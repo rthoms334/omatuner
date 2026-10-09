@@ -31,7 +31,6 @@ pub mod jobs;
 pub mod player;
 #[allow(dead_code, unused_variables, unused_imports)] // WP stubs (see crate docs)
 pub mod sources;
-#[allow(dead_code, unused_variables, unused_imports)] // WP stubs (see crate docs)
 pub mod store;
 
 pub mod fonts;

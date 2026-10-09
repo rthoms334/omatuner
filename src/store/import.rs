@@ -15,15 +15,17 @@
 //! If the job is cancelled, nothing is swept and `source.generation` is not bumped; rows already
 //! upserted simply carry the newer data.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::model::{
-    CatchupSpec, EpgMatchMethod, GroupKey, HttpHeaders, ItemKey, ItemKind, ReattachOutcome, SourceId, StreamLocator,
-    Timestamp, Unsupported,
+    CatchupSpec, Fingerprint, GroupId, GroupKey, HttpHeaders, ItemKey, ItemKind, ItemRef, ReattachOutcome, SeriesId, SourceId,
+    StreamLocator, Timestamp, Unsupported,
 };
+use crate::store::sql::{self, atomic, enum_str, fp_from_json, from_json_opt, or_not_found, u32_of};
 
 /// An in-progress catalogue import.
 #[derive(Debug, Clone)]
@@ -176,40 +178,432 @@ pub struct ImportSummary {
     pub orphaned: u32,
 }
 
+/// Rows deleted per transaction by the sweep (§5.3: no transaction larger than one batch).
+const SWEEP_CHUNK: i64 = 2_000;
+
+/// Running added/updated counters of one import, kept in `meta` so they survive between the
+/// per-batch writer closures (and connections) until `finish_catalogue` reads them.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Counters {
+    added: u32,
+    updated: u32,
+}
+
+fn counter_key(imp: &CatalogueImport, what: &str) -> String { format!("import:{}:{}:{what}", imp.source.0, imp.generation) }
+
+fn bump_counters(conn: &Connection, imp: &CatalogueImport, what: &str, added: u32, updated: u32) -> Result<()> {
+    let key = counter_key(imp, what);
+    let mut c: Counters =
+        from_json_opt(conn.query_row("SELECT value FROM meta WHERE key = ?1", [&key], |r| r.get(0)).optional()?).unwrap_or_default();
+    c.added += added;
+    c.updated += updated;
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key.as_str(), sql::to_json(&c)?],
+    )?;
+    Ok(())
+}
+
+fn take_counters(conn: &Connection, imp: &CatalogueImport, what: &str) -> Result<Counters> {
+    let key = counter_key(imp, what);
+    let c = from_json_opt(conn.query_row("SELECT value FROM meta WHERE key = ?1", [&key], |r| r.get(0)).optional()?).unwrap_or_default();
+    conn.execute("DELETE FROM meta WHERE key = ?1", [&key])?;
+    Ok(c)
+}
+
+/// Catalogue table of a kind.
+fn table_of(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::Channel => "channel",
+        ItemKind::Movie => "movie",
+        ItemKind::Series => "series",
+        ItemKind::Episode => "episode",
+    }
+}
+
 /// Start an import: computes the next generation; nothing is written yet.
 pub fn begin_catalogue(conn: &Connection, source: SourceId, now: Timestamp) -> Result<CatalogueImport> {
-    todo!("WP-02")
+    let generation: i64 =
+        or_not_found(conn.query_row("SELECT generation FROM source WHERE id = ?1", [source], |r| r.get(0)), "source", source)?;
+    // counters of an earlier cancelled run
+    conn.execute("DELETE FROM meta WHERE key LIKE ?1", [format!("import:{}:%", source.0)])?;
+    Ok(CatalogueImport { source, generation: generation + 1, started_at: now })
+}
+
+/// `GroupKey → grp.id` of one kind of a source.
+fn group_ids(conn: &Connection, source: SourceId, kind: ItemKind) -> Result<HashMap<String, GroupId>> {
+    let mut stmt = conn.prepare_cached("SELECT key, id FROM grp WHERE source_id = ?1 AND kind = ?2")?;
+    let rows = stmt.query_map(params![source, kind.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Upsert one group; returns (id, inserted).
+fn upsert_group(conn: &Connection, imp: &CatalogueImport, g: &ImportGroup) -> Result<(GroupId, bool)> {
+    let existed: bool = conn
+        .prepare_cached("SELECT 1 FROM grp WHERE source_id = ?1 AND kind = ?2 AND key = ?3")?
+        .query_row(params![imp.source, g.kind.as_str(), g.key.0], |_| Ok(()))
+        .optional()?
+        .is_some();
+    let id = conn
+        .prepare_cached(
+            "INSERT INTO grp(source_id, kind, key, name, provider_id, provider_order, seen_gen) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(source_id, kind, key) DO UPDATE SET name = excluded.name, provider_id = excluded.provider_id,
+               provider_order = excluded.provider_order, seen_gen = excluded.seen_gen
+             RETURNING id",
+        )?
+        .query_row(params![imp.source, g.kind.as_str(), g.key.0, g.name, g.provider_id, g.provider_order, imp.generation], |r| r.get(0))?;
+    Ok((id, !existed))
+}
+
+/// Group ids of an item's group keys (primary first). A key that `upsert_groups` never saw is
+/// created on the fly (named after its key) rather than silently dropping the membership.
+fn resolve_groups(
+    conn: &Connection,
+    imp: &CatalogueImport,
+    kind: ItemKind,
+    keys: &[GroupKey],
+    map: &mut HashMap<String, GroupId>,
+) -> Result<Vec<GroupId>> {
+    let mut out = Vec::with_capacity(keys.len());
+    for k in keys {
+        let id = match map.get(&k.0) {
+            Some(id) => *id,
+            None => {
+                let name = sql::group_norm(&k.0);
+                let g = ImportGroup { kind, key: k.clone(), name, provider_id: None, provider_order: i32::MAX };
+                let (id, _) = upsert_group(conn, imp, &g)?;
+                map.insert(k.0.clone(), id);
+                id
+            }
+        };
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    Ok(out)
 }
 
 /// Upsert all groups of the import (marks `seen_gen`). One transaction.
 pub fn upsert_groups(conn: &mut Connection, imp: &CatalogueImport, groups: &[ImportGroup]) -> Result<()> {
-    todo!("WP-02")
+    if let Some(g) = groups.iter().find(|g| g.kind == ItemKind::Episode) {
+        return Err(Error::Other(format!("group {} has kind episode", g.key.0)));
+    }
+    let tx = conn.transaction()?;
+    let (mut added, mut updated) = (0, 0);
+    for g in groups {
+        if upsert_group(&tx, imp, g)?.1 {
+            added += 1;
+        } else {
+            updated += 1;
+        }
+    }
+    bump_counters(&tx, imp, "group", added, updated)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Does `(source, key)` exist in `table`? (added vs updated accounting)
+fn exists(conn: &Connection, table: &str, source: SourceId, key: &ItemKey) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(&format!("SELECT 1 FROM {table} WHERE source_id = ?1 AND key = ?2"))?
+        .query_row(params![source, key.as_str()], |_| Ok(()))
+        .optional()?
+        .is_some())
+}
+
+/// Replace the group memberships of one item. `position` = the item's provider order, so a
+/// group's members sort in provider order.
+fn write_memberships(conn: &Connection, link: &str, col: &str, id: i64, groups: &[GroupId], position: i32, fresh: bool) -> Result<()> {
+    if !fresh {
+        conn.prepare_cached(&format!("DELETE FROM {link} WHERE {col} = ?1"))?.execute([id])?;
+    }
+    let primary = if link == "channel_group" { ", is_primary" } else { "" };
+    let primary_val = if link == "channel_group" { ", ?4" } else { "" };
+    let mut ins = conn.prepare_cached(&format!(
+        "INSERT INTO {link}(group_id, {col}, position{primary}) VALUES (?1, ?2, ?3{primary_val}) ON CONFLICT DO NOTHING"
+    ))?;
+    for (i, g) in groups.iter().enumerate() {
+        if primary.is_empty() {
+            ins.execute(params![g, id, position])?;
+        } else {
+            ins.execute(params![g, id, position, i == 0])?;
+        }
+    }
+    Ok(())
 }
 
 /// Upsert one batch of channels in ONE transaction (prepared/cached statements), replacing
 /// their `channel_group` rows. Returns (added, updated).
 pub fn write_channels(conn: &mut Connection, imp: &CatalogueImport, batch: &[ImportChannel]) -> Result<(u32, u32)> {
-    todo!("WP-02")
+    let tx = conn.transaction()?;
+    let mut groups = group_ids(&tx, imp.source, ItemKind::Channel)?;
+    let (mut added, mut updated) = (0u32, 0u32);
+    for ch in batch {
+        let fresh = !exists(&tx, "channel", imp.source, &ch.key)?;
+        let headers = ch.headers.as_ref().filter(|h| !h.is_empty()).map(sql::to_json).transpose()?;
+        let catchup = ch.catchup.as_ref().map(sql::to_json).transpose()?;
+        let id: i64 = tx
+            .prepare_cached(
+                "INSERT INTO channel(source_id, key, provider_id, name, clean_name, norm_name, number, logo, tvg_id, tvg_name,
+                                     tvg_shift_min, stream, url_key, headers, catchup, radio, unsupported, provider_order,
+                                     added_at, seen_gen)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, COALESCE(?19, ?20), ?21)
+                 ON CONFLICT(source_id, key) DO UPDATE SET
+                   provider_id = excluded.provider_id, name = excluded.name, clean_name = excluded.clean_name,
+                   norm_name = excluded.norm_name, number = excluded.number, logo = excluded.logo, tvg_id = excluded.tvg_id,
+                   tvg_name = excluded.tvg_name, tvg_shift_min = excluded.tvg_shift_min, stream = excluded.stream,
+                   url_key = excluded.url_key, headers = excluded.headers, catchup = excluded.catchup, radio = excluded.radio,
+                   unsupported = excluded.unsupported, provider_order = excluded.provider_order,
+                   added_at = COALESCE(?19, channel.added_at), seen_gen = excluded.seen_gen
+                 RETURNING id",
+            )?
+            .query_row(
+                params![
+                    imp.source,
+                    ch.key.as_str(),
+                    ch.provider_id,
+                    ch.name,
+                    ch.clean_name,
+                    ch.norm_name,
+                    ch.number,
+                    ch.logo,
+                    ch.tvg_id,
+                    ch.tvg_name,
+                    ch.tvg_shift_min,
+                    sql::to_json(&ch.stream)?,
+                    ch.url_key,
+                    headers,
+                    catchup,
+                    ch.radio,
+                    ch.unsupported.as_ref().map(enum_str),
+                    ch.provider_order,
+                    ch.added_at,
+                    imp.started_at,
+                    imp.generation,
+                ],
+                |r| r.get(0),
+            )?;
+        let gids = resolve_groups(&tx, imp, ItemKind::Channel, &ch.groups, &mut groups)?;
+        write_memberships(&tx, "channel_group", "channel_id", id, &gids, ch.provider_order, fresh)?;
+        if fresh {
+            added += 1;
+        } else {
+            updated += 1;
+        }
+    }
+    bump_counters(&tx, imp, "channel", added, updated)?;
+    tx.commit()?;
+    Ok((added, updated))
 }
 
 pub fn write_movies(conn: &mut Connection, imp: &CatalogueImport, batch: &[ImportMovie]) -> Result<(u32, u32)> {
-    todo!("WP-02")
+    let tx = conn.transaction()?;
+    let mut groups = group_ids(&tx, imp.source, ItemKind::Movie)?;
+    let (mut added, mut updated) = (0u32, 0u32);
+    for m in batch {
+        let fresh = !exists(&tx, "movie", imp.source, &m.key)?;
+        let id: i64 = tx
+            .prepare_cached(
+                "INSERT INTO movie(source_id, key, provider_id, name, clean_name, norm_name, year, poster, rating, stream, url_key,
+                                   provider_order, added_at, seen_gen)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, COALESCE(?13, ?14), ?15)
+                 ON CONFLICT(source_id, key) DO UPDATE SET
+                   provider_id = excluded.provider_id, name = excluded.name, clean_name = excluded.clean_name,
+                   norm_name = excluded.norm_name, year = COALESCE(excluded.year, movie.year),
+                   poster = COALESCE(excluded.poster, movie.poster), rating = COALESCE(excluded.rating, movie.rating),
+                   stream = excluded.stream, url_key = excluded.url_key, provider_order = excluded.provider_order,
+                   added_at = COALESCE(?13, movie.added_at), seen_gen = excluded.seen_gen
+                 RETURNING id",
+            )?
+            .query_row(
+                params![
+                    imp.source,
+                    m.key.as_str(),
+                    m.provider_id,
+                    m.name,
+                    m.clean_name,
+                    m.norm_name,
+                    m.year,
+                    m.poster,
+                    m.rating.map(f64::from),
+                    sql::to_json(&m.stream)?,
+                    m.url_key,
+                    m.provider_order,
+                    m.added_at,
+                    imp.started_at,
+                    imp.generation,
+                ],
+                |r| r.get(0),
+            )?;
+        let gids = resolve_groups(&tx, imp, ItemKind::Movie, &m.groups, &mut groups)?;
+        write_memberships(&tx, "movie_group", "movie_id", id, &gids, m.provider_order, fresh)?;
+        if fresh {
+            added += 1;
+        } else {
+            updated += 1;
+        }
+    }
+    bump_counters(&tx, imp, "movie", added, updated)?;
+    tx.commit()?;
+    Ok((added, updated))
 }
 
+/// Series rows. A changed provider `last_modified` clears `details_at`, so the detail page
+/// re-fetches seasons/episodes.
 pub fn write_series(conn: &mut Connection, imp: &CatalogueImport, batch: &[ImportSeries]) -> Result<(u32, u32)> {
-    todo!("WP-02")
+    let tx = conn.transaction()?;
+    let mut groups = group_ids(&tx, imp.source, ItemKind::Series)?;
+    let (mut added, mut updated) = (0u32, 0u32);
+    for s in batch {
+        let fresh = !exists(&tx, "series", imp.source, &s.key)?;
+        let id: i64 = tx
+            .prepare_cached(
+                "INSERT INTO series(source_id, key, provider_id, name, clean_name, norm_name, year, cover, backdrop, rating, plot,
+                                    genre, cast_, director, release_date, last_modified, provider_order, added_at, seen_gen)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, COALESCE(?18, ?19), ?20)
+                 ON CONFLICT(source_id, key) DO UPDATE SET
+                   provider_id = excluded.provider_id, name = excluded.name, clean_name = excluded.clean_name,
+                   norm_name = excluded.norm_name, year = COALESCE(excluded.year, series.year),
+                   cover = COALESCE(excluded.cover, series.cover), backdrop = COALESCE(excluded.backdrop, series.backdrop),
+                   rating = COALESCE(excluded.rating, series.rating), plot = COALESCE(excluded.plot, series.plot),
+                   genre = COALESCE(excluded.genre, series.genre), cast_ = COALESCE(excluded.cast_, series.cast_),
+                   director = COALESCE(excluded.director, series.director),
+                   release_date = COALESCE(excluded.release_date, series.release_date),
+                   details_at = CASE WHEN excluded.last_modified IS NOT NULL AND excluded.last_modified IS NOT series.last_modified
+                                     THEN NULL ELSE series.details_at END,
+                   last_modified = COALESCE(excluded.last_modified, series.last_modified),
+                   provider_order = excluded.provider_order, added_at = COALESCE(?18, series.added_at),
+                   seen_gen = excluded.seen_gen
+                 RETURNING id",
+            )?
+            .query_row(
+                params![
+                    imp.source,
+                    s.key.as_str(),
+                    s.provider_id,
+                    s.name,
+                    s.clean_name,
+                    s.norm_name,
+                    s.year,
+                    s.cover,
+                    s.backdrop,
+                    s.rating.map(f64::from),
+                    s.plot,
+                    s.genre,
+                    s.cast,
+                    s.director,
+                    s.release_date,
+                    s.last_modified,
+                    s.provider_order,
+                    s.added_at,
+                    imp.started_at,
+                    imp.generation,
+                ],
+                |r| r.get(0),
+            )?;
+        let gids = resolve_groups(&tx, imp, ItemKind::Series, &s.groups, &mut groups)?;
+        write_memberships(&tx, "series_group", "series_id", id, &gids, s.provider_order, fresh)?;
+        if fresh {
+            added += 1;
+        } else {
+            updated += 1;
+        }
+    }
+    bump_counters(&tx, imp, "series", added, updated)?;
+    tx.commit()?;
+    Ok((added, updated))
+}
+
+/// Delete rows of `kind` not seen by this import, in chunks (one transaction each). Returns
+/// rows removed.
+fn sweep_kind(conn: &Connection, imp: &CatalogueImport, kind: ItemKind) -> Result<u32> {
+    let t = table_of(kind);
+    let sql = format!("DELETE FROM {t} WHERE id IN (SELECT id FROM {t} WHERE source_id = ?1 AND seen_gen < ?2 LIMIT {SWEEP_CHUNK})");
+    let mut removed = 0usize;
+    loop {
+        let n = atomic(conn, |c| Ok(c.prepare_cached(&sql)?.execute(params![imp.source, imp.generation])?))?;
+        removed += n;
+        if n == 0 {
+            return Ok(removed as u32);
+        }
+    }
 }
 
 /// Finish (one transaction): for each kind in `completed`, delete rows with `seen_gen < gen`
 /// (and groups likewise); recompute group `item_count`; run [`reattach_user_data`]; update
 /// source counts and `generation = gen`; call `store::epg::resolve_mappings` for the source.
+///
+/// The sweep itself runs first in chunks of 2 000 rows (one transaction each, DESIGN §5.3) so
+/// that a provider dropping 50k items cannot stall user writes; everything after it is one
+/// transaction. If the process dies in between, the next import simply sweeps again.
 pub fn finish_catalogue(
     conn: &mut Connection,
     imp: &CatalogueImport,
     completed: &[ItemKind],
     now: Timestamp,
 ) -> Result<ImportSummary> {
-    todo!("WP-02")
+    let kinds = [ItemKind::Channel, ItemKind::Movie, ItemKind::Series];
+    let mut removed: HashMap<ItemKind, u32> = HashMap::new();
+    let mut groups_removed = 0u32;
+    for kind in kinds.into_iter().filter(|k| completed.contains(k)) {
+        removed.insert(kind, sweep_kind(conn, imp, kind)?);
+        groups_removed += atomic(conn, |c| {
+            Ok(c.execute(
+                "DELETE FROM grp WHERE source_id = ?1 AND kind = ?2 AND seen_gen < ?3",
+                params![imp.source, kind.as_str(), imp.generation],
+            )? as u32)
+        })?;
+    }
+
+    let tx = conn.transaction()?;
+    let mut summary = ImportSummary::default();
+    for (kind, link) in [(ItemKind::Channel, "channel_group"), (ItemKind::Movie, "movie_group"), (ItemKind::Series, "series_group")] {
+        tx.execute(
+            &format!(
+                "UPDATE grp SET item_count = (SELECT count(*) FROM {link} l WHERE l.group_id = grp.id)
+                 WHERE source_id = ?1 AND kind = ?2"
+            ),
+            params![imp.source, kind.as_str()],
+        )?;
+        let c = take_counters(&tx, imp, kind.as_str())?;
+        let total: i64 =
+            tx.query_row(&format!("SELECT count(*) FROM {} WHERE source_id = ?1", table_of(kind)), [imp.source], |r| r.get(0))?;
+        let counts = KindCounts { added: c.added, updated: c.updated, removed: removed.get(&kind).copied().unwrap_or(0), total: u32_of(total) };
+        match kind {
+            ItemKind::Channel => summary.channels = counts,
+            ItemKind::Movie => summary.movies = counts,
+            _ => summary.series = counts,
+        }
+    }
+    let gc = take_counters(&tx, imp, "group")?;
+    let n_groups: i64 = tx.query_row("SELECT count(*) FROM grp WHERE source_id = ?1", [imp.source], |r| r.get(0))?;
+    summary.groups = KindCounts { added: gc.added, updated: gc.updated, removed: groups_removed, total: u32_of(n_groups) };
+
+    if completed.contains(&ItemKind::Channel) {
+        // per-stream state of channels that are gone for good (user data is reattached below)
+        tx.execute(
+            "DELETE FROM stream_failure WHERE source_id = ?1
+               AND NOT EXISTS (SELECT 1 FROM channel c WHERE c.source_id = ?1 AND c.key = stream_failure.item_key)",
+            [imp.source],
+        )?;
+        tx.execute(
+            "DELETE FROM channel_epg_map WHERE source_id = ?1 AND method != 'manual'
+               AND NOT EXISTS (SELECT 1 FROM channel c WHERE c.source_id = ?1 AND c.key = channel_epg_map.channel_key)",
+            [imp.source],
+        )?;
+    }
+
+    let (outcomes, newly_orphaned) = reattach(&tx, imp.source, &kinds, now)?;
+    summary.reattached = outcomes.iter().filter(|(_, o)| matches!(o, ReattachOutcome::Reattached { .. })).count() as u32;
+    summary.orphaned = newly_orphaned;
+
+    tx.execute(
+        "UPDATE source SET generation = ?2, n_channels = ?3, n_movies = ?4, n_series = ?5, n_groups = ?6 WHERE id = ?1",
+        params![imp.source, imp.generation, summary.channels.total, summary.movies.total, summary.series.total, summary.groups.total],
+    )?;
+    crate::store::epg::resolve_mappings(&tx)?;
+    tx.commit()?;
+    Ok(summary)
 }
 
 /// Re-attach favourites / overrides / progress / reminders / manual EPG mappings of `source`
@@ -225,21 +619,288 @@ pub fn finish_catalogue(
 ///
 /// Ambiguous or no hit → `orphaned_since = now` (kept, listed in Settings ▸ Orphans).
 /// A previously orphaned row that matches again is re-attached and un-orphaned.
+///
+/// Covers channels, movies and series. Episodes are lazily loaded per series, so their user
+/// data is re-attached by [`store_series_details`] when that series' episodes are replaced.
+/// Rows whose key still exists get their stored fingerprint refreshed (and are reported as
+/// `Unchanged` only when they were orphaned before).
 pub fn reattach_user_data(conn: &Connection, source: SourceId, now: Timestamp) -> Result<Vec<(ItemKey, ReattachOutcome)>> {
-    todo!("WP-02")
+    atomic(conn, |c| Ok(reattach(c, source, &[ItemKind::Channel, ItemKind::Movie, ItemKind::Series], now)?.0))
+}
+
+/// [`reattach_user_data`] for `kinds`; also returns how many items became orphans now.
+fn reattach(conn: &Connection, source: SourceId, kinds: &[ItemKind], now: Timestamp) -> Result<(Vec<(ItemKey, ReattachOutcome)>, u32)> {
+    let mut out = Vec::new();
+    let mut newly = 0;
+    for &kind in kinds {
+        newly += reattach_kind(conn, source, kind, None, now, &mut out)?;
+    }
+    Ok((out, newly))
+}
+
+/// Distinct user-data keys of one kind in a source with their best stored fingerprint.
+fn user_keys(conn: &Connection, source: SourceId, kind: ItemKind) -> Result<Vec<(ItemKey, Fingerprint)>> {
+    let sql = crate::store::user::holders_for(kind)
+        .map(|(table, key, extra)| format!("SELECT {key}, fp FROM {table} WHERE source_id = ?1{extra}"))
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt.query_map([source], |r| Ok((ItemKey(r.get::<_, String>(0)?), fp_from_json(&r.get::<_, String>(1)?))))?;
+    let mut out: Vec<(ItemKey, Fingerprint)> = Vec::new();
+    let mut index: HashMap<ItemKey, usize> = HashMap::new();
+    for row in rows {
+        let (key, fp) = row?;
+        match index.get(&key) {
+            Some(&i) => {
+                if out[i].1 == Fingerprint::default() {
+                    out[i].1 = fp;
+                }
+            }
+            None => {
+                index.insert(key.clone(), out.len());
+                out.push((key, fp));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Lookup tables over the current items of one kind (built once per reattach run).
+#[derive(Default)]
+struct Candidates {
+    keys: Vec<ItemKey>,
+    by_provider: HashMap<String, Vec<usize>>,
+    by_tvg_name: HashMap<(String, String), Vec<usize>>,
+    by_name_group: HashMap<(String, String), Vec<usize>>,
+    by_url: HashMap<String, Vec<usize>>,
+    by_name: HashMap<String, Vec<usize>>,
+}
+
+impl Candidates {
+    fn load(conn: &Connection, sql: &str, args: impl rusqlite::Params) -> Result<Self> {
+        let mut c = Candidates::default();
+        let mut stmt = conn.prepare_cached(sql)?;
+        let rows = stmt.query_map(args, crate::store::user::facts_from_row)?;
+        for row in rows {
+            let (key, fp) = row?;
+            let i = c.keys.len();
+            c.keys.push(key);
+            if let Some(p) = fp.provider_id {
+                c.by_provider.entry(p).or_default().push(i);
+            }
+            if fp.norm_name.is_empty() {
+                continue;
+            }
+            if let Some(t) = fp.tvg_id {
+                c.by_tvg_name.entry((t, fp.norm_name.clone())).or_default().push(i);
+            }
+            if let Some(g) = fp.norm_group {
+                c.by_name_group.entry((fp.norm_name.clone(), g)).or_default().push(i);
+            }
+            if let Some(u) = fp.url_key {
+                c.by_url.entry(u).or_default().push(i);
+            }
+            c.by_name.entry(fp.norm_name).or_default().push(i);
+        }
+        Ok(c)
+    }
+
+    /// The first step (§8.3 order) with exactly one candidate.
+    fn find(&self, fp: &Fingerprint) -> Option<(&ItemKey, &'static str)> {
+        let name = (!fp.norm_name.is_empty()).then_some(fp.norm_name.as_str());
+        let steps: [(Option<&Vec<usize>>, &'static str); 5] = [
+            (fp.provider_id.as_ref().and_then(|p| self.by_provider.get(p)), "provider-id"),
+            (fp.tvg_id.as_ref().zip(name).and_then(|(t, n)| self.by_tvg_name.get(&(t.clone(), n.to_owned()))), "tvg-id+name"),
+            (fp.norm_group.as_ref().zip(name).and_then(|(g, n)| self.by_name_group.get(&(n.to_owned(), g.clone()))), "name+group"),
+            (fp.url_key.as_ref().and_then(|u| self.by_url.get(u)), "url"),
+            (name.and_then(|n| self.by_name.get(n)), "name"),
+        ];
+        steps.into_iter().find_map(|(hits, via)| match hits {
+            Some(v) if v.len() == 1 => Some((&self.keys[v[0]], via)),
+            _ => None,
+        })
+    }
+}
+
+/// Reattach one kind. `episodes_of` = (series id, series norm name): only episode user data
+/// whose fingerprint names that series is considered, against that series' episodes.
+fn reattach_kind(
+    conn: &Connection,
+    source: SourceId,
+    kind: ItemKind,
+    episodes_of: Option<(SeriesId, &str)>,
+    now: Timestamp,
+    out: &mut Vec<(ItemKey, ReattachOutcome)>,
+) -> Result<u32> {
+    let mut keys = user_keys(conn, source, kind)?;
+    if let Some((_, norm)) = episodes_of {
+        let prefix = format!("{norm}:");
+        keys.retain(|(_, fp)| fp.norm_name.starts_with(&prefix));
+    }
+    if keys.is_empty() {
+        return Ok(0);
+    }
+    let table = table_of(kind);
+    let mut missing = Vec::new();
+    for (key, stored) in keys {
+        let item = ItemRef { source, kind, key };
+        if exists(conn, table, source, &item.key)? {
+            let fp = crate::store::user::fingerprint_of(conn, &item)?;
+            if crate::store::user::mark_attached(conn, &item, &fp)? {
+                out.push((item.key, ReattachOutcome::Unchanged));
+            }
+        } else {
+            missing.push((item, stored));
+        }
+    }
+    if missing.is_empty() {
+        return Ok(0);
+    }
+    let candidates = match episodes_of {
+        Some((series, _)) => {
+            let sql = format!("{} AND x.series_id = ?2", crate::store::user::facts_sql(ItemKind::Episode, false));
+            Candidates::load(conn, &sql, params![source, series])?
+        }
+        None => Candidates::load(conn, &crate::store::user::facts_sql(kind, false), [source])?,
+    };
+    let mut newly = 0;
+    for (item, fp) in missing {
+        match candidates.find(&fp) {
+            Some((new_key, via)) => {
+                let to = ItemRef { source, kind, key: new_key.clone() };
+                crate::store::user::move_user_data(conn, &item, &to)?;
+                tracing::debug!(kind = kind.as_str(), via, "re-attached user data to a new item key");
+                out.push((item.key, ReattachOutcome::Reattached { new_key: new_key.clone(), via }));
+            }
+            None => {
+                if crate::store::user::mark_orphaned(conn, &item, now)? {
+                    newly += 1;
+                }
+                out.push((item.key, ReattachOutcome::Orphaned));
+            }
+        }
+    }
+    Ok(newly)
 }
 
 /// Store lazily fetched movie details.
 pub fn store_movie_details(conn: &Connection, movie: crate::model::MovieId, d: &MovieDetails, now: Timestamp) -> Result<()> {
-    todo!("WP-02")
+    atomic(conn, |c| {
+        let stream: String = or_not_found(c.query_row("SELECT stream FROM movie WHERE id = ?1", [movie], |r| r.get(0)), "movie", movie)?;
+        let mut stream: StreamLocator = serde_json::from_str(&stream).map_err(Error::other)?;
+        if let (StreamLocator::Xtream { ext, .. }, Some(new)) = (&mut stream, d.container_ext.as_ref().filter(|e| !e.is_empty())) {
+            *ext = Some(new.clone());
+        }
+        c.execute(
+            "UPDATE movie SET plot = COALESCE(?2, plot), genre = COALESCE(?3, genre), cast_ = COALESCE(?4, cast_),
+                    director = COALESCE(?5, director), duration_s = COALESCE(?6, duration_s),
+                    release_date = COALESCE(?7, release_date), tmdb_id = COALESCE(?8, tmdb_id), trailer = COALESCE(?9, trailer),
+                    backdrop = COALESCE(?10, backdrop), rating = COALESCE(?11, rating), poster = COALESCE(?12, poster),
+                    stream = ?13, details_at = ?14
+             WHERE id = ?1",
+            params![
+                movie,
+                d.plot,
+                d.genre,
+                d.cast,
+                d.director,
+                d.duration_s,
+                d.release_date,
+                d.tmdb_id,
+                d.trailer,
+                d.backdrop,
+                d.rating.map(f64::from),
+                d.poster,
+                sql::to_json(&stream)?,
+                now,
+            ],
+        )?;
+        Ok(())
+    })
 }
 
 /// Replace seasons + episodes of a series (upsert episodes by key, delete missing).
+///
+/// Episode user data (progress, favourites…) of this series whose key vanished is re-attached
+/// here (same steps as [`reattach_user_data`], against this series' new episodes).
 pub fn store_series_details(
     conn: &mut Connection,
     series: crate::model::SeriesId,
     d: &SeriesDetails,
     now: Timestamp,
 ) -> Result<()> {
-    todo!("WP-02")
+    let tx = conn.transaction()?;
+    let (source, norm): (SourceId, String) = or_not_found(
+        tx.query_row("SELECT source_id, norm_name FROM series WHERE id = ?1", [series], |r| Ok((r.get(0)?, r.get(1)?))),
+        "series",
+        series,
+    )?;
+    {
+        let mut up = tx.prepare_cached(
+            "INSERT INTO episode(series_id, source_id, key, provider_id, season, episode, title, plot, duration_s, still, air_date,
+                                 rating, stream)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT(source_id, key) DO UPDATE SET
+               series_id = excluded.series_id, provider_id = excluded.provider_id, season = excluded.season,
+               episode = excluded.episode, title = excluded.title, plot = excluded.plot, duration_s = excluded.duration_s,
+               still = excluded.still, air_date = excluded.air_date, rating = excluded.rating, stream = excluded.stream",
+        )?;
+        for e in &d.episodes {
+            up.execute(params![
+                series,
+                source,
+                e.key.as_str(),
+                e.provider_id,
+                e.season,
+                e.episode,
+                e.title,
+                e.plot,
+                e.duration_s,
+                e.still,
+                e.air_date,
+                e.rating.map(f64::from),
+                sql::to_json(&e.stream)?,
+            ])?;
+        }
+    }
+    let keys: Vec<&str> = d.episodes.iter().map(|e| e.key.as_str()).collect();
+    tx.execute(
+        "DELETE FROM episode WHERE series_id = ?1 AND key NOT IN (SELECT value FROM json_each(?2))",
+        params![series, sql::to_json(&keys)?],
+    )?;
+
+    // seasons: as sent, or synthesized from the episodes; counts fall back to the episodes
+    let mut per_season: BTreeMap<u32, u32> = BTreeMap::new();
+    for e in &d.episodes {
+        *per_season.entry(e.season).or_default() += 1;
+    }
+    tx.execute("DELETE FROM season WHERE series_id = ?1", [series])?;
+    {
+        let mut ins = tx.prepare_cached(
+            "INSERT INTO season(series_id, number, name, cover, air_date, overview, episode_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(series_id, number) DO NOTHING",
+        )?;
+        if d.seasons.is_empty() {
+            for (n, count) in &per_season {
+                ins.execute(params![series, n, Option::<String>::None, Option::<String>::None, Option::<String>::None, Option::<String>::None, count])?;
+            }
+        } else {
+            for s in &d.seasons {
+                let count = if s.episode_count > 0 { s.episode_count } else { per_season.get(&s.number).copied().unwrap_or(0) };
+                ins.execute(params![series, s.number, s.name, s.cover, s.air_date, s.overview, count])?;
+            }
+            // episodes of seasons the provider did not list still get a season row
+            for (n, count) in per_season.iter().filter(|(n, _)| !d.seasons.iter().any(|s| s.number == **n)) {
+                ins.execute(params![series, n, Option::<String>::None, Option::<String>::None, Option::<String>::None, Option::<String>::None, count])?;
+            }
+        }
+    }
+    tx.execute(
+        "UPDATE series SET plot = COALESCE(?2, plot), backdrop = COALESCE(?3, backdrop), details_at = ?4 WHERE id = ?1",
+        params![series, d.plot, d.backdrop, now],
+    )?;
+    let mut outcomes = Vec::new();
+    reattach_kind(&tx, source, ItemKind::Episode, Some((series, &norm)), now, &mut outcomes)?;
+    tx.commit()?;
+    Ok(())
 }

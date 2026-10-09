@@ -18,10 +18,13 @@
 //! Hidden lists them); locked items are flagged, not removed (the UI asks for the PIN).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use rusqlite::Connection;
 
 use crate::error::Result;
+use crate::store::live::{GROUP_COLS, GROUP_FROM, GROUP_ORDER, group_from_row};
+use crate::store::sql::{enum_parse, u32_of};
 use crate::model::{
     ChannelId, ChannelSummary, Collection, FavListId, FavouriteEntry, FavouriteList, Group, GroupId, ItemKey, ItemKind,
     ItemRef, MovieId, SeriesId, SortMode, SourceColor, SourceId, SourceKind, Timestamp, VodKind, VodSummary,
@@ -293,12 +296,223 @@ impl Library {
     pub fn has_series(&self) -> bool { !self.vod.series.is_empty() }
 }
 
+/// Recently watched channels kept in the snapshot (`Collection::History`, Home rail).
+const RECENT_CHANNELS: usize = 50;
+
+fn load_sources(conn: &Connection) -> Result<Vec<SourceMeta>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT s.id, s.name, s.icon, s.color, s.kind, s.enabled, s.last_refresh,
+                EXISTS (SELECT 1 FROM movie m WHERE m.source_id = s.id), EXISTS (SELECT 1 FROM series x WHERE x.source_id = s.id)
+         FROM source s ORDER BY s.sort_index, s.id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        let kind: String = r.get(4)?;
+        Ok(SourceMeta {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            icon: r.get(2)?,
+            color: enum_parse(&r.get::<_, String>(3)?).unwrap_or_default(),
+            kind: enum_parse(&kind).unwrap_or(SourceKind::M3uUrl),
+            enabled: r.get(5)?,
+            last_refresh: r.get(6)?,
+            has_vod: r.get(7)?,
+            has_series: r.get(8)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Groups of every kind of enabled sources, in display order per kind.
+fn load_groups(conn: &Connection) -> Result<(Vec<Group>, Vec<Group>, Vec<Group>)> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {GROUP_COLS} {GROUP_FROM} WHERE s.enabled = 1 ORDER BY g.kind, {GROUP_ORDER}"
+    ))?;
+    let (mut ch, mut mv, mut se) = (Vec::new(), Vec::new(), Vec::new());
+    for g in stmt.query_map([], group_from_row)? {
+        let g = g?;
+        match g.kind {
+            ItemKind::Channel => ch.push(g),
+            ItemKind::Movie => mv.push(g),
+            ItemKind::Series => se.push(g),
+            ItemKind::Episode => {}
+        }
+    }
+    Ok((ch, mv, se))
+}
+
+/// Per group: (display position, hidden, locked).
+fn group_flags(groups: &[Group]) -> HashMap<GroupId, (usize, bool, bool)> {
+    groups.iter().enumerate().map(|(i, g)| (g.id, (i, g.hidden, g.locked))).collect()
+}
+
+/// Group memberships `item id → [(group, primary)]` from a link table, restricted to groups
+/// in `flags` (enabled sources).
+fn load_memberships(conn: &Connection, sql: &str, flags: &HashMap<GroupId, (usize, bool, bool)>) -> Result<HashMap<i64, Vec<(GroupId, bool)>>> {
+    let mut stmt = conn.prepare_cached(sql)?;
+    let mut out: HashMap<i64, Vec<(GroupId, bool)>> = HashMap::new();
+    for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, GroupId>(1)?, r.get::<_, bool>(2)?)))? {
+        let (item, g, primary) = row?;
+        if flags.contains_key(&g) {
+            out.entry(item).or_default().push((g, primary));
+        }
+    }
+    Ok(out)
+}
+
+/// Ordered group ids (primary first, then display order) + (all groups hidden, any locked).
+fn effective_groups(links: Option<&Vec<(GroupId, bool)>>, flags: &HashMap<GroupId, (usize, bool, bool)>) -> (Vec<GroupId>, bool, bool) {
+    let Some(links) = links else { return (Vec::new(), false, false) };
+    let mut v: Vec<&(GroupId, bool)> = links.iter().collect();
+    v.sort_by_key(|(g, primary)| (!*primary, flags.get(g).map_or(usize::MAX, |f| f.0)));
+    let all_hidden = !v.is_empty() && v.iter().all(|(g, _)| flags.get(g).is_some_and(|f| f.1));
+    let any_locked = v.iter().any(|(g, _)| flags.get(g).is_some_and(|f| f.2));
+    (v.into_iter().map(|(g, _)| *g).collect(), all_hidden, any_locked)
+}
+
+fn load_live(conn: &Connection, groups: Vec<Group>) -> Result<LiveIndex> {
+    let flags = group_flags(&groups);
+    let links = load_memberships(
+        conn,
+        "SELECT cg.channel_id, cg.group_id, cg.is_primary FROM channel_group cg",
+        &flags,
+    )?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT c.id, c.source_id, c.key, COALESCE(o.rename, c.clean_name), c.number, c.logo, ce.epg_channel_id, c.tvg_shift_min,
+                c.catchup IS NOT NULL, COALESCE(json_extract(c.catchup, '$.days'), 0), c.radio, c.unsupported IS NOT NULL,
+                c.provider_order, o.user_order, c.added_at, COALESCE(o.hidden, 0), COALESCE(o.locked, 0)
+         FROM channel c JOIN source s ON s.id = c.source_id AND s.enabled = 1
+         LEFT JOIN item_override o ON o.source_id = c.source_id AND o.kind = 'channel' AND o.item_key = c.key
+         LEFT JOIN channel_epg ce ON ce.channel_id = c.id
+         ORDER BY s.sort_index, s.id, (o.user_order IS NULL), o.user_order, c.provider_order, c.id",
+    )?;
+    let mut channels = Vec::new();
+    let mut hidden = HashSet::new();
+    let mut members: HashMap<GroupId, Vec<ChannelId>> = HashMap::new();
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            ChannelSummary {
+                id: r.get(0)?,
+                source_id: r.get(1)?,
+                key: ItemKey(r.get(2)?),
+                name: Arc::from(r.get::<_, String>(3)?),
+                number: r.get(4)?,
+                logo: r.get::<_, Option<String>>(5)?.map(Arc::from),
+                group_ids: Vec::new(),
+                epg_channel_id: r.get(6)?,
+                tvg_shift_min: r.get(7)?,
+                has_catchup: r.get(8)?,
+                catchup_days: u32_of(r.get(9)?),
+                radio: r.get(10)?,
+                locked: r.get(16)?,
+                unsupported: r.get(11)?,
+                provider_order: r.get(12)?,
+                user_order: r.get(13)?,
+                added_at: r.get(14)?,
+            },
+            r.get::<_, bool>(15)?,
+        ))
+    })?;
+    for row in rows {
+        let (mut c, item_hidden) = row?;
+        let (gids, all_hidden, any_locked) = effective_groups(links.get(&c.id.0), &flags);
+        c.locked |= any_locked;
+        if item_hidden || all_hidden {
+            hidden.insert(c.id);
+        }
+        for g in &gids {
+            members.entry(*g).or_default().push(c.id);
+        }
+        c.group_ids = gids;
+        channels.push(c);
+    }
+    Ok(LiveIndex::from_parts(channels, groups, members, hidden))
+}
+
+/// Group id → indices into the matching `VodIndex` vector.
+type VodMembers = HashMap<GroupId, Vec<u32>>;
+
+/// Visible movies or series + group members (indices into the returned vector).
+fn load_vod(conn: &Connection, movies: bool, groups: &[Group]) -> Result<(Vec<VodSummary>, VodMembers)> {
+    let flags = group_flags(groups);
+    let (table, link, col, kind, poster) =
+        if movies { ("movie", "movie_group", "movie_id", "movie", "poster") } else { ("series", "series_group", "series_id", "series", "cover") };
+    let links = load_memberships(conn, &format!("SELECT l.{col}, l.group_id, 0 FROM {link} l"), &flags)?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT x.id, x.source_id, x.key, COALESCE(o.rename, x.clean_name), x.year, x.{poster}, x.rating, x.added_at,
+                x.provider_order, COALESCE(o.locked, 0), COALESCE(o.hidden, 0)
+         FROM {table} x JOIN source s ON s.id = x.source_id AND s.enabled = 1
+         LEFT JOIN item_override o ON o.source_id = x.source_id AND o.kind = '{kind}' AND o.item_key = x.key
+         ORDER BY s.sort_index, s.id, (o.user_order IS NULL), o.user_order, x.provider_order, x.id"
+    ))?;
+    let mut items = Vec::new();
+    let mut members = VodMembers::new();
+    let rows = stmt.query_map([], |r| {
+        let id: i64 = r.get(0)?;
+        Ok((
+            VodSummary {
+                kind: if movies { VodKind::Movie(MovieId(id)) } else { VodKind::Series(SeriesId(id)) },
+                source_id: r.get(1)?,
+                key: ItemKey(r.get(2)?),
+                name: Arc::from(r.get::<_, String>(3)?),
+                year: r.get(4)?,
+                poster: r.get::<_, Option<String>>(5)?.map(Arc::from),
+                rating: r.get::<_, Option<f64>>(6)?.map(|v| v as f32),
+                group_ids: Vec::new(),
+                added_at: r.get(7)?,
+                provider_order: r.get(8)?,
+                locked: r.get(9)?,
+            },
+            id,
+            r.get::<_, bool>(10)?,
+        ))
+    })?;
+    for row in rows {
+        let (mut v, id, item_hidden) = row?;
+        let (gids, all_hidden, any_locked) = effective_groups(links.get(&id), &flags);
+        if item_hidden || all_hidden {
+            continue;
+        }
+        v.locked |= any_locked;
+        let idx = items.len() as u32;
+        for g in &gids {
+            members.entry(*g).or_default().push(idx);
+        }
+        v.group_ids = gids;
+        items.push(v);
+    }
+    Ok((items, members))
+}
+
 /// Build a full snapshot from a reader connection (uses the `from_parts` constructors). Never
 /// call on the UI thread.
-pub fn load(conn: &Connection) -> Result<Library> { todo!("WP-02") }
+///
+/// Only enabled sources contribute channels/VOD/groups (`sources` lists every source).
+/// Effective flags: an item is hidden when it is hidden itself or every one of its groups is
+/// hidden; it is locked when it or any of its groups is locked.
+pub fn load(conn: &Connection) -> Result<Library> {
+    let sources = load_sources(conn)?;
+    let (ch_groups, movie_groups, series_groups) = load_groups(conn)?;
+    let live = load_live(conn, ch_groups)?;
+    let (movies, mut members) = load_vod(conn, true, &movie_groups)?;
+    let (series, series_members) = load_vod(conn, false, &series_groups)?;
+    members.extend(series_members);
+    let vod = VodIndex::from_parts(movies, series, movie_groups, series_groups, members);
+    let favs = load_favs(conn)?;
+    let recent_channels =
+        crate::store::user::recent_channels(conn, RECENT_CHANNELS)?.iter().filter_map(|h| live.by_ref(&h.item)).collect();
+    Ok(Library { sources, live, vod, favs, recent_channels, built_at: crate::model::now() })
+}
 
 /// Rebuild only the favourites part (cheap; event-driven on the UI thread, < 5 ms).
-pub fn load_favs(conn: &Connection) -> Result<FavIndex> { todo!("WP-02") }
+pub fn load_favs(conn: &Connection) -> Result<FavIndex> {
+    let lists = crate::store::user::fav_lists(conn)?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {} FROM fav_item ORDER BY list_id, position, added_at",
+        crate::store::user::FAV_ITEM_COLS
+    ))?;
+    let entries = stmt.query_map([], crate::store::user::fav_entry_from_row)?.collect::<rusqlite::Result<Vec<FavouriteEntry>>>()?;
+    Ok(FavIndex::from_parts(lists, entries))
+}
 
 #[cfg(test)]
 mod tests {
