@@ -1,13 +1,14 @@
 //! Controller thread: owns the state machine, executes its effects against mpv, applies direct
 //! commands (pause, seek, tracks...), zapping, connection budget (stop-before-start),
 //! progress persistence, video suspension while nothing renders, and publishes snapshots.
-//! Implemented in the skeleton; owner for changes: WP-07.
+//! Implemented in the skeleton, hardened by WP-07.
 //!
 //! Snapshot publishing: state changes and command results are published IMMEDIATELY (with a
 //! repaint request, so e.g. a volume change while paused is visible at once); continuous values
 //! (time-pos, cache) at most every 100 ms; a repaint for time-pos only when the whole second
 //! changes (radio must not repaint the UI at audio-packet rate).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -17,11 +18,11 @@ use libmpv2::Mpv;
 use tokio::sync::watch;
 
 use super::budget::{ConnectionBudget, Lease};
-use super::events::{MpvEvent, PropId, PropValue};
+use super::events::{EndReason, MpvEvent, PropId, PropValue};
 use super::state::{Effect, Input, MachineConfig, PlayerMachine};
 use super::tracks::{AspectMode, parse_track_list, query_stream_info};
 use super::{PlayRequest, PlayerCommand, PlayerDeps, PlayerError, PlayerErrorKind, PlayerEvent, PlayerSnapshot, PlayerState, RenderClock};
-use crate::config::{Config, SubtitleAuto};
+use crate::config::Config;
 use crate::model::{HistoryEntry, MediaRef, PlayOrigin, Playable, PlayableKind, WatchProgress};
 use crate::msg::AppEvent;
 
@@ -31,6 +32,10 @@ const PUBLISH_EVERY: Duration = Duration::from_millis(100);
 const PENDING_LOAD_MAX: Duration = Duration::from_millis(1500);
 /// No rendered frame for this long while Playing → `vid=no` (hidden window safety net).
 const SUSPEND_VIDEO_AFTER: Duration = Duration::from_secs(2);
+/// How long an END_FILE(error) during Loading waits for the log line that explains it:
+/// `mpv_wait_event` returns queued events before log messages, so ffmpeg's "HTTP error 403"
+/// (logged before the file ended) is delivered just AFTER the END_FILE.
+const END_FILE_LOG_GRACE: Duration = Duration::from_millis(200);
 
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
@@ -54,13 +59,15 @@ pub fn spawn(
         lease: None,
         lease_entry: None,
         pending: None,
-        loaded_entry: None,
+        deferred_end: None,
+        on_air: None,
         last_progress: Instant::now(),
         last_publish: Instant::now(),
         dirty: false,
         force_publish: false,
         last_second: None,
         watched_pct: cfg.player.watched_pct,
+        user_options: cfg.player.mpv_options.clone(),
         render_clock,
         epoch,
     };
@@ -84,14 +91,18 @@ struct Controller {
     /// Playlist entry the current lease belongs to (released on its END_FILE).
     lease_entry: Option<i64>,
     pending: Option<PendingLoad>,
-    /// Entry id of the last loadfile.
-    loaded_entry: Option<i64>,
+    /// END_FILE(error) (reason, error, entry) held for [`END_FILE_LOG_GRACE`], until the instant.
+    deferred_end: Option<(EndReason, i32, i64, Instant)>,
+    /// Last live channel that actually started playing (Backspace recall target).
+    on_air: Option<Arc<Playable>>,
     last_progress: Instant,
     last_publish: Instant,
     dirty: bool,
     force_publish: bool,
     last_second: Option<i64>,
     watched_pct: u8,
+    /// User `mpv_options` currently applied (ApplyConfig applies only the changed ones).
+    user_options: BTreeMap<String, String>,
     render_clock: RenderClock,
     epoch: Instant,
 }
@@ -101,11 +112,15 @@ impl Controller {
         let ticker = crossbeam_channel::tick(Duration::from_millis(250));
         loop {
             let mut state_changed = false;
+            let deferred = match &self.deferred_end {
+                Some((.., at)) => crossbeam_channel::at(*at),
+                None => crossbeam_channel::never(),
+            };
             select! {
                 recv(cmd_rx) -> cmd => match cmd {
                     Ok(PlayerCommand::Shutdown) | Err(_) => {
-                        let fx = self.machine.handle(Input::Stop, Instant::now());
-                        self.apply(fx);
+                        // the final progress save reaches the store before its writer closes
+                        self.feed(Input::Stop, Instant::now());
                         self.publish(true);
                         return;
                     }
@@ -118,6 +133,7 @@ impl Controller {
                     Ok(MpvEvent::Shutdown) | Err(_) => return,
                     Ok(ev) => state_changed |= self.mpv_event(ev),
                 },
+                recv(deferred) -> _ => state_changed |= self.flush_deferred_end(),
                 recv(ticker) -> _ => {
                     let now = Instant::now();
                     state_changed |= self.feed(Input::Tick, now);
@@ -127,7 +143,7 @@ impl Controller {
                         && matches!(self.machine.state(), PlayerState::Playing)
                     {
                         self.last_progress = now;
-                        self.save_progress();
+                        self.save_progress(self.machine.last_position());
                     }
                 },
             }
@@ -138,12 +154,16 @@ impl Controller {
     /// Feed the machine and apply effects; returns true if the state changed.
     fn feed(&mut self, input: Input, now: Instant) -> bool {
         let before = self.machine.state().clone();
+        // the machine forgets the old target's position on Play; its final save needs it
+        let pos = self.machine.last_position();
         let fx = self.machine.handle(input, now);
-        self.apply(fx);
+        self.apply(fx, pos);
         *self.machine.state() != before
     }
 
-    fn apply(&mut self, fx: Vec<Effect>) {
+    /// Execute effects in order. `pos` = position of the target that was current when the
+    /// input arrived (`SaveProgress` / `Ended` of a target that is being replaced or stopped).
+    fn apply(&mut self, fx: Vec<Effect>, pos: Option<f64>) {
         for e in fx {
             match e {
                 Effect::Load(p) => self.load(p),
@@ -155,19 +175,28 @@ impl Controller {
                         self.release_lease();
                     }
                 }
-                Effect::Emit(ev) => {
+                Effect::Emit(mut ev) => {
+                    if let PlayerEvent::Ended { finished, .. } = &mut ev {
+                        *finished = self.watched(pos.or(self.machine.last_position()));
+                    }
                     if let PlayerEvent::NowPlaying(p) = &ev {
-                        let prev = self.snap.playable.clone();
-                        if let Some(prev) = prev
-                            && prev.kind.is_live() && prev.media != p.media {
-                                self.snap.previous_live = Some(prev);
-                            }
+                        // recall = the last channel that really played, not one zapped over
+                        if let Some(prev) = &self.on_air
+                            && prev.media != p.media
+                        {
+                            self.snap.previous_live = Some(prev.clone());
+                        }
                         self.snap.playable = Some(p.clone());
                     }
                     self.deps.bus.send(AppEvent::Player(ev));
                 }
-                Effect::SaveProgress { .. } => self.save_progress(),
-                Effect::PushHistory(p) => self.push_history(&p),
+                Effect::SaveProgress { .. } => self.save_progress(pos.or(self.machine.last_position())),
+                Effect::PushHistory(p) => {
+                    if p.kind.is_live() {
+                        self.on_air = Some(p.clone());
+                    }
+                    self.push_history(&p)
+                }
                 Effect::RecordFailure(p, kind) => self.record_failure(&p, Some(kind)),
                 Effect::ClearFailure(p) => self.record_failure(&p, None),
             }
@@ -214,35 +243,39 @@ impl Controller {
             match self.budget.try_acquire(src) {
                 Ok(l) => self.lease = Some(l),
                 Err(e) => {
-                    let fx = self.machine.handle(
-                        Input::Fail(PlayerError { kind: PlayerErrorKind::Budget, message: e.to_string() }),
-                        Instant::now(),
-                    );
-                    self.apply(fx);
+                    self.feed(Input::Fail(PlayerError { kind: PlayerErrorKind::Budget, message: e.to_string() }), Instant::now());
                     return;
                 }
             }
         }
+        // extra header values are credentials (cookies, tokens): keep them out of mpv logs
+        for (_, v) in &p.headers.extra {
+            crate::redact::register_secret(v);
+        }
+        if self.snap.paused {
+            // a new play always plays (mpv's `pause` survives loadfile)
+            let _ = self.mpv.set_property("pause", false);
+        }
         self.snap.load_generation += 1;
+        // periodic progress saves count from the start of each file
+        self.last_progress = Instant::now();
         self.snap.position = None;
         self.snap.duration = p.duration_hint;
         self.snap.stream_info = None;
         self.snap.tracks = Default::default();
         self.snap.last_error = None;
-        let args = super::mpv::loadfile_args(&p);
-        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        if let Err(e) = self.mpv.command("loadfile", &refs) {
-            let err = PlayerError { kind: PlayerErrorKind::Mpv, message: crate::error::Error::from(e).to_string() };
-            let fx = self.machine.handle(Input::Fail(err), Instant::now());
-            self.apply(fx);
-            return;
-        }
-        // `loadfile … replace` rebuilt the playlist synchronously; this thread is its only writer.
-        let entry = self.mpv.get_property::<i64>("playlist/0/id").ok();
-        self.loaded_entry = entry;
+        let entry = match super::mpv::loadfile(&self.mpv, &super::mpv::loadfile_args(&p)) {
+            Ok(entry) => entry,
+            Err(e) => {
+                tracing::warn!("loadfile failed: {e}");
+                self.release_lease();
+                let err = PlayerError { kind: PlayerErrorKind::Mpv, message: format!("Playback failed ({e})") };
+                self.feed(Input::Fail(err), Instant::now());
+                return;
+            }
+        };
         self.lease_entry = entry;
-        let fx = self.machine.handle(Input::Loaded { entry }, Instant::now());
-        self.apply(fx);
+        self.feed(Input::Loaded { entry }, Instant::now());
     }
 
     fn resolve_and_play(&mut self, req: PlayRequest) -> bool {
@@ -363,25 +396,13 @@ impl Controller {
         false
     }
 
-    /// Settings changed (DESIGN §13.9): everything applies at runtime.
+    /// Settings changed (DESIGN §13.9): everything applies at runtime — the same setting list
+    /// as at init (`mpv::runtime_settings`) plus changed raw `mpv_options`.
     fn apply_config(&mut self, cfg: &Config) {
         self.machine.set_config(MachineConfig::from_config(cfg));
         self.watched_pct = cfg.player.watched_pct;
-        let p = &cfg.player;
-        let m = &self.mpv;
-        let readahead = if p.instant_load { 1 } else { p.cache_secs.max(1) } as i64;
-        let _ = m.set_property("hwdec", cfg.effective_hwdec().as_str());
-        let _ = m.set_property("cache-secs", readahead);
-        let _ = m.set_property("demuxer-readahead-secs", readahead);
-        let _ = m.set_property("demuxer-max-bytes", format!("{}MiB", p.demuxer_max_mib).as_str());
-        let _ = m.set_property("network-timeout", p.network_timeout_s as i64);
-        let _ = m.set_property("cache-pause-initial", if p.instant_load { "no" } else { "yes" });
-        let _ = m.set_property("alang", p.audio_langs.join(",").as_str());
-        let _ = m.set_property("slang", p.sub_langs.join(",").as_str());
-        let _ = m.set_property("subs-fallback-forced", if p.sub_auto == SubtitleAuto::Forced { "always" } else { "no" });
-        let _ = m.set_property("subs-fallback", if p.sub_auto == SubtitleAuto::Always { "yes" } else { "default" });
-        let _ = m.set_property("sub-scale", p.sub_scale);
-        let _ = m.set_property("user-agent", p.user_agent.as_str());
+        super::mpv::apply_runtime(&self.mpv, cfg, &self.user_options);
+        self.user_options = cfg.player.mpv_options.clone();
     }
 
     fn set_aspect(&mut self, a: AspectMode) {
@@ -420,6 +441,32 @@ impl Controller {
         }
     }
 
+    /// Feed an END_FILE and release the lease of the stream that just closed (starting a load
+    /// that waited for it, see [`Controller::load`]).
+    fn end_file(&mut self, reason: EndReason, error: i32, entry_id: i64) -> bool {
+        tracing::debug!("END_FILE entry {entry_id}: {reason:?} ({error}) in {:?}", self.machine.state());
+        let changed = self.feed(Input::EndFile { reason, error, entry: entry_id }, Instant::now());
+        if self.lease_entry == Some(entry_id) && reason == EndReason::Redirect {
+            // the playlist URL expanded into new entries that keep using the source
+            self.lease_entry = None;
+        } else if self.lease_entry == Some(entry_id) {
+            // the leased stream is really closed now
+            self.release_lease();
+            if let Some(pl) = self.pending.take() {
+                self.load_now(pl.playable);
+            }
+        }
+        changed
+    }
+
+    /// Process a held END_FILE (see [`END_FILE_LOG_GRACE`]); true if the state changed.
+    fn flush_deferred_end(&mut self) -> bool {
+        match self.deferred_end.take() {
+            Some((reason, error, entry_id, _)) => self.end_file(reason, error, entry_id),
+            None => false,
+        }
+    }
+
     fn mpv_event(&mut self, ev: MpvEvent) -> bool {
         let now = Instant::now();
         match ev {
@@ -427,18 +474,16 @@ impl Controller {
             MpvEvent::FileLoaded => self.feed(Input::FileLoaded, now),
             MpvEvent::PlaybackRestart => self.feed(Input::PlaybackRestart, now),
             MpvEvent::EndFile { reason, error, entry_id } => {
-                let changed = self.feed(Input::EndFile { reason, error, entry: entry_id }, now);
-                if self.lease_entry == Some(entry_id) {
-                    // the leased stream is really closed now
-                    self.release_lease();
-                    if let Some(pl) = self.pending.take() {
-                        self.load_now(pl.playable);
-                    }
+                let changed = self.flush_deferred_end();
+                if reason == EndReason::Error && matches!(self.machine.state(), PlayerState::Loading { .. }) {
+                    self.deferred_end = Some((reason, error, entry_id, now + END_FILE_LOG_GRACE));
+                    return changed;
                 }
-                changed
+                self.end_file(reason, error, entry_id) || changed
             }
             MpvEvent::Log { level, prefix, text } => {
                 if let Some(code) = http_status_in(&text) {
+                    tracing::debug!("HTTP {code} in {:?}", self.machine.state());
                     self.feed(Input::HttpStatus(code), now);
                 }
                 tracing::warn!(target: "mpv", "[{level}] {prefix}: {text}");
@@ -529,23 +574,31 @@ impl Controller {
         false
     }
 
-    fn save_progress(&mut self) {
+    /// Persist progress of the current movie/episode at `pos` (catch-up items are channel refs
+    /// and ad-hoc URLs have none, so neither gets a resume point).
+    fn save_progress(&mut self, pos: Option<f64>) {
         let Some(p) = self.snap.playable.clone() else { return };
         if !matches!(p.kind, PlayableKind::Movie | PlayableKind::Episode { .. }) {
             return;
         }
-        let (Some(item), Some(pos)) = (p.item.clone(), self.machine.last_position().or(self.snap.position)) else { return };
-        let dur = self.snap.duration;
-        let finished = dur.map(|d| d > 0.0 && pos / d * 100.0 >= self.watched_pct as f64).unwrap_or(false);
+        let (Some(item), Some(pos)) = (p.item.clone(), pos) else { return };
         self.deps.store.save_progress(WatchProgress {
             item,
             position_s: pos,
-            duration_s: dur,
+            duration_s: self.snap.duration.filter(|d| *d > 0.0),
             updated_at: crate::model::now(),
-            finished,
+            finished: self.watched(Some(pos)),
             title: p.title.clone(),
             fingerprint: Default::default(), // computed by the store
         });
+    }
+
+    /// `pos` reached the watched threshold (`watched_pct` of a known duration).
+    fn watched(&self, pos: Option<f64>) -> bool {
+        match (pos, self.snap.duration) {
+            (Some(pos), Some(d)) if d > 0.0 => pos / d * 100.0 >= self.watched_pct as f64,
+            _ => false,
+        }
     }
 
     fn push_history(&mut self, p: &Playable) {
@@ -583,17 +636,38 @@ impl Controller {
     }
 }
 
-/// Extract an HTTP status from an ffmpeg/mpv log line ("HTTP error 404 Not Found").
+/// Extract an HTTP status from an ffmpeg/mpv log line: ffmpeg's http protocol logs
+/// "HTTP error 404 Not Found", and its error strings read "Server returned 403 Forbidden
+/// (access denied)" or, for statuses without a dedicated code, "Server returned 4XX Client
+/// Error, but not one of 40{0,1,3,4}" / "Server returned 5XX Server Error reply" (mapped to
+/// 400 / 500).
 pub fn http_status_in(text: &str) -> Option<u16> {
-    let i = text.find("HTTP error ")?;
-    text[i + 11..].get(..3)?.parse().ok()
+    for marker in ["HTTP error ", "Server returned "] {
+        if let Some(i) = text.find(marker) {
+            let code = text[i + marker.len()..].get(..3)?;
+            return match code {
+                "4XX" => Some(400),
+                "5XX" => Some(500),
+                _ => code.parse().ok().filter(|c| (100..600).contains(c)),
+            };
+        }
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
+    use super::http_status_in;
+
     #[test]
     fn http_status_parse() {
-        assert_eq!(super::http_status_in("http: HTTP error 403 Forbidden"), Some(403));
-        assert_eq!(super::http_status_in("nothing"), None);
+        assert_eq!(http_status_in("http: HTTP error 403 Forbidden"), Some(403));
+        assert_eq!(http_status_in("Failed to open http://h/x: Server returned 404 Not Found"), Some(404));
+        assert_eq!(http_status_in("Server returned 401 Unauthorized (authorization failed)"), Some(401));
+        assert_eq!(http_status_in("Server returned 4XX Client Error, but not one of 40{0,1,3,4}"), Some(400));
+        assert_eq!(http_status_in("Server returned 5XX Server Error reply"), Some(500));
+        assert_eq!(http_status_in("HTTP error 12"), None);
+        assert_eq!(http_status_in("HTTP error abc"), None);
+        assert_eq!(http_status_in("nothing"), None);
     }
 }
