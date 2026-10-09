@@ -24,6 +24,12 @@
 //!
 //! Printable symbols (`?`, `/`, `[`, `F`) are matched against `egui::Event::Text` (layout
 //! independent, shift already applied); named keys and Ctrl/Alt chords against `Event::Key`.
+//!
+//! Caller contract (`App::raw_input_hook`): egui-winit suppresses the `Event::Text` of Ctrl/Cmd
+//! chords but NOT of Alt chords, so Alt+1 arrives as `Key{Num1, alt}` (→ `GoHome`) followed by
+//! `Text("1")` (→ `Digit(1)` in the guide, `FilterInput('1')` in a list). When a Key event with
+//! `alt` resolves to an action, the hook must also drop the `Text` event that immediately
+//! follows it. `resolve` is per-event and cannot see that pairing.
 
 use eframe::egui::{self, Key};
 
@@ -676,12 +682,13 @@ fn find(tables: &[&'static [Binding]], ev: &egui::Event) -> Option<Action> {
     tables.iter().find_map(|t| t.iter().find(|bd| bd.chord.matches(ev)).map(|bd| bd.action))
 }
 
+/// F1…F35.
+fn is_fkey(key: Key) -> bool { key.name().strip_prefix('F').is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) }
+
 /// Ctrl/Alt chord or F-key: the only events a focused text field lets through (to `Global`).
 fn is_chord_or_fkey(ev: &egui::Event) -> bool {
     match ev {
-        egui::Event::Key { key, modifiers, .. } => {
-            modifiers.ctrl || modifiers.alt || modifiers.command || key.name().starts_with('F') && key.name().len() > 1 && key.name()[1..].chars().all(|c| c.is_ascii_digit())
-        }
+        egui::Event::Key { key, modifiers, .. } => modifiers.ctrl || modifiers.alt || modifiers.command || is_fkey(*key),
         _ => false,
     }
 }
@@ -771,6 +778,10 @@ const HINTS: &[(KeyContext, &[(Action, &str)])] = &[
     ),
     (KeyContext::Panel, &[(A::Activate, "toggle"), (A::MoveUp, "reorder"), (A::ContextMenu, "more"), (A::ToggleHelp, "help")]),
     (KeyContext::EpgMapping, &[(A::Activate, "assign"), (A::ClearEpg, "clear")]),
+    (KeyContext::NumericEntry, &[(A::Activate, "go"), (A::FilterBackspace, "delete"), (A::Back, "cancel")]),
+    (KeyContext::Search, &[(A::Activate, "open"), (A::ActivateAlt, "details"), (A::FocusNext, "section"), (A::Back, "close")]),
+    (KeyContext::TextInput, &[(A::Activate, "confirm"), (A::FocusNext, "next field"), (A::Back, "leave")]),
+    (KeyContext::Modal, &[(A::Activate, "confirm"), (A::Back, "cancel")]),
 ];
 
 /// Status-bar hint line for the innermost context that has hints, e.g.
@@ -891,6 +902,22 @@ mod tests {
         let h = hint_line(&[K::List]);
         assert!(h.starts_with("Enter play"), "{h}");
         assert!(h.contains("Ctrl+F fav"), "{h}");
+    }
+
+    #[test]
+    fn every_hint_verb_finds_its_key() {
+        for (ctx, items) in HINTS {
+            let line = hint_line(&[*ctx]);
+            assert_eq!(line.split(" · ").count(), items.len(), "{ctx:?}: {line}");
+        }
+        assert_eq!(hint_line(&[K::TextInput, K::Modal]), "Enter confirm · Tab next field · Esc leave");
+        assert_eq!(hint_line(&[K::PlayerLive]), "", "no hint line in the player (no status bar)");
+    }
+
+    #[test]
+    fn fkeys() {
+        assert!(is_fkey(Key::F1) && is_fkey(Key::F11) && is_fkey(Key::F35));
+        assert!(!is_fkey(Key::F) && !is_fkey(Key::Enter));
     }
 
     #[test]

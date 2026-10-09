@@ -1,11 +1,17 @@
 //! Left navigation (Home, Live TV, Guide, Movies, Series · Search · Settings). Expanded (glyph +
 //! label, 184 pt) / rail (glyph only, 48 pt) / hidden (Compact). Current item = selected fill +
 //! accent text; hover = fg@0.08. Shows Movies/Series only when some source provides them.
-//! Implemented (basic) in the skeleton; WP-10a owns polish (tooltips on rail, focus ring).
+//! Owner: WP-10a.
+//!
+//! **Top glyph strip** (Compact below 480·rem, where `layout::sidebar_width` is 0): call
+//! [`sidebar`] inside a horizontal layout (e.g. `ui.horizontal(|ui| sidebar(ui, …))` in a top
+//! panel of height `ControlHeight + Md`); it then draws the same entries as a row of glyph
+//! buttons with tooltips, so Compact keeps mouse navigation.
 
-use eframe::egui::{self, RichText, Sense};
+use eframe::egui::{self, Align2, RichText, Sense};
 
-use super::glyphs;
+use super::list::paint_row_state;
+use super::{RowState, glyphs, paint};
 use crate::theme::{SpaceToken, Theme, TypeToken};
 use crate::ui::ScreenId;
 
@@ -24,55 +30,83 @@ pub const ITEMS: &[SidebarItem] = &[
     SidebarItem { id: ScreenId::Settings, glyph: glyphs::SETTINGS, label: "Settings" },
 ];
 
+/// Pseudo-entry for the search button (drawn before Settings).
+const SEARCH: SidebarItem = SidebarItem { id: ScreenId::Home, glyph: glyphs::SEARCH, label: "Search" };
+
+/// Whether `current` highlights entry `id` (detail pages belong to their grid).
+fn is_current(id: ScreenId, current: ScreenId) -> bool {
+    current == id || (id == ScreenId::Movies && current == ScreenId::MovieDetail) || (id == ScreenId::Series && current == ScreenId::SeriesDetail)
+}
+
+/// The visible entries in order; `None` marks the search button.
+fn entries(has_vod: bool) -> impl Iterator<Item = Option<&'static SidebarItem>> {
+    ITEMS
+        .iter()
+        .filter(move |it| has_vod || !matches!(it.id, ScreenId::Movies | ScreenId::Series))
+        .flat_map(|it| (it.id == ScreenId::Settings).then_some(None).into_iter().chain([Some(it)]))
+}
+
+/// One entry: `size` rect, glyph (+ label when `expanded`), tooltip otherwise. Returns clicked.
+fn entry(ui: &mut egui::Ui, theme: &Theme, it: &SidebarItem, size: egui::Vec2, expanded: bool, selected: bool) -> bool {
+    let t = &theme.tokens;
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, it.label));
+    if ui.is_rect_visible(rect) {
+        paint_row_state(ui.painter(), rect, theme, RowState::from_flags(resp.hovered(), selected));
+        let color = if selected || resp.hovered() { t.list_cursor_text } else { t.fg };
+        let icon_font = paint::font(theme, TypeToken::IconLarge);
+        if expanded {
+            let pad = theme.space(SpaceToken::RowPaddingX);
+            ui.painter().text(rect.left_center() + egui::vec2(pad, 0.0), Align2::LEFT_CENTER, it.glyph, icon_font, color);
+            let x = pad + theme.font(TypeToken::IconLarge) + theme.space(SpaceToken::ControlGap);
+            paint::text(ui.painter(), rect.left_center() + egui::vec2(x, 0.0), Align2::LEFT_CENTER, it.label, paint::medium(ui.ctx(), theme, TypeToken::Title), color, (rect.width() - x - pad).max(0.0));
+        } else {
+            ui.painter().text(rect.center(), Align2::CENTER_CENTER, it.glyph, icon_font, color);
+        }
+    }
+    let resp = if expanded { resp } else { resp.on_hover_text(RichText::new(it.label).size(theme.font(TypeToken::BodySmall))) };
+    resp.clicked()
+}
+
 /// Draw; returns the clicked item. `search_clicked` is set when the search entry is clicked.
 pub fn sidebar(ui: &mut egui::Ui, theme: &Theme, current: ScreenId, expanded: bool, has_vod: bool, search_clicked: &mut bool) -> Option<ScreenId> {
-    let t = &theme.tokens;
+    let side = theme.space(SpaceToken::ControlHeight) + theme.space(SpaceToken::Md);
+    let strip = ui.layout().main_dir().is_horizontal();
     let mut clicked = None;
-    let row_h = theme.space(SpaceToken::ControlHeight) + theme.space(SpaceToken::Md);
-    ui.add_space(theme.space(SpaceToken::PanelPadding));
-    let item = |ui: &mut egui::Ui, glyph: &str, label: &str, selected: bool| -> bool {
-        let w = ui.available_width();
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, row_h), Sense::click());
-        let fill = if selected { t.fill_selected } else if resp.hovered() { t.fill_hover } else { egui::Color32::TRANSPARENT };
-        ui.painter().rect_filled(rect, t.rounding, fill);
-        let color = if selected || resp.hovered() { t.list_cursor_text } else { t.fg };
-        let pad = theme.space(SpaceToken::RowPaddingX);
-        ui.painter().text(
-            rect.left_center() + egui::vec2(pad, 0.0),
-            egui::Align2::LEFT_CENTER,
-            glyph,
-            egui::FontId::proportional(theme.font(TypeToken::IconLarge)),
-            color,
-        );
-        if expanded {
-            ui.painter().text(
-                rect.left_center() + egui::vec2(pad + theme.font(TypeToken::IconLarge) + theme.space(SpaceToken::ControlGap), 0.0),
-                egui::Align2::LEFT_CENTER,
-                label,
-                egui::FontId::new(theme.font(TypeToken::Title), egui::FontFamily::Name(crate::theme::egui_style::FAMILY_MEDIUM.into())),
-                color,
-            );
-        } else {
-            resp.clone().on_hover_text(RichText::new(label).size(theme.font(TypeToken::BodySmall)));
-        }
-        resp.clicked()
-    };
-    for it in ITEMS {
-        if !has_vod && matches!(it.id, ScreenId::Movies | ScreenId::Series) {
-            continue;
-        }
-        if it.id == ScreenId::Settings {
-            ui.add_space(theme.space(SpaceToken::PanelGap));
-            if item(ui, glyphs::SEARCH, "Search", false) {
-                *search_clicked = true;
+    if !strip {
+        ui.add_space(theme.space(SpaceToken::PanelPadding));
+    }
+    for e in entries(has_vod) {
+        let it = e.unwrap_or(&SEARCH);
+        if strip {
+            if e.is_none() {
+                ui.add_space(theme.space(SpaceToken::Lg));
             }
+        } else if e.is_none() {
+            ui.add_space(theme.space(SpaceToken::PanelGap));
         }
-        let selected = current == it.id
-            || (it.id == ScreenId::Movies && current == ScreenId::MovieDetail)
-            || (it.id == ScreenId::Series && current == ScreenId::SeriesDetail);
-        if item(ui, it.glyph, it.label, selected) {
-            clicked = Some(it.id);
+        let size = if strip { egui::vec2(side, side) } else { egui::vec2(ui.available_width(), side) };
+        let selected = e.is_some_and(|it| is_current(it.id, current));
+        if entry(ui, theme, it, size, expanded && !strip, selected) {
+            match e {
+                Some(it) => clicked = Some(it.id),
+                None => *search_clicked = true,
+            }
         }
     }
     clicked
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vod_entries_hide_without_vod_and_search_precedes_settings() {
+        let labels = |vod| entries(vod).map(|e| e.map_or("Search", |it| it.label)).collect::<Vec<_>>();
+        assert_eq!(labels(true), ["Home", "Live TV", "Guide", "Movies", "Series", "Search", "Settings"]);
+        assert_eq!(labels(false), ["Home", "Live TV", "Guide", "Search", "Settings"]);
+        assert!(is_current(ScreenId::Movies, ScreenId::MovieDetail));
+        assert!(!is_current(ScreenId::Live, ScreenId::Guide));
+    }
 }
