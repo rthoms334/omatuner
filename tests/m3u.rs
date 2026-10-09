@@ -363,12 +363,76 @@ fn directives_headers_and_precedence() {
         user_agent: s("pipe-ua"),
         referrer: s("http://attr/"),
         origin: s("http://o/"),
-        extra: kv(&[("X-Token", "def"), ("Cookie", "a=b")]),
+        extra: kv(&[("Cookie", "a=b"), ("X-Token", "def")]),
     });
     assert_eq!(e[0].url, "http://h/one");
     assert_eq!(e[1].headers, HttpHeaders { user_agent: s("only-attr"), ..Default::default() });
     assert!(!e[1].drm && e[2].drm && !e[3].drm, "DRM flag applies to its own entry only");
     assert!(e[3].headers.is_empty());
+
+    // #KODIPROP beats #EXTVLCOPT whatever their order in the file
+    let text = "#EXTM3U\n#EXTINF:-1,A\n\
+        #KODIPROP:inputstream.adaptive.stream_headers=User-Agent=kodi\n#EXTVLCOPT:http-user-agent=vlc\nhttp://h/a\n";
+    let (_, e) = parse_bytes(text.as_bytes());
+    assert_eq!(e[0].headers.user_agent.as_deref(), Some("kodi"));
+}
+
+#[test]
+fn url_line_with_only_pipe_headers_is_an_error_not_the_playlist_url() {
+    let base = Url::parse("http://h/get.php?username=u&password=SECRETPW").unwrap();
+    let text = "#EXTM3U\n#EXTINF:-1,A\n#EXTVLCOPT:http-user-agent=vlc\n|User-Agent=x\n#EXTINF:-1,B\nhttp://h/b\n";
+    let mut p = m3u::parse(Cursor::new(text), Some(&base)).unwrap();
+    assert!(matches!(p.next(), Some(Err(Error::Parse { line: Some(4), .. }))));
+    let b = p.next().unwrap().unwrap();
+    assert_eq!((b.title.as_str(), b.url.as_str()), ("B", "http://h/b"));
+    assert!(b.headers.is_empty(), "the dropped entry's directives do not leak into the next one");
+    assert!(p.next().is_none());
+}
+
+#[test]
+fn header_catchup_fields_without_a_kind_are_inherited() {
+    let text = "#EXTM3U catchup-days=\"7\" catchup-correction=\"1\"\n\
+        #EXTINF:-1 catchup=\"default\" catchup-source=\"?utc={utc}\",A\nhttp://h/a\n\
+        #EXTINF:-1 catchup=\"xc\" catchup-days=\"2\",B\nhttp://h/b\n\
+        #EXTINF:-1,C\nhttp://h/c\n";
+    let (h, e) = parse_bytes(text.as_bytes());
+    assert_eq!(h.catchup, None, "no kind in the header: nothing to show there");
+    assert_eq!(e[0].catchup, Some(CatchupSpec { kind: CatchupKind::Default, template: s("?utc={utc}"), days: 7, correction_s: 3600 }));
+    assert_eq!(e[1].catchup, Some(CatchupSpec { kind: CatchupKind::Xc, template: None, days: 2, correction_s: 3600 }));
+    assert_eq!(e[2].catchup, None, "header fields alone do not enable an archive");
+
+    // a repeated header fills what is still unset, it never overrides
+    let text = "#EXTM3U catchup-days=\"7\"\n#EXTM3U catchup=\"shift\" catchup-days=\"1\"\n#EXTINF:-1,A\nhttp://h/a\n";
+    let (h, e) = parse_bytes(text.as_bytes());
+    assert_eq!(h.catchup, spec(CatchupKind::Shift, 7));
+    assert_eq!(e[0].catchup, spec(CatchupKind::Shift, 7));
+}
+
+#[test]
+fn hostile_lines_parse_in_linear_time() {
+    // ~1 MiB of unbalanced quotes (no plausible closing quote anywhere)
+    let mut quotes = String::from("#EXTM3U\n#EXTINF:-1 ");
+    while quotes.len() < 1_000_000 {
+        quotes.push_str("k=\"v ");
+    }
+    quotes.push_str(",Quotes\nhttp://h/q\n");
+    // ~1 MiB of distinct keys
+    let mut keys = String::from("#EXTM3U\n#EXTINF:-1 ");
+    let mut n = 0;
+    while keys.len() < 1_000_000 {
+        keys.push_str(&format!("k{n}=v "));
+        n += 1;
+    }
+    keys.push_str(",Keys\nhttp://h/k\n");
+    for (text, title) in [(&quotes, "Quotes"), (&keys, "Keys")] {
+        let started = std::time::Instant::now();
+        let (_, e) = parse_bytes(text.as_bytes());
+        // Quadratic took minutes here; linear is milliseconds even unoptimised.
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{title}: {:?}", started.elapsed());
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].title, title, "the title comma is still found");
+        assert!(e[0].attrs.len() <= 256, "{title}: {} attributes kept", e[0].attrs.len());
+    }
 }
 
 #[test]

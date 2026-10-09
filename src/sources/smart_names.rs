@@ -144,8 +144,9 @@ const COUNTRY3: &[&str] = &[
     "omn", "yem", "sau", "som", "eth", "ken", "gha", "cmr", "sen", "civ", "hin", "urd", "tam", "tel", "fre", "dut", "chi", "jap", "rum", "fil",
 ];
 
-/// Separators that are noise when left dangling at either end.
-fn is_separator(w: &str) -> bool { !w.is_empty() && w.chars().all(|c| matches!(c, '|' | '-' | '–' | '—' | ':' | '·' | '•' | '/' | '~' | '*' | '+' | '_')) }
+/// Separators that are noise when left dangling at either end. Not `+`: `Canal +` and
+/// `Disney +` are channels of their own.
+fn is_separator(w: &str) -> bool { !w.is_empty() && w.chars().all(|c| matches!(c, '|' | '-' | '–' | '—' | ':' | '·' | '•' | '/' | '~' | '*' | '_')) }
 
 fn quality_of(w: &str) -> Option<Quality> {
     let w = w.trim();
@@ -378,9 +379,16 @@ fn clean(raw: &str, vod: bool) -> Cleaned<'_> {
     out
 }
 
-/// Title-case an all-caps name, keeping short acronyms and lower-casing joining words.
+/// Title-case an all-caps name, keeping acronyms and lower-casing joining words. Acronyms are
+/// two-letter words (`TV`, `UK`) that are not common words, letter+digit words (`F1`, `MBC1`)
+/// and a list of well-known longer ones; everything else (`NEW`, `ALL`, `TOP`) is a word.
 fn title_case(s: &str) -> String {
     const SMALL: &[&str] = &["and", "the", "for", "of", "in", "on", "at", "to", "by", "with", "a", "an", "or", "de", "la", "le", "et"];
+    const WORDS2: &[&str] = &["my", "go", "up", "no", "so", "do", "be", "he", "if", "is", "it", "we", "me"];
+    const ACRONYMS: &[&str] = &[
+        "nfl", "nba", "nhl", "mlb", "mls", "ufc", "wwe", "bbc", "itv", "hbo", "mtv", "cnn", "espn", "ppv", "vod", "usa", "vip", "xxx", "rtl",
+        "ard", "zdf", "dazn", "bt", "mbc", "osn", "tnt", "amc", "abc", "nbc", "cbs", "fox", "pbs", "dstv", "iptv",
+    ];
     let mut out = String::with_capacity(s.len());
     for (i, w) in s.split(' ').enumerate() {
         if i > 0 {
@@ -388,9 +396,13 @@ fn title_case(s: &str) -> String {
         }
         let lower = w.to_lowercase();
         let letters = w.chars().filter(|c| c.is_alphabetic()).count();
+        let digits = w.chars().any(|c| c.is_ascii_digit());
+        let core = lower.trim_matches(|c: char| !c.is_alphanumeric());
+        let acronym = !SMALL.contains(&core)
+            && ((letters == 2 && !digits && !WORDS2.contains(&core)) || (digits && letters <= 3) || ACRONYMS.contains(&core));
         if i > 0 && SMALL.contains(&lower.as_str()) {
             out.push_str(&lower);
-        } else if letters <= 3 && !SMALL.contains(&lower.as_str()) {
+        } else if acronym || letters == 0 {
             out.push_str(w);
         } else {
             let mut chars = lower.chars();
@@ -460,5 +472,21 @@ mod tests {
         assert_eq!(clean_group_name("Documentaries"), "Documentaries");
         assert_eq!(clean_group_name("  "), "");
         assert_eq!(clean_group_name("ÉMISSIONS"), "Émissions");
+        // short words are words, not acronyms, unless they look like one
+        assert_eq!(clean_group_name("NEW RELEASES"), "New Releases");
+        assert_eq!(clean_group_name("ALL MOVIES"), "All Movies");
+        assert_eq!(clean_group_name("TOP 100"), "Top 100");
+        assert_eq!(clean_group_name("MY LIST"), "My List");
+        assert_eq!(clean_group_name("F1 & MOTOGP"), "F1 & Motogp");
+        assert_eq!(clean_group_name("BBC CHANNELS (UK)"), "BBC Channels (UK)");
+        assert_eq!(clean_group_name("ESPN PPV EVENTS"), "ESPN PPV Events");
+    }
+
+    #[test]
+    fn plus_is_part_of_the_name() {
+        assert_eq!(ch("Canal +").0, "Canal +");
+        assert_eq!(ch("CANAL + HD"), ("CANAL +".into(), None, Some(Quality::Hd), vec![]));
+        assert_eq!(ch("FR: Disney + 4K").0, "Disney +");
+        assert_eq!(ch("UK | BBC One |").0, "BBC One");
     }
 }

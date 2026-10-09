@@ -19,17 +19,20 @@
 //! * The first meaningful line decides the payload: `#EXTM3U`, `#EXTINF` or a `scheme://` URL
 //!   is a playlist; anything else (including an empty payload) is `NotM3u(kind)` with `kind`
 //!   from [`super::sniff_payload`], so an expired account never imports as an empty list.
-//! * Iterator errors: `Error::Parse` for a malformed entry (an `#EXTINF` without URL, a line
-//!   over 1 MiB) — skip it and keep going; `Error::Io` when reading fails — the iterator ends
+//! * Iterator errors: `Error::Parse` for a malformed entry (an `#EXTINF` without URL, a URL
+//!   line that is only pipe headers, a line over 1 MiB) — skip it and keep going; `Error::Io` when reading fails — the iterator ends
 //!   after it and the import must be aborted (never sweep a half-read playlist).
 //! * `#EXTGRP` is sticky until an empty `#EXTGRP:` (also for bare URL entries); an entry's
 //!   `group-title` overrides it. `#EXTVLCOPT` / `#KODIPROP` lines apply to the next entry
 //!   whether they come before or after its `#EXTINF`.
 //! * Header precedence (low → high): EXTINF `http-*` attributes, `#EXTVLCOPT`, `#KODIPROP
-//!   …stream_headers`, pipe headers.
+//!   …stream_headers`, pipe headers (file order within each kind).
 //! * Header defaults are inherited by entries: `tvg-shift` and catch-up (per field, see
-//!   [`catchup_from_attrs`]). A repeated `#EXTM3U` (concatenated lists) adds its `url-tvg`
-//!   URLs and fills header fields that are still unset.
+//!   [`catchup_from_attrs`]; a header `catchup-days` / `catchup-correction` without a kind still
+//!   applies to entries that name one). A repeated `#EXTM3U` (concatenated lists) adds its
+//!   `url-tvg` URLs and fills header fields that are still unset.
+//! * At most 256 attributes are kept per line (later new keys are ignored), so hostile lines
+//!   stay linear to parse.
 //! * Relative `tvg-logo` values are resolved against `base` like stream URLs (`attrs` keep the
 //!   raw text).
 
@@ -94,6 +97,10 @@ pub enum M3uError {
 /// Longest line kept in memory; longer lines are skipped and reported (`Error::Parse`).
 const MAX_LINE: usize = 1 << 20;
 
+/// Most attributes kept per `#EXTINF` / `#EXTM3U` line, and header attributes / XMLTV URLs in
+/// total. Real playlists use a handful; the cap keeps hostile lines linear.
+const MAX_ATTRS: usize = 256;
+
 /// Archive window when an entry names a catch-up kind but no window at all (Kodi's default).
 const DEFAULT_CATCHUP_DAYS: u32 = 5;
 
@@ -117,6 +124,8 @@ pub struct M3uParser<R: BufRead> {
     reader: R,
     base: Option<Url>,
     header: M3uHeader,
+    /// Header catch-up fields, also those `header.catchup` cannot show (days without a kind).
+    catchup_defaults: CatchupFields,
     /// Physical lines read so far (= 1-based number of the current line).
     line_no: u64,
     bytes_read: u64,
@@ -128,8 +137,10 @@ pub struct M3uParser<R: BufRead> {
     skip_lf: bool,
     header_seen: bool,
     pending: Option<PendingInf>,
-    /// Headers from `#EXTVLCOPT` / `#KODIPROP` since the last entry, in file order.
-    directive_headers: Vec<(String, String)>,
+    /// Headers from `#EXTVLCOPT` since the last entry, in file order.
+    vlc_headers: Vec<(String, String)>,
+    /// Headers from `#KODIPROP …_headers` since the last entry (applied after `vlc_headers`).
+    kodi_headers: Vec<(String, String)>,
     directive_drm: bool,
     /// Sticky `#EXTGRP` groups.
     current_extgrp: Vec<String>,
@@ -145,6 +156,7 @@ pub fn parse<R: BufRead>(reader: R, base: Option<&Url>) -> std::result::Result<M
         reader,
         base: base.cloned(),
         header: M3uHeader::default(),
+        catchup_defaults: CatchupFields::default(),
         line_no: 0,
         bytes_read: 0,
         buf: Vec::with_capacity(512),
@@ -152,7 +164,8 @@ pub fn parse<R: BufRead>(reader: R, base: Option<&Url>) -> std::result::Result<M
         skip_lf: false,
         header_seen: false,
         pending: None,
-        directive_headers: Vec::new(),
+        vlc_headers: Vec::new(),
+        kodi_headers: Vec::new(),
         directive_drm: false,
         current_extgrp: Vec::new(),
         ready: None,
@@ -279,7 +292,7 @@ impl<R: BufRead> M3uParser<R> {
     /// (URL line) or reveals a malformed one.
     fn handle_line(&mut self, line: &str) -> Option<Result<M3uEntry>> {
         if !line.starts_with('#') {
-            return Some(Ok(self.make_entry(line)));
+            return Some(self.make_entry(line));
         }
         if let Some(rest) = strip_prefix_ci(line, "#EXTINF") {
             let rest = rest.strip_prefix(':').unwrap_or(rest);
@@ -300,7 +313,7 @@ impl<R: BufRead> M3uParser<R> {
                     "http-cookie" => "Cookie",
                     _ => return None, // player options (network-caching, http-reconnect…)
                 };
-                self.directive_headers.push((name.to_owned(), v.trim().to_owned()));
+                self.vlc_headers.push((name.to_owned(), v.trim().to_owned()));
             }
         } else if let Some(rest) = strip_prefix_ci(line, "#KODIPROP:")
             && let Some((k, v)) = rest.split_once('=')
@@ -308,7 +321,7 @@ impl<R: BufRead> M3uParser<R> {
             match k.trim().to_ascii_lowercase().as_str() {
                 "inputstream.adaptive.license_type" | "inputstream.adaptive.license_key" => self.directive_drm = true,
                 "inputstream.adaptive.stream_headers" | "inputstream.adaptive.common_headers" | "inputstream.adaptive.manifest_headers" => {
-                    self.directive_headers.extend(split_header_pairs(v));
+                    self.kodi_headers.extend(split_header_pairs(v));
                 }
                 _ => {}
             }
@@ -323,7 +336,7 @@ impl<R: BufRead> M3uParser<R> {
         for (k, v) in &attrs {
             if TVG_URL_KEYS.contains(&k.as_str()) {
                 for u in v.split(',').map(str::trim).filter(|u| !u.is_empty()) {
-                    if !h.tvg_urls.iter().any(|x| x == u) {
+                    if h.tvg_urls.len() < MAX_ATTRS && !h.tvg_urls.iter().any(|x| x == u) {
                         h.tvg_urls.push(u.to_owned());
                     }
                 }
@@ -331,21 +344,37 @@ impl<R: BufRead> M3uParser<R> {
                 if h.tvg_shift_h.is_none() {
                     h.tvg_shift_h = parse_shift_h(v);
                 }
-            } else if !CATCHUP_KEYS.contains(&k.as_str()) && !h.attrs.iter().any(|(hk, _)| hk == k) {
+            } else if !CATCHUP_KEYS.contains(&k.as_str()) && h.attrs.len() < MAX_ATTRS && !h.attrs.iter().any(|(hk, _)| hk == k) {
                 h.attrs.push((k.clone(), v.clone()));
             }
         }
-        if h.catchup.is_none() {
-            h.catchup = catchup_from_attrs(&attrs, None);
+        if let Some(fields) = CatchupFields::from_attrs(&attrs) {
+            self.catchup_defaults.fill(fields);
         }
+        self.header.catchup = CatchupFields::default().resolve(&self.catchup_defaults);
         self.header_seen = true;
     }
 
-    fn make_entry(&mut self, url_line: &str) -> M3uEntry {
+    /// Forget the entry being assembled (its `#EXTINF` and directives).
+    fn drop_pending(&mut self) {
+        self.pending = None;
+        self.vlc_headers.clear();
+        self.kodi_headers.clear();
+        self.directive_drm = false;
+    }
+
+    fn make_entry(&mut self, url_line: &str) -> Result<M3uEntry> {
+        let (raw_url, pipe) = split_pipe_headers(url_line);
+        if raw_url.is_empty() {
+            // `|User-Agent=x` alone: resolving "" would yield the playlist URL itself, which
+            // may carry the account's credentials.
+            self.drop_pending();
+            return Err(Error::parse(Some(self.line_no), "entry has an empty stream URL"));
+        }
         let inf = self.pending.take();
         let drm = std::mem::take(&mut self.directive_drm);
-        let directive_headers = std::mem::take(&mut self.directive_headers);
-        let (raw_url, pipe) = split_pipe_headers(url_line);
+        let vlc_headers = std::mem::take(&mut self.vlc_headers);
+        let kodi_headers = std::mem::take(&mut self.kodi_headers);
         let url = self.resolve(&raw_url).into_owned();
         let (attrs, title) = inf.map(|p| (p.attrs, p.title)).unwrap_or_default();
         let get = |key: &str| attr(&attrs, key).filter(|v| !v.is_empty()).map(str::to_owned);
@@ -356,7 +385,7 @@ impl<R: BufRead> M3uParser<R> {
                 apply_header(&mut headers, name, v);
             }
         }
-        for (name, v) in directive_headers.iter().chain(pipe.iter()) {
+        for (name, v) in vlc_headers.iter().chain(&kodi_headers).chain(&pipe) {
             apply_header(&mut headers, name, v);
         }
 
@@ -375,14 +404,14 @@ impl<R: BufRead> M3uParser<R> {
         let tvg_logo = get("tvg-logo").map(|l| self.resolve(&l).into_owned());
         let radio = attr(&attrs, "radio").is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
             || attr(&attrs, "tvg-type").is_some_and(|v| v.eq_ignore_ascii_case("radio"));
-        M3uEntry {
+        Ok(M3uEntry {
             line: self.line_no,
             tvg_id: get("tvg-id"),
             tvg_logo,
             tvg_chno: attr(&attrs, "tvg-chno").and_then(|v| v.parse().ok()),
             groups,
             tvg_shift_h: attr(&attrs, "tvg-shift").and_then(parse_shift_h).or(self.header.tvg_shift_h),
-            catchup: catchup_from_attrs(&attrs, self.header.catchup.as_ref()),
+            catchup: CatchupFields::from_attrs(&attrs).and_then(|f| f.resolve(&self.catchup_defaults)),
             headers,
             radio,
             drm,
@@ -390,7 +419,7 @@ impl<R: BufRead> M3uParser<R> {
             title,
             tvg_name,
             attrs,
-        }
+        })
     }
 
     /// Resolve a relative reference against the playlist URL; anything with a scheme (or no
@@ -431,9 +460,7 @@ impl<R: BufRead> Iterator for M3uParser<R> {
             if self.overlong {
                 // Most likely the URL of the pending entry: drop the whole entry rather than
                 // attaching its #EXTINF to the next URL.
-                self.pending = None;
-                self.directive_headers.clear();
-                self.directive_drm = false;
+                self.drop_pending();
                 return Some(Err(Error::parse(Some(self.line_no), "line longer than 1 MiB skipped")));
             }
             let buf = std::mem::take(&mut self.buf);
@@ -471,6 +498,7 @@ fn tokenize(s: &str, title_comma: bool) -> (Vec<(String, String)>, String) {
     let ends_word = |c: u8| c.is_ascii_whitespace() || (title_comma && c == b',');
     let mut attrs: Vec<(String, String)> = Vec::new();
     let mut bare: Vec<&str> = Vec::new();
+    let mut no_close_from = [usize::MAX; 2];
     let mut i = 0;
     loop {
         while i < n && b[i].is_ascii_whitespace() {
@@ -488,11 +516,15 @@ fn tokenize(s: &str, title_comma: bool) -> (Vec<(String, String)>, String) {
         }
         if i < n && b[i] == b'=' && i > ks {
             let key = s[ks..i].to_ascii_lowercase();
-            let (value, next) = read_value(s, i + 1, title_comma);
+            let (value, next) = read_value(s, i + 1, title_comma, &mut no_close_from);
             i = next;
+            let full = attrs.len() >= MAX_ATTRS;
             match attrs.iter_mut().find(|(k, _)| *k == key) {
                 Some(slot) => slot.1 = value,
-                None => attrs.push((key, value)),
+                // Past the cap keep tokenizing (the title comma must still be found) but stop
+                // storing, so the duplicate lookup stays bounded on hostile lines.
+                None if !full => attrs.push((key, value)),
+                None => {}
             }
         } else {
             // A word that is not `key=value` (title text when the comma is missing).
@@ -508,8 +540,9 @@ fn tokenize(s: &str, title_comma: bool) -> (Vec<(String, String)>, String) {
 /// Read an attribute value starting at `i` (just after `=`). Returns (trimmed value, index
 /// after it). A quote closes the value only when followed by the end, a comma, or whitespace
 /// and then a comma / the end / another `key=` — so stray inner quotes survive
-/// (`tvg-name="The "Best" One"`).
-fn read_value(s: &str, i: usize, title_comma: bool) -> (String, usize) {
+/// (`tvg-name="The "Best" One"`). `no_close_from` (per quote char, one per line) is the earliest
+/// position known to have no plausible closing quote after it.
+fn read_value(s: &str, i: usize, title_comma: bool, no_close_from: &mut [usize; 2]) -> (String, usize) {
     let b = s.as_bytes();
     let n = b.len();
     let scan_word = |from: usize| {
@@ -521,17 +554,23 @@ fn read_value(s: &str, i: usize, title_comma: bool) -> (String, usize) {
     };
     if i < n && (b[i] == b'"' || b[i] == b'\'') {
         let q = b[i];
+        let slot = usize::from(q == b'\'');
         let vs = i + 1;
-        let mut first_close = None;
-        for (j, &c) in b.iter().enumerate().skip(vs) {
-            if c == q {
-                first_close.get_or_insert(j);
+        // Whether a quote at `j` closes a value depends on `j` alone, so once a scan from some
+        // position found none, no scan from a later one can: skip it (keeps a line full of
+        // unbalanced quotes linear instead of quadratic).
+        if vs < no_close_from[slot] {
+            let mut pos = vs;
+            while let Some(off) = memchr::memchr(q, &b[pos..]) {
+                let j = pos + off;
                 if closes_value(b, j + 1) {
                     return (s[vs..j].trim().to_owned(), j + 1);
                 }
+                pos = j + 1;
             }
+            no_close_from[slot] = vs;
         }
-        if let Some(j) = first_close {
+        if let Some(j) = memchr::memchr(q, &b[vs..]).map(|off| vs + off) {
             return (s[vs..j].trim().to_owned(), j + 1);
         }
         // Unterminated quote: behave like an unquoted value.
@@ -623,36 +662,73 @@ fn hex_val(c: u8) -> Option<u8> {
 /// defaults individually (Kodi semantics), then to 5 days / no template / no correction.
 /// `catchup-correction` is in hours (may be fractional).
 pub fn catchup_from_attrs(attrs: &[(String, String)], defaults: Option<&CatchupSpec>) -> Option<CatchupSpec> {
-    let get = |key: &str| {
-        attrs.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.trim()).filter(|v| !v.is_empty())
-    };
-    let own_kind = match get("catchup").or_else(|| get("catchup-type")) {
-        Some(v) => match super::catchup::parse_kind(v) {
-            Some(k) => Some(k),
-            None => {
-                tracing::debug!(value = v, "ignoring unknown M3U catchup type");
-                return None;
-            }
-        },
-        None => None,
-    };
-    let timeshift_days = get("timeshift").and_then(parse_days);
-    let own_days = get("catchup-days")
-        .and_then(parse_days)
-        .or(timeshift_days)
-        .or_else(|| get("tvg-rec").and_then(parse_days))
-        .or_else(|| get("catchup-time").and_then(seconds_to_days));
-    let template = get("catchup-source").map(str::to_owned);
-    let kind = own_kind
-        .or(timeshift_days.map(|_| CatchupKind::Shift))
-        .or(defaults.map(|d| d.kind))
-        .or(template.as_ref().map(|_| CatchupKind::Default))?;
-    Some(CatchupSpec {
-        kind,
-        days: own_days.or(defaults.map(|d| d.days)).unwrap_or(DEFAULT_CATCHUP_DAYS),
-        template: template.or_else(|| defaults.and_then(|d| d.template.clone())),
-        correction_s: get("catchup-correction").and_then(hours_to_secs).or(defaults.map(|d| d.correction_s)).unwrap_or(0),
-    })
+    CatchupFields::from_attrs(attrs)?.resolve(&defaults.map(CatchupFields::from_spec).unwrap_or_default())
+}
+
+/// The catch-up fields one line gives, before defaults apply. The `#EXTM3U` header keeps one of
+/// these so a header `catchup-days` / `catchup-correction` without a kind is still inherited.
+#[derive(Debug, Clone, Default)]
+struct CatchupFields {
+    /// Own `catchup` / `catchup-type`, else `Shift` when `timeshift` gives a window.
+    kind: Option<CatchupKind>,
+    days: Option<u32>,
+    template: Option<String>,
+    correction_s: Option<i64>,
+}
+
+impl CatchupFields {
+    /// `None` when the line names an unknown kind (`catchup="disabled"`): no archive at all.
+    fn from_attrs(attrs: &[(String, String)]) -> Option<Self> {
+        let get = |key: &str| {
+            attrs.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.trim()).filter(|v| !v.is_empty())
+        };
+        let own_kind = match get("catchup").or_else(|| get("catchup-type")) {
+            Some(v) => match super::catchup::parse_kind(v) {
+                Some(k) => Some(k),
+                None => {
+                    tracing::debug!(value = v, "ignoring unknown M3U catchup type");
+                    return None;
+                }
+            },
+            None => None,
+        };
+        let timeshift_days = get("timeshift").and_then(parse_days);
+        Some(Self {
+            kind: own_kind.or(timeshift_days.map(|_| CatchupKind::Shift)),
+            days: get("catchup-days")
+                .and_then(parse_days)
+                .or(timeshift_days)
+                .or_else(|| get("tvg-rec").and_then(parse_days))
+                .or_else(|| get("catchup-time").and_then(seconds_to_days)),
+            template: get("catchup-source").map(str::to_owned),
+            correction_s: get("catchup-correction").and_then(hours_to_secs),
+        })
+    }
+
+    fn from_spec(spec: &CatchupSpec) -> Self {
+        Self { kind: Some(spec.kind), days: Some(spec.days), template: spec.template.clone(), correction_s: Some(spec.correction_s) }
+    }
+
+    /// Fill the fields that are still unset (a repeated `#EXTM3U` never overrides).
+    fn fill(&mut self, other: Self) {
+        self.kind = self.kind.or(other.kind);
+        self.days = self.days.or(other.days);
+        self.template = self.template.take().or(other.template);
+        self.correction_s = self.correction_s.or(other.correction_s);
+    }
+
+    /// Apply `defaults` field by field. Kind: own → defaults' → `Default` when a template is
+    /// known; none of them → no archive.
+    fn resolve(self, defaults: &CatchupFields) -> Option<CatchupSpec> {
+        let template = self.template.or_else(|| defaults.template.clone());
+        let kind = self.kind.or(defaults.kind).or(template.as_ref().map(|_| CatchupKind::Default))?;
+        Some(CatchupSpec {
+            kind,
+            days: self.days.or(defaults.days).unwrap_or(DEFAULT_CATCHUP_DAYS),
+            template,
+            correction_s: self.correction_s.or(defaults.correction_s).unwrap_or(0),
+        })
+    }
 }
 
 /// Recognise an Xtream `get.php?username=..&password=..` (or `player_api.php`) URL pasted as
