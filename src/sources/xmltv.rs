@@ -63,8 +63,8 @@ const PROGRESS_EVERY: u64 = 1 << 20;
 /// `Err(Error::Cancelled)`). `progress(bytes)` is called every ~1 MiB of input.
 ///
 /// Programmes dropped by `min_stop`/`max_start` are neither emitted nor counted. Malformed
-/// XML is a `Parse` error and a document whose root is not `<tv>` (an HTML error page) is
-/// `BadPayload`; either way the caller keeps the previous guide generation. A non-UTF-8
+/// XML is a `Parse` error and a document whose root is not `<tv>` (an HTML error page) or
+/// that has no root element at all (an empty body, plain text, JSON) is `BadPayload`; either way the caller keeps the previous guide generation. A non-UTF-8
 /// `encoding` in the XML declaration (e.g. ISO-8859-1) is transcoded on the fly; `bytes`
 /// then counts the UTF-8 text.
 pub fn parse<R: BufRead>(
@@ -286,6 +286,11 @@ fn parse_utf8<R: BufRead>(
             Event::Eof if !stack.is_empty() => {
                 // Cut-off download: never let it pass as a (short) complete guide.
                 return Err(Error::parse(None, format!("XMLTV truncated: input ended with {} unclosed element(s)", stack.len())));
+            }
+            Event::Eof if !seen_root => {
+                // An empty 200 (failed Xtream login), plain text or JSON is not an empty guide:
+                // accepting it would replace the user's previous generation with nothing.
+                return Err(Error::BadPayload("empty response or not an XMLTV document".into()));
             }
             Event::Eof => break,
             Event::Comment(_) | Event::Decl(_) | Event::PI(_) | Event::DocType(_) => {}

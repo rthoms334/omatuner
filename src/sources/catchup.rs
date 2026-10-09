@@ -69,8 +69,14 @@ pub fn build_url(req: &CatchupRequest<'_>) -> Result<String> {
     if !in_window(req.spec, req.start, req.now) {
         return Err(Error::NotFound("outside catch-up window".into()));
     }
-    if effective_start(req) >= req.now {
+    let effective = effective_start(req);
+    if effective >= req.now {
         return Err(Error::NotFound("programme not in the archive yet".into()));
+    }
+    // Corrections move the start by hours; one moving it more than a day past the window is
+    // a bogus provider value, not an archived programme.
+    if effective < req.now.saturating_sub(i64::from(req.spec.days) * 86_400 + 86_400) {
+        return Err(Error::NotFound("outside catch-up window".into()));
     }
     let live = req.live_url.trim();
     let template = req.spec.template.as_deref().map(str::trim).filter(|t| !t.is_empty());
@@ -145,8 +151,12 @@ fn one_second_granularity(template: &str) -> bool {
 }
 
 /// Archive (EPG) start before granularity: displayed start − correction − tvg-shift + user offset.
+/// Saturating: correction and offsets come from untrusted playlists.
 fn effective_start(req: &CatchupRequest<'_>) -> Timestamp {
-    req.start - req.spec.correction_s - i64::from(req.tvg_shift_min) * 60 + req.user_offset_s
+    req.start
+        .saturating_sub(req.spec.correction_s)
+        .saturating_sub(i64::from(req.tvg_shift_min) * 60)
+        .saturating_add(req.user_offset_s)
 }
 
 /// Times resolved for one expansion.
@@ -159,12 +169,12 @@ struct Times {
 
 impl Times {
     fn new(req: &CatchupRequest<'_>, one_second: bool) -> Times {
-        let duration = if req.stop > req.start { req.stop - req.start } else { DEFAULT_DURATION_S };
+        let duration = if req.stop > req.start { req.stop.saturating_sub(req.start) } else { DEFAULT_DURATION_S };
         let exact = effective_start(req);
-        let start = if one_second { exact } else { exact.div_euclid(60) * 60 };
+        let start = if one_second { exact } else { exact.saturating_sub(exact.rem_euclid(60)) };
         // Capped at now: the archive cannot serve the future part of a running programme.
-        let end = (exact + duration).min(req.now).max(start);
-        Times { start, end, duration: end - start, now: req.now }
+        let end = exact.saturating_add(duration).min(req.now).max(start);
+        Times { start, end, duration: end.saturating_sub(start), now: req.now }
     }
 }
 
@@ -175,7 +185,7 @@ fn token(name: &str, dollar: bool, t: &Times, req: &CatchupRequest<'_>) -> Optio
             "end" => t.end.to_string(),
             "now" | "timestamp" => t.now.to_string(),
             "duration" => t.duration.to_string(),
-            "offset" => (t.now - t.start).to_string(),
+            "offset" => t.now.saturating_sub(t.start).to_string(),
             _ => {
                 let (base, fmt) = name.split_once(':')?;
                 let at = match base {
@@ -200,9 +210,10 @@ fn token(name: &str, dollar: bool, t: &Times, req: &CatchupRequest<'_>) -> Optio
             match base {
                 "duration" => {
                     let x = divisor(arg)?;
-                    (t.duration + x - 1).div_euclid(x).to_string()
+                    // Rounded up without `duration + x - 1`, which overflows for a huge `x`.
+                    (t.duration / x + i64::from(t.duration % x != 0)).to_string()
                 }
-                "offset" => (t.now - t.start).div_euclid(divisor(arg)?).to_string(),
+                "offset" => t.now.saturating_sub(t.start).div_euclid(divisor(arg)?).to_string(),
                 "utc" => format_time(t.start, arg, &req.tz)?,
                 "utcend" => format_time(t.end, arg, &req.tz)?,
                 "lutc" => format_time(t.now, arg, &req.tz)?,

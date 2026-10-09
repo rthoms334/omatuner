@@ -316,3 +316,30 @@ fn live_url_is_not_expanded() {
     let s = spec(CatchupKind::Shift, None);
     assert_eq!(url(&req("http://h/{utc}/ch", &s)), "http://h/{utc}/ch?utc=1791576000&lutc=1791581400");
 }
+
+#[test]
+fn hostile_provider_values_do_not_overflow() {
+    // `{duration:X}` with a huge divisor still rounds up instead of overflowing.
+    let s = spec(CatchupKind::Default, Some("http://h/a?d={duration:9223372036854775807}&o={offset:9223372036854775807}"));
+    assert_eq!(url(&req("http://h/x", &s)), "http://h/a?d=1&o=0");
+    // Extreme corrections / offsets saturate and land outside the window instead of panicking.
+    for correction_s in [i64::MIN, i64::MAX] {
+        let s = CatchupSpec { correction_s, ..spec(CatchupKind::Default, Some("http://h/a?s={utc}&e={utcend}&o=${offset}")) };
+        assert!(matches!(build_url(&req("http://h/x", &s)), Err(Error::NotFound(_))), "{correction_s}");
+        let r = req("http://h/x", &s);
+        let _ = expand("{utc}{utcend}{duration}{duration:60}{offset:60}${offset}{Y}{utc:Y-m-d}", &r);
+    }
+    for user_offset_s in [i64::MIN, i64::MAX] {
+        let s = spec(CatchupKind::Xc, None);
+        let r = CatchupRequest { user_offset_s, ..req("http://h/live/u/p/1.ts", &s) };
+        assert!(matches!(build_url(&r), Err(Error::NotFound(_))), "{user_offset_s}");
+        let _ = expand("{utc}{utcend}{duration:60}{offset:1}${offset}{M}", &r);
+    }
+    // Programme times at the extremes of the range.
+    let s = spec(CatchupKind::Default, Some("http://h/a?d={duration}"));
+    let r = CatchupRequest { start: i64::MIN, stop: i64::MAX, ..req("http://h/x", &s) };
+    let _ = expand("{utc}{duration}{duration:7}${offset}", &r);
+    // A correction more than a day beyond the archive depth is not served.
+    let s = CatchupSpec { correction_s: 5 * 86_400, ..spec(CatchupKind::Shift, None) };
+    assert!(matches!(build_url(&req("http://h/x", &s)), Err(Error::NotFound(_))));
+}

@@ -255,10 +255,24 @@ fn malformed_and_non_xml_inputs_error_without_panicking() {
     let bad = b"<tv><programme start=\"20261009200000\" channel=\"a\"><title>Caf\xe9</title></programme></tv>";
     let r = parse(&bad[..], &opts(&[]), &mut |_| ControlFlow::Continue(()), &mut |_| {});
     assert!(matches!(r, Err(Error::Parse { .. })), "{r:?}");
-    // Empty input: nothing, no error.
-    let (items, stats) = run(&b""[..], &opts(&[]));
-    assert!(items.is_empty());
-    assert_eq!(stats, XmltvStats::default());
+    // Bodies without a root element (empty 200 from a failed login, plain text, JSON, only
+    // whitespace or a comment) are not an empty guide: the previous generation must survive.
+    for doc in [
+        &b""[..],
+        b"   \n\t ",
+        b"Invalid username or password",
+        b"{\"user_info\":{\"auth\":0}}",
+        b"<?xml version=\"1.0\"?>\n<!-- nothing here -->",
+    ] {
+        let r = parse(doc, &opts(&[]), &mut |_| ControlFlow::Continue(()), &mut |_| {});
+        assert!(matches!(r, Err(Error::BadPayload(_))), "{:?} → {r:?}", String::from_utf8_lossy(doc));
+    }
+    // An explicitly empty guide is still valid.
+    for doc in [&b"<tv/>"[..], b"<?xml version=\"1.0\"?><tv></tv>"] {
+        let (items, stats) = run(doc, &opts(&[]));
+        assert!(items.is_empty());
+        assert_eq!(stats.programmes, 0);
+    }
 }
 
 #[test]
