@@ -5,11 +5,16 @@
 //! 401/403, empty body, `[]`, `user_info.auth == 0` → `Error::AuthRejected`; status Expired /
 //! Banned / Disabled → `Error::AccountUnavailable`.
 //!
-//! Every list action goes through [`LenientList`] (array, id-keyed object or empty → `Vec`,
-//! malformed elements skipped); detail actions treat a non-object reply as "no data". Errors
-//! are scrubbed of this client's username/password (raw and percent-encoded) on top of the
-//! generic redaction, so they are safe even before the secrets are registered.
+//! Every list action goes through [`LenientList`] (array, id-keyed object or `{}` → `Vec`,
+//! malformed elements skipped); a catalogue reply that is no list at all (empty body, `null`,
+//! `{"error":…}`) is `Error::BadPayload`, never an empty catalogue, so an outage can't sweep the
+//! user's lists (DESIGN §7.2). The login object in place of data (`{"user_info":…}`) maps to
+//! `AuthRejected` / `AccountUnavailable` / `BadPayload` by its contents. Detail actions treat a
+//! non-object reply as "no data". Errors are scrubbed of this client's username/password (raw
+//! and percent-encoded) on top of the generic redaction, so they are safe even before the
+//! secrets are registered.
 
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -54,13 +59,10 @@ impl XtreamClient {
             return Err(Error::AuthRejected);
         }
         let account = account_info(&auth, now);
-        let unavailable = match account.status {
-            AccountStatus::Expired => "expired",
-            AccountStatus::Banned => "banned",
-            AccountStatus::Disabled => "disabled",
-            _ => return Ok((auth, account)),
-        };
-        Err(Error::AccountUnavailable { status: unavailable.into() })
+        match unavailable(account.status) {
+            Some(e) => Err(e),
+            None => Ok((auth, account)),
+        }
     }
 
     pub async fn live_categories(&self, cancel: &CancellationToken) -> Result<Vec<XtCategory>> {
@@ -88,8 +90,8 @@ impl XtreamClient {
         if !v.is_object() {
             return Err(Error::NotFound(format!("movie {vod_id}")));
         }
-        if is_login_reply(&v) {
-            return Err(Error::AuthRejected);
+        if let Some(e) = login_reply(&v) {
+            return Err(e);
         }
         self.decode(v, "get_vod_info")
     }
@@ -109,30 +111,37 @@ impl XtreamClient {
             }
         }
     }
-    /// Fallback now/next for channels without XMLTV data (texts decoded).
+    /// Fallback now/next for channels without XMLTV data (texts decoded, sorted by start).
     pub async fn short_epg(&self, stream_id: i64, limit: u32, cancel: &CancellationToken) -> Result<Vec<XtEpgListing>> {
         let extra = [("stream_id", stream_id.to_string()), ("limit", limit.to_string())];
         let v = self.call("get_short_epg", &extra, cancel).await?;
         let mut listings = match v {
             Value::Object(mut m) => match m.remove("epg_listings") {
                 Some(l) => self.decode::<LenientList<XtEpgListing>>(l, "get_short_epg")?.items,
-                None if m.contains_key("user_info") => return Err(Error::AuthRejected),
-                None => vec![],
+                None => match m.get("user_info") {
+                    Some(ui) => return Err(login_reply_error(ui)),
+                    None => vec![],
+                },
             },
             // some forks answer with the bare list
             v @ Value::Array(_) => self.decode::<LenientList<XtEpgListing>>(v, "get_short_epg")?.items,
             _ => vec![],
         };
         decode_epg_texts(&mut listings);
+        // id-keyed listings lose their document order inside a `Value`
+        listings.sort_by_key(|l| l.start_timestamp.unwrap_or(i64::MAX));
         Ok(listings)
     }
 
+    /// A catalogue list. Only a real list may be empty (`[]`, `{}`): anything else that decodes
+    /// as "nothing" is an error, so a failing panel never looks like an emptied catalogue.
     async fn list<T: DeserializeOwned + Send + 'static>(&self, action: &str, extra: &[(&str, String)], cancel: &CancellationToken) -> Result<Vec<T>> {
         let url = urls::player_api_url(&self.creds, Some(action), extra);
-        match self.http.get_json::<LenientList<T>>(&url, &self.headers, cancel).await {
-            Ok(l) if l.login_rejected => Err(Error::AuthRejected),
-            Ok(l) => Ok(l.items),
-            Err(e) => Err(self.scrub(e)),
+        let l = self.http.get_json::<LenientList<T>>(&url, &self.headers, cancel).await.map_err(|e| self.scrub(e))?;
+        match l.user_info {
+            Some(ui) => Err(login_reply_error(&ui)),
+            None if l.is_list => Ok(l.items),
+            None => Err(Error::BadPayload(format!("{action}: the server returned an empty or invalid list"))),
         }
     }
 
@@ -146,8 +155,8 @@ impl XtreamClient {
         if !v.is_object() {
             return Ok(XtSeriesInfo::default());
         }
-        if is_login_reply(&v) {
-            return Err(Error::AuthRejected);
+        if let Some(e) = login_reply(&v) {
+            return Err(e);
         }
         self.decode(v, "get_series_info")
     }
@@ -183,8 +192,44 @@ impl XtreamClient {
 
 fn is_empty_series(s: &XtSeriesInfo) -> bool { s.episodes.is_empty() && s.seasons.is_empty() }
 
-/// Panels answer any action with the login object when the credentials are rejected.
-fn is_login_reply(v: &Value) -> bool { v.get("user_info").is_some() }
+/// The login object in place of data (`{"user_info":…}`), as an error.
+fn login_reply(v: &Value) -> Option<Error> { v.get("user_info").map(login_reply_error) }
+
+/// Panels answer actions with the login object when the credentials are rejected or the account
+/// is unusable; some forks also send it, account fine, for actions they don't support. Never
+/// "no data": that would read as an emptied catalogue.
+fn login_reply_error(user_info: &Value) -> Error {
+    let ui = XtUserInfo::deserialize(user_info).unwrap_or_default();
+    if let Some(e) = parse_status(ui.status.as_deref()).and_then(unavailable) {
+        return e;
+    }
+    if ui.auth.unwrap_or(0) == 0 {
+        return Error::AuthRejected;
+    }
+    Error::BadPayload("the panel answered with account info instead of data".into())
+}
+
+/// `user_info.status` text → status; `None` when the panel sent none.
+fn parse_status(s: Option<&str>) -> Option<AccountStatus> {
+    Some(match s?.trim().to_ascii_lowercase().as_str() {
+        "active" => AccountStatus::Active,
+        "expired" => AccountStatus::Expired,
+        "banned" => AccountStatus::Banned,
+        "disabled" => AccountStatus::Disabled,
+        _ => AccountStatus::Other,
+    })
+}
+
+/// Expired / Banned / Disabled → `Error::AccountUnavailable`.
+fn unavailable(status: AccountStatus) -> Option<Error> {
+    let status = match status {
+        AccountStatus::Expired => "expired",
+        AccountStatus::Banned => "banned",
+        AccountStatus::Disabled => "disabled",
+        _ => return None,
+    };
+    Some(Error::AccountUnavailable { status: status.into() })
+}
 
 /// `user_info` / `server_info` → [`AccountInfo`].
 fn account_info(auth: &XtAuth, now: i64) -> AccountInfo {
@@ -193,12 +238,8 @@ fn account_info(auth: &XtAuth, now: i64) -> AccountInfo {
     let count = |v: Option<i64>| v.and_then(|n| u32::try_from(n).ok());
     let epoch = |v: Option<i64>| v.filter(|&t| t > 0);
     let exp_date = epoch(ui.exp_date);
-    let status = match ui.status.as_deref().map(|s| s.trim().to_ascii_lowercase()) {
-        Some(s) if s == "active" => AccountStatus::Active,
-        Some(s) if s == "expired" => AccountStatus::Expired,
-        Some(s) if s == "banned" => AccountStatus::Banned,
-        Some(s) if s == "disabled" => AccountStatus::Disabled,
-        Some(_) => AccountStatus::Other,
+    let status = match parse_status(ui.status.as_deref()) {
+        Some(s) => s,
         // no status at all: judge by the expiry date, else it logged in fine
         None if exp_date.is_some_and(|e| e < now) => AccountStatus::Expired,
         None => AccountStatus::Unknown,
@@ -256,5 +297,22 @@ mod tests {
         assert_eq!(account_info(&auth(r#"{"user_info":{"auth":1,"exp_date":"0"}}"#), 5).exp_date, None);
         // negative counts are garbage, not huge u32s
         assert_eq!(account_info(&auth(r#"{"user_info":{"auth":1,"max_connections":-1}}"#), 5).max_connections, None);
+    }
+
+    #[test]
+    fn login_object_in_place_of_data() {
+        let err = |json: &str| login_reply(&serde_json::from_str(json).unwrap());
+        assert!(err(r#"{"data":[]}"#).is_none());
+        assert!(matches!(err(r#"{"user_info":{"auth":0}}"#), Some(Error::AuthRejected)));
+        assert!(matches!(err(r#"{"user_info":{"status":"Active"}}"#), Some(Error::AuthRejected)));
+        assert!(matches!(err(r#"{"user_info":[]}"#), Some(Error::AuthRejected)));
+        let status_of = |json: &str| match err(json) {
+            Some(Error::AccountUnavailable { status }) => status,
+            other => panic!("{json}: {other:?}"),
+        };
+        assert_eq!(status_of(r#"{"user_info":{"auth":"1","status":"Banned"}}"#), "banned");
+        assert_eq!(status_of(r#"{"user_info":{"auth":0,"status":"Expired"}}"#), "expired");
+        // account fine: the panel just doesn't serve this action
+        assert!(matches!(err(r#"{"user_info":{"auth":1,"status":"Active"}}"#), Some(Error::BadPayload(_))));
     }
 }

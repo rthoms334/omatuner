@@ -116,7 +116,13 @@ where
 fn episode_list(v: Value) -> Vec<XtEpisode> {
     let items: Vec<Value> = match v {
         Value::Array(a) => a,
-        Value::Object(m) => m.into_iter().map(|(_, v)| v).collect(),
+        Value::Object(m) => {
+            // `serde_json::Map` iterates in key TEXT order ("10" < "2"): sort by the index
+            // (non-numeric keys last, in their original order).
+            let mut keyed: Vec<(i64, Value)> = m.into_iter().map(|(k, v)| (k.trim().parse::<i64>().unwrap_or(i64::MAX), v)).collect();
+            keyed.sort_by_key(|(idx, _)| *idx);
+            keyed.into_iter().map(|(_, v)| v).collect()
+        }
         _ => return vec![],
     };
     items.into_iter().filter(Value::is_object).filter_map(|v| serde_json::from_value(v).ok()).collect()
@@ -125,16 +131,21 @@ fn episode_list(v: Value) -> Vec<XtEpisode> {
 /// A JSON list that never fails as a whole: an array, an object keyed by numeric ids (values in
 /// document order, i.e. the panel's order), or `null`/`""`/`false`/`{}` (empty). Elements that
 /// don't deserialize as `T` (not an object, …) are skipped. Used for every `get_*` list action.
-/// Panels answer list actions with bad credentials by the login object
-/// (`{"user_info":{"auth":0}}`); that sets `login_rejected` instead of yielding a bogus element.
+///
+/// `is_list` tells a real (possibly empty) list — an array, `{}` or an id-keyed object — from a
+/// reply that merely *decodes* as empty (`null`, `""`, `false`, `{"error":…}`): catalogue
+/// actions must not mistake an outage for an empty catalogue (DESIGN §7.2). Panels answer
+/// actions with the login object (`{"user_info":{…}}`) when something is wrong with the account;
+/// that is kept in `user_info` instead of yielding a bogus element.
 #[derive(Debug, Clone)]
 pub(crate) struct LenientList<T> {
     pub items: Vec<T>,
-    pub login_rejected: bool,
+    pub is_list: bool,
+    pub user_info: Option<Value>,
 }
 
 impl<T> LenientList<T> {
-    fn empty() -> Self { Self { items: vec![], login_rejected: false } }
+    fn empty() -> Self { Self { items: vec![], is_list: false, user_info: None } }
 }
 
 impl<'de, T: serde::de::DeserializeOwned> Deserialize<'de> for LenientList<T> {
@@ -147,7 +158,7 @@ impl<'de, T: serde::de::DeserializeOwned> Deserialize<'de> for LenientList<T> {
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("a list") }
 
             fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-                let mut out = LenientList::empty();
+                let mut out = LenientList { is_list: true, ..LenientList::empty() };
                 out.items.reserve(seq.size_hint().unwrap_or(0).min(1 << 16));
                 while let Some(v) = seq.next_element::<Value>()? {
                     if let Ok(t) = serde_json::from_value(v) {
@@ -159,16 +170,22 @@ impl<'de, T: serde::de::DeserializeOwned> Deserialize<'de> for LenientList<T> {
 
             fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
                 let mut out = LenientList::empty();
+                let mut any_key = false;
                 while let Some(key) = map.next_key::<String>()? {
+                    any_key = true;
                     if key.trim().parse::<i64>().is_ok() {
+                        out.is_list = true;
                         if let Ok(t) = serde_json::from_value(map.next_value::<Value>()?) {
                             out.items.push(t);
                         }
+                    } else if key == "user_info" {
+                        out.user_info = Some(map.next_value::<Value>()?);
                     } else {
-                        out.login_rejected |= key == "user_info";
                         map.next_value::<serde::de::IgnoredAny>()?;
                     }
                 }
+                // `{}`: PHP's empty array under JSON_FORCE_OBJECT
+                out.is_list |= !any_key;
                 Ok(out)
             }
 
@@ -568,6 +585,13 @@ mod tests {
         // season keyed by episode index
         let info: XtSeriesInfo = serde_json::from_str(r#"{"episodes":{"3":{"0":{"id":"k"},"1":{"id":"l"}}}}"#).unwrap();
         assert_eq!(info.episodes[&3].len(), 2);
+        // … in index order, not key-text order ("10" < "2"); non-numeric keys last
+        let season: Vec<String> = (0..12).map(|i| format!(r#""{i}":{{"id":"e{i}"}}"#)).collect();
+        let json = format!(r#"{{"episodes":{{"1":{{"x":{{"id":"last"}},{}}}}}}}"#, season.join(","));
+        let info: XtSeriesInfo = serde_json::from_str(&json).unwrap();
+        let ids: Vec<String> = info.episodes[&1].iter().map(|e| e.id.clone().unwrap()).collect();
+        let want: Vec<String> = (0..12).map(|i| format!("e{i}")).chain(["last".into()]).collect();
+        assert_eq!(ids, want);
 
         for empty in [r#"{"episodes":[]}"#, r#"{"episodes":{}}"#, r#"{"episodes":null}"#, r#"{"episodes":""}"#, "{}"] {
             let info: XtSeriesInfo = serde_json::from_str(empty).unwrap();
@@ -583,15 +607,24 @@ mod tests {
     fn lenient_list_shapes() {
         let l: LenientList<XtCategory> = serde_json::from_str(r#"[{"category_id":1},null,"x",{"category_id":"2"}]"#).unwrap();
         assert_eq!(l.items.len(), 2);
-        assert!(!l.login_rejected);
-        let l: LenientList<XtCategory> = serde_json::from_str(r#"{"7":{"category_id":7},"8":{"category_id":8},"total":2}"#).unwrap();
-        assert_eq!(l.items.iter().map(|c| c.category_id.clone().unwrap()).collect::<Vec<_>>(), vec!["7", "8"]);
-        for empty in ["null", "{}", "\"\"", "false", "0"] {
+        assert!(l.is_list && l.user_info.is_none());
+        // keyed by id: document order, not key order
+        let l: LenientList<XtCategory> = serde_json::from_str(r#"{"8":{"category_id":8},"7":{"category_id":7},"total":2}"#).unwrap();
+        assert_eq!(l.items.iter().map(|c| c.category_id.clone().unwrap()).collect::<Vec<_>>(), vec!["8", "7"]);
+        assert!(l.is_list);
+        // genuinely empty lists
+        for empty in ["[]", "{}"] {
             let l: LenientList<XtCategory> = serde_json::from_str(empty).unwrap();
-            assert!(l.items.is_empty() && !l.login_rejected, "{empty}");
+            assert!(l.items.is_empty() && l.is_list && l.user_info.is_none(), "{empty}");
+        }
+        // decodes as empty, but is no list (outage, rate limit, …)
+        for junk in ["null", "\"\"", "false", "0", r#"{"error":"rate limited"}"#] {
+            let l: LenientList<XtCategory> = serde_json::from_str(junk).unwrap();
+            assert!(l.items.is_empty() && !l.is_list && l.user_info.is_none(), "{junk}");
         }
         let l: LenientList<XtCategory> = serde_json::from_str(r#"{"user_info":{"auth":0}}"#).unwrap();
-        assert!(l.login_rejected && l.items.is_empty());
+        assert!(l.items.is_empty() && !l.is_list);
+        assert_eq!(l.user_info.unwrap()["auth"], 0);
     }
 
     #[test]

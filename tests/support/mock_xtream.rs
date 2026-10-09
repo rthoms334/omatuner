@@ -20,7 +20,17 @@
 //! | `disabled`   | `status: "Disabled"`                                 |
 //!
 //! With username `keyed`, `get_live_categories` answers `live_categories_keyed.json` (an object
-//! keyed by id with junk entries, as some forks send).
+//! keyed by id with junk entries, as some forks send). Other usernames pick what EVERY catalogue
+//! list action (`get_*_categories`, `get_live_streams`, `get_vod_streams`, `get_series`) answers:
+//!
+//! | username    | list reply                                                      |
+//! |-------------|-----------------------------------------------------------------|
+//! | `listempty` | empty body, status 200 (busy / broken panel)                    |
+//! | `listnull`  | `null`                                                          |
+//! | `listerror` | `{"error":"rate limited"}`                                      |
+//! | `listnone`  | `[]` (a genuinely empty catalogue)                              |
+//! | `loginreply`| `auth_ok.json` — for every action, details included (forks that |
+//! |             | answer unsupported actions with the login object)               |
 //!
 //! Data served:
 //! * list actions: `live_categories.json`, `live_streams.json` (filtered by `category_id`),
@@ -175,6 +185,23 @@ fn player_api<'a>(st: &State, user: &str, param: &impl Fn(&str) -> Option<&'a st
     }
     if st.opts.html_200 {
         return html();
+    }
+    if user == "loginreply" {
+        return json(fixture("xtream/auth_ok.json"));
+    }
+    let is_list = matches!(
+        action,
+        "get_live_categories" | "get_vod_categories" | "get_series_categories" | "get_live_streams" | "get_vod_streams" | "get_series"
+    );
+    let list_quirk: Option<&[u8]> = match user {
+        "listempty" => Some(b""),
+        "listnull" => Some(b"null"),
+        "listerror" => Some(br#"{"error":"rate limited"}"#),
+        "listnone" => Some(b"[]"),
+        _ => None,
+    };
+    if let Some(body) = list_quirk.filter(|_| is_list) {
+        return json(body.to_vec());
     }
     let id = |k: &str| param(k).and_then(|v| v.parse::<i64>().ok());
     match action {

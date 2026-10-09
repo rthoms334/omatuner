@@ -331,6 +331,40 @@ async fn id_keyed_list_reply_is_flattened() {
 }
 
 #[tokio::test]
+async fn non_list_replies_never_look_like_an_empty_catalogue() {
+    let mock = mock_xtream::start(MockOptions::default()).await;
+    let cancel = CancellationToken::new();
+    // an outage must fail the import (no sweep), not "succeed" with zero rows
+    for user in ["listempty", "listnull", "listerror"] {
+        let c = client(mock.creds(user, "pw-nonlist-Qa8"));
+        let e = c.live_streams(&cancel).await.unwrap_err();
+        assert!(matches!(&e, Error::BadPayload(m) if m.contains("get_live_streams")), "{user}: {e:?}");
+        assert!(matches!(c.series(&cancel).await, Err(Error::BadPayload(_))), "{user}");
+        assert_clean(&e, "pw-nonlist-Qa8");
+    }
+    // `[]` is how PHP spells a genuinely empty catalogue
+    let c = client(mock.creds("listnone", "pw-nonlist-Qa8"));
+    assert!(c.live_streams(&cancel).await.unwrap().is_empty());
+    assert!(c.vod_categories(&cancel).await.unwrap().is_empty());
+
+    // the login object (account fine) in place of data: an error, not AuthRejected / empty
+    let c = client(mock.creds("loginreply", "pw-nonlist-Qa8"));
+    c.authenticate(NOW, &cancel).await.expect("login itself is fine");
+    for e in [
+        c.series(&cancel).await.unwrap_err(),
+        c.vod_info(5001, &cancel).await.unwrap_err(),
+        c.series_info(700, &cancel).await.unwrap_err(),
+        c.short_epg(1001, 4, &cancel).await.unwrap_err(),
+    ] {
+        assert!(matches!(e, Error::BadPayload(_)), "{e:?}");
+    }
+    // an expired account answering list actions with its login object
+    let expired = mock_xtream::start(MockOptions { auth: MockAuth::Expired, ..Default::default() }).await;
+    let e = client(expired.creds("demo", "pw-nonlist-Qa8")).vod_streams(&cancel).await.unwrap_err();
+    assert!(matches!(&e, Error::AccountUnavailable { status } if status == "expired"), "{e:?}");
+}
+
+#[tokio::test]
 async fn lists_with_rejected_login_or_html() {
     let cancel = CancellationToken::new();
     let rejected = mock_xtream::start(MockOptions { auth: MockAuth::Rejected, ..Default::default() }).await;
