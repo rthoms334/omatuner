@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE tv SYSTEM "xmltv.dtd">
+<!-- Edge cases for tests/xmltv.rs (owner WP-05a). Programmes before their channel element on
+     purpose (non-conforming but seen in the wild). -->
+<tv source-info-name="edge" generator-info-name="fixture">
+  <programme start="20261009180000 +0200" stop="20261009190000 +0200" channel="early.de">
+    <title lang="de">Tagesschau</title>
+    <title lang="en">News</title>
+    <title lang="fr">Journal</title>
+    <desc lang="fr">Le journal.</desc>
+    <desc lang="de">Die Nachrichten.</desc>
+    <category lang="de">Nachrichten</category>
+    <category lang="en">News</category>
+    <category lang="de">Nachrichten</category>
+    <credits><director>Jane &amp; John</director><actor role="x">A</actor></credits>
+    <date>2026</date>
+    <rating system="FSK"><value>12</value><icon src="http://r.example/fsk12.png"/></rating>
+    <rating system="MPAA"><value>PG</value></rating>
+    <star-rating><value>3.5/5</value></star-rating>
+    <episode-num system="dd_progid">EP000.0001</episode-num>
+    <episode-num system="onscreen">S1E2</episode-num>
+    <episode-num system="xmltv_ns">4.9.</episode-num>
+    <new></new>
+    <live/>
+  </programme>
+  <channel id="early.de">
+    <display-name lang="de">Das Erste HD</display-name>
+    <display-name lang="en">Das Erste HD</display-name>
+    <display-name>  ARD  </display-name>
+    <display-name></display-name>
+    <icon src="http://logos.example/ard.png"/>
+    <icon src="http://logos.example/ard2.png"/>
+    <url>http://ard.example</url>
+  </channel>
+  <programme start="20261009190000 +0200" channel="early.de">
+    <title><![CDATA[Tatort: Mord & Totschlag]]></title>
+    <sub-title lang="de">Folge 1</sub-title>
+    <episode-num system="onscreen">S03E14</episode-num>
+  </programme>
+  <programme start="20261009190000 +0200" channel="early.de">
+    <title>Duplicate start without stop (dropped)</title>
+  </programme>
+  <programme start="20261009191500 +0200" stop="20261009194500 +0200" channel="early.de" catchup-id="x&amp;y">
+    <title>Kurz</title>
+    <previously-shown start="20200101"/>
+    <icon src="http://img.example/kurz.png"></icon>
+  </programme>
+  <programme start="20261009200000" stop="not a time" channel="unicode.jp">
+    <title lang="ja">&#x65E5;&#26412;&#x8A9E; – Ñoño</title>
+    <desc>Line one
+line two</desc>
+  </programme>
+  <channel id="unicode.jp"><display-name>NHK 総合</display-name></channel>
+  <programme start="20261009230000" channel="late.uk"><title>Late</title></programme>
+</tv>

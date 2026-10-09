@@ -13,11 +13,25 @@
 //!    "Assign EPG" picker; the user's choice is stored as `Manual`.
 //!
 //! Manual mappings are never touched by automatic matching.
+//!
+//! Tie-breaks: several EPG channels for one id (case-insensitive or feed-stripped) → the first
+//! in index order (`channels` order passed to [`build_index`]). Step 2 applies to Xtream
+//! channels (`xt:` item keys) when `provider_guide` is set; their `tvg_id` holds the panel's
+//! `epg_channel_id`.
+//!
+//! Fuzzy prefilter: every distinct display-name norm is indexed by its padded character
+//! trigrams (`^ab`, `abc`, …, `yz$`); [`suggest`] only scores norms that share at least a
+//! quarter of the query's trigrams, best overlap first, at most 512 of them — never a full
+//! Jaro-Winkler scan.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::model::{EpgChannel, EpgChannelId, EpgMapping, EpgSourceId, EpgSuggestion};
+use crate::model::{EpgChannel, EpgChannelId, EpgMapping, EpgMatchMethod, EpgSourceId, EpgSuggestion};
+use crate::sources::identity::normalize_name;
 use crate::store::epg::ChannelMatchRow;
+
+/// Upper bound of Jaro-Winkler evaluations per [`suggest`] call.
+const MAX_FUZZY_CANDIDATES: usize = 512;
 
 /// Lookup structures for one EPG source.
 #[derive(Debug, Default)]
@@ -29,24 +43,218 @@ pub struct EpgCandidateIndex {
     by_norm: HashMap<String, Vec<(EpgChannelId, String)>>,
     /// (norm, epg channel id, xmltv id, display name) for fuzzy scans.
     norms: Vec<(String, EpgChannelId, String, String)>,
+    /// Padded trigram → indices into `norms` (fuzzy prefilter).
+    grams: HashMap<u32, Vec<u32>>,
 }
 
 /// Build the index for `channels` of `epg_source`.
-pub fn build_index(epg_source: EpgSourceId, channels: &[EpgChannel]) -> EpgCandidateIndex { todo!("WP-05a") }
+pub fn build_index(epg_source: EpgSourceId, channels: &[EpgChannel]) -> EpgCandidateIndex {
+    let mut idx = EpgCandidateIndex { epg_source: Some(epg_source), ..Default::default() };
+    for ch in channels {
+        let id = ch.xmltv_id.trim();
+        if id.is_empty() {
+            continue;
+        }
+        let entry = (ch.id, id.to_owned());
+        idx.by_id.entry(id.to_owned()).or_insert_with(|| entry.clone());
+        idx.by_id_lower.entry(id.to_lowercase()).or_default().push(entry.clone());
+        idx.by_id_feedless.entry(strip_feed(id).trim().to_lowercase()).or_default().push(entry.clone());
+
+        let mut seen: HashSet<String> = HashSet::new();
+        for name in &ch.display_names {
+            let norm = normalize_name(name);
+            if norm.is_empty() || !seen.insert(norm.clone()) {
+                continue;
+            }
+            idx.by_norm.entry(norm.clone()).or_default().push(entry.clone());
+            let pos = idx.norms.len() as u32;
+            for g in trigrams(&norm) {
+                let posting = idx.grams.entry(g).or_default();
+                if posting.last() != Some(&pos) {
+                    posting.push(pos);
+                }
+            }
+            idx.norms.push((norm, ch.id, id.to_owned(), name.trim().to_owned()));
+        }
+    }
+    idx
+}
 
 /// Automatic match for one channel. `provider_guide` = this EPG source is the provider guide of
 /// the channel's own playlist source (enables step 2 tagging).
 pub fn match_channel(idx: &EpgCandidateIndex, row: &ChannelMatchRow, provider_guide: bool, name_match: bool) -> Option<EpgMapping> {
-    todo!("WP-05a")
+    let epg_source_id = idx.epg_source?;
+    let mapping = |xmltv_id: &str, method: EpgMatchMethod| EpgMapping {
+        channel: row.channel.clone(),
+        epg_source_id,
+        xmltv_id: xmltv_id.to_owned(),
+        method,
+        confidence: 1.0,
+    };
+    let xtream_guide = provider_guide && row.channel.key.as_str().starts_with("xt:");
+    if let Some(tvg) = row.tvg_id.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        if let Some((_, xid)) = idx.by_id.get(tvg) {
+            return Some(mapping(xid, if xtream_guide { EpgMatchMethod::XtreamEpgId } else { EpgMatchMethod::TvgIdExact }));
+        }
+        if let Some((_, xid)) = idx.by_id_lower.get(&tvg.to_lowercase()).and_then(|v| v.first()) {
+            return Some(mapping(xid, if xtream_guide { EpgMatchMethod::XtreamEpgId } else { EpgMatchMethod::TvgIdCaseless }));
+        }
+        let feedless = strip_feed(tvg).trim().to_lowercase();
+        if !feedless.is_empty()
+            && let Some((_, xid)) = idx.by_id_feedless.get(&feedless).and_then(|v| v.first())
+        {
+            return Some(mapping(xid, EpgMatchMethod::FeedStripped));
+        }
+    }
+    if name_match {
+        let computed;
+        let norm = if row.norm_name.is_empty() {
+            computed = normalize_name(&row.name);
+            &computed
+        } else {
+            &row.norm_name
+        };
+        if let Some([(_, xid)]) = idx.by_norm.get(norm.as_str()).map(Vec::as_slice) {
+            return Some(mapping(xid, EpgMatchMethod::NormalizedName));
+        }
+    }
+    None
 }
 
 /// Match all rows (parallel-safe; pure). Returns only matched rows.
 pub fn match_all(idx: &EpgCandidateIndex, rows: &[ChannelMatchRow], provider_guide: bool, name_match: bool) -> Vec<EpgMapping> {
-    todo!("WP-05a")
+    rows.iter().filter_map(|r| match_channel(idx, r, provider_guide, name_match)).collect()
 }
 
 /// Top `limit` fuzzy candidates for `name` with score ≥ `threshold`, best first.
-pub fn suggest(idx: &EpgCandidateIndex, name: &str, limit: usize, threshold: f64) -> Vec<EpgSuggestion> { todo!("WP-05a") }
+///
+/// One entry per EPG channel (its best-scoring display name); ties are ordered by display name.
+pub fn suggest(idx: &EpgCandidateIndex, name: &str, limit: usize, threshold: f64) -> Vec<EpgSuggestion> {
+    let Some(epg_source_id) = idx.epg_source else { return Vec::new() };
+    let norm = normalize_name(name);
+    if norm.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    let mut best: HashMap<EpgChannelId, (f64, usize)> = HashMap::new();
+    for i in prefilter(idx, &norm) {
+        let (cand, ch, _, _) = &idx.norms[i];
+        let score = strsim::jaro_winkler(&norm, cand);
+        if score < threshold {
+            continue;
+        }
+        let slot = best.entry(*ch).or_insert((score, i));
+        if score > slot.0 {
+            *slot = (score, i);
+        }
+    }
+    let mut out: Vec<EpgSuggestion> = best
+        .into_values()
+        .map(|(score, i)| {
+            let (_, ch, xid, display) = &idx.norms[i];
+            EpgSuggestion {
+                epg_channel_id: *ch,
+                epg_source_id,
+                xmltv_id: xid.clone(),
+                display_name: display.clone(),
+                score: score as f32,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.display_name.cmp(&b.display_name)).then(a.epg_channel_id.cmp(&b.epg_channel_id)));
+    out.truncate(limit);
+    out
+}
+
+/// Indices into `idx.norms` sharing at least a quarter of `norm`'s padded trigrams (at least
+/// one), most shared first, capped at [`MAX_FUZZY_CANDIDATES`]. Strings at Jaro-Winkler ≥ 0.9
+/// share far more than that, so this only drops hopeless candidates.
+fn prefilter(idx: &EpgCandidateIndex, norm: &str) -> Vec<usize> {
+    let mut shared: HashMap<u32, u32> = HashMap::new();
+    let mut query: Vec<u32> = trigrams(norm).collect();
+    query.sort_unstable();
+    query.dedup();
+    let min_shared = (query.len() / 4).max(1) as u32;
+    for g in query {
+        for &i in idx.grams.get(&g).map(Vec::as_slice).unwrap_or_default() {
+            *shared.entry(i).or_default() += 1;
+        }
+    }
+    let mut cands: Vec<(u32, u32)> = shared.into_iter().filter(|&(_, n)| n >= min_shared).collect();
+    cands.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    cands.truncate(MAX_FUZZY_CANDIDATES);
+    cands.into_iter().map(|(i, _)| i as usize).collect()
+}
+
+/// Padded byte trigrams of an (ASCII) norm packed into a `u32`: `"abc"` → `^ab abc bc$`.
+fn trigrams(norm: &str) -> impl Iterator<Item = u32> + '_ {
+    let b = norm.as_bytes();
+    let at = move |i: usize| -> u32 {
+        // Virtual string: '^' + norm + '$'.
+        if i == 0 {
+            u32::from(b'^')
+        } else if i <= b.len() {
+            u32::from(b[i - 1])
+        } else {
+            u32::from(b'$')
+        }
+    };
+    let n = b.len() + 2;
+    (0..n.saturating_sub(2)).map(move |i| (at(i) << 16) | (at(i + 1) << 8) | at(i + 2))
+}
 
 /// `CNN.us@SD` → `CNN.us`.
 pub fn strip_feed(id: &str) -> &str { id.split_once('@').map(|(a, _)| a).unwrap_or(id) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ItemKey, ItemKind, ItemRef, SourceId};
+
+    fn ch(id: i64, xmltv: &str, names: &[&str]) -> EpgChannel {
+        EpgChannel {
+            id: EpgChannelId(id),
+            epg_source_id: EpgSourceId(7),
+            xmltv_id: xmltv.into(),
+            display_names: names.iter().map(|s| s.to_string()).collect(),
+            icon: None,
+        }
+    }
+
+    #[test]
+    fn trigram_packing() {
+        let g: Vec<u32> = trigrams("ab").collect();
+        assert_eq!(g, vec![0x5E_61_62, 0x61_62_24]);
+        assert_eq!(trigrams("a").count(), 1);
+        assert_eq!(trigrams("").count(), 0);
+        assert_eq!(trigrams("bbcone").count(), 6);
+    }
+
+    #[test]
+    fn prefilter_does_not_scan_everything() {
+        let mut chans: Vec<EpgChannel> = (0..5_000).map(|i| ch(i, &format!("c{i}.tv"), &[&format!("Generic Channel {i}")])).collect();
+        chans.push(ch(9_000, "bbc1.uk", &["BBC One"]));
+        chans.push(ch(9_001, "bbc2.uk", &["BBC Two"]));
+        let idx = build_index(EpgSourceId(7), &chans);
+        assert_eq!(idx.norms.len(), 5_002);
+        let c = prefilter(&idx, &normalize_name("BBC One London"));
+        assert!(!c.is_empty() && c.len() < 10, "only the bbc* names share enough trigrams: {}", c.len());
+        assert!(prefilter(&idx, &normalize_name("Generic Channel 1")).len() <= MAX_FUZZY_CANDIDATES);
+        assert!(prefilter(&idx, "zzzzqqqq").is_empty());
+    }
+
+    #[test]
+    fn feed_stripping_on_either_side() {
+        let idx = build_index(EpgSourceId(7), &[ch(1, "CNN.us@SD", &["CNN"]), ch(2, "BBCNews.uk", &["BBC News"])]);
+        let row = |tvg: &str| ChannelMatchRow {
+            channel: ItemRef { source: SourceId(1), kind: ItemKind::Channel, key: ItemKey("m3u:x".into()) },
+            tvg_id: Some(tvg.into()),
+            name: "zzz".into(),
+            norm_name: "zzz".into(),
+        };
+        let m = match_channel(&idx, &row("cnn.us"), false, false).unwrap();
+        assert_eq!((m.xmltv_id.as_str(), m.method), ("CNN.us@SD", EpgMatchMethod::FeedStripped));
+        let m = match_channel(&idx, &row("BBCNews.uk@HD"), false, false).unwrap();
+        assert_eq!((m.xmltv_id.as_str(), m.method), ("BBCNews.uk", EpgMatchMethod::FeedStripped));
+        assert!(match_channel(&idx, &row("@HD"), false, false).is_none());
+    }
+}
