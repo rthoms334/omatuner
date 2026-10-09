@@ -1,9 +1,19 @@
-raw	clean	country	quality
-UK | BBC One FHD	BBC One	UK	Fhd
-|EN| CNN HD (backup)	CNN	EN	Hd
-[VIP] US: ESPN 2 4K	ESPN 2	US	Uhd
-DE - Das Erste HEVC	Das Erste	DE	
-Sky Cinema +1 HD	Sky Cinema +1		Hd
-FR: TF1 ᴴᴰ	TF1	FR	Hd
-AR | الجزيرة HD	الجزيرة	AR	Hd
-NL| NPO 1 1080p	NPO 1	NL	Fhd
+raw	clean	country	quality	tags
+UK | BBC One FHD	BBC One	UK	Fhd	
+|EN| CNN HD (backup)	CNN	EN	Hd	backup
+[VIP] US: ESPN 2 4K	ESPN 2	US	Uhd	VIP
+DE - Das Erste HEVC	Das Erste	DE		HEVC
+Sky Cinema +1 HD	Sky Cinema +1		Hd	
+FR: TF1 ᴴᴰ	TF1	FR	Hd	
+AR | الجزيرة HD	الجزيرة	AR	Hd	
+NL| NPO 1 1080p	NPO 1	NL	Fhd	
+BBC News (720p) [Geo-blocked]	BBC News		Hd	Geo-blocked
+USA: CNN International SD	CNN International	USA	Sd	
+UK: Sky Sports Main Event ꜰʜᴅ	Sky Sports Main Event	UK	Fhd	
+CNN: Live	CNN: Live			
+Sky Sports F1 UHD HEVC	Sky Sports F1		Uhd	HEVC
+BBC One (Scotland)	BBC One (Scotland)			
+[UK] ITV 1 +1	ITV 1 +1	UK		
+ES: La 1 HD 720p	La 1	ES	Hd	
+Ça Tévé	Ça Tévé			
+HD	HD			
