@@ -231,9 +231,11 @@ pub fn begin_catalogue(conn: &Connection, source: SourceId, now: Timestamp) -> R
 }
 
 /// `GroupKey → grp.id` of one kind of a source.
-fn group_ids(conn: &Connection, source: SourceId, kind: ItemKind) -> Result<HashMap<String, GroupId>> {
-    let mut stmt = conn.prepare_cached("SELECT key, id FROM grp WHERE source_id = ?1 AND kind = ?2")?;
-    let rows = stmt.query_map(params![source, kind.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))?;
+fn group_ids(conn: &Connection, imp: &CatalogueImport, kind: ItemKind) -> Result<HashMap<String, GroupId>> {
+    // only groups already marked seen by this import: stale keys go through `resolve_groups`'
+    // fallback so their `seen_gen` is bumped and the sweep keeps them
+    let mut stmt = conn.prepare_cached("SELECT key, id FROM grp WHERE source_id = ?1 AND kind = ?2 AND seen_gen = ?3")?;
+    let rows = stmt.query_map(params![imp.source, kind.as_str(), imp.generation], |r| Ok((r.get(0)?, r.get(1)?)))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
@@ -255,8 +257,9 @@ fn upsert_group(conn: &Connection, imp: &CatalogueImport, g: &ImportGroup) -> Re
     Ok((id, !existed))
 }
 
-/// Group ids of an item's group keys (primary first). A key that `upsert_groups` never saw is
-/// created on the fly (named after its key) rather than silently dropping the membership.
+/// Group ids of an item's group keys (primary first). A key that `upsert_groups` never saw in
+/// this import is marked seen if it exists from an earlier one (keeping its name), otherwise
+/// created on the fly (named after its key), rather than silently dropping the membership.
 fn resolve_groups(
     conn: &Connection,
     imp: &CatalogueImport,
@@ -269,9 +272,18 @@ fn resolve_groups(
         let id = match map.get(&k.0) {
             Some(id) => *id,
             None => {
-                let name = sql::group_norm(&k.0);
-                let g = ImportGroup { kind, key: k.clone(), name, provider_id: None, provider_order: i32::MAX };
-                let (id, _) = upsert_group(conn, imp, &g)?;
+                let kept: Option<GroupId> = conn
+                    .prepare_cached("UPDATE grp SET seen_gen = ?4 WHERE source_id = ?1 AND kind = ?2 AND key = ?3 RETURNING id")?
+                    .query_row(params![imp.source, kind.as_str(), k.0, imp.generation], |r| r.get(0))
+                    .optional()?;
+                let id = match kept {
+                    Some(id) => id,
+                    None => {
+                        let name = sql::group_norm(&k.0);
+                        let g = ImportGroup { kind, key: k.clone(), name, provider_id: None, provider_order: i32::MAX };
+                        upsert_group(conn, imp, &g)?.0
+                    }
+                };
                 map.insert(k.0.clone(), id);
                 id
             }
@@ -336,7 +348,7 @@ fn write_memberships(conn: &Connection, link: &str, col: &str, id: i64, groups: 
 /// their `channel_group` rows. Returns (added, updated).
 pub fn write_channels(conn: &mut Connection, imp: &CatalogueImport, batch: &[ImportChannel]) -> Result<(u32, u32)> {
     let tx = conn.transaction()?;
-    let mut groups = group_ids(&tx, imp.source, ItemKind::Channel)?;
+    let mut groups = group_ids(&tx, imp, ItemKind::Channel)?;
     let (mut added, mut updated) = (0u32, 0u32);
     for ch in batch {
         let fresh = !exists(&tx, "channel", imp.source, &ch.key)?;
@@ -398,7 +410,7 @@ pub fn write_channels(conn: &mut Connection, imp: &CatalogueImport, batch: &[Imp
 
 pub fn write_movies(conn: &mut Connection, imp: &CatalogueImport, batch: &[ImportMovie]) -> Result<(u32, u32)> {
     let tx = conn.transaction()?;
-    let mut groups = group_ids(&tx, imp.source, ItemKind::Movie)?;
+    let mut groups = group_ids(&tx, imp, ItemKind::Movie)?;
     let (mut added, mut updated) = (0u32, 0u32);
     for m in batch {
         let fresh = !exists(&tx, "movie", imp.source, &m.key)?;
@@ -452,7 +464,7 @@ pub fn write_movies(conn: &mut Connection, imp: &CatalogueImport, batch: &[Impor
 /// re-fetches seasons/episodes.
 pub fn write_series(conn: &mut Connection, imp: &CatalogueImport, batch: &[ImportSeries]) -> Result<(u32, u32)> {
     let tx = conn.transaction()?;
-    let mut groups = group_ids(&tx, imp.source, ItemKind::Series)?;
+    let mut groups = group_ids(&tx, imp, ItemKind::Series)?;
     let (mut added, mut updated) = (0u32, 0u32);
     for s in batch {
         let fresh = !exists(&tx, "series", imp.source, &s.key)?;

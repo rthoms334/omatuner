@@ -298,6 +298,53 @@ fn export_without_credentials_strips_secrets_and_restores_disabled_sources() {
     assert_eq!(count(&r, "SELECT count(*) FROM channel_epg_map WHERE method = 'manual'"), 1);
 }
 
+/// Stripping masks credentials only: harmless query values survive even though every source
+/// URL's query values are registered with the (log) redaction registry.
+#[test]
+fn export_without_credentials_keeps_non_secret_url_parts() {
+    let s = store("tuner-sb-keepq");
+    let urls = [
+        ("Public", "https://pub.example/list?country=zz-keepq"),
+        ("Mixed", "https://pub.example/list?region=yy-keepq&token=tk-keepq-81w"),
+        ("Userinfo", "https://bob:pw-keepq-19r@pub.example/list.m3u?lang=xx-keepq"),
+        ("Path", "http://pub.example:8080/live/bob/pw-keepq-27t/101.ts?quality=hd"),
+    ];
+    w(&s, move |c| {
+        for (name, url) in urls {
+            let draft = SourceDraft {
+                name: name.into(),
+                kind: SourceKind::M3uUrl,
+                icon: "x".into(),
+                color: SourceColor::Blue,
+                url: Some(url.into()),
+                path: None,
+                xtream: None,
+                settings: SourceSettings::default(),
+            };
+            sources::insert_source(c, &draft, NOW)?;
+        }
+        Ok(())
+    });
+    let b = w(&s, |c| backup::export(c, BackupOptions::default(), None, NOW));
+    let got: Vec<_> = b.sources.iter().map(|s| s.url.as_deref().unwrap()).collect();
+    assert_eq!(
+        got,
+        vec![
+            "https://pub.example/list?country=zz-keepq",
+            "https://pub.example/list?region=yy-keepq&token=***",
+            "https://***@pub.example/list.m3u?lang=xx-keepq",
+            "http://pub.example:8080/live/***/***/101.ts?quality=hd",
+        ]
+    );
+    let fresh = store("tuner-sb-keepq-fresh");
+    let report = w(&fresh, move |c| backup::restore(c, &b, RestoreMode::Merge));
+    assert_eq!(report.needs_credentials, vec!["Mixed".to_string(), "Userinfo".to_string(), "Path".to_string()]);
+    let r = fresh.reader().unwrap();
+    let public = sources::list_sources(&r).unwrap().into_iter().find(|s| s.name == "Public").unwrap();
+    assert!(public.enabled, "nothing was masked: restored enabled");
+    assert_eq!(public.url.unwrap().expose(), "https://pub.example/list?country=zz-keepq");
+}
+
 #[test]
 fn merge_restore_matches_sources_and_keeps_newer_local_data() {
     let creds = Creds::new("merge");

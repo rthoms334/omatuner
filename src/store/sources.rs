@@ -183,7 +183,11 @@ pub(crate) fn purge_source(conn: &Connection, id: SourceId) -> Result<()> {
 
 /// Delete a source: first `epg::delete_programmes_of(PlaylistSource(id))` in chunks (FTS rows
 /// first), then the row (cascades catalogue, provider EPG sources/channels and user data).
-pub fn delete_source(conn: &mut Connection, id: SourceId) -> Result<()> { purge_source(conn, id) }
+pub fn delete_source(conn: &mut Connection, id: SourceId) -> Result<()> {
+    purge_source(conn, id)?;
+    // other sources' channels mapped to this source's provider guide fall back to the next one
+    crate::store::epg::resolve_mappings(conn)
+}
 
 /// Persist `sort_index` = position in `order`.
 pub fn reorder_sources(conn: &mut Connection, order: &[SourceId]) -> Result<()> {
@@ -379,10 +383,16 @@ pub fn ensure_provider_epg(conn: &mut Connection, source: SourceId, urls: &[Stri
         rows.collect::<rusqlite::Result<_>>()?
     };
     // advertised no more: programmes first (chunked), then the row (cascades channels/mappings)
+    let mut purged = false;
     for (id, _) in existing.iter().filter(|(_, u)| !wanted.contains(&u.as_str())) {
         purge_epg_source(conn, *id)?;
+        purged = true;
     }
     let tx = conn.transaction()?;
+    if purged {
+        // channels that used a dropped guide fall back to the next source
+        crate::store::epg::resolve_mappings(&tx)?;
+    }
     let mut ids = Vec::with_capacity(wanted.len());
     for (i, url) in wanted.iter().enumerate() {
         if let Some((id, _)) = existing.iter().find(|(_, u)| u == url) {

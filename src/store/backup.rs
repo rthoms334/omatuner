@@ -8,7 +8,9 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::LazyLock;
 
+use regex::Regex;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
@@ -103,9 +105,26 @@ pub struct RestoreReport {
     pub needs_credentials: Vec<String>,
 }
 
-/// Credential-free form of a URL (userinfo, credential query values and registered secrets
-/// masked as `***`) — what an export without passwords stores.
-fn strip_credentials(url: &str) -> String { crate::redact::redact_url(url) }
+/// Credential-free form of a URL (userinfo, credential query values and Xtream path
+/// credentials masked as `***`) — what an export without passwords stores.
+///
+/// Deliberately NOT `redact::redact_url`: that also masks every registered secret, and every
+/// query value of every source URL is registered, so harmless parts (`?country=uk`) would be
+/// lost from the backup for good.
+fn strip_credentials(url: &str) -> String {
+    static USERINFO: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)^([a-z][a-z0-9+.-]*://)([^/@\s:]+)(:[^/@\s]*)?@").expect("valid regex"));
+    // same credential keys as the log redaction (DESIGN §20)
+    static QUERY_CRED: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)([?&;](?:username|user|password|pass|pwd|token|auth|key|sig|signature|apikey|api_key|access_token)=)([^&#\s]*)")
+            .expect("valid regex")
+    });
+    static XTREAM_PATH: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)(/(?:live|movie|series|timeshift)/)([^/\s?#]+)/([^/\s?#]+)/").expect("valid regex"));
+    let out = USERINFO.replace(url, "${1}***@");
+    let out = QUERY_CRED.replace_all(&out, "${1}***");
+    XTREAM_PATH.replace_all(&out, "${1}***/***/").into_owned()
+}
 
 /// A URL that went through [`strip_credentials`] and lost something.
 fn is_stripped(url: &str) -> bool { url.contains("***") }

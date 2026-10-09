@@ -147,6 +147,9 @@ pub fn begin_epg_import(conn: &Connection, id: EpgSourceId) -> Result<EpgImport>
 /// would cascade the live guide away) + replace their display names; sets `seen_gen`.
 pub fn write_epg_channels(conn: &mut Connection, imp: &mut EpgImport, batch: &[ImportEpgChannel]) -> Result<()> {
     let tx = conn.transaction()?;
+    // ids join `imp.channel_ids` only once committed: a rolled-back batch must not leave ids
+    // that a later batch would reference
+    let mut ids = Vec::with_capacity(batch.len());
     {
         let mut up = tx.prepare_cached(
             "INSERT INTO epg_channel(epg_source_id, xmltv_id, icon, seen_gen) VALUES (?1, ?2, ?3, ?4)
@@ -164,10 +167,11 @@ pub fn write_epg_channels(conn: &mut Connection, imp: &mut EpgImport, batch: &[I
             for (name, norm) in &ch.display_names {
                 ins.execute(params![id, name, norm])?;
             }
-            imp.channel_ids.insert(ch.xmltv_id.clone(), id);
+            ids.push((ch.xmltv_id.clone(), id));
         }
     }
     tx.commit()?;
+    imp.channel_ids.extend(ids);
     Ok(())
 }
 
@@ -179,6 +183,8 @@ pub fn write_programmes(conn: &mut Connection, imp: &mut EpgImport, batch: &[Imp
     let tx = conn.transaction()?;
     let mut inserted = 0usize;
     let mut max_stop: Option<Timestamp> = None;
+    // channels created by this batch; merged into `imp.channel_ids` after the commit
+    let mut new_ids: HashMap<String, EpgChannelId> = HashMap::new();
     {
         // programmes of channels the file never declared: create the channel (keeps any icon)
         let mut auto = tx.prepare_cached(
@@ -195,11 +201,11 @@ pub fn write_programmes(conn: &mut Connection, imp: &mut EpgImport, batch: &[Imp
         )?;
         let mut fts = tx.prepare_cached("INSERT INTO programme_fts(rowid, title, sub_title) VALUES (?1, ?2, ?3)")?;
         for p in batch {
-            let ch = match imp.channel_ids.get(&p.xmltv_id) {
+            let ch = match imp.channel_ids.get(&p.xmltv_id).or_else(|| new_ids.get(&p.xmltv_id)) {
                 Some(id) => *id,
                 None => {
                     let id: EpgChannelId = auto.query_row(params![imp.epg_source, p.xmltv_id, imp.generation], |r| r.get(0))?;
-                    imp.channel_ids.insert(p.xmltv_id.clone(), id);
+                    new_ids.insert(p.xmltv_id.clone(), id);
                     id
                 }
             };
@@ -246,6 +252,7 @@ pub fn write_programmes(conn: &mut Connection, imp: &mut EpgImport, batch: &[Imp
         )?;
     }
     tx.commit()?;
+    imp.channel_ids.extend(new_ids);
     Ok(inserted)
 }
 
@@ -289,19 +296,31 @@ pub fn finish_epg_import(conn: &mut Connection, imp: &EpgImport, now: Timestamp)
 }
 
 /// Delete everything written for `imp.generation` (cancel/failure): FTS rows by rowid, then
-/// programmes, chunked (one tx per chunk).
+/// programmes, chunked (one tx per chunk); then the guide channels only this run introduced,
+/// and re-resolve mappings.
 pub fn abort_epg_import(conn: &mut Connection, imp: &EpgImport) -> Result<()> {
     let sel = "SELECT id FROM programme WHERE epg_source_id = ?1 AND gen = ?2 LIMIT ?3";
     while delete_selected(conn, sel, params![imp.epg_source, imp.generation, ABORT_CHUNK])? > 0 {}
     atomic(conn, |c| {
-        // channels touched by the aborted run belong to the active guide again
+        // channels only the aborted run introduced (no programmes left at all) go away
         c.execute(
-            "UPDATE epg_channel SET seen_gen = (SELECT active_gen FROM epg_source WHERE id = ?1)
+            "DELETE FROM epg_channel WHERE epg_source_id = ?1 AND seen_gen = ?2
+               AND NOT EXISTS (SELECT 1 FROM programme p WHERE p.epg_channel_id = epg_channel.id)",
+            params![imp.epg_source, imp.generation],
+        )?;
+        // the rest belong to the active guide again if it has programmes for them; otherwise
+        // they were already on their way out (older generations only) and stay sweepable
+        c.execute(
+            "UPDATE epg_channel SET seen_gen = CASE
+                 WHEN EXISTS (SELECT 1 FROM programme p WHERE p.epg_channel_id = epg_channel.id AND p.gen = es.active_gen)
+                 THEN es.active_gen ELSE es.active_gen - 1 END
+             FROM (SELECT active_gen FROM epg_source WHERE id = ?1) AS es
              WHERE epg_source_id = ?1 AND seen_gen = ?2",
             params![imp.epg_source, imp.generation],
         )?;
         c.execute("DELETE FROM meta WHERE key = ?1", [import_meta_key(imp.epg_source, imp.generation)])?;
-        Ok(())
+        // mappings that resolved to a removed channel fall back to the next guide
+        resolve_mappings(c)
     })
 }
 

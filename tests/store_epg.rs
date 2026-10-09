@@ -260,8 +260,9 @@ fn aborted_import_keeps_the_old_guide_and_leaves_no_rows() {
     assert_eq!(count(&r, "SELECT count(*) FROM programme"), 24);
     assert_eq!(titles(&epg::window(&r, a, T0, T0 + H).unwrap()), vec!["Old 0"]);
     assert_eq!(count(&r, "SELECT count(*) FROM meta WHERE key LIKE 'epg-import:%'"), 0);
+    assert_eq!(count(&r, "SELECT count(*) FROM epg_channel"), 1, "the channel the aborted run introduced is gone");
     assert_fts_consistent(&r);
-    // the next import starts cleanly and drops the channel the aborted run introduced
+    // the next import starts cleanly
     let sum = import_guide(&s, g, vec![echan("a.tv", &["A"])], hourly(&["a.tv"], T0, 2, "Next"), T0 + 1);
     assert_eq!((sum.channels, sum.programmes), (1, 2));
     assert_eq!(count(&r, "SELECT count(*) FROM epg_channel"), 1);
@@ -596,4 +597,100 @@ fn matching_inputs_and_automatic_mapping_replacement() {
     // replacing with nothing clears the automatic rows
     auto_map(&s, p, g, &[]);
     assert_eq!(epg::epg_channel_for(&r, a).unwrap(), None);
+}
+
+/// An aborted run's new guide channels are removed and mappings that resolved to them fall
+/// back; channels the active guide still has programmes for stay current.
+#[test]
+fn aborted_import_removes_its_new_channels_and_re_resolves() {
+    let s = store("tuner-se-abort-resolve");
+    let p = playlist(&s, &[("m3u:n", "N", None, 0)]);
+    let g1 = url_guide(&s, "G1", 0);
+    let g2 = url_guide(&s, "G2", 0);
+    import_guide(&s, g1, vec![echan("a.tv", &["A"])], hourly(&["a.tv"], T0, 2, "A"), T0);
+    import_guide(&s, g2, vec![echan("n.tv", &["N"])], hourly(&["n.tv"], T0, 2, "N"), T0);
+    auto_map(&s, p, g1, &[("m3u:n", "n.tv", EpgMatchMethod::TvgIdExact)]);
+    auto_map(&s, p, g2, &[("m3u:n", "n.tv", EpgMatchMethod::TvgIdExact)]);
+    let r = s.reader().unwrap();
+    let n = channel_id(&r, p, "m3u:n");
+    assert_eq!(epg::epg_channel_for(&r, n).unwrap(), Some(epg_id(&r, g2, "n.tv")), "G1 has no n.tv yet");
+    let imp = w(&s, move |c| {
+        let mut imp = epg::begin_epg_import(c, g1)?;
+        epg::write_epg_channels(c, &mut imp, &[echan("a.tv", &["A"]), echan("n.tv", &["N"])])?;
+        epg::write_programmes(c, &mut imp, &hourly(&["a.tv", "n.tv"], T0, 2, "New"))?;
+        // e.g. another guide finished meanwhile: the in-progress channel is picked up
+        epg::resolve_mappings(c)?;
+        Ok(imp)
+    });
+    assert_eq!(epg::epg_channel_for(&r, n).unwrap(), Some(epg_id(&r, g1, "n.tv")));
+    w(&s, move |c| epg::abort_epg_import(c, &imp));
+    assert_eq!(epg::epg_channel_for(&r, n).unwrap(), Some(epg_id(&r, g2, "n.tv")), "falls back after the abort");
+    let current: Vec<String> = epg::epg_channels(&r, g1).unwrap().into_iter().map(|c| c.xmltv_id).collect();
+    assert_eq!(current, vec!["a.tv".to_string()]);
+    assert_eq!(count(&r, &format!("SELECT count(*) FROM epg_channel WHERE epg_source_id = {}", g1.0)), 1);
+    assert_fts_consistent(&r);
+}
+
+/// Deleting a playlist source drops its provider guide; other sources' channels mapped to it
+/// fall back to the next guide at once (same when a refresh stops advertising the guide).
+#[test]
+fn delete_source_re_resolves_channels_mapped_to_its_provider_guide() {
+    let s = store("tuner-se-delsrc-resolve");
+    let other = playlist(&s, &[("m3u:x", "X", None, 0)]);
+    let owner = playlist(&s, &[("m3u:y", "Y", None, 0)]);
+    let pe = w(&s, move |c| Ok(sources::ensure_provider_epg(c, owner, &["http://h.test/xmltv.php".to_string()])?[0]));
+    let g2 = url_guide(&s, "G2", 0);
+    import_guide(&s, pe, vec![echan("x.tv", &["X"])], hourly(&["x.tv"], T0, 2, "p"), T0);
+    import_guide(&s, g2, vec![echan("x.tv", &["X"])], hourly(&["x.tv"], T0, 2, "u"), T0);
+    auto_map(&s, other, pe, &[("m3u:x", "x.tv", EpgMatchMethod::TvgIdExact)]);
+    auto_map(&s, other, g2, &[("m3u:x", "x.tv", EpgMatchMethod::TvgIdExact)]);
+    let r = s.reader().unwrap();
+    let x = channel_id(&r, other, "m3u:x");
+    assert_eq!(epg::epg_channel_for(&r, x).unwrap(), Some(epg_id(&r, pe, "x.tv")), "provider guide first");
+    w(&s, move |c| sources::delete_source(c, owner));
+    assert_eq!(epg::epg_channel_for(&r, x).unwrap(), Some(epg_id(&r, g2, "x.tv")));
+
+    let owner2 = playlist(&s, &[("m3u:z", "Z", None, 0)]);
+    let pe2 = w(&s, move |c| Ok(sources::ensure_provider_epg(c, owner2, &["http://h.test/xmltv2.php".to_string()])?[0]));
+    import_guide(&s, pe2, vec![echan("x.tv", &["X"])], hourly(&["x.tv"], T0, 2, "p2"), T0);
+    auto_map(&s, other, pe2, &[("m3u:x", "x.tv", EpgMatchMethod::TvgIdExact)]);
+    assert_eq!(epg::epg_channel_for(&r, x).unwrap(), Some(epg_id(&r, pe2, "x.tv")));
+    w(&s, move |c| sources::ensure_provider_epg(c, owner2, &[]));
+    assert_eq!(epg::epg_channel_for(&r, x).unwrap(), Some(epg_id(&r, g2, "x.tv")));
+}
+
+/// "Attach to…" onto a channel that already has an automatic row for the same guide: the
+/// manual mapping is never overwritten. If the target has a manual mapping of its own, it wins.
+#[test]
+fn reassign_keeps_manual_mapping_over_target_automatic_row() {
+    let s = store("tuner-se-reassign-manual");
+    let p = playlist(&s, &[("m3u:old", "Old", None, 0), ("m3u:new", "New", None, 0), ("m3u:other", "Other", None, 0)]);
+    let g = url_guide(&s, "G", 0);
+    let ids = ["a.tv", "b.tv", "c.tv"];
+    import_guide(&s, g, ids.iter().map(|i| echan(i, &[i])).collect(), hourly(&ids, T0, 2, "x"), T0);
+    auto_map(&s, p, g, &[("m3u:new", "b.tv", EpgMatchMethod::TvgIdExact)]);
+    let (old, new) = (ch_ref(p, "m3u:old"), ch_ref(p, "m3u:new"));
+    let (o, n) = (old.clone(), new.clone());
+    w(&s, move |c| {
+        epg::set_manual_mapping(c, &o, g, "a.tv")?;
+        tuner::store::user::reassign(c, &o, &n)
+    });
+    let r = s.reader().unwrap();
+    let maps = epg::mappings_for_channel(&r, &new).unwrap();
+    assert_eq!(maps.len(), 1, "{maps:?}");
+    assert_eq!((maps[0].method, maps[0].xmltv_id.as_str()), (EpgMatchMethod::Manual, "a.tv"));
+    assert!(epg::mappings_for_channel(&r, &old).unwrap().is_empty());
+    assert_eq!(epg::epg_channel_for(&r, channel_id(&r, p, "m3u:new")).unwrap(), Some(epg_id(&r, g, "a.tv")));
+
+    // the target's own manual mapping wins; the moved one is dropped (one manual row each)
+    let other = ch_ref(p, "m3u:other");
+    let (ot, n) = (other.clone(), new.clone());
+    w(&s, move |c| {
+        epg::set_manual_mapping(c, &ot, g, "c.tv")?;
+        tuner::store::user::reassign(c, &ot, &n)
+    });
+    let maps = epg::mappings_for_channel(&r, &new).unwrap();
+    assert_eq!(maps.len(), 1, "{maps:?}");
+    assert_eq!((maps[0].method, maps[0].xmltv_id.as_str()), (EpgMatchMethod::Manual, "a.tv"));
+    assert!(epg::mappings_for_channel(&r, &other).unwrap().is_empty());
 }

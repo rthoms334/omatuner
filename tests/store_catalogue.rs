@@ -327,6 +327,27 @@ fn vanished_items_are_swept_only_for_completed_kinds() {
 }
 
 #[test]
+fn item_group_missing_from_upsert_groups_survives_the_sweep() {
+    let s = store("tuner-st-stale-group");
+    let src = w(&s, |c| sources::insert_source(c, &m3u_draft("S", "http://h/s.m3u"), NOW));
+    run_import(&s, src, vec![chan("m3u:a", "A", None, "News", "http://h.tv/a.ts", 0)], vec![], vec![], ALL.to_vec(), NOW);
+    let r = s.reader().unwrap();
+    let (gid, name): (i64, String) = r.query_row("SELECT id, name FROM grp WHERE kind = 'channel'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    // second import: the group list omits "News" but the channel still names it
+    let a = chan("m3u:a", "A", None, "News", "http://h.tv/a.ts", 0);
+    w(&s, move |c| {
+        let imp = import::begin_catalogue(c, src, NOW)?;
+        import::upsert_groups(c, &imp, &[])?;
+        import::write_channels(c, &imp, &[a])?;
+        import::finish_catalogue(c, &imp, &ALL, NOW)
+    });
+    assert_eq!(count(&r, "SELECT count(*) FROM channel_group"), 1, "membership kept");
+    let (gid2, name2): (i64, String) =
+        r.query_row("SELECT id, name FROM grp WHERE kind = 'channel'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!((gid2, name2), (gid, name), "same group row, name kept");
+}
+
+#[test]
 fn cancelled_import_neither_sweeps_nor_bumps_generation() {
     let s = store("tuner-st-cancel");
     let src = w(&s, |c| sources::insert_source(c, &m3u_draft("S", "http://h/s.m3u"), NOW));

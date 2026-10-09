@@ -691,6 +691,30 @@ pub(crate) fn move_user_data(conn: &Connection, from: &ItemRef, to: &ItemRef) ->
         return Ok(());
     }
     let fp = fp_opt(&fingerprint_of(conn, to)?);
+    if from.kind == ItemKind::Channel {
+        // `channel_epg_map` is keyed per (channel, guide) whatever the method, so the generic
+        // move below would lose `from`'s manual row to an automatic row of `to` on the same
+        // guide. Manual mappings are never overwritten: drop those automatic rows first. A
+        // channel has at most one manual mapping, so if `to` already has one it wins.
+        let to_has_manual: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM channel_epg_map WHERE source_id = ?1 AND channel_key = ?2 AND method = 'manual')",
+            params![to.source, to.key.as_str()],
+            |r| r.get(0),
+        )?;
+        if to_has_manual {
+            conn.execute(
+                "DELETE FROM channel_epg_map WHERE source_id = ?1 AND channel_key = ?2 AND method = 'manual'",
+                params![from.source, from.key.as_str()],
+            )?;
+        } else {
+            conn.execute(
+                "DELETE FROM channel_epg_map WHERE source_id = ?3 AND channel_key = ?4 AND method != 'manual'
+                   AND epg_source_id IN (SELECT epg_source_id FROM channel_epg_map
+                                         WHERE source_id = ?1 AND channel_key = ?2 AND method = 'manual')",
+                params![from.source, from.key.as_str(), to.source, to.key.as_str()],
+            )?;
+        }
+    }
     for (table, key, extra) in holders_for(from.kind) {
         conn.execute(
             &format!(
