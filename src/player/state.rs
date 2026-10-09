@@ -109,7 +109,12 @@ pub struct PlayerMachine {
     awaiting_start: bool,
     /// `Loaded` arrived without an id (or our entry redirected): accept the next START_FILE.
     accept_any_start: bool,
+    /// Backoff attempts (Network/Timeout/Stalled/EOF/5xx…); reset by stable playback.
     attempt: u32,
+    /// The one 401/403/404 retry of §11.4 was spent. Counted apart from `attempt`: a 403 right
+    /// after a network reconnect (the provider still counts the dropped connection) is exactly
+    /// the connection-limit race that retry exists for.
+    http_retry_used: bool,
     playing_since: Option<Instant>,
     /// Last `time-pos` of the CURRENT target (only accepted after START_FILE of our entry, so
     /// the replaced file's positions never leak into resume/progress).
@@ -134,6 +139,7 @@ impl PlayerMachine {
             awaiting_start: false,
             accept_any_start: false,
             attempt: 0,
+            http_retry_used: false,
             playing_since: None,
             last_pos: None,
             last_pos_change: None,
@@ -159,6 +165,7 @@ impl PlayerMachine {
                 }
                 self.target = Some(target.clone());
                 self.attempt = 0;
+                self.http_retry_used = false;
                 self.history_pushed = false;
                 self.last_http = None;
                 self.last_pos = None;
@@ -184,11 +191,13 @@ impl PlayerMachine {
                 fx.push(Effect::StopMpv);
                 self.target = None;
                 self.attempt = 0;
+                self.http_retry_used = false;
                 self.set_state(PlayerState::Idle, &mut fx);
             }
             Input::Retry => {
                 if matches!(self.state, PlayerState::Error(_) | PlayerState::Reconnecting { .. }) && self.target.is_some() {
                     self.attempt = 0;
+                    self.http_retry_used = false;
                     self.begin_load(now, &mut fx);
                 }
             }
@@ -365,11 +374,12 @@ impl PlayerMachine {
                     self.fail(PlayerErrorKind::Stalled, now, fx);
                     return;
                 }
-                if self.attempt > 0
+                if (self.attempt > 0 || self.http_retry_used)
                     && let Some(s) = self.playing_since
                     && now.duration_since(s) >= self.cfg.policy.stable_after
                 {
                     self.attempt = 0;
+                    self.http_retry_used = false;
                 }
             }
             PlayerState::Reconnecting { at, .. } if now >= at => self.begin_load(now, fx),
@@ -397,16 +407,19 @@ impl PlayerMachine {
 
     fn fail(&mut self, kind: PlayerErrorKind, now: Instant, fx: &mut Vec<Effect>) {
         let live = self.target.as_ref().map(|t| t.kind.is_live()).unwrap_or(true);
-        let next = self.attempt + 1;
+        let http_once = matches!(kind, PlayerErrorKind::HttpForbidden | PlayerErrorKind::HttpNotFound);
+        // the one-shot HTTP retry has its own counter (see `http_retry_used`)
+        let next = if http_once { 1 + u32::from(self.http_retry_used) } else { self.attempt + 1 };
         fx.push(Effect::StopMpv);
         self.clear_entries();
         match self.cfg.policy.delay(next, kind, live) {
             Some(d) => {
-                self.attempt = next;
-                let max = match kind {
-                    PlayerErrorKind::HttpForbidden | PlayerErrorKind::HttpNotFound => 1,
-                    _ if live => self.cfg.policy.max_attempts_live,
-                    _ => self.cfg.policy.max_attempts_vod,
+                let max = if http_once {
+                    self.http_retry_used = true;
+                    1
+                } else {
+                    self.attempt = next;
+                    if live { self.cfg.policy.max_attempts_live } else { self.cfg.policy.max_attempts_vod }
                 };
                 self.set_state(PlayerState::Reconnecting { attempt: next, max, at: now + d, reason: kind }, fx);
             }
@@ -658,6 +671,83 @@ mod tests {
             }
         }
         assert!(matches!(m.state(), PlayerState::Error(PlayerError { kind: PlayerErrorKind::HttpForbidden, .. })));
+    }
+
+    /// Review fix: the 3 s retry of a 403 is not used up by earlier network reconnects (the
+    /// provider may still count the dropped connection), and a 404 likewise keeps its retry.
+    #[test]
+    fn http_retry_survives_earlier_network_reconnects() {
+        for (code, kind) in [(403, PlayerErrorKind::HttpForbidden), (404, PlayerErrorKind::HttpNotFound)] {
+            let mut m = machine();
+            let mut t = Instant::now();
+            start_playing(&mut m, live(), 1, t);
+            // two network drops → backoff attempts 1 and 2
+            for entry in 1..=2 {
+                m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry }, t);
+                let PlayerState::Reconnecting { at, attempt, reason: PlayerErrorKind::Network, .. } = m.state().clone() else {
+                    panic!("{:?}", m.state())
+                };
+                assert_eq!(attempt, entry as u32);
+                t = at;
+                assert!(has_load(&m.handle(Input::Tick, t)));
+                m.handle(Input::Loaded { entry: Some(entry + 1) }, t);
+                m.handle(Input::StartFile { entry: entry + 1 }, t);
+            }
+            // the reconnect is refused: one HTTP retry, then Error
+            m.handle(Input::HttpStatus(code), t);
+            let fx = m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry: 3 }, t);
+            assert!(recorded(&fx).is_none(), "{code}: no failure recorded while retrying");
+            let PlayerState::Reconnecting { at, attempt: 1, max: 1, reason, .. } = m.state().clone() else {
+                panic!("{code}: {:?}", m.state())
+            };
+            assert_eq!(reason, kind);
+            t = at;
+            assert!(has_load(&m.handle(Input::Tick, t)));
+            m.handle(Input::Loaded { entry: Some(4) }, t);
+            m.handle(Input::StartFile { entry: 4 }, t);
+            m.handle(Input::HttpStatus(code), t);
+            let fx = m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry: 4 }, t);
+            assert!(matches!(m.state(), PlayerState::Error(PlayerError { kind: k, .. }) if *k == kind), "{code}: {:?}", m.state());
+            assert_eq!(recorded(&fx), Some(kind));
+            m.handle(Input::Retry, t);
+            assert!(matches!(m.state(), PlayerState::Loading { attempt: 0, .. }), "user retry resets both counters");
+        }
+    }
+
+    #[test]
+    fn http_retry_is_restored_by_stable_playback_and_by_a_new_play() {
+        let mut m = machine();
+        let t0 = Instant::now();
+        m.handle(Input::Play { target: live(), immediate: true }, t0);
+        m.handle(Input::Loaded { entry: Some(1) }, t0);
+        m.handle(Input::StartFile { entry: 1 }, t0);
+        m.handle(Input::HttpStatus(403), t0);
+        m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry: 1 }, t0);
+        assert!(matches!(m.state(), PlayerState::Reconnecting { reason: PlayerErrorKind::HttpForbidden, .. }));
+        m.handle(Input::Tick, t0 + secs(3));
+        reload_playing(&mut m, 2, t0 + secs(3));
+        // ≥ 30 s of stable playback: the retry is available again
+        for s in (4..=34).step_by(2) {
+            m.handle(Input::TimePos(s as f64), t0 + secs(s));
+            m.handle(Input::Tick, t0 + secs(s));
+        }
+        m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry: 2 }, t0 + secs(34));
+        m.handle(Input::Tick, t0 + secs(35));
+        m.handle(Input::Loaded { entry: Some(3) }, t0 + secs(35));
+        m.handle(Input::StartFile { entry: 3 }, t0 + secs(35));
+        m.handle(Input::HttpStatus(403), t0 + secs(35));
+        m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry: 3 }, t0 + secs(35));
+        assert!(matches!(m.state(), PlayerState::Reconnecting { reason: PlayerErrorKind::HttpForbidden, .. }), "{:?}", m.state());
+
+        // spent retry, then a new Play: the new target gets its own retry
+        m.handle(Input::Tick, t0 + secs(38));
+        m.handle(Input::Loaded { entry: Some(4) }, t0 + secs(38));
+        m.handle(Input::Play { target: live(), immediate: true }, t0 + secs(38));
+        m.handle(Input::Loaded { entry: Some(5) }, t0 + secs(38));
+        m.handle(Input::StartFile { entry: 5 }, t0 + secs(38));
+        m.handle(Input::HttpStatus(403), t0 + secs(38));
+        m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry: 5 }, t0 + secs(38));
+        assert!(matches!(m.state(), PlayerState::Reconnecting { reason: PlayerErrorKind::HttpForbidden, .. }), "{:?}", m.state());
     }
 
     #[test]

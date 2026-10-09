@@ -57,7 +57,7 @@ pub fn create(cfg: &Config) -> Result<Mpv> {
 /// Every config-derived setting that can change while running (DESIGN §11.5 "Settings apply
 /// live"), as `(name, value)` in mpv's option syntax. Applied at init and again by
 /// `PlayerCommand::ApplyConfig`, so the two paths cannot drift apart.
-pub fn runtime_settings(cfg: &Config) -> Vec<(&'static str, String)> {
+pub(super) fn runtime_settings(cfg: &Config) -> Vec<(&'static str, String)> {
     let p = &cfg.player;
     let readahead = if p.instant_load { 1 } else { p.cache_secs.max(1) }.to_string();
     vec![
@@ -79,15 +79,23 @@ pub fn runtime_settings(cfg: &Config) -> Vec<(&'static str, String)> {
     ]
 }
 
-/// Apply [`runtime_settings`] and changed user `mpv_options` to a running instance. Raw
-/// options take effect from the next file for most mpv options; options in
-/// [`RUNTIME_DENY`] (the VO belongs to the render API) and removed keys need a restart.
-pub fn apply_runtime(mpv: &Mpv, cfg: &Config, previous_user: &BTreeMap<String, String>) {
+/// Apply what changed from `previous` (the config currently applied) to a running instance:
+/// the [`runtime_settings`] whose value differs and changed user `mpv_options`. Unchanged
+/// settings are not re-set: `sid` is a live track switch during playback, and `sub-scale` may
+/// have been adjusted for the current stream. Raw options take effect from the next file for
+/// most mpv options; options in [`RUNTIME_DENY`] (the VO belongs to the render API) and
+/// removed keys need a restart.
+pub(super) fn apply_runtime(mpv: &Mpv, cfg: &Config, previous: &Config) {
+    let before: BTreeMap<_, _> = runtime_settings(previous).into_iter().collect();
     for (name, value) in runtime_settings(cfg) {
+        if before.get(name) == Some(&value) {
+            continue;
+        }
         if let Err(e) = mpv.set_property(name, value.as_str()) {
             tracing::warn!("mpv {name}: {}", crate::redact::redact(&e.to_string()));
         }
     }
+    let previous_user = &previous.player.mpv_options;
     for (k, v) in &cfg.player.mpv_options {
         if previous_user.get(k) == Some(v) {
             continue;
@@ -140,7 +148,7 @@ pub fn loadfile_args(p: &Playable) -> Vec<String> {
 /// The id comes from the command result (`playlist_entry_id`, mpv ≥ 0.33), which cannot race
 /// with anything else touching the playlist; `playlist/0/id` is the fallback. The error is a
 /// generic mpv error string (never the URL).
-pub fn loadfile(mpv: &Mpv, args: &[String]) -> std::result::Result<Option<i64>, String> {
+pub(super) fn loadfile(mpv: &Mpv, args: &[String]) -> std::result::Result<Option<i64>, String> {
     let mut owned = Vec::with_capacity(args.len() + 1);
     owned.push(CString::from(c"loadfile"));
     for a in args {
@@ -305,7 +313,7 @@ mod tests {
         cfg.player.demuxer_max_mib = 64;
         cfg.player.mpv_options.insert("vo".into(), "gpu".into()); // denied at runtime
         cfg.player.mpv_options.insert("video-sync".into(), "display-resample".into());
-        apply_runtime(&mpv, &cfg, &BTreeMap::new());
+        apply_runtime(&mpv, &cfg, &Config::default());
         assert_eq!(mpv.get_property::<f64>("cache-secs").unwrap(), 3.0);
         assert_eq!(mpv.get_property::<f64>("demuxer-readahead-secs").unwrap(), 3.0);
         assert_eq!(mpv.get_property::<f64>("network-timeout").unwrap(), 9.0);
@@ -313,5 +321,26 @@ mod tests {
         assert_eq!(mpv.get_property::<i64>("demuxer-max-bytes").unwrap(), 64 << 20);
         assert_eq!(mpv.get_property::<String>("video-sync").unwrap(), "display-resample");
         assert!(mpv.get_property::<String>("vo").unwrap().starts_with("null"), "the VO is never swapped at runtime");
+    }
+
+    /// Review fix: an unrelated settings change must not reset the subtitle track the user
+    /// picked (`sid` is a live track switch) nor a per-stream sub-scale adjustment.
+    #[test]
+    fn apply_runtime_leaves_unchanged_settings_alone() {
+        let mpv = headless();
+        let before = Config::default();
+        mpv.set_property("sid", "3").unwrap();
+        mpv.set_property("sub-scale", 1.4).unwrap();
+        let mut cfg = before.clone();
+        cfg.player.cache_secs = 6;
+        apply_runtime(&mpv, &cfg, &before);
+        assert_eq!(mpv.get_property::<f64>("cache-secs").unwrap(), 6.0);
+        assert_eq!(mpv.get_property::<String>("sid").unwrap(), "3", "track choice kept");
+        assert!((mpv.get_property::<f64>("sub-scale").unwrap() - 1.4).abs() < 1e-3, "per-stream sub scale kept");
+        // the subtitle mode itself changed: applied
+        let mut off = cfg.clone();
+        off.player.sub_auto = SubtitleAuto::Off;
+        apply_runtime(&mpv, &off, &cfg);
+        assert_eq!(mpv.get_property::<String>("sid").unwrap(), "no");
     }
 }

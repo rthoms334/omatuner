@@ -192,6 +192,32 @@ impl Drop for Harness {
 
 const LONG: Duration = Duration::from_secs(30);
 
+/// Debug messages of the player controller, in order (see [`controller_log`]).
+static CONTROLLER_LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Records the `message` of every event it is given into [`CONTROLLER_LOG`].
+struct CaptureLayer;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        let mut m = Message(String::new());
+        event.record(&mut m);
+        CONTROLLER_LOG.lock().unwrap_or_else(|e| e.into_inner()).push(m.0);
+    }
+}
+
+/// The controller's debug lines since the last call (the decisions mpv itself can't show:
+/// stop-before-start, `loadfile` entry ids, END_FILEs as processed).
+fn controller_log() -> Vec<String> { std::mem::take(&mut *CONTROLLER_LOG.lock().unwrap_or_else(|e| e.into_inner())) }
+
 /// Test media (or `None` → skip) plus a process-wide lock held for the whole test.
 ///
 /// The tests run one at a time: libav has ONE global log callback, and mpv routes ffmpeg's
@@ -199,10 +225,48 @@ const LONG: Duration = Duration::from_secs(30);
 /// instance per process. The app has exactly one instance; parallel tests would steal each
 /// other's HTTP statuses. `RUST_LOG=tuner=debug` shows the controller's decisions.
 fn setup() -> Option<(PathBuf, MutexGuard<'static, ()>)> {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::{EnvFilter, Layer, filter::Targets};
     static SERIAL: Mutex<()> = Mutex::new(());
-    let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).try_init();
+    let _ = tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_test_writer().with_filter(EnvFilter::from_default_env()))
+        .with(CaptureLayer.with_filter(Targets::new().with_target("tuner::player::controller", tracing::Level::DEBUG)))
+        .try_init();
     let media = ensure_media()?;
-    Some((media, SERIAL.lock().unwrap_or_else(|e| e.into_inner())))
+    let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    controller_log(); // earlier tests' lines
+    Some((media, guard))
+}
+
+/// The entry id of the first `loadfile` in `log` at or after index `from` (and its index).
+fn loadfile_entry(log: &[String], from: usize) -> Option<(usize, i64)> {
+    log.iter().enumerate().skip(from).find_map(|(i, l)| {
+        let id = l.strip_prefix("loadfile: entry Some(")?.strip_suffix(')')?.parse().ok()?;
+        Some((i, id))
+    })
+}
+
+/// Index of the controller's END_FILE line of `entry` in `log`.
+fn end_file_at(log: &[String], entry: i64) -> Option<usize> {
+    let prefix = format!("END_FILE entry {entry}:");
+    log.iter().position(|l| l.starts_with(&prefix))
+}
+
+/// The stop-before-start sequence after a switch to a same-source stream: the old entry is
+/// stopped, its END_FILE processed, and only THEN the new `loadfile` is issued (a plain
+/// `loadfile replace` issues the new load first and sees the old END_FILE afterwards).
+fn assert_stopped_before_start(log: &[String]) {
+    let (stop_at, old) = log
+        .iter()
+        .enumerate()
+        .find_map(|(i, l)| Some((i, l.strip_prefix("stop-before-start: stopping entry ")?.split(' ').next()?.parse::<i64>().ok()?)))
+        .unwrap_or_else(|| panic!("no stop-before-start: {log:#?}"));
+    let ended = end_file_at(log, old).unwrap_or_else(|| panic!("END_FILE of entry {old} never processed: {log:#?}"));
+    let (loaded, new) = loadfile_entry(log, stop_at).unwrap_or_else(|| panic!("no loadfile after the stop: {log:#?}"));
+    assert!(stop_at < ended && ended < loaded, "stop {stop_at}, END_FILE {ended}, loadfile {loaded}: {log:#?}");
+    assert_ne!(old, new);
+    assert!(!log.iter().any(|l| l.contains("did not report END_FILE in time")), "waited for END_FILE, not the deadline: {log:#?}");
 }
 
 fn is_playing(s: &PlayerState) -> bool { matches!(s, PlayerState::Playing) }
@@ -219,7 +283,13 @@ fn vod_eof_ends_saves_progress_and_history() {
     let mut h = Harness::start(headless_config(), vec![m.clone()]);
     h.play(m.media.clone(), true);
     h.wait_state(LONG, is_playing);
+    let playing = Instant::now();
+    // the start option reached mpv: playback begins near 7 s, not at 0
+    let first = h.wait_snapshot(LONG, |s| s.position.is_some()).position.unwrap();
+    assert!(first >= 6.5, "playback started at {first} s");
     let ended = h.wait_event(LONG, |e| matches!(e, PlayerEvent::Ended { .. })).expect("Ended event");
+    // ~3 s left to play (playback never runs faster than real time: from 0 it'd take ≥ 9 s)
+    assert!(playing.elapsed() < Duration::from_secs(7), "EOF after {:?}", playing.elapsed());
     assert_eq!(ended, PlayerEvent::Ended { item: m.item.clone(), finished: true });
     h.wait_state(LONG, |s| matches!(s, PlayerState::Ended));
     assert!(!h.states().iter().any(|s| matches!(s, PlayerState::Reconnecting { .. } | PlayerState::Error(_))), "{:?}", h.states());
@@ -232,9 +302,6 @@ fn vod_eof_ends_saves_progress_and_history() {
     assert!((last.duration_s.unwrap() - 10.0).abs() < 0.5);
     assert_eq!(h.rec.history.lock().unwrap().len(), 1, "history pushed once");
     assert!(h.rec.failures.lock().unwrap().iter().all(|(_, k)| k.is_none()), "a good play only clears failures");
-    // the start option reached mpv: playback began near 7 s
-    let first_req = srv.requests_for("/testsrc.mp4");
-    assert!(!first_req.is_empty());
 }
 
 #[test]
@@ -372,9 +439,13 @@ fn stop_before_start_waits_for_end_file_with_a_limit_of_one() {
     h.play(a.media.clone(), true);
     h.wait_state(LONG, is_playing);
     assert!(srv.active() >= 1, "A is still streaming when we switch");
+    controller_log();
     let mark = h.mark();
     h.play(b.media.clone(), true);
     h.wait_state_from(mark, LONG, is_playing);
+    // the controller's own ordering (the server-side check below alone can't tell: against a
+    // local server mpv usually closes A before opening B even on a plain replace)
+    assert_stopped_before_start(&controller_log());
 
     let a_reqs = srv.requests_for("/bars.ts");
     let b_reqs = srv.requests_for("/hls/seg001.ts");
@@ -384,6 +455,31 @@ fn stop_before_start_waits_for_end_file_with_a_limit_of_one() {
     }
     // (one stream alone may briefly hold two connections: ffmpeg opens the Range request of a
     // seek before closing the old one, so `max_concurrent` is not the right measure here)
+}
+
+/// Review fix: a playlist URL (`.m3u` listing the real stream) ends its entry with a redirect;
+/// the lease must follow the expanded entry so the next same-source switch still stops first.
+#[test]
+fn lease_follows_a_playlist_redirect() {
+    let Some((media, _serial)) = setup() else { return };
+    let srv = TestServer::start(media, Faults::default());
+    srv.set_throttle(Some(48 * 1024));
+    let lists = tempfile::tempdir().expect("tempdir");
+    std::fs::write(lists.path().join("ch.m3u"), format!("#EXTM3U\n#EXTINF:-1,Bars\n{}\n", srv.url("bars.ts"))).unwrap();
+    let list_srv = TestServer::start(lists.path().to_path_buf(), Faults::default());
+    let a = live(42, list_srv.url("ch.m3u"));
+    let b = live(43, srv.url("hls/seg001.ts"));
+    let mut h = Harness::start(headless_config(), vec![a.clone(), b.clone()]);
+    h.handle.send(PlayerCommand::SetConnectionLimit { source: SourceId(1), max: Some(1) });
+    h.play(a.media.clone(), true);
+    h.wait_state(LONG, is_playing);
+    assert!(!srv.requests_for("/bars.ts").is_empty(), "the playlist expanded into the stream");
+    let log = controller_log();
+    assert!(log.iter().any(|l| l.starts_with("END_FILE") && l.contains("Redirect")), "{log:#?}");
+    let mark = h.mark();
+    h.play(b.media.clone(), true);
+    h.wait_state_from(mark, LONG, is_playing);
+    assert_stopped_before_start(&controller_log());
 }
 
 #[test]

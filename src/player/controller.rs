@@ -8,7 +8,6 @@
 //! (time-pos, cache) at most every 100 ms; a repaint for time-pos only when the whole second
 //! changes (radio must not repaint the UI at audio-packet rate).
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -23,7 +22,7 @@ use super::state::{Effect, Input, MachineConfig, PlayerMachine};
 use super::tracks::{AspectMode, parse_track_list, query_stream_info};
 use super::{PlayRequest, PlayerCommand, PlayerDeps, PlayerError, PlayerErrorKind, PlayerEvent, PlayerSnapshot, PlayerState, RenderClock};
 use crate::config::Config;
-use crate::model::{HistoryEntry, MediaRef, PlayOrigin, Playable, PlayableKind, WatchProgress};
+use crate::model::{HistoryEntry, MediaRef, PlayOrigin, Playable, PlayableKind, SourceId, WatchProgress};
 use crate::msg::AppEvent;
 
 const PROGRESS_EVERY: Duration = Duration::from_secs(10);
@@ -58,6 +57,7 @@ pub fn spawn(
         budget: ConnectionBudget::default(),
         lease: None,
         lease_entry: None,
+        lease_redirected: false,
         pending: None,
         deferred_end: None,
         on_air: None,
@@ -67,7 +67,7 @@ pub fn spawn(
         force_publish: false,
         last_second: None,
         watched_pct: cfg.player.watched_pct,
-        user_options: cfg.player.mpv_options.clone(),
+        applied: Box::new(cfg.clone()),
         render_clock,
         epoch,
     };
@@ -90,6 +90,9 @@ struct Controller {
     lease: Option<Lease>,
     /// Playlist entry the current lease belongs to (released on its END_FILE).
     lease_entry: Option<i64>,
+    /// The leased entry was a playlist that expanded (END_FILE redirect): the lease moves to
+    /// the next entry that starts.
+    lease_redirected: bool,
     pending: Option<PendingLoad>,
     /// END_FILE(error) (reason, error, entry) held for [`END_FILE_LOG_GRACE`], until the instant.
     deferred_end: Option<(EndReason, i32, i64, Instant)>,
@@ -101,8 +104,8 @@ struct Controller {
     force_publish: bool,
     last_second: Option<i64>,
     watched_pct: u8,
-    /// User `mpv_options` currently applied (ApplyConfig applies only the changed ones).
-    user_options: BTreeMap<String, String>,
+    /// Config whose mpv settings are currently applied (ApplyConfig applies only changes).
+    applied: Box<Config>,
     render_clock: RenderClock,
     epoch: Instant,
 }
@@ -209,16 +212,14 @@ impl Controller {
             self.budget.release(l);
         }
         self.lease_entry = None;
+        self.lease_redirected = false;
     }
 
-    /// Stop-before-start: same source with a limit ≤ 1 (or unknown) and a stream still open →
-    /// `stop`, wait for its END_FILE (or 1.5 s), then load.
+    /// Stop-before-start (see [`must_stop_first`]): `stop`, wait for the old entry's END_FILE
+    /// (or 1.5 s), then load.
     fn load(&mut self, p: Arc<Playable>) {
-        let must_wait = match (&self.lease, p.source_id) {
-            (Some(l), Some(src)) => l.source == src && self.lease_entry.is_some() && self.budget.limit(src).is_none_or(|m| m <= 1),
-            _ => false,
-        };
-        if must_wait {
+        if let Some(old) = must_stop_first(self.lease.as_ref(), self.lease_entry, p.source_id, &self.budget) {
+            tracing::debug!("stop-before-start: stopping entry {old} and waiting for its END_FILE");
             let _ = self.mpv.command("stop", &[]);
             self.pending = Some(PendingLoad { playable: p, deadline: Instant::now() + PENDING_LOAD_MAX });
             return;
@@ -274,6 +275,7 @@ impl Controller {
                 return;
             }
         };
+        tracing::debug!("loadfile: entry {entry:?}");
         self.lease_entry = entry;
         self.feed(Input::Loaded { entry }, Instant::now());
     }
@@ -396,13 +398,15 @@ impl Controller {
         false
     }
 
-    /// Settings changed (DESIGN §13.9): everything applies at runtime — the same setting list
-    /// as at init (`mpv::runtime_settings`) plus changed raw `mpv_options`.
+    /// Settings changed (DESIGN §13.9): everything applies at runtime — the changed entries of
+    /// the setting list shared with init (`mpv::runtime_settings`) plus changed raw
+    /// `mpv_options`. Unchanged settings are left alone, so a subtitle track or sub scale the
+    /// user picked for this stream survives an unrelated settings change.
     fn apply_config(&mut self, cfg: &Config) {
         self.machine.set_config(MachineConfig::from_config(cfg));
         self.watched_pct = cfg.player.watched_pct;
-        super::mpv::apply_runtime(&self.mpv, cfg, &self.user_options);
-        self.user_options = cfg.player.mpv_options.clone();
+        super::mpv::apply_runtime(&self.mpv, cfg, &self.applied);
+        *self.applied = cfg.clone();
     }
 
     fn set_aspect(&mut self, a: AspectMode) {
@@ -447,8 +451,10 @@ impl Controller {
         tracing::debug!("END_FILE entry {entry_id}: {reason:?} ({error}) in {:?}", self.machine.state());
         let changed = self.feed(Input::EndFile { reason, error, entry: entry_id }, Instant::now());
         if self.lease_entry == Some(entry_id) && reason == EndReason::Redirect {
-            // the playlist URL expanded into new entries that keep using the source
+            // the playlist URL expanded into new entries that keep using the source; the lease
+            // follows the next one that starts (`mpv_event`, START_FILE)
             self.lease_entry = None;
+            self.lease_redirected = true;
         } else if self.lease_entry == Some(entry_id) {
             // the leased stream is really closed now
             self.release_lease();
@@ -470,7 +476,15 @@ impl Controller {
     fn mpv_event(&mut self, ev: MpvEvent) -> bool {
         let now = Instant::now();
         match ev {
-            MpvEvent::StartFile { entry_id } => self.feed(Input::StartFile { entry: entry_id }, now),
+            MpvEvent::StartFile { entry_id } => {
+                if self.lease_redirected && self.lease.is_some() {
+                    // the controller is the only playlist writer: the entry starting after a
+                    // redirect is the expansion of our leased playlist
+                    self.lease_redirected = false;
+                    self.lease_entry = Some(entry_id);
+                }
+                self.feed(Input::StartFile { entry: entry_id }, now)
+            }
             MpvEvent::FileLoaded => self.feed(Input::FileLoaded, now),
             MpvEvent::PlaybackRestart => self.feed(Input::PlaybackRestart, now),
             MpvEvent::EndFile { reason, error, entry_id } => {
@@ -636,6 +650,15 @@ impl Controller {
     }
 }
 
+/// Stop-before-start decision (DESIGN §11.5): the next stream comes from the same source as
+/// the open leased entry, and that source allows one connection or its limit is unknown —
+/// `loadfile replace` would open the new connection before the old one is closed. Returns the
+/// entry to stop and wait for.
+fn must_stop_first(lease: Option<&Lease>, lease_entry: Option<i64>, next: Option<SourceId>, budget: &ConnectionBudget) -> Option<i64> {
+    let (lease, entry, next) = (lease?, lease_entry?, next?);
+    (lease.source == next && budget.limit(next).is_none_or(|m| m <= 1)).then_some(entry)
+}
+
 /// Extract an HTTP status from an ffmpeg/mpv log line: ffmpeg's http protocol logs
 /// "HTTP error 404 Not Found", and its error strings read "Server returned 403 Forbidden
 /// (access denied)" or, for statuses without a dedicated code, "Server returned 4XX Client
@@ -657,7 +680,25 @@ pub fn http_status_in(text: &str) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::http_status_in;
+    use super::*;
+
+    #[test]
+    fn stop_first_only_for_the_same_source_with_a_limit_of_one_or_unknown() {
+        let (a, b) = (SourceId(1), SourceId(2));
+        let lease = Lease { source: a };
+        let mut budget = ConnectionBudget::default();
+        // unknown limit: assume the usual Xtream limit of 1
+        assert_eq!(must_stop_first(Some(&lease), Some(7), Some(a), &budget), Some(7));
+        budget.set_limit(a, Some(1));
+        assert_eq!(must_stop_first(Some(&lease), Some(7), Some(a), &budget), Some(7));
+        budget.set_limit(a, Some(2));
+        assert_eq!(must_stop_first(Some(&lease), Some(7), Some(a), &budget), None, "room for both: plain replace");
+        budget.set_limit(a, Some(1));
+        assert_eq!(must_stop_first(Some(&lease), Some(7), Some(b), &budget), None, "another source");
+        assert_eq!(must_stop_first(Some(&lease), Some(7), None, &budget), None, "ad-hoc URL without a source");
+        assert_eq!(must_stop_first(Some(&lease), None, Some(a), &budget), None, "no open entry");
+        assert_eq!(must_stop_first(None, Some(7), Some(a), &budget), None, "nothing leased");
+    }
 
     #[test]
     fn http_status_parse() {
