@@ -6,30 +6,362 @@
 //!   `background`.
 //! * `~/.config/omarchy/` — `shell.toml` create/modify/delete (text size override).
 //! * `~/.config/fontconfig/` — `fonts.conf` → `ThemeEvent::FontsChanged`.
-//! * Hyprland config (`~/.config/hypr/*.lua`) → re-query rounding 200 ms later (optional).
+//! * Hyprland config (`~/.config/hypr/*.lua`) → re-query rounding 250 ms later (optional).
 //!
 //! Debounce 180 ms; reload on a background thread with `Theme::try_load` — on error (e.g. the
 //! reload landed between `rm -rf current/theme` and `mv next-theme theme`) keep the current
 //! theme and retry after 300 ms (never flash the fallback palette); send
-//! `ThemeEvent::Changed(Arc<Theme>)`. Font changes: resolve + read the font files on the
-//! background thread too and send `ThemeEvent::FontsChanged(Arc<LoadedFonts>)` — the UI only
-//! installs them.
-//! If a watch can't be set up (dir missing), poll `theme.name` mtime every 5 s instead.
+//! `ThemeEvent::Changed(Arc<Theme>)`, skipping reloads that produce the theme already sent.
+//! Font changes: resolve + read the font files on the background thread too and send
+//! `ThemeEvent::FontsChanged(Arc<LoadedFonts>)` — the UI only installs them.
+//! If a watch can't be set up (dir missing), poll the watched file's mtime every 5 s instead.
+//! No hooks are written into the user's config.
 
-use crate::error::Result;
-use crate::msg::EventBus;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime};
+
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
+use notify::event::{AccessKind, AccessMode, EventKind, ModifyKind, RenameMode};
+use notify::{RecursiveMode, Watcher};
+
+use super::{Theme, ThemeEvent};
+use crate::error::{Error, Result};
+use crate::fonts::FontSet;
+use crate::msg::{AppEvent, EventBus};
 use crate::paths::AppPaths;
+
+/// Quiet period after the last relevant event before reloading.
+const DEBOUNCE: Duration = Duration::from_millis(180);
+/// Hyprland reloads its config asynchronously; give it a moment before re-querying rounding.
+const HYPR_DELAY: Duration = Duration::from_millis(250);
+/// Retry delay after a failed (raced) theme load.
+const RETRY: Duration = Duration::from_millis(300);
+/// Give up after this many consecutive failed loads (~6 s) until the next event.
+const MAX_RETRIES: u32 = 20;
+/// Poll interval for files whose directory could not be watched.
+const POLL: Duration = Duration::from_secs(5);
+
+/// What a file-system change asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Trigger {
+    /// Theme files or the user shell override changed.
+    Theme,
+    /// fontconfig configuration changed.
+    Fonts,
+    /// Hyprland config changed (rounding may differ).
+    Hypr,
+}
+
+/// Directories watched (non-recursively) and the file names in them that matter.
+struct Watched {
+    current: PathBuf,
+    omarchy_config: PathBuf,
+    fontconfig: PathBuf,
+    hypr: PathBuf,
+}
+
+impl Watched {
+    fn new(paths: &AppPaths) -> Self {
+        Self {
+            current: paths.omarchy_current(),
+            omarchy_config: paths.omarchy_config(),
+            fontconfig: paths.fontconfig_dir(),
+            hypr: paths.home.join(".config/hypr"),
+        }
+    }
+
+    /// Map one notify event to the reload it requires, if any.
+    fn classify(&self, ev: &notify::Event) -> Option<Trigger> {
+        if matches!(ev.kind, EventKind::Access(AccessKind::Open(_) | AccessKind::Read | AccessKind::Close(AccessMode::Read))) {
+            return None;
+        }
+        let removal = matches!(ev.kind, EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(RenameMode::From)));
+        ev.paths.iter().find_map(|p| {
+            let dir = p.parent()?;
+            let name = p.file_name()?.to_str()?;
+            if dir == self.current {
+                // `theme` removed / `theme.name` deleted are steps in the middle of a switch;
+                // the moved-in directory and the final `theme.name` write are what count.
+                (!removal && (name == "theme.name" || name == "theme")).then_some(Trigger::Theme)
+            } else if dir == self.omarchy_config {
+                (name == "shell.toml").then_some(Trigger::Theme)
+            } else if dir == self.fontconfig {
+                (name == "fonts.conf").then_some(Trigger::Fonts)
+            } else if dir == self.hypr {
+                (name.ends_with(".lua") || name.ends_with(".conf")).then_some(Trigger::Hypr)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Files to poll when their directory can't be watched.
+    fn poll_targets(&self, dir: &Path) -> Vec<(PathBuf, Trigger)> {
+        if dir == self.current {
+            vec![(dir.join("theme.name"), Trigger::Theme)]
+        } else if dir == self.omarchy_config {
+            vec![(dir.join("shell.toml"), Trigger::Theme)]
+        } else if dir == self.fontconfig {
+            vec![(dir.join("fonts.conf"), Trigger::Fonts)]
+        } else {
+            Vec::new() // Hyprland rounding: optional, not worth polling
+        }
+    }
+}
 
 /// Keeps the watchers alive; dropping stops them.
 pub struct ThemeWatcher {
     _watchers: Vec<notify::RecommendedWatcher>,
     _poller: Option<std::thread::JoinHandle<()>>,
+    /// Last sender of the worker's channel besides the watchers' callbacks: dropping the
+    /// watcher disconnects the channel and the worker thread exits.
+    _alive: Sender<Trigger>,
 }
 
 impl ThemeWatcher {
     /// Start watching. `ui_scale` from config is applied to reloaded themes.
-    /// SKELETON SAFE DEFAULT: `Err` (the app logs it and runs without live reload).
+    /// Directories that can't be watched are polled instead, so this fails only when the
+    /// worker thread can't be spawned.
     pub fn start(paths: AppPaths, ui_scale: f32, bus: EventBus) -> Result<Self> {
-        Err(crate::error::Error::other("theme live reload not implemented yet (WP-01)"))
+        let watched = Arc::new(Watched::new(&paths));
+        let (tx, rx) = crossbeam_channel::unbounded::<Trigger>();
+        let mut polled: Vec<(PathBuf, Trigger)> = Vec::new();
+        let dirs = [&watched.current, &watched.omarchy_config, &watched.fontconfig, &watched.hypr];
+
+        let callback = {
+            let (watched, tx) = (watched.clone(), tx.clone());
+            move |res: notify::Result<notify::Event>| match res {
+                Ok(ev) => {
+                    if let Some(t) = watched.classify(&ev) {
+                        let _ = tx.send(t);
+                    }
+                }
+                Err(e) => tracing::debug!("theme watcher: {e}"),
+            }
+        };
+        let mut watchers = Vec::new();
+        match notify::recommended_watcher(callback) {
+            Ok(mut w) => {
+                for dir in dirs {
+                    if let Err(e) = w.watch(dir, RecursiveMode::NonRecursive) {
+                        tracing::debug!("theme watcher: cannot watch {}: {e}; polling", dir.display());
+                        polled.extend(watched.poll_targets(dir));
+                    }
+                }
+                watchers.push(w);
+            }
+            Err(e) => {
+                tracing::info!("theme watcher: inotify unavailable ({e}); polling every {}s", POLL.as_secs());
+                for dir in dirs {
+                    polled.extend(watched.poll_targets(dir));
+                }
+            }
+        }
+
+        let worker = Worker { paths, ui_scale, bus, poller: Poller::new(polled), last_sent: None };
+        let handle: JoinHandle<()> = std::thread::Builder::new()
+            .name("theme-watch".into())
+            .spawn(move || worker.run(rx))
+            .map_err(|e| Error::other(format!("theme watcher thread: {e}")))?;
+        Ok(Self { _watchers: watchers, _poller: Some(handle), _alive: tx })
+    }
+}
+
+/// mtime + size of a file; `None` while it doesn't exist.
+type Fingerprint = Option<(SystemTime, u64)>;
+
+/// mtime/size fingerprints of polled files.
+struct Poller {
+    files: Vec<(PathBuf, Trigger, Fingerprint)>,
+}
+
+impl Poller {
+    fn new(targets: Vec<(PathBuf, Trigger)>) -> Self {
+        let files = targets
+            .into_iter()
+            .map(|(path, trigger)| {
+                let seen = fingerprint(&path);
+                (path, trigger, seen)
+            })
+            .collect();
+        Self { files }
+    }
+
+    fn is_active(&self) -> bool { !self.files.is_empty() }
+
+    /// Triggers for files whose fingerprint changed since the last poll.
+    fn poll(&mut self) -> Vec<Trigger> {
+        let mut out = Vec::new();
+        for (path, trigger, last) in &mut self.files {
+            let now = fingerprint(path);
+            if now != *last {
+                *last = now;
+                out.push(*trigger);
+            }
+        }
+        out
+    }
+}
+
+fn fingerprint(p: &Path) -> Fingerprint {
+    let m = std::fs::metadata(p).ok()?;
+    Some((m.modified().ok()?, m.len()))
+}
+
+struct Worker {
+    paths: AppPaths,
+    ui_scale: f32,
+    bus: EventBus,
+    poller: Poller,
+    /// The theme most recently sent (spurious events that change nothing send nothing).
+    last_sent: Option<Arc<Theme>>,
+}
+
+impl Worker {
+    fn run(mut self, rx: Receiver<Trigger>) {
+        let mut theme_due: Option<Instant> = None;
+        let mut fonts_due: Option<Instant> = None;
+        let mut retries = 0u32;
+        let mut poll_due = self.poller.is_active().then(|| Instant::now() + POLL);
+        loop {
+            let next = [theme_due, fonts_due, poll_due].into_iter().flatten().min();
+            let msg = match next {
+                Some(at) => rx.recv_deadline(at),
+                None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            };
+            let mut triggers = match msg {
+                Ok(t) => vec![t],
+                Err(RecvTimeoutError::Timeout) => Vec::new(),
+                Err(RecvTimeoutError::Disconnected) => return,
+            };
+            triggers.extend(rx.try_iter());
+            let now = Instant::now();
+            if poll_due.is_some_and(|d| d <= now) {
+                triggers.extend(self.poller.poll());
+                poll_due = Some(now + POLL);
+            }
+            for t in triggers {
+                match t {
+                    Trigger::Theme => {
+                        theme_due = Some(now + DEBOUNCE);
+                        retries = 0;
+                    }
+                    Trigger::Hypr => {
+                        theme_due = Some(theme_due.map_or(now + HYPR_DELAY, |d| d.max(now + HYPR_DELAY)));
+                        retries = 0;
+                    }
+                    Trigger::Fonts => fonts_due = Some(now + DEBOUNCE),
+                }
+            }
+
+            if theme_due.is_some_and(|d| d <= now) {
+                theme_due = None;
+                match Theme::try_load(&self.paths, self.ui_scale) {
+                    Ok(theme) => {
+                        retries = 0;
+                        self.publish(theme);
+                    }
+                    Err(e) if retries < MAX_RETRIES => {
+                        retries += 1;
+                        tracing::debug!("theme reload: {e}; retrying (keeping the current theme)");
+                        theme_due = Some(Instant::now() + RETRY);
+                    }
+                    Err(e) => tracing::warn!("theme reload: {e}; keeping the current theme"),
+                }
+            }
+            if fonts_due.is_some_and(|d| d <= now) {
+                fonts_due = None;
+                let cfg = crate::config::Config::load(&self.paths.config_file()).map(|c| c.fonts).unwrap_or_default();
+                let fonts = FontSet::resolve(&cfg).load();
+                tracing::info!("fonts reloaded ({fonts:?})");
+                self.bus.send(AppEvent::Theme(ThemeEvent::FontsChanged(Arc::new(fonts))));
+            }
+        }
+    }
+
+    fn publish(&mut self, theme: Theme) {
+        if self.last_sent.as_deref().is_some_and(|prev| same_theme(prev, &theme)) {
+            return;
+        }
+        tracing::info!("theme '{}' ({:?}) reloaded", theme.name, theme.palette.mode);
+        let theme = Arc::new(theme);
+        self.last_sent = Some(theme.clone());
+        self.bus.send(AppEvent::Theme(ThemeEvent::Changed(theme)));
+    }
+}
+
+fn same_theme(a: &Theme, b: &Theme) -> bool { a.name == b.name && a.palette == b.palette && a.shell == b.shell && a.tokens == b.tokens }
+
+#[cfg(test)]
+mod tests {
+    use notify::event::{CreateKind, DataChange, RemoveKind};
+
+    use super::*;
+
+    fn watched() -> Watched {
+        let mut paths = AppPaths::rooted(Path::new("/tmp/x"));
+        paths.home = PathBuf::from("/h");
+        Watched::new(&paths)
+    }
+
+    fn ev(kind: EventKind, paths: &[&str]) -> notify::Event {
+        let mut e = notify::Event::new(kind);
+        for p in paths {
+            e = e.add_path(PathBuf::from(p));
+        }
+        e
+    }
+
+    #[test]
+    fn classifies_theme_set_sequence() {
+        let w = watched();
+        let cur = "/h/.local/state/omarchy/current";
+        let close_write = EventKind::Access(AccessKind::Close(AccessMode::Write));
+        let modify = EventKind::Modify(ModifyKind::Data(DataChange::Any));
+        // ignored: staging dir, background symlink, removal of the old theme, reads
+        assert_eq!(w.classify(&ev(EventKind::Create(CreateKind::Folder), &[&format!("{cur}/next-theme")])), None);
+        assert_eq!(w.classify(&ev(EventKind::Create(CreateKind::Any), &[&format!("{cur}/background")])), None);
+        assert_eq!(w.classify(&ev(EventKind::Remove(RemoveKind::Folder), &[&format!("{cur}/theme")])), None);
+        assert_eq!(w.classify(&ev(EventKind::Modify(ModifyKind::Name(RenameMode::From)), &[&format!("{cur}/theme")])), None);
+        assert_eq!(w.classify(&ev(EventKind::Access(AccessKind::Open(notify::event::AccessMode::Any)), &[&format!("{cur}/theme.name")])), None);
+        // relevant: theme moved in, theme.name written
+        assert_eq!(w.classify(&ev(EventKind::Modify(ModifyKind::Name(RenameMode::To)), &[&format!("{cur}/theme")])), Some(Trigger::Theme));
+        assert_eq!(
+            w.classify(&ev(EventKind::Modify(ModifyKind::Name(RenameMode::Both)), &[&format!("{cur}/next-theme"), &format!("{cur}/theme")])),
+            Some(Trigger::Theme)
+        );
+        assert_eq!(w.classify(&ev(close_write, &[&format!("{cur}/theme.name")])), Some(Trigger::Theme));
+        assert_eq!(w.classify(&ev(modify, &[&format!("{cur}/theme.name")])), Some(Trigger::Theme));
+        // files inside the theme dir are not watched (non-recursive), and would be ignored
+        assert_eq!(w.classify(&ev(modify, &[&format!("{cur}/theme/colors.toml")])), None);
+    }
+
+    #[test]
+    fn classifies_override_fonts_hypr() {
+        let w = watched();
+        let modify = EventKind::Modify(ModifyKind::Data(DataChange::Any));
+        assert_eq!(w.classify(&ev(modify, &["/h/.config/omarchy/shell.toml"])), Some(Trigger::Theme));
+        assert_eq!(w.classify(&ev(EventKind::Remove(RemoveKind::File), &["/h/.config/omarchy/shell.toml"])), Some(Trigger::Theme));
+        assert_eq!(w.classify(&ev(modify, &["/h/.config/omarchy/shell.json"])), None);
+        assert_eq!(w.classify(&ev(modify, &["/h/.config/fontconfig/fonts.conf"])), Some(Trigger::Fonts));
+        assert_eq!(w.classify(&ev(modify, &["/h/.config/fontconfig/fonts.conf.bak"])), None);
+        assert_eq!(w.classify(&ev(modify, &["/h/.config/hypr/looknfeel.lua"])), Some(Trigger::Hypr));
+        assert_eq!(w.classify(&ev(modify, &["/h/.config/hypr/hyprland.conf"])), Some(Trigger::Hypr));
+        assert_eq!(w.classify(&ev(modify, &["/elsewhere/shell.toml"])), None);
+    }
+
+    #[test]
+    fn poller_reports_changes_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("theme.name");
+        let mut p = Poller::new(vec![(f.clone(), Trigger::Theme)]);
+        assert!(p.poll().is_empty());
+        std::fs::write(&f, "theme-a\n").unwrap();
+        assert_eq!(p.poll(), vec![Trigger::Theme]);
+        assert!(p.poll().is_empty());
+        std::fs::remove_file(&f).unwrap();
+        assert_eq!(p.poll(), vec![Trigger::Theme]);
     }
 }

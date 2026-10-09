@@ -111,6 +111,11 @@ impl Theme {
             && let Err(e) = shell.merge_override(&u) {
                 tracing::warn!("~/.config/omarchy/shell.toml: {e}");
             }
+        // The directory may have been swapped while we read it (`rm -rf theme` → `mv`): a
+        // missing colors.toml now means the pieces may come from two themes — retry instead.
+        if !dir.join("colors.toml").is_file() {
+            return Err("theme directory replaced while loading".into());
+        }
         let rounding = query_rounding().unwrap_or(0.0);
         Ok(Self::from_parts(name, palette, shell, rounding, ui_scale))
     }

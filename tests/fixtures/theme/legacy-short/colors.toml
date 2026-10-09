@@ -1,0 +1,16 @@
+# Legacy short palette names, `purple` instead of `magenta`, no bright_* and no mode
+# (exercises aliasing, derived shades and luminance-based mode detection).
+accent = "#d08770"
+bg = "#2e3440"
+dark_bg = "#272c36"
+fg = "#d8dee9"
+dark_fg = "#7b88a1"
+light_fg = "#e5e9f0"
+bright_fg = "#eceff4"
+red = "#bf616a"
+yellow = "#ebcb8b"
+green = "#a3be8c"
+cyan = "#88c0d0"
+blue = "#81a1c1"
+purple = "#b48ead"
+color8 = "#4c566a"

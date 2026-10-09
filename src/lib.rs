@@ -40,7 +40,6 @@ pub mod images;
 pub mod keymap;
 #[allow(dead_code, unused_variables, unused_imports)] // WP stubs (see crate docs)
 pub mod search;
-#[allow(dead_code, unused_variables, unused_imports)] // WP stubs (see crate docs)
 pub mod theme;
 
 #[allow(dead_code, unused_variables, unused_imports)] // WP stubs (see crate docs)
