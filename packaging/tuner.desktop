@@ -1,0 +1,23 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Tuner
+GenericName=IPTV Player
+Comment=Watch live TV, catch-up, movies and series from M3U and Xtream playlists
+Exec=tuner %U
+Icon=tuner
+Terminal=false
+StartupNotify=true
+StartupWMClass=tuner
+Categories=AudioVideo;Video;Player;TV;
+MimeType=audio/x-mpegurl;application/x-mpegurl;application/vnd.apple.mpegurl;audio/mpegurl;
+Keywords=iptv;tv;m3u;xtream;epg;live;guide;
+Actions=Guide;Live;
+
+[Desktop Action Guide]
+Name=TV Guide
+Exec=tuner --view guide
+
+[Desktop Action Live]
+Name=Live TV
+Exec=tuner --view live

@@ -1,0 +1,46 @@
+# Maintainer: Robert Thomson
+# Arch / Omarchy package for Tuner. Builds from the git checkout (makepkg -si from packaging/).
+pkgname=tuner
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Keyboard-first IPTV player for Omarchy (M3U, Xtream, XMLTV, catch-up)"
+arch=('x86_64' 'aarch64')
+url="https://example.invalid/tuner"
+license=('GPL-3.0-or-later')
+# mpv provides libmpv.so (client API >= 2.5). fontconfig for fc-match/fc-list; hyprland optional.
+depends=('mpv' 'fontconfig' 'wayland' 'libxkbcommon' 'mesa' 'gcc-libs' 'glibc')
+makedepends=('cargo' 'clang' 'git')
+optdepends=('ffmpeg: generate test media'
+            'noto-fonts-cjk: CJK channel names'
+            'noto-fonts: Arabic/Hebrew/Indic fallbacks'
+            'xdg-desktop-portal-gtk: file pickers')
+options=('!lto')
+source=()
+_srcdir="$(realpath "$startdir/..")"
+
+prepare() {
+  cd "$_srcdir"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$_srcdir"
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+check() {
+  cd "$_srcdir"
+  cargo test --frozen --release --lib
+}
+
+package() {
+  cd "$_srcdir"
+  install -Dm755 target/release/tuner "$pkgdir/usr/bin/tuner"
+  install -Dm644 packaging/tuner.desktop "$pkgdir/usr/share/applications/tuner.desktop"
+  install -Dm644 packaging/icons/tuner.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/tuner.svg"
+  install -Dm644 packaging/hypr/tuner.lua "$pkgdir/usr/share/tuner/hypr/tuner.lua"
+  install -Dm644 packaging/omarchy/omarchy-menu.jsonc "$pkgdir/usr/share/tuner/omarchy/omarchy-menu.jsonc"
+  install -Dm644 docs/DESIGN.md "$pkgdir/usr/share/doc/tuner/DESIGN.md"
+}

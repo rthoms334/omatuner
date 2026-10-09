@@ -1,0 +1,25 @@
+﻿#EXTM3U url-tvg="http://epg.example/a.xml.gz,http://epg.example/b.xml" tvg-shift="-1.5" catchup="shift" catchup-days="3"
+#EXTINF:-1 tvg-id="bbc1.uk" tvg-name="BBC One" tvg-logo="http://logos.example/bbc1.png" tvg-chno="101" group-title="UK;News",UK | BBC One FHD
+http://streams.example/live/bbc1.m3u8
+
+#EXTINF:-1 tvg-id='cnn.us@SD' group-title='News' tvg-logo=cnn.png,CNN, International
+#EXTVLCOPT:http-user-agent=Mozilla/5.0 (X11)
+#EXTVLCOPT:http-referrer=https://cnn.example/
+cnn/index.m3u8
+#EXTGRP:Sports
+#EXTINF:0 Tvg-Id="espn" tvg-name="ESPN, HD",ESPN HD
+http://streams.example/espn.ts|User-Agent=VLC&Referer=http://a.example/
+#EXTINF:-1 tvg-id="drm1" group-title="Premium",Premium DRM
+#KODIPROP:inputstream.adaptive.manifest_type=mpd
+#KODIPROP:inputstream.adaptive.license_type=com.widevine.alpha
+https://drm.example/manifest.mpd
+#EXTINF:-1 tvg-id="arch" catchup="xc" catchup-days="7" group-title="Archive",Archive Channel
+http://panel.example:8080/live/user/pass/1234.ts
+#EXTINF:-1 timeshift="2" group-title="Archive",Legacy Timeshift
+http://fs.example/ch/mpegts
+#EXTINF:-1 radio="true" group-title="Radio",Radio One
+http://radio.example/one.aac
+# a comment line
+http://bare.example/path/bare-stream.m3u8
+#EXTINF:-1 group-title="News",CNN, International
+http://streams.example/cnn-backup.m3u8

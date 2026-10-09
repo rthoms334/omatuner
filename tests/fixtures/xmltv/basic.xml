@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE tv SYSTEM "xmltv.dtd">
+<tv generator-info-name="fixture">
+  <channel id="bbc1.uk">
+    <display-name lang="en">BBC One</display-name>
+    <display-name>BBC 1 HD</display-name>
+    <icon src="http://logos.example/bbc1.png"/>
+  </channel>
+  <channel id="cnn.us@SD">
+    <display-name>CNN International</display-name>
+  </channel>
+  <channel id="espn">
+    <display-name>ESPN</display-name>
+  </channel>
+  <programme start="20261009200000 +0100" stop="20261009210000 +0100" channel="bbc1.uk" catchup-id="abc123">
+    <title lang="cy">Newyddion</title>
+    <title lang="en">News at Eight</title>
+    <sub-title>Headlines &amp; weather</sub-title>
+    <desc lang="en">Tom &amp; Jerry&#39;s &lt;special&gt; report.</desc>
+    <category>News</category>
+    <category>Current affairs</category>
+    <episode-num system="xmltv_ns">1.4.0/1</episode-num>
+    <icon src="http://img.example/p1.jpg"/>
+    <new/>
+  </programme>
+  <programme start="20261009210000 +0100" stop="20261009220000 +0100" channel="bbc1.uk">
+    <title>Drama</title>
+    <episode-num system="onscreen">S03E14</episode-num>
+    <previously-shown/>
+  </programme>
+  <programme start="20261009190000" stop="20261009200000" channel="cnn.us@SD">
+    <title>World Report</title>
+  </programme>
+  <programme start="202610092000 Z" channel="cnn.us@SD">
+    <title>No stop time</title>
+  </programme>
+  <programme start="20261009200000 BST" stop="20261009203000 BST" channel="espn">
+    <title>Sport</title>
+    <live/>
+  </programme>
+  <programme start="garbage" stop="20261009203000" channel="espn">
+    <title>Unparsable start (skipped)</title>
+  </programme>
+  <programme start="20261009203000 +0000" stop="20261009210000 +0000" channel="unknown.channel">
+    <title>Programme for a channel without a channel element</title>
+  </programme>
+</tv>

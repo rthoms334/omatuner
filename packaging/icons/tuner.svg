@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- Tuner app icon: square-cornered screen with antenna and signal bars (Omarchy: no rounding). -->
+  <rect width="256" height="256" fill="#151E26"/>
+  <path d="M96 40 L128 72 L160 40" fill="none" stroke="#ECE5D8" stroke-width="10" stroke-linecap="square"/>
+  <rect x="36" y="72" width="184" height="128" fill="none" stroke="#ECE5D8" stroke-width="12"/>
+  <rect x="64" y="148" width="20" height="28" fill="#F3B77B"/>
+  <rect x="96" y="128" width="20" height="48" fill="#F3B77B"/>
+  <rect x="128" y="108" width="20" height="68" fill="#F3B77B"/>
+  <rect x="160" y="96" width="20" height="80" fill="#F3B77B" opacity="0.45"/>
+  <rect x="84" y="210" width="88" height="10" fill="#ECE5D8"/>
+</svg>

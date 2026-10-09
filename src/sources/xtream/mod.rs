@@ -1,0 +1,15 @@
+//! Xtream Codes API (and XUI.one / forks). Owner: WP-04. Spec: protocols.md §2.
+//!
+//! * `types`  — lenient serde models (numbers-as-strings, `""`/`null`/`[]` empties, `info: []`,
+//!   episodes as object-or-array, base64 EPG text).
+//! * `client` — async `player_api.php` calls; big lists downloaded to bytes and parsed in
+//!   `spawn_blocking`.
+//! * `urls`   — stream / catch-up / xmltv / m3u URL builders (credentials live only here and in
+//!   the store; never logged).
+//! * `convert` lives in `jobs::import_source` (types → `store::import::*`).
+
+pub mod client;
+pub mod types;
+pub mod urls;
+
+pub use client::XtreamClient;
