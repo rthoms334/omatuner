@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100" viewBox="0 0 200 100">
+  <rect x="0" y="0" width="200" height="100" rx="12" fill="#1e88e5"/>
+  <circle cx="50" cy="50" r="30" fill="#ffffff"/>
+  <text x="100" y="60" font-size="30" fill="#ffffff">TV</text>
+  <image href="/etc/hostname" x="0" y="0" width="10" height="10"/>
+</svg>
