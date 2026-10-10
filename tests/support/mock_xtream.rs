@@ -274,6 +274,7 @@ fn login(st: &State, user: &str) -> Response {
         "empty" => return json(Vec::new()),
         "emptyarray" => return json(b"[]".to_vec()),
         "http401" => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
+        "http503" => return (StatusCode::SERVICE_UNAVAILABLE, "Try again later").into_response(),
         "banned" | "disabled" => {
             let status = if user == "banned" { "Banned" } else { "Disabled" };
             let body = format!(r#"{{"user_info":{{"username":"{user}","auth":1,"status":"{status}"}},"server_info":{{}}}}"#);

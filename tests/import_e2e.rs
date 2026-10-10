@@ -990,6 +990,28 @@ async fn a_playlist_whose_login_fails_stays_m3u_and_checks_again_weekly() {
         assert_eq!(logins(), 2, "{name}");
         assert_eq!(h.source(source).await.kind, SourceKind::M3uUrl, "{name}");
     }
+
+    // the server couldn't answer (503): that says nothing about the login, checked in an hour
+    let mut d = draft("Unavailable", SourceKind::M3uUrl);
+    d.url = Some(format!("{}/get.php?username=http503&password={PASSWORD}", mock.base));
+    d.settings.use_provider_epg = Some(false);
+    let source = h.insert(d).await;
+    let logins = || mock.recorded().iter().filter(|r| r.starts_with("/player_api.php") && r.contains("http503")).count();
+    assert!(matches!(h.refresh(source).await, Ok(JobOutcome::SourceRefreshed { upgraded: false, .. })));
+    assert_eq!((logins(), h.source(source).await.kind), (1, SourceKind::M3uUrl));
+    assert!(matches!(h.refresh(source).await, Ok(JobOutcome::SourceRefreshed { upgraded: false, .. })));
+    assert_eq!(logins(), 1, "not again within the hour");
+    h.store
+        .writer()
+        .run(move |c| {
+            let sql = "UPDATE meta SET value = json_set(value, '$.at', json_extract(value, '$.at') - 3601) WHERE key = 'xtream-upgrade:' || ?1";
+            Ok(c.execute(sql, [source])?)
+        })
+        .await
+        .unwrap();
+    assert!(matches!(h.refresh(source).await, Ok(JobOutcome::SourceRefreshed { upgraded: false, .. })));
+    assert_eq!(logins(), 2, "an hour later a plain refresh checks again");
+
     let lines = logs().snapshot(tracing::Level::INFO);
     assert!(lines.iter().any(|l| l.message.contains("Couldn't use the Xtream login of Refused")), "the reason is logged");
     for l in &lines {

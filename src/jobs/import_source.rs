@@ -41,7 +41,8 @@
 //!   checked, or the last check is a week old): from a `get.php` URL before any download, else
 //!   by scanning the downloaded / local playlist. A working login runs the Xtream import, whose
 //!   first finish switches the source (`Upgrade`); a failed login, or an Xtream import failing
-//!   before that finish, records the check and imports the same playlist in the same job.
+//!   before that finish, records the check and imports the same playlist in the same job
+//!   (checked again in a week, or in an hour when the server couldn't answer).
 //!   A playlist without a login records the check too, so it is scanned weekly, not on every
 //!   refresh; while it has no failed login on record, the weekly download stays conditional.
 //! * An upgraded source the user keeps as M3U goes back to its playlist with a forced import
@@ -75,11 +76,14 @@ use crate::store::import::{
     self, CatalogueImport, FinishOptions, ImportChannel, ImportEpisode, ImportGroup, ImportMovie, ImportSeries, ImportSeriesEpisodes, ImportSummary,
     KeyMove, KindCounts,
 };
+use crate::store::sources::UpgradeAttempt;
 
 /// Rows per writer transaction (DESIGN §5.3).
 const BATCH: usize = 2_000;
 /// An M3U source checks again for a working Xtream login after this long (DESIGN §27.3).
 const UPGRADE_RETRY_S: i64 = 7 * 86_400;
+/// ... or after this long when the server couldn't answer (offline, timeout, 5xx).
+const UPGRADE_RETRY_TRANSIENT_S: i64 = 3_600;
 /// Batches in flight between the parser thread and the writer loop.
 const CHANNEL_CAP: usize = 4;
 /// Entries between two cancellation checks of the parser.
@@ -302,7 +306,8 @@ async fn refresh_playlist(
     let id = src.id;
     let last = read(ctx, move |c| crate::store::sources::upgrade_attempted_at(c, id)).await?;
     let now = crate::model::now();
-    if !force && last.as_ref().is_some_and(|l| now - l.at < UPGRADE_RETRY_S) {
+    let retry_s = |l: &UpgradeAttempt| if l.transient { UPGRADE_RETRY_TRANSIENT_S } else { UPGRADE_RETRY_S };
+    if !force && last.as_ref().is_some_and(|l| now - l.at < retry_s(l)) {
         return refresh_m3u(ctx, src, src.kind, force, cfg, progress, cancel, opts).await;
     }
     // a `get.php` playlist kept after its login failed: downloaded in full the first time, as
@@ -331,7 +336,8 @@ async fn refresh_playlist(
     check(cancel)?;
     let Some(creds) = creds else {
         // a plain playlist: check again in a week
-        write(ctx, move |c| crate::store::sources::record_upgrade_attempt(c, id, now, false)).await?;
+        let attempt = UpgradeAttempt { at: now, login_failed: false, transient: false };
+        write(ctx, move |c| crate::store::sources::record_upgrade_attempt(c, id, &attempt)).await?;
         return keep_playlist(ctx, src, playlist, force, cfg, progress, cancel).await;
     };
 
@@ -363,10 +369,12 @@ async fn refresh_playlist(
 }
 
 /// An upgrade check found no usable Xtream login: record it (retried in a week, or on a forced
-/// refresh) and say why in the log.
+/// refresh; in an hour when the server couldn't answer — offline, a timeout, a 5xx or 429 —
+/// as that says nothing about the login) and say why in the log.
 async fn upgrade_failed(ctx: &JobContext, src: &Source, creds: &XtreamCredentials, e: &Error) -> Result<()> {
-    let (id, at) = (src.id, crate::model::now());
-    write(ctx, move |c| crate::store::sources::record_upgrade_attempt(c, id, at, true)).await?;
+    let transient = matches!(e, Error::Network(_) | Error::Http { status: 429 | 500..=599, .. });
+    let (id, attempt) = (src.id, UpgradeAttempt { at: crate::model::now(), login_failed: true, transient });
+    write(ctx, move |c| crate::store::sources::record_upgrade_attempt(c, id, &attempt)).await?;
     tracing::info!(
         "Couldn't use the Xtream login of {} at {} ({}); keeping the playlist",
         src.name,

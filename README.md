@@ -190,7 +190,8 @@ these and signs in with the Xtream API (`player_api.php`) without asking:
   ("Upgraded to Xtream login — movies & series now available"). Favourites, history, progress,
   renames and locks carry over. Settings ▸ Playlists shows them as *Xtream (from M3U)*.
 - **If the login fails** the playlist simply stays M3U and Tuner tries again after a week (or
-  at once with *Refresh now* in the playlist's editor).
+  at once with *Refresh now* in the playlist's editor). If the server couldn't be reached at
+  all (offline, a timeout, a server error), it tries again after an hour.
 - **Keep as M3U:** choose it in the Test step, or turn off **Use the Xtream login** in the
   playlist's editor (it asks first, since movies and series that are not in the playlist go
   away). Turning it back on signs in right away and says so if the login is refused.

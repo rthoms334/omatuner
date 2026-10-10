@@ -2729,8 +2729,11 @@ after reading the row:
 | Xtream (native, or upgraded and not `keep_m3u`) | Xtream import as today. |
 
 *Due* ⇔ the refresh is forced (Settings ▸ Refresh, the switch toggle) OR there is no failed
-attempt on record OR the last one is ≥ 7 days old. Failed attempts are recorded in `meta` as
-`xtream-upgrade:<source id>` = `{"at": <unix s>}` (deleted on success and on switching).
+attempt on record OR the last one is ≥ 7 days old — ≥ 1 hour when the server couldn't answer
+(network error, timeout, HTTP 5xx or 429: `transient`, which says nothing about the login; a
+rejected login, an unusable account or a bad payload keep the week). Failed attempts are
+recorded in `meta` as `xtream-upgrade:<source id>` = `{"at": <unix s>, "login_failed": bool,
+"transient": bool}` (deleted on success and on switching).
 
 Attempt:
 1. Credentials: from the URL for `get.php` (before any download); otherwise download the

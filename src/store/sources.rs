@@ -188,6 +188,9 @@ pub struct UpgradeAttempt {
     /// A login was found but did not work (`false`: the playlist carries none).
     #[serde(default)]
     pub login_failed: bool,
+    /// The server could not answer (network, timeout, 5xx): checked again soon, not in a week.
+    #[serde(default)]
+    pub transient: bool,
 }
 
 /// The last upgrade check of an M3U source (DESIGN §27.3). `None`: never, or it switched since.
@@ -197,10 +200,10 @@ pub fn upgrade_attempted_at(conn: &Connection, id: SourceId) -> Result<Option<Up
 }
 
 /// Record an upgrade check that left the source M3U (see [`upgrade_attempted_at`]).
-pub fn record_upgrade_attempt(conn: &Connection, id: SourceId, at: Timestamp, login_failed: bool) -> Result<()> {
+pub fn record_upgrade_attempt(conn: &Connection, id: SourceId, attempt: &UpgradeAttempt) -> Result<()> {
     conn.execute(
         "INSERT INTO meta(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![upgrade_key(id), sql::to_json(&UpgradeAttempt { at, login_failed })?],
+        params![upgrade_key(id), sql::to_json(attempt)?],
     )?;
     Ok(())
 }
