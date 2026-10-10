@@ -334,6 +334,13 @@ impl TunerApp {
                 self.send_connection_limit(*source);
             }
             Ok(JobOutcome::EpgRefreshed { .. }) => self.offline = false,
+            // the backup's settings, applied like any Settings change — here rather than in the
+            // Settings screen, which the user may have left while the restore ran
+            Ok(JobOutcome::Restored(r)) => {
+                if let Some(cfg) = r.settings.clone() {
+                    self.config_edits.push(Box::new(move |c: &mut Config| *c = *cfg));
+                }
+            }
             Ok(_) => {}
             Err(msg) => {
                 // Probe/add/backup failures are shown by the screen that started them; library
@@ -1754,6 +1761,26 @@ mod tests {
         }));
         let limits: Vec<_> = rig.log().commands.iter().filter(|c| matches!(c, PlayerCommand::SetConnectionLimit { .. })).cloned().collect();
         assert_eq!(limits, [PlayerCommand::SetConnectionLimit { source: SourceId(1), max: Some(1) }]);
+    }
+
+    /// A restore's settings are saved and applied even when the Settings screen that started
+    /// it is no longer open.
+    #[test]
+    fn restored_settings_are_saved_and_applied() {
+        let mut rig = Rig::new();
+        let file = rig.app.services().paths.config_file();
+        let mut cfg = (*rig.app.services().config()).clone();
+        cfg.player.cache_secs = 44;
+        let report = crate::store::backup::RestoreReport { settings: Some(Box::new(cfg)), ..Default::default() };
+        rig.event(AppEvent::Job(JobEvent::Finished {
+            id: JobId(4),
+            kind: JobKind::ImportBackup { path: "/tmp/b.tuner-backup".into(), mode: crate::store::backup::RestoreMode::Merge },
+            outcome: Ok(JobOutcome::Restored(report)),
+            failure: None,
+        }));
+        rig.frame_with(vec![]);
+        assert_eq!(rig.app.services().config().player.cache_secs, 44);
+        assert_eq!(Config::load(&file).unwrap().player.cache_secs, 44);
     }
 
     #[test]

@@ -1437,6 +1437,15 @@ fn zapping_uses_the_zap_list_and_skips_locked_channels_while_locked() {
     let mut p = player_with(&mut t, fake_playing(MediaRef::Channel(ids[0]), PlayableKind::Live, Some(zap), PlayOrigin::Fullscreen));
     act(&mut t, &mut p, Action::ZapNext);
     player_until(&t, "skips the locked channel 1", plays(MediaRef::Channel(ids[2])));
+
+    // Backspace back to the locked channel (watched while unlocked) asks for the PIN — the
+    // controller would ignore the recall silently
+    let mut snap = (*fake_playing(MediaRef::Channel(ids[2]), PlayableKind::Live, None, PlayOrigin::Fullscreen)).clone();
+    snap.previous_live = fake_playing(MediaRef::Channel(ids[1]), PlayableKind::Live, None, PlayOrigin::Fullscreen).playable.clone();
+    let mut p = player_with(&mut t, Arc::new(snap));
+    t.nav.clear();
+    act(&mut t, &mut p, Action::LastChannel);
+    assert!(matches!(opened(&t).as_slice(), [OverlayRequest::Pin { then, .. }] if **then == Action::LastChannel), "{:?}", t.nav);
 }
 
 /// While the session is locked the UI picks the neighbour itself (`ZapTo`), so it must also

@@ -22,7 +22,7 @@ use eframe::egui;
 use tuner::cli::Cli;
 use tuner::config::Config;
 use tuner::fonts::{FontSet, LoadedFonts};
-use tuner::ipc::IpcRequest;
+use tuner::ipc::{Handoff, IpcRequest};
 use tuner::jobs::{JobContext, JobEvent, JobKind, JobManager};
 use tuner::model::JobId;
 use tuner::msg::{AppEvent, EventBus};
@@ -157,21 +157,28 @@ fn instance_running(paths: &AppPaths) -> bool {
 /// Single instance: the IPC server only binds once the window is up, so two quick launches
 /// would both miss the socket and open the same database. The lock is taken before anything
 /// opens the store; a launch that finds it held keeps retrying the handoff while the other
-/// instance starts, and gives up after `wait` (that instance never served its socket).
+/// instance starts — without removing a socket that refuses (it may be one that instance is
+/// binding right now) — and gives up after `wait` (that instance never served its socket). A
+/// request the running instance refuses fails right away.
 fn become_primary(paths: &AppPaths, request: &IpcRequest, wait: Duration) -> anyhow::Result<Option<InstanceLock>> {
     let deadline = Instant::now() + wait;
     loop {
-        if tuner::ipc::try_handoff(&paths.ipc_socket(), request)? {
-            return Ok(None);
-        }
-        match instance_lock(paths) {
-            Ok(Some(lock)) => return Ok(Some(InstanceLock { _file: Some(lock) })),
-            Ok(None) => {}
+        let lock = match instance_lock(paths) {
+            Ok(Some(lock)) => Some(InstanceLock { _file: Some(lock) }),
+            Ok(None) => None,
             Err(e) => {
                 // e.g. a filesystem without locks: run as before, unguarded
                 tracing::warn!("single-instance lock {}: {e}", paths.runtime_dir.display());
-                return Ok(Some(InstanceLock { _file: None }));
+                Some(InstanceLock { _file: None })
             }
+        };
+        // holding the lock, a socket that refuses is stale; an instance from before the lock
+        // existed may still answer
+        match tuner::ipc::handoff(&paths.ipc_socket(), request, lock.is_some())? {
+            Handoff::Delivered => return Ok(None),
+            Handoff::Rejected(e) => anyhow::bail!("the running {} refused the request: {}", tuner::APP_NAME, tuner::redact::redact(&e)),
+            Handoff::NoServer if lock.is_some() => return Ok(lock),
+            Handoff::NoServer => {}
         }
         anyhow::ensure!(Instant::now() < deadline, "{} is already running but doesn't answer (try again in a moment)", tuner::APP_NAME);
         std::thread::sleep(Duration::from_millis(100));
@@ -179,6 +186,7 @@ fn become_primary(paths: &AppPaths, request: &IpcRequest, wait: Duration) -> any
 }
 
 /// Held by the primary instance until it exits (`None` inside: locking failed, unguarded).
+#[derive(Debug)]
 struct InstanceLock {
     _file: Option<std::fs::File>,
 }
@@ -321,32 +329,50 @@ mod tests {
 
     /// Audit fix: two quick launches both missed the socket (bound only once the window is up)
     /// and opened the same database. The second one now waits for the first to serve its socket
-    /// and hands off, or gives up — it never becomes a second primary.
+    /// and hands off, or gives up — it never becomes a second primary, never unlinks the socket
+    /// the first one may be binding, and fails at once when its request is refused.
     #[test]
     fn a_second_launch_hands_off_to_a_starting_instance_or_exits() {
         use std::io::{BufRead, Write};
+        use std::os::unix::net::UnixListener;
         let dir = tempfile::tempdir().unwrap();
         let paths = AppPaths::rooted(dir.path());
         let req = IpcRequest::default();
         let first = become_primary(&paths, &req, Duration::ZERO).unwrap();
         assert!(first.is_some(), "nobody running: primary");
-        assert!(become_primary(&paths, &req, Duration::from_millis(300)).is_err(), "never two primaries");
-
-        // the first instance binds its socket a moment later: the waiting launch hands off
         let sock = paths.ipc_socket();
-        let server = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
-            let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-            let (stream, _) = listener.accept().unwrap();
-            std::io::BufReader::new(&stream).read_line(&mut String::new()).unwrap();
-            (&stream).write_all(b"{\"ok\":true}\n").unwrap();
-        });
+        // bound but not listening yet (refuses connections), as while the first one binds it
+        drop(UnixListener::bind(&sock).unwrap());
+        assert!(become_primary(&paths, &req, Duration::from_millis(300)).is_err(), "never two primaries");
+        assert!(sock.exists(), "a waiting launch leaves the starting instance's socket alone");
+        std::fs::remove_file(&sock).unwrap();
+
+        // the first instance serves its socket `after` from now and answers `reply`
+        let serve = |after: Duration, reply: &'static [u8]| {
+            let sock = sock.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(after);
+                let listener = UnixListener::bind(&sock).unwrap();
+                let (stream, _) = listener.accept().unwrap();
+                std::io::BufReader::new(&stream).read_line(&mut String::new()).unwrap();
+                (&stream).write_all(reply).unwrap();
+            })
+        };
+        let server = serve(Duration::from_millis(300), b"{\"ok\":true}\n");
         assert!(become_primary(&paths, &req, Duration::from_secs(10)).unwrap().is_none(), "handed off");
+        server.join().unwrap();
+
+        std::fs::remove_file(&sock).unwrap();
+        let server = serve(Duration::ZERO, b"{\"ok\":false,\"error\":\"request too large\"}\n");
+        let started = Instant::now();
+        let err = become_primary(&paths, &req, Duration::from_secs(10)).unwrap_err().to_string();
+        assert!(err.contains("request too large") && started.elapsed() < Duration::from_secs(5), "{err}");
         server.join().unwrap();
 
         // the first instance is gone (lock released, stale socket): the next launch is primary
         drop(first);
         assert!(become_primary(&paths, &req, Duration::ZERO).unwrap().is_some());
+        assert!(!sock.exists(), "the primary removes the stale socket");
     }
 
     /// The headless refresh terminates and reports the outcome of `RefreshStale` (with the

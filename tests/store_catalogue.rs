@@ -261,10 +261,11 @@ fn epg_sources_provider_lifecycle_priority_and_staleness() {
     assert!(!list[1].enabled && list[1].refresh_h == Some(6));
     assert_eq!(list[0].last_error.as_deref(), Some("nope"));
 
-    // staleness: never refreshed → stale (F failed just now: not before its interval); disabled
-    // never; max_stop rule
+    // staleness: never refreshed → stale (F never imported and failed just now: retried after an
+    // hour, not a whole interval); disabled never; max_stop rule
     assert_eq!(sources::stale_epg_sources(&r, NOW, 12).unwrap(), vec![ids2[0]]);
-    assert_eq!(sources::stale_epg_sources(&r, NOW + 12 * 3600, 12).unwrap(), vec![f, ids2[0]]);
+    assert_eq!(sources::stale_epg_sources(&r, NOW + 3600 - 1, 12).unwrap(), vec![ids2[0]]);
+    assert_eq!(sources::stale_epg_sources(&r, NOW + 3600, 12).unwrap(), vec![f, ids2[0]]);
     let p = ids2[0];
     w(&s, move |c| {
         c.execute("UPDATE epg_source SET last_refresh = ?2, max_stop = ?3 WHERE id = ?1", rusqlite::params![p, NOW - 7200, NOW + 3 * 86400])?;

@@ -262,16 +262,20 @@ pub fn set_account(conn: &Connection, id: SourceId, account: &AccountInfo) -> Re
 const RETRY_MIN_S: i64 = 10 * 60;
 /// Longest wait between scheduled retries of a failing refresh, whatever its interval.
 const RETRY_MAX_S: i64 = 86_400;
+/// Wait between retries when it's unknown how long the refresh has been failing (a guide that
+/// never imported): short enough that a transient first failure doesn't leave the guide empty
+/// for a whole interval, long enough not to toast on every tick.
+const RETRY_UNKNOWN_S: i64 = 3600;
 
 /// Back-off of a refresh whose last attempt failed: the scheduler waits as long after the last
 /// attempt as the refresh has been failing, so the gaps double — at least [`RETRY_MIN_S`], at
 /// most its interval (and [`RETRY_MAX_S`]). `due_since` = when it became due; `None` (unknown)
-/// waits the longest. The start of the failing streak isn't stored: a refresh that was long
-/// overdue when it started failing (app closed meanwhile) backs off the most. A manual Refresh
-/// (`force`) never goes through here.
+/// waits a fixed [`RETRY_UNKNOWN_S`] (or the interval, if shorter). The start of the failing
+/// streak isn't stored: a refresh that was long overdue when it started failing (app closed
+/// meanwhile) backs off the most. A manual Refresh (`force`) never goes through here.
 fn retry_due(now: Timestamp, last_attempt: Timestamp, due_since: Option<Timestamp>, interval_s: i64) -> bool {
     let cap = interval_s.clamp(RETRY_MIN_S, RETRY_MAX_S);
-    let wait = due_since.map_or(cap, |d| (last_attempt - d).clamp(RETRY_MIN_S, cap));
+    let wait = due_since.map_or(cap.min(RETRY_UNKNOWN_S), |d| (last_attempt - d).clamp(RETRY_MIN_S, cap));
     now - last_attempt >= wait
 }
 
@@ -532,7 +536,7 @@ pub fn stale_epg_sources(conn: &Connection, now: Timestamp, default_h: u32) -> R
         let interval = h.saturating_mul(3600);
         if let Some(at) = attempt.filter(|_| failed) {
             // when it became due (the WHERE above, solved for `now`): by age or by running out;
-            // never imported → unknown
+            // never imported → unknown (fixed wait)
             let due_since = last.map(|t| {
                 let by_age = t.saturating_add(interval);
                 max_stop.map_or(by_age, |m| by_age.min((t + 3600).max(m - 43_200 + 1)))
