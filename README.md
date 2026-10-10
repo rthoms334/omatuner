@@ -213,8 +213,342 @@ Tuner is built for the keyboard, and everything is also clickable. The basics:
 The full reference is generated from `src/keymap.rs`:
 
 <!-- keymap:start -->
-*The key tables are generated at release time with `cargo run --example keymap_md`. Until then,
-press `?` in the app or see [docs/DESIGN.md §15.2](docs/DESIGN.md).*
+### Everywhere (`Global`)
+
+| Keys | Action |
+|---|---|
+| `Ctrl+K` | Search everything |
+| `Ctrl+Q` | Quit |
+| `Alt+1` | Home |
+| `Alt+2` | Live TV |
+| `Alt+3` | TV guide |
+| `Alt+4` | Movies |
+| `Alt+5` | Series |
+| `Ctrl+Comma` / `Alt+0` | Settings |
+| `Alt+←` | Back (also the mouse back button) |
+| `F11` | Toggle window fullscreen |
+| `Ctrl+P` | Open the player (from the mini player) |
+| `Ctrl+Shift+P` | Play / pause |
+| `Ctrl+Shift+S` | Stop playback |
+| `Ctrl+R` / `F5` | Refresh playlists & guide |
+| `Ctrl+J` | Show background tasks |
+| `F1` | Keyboard help |
+
+### Lists (`List`)
+
+| Keys | Action |
+|---|---|
+| `↑` / `↓` | Move |
+| `PgUp` / `PgDn` | Page up / down |
+| `Home` / `End` | First / last |
+| `Enter` / `→` | Play here / open (playing → fullscreen) |
+| `Shift+Enter` | Play fullscreen |
+| `←` / `Backspace` | Back to the previous pane |
+| `Tab` / `Shift+Tab` | Next / previous pane |
+| `Esc` | Back |
+| `/` | Search everything |
+| `?` | Keyboard help |
+| `Ctrl+F` | Add to / remove from Favourites |
+| `Ctrl+Shift+F` | Favourites lists… (add, new list) |
+| `Ctrl+H` | Hide / unhide |
+| `F2` | Rename |
+| `Ctrl+L` | Lock with PIN / unlock |
+| `Alt+↑` | Move up (reorder) |
+| `Alt+↓` | Move down (reorder) |
+| `Ctrl+S` | Sort & view options… |
+| `Ctrl+G` | Show in TV guide |
+| `Ctrl+I` | Details / edit information |
+| `Ctrl+E` | Assign EPG channel |
+| `Ctrl+W` | Mark watched / unwatched |
+| `Delete` | Remove (from list / cancel task / forget) |
+| `Shift+F10` / `Ctrl+Enter` | Context menu |
+| `a–z, 0–9 …` | Type to filter |
+
+### Lists while filtering (`ListFiltering`)
+
+| Keys | Action |
+|---|---|
+| `↑` / `↓` | Move |
+| `PgUp` / `PgDn` | Page up / down |
+| `Enter` | Play here / open (playing → fullscreen) |
+| `Shift+Enter` | Play fullscreen |
+| `Backspace` | Delete character |
+| `Ctrl+Backspace` | Delete word |
+| `Ctrl+U` / `Esc` | Clear filter |
+| `Tab` / `Shift+Tab` | Next / previous pane |
+| `Ctrl+F` | Add to / remove from Favourites |
+| `Ctrl+Shift+F` | Favourites lists… (add, new list) |
+| `Ctrl+H` | Hide / unhide |
+| `F2` | Rename |
+| `Ctrl+L` | Lock with PIN / unlock |
+| `Alt+↑` | Move up (reorder) |
+| `Alt+↓` | Move down (reorder) |
+| `Ctrl+S` | Sort & view options… |
+| `Ctrl+G` | Show in TV guide |
+| `Ctrl+I` | Details / edit information |
+| `Ctrl+E` | Assign EPG channel |
+| `Ctrl+W` | Mark watched / unwatched |
+| `Delete` | Remove (from list / cancel task / forget) |
+| `Shift+F10` / `Ctrl+Enter` | Context menu |
+| `a–z, 0–9 …` | Type to filter |
+
+### Movies & series grid (`PosterGrid`)
+
+| Keys | Action |
+|---|---|
+| `↑` / `↓` / `←` / `→` | Move |
+| `PgUp` / `PgDn` | Page up / down |
+| `Home` / `End` | First / last |
+| `Enter` | Open details (channels: play) |
+| `Shift+Enter` | Play / resume fullscreen |
+| `Backspace` | Back to categories |
+| `Tab` / `Shift+Tab` | Next / previous pane |
+| `Esc` | Back |
+| `/` | Search everything |
+| `?` | Keyboard help |
+| `Ctrl+F` | Add to / remove from Favourites |
+| `Ctrl+Shift+F` | Favourites lists… (add, new list) |
+| `Ctrl+H` | Hide / unhide |
+| `F2` | Rename |
+| `Ctrl+L` | Lock with PIN / unlock |
+| `Alt+↑` | Move up (reorder) |
+| `Alt+↓` | Move down (reorder) |
+| `Ctrl+S` | Sort & view options… |
+| `Ctrl+G` | Show in TV guide |
+| `Ctrl+I` | Details / edit information |
+| `Ctrl+E` | Assign EPG channel |
+| `Ctrl+W` | Mark watched / unwatched |
+| `Delete` | Remove (from list / cancel task / forget) |
+| `Shift+F10` / `Ctrl+Enter` | Context menu |
+| `a–z, 0–9 …` | Type to filter |
+
+### Movies & series grid while filtering (`PosterGridFiltering`)
+
+| Keys | Action |
+|---|---|
+| `↑` / `↓` / `←` / `→` | Move |
+| `PgUp` / `PgDn` | Page up / down |
+| `Enter` | Open details (channels: play) |
+| `Shift+Enter` | Play / resume fullscreen |
+| `Backspace` | Delete character |
+| `Ctrl+Backspace` | Delete word |
+| `Ctrl+U` / `Esc` | Clear filter |
+| `Tab` / `Shift+Tab` | Next / previous pane |
+| `Ctrl+F` | Add to / remove from Favourites |
+| `Ctrl+Shift+F` | Favourites lists… (add, new list) |
+| `Ctrl+H` | Hide / unhide |
+| `F2` | Rename |
+| `Ctrl+L` | Lock with PIN / unlock |
+| `Alt+↑` | Move up (reorder) |
+| `Alt+↓` | Move down (reorder) |
+| `Ctrl+S` | Sort & view options… |
+| `Ctrl+G` | Show in TV guide |
+| `Ctrl+I` | Details / edit information |
+| `Ctrl+E` | Assign EPG channel |
+| `Ctrl+W` | Mark watched / unwatched |
+| `Delete` | Remove (from list / cancel task / forget) |
+| `Shift+F10` / `Ctrl+Enter` | Context menu |
+| `a–z, 0–9 …` | Type to filter |
+
+### Movie & series pages (`Detail`)
+
+| Keys | Action |
+|---|---|
+| `↑` / `↓` / `←` / `→` | Move |
+| `PgUp` / `PgDn` | Page up / down |
+| `[` / `]` | Previous / next season |
+| `Tab` / `Shift+Tab` | Next / previous section (buttons, seasons, episodes) |
+| `Enter` | Play / resume (or the focused button) |
+| `Shift+Enter` | Play from the start |
+| `Backspace` / `Esc` | Back |
+| `/` | Search everything |
+| `?` | Keyboard help |
+| `Ctrl+F` | Add to / remove from Favourites |
+| `Ctrl+Shift+F` | Favourites lists… (add, new list) |
+| `Ctrl+H` | Hide / unhide |
+| `F2` | Rename |
+| `Ctrl+L` | Lock with PIN / unlock |
+| `Alt+↑` | Move up (reorder) |
+| `Alt+↓` | Move down (reorder) |
+| `Ctrl+S` | Sort & view options… |
+| `Ctrl+G` | Show in TV guide |
+| `Ctrl+I` | Details / edit information |
+| `Ctrl+E` | Assign EPG channel |
+| `Ctrl+W` | Mark watched / unwatched |
+| `Delete` | Remove (from list / cancel task / forget) |
+| `Shift+F10` / `Ctrl+Enter` | Context menu |
+
+### TV guide (`Guide`)
+
+| Keys | Action |
+|---|---|
+| `↑` / `k` / `↓` / `j` | Previous / next channel |
+| `←` / `h` / `→` / `l` | Previous / next programme |
+| `PgUp` / `PgDn` | Page channels |
+| `Shift+←` / `Shift+→` / `H` / `L` | Scroll time −/+ 3 h |
+| `[` / `]` | Previous / next day |
+| `n` / `Home` | Jump to now |
+| `g` / `G` | First / last channel |
+| `Enter` | Programme details (Watch / Catch up / Remind) |
+| `w` / `Shift+Enter` | Watch channel |
+| `c` | Catch up (past programme) |
+| `r` | Remind me / cancel reminder |
+| `f` | Collection: favourites lists, groups, all |
+| `0` / `1` / `2` / `3` / `4` / `5` / `6` / `7` / `8` / `9` | Jump to channel number |
+| `Ctrl+F` | Add channel to Favourites |
+| `Ctrl+E` | Assign EPG channel |
+| `/` | Search everything |
+| `?` | Keyboard help |
+| `Esc` | Back |
+
+### Player — live TV (`PlayerLive`)
+
+| Keys | Action |
+|---|---|
+| `↑` / `k` / `↓` / `j` / `PgUp` / `PgDn` | Previous / next channel (in this list) |
+| `Backspace` / `←` | Last channel |
+| `→` / `h` | Channel history |
+| `c` | Channel list |
+| `g` | Mini guide (now / next) |
+| `0` / `1` / `2` / `3` / `4` / `5` / `6` / `7` / `8` / `9` | Type a channel number |
+| `Space` | Play / pause |
+| `m` | Mute |
+| `+` / `=` / `-` | Volume up / down |
+| `Enter` / `i` / `Tab` | On-screen controls |
+| `I` | Stream info (codec, resolution, bitrate) |
+| `a` | Next audio track |
+| `A` | Audio tracks… |
+| `s` | Next subtitle track |
+| `S` | Subtitles… |
+| `z` / `x` | Subtitle delay −/+ 100 ms |
+| `Z` | Reset subtitle delay |
+| `{` / `}` | Subtitle size −/+ |
+| `v` | Aspect ratio (auto, 16:9, 4:3, 21:9, fill, stretch) |
+| `V` | Zoom |
+| `f` | Toggle window fullscreen |
+| `p` | Keep playing in the mini player |
+| `q` | Stop and close |
+| `r` | Retry (after an error) |
+| `Ctrl+F` | Add to / remove from Favourites |
+| `Esc` | Back (hide banner, then leave; keeps playing in the mini player) |
+| `/` | Search everything |
+| `?` | Keyboard help |
+
+### Player — movies, episodes, catch-up (`PlayerVod`)
+
+| Keys | Action |
+|---|---|
+| `←` / `h` / `→` / `l` | Skip back / forward (small step) |
+| `Shift+←` / `Shift+→` / `↑` / `↓` | Skip back / forward (big step) |
+| `L` | Jump to live (from catch-up) |
+| `Home` | Go to start |
+| `Space` | Play / pause |
+| `m` | Mute |
+| `+` / `=` / `-` | Volume up / down |
+| `Enter` / `i` / `Tab` | On-screen controls |
+| `I` | Stream info (codec, resolution, bitrate) |
+| `a` | Next audio track |
+| `A` | Audio tracks… |
+| `s` | Next subtitle track |
+| `S` | Subtitles… |
+| `z` / `x` | Subtitle delay −/+ 100 ms |
+| `Z` | Reset subtitle delay |
+| `{` / `}` | Subtitle size −/+ |
+| `v` | Aspect ratio (auto, 16:9, 4:3, 21:9, fill, stretch) |
+| `V` | Zoom |
+| `f` | Toggle window fullscreen |
+| `p` | Keep playing in the mini player |
+| `q` | Stop and close |
+| `r` | Retry (after an error) |
+| `Ctrl+F` | Add to / remove from Favourites |
+| `Esc` | Back (hide banner, then leave; keeps playing in the mini player) |
+| `/` | Search everything |
+| `?` | Keyboard help |
+
+### Player — on-screen controls (`PlayerOsd`)
+
+| Keys | Action |
+|---|---|
+| `←` / `→` | Move between controls / scrub |
+| `↑` / `↓` | Move between control rows |
+| `Enter` | Activate control |
+| `Tab` / `Shift+Tab` | Next / previous control |
+| `Esc` | Leave the controls |
+
+### Channel number entry (`NumericEntry`)
+
+| Keys | Action |
+|---|---|
+| `0` / `1` / `2` / `3` / `4` / `5` / `6` / `7` / `8` / `9` | Type the channel number |
+| `Enter` | Go now (otherwise after 1.5 s) |
+| `Backspace` | Delete digit |
+| `Esc` | Cancel |
+
+### EPG mapping (`EpgMapping`)
+
+| Keys | Action |
+|---|---|
+| `Enter` | Assign the highlighted EPG channel |
+| `Delete` | Clear the manual assignment |
+
+### Search (`Search`)
+
+| Keys | Action |
+|---|---|
+| `↑` / `↓` | Move |
+| `PgUp` / `PgDn` | Page up / down |
+| `Tab` / `Shift+Tab` | Next / previous section (All, Live, Movies, Series, Guide) |
+| `Enter` | Play fullscreen / open |
+| `Shift+Enter` | Play fullscreen / open details |
+| `Backspace` | Delete character |
+| `Ctrl+Backspace` | Delete word |
+| `Ctrl+U` | Clear |
+| `Esc` | Clear, then close |
+| `Ctrl+F` | Add to / remove from Favourites |
+| `Ctrl+Shift+F` | Favourites lists… (add, new list) |
+| `Ctrl+H` | Hide / unhide |
+| `F2` | Rename |
+| `Ctrl+L` | Lock with PIN / unlock |
+| `Alt+↑` | Move up (reorder) |
+| `Alt+↓` | Move down (reorder) |
+| `Ctrl+S` | Sort & view options… |
+| `Ctrl+G` | Show in TV guide |
+| `Ctrl+I` | Details / edit information |
+| `Ctrl+E` | Assign EPG channel |
+| `Ctrl+W` | Mark watched / unwatched |
+| `Delete` | Remove (from list / cancel task / forget) |
+| `Shift+F10` / `Ctrl+Enter` | Context menu |
+
+### Dialogs & menus (`Modal`)
+
+| Keys | Action |
+|---|---|
+| `↑` / `↓` / `←` / `→` | Move |
+| `Tab` / `Shift+Tab` | Next / previous field |
+| `Enter` / `Space` | Confirm |
+| `Esc` | Cancel |
+
+### Text fields (`TextInput`)
+
+| Keys | Action |
+|---|---|
+| `Tab` / `Shift+Tab` | Next / previous field |
+| `Enter` | Confirm |
+| `Esc` | Leave the field |
+
+### Settings (`Panel`)
+
+| Keys | Action |
+|---|---|
+| `↑` / `k` / `↓` / `j` | Move |
+| `←` / `h` | Decrease / previous option |
+| `→` / `l` | Increase / next option |
+| `Alt+↑` / `K` / `Alt+↓` / `J` | Move up / down (reorder: EPG priority, playlists, lists) |
+| `Tab` / `Shift+Tab` | Next / previous section |
+| `Enter` / `Space` | Toggle / open |
+| `x` / `Delete` | Delete / more actions |
+| `Esc` | Back |
+| `?` | Keyboard help |
 <!-- keymap:end -->
 
 ## Command line
