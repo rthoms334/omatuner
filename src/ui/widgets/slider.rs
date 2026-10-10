@@ -76,10 +76,13 @@ pub fn seek_bar(ui: &mut egui::Ui, theme: &Theme, position: f64, duration: f64, 
     resp.widget_info(|| egui::WidgetInfo::slider(seekable, if position.is_finite() { position } else { 0.0 }, "Seek"));
     let (x0, x1) = (rect.left() + knob / 2.0, rect.right() - knob / 2.0);
     let at = |x: f32| fraction_at(x, x0, x1) as f64 * duration;
-    let request = match resp.interact_pointer_pos() {
-        Some(pos) if seekable && (resp.clicked() || resp.dragged()) => Some(at(pos.x)),
+    // where the pointer holds the knob; a seek is requested only when that changes (a click, a
+    // drag step, the release), not on every frame the knob is held still
+    let held = match resp.interact_pointer_pos() {
+        Some(pos) if seekable && (resp.clicked() || resp.dragged() || resp.drag_stopped()) => Some(at(pos.x)),
         _ => None,
     };
+    let request = held.filter(|_| resp.clicked() || resp.drag_stopped() || resp.drag_delta().x != 0.0);
     if !ui.is_rect_visible(rect) {
         return request;
     }
@@ -90,8 +93,8 @@ pub fn seek_bar(ui: &mut egui::Ui, theme: &Theme, position: f64, duration: f64, 
         return None;
     }
     let x_of = |s: f64| x0 + ((s / duration).clamp(0.0, 1.0) as f32) * (x1 - x0);
-    // while dragging, show the requested position (mpv's answer arrives a frame later)
-    let shown = request.unwrap_or(if position.is_finite() { position } else { 0.0 });
+    // while dragging, show the pointer's position (mpv's answer arrives a frame later)
+    let shown = held.unwrap_or(if position.is_finite() { position } else { 0.0 });
     let played_x = x_of(shown);
     if let Some(end) = cache_end.filter(|e| e.is_finite() && *e > shown) {
         p.rect_filled(Rect::from_min_max(egui::pos2(played_x, track.top()), egui::pos2(x_of(end), track.bottom())), t.rounding, with_alpha(t.osd_text, 0.5));

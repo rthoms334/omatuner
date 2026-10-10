@@ -15,7 +15,7 @@ use super::{Overlay, OverlayOutcome};
 use crate::jobs::{JobPhase, JobStatus};
 use crate::keymap::{Action, KeyContext};
 use crate::logging::LogLine;
-use crate::model::Timestamp;
+use crate::model::{JobId, Timestamp};
 use crate::msg::Toast;
 use crate::theme::{SpaceToken, Theme, TypeToken};
 use crate::ui::UiCtx;
@@ -36,23 +36,50 @@ pub struct JobsOverlay {
     cursor: usize,
     running: Vec<JobStatus>,
     problems: Vec<LogLine>,
-    /// Problem rows showing their full message.
-    expanded: Vec<usize>,
+    /// Problem rows showing their full message (by content: the list is re-read newest first,
+    /// so positions shift whenever a new problem is logged).
+    expanded: Vec<ProblemKey>,
     problems_read: Option<Instant>,
+}
+
+/// Identity of a problem row across re-reads.
+type ProblemKey = (Timestamp, String);
+
+fn problem_key(line: &LogLine) -> ProblemKey { (line.at, line.message.clone()) }
+
+/// What the cursor is on, so it stays on that row when the lists above it change.
+enum CursorRow {
+    Job(JobId),
+    Problem(ProblemKey),
 }
 
 impl JobsOverlay {
     fn rows(&self) -> usize { self.running.len() + self.problems.len() }
 
+    fn cursor_row(&self) -> Option<CursorRow> {
+        match self.cursor.checked_sub(self.running.len()) {
+            None => self.running.get(self.cursor).map(|j| CursorRow::Job(j.id)),
+            Some(p) => self.problems.get(p).map(|l| CursorRow::Problem(problem_key(l))),
+        }
+    }
+
     /// Re-read running jobs (every frame) and problems (throttled) from the services.
     fn refresh(&mut self, ctx: &UiCtx<'_>) {
+        let on = self.cursor_row();
         self.running = ctx.services.jobs.active();
         self.running.sort_by_key(|j| (j.started_at, j.id));
         if self.problems_read.is_none_or(|t| t.elapsed() >= PROBLEMS_REFRESH) {
             self.problems = job_problems(&ctx.services.logs.snapshot(tracing::Level::WARN));
             self.problems_read = Some(Instant::now());
+            let problems = &self.problems;
+            self.expanded.retain(|k| problems.iter().any(|l| l.at == k.0 && l.message == k.1));
         }
-        self.cursor = self.cursor.min(self.rows().saturating_sub(1));
+        // follow the row (a finished job or a new problem shifts the positions)
+        let found = on.and_then(|on| match on {
+            CursorRow::Job(id) => self.running.iter().position(|j| j.id == id),
+            CursorRow::Problem((at, msg)) => self.problems.iter().position(|l| l.at == at && l.message == msg).map(|p| self.running.len() + p),
+        });
+        self.cursor = found.unwrap_or(self.cursor).min(self.rows().saturating_sub(1));
     }
 }
 
@@ -106,12 +133,13 @@ impl Overlay for JobsOverlay {
                 None => return OverlayOutcome::Keep,
             },
             Action::Activate => {
-                if let Some(p) = self.cursor.checked_sub(self.running.len()).filter(|p| *p < self.problems.len()) {
-                    match self.expanded.iter().position(|e| *e == p) {
+                if let Some(line) = self.cursor.checked_sub(self.running.len()).and_then(|p| self.problems.get(p)) {
+                    let key = problem_key(line);
+                    match self.expanded.iter().position(|e| *e == key) {
                         Some(i) => {
                             self.expanded.remove(i);
                         }
-                        None => self.expanded.push(p),
+                        None => self.expanded.push(key),
                     }
                 }
             }
@@ -152,7 +180,8 @@ impl Overlay for JobsOverlay {
                 }
                 for (p, line) in self.problems.iter().enumerate() {
                     let row = self.running.len() + p;
-                    if problem_row(ui, theme, line, self.expanded.contains(&p), row == self.cursor).clicked() {
+                    let expanded = self.expanded.iter().any(|(at, msg)| *at == line.at && *msg == line.message);
+                    if problem_row(ui, theme, line, p, expanded, row == self.cursor).clicked() {
                         clicked = Some(row);
                     }
                 }
@@ -210,7 +239,8 @@ fn running_row(ui: &mut egui::Ui, theme: &Theme, job: &JobStatus, now: Timestamp
 }
 
 /// "20:14  Couldn't refresh My IPTV: HTTP 404" (one line, or the full message when expanded).
-fn problem_row(ui: &mut egui::Ui, theme: &Theme, line: &LogLine, expanded: bool, cursor: bool) -> egui::Response {
+/// `index` salts the row id: the same failure can be logged twice within a second.
+fn problem_row(ui: &mut egui::Ui, theme: &Theme, line: &LogLine, index: usize, expanded: bool, cursor: bool) -> egui::Response {
     let t = &theme.tokens;
     let pad = theme.space(SpaceToken::Lg);
     let color = if cursor { t.list_cursor_text } else { t.fg };
@@ -239,7 +269,7 @@ fn problem_row(ui: &mut egui::Ui, theme: &Theme, line: &LogLine, expanded: bool,
         ui.painter().set(bg, row_bg(theme, rect, cursor));
         rect
     });
-    ui.interact(inner.inner, ui.id().with(("problem", line.at, &line.message)), egui::Sense::click())
+    ui.interact(inner.inner, ui.id().with(("problem", index)), egui::Sense::click())
 }
 
 /// Cursor background for a row whose height is only known after its content was laid out

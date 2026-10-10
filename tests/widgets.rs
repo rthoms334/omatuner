@@ -356,6 +356,23 @@ fn seek_bar_requests_positions_only_for_seekable_media() {
     let s = shapes(&h);
     assert!(fills_in(&s, r, h.state().theme.tokens.osd_accent) >= 1);
 
+    // a drag seeks as the knob moves, not on every frame it is held still
+    let x50 = r.left() + knob / 2.0 + 0.5 * (r.width() - knob);
+    h.state_mut().requests.clear();
+    h.hover_at(Pos2::new(x, r.center().y));
+    h.drag_at(Pos2::new(x, r.center().y));
+    h.run();
+    h.hover_at(Pos2::new(x50, r.center().y));
+    h.run();
+    let moved = h.state().requests.len();
+    let last = *h.state().requests.last().expect("a seek while dragging");
+    assert!((last - 500.0).abs() < 3.0, "{last}");
+    h.run_steps(5);
+    assert_eq!(h.state().requests.len(), moved, "knob held still: no new seeks");
+    h.drop_at(Pos2::new(x50, r.center().y));
+    h.run();
+    assert_eq!(h.state().requests.len(), moved + 1, "the release seeks once more");
+
     // live: duration unknown → never seeks
     h.state_mut().duration = 0.0;
     h.state_mut().requests.clear();
@@ -474,6 +491,21 @@ fn toast_stack_is_capped_and_actions_fire_once() {
     assert!(h.query_by_label("Note 1").is_none() && h.query_by_label("Note 2").is_none(), "older toasts wait");
     assert!(h.query_by_label("Note 3").is_some() && h.query_by_label("Note 6").is_some());
 
+    // queued toasts don't expire while waiting: they show once the newer ones are gone
+    let mut h = toast_harness(None);
+    for i in 1..=2 {
+        h.state_mut().toasts.push(Toast { ttl_ms: 300, ..Toast::error(format!("Failure {i}")) });
+    }
+    for i in 3..=6 {
+        h.state_mut().toasts.push(Toast { ttl_ms: 600, ..Toast::info(format!("Note {i}")) });
+    }
+    h.run();
+    assert!(h.query_by_label("Failure 1").is_none() && h.query_by_label("Note 3").is_some());
+    std::thread::sleep(std::time::Duration::from_millis(650));
+    h.run();
+    assert!(h.query_by_label("Note 3").is_none() && h.query_by_label("Note 6").is_none(), "newer toasts expired");
+    assert!(h.query_by_label("Failure 1").is_some() && h.query_by_label("Failure 2").is_some(), "queued toasts shown in turn");
+
     let mut h = toast_harness(None);
     h.state_mut().toasts.push(Toast { action: Some(("Undo".into(), Action::ToggleHidden)), ..Toast::info("Channel hidden") });
     h.run();
@@ -556,6 +588,23 @@ fn help_and_jobs_overlays() {
     assert_eq!(h.state_mut().act(Action::FilterInput('x')), "Keep");
     assert_eq!(h.state_mut().act(Action::GoLive), "Ignored");
     h.run();
+    // a newer failure is listed above it: the cursor stays on the row it was on
+    let cursor_bg = h.state().t.theme.tokens.list_cursor_bg;
+    let (old, new) = ("Couldn't refresh My IPTV: HTTP 404", "Couldn't refresh Backup: timed out");
+    assert_eq!(fills_in(&shapes(&h), h.get_by_label(old).rect(), cursor_bg), 1);
+    h.state().t.services().logs.push(tuner::logging::LogLine {
+        at: tuner::model::now(),
+        level: tracing::Level::ERROR,
+        target: "tuner::jobs::import_source".into(),
+        message: new.into(),
+    });
+    std::thread::sleep(std::time::Duration::from_millis(550));
+    h.run();
+    let s = shapes(&h);
+    let (old_r, new_r) = (h.get_by_label(old).rect(), h.get_by_label(new).rect());
+    assert!(new_r.bottom() <= old_r.top(), "newest problem first");
+    assert_eq!(fills_in(&s, old_r, cursor_bg), 1, "the cursor stayed on its row");
+    assert_eq!(fills_in(&s, new_r, cursor_bg), 0);
     assert_eq!(h.state_mut().act(Action::ShowJobs), "Close");
 }
 
@@ -625,7 +674,10 @@ fn confirm_context_menu_and_rename_dialogs() {
     let spec = RenameSpec { title: "Rename playlist".into(), initial: "My IPTV".into(), target: RenameTarget::Source(SourceId(1)) };
     let mut h = overlay_harness(OvApp::new(t, OverlayRequest::Rename(spec)), size);
     assert_eq!(h.state().ov.key_contexts(), vec![KeyContext::TextInput, KeyContext::Modal]);
-    assert_eq!(h.state_mut().act(Action::Activate), "Close");
+    // Enter is acted on in `ui`, after the field took that frame's typing
+    assert_eq!(h.state_mut().act(Action::Activate), "Keep");
+    h.run();
+    assert_eq!(h.state().last, "Close");
     h.run_steps(2);
     h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::CTRL, egui::Key::A);
     h.key_press(egui::Key::Backspace);
@@ -653,9 +705,11 @@ fn pin_prompt_and_list_picker() {
     assert_eq!(h.state_mut().act(Action::Activate), "Keep", "too short");
     h.run();
     assert!(h.query_by_label("Enter 4–8 digits").is_some());
+    // the last digits and Enter in the same frame: Enter is acted on after the field took them
     h.event(egui::Event::Text("34".into()));
+    assert_eq!(h.state_mut().act(Action::Activate), "Keep");
     h.run();
-    assert_eq!(h.state_mut().act(Action::Activate), "CloseWith(Unlocked(ToggleFavourite))", "letters are dropped: 12a34 → 1234");
+    assert_eq!(h.state().last, "CloseWith(Unlocked(ToggleFavourite))", "letters are dropped: 12a34 → 1234");
     assert!(h.state().t.parental.is_unlocked(&h.state().t.config.parental));
 
     // three wrong PINs → cooldown: no text field, even the right PIN is refused
@@ -665,18 +719,22 @@ fn pin_prompt_and_list_picker() {
     h.run_steps(2);
     for attempt in 1..=3 {
         h.event(egui::Event::Text("0000".into()));
-        h.run();
         assert_eq!(h.state_mut().act(Action::Activate), "Keep", "attempt {attempt}");
         h.run();
+        assert!(h.state().last.is_empty(), "attempt {attempt}: {}", h.state().last);
     }
     assert_eq!(h.state().ov.key_contexts(), vec![KeyContext::Modal]);
     assert!(h.query_by_label_contains("try again in").is_some());
     assert_eq!(h.state_mut().act(Action::Activate), "Keep");
+    h.run();
+    assert!(h.state().last.is_empty());
     assert!(!h.state().t.parental.is_unlocked(&h.state().t.config.parental));
     assert_eq!(h.state_mut().act(Action::Back), "Close");
 
-    // favourites-list picker: optimistic toggles in the app-owned FavIndex
+    // favourites-list picker: optimistic toggles in the app-owned FavIndex, undone (with a
+    // message) when the write fails — the writer is stopped here, so every write fails
     let mut t = h.into_state().t;
+    assert!(t.services().store.writer().shutdown(std::time::Duration::from_secs(5)));
     let list = |id, name: &str, default| FavouriteList { id: FavListId(id), name: name.into(), icon: String::new(), sort_index: id as i32, is_default: default };
     t.favs = FavIndex::from_parts(vec![list(1, "Favourites", true), list(2, "Sport", false)], Vec::new());
     let item = ItemRef { source: SourceId(1), kind: ItemKind::Channel, key: ItemKey("bbc-one".into()) };
@@ -684,13 +742,17 @@ fn pin_prompt_and_list_picker() {
     let mut h = overlay_harness(OvApp::new(t, OverlayRequest::ListPicker(spec)), size);
     assert!(h.query_by_label("Sport").is_some() && h.query_by_label("New list…").is_some());
     assert_eq!(h.state_mut().act(Action::Activate), "Keep");
-    assert_eq!(h.state().t.favs.lists_of(&item), &[FavListId(1)]);
+    assert_eq!(h.state().t.favs.lists_of(&item), &[FavListId(1)], "optimistic");
     h.state_mut().act(Action::Down);
     h.state_mut().act(Action::Activate);
     assert_eq!(h.state().t.favs.lists_of(&item), &[FavListId(1), FavListId(2)]);
+    h.run();
+    assert!(h.state().t.favs.lists_of(&item).is_empty(), "failed writes are undone");
+    assert!(h.query_by_label_contains("Couldn't update “").is_some());
     h.get_by_label("Favourites").click();
     h.run();
-    assert_eq!(h.state().t.favs.lists_of(&item), &[FavListId(2)]);
+    assert!(h.state().t.favs.lists_of(&item).is_empty());
+    assert!(h.query_by_label_contains("Couldn't update “Favourites”").is_some());
     // "New list…" (below the lists; the click put the cursor on row 0) opens an inline field
     // (TextInput); Esc returns to the checklist
     h.state_mut().act(Action::Down);
@@ -701,6 +763,11 @@ fn pin_prompt_and_list_picker() {
     assert_eq!(h.state_mut().act(Action::Activate), "Keep", "empty name");
     h.run();
     assert!(h.query_by_label("The name can't be empty").is_some());
+    // a name typed in the same frame as Enter is used (the create then fails: no writer)
+    h.event(egui::Event::Text("Sport 2".into()));
+    assert_eq!(h.state_mut().act(Action::Activate), "Keep");
+    h.run();
+    assert!(h.query_by_label_contains("Couldn't create the list").is_some());
     assert_eq!(h.state_mut().act(Action::Back), "Keep");
     assert_eq!(h.state().ov.key_contexts(), vec![KeyContext::Modal]);
     assert_eq!(h.state_mut().act(Action::Back), "Close");
@@ -841,8 +908,10 @@ fn dialogs_write_through_the_store() {
     h.state_mut().act(Action::Activate);
     h.run_steps(2);
     h.event(egui::Event::Text("Sport".into()));
-    h.run();
     h.state_mut().act(Action::Activate);
+    h.step(); // the create is submitted at the end of this frame, after the field took the text
+    // Esc while the create is pending: the new list still gets the typed name
+    assert_eq!(h.state_mut().act(Action::Back), "Keep");
     step_until(&mut h, |a| a.t.favs.lists.len() > lists);
     let new = h.state().t.favs.lists.iter().find(|l| l.name == "Sport").expect("new list shown").id;
     let stored = tuner::store::user::lists_containing(&h.state().t.db, &item).expect("lists");

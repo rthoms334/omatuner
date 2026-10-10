@@ -2,7 +2,8 @@
 //! with kind glyph, auto-expire, optional action button ("Undo"). Owner: WP-10a.
 //!
 //! Newest toast at the bottom (next to the anchor), at most [`MAX_VISIBLE`] at once (older ones
-//! wait their turn); hovering a toast restarts its timer; pressing its action dismisses it.
+//! wait their turn, and their timer only starts once shown); hovering a toast restarts its
+//! timer; pressing its action dismisses it.
 
 use std::time::{Duration, Instant};
 
@@ -32,16 +33,22 @@ impl Toasts {
     /// the status bar top. Returns an action if a toast button was pressed.
     pub fn show(&mut self, ctx: &egui::Context, theme: &Theme, avoid: Option<egui::Rect>, bottom: f32) -> Option<Action> {
         let now = Instant::now();
+        // queued toasts don't age (their timer starts once they're shown); done before expiring
+        // so one that moves up into the stack this frame starts with its full time
+        let queued = self.items.len().saturating_sub(MAX_VISIBLE);
+        for (_, at) in &mut self.items[..queued] {
+            *at = now;
+        }
         self.items.retain(|(t, at)| now.duration_since(*at) < ttl(t));
         if self.items.is_empty() {
             return None;
         }
+        let first = self.items.len().saturating_sub(MAX_VISIBLE);
         let tk = &theme.tokens;
         let gap = theme.space(SpaceToken::PanelGap);
         let width = (MAX_WIDTH * theme.rem()).min(ctx.content_rect().width() - 2.0 * gap).max(120.0);
         let screen = ctx.content_rect();
         let anchor = stack_anchor(screen, width, gap, avoid, bottom);
-        let first = self.items.len().saturating_sub(MAX_VISIBLE);
         let mut out = None;
         let mut dismiss = None;
         let mut hovered = Vec::new();

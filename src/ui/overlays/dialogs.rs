@@ -9,7 +9,7 @@
 //! overlay keeps the `Ticket` and polls it every frame, closing on success and showing the
 //! (already redacted) error otherwise.
 
-use std::sync::Mutex;
+use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, RichText};
@@ -112,6 +112,29 @@ fn poll<R>(ticket: &mut Option<Ticket<R>>, egui_ctx: &egui::Context) -> Option<c
         egui_ctx.request_repaint_after(Duration::from_millis(30));
     }
     r
+}
+
+/// Enter in a dialog with a text field. Actions are dispatched at the start of the frame, before
+/// the field takes that frame's `Text` events (DESIGN §15.1): acting in `on_action` would miss a
+/// digit typed in the same frame as Enter. So `on_action` only records the request and `ui`
+/// acts on it after drawing the field.
+#[derive(Default)]
+struct Submit(bool);
+
+impl Submit {
+    fn request(&mut self) -> OverlayOutcome {
+        self.0 = true;
+        OverlayOutcome::Keep
+    }
+    /// True once per request. Asks for another frame: the outcome (an error line, "Saving…")
+    /// is acted on after this frame's widgets were drawn.
+    fn take(&mut self, egui_ctx: &egui::Context) -> bool {
+        let requested = std::mem::take(&mut self.0);
+        if requested {
+            egui_ctx.request_repaint();
+        }
+        requested
+    }
 }
 
 /// A user-visible error message (errors are redacted by contract; redact again defensively).
@@ -317,28 +340,33 @@ impl Overlay for ConfirmOverlay {
 const PIN_MAX_FAILURES: u32 = 3;
 const PIN_COOLDOWN: Duration = Duration::from_secs(30);
 
-/// Failed attempts and cooldown are process-wide, so closing and reopening the prompt doesn't
-/// reset them (it's still only a speed bump — see DESIGN §20.3).
+/// Failed attempts and cooldown live as long as the UI thread, so closing and reopening the
+/// prompt doesn't reset them (it's still only a speed bump — see DESIGN §20.3). Thread-local
+/// rather than a process-wide static: the app has one UI thread, and tests (one thread each)
+/// don't put each other into the cooldown.
+#[derive(Default)]
 struct PinGuard {
     failures: u32,
     until: Option<Instant>,
 }
 
-static PIN_GUARD: Mutex<PinGuard> = Mutex::new(PinGuard { failures: 0, until: None });
-
-fn pin_guard() -> std::sync::MutexGuard<'static, PinGuard> { PIN_GUARD.lock().unwrap_or_else(|e| e.into_inner()) }
+thread_local! {
+    static PIN_GUARD: RefCell<PinGuard> = RefCell::default();
+}
 
 /// Remaining cooldown, if any.
 fn pin_cooldown() -> Option<Duration> {
-    let mut g = pin_guard();
-    match g.until {
-        Some(u) if u > Instant::now() => Some(u - Instant::now()),
-        Some(_) => {
-            g.until = None;
-            None
+    PIN_GUARD.with_borrow_mut(|g| {
+        let now = Instant::now();
+        match g.until {
+            Some(u) if u > now => Some(u - now),
+            Some(_) => {
+                g.until = None;
+                None
+            }
+            None => None,
         }
-        None => None,
-    }
+    })
 }
 
 /// 4–8 digit PIN entry (dots), 3 wrong attempts → 30 s cooldown. Verifies with
@@ -348,10 +376,12 @@ pub struct PinOverlay {
     pub reason: String,
     entered: String,
     error: Option<String>,
+    /// Enter was pressed: checked at the end of `ui`, see [`Submit`].
+    enter: Submit,
 }
 
 impl PinOverlay {
-    pub fn new(then: Action, reason: String) -> Self { Self { then, reason, entered: String::new(), error: None } }
+    pub fn new(then: Action, reason: String) -> Self { Self { then, reason, entered: String::new(), error: None, enter: Submit::default() } }
 
     fn submit(&mut self, ctx: &mut UiCtx<'_>) -> OverlayOutcome {
         if pin_cooldown().is_some() {
@@ -362,19 +392,19 @@ impl PinOverlay {
             return OverlayOutcome::Keep;
         }
         if ctx.parental.unlock(&self.entered, &ctx.config.parental) {
-            *pin_guard() = PinGuard { failures: 0, until: None };
+            PIN_GUARD.set(PinGuard::default());
             return OverlayOutcome::CloseWith(OverlayResult::Unlocked(self.then));
         }
         self.entered.clear();
-        let mut g = pin_guard();
-        g.failures += 1;
-        if g.failures >= PIN_MAX_FAILURES {
-            g.failures = 0;
-            g.until = Some(Instant::now() + PIN_COOLDOWN);
-            self.error = None;
-        } else {
-            self.error = Some(format!("Wrong PIN ({} of {PIN_MAX_FAILURES} attempts)", g.failures));
-        }
+        self.error = PIN_GUARD.with_borrow_mut(|g| {
+            g.failures += 1;
+            if g.failures >= PIN_MAX_FAILURES {
+                *g = PinGuard { failures: 0, until: Some(Instant::now() + PIN_COOLDOWN) };
+                None
+            } else {
+                Some(format!("Wrong PIN ({} of {PIN_MAX_FAILURES} attempts)", g.failures))
+            }
+        });
         OverlayOutcome::Keep
     }
 }
@@ -385,9 +415,9 @@ impl Overlay for PinOverlay {
         if pin_cooldown().is_some() { vec![KeyContext::Modal] } else { vec![KeyContext::TextInput, KeyContext::Modal] }
     }
 
-    fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> OverlayOutcome {
+    fn on_action(&mut self, _ctx: &mut UiCtx<'_>, action: Action) -> OverlayOutcome {
         match action {
-            Action::Activate => self.submit(ctx),
+            Action::Activate => self.enter.request(),
             Action::Back => OverlayOutcome::Close,
             _ => OverlayOutcome::Ignored,
         }
@@ -424,7 +454,7 @@ impl Overlay for PinOverlay {
             buttons(ui, theme, "Unlock", ButtonStyle { primary: true, ..Default::default() }, None)
         })
         .inner;
-        if ok {
+        if self.enter.take(egui_ctx) || ok {
             self.submit(ctx)
         } else if cancel {
             OverlayOutcome::Close
@@ -475,10 +505,14 @@ pub struct RenameOverlay {
     text: String,
     pending: Option<Ticket<()>>,
     error: Option<String>,
+    enter: Submit,
 }
 
 impl RenameOverlay {
-    pub fn new(spec: RenameSpec) -> Self { let t = spec.initial.clone(); Self { spec, text: t, pending: None, error: None } }
+    pub fn new(spec: RenameSpec) -> Self {
+        let text = spec.initial.clone();
+        Self { spec, text, pending: None, error: None, enter: Submit::default() }
+    }
 
     fn save(&mut self, ctx: &mut UiCtx<'_>) -> OverlayOutcome {
         if self.pending.is_some() {
@@ -500,9 +534,9 @@ impl RenameOverlay {
 impl Overlay for RenameOverlay {
     fn key_contexts(&self) -> Vec<KeyContext> { vec![KeyContext::TextInput, KeyContext::Modal] }
 
-    fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> OverlayOutcome {
+    fn on_action(&mut self, _ctx: &mut UiCtx<'_>, action: Action) -> OverlayOutcome {
         match action {
-            Action::Activate => self.save(ctx),
+            Action::Activate => self.enter.request(),
             Action::Back => OverlayOutcome::Close,
             _ => OverlayOutcome::Ignored,
         }
@@ -539,7 +573,7 @@ impl Overlay for RenameOverlay {
             buttons(ui, theme, if saving { "Saving…" } else { "Save" }, ButtonStyle { primary: true, ..Default::default() }, None)
         })
         .inner;
-        if ok {
+        if self.enter.take(egui_ctx) || ok {
             self.save(ctx)
         } else if cancel {
             OverlayOutcome::Close
@@ -555,39 +589,78 @@ impl Overlay for RenameOverlay {
 /// (opens an inline name field: `[TextInput, Modal]` while typing).
 ///
 /// Lists and memberships come from the app-owned `ctx.favs` (no DB read on the UI thread);
-/// toggles are written through the store writer and patched into `ctx.favs` optimistically.
+/// toggles are written through the store writer and patched into `ctx.favs` optimistically
+/// (reverted, with an error line, if the write fails while the picker is open).
 pub struct ListPickerOverlay {
     pub spec: ListPickerSpec,
     cursor: usize,
     /// `Some(name)` while the "New list…" field is open.
     naming: Option<String>,
     creating: Option<Ticket<FavListId>>,
+    /// Name the pending create was submitted with (the field may be closed meanwhile).
+    new_name: String,
+    /// Membership writes not answered yet.
+    toggles: Vec<PendingToggle>,
     error: Option<String>,
+    enter: Submit,
+}
+
+/// An optimistic membership change waiting for the writer.
+struct PendingToggle {
+    ticket: Ticket<()>,
+    list: FavListId,
+    on: bool,
 }
 
 impl ListPickerOverlay {
-    pub fn new(spec: ListPickerSpec) -> Self { Self { spec, cursor: 0, naming: None, creating: None, error: None } }
+    pub fn new(spec: ListPickerSpec) -> Self {
+        Self { spec, cursor: 0, naming: None, creating: None, new_name: String::new(), toggles: Vec::new(), error: None, enter: Submit::default() }
+    }
 
     fn toggle(&mut self, ctx: &mut UiCtx<'_>, list: FavListId) {
         let item = self.spec.item.clone();
         let on = !ctx.favs.lists_of(&item).contains(&list);
         let now = ctx.now;
         let write_item = item.clone();
-        // fire-and-forget: DataScope::Favourites makes the app reload `favs` from the store
-        drop(ctx.services.store.writer().submit_notify(DataScope::Favourites, move |c| {
+        // DataScope::Favourites makes the app reload `favs` from the store once it's written
+        let ticket = ctx.services.store.writer().submit_notify(DataScope::Favourites, move |c| {
             crate::store::user::set_favourite(c, list, &write_item, on, now)
-        }));
+        });
+        self.toggles.push(PendingToggle { ticket, list, on });
         ctx.favs.apply_toggle(list, &item, on);
     }
 
+    /// Settle answered membership writes: a failed one is undone in `ctx.favs` and reported.
+    fn poll_toggles(&mut self, egui_ctx: &egui::Context, ctx: &mut UiCtx<'_>) {
+        let item = &self.spec.item;
+        let mut failed = None;
+        self.toggles.retain_mut(|p| match p.ticket.try_take() {
+            None => true,
+            Some(Ok(())) => false,
+            Some(Err(e)) => {
+                ctx.favs.apply_toggle(p.list, item, !p.on);
+                failed = Some((p.list, e));
+                false
+            }
+        });
+        if let Some((list, e)) = failed {
+            let name = ctx.favs.lists.iter().find(|l| l.id == list).map(|l| l.name.as_str()).unwrap_or("the list");
+            self.error = Some(format!("Couldn't update “{name}”: {}", message(&e)));
+        }
+        if !self.toggles.is_empty() {
+            egui_ctx.request_repaint_after(Duration::from_millis(30));
+        }
+    }
+
     fn create(&mut self, ctx: &mut UiCtx<'_>) {
+        if self.creating.is_some() {
+            return;
+        }
         let Some(name) = self.naming.as_ref().map(|n| n.trim().to_owned()).filter(|n| !n.is_empty()) else {
             self.error = Some("The name can't be empty".into());
             return;
         };
-        if self.creating.is_some() {
-            return;
-        }
+        self.new_name = name.clone();
         let item = self.spec.item.clone();
         let now = ctx.now;
         self.creating = Some(ctx.services.store.writer().submit_notify(DataScope::Favourites, move |c| {
@@ -599,7 +672,8 @@ impl ListPickerOverlay {
 
     /// The new list was stored: show it at once (the app's reload follows).
     fn created(&mut self, ctx: &mut UiCtx<'_>, id: FavListId) {
-        let name = self.naming.take().unwrap_or_default().trim().to_owned();
+        self.naming = None;
+        let name = std::mem::take(&mut self.new_name);
         if !ctx.favs.lists.iter().any(|l| l.id == id) {
             let sort_index = ctx.favs.lists.iter().map(|l| l.sort_index).max().unwrap_or(0) + 1;
             ctx.favs.lists.push(FavouriteList { id, name, icon: glyphs::FAV_LIST.into(), sort_index, is_default: false });
@@ -617,10 +691,7 @@ impl Overlay for ListPickerOverlay {
     fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> OverlayOutcome {
         if self.naming.is_some() {
             return match action {
-                Action::Activate => {
-                    self.create(ctx);
-                    OverlayOutcome::Keep
-                }
+                Action::Activate => self.enter.request(),
                 Action::Back => {
                     self.naming = None;
                     self.error = None;
@@ -658,6 +729,7 @@ impl Overlay for ListPickerOverlay {
             Some(Err(e)) => self.error = Some(format!("Couldn't create the list: {}", message(&e))),
             None => {}
         }
+        self.poll_toggles(egui_ctx, ctx);
         let theme = ctx.theme;
         let t = &theme.tokens;
         if scrim(egui_ctx, theme, "list-picker") {
@@ -726,6 +798,24 @@ impl Overlay for ListPickerOverlay {
         if let Some(id) = clicked {
             self.toggle(ctx, id);
         }
+        // Enter in the name field, after the field took this frame's text
+        if self.enter.take(egui_ctx) && self.naming.is_some() {
+            self.create(ctx);
+        }
         if close { OverlayOutcome::Close } else { OverlayOutcome::Keep }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pin_cooldown_is_per_thread() {
+        PIN_GUARD.set(PinGuard { failures: 0, until: Some(Instant::now() + PIN_COOLDOWN) });
+        assert!(pin_cooldown().is_some());
+        assert!(std::thread::spawn(pin_cooldown).join().expect("thread").is_none(), "another thread isn't locked out");
+        PIN_GUARD.set(PinGuard { failures: 0, until: Some(Instant::now()) });
+        assert!(pin_cooldown().is_none(), "an elapsed cooldown ends");
     }
 }
