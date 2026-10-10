@@ -52,6 +52,7 @@ struct Harness {
     store: Store,
     events: crossbeam_channel::Receiver<AppEvent>,
     stash: Mutex<Vec<Finished>>,
+    paths: tuner::paths::AppPaths,
 }
 
 fn harness() -> Harness {
@@ -64,9 +65,9 @@ fn harness() -> Harness {
     let mut cfg = Config::default();
     cfg.general.epg_keep_past_days = KEEP_PAST_DAYS;
     let config: SharedConfig = Arc::new(RwLock::new(Arc::new(cfg)));
-    let ctx = JobContext::new(store.clone(), http, bus, paths, config);
+    let ctx = JobContext::new(store.clone(), http, bus, paths.clone(), config);
     let jobs = JobManager::new(ctx, tokio::runtime::Handle::current());
-    Harness { _dir: dir, jobs, store, events, stash: Mutex::default() }
+    Harness { _dir: dir, jobs, store, events, stash: Mutex::default(), paths }
 }
 
 impl Harness {
@@ -768,19 +769,29 @@ async fn maintenance_backup_and_restore_jobs() {
 
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("backup.json");
+    let mut cfg = Config::default();
+    cfg.player.cache_secs = 44;
+    std::fs::write(h.paths.config_file(), toml::to_string_pretty(&cfg).unwrap()).unwrap();
     h.jobs.submit(JobKind::ExportBackup { path: file.clone(), opts: Default::default() });
     match h.finished(|k| matches!(k, JobKind::ExportBackup { .. })).await.1 {
         Ok(JobOutcome::BackupWritten(p)) => assert_eq!(p, file),
         other => panic!("{other:?}"),
     }
     h.settle().await;
-    h.jobs.submit(JobKind::ImportBackup { path: file, mode: tuner::store::backup::RestoreMode::Merge });
-    match h.finished(|k| matches!(k, JobKind::ImportBackup { .. })).await.1 {
-        Ok(JobOutcome::Restored(r)) => assert_eq!((r.sources_added, r.sources_matched), (0, 1)),
-        other => panic!("{other:?}"),
+    // a Merge without "Restore settings" leaves the settings alone; with it they come back
+    for settings in [false, true] {
+        h.jobs.submit(JobKind::ImportBackup { path: file.clone(), mode: tuner::store::backup::RestoreMode::Merge, settings });
+        match h.finished(|k| matches!(k, JobKind::ImportBackup { .. })).await.1 {
+            Ok(JobOutcome::Restored(r)) => {
+                assert_eq!((r.sources_added, r.sources_matched), (0, 1));
+                assert_eq!(r.settings.map(|c| c.player.cache_secs), settings.then_some(44));
+            }
+            other => panic!("{other:?}"),
+        }
+        // restore → every enabled source is refreshed
+        assert!(h.finished(|k| matches!(k, JobKind::RefreshSource { source: s, .. } if *s == source)).await.1.is_ok());
+        h.settle().await;
     }
-    // restore → every enabled source is refreshed
-    assert!(h.finished(|k| matches!(k, JobKind::RefreshSource { source: s, .. } if *s == source)).await.1.is_ok());
 }
 
 // ---------------------------------------------------------------------------------------------

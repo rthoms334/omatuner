@@ -1560,7 +1560,7 @@ favourites lists) show a 󰇙 drag grip and move with Alt+↑/↓ or K/J. Every 
 | Favourites | lists: create, rename (F2), delete (Confirm), reorder (grip / Alt+↑/↓) | `fav_list` | "Favourites" (default, not deletable) |
 | Reminders | pending reminders (programme, channel, time); Delete cancels | `reminder` | — |
 | Parental | enable · set/change PIN · relock after · lock groups/channels (from lists via Ctrl+L) | `parental.*`, overrides | off |
-| Backup | export (include passwords? history?) · import (merge/replace) | §19 | — |
+| Backup | export (include passwords? history?) · import (merge/replace, restore settings?) | §19 | — |
 | Hidden items | unhide groups/channels/VOD | overrides | — |
 | Orphans | Enter = attach to…, Delete/x → menu with Forget | §8.3 | — |
 | About & logs | version, paths, debug logging, log viewer, export log | `general.debug_log` | off |
@@ -2165,7 +2165,10 @@ watch progress, history (optional), reminders, manual EPG mappings (by EPG sourc
 raw `config.toml`. Written 0600 via the portal file picker. Restore: Merge (match sources by
 kind + name + URL/server) or Replace; then every restored source is refreshed and user data
 re-attaches through fingerprints (§8.3). Sources restored without passwords are listed as
-"needs credentials".
+"needs credentials". The backup's settings are applied only when "Restore settings" is on (it
+follows the mode: on for Replace, off for Merge, so a Merge that brings back favourites keeps
+the current settings; the onboarding restore always applies them). Machine-specific settings
+(fonts, hwdec, mpv options, UI scale, debug log) stay, and an existing PIN is never replaced.
 
 ---
 

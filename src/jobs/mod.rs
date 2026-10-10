@@ -109,10 +109,12 @@ pub enum JobKind {
         path: PathBuf,
         opts: BackupOptions,
     },
-    /// Restore, then submit `RefreshSource` for every restored source.
+    /// Restore, then submit `RefreshSource` for every restored source. `settings`: apply the
+    /// backup's settings too (the user's choice on Settings ▸ Backup).
     ImportBackup {
         path: PathBuf,
         mode: RestoreMode,
+        settings: bool,
     },
 }
 
@@ -832,9 +834,9 @@ async fn execute(ctx: &JobContext, kind: &JobKind, progress: &Progress, cancel: 
             maintenance::export_backup(ctx, path, *opts).await?;
             Ok(JobOutcome::BackupWritten(path.clone()))
         }
-        JobKind::ImportBackup { path, mode } => {
+        JobKind::ImportBackup { path, mode, settings } => {
             progress.set(JobPhase::Writing { done: 0, total: None });
-            Ok(JobOutcome::Restored(maintenance::import_backup(ctx, path, *mode).await?))
+            Ok(JobOutcome::Restored(maintenance::import_backup(ctx, path, *mode, *settings).await?))
         }
     }
 }

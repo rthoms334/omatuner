@@ -985,7 +985,9 @@ impl Screen for OnboardingScreen {
                 (PickPurpose::ImportBackup, Some(path)) if self.step == Step::Welcome && self.restore.is_none() => {
                     use crate::store::backup::RestoreMode;
                     self.asked = None;
-                    self.restore = Some(ctx.services.jobs.submit(JobKind::ImportBackup { path: path.clone(), mode: RestoreMode::Merge }));
+                    // first run: there are no settings of the user's to keep yet
+                    self.restore =
+                        Some(ctx.services.jobs.submit(JobKind::ImportBackup { path: path.clone(), mode: RestoreMode::Merge, settings: true }));
                     self.restore_report = None;
                     self.go(Step::Restoring);
                 }

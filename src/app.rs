@@ -1992,7 +1992,7 @@ mod tests {
         let report = crate::store::backup::RestoreReport { settings: Some(Box::new(cfg)), ..Default::default() };
         rig.event(AppEvent::Job(JobEvent::Finished {
             id: JobId(4),
-            kind: JobKind::ImportBackup { path: "/tmp/b.tuner-backup".into(), mode: crate::store::backup::RestoreMode::Merge },
+            kind: JobKind::ImportBackup { path: "/tmp/b.tuner-backup".into(), mode: crate::store::backup::RestoreMode::Merge, settings: true },
             outcome: Ok(JobOutcome::Restored(report)),
             failure: None,
         }));

@@ -342,6 +342,8 @@ enum Local {
     BackupPasswords,
     BackupHistory,
     RestoreMode,
+    /// Apply the backup's settings too (on for "Replace everything", off for "Merge").
+    RestoreSettings,
     SrcName,
     SrcIcon,
     SrcColor,
@@ -382,7 +384,13 @@ impl Local {
     fn is_toggle(self) -> bool {
         matches!(
             self,
-            Local::BackupPasswords | Local::BackupHistory | Local::SrcProviderEpg | Local::SrcSmartNames | Local::SrcImportVod | Local::SrcUseXtream
+            Local::BackupPasswords
+                | Local::BackupHistory
+                | Local::RestoreSettings
+                | Local::SrcProviderEpg
+                | Local::SrcSmartNames
+                | Local::SrcImportVod
+                | Local::SrcUseXtream
         )
     }
 }
@@ -574,7 +582,8 @@ enum Pending {
     DeleteEpg(EpgSourceId),
     DeleteList(FavListId),
     ForgetOrphan(ItemRef),
-    Restore(PathBuf),
+    /// A Replace restore (and whether the backup's settings are applied too).
+    Restore(PathBuf, bool),
     RemovePin,
     Menu(Item),
     /// ←/→ on a parental row waiting for the PIN (retried as the same adjustment).
@@ -637,6 +646,8 @@ pub struct SettingsScreen {
     error: Option<(Local, String)>,
     backup: BackupOptions,
     restore_replace: bool,
+    /// Apply the backup's settings on restore; follows the mode until the user sets it.
+    restore_settings: bool,
     backup_job: Option<JobId>,
     backup_status: Option<(bool, String)>,
     pending: Option<Pending>,
@@ -906,6 +917,7 @@ impl SettingsScreen {
                 v.push(Row::Act { act: Act::ExportBackup, icon: glyphs::BACKUP, label: "Export backup…".into(), danger: false });
                 v.push(Row::Section("Restore".into()));
                 v.push(Row::Local { field: Local::RestoreMode, label: "When restoring" });
+                v.push(Row::Local { field: Local::RestoreSettings, label: "Restore settings" });
                 v.push(Row::Act { act: Act::ImportBackup, icon: glyphs::FOLDER, label: "Restore a backup…".into(), danger: self.restore_replace });
                 if let Some((ok, msg)) = &self.backup_status {
                     v.push(Row::Note(msg.clone(), !ok));
@@ -1090,6 +1102,7 @@ impl SettingsScreen {
         Some(match f {
             Local::BackupPasswords => &mut self.backup.include_credentials,
             Local::BackupHistory => &mut self.backup.include_history,
+            Local::RestoreSettings => &mut self.restore_settings,
             Local::SrcProviderEpg => &mut self.editor.as_mut()?.provider_epg,
             Local::SrcSmartNames => &mut self.editor.as_mut()?.smart_names,
             Local::SrcImportVod => &mut self.editor.as_mut()?.import_vod,
@@ -1114,7 +1127,10 @@ impl SettingsScreen {
     fn adjust_local(&mut self, f: Local, dir: i32) {
         let cycle = |v: &mut usize, n: usize| *v = ((*v as i32 + dir).rem_euclid(n as i32)) as usize;
         match f {
-            Local::RestoreMode => self.restore_replace = !self.restore_replace,
+            Local::RestoreMode => {
+                self.restore_replace = !self.restore_replace;
+                self.restore_settings = self.restore_replace;
+            }
             Local::SrcIcon => {
                 if let Some(e) = &mut self.editor {
                     cycle(&mut e.icon, glyphs::SOURCE_ICONS.len());
@@ -2051,7 +2067,7 @@ impl Screen for SettingsScreen {
                 (PickPurpose::ImportBackup, Some(path)) => {
                     self.asked = None;
                     if self.restore_replace {
-                        let token = self.token(Pending::Restore(path.clone()));
+                        let token = self.token(Pending::Restore(path.clone(), self.restore_settings));
                         ctx.open(OverlayRequest::Confirm(ConfirmSpec {
                             title: "Replace everything?".into(),
                             body: "All playlists, guides, favourites and progress are replaced by the backup.".into(),
@@ -2060,7 +2076,9 @@ impl Screen for SettingsScreen {
                             token,
                         }));
                     } else {
-                        self.backup_job = Some(ctx.services.jobs.submit(JobKind::ImportBackup { path: path.clone(), mode: RestoreMode::Merge }));
+                        let settings = self.restore_settings;
+                        self.backup_job =
+                            Some(ctx.services.jobs.submit(JobKind::ImportBackup { path: path.clone(), mode: RestoreMode::Merge, settings }));
                         self.backup_status = Some((true, "Restoring…".into()));
                     }
                 }
@@ -2182,8 +2200,8 @@ impl Screen for SettingsScreen {
                         let _ = ctx.services.store.writer().submit_notify(DataScope::All, move |c| crate::store::user::forget_orphan(c, &r));
                     }
                 }
-                Pending::Restore(path) => {
-                    self.backup_job = Some(ctx.services.jobs.submit(JobKind::ImportBackup { path, mode: RestoreMode::Replace }));
+                Pending::Restore(path, settings) => {
+                    self.backup_job = Some(ctx.services.jobs.submit(JobKind::ImportBackup { path, mode: RestoreMode::Replace, settings }));
                     self.backup_status = Some((true, "Restoring…".into()));
                 }
                 Pending::RemovePin => {
@@ -2970,7 +2988,7 @@ mod tests {
         focus(&mut h, "When restoring");
         h.state_mut().act(Action::Activate);
         h.run_steps(2);
-        assert!(h.state().s.restore_replace);
+        assert!(h.state().s.restore_replace && h.state().s.restore_settings, "Replace restores the settings by default");
         focus(&mut h, "Restore a backup…");
         h.state_mut().act(Action::Activate);
         h.run_steps(2);

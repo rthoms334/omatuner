@@ -649,8 +649,10 @@ With `--profile-dir DIR`, the same files live under `DIR/config`, `DIR/data`, `D
 
 Per-playlist and per-channel settings (renames, hidden items, favourites, progress, EPG
 mappings) live in the database. **Settings ▸ Backup** exports them as JSON, without passwords
-unless you tick *Include passwords*. Restoring offers Merge or Replace. After a restore, every
-playlist is refreshed and your data is re-attached to the refreshed channels.
+unless you tick *Include passwords*. Restoring offers Merge or Replace; the backup's settings
+are applied too only with *Restore settings* (on for Replace, off for Merge), and a PIN you
+already set is never replaced. After a restore, every playlist is refreshed and your data is
+re-attached to the refreshed channels.
 
 ## Theming
 
