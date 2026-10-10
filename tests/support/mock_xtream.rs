@@ -44,6 +44,13 @@
 //! * `xmltv.php` / `get.php`: `ETag` + `Last-Modified`, answering 304 to a matching
 //!   `If-None-Match` / `If-Modified-Since`. `xmltv.php` sends the gzip bytes as they are (no
 //!   `Content-Encoding`), like real panels serving `.xml.gz`.
+//! * `get.php` (m3u_plus style, phase 5): the live streams, then the movies of
+//!   `vod_streams.json` (`/movie/…`, group = category name) and the episodes of series 700
+//!   from `series_info_object.json` (`/series/…`, titled `Example Show (2020) S01 E01`, group
+//!   "Drama"). `playlist.m3u?username=…&password=…` serves the same list under a name that is
+//!   not `get.php` (an entry-shaped playlist URL); [`MockXtream::playlist`] returns it as text.
+//! * `MockOptions::path_prefix` (`/panel`): every endpoint lives under it, as on panels behind
+//!   a reverse proxy; [`MockXtream::server`] is the base with the prefix.
 //!
 //! With `MockAuth::Rejected` every action answers the login-failure object; with `Http403`
 //! every path answers 403 (stream paths too: the "too many connections" case). `html_200`
@@ -65,6 +72,8 @@ pub struct MockOptions {
     pub delay_ms: u64,
     /// Where stream paths redirect (from `media::ensure_media`).
     pub media_base: Option<String>,
+    /// Serve everything under this path (`/panel`); other paths answer 404.
+    pub path_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -77,8 +86,10 @@ pub enum MockAuth {
 }
 
 pub struct MockXtream {
-    /// `http://127.0.0.1:<port>` — use as the Xtream server URL.
+    /// `http://127.0.0.1:<port>` — use as the Xtream server URL (with [`MockXtream::server`]
+    /// when there is a path prefix).
     pub base: String,
+    prefix: String,
     pub requests: Arc<Mutex<Vec<String>>>,
     pub shutdown: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -97,7 +108,8 @@ pub const MOCK_LAST_MODIFIED: &str = "Fri, 09 Oct 2026 18:00:00 GMT";
 
 struct State {
     opts: MockOptions,
-    base: String,
+    /// Base URL with the path prefix.
+    server: String,
     requests: Arc<Mutex<Vec<String>>>,
 }
 
@@ -105,8 +117,9 @@ struct State {
 pub async fn start(opts: MockOptions) -> MockXtream {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind mock xtream");
     let base = format!("http://{}", listener.local_addr().expect("local addr"));
+    let prefix = opts.path_prefix.clone().unwrap_or_default().trim_end_matches('/').to_owned();
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let state = Arc::new(State { opts, base: base.clone(), requests: requests.clone() });
+    let state = Arc::new(State { opts, server: format!("{base}{prefix}"), requests: requests.clone() });
     let app = axum::Router::new().fallback(move |uri: Uri, headers: HeaderMap| {
         let state = state.clone();
         async move { handle(&state, uri, headers).await }
@@ -119,7 +132,7 @@ pub async fn start(opts: MockOptions) -> MockXtream {
             })
             .await;
     });
-    MockXtream { base, requests, shutdown: Some(tx) }
+    MockXtream { base, prefix, requests, shutdown: Some(tx) }
 }
 
 impl MockXtream {
@@ -128,13 +141,25 @@ impl MockXtream {
         self.requests.lock().unwrap().clone()
     }
 
+    /// Recorded requests whose path (after the prefix) starts with `path`.
+    pub fn count(&self, path: &str) -> usize {
+        let full = format!("{}{path}", self.prefix);
+        self.recorded().iter().filter(|r| r.starts_with(&full)).count()
+    }
+
+    /// The Xtream server URL: the base plus the path prefix.
+    pub fn server(&self) -> String {
+        format!("{}{}", self.base, self.prefix)
+    }
+
     /// Credentials for this panel (any non-empty pair works; `username` picks login quirks).
     pub fn creds(&self, username: &str, password: &str) -> tuner::model::XtreamCredentials {
-        tuner::model::XtreamCredentials {
-            server: self.base.clone(),
-            username: username.into(),
-            password: tuner::redact::Secret::new(password.into()),
-        }
+        tuner::model::XtreamCredentials { server: self.server(), username: username.into(), password: tuner::redact::Secret::new(password.into()) }
+    }
+
+    /// The `get.php` playlist of a login (`.ts` live streams), e.g. to save as a local file.
+    pub fn playlist(&self, username: &str, password: &str) -> String {
+        m3u_from_fixtures(&self.server(), username, password, "ts")
     }
 }
 
@@ -164,8 +189,9 @@ async fn handle(st: &State, uri: Uri, headers: HeaderMap) -> Response {
     }
     let q: Vec<(String, String)> = url::form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()).into_owned().collect();
     let param = |k: &str| q.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
-    let path = uri.path();
-    if path == "/player_api.php" || path == "/xmltv.php" || path == "/get.php" {
+    let prefix = st.opts.path_prefix.as_deref().unwrap_or("").trim_end_matches('/');
+    let Some(path) = uri.path().strip_prefix(prefix) else { return (StatusCode::NOT_FOUND, "not found").into_response() };
+    if matches!(path, "/player_api.php" | "/xmltv.php" | "/get.php" | "/playlist.m3u") {
         let (Some(user), Some(pass)) = (param("username"), param("password")) else { return json(fixture(AUTH_FAIL)) };
         if user.is_empty() || pass.is_empty() || st.opts.auth == MockAuth::Rejected {
             return if path == "/player_api.php" { json(fixture(AUTH_FAIL)) } else { (StatusCode::UNAUTHORIZED, "").into_response() };
@@ -175,7 +201,7 @@ async fn handle(st: &State, uri: Uri, headers: HeaderMap) -> Response {
             "/xmltv.php" => conditional(st, &headers, fixture("xmltv/basic.xml.gz"), "application/xml"),
             _ => {
                 let ext = param("output").unwrap_or("ts");
-                conditional(st, &headers, m3u_from_fixtures(&st.base, user, pass, ext).into_bytes(), "audio/x-mpegurl")
+                conditional(st, &headers, m3u_from_fixtures(&st.server, user, pass, ext).into_bytes(), "audio/x-mpegurl")
             }
         };
     }
@@ -275,33 +301,58 @@ fn conditional(st: &State, headers: &HeaderMap, body: Vec<u8>, content_type: &'s
     ([(header::CONTENT_TYPE, content_type), (header::ETAG, MOCK_ETAG), (header::LAST_MODIFIED, MOCK_LAST_MODIFIED)], Body::from(body)).into_response()
 }
 
-/// `get.php?type=m3u_plus` equivalent of the live fixtures.
+/// `get.php?type=m3u_plus` equivalent of the fixtures: live streams, movies, the episodes of
+/// series 700.
 fn m3u_from_fixtures(base: &str, user: &str, pass: &str, ext: &str) -> String {
     use serde_json::Value;
     let enc = tuner::sources::xtream::urls::enc;
-    let cats: Vec<Value> = serde_json::from_slice(&fixture("xtream/live_categories.json")).expect("live_categories.json");
-    let streams: Vec<Value> = serde_json::from_slice(&fixture("xtream/live_streams.json")).expect("live_streams.json");
+    let list = |name: &str| -> Vec<Value> { serde_json::from_slice(&fixture(&format!("xtream/{name}"))).expect(name) };
     let text = |v: &Value, k: &str| match v.get(k) {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Number(n)) => n.to_string(),
         _ => String::new(),
     };
-    let mut out = format!("#EXTM3U url-tvg=\"{base}/xmltv.php?username={}&password={}\"\n", enc(user), enc(pass));
-    for s in &streams {
-        let id = text(s, "stream_id");
+    let category = |cats: &[Value], item: &Value| {
+        let id = text(item, "category_id");
+        cats.iter().find(|c| text(c, "category_id") == id).map(|c| text(c, "category_name")).unwrap_or_default()
+    };
+    let (u, p) = (enc(user), enc(pass));
+    let mut out = format!("#EXTM3U url-tvg=\"{base}/xmltv.php?username={u}&password={p}\"\n");
+    let live_cats = list("live_categories.json");
+    for s in list("live_streams.json") {
+        let id = text(&s, "stream_id");
         if id.is_empty() {
             continue;
         }
-        let cat_id = text(s, "category_id");
-        let group = cats.iter().find(|c| text(c, "category_id") == cat_id).map(|c| text(c, "category_name")).unwrap_or_default();
-        let name = text(s, "name");
+        let (name, group) = (text(&s, "name"), category(&live_cats, &s));
         out.push_str(&format!(
-            "#EXTINF:-1 tvg-id=\"{}\" tvg-name=\"{name}\" tvg-logo=\"{}\" group-title=\"{group}\",{name}\n{base}/live/{}/{}/{id}.{ext}\n",
-            text(s, "epg_channel_id"),
-            text(s, "stream_icon"),
-            enc(user),
-            enc(pass),
+            "#EXTINF:-1 tvg-id=\"{}\" tvg-name=\"{name}\" tvg-logo=\"{}\" group-title=\"{group}\",{name}\n{base}/live/{u}/{p}/{id}.{ext}\n",
+            text(&s, "epg_channel_id"),
+            text(&s, "stream_icon"),
         ));
+    }
+    let vod_cats = list("vod_categories.json");
+    for m in list("vod_streams.json") {
+        let (id, name, group) = (text(&m, "stream_id"), text(&m, "name"), category(&vod_cats, &m));
+        out.push_str(&format!(
+            "#EXTINF:-1 tvg-id=\"\" tvg-name=\"{name}\" tvg-logo=\"{}\" group-title=\"{group}\",{name}\n{base}/movie/{u}/{p}/{id}.{}\n",
+            text(&m, "stream_icon"),
+            text(&m, "container_extension"),
+        ));
+    }
+    let series_cats = list("series_categories.json");
+    let info: Value = serde_json::from_slice(&fixture("xtream/series_info_object.json")).expect("series_info_object.json");
+    for s in list("series.json").iter().filter(|s| text(s, "series_id") == "700") {
+        let (show, cover, group) = (text(s, "name"), text(s, "cover"), category(&series_cats, s));
+        for e in info["episodes"].as_object().into_iter().flat_map(|seasons| seasons.values()).flat_map(|eps| eps.as_array().into_iter().flatten()) {
+            let name =
+                format!("{show} S{:02} E{:02}", text(e, "season").parse::<u32>().unwrap_or(1), text(e, "episode_num").parse::<u32>().unwrap_or(0));
+            out.push_str(&format!(
+                "#EXTINF:-1 tvg-id=\"\" tvg-name=\"{name}\" tvg-logo=\"{cover}\" group-title=\"{group}\",{name}\n{base}/series/{u}/{p}/{}.{}\n",
+                text(e, "id"),
+                text(e, "container_extension"),
+            ));
+        }
     }
     out
 }

@@ -31,32 +31,55 @@
 //!   the manager's coalescing alone cannot keep it apart from a `RefreshSource` of the same row
 //!   (or from a second onboarding attempt). A per-source async lock serializes them, and each run
 //!   downloads to its own file (`<source>-<job>.m3u`).
+//!
+//! Phase 5 (DESIGN §27.3–27.5):
+//! * M3U imports classify entries (`m3u_vod::classify`): Xtream `/movie/` and `/series/` URLs
+//!   become movies and series episodes (keeping the key the entry has as a channel); episodes
+//!   are collected during the parse and written as whole series after it. Channels, movies and
+//!   series all complete (and are swept) at the finish.
+//! * An M3U source not kept as M3U checks for its Xtream login when due (forced, never
+//!   checked, or the last check is a week old): from a `get.php` URL before any download, else
+//!   by scanning the downloaded / local playlist. A working login runs the Xtream import, whose
+//!   first finish switches the source (`Upgrade`); a failed login, or an Xtream import failing
+//!   before that finish, records the check and imports the same playlist in the same job.
+//!   A playlist without a login records the check too, so it is scanned weekly, not on every
+//!   refresh; while it has no failed login on record, the weekly download stays conditional.
+//! * An upgraded source the user keeps as M3U goes back to its playlist with a forced import
+//!   whose finish switches it and moves Xtream-keyed user data to the playlist's rows.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use tokio_util::sync::CancellationToken;
 
-use super::{JobContext, JobKind, JobPhase, Progress, blocking, check, read, write};
+use super::{JobContext, JobKind, JobPhase, Progress, blocking, check, notify, read, write};
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::model::{
-    CatchupKind, CatchupSpec, EpgSourceId, EpgSourceKind, HttpHeaders, ItemKind, Source, SourceCounts, SourceId, SourceKind, SourceStatus,
-    StreamLocator, Timestamp, Unsupported, XtreamStreamKind,
+    AccountInfo, CatchupKind, CatchupSpec, EpgSourceId, EpgSourceKind, GroupKey, HttpHeaders, ItemKey, ItemKind, Source, SourceCounts, SourceId,
+    SourceKind, SourceStatus, StreamLocator, Timestamp, Unsupported, XtreamCredentials, XtreamStreamKind,
 };
+use crate::msg::DataScope;
 use crate::sources::PayloadKind;
 use crate::sources::http::{DownloadOutcome, DownloadRequest, open_decompressed};
 use crate::sources::identity::{self, KeyAllocator, group_key, normalize_group, normalize_name};
 use crate::sources::m3u::{self, M3uEntry, M3uError};
+use crate::sources::m3u_vod::{self, EntryClass, EpisodeMarker};
 use crate::sources::smart_names::{clean_channel_name, clean_group_name, clean_vod_name};
 use crate::sources::xtream::XtreamClient;
+use crate::sources::xtream::detect::{PlaylistScan, parse_stream_url};
 use crate::sources::xtream::types::{XtCategory, XtLiveStream, XtSeries, XtVodStream};
 use crate::sources::xtream::urls;
-use crate::store::import::{self, CatalogueImport, ImportChannel, ImportGroup, ImportMovie, ImportSeries, ImportSummary, KindCounts};
+use crate::store::import::{
+    self, CatalogueImport, FinishOptions, ImportChannel, ImportEpisode, ImportGroup, ImportMovie, ImportSeries, ImportSeriesEpisodes, ImportSummary,
+    KeyMove, KindCounts,
+};
 
 /// Rows per writer transaction (DESIGN §5.3).
 const BATCH: usize = 2_000;
+/// An M3U source checks again for a working Xtream login after this long (DESIGN §27.3).
+const UPGRADE_RETRY_S: i64 = 7 * 86_400;
 /// Batches in flight between the parser thread and the writer loop.
 const CHANNEL_CAP: usize = 4;
 /// Entries between two cancellation checks of the parser.
@@ -91,9 +114,10 @@ pub async fn refresh_source(
     let started = crate::model::now();
     write(ctx, move |c| crate::store::sources::mark_attempt(c, source, started)).await?;
     let cfg = crate::config::current(&ctx.config);
-    let result = match src.kind {
-        SourceKind::M3uUrl | SourceKind::M3uFile => refresh_m3u(ctx, &src, force, &cfg, progress, cancel).await,
-        SourceKind::Xtream => refresh_xtream(ctx, &src, &cfg, progress, cancel).await,
+    let result = match (src.kind, src.m3u_origin()) {
+        (SourceKind::M3uUrl | SourceKind::M3uFile, _) => refresh_playlist(ctx, &src, force, &cfg, progress, cancel).await,
+        (SourceKind::Xtream, Some(origin)) if src.settings.keep_m3u => switch_back(ctx, &src, origin, &cfg, progress, cancel).await,
+        (SourceKind::Xtream, _) => refresh_xtream(ctx, &src, &cfg, progress, cancel, None).await,
     };
     match &result {
         Ok(_) | Err(Error::Cancelled) => {}
@@ -211,7 +235,59 @@ impl Drop for TempFile {
     }
 }
 
-async fn refresh_m3u(
+/// A playlist ready to parse: a download (deleted when dropped) or the source's own file.
+struct Playlist {
+    path: PathBuf,
+    base: Option<url::Url>,
+    _guard: TempFile,
+    etag: Option<String>,
+    last_modified: Option<String>,
+}
+
+enum Fetched {
+    NotModified,
+    Playlist(Playlist),
+}
+
+/// Download the playlist of `src` (`kind` = where it lives: URL or file; a switched-back
+/// source is still Xtream when this runs). `validators` = send the stored ETag /
+/// Last-Modified.
+async fn fetch_playlist(
+    ctx: &JobContext,
+    src: &Source,
+    kind: SourceKind,
+    validators: bool,
+    cfg: &Config,
+    progress: &Progress,
+    cancel: &CancellationToken,
+) -> Result<Fetched> {
+    if kind == SourceKind::M3uFile {
+        let path = src.path.clone().ok_or_else(|| Error::Config("this playlist has no file".into()))?;
+        return Ok(Fetched::Playlist(Playlist { path, base: None, _guard: TempFile(None), etag: None, last_modified: None }));
+    }
+    let url = src.url.clone().ok_or_else(|| Error::Config("this playlist has no URL".into()))?;
+    progress.set(JobPhase::Connecting);
+    let dest = ctx.paths.playlist_cache().join(format!("{}-{}.m3u", src.id.0, progress.id.0));
+    let req = DownloadRequest {
+        url: url.clone(),
+        dest,
+        headers: source_headers(src, cfg),
+        etag: if validators { src.status.etag.clone() } else { None },
+        last_modified: if validators { src.status.last_modified.clone() } else { None },
+    };
+    let p = progress.clone();
+    Ok(match ctx.http.download(&req, &move |done, total| p.set(JobPhase::Downloading { done, total }), cancel).await? {
+        DownloadOutcome::NotModified => Fetched::NotModified,
+        DownloadOutcome::Downloaded { path, etag, last_modified, .. } => {
+            let base = url::Url::parse(url.expose().trim()).ok();
+            Fetched::Playlist(Playlist { path: path.clone(), base, _guard: TempFile(Some(path)), etag, last_modified })
+        }
+    })
+}
+
+/// An M3U source: switch to the Xtream login it carries when an upgrade check is due and the
+/// login works (DESIGN §27.3), else import the playlist.
+async fn refresh_playlist(
     ctx: &JobContext,
     src: &Source,
     force: bool,
@@ -219,34 +295,167 @@ async fn refresh_m3u(
     progress: &Progress,
     cancel: &CancellationToken,
 ) -> Result<RefreshResult> {
-    let (path, base, _guard, etag, last_modified) = match src.kind {
-        SourceKind::M3uFile => {
-            let path = src.path.clone().ok_or_else(|| Error::Config("this playlist has no file".into()))?;
-            (path, None, TempFile(None), None, None)
-        }
-        _ => {
-            let url = src.url.clone().ok_or_else(|| Error::Config("this playlist has no URL".into()))?;
-            progress.set(JobPhase::Connecting);
-            let dest = ctx.paths.playlist_cache().join(format!("{}-{}.m3u", src.id.0, progress.id.0));
-            let req = DownloadRequest {
-                url: url.clone(),
-                dest,
-                headers: source_headers(src, cfg),
-                etag: if force { None } else { src.status.etag.clone() },
-                last_modified: if force { None } else { src.status.last_modified.clone() },
+    let opts = FinishOptions { m3u: true, ..Default::default() };
+    if src.settings.keep_m3u {
+        return refresh_m3u(ctx, src, src.kind, force, cfg, progress, cancel, opts).await;
+    }
+    let id = src.id;
+    let last = read(ctx, move |c| crate::store::sources::upgrade_attempted_at(c, id)).await?;
+    let now = crate::model::now();
+    if !force && last.as_ref().is_some_and(|l| now - l.at < UPGRADE_RETRY_S) {
+        return refresh_m3u(ctx, src, src.kind, force, cfg, progress, cancel, opts).await;
+    }
+    // a `get.php` playlist kept after its login failed: downloaded in full the first time, as
+    // the import before this check may predate the movies / series fallback
+    let refetch = force || last.is_none();
+
+    // 1. the login: from a `get.php` URL, else from the entries (§27.2)
+    let get_php = match src.kind {
+        SourceKind::M3uUrl => src.url.as_ref().and_then(|u| m3u::detect_xtream_url(u.expose())),
+        _ => None,
+    };
+    let (creds, playlist) = match get_php {
+        Some(c) => (Some(c), None),
+        None => {
+            // never a 304 before the first check, nor while a login it found is failing
+            let validators = !force && last.as_ref().is_some_and(|l| !l.login_failed);
+            let playlist = match fetch_playlist(ctx, src, src.kind, validators, cfg, progress, cancel).await? {
+                Fetched::NotModified => return m3u_not_modified(ctx, src, cfg).await,
+                Fetched::Playlist(p) => p,
             };
-            let p = progress.clone();
-            match ctx.http.download(&req, &move |done, total| p.set(JobPhase::Downloading { done, total }), cancel).await? {
-                DownloadOutcome::NotModified => return m3u_not_modified(ctx, src, cfg).await,
-                DownloadOutcome::Downloaded { path, etag, last_modified, .. } => {
-                    let base = url::Url::parse(url.expose().trim()).ok();
-                    (path.clone(), base, TempFile(Some(path)), etag, last_modified)
-                }
-            }
+            let (path, base, scan_cancel) = (playlist.path.clone(), playlist.base.clone(), cancel.clone());
+            progress.set(JobPhase::Parsing { items: 0 });
+            (blocking(move || scan_playlist(&path, base, &scan_cancel)).await?, Some(playlist))
         }
     };
     check(cancel)?;
+    let Some(creds) = creds else {
+        // a plain playlist: check again in a week
+        write(ctx, move |c| crate::store::sources::record_upgrade_attempt(c, id, now, false)).await?;
+        return keep_playlist(ctx, src, playlist, force, cfg, progress, cancel).await;
+    };
 
+    // 2. try the login (the playlist's own User-Agent)
+    crate::redact::register_secret(&creds.username);
+    crate::redact::register_secret(creds.password.expose());
+    let client = XtreamClient::new(ctx.http.clone(), creds.clone(), source_headers(src, cfg).user_agent);
+    progress.set(JobPhase::Connecting);
+    let account = match client.authenticate(crate::model::now(), cancel).await {
+        Ok((_, account)) => account,
+        Err(Error::Cancelled) => return Err(Error::Cancelled),
+        Err(e) => {
+            upgrade_failed(ctx, src, &creds, &e).await?;
+            return keep_playlist(ctx, src, playlist, refetch, cfg, progress, cancel).await;
+        }
+    };
+
+    // 3. switch: the Xtream import commits it at its first finish
+    let login = creds.clone();
+    let moves = read(ctx, move |c| import::m3u_to_xtream_moves(c, id, &login)).await?;
+    let mut upgrade = Upgrade { creds, account, moves, committed: false };
+    match refresh_xtream(ctx, src, cfg, progress, cancel, Some(&mut upgrade)).await {
+        Err(e) if !upgrade.committed && !matches!(e, Error::Cancelled) => {
+            upgrade_failed(ctx, src, &upgrade.creds, &e).await?;
+            keep_playlist(ctx, src, playlist, refetch, cfg, progress, cancel).await
+        }
+        r => r,
+    }
+}
+
+/// An upgrade check found no usable Xtream login: record it (retried in a week, or on a forced
+/// refresh) and say why in the log.
+async fn upgrade_failed(ctx: &JobContext, src: &Source, creds: &XtreamCredentials, e: &Error) -> Result<()> {
+    let (id, at) = (src.id, crate::model::now());
+    write(ctx, move |c| crate::store::sources::record_upgrade_attempt(c, id, at, true)).await?;
+    tracing::info!(
+        "Couldn't use the Xtream login of {} at {} ({}); keeping the playlist",
+        src.name,
+        crate::redact::redact_url(&creds.server),
+        crate::redact::redact(&e.to_string())
+    );
+    Ok(())
+}
+
+/// The source stays M3U: import the playlist already at hand (or download it now).
+async fn keep_playlist(
+    ctx: &JobContext,
+    src: &Source,
+    playlist: Option<Playlist>,
+    force: bool,
+    cfg: &Config,
+    progress: &Progress,
+    cancel: &CancellationToken,
+) -> Result<RefreshResult> {
+    let opts = FinishOptions { m3u: true, ..Default::default() };
+    match playlist {
+        Some(p) => import_m3u(ctx, src, p, cfg, progress, cancel, opts).await,
+        None => refresh_m3u(ctx, src, src.kind, force, cfg, progress, cancel, opts).await,
+    }
+}
+
+/// An upgraded source whose user chose "Keep as M3U": back to its playlist, the switch
+/// committed by the import's finish (with the Xtream → M3U key moves, `FinishOptions::m3u`).
+async fn switch_back(
+    ctx: &JobContext,
+    src: &Source,
+    origin: SourceKind,
+    cfg: &Config,
+    progress: &Progress,
+    cancel: &CancellationToken,
+) -> Result<RefreshResult> {
+    let opts = FinishOptions { switch_kind: Some((origin, None)), m3u: true, ..Default::default() };
+    refresh_m3u(ctx, src, origin, true, cfg, progress, cancel, opts).await
+}
+
+/// Blocking: the Xtream login a playlist carries in its entries (§27.2), `None` as soon as an
+/// entry rules it out.
+fn scan_playlist(path: &Path, base: Option<url::Url>, cancel: &CancellationToken) -> Result<Option<XtreamCredentials>> {
+    let mut parser = m3u::parse(open_decompressed(path)?, base.as_ref()).map_err(m3u_error)?;
+    let mut scan = PlaylistScan::default();
+    let mut n = 0u64;
+    for item in parser.by_ref() {
+        match item {
+            Ok(e) if !scan.push(&e.url) => return Ok(None),
+            Ok(_) | Err(Error::Parse { .. }) => {}
+            Err(e) => return Err(e),
+        }
+        n += 1;
+        if n.is_multiple_of(CANCEL_EVERY) && cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+    }
+    Ok(scan.finish())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn refresh_m3u(
+    ctx: &JobContext,
+    src: &Source,
+    kind: SourceKind,
+    force: bool,
+    cfg: &Config,
+    progress: &Progress,
+    cancel: &CancellationToken,
+    opts: FinishOptions,
+) -> Result<RefreshResult> {
+    match fetch_playlist(ctx, src, kind, !force, cfg, progress, cancel).await? {
+        Fetched::NotModified => m3u_not_modified(ctx, src, cfg).await,
+        Fetched::Playlist(p) => import_m3u(ctx, src, p, cfg, progress, cancel, opts).await,
+    }
+}
+
+/// Parse and import a playlist: channels, plus Xtream-style movies and series (§27.5).
+async fn import_m3u(
+    ctx: &JobContext,
+    src: &Source,
+    playlist: Playlist,
+    cfg: &Config,
+    progress: &Progress,
+    cancel: &CancellationToken,
+    opts: FinishOptions,
+) -> Result<RefreshResult> {
+    check(cancel)?;
+    let Playlist { path, base, _guard, etag, last_modified } = playlist;
     let now = crate::model::now();
     let id = src.id;
     let imp = write(ctx, move |c| import::begin_catalogue(c, id, now)).await?;
@@ -258,13 +467,22 @@ async fn refresh_m3u(
     let mut done = 0u64;
     while let Some(batch) = rx.recv().await {
         check(cancel)?;
-        let n = batch.channels.len() as u64;
+        let n = batch.len() as u64;
         let imp = imp.clone();
         write(ctx, move |c| {
             if !batch.groups.is_empty() {
                 import::upsert_groups(c, &imp, &batch.groups)?;
             }
-            import::write_channels(c, &imp, &batch.channels)
+            if !batch.channels.is_empty() {
+                import::write_channels(c, &imp, &batch.channels)?;
+            }
+            if !batch.movies.is_empty() {
+                import::write_movies(c, &imp, &batch.movies)?;
+            }
+            if !batch.series.is_empty() {
+                import::write_series_episodes(c, &imp, &batch.series)?;
+            }
+            Ok(())
         })
         .await?;
         done += n;
@@ -280,8 +498,12 @@ async fn refresh_m3u(
     }
 
     progress.set(JobPhase::Finishing);
-    let fin = imp.clone();
-    let summary = write(ctx, move |c| import::finish_catalogue(c, &fin, &[ItemKind::Channel], now)).await?;
+    let (fin, switched) = (imp.clone(), opts.switch_kind.is_some());
+    let completed = [ItemKind::Channel, ItemKind::Movie, ItemKind::Series];
+    let summary = write(ctx, move |c| import::finish_catalogue_with(c, &fin, &completed, now, &opts)).await?;
+    if switched {
+        notify(ctx, DataScope::Sources);
+    }
     mark_refreshed(ctx, src, counts_of(&summary), etag, last_modified, now).await?;
     provider_epg(ctx, src, parsed.tvg_urls.clone(), cfg).await?;
     (ctx.submit)(JobKind::RebuildLibrary);
@@ -299,11 +521,21 @@ async fn m3u_not_modified(ctx: &JobContext, src: &Source, cfg: &Config) -> Resul
     Ok(RefreshResult { summary: ImportSummary::default(), not_modified: true, epg_urls: Vec::new(), upgraded: false })
 }
 
-/// One writer transaction's worth of channels plus the groups first seen in it.
+/// One writer transaction's worth of rows plus the groups first seen in it.
 #[derive(Default)]
 struct M3uBatch {
     groups: Vec<ImportGroup>,
     channels: Vec<ImportChannel>,
+    movies: Vec<ImportMovie>,
+    /// Whole series, written after the parse.
+    series: Vec<ImportSeriesEpisodes>,
+}
+
+impl M3uBatch {
+    /// Entries in the batch (episodes counted one by one).
+    fn len(&self) -> usize {
+        self.channels.len() + self.movies.len() + self.series.iter().map(|s| s.episodes.len()).sum::<usize>()
+    }
 }
 
 struct M3uParsed {
@@ -327,22 +559,26 @@ fn parse_m3u_file(
     let mut seen_groups: HashSet<String> = HashSet::new();
     let mut new_groups: Vec<ImportGroup> = Vec::new();
     let mut batch = M3uBatch::default();
+    let mut episodes = EpisodeCollector::default();
     let (mut entries, mut skipped) = (0u64, 0u64);
     let send = |b: M3uBatch| tx.blocking_send(b).map_err(|_| Error::Cancelled);
     for item in parser.by_ref() {
         match item {
             Ok(e) => {
                 let order = i32::try_from(entries).unwrap_or(i32::MAX);
-                let ch = m3u_entry_to_channel(&e, order, smart, &mut keys, &mut new_groups);
+                match m3u_vod::classify(&e) {
+                    EntryClass::Live => batch.channels.push(m3u_entry_to_channel(&e, order, smart, &mut keys, &mut new_groups)),
+                    EntryClass::Movie { stream_id } => batch.movies.push(m3u_entry_to_movie(&e, stream_id, order, smart, &mut keys, &mut new_groups)),
+                    EntryClass::Episode { stream_id, marker } => episodes.push(&e, stream_id, marker, order, smart, &mut keys, &mut new_groups),
+                }
                 for mut g in new_groups.drain(..) {
                     if seen_groups.insert(g.key.0.clone()) {
                         g.provider_order = i32::try_from(seen_groups.len() - 1).unwrap_or(i32::MAX);
                         batch.groups.push(g);
                     }
                 }
-                batch.channels.push(ch);
                 entries += 1;
-                if batch.channels.len() >= BATCH {
+                if batch.channels.len() + batch.movies.len() >= BATCH {
                     send(std::mem::take(&mut batch))?;
                 }
                 if entries.is_multiple_of(CANCEL_EVERY) && cancel.is_cancelled() {
@@ -357,13 +593,18 @@ fn parse_m3u_file(
             Err(e) => return Err(e),
         }
     }
-    if !batch.channels.is_empty() || !batch.groups.is_empty() {
+    if batch.len() > 0 || !batch.groups.is_empty() {
         send(batch)?;
+    }
+    for series in episodes.into_batches(smart) {
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        send(M3uBatch { series, ..Default::default() })?;
     }
     Ok(M3uParsed { tvg_urls: parser.header().tvg_urls.clone(), entries, skipped })
 }
 
-/// Parser refusal → user-facing error (DESIGN §9.1 copy).
 pub(super) fn m3u_error(e: M3uError) -> Error {
     match e {
         M3uError::NotM3u(PayloadKind::Html) => {
@@ -403,46 +644,15 @@ pub fn m3u_entry_to_channel(
     keys: &mut crate::sources::identity::KeyAllocator,
     groups_out: &mut Vec<ImportGroup>,
 ) -> ImportChannel {
-    let title = e.title.trim();
-    let name = if title.is_empty() { e.tvg_name.as_deref().map(str::trim).unwrap_or("").to_owned() } else { title.to_owned() };
-    let name = if name.is_empty() { e.url.rsplit('/').find(|s| !s.is_empty()).unwrap_or(&e.url).to_owned() } else { name };
+    let EntryIdentity { name, norm_name, tvg_id, key } = entry_identity(e, keys);
     let clean_name = if smart { clean_channel_name(&name).name } else { name.clone() };
-    let norm_name = normalize_name(&name);
-    let tvg_id = non_empty(e.tvg_id.as_deref());
-    let primary_group = e.groups.first().map(|g| normalize_group(g));
-    let key = keys.alloc(identity::m3u_base_key(tvg_id.as_deref(), &norm_name, primary_group.as_deref()));
-
-    let mut groups = Vec::with_capacity(e.groups.len().max(1));
-    for raw in &e.groups {
-        let k = group_key(ItemKind::Channel, raw);
-        if groups.contains(&k) {
-            continue;
-        }
-        // playlists are grouped: the newest group is the likeliest hit
-        if !groups_out.iter().rev().any(|g| g.key == k) {
-            let provider_order = i32::try_from(groups_out.len()).unwrap_or(i32::MAX);
-            groups_out.push(ImportGroup {
-                kind: ItemKind::Channel,
-                key: k.clone(),
-                name: group_display(raw, smart),
-                provider_id: None,
-                provider_order,
-            });
-        }
-        groups.push(k);
-    }
-    if groups.is_empty() {
-        let k = group_key(ItemKind::Channel, "");
-        if !groups_out.iter().rev().any(|g| g.key == k) {
-            let provider_order = i32::try_from(groups_out.len()).unwrap_or(i32::MAX);
-            groups_out.push(ImportGroup { kind: ItemKind::Channel, key: k.clone(), name: "Uncategorized".into(), provider_id: None, provider_order });
-        }
-        groups.push(k);
-    }
+    let groups = entry_groups(e, ItemKind::Channel, smart, groups_out);
+    // the Xtream id of a live stream URL: switching back from Xtream finds the channel by it
+    let provider_id = parse_stream_url(&e.url).filter(|s| s.kind == XtreamStreamKind::Live).map(|s| s.stream_id.to_string());
 
     ImportChannel {
         key,
-        provider_id: None,
+        provider_id,
         name,
         clean_name,
         norm_name,
@@ -460,6 +670,213 @@ pub fn m3u_entry_to_channel(
         provider_order: order,
         added_at: None,
         groups,
+    }
+}
+
+/// Name and key of an entry, whatever it becomes: movies and episodes keep the key the entry
+/// had as a channel, so user data of legacy imports follows them (DESIGN §27.4).
+struct EntryIdentity {
+    name: String,
+    norm_name: String,
+    tvg_id: Option<String>,
+    key: ItemKey,
+}
+
+fn entry_identity(e: &M3uEntry, keys: &mut KeyAllocator) -> EntryIdentity {
+    let title = e.title.trim();
+    let name = if title.is_empty() { e.tvg_name.as_deref().map(str::trim).unwrap_or("").to_owned() } else { title.to_owned() };
+    let name = if name.is_empty() { e.url.rsplit('/').find(|s| !s.is_empty()).unwrap_or(&e.url).to_owned() } else { name };
+    let norm_name = normalize_name(&name);
+    let tvg_id = non_empty(e.tvg_id.as_deref());
+    let primary_group = e.groups.first().map(|g| normalize_group(g));
+    let key = keys.alloc(identity::m3u_base_key(tvg_id.as_deref(), &norm_name, primary_group.as_deref()));
+    EntryIdentity { name, norm_name, tvg_id, key }
+}
+
+/// Group keys of an entry as `kind` groups ("Uncategorized" when it has none); new groups are
+/// appended to `groups_out` (deduped by key).
+fn entry_groups(e: &M3uEntry, kind: ItemKind, smart: bool, groups_out: &mut Vec<ImportGroup>) -> Vec<GroupKey> {
+    let mut groups = Vec::with_capacity(e.groups.len().max(1));
+    let raws: Vec<&str> = if e.groups.is_empty() { vec![""] } else { e.groups.iter().map(String::as_str).collect() };
+    for raw in raws {
+        let k = group_key(kind, raw);
+        if groups.contains(&k) {
+            continue;
+        }
+        // playlists are grouped: the newest group is the likeliest hit
+        if !groups_out.iter().rev().any(|g| g.key == k) {
+            let provider_order = i32::try_from(groups_out.len()).unwrap_or(i32::MAX);
+            groups_out.push(ImportGroup { kind, key: k.clone(), name: group_display(raw, smart), provider_id: None, provider_order });
+        }
+        groups.push(k);
+    }
+    groups
+}
+
+/// An Xtream-style `/movie/` entry (§27.5): title, poster and groups are all a playlist has.
+fn m3u_entry_to_movie(
+    e: &M3uEntry,
+    stream_id: i64,
+    order: i32,
+    smart: bool,
+    keys: &mut KeyAllocator,
+    groups_out: &mut Vec<ImportGroup>,
+) -> ImportMovie {
+    let EntryIdentity { name, norm_name, key, .. } = entry_identity(e, keys);
+    let (cleaned, year) = clean_vod_name(&name);
+    ImportMovie {
+        key,
+        provider_id: Some(stream_id.to_string()),
+        clean_name: if smart { cleaned } else { name.clone() },
+        norm_name,
+        year,
+        poster: non_empty(e.tvg_logo.as_deref()),
+        rating: None,
+        stream: StreamLocator::Url { url: e.url.clone() },
+        url_key: identity::url_key(&e.url),
+        provider_order: order,
+        added_at: None,
+        groups: entry_groups(e, ItemKind::Movie, smart, groups_out),
+        name,
+    }
+}
+
+/// Episode entries collected during the parse and assembled into whole series at its end
+/// (§27.5): one compact record per entry.
+#[derive(Default)]
+struct EpisodeCollector {
+    series: Vec<SeriesAcc>,
+    /// `normalize_name(series title)` → index in `series`.
+    index: HashMap<String, usize>,
+    episodes: Vec<EpisodeEntry>,
+}
+
+struct SeriesAcc {
+    title: String,
+    norm: String,
+    cover: Option<String>,
+    groups: Vec<GroupKey>,
+    order: i32,
+    /// Episodes without a marker so far (they are numbered in file order).
+    unmarked: u32,
+}
+
+struct EpisodeEntry {
+    series: usize,
+    season: u32,
+    episode: u32,
+    order: i32,
+    title: Option<String>,
+    key: ItemKey,
+    stream_id: i64,
+    url: String,
+    logo: Option<String>,
+}
+
+impl EpisodeCollector {
+    #[allow(clippy::too_many_arguments)]
+    fn push(
+        &mut self,
+        e: &M3uEntry,
+        stream_id: i64,
+        marker: Option<EpisodeMarker>,
+        order: i32,
+        smart: bool,
+        keys: &mut KeyAllocator,
+        groups_out: &mut Vec<ImportGroup>,
+    ) {
+        let EntryIdentity { name, key, .. } = entry_identity(e, keys);
+        let (title, season, episode, episode_title) = match marker {
+            Some(m) => {
+                let series = if m.series.is_empty() { e.groups.first().cloned().unwrap_or_else(|| name.clone()) } else { m.series };
+                (series, m.season, Some(m.episode), m.title)
+            }
+            None => (if smart { clean_vod_name(&name).0 } else { name.clone() }, 1, None, None),
+        };
+        let norm = normalize_name(&title);
+        let logo = non_empty(e.tvg_logo.as_deref());
+        let i = match self.index.get(&norm) {
+            Some(&i) => i,
+            None => {
+                self.series.push(SeriesAcc { title, norm: norm.clone(), cover: None, groups: Vec::new(), order, unmarked: 0 });
+                self.index.insert(norm, self.series.len() - 1);
+                self.series.len() - 1
+            }
+        };
+        let s = &mut self.series[i];
+        for g in entry_groups(e, ItemKind::Series, smart, groups_out) {
+            if !s.groups.contains(&g) {
+                s.groups.push(g);
+            }
+        }
+        if s.cover.is_none() {
+            s.cover.clone_from(&logo);
+        }
+        let episode = episode.unwrap_or_else(|| {
+            s.unmarked += 1;
+            s.unmarked
+        });
+        self.episodes.push(EpisodeEntry { series: i, season, episode, order, title: episode_title, key, stream_id, url: e.url.clone(), logo });
+    }
+
+    /// Whole series in writer batches of about [`BATCH`] episodes, episodes ordered by
+    /// (season, episode, file order).
+    fn into_batches(mut self, smart: bool) -> Vec<Vec<ImportSeriesEpisodes>> {
+        self.episodes.sort_by_key(|e| (e.series, e.season, e.episode, e.order));
+        let mut out: Vec<Vec<ImportSeriesEpisodes>> = Vec::new();
+        let (mut batch, mut size) = (Vec::new(), 0usize);
+        let mut eps = self.episodes.into_iter().peekable();
+        for (i, s) in self.series.into_iter().enumerate() {
+            let mut episodes = Vec::new();
+            while let Some(e) = eps.next_if(|e| e.series == i) {
+                episodes.push(ImportEpisode {
+                    key: e.key,
+                    provider_id: Some(e.stream_id.to_string()),
+                    season: e.season,
+                    episode: e.episode,
+                    title: e.title.unwrap_or_default(),
+                    plot: None,
+                    duration_s: None,
+                    still: e.logo.filter(|l| s.cover.as_ref() != Some(l)),
+                    air_date: None,
+                    rating: None,
+                    stream: StreamLocator::Url { url: e.url },
+                });
+            }
+            let (cleaned, year) = clean_vod_name(&s.title);
+            size += episodes.len();
+            batch.push(ImportSeriesEpisodes {
+                series: ImportSeries {
+                    key: identity::m3u_series_key(&s.norm),
+                    provider_id: None,
+                    clean_name: if smart { cleaned } else { s.title.clone() },
+                    norm_name: s.norm,
+                    year,
+                    cover: s.cover,
+                    backdrop: None,
+                    rating: None,
+                    plot: None,
+                    genre: None,
+                    cast: None,
+                    director: None,
+                    release_date: None,
+                    last_modified: None,
+                    provider_order: s.order,
+                    added_at: None,
+                    groups: s.groups,
+                    name: s.title,
+                },
+                episodes,
+            });
+            if size >= BATCH {
+                out.push(std::mem::take(&mut batch));
+                size = 0;
+            }
+        }
+        if !batch.is_empty() {
+            out.push(batch);
+        }
+        out
     }
 }
 
@@ -506,13 +923,73 @@ impl XtKind {
     }
 }
 
-async fn refresh_xtream(ctx: &JobContext, src: &Source, cfg: &Config, progress: &Progress, cancel: &CancellationToken) -> Result<RefreshResult> {
-    let creds = src.xtream.clone().ok_or_else(|| Error::Config("this source has no Xtream login".into()))?;
+/// An M3U source switching to its Xtream login in this refresh (DESIGN §27.3).
+struct Upgrade {
+    creds: XtreamCredentials,
+    /// From the login of the upgrade check (stored with the switch).
+    account: AccountInfo,
+    /// M3U → Xtream user-data moves not applied yet: each finish applies those of its kinds,
+    /// so moved data never meets the M3U rows of a kind that is not re-imported yet.
+    moves: Vec<KeyMove>,
+    /// The source is Xtream now (its first finish switched it).
+    committed: bool,
+}
+
+impl Upgrade {
+    /// Options of a finish completing `kinds`: the switch at the first one, and the moves from
+    /// or to those kinds (episodes go with series).
+    fn finish_options(&mut self, kinds: &[ItemKind]) -> FinishOptions {
+        let touches = |k: ItemKind| kinds.contains(&if k == ItemKind::Episode { ItemKind::Series } else { k });
+        let (now, later) = std::mem::take(&mut self.moves).into_iter().partition(|m| touches(m.from.kind) || touches(m.to.kind));
+        self.moves = later;
+        FinishOptions {
+            switch_kind: (!self.committed).then(|| (SourceKind::Xtream, Some(self.creds.clone()))),
+            account: (!self.committed).then(|| self.account.clone()),
+            moves: now,
+            m3u: false,
+        }
+    }
+}
+
+/// `finish_catalogue` of an Xtream import; the first finish of an upgrade commits it.
+async fn finish_xtream(
+    ctx: &JobContext,
+    imp: &CatalogueImport,
+    kinds: Vec<ItemKind>,
+    now: Timestamp,
+    mut upgrade: Option<&mut Upgrade>,
+) -> Result<ImportSummary> {
+    let opts = upgrade.as_deref_mut().map(|u| u.finish_options(&kinds)).unwrap_or_default();
+    let fin = imp.clone();
+    let summary = write(ctx, move |c| import::finish_catalogue_with(c, &fin, &kinds, now, &opts)).await?;
+    if let Some(u) = upgrade
+        && !u.committed
+    {
+        u.committed = true;
+        notify(ctx, DataScope::Sources);
+    }
+    Ok(summary)
+}
+
+async fn refresh_xtream(
+    ctx: &JobContext,
+    src: &Source,
+    cfg: &Config,
+    progress: &Progress,
+    cancel: &CancellationToken,
+    mut upgrade: Option<&mut Upgrade>,
+) -> Result<RefreshResult> {
+    let creds = match &upgrade {
+        Some(u) => u.creds.clone(),
+        None => src.xtream.clone().ok_or_else(|| Error::Config("this source has no Xtream login".into()))?,
+    };
     let client = XtreamClient::new(ctx.http.clone(), creds.clone(), source_headers(src, cfg).user_agent);
-    progress.set(JobPhase::Connecting);
-    let (_, account) = client.authenticate(crate::model::now(), cancel).await?;
     let id = src.id;
-    write(ctx, move |c| crate::store::sources::set_account(c, id, &account)).await?;
+    if upgrade.is_none() {
+        progress.set(JobPhase::Connecting);
+        let (_, account) = client.authenticate(crate::model::now(), cancel).await?;
+        write(ctx, move |c| crate::store::sources::set_account(c, id, &account)).await?;
+    }
 
     let now = crate::model::now();
     let imp = write(ctx, move |c| import::begin_catalogue(c, id, now)).await?;
@@ -524,8 +1001,7 @@ async fn refresh_xtream(ctx: &JobContext, src: &Source, cfg: &Config, progress: 
     match import_xt_kind(ctx, &client, &imp, XtKind::Live, smart, progress, cancel).await {
         Ok(()) => {
             progress.set(JobPhase::Finishing);
-            let fin = imp.clone();
-            live = Some(write(ctx, move |c| import::finish_catalogue(c, &fin, &[ItemKind::Channel], now)).await?);
+            live = Some(finish_xtream(ctx, &imp, vec![ItemKind::Channel], now, upgrade.as_deref_mut()).await?);
             (ctx.submit)(JobKind::RebuildLibrary);
         }
         Err(e) if is_fatal(&e) => return Err(e),
@@ -551,8 +1027,7 @@ async fn refresh_xtream(ctx: &JobContext, src: &Source, cfg: &Config, progress: 
         (Some(s), true) => s,
         (live, false) => {
             progress.set(JobPhase::Finishing);
-            let fin = imp.clone();
-            let mut s = write(ctx, move |c| import::finish_catalogue(c, &fin, &vod_done, now)).await?;
+            let mut s = finish_xtream(ctx, &imp, vod_done, now, upgrade.as_deref_mut()).await?;
             if let Some(l) = live {
                 s.channels = KindCounts { total: s.channels.total, ..l.channels };
                 s.groups.added += l.groups.added;
@@ -577,7 +1052,11 @@ async fn refresh_xtream(ctx: &JobContext, src: &Source, cfg: &Config, progress: 
     let epg_urls = vec![urls::xmltv_url(&creds)];
     provider_epg(ctx, src, epg_urls.clone(), cfg).await?;
     (ctx.submit)(JobKind::RebuildLibrary);
-    Ok(RefreshResult { summary, not_modified: false, epg_urls, upgraded: false })
+    let upgraded = upgrade.is_some_and(|u| u.committed);
+    if upgraded {
+        tracing::info!("{} now uses its Xtream login ({})", src.name, crate::redact::redact_url(&creds.server));
+    }
+    Ok(RefreshResult { summary, not_modified: false, epg_urls, upgraded })
 }
 
 /// Every kind failed: one error naming each kind (the first error alone when only one).

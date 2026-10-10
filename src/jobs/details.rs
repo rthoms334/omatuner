@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{JobContext, JobPhase, Progress, check, read};
 use crate::error::{Error, Result};
-use crate::model::{ItemKind, MovieId, SeriesId, Source, StreamLocator, Timestamp, XtreamStreamKind};
+use crate::model::{ItemKind, MovieId, SeriesId, Source, SourceKind, StreamLocator, Timestamp, XtreamStreamKind};
 use crate::msg::DataScope;
 use crate::sources::identity;
 use crate::sources::xtream::XtreamClient;
@@ -28,8 +28,10 @@ fn fresh(loaded_at: Option<Timestamp>, now: Timestamp) -> bool {
     loaded_at.is_some_and(|t| now - t < DETAILS_TTL_S)
 }
 
+/// `None` for M3U sources, also those keeping the login of an earlier upgrade (DESIGN §27.5:
+/// their movies and series are complete at import, the provider is never asked).
 fn client(ctx: &JobContext, src: &Source) -> Option<XtreamClient> {
-    let creds = src.xtream.clone()?;
+    let creds = src.xtream.clone().filter(|_| src.kind == SourceKind::Xtream)?;
     let cfg = crate::config::current(&ctx.config);
     let ua = src.settings.user_agent.clone().filter(|u| !u.trim().is_empty()).unwrap_or_else(|| cfg.player.user_agent.clone());
     Some(XtreamClient::new(ctx.http.clone(), creds, Some(ua)))
