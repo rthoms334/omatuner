@@ -99,9 +99,25 @@ fn remove_stale(socket: &Path) {
 
 pub struct IpcServer {
     task: Option<tokio::task::JoinHandle<()>>,
-    /// Socket path + (dev, ino) of the file we bound, removed on drop only if still ours.
+    socket: SocketGuard,
+}
+
+/// The socket file we bound: path + (dev, ino). Removing it only removes it while it is still
+/// ours (another instance may have replaced a stale one).
+#[derive(Debug, Clone)]
+pub struct SocketGuard {
     path: PathBuf,
     ident: (u64, u64),
+}
+
+impl SocketGuard {
+    /// Remove the socket file if it is still the one we bound (idempotent).
+    pub fn remove(&self) {
+        let ours = std::fs::symlink_metadata(&self.path).map(|m| (m.dev(), m.ino()) == self.ident).unwrap_or(false);
+        if ours {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 impl IpcServer {
@@ -128,8 +144,11 @@ impl IpcServer {
             tokio::net::UnixListener::from_std(listener).map_err(|e| Error::io(socket, e))?
         };
         let task = rt.spawn(serve(listener, meta.uid(), bus));
-        Ok(Self { task: Some(task), path: socket.to_path_buf(), ident: (meta.dev(), meta.ino()) })
+        Ok(Self { task: Some(task), socket: SocketGuard { path: socket.to_path_buf(), ident: (meta.dev(), meta.ino()) } })
     }
+
+    /// The bound socket, for an exit path that can't drop the server (signal handling).
+    pub fn socket(&self) -> SocketGuard { self.socket.clone() }
 }
 
 impl Drop for IpcServer {
@@ -137,10 +156,7 @@ impl Drop for IpcServer {
         if let Some(t) = self.task.take() {
             t.abort();
         }
-        let ours = std::fs::symlink_metadata(&self.path).map(|m| (m.dev(), m.ino()) == self.ident).unwrap_or(false);
-        if ours {
-            let _ = std::fs::remove_file(&self.path);
-        }
+        self.socket.remove();
     }
 }
 

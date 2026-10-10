@@ -454,7 +454,8 @@ const RAIL_POSTER_W: f32 = 120.0;
 /// What the rails were built from: rebuilt only when one of these changes, never per frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RailsKey {
-    built_at: Timestamp,
+    /// `Library::generation`: a new snapshot, including a zap's new recently watched list.
+    generation: u64,
     favs: u64,
     continue_gen: u64,
 }
@@ -498,7 +499,7 @@ impl HomeScreen {
 
     /// Rebuild the rails when the library, the favourites or Continue watching changed.
     fn build_rails(&mut self, ctx: &mut UiCtx<'_>) {
-        let key = RailsKey { built_at: ctx.lib.built_at, favs: favs_signature(ctx.favs), continue_gen: self.continue_gen };
+        let key = RailsKey { generation: ctx.lib.generation, favs: favs_signature(ctx.favs), continue_gen: self.continue_gen };
         if self.rails_key == Some(key) {
             return;
         }
@@ -1569,6 +1570,27 @@ mod tests {
         assert!(h.state().s.rails.is_empty(), "stale rails dropped");
         h.state_mut().act(Action::Activate);
         assert_eq!(h.state_mut().nav(), vec![NavRequest::Switch(Route::Onboarding(OnboardingStart::Welcome))]);
+    }
+
+    /// A zap swaps in a copy of the same build (same `built_at`) with a new recently watched
+    /// list: the rail follows without a library rebuild.
+    #[test]
+    fn recently_watched_follows_a_zap_without_a_rebuild() {
+        let (mut t, one) = rig();
+        let chans = seed(&mut t, |c| {
+            let s = testkit::source(c, "My IPTV")?;
+            testkit::channels(c, s, 3)
+        });
+        let mut h = harness(t, one, HomeScreen::default(), egui::vec2(1000.0, 800.0));
+        h.state_mut().enter(Route::Home);
+        h.run_steps(2);
+        assert!(!has_label(&h, "RECENTLY WATCHED"));
+        let app = h.state_mut();
+        let zapped = app.t.lib.with_recent_channels(vec![chans[1]]);
+        assert_eq!(zapped.built_at, app.t.lib.built_at);
+        app.t.set_library(zapped);
+        h.run_steps(2);
+        assert!(has_label(&h, "RECENTLY WATCHED"));
     }
 
     #[test]

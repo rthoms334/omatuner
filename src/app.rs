@@ -45,7 +45,7 @@ use crate::config::Config;
 use crate::fonts::LoadedFonts;
 use crate::images::ImageCache;
 use crate::ipc::IpcRequest;
-use crate::jobs::{JobKind, JobOutcome};
+use crate::jobs::{FailureKind, JobKind, JobOutcome};
 use crate::keymap::{self, Action, KeyContext};
 use crate::model::{ChannelId, Collection, GroupId, ItemKey, ItemKind, ItemRef, MediaRef, PlayOrigin, SourceId, Timestamp, ZapList};
 use crate::msg::{AppEvent, DataScope, Toast, ToastKind};
@@ -192,6 +192,7 @@ impl TunerApp {
             log: Default::default(),
         };
         app.refresh_epg_updated();
+        app.refresh_image_agents();
         app.submit_job(JobKind::RebuildLibrary);
         app.handle_ipc(&initial);
         app
@@ -272,7 +273,7 @@ impl TunerApp {
                 crate::theme::egui_style::apply(egui_ctx, &self.theme);
             }
             AppEvent::Theme(ThemeEvent::FontsChanged(f)) => f.install(egui_ctx),
-            AppEvent::Job(crate::jobs::JobEvent::Finished { kind, outcome, .. }) => self.on_job_finished(kind, outcome),
+            AppEvent::Job(crate::jobs::JobEvent::Finished { kind, outcome, failure, .. }) => self.on_job_finished(kind, outcome, *failure),
             AppEvent::Job(crate::jobs::JobEvent::Updated(_)) => {} // the status bar polls `jobs.active()`
             AppEvent::Data(scope) => self.on_data_changed(*scope),
             AppEvent::Toast(t) => self.toast(t.clone()),
@@ -299,7 +300,7 @@ impl TunerApp {
         });
     }
 
-    fn on_job_finished(&mut self, kind: &JobKind, outcome: &Result<JobOutcome, String>) {
+    fn on_job_finished(&mut self, kind: &JobKind, outcome: &Result<JobOutcome, String>, failure: Option<FailureKind>) {
         match outcome {
             Ok(JobOutcome::Library(lib)) => {
                 self.lib = lib.clone();
@@ -309,6 +310,8 @@ impl TunerApp {
                     tracing::warn!("favourites: {e}");
                     lib.favs.clone()
                 });
+                // likewise a zap during the build (its `DataScope::History` patched the old one)
+                self.refresh_recent_channels();
                 self.search_index = None;
                 self.refresh_epg_updated();
                 self.send_pending_zap();
@@ -318,6 +321,13 @@ impl TunerApp {
                 if let Some(a) = account {
                     self.send_player(PlayerCommand::SetConnectionLimit { source: *source, max: a.max_connections });
                 }
+            }
+            // AddSource ran the first import inline (no `SourceRefreshed`): its stored account
+            // limit is known now, before the first play of the new playlist (its image
+            // User-Agent followed the `DataScope::Sources` the insert sent)
+            Ok(JobOutcome::SourceAdded(source)) => {
+                self.offline = false;
+                self.send_connection_limit(*source);
             }
             Ok(JobOutcome::EpgRefreshed { .. }) => self.offline = false,
             Ok(_) => {}
@@ -330,13 +340,25 @@ impl TunerApp {
                     JobKind::RefreshStale => "your playlists".to_owned(),
                     _ => return,
                 };
-                if msg == &crate::error::Error::Cancelled.to_string() {
+                if failure == Some(FailureKind::Cancelled) {
                     return;
                 }
-                // `Error::Network` displays as "network error: …" (frozen error.rs).
-                self.offline = msg.contains("network error");
+                // unreachable server; an HTTP error status means the network works
+                self.offline = failure == Some(FailureKind::Network);
                 self.toast(Toast::error(format!("Couldn't refresh {what}: {}", crate::redact::redact(msg))));
             }
+        }
+    }
+
+    /// `SetConnectionLimit` from the stored account info of `source` (one row of a tiny table).
+    fn send_connection_limit(&self, source: SourceId) {
+        match crate::store::sources::account_limits(&self.db) {
+            Ok(limits) => {
+                if let Some((source, max)) = limits.into_iter().find(|(s, _)| *s == source) {
+                    self.send_player(PlayerCommand::SetConnectionLimit { source, max });
+                }
+            }
+            Err(e) => tracing::warn!("connection limit of a new playlist: {e}"),
         }
     }
 
@@ -382,12 +404,41 @@ impl TunerApp {
             }
             DataScope::Sources | DataScope::All => {
                 self.refresh_epg_updated();
+                self.refresh_image_agents();
                 self.submit_job(JobKind::RebuildLibrary);
             }
-            DataScope::Live | DataScope::Vod | DataScope::Overrides | DataScope::History => {
+            DataScope::Live | DataScope::Vod | DataScope::Overrides => {
                 self.submit_job(JobKind::RebuildLibrary);
             }
+            // every zap writes history: patch the recently watched list, never rebuild
+            DataScope::History => self.refresh_recent_channels(),
             DataScope::VodDetails | DataScope::Progress => {}
+        }
+    }
+
+    /// Re-read the recently watched channels (one aggregate over the ≤ 500-row history table)
+    /// and swap in a snapshot that shares the library's indexes when they changed: the
+    /// incremental reaction to `DataScope::History` (DESIGN §5.4). `built_at` stays, so screens
+    /// keyed on it (VOD grids, search, Home's recently added) don't rebuild for a zap; those
+    /// showing the recent list follow `Library::generation`.
+    fn refresh_recent_channels(&mut self) {
+        match crate::store::library::load_recent_channels(&self.db, &self.lib.live) {
+            Ok(recent) if recent != self.lib.recent_channels => self.lib = Arc::new(self.lib.with_recent_channels(recent)),
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!("recently watched channels: {e}");
+                self.submit_job(JobKind::RebuildLibrary);
+            }
+        }
+    }
+
+    /// Per-source User-Agents for image fetches, by the host each playlist is served from
+    /// (`ImageCache::set_source_agents`; the source table is tiny, read on startup and when
+    /// sources change).
+    fn refresh_image_agents(&mut self) {
+        match crate::store::sources::list_sources(&self.db) {
+            Ok(sources) => self.images.set_source_agents(image_agents(&sources)),
+            Err(e) => tracing::warn!("image user agents: {e}"),
         }
     }
 
@@ -897,6 +948,29 @@ impl eframe::App for TunerApp {
     }
 }
 
+/// Host → User-Agent of every playlist with its own User-Agent (URL playlists and Xtream
+/// panels; a local file has no host).
+fn image_agents(sources: &[crate::model::Source]) -> std::collections::HashMap<String, String> {
+    use crate::model::SourceKind;
+    let host = |loc: &str| {
+        let loc = loc.trim();
+        let parsed = url::Url::parse(loc).ok().filter(|u| u.has_host()).or_else(|| url::Url::parse(&format!("http://{loc}")).ok());
+        parsed.and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+    };
+    sources
+        .iter()
+        .filter_map(|s| {
+            let ua = s.settings.user_agent.as_deref().map(str::trim).filter(|u| !u.is_empty())?;
+            let loc = match s.kind {
+                SourceKind::M3uUrl => s.url.as_ref()?.expose().clone(),
+                SourceKind::Xtream => s.xtream.as_ref()?.server.clone(),
+                SourceKind::M3uFile => return None,
+            };
+            Some((host(&loc)?, ua.to_owned()))
+        })
+        .collect()
+}
+
 /// The same theme at another `interface.ui_scale`.
 fn scaled(t: Theme, ui_scale: f32) -> Theme { Theme::from_parts(t.name, t.palette, t.shell, t.tokens.rounding, ui_scale) }
 
@@ -1241,7 +1315,7 @@ mod tests {
     /// Load the real library from the profile and deliver it like the RebuildLibrary job.
     fn deliver_library(rig: &mut Rig) {
         let lib = crate::store::library::load(&rig.app.db).unwrap();
-        rig.event(AppEvent::Job(JobEvent::Finished { id: JobId(9), kind: JobKind::RebuildLibrary, outcome: Ok(JobOutcome::Library(Arc::new(lib))) }));
+        rig.event(AppEvent::Job(JobEvent::Finished { id: JobId(9), kind: JobKind::RebuildLibrary, outcome: Ok(JobOutcome::Library(Arc::new(lib))), failure: None }));
     }
 
     fn played(log: &Log) -> Vec<(MediaRef, PlayOrigin)> {
@@ -1480,15 +1554,39 @@ mod tests {
         let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_channels(c, 3, None));
         rig.app.log.borrow_mut().jobs.clear();
         // rebuild scopes
-        for scope in [DataScope::Live, DataScope::Vod, DataScope::Overrides, DataScope::History, DataScope::Sources, DataScope::All] {
+        for scope in [DataScope::Live, DataScope::Vod, DataScope::Overrides, DataScope::Sources, DataScope::All] {
             rig.event(AppEvent::Data(scope));
         }
-        assert_eq!(rig.log().jobs.len(), 6);
+        assert_eq!(rig.log().jobs.len(), 5);
         assert!(rig.log().jobs.iter().all(|j| *j == JobKind::RebuildLibrary));
         // screens react themselves
         rig.event(AppEvent::Data(DataScope::VodDetails));
         rig.event(AppEvent::Data(DataScope::Progress));
-        assert_eq!(rig.log().jobs.len(), 6);
+        assert_eq!(rig.log().jobs.len(), 5);
+        // history (every zap): only the recently watched list changes, the indexes are shared
+        rig.app.log.borrow_mut().jobs.clear();
+        deliver_library(&mut rig);
+        let before = rig.app.lib.clone();
+        assert!(before.recent_channels.is_empty());
+        rig.writer()
+            .blocking(|c| crate::store::user::push_history(c, &crate::model::HistoryEntry { item: channel_ref(2), at: 10, title: "Channel 2".into() }))
+            .unwrap();
+        rig.event(AppEvent::Data(DataScope::History));
+        assert!(rig.log().jobs.is_empty(), "a zap never rebuilds the library");
+        let after = rig.app.lib.clone();
+        assert_eq!(after.recent_channels, [after.live.by_ref(&channel_ref(2)).unwrap()]);
+        assert!(Arc::ptr_eq(&before.live, &after.live) && Arc::ptr_eq(&before.vod, &after.vod));
+        assert_eq!(after.built_at, before.built_at, "screens keyed on the build don't rebuild");
+        assert_ne!(after.generation, before.generation, "screens showing the recent list do");
+        // nothing new: the snapshot stays the same
+        rig.event(AppEvent::Data(DataScope::History));
+        assert!(Arc::ptr_eq(&after, &rig.app.lib));
+        // a library built before that zap lands later: the list is re-read on the swap
+        let mut stale = crate::store::library::load(&rig.app.db).unwrap();
+        stale.recent_channels.clear();
+        rig.event(AppEvent::Job(JobEvent::Finished { id: JobId(9), kind: JobKind::RebuildLibrary, outcome: Ok(JobOutcome::Library(Arc::new(stale))), failure: None }));
+        assert_eq!(rig.app.lib.recent_channels.len(), 1);
+        rig.app.log.borrow_mut().jobs.clear();
         // EPG: fresh guide time + rebuild
         rig.writer()
             .blocking(|c| Ok(c.execute("INSERT INTO epg_source(name, kind, url, last_refresh) VALUES ('G', 'url', 'http://127.0.0.1/e.xml', 1234567)", [])?))
@@ -1496,7 +1594,7 @@ mod tests {
         assert_eq!(rig.app.epg_updated, None);
         rig.event(AppEvent::Data(DataScope::Epg));
         assert_eq!(rig.app.epg_updated, Some(1_234_567));
-        assert_eq!(rig.log().jobs.len(), 7);
+        assert_eq!(rig.log().jobs, [JobKind::RebuildLibrary]);
         // favourites reload from the DB into the app-owned index
         let item = channel_ref(1);
         assert!(!rig.app.favs.is_fav(&item));
@@ -1509,7 +1607,7 @@ mod tests {
             .unwrap();
         rig.event(AppEvent::Data(DataScope::Favourites));
         assert!(rig.app.favs.is_fav(&item));
-        assert_eq!(rig.log().jobs.len(), 7, "favourites never rebuild the library");
+        assert_eq!(rig.log().jobs.len(), 1, "favourites never rebuild the library");
     }
 
     #[test]
@@ -1535,6 +1633,7 @@ mod tests {
                 id: JobId(3),
                 kind: JobKind::RefreshSource { source: SourceId(4), force: false },
                 outcome: Ok(JobOutcome::SourceRefreshed { source: SourceId(4), summary: Default::default(), not_modified: false, account }),
+                failure: None,
             })
         };
         rig.event(refreshed(None));
@@ -1543,25 +1642,59 @@ mod tests {
         assert_eq!(limits, [PlayerCommand::SetConnectionLimit { source: SourceId(4), max: Some(2) }]);
     }
 
+    /// AddSource imports inline (no `SourceRefreshed`): the stored account limit follows it.
+    #[test]
+    fn connection_limit_follows_an_added_source() {
+        let account = serde_json::to_string(&crate::model::AccountInfo { max_connections: Some(1), ..Default::default() }).unwrap();
+        let mut rig = Rig::with(test_config(), live(), 1.0, move |c| seed_channels(c, 1, Some(&account)));
+        rig.app.log.borrow_mut().commands.clear();
+        rig.event(AppEvent::Job(JobEvent::Finished {
+            id: JobId(3),
+            kind: JobKind::AddSource(crate::model::SourceDraft {
+                name: "My IPTV".into(),
+                kind: crate::model::SourceKind::M3uUrl,
+                icon: String::new(),
+                color: Default::default(),
+                url: Some("http://127.0.0.1/p.m3u".into()),
+                path: None,
+                xtream: None,
+                settings: Default::default(),
+            }),
+            outcome: Ok(JobOutcome::SourceAdded(SourceId(1))),
+            failure: None,
+        }));
+        let limits: Vec<_> = rig.log().commands.iter().filter(|c| matches!(c, PlayerCommand::SetConnectionLimit { .. })).cloned().collect();
+        assert_eq!(limits, [PlayerCommand::SetConnectionLimit { source: SourceId(1), max: Some(1) }]);
+    }
+
     #[test]
     fn failed_refreshes_toast_and_flag_offline_until_the_next_success() {
         let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_channels(c, 1, None));
-        let failed = |kind, msg: &str| AppEvent::Job(JobEvent::Finished { id: JobId(5), kind, outcome: Err(msg.to_owned()) });
-        rig.event(failed(JobKind::RebuildLibrary, "boom"));
-        rig.event(failed(JobKind::RefreshSource { source: SourceId(1), force: false }, "cancelled"));
+        let failed = |kind, e: crate::error::Error| {
+            let failure = Some(FailureKind::of(&e));
+            AppEvent::Job(JobEvent::Finished { id: JobId(5), kind, outcome: Err(e.to_string()), failure })
+        };
+        let source = || JobKind::RefreshSource { source: SourceId(1), force: false };
+        rig.event(failed(JobKind::RebuildLibrary, crate::error::Error::Other("boom".into())));
+        rig.event(failed(source(), crate::error::Error::Cancelled));
         assert!(rig.log().toasts.is_empty(), "library builds and cancellations stay quiet");
-        rig.event(failed(JobKind::RefreshSource { source: SourceId(1), force: false }, "network error: dns failure"));
+        rig.event(failed(source(), crate::error::Error::Network("dns failure".into())));
         assert!(rig.app.offline);
         assert_eq!(rig.log().toasts.last().unwrap().text, "Couldn't refresh My IPTV: network error: dns failure");
-        rig.event(failed(JobKind::RefreshEpg { epg_source: crate::model::EpgSourceId(1), force: false }, "HTTP 404 from http://h/e.xml"));
+        rig.event(failed(JobKind::RefreshEpg { epg_source: crate::model::EpgSourceId(1), force: false }, crate::error::Error::Http { status: 404, url: "http://h/e.xml".into() }));
         assert!(!rig.app.offline, "an HTTP error means the network works");
         assert_eq!(rig.log().toasts.last().unwrap().kind, ToastKind::Error);
-        rig.event(failed(JobKind::RefreshStale, "network error: timeout"));
+        rig.event(failed(JobKind::RefreshStale, crate::error::Error::Network("timeout".into())));
         assert!(rig.app.offline);
+        // the kind decides, not the wording: a parse error quoting "network error" is not offline
+        rig.event(failed(source(), crate::error::Error::parse(Some(3), "network error in the playlist text")));
+        assert!(!rig.app.offline);
+        rig.event(failed(source(), crate::error::Error::Network("timeout".into())));
         rig.event(AppEvent::Job(JobEvent::Finished {
             id: JobId(6),
-            kind: JobKind::RefreshSource { source: SourceId(1), force: false },
+            kind: source(),
             outcome: Ok(JobOutcome::SourceRefreshed { source: SourceId(1), summary: Default::default(), not_modified: true, account: None }),
+            failure: None,
         }));
         assert!(!rig.app.offline);
     }
@@ -1740,7 +1873,7 @@ mod tests {
             .unwrap();
         rig.event(AppEvent::Data(DataScope::Favourites));
         assert!(rig.app.favs.is_fav(&channel_ref(0)));
-        rig.event(AppEvent::Job(JobEvent::Finished { id: JobId(9), kind: JobKind::RebuildLibrary, outcome: Ok(JobOutcome::Library(Arc::new(stale))) }));
+        rig.event(AppEvent::Job(JobEvent::Finished { id: JobId(9), kind: JobKind::RebuildLibrary, outcome: Ok(JobOutcome::Library(Arc::new(stale))), failure: None }));
         assert!(rig.app.favs.is_fav(&channel_ref(0)), "the older library's favourites don't win");
     }
 
@@ -1756,6 +1889,36 @@ mod tests {
         rig.event(AppEvent::Platform(PlatformEvent::ReminderWatch { reminder: crate::model::ReminderId(2), channel: channel_ref(9) }));
         assert_eq!(played(&rig.log()).len(), 1);
         assert_eq!(rig.log().toasts.len(), 1);
+    }
+
+    #[test]
+    fn image_user_agents_by_playlist_host() {
+        use crate::model::{Source, SourceKind, SourceSettings, XtreamCredentials};
+        let src = |kind, url: Option<&str>, server: Option<&str>, ua: Option<&str>| Source {
+            id: SourceId(1),
+            name: "S".into(),
+            kind,
+            icon: String::new(),
+            color: Default::default(),
+            url: url.map(|u| u.to_owned().into()),
+            path: None,
+            xtream: server.map(|s| XtreamCredentials { server: s.into(), username: "u".into(), password: "p".to_owned().into() }),
+            settings: SourceSettings { user_agent: ua.map(str::to_owned), ..Default::default() },
+            enabled: true,
+            sort_index: 0,
+            created_at: 0,
+            status: Default::default(),
+        };
+        let agents = image_agents(&[
+            src(SourceKind::M3uUrl, Some("http://Lists.Example:8000/get.php?username=a&password=b"), None, Some("Smart/1")),
+            src(SourceKind::Xtream, None, Some("panel.example:8080"), Some(" Panel/2 ")),
+            src(SourceKind::M3uUrl, Some("http://plain.example/p.m3u"), None, None),
+            src(SourceKind::M3uUrl, Some("http://blank.example/p.m3u"), None, Some("  ")),
+            src(SourceKind::M3uFile, None, None, Some("File/1")),
+        ]);
+        let mut v: Vec<_> = agents.into_iter().collect();
+        v.sort();
+        assert_eq!(v, [("lists.example".to_owned(), "Smart/1".to_owned()), ("panel.example".to_owned(), "Panel/2".to_owned())]);
     }
 
     #[test]
@@ -1804,6 +1967,29 @@ mod tests {
     }
 
     // ---- settings ----------------------------------------------------------------------------
+
+    #[test]
+    fn network_settings_reach_the_shared_http_client_live() {
+        let mut rig = Rig::new();
+        let images_and_jobs = rig.app.services().jobs.context().http.clone();
+        rig.app.config_edits.push(Box::new(|c: &mut Config| c.player.user_agent = "Live/1".into()));
+        rig.frame_with(vec![]);
+        assert_eq!(rig.app.services().http.default_user_agent(), "Live/1");
+        assert_eq!(images_and_jobs.default_user_agent(), "Live/1", "every clone follows");
+    }
+
+    /// The signal watcher's direct exit (no frame can run): player stopped, writer flushed,
+    /// `run/tuner.sock` removed.
+    #[test]
+    fn exit_cleanup_stops_the_player_and_removes_the_socket() {
+        let rig = Rig::new();
+        let sock = rig.app.services().paths.ipc_socket();
+        assert!(sock.exists(), "IPC server bound");
+        let cleanup = rig.app.services().exit_cleanup();
+        rig.app.services().rt.block_on(cleanup);
+        assert!(!sock.exists());
+        assert_eq!(rig.app.services().player.handle().snapshot().state, PlayerState::Idle);
+    }
 
     #[test]
     fn config_edits_are_saved_and_applied() {

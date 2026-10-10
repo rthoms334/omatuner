@@ -4,16 +4,20 @@
 //! register secrets) → HTTP client → job manager → player (mpv + threads) → [window] →
 //! video surface → integrations (theme watcher, IPC server, MPRIS, reminders, scheduler,
 //! connection limits).
-//! Shutdown order: integrations → jobs.cancel_all → video surface destroy (GL, done by the app)
-//! → player shutdown (mpv) → runtime (shutdown_timeout 2 s) → store writer drains + joins.
+//! Shutdown order: video surface destroy (GL, done by the app) → integrations → jobs.shutdown
+//! (cancel all, refuse new ones) → player shutdown (mpv; final progress save) → wait ≤ 5 s for
+//! the cancelled jobs' wind-down → runtime (shutdown_timeout 2 s) → store writer drains + joins.
 //!
 //! Every optional integration may fail to start (no session bus, socket in use…): the failure
 //! is logged and the app runs without it. Settings edits re-apply live
 //! ([`Services::apply_config`]): toggling the theme follower, MPRIS or reminders starts/stops
-//! them, a reminder lead change restarts the scheduler, a font change reloads fonts on a worker.
+//! them, a reminder lead change restarts the scheduler, a font change reloads fonts on a worker,
+//! a User-Agent / network timeout change rebuilds the shared HTTP client (jobs and image
+//! fetches), and debug logging switches the log filter.
 
 use std::collections::HashSet;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use crate::config::{Config, SharedConfig};
@@ -27,6 +31,9 @@ use crate::player::{MediaResolver, Player, PlayerCommand, PlayerDeps, PlayerErro
 use crate::sources::http::{HttpClient, HttpOptions};
 use crate::store::{Store, Writer};
 use crate::theme::ThemeEvent;
+
+/// Longest wait at exit for cancelled jobs to wind down.
+const JOBS_WIND_DOWN: Duration = Duration::from_secs(5);
 
 /// Optional desktop integrations (each may be absent if its start failed).
 #[derive(Default)]
@@ -49,6 +56,11 @@ pub struct Services {
     pub player: Player,
     pub logs: LogBuffer,
     pub integrations: Integrations,
+    /// Set when [`Services::shutdown`] begins (the signal watcher leaves the exit to it; a
+    /// signal after that means it is stuck).
+    closing: Arc<AtomicBool>,
+    /// The IPC socket we bound, for the signal watcher's direct exit.
+    socket: Arc<Mutex<Option<crate::ipc::SocketGuard>>>,
 }
 
 impl Services {
@@ -66,11 +78,7 @@ impl Services {
         if let Err(e) = store.reader().and_then(|c| crate::store::sources::register_secrets(&c)) {
             tracing::error!("registering stored secrets: {e}");
         }
-        let http = HttpClient::new(&HttpOptions {
-            default_user_agent: config.player.user_agent.clone(),
-            connect_timeout_s: 10,
-            read_timeout_s: config.player.network_timeout_s.max(30) as u64,
-        })?;
+        let http = HttpClient::new(&http_options(&config))?;
         let config: SharedConfig = Arc::new(RwLock::new(Arc::new(config)));
         let jobs = JobManager::new(JobContext::new(store.clone(), http.clone(), bus.clone(), paths.clone(), config.clone()), rt.handle().clone());
         let player = {
@@ -82,7 +90,20 @@ impl Services {
             };
             Player::start(&cfg, deps)?
         };
-        Ok(Self { paths, config, bus, rt, store, http, jobs, player, logs, integrations: Integrations::default() })
+        Ok(Self {
+            paths,
+            config,
+            bus,
+            rt,
+            store,
+            http,
+            jobs,
+            player,
+            logs,
+            integrations: Integrations::default(),
+            closing: Arc::default(),
+            socket: Arc::default(),
+        })
     }
 
     /// Start optional integrations; each failure is logged, never fatal. Also feeds the
@@ -93,6 +114,7 @@ impl Services {
             self.start_theme_watch(&cfg);
         }
         self.integrations.ipc = ok("IPC server", crate::ipc::IpcServer::start(self.rt.handle(), &self.paths.ipc_socket(), self.bus.clone()));
+        *self.socket.lock().unwrap_or_else(|e| e.into_inner()) = self.integrations.ipc.as_ref().map(|s| s.socket());
         if cfg.integration.mpris {
             self.start_mpris();
         }
@@ -151,6 +173,15 @@ impl Services {
                 self.start_reminders(new);
             }
         }
+        if old.general.debug_log != new.general.debug_log {
+            crate::logging::set_debug(new.general.debug_log);
+        }
+        // User-Agent / timeout: every clone of the client (jobs, image fetches) follows
+        if http_options(old) != http_options(new)
+            && let Err(e) = self.http.reconfigure(&http_options(new))
+        {
+            tracing::warn!("network settings: {e}");
+        }
         if old.fonts != new.fonts {
             let (fonts, bus) = (new.fonts.clone(), self.bus.clone());
             self.rt.spawn_blocking(move || {
@@ -163,8 +194,55 @@ impl Services {
     /// Current config (cheap `Arc` clone, no struct copy).
     pub fn config(&self) -> Arc<Config> { crate::config::current(&self.config) }
 
+    /// Quit cleanly on SIGTERM / SIGINT / SIGHUP (`platform::signals`): close the window, or
+    /// exit directly when it can't close. Called by `main` only — tests keep the default
+    /// signal handling. Both tasks run until the runtime stops, past `shutdown`'s slow steps.
+    pub fn watch_signals(&self) {
+        let _rt = self.rt.enter();
+        let (signals, _forwarder) = match crate::platform::signals::forward() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::info!("signal handling: {e}");
+                return;
+            }
+        };
+        let cleanup = self.exit_cleanup();
+        self.rt.spawn(crate::platform::signals::quit_on_signals(
+            signals,
+            self.bus.clone(),
+            self.closing.clone(),
+            crate::platform::signals::GRACE,
+            move || async move {
+                cleanup.await;
+                crate::logging::flush(Duration::from_millis(500));
+                std::process::exit(0);
+            },
+        ));
+    }
+
+    /// What the direct exit does instead of [`Services::shutdown`] (the UI thread can't run
+    /// it): stop the player (its final progress save goes to the writer), flush the writer
+    /// queue, remove the IPC socket. mpv and the WAL are left to process exit / the next open.
+    pub(crate) fn exit_cleanup(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let (player, writer, socket) = (self.player.handle(), self.store.writer().clone(), self.socket.clone());
+        async move {
+            player.send(PlayerCommand::Shutdown);
+            let mut snap = player.subscribe();
+            let _ = tokio::time::timeout(Duration::from_secs(1), snap.wait_for(|s| s.state == crate::player::PlayerState::Idle)).await;
+            if tokio::time::timeout(Duration::from_secs(2), writer.run(|_| Ok(()))).await.is_err() {
+                tracing::warn!("database writer busy at exit");
+            }
+            if let Some(s) = socket.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                s.remove();
+            }
+        }
+    }
+
     /// Orderly shutdown (see module docs). The video surface must already be destroyed.
     pub fn shutdown(mut self) {
+        // the signal watcher stays until the runtime stops: a signal during a stuck shutdown
+        // still exits directly (`platform::signals`)
+        self.closing.store(true, Ordering::SeqCst);
         if let Some(m) = &mut self.integrations.mpris {
             m.stop();
         }
@@ -172,13 +250,23 @@ impl Services {
             s.abort();
         }
         self.integrations = Integrations::default();
-        self.jobs.cancel_all();
+        self.jobs.shutdown();
         self.player.shutdown(); // final progress save is submitted to the writer here
+        // cancelled jobs finish their wind-down (an aborted guide import discards its partial
+        // data and restores the channel matches) before the runtime drops their tasks
+        if !self.jobs.wait_idle(JOBS_WIND_DOWN) {
+            tracing::warn!("background jobs still running after {} s; stopping them", JOBS_WIND_DOWN.as_secs());
+        }
         self.rt.shutdown_timeout(Duration::from_secs(2));
         if !self.store.close(Duration::from_secs(3)) {
             tracing::warn!("database writer did not finish within 3 s");
         }
     }
+}
+
+/// HTTP client options from the config (default User-Agent, read timeout ≥ 30 s).
+pub fn http_options(cfg: &Config) -> HttpOptions {
+    HttpOptions { default_user_agent: cfg.player.user_agent.clone(), connect_timeout_s: 10, read_timeout_s: cfg.player.network_timeout_s.max(30) as u64 }
 }
 
 /// Log an optional integration's start failure and carry on without it.

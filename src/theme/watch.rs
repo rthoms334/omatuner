@@ -14,11 +14,13 @@
 //! `ThemeEvent::Changed(Arc<Theme>)`, skipping reloads that produce the theme already sent.
 //! Font changes: resolve + read the font files on the background thread too and send
 //! `ThemeEvent::FontsChanged(Arc<LoadedFonts>)` — the UI only installs them.
-//! If a watch can't be set up (dir missing), poll the watched file's mtime every 5 s instead.
+//! If a watch can't be set up (dir missing), poll the watched file's mtime every 5 s instead;
+//! every poll also retries the watch, so a directory created later (first `omarchy-theme-set`,
+//! a new `~/.config/fontconfig/`) switches to inotify and polling stops.
 //! No hooks are written into the user's config.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -111,9 +113,12 @@ impl Watched {
     }
 }
 
+/// The inotify watcher, shared with the worker (it adds watches for directories that appear).
+type SharedWatcher = Arc<Mutex<notify::RecommendedWatcher>>;
+
 /// Keeps the watchers alive; dropping stops them.
 pub struct ThemeWatcher {
-    _watchers: Vec<notify::RecommendedWatcher>,
+    _watcher: Option<SharedWatcher>,
     _poller: Option<std::thread::JoinHandle<()>>,
     /// Last sender of the worker's channel besides the watchers' callbacks: dropping the
     /// watcher disconnects the channel and the worker thread exits.
@@ -143,7 +148,7 @@ impl ThemeWatcher {
                 Err(e) => tracing::debug!("theme watcher: {e}"),
             }
         };
-        let mut watchers = Vec::new();
+        let mut watcher = None;
         match notify::recommended_watcher(callback) {
             Ok(mut w) => {
                 for dir in dirs {
@@ -152,7 +157,7 @@ impl ThemeWatcher {
                         polled.extend(watched.poll_targets(dir));
                     }
                 }
-                watchers.push(w);
+                watcher = Some(Arc::new(Mutex::new(w)));
             }
             Err(e) => {
                 tracing::info!("theme watcher: inotify unavailable ({e}); polling every {}s", POLL.as_secs());
@@ -162,12 +167,12 @@ impl ThemeWatcher {
             }
         }
 
-        let worker = Worker { paths, ui_scale, bus, poller: Poller::new(polled), last_sent: None };
+        let worker = Worker { paths, ui_scale, bus, poller: Poller::new(polled), watcher: watcher.as_ref().map(Arc::downgrade), last_sent: None };
         let handle: JoinHandle<()> = std::thread::Builder::new()
             .name("theme-watch".into())
             .spawn(move || worker.run(rx))
             .map_err(|e| Error::other(format!("theme watcher thread: {e}")))?;
-        Ok(Self { _watchers: watchers, _poller: Some(handle), _alive: tx })
+        Ok(Self { _watcher: watcher, _poller: Some(handle), _alive: tx })
     }
 }
 
@@ -192,6 +197,27 @@ impl Poller {
     }
 
     fn is_active(&self) -> bool { !self.files.is_empty() }
+
+    /// Stop polling the files of every directory `watch` could watch now (it exists by now);
+    /// returns those directories and the triggers of one last poll of their files, taken after
+    /// the watch was added (a change before it is caught here, one after it by inotify).
+    fn upgrade(&mut self, mut watch: impl FnMut(&Path) -> bool) -> (Vec<PathBuf>, Vec<Trigger>) {
+        let mut dirs: Vec<PathBuf> = self.files.iter().filter_map(|(p, ..)| p.parent().map(Path::to_path_buf)).collect();
+        dirs.sort();
+        dirs.dedup();
+        let watched: Vec<PathBuf> = dirs.into_iter().filter(|d| d.is_dir() && watch(d)).collect();
+        let mut changed = Vec::new();
+        self.files.retain(|(p, trigger, last)| {
+            if !watched.iter().any(|d| p.parent() == Some(d.as_path())) {
+                return true;
+            }
+            if fingerprint(p) != *last {
+                changed.push(*trigger);
+            }
+            false
+        });
+        (watched, changed)
+    }
 
     /// Triggers for files whose fingerprint changed since the last poll.
     fn poll(&mut self) -> Vec<Trigger> {
@@ -218,6 +244,9 @@ struct Worker {
     ui_scale: f32,
     bus: EventBus,
     poller: Poller,
+    /// Retried for polled directories on every poll (`None`: inotify unavailable). Weak: the
+    /// watcher holds the channel sender, so dropping `ThemeWatcher` must free it to end this loop.
+    watcher: Option<std::sync::Weak<Mutex<notify::RecommendedWatcher>>>,
     /// The theme most recently sent (spurious events that change nothing send nothing).
     last_sent: Option<Arc<Theme>>,
 }
@@ -242,8 +271,16 @@ impl Worker {
             triggers.extend(rx.try_iter());
             let now = Instant::now();
             if poll_due.is_some_and(|d| d <= now) {
+                if let Some(w) = self.watcher.as_ref().and_then(std::sync::Weak::upgrade) {
+                    let watch = |d: &Path| w.lock().unwrap_or_else(|e| e.into_inner()).watch(d, RecursiveMode::NonRecursive).is_ok();
+                    let (dirs, changed) = self.poller.upgrade(watch);
+                    triggers.extend(changed);
+                    for d in dirs {
+                        tracing::info!("theme watcher: {} exists now; watching it instead of polling", d.display());
+                    }
+                }
                 triggers.extend(self.poller.poll());
-                poll_due = Some(now + POLL);
+                poll_due = self.poller.is_active().then(|| now + POLL);
             }
             for t in triggers {
                 match t {
@@ -359,6 +396,32 @@ mod tests {
         assert_eq!(w.classify(&ev(modify, &["/h/.config/hypr/looknfeel.lua"])), Some(Trigger::Hypr));
         assert_eq!(w.classify(&ev(modify, &["/h/.config/hypr/hyprland.conf"])), Some(Trigger::Hypr));
         assert_eq!(w.classify(&ev(modify, &["/elsewhere/shell.toml"])), None);
+    }
+
+    /// A polled directory that appeared is watched instead; the others stay polled.
+    #[test]
+    fn polled_directories_switch_to_watches_once_they_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("omarchy"), dir.path().join("fontconfig"));
+        let mut p = Poller::new(vec![(a.join("shell.toml"), Trigger::Theme), (b.join("fonts.conf"), Trigger::Fonts)]);
+        let mut asked = Vec::new();
+        let (dirs, _) = p.upgrade(|d| {
+            asked.push(d.to_path_buf());
+            true
+        });
+        assert!(dirs.is_empty());
+        assert!(asked.is_empty(), "missing directories are not tried");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        // written before the watch was added: reported by the upgrade, not lost
+        std::fs::write(a.join("shell.toml"), "x\n").unwrap();
+        // the watch of `b` fails (e.g. out of inotify watches): it keeps being polled
+        assert_eq!(p.upgrade(|d| d == a), (vec![a.clone()], vec![Trigger::Theme]));
+        assert_eq!(p.files.len(), 1);
+        assert_eq!(p.files[0].0, b.join("fonts.conf"));
+        assert!(p.is_active());
+        assert_eq!(p.upgrade(|_| true), (vec![b], vec![]));
+        assert!(!p.is_active(), "nothing left to poll");
     }
 
     #[test]

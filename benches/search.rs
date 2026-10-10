@@ -96,8 +96,8 @@ fn library() -> Library {
     };
     Library {
         sources: vec![source(1, "My IPTV"), source(2, "Backup")],
-        live: LiveIndex::from_parts(channels, groups, HashMap::new(), HashSet::new()),
-        vod: VodIndex::from_parts(movies, series, vod_groups, vec![], HashMap::new()),
+        live: LiveIndex::from_parts(channels, groups, HashMap::new(), HashSet::new()).into(),
+        vod: VodIndex::from_parts(movies, series, vod_groups, vec![], HashMap::new()).into(),
         ..Library::default()
     }
 }

@@ -18,7 +18,6 @@
 //! reminder toggles.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Rect};
@@ -415,7 +414,7 @@ pub struct LiveScreen {
     /// Medium: the groups drawer is open; Compact: the groups list is shown.
     drawer: bool,
     /// Library snapshot + favourites signature the lists were built from.
-    built: Option<(usize, u64, SortMode, bool)>,
+    built: Option<(u64, u64, SortMode, bool)>,
     /// Rebuild groups and channels on the next frame.
     dirty: bool,
     /// Re-read the failure cache (a zap succeeded or failed) — nothing else.
@@ -472,8 +471,8 @@ impl LiveScreen {
 
     fn open_index(&self) -> Option<usize> { self.open.as_ref().and_then(|e| self.groups.iter().position(|g| &g.entry == e)) }
 
-    fn signature(ctx: &UiCtx<'_>, sort: SortMode) -> (usize, u64, SortMode, bool) {
-        (Arc::as_ptr(ctx.lib) as usize, fav_signature(ctx.favs), sort, ctx.config.interface.hide_empty_groups)
+    fn signature(ctx: &UiCtx<'_>, sort: SortMode) -> (u64, u64, SortMode, bool) {
+        (ctx.lib.generation, fav_signature(ctx.favs), sort, ctx.config.interface.hide_empty_groups)
     }
 
     /// Rebuild when the library, the favourites, the sort or the hide-empty setting changed.
@@ -1610,7 +1609,7 @@ mod tests {
         let mut s = PlayerSnapshot::default();
         assert_eq!(playing_channel(&s), None);
         s.state = PlayerState::Playing;
-        s.playable = Some(Arc::new(crate::model::Playable {
+        s.playable = Some(std::sync::Arc::new(crate::model::Playable {
             media: MediaRef::Channel(ChannelId(4)),
             kind: crate::model::PlayableKind::Live,
             item: None,

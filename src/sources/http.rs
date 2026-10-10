@@ -8,6 +8,9 @@
 //!   never by Content-Type/extension.
 //! * Conditional GET with ETag / Last-Modified.
 //! * Every error leaving this module is redacted (`Error::from(reqwest::Error)`).
+//! * Clones share one configuration: [`HttpClient::reconfigure`] (a Settings change of the
+//!   User-Agent or network timeout) rebuilds the reqwest client for every clone — jobs, image
+//!   fetches — without a restart. Requests already sent keep the client they started with.
 //! * Files that may contain credentials (playlists from `get.php`, `xmltv.php` guides) are
 //!   written to the 0700 `playlists/` / `epg/` cache dirs; the `.part` file is created with
 //!   mode 0600 (`OpenOptionsExt::mode`) before the first byte is written. M3U playlists are
@@ -15,6 +18,7 @@
 
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use bytes::{Bytes, BytesMut};
 use reqwest::header::{self, HeaderName, HeaderValue};
@@ -40,11 +44,16 @@ const HTML_INSTEAD_OF_DATA: &str =
 
 #[derive(Clone)]
 pub struct HttpClient {
-    inner: reqwest::Client,
-    default_user_agent: String,
+    shared: Arc<RwLock<Configured>>,
 }
 
-#[derive(Debug, Clone)]
+/// The current reqwest client and the options it was built from.
+struct Configured {
+    client: reqwest::Client,
+    opts: HttpOptions,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct HttpOptions {
     pub default_user_agent: String,
     pub connect_timeout_s: u64,
@@ -93,15 +102,23 @@ pub type ProgressFn<'a> = &'a (dyn Fn(u64, Option<u64>) + Send + Sync);
 
 impl HttpClient {
     pub fn new(opts: &HttpOptions) -> Result<Self> {
-        let inner = reqwest::Client::builder()
-            .user_agent(opts.default_user_agent.clone())
-            .connect_timeout(std::time::Duration::from_secs(opts.connect_timeout_s))
-            .read_timeout(std::time::Duration::from_secs(opts.read_timeout_s))
-            .redirect(reqwest::redirect::Policy::limited(10))
-            .build()
-            .map_err(crate::error::Error::from)?;
-        Ok(Self { inner, default_user_agent: opts.default_user_agent.clone() })
+        let client = build_client(opts)?;
+        Ok(Self { shared: Arc::new(RwLock::new(Configured { client, opts: opts.clone() })) })
     }
+
+    /// Apply new options to this client and every clone of it (Settings ▸ Playback User-Agent,
+    /// network timeout). A no-op when nothing changed; on a build error the old client stays.
+    pub fn reconfigure(&self, opts: &HttpOptions) -> Result<()> {
+        if self.shared.read().unwrap_or_else(|e| e.into_inner()).opts == *opts {
+            return Ok(());
+        }
+        let client = build_client(opts)?;
+        *self.shared.write().unwrap_or_else(|e| e.into_inner()) = Configured { client, opts: opts.clone() };
+        Ok(())
+    }
+
+    /// The current reqwest client (an `Arc` clone).
+    fn client(&self) -> reqwest::Client { self.shared.read().unwrap_or_else(|e| e.into_inner()).client.clone() }
 
     /// GET a URL and deserialize JSON. Body read fully (bounded at 512 MiB), then
     /// `serde_json::from_slice` in `spawn_blocking`. HTML bodies → `Error::BadPayload`.
@@ -178,7 +195,7 @@ impl HttpClient {
         result
     }
 
-    pub fn default_user_agent(&self) -> &str { &self.default_user_agent }
+    pub fn default_user_agent(&self) -> String { self.shared.read().unwrap_or_else(|e| e.into_inner()).opts.default_user_agent.clone() }
 
     /// GET with `headers`; non-success status → `Error::Http`; body bounded at `max`.
     async fn fetch(&self, url: &str, headers: &HttpHeaders, max: u64, cancel: &CancellationToken) -> Result<Bytes> {
@@ -188,7 +205,7 @@ impl HttpClient {
     }
 
     fn request(&self, url: &str, headers: &HttpHeaders) -> reqwest::RequestBuilder {
-        let mut rb = self.inner.get(url);
+        let mut rb = self.client().get(url);
         // Invalid values are skipped (reqwest would otherwise fail the whole request with a
         // builder error). Only header names are logged; values may be tokens.
         let named = [
@@ -220,6 +237,16 @@ impl HttpClient {
             r = rb.send() => r.map_err(|e| transport_error(e, url)),
         }
     }
+}
+
+fn build_client(opts: &HttpOptions) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent(opts.default_user_agent.clone())
+        .connect_timeout(std::time::Duration::from_secs(opts.connect_timeout_s))
+        .read_timeout(std::time::Duration::from_secs(opts.read_timeout_s))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .map_err(crate::error::Error::from)
 }
 
 /// Detect compression from magic bytes. Implemented in the skeleton (shared contract).
@@ -569,6 +596,23 @@ mod tests {
         let bad_ua = HttpHeaders { user_agent: Some("bad\r\nua".into()), ..Default::default() };
         let v: serde_json::Value = c.get_json(&format!("{base}/headers"), &bad_ua, &tok).await.unwrap();
         assert_eq!(v["ua"], "VLC/3.0.21 LibVLC/3.0.21");
+    }
+
+    /// A Settings change of the User-Agent reaches every clone (jobs, images) without a restart.
+    #[tokio::test]
+    async fn reconfigure_applies_to_every_clone() {
+        let base = server().await;
+        let c = client();
+        let clone = c.clone();
+        let tok = CancellationToken::new();
+        c.reconfigure(&HttpOptions { default_user_agent: "Tuner-Test/2".into(), ..HttpOptions::default() }).unwrap();
+        let v: serde_json::Value = clone.get_json(&format!("{base}/headers"), &none(), &tok).await.unwrap();
+        assert_eq!(v["ua"], "Tuner-Test/2");
+        assert_eq!(clone.default_user_agent(), "Tuner-Test/2");
+        // an explicit per-request (per-source) agent still wins
+        let h = HttpHeaders { user_agent: Some("Src/1".into()), ..Default::default() };
+        let v: serde_json::Value = clone.get_json(&format!("{base}/headers"), &h, &tok).await.unwrap();
+        assert_eq!(v["ua"], "Src/1");
     }
 
     #[tokio::test]

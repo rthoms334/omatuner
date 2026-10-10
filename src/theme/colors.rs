@@ -118,8 +118,9 @@ impl RawPalette {
     }
 
     /// `[[ key ]] || key = mix(from, with, t)`. The awk mixer reads an empty/undefined `from` as
-    /// `#000000` (an undefined `yellow` gives `bright_yellow = #333333`); we mirror that. Other
-    /// non-`#rrggbb` inputs give the script garbage, so they leave `key` unset instead (it then
+    /// `#000000` (an undefined `yellow` gives `bright_yellow = #333333`) and only the first six
+    /// hex digits of a `#rrggbbaa` value (its alpha is ignored, the result is opaque); we mirror
+    /// both. Other inputs give the script garbage, so they leave `key` unset instead (it then
     /// falls back like any undefined colour).
     fn default_mix(&mut self, key: &str, from: &str, with: Color32, t: f32) {
         if self.has(key) {
@@ -127,7 +128,7 @@ impl RawPalette {
         }
         let from = match self.get(from) {
             None => Some(Color32::BLACK),
-            Some(v) => strict_hex6(v),
+            Some(v) => hex_rgb(v),
         };
         if let Some(c) = from {
             self.set(key, to_hex(mix(c, with, t)));
@@ -300,6 +301,14 @@ fn strict_hex6(s: &str) -> Option<Color32> {
     Some(Color32::from_rgb(p(0)?, p(2)?, p(4)?))
 }
 
+/// `#rrggbb` or `#rrggbbaa` as its opaque RGB (what the script's awk mixer reads).
+fn hex_rgb(s: &str) -> Option<Color32> {
+    match s.len() {
+        9 => strict_hex6(s.get(..7)?).filter(|_| s.get(7..).is_some_and(|a| a.bytes().all(|b| b.is_ascii_hexdigit()))),
+        _ => strict_hex6(s),
+    }
+}
+
 fn to_hex(c: Color32) -> String { format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b()) }
 
 pub const fn rgb(r: u8, g: u8, b: u8) -> Color32 { Color32::from_rgb(r, g, b) }
@@ -395,6 +404,20 @@ pub(super) fn is_angle(t: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Derived colours of `#rrggbbaa` inputs mix their RGB like the script does (before, a
+    /// translucent `red` left `bright_red` unset → the foreground).
+    #[test]
+    fn eight_digit_hex_inputs_still_derive_colours() {
+        let p = Palette::parse("background = \"#10203080\"\nforeground = \"#e0e0e0\"\nred = \"#cc0000ff\"\norange = \"#c08040cc\"\n", false).unwrap();
+        assert_eq!(p.bright_red, mix(rgb(0xcc, 0, 0), Color32::WHITE, 0.2));
+        assert_eq!(p.brown, mix(rgb(0xc0, 0x80, 0x40), Color32::BLACK, 0.5));
+        assert_eq!(p.dark_background, mix(rgb(0x10, 0x20, 0x30), Color32::BLACK, 0.25));
+        assert_eq!(p.red, rgb(0xcc, 0, 0), "palette colours are opaque (Omarchy reads 6 digits)");
+        assert_eq!(p.mode, Mode::Dark, "the luminance check only reads #rrggbb (like the script)");
+        assert_eq!(hex_rgb("#zz000000"), None);
+        assert_eq!(hex_rgb("#cc0000zz"), None);
+    }
 
     #[test]
     fn parses_liftoff_subset() {
