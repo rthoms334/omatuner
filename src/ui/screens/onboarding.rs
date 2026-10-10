@@ -1607,6 +1607,7 @@ mod tests {
             estimate_channels: Some(1234),
             suggested_name: None,
             epg_urls: vec![],
+            upgraded_from: None,
         };
         assert_eq!(estimate_text(&r).as_deref(), Some("1234 channels in the playlist"));
         r.kind = SourceKind::Xtream;

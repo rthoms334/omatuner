@@ -262,7 +262,7 @@ async fn a_request_arriving_mid_download_reruns_the_job_afterwards() {
     let (id, outcome) = h.finished(|k| matches!(k, JobKind::RefreshSource { .. })).await;
     assert_eq!(id, first);
     match outcome {
-        Ok(JobOutcome::SourceRefreshed { source, summary, not_modified: false, account: None }) => {
+        Ok(JobOutcome::SourceRefreshed { source, summary, not_modified: false, account: None, upgraded: false }) => {
             assert_eq!(source, s);
             assert_eq!(summary.channels.total, 50);
         }

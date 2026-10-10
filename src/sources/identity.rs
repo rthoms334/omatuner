@@ -9,6 +9,9 @@
 //! * M3U: `m3u:` + first 16 hex chars of blake3(`tvg_id` | `norm_name` | `norm_group`), where
 //!   empty fields stay empty. The URL is deliberately NOT part of the key (tokenized URLs
 //!   rotate). Duplicates within one import get `#2`, `#3`… in file order ([`KeyAllocator`]).
+//! * M3U series (DESIGN §27.5, added in phase 5): `m3u:s:` + first 16 hex chars of
+//!   blake3(`normalize_name(series title)`). M3U movies and episodes keep the entry key above
+//!   (the key the entry had as a channel), so legacy user data follows them (§27.4).
 //! * Groups: `<kind>:<normalize_group(name)>` ("uncategorized" when empty).
 //!   `Fingerprint.norm_group` is the same string without the `<kind>:` prefix.
 
@@ -120,6 +123,12 @@ pub fn m3u_base_key(tvg_id: Option<&str>, norm_name: &str, norm_group: Option<&s
     format!("m3u:{}", &h.finalize().to_hex()[..16])
 }
 
+/// Key of a series assembled from M3U episode entries (`norm_series` = `normalize_name` of
+/// the series title). One series per normalized title per source.
+pub fn m3u_series_key(norm_series: &str) -> ItemKey {
+    ItemKey(format!("m3u:s:{}", &blake3::hash(norm_series.as_bytes()).to_hex()[..16]))
+}
+
 /// Allocates unique keys within one import, suffixing duplicates deterministically.
 #[derive(Debug, Default)]
 pub struct KeyAllocator {
@@ -172,6 +181,7 @@ mod tests {
         assert_eq!(a.alloc("m3u:x".into()).0, "m3u:x");
         assert_eq!(a.alloc("m3u:x".into()).0, "m3u:x#2");
         assert_eq!(xtream_key(ItemKind::Channel, 42).0, "xt:live:42");
+        assert_eq!(m3u_series_key("exampleshow").0, "m3u:s:01aa74f920f85034");
     }
 
     #[test]

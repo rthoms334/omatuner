@@ -226,7 +226,7 @@ async fn adding_an_xtream_source_imports_live_vod_series_and_the_provider_guide(
 
     // a refresh reports the fresh account (the app feeds the player's connection budget)
     match h.refresh(source).await {
-        Ok(JobOutcome::SourceRefreshed { source: s, summary, not_modified: false, account: Some(a) }) => {
+        Ok(JobOutcome::SourceRefreshed { source: s, summary, not_modified: false, account: Some(a), upgraded: false }) => {
             assert_eq!(s, source);
             assert_eq!(a.max_connections, Some(2));
             assert_eq!((summary.channels.total, summary.channels.added, summary.channels.updated), (2, 0, 2));

@@ -82,6 +82,10 @@ pub struct SourceSettings {
     pub smart_names: Option<bool>,
     /// Import VOD/series for Xtream (users with live-only interest can disable).
     pub import_vod: Option<bool>,
+    /// Never switch this M3U playlist to the Xtream login it carries (DESIGN §27.3): set by
+    /// "Keep as M3U" in onboarding and the source's settings. On an upgraded source (Xtream
+    /// with [`Source::m3u_origin`]) it switches the source back to its playlist.
+    pub keep_m3u: bool,
 }
 
 /// Account information from Xtream `user_info`/`server_info` (UHF "server info").
@@ -139,6 +143,23 @@ pub struct Source {
     pub sort_index: i32,
     pub created_at: Timestamp,
     pub status: SourceStatus,
+}
+
+impl Source {
+    /// The playlist an Xtream source was upgraded from (DESIGN §27.3): the M3U URL or file it
+    /// keeps so the user can switch back. `None` for native Xtream logins and M3U sources.
+    pub fn m3u_origin(&self) -> Option<SourceKind> {
+        if self.kind != SourceKind::Xtream {
+            return None;
+        }
+        if self.url.is_some() {
+            Some(SourceKind::M3uUrl)
+        } else if self.path.is_some() {
+            Some(SourceKind::M3uFile)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]

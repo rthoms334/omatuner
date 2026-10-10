@@ -58,6 +58,7 @@ pub async fn probe(ctx: &JobContext, draft: &SourceDraft, progress: &Progress, c
             account: Some(account),
             estimate_channels: estimate,
             epg_urls: Vec::new(),
+            upgraded_from: (draft.kind != SourceKind::Xtream).then_some(draft.kind),
         });
     }
 
@@ -74,6 +75,7 @@ pub async fn probe(ctx: &JobContext, draft: &SourceDraft, progress: &Progress, c
                 estimate_channels: Some(count),
                 suggested_name: suggested,
                 epg_urls,
+                upgraded_from: None,
             })
         }
         SourceKind::M3uUrl => {
@@ -110,6 +112,7 @@ pub async fn probe(ctx: &JobContext, draft: &SourceDraft, progress: &Progress, c
                 estimate_channels: Some(count),
                 suggested_name: host_name(url),
                 epg_urls,
+                upgraded_from: None,
             })
         }
     }

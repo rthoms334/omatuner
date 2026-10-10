@@ -148,6 +148,15 @@ pub fn update_source(conn: &Connection, src: &Source) -> Result<()> {
     Ok(())
 }
 
+/// Switch a source between M3U and its Xtream login (DESIGN §27.3): sets `kind`, stores
+/// `xtream` when given (credential columns are otherwise kept, so switching back and forth
+/// needs no new detection), clears the ETag / Last-Modified validators (the next M3U download
+/// must be complete) and registers the secrets. The M3U URL / file is never cleared.
+pub fn set_source_kind(conn: &Connection, id: SourceId, kind: SourceKind, xtream: Option<&XtreamCredentials>) -> Result<()> {
+    let _ = (conn, id, kind, xtream);
+    todo!("P5-sources")
+}
+
 /// Delete `table` rows matching `cond` (which binds `?1`) in chunks, one savepoint each.
 pub(crate) fn delete_chunked(conn: &Connection, table: &str, cond: &str, arg: i64) -> Result<usize> {
     let sql = format!("DELETE FROM {table} WHERE id IN (SELECT id FROM {table} WHERE {cond} LIMIT {DELETE_CHUNK})");

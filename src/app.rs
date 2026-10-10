@@ -1715,7 +1715,13 @@ mod tests {
             AppEvent::Job(JobEvent::Finished {
                 id: JobId(3),
                 kind: JobKind::RefreshSource { source: SourceId(4), force: false },
-                outcome: Ok(JobOutcome::SourceRefreshed { source: SourceId(4), summary: Default::default(), not_modified: false, account }),
+                outcome: Ok(JobOutcome::SourceRefreshed {
+                    source: SourceId(4),
+                    summary: Default::default(),
+                    not_modified: false,
+                    account,
+                    upgraded: false,
+                }),
                 failure: None,
             })
         };
@@ -1779,7 +1785,13 @@ mod tests {
         rig.event(AppEvent::Job(JobEvent::Finished {
             id: JobId(6),
             kind: source(),
-            outcome: Ok(JobOutcome::SourceRefreshed { source: SourceId(1), summary: Default::default(), not_modified: true, account: None }),
+            outcome: Ok(JobOutcome::SourceRefreshed {
+                source: SourceId(1),
+                summary: Default::default(),
+                not_modified: true,
+                account: None,
+                upgraded: false,
+            }),
             failure: None,
         }));
         assert!(!rig.app.offline);

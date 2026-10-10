@@ -68,6 +68,8 @@ pub struct RefreshResult {
     pub not_modified: bool,
     /// Provider guide URLs discovered (M3U `url-tvg`, Xtream `xmltv.php`).
     pub epg_urls: Vec<String>,
+    /// The M3U source was switched to its Xtream login by this refresh (DESIGN §27.3).
+    pub upgraded: bool,
 }
 
 pub async fn refresh_source(
@@ -283,7 +285,7 @@ async fn refresh_m3u(
     mark_refreshed(ctx, src, counts_of(&summary), etag, last_modified, now).await?;
     provider_epg(ctx, src, parsed.tvg_urls.clone(), cfg).await?;
     (ctx.submit)(JobKind::RebuildLibrary);
-    Ok(RefreshResult { summary, not_modified: false, epg_urls: parsed.tvg_urls })
+    Ok(RefreshResult { summary, not_modified: false, epg_urls: parsed.tvg_urls, upgraded: false })
 }
 
 /// 304: the stored catalogue is current. Bookkeeping only; due provider guides still refresh.
@@ -294,7 +296,7 @@ async fn m3u_not_modified(ctx: &JobContext, src: &Source, cfg: &Config) -> Resul
         let ids = provider_epg_ids(ctx, src.id).await?;
         submit_stale_epg(ctx, ids, cfg).await?;
     }
-    Ok(RefreshResult { summary: ImportSummary::default(), not_modified: true, epg_urls: Vec::new() })
+    Ok(RefreshResult { summary: ImportSummary::default(), not_modified: true, epg_urls: Vec::new(), upgraded: false })
 }
 
 /// One writer transaction's worth of channels plus the groups first seen in it.
@@ -575,7 +577,7 @@ async fn refresh_xtream(ctx: &JobContext, src: &Source, cfg: &Config, progress: 
     let epg_urls = vec![urls::xmltv_url(&creds)];
     provider_epg(ctx, src, epg_urls.clone(), cfg).await?;
     (ctx.submit)(JobKind::RebuildLibrary);
-    Ok(RefreshResult { summary, not_modified: false, epg_urls })
+    Ok(RefreshResult { summary, not_modified: false, epg_urls, upgraded: false })
 }
 
 /// Every kind failed: one error naming each kind (the first error alone when only one).

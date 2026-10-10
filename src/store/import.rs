@@ -160,6 +160,22 @@ pub struct SeriesDetails {
     pub backdrop: Option<String>,
 }
 
+/// A series assembled from M3U episode entries, with every episode the playlist lists
+/// (DESIGN §27.5). Written by [`write_series_episodes`]; there are no lazy details.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportSeriesEpisodes {
+    pub series: ImportSeries,
+    pub episodes: Vec<ImportEpisode>,
+}
+
+/// User data to re-point from one item to another, possibly of another kind (M3U ⇄ Xtream
+/// switches and M3U channels reclassified as movies/episodes; DESIGN §27.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyMove {
+    pub from: ItemRef,
+    pub to: ItemRef,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct KindCounts {
     pub added: u32,
@@ -524,6 +540,25 @@ pub fn write_series(conn: &mut Connection, imp: &CatalogueImport, batch: &[Impor
     bump_counters(&tx, imp, "series", added, updated)?;
     tx.commit()?;
     Ok((added, updated))
+}
+
+/// Upsert M3U series (like [`write_series`]) and replace each one's episodes and seasons
+/// (seasons synthesized from the episodes; `details_at` = the import's start, so detail pages
+/// never ask the provider). One transaction per batch; returns series (added, updated).
+/// DESIGN §27.5.
+pub fn write_series_episodes(conn: &mut Connection, imp: &CatalogueImport, batch: &[ImportSeriesEpisodes]) -> Result<(u32, u32)> {
+    let _ = (conn, imp, batch);
+    todo!("P5-sources")
+}
+
+/// Apply `moves` inside the caller's transaction: every user-data row of `from` (favourites,
+/// overrides, progress, history; reminders and manual EPG mappings only channel → channel)
+/// is re-pointed to `to`, across kinds; where `to` already has a row the existing one wins.
+/// Moves whose `from` holds no user data are skipped cheaply. Returns the items moved.
+/// DESIGN §27.4.
+pub fn apply_key_moves(conn: &Connection, moves: &[KeyMove]) -> Result<u32> {
+    let _ = (conn, moves);
+    todo!("P5-sources")
 }
 
 /// Delete rows of `kind` not seen by this import, in chunks (one transaction each). Returns

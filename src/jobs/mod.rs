@@ -237,6 +237,10 @@ pub struct ProbeResult {
     pub estimate_channels: Option<u32>,
     pub suggested_name: Option<String>,
     pub epg_urls: Vec<String>,
+    /// `Some(draft kind)` when an M3U draft (URL or file) turned out to be an Xtream login and
+    /// that login works (DESIGN §27.3): `kind` is then `Xtream` and `xtream` holds the login.
+    /// Onboarding offers "Keep as M3U" only then.
+    pub upgraded_from: Option<SourceKind>,
 }
 
 #[derive(Debug, Clone)]
@@ -244,11 +248,14 @@ pub enum JobOutcome {
     Nothing,
     /// `account` = fresh Xtream account info (the app forwards `max_connections` to the
     /// player budget with `PlayerCommand::SetConnectionLimit`).
+    /// `upgraded` = this refresh switched the M3U source to its Xtream login (DESIGN §27.3;
+    /// the app shows a toast).
     SourceRefreshed {
         source: SourceId,
         summary: ImportSummary,
         not_modified: bool,
         account: Option<AccountInfo>,
+        upgraded: bool,
     },
     EpgRefreshed {
         epg_source: EpgSourceId,
@@ -788,7 +795,7 @@ async fn execute(ctx: &JobContext, kind: &JobKind, progress: &Progress, cancel: 
             let r = import_source::refresh_source(ctx, *source, *force, progress, cancel).await?;
             let source = *source;
             let account = read(ctx, move |c| Ok(crate::store::sources::get_source(c, source)?.status.account)).await?;
-            Ok(JobOutcome::SourceRefreshed { source, summary: r.summary, not_modified: r.not_modified, account })
+            Ok(JobOutcome::SourceRefreshed { source, summary: r.summary, not_modified: r.not_modified, account, upgraded: r.upgraded })
         }
         JobKind::RefreshEpg { epg_source, force } => {
             let r = import_epg::refresh_epg(ctx, *epg_source, *force, progress, cancel).await?;
