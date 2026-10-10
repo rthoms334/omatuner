@@ -502,7 +502,7 @@ impl PlayerScreen {
             Ok(Some(e)) => {
                 self.next_episode = Some(NextEpisode {
                     id: e.id,
-                    label: format!("S{:02}E{:02} · {}", e.season, e.episode, e.title),
+                    label: format!("S{:02}E{:02} · {}", e.season, e.episode, crate::ui::widgets::rows::episode_title(&e)),
                     at: Instant::now() + NEXT_EPISODE_DELAY,
                 })
             }

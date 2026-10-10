@@ -1,6 +1,7 @@
-//! Onboarding wizard (DESIGN §13.10): one centred card, steps: Welcome (Add playlist /
-//! Restore backup) → Type (Xtream / M3U URL / M3U file — pasted get.php URLs auto-detected) →
-//! Details (name, icon, colour, credentials) → Test (ProbeSource: account info, warnings) →
+//! Onboarding wizard (DESIGN §13.10, §27): one centred card, steps: Welcome (Add playlist /
+//! Restore backup) → Type (Xtream / M3U URL / M3U file / Try free channels) → Details (name,
+//! icon, colour, credentials) or Presets (free channels) → Test (ProbeSource: account info,
+//! warnings; an M3U that is an Xtream account offers Continue with the login / Keep as M3U) →
 //! Guide (only for M3U without `url-tvg`: XMLTV URL/file or Skip) → Import progress
 //! (AddSource job phases) → Done. Details (DESIGN §13.10): "Open Live TV" is enabled as soon as
 //! the channels phase finishes; Test failures route back to the offending field (auth) or offer
@@ -26,6 +27,13 @@
 //! * **Text fields** follow the dialogs' pattern: Enter is acted on after the fields were drawn
 //!   (a character typed in the same frame is not lost); Tab/Shift+Tab move between fields,
 //!   Esc leaves a field, Esc again goes back a step.
+//! * **Free channels** (DESIGN §27.8): the presets and their "Added" state (a source with the
+//!   same URL exists) are read off the UI thread; nothing is downloaded before a pick, which
+//!   probes the playlist like a typed M3U URL.
+//! * **Xtream upgrade** (DESIGN §27.3): the probe decides. Continue adds the Xtream login and
+//!   keeps the playlist URL / file (what "Keep as M3U" in the source's settings goes back to);
+//!   Keep as M3U probes the playlist again as M3U (`keep_m3u`), so the Guide step rules for M3U
+//!   apply to what it really carries.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -40,6 +48,7 @@ use crate::model::{
 };
 use crate::msg::{AppEvent, DataScope};
 use crate::platform::{PickPurpose, PlatformEvent};
+use crate::sources::presets::{self, Preset};
 use crate::store::Ticket;
 use crate::theme::{SpaceToken, Theme, TypeToken};
 use crate::ui::widgets::button::{ButtonStyle, button};
@@ -70,6 +79,8 @@ pub(crate) enum Step {
     #[default]
     Welcome,
     Type,
+    /// Free-channel presets (DESIGN §27.8).
+    Presets,
     Details,
     Test,
     Guide,
@@ -85,7 +96,6 @@ pub(crate) enum Field {
     Icon,
     Color,
     Url,
-    UseXtream,
     Server,
     Username,
     Password,
@@ -223,6 +233,10 @@ pub(crate) struct Form {
     pub server: String,
     pub username: String,
     pub password: String,
+    /// "Keep as M3U": never switch this playlist to the Xtream login it carries.
+    pub keep_m3u: bool,
+    /// A restored upgraded source (Xtream with its playlist): the draft keeps the URL / file.
+    pub m3u_origin: bool,
 }
 
 impl Form {
@@ -234,27 +248,23 @@ impl Form {
         let mut v = vec![Field::Name, Field::Icon, Field::Color];
         match self.kind() {
             SourceKind::Xtream => v.extend([Field::Server, Field::Username, Field::Password]),
-            SourceKind::M3uUrl => {
-                v.push(Field::Url);
-                if crate::sources::m3u::detect_xtream_url(&self.url).is_some() {
-                    v.push(Field::UseXtream);
-                }
-            }
+            SourceKind::M3uUrl => v.push(Field::Url),
             SourceKind::M3uFile => v.extend([Field::Path, Field::ChooseFile]),
         }
         v.push(Field::Continue);
         v
     }
 
-    /// Switch an Xtream `get.php` URL to the Xtream login.
-    fn use_xtream(&mut self) -> bool {
-        let Some(c) = crate::sources::m3u::detect_xtream_url(&self.url) else { return false };
-        self.kind = Some(SourceKind::Xtream);
-        self.server = c.server;
-        self.username = c.username;
-        self.password = c.password.expose().clone();
-        self.icon = icon_for(SourceKind::Xtream);
-        true
+    /// The M3U URL form of a free-channel preset (name and URL set, default glyph/colour).
+    pub(crate) fn for_preset(p: &PresetRow) -> Self {
+        Self {
+            kind: Some(SourceKind::M3uUrl),
+            name: p.name.clone(),
+            name_edited: true,
+            icon: icon_for(SourceKind::M3uUrl),
+            url: p.url.clone(),
+            ..Default::default()
+        }
     }
 
     /// Validate and build the draft; `Err((field, message))` points at the problem.
@@ -268,11 +278,15 @@ impl Form {
             url: None,
             path: None,
             xtream: None,
-            settings: SourceSettings::default(),
+            settings: SourceSettings { keep_m3u: self.keep_m3u, ..Default::default() },
         };
         match kind {
             SourceKind::Xtream => {
-                let server = crate::sources::xtream::urls::normalize_server(&self.server)
+                // an upgraded playlist's server may sit behind a path prefix (DESIGN §27.2):
+                // normalizing would strip it
+                let kept = Some(self.server.trim().trim_end_matches('/')).filter(|s| self.m3u_origin && s.contains("://")).map(str::to_owned);
+                let server = kept
+                    .or_else(|| crate::sources::xtream::urls::normalize_server(&self.server))
                     .ok_or((Field::Server, "Enter the server address, e.g. panel.example.com:8080".to_owned()))?;
                 if self.username.trim().is_empty() {
                     return Err((Field::Username, "Enter your username".into()));
@@ -285,6 +299,10 @@ impl Form {
                     username: self.username.trim().to_owned(),
                     password: crate::redact::Secret::new(self.password.clone()),
                 });
+                if self.m3u_origin {
+                    d.url = Some(self.url.trim().to_owned()).filter(|u| !u.is_empty());
+                    d.path = Some(self.path.trim()).filter(|p| !p.is_empty()).map(PathBuf::from);
+                }
             }
             SourceKind::M3uUrl => {
                 let url = self.url.trim();
@@ -322,6 +340,40 @@ impl Form {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "My playlist".into())
     }
+}
+
+/// A free-channel playlist of the Presets step (DESIGN §27.8).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PresetRow {
+    pub name: String,
+    pub url: String,
+    pub description: &'static str,
+    /// A playlist with this URL is already a source: shown as "Added", not selectable.
+    pub added: bool,
+}
+
+/// The presets with their "Added" state against the URLs of the existing sources.
+pub(crate) fn preset_rows(list: &[Preset], existing: &HashSet<String>) -> Vec<PresetRow> {
+    list.iter()
+        .map(|p| {
+            let url = p.url();
+            PresetRow { name: p.source_name(), added: existing.contains(&url), url, description: p.description() }
+        })
+        .collect()
+}
+
+/// Off the UI thread: the user's country and its name (two small tz-database reads, once per
+/// process) and the URLs of the existing sources.
+/// Unreadable sources only lose the "Added" state: the step never comes up empty.
+fn load_presets(c: &rusqlite::Connection) -> crate::error::Result<Vec<PresetRow>> {
+    let existing: HashSet<String> = match crate::store::sources::list_sources(c) {
+        Ok(list) => list.into_iter().filter_map(|s| s.url.map(|u| u.expose().trim().to_owned())).collect(),
+        Err(e) => {
+            tracing::warn!("free playlists: reading the sources: {e}");
+            HashSet::new()
+        }
+    };
+    Ok(preset_rows(&presets::presets(presets::detect_country().as_deref()), &existing))
 }
 
 fn icon_for(kind: SourceKind) -> usize {
@@ -377,6 +429,13 @@ pub struct OnboardingScreen {
     guides_loader: Option<Loader<super::settings::GuideList>>,
     /// Done offers "TV guide settings" (no guide, or it covers under half the channels).
     guide_action: bool,
+    /// Presets step rows (read when the step opens).
+    presets: Vec<PresetRow>,
+    presets_loader: Option<Loader<Vec<PresetRow>>>,
+    /// The draft came from a preset: Back from Test (or from Details after a failed probe)
+    /// returns to the presets, on `preset_idx`.
+    from_preset: bool,
+    preset_idx: usize,
 }
 
 impl OnboardingScreen {
@@ -384,7 +443,8 @@ impl OnboardingScreen {
     fn rows(&self) -> usize {
         match self.step {
             Step::Welcome => 2,
-            Step::Type => 3,
+            Step::Type => 4,
+            Step::Presets => self.presets.len(),
             Step::Details => self.form.fields().len(),
             Step::Guide => self.guide_fields().len(),
             Step::Test => self.test_buttons().len(),
@@ -402,8 +462,8 @@ impl OnboardingScreen {
     fn test_buttons(&self) -> Vec<&'static str> {
         if self.unreachable.is_some() {
             vec!["Retry", "Add anyway", "Back"]
-        } else if self.probe_result.is_some() {
-            vec!["Continue", "Back"]
+        } else if let Some(r) = &self.probe_result {
+            if r.upgraded_from.is_some() { vec!["Continue", "Keep as M3U", "Back"] } else { vec!["Continue", "Back"] }
         } else {
             vec!["Back"]
         }
@@ -436,6 +496,7 @@ impl OnboardingScreen {
             self.form.icon = icon_for(kind);
         }
         self.form.kind = Some(kind);
+        self.from_preset = false;
         self.error = None;
         self.go(Step::Details);
         // start at the first credential field (the name is optional)
@@ -464,6 +525,7 @@ impl OnboardingScreen {
         match self.start {
             OnboardingStart::Welcome => Step::Welcome,
             OnboardingStart::AddSource => Step::Type,
+            OnboardingStart::FreeChannels => Step::Presets,
             OnboardingStart::PlaylistFile(_) | OnboardingStart::NeedsCredentials(_) => Step::Details,
         }
     }
@@ -474,19 +536,24 @@ impl OnboardingScreen {
             s if s == first => return false,
             Step::Welcome => return false,
             Step::Type => Step::Welcome,
-            Step::Details => Step::Type,
+            Step::Test | Step::Details if self.from_preset => Step::Presets,
+            Step::Presets | Step::Details => Step::Type,
             Step::Test => Step::Details,
             Step::Guide => Step::Test,
             // a running import keeps running (and the button says so); leaving is the app's
             Step::Importing | Step::Done | Step::Restoring => return false,
         };
         if self.step == Step::Test {
-            // a late probe answer is ignored
+            // a late probe answer is ignored; the next test asks about the upgrade again
             self.probe = None;
             self.probe_result = None;
             self.unreachable = None;
+            self.form.keep_m3u = false;
         }
         self.go(prev);
+        if prev == Step::Presets {
+            self.focus = self.preset_idx.min(self.rows().saturating_sub(1));
+        }
         true
     }
 
@@ -521,12 +588,55 @@ impl OnboardingScreen {
         }
     }
 
+    /// Test ▸ Keep as M3U: probe the playlist again as M3U, never upgrading it.
+    fn keep_as_m3u(&mut self, ctx: &mut UiCtx<'_>) {
+        self.form.keep_m3u = true;
+        self.test(ctx);
+    }
+
+    /// Type ▸ Try free channels (or the FreeChannels start): the presets, re-read each time so
+    /// "Added" is current.
+    fn open_presets(&mut self, ctx: &mut UiCtx<'_>) {
+        self.go(Step::Presets);
+        self.presets_loader = Some(Loader::start(ctx, load_presets));
+    }
+
+    /// Presets ▸ a playlist: its M3U URL draft, probed right away (there is nothing to type).
+    fn pick_preset(&mut self, ctx: &mut UiCtx<'_>, i: usize) {
+        let Some(p) = self.presets.get(i) else { return };
+        if p.added {
+            ctx.toast(crate::msg::Toast::info(format!("{} is already one of your playlists", p.name)));
+            return;
+        }
+        self.form = Form::for_preset(p);
+        self.from_preset = true;
+        self.preset_idx = i;
+        self.error = None;
+        self.test(ctx);
+    }
+
+    /// The draft `AddSource` gets: the form's, or the Xtream login the probe found in the
+    /// playlist — keeping its URL / file, which switching back in Settings returns to.
+    pub(crate) fn import_draft(&self) -> Result<SourceDraft, (Field, String)> {
+        let mut draft = self.form.draft()?;
+        if let Some(r) = &self.probe_result
+            && r.kind == SourceKind::Xtream
+            && draft.kind != SourceKind::Xtream
+            && !self.form.keep_m3u
+            && let Some(x) = r.xtream.clone()
+        {
+            draft.kind = SourceKind::Xtream;
+            draft.xtream = Some(x);
+        }
+        Ok(draft)
+    }
+
     /// Submit `AddSource` exactly once per attempt (see module docs).
     fn start_import(&mut self, ctx: &mut UiCtx<'_>) {
         if self.import.job.is_some() {
             return;
         }
-        let mut draft = match self.form.draft() {
+        let draft = match self.import_draft() {
             Ok(d) => d,
             Err((f, msg)) => {
                 self.error = Some((f, msg));
@@ -535,16 +645,6 @@ impl OnboardingScreen {
                 return;
             }
         };
-        // a pasted get.php URL the probe upgraded to Xtream
-        if let Some(r) = &self.probe_result
-            && r.kind == SourceKind::Xtream
-            && draft.kind != SourceKind::Xtream
-            && let Some(x) = r.xtream.clone()
-        {
-            draft.kind = SourceKind::Xtream;
-            draft.xtream = Some(x);
-            draft.url = None;
-        }
         let had: HashSet<SourceId> = ctx.lib.live.channels.iter().map(|c| c.source_id).collect();
         self.import = Import { had_channels: had, guide_requested: self.import.guide_requested, ..Default::default() };
         self.import.job = Some(ctx.services.jobs.submit(JobKind::AddSource(draft)));
@@ -580,11 +680,15 @@ impl OnboardingScreen {
         ctx.navigate(NavRequest::Switch(Route::Live { group: None, channel: None }));
     }
 
-    fn reset_for_another(&mut self) {
+    fn reset_for_another(&mut self, ctx: &mut UiCtx<'_>) {
         let start = std::mem::take(&mut self.start);
         *self = Self::default();
         self.start = start;
-        self.go(Step::Type);
+        if self.first_step() == Step::Presets {
+            self.open_presets(ctx);
+        } else {
+            self.go(Step::Type);
+        }
     }
 
     /// Activate the focused row / button of the current step.
@@ -597,16 +701,15 @@ impl OnboardingScreen {
                     self.ask_file(ctx, PickPurpose::ImportBackup);
                 }
             }
-            Step::Type => self.choose_kind([SourceKind::Xtream, SourceKind::M3uUrl, SourceKind::M3uFile][self.focus.min(2)]),
+            Step::Type => match self.focus {
+                3 => self.open_presets(ctx),
+                i => self.choose_kind([SourceKind::Xtream, SourceKind::M3uUrl, SourceKind::M3uFile][i.min(2)]),
+            },
+            Step::Presets => self.pick_preset(ctx, self.focus),
             Step::Details => match self.current_field() {
                 Some(Field::Icon) => self.form.icon = (self.form.icon + 1) % glyphs::SOURCE_ICONS.len(),
                 Some(Field::Color) => self.form.color = (self.form.color + 1) % COLORS.len(),
                 Some(Field::ChooseFile) => self.ask_file(ctx, PickPurpose::OpenPlaylist),
-                Some(Field::UseXtream) => {
-                    if self.form.use_xtream() {
-                        self.focus_field(Field::Continue);
-                    }
-                }
                 Some(Field::Continue) => self.test(ctx),
                 Some(f) if f.is_text() => {
                     // Enter in a field: next field, the last one submits
@@ -625,6 +728,7 @@ impl OnboardingScreen {
             },
             Step::Test => match self.test_buttons().get(self.focus).copied() {
                 Some("Continue") | Some("Add anyway") => self.after_test(ctx),
+                Some("Keep as M3U") => self.keep_as_m3u(ctx),
                 Some("Retry") => {
                     self.unreachable = None;
                     self.test(ctx);
@@ -661,7 +765,7 @@ impl OnboardingScreen {
             }
             Step::Done => match self.focus {
                 0 => self.open_live(ctx),
-                1 => self.reset_for_another(),
+                1 => self.reset_for_another(ctx),
                 3 => ctx.navigate(NavRequest::Switch(Route::Settings(SettingsPage::Epg))),
                 _ => ctx.navigate(NavRequest::Switch(Route::Home)),
             },
@@ -677,11 +781,16 @@ impl OnboardingScreen {
         match self.step {
             Step::Welcome => ("Welcome to Tuner", "Add a playlist to start watching, or restore a backup."),
             Step::Type => ("Add a playlist", "How does your provider give you access?"),
+            Step::Presets => (
+                "Try free channels",
+                "Public playlists of free-to-air channels. Nothing is downloaded until you pick one; some channels may not play where you are.",
+            ),
             Step::Details => match self.form.kind() {
                 SourceKind::Xtream => ("Xtream login", "Server, username and password from your provider."),
-                SourceKind::M3uUrl => ("M3U playlist URL", "Paste the playlist link (a get.php link becomes an Xtream login)."),
+                SourceKind::M3uUrl => ("M3U playlist URL", "Paste the playlist link. Xtream playlists sign in with their login automatically."),
                 SourceKind::M3uFile => ("M3U playlist file", "Pick an .m3u or .m3u8 file on this computer."),
             },
+            Step::Test if self.probe_result.is_some() => ("Checking your playlist", "Here's what Tuner found."),
             Step::Test => ("Checking your playlist", "Talking to the provider…"),
             Step::Guide => ("TV guide", "This playlist has no guide. Add an XMLTV guide, or skip — you can add one later in Settings ▸ EPG."),
             Step::Importing => ("Importing", "Channels come first; movies, series and the guide continue in the background."),
@@ -712,6 +821,17 @@ impl OnboardingScreen {
                 None => ui_repaint(ctx),
             }
         }
+        match kit::poll(&mut self.presets_loader) {
+            Some(Ok(rows)) => {
+                // the cursor starts on the first playlist that isn't added yet
+                if self.step == Step::Presets && self.focus == 0 {
+                    self.focus = rows.iter().position(|r| !r.added).unwrap_or(0);
+                }
+                self.presets = rows;
+            }
+            Some(Err(e)) => kit::error_toast(ctx, "Couldn't list the free playlists", &e),
+            None => {}
+        }
         match kit::poll(&mut self.creds_loader) {
             Some(Ok(src)) => {
                 self.form.kind = Some(src.kind);
@@ -719,6 +839,8 @@ impl OnboardingScreen {
                 self.form.name_edited = true;
                 self.form.icon = glyphs::SOURCE_ICONS.iter().position(|g| *g == src.icon).unwrap_or_else(|| icon_for(src.kind));
                 self.form.color = COLORS.iter().position(|c| c.0 == src.color).unwrap_or(0);
+                self.form.m3u_origin = src.m3u_origin().is_some();
+                self.form.keep_m3u = src.settings.keep_m3u;
                 self.form.url = src.url.as_ref().map(|u| u.expose().clone()).unwrap_or_default();
                 self.form.path = src.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
                 if let Some(x) = &src.xtream {
@@ -763,6 +885,7 @@ impl Screen for OnboardingScreen {
         match start {
             OnboardingStart::Welcome => self.go(Step::Welcome),
             OnboardingStart::AddSource => self.go(Step::Type),
+            OnboardingStart::FreeChannels => self.open_presets(ctx),
             OnboardingStart::PlaylistFile(p) => {
                 self.form.path = p.display().to_string();
                 self.form.name = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -950,7 +1073,7 @@ impl Screen for OnboardingScreen {
                             theme,
                             self.focus,
                             &[
-                                (glyphs::ADD, "Add a playlist", "Xtream login, M3U URL or M3U file"),
+                                (glyphs::ADD, "Add a playlist", "Xtream login, M3U playlist or free channels"),
                                 (glyphs::BACKUP, "Restore a backup", "A Tuner backup file (.json)"),
                             ],
                         ),
@@ -960,10 +1083,12 @@ impl Screen for OnboardingScreen {
                             self.focus,
                             &[
                                 (glyphs::SOURCE_XTREAM, "Xtream login", "Server, username and password"),
-                                (glyphs::SOURCE_URL, "M3U URL", "A playlist link (get.php links become Xtream logins)"),
+                                (glyphs::SOURCE_URL, "M3U URL", "A playlist link (Xtream playlists sign in automatically)"),
                                 (glyphs::FOLDER, "M3U file", "An .m3u / .m3u8 file on this computer"),
+                                (glyphs::LIVE_TV, "Try free channels", "Free-to-air channels from iptv-org or Free-TV — no account"),
                             ],
                         ),
+                        Step::Presets => self.presets_ui(ui, ctx),
                         Step::Details => self.details_ui(ui, ctx),
                         Step::Test => self.test_ui(ui, ctx),
                         Step::Guide => self.guide_ui(ui, ctx),
@@ -1080,7 +1205,7 @@ impl OnboardingScreen {
         let theme = ctx.theme;
         let t = &theme.tokens;
         if self.creds_loader.is_some() {
-            busy_bar(ui, theme, 3.0);
+            busy_bar(ui, theme, (3.0 * theme.rem()).round());
             return None;
         }
         let fields = self.form.fields();
@@ -1158,23 +1283,6 @@ impl OnboardingScreen {
                     )
                     .0
                 }
-                Field::UseXtream => {
-                    ui.label(
-                        RichText::new("This is an Xtream link: the Xtream login also brings movies, series and account info.")
-                            .size(theme.font(TypeToken::BodySmall))
-                            .color(t.text_secondary),
-                    );
-                    let r = button(
-                        ui,
-                        theme,
-                        Some(glyphs::SOURCE_XTREAM),
-                        "Use the Xtream login instead",
-                        ButtonStyle { focused, bordered: true, ..Default::default() },
-                    )
-                    .clicked();
-                    ui.add_space(theme.space(SpaceToken::Md));
-                    r
-                }
                 Field::Path => {
                     field_row(ui, theme, "Playlist file", None, &mut self.form.path, "/home/you/playlist.m3u", false, focused, editing, e.as_deref())
                         .0
@@ -1226,18 +1334,27 @@ impl OnboardingScreen {
             );
             ui.add_space(theme.space(SpaceToken::Lg));
         } else if let Some(r) = &self.probe_result {
-            let kind = match r.kind {
-                SourceKind::Xtream => "Xtream login",
-                SourceKind::M3uUrl => "M3U playlist",
-                SourceKind::M3uFile => "M3U file",
-            };
-            ui.label(RichText::new(format!("{}  Looks good — {kind}", glyphs::CHECK)).size(theme.font(TypeToken::Title)).color(t.success));
-            if r.kind == SourceKind::Xtream && self.form.kind() != SourceKind::Xtream {
-                ui.label(
-                    RichText::new("This link is an Xtream login; it will be added as one (movies, series and account info included).")
+            if r.upgraded_from.is_some() {
+                // DESIGN §27.3: the playlist is an Xtream account; its login is used unless kept
+                ui.label(RichText::new(format!("{}  Xtream login found", glyphs::CHECK)).size(theme.font(TypeToken::Title)).color(t.success));
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(
+                            "This playlist comes with an Xtream login. Tuner signs in with it: movies, series, catch-up and account info \
+                             included. Keep as M3U uses only the playlist's own entries.",
+                        )
                         .size(theme.font(TypeToken::BodySmall))
                         .color(t.text_secondary),
+                    )
+                    .wrap(),
                 );
+            } else {
+                let kind = match r.kind {
+                    SourceKind::Xtream => "Xtream login",
+                    SourceKind::M3uUrl => "M3U playlist",
+                    SourceKind::M3uFile => "M3U file",
+                };
+                ui.label(RichText::new(format!("{}  Looks good — {kind}", glyphs::CHECK)).size(theme.font(TypeToken::Title)).color(t.success));
             }
             if let Some(e) = estimate_text(r) {
                 ui.label(RichText::new(e).size(theme.font(TypeToken::Body)).color(t.fg));
@@ -1253,6 +1370,27 @@ impl OnboardingScreen {
             ui.add_space(theme.space(SpaceToken::Lg));
         }
         button_row(ui, theme, &self.test_buttons(), self.focus)
+    }
+
+    /// Free-channel playlists; one already added reads "Added" and can't be picked.
+    fn presets_ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) -> Option<usize> {
+        let theme = ctx.theme;
+        if self.presets.is_empty() {
+            if self.presets_loader.is_some() {
+                busy_bar(ui, theme, (3.0 * theme.rem()).round());
+            }
+            return None;
+        }
+        let mut clicked = None;
+        for (i, p) in self.presets.iter().enumerate() {
+            let state = if i == self.focus { RowState::Cursor } else { RowState::Idle };
+            let (icon, detail) = if p.added { (glyphs::CHECK, "Added — already one of your playlists") } else { (glyphs::LIVE_TV, p.description) };
+            let r = ui.add_enabled_ui(!p.added, |ui| rows::menu_row(ui, theme, Some(icon), &p.name, Some(detail), !p.added, state)).inner;
+            if r.clicked() {
+                clicked = Some(i);
+            }
+        }
+        clicked
     }
 
     fn guide_ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) -> Option<usize> {
@@ -1567,21 +1705,79 @@ mod tests {
     }
 
     #[test]
-    fn get_php_urls_offer_the_xtream_login() {
-        let mut f = form(SourceKind::M3uUrl);
-        assert_eq!(f.draft().unwrap_err().0, Field::Url);
-        f.url = "http://panel.example:8080/get.php?username=u1&password=p1&type=m3u_plus".into();
-        assert!(f.fields().contains(&Field::UseXtream));
-        assert!(f.use_xtream());
-        assert_eq!(f.kind, Some(SourceKind::Xtream));
-        assert_eq!((f.username.as_str(), f.password.as_str()), ("u1", "p1"));
+    fn m3u_urls_get_a_scheme_and_files_a_name() {
         let mut plain = form(SourceKind::M3uUrl);
+        assert_eq!(plain.draft().unwrap_err().0, Field::Url);
         plain.url = "example.com/list.m3u".into();
-        assert!(!plain.fields().contains(&Field::UseXtream));
         assert_eq!(plain.draft().unwrap().url.as_deref(), Some("http://example.com/list.m3u"));
         let mut file = form(SourceKind::M3uFile);
         file.path = "/tmp/My List.m3u".into();
         assert_eq!(file.draft().unwrap().name, "My List");
+    }
+
+    /// DESIGN §27.3: the probe found the Xtream login of a playlist. Continue adds the login
+    /// and keeps the playlist URL (switching back needs it); Keep as M3U adds the playlist with
+    /// `keep_m3u`, whatever the probe answered.
+    #[test]
+    fn an_upgraded_playlist_keeps_its_url_or_stays_m3u() {
+        let url = "http://panel.example:8080/get.php?username=u1&password=p1&type=m3u_plus";
+        let mut s = OnboardingScreen { form: Form { url: url.into(), ..form(SourceKind::M3uUrl) }, ..Default::default() };
+        let login = XtreamCredentials {
+            server: "http://panel.example:8080".into(),
+            username: "u1".into(),
+            password: crate::redact::Secret::new("p1".into()),
+        };
+        s.probe_result = Some(ProbeResult {
+            kind: SourceKind::Xtream,
+            xtream: Some(login.clone()),
+            account: None,
+            estimate_channels: Some(3),
+            suggested_name: None,
+            epg_urls: vec![],
+            upgraded_from: Some(SourceKind::M3uUrl),
+        });
+        assert_eq!(s.test_buttons(), vec!["Continue", "Keep as M3U", "Back"]);
+        let d = s.import_draft().unwrap();
+        assert_eq!((d.kind, d.xtream.as_ref(), d.url.as_deref()), (SourceKind::Xtream, Some(&login), Some(url)));
+        assert!(!d.settings.keep_m3u);
+        s.form.keep_m3u = true;
+        let d = s.import_draft().unwrap();
+        assert_eq!((d.kind, d.xtream, d.url.as_deref()), (SourceKind::M3uUrl, None, Some(url)));
+        assert!(d.settings.keep_m3u);
+        // Back to the form asks again next time
+        s.go(Step::Test);
+        assert!(s.back());
+        assert!(!s.form.keep_m3u);
+    }
+
+    /// DESIGN §27.8: a preset becomes an M3U URL draft named after it; one whose URL is a
+    /// source already is "Added". The card opened from Settings ▸ "Add free channels" starts at
+    /// the presets, and Back from a preset's test (or from Details after a failed probe) returns
+    /// there, on the preset picked.
+    #[test]
+    fn presets_build_m3u_drafts_and_know_what_is_added() {
+        let list = presets::presets(Some("gb"));
+        let existing: HashSet<String> = [presets::FREE_TV.to_owned()].into();
+        let rows = preset_rows(&list, &existing);
+        assert_eq!(rows.iter().map(|r| r.added).collect::<Vec<_>>(), [false, false, true]);
+        for r in &rows {
+            let d = Form::for_preset(r).draft().unwrap();
+            assert_eq!((d.kind, d.url.as_deref(), d.name.as_str()), (SourceKind::M3uUrl, Some(r.url.as_str()), r.name.as_str()));
+            assert!(!d.settings.keep_m3u && d.xtream.is_none());
+        }
+        let mut s = OnboardingScreen { start: OnboardingStart::FreeChannels, presets: rows, ..Default::default() };
+        s.go(s.first_step());
+        assert_eq!((s.step, s.back_label()), (Step::Presets, Some("Cancel")));
+        assert!(!s.back(), "Back leaves the card");
+        s.form = Form::for_preset(&s.presets[1]);
+        (s.from_preset, s.preset_idx) = (true, 1);
+        s.go(Step::Test);
+        assert!(s.back());
+        assert_eq!((s.step, s.focus), (Step::Presets, 1));
+        // a failed probe shows the URL field; Back skips Type (not a step of this card)
+        s.go(Step::Details);
+        assert!(s.back());
+        assert_eq!((s.step, s.focus), (Step::Presets, 1));
     }
 
     #[test]

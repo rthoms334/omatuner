@@ -277,6 +277,19 @@ fn help_is_complete_for_every_context() {
     assert!(!help_rows(K::Search).iter().any(|r| r.1 == "Type to filter"));
 }
 
+/// Search's help lists only what the overlay does: no reorder, sort or remove there (they
+/// used to come with the shared item table and answer "not here").
+#[test]
+fn search_binds_only_the_item_shortcuts_it_acts_on() {
+    for ev in [alt(Key::ArrowUp), alt(Key::ArrowDown), ctrl(Key::S), key(Key::Delete)] {
+        assert_eq!(resolve(&[K::Search], &ev), None, "{ev:?}");
+    }
+    assert_eq!(resolve(&[K::Search], &ctrl(Key::G)), Some(Action::OpenInGuide));
+    assert_eq!(resolve(&[K::Search], &ctrl(Key::F)), Some(Action::ToggleFavourite));
+    let rows = help_rows(K::Search);
+    assert!(!rows.iter().any(|(_, h)| h.contains("reorder") || h.starts_with("Sort") || h.starts_with("Remove")), "{rows:?}");
+}
+
 #[test]
 fn labels_are_human() {
     assert_eq!(KeyChord::ctrl(Key::K).label(), "Ctrl+K");

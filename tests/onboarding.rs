@@ -204,7 +204,7 @@ fn unreachable_server_offers_retry_and_add_anyway() {
 }
 
 #[test]
-fn get_php_urls_are_offered_as_xtream_logins() {
+fn get_php_urls_sign_in_with_their_xtream_login_and_keep_the_playlist() {
     let (_rt, mock) = panel(MockOptions::default());
     let mut h = harness(OnboardingStart::Welcome);
     assert!(has(&h, "Welcome to Tuner") && has(&h, "Restore a backup"));
@@ -212,16 +212,19 @@ fn get_php_urls_are_offered_as_xtream_logins() {
     press(&mut h, Action::Down);
     press(&mut h, Action::Activate); // M3U URL
     assert!(has(&h, "M3U playlist URL"));
-    type_text(&mut h, &format!("{}/get.php?username=demo&password=pw-onb-4&type=m3u_plus&output=ts", mock.base));
-    h.run_steps(1);
-    assert!(has(&h, "Use the Xtream login instead"));
-    // Esc leaves the field; ↓ to the offer; Enter switches the form to the Xtream login
-    press(&mut h, Action::Back);
-    press(&mut h, Action::Down);
+    let url = format!("{}/get.php?username=demo&password=pw-onb-4&type=m3u_plus&output=ts", mock.base);
+    type_text(&mut h, &url);
+    // Enter in the URL field tests it: the probe finds the Xtream login (DESIGN §27.3)
     press(&mut h, Action::Activate);
-    assert!(has(&h, "Xtream login"));
-    press(&mut h, Action::Activate); // Continue → test
-    until(&mut h, "the probe", |h| has_containing(h, "Looks good — Xtream login"));
+    until(&mut h, "the probe", |h| has_containing(h, "Xtream login found"));
+    assert!(has(&h, "Keep as M3U"));
+    press(&mut h, Action::Activate); // Continue (focused)
+    until(&mut h, "the import to finish", |h| has(h, "All set"));
+    let sources = h.state().sources();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0].kind, SourceKind::Xtream);
+    assert_eq!(sources[0].url.as_ref().map(|u| u.expose().as_str()), Some(url.as_str()), "the playlist is kept for switching back");
+    assert_eq!(sources[0].m3u_origin(), Some(SourceKind::M3uUrl));
 }
 
 #[test]

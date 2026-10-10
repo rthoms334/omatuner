@@ -15,7 +15,7 @@
 //!   movies/series open their page; guide hits watch (airing), catch up (past, archive) or set
 //!   a reminder (future). Shift+Enter plays movies/series directly. Esc clears the query,
 //!   then closes.
-//! * Item shortcuts (`ITEM_ACTIONS`, listed in Help for `[Search]`) act on the highlighted
+//! * Item shortcuts (`SEARCH_ITEM_ACTIONS`, listed in Help for `[Search]`) act on the highlighted
 //!   hit: Ctrl+F favourite, Ctrl+Shift+F lists, Ctrl+G guide, Ctrl+I details / edit
 //!   information, Ctrl+E assign EPG, Ctrl+W watched, F2 rename, Ctrl+H hide, Ctrl+L lock.
 //!   Overlays opened from here (rename, lists, edit information) write by themselves; menus
@@ -447,10 +447,6 @@ impl Overlay for SearchOverlay {
             | Action::AssignEpg
             | Action::MarkWatched
             | Action::ContextMenu => self.item_action(ctx, action),
-            Action::MoveUp | Action::MoveDown | Action::SortMenu | Action::Remove => {
-                kit::not_here(ctx);
-                OverlayOutcome::Keep
-            }
             _ => OverlayOutcome::Ignored,
         }
     }

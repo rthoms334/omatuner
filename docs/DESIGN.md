@@ -2877,7 +2877,7 @@ layout, theme tokens only:
   `LC_ALL` / `LANG` (`en_GB.UTF-8` → GB; `C`/`POSIX` → none). Timezone first: many systems keep
   `en_US` wherever they are. Display name from `iso3166.tab` (`country_name`).
 * `presets::presets(country)` → [IptvOrgCountry(cc) if known, IptvOrgAll, FreeTv], each with
-  `url()`, `source_name()` ("iptv-org · Britain (UK)", "iptv-org · All countries", "Free-TV")
+  `url()`, `source_name()` ("iptv-org · United Kingdom", "iptv-org · All countries", "Free-TV")
   and `description()`.
 * Onboarding: Type step gains "Try free channels" → a Presets step (choice rows, `[Modal]`);
   picking one builds an M3U URL draft (name = `source_name()`, glyph/colour defaults) and

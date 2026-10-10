@@ -86,6 +86,8 @@ pub enum OnboardingStart {
     Welcome,
     /// Settings ▸ Playlists ▸ "+ Add": the Type step.
     AddSource,
+    /// Settings ▸ Playlists ▸ "Add free channels": the free-channel presets (DESIGN §27.8).
+    FreeChannels,
     /// A local playlist file (CLI argument, drag & drop): Details step, name prefilled.
     PlaylistFile(PathBuf),
     /// A restored source without password: Details step for that source.

@@ -1028,7 +1028,12 @@ impl VodBrowser {
                         )
                         .clicked();
                     }
-                    header_clicked = search_header(ui, theme, self.grid.filter.query(), &format!("{name} — type to filter"), None).clicked();
+                    // the sort key, like the hint line of a list would say it (Home's rails share
+                    // that hint line and have no sort, so it lives here)
+                    let sort_key =
+                        super::live::shortcut(KeyContext::PosterGrid, Action::SortMenu).map(|k| format!(" · {k} sort")).unwrap_or_default();
+                    header_clicked =
+                        search_header(ui, theme, self.grid.filter.query(), &format!("{name} — type to filter{sort_key}"), None).clicked();
                 });
             });
         });

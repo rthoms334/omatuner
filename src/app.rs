@@ -14,7 +14,8 @@
 //!   while hidden lives here (mpv events, reconnects, MPRIS, reminders run on other threads;
 //!   the player suspends video decoding when no frames are rendered).
 //! * `ui()`: dispatch the resolved actions (overlay → screen → globals; `Ignored` overlay
-//!   actions fall back to globals) → status bar / sidebar (or the Compact top glyph strip) /
+//!   actions fall back to globals) → dropped files (taken from the raw input by the hook) →
+//!   status bar / sidebar (or the Compact top glyph strip) /
 //!   content → mini-player → overlays → toasts → apply queued navigation and config edits.
 //! * `on_exit()`: remember the last screen, destroy the video surface (GL), then shut services
 //!   down (mpv last).
@@ -24,7 +25,7 @@
 //! [`TunerApp::back`]: close a stray overlay → leave window fullscreen (on any screen; the
 //! state follows the compositor's) → pop the route stack (leaving the player keeps the
 //! mini-player playing) → a parent for a lone sub-page (details → grid, Logs/EPG mapping →
-//! Settings, player → Live).
+//! Settings, player → Live, a playlist card → Home).
 //!
 //! Blocking work never runs here: log export goes to the blocking pool, the theme / fonts are
 //! (re)loaded on workers, the only I/O is indexed SQLite reads on the UI reader and the
@@ -69,6 +70,9 @@ struct OpenOverlay {
     opener: ScreenId,
     kind: std::mem::Discriminant<OverlayRequest>,
 }
+
+/// After a network failure toast, further network failures stay quiet this long.
+const NETWORK_TOAST_QUIET: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub struct TunerApp {
     // DROP ORDER MATTERS: `video` (render context) is declared before `services` (mpv) so an
@@ -118,6 +122,18 @@ pub struct TunerApp {
     epg_updated: Option<Timestamp>,
     /// A refresh failed with a network error; the next successful refresh clears it.
     offline: bool,
+    /// The last failure toasted per refresh target (`JobKind::dedupe_key`): a background
+    /// refresh failing the same way again stays quiet (the status bar says "Offline"); a
+    /// refresh the user started always reports. Cleared by the target's next success.
+    refresh_failures: std::collections::HashMap<String, String>,
+    /// Refreshes started by Ctrl+R / F5 (`JobKind::dedupe_key`): user-started for the failure
+    /// toast without forcing them (a forced refresh skips ETags and the upgrade back-off).
+    user_refreshes: std::collections::HashSet<String>,
+    /// When a network failure was last toasted: offline, one Ctrl+R fails every playlist and
+    /// guide at once, and one toast says so.
+    last_network_toast: Option<std::time::Instant>,
+    /// Files dropped on the window, handled after the frame's actions (DESIGN §13.10).
+    dropped: Vec<PathBuf>,
     #[cfg(test)]
     log: std::cell::RefCell<tests::Log>,
 }
@@ -188,6 +204,10 @@ impl TunerApp {
             layout: LayoutClass::Wide,
             epg_updated: None,
             offline: false,
+            refresh_failures: Default::default(),
+            user_refreshes: Default::default(),
+            last_network_toast: None,
+            dropped: Vec::new(),
             #[cfg(test)]
             log: Default::default(),
         };
@@ -305,6 +325,11 @@ impl TunerApp {
     }
 
     fn on_job_finished(&mut self, kind: &JobKind, outcome: &Result<JobOutcome, String>, failure: Option<FailureKind>) {
+        let key = kind.dedupe_key();
+        let started_by_key = self.user_refreshes.remove(&key);
+        if outcome.is_ok() {
+            self.refresh_failures.remove(&key);
+        }
         match outcome {
             Ok(JobOutcome::Library(lib)) => {
                 self.lib = lib.clone();
@@ -320,10 +345,20 @@ impl TunerApp {
                 self.refresh_epg_updated();
                 self.send_pending_zap();
             }
-            Ok(JobOutcome::SourceRefreshed { source, account, .. }) => {
+            Ok(JobOutcome::SourceRefreshed { source, account, upgraded, .. }) => {
                 self.offline = false;
                 if let Some(a) = account {
                     self.send_player(PlayerCommand::SetConnectionLimit { source: *source, max: a.max_connections });
+                }
+                // DESIGN §27.3: also after a silent (scheduled) refresh; named when it could be
+                // any of several playlists
+                if *upgraded {
+                    let text = if self.lib.sources.len() > 1 {
+                        format!("{}: upgraded to Xtream login — movies & series now available", self.source_name(*source))
+                    } else {
+                        "Upgraded to Xtream login — movies & series now available".to_owned()
+                    };
+                    self.toast(Toast::info(text));
                 }
             }
             // AddSource ran the first import inline (no `SourceRefreshed`): its stored account
@@ -347,7 +382,10 @@ impl TunerApp {
                 // builds, details and maintenance only log (WP-06 logs every failure).
                 let what = match kind {
                     JobKind::RefreshSource { source, .. } => self.source_name(*source),
-                    JobKind::RefreshEpg { .. } => "the guide".to_owned(),
+                    JobKind::RefreshEpg { epg_source, .. } => match crate::store::sources::get_epg_source(&self.db, *epg_source) {
+                        Ok(g) => format!("the guide {}", g.name),
+                        Err(_) => "the guide".to_owned(),
+                    },
                     JobKind::RefreshStale => "your playlists".to_owned(),
                     _ => return,
                 };
@@ -356,7 +394,17 @@ impl TunerApp {
                 }
                 // unreachable server; an HTTP error status means the network works
                 self.offline = failure == Some(FailureKind::Network);
-                self.toast(Toast::error(format!("Couldn't refresh {what}: {}", crate::redact::redact(msg))));
+                let user = started_by_key || matches!(kind, JobKind::RefreshSource { force: true, .. } | JobKind::RefreshEpg { force: true, .. });
+                let repeated = self.refresh_failures.insert(key, msg.clone()).is_some_and(|last| last == *msg);
+                // one network failure toast per burst, user-started or not
+                let network = failure == Some(FailureKind::Network);
+                let burst = network && self.last_network_toast.is_some_and(|t| t.elapsed() < NETWORK_TOAST_QUIET);
+                if (user || !repeated) && !burst {
+                    if network {
+                        self.last_network_toast = Some(std::time::Instant::now());
+                    }
+                    self.toast(Toast::error(format!("Couldn't refresh {what}: {}", crate::redact::redact(msg))));
+                }
             }
         }
     }
@@ -580,10 +628,84 @@ impl TunerApp {
             Action::OpenPlayer if self.snapshot.state != PlayerState::Idle => self.nav.push(NavRequest::Push(Route::Player)),
             Action::GlobalPlayPause => self.send_player(PlayerCommand::TogglePause),
             Action::StopPlayback => self.send_player(PlayerCommand::Stop),
-            Action::RefreshSource => self.submit_job(JobKind::RefreshStale),
+            Action::RefreshSource => self.refresh_everything(),
             Action::Back => self.back(egui_ctx),
             _ => {}
         }
+    }
+
+    /// Files dropped on the window (DESIGN §13.10): the first playlist opens the onboarding
+    /// card at Details for it, XMLTV guides are added and imported in the background, anything
+    /// else says what can be dropped.
+    fn handle_dropped_files(&mut self) {
+        let mut playlist = false;
+        for path in std::mem::take(&mut self.dropped) {
+            if let Some(p) = path.to_str().and_then(playlist_file) {
+                if !std::mem::replace(&mut playlist, true) {
+                    self.nav.push(NavRequest::Push(Route::Onboarding(OnboardingStart::PlaylistFile(p))));
+                }
+            } else if let Some(name) = guide_name(&path) {
+                let kind = crate::model::EpgSourceKind::File { path };
+                // a tiny table on the UI reader, like `refresh_everything`
+                let known = crate::store::sources::list_epg_sources(&self.db).is_ok_and(|g| g.iter().any(|g| g.kind == kind));
+                if known {
+                    self.toast(Toast::info(format!("{name} is already in your guides")));
+                    continue;
+                }
+                let jobs = self.services().jobs.clone();
+                let toast = format!("Added the guide {name} — importing in the background");
+                let _ = self.services().store.writer().submit_notify(DataScope::Epg, move |c| {
+                    let id = crate::store::sources::insert_epg_source(c, &name, &kind, 0)?;
+                    jobs.submit(JobKind::RefreshEpg { epg_source: id, force: true });
+                    Ok(())
+                });
+                self.toast(Toast::info(toast));
+            } else {
+                self.toast(Toast::info("Drop an .m3u / .m3u8 playlist or an XMLTV guide (.xml, .xml.gz, .xml.xz)"));
+            }
+        }
+    }
+
+    /// Ctrl+R / F5: refresh every enabled playlist and guide now, stale or not (`RefreshStale`
+    /// stays the scheduler's and `--refresh`'s). Not forced: ETags still apply and a failed
+    /// Xtream upgrade keeps its 7-day back-off (DESIGN §27.3); the jobs count as user-started
+    /// for the failure toast. Two tiny tables read on the UI reader, like `refresh_image_agents`.
+    fn refresh_everything(&mut self) {
+        let read = crate::store::sources::list_sources(&self.db).and_then(|s| Ok((s, crate::store::sources::list_epg_sources(&self.db)?)));
+        let (sources, guides) = match read {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("refresh: {e}");
+                self.submit_job(JobKind::RefreshStale);
+                return;
+            }
+        };
+        let sources: Vec<SourceId> = sources.iter().filter(|s| s.enabled).map(|s| s.id).collect();
+        // a provider guide follows its playlist
+        let guides: Vec<crate::model::EpgSourceId> = guides
+            .iter()
+            .filter(|g| g.enabled && !matches!(g.kind, crate::model::EpgSourceKind::Provider { source_id, .. } if !sources.contains(&source_id)))
+            .map(|g| g.id)
+            .collect();
+        if sources.is_empty() && guides.is_empty() {
+            self.toast(Toast::info("No playlists to refresh"));
+            return;
+        }
+        let jobs = sources
+            .iter()
+            .map(|&source| JobKind::RefreshSource { source, force: false })
+            .chain(guides.iter().map(|&epg_source| JobKind::RefreshEpg { epg_source, force: false }));
+        for job in jobs {
+            self.user_refreshes.insert(job.dedupe_key());
+            self.submit_job(job);
+        }
+        let plural = |n: usize, one: &str| if n == 1 { format!("1 {one}") } else { format!("{n} {one}s") };
+        let what = match (sources.len(), guides.len()) {
+            (s, 0) => plural(s, "playlist"),
+            (0, g) => plural(g, "guide"),
+            (s, g) => format!("{} and {}", plural(s, "playlist"), plural(g, "guide")),
+        };
+        self.toast(Toast::info(format!("Refreshing {what}")));
     }
 
     fn set_window_fullscreen(&mut self, on: bool, egui_ctx: &egui::Context) {
@@ -827,6 +949,7 @@ impl eframe::App for TunerApp {
         });
         self.drop_alt_text = drop_text;
         self.pending_actions.extend(resolved);
+        self.dropped.extend(raw.dropped_files.drain(..).map(|f| f.path().to_path_buf()));
     }
 
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
@@ -865,6 +988,7 @@ impl eframe::App for TunerApp {
         self.video.begin_frame();
         self.images.pump();
         self.dispatch_actions(&egui_ctx);
+        self.handle_dropped_files();
         self.apply_nav();
 
         let theme = self.theme.clone();
@@ -1014,6 +1138,9 @@ fn parent_route(route: &Route) -> Option<Route> {
         ScreenId::MovieDetail => Some(Route::Movies { group: None }),
         ScreenId::SeriesDetail => Some(Route::Series { group: None }),
         ScreenId::Logs | ScreenId::EpgMapping => Some(Route::Settings(Default::default())),
+        // a playlist card opened alone (`tuner file.m3u`): Cancel / Esc leave it; first-run
+        // Welcome has nowhere to go
+        ScreenId::Onboarding if *route != Route::Onboarding(OnboardingStart::Welcome) => Some(Route::Home),
         _ => None,
     }
 }
@@ -1061,6 +1188,14 @@ fn playlist_file(input: &str) -> Option<PathBuf> {
     };
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     matches!(ext.as_str(), "m3u" | "m3u8").then_some(path)
+}
+
+/// The guide name of an XMLTV file (`.xml`, `.xml.gz`, `.xml.xz`): its name without them.
+fn guide_name(path: &std::path::Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let lower = name.to_ascii_lowercase(); // same byte offsets as `name`
+    let ext = [".xml", ".xml.gz", ".xml.xz"].into_iter().find(|ext| lower.ends_with(ext))?;
+    Some(Some(&name[..name.len() - ext.len()]).filter(|s| !s.is_empty()).unwrap_or("Guide").to_owned())
 }
 
 /// `--play <source-id>:<item-key>` for a channel (`2:xt:live:1234`, `1:m3u:0123abcd…`);
@@ -1514,7 +1649,41 @@ mod tests {
         rig.press(Key::ArrowDown, NONE);
         rig.press(Key::F5, NONE); // screen declines → global RefreshSource
         assert_eq!(probe.borrow().actions, [Action::Down, Action::RefreshSource]);
-        assert_eq!(rig.log().jobs.last(), Some(&JobKind::RefreshStale));
+        assert_eq!(rig.log().toasts.last().map(|t| t.text.as_str()), Some("No playlists to refresh"));
+    }
+
+    /// Ctrl+R / F5 refresh every enabled playlist and guide, stale or not (it used to submit
+    /// `RefreshStale`, which skips anything refreshed recently), unforced (ETags and the upgrade
+    /// back-off apply) yet user-started for the failure toast.
+    #[test]
+    fn refresh_key_refreshes_every_enabled_playlist_and_guide() {
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| {
+            seed_channels(c, 1, None)?;
+            c.execute("INSERT INTO source(name, kind, url, created_at, enabled) VALUES ('Off', 'm3u-url', 'http://127.0.0.1/off.m3u', 0, 0)", [])?;
+            c.execute("INSERT INTO epg_source(name, kind, url, last_refresh) VALUES ('G', 'url', 'http://127.0.0.1/e.xml', 1)", [])?;
+            Ok(())
+        });
+        rig.app.log.borrow_mut().jobs.clear();
+        rig.press(Key::R, CTRL);
+        let jobs = rig.log().jobs.clone();
+        assert_eq!(
+            jobs,
+            [
+                JobKind::RefreshSource { source: SourceId(1), force: false },
+                JobKind::RefreshEpg { epg_source: crate::model::EpgSourceId(1), force: false }
+            ]
+        );
+        assert_eq!(rig.log().toasts.last().unwrap().text, "Refreshing 1 playlist and 1 guide");
+        // the same failure as last time still reports: the user asked
+        let kind = JobKind::RefreshEpg { epg_source: crate::model::EpgSourceId(1), force: false };
+        let msg = crate::error::Error::Http { status: 404, url: "http://h/e.xml".into() }.to_string();
+        rig.app.refresh_failures.insert(kind.dedupe_key(), msg.clone());
+        let failed = || AppEvent::Job(JobEvent::Finished { id: JobId(5), kind: kind.clone(), outcome: Err(msg.clone()), failure: None });
+        rig.event(failed());
+        assert!(rig.log().toasts.last().unwrap().text.starts_with("Couldn't refresh the guide G:"));
+        let n = rig.log().toasts.len();
+        rig.event(failed());
+        assert_eq!(rig.log().toasts.len(), n, "only the refresh the key started");
     }
 
     #[test]
@@ -1626,6 +1795,55 @@ mod tests {
         rig.app.routes.push(Route::MovieDetail(crate::model::MovieId(1)));
         rig.press(Key::ArrowLeft, ALT);
         assert_eq!(rig.app.routes, [Route::Live { group: None, channel: None }]);
+        // a playlist card opened alone (`tuner list.m3u`) can be left; first-run Welcome can't
+        rig.app.routes = vec![Route::Onboarding(OnboardingStart::PlaylistFile("/tmp/list.m3u".into()))];
+        rig.frame_with(vec![]);
+        rig.press(Key::Escape, NONE);
+        assert_eq!(rig.app.routes, [Route::Home]);
+        rig.app.routes = vec![Route::Onboarding(OnboardingStart::Welcome)];
+        rig.frame_with(vec![]);
+        rig.press(Key::Escape, NONE);
+        assert_eq!(rig.app.routes, [Route::Onboarding(OnboardingStart::Welcome)]);
+    }
+
+    /// Dropping files on the window (DESIGN §13.10): a playlist opens the card at Details for
+    /// it (over the current screen, so Cancel returns), a guide is added and imported.
+    #[test]
+    fn dropped_playlists_open_the_card_and_guides_are_added() {
+        #[derive(Debug)]
+        struct Dropped(PathBuf);
+        impl egui::DroppedFile for Dropped {
+            fn path(&self) -> &std::path::Path {
+                &self.0
+            }
+            fn bytes(&self) -> Result<Vec<u8>, String> {
+                Err("not read".into())
+            }
+        }
+        let mut rig = Rig::new();
+        let drop = |path: &str| egui::RawInput { dropped_files: vec![Arc::new(Dropped(path.into()))], ..Default::default() };
+        let mut raw = drop("/tmp/My List.M3U");
+        rig.app.raw_input_hook(&rig.ctx.clone(), &mut raw);
+        rig.frame_with(vec![]);
+        assert_eq!(
+            rig.app.routes,
+            [Route::Live { group: None, channel: None }, Route::Onboarding(OnboardingStart::PlaylistFile("/tmp/My List.M3U".into()))]
+        );
+        let mut raw = drop("/tmp/epg/uk.xml.gz");
+        rig.app.raw_input_hook(&rig.ctx.clone(), &mut raw);
+        rig.frame_with(vec![]);
+        assert_eq!(rig.log().toasts.last().unwrap().text, "Added the guide uk — importing in the background");
+        rig.until("the guide row", |r| {
+            crate::store::sources::list_epg_sources(&r.app.db)
+                .unwrap()
+                .iter()
+                .any(|e| e.name == "uk" && e.kind == crate::model::EpgSourceKind::File { path: "/tmp/epg/uk.xml.gz".into() })
+        });
+        // dropped again: not a second copy
+        let mut raw = drop("/tmp/epg/uk.xml.gz");
+        rig.app.raw_input_hook(&rig.ctx.clone(), &mut raw);
+        rig.frame_with(vec![]);
+        assert_eq!(rig.log().toasts.last().unwrap().text, "uk is already in your guides");
     }
 
     // ---- data scopes, jobs, events -----------------------------------------------------------
@@ -1809,19 +2027,47 @@ mod tests {
         rig.event(failed(source(), crate::error::Error::parse(Some(3), "network error in the playlist text")));
         assert!(!rig.app.offline);
         rig.event(failed(source(), crate::error::Error::Network("timeout".into())));
-        rig.event(AppEvent::Job(JobEvent::Finished {
-            id: JobId(6),
-            kind: source(),
-            outcome: Ok(JobOutcome::SourceRefreshed {
-                source: SourceId(1),
-                summary: Default::default(),
-                not_modified: true,
-                account: None,
-                upgraded: false,
-            }),
-            failure: None,
-        }));
+        let refreshed = |upgraded: bool| {
+            AppEvent::Job(JobEvent::Finished {
+                id: JobId(6),
+                kind: source(),
+                outcome: Ok(JobOutcome::SourceRefreshed {
+                    source: SourceId(1),
+                    summary: Default::default(),
+                    not_modified: !upgraded,
+                    account: None,
+                    upgraded,
+                }),
+                failure: None,
+            })
+        };
+        rig.event(refreshed(false));
         assert!(!rig.app.offline);
+        // offline in the background: the same failure again stays quiet (the status bar says
+        // "Offline"); a new error, or a refresh the user started, still reports
+        let toasts = |rig: &Rig| rig.log().toasts.len();
+        let quiet_window_passed = |rig: &mut Rig| rig.app.last_network_toast = None;
+        quiet_window_passed(&mut rig);
+        rig.event(failed(source(), crate::error::Error::Network("timeout".into())));
+        let n = toasts(&rig);
+        quiet_window_passed(&mut rig);
+        rig.event(failed(source(), crate::error::Error::Network("timeout".into())));
+        assert_eq!(toasts(&rig), n, "a repeated background failure is not toasted again");
+        rig.event(failed(JobKind::RefreshSource { source: SourceId(1), force: true }, crate::error::Error::Network("timeout".into())));
+        assert_eq!(toasts(&rig), n + 1, "a refresh the user started always reports");
+        // offline, a refresh of everything fails every target at once: one toast
+        rig.event(failed(
+            JobKind::RefreshEpg { epg_source: crate::model::EpgSourceId(1), force: true },
+            crate::error::Error::Network("timeout".into()),
+        ));
+        assert_eq!(toasts(&rig), n + 1, "network failures right after one are not toasted");
+        rig.event(failed(source(), crate::error::Error::Http { status: 503, url: "http://h/p.m3u".into() }));
+        assert_eq!(toasts(&rig), n + 2, "a different error reports");
+        // a success forgets it; the upgrade says what changed (DESIGN §27.3)
+        rig.event(refreshed(true));
+        assert_eq!(rig.log().toasts.last().unwrap().text, "Upgraded to Xtream login — movies & series now available");
+        rig.event(failed(source(), crate::error::Error::Http { status: 503, url: "http://h/p.m3u".into() }));
+        assert_eq!(toasts(&rig), n + 4, "the same error after a success reports again");
     }
 
     #[test]

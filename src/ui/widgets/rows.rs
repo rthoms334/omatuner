@@ -427,6 +427,11 @@ pub fn programme_row(
     resp
 }
 
+/// An episode's title; a playlist episode without one reads "Episode 2" (DESIGN §27.7).
+pub fn episode_title(e: &Episode) -> std::borrow::Cow<'_, str> {
+    if e.title.trim().is_empty() { format!("Episode {}", e.episode).into() } else { e.title.as_str().into() }
+}
+
 /// `E05  Title · 42 min` with watched check / progress bar; `playing` puts the accent 󰐊
 /// marker left of the title, like channel rows (DESIGN §13.0).
 pub fn episode_row(
@@ -439,7 +444,8 @@ pub fn episode_row(
     state: RowState,
 ) -> egui::Response {
     let t = &theme.tokens;
-    let (rect, resp) = allocate_row(ui, theme, row_height(theme, Density::Comfortable, false), state, &e.title);
+    let name = episode_title(e);
+    let (rect, resp) = allocate_row(ui, theme, row_height(theme, Density::Comfortable, false), state, &name);
     if !ui.is_rect_visible(rect) {
         return resp;
     }
@@ -479,8 +485,8 @@ pub fn episode_row(
         right = r.left() - theme.space(SpaceToken::Md);
     }
     let title = match e.duration_s {
-        Some(d) if d > 0 => format!("{} · {} min", e.title, (d + 30) / 60),
-        _ => e.title.clone(),
+        Some(d) if d > 0 => format!("{name} · {} min", (d + 30) / 60),
+        _ => name.into_owned(),
     };
     paint::text(painter, egui::pos2(left, y), Align2::LEFT_CENTER, title, paint::font(theme, TypeToken::Title), color, (right - left).max(0.0));
     if let Some(f) = progress.filter(|f| !watched && *f > 0.0 && *f < 1.0) {

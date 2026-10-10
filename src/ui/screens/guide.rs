@@ -3,7 +3,9 @@
 //! first non-empty favourites list, else the last-used group. Enter → programme popover; `r`
 //! toggles a reminder; digits jump to a channel number (`[NumericEntry, Guide]`); click on the
 //! channel column = watch; returning from the player focuses the channel just watched
-//! (UHF 1.96). Keeps the focused cell clear of `ctx.mini_rect`. Owner: WP-11.
+//! (UHF 1.96). Keeps the focused cell clear of `ctx.mini_rect`. The focused channel is
+//! managed as in Live (Ctrl+F / Ctrl+Shift+F / Ctrl+I / F2 / Ctrl+H / Ctrl+L, Shift+F10 menu).
+//! Owner: WP-11.
 //!
 //! "Last-used group": the collection picked in the guide this session; without one, the group
 //! of the channel playing (or All channels).
@@ -152,6 +154,7 @@ impl GuideScreen {
             None => {
                 let mut g = EpgGridState::new(rows, ctx.now);
                 g.clock_24h = ctx.config.interface.clock_24h;
+                g.show_numbers = ctx.config.interface.show_channel_numbers;
                 self.grid = Some(g);
             }
         }
@@ -239,6 +242,35 @@ impl GuideScreen {
         }
         self.choices = choices;
         ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: "Show in the guide…".into(), items }));
+    }
+
+    fn focused_channel(&self, ctx: &UiCtx<'_>) -> Option<crate::model::ChannelSummary> {
+        self.grid.as_ref().and_then(|g| g.focused()).and_then(|(id, _)| ctx.lib.live.get(id).cloned())
+    }
+
+    /// Shift+F10 / Ctrl+Enter: the focused channel's menu (Live's channel management); the
+    /// choice comes back as its action.
+    fn channel_menu(&mut self, ctx: &mut UiCtx<'_>) {
+        let Some(ch) = self.focused_channel(ctx) else { return };
+        let k = KeyContext::Guide;
+        let fav = ctx.favs.is_fav(&live::channel_ref(&ch));
+        let items = vec![
+            live::menu_item(glyphs::PLAY, "Watch", Action::GuideWatch, !ch.unsupported, k),
+            live::menu_item(
+                if fav { glyphs::FAVOURITE_OFF } else { glyphs::FAVOURITE },
+                if fav { "Remove from Favourites" } else { "Add to Favourites" },
+                Action::ToggleFavourite,
+                true,
+                k,
+            ),
+            live::menu_item(glyphs::FAV_LIST, "Favourites lists…", Action::AddToList, true, k),
+            live::menu_item(glyphs::INFO, "Edit information…", Action::ShowDetails, true, k),
+            live::menu_item(glyphs::TAG, "Rename", Action::Rename, true, k),
+            live::menu_item(glyphs::GUIDE, "Assign EPG channel…", Action::AssignEpg, true, k),
+            live::menu_item(glyphs::HIDDEN, "Hide", Action::ToggleHidden, true, k),
+            live::menu_item(glyphs::LOCK, if ch.locked { "Unlock" } else { "Lock with PIN" }, Action::ToggleLock, true, k),
+        ];
+        ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: ch.name.to_string(), items }));
     }
 
     fn set_collection(&mut self, ctx: &mut UiCtx<'_>, c: Collection) {
@@ -520,7 +552,7 @@ impl Screen for GuideScreen {
         if ctx.lib.built_at != 0 && ctx.lib.is_empty() {
             // "No playlists yet": Enter is the "Add playlist" button
             if action == Action::Activate {
-                ctx.navigate(crate::ui::NavRequest::Switch(Route::Onboarding(crate::ui::OnboardingStart::AddSource)));
+                ctx.push(Route::Onboarding(crate::ui::OnboardingStart::AddSource));
                 return true;
             }
             return false;
@@ -537,10 +569,15 @@ impl Screen for GuideScreen {
                 self.open_picker(ctx);
                 true
             }
-            Action::ToggleFavourite => {
-                if let Some(c) = self.grid.as_ref().and_then(|g| g.focused()).and_then(|(id, _)| ctx.lib.live.get(id).cloned()) {
-                    live::toggle_favourite(ctx, live::channel_ref(&c), &c.name);
+            // channel management, as in Live
+            Action::ToggleFavourite | Action::AddToList | Action::ShowDetails | Action::Rename | Action::ToggleHidden | Action::ToggleLock => {
+                if let Some(c) = self.focused_channel(ctx) {
+                    live::channel_item_action(ctx, &c, action);
                 }
+                true
+            }
+            Action::ContextMenu => {
+                self.channel_menu(ctx);
                 true
             }
             Action::AssignEpg => {
@@ -602,7 +639,7 @@ impl Screen for GuideScreen {
             if empty_state(ui, theme, glyphs::PLAYLIST, "No playlists yet", Some(live::EMPTY_LIBRARY_DETAIL), Some("Add playlist"))
                 .is_some_and(|r| r.clicked())
             {
-                ctx.navigate(crate::ui::NavRequest::Switch(Route::Onboarding(crate::ui::OnboardingStart::AddSource)));
+                ctx.push(Route::Onboarding(crate::ui::OnboardingStart::AddSource));
             }
             return;
         }
@@ -658,6 +695,7 @@ impl Screen for GuideScreen {
             g.avoid = ctx.mini_rect;
             g.no_guide_label = no_guide;
             g.clock_24h = ctx.config.interface.clock_24h;
+            g.show_numbers = ctx.config.interface.show_channel_numbers;
             // hovered programme: load its description for the tooltip (one indexed read)
             if let Some(id) = g.hovered.filter(|id| g.hover_detail.as_ref().is_none_or(|(h, _)| h != id)) {
                 let db = ctx.db;
@@ -690,11 +728,17 @@ impl Screen for GuideScreen {
 
     fn on_overlay_result(&mut self, ctx: &mut UiCtx<'_>, result: OverlayResult) {
         match result {
-            OverlayResult::Chosen(a) => {
-                if let Some(c) = choice_index(a).and_then(|i| self.choices.get(i).cloned()) {
-                    self.set_collection(ctx, c);
+            OverlayResult::Chosen(a) => match choice_index(a) {
+                Some(i) => {
+                    if let Some(c) = self.choices.get(i).cloned() {
+                        self.set_collection(ctx, c);
+                    }
                 }
-            }
+                // the channel menu
+                None => {
+                    self.on_action(ctx, a);
+                }
+            },
             OverlayResult::Unlocked(a) => {
                 self.on_action(ctx, a);
             }
