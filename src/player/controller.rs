@@ -23,7 +23,7 @@ use super::state::{Effect, Input, MachineConfig, PlayerMachine};
 use super::tracks::{AspectMode, parse_track_list, query_stream_info};
 use super::{PlayRequest, PlayerCommand, PlayerDeps, PlayerError, PlayerErrorKind, PlayerEvent, PlayerSnapshot, PlayerState, RenderClock};
 use crate::config::Config;
-use crate::model::{HistoryEntry, MediaRef, PlayOrigin, Playable, PlayableKind, SourceId, WatchProgress};
+use crate::model::{ChannelId, HistoryEntry, MediaRef, PlayOrigin, Playable, PlayableKind, SourceId, WatchProgress};
 use crate::msg::AppEvent;
 
 const PROGRESS_EVERY: Duration = Duration::from_secs(10);
@@ -326,8 +326,8 @@ impl Controller {
                     let _ = m.command("seek", &[&format!("{t}"), "absolute"]);
                 }
             }
-            PlayerCommand::Zap { forward } => {
-                if let Some(next) = self.zap_neighbour(forward) {
+            PlayerCommand::Zap { forward, unlocked } => {
+                if let Some(next) = self.zap_neighbour(forward, unlocked) {
                     let req = self.zap_request(MediaRef::Channel(next), false);
                     return self.resolve_and_play(req);
                 }
@@ -336,8 +336,14 @@ impl Controller {
                 let req = self.zap_request(MediaRef::Channel(id), false);
                 return self.resolve_and_play(req);
             }
-            PlayerCommand::LastChannel => {
+            PlayerCommand::LastChannel { unlocked } => {
                 if let Some(prev) = self.snap.previous_live.clone() {
+                    if let Some(ch) = channel_of(&prev.media)
+                        && self.locked_out(ch, unlocked)
+                    {
+                        tracing::debug!("last channel {ch:?} is locked; not recalled");
+                        return false;
+                    }
                     let req = self.zap_request(prev.media.clone(), true);
                     return self.resolve_and_play(req);
                 }
@@ -422,16 +428,23 @@ impl Controller {
         self.snap.aspect = a;
     }
 
-    /// Next/previous channel of the ZapList, skipping what the resolver says to skip.
-    fn zap_neighbour(&mut self, forward: bool) -> Option<crate::model::ChannelId> {
+    /// Parental gate of zapping and recall (DESIGN §20.3), authoritative for every sender: with
+    /// a PIN set and the sender's session locked, a PIN-locked channel is never tuned.
+    fn locked_out(&mut self, ch: ChannelId, unlocked: bool) -> bool {
+        let p = &self.applied.parental;
+        !unlocked && p.enabled && p.pin_hash.is_some() && self.deps.resolver.is_locked(ch)
+    }
+
+    /// Next/previous channel of the ZapList, skipping what the resolver says to skip and, while
+    /// the parental session is locked, locked channels.
+    fn zap_neighbour(&mut self, forward: bool, unlocked: bool) -> Option<ChannelId> {
         let ids = self.snap.zap.as_ref()?.channels.clone();
-        let cur = match self.snap.playable.as_ref().map(|p| &p.media) {
-            Some(MediaRef::Channel(c)) | Some(MediaRef::Catchup { channel: c, .. }) => *c,
-            _ => crate::model::ChannelId(i64::MIN),
-        };
-        let resolver = &mut self.deps.resolver;
-        let skip = std::cell::RefCell::new(|c| resolver.skip_on_zap(c));
-        crate::store::library::LiveIndex::neighbour(&ids, cur, forward, &|c| (skip.borrow_mut())(c))
+        let cur = self.snap.playable.as_ref().and_then(|p| channel_of(&p.media)).unwrap_or(ChannelId(i64::MIN));
+        let this = std::cell::RefCell::new(self);
+        crate::store::library::LiveIndex::neighbour(&ids, cur, forward, &|c| {
+            let mut this = this.borrow_mut();
+            this.deps.resolver.skip_on_zap(c) || this.locked_out(c, unlocked)
+        })
     }
 
     /// Hidden-window safety net (module docs of `player`).
@@ -677,6 +690,14 @@ enum LeaseOnEnd {
     /// The leased playlist expanded (redirect): the lease belongs to this inserted entry now
     /// (`None`: mpv didn't say which — the next START_FILE).
     MoveTo(Option<i64>),
+}
+
+/// The channel a live or catch-up media plays.
+fn channel_of(media: &MediaRef) -> Option<ChannelId> {
+    match media {
+        MediaRef::Channel(c) | MediaRef::Catchup { channel: c, .. } => Some(*c),
+        _ => None,
+    }
 }
 
 fn lease_on_end(lease_entry: Option<i64>, entry_id: i64, reason: EndReason, inserted: Option<i64>) -> LeaseOnEnd {

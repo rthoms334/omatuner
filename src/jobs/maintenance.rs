@@ -9,7 +9,9 @@
 //!   scheduler. History is already capped at 500 rows by `store::user::push_history`.
 //! * A backup export includes `config.toml` when it exists; a restore registers the restored
 //!   secrets with the redactor, emits `DataScope::All` and submits `RefreshSource` for every
-//!   enabled source (restored sources that need credentials are disabled by the store).
+//!   enabled source (restored sources that need credentials are disabled by the store). The
+//!   backup's settings come back in `RestoreReport::settings` (machine-specific ones and an
+//!   existing PIN kept, `Config::restored`); the app applies them like a Settings change.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -104,11 +106,20 @@ pub async fn export_backup(ctx: &JobContext, path: &Path, opts: BackupOptions) -
     blocking(move || crate::store::backup::write_file(&path, &backup)).await
 }
 
-/// Restore, then submit `RefreshSource` for every restored source.
+/// Restore, then submit `RefreshSource` for every restored source. The backup's settings are
+/// returned in the report for the app to apply (`RestoreReport::settings`).
 pub async fn import_backup(ctx: &JobContext, path: &Path, mode: RestoreMode) -> Result<RestoreReport> {
     let p = path.to_path_buf();
-    let backup = blocking(move || crate::store::backup::read_file(&p)).await?;
-    let report = write(ctx, move |c| crate::store::backup::restore(c, &backup, mode)).await?;
+    let mut backup = blocking(move || crate::store::backup::read_file(&p)).await?;
+    let raw_config = backup.config.take();
+    let mut report = write(ctx, move |c| crate::store::backup::restore(c, &backup, mode)).await?;
+    if let Some(raw) = raw_config {
+        // a broken config.toml in the backup doesn't fail the restore of the data
+        match crate::config::Config::restored(&raw, &crate::config::current(&ctx.config)) {
+            Ok(cfg) => report.settings = Some(Box::new(cfg)),
+            Err(e) => tracing::warn!("restore: settings not restored: {e}"),
+        }
+    }
     let sources = read(ctx, |c| {
         crate::store::sources::register_secrets(c)?;
         crate::store::sources::list_sources(c)

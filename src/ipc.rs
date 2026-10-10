@@ -2,11 +2,15 @@
 //!
 //! Protocol: one JSON line per connection (`IpcRequest`), server replies `{"ok":true}`
 //! (or `{"ok":false,"error":"…"}` for a malformed request).
-//! Startup: `try_handoff` connects; if a server answers, the request is delivered and the new
+//! Startup: [`handoff`] connects; if a server answers, the request is delivered and the new
 //! process exits 0. Otherwise (no socket / ECONNREFUSED → stale file removed) this process
-//! becomes the server. Requests arrive in the UI as `AppEvent::Ipc` and also trigger
-//! `hypr::focus_self` right away — the UI may not be running `logic` while the window sits on
-//! another workspace, so raising cannot wait for it.
+//! becomes the server — once it holds the instance lock (`run/tuner.lock`, taken by `main`
+//! before the store opens): the socket is only bound once the window is up, so a second quick
+//! launch finds the lock held and keeps retrying the handoff (removing nothing: the socket may
+//! be the starting instance's) instead of opening the database.
+//! Requests arrive in the UI as `AppEvent::Ipc` and also trigger `hypr::focus_self` right
+//! away — the UI may not be running `logic` while the window sits on another workspace, so
+//! raising cannot wait for it.
 //!
 //! Security: the socket is 0600 inside the 0700 runtime dir, and the server only accepts peers
 //! with the socket owner's uid (`SO_PEERCRED`). Requests are capped at 64 KiB and 5 s.
@@ -43,35 +47,44 @@ const MAX_REQUEST: u64 = 64 * 1024;
 /// Per-connection limit on the server; client read/write timeout.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Try to deliver `req` to a running instance. `Ok(true)` = delivered (caller exits).
-///
-/// `Ok(false)` = become the primary instance: no socket, a stale socket (connection refused;
-/// the file is removed), or a server that does not answer properly (logged — starting a
-/// second window beats starting nothing).
-pub fn try_handoff(socket: &Path, req: &IpcRequest) -> Result<bool> {
+/// Outcome of [`handoff`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Handoff {
+    /// A running instance took the request (the caller exits).
+    Delivered,
+    /// Nobody answered: no socket, a stale one (connection refused), or a server that did not
+    /// answer properly (logged).
+    NoServer,
+    /// A running instance answered and refused the request (its reason; e.g. over 64 KiB).
+    Rejected(String),
+}
+
+/// Try to deliver `req` to a running instance. `remove_stale`: a socket file that refuses the
+/// connection is removed. Only pass `true` while holding the instance lock (or without one) —
+/// otherwise the file may be one a starting instance has bound but not listened on yet.
+pub fn handoff(socket: &Path, req: &IpcRequest, remove_stale: bool) -> Result<Handoff> {
     let stream = match UnixStream::connect(socket) {
         Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Handoff::NoServer),
         Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-            remove_stale(socket);
-            return Ok(false);
+            if remove_stale {
+                self::remove_stale(socket);
+            }
+            return Ok(Handoff::NoServer);
         }
         Err(e) => {
             tracing::warn!("IPC: cannot reach {}: {e}", socket.display());
-            return Ok(false);
+            return Ok(Handoff::NoServer);
         }
     };
     let mut line = serde_json::to_string(req).map_err(Error::other)?;
     line.push('\n');
     match exchange(stream, &line) {
-        Ok(reply) if reply.ok => Ok(true),
-        Ok(reply) => {
-            tracing::warn!("IPC: running instance rejected the request: {}", reply.error.unwrap_or_default());
-            Ok(false)
-        }
+        Ok(reply) if reply.ok => Ok(Handoff::Delivered),
+        Ok(reply) => Ok(Handoff::Rejected(reply.error.unwrap_or_default())),
         Err(e) => {
             tracing::warn!("IPC: running instance did not answer: {e}");
-            Ok(false)
+            Ok(Handoff::NoServer)
         }
     }
 }

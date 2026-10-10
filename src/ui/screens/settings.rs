@@ -1857,6 +1857,10 @@ impl Screen for SettingsScreen {
                         if !r.needs_credentials.is_empty() {
                             s.push_str(&format!(" · needs credentials: {}", r.needs_credentials.join(", ")));
                         }
+                        // the app applies them (`TunerApp::on_job_finished`)
+                        if r.settings.is_some() {
+                            s.push_str(" · settings restored");
+                        }
                         (true, s)
                     }
                     Ok(_) => (true, "Done".into()),

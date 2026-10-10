@@ -458,3 +458,67 @@ fn read_file_validates_format_and_version() {
     b.version = 99;
     assert!(s.writer().blocking(move |c| backup::restore(c, &b, RestoreMode::Merge)).is_err());
 }
+
+/// Phase 5 (§27.10): a playlist upgraded to its Xtream login keeps its playlist URL / file and
+/// `keep_m3u` through a backup, and a Merge restore pairs it with the local source even when
+/// one side has switched kinds since (upgraded after the backup, or switched back).
+#[test]
+fn upgraded_sources_survive_a_backup_and_merge_across_the_switch() {
+    let pass = "xtpw-upgraded-62r";
+    let s = store("tuner-sb-upgraded");
+    let draft = |name: &str, kind, url: Option<String>, path: Option<&str>, keep_m3u| SourceDraft {
+        name: name.into(),
+        kind,
+        icon: "a".into(),
+        color: SourceColor::Blue,
+        url,
+        path: path.map(Into::into),
+        xtream: (kind == SourceKind::Xtream).then(|| XtreamCredentials {
+            server: "http://panel.test/sub".into(),
+            username: "viewer".into(),
+            password: Secret::new(pass.into()),
+        }),
+        settings: SourceSettings { keep_m3u, ..Default::default() },
+    };
+    let get_php = format!("http://panel.test/sub/get.php?username=viewer&password={pass}&type=m3u_plus");
+    let (upgraded, kept) = (
+        draft("Provider", SourceKind::Xtream, Some(get_php.clone()), None, false),
+        draft("Provider file", SourceKind::M3uFile, None, Some("/media/lists/provider.m3u"), true),
+    );
+    w(&s, move |c| {
+        sources::insert_source(c, &upgraded, NOW)?;
+        sources::insert_source(c, &kept, NOW)
+    });
+    let full = w(&s, |c| backup::export(c, FULL, None, NOW));
+    assert_eq!(full.sources[0].url.as_deref(), Some(get_php.as_str()), "the playlist URL of an upgraded source is exported");
+    assert!(full.sources[1].settings.keep_m3u);
+    let stripped = w(&s, |c| backup::export(c, BackupOptions::default(), None, NOW));
+
+    // restored elsewhere: same kinds, playlist URL / file and keep_m3u
+    let fresh = store("tuner-sb-upgraded-fresh");
+    let b = full.clone();
+    w(&fresh, move |c| backup::restore(c, &b, RestoreMode::Replace));
+    let restored = sources::list_sources(&fresh.reader().unwrap()).unwrap();
+    assert_eq!(restored[0].kind, SourceKind::Xtream);
+    assert_eq!(restored[0].m3u_origin(), Some(SourceKind::M3uUrl));
+    assert_eq!(restored[0].url.as_ref().unwrap().expose(), &get_php);
+    assert_eq!(restored[1].path.as_deref(), Some(std::path::Path::new("/media/lists/provider.m3u")));
+    assert!(restored[1].settings.keep_m3u);
+
+    // merged into the original profile: both pair up, with or without the passwords
+    for b in [full.clone(), stripped] {
+        let report = w(&s, move |c| backup::restore(c, &b, RestoreMode::Merge));
+        assert_eq!((report.sources_added, report.sources_matched), (0, 2));
+    }
+    // the first switched back to its playlist and the file got upgraded since the backup
+    w(&s, |c| {
+        c.execute_batch(
+            "UPDATE source SET kind = 'm3u-url', xt_server = NULL, xt_username = NULL, xt_password = NULL WHERE name = 'Provider';
+             UPDATE source SET kind = 'xtream', xt_server = 'http://panel.test', xt_username = 'viewer', xt_password = 'p'
+             WHERE name = 'Provider file';",
+        )?;
+        Ok(())
+    });
+    let report = w(&s, move |c| backup::restore(c, &full, RestoreMode::Merge));
+    assert_eq!((report.sources_added, report.sources_matched), (0, 2), "no duplicate sources");
+}

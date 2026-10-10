@@ -263,7 +263,7 @@ impl PlayerScreen {
             return;
         }
         if ctx.parental.is_unlocked(&ctx.config.parental) {
-            ctx.play(PlayerCommand::Zap { forward });
+            ctx.play(PlayerCommand::Zap { forward, unlocked: true });
             return;
         }
         let failing = super::live::failing_set(ctx).unwrap_or_default();
@@ -1281,8 +1281,17 @@ impl Screen for PlayerScreen {
             }
             Action::ZapPrev | Action::ZapNext if live => self.zap(ctx, action == Action::ZapNext),
             Action::LastChannel if live => {
-                if ctx.player.previous_live.is_some() {
-                    ctx.play(PlayerCommand::LastChannel);
+                let unlocked = ctx.parental.is_unlocked(&ctx.config.parental);
+                let prev = ctx.player.previous_live.as_ref().map(|p| p.media.clone());
+                // the controller ignores a recall onto a locked channel while locked: ask first
+                let locked = match &prev {
+                    Some(MediaRef::Channel(id)) if !unlocked => ctx.lib.live.get(*id).filter(|c| c.locked).map(|c| c.name.clone()),
+                    _ => None,
+                };
+                if let Some(name) = locked {
+                    ctx.open(OverlayRequest::Pin { then: Box::new(Action::LastChannel), reason: format!("“{name}” is locked") });
+                } else if prev.is_some() {
+                    ctx.play(PlayerCommand::LastChannel { unlocked });
                 }
             }
             Action::ChannelHistory if live => self.open_panel(ctx, PanelKind::History),

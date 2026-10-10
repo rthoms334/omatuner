@@ -205,8 +205,10 @@ fn sources_crud_order_status_and_secrets() {
     assert!(!xb.status.last_error.as_deref().unwrap().contains("xt-pass-9931"), "stored errors are redacted");
     assert_eq!(sources::account_limits(&r).unwrap().into_iter().find(|x| x.0 == b).unwrap().1, Some(2));
 
-    // staleness: B (refresh_h 2) never refreshed → stale; A disabled → never
-    assert_eq!(sources::stale_sources(&r, NOW, 24).unwrap(), vec![b]);
+    // staleness: B (refresh_h 2) never refreshed → stale once the back-off of its failure just
+    // now is over; A disabled → never
+    assert!(sources::stale_sources(&r, NOW, 24).unwrap().is_empty());
+    assert_eq!(sources::stale_sources(&r, NOW + 600, 24).unwrap(), vec![b]);
     w(&s, move |c| {
         let st = SourceStatus { last_refresh: Some(NOW - 3600), counts: SourceCounts { channels: 3, ..Default::default() }, ..Default::default() };
         sources::mark_refreshed(c, b, &st)
@@ -259,16 +261,57 @@ fn epg_sources_provider_lifecycle_priority_and_staleness() {
     assert!(!list[1].enabled && list[1].refresh_h == Some(6));
     assert_eq!(list[0].last_error.as_deref(), Some("nope"));
 
-    // staleness: never refreshed → stale; disabled never; max_stop rule
-    assert_eq!(sources::stale_epg_sources(&r, NOW, 12).unwrap(), vec![f, ids2[0]]);
+    // staleness: never refreshed → stale (F never imported and failed just now: retried after an
+    // hour, not a whole interval); disabled never; max_stop rule
+    assert_eq!(sources::stale_epg_sources(&r, NOW, 12).unwrap(), vec![ids2[0]]);
+    assert_eq!(sources::stale_epg_sources(&r, NOW + 3600 - 1, 12).unwrap(), vec![ids2[0]]);
+    assert_eq!(sources::stale_epg_sources(&r, NOW + 3600, 12).unwrap(), vec![f, ids2[0]]);
     let p = ids2[0];
     w(&s, move |c| {
         c.execute("UPDATE epg_source SET last_refresh = ?2, max_stop = ?3 WHERE id = ?1", rusqlite::params![p, NOW - 7200, NOW + 3 * 86400])?;
-        c.execute("UPDATE epg_source SET last_refresh = ?2, max_stop = ?3 WHERE id = ?1", rusqlite::params![f, NOW - 7200, NOW + 3600])?;
+        let ok = "UPDATE epg_source SET last_refresh = ?2, max_stop = ?3, last_error = NULL WHERE id = ?1";
+        c.execute(ok, rusqlite::params![f, NOW - 7200, NOW + 3600])?;
         Ok(())
     });
     assert_eq!(sources::stale_epg_sources(&r, NOW, 12).unwrap(), vec![f], "guide running out");
     assert_eq!(sources::stale_epg_sources(&r, NOW + 11 * 3600, 12).unwrap(), vec![f, p]);
+    // a running-out guide that fails is not fetched again on every tick: it has been due for an
+    // hour (since NOW - 1 h), so it waits an hour
+    w(&s, move |c| sources::mark_epg_failed(c, f, "down", NOW));
+    assert!(sources::stale_epg_sources(&r, NOW + 3540, 12).unwrap().is_empty());
+    assert_eq!(sources::stale_epg_sources(&r, NOW + 3600, 12).unwrap(), vec![f]);
+}
+
+/// Audit fix: a provider that is down was retried (WARN + error toast) on every 15-minute
+/// scheduler tick forever. Failed refreshes now back off: the wait doubles with how long the
+/// source has been failing, from 10 min up to its interval; a success resets it.
+#[test]
+fn failing_refreshes_back_off_up_to_the_interval() {
+    let s = store("tuner-st-backoff");
+    let id = w(&s, |c| {
+        let id = sources::insert_source(c, &m3u_draft("Down", "http://h/p.m3u"), NOW - 86_400)?;
+        sources::set_source_settings(c, id, &SourceSettings { refresh_h: Some(4), ..Default::default() })?;
+        let st = SourceStatus { last_refresh: Some(NOW - 4 * 3600), ..Default::default() };
+        sources::mark_refreshed(c, id, &st)?;
+        sources::mark_failed(c, id, "HTTP 503", NOW)?;
+        Ok(id)
+    });
+    let r = s.reader().unwrap();
+    let stale = |at: Timestamp| sources::stale_sources(&r, at, 24).unwrap() == vec![id];
+    // due since NOW, failed at once: the shortest wait
+    assert!(!stale(NOW + 599) && stale(NOW + 600));
+    // failed again after an hour of failing: waits an hour
+    w(&s, move |c| sources::mark_failed(c, id, "HTTP 503", NOW + 3600));
+    assert!(!stale(NOW + 2 * 3600 - 1) && stale(NOW + 2 * 3600));
+    // failing for 10 h: capped at the 4 h interval
+    w(&s, move |c| sources::mark_failed(c, id, "HTTP 503", NOW + 10 * 3600));
+    assert!(!stale(NOW + 14 * 3600 - 1) && stale(NOW + 14 * 3600));
+    // a success resets the back-off: the next failure is retried soon again
+    w(&s, move |c| {
+        sources::mark_refreshed(c, id, &SourceStatus { last_refresh: Some(NOW + 14 * 3600), ..Default::default() })?;
+        sources::mark_failed(c, id, "HTTP 503", NOW + 18 * 3600)
+    });
+    assert!(stale(NOW + 18 * 3600 + 600));
 }
 
 // ------------------------------------------------------------------ imports
