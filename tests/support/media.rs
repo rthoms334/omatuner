@@ -15,7 +15,7 @@ use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -129,6 +129,8 @@ struct Shared {
     active: AtomicUsize,
     max_active: AtomicUsize,
     throttle_bps: Mutex<Option<u64>>,
+    /// Requests are not recorded (long soaks: the log would grow with every stream load).
+    unlogged: AtomicBool,
 }
 
 enum Ctl {
@@ -192,6 +194,11 @@ impl TestServer {
     /// Listen again on the same port.
     pub fn revive(&self) {
         let _ = self.ctl.send(Ctl::Revive);
+    }
+
+    /// Stop (`false`) or resume recording requests for [`TestServer::requests`].
+    pub fn set_request_log(&self, on: bool) {
+        self.shared.unlogged.store(!on, Ordering::SeqCst);
     }
 
     pub fn requests(&self) -> Vec<Request> {
@@ -290,13 +297,17 @@ async fn connection(mut stream: TcpStream, ctx: Arc<Ctx>) {
     let mut guard = ConnGuard { shared: shared.clone(), index: None };
 
     let Some((method, path, headers)) = read_head(&mut stream).await else { return };
-    let index = {
+    let index = (!shared.unlogged.load(Ordering::SeqCst)).then(|| {
         let mut reqs = shared.requests.lock().unwrap();
         reqs.push(Request { path: path.clone(), headers: headers.clone(), status: 0, opened: Instant::now(), closed: None });
         reqs.len() - 1
+    });
+    guard.index = index;
+    let set_status = |s: u16| {
+        if let Some(i) = index {
+            shared.requests.lock().unwrap()[i].status = s;
+        }
     };
-    guard.index = Some(index);
-    let set_status = |s: u16| shared.requests.lock().unwrap()[index].status = s;
 
     let forced = shared.status.lock().unwrap().get(&path).copied();
     if let Some(code) = forced {

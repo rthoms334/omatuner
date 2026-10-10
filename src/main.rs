@@ -41,6 +41,7 @@ const REFRESH_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const REFRESH_SETTLE: Duration = Duration::from_millis(500);
 
 fn main() -> anyhow::Result<()> {
+    tuner::platform::limit_malloc_arenas();
     let cli = Cli::parse();
     let paths = match &cli.profile_dir {
         Some(dir) => AppPaths::rooted(dir),

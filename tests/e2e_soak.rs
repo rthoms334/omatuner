@@ -6,7 +6,10 @@
 //! (caches, mpv demuxer buffers and egui galleys reach their steady size) it must stay within
 //! +10 % of the post-warm-up value. SQLite's heap is reported next to it and left out of the
 //! comparison: its page caches (up to 16 MB per reader, 32 MB for the writer) are bounded, so
-//! filling them is not a leak (measured: ≈ 1 MiB in this probe).
+//! filling them is not a leak (measured: ≈ 1 MiB in this probe). The probe uses `main`'s
+//! allocator setup (`platform::limit_malloc_arenas`) and turns the test server's request log
+//! off. What still grows is libmpv's own ≈ 0.7–1 KiB per `loadfile` (also for a file that
+//! fails to open; outside our code), ≈ 1–2 MiB per 2 000 zaps.
 //!
 //! Too slow for the normal gate (≈ 2 000 real stream loads), so it is ignored:
 //! `cargo test --release --test e2e_soak -- --ignored --nocapture`
@@ -57,10 +60,14 @@ fn sqlite_kib() -> u64 {
 #[test]
 #[ignore = "slow (≈ 2 000 stream loads); run explicitly, see module docs"]
 fn memory_stays_flat_over_2000_zaps_and_guide_scrolls() {
+    // the allocator setup of `main` (glibc arenas; without it mpv's per-file threads fragment
+    // the heap and RSS climbs ~50 KiB per zap)
+    tuner::platform::limit_malloc_arenas();
     let Some(media) = ensure_media() else { return };
     let zaps: usize = std::env::var("TUNER_SOAK_ZAPS").ok().and_then(|v| v.parse().ok()).unwrap_or(2_000);
     let warmup = (zaps / 5).max(1);
     let server = TestServer::start(media, Faults::default());
+    server.set_request_log(false); // ≈ 1 KiB per request, 4 requests per zap: not the app's memory
     let files = ["bars.ts", "hls/index.m3u8", "testsrc.mp4"];
 
     // profile: channels with a guide; the first STREAMS point at local test media
