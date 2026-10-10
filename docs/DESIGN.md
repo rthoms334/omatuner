@@ -2391,7 +2391,9 @@ cancellation (no sweep), throttled progress, follow-up submits, scheduler stalen
 has channels/movies/series, provider EPG imported and mapped, account info stored and reported in
 `SourceRefreshed`; refresh with renumbered stream ids keeps favourites (reattach); M3U file
 import; failing refresh keeps the old catalogue and records a redacted error; [bench
-`benches/import.rs`] wired (gates run by WP-13).
+`benches/import.rs`] wired (gates run by WP-13). Job failures are logged at WARN or above under
+target `tuner::jobs` (the Jobs overlay's Problems list reads them from the log buffer; there is no
+job-history API — decided after phase 1).
 
 **WP-07 Player core** — milestone A: `tests/support/media.rs` + `scripts/gen-test-media.sh` by
 day 2. [unit] state machine covers every transition of §11.3 (entry tracking incl. the fast
@@ -2429,7 +2431,10 @@ gate, row states, toggle, seek bar, toast stacking above an avoid rect), help ov
 overlay `Ignored` → globals, Esc ladder, DataScope reactions (§5.4 table), CLI/IPC inputs
 (`--play`, `.m3u` file → onboarding), connection limits sent at startup and after refresh,
 `ApplyConfig` sent on edits, reminders refresh; usable at 790 and 1600 pt at text size 12 and
-16; [e2e after WP-06/08/09/01] every remaining `SKELETON-STUB` removed.
+16; [e2e after WP-06/08/09/01] every remaining `SKELETON-STUB` removed. Help is opened with
+`HelpOverlay::with_contexts(<current context stack>)` (current contexts first, §13.11) instead
+of `overlays::build(OverlayRequest::Help)`; after an Alt chord resolves, drop its text event; when
+`layout::sidebar_width` is 0 call `widgets::sidebar::sidebar` in a horizontal top panel (glyph strip).
 
 **WP-11 Live/Guide/Player UI** — [kittest with `TestUi` + seed + fake `EpgReader`] Live
 3-pane/2-pane/stack layouts; Enter rule; preview autoplay off by default, keyboard-rest only,

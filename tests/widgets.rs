@@ -832,9 +832,9 @@ fn data_rows_render_with_real_services() {
     let theme = Theme::fallback();
     let mut h = Harness::builder().with_size(egui::vec2(900.0, 700.0)).build_ui(|ui| {
         t.images.pump();
-        let opts = rows::ChannelRowOpts { density: Density::Comfortable, show_number: true, show_logo: true, source: None, favourite: true, failed: false };
+        let opts = rows::ChannelRowOpts { density: Density::Comfortable, show_number: true, show_logo: true, source: None, favourite: true, failed: false, playing: true };
         rows::channel_row(ui, &theme, &mut t.images, &ch, Some(&nn), now, opts, RowState::Cursor);
-        rows::channel_row(ui, &theme, &mut t.images, &ch, None, now, rows::ChannelRowOpts { density: Density::Compact, ..opts }, RowState::Idle);
+        rows::channel_row(ui, &theme, &mut t.images, &ch, None, now, rows::ChannelRowOpts { density: Density::Compact, playing: false, ..opts }, RowState::Idle);
         rows::group_row(ui, &theme, &group, RowState::Selected);
         rows::programme_row(ui, &theme, &nn.now.clone().unwrap(), now, true, RowState::Idle);
         rows::episode_row(ui, &theme, &ep, Some(0.4), false, RowState::Idle);
@@ -864,6 +864,8 @@ fn data_rows_render_with_real_services() {
     let s = shapes(&h);
     assert!(s.iter().any(|s| matches!(s, Shape::Text(t) if t.galley.job.text.starts_with("News at Eight · ") && t.galley.job.text.ends_with("next: Panorama"))));
     assert!(monogram(&h), "monogram for a failed logo");
+    let play = s.iter().filter(|s| matches!(s, Shape::Text(t) if t.galley.job.text == tuner::ui::widgets::glyphs::PLAY)).count();
+    assert_eq!(play, 1, "now-playing marker only on the playing row");
 }
 
 /// Step `h` until `done` holds (the store writer answers asynchronously).

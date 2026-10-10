@@ -100,6 +100,8 @@ pub struct ChannelRowOpts<'a> {
     pub favourite: bool,
     /// Dim + warning glyph (recent failures).
     pub failed: bool,
+    /// The playing channel: accent 󰐊 glyph left of the name (§13.0).
+    pub playing: bool,
 }
 
 /// The detail line of a channel row for a row `width`: "title · 20:00–21:00 · next: X",
@@ -198,6 +200,10 @@ pub fn channel_row(
             paint::text(&p, egui::pos2(left + col, line_y), Align2::RIGHT_CENTER, n.to_string(), num_font, t.text_secondary, col);
         }
         left += col + gap;
+    }
+    if opts.playing {
+        let r = paint::text(&p, egui::pos2(left, line_y), Align2::LEFT_CENTER, glyphs::PLAY, paint::font(theme, TypeToken::Icon), t.accent, f32::INFINITY);
+        left = r.right() + theme.space(SpaceToken::Md);
     }
     let mut name_right = right;
     let mut suffix = String::new();
