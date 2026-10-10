@@ -1,5 +1,8 @@
 # Maintainer: Robert Thomson
-# Arch / Omarchy package for Tuner. Builds from the git checkout (makepkg -si from packaging/).
+# Arch / Omarchy package for Tuner, built from this checkout (no download of the app itself):
+#   cd packaging && makepkg -si
+# Cargo's build output goes to packaging/src/target, so makepkg's RUSTFLAGS don't invalidate the
+# developer's own target/ directory.
 pkgname=tuner
 pkgver=0.1.0
 pkgrel=1
@@ -7,42 +10,58 @@ pkgdesc="Keyboard-first IPTV player for Omarchy (M3U, Xtream, XMLTV, catch-up)"
 arch=('x86_64' 'aarch64')
 url="https://example.invalid/tuner"
 license=('GPL-3.0-or-later')
-# mpv provides libmpv.so (client API >= 2.5). fontconfig for fc-match/fc-list; dbus for the
-# portal file pickers (libdbus is loaded at runtime; MPRIS and notifications use zbus).
-# hyprland optional.
-depends=('mpv' 'fontconfig' 'wayland' 'libxkbcommon' 'mesa' 'dbus' 'gcc-libs' 'glibc')
-makedepends=('cargo' 'clang' 'git')
-optdepends=('ffmpeg: generate test media'
-            'noto-fonts-cjk: CJK channel names'
-            'noto-fonts: Arabic/Hebrew/Indic fallbacks'
-            'xdg-desktop-portal-gtk: file pickers')
+# Linked: libmpv (client API >= 2.5, mpv >= 0.38) and liblzma (xz). Loaded at runtime:
+# libwayland-client, libxkbcommon, libEGL/libGL (mesa). fontconfig for fc-match/fc-list; the
+# UI font and its icon glyphs are JetBrains Mono Nerd Font (Omarchy's monospace). MPRIS,
+# notifications and the portal file pickers talk to the session bus (dbus).
+depends=('mpv>=1:0.38' 'xz' 'fontconfig' 'ttf-jetbrains-mono-nerd' 'wayland' 'libxkbcommon'
+         'mesa' 'dbus' 'gcc-libs' 'glibc')
+makedepends=('cargo')
+optdepends=('hyprland: window rules from /usr/share/tuner/hypr, raising the window'
+            'xdg-desktop-portal-gtk: file pickers (add a playlist file, backup, log export)'
+            'noto-fonts-cjk: CJK channel and programme names'
+            'noto-fonts: Arabic, Hebrew and Indic fallbacks')
 options=('!lto')
 source=()
 _srcdir="$(realpath "$startdir/..")"
 
 prepare() {
   cd "$_srcdir"
+  if [[ ! -f Cargo.toml ]]; then
+    error "PKGBUILD must stay in packaging/ of the Tuner checkout"
+    return 1
+  fi
+  local _version
+  _version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+  if [[ $_version != "$pkgver" ]]; then
+    error "pkgver ($pkgver) does not match Cargo.toml ($_version)"
+    return 1
+  fi
   export RUSTUP_TOOLCHAIN=stable
   cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
 }
 
 build() {
   cd "$_srcdir"
-  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR="$srcdir/target"
   cargo build --frozen --release
 }
 
 check() {
   cd "$_srcdir"
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR="$srcdir/target"
+  # Library unit tests: no network, ffmpeg or Wayland session needed.
   cargo test --frozen --release --lib
 }
 
 package() {
   cd "$_srcdir"
-  install -Dm755 target/release/tuner "$pkgdir/usr/bin/tuner"
+  install -Dm755 "$srcdir/target/release/tuner" "$pkgdir/usr/bin/tuner"
   install -Dm644 packaging/tuner.desktop "$pkgdir/usr/share/applications/tuner.desktop"
   install -Dm644 packaging/icons/tuner.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/tuner.svg"
+  # Opt-in snippets (nothing is written to the user's config): see README "Omarchy integration".
   install -Dm644 packaging/hypr/tuner.lua "$pkgdir/usr/share/tuner/hypr/tuner.lua"
   install -Dm644 packaging/omarchy/omarchy-menu.jsonc "$pkgdir/usr/share/tuner/omarchy/omarchy-menu.jsonc"
-  install -Dm644 docs/DESIGN.md "$pkgdir/usr/share/doc/tuner/DESIGN.md"
+  install -Dm644 -t "$pkgdir/usr/share/doc/tuner" README.md docs/DESIGN.md docs/MANUAL_CHECKLIST.md
+  # GPL-3.0-or-later is a common SPDX licence on Arch: no licence file to install.
 }
