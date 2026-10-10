@@ -427,6 +427,28 @@ fn user_override_change_reloads() {
     assert_eq!(changed(&ev).unwrap().font(TypeToken::Body), 12.0);
 }
 
+/// A UI-scale change saved by Settings after start-up survives later reloads (the watcher
+/// re-reads `interface.ui_scale` instead of reusing the start-up value).
+#[test]
+fn reload_uses_the_current_ui_scale() {
+    let (_dir, paths) = fake_home("liftoff");
+    std::fs::create_dir_all(paths.omarchy_config()).unwrap();
+    let (_w, events) = start_watcher(&paths);
+    std::fs::create_dir_all(&paths.config_dir).unwrap();
+    std::fs::write(paths.config_file(), "[interface]\nui_scale = 1.5\n").unwrap();
+    std::fs::write(paths.omarchy_config().join("shell.toml"), "[lock]\nborder-alpha = 0.3\n").unwrap();
+    let (ev, _) = events.first_within(Duration::from_millis(1000)).expect("Changed");
+    let t = changed(&ev).expect("a Changed event");
+    assert_eq!(t.font(TypeToken::Body), 18.0);
+    assert_eq!(t.rem(), 1.5);
+
+    // a malformed config keeps the last good scale source: the start-up value
+    std::fs::write(paths.config_file(), "[interface\n").unwrap();
+    omarchy_theme_set(&paths, "nord");
+    let (ev, _) = events.first_within(Duration::from_millis(1000)).expect("Changed");
+    assert_eq!(changed(&ev).unwrap().font(TypeToken::Body), 12.0);
+}
+
 #[test]
 fn ignores_staging_and_background_changes() {
     let (_dir, paths) = fake_home("liftoff");

@@ -2,9 +2,10 @@
 //! state fills; omarchy.md §2, §5; DESIGN §16.2).
 //!
 //! * `font(t)  = override[t] ?: max(1, round(base × mult[t]))`, base = `[font] base-size`
-//!   (integer, default 12, floor 1) × `ui_scale`; pinned overrides are scaled by `ui_scale` too.
+//!   (integer, default 12, floor 1) × `ui_scale`; a pinned override is used as is.
 //! * `space(t) = override[t] ?: max(1, round(px[t] × scale))`,
-//!   `scale = spacing.scale × (scale-with-font ? base/12 : ui_scale)`; `hairline` can't be pinned.
+//!   `scale = spacing.scale × (scale-with-font ? base/12 : 1)`; `hairline` can't be pinned.
+//!   So `ui_scale` reaches spacing only through `scale-with-font` (it scales `base`).
 //! * State tints are the `[controls]` state colours (default FOREGROUND) at the Omarchy alphas
 //!   (works in light themes); a state with border width 0 gets a transparent border.
 //! * Surface colours use `composed(colour, alpha)`: the `*-alpha` key replaces the colour's alpha.
@@ -276,7 +277,7 @@ impl Tokens {
         let base_font = base_size(shell) * ui_scale;
         let scale_with_font = shell.bool("spacing", "scale-with-font").unwrap_or(true);
         let spacing_scale = shell.f32("spacing", "scale").filter(|s| *s >= 0.0).unwrap_or(1.0);
-        let scale = spacing_scale * if scale_with_font { (base_font / 12.0).max(1.0 / 12.0) } else { ui_scale };
+        let scale = spacing_scale * if scale_with_font { (base_font / 12.0).max(1.0 / 12.0) } else { 1.0 };
 
         // A colour whose alpha is about to be replaced: its unmultiplied RGB, opaque (a
         // translucent gradient stop like `rgba(26a269ee)` keeps its exact RGB).
@@ -348,15 +349,16 @@ impl Tokens {
         }
     }
 
-    /// `[font] <token>` override (integer px > 0, × UI scale) or `max(1, round(base × mult))`.
+    /// `[font] <token>` override (integer px > 0, pinned: not scaled) or
+    /// `max(1, round(base × mult))`.
     pub fn font(&self, shell: &ShellConfig, t: TypeToken) -> f32 {
         match shell.f32("font", t.key()).map(f32::trunc).filter(|px| *px > 0.0) {
-            Some(px) => (px * self.ui_scale(shell)).round().max(1.0),
+            Some(px) => px,
             None => (self.base_font * t.mult()).round().max(1.0),
         }
     }
 
-    /// `[spacing] <token>` override (px ≥ 0, × UI scale) or `max(1, round(px × scale))`.
+    /// `[spacing] <token>` override (px ≥ 0, pinned: not scaled) or `max(1, round(px × scale))`.
     /// `hairline` is never overridden (Style.qml).
     pub fn space(&self, shell: &ShellConfig, t: SpaceToken) -> f32 {
         let computed = (t.base_px() * self.scale).round().max(1.0);
@@ -364,13 +366,10 @@ impl Tokens {
             return computed;
         }
         match shell.f32("spacing", t.key()).filter(|px| *px >= 0.0) {
-            Some(px) => (px * self.ui_scale(shell)).round(),
+            Some(px) => px.round(),
             None => computed,
         }
     }
-
-    /// The UI scale baked into `base_font` (pinned token overrides scale with it too).
-    fn ui_scale(&self, shell: &ShellConfig) -> f32 { self.base_font / base_size(shell) }
 
     pub fn fill(&self, i: Interaction) -> Color32 {
         match i {
@@ -470,6 +469,23 @@ mod tests {
         let shell = ShellConfig::parse("[font]\nbase-size = 0\n", None).unwrap();
         assert_eq!(Tokens::compute(&pal(), &shell, -2.0, 1.0).base_font, 1.0, "1 px floor");
         assert_eq!(Tokens::compute(&pal(), &shell, -2.0, 1.0).rounding, 0.0);
+    }
+
+    /// DESIGN §16.2: `ui_scale` scales `base`; spacing follows it only via `scale-with-font`, and
+    /// pinned font/spacing tokens stay exactly as written.
+    #[test]
+    fn ui_scale_spares_pinned_tokens_and_fixed_spacing() {
+        let shell = ShellConfig::parse("[spacing]\nscale-with-font = false\npanel-padding = 5\n[font]\ntitle = 30\n", None).unwrap();
+        let t = Tokens::compute(&pal(), &shell, 0.0, 1.5);
+        assert_eq!(t.font(&shell, TypeToken::Body), 18.0, "base × ui_scale");
+        assert_eq!(t.font(&shell, TypeToken::Title), 30.0, "pinned font token");
+        assert_eq!(t.space(&shell, SpaceToken::ControlHeight), 28.0, "scale = spacing.scale × 1");
+        assert_eq!(t.space(&shell, SpaceToken::PanelPadding), 5.0, "pinned spacing token");
+        assert_eq!(t.rem(), 1.5, "layout unit still follows ui_scale");
+        let shell = ShellConfig::parse("[spacing]\npanel-padding = 5\n", None).unwrap();
+        let t = Tokens::compute(&pal(), &shell, 0.0, 1.5);
+        assert_eq!(t.space(&shell, SpaceToken::ControlHeight), 42.0, "scale-with-font: base/12");
+        assert_eq!(t.space(&shell, SpaceToken::PanelPadding), 5.0);
     }
 
     #[test]

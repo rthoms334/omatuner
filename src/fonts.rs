@@ -22,8 +22,8 @@
 //! * Reload on `ThemeEvent::FontsChanged(Arc<LoadedFonts>)` (fonts.conf changed).
 
 use std::borrow::Cow;
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use eframe::egui::{self, FontData, FontDefinitions, FontFamily};
@@ -72,6 +72,9 @@ impl FontSet {
     }
 
     /// Read the font files (cached per path+index). Blocking I/O: never on the UI thread.
+    /// The cache keeps only this set's faces afterwards, so fonts superseded by a `fonts.conf`
+    /// change are freed once egui drops them (a reload that keeps the CJK collection doesn't
+    /// re-read its ~19 MB).
     pub fn load(&self) -> LoadedFonts {
         let get = |f: &FontFace| -> Option<Arc<FontData>> {
             let key = (f.path.clone(), f.index);
@@ -92,12 +95,20 @@ impl FontSet {
                 }
             }
         };
-        LoadedFonts {
+        let loaded = LoadedFonts {
             regular: self.regular.as_ref().and_then(get),
             medium: self.medium.as_ref().and_then(get),
             bold: self.bold.as_ref().and_then(get),
             fallbacks: self.fallbacks.iter().filter_map(get).collect(),
-        }
+        };
+        let wanted: HashSet<(&Path, u32)> = self.faces().map(|f| (f.path.as_path(), f.index)).collect();
+        FONT_CACHE.lock().unwrap_or_else(|e| e.into_inner()).retain(|(path, index), _| wanted.contains(&(path.as_path(), *index)));
+        loaded
+    }
+
+    /// Every face of the set: regular, medium, bold, then the fallbacks.
+    fn faces(&self) -> impl Iterator<Item = &FontFace> {
+        self.regular.iter().chain(&self.medium).chain(&self.bold).chain(&self.fallbacks)
     }
 
     /// Convenience for tests/tools: load + install (blocking).
@@ -381,6 +392,20 @@ mod tests {
         });
         assert!(!out.textures_delta.set.is_empty(), "font atlas built from in-memory bytes");
         out.textures_delta.clear();
+    }
+
+    /// A reload drops the faces it no longer uses from the process-wide cache. Only eviction of
+    /// this test's own temp paths is asserted: other tests load concurrently through the same
+    /// cache and prune it to their own sets, so "still cached" would be racy here.
+    #[test]
+    fn cache_keeps_only_the_current_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cjk, old, new) = (temp_font(dir.path(), "cjk.ttc"), temp_font(dir.path(), "old.ttf"), temp_font(dir.path(), "new.ttf"));
+        let cached = |f: &FontFace| FONT_CACHE.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&(f.path.clone(), f.index));
+        let first = FontSet { regular: Some(old.clone()), fallbacks: vec![cjk.clone()], ..Default::default() }.load();
+        let second = FontSet { regular: Some(new), fallbacks: vec![cjk], ..Default::default() }.load();
+        assert!(!cached(&old), "superseded face evicted");
+        assert!(first.regular.is_some() && second.regular.is_some() && second.fallbacks.len() == 1);
     }
 
     #[test]

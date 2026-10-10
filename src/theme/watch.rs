@@ -121,7 +121,9 @@ pub struct ThemeWatcher {
 }
 
 impl ThemeWatcher {
-    /// Start watching. `ui_scale` from config is applied to reloaded themes.
+    /// Start watching. Reloaded themes use the config's current `interface.ui_scale` (re-read
+    /// on each reload, so a Settings change isn't undone); `ui_scale` is the fallback while the
+    /// config file is unreadable or malformed.
     /// Directories that can't be watched are polled instead, so this fails only when the
     /// worker thread can't be spawned.
     pub fn start(paths: AppPaths, ui_scale: f32, bus: EventBus) -> Result<Self> {
@@ -212,6 +214,7 @@ fn fingerprint(p: &Path) -> Fingerprint {
 
 struct Worker {
     paths: AppPaths,
+    /// Start-up `ui_scale`, used only while the config is unreadable or malformed.
     ui_scale: f32,
     bus: EventBus,
     poller: Poller,
@@ -258,7 +261,7 @@ impl Worker {
 
             if theme_due.is_some_and(|d| d <= now) {
                 theme_due = None;
-                match Theme::try_load(&self.paths, self.ui_scale) {
+                match Theme::try_load(&self.paths, self.current_ui_scale()) {
                     Ok(theme) => {
                         retries = 0;
                         self.publish(theme);
@@ -279,6 +282,12 @@ impl Worker {
                 self.bus.send(AppEvent::Theme(ThemeEvent::FontsChanged(Arc::new(fonts))));
             }
         }
+    }
+
+    /// `interface.ui_scale` as currently saved (Settings may have changed it since start-up);
+    /// the start-up value while the config is unreadable or malformed.
+    fn current_ui_scale(&self) -> f32 {
+        crate::config::Config::load(&self.paths.config_file()).map_or(self.ui_scale, |c| c.interface.ui_scale)
     }
 
     fn publish(&mut self, theme: Theme) {
