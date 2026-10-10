@@ -51,6 +51,8 @@ pub struct VideoHost {
     placed_this_frame: Placement,
     last_generation: u64,
     mini: Option<egui::Rect>,
+    /// `mini_player` ran since the last `begin_frame` (a rect nobody redraws is dropped).
+    mini_drawn: bool,
 }
 
 impl VideoHost {
@@ -60,6 +62,12 @@ impl VideoHost {
     pub fn begin_frame(&mut self) {
         self.placed = self.placed_this_frame;
         self.placed_this_frame = Placement::None;
+        // the mini-player wasn't drawn last frame (a screen placed the video, playback
+        // stopped, Compact…): toasts and the guide must stop avoiding its old rect
+        if !self.mini_drawn {
+            self.mini = None;
+        }
+        self.mini_drawn = false;
     }
 
     /// Where the video was shown last frame.
@@ -68,7 +76,8 @@ impl VideoHost {
     /// False when libmpv/GL failed at startup (no surface).
     pub fn available(&self) -> bool { self.surface.is_some() }
 
-    /// The mini-player rect drawn last frame (toasts and the guide avoid it).
+    /// The mini-player rect drawn this frame or the previous one (toasts and the guide avoid
+    /// it); `None` once a frame passed without the mini-player.
     pub fn mini_rect(&self) -> Option<egui::Rect> { self.mini }
 
     /// Render mpv into the FBO (from `App::logic`, GL current). Clears to black on new loads.
@@ -106,12 +115,12 @@ impl VideoHost {
                 theme.tokens.osd_text,
             );
         }
-        self.paint_state_overlay(ui, rect, theme, snap);
+        self.paint_state_overlay(ui, rect, placement, theme, snap);
         resp
     }
 
     /// Loading / buffering / reconnecting / error overlay (fixed dark scrim). WP-11.
-    fn paint_state_overlay(&self, ui: &mut egui::Ui, rect: egui::Rect, theme: &Theme, snap: &PlayerSnapshot) {
+    fn paint_state_overlay(&self, ui: &mut egui::Ui, rect: egui::Rect, placement: Placement, theme: &Theme, snap: &PlayerSnapshot) {
         let t = &theme.tokens;
         let p = ui.painter_at(rect);
         let k = overlay_scale(rect);
@@ -158,7 +167,7 @@ impl VideoHost {
                 let secs = at.saturating_duration_since(Instant::now()).as_secs_f32().ceil() as u64;
                 let head = format!("Reconnecting… ({attempt}/{max})");
                 let detail = if secs > 0 { format!("{} · retrying in {secs} s", reason_label(*reason)) } else { format!("{} · retrying now", reason_label(*reason)) };
-                let hint = if live { "r Retry now · Backspace Last channel" } else { "r Retry now" };
+                let hint = recovery_hint(placement, live, snap.previous_live.is_some(), true);
                 let lines = [(head.as_str(), title_font, t.osd_text), (detail.as_str(), body_font, with_alpha(t.osd_text, 0.7)), (hint, small_font, t.osd_accent)];
                 stacked(&p, rect, &lines, gap);
                 spinner(&p, egui::pos2(rect.center().x, rect.center().y - 3.0 * title_font_size(theme, k)), 10.0 * k, t.osd_accent, time);
@@ -167,7 +176,7 @@ impl VideoHost {
             PlayerState::Error(e) => {
                 p.rect_filled(rect, 0.0, t.osd_scrim);
                 let (head, detail) = error_copy(e.kind, &e.message);
-                let hint = if live { "r Retry · Backspace Last channel" } else { "r Retry" };
+                let hint = recovery_hint(placement, live, snap.previous_live.is_some(), false);
                 let glyph_font = FontId::proportional((theme.font(TypeToken::DisplayLarge) * k).round());
                 let lines = [
                     (glyphs::WARNING, glyph_font, t.osd_accent),
@@ -252,6 +261,7 @@ impl VideoHost {
         // not a placement (see module docs)
         self.placed_this_frame = restore;
         self.mini = Some(total);
+        self.mini_drawn = true;
         result
     }
 
@@ -331,6 +341,25 @@ fn reason_label(kind: PlayerErrorKind) -> &'static str {
     }
 }
 
+/// The key hint under a failed / reconnecting stream. The player's keys (`r`, Backspace) only
+/// work in the fullscreen player: in the Live list `r` types into the filter and Backspace
+/// goes back a pane, so the preview and the mini-player name what works there.
+pub(crate) fn recovery_hint(placement: Placement, live: bool, has_last_channel: bool, reconnecting: bool) -> &'static str {
+    match placement {
+        Placement::Mini => "Click to open the player",
+        // Enter on a failed channel plays it again (`playing_channel` ignores the error);
+        // while reconnecting the player retries by itself
+        Placement::Preview if reconnecting => "Shift+Enter fullscreen",
+        Placement::Preview => "Enter retries · Shift+Enter fullscreen",
+        Placement::Fullscreen | Placement::None => match (reconnecting, live && has_last_channel) {
+            (true, true) => "r Retry now · Backspace Last channel",
+            (true, false) => "r Retry now",
+            (false, true) => "r Retry · Backspace Last channel",
+            (false, false) => "r Retry",
+        },
+    }
+}
+
 /// One OSD text line, elided.
 pub(crate) fn osd_text(p: &egui::Painter, pos: egui::Pos2, anchor: Align2, s: &str, font: FontId, color: Color32, max_w: f32) -> Rect {
     let mut job = egui::text::LayoutJob::simple_singleline(s.to_owned(), font, color);
@@ -341,14 +370,27 @@ pub(crate) fn osd_text(p: &egui::Painter, pos: egui::Pos2, anchor: Align2, s: &s
     r
 }
 
-/// Lines stacked and centred in `rect`.
+/// Lines stacked and centred in `rect`; each wraps to at most two rows (a long error
+/// headline keeps its tail — "…or too many connections" is the part users need).
 fn stacked(p: &egui::Painter, rect: Rect, lines: &[(&str, FontId, Color32)], gap: f32) {
-    let lines: Vec<_> = lines.iter().filter(|(s, _, _)| !s.is_empty()).collect();
-    let h: f32 = lines.iter().map(|(_, f, _)| f.size * 1.3).sum::<f32>() + gap * lines.len().saturating_sub(1) as f32;
+    let max_w = (rect.width() - 2.0 * gap).max(0.0);
+    let galleys: Vec<Arc<egui::Galley>> = lines
+        .iter()
+        .filter(|(s, _, _)| !s.is_empty())
+        .map(|(s, f, c)| {
+            let mut job = egui::text::LayoutJob::simple((*s).to_owned(), f.clone(), *c, max_w);
+            job.halign = egui::Align::Center;
+            job.wrap.max_rows = 2;
+            p.layout_job(job)
+        })
+        .collect();
+    let h: f32 = galleys.iter().map(|g| g.size().y).sum::<f32>() + gap * galleys.len().saturating_sub(1) as f32;
     let mut y = rect.center().y - h / 2.0;
-    for (s, f, c) in lines {
-        osd_text(p, egui::pos2(rect.center().x, y), Align2::CENTER_TOP, s, f.clone(), *c, rect.width() - 2.0 * gap);
-        y += f.size * 1.3 + gap;
+    for g in galleys {
+        let gh = g.size().y;
+        // a centre-aligned galley is laid out around x = 0
+        p.galley(egui::pos2(rect.center().x, y), g, Color32::PLACEHOLDER);
+        y += gh + gap;
     }
 }
 
@@ -399,6 +441,19 @@ mod tests {
         assert_eq!(d, "HTTP 403");
         assert_eq!(error_copy(PlayerErrorKind::HttpNotFound, "").0, "Channel offline");
         assert!(error_copy(PlayerErrorKind::Drm, "x").0.starts_with("DRM"));
+    }
+
+    #[test]
+    fn recovery_hints_name_keys_that_work_where_the_video_is() {
+        assert_eq!(recovery_hint(Placement::Fullscreen, true, true, false), "r Retry · Backspace Last channel");
+        assert_eq!(recovery_hint(Placement::Fullscreen, true, false, false), "r Retry", "no last channel to go back to");
+        assert_eq!(recovery_hint(Placement::Fullscreen, false, true, true), "r Retry now");
+        // the Live list: `r` types into the filter, Backspace goes back a pane
+        for reconnecting in [false, true] {
+            let h = recovery_hint(Placement::Preview, true, true, reconnecting);
+            assert!(!h.contains("r Retry") && !h.contains("Backspace"), "{h}");
+        }
+        assert_eq!(recovery_hint(Placement::Mini, true, true, false), "Click to open the player");
     }
 
     #[test]

@@ -26,7 +26,7 @@ use eframe::egui::{self, Rect};
 use crate::keymap::{Action, KeyContext};
 use crate::model::{
     ChannelId, ChannelSummary, Collection, FavListId, Group, GroupId, GroupKey, ItemKind, ItemRef, MediaRef, PlayOrigin, Programme, ProgrammeSlim,
-    Reminder, ReminderId, ReminderState, SortMode, SourceId, ZapList,
+    Reminder, ReminderId, ReminderState, SortMode, SourceId, Timestamp, ZapList,
 };
 use crate::msg::{AppEvent, DataScope, Toast};
 use crate::player::{PlayRequest, PlayerCommand, PlayerEvent, PlayerSnapshot, PlayerState};
@@ -146,12 +146,82 @@ pub(crate) fn toggle_reminder(ctx: &mut UiCtx<'_>, ch: &ChannelSummary, p: &Prog
     }
 }
 
-/// Pending reminders (Settings ▸ Reminders query; a small table read on events, not per frame).
-pub(crate) fn load_reminders(ctx: &UiCtx<'_>) -> Vec<Reminder> {
-    crate::store::user::all_reminders(ctx.db).unwrap_or_else(|e| {
+/// Pending reminders (Settings ▸ Reminders query; a small table read on events, not per
+/// frame), inside the frame budget: `None` = deferred to the next frame.
+pub(crate) fn load_reminders(ctx: &mut UiCtx<'_>) -> Option<Vec<Reminder>> {
+    let db = ctx.db;
+    let r = ctx.budget.run(|| crate::store::user::all_reminders(db))?;
+    Some(r.unwrap_or_else(|e| {
         tracing::debug!("reminders: {e}");
         Vec::new()
-    })
+    }))
+}
+
+/// Guide freshness (DESIGN §9.5, §13.12): one aggregate over the small `epg_source` table.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct GuideInfo {
+    /// Enabled EPG sources.
+    pub sources: i64,
+    /// End of the newest guide data (`None` = no guide imported yet).
+    pub max_stop: Option<Timestamp>,
+    pub last_refresh: Option<Timestamp>,
+}
+
+/// What the Live preview, the guide and the player OSD say about the guide as a whole: the
+/// cached [`GuideInfo`] (re-read after `DataScope::Epg/Sources/All`) and the progress of the
+/// first guide import.
+#[derive(Default)]
+pub(crate) struct GuideStatus {
+    info: Option<GuideInfo>,
+}
+
+impl GuideStatus {
+    /// Forget the cached info when the guide sources or their data changed.
+    pub(crate) fn on_event(&mut self, ev: &AppEvent) {
+        if matches!(ev, AppEvent::Data(DataScope::Epg | DataScope::Sources | DataScope::All)) {
+            self.info = None;
+        }
+    }
+
+    /// The guide info; `None` while the read waits for frame budget.
+    pub(crate) fn info(&mut self, ctx: &mut UiCtx<'_>) -> Option<GuideInfo> {
+        if self.info.is_none() {
+            let db = ctx.db;
+            self.info = ctx.budget.run(|| {
+                db.query_row("SELECT count(*), max(max_stop), max(last_refresh) FROM epg_source WHERE enabled = 1", [], |r| {
+                    Ok(GuideInfo { sources: r.get(0)?, max_stop: r.get(1)?, last_refresh: r.get(2)? })
+                })
+                .unwrap_or_else(|e| {
+                    tracing::debug!("guide info: {e}");
+                    GuideInfo::default()
+                })
+            });
+        }
+        self.info
+    }
+
+    /// "Loading guide… 45 %" while the first guide import runs (no guide data at all yet):
+    /// rows, grid and preview say that instead of "No guide data", which would send new users
+    /// off to map EPG channels by hand (DESIGN §13.12).
+    pub(crate) fn loading_label(&mut self, ctx: &mut UiCtx<'_>) -> Option<String> {
+        if self.info(ctx)?.max_stop.is_some() {
+            return None;
+        }
+        let job = ctx.services.jobs.active().into_iter().find(|j| matches!(j.kind, crate::jobs::JobKind::RefreshEpg { .. }))?;
+        let pct = job.fraction.filter(|f| f.is_finite()).map(|f| format!(" {:.0} %", f.clamp(0.0, 1.0) * 100.0)).unwrap_or_default();
+        Some(format!("Loading guide…{pct}"))
+    }
+}
+
+/// "3 h ago" / "2 d ago" (the status bar's freshness wording).
+pub(crate) fn age_label(now: Timestamp, at: Timestamp) -> String {
+    let age = (now - at).max(0);
+    match age {
+        0..=59 => "just now".to_owned(),
+        60..=3_599 => format!("{} min ago", age / 60),
+        3_600..=172_799 => format!("{} h ago", age / 3_600),
+        _ => format!("{} d ago", age / 86_400),
+    }
 }
 
 /// Play a past programme from the archive, fullscreen.
@@ -257,7 +327,8 @@ pub(crate) fn skeleton_rows(ui: &mut egui::Ui, theme: &Theme, row_h: f32) {
     for i in 0..n {
         let y = rect.top() + i as f32 * row_h + row_h / 2.0;
         let w = rect.width() * (0.45 + 0.25 * ((i * 7 % 5) as f32 / 5.0));
-        p.rect_filled(Rect::from_min_size(egui::pos2(rect.left() + pad, y - 6.0), egui::vec2(w, 12.0)), theme.tokens.rounding, theme.tokens.fill_field);
+        let h = (12.0 * theme.rem()).round();
+        p.rect_filled(Rect::from_min_size(egui::pos2(rect.left() + pad, y - h / 2.0), egui::vec2(w, h)), theme.tokens.rounding, theme.tokens.fill_field);
     }
 }
 
@@ -316,6 +387,9 @@ enum Menu {
     Sort,
 }
 
+/// Detail line of the "No playlists yet" empty state (Live and the guide).
+pub(crate) const EMPTY_LIBRARY_DETAIL: &str = "Add an M3U playlist or an Xtream login to start watching — press Enter.";
+
 /// Sort choices of the Ctrl+S menu (label, mode).
 const SORTS: &[(&str, SortMode)] = &[
     ("Custom order", SortMode::Provider),
@@ -342,7 +416,13 @@ pub struct LiveScreen {
     drawer: bool,
     /// Library snapshot + favourites signature the lists were built from.
     built: Option<(usize, u64, SortMode, bool)>,
+    /// Rebuild groups and channels on the next frame.
     dirty: bool,
+    /// Re-read the failure cache (a zap succeeded or failed) — nothing else.
+    failed_dirty: bool,
+    /// Re-read the reminders (a reminder changed).
+    reminders_dirty: bool,
+    guide: GuideStatus,
     /// Keyboard cursor rest (preview autoplay).
     rest: Option<(ChannelId, Instant)>,
     failed: HashSet<ItemRef>,
@@ -351,6 +431,11 @@ pub struct LiveScreen {
     /// Delete-list confirmation token → list.
     confirm: Option<(u64, FavListId)>,
     layout: Option<LayoutClass>,
+}
+
+/// Appended to lock toasts while no PIN is set (locks do nothing without one).
+pub(crate) fn pin_hint(ctx: &UiCtx<'_>) -> &'static str {
+    if ctx.config.parental.enabled && ctx.config.parental.pin_hash.is_some() { "" } else { " — set a PIN in Settings ▸ Parental to enforce it" }
 }
 
 /// Cheap signature of the favourites (lists and their sizes).
@@ -387,21 +472,39 @@ impl LiveScreen {
 
     fn open_index(&self) -> Option<usize> { self.open.as_ref().and_then(|e| self.groups.iter().position(|g| &g.entry == e)) }
 
+    fn signature(ctx: &UiCtx<'_>, sort: SortMode) -> (usize, u64, SortMode, bool) {
+        (Arc::as_ptr(ctx.lib) as usize, fav_signature(ctx.favs), sort, ctx.config.interface.hide_empty_groups)
+    }
+
     /// Rebuild when the library, the favourites, the sort or the hide-empty setting changed.
+    /// Side tables (failures, reminders) are re-read only when their own events say so, inside
+    /// the frame budget — a zap never rebuilds the channel list.
     fn refresh(&mut self, ctx: &mut UiCtx<'_>) {
-        let sig = (Arc::as_ptr(ctx.lib) as usize, fav_signature(ctx.favs), ctx.config.interface.live_sort, ctx.config.interface.hide_empty_groups);
+        if self.built.is_none() {
+            self.failed_dirty = true;
+            self.reminders_dirty = true;
+        }
+        if self.failed_dirty {
+            let (db, since) = (ctx.db, ctx.now - 86_400);
+            if let Some(r) = ctx.budget.run(|| crate::store::live::failures(db, since)) {
+                self.failed = r.map(|m| m.into_iter().filter(|(_, f)| f.count >= 2).map(|(k, _)| k).collect()).unwrap_or_default();
+                self.failed_dirty = false;
+            }
+        }
+        if self.reminders_dirty
+            && let Some(r) = load_reminders(ctx)
+        {
+            self.reminders = r;
+            self.reminders_dirty = false;
+            // the Reminders group comes and goes with them (rare: a full rebuild is fine)
+            self.dirty = true;
+        }
+        let sig = Self::signature(ctx, ctx.config.interface.live_sort);
         if self.built == Some(sig) && !self.dirty {
             return;
         }
-        let reload_side = self.dirty || self.built.is_none_or(|b| b.0 != sig.0);
         self.built = Some(sig);
         self.dirty = false;
-        if reload_side {
-            self.reminders = load_reminders(ctx);
-            self.failed = crate::store::live::failures(ctx.db, ctx.now - 86_400)
-                .map(|m| m.into_iter().filter(|(_, f)| f.count >= 2).map(|(k, _)| k).collect())
-                .unwrap_or_default();
-        }
         self.rebuild_groups(ctx);
         if self.open.as_ref().is_none_or(|e| !self.groups.iter().any(|g| &g.entry == e)) {
             self.open = self.default_entry(ctx);
@@ -461,6 +564,16 @@ impl LiveScreen {
             Some(e) => e.collection().map(|c| ctx.lib.live.collection(&c, ctx.favs, &ctx.lib.recent_channels, ctx.config.interface.live_sort)).unwrap_or_default(),
             None => Vec::new(),
         };
+        self.rebuild_haystacks(ctx);
+        match keep.and_then(|k| self.row_of(k)).filter(|_| !reset_cursor) {
+            Some(i) => self.chan_list.select(i),
+            None if reset_cursor => self.chan_list.select(0),
+            None => {}
+        }
+    }
+
+    /// Filter haystacks (`"<number> <name>"`) of `self.channels` + refilter.
+    fn rebuild_haystacks(&mut self, ctx: &UiCtx<'_>) {
         let live = &ctx.lib.live;
         self.haystacks = self
             .channels
@@ -474,11 +587,6 @@ impl LiveScreen {
             })
             .collect();
         self.refilter_channels();
-        match keep.and_then(|k| self.row_of(k)).filter(|_| !reset_cursor) {
-            Some(i) => self.chan_list.select(i),
-            None if reset_cursor => self.chan_list.select(0),
-            None => {}
-        }
     }
 
     fn refilter_channels(&mut self) {
@@ -599,16 +707,25 @@ impl LiveScreen {
                     true
                 }
                 Action::ToggleHidden => {
-                    self.group_override(ctx, |o| o.hidden = !o.hidden, "Hidden");
+                    if let Some(name) = self.group_override(ctx, |o| o.hidden = !o.hidden) {
+                        ctx.toast(Toast::info(format!("Hid “{name}” — Settings ▸ Hidden items brings it back")));
+                    }
                     true
                 }
                 Action::ToggleLock => {
-                    if self.cursor_group().is_some_and(|g| matches!(g.entry, Entry::Group(_))) {
-                        if ctx.parental.is_unlocked(&ctx.config.parental) {
-                            self.group_override(ctx, |o| o.locked = !o.locked, "Lock changed");
-                        } else {
-                            ctx.open(OverlayRequest::Pin { then: Box::new(Action::ToggleLock), reason: "Enter your PIN to change locks".into() });
+                    match self.cursor_group().map(|g| (matches!(g.entry, Entry::Group(_)), g.group.locked)) {
+                        Some((true, locked)) => {
+                            if ctx.parental.is_unlocked(&ctx.config.parental) {
+                                if let Some(name) = self.group_override(ctx, move |o| o.locked = !locked) {
+                                    let hint = pin_hint(ctx);
+                                    ctx.toast(Toast::info(format!("{} “{name}”{hint}", if locked { "Unlocked" } else { "Locked" })));
+                                }
+                            } else {
+                                ctx.open(OverlayRequest::Pin { then: Box::new(Action::ToggleLock), reason: "Enter your PIN to change locks".into() });
+                            }
                         }
+                        Some((false, _)) => ctx.toast(Toast::info("Only playlist groups can be locked")),
+                        None => {}
                     }
                     true
                 }
@@ -672,9 +789,10 @@ impl LiveScreen {
         ctx.open(OverlayRequest::Rename(spec));
     }
 
-    fn group_override(&mut self, ctx: &mut UiCtx<'_>, f: impl FnOnce(&mut crate::model::GroupOverride) + Send + 'static, what: &str) {
-        let Some(Entry::Group(id)) = self.cursor_group().map(|g| g.entry.clone()) else { return };
-        let Some(gr) = ctx.lib.live.groups.iter().find(|x| x.id == id).cloned() else { return };
+    /// Change the cursor group's override; returns its display name (for the toast).
+    fn group_override(&mut self, ctx: &mut UiCtx<'_>, f: impl FnOnce(&mut crate::model::GroupOverride) + Send + 'static) -> Option<String> {
+        let Some(Entry::Group(id)) = self.cursor_group().map(|g| g.entry.clone()) else { return None };
+        let gr = ctx.lib.live.groups.iter().find(|x| x.id == id).cloned()?;
         let (source, kind, key) = (gr.source_id, gr.kind, gr.key.clone());
         let _ = ctx.services.store.writer().submit_notify(DataScope::Overrides, move |c| {
             let mut ov = crate::store::user::group_overrides(c)?
@@ -685,7 +803,7 @@ impl LiveScreen {
             f(&mut ov);
             crate::store::user::set_group_override(c, source, kind, &key, &ov)
         });
-        ctx.toast(Toast::info(format!("{what}: {}", gr.display_name())));
+        Some(gr.display_name().to_owned())
     }
 
     fn move_list(&mut self, ctx: &mut UiCtx<'_>, up: bool) {
@@ -719,6 +837,11 @@ impl LiveScreen {
     // ------------------------------------------------------------------ actions: channels
 
     fn channels_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
+        // the empty state's button, from the keyboard
+        if self.channel_rows.is_empty() && action == Action::Activate && !self.chan_list.filter.is_active() && self.all_hidden(ctx) {
+            ctx.push(Route::Settings(SettingsPage::Hidden));
+            return true;
+        }
         match self.chan_list.handle(action) {
             ListOutcome::Moved => {
                 // keyboard rest starts the (opt-in) preview autoplay timer; hover never does
@@ -746,6 +869,14 @@ impl LiveScreen {
                 true
             }
             ListOutcome::None => self.channel_command(ctx, action),
+        }
+    }
+
+    /// The open provider group has channels, all of them hidden ("Everything here is hidden").
+    fn all_hidden(&self, ctx: &UiCtx<'_>) -> bool {
+        match &self.open {
+            Some(Entry::Group(g)) => self.channels.is_empty() && ctx.lib.live.groups.iter().find(|x| x.id == *g).is_some_and(|x| x.item_count > 0),
+            _ => false,
         }
     }
 
@@ -802,7 +933,7 @@ impl LiveScreen {
                             ov.locked = lock;
                             crate::store::user::set_item_override(c, &item, &ov)
                         });
-                        let hint = if ctx.config.parental.enabled && ctx.config.parental.pin_hash.is_some() { "" } else { " — set a PIN in Settings ▸ Parental to enforce it" };
+                        let hint = pin_hint(ctx);
                         ctx.toast(Toast::info(format!("{} “{}”{hint}", if lock { "Locked" } else { "Unlocked" }, ch.name)));
                     }
                 }
@@ -880,50 +1011,72 @@ impl LiveScreen {
     }
 
     /// Alt+↑/↓: reorder inside a provider group (`item_override.user_order`) or a favourites
-    /// list; a non-custom sort switches to custom order first (DESIGN §13.0).
+    /// list. A non-custom sort switches to custom order first (DESIGN §13.0) and the move then
+    /// happens in that order: the cursor channel moves one place in the list the user is
+    /// about to see.
     fn reorder(&mut self, ctx: &mut UiCtx<'_>, up: bool) {
         if self.chan_list.filter.is_active() {
             ctx.toast(Toast::info("Clear the filter to reorder"));
             return;
         }
-        // no filter: displayed rows are the channels in order
-        let i = self.chan_list.cursor;
-        if i >= self.channels.len() {
-            return;
-        }
-        let j = if up { i.checked_sub(1) } else { (i + 1 < self.channels.len()).then_some(i + 1) };
-        let Some(j) = j else { return };
-        let switch = ctx.config.interface.live_sort != SortMode::Provider;
-        match self.open.clone() {
-            Some(Entry::Group(g)) => {
-                if switch {
-                    ctx.edit_config(|c| c.interface.live_sort = SortMode::Provider);
-                    ctx.toast(Toast::info("Switched to custom order"));
-                    // reorder from the provider order the list is about to show
-                    self.channels = ctx.lib.live.group_members(g).to_vec();
-                }
-                let Some(src) = self.channels.first().and_then(|c| ctx.lib.live.get(*c)).map(|c| c.source_id) else { return };
-                self.channels.swap(i, j);
-                let keys: Vec<crate::model::ItemKey> = self.channels.iter().filter_map(|c| ctx.lib.live.get(*c)).filter(|c| c.source_id == src).map(|c| c.key.clone()).collect();
-                let _ = ctx.services.store.writer().submit_notify(DataScope::Overrides, move |c| crate::store::user::reorder_items(c, src, ItemKind::Channel, &keys));
-            }
-            Some(Entry::FavList(l)) => {
-                let Some(ch) = ctx.lib.live.get(self.channels[i]).cloned() else { return };
-                let item = channel_ref(&ch);
-                // position in the list's own order (favourites keep list order)
-                let Some(pos) = ctx.favs.items(l).iter().position(|x| *x == item) else { return };
-                let target = if up { pos.saturating_sub(1) } else { pos + 1 };
-                self.channels.swap(i, j);
-                let _ = ctx.services.store.writer().submit_notify(DataScope::Favourites, move |c| crate::store::user::move_favourite(c, l, &item, target));
-            }
+        let Some(cur) = self.cursor_channel() else { return };
+        let coll = match &self.open {
+            Some(Entry::Group(g)) => Collection::Group(*g),
+            Some(Entry::FavList(l)) => Collection::Favourites(*l),
             _ => {
                 ctx.toast(Toast::info("This list can't be reordered"));
                 return;
             }
+        };
+        if ctx.config.interface.live_sort != SortMode::Provider {
+            ctx.edit_config(|c| c.interface.live_sort = SortMode::Provider);
+            ctx.toast(Toast::info("Switched to custom order"));
+            // the list below already is in custom order: the sort change must not rebuild it
+            // from a library that doesn't carry the move yet
+            self.built = Some(Self::signature(ctx, SortMode::Provider));
+            self.channels = ctx.lib.live.collection(&coll, ctx.favs, &ctx.lib.recent_channels, SortMode::Provider);
+            self.rebuild_haystacks(ctx);
         }
-        self.haystacks.swap(i, j);
-        self.refilter_channels();
-        self.chan_list.select(j);
+        // unfiltered and in custom order: the rows are `channels`
+        if let Some(i) = self.channels.iter().position(|c| *c == cur) {
+            let j = if up { i.checked_sub(1) } else { (i + 1 < self.channels.len()).then_some(i + 1) };
+            if let Some(j) = j {
+                self.write_order(ctx, &coll, i, j);
+                self.channels.swap(i, j);
+                self.haystacks.swap(i, j);
+                self.refilter_channels();
+            }
+        }
+        if let Some(r) = self.row_of(cur) {
+            self.chan_list.select(r);
+        }
+    }
+
+    /// Persist moving `channels[i]` to its neighbour `channels[j]` (called before the swap).
+    fn write_order(&self, ctx: &mut UiCtx<'_>, coll: &Collection, i: usize, j: usize) {
+        let live = &ctx.lib.live;
+        match coll {
+            Collection::Group(_) => {
+                let Some(src) = live.get(self.channels[i]).map(|c| c.source_id) else { return };
+                let mut order = self.channels.clone();
+                order.swap(i, j);
+                let keys: Vec<crate::model::ItemKey> = order.iter().filter_map(|c| live.get(*c)).filter(|c| c.source_id == src).map(|c| c.key.clone()).collect();
+                let _ = ctx.services.store.writer().submit_notify(DataScope::Overrides, move |c| crate::store::user::reorder_items(c, src, ItemKind::Channel, &keys));
+            }
+            Collection::Favourites(l) => {
+                let (Some(a), Some(b)) = (live.get(self.channels[i]), live.get(self.channels[j])) else { return };
+                let (item, other) = (channel_ref(a), channel_ref(b));
+                // positions in the list itself (it may hold hidden or vanished items)
+                let items = ctx.favs.items(*l);
+                let Some(target) = items.iter().position(|x| *x == other) else { return };
+                if !items.contains(&item) {
+                    return;
+                }
+                let l = *l;
+                let _ = ctx.services.store.writer().submit_notify(DataScope::Favourites, move |c| crate::store::user::move_favourite(c, l, &item, target));
+            }
+            _ => {}
+        }
     }
 
     fn remove(&mut self, ctx: &mut UiCtx<'_>, ch: &ChannelSummary) {
@@ -966,7 +1119,7 @@ impl LiveScreen {
         let open = self.open_index();
         let virtual_count = self.groups.iter().take_while(|g| !matches!(g.entry, Entry::Group(_))).count();
         let (groups, rows) = (&self.groups, &self.group_rows);
-        let clicked = ui.input(|i| i.pointer.any_click());
+        let mut clicked = None;
         let out = virtual_list(ui, theme, "live-groups", &mut self.group_list, row_h, |ui, rc| {
             let gi = rows[rc.index] as usize;
             let g = &groups[gi];
@@ -976,14 +1129,21 @@ impl LiveScreen {
                 let r = resp.rect;
                 ui.painter().hline(r.x_range(), r.bottom() - 0.5, egui::Stroke::new(1.0, theme.tokens.group_divider));
             }
+            // the list reports `Moved` only when the cursor wasn't there yet, and a hover with
+            // real pointer motion has already put it there before the click
+            if resp.clicked() {
+                clicked = Some(rc.index);
+            }
             resp
         });
-        match out {
+        if let Some(i) = clicked.filter(|_| !matches!(out, ListOutcome::ContextMenu(_))) {
             // a click (not a hover) focuses the pane and opens the group
-            ListOutcome::Moved if clicked => {
-                self.focus = Pane::Groups;
-                self.groups_action(ctx, Action::Activate);
-            }
+            self.group_list.select(i);
+            self.focus = Pane::Groups;
+            self.groups_action(ctx, Action::Activate);
+            return;
+        }
+        match out {
             ListOutcome::Activated(_) => {
                 self.focus = Pane::Groups;
                 self.groups_action(ctx, Action::Activate);
@@ -1037,7 +1197,7 @@ impl LiveScreen {
         let (channels, rows, failed) = (&self.channels, &self.channel_rows, &self.failed);
         let lib = ctx.lib.clone();
         let now = ctx.now;
-        let clicked = ui.input(|i| i.pointer.any_click());
+        let mut clicked = false;
         let out = virtual_list(ui, theme, ("live-channels", self.open.clone()), &mut self.chan_list, row_h, |ui, rc| {
             let id = channels[rows[rc.index] as usize];
             let Some(ch) = lib.live.get(id) else { return ui.allocate_response(egui::vec2(ui.available_width(), row_h), egui::Sense::hover()) };
@@ -1054,15 +1214,18 @@ impl LiveScreen {
                 ..opts
             };
             let state = if focused { rc.state } else if rc.state.is_cursor() { RowState::Selected } else { RowState::Idle };
-            channel_row(ui, theme, ctx.images, ch, nn.as_ref(), now, o, state)
+            let resp = channel_row(ui, theme, ctx.images, ch, nn.as_ref(), now, o, state);
+            clicked |= resp.clicked();
+            resp
         });
+        if clicked {
+            // a click (also on the row a hover already moved the cursor to) takes the focus
+            self.focus = Pane::Channels;
+        }
         match out {
             ListOutcome::Moved => {
-                // pointer (hover/click): never autoplay; only a click takes the focus
+                // pointer (hover/click): never autoplay
                 self.rest = None;
-                if clicked {
-                    self.focus = Pane::Channels;
-                }
             }
             ListOutcome::Activated(_) => {
                 self.focus = Pane::Channels;
@@ -1091,7 +1254,7 @@ impl LiveScreen {
                 _ => String::new(),
             };
             let detail = r.map(|r| format!("{} {}", crate::ui::epg_grid::day_label(r.start), hhmm(r.start, h24)));
-            let state = if focused { rc.state } else { RowState::Idle };
+            let state = if focused { rc.state } else if rc.state.is_cursor() { RowState::Selected } else { RowState::Idle };
             menu_row(ui, theme, Some(glyphs::REMINDER), &label, detail.as_deref(), false, state)
         });
     }
@@ -1107,13 +1270,12 @@ impl LiveScreen {
             Some(Entry::FavList(_)) => (glyphs::FAVOURITE, "Press Ctrl+F on any channel to add it here".into(), None),
             Some(Entry::History) => (glyphs::HISTORY, "Nothing watched yet".into(), None),
             Some(Entry::Reminders) => (glyphs::REMINDER, "No reminders — press r on a programme in the TV guide".into(), None),
-            Some(Entry::Group(g)) => {
-                let total = ctx.lib.live.groups.iter().find(|x| x.id == *g).map_or(0, |x| x.item_count);
-                if total > 0 { (glyphs::HIDDEN, "Everything here is hidden".into(), Some("Show hidden")) } else { (glyphs::LIVE_TV, "This group is empty".into(), None) }
-            }
+            Some(Entry::Group(_)) if self.all_hidden(ctx) => (glyphs::HIDDEN, "Everything here is hidden".into(), Some("Show hidden")),
+            Some(Entry::Group(_)) => (glyphs::LIVE_TV, "This group is empty".into(), None),
             _ => (glyphs::LIVE_TV, "No channels".into(), None),
         };
-        if empty_state(ui, theme, glyph, &title, None, action).is_some_and(|r| r.clicked()) {
+        let detail = action.map(|_| "Enter opens Settings ▸ Hidden items");
+        if empty_state(ui, theme, glyph, &title, detail, action).is_some_and(|r| r.clicked()) {
             ctx.push(Route::Settings(SettingsPage::Hidden));
         }
     }
@@ -1122,22 +1284,30 @@ impl LiveScreen {
     fn draw_preview(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) {
         let theme = ctx.theme;
         let t = &theme.tokens;
+        let rem = theme.rem();
         let width = ui.available_width();
         let video_rect = Rect::from_min_size(ui.cursor().min, egui::vec2(width, (width * 9.0 / 16.0).round()));
         let snap = ctx.player.clone();
+        let cursor = self.cursor_channel();
         if snap.state != PlayerState::Idle {
             let resp = ctx.video.paint(ui, video_rect, Placement::Preview, theme, &snap);
             if resp.on_hover_text("Open the player").clicked() {
                 ctx.push(Route::Player);
             }
+            // the text below describes the cursor channel: say which one the video is
+            if let Some(pc) = playing_channel(&snap).filter(|p| Some(*p) != cursor).and_then(|p| ctx.lib.live.get(p)) {
+                let next = cursor.and_then(|c| ctx.lib.live.get(c)).map(|c| format!(" · Enter on {} switches", c.name)).unwrap_or_default();
+                ui.add_space(theme.space(SpaceToken::Sm));
+                ui.add(egui::Label::new(egui::RichText::new(format!("{} {}{next}", glyphs::PLAY, pc.name)).size(theme.font(TypeToken::BodySmall)).color(t.text_secondary)).truncate());
+            }
         } else {
             let r = ui.allocate_rect(video_rect, egui::Sense::hover()).rect;
             ui.painter().rect_filled(r, t.rounding, t.fill_field);
-            let hint = if self.cursor_channel().is_some() { "Enter plays here · Shift+Enter fullscreen" } else { "" };
+            let hint = if cursor.is_some() { "Enter plays here · Shift+Enter fullscreen" } else { "" };
             ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, hint, egui::FontId::proportional(theme.font(TypeToken::BodySmall)), t.text_secondary);
         }
         ui.add_space(theme.space(SpaceToken::Lg));
-        let Some(ch) = self.cursor_channel().and_then(|id| ctx.lib.live.get(id).cloned()) else { return };
+        let Some(ch) = cursor.and_then(|id| ctx.lib.live.get(id).cloned()) else { return };
         let h24 = ctx.config.interface.clock_24h;
         // name · number + badges
         ui.horizontal_wrapped(|ui| {
@@ -1166,27 +1336,39 @@ impl LiveScreen {
             return;
         }
         if ch.epg_channel_id.is_none() {
-            ui.label(egui::RichText::new("No guide data").size(theme.font(TypeToken::Body)).color(t.text_disabled));
-            ui.label(egui::RichText::new("Ctrl+E assigns an EPG channel").size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
+            match self.guide.loading_label(ctx) {
+                // the first guide import hasn't mapped anything yet
+                Some(loading) => {
+                    ui.label(egui::RichText::new(loading).size(theme.font(TypeToken::Body)).color(t.text_secondary));
+                }
+                None => {
+                    ui.label(egui::RichText::new("No guide data").size(theme.font(TypeToken::Body)).color(t.text_disabled));
+                    ui.label(egui::RichText::new("Ctrl+E assigns an EPG channel").size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
+                }
+            }
             return;
         }
         let nn = now_next_of(ctx, &ch);
         let now_prog = nn.as_ref().and_then(|n| n.now.clone());
         self.details.ensure(ctx, &ch, now_prog.as_ref());
+        let line_h = ui.spacing().interact_size.y.max((theme.font(TypeToken::Title) * 1.4).round());
         match (&nn, &now_prog) {
             (None, _) => {
-                ui.label(egui::RichText::new("…").color(t.text_secondary));
+                // still loading: a skeleton bar (DESIGN §13.12)
+                let (r, _) = ui.allocate_exact_size(egui::vec2((width * 0.6).round(), theme.font(TypeToken::Title).round()), egui::Sense::hover());
+                ui.painter().rect_filled(r, t.rounding, t.fill_field);
             }
             (Some(_), Some(p)) => {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(p.title.as_ref()).size(theme.font(TypeToken::Title)).color(t.fg));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(egui::RichText::new(time_range(p.start, p.stop, h24)).size(theme.font(TypeToken::Body)).color(t.text_secondary));
+                // time on the right first, the title truncated into what is left
+                ui.allocate_ui_with_layout(egui::vec2(width, line_h), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(time_range(p.start, p.stop, h24)).size(theme.font(TypeToken::Body)).color(t.text_secondary));
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(egui::Label::new(egui::RichText::new(p.title.as_ref()).size(theme.font(TypeToken::Title)).color(t.fg)).truncate());
                     });
                 });
                 ui.horizontal(|ui| {
                     let w = (ui.available_width() * 0.6).max(60.0);
-                    ui.allocate_ui(egui::vec2(w, 8.0), |ui| progress::progress_bar(ui, theme, p.progress(ctx.now), (3.0 * theme.rem()).round()));
+                    ui.allocate_ui(egui::vec2(w, (8.0 * rem).round()), |ui| progress::progress_bar(ui, theme, p.progress(ctx.now), (3.0 * rem).round()));
                     ui.label(egui::RichText::new(time_left(p.stop - ctx.now)).size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
                 });
                 if let Some(d) = self.details.description.as_deref().filter(|d| !d.is_empty()) {
@@ -1202,14 +1384,23 @@ impl LiveScreen {
             ui.add_space(theme.space(SpaceToken::Lg));
             section::section_header(ui, theme, "Upcoming");
             let item = channel_ref(&ch);
+            // a fixed time column ("20:00" / "10:00 pm"), titles truncated to the pane
+            let time_w = (theme.font(TypeToken::Body) * 5.0).round();
             for p in up {
                 let remind = self.reminders.iter().any(|r| r.channel == item && r.start == p.start);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(hhmm(p.start, h24)).size(theme.font(TypeToken::Body)).color(t.text_secondary));
-                    ui.label(egui::RichText::new(p.title.as_ref()).size(theme.font(TypeToken::Body)).color(t.fg));
-                    if remind {
-                        ui.label(egui::RichText::new(glyphs::REMINDER).size(theme.font(TypeToken::Body)).color(t.accent));
-                    }
+                ui.allocate_ui_with_layout(egui::vec2(width, line_h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.allocate_ui_with_layout(egui::vec2(time_w, line_h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.set_min_width(time_w);
+                        ui.label(egui::RichText::new(hhmm(p.start, h24)).size(theme.font(TypeToken::Body)).color(t.text_secondary));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if remind {
+                            ui.label(egui::RichText::new(glyphs::REMINDER).size(theme.font(TypeToken::Body)).color(t.accent));
+                        }
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.add(egui::Label::new(egui::RichText::new(p.title.as_ref()).size(theme.font(TypeToken::Body)).color(t.fg)).truncate());
+                        });
+                    });
                 });
             }
         }
@@ -1270,16 +1461,28 @@ impl Screen for LiveScreen {
     }
 
     fn on_event(&mut self, _ctx: &mut UiCtx<'_>, ev: &AppEvent) {
+        self.guide.on_event(ev);
         match ev {
-            AppEvent::Data(DataScope::Favourites | DataScope::Reminders | DataScope::History | DataScope::Epg | DataScope::Overrides) => self.dirty = true,
-            AppEvent::Data(DataScope::Live | DataScope::Sources | DataScope::All) => self.dirty = true,
-            AppEvent::Player(PlayerEvent::Failed(_) | PlayerEvent::NowPlaying(_)) => self.dirty = true,
+            AppEvent::Data(DataScope::Reminders) => self.reminders_dirty = true,
+            // a zap only changes the failure marks (its History write, like Overrides / Epg
+            // changes, rebuilds the library, and a new library rebuilds the lists anyway)
+            AppEvent::Player(PlayerEvent::Failed(_) | PlayerEvent::NowPlaying(_)) => self.failed_dirty = true,
+            // a favourites move keeps the cheap signature: rebuild explicitly
+            AppEvent::Data(DataScope::Favourites | DataScope::Live | DataScope::Sources | DataScope::All) => self.dirty = true,
             _ => {}
         }
     }
 
     fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
         self.refresh(ctx);
+        if ctx.lib.built_at != 0 && ctx.lib.is_empty() {
+            // "No playlists yet": Enter is the "Add playlist" button
+            if action == Action::Activate {
+                ctx.navigate(crate::ui::NavRequest::Switch(Route::Onboarding(crate::ui::OnboardingStart::AddSource)));
+                return true;
+            }
+            return false;
+        }
         if self.layout == Some(LayoutClass::Wide) && self.drawer {
             self.drawer = false;
         }
@@ -1303,7 +1506,7 @@ impl Screen for LiveScreen {
             }
         }
         if ctx.lib.built_at != 0 && ctx.lib.is_empty() {
-            if empty_state(ui, theme, glyphs::PLAYLIST, "No playlists yet", Some("Add an M3U playlist or an Xtream login to start watching."), Some("Add playlist")).is_some_and(|r| r.clicked()) {
+            if empty_state(ui, theme, glyphs::PLAYLIST, "No playlists yet", Some(EMPTY_LIBRARY_DETAIL), Some("Add playlist")).is_some_and(|r| r.clicked()) {
                 ctx.navigate(crate::ui::NavRequest::Switch(Route::Onboarding(crate::ui::OnboardingStart::AddSource)));
             }
             return;

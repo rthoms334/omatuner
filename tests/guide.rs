@@ -427,6 +427,8 @@ fn grid_mouse_click_focuses_and_header_click_watches() {
     h.input_mut().events.push(egui::Event::PointerButton { pos: egui::pos2(20.0, hy), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
     h.step();
     assert!(h.state().outcomes.contains(&GridOutcome::Watch(ChannelId(2))), "{:?}", h.state().outcomes);
+    // …and focuses that row first: a locked channel's PIN retry (`GuideWatch`) watches the focus
+    assert_eq!(h.state().state.focused().map(|f| f.0), Some(ChannelId(2)));
 }
 
 // ====================================================================== guide screen
@@ -488,6 +490,18 @@ fn guide_defaults_to_the_first_non_empty_favourites_list() {
     assert!(labels.contains(&"Favourites") && labels.contains(&"All channels") && labels.contains(&"News"), "{labels:?}");
 }
 
+/// `snap` after a newer load (the player bumps the generation on every load, zaps included).
+fn reloaded(snap: Arc<PlayerSnapshot>, generation: u64) -> Arc<PlayerSnapshot> { Arc::new(PlayerSnapshot { load_generation: generation, ..(*snap).clone() }) }
+
+/// The collection the picker marks as current.
+fn picked_collection(t: &mut TestUi, g: &mut GuideScreen) -> String {
+    t.nav.clear();
+    act(t, g, Action::GuideCategory);
+    let menus = opened(t);
+    let Some(OverlayRequest::ContextMenu(spec)) = menus.last() else { panic!("picker: {menus:?}") };
+    spec.items.iter().find(|i| i.icon == tuner::ui::widgets::glyphs::CHECK).map(|i| i.label.clone()).unwrap_or_default()
+}
+
 #[test]
 fn guide_returns_focus_to_the_channel_just_watched() {
     let _one = one();
@@ -497,12 +511,61 @@ fn guide_returns_focus_to_the_channel_just_watched() {
     draw(&mut t, &mut g);
     act(&mut t, &mut g, Action::GuideWatch);
     // the user zapped to channel 15 in the player, then came back
-    t.snapshot = fake_playing(MediaRef::Channel(ids[14]), PlayableKind::Live, None, PlayOrigin::Guide);
+    t.snapshot = reloaded(fake_playing(MediaRef::Channel(ids[14]), PlayableKind::Live, None, PlayOrigin::Guide), 3);
     t.with_ctx(|ctx| g.on_enter(ctx, &Route::Guide { collection: None, focus: None }));
     t.nav.clear();
-    // Enter on a playing channel's programme opens the popover; Watch (w) → player (it plays)
+    // the focus is the playing channel: Watch (w) on it opens the player without a new play
     act(&mut t, &mut g, Action::GuideWatch);
     assert!(pushed(&t, &Route::Player), "the focused channel is the playing one");
+}
+
+/// Ctrl+G from Live enters with a focus; after Watch and zaps, coming back follows the zap
+/// (not the route's focus) and keeps the collection picked with `f` (DESIGN §13.0, §13.4).
+#[test]
+fn guide_return_beats_the_route_focus_and_keeps_the_picked_collection() {
+    let _one = one();
+    let (mut t, ids) = seeded(20, 20, None);
+    let news = t.lib.live.groups.iter().find(|g| g.name == "News").map(|g| g.id).expect("News");
+    let route = Route::Guide { collection: Some(Collection::Group(news)), focus: Some(ids[10]) };
+    let mut g = GuideScreen::default();
+    t.with_ctx(|ctx| g.on_enter(ctx, &route));
+    draw(&mut t, &mut g);
+    assert_eq!(picked_collection(&mut t, &mut g), "News");
+    // `f` → All channels
+    let all = {
+        let Some(OverlayRequest::ContextMenu(spec)) = opened(&t).pop() else { panic!() };
+        spec.items.iter().find(|i| i.label == "All channels").map(|i| i.action).unwrap()
+    };
+    t.with_ctx(|ctx| g.on_overlay_result(ctx, tuner::ui::overlays::OverlayResult::Chosen(all)));
+    draw(&mut t, &mut g);
+    act(&mut t, &mut g, Action::GuideWatch);
+    // zapped to channel 5 in the player, then Esc back to the same route
+    t.snapshot = reloaded(fake_playing(MediaRef::Channel(ids[4]), PlayableKind::Live, None, PlayOrigin::Guide), 5);
+    t.with_ctx(|ctx| g.on_enter(ctx, &route));
+    draw(&mut t, &mut g);
+    t.nav.clear();
+    act(&mut t, &mut g, Action::GuideWatch);
+    assert!(pushed(&t, &Route::Player), "the focus followed the zap, not the route's focus");
+    assert_eq!(picked_collection(&mut t, &mut g), "All channels", "the picked collection stays");
+
+    // the popover's Watch (the usual Enter path) counts as a guide launch too
+    t.snapshot = Arc::new(PlayerSnapshot::default());
+    t.with_ctx(|ctx| g.on_enter(ctx, &Route::Guide { collection: None, focus: Some(ids[2]) }));
+    draw(&mut t, &mut g);
+    t.nav.clear();
+    act(&mut t, &mut g, Action::Activate);
+    assert!(matches!(opened(&t).last(), Some(OverlayRequest::Programme { channel, .. }) if *channel == ids[2]));
+    t.snapshot = reloaded(fake_playing(MediaRef::Channel(ids[7]), PlayableKind::Live, None, PlayOrigin::Guide), 9);
+    t.with_ctx(|ctx| g.on_enter(ctx, &Route::Guide { collection: None, focus: Some(ids[2]) }));
+    t.nav.clear();
+    act(&mut t, &mut g, Action::GuideWatch);
+    assert!(pushed(&t, &Route::Player), "popover Watch → zap → back follows the zap");
+
+    // a fresh Ctrl+G (another route) focuses what it asks for, even after a newer load
+    t.snapshot = reloaded(t.snapshot.clone(), 11);
+    t.with_ctx(|ctx| g.on_enter(ctx, &Route::Guide { collection: None, focus: Some(ids[3]) }));
+    act(&mut t, &mut g, Action::GuideWatch);
+    player_until(&t, "channel 4 (the route's focus) plays", plays(MediaRef::Channel(ids[3])));
 }
 
 #[test]
@@ -788,13 +851,180 @@ fn live_empty_states() {
     h.step();
     h.step();
     assert!(has(&h, "Press Ctrl+F on any channel to add it here"));
-    // empty library → onboarding
-    let _ = h;
+    drop(h);
+
+    // everything in a group hidden: Enter is the "Show hidden" button (News = Channel 0 here)
+    let (mut t, _ids) = seeded(10, 0, None);
+    t.services()
+        .store
+        .writer()
+        .blocking(|c| Ok(c.execute("INSERT INTO item_override(source_id, kind, item_key, hidden, fp) VALUES (1, 'channel', ?1, 1, '')", [format!("m3u:seed{:011}", 0)])?))
+        .unwrap();
+    reload(&mut t);
+    let news = t.lib.live.groups.iter().find(|g| g.name == "News").map(|g| g.id).expect("News");
+    let mut s = LiveScreen::default();
+    t.with_ctx(|ctx| s.on_enter(ctx, &Route::Live { group: Some(news), channel: None }));
+    assert!(act(&mut t, &mut s, Action::Activate));
+    assert!(pushed(&t, &Route::Settings(tuner::ui::SettingsPage::Hidden)), "{:?}", t.nav);
+    let mut h = screen_harness(t, s, 1600.0);
+    h.step();
+    h.step();
+    assert!(has(&h, "Everything here is hidden") && has(&h, "Show hidden"));
+    drop(h);
+
+    // empty library → onboarding, by click or Enter
     let mut t = TestUi::new().unwrap();
     t.set_library(tuner::store::library::Library { built_at: 1, ..Default::default() });
+    let mut s = LiveScreen::default();
+    assert!(act(&mut t, &mut s, Action::Activate));
+    assert!(t.nav.iter().any(|n| matches!(n, NavRequest::Switch(Route::Onboarding(_)))), "{:?}", t.nav);
+    let mut g = GuideScreen::default();
+    t.nav.clear();
+    assert!(act(&mut t, &mut g, Action::Activate));
+    assert!(t.nav.iter().any(|n| matches!(n, NavRequest::Switch(Route::Onboarding(_)))), "guide: {:?}", t.nav);
     let mut h = screen_harness(t, LiveScreen::default(), 1600.0);
     h.step();
     assert!(has(&h, "No playlists yet"));
+}
+
+/// Alt+↓ under a non-custom sort switches to custom order and moves the CURSOR channel one
+/// place down in that order (provider groups and favourites lists alike).
+#[test]
+fn live_reorder_under_a_sort_moves_the_cursor_channel_in_custom_order() {
+    let _one = one();
+    let mut cfg = tuner::config::Config::default();
+    cfg.interface.live_sort = tuner::model::SortMode::NameAsc;
+    let (mut t, ids) = seeded(12, 0, Some(cfg.clone()));
+    let key = |i: usize| format!("m3u:seed{i:011}");
+    let all = t.lib.live.groups.iter().find(|g| g.name == "All").map(|g| g.id).expect("All");
+    let mut s = LiveScreen::default();
+    t.with_ctx(|ctx| s.on_enter(ctx, &Route::Live { group: Some(all), channel: None }));
+    // Name A–Z: Channel 0, Channel 1, Channel 10, …
+    act(&mut t, &mut s, Action::Down);
+    act(&mut t, &mut s, Action::Down);
+    act(&mut t, &mut s, Action::MoveDown);
+    assert!(t.toasts.iter().any(|x| x.text == "Switched to custom order"));
+    assert_eq!(t.config_edits.len(), 1, "the sort switch is queued");
+    let order = |t: &TestUi, k: String| t.db.query_row("SELECT user_order FROM item_override WHERE item_key = ?1", [k], |r| r.get::<_, Option<i64>>(0)).ok().flatten();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while order(&t, key(10)).is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!((order(&t, key(10)), order(&t, key(11))), (Some(11), Some(10)), "Channel 10 moved below Channel 11");
+    assert_eq!(order(&t, key(2)), Some(2), "Channel 2 stays");
+    // the cursor stays on the moved channel: Shift+Enter plays it
+    act(&mut t, &mut s, Action::ActivateAlt);
+    player_until(&t, "the moved channel", plays(MediaRef::Channel(ids[10])));
+
+    // a favourites list: list order ch2, ch0, ch1 — shown A–Z as ch0, ch1, ch2
+    t.services()
+        .store
+        .writer()
+        .blocking(move |c| {
+            let list = tuner::store::user::default_fav_list(c)?;
+            for i in [2usize, 0, 1] {
+                let it = ItemRef { source: SourceId(1), kind: ItemKind::Channel, key: ItemKey(format!("m3u:seed{i:011}")) };
+                tuner::store::user::set_favourite(c, list, &it, true, 0)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    reload(&mut t);
+    t.config_edits.clear();
+    t.toasts.clear();
+    let mut s = LiveScreen::default();
+    t.with_ctx(|ctx| s.on_enter(ctx, &Route::Live { group: None, channel: None }));
+    // cursor on ch0 (first A–Z); Alt+↓ moves it below ch1 in the list's own order
+    act(&mut t, &mut s, Action::MoveDown);
+    assert!(t.toasts.iter().any(|x| x.text == "Switched to custom order"), "favourites switch too");
+    let list_order = |t: &TestUi| {
+        let mut st = t.db.prepare("SELECT item_key FROM fav_item ORDER BY position").unwrap();
+        st.query_map([], |r| r.get::<_, String>(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+    };
+    let want = vec![key(2), key(1), key(0)];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while list_order(&t) != want && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(list_order(&t), want);
+}
+
+/// Long programme titles in the preview pane are truncated inside the pane; the time range
+/// stays visible (Wide and Medium).
+#[test]
+fn live_preview_text_stays_inside_the_pane() {
+    let _one = one();
+    for (layout, w) in [(LayoutClass::Wide, 1600.0), (LayoutClass::Medium, 790.0)] {
+        let (mut t, _ids) = seeded(3, 3, None);
+        let long = "An extraordinarily long programme title that keeps going well past the edge of any preview pane";
+        t.services().store.writer().blocking(move |c| Ok(c.execute("UPDATE programme SET title = ?1", [long])?)).unwrap();
+        t.layout = layout;
+        let mut s = LiveScreen::default();
+        t.with_ctx(|ctx| s.on_enter(ctx, &Route::Live { group: None, channel: None }));
+        let mut h = screen_harness(t, s, w);
+        for _ in 0..4 {
+            h.step();
+        }
+        let tx = texts(&shapes(&h));
+        let titles: Vec<Rect> = tx.iter().filter(|(x, _, _)| x.starts_with("An extraordinarily")).map(|(_, _, r)| *r).collect();
+        assert!(titles.len() >= 2, "{layout:?}: the now and upcoming titles are painted");
+        for r in &titles {
+            assert!(r.right() <= w + 0.5, "{layout:?}: a title ends at {} in a {w} pt window", r.right());
+        }
+        // the now programme's time range sits beside its (truncated) title, clear of it
+        let range = tx.iter().find(|(x, _, r)| x.contains(" – ") && titles.iter().any(|t| (t.center().y - r.center().y).abs() < t.height())).expect("time range beside the title");
+        assert!(range.2.right() <= w + 0.5 && titles.iter().all(|t| !t.intersects(range.2)), "{layout:?}: the time range {:?} overlaps a title", range.2);
+    }
+}
+
+/// A click on a group row opens it even when a hover already put the cursor there.
+#[test]
+fn live_click_opens_a_hovered_group() {
+    let _one = one();
+    let (mut t, _ids) = seeded(12, 0, None);
+    t.layout = LayoutClass::Wide;
+    let mut s = LiveScreen::default();
+    t.with_ctx(|ctx| s.on_enter(ctx, &Route::Live { group: None, channel: None }));
+    let mut h = screen_harness(t, s, 1600.0);
+    for _ in 0..3 {
+        h.step();
+    }
+    assert!(has(&h, "Channel 1"), "All channels is open");
+    h.get_by_label("All channels").hover();
+    h.step();
+    h.get_by_label("News").hover();
+    h.step();
+    h.get_by_label("News").click();
+    for _ in 0..3 {
+        h.step();
+    }
+    assert!(!has(&h, "Channel 1") && has(&h, "Channel 10"), "News is open");
+    assert_eq!(h.state().s.key_contexts(), [KeyContext::List]);
+}
+
+/// Opted-in preview autoplay never starts from hovering (the pointer moves the cursor too).
+#[test]
+fn live_hover_never_autoplays() {
+    let _one = one();
+    let mut cfg = tuner::config::Config::default();
+    cfg.interface.live_preview_autoplay = true;
+    cfg.interface.preview_delay_ms = 5;
+    let (mut t, _ids) = seeded(6, 0, Some(cfg));
+    t.layout = LayoutClass::Wide;
+    let mut s = LiveScreen::default();
+    t.with_ctx(|ctx| s.on_enter(ctx, &Route::Live { group: None, channel: None }));
+    let mut h = screen_harness(t, s, 1600.0);
+    for _ in 0..3 {
+        h.step();
+    }
+    // the row (its logo carries the same label)
+    h.query_all_by_label("Channel 3").next().expect("row").hover();
+    h.step();
+    for _ in 0..4 {
+        std::thread::sleep(Duration::from_millis(20));
+        h.step();
+    }
+    player_stays_idle(&h.state().t, 300);
 }
 
 #[test]
@@ -852,9 +1082,25 @@ fn info_banner_never_changes_the_context_and_controls_need_focus() {
     // window keys never show the banner
     act(&mut t, &mut p, Action::ToggleWindowFullscreen);
     assert!(!act(&mut t, &mut p, Action::Back));
+
     // seekable content uses the VOD context
     let p2 = player_with(&mut t, fake_playing(MediaRef::Movie(tuner::model::MovieId(1)), PlayableKind::Movie, None, PlayOrigin::Fullscreen));
     assert_eq!(p2.key_contexts(), [KeyContext::PlayerVod]);
+}
+
+/// A pause keeps the banner up after its timeout; Esc still hides it before leaving.
+#[test]
+fn esc_hides_the_banner_a_pause_keeps_up() {
+    let _one = one();
+    let mut cfg = tuner::config::Config::default();
+    cfg.interface.osd_timeout_ms = 1;
+    let (mut t, ids) = seeded(2, 0, Some(cfg));
+    let mut paused = (*fake_playing(MediaRef::Channel(ids[0]), PlayableKind::Live, None, PlayOrigin::Fullscreen)).clone();
+    paused.paused = true;
+    let mut p = player_with(&mut t, Arc::new(paused));
+    std::thread::sleep(Duration::from_millis(20));
+    assert!(act(&mut t, &mut p, Action::Back), "Esc hides the paused banner");
+    assert!(!act(&mut t, &mut p, Action::Back), "then the app handles Esc");
 }
 
 #[test]
@@ -940,6 +1186,47 @@ fn numeric_entry_tunes_by_channel_number() {
     act(&mut t, &mut p, Action::Digit(2));
     act(&mut t, &mut p, Action::Back);
     assert_eq!(p.key_contexts(), [KeyContext::PlayerLive]);
+    // another key commits the number (like the guide), then acts
+    act(&mut t, &mut p, Action::Digit(5));
+    act(&mut t, &mut p, Action::Mute);
+    assert_eq!(p.key_contexts(), [KeyContext::PlayerLive]);
+    player_until(&t, "channel 5", plays(MediaRef::Channel(ids[4])));
+}
+
+/// At 790 pt (a tiled half) every control is drawn — transport controls as glyphs — and
+/// controls focus mode only walks drawn controls.
+#[test]
+fn player_controls_fit_a_tiled_half() {
+    let _one = one();
+    let (mut t, ids) = seeded(3, 0, None);
+    t.layout = LayoutClass::Medium;
+    let mut snap = (*fake_playing(MediaRef::Channel(ids[0]), PlayableKind::Live, None, PlayOrigin::Fullscreen)).clone();
+    snap.tracks.audio = vec![tuner::player::Track {
+        id: 1,
+        kind: tuner::player::TrackKind::Audio,
+        title: Some("English (AC-3 5.1) Dolby Digital commentary".into()),
+        lang: Some("eng".into()),
+        codec: Some("ac3".into()),
+        default: true,
+        forced: false,
+        selected: true,
+        external: false,
+        channels: Some(6),
+    }];
+    let p = player_with(&mut t, Arc::new(snap));
+    let mut h = screen_harness(t, p, 790.0);
+    {
+        let ScreenApp { t, s } = h.state_mut();
+        t.with_ctx(|ctx| s.on_action(ctx, Action::FocusOsdControls));
+    }
+    for _ in 0..3 {
+        h.step();
+    }
+    for label in ["Previous channel", "Play / pause", "Next channel", "Audio", "Subtitles", "Guide", "History", "Info", "Fullscreen"] {
+        assert!(has(&h, label), "{label} is drawn at 790 pt");
+    }
+    // the transport controls are glyphs (no "Previous channel" text painted)
+    assert!(!texts(&shapes(&h)).iter().any(|(x, _, _)| x.contains("Previous channel")));
 }
 
 #[test]
@@ -1025,16 +1312,20 @@ fn mini_player_sits_bottom_right_and_toasts_avoid_it() {
         snap: Arc<PlayerSnapshot>,
         toasts: tuner::ui::widgets::toast::Toasts,
         result: Vec<Option<bool>>,
+        /// The app draws the mini-player (nothing else placed the video).
+        mini: bool,
     }
     let mut h = Harness::builder().with_size(egui::vec2(1600.0, 900.0)).build_ui_state(
         |ui, a: &mut App| {
             a.host.begin_frame();
-            let r = a.host.mini_player(ui.ctx(), &a.theme, &a.snap);
-            a.result.push(r);
+            if a.mini {
+                let r = a.host.mini_player(ui.ctx(), &a.theme, &a.snap);
+                a.result.push(r);
+            }
             let bottom = 900.0 - 26.0;
             a.toasts.show(ui.ctx(), &a.theme, a.host.mini_rect(), bottom);
         },
-        App { host: VideoHost::new(None), theme: theme.clone(), snap, toasts: Default::default(), result: Vec::new() },
+        App { host: VideoHost::new(None), theme: theme.clone(), snap, toasts: Default::default(), result: Vec::new(), mini: true },
     );
     h.state_mut().toasts.push(tuner::msg::Toast::info("Reminder set"));
     for _ in 0..3 {
@@ -1051,7 +1342,21 @@ fn mini_player_sits_bottom_right_and_toasts_avoid_it() {
     h.step();
     h.step();
     assert!(h.state().result.contains(&Some(false)));
+    let video = egui::pos2(mini.center().x, mini.top() + mini.height() * 0.3);
+    h.input_mut().events.push(egui::Event::PointerMoved(video));
+    h.step();
+    for pressed in [true, false] {
+        h.input_mut().events.push(egui::Event::PointerButton { pos: video, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+        h.step();
+    }
+    assert!(h.state().result.contains(&Some(true)), "a click on the video opens the player");
+    // a frame without the mini-player (a screen placed the video, Compact…): its rect goes
+    h.state_mut().mini = false;
+    h.step();
+    h.step();
+    assert!(h.state().host.mini_rect().is_none(), "no rect is avoided once the mini-player is gone");
     // nothing plays → no mini player
+    h.state_mut().mini = true;
     h.state_mut().snap = Arc::new(PlayerSnapshot::default());
     h.step();
     assert!(h.state().host.mini_rect().is_none());

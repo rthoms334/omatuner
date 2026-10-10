@@ -243,6 +243,9 @@ pub struct EpgGridState {
     /// Programme under the pointer (the screen loads its description into `hover_detail`).
     pub(crate) hovered: Option<ProgrammeId>,
     pub(crate) hover_detail: Option<(ProgrammeId, String)>,
+    /// Set by the guide screen each frame while the first guide import runs ("Loading guide…
+    /// 45 %"): shown instead of "No guide data" on rows without a mapping (DESIGN §13.12).
+    pub(crate) loading_label: Option<String>,
 }
 
 impl EpgGridState {
@@ -264,6 +267,7 @@ impl EpgGridState {
             clock_24h: true,
             hovered: None,
             hover_detail: None,
+            loading_label: None,
         }
     }
     /// Replace rows (collection/filter changed), keeping focus on the same channel if present.
@@ -531,6 +535,8 @@ struct Frame<'a> {
     now: Timestamp,
     view_start: Timestamp,
     view_end: Timestamp,
+    /// Gap label of a row without guide data.
+    no_guide: &'a str,
 }
 
 impl Frame<'_> {
@@ -588,7 +594,8 @@ pub fn epg_grid(
         }
     }
     let view_end = state.view_start + state.view_secs;
-    let f = Frame { theme, m, grid, now, view_start: state.view_start, view_end };
+    let no_guide = state.loading_label.clone().unwrap_or_else(|| "No guide data".to_owned());
+    let f = Frame { theme, m, grid, now, view_start: state.view_start, view_end, no_guide: &no_guide };
 
     // the focus row first so a deferred refocus resolves before its cell is painted
     state.resolve_focus(reader, budget);
@@ -606,7 +613,7 @@ pub fn epg_grid(
 
     let pointer = resp.hover_pos();
     let mut hovered: Option<(usize, Timestamp, Option<ProgrammeSlim>)> = None;
-    let mut header_hit: Option<ChannelId> = None;
+    let mut header_hit: Option<usize> = None;
     let mut loading = false;
     let y0 = grid.top() - (state.scroll_rows - first as f32) * row_h;
     let grid_painter = painter.with_clip_rect(grid);
@@ -622,7 +629,7 @@ pub fn epg_grid(
         let header = Rect::from_min_max(egui::pos2(rect.left(), y), egui::pos2(grid.left(), y + row_h));
         paint_header(ui, &header_painter, theme, images, live, &row, header, focus_row);
         if pointer.is_some_and(|p| header.contains(p) && grid.y_range().contains(p.y)) {
-            header_hit = Some(row.channel);
+            header_hit = Some(i);
         }
         // cells
         let cells = cells_of(progs.as_deref(), state.view_start - 3600, view_end + 3600);
@@ -658,15 +665,19 @@ pub fn epg_grid(
     if (state.view_start..view_end).contains(&now) {
         let x = f.x_of(now);
         painter.vline(x, egui::Rangef::new(ruler.bottom(), rect.bottom()), egui::Stroke::new(2.0, t.accent));
-        let marker = Rect::from_center_size(egui::pos2(x, ruler.bottom() - 3.0), egui::vec2(8.0, 6.0));
+        let rem = theme.rem();
+        let marker = Rect::from_center_size(egui::pos2(x, ruler.bottom() - 3.0 * rem), egui::vec2(8.0 * rem, 6.0 * rem));
         painter.rect_filled(marker, 0.0, t.accent);
     }
 
     // ---- clicks: the channel column watches, cells focus / open
-    if let Some(ch) = header_hit
+    if let Some(i) = header_hit
         && resp.clicked()
     {
-        outcome = GridOutcome::Watch(ch);
+        // focus the row first: a locked channel's PIN retry (`GuideWatch`) watches the focus
+        state.focus_at(i, state.focus_time, None);
+        state.refocus = true;
+        outcome = GridOutcome::Watch(state.rows[i].channel);
     }
     if let Some((row, tp, prog)) = hovered.clone() {
         state.hovered = prog.as_ref().map(|p| p.id);
@@ -805,7 +816,7 @@ fn paint_cell(p: &egui::Painter, f: &Frame<'_>, row: &GuideRow, cell: &Cell, r: 
             paint_row_state(p, inner, theme, RowState::Cursor);
             p.rect_stroke(inner, t.rounding, egui::Stroke::new(1.0, t.list_cursor_border), egui::StrokeKind::Inside);
         }
-        let label = if row.epg.is_none() { "No guide data" } else { "No information" };
+        let label = if row.epg.is_none() { f.no_guide } else { "No information" };
         let color = if focused { t.list_cursor_text } else { t.text_disabled };
         if text_w > 12.0 {
             text(p, egui::pos2(text_left, inner.center().y), Align2::LEFT_CENTER, label, FontId::proportional(theme.font(TypeToken::Body)), color, text_w);

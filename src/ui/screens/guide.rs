@@ -7,6 +7,11 @@
 //!
 //! "Last-used group": the collection picked in the guide this session; without one, the group
 //! of the channel playing (or All channels).
+//!
+//! Returning from the player: when the guide started the playback itself (Watch, catch-up, or
+//! the programme popover's Watch) and the same guide route is entered again after a new load,
+//! the focus follows the channel playing now (zaps included) and the collection the user
+//! picked stays; any other entry applies the route's collection / focus.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -15,13 +20,13 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Rect, RichText};
 
 use crate::keymap::{Action, KeyContext};
-use crate::model::{ChannelId, Collection, PlayOrigin, Reminder, SortMode, Timestamp};
+use crate::model::{ChannelId, Collection, MediaRef, PlayOrigin, Reminder, SortMode, Timestamp};
 use crate::msg::{AppEvent, DataScope, Toast};
-use crate::player::{PlayRequest, PlayerCommand, PlayerState};
+use crate::player::{PlayRequest, PlayerCommand, PlayerSnapshot, PlayerState};
 use crate::theme::{SpaceToken, TypeToken};
 use crate::ui::epg_grid::{self, EpgGridState, GridMetrics, GridOutcome, GuideRow, day_label};
 use crate::ui::overlays::{ContextMenuSpec, MenuItem, OverlayResult};
-use crate::ui::screens::live::{self, choice_action, choice_index, playing_channel};
+use crate::ui::screens::live::{self, GuideStatus, choice_action, choice_index, playing_channel};
 use crate::ui::video_host::Placement;
 use crate::ui::widgets::button::{ButtonStyle, button, icon_button};
 use crate::ui::widgets::{empty_state::empty_state, glyphs, section};
@@ -30,11 +35,15 @@ use crate::ui::{LayoutClass, OverlayRequest, Route, Screen, ScreenId, UiCtx};
 /// Numeric entry auto-commits after this long without a digit.
 const NUMERIC_COMMIT: Duration = Duration::from_millis(1500);
 
-/// Guide freshness for the header (DESIGN §13.12).
-#[derive(Debug, Clone, Copy, Default)]
-struct GuideInfo {
-    sources: i64,
-    max_stop: Option<Timestamp>,
+/// The guide data counts as stale after this long without an import (the status bar's rule).
+const GUIDE_STALE_S: i64 = 2 * 86_400;
+
+/// The channel of what plays (live or catch-up), whatever its state.
+fn played_channel(snap: &PlayerSnapshot) -> Option<ChannelId> {
+    match snap.playable.as_ref().map(|p| &p.media) {
+        Some(MediaRef::Channel(id) | MediaRef::Catchup { channel: id, .. }) => Some(*id),
+        _ => None,
+    }
 }
 
 #[derive(Default)]
@@ -48,11 +57,14 @@ pub struct GuideScreen {
     numeric: Option<(String, Instant)>,
     /// Collections offered by the open picker (choice index → collection).
     choices: Vec<Collection>,
-    /// A watch started from the guide: re-focus the playing channel when coming back.
-    launched: bool,
+    /// The guide started (or offered, through the popover) a playback: the player's load
+    /// generation at that moment. Coming back after a newer load re-focuses what plays.
+    launched: Option<u64>,
+    /// The route the guide was last entered with (a return re-enters the same one).
+    entered: Option<Route>,
     /// Keyboard focus rest (optional guide preview autoplay).
     rest: Option<(ChannelId, Instant)>,
-    info: Option<GuideInfo>,
+    guide: GuideStatus,
 }
 
 fn fav_signature(ctx: &UiCtx<'_>) -> u64 {
@@ -101,17 +113,15 @@ impl GuideScreen {
     fn refresh(&mut self, ctx: &mut UiCtx<'_>) {
         let coll = self.default_collection(ctx);
         let sig = (Arc::as_ptr(ctx.lib) as usize, fav_signature(ctx), ctx.config.interface.live_sort, Some(coll.clone()));
-        if self.reminders_dirty || self.grid.is_none() {
-            self.reminders = live::load_reminders(ctx);
+        if self.grid.is_none() {
+            self.reminders_dirty = true;
+        }
+        if self.reminders_dirty
+            && let Some(r) = live::load_reminders(ctx)
+        {
+            self.reminders = r;
             self.reminders_dirty = false;
             self.apply_reminders(ctx);
-        }
-        if self.info.is_none() {
-            self.info = Some(
-                ctx.db
-                    .query_row("SELECT count(*), max(max_stop) FROM epg_source WHERE enabled = 1", [], |r| Ok(GuideInfo { sources: r.get(0)?, max_stop: r.get(1)? }))
-                    .unwrap_or_default(),
-            );
         }
         if self.built.as_ref() == Some(&sig) && !self.dirty && self.grid.is_some() {
             return;
@@ -165,15 +175,17 @@ impl GuideScreen {
             GridOutcome::Open { programme, channel } => {
                 crate::ui::overlays::programme::set_zap_hint(programme, channel, self.zap(ctx));
                 ctx.open(OverlayRequest::Programme { programme, channel });
+                // its Watch / Catch up play from the guide too
+                self.launched = Some(ctx.player.load_generation);
             }
             GridOutcome::Watch(ch) => {
                 let zap = self.zap(ctx);
                 live::activate_channel(ctx, ch, zap, PlayOrigin::Guide, false, Action::GuideWatch);
-                self.launched = true;
+                self.launched = Some(ctx.player.load_generation);
             }
             GridOutcome::Catchup { channel, programme } => {
                 live::play_catchup(ctx, channel, &programme, Action::GuideCatchup);
-                self.launched = true;
+                self.launched = Some(ctx.player.load_generation);
             }
             GridOutcome::Remind { channel, programme } => {
                 let Some(ch) = ctx.lib.live.get(channel).cloned() else { return };
@@ -294,49 +306,65 @@ impl GuideScreen {
             if button(ui, theme, None, "Now", Default::default()).on_hover_text("Jump to now (n)").clicked() {
                 act = Some(Action::GuideNow);
             }
+            let (text, color) = self.status_line(ctx, view_start);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let (text, color) = self.status_line(ctx, view_start);
                 ui.add(egui::Label::new(RichText::new(text).size(theme.font(TypeToken::BodySmall)).color(color)).truncate());
             });
         });
         act
     }
 
-    /// Right side of the header: loading / stale / no-data notices, else key hints.
-    fn status_line(&self, ctx: &UiCtx<'_>, view_start: Timestamp) -> (String, egui::Color32) {
+    /// Right side of the header: loading / stale / no-data notices, else key hints. Stale and
+    /// ended use the status bar's wording (DESIGN §9.5, §13.12).
+    fn status_line(&mut self, ctx: &mut UiCtx<'_>, view_start: Timestamp) -> (String, egui::Color32) {
         let t = &ctx.theme.tokens;
-        let info = self.info.unwrap_or_default();
-        let epg_job = ctx.services.jobs.active().into_iter().find(|j| matches!(j.kind, crate::jobs::JobKind::RefreshEpg { .. }));
-        if let Some(j) = epg_job.filter(|_| info.max_stop.is_none()) {
-            let pct = j.fraction.map(|f| format!(" {} %", (f * 100.0).round() as i64)).unwrap_or_default();
-            return (format!("Loading guide…{pct}"), t.text_secondary);
+        let hints = ("f collection · [ ] day · n now · r remind".to_owned(), t.text_secondary);
+        if let Some(loading) = self.guide.loading_label(ctx) {
+            return (loading, t.text_secondary);
         }
+        let Some(info) = self.guide.info(ctx) else { return hints };
         if info.sources == 0 {
             return ("No guide yet — add one in Settings ▸ EPG".into(), t.text_secondary);
         }
+        let refresh = crate::keymap::GLOBAL.iter().find(|b| b.action == Action::RefreshSource).map(|b| b.chord.label()).unwrap_or_default();
         if let Some(stop) = info.max_stop {
             if stop <= ctx.now {
-                return (format!("{} Guide data ended — Ctrl+R refreshes", glyphs::WARNING), t.warning);
+                return (format!("{} Guide data ended · {refresh} refresh", glyphs::WARNING), t.warning);
             }
             if view_start >= stop {
                 return (format!("No guide data for {}", day_label(view_start + 3600)), t.text_secondary);
             }
         }
-        ("f collection · [ ] day · n now · r remind".into(), t.text_secondary)
+        if let Some(at) = info.last_refresh.filter(|at| ctx.now - at >= GUIDE_STALE_S) {
+            return (format!("{} Guide updated {} · {refresh} refresh", glyphs::WARNING, live::age_label(ctx.now, at)), t.warning);
+        }
+        hints
     }
 
+    /// The numeric entry box: digits + the channel they match (like the player's).
     fn draw_numeric(&self, ui: &egui::Ui, ctx: &UiCtx<'_>, area: Rect) {
         let Some((digits, _)) = &self.numeric else { return };
         let theme = ctx.theme;
         let t = &theme.tokens;
-        let font = egui::FontId::proportional(theme.font(TypeToken::Display));
         let p = ui.painter();
-        let g = p.layout_no_wrap(format!("{digits}_"), font, t.accent);
+        let g = p.layout_no_wrap(format!("{digits}_"), egui::FontId::proportional(theme.font(TypeToken::Display)), t.accent);
+        let name = digits.parse::<u32>().ok().and_then(|n| ctx.lib.live.by_number(n)).and_then(|id| ctx.lib.live.get(id)).map(|c| c.name.to_string());
+        let name_g = name.map(|n| {
+            let mut job = egui::text::LayoutJob::simple_singleline(n, egui::FontId::proportional(theme.font(TypeToken::Body)), t.text_secondary);
+            job.wrap = egui::text::TextWrapping::truncate_at_width((240.0 * theme.rem()).round());
+            p.layout_job(job)
+        });
         let pad = theme.space(SpaceToken::PopupPadding);
-        let r = Rect::from_min_size(egui::pos2(area.right() - g.size().x - 3.0 * pad, area.top() + pad), g.size() + egui::vec2(2.0 * pad, 2.0 * pad));
+        let gap = theme.space(SpaceToken::Sm);
+        let inner = egui::vec2(g.size().x.max(name_g.as_ref().map_or(0.0, |n| n.size().x)), g.size().y + name_g.as_ref().map_or(0.0, |n| gap + n.size().y));
+        let r = Rect::from_min_size(egui::pos2(area.right() - inner.x - 3.0 * pad, area.top() + pad), inner + egui::vec2(2.0 * pad, 2.0 * pad));
         p.rect_filled(r, t.rounding, t.card_bg);
         p.rect_stroke(r, t.rounding, egui::Stroke::new(t.card_border_width, t.popup_border), egui::StrokeKind::Inside);
+        let gh = g.size().y;
         p.galley(r.min + egui::vec2(pad, pad), g, t.accent);
+        if let Some(n) = name_g {
+            p.galley(r.min + egui::vec2(pad, pad + gh + gap), n, t.text_secondary);
+        }
     }
 
     /// Optional preview strip (Wide + `guide_preview`): video + the focused programme.
@@ -401,38 +429,48 @@ impl Screen for GuideScreen {
             self.refresh(ctx);
             return;
         };
-        if let Some(c) = collection {
+        // back from a playback the guide started (then maybe zapped): the same route again,
+        // a newer load, still the guide's stream
+        let snap = ctx.player.clone();
+        let returning = self.launched.take().is_some_and(|g| g != snap.load_generation) && snap.origin == Some(PlayOrigin::Guide) && self.entered.as_ref() == Some(route);
+        self.entered = Some(route.clone());
+        if !returning && let Some(c) = collection {
             self.collection = Some(c.clone());
         }
-        self.info = None;
+        self.guide = GuideStatus::default();
         self.refresh(ctx);
         let now = ctx.now;
-        let target = focus.or_else(|| if std::mem::take(&mut self.launched) { playing_channel(ctx.player) } else { None });
+        let target = if returning { played_channel(&snap).or(*focus) } else { *focus };
         if let (Some(ch), Some(g)) = (target, &mut self.grid) {
             g.jump_to(ch, now);
         }
     }
 
     fn on_event(&mut self, _ctx: &mut UiCtx<'_>, ev: &AppEvent) {
+        self.guide.on_event(ev);
         match ev {
             AppEvent::Data(DataScope::Reminders) => self.reminders_dirty = true,
             AppEvent::Data(DataScope::Epg) => {
                 self.dirty = true;
-                self.info = None;
                 if let Some(g) = &mut self.grid {
                     g.cache.invalidate();
                 }
             }
-            AppEvent::Data(DataScope::Favourites | DataScope::Sources | DataScope::All) => {
-                self.dirty = true;
-                self.info = None;
-            }
+            AppEvent::Data(DataScope::Favourites | DataScope::Sources | DataScope::All) => self.dirty = true,
             _ => {}
         }
     }
 
     fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
         self.refresh(ctx);
+        if ctx.lib.built_at != 0 && ctx.lib.is_empty() {
+            // "No playlists yet": Enter is the "Add playlist" button
+            if action == Action::Activate {
+                ctx.navigate(crate::ui::NavRequest::Switch(Route::Onboarding(crate::ui::OnboardingStart::AddSource)));
+                return true;
+            }
+            return false;
+        }
         if let Some(handled) = self.numeric_action(ctx, action) {
             return handled;
         }
@@ -502,7 +540,7 @@ impl Screen for GuideScreen {
         self.refresh(ctx);
         let theme = ctx.theme;
         if ctx.lib.built_at != 0 && ctx.lib.is_empty() {
-            if empty_state(ui, theme, glyphs::PLAYLIST, "No playlists yet", Some("Add an M3U playlist or an Xtream login to start watching."), Some("Add playlist")).is_some_and(|r| r.clicked()) {
+            if empty_state(ui, theme, glyphs::PLAYLIST, "No playlists yet", Some(live::EMPTY_LIBRARY_DETAIL), Some("Add playlist")).is_some_and(|r| r.clicked()) {
                 ctx.navigate(crate::ui::NavRequest::Switch(Route::Onboarding(crate::ui::OnboardingStart::AddSource)));
             }
             return;
@@ -539,8 +577,10 @@ impl Screen for GuideScreen {
         let compact_rows = ctx.config.interface.density == crate::config::Density::Compact;
         let metrics = GridMetrics::for_layout(ctx.layout, compact_rows, theme);
         let mut out = GridOutcome::None;
+        let loading = self.guide.loading_label(ctx);
         if let Some(g) = &mut self.grid {
             g.avoid = ctx.mini_rect;
+            g.loading_label = loading;
             g.clock_24h = ctx.config.interface.clock_24h;
             // hovered programme: load its description for the tooltip (one indexed read)
             if let Some(id) = g.hovered.filter(|id| g.hover_detail.as_ref().is_none_or(|(h, _)| h != id)) {

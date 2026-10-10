@@ -118,7 +118,9 @@ impl ProgrammeOverlay {
                 if p.contains(now) {
                     v.push(Act::Watch);
                 }
-                let row = crate::ui::epg_grid::GuideRow { channel: ch.id, epg: ch.epg_channel_id, tvg_shift_min: ch.tvg_shift_min, catchup_days: ch.catchup_days };
+                // the same archive rule as the guide's rows
+                let catchup_days = if ch.has_catchup { ch.catchup_days } else { 0 };
+                let row = crate::ui::epg_grid::GuideRow { channel: ch.id, epg: ch.epg_channel_id, tvg_shift_min: ch.tvg_shift_min, catchup_days };
                 if crate::ui::epg_grid::catchup_available(&row, p, now) {
                     v.push(Act::Catchup);
                 }
@@ -256,7 +258,7 @@ impl Overlay for ProgrammeOverlay {
                         ui.add_space(theme.space(SpaceToken::Sm));
                         ui.horizontal(|ui| {
                             let w = (ui.available_width() * 0.7).max(60.0);
-                            ui.allocate_ui(egui::vec2(w, 8.0), |ui| progress::progress_bar(ui, theme, s.progress(now), (3.0 * theme.rem()).round()));
+                            ui.allocate_ui(egui::vec2(w, (8.0 * theme.rem()).round()), |ui| progress::progress_bar(ui, theme, s.progress(now), (3.0 * theme.rem()).round()));
                             ui.label(RichText::new(time_left(s.stop - now)).size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
                         });
                     }

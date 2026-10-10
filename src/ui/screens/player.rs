@@ -13,6 +13,11 @@
 //! * End of playback: episode → "Next episode in 10 s" card; movie → marked watched, back to
 //!   its detail page.
 //! * Mouse: double-click toggles window fullscreen; wheel = volume (only here).
+//! * Controls row: transport controls (previous / play / next, skips, fullscreen) are glyphs,
+//!   the rest glyph + label; when that doesn't fit every control is a glyph, and controls
+//!   focus mode only walks the controls actually drawn.
+//! * Numeric entry: any key that isn't part of it commits the number, then acts (like the
+//!   guide).
 //!
 //! Owner: WP-11.
 //!
@@ -36,7 +41,7 @@ use crate::theme::{SpaceToken, Theme, TypeToken, with_alpha};
 use crate::ui::epg_grid::{hhmm, time_left, time_range};
 use crate::ui::layout::osd_scale;
 use crate::ui::overlays::OverlayResult;
-use crate::ui::screens::live::{self, playing_channel};
+use crate::ui::screens::live::{self, GuideStatus, playing_channel};
 use crate::ui::video_host::{Placement, osd_text};
 use crate::ui::widgets::list::{ListOutcome, ListState};
 use crate::ui::widgets::{glyphs, logo, slider};
@@ -124,6 +129,9 @@ impl Control {
             Control::Fullscreen => "Fullscreen",
         }
     }
+    /// Drawn as a glyph only (DESIGN §13.8 wireframe); the label stays the accessible name and
+    /// the hover text.
+    fn glyph_only(self) -> bool { matches!(self, Control::Prev | Control::PlayPause | Control::Next | Control::SkipBack | Control::SkipForward | Control::Fullscreen) }
 }
 
 /// Which OSD row has the controls focus (VOD has a seek bar row above the buttons).
@@ -170,6 +178,15 @@ pub struct PlayerScreen {
     /// Live content (`PlayerLive`) vs seekable (`PlayerVod`), from the snapshot.
     live_ctx: bool,
     wheel: f32,
+    /// Controls drawn in the last OSD frame (focus mode never lands on an undrawn one).
+    visible: Vec<Control>,
+    /// Height of the bottom OSD bar drawn this frame (the next-episode card sits above it).
+    bottom_bar: Option<f32>,
+    /// Esc hid the banner that a pause keeps up (cleared by anything that shows it).
+    banner_dismissed: bool,
+    /// An episode ended: its successor is looked up within the frame budget.
+    next_lookup: Option<EpisodeId>,
+    guide: GuideStatus,
 }
 
 /// The OSD scale of the current window.
@@ -190,11 +207,25 @@ fn zap_target(live_idx: &LiveIndex, snap: &PlayerSnapshot, forward: bool, skip_l
 }
 
 impl PlayerScreen {
-    fn show_banner(&mut self, ctx: &UiCtx<'_>) { self.banner_until = Some(Instant::now() + Duration::from_millis(u64::from(ctx.config.interface.osd_timeout_ms))); }
-
-    fn banner_visible(&self, snap: &PlayerSnapshot) -> bool {
-        self.osd_focus || self.panel.is_some() || snap.paused || self.banner_until.is_some_and(|t| Instant::now() < t)
+    fn show_banner(&mut self, ctx: &UiCtx<'_>) {
+        self.banner_until = Some(Instant::now() + Duration::from_millis(u64::from(ctx.config.interface.osd_timeout_ms)));
+        self.banner_dismissed = false;
     }
+
+    /// The passive banner is up (a pause keeps it up until Esc).
+    fn banner_shown(&self, snap: &PlayerSnapshot) -> bool { (snap.paused && !self.banner_dismissed) || self.banner_until.is_some_and(|t| Instant::now() < t) }
+
+    fn banner_visible(&self, snap: &PlayerSnapshot) -> bool { self.osd_focus || self.panel.is_some() || self.banner_shown(snap) }
+
+    /// The controls focus mode walks: those drawn last frame (a prefix of `controls`).
+    fn active_controls(&self, snap: &PlayerSnapshot, narrow: bool) -> Vec<Control> {
+        let all = Self::controls(snap, narrow);
+        let drawn: Vec<Control> = all.iter().copied().filter(|c| self.visible.contains(c)).collect();
+        if drawn.is_empty() { all } else { drawn }
+    }
+
+    /// Below 700 pt (× rem) the controls row collapses (DESIGN §13.8).
+    fn narrow(width: f32, theme: &Theme) -> bool { width < 700.0 * theme.rem() }
 
     fn controls(snap: &PlayerSnapshot, narrow: bool) -> Vec<Control> {
         use Control as C;
@@ -338,8 +369,9 @@ impl PlayerScreen {
                 self.commit_numeric(ctx);
                 Some(true)
             }
+            // anything else commits what was typed, then acts
             _ => {
-                self.numeric = None;
+                self.commit_numeric(ctx);
                 None
             }
         }
@@ -388,7 +420,7 @@ impl PlayerScreen {
             return None;
         }
         let snap = ctx.player.clone();
-        let controls = Self::controls(&snap, narrow);
+        let controls = self.active_controls(&snap, narrow);
         let n = controls.len();
         let seekable = !is_live(&snap) && snap.seekable;
         self.show_banner(ctx);
@@ -419,14 +451,8 @@ impl PlayerScreen {
         let media = ctx.player.playable.as_ref().map(|p| p.media.clone());
         match media {
             Some(MediaRef::Episode(id)) => {
-                let db = ctx.db;
-                let next = crate::store::vod::episode(db, id).and_then(|e| {
-                    let eps = crate::store::vod::episodes(db, e.series_id, None)?;
-                    Ok(eps.iter().position(|x| x.id == id).and_then(|i| eps.get(i + 1).cloned()))
-                });
-                if let Ok(Some(e)) = next {
-                    self.next_episode = Some(NextEpisode { id: e.id, label: format!("S{:02}E{:02} · {}", e.season, e.episode, e.title), at: Instant::now() + NEXT_EPISODE_DELAY });
-                }
+                self.next_lookup = Some(id);
+                self.find_next_episode(ctx);
             }
             Some(MediaRef::Movie(id)) => {
                 // watched is recorded by the player (progress `finished`); back to the movie
@@ -434,6 +460,27 @@ impl PlayerScreen {
                 ctx.push(Route::MovieDetail(id));
             }
             _ => {}
+        }
+    }
+
+    /// The episode after the one that ended (two indexed reads, inside the frame budget;
+    /// retried next frame when the budget is spent).
+    fn find_next_episode(&mut self, ctx: &mut UiCtx<'_>) {
+        let Some(id) = self.next_lookup else { return };
+        let db = ctx.db;
+        let Some(next) = ctx.budget.run(|| {
+            crate::store::vod::episode(db, id).and_then(|e| {
+                let eps = crate::store::vod::episodes(db, e.series_id, None)?;
+                Ok(eps.iter().position(|x| x.id == id).and_then(|i| eps.get(i + 1).cloned()))
+            })
+        }) else {
+            return;
+        };
+        self.next_lookup = None;
+        match next {
+            Ok(Some(e)) => self.next_episode = Some(NextEpisode { id: e.id, label: format!("S{:02}E{:02} · {}", e.season, e.episode, e.title), at: Instant::now() + NEXT_EPISODE_DELAY }),
+            Ok(None) => {}
+            Err(err) => tracing::debug!("next episode: {err}"),
         }
     }
 
@@ -450,7 +497,7 @@ impl PlayerScreen {
         let theme = ctx.theme;
         let t = &theme.tokens;
         let s = scale_of(ui);
-        let narrow = rect.width() < 700.0 * theme.rem();
+        let narrow = Self::narrow(rect.width(), theme);
         let pad = (theme.space(SpaceToken::PanelPadding) * s).round();
         let title_font = FontId::proportional((theme.font(TypeToken::Display) * s).round());
         let body_font = FontId::proportional((theme.font(TypeToken::Title) * s).round());
@@ -495,6 +542,7 @@ impl PlayerScreen {
         let bottom_h = pad * 2.0 + line * lines + ctrl_h + pad / 2.0;
         let bottom = Rect::from_min_max(egui::pos2(rect.left(), rect.bottom() - bottom_h), rect.max);
         p.rect_filled(bottom, 0.0, t.osd_scrim);
+        self.bottom_bar = Some(bottom_h);
         let inner = bottom.shrink2(egui::vec2(pad, pad));
         let mut y = inner.top();
         if live {
@@ -510,8 +558,12 @@ impl PlayerScreen {
                     p.rect_filled(fill, t.rounding, t.osd_accent);
                 }
                 None => {
-                    let msg = if ch.as_ref().is_some_and(|c| c.epg_channel_id.is_none()) { "No guide data" } else { "No information" };
-                    osd_text(&p, egui::pos2(inner.left(), y), Align2::LEFT_TOP, msg, body_font.clone(), with_alpha(t.osd_text, 0.7), inner.width());
+                    let msg = if ch.as_ref().is_some_and(|c| c.epg_channel_id.is_none()) {
+                        self.guide.loading_label(ctx).unwrap_or_else(|| "No guide data".to_owned())
+                    } else {
+                        "No information".to_owned()
+                    };
+                    osd_text(&p, egui::pos2(inner.left(), y), Align2::LEFT_TOP, &msg, body_font.clone(), with_alpha(t.osd_text, 0.7), inner.width());
                     y += line;
                 }
             }
@@ -550,20 +602,27 @@ impl PlayerScreen {
             y += line;
         }
 
-        // controls row
+        // controls row: labelled where the design labels them; all glyphs when that doesn't
+        // fit; whatever still doesn't fit isn't drawn (and focus mode skips it)
         let mut cx = inner.left();
         let cy = y + pad / 2.0;
         let mut clicked = None;
+        let text_of = |c: Control, glyphs_only: bool| {
+            if glyphs_only || c.glyph_only() { c.glyph(snap.paused).to_owned() } else { format!("{}  {}", c.glyph(snap.paused), control_text(c, snap)) }
+        };
+        let row_width = |glyphs_only: bool| -> f32 { controls.iter().map(|c| p.layout_no_wrap(text_of(*c, glyphs_only), small_font.clone(), t.osd_text).size().x + pad * 1.5).sum() };
+        let glyphs_only = narrow || row_width(false) > inner.width();
+        let mut drawn = Vec::with_capacity(controls.len());
         for (i, c) in controls.iter().enumerate() {
-            let label = if narrow { String::new() } else { format!("  {}", control_text(*c, snap)) };
-            let text = format!("{}{label}", c.glyph(snap.paused));
-            let g = p.layout_no_wrap(text.clone(), small_font.clone(), t.osd_text);
+            let g = p.layout_no_wrap(text_of(*c, glyphs_only), small_font.clone(), t.osd_text);
             let r = Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(g.size().x + pad, ctrl_h));
             if r.right() > inner.right() {
                 break;
             }
+            drawn.push(*c);
             let resp = ui.interact(r, ui.id().with(("osd-control", i)), egui::Sense::click());
             resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, c.label()));
+            let resp = if glyphs_only || c.glyph_only() { resp.on_hover_text(control_text(*c, snap)) } else { resp };
             let focused = self.osd_focus && self.row == OsdRow::Buttons && i == self.control.min(controls.len() - 1);
             if resp.hovered() || focused {
                 p.rect_filled(r, t.rounding, with_alpha(t.osd_text, 0.12));
@@ -577,6 +636,8 @@ impl PlayerScreen {
             }
             cx = r.right() + pad / 2.0;
         }
+        self.control = self.control.min(drawn.len().saturating_sub(1));
+        self.visible = drawn;
         if let Some((i, c)) = clicked {
             // a click on a control enters controls focus mode on it
             self.osd_focus = true;
@@ -631,6 +692,10 @@ impl PlayerScreen {
     }
 
     fn draw_panel(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect) {
+        if self.panel.is_none() {
+            return;
+        }
+        let loading = self.guide.loading_label(ctx);
         let Some(panel) = &mut self.panel else { return };
         let theme = ctx.theme;
         let t = &theme.tokens;
@@ -708,7 +773,7 @@ impl PlayerScreen {
                             None => now,
                         }
                     }
-                    None if ch.epg_channel_id.is_none() => "No guide data".into(),
+                    None if ch.epg_channel_id.is_none() => loading.clone().unwrap_or_else(|| "No guide data".into()),
                     None => "…".into(),
                 };
                 osd_text(&p, egui::pos2(x, r.top() + row_h * 0.72), Align2::LEFT_CENTER, &detail, small.clone(), with_alpha(t.osd_text, 0.7), r.right() - pad / 2.0 - x);
@@ -771,11 +836,12 @@ impl PlayerScreen {
             let name = digits.parse::<u32>().ok().and_then(|n| ctx.lib.live.by_number(n)).and_then(|id| ctx.lib.live.get(id)).map(|c| c.name.to_string()).unwrap_or_default();
             let g = p.layout_no_wrap(format!("{digits}_"), font, t.osd_accent);
             let r = Rect::from_min_size(egui::pos2(rect.right() - g.size().x - 3.0 * pad, rect.top() + pad * 6.0), g.size() + egui::vec2(2.0 * pad, 2.0 * pad));
-            let extra = if name.is_empty() { 0.0 } else { 24.0 * s };
+            let name_font = FontId::proportional((theme.font(TypeToken::Body) * s).round());
+            let extra = if name.is_empty() { 0.0 } else { (name_font.size * 2.0).round() };
             p.rect_filled(r.union(Rect::from_min_size(r.left_bottom(), egui::vec2(r.width(), extra))), t.rounding, t.osd_scrim);
             p.galley(r.min + egui::vec2(pad, pad), g, t.osd_accent);
             if !name.is_empty() {
-                osd_text(&p, egui::pos2(r.center().x, r.bottom() + 12.0 * s), Align2::CENTER_CENTER, &name, FontId::proportional((theme.font(TypeToken::Body) * s).round()), t.osd_text, r.width());
+                osd_text(&p, egui::pos2(r.center().x, r.bottom() + extra / 2.0), Align2::CENTER_CENTER, &name, name_font, t.osd_text, r.width());
             }
         }
         // flash message (track / delay / volume changes)
@@ -797,7 +863,10 @@ impl PlayerScreen {
             let font = FontId::proportional((theme.font(TypeToken::Title) * s).round());
             let small = FontId::proportional((theme.font(TypeToken::Body) * s).round());
             let w = (420.0 * s).min(rect.width() - 2.0 * pad);
-            let r = Rect::from_min_size(egui::pos2(rect.right() - w - pad, rect.bottom() - pad * 14.0), egui::vec2(w, font.size * 3.6 + 2.0 * pad));
+            let h = font.size * 3.6 + 2.0 * pad;
+            // above the bottom OSD bar while it shows, else near the bottom edge
+            let bottom = rect.bottom() - self.bottom_bar.unwrap_or(0.0) - 2.0 * pad;
+            let r = Rect::from_min_size(egui::pos2(rect.right() - w - pad, (bottom - h).max(rect.top() + pad)), egui::vec2(w, h));
             p.rect_filled(r, t.rounding, t.osd_scrim);
             p.rect_stroke(r, t.rounding, egui::Stroke::new(1.0, t.osd_accent), egui::StrokeKind::Inside);
             osd_text(&p, egui::pos2(r.left() + pad, r.top() + pad), Align2::LEFT_TOP, &format!("Next episode in {left} s"), font.clone(), t.osd_accent, w - 2.0 * pad);
@@ -879,6 +948,7 @@ impl Screen for PlayerScreen {
         self.osd_focus = false;
         self.panel = None;
         self.numeric = None;
+        self.visible.clear();
         self.live_ctx = is_live(ctx.player);
         if ctx.player.state != PlayerState::Idle {
             self.show_banner(ctx);
@@ -888,6 +958,7 @@ impl Screen for PlayerScreen {
     }
 
     fn on_event(&mut self, ctx: &mut UiCtx<'_>, ev: &AppEvent) {
+        self.guide.on_event(ev);
         // only while the fullscreen player was on screen last frame
         if ctx.video.placement() != Placement::Fullscreen {
             return;
@@ -897,6 +968,8 @@ impl Screen for PlayerScreen {
             AppEvent::Player(PlayerEvent::NowPlaying(p)) => {
                 self.live_ctx = p.kind.is_live();
                 self.next_episode = None;
+                self.next_lookup = None;
+                self.visible.clear();
                 self.show_banner(ctx);
             }
             _ => {}
@@ -905,6 +978,7 @@ impl Screen for PlayerScreen {
 
     fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
         self.live_ctx = is_live(ctx.player);
+        self.find_next_episode(ctx);
         if let Some(h) = self.numeric_action(ctx, action) {
             return h;
         }
@@ -948,7 +1022,7 @@ impl Screen for PlayerScreen {
             Action::FocusOsdControls => {
                 self.osd_focus = true;
                 self.row = OsdRow::Buttons;
-                self.control = Self::controls(ctx.player, narrow).iter().position(|c| *c == Control::PlayPause).unwrap_or(0);
+                self.control = self.active_controls(ctx.player, narrow).iter().position(|c| *c == Control::PlayPause).unwrap_or(0);
             }
             Action::LeaveOsdControls => self.osd_focus = false,
             Action::StreamInfo => self.toggle_info(ctx),
@@ -1004,8 +1078,10 @@ impl Screen for PlayerScreen {
                     self.info = false;
                     return true;
                 }
-                if self.banner_until.is_some_and(|t| Instant::now() < t) {
+                // the visible banner — also the one a pause keeps up — is the next rung
+                if self.banner_shown(ctx.player) {
                     self.banner_until = None;
+                    self.banner_dismissed = true;
                     return true;
                 }
                 return false;
@@ -1040,6 +1116,8 @@ impl Screen for PlayerScreen {
         let theme = ctx.theme;
         let snap = ctx.player.clone();
         self.live_ctx = is_live(&snap);
+        self.bottom_bar = None;
+        self.find_next_episode(ctx);
         if std::mem::take(&mut self.toggle_fullscreen) {
             let fs = ui.input(|i| i.viewport().fullscreen).unwrap_or(false);
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fs));

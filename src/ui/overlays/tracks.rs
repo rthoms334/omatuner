@@ -1,7 +1,8 @@
 //! Audio / subtitle track menu over the video (fixed dark scrim). Subtitle menu also has delay
 //! (−/+ 100 ms) and size rows. Owner: WP-11.
 //!
-//! A panel on the right of the window in OSD colours (`osd_scrim`, `osd_text`, `osd_accent`)
+//! A panel at the right edge of the window, vertically centred (clear of the OSD bars and the
+//! controls row it is opened from), in OSD colours (`osd_scrim`, `osd_text`, `osd_accent`)
 //! so it stays legible over any video and in light themes. Enter picks a track (and closes);
 //! ←/→ on the delay and size rows adjust them (the menu stays open); Tab switches between the
 //! audio and subtitle menus; Esc or a click outside closes. Track data comes from the player
@@ -152,7 +153,7 @@ impl Overlay for TracksOverlay {
         let title_h = theme.font(TypeToken::Caption) * s * 2.0;
         let body_h = row_h * rows.len().max(1) as f32;
         let height = (title_h + body_h + 2.0 * pad).min(screen.height() - 2.0 * pad);
-        let panel = Rect::from_min_size(egui::pos2(screen.right() - width - pad, screen.bottom() - height - pad * 6.0).max(screen.min), egui::vec2(width, height));
+        let panel = Rect::from_min_size(egui::pos2(screen.right() - width - pad, screen.center().y - height / 2.0).max(screen.min), egui::vec2(width, height));
         let mut outcome = OverlayOutcome::Keep;
         // click outside closes (no theme scrim over the video)
         egui::Area::new(egui::Id::new("tracks-catcher")).movable(false).order(egui::Order::Foreground).fixed_pos(screen.min).show(egui_ctx, |ui| {

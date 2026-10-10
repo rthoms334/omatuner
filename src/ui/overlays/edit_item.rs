@@ -22,6 +22,7 @@ use crate::store::Ticket;
 use crate::theme::{SpaceToken, TypeToken};
 use crate::ui::widgets::button::{ButtonStyle, button};
 use crate::ui::widgets::card::CardKind;
+use crate::ui::screens::live;
 use crate::ui::widgets::{text_field::text_field, toggle::toggle};
 use crate::ui::{Route, UiCtx};
 
@@ -136,7 +137,8 @@ impl EditItemOverlay {
                 if self.lock_allowed(ctx) {
                     self.locked = !self.locked;
                 } else {
-                    self.error = Some("Unlock with your PIN first (Ctrl+L in a list)".into());
+                    // (not "Ctrl+L in a list": that would change that item's lock after the PIN)
+                    self.error = Some("Changing locks needs the parental PIN — enter it on any locked channel or group first".into());
                 }
             }
             Field::Hidden => self.hidden = !self.hidden,
@@ -273,6 +275,7 @@ impl Overlay for EditItemOverlay {
         self.cursor = self.cursor.min(fields.len() - 1);
         let cur = fields[self.cursor];
         let lock_ok = self.lock_allowed(ctx);
+        let lock_label = if live::pin_hint(ctx).is_empty() { "Locked (needs the parental PIN)".to_owned() } else { format!("Locked{}", live::pin_hint(ctx)) };
         let mut clicked: Option<Field> = None;
         let mut outcome = OverlayOutcome::Keep;
         let saving = self.pending.is_some();
@@ -353,7 +356,7 @@ impl Overlay for EditItemOverlay {
                         ui.add_space(theme.space(SpaceToken::Md));
                         ui.add_enabled_ui(lock_ok, |ui| {
                             let mut v = self.locked;
-                            if toggle(ui, theme, &mut v, "Locked (needs the parental PIN)", focused).changed() {
+                            if toggle(ui, theme, &mut v, &lock_label, focused).changed() {
                                 self.locked = v;
                             }
                         });
