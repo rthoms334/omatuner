@@ -3,22 +3,729 @@
 //! `store::vod::next_episode`; Enter plays, Shift+Enter from the start, Ctrl+W marks watched,
 //! bulk "mark season watched" in the context menu. Key context `[Detail]`. End of an episode:
 //! "Next episode in 10 s" card (Enter = now, Esc = cancel). Owner: WP-12.
+//!
+//! Data is read off the UI thread (series, seasons, episodes, per-episode progress and the
+//! episode to open at) and re-read on `DataScope::{VodDetails, Progress, Overrides}`; Xtream
+//! series without loaded details submit `JobKind::LoadSeriesDetails` and show a skeleton.
+//! When an episode this page started ends (watched) while the fullscreen player shows it,
+//! the resume overlay opens in its "Next episode in 10 s" mode for the following episode.
 
-use eframe::egui;
+use std::collections::HashMap;
 
+use eframe::egui::{self, Align2};
+
+use super::home::kit::{self, Loader};
+use super::movie_detail::{DetailHeader, fraction, resumable, resume_or_play};
+use crate::jobs::{JobEvent, JobKind};
 use crate::keymap::{Action, KeyContext};
-use crate::ui::widgets::glyphs;
-use crate::ui::{Route, Screen, ScreenId, UiCtx};
+use crate::model::{Episode, EpisodeId, ItemKey, ItemKind, ItemRef, MediaRef, PlayOrigin, Series, SeriesId, SourceKind, VodKind, WatchProgress};
+use crate::msg::{AppEvent, DataScope};
+use crate::player::PlayerEvent;
+use crate::theme::{SpaceToken, TypeToken};
+use crate::ui::overlays::{ContextMenuSpec, MenuItem, OverlayResult, ResumeSpec};
+use crate::ui::video_host::Placement;
+use crate::ui::widgets::button::{ButtonStyle, button};
+use crate::ui::widgets::{RowState, empty_state, glyphs, rows, section};
+use crate::ui::{OverlayRequest, Route, Screen, ScreenId, UiCtx};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Section {
+    Buttons,
+    Seasons,
+    #[default]
+    Episodes,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Btn {
+    Play,
+    Favourite,
+    SeasonWatched,
+}
+
+/// Context-menu choices (echoed back as `Action::Digit`).
+const MENU_SEASON_WATCHED: u8 = 1;
+const MENU_SEASON_UNWATCHED: u8 = 2;
+
+#[derive(Debug, Clone)]
+struct Data {
+    series: Series,
+    /// Season numbers in order (from the season rows and the episodes).
+    seasons: Vec<u32>,
+    episodes: Vec<Episode>,
+    progress: HashMap<ItemKey, WatchProgress>,
+    next: Option<EpisodeId>,
+}
+
+impl Data {
+    fn season_episodes(&self, season: u32) -> Vec<&Episode> { self.episodes.iter().filter(|e| e.season == season).collect() }
+}
+
+fn load(c: &rusqlite::Connection, id: SeriesId) -> crate::error::Result<Data> {
+    use crate::store::{user, vod};
+    let series = vod::series(c, id)?;
+    let mut seasons: Vec<u32> = vod::seasons(c, id)?.into_iter().map(|s| s.number).collect();
+    let episodes = vod::episodes(c, id, None)?;
+    for e in &episodes {
+        if !seasons.contains(&e.season) {
+            seasons.push(e.season);
+        }
+    }
+    seasons.sort_unstable();
+    seasons.dedup();
+    let mut progress = HashMap::new();
+    for e in &episodes {
+        if let Some(p) = user::progress(c, &episode_ref(e))? {
+            progress.insert(e.key.clone(), p);
+        }
+    }
+    let next = vod::next_episode(c, id)?.map(|e| e.id);
+    Ok(Data { series, seasons, episodes, progress, next })
+}
+
+fn episode_ref(e: &Episode) -> ItemRef { ItemRef { source: e.source_id, kind: ItemKind::Episode, key: e.key.clone() } }
+
+/// "S01E03 · Pilot".
+fn episode_label(e: &Episode) -> String { format!("S{:02}E{:02} · {}", e.season, e.episode, e.title) }
 
 #[derive(Default)]
 pub struct SeriesDetailScreen {
-    // WP-12: screen state (private; free to reshape)
+    id: Option<SeriesId>,
+    data: Option<Data>,
+    loader: Option<Loader<Data>>,
+    missing: bool,
+    details_requested: Option<SeriesId>,
+    section: Section,
+    btn: usize,
+    season: usize,
+    /// Cursor inside the current season's episodes.
+    ep: usize,
+    /// Place the cursor on the next episode when the data arrives (first load of a series).
+    position_pending: bool,
+    scroll_to_cursor: bool,
+    /// The episode this page started (end-of-playback card).
+    started: Option<EpisodeId>,
+}
+
+impl SeriesDetailScreen {
+    fn reload(&mut self, ctx: &UiCtx<'_>) {
+        let Some(id) = self.id else { return };
+        self.loader = Some(Loader::start(ctx, move |c| load(c, id)));
+    }
+
+    fn season_number(&self) -> Option<u32> { self.data.as_ref().and_then(|d| d.seasons.get(self.season).copied()) }
+
+    fn current_episodes(&self) -> Vec<&Episode> {
+        match (&self.data, self.season_number()) {
+            (Some(d), Some(s)) => d.season_episodes(s),
+            _ => Vec::new(),
+        }
+    }
+
+    fn focused_episode(&self) -> Option<Episode> { self.current_episodes().get(self.ep).map(|e| (*e).clone()) }
+
+    /// The next episode to watch (button "Play S01E03"): the stored one, else the first.
+    fn next_episode(&self) -> Option<Episode> {
+        let d = self.data.as_ref()?;
+        d.next.and_then(|id| d.episodes.iter().find(|e| e.id == id)).or(d.episodes.first()).cloned()
+    }
+
+    fn series_ref(&self) -> Option<ItemRef> {
+        self.data.as_ref().map(|d| ItemRef { source: d.series.source_id, kind: ItemKind::Series, key: d.series.key.clone() })
+    }
+
+    fn locked(&self, ctx: &UiCtx<'_>) -> bool {
+        let locked = self.data.as_ref().map(|d| d.series.locked).or_else(|| self.id.and_then(|id| ctx.lib.vod.find(VodKind::Series(id))).map(|v| v.locked)).unwrap_or(false);
+        locked && !kit::unlocked(ctx)
+    }
+
+    /// Put the cursor on `id` (switching season).
+    fn select_episode(&mut self, id: EpisodeId) {
+        let Some(d) = &self.data else { return };
+        let Some(e) = d.episodes.iter().find(|e| e.id == id) else { return };
+        if let Some(si) = d.seasons.iter().position(|s| *s == e.season) {
+            self.season = si;
+            self.ep = d.season_episodes(e.season).iter().position(|x| x.id == id).unwrap_or(0);
+            self.scroll_to_cursor = true;
+        }
+    }
+
+    fn set_season(&mut self, idx: usize) {
+        let n = self.data.as_ref().map_or(0, |d| d.seasons.len());
+        if n == 0 {
+            return;
+        }
+        let idx = idx.min(n - 1);
+        if idx != self.season {
+            self.season = idx;
+            self.ep = 0;
+            self.scroll_to_cursor = true;
+        }
+    }
+
+    fn play(&mut self, ctx: &mut UiCtx<'_>, e: &Episode, from_start: bool, alt: bool) {
+        if self.locked(ctx) {
+            kit::ask_pin(ctx, if alt { Action::ActivateAlt } else { Action::Activate }, "This series is locked");
+            return;
+        }
+        self.started = Some(e.id);
+        if from_start {
+            kit::play_media(ctx, MediaRef::Episode(e.id), false, PlayOrigin::Fullscreen);
+        } else {
+            resume_or_play(ctx, MediaRef::Episode(e.id), &episode_ref(e), episode_label(e), PlayOrigin::Fullscreen);
+        }
+    }
+
+    fn buttons(&self) -> [Btn; 3] { [Btn::Play, Btn::Favourite, Btn::SeasonWatched] }
+
+    fn season_watched(&self) -> bool {
+        let eps = self.current_episodes();
+        let d = self.data.as_ref();
+        !eps.is_empty() && eps.iter().all(|e| d.and_then(|d| d.progress.get(&e.key)).is_some_and(|p| p.finished))
+    }
+
+    fn mark(&mut self, ctx: &mut UiCtx<'_>, eps: Vec<Episode>, on: bool) {
+        if eps.is_empty() {
+            return;
+        }
+        let items: Vec<(ItemRef, String)> = eps.iter().map(|e| (episode_ref(e), episode_label(e))).collect();
+        let now = ctx.now;
+        let _ = ctx.services.store.writer().submit_notify(DataScope::Progress, move |c| crate::store::user::mark_watched(c, &items, on, now));
+        // optimistic; the reload on DataScope::Progress confirms it
+        if let Some(d) = &mut self.data {
+            for e in &eps {
+                if on {
+                    let p = d.progress.entry(e.key.clone()).or_insert_with(|| WatchProgress {
+                        item: episode_ref(e),
+                        position_s: 0.0,
+                        duration_s: None,
+                        updated_at: now,
+                        finished: true,
+                        title: String::new(),
+                        fingerprint: Default::default(),
+                    });
+                    p.finished = true;
+                } else {
+                    d.progress.remove(&e.key);
+                }
+            }
+        }
+    }
+
+    fn press(&mut self, ctx: &mut UiCtx<'_>, b: Btn) {
+        match b {
+            Btn::Play => {
+                if let Some(e) = self.next_episode() {
+                    self.play(ctx, &e, false, false);
+                }
+            }
+            Btn::Favourite => {
+                if let Some(item) = self.series_ref() {
+                    kit::toggle_favourite(ctx, &item);
+                }
+            }
+            Btn::SeasonWatched => {
+                let on = !self.season_watched();
+                let eps = self.current_episodes().into_iter().cloned().collect();
+                self.mark(ctx, eps, on);
+            }
+        }
+    }
+
+    fn move_vertical(&mut self, down: bool) {
+        let n_eps = self.current_episodes().len();
+        match (self.section, down) {
+            (Section::Buttons, true) => self.section = Section::Seasons,
+            (Section::Seasons, true) => self.section = Section::Episodes,
+            (Section::Seasons, false) => self.section = Section::Buttons,
+            (Section::Episodes, false) if self.ep == 0 => self.section = Section::Seasons,
+            (Section::Episodes, false) => self.ep -= 1,
+            (Section::Episodes, true) => self.ep = (self.ep + 1).min(n_eps.saturating_sub(1)),
+            (Section::Buttons, false) => {}
+        }
+        self.scroll_to_cursor = true;
+    }
+
+    /// After an episode ended: the episode after `key` (next in season order), if any.
+    fn after(&self, key: &ItemKey) -> Option<Episode> {
+        let d = self.data.as_ref()?;
+        let i = d.episodes.iter().position(|e| &e.key == key)?;
+        d.episodes.get(i + 1).cloned()
+    }
 }
 
 impl Screen for SeriesDetailScreen {
     fn id(&self) -> ScreenId { ScreenId::SeriesDetail }
     fn key_contexts(&self) -> Vec<KeyContext> { vec![KeyContext::Detail] }
-    fn on_enter(&mut self, ctx: &mut UiCtx<'_>, route: &Route) {}
-    fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool { false }
-    fn ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) { super::placeholder(ui, ctx, glyphs::SERIES, "Series", "WP-12") }
+
+    fn on_enter(&mut self, ctx: &mut UiCtx<'_>, route: &Route) {
+        let Route::SeriesDetail(id) = route else { return };
+        if self.id != Some(*id) {
+            self.data = None;
+            self.section = Section::Episodes;
+            self.season = 0;
+            self.ep = 0;
+            self.btn = 0;
+            self.position_pending = true;
+        }
+        self.id = Some(*id);
+        self.missing = false;
+        self.reload(ctx);
+    }
+
+    fn on_event(&mut self, ctx: &mut UiCtx<'_>, ev: &AppEvent) {
+        let Some(id) = self.id else { return };
+        match ev {
+            AppEvent::Data(DataScope::VodDetails | DataScope::Progress | DataScope::Overrides | DataScope::Vod | DataScope::All) => self.reload(ctx),
+            AppEvent::Job(JobEvent::Finished { kind: JobKind::LoadSeriesDetails(s), outcome: Err(msg), .. }) if *s == id => {
+                ctx.toast(crate::msg::Toast::error(format!("Couldn't load the episodes: {}", crate::redact::redact(msg))));
+            }
+            AppEvent::Player(PlayerEvent::Ended { item: Some(item), finished }) if item.kind == ItemKind::Episode => {
+                let Some(ended) = self.data.as_ref().and_then(|d| d.episodes.iter().find(|e| e.key == item.key && e.source_id == item.source)).cloned() else { return };
+                self.reload(ctx);
+                let next = self.after(&ended.key);
+                if let Some(n) = &next {
+                    self.select_episode(n.id);
+                }
+                // DESIGN §13.6: "Next episode in 10 s" over the video (Enter = now, Esc = stay)
+                if *finished && self.started == Some(ended.id) && ctx.video.placement() == Placement::Fullscreen {
+                    self.started = next.as_ref().map(|n| n.id);
+                    if let Some(n) = next {
+                        ctx.open(OverlayRequest::Resume(ResumeSpec {
+                            media: MediaRef::Episode(n.id),
+                            title: episode_label(&n),
+                            position_s: 0.0,
+                            duration_s: n.duration_s.map(f64::from),
+                        }));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
+        match action {
+            Action::Up => self.move_vertical(false),
+            Action::Down => self.move_vertical(true),
+            Action::Left | Action::Right => {
+                let d: isize = if action == Action::Left { -1 } else { 1 };
+                match self.section {
+                    Section::Buttons => self.btn = (self.btn as isize + d).clamp(0, self.buttons().len() as isize - 1) as usize,
+                    Section::Seasons => self.set_season((self.season as isize + d).max(0) as usize),
+                    Section::Episodes => {}
+                }
+            }
+            Action::TabPrev => self.set_season(self.season.saturating_sub(1)),
+            Action::TabNext => self.set_season(self.season + 1),
+            Action::FocusNext | Action::FocusPrev => {
+                let order = [Section::Buttons, Section::Seasons, Section::Episodes];
+                let i = order.iter().position(|s| *s == self.section).unwrap_or(0);
+                let next = if action == Action::FocusNext { (i + 1) % 3 } else { (i + 2) % 3 };
+                self.section = order[next];
+            }
+            Action::PageUp | Action::Home if self.section == Section::Episodes => {
+                self.ep = 0;
+                self.scroll_to_cursor = true;
+            }
+            Action::PageDown | Action::End if self.section == Section::Episodes => {
+                self.ep = self.current_episodes().len().saturating_sub(1);
+                self.scroll_to_cursor = true;
+            }
+            Action::Activate => match self.section {
+                Section::Buttons => {
+                    let b = self.buttons()[self.btn.min(2)];
+                    self.press(ctx, b);
+                }
+                Section::Seasons => self.section = Section::Episodes,
+                Section::Episodes => {
+                    if let Some(e) = self.focused_episode() {
+                        self.play(ctx, &e, false, false);
+                    }
+                }
+            },
+            Action::ActivateAlt => {
+                let e = if self.section == Section::Episodes { self.focused_episode() } else { self.next_episode() };
+                if let Some(e) = e {
+                    self.play(ctx, &e, true, true);
+                }
+            }
+            Action::MarkWatched => {
+                if let Some(e) = self.focused_episode() {
+                    let on = !self.data.as_ref().and_then(|d| d.progress.get(&e.key)).is_some_and(|p| p.finished);
+                    self.mark(ctx, vec![e], on);
+                }
+            }
+            Action::ToggleFavourite => self.press(ctx, Btn::Favourite),
+            Action::ToggleLock => {
+                if let Some(item) = self.series_ref() {
+                    let locked = self.data.as_ref().is_some_and(|d| d.series.locked);
+                    kit::toggle_lock(ctx, &item, locked);
+                }
+            }
+            Action::ContextMenu => {
+                let items = vec![
+                    MenuItem { icon: glyphs::CHECK, label: "Mark season watched".into(), action: Action::Digit(MENU_SEASON_WATCHED), enabled: true, shortcut: None },
+                    MenuItem { icon: glyphs::CLOSE, label: "Mark season unwatched".into(), action: Action::Digit(MENU_SEASON_UNWATCHED), enabled: true, shortcut: None },
+                    MenuItem { icon: glyphs::CHECK, label: "Mark episode watched / unwatched".into(), action: Action::MarkWatched, enabled: self.focused_episode().is_some(), shortcut: Some("Ctrl+W".into()) },
+                    MenuItem { icon: glyphs::FAVOURITE, label: "Add to / remove from Favourites".into(), action: Action::ToggleFavourite, enabled: true, shortcut: Some("Ctrl+F".into()) },
+                ];
+                ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: "Series".into(), items }));
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn on_overlay_result(&mut self, ctx: &mut UiCtx<'_>, result: OverlayResult) {
+        match result {
+            OverlayResult::Chosen(Action::Digit(MENU_SEASON_WATCHED)) => {
+                let eps = self.current_episodes().into_iter().cloned().collect();
+                self.mark(ctx, eps, true);
+            }
+            OverlayResult::Chosen(Action::Digit(MENU_SEASON_UNWATCHED)) => {
+                let eps = self.current_episodes().into_iter().cloned().collect();
+                self.mark(ctx, eps, false);
+            }
+            OverlayResult::Chosen(a @ (Action::MarkWatched | Action::ToggleFavourite)) => {
+                self.on_action(ctx, a);
+            }
+            OverlayResult::Unlocked(a @ (Action::Activate | Action::ActivateAlt | Action::ToggleLock)) => {
+                self.on_action(ctx, a);
+            }
+            _ => {}
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) {
+        match kit::poll(&mut self.loader) {
+            Some(Ok(d)) => {
+                let lazy = d.series.details_loaded_at.is_none() && ctx.lib.source(d.series.source_id).is_some_and(|s| s.kind == SourceKind::Xtream);
+                if lazy && self.details_requested != Some(d.series.id) {
+                    self.details_requested = Some(d.series.id);
+                    ctx.services.jobs.submit(JobKind::LoadSeriesDetails(d.series.id));
+                }
+                let next = d.next;
+                let had_episodes = !d.episodes.is_empty();
+                self.data = Some(d);
+                if self.position_pending && had_episodes {
+                    self.position_pending = false;
+                    if let Some(n) = next {
+                        self.select_episode(n);
+                    }
+                }
+                let n = self.data.as_ref().map_or(0, |d| d.seasons.len());
+                self.season = self.season.min(n.saturating_sub(1));
+                self.ep = self.ep.min(self.current_episodes().len().saturating_sub(1));
+                self.missing = false;
+            }
+            Some(Err(crate::error::Error::NotFound(_))) => self.missing = true,
+            Some(Err(e)) => kit::error_toast(ctx, "Couldn't read this series", &e),
+            None => {}
+        }
+        let theme = ctx.theme;
+        let t = &theme.tokens;
+        if self.missing || self.id.is_none() {
+            empty_state::empty_state(ui, theme, glyphs::SERIES, "This series is no longer in your playlists", None, None);
+            return;
+        }
+        let summary = self.id.and_then(|id| ctx.lib.vod.find(VodKind::Series(id))).cloned();
+        let Some(data) = self.data.clone() else {
+            // list-level data while the page loads
+            let title = summary.as_ref().map(|s| s.name.to_string()).unwrap_or_default();
+            let header = DetailHeader { title: &title, meta: "", text: &[], poster: summary.as_ref().and_then(|s| s.poster.as_deref()), backdrop: None, playing: false, locked: false, loading: true };
+            header.show(ui, ctx, |_, _| {});
+            return;
+        };
+        let s = &data.series;
+        let mut meta = Vec::new();
+        if let Some(y) = s.year {
+            meta.push(y.to_string());
+        }
+        if let Some(g) = s.genre.clone().filter(|g| !g.is_empty()) {
+            meta.push(g);
+        }
+        if let Some(r) = s.rating.filter(|r| *r > 0.0) {
+            meta.push(format!("★ {r:.1}"));
+        }
+        let mut text = Vec::new();
+        if let Some(p) = s.plot.as_deref().filter(|p| !p.trim().is_empty()) {
+            text.push((p.to_owned(), false));
+        }
+        if let Some(c) = s.cast.as_deref().filter(|c| !c.trim().is_empty()) {
+            text.push((format!("Cast: {c}"), true));
+        }
+        let playing_ep = ctx.player.playable.as_ref().and_then(|p| match p.media {
+            MediaRef::Episode(id) => Some(id),
+            _ => None,
+        });
+        let playing = playing_ep.is_some_and(|id| data.episodes.iter().any(|e| e.id == id));
+        let fav = self.series_ref().is_some_and(|i| ctx.favs.is_fav(&i));
+        let next = self.next_episode();
+        let resume_at = next.as_ref().and_then(|e| data.progress.get(&e.key)).filter(|p| resumable(p, ctx.config.player.resume_min_s)).map(|p| p.position_s);
+        let season_watched = self.season_watched();
+        let loading = self.loader.is_some() && data.episodes.is_empty() || s.details_loaded_at.is_none() && data.episodes.is_empty();
+        let (section, btn_focus, season_idx, ep_idx) = (self.section, self.btn, self.season, self.ep);
+        let scroll = std::mem::take(&mut self.scroll_to_cursor);
+        let mut clicked_btn = None;
+        let mut clicked_season = None;
+        let mut clicked_ep: Option<(usize, bool)> = None;
+        egui::ScrollArea::vertical().id_salt("series-detail").auto_shrink([false, false]).show(ui, |ui| {
+            let header = DetailHeader { title: s.display_name(), meta: &meta.join(" · "), text: &text, poster: s.cover.as_deref(), backdrop: s.backdrop.as_deref(), playing, locked: s.locked, loading: false };
+            header.show(ui, ctx, |ui, ctx| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(theme.space(SpaceToken::Lg), theme.space(SpaceToken::Md));
+                    for (i, b) in self.buttons().iter().enumerate() {
+                        let (icon, label, primary, selected) = match b {
+                            Btn::Play => {
+                                let label = match (&next, resume_at) {
+                                    (Some(e), Some(at)) => format!("Resume S{:02}E{:02} {}", e.season, e.episode, kit::clock(at)),
+                                    (Some(e), None) => format!("Play S{:02}E{:02}", e.season, e.episode),
+                                    (None, _) => "Play".into(),
+                                };
+                                (glyphs::PLAY, label, true, false)
+                            }
+                            Btn::Favourite => (if fav { glyphs::FAVOURITE } else { glyphs::FAVOURITE_OFF }, if fav { "Favourite".into() } else { "Add to Favourites".into() }, false, fav),
+                            Btn::SeasonWatched => (glyphs::CHECK, if season_watched { "Season watched".into() } else { "Mark season watched".into() }, false, season_watched),
+                        };
+                        let style = ButtonStyle { primary, selected, bordered: true, focused: section == Section::Buttons && i == btn_focus, ..Default::default() };
+                        let enabled = !matches!(b, Btn::Play) || next.is_some();
+                        if ui.add_enabled_ui(enabled, |ui| button(ui, ctx.theme, Some(icon), &label, style)).inner.clicked() {
+                            clicked_btn = Some(i);
+                        }
+                    }
+                });
+            });
+            ui.add_space(theme.space(SpaceToken::Xxl));
+            if data.seasons.is_empty() {
+                if loading {
+                    section::section_header(ui, theme, "Episodes");
+                    for _ in 0..4 {
+                        let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), rows::row_height(theme, crate::config::Density::Comfortable, false) - 4.0), egui::Sense::hover());
+                        ui.painter().rect_filled(r, t.rounding, t.fill_field);
+                        ui.add_space(4.0);
+                    }
+                } else {
+                    empty_state::empty_state(ui, theme, glyphs::SERIES, "No episodes yet", Some("The provider lists no episodes for this series."), None);
+                }
+                return;
+            }
+            // season tabs
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = theme.space(SpaceToken::Xs);
+                for (i, n) in data.seasons.iter().enumerate() {
+                    let style = ButtonStyle { selected: i == season_idx, focused: section == Section::Seasons && i == season_idx, ..Default::default() };
+                    let label = if *n == 0 { "Specials".to_owned() } else { format!("Season {n}") };
+                    if button(ui, theme, None, &label, style).clicked() {
+                        clicked_season = Some(i);
+                    }
+                }
+                ui.label(egui::RichText::new("[ ]").size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
+            });
+            ui.add_space(theme.space(SpaceToken::Md));
+            let season = data.seasons.get(season_idx).copied().unwrap_or(0);
+            for (i, e) in data.season_episodes(season).into_iter().enumerate() {
+                let p = data.progress.get(&e.key);
+                let watched = p.is_some_and(|p| p.finished);
+                let cursor = section == Section::Episodes && i == ep_idx;
+                let selected = section != Section::Episodes && i == ep_idx;
+                let resp = rows::episode_row(ui, theme, e, p.and_then(fraction), watched, RowState::from_flags(cursor, selected));
+                if playing_ep == Some(e.id) {
+                    // now-playing marker (DESIGN §13.0), right of the watched check
+                    let x = resp.rect.right() - theme.space(SpaceToken::Lg) - if watched { theme.font(TypeToken::Icon) + theme.space(SpaceToken::Md) } else { 0.0 };
+                    ui.painter().text(egui::pos2(x, resp.rect.center().y), Align2::RIGHT_CENTER, glyphs::PLAY, egui::FontId::proportional(theme.font(TypeToken::Icon)), t.accent);
+                }
+                if (cursor || selected) && scroll {
+                    ui.scroll_to_rect(resp.rect, None);
+                }
+                if resp.double_clicked() {
+                    clicked_ep = Some((i, true));
+                } else if resp.clicked() {
+                    clicked_ep = Some((i, false));
+                }
+            }
+        });
+        if let Some(i) = clicked_btn {
+            self.section = Section::Buttons;
+            self.btn = i;
+            let b = self.buttons()[i];
+            self.press(ctx, b);
+        }
+        if let Some(i) = clicked_season {
+            self.section = Section::Seasons;
+            self.set_season(i);
+        }
+        if let Some((i, play)) = clicked_ep {
+            self.section = Section::Episodes;
+            self.ep = i;
+            if play && let Some(e) = self.focused_episode() {
+                self.play(ctx, &e, false, false);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{SourceId, StreamLocator};
+
+    fn ep(id: i64, season: u32, n: u32) -> Episode {
+        Episode {
+            id: EpisodeId(id),
+            series_id: SeriesId(1),
+            source_id: SourceId(1),
+            key: ItemKey(format!("e{id}")),
+            provider_id: None,
+            season,
+            episode: n,
+            title: format!("Episode {n}"),
+            plot: None,
+            duration_s: Some(2700),
+            still: None,
+            air_date: None,
+            rating: None,
+            stream: StreamLocator::Url { url: "http://x".into() },
+        }
+    }
+
+    fn screen() -> SeriesDetailScreen {
+        let series = Series {
+            id: SeriesId(1),
+            source_id: SourceId(1),
+            key: ItemKey("s".into()),
+            provider_id: None,
+            name: "Show".into(),
+            clean_name: "Show".into(),
+            rename: None,
+            year: None,
+            group_ids: vec![],
+            cover: None,
+            backdrop: None,
+            rating: None,
+            plot: None,
+            genre: None,
+            cast: None,
+            director: None,
+            release_date: None,
+            last_modified: None,
+            added_at: None,
+            provider_order: 0,
+            hidden: false,
+            locked: false,
+            details_loaded_at: Some(1),
+        };
+        let episodes = vec![ep(1, 1, 1), ep(2, 1, 2), ep(3, 2, 1), ep(4, 2, 2), ep(5, 2, 3)];
+        SeriesDetailScreen {
+            id: Some(SeriesId(1)),
+            data: Some(Data { series, seasons: vec![1, 2], episodes, progress: HashMap::new(), next: Some(EpisodeId(4)) }),
+            ..Default::default()
+        }
+    }
+
+    use crate::ui::NavRequest;
+    use crate::ui::screens::home::testkit::{self, harness, has_label, rig, seed, until};
+
+    fn ep_progress(t: &crate::ui::testing::TestUi, key: &str) -> Option<WatchProgress> {
+        let item = ItemRef { source: SourceId(1), kind: ItemKind::Episode, key: ItemKey(key.into()) };
+        crate::store::user::progress(&t.services().store.reader().unwrap(), &item).unwrap()
+    }
+
+    #[test]
+    fn page_opens_at_the_next_episode_seasons_marks_and_the_up_next_card() {
+        let (mut t, one) = rig();
+        let ids = seed(&mut t, |c| {
+            let s = testkit::source(c, "My IPTV")?;
+            let ids = testkit::series(c, s, 1, 2, 3)?;
+            let p = |key: &str, pos: f64, finished: bool, at: i64| WatchProgress {
+                item: ItemRef { source: s, kind: ItemKind::Episode, key: ItemKey(key.into()) },
+                position_s: pos,
+                duration_s: Some(2700.0),
+                updated_at: at,
+                finished,
+                title: String::new(),
+                fingerprint: Default::default(),
+            };
+            crate::store::user::save_progress(c, &p("m3u:ep0-1-1", 2600.0, true, 5))?;
+            crate::store::user::save_progress(c, &p("m3u:ep0-1-2", 600.0, false, 6))?;
+            Ok(ids)
+        });
+        let mut h = harness(t, one, SeriesDetailScreen::default(), egui::vec2(1200.0, 900.0));
+        h.state_mut().enter(Route::SeriesDetail(ids[0]));
+        until(&mut h, "the episodes", |h| has_label(h, "Resume S01E02 10:00"));
+        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::Detail]);
+        assert!(has_label(&h, "Season 1") && has_label(&h, "Season 2"));
+        assert_eq!((h.state().s.season, h.state().s.ep), (0, 1), "opens at the episode in progress");
+        // Enter on it: the resume prompt
+        h.state_mut().act(Action::Activate);
+        let nav = h.state_mut().nav();
+        assert!(matches!(nav.as_slice(), [NavRequest::Open(OverlayRequest::Resume(r))] if r.position_s == 600.0), "{nav:?}");
+        // ] next season, [ back; Ctrl+W marks the focused episode
+        h.state_mut().act(Action::TabNext);
+        assert_eq!((h.state().s.season, h.state().s.ep), (1, 0));
+        h.state_mut().act(Action::MarkWatched);
+        until(&mut h, "S2E1 watched", |h| ep_progress(&h.state().t, "m3u:ep0-2-1").is_some_and(|p| p.finished));
+        // the context menu marks the whole season
+        h.state_mut().act(Action::ContextMenu);
+        let nav = h.state_mut().nav();
+        assert!(matches!(nav.as_slice(), [NavRequest::Open(OverlayRequest::ContextMenu(m))] if m.items[0].label == "Mark season watched"), "{nav:?}");
+        h.state_mut().result(OverlayResult::Chosen(Action::Digit(MENU_SEASON_WATCHED)));
+        until(&mut h, "season 2 watched", |h| (1..=3).all(|e| ep_progress(&h.state().t, &format!("m3u:ep0-2-{e}")).is_some_and(|p| p.finished)));
+        h.state_mut().act(Action::TabPrev);
+        assert_eq!(h.state().s.season, 0);
+        // Shift+Enter on S1E3 plays from the start, and the page remembers it started it
+        h.state_mut().act(Action::Down);
+        h.state_mut().act(Action::Down);
+        h.state_mut().act(Action::ActivateAlt);
+        assert_eq!(h.state_mut().nav(), vec![NavRequest::Push(Route::Player)]);
+        let s13 = h.state().s.focused_episode().unwrap();
+        assert_eq!((s13.season, s13.episode), (1, 3));
+        // it ends (watched) in the fullscreen player: "Next episode in 10 s" for S2E1
+        crate::ui::screens::movie_detail::tests::fullscreen_placement(&mut h.state_mut().t);
+        h.state().t.services().bus.send(AppEvent::Player(PlayerEvent::Ended { item: Some(episode_ref(&s13)), finished: true }));
+        h.run_steps(1);
+        let nav = h.state_mut().nav();
+        let next = h.state().s.data.as_ref().unwrap().episodes.iter().find(|e| e.season == 2 && e.episode == 1).unwrap().id;
+        assert!(
+            matches!(nav.as_slice(), [NavRequest::Open(OverlayRequest::Resume(r))] if r.position_s == 0.0 && r.media == MediaRef::Episode(next)),
+            "{nav:?}"
+        );
+    }
+
+    #[test]
+    fn opens_at_the_next_episode_and_walks_sections() {
+        let mut s = screen();
+        s.select_episode(EpisodeId(4));
+        assert_eq!((s.season, s.ep), (1, 1));
+        assert_eq!(s.next_episode().map(|e| e.id), Some(EpisodeId(4)));
+        s.move_vertical(true);
+        s.move_vertical(true);
+        assert_eq!(s.ep, 2);
+        s.move_vertical(true);
+        assert_eq!(s.ep, 2, "clamped at the last episode");
+        s.ep = 0;
+        s.move_vertical(false);
+        assert_eq!(s.section, Section::Seasons, "↑ from the first episode reaches the season tabs");
+        s.move_vertical(false);
+        assert_eq!(s.section, Section::Buttons);
+        s.set_season(0);
+        assert_eq!((s.season, s.ep), (0, 0));
+        s.set_season(9);
+        assert_eq!(s.season, 1, "clamped to the last season");
+        assert_eq!(s.after(&ItemKey("e2".into())).map(|e| e.id), Some(EpisodeId(3)), "the next episode crosses seasons");
+        assert!(s.after(&ItemKey("e5".into())).is_none());
+    }
+
+    #[test]
+    fn season_watched_follows_progress() {
+        let mut s = screen();
+        s.set_season(0);
+        assert!(!s.season_watched());
+        let d = s.data.as_mut().unwrap();
+        for e in d.episodes.clone().iter().filter(|e| e.season == 1) {
+            d.progress.insert(e.key.clone(), WatchProgress { item: episode_ref(e), position_s: 0.0, duration_s: None, updated_at: 0, finished: true, title: String::new(), fingerprint: Default::default() });
+        }
+        assert!(s.season_watched());
+        assert_eq!(episode_label(&ep(7, 1, 3)), "S01E03 · Episode 3");
+    }
 }
