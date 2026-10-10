@@ -21,9 +21,10 @@
 //!
 //! Esc ladder (DESIGN §15.1): the topmost overlay, then the screen get `Back` first (clear
 //! filter, close side panel, leave OSD controls, hide banner); what nobody handled reaches
-//! [`TunerApp::back`]: close a stray overlay → leave window fullscreen (player) → pop the
-//! route stack (leaving the player keeps the mini-player playing) → a parent for a lone
-//! sub-page (details → grid, Logs/EPG mapping → Settings, player → Live).
+//! [`TunerApp::back`]: close a stray overlay → leave window fullscreen (on any screen; the
+//! state follows the compositor's) → pop the route stack (leaving the player keeps the
+//! mini-player playing) → a parent for a lone sub-page (details → grid, Logs/EPG mapping →
+//! Settings, player → Live).
 //!
 //! Blocking work never runs here: log export goes to the blocking pool, the theme / fonts are
 //! (re)loaded on workers, the only I/O is indexed SQLite reads on the UI reader and the
@@ -46,7 +47,7 @@ use crate::images::ImageCache;
 use crate::ipc::IpcRequest;
 use crate::jobs::{JobKind, JobOutcome};
 use crate::keymap::{self, Action, KeyContext};
-use crate::model::{ChannelId, Collection, ItemKey, ItemKind, ItemRef, MediaRef, PlayOrigin, SourceId, Timestamp, ZapList};
+use crate::model::{ChannelId, Collection, GroupId, ItemKey, ItemKind, ItemRef, MediaRef, PlayOrigin, SourceId, Timestamp, ZapList};
 use crate::msg::{AppEvent, DataScope, Toast, ToastKind};
 use crate::platform::{PickPurpose, PlatformEvent};
 use crate::player::{PlayRequest, PlayerCommand, PlayerSnapshot, PlayerState};
@@ -100,7 +101,12 @@ pub struct TunerApp {
     /// next (possibly in the next batch of input).
     drop_alt_text: bool,
     idle: Option<crate::platform::idle::IdleInhibitor>,
+    /// Window fullscreen as last requested by the app, re-synced every frame from the
+    /// compositor's state (`ViewportInfo::fullscreen`) when the backend reports it.
     window_fullscreen: bool,
+    /// A channel played before the library knew it (`--play` at startup) and its primary
+    /// group: the zap list follows once the library lands.
+    pending_zap: Option<(ChannelId, GroupId)>,
     /// Route whose `on_enter` ran last (a new route — even of the same screen — re-enters).
     entered: Option<Route>,
     layout: LayoutClass,
@@ -172,6 +178,7 @@ impl TunerApp {
             drop_alt_text: false,
             idle,
             window_fullscreen: false,
+            pending_zap: None,
             entered: None,
             layout: LayoutClass::Wide,
             epg_updated: None,
@@ -253,6 +260,8 @@ impl TunerApp {
 
     fn handle_event(&mut self, ev: AppEvent, egui_ctx: &egui::Context) {
         match &ev {
+            // A load started before "follow Omarchy theme" was turned off may still land.
+            AppEvent::Theme(ThemeEvent::Changed(_)) if !self.services().config().integration.follow_omarchy_theme => {}
             AppEvent::Theme(ThemeEvent::Changed(t)) => {
                 self.theme = t.clone();
                 crate::theme::egui_style::apply(egui_ctx, &self.theme);
@@ -289,9 +298,15 @@ impl TunerApp {
         match outcome {
             Ok(JobOutcome::Library(lib)) => {
                 self.lib = lib.clone();
-                self.favs = lib.favs.clone();
+                // A favourite toggled while this library was being built is newer than
+                // `lib.favs`: re-read the set (the same ≤ 5 ms query as `DataScope::Favourites`).
+                self.favs = crate::store::library::load_favs(&self.db).unwrap_or_else(|e| {
+                    tracing::warn!("favourites: {e}");
+                    lib.favs.clone()
+                });
                 self.search_index = None;
                 self.refresh_epg_updated();
+                self.send_pending_zap();
             }
             Ok(JobOutcome::SourceRefreshed { source, account, .. }) => {
                 self.offline = false;
@@ -317,6 +332,22 @@ impl TunerApp {
                 self.offline = msg.contains("network error");
                 self.toast(Toast::error(format!("Couldn't refresh {what}: {}", crate::redact::redact(msg))));
             }
+        }
+    }
+
+    /// The zap list of a channel played before the library knew it, if that channel is still
+    /// what plays without one.
+    fn send_pending_zap(&mut self) {
+        let Some((id, group)) = self.pending_zap else { return };
+        let playing = self.snapshot.zap.is_none() && self.snapshot.playable.as_ref().is_none_or(|p| p.media == MediaRef::Channel(id));
+        if !playing {
+            self.pending_zap = None;
+            return;
+        }
+        let cfg = self.services().config();
+        if let Some(zap) = self.zap_list(group, &cfg) {
+            self.pending_zap = None;
+            self.send_player(PlayerCommand::SetZapList(zap));
         }
     }
 
@@ -378,8 +409,8 @@ impl TunerApp {
         }
         let mut play: Option<&str> = req.play.as_deref();
         for input in &req.inputs {
-            if is_playlist_file(input) {
-                self.nav.push(NavRequest::Switch(Route::Onboarding(OnboardingStart::PlaylistFile(PathBuf::from(input)))));
+            if let Some(path) = playlist_file(input) {
+                self.nav.push(NavRequest::Switch(Route::Onboarding(OnboardingStart::PlaylistFile(path))));
             } else if play.is_none() {
                 play = Some(input);
             }
@@ -391,6 +422,7 @@ impl TunerApp {
                 None => self.toast(Toast::error(format!("No channel {target} in your playlists"))),
             }
         } else {
+            self.pending_zap = None;
             self.send_player(PlayerCommand::Play(PlayRequest {
                 media: MediaRef::Url(target.to_owned()),
                 zap: None,
@@ -416,20 +448,35 @@ impl TunerApp {
 
     /// Play a channel fullscreen, zapping through its primary group (DESIGN §13.0). Locked
     /// channels need the parental PIN first (the app never bypasses it).
+    ///
+    /// The lock comes from the library, else (startup `--play`, hidden channel) from one
+    /// indexed DB read; a channel whose lock can't be read counts as locked.
     fn play_channel(&mut self, id: ChannelId, origin: PlayOrigin) {
         let cfg = self.services().config();
-        let (locked, group) = self.lib.live.get(id).map_or((false, None), |c| (c.locked, c.group_ids.first().copied()));
+        let in_lib = self.lib.live.get(id).map(|c| (c.locked, c.group_ids.first().copied()));
+        let (locked, group) = in_lib.unwrap_or_else(|| match crate::store::live::channel(&self.db, id) {
+            Ok(c) => (c.locked, c.group_ids.first().copied()),
+            Err(e) => {
+                tracing::warn!("channel {id:?}: {e}");
+                (true, None)
+            }
+        });
         if locked && !self.parental.is_unlocked(&cfg.parental) {
             self.toast(Toast::info("This channel is locked — unlock it with your PIN first"));
             return;
         }
-        let zap = group.map(|g| {
-            let collection = Collection::Group(g);
-            let channels = self.lib.live.collection(&collection, &self.favs, &self.lib.recent_channels, cfg.interface.live_sort);
-            ZapList { collection, channels: channels.into() }
-        });
+        let zap = group.and_then(|g| self.zap_list(g, &cfg));
+        // not in the library yet: send the zap list once it has loaded (`on_job_finished`)
+        self.pending_zap = group.filter(|_| zap.is_none() && in_lib.is_none()).map(|g| (id, g));
         self.send_player(PlayerCommand::Play(PlayRequest { media: MediaRef::Channel(id), zap, origin, resume: false, immediate: true }));
         self.nav.push(NavRequest::Push(Route::Player));
+    }
+
+    /// The visible channels of a group in the Live sort order; `None` when the library has none.
+    fn zap_list(&self, group: GroupId, cfg: &Config) -> Option<ZapList> {
+        let collection = Collection::Group(group);
+        let channels = self.lib.live.collection(&collection, &self.favs, &self.lib.recent_channels, cfg.interface.live_sort);
+        (!channels.is_empty()).then(|| ZapList { collection, channels: channels.into() })
     }
 
     /// Logs ▸ Export…: `LogBuffer::export` is blocking file I/O → blocking pool; the outcome
@@ -481,7 +528,7 @@ impl TunerApp {
         if !self.overlays.is_empty() {
             // an overlay that doesn't handle Back itself still closes on Esc
             self.overlays.pop();
-        } else if self.window_fullscreen && self.current_route().screen() == ScreenId::Player {
+        } else if self.window_fullscreen {
             self.set_window_fullscreen(false, egui_ctx);
         } else {
             self.nav.push(NavRequest::Back);
@@ -728,6 +775,11 @@ impl eframe::App for TunerApp {
         let egui_ctx = ui.ctx().clone();
         let width = egui_ctx.content_rect().width();
         self.layout = LayoutClass::from_width(width, self.theme.rem());
+        // the compositor's toggle, a double-click on video… (only the app's own requests are
+        // known otherwise)
+        if let Some(fs) = egui_ctx.input(|i| i.viewport().fullscreen) {
+            self.window_fullscreen = fs;
+        }
         self.budget.begin_frame();
         self.now_next.begin_frame();
         self.video.begin_frame();
@@ -895,9 +947,16 @@ fn route_for_view_name(name: &str) -> Option<Route> {
 }
 
 /// `.m3u` / `.m3u8` local file (a playlist to add, not a stream to play).
-fn is_playlist_file(input: &str) -> bool {
-    let lower = input.to_ascii_lowercase();
-    !lower.contains("://") && (lower.ends_with(".m3u") || lower.ends_with(".m3u8"))
+fn playlist_file(input: &str) -> Option<PathBuf> {
+    // `main` already turned `file://` URIs (desktop entry `%U`) into paths; an IPC client
+    // other than `main` might not have.
+    let path = match url::Url::parse(input) {
+        Ok(u) if u.scheme() == "file" => u.to_file_path().ok()?,
+        Ok(_) => return None,
+        Err(_) => PathBuf::from(input),
+    };
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    matches!(ext.as_str(), "m3u" | "m3u8").then_some(path)
 }
 
 /// `--play <source-id>:<item-key>` for a channel (`2:xt:live:1234`, `1:m3u:0123abcd…`);
@@ -971,6 +1030,8 @@ mod tests {
         ctx: egui::Context,
         frame: eframe::Frame,
         size: egui::Vec2,
+        /// What the window backend reports as the window's fullscreen state.
+        fullscreen: Option<bool>,
         dir: tempfile::TempDir,
         _one: std::sync::MutexGuard<'static, ()>,
     }
@@ -1011,7 +1072,7 @@ mod tests {
             let cc = eframe::CreationContext::_new_kittest(ctx.clone());
             let theme = Arc::new(scaled(Theme::fallback(), ui_scale));
             let app = TunerApp::new(&cc, services, events, theme, LoadedFonts::default(), initial);
-            let mut rig = Self { app, ctx, frame: eframe::Frame::_new_kittest(), size: egui::vec2(1280.0, 800.0), dir, _one: one };
+            let mut rig = Self { app, ctx, frame: eframe::Frame::_new_kittest(), size: egui::vec2(1280.0, 800.0), fullscreen: None, dir, _one: one };
             rig.frame_with(vec![]);
             rig
         }
@@ -1021,6 +1082,7 @@ mod tests {
 
         fn frame_raw(&mut self, events: Vec<Event>, hook: bool) -> egui::FullOutput {
             let mut raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.size)), events, ..Default::default() };
+            raw.viewports.entry(egui::ViewportId::ROOT).or_default().fullscreen = self.fullscreen;
             let Rig { app, ctx, frame, .. } = self;
             if hook {
                 app.raw_input_hook(ctx, &mut raw);
@@ -1036,8 +1098,10 @@ mod tests {
         fn press(&mut self, key: Key, modifiers: Modifiers) -> egui::FullOutput { self.frame_with(key_events(key, modifiers)) }
 
         /// Run frames until `done` or 10 s (background work finishing).
-        fn until(&mut self, what: &str, mut done: impl FnMut(&mut Self) -> bool) {
-            let deadline = Instant::now() + Duration::from_secs(10);
+        fn until(&mut self, what: &str, done: impl FnMut(&mut Self) -> bool) { self.until_within(what, Duration::from_secs(10), done) }
+
+        fn until_within(&mut self, what: &str, limit: Duration, mut done: impl FnMut(&mut Self) -> bool) {
+            let deadline = Instant::now() + limit;
             while !done(self) {
                 assert!(Instant::now() < deadline, "timed out waiting for {what}");
                 std::thread::sleep(Duration::from_millis(20));
@@ -1363,6 +1427,17 @@ mod tests {
         // 4. a tab root stays put
         rig.press(Key::Escape, NONE);
         assert_eq!(rig.app.routes, [Route::Live { group: None, channel: None }]);
+        // 5. fullscreen entered by the compositor (or a double-click on video) is left from
+        //    any screen
+        rig.fullscreen = Some(true);
+        rig.frame_with(vec![]);
+        assert!(rig.app.window_fullscreen, "follows the backend's state");
+        let out = rig.press(Key::Escape, NONE);
+        assert!(out.viewport_output.values().any(|v| v.commands.contains(&egui::ViewportCommand::Fullscreen(false))));
+        assert_eq!(rig.app.routes, [Route::Live { group: None, channel: None }]);
+        rig.fullscreen = Some(false);
+        rig.frame_with(vec![]);
+        assert!(!rig.app.window_fullscreen);
         // 5. a lone sub-page goes to its parent
         rig.app.routes = vec![Route::Logs];
         rig.press(Key::Escape, NONE);
@@ -1502,10 +1577,9 @@ mod tests {
         // the scheduler's first load dismissed the first one
         rig.until("the startup load", |r| state(r, "m3u:ch0") != "pending");
         rig.writer().blocking(move |c| insert(c, "m3u:ch1")).unwrap();
-        let asked = Instant::now();
         rig.event(AppEvent::Data(DataScope::Reminders));
-        rig.until("the refreshed load", |r| state(r, "m3u:ch1") != "pending");
-        assert!(asked.elapsed() < Duration::from_secs(10), "picked up by the refresh, not the minute tick");
+        // well inside the scheduler's one-minute re-check: only the refresh can explain it
+        rig.until_within("the refreshed load", Duration::from_secs(3), |r| state(r, "m3u:ch1") != "pending");
     }
 
     #[test]
@@ -1577,6 +1651,68 @@ mod tests {
     }
 
     #[test]
+    fn startup_play_of_a_locked_channel_asks_for_the_pin() {
+        let mut cfg = test_config();
+        let salt = "00".repeat(16);
+        cfg.parental.enabled = true;
+        cfg.parental.pin_hash = Some(crate::ui::parental::hash_pin("1234", &salt));
+        cfg.parental.pin_salt = Some(salt);
+        let req = IpcRequest { play: Some("1:m3u:ch0".into()), ..live() };
+        let rig = Rig::with(cfg, req, 1.0, |c| {
+            seed_channels(c, 2, None)?;
+            c.execute("INSERT INTO item_override(source_id, kind, item_key, locked, fp) VALUES (1, 'channel', 'm3u:ch0', 1, '')", [])?;
+            Ok(())
+        });
+        assert!(rig.app.lib.live.channels.is_empty(), "the library hasn't loaded");
+        assert_eq!(played(&rig.log()), []);
+        assert!(rig.log().toasts.iter().any(|t| t.text.contains("locked")));
+        assert_eq!(rig.route(), &Route::Live { group: None, channel: None });
+    }
+
+    #[test]
+    fn startup_play_gets_its_zap_list_once_the_library_loads() {
+        let req = IpcRequest { play: Some("1:m3u:ch1".into()), ..live() };
+        let mut rig = Rig::with(test_config(), req, 1.0, |c| seed_channels(c, 3, None));
+        let first = rig.log().commands.iter().find_map(|c| match c {
+            PlayerCommand::Play(r) => Some(r.zap.clone()),
+            _ => None,
+        });
+        assert_eq!(first, Some(None), "the library hasn't loaded");
+        deliver_library(&mut rig);
+        let zaps = |rig: &Rig| -> Vec<usize> {
+            rig.log()
+                .commands
+                .iter()
+                .filter_map(|c| match c {
+                    PlayerCommand::SetZapList(z) => Some(z.channels.len()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(zaps(&rig), [3]);
+        // only once
+        deliver_library(&mut rig);
+        assert_eq!(zaps(&rig), [3]);
+    }
+
+    #[test]
+    fn library_swap_keeps_a_newer_favourite() {
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_channels(c, 1, None));
+        let stale = crate::store::library::load(&rig.app.db).unwrap();
+        // starred while that library was being built
+        rig.writer()
+            .blocking(|c| {
+                let list = crate::store::user::default_fav_list(c)?;
+                crate::store::user::set_favourite(c, list, &channel_ref(0), true, 1)
+            })
+            .unwrap();
+        rig.event(AppEvent::Data(DataScope::Favourites));
+        assert!(rig.app.favs.is_fav(&channel_ref(0)));
+        rig.event(AppEvent::Job(JobEvent::Finished { id: JobId(9), kind: JobKind::RebuildLibrary, outcome: Ok(JobOutcome::Library(Arc::new(stale))) }));
+        assert!(rig.app.favs.is_fav(&channel_ref(0)), "the older library's favourites don't win");
+    }
+
+    #[test]
     fn reminder_watch_plays_the_channel() {
         let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_channels(c, 2, None));
         deliver_library(&mut rig);
@@ -1598,8 +1734,12 @@ mod tests {
         for s in ["http://h/x.ts", "/tmp/a.ts", "2:xt:vod:5", "x:m3u:ab", "2:xt:live:", "2:m3u:", "2", "file.ts"] {
             assert_eq!(parse_channel_ref(s), None, "{s}");
         }
-        assert!(is_playlist_file("/a/b.m3u") && is_playlist_file("B.M3U8"));
-        assert!(!is_playlist_file("http://h/list.m3u8") && !is_playlist_file("/a/b.ts"));
+        assert_eq!(playlist_file("/a/b.m3u"), Some("/a/b.m3u".into()));
+        assert_eq!(playlist_file("B.M3U8"), Some("B.M3U8".into()));
+        assert_eq!(playlist_file("file:///home/u/My%20List.m3u"), Some("/home/u/My List.m3u".into()));
+        for s in ["http://h/list.m3u8", "/a/b.ts", "file:///a/b.ts", "/a/m3u", "file://host/a.m3u"] {
+            assert_eq!(playlist_file(s), None, "{s}");
+        }
     }
 
     // ---- globals ----------------------------------------------------------------------------
@@ -1684,6 +1824,11 @@ mod tests {
         assert!(rig.app.services().integrations.theme_watch.is_none());
         assert_eq!(rig.app.theme.name, "fallback");
         assert!((rig.app.theme.rem() - 1.25).abs() < 1e-4);
+        // a load still in flight when following stopped doesn't replace the fallback
+        let mut late = Theme::fallback();
+        late.name = "theme-late".into();
+        rig.event(AppEvent::Theme(ThemeEvent::Changed(Arc::new(late))));
+        assert_eq!(rig.app.theme.name, "fallback");
     }
 
     #[test]

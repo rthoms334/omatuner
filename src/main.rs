@@ -11,7 +11,7 @@
 //! windowed instance runs it does nothing — that instance owns the database writer and its
 //! scheduler refreshes on its own.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -116,15 +116,21 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// An existing local file → its absolute path; URLs, channel references (`2:xt:live:1`) and
-/// paths that don't exist pass through unchanged.
+/// An existing local file → its absolute path; a local `file://` URI (desktop entry `%U`, file
+/// managers, `gio open`) → its decoded path; other URLs, channel references (`2:xt:live:1`)
+/// and paths that don't exist pass through unchanged.
 fn absolute_input(input: &str) -> String {
-    if input.contains("://") {
-        return input.to_owned();
-    }
-    match std::fs::canonicalize(input) {
+    let path = match url::Url::parse(input) {
+        Ok(u) if u.scheme() == "file" => match u.to_file_path() {
+            Ok(p) => p,
+            Err(()) => return input.to_owned(), // `file://other-host/…`
+        },
+        _ if input.contains("://") => return input.to_owned(),
+        _ => PathBuf::from(input),
+    };
+    match std::fs::canonicalize(&path) {
         Ok(p) if p.is_file() => p.to_string_lossy().into_owned(),
-        _ => input.to_owned(),
+        _ => path.to_string_lossy().into_owned(),
     }
 }
 
@@ -214,6 +220,20 @@ mod tests {
         // a directory is not a playable input
         let d = dir.path().to_string_lossy().into_owned();
         assert_eq!(absolute_input(&d), d);
+    }
+
+    #[test]
+    fn file_uris_become_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("My List.m3u");
+        std::fs::write(&file, "#EXTM3U\n").unwrap();
+        let abs = std::fs::canonicalize(&file).unwrap();
+        let uri = url::Url::from_file_path(&abs).unwrap();
+        assert!(uri.as_str().ends_with("/My%20List.m3u"), "{uri}");
+        assert_eq!(absolute_input(uri.as_str()), abs.to_string_lossy());
+        // a missing file still becomes its (decoded) path; a remote host stays a URI
+        assert_eq!(absolute_input("file:///nowhere/A%20B.m3u8"), "/nowhere/A B.m3u8");
+        assert_eq!(absolute_input("file://nas/share/a.m3u"), "file://nas/share/a.m3u");
     }
 
     /// `file` relative to the current directory (`../..` as needed).
