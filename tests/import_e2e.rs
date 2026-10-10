@@ -1098,4 +1098,6 @@ async fn legacy_channels_of_a_kept_playlist_become_movies_and_series_with_their_
     assert_eq!(series, ["Example Show |1x1:,1x2:Second", "Nature Hour |1x1:"]);
     assert_eq!(h.scalar("SELECT count(*) FROM series WHERE source_id = ?1 AND details_at IS NULL", source).await, 0, "nothing to fetch");
     assert_eq!(h.scalar("SELECT count(*) FROM season WHERE series_id IN (SELECT id FROM series WHERE source_id = ?1)", source).await, 2);
+    // the login of its stream URLs is kept for the redactor's next start (tests/redact.rs)
+    assert_eq!(h.strings("SELECT value FROM meta WHERE key = 'playlist-logins:' || ?1", source).await, [r#"[["u","pw"]]"#]);
 }

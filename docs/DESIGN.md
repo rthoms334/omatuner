@@ -2182,9 +2182,12 @@ the current settings; the onboarding restore always applies them). Machine-speci
 * **In memory/types**: `Secret<T>` for passwords, credential-bearing URLs (M3U URL, xmltv.php,
   stream URLs) — `Debug` prints `Secret(***)`.
 * **Redaction** (`redact::redact`, implemented + tests): registered secrets (all usernames/
-  passwords/URL tokens loaded at startup and on source edits), URL userinfo, credential query
+  passwords/URL tokens loaded at startup and on source edits, plus the Xtream logins an M3U
+  import finds in its stream URLs — registered as found and kept in `meta`
+  (`playlist-logins:<id>`) for the next start, so a playlist that stays M3U has its prefixed
+  short-form URLs `host/<prefix>/<u>/<p>/<id>` masked too), URL userinfo, credential query
   parameters (`username password pass token auth key sig…`), Xtream path segments
-  (`/live|movie|series|timeshift/<u>/<p>/`). Applied to: every log line (tracing layer), every
+  (`/live|movie|series|timeshift/<u>/<p>/`, and the bare `host/<u>/<p>/<id>`). Applied to: every log line (tracing layer), every
   `Error` Display, mpv log messages, job errors, toasts, stream-info panel, Settings URL
   display. The secret registry is process-global: tests never call `redact::clear_secrets`
   (parallel tests race) and use a unique secret per test instead.

@@ -205,6 +205,28 @@ pub fn record_upgrade_attempt(conn: &Connection, id: SourceId, at: Timestamp, lo
     Ok(())
 }
 
+/// `meta` key of the Xtream logins found in an M3U source's entries (redaction only).
+fn playlist_logins_key(id: SourceId) -> String {
+    format!("playlist-logins:{}", id.0)
+}
+
+/// Store the Xtream logins (user, password) the last import found in the stream URLs of an M3U
+/// source, replacing the previous ones (none: forgotten). [`register_secrets`] registers them
+/// at startup, so a playlist that stays M3U has its short-form stream URLs
+/// (`host/<prefix>/<user>/<pass>/<id>`, which no URL pattern can tell from a CDN path) masked
+/// before its next import. They live where the URLs that carry them already do.
+pub fn set_playlist_logins(conn: &Connection, id: SourceId, logins: &[(String, String)]) -> Result<()> {
+    if logins.is_empty() {
+        conn.execute("DELETE FROM meta WHERE key = ?1", [playlist_logins_key(id)])?;
+    } else {
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![playlist_logins_key(id), sql::to_json(&logins)?],
+        )?;
+    }
+    Ok(())
+}
+
 /// Delete `table` rows matching `cond` (which binds `?1`) in chunks, one savepoint each.
 pub(crate) fn delete_chunked(conn: &Connection, table: &str, cond: &str, arg: i64) -> Result<usize> {
     let sql = format!("DELETE FROM {table} WHERE id IN (SELECT id FROM {table} WHERE {cond} LIMIT {DELETE_CHUNK})");
@@ -228,7 +250,10 @@ pub(crate) fn purge_source(conn: &Connection, id: SourceId) -> Result<()> {
         delete_chunked(conn, t, "source_id = ?1", id.0)?;
     }
     atomic(conn, |c| {
-        c.execute("DELETE FROM meta WHERE key LIKE ?1 OR key = ?2", params![format!("import:{}:%", id.0), upgrade_key(id)])?;
+        c.execute(
+            "DELETE FROM meta WHERE key LIKE ?1 OR key IN (?2, ?3)",
+            params![format!("import:{}:%", id.0), upgrade_key(id), playlist_logins_key(id)],
+        )?;
         c.execute("DELETE FROM source WHERE id = ?1", [id])?;
         Ok(())
     })
@@ -366,8 +391,16 @@ pub fn stale_sources(conn: &Connection, now: Timestamp, default_h: u32) -> Resul
 
 /// Register every stored credential/URL secret with the redactor. Called once at startup
 /// (implemented in the skeleton: it runs on every launch). Registers Xtream usernames and
-/// passwords and every query-parameter value of M3U / XMLTV URLs.
+/// passwords, the logins found in M3U entries ([`set_playlist_logins`]) and every
+/// query-parameter value of M3U / XMLTV URLs.
 pub fn register_secrets(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("SELECT value FROM meta WHERE key LIKE 'playlist-logins:%'")?;
+    for v in stmt.query_map([], |r| r.get::<_, Option<String>>(0))? {
+        for (user, pass) in from_json_opt::<Vec<(String, String)>>(v?).unwrap_or_default() {
+            crate::redact::register_secret(&user);
+            crate::redact::register_secret(&pass);
+        }
+    }
     let mut stmt = conn.prepare("SELECT xt_username, xt_password, url FROM source UNION ALL SELECT NULL, NULL, url FROM epg_source")?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?)))?;
     for row in rows {

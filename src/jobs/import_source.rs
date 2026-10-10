@@ -504,6 +504,8 @@ async fn import_m3u(
     if switched {
         notify(ctx, DataScope::Sources);
     }
+    let logins = parsed.logins;
+    write(ctx, move |c| crate::store::sources::set_playlist_logins(c, id, &logins)).await?;
     mark_refreshed(ctx, src, counts_of(&summary), etag, last_modified, now).await?;
     provider_epg(ctx, src, parsed.tvg_urls.clone(), cfg).await?;
     (ctx.submit)(JobKind::RebuildLibrary);
@@ -542,6 +544,28 @@ struct M3uParsed {
     tvg_urls: Vec<String>,
     entries: u64,
     skipped: u64,
+    /// The Xtream logins (user, password) of the entries' stream URLs, registered with the
+    /// redactor as they were found ([`MAX_PLAYLIST_LOGINS`] at most).
+    logins: Vec<(String, String)>,
+}
+
+/// Distinct Xtream logins an M3U import keeps for redaction (a merged playlist may carry many).
+const MAX_PLAYLIST_LOGINS: usize = 16;
+
+/// Collect (and register at once) the login of an entry's Xtream stream URL: the playlist's
+/// short-form entries with a path prefix carry it too, and no URL pattern can mask those.
+fn note_login(logins: &mut Vec<(String, String)>, url: &str) {
+    if logins.len() >= MAX_PLAYLIST_LOGINS {
+        return;
+    }
+    if let Some(s) = parse_stream_url(url) {
+        let login = (s.creds.username, s.creds.password.into_inner());
+        if !logins.contains(&login) {
+            crate::redact::register_secret(&login.0);
+            crate::redact::register_secret(&login.1);
+            logins.push(login);
+        }
+    }
 }
 
 /// Blocking: parse `path` and feed batches into `tx`. Stops (`Cancelled`) when the receiver
@@ -561,11 +585,13 @@ fn parse_m3u_file(
     let mut batch = M3uBatch::default();
     let mut episodes = EpisodeCollector::default();
     let (mut entries, mut skipped) = (0u64, 0u64);
+    let mut logins = Vec::new();
     let send = |b: M3uBatch| tx.blocking_send(b).map_err(|_| Error::Cancelled);
     for item in parser.by_ref() {
         match item {
             Ok(e) => {
                 let order = i32::try_from(entries).unwrap_or(i32::MAX);
+                note_login(&mut logins, &e.url);
                 match m3u_vod::classify(&e) {
                     EntryClass::Live => batch.channels.push(m3u_entry_to_channel(&e, order, smart, &mut keys, &mut new_groups)),
                     EntryClass::Movie { stream_id } => batch.movies.push(m3u_entry_to_movie(&e, stream_id, order, smart, &mut keys, &mut new_groups)),
@@ -602,7 +628,7 @@ fn parse_m3u_file(
         }
         send(M3uBatch { series, ..Default::default() })?;
     }
-    Ok(M3uParsed { tvg_urls: parser.header().tvg_urls.clone(), entries, skipped })
+    Ok(M3uParsed { tvg_urls: parser.header().tvg_urls.clone(), entries, skipped, logins })
 }
 
 pub(super) fn m3u_error(e: M3uError) -> Error {

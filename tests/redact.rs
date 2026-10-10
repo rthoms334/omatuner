@@ -56,6 +56,38 @@ fn registered_secrets_vanish_everywhere() {
     }
 }
 
+/// A playlist kept as M3U whose short-form stream URLs sit behind a path prefix: no URL pattern
+/// can tell `host/<prefix>/<user>/<pass>/<id>` from a CDN path, so the login its last import
+/// found is stored and registered again at the next start (this test binary has never seen it).
+#[test]
+fn a_kept_playlists_login_is_registered_again_at_startup() {
+    use tuner::model::{SourceColor, SourceDraft, SourceKind, SourceSettings};
+    let store = tuner::store::Store::open_temp("tuner-redact-logins", None).unwrap();
+    let draft = SourceDraft {
+        name: "Kept".into(),
+        kind: SourceKind::M3uFile,
+        icon: String::new(),
+        color: SourceColor::Accent,
+        url: None,
+        path: Some("/tmp/kept.m3u".into()),
+        xtream: None,
+        settings: SourceSettings { keep_m3u: true, ..Default::default() },
+    };
+    let login = [("kl-user-3e8b".to_owned(), "kl-pass-3e8b".to_owned())];
+    store
+        .writer()
+        .blocking(move |c| {
+            let id = tuner::store::sources::insert_source(c, &draft, 0)?;
+            tuner::store::sources::set_playlist_logins(c, id, &login)
+        })
+        .unwrap();
+    let line = "mpv: Opening http://cdn.example/pre/kl-user-3e8b/kl-pass-3e8b/1001.ts";
+    assert_eq!(redact(line), line, "nothing registered yet: the prefixed short form is not a URL pattern");
+    // what `Services::start` does on every launch
+    tuner::store::sources::register_secrets(&store.reader().unwrap()).unwrap();
+    assert_eq!(redact(line), "mpv: Opening http://cdn.example/pre/***/***/1001.ts");
+}
+
 #[test]
 fn credential_headers_lose_their_values() {
     let cases = [
