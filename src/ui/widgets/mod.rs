@@ -26,6 +26,7 @@ pub mod sidebar;
 pub mod slider;
 pub mod status_bar;
 pub mod text_field;
+pub mod time;
 pub mod toast;
 pub mod toggle;
 

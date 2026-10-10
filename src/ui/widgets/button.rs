@@ -32,13 +32,11 @@ fn text_color(theme: &Theme, style: ButtonStyle, enabled: bool) -> egui::Color32
     }
 }
 
-/// Paint the state fill + border of a button-like rect. Priority (Omarchy): pressed > focus >
-/// hover > selected > idle; the border is always inset, so it never shifts the layout.
-fn paint_frame(painter: &egui::Painter, rect: egui::Rect, theme: &Theme, resp: &egui::Response, style: ButtonStyle) {
+/// Fill and inset border (width, colour) of a button in a state. Priority (Omarchy): pressed >
+/// focus > hover > selected > idle. A primary button keeps its accent border when focused or
+/// hovered and gains the hover fill and a 2 px border, so focus never looks weaker than rest.
+fn frame_style(theme: &Theme, style: ButtonStyle, enabled: bool, pressed: bool, hot: bool) -> (egui::Color32, Option<(f32, egui::Color32)>) {
     let t = &theme.tokens;
-    let enabled = resp.enabled();
-    let pressed = enabled && resp.is_pointer_button_down_on();
-    let hot = enabled && (style.focused || resp.hovered() || resp.has_focus());
     let fill = if pressed {
         t.fill_pressed
     } else if hot {
@@ -48,16 +46,28 @@ fn paint_frame(painter: &egui::Painter, rect: egui::Rect, theme: &Theme, resp: &
     } else {
         egui::Color32::TRANSPARENT
     };
-    painter.rect_filled(rect, t.rounding, fill);
-    let border = if hot {
-        Some(t.border_hover)
+    let border = if style.primary && enabled {
+        Some((if hot || pressed { 2.0 } else { 1.0 }, t.accent))
+    } else if hot {
+        Some((1.0, t.border_hover))
     } else if style.bordered || style.primary {
-        Some(if style.primary && enabled { t.accent } else { t.border_field })
+        Some((1.0, t.border_field))
     } else {
         None
     };
-    if let Some(c) = border {
-        painter.rect_stroke(rect, t.rounding, egui::Stroke::new(1.0, c), egui::StrokeKind::Inside);
+    (fill, border)
+}
+
+/// Paint the state fill + border of a button-like rect; the border is always inset, so it
+/// never shifts the layout.
+fn paint_frame(painter: &egui::Painter, rect: egui::Rect, theme: &Theme, resp: &egui::Response, style: ButtonStyle) {
+    let enabled = resp.enabled();
+    let pressed = enabled && resp.is_pointer_button_down_on();
+    let hot = enabled && (style.focused || resp.hovered() || resp.has_focus());
+    let (fill, border) = frame_style(theme, style, enabled, pressed, hot);
+    painter.rect_filled(rect, theme.tokens.rounding, fill);
+    if let Some((w, c)) = border {
+        painter.rect_stroke(rect, theme.tokens.rounding, egui::Stroke::new(w, c), egui::StrokeKind::Inside);
     }
 }
 
@@ -104,4 +114,22 @@ pub fn icon_button(ui: &mut egui::Ui, theme: &Theme, icon: &str, tooltip: &str, 
         ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, icon, paint::font(theme, TypeToken::Icon), color);
     }
     if tooltip.is_empty() { resp } else { resp.on_hover_text(egui::RichText::new(tooltip).size(theme.font(TypeToken::BodySmall))) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A focused primary button must read at least as strongly as an idle one (it used to
+    /// drop the accent border): the accent border is kept, and wider.
+    #[test]
+    fn focused_primary_is_stronger_than_idle() {
+        let th = Theme::fallback();
+        let primary = ButtonStyle { primary: true, ..Default::default() };
+        let (_, idle_border) = frame_style(&th, primary, true, false, false);
+        let (_, focus_border) = frame_style(&th, ButtonStyle { focused: true, ..primary }, true, false, true);
+        let (w, c) = focus_border.expect("focused primary keeps a border");
+        assert_eq!(c, th.tokens.accent, "focus keeps the accent border");
+        assert!(w > idle_border.map_or(0.0, |b| b.0), "focus border is wider");
+    }
 }

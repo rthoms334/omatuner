@@ -29,13 +29,14 @@ use crate::model::{
 };
 use crate::msg::{AppEvent, DataScope, Toast};
 use crate::player::{PlayRequest, PlayerCommand, PlayerEvent, PlayerSnapshot, PlayerState};
+use crate::sources::smart_names::Quality;
 use crate::store::library::FavIndex;
 use crate::theme::{SpaceToken, Theme, TypeToken};
 use crate::ui::epg_grid::{hhmm, time_left, time_range};
 use crate::ui::overlays::{ConfirmSpec, ContextMenuSpec, ListPickerSpec, MenuItem, OverlayResult, RenameSpec, RenameTarget};
 use crate::ui::video_host::Placement;
 use crate::ui::widgets::list::{ListOutcome, ListState, virtual_list};
-use crate::ui::widgets::rows::{ChannelRowOpts, channel_row, group_row, menu_row, row_height};
+use crate::ui::widgets::rows::{ChannelRowOpts, channel_row, group_row, grouped, menu_row, row_height};
 use crate::ui::widgets::{RowState, badge, empty_state::empty_state, glyphs, logo, progress, section, text_field};
 use crate::ui::{LayoutClass, OverlayRequest, Route, Screen, ScreenId, SettingsPage, UiCtx};
 
@@ -167,11 +168,64 @@ pub(crate) struct GuideInfo {
 }
 
 /// What the Live preview, the guide and the player OSD say about the guide as a whole: the
-/// cached [`GuideInfo`] (re-read after `DataScope::Epg/Sources/All`) and the progress of the
-/// first guide import.
+/// cached [`GuideInfo`] (re-read after `DataScope::Epg/Sources/All`), the progress of the
+/// first guide import, and how many channels the guides cover.
 #[derive(Default)]
 pub(crate) struct GuideStatus {
     info: Option<GuideInfo>,
+    /// (library snapshot, channels with a guide, all channels).
+    coverage: Option<(usize, usize, usize)>,
+}
+
+/// Why a channel has no programmes (DESIGN §13.12), so the copy can say what to do about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NoGuide {
+    /// The first guide import runs: "Loading guide… 45 %".
+    Loading(String),
+    /// No guide is set up (or every one is disabled).
+    Missing,
+    /// Guides are set up but none has data yet (never imported, or the import failed).
+    NotLoaded,
+    /// The guides are loaded but don't list this channel; they cover `covered` of `total`.
+    NotCovered { covered: usize, total: usize },
+}
+
+impl NoGuide {
+    /// One line for guide cells (row detail lines keep "No guide data" unless loading).
+    pub(crate) fn short(&self) -> String {
+        match self {
+            NoGuide::Loading(l) => l.clone(),
+            NoGuide::Missing => "No guide — Ctrl+E adds one".into(),
+            NoGuide::NotLoaded => "Guide not loaded — Ctrl+E".into(),
+            NoGuide::NotCovered { .. } => "Not in your guide — Ctrl+E maps it".into(),
+        }
+    }
+
+    /// (title, detail) for the preview pane and the guide header.
+    pub(crate) fn copy(&self) -> (String, Option<String>) {
+        match self {
+            NoGuide::Loading(l) => (l.clone(), None),
+            NoGuide::Missing => ("No TV guide yet".into(), Some("Ctrl+E adds an XMLTV guide in Settings ▸ EPG".into())),
+            NoGuide::NotLoaded => ("The guide hasn't loaded".into(), Some("Ctrl+E shows it in Settings ▸ EPG".into())),
+            // a guide that lists few of the channels (iptv-org: 2 of 11 249): mapping won't
+            // help much, a guide that lists them will
+            NoGuide::NotCovered { covered, total } if self.poor() => (
+                "Not in your guide".into(),
+                Some(format!(
+                    "Your guides cover {} of {} channels — add one that lists yours in Settings ▸ EPG · Ctrl+E maps this one",
+                    grouped(*covered),
+                    grouped(*total)
+                )),
+            ),
+            NoGuide::NotCovered { covered, total } => (
+                "Not in your guide".into(),
+                Some(format!("Your guides cover {} of {} channels · Ctrl+E maps this one", grouped(*covered), grouped(*total))),
+            ),
+        }
+    }
+
+    /// The guides cover under half the channels.
+    pub(crate) fn poor(&self) -> bool { matches!(self, NoGuide::NotCovered { covered, total } if covered * 2 < *total) }
 }
 
 impl GuideStatus {
@@ -180,6 +234,36 @@ impl GuideStatus {
         if matches!(ev, AppEvent::Data(DataScope::Epg | DataScope::Sources | DataScope::All)) {
             self.info = None;
         }
+    }
+
+    /// (channels with a guide, all channels) of the library (cached per snapshot).
+    pub(crate) fn coverage(&mut self, ctx: &UiCtx<'_>) -> (usize, usize) {
+        let key = Arc::as_ptr(ctx.lib) as usize;
+        match self.coverage {
+            Some((k, covered, total)) if k == key => (covered, total),
+            _ => {
+                let all = &ctx.lib.live.channels;
+                let covered = all.iter().filter(|c| c.epg_channel_id.is_some()).count();
+                self.coverage = Some((key, covered, all.len()));
+                (covered, all.len())
+            }
+        }
+    }
+
+    /// Why a channel without a guide mapping has none; `None` while the read waits for budget.
+    pub(crate) fn no_guide(&mut self, ctx: &mut UiCtx<'_>) -> Option<NoGuide> {
+        if let Some(l) = self.loading_label(ctx) {
+            return Some(NoGuide::Loading(l));
+        }
+        let info = self.info(ctx)?;
+        Some(if info.sources == 0 {
+            NoGuide::Missing
+        } else if info.max_stop.is_none() {
+            NoGuide::NotLoaded
+        } else {
+            let (covered, total) = self.coverage(ctx);
+            NoGuide::NotCovered { covered, total }
+        })
     }
 
     /// The guide info; `None` while the read waits for frame budget.
@@ -210,6 +294,46 @@ impl GuideStatus {
         let pct = job.fraction.filter(|f| f.is_finite()).map(|f| format!(" {:.0} %", f.clamp(0.0, 1.0) * 100.0)).unwrap_or_default();
         Some(format!("Loading guide…{pct}"))
     }
+}
+
+/// Channels the resolver's zap skips for failures (`store::live::should_skip`: ≥ 2 failures
+/// in the last 24 h), read inside the frame budget (`None` when it is spent).
+pub(crate) fn failing_set(ctx: &mut UiCtx<'_>) -> Option<HashSet<ItemRef>> {
+    let (db, since) = (ctx.db, ctx.now - 86_400);
+    let r = ctx.budget.run(|| crate::store::live::failures(db, since))?;
+    Some(match r {
+        Ok(m) => m.into_iter().filter(|(_, f)| f.count >= 2).map(|(k, _)| k).collect(),
+        Err(e) => {
+            tracing::debug!("zap failures: {e}");
+            HashSet::new()
+        }
+    })
+}
+
+/// Ctrl+E on a channel: the EPG mapping screen for it — or, while no guide is loaded (there is
+/// nothing to map to), Settings ▸ EPG to add one.
+pub(crate) fn assign_epg(ctx: &mut UiCtx<'_>, guide: &mut GuideStatus, channel: ChannelId) {
+    match guide.no_guide(ctx) {
+        Some(NoGuide::Missing | NoGuide::NotLoaded) => ctx.push(Route::Settings(SettingsPage::Epg)),
+        _ => ctx.push(Route::EpgMapping { channel: Some(channel) }),
+    }
+}
+
+/// The quality badge of a channel: from the decoded video when it plays, else from its
+/// provider name ("BBC One HD", "ESPN 4K", smart names keep the word in the raw name).
+pub(crate) fn quality_label(video_size: Option<(i64, i64)>, name: Option<Quality>) -> Option<&'static str> {
+    if let Some((_, h)) = video_size {
+        return Some(match h {
+            h if h >= 2000 => "4K",
+            h if h >= 700 => "HD",
+            _ => "SD",
+        });
+    }
+    name.map(|q| match q {
+        Quality::Uhd => "4K",
+        Quality::Fhd | Quality::Hd => "HD",
+        Quality::Sd => "SD",
+    })
 }
 
 /// "3 h ago" / "2 d ago" (the status bar's freshness wording).
@@ -410,6 +534,11 @@ pub struct LiveScreen {
     channel_rows: Vec<u32>,
     chan_list: ListState,
     reminders: Vec<Reminder>,
+    /// The Reminders group lists one row per reminder: `reminders` index of each `channels`
+    /// entry while it is open.
+    reminder_rows: Vec<usize>,
+    /// Quality word of the cursor channel's provider name (one point read per channel).
+    quality: Option<(ChannelId, Option<Quality>)>,
     focus: Pane,
     /// Medium: the groups drawer is open; Compact: the groups list is shown.
     drawer: bool,
@@ -483,12 +612,11 @@ impl LiveScreen {
             self.failed_dirty = true;
             self.reminders_dirty = true;
         }
-        if self.failed_dirty {
-            let (db, since) = (ctx.db, ctx.now - 86_400);
-            if let Some(r) = ctx.budget.run(|| crate::store::live::failures(db, since)) {
-                self.failed = r.map(|m| m.into_iter().filter(|(_, f)| f.count >= 2).map(|(k, _)| k).collect()).unwrap_or_default();
-                self.failed_dirty = false;
-            }
+        if self.failed_dirty
+            && let Some(f) = failing_set(ctx)
+        {
+            self.failed = f;
+            self.failed_dirty = false;
         }
         if self.reminders_dirty
             && let Some(r) = load_reminders(ctx)
@@ -516,6 +644,7 @@ impl LiveScreen {
     }
 
     fn rebuild_groups(&mut self, ctx: &UiCtx<'_>) {
+        let keep = self.cursor_group().map(|g| g.entry.clone());
         let live = &ctx.lib.live;
         let mut v = Vec::new();
         if !ctx.lib.is_empty() || !live.channels.is_empty() {
@@ -545,6 +674,10 @@ impl LiveScreen {
         }
         self.groups = v;
         self.refilter_groups();
+        // the cursor stays on its group (a reorder moves it)
+        if let Some(i) = keep.and_then(|e| self.group_rows.iter().position(|&r| self.groups.get(r as usize).is_some_and(|g| g.entry == e))) {
+            self.group_list.select(i);
+        }
     }
 
     fn refilter_groups(&mut self) {
@@ -555,37 +688,59 @@ impl LiveScreen {
     /// Channels of the open group (sorted like the zap order) + filter haystacks.
     fn rebuild_channels(&mut self, ctx: &UiCtx<'_>, reset_cursor: bool) {
         let keep = self.cursor_channel();
+        // Reminders: keep the reminder (a channel can have several)
+        let keep_reminder = self.cursor_reminder().map(|r| r.id);
+        self.reminder_rows.clear();
         self.channels = match &self.open {
             Some(Entry::Reminders) => {
-                let mut seen = HashSet::new();
-                self.reminders.iter().filter_map(|r| ctx.lib.live.by_ref(&r.channel)).filter(|c| seen.insert(*c)).collect()
+                // one row per reminder (several on one channel are separate programmes)
+                let mut v = Vec::new();
+                for (i, r) in self.reminders.iter().enumerate() {
+                    if let Some(c) = ctx.lib.live.by_ref(&r.channel) {
+                        v.push(c);
+                        self.reminder_rows.push(i);
+                    }
+                }
+                v
             }
             Some(e) => e.collection().map(|c| ctx.lib.live.collection(&c, ctx.favs, &ctx.lib.recent_channels, ctx.config.interface.live_sort)).unwrap_or_default(),
             None => Vec::new(),
         };
         self.rebuild_haystacks(ctx);
-        match keep.and_then(|k| self.row_of(k)).filter(|_| !reset_cursor) {
+        let reminder_row = keep_reminder.and_then(|id| {
+            self.channel_rows.iter().position(|&i| self.reminder_rows.get(i as usize).and_then(|r| self.reminders.get(*r)).is_some_and(|r| r.id == id))
+        });
+        match reminder_row.or_else(|| keep.and_then(|k| self.row_of(k))).filter(|_| !reset_cursor) {
             Some(i) => self.chan_list.select(i),
             None if reset_cursor => self.chan_list.select(0),
             None => {}
         }
     }
 
-    /// Filter haystacks (`"<number> <name>"`) of `self.channels` + refilter.
+    /// Filter haystacks (`"<number> <name>"`, reminders `"<programme> <channel>"`) of
+    /// `self.channels` + refilter.
     fn rebuild_haystacks(&mut self, ctx: &UiCtx<'_>) {
         let live = &ctx.lib.live;
         self.haystacks = self
             .channels
             .iter()
-            .map(|id| match live.get(*id) {
-                Some(c) => match c.number {
+            .enumerate()
+            .map(|(i, id)| match (live.get(*id), self.reminder_rows.get(i).and_then(|r| self.reminders.get(*r))) {
+                (Some(c), Some(r)) => format!("{} {}", r.programme_title, c.name),
+                (Some(c), None) => match c.number {
                     Some(n) => format!("{n} {}", c.name),
                     None => c.name.to_string(),
                 },
-                None => String::new(),
+                (None, _) => String::new(),
             })
             .collect();
         self.refilter_channels();
+    }
+
+    /// The reminder of the cursor row (Reminders group).
+    fn cursor_reminder(&self) -> Option<&Reminder> {
+        let row = *self.channel_rows.get(self.chan_list.cursor)? as usize;
+        self.reminder_rows.get(row).and_then(|i| self.reminders.get(*i))
     }
 
     fn refilter_channels(&mut self) {
@@ -729,7 +884,12 @@ impl LiveScreen {
                     true
                 }
                 Action::MoveUp | Action::MoveDown => {
-                    self.move_list(ctx, action == Action::MoveUp);
+                    match self.cursor_group().map(|g| g.entry.clone()) {
+                        Some(Entry::FavList(_)) => self.move_list(ctx, action == Action::MoveUp),
+                        Some(Entry::Group(id)) => self.move_group(ctx, id, action == Action::MoveUp),
+                        Some(_) => ctx.toast(Toast::info("Built-in groups stay on top")),
+                        None => {}
+                    }
                     true
                 }
                 Action::Remove => {
@@ -760,6 +920,8 @@ impl LiveScreen {
                 menu_item(glyphs::TAG, "Rename group", Action::Rename, true, k),
                 menu_item(glyphs::HIDDEN, "Hide group", Action::ToggleHidden, true, k),
                 menu_item(glyphs::LOCK, if g.group.locked { "Unlock group" } else { "Lock group" }, Action::ToggleLock, true, k),
+                menu_item(glyphs::REORDER, "Move up", Action::MoveUp, true, k),
+                menu_item(glyphs::REORDER, "Move down", Action::MoveDown, true, k),
             ],
             _ => return,
         };
@@ -813,6 +975,17 @@ impl LiveScreen {
         let Some(j) = j else { return };
         order.swap(i, j);
         let _ = ctx.services.store.writer().submit_notify(DataScope::Favourites, move |c| crate::store::user::reorder_fav_lists(c, &order));
+    }
+
+    /// Alt+↑/↓ on a provider group: move it among its playlist's groups
+    /// (`group_override.user_order`); the cursor follows it once the library is rebuilt.
+    fn move_group(&mut self, ctx: &mut UiCtx<'_>, id: GroupId, up: bool) {
+        if self.group_list.filter.is_active() {
+            ctx.toast(Toast::info("Clear the filter to reorder"));
+            return;
+        }
+        let visible = ctx.lib.live.visible_groups(None, ctx.config.interface.hide_empty_groups);
+        super::home::kit::reorder_group(&*ctx, &visible, id, if up { -1 } else { 1 });
     }
 
     fn delete_list(&mut self, ctx: &mut UiCtx<'_>) {
@@ -967,7 +1140,7 @@ impl LiveScreen {
             }
             Action::AssignEpg => {
                 if let Some(ch) = cur {
-                    ctx.push(Route::EpgMapping { channel: Some(ch.id) });
+                    assign_epg(ctx, &mut self.guide, ch.id);
                 }
                 true
             }
@@ -1090,8 +1263,7 @@ impl LiveScreen {
                 ctx.toast(Toast::info(format!("Removed “{}” from {list}", ch.name)));
             }
             Some(Entry::Reminders) => {
-                let item = channel_ref(ch);
-                if let Some(r) = self.reminders.iter().find(|r| r.channel == item) {
+                if let Some(r) = self.cursor_reminder().filter(|r| r.channel == channel_ref(ch)) {
                     let id = r.id;
                     let _ = ctx.services.store.writer().submit_notify(DataScope::Reminders, move |c| crate::store::user::remove_reminder(c, id));
                     ctx.toast(Toast::info(format!("Reminder cancelled: {}", r.programme_title)));
@@ -1186,10 +1358,14 @@ impl LiveScreen {
             return;
         }
         let playing = playing_channel(ctx.player);
+        // the first guide import says so instead of "No guide data" (DESIGN §13.12)
+        let loading = self.guide.loading_label(ctx);
         let opts = ChannelRowOpts {
             density,
             show_number: ctx.config.interface.show_channel_numbers,
             show_logo: ctx.config.interface.show_logos,
+            twelve_hour: !ctx.config.interface.clock_24h,
+            no_guide_label: loading.as_deref(),
             ..Default::default()
         };
         let multi = ctx.lib.sources.len() > 1;
@@ -1241,12 +1417,12 @@ impl LiveScreen {
     fn draw_reminders(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, focused: bool, row_h: f32) {
         let theme = ctx.theme;
         let h24 = ctx.config.interface.clock_24h;
-        let (channels, rows, reminders) = (&self.channels, &self.channel_rows, &self.reminders);
+        let (channels, rows, reminders, reminder_rows) = (&self.channels, &self.channel_rows, &self.reminders, &self.reminder_rows);
         let lib = ctx.lib.clone();
         virtual_list(ui, theme, "live-reminders", &mut self.chan_list, row_h, |ui, rc| {
-            let id = channels[rows[rc.index] as usize];
-            let ch = lib.live.get(id);
-            let r = ch.and_then(|c| reminders.iter().find(|r| r.channel == channel_ref(c)));
+            let row = rows[rc.index] as usize;
+            let ch = lib.live.get(channels[row]);
+            let r = reminder_rows.get(row).and_then(|i| reminders.get(*i));
             let label = match (ch, r) {
                 (Some(c), Some(r)) => format!("{} · {}", r.programme_title, c.name),
                 (Some(c), None) => c.name.to_string(),
@@ -1289,7 +1465,7 @@ impl LiveScreen {
         let snap = ctx.player.clone();
         let cursor = self.cursor_channel();
         if snap.state != PlayerState::Idle {
-            let resp = ctx.video.paint(ui, video_rect, Placement::Preview, theme, &snap);
+            let resp = ctx.video.paint(ui, video_rect, Placement::Preview, theme, ctx.images, &snap);
             if resp.on_hover_text("Open the player").clicked() {
                 ctx.push(Route::Player);
             }
@@ -1308,6 +1484,8 @@ impl LiveScreen {
         ui.add_space(theme.space(SpaceToken::Lg));
         let Some(ch) = cursor.and_then(|id| ctx.lib.live.get(id).cloned()) else { return };
         let h24 = ctx.config.interface.clock_24h;
+        let playing_here = playing_channel(&snap) == Some(ch.id);
+        let quality = quality_label(snap.video_size.filter(|_| playing_here), self.name_quality(ctx, ch.id));
         // name · number + badges
         ui.horizontal_wrapped(|ui| {
             let size = (theme.font(TypeToken::Heading) * 1.6).round();
@@ -1317,6 +1495,9 @@ impl LiveScreen {
                 title.push_str(&format!(" · {n}"));
             }
             ui.label(egui::RichText::new(title).size(theme.font(TypeToken::Heading)).color(t.fg));
+            if let Some(q) = quality {
+                badge::badge(ui, theme, q, t.fg);
+            }
             if ch.has_catchup && ch.catchup_days > 0 {
                 badge::badge(ui, theme, &format!("{} {} d", glyphs::CATCHUP, ch.catchup_days), t.fg);
             }
@@ -1335,15 +1516,15 @@ impl LiveScreen {
             return;
         }
         if ch.epg_channel_id.is_none() {
-            match self.guide.loading_label(ctx) {
-                // the first guide import hasn't mapped anything yet
-                Some(loading) => {
-                    ui.label(egui::RichText::new(loading).size(theme.font(TypeToken::Body)).color(t.text_secondary));
-                }
-                None => {
-                    ui.label(egui::RichText::new("No guide data").size(theme.font(TypeToken::Body)).color(t.text_disabled));
-                    ui.label(egui::RichText::new("Ctrl+E assigns an EPG channel").size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
-                }
+            // say why (loading / no guide / not in the guide) and what to do (DESIGN §13.12)
+            let (title, detail) = match self.guide.no_guide(ctx) {
+                Some(reason) => reason.copy(),
+                None => ("No guide data".to_owned(), Some("Ctrl+E assigns an EPG channel".to_owned())),
+            };
+            let loading = detail.is_none();
+            ui.label(egui::RichText::new(title).size(theme.font(TypeToken::Body)).color(if loading { t.text_secondary } else { t.text_disabled }));
+            if let Some(d) = detail {
+                ui.add(egui::Label::new(egui::RichText::new(d).size(theme.font(TypeToken::BodySmall)).color(t.text_secondary)).wrap());
             }
             return;
         }
@@ -1403,6 +1584,18 @@ impl LiveScreen {
                 });
             }
         }
+    }
+
+    /// The quality word in the provider name of `id` (one indexed point read inside the frame
+    /// budget, kept while the cursor stays on the channel).
+    fn name_quality(&mut self, ctx: &mut UiCtx<'_>, id: ChannelId) -> Option<Quality> {
+        if self.quality.is_none_or(|(c, _)| c != id) {
+            let db = ctx.db;
+            let raw = ctx.budget.run(|| crate::store::live::channel(db, id))?;
+            let q = raw.ok().and_then(|c| crate::sources::smart_names::clean_channel_name(&c.name).quality);
+            self.quality = Some((id, q));
+        }
+        self.quality.and_then(|(_, q)| q)
     }
 
     /// Opt-in preview autoplay after the keyboard cursor rested.

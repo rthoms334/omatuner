@@ -454,6 +454,15 @@ pub fn push_history(conn: &Connection, e: &HistoryEntry) -> Result<()> {
     })
 }
 
+/// Forget every history row of `item` (Delete on a "Recently watched" tile); returns the rows
+/// removed.
+pub fn remove_history(conn: &Connection, item: &ItemRef) -> Result<usize> {
+    Ok(conn.execute(
+        "DELETE FROM history WHERE source_id = ?1 AND kind = ?2 AND item_key = ?3",
+        params![item.source, item.kind.as_str(), item.key.as_str()],
+    )?)
+}
+
 /// Distinct channels by most recent watch (channel history overlay, last-channel recall).
 pub fn recent_channels(conn: &Connection, limit: usize) -> Result<Vec<HistoryEntry>> {
     // SQLite: bare columns of an aggregate query come from the row holding max(at)

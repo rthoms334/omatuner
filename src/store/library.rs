@@ -156,7 +156,9 @@ impl LiveIndex {
 
 #[derive(Debug, Default)]
 pub struct VodIndex {
-    /// Visible (non-hidden) movies, provider order. Settings ▸ Hidden reads hidden VOD via SQL.
+    /// Visible (non-hidden) movies in display order (source sort_index, then the user's custom
+    /// order `item_override.user_order`, then provider order — `SortMode::Provider` is this
+    /// order). Settings ▸ Hidden reads hidden VOD via SQL.
     pub movies: Vec<VodSummary>,
     pub series: Vec<VodSummary>,
     pub movie_groups: Vec<Group>,
@@ -198,7 +200,9 @@ impl VodIndex {
         let all = if movies { &self.movies } else { &self.series };
         let v = |i: &u32| &all[*i as usize];
         match sort {
-            SortMode::Provider | SortMode::Number => items.sort_by_key(|i| v(i).provider_order),
+            // custom order: the display order of the vectors (user order applied by `load`)
+            SortMode::Provider => items.sort_unstable(),
+            SortMode::Number => items.sort_by_key(|i| v(i).provider_order),
             SortMode::NameAsc => items.sort_by_cached_key(|i| v(i).name.to_lowercase()),
             SortMode::NameDesc => items.sort_by_cached_key(|i| std::cmp::Reverse(v(i).name.to_lowercase())),
             SortMode::RecentlyAdded => items.sort_by_key(|i| std::cmp::Reverse(v(i).added_at.unwrap_or(i64::MIN))),

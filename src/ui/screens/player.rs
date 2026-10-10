@@ -27,14 +27,16 @@
 //! that manage the window or the app (F11, Esc, ?, /) don't show the banner. Zapping before
 //! the zap list exists (a startup `--play` before the library loaded) does nothing. While the
 //! parental session is locked, ↑/↓ skip locked channels (the UI picks the neighbour and tunes
-//! it with `ZapTo`).
+//! it with `ZapTo`), and also what the resolver's zap skips (≥ 2 recent failures, DRM), since
+//! `ZapTo` tunes exactly the channel it is given.
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, Color32, FontId, Rect};
 
 use crate::keymap::{Action, KeyContext};
-use crate::model::{ChannelId, Collection, EpisodeId, MediaRef, PlayOrigin, PlayableKind};
+use crate::model::{ChannelId, Collection, EpisodeId, ItemRef, MediaRef, PlayOrigin, PlayableKind};
 use crate::msg::{AppEvent, Toast};
 use crate::player::{PlayRequest, PlayerCommand, PlayerEvent, PlayerSnapshot, PlayerState};
 use crate::store::library::LiveIndex;
@@ -195,15 +197,15 @@ fn scale_of(ui: &egui::Ui) -> f32 { osd_scale(ui.ctx().content_rect().width()) }
 
 fn is_live(snap: &PlayerSnapshot) -> bool { crate::ui::video_host::is_live(snap.playable.as_ref().map(|p| &p.kind)) }
 
-/// Channels with lock status checked against the session (zapping skips locked ones while the
-/// session is locked).
-fn zap_target(live_idx: &LiveIndex, snap: &PlayerSnapshot, forward: bool, skip_locked: bool) -> Option<ChannelId> {
+/// The neighbour to tune while the session is locked: skips locked channels and what the
+/// controller's own zap would skip (`failing`: ≥ 2 failures in 24 h; DRM; vanished channels).
+fn zap_target(live_idx: &LiveIndex, snap: &PlayerSnapshot, forward: bool, failing: &HashSet<ItemRef>) -> Option<ChannelId> {
     let zap = snap.zap.as_ref()?;
     let current = playing_channel(snap).or_else(|| match snap.playable.as_ref().map(|p| &p.media) {
         Some(MediaRef::Channel(c)) => Some(*c),
         _ => None,
     })?;
-    let skip = |c: ChannelId| skip_locked && live_idx.get(c).is_none_or(|x| x.locked || x.unsupported);
+    let skip = |c: ChannelId| live_idx.get(c).is_none_or(|x| x.locked || x.unsupported || failing.contains(&live::channel_ref(x)));
     LiveIndex::neighbour(&zap.channels, current, forward, &skip)
 }
 
@@ -248,7 +250,10 @@ impl PlayerScreen {
         }
         if ctx.parental.is_unlocked(&ctx.config.parental) {
             ctx.play(PlayerCommand::Zap { forward });
-        } else if let Some(target) = zap_target(&ctx.lib.live, &snap, forward, true) {
+            return;
+        }
+        let failing = super::live::failing_set(ctx).unwrap_or_default();
+        if let Some(target) = zap_target(&ctx.lib.live, &snap, forward, &failing) {
             ctx.play(PlayerCommand::ZapTo(target));
         }
     }
@@ -1125,7 +1130,7 @@ impl Screen for PlayerScreen {
             osd_text(&p, rect.center() + egui::vec2(0.0, 8.0), Align2::CENTER_TOP, "Esc goes back", FontId::proportional(theme.font(TypeToken::Body)), with_alpha(t.osd_text, 0.7), rect.width());
             return;
         }
-        let resp = ctx.video.paint(ui, rect, Placement::Fullscreen, theme, &snap);
+        let resp = ctx.video.paint(ui, rect, Placement::Fullscreen, theme, ctx.images, &snap);
         // mouse: motion shows the banner, double-click toggles window fullscreen, wheel = volume
         if ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO) && resp.hovered() {
             self.show_banner(ctx);

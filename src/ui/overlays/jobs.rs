@@ -158,6 +158,7 @@ impl Overlay for JobsOverlay {
             return OverlayOutcome::Close;
         }
         let now = ctx.now;
+        let h24 = ctx.config.interface.clock_24h;
         let mut clicked = None;
         card_area(egui_ctx, theme, "jobs", CardKind::Menu, 560.0 * theme.rem(), None, |ui| {
             let t = &theme.tokens;
@@ -181,7 +182,7 @@ impl Overlay for JobsOverlay {
                 for (p, line) in self.problems.iter().enumerate() {
                     let row = self.running.len() + p;
                     let expanded = self.expanded.iter().any(|(at, msg)| *at == line.at && *msg == line.message);
-                    if problem_row(ui, theme, line, p, expanded, row == self.cursor).clicked() {
+                    if problem_row(ui, theme, line, p, expanded, row == self.cursor, h24).clicked() {
                         clicked = Some(row);
                     }
                 }
@@ -238,15 +239,14 @@ fn running_row(ui: &mut egui::Ui, theme: &Theme, job: &JobStatus, now: Timestamp
     ui.interact(inner.inner, ui.id().with(("job", job.id)), egui::Sense::click())
 }
 
-/// "20:14  Couldn't refresh My IPTV: HTTP 404" (one line, or the full message when expanded).
-/// `index` salts the row id: the same failure can be logged twice within a second.
-fn problem_row(ui: &mut egui::Ui, theme: &Theme, line: &LogLine, index: usize, expanded: bool, cursor: bool) -> egui::Response {
+/// "20:14  Couldn't refresh My IPTV: HTTP 404" (one line, or the full message when expanded;
+/// "8:14 PM" on the 12-hour clock). `index` salts the row id: the same failure can be logged
+/// twice within a second.
+fn problem_row(ui: &mut egui::Ui, theme: &Theme, line: &LogLine, index: usize, expanded: bool, cursor: bool, h24: bool) -> egui::Response {
     let t = &theme.tokens;
     let pad = theme.space(SpaceToken::Lg);
     let color = if cursor { t.list_cursor_text } else { t.fg };
-    let time = jiff::Timestamp::from_second(line.at)
-        .map(|ts| ts.to_zoned(jiff::tz::TimeZone::system()).strftime("%H:%M").to_string())
-        .unwrap_or_default();
+    let time = crate::ui::widgets::time::hhmm(line.at, h24);
     let width = ui.available_width();
     let inner = ui.scope(|ui| {
         let top = ui.cursor().min;

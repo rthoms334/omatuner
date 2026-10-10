@@ -16,7 +16,9 @@
 //! store rows go through the writer and its `DataScope` notification. Changing parental
 //! settings needs the open PIN session once a PIN exists.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use eframe::egui::{self, RichText};
 
@@ -39,6 +41,7 @@ use crate::ui::widgets::button::{ButtonStyle, icon_button};
 use crate::ui::widgets::list::paint_row_state;
 use crate::ui::widgets::text_field::text_field;
 use crate::ui::widgets::toggle::toggle;
+use crate::ui::widgets::rows::grouped;
 use crate::ui::widgets::{RowState, empty_state, glyphs, rows, section};
 use crate::ui::{LayoutClass, OnboardingStart, OverlayRequest, Route, Screen, ScreenId, SettingsPage, UiCtx};
 
@@ -505,7 +508,11 @@ pub struct SettingsScreen {
     sources: Vec<Source>,
     sources_loader: Option<Loader<Vec<Source>>>,
     epg_sources: Vec<EpgSource>,
-    epg_loader: Option<Loader<Vec<EpgSource>>>,
+    /// Playlist channels each guide matches (`guide_matches`), read with the guides.
+    epg_matches: HashMap<EpgSourceId, usize>,
+    epg_loader: Option<Loader<GuideList>>,
+    /// Channels with a guide per playlist, for the library build in `.0` (Playlists rows).
+    guide_counts: (usize, HashMap<SourceId, usize>),
     reminders: Vec<Reminder>,
     reminders_loader: Option<Loader<Vec<Reminder>>>,
     orphans: Vec<Orphan>,
@@ -549,7 +556,7 @@ impl SettingsScreen {
     fn reload(&mut self, ctx: &UiCtx<'_>) {
         match self.page {
             SettingsPage::Playlists => self.sources_loader = Some(Loader::start(ctx, crate::store::sources::list_sources)),
-            SettingsPage::Epg => self.epg_loader = Some(Loader::start(ctx, crate::store::sources::list_epg_sources)),
+            SettingsPage::Epg => self.epg_loader = Some(Loader::start(ctx, load_guides)),
             SettingsPage::Reminders => self.reminders_loader = Some(Loader::start(ctx, crate::store::user::all_reminders)),
             SettingsPage::Orphans => self.orphans_loader = Some(Loader::start(ctx, crate::store::user::orphans)),
             SettingsPage::Hidden => self.hidden_loader = Some(Loader::start(ctx, load_hidden_vod)),
@@ -604,7 +611,7 @@ impl SettingsScreen {
                         icon: if s.icon.is_empty() { glyphs::PLAYLIST.to_owned() } else { s.icon.clone() },
                         color: Some(s.color),
                         label: s.name.clone(),
-                        detail: Some(source_detail(s, ctx.now, running.map(|j| super::onboarding::phase_text(&j.phase)))),
+                        detail: Some(source_detail(s, ctx.now, running.map(|j| super::onboarding::phase_text(&j.phase)), self.guide_counts.1.get(&s.id).copied())),
                         reorder: true,
                     });
                 }
@@ -631,13 +638,19 @@ impl SettingsScreen {
                     if e.offset_min != 0 {
                         parts.push(format!("offset {:+} min", e.offset_min));
                     }
-                    parts.push(format!("{} channels · {} programmes", e.channel_count, e.programme_count));
+                    // coverage first: a guide that lists 2 of 11 249 channels must say so
+                    if e.last_refresh.is_some() {
+                        parts.insert(usize::from(!e.enabled), coverage_text(e, self.epg_matches.get(&e.id).copied().unwrap_or(0), ctx.lib.live.channels.len()));
+                    }
                     match (&e.last_error, e.last_refresh) {
                         (Some(err), _) => parts.push(format!("Failed: {}", crate::redact::redact(err))),
                         (None, Some(t)) => parts.push(format!("Updated {}", kit::ago(ctx.now, t))),
                         (None, None) => parts.push("Not imported yet".into()),
                     }
                     v.push(Row::Item { item: Item::Epg(e.id), icon: glyphs::GUIDE.to_owned(), color: None, label: e.name.clone(), detail: Some(parts.join(" · ")), reorder: true });
+                }
+                if let Some(note) = coverage_note(&self.epg_sources, self.guide_counts.1.values().sum(), ctx.lib.live.channels.len()) {
+                    v.push(Row::Note(note, true));
                 }
                 v.push(Row::Local { field: Local::NewEpgUrl, label: "Add an XMLTV URL" });
                 v.push(Row::Act { act: Act::AddEpgUrl, icon: glyphs::ADD, label: "Add URL".into(), danger: false });
@@ -1496,8 +1509,66 @@ static PARENTAL_ENABLED: CfgToggle = toggle_row!("Parental lock", parental.enabl
 /// A restored Xtream source without its password.
 fn needs_credentials(s: &Source) -> bool { s.xtream.as_ref().is_some_and(|x| x.password.expose().is_empty()) }
 
-/// "Xtream · 9 812 ch · 48 211 movies · Updated 2 h ago · Active, expires 2027-01-01".
-fn source_detail(s: &Source, now: crate::model::Timestamp, running: Option<String>) -> String {
+/// The guides with the playlist channels each one matches.
+pub(crate) type GuideList = (Vec<EpgSource>, HashMap<EpgSourceId, usize>);
+
+/// Settings ▸ EPG / onboarding read (off the UI thread): the guides and their matches.
+pub(crate) fn load_guides(c: &rusqlite::Connection) -> crate::error::Result<GuideList> { Ok((crate::store::sources::list_epg_sources(c)?, guide_matches(c)?)) }
+
+/// How many channels of enabled playlists each guide matches (automatic or manual mappings to
+/// a channel of its current data). A guide that lists 2 channels of a 11 249-channel playlist
+/// imports fine; this is what tells the user it covers almost nothing.
+pub(crate) fn guide_matches(c: &rusqlite::Connection) -> crate::error::Result<HashMap<EpgSourceId, usize>> {
+    let mut stmt = c.prepare_cached(
+        "SELECT m.epg_source_id, count(*) FROM channel_epg_map m
+         JOIN channel ch ON ch.source_id = m.source_id AND ch.key = m.channel_key
+         JOIN source s ON s.id = ch.source_id AND s.enabled = 1
+         JOIN epg_source es ON es.id = m.epg_source_id
+         JOIN epg_channel ec ON ec.epg_source_id = m.epg_source_id AND ec.xmltv_id = m.xmltv_id AND ec.seen_gen >= es.active_gen
+         WHERE m.orphaned_since IS NULL
+         GROUP BY m.epg_source_id",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, EpgSourceId>(0)?, r.get::<_, i64>(1)?)))?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (id, n) = row?;
+        out.insert(id, usize::try_from(n).unwrap_or(0));
+    }
+    Ok(out)
+}
+
+/// "Matches 3 of 11 249 channels · guide lists 2 channels, 312 programmes".
+pub(crate) fn coverage_text(e: &EpgSource, matched: usize, total: usize) -> String {
+    let n = |v: u32| grouped(v as usize);
+    format!(
+        "Matches {} of {} channels · guide lists {} channel{}, {} programme{}",
+        grouped(matched.min(total)),
+        grouped(total),
+        n(e.channel_count),
+        if e.channel_count == 1 { "" } else { "s" },
+        n(e.programme_count),
+        if e.programme_count == 1 { "" } else { "s" }
+    )
+}
+
+/// A note under the guides when they cover less than half of the `total` channels, with the
+/// way forward (both rows are on this page).
+fn coverage_note(guides: &[EpgSource], covered: usize, total: usize) -> Option<String> {
+    if total == 0 || !guides.iter().any(|g| g.enabled && g.last_refresh.is_some()) {
+        return None;
+    }
+    (covered * 2 < total).then(|| {
+        format!(
+            "Your guides cover {} of {} channels. Add an XMLTV guide that lists your channels, or map them in EPG mapping (below).",
+            grouped(covered),
+            grouped(total)
+        )
+    })
+}
+
+/// "Xtream · 9 812 ch (3 with guide) · 48 211 movies · Updated 2 h ago · Active, expires
+/// 2027-01-01".
+fn source_detail(s: &Source, now: crate::model::Timestamp, running: Option<String>, with_guide: Option<usize>) -> String {
     let kind = match s.kind {
         SourceKind::Xtream => "Xtream",
         SourceKind::M3uUrl => "M3U URL",
@@ -1511,12 +1582,16 @@ fn source_detail(s: &Source, now: crate::model::Timestamp, running: Option<Strin
         parts.insert(0, "Needs credentials".into());
     }
     let c = s.status.counts;
-    parts.push(format!("{} ch", c.channels));
+    let channels = c.channels as usize;
+    match with_guide {
+        Some(g) if channels > 0 => parts.push(format!("{} ch ({} with guide)", grouped(channels), grouped(g.min(channels)))),
+        _ => parts.push(format!("{} ch", grouped(channels))),
+    }
     if c.movies > 0 {
-        parts.push(format!("{} movies", c.movies));
+        parts.push(format!("{} movies", grouped(c.movies as usize)));
     }
     if c.series > 0 {
-        parts.push(format!("{} series", c.series));
+        parts.push(format!("{} series", grouped(c.series as usize)));
     }
     match (running, &s.status.last_error, s.status.last_refresh) {
         (Some(p), _, _) => parts.push(format!("Refreshing: {p}")),
@@ -1823,9 +1898,21 @@ impl SettingsScreen {
         }
         if let Some(r) = kit::poll(&mut self.epg_loader) {
             match r {
-                Ok(v) => self.epg_sources = v,
+                Ok((v, m)) => {
+                    self.epg_sources = v;
+                    self.epg_matches = m;
+                }
                 Err(e) => kit::error_toast(ctx, "Couldn't read the guides", &e),
             }
+        }
+        // channels with a guide per playlist (one pass per library build)
+        let built = Arc::as_ptr(ctx.lib) as usize;
+        if matches!(self.page, SettingsPage::Playlists | SettingsPage::Epg) && self.guide_counts.0 != built {
+            let mut m: HashMap<SourceId, usize> = HashMap::new();
+            for c in ctx.lib.live.channels.iter().filter(|c| c.epg_channel_id.is_some()) {
+                *m.entry(c.source_id).or_default() += 1;
+            }
+            self.guide_counts = (built, m);
         }
         if let Some(r) = kit::poll(&mut self.reminders_loader) {
             match r {
@@ -2109,17 +2196,13 @@ fn value_row(ui: &mut egui::Ui, theme: &Theme, label: &str, value: &str, color: 
             r = Some(1);
         }
         ui.label(RichText::new(value).size(theme.font(TypeToken::Body)).color(t.fg));
-        if icon_button(ui, theme, CHEVRON_LEFT, "Decrease", ButtonStyle::default()).clicked() {
+        if icon_button(ui, theme, glyphs::CHEVRON_LEFT, "Decrease", ButtonStyle::default()).clicked() {
             r = Some(-1);
         }
         r
     })
     .inner
 }
-
-/// `nf-md-chevron_left`, the twin of `glyphs::CHEVRON_RIGHT` (the shared glyph table has no
-/// left chevron).
-const CHEVRON_LEFT: &str = "\u{f0141}";
 
 /// `Label                       [switch]` with the label in the row's colour (accent when
 /// focused, like the other rows). True when the switch was clicked.
@@ -2688,8 +2771,59 @@ mod tests {
         e.server = "".into();
         assert_eq!(e.apply().unwrap_err().0, Local::SrcServer);
         assert!(!needs_credentials(&src));
-        let detail = source_detail(&src, 1000, None);
+        let detail = source_detail(&src, 1000, None, Some(0));
         assert!(detail.starts_with("Xtream · 0 ch") && detail.ends_with("Never refreshed"), "{detail}");
+    }
+
+    /// The iptv-org case: a guide that lists 2 channels matching 3 of 11 249 says so.
+    #[test]
+    fn guide_rows_say_how_much_they_cover() {
+        let e = EpgSource {
+            id: EpgSourceId(1),
+            name: "iptv-org".into(),
+            kind: EpgSourceKind::Url { url: crate::redact::Secret::new("http://example.com/guide.xml".into()) },
+            priority: 0,
+            offset_min: 0,
+            enabled: true,
+            refresh_h: None,
+            active_generation: 1,
+            last_refresh: Some(1),
+            last_error: None,
+            etag: None,
+            last_modified: None,
+            channel_count: 2,
+            programme_count: 312,
+            max_stop: Some(10),
+        };
+        assert_eq!(coverage_text(&e, 3, 11_249), "Matches 3 of 11\u{2009}249 channels · guide lists 2 channels, 312 programmes");
+        let note = coverage_note(std::slice::from_ref(&e), 3, 11_249).expect("a note for poor coverage");
+        assert!(note.starts_with("Your guides cover 3 of 11\u{2009}249 channels") && note.contains("EPG mapping"), "{note}");
+        assert_eq!(coverage_note(std::slice::from_ref(&e), 9_000, 11_249), None, "good coverage needs no note");
+        assert_eq!(coverage_note(&[], 0, 11_249), None, "no guide: the page says so already");
+    }
+
+    /// The "Matches N" count takes only live mappings: channels of enabled playlists, mapped
+    /// to the guide's current data, not orphaned.
+    #[test]
+    fn guide_matches_counts_live_mappings_only() {
+        let mut c = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::migrations::migrate(&mut c).unwrap();
+        c.execute_batch(
+            "INSERT INTO source(id, name, kind, created_at, enabled) VALUES (1, 'on', 'm3u-url', 0, 1), (2, 'off', 'm3u-url', 0, 0);
+             INSERT INTO channel(source_id, key, name, clean_name, norm_name, stream, provider_order, seen_gen) VALUES
+               (1, 'a', 'A', 'A', 'a', '{}', 0, 1), (1, 'b', 'B', 'B', 'b', '{}', 1, 1), (1, 'c', 'C', 'C', 'c', '{}', 2, 1),
+               (1, 'd', 'D', 'D', 'd', '{}', 3, 1), (2, 'e', 'E', 'E', 'e', '{}', 0, 1);
+             INSERT INTO epg_source(id, name, kind, active_gen) VALUES (1, 'g', 'url', 2);
+             INSERT INTO epg_channel(epg_source_id, xmltv_id, seen_gen) VALUES (1, 'x', 2), (1, 'y', 2), (1, 'old', 1);
+             INSERT INTO channel_epg_map(source_id, channel_key, epg_source_id, xmltv_id, method, orphaned_since) VALUES
+               (1, 'a', 1, 'x', 'tvg-id', NULL),   -- automatic
+               (1, 'b', 1, 'y', 'manual', NULL),   -- manual
+               (1, 'c', 1, 'x', 'manual', 5),      -- orphaned
+               (1, 'd', 1, 'old', 'tvg-id', NULL), -- the guide's previous data
+               (2, 'e', 1, 'x', 'tvg-id', NULL);   -- a disabled playlist",
+        )
+        .unwrap();
+        assert_eq!(guide_matches(&c).unwrap(), HashMap::from([(EpgSourceId(1), 2)]));
     }
 
     #[test]

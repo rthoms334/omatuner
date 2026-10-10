@@ -243,9 +243,10 @@ pub struct EpgGridState {
     /// Programme under the pointer (the screen loads its description into `hover_detail`).
     pub(crate) hovered: Option<ProgrammeId>,
     pub(crate) hover_detail: Option<(ProgrammeId, String)>,
-    /// Set by the guide screen each frame while the first guide import runs ("Loading guide…
-    /// 45 %"): shown instead of "No guide data" on rows without a mapping (DESIGN §13.12).
-    pub(crate) loading_label: Option<String>,
+    /// Set by the guide screen each frame: why rows without a mapping have no programmes
+    /// ("Loading guide… 45 %", "Not in your guide — Ctrl+E maps it"…), shown instead of "No
+    /// guide data" (DESIGN §13.12).
+    pub(crate) no_guide_label: Option<String>,
 }
 
 impl EpgGridState {
@@ -267,7 +268,7 @@ impl EpgGridState {
             clock_24h: true,
             hovered: None,
             hover_detail: None,
-            loading_label: None,
+            no_guide_label: None,
         }
     }
     /// Replace rows (collection/filter changed), keeping focus on the same channel if present.
@@ -482,16 +483,8 @@ pub(crate) fn catchup_available(row: &GuideRow, p: &ProgrammeSlim, now: Timestam
 
 // ------------------------------------------------------------------ time formatting
 
-/// Local wall-clock time: "20:00" (24 h) or "8:00 pm".
-pub(crate) fn hhmm(ts: Timestamp, h24: bool) -> String {
-    match jiff::Timestamp::from_second(ts) {
-        Ok(t) => {
-            let z = t.to_zoned(jiff::tz::TimeZone::system());
-            if h24 { z.strftime("%H:%M").to_string() } else { z.strftime("%-I:%M %P").to_string() }
-        }
-        Err(_) => "--:--".into(),
-    }
-}
+/// Local wall-clock time: "20:00" (24 h) or "8:00 PM" (the app-wide format).
+pub(crate) use crate::ui::widgets::time::hhmm;
 
 /// "Thu 9 Oct" in local time.
 pub(crate) fn day_label(ts: Timestamp) -> String {
@@ -594,7 +587,7 @@ pub fn epg_grid(
         }
     }
     let view_end = state.view_start + state.view_secs;
-    let no_guide = state.loading_label.clone().unwrap_or_else(|| "No guide data".to_owned());
+    let no_guide = state.no_guide_label.clone().unwrap_or_else(|| "No guide data".to_owned());
     let f = Frame { theme, m, grid, now, view_start: state.view_start, view_end, no_guide: &no_guide };
 
     // the focus row first so a deferred refocus resolves before its cell is painted
@@ -1140,8 +1133,6 @@ mod tests {
 
     #[test]
     fn formatting() {
-        assert_eq!(hhmm(T0, true).len(), 5);
-        assert!(hhmm(T0, false).ends_with('m'));
         assert_eq!(time_left(34 * 60), "34 min left");
         assert_eq!(time_left(65 * 60), "1 h 05 left");
         assert_eq!(excerpt("one two three", 7), "one two…");

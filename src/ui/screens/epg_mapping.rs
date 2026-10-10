@@ -34,6 +34,8 @@ use crate::ui::{LayoutClass, OverlayRequest, Route, Screen, ScreenId, UiCtx};
 /// Suggestions kept per channel, and channels per suggestion batch.
 const SUGGESTIONS: usize = 5;
 const BATCH: usize = 40;
+/// The mode menu's "Guide settings…" (after the `Mode::ALL` digits).
+const MENU_GUIDE_SETTINGS: u8 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Mode {
@@ -230,12 +232,22 @@ impl EpgMappingScreen {
     }
 
     fn mode_menu(&self, ctx: &mut UiCtx<'_>) {
-        let items = Mode::ALL
+        let mut items: Vec<MenuItem> = Mode::ALL
             .iter()
             .enumerate()
             .map(|(i, (m, l))| MenuItem { icon: if *m == self.mode { glyphs::CHECK } else { "" }, label: (*l).into(), action: Action::Digit(i as u8), enabled: true, shortcut: None })
             .collect();
+        // the way to a guide that lists more channels, by keyboard
+        items.push(MenuItem { icon: glyphs::SETTINGS, label: "Guide settings…".into(), action: Action::Digit(MENU_GUIDE_SETTINGS), enabled: true, shortcut: None });
         ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: "Show channels".into(), items }));
+    }
+
+    /// "Your guides list 2 channels. Add one…" when the guides list under half as many
+    /// channels as the playlists (mapping can't cover the rest).
+    fn few_note(&self, ctx: &UiCtx<'_>) -> Option<String> {
+        let n = self.catalog.as_ref()?.entries.len();
+        (n * 2 < ctx.lib.live.channels.len())
+            .then(|| format!("Your guides list {} channel{}. Add one that lists yours in Settings ▸ EPG.", rows::grouped(n), if n == 1 { "" } else { "s" }))
     }
 
     /// Start a suggestion batch for visible channels without cached suggestions.
@@ -346,6 +358,11 @@ impl Screen for EpgMappingScreen {
     }
 
     fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
+        // "No guide data": Enter is the "Open EPG settings" button
+        if action == Action::Activate && self.catalog.as_ref().is_some_and(|c| c.entries.is_empty()) && !ctx.lib.live.channels.is_empty() {
+            ctx.push(Route::Settings(crate::ui::SettingsPage::Epg));
+            return true;
+        }
         match action {
             Action::SortMenu => {
                 self.mode_menu(ctx);
@@ -389,6 +406,11 @@ impl Screen for EpgMappingScreen {
                 ListOutcome::Parent => false,
                 ListOutcome::None => matches!(action, Action::Up | Action::Down | Action::PageUp | Action::PageDown | Action::Home | Action::End | Action::FilterInput(_) | Action::Activate),
             },
+            // no candidate to pick: Enter is the empty state's "Open EPG settings"
+            Pane::Candidates if action == Action::Activate && self.catalog.is_some() && self.cand_rows.is_empty() => {
+                ctx.push(Route::Settings(crate::ui::SettingsPage::Epg));
+                true
+            }
             Pane::Candidates => match self.cands.handle(action) {
                 ListOutcome::Activated(_) | ListOutcome::ActivatedAlt(_) => {
                     self.assign(ctx);
@@ -409,7 +431,9 @@ impl Screen for EpgMappingScreen {
     }
 
     fn on_overlay_result(&mut self, ctx: &mut UiCtx<'_>, result: OverlayResult) {
-        if let OverlayResult::Chosen(Action::Digit(i)) = result
+        if result == OverlayResult::Chosen(Action::Digit(MENU_GUIDE_SETTINGS)) {
+            ctx.push(Route::Settings(crate::ui::SettingsPage::Epg));
+        } else if let OverlayResult::Chosen(Action::Digit(i)) = result
             && let Some((m, _)) = Mode::ALL.get(i as usize)
         {
             self.mode = *m;
@@ -529,6 +553,10 @@ impl Screen for EpgMappingScreen {
                     ui_r.label(RichText::new(" ").size(theme.font(TypeToken::BodySmall)));
                 }
             }
+            let few = self.few_note(ctx);
+            if let Some(note) = &few {
+                ui_r.label(RichText::new(note).size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
+            }
             ui_r.add_space(theme.space(SpaceToken::Md));
             search_header(&mut ui_r, theme, self.cands.filter.query(), "Search guide channels", Some(glyphs::GUIDE));
             ui_r.add_space(theme.space(SpaceToken::Md));
@@ -539,7 +567,10 @@ impl Screen for EpgMappingScreen {
                     ui_r.add_space(6.0);
                 }
             } else if self.cand_rows.is_empty() {
-                empty_state::empty_state(&mut ui_r, theme, glyphs::SEARCH, "No matching guide channels", None, None);
+                let detail = few.as_deref().unwrap_or("Search for another name, or add a guide that lists this channel in Settings ▸ EPG.");
+                if empty_state::empty_state(&mut ui_r, theme, glyphs::SEARCH, "No matching guide channels", Some(detail), Some("Open EPG settings")).is_some_and(|r| r.clicked()) {
+                    ctx.push(Route::Settings(crate::ui::SettingsPage::Epg));
+                }
             } else {
                 let focused = self.pane == Pane::Candidates;
                 let (cand_rows, catalog) = (&self.cand_rows, &self.catalog);

@@ -766,11 +766,13 @@ const HINTS: &[(KeyContext, &[(Action, &str)])] = &[
         &[(A::Activate, "play"), (A::ActivateAlt, "fullscreen"), (A::ToggleFavourite, "fav"), (A::ContextMenu, "more"), (A::ToggleHelp, "help")],
     ),
     (KeyContext::ListFiltering, &[(A::Activate, "play"), (A::FilterClear, "clear"), (A::ContextMenu, "more")]),
+    // also Home's rails (Enter plays a channel or opens a title; Home has no sort): only verbs
+    // that hold for both
     (
         KeyContext::PosterGrid,
-        &[(A::Activate, "details"), (A::ActivateAlt, "play"), (A::SortMenu, "sort"), (A::ToggleHelp, "help")],
+        &[(A::Activate, "open"), (A::ActivateAlt, "play"), (A::ToggleFavourite, "fav"), (A::ContextMenu, "more"), (A::ToggleHelp, "help")],
     ),
-    (KeyContext::PosterGridFiltering, &[(A::Activate, "details"), (A::FilterClear, "clear")]),
+    (KeyContext::PosterGridFiltering, &[(A::Activate, "open"), (A::FilterClear, "clear")]),
     (KeyContext::Detail, &[(A::Activate, "play"), (A::TabNext, "season"), (A::MarkWatched, "watched"), (A::Back, "back")]),
     (
         KeyContext::Guide,
@@ -784,22 +786,36 @@ const HINTS: &[(KeyContext, &[(Action, &str)])] = &[
     (KeyContext::Modal, &[(A::Activate, "confirm"), (A::Back, "cancel")]),
 ];
 
+/// Hints of a filtering list inside a dialog or menu (Esc clears the filter there).
+const MODAL_FILTERING_HINTS: &[(Action, &str)] = &[(A::Activate, "confirm"), (A::FilterClear, "clear")];
+
+/// The hints of a context stack: (action, key, verb) for the innermost context that has
+/// hints. A list inside a dialog or menu (`[List, Modal]`) gets the dialog's verbs: the
+/// screen-list verbs (play, fav…) don't apply there. Keys come from the stack's own tables.
+pub fn hints(stack: &[KeyContext]) -> Vec<(Action, KeyChord, &'static str)> {
+    let modal = stack.contains(&KeyContext::Modal);
+    for ctx in stack {
+        let items = match ctx {
+            KeyContext::List if modal => continue,
+            KeyContext::ListFiltering if modal => MODAL_FILTERING_HINTS,
+            _ => match HINTS.iter().find(|(c, _)| c == ctx) {
+                Some((_, items)) => *items,
+                None => continue,
+            },
+        };
+        let t = tables(*ctx);
+        return items
+            .iter()
+            .filter_map(|(a, verb)| t.iter().chain(std::iter::once(&GLOBAL)).find_map(|tb| tb.iter().find(|bd| bd.action == *a)).map(|bd| (*a, bd.chord, *verb)))
+            .collect();
+    }
+    Vec::new()
+}
+
 /// Status-bar hint line for the innermost context that has hints, e.g.
 /// "Enter play · Shift+Enter fullscreen · Ctrl+F fav · Shift+F10 more · ? help".
 pub fn hint_line(stack: &[KeyContext]) -> String {
-    for ctx in stack {
-        if let Some((_, items)) = HINTS.iter().find(|(c, _)| c == ctx) {
-            let t = tables(*ctx);
-            let parts: Vec<String> = items
-                .iter()
-                .filter_map(|(a, verb)| {
-                    t.iter().chain(std::iter::once(&GLOBAL)).find_map(|tb| tb.iter().find(|bd| bd.action == *a)).map(|bd| format!("{} {verb}", bd.chord.label()))
-                })
-                .collect();
-            return parts.join(" · ");
-        }
-    }
-    String::new()
+    hints(stack).iter().map(|(_, chord, verb)| format!("{} {verb}", chord.label())).collect::<Vec<_>>().join(" · ")
 }
 
 #[cfg(test)]
@@ -912,6 +928,36 @@ mod tests {
         }
         assert_eq!(hint_line(&[K::TextInput, K::Modal]), "Enter confirm · Tab next field · Esc leave");
         assert_eq!(hint_line(&[K::PlayerLive]), "", "no hint line in the player (no status bar)");
+    }
+
+    /// The event a chord produces (what `resolve` sees for it).
+    fn event_of(c: KeyChord) -> egui::Event {
+        match c.trigger {
+            Trigger::Key(k) => key_ev(k, c.ctrl, c.alt, c.shift, false),
+            Trigger::Char(ch) => egui::Event::Text(ch.to_string()),
+        }
+    }
+
+    /// Every hint names a key that, pressed in that stack, resolves to the hinted action (not
+    /// shadowed by an inner context, not a key of another table).
+    #[test]
+    fn hint_lines_only_name_keys_that_do_what_they_say() {
+        let mut stacks: Vec<Vec<KeyContext>> = KeyContext::ALL.iter().map(|c| vec![*c]).collect();
+        stacks.extend([
+            vec![K::List, K::Modal],
+            vec![K::ListFiltering, K::Modal],
+            vec![K::TextInput, K::Modal],
+            vec![K::TextInput, K::Panel],
+            vec![K::EpgMapping, K::List],
+            vec![K::NumericEntry, K::Guide],
+            vec![K::NumericEntry, K::PlayerLive],
+            vec![K::PlayerOsd, K::PlayerVod],
+        ]);
+        for stack in &stacks {
+            for (action, chord, verb) in hints(stack) {
+                assert_eq!(resolve(stack, &event_of(chord)), Some(action), "{stack:?}: “{} {verb}”", chord.label());
+            }
+        }
     }
 
     #[test]

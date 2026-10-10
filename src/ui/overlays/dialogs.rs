@@ -10,6 +10,7 @@
 //! (already redacted) error otherwise.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, RichText};
@@ -589,8 +590,10 @@ impl Overlay for RenameOverlay {
 /// (opens an inline name field: `[TextInput, Modal]` while typing).
 ///
 /// Lists and memberships come from the app-owned `ctx.favs` (no DB read on the UI thread);
-/// toggles are written through the store writer and patched into `ctx.favs` optimistically
-/// (reverted, with an error line, if the write fails while the picker is open).
+/// toggles are written through the store writer and patched into `ctx.favs` optimistically.
+/// Every write ends with `DataScope::Favourites`, failed ones too, so the app re-reads the
+/// real memberships even after the picker closed; while it is open, a failure also restores
+/// the list's last stored state at once (with an error line).
 pub struct ListPickerOverlay {
     pub spec: ListPickerSpec,
     cursor: usize,
@@ -601,6 +604,8 @@ pub struct ListPickerOverlay {
     new_name: String,
     /// Membership writes not answered yet.
     toggles: Vec<PendingToggle>,
+    /// Per list toggled here: its stored membership as far as the answered writes tell.
+    stored: HashMap<FavListId, bool>,
     error: Option<String>,
     enter: Submit,
 }
@@ -614,35 +619,62 @@ struct PendingToggle {
 
 impl ListPickerOverlay {
     pub fn new(spec: ListPickerSpec) -> Self {
-        Self { spec, cursor: 0, naming: None, creating: None, new_name: String::new(), toggles: Vec::new(), error: None, enter: Submit::default() }
+        Self {
+            spec,
+            cursor: 0,
+            naming: None,
+            creating: None,
+            new_name: String::new(),
+            toggles: Vec::new(),
+            stored: HashMap::new(),
+            error: None,
+            enter: Submit::default(),
+        }
     }
 
     fn toggle(&mut self, ctx: &mut UiCtx<'_>, list: FavListId) {
         let item = self.spec.item.clone();
-        let on = !ctx.favs.lists_of(&item).contains(&list);
+        let was = ctx.favs.lists_of(&item).contains(&list);
+        let on = !was;
         let now = ctx.now;
         let write_item = item.clone();
-        // DataScope::Favourites makes the app reload `favs` from the store once it's written
-        let ticket = ctx.services.store.writer().submit_notify(DataScope::Favourites, move |c| {
-            crate::store::user::set_favourite(c, list, &write_item, on, now)
+        let bus = ctx.services.bus.clone();
+        // DataScope::Favourites makes the app reload `favs` from the store, also after a
+        // failed write: that undoes the optimistic patch even once the picker is closed
+        let ticket = ctx.services.store.writer().submit(move |c| {
+            let r = crate::store::user::set_favourite(c, list, &write_item, on, now);
+            bus.data_changed(DataScope::Favourites);
+            r
         });
+        self.stored.entry(list).or_insert(was);
         self.toggles.push(PendingToggle { ticket, list, on });
         ctx.favs.apply_toggle(list, &item, on);
     }
 
-    /// Settle answered membership writes: a failed one is undone in `ctx.favs` and reported.
+    /// Settle answered membership writes (the writer answers in order). A failure restores the
+    /// list's last stored state once no later write for it is pending, and is reported.
     fn poll_toggles(&mut self, egui_ctx: &egui::Context, ctx: &mut UiCtx<'_>) {
-        let item = &self.spec.item;
         let mut failed = None;
+        let mut settled = Vec::new();
         self.toggles.retain_mut(|p| match p.ticket.try_take() {
             None => true,
-            Some(Ok(())) => false,
-            Some(Err(e)) => {
-                ctx.favs.apply_toggle(p.list, item, !p.on);
-                failed = Some((p.list, e));
+            Some(r) => {
+                settled.push((p.list, p.on, r.is_ok()));
+                if let Err(e) = r {
+                    failed = Some((p.list, e));
+                }
                 false
             }
         });
+        for (list, on, ok) in settled {
+            if ok {
+                self.stored.insert(list, on);
+            } else if !self.toggles.iter().any(|p| p.list == list)
+                && let Some(stored) = self.stored.get(&list).copied()
+            {
+                ctx.favs.apply_toggle(list, &self.spec.item, stored);
+            }
+        }
         if let Some((list, e)) = failed {
             let name = ctx.favs.lists.iter().find(|l| l.id == list).map(|l| l.name.as_str()).unwrap_or("the list");
             self.error = Some(format!("Couldn't update “{name}”: {}", message(&e)));

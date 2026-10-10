@@ -26,11 +26,12 @@ use crate::player::{PlayRequest, PlayerCommand, PlayerSnapshot, PlayerState};
 use crate::theme::{SpaceToken, TypeToken};
 use crate::ui::epg_grid::{self, EpgGridState, GridMetrics, GridOutcome, GuideRow, day_label};
 use crate::ui::overlays::{ContextMenuSpec, MenuItem, OverlayResult};
-use crate::ui::screens::live::{self, GuideStatus, choice_action, choice_index, playing_channel};
+use crate::ui::screens::live::{self, GuideStatus, NoGuide, choice_action, choice_index, playing_channel};
 use crate::ui::video_host::Placement;
 use crate::ui::widgets::button::{ButtonStyle, button, icon_button};
+use crate::ui::widgets::rows::grouped;
 use crate::ui::widgets::{empty_state::empty_state, glyphs, section};
-use crate::ui::{LayoutClass, OverlayRequest, Route, Screen, ScreenId, UiCtx};
+use crate::ui::{LayoutClass, OverlayRequest, Route, Screen, ScreenId, SettingsPage, UiCtx};
 
 /// Numeric entry auto-commits after this long without a digit.
 const NUMERIC_COMMIT: Duration = Duration::from_millis(1500);
@@ -166,6 +167,13 @@ impl GuideScreen {
 
     fn zap(&self, ctx: &UiCtx<'_>) -> Option<crate::model::ZapList> { self.collection.as_ref().and_then(|c| live::zap_list(ctx, c)) }
 
+    /// The collection is a provider group whose channels are all hidden ("Everything here is
+    /// hidden" + Show hidden).
+    fn all_hidden(&self, ctx: &UiCtx<'_>) -> bool {
+        self.grid.as_ref().is_some_and(|g| g.rows.is_empty())
+            && matches!(&self.collection, Some(Collection::Group(id)) if ctx.lib.live.groups.iter().any(|g| g.id == *id && g.item_count > 0))
+    }
+
     fn handle_outcome(&mut self, ctx: &mut UiCtx<'_>, out: GridOutcome) {
         match out {
             GridOutcome::None => {}
@@ -173,8 +181,8 @@ impl GuideScreen {
                 self.rest = self.grid.as_ref().and_then(|g| g.focused()).map(|(c, _)| (c, Instant::now()));
             }
             GridOutcome::Open { programme, channel } => {
-                crate::ui::overlays::programme::set_zap_hint(programme, channel, self.zap(ctx));
-                ctx.open(OverlayRequest::Programme { programme, channel });
+                let zap = self.zap(ctx);
+                ctx.open(OverlayRequest::Programme { programme, channel, zap });
                 // its Watch / Catch up play from the guide too
                 self.launched = Some(ctx.player.load_generation);
             }
@@ -314,17 +322,25 @@ impl GuideScreen {
         act
     }
 
-    /// Right side of the header: loading / stale / no-data notices, else key hints. Stale and
-    /// ended use the status bar's wording (DESIGN §9.5, §13.12).
+    /// Right side of the header: loading / missing / stale / no-data notices, why the focused
+    /// channel has no programmes, else key hints. Stale and ended use the status bar's wording
+    /// (DESIGN §9.5, §13.12).
     fn status_line(&mut self, ctx: &mut UiCtx<'_>, view_start: Timestamp) -> (String, egui::Color32) {
         let t = &ctx.theme.tokens;
         let hints = ("f collection · [ ] day · n now · r remind".to_owned(), t.text_secondary);
+        let joined = |r: NoGuide| {
+            let (title, detail) = r.copy();
+            detail.map_or(title.clone(), |d| format!("{title} · {d}"))
+        };
         if let Some(loading) = self.guide.loading_label(ctx) {
             return (loading, t.text_secondary);
         }
         let Some(info) = self.guide.info(ctx) else { return hints };
         if info.sources == 0 {
-            return ("No guide yet — add one in Settings ▸ EPG".into(), t.text_secondary);
+            return (joined(NoGuide::Missing), t.text_secondary);
+        }
+        if info.max_stop.is_none() {
+            return (joined(NoGuide::NotLoaded), t.warning);
         }
         let refresh = crate::keymap::GLOBAL.iter().find(|b| b.action == Action::RefreshSource).map(|b| b.chord.label()).unwrap_or_default();
         if let Some(stop) = info.max_stop {
@@ -337,6 +353,16 @@ impl GuideScreen {
         }
         if let Some(at) = info.last_refresh.filter(|at| ctx.now - at >= GUIDE_STALE_S) {
             return (format!("{} Guide updated {} · {refresh} refresh", glyphs::WARNING, live::age_label(ctx.now, at)), t.warning);
+        }
+        // the focused channel isn't in the guides, and they cover few channels: say so, the
+        // action first (the label truncates); the cells already say it for well-covered ones
+        let unmapped = self.grid.as_ref().and_then(|g| g.focused()).and_then(|(ch, _)| ctx.lib.live.get(ch)).is_some_and(|c| c.epg_channel_id.is_none());
+        if unmapped {
+            let (covered, total) = self.guide.coverage(ctx);
+            let why = NoGuide::NotCovered { covered, total };
+            if why.poor() {
+                return (format!("{} · guides cover {} of {} channels", why.short(), grouped(covered), grouped(total)), t.text_secondary);
+            }
         }
         hints
     }
@@ -375,7 +401,7 @@ impl GuideScreen {
         let video = Rect::from_min_size(ui.cursor().min, egui::vec2(w, (w * 9.0 / 16.0).round()));
         let snap = ctx.player.clone();
         if snap.state != PlayerState::Idle {
-            if ctx.video.paint(ui, video, Placement::Preview, theme, &snap).clicked() {
+            if ctx.video.paint(ui, video, Placement::Preview, theme, ctx.images, &snap).clicked() {
                 ctx.push(Route::Player);
             }
         } else {
@@ -491,8 +517,13 @@ impl Screen for GuideScreen {
             }
             Action::AssignEpg => {
                 if let Some((ch, _)) = self.grid.as_ref().and_then(|g| g.focused()) {
-                    ctx.push(Route::EpgMapping { channel: Some(ch) });
+                    live::assign_epg(ctx, &mut self.guide, ch);
                 }
+                true
+            }
+            // the empty state's "Show hidden", from the keyboard
+            Action::Activate if self.all_hidden(ctx) => {
+                ctx.push(Route::Settings(SettingsPage::Hidden));
                 true
             }
             Action::OpenSearch | Action::ToggleHelp | Action::Back => false,
@@ -561,6 +592,14 @@ impl Screen for GuideScreen {
             return;
         }
         if self.grid.as_ref().is_some_and(|g| g.rows.is_empty()) {
+            if self.all_hidden(ctx) {
+                if empty_state(ui, theme, glyphs::HIDDEN, "Everything here is hidden", Some("Enter opens Settings ▸ Hidden items · f shows another collection"), Some("Show hidden"))
+                    .is_some_and(|r| r.clicked())
+                {
+                    ctx.push(Route::Settings(SettingsPage::Hidden));
+                }
+                return;
+            }
             let (glyph, title) = match &self.collection {
                 Some(Collection::Favourites(_)) => (glyphs::FAVOURITE, "Press Ctrl+F on any channel to add it here"),
                 Some(Collection::History) => (glyphs::HISTORY, "Nothing watched yet"),
@@ -577,10 +616,10 @@ impl Screen for GuideScreen {
         let compact_rows = ctx.config.interface.density == crate::config::Density::Compact;
         let metrics = GridMetrics::for_layout(ctx.layout, compact_rows, theme);
         let mut out = GridOutcome::None;
-        let loading = self.guide.loading_label(ctx);
+        let no_guide = self.guide.no_guide(ctx).map(|r| r.short());
         if let Some(g) = &mut self.grid {
             g.avoid = ctx.mini_rect;
-            g.loading_label = loading;
+            g.no_guide_label = no_guide;
             g.clock_24h = ctx.config.interface.clock_24h;
             // hovered programme: load its description for the tooltip (one indexed read)
             if let Some(id) = g.hovered.filter(|id| g.hover_detail.as_ref().is_none_or(|(h, _)| h != id)) {

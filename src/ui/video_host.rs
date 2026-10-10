@@ -17,11 +17,12 @@
 //! countdown), Error (glyph + message + "r Retry · Backspace Last channel"), Radio (logo +
 //! now playing instead of black).
 //!
-//! The state overlay has no image cache, so "logo" is the channel monogram tile (the OSD of the
-//! fullscreen player shows the real logo). The mini-player is drawn as a card (theme colours
-//! for its title strip, OSD colours inside the video) and is NOT recorded as a placement: the
-//! app shows it only when no screen placed the video in the previous frame, so recording it
-//! would make it blink every other frame.
+//! The overlay's logo is the channel logo through the image cache (screens pass it to
+//! [`VideoHost::paint`]; the last texture is kept for the mini-player, which the app draws
+//! without one), with the monogram tile as the fallback. The mini-player is drawn as a card
+//! (theme colours for its title strip, OSD colours inside the video) and is NOT recorded as a
+//! placement: the app shows it only when no screen placed the video in the previous frame, so
+//! recording it would make it blink every other frame.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -29,6 +30,7 @@ use std::time::Instant;
 use eframe::egui::{self, Align2, Color32, FontId, Rect};
 use eframe::glow;
 
+use crate::images::{ImageCache, ImageKind, ImageState};
 use crate::model::PlayableKind;
 use crate::player::{PlayerErrorKind, PlayerSnapshot, PlayerState, VideoSurface};
 use crate::theme::{SpaceToken, Theme, TypeToken, with_alpha};
@@ -53,6 +55,8 @@ pub struct VideoHost {
     mini: Option<egui::Rect>,
     /// `mini_player` ran since the last `begin_frame` (a rect nobody redraws is dropped).
     mini_drawn: bool,
+    /// Logo of what plays (url, texture), resolved through the image cache by `paint`.
+    logo: Option<(String, egui::TextureHandle)>,
 }
 
 impl VideoHost {
@@ -90,9 +94,35 @@ impl VideoHost {
         s.render(gl, frame);
     }
 
-    /// Paint the video into `rect` (mpv draws black bars), plus the state overlay. Returns
-    /// the response over the whole rect (click / double-click handling by the caller).
-    pub fn paint(&mut self, ui: &mut egui::Ui, rect: egui::Rect, placement: Placement, theme: &Theme, snap: &PlayerSnapshot) -> egui::Response {
+    /// Paint the video into `rect` (mpv draws black bars), plus the state overlay (with the
+    /// channel logo from `images`). Returns the response over the whole rect (click /
+    /// double-click handling by the caller).
+    pub fn paint(&mut self, ui: &mut egui::Ui, rect: egui::Rect, placement: Placement, theme: &Theme, images: &mut ImageCache, snap: &PlayerSnapshot) -> egui::Response {
+        self.update_logo(images, snap);
+        self.paint_video(ui, rect, placement, theme, snap)
+    }
+
+    /// Resolve the logo of what plays (only requested while a video rect is painted).
+    fn update_logo(&mut self, images: &mut ImageCache, snap: &PlayerSnapshot) {
+        let Some(url) = snap.playable.as_ref().and_then(|p| p.logo.as_deref()).map(str::trim).filter(|u| !u.is_empty()) else {
+            self.logo = None;
+            return;
+        };
+        match images.get(url, ImageKind::Logo) {
+            ImageState::Ready(tex) => self.logo = Some((url.to_owned(), tex)),
+            // keep a texture of the same url while it reloads; a new channel starts without
+            ImageState::Loading => self.logo = self.logo.take().filter(|(u, _)| u == url),
+            ImageState::Failed => self.logo = None,
+        }
+    }
+
+    /// The logo texture for what plays now (`None` → monogram).
+    fn logo_for(&self, snap: &PlayerSnapshot) -> Option<&egui::TextureHandle> {
+        let url = snap.playable.as_ref().and_then(|p| p.logo.as_deref()).map(str::trim)?;
+        self.logo.as_ref().filter(|(u, _)| u == url).map(|(_, t)| t)
+    }
+
+    fn paint_video(&mut self, ui: &mut egui::Ui, rect: egui::Rect, placement: Placement, theme: &Theme, snap: &PlayerSnapshot) -> egui::Response {
         self.placed_this_frame = placement;
         let resp = ui.allocate_rect(rect, egui::Sense::click());
         let painter = ui.painter_at(rect);
@@ -142,7 +172,7 @@ impl VideoHost {
                 let tile = 56.0 * k;
                 let block_h = tile + gap + title_font.size + gap + body_font.size + gap + 18.0 * k;
                 let mut y = rect.center().y - block_h / 2.0;
-                monogram_tile(&p, theme, Rect::from_center_size(egui::pos2(rect.center().x, y + tile / 2.0), egui::vec2(tile, tile)), title);
+                logo_tile(&p, theme, Rect::from_center_size(egui::pos2(rect.center().x, y + tile / 2.0), egui::vec2(tile, tile)), title, self.logo_for(snap));
                 y += tile + gap;
                 osd_text(&p, egui::pos2(rect.center().x, y), Align2::CENTER_TOP, title, title_font.clone(), t.osd_text, rect.width() - 2.0 * gap);
                 y += title_font.size + gap;
@@ -197,7 +227,7 @@ impl VideoHost {
                 if audio_only {
                     let tile = 72.0 * k;
                     let mut y = rect.center().y - (tile + gap + 2.0 * title_font.size) / 2.0;
-                    monogram_tile(&p, theme, Rect::from_center_size(egui::pos2(rect.center().x, y + tile / 2.0), egui::vec2(tile, tile)), title);
+                    logo_tile(&p, theme, Rect::from_center_size(egui::pos2(rect.center().x, y + tile / 2.0), egui::vec2(tile, tile)), title, self.logo_for(snap));
                     y += tile + gap;
                     osd_text(&p, egui::pos2(rect.center().x, y), Align2::CENTER_TOP, title, title_font.clone(), t.osd_text, rect.width() - 2.0 * gap);
                     if let Some(sub) = snap.playable.as_ref().and_then(|p| p.subtitle.as_deref()) {
@@ -232,7 +262,7 @@ impl VideoHost {
         egui::Area::new(egui::Id::new("mini-player")).movable(false).order(egui::Order::Foreground).fixed_pos(total.min).show(ctx, |ui| {
             ui.set_min_size(total.size());
             let video = Rect::from_min_size(total.min, egui::vec2(total.width(), total.height() - strip_h));
-            let resp = self.paint(ui, video, Placement::Mini, theme, snap);
+            let resp = self.paint_video(ui, video, Placement::Mini, theme, snap);
             if resp.on_hover_text("Open the player").clicked() {
                 result = Some(true);
             }
@@ -394,9 +424,16 @@ fn stacked(p: &egui::Painter, rect: Rect, lines: &[(&str, FontId, Color32)], gap
     }
 }
 
-/// Monogram tile on the OSD scrim (logo stand-in).
-fn monogram_tile(p: &egui::Painter, theme: &Theme, r: Rect, name: &str) {
+/// The channel logo (aspect kept, fit into `r`) on the OSD scrim, or its monogram tile.
+fn logo_tile(p: &egui::Painter, theme: &Theme, r: Rect, name: &str, logo: Option<&egui::TextureHandle>) {
     let t = &theme.tokens;
+    if let Some(tex) = logo {
+        let s = tex.size_vec2();
+        let scale = (r.width() / s.x.max(1.0)).min(r.height() / s.y.max(1.0));
+        let uv = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        p.image(tex.id(), Rect::from_center_size(r.center(), s * scale), uv, Color32::WHITE);
+        return;
+    }
     p.rect_filled(r, t.rounding, with_alpha(t.osd_text, 0.12));
     p.text(r.center(), Align2::CENTER_CENTER, logo::monogram(name), FontId::proportional((r.height() * 0.4).round().max(6.0)), t.osd_text);
 }

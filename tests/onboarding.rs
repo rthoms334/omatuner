@@ -282,6 +282,15 @@ fn m3u_file_without_a_guide_asks_for_one_and_imports() {
     assert_eq!((sources[0].name.as_str(), sources[0].kind), ("Holiday List", SourceKind::M3uFile));
     let epg = tuner::store::sources::list_epg_sources(&h.state().t.services().store.reader().unwrap()).unwrap();
     assert!(epg.is_empty(), "skipped: no guide added");
+    // the summary says there is no guide and offers the way to add one, from the keyboard
+    until(&mut h, "the guide line", |h| has_containing(h, "No TV guide — add an XMLTV guide"));
+    assert!(has(&h, "TV guide settings"));
+    for _ in 0..3 {
+        press(&mut h, Action::Down);
+    }
+    press(&mut h, Action::Activate);
+    let nav = std::mem::take(&mut h.state_mut().t.nav);
+    assert!(nav.contains(&NavRequest::Switch(Route::Settings(tuner::ui::SettingsPage::Epg))), "{nav:?}");
 }
 
 /// A one-channel local file imports too fast to observe the disabled "Open Live TV" here;

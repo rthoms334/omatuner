@@ -539,11 +539,11 @@ pub(crate) mod tests {
     pub(crate) fn fullscreen_placement(t: &mut crate::ui::testing::TestUi) {
         let theme = t.theme.clone();
         let snap = t.snapshot.clone();
-        let video = &mut t.video;
+        let (video, images) = (&mut t.video, &mut t.images);
         let ctx = egui::Context::default();
         let mut out = ctx.run_ui(Default::default(), |ui| {
             let r = ui.max_rect();
-            video.paint(ui, r, Placement::Fullscreen, &theme, &snap);
+            video.paint(ui, r, Placement::Fullscreen, &theme, images, &snap);
         });
         out.textures_delta.clear();
         t.video.begin_frame();

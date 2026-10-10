@@ -773,6 +773,49 @@ fn pin_prompt_and_list_picker() {
     assert_eq!(h.state_mut().act(Action::Back), "Close");
 }
 
+/// Failed favourites-list writes settle to what the store holds: two failed toggles of the
+/// same list end unticked (each used to undo "its" toggle, leaving the second one's tick), and
+/// a failure answered after the picker closed still makes the app re-read the memberships.
+#[test]
+fn list_picker_failures_settle_to_the_stored_state() {
+    let mut t = TestUi::new().expect("TestUi");
+    // list 99 isn't in the database: every write to it fails (foreign key)
+    t.favs = FavIndex::from_parts(vec![FavouriteList { id: FavListId(99), name: "Ghost".into(), icon: String::new(), sort_index: 0, is_default: false }], Vec::new());
+    let item = ItemRef { source: SourceId(1), kind: ItemKind::Channel, key: ItemKey("bbc-one".into()) };
+    let spec = ListPickerSpec { item: item.clone(), title: "Add “BBC One” to…".into() };
+    let mut h = overlay_harness(OvApp::new(t, OverlayRequest::ListPicker(spec)), egui::vec2(900.0, 700.0));
+    assert_eq!(h.state_mut().act(Action::Activate), "Keep");
+    assert_eq!(h.state_mut().act(Action::Activate), "Keep");
+    assert!(h.state().t.favs.lists_of(&item).is_empty(), "on, then off (optimistic)");
+    for _ in 0..500 {
+        h.run();
+        if h.query_by_label_contains("Couldn't update “Ghost”").is_some() && h.state().t.favs.lists_of(&item).is_empty() {
+            // let any answer still in flight arrive
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            h.run();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(h.query_by_label_contains("Couldn't update “Ghost”").is_some());
+    assert!(h.state().t.favs.lists_of(&item).is_empty(), "both writes failed: still not in the list");
+
+    // a toggle, then the picker closes before the writer answers
+    while h.state().t.events.try_recv().is_ok() {}
+    assert_eq!(h.state_mut().act(Action::Activate), "Keep");
+    assert_eq!(h.state_mut().act(Action::Back), "Close");
+    let t = h.into_state().t;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut reread = false;
+    while let Ok(ev) = t.events.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+        if matches!(ev, tuner::msg::AppEvent::Data(tuner::msg::DataScope::Favourites)) {
+            reread = true;
+            break;
+        }
+    }
+    assert!(reread, "the app is told to re-read the favourites after a failed write");
+}
+
 #[test]
 fn data_rows_render_with_real_services() {
     use tuner::model::{ChannelId, ChannelSummary, EpgChannelId, Episode, EpisodeId, Group, GroupId, GroupKey, NowNext, ProgrammeId, ProgrammeSlim, SeriesId, StreamLocator};
@@ -832,12 +875,12 @@ fn data_rows_render_with_real_services() {
     let theme = Theme::fallback();
     let mut h = Harness::builder().with_size(egui::vec2(900.0, 700.0)).build_ui(|ui| {
         t.images.pump();
-        let opts = rows::ChannelRowOpts { density: Density::Comfortable, show_number: true, show_logo: true, source: None, favourite: true, failed: false, playing: true };
+        let opts = rows::ChannelRowOpts { density: Density::Comfortable, show_number: true, show_logo: true, favourite: true, playing: true, ..Default::default() };
         rows::channel_row(ui, &theme, &mut t.images, &ch, Some(&nn), now, opts, RowState::Cursor);
         rows::channel_row(ui, &theme, &mut t.images, &ch, None, now, rows::ChannelRowOpts { density: Density::Compact, playing: false, ..opts }, RowState::Idle);
         rows::group_row(ui, &theme, &group, RowState::Selected);
-        rows::programme_row(ui, &theme, &nn.now.clone().unwrap(), now, true, RowState::Idle);
-        rows::episode_row(ui, &theme, &ep, Some(0.4), false, RowState::Idle);
+        rows::programme_row(ui, &theme, &nn.now.clone().unwrap(), now, true, true, RowState::Idle);
+        rows::episode_row(ui, &theme, &ep, Some(0.4), false, false, RowState::Idle);
         tuner::ui::widgets::badge::live_badge(ui, &theme);
         tuner::ui::widgets::progress::busy_bar(ui, &theme, 3.0);
         tuner::ui::widgets::text_field::search_header(ui, &theme, "", "Search channels", Some("󰍉"));

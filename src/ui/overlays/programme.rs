@@ -3,14 +3,11 @@
 //! Owner: WP-11.
 //!
 //! The popover performs its actions itself (it can be opened from the guide, and from search
-//! results that show programmes). Watch zaps through the channel's primary group unless the
-//! opener registered a zap list for exactly this (programme, channel) with [`set_zap_hint`]
-//! right before opening it — the guide does, so Watch zaps through the guide's collection
-//! (DESIGN §13.0). A locked channel opens the PIN prompt with `GuideWatch` / `GuideCatchup`
+//! results that show programmes). Watch zaps through the zap list of the request
+//! (`OverlayRequest::Programme::zap` — the guide passes its collection, DESIGN §13.0), else
+//! through the channel's primary group. A locked channel opens the PIN prompt with `GuideWatch` / `GuideCatchup`
 //! as the action to retry, which the guide (the opener) re-runs on its focused programme.
 //! The programme row is read once (one indexed read inside the frame budget).
-
-use std::cell::RefCell;
 
 use eframe::egui::{self, RichText};
 
@@ -25,25 +22,6 @@ use crate::ui::widgets::button::{ButtonStyle, button};
 use crate::ui::widgets::card::CardKind;
 use crate::ui::widgets::{badge, glyphs, progress};
 use crate::ui::{Route, UiCtx};
-
-thread_local! {
-    static ZAP_HINT: RefCell<Option<(ProgrammeId, ChannelId, Option<ZapList>)>> = const { RefCell::new(None) };
-}
-
-/// Register the zap list Watch should use for the popover about to open for
-/// (`programme`, `channel`) (UI thread only).
-pub(crate) fn set_zap_hint(programme: ProgrammeId, channel: ChannelId, zap: Option<ZapList>) { ZAP_HINT.with(|h| *h.borrow_mut() = Some((programme, channel, zap))) }
-
-/// Take the hint if it belongs to this popover.
-fn take_zap_hint(programme: ProgrammeId, channel: ChannelId) -> Option<Option<ZapList>> {
-    ZAP_HINT.with(|h| {
-        let mut h = h.borrow_mut();
-        match h.as_ref() {
-            Some((p, c, _)) if *p == programme && *c == channel => h.take().map(|(_, _, z)| z),
-            _ => None,
-        }
-    })
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Act {
@@ -73,11 +51,12 @@ pub struct ProgrammeOverlay {
 }
 
 impl ProgrammeOverlay {
-    pub fn new(programme: ProgrammeId, channel: ChannelId) -> Self { Self { programme, channel, cursor: 0, loaded: None, zap: None } }
+    /// `zap`: the opener's zap list for Watch (`None` = the channel's primary group).
+    pub fn new(programme: ProgrammeId, channel: ChannelId, zap: Option<ZapList>) -> Self { Self { programme, channel, cursor: 0, loaded: None, zap: zap.map(Some) } }
 
     fn load(&mut self, ctx: &mut UiCtx<'_>) {
         if self.zap.is_none() {
-            self.zap = Some(take_zap_hint(self.programme, self.channel).unwrap_or_else(|| live::primary_zap(ctx, self.channel)));
+            self.zap = Some(live::primary_zap(ctx, self.channel));
         }
         if self.loaded.is_some() {
             return;
