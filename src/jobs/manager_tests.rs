@@ -166,7 +166,7 @@ impl Harness {
             let hit = {
                 let mut stash = self.stash.lock().unwrap();
                 while let Ok(ev) = self.events.try_recv() {
-                    if let AppEvent::Job(JobEvent::Finished { id, kind, outcome }) = ev {
+                    if let AppEvent::Job(JobEvent::Finished { id, kind, outcome, .. }) = ev {
                         stash.push((id, kind, outcome));
                     }
                 }
@@ -215,7 +215,7 @@ async fn coalesces_while_queued_or_connecting_and_upgrades_force() {
     // cancelling A frees a permit: C starts, with the upgraded kind
     h.jobs.cancel(ja);
     let (id, outcome) = h.finished(|k| *k == refresh(a, false)).await;
-    assert_eq!((id, outcome.unwrap_err()), (ja, "Cancelled".to_owned()));
+    assert_eq!((id, outcome.unwrap_err()), (ja, "cancelled".to_owned()));
     h.wait_phase(jc, |p| *p == JobPhase::Connecting).await;
     assert_eq!(h.status(jc).unwrap().kind, refresh(c, true));
 
@@ -226,7 +226,7 @@ async fn coalesces_while_queued_or_connecting_and_upgrades_force() {
     assert_eq!(h.status(jd).unwrap().phase, JobPhase::Queued);
     h.jobs.cancel(jd);
     let (id, outcome) = h.finished(|k| *k == refresh(d, false)).await;
-    assert_eq!((id, outcome.unwrap_err()), (jd, "Cancelled".to_owned()));
+    assert_eq!((id, outcome.unwrap_err()), (jd, "cancelled".to_owned()));
 
     h.jobs.cancel_all();
     assert!(h.finished(|k| *k == refresh(b, false)).await.1.is_err());
@@ -293,7 +293,7 @@ async fn a_cancelled_import_never_sweeps() {
     h.wait_phase(job, |p| matches!(p, JobPhase::Writing { done, .. } if *done > 0)).await;
     h.jobs.cancel(job);
     let (id, outcome) = h.finished(|k| matches!(k, JobKind::RefreshSource { .. })).await;
-    assert_eq!((id, outcome.unwrap_err()), (job, "Cancelled".to_owned()));
+    assert_eq!((id, outcome.unwrap_err()), (job, "cancelled".to_owned()));
 
     let old = h.count("SELECT count(*) FROM channel WHERE source_id = ?1 AND name LIKE 'Old %'", s);
     let new = h.count("SELECT count(*) FROM channel WHERE source_id = ?1 AND name LIKE 'New %'", s);
@@ -351,6 +351,32 @@ fn probe_draft(url: &str) -> SourceDraft {
     }
 }
 
+/// Adds of one playlist (a double Enter, a retry under another name) while the first is still
+/// importing join it: one job, one source — never a second row once the first add refreshed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn adds_of_one_locator_join_the_running_add() {
+    let body = Arc::new(playlist(20, "Ch"));
+    let srv = server(HashMap::from([("/new.m3u", Script::Gated(body))])).await;
+    let h = harness();
+    let url = format!("{}/new.m3u", srv.base);
+    let draft = |name: &str| SourceDraft { name: name.into(), ..probe_draft(&url) };
+    let first = h.jobs.submit(JobKind::AddSource(draft("Mine")));
+    h.wait_phase(first, |p| matches!(p, JobPhase::Downloading { .. })).await;
+    assert_eq!(h.jobs.submit(JobKind::AddSource(draft("Mine"))), first, "identical request");
+    assert_eq!(h.jobs.submit(JobKind::AddSource(draft("Renamed"))), first, "same locator, other name");
+    assert_eq!(h.jobs.active().len(), 1);
+    srv.gate.send(true).unwrap();
+    let (id, outcome) = h.finished(|k| matches!(k, JobKind::AddSource(_))).await;
+    assert_eq!(id, first);
+    assert!(matches!(outcome, Ok(JobOutcome::SourceAdded(_))), "{outcome:?}");
+    // no rerun inserting a second source after the first one refreshed
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(h.jobs.active().iter().all(|s| !matches!(s.kind, JobKind::AddSource(_))), "{:?}", h.jobs.active());
+    let c = h.jobs.context().store.reader().unwrap();
+    assert_eq!(c.query_row("SELECT count(*) FROM source", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    assert_eq!(srv.hits.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn a_connecting_job_that_has_not_read_inputs_absorbs_identical_requests() {
     let srv = server(HashMap::from([("/late.m3u", Script::Late404)])).await;
@@ -381,7 +407,7 @@ async fn a_request_after_a_cancel_runs_once_the_cancelled_job_is_gone() {
     // "Refresh" clicked again right away, while the cancelled run still winds down
     h.jobs.submit(refresh(a, true));
     let (id, outcome) = h.finished(|k| matches!(k, JobKind::RefreshSource { .. })).await;
-    assert_eq!((id, outcome.unwrap_err()), (first, "Cancelled".to_owned()));
+    assert_eq!((id, outcome.unwrap_err()), (first, "cancelled".to_owned()));
 
     let mut second = None;
     for _ in 0..2000 {
@@ -395,7 +421,7 @@ async fn a_request_after_a_cancel_runs_once_the_cancelled_job_is_gone() {
     assert_eq!(srv.hits.load(Ordering::SeqCst), 2);
     h.jobs.cancel_all();
     let (id, outcome) = h.finished(|k| matches!(k, JobKind::RefreshSource { .. })).await;
-    assert_eq!((id, outcome.unwrap_err()), (second.id, "Cancelled".to_owned()));
+    assert_eq!((id, outcome.unwrap_err()), (second.id, "cancelled".to_owned()));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
@@ -447,6 +473,32 @@ fn guide(channels: usize, per_channel: usize, title: &str) -> String {
     }
     s.push_str("</tv>\n");
     s
+}
+
+/// App exit: `shutdown` cancels and refuses new jobs; `wait_idle` returns only once the
+/// cancelled guide import has discarded its partial generation (its wind-down), so the
+/// runtime shutdown that follows never cuts it short.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn shutdown_waits_for_the_wind_down_of_cancelled_jobs() {
+    let h = harness();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("guide.xml");
+    std::fs::write(&file, guide(200, 400, "Big")).unwrap();
+    let kind = EpgSourceKind::File { path: file.clone() };
+    let g = h.jobs.context().store.writer().run(move |c| crate::store::sources::insert_epg_source(c, "Guide", &kind, 0)).await.unwrap();
+    let job = h.jobs.submit(JobKind::RefreshEpg { epg_source: g, force: true });
+    h.wait_phase(job, |p| matches!(p, JobPhase::Writing { done, .. } if *done > 0)).await;
+
+    h.jobs.shutdown();
+    assert_eq!(h.jobs.submit(JobKind::RebuildLibrary), JobId(0), "nothing new starts while closing");
+    let jobs = h.jobs.clone();
+    assert!(tokio::task::spawn_blocking(move || jobs.wait_idle(Duration::from_secs(20))).await.unwrap());
+    assert!(h.jobs.active().is_empty());
+    let (id, outcome) = h.finished(|k| matches!(k, JobKind::RefreshEpg { .. })).await;
+    assert_eq!((id, outcome.unwrap_err()), (job, "cancelled".to_owned()));
+    // the partial guide is gone already: nothing left for a later sweep
+    let partial: i64 = h.jobs.context().store.reader().unwrap().query_row("SELECT count(*) FROM programme WHERE epg_source_id = ?1", [g], |r| r.get(0)).unwrap();
+    assert_eq!(partial, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]

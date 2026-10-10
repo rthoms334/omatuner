@@ -564,7 +564,7 @@ mod tests {
 
     fn library(n: usize) -> Library {
         let chans = (0..n as i64).map(|i| channel(i, &format!("Channel {i:06}"))).collect();
-        Library { live: LiveIndex::from_parts(chans, vec![], HashMap::new(), HashSet::new()), ..Library::default() }
+        Library { live: LiveIndex::from_parts(chans, vec![], HashMap::new(), HashSet::new()).into(), ..Library::default() }
     }
 
     /// Tick until the matcher is idle and every injected item was matched.
@@ -637,7 +637,7 @@ mod tests {
     #[test]
     fn highlights_match_the_haystack_for_decomposed_names() {
         let lib = Library {
-            live: LiveIndex::from_parts(vec![channel(1, "Cafe\u{301} Noir")], vec![], HashMap::new(), HashSet::new()),
+            live: LiveIndex::from_parts(vec![channel(1, "Cafe\u{301} Noir")], vec![], HashMap::new(), HashSet::new()).into(),
             ..Library::default()
         };
         let mut idx = SearchIndex::new(Arc::new(|| {}));
@@ -659,7 +659,8 @@ mod tests {
                 vec![],
                 HashMap::new(),
                 HashSet::new(),
-            ),
+            )
+            .into(),
             ..Library::default()
         };
         let ids = |idx: &SearchIndex| {

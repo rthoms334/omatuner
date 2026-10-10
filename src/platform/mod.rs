@@ -7,6 +7,7 @@ pub mod hypr;
 pub mod idle;
 pub mod mpris;
 pub mod notify;
+pub mod signals;
 
 use crate::model::{ItemRef, ReminderId};
 

@@ -22,7 +22,7 @@ use std::path::PathBuf;
 
 use tokio_util::sync::CancellationToken;
 
-use super::{JobContext, JobPhase, ProbeResult, Progress, blocking, check, notify, read, write};
+use super::{JobContext, JobPhase, ProbeResult, Progress, blocking, check, notify, write};
 use crate::error::{Error, Result};
 use crate::model::{HttpHeaders, Source, SourceDraft, SourceId, SourceKind};
 use crate::msg::DataScope;
@@ -174,28 +174,25 @@ fn apply_draft(src: &mut Source, draft: &SourceDraft) {
 /// Insert the source and run its first refresh inline (progress continues on the same job).
 pub async fn add_source(ctx: &JobContext, draft: &SourceDraft, progress: &Progress, cancel: &CancellationToken) -> Result<SourceId> {
     check(cancel)?;
-    let d = draft.clone();
-    let reuse = read(ctx, move |c| {
-        Ok(crate::store::sources::list_sources(c)?.into_iter().find(|s| s.status.last_refresh.is_none() && same_locator(s, &d)))
+    // find-or-insert in ONE writer closure: an add racing this one (same locator, another job)
+    // sees the row this one saved and reuses it instead of inserting a second source
+    let (d, now) = (draft.clone(), crate::model::now());
+    let (id, reused) = write(ctx, move |c| {
+        let saved = crate::store::sources::list_sources(c)?.into_iter().find(|s| s.status.last_refresh.is_none() && same_locator(s, &d));
+        match saved {
+            Some(mut src) => {
+                apply_draft(&mut src, &d);
+                crate::store::sources::update_source(c, &src)?;
+                Ok((src.id, true))
+            }
+            None => Ok((crate::store::sources::insert_source(c, &d, now)?, false)),
+        }
     })
     .await?;
-    let id = match reuse {
-        Some(mut src) => {
-            tracing::info!("adding {}: retrying the import of the source saved by an earlier attempt", draft.name);
-            apply_draft(&mut src, draft);
-            let id = src.id;
-            write(ctx, move |c| crate::store::sources::update_source(c, &src)).await?;
-            notify(ctx, DataScope::Sources);
-            id
-        }
-        None => {
-            let d = draft.clone();
-            let now = crate::model::now();
-            let id = write(ctx, move |c| crate::store::sources::insert_source(c, &d, now)).await?;
-            notify(ctx, DataScope::Sources);
-            id
-        }
-    };
+    if reused {
+        tracing::info!("adding {}: importing the source saved by an earlier attempt", draft.name);
+    }
+    notify(ctx, DataScope::Sources);
     if let Err(e) = super::import_source::refresh_source(ctx, id, true, progress, cancel).await {
         if !matches!(e, Error::Cancelled) {
             tracing::warn!(target: "tuner::jobs", "{} was saved; its first import failed (refresh it from Settings ▸ Playlists)", draft.name);

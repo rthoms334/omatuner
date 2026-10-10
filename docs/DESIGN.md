@@ -290,7 +290,12 @@ Shutdown (`on_exit`): `VideoSurface::destroy` (GL current: render ctx, then FBO)
 `Services::shutdown`: integrations stop → `jobs.cancel_all` → `Player::shutdown` (Stop → final
 progress save submitted, join controller, stop pump, drop mpv) → runtime `shutdown_timeout(2 s)`
 → `Store::close(3 s)`: the writer runs everything queued before the sentinel (incl. that final
-save), checkpoints the WAL (TRUNCATE) and is joined.
+save), checkpoints the WAL (TRUNCATE) and is joined. (WP-13: `jobs.shutdown` refuses new jobs
+and cancels; after the player, the app waits ≤ 5 s for cancelled jobs to wind down — an aborted
+guide import discards its partial generation and restores channel matches — before the runtime
+goes. SIGTERM/SIGINT/SIGHUP close the window the same way; if no frame runs within 3 s (hidden
+workspace) or a second signal arrives, the signal watcher stops the player, flushes the writer,
+removes `run/tuner.sock` and exits 0.)
 Unwind safety: `TunerApp` declares `video` before `services`; `MpvGl` frees its context only in
 an explicit `destroy` (GL current) and otherwise leaks it; `Player` leaks mpv while a render
 context is alive — never UB on a panic path.
@@ -350,7 +355,8 @@ recent, sort)`) happens here, so zapping order == list order.
 
 | `DataScope` | App reaction |
 |---|---|
-| Live, Vod, Overrides, History, Sources, All | `RebuildLibrary` |
+| Live, Vod, Overrides, Sources, All | `RebuildLibrary` |
+| History (every zap) | re-read `recent_channels` (≤ 500 history rows) → `Library::with_recent_channels` (shares the `Arc` indexes, keeps `built_at`); no rebuild (WP-13) |
 | Epg | `NowNextCache::invalidate` + `RebuildLibrary` (`ChannelSummary.epg_channel_id` is a snapshot of `channel_epg`) |
 | Favourites | `load_favs` → `TunerApp.favs` |
 | Reminders | `ReminderScheduler::refresh` |
@@ -2115,7 +2121,13 @@ max_image_width: 8192, max_image_height: 8192, max_alloc: 64 MiB }`; SVG sources
 rejected, parsed with an EMPTY `usvg` fontdb (never `load_system_fonts`) and rasterized at most
 at the kind's box. Fetching goes through a private `Fetch` trait (HTTP impl + test fake).
 Until WP-09 lands `get` returns `Failed` (monogram) and `pump` is a no-op.
-Failures negative-cached (memory 1 h, `.fail` marker 24 h). Logos never show spinners (neutral
+Failures negative-cached (memory 1 h, `.fail` marker 24 h); transient network failures
+(timeouts, 5xx, offline, TLS) memory only, backing off per image 2 → 8 → 32 → 60 min (WP-13: a
+blip must not hide logos for an hour; an unreachable host is retried a few times an hour). The
+texture budget is a hard cap: an image that doesn't fit beside the visible set waits (loading)
+until something scrolls away. SVG: ≤ 10 000 nodes, render > 3 s = invalid. "Source User-Agent"
+= by host (WP-13 decision): `get(url, kind)` has no source, so images on the host a playlist is
+served from use that playlist's User-Agent, others the default. Logos never show spinners (neutral
 placeholder, then monogram on failure); posters show a skeleton. Disk cache pruned to 500 MB
 by maintenance.
 

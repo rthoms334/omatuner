@@ -121,7 +121,7 @@ fn library() -> Library {
         vec![group(20, ItemKind::Series, "Drama", false, false)],
         HashMap::new(),
     );
-    Library { sources: vec![source(1, "My IPTV"), source(2, "Free")], live, vod: vod_index, ..Library::default() }
+    Library { sources: vec![source(1, "My IPTV"), source(2, "Free")], live: live.into(), vod: vod_index.into(), ..Library::default() }
 }
 
 fn index(include_locked: bool) -> SearchIndex {

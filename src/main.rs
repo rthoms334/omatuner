@@ -28,7 +28,7 @@ use tuner::model::JobId;
 use tuner::msg::{AppEvent, EventBus};
 use tuner::paths::AppPaths;
 use tuner::services::Services;
-use tuner::sources::http::{HttpClient, HttpOptions};
+use tuner::sources::http::HttpClient;
 use tuner::store::Store;
 use tuner::theme::Theme;
 
@@ -49,6 +49,9 @@ fn main() -> anyhow::Result<()> {
         Err(e) => (Config::default(), Some(e)),
     };
     let logs = tuner::logging::init(&paths, cli.debug || config.general.debug_log);
+    if cli.debug {
+        tuner::logging::pin_debug();
+    }
     if let Some(e) = config_err {
         tracing::error!("{e}; using defaults (your file was not modified)");
     }
@@ -88,7 +91,8 @@ fn main() -> anyhow::Result<()> {
             Theme::from_parts(t.name, t.palette, t.shell, t.tokens.rounding, ui_scale)
         }
     })?;
-    let services = Services::start(paths.clone(), config, logs, bus.clone())?;
+    let mut services = Services::start(paths.clone(), config, logs, bus.clone())?;
+    services.watch_signals();
 
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
@@ -148,11 +152,7 @@ fn refresh_headless(paths: AppPaths, config: Config, timeout: Duration) -> anyho
     if let Err(e) = store.reader().and_then(|c| tuner::store::sources::register_secrets(&c)) {
         tracing::error!("registering stored secrets: {e}");
     }
-    let http = HttpClient::new(&HttpOptions {
-        default_user_agent: config.player.user_agent.clone(),
-        connect_timeout_s: 10,
-        read_timeout_s: config.player.network_timeout_s.max(30) as u64,
-    })?;
+    let http = HttpClient::new(&tuner::services::http_options(&config))?;
     let shared = Arc::new(RwLock::new(Arc::new(config)));
     let jobs = JobManager::new(JobContext::new(store.clone(), http, bus, paths, shared), rt.handle().clone());
     let root = jobs.submit(JobKind::RefreshStale);
@@ -173,7 +173,7 @@ fn wait_for_jobs(jobs: &JobManager, events: &Receiver<AppEvent>, root: JobId, ti
     let mut idle_since: Option<Instant> = None;
     loop {
         match events.recv_timeout(Duration::from_millis(100)) {
-            Ok(AppEvent::Job(JobEvent::Finished { id, kind, outcome })) => {
+            Ok(AppEvent::Job(JobEvent::Finished { id, kind, outcome, .. })) => {
                 root_done |= id == root;
                 match outcome {
                     Ok(_) => tracing::info!("refresh: {kind:?} done"),
@@ -286,7 +286,7 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let (bus, events) = EventBus::new(None);
         let store = Store::open(&paths.db_file(), None).unwrap();
-        let http = HttpClient::new(&HttpOptions { default_user_agent: "t".into(), connect_timeout_s: 1, read_timeout_s: 1 }).unwrap();
+        let http = HttpClient::new(&tuner::sources::http::HttpOptions { default_user_agent: "t".into(), connect_timeout_s: 1, read_timeout_s: 1 }).unwrap();
         let jobs = JobManager::new(JobContext::new(store.clone(), http, bus, paths, Arc::default()), rt.handle().clone());
         // a root id that never finishes
         let failed = wait_for_jobs(&jobs, &events, JobId(u64::MAX), Duration::from_millis(300));

@@ -18,8 +18,11 @@
 //!   max_image_height: 8192, max_alloc: 64 MiB }` (a 20k×20k PNG must not allocate GBs); SVG:
 //!   reject sources > 1 MiB, `usvg::Options` with an EMPTY fontdb (never `load_system_fonts`),
 //!   no external or embedded `<image>` references (no local file reads, no nested decoders
-//!   outside our limits), at most 16 filter primitives (blurs over a large canvas take seconds),
-//!   raster size clamped to the kind's box. gzip-compressed SVG (svgz) is not accepted.
+//!   outside our limits), at most 16 filter primitives (blurs over a large canvas take seconds)
+//!   and 10 000 nodes after `<use>` expansion, raster size clamped to the kind's box. A render
+//!   still running after 3 s counts as undecodable (`.fail` marker); its thread keeps the one
+//!   SVG permit until it really ends, so runaway renders never pile up. gzip-compressed SVG
+//!   (svgz) is not accepted.
 //!   Downloads are capped at 8 MiB.
 //! * A decoder panic (hostile input) counts as an undecodable file: `.fail` marker, no retry.
 //! * Fetching goes through a private `trait Fetch` (implemented for `HttpClient`) so WP-09's
@@ -29,11 +32,15 @@
 //!   scrolling through 100k channels must not queue 100k downloads). The check runs before the
 //!   disk read and again right before the network request (after waiting for a permit).
 //! * Failures are negative-cached in memory for 1 h and on disk (`.fail` marker) for 24 h.
-//!   Transient network failures (timeouts, 5xx, offline) are only cached in memory, for 2 min,
-//!   so a network blip does not hide logos for a day.
-//! * Memory: LRU over texture bytes (default budget 192 MiB GPU, configurable). Only entries not
-//!   used for ≥ 2 frames are evicted, so the visible set never thrashes (it may exceed a budget
-//!   smaller than one screenful).
+//!   Transient network failures (timeouts, 5xx, offline, TLS) are cached in memory only, backing
+//!   off per image 2 → 8 → 32 → 60 min (DESIGN §18): a network blip hides logos for minutes,
+//!   not a day, and a host that stays unreachable is retried a few times an hour, not every
+//!   2 min. A successful load resets the back-off. A failed fetch logs one DEBUG line naming
+//!   the host only.
+//! * Memory: LRU over texture bytes (default budget 192 MiB GPU, configurable), never exceeded.
+//!   Only entries not used for ≥ 2 frames are evicted, so the visible set never thrashes; an
+//!   image that doesn't fit next to the visible set waits decoded (shown as loading) until
+//!   something scrolls away, and one larger than the whole budget fails.
 //! * Placeholder (UI decides): monogram of the name on fg@0.04; missing logo ≠ loading state.
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -41,6 +48,7 @@ use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -57,6 +65,11 @@ const MAX_DOWNLOAD_BYTES: u64 = 8 << 20;
 const MAX_SVG_BYTES: usize = 1 << 20;
 /// SVGs applying more filter primitives than this are rejected (rendering time).
 const MAX_SVG_FILTER_PRIMITIVES: usize = 16;
+/// SVGs with more nodes than this (after `<use>` expansion, incl. clip/mask/pattern content)
+/// are rejected (rendering time).
+const MAX_SVG_NODES: usize = 10_000;
+/// Back-off factor between consecutive transient failures of one image.
+const TRANSIENT_BACKOFF: u32 = 4;
 /// Raster decode limits (untrusted input).
 const MAX_DIMENSION: u32 = 8192;
 const MAX_DECODE_ALLOC: u64 = 64 << 20;
@@ -115,16 +128,18 @@ pub enum ImageState {
 
 type FetchFuture<'a> = Pin<Box<dyn Future<Output = Result<bytes::Bytes>> + Send + 'a>>;
 
-/// Network seam: the HTTP client in production, a fake in tests.
+/// Network seam: the HTTP client in production, a fake in tests. `user_agent: None` = the
+/// client's default (Settings ▸ Playback User-Agent).
 trait Fetch: Send + Sync + 'static {
-    fn fetch<'a>(&'a self, url: &'a str, max_bytes: u64) -> FetchFuture<'a>;
+    fn fetch<'a>(&'a self, url: &'a str, user_agent: Option<&'a str>, max_bytes: u64) -> FetchFuture<'a>;
 }
 
 impl Fetch for HttpClient {
-    fn fetch<'a>(&'a self, url: &'a str, max_bytes: u64) -> FetchFuture<'a> {
+    fn fetch<'a>(&'a self, url: &'a str, user_agent: Option<&'a str>, max_bytes: u64) -> FetchFuture<'a> {
         Box::pin(async move {
             let cancel = tokio_util::sync::CancellationToken::new();
-            self.get_bytes(url, &crate::model::HttpHeaders::default(), max_bytes, &cancel).await
+            let headers = crate::model::HttpHeaders { user_agent: user_agent.map(str::to_owned), ..Default::default() };
+            self.get_bytes(url, &headers, max_bytes, &cancel).await
         })
     }
 }
@@ -136,8 +151,11 @@ struct Tuning {
     stale_after: Duration,
     /// Memory negative cache for permanent failures.
     fail_ttl: Duration,
-    /// Memory negative cache for transient (network) failures.
+    /// Memory negative cache for the first transient (network) failure; later ones back off
+    /// ×4 each, up to `fail_ttl`.
     transient_fail_ttl: Duration,
+    /// An SVG render taking longer counts as undecodable.
+    svg_timeout: Duration,
     /// Age limit of a `.fail` marker on disk.
     disk_fail_ttl: Duration,
 }
@@ -148,6 +166,7 @@ impl Default for Tuning {
             stale_after: Duration::from_secs(2),
             fail_ttl: Duration::from_secs(3600),
             transient_fail_ttl: Duration::from_secs(120),
+            svg_timeout: Duration::from_secs(3),
             disk_fail_ttl: Duration::from_secs(24 * 3600),
         }
     }
@@ -184,10 +203,13 @@ struct Shared {
     tuning: Tuning,
     /// key → last time `get` asked for it.
     wanted: Mutex<HashMap<Key, Instant>>,
+    /// Host → User-Agent of the playlist served from that host ([`ImageCache::set_source_agents`]).
+    agents: Mutex<HashMap<String, String>>,
     net: Semaphore,
     hosts: Mutex<HashMap<String, Arc<Semaphore>>>,
-    decode: Semaphore,
-    svg: Semaphore,
+    decode: Arc<Semaphore>,
+    /// Owned permits: a timed-out render keeps its slot until its thread ends.
+    svg: Arc<Semaphore>,
     /// [`decode`]; a seam so tests can simulate a decoder panic.
     decoder: fn(&[u8], ImageKind) -> Result<egui::ColorImage>,
     tx: crossbeam_channel::Sender<Done>,
@@ -256,6 +278,8 @@ pub struct ImageCache {
     inflight: HashSet<Key>,
     /// Negative cache: key → expiry.
     failed: HashMap<Key, Instant>,
+    /// Consecutive transient failures per image (back-off), reset by a successful load.
+    strikes: HashMap<Key, u32>,
     /// Decoded images waiting for their upload slot.
     ready: VecDeque<(Key, egui::ColorImage)>,
     rx: crossbeam_channel::Receiver<Done>,
@@ -280,10 +304,11 @@ impl ImageCache {
             fetch,
             tuning,
             wanted: Mutex::default(),
+            agents: Mutex::default(),
             net: Semaphore::new(MAX_FETCHES),
             hosts: Mutex::default(),
-            decode: Semaphore::new(MAX_DECODES),
-            svg: Semaphore::new(MAX_SVG_RENDERS),
+            decode: Arc::new(Semaphore::new(MAX_DECODES)),
+            svg: Arc::new(Semaphore::new(MAX_SVG_RENDERS)),
             decoder: decode,
             tx,
             egui: egui.clone(),
@@ -298,6 +323,7 @@ impl ImageCache {
             texture_bytes: 0,
             inflight: HashSet::new(),
             failed: HashMap::new(),
+            strikes: HashMap::new(),
             ready: VecDeque::new(),
             rx,
         }
@@ -345,6 +371,12 @@ impl ImageCache {
         }
     }
 
+    /// Per-source User-Agents by host (DESIGN §18): an image on the host a playlist is served
+    /// from (an Xtream panel's logos and posters) is fetched with that playlist's User-Agent;
+    /// images elsewhere (CDNs, wikis) with the default one. `ImageCache::get` has no source:
+    /// the host is what ties a URL to a provider.
+    pub fn set_source_agents(&mut self, agents: HashMap<String, String>) { *lock(&self.shared.agents) = agents; }
+
     /// Drop all textures (theme/scale change does NOT require this; memory pressure does).
     pub fn clear_memory(&mut self) {
         self.textures.clear();
@@ -360,11 +392,22 @@ impl ImageCache {
     fn drain_results(&mut self) {
         while let Ok(Done { key, outcome }) = self.rx.try_recv() {
             match outcome {
-                Outcome::Ready(img) => self.ready.push_back((key, img)),
+                Outcome::Ready(img) => {
+                    self.strikes.remove(&key);
+                    self.ready.push_back((key, img));
+                }
                 Outcome::Failed { transient } => {
                     self.inflight.remove(&key);
                     let t = &self.shared.tuning;
-                    let ttl = if transient { t.transient_fail_ttl } else { t.fail_ttl };
+                    let ttl = if transient {
+                        let strikes = self.strikes.entry(key).or_default();
+                        let ttl = t.transient_fail_ttl.saturating_mul(TRANSIENT_BACKOFF.saturating_pow(*strikes));
+                        *strikes = strikes.saturating_add(1);
+                        ttl.min(t.fail_ttl)
+                    } else {
+                        self.strikes.remove(&key);
+                        t.fail_ttl
+                    };
                     self.failed.insert(key, Instant::now() + ttl);
                 }
                 Outcome::Skipped => {
@@ -383,10 +426,23 @@ impl ImageCache {
                 break;
             }
             let Some((key, img)) = self.ready.pop_front() else { break };
-            self.inflight.remove(&key);
             if self.shared.is_stale(key) {
+                self.inflight.remove(&key);
                 continue; // scrolled away while decoding: don't spend upload budget on it
             }
+            if bytes > self.budget_bytes {
+                // can never fit: the placeholder instead of evicting everything else
+                self.inflight.remove(&key);
+                self.failed.insert(key, Instant::now() + self.shared.tuning.fail_ttl);
+                continue;
+            }
+            if !self.make_room(bytes) {
+                // the visible set fills the budget: wait (still loading) until something
+                // scrolls away; no repaint loop for that
+                self.ready.push_front((key, img));
+                return;
+            }
+            self.inflight.remove(&key);
             let handle = self.egui.load_texture(format!("img-{key:032x}"), img, egui::TextureOptions::LINEAR);
             if let Some(old) = self.textures.put(key, Tex { handle, bytes, last_frame: self.frame }) {
                 self.texture_bytes -= old.bytes;
@@ -399,18 +455,23 @@ impl ImageCache {
         }
     }
 
-    fn evict(&mut self) {
-        while self.texture_bytes > self.budget_bytes {
+    /// Evict idle entries until `extra` more bytes fit the budget; false if the entries used in
+    /// the last frames (the visible set) leave no room.
+    fn make_room(&mut self, extra: usize) -> bool {
+        while self.texture_bytes + extra > self.budget_bytes {
             match self.textures.peek_lru() {
                 Some((_, t)) if self.frame.saturating_sub(t.last_frame) >= EVICT_IDLE_FRAMES => {}
                 // everything left was used in the last frames: keep the visible set
-                _ => break,
+                _ => return false,
             }
             if let Some((_, t)) = self.textures.pop_lru() {
                 self.texture_bytes -= t.bytes;
             }
         }
+        true
     }
+
+    fn evict(&mut self) { self.make_room(0); }
 }
 
 fn image_bytes(img: &egui::ColorImage) -> usize { img.size[0] * img.size[1] * 4 }
@@ -470,12 +531,14 @@ async fn run_load(shared: &Arc<Shared>, key: Key, url: &str, kind: ImageKind) ->
         if shared.is_stale(key) {
             return Outcome::Skipped;
         }
-        shared.fetch.fetch(url, MAX_DOWNLOAD_BYTES).await
+        let agent = lock(&shared.agents).get(&host).cloned();
+        shared.fetch.fetch(url, agent.as_deref(), MAX_DOWNLOAD_BYTES).await
     };
     let bytes = match fetched {
         Ok(b) => b,
         Err(e) => {
-            tracing::debug!(url = %crate::redact::redact_url(url), error = %e, "image fetch failed");
+            // one quiet line naming the host, never the URL (paths may carry tokens)
+            tracing::debug!(target: "tuner::images", "image from {host} failed: {e}");
             if e.is_transient() || matches!(e, Error::Cancelled) {
                 return Outcome::Failed { transient: true };
             }
@@ -494,24 +557,40 @@ async fn run_load(shared: &Arc<Shared>, key: Key, url: &str, kind: ImageKind) ->
 /// bytes are persisted. Undecodable input, including a decoder panic on hostile data, drops
 /// the cached file and leaves a `.fail` marker, so it is not decoded again.
 async fn decode_and_settle(shared: &Shared, path: PathBuf, bytes: bytes::Bytes, kind: ImageKind, cached: bool) -> Outcome {
-    let permits = if looks_like_svg(&bytes) { &shared.svg } else { &shared.decode };
-    let Ok(_permit) = permits.acquire().await else { return Outcome::Failed { transient: true } };
-    let (decoder, p) = (shared.decoder, path.clone());
-    let joined = tokio::task::spawn_blocking(move || {
+    let svg = looks_like_svg(&bytes);
+    let permits = if svg { &shared.svg } else { &shared.decode };
+    let Ok(permit) = permits.clone().acquire_owned().await else { return Outcome::Failed { transient: true } };
+    // set when a render timed out: its late result is dropped (the marker is written already)
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let (decoder, p, gone) = (shared.decoder, path.clone(), abandoned.clone());
+    let task = tokio::task::spawn_blocking(move || {
+        let _permit = permit; // held until the decode really ends
         let img = decoder(&bytes, kind)?;
+        if gone.load(AtomicOrdering::SeqCst) {
+            return Err(Error::Cancelled);
+        }
         if cached {
             let _ = std::fs::File::open(&p).and_then(|f| f.set_modified(SystemTime::now()));
         } else if let Err(e) = write_atomic(&p, &bytes) {
             tracing::debug!(error = %e, "image cache write failed");
         }
         Ok::<_, Error>(img)
-    })
-    .await;
+    });
+    let joined = if svg {
+        let timeout = shared.tuning.svg_timeout;
+        tokio::time::timeout(timeout, task).await.map_err(|_| {
+            abandoned.store(true, AtomicOrdering::SeqCst);
+            tracing::debug!(target: "tuner::images", "svg render took over {timeout:?}; treating the image as invalid");
+        })
+    } else {
+        Ok(task.await)
+    };
     match joined {
-        Ok(Ok(img)) => return Outcome::Ready(img),
-        Ok(Err(e)) => tracing::debug!(error = %e, cached, "image decode failed"),
-        Err(e) if e.is_panic() => tracing::warn!(cached, "image decoder panicked; treating the image as invalid"),
-        Err(_) => return Outcome::Failed { transient: true }, // runtime shutting down
+        Ok(Ok(Ok(img))) => return Outcome::Ready(img),
+        Ok(Ok(Err(e))) => tracing::debug!(error = %e, cached, "image decode failed"),
+        Ok(Err(e)) if e.is_panic() => tracing::warn!(cached, "image decoder panicked; treating the image as invalid"),
+        Ok(Err(_)) => return Outcome::Failed { transient: true }, // runtime shutting down
+        Err(()) => {} // timed out
     }
     let _ = tokio::task::spawn_blocking(move || {
         if cached {
@@ -650,6 +729,10 @@ fn decode_svg(bytes: &[u8], kind: ImageKind) -> Result<egui::ColorImage> {
     if primitives > MAX_SVG_FILTER_PRIMITIVES {
         return Err(Error::BadPayload(format!("svg: {primitives} filter primitives")));
     }
+    let nodes = node_count(tree.root());
+    if nodes > MAX_SVG_NODES {
+        return Err(Error::BadPayload(format!("svg: {nodes} nodes")));
+    }
     let size = tree.size();
     let (dw, dh, scale) = fit(size.width(), size.height(), kind.max_size(), true);
     let mut pixmap = tiny_skia::Pixmap::new(dw, dh).ok_or_else(|| Error::BadPayload("svg: empty canvas".into()))?;
@@ -673,6 +756,22 @@ fn filter_primitives(group: &resvg::usvg::Group) -> usize {
             n
         })
         .fold(own, usize::saturating_add)
+}
+
+/// Nodes anywhere in the tree (children, and pattern/mask/clip/filter content via subroots).
+fn node_count(group: &resvg::usvg::Group) -> usize {
+    group
+        .children()
+        .iter()
+        .map(|node| {
+            let mut n = 1usize;
+            if let resvg::usvg::Node::Group(g) = node {
+                n = n.saturating_add(node_count(g));
+            }
+            node.subroots(|sub| n = n.saturating_add(node_count(sub)));
+            n
+        })
+        .fold(0, usize::saturating_add)
 }
 
 /// Delete least-recently-modified cache files until the directory is under `max_bytes`
@@ -750,7 +849,8 @@ mod tests {
         Panic,
     }
 
-    /// Fake network: counts calls, tracks max concurrency (overall and per host).
+    /// Fake network: counts calls, tracks max concurrency (overall and per host) and the
+    /// User-Agents asked for.
     struct FakeFetch {
         body: Vec<u8>,
         reply: Answer,
@@ -758,6 +858,7 @@ mod tests {
         calls: AtomicUsize,
         active: AtomicUsize,
         max_active: AtomicUsize,
+        agents: Mutex<Vec<(String, Option<String>)>>,
     }
 
     impl FakeFetch {
@@ -769,15 +870,17 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 active: AtomicUsize::new(0),
                 max_active: AtomicUsize::new(0),
+                agents: Mutex::default(),
             })
         }
         fn calls(&self) -> usize { self.calls.load(Ordering::SeqCst) }
     }
 
     impl Fetch for FakeFetch {
-        fn fetch<'a>(&'a self, _url: &'a str, max_bytes: u64) -> FetchFuture<'a> {
+        fn fetch<'a>(&'a self, url: &'a str, user_agent: Option<&'a str>, max_bytes: u64) -> FetchFuture<'a> {
             Box::pin(async move {
                 assert_eq!(max_bytes, MAX_DOWNLOAD_BYTES);
+                lock(&self.agents).push((url.to_owned(), user_agent.map(str::to_owned)));
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
                 self.max_active.fetch_max(now, Ordering::SeqCst);
@@ -968,6 +1071,44 @@ mod tests {
         assert_eq!(r.cache.stats(), (0, 0));
     }
 
+    /// The budget holds even when everything on screen wants a texture: what doesn't fit waits
+    /// (loading) until something scrolls away; an image larger than the whole budget fails.
+    #[test]
+    fn the_budget_is_never_exceeded_by_visible_images() {
+        let fake = FakeFetch::new(png(40, 20), Answer::Bytes, Duration::ZERO);
+        let one = 40 * 20 * 4;
+        let mut r = rig(fake.clone(), 2 * one, Tuning::default());
+        let urls: Vec<String> = (0..4).map(|i| format!("http://v.example/{i}.png")).collect();
+        let ready = |c: &mut ImageCache, us: &[String]| us.iter().filter(|u| matches!(c.get(u, ImageKind::Logo), ImageState::Ready(_))).count();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while fake.calls() < 4 || r.cache.ready.len() < 2 {
+            assert!(Instant::now() < deadline, "loads never finished");
+            ready(&mut r.cache, &urls); // all four visible every frame
+            r.cache.pump();
+            assert!(r.cache.stats().1 <= 2 * one, "over budget: {:?}", r.cache.stats());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        for _ in 0..5 {
+            ready(&mut r.cache, &urls);
+            r.cache.pump();
+        }
+        assert_eq!(ready(&mut r.cache, &urls), 2, "two fit, two wait");
+        assert!(r.cache.stats().1 <= 2 * one);
+        // the first two scroll away: the waiting ones take their place (from memory, no refetch)
+        for _ in 0..4 {
+            ready(&mut r.cache, &urls[2..]);
+            r.cache.pump();
+        }
+        assert_eq!(ready(&mut r.cache, &urls[2..]), 2);
+        assert_eq!(r.cache.stats(), (2, 2 * one));
+        assert_eq!(fake.calls(), 4);
+
+        let big = FakeFetch::new(png(300, 300), Answer::Bytes, Duration::ZERO);
+        let mut r = rig(big, 2 * one, Tuning::default());
+        assert!(matches!(drive(&mut r.cache, "http://v.example/big.png", ImageKind::Logo), ImageState::Failed));
+        assert_eq!(r.cache.stats(), (0, 0));
+    }
+
     #[test]
     fn permanent_failures_are_negative_cached_in_memory_and_on_disk() {
         let fake = FakeFetch::new(vec![], Answer::NotFound, Duration::ZERO);
@@ -1002,6 +1143,27 @@ mod tests {
         assert!(!cache_path(r.dir.path(), url).with_extension("fail").exists(), "no disk marker for network errors");
         std::thread::sleep(Duration::from_millis(80));
         assert!(matches!(r.cache.get(url, ImageKind::Logo), ImageState::Loading), "retried after the short ttl");
+        // still failing: the next retry waits 4× longer, capped at the permanent ttl
+        assert!(matches!(drive(&mut r.cache, url, ImageKind::Logo), ImageState::Failed));
+        let key = key_of(url, ImageKind::Logo);
+        let left = r.cache.failed[&key].saturating_duration_since(Instant::now());
+        assert!(left > Duration::from_millis(150) && left <= Duration::from_millis(200), "{left:?}");
+        r.cache.strikes.insert(key, 20);
+        r.cache.failed.clear();
+        assert!(matches!(drive(&mut r.cache, url, ImageKind::Logo), ImageState::Failed));
+        let left = r.cache.failed[&key].saturating_duration_since(Instant::now());
+        assert!(left <= Duration::from_secs(3600) && left > Duration::from_secs(3500), "capped at 1 h: {left:?}");
+        assert_eq!(fake.calls(), 3);
+    }
+
+    #[test]
+    fn a_load_resets_the_transient_back_off() {
+        let fake = FakeFetch::new(png(4, 4), Answer::Bytes, Duration::ZERO);
+        let mut r = rig(fake, 1 << 20, Tuning::default());
+        let url = "http://x.example/back.png";
+        r.cache.strikes.insert(key_of(url, ImageKind::Logo), 3);
+        assert!(matches!(drive(&mut r.cache, url, ImageKind::Logo), ImageState::Ready(_)));
+        assert!(r.cache.strikes.is_empty());
     }
 
     #[test]
@@ -1104,6 +1266,59 @@ mod tests {
         assert!(svgs.iter().all(|u| matches!(r.cache.get(u, ImageKind::Logo), ImageState::Ready(_))));
         assert_eq!(SVG_MAX_ACTIVE.load(Ordering::SeqCst), MAX_SVG_RENDERS);
         assert_eq!(fake.calls(), 0);
+    }
+
+    /// Real decoder, but SVG renders take 400 ms.
+    fn slower_svg_decoder(bytes: &[u8], kind: ImageKind) -> Result<egui::ColorImage> {
+        if looks_like_svg(bytes) {
+            std::thread::sleep(Duration::from_millis(400));
+        }
+        decode(bytes, kind)
+    }
+
+    #[test]
+    fn svg_renders_are_bounded_in_time_and_complexity() {
+        let fake = FakeFetch::new(vec![], Answer::NotFound, Duration::ZERO);
+        let mut r = rig(fake, 64 << 20, Tuning { svg_timeout: Duration::from_millis(100), ..Tuning::default() });
+        with_decoder(&mut r, slower_svg_decoder);
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10"/></svg>"#;
+        let url = "http://s.example/slow.svg";
+        let p = cache_path(r.dir.path(), url);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, svg).unwrap();
+        let t = Instant::now();
+        assert!(matches!(drive(&mut r.cache, url, ImageKind::Logo), ImageState::Failed));
+        assert!(t.elapsed() < Duration::from_millis(350), "gave up at the timeout: {:?}", t.elapsed());
+        assert!(p.with_extension("fail").is_file(), "marker written");
+        // the abandoned render finishes later without re-caching anything
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!p.exists());
+
+        // many nodes (here 12 000 rects, ~400 KiB) are rejected before rendering
+        let mut many = String::from(r#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">"#);
+        for i in 0..12_000 {
+            many.push_str(&format!(r#"<rect x="{}" width="1" height="1"/>"#, i % 10));
+        }
+        many.push_str("</svg>");
+        assert!(many.len() < MAX_SVG_BYTES);
+        let e = decode(many.as_bytes(), ImageKind::Logo).unwrap_err();
+        assert!(e.to_string().contains("nodes"), "{e}");
+        assert!(decode(svg, ImageKind::Logo).is_ok());
+    }
+
+    #[test]
+    fn images_on_a_playlists_host_use_its_user_agent() {
+        let fake = FakeFetch::new(png(4, 4), Answer::Bytes, Duration::ZERO);
+        let mut r = rig(fake.clone(), 1 << 20, Tuning::default());
+        r.cache.set_source_agents(HashMap::from([("panel.example".to_owned(), "IPTVSmarters/1.0".to_owned())]));
+        assert!(matches!(drive(&mut r.cache, "http://panel.example:8080/logos/1.png", ImageKind::Logo), ImageState::Ready(_)));
+        assert!(matches!(drive(&mut r.cache, "https://cdn.example/2.png", ImageKind::Logo), ImageState::Ready(_)));
+        let mut agents = lock(&fake.agents).clone();
+        agents.sort();
+        assert_eq!(
+            agents,
+            [("http://panel.example:8080/logos/1.png".to_owned(), Some("IPTVSmarters/1.0".to_owned())), ("https://cdn.example/2.png".to_owned(), None)]
+        );
     }
 
     #[test]

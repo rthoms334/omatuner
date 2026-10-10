@@ -18,6 +18,7 @@ use tokio::sync::watch;
 
 use super::budget::{ConnectionBudget, Lease};
 use super::events::{EndReason, MpvEvent, PropId, PropValue};
+use super::mpv_log::{self, MpvLog};
 use super::state::{Effect, Input, MachineConfig, PlayerMachine};
 use super::tracks::{AspectMode, parse_track_list, query_stream_info};
 use super::{PlayRequest, PlayerCommand, PlayerDeps, PlayerError, PlayerErrorKind, PlayerEvent, PlayerSnapshot, PlayerState, RenderClock};
@@ -70,6 +71,7 @@ pub fn spawn(
         applied: Box::new(cfg.clone()),
         render_clock,
         epoch,
+        mpv_log: MpvLog::default(),
     };
     std::thread::Builder::new().name("player".into()).spawn(move || c.run(cmd_rx, evt_rx))
 }
@@ -108,6 +110,8 @@ struct Controller {
     applied: Box<Config>,
     render_clock: RenderClock,
     epoch: Instant,
+    /// Rate limiter of forwarded mpv log lines.
+    mpv_log: MpvLog,
 }
 
 impl Controller {
@@ -140,6 +144,7 @@ impl Controller {
                 recv(ticker) -> _ => {
                     let now = Instant::now();
                     state_changed |= self.feed(Input::Tick, now);
+                    self.mpv_log.expire(now).iter().for_each(mpv_log::emit_summary);
                     self.pending_tick(now);
                     self.video_watchdog(now);
                     if now.duration_since(self.last_progress) >= PROGRESS_EVERY
@@ -447,19 +452,25 @@ impl Controller {
 
     /// Feed an END_FILE and release the lease of the stream that just closed (starting a load
     /// that waited for it, see [`Controller::load`]).
-    fn end_file(&mut self, reason: EndReason, error: i32, entry_id: i64) -> bool {
+    fn end_file(&mut self, reason: EndReason, error: i32, entry_id: i64, inserted: Option<i64>) -> bool {
         tracing::debug!("END_FILE entry {entry_id}: {reason:?} ({error}) in {:?}", self.machine.state());
         let changed = self.feed(Input::EndFile { reason, error, entry: entry_id }, Instant::now());
-        if self.lease_entry == Some(entry_id) && reason == EndReason::Redirect {
-            // the playlist URL expanded into new entries that keep using the source; the lease
-            // follows the next one that starts (`mpv_event`, START_FILE)
-            self.lease_entry = None;
-            self.lease_redirected = true;
-        } else if self.lease_entry == Some(entry_id) {
-            // the leased stream is really closed now
-            self.release_lease();
-            if let Some(pl) = self.pending.take() {
-                self.load_now(pl.playable);
+        match lease_on_end(self.lease_entry, entry_id, reason, inserted) {
+            LeaseOnEnd::Unrelated => {}
+            LeaseOnEnd::MoveTo(next) => {
+                // the playlist URL expanded into new entries that keep using the source: the
+                // lease moves to the first of them right away (no window in which a same-source
+                // play would skip stop-before-start); without mpv's insert id it follows the
+                // next entry that starts (`mpv_event`, START_FILE)
+                self.lease_entry = next;
+                self.lease_redirected = next.is_none();
+            }
+            LeaseOnEnd::Release => {
+                // the leased stream is really closed now
+                self.release_lease();
+                if let Some(pl) = self.pending.take() {
+                    self.load_now(pl.playable);
+                }
             }
         }
         changed
@@ -468,7 +479,7 @@ impl Controller {
     /// Process a held END_FILE (see [`END_FILE_LOG_GRACE`]); true if the state changed.
     fn flush_deferred_end(&mut self) -> bool {
         match self.deferred_end.take() {
-            Some((reason, error, entry_id, _)) => self.end_file(reason, error, entry_id),
+            Some((reason, error, entry_id, _)) => self.end_file(reason, error, entry_id, None),
             None => false,
         }
     }
@@ -487,20 +498,26 @@ impl Controller {
             }
             MpvEvent::FileLoaded => self.feed(Input::FileLoaded, now),
             MpvEvent::PlaybackRestart => self.feed(Input::PlaybackRestart, now),
-            MpvEvent::EndFile { reason, error, entry_id } => {
+            MpvEvent::EndFile { reason, error, entry_id, inserted } => {
                 let changed = self.flush_deferred_end();
                 if reason == EndReason::Error && matches!(self.machine.state(), PlayerState::Loading { .. }) {
                     self.deferred_end = Some((reason, error, entry_id, now + END_FILE_LOG_GRACE));
                     return changed;
                 }
-                self.end_file(reason, error, entry_id) || changed
+                self.end_file(reason, error, entry_id, inserted) || changed
             }
             MpvEvent::Log { level, prefix, text } => {
                 if let Some(code) = http_status_in(&text) {
                     tracing::debug!("HTTP {code} in {:?}", self.machine.state());
                     self.feed(Input::HttpStatus(code), now);
                 }
-                tracing::warn!(target: "mpv", "[{level}] {prefix}: {text}");
+                let (verdict, summary) = self.mpv_log.admit(&prefix, mpv_log::level_of(&level), now);
+                if let Some(s) = summary {
+                    mpv_log::emit_summary(&s);
+                }
+                if let mpv_log::Verdict::Show(l) = verdict {
+                    mpv_log::emit(l, &prefix, &text);
+                }
                 false
             }
             MpvEvent::Prop { id, value } => self.prop(id, value, now),
@@ -650,6 +667,26 @@ impl Controller {
     }
 }
 
+/// What an END_FILE does to the connection lease.
+#[derive(Debug, PartialEq)]
+enum LeaseOnEnd {
+    /// Not the leased entry.
+    Unrelated,
+    /// The leased stream closed.
+    Release,
+    /// The leased playlist expanded (redirect): the lease belongs to this inserted entry now
+    /// (`None`: mpv didn't say which — the next START_FILE).
+    MoveTo(Option<i64>),
+}
+
+fn lease_on_end(lease_entry: Option<i64>, entry_id: i64, reason: EndReason, inserted: Option<i64>) -> LeaseOnEnd {
+    match (lease_entry == Some(entry_id), reason) {
+        (false, _) => LeaseOnEnd::Unrelated,
+        (true, EndReason::Redirect) => LeaseOnEnd::MoveTo(inserted),
+        (true, _) => LeaseOnEnd::Release,
+    }
+}
+
 /// Stop-before-start decision (DESIGN §11.5): the next stream comes from the same source as
 /// the open leased entry, and that source allows one connection or its limit is unknown —
 /// `loadfile replace` would open the new connection before the old one is closed. Returns the
@@ -698,6 +735,20 @@ mod tests {
         assert_eq!(must_stop_first(Some(&lease), Some(7), None, &budget), None, "ad-hoc URL without a source");
         assert_eq!(must_stop_first(Some(&lease), None, Some(a), &budget), None, "no open entry");
         assert_eq!(must_stop_first(None, Some(7), Some(a), &budget), None, "nothing leased");
+    }
+
+    /// A redirect hands the lease to the inserted entry at once, so a same-source play right
+    /// after it still stops first (before: no leased entry until the next START_FILE).
+    #[test]
+    fn a_redirect_moves_the_lease_to_the_inserted_entry_at_once() {
+        assert_eq!(lease_on_end(Some(3), 3, EndReason::Redirect, Some(4)), LeaseOnEnd::MoveTo(Some(4)));
+        let (a, budget) = (SourceId(1), ConnectionBudget::default());
+        assert_eq!(must_stop_first(Some(&Lease { source: a }), Some(4), Some(a), &budget), Some(4));
+        assert_eq!(lease_on_end(Some(3), 3, EndReason::Redirect, None), LeaseOnEnd::MoveTo(None), "older mpv: next START_FILE");
+        assert_eq!(lease_on_end(Some(4), 4, EndReason::Eof, None), LeaseOnEnd::Release);
+        assert_eq!(lease_on_end(Some(4), 4, EndReason::Error, None), LeaseOnEnd::Release);
+        assert_eq!(lease_on_end(Some(4), 3, EndReason::Stop, None), LeaseOnEnd::Unrelated, "the replaced entry");
+        assert_eq!(lease_on_end(None, 3, EndReason::Redirect, Some(4)), LeaseOnEnd::Unrelated);
     }
 
     #[test]

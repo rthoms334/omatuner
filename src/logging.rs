@@ -7,20 +7,28 @@
 //! dropped from the file (never from the in-memory ring) and the loss is noted in the file.
 //! The log file is 0600 inside the 0700 state dir: lines are redacted, but they still name the
 //! user's providers and channels.
+//!
+//! Filtering: our own targets (`tuner::*`) log at INFO, or DEBUG with debug logging. Other
+//! crates (through `tracing` or the `log` bridge) are OFF in normal use — their WARN/ERROR
+//! lines are noise to users (a TLS verifier rejecting a logo host, calloop event races) and
+//! every real problem has a `tuner::*` line of its own. With debug logging they are recorded
+//! from INFO up, DEMOTED to DEBUG and under their real target (not the bridge's `log`).
+//! `general.debug_log` applies live ([`set_debug`]); `--debug` pins it on ([`pin_debug`]);
+//! `RUST_LOG` replaces the filter entirely.
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{BufWriter, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use tracing::Level;
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Layer};
+use tracing_subscriber::{EnvFilter, Layer, Registry, reload};
 
 use crate::error::{Error, Result};
 use crate::paths::AppPaths;
@@ -243,35 +251,57 @@ struct RingLayer {
     file: Option<FileWriter>,
 }
 
-struct MsgVisitor(String);
+/// Message text plus the `log` bridge's real target (`log.target`; its other `log.*` fields —
+/// module path, file, line — are dropped).
+#[derive(Default)]
+struct MsgVisitor {
+    text: String,
+    log_target: Option<String>,
+}
 
 impl tracing::field::Visit for MsgVisitor {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            let _ = write!(self.0, "{value:?}");
-        } else {
-            let _ = write!(self.0, " {}={value:?}", field.name());
+        match field.name() {
+            "message" => {
+                let _ = write!(self.text, "{value:?}");
+            }
+            "log.target" => self.log_target = Some(format!("{value:?}").trim_matches('"').to_owned()),
+            n if n.starts_with("log.") => {}
+            n => {
+                let _ = write!(self.text, " {n}={value:?}");
+            }
         }
     }
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "message" {
-            self.0.push_str(value);
-        } else {
-            let _ = write!(self.0, " {}={value}", field.name());
+        match field.name() {
+            "message" => self.text.push_str(value),
+            "log.target" => self.log_target = Some(value.to_owned()),
+            n if n.starts_with("log.") => {}
+            n => {
+                let _ = write!(self.text, " {n}={value}");
+            }
         }
     }
 }
 
+/// Our own crate (`tuner`, `tuner::*`).
+fn is_own(target: &str) -> bool { target == "tuner" || target.starts_with("tuner::") }
+
+/// The level a line is recorded at: other crates' lines never above DEBUG (see module docs).
+fn recorded_level(target: &str, level: Level) -> Level { if is_own(target) { level } else { level.max(Level::DEBUG) } }
+
 impl<S: tracing::Subscriber> Layer<S> for RingLayer {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
-        let mut v = MsgVisitor(String::new());
+        let mut v = MsgVisitor::default();
         event.record(&mut v);
-        let message = crate::redact::redact(&v.0).into_owned();
+        let message = crate::redact::redact(&v.text).into_owned();
         let meta = event.metadata();
+        let target = v.log_target.unwrap_or_else(|| meta.target().to_owned());
+        let level = recorded_level(&target, *meta.level());
         if self.stderr {
-            stderr_line(format_args!("{:>5} {}: {}", meta.level(), meta.target(), message));
+            stderr_line(format_args!("{level:>5} {target}: {message}"));
         }
-        let line = LogLine { at: crate::model::now(), level: *meta.level(), target: meta.target().to_owned(), message };
+        let line = LogLine { at: crate::model::now(), level, target, message };
         if let Some(f) = &self.file {
             f.send(line.to_text());
         }
@@ -279,14 +309,57 @@ impl<S: tracing::Subscriber> Layer<S> for RingLayer {
     }
 }
 
-/// Install the global subscriber. `debug` = config `general.debug_log` (or `--debug`).
-/// `RUST_LOG` overrides the filter. Returns the buffer for the Logs screen.
+/// The filter for normal use / debug logging (see module docs).
+fn default_filter(debug: bool) -> EnvFilter { EnvFilter::new(if debug { "tuner=debug,info" } else { "tuner=info,off" }) }
+
+/// Live control of the installed filter.
+struct FilterControl {
+    handle: reload::Handle<EnvFilter, Registry>,
+    /// `RUST_LOG` chose the filter: Settings don't touch it.
+    from_env: bool,
+    /// `--debug`: debug logging stays on whatever Settings say.
+    pinned: AtomicBool,
+}
+
+impl FilterControl {
+    fn set_debug(&self, debug: bool) {
+        if self.from_env {
+            return;
+        }
+        let debug = debug || self.pinned.load(Ordering::Relaxed);
+        if let Err(e) = self.handle.reload(default_filter(debug)) {
+            stderr_line(format_args!("tuner: changing the log filter: {e}"));
+        }
+    }
+}
+
+static FILTER: OnceLock<FilterControl> = OnceLock::new();
+
+/// Apply `general.debug_log` to the running subscriber (Settings edit; no restart needed).
+pub fn set_debug(debug: bool) {
+    if let Some(f) = FILTER.get() {
+        f.set_debug(debug);
+    }
+}
+
+/// `--debug`: keep debug logging on even when the setting is off.
+pub fn pin_debug() {
+    if let Some(f) = FILTER.get() {
+        f.pinned.store(true, Ordering::Relaxed);
+        f.set_debug(true);
+    }
+}
+
+/// Install the global subscriber. `debug` = config `general.debug_log` (or `--debug`; call
+/// [`pin_debug`] too so a Settings change can't turn it off). `RUST_LOG` overrides the filter.
+/// Returns the buffer for the Logs screen.
 /// Called before `AppPaths::ensure`, so the state dir is created (0700) here if missing; a log
 /// file that cannot be opened is reported on stderr and logging continues without it.
 pub fn init(paths: &AppPaths, debug: bool) -> LogBuffer {
     let buf = LogBuffer::new(5000);
-    let default = if debug { "tuner=debug,info" } else { "tuner=info,warn" };
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
+    let env = EnvFilter::try_from_default_env().ok();
+    let from_env = env.is_some();
+    let (filter, handle) = reload::Layer::new(env.unwrap_or_else(|| default_filter(debug)));
     let log_file = paths.log_file();
     let file = match FileSink::open(&log_file, ROTATE_BYTES).and_then(FileWriter::spawn) {
         Ok(w) => Some(w),
@@ -296,7 +369,9 @@ pub fn init(paths: &AppPaths, debug: bool) -> LogBuffer {
         }
     };
     let layer = RingLayer { buf: buf.clone(), stderr: true, file };
-    let _ = tracing_subscriber::registry().with(filter).with(layer).try_init();
+    if tracing_subscriber::registry().with(filter).with(layer).try_init().is_ok() {
+        let _ = FILTER.set(FilterControl { handle, from_env, pinned: AtomicBool::new(false) });
+    }
     buf
 }
 
@@ -388,6 +463,60 @@ mod tests {
         assert!(text.contains("refresh failed for ***"), "{text}");
         assert!(text.contains("INFO tuner::logging::tests: plain line"), "{text}");
         assert!(!text.contains("hunter2") && !text.contains("layer-secret-91c2"), "{text}");
+    }
+
+    /// Other crates' lines (direct or through the `log` bridge) are off in normal use; with
+    /// debug logging they are recorded as DEBUG under their real target. The filter follows
+    /// the setting live.
+    #[test]
+    fn third_party_lines_are_filtered_demoted_and_follow_the_setting_live() {
+        let buf = LogBuffer::new(20);
+        let (filter, handle) = reload::Layer::new(default_filter(false));
+        let control = FilterControl { handle, from_env: false, pinned: AtomicBool::new(false) };
+        let subscriber = tracing_subscriber::registry().with(filter).with(RingLayer { buf: buf.clone(), stderr: false, file: None });
+        let emit = || {
+            // what `tracing-log` makes of `log::error!` in rustls-platform-verifier
+            tracing::event!(
+                target: "log",
+                Level::ERROR,
+                log.target = "rustls_platform_verifier::verification",
+                log.module_path = "rustls_platform_verifier::verification",
+                log.line = 7u32,
+                "failed to verify TLS certificate: invalid peer certificate: UnknownIssuer"
+            );
+            tracing::warn!(target: "calloop::loop_logic", "Received an event for non-existence source");
+            tracing::info!(target: "tuner::images", "own line");
+            tracing::debug!(target: "tuner::images", "own debug line");
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            emit();
+            let lines = buf.snapshot(Level::TRACE);
+            assert_eq!(lines.iter().map(|l| (l.level, l.target.as_str())).collect::<Vec<_>>(), [(Level::INFO, "tuner::images")]);
+
+            control.set_debug(true);
+            emit();
+            let lines = buf.snapshot(Level::TRACE);
+            let new: Vec<_> = lines[1..].iter().map(|l| (l.level, l.target.as_str(), l.message.as_str())).collect();
+            assert_eq!(
+                new,
+                [
+                    (Level::DEBUG, "rustls_platform_verifier::verification", "failed to verify TLS certificate: invalid peer certificate: UnknownIssuer"),
+                    (Level::DEBUG, "calloop::loop_logic", "Received an event for non-existence source"),
+                    (Level::INFO, "tuner::images", "own line"),
+                    (Level::DEBUG, "tuner::images", "own debug line"),
+                ]
+            );
+            assert!(buf.snapshot(Level::WARN).is_empty(), "no WARN/ERROR from other crates, even in debug");
+
+            // the setting turned off again: back to INFO; `--debug` (pinned) wins over it
+            control.set_debug(false);
+            emit();
+            assert_eq!(buf.snapshot(Level::TRACE).len(), 6);
+            control.pinned.store(true, Ordering::Relaxed);
+            control.set_debug(false);
+            emit();
+            assert_eq!(buf.snapshot(Level::TRACE).len(), 10);
+        });
     }
 
     #[test]

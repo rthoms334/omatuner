@@ -73,7 +73,7 @@ impl Harness {
     fn drain(&self) {
         let mut stash = self.stash.lock().unwrap();
         while let Ok(ev) = self.events.try_recv() {
-            if let AppEvent::Job(JobEvent::Finished { id, kind, outcome }) = ev {
+            if let AppEvent::Job(JobEvent::Finished { id, kind, outcome, .. }) = ev {
                 stash.push((id, kind, outcome));
             }
         }

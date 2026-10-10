@@ -34,6 +34,7 @@ pub mod budget;
 pub mod controller;
 pub mod events;
 pub mod mpv;
+pub mod mpv_log;
 pub mod reconnect;
 pub mod render;
 pub mod state;

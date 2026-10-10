@@ -5,8 +5,10 @@
 //!
 //! Built off the UI thread by `jobs` (`JobKind::RebuildLibrary`) from a reader connection,
 //! handed to the UI as `Arc<Library>` and swapped atomically. Rebuilt after `DataScope::{Live,
-//! Vod, Overrides, Epg, History, All}` (Epg: `ChannelSummary.epg_channel_id` is a snapshot of
-//! `channel_epg`; History: `recent_channels`).
+//! Vod, Overrides, Epg, All}` (Epg: `ChannelSummary.epg_channel_id` is a snapshot of
+//! `channel_epg`). `DataScope::History` (every zap writes history) does NOT rebuild: the app
+//! re-reads only the recently watched list ([`load_recent_channels`], ≤ 500 history rows) and
+//! swaps in [`Library::with_recent_channels`], which shares the (`Arc`) indexes.
 //!
 //! Favourites are NOT read from the snapshot by screens: the app copies `Library::favs` into
 //! its own mutable `FavIndex` on every swap (`UiCtx::favs`), patches it optimistically with
@@ -279,8 +281,9 @@ impl FavIndex {
 #[derive(Debug, Default)]
 pub struct Library {
     pub sources: Vec<SourceMeta>,
-    pub live: LiveIndex,
-    pub vod: VodIndex,
+    /// Shared between the snapshots of one build (see [`Library::with_recent_channels`]).
+    pub live: Arc<LiveIndex>,
+    pub vod: Arc<VodIndex>,
     /// Favourites at build time — the app copies this into `TunerApp.favs` on swap; screens use
     /// `UiCtx::favs` (see module docs), never this field.
     pub favs: FavIndex,
@@ -294,6 +297,19 @@ impl Library {
     pub fn is_empty(&self) -> bool { self.sources.is_empty() }
     pub fn has_vod(&self) -> bool { !self.vod.movies.is_empty() }
     pub fn has_series(&self) -> bool { !self.vod.series.is_empty() }
+
+    /// This catalogue with another recently-watched list: the indexes are shared, not copied,
+    /// and `built_at` is kept (screens keyed on it don't rebuild for a zap).
+    pub fn with_recent_channels(&self, recent_channels: Vec<ChannelId>) -> Library {
+        Library {
+            sources: self.sources.clone(),
+            live: self.live.clone(),
+            vod: self.vod.clone(),
+            favs: self.favs.clone(),
+            recent_channels,
+            built_at: self.built_at,
+        }
+    }
 }
 
 /// Recently watched channels kept in the snapshot (`Collection::History`, Home rail).
@@ -498,9 +514,14 @@ pub fn load(conn: &Connection) -> Result<Library> {
     members.extend(series_members);
     let vod = VodIndex::from_parts(movies, series, movie_groups, series_groups, members);
     let favs = load_favs(conn)?;
-    let recent_channels =
-        crate::store::user::recent_channels(conn, RECENT_CHANNELS)?.iter().filter_map(|h| live.by_ref(&h.item)).collect();
-    Ok(Library { sources, live, vod, favs, recent_channels, built_at: crate::model::now() })
+    let recent_channels = load_recent_channels(conn, &live)?;
+    Ok(Library { sources, live: Arc::new(live), vod: Arc::new(vod), favs, recent_channels, built_at: crate::model::now() })
+}
+
+/// Distinct recently watched channels of `live`, most recent first (one aggregate over the
+/// ≤ 500-row history table: cheap enough for the UI reader on `DataScope::History`).
+pub fn load_recent_channels(conn: &Connection, live: &LiveIndex) -> Result<Vec<ChannelId>> {
+    Ok(crate::store::user::recent_channels(conn, RECENT_CHANNELS)?.iter().filter_map(|h| live.by_ref(&h.item)).collect())
 }
 
 /// Rebuild only the favourites part (cheap; event-driven on the UI thread, < 5 ms).

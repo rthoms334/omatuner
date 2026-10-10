@@ -220,7 +220,8 @@ fn logging_init_redacts_lines_into_the_ring_and_the_file() {
     let buf = tuner::logging::init(&paths, true);
     let secret = "init-secret-0b9c";
     register_secret(secret);
-    tracing::warn!("refresh of http://h.tv/get.php?username=bob&password={secret} failed");
+    // (lines of other crates — this test binary included — are recorded as DEBUG at most)
+    tracing::warn!(target: "tuner::jobs", "refresh of http://h.tv/get.php?username=bob&password={secret} failed");
     tracing::debug!(target: "tuner::player", "mpv: Opening http://h.tv/live/bob/{secret}/1.ts");
 
     let lines = buf.snapshot(tracing::Level::TRACE);
@@ -238,7 +239,7 @@ fn logging_init_redacts_lines_into_the_ring_and_the_file() {
         }
         std::thread::sleep(Duration::from_millis(10));
     };
-    assert!(text.contains(" WARN redact: refresh of http://h.tv/get.php?username=***&password=*** failed"), "{text}");
+    assert!(text.contains(" WARN tuner::jobs: refresh of http://h.tv/get.php?username=***&password=*** failed"), "{text}");
     assert!(text.contains("DEBUG tuner::player: mpv: Opening http://h.tv/live/***/***/1.ts"), "{text}");
     assert!(!text.contains(secret), "{text}");
     assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);

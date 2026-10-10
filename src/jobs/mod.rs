@@ -36,7 +36,10 @@
 //! * A panicking job becomes `Finished(Err)`; the manager keeps running.
 //! * `AddSource` runs the first refresh inline (one job, one progress bar for onboarding) and
 //!   reuses a never-refreshed source with the same locator instead of inserting a duplicate
-//!   (an onboarding retry after a failed import).
+//!   (an onboarding retry after a failed import). The find-or-insert is one writer closure, so
+//!   two adds of one locator racing each other end up with one source. Adds coalesce by
+//!   locator (not name), and a request for an add that is already running joins it (same job
+//!   id, no rerun).
 
 pub mod details;
 pub mod import_epg;
@@ -109,7 +112,8 @@ impl JobKind {
             JobKind::RefreshEpg { epg_source, .. } => format!("refresh-epg:{}", epg_source.0),
             JobKind::RefreshStale => "refresh-stale".into(),
             JobKind::ProbeSource(d) => format!("probe-source:{}", draft_digest(d)),
-            JobKind::AddSource(d) => format!("add-source:{}", draft_digest(d)),
+            // by locator, not by name: two adds of one playlist are one source
+            JobKind::AddSource(d) => format!("add-source:{}", locator_digest(d)),
             JobKind::LoadMovieDetails(id) => format!("movie-details:{}", id.0),
             JobKind::LoadSeriesDetails(id) => format!("series-details:{}", id.0),
             JobKind::RematchEpg => "rematch-epg".into(),
@@ -149,6 +153,29 @@ fn draft_digest(d: &SourceDraft) -> String {
         field(&x.server);
         field(&x.username);
         field(x.password.expose());
+    }
+    h.finalize().to_hex()[..16].to_owned()
+}
+
+/// Short digest of what a draft points at (kind + URL / file / server + account), the identity
+/// `probe::add_source` reuses a saved source by; names, colours and settings don't count.
+fn locator_digest(d: &SourceDraft) -> String {
+    let mut h = blake3::Hasher::new();
+    let mut field = |s: &str| {
+        h.update(s.as_bytes());
+        h.update(b"\x1f");
+    };
+    field(d.kind.as_str());
+    match d.kind {
+        SourceKind::M3uUrl => field(d.url.as_deref().unwrap_or("").trim()),
+        SourceKind::M3uFile => field(&d.path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()),
+        SourceKind::Xtream => {
+            if let Some(x) = &d.xtream {
+                field(x.server.trim_end_matches('/'));
+                field(&x.username);
+                field(x.password.expose());
+            }
+        }
     }
     h.finalize().to_hex()[..16].to_owned()
 }
@@ -206,12 +233,33 @@ pub enum JobOutcome {
     Restored(RestoreReport),
 }
 
+/// Why a job failed, for reactions that must not parse the (user-facing) message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    Cancelled,
+    /// The server could not be reached (DNS, connection, TLS, timeout): `Error::Network`. An
+    /// HTTP error status means the network works and is `Other`.
+    Network,
+    Other,
+}
+
+impl FailureKind {
+    pub fn of(e: &Error) -> Self {
+        match e {
+            Error::Cancelled => FailureKind::Cancelled,
+            Error::Network(_) => FailureKind::Network,
+            _ => FailureKind::Other,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)] // progress/finish messages, ≤ 10 Hz per job
 pub enum JobEvent {
     Updated(JobStatus),
-    /// `Err` holds a redacted, user-presentable message.
-    Finished { id: JobId, kind: JobKind, outcome: Result<JobOutcome, String> },
+    /// `Err` holds a redacted, user-presentable message; `failure` is `Some` exactly when
+    /// `outcome` is `Err` and says what kind of failure it was.
+    Finished { id: JobId, kind: JobKind, outcome: Result<JobOutcome, String>, failure: Option<FailureKind> },
 }
 
 /// Submits a follow-up job (returns its id). Installed by [`JobManager::new`].
@@ -430,6 +478,8 @@ struct ManagerInner {
     jobs: Mutex<Jobs>,
     next_id: AtomicU64,
     limits: Limits,
+    /// Shutting down: new submissions (follow-ups, reruns) are refused.
+    closing: AtomicBool,
 }
 
 #[derive(Default)]
@@ -505,13 +555,17 @@ impl JobManager {
                 Some(inner) => JobManager { inner }.submit(kind),
                 None => JobId(0),
             });
-            ManagerInner { ctx, rt, jobs: Mutex::default(), next_id: AtomicU64::new(1), limits: Limits::new() }
+            ManagerInner { ctx, rt, jobs: Mutex::default(), next_id: AtomicU64::new(1), limits: Limits::new(), closing: AtomicBool::new(false) }
         });
         Self { inner }
     }
 
     /// Queue a job (non-blocking). Returns the id (existing one when coalesced).
     pub fn submit(&self, kind: JobKind) -> JobId {
+        if self.inner.closing.load(Ordering::SeqCst) {
+            tracing::debug!(target: "tuner::jobs", "shutting down: {} not started", label_for(&kind, None));
+            return JobId(0);
+        }
         let key = kind.dedupe_key();
         let mut jobs = lock(&self.inner.jobs);
         if let Some(id) = jobs.by_key.get(&key).copied()
@@ -527,6 +581,9 @@ impl JobManager {
                     lock(&e.progress.status).kind = e.kind.clone();
                 }
                 JobPhase::Connecting if !e.progress.has_read_inputs() && e.kind.merged_with(&kind) == e.kind => {}
+                // the running add answers this request too: a rerun after it would find the
+                // source already refreshed and add it a second time
+                _ if matches!(kind, JobKind::AddSource(_)) => {}
                 _ => e.queue_rerun(kind),
             }
             return id;
@@ -565,6 +622,29 @@ impl JobManager {
     pub fn cancel_all(&self) {
         for e in lock(&self.inner.jobs).by_id.values_mut() {
             e.cancel_run();
+        }
+    }
+
+    /// App exit: refuse new jobs (follow-ups, reruns) and cancel everything. Cancelled jobs
+    /// still wind down (discard a partial guide, restore its channel matches) — wait for that
+    /// with [`Self::wait_idle`] before the runtime goes away.
+    pub fn shutdown(&self) {
+        self.inner.closing.store(true, Ordering::SeqCst);
+        self.cancel_all();
+    }
+
+    /// Block until no job is queued or running, at most `timeout`; false on timeout. Not for
+    /// the UI thread while it runs frames (exit only).
+    pub fn wait_idle(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if lock(&self.inner.jobs).by_id.is_empty() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -635,6 +715,7 @@ impl ManagerInner {
             }
         };
         let subject = progress.subject();
+        let failure = result.as_ref().err().map(FailureKind::of);
         let outcome = match result {
             Ok(o) => {
                 tracing::debug!(target: "tuner::jobs", "{} done", label_for(&kind, subject.as_deref()));
@@ -642,7 +723,7 @@ impl ManagerInner {
             }
             Err(Error::Cancelled) => {
                 tracing::info!(target: "tuner::jobs", "{} cancelled", label_for(&kind, subject.as_deref()));
-                Err("Cancelled".to_owned())
+                Err(Error::Cancelled.to_string())
             }
             Err(e) => {
                 let msg = crate::redact::redact(&e.to_string()).into_owned();
@@ -650,7 +731,7 @@ impl ManagerInner {
                 Err(msg)
             }
         };
-        self.ctx.bus.send(AppEvent::Job(JobEvent::Finished { id, kind, outcome }));
+        self.ctx.bus.send(AppEvent::Job(JobEvent::Finished { id, kind, outcome, failure }));
         // (reruns of a cancelled job were requested after the cancel)
         if let Some(k) = rerun {
             (self.ctx.submit)(k);
@@ -744,6 +825,11 @@ mod tests {
         assert_eq!(p.dedupe_key(), JobKind::ProbeSource(draft("x", "hunter2-secret")).dedupe_key());
         assert_ne!(p.dedupe_key(), JobKind::ProbeSource(draft("x", "other")).dedupe_key());
         assert_ne!(p.dedupe_key(), JobKind::AddSource(draft("x", "hunter2-secret")).dedupe_key());
+        // adds coalesce by what they point at, not by name
+        let add = |name: &str, pw: &str| JobKind::AddSource(draft(name, pw)).dedupe_key();
+        assert_eq!(add("x", "pw"), add("Other name", "pw"));
+        assert_ne!(add("x", "pw"), add("x", "pw2"));
+        assert!(!add("x", "hunter2-secret").contains("hunter2"));
     }
 
     #[test]
