@@ -2,7 +2,7 @@
 
 These are the release checks that automated tests can't cover: a real compositor, real video,
 real providers, the Omarchy desktop, and long runs. They come from DESIGN §23 and from the
-`[manual]` items collected in phases 1–4. Run them on the release build of the tree you are
+`[manual]` items collected in phases 1–5. Run them on the release build of the tree you are
 about to tag. For each item, record the date, the commit, and anything unexpected next to the
 checkbox.
 
@@ -344,6 +344,23 @@ These items use the **default** profile: start Tuner from the launcher, not with
     - The GTK portal dialog opens, floating and following the light/dark preference.
     - Cancel changes nothing. The chosen files work.
     - Exported files are mode 0600.
+- [ ] **Drag and drop (Hyprland):**
+  - **Do:** drag an `.m3u` from the file manager onto the window, then an `.xml.gz` guide, then
+    the same guide again, then a `.txt`.
+  - **Expect:** the playlist opens the onboarding card at Details; the guide is added and
+    imports ("Added the guide …"); the second drop says "… is already in your guides"; the
+    `.txt` gets the "Drop an .m3u / .m3u8 playlist or an XMLTV guide" hint. If nothing arrives
+    at all, record it: drops may be inert under Wayland with this eframe build (known gap).
+- [ ] **MPRIS never zaps onto a locked channel:**
+  - **Do:** set a PIN, lock a channel between two others, play the one before it and press the
+    media key *next* (or `playerctl -p tuner next`), also after unlocking the session in-app.
+  - **Expect:** the locked channel is skipped both times (deliberate: MPRIS always counts as
+    locked while a PIN is set).
+- [ ] **Single instance, quick double launch:**
+  - **Do:** run `tuner --profile-dir /tmp/tuner-check & tuner --profile-dir /tmp/tuner-check`
+    (both within a second), then a third launch a moment later.
+  - **Expect:** one window opens; `/tmp/tuner-check/run/tuner.sock` still exists afterwards;
+    the third launch hands off (the window comes forward) and exits.
 
 ## 9. Onboarding (real providers)
 
@@ -368,6 +385,30 @@ These items use the **default** profile: start Tuner from the launcher, not with
     when that is the running profile).
   - **Expect:** the onboarding card opens at Details with the name filled in, in the running
     window.
+- [ ] **Free channels against the real internet:**
+  - **Do:** in a fresh profile with a GB time zone, choose *Try free channels*. Pick
+    *iptv-org · United Kingdom*; in another fresh profile pick *Free-TV*, and later add
+    *iptv-org · All countries* from Settings ▸ Playlists ▸ *Add free channels…*.
+  - **Expect:**
+    - Nothing is downloaded before a pick; the first row reads "iptv-org · United Kingdom" and
+      the subtitle warns that some channels may not play where you are.
+    - UK: about 300 channels; Free-TV: about 2 000 with its epgshare01 guide added; all
+      countries: about 11 000. All are live channels only (no movies or series).
+    - Playlists already added read *Added* and can't be picked again.
+- [ ] **A preset that fails:** start with `TZ=` set to a zone whose country has no iptv-org
+  list (check that its `countries/<cc>.m3u` URL returns 404) and pick the country row.
+  **Expect:** the error, and Back returns to the presets with that row focused, never to Welcome.
+- [ ] **Provider M3U is offered its Xtream login:**
+  - **Do:** add a provider's `get.php?username=…&password=…` URL; in another fresh profile its
+    downloaded `.m3u` file; in a third a file whose live section uses the short form
+    `http://host:port/<u>/<p>/<id>` and whose VOD uses `/movie/<u>/<p>/…`.
+  - **Expect:** the Test step shows *Xtream login found* each time; *Continue* imports live,
+    movies, series and the provider guide with catch-up and account info.
+- [ ] **Keep as M3U:**
+  - **Do:** repeat the previous item and choose *Keep as M3U*.
+  - **Expect:** the Test step then reads "Looks good — M3U playlist". The import puts the
+    provider's `/movie/` entries under Movies and `/series/` entries under Series (grouped into
+    seasons and episodes); no `player_api.php` request is made (provider or proxy log).
 
 ## 10. Runtime behaviour
 
@@ -401,6 +442,19 @@ These items use the **default** profile: start Tuner from the launcher, not with
     send SIGTERM.
   - **Expect:** within about 3 s the log says it is exiting directly. The socket is gone and
     the VOD position is saved.
+- [ ] **A dead guide backs off:** add a source whose guide URL is dead. **Expect:** after the
+  first failure the guide is retried about an hour later (not after 12 h, not every 15 min),
+  with one toast per failure.
+- [ ] **Ctrl+R online:** **Expect:** an unchanged playlist comes back not modified (304); an M3U
+  whose Xtream upgrade failed recently is not retried; the "Refreshing N playlists and M guides"
+  toast still shows.
+- [ ] **Ctrl+R offline with several playlists and guides:** **Expect:** exactly one error toast,
+  and the status bar says "Offline — showing saved data".
+- [ ] **Backspace onto a locked channel:** with a PIN set, unlock, watch a locked channel, zap
+  away and let the session relock. **Expect:** Backspace opens the PIN prompt; the right PIN goes
+  back to that channel.
+- [ ] **Restore while leaving Settings:** start a backup restore and leave Settings before it
+  finishes. **Expect:** the restored preferences are applied and saved to `config.toml`.
 
 ## 11. Soak
 
@@ -413,6 +467,13 @@ These items use the **default** profile: start Tuner from the launcher, not with
     - RSS at 60 minutes is within ± 10 % of the 5-minute value.
     - No growing CPU use, and no stalls.
     - Playback is still in sync with the audio.
+- [ ] **Malloc arenas:**
+  - **Do:** repeat the soak once as usual and once with `MALLOC_ARENA_MAX=8` set; also play a
+    1080p channel for 10 minutes with the default (Tuner caps glibc at 2 arenas).
+  - **Expect:** RSS about 100–140 MiB with the default against 250 MiB or more with 8 arenas on
+    16 KiB-page machines (record x86_64 too, it was never measured); no dropped frames at 1080p
+    from CPU or lock contention (stream info). With `GLIBC_TUNABLES=glibc.malloc.arena_max=8`
+    the user's limit is kept.
 
 ## 12. Real providers (summary)
 
@@ -427,3 +488,36 @@ These items use the **default** profile: start Tuner from the launcher, not with
 - [ ] **Pluto TV with the i.mjh.nz guide:**
   - **Expect:** most channels match the guide. Now/next and the grid are filled, and times are
     correct for the local time zone.
+
+## 13. Xtream upgrade and M3U movies & series (real provider)
+
+- [ ] **Existing M3U upgrades silently:**
+  - **Do:** with the previous release, add a provider's `get.php` URL as M3U; favourite a few
+    channels, watch part of a `/movie/` entry, lock a group "Adult". Install this build and
+    refresh (or wait for the scheduler).
+  - **Expect:**
+    - Toast "Upgraded to Xtream login — movies & series now available" (with several
+      playlists it is prefixed with the playlist's name). Settings ▸ Playlists reads *Xtream
+      (from M3U)*.
+    - Favourites, history and progress are still there; the movie group "Adult" is locked.
+- [ ] **Quit during the first import:** lock the channel group "Adult", quit while the first
+  import after the update runs, start again and refresh. **Expect:** the movie group "Adult" is
+  locked.
+- [ ] **Switching back and forth:**
+  - **Do:** open the upgraded playlist's editor and turn **Use the Xtream login** off; Cancel the
+    confirm, then do it again and choose *Use playlist*. Then turn it back on.
+  - **Expect:** Cancel changes nothing. *Use playlist* goes back to the M3U (favourites kept
+    where the playlist has them). Turning it on signs in again with the upgrade toast.
+- [ ] **Turning the login on fails:** on a playlist kept as M3U whose login is rejected, turn
+  **Use the Xtream login** on. **Expect:** the "Couldn't sign in…" toast; the row reads off again
+  and the playlist stays kept (no automatic retries afterwards).
+- [ ] **Silent upgrade under an open editor:** open the playlist's editor and start editing
+  *Playlist URL*, then let a refresh upgrade it. **Expect:** editing ends, the cursor goes to
+  Name, and Save does not undo the upgrade.
+- [ ] **Sparse M3U pages:** on a playlist kept as M3U, open a movie and a series. **Expect:** a
+  deliberate short page (title, poster, group, and the playlist when there are several) with no
+  loading skeleton and no request to the provider; an untitled episode reads
+  "S01E03 · Episode 3", also on the next-episode card.
+- [ ] **Login refused:** use a playlist whose panel rejects the API login. **Expect:** it stays
+  M3U with movies and series sorted out of the playlist, and the next automatic check is a week
+  later (*Refresh now* in its editor retries at once).

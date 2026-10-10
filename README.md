@@ -34,8 +34,11 @@ on-screen controls, and a light theme (catppuccin-latte).
 
 - **Sources:** M3U by URL or local file, and Xtream Codes (live, movies, series and the
   provider's guide). You can add several playlists, each with its own colour and glyph badge.
-  A pasted `get.php?username=…` link is offered as an Xtream login. Tuner refreshes playlists
-  in the background and shows account information (expiry, connections, formats).
+  A provider's M3U (a `get.php?username=…` link or a downloaded file) switches to its Xtream
+  login automatically, so movies, series and catch-up appear; providers that don't allow that
+  still get their movies and series sorted out of the playlist. *Try free channels* adds a
+  free iptv-org or Free-TV playlist in two keystrokes. Tuner refreshes playlists in the
+  background and shows account information (expiry, connections, formats).
 - **Live TV:** groups, channel rows with now/next and progress, and a preview pane.
   - Zap with ↑/↓, recall the last channel, and browse your history.
   - Keep several favourites lists.
@@ -112,12 +115,16 @@ Then follow [Omarchy integration](#omarchy-integration).
 With no playlists, Tuner opens a single onboarding card with these steps:
 
 1. **Welcome:** add a playlist or restore a backup.
-2. **Type:** Xtream login, M3U URL or M3U file.
+2. **Type:** Xtream login, M3U URL, M3U file, or **Try free channels** (see
+   [Free channels](#free-channels)).
 3. **Details:** name, glyph, colour and credentials. For Xtream, the server field accepts a
    bare host. It adds `http://` and keeps the port.
 4. **Test:** checks the account (status, expiry, connections).
    - A rejected or expired login sends you back to the field at fault.
    - An unreachable server offers *Retry* and *Add anyway*.
+   - When an M3U playlist turns out to carry an Xtream login, the card says **Xtream login
+     found**. *Continue* uses the login (movies, series, catch-up, account info);
+     **Keep as M3U** keeps the plain playlist.
 5. **Guide:** only for M3U playlists that don't name their own guide. Enter an XMLTV URL or
    file, or skip (you can add one later in Settings ▸ EPG).
 6. **Importing:** **Open Live TV** becomes available as soon as the channels are in. Movies,
@@ -147,10 +154,56 @@ Tuner (file manager, `tuner list.m3u`) does the same.
   - whether to import movies and series
 
   A User-Agent change applies without a restart: the next refresh, logo fetch and stream use it.
+- **Drag and drop:** dropping an `.m3u`/`.m3u8` on the window opens the playlist card; dropping
+  an XMLTV file (`.xml`, `.xml.gz`, `.xml.xz`) adds it as a guide. Whether drops arrive depends
+  on the compositor (not yet confirmed under Wayland/Hyprland); the menu entries always work.
 - **XMLTV guides:** **Settings ▸ EPG ▸ Add URL / Add a guide file…** accepts plain, `.gz` or
   `.xz`.
   - The order of the guides is their priority: drag the rows, or use Alt+↑/↓.
   - Each guide has a minutes offset for guides that are off by a time zone.
+
+### Free channels
+
+**Try free channels** in onboarding, or **Settings ▸ Playlists ▸ Add free channels…** later,
+lists ready-made playlists of free, legal streams. Nothing is downloaded until you pick one, and
+none is added for you. Playlists you already have read *Added*.
+
+- **iptv-org, your country** (first): `https://iptv-org.github.io/iptv/countries/<cc>.m3u`. The
+  country comes from the system time zone, then the locale (the UK is `uk`, about 300 channels).
+- **iptv-org, all countries:** `https://iptv-org.github.io/iptv/index.m3u` (about 11 000).
+- **Free-TV/IPTV:** about 2 000 hand-picked channels; its header names the epgshare01 guides,
+  which are added with it.
+
+Some channels are geo-blocked or offline; dead ones fail fast and get dimmed.
+
+### Provider playlists and the Xtream login
+
+Most providers hand out an M3U that is really an Xtream Codes account: a
+`…/get.php?username=…&password=…` link, or a playlist (also a downloaded file) whose entries look
+like `http://host[:port][/path]/live|movie|series/<user>/<pass>/<id>.<ext>`. Tuner recognises
+these and signs in with the Xtream API (`player_api.php`) without asking:
+
+- **New playlists:** the Test step shows *Xtream login found*. The source becomes an Xtream
+  source with full movie and series metadata, catch-up and account info; it remembers the
+  playlist URL or file so you can go back to it.
+- **Playlists added before:** they switch on their next refresh, silently, with a toast
+  ("Upgraded to Xtream login — movies & series now available"). Favourites, history, progress,
+  renames and locks carry over. Settings ▸ Playlists shows them as *Xtream (from M3U)*.
+- **If the login fails** the playlist simply stays M3U and Tuner tries again after a week (or
+  at once with *Refresh now* in the playlist's editor).
+- **Keep as M3U:** choose it in the Test step, or turn off **Use the Xtream login** in the
+  playlist's editor (it asks first, since movies and series that are not in the playlist go
+  away). Turning it back on signs in right away and says so if the login is refused.
+
+A playlist that mixes entries from other hosts is treated as a merged list and never switched.
+
+**Movies and series from a plain M3U.** When a provider playlist stays M3U (login refused, or
+*Keep as M3U*), its `/movie/` entries appear under Movies and its `/series/` entries under
+Series, grouped by `group-title`. Episode titles such as `Show S01 E02`, `S01E02`, `1x02` or
+`Season 1 Episode 2` are grouped into series, seasons and episodes; titles without one go to
+season 1 in playlist order. Everything else stays a live channel. These pages only have what the
+playlist carries (title, poster, group), so they show a short page with no plot or cast.
+Ordinary playlists such as iptv-org or Free-TV are not affected.
 
 ## TV guide and guide coverage
 
@@ -396,7 +449,13 @@ The full reference is generated from `src/keymap.rs`:
 | `f` | Collection: favourites lists, groups, all |
 | `0` / `1` / `2` / `3` / `4` / `5` / `6` / `7` / `8` / `9` | Jump to channel number |
 | `Ctrl+F` | Add channel to Favourites |
+| `Ctrl+Shift+F` | Favourites lists… (add, new list) |
 | `Ctrl+E` | Assign EPG channel |
+| `Ctrl+I` | Edit channel information |
+| `F2` | Rename channel |
+| `Ctrl+H` | Hide channel |
+| `Ctrl+L` | Lock channel with PIN / unlock |
+| `Shift+F10` / `Ctrl+Enter` | Channel menu |
 | `/` | Search everything |
 | `?` | Keyboard help |
 | `Esc` | Back |
@@ -509,15 +568,11 @@ The full reference is generated from `src/keymap.rs`:
 | `Ctrl+H` | Hide / unhide |
 | `F2` | Rename |
 | `Ctrl+L` | Lock with PIN / unlock |
-| `Alt+↑` | Move up (reorder) |
-| `Alt+↓` | Move down (reorder) |
-| `Ctrl+S` | Sort & view options… |
 | `Ctrl+G` | Show in TV guide |
 | `Ctrl+I` | Details / edit information |
 | `Ctrl+E` | Assign EPG channel |
 | `Ctrl+W` | Mark watched / unwatched |
-| `Delete` | Remove (from list / cancel task / forget) |
-| `Shift+F10` / `Ctrl+Enter` | Context menu |
+| `Shift+F10` / `Ctrl+Enter` | List these shortcuts |
 
 ### Dialogs & menus (`Modal`)
 

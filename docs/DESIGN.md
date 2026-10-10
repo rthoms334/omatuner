@@ -1591,7 +1591,9 @@ One centred card (launcher look; **no sidebar, status bar or mini-player**), ste
 Esc goes back a step; everything keyboard-reachable. The same card is reused via
 `Route::Onboarding(OnboardingStart)`: `AddSource` (Settings ▸ Playlists ▸ "+ Add", starts at
 Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the name prefilled),
-`NeedsCredentials(source)` (restored sources without password; Details for that source).
+`NeedsCredentials(source)` (restored sources without password; Details for that source),
+`FreeChannels` (Settings ▸ Playlists ▸ "Add free channels…"; starts at the **Presets** step that
+"Try free channels" opens, §27.8 — a pick probes the preset like a typed M3U URL).
 
 ### 13.11 Help, jobs, dialogs, EPG mapping, logs
 * Help (`?`, F1): generated from `keymap::help_rows`; current contexts first; two columns ≥
@@ -1897,7 +1899,13 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `f` | Collection: favourites lists, groups, all |
 | `0` / `1` / `2` / `3` / `4` / `5` / `6` / `7` / `8` / `9` | Jump to channel number |
 | `Ctrl+F` | Add channel to Favourites |
+| `Ctrl+Shift+F` | Favourites lists… (add, new list) |
 | `Ctrl+E` | Assign EPG channel |
+| `Ctrl+I` | Edit channel information |
+| `F2` | Rename channel |
+| `Ctrl+H` | Hide channel |
+| `Ctrl+L` | Lock channel with PIN / unlock |
+| `Shift+F10` / `Ctrl+Enter` | Channel menu |
 | `/` | Search everything |
 | `?` | Keyboard help |
 | `Esc` | Back |
@@ -2010,15 +2018,11 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Ctrl+H` | Hide / unhide |
 | `F2` | Rename |
 | `Ctrl+L` | Lock with PIN / unlock |
-| `Alt+↑` | Move up (reorder) |
-| `Alt+↓` | Move down (reorder) |
-| `Ctrl+S` | Sort & view options… |
 | `Ctrl+G` | Show in TV guide |
 | `Ctrl+I` | Details / edit information |
 | `Ctrl+E` | Assign EPG channel |
 | `Ctrl+W` | Mark watched / unwatched |
-| `Delete` | Remove (from list / cancel task / forget) |
-| `Shift+F10` / `Ctrl+Enter` | Context menu |
+| `Shift+F10` / `Ctrl+Enter` | List these shortcuts |
 
 #### Dialogs & menus (`Modal`)
 
@@ -2565,7 +2569,9 @@ in the skeleton code. Listed: points rejected or implemented differently, with t
   per-item limitation is documented (§8.3, §13.2) instead.
 * *M6(e) — drag & drop / `tuner file.m3u`*: reuse the onboarding card
   (`Route::Onboarding(PlaylistFile)`), so `JobKind::ImportPlaylistFile` (suggested by the
-  implementability review M8) was removed — `AddSource` covers file sources.
+  implementability review M8) was removed — `AddSource` covers file sources. Dropped XMLTV
+  files are added as guides (Phase 5). Caveat: drops depend on the eframe/winit backend and
+  were not confirmed to arrive under Wayland/Hyprland (MANUAL_CHECKLIST §8).
 
 **Architecture / concurrency review**
 * *B1(d) — video watchdog*: implemented (not left optional), because users who don't install the
