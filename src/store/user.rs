@@ -15,8 +15,8 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::error::{Error, Result};
 use crate::model::{
-    FavListId, FavouriteEntry, FavouriteList, Fingerprint, GroupKey, GroupOverride, GroupOverrideRow, HistoryEntry, ItemKey,
-    ItemKind, ItemOverride, ItemOverrideRow, ItemRef, Reminder, ReminderId, ReminderState, SourceId, Timestamp, WatchProgress,
+    FavListId, FavouriteEntry, FavouriteList, Fingerprint, GroupKey, GroupOverride, GroupOverrideRow, HistoryEntry, ItemKey, ItemKind, ItemOverride,
+    ItemOverrideRow, ItemRef, Reminder, ReminderId, ReminderState, SourceId, Timestamp, WatchProgress,
 };
 use crate::store::sql::{self, atomic, enum_parse, enum_str, fp_from_json, fp_opt, group_norm, kind_from_sql, or_not_found};
 
@@ -112,8 +112,7 @@ pub fn rename_fav_list(conn: &Connection, id: FavListId, name: &str, icon: &str)
 
 /// The default list cannot be deleted (returns `Error::Other`).
 pub fn delete_fav_list(conn: &Connection, id: FavListId) -> Result<()> {
-    let is_default: bool =
-        or_not_found(conn.query_row("SELECT is_default FROM fav_list WHERE id = ?1", [id], |r| r.get(0)), "favourites list", id)?;
+    let is_default: bool = or_not_found(conn.query_row("SELECT is_default FROM fav_list WHERE id = ?1", [id], |r| r.get(0)), "favourites list", id)?;
     if is_default {
         return Err(Error::Other("the default favourites list cannot be deleted".into()));
     }
@@ -303,10 +302,7 @@ pub fn item_overrides(conn: &Connection, source: Option<SourceId>) -> Result<Vec
 
 pub fn set_group_override(conn: &Connection, source: SourceId, kind: ItemKind, key: &GroupKey, ov: &GroupOverride) -> Result<()> {
     if *ov == GroupOverride::default() {
-        conn.execute(
-            "DELETE FROM group_override WHERE source_id = ?1 AND kind = ?2 AND group_key = ?3",
-            params![source, kind.as_str(), key.0],
-        )?;
+        conn.execute("DELETE FROM group_override WHERE source_id = ?1 AND kind = ?2 AND group_key = ?3", params![source, kind.as_str(), key.0])?;
         return Ok(());
     }
     conn.execute(
@@ -441,13 +437,15 @@ pub fn push_history(conn: &Connection, e: &HistoryEntry) -> Result<()> {
                 c.execute("UPDATE history SET at = max(at, ?2), title = ?3 WHERE id = ?1", params![id, e.at, e.title])?;
             }
             _ => {
-                c.prepare_cached("INSERT INTO history(source_id, kind, item_key, title, at) VALUES (?1, ?2, ?3, ?4, ?5)")?.execute(
-                    params![e.item.source, e.item.kind.as_str(), e.item.key.as_str(), e.title, e.at],
-                )?;
-                c.prepare_cached(
-                    "DELETE FROM history WHERE id IN (SELECT id FROM history ORDER BY at DESC, id DESC LIMIT -1 OFFSET ?1)",
-                )?
-                .execute([HISTORY_KEEP])?;
+                c.prepare_cached("INSERT INTO history(source_id, kind, item_key, title, at) VALUES (?1, ?2, ?3, ?4, ?5)")?.execute(params![
+                    e.item.source,
+                    e.item.kind.as_str(),
+                    e.item.key.as_str(),
+                    e.title,
+                    e.at
+                ])?;
+                c.prepare_cached("DELETE FROM history WHERE id IN (SELECT id FROM history ORDER BY at DESC, id DESC LIMIT -1 OFFSET ?1)")?
+                    .execute([HISTORY_KEEP])?;
             }
         }
         Ok(())
@@ -523,7 +521,17 @@ pub fn add_reminder(conn: &Connection, r: &Reminder) -> Result<ReminderId> {
         "INSERT INTO reminder(source_id, channel_key, channel_name, title, start, stop, lead_s, state, fp)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, COALESCE(?9, '{}'))
          ON CONFLICT(source_id, channel_key, start) DO NOTHING",
-        params![r.channel.source, r.channel.key.as_str(), r.channel_name, r.programme_title, r.start, r.stop, r.lead_s, enum_str(&r.state), fp_opt(&fp)],
+        params![
+            r.channel.source,
+            r.channel.key.as_str(),
+            r.channel_name,
+            r.programme_title,
+            r.start,
+            r.stop,
+            r.lead_s,
+            enum_str(&r.state),
+            fp_opt(&fp)
+        ],
     )?;
     Ok(conn.query_row(
         "SELECT id FROM reminder WHERE source_id = ?1 AND channel_key = ?2 AND start = ?3",
@@ -555,10 +563,14 @@ pub fn reminders_for_channel(conn: &Connection, channel: &ItemRef) -> Result<Vec
 }
 
 /// Every pending reminder (Settings ▸ Reminders), soonest first.
-pub fn all_reminders(conn: &Connection) -> Result<Vec<Reminder>> { reminders_where(conn, "state = 'pending' ORDER BY start, id", []) }
+pub fn all_reminders(conn: &Connection) -> Result<Vec<Reminder>> {
+    reminders_where(conn, "state = 'pending' ORDER BY start, id", [])
+}
 
 /// Every reminder in any state (backup).
-pub(crate) fn every_reminder(conn: &Connection) -> Result<Vec<Reminder>> { reminders_where(conn, "1 ORDER BY start, id", []) }
+pub(crate) fn every_reminder(conn: &Connection) -> Result<Vec<Reminder>> {
+    reminders_where(conn, "1 ORDER BY start, id", [])
+}
 
 // ------------------------------------------------------------------ orphans
 
@@ -583,7 +595,9 @@ const HOLDERS: &[(&str, &str, &str, &str, &str)] = &[
     ("epg", "channel_epg_map", "'channel'", "channel_key", " AND method = 'manual'"),
 ];
 
-fn holder_name(s: &str) -> &'static str { HOLDERS.iter().find(|h| h.0 == s).map(|h| h.0).unwrap_or("other") }
+fn holder_name(s: &str) -> &'static str {
+    HOLDERS.iter().find(|h| h.0 == s).map(|h| h.0).unwrap_or("other")
+}
 
 pub fn orphans(conn: &Connection) -> Result<Vec<Orphan>> {
     let sql = HOLDERS
@@ -660,9 +674,7 @@ pub(crate) fn mark_orphaned(conn: &Connection, item: &ItemRef, now: Timestamp) -
     let mut newly = false;
     for (table, key, extra) in holders_for(item.kind) {
         let n = conn.execute(
-            &format!(
-                "UPDATE {table} SET orphaned_since = ?3 WHERE source_id = ?1 AND {key} = ?2 AND orphaned_since IS NULL{extra}"
-            ),
+            &format!("UPDATE {table} SET orphaned_since = ?3 WHERE source_id = ?1 AND {key} = ?2 AND orphaned_since IS NULL{extra}"),
             params![item.source, item.key.as_str(), now],
         )?;
         newly |= n > 0;

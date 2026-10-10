@@ -159,7 +159,9 @@ impl<R: BufRead> BufRead for Transcode<R> {
         Ok(&self.out[self.pos..])
     }
 
-    fn consume(&mut self, amt: usize) { self.pos = (self.pos + amt).min(self.out.len()); }
+    fn consume(&mut self, amt: usize) {
+        self.pos = (self.pos + amt).min(self.out.len());
+    }
 }
 
 fn parse_utf8<R: BufRead>(
@@ -240,9 +242,7 @@ fn parse_utf8<R: BufRead>(
                     }
                     (Some(Tag::Programme), "new") => p.prog.as_mut().into_iter().for_each(|pb| pb.is_new = true),
                     (Some(Tag::Programme), "live") => p.prog.as_mut().into_iter().for_each(|pb| pb.is_live = true),
-                    (Some(Tag::Programme), "previously-shown") => {
-                        p.prog.as_mut().into_iter().for_each(|pb| pb.previously_shown = true)
-                    }
+                    (Some(Tag::Programme), "previously-shown") => p.prog.as_mut().into_iter().for_each(|pb| pb.previously_shown = true),
                     _ => {}
                 }
                 if empty {
@@ -695,7 +695,9 @@ fn parse_zone(z: &[u8]) -> Option<i64> {
     NAMED.iter().find(|(name, _)| name.as_bytes().eq_ignore_ascii_case(z)).map(|(_, min)| min * 60)
 }
 
-fn is_leap(y: i64) -> bool { (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 }
+fn is_leap(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
 
 fn days_in_month(y: i64, m: i64) -> i64 {
     match m {
@@ -752,8 +754,7 @@ fn parse_onscreen(v: &str) -> Option<EpisodeNum> {
 
     use regex::Regex;
     static SE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)\bs(?:eason)?\s*\.?\s*(\d{1,4})\s*[-_.,/ ]?\s*e(?:p(?:isode)?)?\s*\.?\s*(\d{1,5})\b")
-            .expect("static regex")
+        Regex::new(r"(?i)\bs(?:eason)?\s*\.?\s*(\d{1,4})\s*[-_.,/ ]?\s*e(?:p(?:isode)?)?\s*\.?\s*(\d{1,5})\b").expect("static regex")
     });
     static X: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b(\d{1,3})\s*[xX]\s*(\d{1,4})\b").expect("static regex"));
     static S: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bs(?:eason)?\s*\.?\s*(\d{1,4})\b").expect("static regex"));
@@ -890,10 +891,15 @@ mod tests {
     fn parse_str(xml: &str, langs: &[&str]) -> (Vec<XmltvItem>, XmltvStats) {
         let opts = XmltvOptions { preferred_langs: langs.iter().map(|s| s.to_string()).collect(), min_stop: None, max_start: None };
         let mut items = Vec::new();
-        let stats = parse(xml.as_bytes(), &opts, &mut |i| {
-            items.push(i);
-            ControlFlow::Continue(())
-        }, &mut |_| {})
+        let stats = parse(
+            xml.as_bytes(),
+            &opts,
+            &mut |i| {
+                items.push(i);
+                ControlFlow::Continue(())
+            },
+            &mut |_| {},
+        )
         .expect("parse");
         (items, stats)
     }
@@ -956,7 +962,12 @@ mod tests {
     #[test]
     fn malformed_xml_is_a_parse_error() {
         let opts = XmltvOptions { preferred_langs: vec![], min_stop: None, max_start: None };
-        let r = parse(&b"<tv><programme start=\"2026\" channel=\"a\"><title>x</titl></programme></tv>"[..], &opts, &mut |_| ControlFlow::Continue(()), &mut |_| {});
+        let r = parse(
+            &b"<tv><programme start=\"2026\" channel=\"a\"><title>x</titl></programme></tv>"[..],
+            &opts,
+            &mut |_| ControlFlow::Continue(()),
+            &mut |_| {},
+        );
         assert!(matches!(r, Err(Error::Parse { .. })), "{r:?}");
     }
 }

@@ -26,7 +26,13 @@ fn groups() -> Vec<ImportGroup> {
     (0..GROUPS)
         .map(|i| {
             let name = format!("Country {} | Category {}", i / 10, i % 10);
-            ImportGroup { kind: ItemKind::Channel, key: group_key(ItemKind::Channel, &name), name, provider_id: Some(i.to_string()), provider_order: i as i32 }
+            ImportGroup {
+                kind: ItemKind::Channel,
+                key: group_key(ItemKind::Channel, &name),
+                name,
+                provider_id: Some(i.to_string()),
+                provider_order: i as i32,
+            }
         })
         .collect()
 }
@@ -67,7 +73,9 @@ fn channels(n: usize, groups: &[ImportGroup]) -> Vec<ImportChannel> {
         .collect()
 }
 
-fn new_source(store: &Store) -> SourceId { store.writer().blocking(|c| seed::seed_source(c, "Bench")).expect("source") }
+fn new_source(store: &Store) -> SourceId {
+    store.writer().blocking(|c| seed::seed_source(c, "Bench")).expect("source")
+}
 
 /// One catalogue import as `jobs::import_source` drives it: one writer job per batch.
 fn import(store: &Store, src: SourceId, groups: &[ImportGroup], chans: &[ImportChannel], now: Timestamp) {

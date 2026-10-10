@@ -15,9 +15,13 @@ use tuner::theme::tokens::{OSD_EFFECTIVE_BG, contrast_ratio};
 use tuner::theme::watch::ThemeWatcher;
 use tuner::theme::{Interaction, ShellConfig, SpaceToken, Theme, ThemeEvent, TypeToken, with_alpha};
 
-fn fixture(rel: &str) -> PathBuf { PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/theme").join(rel) }
+fn fixture(rel: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/theme").join(rel)
+}
 
-fn read(p: &Path) -> String { std::fs::read_to_string(p).unwrap_or_else(|e| panic!("{}: {e}", p.display())) }
+fn read(p: &Path) -> String {
+    std::fs::read_to_string(p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+}
 
 fn palette_of(name: &str) -> Palette {
     let dir = fixture(name);
@@ -152,17 +156,45 @@ fn light_detection() {
 #[test]
 fn liftoff_tokens_match_omarchy_tables() {
     let t = theme_of("liftoff", 1.0);
-    let fonts: Vec<f32> = [TypeToken::Caption, TypeToken::BodySmall, TypeToken::Body, TypeToken::Subtitle, TypeToken::Title, TypeToken::Heading, TypeToken::Display, TypeToken::DisplayLarge]
-        .iter()
-        .map(|tok| t.font(*tok))
-        .collect();
+    let fonts: Vec<f32> = [
+        TypeToken::Caption,
+        TypeToken::BodySmall,
+        TypeToken::Body,
+        TypeToken::Subtitle,
+        TypeToken::Title,
+        TypeToken::Heading,
+        TypeToken::Display,
+        TypeToken::DisplayLarge,
+    ]
+    .iter()
+    .map(|tok| t.font(*tok))
+    .collect();
     assert_eq!(fonts, [10.0, 11.0, 12.0, 13.0, 14.0, 16.0, 24.0, 28.0]);
     assert_eq!((t.font(TypeToken::IconSmall), t.font(TypeToken::Icon), t.font(TypeToken::IconLarge)), (11.0, 14.0, 18.0));
     use SpaceToken::*;
     let table = [
-        (Hairline, 1.0), (Xxs, 2.0), (Xs, 3.0), (Sm, 4.0), (Md, 6.0), (Lg, 8.0), (Xl, 10.0), (Xxl, 12.0), (Xxxl, 14.0), (Huge, 18.0),
-        (ControlGap, 8.0), (ControlPaddingX, 10.0), (ControlPaddingY, 6.0), (InputPaddingY, 7.0), (ControlHeight, 28.0), (PopupRowHeight, 28.0),
-        (RowGap, 8.0), (RowPaddingX, 12.0), (LabelGap, 4.0), (PanelGap, 14.0), (PanelPadding, 18.0), (PopupPadding, 14.0),
+        (Hairline, 1.0),
+        (Xxs, 2.0),
+        (Xs, 3.0),
+        (Sm, 4.0),
+        (Md, 6.0),
+        (Lg, 8.0),
+        (Xl, 10.0),
+        (Xxl, 12.0),
+        (Xxxl, 14.0),
+        (Huge, 18.0),
+        (ControlGap, 8.0),
+        (ControlPaddingX, 10.0),
+        (ControlPaddingY, 6.0),
+        (InputPaddingY, 7.0),
+        (ControlHeight, 28.0),
+        (PopupRowHeight, 28.0),
+        (RowGap, 8.0),
+        (RowPaddingX, 12.0),
+        (LabelGap, 4.0),
+        (PanelGap, 14.0),
+        (PanelPadding, 18.0),
+        (PopupPadding, 14.0),
     ];
     for (tok, px) in table {
         assert_eq!(t.space(tok), px, "{tok:?}");
@@ -239,7 +271,11 @@ fn text_size_override_and_ui_scale() {
     assert_eq!(t.space(SpaceToken::ControlHeight), 37.0, "spacing scales with font");
     assert!((t.rem() - 16.0 / 12.0).abs() < 1e-6);
 
-    let shell = ShellConfig::parse("[font]\nbase-size = 16\n[spacing]\nscale-with-font = false\nscale = 2\npanel-padding = 5\nhairline = 9\n[font]\ntitle = 30\n", None).unwrap();
+    let shell = ShellConfig::parse(
+        "[font]\nbase-size = 16\n[spacing]\nscale-with-font = false\nscale = 2\npanel-padding = 5\nhairline = 9\n[font]\ntitle = 30\n",
+        None,
+    )
+    .unwrap();
     let t = Theme::from_parts("x".into(), pal.clone(), shell, 0.0, 1.0);
     assert_eq!(t.space(SpaceToken::ControlHeight), 56.0);
     assert_eq!(t.space(SpaceToken::PanelPadding), 5.0, "pinned token");

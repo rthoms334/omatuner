@@ -245,12 +245,24 @@ pub struct KeyChord {
 }
 
 impl KeyChord {
-    pub const fn key(k: Key) -> Self { Self { trigger: Trigger::Key(k), ctrl: false, alt: false, shift: false } }
-    pub const fn ch(c: char) -> Self { Self { trigger: Trigger::Char(c), ctrl: false, alt: false, shift: false } }
-    pub const fn ctrl(k: Key) -> Self { Self { trigger: Trigger::Key(k), ctrl: true, alt: false, shift: false } }
-    pub const fn alt(k: Key) -> Self { Self { trigger: Trigger::Key(k), ctrl: false, alt: true, shift: false } }
-    pub const fn shift(k: Key) -> Self { Self { trigger: Trigger::Key(k), ctrl: false, alt: false, shift: true } }
-    pub const fn ctrl_shift(k: Key) -> Self { Self { trigger: Trigger::Key(k), ctrl: true, alt: false, shift: true } }
+    pub const fn key(k: Key) -> Self {
+        Self { trigger: Trigger::Key(k), ctrl: false, alt: false, shift: false }
+    }
+    pub const fn ch(c: char) -> Self {
+        Self { trigger: Trigger::Char(c), ctrl: false, alt: false, shift: false }
+    }
+    pub const fn ctrl(k: Key) -> Self {
+        Self { trigger: Trigger::Key(k), ctrl: true, alt: false, shift: false }
+    }
+    pub const fn alt(k: Key) -> Self {
+        Self { trigger: Trigger::Key(k), ctrl: false, alt: true, shift: false }
+    }
+    pub const fn shift(k: Key) -> Self {
+        Self { trigger: Trigger::Key(k), ctrl: false, alt: false, shift: true }
+    }
+    pub const fn ctrl_shift(k: Key) -> Self {
+        Self { trigger: Trigger::Key(k), ctrl: true, alt: false, shift: true }
+    }
 
     /// Human label: "Ctrl+K", "Shift+Enter", "?", "↑".
     pub fn label(&self) -> String {
@@ -303,7 +315,9 @@ pub struct Binding {
     pub help: &'static str,
 }
 
-const fn b(chord: KeyChord, action: Action, help: &'static str) -> Binding { Binding { chord, action, help } }
+const fn b(chord: KeyChord, action: Action, help: &'static str) -> Binding {
+    Binding { chord, action, help }
+}
 
 use Action as A;
 use KeyChord as C;
@@ -586,10 +600,8 @@ pub static NUMERIC_ENTRY: &[Binding] = &[
 ];
 
 /// Stacked above `List`/`ListFiltering` on the EPG mapping screen.
-pub static EPG_MAPPING: &[Binding] = &[
-    b(C::key(Key::Enter), A::Activate, "Assign the highlighted EPG channel"),
-    b(C::key(Key::Delete), A::ClearEpg, "Clear the manual assignment"),
-];
+pub static EPG_MAPPING: &[Binding] =
+    &[b(C::key(Key::Enter), A::Activate, "Assign the highlighted EPG channel"), b(C::key(Key::Delete), A::ClearEpg, "Clear the manual assignment")];
 
 pub static SEARCH: &[Binding] = &[
     b(C::key(Key::ArrowUp), A::Up, "Move"),
@@ -672,10 +684,7 @@ pub fn tables(ctx: KeyContext) -> Vec<&'static [Binding]> {
 
 /// Contexts whose unbound printable characters become `FilterInput`.
 pub fn is_filtering(ctx: KeyContext) -> bool {
-    matches!(
-        ctx,
-        KeyContext::List | KeyContext::ListFiltering | KeyContext::PosterGrid | KeyContext::PosterGridFiltering | KeyContext::Search
-    )
+    matches!(ctx, KeyContext::List | KeyContext::ListFiltering | KeyContext::PosterGrid | KeyContext::PosterGridFiltering | KeyContext::Search)
 }
 
 fn find(tables: &[&'static [Binding]], ev: &egui::Event) -> Option<Action> {
@@ -683,7 +692,9 @@ fn find(tables: &[&'static [Binding]], ev: &egui::Event) -> Option<Action> {
 }
 
 /// F1…F35.
-fn is_fkey(key: Key) -> bool { key.name().strip_prefix('F').is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) }
+fn is_fkey(key: Key) -> bool {
+    key.name().strip_prefix('F').is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
 
 /// Ctrl/Alt chord or F-key: the only events a focused text field lets through (to `Global`).
 fn is_chord_or_fkey(ev: &egui::Event) -> bool {
@@ -724,9 +735,10 @@ fn resolve_inner(stack: &[KeyContext], ev: &egui::Event) -> Option<Action> {
                 if let egui::Event::Text(t) = ev {
                     let mut it = t.chars();
                     if let (Some(c), None) = (it.next(), it.next())
-                        && !c.is_control() {
-                            return Some(Action::FilterInput(c));
-                        }
+                        && !c.is_control()
+                    {
+                        return Some(Action::FilterInput(c));
+                    }
                 }
             }
             // PlayerOsd / NumericEntry / EpgMapping / others fall through to the next context.
@@ -806,7 +818,9 @@ pub fn hints(stack: &[KeyContext]) -> Vec<(Action, KeyChord, &'static str)> {
         let t = tables(*ctx);
         return items
             .iter()
-            .filter_map(|(a, verb)| t.iter().chain(std::iter::once(&GLOBAL)).find_map(|tb| tb.iter().find(|bd| bd.action == *a)).map(|bd| (*a, bd.chord, *verb)))
+            .filter_map(|(a, verb)| {
+                t.iter().chain(std::iter::once(&GLOBAL)).find_map(|tb| tb.iter().find(|bd| bd.action == *a)).map(|bd| (*a, bd.chord, *verb))
+            })
             .collect();
     }
     Vec::new()
@@ -831,7 +845,9 @@ mod tests {
             modifiers: egui::Modifiers { ctrl, alt, shift, command: ctrl, ..Default::default() },
         }
     }
-    fn key(k: Key, ctrl: bool) -> egui::Event { key_ev(k, ctrl, false, false, false) }
+    fn key(k: Key, ctrl: bool) -> egui::Event {
+        key_ev(k, ctrl, false, false, false)
+    }
     use KeyContext as K;
 
     #[test]

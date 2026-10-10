@@ -42,9 +42,10 @@ use super::{JobContext, JobKind, JobPhase, Progress, blocking, check, read, writ
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::model::{
-    CatchupKind, CatchupSpec, EpgSourceId, EpgSourceKind, HttpHeaders, ItemKind, Source, SourceCounts, SourceId, SourceKind,
-    SourceStatus, StreamLocator, Timestamp, Unsupported, XtreamStreamKind,
+    CatchupKind, CatchupSpec, EpgSourceId, EpgSourceKind, HttpHeaders, ItemKind, Source, SourceCounts, SourceId, SourceKind, SourceStatus,
+    StreamLocator, Timestamp, Unsupported, XtreamStreamKind,
 };
+use crate::sources::PayloadKind;
 use crate::sources::http::{DownloadOutcome, DownloadRequest, open_decompressed};
 use crate::sources::identity::{self, KeyAllocator, group_key, normalize_group, normalize_name};
 use crate::sources::m3u::{self, M3uEntry, M3uError};
@@ -52,7 +53,6 @@ use crate::sources::smart_names::{clean_channel_name, clean_group_name, clean_vo
 use crate::sources::xtream::XtreamClient;
 use crate::sources::xtream::types::{XtCategory, XtLiveStream, XtSeries, XtVodStream};
 use crate::sources::xtream::urls;
-use crate::sources::PayloadKind;
 use crate::store::import::{self, CatalogueImport, ImportChannel, ImportGroup, ImportMovie, ImportSeries, ImportSummary, KindCounts};
 
 /// Rows per writer transaction (DESIGN §5.3).
@@ -70,7 +70,13 @@ pub struct RefreshResult {
     pub epg_urls: Vec<String>,
 }
 
-pub async fn refresh_source(ctx: &JobContext, source: SourceId, force: bool, progress: &Progress, cancel: &CancellationToken) -> Result<RefreshResult> {
+pub async fn refresh_source(
+    ctx: &JobContext,
+    source: SourceId,
+    force: bool,
+    progress: &Progress,
+    cancel: &CancellationToken,
+) -> Result<RefreshResult> {
     let lock = source_lock(ctx, source);
     let _running = tokio::select! {
         biased;
@@ -111,7 +117,9 @@ fn source_lock(ctx: &JobContext, id: SourceId) -> Arc<tokio::sync::Mutex<()>> {
 }
 
 /// Smart-name cleanup for this source (its own setting, else the global one).
-fn smart_names(src: &Source, cfg: &Config) -> bool { src.settings.smart_names.unwrap_or(cfg.general.smart_names) }
+fn smart_names(src: &Source, cfg: &Config) -> bool {
+    src.settings.smart_names.unwrap_or(cfg.general.smart_names)
+}
 
 /// HTTP headers for API calls and downloads of this source.
 fn source_headers(src: &Source, cfg: &Config) -> HttpHeaders {
@@ -120,7 +128,14 @@ fn source_headers(src: &Source, cfg: &Config) -> HttpHeaders {
 }
 
 /// Successful refresh bookkeeping: `last_refresh`, counts, validators (clears `last_error`).
-async fn mark_refreshed(ctx: &JobContext, src: &Source, counts: SourceCounts, etag: Option<String>, last_modified: Option<String>, now: Timestamp) -> Result<()> {
+async fn mark_refreshed(
+    ctx: &JobContext,
+    src: &Source,
+    counts: SourceCounts,
+    etag: Option<String>,
+    last_modified: Option<String>,
+    now: Timestamp,
+) -> Result<()> {
     let status = SourceStatus {
         last_refresh: Some(now),
         last_attempt: Some(now),
@@ -194,7 +209,14 @@ impl Drop for TempFile {
     }
 }
 
-async fn refresh_m3u(ctx: &JobContext, src: &Source, force: bool, cfg: &Config, progress: &Progress, cancel: &CancellationToken) -> Result<RefreshResult> {
+async fn refresh_m3u(
+    ctx: &JobContext,
+    src: &Source,
+    force: bool,
+    cfg: &Config,
+    progress: &Progress,
+    cancel: &CancellationToken,
+) -> Result<RefreshResult> {
     let (path, base, _guard, etag, last_modified) = match src.kind {
         SourceKind::M3uFile => {
             let path = src.path.clone().ok_or_else(|| Error::Config("this playlist has no file".into()))?;
@@ -345,9 +367,7 @@ pub(super) fn m3u_error(e: M3uError) -> Error {
         M3uError::NotM3u(PayloadKind::Html) => {
             Error::BadPayload("the server returned a web page instead of a playlist — the account may have expired".into())
         }
-        M3uError::HlsMediaPlaylist => {
-            Error::BadPayload("this address is a single HLS stream, not a channel list — add it as a single stream".into())
-        }
+        M3uError::HlsMediaPlaylist => Error::BadPayload("this address is a single HLS stream, not a channel list — add it as a single stream".into()),
         M3uError::NotM3u(kind) => Error::BadPayload(format!("this is not an M3U playlist (it looks like {})", payload_name(kind))),
     }
 }
@@ -362,7 +382,9 @@ fn payload_name(kind: PayloadKind) -> &'static str {
     }
 }
 
-fn non_empty(s: Option<&str>) -> Option<String> { s.map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned) }
+fn non_empty(s: Option<&str>) -> Option<String> {
+    s.map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned)
+}
 
 /// Display name of a group (smart cleanup or trimmed raw), never empty.
 fn group_display(raw: &str, smart: bool) -> String {
@@ -397,7 +419,13 @@ pub fn m3u_entry_to_channel(
         // playlists are grouped: the newest group is the likeliest hit
         if !groups_out.iter().rev().any(|g| g.key == k) {
             let provider_order = i32::try_from(groups_out.len()).unwrap_or(i32::MAX);
-            groups_out.push(ImportGroup { kind: ItemKind::Channel, key: k.clone(), name: group_display(raw, smart), provider_id: None, provider_order });
+            groups_out.push(ImportGroup {
+                kind: ItemKind::Channel,
+                key: k.clone(),
+                name: group_display(raw, smart),
+                provider_id: None,
+                provider_order,
+            });
         }
         groups.push(k);
     }
@@ -704,13 +732,19 @@ trait HasGroups {
     fn group_keys(&self) -> &[crate::model::GroupKey];
 }
 impl HasGroups for ImportChannel {
-    fn group_keys(&self) -> &[crate::model::GroupKey] { &self.groups }
+    fn group_keys(&self) -> &[crate::model::GroupKey] {
+        &self.groups
+    }
 }
 impl HasGroups for ImportMovie {
-    fn group_keys(&self) -> &[crate::model::GroupKey] { &self.groups }
+    fn group_keys(&self) -> &[crate::model::GroupKey] {
+        &self.groups
+    }
 }
 impl HasGroups for ImportSeries {
-    fn group_keys(&self) -> &[crate::model::GroupKey] { &self.groups }
+    fn group_keys(&self) -> &[crate::model::GroupKey] {
+        &self.groups
+    }
 }
 
 /// Group keys of an item: its categories found in `cats` (by id), else "uncategorized".
@@ -730,10 +764,14 @@ fn xt_group_keys(kind: ItemKind, single: &Option<String>, many: &[String], cats:
     keys
 }
 
-fn positive(v: Option<i64>) -> Option<i64> { v.filter(|v| *v > 0) }
+fn positive(v: Option<i64>) -> Option<i64> {
+    v.filter(|v| *v > 0)
+}
 
 /// Provider name, or a stand-in so an unnamed stream stays reachable.
-fn xt_name(name: &Option<String>, fallback: impl FnOnce() -> String) -> String { non_empty(name.as_deref()).unwrap_or_else(fallback) }
+fn xt_name(name: &Option<String>, fallback: impl FnOnce() -> String) -> String {
+    non_empty(name.as_deref()).unwrap_or_else(fallback)
+}
 
 pub fn xt_live_to_channel(s: &XtLiveStream, order: i32, smart: bool, cats: &[XtCategory]) -> Option<ImportChannel> {
     let id = positive(s.stream_id)?;
@@ -777,7 +815,9 @@ fn year_of(s: Option<&str>) -> Option<u16> {
 }
 
 /// 0..10 rating; panels send 0 for "unrated".
-fn rating_of(r: Option<f64>) -> Option<f32> { r.filter(|r| r.is_finite() && *r > 0.0).map(|r| r.min(10.0) as f32) }
+fn rating_of(r: Option<f64>) -> Option<f32> {
+    r.filter(|r| r.is_finite() && *r > 0.0).map(|r| r.min(10.0) as f32)
+}
 
 pub fn xt_vod_to_movie(s: &XtVodStream, order: i32, smart: bool, cats: &[XtCategory]) -> Option<ImportMovie> {
     let id = positive(s.stream_id)?;
@@ -883,7 +923,8 @@ mod tests {
         assert_eq!(groups[0].name, "News");
         assert_eq!(groups[1].provider_order, 1);
         // the URL is not part of the key; a duplicate in the same import gets `#2`
-        let b = m3u_entry_to_channel(&entry("UK | BBC One FHD", Some("bbc1.uk"), &["UK | News"], "http://other/2.ts"), 1, false, &mut keys, &mut groups);
+        let b =
+            m3u_entry_to_channel(&entry("UK | BBC One FHD", Some("bbc1.uk"), &["UK | News"], "http://other/2.ts"), 1, false, &mut keys, &mut groups);
         assert_eq!(b.key.0, format!("{}#2", a.key.0));
         assert_eq!(b.clean_name, "UK | BBC One FHD", "smart names off keeps the raw name");
         assert_eq!(groups.len(), 2, "known groups are not repeated");
@@ -902,7 +943,9 @@ mod tests {
         assert_eq!(ch.name, "stream.ts");
     }
 
-    fn cats(json: &str) -> Vec<XtCategory> { serde_json::from_str(json).unwrap() }
+    fn cats(json: &str) -> Vec<XtCategory> {
+        serde_json::from_str(json).unwrap()
+    }
 
     #[test]
     fn xtream_categories_dedupe_by_name_key() {

@@ -27,9 +27,13 @@ pub struct HelpOverlay {
 }
 
 impl HelpOverlay {
-    pub fn new() -> Self { Self::with_contexts(Vec::new()) }
+    pub fn new() -> Self {
+        Self::with_contexts(Vec::new())
+    }
     /// Put the given contexts (current screen's stack) at the top.
-    pub fn with_contexts(contexts: Vec<KeyContext>) -> Self { Self { first: contexts, scroll: 0.0, viewport: 0.0, max_scroll: f32::INFINITY } }
+    pub fn with_contexts(contexts: Vec<KeyContext>) -> Self {
+        Self { first: contexts, scroll: 0.0, viewport: 0.0, max_scroll: f32::INFINITY }
+    }
 
     /// Every context exactly once: the current ones first (innermost first), then the rest in
     /// documentation order, `Global` last.
@@ -90,7 +94,9 @@ fn context_block(ui: &mut egui::Ui, theme: &Theme, ctx: KeyContext, rows: &[(Str
 }
 
 impl Overlay for HelpOverlay {
-    fn key_contexts(&self) -> Vec<KeyContext> { vec![KeyContext::Panel] }
+    fn key_contexts(&self) -> Vec<KeyContext> {
+        vec![KeyContext::Panel]
+    }
 
     fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> OverlayOutcome {
         let line = ctx.theme.font(TypeToken::Body) * 3.0;
@@ -129,11 +135,9 @@ impl Overlay for HelpOverlay {
             let width = ui.available_width();
             let cols = if width >= TWO_COLUMNS_FROM { 2 } else { 1 };
             let keys_w = (150.0 * theme.rem()).min(width / cols as f32 * 0.4);
-            egui::ScrollArea::vertical()
-                .max_height(screen.height() * 0.8)
-                .vertical_scroll_offset(self.scroll)
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
+            egui::ScrollArea::vertical().max_height(screen.height() * 0.8).vertical_scroll_offset(self.scroll).auto_shrink([false, true]).show(
+                ui,
+                |ui| {
                     let split = split_columns(&contexts, cols);
                     ui.columns(cols, |columns| {
                         for (col, idx) in columns.iter_mut().zip(&split) {
@@ -142,7 +146,8 @@ impl Overlay for HelpOverlay {
                             }
                         }
                     });
-                })
+                },
+            )
         });
         let out = r.inner;
         self.viewport = out.inner_rect.height();

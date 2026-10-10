@@ -80,10 +80,14 @@ impl Store {
         Ok(s)
     }
 
-    pub fn path(&self) -> &Path { &self.path }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 
     /// The single writer.
-    pub fn writer(&self) -> &Writer { &self.writer }
+    pub fn writer(&self) -> &Writer {
+        &self.writer
+    }
 
     /// Open a new read-only connection (`query_only=ON`). Each thread keeps its own.
     pub fn reader(&self) -> Result<Connection> {
@@ -93,7 +97,9 @@ impl Store {
     }
 
     /// Drain the writer and join it (see [`Writer::shutdown`]).
-    pub fn close(&self, timeout: Duration) -> bool { self.writer.shutdown(timeout) }
+    pub fn close(&self, timeout: Duration) -> bool {
+        self.writer.shutdown(timeout)
+    }
 }
 
 /// Private temp dir (0700) without the `tempfile` crate (dev-only dependency).
@@ -105,11 +111,7 @@ impl TempDir {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-        let p = std::env::temp_dir().join(format!(
-            "{prefix}-{}-{}-{nanos}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
+        let p = std::env::temp_dir().join(format!("{prefix}-{}-{}-{nanos}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
         std::fs::create_dir_all(&p).map_err(|e| Error::io(&p, e))?;
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).map_err(|e| Error::io(&p, e))?;
         Ok(Self(p))
@@ -117,7 +119,9 @@ impl TempDir {
 }
 
 impl Drop for TempDir {
-    fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 fn create_private_file(path: &Path) -> Result<()> {
@@ -125,12 +129,7 @@ fn create_private_file(path: &Path) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
     }
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| Error::io(path, e))?;
+    std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(path).map_err(|e| Error::io(path, e))?;
     // tighten pre-existing files too
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| Error::io(path, e))
 }
@@ -219,9 +218,10 @@ impl Writer {
         self.submit(move |c| {
             let r = f(c);
             if r.is_ok()
-                && let Some(b) = &bus {
-                    b.data_changed(scope);
-                }
+                && let Some(b) = &bus
+            {
+                b.data_changed(scope);
+            }
             r
         })
     }
@@ -258,7 +258,9 @@ impl Writer {
         true
     }
 
-    pub fn bus(&self) -> Option<&EventBus> { self.bus.as_ref() }
+    pub fn bus(&self) -> Option<&EventBus> {
+        self.bus.as_ref()
+    }
 }
 
 /// Completion handle of a write. Dropping it is fine (fire-and-forget).

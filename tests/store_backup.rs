@@ -15,13 +15,17 @@ use tuner::store::{Store, epg, sources, user};
 
 const NOW: Timestamp = 1_791_576_000;
 
-fn store(name: &str) -> Store { Store::open_temp(name, None).expect("temp store") }
+fn store(name: &str) -> Store {
+    Store::open_temp(name, None).expect("temp store")
+}
 
 fn w<R: Send + 'static>(s: &Store, f: impl FnOnce(&mut Connection) -> tuner::error::Result<R> + Send + 'static) -> R {
     s.writer().blocking(f).expect("writer job")
 }
 
-fn count(c: &Connection, sql: &str) -> i64 { c.query_row(sql, [], |r| r.get(0)).unwrap() }
+fn count(c: &Connection, sql: &str) -> i64 {
+    c.query_row(sql, [], |r| r.get(0)).unwrap()
+}
 
 /// Credentials unique to one test (the redaction registry is process-global).
 struct Creds {
@@ -83,8 +87,12 @@ fn movie(key: &str, name: &str) -> ImportMovie {
     }
 }
 
-fn ch(src: SourceId, key: &str) -> ItemRef { ItemRef { source: src, kind: ItemKind::Channel, key: ItemKey(key.into()) } }
-fn mv(src: SourceId, key: &str) -> ItemRef { ItemRef { source: src, kind: ItemKind::Movie, key: ItemKey(key.into()) } }
+fn ch(src: SourceId, key: &str) -> ItemRef {
+    ItemRef { source: src, kind: ItemKind::Channel, key: ItemKey(key.into()) }
+}
+fn mv(src: SourceId, key: &str) -> ItemRef {
+    ItemRef { source: src, kind: ItemKind::Movie, key: ItemKey(key.into()) }
+}
 
 /// Two sources with a small catalogue and every kind of user data.
 fn populate(s: &Store, creds: &Creds) -> Fixture {
@@ -99,7 +107,11 @@ fn populate(s: &Store, creds: &Creds) -> Fixture {
                 color: SourceColor::Magenta,
                 url: None,
                 path: None,
-                xtream: Some(XtreamCredentials { server: "http://panel.test:8080".into(), username: "viewer".into(), password: Secret::new(xt_pass) }),
+                xtream: Some(XtreamCredentials {
+                    server: "http://panel.test:8080".into(),
+                    username: "viewer".into(),
+                    password: Secret::new(xt_pass),
+                }),
                 settings: SourceSettings { refresh_h: Some(6), ..Default::default() },
             },
             NOW,
@@ -118,14 +130,30 @@ fn populate(s: &Store, creds: &Creds) -> Fixture {
             },
             NOW,
         )?;
-        let guide = sources::insert_epg_source(c, "My guide", &EpgSourceKind::Url { url: Secret::new(format!("http://epg.test/g.xml?apikey={key}")) }, -30)?;
+        let guide =
+            sources::insert_epg_source(c, "My guide", &EpgSourceKind::Url { url: Secret::new(format!("http://epg.test/g.xml?apikey={key}")) }, -30)?;
         sources::insert_epg_source(c, "Local file", &EpgSourceKind::File { path: "/tmp/guide.xml".into() }, 0)?;
 
-        for (src, chans, movies) in [(xt, vec![chan("xt:live:1", "BBC One"), chan("xt:live:2", "ITV")], vec![movie("xt:vod:7", "Heat")]), (m3u, vec![chan("m3u:aa", "Arte")], vec![])] {
+        for (src, chans, movies) in [
+            (xt, vec![chan("xt:live:1", "BBC One"), chan("xt:live:2", "ITV")], vec![movie("xt:vod:7", "Heat")]),
+            (m3u, vec![chan("m3u:aa", "Arte")], vec![]),
+        ] {
             let imp = import::begin_catalogue(c, src, NOW)?;
             let groups = [
-                ImportGroup { kind: ItemKind::Channel, key: group_key(ItemKind::Channel, "News"), name: "News".into(), provider_id: None, provider_order: 0 },
-                ImportGroup { kind: ItemKind::Movie, key: group_key(ItemKind::Movie, "Films"), name: "Films".into(), provider_id: None, provider_order: 0 },
+                ImportGroup {
+                    kind: ItemKind::Channel,
+                    key: group_key(ItemKind::Channel, "News"),
+                    name: "News".into(),
+                    provider_id: None,
+                    provider_order: 0,
+                },
+                ImportGroup {
+                    kind: ItemKind::Movie,
+                    key: group_key(ItemKind::Movie, "Films"),
+                    name: "Films".into(),
+                    provider_id: None,
+                    provider_order: 0,
+                },
             ];
             import::upsert_groups(c, &imp, &groups)?;
             import::write_channels(c, &imp, &chans)?;
@@ -352,11 +380,10 @@ fn merge_restore_matches_sources_and_keeps_newer_local_data() {
     let fx = populate(&s, &creds);
     let b = w(&s, |c| backup::export(c, FULL, None, NOW));
     let r = s.reader().unwrap();
-    let before: Vec<i64> =
-        ["fav_item", "fav_list", "item_override", "group_override", "reminder", "channel_epg_map", "source", "epg_source"]
-            .iter()
-            .map(|t| count(&r, &format!("SELECT count(*) FROM {t}")))
-            .collect();
+    let before: Vec<i64> = ["fav_item", "fav_list", "item_override", "group_override", "reminder", "channel_epg_map", "source", "epg_source"]
+        .iter()
+        .map(|t| count(&r, &format!("SELECT count(*) FROM {t}")))
+        .collect();
 
     // local progress moved on since the backup; another item has older local progress
     let (xt, m3u) = (fx.xt, fx.m3u);
@@ -385,11 +412,10 @@ fn merge_restore_matches_sources_and_keeps_newer_local_data() {
     });
     let report = w(&s, move |c| backup::restore(c, &b2, RestoreMode::Merge));
     assert_eq!((report.sources_added, report.sources_matched), (0, 2));
-    let after: Vec<i64> =
-        ["fav_item", "fav_list", "item_override", "group_override", "reminder", "channel_epg_map", "source", "epg_source"]
-            .iter()
-            .map(|t| count(&r, &format!("SELECT count(*) FROM {t}")))
-            .collect();
+    let after: Vec<i64> = ["fav_item", "fav_list", "item_override", "group_override", "reminder", "channel_epg_map", "source", "epg_source"]
+        .iter()
+        .map(|t| count(&r, &format!("SELECT count(*) FROM {t}")))
+        .collect();
     assert_eq!(after, before, "nothing duplicated; the removed favourite came back");
     let p = user::progress(&r, &mv(xt, "xt:vod:7")).unwrap().unwrap();
     assert_eq!(p.position_s, 4000.0, "newer local progress wins");

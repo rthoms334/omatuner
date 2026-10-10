@@ -14,7 +14,9 @@ fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
 }
 
-fn px(img: &egui::ColorImage, x: usize, y: usize) -> Color32 { img.pixels[y * img.size[0] + x] }
+fn px(img: &egui::ColorImage, x: usize, y: usize) -> Color32 {
+    img.pixels[y * img.size[0] + x]
+}
 
 fn fits(img: &egui::ColorImage, kind: ImageKind) -> bool {
     let (w, h) = kind.max_size();

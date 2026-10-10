@@ -39,10 +39,7 @@ pub fn text_field(ui: &mut egui::Ui, theme: &Theme, text: &mut String, placehold
         .inner;
     let hot = resp.has_focus() || resp.hovered();
     let (fill, border) = if hot { (t.fill_hover, t.border_hover) } else { (t.fill_field, t.border_field) };
-    ui.painter().set(
-        bg,
-        egui::epaint::RectShape::new(resp.rect, t.rounding, fill, egui::Stroke::new(1.0, border), egui::StrokeKind::Inside),
-    );
+    ui.painter().set(bg, egui::epaint::RectShape::new(resp.rect, t.rounding, fill, egui::Stroke::new(1.0, border), egui::StrokeKind::Inside));
     resp
 }
 
@@ -62,7 +59,15 @@ pub fn search_header(ui: &mut egui::Ui, theme: &Theme, query: &str, placeholder:
     let p = ui.painter();
     let mut x = rect.left();
     if let Some(icon) = icon {
-        let r = paint::text(p, egui::pos2(x, rect.center().y), Align2::LEFT_CENTER, icon, paint::font(theme, TypeToken::IconLarge), t.text_placeholder, f32::INFINITY);
+        let r = paint::text(
+            p,
+            egui::pos2(x, rect.center().y),
+            Align2::LEFT_CENTER,
+            icon,
+            paint::font(theme, TypeToken::IconLarge),
+            t.text_placeholder,
+            f32::INFINITY,
+        );
         x = r.right() + theme.space(SpaceToken::ControlGap);
     }
     let caret_w = 2.0;
@@ -72,13 +77,20 @@ pub fn search_header(ui: &mut egui::Ui, theme: &Theme, query: &str, placeholder:
     } else {
         // long queries keep their end (what is being typed) visible
         let g = paint::galley(p, query, font.clone(), t.fg, f32::INFINITY);
-        let g = if g.size().x > max_w { paint::galley(p, format!("…{}", tail_fitting(p, &g, query, &font, max_w)), font, t.fg, f32::INFINITY) } else { g };
+        let g = if g.size().x > max_w {
+            paint::galley(p, format!("…{}", tail_fitting(p, &g, query, &font, max_w)), font, t.fg, f32::INFINITY)
+        } else {
+            g
+        };
         let r = Align2::LEFT_CENTER.anchor_size(egui::pos2(x, rect.center().y), g.size());
         let text_right = r.right();
         p.galley(r.min, g, t.fg);
         let time = ui.input(|i| i.time);
         if (time / CARET_PERIOD_S).fract() < 0.5 {
-            let caret = egui::Rect::from_center_size(egui::pos2(text_right + theme.space(SpaceToken::Xxs) + caret_w / 2.0, rect.center().y), egui::vec2(caret_w, theme.font(TypeToken::Heading)));
+            let caret = egui::Rect::from_center_size(
+                egui::pos2(text_right + theme.space(SpaceToken::Xxs) + caret_w / 2.0, rect.center().y),
+                egui::vec2(caret_w, theme.font(TypeToken::Heading)),
+            );
             p.rect_filled(caret, 0.0, t.accent);
         }
         ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(CARET_PERIOD_S / 2.0));
@@ -87,7 +99,9 @@ pub fn search_header(ui: &mut egui::Ui, theme: &Theme, query: &str, placeholder:
 }
 
 /// "Search channels" → "Search channels…" (unless it already ends with an ellipsis).
-fn placeholder_text(p: &str) -> String { if p.ends_with('…') || p.is_empty() { p.to_owned() } else { format!("{p}…") } }
+fn placeholder_text(p: &str) -> String {
+    if p.ends_with('…') || p.is_empty() { p.to_owned() } else { format!("{p}…") }
+}
 
 /// The longest suffix of `text` (laid out as `g`) that fits in `max_w` after a leading "…".
 fn tail_fitting<'t>(painter: &egui::Painter, g: &egui::Galley, text: &'t str, font: &egui::FontId, max_w: f32) -> &'t str {

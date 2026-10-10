@@ -31,7 +31,9 @@ pub fn focus_self() {
 }
 
 /// True when running under Hyprland (`HYPRLAND_INSTANCE_SIGNATURE` set).
-pub fn is_hyprland() -> bool { std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() }
+pub fn is_hyprland() -> bool {
+    std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some()
+}
 
 fn focus_pid(pid: u32) -> Result<(), String> {
     let out = Command::new("hyprctl").args(["-j", "clients"]).output().map_err(|e| format!("hyprctl: {e}"))?;
@@ -125,15 +127,7 @@ mod tests {
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         let rules = String::from_utf8_lossy(&out.stdout);
         let lines: Vec<&str> = rules.lines().collect();
-        assert_eq!(
-            lines,
-            [
-                "^(tuner)$\t-default-opacity\t-\tnil\t-",
-                "^(tuner)$\t-\t1 1\tnil\t-",
-                "^(tuner)$\t-\t-\ttrue\t-",
-            ],
-            "{rules}"
-        );
+        assert_eq!(lines, ["^(tuner)$\t-default-opacity\t-\tnil\t-", "^(tuner)$\t-\t1 1\tnil\t-", "^(tuner)$\t-\t-\ttrue\t-",], "{rules}");
         assert!(regex::Regex::new("^(tuner)$").unwrap().is_match(crate::APP_ID));
     }
 

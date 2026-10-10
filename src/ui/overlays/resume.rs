@@ -33,10 +33,14 @@ pub struct ResumeOverlay {
 }
 
 impl ResumeOverlay {
-    pub fn new(spec: ResumeSpec) -> Self { Self { spec, resume_focused: true, started: None } }
+    pub fn new(spec: ResumeSpec) -> Self {
+        Self { spec, resume_focused: true, started: None }
+    }
 
     /// The up-next card (no position to resume from).
-    fn up_next(&self) -> bool { self.spec.position_s <= 0.0 }
+    fn up_next(&self) -> bool {
+        self.spec.position_s <= 0.0
+    }
 
     fn start(&self, ctx: &mut UiCtx<'_>, resume: bool) -> OverlayOutcome {
         let req = PlayRequest { media: self.spec.media.clone(), zap: None, origin: PlayOrigin::Fullscreen, resume, immediate: true };
@@ -54,11 +58,15 @@ impl ResumeOverlay {
         self.start(ctx, self.resume_focused)
     }
 
-    fn remaining(&self) -> Duration { self.started.map_or(UP_NEXT, |s| UP_NEXT.saturating_sub(s.elapsed())) }
+    fn remaining(&self) -> Duration {
+        self.started.map_or(UP_NEXT, |s| UP_NEXT.saturating_sub(s.elapsed()))
+    }
 }
 
 impl Overlay for ResumeOverlay {
-    fn key_contexts(&self) -> Vec<KeyContext> { vec![KeyContext::Modal] }
+    fn key_contexts(&self) -> Vec<KeyContext> {
+        vec![KeyContext::Modal]
+    }
 
     fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> OverlayOutcome {
         match action {
@@ -92,7 +100,12 @@ impl Overlay for ResumeOverlay {
             (format!("Next episode in {secs} s"), self.spec.title.clone(), "Play now".to_owned(), "Cancel".to_owned())
         } else {
             let of = self.spec.duration_s.filter(|d| *d > 0.0).map(|d| format!(" of {}", clock(d))).unwrap_or_default();
-            (self.spec.title.clone(), format!("Stopped at {}{of}", clock(self.spec.position_s)), format!("Resume from {}", clock(self.spec.position_s)), "Start over".to_owned())
+            (
+                self.spec.title.clone(),
+                format!("Stopped at {}{of}", clock(self.spec.position_s)),
+                format!("Resume from {}", clock(self.spec.position_s)),
+                "Start over".to_owned(),
+            )
         };
         let (a, b) = card_area(egui_ctx, theme, "resume", CardKind::Popup, 420.0 * theme.rem(), None, |ui| {
             ui.label(RichText::new(&title).size(theme.font(TypeToken::Heading)).color(t.fg));
@@ -106,9 +119,18 @@ impl Overlay for ResumeOverlay {
             ui.add_space(theme.space(SpaceToken::Lg));
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = theme.space(SpaceToken::Lg);
-                let a = button(ui, theme, Some(glyphs::PLAY), &primary, ButtonStyle { primary: true, focused: self.resume_focused, ..Default::default() }).clicked();
+                let a = button(
+                    ui,
+                    theme,
+                    Some(glyphs::PLAY),
+                    &primary,
+                    ButtonStyle { primary: true, focused: self.resume_focused, ..Default::default() },
+                )
+                .clicked();
                 let icon = if up_next { glyphs::CLOSE } else { glyphs::SKIP_BACK };
-                let b = button(ui, theme, Some(icon), &secondary, ButtonStyle { bordered: true, focused: !self.resume_focused, ..Default::default() }).clicked();
+                let b =
+                    button(ui, theme, Some(icon), &secondary, ButtonStyle { bordered: true, focused: !self.resume_focused, ..Default::default() })
+                        .clicked();
                 (a, b)
             })
             .inner
@@ -128,14 +150,18 @@ impl Overlay for ResumeOverlay {
 }
 
 /// "41:20" / "1:02:13".
-fn clock(seconds: f64) -> String { crate::ui::screens::home::kit::clock(seconds) }
+fn clock(seconds: f64) -> String {
+    crate::ui::screens::home::kit::clock(seconds)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::MediaRef;
 
-    fn spec(pos: f64) -> ResumeSpec { ResumeSpec { media: MediaRef::Url("x".into()), title: "T".into(), position_s: pos, duration_s: Some(100.0) } }
+    fn spec(pos: f64) -> ResumeSpec {
+        ResumeSpec { media: MediaRef::Url("x".into()), title: "T".into(), position_s: pos, duration_s: Some(100.0) }
+    }
 
     use crate::ui::NavRequest;
     use crate::ui::screens::home::testkit::{has_label, overlay_harness, rig};

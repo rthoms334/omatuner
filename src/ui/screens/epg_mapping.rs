@@ -47,7 +47,9 @@ enum Mode {
 
 impl Mode {
     const ALL: [(Mode, &'static str); 3] = [(Mode::Unmapped, "Unmapped"), (Mode::Suggested, "Has suggestions"), (Mode::All, "All channels")];
-    fn label(self) -> &'static str { Self::ALL.iter().find(|(m, _)| *m == self).map(|(_, l)| *l).unwrap_or("All") }
+    fn label(self) -> &'static str {
+        Self::ALL.iter().find(|(m, _)| *m == self).map(|(_, l)| *l).unwrap_or("All")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -134,7 +136,9 @@ pub struct EpgMappingScreen {
 }
 
 impl EpgMappingScreen {
-    fn highlighted(&self) -> Option<ChannelId> { self.chan_rows.get(self.channels.cursor).copied() }
+    fn highlighted(&self) -> Option<ChannelId> {
+        self.chan_rows.get(self.channels.cursor).copied()
+    }
 
     /// What the channel rows depend on (new suggestions matter only for "Has suggestions").
     fn rows_key(&self, ctx: &UiCtx<'_>) -> (Mode, Timestamp, usize) {
@@ -168,7 +172,9 @@ impl EpgMappingScreen {
             .collect();
         let hay: Vec<String> = ids
             .iter()
-            .map(|id| ctx.lib.live.get(*id).map(|c| format!("{} {}", c.number.map(|n| n.to_string()).unwrap_or_default(), c.name)).unwrap_or_default())
+            .map(|id| {
+                ctx.lib.live.get(*id).map(|c| format!("{} {}", c.number.map(|n| n.to_string()).unwrap_or_default(), c.name)).unwrap_or_default()
+            })
             .collect();
         self.chan_rows = self.channels.filter.apply(hay.iter().map(String::as_str)).into_iter().map(|i| ids[i as usize]).collect();
         self.channels.set_len(self.chan_rows.len());
@@ -207,7 +213,8 @@ impl EpgMappingScreen {
                 None => return,
             },
         };
-        let _ = ctx.services.store.writer().submit_notify(DataScope::Epg, move |c| crate::store::epg::set_manual_mapping(c, &item, source, &xmltv_id));
+        let _ =
+            ctx.services.store.writer().submit_notify(DataScope::Epg, move |c| crate::store::epg::set_manual_mapping(c, &item, source, &xmltv_id));
         let channel = ctx.lib.live.get(ch).map(|c| c.name.to_string()).unwrap_or_default();
         ctx.toast(crate::msg::Toast::info(format!("{channel} now uses the guide of {name}")));
         self.mappings = None;
@@ -235,10 +242,22 @@ impl EpgMappingScreen {
         let mut items: Vec<MenuItem> = Mode::ALL
             .iter()
             .enumerate()
-            .map(|(i, (m, l))| MenuItem { icon: if *m == self.mode { glyphs::CHECK } else { "" }, label: (*l).into(), action: Action::Digit(i as u8), enabled: true, shortcut: None })
+            .map(|(i, (m, l))| MenuItem {
+                icon: if *m == self.mode { glyphs::CHECK } else { "" },
+                label: (*l).into(),
+                action: Action::Digit(i as u8),
+                enabled: true,
+                shortcut: None,
+            })
             .collect();
         // the way to a guide that lists more channels, by keyboard
-        items.push(MenuItem { icon: glyphs::SETTINGS, label: "Guide settings…".into(), action: Action::Digit(MENU_GUIDE_SETTINGS), enabled: true, shortcut: None });
+        items.push(MenuItem {
+            icon: glyphs::SETTINGS,
+            label: "Guide settings…".into(),
+            action: Action::Digit(MENU_GUIDE_SETTINGS),
+            enabled: true,
+            shortcut: None,
+        });
         ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: "Show channels".into(), items }));
     }
 
@@ -246,8 +265,9 @@ impl EpgMappingScreen {
     /// channels as the playlists (mapping can't cover the rest).
     fn few_note(&self, ctx: &UiCtx<'_>) -> Option<String> {
         let n = self.catalog.as_ref()?.entries.len();
-        (n * 2 < ctx.lib.live.channels.len())
-            .then(|| format!("Your guides list {} channel{}. Add one that lists yours in Settings ▸ EPG.", rows::grouped(n), if n == 1 { "" } else { "s" }))
+        (n * 2 < ctx.lib.live.channels.len()).then(|| {
+            format!("Your guides list {} channel{}. Add one that lists yours in Settings ▸ EPG.", rows::grouped(n), if n == 1 { "" } else { "s" })
+        })
     }
 
     /// Start a suggestion batch for visible channels without cached suggestions.
@@ -272,7 +292,9 @@ impl EpgMappingScreen {
             .iter()
             .chain(self.highlighted().iter())
             .filter(|id| !self.suggestions.contains_key(id))
-            .filter_map(|id| ctx.lib.live.get(*id).filter(|c| c.epg_channel_id.is_none() || self.mode == Mode::All).map(|c| (*id, c.name.to_string())))
+            .filter_map(|id| {
+                ctx.lib.live.get(*id).filter(|c| c.epg_channel_id.is_none() || self.mode == Mode::All).map(|c| (*id, c.name.to_string()))
+            })
             .collect::<HashSet<_>>()
             .into_iter()
             .take(BATCH)
@@ -326,7 +348,9 @@ fn method_label(m: EpgMatchMethod) -> &'static str {
 }
 
 impl Screen for EpgMappingScreen {
-    fn id(&self) -> ScreenId { ScreenId::EpgMapping }
+    fn id(&self) -> ScreenId {
+        ScreenId::EpgMapping
+    }
 
     fn key_contexts(&self) -> Vec<KeyContext> {
         let list = match self.pane {
@@ -404,7 +428,17 @@ impl Screen for EpgMappingScreen {
                     true
                 }
                 ListOutcome::Parent => false,
-                ListOutcome::None => matches!(action, Action::Up | Action::Down | Action::PageUp | Action::PageDown | Action::Home | Action::End | Action::FilterInput(_) | Action::Activate),
+                ListOutcome::None => matches!(
+                    action,
+                    Action::Up
+                        | Action::Down
+                        | Action::PageUp
+                        | Action::PageDown
+                        | Action::Home
+                        | Action::End
+                        | Action::FilterInput(_)
+                        | Action::Activate
+                ),
             },
             // no candidate to pick: Enter is the empty state's "Open EPG settings"
             Pane::Candidates if action == Action::Activate && self.catalog.is_some() && self.cand_rows.is_empty() => {
@@ -425,7 +459,17 @@ impl Screen for EpgMappingScreen {
                     true
                 }
                 ListOutcome::Moved | ListOutcome::ContextMenu(_) => true,
-                ListOutcome::None => matches!(action, Action::Up | Action::Down | Action::PageUp | Action::PageDown | Action::Home | Action::End | Action::FilterInput(_) | Action::Activate),
+                ListOutcome::None => matches!(
+                    action,
+                    Action::Up
+                        | Action::Down
+                        | Action::PageUp
+                        | Action::PageDown
+                        | Action::Home
+                        | Action::End
+                        | Action::FilterInput(_)
+                        | Action::Activate
+                ),
             },
         }
     }
@@ -464,8 +508,15 @@ impl Screen for EpgMappingScreen {
             return;
         }
         if self.catalog.as_ref().is_some_and(|c| c.entries.is_empty()) {
-            if empty_state::empty_state(ui, theme, glyphs::GUIDE, "No guide data", Some("Add an XMLTV guide in Settings ▸ EPG, then map channels here."), Some("Open EPG settings"))
-                .is_some_and(|r| r.clicked())
+            if empty_state::empty_state(
+                ui,
+                theme,
+                glyphs::GUIDE,
+                "No guide data",
+                Some("Add an XMLTV guide in Settings ▸ EPG, then map channels here."),
+                Some("Open EPG settings"),
+            )
+            .is_some_and(|r| r.clicked())
             {
                 ctx.push(Route::Settings(crate::ui::SettingsPage::Epg));
             }
@@ -498,17 +549,24 @@ impl Screen for EpgMappingScreen {
                     let id = chan_rows[rc.index];
                     visible.push(id);
                     let c = ctx.lib.live.get(id);
-                    let label = c.map(|c| match c.number {
-                        Some(n) => format!("{n}  {}", c.name),
-                        None => c.name.to_string(),
-                    }).unwrap_or_default();
+                    let label = c
+                        .map(|c| match c.number {
+                            Some(n) => format!("{n}  {}", c.name),
+                            None => c.name.to_string(),
+                        })
+                        .unwrap_or_default();
                     let (icon, detail) = match c.and_then(|c| c.epg_channel_id) {
                         Some(e) => {
-                            let name = catalog.as_ref().and_then(|cat| cat.by_id.get(&e).map(|i| cat.entries[*i].name.clone())).unwrap_or_else(|| "a guide channel".into());
+                            let name = catalog
+                                .as_ref()
+                                .and_then(|cat| cat.by_id.get(&e).map(|i| cat.entries[*i].name.clone()))
+                                .unwrap_or_else(|| "a guide channel".into());
                             (glyphs::CHECK, format!("Guide: {name}"))
                         }
                         None => match suggestions.get(&id) {
-                            Some(s) if !s.is_empty() => (glyphs::WARNING, format!("No guide data · {} suggestion{}", s.len(), if s.len() == 1 { "" } else { "s" })),
+                            Some(s) if !s.is_empty() => {
+                                (glyphs::WARNING, format!("No guide data · {} suggestion{}", s.len(), if s.len() == 1 { "" } else { "s" }))
+                            }
                             _ => (glyphs::WARNING, "No guide data".to_owned()),
                         },
                     };
@@ -543,10 +601,18 @@ impl Screen for EpgMappingScreen {
                             .map(|e| format!("{} ({})", e.name, e.source_name))
                             .unwrap_or_else(|| best.xmltv_id.clone());
                         let extra = if best.method == EpgMatchMethod::Manual { " · Delete clears it" } else { "" };
-                        ui_r.label(RichText::new(format!("Matched {name} by {}{extra}", method_label(best.method))).size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
+                        ui_r.label(
+                            RichText::new(format!("Matched {name} by {}{extra}", method_label(best.method)))
+                                .size(theme.font(TypeToken::BodySmall))
+                                .color(t.text_secondary),
+                        );
                     }
                     None => {
-                        ui_r.label(RichText::new("Not matched — pick a guide channel below (Enter assigns)").size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
+                        ui_r.label(
+                            RichText::new("Not matched — pick a guide channel below (Enter assigns)")
+                                .size(theme.font(TypeToken::BodySmall))
+                                .color(t.text_secondary),
+                        );
                     }
                 },
                 _ => {
@@ -568,7 +634,9 @@ impl Screen for EpgMappingScreen {
                 }
             } else if self.cand_rows.is_empty() {
                 let detail = few.as_deref().unwrap_or("Search for another name, or add a guide that lists this channel in Settings ▸ EPG.");
-                if empty_state::empty_state(&mut ui_r, theme, glyphs::SEARCH, "No matching guide channels", Some(detail), Some("Open EPG settings")).is_some_and(|r| r.clicked()) {
+                if empty_state::empty_state(&mut ui_r, theme, glyphs::SEARCH, "No matching guide channels", Some(detail), Some("Open EPG settings"))
+                    .is_some_and(|r| r.clicked())
+                {
                     ctx.push(Route::Settings(crate::ui::SettingsPage::Epg));
                 }
             } else {
@@ -578,12 +646,24 @@ impl Screen for EpgMappingScreen {
                     let state = if focused { rc.state } else { RowState::Idle };
                     match &cand_rows[rc.index] {
                         Cand::Suggestion(s) => {
-                            let src = catalog.as_ref().and_then(|c| c.entries.iter().find(|e| e.id == s.epg_channel_id)).map(|e| e.source_name.clone()).unwrap_or_default();
+                            let src = catalog
+                                .as_ref()
+                                .and_then(|c| c.entries.iter().find(|e| e.id == s.epg_channel_id))
+                                .map(|e| e.source_name.clone())
+                                .unwrap_or_default();
                             let detail = format!("Suggested · {:.0} % · {} · {src}", s.score * 100.0, s.xmltv_id);
                             rows::menu_row(ui, theme, Some(glyphs::TAG), &s.display_name, Some(&detail), false, state)
                         }
                         Cand::Entry(i) => match catalog.as_ref().and_then(|c| c.entries.get(*i)) {
-                            Some(e) => rows::menu_row(ui, theme, Some(glyphs::GUIDE), &e.name, Some(&format!("{} · {}", e.xmltv_id, e.source_name)), false, state),
+                            Some(e) => rows::menu_row(
+                                ui,
+                                theme,
+                                Some(glyphs::GUIDE),
+                                &e.name,
+                                Some(&format!("{} · {}", e.xmltv_id, e.source_name)),
+                                false,
+                                state,
+                            ),
                             None => ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), egui::Sense::hover()).1,
                         },
                     }
@@ -614,7 +694,11 @@ mod tests {
 
     fn manual(t: &crate::ui::testing::TestUi, i: usize) -> Vec<EpgMapping> {
         let item = ItemRef { source: SourceId(1), kind: ItemKind::Channel, key: ItemKey(format!("m3u:seed{i:011}")) };
-        crate::store::epg::mappings_for_channel(&t.services().store.reader().unwrap(), &item).unwrap().into_iter().filter(|m| m.method == EpgMatchMethod::Manual).collect()
+        crate::store::epg::mappings_for_channel(&t.services().store.reader().unwrap(), &item)
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.method == EpgMatchMethod::Manual)
+            .collect()
     }
 
     #[test]
@@ -666,8 +750,20 @@ mod tests {
     #[test]
     fn suggestions_merge_guides_best_first() {
         let chans = vec![
-            EpgChannel { id: EpgChannelId(1), epg_source_id: EpgSourceId(1), xmltv_id: "bbc1.uk".into(), display_names: vec!["BBC One".into()], icon: None },
-            EpgChannel { id: EpgChannelId(2), epg_source_id: EpgSourceId(1), xmltv_id: "bbc2.uk".into(), display_names: vec!["BBC Two".into()], icon: None },
+            EpgChannel {
+                id: EpgChannelId(1),
+                epg_source_id: EpgSourceId(1),
+                xmltv_id: "bbc1.uk".into(),
+                display_names: vec!["BBC One".into()],
+                icon: None,
+            },
+            EpgChannel {
+                id: EpgChannelId(2),
+                epg_source_id: EpgSourceId(1),
+                xmltv_id: "bbc2.uk".into(),
+                display_names: vec!["BBC Two".into()],
+                icon: None,
+            },
         ];
         let cat = Catalog { entries: vec![], hay: vec![], by_id: HashMap::new(), indexes: vec![build_index(EpgSourceId(1), &chans)] };
         let r = compute_suggestions(&cat, vec![(ChannelId(7), "BBC One HD".into())], 0.8);

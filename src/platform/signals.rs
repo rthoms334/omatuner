@@ -51,8 +51,13 @@ pub fn forward() -> std::io::Result<(mpsc::UnboundedReceiver<&'static str>, toki
 
 /// The policy above. `closing` is set when the app's own shutdown has begun; `emergency`
 /// performs the direct exit (or, in tests, records that it would).
-pub async fn quit_on_signals<F, Fut>(mut signals: mpsc::UnboundedReceiver<&'static str>, bus: EventBus, closing: Arc<AtomicBool>, grace: Duration, emergency: F)
-where
+pub async fn quit_on_signals<F, Fut>(
+    mut signals: mpsc::UnboundedReceiver<&'static str>,
+    bus: EventBus,
+    closing: Arc<AtomicBool>,
+    grace: Duration,
+    emergency: F,
+) where
     F: FnOnce() -> Fut,
     Fut: Future<Output = ()>,
 {
@@ -97,7 +102,14 @@ mod tests {
         let closing = Arc::new(AtomicBool::new(false));
         let fired = Arc::new(AtomicBool::new(false));
         let f = fired.clone();
-        let task = tokio::spawn(quit_on_signals(rx, bus, closing.clone(), Duration::from_millis(100), move || async move { f.store(true, Ordering::SeqCst) }));
+        let task =
+            tokio::spawn(quit_on_signals(
+                rx,
+                bus,
+                closing.clone(),
+                Duration::from_millis(100),
+                move || async move { f.store(true, Ordering::SeqCst) },
+            ));
         tx.send("SIGTERM").unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert_eq!(quits(&events), 1);
@@ -115,7 +127,8 @@ mod tests {
         let (tx, rx, bus, events) = rig();
         let fired = Arc::new(AtomicBool::new(false));
         let f = fired.clone();
-        let task = tokio::spawn(quit_on_signals(rx, bus, Arc::default(), Duration::from_millis(50), move || async move { f.store(true, Ordering::SeqCst) }));
+        let task =
+            tokio::spawn(quit_on_signals(rx, bus, Arc::default(), Duration::from_millis(50), move || async move { f.store(true, Ordering::SeqCst) }));
         tx.send("SIGINT").unwrap();
         task.await.unwrap();
         assert_eq!(quits(&events), 1);
@@ -127,7 +140,8 @@ mod tests {
         let (tx, rx, bus, _events) = rig();
         let fired = Arc::new(AtomicBool::new(false));
         let f = fired.clone();
-        let task = tokio::spawn(quit_on_signals(rx, bus, Arc::default(), Duration::from_secs(60), move || async move { f.store(true, Ordering::SeqCst) }));
+        let task =
+            tokio::spawn(quit_on_signals(rx, bus, Arc::default(), Duration::from_secs(60), move || async move { f.store(true, Ordering::SeqCst) }));
         tx.send("SIGTERM").unwrap();
         tx.send("SIGTERM").unwrap();
         tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();

@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::model::{
-    EpgSourceId, EpgSourceKind, FavListId, FavouriteEntry, FavouriteList, GroupOverrideRow, HistoryEntry, ItemOverrideRow, ItemRef,
-    Reminder, SourceColor, SourceId, SourceKind, SourceSettings, Timestamp, WatchProgress,
+    EpgSourceId, EpgSourceKind, FavListId, FavouriteEntry, FavouriteList, GroupOverrideRow, HistoryEntry, ItemOverrideRow, ItemRef, Reminder,
+    SourceColor, SourceId, SourceKind, SourceSettings, Timestamp, WatchProgress,
 };
 use crate::store::sql::{self, enum_str};
 use crate::store::user;
@@ -112,8 +112,7 @@ pub struct RestoreReport {
 /// query value of every source URL is registered, so harmless parts (`?country=uk`) would be
 /// lost from the backup for good.
 fn strip_credentials(url: &str) -> String {
-    static USERINFO: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?i)^([a-z][a-z0-9+.-]*://)([^/@\s:]+)(:[^/@\s]*)?@").expect("valid regex"));
+    static USERINFO: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^([a-z][a-z0-9+.-]*://)([^/@\s:]+)(:[^/@\s]*)?@").expect("valid regex"));
     // same credential keys as the log redaction (DESIGN §20)
     static QUERY_CRED: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?i)([?&;](?:username|user|password|pass|pwd|token|auth|key|sig|signature|apikey|api_key|access_token)=)([^&#\s]*)")
@@ -127,7 +126,9 @@ fn strip_credentials(url: &str) -> String {
 }
 
 /// A URL that went through [`strip_credentials`] and lost something.
-fn is_stripped(url: &str) -> bool { url.contains("***") }
+fn is_stripped(url: &str) -> bool {
+    url.contains("***")
+}
 
 pub fn export(conn: &Connection, opts: BackupOptions, config_toml: Option<String>, now: Timestamp) -> Result<Backup> {
     let creds = opts.include_credentials;
@@ -173,8 +174,10 @@ pub fn export(conn: &Connection, opts: BackupOptions, config_toml: Option<String
             "SELECT m.source_id, m.channel_key, es.name, m.xmltv_id FROM channel_epg_map m JOIN epg_source es ON es.id = m.epg_source_id
              WHERE m.method = 'manual' ORDER BY m.source_id, m.channel_key",
         )?;
-        stmt.query_map([], |r| Ok(BackupManualMapping { source_id: r.get(0)?, channel_key: r.get(1)?, epg_source_name: r.get(2)?, xmltv_id: r.get(3)? }))?
-            .collect::<rusqlite::Result<_>>()?
+        stmt.query_map([], |r| {
+            Ok(BackupManualMapping { source_id: r.get(0)?, channel_key: r.get(1)?, epg_source_name: r.get(2)?, xmltv_id: r.get(3)? })
+        })?
+        .collect::<rusqlite::Result<_>>()?
     };
     Ok(Backup {
         format: FORMAT.into(),
@@ -328,8 +331,7 @@ pub fn restore(conn: &mut Connection, b: &Backup, mode: RestoreMode) -> Result<R
             params![e.name, e.kind, e.url, e.path, e.priority, e.offset_min, e.enabled && !stripped],
         )?;
     }
-    let epg_by_name: HashMap<String, EpgSourceId> =
-        crate::store::sources::list_epg_sources(&tx)?.into_iter().rev().map(|e| (e.name, e.id)).collect();
+    let epg_by_name: HashMap<String, EpgSourceId> = crate::store::sources::list_epg_sources(&tx)?.into_iter().rev().map(|e| (e.name, e.id)).collect();
 
     // ---- favourite lists
     let local_lists = user::fav_lists(&tx)?;
@@ -369,7 +371,16 @@ pub fn restore(conn: &mut Connection, b: &Backup, mode: RestoreMode) -> Result<R
         rows += tx.execute(
             "INSERT INTO fav_item(list_id, source_id, kind, item_key, position, added_at, fp, orphaned_since)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(list_id, source_id, kind, item_key) DO NOTHING",
-            params![list, item.source, item.kind.as_str(), item.key.as_str(), offset + i64::from(e.position), e.added_at, sql::fp_to_json(&e.fingerprint), e.orphaned_since],
+            params![
+                list,
+                item.source,
+                item.kind.as_str(),
+                item.key.as_str(),
+                offset + i64::from(e.position),
+                e.added_at,
+                sql::fp_to_json(&e.fingerprint),
+                e.orphaned_since
+            ],
         )?;
     }
 
@@ -411,7 +422,17 @@ pub fn restore(conn: &mut Connection, b: &Backup, mode: RestoreMode) -> Result<R
              ON CONFLICT(source_id, kind, item_key) DO UPDATE SET position_s = excluded.position_s, duration_s = excluded.duration_s,
                finished = excluded.finished, updated_at = excluded.updated_at, title = excluded.title, fp = excluded.fp
              WHERE excluded.updated_at > watch_progress.updated_at",
-            params![item.source, item.kind.as_str(), item.key.as_str(), p.position_s, p.duration_s, p.finished, p.updated_at, p.title, sql::fp_to_json(&p.fingerprint)],
+            params![
+                item.source,
+                item.kind.as_str(),
+                item.key.as_str(),
+                p.position_s,
+                p.duration_s,
+                p.finished,
+                p.updated_at,
+                p.title,
+                sql::fp_to_json(&p.fingerprint)
+            ],
         )?;
     }
     for h in b.history.iter().rev() {

@@ -145,7 +145,9 @@ pub(crate) struct LenientList<T> {
 }
 
 impl<T> LenientList<T> {
-    fn empty() -> Self { Self { items: vec![], is_list: false, user_info: None } }
+    fn empty() -> Self {
+        Self { items: vec![], is_list: false, user_info: None }
+    }
 }
 
 impl<'de, T: serde::de::DeserializeOwned> Deserialize<'de> for LenientList<T> {
@@ -155,7 +157,9 @@ impl<'de, T: serde::de::DeserializeOwned> Deserialize<'de> for LenientList<T> {
         impl<'de, T: serde::de::DeserializeOwned> serde::de::Visitor<'de> for V<T> {
             type Value = LenientList<T>;
 
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("a list") }
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a list")
+            }
 
             fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
                 let mut out = LenientList { is_list: true, ..LenientList::empty() };
@@ -189,13 +193,27 @@ impl<'de, T: serde::de::DeserializeOwned> Deserialize<'de> for LenientList<T> {
                 Ok(out)
             }
 
-            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> { Ok(LenientList::empty()) }
-            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> { Ok(LenientList::empty()) }
-            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> { Ok(LenientList::empty()) }
-            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> { Ok(LenientList::empty()) }
-            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> { Ok(LenientList::empty()) }
-            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> { Ok(LenientList::empty()) }
-            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> { Ok(LenientList::empty()) }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(LenientList::empty())
+            }
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(LenientList::empty())
+            }
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(LenientList::empty())
+            }
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(LenientList::empty())
+            }
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(LenientList::empty())
+            }
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(LenientList::empty())
+            }
+            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(LenientList::empty())
+            }
         }
 
         d.deserialize_any(V(std::marker::PhantomData))
@@ -564,10 +582,9 @@ mod tests {
 
     #[test]
     fn episodes_object_array_flat_keyed_and_empty() {
-        let info: XtSeriesInfo = serde_json::from_str(
-            r#"{"episodes":{"1":[{"id":"1","season":"1"},{"id":2}],"2":[{"id":"3"}],"3":[],"x":[{"id":"9","season":4}]}}"#,
-        )
-        .unwrap();
+        let info: XtSeriesInfo =
+            serde_json::from_str(r#"{"episodes":{"1":[{"id":"1","season":"1"},{"id":2}],"2":[{"id":"3"}],"3":[],"x":[{"id":"9","season":4}]}}"#)
+                .unwrap();
         assert_eq!(info.episodes.keys().copied().collect::<Vec<_>>(), vec![1, 2, 4]);
         assert_eq!(info.episodes[&1].len(), 2);
         assert_eq!(info.episodes[&1][1].id.as_deref(), Some("2"));

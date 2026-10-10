@@ -53,7 +53,9 @@ pub struct TestUi {
 
 impl TestUi {
     /// Fresh profile with default config (+ headless mpv options).
-    pub fn new() -> Result<Self> { Self::with_config(Config::default()) }
+    pub fn new() -> Result<Self> {
+        Self::with_config(Config::default())
+    }
 
     pub fn with_config(mut config: Config) -> Result<Self> {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -95,7 +97,9 @@ impl TestUi {
         })
     }
 
-    pub fn services(&self) -> &Services { self.services.as_ref().expect("services alive") }
+    pub fn services(&self) -> &Services {
+        self.services.as_ref().expect("services alive")
+    }
 
     /// Replace the library snapshot (and the app-owned favourites, like the app does on swap).
     pub fn set_library(&mut self, lib: Library) {
@@ -104,7 +108,9 @@ impl TestUi {
     }
 
     /// Refresh `snapshot` from the player (after sending commands).
-    pub fn refresh_snapshot(&mut self) { self.snapshot = self.services().player.handle().snapshot(); }
+    pub fn refresh_snapshot(&mut self) {
+        self.snapshot = self.services().player.handle().snapshot();
+    }
 
     /// Run `f` with a `UiCtx` over the owned parts.
     pub fn with_ctx<R>(&mut self, f: impl FnOnce(&mut UiCtx<'_>) -> R) -> R {

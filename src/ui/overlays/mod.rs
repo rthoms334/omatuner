@@ -53,8 +53,14 @@ pub struct ConfirmSpec {
 #[derive(Debug, Clone, PartialEq)]
 pub enum RenameTarget {
     /// The store computes the fingerprint inside the write.
-    Item { item: ItemRef },
-    Group { source: SourceId, kind: ItemKind, key: GroupKey },
+    Item {
+        item: ItemRef,
+    },
+    Group {
+        source: SourceId,
+        kind: ItemKind,
+        key: GroupKey,
+    },
     FavList(FavListId),
     Source(SourceId),
 }

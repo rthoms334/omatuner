@@ -43,36 +43,24 @@ fn run(spec: &DialogSpec) -> Option<std::path::PathBuf> {
 }
 
 /// Local date `YYYY-MM-DD` for default export names.
-fn today() -> String { jiff::Zoned::now().strftime("%Y-%m-%d").to_string() }
+fn today() -> String {
+    jiff::Zoned::now().strftime("%Y-%m-%d").to_string()
+}
 
 fn spec(purpose: PickPurpose, date: &str) -> DialogSpec {
     const ALL: (&str, &[&str]) = ("All files", &["*"]);
     match purpose {
-        PickPurpose::OpenPlaylist => DialogSpec {
-            title: "Open playlist",
-            filters: vec![("M3U playlists", &["m3u", "m3u8"]), ALL],
-            save_as: None,
-        },
-        PickPurpose::OpenEpg => DialogSpec {
-            title: "Open TV guide (XMLTV)",
-            filters: vec![("XMLTV guides", &["xml", "gz", "xz"]), ALL],
-            save_as: None,
-        },
-        PickPurpose::ImportBackup => DialogSpec {
-            title: "Restore Tuner backup",
-            filters: vec![("Tuner backups", &["json"]), ALL],
-            save_as: None,
-        },
-        PickPurpose::ExportBackup => DialogSpec {
-            title: "Save Tuner backup",
-            filters: vec![("Tuner backups", &["json"])],
-            save_as: Some(format!("tuner-backup-{date}.json")),
-        },
-        PickPurpose::ExportLog => DialogSpec {
-            title: "Save log",
-            filters: vec![("Text files", &["txt", "log"])],
-            save_as: Some(format!("tuner-log-{date}.txt")),
-        },
+        PickPurpose::OpenPlaylist => DialogSpec { title: "Open playlist", filters: vec![("M3U playlists", &["m3u", "m3u8"]), ALL], save_as: None },
+        PickPurpose::OpenEpg => {
+            DialogSpec { title: "Open TV guide (XMLTV)", filters: vec![("XMLTV guides", &["xml", "gz", "xz"]), ALL], save_as: None }
+        }
+        PickPurpose::ImportBackup => DialogSpec { title: "Restore Tuner backup", filters: vec![("Tuner backups", &["json"]), ALL], save_as: None },
+        PickPurpose::ExportBackup => {
+            DialogSpec { title: "Save Tuner backup", filters: vec![("Tuner backups", &["json"])], save_as: Some(format!("tuner-backup-{date}.json")) }
+        }
+        PickPurpose::ExportLog => {
+            DialogSpec { title: "Save log", filters: vec![("Text files", &["txt", "log"])], save_as: Some(format!("tuner-log-{date}.txt")) }
+        }
     }
 }
 

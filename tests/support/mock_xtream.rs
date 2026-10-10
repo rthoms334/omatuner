@@ -124,7 +124,9 @@ pub async fn start(opts: MockOptions) -> MockXtream {
 
 impl MockXtream {
     /// Snapshot of the recorded requests (`/path?query`).
-    pub fn recorded(&self) -> Vec<String> { self.requests.lock().unwrap().clone() }
+    pub fn recorded(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
 
     /// Credentials for this panel (any non-empty pair works; `username` picks login quirks).
     pub fn creds(&self, username: &str, password: &str) -> tuner::model::XtreamCredentials {
@@ -141,7 +143,9 @@ fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|e| panic!("mock xtream fixture {}: {e}", path.display()))
 }
 
-fn json(body: Vec<u8>) -> Response { ([(header::CONTENT_TYPE, "application/json")], body).into_response() }
+fn json(body: Vec<u8>) -> Response {
+    ([(header::CONTENT_TYPE, "application/json")], body).into_response()
+}
 
 fn html() -> Response {
     ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], fixture("xtream/html_200_error.html")).into_response()
@@ -212,8 +216,7 @@ fn player_api<'a>(st: &State, user: &str, param: &impl Fn(&str) -> Option<&'a st
         "get_live_streams" => match param("category_id") {
             Some(cat) => {
                 let all: Vec<serde_json::Value> = serde_json::from_slice(&fixture("xtream/live_streams.json")).expect("live_streams.json");
-                let matches =
-                    |v: &serde_json::Value| v.get("category_id").map(|c| c.to_string().trim_matches('"') == cat).unwrap_or(false);
+                let matches = |v: &serde_json::Value| v.get("category_id").map(|c| c.to_string().trim_matches('"') == cat).unwrap_or(false);
                 json(serde_json::to_vec(&all.into_iter().filter(matches).collect::<Vec<_>>()).expect("serialize"))
             }
             None => json(fixture("xtream/live_streams.json")),
@@ -269,11 +272,7 @@ fn conditional(st: &State, headers: &HeaderMap, body: Vec<u8>, content_type: &'s
     if etag_hit || lm_hit {
         return (StatusCode::NOT_MODIFIED, [(header::ETAG, MOCK_ETAG)]).into_response();
     }
-    (
-        [(header::CONTENT_TYPE, content_type), (header::ETAG, MOCK_ETAG), (header::LAST_MODIFIED, MOCK_LAST_MODIFIED)],
-        Body::from(body),
-    )
-        .into_response()
+    ([(header::CONTENT_TYPE, content_type), (header::ETAG, MOCK_ETAG), (header::LAST_MODIFIED, MOCK_LAST_MODIFIED)], Body::from(body)).into_response()
 }
 
 /// `get.php?type=m3u_plus` equivalent of the live fixtures.

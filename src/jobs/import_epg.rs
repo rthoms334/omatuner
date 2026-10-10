@@ -59,7 +59,13 @@ pub struct EpgRefreshResult {
     pub not_modified: bool,
 }
 
-pub async fn refresh_epg(ctx: &JobContext, id: EpgSourceId, force: bool, progress: &Progress, cancel: &CancellationToken) -> Result<EpgRefreshResult> {
+pub async fn refresh_epg(
+    ctx: &JobContext,
+    id: EpgSourceId,
+    force: bool,
+    progress: &Progress,
+    cancel: &CancellationToken,
+) -> Result<EpgRefreshResult> {
     progress.mark_inputs_read();
     let src = read(ctx, move |c| crate::store::sources::get_epg_source(c, id)).await?;
     progress.set_subject(&src.name);
@@ -107,12 +113,8 @@ async fn run(ctx: &JobContext, src: &EpgSource, force: bool, progress: &Progress
                 DownloadOutcome::NotModified => {
                     let now = crate::model::now();
                     write(ctx, move |c| super::db::mark_epg_not_modified(c, id, now)).await?;
-                    let summary = EpgImportSummary {
-                        channels: src.channel_count,
-                        programmes: src.programme_count,
-                        max_stop: src.max_stop,
-                        mapped_channels: 0,
-                    };
+                    let summary =
+                        EpgImportSummary { channels: src.channel_count, programmes: src.programme_count, max_stop: src.max_stop, mapped_channels: 0 };
                     return Ok(EpgRefreshResult { summary, not_modified: true });
                 }
                 DownloadOutcome::Downloaded { path, etag, last_modified, .. } => (path.clone(), TempFile(Some(path)), Some((etag, last_modified))),
@@ -211,7 +213,6 @@ async fn write_guide(
     progress: &Progress,
     cancel: &CancellationToken,
 ) -> Result<EpgImport> {
-
     let (tx, mut rx) = tokio::sync::mpsc::channel::<EpgBatch>(CHANNEL_CAP);
     let parse_cancel = cancel.clone();
     let parser = tokio::task::spawn_blocking(move || parse_file(&path, &opts, &tx, &parse_cancel));
@@ -336,7 +337,13 @@ pub(super) async fn compact_fts(ctx: &JobContext, cancel: &CancellationToken) ->
 
 /// Match guide `id` against every playlist source and replace its automatic mappings (no
 /// resolve). Returns the number of automatic mappings.
-async fn rematch_source(ctx: &JobContext, id: EpgSourceId, provider_of: Option<SourceId>, name_match: bool, cancel: &CancellationToken) -> Result<u32> {
+async fn rematch_source(
+    ctx: &JobContext,
+    id: EpgSourceId,
+    provider_of: Option<SourceId>,
+    name_match: bool,
+    cancel: &CancellationToken,
+) -> Result<u32> {
     let store = ctx.store.clone();
     let maps: Vec<(SourceId, Vec<EpgMapping>)> = blocking(move || {
         let conn = store.reader()?;

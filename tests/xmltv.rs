@@ -22,10 +22,15 @@ fn opts(langs: &[&str]) -> XmltvOptions {
 
 fn run<R: std::io::BufRead>(r: R, o: &XmltvOptions) -> (Vec<XmltvItem>, XmltvStats) {
     let mut items = Vec::new();
-    let stats = parse(r, o, &mut |i| {
-        items.push(i);
-        ControlFlow::Continue(())
-    }, &mut |_| {})
+    let stats = parse(
+        r,
+        o,
+        &mut |i| {
+            items.push(i);
+            ControlFlow::Continue(())
+        },
+        &mut |_| {},
+    )
     .expect("parse");
     (items, stats)
 }
@@ -62,7 +67,9 @@ fn prog(ch: &str, start: Timestamp, stop: Timestamp, title: &str) -> ImportProgr
     }
 }
 
-fn ep(season: Option<u32>, episode: Option<u32>) -> Option<EpisodeNum> { Some(EpisodeNum { season, episode }) }
+fn ep(season: Option<u32>, episode: Option<u32>) -> Option<EpisodeNum> {
+    Some(EpisodeNum { season, episode })
+}
 
 fn basic_expected(title_bbc: &str) -> Vec<XmltvItem> {
     vec![
@@ -152,8 +159,7 @@ fn edge_cases_parsed_exactly() {
         // EOF flush, ordered by (channel, start)
         XmltvItem::Programme(prog("late.uk", S + 3 * H, S + 4 * H, "Late")),
         XmltvItem::Programme(ImportProgramme {
-            description: Some("Line one\nline two".into()),
-            ..prog("unicode.jp", S, S + H, "日本語 – Ñoño")
+            description: Some("Line one\nline two".into()), ..prog("unicode.jp", S, S + H, "日本語 – Ñoño")
         }),
     ];
     assert_eq!(items, expected);
@@ -173,10 +179,7 @@ fn edge_cases_without_language_preference() {
 fn min_stop_and_max_start_filter_without_counting() {
     let o = XmltvOptions { min_stop: Some(S + 1), max_start: Some(S), ..opts(&["en"]) };
     let (items, stats) = run_file("xmltv/basic.xml", &o);
-    let titles: Vec<&str> = items
-        .iter()
-        .filter_map(|i| if let XmltvItem::Programme(p) = i { Some(p.title.as_str()) } else { None })
-        .collect();
+    let titles: Vec<&str> = items.iter().filter_map(|i| if let XmltvItem::Programme(p) = i { Some(p.title.as_str()) } else { None }).collect();
     assert_eq!(titles, ["Drama", "No stop time"]);
     assert_eq!((stats.channels, stats.programmes, stats.skipped), (3, 2, 1));
 }
@@ -184,10 +187,15 @@ fn min_stop_and_max_start_filter_without_counting() {
 #[test]
 fn sink_break_cancels() {
     let mut calls = 0;
-    let r = parse(File::open(support::fixture("xmltv/basic.xml")).map(BufReader::new).unwrap(), &opts(&[]), &mut |_| {
-        calls += 1;
-        if calls == 2 { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
-    }, &mut |_| {});
+    let r = parse(
+        File::open(support::fixture("xmltv/basic.xml")).map(BufReader::new).unwrap(),
+        &opts(&[]),
+        &mut |_| {
+            calls += 1;
+            if calls == 2 { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
+        },
+        &mut |_| {},
+    );
     assert!(matches!(r, Err(Error::Cancelled)), "{r:?}");
     assert_eq!(calls, 2, "no item after Break");
     // Cancelling on the EOF flush also reports Cancelled.
@@ -214,10 +222,15 @@ fn progress_every_mib_and_bytes_counted() {
     assert!(doc.len() > 5 << 20);
     let mut reports = Vec::new();
     let mut n = 0u64;
-    let stats = parse(doc.as_bytes(), &opts(&[]), &mut |_| {
-        n += 1;
-        ControlFlow::Continue(())
-    }, &mut |b| reports.push(b))
+    let stats = parse(
+        doc.as_bytes(),
+        &opts(&[]),
+        &mut |_| {
+            n += 1;
+            ControlFlow::Continue(())
+        },
+        &mut |b| reports.push(b),
+    )
     .unwrap();
     assert_eq!(stats.bytes, doc.len() as u64);
     assert_eq!(n, 40_001);
@@ -257,13 +270,9 @@ fn malformed_and_non_xml_inputs_error_without_panicking() {
     assert!(matches!(r, Err(Error::Parse { .. })), "{r:?}");
     // Bodies without a root element (empty 200 from a failed login, plain text, JSON, only
     // whitespace or a comment) are not an empty guide: the previous generation must survive.
-    for doc in [
-        &b""[..],
-        b"   \n\t ",
-        b"Invalid username or password",
-        b"{\"user_info\":{\"auth\":0}}",
-        b"<?xml version=\"1.0\"?>\n<!-- nothing here -->",
-    ] {
+    for doc in
+        [&b""[..], b"   \n\t ", b"Invalid username or password", b"{\"user_info\":{\"auth\":0}}", b"<?xml version=\"1.0\"?>\n<!-- nothing here -->"]
+    {
         let r = parse(doc, &opts(&[]), &mut |_| ControlFlow::Continue(()), &mut |_| {});
         assert!(matches!(r, Err(Error::BadPayload(_))), "{:?} → {r:?}", String::from_utf8_lossy(doc));
     }

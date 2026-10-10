@@ -37,7 +37,9 @@ pub struct Movie {
 }
 
 impl Movie {
-    pub fn display_name(&self) -> &str { self.rename.as_deref().unwrap_or(&self.clean_name) }
+    pub fn display_name(&self) -> &str {
+        self.rename.as_deref().unwrap_or(&self.clean_name)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -69,7 +71,9 @@ pub struct Series {
 }
 
 impl Series {
-    pub fn display_name(&self) -> &str { self.rename.as_deref().unwrap_or(&self.clean_name) }
+    pub fn display_name(&self) -> &str {
+        self.rename.as_deref().unwrap_or(&self.clean_name)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

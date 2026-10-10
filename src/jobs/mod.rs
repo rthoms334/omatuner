@@ -68,20 +68,26 @@ use crate::model::{AccountInfo, EpgSourceId, JobId, MovieId, SeriesId, SourceDra
 use crate::msg::{AppEvent, DataScope, EventBus};
 use crate::paths::AppPaths;
 use crate::sources::http::HttpClient;
+use crate::store::Store;
 use crate::store::backup::{BackupOptions, RestoreMode, RestoreReport};
 use crate::store::epg::EpgImportSummary;
 use crate::store::import::ImportSummary;
 use crate::store::library::Library;
-use crate::store::Store;
 
 /// What to do.
 #[derive(Debug, Clone, PartialEq)]
 pub enum JobKind {
     /// Re-import a playlist source (M3U download/parse or Xtream API), then its provider EPG
     /// if stale, then `RebuildLibrary`. `force` ignores ETag/Last-Modified.
-    RefreshSource { source: SourceId, force: bool },
+    RefreshSource {
+        source: SourceId,
+        force: bool,
+    },
     /// Re-import one EPG source, re-match, then emit `DataScope::Epg`.
-    RefreshEpg { epg_source: EpgSourceId, force: bool },
+    RefreshEpg {
+        epg_source: EpgSourceId,
+        force: bool,
+    },
     /// Scheduler tick: every stale playlist + EPG source (DESIGN §9.5).
     RefreshStale,
     /// Validate a draft without saving (onboarding "Test" / step 5): login, account info,
@@ -99,9 +105,15 @@ pub enum JobKind {
     RebuildLibrary,
     /// Prune old programmes, sweep inactive EPG generations, `PRAGMA optimize`.
     Maintenance,
-    ExportBackup { path: PathBuf, opts: BackupOptions },
+    ExportBackup {
+        path: PathBuf,
+        opts: BackupOptions,
+    },
     /// Restore, then submit `RefreshSource` for every restored source.
-    ImportBackup { path: PathBuf, mode: RestoreMode },
+    ImportBackup {
+        path: PathBuf,
+        mode: RestoreMode,
+    },
 }
 
 impl JobKind {
@@ -185,11 +197,19 @@ pub enum JobPhase {
     Queued,
     Connecting,
     /// bytes done / total (if known).
-    Downloading { done: u64, total: Option<u64> },
+    Downloading {
+        done: u64,
+        total: Option<u64>,
+    },
     /// items parsed so far.
-    Parsing { items: u64 },
+    Parsing {
+        items: u64,
+    },
     /// rows written / expected.
-    Writing { done: u64, total: Option<u64> },
+    Writing {
+        done: u64,
+        total: Option<u64>,
+    },
     Matching,
     Indexing,
     Finishing,
@@ -224,8 +244,17 @@ pub enum JobOutcome {
     Nothing,
     /// `account` = fresh Xtream account info (the app forwards `max_connections` to the
     /// player budget with `PlayerCommand::SetConnectionLimit`).
-    SourceRefreshed { source: SourceId, summary: ImportSummary, not_modified: bool, account: Option<AccountInfo> },
-    EpgRefreshed { epg_source: EpgSourceId, summary: EpgImportSummary, not_modified: bool },
+    SourceRefreshed {
+        source: SourceId,
+        summary: ImportSummary,
+        not_modified: bool,
+        account: Option<AccountInfo>,
+    },
+    EpgRefreshed {
+        epg_source: EpgSourceId,
+        summary: EpgImportSummary,
+        not_modified: bool,
+    },
     Probe(ProbeResult),
     SourceAdded(SourceId),
     Library(Arc<Library>),
@@ -259,7 +288,12 @@ pub enum JobEvent {
     Updated(JobStatus),
     /// `Err` holds a redacted, user-presentable message; `failure` is `Some` exactly when
     /// `outcome` is `Err` and says what kind of failure it was.
-    Finished { id: JobId, kind: JobKind, outcome: Result<JobOutcome, String>, failure: Option<FailureKind> },
+    Finished {
+        id: JobId,
+        kind: JobKind,
+        outcome: Result<JobOutcome, String>,
+        failure: Option<FailureKind>,
+    },
 }
 
 /// Submits a follow-up job (returns its id). Installed by [`JobManager::new`].
@@ -290,7 +324,9 @@ impl JobContext {
 // ------------------------------------------------------------------ helpers for job bodies
 
 /// Poison-tolerant lock (a panicking job must not wedge the manager).
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> { m.lock().unwrap_or_else(|e| e.into_inner()) }
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Run `f` with a fresh reader connection on the blocking pool (never on an async worker).
 async fn read<R, F>(ctx: &JobContext, f: F) -> Result<R>
@@ -321,7 +357,9 @@ where
 }
 
 /// `Err(Cancelled)` once `cancel` fired.
-fn check(cancel: &CancellationToken) -> Result<()> { if cancel.is_cancelled() { Err(Error::Cancelled) } else { Ok(()) } }
+fn check(cancel: &CancellationToken) -> Result<()> {
+    if cancel.is_cancelled() { Err(Error::Cancelled) } else { Ok(()) }
+}
 
 // ------------------------------------------------------------------ progress
 
@@ -345,14 +383,8 @@ impl Progress {
     /// A reporter attached to nothing (unit tests of job functions; events go nowhere).
     pub fn detached() -> Self {
         let (bus, _rx) = EventBus::new(None);
-        let status = JobStatus {
-            id: JobId(0),
-            kind: JobKind::Maintenance,
-            label: "test".into(),
-            phase: JobPhase::Queued,
-            started_at: 0,
-            fraction: None,
-        };
+        let status =
+            JobStatus { id: JobId(0), kind: JobKind::Maintenance, label: "test".into(), phase: JobPhase::Queued, started_at: 0, fraction: None };
         Self::attached(bus, status)
     }
 
@@ -405,13 +437,19 @@ impl Progress {
         self.emit(snapshot, true);
     }
 
-    fn subject(&self) -> Option<String> { lock(&self.subject).clone() }
+    fn subject(&self) -> Option<String> {
+        lock(&self.subject).clone()
+    }
 
     /// Called right BEFORE a job reads the inputs a newer request could change (its source
     /// row): a request submitted after this is rerun instead of merged into this run.
-    fn mark_inputs_read(&self) { self.inputs_read.store(true, Ordering::SeqCst); }
+    fn mark_inputs_read(&self) {
+        self.inputs_read.store(true, Ordering::SeqCst);
+    }
 
-    fn has_read_inputs(&self) -> bool { self.inputs_read.load(Ordering::SeqCst) }
+    fn has_read_inputs(&self) -> bool {
+        self.inputs_read.load(Ordering::SeqCst)
+    }
 
     fn emit(&self, status: JobStatus, always: bool) {
         {
@@ -655,8 +693,12 @@ impl JobManager {
         out
     }
 
-    pub fn context(&self) -> &JobContext { &self.inner.ctx }
-    pub fn runtime(&self) -> &tokio::runtime::Handle { &self.inner.rt }
+    pub fn context(&self) -> &JobContext {
+        &self.inner.ctx
+    }
+    pub fn runtime(&self) -> &tokio::runtime::Handle {
+        &self.inner.rt
+    }
 }
 
 impl ManagerInner {
@@ -791,7 +833,9 @@ async fn execute(ctx: &JobContext, kind: &JobKind, progress: &Progress, cancel: 
 }
 
 /// `DataScope` notification helper for job bodies.
-fn notify(ctx: &JobContext, scope: DataScope) { ctx.bus.data_changed(scope) }
+fn notify(ctx: &JobContext, scope: DataScope) {
+    ctx.bus.data_changed(scope)
+}
 
 #[cfg(test)]
 mod tests {

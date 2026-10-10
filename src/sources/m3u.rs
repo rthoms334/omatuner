@@ -225,9 +225,13 @@ pub fn parse<R: BufRead>(reader: R, base: Option<&Url>) -> std::result::Result<M
 }
 
 impl<R: BufRead> M3uParser<R> {
-    pub fn header(&self) -> &M3uHeader { &self.header }
+    pub fn header(&self) -> &M3uHeader {
+        &self.header
+    }
     /// Bytes consumed so far (progress reporting).
-    pub fn bytes_read(&self) -> u64 { self.bytes_read }
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
 
     /// Read the next physical line into `buf` (terminator removed; `\n`, `\r\n` and `\r` all
     /// end a line). `Ok(false)` at end of input.
@@ -679,9 +683,7 @@ struct CatchupFields {
 impl CatchupFields {
     /// `None` when the line names an unknown kind (`catchup="disabled"`): no archive at all.
     fn from_attrs(attrs: &[(String, String)]) -> Option<Self> {
-        let get = |key: &str| {
-            attrs.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.trim()).filter(|v| !v.is_empty())
-        };
+        let get = |key: &str| attrs.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.trim()).filter(|v| !v.is_empty());
         let own_kind = match get("catchup").or_else(|| get("catchup-type")) {
             Some(v) => match super::catchup::parse_kind(v) {
                 Some(k) => Some(k),
@@ -780,15 +782,25 @@ fn decode(buf: &[u8]) -> Cow<'_, str> {
 }
 
 /// Trim whitespace and any BOM (concatenated playlists carry one per part).
-fn clean_line(s: &str) -> &str { s.trim().trim_start_matches('\u{feff}').trim_start() }
+fn clean_line(s: &str) -> &str {
+    s.trim().trim_start_matches('\u{feff}').trim_start()
+}
 
-fn io_error(e: io::Error) -> Error { Error::io("playlist", e) }
+fn io_error(e: io::Error) -> Error {
+    Error::io("playlist", e)
+}
 
-fn dangling(p: &PendingInf) -> Error { Error::parse(Some(p.line), format!("#EXTINF \"{}\" has no stream URL", p.title)) }
+fn dangling(p: &PendingInf) -> Error {
+    Error::parse(Some(p.line), format!("#EXTINF \"{}\" has no stream URL", p.title))
+}
 
-fn starts_with_ci(s: &str, prefix: &str) -> bool { s.len() >= prefix.len() && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes()) }
+fn starts_with_ci(s: &str, prefix: &str) -> bool {
+    s.len() >= prefix.len() && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
 
-fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> { starts_with_ci(s, prefix).then(|| &s[prefix.len()..]) }
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    starts_with_ci(s, prefix).then(|| &s[prefix.len()..])
+}
 
 /// Last value of an attribute (keys are already lowercase and unique).
 fn attr<'a>(attrs: &'a [(String, String)], key: &str) -> Option<&'a str> {
@@ -850,7 +862,10 @@ fn parse_shift_h(v: &str) -> Option<f32> {
 /// Positive whole days (fractions round up).
 fn parse_days(v: &str) -> Option<u32> {
     let v = v.trim();
-    v.parse::<u32>().ok().or_else(|| v.parse::<f64>().ok().filter(|f| f.is_finite() && *f > 0.0).map(|f| f.ceil().min(u32::MAX as f64) as u32)).filter(|d| *d > 0)
+    v.parse::<u32>()
+        .ok()
+        .or_else(|| v.parse::<f64>().ok().filter(|f| f.is_finite() && *f > 0.0).map(|f| f.ceil().min(u32::MAX as f64) as u32))
+        .filter(|d| *d > 0)
 }
 
 /// `catchup-time` seconds → days, rounded up so a 12 h archive stays usable.
@@ -869,7 +884,9 @@ fn hours_to_secs(v: &str) -> Option<i64> {
 mod tests {
     use super::*;
 
-    fn kv(pairs: &[(&str, &str)]) -> Vec<(String, String)> { pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect() }
+    fn kv(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
 
     #[test]
     fn extinf_doc_example() {

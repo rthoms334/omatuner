@@ -26,7 +26,9 @@ fn snap(v: f32, range: &std::ops::RangeInclusive<f32>, step: f32) -> f32 {
 }
 
 /// 0..1 position of `x` along a track whose usable span is `[left, right]`.
-fn fraction_at(x: f32, left: f32, right: f32) -> f32 { if right > left { ((x - left) / (right - left)).clamp(0.0, 1.0) } else { 0.0 } }
+fn fraction_at(x: f32, left: f32, right: f32) -> f32 {
+    if right > left { ((x - left) / (right - left)).clamp(0.0, 1.0) } else { 0.0 }
+}
 
 pub fn slider(ui: &mut egui::Ui, theme: &Theme, value: &mut f32, range: std::ops::RangeInclusive<f32>, step: f32, focused: bool) -> egui::Response {
     let t = &theme.tokens;
@@ -97,7 +99,11 @@ pub fn seek_bar(ui: &mut egui::Ui, theme: &Theme, position: f64, duration: f64, 
     let shown = held.unwrap_or(if position.is_finite() { position } else { 0.0 });
     let played_x = x_of(shown);
     if let Some(end) = cache_end.filter(|e| e.is_finite() && *e > shown) {
-        p.rect_filled(Rect::from_min_max(egui::pos2(played_x, track.top()), egui::pos2(x_of(end), track.bottom())), t.rounding, with_alpha(t.osd_text, 0.5));
+        p.rect_filled(
+            Rect::from_min_max(egui::pos2(played_x, track.top()), egui::pos2(x_of(end), track.bottom())),
+            t.rounding,
+            with_alpha(t.osd_text, 0.5),
+        );
     }
     p.rect_filled(Rect::from_min_max(track.min, egui::pos2(played_x, track.bottom())), t.rounding, t.osd_accent);
     let hot = resp.hovered() || resp.dragged();

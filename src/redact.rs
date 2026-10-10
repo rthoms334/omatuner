@@ -31,23 +31,35 @@ use serde::{Deserialize, Serialize};
 pub struct Secret<T>(T);
 
 impl<T> Secret<T> {
-    pub fn new(v: T) -> Self { Secret(v) }
+    pub fn new(v: T) -> Self {
+        Secret(v)
+    }
     /// Access the secret value. Grep for `expose(` when auditing.
-    pub fn expose(&self) -> &T { &self.0 }
-    pub fn into_inner(self) -> T { self.0 }
+    pub fn expose(&self) -> &T {
+        &self.0
+    }
+    pub fn into_inner(self) -> T {
+        self.0
+    }
 }
 
 impl<T> std::fmt::Debug for Secret<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("Secret(***)") }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(***)")
+    }
 }
 
 impl Secret<String> {
     /// Redacted rendering suitable for UI/logs.
-    pub fn redacted(&self) -> String { redact_url(&self.0) }
+    pub fn redacted(&self) -> String {
+        redact_url(&self.0)
+    }
 }
 
 impl From<String> for Secret<String> {
-    fn from(s: String) -> Self { Secret(s) }
+    fn from(s: String) -> Self {
+        Secret(s)
+    }
 }
 
 static SECRETS: LazyLock<RwLock<Vec<String>>> = LazyLock::new(|| RwLock::new(Vec::new()));
@@ -109,12 +121,8 @@ static USERINFO: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b([a-z][a-z0-9+.-]*://)([^/@\s:]+)(:[^/\s]*)?@").unwrap());
 /// `?name=value`, `&name=value`, `;name=value` and free-standing `name=value` (form bodies,
 /// mpv option strings). The value stops at separators and quotes.
-static QUERY_CRED: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(&format!(r#"(?i)((?:[?&;]|\b)(?:{CRED_NAMES})=)([^&#\s"'<>]*)"#)).unwrap()
-});
-static XTREAM_PATH: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(/(?:live|movie|series|timeshift)/)([^/\s]+)/([^/\s]+)/").unwrap()
-});
+static QUERY_CRED: LazyLock<Regex> = LazyLock::new(|| Regex::new(&format!(r#"(?i)((?:[?&;]|\b)(?:{CRED_NAMES})=)([^&#\s"'<>]*)"#)).unwrap());
+static XTREAM_PATH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)(/(?:live|movie|series|timeshift)/)([^/\s]+)/([^/\s]+)/").unwrap());
 /// Xtream panels' M3U output: `http://host:port/<user>/<pass>/<stream id>[.ext]`.
 static XTREAM_BARE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)\b(https?://[^/\s"'<>]+/)([^/\s?#"'<>]+)/([^/\s?#"'<>]+)/(\d+(?:\.[a-z0-9]{2,5})?)($|[\s?#"'<>,;)])"#).unwrap()
@@ -127,8 +135,7 @@ static HEADER_CRED: LazyLock<Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
-static JSON_CRED: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r#"(?i)("(?:{CRED_NAMES})"\s*:\s*")((?:[^"\\]|\\.)*)""#)).unwrap());
+static JSON_CRED: LazyLock<Regex> = LazyLock::new(|| Regex::new(&format!(r#"(?i)("(?:{CRED_NAMES})"\s*:\s*")((?:[^"\\]|\\.)*)""#)).unwrap());
 
 /// Redact credentials from free text (log lines, error messages, mpv messages).
 pub fn redact(s: &str) -> Cow<'_, str> {
@@ -165,7 +172,9 @@ pub fn redact(s: &str) -> Cow<'_, str> {
 }
 
 /// Redact a URL for display (same rules as [`redact`]).
-pub fn redact_url(url: &str) -> String { redact(url).into_owned() }
+pub fn redact_url(url: &str) -> String {
+    redact(url).into_owned()
+}
 
 #[cfg(test)]
 mod tests {
@@ -206,10 +215,7 @@ mod tests {
     #[test]
     fn headers_keep_their_name_and_lose_their_value() {
         assert_eq!(redact("Authorization: Bearer abc.def.ghi"), "Authorization: ***");
-        assert_eq!(
-            redact("http-header-fields=Cookie: sid=1; x=2,User-Agent: Tuner/1.0"),
-            "http-header-fields=Cookie: ***,User-Agent: Tuner/1.0"
-        );
+        assert_eq!(redact("http-header-fields=Cookie: sid=1; x=2,User-Agent: Tuner/1.0"), "http-header-fields=Cookie: ***,User-Agent: Tuner/1.0");
         assert_eq!(redact("x-api-key=0123456789"), "x-api-key=***");
     }
 

@@ -30,7 +30,9 @@ pub struct Group {
 }
 
 impl Group {
-    pub fn display_name(&self) -> &str { self.rename.as_deref().unwrap_or(&self.name) }
+    pub fn display_name(&self) -> &str {
+        self.rename.as_deref().unwrap_or(&self.name)
+    }
 }
 
 /// Extra HTTP request properties for a stream (M3U `#EXTVLCOPT`, `#KODIPROP`, pipe headers,
@@ -151,7 +153,9 @@ pub struct Channel {
 }
 
 impl Channel {
-    pub fn display_name(&self) -> &str { self.rename.as_deref().unwrap_or(&self.clean_name) }
+    pub fn display_name(&self) -> &str {
+        self.rename.as_deref().unwrap_or(&self.clean_name)
+    }
 }
 
 /// Slim, `Clone`-cheap row kept in the in-memory library index for every visible channel.

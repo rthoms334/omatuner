@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use tuner::keymap::Action;
-use tuner::model::{ChannelId, ChannelSummary, EpgChannelId, GroupId, ItemKey, NowNext, ProgrammeFlags, ProgrammeId, ProgrammeSlim, SourceId, Timestamp};
+use tuner::model::{
+    ChannelId, ChannelSummary, EpgChannelId, GroupId, ItemKey, NowNext, ProgrammeFlags, ProgrammeId, ProgrammeSlim, SourceId, Timestamp,
+};
 use tuner::store::library::LiveIndex;
 use tuner::theme::Theme;
 use tuner::ui::LayoutClass;
@@ -27,7 +29,8 @@ const WARMUP: usize = 20;
 const GATE: Duration = Duration::from_millis(8);
 const T0: Timestamp = 1_791_576_000;
 
-const TITLES: [&str; 8] = ["News at Eight", "Gardeners' World", "Film: The Matrix", "Live Football", "The Simpsons", "Panorama", "Weather", "Big Bang Theory"];
+const TITLES: [&str; 8] =
+    ["News at Eight", "Gardeners' World", "Film: The Matrix", "Live Football", "The Simpsons", "Panorama", "Weather", "Big Bang Theory"];
 
 struct Fake;
 
@@ -39,12 +42,21 @@ impl EpgReader for Fake {
             // vary lengths a little: 30 or 60 minutes
             let len = if (s / 1800 + ch.0) % 3 == 0 { 3600 } else { 1800 };
             let i = ((s / 1800 + ch.0) % TITLES.len() as i64) as usize;
-            out.push(ProgrammeSlim { id: ProgrammeId(ch.0 * 1_000_000 + s / 60), start: s, stop: s + len, title: Arc::from(TITLES[i]), sub_title: None, flags: ProgrammeFlags::default() });
+            out.push(ProgrammeSlim {
+                id: ProgrammeId(ch.0 * 1_000_000 + s / 60),
+                start: s,
+                stop: s + len,
+                title: Arc::from(TITLES[i]),
+                sub_title: None,
+                flags: ProgrammeFlags::default(),
+            });
             s += len;
         }
         Ok(out)
     }
-    fn now_next(&mut self, _: &[(EpgChannelId, i32)], _: Timestamp) -> tuner::error::Result<HashMap<(EpgChannelId, i32), NowNext>> { Ok(HashMap::new()) }
+    fn now_next(&mut self, _: &[(EpgChannelId, i32)], _: Timestamp) -> tuner::error::Result<HashMap<(EpgChannelId, i32), NowNext>> {
+        Ok(HashMap::new())
+    }
 }
 
 fn live() -> LiveIndex {
@@ -83,7 +95,8 @@ fn main() {
     let theme = Theme::fallback();
     tuner::theme::egui_style::apply(&ctx, &theme);
     let live = live();
-    let rows: Arc<[GuideRow]> = live.channels.iter().map(|c| GuideRow { channel: c.id, epg: c.epg_channel_id, tvg_shift_min: 0, catchup_days: c.catchup_days }).collect();
+    let rows: Arc<[GuideRow]> =
+        live.channels.iter().map(|c| GuideRow { channel: c.id, epg: c.epg_channel_id, tvg_shift_min: 0, catchup_days: c.catchup_days }).collect();
     let now = T0 + 1234;
     let mut state = EpgGridState::new(rows, now);
     let metrics = GridMetrics::for_layout(LayoutClass::Wide, false, &theme);
@@ -111,7 +124,10 @@ fn main() {
     let median = times[times.len() / 2];
     let p95 = times[times.len() * 95 / 100];
     let focus = state.focused().map(|(c, _)| c.0).unwrap_or_default();
-    println!("guide: {CHANNELS} channels, {FRAMES} frames holding ↓ (focus now on channel {focus}): median {median:?}, p95 {p95:?}, max {:?}", times[times.len() - 1]);
+    println!(
+        "guide: {CHANNELS} channels, {FRAMES} frames holding ↓ (focus now on channel {focus}): median {median:?}, p95 {p95:?}, max {:?}",
+        times[times.len() - 1]
+    );
     let verdict = if median < GATE { "PASS" } else { "FAIL" };
     println!("gate {:<24} {:>8.2} ms   (< {} ms)   {verdict}", "guide frame (median)", median.as_secs_f64() * 1e3, GATE.as_millis());
     let _ = std::fs::remove_dir_all(&dir);

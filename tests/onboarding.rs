@@ -51,10 +51,14 @@ impl App {
         }
     }
 
-    fn sources(&self) -> Vec<tuner::model::Source> { tuner::store::sources::list_sources(&self.t.services().store.reader().unwrap()).unwrap() }
+    fn sources(&self) -> Vec<tuner::model::Source> {
+        tuner::store::sources::list_sources(&self.t.services().store.reader().unwrap()).unwrap()
+    }
 }
 
-fn harness(start: OnboardingStart) -> Harness<'static, App> { harness_with(|_| start) }
+fn harness(start: OnboardingStart) -> Harness<'static, App> {
+    harness_with(|_| start)
+}
 
 /// A rig whose profile `prepare` may seed first; it returns where the card starts.
 fn harness_with(prepare: impl FnOnce(&TestUi) -> OnboardingStart) -> Harness<'static, App> {
@@ -76,8 +80,12 @@ fn harness_with(prepare: impl FnOnce(&TestUi) -> OnboardingStart) -> Harness<'st
     h
 }
 
-fn has(h: &Harness<'static, App>, label: &str) -> bool { h.query_all_by_label(label).next().is_some() }
-fn has_containing(h: &Harness<'static, App>, label: &str) -> bool { h.query_all_by_label_contains(label).next().is_some() }
+fn has(h: &Harness<'static, App>, label: &str) -> bool {
+    h.query_all_by_label(label).next().is_some()
+}
+fn has_containing(h: &Harness<'static, App>, label: &str) -> bool {
+    h.query_all_by_label_contains(label).next().is_some()
+}
 
 /// Step frames until `done` (20 s limit: imports run real jobs).
 fn until(h: &mut Harness<'static, App>, what: &str, mut done: impl FnMut(&mut Harness<'static, App>) -> bool) {
@@ -110,7 +118,9 @@ fn panel(opts: MockOptions) -> (tokio::runtime::Runtime, MockXtream) {
     (rt, mock)
 }
 
-fn host_port(base: &str) -> &str { base.trim_start_matches("http://") }
+fn host_port(base: &str) -> &str {
+    base.trim_start_matches("http://")
+}
 
 /// Fill the Xtream form (the cursor starts on Server) and test it.
 fn xtream_login(h: &mut Harness<'static, App>, server: &str, user: &str, password: &str) {

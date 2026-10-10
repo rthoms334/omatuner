@@ -58,8 +58,12 @@ struct LineId {
 }
 
 impl LineId {
-    fn of(l: &LogLine) -> Self { Self { at: l.at, level: l.level, target: l.target.clone(), message: l.message.clone() } }
-    fn is(&self, l: &LogLine) -> bool { self.at == l.at && self.level == l.level && self.target == l.target && self.message == l.message }
+    fn of(l: &LogLine) -> Self {
+        Self { at: l.at, level: l.level, target: l.target.clone(), message: l.message.clone() }
+    }
+    fn is(&self, l: &LogLine) -> bool {
+        self.at == l.at && self.level == l.level && self.target == l.target && self.message == l.message
+    }
 }
 
 impl Default for LogsScreen {
@@ -94,10 +98,14 @@ impl LogsScreen {
     }
 
     /// The line of displayed row `i`.
-    fn line_at(&self, i: usize) -> Option<&LogLine> { self.rows.get(i).and_then(|l| self.lines.get(*l as usize)) }
+    fn line_at(&self, i: usize) -> Option<&LogLine> {
+        self.rows.get(i).and_then(|l| self.lines.get(*l as usize))
+    }
 
     /// The displayed row of a line.
-    fn row_of(&self, id: &LineId) -> Option<usize> { self.rows.iter().position(|l| self.lines.get(*l as usize).is_some_and(|x| id.is(x))) }
+    fn row_of(&self, id: &LineId) -> Option<usize> {
+        self.rows.iter().position(|l| self.lines.get(*l as usize).is_some_and(|x| id.is(x)))
+    }
 
     /// Enter on row `i`: expand it, or collapse it when it is the expanded one.
     fn toggle_expanded(&mut self, i: usize) {
@@ -138,8 +146,12 @@ fn level_label(l: Level) -> &'static str {
 }
 
 impl Screen for LogsScreen {
-    fn id(&self) -> ScreenId { ScreenId::Logs }
-    fn key_contexts(&self) -> Vec<KeyContext> { vec![self.list.key_context()] }
+    fn id(&self) -> ScreenId {
+        ScreenId::Logs
+    }
+    fn key_contexts(&self) -> Vec<KeyContext> {
+        vec![self.list.key_context()]
+    }
 
     fn on_enter(&mut self, ctx: &mut UiCtx<'_>, _route: &Route) {
         if ctx.config.general.debug_log && self.refreshed.is_none() {
@@ -173,7 +185,17 @@ impl Screen for LogsScreen {
             }
             // ←/Backspace on an empty filter: back to Settings (the app's Back)
             ListOutcome::Parent => false,
-            ListOutcome::None => matches!(action, Action::Up | Action::Down | Action::PageUp | Action::PageDown | Action::Home | Action::End | Action::FilterInput(_) | Action::Activate),
+            ListOutcome::None => matches!(
+                action,
+                Action::Up
+                    | Action::Down
+                    | Action::PageUp
+                    | Action::PageDown
+                    | Action::Home
+                    | Action::End
+                    | Action::FilterInput(_)
+                    | Action::Activate
+            ),
         }
     }
 
@@ -218,7 +240,14 @@ impl Screen for LogsScreen {
         if self.rows.is_empty() {
             let q = self.list.filter.query().to_owned();
             if q.is_empty() {
-                empty_state::empty_state(ui, theme, glyphs::INFO, "The log is empty", Some("Turn on debug logging in Settings ▸ About & logs for more detail."), None);
+                empty_state::empty_state(
+                    ui,
+                    theme,
+                    glyphs::INFO,
+                    "The log is empty",
+                    Some("Turn on debug logging in Settings ▸ About & logs for more detail."),
+                    None,
+                );
             } else {
                 empty_state::empty_state(ui, theme, glyphs::SEARCH, &format!("No matches for “{q}”"), None, None);
             }
@@ -245,8 +274,15 @@ impl Screen for LogsScreen {
                 };
                 let p = ui.painter();
                 let x = rect.left() + theme.space(SpaceToken::Md);
-                let r = p.text(egui::pos2(x, rect.center().y), Align2::LEFT_CENTER, super::home::kit::hhmm(line.at, h24), font.clone(), t.text_secondary);
-                let r = p.text(egui::pos2(r.right() + theme.space(SpaceToken::Lg), rect.center().y), Align2::LEFT_CENTER, format!("{:>5}", level_label(line.level)), font.clone(), lc);
+                let r =
+                    p.text(egui::pos2(x, rect.center().y), Align2::LEFT_CENTER, super::home::kit::hhmm(line.at, h24), font.clone(), t.text_secondary);
+                let r = p.text(
+                    egui::pos2(r.right() + theme.space(SpaceToken::Lg), rect.center().y),
+                    Align2::LEFT_CENTER,
+                    format!("{:>5}", level_label(line.level)),
+                    font.clone(),
+                    lc,
+                );
                 let color = if rc.state.is_cursor() { t.list_cursor_text } else { t.fg };
                 let text = format!("{}: {}", line.target, line.message);
                 let mut job = egui::text::LayoutJob::simple_singleline(text, font, color);
@@ -266,7 +302,11 @@ impl Screen for LogsScreen {
             ui.add_space(theme.space(SpaceToken::Md));
             crate::ui::widgets::card::card(ui, theme, crate::ui::widgets::card::CardKind::Pane, |ui| {
                 egui::ScrollArea::vertical().id_salt("log-detail").max_height(detail_h).show(ui, |ui| {
-                    ui.label(RichText::new(format!("{} {} {}", super::home::kit::date(line.at), level_label(line.level), line.target)).size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
+                    ui.label(
+                        RichText::new(format!("{} {} {}", super::home::kit::date(line.at), level_label(line.level), line.target))
+                            .size(theme.font(TypeToken::BodySmall))
+                            .color(t.text_secondary),
+                    );
                     ui.add(egui::Label::new(RichText::new(&line.message).monospace().size(theme.font(TypeToken::Body)).color(t.fg)).wrap());
                 });
             });
@@ -280,7 +320,9 @@ mod tests {
     use crate::ui::screens::home::kit;
     use crate::ui::screens::home::testkit::{harness, has_label, rig};
 
-    fn line(level: Level, msg: &str) -> LogLine { LogLine { at: 1_791_576_000, level, target: "tuner::test".into(), message: msg.into() } }
+    fn line(level: Level, msg: &str) -> LogLine {
+        LogLine { at: 1_791_576_000, level, target: "tuner::test".into(), message: msg.into() }
+    }
 
     #[test]
     fn filter_expand_level_and_export_without_file_io() {
@@ -308,7 +350,10 @@ mod tests {
         // Ctrl+S: the view menu — errors only, and Export…
         h.state_mut().act(Action::SortMenu);
         let nav = h.state_mut().nav();
-        assert!(matches!(nav.as_slice(), [crate::ui::NavRequest::Open(OverlayRequest::ContextMenu(m))] if m.items.iter().any(|i| i.label == "Export…")), "{nav:?}");
+        assert!(
+            matches!(nav.as_slice(), [crate::ui::NavRequest::Open(OverlayRequest::ContextMenu(m))] if m.items.iter().any(|i| i.label == "Export…")),
+            "{nav:?}"
+        );
         h.state_mut().result(OverlayResult::Chosen(Action::Digit(0)));
         assert_eq!(h.state().s.rows.len(), 1, "errors only");
         let before: Vec<_> = std::fs::read_dir(&dir).map(|d| d.flatten().map(|e| e.path()).collect()).unwrap_or_default();

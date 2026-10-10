@@ -66,10 +66,8 @@ impl ShellConfig {
     /// Numeric value (`parseFloat` semantics: a leading number, e.g. `"2 4"` → 2).
     pub fn f32(&self, section: &str, key: &str) -> Option<f32> {
         let v = self.raw(section, key)?;
-        let end = v
-            .char_indices()
-            .find(|&(i, c)| !(c.is_ascii_digit() || c == '.' || (i == 0 && (c == '-' || c == '+'))))
-            .map_or(v.len(), |(i, _)| i);
+        let end =
+            v.char_indices().find(|&(i, c)| !(c.is_ascii_digit() || c == '.' || (i == 0 && (c == '-' || c == '+')))).map_or(v.len(), |(i, _)| i);
         v[..end].parse::<f32>().ok().filter(|f| f.is_finite())
     }
 
@@ -125,7 +123,9 @@ impl ShellConfig {
     pub(super) fn border_width(&self, section: &str, key: &str) -> Option<f32> {
         let nums: Vec<f32> = self
             .raw(section, key)
-            .map(|v| v.split_whitespace().filter_map(|n| n.parse::<f32>().ok()).take(4).map(|n| if n.is_finite() && n > 0.0 { n } else { 0.0 }).collect())
+            .map(|v| {
+                v.split_whitespace().filter_map(|n| n.parse::<f32>().ok()).take(4).map(|n| if n.is_finite() && n > 0.0 { n } else { 0.0 }).collect()
+            })
             .unwrap_or_default();
         let mut sides: [Option<f32>; 4] = match nums.as_slice() {
             [] => [None; 4],
@@ -143,7 +143,9 @@ impl ShellConfig {
     }
 }
 
-fn is_name_char(c: char) -> bool { c.is_ascii_alphanumeric() || c == '_' || c == '-' }
+fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
+}
 
 /// `parseShell`: `[section]` headers; `key = "string"` / `'string'`, numbers, width lists
 /// (`1 2`), bare words (`foreground`, `true`); inline `#` comments; keys outside a section are
@@ -210,7 +212,10 @@ mod tests {
     use super::*;
     use crate::theme::colors::rgb;
 
-    fn pal() -> Palette { Palette::parse("accent = \"#F3B77B\"\nbackground = \"#151E26\"\nforeground = \"#ECE5D8\"\nred = \"#EF8D80\"\nmuted = \"#88979F\"\n", false).unwrap() }
+    fn pal() -> Palette {
+        Palette::parse("accent = \"#F3B77B\"\nbackground = \"#151E26\"\nforeground = \"#ECE5D8\"\nred = \"#EF8D80\"\nmuted = \"#88979F\"\n", false)
+            .unwrap()
+    }
 
     #[test]
     fn value_grammar() {

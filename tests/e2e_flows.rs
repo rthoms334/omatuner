@@ -13,9 +13,9 @@
 //!   of that user data to the new ids (the store-level reattach rules are in
 //!   `store_catalogue.rs`; this checks them through the real job and library).
 
-mod support;
 #[path = "support/static_http.rs"]
 mod static_http;
+mod support;
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -79,9 +79,13 @@ impl App {
         Self { services: Some(services), events, stash: Vec::new() }
     }
 
-    fn services(&self) -> &Services { self.services.as_ref().expect("services alive") }
+    fn services(&self) -> &Services {
+        self.services.as_ref().expect("services alive")
+    }
 
-    fn reader(&self) -> rusqlite::Connection { self.services().store.reader().expect("reader") }
+    fn reader(&self) -> rusqlite::Connection {
+        self.services().store.reader().expect("reader")
+    }
 
     fn write<R: Send + 'static>(&self, f: impl FnOnce(&mut rusqlite::Connection) -> tuner::error::Result<R> + Send + 'static) -> R {
         self.services().store.writer().blocking(f).expect("write")
@@ -153,7 +157,9 @@ impl App {
         }
     }
 
-    fn source(&self, id: SourceId) -> tuner::model::Source { tuner::store::sources::get_source(&self.reader(), id).expect("source") }
+    fn source(&self, id: SourceId) -> tuner::model::Source {
+        tuner::store::sources::get_source(&self.reader(), id).expect("source")
+    }
 
     /// Orderly shutdown (final writes drained, WAL checkpointed).
     fn shutdown(mut self) {
@@ -184,7 +190,9 @@ fn draft(name: &str, kind: SourceKind) -> SourceDraft {
     }
 }
 
-fn channel(source: SourceId, key: &str) -> ItemRef { ItemRef { source, kind: ItemKind::Channel, key: ItemKey(key.into()) } }
+fn channel(source: SourceId, key: &str) -> ItemRef {
+    ItemRef { source, kind: ItemKind::Channel, key: ItemKey(key.into()) }
+}
 
 fn gzip(text: &str) -> Vec<u8> {
     let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -221,7 +229,11 @@ fn iptv_org_playlist(guide_url: &str) -> String {
         }
         out.push_str(&format!("http://127.0.0.1:9/live/{i}.m3u8\r\n"));
     }
-    for (id, name) in [("AlJazeera.qa@Arabic", "Al Jazeera Arabic"), ("AlJazeera.qa@English", "Al Jazeera English (1080p)"), ("AlJazeera.qa@EnglishHD", "Al Jazeera English HD")] {
+    for (id, name) in [
+        ("AlJazeera.qa@Arabic", "Al Jazeera Arabic"),
+        ("AlJazeera.qa@English", "Al Jazeera English (1080p)"),
+        ("AlJazeera.qa@EnglishHD", "Al Jazeera English HD"),
+    ] {
         out.push_str(&format!("#EXTINF:-1 tvg-id=\"{id}\" group-title=\"News\",{name}\r\nhttp://127.0.0.1:9/aj/{id}.m3u8\r\n"));
     }
     out.push_str("#EXTINF:-1 tvg-id=\"\" group-title=\"General\",ANT1 Europe\r\nhttp://127.0.0.1:9/ant1.m3u8\r\n");
@@ -374,9 +386,13 @@ fn start_panel(panel: Arc<Panel>) -> PanelServer {
     PanelServer { base, _rt: rt }
 }
 
-fn fixture_json(rel: &str) -> serde_json::Value { serde_json::from_slice(&std::fs::read(support::fixture(rel)).expect("fixture")).expect("json") }
+fn fixture_json(rel: &str) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(support::fixture(rel)).expect("fixture")).expect("json")
+}
 
-fn json(v: &serde_json::Value) -> Response { ([(header::CONTENT_TYPE, "application/json")], v.to_string()).into_response() }
+fn json(v: &serde_json::Value) -> Response {
+    ([(header::CONTENT_TYPE, "application/json")], v.to_string()).into_response()
+}
 
 fn shifted(rel: &str, field: &str, offset: i64) -> serde_json::Value {
     let mut v = fixture_json(rel);

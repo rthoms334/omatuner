@@ -182,9 +182,8 @@ pub fn virtual_list(
                 for index in range {
                     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), egui::Sense::hover());
                     let row_state = if index == state.cursor { RowState::Cursor } else { RowState::Idle };
-                    let mut child = ui.new_child(
-                        egui::UiBuilder::new().id_salt(index).max_rect(rect).layout(egui::Layout::top_down(egui::Align::Min)),
-                    );
+                    let mut child =
+                        ui.new_child(egui::UiBuilder::new().id_salt(index).max_rect(rect).layout(egui::Layout::top_down(egui::Align::Min)));
                     let resp = row(&mut child, RowCtx { index, state: row_state });
                     if resp.double_clicked() {
                         state.cursor = index;

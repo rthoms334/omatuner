@@ -26,14 +26,18 @@ pub struct FrameBudget {
 }
 
 impl Default for FrameBudget {
-    fn default() -> Self { Self::new(Self::UI_DB) }
+    fn default() -> Self {
+        Self::new(Self::UI_DB)
+    }
 }
 
 impl FrameBudget {
     /// The UI-thread DB budget per frame.
     pub const UI_DB: Duration = Duration::from_millis(2);
 
-    pub fn new(limit: Duration) -> Self { Self { limit, spent: Duration::ZERO, deferred: false } }
+    pub fn new(limit: Duration) -> Self {
+        Self { limit, spent: Duration::ZERO, deferred: false }
+    }
 
     /// Reset (app, start of every frame).
     pub fn begin_frame(&mut self) {
@@ -41,7 +45,9 @@ impl FrameBudget {
         self.deferred = false;
     }
 
-    pub fn exhausted(&self) -> bool { self.spent >= self.limit }
+    pub fn exhausted(&self) -> bool {
+        self.spent >= self.limit
+    }
 
     /// Run `f` if budget remains (timing it); `None` = deferred to a later frame.
     pub fn run<R>(&mut self, f: impl FnOnce() -> R) -> Option<R> {
@@ -56,8 +62,12 @@ impl FrameBudget {
     }
 
     /// Something was deferred this frame: the app requests a repaint.
-    pub fn deferred(&self) -> bool { self.deferred }
-    pub fn spent(&self) -> Duration { self.spent }
+    pub fn deferred(&self) -> bool {
+        self.deferred
+    }
+    pub fn spent(&self) -> Duration {
+        self.spent
+    }
 }
 
 /// EPG reads used by UI code. Times are EPG time except where noted (see `store::epg`).
@@ -102,13 +112,7 @@ impl NowNextCache {
     /// Cached value, loading it if allowed (≤ 8 misses per frame, within `budget`). A stale
     /// value is returned while a reload is deferred; `None` = not loaded yet (draw a skeleton
     /// and request a repaint — see [`NowNextCache::pending`]).
-    pub fn get(
-        &mut self,
-        key: (EpgChannelId, i32),
-        now: Timestamp,
-        reader: &mut dyn EpgReader,
-        budget: &mut FrameBudget,
-    ) -> Option<&NowNext> {
+    pub fn get(&mut self, key: (EpgChannelId, i32), now: Timestamp, reader: &mut dyn EpgReader, budget: &mut FrameBudget) -> Option<&NowNext> {
         let fresh = self.map.get(&key).is_some_and(|(_, until)| now < *until);
         if !fresh {
             if self.misses < Self::MAX_MISSES_PER_FRAME {
@@ -140,10 +144,14 @@ impl NowNextCache {
     }
 
     /// Some lookups were deferred this frame (request a repaint).
-    pub fn pending(&self) -> bool { self.pending }
+    pub fn pending(&self) -> bool {
+        self.pending
+    }
 
     /// Drop everything (`DataScope::Epg`).
-    pub fn invalidate(&mut self) { self.map.clear(); }
+    pub fn invalidate(&mut self) {
+        self.map.clear();
+    }
 }
 
 #[cfg(test)]
@@ -154,10 +162,19 @@ mod tests {
 
     struct Fake(u32);
     impl EpgReader for Fake {
-        fn window(&mut self, _: EpgChannelId, _: Timestamp, _: Timestamp) -> Result<Vec<ProgrammeSlim>> { Ok(vec![]) }
+        fn window(&mut self, _: EpgChannelId, _: Timestamp, _: Timestamp) -> Result<Vec<ProgrammeSlim>> {
+            Ok(vec![])
+        }
         fn now_next(&mut self, keys: &[(EpgChannelId, i32)], _now: Timestamp) -> Result<HashMap<(EpgChannelId, i32), NowNext>> {
             self.0 += 1;
-            let p = ProgrammeSlim { id: ProgrammeId(1), start: 0, stop: 100, title: Arc::from("News"), sub_title: None, flags: ProgrammeFlags::default() };
+            let p = ProgrammeSlim {
+                id: ProgrammeId(1),
+                start: 0,
+                stop: 100,
+                title: Arc::from("News"),
+                sub_title: None,
+                flags: ProgrammeFlags::default(),
+            };
             Ok(keys.iter().map(|k| (*k, NowNext { now: Some(p.shifted(k.1)), next: None })).collect())
         }
     }

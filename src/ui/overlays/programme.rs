@@ -52,7 +52,9 @@ pub struct ProgrammeOverlay {
 
 impl ProgrammeOverlay {
     /// `zap`: the opener's zap list for Watch (`None` = the channel's primary group).
-    pub fn new(programme: ProgrammeId, channel: ChannelId, zap: Option<ZapList>) -> Self { Self { programme, channel, cursor: 0, loaded: None, zap: zap.map(Some) } }
+    pub fn new(programme: ProgrammeId, channel: ChannelId, zap: Option<ZapList>) -> Self {
+        Self { programme, channel, cursor: 0, loaded: None, zap: zap.map(Some) }
+    }
 
     fn load(&mut self, ctx: &mut UiCtx<'_>) {
         if self.zap.is_none() {
@@ -158,7 +160,9 @@ impl ProgrammeOverlay {
 }
 
 impl Overlay for ProgrammeOverlay {
-    fn key_contexts(&self) -> Vec<KeyContext> { vec![KeyContext::Modal] }
+    fn key_contexts(&self) -> Vec<KeyContext> {
+        vec![KeyContext::Modal]
+    }
 
     fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> OverlayOutcome {
         self.load(ctx);
@@ -237,7 +241,9 @@ impl Overlay for ProgrammeOverlay {
                         ui.add_space(theme.space(SpaceToken::Sm));
                         ui.horizontal(|ui| {
                             let w = (ui.available_width() * 0.7).max(60.0);
-                            ui.allocate_ui(egui::vec2(w, (8.0 * theme.rem()).round()), |ui| progress::progress_bar(ui, theme, s.progress(now), (3.0 * theme.rem()).round()));
+                            ui.allocate_ui(egui::vec2(w, (8.0 * theme.rem()).round()), |ui| {
+                                progress::progress_bar(ui, theme, s.progress(now), (3.0 * theme.rem()).round())
+                            });
                             ui.label(RichText::new(time_left(s.stop - now)).size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
                         });
                     }
@@ -257,7 +263,12 @@ impl Overlay for ProgrammeOverlay {
                 ui.spacing_mut().item_spacing.x = theme.space(SpaceToken::Md);
                 for (i, a) in acts.iter().enumerate() {
                     let (icon, label) = self.label(*a, now);
-                    let style = ButtonStyle { focused: i == self.cursor, primary: i == 0 && *a != Act::Close, bordered: *a == Act::Close, ..Default::default() };
+                    let style = ButtonStyle {
+                        focused: i == self.cursor,
+                        primary: i == 0 && *a != Act::Close,
+                        bordered: *a == Act::Close,
+                        ..Default::default()
+                    };
                     if button(ui, theme, (!icon.is_empty()).then_some(icon), &label, style).clicked() {
                         clicked = Some(*a);
                     }

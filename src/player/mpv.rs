@@ -32,10 +32,7 @@ pub fn create(cfg: &Config) -> Result<Mpv> {
         init.set_option("audio-client-name", crate::APP_ID)?;
         init.set_option("cache", "yes")?;
         init.set_option("demuxer-max-back-bytes", "32MiB")?;
-        init.set_option(
-            "stream-lavf-o",
-            "reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=5",
-        )?;
+        init.set_option("stream-lavf-o", "reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=5")?;
         for (name, value) in runtime_settings(cfg) {
             init.set_option(name, value.as_str())?;
         }
@@ -113,7 +110,9 @@ pub(super) fn apply_runtime(mpv: &Mpv, cfg: &Config, previous: &Config) {
 
 /// mpv option-value quoting: `%<bytes>%<value>` is accepted by every mpv option parser and
 /// survives `,` `=` `"` inside values (header lists, URLs with commas).
-pub fn quote(value: &str) -> String { format!("%{}%{}", value.len(), value) }
+pub fn quote(value: &str) -> String {
+    format!("%{}%{}", value.len(), value)
+}
 
 /// Arguments for `loadfile <url> replace -1 <options>` (mpv ≥ 0.38: the index `-1` is REQUIRED
 /// before the options argument; verified in the local mpv 0.41 man page).
@@ -255,8 +254,18 @@ mod tests {
         cfg.player.sub_auto = SubtitleAuto::Off;
         let s: BTreeMap<_, _> = runtime_settings(&cfg).into_iter().collect();
         for name in [
-            "hwdec", "cache-secs", "demuxer-readahead-secs", "demuxer-max-bytes", "network-timeout", "alang", "slang", "sid",
-            "subs-fallback-forced", "subs-fallback", "sub-scale", "user-agent",
+            "hwdec",
+            "cache-secs",
+            "demuxer-readahead-secs",
+            "demuxer-max-bytes",
+            "network-timeout",
+            "alang",
+            "slang",
+            "sid",
+            "subs-fallback-forced",
+            "subs-fallback",
+            "sub-scale",
+            "user-agent",
         ] {
             assert!(s.contains_key(name), "{name}");
         }

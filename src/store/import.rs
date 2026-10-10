@@ -22,8 +22,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::model::{
-    CatchupSpec, Fingerprint, GroupId, GroupKey, HttpHeaders, ItemKey, ItemKind, ItemRef, ReattachOutcome, SeriesId, SourceId,
-    StreamLocator, Timestamp, Unsupported,
+    CatchupSpec, Fingerprint, GroupId, GroupKey, HttpHeaders, ItemKey, ItemKind, ItemRef, ReattachOutcome, SeriesId, SourceId, StreamLocator,
+    Timestamp, Unsupported,
 };
 use crate::store::sql::{self, atomic, enum_str, fp_from_json, from_json_opt, or_not_found, u32_of};
 
@@ -189,7 +189,9 @@ struct Counters {
     updated: u32,
 }
 
-fn counter_key(imp: &CatalogueImport, what: &str) -> String { format!("import:{}:{}:{what}", imp.source.0, imp.generation) }
+fn counter_key(imp: &CatalogueImport, what: &str) -> String {
+    format!("import:{}:{}:{what}", imp.source.0, imp.generation)
+}
 
 fn bump_counters(conn: &Connection, imp: &CatalogueImport, what: &str, added: u32, updated: u32) -> Result<()> {
     let key = counter_key(imp, what);
@@ -223,8 +225,7 @@ fn table_of(kind: ItemKind) -> &'static str {
 
 /// Start an import: computes the next generation; nothing is written yet.
 pub fn begin_catalogue(conn: &Connection, source: SourceId, now: Timestamp) -> Result<CatalogueImport> {
-    let generation: i64 =
-        or_not_found(conn.query_row("SELECT generation FROM source WHERE id = ?1", [source], |r| r.get(0)), "source", source)?;
+    let generation: i64 = or_not_found(conn.query_row("SELECT generation FROM source WHERE id = ?1", [source], |r| r.get(0)), "source", source)?;
     // counters of an earlier cancelled run
     conn.execute("DELETE FROM meta WHERE key LIKE ?1", [format!("import:{}:%", source.0)])?;
     Ok(CatalogueImport { source, generation: generation + 1, started_at: now })
@@ -331,9 +332,8 @@ fn write_memberships(conn: &Connection, link: &str, col: &str, id: i64, groups: 
     }
     let primary = if link == "channel_group" { ", is_primary" } else { "" };
     let primary_val = if link == "channel_group" { ", ?4" } else { "" };
-    let mut ins = conn.prepare_cached(&format!(
-        "INSERT INTO {link}(group_id, {col}, position{primary}) VALUES (?1, ?2, ?3{primary_val}) ON CONFLICT DO NOTHING"
-    ))?;
+    let mut ins = conn
+        .prepare_cached(&format!("INSERT INTO {link}(group_id, {col}, position{primary}) VALUES (?1, ?2, ?3{primary_val}) ON CONFLICT DO NOTHING"))?;
     for (i, g) in groups.iter().enumerate() {
         if primary.is_empty() {
             ins.execute(params![g, id, position])?;
@@ -548,22 +548,15 @@ fn sweep_kind(conn: &Connection, imp: &CatalogueImport, kind: ItemKind) -> Resul
 /// The sweep itself runs first in chunks of 2 000 rows (one transaction each, DESIGN §5.3) so
 /// that a provider dropping 50k items cannot stall user writes; everything after it is one
 /// transaction. If the process dies in between, the next import simply sweeps again.
-pub fn finish_catalogue(
-    conn: &mut Connection,
-    imp: &CatalogueImport,
-    completed: &[ItemKind],
-    now: Timestamp,
-) -> Result<ImportSummary> {
+pub fn finish_catalogue(conn: &mut Connection, imp: &CatalogueImport, completed: &[ItemKind], now: Timestamp) -> Result<ImportSummary> {
     let kinds = [ItemKind::Channel, ItemKind::Movie, ItemKind::Series];
     let mut removed: HashMap<ItemKind, u32> = HashMap::new();
     let mut groups_removed = 0u32;
     for kind in kinds.into_iter().filter(|k| completed.contains(k)) {
         removed.insert(kind, sweep_kind(conn, imp, kind)?);
         groups_removed += atomic(conn, |c| {
-            Ok(c.execute(
-                "DELETE FROM grp WHERE source_id = ?1 AND kind = ?2 AND seen_gen < ?3",
-                params![imp.source, kind.as_str(), imp.generation],
-            )? as u32)
+            Ok(c.execute("DELETE FROM grp WHERE source_id = ?1 AND kind = ?2 AND seen_gen < ?3", params![imp.source, kind.as_str(), imp.generation])?
+                as u32)
         })?;
     }
 
@@ -578,8 +571,7 @@ pub fn finish_catalogue(
             params![imp.source, kind.as_str()],
         )?;
         let c = take_counters(&tx, imp, kind.as_str())?;
-        let total: i64 =
-            tx.query_row(&format!("SELECT count(*) FROM {} WHERE source_id = ?1", table_of(kind)), [imp.source], |r| r.get(0))?;
+        let total: i64 = tx.query_row(&format!("SELECT count(*) FROM {} WHERE source_id = ?1", table_of(kind)), [imp.source], |r| r.get(0))?;
         let counts = KindCounts { added: c.added, updated: c.updated, removed: removed.get(&kind).copied().unwrap_or(0), total: u32_of(total) };
         match kind {
             ItemKind::Channel => summary.channels = counts,
@@ -835,12 +827,7 @@ pub fn store_movie_details(conn: &Connection, movie: crate::model::MovieId, d: &
 ///
 /// Episode user data (progress, favourites…) of this series whose key vanished is re-attached
 /// here (same steps as [`reattach_user_data`], against this series' new episodes).
-pub fn store_series_details(
-    conn: &mut Connection,
-    series: crate::model::SeriesId,
-    d: &SeriesDetails,
-    now: Timestamp,
-) -> Result<()> {
+pub fn store_series_details(conn: &mut Connection, series: crate::model::SeriesId, d: &SeriesDetails, now: Timestamp) -> Result<()> {
     let tx = conn.transaction()?;
     let (source, norm): (SourceId, String) = or_not_found(
         tx.query_row("SELECT source_id, norm_name FROM series WHERE id = ?1", [series], |r| Ok((r.get(0)?, r.get(1)?))),
@@ -876,10 +863,7 @@ pub fn store_series_details(
         }
     }
     let keys: Vec<&str> = d.episodes.iter().map(|e| e.key.as_str()).collect();
-    tx.execute(
-        "DELETE FROM episode WHERE series_id = ?1 AND key NOT IN (SELECT value FROM json_each(?2))",
-        params![series, sql::to_json(&keys)?],
-    )?;
+    tx.execute("DELETE FROM episode WHERE series_id = ?1 AND key NOT IN (SELECT value FROM json_each(?2))", params![series, sql::to_json(&keys)?])?;
 
     // seasons: as sent, or synthesized from the episodes; counts fall back to the episodes
     let mut per_season: BTreeMap<u32, u32> = BTreeMap::new();
@@ -894,7 +878,15 @@ pub fn store_series_details(
         )?;
         if d.seasons.is_empty() {
             for (n, count) in &per_season {
-                ins.execute(params![series, n, Option::<String>::None, Option::<String>::None, Option::<String>::None, Option::<String>::None, count])?;
+                ins.execute(params![
+                    series,
+                    n,
+                    Option::<String>::None,
+                    Option::<String>::None,
+                    Option::<String>::None,
+                    Option::<String>::None,
+                    count
+                ])?;
             }
         } else {
             for s in &d.seasons {
@@ -903,7 +895,15 @@ pub fn store_series_details(
             }
             // episodes of seasons the provider did not list still get a season row
             for (n, count) in per_season.iter().filter(|(n, _)| !d.seasons.iter().any(|s| s.number == **n)) {
-                ins.execute(params![series, n, Option::<String>::None, Option::<String>::None, Option::<String>::None, Option::<String>::None, count])?;
+                ins.execute(params![
+                    series,
+                    n,
+                    Option::<String>::None,
+                    Option::<String>::None,
+                    Option::<String>::None,
+                    Option::<String>::None,
+                    count
+                ])?;
             }
         }
     }

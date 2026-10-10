@@ -148,7 +148,9 @@ impl IpcServer {
     }
 
     /// The bound socket, for an exit path that can't drop the server (signal handling).
-    pub fn socket(&self) -> SocketGuard { self.socket.clone() }
+    pub fn socket(&self) -> SocketGuard {
+        self.socket.clone()
+    }
 }
 
 impl Drop for IpcServer {

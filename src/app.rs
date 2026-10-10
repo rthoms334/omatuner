@@ -149,9 +149,9 @@ impl TunerApp {
         let idle = {
             use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
             match (cc.display_handle(), cc.window_handle()) {
-                (Ok(d), Ok(w)) => crate::platform::idle::IdleInhibitor::new(d.as_raw(), w.as_raw())
-                    .map_err(|e| tracing::info!("idle inhibitor: {e}"))
-                    .ok(),
+                (Ok(d), Ok(w)) => {
+                    crate::platform::idle::IdleInhibitor::new(d.as_raw(), w.as_raw()).map_err(|e| tracing::info!("idle inhibitor: {e}")).ok()
+                }
                 _ => None,
             }
         };
@@ -198,9 +198,13 @@ impl TunerApp {
         app
     }
 
-    fn services(&self) -> &Services { self.services.as_ref().expect("services alive") }
+    fn services(&self) -> &Services {
+        self.services.as_ref().expect("services alive")
+    }
 
-    fn current_route(&self) -> &Route { self.routes.last().expect("route stack never empty") }
+    fn current_route(&self) -> &Route {
+        self.routes.last().expect("route stack never empty")
+    }
 
     fn screen_index(&self, id: ScreenId) -> usize {
         self.screens.iter().position(|s| s.id() == id).expect("every ScreenId has a screen")
@@ -732,7 +736,9 @@ impl TunerApp {
         }
     }
 
-    fn chrome_hidden(&self) -> bool { matches!(self.current_route().screen(), ScreenId::Player | ScreenId::Onboarding) }
+    fn chrome_hidden(&self) -> bool {
+        matches!(self.current_route().screen(), ScreenId::Player | ScreenId::Onboarding)
+    }
 
     /// `StartScreen::Last`: store the main screen the user leaves on (written at exit only).
     fn remember_last_screen(&self) {
@@ -772,7 +778,9 @@ impl TunerApp {
                 .resizable(false)
                 .show_separator_line(false)
                 .frame(frame.inner_margin(egui::Margin::symmetric(theme.space(SpaceToken::Md) as i8, 0)))
-                .show(ui, |ui| ui.horizontal(|ui| crate::ui::widgets::sidebar::sidebar(ui, theme, current, false, has_vod, &mut search_clicked)).inner)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| crate::ui::widgets::sidebar::sidebar(ui, theme, current, false, has_vod, &mut search_clicked)).inner
+                })
                 .inner
         };
         if let Some(id) = clicked {
@@ -863,9 +871,8 @@ impl eframe::App for TunerApp {
             let jobs = self.services().jobs.active();
             let hint = keymap::hint_line(&self.key_stack());
             let mini_hidden = self.layout == LayoutClass::Compact || !cfg.interface.mini_player;
-            let now_playing = (mini_hidden && self.snapshot.state != PlayerState::Idle)
-                .then(|| self.snapshot.playable.as_ref().map(|p| p.title.clone()))
-                .flatten();
+            let now_playing =
+                (mini_hidden && self.snapshot.state != PlayerState::Idle).then(|| self.snapshot.playable.as_ref().map(|p| p.title.clone())).flatten();
             let info = StatusInfo {
                 jobs: &jobs,
                 epg_updated: self.epg_updated,
@@ -972,7 +979,9 @@ fn image_agents(sources: &[crate::model::Source]) -> std::collections::HashMap<S
 }
 
 /// The same theme at another `interface.ui_scale`.
-fn scaled(t: Theme, ui_scale: f32) -> Theme { Theme::from_parts(t.name, t.palette, t.shell, t.tokens.rounding, ui_scale) }
+fn scaled(t: Theme, ui_scale: f32) -> Theme {
+    Theme::from_parts(t.name, t.palette, t.shell, t.tokens.rounding, ui_scale)
+}
 
 fn route_for_screen(id: ScreenId) -> Route {
     match id {
@@ -1145,9 +1154,16 @@ mod tests {
 
     impl Rig {
         /// Live TV start route, default test config, empty profile.
-        fn new() -> Self { Self::with(test_config(), live(), 1.0, |_| Ok(())) }
+        fn new() -> Self {
+            Self::with(test_config(), live(), 1.0, |_| Ok(()))
+        }
 
-        fn with(cfg: Config, initial: IpcRequest, ui_scale: f32, seed: impl FnOnce(&mut rusqlite::Connection) -> crate::error::Result<()> + Send + 'static) -> Self {
+        fn with(
+            cfg: Config,
+            initial: IpcRequest,
+            ui_scale: f32,
+            seed: impl FnOnce(&mut rusqlite::Connection) -> crate::error::Result<()> + Send + 'static,
+        ) -> Self {
             let one = ONE_APP.lock().unwrap_or_else(|e| e.into_inner());
             let dir = tempfile::tempdir().unwrap();
             let paths = rooted(dir.path());
@@ -1168,7 +1184,9 @@ mod tests {
         }
 
         /// One eframe frame with these input events.
-        fn frame_with(&mut self, events: Vec<Event>) -> egui::FullOutput { self.frame_raw(events, true) }
+        fn frame_with(&mut self, events: Vec<Event>) -> egui::FullOutput {
+            self.frame_raw(events, true)
+        }
 
         fn frame_raw(&mut self, events: Vec<Event>, hook: bool) -> egui::FullOutput {
             let mut raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.size)), events, ..Default::default() };
@@ -1185,10 +1203,14 @@ mod tests {
             out
         }
 
-        fn press(&mut self, key: Key, modifiers: Modifiers) -> egui::FullOutput { self.frame_with(key_events(key, modifiers)) }
+        fn press(&mut self, key: Key, modifiers: Modifiers) -> egui::FullOutput {
+            self.frame_with(key_events(key, modifiers))
+        }
 
         /// Run frames until `done` or 10 s (background work finishing).
-        fn until(&mut self, what: &str, done: impl FnMut(&mut Self) -> bool) { self.until_within(what, Duration::from_secs(10), done) }
+        fn until(&mut self, what: &str, done: impl FnMut(&mut Self) -> bool) {
+            self.until_within(what, Duration::from_secs(10), done)
+        }
 
         fn until_within(&mut self, what: &str, limit: Duration, mut done: impl FnMut(&mut Self) -> bool) {
             let deadline = Instant::now() + limit;
@@ -1205,9 +1227,13 @@ mod tests {
             self.until("startup jobs", |r| r.app.lib.built_at != 0 && r.app.services().jobs.active().is_empty());
         }
 
-        fn route(&self) -> &Route { self.app.current_route() }
+        fn route(&self) -> &Route {
+            self.app.current_route()
+        }
 
-        fn log(&self) -> std::cell::Ref<'_, Log> { self.app.log.borrow() }
+        fn log(&self) -> std::cell::Ref<'_, Log> {
+            self.app.log.borrow()
+        }
 
         fn probe(&mut self, id: ScreenId, contexts: Vec<KeyContext>) -> Rc<RefCell<Probe>> {
             let st = Rc::new(RefCell::new(Probe { contexts, ..Default::default() }));
@@ -1222,18 +1248,28 @@ mod tests {
             self.app.handle_event(ev, &ctx);
         }
 
-        fn writer(&self) -> crate::store::Writer { self.app.services().store.writer().clone() }
+        fn writer(&self) -> crate::store::Writer {
+            self.app.services().store.writer().clone()
+        }
 
-        fn overlay_kinds(&self) -> Vec<std::mem::Discriminant<OverlayRequest>> { self.app.overlays.iter().map(|o| o.kind).collect() }
+        fn overlay_kinds(&self) -> Vec<std::mem::Discriminant<OverlayRequest>> {
+            self.app.overlays.iter().map(|o| o.kind).collect()
+        }
     }
 
     impl Drop for Rig {
-        fn drop(&mut self) { self.app.on_exit(None); }
+        fn drop(&mut self) {
+            self.app.on_exit(None);
+        }
     }
 
-    fn live() -> IpcRequest { IpcRequest { view: Some(crate::cli::ViewArg::Live), ..Default::default() } }
+    fn live() -> IpcRequest {
+        IpcRequest { view: Some(crate::cli::ViewArg::Live), ..Default::default() }
+    }
 
-    fn kind(req: OverlayRequest) -> std::mem::Discriminant<OverlayRequest> { std::mem::discriminant(&req) }
+    fn kind(req: OverlayRequest) -> std::mem::Discriminant<OverlayRequest> {
+        std::mem::discriminant(&req)
+    }
 
     fn key_events(key: Key, modifiers: Modifiers) -> Vec<Event> {
         let ev = |pressed| Event::Key { key, physical_key: None, pressed, repeat: false, modifiers };
@@ -1263,10 +1299,18 @@ mod tests {
     }
 
     impl Screen for ProbeScreen {
-        fn id(&self) -> ScreenId { self.id }
-        fn key_contexts(&self) -> Vec<KeyContext> { self.st.borrow().contexts.clone() }
-        fn on_enter(&mut self, _ctx: &mut UiCtx<'_>, route: &Route) { self.st.borrow_mut().entered.push(route.clone()) }
-        fn on_event(&mut self, _ctx: &mut UiCtx<'_>, _ev: &AppEvent) { self.st.borrow_mut().events += 1 }
+        fn id(&self) -> ScreenId {
+            self.id
+        }
+        fn key_contexts(&self) -> Vec<KeyContext> {
+            self.st.borrow().contexts.clone()
+        }
+        fn on_enter(&mut self, _ctx: &mut UiCtx<'_>, route: &Route) {
+            self.st.borrow_mut().entered.push(route.clone())
+        }
+        fn on_event(&mut self, _ctx: &mut UiCtx<'_>, _ev: &AppEvent) {
+            self.st.borrow_mut().events += 1
+        }
         fn on_action(&mut self, _ctx: &mut UiCtx<'_>, action: Action) -> bool {
             let mut st = self.st.borrow_mut();
             st.actions.push(action);
@@ -1287,22 +1331,39 @@ mod tests {
                 st.clicks += 1;
             }
         }
-        fn on_overlay_result(&mut self, _ctx: &mut UiCtx<'_>, result: OverlayResult) { self.st.borrow_mut().results.push(result) }
+        fn on_overlay_result(&mut self, _ctx: &mut UiCtx<'_>, result: OverlayResult) {
+            self.st.borrow_mut().results.push(result)
+        }
     }
 
     /// One source, an "All" group and channels `m3u:ch<i>` (numbers 1…n).
     fn seed_channels(c: &mut rusqlite::Connection, n: usize, account: Option<&str>) -> crate::error::Result<()> {
         use rusqlite::params;
-        c.execute("INSERT INTO source(name, kind, url, created_at, generation, account) VALUES ('My IPTV', 'm3u-url', 'http://127.0.0.1/p.m3u', 0, 1, ?1)", [account])?;
+        c.execute(
+            "INSERT INTO source(name, kind, url, created_at, generation, account) VALUES ('My IPTV', 'm3u-url', 'http://127.0.0.1/p.m3u', 0, 1, ?1)",
+            [account],
+        )?;
         let src = c.last_insert_rowid();
-        c.execute("INSERT INTO grp(source_id, kind, key, name, provider_order, item_count, seen_gen) VALUES (?1,'channel','channel:all','All',0,?2,1)", params![src, n as i64])?;
+        c.execute(
+            "INSERT INTO grp(source_id, kind, key, name, provider_order, item_count, seen_gen) VALUES (?1,'channel','channel:all','All',0,?2,1)",
+            params![src, n as i64],
+        )?;
         let grp = c.last_insert_rowid();
         for i in 0..n {
             let url = format!("http://127.0.0.1/live/{i}.ts");
             c.execute(
                 "INSERT INTO channel(source_id, key, name, clean_name, norm_name, number, stream, url_key, provider_order, seen_gen)
                  VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
-                params![src, format!("m3u:ch{i}"), format!("Channel {i}"), format!("channel{i}"), (i + 1) as i64, format!(r#"{{"t":"url","url":"{url}"}}"#), url, i as i64],
+                params![
+                    src,
+                    format!("m3u:ch{i}"),
+                    format!("Channel {i}"),
+                    format!("channel{i}"),
+                    (i + 1) as i64,
+                    format!(r#"{{"t":"url","url":"{url}"}}"#),
+                    url,
+                    i as i64
+                ],
             )?;
             let id = c.last_insert_rowid();
             c.execute("INSERT INTO channel_group(group_id, channel_id, position, is_primary) VALUES (?1, ?2, ?3, 1)", params![grp, id, i as i64])?;
@@ -1310,12 +1371,19 @@ mod tests {
         Ok(())
     }
 
-    fn channel_ref(i: usize) -> ItemRef { ItemRef { source: SourceId(1), kind: ItemKind::Channel, key: ItemKey(format!("m3u:ch{i}")) } }
+    fn channel_ref(i: usize) -> ItemRef {
+        ItemRef { source: SourceId(1), kind: ItemKind::Channel, key: ItemKey(format!("m3u:ch{i}")) }
+    }
 
     /// Load the real library from the profile and deliver it like the RebuildLibrary job.
     fn deliver_library(rig: &mut Rig) {
         let lib = crate::store::library::load(&rig.app.db).unwrap();
-        rig.event(AppEvent::Job(JobEvent::Finished { id: JobId(9), kind: JobKind::RebuildLibrary, outcome: Ok(JobOutcome::Library(Arc::new(lib))), failure: None }));
+        rig.event(AppEvent::Job(JobEvent::Finished {
+            id: JobId(9),
+            kind: JobKind::RebuildLibrary,
+            outcome: Ok(JobOutcome::Library(Arc::new(lib))),
+            failure: None,
+        }));
     }
 
     fn played(log: &Log) -> Vec<(MediaRef, PlayOrigin)> {
@@ -1482,7 +1550,13 @@ mod tests {
     fn overlay_results_go_to_the_screen_that_opened_it() {
         let mut rig = Rig::new();
         let probe = rig.probe(ScreenId::Live, vec![KeyContext::List]);
-        let spec = crate::ui::overlays::ConfirmSpec { title: "Delete?".into(), body: String::new(), confirm_label: "Delete".into(), destructive: false, token: 7 };
+        let spec = crate::ui::overlays::ConfirmSpec {
+            title: "Delete?".into(),
+            body: String::new(),
+            confirm_label: "Delete".into(),
+            destructive: false,
+            token: 7,
+        };
         rig.app.nav.push(NavRequest::Open(OverlayRequest::Confirm(spec)));
         rig.frame_with(vec![]);
         assert_eq!(rig.overlay_kinds().len(), 1);
@@ -1569,7 +1643,9 @@ mod tests {
         let before = rig.app.lib.clone();
         assert!(before.recent_channels.is_empty());
         rig.writer()
-            .blocking(|c| crate::store::user::push_history(c, &crate::model::HistoryEntry { item: channel_ref(2), at: 10, title: "Channel 2".into() }))
+            .blocking(|c| {
+                crate::store::user::push_history(c, &crate::model::HistoryEntry { item: channel_ref(2), at: 10, title: "Channel 2".into() })
+            })
             .unwrap();
         rig.event(AppEvent::Data(DataScope::History));
         assert!(rig.log().jobs.is_empty(), "a zap never rebuilds the library");
@@ -1584,12 +1660,19 @@ mod tests {
         // a library built before that zap lands later: the list is re-read on the swap
         let mut stale = crate::store::library::load(&rig.app.db).unwrap();
         stale.recent_channels.clear();
-        rig.event(AppEvent::Job(JobEvent::Finished { id: JobId(9), kind: JobKind::RebuildLibrary, outcome: Ok(JobOutcome::Library(Arc::new(stale))), failure: None }));
+        rig.event(AppEvent::Job(JobEvent::Finished {
+            id: JobId(9),
+            kind: JobKind::RebuildLibrary,
+            outcome: Ok(JobOutcome::Library(Arc::new(stale))),
+            failure: None,
+        }));
         assert_eq!(rig.app.lib.recent_channels.len(), 1);
         rig.app.log.borrow_mut().jobs.clear();
         // EPG: fresh guide time + rebuild
         rig.writer()
-            .blocking(|c| Ok(c.execute("INSERT INTO epg_source(name, kind, url, last_refresh) VALUES ('G', 'url', 'http://127.0.0.1/e.xml', 1234567)", [])?))
+            .blocking(|c| {
+                Ok(c.execute("INSERT INTO epg_source(name, kind, url, last_refresh) VALUES ('G', 'url', 'http://127.0.0.1/e.xml', 1234567)", [])?)
+            })
             .unwrap();
         assert_eq!(rig.app.epg_updated, None);
         rig.event(AppEvent::Data(DataScope::Epg));
@@ -1681,7 +1764,10 @@ mod tests {
         rig.event(failed(source(), crate::error::Error::Network("dns failure".into())));
         assert!(rig.app.offline);
         assert_eq!(rig.log().toasts.last().unwrap().text, "Couldn't refresh My IPTV: network error: dns failure");
-        rig.event(failed(JobKind::RefreshEpg { epg_source: crate::model::EpgSourceId(1), force: false }, crate::error::Error::Http { status: 404, url: "http://h/e.xml".into() }));
+        rig.event(failed(
+            JobKind::RefreshEpg { epg_source: crate::model::EpgSourceId(1), force: false },
+            crate::error::Error::Http { status: 404, url: "http://h/e.xml".into() },
+        ));
         assert!(!rig.app.offline, "an HTTP error means the network works");
         assert_eq!(rig.log().toasts.last().unwrap().kind, ToastKind::Error);
         rig.event(failed(JobKind::RefreshStale, crate::error::Error::Network("timeout".into())));
@@ -1740,7 +1826,12 @@ mod tests {
     #[test]
     fn log_export_runs_off_the_ui_thread_and_toasts() {
         let mut rig = Rig::new();
-        rig.app.services().logs.push(crate::logging::LogLine { at: 0, level: tracing::Level::INFO, target: "tuner".into(), message: "exported line".into() });
+        rig.app.services().logs.push(crate::logging::LogLine {
+            at: 0,
+            level: tracing::Level::INFO,
+            target: "tuner".into(),
+            message: "exported line".into(),
+        });
         let path = rig.dir.path().join("log.txt");
         rig.event(AppEvent::Platform(PlatformEvent::FilePicked { purpose: PickPurpose::ExportLog, path: Some(path.clone()) }));
         rig.until("the export toast", |r| r.log().toasts.iter().any(|t| t.kind == ToastKind::Success));
@@ -1873,7 +1964,12 @@ mod tests {
             .unwrap();
         rig.event(AppEvent::Data(DataScope::Favourites));
         assert!(rig.app.favs.is_fav(&channel_ref(0)));
-        rig.event(AppEvent::Job(JobEvent::Finished { id: JobId(9), kind: JobKind::RebuildLibrary, outcome: Ok(JobOutcome::Library(Arc::new(stale))), failure: None }));
+        rig.event(AppEvent::Job(JobEvent::Finished {
+            id: JobId(9),
+            kind: JobKind::RebuildLibrary,
+            outcome: Ok(JobOutcome::Library(Arc::new(stale))),
+            failure: None,
+        }));
         assert!(rig.app.favs.is_fav(&channel_ref(0)), "the older library's favourites don't win");
     }
 
@@ -2182,7 +2278,12 @@ mod tests {
             OverlayRequest::Jobs,
             OverlayRequest::Help,
             OverlayRequest::Tracks { audio: false },
-            OverlayRequest::Resume(crate::ui::overlays::ResumeSpec { media: MediaRef::Url("x".into()), title: "t".into(), position_s: 10.0, duration_s: None }),
+            OverlayRequest::Resume(crate::ui::overlays::ResumeSpec {
+                media: MediaRef::Url("x".into()),
+                title: "t".into(),
+                position_s: 10.0,
+                duration_s: None,
+            }),
         ];
         for o in overlays {
             rig.app.nav.push(NavRequest::Open(o));

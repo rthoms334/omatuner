@@ -11,9 +11,13 @@ use tuner::sources::m3u::{self, M3uEntry, M3uError, M3uHeader};
 use tuner::sources::smart_names::{Quality, clean_channel_name};
 use url::Url;
 
-fn fixture(rel: &str) -> PathBuf { PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/m3u").join(rel) }
+fn fixture(rel: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/m3u").join(rel)
+}
 
-fn read_fixture(rel: &str) -> Vec<u8> { std::fs::read(fixture(rel)).expect("fixture") }
+fn read_fixture(rel: &str) -> Vec<u8> {
+    std::fs::read(fixture(rel)).expect("fixture")
+}
 
 const BASE: &str = "http://lists.example/playlists/edge.m3u";
 
@@ -29,13 +33,21 @@ fn parse_bytes(b: &[u8]) -> (M3uHeader, Vec<M3uEntry>) {
     (h, e)
 }
 
-fn kv(pairs: &[(&str, &str)]) -> Vec<(String, String)> { pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect() }
+fn kv(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+}
 
-fn s(v: &str) -> Option<String> { Some(v.to_owned()) }
+fn s(v: &str) -> Option<String> {
+    Some(v.to_owned())
+}
 
-fn spec(kind: CatchupKind, days: u32) -> Option<CatchupSpec> { Some(CatchupSpec { kind, template: None, days, correction_s: 0 }) }
+fn spec(kind: CatchupKind, days: u32) -> Option<CatchupSpec> {
+    Some(CatchupSpec { kind, template: None, days, correction_s: 0 })
+}
 
-fn header_shift() -> Option<CatchupSpec> { spec(CatchupKind::Shift, 3) }
+fn header_shift() -> Option<CatchupSpec> {
+    spec(CatchupKind::Shift, 3)
+}
 
 /// The exact expected parse of `edge_cases.m3u` against `BASE`.
 fn expected_edge_cases() -> (M3uHeader, Vec<M3uEntry>) {
@@ -227,7 +239,13 @@ fn variants(lf: &str) -> Vec<(&'static str, Vec<u8>)> {
         .enumerate()
         .map(|(i, l)| {
             let next_empty = lines.get(i + 1).is_none_or(|n| n.is_empty());
-            let term = if i % 3 == 2 && !next_empty { "\r" } else if i % 2 == 0 { "\n" } else { "\r\n" };
+            let term = if i % 3 == 2 && !next_empty {
+                "\r"
+            } else if i % 2 == 0 {
+                "\n"
+            } else {
+                "\r\n"
+            };
             format!("{l}{term}")
         })
         .collect();
@@ -315,7 +333,10 @@ fn other_payloads_are_not_m3u() {
         (b"# just a comment\n", PayloadKind::Unknown),
         (b"relative/path.ts\n", PayloadKind::Unknown),
         // XHTML error page: only a later line says `<html`
-        (b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0//EN\">\n<html><body>Expired</body></html>", PayloadKind::Html),
+        (
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0//EN\">\n<html><body>Expired</body></html>",
+            PayloadKind::Html,
+        ),
         (b"\xEF\xBB\xBF<!DOCTYPE html>\n<html></html>", PayloadKind::Html),
     ];
     for (bytes, kind) in cases {
@@ -331,10 +352,10 @@ fn headerless_playlists_are_accepted() {
     let (h, e) = parse_bytes(b"#EXTINF:-1,A\nhttp://h/a\n");
     assert_eq!((h, e.len()), (M3uHeader::default(), 1));
     let (_, e) = parse_bytes(b"\n\nrtmp://h/live/a\nudp://@239.0.0.1:1234\n");
-    assert_eq!(e.iter().map(|e| (e.title.as_str(), e.url.as_str())).collect::<Vec<_>>(), [
-        ("a", "rtmp://h/live/a"),
-        ("udp://@239.0.0.1:1234", "udp://@239.0.0.1:1234")
-    ]);
+    assert_eq!(
+        e.iter().map(|e| (e.title.as_str(), e.url.as_str())).collect::<Vec<_>>(),
+        [("a", "rtmp://h/live/a"), ("udp://@239.0.0.1:1234", "udp://@239.0.0.1:1234")]
+    );
     // a header alone is an empty (but valid) playlist
     let (_, e) = parse_bytes(b"#EXTM3U\n");
     assert!(e.is_empty());
@@ -359,12 +380,15 @@ fn directives_headers_and_precedence() {
         http://h/three\n\
         #EXTINF:-1,Four\nhttp://h/four\n";
     let (_, e) = parse_bytes(text.as_bytes());
-    assert_eq!(e[0].headers, HttpHeaders {
-        user_agent: s("pipe-ua"),
-        referrer: s("http://attr/"),
-        origin: s("http://o/"),
-        extra: kv(&[("Cookie", "a=b"), ("X-Token", "def")]),
-    });
+    assert_eq!(
+        e[0].headers,
+        HttpHeaders {
+            user_agent: s("pipe-ua"),
+            referrer: s("http://attr/"),
+            origin: s("http://o/"),
+            extra: kv(&[("Cookie", "a=b"), ("X-Token", "def")]),
+        }
+    );
     assert_eq!(e[0].url, "http://h/one");
     assert_eq!(e[1].headers, HttpHeaders { user_agent: s("only-attr"), ..Default::default() });
     assert!(!e[1].drm && e[2].drm && !e[3].drm, "DRM flag applies to its own entry only");
@@ -441,7 +465,10 @@ fn extgrp_is_sticky_until_cleared_and_group_title_wins() {
         #EXTINF:-1 group-title=\" ; \",C\nhttp://h/c\n#EXTGRP:\n#EXTINF:-1,D\nhttp://h/d\n";
     let (_, e) = parse_bytes(text.as_bytes());
     let groups: Vec<Vec<String>> = e.iter().map(|e| e.groups.clone()).collect();
-    assert_eq!(groups, vec![vec!["Kids".to_owned(), "Family".to_owned()], vec!["Own".to_owned()], vec!["Kids".to_owned(), "Family".to_owned()], vec![]]);
+    assert_eq!(
+        groups,
+        vec![vec!["Kids".to_owned(), "Family".to_owned()], vec!["Own".to_owned()], vec!["Kids".to_owned(), "Family".to_owned()], vec![]]
+    );
 }
 
 #[test]
@@ -527,13 +554,16 @@ fn relative_urls_resolve_against_the_playlist() {
         #EXTINF:-1,D\nrtsp://cam/stream\n#EXTINF:-1 tvg-logo=\"data:image/png;base64,AAAA\",E\nhttps://other.example/e\n";
     let (_, e, _) = parse_all(Cursor::new(text), Some(&base));
     let urls: Vec<&str> = e.iter().map(|e| e.url.as_str()).collect();
-    assert_eq!(urls, [
-        "https://cdn.example/lists/a/index.m3u8",
-        "https://cdn.example/abs/b.ts",
-        "https://cdn.example/lists/tv/c.ts",
-        "rtsp://cam/stream",
-        "https://other.example/e"
-    ]);
+    assert_eq!(
+        urls,
+        [
+            "https://cdn.example/lists/a/index.m3u8",
+            "https://cdn.example/abs/b.ts",
+            "https://cdn.example/lists/tv/c.ts",
+            "rtsp://cam/stream",
+            "https://other.example/e"
+        ]
+    );
     assert_eq!(e[0].tvg_logo.as_deref(), Some("https://cdn.example/logos/a.png"));
     assert_eq!(e[4].tvg_logo.as_deref(), Some("data:image/png;base64,AAAA"));
     assert_eq!(e[2].headers.referrer.as_deref(), Some("x"));
@@ -545,7 +575,10 @@ fn extinf_attribute_tokenizer_contract() {
     let (attrs, title) = m3u::parse_extinf_attrs(r#"-1 tvg-id="a,b" group-title='News' tvg-logo=x.png,Title, with comma"#);
     assert_eq!(attrs, kv(&[("tvg-id", "a,b"), ("group-title", "News"), ("tvg-logo", "x.png")]));
     assert_eq!(title, "Title, with comma");
-    assert_eq!(m3u::split_pipe_headers("http://x/y.m3u8|User-Agent=a&Referer=b"), ("http://x/y.m3u8".to_owned(), kv(&[("User-Agent", "a"), ("Referer", "b")])));
+    assert_eq!(
+        m3u::split_pipe_headers("http://x/y.m3u8|User-Agent=a&Referer=b"),
+        ("http://x/y.m3u8".to_owned(), kv(&[("User-Agent", "a"), ("Referer", "b")]))
+    );
 }
 
 #[test]

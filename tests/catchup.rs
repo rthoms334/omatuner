@@ -9,10 +9,14 @@ use tuner::sources::xtream::urls::{self, LiveExt};
 /// 2026-10-09 20:00:00 UTC (21:00 BST in London).
 const S: Timestamp = 1_791_576_000;
 
-fn ts(s: &str) -> Timestamp { s.parse::<jiff::Timestamp>().expect("timestamp").as_second() }
+fn ts(s: &str) -> Timestamp {
+    s.parse::<jiff::Timestamp>().expect("timestamp").as_second()
+}
 
 /// Europe/London without depending on the system tz database.
-fn london() -> jiff::tz::TimeZone { jiff::tz::TimeZone::posix("GMT0BST,M3.5.0/1,M10.5.0").expect("posix tz") }
+fn london() -> jiff::tz::TimeZone {
+    jiff::tz::TimeZone::posix("GMT0BST,M3.5.0/1,M10.5.0").expect("posix tz")
+}
 
 fn spec(kind: CatchupKind, template: Option<&str>) -> CatchupSpec {
     CatchupSpec { kind, template: template.map(str::to_owned), days: 3, correction_s: 0 }
@@ -33,7 +37,9 @@ fn req<'a>(live_url: &'a str, spec: &'a CatchupSpec) -> CatchupRequest<'a> {
     }
 }
 
-fn url(r: &CatchupRequest<'_>) -> String { build_url(r).expect("catch-up url") }
+fn url(r: &CatchupRequest<'_>) -> String {
+    build_url(r).expect("catch-up url")
+}
 
 #[test]
 fn design_example_timestamp() {
@@ -187,14 +193,8 @@ fn correction_tvg_shift_and_user_offset() {
     // Displayed start 21:00 on a `tvg-shift=1` channel = EPG 20:00. Correction 120 s earlier,
     // user offset +30 s later: archive start = 21:00 − 60 min − 120 s + 30 s = 19:58:30.
     let s = CatchupSpec { correction_s: 120, ..spec(CatchupKind::Shift, None) };
-    let r = CatchupRequest {
-        start: S + 3600,
-        stop: S + 7200,
-        now: S + 4 * 3600,
-        tvg_shift_min: 60,
-        user_offset_s: 30,
-        ..req("http://h/ch.m3u8", &s)
-    };
+    let r =
+        CatchupRequest { start: S + 3600, stop: S + 7200, now: S + 4 * 3600, tvg_shift_min: 60, user_offset_s: 30, ..req("http://h/ch.m3u8", &s) };
     let start = S - 90;
     assert_eq!(url(&r), format!("http://h/ch.m3u8?utc={start}&lutc={}", S + 4 * 3600));
     assert_eq!(expand("{utc}-{utcend}-{duration}", &r), format!("{start}-{}-3600", start + 3600));

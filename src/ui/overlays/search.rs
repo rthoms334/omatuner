@@ -68,7 +68,9 @@ enum Row {
 }
 
 impl Row {
-    fn selectable(&self) -> bool { !matches!(self, Row::Header(_)) }
+    fn selectable(&self) -> bool {
+        !matches!(self, Row::Header(_))
+    }
 }
 
 pub struct SearchOverlay {
@@ -108,9 +110,13 @@ impl SearchOverlay {
         }
     }
 
-    fn selectable(&self) -> Vec<usize> { self.rows.iter().enumerate().filter(|(_, r)| r.selectable()).map(|(i, _)| i).collect() }
+    fn selectable(&self) -> Vec<usize> {
+        self.rows.iter().enumerate().filter(|(_, r)| r.selectable()).map(|(i, _)| i).collect()
+    }
 
-    fn current(&self) -> Option<Row> { self.selectable().get(self.cursor).map(|i| self.rows[*i].clone()) }
+    fn current(&self) -> Option<Row> {
+        self.selectable().get(self.cursor).map(|i| self.rows[*i].clone())
+    }
 
     fn edit(&mut self, f: impl FnOnce(&mut String)) -> OverlayOutcome {
         f(&mut self.query);
@@ -184,7 +190,12 @@ impl SearchOverlay {
                             locked_toast(ctx);
                             return OverlayOutcome::Keep;
                         }
-                        kit::play_media(ctx, MediaRef::Catchup { channel: ch, start: p.start, stop: p.stop, catchup_id: None }, false, PlayOrigin::Search);
+                        kit::play_media(
+                            ctx,
+                            MediaRef::Catchup { channel: ch, start: p.start, stop: p.stop, catchup_id: None },
+                            false,
+                            PlayOrigin::Search,
+                        );
                         OverlayOutcome::Close
                     } else {
                         ctx.toast(crate::msg::Toast::info("This programme has ended and the channel has no catch-up for it"));
@@ -205,8 +216,12 @@ impl SearchOverlay {
                 let by_group = kit::any_group_locked(&ctx.lib.live.groups, &c.group_ids);
                 (ItemRef { source: c.source_id, kind: ItemKind::Channel, key: c.key.clone() }, c.locked, by_group)
             }),
-            SearchTarget::Movie(id) => ctx.lib.vod.find(VodKind::Movie(id)).map(|v| (vod_ref(v), v.locked, kit::any_group_locked(&ctx.lib.vod.movie_groups, &v.group_ids))),
-            SearchTarget::Series(id) => ctx.lib.vod.find(VodKind::Series(id)).map(|v| (vod_ref(v), v.locked, kit::any_group_locked(&ctx.lib.vod.series_groups, &v.group_ids))),
+            SearchTarget::Movie(id) => {
+                ctx.lib.vod.find(VodKind::Movie(id)).map(|v| (vod_ref(v), v.locked, kit::any_group_locked(&ctx.lib.vod.movie_groups, &v.group_ids)))
+            }
+            SearchTarget::Series(id) => {
+                ctx.lib.vod.find(VodKind::Series(id)).map(|v| (vod_ref(v), v.locked, kit::any_group_locked(&ctx.lib.vod.series_groups, &v.group_ids)))
+            }
         }
     }
 
@@ -237,7 +252,9 @@ impl SearchOverlay {
             (Action::Rename, _) => kit::rename_item(ctx, &item, &name),
             (Action::ToggleHidden, _) => kit::hide_item(ctx, &item, &name),
             // the PIN prompt would answer the screen below
-            (Action::ToggleLock, _) if !kit::unlocked(ctx) => ctx.toast(crate::msg::Toast::info("Locks change with the PIN — press Ctrl+L in a list")),
+            (Action::ToggleLock, _) if !kit::unlocked(ctx) => {
+                ctx.toast(crate::msg::Toast::info("Locks change with the PIN — press Ctrl+L in a list"))
+            }
             (Action::ToggleLock, _) => kit::toggle_lock(ctx, &item, locked, by_group),
             (Action::ShowDetails, SearchTarget::Channel(_)) => ctx.open(crate::ui::OverlayRequest::EditItem(item)),
             (Action::ShowDetails, SearchTarget::Movie(id)) => {
@@ -309,7 +326,11 @@ impl SearchOverlay {
         epg.results()
             .into_iter()
             .filter(|h| hit_matches(&self.query, &h.programme.title, h.programme.sub_title.as_deref()))
-            .filter(|h| h.channel_ids.iter().any(|c| ctx.lib.live.get(*c).is_some() && !ctx.lib.live.hidden.contains(c) && (unlocked || !kit::channel_locked(ctx, *c))))
+            .filter(|h| {
+                h.channel_ids
+                    .iter()
+                    .any(|c| ctx.lib.live.get(*c).is_some() && !ctx.lib.live.hidden.contains(c) && (unlocked || !kit::channel_locked(ctx, *c)))
+            })
             .collect()
     }
 
@@ -319,7 +340,11 @@ impl SearchOverlay {
             self.rows = rows;
             return;
         }
-        let hits = ctx.search_index.as_ref().map(|i| i.results(self.section, if self.section == SearchSection::All { ALL_LIMIT } else { SECTION_LIMIT })).unwrap_or_default();
+        let hits = ctx
+            .search_index
+            .as_ref()
+            .map(|i| i.results(self.section, if self.section == SearchSection::All { ALL_LIMIT } else { SECTION_LIMIT }))
+            .unwrap_or_default();
         let mut last: Option<&'static str> = None;
         for h in hits {
             let header = match h.item.target {
@@ -380,7 +405,9 @@ fn catchup_available(ctx: &UiCtx<'_>, ch: crate::model::ChannelId, p: &Programme
 }
 
 impl Overlay for SearchOverlay {
-    fn key_contexts(&self) -> Vec<KeyContext> { vec![KeyContext::Search] }
+    fn key_contexts(&self) -> Vec<KeyContext> {
+        vec![KeyContext::Search]
+    }
 
     fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> OverlayOutcome {
         match action {
@@ -479,11 +506,17 @@ impl Overlay for SearchOverlay {
             });
             ui.add_space(theme.space(SpaceToken::Md));
             if self.query.trim().is_empty() {
-                ui.label(RichText::new("Type to search channels, movies, series and the guide").size(theme.font(TypeToken::Body)).color(t.text_secondary));
+                ui.label(
+                    RichText::new("Type to search channels, movies, series and the guide").size(theme.font(TypeToken::Body)).color(t.text_secondary),
+                );
                 return;
             }
             if rows.is_empty() {
-                ui.label(RichText::new("No matches — Ctrl+K searches everything, Tab switches sections").size(theme.font(TypeToken::Title)).color(t.text_secondary));
+                ui.label(
+                    RichText::new("No matches — Ctrl+K searches everything, Tab switches sections")
+                        .size(theme.font(TypeToken::Title))
+                        .color(t.text_secondary),
+                );
                 return;
             }
             egui::ScrollArea::vertical().max_height(egui_ctx.content_rect().height() * 0.62).auto_shrink([false, true]).show(ui, |ui| {
@@ -651,14 +684,22 @@ fn paint_guide(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, g: &Programme
     let left = rect.left() + pad + tw.max(90.0 * theme.rem()) + pad;
     let title = if channel_name.is_empty() { prog.title.to_string() } else { format!("{} · {channel_name}", prog.title) };
     let past = prog.stop <= now;
-    let c = if cursor { t.list_cursor_text } else if past { t.text_secondary } else { t.fg };
+    let c = if cursor {
+        t.list_cursor_text
+    } else if past {
+        t.text_secondary
+    } else {
+        t.fg
+    };
     let g = elided(p, &title, egui::FontId::proportional(theme.font(TypeToken::Title)), c, (right - left).max(0.0));
     p.galley(egui::pos2(left, y - g.size().y / 2.0), g, c);
 }
 
 /// A locked hit (the session relocked while the card was open): a PIN prompt from here would
 /// answer the screen below, so the user unlocks from a list instead.
-fn locked_toast(ctx: &mut UiCtx<'_>) { ctx.toast(crate::msg::Toast::info("This is locked — open it from its list to enter the PIN")); }
+fn locked_toast(ctx: &mut UiCtx<'_>) {
+    ctx.toast(crate::msg::Toast::info("This is locked — open it from its list to enter the PIN"));
+}
 
 fn elided(p: &egui::Painter, text: &str, font: egui::FontId, color: egui::Color32, max_w: f32) -> Arc<egui::Galley> {
     let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
@@ -757,7 +798,12 @@ mod tests {
             crate::store::user::set_item_override(c, &item, &ItemOverride { locked: true, ..Default::default() })
         });
         let mut cfg = (*t.config).clone();
-        cfg.parental = crate::config::ParentalConfig { enabled: true, pin_salt: Some("s".into()), pin_hash: Some(crate::ui::parental::hash_pin("1234", "s")), relock_min: 0 };
+        cfg.parental = crate::config::ParentalConfig {
+            enabled: true,
+            pin_salt: Some("s".into()),
+            pin_hash: Some(crate::ui::parental::hash_pin("1234", "s")),
+            relock_min: 0,
+        };
         t.config = Arc::new(cfg);
         let mut h = overlay_harness(t, one, SearchOverlay::new("Channel".into()), egui::vec2(1000.0, 900.0));
         until_ov(&mut h, "results", |h| has_label(h, "Channel 1"));
@@ -782,7 +828,12 @@ mod tests {
             testkit::movies(c, s, 3)
         });
         let mut cfg = (*t.config).clone();
-        cfg.parental = crate::config::ParentalConfig { enabled: true, pin_salt: Some("s".into()), pin_hash: Some(crate::ui::parental::hash_pin("1234", "s")), relock_min: 0 };
+        cfg.parental = crate::config::ParentalConfig {
+            enabled: true,
+            pin_salt: Some("s".into()),
+            pin_hash: Some(crate::ui::parental::hash_pin("1234", "s")),
+            relock_min: 0,
+        };
         t.config = Arc::new(cfg);
         let p = t.config.parental.clone();
         assert!(t.parental.unlock("1234", &p));
@@ -830,11 +881,21 @@ mod tests {
     #[test]
     fn editing_and_sections() {
         let mut o = SearchOverlay::new(String::new());
-        o.rows = vec![Row::Header("Live"), Row::Guide(ProgrammeHit {
-            programme: ProgrammeSlim { id: crate::model::ProgrammeId(1), start: 0, stop: 1, title: "X".into(), sub_title: None, flags: Default::default() },
-            epg_channel_id: crate::model::EpgChannelId(1),
-            channel_ids: vec![],
-        })];
+        o.rows = vec![
+            Row::Header("Live"),
+            Row::Guide(ProgrammeHit {
+                programme: ProgrammeSlim {
+                    id: crate::model::ProgrammeId(1),
+                    start: 0,
+                    stop: 1,
+                    title: "X".into(),
+                    sub_title: None,
+                    flags: Default::default(),
+                },
+                epg_channel_id: crate::model::EpgChannelId(1),
+                channel_ids: vec![],
+            }),
+        ];
         assert_eq!(o.selectable(), vec![1]);
         o.cursor = 5;
         let _ = o.move_cursor(1);

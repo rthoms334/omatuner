@@ -17,7 +17,9 @@ fn runtime() -> tokio::runtime::Runtime {
 }
 
 /// `<tmp>/run/tuner.sock`, like `AppPaths::rooted(<tmp>).ipc_socket()`.
-fn socket_in(dir: &tempfile::TempDir) -> PathBuf { dir.path().join("run").join("tuner.sock") }
+fn socket_in(dir: &tempfile::TempDir) -> PathBuf {
+    dir.path().join("run").join("tuner.sock")
+}
 
 fn next_ipc(rx: &Receiver<AppEvent>) -> IpcRequest {
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -31,7 +33,9 @@ fn next_ipc(rx: &Receiver<AppEvent>) -> IpcRequest {
     }
 }
 
-fn mode(p: &Path) -> u32 { std::fs::metadata(p).unwrap().permissions().mode() & 0o777 }
+fn mode(p: &Path) -> u32 {
+    std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+}
 
 /// Leave a socket file nobody listens on, like a crashed instance does. Other tests spawn
 /// processes concurrently, and a child forked before its `exec` briefly inherits the listener,
@@ -59,11 +63,7 @@ fn handoff_delivers_the_request_to_the_running_instance() {
     assert!(try_handoff(&sock, &req).unwrap());
     assert_eq!(next_ipc(&rx), req);
 
-    let req = IpcRequest {
-        view: None,
-        play: Some("2:xt:live:1234".into()),
-        inputs: vec!["/tmp/a b.m3u".into(), "http://h.tv/x.m3u8".into()],
-    };
+    let req = IpcRequest { view: None, play: Some("2:xt:live:1234".into()), inputs: vec!["/tmp/a b.m3u".into(), "http://h.tv/x.m3u8".into()] };
     assert!(try_handoff(&sock, &req).unwrap());
     assert_eq!(next_ipc(&rx), req);
 }
@@ -194,8 +194,5 @@ fn second_instance_binary_hands_over_and_exits_zero() {
         std::thread::sleep(Duration::from_millis(20));
     };
     assert!(status.success(), "exit status {status}");
-    assert_eq!(
-        next_ipc(&rx),
-        IpcRequest { view: Some(ViewArg::Guide), play: Some("1:xt:live:42".into()), inputs: vec!["/tmp/list.m3u".into()] }
-    );
+    assert_eq!(next_ipc(&rx), IpcRequest { view: Some(ViewArg::Guide), play: Some("1:xt:live:42".into()), inputs: vec!["/tmp/list.m3u".into()] });
 }

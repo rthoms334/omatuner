@@ -44,7 +44,9 @@ pub fn sidebar_width(width: f32, rem: f32, mode: crate::config::SidebarMode) -> 
 /// OSD scale `s` for the fullscreen player: readable from a distance on big windows. OSD type
 /// tokens: title = Display (24)·s, body = Title (14)·s, badges = Caption·s. Below 700 pt the
 /// controls row collapses to play/pause · audio · subtitles · info.
-pub fn osd_scale(window_width: f32) -> f32 { (window_width / 1280.0).clamp(1.0, 1.6) }
+pub fn osd_scale(window_width: f32) -> f32 {
+    (window_width / 1280.0).clamp(1.0, 1.6)
+}
 
 #[cfg(test)]
 mod tests {

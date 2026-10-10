@@ -59,7 +59,10 @@ impl MachineConfig {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Input {
-    Play { target: Arc<Playable>, immediate: bool },
+    Play {
+        target: Arc<Playable>,
+        immediate: bool,
+    },
     Stop,
     /// User retry from Error.
     Retry,
@@ -70,11 +73,19 @@ pub enum Input {
     ResolveFailed(PlayerError),
     /// `loadfile` issued; `entry` = its playlist entry id (`None` if it couldn't be read →
     /// the first START_FILE is accepted).
-    Loaded { entry: Option<i64> },
-    StartFile { entry: i64 },
+    Loaded {
+        entry: Option<i64>,
+    },
+    StartFile {
+        entry: i64,
+    },
     FileLoaded,
     PlaybackRestart,
-    EndFile { reason: EndReason, error: i32, entry: i64 },
+    EndFile {
+        reason: EndReason,
+        error: i32,
+        entry: i64,
+    },
     Pause(bool),
     PausedForCache(bool),
     BufferingPercent(i64),
@@ -91,7 +102,9 @@ pub enum Effect {
     StopMpv,
     Emit(PlayerEvent),
     /// Persist VOD/catch-up progress (`final_` = on stop/switch/end).
-    SaveProgress { final_: bool },
+    SaveProgress {
+        final_: bool,
+    },
     PushHistory(Arc<Playable>),
     RecordFailure(Arc<Playable>, PlayerErrorKind),
     ClearFailure(Arc<Playable>),
@@ -150,10 +163,18 @@ impl PlayerMachine {
         }
     }
 
-    pub fn state(&self) -> &PlayerState { &self.state }
-    pub fn target(&self) -> Option<&Arc<Playable>> { self.target.as_ref() }
-    pub fn last_position(&self) -> Option<f64> { self.last_pos }
-    pub fn set_config(&mut self, cfg: MachineConfig) { self.cfg = cfg; }
+    pub fn state(&self) -> &PlayerState {
+        &self.state
+    }
+    pub fn target(&self) -> Option<&Arc<Playable>> {
+        self.target.as_ref()
+    }
+    pub fn last_position(&self) -> Option<f64> {
+        self.last_pos
+    }
+    pub fn set_config(&mut self, cfg: MachineConfig) {
+        self.cfg = cfg;
+    }
 
     /// Feed one input; returns effects for the controller to execute in order.
     pub fn handle(&mut self, input: Input, now: Instant) -> Vec<Effect> {
@@ -308,11 +329,7 @@ impl PlayerMachine {
                     (PlayerState::Playing | PlayerState::Buffering { .. }, true) => self.set_state(PlayerState::Paused, &mut fx),
                     (PlayerState::Paused, false) => {
                         self.last_pos_change = Some(now);
-                        let next = if self.paused_for_cache {
-                            PlayerState::Buffering { since: now, percent: None }
-                        } else {
-                            PlayerState::Playing
-                        };
+                        let next = if self.paused_for_cache { PlayerState::Buffering { since: now, percent: None } } else { PlayerState::Playing };
                         self.set_state(next, &mut fx)
                     }
                     _ => {}
@@ -356,9 +373,7 @@ impl PlayerMachine {
         let live = self.target.as_ref().map(|t| t.kind.is_live()).unwrap_or(true);
         match self.state.clone() {
             PlayerState::Zapping { until } if now >= until => self.begin_load(now, fx),
-            PlayerState::Loading { since, .. } if now.duration_since(since) > self.cfg.load_timeout => {
-                self.fail(PlayerErrorKind::Timeout, now, fx)
-            }
+            PlayerState::Loading { since, .. } if now.duration_since(since) > self.cfg.load_timeout => self.fail(PlayerErrorKind::Timeout, now, fx),
             PlayerState::Buffering { since, .. } => {
                 let limit = if live { self.cfg.buffer_timeout_live } else { self.cfg.buffer_timeout_vod };
                 if now.duration_since(since) > limit {
@@ -466,8 +481,8 @@ pub fn classify(mpv_error: i32, http: Option<u16>) -> PlayerErrorKind {
         _ => {}
     }
     match mpv_error {
-        -13 => PlayerErrorKind::Network,                            // LOADING_FAILED
-        -18..=-16 => PlayerErrorKind::Unsupported,            // NOTHING_TO_PLAY / UNKNOWN_FORMAT / UNSUPPORTED
+        -13 => PlayerErrorKind::Network,           // LOADING_FAILED
+        -18..=-16 => PlayerErrorKind::Unsupported, // NOTHING_TO_PLAY / UNKNOWN_FORMAT / UNSUPPORTED
         _ => PlayerErrorKind::Mpv,
     }
 }
@@ -513,14 +528,24 @@ mod tests {
         })
     }
 
-    fn live() -> Arc<Playable> { playable(PlayableKind::Live, MediaRef::Url("x".into())) }
-    fn vod() -> Arc<Playable> { playable(PlayableKind::Movie, MediaRef::Movie(MovieId(1))) }
+    fn live() -> Arc<Playable> {
+        playable(PlayableKind::Live, MediaRef::Url("x".into()))
+    }
+    fn vod() -> Arc<Playable> {
+        playable(PlayableKind::Movie, MediaRef::Movie(MovieId(1)))
+    }
 
-    fn machine() -> PlayerMachine { PlayerMachine::new(MachineConfig::from_config(&Config::default())) }
+    fn machine() -> PlayerMachine {
+        PlayerMachine::new(MachineConfig::from_config(&Config::default()))
+    }
 
-    fn secs(s: u64) -> Duration { Duration::from_secs(s) }
+    fn secs(s: u64) -> Duration {
+        Duration::from_secs(s)
+    }
 
-    fn has_load(fx: &[Effect]) -> bool { fx.iter().any(|e| matches!(e, Effect::Load(_))) }
+    fn has_load(fx: &[Effect]) -> bool {
+        fx.iter().any(|e| matches!(e, Effect::Load(_)))
+    }
 
     fn loads(fx: &[Effect]) -> Vec<Arc<Playable>> {
         fx.iter().filter_map(|e| if let Effect::Load(p) = e { Some(p.clone()) } else { None }).collect()
@@ -664,10 +689,7 @@ mod tests {
             m.handle(Input::HttpStatus(403), t0);
             m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry: i }, t0 + Duration::from_secs(at));
             if i == 1 {
-                assert!(matches!(
-                    m.state(),
-                    PlayerState::Reconnecting { attempt: 1, max: 1, reason: PlayerErrorKind::HttpForbidden, .. }
-                ));
+                assert!(matches!(m.state(), PlayerState::Reconnecting { attempt: 1, max: 1, reason: PlayerErrorKind::HttpForbidden, .. }));
             }
         }
         assert!(matches!(m.state(), PlayerState::Error(PlayerError { kind: PlayerErrorKind::HttpForbidden, .. })));
@@ -697,9 +719,7 @@ mod tests {
             m.handle(Input::HttpStatus(code), t);
             let fx = m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry: 3 }, t);
             assert!(recorded(&fx).is_none(), "{code}: no failure recorded while retrying");
-            let PlayerState::Reconnecting { at, attempt: 1, max: 1, reason, .. } = m.state().clone() else {
-                panic!("{code}: {:?}", m.state())
-            };
+            let PlayerState::Reconnecting { at, attempt: 1, max: 1, reason, .. } = m.state().clone() else { panic!("{code}: {:?}", m.state()) };
             assert_eq!(reason, kind);
             t = at;
             assert!(has_load(&m.handle(Input::Tick, t)));

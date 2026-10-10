@@ -6,8 +6,8 @@ use rusqlite::{Connection, Row, params};
 
 use crate::error::Result;
 use crate::model::{
-    AccountInfo, EpgSource, EpgSourceId, EpgSourceKind, Source, SourceCounts, SourceDraft, SourceId, SourceKind, SourceSettings,
-    SourceStatus, Timestamp, XtreamCredentials,
+    AccountInfo, EpgSource, EpgSourceId, EpgSourceKind, Source, SourceCounts, SourceDraft, SourceId, SourceKind, SourceSettings, SourceStatus,
+    Timestamp, XtreamCredentials,
 };
 use crate::redact::Secret;
 use crate::store::sql::{self, atomic, enum_parse, enum_str, from_json_opt, or_not_found, u32_of};
@@ -24,9 +24,8 @@ const SOURCE_COLS: &str = "id, name, kind, icon, color, url, path, xt_server, xt
 
 fn source_from_row(r: &Row<'_>) -> rusqlite::Result<Source> {
     let kind_s: String = r.get(2)?;
-    let kind = enum_parse::<SourceKind>(&kind_s).ok_or_else(|| {
-        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, format!("bad source kind {kind_s:?}").into())
-    })?;
+    let kind = enum_parse::<SourceKind>(&kind_s)
+        .ok_or_else(|| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, format!("bad source kind {kind_s:?}").into()))?;
     let xt_server: Option<String> = r.get(7)?;
     let xtream = xt_server.map(|server| -> rusqlite::Result<_> {
         Ok(XtreamCredentials {
@@ -55,12 +54,7 @@ fn source_from_row(r: &Row<'_>) -> rusqlite::Result<Source> {
             etag: r.get(17)?,
             last_modified: r.get(18)?,
             account: from_json_opt(r.get(19)?),
-            counts: SourceCounts {
-                channels: u32_of(r.get(20)?),
-                movies: u32_of(r.get(21)?),
-                series: u32_of(r.get(22)?),
-                groups: u32_of(r.get(23)?),
-            },
+            counts: SourceCounts { channels: u32_of(r.get(20)?), movies: u32_of(r.get(21)?), series: u32_of(r.get(22)?), groups: u32_of(r.get(23)?) },
         },
     })
 }
@@ -82,7 +76,9 @@ fn register_values(url: Option<&str>, xtream: Option<&XtreamCredentials>) {
     }
 }
 
-fn path_str(p: &Option<PathBuf>) -> Option<String> { p.as_ref().map(|p| p.to_string_lossy().into_owned()) }
+fn path_str(p: &Option<PathBuf>) -> Option<String> {
+    p.as_ref().map(|p| p.to_string_lossy().into_owned())
+}
 
 /// All sources ordered by `sort_index, id`, credentials included (UI must only display them
 /// through `redact`).
@@ -302,10 +298,7 @@ fn epg_source_from_row(r: &Row<'_>) -> rusqlite::Result<EpgSource> {
     let kind = match kind.as_str() {
         "url" => EpgSourceKind::Url { url: url()? },
         "file" => EpgSourceKind::File { path: PathBuf::from(r.get::<_, Option<String>>(4)?.unwrap_or_default()) },
-        "provider" => EpgSourceKind::Provider {
-            source_id: r.get::<_, Option<SourceId>>(5)?.unwrap_or(SourceId(0)),
-            url: url()?,
-        },
+        "provider" => EpgSourceKind::Provider { source_id: r.get::<_, Option<SourceId>>(5)?.unwrap_or(SourceId(0)), url: url()? },
         other => {
             return Err(rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, format!("bad EPG kind {other:?}").into()));
         }

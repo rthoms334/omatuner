@@ -23,7 +23,9 @@ use crate::model::{LiveFormat, SortMode};
 pub type SharedConfig = std::sync::Arc<std::sync::RwLock<std::sync::Arc<Config>>>;
 
 /// Current value of a [`SharedConfig`] (poison-tolerant).
-pub fn current(c: &SharedConfig) -> std::sync::Arc<Config> { c.read().unwrap_or_else(|e| e.into_inner()).clone() }
+pub fn current(c: &SharedConfig) -> std::sync::Arc<Config> {
+    c.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -248,7 +250,9 @@ pub struct EpgConfig {
 }
 
 impl Default for EpgConfig {
-    fn default() -> Self { Self { fuzzy_threshold: 0.92, auto_name_match: true } }
+    fn default() -> Self {
+        Self { fuzzy_threshold: 0.92, auto_name_match: true }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -260,7 +264,9 @@ pub struct ReminderConfig {
 }
 
 impl Default for ReminderConfig {
-    fn default() -> Self { Self { enabled: true, lead_min: 2 } }
+    fn default() -> Self {
+        Self { enabled: true, lead_min: 2 }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -358,9 +364,7 @@ pub fn is_asahi() -> bool {
     if std::env::consts::ARCH != "aarch64" {
         return false;
     }
-    std::fs::read("/proc/device-tree/compatible")
-        .map(|b| String::from_utf8_lossy(&b).contains("apple,"))
-        .unwrap_or(false)
+    std::fs::read("/proc/device-tree/compatible").map(|b| String::from_utf8_lossy(&b).contains("apple,")).unwrap_or(false)
 }
 
 #[cfg(test)]

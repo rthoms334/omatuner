@@ -53,8 +53,28 @@ impl Theme {
         let fonts = TypeToken::ALL.iter().map(|t| (*t, tokens.font(&shell, *t))).collect();
         use SpaceToken::*;
         let all = [
-            Hairline, Xxs, Xs, Sm, Md, Lg, Xl, Xxl, Xxxl, Huge, ControlGap, ControlPaddingX, ControlPaddingY, InputPaddingY,
-            ControlHeight, PopupRowHeight, RowGap, RowPaddingX, LabelGap, PanelGap, PanelPadding, PopupPadding,
+            Hairline,
+            Xxs,
+            Xs,
+            Sm,
+            Md,
+            Lg,
+            Xl,
+            Xxl,
+            Xxxl,
+            Huge,
+            ControlGap,
+            ControlPaddingX,
+            ControlPaddingY,
+            InputPaddingY,
+            ControlHeight,
+            PopupRowHeight,
+            RowGap,
+            RowPaddingX,
+            LabelGap,
+            PanelGap,
+            PanelPadding,
+            PopupPadding,
         ];
         let spaces = all.iter().map(|t| (*t, tokens.space(&shell, *t))).collect();
         Self { name, palette, shell, tokens, fonts, spaces }
@@ -86,9 +106,8 @@ impl Theme {
     /// `shell.<section>.toml` files → user `~/.config/omarchy/shell.toml` (last, key by key).
     pub fn try_load(paths: &AppPaths, ui_scale: f32) -> Result<Self, String> {
         let dir = paths.omarchy_theme_dir();
-        let name = std::fs::read_to_string(paths.omarchy_current().join("theme.name"))
-            .map(|s| s.trim().to_owned())
-            .unwrap_or_else(|_| "fallback".into());
+        let name =
+            std::fs::read_to_string(paths.omarchy_current().join("theme.name")).map(|s| s.trim().to_owned()).unwrap_or_else(|_| "fallback".into());
         let colors = std::fs::read_to_string(dir.join("colors.toml")).map_err(|e| format!("colors.toml: {e}"))?;
         let palette = Palette::parse(&colors, dir.join("light.mode").exists()).map_err(|e| format!("colors.toml: {e}"))?;
         let theme_shell = std::fs::read_to_string(dir.join("shell.toml")).unwrap_or_default();
@@ -102,15 +121,17 @@ impl Theme {
             for (f, path) in files {
                 if let Some(section) = f.strip_prefix("shell.").and_then(|s| s.strip_suffix(".toml"))
                     && let Ok(t) = std::fs::read_to_string(&path)
-                        && let Err(e) = shell.merge_section(section, &t) {
-                            tracing::warn!("{f}: {e}");
-                        }
+                    && let Err(e) = shell.merge_section(section, &t)
+                {
+                    tracing::warn!("{f}: {e}");
+                }
             }
         }
         if let Ok(u) = std::fs::read_to_string(paths.omarchy_config().join("shell.toml"))
-            && let Err(e) = shell.merge_override(&u) {
-                tracing::warn!("~/.config/omarchy/shell.toml: {e}");
-            }
+            && let Err(e) = shell.merge_override(&u)
+        {
+            tracing::warn!("~/.config/omarchy/shell.toml: {e}");
+        }
         // The directory may have been swapped while we read it (`rm -rf theme` → `mv`): a
         // missing colors.toml now means the pieces may come from two themes — retry instead.
         if !dir.join("colors.toml").is_file() {
@@ -121,11 +142,19 @@ impl Theme {
     }
 
     /// Layout unit (see `Tokens::rem`).
-    pub fn rem(&self) -> f32 { self.tokens.rem() }
+    pub fn rem(&self) -> f32 {
+        self.tokens.rem()
+    }
 
-    pub fn font(&self, t: TypeToken) -> f32 { self.fonts.get(&t).copied().unwrap_or(12.0) }
-    pub fn space(&self, t: SpaceToken) -> f32 { self.spaces.get(&t).copied().unwrap_or(8.0) }
-    pub fn is_light(&self) -> bool { self.palette.mode == Mode::Light }
+    pub fn font(&self, t: TypeToken) -> f32 {
+        self.fonts.get(&t).copied().unwrap_or(12.0)
+    }
+    pub fn space(&self, t: SpaceToken) -> f32 {
+        self.spaces.get(&t).copied().unwrap_or(8.0)
+    }
+    pub fn is_light(&self) -> bool {
+        self.palette.mode == Mode::Light
+    }
 
     /// Badge colour for a source, from the live palette.
     pub fn source_color(&self, c: SourceColor) -> Color32 {

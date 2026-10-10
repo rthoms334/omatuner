@@ -53,10 +53,14 @@ pub fn busy_bar(ui: &mut egui::Ui, theme: &Theme, height: f32) -> egui::Response
     resp
 }
 
-fn clamp_fraction(f: f32) -> f32 { if f.is_finite() { f.clamp(0.0, 1.0) } else { 0.0 } }
+fn clamp_fraction(f: f32) -> f32 {
+    if f.is_finite() { f.clamp(0.0, 1.0) } else { 0.0 }
+}
 
 /// 0..1 position of the busy block at time `t` (seconds).
-fn busy_phase(t: f64) -> f32 { ((t / BUSY_PERIOD_S).fract()) as f32 }
+fn busy_phase(t: f64) -> f32 {
+    ((t / BUSY_PERIOD_S).fract()) as f32
+}
 
 #[cfg(test)]
 mod tests {

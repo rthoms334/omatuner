@@ -66,13 +66,18 @@ fn synthetic_gz(channels: usize, days: usize) -> Vec<u8> {
 fn parse_all(gz: &[u8], opts: &XmltvOptions) -> u64 {
     let reader = BufReader::with_capacity(256 * 1024, MultiGzDecoder::new(gz));
     let mut n = 0u64;
-    parse(reader, opts, &mut |item| {
-        if let XmltvItem::Programme(p) = item {
-            n += 1;
-            black_box(p);
-        }
-        ControlFlow::Continue(())
-    }, &mut |_| {})
+    parse(
+        reader,
+        opts,
+        &mut |item| {
+            if let XmltvItem::Programme(p) = item {
+                n += 1;
+                black_box(p);
+            }
+            ControlFlow::Continue(())
+        },
+        &mut |_| {},
+    )
     .expect("parse");
     n
 }

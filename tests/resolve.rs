@@ -19,14 +19,18 @@ use tuner::store::{Store, live, sources, user, vod};
 const T20: Timestamp = 1_791_576_000;
 const HOUR: i64 = 3600;
 
-fn store(name: &str) -> Store { Store::open_temp(name, None).expect("temp store") }
+fn store(name: &str) -> Store {
+    Store::open_temp(name, None).expect("temp store")
+}
 
 /// Run `f` on the writer connection.
 fn w<R: Send + 'static>(s: &Store, f: impl FnOnce(&mut Connection) -> tuner::error::Result<R> + Send + 'static) -> R {
     s.writer().blocking(f).expect("writer job")
 }
 
-fn reader(s: &Store) -> Connection { s.reader().expect("reader") }
+fn reader(s: &Store) -> Connection {
+    s.reader().expect("reader")
+}
 
 fn xtream_source(s: &Store, server: &str, password: &str, settings: SourceSettings, account: Option<AccountInfo>) -> SourceId {
     let draft = SourceDraft {
@@ -93,9 +97,13 @@ fn chan(key: &str, name: &str, stream: StreamLocator) -> ImportChannel {
     }
 }
 
-fn xt_live(id: i64) -> StreamLocator { StreamLocator::Xtream { kind: XtreamStreamKind::Live, stream_id: id, ext: None } }
+fn xt_live(id: i64) -> StreamLocator {
+    StreamLocator::Xtream { kind: XtreamStreamKind::Live, stream_id: id, ext: None }
+}
 
-fn url_stream(url: &str) -> StreamLocator { StreamLocator::Url { url: url.into() } }
+fn url_stream(url: &str) -> StreamLocator {
+    StreamLocator::Url { url: url.into() }
+}
 
 fn spec(kind: CatchupKind, template: Option<&str>, days: u32) -> CatchupSpec {
     CatchupSpec { kind, template: template.map(str::to_owned), days, correction_s: 0 }
@@ -106,7 +114,13 @@ fn import_channels(s: &Store, source: SourceId, channels: Vec<ImportChannel>) ->
     let keys: Vec<ItemKey> = channels.iter().map(|c| c.key.clone()).collect();
     w(s, move |c| {
         let imp = import::begin_catalogue(c, source, T20)?;
-        let g = ImportGroup { kind: ItemKind::Channel, key: group_key(ItemKind::Channel, "News"), name: "News".into(), provider_id: None, provider_order: 0 };
+        let g = ImportGroup {
+            kind: ItemKind::Channel,
+            key: group_key(ItemKind::Channel, "News"),
+            name: "News".into(),
+            provider_id: None,
+            provider_order: 0,
+        };
         import::upsert_groups(c, &imp, &[g])?;
         import::write_channels(c, &imp, &channels)?;
         import::finish_catalogue(c, &imp, &[ItemKind::Channel], T20)?;
@@ -143,7 +157,13 @@ fn import_movies(s: &Store, source: SourceId, movies: Vec<ImportMovie>) -> Vec<M
     let keys: Vec<ItemKey> = movies.iter().map(|m| m.key.clone()).collect();
     w(s, move |c| {
         let imp = import::begin_catalogue(c, source, T20)?;
-        let g = ImportGroup { kind: ItemKind::Movie, key: group_key(ItemKind::Movie, "Films"), name: "Films".into(), provider_id: None, provider_order: 0 };
+        let g = ImportGroup {
+            kind: ItemKind::Movie,
+            key: group_key(ItemKind::Movie, "Films"),
+            name: "Films".into(),
+            provider_id: None,
+            provider_order: 0,
+        };
         import::upsert_groups(c, &imp, &[g])?;
         import::write_movies(c, &imp, &movies)?;
         import::finish_catalogue(c, &imp, &[ItemKind::Movie], T20)?;
@@ -179,7 +199,13 @@ fn import_series(s: &Store, source: SourceId, name: &str, episodes: Vec<ImportEp
     };
     let id = w(s, move |c| {
         let imp = import::begin_catalogue(c, source, T20)?;
-        let g = ImportGroup { kind: ItemKind::Series, key: group_key(ItemKind::Series, "Shows"), name: "Shows".into(), provider_id: None, provider_order: 0 };
+        let g = ImportGroup {
+            kind: ItemKind::Series,
+            key: group_key(ItemKind::Series, "Shows"),
+            name: "Shows".into(),
+            provider_id: None,
+            provider_order: 0,
+        };
         import::upsert_groups(c, &imp, &[g])?;
         import::write_series(c, &imp, &[series])?;
         import::finish_catalogue(c, &imp, &[ItemKind::Series], T20)?;
@@ -216,11 +242,17 @@ fn save_progress(s: &Store, item: ItemRef, position_s: f64, duration_s: Option<f
     });
 }
 
-fn set_override(s: &Store, item: ItemRef, ov: ItemOverride) { w(s, move |c| user::set_item_override(c, &item, &ov)); }
+fn set_override(s: &Store, item: ItemRef, ov: ItemOverride) {
+    w(s, move |c| user::set_item_override(c, &item, &ov));
+}
 
-fn catchup(channel: ChannelId, start: Timestamp, stop: Timestamp) -> MediaRef { MediaRef::Catchup { channel, start, stop, catchup_id: None } }
+fn catchup(channel: ChannelId, start: Timestamp, stop: Timestamp) -> MediaRef {
+    MediaRef::Catchup { channel, start, stop, catchup_id: None }
+}
 
-fn url_of(p: &Playable) -> &str { p.url.expose() }
+fn url_of(p: &Playable) -> &str {
+    p.url.expose()
+}
 
 fn not_found(r: tuner::error::Result<Playable>) -> String {
     match r {
@@ -288,10 +320,11 @@ fn title_comes_from_the_catalogue_and_never_the_url() {
     let pw = "pw-title-55e1";
     let src = xtream_source(&s, "http://panel.example", pw, SourceSettings::default(), None);
     let ch = import_channels(&s, src, vec![chan("xt:live:5", "Raw Name", xt_live(5))])[0];
-    set_override(&s, ItemRef { source: src, kind: ItemKind::Channel, key: ItemKey("xt:live:5".into()) }, ItemOverride {
-        rename: Some("My Channel".into()),
-        ..Default::default()
-    });
+    set_override(
+        &s,
+        ItemRef { source: src, kind: ItemKind::Channel, key: ItemKey("xt:live:5".into()) },
+        ItemOverride { rename: Some("My Channel".into()), ..Default::default() },
+    );
     let p = resolve(&reader(&s), &Config::default(), &MediaRef::Channel(ch), false, T20).expect("resolve");
     assert_eq!(p.title, "My Channel", "user rename");
     let dbg = format!("{p:?}");
@@ -355,7 +388,12 @@ fn missing_rows_and_disabled_sources_are_not_found() {
     let s = store("resolve-missing");
     let r = reader(&s);
     let cfg = Config::default();
-    for media in [MediaRef::Channel(ChannelId(999)), catchup(ChannelId(999), T20, T20 + HOUR), MediaRef::Movie(MovieId(999)), MediaRef::Episode(EpisodeId(999))] {
+    for media in [
+        MediaRef::Channel(ChannelId(999)),
+        catchup(ChannelId(999), T20, T20 + HOUR),
+        MediaRef::Movie(MovieId(999)),
+        MediaRef::Episode(EpisodeId(999)),
+    ] {
         not_found(resolve(&r, &cfg, &media, true, T20));
     }
 
@@ -385,10 +423,14 @@ fn xtream_stream_in_a_source_without_credentials_is_a_config_error() {
 fn xtream_movie_url_extension_and_metadata() {
     let s = store("resolve-movie");
     let src = xtream_source(&s, "http://panel.example:8080/", "pw-movie-0b7d", SourceSettings::default(), None);
-    let ids = import_movies(&s, src, vec![
-        movie("xt:vod:55", "Inception", StreamLocator::Xtream { kind: XtreamStreamKind::Movie, stream_id: 55, ext: Some("mkv".into()) }),
-        movie("xt:vod:56", "No Ext", StreamLocator::Xtream { kind: XtreamStreamKind::Movie, stream_id: 56, ext: None }),
-    ]);
+    let ids = import_movies(
+        &s,
+        src,
+        vec![
+            movie("xt:vod:55", "Inception", StreamLocator::Xtream { kind: XtreamStreamKind::Movie, stream_id: 55, ext: Some("mkv".into()) }),
+            movie("xt:vod:56", "No Ext", StreamLocator::Xtream { kind: XtreamStreamKind::Movie, stream_id: 56, ext: None }),
+        ],
+    );
     let cfg = Config::default();
     let p = resolve(&reader(&s), &cfg, &MediaRef::Movie(ids[0]), true, T20).expect("movie");
     assert_eq!(url_of(&p), "http://panel.example:8080/movie/user/pw-movie-0b7d/55.mkv");
@@ -406,7 +448,12 @@ fn xtream_movie_url_extension_and_metadata() {
     // lazy details: container extension and duration
     let movie_id = ids[0];
     w(&s, move |c| {
-        import::store_movie_details(c, movie_id, &MovieDetails { container_ext: Some("mp4".into()), duration_s: Some(8880), ..Default::default() }, T20)
+        import::store_movie_details(
+            c,
+            movie_id,
+            &MovieDetails { container_ext: Some("mp4".into()), duration_s: Some(8880), ..Default::default() },
+            T20,
+        )
     });
     let p = resolve(&reader(&s), &cfg, &MediaRef::Movie(ids[0]), true, T20).expect("movie");
     assert!(url_of(&p).ends_with("/55.mp4"));
@@ -437,7 +484,8 @@ fn seeded_movie_and_episode_urls_play_as_is() {
 #[test]
 fn xtream_episode_url_and_labels() {
     let s = store("resolve-episode");
-    let src = xtream_source(&s, "https://panel.example", "pw-ep-44a0", SourceSettings { user_agent: Some("PanelUA".into()), ..Default::default() }, None);
+    let src =
+        xtream_source(&s, "https://panel.example", "pw-ep-44a0", SourceSettings { user_agent: Some("PanelUA".into()), ..Default::default() }, None);
     let (_, eps) = import_series(&s, src, "The Show", vec![episode(9001, 1, "Pilot", Some("mkv")), episode(9002, 2, "", None)]);
     let r = reader(&s);
     let cfg = Config::default();
@@ -502,7 +550,9 @@ fn xtream_catchup_channel(s: &Store, server: &str, settings: SourceSettings, acc
     (src, ch)
 }
 
-fn london() -> SourceSettings { SourceSettings { server_tz: Some("Europe/London".into()), ..Default::default() } }
+fn london() -> SourceSettings {
+    SourceSettings { server_tz: Some("Europe/London".into()), ..Default::default() }
+}
 
 #[test]
 fn xtream_catchup_uses_server_local_time() {
@@ -562,10 +612,11 @@ fn xtream_catchup_applies_shift_offset_and_caps_running_programmes() {
     assert!(url_of(&p).ends_with("/60/2026-10-09:21-00/1234.m3u8"), "tvg-shift converts back to EPG time: {}", p.url.redacted());
 
     // per-channel user offset (Ctrl+I) +2 min
-    set_override(&s, ItemRef { source: src, kind: ItemKind::Channel, key: ItemKey("xt:live:1234".into()) }, ItemOverride {
-        catchup_offset_s: Some(120),
-        ..Default::default()
-    });
+    set_override(
+        &s,
+        ItemRef { source: src, kind: ItemKind::Channel, key: ItemKey("xt:live:1234".into()) },
+        ItemOverride { catchup_offset_s: Some(120), ..Default::default() },
+    );
     let p = resolve(&reader(&s), &cfg, &catchup(ch, T20 + HOUR, T20 + 2 * HOUR), false, now).expect("offset");
     assert!(url_of(&p).ends_with("/60/2026-10-09:21-02/1234.m3u8"), "{}", p.url.redacted());
 

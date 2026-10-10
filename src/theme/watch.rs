@@ -196,7 +196,9 @@ impl Poller {
         Self { files }
     }
 
-    fn is_active(&self) -> bool { !self.files.is_empty() }
+    fn is_active(&self) -> bool {
+        !self.files.is_empty()
+    }
 
     /// Stop polling the files of every directory `watch` could watch now (it exists by now);
     /// returns those directories and the triggers of one last poll of their files, taken after
@@ -338,7 +340,9 @@ impl Worker {
     }
 }
 
-fn same_theme(a: &Theme, b: &Theme) -> bool { a.name == b.name && a.palette == b.palette && a.shell == b.shell && a.tokens == b.tokens }
+fn same_theme(a: &Theme, b: &Theme) -> bool {
+    a.name == b.name && a.palette == b.palette && a.shell == b.shell && a.tokens == b.tokens
+}
 
 #[cfg(test)]
 mod tests {

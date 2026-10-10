@@ -26,12 +26,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rusqlite::Connection;
 
 use crate::error::Result;
+use crate::model::{
+    ChannelId, ChannelSummary, Collection, FavListId, FavouriteEntry, FavouriteList, Group, GroupId, ItemKey, ItemKind, ItemRef, MovieId, SeriesId,
+    SortMode, SourceColor, SourceId, SourceKind, Timestamp, VodKind, VodSummary,
+};
 use crate::store::live::{GROUP_COLS, GROUP_FROM, GROUP_ORDER, group_from_row};
 use crate::store::sql::{enum_parse, u32_of};
-use crate::model::{
-    ChannelId, ChannelSummary, Collection, FavListId, FavouriteEntry, FavouriteList, Group, GroupId, ItemKey, ItemKind,
-    ItemRef, MovieId, SeriesId, SortMode, SourceColor, SourceId, SourceKind, Timestamp, VodKind, VodSummary,
-};
 
 /// Non-secret source facts for badges/filters.
 #[derive(Debug, Clone, PartialEq)]
@@ -77,7 +77,9 @@ impl LiveIndex {
         Self { channels, hidden, by_id, by_ref, groups, members }
     }
 
-    pub fn get(&self, id: ChannelId) -> Option<&ChannelSummary> { self.by_id.get(&id).map(|i| &self.channels[*i as usize]) }
+    pub fn get(&self, id: ChannelId) -> Option<&ChannelSummary> {
+        self.by_id.get(&id).map(|i| &self.channels[*i as usize])
+    }
 
     pub fn by_ref(&self, item: &ItemRef) -> Option<ChannelId> {
         if item.kind != ItemKind::Channel {
@@ -86,7 +88,9 @@ impl LiveIndex {
         self.by_ref.get(&(item.source, item.key.clone())).copied()
     }
 
-    pub fn group_members(&self, g: GroupId) -> &[ChannelId] { self.members.get(&g).map(Vec::as_slice).unwrap_or(&[]) }
+    pub fn group_members(&self, g: GroupId) -> &[ChannelId] {
+        self.members.get(&g).map(Vec::as_slice).unwrap_or(&[])
+    }
 
     /// Visible groups (not hidden; non-empty when `hide_empty`), optionally one source.
     pub fn visible_groups(&self, source: Option<SourceId>, hide_empty: bool) -> Vec<&Group> {
@@ -115,9 +119,7 @@ impl LiveIndex {
             SortMode::Provider | SortMode::Rating | SortMode::Year => {}
             SortMode::Number => ids.sort_by_key(|id| key(id).and_then(|c| c.number).unwrap_or(u32::MAX)),
             SortMode::NameAsc => ids.sort_by_cached_key(|id| key(id).map(|c| c.name.to_lowercase()).unwrap_or_default()),
-            SortMode::NameDesc => {
-                ids.sort_by_cached_key(|id| std::cmp::Reverse(key(id).map(|c| c.name.to_lowercase()).unwrap_or_default()))
-            }
+            SortMode::NameDesc => ids.sort_by_cached_key(|id| std::cmp::Reverse(key(id).map(|c| c.name.to_lowercase()).unwrap_or_default())),
             SortMode::RecentlyAdded => ids.sort_by_key(|id| std::cmp::Reverse(key(id).and_then(|c| c.added_at).unwrap_or(i64::MIN))),
         }
         ids
@@ -255,14 +257,26 @@ impl FavIndex {
         f
     }
 
-    pub fn items(&self, list: FavListId) -> &[ItemRef] { self.items.get(&list).map(Vec::as_slice).unwrap_or(&[]) }
-    pub fn lists_of(&self, item: &ItemRef) -> &[FavListId] { self.membership.get(item).map(Vec::as_slice).unwrap_or(&[]) }
+    pub fn items(&self, list: FavListId) -> &[ItemRef] {
+        self.items.get(&list).map(Vec::as_slice).unwrap_or(&[])
+    }
+    pub fn lists_of(&self, item: &ItemRef) -> &[FavListId] {
+        self.membership.get(item).map(Vec::as_slice).unwrap_or(&[])
+    }
     /// Member of the default list (what Ctrl+F toggles and the ★ glyph shows).
-    pub fn is_fav(&self, item: &ItemRef) -> bool { self.default_list().is_some_and(|d| self.lists_of(item).contains(&d)) }
-    pub fn default_list(&self) -> Option<FavListId> { self.lists.iter().find(|l| l.is_default).map(|l| l.id) }
+    pub fn is_fav(&self, item: &ItemRef) -> bool {
+        self.default_list().is_some_and(|d| self.lists_of(item).contains(&d))
+    }
+    pub fn default_list(&self) -> Option<FavListId> {
+        self.lists.iter().find(|l| l.is_default).map(|l| l.id)
+    }
     /// Non-empty lists in order (Guide default collection, Home rails).
-    pub fn non_empty_lists(&self) -> impl Iterator<Item = &FavouriteList> { self.lists.iter().filter(|l| !self.items(l.id).is_empty()) }
-    pub fn is_empty(&self) -> bool { self.items.values().all(Vec::is_empty) }
+    pub fn non_empty_lists(&self) -> impl Iterator<Item = &FavouriteList> {
+        self.lists.iter().filter(|l| !self.items(l.id).is_empty())
+    }
+    pub fn is_empty(&self) -> bool {
+        self.items.values().all(Vec::is_empty)
+    }
 
     /// Optimistic local update after `user::set_favourite` was submitted (appends at the end).
     pub fn apply_toggle(&mut self, list: FavListId, item: &ItemRef, on: bool) {
@@ -302,10 +316,18 @@ pub struct Library {
 }
 
 impl Library {
-    pub fn source(&self, id: SourceId) -> Option<&SourceMeta> { self.sources.iter().find(|s| s.id == id) }
-    pub fn is_empty(&self) -> bool { self.sources.is_empty() }
-    pub fn has_vod(&self) -> bool { !self.vod.movies.is_empty() }
-    pub fn has_series(&self) -> bool { !self.vod.series.is_empty() }
+    pub fn source(&self, id: SourceId) -> Option<&SourceMeta> {
+        self.sources.iter().find(|s| s.id == id)
+    }
+    pub fn is_empty(&self) -> bool {
+        self.sources.is_empty()
+    }
+    pub fn has_vod(&self) -> bool {
+        !self.vod.movies.is_empty()
+    }
+    pub fn has_series(&self) -> bool {
+        !self.vod.series.is_empty()
+    }
 
     /// This catalogue with another recently-watched list: the indexes are shared, not copied,
     /// and `built_at` is kept (screens keyed on it don't rebuild for a zap); `generation` is new
@@ -356,9 +378,7 @@ fn load_sources(conn: &Connection) -> Result<Vec<SourceMeta>> {
 
 /// Groups of every kind of enabled sources, in display order per kind.
 fn load_groups(conn: &Connection) -> Result<(Vec<Group>, Vec<Group>, Vec<Group>)> {
-    let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {GROUP_COLS} {GROUP_FROM} WHERE s.enabled = 1 ORDER BY g.kind, {GROUP_ORDER}"
-    ))?;
+    let mut stmt = conn.prepare_cached(&format!("SELECT {GROUP_COLS} {GROUP_FROM} WHERE s.enabled = 1 ORDER BY g.kind, {GROUP_ORDER}"))?;
     let (mut ch, mut mv, mut se) = (Vec::new(), Vec::new(), Vec::new());
     for g in stmt.query_map([], group_from_row)? {
         let g = g?;
@@ -403,11 +423,7 @@ fn effective_groups(links: Option<&Vec<(GroupId, bool)>>, flags: &HashMap<GroupI
 
 fn load_live(conn: &Connection, groups: Vec<Group>) -> Result<LiveIndex> {
     let flags = group_flags(&groups);
-    let links = load_memberships(
-        conn,
-        "SELECT cg.channel_id, cg.group_id, cg.is_primary FROM channel_group cg",
-        &flags,
-    )?;
+    let links = load_memberships(conn, "SELECT cg.channel_id, cg.group_id, cg.is_primary FROM channel_group cg", &flags)?;
     let mut stmt = conn.prepare_cached(
         "SELECT c.id, c.source_id, c.key, COALESCE(o.rename, c.clean_name), c.number, c.logo, ce.epg_channel_id, c.tvg_shift_min,
                 c.catchup IS NOT NULL, COALESCE(json_extract(c.catchup, '$.days'), 0), c.radio, c.unsupported IS NOT NULL,
@@ -531,7 +547,15 @@ pub fn load(conn: &Connection) -> Result<Library> {
     let vod = VodIndex::from_parts(movies, series, movie_groups, series_groups, members);
     let favs = load_favs(conn)?;
     let recent_channels = load_recent_channels(conn, &live)?;
-    Ok(Library { sources, live: Arc::new(live), vod: Arc::new(vod), favs, recent_channels, built_at: crate::model::now(), generation: next_generation() })
+    Ok(Library {
+        sources,
+        live: Arc::new(live),
+        vod: Arc::new(vod),
+        favs,
+        recent_channels,
+        built_at: crate::model::now(),
+        generation: next_generation(),
+    })
 }
 
 /// Distinct recently watched channels of `live`, most recent first (one aggregate over the
@@ -543,10 +567,8 @@ pub fn load_recent_channels(conn: &Connection, live: &LiveIndex) -> Result<Vec<C
 /// Rebuild only the favourites part (cheap; event-driven on the UI thread, < 5 ms).
 pub fn load_favs(conn: &Connection) -> Result<FavIndex> {
     let lists = crate::store::user::fav_lists(conn)?;
-    let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {} FROM fav_item ORDER BY list_id, position, added_at",
-        crate::store::user::FAV_ITEM_COLS
-    ))?;
+    let mut stmt =
+        conn.prepare_cached(&format!("SELECT {} FROM fav_item ORDER BY list_id, position, added_at", crate::store::user::FAV_ITEM_COLS))?;
     let entries = stmt.query_map([], crate::store::user::fav_entry_from_row)?.collect::<rusqlite::Result<Vec<FavouriteEntry>>>()?;
     Ok(FavIndex::from_parts(lists, entries))
 }

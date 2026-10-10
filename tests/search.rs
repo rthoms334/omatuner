@@ -9,8 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tuner::model::{
-    ChannelId, ChannelSummary, Group, GroupId, GroupKey, ItemKey, ItemKind, MovieId, SeriesId, SourceColor, SourceId, SourceKind,
-    VodKind, VodSummary,
+    ChannelId, ChannelSummary, Group, GroupId, GroupKey, ItemKey, ItemKind, MovieId, SeriesId, SourceColor, SourceId, SourceKind, VodKind, VodSummary,
 };
 use tuner::search::{EpgSearch, SearchHit, SearchIndex, SearchSection, SearchTarget};
 use tuner::store::library::{Library, LiveIndex, SourceMeta, VodIndex};
@@ -113,7 +112,8 @@ fn library() -> Library {
         vod(VodKind::Movie(MovieId(2)), "Planet Earth", &[10], false),
         vod(VodKind::Movie(MovieId(3)), "Bbc Kids Movie", &[11], false),
     ];
-    let series = vec![vod(VodKind::Series(SeriesId(1)), "Bbc Drama Hour", &[20], false), vod(VodKind::Series(SeriesId(2)), "Line of Duty", &[20], false)];
+    let series =
+        vec![vod(VodKind::Series(SeriesId(1)), "Bbc Drama Hour", &[20], false), vod(VodKind::Series(SeriesId(2)), "Line of Duty", &[20], false)];
     let vod_index = VodIndex::from_parts(
         movies,
         series,
@@ -131,7 +131,9 @@ fn index(include_locked: bool) -> SearchIndex {
 }
 
 /// Tick like the overlay does until `section` yields `n` hits (or time out).
-fn wait(idx: &mut SearchIndex, section: SearchSection, n: usize) -> Vec<SearchHit> { wait_for(idx, section, |r| r.len() == n) }
+fn wait(idx: &mut SearchIndex, section: SearchSection, n: usize) -> Vec<SearchHit> {
+    wait_for(idx, section, |r| r.len() == n)
+}
 
 fn wait_for(idx: &mut SearchIndex, section: SearchSection, done: impl Fn(&[SearchHit]) -> bool) -> Vec<SearchHit> {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -145,7 +147,9 @@ fn wait_for(idx: &mut SearchIndex, section: SearchSection, done: impl Fn(&[Searc
     }
 }
 
-fn targets(hits: &[SearchHit]) -> Vec<SearchTarget> { hits.iter().map(|h| h.item.target).collect() }
+fn targets(hits: &[SearchHit]) -> Vec<SearchTarget> {
+    hits.iter().map(|h| h.item.target).collect()
+}
 
 #[test]
 fn sections_split_by_kind_and_all_groups_kinds() {
@@ -180,10 +184,7 @@ fn sections_split_by_kind_and_all_groups_kinds() {
     let live = idx.results(SearchSection::Live, 200);
     let mut live_ids = targets(&live);
     live_ids.sort_by_key(|t| format!("{t:?}"));
-    assert_eq!(
-        live_ids,
-        vec![SearchTarget::Channel(ChannelId(1)), SearchTarget::Channel(ChannelId(2)), SearchTarget::Channel(ChannelId(8))]
-    );
+    assert_eq!(live_ids, vec![SearchTarget::Channel(ChannelId(1)), SearchTarget::Channel(ChannelId(2)), SearchTarget::Channel(ChannelId(8))]);
     assert_eq!(targets(&idx.results(SearchSection::Movies, 200)), vec![SearchTarget::Movie(MovieId(1))]);
     assert_eq!(targets(&idx.results(SearchSection::Series, 200)), vec![SearchTarget::Series(SeriesId(1))]);
     assert!(idx.results(SearchSection::Guide, 200).is_empty(), "guide comes from EpgSearch");
@@ -350,8 +351,7 @@ fn epg_search_against_the_store() {
 /// FTS5 semantics of the store's query (each token quoted, the last one a prefix): every query
 /// token but the last equals a title token; the last is a prefix of one.
 fn fts_matches(title: &str, query: &str) -> bool {
-    let words: Vec<String> =
-        title.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_owned).collect();
+    let words: Vec<String> = title.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_owned).collect();
     let q: Vec<&str> = query.split_whitespace().collect();
     let Some((last, rest)) = q.split_last() else { return false };
     rest.iter().all(|t| words.iter().any(|w| w == t)) && words.iter().any(|w| w.starts_with(last))

@@ -50,7 +50,9 @@ pub struct LogLine {
 
 impl LogLine {
     /// `2026-10-10 20:15:03  WARN tuner::player: message` (local time).
-    fn to_text(&self) -> String { format!("{} {:>5} {}: {}", local_time(self.at), self.level, self.target, self.message) }
+    fn to_text(&self) -> String {
+        format!("{} {:>5} {}: {}", local_time(self.at), self.level, self.target, self.message)
+    }
 }
 
 /// Local wall-clock rendering of a unix timestamp (UTC if the zone database is unavailable).
@@ -69,7 +71,9 @@ pub struct LogBuffer {
 }
 
 impl LogBuffer {
-    pub fn new(cap: usize) -> Self { Self { inner: Arc::default(), cap } }
+    pub fn new(cap: usize) -> Self {
+        Self { inner: Arc::default(), cap }
+    }
 
     pub fn push(&self, line: LogLine) {
         let mut q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -107,13 +111,7 @@ impl LogBuffer {
 /// truncate.
 fn open_private(path: &Path, append: bool) -> std::io::Result<File> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let f = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(append)
-        .truncate(!append)
-        .mode(0o600)
-        .open(path)?;
+    let f = std::fs::OpenOptions::new().create(true).write(true).append(append).truncate(!append).mode(0o600).open(path)?;
     f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     Ok(f)
 }
@@ -307,10 +305,14 @@ impl tracing::field::Visit for MsgVisitor {
 }
 
 /// Our own crate (`tuner`, `tuner::*`).
-fn is_own(target: &str) -> bool { target == "tuner" || target.starts_with("tuner::") }
+fn is_own(target: &str) -> bool {
+    target == "tuner" || target.starts_with("tuner::")
+}
 
 /// The level a line is recorded at: other crates' lines never above DEBUG (see module docs).
-fn recorded_level(target: &str, level: Level) -> Level { if is_own(target) { level } else { level.max(Level::DEBUG) } }
+fn recorded_level(target: &str, level: Level) -> Level {
+    if is_own(target) { level } else { level.max(Level::DEBUG) }
+}
 
 impl<S: tracing::Subscriber> Layer<S> for RingLayer {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
@@ -332,7 +334,9 @@ impl<S: tracing::Subscriber> Layer<S> for RingLayer {
 }
 
 /// The filter for normal use / debug logging (see module docs).
-fn default_filter(debug: bool) -> EnvFilter { EnvFilter::new(if debug { "tuner=debug,info" } else { "tuner=info,off" }) }
+fn default_filter(debug: bool) -> EnvFilter {
+    EnvFilter::new(if debug { "tuner=debug,info" } else { "tuner=info,off" })
+}
 
 /// Live control of the installed filter.
 struct FilterControl {
@@ -416,9 +420,13 @@ mod tests {
 
     use super::*;
 
-    fn tmp() -> tempfile::TempDir { tempfile::Builder::new().prefix("tuner-logging-").tempdir().unwrap() }
+    fn tmp() -> tempfile::TempDir {
+        tempfile::Builder::new().prefix("tuner-logging-").tempdir().unwrap()
+    }
 
-    fn mode(p: &Path) -> u32 { std::fs::metadata(p).unwrap().permissions().mode() & 0o777 }
+    fn mode(p: &Path) -> u32 {
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
 
     #[test]
     fn rotates_at_five_megabytes_with_one_backup() {
@@ -528,7 +536,11 @@ mod tests {
             assert_eq!(
                 new,
                 [
-                    (Level::DEBUG, "rustls_platform_verifier::verification", "failed to verify TLS certificate: invalid peer certificate: UnknownIssuer"),
+                    (
+                        Level::DEBUG,
+                        "rustls_platform_verifier::verification",
+                        "failed to verify TLS certificate: invalid peer certificate: UnknownIssuer"
+                    ),
                     (Level::DEBUG, "calloop::loop_logic", "Received an event for non-existence source"),
                     (Level::INFO, "tuner::images", "own line"),
                     (Level::DEBUG, "tuner::images", "own debug line"),

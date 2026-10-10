@@ -43,7 +43,9 @@ use crate::ui::{LayoutClass, OverlayRequest, Route, Screen, ScreenId, SettingsPa
 // ====================================================================== shared helpers
 
 /// The stable reference of a channel.
-pub(crate) fn channel_ref(ch: &ChannelSummary) -> ItemRef { ItemRef { source: ch.source_id, kind: ItemKind::Channel, key: ch.key.clone() } }
+pub(crate) fn channel_ref(ch: &ChannelSummary) -> ItemRef {
+    ItemRef { source: ch.source_id, kind: ItemKind::Channel, key: ch.key.clone() }
+}
 
 /// The live channel the player is on (or zapping to), if any. A failed stream doesn't count
 /// (Enter on it plays it again).
@@ -225,7 +227,9 @@ impl NoGuide {
     }
 
     /// The guides cover under half the channels.
-    pub(crate) fn poor(&self) -> bool { matches!(self, NoGuide::NotCovered { covered, total } if covered * 2 < *total) }
+    pub(crate) fn poor(&self) -> bool {
+        matches!(self, NoGuide::NotCovered { covered, total } if covered * 2 < *total)
+    }
 }
 
 impl GuideStatus {
@@ -369,7 +373,9 @@ pub(crate) fn play_catchup(ctx: &mut UiCtx<'_>, channel: ChannelId, p: &Programm
 
 /// Encode a menu choice index as an action (menus report an `Action`; see `ContextMenuSpec`).
 /// Uses Supplementary Private Use Area-A characters, which no keyboard produces.
-pub(crate) fn choice_action(i: usize) -> Action { Action::FilterInput(char::from_u32(0xF0000 + i as u32).unwrap_or('\u{F0000}')) }
+pub(crate) fn choice_action(i: usize) -> Action {
+    Action::FilterInput(char::from_u32(0xF0000 + i as u32).unwrap_or('\u{F0000}'))
+}
 
 /// Decode [`choice_action`].
 pub(crate) fn choice_index(a: Action) -> Option<usize> {
@@ -451,7 +457,11 @@ pub(crate) fn skeleton_rows(ui: &mut egui::Ui, theme: &Theme, row_h: f32) {
         let y = rect.top() + i as f32 * row_h + row_h / 2.0;
         let w = rect.width() * (0.45 + 0.25 * ((i * 7 % 5) as f32 / 5.0));
         let h = (12.0 * theme.rem()).round();
-        p.rect_filled(Rect::from_min_size(egui::pos2(rect.left() + pad, y - h / 2.0), egui::vec2(w, h)), theme.tokens.rounding, theme.tokens.fill_field);
+        p.rect_filled(
+            Rect::from_min_size(egui::pos2(rect.left() + pad, y - h / 2.0), egui::vec2(w, h)),
+            theme.tokens.rounding,
+            theme.tokens.fill_field,
+        );
     }
 }
 
@@ -594,11 +604,17 @@ fn synthetic_group(name: String, count: usize) -> Group {
 }
 
 impl LiveScreen {
-    fn preview_visible(layout: LayoutClass) -> bool { layout != LayoutClass::Compact }
+    fn preview_visible(layout: LayoutClass) -> bool {
+        layout != LayoutClass::Compact
+    }
 
-    fn open_collection(&self) -> Option<Collection> { self.open.as_ref().and_then(Entry::collection) }
+    fn open_collection(&self) -> Option<Collection> {
+        self.open.as_ref().and_then(Entry::collection)
+    }
 
-    fn open_index(&self) -> Option<usize> { self.open.as_ref().and_then(|e| self.groups.iter().position(|g| &g.entry == e)) }
+    fn open_index(&self) -> Option<usize> {
+        self.open.as_ref().and_then(|e| self.groups.iter().position(|g| &g.entry == e))
+    }
 
     fn signature(ctx: &UiCtx<'_>, sort: SortMode) -> (u64, u64, SortMode, bool) {
         (ctx.lib.generation, fav_signature(ctx.favs), sort, ctx.config.interface.hide_empty_groups)
@@ -640,7 +656,11 @@ impl LiveScreen {
     }
 
     fn default_entry(&self, ctx: &UiCtx<'_>) -> Option<Entry> {
-        ctx.favs.non_empty_lists().next().map(|l| Entry::FavList(l.id)).or_else(|| self.groups.iter().find(|g| g.entry == Entry::All).map(|g| g.entry.clone()))
+        ctx.favs
+            .non_empty_lists()
+            .next()
+            .map(|l| Entry::FavList(l.id))
+            .or_else(|| self.groups.iter().find(|g| g.entry == Entry::All).map(|g| g.entry.clone()))
     }
 
     fn rebuild_groups(&mut self, ctx: &UiCtx<'_>) {
@@ -703,12 +723,17 @@ impl LiveScreen {
                 }
                 v
             }
-            Some(e) => e.collection().map(|c| ctx.lib.live.collection(&c, ctx.favs, &ctx.lib.recent_channels, ctx.config.interface.live_sort)).unwrap_or_default(),
+            Some(e) => e
+                .collection()
+                .map(|c| ctx.lib.live.collection(&c, ctx.favs, &ctx.lib.recent_channels, ctx.config.interface.live_sort))
+                .unwrap_or_default(),
             None => Vec::new(),
         };
         self.rebuild_haystacks(ctx);
         let reminder_row = keep_reminder.and_then(|id| {
-            self.channel_rows.iter().position(|&i| self.reminder_rows.get(i as usize).and_then(|r| self.reminders.get(*r)).is_some_and(|r| r.id == id))
+            self.channel_rows
+                .iter()
+                .position(|&i| self.reminder_rows.get(i as usize).and_then(|r| self.reminders.get(*r)).is_some_and(|r| r.id == id))
         });
         match reminder_row.or_else(|| keep.and_then(|k| self.row_of(k))).filter(|_| !reset_cursor) {
             Some(i) => self.chan_list.select(i),
@@ -752,9 +777,13 @@ impl LiveScreen {
         self.channel_rows.get(self.chan_list.cursor).and_then(|&i| self.channels.get(i as usize)).copied()
     }
 
-    fn row_of(&self, id: ChannelId) -> Option<usize> { self.channel_rows.iter().position(|&i| self.channels.get(i as usize) == Some(&id)) }
+    fn row_of(&self, id: ChannelId) -> Option<usize> {
+        self.channel_rows.iter().position(|&i| self.channels.get(i as usize) == Some(&id))
+    }
 
-    fn cursor_group(&self) -> Option<&GroupItem> { self.group_rows.get(self.group_list.cursor).and_then(|&i| self.groups.get(i as usize)) }
+    fn cursor_group(&self) -> Option<&GroupItem> {
+        self.group_rows.get(self.group_list.cursor).and_then(|&i| self.groups.get(i as usize))
+    }
 
     /// Open a group: list its channels, cursor on the first.
     fn open_entry(&mut self, ctx: &mut UiCtx<'_>, entry: Entry) {
@@ -776,7 +805,9 @@ impl LiveScreen {
                 self.refilter_channels();
             }
             if self.row_of(id).is_none() {
-                let entry = prefer.filter(|e| self.groups.iter().any(|g| &g.entry == e)).or_else(|| ctx.lib.live.get(id).and_then(|c| c.group_ids.first()).map(|g| Entry::Group(*g)));
+                let entry = prefer
+                    .filter(|e| self.groups.iter().any(|g| &g.entry == e))
+                    .or_else(|| ctx.lib.live.get(id).and_then(|c| c.group_ids.first()).map(|g| Entry::Group(*g)));
                 if let Some(e) = entry {
                     self.open_entry(ctx, e);
                 }
@@ -896,7 +927,14 @@ impl LiveScreen {
                     self.delete_list(ctx);
                     true
                 }
-                Action::Up | Action::Down | Action::PageUp | Action::PageDown | Action::Home | Action::End | Action::Activate | Action::ActivateAlt => true,
+                Action::Up
+                | Action::Down
+                | Action::PageUp
+                | Action::PageDown
+                | Action::Home
+                | Action::End
+                | Action::Activate
+                | Action::ActivateAlt => true,
                 Action::FilterInput(_) | Action::FilterBackspace | Action::FilterClear | Action::FilterDeleteWord => true,
                 _ => false,
             },
@@ -1089,7 +1127,11 @@ impl LiveScreen {
             }
             Action::Rename => {
                 if let Some(ch) = cur {
-                    ctx.open(OverlayRequest::Rename(RenameSpec { title: "Rename channel".into(), initial: ch.name.to_string(), target: RenameTarget::Item { item: channel_ref(&ch) } }));
+                    ctx.open(OverlayRequest::Rename(RenameSpec {
+                        title: "Rename channel".into(),
+                        initial: ch.name.to_string(),
+                        target: RenameTarget::Item { item: channel_ref(&ch) },
+                    }));
                 }
                 true
             }
@@ -1120,7 +1162,13 @@ impl LiveScreen {
                 let items = SORTS
                     .iter()
                     .enumerate()
-                    .map(|(i, (label, mode))| MenuItem { icon: if *mode == current { glyphs::CHECK } else { "" }, label: (*label).into(), action: choice_action(i), enabled: true, shortcut: None })
+                    .map(|(i, (label, mode))| MenuItem {
+                        icon: if *mode == current { glyphs::CHECK } else { "" },
+                        label: (*label).into(),
+                        action: choice_action(i),
+                        enabled: true,
+                        shortcut: None,
+                    })
                     .collect();
                 self.menu = Some(Menu::Sort);
                 ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: "Sort channels".into(), items }));
@@ -1150,7 +1198,9 @@ impl LiveScreen {
                 }
                 true
             }
-            Action::Up | Action::Down | Action::PageUp | Action::PageDown | Action::Home | Action::End | Action::Activate | Action::ActivateAlt => true,
+            Action::Up | Action::Down | Action::PageUp | Action::PageDown | Action::Home | Action::End | Action::Activate | Action::ActivateAlt => {
+                true
+            }
             Action::FilterInput(_) | Action::FilterBackspace | Action::FilterClear | Action::FilterDeleteWord => true,
             _ => false,
         }
@@ -1162,7 +1212,13 @@ impl LiveScreen {
         let fav = ctx.favs.is_fav(&channel_ref(&ch));
         let mut items = vec![
             menu_item(glyphs::PLAY, "Play fullscreen", Action::ActivateAlt, !ch.unsupported, k),
-            menu_item(if fav { glyphs::FAVOURITE_OFF } else { glyphs::FAVOURITE }, if fav { "Remove from Favourites" } else { "Add to Favourites" }, Action::ToggleFavourite, true, k),
+            menu_item(
+                if fav { glyphs::FAVOURITE_OFF } else { glyphs::FAVOURITE },
+                if fav { "Remove from Favourites" } else { "Add to Favourites" },
+                Action::ToggleFavourite,
+                true,
+                k,
+            ),
             menu_item(glyphs::FAV_LIST, "Favourites lists…", Action::AddToList, true, k),
             menu_item(glyphs::GUIDE, "Show in TV guide", Action::OpenInGuide, true, k),
             menu_item(glyphs::INFO, "Edit information…", Action::ShowDetails, true, k),
@@ -1232,8 +1288,13 @@ impl LiveScreen {
                 let Some(src) = live.get(self.channels[i]).map(|c| c.source_id) else { return };
                 let mut order = self.channels.clone();
                 order.swap(i, j);
-                let keys: Vec<crate::model::ItemKey> = order.iter().filter_map(|c| live.get(*c)).filter(|c| c.source_id == src).map(|c| c.key.clone()).collect();
-                let _ = ctx.services.store.writer().submit_notify(DataScope::Overrides, move |c| crate::store::user::reorder_items(c, src, ItemKind::Channel, &keys));
+                let keys: Vec<crate::model::ItemKey> =
+                    order.iter().filter_map(|c| live.get(*c)).filter(|c| c.source_id == src).map(|c| c.key.clone()).collect();
+                let _ = ctx
+                    .services
+                    .store
+                    .writer()
+                    .submit_notify(DataScope::Overrides, move |c| crate::store::user::reorder_items(c, src, ItemKind::Channel, &keys));
             }
             Collection::Favourites(l) => {
                 let (Some(a), Some(b)) = (live.get(self.channels[i]), live.get(self.channels[j])) else { return };
@@ -1245,7 +1306,11 @@ impl LiveScreen {
                     return;
                 }
                 let l = *l;
-                let _ = ctx.services.store.writer().submit_notify(DataScope::Favourites, move |c| crate::store::user::move_favourite(c, l, &item, target));
+                let _ = ctx
+                    .services
+                    .store
+                    .writer()
+                    .submit_notify(DataScope::Favourites, move |c| crate::store::user::move_favourite(c, l, &item, target));
             }
             _ => {}
         }
@@ -1257,7 +1322,11 @@ impl LiveScreen {
                 let item = channel_ref(ch);
                 let now = ctx.now;
                 let it = item.clone();
-                let _ = ctx.services.store.writer().submit_notify(DataScope::Favourites, move |c| crate::store::user::set_favourite(c, l, &it, false, now));
+                let _ = ctx
+                    .services
+                    .store
+                    .writer()
+                    .submit_notify(DataScope::Favourites, move |c| crate::store::user::set_favourite(c, l, &it, false, now));
                 ctx.favs.apply_toggle(l, &item, false);
                 let list = ctx.favs.lists.iter().find(|x| x.id == l).map(|x| x.name.clone()).unwrap_or_default();
                 ctx.toast(Toast::info(format!("Removed “{}” from {list}", ch.name)));
@@ -1388,7 +1457,13 @@ impl LiveScreen {
                 playing: playing == Some(id),
                 ..opts
             };
-            let state = if focused { rc.state } else if rc.state.is_cursor() { RowState::Selected } else { RowState::Idle };
+            let state = if focused {
+                rc.state
+            } else if rc.state.is_cursor() {
+                RowState::Selected
+            } else {
+                RowState::Idle
+            };
             let resp = channel_row(ui, theme, ctx.images, ch, nn.as_ref(), now, o, state);
             clicked |= resp.clicked();
             resp
@@ -1429,7 +1504,13 @@ impl LiveScreen {
                 _ => String::new(),
             };
             let detail = r.map(|r| format!("{} {}", crate::ui::epg_grid::day_label(r.start), hhmm(r.start, h24)));
-            let state = if focused { rc.state } else if rc.state.is_cursor() { RowState::Selected } else { RowState::Idle };
+            let state = if focused {
+                rc.state
+            } else if rc.state.is_cursor() {
+                RowState::Selected
+            } else {
+                RowState::Idle
+            };
             menu_row(ui, theme, Some(glyphs::REMINDER), &label, detail.as_deref(), false, state)
         });
     }
@@ -1473,13 +1554,26 @@ impl LiveScreen {
             if let Some(pc) = playing_channel(&snap).filter(|p| Some(*p) != cursor).and_then(|p| ctx.lib.live.get(p)) {
                 let next = cursor.and_then(|c| ctx.lib.live.get(c)).map(|c| format!(" · Enter on {} switches", c.name)).unwrap_or_default();
                 ui.add_space(theme.space(SpaceToken::Sm));
-                ui.add(egui::Label::new(egui::RichText::new(format!("{} {}{next}", glyphs::PLAY, pc.name)).size(theme.font(TypeToken::BodySmall)).color(t.text_secondary)).truncate());
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("{} {}{next}", glyphs::PLAY, pc.name))
+                            .size(theme.font(TypeToken::BodySmall))
+                            .color(t.text_secondary),
+                    )
+                    .truncate(),
+                );
             }
         } else {
             let r = ui.allocate_rect(video_rect, egui::Sense::hover()).rect;
             ui.painter().rect_filled(r, t.rounding, t.fill_field);
             let hint = if cursor.is_some() { "Enter plays here · Shift+Enter fullscreen" } else { "" };
-            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, hint, egui::FontId::proportional(theme.font(TypeToken::BodySmall)), t.text_secondary);
+            ui.painter().text(
+                r.center(),
+                egui::Align2::CENTER_CENTER,
+                hint,
+                egui::FontId::proportional(theme.font(TypeToken::BodySmall)),
+                t.text_secondary,
+            );
         }
         ui.add_space(theme.space(SpaceToken::Lg));
         let Some(ch) = cursor.and_then(|id| ctx.lib.live.get(id).cloned()) else { return };
@@ -1548,7 +1642,9 @@ impl LiveScreen {
                 });
                 ui.horizontal(|ui| {
                     let w = (ui.available_width() * 0.6).max(60.0);
-                    ui.allocate_ui(egui::vec2(w, (8.0 * rem).round()), |ui| progress::progress_bar(ui, theme, p.progress(ctx.now), (3.0 * rem).round()));
+                    ui.allocate_ui(egui::vec2(w, (8.0 * rem).round()), |ui| {
+                        progress::progress_bar(ui, theme, p.progress(ctx.now), (3.0 * rem).round())
+                    });
                     ui.label(egui::RichText::new(time_left(p.stop - ctx.now)).size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
                 });
                 if let Some(d) = self.details.description.as_deref().filter(|d| !d.is_empty()) {
@@ -1621,12 +1717,20 @@ impl LiveScreen {
             return;
         }
         let zap = self.zap_for_open(ctx, ch);
-        ctx.play(PlayerCommand::Play(PlayRequest { media: MediaRef::Channel(ch), zap, origin: PlayOrigin::LivePreview, resume: false, immediate: true }));
+        ctx.play(PlayerCommand::Play(PlayRequest {
+            media: MediaRef::Channel(ch),
+            zap,
+            origin: PlayOrigin::LivePreview,
+            resume: false,
+            immediate: true,
+        }));
     }
 }
 
 impl Screen for LiveScreen {
-    fn id(&self) -> ScreenId { ScreenId::Live }
+    fn id(&self) -> ScreenId {
+        ScreenId::Live
+    }
 
     fn key_contexts(&self) -> Vec<KeyContext> {
         match self.focus {
@@ -1698,7 +1802,9 @@ impl Screen for LiveScreen {
             }
         }
         if ctx.lib.built_at != 0 && ctx.lib.is_empty() {
-            if empty_state(ui, theme, glyphs::PLAYLIST, "No playlists yet", Some(EMPTY_LIBRARY_DETAIL), Some("Add playlist")).is_some_and(|r| r.clicked()) {
+            if empty_state(ui, theme, glyphs::PLAYLIST, "No playlists yet", Some(EMPTY_LIBRARY_DETAIL), Some("Add playlist"))
+                .is_some_and(|r| r.clicked())
+            {
                 ctx.navigate(crate::ui::NavRequest::Switch(Route::Onboarding(crate::ui::OnboardingStart::AddSource)));
             }
             return;

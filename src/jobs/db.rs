@@ -28,9 +28,8 @@ pub(super) fn mark_epg_not_modified(conn: &Connection, id: EpgSourceId, now: Tim
 
 /// Largest catch-up window (days) of any channel: programmes inside it are kept (DESIGN §7.4).
 pub(super) fn max_catchup_days(conn: &Connection) -> Result<u32> {
-    let d: i64 = conn.query_row("SELECT COALESCE(max(json_extract(catchup, '$.days')), 0) FROM channel WHERE catchup IS NOT NULL", [], |r| {
-        r.get(0)
-    })?;
+    let d: i64 =
+        conn.query_row("SELECT COALESCE(max(json_extract(catchup, '$.days')), 0) FROM channel WHERE catchup IS NOT NULL", [], |r| r.get(0))?;
     Ok(u32::try_from(d.clamp(0, 3650)).unwrap_or(0))
 }
 

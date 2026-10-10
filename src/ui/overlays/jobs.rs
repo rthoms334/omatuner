@@ -45,7 +45,9 @@ pub struct JobsOverlay {
 /// Identity of a problem row across re-reads.
 type ProblemKey = (Timestamp, String);
 
-fn problem_key(line: &LogLine) -> ProblemKey { (line.at, line.message.clone()) }
+fn problem_key(line: &LogLine) -> ProblemKey {
+    (line.at, line.message.clone())
+}
 
 /// What the cursor is on, so it stays on that row when the lists above it change.
 enum CursorRow {
@@ -54,7 +56,9 @@ enum CursorRow {
 }
 
 impl JobsOverlay {
-    fn rows(&self) -> usize { self.running.len() + self.problems.len() }
+    fn rows(&self) -> usize {
+        self.running.len() + self.problems.len()
+    }
 
     fn cursor_row(&self) -> Option<CursorRow> {
         match self.cursor.checked_sub(self.running.len()) {
@@ -90,7 +94,9 @@ fn job_problems(lines: &[LogLine]) -> Vec<LogLine> {
 
 /// "Downloading 12.3 MB of 40.0 MB", "Parsing · 12 345 items"…
 fn phase_text(p: &JobPhase) -> String {
-    fn mb(b: u64) -> String { format!("{:.1} MB", b as f64 / 1_000_000.0) }
+    fn mb(b: u64) -> String {
+        format!("{:.1} MB", b as f64 / 1_000_000.0)
+    }
     match p {
         JobPhase::Queued => "Waiting".into(),
         JobPhase::Connecting => "Connecting".into(),
@@ -116,7 +122,9 @@ fn elapsed_text(now: Timestamp, started: Timestamp) -> String {
 }
 
 impl Overlay for JobsOverlay {
-    fn key_contexts(&self) -> Vec<KeyContext> { vec![KeyContext::List, KeyContext::Modal] }
+    fn key_contexts(&self) -> Vec<KeyContext> {
+        vec![KeyContext::List, KeyContext::Modal]
+    }
 
     fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> OverlayOutcome {
         let rows = self.rows();
@@ -282,7 +290,9 @@ fn row_bg(theme: &Theme, rect: egui::Rect, cursor: bool) -> egui::Shape {
 mod tests {
     use super::*;
 
-    fn line(target: &str, level: tracing::Level, msg: &str) -> LogLine { LogLine { at: 0, level, target: target.into(), message: msg.into() } }
+    fn line(target: &str, level: tracing::Level, msg: &str) -> LogLine {
+        LogLine { at: 0, level, target: target.into(), message: msg.into() }
+    }
 
     #[test]
     fn problems_are_job_warnings_newest_first() {

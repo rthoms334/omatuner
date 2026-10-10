@@ -186,7 +186,9 @@ fn key_of(url: &str, kind: ImageKind) -> Key {
 
 enum Outcome {
     Ready(egui::ColorImage),
-    Failed { transient: bool },
+    Failed {
+        transient: bool,
+    },
     /// Not requested recently; dropped without work. A later `get` re-requests it.
     Skipped,
 }
@@ -216,7 +218,9 @@ struct Shared {
     egui: egui::Context,
 }
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> { m.lock().unwrap_or_else(|e| e.into_inner()) }
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 impl Shared {
     fn is_stale(&self, key: Key) -> bool {
@@ -290,14 +294,7 @@ impl ImageCache {
         Self::with_fetch(paths.image_cache(), Arc::new(http), rt, egui, budget_bytes, Tuning::default())
     }
 
-    fn with_fetch(
-        dir: PathBuf,
-        fetch: Arc<dyn Fetch>,
-        rt: tokio::runtime::Handle,
-        egui: egui::Context,
-        budget_bytes: usize,
-        tuning: Tuning,
-    ) -> Self {
+    fn with_fetch(dir: PathBuf, fetch: Arc<dyn Fetch>, rt: tokio::runtime::Handle, egui: egui::Context, budget_bytes: usize, tuning: Tuning) -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
         let shared = Arc::new(Shared {
             dir,
@@ -375,7 +372,9 @@ impl ImageCache {
     /// from (an Xtream panel's logos and posters) is fetched with that playlist's User-Agent;
     /// images elsewhere (CDNs, wikis) with the default one. `ImageCache::get` has no source:
     /// the host is what ties a URL to a provider.
-    pub fn set_source_agents(&mut self, agents: HashMap<String, String>) { *lock(&self.shared.agents) = agents; }
+    pub fn set_source_agents(&mut self, agents: HashMap<String, String>) {
+        *lock(&self.shared.agents) = agents;
+    }
 
     /// Drop all textures (theme/scale change does NOT require this; memory pressure does).
     pub fn clear_memory(&mut self) {
@@ -387,7 +386,9 @@ impl ImageCache {
     }
 
     /// (textures, bytes) for the debug overlay.
-    pub fn stats(&self) -> (usize, usize) { (self.textures.len(), self.texture_bytes) }
+    pub fn stats(&self) -> (usize, usize) {
+        (self.textures.len(), self.texture_bytes)
+    }
 
     fn drain_results(&mut self) {
         while let Ok(Done { key, outcome }) = self.rx.try_recv() {
@@ -473,10 +474,14 @@ impl ImageCache {
         true
     }
 
-    fn evict(&mut self) { self.make_room(0); }
+    fn evict(&mut self) {
+        self.make_room(0);
+    }
 }
 
-fn image_bytes(img: &egui::ColorImage) -> usize { img.size[0] * img.size[1] * 4 }
+fn image_bytes(img: &egui::ColorImage) -> usize {
+    img.size[0] * img.size[1] * 4
+}
 
 // ---------------------------------------------------------------------------- loader task
 
@@ -600,7 +605,7 @@ async fn decode_and_settle(shared: &Shared, path: PathBuf, bytes: bytes::Bytes, 
         Ok(Ok(Err(e))) => tracing::debug!(error = %e, cached, "image decode failed"),
         Ok(Err(e)) if e.is_panic() => tracing::warn!(cached, "image decoder panicked; treating the image as invalid"),
         Ok(Err(_)) => return Outcome::Failed { transient: true }, // runtime shutting down
-        Err(()) => {} // timed out
+        Err(()) => {}                                             // timed out
     }
     let _ = tokio::task::spawn_blocking(move || {
         if cached {
@@ -690,9 +695,8 @@ fn fit(w: f32, h: f32, max: (u32, u32), upscale: bool) -> (u32, u32, f32) {
 }
 
 fn decode_raster(bytes: &[u8], kind: ImageKind) -> Result<egui::ColorImage> {
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(|e| Error::BadPayload(format!("image: {e}")))?;
+    let mut reader =
+        image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().map_err(|e| Error::BadPayload(format!("image: {e}")))?;
     if reader.format().is_none() {
         return Err(Error::BadPayload("not an image".into()));
     }
@@ -727,10 +731,7 @@ fn decode_svg(bytes: &[u8], kind: ImageKind) -> Result<egui::ColorImage> {
         // never load system fonts (slow, and text in logos is decorative); text is dropped
         fontdb: Arc::new(usvg::fontdb::Database::new()),
         // no local files, no nested decoders that bypass our limits
-        image_href_resolver: usvg::ImageHrefResolver {
-            resolve_data: Box::new(|_, _, _| None),
-            resolve_string: Box::new(|_, _| None),
-        },
+        image_href_resolver: usvg::ImageHrefResolver { resolve_data: Box::new(|_, _, _| None), resolve_string: Box::new(|_, _| None) },
         ..usvg::Options::default()
     };
     let tree = usvg::Tree::from_data(bytes, &opt).map_err(|e| Error::BadPayload(format!("svg: {e}")))?;
@@ -883,7 +884,9 @@ mod tests {
                 agents: Mutex::default(),
             })
         }
-        fn calls(&self) -> usize { self.calls.load(Ordering::SeqCst) }
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
     }
 
     impl Fetch for FakeFetch {
@@ -980,7 +983,14 @@ mod tests {
 
         let fake2 = FakeFetch::new(vec![], Answer::NotFound, Duration::ZERO);
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
-        let mut c2 = ImageCache::with_fetch(r.dir.path().to_path_buf(), fake2.clone(), rt.handle().clone(), egui::Context::default(), 1 << 20, Tuning::default());
+        let mut c2 = ImageCache::with_fetch(
+            r.dir.path().to_path_buf(),
+            fake2.clone(),
+            rt.handle().clone(),
+            egui::Context::default(),
+            1 << 20,
+            Tuning::default(),
+        );
         assert_eq!(size_of(&drive(&mut c2, url, ImageKind::Poster)), [300, 300]);
         assert_eq!(fake2.calls(), 0);
     }
@@ -1132,13 +1142,21 @@ mod tests {
         // a fresh instance (new session) trusts the marker: no request
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
         let fake2 = FakeFetch::new(png(4, 4), Answer::Bytes, Duration::ZERO);
-        let mut c2 = ImageCache::with_fetch(r.dir.path().to_path_buf(), fake2.clone(), rt.handle().clone(), egui::Context::default(), 1 << 20, Tuning::default());
+        let mut c2 = ImageCache::with_fetch(
+            r.dir.path().to_path_buf(),
+            fake2.clone(),
+            rt.handle().clone(),
+            egui::Context::default(),
+            1 << 20,
+            Tuning::default(),
+        );
         assert!(matches!(drive(&mut c2, url, ImageKind::Logo), ImageState::Failed));
         assert_eq!(fake2.calls(), 0);
 
         // an expired marker is ignored
         let tuning = Tuning { disk_fail_ttl: Duration::ZERO, ..Tuning::default() };
-        let mut c3 = ImageCache::with_fetch(r.dir.path().to_path_buf(), fake2.clone(), rt.handle().clone(), egui::Context::default(), 1 << 20, tuning);
+        let mut c3 =
+            ImageCache::with_fetch(r.dir.path().to_path_buf(), fake2.clone(), rt.handle().clone(), egui::Context::default(), 1 << 20, tuning);
         assert!(matches!(drive(&mut c3, url, ImageKind::Logo), ImageState::Ready(_)));
         assert_eq!(fake2.calls(), 1);
     }
@@ -1203,7 +1221,9 @@ mod tests {
         Arc::get_mut(&mut r.cache.shared).expect("no task started yet").decoder = decoder;
     }
 
-    fn panicking_decoder(_: &[u8], _: ImageKind) -> Result<egui::ColorImage> { panic!("decoder exploded") }
+    fn panicking_decoder(_: &[u8], _: ImageKind) -> Result<egui::ColorImage> {
+        panic!("decoder exploded")
+    }
 
     #[test]
     fn decoder_panics_are_permanent_failures_with_a_disk_marker() {
@@ -1326,7 +1346,10 @@ mod tests {
         agents.sort();
         assert_eq!(
             agents,
-            [("http://panel.example:8080/logos/1.png".to_owned(), Some("IPTVSmarters/1.0".to_owned())), ("https://cdn.example/2.png".to_owned(), None)]
+            [
+                ("http://panel.example:8080/logos/1.png".to_owned(), Some("IPTVSmarters/1.0".to_owned())),
+                ("https://cdn.example/2.png".to_owned(), None)
+            ]
         );
     }
 

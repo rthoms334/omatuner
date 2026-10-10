@@ -55,13 +55,12 @@ impl IdleInhibitor {
         let backend = unsafe { Backend::from_foreign_display(d.display.as_ptr().cast()) };
         let conn = Connection::from_backend(backend);
         let (globals, queue) = registry_queue_init::<QueueState>(&conn).map_err(|e| Error::other(format!("wayland registry: {e}")))?;
-        let manager: ZwpIdleInhibitManagerV1 = globals
-            .bind(&queue.handle(), 1..=1, ())
-            .map_err(|e| Error::other(format!("zwp_idle_inhibit_manager_v1 unavailable: {e}")))?;
+        let manager: ZwpIdleInhibitManagerV1 =
+            globals.bind(&queue.handle(), 1..=1, ()).map_err(|e| Error::other(format!("zwp_idle_inhibit_manager_v1 unavailable: {e}")))?;
         // SAFETY: the pointer is the live wl_surface of our window (same lifetime argument as
         // the display); we only use it as the argument of `create_inhibitor`.
-        let id = unsafe { ObjectId::from_ptr(WlSurface::interface(), w.surface.as_ptr().cast()) }
-            .map_err(|e| Error::other(format!("wl_surface: {e}")))?;
+        let id =
+            unsafe { ObjectId::from_ptr(WlSurface::interface(), w.surface.as_ptr().cast()) }.map_err(|e| Error::other(format!("wl_surface: {e}")))?;
         let surface = WlSurface::from_id(&conn, id).map_err(|e| Error::other(format!("wl_surface: {e}")))?;
         Ok(Self { conn, queue, manager, surface, inhibitor: None, active: false })
     }
@@ -86,7 +85,9 @@ impl IdleInhibitor {
         }
     }
 
-    pub fn is_active(&self) -> bool { self.active }
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
 }
 
 impl Drop for IdleInhibitor {

@@ -24,10 +24,10 @@ const QUALITY_TAGS: &[&str] = &["hd", "fhd", "uhd", "4k", "sd", "1080p", "720p",
 
 static PREFIX_RES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     [
-        r"^\[[^\]]*\]\s*",          // [vip]
-        r"^\|[a-z]{2,3}\|\s*",      // |en|
-        r"^[a-z]{2,3}\s*[:|]\s*",   // us:  uk |
-        r"^[a-z]{2}\s+-\s+",        // de - Das Erste
+        r"^\[[^\]]*\]\s*",        // [vip]
+        r"^\|[a-z]{2,3}\|\s*",    // |en|
+        r"^[a-z]{2,3}\s*[:|]\s*", // us:  uk |
+        r"^[a-z]{2}\s+-\s+",      // de - Das Erste
     ]
     .iter()
     .map(|r| Regex::new(r).expect("static regex"))
@@ -63,7 +63,9 @@ pub fn normalize_name(s: &str) -> String {
 }
 
 /// Keep ASCII alphanumerics and `+`.
-fn squash(s: &str) -> String { s.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '+').collect() }
+fn squash(s: &str) -> String {
+    s.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '+').collect()
+}
 
 /// Group-name normalization (lighter than [`normalize_name`]: country prefixes are KEPT so
 /// "UK | News" and "US | News" stay distinct groups). Empty → "uncategorized".
@@ -73,7 +75,9 @@ pub fn normalize_group(raw: &str) -> String {
 }
 
 /// Group key for a raw group name.
-pub fn group_key(kind: ItemKind, raw_name: &str) -> GroupKey { GroupKey(format!("{}:{}", kind.as_str(), normalize_group(raw_name))) }
+pub fn group_key(kind: ItemKind, raw_name: &str) -> GroupKey {
+    GroupKey(format!("{}:{}", kind.as_str(), normalize_group(raw_name)))
+}
 
 /// URL identity for reattach: scheme://host[:port]/path with userinfo, query, fragment and
 /// Xtream credential path segments removed (`/live/u/p/1.ts` → `/live/1.ts`,

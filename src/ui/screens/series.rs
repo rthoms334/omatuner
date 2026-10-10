@@ -16,8 +16,12 @@ pub struct SeriesScreen {
 }
 
 impl Screen for SeriesScreen {
-    fn id(&self) -> ScreenId { ScreenId::Series }
-    fn key_contexts(&self) -> Vec<KeyContext> { self.browser.key_contexts() }
+    fn id(&self) -> ScreenId {
+        ScreenId::Series
+    }
+    fn key_contexts(&self) -> Vec<KeyContext> {
+        self.browser.key_contexts()
+    }
     fn on_enter(&mut self, ctx: &mut UiCtx<'_>, route: &Route) {
         let group = match route {
             Route::Series { group } => *group,
@@ -25,8 +29,16 @@ impl Screen for SeriesScreen {
         };
         self.browser.enter(ctx, false, group);
     }
-    fn on_event(&mut self, ctx: &mut UiCtx<'_>, ev: &AppEvent) { self.browser.event(ctx, ev) }
-    fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool { self.browser.action(ctx, action) }
-    fn on_overlay_result(&mut self, ctx: &mut UiCtx<'_>, result: OverlayResult) { self.browser.overlay_result(ctx, result) }
-    fn ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) { self.browser.ui(ui, ctx) }
+    fn on_event(&mut self, ctx: &mut UiCtx<'_>, ev: &AppEvent) {
+        self.browser.event(ctx, ev)
+    }
+    fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
+        self.browser.action(ctx, action)
+    }
+    fn on_overlay_result(&mut self, ctx: &mut UiCtx<'_>, result: OverlayResult) {
+        self.browser.overlay_result(ctx, result)
+    }
+    fn ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) {
+        self.browser.ui(ui, ctx)
+    }
 }

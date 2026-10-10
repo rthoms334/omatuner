@@ -104,7 +104,9 @@ impl EventBus {
         self.request_repaint();
     }
 
-    pub fn toast(&self, t: Toast) { self.send(AppEvent::Toast(t)) }
+    pub fn toast(&self, t: Toast) {
+        self.send(AppEvent::Toast(t))
+    }
 
     /// Ask for a frame without sending an event (continuous state changed, e.g. time-pos).
     pub fn request_repaint(&self) {
@@ -113,5 +115,7 @@ impl EventBus {
         }
     }
 
-    pub fn data_changed(&self, scope: DataScope) { self.send(AppEvent::Data(scope)) }
+    pub fn data_changed(&self, scope: DataScope) {
+        self.send(AppEvent::Data(scope))
+    }
 }

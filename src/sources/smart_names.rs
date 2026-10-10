@@ -130,8 +130,26 @@ const CODEC_WORDS: &[&str] =
 /// `(…)` contents that are tags rather than part of the name (compared lower-case; `backup`
 /// matches `backup 2`, `backup-1`…).
 const PAREN_TAGS: &[&str] = &[
-    "backup", "multi-sub", "multisub", "multi-audio", "multi audio", "multi", "vip", "geo-blocked", "not 24/7", "24/7", "opt-in", "dubbed",
-    "sub", "subbed", "vostfr", "vo", "ppv", "test", "new", "alt",
+    "backup",
+    "multi-sub",
+    "multisub",
+    "multi-audio",
+    "multi audio",
+    "multi",
+    "vip",
+    "geo-blocked",
+    "not 24/7",
+    "24/7",
+    "opt-in",
+    "dubbed",
+    "sub",
+    "subbed",
+    "vostfr",
+    "vo",
+    "ppv",
+    "test",
+    "new",
+    "alt",
 ];
 
 /// Three-letter codes accepted as country/language prefixes (two letters are always codes).
@@ -139,21 +157,25 @@ const COUNTRY3: &[&str] = &[
     "usa", "uae", "ksa", "gbr", "deu", "ger", "fra", "ita", "esp", "spa", "por", "prt", "bra", "arg", "mex", "can", "aus", "ind", "pak", "tur",
     "rus", "ukr", "pol", "nld", "bel", "swe", "nor", "dnk", "den", "fin", "isl", "irl", "che", "sui", "aut", "gre", "grc", "cze", "svk", "hun",
     "rou", "rom", "bgr", "bul", "srb", "hrv", "cro", "bih", "slo", "svn", "mkd", "alb", "ara", "eng", "lat", "afr", "asi", "chn", "jpn", "kor",
-    "phi", "tha", "vie", "idn", "mys", "isr", "irn", "irq", "egy", "mar", "tun", "dza", "alg", "nga", "zaf", "kur", "per", "chl", "col",
-    "ven", "lux", "ltu", "lva", "est", "geo", "arm", "aze", "kaz", "uzb", "bgd", "lka", "npl", "afg", "syr", "lbn", "jor", "kwt", "qat", "bhr",
-    "omn", "yem", "sau", "som", "eth", "ken", "gha", "cmr", "sen", "civ", "hin", "urd", "tam", "tel", "fre", "dut", "chi", "jap", "rum", "fil",
+    "phi", "tha", "vie", "idn", "mys", "isr", "irn", "irq", "egy", "mar", "tun", "dza", "alg", "nga", "zaf", "kur", "per", "chl", "col", "ven",
+    "lux", "ltu", "lva", "est", "geo", "arm", "aze", "kaz", "uzb", "bgd", "lka", "npl", "afg", "syr", "lbn", "jor", "kwt", "qat", "bhr", "omn",
+    "yem", "sau", "som", "eth", "ken", "gha", "cmr", "sen", "civ", "hin", "urd", "tam", "tel", "fre", "dut", "chi", "jap", "rum", "fil",
 ];
 
 /// Separators that are noise when left dangling at either end. Not `+`: `Canal +` and
 /// `Disney +` are channels of their own.
-fn is_separator(w: &str) -> bool { !w.is_empty() && w.chars().all(|c| matches!(c, '|' | '-' | '–' | '—' | ':' | '·' | '•' | '/' | '~' | '*' | '_')) }
+fn is_separator(w: &str) -> bool {
+    !w.is_empty() && w.chars().all(|c| matches!(c, '|' | '-' | '–' | '—' | ':' | '·' | '•' | '/' | '~' | '*' | '_'))
+}
 
 fn quality_of(w: &str) -> Option<Quality> {
     let w = w.trim();
     QUALITY_WORDS.iter().find(|(k, _)| w.eq_ignore_ascii_case(k)).map(|(_, q)| *q)
 }
 
-fn is_codec(w: &str) -> bool { CODEC_WORDS.iter().any(|k| w.eq_ignore_ascii_case(k)) }
+fn is_codec(w: &str) -> bool {
+    CODEC_WORDS.iter().any(|k| w.eq_ignore_ascii_case(k))
+}
 
 fn is_paren_tag(inner: &str) -> bool {
     let l = inner.trim().to_lowercase();
@@ -274,7 +296,9 @@ fn split_prefix(s: &str) -> Option<(Prefix<'_>, &str)> {
 }
 
 /// Strip leading separators/whitespace left after a prefix.
-fn trim_lead(s: &str) -> &str { s.trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '|' | ':' | '-' | '–' | '·' | '•')) }
+fn trim_lead(s: &str) -> &str {
+    s.trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '|' | ':' | '-' | '–' | '·' | '•'))
+}
 
 /// The shared pass: prefixes, then words and bracket groups.
 fn clean(raw: &str, vod: bool) -> Cleaned<'_> {
@@ -386,8 +410,8 @@ fn title_case(s: &str) -> String {
     const SMALL: &[&str] = &["and", "the", "for", "of", "in", "on", "at", "to", "by", "with", "a", "an", "or", "de", "la", "le", "et"];
     const WORDS2: &[&str] = &["my", "go", "up", "no", "so", "do", "be", "he", "if", "is", "it", "we", "me"];
     const ACRONYMS: &[&str] = &[
-        "nfl", "nba", "nhl", "mlb", "mls", "ufc", "wwe", "bbc", "itv", "hbo", "mtv", "cnn", "espn", "ppv", "vod", "usa", "vip", "xxx", "rtl",
-        "ard", "zdf", "dazn", "bt", "mbc", "osn", "tnt", "amc", "abc", "nbc", "cbs", "fox", "pbs", "dstv", "iptv",
+        "nfl", "nba", "nhl", "mlb", "mls", "ufc", "wwe", "bbc", "itv", "hbo", "mtv", "cnn", "espn", "ppv", "vod", "usa", "vip", "xxx", "rtl", "ard",
+        "zdf", "dazn", "bt", "mbc", "osn", "tnt", "amc", "abc", "nbc", "cbs", "fox", "pbs", "dstv", "iptv",
     ];
     let mut out = String::with_capacity(s.len());
     for (i, w) in s.split(' ').enumerate() {
@@ -398,8 +422,8 @@ fn title_case(s: &str) -> String {
         let letters = w.chars().filter(|c| c.is_alphabetic()).count();
         let digits = w.chars().any(|c| c.is_ascii_digit());
         let core = lower.trim_matches(|c: char| !c.is_alphanumeric());
-        let acronym = !SMALL.contains(&core)
-            && ((letters == 2 && !digits && !WORDS2.contains(&core)) || (digits && letters <= 3) || ACRONYMS.contains(&core));
+        let acronym =
+            !SMALL.contains(&core) && ((letters == 2 && !digits && !WORDS2.contains(&core)) || (digits && letters <= 3) || ACRONYMS.contains(&core));
         if i > 0 && SMALL.contains(&lower.as_str()) {
             out.push_str(&lower);
         } else if acronym || letters == 0 {

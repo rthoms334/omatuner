@@ -56,8 +56,7 @@ static FLUSSONIC_RE: LazyLock<Regex> =
 /// `scheme://host` / panel path (only before an explicit `live/`) / user / pass / stream id /
 /// extension; `live/` optional, query ignored.
 static XC_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(https?://[^/]+)(?:(/.+?)/live)??/(?:live/)?([^/]+)/([^/]+)/([^/.?]+)(?:\.([A-Za-z0-9]+))?(?:\?.*)?$")
-        .expect("static regex")
+    Regex::new(r"^(https?://[^/]+)(?:(/.+?)/live)??/(?:live/)?([^/]+)/([^/]+)/([^/.?]+)(?:\.([A-Za-z0-9]+))?(?:\?.*)?$").expect("static regex")
 });
 
 /// Build the URL. Errors: `NotFound` when outside the archive window, `Parse` when a
@@ -155,10 +154,7 @@ fn one_second_granularity(template: &str) -> bool {
 /// Archive (EPG) start before granularity: displayed start − correction − tvg-shift + user offset.
 /// Saturating: correction and offsets come from untrusted playlists.
 fn effective_start(req: &CatchupRequest<'_>) -> Timestamp {
-    req.start
-        .saturating_sub(req.spec.correction_s)
-        .saturating_sub(i64::from(req.tvg_shift_min) * 60)
-        .saturating_add(req.user_offset_s)
+    req.start.saturating_sub(req.spec.correction_s).saturating_sub(i64::from(req.tvg_shift_min) * 60).saturating_add(req.user_offset_s)
 }
 
 /// Times resolved for one expansion.
@@ -225,7 +221,9 @@ fn token(name: &str, dollar: bool, t: &Times, req: &CatchupRequest<'_>) -> Optio
     })
 }
 
-fn divisor(arg: &str) -> Option<i64> { arg.trim().parse::<i64>().ok().filter(|&x| x > 0) }
+fn divisor(arg: &str) -> Option<i64> {
+    arg.trim().parse::<i64>().ok().filter(|&x| x > 0)
+}
 
 /// Render `at` in `tz` with Kodi-style letters (`Y` → 4-digit year, `m d H M S` → 2 digits);
 /// every other character is copied.
@@ -262,9 +260,7 @@ fn append(live: &str, frag: &str) -> String {
 }
 
 fn flussonic(live: &str, req: &CatchupRequest<'_>) -> Result<String> {
-    let c = FLUSSONIC_RE
-        .captures(live)
-        .ok_or_else(|| Error::parse(None, "catch-up: live URL is not a Flussonic stream URL"))?;
+    let c = FLUSSONIC_RE.captures(live).ok_or_else(|| Error::parse(None, "catch-up: live URL is not a Flussonic stream URL"))?;
     let (host, path, stem) = (&c[1], &c[2], &c[3]);
     let query = c.get(5).map_or("", |m| m.as_str());
     let file = if &c[4] == "mpegts" {

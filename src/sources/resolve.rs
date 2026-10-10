@@ -36,8 +36,8 @@ use rusqlite::Connection;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::model::{
-    CatchupKind, CatchupSpec, Channel, ChannelId, EpgChannelId, EpisodeId, HttpHeaders, ItemKind, ItemRef, LiveFormat, MediaRef, MovieId,
-    Playable, PlayableKind, Source, SourceId, StreamLocator, Timestamp, Unsupported, WatchProgress, XtreamCredentials, XtreamStreamKind,
+    CatchupKind, CatchupSpec, Channel, ChannelId, EpgChannelId, EpisodeId, HttpHeaders, ItemKind, ItemRef, LiveFormat, MediaRef, MovieId, Playable,
+    PlayableKind, Source, SourceId, StreamLocator, Timestamp, Unsupported, WatchProgress, XtreamCredentials, XtreamStreamKind,
 };
 use crate::redact::Secret;
 use crate::sources::catchup::{self, CatchupRequest};
@@ -234,7 +234,9 @@ fn check_supported(ch: &Channel) -> Result<()> {
     }
 }
 
-fn channel_ref(ch: &Channel) -> ItemRef { ItemRef { source: ch.source_id, kind: ItemKind::Channel, key: ch.key.clone() } }
+fn channel_ref(ch: &Channel) -> ItemRef {
+    ItemRef { source: ch.source_id, kind: ItemKind::Channel, key: ch.key.clone() }
+}
 
 fn load_source(conn: &Connection, id: SourceId) -> Result<Source> {
     let src = store::sources::get_source(conn, id)?;
@@ -280,9 +282,13 @@ fn live_ext(src: &Source, cfg: &Config) -> LiveExt {
     urls::pick_live_ext(pref, allowed)
 }
 
-fn vod_ext(ext: Option<&str>) -> &str { ext.map(|e| e.trim().trim_start_matches('.')).filter(|e| !e.is_empty()).unwrap_or(DEFAULT_VOD_EXT) }
+fn vod_ext(ext: Option<&str>) -> &str {
+    ext.map(|e| e.trim().trim_start_matches('.')).filter(|e| !e.is_empty()).unwrap_or(DEFAULT_VOD_EXT)
+}
 
-fn non_blank(s: Option<&str>) -> Option<&str> { s.filter(|s| !s.trim().is_empty()) }
+fn non_blank(s: Option<&str>) -> Option<&str> {
+    s.filter(|s| !s.trim().is_empty())
+}
 
 /// Entry headers win; the User-Agent falls back to the source's, then the configured default.
 fn merge_headers(entry: &HttpHeaders, src: Option<&Source>, cfg: &Config) -> HttpHeaders {
@@ -370,10 +376,7 @@ fn resume_at(p: &WatchProgress, cfg: &Config) -> Option<f64> {
 }
 
 fn duration_hint(meta_s: Option<u32>, progress: Option<&WatchProgress>) -> Option<f64> {
-    meta_s
-        .filter(|d| *d > 0)
-        .map(f64::from)
-        .or_else(|| progress.and_then(|p| p.duration_s).filter(|d| d.is_finite() && *d > 0.0))
+    meta_s.filter(|d| *d > 0).map(f64::from).or_else(|| progress.and_then(|p| p.duration_s).filter(|d| d.is_finite() && *d > 0.0))
 }
 
 /// `S02E05 · Title` (just `S02E05` when the provider sent no title).
@@ -400,7 +403,9 @@ fn apply_header(h: &mut HttpHeaders, name: &str, value: &str) {
 }
 
 /// No URL scheme (`proto://`), or `file://`.
-fn is_local(addr: &str) -> bool { !addr.contains("://") || addr.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("file://")) }
+fn is_local(addr: &str) -> bool {
+    !addr.contains("://") || addr.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("file://"))
+}
 
 fn local_path(addr: &str) -> Option<PathBuf> {
     if !is_local(addr) {

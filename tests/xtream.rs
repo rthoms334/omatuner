@@ -18,11 +18,17 @@ use tuner::sources::{PayloadKind, sniff_payload};
 
 const NOW: i64 = 1_791_576_000; // 2026-10-09 18:00 UTC (= auth_ok.json timestamp_now)
 
-fn http() -> HttpClient { HttpClient::new(&HttpOptions::default()).expect("http client") }
+fn http() -> HttpClient {
+    HttpClient::new(&HttpOptions::default()).expect("http client")
+}
 
-fn client(creds: XtreamCredentials) -> XtreamClient { XtreamClient::new(http(), creds, Some("TunerTest/1.0".into())) }
+fn client(creds: XtreamCredentials) -> XtreamClient {
+    XtreamClient::new(http(), creds, Some("TunerTest/1.0".into()))
+}
 
-fn read(rel: &str) -> Vec<u8> { std::fs::read(support::fixture(rel)).expect(rel) }
+fn read(rel: &str) -> Vec<u8> {
+    std::fs::read(support::fixture(rel)).expect(rel)
+}
 
 fn de<T: serde::de::DeserializeOwned>(rel: &str) -> T {
     serde_json::from_slice(&read(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
@@ -470,7 +476,13 @@ async fn provider_guide_and_playlist_downloads() {
     assert_eq!(h.download(&req, &noop, &cancel).await.unwrap(), DownloadOutcome::NotModified);
 
     let m3u = dir.path().join("playlists/7.m3u");
-    let req = DownloadRequest { url: Secret::new(urls::m3u_url(&creds, LiveExt::M3u8)), dest: m3u.clone(), headers: Default::default(), etag: None, last_modified: None };
+    let req = DownloadRequest {
+        url: Secret::new(urls::m3u_url(&creds, LiveExt::M3u8)),
+        dest: m3u.clone(),
+        headers: Default::default(),
+        etag: None,
+        last_modified: None,
+    };
     h.download(&req, &noop, &cancel).await.unwrap();
     let text = std::fs::read_to_string(&m3u).unwrap();
     assert_eq!(sniff_payload(text.as_bytes()), PayloadKind::M3u);
@@ -543,7 +555,9 @@ async fn errors_never_contain_the_password() {
     errors.push(client(html.creds("someuser", pw)).series(&cancel).await.unwrap_err());
     let ok = mock_xtream::start(MockOptions::default()).await;
     errors.push(client(ok.creds("someuser", pw)).vod_info(1, &cancel).await.unwrap_err());
-    errors.push(http().get_json::<Vec<u8>>(&urls::player_api_url(&ok.creds("someuser", pw), None, &[]), &Default::default(), &cancel).await.unwrap_err());
+    errors.push(
+        http().get_json::<Vec<u8>>(&urls::player_api_url(&ok.creds("someuser", pw), None, &[]), &Default::default(), &cancel).await.unwrap_err(),
+    );
     let http404 = http()
         .get_bytes(&format!("{}/nope?username=someuser&password={}", ok.base, urls::enc(pw)), &Default::default(), 10, &cancel)
         .await

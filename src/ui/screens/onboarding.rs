@@ -35,7 +35,9 @@ use eframe::egui::{self, RichText};
 use super::home::kit::{self, Loader};
 use crate::jobs::{JobEvent, JobKind, JobOutcome, JobPhase, ProbeResult};
 use crate::keymap::{Action, KeyContext};
-use crate::model::{AccountInfo, AccountStatus, EpgSourceKind, JobId, Source, SourceColor, SourceDraft, SourceId, SourceKind, SourceSettings, XtreamCredentials};
+use crate::model::{
+    AccountInfo, AccountStatus, EpgSourceKind, JobId, Source, SourceColor, SourceDraft, SourceId, SourceKind, SourceSettings, XtreamCredentials,
+};
 use crate::msg::{AppEvent, DataScope};
 use crate::platform::{PickPurpose, PlatformEvent};
 use crate::store::Ticket;
@@ -97,7 +99,9 @@ pub(crate) enum Field {
 }
 
 impl Field {
-    fn is_text(self) -> bool { matches!(self, Field::Name | Field::Url | Field::Server | Field::Username | Field::Password | Field::Path | Field::GuideUrl) }
+    fn is_text(self) -> bool {
+        matches!(self, Field::Name | Field::Url | Field::Server | Field::Username | Field::Password | Field::Path | Field::GuideUrl)
+    }
 }
 
 /// Why a probe failed, and what the wizard does about it.
@@ -121,7 +125,12 @@ pub(crate) fn classify(msg: &str, kind: SourceKind) -> Failure {
     let http = m.strip_prefix("http ").and_then(|r| r.split_whitespace().next()).and_then(|s| s.parse::<u16>().ok());
     if m.starts_with("network error") || matches!(http, Some(s) if s >= 500 || s == 408 || s == 429) {
         Failure::Unreachable
-    } else if m.contains("login rejected") || matches!(http, Some(401 | 403)) || m.starts_with("account ") || m.contains("password") || m.contains("username") {
+    } else if m.contains("login rejected")
+        || matches!(http, Some(401 | 403))
+        || m.starts_with("account ")
+        || m.contains("password")
+        || m.contains("username")
+    {
         // rejected login, unusable account, or a "enter the username/password" config error
         Failure::Field(login)
     } else {
@@ -217,7 +226,9 @@ pub(crate) struct Form {
 }
 
 impl Form {
-    fn kind(&self) -> SourceKind { self.kind.unwrap_or(SourceKind::Xtream) }
+    fn kind(&self) -> SourceKind {
+        self.kind.unwrap_or(SourceKind::Xtream)
+    }
 
     pub(crate) fn fields(&self) -> Vec<Field> {
         let mut v = vec![Field::Name, Field::Icon, Field::Color];
@@ -269,7 +280,11 @@ impl Form {
                 if self.password.is_empty() {
                     return Err((Field::Password, "Enter your password".into()));
                 }
-                d.xtream = Some(XtreamCredentials { server, username: self.username.trim().to_owned(), password: crate::redact::Secret::new(self.password.clone()) });
+                d.xtream = Some(XtreamCredentials {
+                    server,
+                    username: self.username.trim().to_owned(),
+                    password: crate::redact::Secret::new(self.password.clone()),
+                });
             }
             SourceKind::M3uUrl => {
                 let url = self.url.trim();
@@ -379,7 +394,9 @@ impl OnboardingScreen {
         }
     }
 
-    fn guide_fields(&self) -> Vec<Field> { vec![Field::GuideUrl, Field::GuideFile, Field::Continue, Field::Skip] }
+    fn guide_fields(&self) -> Vec<Field> {
+        vec![Field::GuideUrl, Field::GuideFile, Field::Continue, Field::Skip]
+    }
 
     /// Test step buttons for the current state.
     fn test_buttons(&self) -> Vec<&'static str> {
@@ -495,7 +512,8 @@ impl OnboardingScreen {
 
     /// Test ▸ Continue: the Guide step for M3U without `url-tvg`, else import.
     fn after_test(&mut self, ctx: &mut UiCtx<'_>) {
-        let needs_guide = self.form.kind() != SourceKind::Xtream && self.probe_result.as_ref().is_none_or(|r| r.epg_urls.is_empty() && r.kind != SourceKind::Xtream);
+        let needs_guide = self.form.kind() != SourceKind::Xtream
+            && self.probe_result.as_ref().is_none_or(|r| r.epg_urls.is_empty() && r.kind != SourceKind::Xtream);
         if needs_guide {
             self.go(Step::Guide);
         } else {
@@ -549,7 +567,8 @@ impl OnboardingScreen {
         };
         self.import.guide_requested = true;
         let name = format!("{} guide", self.form.draft().map(|d| d.name).unwrap_or_else(|_| "Playlist".into()));
-        self.import.guide_ticket = Some(ctx.services.store.writer().submit_notify(DataScope::Epg, move |c| crate::store::sources::insert_epg_source(c, &name, &kind, 0)));
+        self.import.guide_ticket =
+            Some(ctx.services.store.writer().submit_notify(DataScope::Epg, move |c| crate::store::sources::insert_epg_source(c, &name, &kind, 0)));
     }
 
     fn ask_file(&mut self, ctx: &UiCtx<'_>, purpose: PickPurpose) {
@@ -557,7 +576,9 @@ impl OnboardingScreen {
         kit::pick_file(ctx, purpose);
     }
 
-    fn open_live(&self, ctx: &mut UiCtx<'_>) { ctx.navigate(NavRequest::Switch(Route::Live { group: None, channel: None })); }
+    fn open_live(&self, ctx: &mut UiCtx<'_>) {
+        ctx.navigate(NavRequest::Switch(Route::Live { group: None, channel: None }));
+    }
 
     fn reset_for_another(&mut self) {
         let start = std::mem::take(&mut self.start);
@@ -713,10 +734,14 @@ impl OnboardingScreen {
     }
 }
 
-fn ui_repaint(ctx: &UiCtx<'_>) { ctx.services.bus.request_repaint(); }
+fn ui_repaint(ctx: &UiCtx<'_>) {
+    ctx.services.bus.request_repaint();
+}
 
 impl Screen for OnboardingScreen {
-    fn id(&self) -> ScreenId { ScreenId::Onboarding }
+    fn id(&self) -> ScreenId {
+        ScreenId::Onboarding
+    }
 
     fn key_contexts(&self) -> Vec<KeyContext> {
         // no field takes the keyboard while a restored source is still being read
@@ -724,7 +749,9 @@ impl Screen for OnboardingScreen {
         if field { vec![KeyContext::TextInput, KeyContext::Modal] } else { vec![KeyContext::Modal] }
     }
 
-    fn allows_mini_player(&self) -> bool { false }
+    fn allows_mini_player(&self) -> bool {
+        false
+    }
 
     fn on_enter(&mut self, ctx: &mut UiCtx<'_>, route: &Route) {
         let Route::Onboarding(start) = route else { return };
@@ -903,46 +930,64 @@ impl Screen for OnboardingScreen {
         let frame = card_frame(theme, CardKind::Menu);
         let chrome = frame.total_margin().sum().x;
         let card_rect = egui::Rect::from_min_size(egui::pos2(full.center().x - width / 2.0, top), egui::vec2(width, full.bottom() - top));
-        let mut card_ui = ui.new_child(egui::UiBuilder::new().id_salt("onboarding-card").max_rect(card_rect).layout(egui::Layout::top_down(egui::Align::Min)));
+        let mut card_ui =
+            ui.new_child(egui::UiBuilder::new().id_salt("onboarding-card").max_rect(card_rect).layout(egui::Layout::top_down(egui::Align::Min)));
         let mut clicked: Option<usize> = None;
         let mut back_clicked = false;
         frame.show(&mut card_ui, |ui| {
             ui.set_width(width - chrome);
-            egui::ScrollArea::vertical().id_salt("onboarding").max_height(full.height() - 2.0 * theme.space(SpaceToken::PanelPadding)).show(ui, |ui| {
-                let (title, sub) = self.step_title();
-                ui.label(RichText::new(title).size(theme.font(TypeToken::Heading)).color(t.fg));
-                ui.add_space(theme.space(SpaceToken::Xs));
-                ui.add(egui::Label::new(RichText::new(sub).size(theme.font(TypeToken::Body)).color(t.text_secondary)).wrap());
-                ui.add_space(theme.space(SpaceToken::Xxl));
-                clicked = match self.step {
-                    Step::Welcome => choice_rows(ui, theme, self.focus, &[
-                        (glyphs::ADD, "Add a playlist", "Xtream login, M3U URL or M3U file"),
-                        (glyphs::BACKUP, "Restore a backup", "A Tuner backup file (.json)"),
-                    ]),
-                    Step::Type => choice_rows(ui, theme, self.focus, &[
-                        (glyphs::SOURCE_XTREAM, "Xtream login", "Server, username and password"),
-                        (glyphs::SOURCE_URL, "M3U URL", "A playlist link (get.php links become Xtream logins)"),
-                        (glyphs::FOLDER, "M3U file", "An .m3u / .m3u8 file on this computer"),
-                    ]),
-                    Step::Details => self.details_ui(ui, ctx),
-                    Step::Test => self.test_ui(ui, ctx),
-                    Step::Guide => self.guide_ui(ui, ctx),
-                    Step::Importing => self.importing_ui(ui, ctx),
-                    Step::Done => self.done_ui(ui, ctx),
-                    Step::Restoring => self.restoring_ui(ui, ctx),
-                };
-                ui.add_space(theme.space(SpaceToken::Lg));
-                // the mouse twin of Esc: a step back, or out of the card where it was opened
-                // from Settings / a file / a restored playlist
-                ui.horizontal(|ui| {
-                    if let Some(label) = self.back_label() {
-                        back_clicked = button(ui, theme, Some(glyphs::PREVIOUS), label, ButtonStyle::default()).clicked();
-                        ui.add_space(theme.space(SpaceToken::Lg));
-                    }
-                    let hint = if self.editing { "Enter next · Tab next field · Esc leave the field" } else { "↑/↓ move · Enter choose · Esc back" };
-                    ui.label(RichText::new(hint).size(theme.font(TypeToken::BodySmall)).color(t.text_disabled));
-                });
-            });
+            egui::ScrollArea::vertical().id_salt("onboarding").max_height(full.height() - 2.0 * theme.space(SpaceToken::PanelPadding)).show(
+                ui,
+                |ui| {
+                    let (title, sub) = self.step_title();
+                    ui.label(RichText::new(title).size(theme.font(TypeToken::Heading)).color(t.fg));
+                    ui.add_space(theme.space(SpaceToken::Xs));
+                    ui.add(egui::Label::new(RichText::new(sub).size(theme.font(TypeToken::Body)).color(t.text_secondary)).wrap());
+                    ui.add_space(theme.space(SpaceToken::Xxl));
+                    clicked = match self.step {
+                        Step::Welcome => choice_rows(
+                            ui,
+                            theme,
+                            self.focus,
+                            &[
+                                (glyphs::ADD, "Add a playlist", "Xtream login, M3U URL or M3U file"),
+                                (glyphs::BACKUP, "Restore a backup", "A Tuner backup file (.json)"),
+                            ],
+                        ),
+                        Step::Type => choice_rows(
+                            ui,
+                            theme,
+                            self.focus,
+                            &[
+                                (glyphs::SOURCE_XTREAM, "Xtream login", "Server, username and password"),
+                                (glyphs::SOURCE_URL, "M3U URL", "A playlist link (get.php links become Xtream logins)"),
+                                (glyphs::FOLDER, "M3U file", "An .m3u / .m3u8 file on this computer"),
+                            ],
+                        ),
+                        Step::Details => self.details_ui(ui, ctx),
+                        Step::Test => self.test_ui(ui, ctx),
+                        Step::Guide => self.guide_ui(ui, ctx),
+                        Step::Importing => self.importing_ui(ui, ctx),
+                        Step::Done => self.done_ui(ui, ctx),
+                        Step::Restoring => self.restoring_ui(ui, ctx),
+                    };
+                    ui.add_space(theme.space(SpaceToken::Lg));
+                    // the mouse twin of Esc: a step back, or out of the card where it was opened
+                    // from Settings / a file / a restored playlist
+                    ui.horizontal(|ui| {
+                        if let Some(label) = self.back_label() {
+                            back_clicked = button(ui, theme, Some(glyphs::PREVIOUS), label, ButtonStyle::default()).clicked();
+                            ui.add_space(theme.space(SpaceToken::Lg));
+                        }
+                        let hint = if self.editing {
+                            "Enter next · Tab next field · Esc leave the field"
+                        } else {
+                            "↑/↓ move · Enter choose · Esc back"
+                        };
+                        ui.label(RichText::new(hint).size(theme.font(TypeToken::BodySmall)).color(t.text_disabled));
+                    });
+                },
+            );
         });
         ui.allocate_rect(full, egui::Sense::hover());
         if back_clicked && !self.back() {
@@ -979,7 +1024,18 @@ fn choice_rows(ui: &mut egui::Ui, theme: &Theme, focus: usize, items: &[(&str, &
 
 /// A labelled text field row that follows the wizard's focus; returns true when clicked.
 #[allow(clippy::too_many_arguments)]
-fn field_row(ui: &mut egui::Ui, theme: &Theme, label: &str, hint: Option<&str>, text: &mut String, placeholder: &str, password: bool, focused: bool, editing: bool, error: Option<&str>) -> (bool, bool) {
+fn field_row(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    label: &str,
+    hint: Option<&str>,
+    text: &mut String,
+    placeholder: &str,
+    password: bool,
+    focused: bool,
+    editing: bool,
+    error: Option<&str>,
+) -> (bool, bool) {
     let t = &theme.tokens;
     ui.label(RichText::new(label).size(theme.font(TypeToken::BodySmall)).color(if focused { t.accent } else { t.text_secondary }));
     let resp = text_field(ui, theme, text, placeholder, password);
@@ -1007,7 +1063,10 @@ fn picker_row(ui: &mut egui::Ui, theme: &Theme, label: &str, value: &str, color:
         let b = button(ui, theme, None, &format!("‹  {value}  ›"), ButtonStyle { focused, bordered: true, ..Default::default() });
         // a swatch of the value's colour (icons: fg), as tall as the text
         let side = theme.font(TypeToken::Body).round();
-        let sw = egui::Rect::from_min_size(egui::pos2(b.rect.right() + theme.space(SpaceToken::Lg), b.rect.center().y - side / 2.0), egui::vec2(side, side));
+        let sw = egui::Rect::from_min_size(
+            egui::pos2(b.rect.right() + theme.space(SpaceToken::Lg), b.rect.center().y - side / 2.0),
+            egui::vec2(side, side),
+        );
         ui.allocate_rect(sw, egui::Sense::hover());
         ui.painter().rect_filled(sw, t.rounding, color);
         b.clicked()
@@ -1052,23 +1111,77 @@ impl OnboardingScreen {
                     let r = picker_row(ui, theme, "Colour", name, col, focused);
                     // the preview is text: yellow on a light theme falls back to fg
                     let text = kit::legible(theme, col);
-                    ui.label(RichText::new(format!("{g}  {}", if self.form.name.trim().is_empty() { self.form.default_name() } else { self.form.name.trim().to_owned() })).size(theme.font(TypeToken::Body)).color(text));
+                    ui.label(
+                        RichText::new(format!(
+                            "{g}  {}",
+                            if self.form.name.trim().is_empty() { self.form.default_name() } else { self.form.name.trim().to_owned() }
+                        ))
+                        .size(theme.font(TypeToken::Body))
+                        .color(text),
+                    );
                     ui.add_space(theme.space(SpaceToken::Md));
                     r
                 }
-                Field::Server => field_row(ui, theme, "Server", Some("http:// is added when missing; paths and queries are removed; the port is kept."), &mut self.form.server, "panel.example.com:8080", false, focused, editing, e.as_deref()).0,
-                Field::Username => field_row(ui, theme, "Username", None, &mut self.form.username, "username", false, focused, editing, e.as_deref()).0,
-                Field::Password => field_row(ui, theme, "Password", None, &mut self.form.password, "password", true, focused, editing, e.as_deref()).0,
-                Field::Url => field_row(ui, theme, "Playlist URL", None, &mut self.form.url, "http://example.com/playlist.m3u", false, focused, editing, e.as_deref()).0,
+                Field::Server => {
+                    field_row(
+                        ui,
+                        theme,
+                        "Server",
+                        Some("http:// is added when missing; paths and queries are removed; the port is kept."),
+                        &mut self.form.server,
+                        "panel.example.com:8080",
+                        false,
+                        focused,
+                        editing,
+                        e.as_deref(),
+                    )
+                    .0
+                }
+                Field::Username => {
+                    field_row(ui, theme, "Username", None, &mut self.form.username, "username", false, focused, editing, e.as_deref()).0
+                }
+                Field::Password => {
+                    field_row(ui, theme, "Password", None, &mut self.form.password, "password", true, focused, editing, e.as_deref()).0
+                }
+                Field::Url => {
+                    field_row(
+                        ui,
+                        theme,
+                        "Playlist URL",
+                        None,
+                        &mut self.form.url,
+                        "http://example.com/playlist.m3u",
+                        false,
+                        focused,
+                        editing,
+                        e.as_deref(),
+                    )
+                    .0
+                }
                 Field::UseXtream => {
-                    ui.label(RichText::new("This is an Xtream link: the Xtream login also brings movies, series and account info.").size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
-                    let r = button(ui, theme, Some(glyphs::SOURCE_XTREAM), "Use the Xtream login instead", ButtonStyle { focused, bordered: true, ..Default::default() }).clicked();
+                    ui.label(
+                        RichText::new("This is an Xtream link: the Xtream login also brings movies, series and account info.")
+                            .size(theme.font(TypeToken::BodySmall))
+                            .color(t.text_secondary),
+                    );
+                    let r = button(
+                        ui,
+                        theme,
+                        Some(glyphs::SOURCE_XTREAM),
+                        "Use the Xtream login instead",
+                        ButtonStyle { focused, bordered: true, ..Default::default() },
+                    )
+                    .clicked();
                     ui.add_space(theme.space(SpaceToken::Md));
                     r
                 }
-                Field::Path => field_row(ui, theme, "Playlist file", None, &mut self.form.path, "/home/you/playlist.m3u", false, focused, editing, e.as_deref()).0,
+                Field::Path => {
+                    field_row(ui, theme, "Playlist file", None, &mut self.form.path, "/home/you/playlist.m3u", false, focused, editing, e.as_deref())
+                        .0
+                }
                 Field::ChooseFile => {
-                    let r = button(ui, theme, Some(glyphs::FOLDER), "Choose file…", ButtonStyle { focused, bordered: true, ..Default::default() }).clicked();
+                    let r = button(ui, theme, Some(glyphs::FOLDER), "Choose file…", ButtonStyle { focused, bordered: true, ..Default::default() })
+                        .clicked();
                     ui.add_space(theme.space(SpaceToken::Md));
                     r
                 }
@@ -1092,14 +1205,25 @@ impl OnboardingScreen {
         let theme = ctx.theme;
         let t = &theme.tokens;
         if self.probe.is_some() {
-            let phase = ctx.services.jobs.active().into_iter().find(|j| Some(j.id) == self.probe).map(|j| phase_text(&j.phase)).unwrap_or_else(|| "Connecting…".into());
+            let phase = ctx
+                .services
+                .jobs
+                .active()
+                .into_iter()
+                .find(|j| Some(j.id) == self.probe)
+                .map(|j| phase_text(&j.phase))
+                .unwrap_or_else(|| "Connecting…".into());
             ui.label(RichText::new(phase).size(theme.font(TypeToken::Body)).color(t.text_secondary));
             ui.add_space(theme.space(SpaceToken::Md));
             busy_bar(ui, theme, (3.0 * theme.rem()).round());
             ui.add_space(theme.space(SpaceToken::Lg));
         } else if let Some(msg) = &self.unreachable {
             ui.label(RichText::new(format!("{}  {msg}", glyphs::OFFLINE)).size(theme.font(TypeToken::Body)).color(t.urgent));
-            ui.label(RichText::new("You can retry, or add the playlist anyway and refresh it later.").size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
+            ui.label(
+                RichText::new("You can retry, or add the playlist anyway and refresh it later.")
+                    .size(theme.font(TypeToken::BodySmall))
+                    .color(t.text_secondary),
+            );
             ui.add_space(theme.space(SpaceToken::Lg));
         } else if let Some(r) = &self.probe_result {
             let kind = match r.kind {
@@ -1109,7 +1233,11 @@ impl OnboardingScreen {
             };
             ui.label(RichText::new(format!("{}  Looks good — {kind}", glyphs::CHECK)).size(theme.font(TypeToken::Title)).color(t.success));
             if r.kind == SourceKind::Xtream && self.form.kind() != SourceKind::Xtream {
-                ui.label(RichText::new("This link is an Xtream login; it will be added as one (movies, series and account info included).").size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
+                ui.label(
+                    RichText::new("This link is an Xtream login; it will be added as one (movies, series and account info included).")
+                        .size(theme.font(TypeToken::BodySmall))
+                        .color(t.text_secondary),
+                );
             }
             if let Some(e) = estimate_text(r) {
                 ui.label(RichText::new(e).size(theme.font(TypeToken::Body)).color(t.fg));
@@ -1136,7 +1264,18 @@ impl OnboardingScreen {
             let focused = i == self.focus;
             let hit = match f {
                 Field::GuideUrl => {
-                    let (c, changed) = field_row(ui, theme, "XMLTV URL", Some(".xml, .xml.gz or .xml.xz"), &mut self.guide_url, "http://example.com/guide.xml.gz", false, focused, self.editing, None);
+                    let (c, changed) = field_row(
+                        ui,
+                        theme,
+                        "XMLTV URL",
+                        Some(".xml, .xml.gz or .xml.xz"),
+                        &mut self.guide_url,
+                        "http://example.com/guide.xml.gz",
+                        false,
+                        focused,
+                        self.editing,
+                        None,
+                    );
                     if changed {
                         self.guide_path = None;
                     }
@@ -1146,11 +1285,20 @@ impl OnboardingScreen {
                     if let Some(p) = &self.guide_path {
                         ui.label(RichText::new(format!("{}  {}", glyphs::FOLDER, p.display())).size(theme.font(TypeToken::Body)).color(t.fg));
                     }
-                    let r = button(ui, theme, Some(glyphs::FOLDER), "Choose a guide file…", ButtonStyle { focused, bordered: true, ..Default::default() }).clicked();
+                    let r = button(
+                        ui,
+                        theme,
+                        Some(glyphs::FOLDER),
+                        "Choose a guide file…",
+                        ButtonStyle { focused, bordered: true, ..Default::default() },
+                    )
+                    .clicked();
                     ui.add_space(theme.space(SpaceToken::Lg));
                     r
                 }
-                Field::Continue => button(ui, theme, Some(glyphs::CHEVRON_RIGHT), "Continue", ButtonStyle { primary: true, focused, ..Default::default() }).clicked(),
+                Field::Continue => {
+                    button(ui, theme, Some(glyphs::CHEVRON_RIGHT), "Continue", ButtonStyle { primary: true, focused, ..Default::default() }).clicked()
+                }
                 Field::Skip => {
                     ui.add_space(theme.space(SpaceToken::Xs));
                     button(ui, theme, None, "Skip", ButtonStyle { focused, ..Default::default() }).clicked()
@@ -1182,7 +1330,13 @@ impl OnboardingScreen {
         }
         for (label, done, active) in rows_ {
             ui.horizontal(|ui| {
-                let (g, c) = if done { (glyphs::CHECK, t.success) } else if active { (glyphs::BUSY, t.accent) } else { (glyphs::HISTORY, t.text_disabled) };
+                let (g, c) = if done {
+                    (glyphs::CHECK, t.success)
+                } else if active {
+                    (glyphs::BUSY, t.accent)
+                } else {
+                    (glyphs::HISTORY, t.text_disabled)
+                };
                 ui.label(RichText::new(g).size(theme.font(TypeToken::Icon)).color(c));
                 ui.label(RichText::new(label).size(theme.font(TypeToken::Body)).color(if done || active { t.fg } else { t.text_secondary }));
                 if active && let Some(s) = &status {
@@ -1208,7 +1362,9 @@ impl OnboardingScreen {
         }
         let mut clicked = None;
         ui.add_enabled_ui(self.import.channels_done, |ui| {
-            if button(ui, theme, Some(glyphs::LIVE_TV), "Open Live TV", ButtonStyle { primary: true, focused: self.focus == 0, ..Default::default() }).clicked() {
+            if button(ui, theme, Some(glyphs::LIVE_TV), "Open Live TV", ButtonStyle { primary: true, focused: self.focus == 0, ..Default::default() })
+                .clicked()
+            {
                 clicked = Some(0);
             }
         });
@@ -1312,9 +1468,17 @@ impl OnboardingScreen {
                 None
             }
             Some(Ok(r)) => {
-                ui.label(RichText::new(format!("{}  {}", glyphs::CHECK, restored_text(r.sources_added, r.sources_matched))).size(theme.font(TypeToken::Body)).color(t.fg));
+                ui.label(
+                    RichText::new(format!("{}  {}", glyphs::CHECK, restored_text(r.sources_added, r.sources_matched)))
+                        .size(theme.font(TypeToken::Body))
+                        .color(t.fg),
+                );
                 if !r.needs_credentials.is_empty() {
-                    ui.label(RichText::new(format!("Needs credentials: {} — enter them in Settings ▸ Playlists.", r.needs_credentials.join(", "))).size(theme.font(TypeToken::BodySmall)).color(t.warning));
+                    ui.label(
+                        RichText::new(format!("Needs credentials: {} — enter them in Settings ▸ Playlists.", r.needs_credentials.join(", ")))
+                            .size(theme.font(TypeToken::BodySmall))
+                            .color(t.warning),
+                    );
                 }
                 ui.add_space(theme.space(SpaceToken::Lg));
                 button_row(ui, theme, &["Open Live TV"], 0)
@@ -1383,7 +1547,9 @@ pub(crate) fn phase_text(p: &JobPhase) -> String {
 mod tests {
     use super::*;
 
-    fn form(kind: SourceKind) -> Form { Form { kind: Some(kind), ..Default::default() } }
+    fn form(kind: SourceKind) -> Form {
+        Form { kind: Some(kind), ..Default::default() }
+    }
 
     #[test]
     fn xtream_server_is_normalized_and_required_fields_point_at_themselves() {
@@ -1434,7 +1600,14 @@ mod tests {
 
     #[test]
     fn estimates_say_what_was_counted() {
-        let mut r = ProbeResult { kind: SourceKind::M3uUrl, xtream: None, account: None, estimate_channels: Some(1234), suggested_name: None, epg_urls: vec![] };
+        let mut r = ProbeResult {
+            kind: SourceKind::M3uUrl,
+            xtream: None,
+            account: None,
+            estimate_channels: Some(1234),
+            suggested_name: None,
+            epg_urls: vec![],
+        };
         assert_eq!(estimate_text(&r).as_deref(), Some("1234 channels in the playlist"));
         r.kind = SourceKind::Xtream;
         r.estimate_channels = Some(12);
@@ -1445,7 +1618,14 @@ mod tests {
 
     #[test]
     fn account_lines_flag_unusable_accounts() {
-        let a = AccountInfo { status: AccountStatus::Expired, exp_date: Some(1_790_000_000), max_connections: Some(2), active_cons: Some(1), allowed_formats: vec!["ts".into(), "m3u8".into()], ..Default::default() };
+        let a = AccountInfo {
+            status: AccountStatus::Expired,
+            exp_date: Some(1_790_000_000),
+            max_connections: Some(2),
+            active_cons: Some(1),
+            allowed_formats: vec!["ts".into(), "m3u8".into()],
+            ..Default::default()
+        };
         let l = account_lines(&a);
         assert!(l[0].0.starts_with("Expired on ") && l[0].1);
         assert!(l.iter().any(|(s, _)| s == "1/2 connections in use"));
@@ -1516,7 +1696,8 @@ mod tests {
         app.s.start = OnboardingStart::AddSource;
         app.s.form.kind = Some(SourceKind::Xtream);
         app.s.go(Step::Importing);
-        app.s.import = Import { job: Some(JobId(u64::MAX)), had_channels: app.t.lib.live.channels.iter().map(|c| c.source_id).collect(), ..Default::default() };
+        app.s.import =
+            Import { job: Some(JobId(u64::MAX)), had_channels: app.t.lib.live.channels.iter().map(|c| c.source_id).collect(), ..Default::default() };
         h.run_steps(2);
         assert!(has_label(&h, "Open Live TV") && has_label(&h, "Channels"));
         h.state_mut().act(Action::Activate);

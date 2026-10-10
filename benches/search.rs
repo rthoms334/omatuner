@@ -11,8 +11,7 @@ use std::time::{Duration, Instant};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use tuner::model::{
-    ChannelId, ChannelSummary, Group, GroupId, GroupKey, ItemKey, ItemKind, MovieId, SeriesId, SourceColor, SourceId, SourceKind,
-    VodKind, VodSummary,
+    ChannelId, ChannelSummary, Group, GroupId, GroupKey, ItemKey, ItemKind, MovieId, SeriesId, SourceColor, SourceId, SourceKind, VodKind, VodSummary,
 };
 use tuner::search::{ListFilter, SearchIndex, SearchSection};
 use tuner::store::library::{Library, LiveIndex, SourceMeta, VodIndex};
@@ -22,8 +21,8 @@ const MOVIES: usize = 50_000;
 const SERIES: usize = 20_000;
 
 const WORDS: [&str; 24] = [
-    "News", "Sport", "Movies", "Kids", "Music", "Drama", "Comedy", "Action", "World", "Live", "Cinema", "Premium", "Family",
-    "Nature", "History", "Science", "Travel", "Food", "Arena", "Max", "Gold", "Plus", "Classic", "Prime",
+    "News", "Sport", "Movies", "Kids", "Music", "Drama", "Comedy", "Action", "World", "Live", "Cinema", "Premium", "Family", "Nature", "History",
+    "Science", "Travel", "Food", "Arena", "Max", "Gold", "Plus", "Classic", "Prime",
 ];
 const BRANDS: [&str; 12] = ["BBC", "ITV", "Sky", "CNN", "ESPN", "HBO", "Canal+", "RTL", "TF1", "Rai", "ZDF", "Fox"];
 
@@ -161,8 +160,7 @@ fn bench_global(c: &mut Criterion) {
 }
 
 fn bench_list_filter(c: &mut Criterion) {
-    let rows: Vec<String> =
-        (0..20_000).map(|i| format!("{} {} {} {}", i + 1, BRANDS[i % BRANDS.len()], WORDS[i % WORDS.len()], i % 97)).collect();
+    let rows: Vec<String> = (0..20_000).map(|i| format!("{} {} {} {}", i + 1, BRANDS[i % BRANDS.len()], WORDS[i % WORDS.len()], i % 97)).collect();
     let mut f = ListFilter::default();
     for ch in "sky spo".chars() {
         f.push(ch);

@@ -14,13 +14,13 @@ use crossbeam_channel::Receiver;
 use support::media::{Faults, TestServer, ensure_media};
 use tuner::config::Config;
 use tuner::model::{
-    ChannelId, Collection, HistoryEntry, HttpHeaders, ItemKey, ItemKind, ItemRef, MediaRef, MovieId, PlayOrigin, Playable,
-    PlayableKind, SourceId, WatchProgress, ZapList,
+    ChannelId, Collection, HistoryEntry, HttpHeaders, ItemKey, ItemKind, ItemRef, MediaRef, MovieId, PlayOrigin, Playable, PlayableKind, SourceId,
+    WatchProgress, ZapList,
 };
 use tuner::msg::{AppEvent, EventBus};
 use tuner::player::{
-    MediaResolver, PlayRequest, Player, PlayerCommand, PlayerDeps, PlayerError, PlayerErrorKind, PlayerEvent, PlayerHandle,
-    PlayerSnapshot, PlayerState, PlayerStore,
+    MediaResolver, PlayRequest, Player, PlayerCommand, PlayerDeps, PlayerError, PlayerErrorKind, PlayerEvent, PlayerHandle, PlayerSnapshot,
+    PlayerState, PlayerStore,
 };
 use tuner::redact::Secret;
 
@@ -40,9 +40,15 @@ struct Recorded {
 struct RecordingStore(Recorded);
 
 impl PlayerStore for RecordingStore {
-    fn save_progress(&mut self, p: WatchProgress) { self.0.progress.lock().unwrap().push(p); }
-    fn push_history(&mut self, e: HistoryEntry) { self.0.history.lock().unwrap().push(e); }
-    fn record_failure(&mut self, item: ItemRef, kind: Option<PlayerErrorKind>) { self.0.failures.lock().unwrap().push((item, kind)); }
+    fn save_progress(&mut self, p: WatchProgress) {
+        self.0.progress.lock().unwrap().push(p);
+    }
+    fn push_history(&mut self, e: HistoryEntry) {
+        self.0.history.lock().unwrap().push(e);
+    }
+    fn record_failure(&mut self, item: ItemRef, kind: Option<PlayerErrorKind>) {
+        self.0.failures.lock().unwrap().push((item, kind));
+    }
 }
 
 /// Resolves from a fixed table; unknown media → `Resolve` error.
@@ -52,10 +58,14 @@ impl MediaResolver for TableResolver {
     fn resolve(&mut self, media: &MediaRef, _resume: bool) -> Result<Playable, PlayerError> {
         self.0.get(media).cloned().ok_or(PlayerError { kind: PlayerErrorKind::Resolve, message: "unknown item".into() })
     }
-    fn skip_on_zap(&mut self, _ch: ChannelId) -> bool { false }
+    fn skip_on_zap(&mut self, _ch: ChannelId) -> bool {
+        false
+    }
 }
 
-fn item(key: &str, kind: ItemKind) -> ItemRef { ItemRef { source: SourceId(1), kind, key: ItemKey(key.into()) } }
+fn item(key: &str, kind: ItemKind) -> ItemRef {
+    ItemRef { source: SourceId(1), kind, key: ItemKey(key.into()) }
+}
 
 fn playable(media: MediaRef, kind: PlayableKind, url: String) -> Playable {
     let key = format!("{media:?}");
@@ -80,8 +90,12 @@ fn playable(media: MediaRef, kind: PlayableKind, url: String) -> Playable {
     }
 }
 
-fn live(ch: i64, url: String) -> Playable { playable(MediaRef::Channel(ChannelId(ch)), PlayableKind::Live, url) }
-fn movie(id: i64, url: String) -> Playable { playable(MediaRef::Movie(MovieId(id)), PlayableKind::Movie, url) }
+fn live(ch: i64, url: String) -> Playable {
+    playable(MediaRef::Channel(ChannelId(ch)), PlayableKind::Live, url)
+}
+fn movie(id: i64, url: String) -> Playable {
+    playable(MediaRef::Movie(MovieId(id)), PlayableKind::Movie, url)
+}
 
 // ---------------------------------------------------------------------------------------------
 // harness
@@ -170,7 +184,9 @@ impl Harness {
         self.seen.iter().filter_map(|e| if let PlayerEvent::StateChanged(s) = e { Some(s.clone()) } else { None }).collect()
     }
 
-    fn snapshot(&self) -> Arc<PlayerSnapshot> { self.handle.snapshot() }
+    fn snapshot(&self) -> Arc<PlayerSnapshot> {
+        self.handle.snapshot()
+    }
 
     /// Poll the snapshot until `pred` holds.
     fn wait_snapshot(&self, timeout: Duration, pred: impl Fn(&PlayerSnapshot) -> bool) -> Arc<PlayerSnapshot> {
@@ -187,7 +203,9 @@ impl Harness {
 }
 
 impl Drop for Harness {
-    fn drop(&mut self) { self.player.shutdown(); }
+    fn drop(&mut self) {
+        self.player.shutdown();
+    }
 }
 
 const LONG: Duration = Duration::from_secs(30);
@@ -216,7 +234,9 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
 
 /// The controller's debug lines since the last call (the decisions mpv itself can't show:
 /// stop-before-start, `loadfile` entry ids, END_FILEs as processed).
-fn controller_log() -> Vec<String> { std::mem::take(&mut *CONTROLLER_LOG.lock().unwrap_or_else(|e| e.into_inner())) }
+fn controller_log() -> Vec<String> {
+    std::mem::take(&mut *CONTROLLER_LOG.lock().unwrap_or_else(|e| e.into_inner()))
+}
 
 /// Test media (or `None` → skip) plus a process-wide lock held for the whole test.
 ///
@@ -269,7 +289,9 @@ fn assert_stopped_before_start(log: &[String]) {
     assert!(!log.iter().any(|l| l.contains("did not report END_FILE in time")), "waited for END_FILE, not the deadline: {log:#?}");
 }
 
-fn is_playing(s: &PlayerState) -> bool { matches!(s, PlayerState::Playing) }
+fn is_playing(s: &PlayerState) -> bool {
+    matches!(s, PlayerState::Playing)
+}
 
 // ---------------------------------------------------------------------------------------------
 // tests
@@ -379,7 +401,10 @@ fn http_403_and_404_are_classified_from_the_fault_server() {
     assert!(matches!(s, PlayerState::Error(PlayerError { kind: PlayerErrorKind::HttpForbidden, .. })), "{s:?}");
     assert_eq!(srv.requests_for("/forbidden.ts").len(), 2, "initial attempt + one retry");
     assert!(h.rec.failures.lock().unwrap().iter().any(|(i, k)| Some(i) == ch.item.as_ref() && *k == Some(PlayerErrorKind::HttpForbidden)));
-    assert!(matches!(h.wait_event(LONG, |e| matches!(e, PlayerEvent::Failed(_))), Some(PlayerEvent::Failed(PlayerError { kind: PlayerErrorKind::HttpForbidden, .. }))));
+    assert!(matches!(
+        h.wait_event(LONG, |e| matches!(e, PlayerEvent::Failed(_))),
+        Some(PlayerEvent::Failed(PlayerError { kind: PlayerErrorKind::HttpForbidden, .. }))
+    ));
 
     // VOD 404: no retry
     let mark = h.mark();
@@ -489,7 +514,13 @@ fn fast_zaps_coalesce_into_one_connection() {
     let paths = ["long/index.m3u8", "bars.ts", "hls/index.m3u8", "testsrc.mp4"];
     let chans: Vec<Playable> = paths.iter().zip(50..).map(|(p, id)| live(id, srv.url(p))).collect();
     let mut h = Harness::start(headless_config(), chans.clone());
-    let ids = chans.iter().map(|c| match c.media { MediaRef::Channel(id) => id, _ => unreachable!() }).collect();
+    let ids = chans
+        .iter()
+        .map(|c| match c.media {
+            MediaRef::Channel(id) => id,
+            _ => unreachable!(),
+        })
+        .collect();
     let zap = ZapList { collection: Collection::AllChannels, channels: ids };
     let req = PlayRequest { media: chans[0].media.clone(), zap: Some(zap), origin: PlayOrigin::Fullscreen, resume: false, immediate: true };
     h.handle.send(PlayerCommand::Play(req));
@@ -548,7 +579,11 @@ fn segment_404s_while_playing_are_not_channel_offline() {
     }
     assert!(srv.requests().iter().any(|r| r.status == 404), "faults were injected");
     let bad = h.states().into_iter().find(|s| {
-        matches!(s, PlayerState::Error(PlayerError { kind: PlayerErrorKind::HttpNotFound, .. }) | PlayerState::Reconnecting { reason: PlayerErrorKind::HttpNotFound, .. })
+        matches!(
+            s,
+            PlayerState::Error(PlayerError { kind: PlayerErrorKind::HttpNotFound, .. })
+                | PlayerState::Reconnecting { reason: PlayerErrorKind::HttpNotFound, .. }
+        )
     });
     assert_eq!(bad, None, "states: {:?}", h.states());
 }

@@ -74,8 +74,7 @@ impl Plan {
                 out.push(Due::RefreshStale);
             }
         }
-        let maintenance_due = now >= self.started + MAINTENANCE_DELAY_S
-            && self.last_maintenance.is_none_or(|t| now - t >= MAINTENANCE_EVERY_S);
+        let maintenance_due = now >= self.started + MAINTENANCE_DELAY_S && self.last_maintenance.is_none_or(|t| now - t >= MAINTENANCE_EVERY_S);
         if maintenance_due && !busy {
             self.last_maintenance = Some(now);
             out.push(Due::Maintenance);
@@ -137,10 +136,9 @@ pub(super) async fn refresh_stale(ctx: &JobContext) -> Result<()> {
 
 async fn submit_stale(ctx: &JobContext, playlist_h: u32, epg_h: u32) -> Result<()> {
     let now = crate::model::now();
-    let (sources, guides) = read(ctx, move |c| {
-        Ok((crate::store::sources::stale_sources(c, now, playlist_h)?, crate::store::sources::stale_epg_sources(c, now, epg_h)?))
-    })
-    .await?;
+    let (sources, guides) =
+        read(ctx, move |c| Ok((crate::store::sources::stale_sources(c, now, playlist_h)?, crate::store::sources::stale_epg_sources(c, now, epg_h)?)))
+            .await?;
     if !sources.is_empty() || !guides.is_empty() {
         tracing::info!("refreshing {} playlist(s) and {} guide(s)", sources.len(), guides.len());
     }

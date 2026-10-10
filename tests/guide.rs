@@ -22,8 +22,8 @@ use egui_kittest::kittest::Queryable;
 use support::seed;
 use tuner::keymap::{self, Action, KeyContext};
 use tuner::model::{
-    ChannelId, ChannelSummary, Collection, EpgChannelId, GroupId, ItemKey, ItemKind, ItemRef, MediaRef, NowNext, PlayOrigin, Playable, PlayableKind, ProgrammeFlags, ProgrammeId,
-    ProgrammeSlim, SourceId, Timestamp, ZapList,
+    ChannelId, ChannelSummary, Collection, EpgChannelId, GroupId, ItemKey, ItemKind, ItemRef, MediaRef, NowNext, PlayOrigin, Playable, PlayableKind,
+    ProgrammeFlags, ProgrammeId, ProgrammeSlim, SourceId, Timestamp, ZapList,
 };
 use tuner::player::{PlayerSnapshot, PlayerState};
 use tuner::store::library::LiveIndex;
@@ -40,10 +40,14 @@ use tuner::ui::{LayoutClass, NavRequest, OverlayRequest, Route, Screen};
 
 static ONE_UI: Mutex<()> = Mutex::new(());
 
-fn one() -> MutexGuard<'static, ()> { ONE_UI.lock().unwrap_or_else(|e| e.into_inner()) }
+fn one() -> MutexGuard<'static, ()> {
+    ONE_UI.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// A multiple of 30 minutes near "now" so programmes line up with the ruler.
-fn slot(now: Timestamp) -> Timestamp { now - now.rem_euclid(1800) }
+fn slot(now: Timestamp) -> Timestamp {
+    now - now.rem_euclid(1800)
+}
 
 /// `TestUi` with one source, `n` channels ("Channel i", number i+1) and a guide from 3 h ago
 /// for 8 h for the first `epg` channels. Returns the channel ids.
@@ -80,13 +84,16 @@ fn reload(t: &mut TestUi) {
 /// Run one frame of a screen headlessly.
 fn draw(t: &mut TestUi, screen: &mut dyn Screen) {
     let egui = t.egui.clone();
-    let mut out = egui.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0))), ..Default::default() }, |ui| {
-        t.with_ctx(|ctx| screen.ui(ui, ctx))
-    });
+    let mut out = egui
+        .run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0))), ..Default::default() }, |ui| {
+            t.with_ctx(|ctx| screen.ui(ui, ctx))
+        });
     out.textures_delta.clear();
 }
 
-fn act(t: &mut TestUi, screen: &mut dyn Screen, a: Action) -> bool { t.with_ctx(|ctx| screen.on_action(ctx, a)) }
+fn act(t: &mut TestUi, screen: &mut dyn Screen, a: Action) -> bool {
+    t.with_ctx(|ctx| screen.on_action(ctx, a))
+}
 
 /// Wait for the REAL player (commands sent by the UI) to satisfy `f`.
 fn player_until(t: &TestUi, what: &str, f: impl Fn(&PlayerSnapshot) -> bool) -> Arc<PlayerSnapshot> {
@@ -109,7 +116,9 @@ fn player_stays_idle(t: &TestUi, ms: u64) {
     assert!(s.playable.is_none(), "nothing may play: {:?}", s.playable.as_ref().map(|p| &p.media));
 }
 
-fn plays(media: MediaRef) -> impl Fn(&PlayerSnapshot) -> bool { move |s| s.playable.as_ref().is_some_and(|p| p.media == media) }
+fn plays(media: MediaRef) -> impl Fn(&PlayerSnapshot) -> bool {
+    move |s| s.playable.as_ref().is_some_and(|p| p.media == media)
+}
 
 /// A snapshot as the screens would see it while `media` plays.
 fn fake_playing(media: MediaRef, kind: PlayableKind, zap: Option<ZapList>, origin: PlayOrigin) -> Arc<PlayerSnapshot> {
@@ -139,9 +148,13 @@ fn fake_playing(media: MediaRef, kind: PlayableKind, zap: Option<ZapList>, origi
 }
 
 /// Some accesskit node has this label (several may: a row and the preview's logo).
-fn has<S>(h: &Harness<'_, S>, label: &str) -> bool { h.query_all_by_label(label).next().is_some() }
+fn has<S>(h: &Harness<'_, S>, label: &str) -> bool {
+    h.query_all_by_label(label).next().is_some()
+}
 
-fn pushed(t: &TestUi, r: &Route) -> bool { t.nav.iter().any(|n| matches!(n, NavRequest::Push(x) if x == r)) }
+fn pushed(t: &TestUi, r: &Route) -> bool {
+    t.nav.iter().any(|n| matches!(n, NavRequest::Push(x) if x == r))
+}
 
 fn opened(t: &TestUi) -> Vec<OverlayRequest> {
     t.nav
@@ -172,7 +185,11 @@ fn texts(shapes: &[Shape]) -> Vec<(String, Color32, Rect)> {
     shapes
         .iter()
         .filter_map(|s| match s {
-            Shape::Text(t) => Some((t.galley.job.text.clone(), t.galley.job.sections.first().map_or(t.fallback_color, |s| s.format.color), t.visual_bounding_rect())),
+            Shape::Text(t) => Some((
+                t.galley.job.text.clone(),
+                t.galley.job.sections.first().map_or(t.fallback_color, |s| s.format.color),
+                t.visual_bounding_rect(),
+            )),
             _ => None,
         })
         .collect()
@@ -195,12 +212,21 @@ impl EpgReader for FakeEpg {
         let mut s = from - from.rem_euclid(1800);
         while s < to {
             let slot = (s - T0).div_euclid(1800);
-            out.push(ProgrammeSlim { id: ProgrammeId(ch.0 * 100_000 + slot + 50_000), start: s, stop: s + 1800, title: format!("Show {slot}").into(), sub_title: None, flags: ProgrammeFlags::default() });
+            out.push(ProgrammeSlim {
+                id: ProgrammeId(ch.0 * 100_000 + slot + 50_000),
+                start: s,
+                stop: s + 1800,
+                title: format!("Show {slot}").into(),
+                sub_title: None,
+                flags: ProgrammeFlags::default(),
+            });
             s += 1800;
         }
         Ok(out)
     }
-    fn now_next(&mut self, _: &[(EpgChannelId, i32)], _: Timestamp) -> tuner::error::Result<HashMap<(EpgChannelId, i32), NowNext>> { Ok(HashMap::new()) }
+    fn now_next(&mut self, _: &[(EpgChannelId, i32)], _: Timestamp) -> tuner::error::Result<HashMap<(EpgChannelId, i32), NowNext>> {
+        Ok(HashMap::new())
+    }
 }
 
 fn summary(i: i64) -> ChannelSummary {
@@ -231,9 +257,13 @@ fn live_index(n: i64) -> LiveIndex {
     LiveIndex::from_parts(chans, vec![], members, HashSet::new())
 }
 
-fn guide_rows(n: i64) -> Arc<[GuideRow]> { (1..=n).map(|i| GuideRow { channel: ChannelId(i), epg: Some(EpgChannelId(i)), tvg_shift_min: 0, catchup_days: 7 }).collect() }
+fn guide_rows(n: i64) -> Arc<[GuideRow]> {
+    (1..=n).map(|i| GuideRow { channel: ChannelId(i), epg: Some(EpgChannelId(i)), tvg_shift_min: 0, catchup_days: 7 }).collect()
+}
 
-fn big_budget() -> FrameBudget { FrameBudget::new(Duration::from_secs(10)) }
+fn big_budget() -> FrameBudget {
+    FrameBudget::new(Duration::from_secs(10))
+}
 
 // ====================================================================== EPG grid
 
@@ -341,7 +371,18 @@ fn grid_harness(n: i64, now: Timestamp, budget: Duration) -> Harness<'static, Gr
     let http = tuner::sources::http::HttpClient::new(&Default::default()).unwrap();
     let ctx = egui::Context::default();
     let images = tuner::images::ImageCache::new(&paths, http, rt.handle().clone(), ctx, 1 << 20);
-    let app = GridApp { theme: Theme::fallback(), live: live_index(n), state: EpgGridState::new(guide_rows(n), now), reader: FakeEpg::default(), images, now, outcomes: Vec::new(), loads: Vec::new(), _rt: rt, _dir: dir };
+    let app = GridApp {
+        theme: Theme::fallback(),
+        live: live_index(n),
+        state: EpgGridState::new(guide_rows(n), now),
+        reader: FakeEpg::default(),
+        images,
+        now,
+        outcomes: Vec::new(),
+        loads: Vec::new(),
+        _rt: rt,
+        _dir: dir,
+    };
     Harness::builder().with_size(egui::vec2(1200.0, 700.0)).build_ui_state(
         move |ui, a: &mut GridApp| {
             let mut b = FrameBudget::new(budget);
@@ -411,9 +452,19 @@ fn grid_mouse_click_focuses_and_header_click_watches() {
     let y = m.ruler_height + 2.5 * m.row_height;
     h.input_mut().events.push(egui::Event::PointerMoved(egui::pos2(x, y)));
     h.step();
-    h.input_mut().events.push(egui::Event::PointerButton { pos: egui::pos2(x, y), button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    h.input_mut().events.push(egui::Event::PointerButton {
+        pos: egui::pos2(x, y),
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: Default::default(),
+    });
     h.step();
-    h.input_mut().events.push(egui::Event::PointerButton { pos: egui::pos2(x, y), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    h.input_mut().events.push(egui::Event::PointerButton {
+        pos: egui::pos2(x, y),
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: Default::default(),
+    });
     h.step();
     let (ch, p) = h.state().state.focused().map(|(c, p)| (c, p.cloned())).unwrap();
     assert_eq!(ch, ChannelId(3));
@@ -422,9 +473,19 @@ fn grid_mouse_click_focuses_and_header_click_watches() {
     let hy = m.ruler_height + 1.5 * m.row_height;
     h.input_mut().events.push(egui::Event::PointerMoved(egui::pos2(20.0, hy)));
     h.step();
-    h.input_mut().events.push(egui::Event::PointerButton { pos: egui::pos2(20.0, hy), button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    h.input_mut().events.push(egui::Event::PointerButton {
+        pos: egui::pos2(20.0, hy),
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: Default::default(),
+    });
     h.step();
-    h.input_mut().events.push(egui::Event::PointerButton { pos: egui::pos2(20.0, hy), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    h.input_mut().events.push(egui::Event::PointerButton {
+        pos: egui::pos2(20.0, hy),
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: Default::default(),
+    });
     h.step();
     assert!(h.state().outcomes.contains(&GridOutcome::Watch(ChannelId(2))), "{:?}", h.state().outcomes);
     // …and focuses that row first: a locked channel's PIN retry (`GuideWatch`) watches the focus
@@ -491,7 +552,9 @@ fn guide_defaults_to_the_first_non_empty_favourites_list() {
 }
 
 /// `snap` after a newer load (the player bumps the generation on every load, zaps included).
-fn reloaded(snap: Arc<PlayerSnapshot>, generation: u64) -> Arc<PlayerSnapshot> { Arc::new(PlayerSnapshot { load_generation: generation, ..(*snap).clone() }) }
+fn reloaded(snap: Arc<PlayerSnapshot>, generation: u64) -> Arc<PlayerSnapshot> {
+    Arc::new(PlayerSnapshot { load_generation: generation, ..(*snap).clone() })
+}
 
 /// The collection the picker marks as current.
 fn picked_collection(t: &mut TestUi, g: &mut GuideScreen) -> String {
@@ -626,7 +689,12 @@ fn guide_all_hidden_group_offers_show_hidden() {
     t.services()
         .store
         .writer()
-        .blocking(|c| Ok(c.execute("INSERT INTO item_override(source_id, kind, item_key, hidden, fp) VALUES (1, 'channel', ?1, 1, '')", [format!("m3u:seed{:011}", 0)])?))
+        .blocking(|c| {
+            Ok(c.execute(
+                "INSERT INTO item_override(source_id, kind, item_key, hidden, fp) VALUES (1, 'channel', ?1, 1, '')",
+                [format!("m3u:seed{:011}", 0)],
+            )?)
+        })
         .unwrap();
     reload(&mut t);
     let news = t.lib.live.groups.iter().find(|g| g.name == "News").map(|g| g.id).expect("News");
@@ -868,7 +936,10 @@ fn live_preview_says_why_a_channel_has_no_guide() {
     h.run_steps(3);
     assert!(h.query_by_label("Not in your guide").is_some(), "the reason");
     // a guide that lists few of the channels: add one that lists them, or map this one
-    assert!(h.query_by_label_contains("cover 1 of 4 channels — add one that lists yours in Settings ▸ EPG · Ctrl+E maps this one").is_some(), "coverage + the way forward");
+    assert!(
+        h.query_by_label_contains("cover 1 of 4 channels — add one that lists yours in Settings ▸ EPG · Ctrl+E maps this one").is_some(),
+        "coverage + the way forward"
+    );
     assert!(hact(&mut h, Action::AssignEpg));
     assert!(pushed(&h.state().t, &Route::EpgMapping { channel: Some(ids[1]) }));
     drop(h);
@@ -1068,7 +1139,12 @@ fn live_empty_states() {
     t.services()
         .store
         .writer()
-        .blocking(|c| Ok(c.execute("INSERT INTO item_override(source_id, kind, item_key, hidden, fp) VALUES (1, 'channel', ?1, 1, '')", [format!("m3u:seed{:011}", 0)])?))
+        .blocking(|c| {
+            Ok(c.execute(
+                "INSERT INTO item_override(source_id, kind, item_key, hidden, fp) VALUES (1, 'channel', ?1, 1, '')",
+                [format!("m3u:seed{:011}", 0)],
+            )?)
+        })
         .unwrap();
     reload(&mut t);
     let news = t.lib.live.groups.iter().find(|g| g.name == "News").map(|g| g.id).expect("News");
@@ -1115,7 +1191,9 @@ fn live_reorder_under_a_sort_moves_the_cursor_channel_in_custom_order() {
     act(&mut t, &mut s, Action::MoveDown);
     assert!(t.toasts.iter().any(|x| x.text == "Switched to custom order"));
     assert_eq!(t.config_edits.len(), 1, "the sort switch is queued");
-    let order = |t: &TestUi, k: String| t.db.query_row("SELECT user_order FROM item_override WHERE item_key = ?1", [k], |r| r.get::<_, Option<i64>>(0)).ok().flatten();
+    let order = |t: &TestUi, k: String| {
+        t.db.query_row("SELECT user_order FROM item_override WHERE item_key = ?1", [k], |r| r.get::<_, Option<i64>>(0)).ok().flatten()
+    };
     let deadline = Instant::now() + Duration::from_secs(5);
     while order(&t, key(10)).is_none() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
@@ -1182,8 +1260,15 @@ fn live_preview_text_stays_inside_the_pane() {
             assert!(r.right() <= w + 0.5, "{layout:?}: a title ends at {} in a {w} pt window", r.right());
         }
         // the now programme's time range sits beside its (truncated) title, clear of it
-        let range = tx.iter().find(|(x, _, r)| x.contains(" – ") && titles.iter().any(|t| (t.center().y - r.center().y).abs() < t.height())).expect("time range beside the title");
-        assert!(range.2.right() <= w + 0.5 && titles.iter().all(|t| !t.intersects(range.2)), "{layout:?}: the time range {:?} overlaps a title", range.2);
+        let range = tx
+            .iter()
+            .find(|(x, _, r)| x.contains(" – ") && titles.iter().any(|t| (t.center().y - r.center().y).abs() < t.height()))
+            .expect("time range beside the title");
+        assert!(
+            range.2.right() <= w + 0.5 && titles.iter().all(|t| !t.intersects(range.2)),
+            "{layout:?}: the time range {:?} overlaps a title",
+            range.2
+        );
     }
 }
 
@@ -1251,7 +1336,9 @@ fn live_favourite_toggle_and_item_menus() {
     act(&mut t, &mut s, Action::SortMenu);
     let o = opened(&t);
     assert!(matches!(o[0], OverlayRequest::EditItem(ref i) if *i == item));
-    assert!(matches!(&o[1], OverlayRequest::ContextMenu(m) if m.items.iter().any(|i| i.label == "Show in TV guide" && i.shortcut.as_deref() == Some("Ctrl+G"))));
+    assert!(
+        matches!(&o[1], OverlayRequest::ContextMenu(m) if m.items.iter().any(|i| i.label == "Show in TV guide" && i.shortcut.as_deref() == Some("Ctrl+G")))
+    );
     assert!(matches!(&o[2], OverlayRequest::ContextMenu(m) if m.items.iter().any(|i| i.label == "Custom order")));
     act(&mut t, &mut s, Action::OpenInGuide);
     assert!(t.nav.iter().any(|n| matches!(n, NavRequest::Push(Route::Guide { focus: Some(_), .. }))));
@@ -1338,7 +1425,12 @@ fn zapping_uses_the_zap_list_and_skips_locked_channels_while_locked() {
     t.services()
         .store
         .writer()
-        .blocking(|c| Ok(c.execute("INSERT INTO item_override(source_id, kind, item_key, locked, fp) VALUES (1, 'channel', ?1, 1, '')", [format!("m3u:seed{:011}", 1)])?))
+        .blocking(|c| {
+            Ok(c.execute(
+                "INSERT INTO item_override(source_id, kind, item_key, locked, fp) VALUES (1, 'channel', ?1, 1, '')",
+                [format!("m3u:seed{:011}", 1)],
+            )?)
+        })
         .unwrap();
     reload(&mut t);
     let zap = ZapList { collection: Collection::AllChannels, channels: ids.clone().into() };
@@ -1364,8 +1456,14 @@ fn locked_session_zaps_also_skip_failing_channels() {
         .writer()
         .blocking(move |c| {
             // channel 1 is locked, channel 2 failed twice recently: ↓ from 0 lands on 3
-            c.execute("INSERT INTO item_override(source_id, kind, item_key, locked, fp) VALUES (1, 'channel', ?1, 1, '')", [format!("m3u:seed{:011}", 1)])?;
-            c.execute("INSERT INTO stream_failure(source_id, item_key, reason, at, count) VALUES (1, ?1, 'http-404', ?2, 2)", rusqlite::params![format!("m3u:seed{:011}", 2), now - 60])?;
+            c.execute(
+                "INSERT INTO item_override(source_id, kind, item_key, locked, fp) VALUES (1, 'channel', ?1, 1, '')",
+                [format!("m3u:seed{:011}", 1)],
+            )?;
+            c.execute(
+                "INSERT INTO stream_failure(source_id, item_key, reason, at, count) VALUES (1, ?1, 'http-404', ?2, 2)",
+                rusqlite::params![format!("m3u:seed{:011}", 2), now - 60],
+            )?;
             Ok(())
         })
         .unwrap();
@@ -1493,10 +1591,12 @@ fn episode_end_offers_the_next_episode() {
     };
     // the last episode has no successor, and an episode stopped early (not watched) gets no
     // card: Enter / i only focus the controls
-    let mut last = player_with(&mut t, fake_playing(MediaRef::Episode(eps[2]), PlayableKind::Episode { season: 1, episode: 3 }, None, PlayOrigin::Fullscreen));
+    let mut last =
+        player_with(&mut t, fake_playing(MediaRef::Episode(eps[2]), PlayableKind::Episode { season: 1, episode: 3 }, None, PlayOrigin::Fullscreen));
     ended(&mut t, &mut last, true);
     assert!(act(&mut t, &mut last, Action::FocusOsdControls));
-    let mut p = player_with(&mut t, fake_playing(MediaRef::Episode(eps[0]), PlayableKind::Episode { season: 1, episode: 1 }, None, PlayOrigin::Fullscreen));
+    let mut p =
+        player_with(&mut t, fake_playing(MediaRef::Episode(eps[0]), PlayableKind::Episode { season: 1, episode: 1 }, None, PlayOrigin::Fullscreen));
     ended(&mut t, &mut p, false);
     assert!(act(&mut t, &mut p, Action::FocusOsdControls));
     assert!(act(&mut t, &mut p, Action::LeaveOsdControls));
@@ -1598,7 +1698,12 @@ fn mini_player_sits_bottom_right_and_toasts_avoid_it() {
     h.input_mut().events.push(egui::Event::PointerMoved(video));
     h.step();
     for pressed in [true, false] {
-        h.input_mut().events.push(egui::Event::PointerButton { pos: video, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+        h.input_mut().events.push(egui::Event::PointerButton {
+            pos: video,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        });
         h.step();
     }
     assert!(h.state().result.contains(&Some(true)), "a click on the video opens the player");
@@ -1636,15 +1741,25 @@ fn state_overlay_shows_the_channel_logo() {
     let frame = |t: &mut TestUi, host: &mut VideoHost, mini: bool| {
         let egui = t.egui.clone();
         let images = &mut t.images;
-        let mut out = egui.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0))), ..Default::default() }, |ui| {
-            images.pump();
-            host.begin_frame();
-            if mini {
-                host.mini_player(ui.ctx(), &theme, &snap);
-            } else {
-                host.paint(ui, Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0)), tuner::ui::video_host::Placement::Fullscreen, &theme, images, &snap);
-            }
-        });
+        let mut out = egui.run_ui(
+            egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0))), ..Default::default() },
+            |ui| {
+                images.pump();
+                host.begin_frame();
+                if mini {
+                    host.mini_player(ui.ctx(), &theme, &snap);
+                } else {
+                    host.paint(
+                        ui,
+                        Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0)),
+                        tuner::ui::video_host::Placement::Fullscreen,
+                        &theme,
+                        images,
+                        &snap,
+                    );
+                }
+            },
+        );
         let mut flat = Vec::new();
         fn walk(s: &Shape, out: &mut Vec<Shape>) {
             match s {
@@ -1680,9 +1795,23 @@ fn state_overlay_shows_the_channel_logo() {
     let egui = t.egui.clone();
     let images = &mut t.images;
     let mut out = egui.run_ui(Default::default(), |ui| {
-        host.paint(ui, Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0)), tuner::ui::video_host::Placement::Fullscreen, &theme, images, &snap2);
+        host.paint(
+            ui,
+            Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0)),
+            tuner::ui::video_host::Placement::Fullscreen,
+            &theme,
+            images,
+            &snap2,
+        );
     });
-    let texts: Vec<String> = out.shapes.iter().filter_map(|c| match &c.shape { Shape::Text(x) => Some(x.galley.job.text.clone()), _ => None }).collect();
+    let texts: Vec<String> = out
+        .shapes
+        .iter()
+        .filter_map(|c| match &c.shape {
+            Shape::Text(x) => Some(x.galley.job.text.clone()),
+            _ => None,
+        })
+        .collect();
     out.textures_delta.clear();
     assert!(texts.iter().any(|x| x == "BO"), "monogram fallback: {texts:?}");
 }
@@ -1692,7 +1821,18 @@ fn tracks_overlay_selects_tracks_and_adjusts_subtitles() {
     let _one = one();
     let mut t = TestUi::new().unwrap();
     let mut snap = (*fake_playing(MediaRef::Channel(ChannelId(1)), PlayableKind::Live, None, PlayOrigin::Fullscreen)).clone();
-    let track = |id: i64, kind, lang: &str, selected| tuner::player::Track { id, kind, title: None, lang: Some(lang.into()), codec: Some("aac".into()), default: false, forced: false, selected, external: false, channels: Some(2) };
+    let track = |id: i64, kind, lang: &str, selected| tuner::player::Track {
+        id,
+        kind,
+        title: None,
+        lang: Some(lang.into()),
+        codec: Some("aac".into()),
+        default: false,
+        forced: false,
+        selected,
+        external: false,
+        channels: Some(2),
+    };
     snap.tracks.audio = vec![track(1, tuner::player::TrackKind::Audio, "eng", true), track(2, tuner::player::TrackKind::Audio, "deu", false)];
     snap.tracks.subs = vec![track(3, tuner::player::TrackKind::Sub, "eng", false)];
     t.snapshot = Arc::new(snap);
@@ -1794,18 +1934,48 @@ fn edit_information_saves_overrides() {
 fn every_wp11_key_is_in_help() {
     let help = |c: KeyContext| keymap::help_rows(c).into_iter().map(|(_, h)| h).collect::<Vec<_>>();
     let guide = help(KeyContext::Guide);
-    for h in ["Previous / next channel", "Previous / next programme", "Jump to channel number", "Remind me / cancel reminder", "Catch up (past programme)", "Watch channel", "Collection: favourites lists, groups, all", "Previous / next day", "Jump to now", "Scroll time −/+ 3 h"] {
+    for h in [
+        "Previous / next channel",
+        "Previous / next programme",
+        "Jump to channel number",
+        "Remind me / cancel reminder",
+        "Catch up (past programme)",
+        "Watch channel",
+        "Collection: favourites lists, groups, all",
+        "Previous / next day",
+        "Jump to now",
+        "Scroll time −/+ 3 h",
+    ] {
         assert!(guide.contains(&h), "guide help lacks {h}");
     }
     let live = help(KeyContext::PlayerLive);
-    for h in ["Previous / next channel (in this list)", "Last channel", "Channel history", "Channel list", "Mini guide (now / next)", "Type a channel number", "On-screen controls", "Stream info (codec, resolution, bitrate)", "Subtitle delay −/+ 100 ms", "Audio tracks…", "Subtitles…"] {
+    for h in [
+        "Previous / next channel (in this list)",
+        "Last channel",
+        "Channel history",
+        "Channel list",
+        "Mini guide (now / next)",
+        "Type a channel number",
+        "On-screen controls",
+        "Stream info (codec, resolution, bitrate)",
+        "Subtitle delay −/+ 100 ms",
+        "Audio tracks…",
+        "Subtitles…",
+    ] {
         assert!(live.contains(&h), "player help lacks {h}");
     }
     assert!(help(KeyContext::PlayerVod).contains(&"Jump to live (from catch-up)"));
     assert!(help(KeyContext::PlayerOsd).contains(&"Leave the controls"));
     assert!(help(KeyContext::NumericEntry).contains(&"Go now (otherwise after 1.5 s)"));
     let list = help(KeyContext::List);
-    for h in ["Play here / open (playing → fullscreen)", "Play fullscreen", "Show in TV guide", "Details / edit information", "Assign EPG channel", "Sort & view options…"] {
+    for h in [
+        "Play here / open (playing → fullscreen)",
+        "Play fullscreen",
+        "Show in TV guide",
+        "Details / edit information",
+        "Assign EPG channel",
+        "Sort & view options…",
+    ] {
         assert!(list.contains(&h), "list help lacks {h}");
     }
 }

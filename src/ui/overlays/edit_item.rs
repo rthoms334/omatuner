@@ -20,9 +20,9 @@ use crate::model::{ChannelId, ItemKind, ItemOverride, ItemRef};
 use crate::msg::DataScope;
 use crate::store::Ticket;
 use crate::theme::{SpaceToken, TypeToken};
+use crate::ui::screens::live;
 use crate::ui::widgets::button::{ButtonStyle, button};
 use crate::ui::widgets::card::CardKind;
-use crate::ui::screens::live;
 use crate::ui::widgets::{text_field::text_field, toggle::toggle};
 use crate::ui::{Route, UiCtx};
 
@@ -90,7 +90,10 @@ impl EditItemOverlay {
         }
         let (db, item) = (ctx.db, self.item.clone());
         let Some(r) = ctx.budget.run(|| load_item(db, &item)) else { return };
-        self.loaded = Some(r.map_err(|e| crate::redact::redact(&e.to_string()).into_owned()).and_then(|l| l.ok_or_else(|| "This item is no longer in your playlists".to_owned())));
+        self.loaded = Some(
+            r.map_err(|e| crate::redact::redact(&e.to_string()).into_owned())
+                .and_then(|l| l.ok_or_else(|| "This item is no longer in your playlists".to_owned())),
+        );
         if let Some(Ok(l)) = &self.loaded {
             self.name = l.ov.rename.clone().unwrap_or_else(|| l.provider_name.clone());
             self.offset_min = l.ov.catchup_offset_s.unwrap_or(0) / 60;
@@ -118,7 +121,9 @@ impl EditItemOverlay {
         f[self.cursor.min(f.len() - 1)]
     }
 
-    fn lock_allowed(&self, ctx: &UiCtx<'_>) -> bool { ctx.parental.is_unlocked(&ctx.config.parental) }
+    fn lock_allowed(&self, ctx: &UiCtx<'_>) -> bool {
+        ctx.parental.is_unlocked(&ctx.config.parental)
+    }
 
     fn activate(&mut self, ctx: &mut UiCtx<'_>, f: Field) -> OverlayOutcome {
         match f {
@@ -173,7 +178,8 @@ impl EditItemOverlay {
             return OverlayOutcome::Close;
         }
         let item = self.item.clone();
-        self.pending = Some(ctx.services.store.writer().submit_notify(DataScope::Overrides, move |c| crate::store::user::set_item_override(c, &item, &ov)));
+        self.pending =
+            Some(ctx.services.store.writer().submit_notify(DataScope::Overrides, move |c| crate::store::user::set_item_override(c, &item, &ov)));
         OverlayOutcome::Keep
     }
 }
@@ -183,15 +189,23 @@ fn load_item(db: &rusqlite::Connection, item: &ItemRef) -> crate::error::Result<
     let ov = crate::store::user::item_override(db, item)?.unwrap_or_default();
     let loaded = match item.kind {
         ItemKind::Channel => crate::store::live::channel_by_ref(db, item)?.map(|c| {
-            let epg_label = c.epg_channel_id.and_then(|id| crate::store::epg::epg_channel(db, id).ok()).map(|e| e.display_names.first().cloned().unwrap_or(e.xmltv_id));
+            let epg_label = c
+                .epg_channel_id
+                .and_then(|id| crate::store::epg::epg_channel(db, id).ok())
+                .map(|e| e.display_names.first().cloned().unwrap_or(e.xmltv_id));
             Loaded { provider_name: c.clean_name.clone(), channel: Some(c.id), has_catchup: c.catchup.is_some(), epg_label, ov: ov.clone() }
         }),
-        ItemKind::Movie => crate::store::vod::resolve_movie(db, item)?
-            .map(|id| crate::store::vod::movie(db, id))
-            .transpose()?
-            .map(|m| Loaded { provider_name: m.clean_name, channel: None, has_catchup: false, epg_label: None, ov: ov.clone() }),
+        ItemKind::Movie => crate::store::vod::resolve_movie(db, item)?.map(|id| crate::store::vod::movie(db, id)).transpose()?.map(|m| Loaded {
+            provider_name: m.clean_name,
+            channel: None,
+            has_catchup: false,
+            epg_label: None,
+            ov: ov.clone(),
+        }),
         ItemKind::Series => db
-            .query_row("SELECT clean_name FROM series WHERE source_id = ?1 AND key = ?2", rusqlite::params![item.source, item.key.as_str()], |r| r.get::<_, String>(0))
+            .query_row("SELECT clean_name FROM series WHERE source_id = ?1 AND key = ?2", rusqlite::params![item.source, item.key.as_str()], |r| {
+                r.get::<_, String>(0)
+            })
             .ok()
             .map(|n| Loaded { provider_name: n, channel: None, has_catchup: false, epg_label: None, ov: ov.clone() }),
         ItemKind::Episode => crate::store::vod::resolve_episode(db, item)?
@@ -275,7 +289,8 @@ impl Overlay for EditItemOverlay {
         self.cursor = self.cursor.min(fields.len() - 1);
         let cur = fields[self.cursor];
         let lock_ok = self.lock_allowed(ctx);
-        let lock_label = if live::pin_hint(ctx).is_empty() { "Locked (needs the parental PIN)".to_owned() } else { format!("Locked{}", live::pin_hint(ctx)) };
+        let lock_label =
+            if live::pin_hint(ctx).is_empty() { "Locked (needs the parental PIN)".to_owned() } else { format!("Locked{}", live::pin_hint(ctx)) };
         let mut clicked: Option<Field> = None;
         let mut outcome = OverlayOutcome::Keep;
         let saving = self.pending.is_some();
@@ -321,7 +336,11 @@ impl Overlay for EditItemOverlay {
                         if focused && !self.editing {
                             ui.painter().rect_stroke(resp.rect, t.rounding, egui::Stroke::new(1.0, t.list_cursor_border), egui::StrokeKind::Outside);
                         }
-                        ui.label(RichText::new("Leave empty to restore the provider's name.").size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
+                        ui.label(
+                            RichText::new("Leave empty to restore the provider's name.")
+                                .size(theme.font(TypeToken::BodySmall))
+                                .color(t.text_secondary),
+                        );
                     }
                     Field::Offset => {
                         ui.add_space(theme.space(SpaceToken::Md));
@@ -377,7 +396,13 @@ impl Overlay for EditItemOverlay {
             ui.add_space(theme.space(SpaceToken::Lg));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = theme.space(SpaceToken::Lg);
-                let save = button(ui, theme, None, if saving { "Saving…" } else { "Save" }, ButtonStyle { primary: true, focused: cur == Field::Save, ..Default::default() });
+                let save = button(
+                    ui,
+                    theme,
+                    None,
+                    if saving { "Saving…" } else { "Save" },
+                    ButtonStyle { primary: true, focused: cur == Field::Save, ..Default::default() },
+                );
                 if save.clicked() {
                     clicked = Some(Field::Save);
                 }

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, RichText};
 
-use super::{ConfirmSpec, ContextMenuSpec, ListPickerSpec, OverlayResult, Overlay, OverlayOutcome, RenameSpec, RenameTarget};
+use super::{ConfirmSpec, ContextMenuSpec, ListPickerSpec, Overlay, OverlayOutcome, OverlayResult, RenameSpec, RenameTarget};
 use crate::keymap::{Action, KeyContext};
 use crate::model::{FavListId, FavouriteList};
 use crate::msg::DataScope;
@@ -98,7 +98,8 @@ fn buttons(ui: &mut egui::Ui, theme: &Theme, confirm: &str, style: ButtonStyle, 
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         ui.spacing_mut().item_spacing.x = theme.space(SpaceToken::Lg);
         let ok = button(ui, theme, None, confirm, ButtonStyle { focused: focus_confirm == Some(true), ..style }).clicked();
-        let cancel = button(ui, theme, None, "Cancel", ButtonStyle { bordered: true, focused: focus_confirm == Some(false), ..Default::default() }).clicked();
+        let cancel =
+            button(ui, theme, None, "Cancel", ButtonStyle { bordered: true, focused: focus_confirm == Some(false), ..Default::default() }).clicked();
         (cancel, ok)
     })
     .inner
@@ -139,7 +140,9 @@ impl Submit {
 }
 
 /// A user-visible error message (errors are redacted by contract; redact again defensively).
-fn message(e: &crate::error::Error) -> String { crate::redact::redact(&e.to_string()).into_owned() }
+fn message(e: &crate::error::Error) -> String {
+    crate::redact::redact(&e.to_string()).into_owned()
+}
 
 // ------------------------------------------------------------------ context menu
 
@@ -185,7 +188,9 @@ impl ContextMenuOverlay {
 }
 
 impl Overlay for ContextMenuOverlay {
-    fn key_contexts(&self) -> Vec<KeyContext> { vec![self.list.key_context(), KeyContext::Modal] }
+    fn key_contexts(&self) -> Vec<KeyContext> {
+        vec![self.list.key_context(), KeyContext::Modal]
+    }
 
     fn on_action(&mut self, _ctx: &mut UiCtx<'_>, action: Action) -> OverlayOutcome {
         match self.list.handle(action) {
@@ -203,7 +208,9 @@ impl Overlay for ContextMenuOverlay {
             ListOutcome::None => match action {
                 Action::Back => OverlayOutcome::Close,
                 // keys the list absorbed without effect (ends of the list, a leading space)
-                Action::Up | Action::Down | Action::PageUp | Action::PageDown | Action::Home | Action::End | Action::FilterInput(_) => OverlayOutcome::Keep,
+                Action::Up | Action::Down | Action::PageUp | Action::PageDown | Action::Home | Action::End | Action::FilterInput(_) => {
+                    OverlayOutcome::Keep
+                }
                 Action::Activate | Action::ActivateAlt | Action::Left | Action::Right => OverlayOutcome::Keep,
                 _ => OverlayOutcome::Ignored,
             },
@@ -269,11 +276,23 @@ fn paint_menu_row(p: &egui::Painter, rect: egui::Rect, theme: &Theme, icon: &str
     let inset = theme.space(SpaceToken::Lg);
     let icon_col = (28.0 * theme.rem()).round();
     if !icon.is_empty() {
-        p.text(egui::pos2(rect.left() + inset + icon_col / 2.0, rect.center().y), Align2::CENTER_CENTER, icon, egui::FontId::proportional(theme.font(TypeToken::Icon)), color);
+        p.text(
+            egui::pos2(rect.left() + inset + icon_col / 2.0, rect.center().y),
+            Align2::CENTER_CENTER,
+            icon,
+            egui::FontId::proportional(theme.font(TypeToken::Icon)),
+            color,
+        );
     }
     let mut right = rect.right() - inset;
     if let Some(s) = shortcut {
-        let r = p.text(egui::pos2(right, rect.center().y), Align2::RIGHT_CENTER, s, egui::FontId::proportional(theme.font(TypeToken::BodySmall)), t.text_secondary);
+        let r = p.text(
+            egui::pos2(right, rect.center().y),
+            Align2::RIGHT_CENTER,
+            s,
+            egui::FontId::proportional(theme.font(TypeToken::BodySmall)),
+            t.text_secondary,
+        );
         right = r.left() - theme.space(SpaceToken::Lg);
     }
     let left = rect.left() + inset + icon_col + theme.space(SpaceToken::Md);
@@ -292,7 +311,10 @@ pub struct ConfirmOverlay {
 }
 
 impl ConfirmOverlay {
-    pub fn new(spec: ConfirmSpec) -> Self { let f = !spec.destructive; Self { spec, focus_confirm: f } }
+    pub fn new(spec: ConfirmSpec) -> Self {
+        let f = !spec.destructive;
+        Self { spec, focus_confirm: f }
+    }
 
     fn result(&self, confirm: bool) -> OverlayOutcome {
         OverlayOutcome::CloseWith(if confirm { OverlayResult::Confirmed(self.spec.token) } else { OverlayResult::Cancelled(self.spec.token) })
@@ -300,7 +322,9 @@ impl ConfirmOverlay {
 }
 
 impl Overlay for ConfirmOverlay {
-    fn key_contexts(&self) -> Vec<KeyContext> { vec![KeyContext::Modal] }
+    fn key_contexts(&self) -> Vec<KeyContext> {
+        vec![KeyContext::Modal]
+    }
 
     fn on_action(&mut self, _ctx: &mut UiCtx<'_>, action: Action) -> OverlayOutcome {
         match action {
@@ -382,7 +406,9 @@ pub struct PinOverlay {
 }
 
 impl PinOverlay {
-    pub fn new(then: Action, reason: String) -> Self { Self { then, reason, entered: String::new(), error: None, enter: Submit::default() } }
+    pub fn new(then: Action, reason: String) -> Self {
+        Self { then, reason, entered: String::new(), error: None, enter: Submit::default() }
+    }
 
     fn submit(&mut self, ctx: &mut UiCtx<'_>) -> OverlayOutcome {
         if pin_cooldown().is_some() {
@@ -533,7 +559,9 @@ impl RenameOverlay {
 }
 
 impl Overlay for RenameOverlay {
-    fn key_contexts(&self) -> Vec<KeyContext> { vec![KeyContext::TextInput, KeyContext::Modal] }
+    fn key_contexts(&self) -> Vec<KeyContext> {
+        vec![KeyContext::TextInput, KeyContext::Modal]
+    }
 
     fn on_action(&mut self, _ctx: &mut UiCtx<'_>, action: Action) -> OverlayOutcome {
         match action {

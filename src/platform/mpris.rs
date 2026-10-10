@@ -27,8 +27,7 @@ use std::time::Instant;
 
 use mpris_server::zbus::{self, fdo};
 use mpris_server::{
-    LoopStatus, Metadata, PlaybackRate, PlaybackStatus, PlayerInterface, Property, RootInterface, Server, Signal, Time, TrackId,
-    Volume,
+    LoopStatus, Metadata, PlaybackRate, PlaybackStatus, PlayerInterface, Property, RootInterface, Server, Signal, Time, TrackId, Volume,
 };
 use tokio::sync::watch;
 
@@ -92,7 +91,9 @@ impl MprisService {
 }
 
 impl Drop for MprisService {
-    fn drop(&mut self) { self.stop(); }
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 /// `DBUS_SESSION_BUS_ADDRESS`, or the systemd default socket `$XDG_RUNTIME_DIR/bus`.
@@ -117,7 +118,9 @@ trait Commands: Send + Sync + 'static {
 }
 
 impl Commands for PlayerHandle {
-    fn send(&self, cmd: PlayerCommand) { PlayerHandle::send(self, cmd) }
+    fn send(&self, cmd: PlayerCommand) {
+        PlayerHandle::send(self, cmd)
+    }
 }
 
 #[derive(Clone)]
@@ -128,12 +131,16 @@ struct Imp {
 }
 
 impl Imp {
-    fn snap(&self) -> Arc<PlayerSnapshot> { self.snapshots.borrow().clone() }
+    fn snap(&self) -> Arc<PlayerSnapshot> {
+        self.snapshots.borrow().clone()
+    }
 }
 
 // ------------------------------------------------------------------ snapshot → MPRIS values
 
-fn is_live(s: &PlayerSnapshot) -> bool { s.playable.as_ref().is_some_and(|p| p.kind.is_live()) }
+fn is_live(s: &PlayerSnapshot) -> bool {
+    s.playable.as_ref().is_some_and(|p| p.kind.is_live())
+}
 
 fn playback_status(s: &PlayerSnapshot) -> PlaybackStatus {
     match &s.state {
@@ -144,11 +151,17 @@ fn playback_status(s: &PlayerSnapshot) -> PlaybackStatus {
     }
 }
 
-fn can_zap(s: &PlayerSnapshot) -> bool { is_live(s) && s.zap.as_ref().is_some_and(|z| z.channels.len() > 1) }
+fn can_zap(s: &PlayerSnapshot) -> bool {
+    is_live(s) && s.zap.as_ref().is_some_and(|z| z.channels.len() > 1)
+}
 
-fn can_pause(s: &PlayerSnapshot) -> bool { s.playable.is_some() }
+fn can_pause(s: &PlayerSnapshot) -> bool {
+    s.playable.is_some()
+}
 
-fn volume(s: &PlayerSnapshot) -> Volume { if s.muted { 0.0 } else { (s.volume / 100.0).clamp(0.0, MAX_VOLUME) } }
+fn volume(s: &PlayerSnapshot) -> Volume {
+    if s.muted { 0.0 } else { (s.volume / 100.0).clamp(0.0, MAX_VOLUME) }
+}
 
 /// Stable per item: `/tuner/item/<16 hex>` of the item's identity (or its media ref).
 fn track_id(s: &PlayerSnapshot) -> TrackId {
@@ -185,7 +198,9 @@ fn metadata(s: &PlayerSnapshot) -> Metadata {
     m
 }
 
-fn position_us(s: &PlayerSnapshot) -> i64 { s.position.filter(|p| p.is_finite() && *p >= 0.0).map_or(0, |p| (p * 1e6) as i64) }
+fn position_us(s: &PlayerSnapshot) -> i64 {
+    s.position.filter(|p| p.is_finite() && *p >= 0.0).map_or(0, |p| (p * 1e6) as i64)
+}
 
 impl RootInterface for Imp {
     async fn raise(&self) -> fdo::Result<()> {
@@ -197,16 +212,36 @@ impl RootInterface for Imp {
         self.bus.send(AppEvent::Platform(PlatformEvent::Quit));
         Ok(())
     }
-    async fn can_quit(&self) -> fdo::Result<bool> { Ok(true) }
-    async fn fullscreen(&self) -> fdo::Result<bool> { Ok(false) }
-    async fn set_fullscreen(&self, _fullscreen: bool) -> zbus::Result<()> { Ok(()) }
-    async fn can_set_fullscreen(&self) -> fdo::Result<bool> { Ok(false) }
-    async fn can_raise(&self) -> fdo::Result<bool> { Ok(true) }
-    async fn has_track_list(&self) -> fdo::Result<bool> { Ok(false) }
-    async fn identity(&self) -> fdo::Result<String> { Ok(crate::APP_NAME.to_owned()) }
-    async fn desktop_entry(&self) -> fdo::Result<String> { Ok(crate::APP_ID.to_owned()) }
-    async fn supported_uri_schemes(&self) -> fdo::Result<Vec<String>> { Ok(Vec::new()) }
-    async fn supported_mime_types(&self) -> fdo::Result<Vec<String>> { Ok(Vec::new()) }
+    async fn can_quit(&self) -> fdo::Result<bool> {
+        Ok(true)
+    }
+    async fn fullscreen(&self) -> fdo::Result<bool> {
+        Ok(false)
+    }
+    async fn set_fullscreen(&self, _fullscreen: bool) -> zbus::Result<()> {
+        Ok(())
+    }
+    async fn can_set_fullscreen(&self) -> fdo::Result<bool> {
+        Ok(false)
+    }
+    async fn can_raise(&self) -> fdo::Result<bool> {
+        Ok(true)
+    }
+    async fn has_track_list(&self) -> fdo::Result<bool> {
+        Ok(false)
+    }
+    async fn identity(&self) -> fdo::Result<String> {
+        Ok(crate::APP_NAME.to_owned())
+    }
+    async fn desktop_entry(&self) -> fdo::Result<String> {
+        Ok(crate::APP_ID.to_owned())
+    }
+    async fn supported_uri_schemes(&self) -> fdo::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    async fn supported_mime_types(&self) -> fdo::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
 }
 
 impl PlayerInterface for Imp {
@@ -261,31 +296,69 @@ impl PlayerInterface for Imp {
         }
         Ok(())
     }
-    async fn open_uri(&self, _uri: String) -> fdo::Result<()> { Err(fdo::Error::NotSupported("OpenUri is not supported".into())) }
-    async fn playback_status(&self) -> fdo::Result<PlaybackStatus> { Ok(playback_status(&self.snap())) }
-    async fn loop_status(&self) -> fdo::Result<LoopStatus> { Ok(LoopStatus::None) }
-    async fn set_loop_status(&self, _loop_status: LoopStatus) -> zbus::Result<()> { Ok(()) }
-    async fn rate(&self) -> fdo::Result<PlaybackRate> { Ok(1.0) }
-    async fn set_rate(&self, _rate: PlaybackRate) -> zbus::Result<()> { Ok(()) }
-    async fn shuffle(&self) -> fdo::Result<bool> { Ok(false) }
-    async fn set_shuffle(&self, _shuffle: bool) -> zbus::Result<()> { Ok(()) }
-    async fn metadata(&self) -> fdo::Result<Metadata> { Ok(metadata(&self.snap())) }
-    async fn volume(&self) -> fdo::Result<Volume> { Ok(volume(&self.snap())) }
+    async fn open_uri(&self, _uri: String) -> fdo::Result<()> {
+        Err(fdo::Error::NotSupported("OpenUri is not supported".into()))
+    }
+    async fn playback_status(&self) -> fdo::Result<PlaybackStatus> {
+        Ok(playback_status(&self.snap()))
+    }
+    async fn loop_status(&self) -> fdo::Result<LoopStatus> {
+        Ok(LoopStatus::None)
+    }
+    async fn set_loop_status(&self, _loop_status: LoopStatus) -> zbus::Result<()> {
+        Ok(())
+    }
+    async fn rate(&self) -> fdo::Result<PlaybackRate> {
+        Ok(1.0)
+    }
+    async fn set_rate(&self, _rate: PlaybackRate) -> zbus::Result<()> {
+        Ok(())
+    }
+    async fn shuffle(&self) -> fdo::Result<bool> {
+        Ok(false)
+    }
+    async fn set_shuffle(&self, _shuffle: bool) -> zbus::Result<()> {
+        Ok(())
+    }
+    async fn metadata(&self) -> fdo::Result<Metadata> {
+        Ok(metadata(&self.snap()))
+    }
+    async fn volume(&self) -> fdo::Result<Volume> {
+        Ok(volume(&self.snap()))
+    }
     async fn set_volume(&self, volume: Volume) -> zbus::Result<()> {
         if volume.is_finite() {
             self.cmds.send(PlayerCommand::SetVolume(volume.clamp(0.0, MAX_VOLUME) * 100.0));
         }
         Ok(())
     }
-    async fn position(&self) -> fdo::Result<Time> { Ok(Time::from_micros(position_us(&self.snap()))) }
-    async fn minimum_rate(&self) -> fdo::Result<PlaybackRate> { Ok(1.0) }
-    async fn maximum_rate(&self) -> fdo::Result<PlaybackRate> { Ok(1.0) }
-    async fn can_go_next(&self) -> fdo::Result<bool> { Ok(can_zap(&self.snap())) }
-    async fn can_go_previous(&self) -> fdo::Result<bool> { Ok(can_zap(&self.snap())) }
-    async fn can_play(&self) -> fdo::Result<bool> { Ok(can_pause(&self.snap())) }
-    async fn can_pause(&self) -> fdo::Result<bool> { Ok(can_pause(&self.snap())) }
-    async fn can_seek(&self) -> fdo::Result<bool> { Ok(self.snap().seekable) }
-    async fn can_control(&self) -> fdo::Result<bool> { Ok(true) }
+    async fn position(&self) -> fdo::Result<Time> {
+        Ok(Time::from_micros(position_us(&self.snap())))
+    }
+    async fn minimum_rate(&self) -> fdo::Result<PlaybackRate> {
+        Ok(1.0)
+    }
+    async fn maximum_rate(&self) -> fdo::Result<PlaybackRate> {
+        Ok(1.0)
+    }
+    async fn can_go_next(&self) -> fdo::Result<bool> {
+        Ok(can_zap(&self.snap()))
+    }
+    async fn can_go_previous(&self) -> fdo::Result<bool> {
+        Ok(can_zap(&self.snap()))
+    }
+    async fn can_play(&self) -> fdo::Result<bool> {
+        Ok(can_pause(&self.snap()))
+    }
+    async fn can_pause(&self) -> fdo::Result<bool> {
+        Ok(can_pause(&self.snap()))
+    }
+    async fn can_seek(&self) -> fdo::Result<bool> {
+        Ok(self.snap().seekable)
+    }
+    async fn can_control(&self) -> fdo::Result<bool> {
+        Ok(true)
+    }
 }
 
 // ------------------------------------------------------------------ change notification
@@ -391,7 +464,9 @@ mod tests {
     struct Recorder(Mutex<Vec<PlayerCommand>>);
 
     impl Commands for Recorder {
-        fn send(&self, cmd: PlayerCommand) { self.0.lock().unwrap().push(cmd) }
+        fn send(&self, cmd: PlayerCommand) {
+            self.0.lock().unwrap().push(cmd)
+        }
     }
 
     fn live(programme: Option<&str>) -> PlayerSnapshot {
@@ -508,7 +583,9 @@ mod tests {
         assert!(ch.contains(&Property::CanGoNext(true)) && ch.contains(&Property::CanSeek(false)));
     }
 
-    fn session_bus_available() -> bool { std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some() }
+    fn session_bus_available() -> bool {
+        std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some()
+    }
 
     async fn call(conn: &zbus::Connection, dest: &str, iface: &str, method: &str) {
         conn.call_method(Some(dest), "/org/mpris/MediaPlayer2", Some(iface), method, &()).await.unwrap();
@@ -516,7 +593,13 @@ mod tests {
 
     async fn get(conn: &zbus::Connection, dest: &str, prop: &str) -> zbus::zvariant::OwnedValue {
         let reply = conn
-            .call_method(Some(dest), "/org/mpris/MediaPlayer2", Some("org.freedesktop.DBus.Properties"), "Get", &("org.mpris.MediaPlayer2.Player", prop))
+            .call_method(
+                Some(dest),
+                "/org/mpris/MediaPlayer2",
+                Some("org.freedesktop.DBus.Properties"),
+                "Get",
+                &("org.mpris.MediaPlayer2.Player", prop),
+            )
             .await
             .unwrap();
         reply.body().deserialize::<zbus::zvariant::OwnedValue>().unwrap()

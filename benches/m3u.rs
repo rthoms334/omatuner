@@ -93,7 +93,8 @@ fn bench(c: &mut Criterion) {
     g.bench_function("parse_100k", |b| b.iter(|| black_box(parse_count(black_box(&bytes)))));
     g.finish();
 
-    let line = r#"-1 tvg-id="bbc1.uk" tvg-name="BBC One" tvg-logo="http://logos.example/bbc1.png" tvg-chno="101" group-title="UK;News",UK | BBC One FHD"#;
+    let line =
+        r#"-1 tvg-id="bbc1.uk" tvg-name="BBC One" tvg-logo="http://logos.example/bbc1.png" tvg-chno="101" group-title="UK;News",UK | BBC One FHD"#;
     c.bench_function("extinf_attrs", |b| b.iter(|| black_box(m3u::parse_extinf_attrs(black_box(line)))));
     c.bench_function("clean_channel_name", |b| {
         b.iter(|| black_box(tuner::sources::smart_names::clean_channel_name(black_box("[VIP] US: ESPN 2 4K (backup)"))))

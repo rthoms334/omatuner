@@ -9,10 +9,7 @@ use tuner::model::{ChannelId, EpgSourceId, MovieId, SeriesId, SourceId, Timestam
 
 /// An M3U-URL source named `name`; returns its id.
 pub fn seed_source(c: &mut Connection, name: &str) -> Result<SourceId> {
-    c.execute(
-        "INSERT INTO source(name, kind, url, created_at, generation) VALUES (?1, 'm3u-url', 'http://127.0.0.1/playlist.m3u', 0, 1)",
-        [name],
-    )?;
+    c.execute("INSERT INTO source(name, kind, url, created_at, generation) VALUES (?1, 'm3u-url', 'http://127.0.0.1/playlist.m3u', 0, 1)", [name])?;
     Ok(SourceId(c.last_insert_rowid()))
 }
 
@@ -69,7 +66,10 @@ pub fn seed_channels(c: &mut Connection, source: SourceId, n: usize) -> Result<V
 /// FTS rows included. Returns the EPG source id.
 pub fn seed_epg(c: &mut Connection, channels: &[ChannelId], start: Timestamp, hours: u32) -> Result<EpgSourceId> {
     let tx = c.transaction()?;
-    tx.execute("INSERT INTO epg_source(name, kind, url, active_gen, n_channels) VALUES ('Seed EPG','url','http://127.0.0.1/epg.xml',1,?1)", [channels.len() as i64])?;
+    tx.execute(
+        "INSERT INTO epg_source(name, kind, url, active_gen, n_channels) VALUES ('Seed EPG','url','http://127.0.0.1/epg.xml',1,?1)",
+        [channels.len() as i64],
+    )?;
     let src = tx.last_insert_rowid();
     {
         let mut ec = tx.prepare("INSERT INTO epg_channel(epg_source_id, xmltv_id, seen_gen) VALUES (?1, ?2, 1)")?;

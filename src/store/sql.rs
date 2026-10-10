@@ -14,9 +14,15 @@ use serde::de::DeserializeOwned;
 use crate::error::{Error, Result};
 use crate::model::{Fingerprint, ItemKind};
 
-pub fn fp_to_json(fp: &Fingerprint) -> String { serde_json::to_string(fp).unwrap_or_else(|_| "{}".into()) }
-pub fn fp_from_json(s: &str) -> Fingerprint { serde_json::from_str(s).unwrap_or_default() }
-pub fn kind_str(k: ItemKind) -> &'static str { k.as_str() }
+pub fn fp_to_json(fp: &Fingerprint) -> String {
+    serde_json::to_string(fp).unwrap_or_else(|_| "{}".into())
+}
+pub fn fp_from_json(s: &str) -> Fingerprint {
+    serde_json::from_str(s).unwrap_or_default()
+}
+pub fn kind_str(k: ItemKind) -> &'static str {
+    k.as_str()
+}
 
 /// `ItemKind` from a TEXT column (unknown values are a data error, not a panic).
 pub(crate) fn kind_from_sql(s: &str) -> rusqlite::Result<ItemKind> {
@@ -25,7 +31,9 @@ pub(crate) fn kind_from_sql(s: &str) -> rusqlite::Result<ItemKind> {
 
 /// Fingerprint JSON for a write, or `None` when the item no longer exists (the default
 /// fingerprint): SQL then keeps the stored value via `COALESCE(?, fp)`.
-pub(crate) fn fp_opt(fp: &Fingerprint) -> Option<String> { (*fp != Fingerprint::default()).then(|| fp_to_json(fp)) }
+pub(crate) fn fp_opt(fp: &Fingerprint) -> Option<String> {
+    (*fp != Fingerprint::default()).then(|| fp_to_json(fp))
+}
 
 /// Serialize a unit-like serde enum (kebab/lowercase rename) to its bare string.
 pub(crate) fn enum_str<T: Serialize>(v: &T) -> String {
@@ -36,10 +44,14 @@ pub(crate) fn enum_str<T: Serialize>(v: &T) -> String {
 }
 
 /// Parse a unit-like serde enum from its bare string.
-pub(crate) fn enum_parse<T: DeserializeOwned>(s: &str) -> Option<T> { serde_json::from_value(serde_json::Value::String(s.to_owned())).ok() }
+pub(crate) fn enum_parse<T: DeserializeOwned>(s: &str) -> Option<T> {
+    serde_json::from_value(serde_json::Value::String(s.to_owned())).ok()
+}
 
 /// JSON text of a value (`None` → SQL NULL).
-pub(crate) fn to_json<T: Serialize>(v: &T) -> Result<String> { serde_json::to_string(v).map_err(Error::other) }
+pub(crate) fn to_json<T: Serialize>(v: &T) -> Result<String> {
+    serde_json::to_string(v).map_err(Error::other)
+}
 
 /// Parse an optional JSON column; malformed JSON is treated as absent (logged).
 pub(crate) fn from_json_opt<T: DeserializeOwned>(s: Option<String>) -> Option<T> {
@@ -97,10 +109,14 @@ pub(crate) fn json_ids(ids: impl IntoIterator<Item = i64>) -> String {
 }
 
 /// The `<kind>:` prefix stripped from a group key (`Fingerprint.norm_group`).
-pub(crate) fn group_norm(key: &str) -> String { key.split_once(':').map(|(_, n)| n).unwrap_or(key).to_owned() }
+pub(crate) fn group_norm(key: &str) -> String {
+    key.split_once(':').map(|(_, n)| n).unwrap_or(key).to_owned()
+}
 
 /// `Error::NotFound` with a uniform message.
-pub(crate) fn not_found(what: &str, id: impl std::fmt::Display) -> Error { Error::NotFound(format!("{what} {id}")) }
+pub(crate) fn not_found(what: &str, id: impl std::fmt::Display) -> Error {
+    Error::NotFound(format!("{what} {id}"))
+}
 
 /// Map `QueryReturnedNoRows` to `Error::NotFound`.
 pub(crate) fn or_not_found<T>(r: rusqlite::Result<T>, what: &str, id: impl std::fmt::Display) -> Result<T> {
@@ -112,7 +128,9 @@ pub(crate) fn or_not_found<T>(r: rusqlite::Result<T>, what: &str, id: impl std::
 }
 
 /// Saturating u32 from a SQLite integer (counts never go negative).
-pub(crate) fn u32_of(v: i64) -> u32 { v.clamp(0, u32::MAX as i64) as u32 }
+pub(crate) fn u32_of(v: i64) -> u32 {
+    v.clamp(0, u32::MAX as i64) as u32
+}
 
 #[cfg(test)]
 mod tests {

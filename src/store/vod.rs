@@ -145,21 +145,12 @@ pub fn seasons(conn: &Connection, id: SeriesId) -> Result<Vec<Season>> {
     }
     let mut stmt = conn.prepare_cached("SELECT season, count(*) FROM episode WHERE series_id = ?1 GROUP BY season ORDER BY season")?;
     let rows = stmt.query_map([id], |r| {
-        Ok(Season {
-            series_id: id,
-            number: r.get(0)?,
-            name: None,
-            cover: None,
-            air_date: None,
-            overview: None,
-            episode_count: u32_of(r.get(1)?),
-        })
+        Ok(Season { series_id: id, number: r.get(0)?, name: None, cover: None, air_date: None, overview: None, episode_count: u32_of(r.get(1)?) })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-const EPISODE_COLS: &str =
-    "id, series_id, source_id, key, provider_id, season, episode, title, plot, duration_s, still, air_date, rating, stream";
+const EPISODE_COLS: &str = "id, series_id, source_id, key, provider_id, season, episode, title, plot, duration_s, still, air_date, rating, stream";
 
 fn episode_from_row(r: &Row<'_>) -> rusqlite::Result<Episode> {
     Ok(Episode {

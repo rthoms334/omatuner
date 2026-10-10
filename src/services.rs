@@ -68,12 +68,7 @@ impl Services {
     /// readable message (DB unreadable, mpv missing).
     pub fn start(paths: AppPaths, config: Config, logs: LogBuffer, bus: EventBus) -> Result<Self> {
         paths.ensure()?;
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(3)
-            .thread_name("tuner-rt")
-            .enable_all()
-            .build()
-            .map_err(Error::other)?;
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(3).thread_name("tuner-rt").enable_all().build().map_err(Error::other)?;
         let store = Store::open(&paths.db_file(), Some(bus.clone()))?;
         if let Err(e) = store.reader().and_then(|c| crate::store::sources::register_secrets(&c)) {
             tracing::error!("registering stored secrets: {e}");
@@ -192,7 +187,9 @@ impl Services {
     }
 
     /// Current config (cheap `Arc` clone, no struct copy).
-    pub fn config(&self) -> Arc<Config> { crate::config::current(&self.config) }
+    pub fn config(&self) -> Arc<Config> {
+        crate::config::current(&self.config)
+    }
 
     /// Quit cleanly on SIGTERM / SIGINT / SIGHUP (`platform::signals`): close the window, or
     /// exit directly when it can't close. Called by `main` only — tests keep the default
@@ -266,11 +263,17 @@ impl Services {
 
 /// HTTP client options from the config (default User-Agent, read timeout ≥ 30 s).
 pub fn http_options(cfg: &Config) -> HttpOptions {
-    HttpOptions { default_user_agent: cfg.player.user_agent.clone(), connect_timeout_s: 10, read_timeout_s: cfg.player.network_timeout_s.max(30) as u64 }
+    HttpOptions {
+        default_user_agent: cfg.player.user_agent.clone(),
+        connect_timeout_s: 10,
+        read_timeout_s: cfg.player.network_timeout_s.max(30) as u64,
+    }
 }
 
 /// Log an optional integration's start failure and carry on without it.
-fn ok<T>(what: &str, r: Result<T>) -> Option<T> { r.map_err(|e| tracing::info!("{what}: {e}")).ok() }
+fn ok<T>(what: &str, r: Result<T>) -> Option<T> {
+    r.map_err(|e| tracing::info!("{what}: {e}")).ok()
+}
 
 /// `SetConnectionLimit` for every source with stored account info, so the budget is known
 /// before the first play rather than after the next refresh (DESIGN §11.5).
@@ -326,7 +329,9 @@ struct DbResolver {
 }
 
 impl DbResolver {
-    fn new(store: Store, config: SharedConfig) -> Self { Self { store, config, conn: None, unresolvable: HashSet::new() } }
+    fn new(store: Store, config: SharedConfig) -> Self {
+        Self { store, config, conn: None, unresolvable: HashSet::new() }
+    }
 
     fn conn(&mut self) -> std::result::Result<&rusqlite::Connection, PlayerError> {
         if self.conn.is_none() {
@@ -394,7 +399,10 @@ mod tests {
             .writer()
             .blocking(move |c| {
                 for a in &accounts {
-                    c.execute("INSERT INTO source(name, kind, url, created_at, account) VALUES ('S', 'm3u-url', 'http://127.0.0.1/p.m3u', 0, ?1)", [a])?;
+                    c.execute(
+                        "INSERT INTO source(name, kind, url, created_at, account) VALUES ('S', 'm3u-url', 'http://127.0.0.1/p.m3u', 0, ?1)",
+                        [a],
+                    )?;
                 }
                 c.execute(
                     "INSERT INTO channel(source_id, key, name, clean_name, norm_name, stream, provider_order, seen_gen)
@@ -407,7 +415,9 @@ mod tests {
         store
     }
 
-    fn shared_default() -> SharedConfig { Arc::new(RwLock::new(Arc::new(Config::default()))) }
+    fn shared_default() -> SharedConfig {
+        Arc::new(RwLock::new(Arc::new(Config::default())))
+    }
 
     #[test]
     fn stored_account_limits_become_connection_limit_commands() {

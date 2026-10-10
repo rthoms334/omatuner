@@ -9,12 +9,24 @@ use tuner::keymap::{self, Action, KeyChord, KeyContext as K, Trigger, help_rows,
 fn key_mods(k: Key, modifiers: Modifiers, repeat: bool) -> egui::Event {
     egui::Event::Key { key: k, physical_key: None, pressed: true, repeat, modifiers }
 }
-fn key(k: Key) -> egui::Event { key_mods(k, Modifiers::NONE, false) }
-fn ctrl(k: Key) -> egui::Event { key_mods(k, Modifiers::CTRL | Modifiers::COMMAND, false) }
-fn alt(k: Key) -> egui::Event { key_mods(k, Modifiers::ALT, false) }
-fn shift(k: Key) -> egui::Event { key_mods(k, Modifiers::SHIFT, false) }
-fn held(k: Key) -> egui::Event { key_mods(k, Modifiers::NONE, true) }
-fn text(s: &str) -> egui::Event { egui::Event::Text(s.into()) }
+fn key(k: Key) -> egui::Event {
+    key_mods(k, Modifiers::NONE, false)
+}
+fn ctrl(k: Key) -> egui::Event {
+    key_mods(k, Modifiers::CTRL | Modifiers::COMMAND, false)
+}
+fn alt(k: Key) -> egui::Event {
+    key_mods(k, Modifiers::ALT, false)
+}
+fn shift(k: Key) -> egui::Event {
+    key_mods(k, Modifiers::SHIFT, false)
+}
+fn held(k: Key) -> egui::Event {
+    key_mods(k, Modifiers::NONE, true)
+}
+fn text(s: &str) -> egui::Event {
+    egui::Event::Text(s.into())
+}
 
 // ------------------------------------------------------------------ layering
 

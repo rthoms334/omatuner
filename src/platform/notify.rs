@@ -45,7 +45,9 @@ const DEFAULT_DURATION_S: i64 = 3600;
 ///
 /// Blocks for one D-Bus round trip (at most 5 s): call it from a worker, not the UI thread.
 /// Works inside or outside a tokio runtime (the call runs on its own helper thread).
-pub fn notify(summary: &str, body: &str, urgency_critical: bool) -> bool { notify_at(None, summary, body, urgency_critical) }
+pub fn notify(summary: &str, body: &str, urgency_critical: bool) -> bool {
+    notify_at(None, summary, body, urgency_critical)
+}
 
 /// [`notify`] against `org.freedesktop.Notifications` (`bus = None`) or notify-rust's test bus
 /// namespace `de.hoodie.Notification.<bus>`.
@@ -113,7 +115,9 @@ impl ReminderScheduler {
     }
 
     /// Reload pending reminders (after add/remove).
-    pub fn refresh(&self) { let _ = self.wake.send(()); }
+    pub fn refresh(&self) {
+        let _ = self.wake.send(());
+    }
 }
 
 impl Drop for ReminderScheduler {
@@ -163,7 +167,9 @@ struct Note {
 
 impl Note {
     /// One-line form for the in-app toast fallback.
-    fn toast_text(&self) -> String { format!("{} — {}", self.summary, self.body) }
+    fn toast_text(&self) -> String {
+        format!("{} — {}", self.summary, self.body)
+    }
 }
 
 /// Shows reminder notifications. `on_watch` runs (at most once) when the user picks "Watch".
@@ -223,7 +229,9 @@ struct Plan {
 }
 
 /// Programme end used for the "missed" test (rows without a sane stop get a default length).
-fn effective_stop(r: &Reminder) -> Timestamp { if r.stop > r.start { r.stop } else { r.start + DEFAULT_DURATION_S } }
+fn effective_stop(r: &Reminder) -> Timestamp {
+    if r.stop > r.start { r.stop } else { r.start + DEFAULT_DURATION_S }
+}
 
 /// Pure scheduling step: what to do at `now` and when to look again.
 fn plan(pending: &[Reminder], now: Timestamp, lead_default_s: i64, handled: &HashSet<ReminderId>) -> Plan {
@@ -356,12 +364,12 @@ mod tests {
     fn plan_fires_waits_and_dismisses() {
         let now = 1_000_000;
         let pending = vec![
-            reminder(1, now + 120, now + 1800, 120),    // fire time == now
-            reminder(2, now + 600, now + 1800, 120),    // in 480 s
-            reminder(3, now - 3600, now - 60, 120),     // ended → dismissed
-            reminder(4, now - 300, now + 600, 120),     // still airing → fires late
-            reminder(5, now + 300, now + 900, 0),       // no own lead → default 240 → in 60 s
-            reminder(6, now - 7200, now - 7200, 120),   // no stop: assumed 1 h → ended
+            reminder(1, now + 120, now + 1800, 120),  // fire time == now
+            reminder(2, now + 600, now + 1800, 120),  // in 480 s
+            reminder(3, now - 3600, now - 60, 120),   // ended → dismissed
+            reminder(4, now - 300, now + 600, 120),   // still airing → fires late
+            reminder(5, now + 300, now + 900, 0),     // no own lead → default 240 → in 60 s
+            reminder(6, now - 7200, now - 7200, 120), // no stop: assumed 1 h → ended
         ];
         let p = plan(&pending, now, 240, &HashSet::new());
         assert_eq!(
@@ -414,7 +422,9 @@ mod tests {
             let rows = self.rows.lock().unwrap();
             Ok(rows.iter().filter(|r| !states.iter().any(|(id, _)| *id == r.id)).cloned().collect())
         }
-        fn set_state(&self, id: ReminderId, state: ReminderState) { self.states.lock().unwrap().push((id, state)); }
+        fn set_state(&self, id: ReminderId, state: ReminderState) {
+            self.states.lock().unwrap().push((id, state));
+        }
     }
 
     /// Records notes; clicks "Watch" immediately when `click` is set; `available` = server up.
@@ -459,7 +469,7 @@ mod tests {
         let now = crate::model::now();
         let backend = Arc::new(FakeBackend::default());
         *backend.rows.lock().unwrap() = vec![
-            reminder(1, now + 60, now + 3600, 120), // due now
+            reminder(1, now + 60, now + 3600, 120),   // due now
             reminder(2, now - 7200, now - 3600, 120), // missed
             reminder(3, now + 2, now + 3600, 1),      // due in ~1 s
             reminder(4, now + 7200, now + 9000, 120), // later
@@ -488,10 +498,7 @@ mod tests {
         backend.rows.lock().unwrap().push(reminder(5, now - 60, now + 600, 120));
         sched.refresh();
         let ev = recv_until(&rx, Duration::from_secs(5), |ev| matches!(ev, AppEvent::Platform(PlatformEvent::ReminderWatch { .. })));
-        assert!(
-            ev.iter().any(|e| matches!(e, AppEvent::Platform(PlatformEvent::ReminderWatch { reminder: ReminderId(5), .. }))),
-            "{ev:?}"
-        );
+        assert!(ev.iter().any(|e| matches!(e, AppEvent::Platform(PlatformEvent::ReminderWatch { reminder: ReminderId(5), .. }))), "{ev:?}");
         assert_eq!(notifier.shown.lock().unwrap().last().unwrap().body, "Started 1 min ago on BBC One");
         drop(sched);
     }
@@ -578,7 +585,9 @@ mod tests {
 
     // ---------------------------------------------------------------- D-Bus (fake server)
 
-    fn session_bus_available() -> bool { std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some() }
+    fn session_bus_available() -> bool {
+        std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some()
+    }
 
     /// Minimal notification server on `de.hoodie.Notification.<suffix>` that records Notify
     /// calls and keeps emitting `ActionInvoked(id, action)` for them (the client subscribes

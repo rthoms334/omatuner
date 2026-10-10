@@ -18,12 +18,12 @@ use tuner::model::{FavListId, FavouriteList, ItemKey, ItemKind, ItemRef, SourceI
 use tuner::msg::Toast;
 use tuner::store::library::FavIndex;
 use tuner::theme::Theme;
+use tuner::ui::OverlayRequest;
 use tuner::ui::overlays::{self, ConfirmSpec, ContextMenuSpec, ListPickerSpec, MenuItem, Overlay, OverlayOutcome, RenameSpec, RenameTarget};
 use tuner::ui::testing::TestUi;
 use tuner::ui::widgets::list::{ListOutcome, ListState, virtual_list};
 use tuner::ui::widgets::toast::Toasts;
 use tuner::ui::widgets::{RowState, rows, slider, toggle};
-use tuner::ui::OverlayRequest;
 
 // ------------------------------------------------------------------ helpers
 
@@ -79,7 +79,13 @@ impl ListApp {
     fn new(n: usize) -> Self {
         let mut list = ListState::default();
         list.set_len(n);
-        Self { theme: Theme::fallback(), names: (0..n).map(|i| format!("Row {i}")).collect(), rows: (0..n as u32).collect(), list, outcomes: Vec::new() }
+        Self {
+            theme: Theme::fallback(),
+            names: (0..n).map(|i| format!("Row {i}")).collect(),
+            rows: (0..n as u32).collect(),
+            list,
+            outcomes: Vec::new(),
+        }
     }
 
     /// What a screen does with a key action.
@@ -105,7 +111,8 @@ impl ListApp {
 }
 
 fn list_harness(n: usize) -> Harness<'static, ListApp> {
-    let mut h = Harness::builder().with_size(egui::vec2(420.0, 600.0)).with_step_dt(0.02).build_ui_state(|ui, app: &mut ListApp| app.ui(ui), ListApp::new(n));
+    let mut h =
+        Harness::builder().with_size(egui::vec2(420.0, 600.0)).with_step_dt(0.02).build_ui_state(|ui, app: &mut ListApp| app.ui(ui), ListApp::new(n));
     h.run();
     h
 }
@@ -248,7 +255,9 @@ fn rows_fit_compact_list_slots() {
     list.set_len(20);
     let h_compact = rows::row_height(&theme, Density::Compact, false);
     let mut h = Harness::builder().with_size(egui::vec2(420.0, 300.0)).build_ui(|ui| {
-        virtual_list(ui, &theme, "compact", &mut list, h_compact, |ui, rc| rows::menu_row(ui, &theme, None, &format!("Item {}", rc.index), None, false, rc.state));
+        virtual_list(ui, &theme, "compact", &mut list, h_compact, |ui, rc| {
+            rows::menu_row(ui, &theme, None, &format!("Item {}", rc.index), None, false, rc.state)
+        });
     });
     h.run();
     assert_eq!(h.get_by_label("Item 1").rect().height().round(), 36.0);
@@ -614,7 +623,13 @@ fn confirm_context_menu_and_rename_dialogs() {
     let size = egui::vec2(1200.0, 900.0);
 
     // destructive confirm: Cancel focused first
-    let spec = ConfirmSpec { title: "Delete playlist?".into(), body: "This removes 9 812 channels.".into(), confirm_label: "Delete".into(), destructive: true, token: 7 };
+    let spec = ConfirmSpec {
+        title: "Delete playlist?".into(),
+        body: "This removes 9 812 channels.".into(),
+        confirm_label: "Delete".into(),
+        destructive: true,
+        token: 7,
+    };
     let mut h = overlay_harness(OvApp::new(t, OverlayRequest::Confirm(spec.clone())), size);
     assert_eq!(h.state_mut().act(Action::Activate), "CloseWith(Cancelled(7))");
     assert_eq!(h.state_mut().act(Action::Right), "Keep");
@@ -691,7 +706,12 @@ fn confirm_context_menu_and_rename_dialogs() {
 #[test]
 fn pin_prompt_and_list_picker() {
     let salt = tuner::ui::parental::new_salt();
-    let parental = tuner::config::ParentalConfig { enabled: true, pin_hash: Some(tuner::ui::parental::hash_pin("1234", &salt)), pin_salt: Some(salt), relock_min: 0 };
+    let parental = tuner::config::ParentalConfig {
+        enabled: true,
+        pin_hash: Some(tuner::ui::parental::hash_pin("1234", &salt)),
+        pin_salt: Some(salt),
+        relock_min: 0,
+    };
     let cfg = tuner::config::Config { parental, ..Default::default() };
     let t = TestUi::with_config(cfg).expect("TestUi");
     let size = egui::vec2(1200.0, 900.0);
@@ -735,7 +755,13 @@ fn pin_prompt_and_list_picker() {
     // message) when the write fails — the writer is stopped here, so every write fails
     let mut t = h.into_state().t;
     assert!(t.services().store.writer().shutdown(std::time::Duration::from_secs(5)));
-    let list = |id, name: &str, default| FavouriteList { id: FavListId(id), name: name.into(), icon: String::new(), sort_index: id as i32, is_default: default };
+    let list = |id, name: &str, default| FavouriteList {
+        id: FavListId(id),
+        name: name.into(),
+        icon: String::new(),
+        sort_index: id as i32,
+        is_default: default,
+    };
     t.favs = FavIndex::from_parts(vec![list(1, "Favourites", true), list(2, "Sport", false)], Vec::new());
     let item = ItemRef { source: SourceId(1), kind: ItemKind::Channel, key: ItemKey("bbc-one".into()) };
     let spec = ListPickerSpec { item: item.clone(), title: "Add “BBC One” to…".into() };
@@ -780,7 +806,10 @@ fn pin_prompt_and_list_picker() {
 fn list_picker_failures_settle_to_the_stored_state() {
     let mut t = TestUi::new().expect("TestUi");
     // list 99 isn't in the database: every write to it fails (foreign key)
-    t.favs = FavIndex::from_parts(vec![FavouriteList { id: FavListId(99), name: "Ghost".into(), icon: String::new(), sort_index: 0, is_default: false }], Vec::new());
+    t.favs = FavIndex::from_parts(
+        vec![FavouriteList { id: FavListId(99), name: "Ghost".into(), icon: String::new(), sort_index: 0, is_default: false }],
+        Vec::new(),
+    );
     let item = ItemRef { source: SourceId(1), kind: ItemKind::Channel, key: ItemKey("bbc-one".into()) };
     let spec = ListPickerSpec { item: item.clone(), title: "Add “BBC One” to…".into() };
     let mut h = overlay_harness(OvApp::new(t, OverlayRequest::ListPicker(spec)), egui::vec2(900.0, 700.0));
@@ -818,7 +847,10 @@ fn list_picker_failures_settle_to_the_stored_state() {
 
 #[test]
 fn data_rows_render_with_real_services() {
-    use tuner::model::{ChannelId, ChannelSummary, EpgChannelId, Episode, EpisodeId, Group, GroupId, GroupKey, NowNext, ProgrammeId, ProgrammeSlim, SeriesId, StreamLocator};
+    use tuner::model::{
+        ChannelId, ChannelSummary, EpgChannelId, Episode, EpisodeId, Group, GroupId, GroupKey, NowNext, ProgrammeId, ProgrammeSlim, SeriesId,
+        StreamLocator,
+    };
     let mut t = TestUi::new().expect("TestUi");
     let now = 1_791_576_000;
     let ch = ChannelSummary {
@@ -840,7 +872,14 @@ fn data_rows_render_with_real_services() {
         user_order: None,
         added_at: None,
     };
-    let prog = |id, title: &str, start, stop| ProgrammeSlim { id: ProgrammeId(id), start, stop, title: Arc::from(title), sub_title: None, flags: Default::default() };
+    let prog = |id, title: &str, start, stop| ProgrammeSlim {
+        id: ProgrammeId(id),
+        start,
+        stop,
+        title: Arc::from(title),
+        sub_title: None,
+        flags: Default::default(),
+    };
     let nn = NowNext { now: Some(prog(1, "News at Eight", now - 600, now + 3000)), next: Some(prog(2, "Panorama", now + 3000, now + 6600)) };
     let group = Group {
         id: GroupId(1),
@@ -875,9 +914,25 @@ fn data_rows_render_with_real_services() {
     let theme = Theme::fallback();
     let mut h = Harness::builder().with_size(egui::vec2(900.0, 700.0)).build_ui(|ui| {
         t.images.pump();
-        let opts = rows::ChannelRowOpts { density: Density::Comfortable, show_number: true, show_logo: true, favourite: true, playing: true, ..Default::default() };
+        let opts = rows::ChannelRowOpts {
+            density: Density::Comfortable,
+            show_number: true,
+            show_logo: true,
+            favourite: true,
+            playing: true,
+            ..Default::default()
+        };
         rows::channel_row(ui, &theme, &mut t.images, &ch, Some(&nn), now, opts, RowState::Cursor);
-        rows::channel_row(ui, &theme, &mut t.images, &ch, None, now, rows::ChannelRowOpts { density: Density::Compact, playing: false, ..opts }, RowState::Idle);
+        rows::channel_row(
+            ui,
+            &theme,
+            &mut t.images,
+            &ch,
+            None,
+            now,
+            rows::ChannelRowOpts { density: Density::Compact, playing: false, ..opts },
+            RowState::Idle,
+        );
         rows::group_row(ui, &theme, &group, RowState::Selected);
         rows::programme_row(ui, &theme, &nn.now.clone().unwrap(), now, true, true, RowState::Idle);
         rows::episode_row(ui, &theme, &ep, Some(0.4), false, false, RowState::Idle);
@@ -905,7 +960,11 @@ fn data_rows_render_with_real_services() {
     assert!(h.query_by_label("LIVE").is_some());
     assert!(h.query_by_label("Search channels…").is_some());
     let s = shapes(&h);
-    assert!(s.iter().any(|s| matches!(s, Shape::Text(t) if t.galley.job.text.starts_with("News at Eight · ") && t.galley.job.text.ends_with("next: Panorama"))));
+    assert!(
+        s.iter().any(
+            |s| matches!(s, Shape::Text(t) if t.galley.job.text.starts_with("News at Eight · ") && t.galley.job.text.ends_with("next: Panorama"))
+        )
+    );
     assert!(monogram(&h), "monogram for a failed logo");
     let play = s.iter().filter(|s| matches!(s, Shape::Text(t) if t.galley.job.text == tuner::ui::widgets::glyphs::PLAY)).count();
     assert_eq!(play, 1, "now-playing marker only on the playing row");

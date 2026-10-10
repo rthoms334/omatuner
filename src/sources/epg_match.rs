@@ -151,13 +151,7 @@ pub fn suggest(idx: &EpgCandidateIndex, name: &str, limit: usize, threshold: f64
         .into_values()
         .map(|(score, i)| {
             let (_, ch, xid, display) = &idx.norms[i];
-            EpgSuggestion {
-                epg_channel_id: *ch,
-                epg_source_id,
-                xmltv_id: xid.clone(),
-                display_name: display.clone(),
-                score: score as f32,
-            }
+            EpgSuggestion { epg_channel_id: *ch, epg_source_id, xmltv_id: xid.clone(), display_name: display.clone(), score: score as f32 }
         })
         .collect();
     out.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.display_name.cmp(&b.display_name)).then(a.epg_channel_id.cmp(&b.epg_channel_id)));
@@ -203,7 +197,9 @@ fn trigrams(norm: &str) -> impl Iterator<Item = u32> + '_ {
 }
 
 /// `CNN.us@SD` → `CNN.us`.
-pub fn strip_feed(id: &str) -> &str { id.split_once('@').map(|(a, _)| a).unwrap_or(id) }
+pub fn strip_feed(id: &str) -> &str {
+    id.split_once('@').map(|(a, _)| a).unwrap_or(id)
+}
 
 #[cfg(test)]
 mod tests {

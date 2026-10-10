@@ -141,14 +141,50 @@ impl Rng {
         self.0 ^= self.0 >> 27;
         self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
-    fn below(&mut self, n: usize) -> usize { (self.next() % n as u64) as usize }
-    fn pick<'a>(&mut self, xs: &[&'a str]) -> &'a str { xs[self.below(xs.len())] }
-    fn chance(&mut self, pct: usize) -> bool { self.below(100) < pct }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+    fn pick<'a>(&mut self, xs: &[&'a str]) -> &'a str {
+        xs[self.below(xs.len())]
+    }
+    fn chance(&mut self, pct: usize) -> bool {
+        self.below(100) < pct
+    }
 }
 
 const WORDS: &[&str] = &[
-    "bbc", "one", "news", "sky", "cinema", "sports", "arena", "kanal", "das", "erste", "rai", "uno", "télé", "música", "Ελλάδα", "日本", "Москва", "24",
-    "7", "2", "max", "kids", "zdf", "info", "première", "e!", "nick", "jr.", "a&e", "mtv", "fox", "life",
+    "bbc",
+    "one",
+    "news",
+    "sky",
+    "cinema",
+    "sports",
+    "arena",
+    "kanal",
+    "das",
+    "erste",
+    "rai",
+    "uno",
+    "télé",
+    "música",
+    "Ελλάδα",
+    "日本",
+    "Москва",
+    "24",
+    "7",
+    "2",
+    "max",
+    "kids",
+    "zdf",
+    "info",
+    "première",
+    "e!",
+    "nick",
+    "jr.",
+    "a&e",
+    "mtv",
+    "fox",
+    "life",
 ];
 const PREFIXES: &[&str] = &["UK | ", "uk|", "US: ", "|EN| ", "[VIP] ", "[UK] ", "DE - ", "FR:", "|AR| ", "[HD] "];
 const SUFFIXES: &[&str] = &[" HD", " FHD", " UHD", " 4K", " SD", " 1080p", " 720p", " HEVC", " H.265", " (backup)", " h264"];

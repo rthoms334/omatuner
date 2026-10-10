@@ -76,7 +76,9 @@ impl SidePanel {
         self.rows = self.list.filter.apply(self.haystacks.iter().map(String::as_str));
         self.list.set_len(self.rows.len());
     }
-    fn cursor_item(&self) -> Option<ChannelId> { self.rows.get(self.list.cursor).and_then(|&i| self.items.get(i as usize)).copied() }
+    fn cursor_item(&self) -> Option<ChannelId> {
+        self.rows.get(self.list.cursor).and_then(|&i| self.items.get(i as usize)).copied()
+    }
 }
 
 /// OSD controls (controls focus mode moves between them).
@@ -134,7 +136,9 @@ impl Control {
     }
     /// Drawn as a glyph only (DESIGN §13.8 wireframe); the label stays the accessible name and
     /// the hover text.
-    fn glyph_only(self) -> bool { matches!(self, Control::Prev | Control::PlayPause | Control::Next | Control::SkipBack | Control::SkipForward | Control::Fullscreen) }
+    fn glyph_only(self) -> bool {
+        matches!(self, Control::Prev | Control::PlayPause | Control::Next | Control::SkipBack | Control::SkipForward | Control::Fullscreen)
+    }
 }
 
 /// Which OSD row has the controls focus (VOD has a seek bar row above the buttons).
@@ -193,9 +197,13 @@ pub struct PlayerScreen {
 }
 
 /// The OSD scale of the current window.
-fn scale_of(ui: &egui::Ui) -> f32 { osd_scale(ui.ctx().content_rect().width()) }
+fn scale_of(ui: &egui::Ui) -> f32 {
+    osd_scale(ui.ctx().content_rect().width())
+}
 
-fn is_live(snap: &PlayerSnapshot) -> bool { crate::ui::video_host::is_live(snap.playable.as_ref().map(|p| &p.kind)) }
+fn is_live(snap: &PlayerSnapshot) -> bool {
+    crate::ui::video_host::is_live(snap.playable.as_ref().map(|p| &p.kind))
+}
 
 /// The neighbour to tune while the session is locked: skips locked channels and what the
 /// controller's own zap would skip (`failing`: ≥ 2 failures in 24 h; DRM; vanished channels).
@@ -216,9 +224,13 @@ impl PlayerScreen {
     }
 
     /// The passive banner is up (a pause keeps it up until Esc).
-    fn banner_shown(&self, snap: &PlayerSnapshot) -> bool { (snap.paused && !self.banner_dismissed) || self.banner_until.is_some_and(|t| Instant::now() < t) }
+    fn banner_shown(&self, snap: &PlayerSnapshot) -> bool {
+        (snap.paused && !self.banner_dismissed) || self.banner_until.is_some_and(|t| Instant::now() < t)
+    }
 
-    fn banner_visible(&self, snap: &PlayerSnapshot) -> bool { self.osd_focus || self.panel.is_some() || self.banner_shown(snap) }
+    fn banner_visible(&self, snap: &PlayerSnapshot) -> bool {
+        self.osd_focus || self.panel.is_some() || self.banner_shown(snap)
+    }
 
     /// The controls focus mode walks: those drawn last frame (a prefix of `controls`).
     fn active_controls(&self, snap: &PlayerSnapshot, narrow: bool) -> Vec<Control> {
@@ -228,7 +240,9 @@ impl PlayerScreen {
     }
 
     /// Below 700 pt (× rem) the controls row collapses (DESIGN §13.8).
-    fn narrow(width: f32, theme: &Theme) -> bool { width < 700.0 * theme.rem() }
+    fn narrow(width: f32, theme: &Theme) -> bool {
+        width < 700.0 * theme.rem()
+    }
 
     fn controls(snap: &PlayerSnapshot, narrow: bool) -> Vec<Control> {
         use Control as C;
@@ -277,7 +291,13 @@ impl PlayerScreen {
             ctx.play(PlayerCommand::ZapTo(id));
         } else {
             let zap = live::primary_zap(ctx, id);
-            ctx.play(PlayerCommand::Play(PlayRequest { media: MediaRef::Channel(id), zap, origin: PlayOrigin::Fullscreen, resume: false, immediate: true }));
+            ctx.play(PlayerCommand::Play(PlayRequest {
+                media: MediaRef::Channel(id),
+                zap,
+                origin: PlayOrigin::Fullscreen,
+                resume: false,
+                immediate: true,
+            }));
         }
         true
     }
@@ -302,10 +322,12 @@ impl PlayerScreen {
         };
         let haystacks = items
             .iter()
-            .map(|id| ctx.lib.live.get(*id).map_or_else(String::new, |c| match c.number {
-                Some(n) => format!("{n} {}", c.name),
-                None => c.name.to_string(),
-            }))
+            .map(|id| {
+                ctx.lib.live.get(*id).map_or_else(String::new, |c| match c.number {
+                    Some(n) => format!("{n} {}", c.name),
+                    None => c.name.to_string(),
+                })
+            })
             .collect();
         let mut p = SidePanel { kind, list: ListState::default(), items, haystacks, rows: Vec::new() };
         p.refilter();
@@ -477,7 +499,13 @@ impl PlayerScreen {
         };
         self.next_lookup = None;
         match next {
-            Ok(Some(e)) => self.next_episode = Some(NextEpisode { id: e.id, label: format!("S{:02}E{:02} · {}", e.season, e.episode, e.title), at: Instant::now() + NEXT_EPISODE_DELAY }),
+            Ok(Some(e)) => {
+                self.next_episode = Some(NextEpisode {
+                    id: e.id,
+                    label: format!("S{:02}E{:02} · {}", e.season, e.episode, e.title),
+                    at: Instant::now() + NEXT_EPISODE_DELAY,
+                })
+            }
             Ok(None) => {}
             Err(err) => tracing::debug!("next episode: {err}"),
         }
@@ -485,7 +513,13 @@ impl PlayerScreen {
 
     fn play_next_episode(&mut self, ctx: &mut UiCtx<'_>) {
         if let Some(n) = self.next_episode.take() {
-            ctx.play(PlayerCommand::Play(PlayRequest { media: MediaRef::Episode(n.id), zap: None, origin: PlayOrigin::Fullscreen, resume: true, immediate: true }));
+            ctx.play(PlayerCommand::Play(PlayRequest {
+                media: MediaRef::Episode(n.id),
+                zap: None,
+                origin: PlayOrigin::Fullscreen,
+                resume: true,
+                immediate: true,
+            }));
             self.show_banner(ctx);
         }
     }
@@ -518,13 +552,30 @@ impl PlayerScreen {
             osd_logo(&p, theme, ctx.images, pl.logo.as_deref(), &pl.title, lr);
             x = lr.right() + pad / 2.0;
             if let Some(n) = pl.number {
-                let r = osd_text(&p, egui::pos2(x, top.center().y), Align2::LEFT_CENTER, &n.to_string(), body_font.clone(), with_alpha(t.osd_text, 0.7), f32::INFINITY);
+                let r = osd_text(
+                    &p,
+                    egui::pos2(x, top.center().y),
+                    Align2::LEFT_CENTER,
+                    &n.to_string(),
+                    body_font.clone(),
+                    with_alpha(t.osd_text, 0.7),
+                    f32::INFINITY,
+                );
                 x = r.right() + pad / 2.0;
             }
         }
         let vol = if snap.muted { format!("{} muted", glyphs::MUTED) } else { format!("{} {:.0} %", glyphs::VOLUME, snap.volume) };
-        let vr = osd_text(&p, egui::pos2(top.right() - pad, top.center().y), Align2::RIGHT_CENTER, &vol, small_font.clone(), t.osd_text, f32::INFINITY);
-        let cr = osd_text(&p, egui::pos2(vr.left() - pad, top.center().y), Align2::RIGHT_CENTER, &hhmm(ctx.now, h24), small_font.clone(), t.osd_text, f32::INFINITY);
+        let vr =
+            osd_text(&p, egui::pos2(top.right() - pad, top.center().y), Align2::RIGHT_CENTER, &vol, small_font.clone(), t.osd_text, f32::INFINITY);
+        let cr = osd_text(
+            &p,
+            egui::pos2(vr.left() - pad, top.center().y),
+            Align2::RIGHT_CENTER,
+            &hhmm(ctx.now, h24),
+            small_font.clone(),
+            t.osd_text,
+            f32::INFINITY,
+        );
         let title = playable.as_ref().map(|p| p.title.as_str()).unwrap_or("");
         osd_text(&p, egui::pos2(x, top.center().y), Align2::LEFT_CENTER, title, title_font.clone(), t.osd_text, (cr.left() - pad - x).max(0.0));
 
@@ -547,11 +598,38 @@ impl PlayerScreen {
         if live {
             match nn.as_ref().and_then(|n| n.now.clone()) {
                 Some(now) => {
-                    let tr = osd_text(&p, egui::pos2(inner.right(), y), Align2::RIGHT_TOP, &time_range(now.start, now.stop, h24), small_font.clone(), with_alpha(t.osd_text, 0.8), f32::INFINITY);
-                    osd_text(&p, egui::pos2(inner.left(), y), Align2::LEFT_TOP, &now.title, body_font.clone(), t.osd_text, (tr.left() - pad - inner.left()).max(0.0));
+                    let tr = osd_text(
+                        &p,
+                        egui::pos2(inner.right(), y),
+                        Align2::RIGHT_TOP,
+                        &time_range(now.start, now.stop, h24),
+                        small_font.clone(),
+                        with_alpha(t.osd_text, 0.8),
+                        f32::INFINITY,
+                    );
+                    osd_text(
+                        &p,
+                        egui::pos2(inner.left(), y),
+                        Align2::LEFT_TOP,
+                        &now.title,
+                        body_font.clone(),
+                        t.osd_text,
+                        (tr.left() - pad - inner.left()).max(0.0),
+                    );
                     y += line;
-                    let left = osd_text(&p, egui::pos2(inner.right(), y + line / 2.0), Align2::RIGHT_CENTER, &time_left(now.stop - ctx.now), small_font.clone(), with_alpha(t.osd_text, 0.8), f32::INFINITY);
-                    let bar = Rect::from_min_max(egui::pos2(inner.left(), y + line / 2.0 - 2.0 * s), egui::pos2(left.left() - pad, y + line / 2.0 + 2.0 * s));
+                    let left = osd_text(
+                        &p,
+                        egui::pos2(inner.right(), y + line / 2.0),
+                        Align2::RIGHT_CENTER,
+                        &time_left(now.stop - ctx.now),
+                        small_font.clone(),
+                        with_alpha(t.osd_text, 0.8),
+                        f32::INFINITY,
+                    );
+                    let bar = Rect::from_min_max(
+                        egui::pos2(inner.left(), y + line / 2.0 - 2.0 * s),
+                        egui::pos2(left.left() - pad, y + line / 2.0 + 2.0 * s),
+                    );
                     p.rect_filled(bar, t.rounding, with_alpha(t.osd_text, 0.25));
                     let fill = Rect::from_min_max(bar.min, egui::pos2(bar.left() + bar.width() * now.progress(ctx.now), bar.bottom()));
                     p.rect_filled(fill, t.rounding, t.osd_accent);
@@ -568,8 +646,24 @@ impl PlayerScreen {
             }
             y += line;
             let next = nn.as_ref().and_then(|n| n.next.clone()).map(|n| format!("Next  {}  {}", hhmm(n.start, h24), n.title)).unwrap_or_default();
-            let br = self.badges(&p, theme, snap, ch.as_ref().is_some_and(|c| c.has_catchup), egui::pos2(inner.right(), y + line / 2.0), badge_font.clone(), s);
-            osd_text(&p, egui::pos2(inner.left(), y + line / 2.0), Align2::LEFT_CENTER, &next, small_font.clone(), with_alpha(t.osd_text, 0.8), (br.left() - pad - inner.left()).max(0.0));
+            let br = self.badges(
+                &p,
+                theme,
+                snap,
+                ch.as_ref().is_some_and(|c| c.has_catchup),
+                egui::pos2(inner.right(), y + line / 2.0),
+                badge_font.clone(),
+                s,
+            );
+            osd_text(
+                &p,
+                egui::pos2(inner.left(), y + line / 2.0),
+                Align2::LEFT_CENTER,
+                &next,
+                small_font.clone(),
+                with_alpha(t.osd_text, 0.8),
+                (br.left() - pad - inner.left()).max(0.0),
+            );
             y += line;
         } else {
             let sub = playable.as_ref().and_then(|p| p.subtitle.clone()).unwrap_or_default();
@@ -585,11 +679,13 @@ impl PlayerScreen {
             let pos = snap.position.unwrap_or(0.0);
             let dur = snap.duration.or_else(|| playable.as_ref().and_then(|p| p.duration_hint)).unwrap_or(0.0);
             let times = format!("{} / {}", clock(pos), clock(dur));
-            let tr = osd_text(&p, egui::pos2(inner.right(), y + line / 2.0), Align2::RIGHT_CENTER, &times, small_font.clone(), t.osd_text, f32::INFINITY);
+            let tr =
+                osd_text(&p, egui::pos2(inner.right(), y + line / 2.0), Align2::RIGHT_CENTER, &times, small_font.clone(), t.osd_text, f32::INFINITY);
             let seek_rect = Rect::from_min_max(egui::pos2(inner.left(), y), egui::pos2(tr.left() - pad, y + line));
             let focused = self.osd_focus && self.row == OsdRow::Seek;
             let cache_end = snap.cache_secs.map(|c| pos + c);
-            let req = ui.scope_builder(egui::UiBuilder::new().max_rect(seek_rect), |ui| slider::seek_bar(ui, theme, pos, dur, cache_end, focused)).inner;
+            let req =
+                ui.scope_builder(egui::UiBuilder::new().max_rect(seek_rect), |ui| slider::seek_bar(ui, theme, pos, dur, cache_end, focused)).inner;
             if let Some(to) = req {
                 ctx.play(PlayerCommand::SeekTo(to));
                 self.show_banner(ctx);
@@ -597,7 +693,15 @@ impl PlayerScreen {
             y += line;
             let br = self.badges(&p, theme, snap, false, egui::pos2(inner.right(), y + line / 2.0), badge_font.clone(), s);
             let hint = format!("−{} / +{} s", ctx.config.player.skip_small_s, ctx.config.player.skip_small_s);
-            osd_text(&p, egui::pos2(inner.left(), y + line / 2.0), Align2::LEFT_CENTER, &hint, small_font.clone(), with_alpha(t.osd_text, 0.7), (br.left() - pad - inner.left()).max(0.0));
+            osd_text(
+                &p,
+                egui::pos2(inner.left(), y + line / 2.0),
+                Align2::LEFT_CENTER,
+                &hint,
+                small_font.clone(),
+                with_alpha(t.osd_text, 0.7),
+                (br.left() - pad - inner.left()).max(0.0),
+            );
             y += line;
         }
 
@@ -607,9 +711,15 @@ impl PlayerScreen {
         let cy = y + pad / 2.0;
         let mut clicked = None;
         let text_of = |c: Control, glyphs_only: bool| {
-            if glyphs_only || c.glyph_only() { c.glyph(snap.paused).to_owned() } else { format!("{}  {}", c.glyph(snap.paused), control_text(c, snap)) }
+            if glyphs_only || c.glyph_only() {
+                c.glyph(snap.paused).to_owned()
+            } else {
+                format!("{}  {}", c.glyph(snap.paused), control_text(c, snap))
+            }
         };
-        let row_width = |glyphs_only: bool| -> f32 { controls.iter().map(|c| p.layout_no_wrap(text_of(*c, glyphs_only), small_font.clone(), t.osd_text).size().x + pad * 1.5).sum() };
+        let row_width = |glyphs_only: bool| -> f32 {
+            controls.iter().map(|c| p.layout_no_wrap(text_of(*c, glyphs_only), small_font.clone(), t.osd_text).size().x + pad * 1.5).sum()
+        };
         let glyphs_only = narrow || row_width(false) > inner.width();
         let mut drawn = Vec::with_capacity(controls.len());
         for (i, c) in controls.iter().enumerate() {
@@ -681,7 +791,10 @@ impl PlayerScreen {
         let gap = theme.space(SpaceToken::Sm) * s;
         for l in labels.iter().rev() {
             let g = p.layout_no_wrap(l.clone(), font.clone(), t.osd_text);
-            let r = Rect::from_min_size(egui::pos2(right - g.size().x - 2.0 * gap, right_center.y - g.size().y / 2.0 - gap / 2.0), g.size() + egui::vec2(2.0 * gap, gap));
+            let r = Rect::from_min_size(
+                egui::pos2(right - g.size().x - 2.0 * gap, right_center.y - g.size().y / 2.0 - gap / 2.0),
+                g.size() + egui::vec2(2.0 * gap, gap),
+            );
             p.rect_stroke(r, t.rounding, egui::Stroke::new(1.0, with_alpha(t.osd_text, 0.6)), egui::StrokeKind::Inside);
             p.galley(r.min + egui::vec2(gap, gap / 2.0), g, t.osd_text);
             extent = extent.union(r);
@@ -701,7 +814,10 @@ impl PlayerScreen {
         let s = scale_of(ui);
         let pad = (theme.space(SpaceToken::PopupPadding) * s).round();
         let w = (340.0 * theme.rem() * s).min(rect.width() * 0.6);
-        let area = Rect::from_min_max(egui::pos2(rect.right() - w - pad, rect.top() + pad * 6.0), egui::pos2(rect.right() - pad, rect.bottom() - pad * 12.0));
+        let area = Rect::from_min_max(
+            egui::pos2(rect.right() - w - pad, rect.top() + pad * 6.0),
+            egui::pos2(rect.right() - pad, rect.bottom() - pad * 12.0),
+        );
         if area.height() < 60.0 {
             return;
         }
@@ -717,7 +833,15 @@ impl PlayerScreen {
         };
         let q = panel.list.filter.query();
         let head = if q.is_empty() { title.to_owned() } else { format!("{title}  ·  {q}") };
-        osd_text(&p, egui::pos2(area.left() + pad, area.top() + pad), Align2::LEFT_TOP, &head, caption.clone(), with_alpha(t.osd_text, 0.7), area.width() - 2.0 * pad);
+        osd_text(
+            &p,
+            egui::pos2(area.left() + pad, area.top() + pad),
+            Align2::LEFT_TOP,
+            &head,
+            caption.clone(),
+            with_alpha(t.osd_text, 0.7),
+            area.width() - 2.0 * pad,
+        );
         let list_top = area.top() + pad + caption.size * 2.0;
         let mini = panel.kind == PanelKind::MiniGuide;
         let row_h = (if mini { font.size * 2.8 } else { font.size * 2.0 }).round();
@@ -727,7 +851,15 @@ impl PlayerScreen {
         let playing = playing_channel(ctx.player);
         if panel.rows.is_empty() {
             let msg = if q.is_empty() { "Nothing here yet" } else { "No matches" };
-            osd_text(&p, egui::pos2(area.left() + pad, list_top + row_h / 2.0), Align2::LEFT_CENTER, msg, small.clone(), with_alpha(t.osd_text, 0.7), area.width() - 2.0 * pad);
+            osd_text(
+                &p,
+                egui::pos2(area.left() + pad, list_top + row_h / 2.0),
+                Align2::LEFT_CENTER,
+                msg,
+                small.clone(),
+                with_alpha(t.osd_text, 0.7),
+                area.width() - 2.0 * pad,
+            );
         }
         let pointer_moved = ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO);
         let mut activate = None;
@@ -754,7 +886,15 @@ impl PlayerScreen {
             let mut x = r.left() + pad / 2.0;
             let num = ch.number.map(|n| n.to_string()).unwrap_or_default();
             let line_y = if mini { r.top() + row_h * 0.33 } else { r.center().y };
-            let nr = osd_text(&p, egui::pos2(x + 3.0 * small.size, line_y), Align2::RIGHT_CENTER, &num, small.clone(), with_alpha(t.osd_text, 0.7), f32::INFINITY);
+            let nr = osd_text(
+                &p,
+                egui::pos2(x + 3.0 * small.size, line_y),
+                Align2::RIGHT_CENTER,
+                &num,
+                small.clone(),
+                with_alpha(t.osd_text, 0.7),
+                f32::INFINITY,
+            );
             x = nr.right().max(x + 3.0 * small.size) + pad / 2.0;
             if playing == Some(id) {
                 let g = osd_text(&p, egui::pos2(x, line_y), Align2::LEFT_CENTER, glyphs::PLAY, small.clone(), t.osd_accent, f32::INFINITY);
@@ -775,7 +915,15 @@ impl PlayerScreen {
                     None if ch.epg_channel_id.is_none() => loading.clone().unwrap_or_else(|| "No guide data".into()),
                     None => "…".into(),
                 };
-                osd_text(&p, egui::pos2(x, r.top() + row_h * 0.72), Align2::LEFT_CENTER, &detail, small.clone(), with_alpha(t.osd_text, 0.7), r.right() - pad / 2.0 - x);
+                osd_text(
+                    &p,
+                    egui::pos2(x, r.top() + row_h * 0.72),
+                    Align2::LEFT_CENTER,
+                    &detail,
+                    small.clone(),
+                    with_alpha(t.osd_text, 0.7),
+                    r.right() - pad / 2.0 - x,
+                );
             }
         }
         if let Some(id) = activate
@@ -801,7 +949,12 @@ impl PlayerScreen {
                 };
                 lines.push(format!("Video    {} · {res} · {}", opt(&i.video_codec), i.fps.map_or_else(|| "–".into(), |f| format!("{f:.2} fps"))));
                 lines.push(format!("Format   {}{}", opt(&i.pixel_format), if i.is_hdr() { " · HDR" } else { "" }));
-                lines.push(format!("Audio    {} · {} · {}", opt(&i.audio_codec), opt(&i.audio_channels), i.samplerate.map_or_else(|| "–".into(), |r| format!("{r} Hz"))));
+                lines.push(format!(
+                    "Audio    {} · {} · {}",
+                    opt(&i.audio_codec),
+                    opt(&i.audio_channels),
+                    i.samplerate.map_or_else(|| "–".into(), |r| format!("{r} Hz"))
+                ));
                 let kbps = |b: Option<f64>| b.map_or_else(|| "–".into(), |b| format!("{:.0} kb/s", b / 1000.0));
                 lines.push(format!("Bitrate  video {} · audio {}", kbps(i.video_bitrate), kbps(i.audio_bitrate)));
                 lines.push(format!("Decoder  {}", i.hwdec.clone().filter(|h| !h.is_empty() && h != "no").unwrap_or_else(|| "software".into())));
@@ -819,7 +972,15 @@ impl PlayerScreen {
         let area = Rect::from_min_size(egui::pos2(rect.left() + pad, rect.top() + pad * 6.0), egui::vec2(w, lh * lines.len() as f32 + 2.0 * pad));
         p.rect_filled(area, t.rounding, t.osd_scrim);
         for (i, l) in lines.iter().enumerate() {
-            osd_text(&p, egui::pos2(area.left() + pad, area.top() + pad + i as f32 * lh), Align2::LEFT_TOP, l, font.clone(), t.osd_text, w - 2.0 * pad);
+            osd_text(
+                &p,
+                egui::pos2(area.left() + pad, area.top() + pad + i as f32 * lh),
+                Align2::LEFT_TOP,
+                l,
+                font.clone(),
+                t.osd_text,
+                w - 2.0 * pad,
+            );
         }
     }
 
@@ -832,9 +993,18 @@ impl PlayerScreen {
         // numeric entry
         if let Some((digits, _)) = &self.numeric {
             let font = FontId::proportional((theme.font(TypeToken::DisplayLarge) * s * 1.4).round());
-            let name = digits.parse::<u32>().ok().and_then(|n| ctx.lib.live.by_number(n)).and_then(|id| ctx.lib.live.get(id)).map(|c| c.name.to_string()).unwrap_or_default();
+            let name = digits
+                .parse::<u32>()
+                .ok()
+                .and_then(|n| ctx.lib.live.by_number(n))
+                .and_then(|id| ctx.lib.live.get(id))
+                .map(|c| c.name.to_string())
+                .unwrap_or_default();
             let g = p.layout_no_wrap(format!("{digits}_"), font, t.osd_accent);
-            let r = Rect::from_min_size(egui::pos2(rect.right() - g.size().x - 3.0 * pad, rect.top() + pad * 6.0), g.size() + egui::vec2(2.0 * pad, 2.0 * pad));
+            let r = Rect::from_min_size(
+                egui::pos2(rect.right() - g.size().x - 3.0 * pad, rect.top() + pad * 6.0),
+                g.size() + egui::vec2(2.0 * pad, 2.0 * pad),
+            );
             let name_font = FontId::proportional((theme.font(TypeToken::Body) * s).round());
             let extra = if name.is_empty() { 0.0 } else { (name_font.size * 2.0).round() };
             p.rect_filled(r.union(Rect::from_min_size(r.left_bottom(), egui::vec2(r.width(), extra))), t.rounding, t.osd_scrim);
@@ -868,9 +1038,25 @@ impl PlayerScreen {
             let r = Rect::from_min_size(egui::pos2(rect.right() - w - pad, (bottom - h).max(rect.top() + pad)), egui::vec2(w, h));
             p.rect_filled(r, t.rounding, t.osd_scrim);
             p.rect_stroke(r, t.rounding, egui::Stroke::new(1.0, t.osd_accent), egui::StrokeKind::Inside);
-            osd_text(&p, egui::pos2(r.left() + pad, r.top() + pad), Align2::LEFT_TOP, &format!("Next episode in {left} s"), font.clone(), t.osd_accent, w - 2.0 * pad);
+            osd_text(
+                &p,
+                egui::pos2(r.left() + pad, r.top() + pad),
+                Align2::LEFT_TOP,
+                &format!("Next episode in {left} s"),
+                font.clone(),
+                t.osd_accent,
+                w - 2.0 * pad,
+            );
             osd_text(&p, egui::pos2(r.left() + pad, r.top() + pad + font.size * 1.3), Align2::LEFT_TOP, &n.label, font, t.osd_text, w - 2.0 * pad);
-            osd_text(&p, egui::pos2(r.left() + pad, r.bottom() - pad), Align2::LEFT_BOTTOM, "Enter play now · Esc cancel", small, with_alpha(t.osd_text, 0.7), w - 2.0 * pad);
+            osd_text(
+                &p,
+                egui::pos2(r.left() + pad, r.bottom() - pad),
+                Align2::LEFT_BOTTOM,
+                "Enter play now · Esc cancel",
+                small,
+                with_alpha(t.osd_text, 0.7),
+                w - 2.0 * pad,
+            );
         }
     }
 }
@@ -925,7 +1111,9 @@ fn flash_text(f: Flash, snap: &PlayerSnapshot, zoom: &usize) -> String {
 }
 
 impl Screen for PlayerScreen {
-    fn id(&self) -> ScreenId { ScreenId::Player }
+    fn id(&self) -> ScreenId {
+        ScreenId::Player
+    }
 
     fn key_contexts(&self) -> Vec<KeyContext> {
         // the context is only decided by the content; the banner never changes it
@@ -941,7 +1129,9 @@ impl Screen for PlayerScreen {
         }
     }
 
-    fn allows_mini_player(&self) -> bool { false }
+    fn allows_mini_player(&self) -> bool {
+        false
+    }
 
     fn on_enter(&mut self, ctx: &mut UiCtx<'_>, _route: &Route) {
         self.osd_focus = false;
@@ -1003,7 +1193,10 @@ impl Screen for PlayerScreen {
             return h;
         }
         // keys that manage the window / app never show the banner
-        if !matches!(action, Action::Back | Action::ToggleWindowFullscreen | Action::ToggleHelp | Action::OpenSearch | Action::Quit | Action::ShowJobs) {
+        if !matches!(
+            action,
+            Action::Back | Action::ToggleWindowFullscreen | Action::ToggleHelp | Action::OpenSearch | Action::Quit | Action::ShowJobs
+        ) {
             self.show_banner(ctx);
         }
         let skip_small = f64::from(ctx.config.player.skip_small_s);
@@ -1126,8 +1319,24 @@ impl Screen for PlayerScreen {
             let p = ui.painter_at(rect);
             p.rect_filled(rect, 0.0, Color32::BLACK);
             let t = &theme.tokens;
-            osd_text(&p, rect.center(), Align2::CENTER_BOTTOM, "Nothing is playing", FontId::proportional(theme.font(TypeToken::Title)), t.osd_text, rect.width());
-            osd_text(&p, rect.center() + egui::vec2(0.0, 8.0), Align2::CENTER_TOP, "Esc goes back", FontId::proportional(theme.font(TypeToken::Body)), with_alpha(t.osd_text, 0.7), rect.width());
+            osd_text(
+                &p,
+                rect.center(),
+                Align2::CENTER_BOTTOM,
+                "Nothing is playing",
+                FontId::proportional(theme.font(TypeToken::Title)),
+                t.osd_text,
+                rect.width(),
+            );
+            osd_text(
+                &p,
+                rect.center() + egui::vec2(0.0, 8.0),
+                Align2::CENTER_TOP,
+                "Esc goes back",
+                FontId::proportional(theme.font(TypeToken::Body)),
+                with_alpha(t.osd_text, 0.7),
+                rect.width(),
+            );
             return;
         }
         let resp = ctx.video.paint(ui, rect, Placement::Fullscreen, theme, ctx.images, &snap);

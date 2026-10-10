@@ -13,6 +13,7 @@
 use eframe::egui::{self, RichText};
 
 use super::home::kit::{self, Loader};
+use crate::images::ImageKind;
 use crate::jobs::{JobEvent, JobKind};
 use crate::keymap::{Action, KeyContext};
 use crate::model::{ItemKind, ItemRef, MediaRef, Movie, MovieId, PlayOrigin, SourceKind, VodKind, VodSummary, WatchProgress};
@@ -22,9 +23,8 @@ use crate::theme::{SpaceToken, Theme, TypeToken, with_alpha};
 use crate::ui::overlays::{ContextMenuSpec, MenuItem, OverlayResult, ResumeSpec};
 use crate::ui::video_host::Placement;
 use crate::ui::widgets::button::{ButtonStyle, button};
-use crate::ui::widgets::{empty_state, glyphs};
 use crate::ui::widgets::poster::paint_poster_image;
-use crate::images::ImageKind;
+use crate::ui::widgets::{empty_state, glyphs};
 use crate::ui::{NavRequest, OverlayRequest, Route, Screen, ScreenId, UiCtx};
 
 /// Play a movie fullscreen from a grid/rail/search (Shift+Enter): the resume prompt when
@@ -55,7 +55,9 @@ pub(crate) fn resume_or_play(ctx: &mut UiCtx<'_>, media: MediaRef, item: &ItemRe
 }
 
 /// Unfinished, past the resume threshold.
-pub(crate) fn resumable(p: &WatchProgress, min_s: u32) -> bool { !p.finished && p.position_s > f64::from(min_s) }
+pub(crate) fn resumable(p: &WatchProgress, min_s: u32) -> bool {
+    !p.finished && p.position_s > f64::from(min_s)
+}
 
 /// Progress 0..1 of a row (unknown duration → none).
 pub(crate) fn fraction(p: &WatchProgress) -> Option<f32> {
@@ -94,7 +96,9 @@ impl MovieDetailScreen {
         }));
     }
 
-    fn summary<'l>(&self, ctx: &'l UiCtx<'_>) -> Option<&'l VodSummary> { self.id.and_then(|id| ctx.lib.vod.find(VodKind::Movie(id))) }
+    fn summary<'l>(&self, ctx: &'l UiCtx<'_>) -> Option<&'l VodSummary> {
+        self.id.and_then(|id| ctx.lib.vod.find(VodKind::Movie(id)))
+    }
 
     fn item(&self, ctx: &UiCtx<'_>) -> Option<ItemRef> {
         match (&self.movie, self.summary(ctx)) {
@@ -117,7 +121,9 @@ impl MovieDetailScreen {
         locked && !kit::unlocked(ctx)
     }
 
-    fn watched(&self) -> bool { self.progress.as_ref().is_some_and(|p| p.finished) }
+    fn watched(&self) -> bool {
+        self.progress.as_ref().is_some_and(|p| p.finished)
+    }
 
     fn resume_at(&self, ctx: &UiCtx<'_>) -> Option<f64> {
         self.progress.as_ref().filter(|p| resumable(p, ctx.config.player.resume_min_s)).map(|p| p.position_s)
@@ -168,7 +174,13 @@ impl MovieDetailScreen {
             }
             Action::ContextMenu => {
                 let fav = ctx.favs.is_fav(&item);
-                let mi = |icon: &'static str, label: &str, action: Action, shortcut: &str| MenuItem { icon, label: label.into(), action, enabled: true, shortcut: Some(shortcut.into()) };
+                let mi = |icon: &'static str, label: &str, action: Action, shortcut: &str| MenuItem {
+                    icon,
+                    label: label.into(),
+                    action,
+                    enabled: true,
+                    shortcut: Some(shortcut.into()),
+                };
                 let items = vec![
                     mi(glyphs::PLAY, if self.resume_at(ctx).is_some() { "Resume" } else { "Play" }, Action::Activate, "Enter"),
                     mi(glyphs::SKIP_BACK, "Play from the start", Action::ActivateAlt, "Shift+Enter"),
@@ -201,7 +213,6 @@ fn return_to_page(ctx: &mut UiCtx<'_>, item: &ItemRef) {
 }
 
 impl MovieDetailScreen {
-
     fn press(&mut self, ctx: &mut UiCtx<'_>, b: Btn) {
         match b {
             Btn::Play => self.play(ctx, true),
@@ -240,8 +251,12 @@ impl MovieDetailScreen {
 }
 
 impl Screen for MovieDetailScreen {
-    fn id(&self) -> ScreenId { ScreenId::MovieDetail }
-    fn key_contexts(&self) -> Vec<KeyContext> { vec![KeyContext::Detail] }
+    fn id(&self) -> ScreenId {
+        ScreenId::MovieDetail
+    }
+    fn key_contexts(&self) -> Vec<KeyContext> {
+        vec![KeyContext::Detail]
+    }
 
     fn on_enter(&mut self, ctx: &mut UiCtx<'_>, route: &Route) {
         let Route::MovieDetail(id) = route else { return };
@@ -402,18 +417,39 @@ impl Screen for MovieDetailScreen {
         let locked = m.as_ref().map(|m| m.locked).or(summary.as_ref().map(|s| s.locked)).unwrap_or(false);
         let mut pressed = None;
         egui::ScrollArea::vertical().id_salt("movie-detail").auto_shrink([false, false]).show(ui, |ui| {
-            let header = DetailHeader { title: &title, meta: &meta.join(" · "), text: &text, poster: poster_url.as_deref(), backdrop: backdrop.as_deref(), playing, locked, loading };
+            let header = DetailHeader {
+                title: &title,
+                meta: &meta.join(" · "),
+                text: &text,
+                poster: poster_url.as_deref(),
+                backdrop: backdrop.as_deref(),
+                playing,
+                locked,
+                loading,
+            };
             header.show(ui, ctx, |ui, ctx| {
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(theme.space(SpaceToken::Lg), theme.space(SpaceToken::Md));
                     for (i, b) in buttons.iter().enumerate() {
                         let (icon, label, primary) = match b {
-                            Btn::Play => (Some(glyphs::PLAY), resume_at.map(|s| format!("Resume {}", kit::clock(s))).unwrap_or_else(|| "Play".into()), true),
+                            Btn::Play => {
+                                (Some(glyphs::PLAY), resume_at.map(|s| format!("Resume {}", kit::clock(s))).unwrap_or_else(|| "Play".into()), true)
+                            }
                             Btn::StartOver => (Some(glyphs::SKIP_BACK), "Start over".into(), false),
-                            Btn::Favourite => (Some(if fav { glyphs::FAVOURITE } else { glyphs::FAVOURITE_OFF }), if fav { "Favourite".into() } else { "Add to Favourites".into() }, false),
+                            Btn::Favourite => (
+                                Some(if fav { glyphs::FAVOURITE } else { glyphs::FAVOURITE_OFF }),
+                                if fav { "Favourite".into() } else { "Add to Favourites".into() },
+                                false,
+                            ),
                             Btn::Watched => (Some(glyphs::CHECK), if watched { "Watched".into() } else { "Mark watched".into() }, false),
                         };
-                        let style = ButtonStyle { primary, focused: i == self.focus, selected: matches!(b, Btn::Favourite) && fav || matches!(b, Btn::Watched) && watched, bordered: true, ..Default::default() };
+                        let style = ButtonStyle {
+                            primary,
+                            focused: i == self.focus,
+                            selected: matches!(b, Btn::Favourite) && fav || matches!(b, Btn::Watched) && watched,
+                            bordered: true,
+                            ..Default::default()
+                        };
                         if button(ui, ctx.theme, icon, &label, style).clicked() {
                             pressed = Some((i, *b));
                         }
@@ -488,7 +524,8 @@ impl DetailHeader<'_> {
                     }
                 }
                 for (p, secondary) in self.text {
-                    let (size, color) = if *secondary { (theme.font(TypeToken::BodySmall), t.text_secondary) } else { (theme.font(TypeToken::Body), t.fg) };
+                    let (size, color) =
+                        if *secondary { (theme.font(TypeToken::BodySmall), t.text_secondary) } else { (theme.font(TypeToken::Body), t.fg) };
                     ui.add(egui::Label::new(RichText::new(p).size(size).color(color)).wrap());
                 }
                 ui.add_space(theme.space(SpaceToken::Md));
@@ -508,7 +545,8 @@ fn skeleton(ui: &mut egui::Ui, theme: &Theme) {
         ui.painter().rect_filled(r, t.rounding, t.fill_field);
         ui.vertical(|ui| {
             for w in [0.5, 0.3, 0.9, 0.8] {
-                let (r, _) = ui.allocate_exact_size(egui::vec2((ui.available_width() * w).max(40.0), theme.font(TypeToken::Title)), egui::Sense::hover());
+                let (r, _) =
+                    ui.allocate_exact_size(egui::vec2((ui.available_width() * w).max(40.0), theme.font(TypeToken::Title)), egui::Sense::hover());
                 ui.painter().rect_filled(r, t.rounding, t.fill_field);
                 ui.add_space(theme.space(SpaceToken::Md));
             }
@@ -561,7 +599,18 @@ pub(crate) mod tests {
             let s = testkit::source(c, "My IPTV")?;
             let ids = testkit::movies(c, s, 2)?;
             let item = ItemRef { source: s, kind: ItemKind::Movie, key: ItemKey("m3u:movie0000000000".into()) };
-            crate::store::user::save_progress(c, &WatchProgress { item, position_s: 600.0, duration_s: Some(1200.0), updated_at: 5, finished: false, title: "Movie 0".into(), fingerprint: Default::default() })?;
+            crate::store::user::save_progress(
+                c,
+                &WatchProgress {
+                    item,
+                    position_s: 600.0,
+                    duration_s: Some(1200.0),
+                    updated_at: 5,
+                    finished: false,
+                    title: "Movie 0".into(),
+                    fingerprint: Default::default(),
+                },
+            )?;
             Ok(ids)
         });
         let mut h = harness(t, one, MovieDetailScreen::default(), egui::vec2(1400.0, 900.0));
@@ -593,7 +642,11 @@ pub(crate) mod tests {
         h.state().t.services().bus.send(AppEvent::Player(PlayerEvent::Ended { item: Some(item), finished: true }));
         h.run_steps(1);
         // (leave the player; the page is already under it, so the push is a no-op for the app)
-        assert_eq!(h.state_mut().nav(), vec![crate::ui::NavRequest::Back, crate::ui::NavRequest::Push(Route::MovieDetail(ids[0]))], "returns to the detail page");
+        assert_eq!(
+            h.state_mut().nav(),
+            vec![crate::ui::NavRequest::Back, crate::ui::NavRequest::Push(Route::MovieDetail(ids[0]))],
+            "returns to the detail page"
+        );
         // a movie started anywhere else (grid, Home, search) also ends on its page
         let other = ItemRef { source: SourceId(1), kind: ItemKind::Movie, key: ItemKey("m3u:movie0000000001".into()) };
         h.state().t.services().bus.send(AppEvent::Player(PlayerEvent::Ended { item: Some(other.clone()), finished: true }));

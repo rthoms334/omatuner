@@ -96,10 +96,20 @@ pub enum OnboardingStart {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Route {
     Home,
-    Live { group: Option<GroupId>, channel: Option<ChannelId> },
-    Guide { collection: Option<Collection>, focus: Option<ChannelId> },
-    Movies { group: Option<GroupId> },
-    Series { group: Option<GroupId> },
+    Live {
+        group: Option<GroupId>,
+        channel: Option<ChannelId>,
+    },
+    Guide {
+        collection: Option<Collection>,
+        focus: Option<ChannelId>,
+    },
+    Movies {
+        group: Option<GroupId>,
+    },
+    Series {
+        group: Option<GroupId>,
+    },
     MovieDetail(MovieId),
     SeriesDetail(SeriesId),
     /// Fullscreen player for whatever is playing.
@@ -107,7 +117,9 @@ pub enum Route {
     Settings(SettingsPage),
     /// Sidebar and status bar are hidden while this route is current.
     Onboarding(OnboardingStart),
-    EpgMapping { channel: Option<ChannelId> },
+    EpgMapping {
+        channel: Option<ChannelId>,
+    },
     Logs,
 }
 
@@ -134,24 +146,35 @@ impl Route {
 #[derive(Debug, Clone, PartialEq)]
 pub enum OverlayRequest {
     /// Global search (WP-12).
-    Search { initial: String },
+    Search {
+        initial: String,
+    },
     Help,
     Jobs,
     /// Also used for Ctrl+S "Sort & view options…" menus.
     ContextMenu(overlays::ContextMenuSpec),
     Confirm(overlays::ConfirmSpec),
     /// Ask for the parental PIN, then run `then`.
-    Pin { then: Box<Action>, reason: String },
+    Pin {
+        then: Box<Action>,
+        reason: String,
+    },
     Rename(overlays::RenameSpec),
     /// Pick favourites lists (Ctrl+Shift+F), incl. "New list…".
     ListPicker(overlays::ListPickerSpec),
     /// Guide programme popover (WP-11). `zap`: the list Watch zaps through (the opener's
     /// collection, DESIGN §13.0); `None` = the channel's primary group.
-    Programme { programme: ProgrammeId, channel: ChannelId, zap: Option<crate::model::ZapList> },
+    Programme {
+        programme: ProgrammeId,
+        channel: ChannelId,
+        zap: Option<crate::model::ZapList>,
+    },
     /// VOD "Resume from 41:20 / Start over" (WP-12).
     Resume(overlays::ResumeSpec),
     /// Audio / subtitle track menu (WP-11).
-    Tracks { audio: bool },
+    Tracks {
+        audio: bool,
+    },
     /// Ctrl+I "Edit information": rename, per-channel catch-up offset, EPG assignment, lock,
     /// hide (WP-11).
     EditItem(ItemRef),
@@ -258,17 +281,31 @@ impl<'a> UiCtx<'a> {
         }
     }
 
-    pub fn navigate(&mut self, r: NavRequest) { self.nav.push(r); }
-    pub fn push(&mut self, route: Route) { self.nav.push(NavRequest::Push(route)); }
-    pub fn open(&mut self, o: OverlayRequest) { self.nav.push(NavRequest::Open(o)); }
-    pub fn toast(&mut self, t: Toast) { self.toasts.push(t); }
+    pub fn navigate(&mut self, r: NavRequest) {
+        self.nav.push(r);
+    }
+    pub fn push(&mut self, route: Route) {
+        self.nav.push(NavRequest::Push(route));
+    }
+    pub fn open(&mut self, o: OverlayRequest) {
+        self.nav.push(NavRequest::Open(o));
+    }
+    pub fn toast(&mut self, t: Toast) {
+        self.toasts.push(t);
+    }
     /// Queue a config change; the app applies it, saves `config.toml`, sends
     /// `PlayerCommand::ApplyConfig` and re-applies dependent state (theme scale) after the frame.
-    pub fn edit_config(&mut self, f: impl FnOnce(&mut Config) + 'static) { self.config_edits.push(Box::new(f)); }
+    pub fn edit_config(&mut self, f: impl FnOnce(&mut Config) + 'static) {
+        self.config_edits.push(Box::new(f));
+    }
     /// Send a player command (non-blocking; never call mpv from the UI thread).
-    pub fn play(&self, cmd: crate::player::PlayerCommand) { self.services.player.handle().send(cmd); }
+    pub fn play(&self, cmd: crate::player::PlayerCommand) {
+        self.services.player.handle().send(cmd);
+    }
     /// An `EpgReader` over the UI connection (guide grid, now/next cache).
-    pub fn epg_reader(&self) -> data::DbEpg<'a> { data::DbEpg(self.db) }
+    pub fn epg_reader(&self) -> data::DbEpg<'a> {
+        data::DbEpg(self.db)
+    }
 }
 
 /// A full-page view. Implementations live in `ui/screens/*` (one file per screen, one owner).
@@ -297,5 +334,7 @@ pub trait Screen {
 
     /// Whether the corner mini-player may show over this screen while something plays.
     /// False for Onboarding and the Player itself.
-    fn allows_mini_player(&self) -> bool { true }
+    fn allows_mini_player(&self) -> bool {
+        true
+    }
 }

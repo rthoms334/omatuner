@@ -47,10 +47,20 @@ fn allocate_row(ui: &mut egui::Ui, theme: &Theme, natural_h: f32, state: RowStat
 }
 
 /// Thin progress bar height (programme / watch progress inside rows).
-fn bar_h(theme: &Theme) -> f32 { (3.0 * theme.rem()).round().max(2.0) }
+fn bar_h(theme: &Theme) -> f32 {
+    (3.0 * theme.rem()).round().max(2.0)
+}
 
 /// Icon + label (+ detail at body-small @0.52, + chevron @0.36).
-pub fn menu_row(ui: &mut egui::Ui, theme: &Theme, icon: Option<&str>, label: &str, detail: Option<&str>, chevron: bool, state: RowState) -> egui::Response {
+pub fn menu_row(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    icon: Option<&str>,
+    label: &str,
+    detail: Option<&str>,
+    chevron: bool,
+    state: RowState,
+) -> egui::Response {
     let t = &theme.tokens;
     let (rect, resp) = allocate_row(ui, theme, row_height(theme, Density::Comfortable, detail.is_some()), state, label);
     if !ui.is_rect_visible(rect) {
@@ -69,7 +79,15 @@ pub fn menu_row(ui: &mut egui::Ui, theme: &Theme, icon: Option<&str>, label: &st
         left += theme.space(SpaceToken::Sm);
     }
     if chevron {
-        let r = paint::text(p, egui::pos2(right, rect.center().y), Align2::RIGHT_CENTER, glyphs::CHEVRON_RIGHT, paint::font(theme, TypeToken::Icon), t.text_disabled, f32::INFINITY);
+        let r = paint::text(
+            p,
+            egui::pos2(right, rect.center().y),
+            Align2::RIGHT_CENTER,
+            glyphs::CHEVRON_RIGHT,
+            paint::font(theme, TypeToken::Icon),
+            t.text_disabled,
+            f32::INFINITY,
+        );
         right = r.left() - theme.space(SpaceToken::Lg);
     }
     let max_w = (right - left).max(0.0);
@@ -209,7 +227,15 @@ pub fn channel_row(
         left += col + gap;
     }
     if opts.playing {
-        let r = paint::text(&p, egui::pos2(left, line_y), Align2::LEFT_CENTER, glyphs::PLAY, paint::font(theme, TypeToken::Icon), t.accent, f32::INFINITY);
+        let r = paint::text(
+            &p,
+            egui::pos2(left, line_y),
+            Align2::LEFT_CENTER,
+            glyphs::PLAY,
+            paint::font(theme, TypeToken::Icon),
+            t.accent,
+            f32::INFINITY,
+        );
         left = r.right() + theme.space(SpaceToken::Md);
     }
     let mut name_right = right;
@@ -223,7 +249,13 @@ pub fn channel_row(
         suffix.push_str(glyphs::RADIO);
     }
     if !suffix.is_empty() {
-        let sg = paint::galley(&p, suffix.trim(), paint::font(theme, TypeToken::BodySmall), if opts.failed { t.warning } else { t.text_secondary }, f32::INFINITY);
+        let sg = paint::galley(
+            &p,
+            suffix.trim(),
+            paint::font(theme, TypeToken::BodySmall),
+            if opts.failed { t.warning } else { t.text_secondary },
+            f32::INFINITY,
+        );
         name_right -= sg.size().x + theme.space(SpaceToken::Md);
         let name_g = paint::galley(&p, ch.name.to_string(), line_font.clone(), color, (name_right - left).max(0.0));
         let sx = left + name_g.size().x + theme.space(SpaceToken::Md);
@@ -235,7 +267,15 @@ pub fn channel_row(
     if let Some((line, has_data)) = detail {
         let c = if has_data { t.text_secondary } else { t.text_disabled };
         let y = rect.top() + rect.height() * 0.70;
-        paint::text(&p, egui::pos2(left, y), Align2::LEFT_CENTER, line, paint::font(theme, TypeToken::BodySmall), c, (rect.right() - inset - left).max(0.0));
+        paint::text(
+            &p,
+            egui::pos2(left, y),
+            Align2::LEFT_CENTER,
+            line,
+            paint::font(theme, TypeToken::BodySmall),
+            c,
+            (rect.right() - inset - left).max(0.0),
+        );
     }
     resp
 }
@@ -254,17 +294,49 @@ pub fn group_row(ui: &mut egui::Ui, theme: &Theme, g: &Group, state: RowState) -
     let left = rect.left() + inset + theme.space(SpaceToken::Sm);
     let mut right = rect.right() - inset;
     let y = rect.center().y;
-    let count = paint::text(p, egui::pos2(right, y), Align2::RIGHT_CENTER, grouped(g.item_count as usize), paint::font(theme, TypeToken::Body), t.text_secondary, f32::INFINITY);
+    let count = paint::text(
+        p,
+        egui::pos2(right, y),
+        Align2::RIGHT_CENTER,
+        grouped(g.item_count as usize),
+        paint::font(theme, TypeToken::Body),
+        t.text_secondary,
+        f32::INFINITY,
+    );
     right = count.left() - theme.space(SpaceToken::Lg);
     if g.locked {
-        let r = paint::text(p, egui::pos2(right, y), Align2::RIGHT_CENTER, glyphs::LOCK, paint::font(theme, TypeToken::Icon), t.text_secondary, f32::INFINITY);
+        let r = paint::text(
+            p,
+            egui::pos2(right, y),
+            Align2::RIGHT_CENTER,
+            glyphs::LOCK,
+            paint::font(theme, TypeToken::Icon),
+            t.text_secondary,
+            f32::INFINITY,
+        );
         right = r.left() - theme.space(SpaceToken::Md);
     }
     if g.hidden {
-        let r = paint::text(p, egui::pos2(right, y), Align2::RIGHT_CENTER, glyphs::HIDDEN, paint::font(theme, TypeToken::Icon), t.text_disabled, f32::INFINITY);
+        let r = paint::text(
+            p,
+            egui::pos2(right, y),
+            Align2::RIGHT_CENTER,
+            glyphs::HIDDEN,
+            paint::font(theme, TypeToken::Icon),
+            t.text_disabled,
+            f32::INFINITY,
+        );
         right = r.left() - theme.space(SpaceToken::Md);
     }
-    paint::text(p, egui::pos2(left, y), Align2::LEFT_CENTER, name, paint::medium(ui.ctx(), theme, TypeToken::Heading), color, (right - left).max(0.0));
+    paint::text(
+        p,
+        egui::pos2(left, y),
+        Align2::LEFT_CENTER,
+        name,
+        paint::medium(ui.ctx(), theme, TypeToken::Heading),
+        color,
+        (right - left).max(0.0),
+    );
     resp
 }
 
@@ -282,7 +354,15 @@ pub(crate) fn grouped(n: usize) -> String {
 }
 
 /// `20:00  News at Eight` (+ catch-up glyph when available, + live progress).
-pub fn programme_row(ui: &mut egui::Ui, theme: &Theme, p: &ProgrammeSlim, now: Timestamp, catchup: bool, h24: bool, state: RowState) -> egui::Response {
+pub fn programme_row(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    p: &ProgrammeSlim,
+    now: Timestamp,
+    catchup: bool,
+    h24: bool,
+    state: RowState,
+) -> egui::Response {
     let t = &theme.tokens;
     let (rect, resp) = allocate_row(ui, theme, row_height(theme, Density::Comfortable, false), state, &p.title);
     if !ui.is_rect_visible(rect) {
@@ -291,7 +371,13 @@ pub fn programme_row(ui: &mut egui::Ui, theme: &Theme, p: &ProgrammeSlim, now: T
     let painter = ui.painter();
     let airing = p.contains(now);
     let past = p.stop <= now;
-    let color = if state.is_cursor() { t.list_cursor_text } else if past { t.text_secondary } else { t.fg };
+    let color = if state.is_cursor() {
+        t.list_cursor_text
+    } else if past {
+        t.text_secondary
+    } else {
+        t.fg
+    };
     let inset = theme.space(SpaceToken::Lg);
     let gap = theme.space(SpaceToken::Lg);
     let y = rect.center().y;
@@ -299,14 +385,31 @@ pub fn programme_row(ui: &mut egui::Ui, theme: &Theme, p: &ProgrammeSlim, now: T
     let mut right = rect.right() - inset;
     let time_font = paint::font(theme, TypeToken::Body);
     let col = paint::galley(painter, if h24 { "00:00" } else { "00:00 PM" }, time_font.clone(), t.text_secondary, f32::INFINITY).size().x;
-    paint::text(painter, egui::pos2(left, y), Align2::LEFT_CENTER, super::time::hhmm(p.start, h24), time_font, if airing { t.fg } else { t.text_secondary }, col);
+    paint::text(
+        painter,
+        egui::pos2(left, y),
+        Align2::LEFT_CENTER,
+        super::time::hhmm(p.start, h24),
+        time_font,
+        if airing { t.fg } else { t.text_secondary },
+        col,
+    );
     left += col + gap;
     if catchup && p.start <= now {
-        let r = paint::text(painter, egui::pos2(right, y), Align2::RIGHT_CENTER, glyphs::CATCHUP, paint::font(theme, TypeToken::Icon), t.text_secondary, f32::INFINITY);
+        let r = paint::text(
+            painter,
+            egui::pos2(right, y),
+            Align2::RIGHT_CENTER,
+            glyphs::CATCHUP,
+            paint::font(theme, TypeToken::Icon),
+            t.text_secondary,
+            f32::INFINITY,
+        );
         right = r.left() - theme.space(SpaceToken::Md);
     }
     if p.flags.is_live {
-        let r = paint::text(painter, egui::pos2(right, y), Align2::RIGHT_CENTER, "LIVE", paint::font(theme, TypeToken::Caption), t.urgent, f32::INFINITY);
+        let r =
+            paint::text(painter, egui::pos2(right, y), Align2::RIGHT_CENTER, "LIVE", paint::font(theme, TypeToken::Caption), t.urgent, f32::INFINITY);
         right = r.left() - theme.space(SpaceToken::Md);
     }
     let title = match &p.sub_title {
@@ -315,7 +418,10 @@ pub fn programme_row(ui: &mut egui::Ui, theme: &Theme, p: &ProgrammeSlim, now: T
     };
     paint::text(painter, egui::pos2(left, y), Align2::LEFT_CENTER, title, paint::font(theme, TypeToken::Title), color, (right - left).max(0.0));
     if airing {
-        let bar = Rect::from_min_max(egui::pos2(left, rect.bottom() - theme.space(SpaceToken::Md) - bar_h(theme)), egui::pos2(rect.right() - inset, rect.bottom() - theme.space(SpaceToken::Md)));
+        let bar = Rect::from_min_max(
+            egui::pos2(left, rect.bottom() - theme.space(SpaceToken::Md) - bar_h(theme)),
+            egui::pos2(rect.right() - inset, rect.bottom() - theme.space(SpaceToken::Md)),
+        );
         paint_progress(painter, bar, theme, p.progress(now), false);
     }
     resp
@@ -323,7 +429,15 @@ pub fn programme_row(ui: &mut egui::Ui, theme: &Theme, p: &ProgrammeSlim, now: T
 
 /// `E05  Title · 42 min` with watched check / progress bar; `playing` puts the accent 󰐊
 /// marker left of the title, like channel rows (DESIGN §13.0).
-pub fn episode_row(ui: &mut egui::Ui, theme: &Theme, e: &Episode, progress: Option<f32>, watched: bool, playing: bool, state: RowState) -> egui::Response {
+pub fn episode_row(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    e: &Episode,
+    progress: Option<f32>,
+    watched: bool,
+    playing: bool,
+    state: RowState,
+) -> egui::Response {
     let t = &theme.tokens;
     let (rect, resp) = allocate_row(ui, theme, row_height(theme, Density::Comfortable, false), state, &e.title);
     if !ui.is_rect_visible(rect) {
@@ -341,11 +455,27 @@ pub fn episode_row(ui: &mut egui::Ui, theme: &Theme, e: &Episode, progress: Opti
     paint::text(painter, egui::pos2(left, y), Align2::LEFT_CENTER, format!("E{:02}", e.episode), num_font, t.text_secondary, col);
     left += col + gap;
     if playing {
-        let r = paint::text(painter, egui::pos2(left, y), Align2::LEFT_CENTER, glyphs::PLAY, paint::font(theme, TypeToken::Icon), t.accent, f32::INFINITY);
+        let r = paint::text(
+            painter,
+            egui::pos2(left, y),
+            Align2::LEFT_CENTER,
+            glyphs::PLAY,
+            paint::font(theme, TypeToken::Icon),
+            t.accent,
+            f32::INFINITY,
+        );
         left = r.right() + theme.space(SpaceToken::Md);
     }
     if watched {
-        let r = paint::text(painter, egui::pos2(right, y), Align2::RIGHT_CENTER, glyphs::CHECK, paint::font(theme, TypeToken::Icon), t.accent, f32::INFINITY);
+        let r = paint::text(
+            painter,
+            egui::pos2(right, y),
+            Align2::RIGHT_CENTER,
+            glyphs::CHECK,
+            paint::font(theme, TypeToken::Icon),
+            t.accent,
+            f32::INFINITY,
+        );
         right = r.left() - theme.space(SpaceToken::Md);
     }
     let title = match e.duration_s {
@@ -354,7 +484,10 @@ pub fn episode_row(ui: &mut egui::Ui, theme: &Theme, e: &Episode, progress: Opti
     };
     paint::text(painter, egui::pos2(left, y), Align2::LEFT_CENTER, title, paint::font(theme, TypeToken::Title), color, (right - left).max(0.0));
     if let Some(f) = progress.filter(|f| !watched && *f > 0.0 && *f < 1.0) {
-        let bar = Rect::from_min_max(egui::pos2(left, rect.bottom() - theme.space(SpaceToken::Md) - bar_h(theme)), egui::pos2(rect.right() - inset, rect.bottom() - theme.space(SpaceToken::Md)));
+        let bar = Rect::from_min_max(
+            egui::pos2(left, rect.bottom() - theme.space(SpaceToken::Md) - bar_h(theme)),
+            egui::pos2(rect.right() - inset, rect.bottom() - theme.space(SpaceToken::Md)),
+        );
         paint_progress(painter, bar, theme, f, true);
     }
     resp

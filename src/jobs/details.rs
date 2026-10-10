@@ -24,7 +24,9 @@ use crate::store::import::{ImportEpisode, ImportSeason, MovieDetails, SeriesDeta
 /// Details are re-fetched after this long.
 const DETAILS_TTL_S: i64 = 7 * 86_400;
 
-fn fresh(loaded_at: Option<Timestamp>, now: Timestamp) -> bool { loaded_at.is_some_and(|t| now - t < DETAILS_TTL_S) }
+fn fresh(loaded_at: Option<Timestamp>, now: Timestamp) -> bool {
+    loaded_at.is_some_and(|t| now - t < DETAILS_TTL_S)
+}
 
 fn client(ctx: &JobContext, src: &Source) -> Option<XtreamClient> {
     let creds = src.xtream.clone()?;
@@ -67,11 +69,17 @@ pub async fn load_movie(ctx: &JobContext, id: MovieId, progress: &Progress, canc
     ctx.store.writer().submit_notify(DataScope::VodDetails, move |c| crate::store::import::store_movie_details(c, id, &d, now)).recv().await
 }
 
-fn text(s: &Option<String>) -> Option<String> { s.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned) }
+fn text(s: &Option<String>) -> Option<String> {
+    s.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned)
+}
 
-fn rating(r: Option<f64>) -> Option<f32> { r.filter(|r| r.is_finite() && *r > 0.0).map(|r| r.min(10.0) as f32) }
+fn rating(r: Option<f64>) -> Option<f32> {
+    r.filter(|r| r.is_finite() && *r > 0.0).map(|r| r.min(10.0) as f32)
+}
 
-fn secs(v: Option<i64>) -> Option<u32> { v.filter(|v| *v > 0).and_then(|v| u32::try_from(v).ok()) }
+fn secs(v: Option<i64>) -> Option<u32> {
+    v.filter(|v| *v > 0).and_then(|v| u32::try_from(v).ok())
+}
 
 fn movie_details(info: &XtVodInfo) -> MovieDetails {
     let i = &info.info;
@@ -152,12 +160,7 @@ fn series_details(info: &XtSeriesInfo) -> SeriesDetails {
             });
         }
     }
-    SeriesDetails {
-        seasons,
-        episodes,
-        plot: text(&info.info.plot),
-        backdrop: info.info.backdrop_path.iter().find_map(|b| text(&Some(b.clone()))),
-    }
+    SeriesDetails { seasons, episodes, plot: text(&info.info.plot), backdrop: info.info.backdrop_path.iter().find_map(|b| text(&Some(b.clone()))) }
 }
 
 #[cfg(test)]

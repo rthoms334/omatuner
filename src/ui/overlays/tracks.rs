@@ -35,7 +35,9 @@ pub struct TracksOverlay {
 }
 
 impl TracksOverlay {
-    pub fn new(audio: bool) -> Self { Self { audio, cursor: 0, placed: false } }
+    pub fn new(audio: bool) -> Self {
+        Self { audio, cursor: 0, placed: false }
+    }
 
     fn rows(&self, snap: &PlayerSnapshot) -> Vec<Row> {
         let mut v = Vec::new();
@@ -105,7 +107,9 @@ fn row_label(row: &Row) -> (String, bool) {
 }
 
 impl Overlay for TracksOverlay {
-    fn key_contexts(&self) -> Vec<KeyContext> { vec![KeyContext::Modal] }
+    fn key_contexts(&self) -> Vec<KeyContext> {
+        vec![KeyContext::Modal]
+    }
 
     fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> OverlayOutcome {
         let rows = self.rows(ctx.player);
@@ -153,7 +157,10 @@ impl Overlay for TracksOverlay {
         let title_h = theme.font(TypeToken::Caption) * s * 2.0;
         let body_h = row_h * rows.len().max(1) as f32;
         let height = (title_h + body_h + 2.0 * pad).min(screen.height() - 2.0 * pad);
-        let panel = Rect::from_min_size(egui::pos2(screen.right() - width - pad, screen.center().y - height / 2.0).max(screen.min), egui::vec2(width, height));
+        let panel = Rect::from_min_size(
+            egui::pos2(screen.right() - width - pad, screen.center().y - height / 2.0).max(screen.min),
+            egui::vec2(width, height),
+        );
         let mut outcome = OverlayOutcome::Keep;
         // click outside closes (no theme scrim over the video)
         egui::Area::new(egui::Id::new("tracks-catcher")).movable(false).order(egui::Order::Foreground).fixed_pos(screen.min).show(egui_ctx, |ui| {
@@ -169,10 +176,26 @@ impl Overlay for TracksOverlay {
             let font = FontId::proportional((theme.font(TypeToken::Title) * s).round());
             let caption = FontId::proportional((theme.font(TypeToken::Caption) * s).round());
             let title = if self.audio { "AUDIO  ·  Tab: subtitles" } else { "SUBTITLES  ·  Tab: audio" };
-            osd_text(p, egui::pos2(panel.left() + pad, panel.top() + pad), Align2::LEFT_TOP, title, caption, with_alpha(t.osd_text, 0.7), width - 2.0 * pad);
+            osd_text(
+                p,
+                egui::pos2(panel.left() + pad, panel.top() + pad),
+                Align2::LEFT_TOP,
+                title,
+                caption,
+                with_alpha(t.osd_text, 0.7),
+                width - 2.0 * pad,
+            );
             let top = panel.top() + pad + title_h;
             if rows.is_empty() {
-                osd_text(p, egui::pos2(panel.left() + pad, top + row_h / 2.0), Align2::LEFT_CENTER, "No audio tracks", font.clone(), with_alpha(t.osd_text, 0.7), width - 2.0 * pad);
+                osd_text(
+                    p,
+                    egui::pos2(panel.left() + pad, top + row_h / 2.0),
+                    Align2::LEFT_CENTER,
+                    "No audio tracks",
+                    font.clone(),
+                    with_alpha(t.osd_text, 0.7),
+                    width - 2.0 * pad,
+                );
             }
             for (i, row) in rows.iter().enumerate() {
                 let r = Rect::from_min_size(egui::pos2(panel.left() + pad / 2.0, top + i as f32 * row_h), egui::vec2(width - pad, row_h));
@@ -191,7 +214,15 @@ impl Overlay for TracksOverlay {
                 }
                 let color = if cursor { t.osd_accent } else { t.osd_text };
                 if selected {
-                    osd_text(p, egui::pos2(r.left() + pad / 2.0, r.center().y), Align2::LEFT_CENTER, glyphs::CHECK, font.clone(), t.osd_accent, f32::INFINITY);
+                    osd_text(
+                        p,
+                        egui::pos2(r.left() + pad / 2.0, r.center().y),
+                        Align2::LEFT_CENTER,
+                        glyphs::CHECK,
+                        font.clone(),
+                        t.osd_accent,
+                        f32::INFINITY,
+                    );
                 }
                 osd_text(p, egui::pos2(r.left() + pad * 2.0, r.center().y), Align2::LEFT_CENTER, &label, font.clone(), color, r.width() - pad * 2.5);
                 if resp.clicked() {

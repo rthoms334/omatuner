@@ -100,7 +100,9 @@ pub struct ChannelMatchRow {
 
 /// `meta` key holding the running counters of an in-progress import (programmes inserted,
 /// latest stop), so `finish_epg_import` stays a few UPDATEs instead of scanning 400k rows.
-fn import_meta_key(id: EpgSourceId, generation: i64) -> String { format!("epg-import:{}:{generation}", id.0) }
+fn import_meta_key(id: EpgSourceId, generation: i64) -> String {
+    format!("epg-import:{}:{generation}", id.0)
+}
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ImportCounters {
@@ -128,8 +130,7 @@ fn slim_from_row(r: &Row<'_>) -> rusqlite::Result<ProgrammeSlim> {
 
 /// Active generation of the EPG source owning `ch`, as a scalar subquery on `?1` (keeps the
 /// `programme_grid` index usable: `epg_channel_id = ? AND gen = <const> AND start …`).
-const ACTIVE_GEN_OF_CH: &str =
-    "(SELECT es.active_gen FROM epg_channel ec JOIN epg_source es ON es.id = ec.epg_source_id WHERE ec.id = ?1)";
+const ACTIVE_GEN_OF_CH: &str = "(SELECT es.active_gen FROM epg_channel ec JOIN epg_source es ON es.id = ec.epg_source_id WHERE ec.id = ?1)";
 
 pub fn begin_epg_import(conn: &Connection, id: EpgSourceId) -> Result<EpgImport> {
     let (active, offset_min): (i64, i64) = or_not_found(
@@ -269,11 +270,10 @@ pub fn finish_epg_import(conn: &mut Connection, imp: &EpgImport, now: Timestamp)
     let key = import_meta_key(imp.epg_source, imp.generation);
     let counters: ImportCounters =
         from_json_opt(tx.query_row("SELECT value FROM meta WHERE key = ?1", [&key], |r| r.get(0)).optional()?).unwrap_or_default();
-    let channels: i64 = tx.query_row(
-        "SELECT count(*) FROM epg_channel WHERE epg_source_id = ?1 AND seen_gen = ?2",
-        params![imp.epg_source, imp.generation],
-        |r| r.get(0),
-    )?;
+    let channels: i64 =
+        tx.query_row("SELECT count(*) FROM epg_channel WHERE epg_source_id = ?1 AND seen_gen = ?2", params![imp.epg_source, imp.generation], |r| {
+            r.get(0)
+        })?;
     let n = tx.execute(
         "UPDATE epg_source SET active_gen = ?2, n_channels = ?3, n_programmes = ?4, max_stop = ?5, last_refresh = ?6,
                 last_attempt = ?6, last_error = NULL
@@ -344,8 +344,7 @@ const ABORT_CHUNK: i64 = 20_000;
 /// [`merge_fts_step`] (import job and `Maintenance`).
 pub fn sweep_old_generations(conn: &mut Connection, id: EpgSourceId, chunk: usize) -> Result<usize> {
     let active: i64 = or_not_found(conn.query_row("SELECT active_gen FROM epg_source WHERE id = ?1", [id], |r| r.get(0)), "EPG source", id)?;
-    let deletemerge: Option<i64> =
-        conn.query_row("SELECT v FROM programme_fts_config WHERE k = 'deletemerge'", [], |r| r.get(0)).optional()?;
+    let deletemerge: Option<i64> = conn.query_row("SELECT v FROM programme_fts_config WHERE k = 'deletemerge'", [], |r| r.get(0)).optional()?;
     if deletemerge != Some(0) {
         conn.execute("INSERT INTO programme_fts(programme_fts, rank) VALUES('deletemerge', 0)", [])?;
     }
@@ -401,9 +400,7 @@ pub fn delete_programmes_of(conn: &mut Connection, scope: &ProgrammeScope, chunk
 pub(crate) fn delete_programmes_in(conn: &Connection, scope: &ProgrammeScope, chunk: usize) -> Result<usize> {
     let chunk = chunk as i64;
     match scope {
-        ProgrammeScope::EpgSource(id) => {
-            delete_selected(conn, "SELECT id FROM programme WHERE epg_source_id = ?1 LIMIT ?2", params![id, chunk])
-        }
+        ProgrammeScope::EpgSource(id) => delete_selected(conn, "SELECT id FROM programme WHERE epg_source_id = ?1 LIMIT ?2", params![id, chunk]),
         ProgrammeScope::EpgChannels(ids) => delete_selected(
             conn,
             "SELECT id FROM programme WHERE epg_channel_id IN (SELECT value FROM json_each(?1)) LIMIT ?2",
@@ -667,17 +664,9 @@ pub fn channels_for_matching(conn: &Connection, source: SourceId) -> Result<Vec<
 }
 
 /// Replace automatic mappings for (source, epg_source); manual rows are preserved.
-pub fn replace_auto_mappings(
-    conn: &mut Connection,
-    source: SourceId,
-    epg_source: EpgSourceId,
-    maps: &[EpgMapping],
-) -> Result<()> {
+pub fn replace_auto_mappings(conn: &mut Connection, source: SourceId, epg_source: EpgSourceId, maps: &[EpgMapping]) -> Result<()> {
     let tx = conn.transaction()?;
-    tx.execute(
-        "DELETE FROM channel_epg_map WHERE source_id = ?1 AND epg_source_id = ?2 AND method != 'manual'",
-        params![source, epg_source],
-    )?;
+    tx.execute("DELETE FROM channel_epg_map WHERE source_id = ?1 AND epg_source_id = ?2 AND method != 'manual'", params![source, epg_source])?;
     {
         // a manual row for the same (channel, epg source) wins: DO NOTHING
         let mut ins = tx.prepare_cached(

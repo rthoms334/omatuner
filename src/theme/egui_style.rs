@@ -83,7 +83,9 @@ fn visuals(theme: &Theme) -> Visuals {
     v
 }
 
-fn margin(px: f32) -> Margin { Margin::same(px.round().clamp(0.0, 127.0) as i8) }
+fn margin(px: f32) -> Margin {
+    Margin::same(px.round().clamp(0.0, 127.0) as i8)
+}
 
 #[cfg(test)]
 mod tests {

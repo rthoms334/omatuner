@@ -46,7 +46,9 @@ impl<S: Screen> App<S> {
         }
         self.t.config = Arc::new(c);
     }
-    fn nav(&mut self) -> Vec<NavRequest> { std::mem::take(&mut self.t.nav) }
+    fn nav(&mut self) -> Vec<NavRequest> {
+        std::mem::take(&mut self.t.nav)
+    }
 }
 
 fn harness<S: Screen + 'static>(t: TestUi, s: S, route: Route) -> Harness<'static, App<S>> {
@@ -65,7 +67,9 @@ fn harness<S: Screen + 'static>(t: TestUi, s: S, route: Route) -> Harness<'stati
     h
 }
 
-fn has<T>(h: &Harness<'static, T>, label: &str) -> bool { h.query_all_by_label(label).next().is_some() }
+fn has<T>(h: &Harness<'static, T>, label: &str) -> bool {
+    h.query_all_by_label(label).next().is_some()
+}
 
 fn press<S: Screen>(h: &mut Harness<'static, App<S>>, a: Action) {
     h.state_mut().act(a);

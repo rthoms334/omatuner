@@ -77,7 +77,11 @@ impl GridState {
                 }
             }
             Action::Left if self.len > 0 && self.cursor.is_multiple_of(cols) => {
-                if self.filter.is_active() { ListOutcome::None } else { ListOutcome::Parent }
+                if self.filter.is_active() {
+                    ListOutcome::None
+                } else {
+                    ListOutcome::Parent
+                }
             }
             Action::Left => self.move_to(self.cursor.saturating_sub(1)),
             Action::Right if self.cursor + 1 < self.len && !(self.cursor + 1).is_multiple_of(cols) => self.move_to(self.cursor + 1),
@@ -245,7 +249,10 @@ pub(crate) fn poster_tile(
     let p = ui.painter();
     let corner = |p: &egui::Painter, glyph: &str, color: egui::Color32, slot: f32| {
         let size = theme.font(TypeToken::Icon) + 2.0 * theme.space(SpaceToken::Xs);
-        let r = Rect::from_min_size(egui::pos2(poster.right() - size * (slot + 1.0) - theme.space(SpaceToken::Xs) * slot, poster.top()), egui::vec2(size, size));
+        let r = Rect::from_min_size(
+            egui::pos2(poster.right() - size * (slot + 1.0) - theme.space(SpaceToken::Xs) * slot, poster.top()),
+            egui::vec2(size, size),
+        );
         p.rect_filled(r, t.rounding, with_alpha(t.bg, 0.85));
         p.text(r.center(), Align2::CENTER_CENTER, glyph, paint::font(theme, TypeToken::Icon), color);
     };
@@ -276,7 +283,8 @@ pub(crate) fn poster_tile(
         let r = paint::text(p, egui::pos2(left, y), Align2::LEFT_TOP, glyphs::PLAY, paint::font(theme, TypeToken::Body), t.accent, f32::INFINITY);
         left = r.right() + theme.space(SpaceToken::Sm);
     }
-    let mut job = egui::text::LayoutJob::simple(item.name.to_string(), paint::font(theme, TypeToken::Body), title_color, (rect.right() - left).max(1.0));
+    let mut job =
+        egui::text::LayoutJob::simple(item.name.to_string(), paint::font(theme, TypeToken::Body), title_color, (rect.right() - left).max(1.0));
     job.wrap.max_rows = 2;
     job.wrap.break_anywhere = false;
     job.wrap.overflow_character = Some('…');
@@ -360,7 +368,8 @@ pub(crate) fn poster_grid_with(
                         let Some(item) = all.get(idx as usize) else { continue };
                         let x = row_rect.left() + col as f32 * (card_w + gap);
                         let cell = Rect::from_min_size(egui::pos2(x, row_rect.top()), egui::vec2(card_w, row_h - gap));
-                        let mut child = ui.new_child(egui::UiBuilder::new().id_salt(("poster", i)).max_rect(cell).layout(egui::Layout::top_down(egui::Align::Min)));
+                        let mut child = ui
+                            .new_child(egui::UiBuilder::new().id_salt(("poster", i)).max_rect(cell).layout(egui::Layout::top_down(egui::Align::Min)));
                         let current = i == cursor;
                         let d = TileDecor { selected: current && !focused, ..decor(idx, item) };
                         let resp = poster_tile(&mut child, theme, images, item, card_w, current && focused, d);

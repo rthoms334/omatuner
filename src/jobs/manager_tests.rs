@@ -60,7 +60,10 @@ async fn server(scripts: HashMap<&'static str, Script>) -> Server {
                         let _ = gate_rx.wait_for(|_| false).await; // forever (until the server drops)
                     }
                     Some(Script::Gated(body)) => {
-                        let head = format!("HTTP/1.1 200 OK\r\nContent-Type: audio/x-mpegurl\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: audio/x-mpegurl\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
                         let split = body.len().min(300 * 1024);
                         if sock.write_all(head.as_bytes()).await.is_err() || sock.write_all(&body[..split]).await.is_err() {
                             return;
@@ -147,7 +150,9 @@ impl Harness {
         self.jobs.context().store.writer().run(move |c| crate::store::sources::insert_source(c, &draft, 0)).await.unwrap()
     }
 
-    fn status(&self, id: JobId) -> Option<JobStatus> { self.jobs.active().into_iter().find(|s| s.id == id) }
+    fn status(&self, id: JobId) -> Option<JobStatus> {
+        self.jobs.active().into_iter().find(|s| s.id == id)
+    }
 
     async fn wait_phase(&self, id: JobId, pred: impl Fn(&JobPhase) -> bool) -> JobStatus {
         for _ in 0..2000 {
@@ -186,7 +191,9 @@ impl Harness {
     }
 }
 
-fn refresh(source: SourceId, force: bool) -> JobKind { JobKind::RefreshSource { source, force } }
+fn refresh(source: SourceId, force: bool) -> JobKind {
+    JobKind::RefreshSource { source, force }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn coalesces_while_queued_or_connecting_and_upgrades_force() {
@@ -300,14 +307,8 @@ async fn a_cancelled_import_never_sweeps() {
     assert_eq!(old, 100, "no sweep after a cancelled import");
     assert!(new > 0 && new < 150_000, "{new} new rows");
     assert_eq!(h.count("SELECT generation FROM source WHERE id = ?1", s), gen0, "generation not bumped");
-    let last_error: Option<String> = h
-        .jobs
-        .context()
-        .store
-        .reader()
-        .unwrap()
-        .query_row("SELECT last_error FROM source WHERE id = ?1", [s], |r| r.get(0))
-        .unwrap();
+    let last_error: Option<String> =
+        h.jobs.context().store.reader().unwrap().query_row("SELECT last_error FROM source WHERE id = ?1", [s], |r| r.get(0)).unwrap();
     assert_eq!(last_error, None, "a cancellation is not a failure");
 }
 
@@ -321,14 +322,8 @@ async fn failures_finish_with_a_redacted_message_and_the_manager_keeps_going() {
     let (_, outcome) = h.finished(|k| matches!(k, JobKind::RefreshSource { .. })).await;
     let msg = outcome.unwrap_err();
     assert!(!msg.contains(secret), "{msg}");
-    let stored: Option<String> = h
-        .jobs
-        .context()
-        .store
-        .reader()
-        .unwrap()
-        .query_row("SELECT last_error FROM source WHERE id = ?1", [s], |r| r.get(0))
-        .unwrap();
+    let stored: Option<String> =
+        h.jobs.context().store.reader().unwrap().query_row("SELECT last_error FROM source WHERE id = ?1", [s], |r| r.get(0)).unwrap();
     let stored = stored.expect("failure recorded");
     assert!(!stored.contains(secret), "{stored}");
     // a missing source is an error, not a panic; the manager still serves jobs
@@ -497,7 +492,8 @@ async fn shutdown_waits_for_the_wind_down_of_cancelled_jobs() {
     let (id, outcome) = h.finished(|k| matches!(k, JobKind::RefreshEpg { .. })).await;
     assert_eq!((id, outcome.unwrap_err()), (job, "cancelled".to_owned()));
     // the partial guide is gone already: nothing left for a later sweep
-    let partial: i64 = h.jobs.context().store.reader().unwrap().query_row("SELECT count(*) FROM programme WHERE epg_source_id = ?1", [g], |r| r.get(0)).unwrap();
+    let partial: i64 =
+        h.jobs.context().store.reader().unwrap().query_row("SELECT count(*) FROM programme WHERE epg_source_id = ?1", [g], |r| r.get(0)).unwrap();
     assert_eq!(partial, 0);
 }
 

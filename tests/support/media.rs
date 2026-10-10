@@ -44,9 +44,7 @@ pub fn ensure_media() -> Option<PathBuf> {
 }
 
 fn target_dir() -> PathBuf {
-    std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"))
+    std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"))
 }
 
 fn is_complete(dir: &Path) -> bool {
@@ -167,7 +165,9 @@ impl TestServer {
     }
 
     /// `base` + `/path`.
-    pub fn url(&self, path: &str) -> String { format!("{}/{}", self.base, path.trim_start_matches('/')) }
+    pub fn url(&self, path: &str) -> String {
+        format!("{}/{}", self.base, path.trim_start_matches('/'))
+    }
 
     /// Answer every request for `path` (e.g. `/a.ts`) with `status` (0 = back to normal).
     pub fn set_status(&self, path: &str, status: u16) {
@@ -180,22 +180,36 @@ impl TestServer {
     }
 
     /// Limit every response body to `bps` bytes per second (`None` = unlimited).
-    pub fn set_throttle(&self, bps: Option<u64>) { *self.shared.throttle_bps.lock().unwrap() = bps; }
+    pub fn set_throttle(&self, bps: Option<u64>) {
+        *self.shared.throttle_bps.lock().unwrap() = bps;
+    }
 
     /// Close the listener (connection refused) and reset every open connection.
-    pub fn kill(&self) { let _ = self.ctl.send(Ctl::Kill); }
+    pub fn kill(&self) {
+        let _ = self.ctl.send(Ctl::Kill);
+    }
 
     /// Listen again on the same port.
-    pub fn revive(&self) { let _ = self.ctl.send(Ctl::Revive); }
+    pub fn revive(&self) {
+        let _ = self.ctl.send(Ctl::Revive);
+    }
 
-    pub fn requests(&self) -> Vec<Request> { self.shared.requests.lock().unwrap().clone() }
+    pub fn requests(&self) -> Vec<Request> {
+        self.shared.requests.lock().unwrap().clone()
+    }
 
-    pub fn requests_for(&self, path: &str) -> Vec<Request> { self.requests().into_iter().filter(|r| r.path == path).collect() }
+    pub fn requests_for(&self, path: &str) -> Vec<Request> {
+        self.requests().into_iter().filter(|r| r.path == path).collect()
+    }
 
     /// Highest number of simultaneously open connections so far.
-    pub fn max_concurrent(&self) -> usize { self.shared.max_active.load(Ordering::SeqCst) }
+    pub fn max_concurrent(&self) -> usize {
+        self.shared.max_active.load(Ordering::SeqCst)
+    }
 
-    pub fn active(&self) -> usize { self.shared.active.load(Ordering::SeqCst) }
+    pub fn active(&self) -> usize {
+        self.shared.active.load(Ordering::SeqCst)
+    }
 }
 
 impl Drop for TestServer {
@@ -304,11 +318,7 @@ async fn connection(mut stream: TcpStream, ctx: Arc<Ctx>) {
         Some(live_playlist(ctx.epoch.elapsed()).into_bytes())
     } else {
         let rel = path.strip_prefix("/live/").map(|f| format!("long/{f}")).unwrap_or_else(|| path.trim_start_matches('/').to_owned());
-        if rel.split('/').any(|c| c == ".." || c.is_empty()) {
-            None
-        } else {
-            tokio::fs::read(ctx.dir.join(rel)).await.ok()
-        }
+        if rel.split('/').any(|c| c == ".." || c.is_empty()) { None } else { tokio::fs::read(ctx.dir.join(rel)).await.ok() }
     };
     let Some(body) = body else {
         set_status(404);
@@ -418,11 +428,8 @@ fn parse_range(v: &str, total: u64) -> Option<(u64, u64)> {
 
 async fn respond_error(stream: &mut TcpStream, code: u16) -> std::io::Result<()> {
     let body = format!("{code} {}\n", reason(code));
-    let head = format!(
-        "HTTP/1.1 {code} {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        reason(code),
-        body.len()
-    );
+    let head =
+        format!("HTTP/1.1 {code} {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", reason(code), body.len());
     stream.write_all(head.as_bytes()).await?;
     stream.shutdown().await.or_else(|e| if e.kind() == ErrorKind::NotConnected { Ok(()) } else { Err(e) })
 }

@@ -19,13 +19,17 @@ use tuner::store::{Store, library, sources};
 const T0: Timestamp = 1_791_576_000;
 const H: i64 = 3600;
 
-fn store(name: &str) -> Store { Store::open_temp(name, None).expect("temp store") }
+fn store(name: &str) -> Store {
+    Store::open_temp(name, None).expect("temp store")
+}
 
 fn w<R: Send + 'static>(s: &Store, f: impl FnOnce(&mut Connection) -> tuner::error::Result<R> + Send + 'static) -> R {
     s.writer().blocking(f).expect("writer job")
 }
 
-fn count(c: &Connection, sql: &str) -> i64 { c.query_row(sql, [], |r| r.get(0)).unwrap() }
+fn count(c: &Connection, sql: &str) -> i64 {
+    c.query_row(sql, [], |r| r.get(0)).unwrap()
+}
 
 /// Programme and FTS rows agree: every FTS row belongs to a programme and vice versa.
 fn assert_fts_consistent(c: &Connection) {
@@ -84,8 +88,7 @@ fn import_guide(s: &Store, src: EpgSourceId, chans: Vec<ImportEpgChannel>, progs
 }
 
 fn epg_id(c: &Connection, src: EpgSourceId, xmltv_id: &str) -> EpgChannelId {
-    c.query_row("SELECT id FROM epg_channel WHERE epg_source_id = ?1 AND xmltv_id = ?2", rusqlite::params![src, xmltv_id], |r| r.get(0))
-        .unwrap()
+    c.query_row("SELECT id FROM epg_channel WHERE epg_source_id = ?1 AND xmltv_id = ?2", rusqlite::params![src, xmltv_id], |r| r.get(0)).unwrap()
 }
 
 /// A playlist source with one channel per `(key, name, tvg_id, tvg_shift)`.
@@ -131,7 +134,13 @@ fn playlist(s: &Store, chans: &[(&str, &str, Option<&str>, i32)]) -> SourceId {
             T0,
         )?;
         let imp = import::begin_catalogue(c, src, T0)?;
-        let g = ImportGroup { kind: ItemKind::Channel, key: group_key(ItemKind::Channel, "All"), name: "All".into(), provider_id: None, provider_order: 0 };
+        let g = ImportGroup {
+            kind: ItemKind::Channel,
+            key: group_key(ItemKind::Channel, "All"),
+            name: "All".into(),
+            provider_id: None,
+            provider_order: 0,
+        };
         import::upsert_groups(c, &imp, &[g])?;
         import::write_channels(c, &imp, &chans)?;
         import::finish_catalogue(c, &imp, &[ItemKind::Channel], T0)?;
@@ -160,9 +169,13 @@ fn channel_id(c: &Connection, src: SourceId, key: &str) -> ChannelId {
     c.query_row("SELECT id FROM channel WHERE source_id = ?1 AND key = ?2", rusqlite::params![src, key], |r| r.get(0)).unwrap()
 }
 
-fn ch_ref(src: SourceId, key: &str) -> ItemRef { ItemRef { source: src, kind: ItemKind::Channel, key: ItemKey(key.into()) } }
+fn ch_ref(src: SourceId, key: &str) -> ItemRef {
+    ItemRef { source: src, kind: ItemKind::Channel, key: ItemKey(key.into()) }
+}
 
-fn titles(v: &[ProgrammeSlim]) -> Vec<&str> { v.iter().map(|p| &*p.title).collect() }
+fn titles(v: &[ProgrammeSlim]) -> Vec<&str> {
+    v.iter().map(|p| &*p.title).collect()
+}
 
 // ------------------------------------------------------------------ generations
 
@@ -515,9 +528,7 @@ fn mapping_resolution_manual_priority_method_and_fallbacks() {
     assert_eq!(maps[0].method, EpgMatchMethod::Manual);
     assert_eq!((maps[0].epg_source_id, maps[0].xmltv_id.as_str()), (g1, "b.tv"));
     assert_eq!(maps.len(), 2);
-    let fp: String = r
-        .query_row("SELECT fp FROM channel_epg_map WHERE method = 'manual'", [], |row| row.get(0))
-        .unwrap();
+    let fp: String = r.query_row("SELECT fp FROM channel_epg_map WHERE method = 'manual'", [], |row| row.get(0)).unwrap();
     assert!(fp.contains("\"tvg_id\":\"a.tv\""), "manual rows carry the channel fingerprint: {fp}");
     // re-assigning to another guide keeps one manual row per channel
     let ra3 = ra.clone();

@@ -26,8 +26,8 @@ use crate::config::{Config, Density, IdleInhibitMode, SidebarMode, StartScreen, 
 use crate::jobs::{JobEvent, JobKind, JobOutcome};
 use crate::keymap::{Action, KeyContext};
 use crate::model::{
-    AccountStatus, ChannelId, EpgSource, EpgSourceId, EpgSourceKind, FavListId, GroupId, ItemKind, ItemRef, JobId, LiveFormat, Reminder, ReminderId, SortMode, Source,
-    SourceColor, SourceId, SourceKind,
+    AccountStatus, ChannelId, EpgSource, EpgSourceId, EpgSourceKind, FavListId, GroupId, ItemKind, ItemRef, JobId, LiveFormat, Reminder, ReminderId,
+    SortMode, Source, SourceColor, SourceId, SourceKind,
 };
 use crate::msg::{AppEvent, DataScope, Toast};
 use crate::platform::{PickPurpose, PlatformEvent};
@@ -38,9 +38,9 @@ use crate::ui::overlays::{ConfirmSpec, ContextMenuSpec, MenuItem, OverlayResult,
 use crate::ui::parental::{hash_pin, new_salt};
 use crate::ui::widgets::button::{ButtonStyle, icon_button};
 use crate::ui::widgets::list::paint_row_state;
+use crate::ui::widgets::rows::grouped;
 use crate::ui::widgets::text_field::text_field;
 use crate::ui::widgets::toggle::toggle;
-use crate::ui::widgets::rows::grouped;
 use crate::ui::widgets::{RowState, empty_state, glyphs, rows, section};
 use crate::ui::{LayoutClass, OnboardingStart, OverlayRequest, Route, Screen, ScreenId, SettingsPage, UiCtx};
 
@@ -92,8 +92,11 @@ pub(crate) struct CfgText {
 }
 
 const SORT_LIVE: [SortMode; 5] = [SortMode::Provider, SortMode::Number, SortMode::NameAsc, SortMode::NameDesc, SortMode::RecentlyAdded];
-const SORT_VOD: [SortMode; 6] = [SortMode::RecentlyAdded, SortMode::NameAsc, SortMode::NameDesc, SortMode::Year, SortMode::Rating, SortMode::Provider];
-fn pos<T: PartialEq>(all: &[T], v: &T) -> usize { all.iter().position(|x| x == v).unwrap_or(0) }
+const SORT_VOD: [SortMode; 6] =
+    [SortMode::RecentlyAdded, SortMode::NameAsc, SortMode::NameDesc, SortMode::Year, SortMode::Rating, SortMode::Provider];
+fn pos<T: PartialEq>(all: &[T], v: &T) -> usize {
+    all.iter().position(|x| x == v).unwrap_or(0)
+}
 
 macro_rules! toggle_row {
     ($label:expr, $($path:ident).+) => {
@@ -150,9 +153,24 @@ static PLAYER_SUB: CfgChoice = CfgChoice {
     set: |c, i| c.player.sub_auto = [SubtitleAuto::Off, SubtitleAuto::Forced, SubtitleAuto::Always][i],
 };
 static PLAYER_TEXT: [CfgText; 4] = [
-    CfgText { label: "Audio languages", placeholder: "eng, en", get: |c| c.player.audio_langs.join(", "), set: |c, v| c.player.audio_langs = split_list(&v) },
-    CfgText { label: "Subtitle languages", placeholder: "eng, en", get: |c| c.player.sub_langs.join(", "), set: |c, v| c.player.sub_langs = split_list(&v) },
-    CfgText { label: "Default User-Agent", placeholder: "VLC/3.0.21 LibVLC/3.0.21", get: |c| c.player.user_agent.clone(), set: |c, v| c.player.user_agent = v.trim().to_owned() },
+    CfgText {
+        label: "Audio languages",
+        placeholder: "eng, en",
+        get: |c| c.player.audio_langs.join(", "),
+        set: |c, v| c.player.audio_langs = split_list(&v),
+    },
+    CfgText {
+        label: "Subtitle languages",
+        placeholder: "eng, en",
+        get: |c| c.player.sub_langs.join(", "),
+        set: |c, v| c.player.sub_langs = split_list(&v),
+    },
+    CfgText {
+        label: "Default User-Agent",
+        placeholder: "VLC/3.0.21 LibVLC/3.0.21",
+        get: |c| c.player.user_agent.clone(),
+        set: |c, v| c.player.user_agent = v.trim().to_owned(),
+    },
     CfgText {
         label: "Advanced mpv options",
         placeholder: "key=value; key=value",
@@ -232,7 +250,12 @@ static IFACE_N: [CfgNumber; 4] = [
     number_row!("Remind me before", "min", 0.0, 60.0, 1.0, u32, reminders.lead_min),
 ];
 static IFACE_TEXT: [CfgText; 2] = [
-    CfgText { label: "Font family", placeholder: "monospace", get: |c| c.fonts.family.clone(), set: |c, v| c.fonts.family = if v.trim().is_empty() { "monospace".into() } else { v.trim().to_owned() } },
+    CfgText {
+        label: "Font family",
+        placeholder: "monospace",
+        get: |c| c.fonts.family.clone(),
+        set: |c, v| c.fonts.family = if v.trim().is_empty() { "monospace".into() } else { v.trim().to_owned() },
+    },
     CfgText {
         label: "Extra font files",
         placeholder: "/path/a.ttf, /path/b.otf",
@@ -243,7 +266,9 @@ static IFACE_TEXT: [CfgText; 2] = [
 static PARENTAL_RELOCK: CfgNumber = number_row!("Lock again after", "min (0 = until restart)", 0.0, 480.0, 5.0, u32, parental.relock_min);
 
 /// "eng, en ,de" → ["eng", "en", "de"].
-pub(crate) fn split_list(s: &str) -> Vec<String> { s.split([',', ';']).map(str::trim).filter(|x| !x.is_empty()).map(str::to_owned).collect() }
+pub(crate) fn split_list(s: &str) -> Vec<String> {
+    s.split([',', ';']).map(str::trim).filter(|x| !x.is_empty()).map(str::to_owned).collect()
+}
 
 /// "a=1; b = two" → {a: 1, b: two} (entries without `=` are ignored).
 pub(crate) fn parse_mpv_options(s: &str) -> std::collections::BTreeMap<String, String> {
@@ -331,10 +356,23 @@ impl Local {
     fn is_text(self) -> bool {
         matches!(
             self,
-            Local::NewEpgUrl | Local::NewListName | Local::PinNew | Local::PinConfirm | Local::SrcName | Local::SrcUrl | Local::SrcServer | Local::SrcUser | Local::SrcPassword | Local::SrcUa | Local::SrcTz | Local::AttachFilter
+            Local::NewEpgUrl
+                | Local::NewListName
+                | Local::PinNew
+                | Local::PinConfirm
+                | Local::SrcName
+                | Local::SrcUrl
+                | Local::SrcServer
+                | Local::SrcUser
+                | Local::SrcPassword
+                | Local::SrcUa
+                | Local::SrcTz
+                | Local::AttachFilter
         )
     }
-    fn is_toggle(self) -> bool { matches!(self, Local::BackupPasswords | Local::BackupHistory | Local::SrcProviderEpg | Local::SrcSmartNames | Local::SrcImportVod) }
+    fn is_toggle(self) -> bool {
+        matches!(self, Local::BackupPasswords | Local::BackupHistory | Local::SrcProviderEpg | Local::SrcSmartNames | Local::SrcImportVod)
+    }
 }
 
 #[derive(Clone)]
@@ -351,8 +389,12 @@ enum Row {
 }
 
 impl Row {
-    fn focusable(&self) -> bool { !matches!(self, Row::Section(_) | Row::Note(..)) }
-    fn is_text(&self) -> bool { matches!(self, Row::Text(_)) || matches!(self, Row::Local { field, .. } if field.is_text()) }
+    fn focusable(&self) -> bool {
+        !matches!(self, Row::Section(_) | Row::Note(..))
+    }
+    fn is_text(&self) -> bool {
+        matches!(self, Row::Text(_)) || matches!(self, Row::Local { field, .. } if field.is_text())
+    }
 }
 
 /// The source editor's working copy.
@@ -410,13 +452,22 @@ impl SourceEditor {
         s.color = super::onboarding::COLORS.get(self.color).map(|c| c.0).unwrap_or_default();
         match s.kind {
             SourceKind::Xtream => {
-                let server = crate::sources::xtream::urls::normalize_server(&self.server).ok_or((Local::SrcServer, "Enter the server address, e.g. panel.example.com:8080".to_owned()))?;
+                let server = crate::sources::xtream::urls::normalize_server(&self.server)
+                    .ok_or((Local::SrcServer, "Enter the server address, e.g. panel.example.com:8080".to_owned()))?;
                 if self.user.trim().is_empty() {
                     return Err((Local::SrcUser, "Enter the username".into()));
                 }
                 let old = s.xtream.clone();
-                let password = if self.password.is_empty() { old.as_ref().map(|x| x.password.expose().clone()).unwrap_or_default() } else { self.password.clone() };
-                s.xtream = Some(crate::model::XtreamCredentials { server, username: self.user.trim().to_owned(), password: crate::redact::Secret::new(password) });
+                let password = if self.password.is_empty() {
+                    old.as_ref().map(|x| x.password.expose().clone()).unwrap_or_default()
+                } else {
+                    self.password.clone()
+                };
+                s.xtream = Some(crate::model::XtreamCredentials {
+                    server,
+                    username: self.user.trim().to_owned(),
+                    password: crate::redact::Secret::new(password),
+                });
             }
             SourceKind::M3uUrl => {
                 let u = self.url.trim();
@@ -445,7 +496,8 @@ impl SourceEditor {
         let o = &self.original;
         let refresh = s.url != o.url
             || s.path != o.path
-            || s.xtream.as_ref().map(|x| (&x.server, &x.username, x.password.expose())) != o.xtream.as_ref().map(|x| (&x.server, &x.username, x.password.expose()))
+            || s.xtream.as_ref().map(|x| (&x.server, &x.username, x.password.expose()))
+                != o.xtream.as_ref().map(|x| (&x.server, &x.username, x.password.expose()))
             || s.settings != o.settings;
         Ok((s, refresh))
     }
@@ -549,7 +601,9 @@ pub struct SettingsScreen {
 const OFFSET_SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// "channel 1" (the name the orphan had) or its key.
-fn orphan_name(o: &Orphan) -> String { if o.fingerprint.norm_name.is_empty() { o.item.key.to_string() } else { o.fingerprint.norm_name.clone() } }
+fn orphan_name(o: &Orphan) -> String {
+    if o.fingerprint.norm_name.is_empty() { o.item.key.to_string() } else { o.fingerprint.norm_name.clone() }
+}
 
 impl SettingsScreen {
     fn reload(&mut self, ctx: &UiCtx<'_>) {
@@ -577,7 +631,9 @@ impl SettingsScreen {
         self.reload(ctx);
     }
 
-    fn parental_locked(&self, ctx: &UiCtx<'_>) -> bool { ctx.config.parental.pin_hash.is_some() && !ctx.parental.is_unlocked(&ctx.config.parental) && ctx.config.parental.enabled }
+    fn parental_locked(&self, ctx: &UiCtx<'_>) -> bool {
+        ctx.config.parental.pin_hash.is_some() && !ctx.parental.is_unlocked(&ctx.config.parental) && ctx.config.parental.enabled
+    }
 
     fn token(&mut self, p: Pending) -> u64 {
         self.next_token += 1;
@@ -595,7 +651,14 @@ impl SettingsScreen {
             return self.editor_rows(e);
         }
         let mut v = Vec::new();
-        let item = |item: Item, icon: &str, label: String, detail: Option<String>| Row::Item { item, icon: icon.to_owned(), color: None, label, detail, reorder: false };
+        let item = |item: Item, icon: &str, label: String, detail: Option<String>| Row::Item {
+            item,
+            icon: icon.to_owned(),
+            color: None,
+            label,
+            detail,
+            reorder: false,
+        };
         match self.page {
             SettingsPage::Playlists => {
                 v.push(Row::Section("Playlists".into()));
@@ -610,7 +673,12 @@ impl SettingsScreen {
                         icon: if s.icon.is_empty() { glyphs::PLAYLIST.to_owned() } else { s.icon.clone() },
                         color: Some(s.color),
                         label: s.name.clone(),
-                        detail: Some(source_detail(s, ctx.now, running.map(|j| super::onboarding::phase_text(&j.phase)), self.guide_counts.1.get(&s.id).copied())),
+                        detail: Some(source_detail(
+                            s,
+                            ctx.now,
+                            running.map(|j| super::onboarding::phase_text(&j.phase)),
+                            self.guide_counts.1.get(&s.id).copied(),
+                        )),
                         reorder: true,
                     });
                 }
@@ -628,7 +696,9 @@ impl SettingsScreen {
                     let kind = match &e.kind {
                         EpgSourceKind::Url { url } => crate::redact::redact_url(url.expose()),
                         EpgSourceKind::File { path } => path.display().to_string(),
-                        EpgSourceKind::Provider { source_id, .. } => format!("from {}", ctx.lib.source(*source_id).map(|s| s.name.as_str()).unwrap_or("a playlist")),
+                        EpgSourceKind::Provider { source_id, .. } => {
+                            format!("from {}", ctx.lib.source(*source_id).map(|s| s.name.as_str()).unwrap_or("a playlist"))
+                        }
                     };
                     let mut parts = vec![kind];
                     if !e.enabled {
@@ -639,14 +709,24 @@ impl SettingsScreen {
                     }
                     // coverage first: a guide that lists 2 of 11 249 channels must say so
                     if e.last_refresh.is_some() {
-                        parts.insert(usize::from(!e.enabled), coverage_text(e, self.epg_matches.get(&e.id).copied().unwrap_or(0), ctx.lib.live.channels.len()));
+                        parts.insert(
+                            usize::from(!e.enabled),
+                            coverage_text(e, self.epg_matches.get(&e.id).copied().unwrap_or(0), ctx.lib.live.channels.len()),
+                        );
                     }
                     match (&e.last_error, e.last_refresh) {
                         (Some(err), _) => parts.push(format!("Failed: {}", crate::redact::redact(err))),
                         (None, Some(t)) => parts.push(format!("Updated {}", kit::ago(ctx.now, t))),
                         (None, None) => parts.push("Not imported yet".into()),
                     }
-                    v.push(Row::Item { item: Item::Epg(e.id), icon: glyphs::GUIDE.to_owned(), color: None, label: e.name.clone(), detail: Some(parts.join(" · ")), reorder: true });
+                    v.push(Row::Item {
+                        item: Item::Epg(e.id),
+                        icon: glyphs::GUIDE.to_owned(),
+                        color: None,
+                        label: e.name.clone(),
+                        detail: Some(parts.join(" · ")),
+                        reorder: true,
+                    });
                 }
                 if let Some(note) = coverage_note(&self.epg_sources, self.guide_counts.1.values().sum(), ctx.lib.live.channels.len()) {
                     v.push(Row::Note(note, true));
@@ -707,7 +787,14 @@ impl SettingsScreen {
                 for l in &ctx.favs.lists {
                     let n = ctx.favs.items(l.id).len();
                     let detail = if l.is_default { format!("{n} items · the default list (Ctrl+F)") } else { format!("{n} items") };
-                    v.push(Row::Item { item: Item::List(l.id), icon: if l.icon.is_empty() { glyphs::FAV_LIST.into() } else { l.icon.clone() }, color: None, label: l.name.clone(), detail: Some(detail), reorder: true });
+                    v.push(Row::Item {
+                        item: Item::List(l.id),
+                        icon: if l.icon.is_empty() { glyphs::FAV_LIST.into() } else { l.icon.clone() },
+                        color: None,
+                        label: l.name.clone(),
+                        detail: Some(detail),
+                        reorder: true,
+                    });
                 }
                 v.push(Row::Local { field: Local::NewListName, label: "New list" });
                 v.push(Row::Act { act: Act::NewList, icon: glyphs::ADD, label: "Create list".into(), danger: false });
@@ -718,7 +805,12 @@ impl SettingsScreen {
                     v.push(Row::Note("No reminders. Press r on a future programme in the guide.".into(), false));
                 }
                 for r in &self.reminders {
-                    v.push(item(Item::Reminder(r.id), glyphs::REMINDER, r.programme_title.clone(), Some(format!("{} · {} · {}", r.channel_name, kit::day_time(r.start, ctx.config.interface.clock_24h), kit::date(r.start)))));
+                    v.push(item(
+                        Item::Reminder(r.id),
+                        glyphs::REMINDER,
+                        r.programme_title.clone(),
+                        Some(format!("{} · {} · {}", r.channel_name, kit::day_time(r.start, ctx.config.interface.clock_24h), kit::date(r.start))),
+                    ));
                 }
             }
             SettingsPage::Parental => {
@@ -735,7 +827,12 @@ impl SettingsScreen {
                 }
                 v.push(Row::Local { field: Local::PinNew, label: "New PIN" });
                 v.push(Row::Local { field: Local::PinConfirm, label: "Repeat the PIN" });
-                v.push(Row::Act { act: Act::SetPin, icon: glyphs::LOCK, label: if has_pin { "Change PIN".into() } else { "Set PIN".into() }, danger: false });
+                v.push(Row::Act {
+                    act: Act::SetPin,
+                    icon: glyphs::LOCK,
+                    label: if has_pin { "Change PIN".into() } else { "Set PIN".into() },
+                    danger: false,
+                });
                 if has_pin {
                     v.push(Row::Act { act: Act::RemovePin, icon: glyphs::UNLOCK, label: "Remove PIN…".into(), danger: true });
                 }
@@ -755,7 +852,8 @@ impl SettingsScreen {
             }
             SettingsPage::Hidden => {
                 v.push(Row::Section("Hidden groups".into()));
-                let groups: Vec<&crate::model::Group> = ctx.lib.live.groups.iter().chain(&ctx.lib.vod.movie_groups).chain(&ctx.lib.vod.series_groups).filter(|g| g.hidden).collect();
+                let groups: Vec<&crate::model::Group> =
+                    ctx.lib.live.groups.iter().chain(&ctx.lib.vod.movie_groups).chain(&ctx.lib.vod.series_groups).filter(|g| g.hidden).collect();
                 if groups.is_empty() {
                     v.push(Row::Note("Nothing hidden.".into(), false));
                 }
@@ -815,7 +913,9 @@ impl SettingsScreen {
         let l = |field, label| Row::Local { field, label };
         v.extend([l(Local::SrcName, "Name"), l(Local::SrcIcon, "Icon"), l(Local::SrcColor, "Colour")]);
         match e.original.kind {
-            SourceKind::Xtream => v.extend([l(Local::SrcServer, "Server"), l(Local::SrcUser, "Username"), l(Local::SrcPassword, "Password (empty = keep)")]),
+            SourceKind::Xtream => {
+                v.extend([l(Local::SrcServer, "Server"), l(Local::SrcUser, "Username"), l(Local::SrcPassword, "Password (empty = keep)")])
+            }
             SourceKind::M3uUrl => v.push(l(Local::SrcUrl, "Playlist URL")),
             SourceKind::M3uFile => v.push(l(Local::SrcUrl, "Playlist file")),
         }
@@ -849,7 +949,14 @@ impl SettingsScreen {
         v.push(Row::Note(format!("{} ({}) — pick the item it became", orphan_name(o), o.item.kind.as_str()), false));
         v.push(Row::Local { field: Local::AttachFilter, label: "Filter" });
         for (i, (_, label)) in a.candidates.iter().enumerate().take(200) {
-            v.push(Row::Item { item: Item::AttachTarget(i), icon: glyphs::CHEVRON_RIGHT.into(), color: None, label: label.clone(), detail: None, reorder: false });
+            v.push(Row::Item {
+                item: Item::AttachTarget(i),
+                icon: glyphs::CHEVRON_RIGHT.into(),
+                color: None,
+                label: label.clone(),
+                detail: None,
+                reorder: false,
+            });
         }
         if a.candidates.is_empty() {
             v.push(Row::Note("No matches".into(), false));
@@ -858,7 +965,9 @@ impl SettingsScreen {
         v
     }
 
-    fn focusable(rows: &[Row]) -> Vec<usize> { rows.iter().enumerate().filter(|(_, r)| r.focusable()).map(|(i, _)| i).collect() }
+    fn focusable(rows: &[Row]) -> Vec<usize> {
+        rows.iter().enumerate().filter(|(_, r)| r.focusable()).map(|(i, _)| i).collect()
+    }
 
     /// Clamp `self.row` onto a focusable row.
     fn clamp_row(&mut self, rows: &[Row]) {
@@ -1085,7 +1194,11 @@ impl SettingsScreen {
                     self.error = Some((Local::NewListName, "Enter a name".into()));
                     return;
                 }
-                let _ = ctx.services.store.writer().submit_notify(DataScope::Favourites, move |c| crate::store::user::create_fav_list(c, &name, glyphs::FAV_LIST).map(|_| ()));
+                let _ = ctx
+                    .services
+                    .store
+                    .writer()
+                    .submit_notify(DataScope::Favourites, move |c| crate::store::user::create_fav_list(c, &name, glyphs::FAV_LIST).map(|_| ()));
                 self.new_list_name.clear();
                 self.error = None;
                 ctx.toast(Toast::info("List created"));
@@ -1167,7 +1280,12 @@ impl SettingsScreen {
             return;
         }
         let salt = new_salt();
-        let cfg = crate::config::ParentalConfig { enabled: true, pin_hash: Some(hash_pin(&pin, &salt)), pin_salt: Some(salt), relock_min: ctx.config.parental.relock_min };
+        let cfg = crate::config::ParentalConfig {
+            enabled: true,
+            pin_hash: Some(hash_pin(&pin, &salt)),
+            pin_salt: Some(salt),
+            relock_min: ctx.config.parental.relock_min,
+        };
         // the session that set the PIN stays unlocked (relock rules apply from here)
         ctx.parental.unlock(&pin, &cfg);
         ctx.edit_config(move |c| c.parental = cfg);
@@ -1260,7 +1378,9 @@ impl SettingsScreen {
             Item::Epg(id) => self.toggle_epg(ctx, id),
             Item::List(id) => self.rename_list(ctx, id),
             Item::HiddenGroup(g) => self.unhide_group(ctx, g),
-            Item::HiddenChannel(c) => self.unhide_item(ctx, ctx.lib.live.get(c).map(|c| ItemRef { source: c.source_id, kind: ItemKind::Channel, key: c.key.clone() })),
+            Item::HiddenChannel(c) => {
+                self.unhide_item(ctx, ctx.lib.live.get(c).map(|c| ItemRef { source: c.source_id, kind: ItemKind::Channel, key: c.key.clone() }))
+            }
             Item::HiddenVod(r) => {
                 self.hidden_items.retain(|(x, _)| *x != r);
                 self.unhide_item(ctx, Some(r));
@@ -1287,7 +1407,10 @@ impl SettingsScreen {
     }
 
     fn unhide_group(&mut self, ctx: &mut UiCtx<'_>, g: GroupId) {
-        let Some(group) = ctx.lib.live.groups.iter().chain(&ctx.lib.vod.movie_groups).chain(&ctx.lib.vod.series_groups).find(|x| x.id == g).cloned() else { return };
+        let Some(group) = ctx.lib.live.groups.iter().chain(&ctx.lib.vod.movie_groups).chain(&ctx.lib.vod.series_groups).find(|x| x.id == g).cloned()
+        else {
+            return;
+        };
         let _ = ctx.services.store.writer().submit_notify(DataScope::Overrides, move |c| {
             let mut ov = crate::store::user::group_overrides(c)?
                 .into_iter()
@@ -1323,7 +1446,13 @@ impl SettingsScreen {
     fn refilter_attach(&mut self, ctx: &UiCtx<'_>) {
         let Some(a) = &mut self.attach else { return };
         let all: Vec<(ItemRef, String)> = match a.orphan.item.kind {
-            ItemKind::Channel => ctx.lib.live.channels.iter().map(|c| (ItemRef { source: c.source_id, kind: ItemKind::Channel, key: c.key.clone() }, c.name.to_string())).collect(),
+            ItemKind::Channel => ctx
+                .lib
+                .live
+                .channels
+                .iter()
+                .map(|c| (ItemRef { source: c.source_id, kind: ItemKind::Channel, key: c.key.clone() }, c.name.to_string()))
+                .collect(),
             ItemKind::Movie => ctx.lib.vod.movies.iter().map(|v| (super::home::vod_ref(v), v.name.to_string())).collect(),
             ItemKind::Series => ctx.lib.vod.series.iter().map(|v| (super::home::vod_ref(v), v.name.to_string())).collect(),
             ItemKind::Episode => Vec::new(),
@@ -1347,7 +1476,13 @@ impl SettingsScreen {
 
     /// x / Delete / right-click: the row's menu.
     fn item_menu(&mut self, ctx: &mut UiCtx<'_>, item: Item) {
-        let mi = |icon: &'static str, label: &str, code: u8| MenuItem { icon, label: label.into(), action: Action::Digit(code), enabled: true, shortcut: None };
+        let mi = |icon: &'static str, label: &str, code: u8| MenuItem {
+            icon,
+            label: label.into(),
+            action: Action::Digit(code),
+            enabled: true,
+            shortcut: None,
+        };
         let (title, items) = match item {
             Item::Source(id) => {
                 let Some(s) = self.sources.iter().find(|s| s.id == id) else { return };
@@ -1357,7 +1492,11 @@ impl SettingsScreen {
                 }
                 v.push(mi(if s.enabled { glyphs::HIDDEN } else { glyphs::CHECK }, if s.enabled { "Disable" } else { "Enable" }, MENU_TOGGLE));
                 v.push(mi(glyphs::TAG, "Rename…", MENU_RENAME));
-                v.extend([mi(glyphs::REORDER, "Move up", MENU_UP), mi(glyphs::REORDER, "Move down", MENU_DOWN), mi(glyphs::CLOSE, "Delete…", MENU_DELETE)]);
+                v.extend([
+                    mi(glyphs::REORDER, "Move up", MENU_UP),
+                    mi(glyphs::REORDER, "Move down", MENU_DOWN),
+                    mi(glyphs::CLOSE, "Delete…", MENU_DELETE),
+                ]);
                 (s.name.clone(), v)
             }
             Item::Epg(id) => {
@@ -1377,7 +1516,11 @@ impl SettingsScreen {
             }
             Item::List(id) => {
                 let Some(l) = ctx.favs.lists.iter().find(|l| l.id == id) else { return };
-                let mut v = vec![mi(glyphs::TAG, "Rename…", MENU_RENAME), mi(glyphs::REORDER, "Move up", MENU_UP), mi(glyphs::REORDER, "Move down", MENU_DOWN)];
+                let mut v = vec![
+                    mi(glyphs::TAG, "Rename…", MENU_RENAME),
+                    mi(glyphs::REORDER, "Move up", MENU_UP),
+                    mi(glyphs::REORDER, "Move down", MENU_DOWN),
+                ];
                 let mut del = mi(glyphs::CLOSE, "Delete…", MENU_DELETE);
                 del.enabled = !l.is_default;
                 v.push(del);
@@ -1388,7 +1531,9 @@ impl SettingsScreen {
                 self.cancel_reminder(ctx, id);
                 return;
             }
-            Item::Orphan(_) => ("Orphan".into(), vec![mi(glyphs::CHEVRON_RIGHT, "Attach to…", MENU_ATTACH), mi(glyphs::CLOSE, "Forget…", MENU_DELETE)]),
+            Item::Orphan(_) => {
+                ("Orphan".into(), vec![mi(glyphs::CHEVRON_RIGHT, "Attach to…", MENU_ATTACH), mi(glyphs::CLOSE, "Forget…", MENU_DELETE)])
+            }
             Item::HiddenGroup(_) | Item::HiddenChannel(_) | Item::HiddenVod(_) => ("Hidden".into(), vec![mi(glyphs::CHECK, "Unhide", MENU_TOGGLE)]),
             Item::AttachTarget(_) => return,
         };
@@ -1427,20 +1572,38 @@ impl SettingsScreen {
             (Item::Epg(id), MENU_DELETE) => {
                 let name = self.epg_sources.iter().find(|e| e.id == id).map(|e| e.name.clone()).unwrap_or_default();
                 let token = self.token(Pending::DeleteEpg(id));
-                ctx.open(OverlayRequest::Confirm(ConfirmSpec { title: format!("Delete {name}?"), body: "Its programmes are removed; channels fall back to the next guide.".into(), confirm_label: "Delete".into(), destructive: true, token }));
+                ctx.open(OverlayRequest::Confirm(ConfirmSpec {
+                    title: format!("Delete {name}?"),
+                    body: "Its programmes are removed; channels fall back to the next guide.".into(),
+                    confirm_label: "Delete".into(),
+                    destructive: true,
+                    token,
+                }));
             }
             (Item::List(id), MENU_RENAME) => self.rename_list(ctx, id),
             (Item::List(id), MENU_DELETE) => {
                 let name = ctx.favs.lists.iter().find(|l| l.id == id).map(|l| l.name.clone()).unwrap_or_default();
                 let token = self.token(Pending::DeleteList(id));
-                ctx.open(OverlayRequest::Confirm(ConfirmSpec { title: format!("Delete the list {name}?"), body: "The channels stay in your playlists.".into(), confirm_label: "Delete".into(), destructive: true, token }));
+                ctx.open(OverlayRequest::Confirm(ConfirmSpec {
+                    title: format!("Delete the list {name}?"),
+                    body: "The channels stay in your playlists.".into(),
+                    confirm_label: "Delete".into(),
+                    destructive: true,
+                    token,
+                }));
             }
             (item, MENU_UP) | (item, MENU_DOWN) => self.reorder(ctx, item, if code == MENU_UP { -1 } else { 1 }),
             (Item::Reminder(id), MENU_DELETE) => self.cancel_reminder(ctx, id),
             (Item::Orphan(r), MENU_ATTACH) => self.start_attach(ctx, &r),
             (Item::Orphan(r), MENU_DELETE) => {
                 let token = self.token(Pending::ForgetOrphan(r));
-                ctx.open(OverlayRequest::Confirm(ConfirmSpec { title: "Forget this item's data?".into(), body: "Its favourites, progress and settings are deleted.".into(), confirm_label: "Forget".into(), destructive: true, token }));
+                ctx.open(OverlayRequest::Confirm(ConfirmSpec {
+                    title: "Forget this item's data?".into(),
+                    body: "Its favourites, progress and settings are deleted.".into(),
+                    confirm_label: "Forget".into(),
+                    destructive: true,
+                    token,
+                }));
             }
             (item @ (Item::HiddenGroup(_) | Item::HiddenChannel(_) | Item::HiddenVod(_)), MENU_TOGGLE) => self.item_default(ctx, item),
             _ => {}
@@ -1487,7 +1650,8 @@ impl SettingsScreen {
                 let mut order: Vec<FavListId> = ctx.favs.lists.iter().map(|l| l.id).collect();
                 if moved(&mut order, id, delta) {
                     ctx.favs.lists.sort_by_key(|l| order.iter().position(|x| *x == l.id));
-                    let _ = ctx.services.store.writer().submit_notify(DataScope::Favourites, move |c| crate::store::user::reorder_fav_lists(c, &order));
+                    let _ =
+                        ctx.services.store.writer().submit_notify(DataScope::Favourites, move |c| crate::store::user::reorder_fav_lists(c, &order));
                 }
             }
             _ => return,
@@ -1500,19 +1664,25 @@ impl SettingsScreen {
         }
     }
 
-    fn current_row(&self, ctx: &UiCtx<'_>) -> Option<Row> { self.rows(ctx).get(self.row).cloned() }
+    fn current_row(&self, ctx: &UiCtx<'_>) -> Option<Row> {
+        self.rows(ctx).get(self.row).cloned()
+    }
 }
 
 static PARENTAL_ENABLED: CfgToggle = toggle_row!("Parental lock", parental.enabled);
 
 /// A restored Xtream source without its password.
-fn needs_credentials(s: &Source) -> bool { s.xtream.as_ref().is_some_and(|x| x.password.expose().is_empty()) }
+fn needs_credentials(s: &Source) -> bool {
+    s.xtream.as_ref().is_some_and(|x| x.password.expose().is_empty())
+}
 
 /// The guides with the playlist channels each one matches.
 pub(crate) type GuideList = (Vec<EpgSource>, HashMap<EpgSourceId, usize>);
 
 /// Settings ▸ EPG / onboarding read (off the UI thread): the guides and their matches.
-pub(crate) fn load_guides(c: &rusqlite::Connection) -> crate::error::Result<GuideList> { Ok((crate::store::sources::list_epg_sources(c)?, guide_matches(c)?)) }
+pub(crate) fn load_guides(c: &rusqlite::Connection) -> crate::error::Result<GuideList> {
+    Ok((crate::store::sources::list_epg_sources(c)?, guide_matches(c)?))
+}
 
 /// How many channels of enabled playlists each guide matches (automatic or manual mappings to
 /// a channel of its current data). A guide that lists 2 channels of a 11 249-channel playlist
@@ -1594,7 +1764,9 @@ fn source_detail(s: &Source, now: crate::model::Timestamp, running: Option<Strin
     }
     match (running, &s.status.last_error, s.status.last_refresh) {
         (Some(p), _, _) => parts.push(format!("Refreshing: {p}")),
-        (None, Some(e), _) => parts.push(format!("Failed {}: {}", s.status.last_attempt.map(|t| kit::ago(now, t)).unwrap_or_default(), crate::redact::redact(e))),
+        (None, Some(e), _) => {
+            parts.push(format!("Failed {}: {}", s.status.last_attempt.map(|t| kit::ago(now, t)).unwrap_or_default(), crate::redact::redact(e)))
+        }
         (None, None, Some(t)) => parts.push(format!("Updated {}", kit::ago(now, t))),
         (None, None, None) => parts.push("Never refreshed".into()),
     }
@@ -1618,21 +1790,32 @@ fn source_detail(s: &Source, now: crate::model::Timestamp, running: Option<Strin
 /// Hidden movies / series (item overrides with `hidden`), named from the catalogue.
 fn load_hidden_vod(c: &rusqlite::Connection) -> crate::error::Result<Vec<(ItemRef, String)>> {
     let mut out = Vec::new();
-    for r in crate::store::user::item_overrides(c, None)?.into_iter().filter(|r| r.ov.hidden && matches!(r.item.kind, ItemKind::Movie | ItemKind::Series)) {
+    for r in
+        crate::store::user::item_overrides(c, None)?.into_iter().filter(|r| r.ov.hidden && matches!(r.item.kind, ItemKind::Movie | ItemKind::Series))
+    {
         let name = match r.item.kind {
-            ItemKind::Movie => crate::store::vod::resolve_movie(c, &r.item)?.map(|id| crate::store::vod::movie(c, id)).transpose()?.map(|m| m.display_name().to_owned()),
+            ItemKind::Movie => crate::store::vod::resolve_movie(c, &r.item)?
+                .map(|id| crate::store::vod::movie(c, id))
+                .transpose()?
+                .map(|m| m.display_name().to_owned()),
             _ => None,
         };
-        let name = name.or(r.ov.rename.clone()).unwrap_or_else(|| if r.fingerprint.norm_name.is_empty() { r.item.key.to_string() } else { r.fingerprint.norm_name.clone() });
+        let name = name
+            .or(r.ov.rename.clone())
+            .unwrap_or_else(|| if r.fingerprint.norm_name.is_empty() { r.item.key.to_string() } else { r.fingerprint.norm_name.clone() });
         out.push((r.item, name));
     }
     Ok(out)
 }
 
 impl Screen for SettingsScreen {
-    fn id(&self) -> ScreenId { ScreenId::Settings }
+    fn id(&self) -> ScreenId {
+        ScreenId::Settings
+    }
 
-    fn key_contexts(&self) -> Vec<KeyContext> { if self.editing { vec![KeyContext::TextInput, KeyContext::Panel] } else { vec![KeyContext::Panel] } }
+    fn key_contexts(&self) -> Vec<KeyContext> {
+        if self.editing { vec![KeyContext::TextInput, KeyContext::Panel] } else { vec![KeyContext::Panel] }
+    }
 
     fn on_enter(&mut self, ctx: &mut UiCtx<'_>, route: &Route) {
         let page = match route {
@@ -1669,7 +1852,8 @@ impl Screen for SettingsScreen {
                 self.backup_status = Some(match outcome {
                     Ok(JobOutcome::BackupWritten(p)) => (true, format!("Backup saved to {}", p.display())),
                     Ok(JobOutcome::Restored(r)) => {
-                        let mut s = format!("Restored: {} playlists added, {} matched, {} user rows", r.sources_added, r.sources_matched, r.user_rows);
+                        let mut s =
+                            format!("Restored: {} playlists added, {} matched, {} user rows", r.sources_added, r.sources_matched, r.user_rows);
                         if !r.needs_credentials.is_empty() {
                             s.push_str(&format!(" · needs credentials: {}", r.needs_credentials.join(", ")));
                         }
@@ -1862,14 +2046,20 @@ impl Screen for SettingsScreen {
         let pages_rect = egui::Rect::from_min_size(full.min, egui::vec2(pages_w.min(full.width()), full.height()));
         let content_rect = if compact { full } else { egui::Rect::from_min_max(egui::pos2(pages_rect.right() + gap, full.top()), full.max) };
         if !compact || self.pane == Pane::Pages {
-            let mut pui = ui.new_child(egui::UiBuilder::new().id_salt("settings-pages").max_rect(pages_rect).layout(egui::Layout::top_down(egui::Align::Min)));
+            let mut pui =
+                ui.new_child(egui::UiBuilder::new().id_salt("settings-pages").max_rect(pages_rect).layout(egui::Layout::top_down(egui::Align::Min)));
             self.pages_ui(&mut pui, ctx);
             if !compact {
                 section::pane_divider(ui.painter(), pages_rect.right() + gap / 2.0, full.y_range(), theme);
             }
         }
         if !compact || self.pane == Pane::Content {
-            let mut cui = ui.new_child(egui::UiBuilder::new().id_salt(("settings-content", self.page as u8)).max_rect(content_rect).layout(egui::Layout::top_down(egui::Align::Min)));
+            let mut cui = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt(("settings-content", self.page as u8))
+                    .max_rect(content_rect)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+            );
             self.content_ui(&mut cui, ctx);
         }
         ui.allocate_rect(full, egui::Sense::hover());
@@ -1882,7 +2072,8 @@ impl SettingsScreen {
             // one pass per library build, not one per `rows()` call
             self.hidden_built = ctx.lib.built_at;
             let live = &ctx.lib.live;
-            self.hidden_channels = live.channels.iter().filter(|c| live.hidden.contains(&c.id)).take(500).map(|c| (c.id, c.name.to_string())).collect();
+            self.hidden_channels =
+                live.channels.iter().filter(|c| live.hidden.contains(&c.id)).take(500).map(|c| (c.id, c.name.to_string())).collect();
         }
         if self.offset_pending.is_some_and(|(_, at)| at.elapsed() >= OFFSET_SETTLE) {
             self.flush_epg_offset(ctx);
@@ -1984,14 +2175,28 @@ impl SettingsScreen {
                         continue;
                     }
                     Row::Note(s, bad) => {
-                        ui.add(egui::Label::new(RichText::new(s).size(theme.font(TypeToken::BodySmall)).color(if *bad { t.urgent } else { t.text_secondary })).wrap());
+                        ui.add(
+                            egui::Label::new(RichText::new(s).size(theme.font(TypeToken::BodySmall)).color(if *bad {
+                                t.urgent
+                            } else {
+                                t.text_secondary
+                            }))
+                            .wrap(),
+                        );
                         continue;
                     }
                     _ => {}
                 }
                 let is_text = row.is_text();
-                let item_h = if matches!(row, Row::Item { detail: Some(_), .. }) { rows::row_height(theme, ctx.config.interface.density, true) } else { row_h };
-                let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), if is_text { row_h + theme.font(TypeToken::Body) } else { item_h }), egui::Sense::click());
+                let item_h = if matches!(row, Row::Item { detail: Some(_), .. }) {
+                    rows::row_height(theme, ctx.config.interface.density, true)
+                } else {
+                    row_h
+                };
+                let (rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), if is_text { row_h + theme.font(TypeToken::Body) } else { item_h }),
+                    egui::Sense::click(),
+                );
                 if focused && scroll {
                     ui.scroll_to_rect(rect, None);
                 }
@@ -2006,7 +2211,12 @@ impl SettingsScreen {
                 } else if pointer_moved && resp.hovered() && i != self.row && !self.editing {
                     hovered = Some(i);
                 }
-                let mut inner = ui.new_child(egui::UiBuilder::new().id_salt(("row", i)).max_rect(rect.shrink2(egui::vec2(theme.space(SpaceToken::Lg), theme.space(SpaceToken::Xs)))).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                let mut inner = ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt(("row", i))
+                        .max_rect(rect.shrink2(egui::vec2(theme.space(SpaceToken::Lg), theme.space(SpaceToken::Xs))))
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
                 let label_color = if focused { t.list_cursor_text } else { t.fg };
                 match row {
                     Row::Toggle(tg) => {
@@ -2052,7 +2262,8 @@ impl SettingsScreen {
                                 _ => "",
                             };
                             let mut buf = self.local_text(field).map(std::mem::take).unwrap_or_default();
-                            let (hit, changed) = text_row(&mut inner, theme, label, &mut buf, placeholder, password, editing, release, label_color, err.as_deref());
+                            let (hit, changed) =
+                                text_row(&mut inner, theme, label, &mut buf, placeholder, password, editing, release, label_color, err.as_deref());
                             if matches!(field, Local::PinNew | Local::PinConfirm) {
                                 buf.retain(|c| c.is_ascii_digit());
                                 buf.truncate(8);
@@ -2084,7 +2295,10 @@ impl SettingsScreen {
                     }
                     Row::Item { icon, color, label, detail, reorder, item } => {
                         if *reorder {
-                            let g = inner.add(egui::Label::new(RichText::new(glyphs::REORDER).size(theme.font(TypeToken::Icon)).color(t.text_disabled)).sense(egui::Sense::drag()));
+                            let g = inner.add(
+                                egui::Label::new(RichText::new(glyphs::REORDER).size(theme.font(TypeToken::Icon)).color(t.text_disabled))
+                                    .sense(egui::Sense::drag()),
+                            );
                             if g.drag_started() {
                                 drag_started = Some(i);
                             }
@@ -2099,7 +2313,11 @@ impl SettingsScreen {
                         // the button is laid out first so long names and errors end before it
                         inner.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if more {
-                                let (glyph, tip) = if matches!(item, Item::Reminder(_)) { (glyphs::CLOSE, "Cancel reminder (Delete)") } else { (glyphs::SETTINGS, "More (x)") };
+                                let (glyph, tip) = if matches!(item, Item::Reminder(_)) {
+                                    (glyphs::CLOSE, "Cancel reminder (Delete)")
+                                } else {
+                                    (glyphs::SETTINGS, "More (x)")
+                                };
                                 if icon_button(ui, theme, glyph, tip, ButtonStyle::default()).clicked() {
                                     clicked = Some((i, 2));
                                 }
@@ -2179,7 +2397,10 @@ impl SettingsScreen {
                 self.activate(ctx, &r);
             }
         }
-        if self.sources_loader.is_some() || self.epg_loader.is_some() || ctx.services.jobs.active().iter().any(|j| matches!(j.kind, JobKind::RefreshSource { .. })) {
+        if self.sources_loader.is_some()
+            || self.epg_loader.is_some()
+            || ctx.services.jobs.active().iter().any(|j| matches!(j.kind, JobKind::RefreshSource { .. }))
+        {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
         }
     }
@@ -2212,7 +2433,18 @@ fn toggle_row(ui: &mut egui::Ui, theme: &Theme, on: &mut bool, label: &str, colo
 
 /// Label above a text field that follows the settings focus. Returns (clicked, changed).
 #[allow(clippy::too_many_arguments)]
-fn text_row(ui: &mut egui::Ui, theme: &Theme, label: &str, text: &mut String, placeholder: &str, password: bool, editing: bool, release: bool, color: egui::Color32, error: Option<&str>) -> (bool, bool) {
+fn text_row(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    label: &str,
+    text: &mut String,
+    placeholder: &str,
+    password: bool,
+    editing: bool,
+    release: bool,
+    color: egui::Color32,
+    error: Option<&str>,
+) -> (bool, bool) {
     let t = &theme.tokens;
     let mut out = (false, false);
     ui.vertical(|ui| {
@@ -2273,7 +2505,9 @@ mod tests {
         h.run_steps(1);
     }
 
-    fn sources(h: &H) -> Vec<Source> { crate::store::sources::list_sources(&h.state().t.services().store.reader().unwrap()).unwrap() }
+    fn sources(h: &H) -> Vec<Source> {
+        crate::store::sources::list_sources(&h.state().t.services().store.reader().unwrap()).unwrap()
+    }
 
     #[test]
     fn config_rows_edit_and_apply_and_pages_switch() {
@@ -2351,8 +2585,14 @@ mod tests {
             let ch = testkit::channels(c, a, 3)?;
             testkit::epg(c, &ch, 0, 1, true)?;
             c.execute("UPDATE epg_source SET priority = 0 WHERE name = 'Seed EPG'", [])?;
-            c.execute("INSERT INTO epg_source(name, kind, url, active_gen, priority) VALUES ('Second guide','url','http://127.0.0.1:9/b.xml',0,1)", [])?;
-            c.execute("INSERT INTO epg_source(name, kind, url, active_gen, priority) VALUES ('Third guide','url','http://127.0.0.1:9/c.xml',0,2)", [])?;
+            c.execute(
+                "INSERT INTO epg_source(name, kind, url, active_gen, priority) VALUES ('Second guide','url','http://127.0.0.1:9/b.xml',0,1)",
+                [],
+            )?;
+            c.execute(
+                "INSERT INTO epg_source(name, kind, url, active_gen, priority) VALUES ('Third guide','url','http://127.0.0.1:9/c.xml',0,2)",
+                [],
+            )?;
             Ok(())
         });
         let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 1000.0));
@@ -2381,7 +2621,10 @@ mod tests {
         focus(&mut h, "Beta");
         h.state_mut().act(Action::ContextMenu);
         let nav = h.state_mut().nav();
-        assert!(matches!(nav.as_slice(), [NavRequest::Open(OverlayRequest::ContextMenu(m))] if m.items.iter().any(|i| i.label == "Delete…")), "{nav:?}");
+        assert!(
+            matches!(nav.as_slice(), [NavRequest::Open(OverlayRequest::ContextMenu(m))] if m.items.iter().any(|i| i.label == "Delete…")),
+            "{nav:?}"
+        );
         h.state_mut().result(OverlayResult::Chosen(Action::Digit(MENU_DELETE)));
         let nav = h.state_mut().nav();
         let token = match nav.as_slice() {
@@ -2400,7 +2643,13 @@ mod tests {
         assert_eq!(h.state_mut().nav(), vec![NavRequest::Push(Route::Onboarding(OnboardingStart::AddSource))]);
 
         // EPG priority: keyboard, then drag & drop on the grip
-        let names = |h: &H| crate::store::sources::list_epg_sources(&h.state().t.services().store.reader().unwrap()).unwrap().into_iter().map(|e| e.name).collect::<Vec<_>>();
+        let names = |h: &H| {
+            crate::store::sources::list_epg_sources(&h.state().t.services().store.reader().unwrap())
+                .unwrap()
+                .into_iter()
+                .map(|e| e.name)
+                .collect::<Vec<_>>()
+        };
         h.state_mut().enter(Route::Settings(SettingsPage::Epg));
         until(&mut h, "the guides", |h| has_label(h, "Third guide"));
         assert_eq!(names(&h), ["Seed EPG", "Second guide", "Third guide"]);
@@ -2408,7 +2657,10 @@ mod tests {
         h.state_mut().act(Action::MoveUp);
         until(&mut h, "keyboard reorder", |h| names(h) == ["Seed EPG", "Third guide", "Second guide"]);
         h.state_mut().enter(Route::Settings(SettingsPage::Epg));
-        until(&mut h, "reloaded order", |h| h.state().s.epg_sources.first().is_some_and(|e| e.name == "Seed EPG") && h.state().s.epg_sources.get(1).is_some_and(|e| e.name == "Third guide"));
+        until(&mut h, "reloaded order", |h| {
+            h.state().s.epg_sources.first().is_some_and(|e| e.name == "Seed EPG")
+                && h.state().s.epg_sources.get(1).is_some_and(|e| e.name == "Third guide")
+        });
         h.run_steps(2);
         let grip = |h: &H, name: &str| {
             let row = h.query_all_by_label(name).next().expect("row").rect();
@@ -2486,7 +2738,9 @@ mod tests {
         h.state_mut().act(Action::Activate);
         h.run_steps(1);
         let item = ItemRef { source: SourceId(1), kind: ItemKind::Channel, key: ItemKey(format!("m3u:seed{:011}", 2)) };
-        until(&mut h, "unhidden", |h| crate::store::user::item_override(&h.state().t.services().store.reader().unwrap(), &item).unwrap().is_none_or(|o| !o.hidden));
+        until(&mut h, "unhidden", |h| {
+            crate::store::user::item_override(&h.state().t.services().store.reader().unwrap(), &item).unwrap().is_none_or(|o| !o.hidden)
+        });
         // orphans: attach to a library item (the filter starts with the old name)
         h.state_mut().enter(Route::Settings(SettingsPage::Orphans));
         until(&mut h, "the orphan", |h| has_label(h, "channel 1"));
@@ -2519,7 +2773,11 @@ mod tests {
         h.run_steps(2);
         assert_eq!(kit::PICKED.with_borrow_mut(std::mem::take), vec![PickPurpose::ExportBackup]);
         // the dialog answers: the export job runs
-        h.state().t.services().bus.send(AppEvent::Platform(PlatformEvent::FilePicked { purpose: PickPurpose::ExportBackup, path: Some(path.clone()) }));
+        h.state()
+            .t
+            .services()
+            .bus
+            .send(AppEvent::Platform(PlatformEvent::FilePicked { purpose: PickPurpose::ExportBackup, path: Some(path.clone()) }));
         until(&mut h, "the export", |h| testkit::has_label_containing(h, "Backup saved to"));
         assert!(path.exists());
         // restore, replacing everything: confirmed first
@@ -2531,7 +2789,11 @@ mod tests {
         h.state_mut().act(Action::Activate);
         h.run_steps(2);
         assert_eq!(kit::PICKED.with_borrow_mut(std::mem::take), vec![PickPurpose::ImportBackup]);
-        h.state().t.services().bus.send(AppEvent::Platform(PlatformEvent::FilePicked { purpose: PickPurpose::ImportBackup, path: Some(path.clone()) }));
+        h.state()
+            .t
+            .services()
+            .bus
+            .send(AppEvent::Platform(PlatformEvent::FilePicked { purpose: PickPurpose::ImportBackup, path: Some(path.clone()) }));
         h.run_steps(2);
         let token = match h.state_mut().nav().as_slice() {
             [NavRequest::Open(OverlayRequest::Confirm(c))] if c.destructive => c.token,
@@ -2541,7 +2803,9 @@ mod tests {
         until(&mut h, "the restore", |h| testkit::has_label_containing(h, "Restored:"));
     }
 
-    fn has(h: &H, label: &str) -> bool { has_label(h, label) }
+    fn has(h: &H, label: &str) -> bool {
+        has_label(h, label)
+    }
 
     /// A Forget confirmed after the orphans were re-read in another order (a refresh finished
     /// while the dialog was open) forgets the orphan the dialog named; Delete on a reminder
@@ -2573,7 +2837,13 @@ mod tests {
             crate::store::user::add_reminder(c, &r).map(|_| ())
         });
         let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 1000.0));
-        let orphans = |h: &H| crate::store::user::orphans(&h.state().t.services().store.reader().unwrap()).unwrap().into_iter().map(|o| o.fingerprint.norm_name).collect::<Vec<_>>();
+        let orphans = |h: &H| {
+            crate::store::user::orphans(&h.state().t.services().store.reader().unwrap())
+                .unwrap()
+                .into_iter()
+                .map(|o| o.fingerprint.norm_name)
+                .collect::<Vec<_>>()
+        };
         h.state_mut().enter(Route::Settings(SettingsPage::Orphans));
         until(&mut h, "the orphans", |h| has_label(h, "alpha one") && has_label(h, "beta two"));
         focus(&mut h, "beta two");
@@ -2616,7 +2886,8 @@ mod tests {
     fn parental_rows_retry_the_same_adjustment_after_the_pin_and_lock_now_locks() {
         let (mut t, one) = rig();
         let mut cfg = (*t.config).clone();
-        cfg.parental = crate::config::ParentalConfig { enabled: true, pin_salt: Some("s".into()), pin_hash: Some(hash_pin("1234", "s")), relock_min: 30 };
+        cfg.parental =
+            crate::config::ParentalConfig { enabled: true, pin_salt: Some("s".into()), pin_hash: Some(hash_pin("1234", "s")), relock_min: 30 };
         t.config = std::sync::Arc::new(cfg);
         let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1200.0, 1000.0));
         h.state_mut().enter(Route::Settings(SettingsPage::Parental));
@@ -2751,7 +3022,11 @@ mod tests {
             color: SourceColor::Blue,
             url: None,
             path: None,
-            xtream: Some(crate::model::XtreamCredentials { server: "http://p.example:8080".into(), username: "u".into(), password: crate::redact::Secret::new("pw".into()) }),
+            xtream: Some(crate::model::XtreamCredentials {
+                server: "http://p.example:8080".into(),
+                username: "u".into(),
+                password: crate::redact::Secret::new("pw".into()),
+            }),
             settings: Default::default(),
             enabled: true,
             sort_index: 0,

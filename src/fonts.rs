@@ -112,7 +112,9 @@ impl FontSet {
     }
 
     /// Convenience for tests/tools: load + install (blocking).
-    pub fn install(&self, ctx: &egui::Context) { self.load().install(ctx) }
+    pub fn install(&self, ctx: &egui::Context) {
+        self.load().install(ctx)
+    }
 }
 
 type FontCache = Mutex<HashMap<(PathBuf, u32), Arc<FontData>>>;
@@ -135,7 +137,9 @@ impl std::fmt::Debug for LoadedFonts {
 
 impl LoadedFonts {
     /// Install into egui (replaces all font definitions). Cheap: no I/O (UI thread).
-    pub fn install(&self, ctx: &egui::Context) { ctx.set_fonts(self.definitions()) }
+    pub fn install(&self, ctx: &egui::Context) {
+        ctx.set_fonts(self.definitions())
+    }
 
     /// egui font definitions: `Proportional`/`Monospace` = [primary, script fallbacks…, egui
     /// defaults]; `Name("medium")`/`Name("bold")` = [face, primary, fallbacks…, defaults].
@@ -200,7 +204,8 @@ impl LoadedFonts {
 /// One Regular-style face per script in [`FALLBACK_LANGS`] (see module docs).
 pub fn resolve_script_fallbacks() -> Vec<FontFace> {
     let picks = FALLBACK_LANGS.iter().filter_map(|lang| {
-        let out = std::process::Command::new("fc-list").args([&format!(":lang={lang}:weight=80:slant=0"), "file", "index", "family"]).output().ok()?;
+        let out =
+            std::process::Command::new("fc-list").args([&format!(":lang={lang}:weight=80:slant=0"), "file", "index", "family"]).output().ok()?;
         pick_fallback(lang, &String::from_utf8_lossy(&out.stdout))
     });
     dedup_fallbacks(None, picks)
@@ -226,7 +231,8 @@ fn pick_fallback(lang: &str, fc_list: &str) -> Option<FontFace> {
             let family = fields.next().unwrap_or("").split(',').next().unwrap_or("").trim();
             let index: u32 = fields.find_map(|f| f.strip_prefix("index=")).and_then(|i| i.trim().parse().ok()).unwrap_or(0);
             let has = |w: &str| family.split_whitespace().any(|t| t == w);
-            let score = 2 * i32::from(has("Sans")) - 2 * i32::from(has("Serif")) + i32::from(family.starts_with("Noto"))
+            let score = 2 * i32::from(has("Sans")) - 2 * i32::from(has("Serif"))
+                + i32::from(family.starts_with("Noto"))
                 + region.map_or(0, |r| i32::from(has(r)))
                 - i32::from(has("Mono"));
             Some((score, family.len(), FontFace { path: PathBuf::from(file), index }))
@@ -299,7 +305,9 @@ mod tests {
 /usr/share/fonts/noto/NotoSansArabic-Regular.ttf: Noto Sans Arabic:index=0
 ";
 
-    fn face(p: &str, index: u32) -> FontFace { FontFace { path: PathBuf::from(p), index } }
+    fn face(p: &str, index: u32) -> FontFace {
+        FontFace { path: PathBuf::from(p), index }
+    }
 
     #[test]
     fn picks_regular_sans_per_script() {
@@ -324,7 +332,14 @@ mod tests {
     #[test]
     fn fallbacks_deduplicated_by_file() {
         let primary = face("/f/JetBrainsMono.ttf", 0);
-        let faces = [face("/f/cjk.ttc", 0), face("/f/cjk.ttc", 2), face("/f/ar.ttf", 0), face("/f/JetBrainsMono.ttf", 0), face("/f/cjk.ttc", 1), face("/f/ar.ttf", 0)];
+        let faces = [
+            face("/f/cjk.ttc", 0),
+            face("/f/cjk.ttc", 2),
+            face("/f/ar.ttf", 0),
+            face("/f/JetBrainsMono.ttf", 0),
+            face("/f/cjk.ttc", 1),
+            face("/f/ar.ttf", 0),
+        ];
         assert_eq!(dedup_fallbacks(Some(&primary), faces.clone()), vec![face("/f/cjk.ttc", 0), face("/f/ar.ttf", 0)]);
         assert_eq!(dedup_fallbacks(None, faces).len(), 3);
     }

@@ -15,7 +15,9 @@ use tuner::store::{Store, epg, library, live, sources, user, vod};
 
 const NOW: Timestamp = 1_791_576_000;
 
-fn store(name: &str) -> Store { Store::open_temp(name, None).expect("temp store") }
+fn store(name: &str) -> Store {
+    Store::open_temp(name, None).expect("temp store")
+}
 
 /// Run `f` on the writer connection.
 fn w<R: Send + 'static>(s: &Store, f: impl FnOnce(&mut Connection) -> tuner::error::Result<R> + Send + 'static) -> R {
@@ -141,14 +143,18 @@ fn run_import(
 
 const ALL: [ItemKind; 3] = [ItemKind::Channel, ItemKind::Movie, ItemKind::Series];
 
-fn ch_ref(src: SourceId, key: &str) -> ItemRef { ItemRef { source: src, kind: ItemKind::Channel, key: ItemKey(key.into()) } }
+fn ch_ref(src: SourceId, key: &str) -> ItemRef {
+    ItemRef { source: src, kind: ItemKind::Channel, key: ItemKey(key.into()) }
+}
 
 fn ids(c: &Connection, table: &str) -> Vec<(String, i64)> {
     let mut st = c.prepare(&format!("SELECT key, id FROM {table} ORDER BY key")).unwrap();
     st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect()
 }
 
-fn count(c: &Connection, sql: &str) -> i64 { c.query_row(sql, [], |r| r.get(0)).unwrap() }
+fn count(c: &Connection, sql: &str) -> i64 {
+    c.query_row(sql, [], |r| r.get(0)).unwrap()
+}
 
 // ------------------------------------------------------------------ sources
 
@@ -269,7 +275,16 @@ fn epg_sources_provider_lifecycle_priority_and_staleness() {
 
 fn sample(n: usize) -> (Vec<ImportChannel>, Vec<ImportMovie>, Vec<ImportSeries>) {
     let ch = (0..n)
-        .map(|i| chan(&format!("xt:live:{i}"), &format!("Chan {i}"), Some(&format!("c{i}.tv")), if i % 2 == 0 { "News" } else { "Sport" }, &format!("http://h.tv/live/u/p/{i}.ts"), i as i32))
+        .map(|i| {
+            chan(
+                &format!("xt:live:{i}"),
+                &format!("Chan {i}"),
+                Some(&format!("c{i}.tv")),
+                if i % 2 == 0 { "News" } else { "Sport" },
+                &format!("http://h.tv/live/u/p/{i}.ts"),
+                i as i32,
+            )
+        })
         .collect();
     let mv = (0..10).map(|i| movie(&format!("xt:vod:{i}"), &format!("Movie {i}"), "Films", i)).collect();
     let se = (0..5).map(|i| series(&format!("xt:series:{i}"), &format!("Show {i}"), "Shows", i)).collect();
@@ -342,8 +357,7 @@ fn item_group_missing_from_upsert_groups_survives_the_sweep() {
         import::finish_catalogue(c, &imp, &ALL, NOW)
     });
     assert_eq!(count(&r, "SELECT count(*) FROM channel_group"), 1, "membership kept");
-    let (gid2, name2): (i64, String) =
-        r.query_row("SELECT id, name FROM grp WHERE kind = 'channel'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    let (gid2, name2): (i64, String) = r.query_row("SELECT id, name FROM grp WHERE kind = 'channel'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
     assert_eq!((gid2, name2), (gid, name), "same group row, name kept");
 }
 
@@ -379,12 +393,29 @@ fn attach_all(c: &mut Connection, item: &ItemRef, epg_src: EpgSourceId) -> tuner
     user::set_item_override(c, item, &ItemOverride { rename: Some("Mine".into()), ..Default::default() })?;
     user::save_progress(
         c,
-        &WatchProgress { item: item.clone(), position_s: 12.0, duration_s: None, updated_at: NOW, finished: false, title: "t".into(), fingerprint: Fingerprint::default() },
+        &WatchProgress {
+            item: item.clone(),
+            position_s: 12.0,
+            duration_s: None,
+            updated_at: NOW,
+            finished: false,
+            title: "t".into(),
+            fingerprint: Fingerprint::default(),
+        },
     )?;
     if item.kind == ItemKind::Channel {
         user::add_reminder(
             c,
-            &Reminder { id: ReminderId(0), channel: item.clone(), channel_name: "c".into(), programme_title: "p".into(), start: NOW + 600, stop: NOW + 1200, lead_s: 120, state: ReminderState::Pending },
+            &Reminder {
+                id: ReminderId(0),
+                channel: item.clone(),
+                channel_name: "c".into(),
+                programme_title: "p".into(),
+                start: NOW + 600,
+                stop: NOW + 1200,
+                lead_s: 120,
+                state: ReminderState::Pending,
+            },
         )?;
         epg::set_manual_mapping(c, item, epg_src, "manual.tv")?;
     }
@@ -566,7 +597,15 @@ fn movie_progress_reattaches_by_name_and_group() {
 fn fingerprints_are_computed_inside_writes() {
     let s = store("tuner-st-fp");
     let src = w(&s, |c| sources::insert_source(c, &m3u_draft("S", "http://h/s.m3u"), NOW));
-    run_import(&s, src, vec![chan("xt:live:5", "UK: BBC Two HD", Some("bbc2.uk"), "UK | News", "http://h/live/u/p/5.ts", 0)], vec![], vec![], vec![ItemKind::Channel], NOW);
+    run_import(
+        &s,
+        src,
+        vec![chan("xt:live:5", "UK: BBC Two HD", Some("bbc2.uk"), "UK | News", "http://h/live/u/p/5.ts", 0)],
+        vec![],
+        vec![],
+        vec![ItemKind::Channel],
+        NOW,
+    );
     let item = ch_ref(src, "xt:live:5");
     let i2 = item.clone();
     w(&s, move |c| user::set_favourite(c, user::default_fav_list(c)?, &i2, true, NOW));
@@ -665,7 +704,13 @@ fn overrides_progress_history_and_reminders() {
     // group overrides
     w(&s, move |c| {
         user::set_group_override(c, src, ItemKind::Channel, &GroupKey("channel:news".into()), &GroupOverride { hidden: true, ..Default::default() })?;
-        user::set_group_override(c, src, ItemKind::Channel, &GroupKey("channel:all".into()), &GroupOverride { pinned_home: true, ..Default::default() })?;
+        user::set_group_override(
+            c,
+            src,
+            ItemKind::Channel,
+            &GroupKey("channel:all".into()),
+            &GroupOverride { pinned_home: true, ..Default::default() },
+        )?;
         user::set_group_override(c, src, ItemKind::Channel, &GroupKey("channel:all".into()), &GroupOverride::default())
     });
     let go = user::group_overrides(&r).unwrap();
@@ -674,7 +719,15 @@ fn overrides_progress_history_and_reminders() {
 
     // progress + continue watching + mark watched
     let (m0, m1, m2) = (mref(0), mref(1), mref(2));
-    let wp = |item: &ItemRef, pos: f64, at: Timestamp| WatchProgress { item: item.clone(), position_s: pos, duration_s: Some(100.0), updated_at: at, finished: false, title: "x".into(), fingerprint: Fingerprint::default() };
+    let wp = |item: &ItemRef, pos: f64, at: Timestamp| WatchProgress {
+        item: item.clone(),
+        position_s: pos,
+        duration_s: Some(100.0),
+        updated_at: at,
+        finished: false,
+        title: "x".into(),
+        fingerprint: Fingerprint::default(),
+    };
     let (p0, p1, p2) = (wp(&m0, 10.0, 1), wp(&m1, 20.0, 3), wp(&m2, 30.0, 2));
     w(&s, move |c| {
         user::save_progress(c, &p0)?;
@@ -715,7 +768,16 @@ fn overrides_progress_history_and_reminders() {
     assert_eq!(count(&r, "SELECT count(*) FROM history"), 500);
 
     // reminders
-    let rem = |start: Timestamp, lead: i64| Reminder { id: ReminderId(0), channel: ch_ref(src, "m3u:seed00000000001"), channel_name: "C1".into(), programme_title: "P".into(), start, stop: start + 60, lead_s: lead, state: ReminderState::Pending };
+    let rem = |start: Timestamp, lead: i64| Reminder {
+        id: ReminderId(0),
+        channel: ch_ref(src, "m3u:seed00000000001"),
+        channel_name: "C1".into(),
+        programme_title: "P".into(),
+        start,
+        stop: start + 60,
+        lead_s: lead,
+        state: ReminderState::Pending,
+    };
     let (r1, r2, r3) = (rem(1000, 100), rem(950, 0), rem(1000, 5));
     let (id1, id2, id3) = w(&s, move |c| Ok((user::add_reminder(c, &r1)?, user::add_reminder(c, &r2)?, user::add_reminder(c, &r3)?)));
     assert_eq!(id1, id3, "unique per channel + start");
@@ -731,7 +793,9 @@ fn overrides_progress_history_and_reminders() {
     assert!(s.writer().blocking(move |c| user::add_reminder(c, &bad)).is_err());
 }
 
-fn movies_keys(n: usize) -> Vec<String> { (0..n).map(|i| format!("m3u:movie{i:010}")).collect() }
+fn movies_keys(n: usize) -> Vec<String> {
+    (0..n).map(|i| format!("m3u:movie{i:010}")).collect()
+}
 
 // ------------------------------------------------------------------ live & VOD reads
 
@@ -750,7 +814,13 @@ fn live_reads_groups_and_failure_cache() {
     let a2 = a.clone();
     w(&s, move |c| {
         user::set_item_override(c, &a2, &ItemOverride { rename: Some("A!".into()), catchup_offset_s: Some(30), ..Default::default() })?;
-        user::set_group_override(c, src, ItemKind::Channel, &group_key(ItemKind::Channel, "Premium"), &GroupOverride { locked: true, user_order: Some(0), ..Default::default() })
+        user::set_group_override(
+            c,
+            src,
+            ItemKind::Channel,
+            &group_key(ItemKind::Channel, "Premium"),
+            &GroupOverride { locked: true, user_order: Some(0), ..Default::default() },
+        )
     });
     let r = s.reader().unwrap();
     let ch = live::channel_by_ref(&r, &a).unwrap().unwrap();
@@ -794,10 +864,25 @@ fn vod_reads_details_and_next_episode() {
     let src = w(&s, |c| sources::insert_source(c, &m3u_draft("S", "http://h/s.m3u"), NOW));
     let mut m = movie("xt:vod:7", "Heat", "Crime", 0);
     m.stream = StreamLocator::Xtream { kind: XtreamStreamKind::Movie, stream_id: 7, ext: Some("mp4".into()) };
-    run_import(&s, src, vec![], vec![m, movie("xt:vod:8", "Alien", "SciFi", 1)], vec![series("xt:series:1", "Lost", "Drama", 0)], vec![ItemKind::Movie, ItemKind::Series], NOW);
+    run_import(
+        &s,
+        src,
+        vec![],
+        vec![m, movie("xt:vod:8", "Alien", "SciFi", 1)],
+        vec![series("xt:series:1", "Lost", "Drama", 0)],
+        vec![ItemKind::Movie, ItemKind::Series],
+        NOW,
+    );
     let r = s.reader().unwrap();
     let mid = vod::resolve_movie(&r, &ItemRef { source: src, kind: ItemKind::Movie, key: ItemKey("xt:vod:7".into()) }).unwrap().unwrap();
-    w(&s, move |c| import::store_movie_details(c, mid, &MovieDetails { plot: Some("Cops".into()), duration_s: Some(9000), container_ext: Some("mkv".into()), ..Default::default() }, NOW));
+    w(&s, move |c| {
+        import::store_movie_details(
+            c,
+            mid,
+            &MovieDetails { plot: Some("Cops".into()), duration_s: Some(9000), container_ext: Some("mkv".into()), ..Default::default() },
+            NOW,
+        )
+    });
     let mv = vod::movie(&r, mid).unwrap();
     assert_eq!((mv.plot.as_deref(), mv.duration_s, mv.details_loaded_at), (Some("Cops"), Some(9000), Some(NOW)));
     assert_eq!(mv.stream, StreamLocator::Xtream { kind: XtreamStreamKind::Movie, stream_id: 7, ext: Some("mkv".into()) });
@@ -832,7 +917,15 @@ fn vod_reads_details_and_next_episode() {
     let (e0, e1) = (eref(&all[0]), eref(&all[1]));
     w(&s, move |c| user::mark_watched(c, &[(e0, "E1".into())], true, NOW));
     assert_eq!(vod::next_episode(&r, sid).unwrap().unwrap().key, all[1].key, "after the last finished");
-    let p = WatchProgress { item: e1.clone(), position_s: 60.0, duration_s: None, updated_at: NOW + 1, finished: false, title: "E2".into(), fingerprint: Fingerprint::default() };
+    let p = WatchProgress {
+        item: e1.clone(),
+        position_s: 60.0,
+        duration_s: None,
+        updated_at: NOW + 1,
+        finished: false,
+        title: "E2".into(),
+        fingerprint: Fingerprint::default(),
+    };
     w(&s, move |c| user::save_progress(c, &p));
     assert_eq!(vod::next_episode(&r, sid).unwrap().unwrap().key, all[1].key, "in-progress episode");
     assert_eq!(vod::resolve_episode(&r, &e1).unwrap(), Some(all[1].id));
@@ -844,12 +937,20 @@ fn vod_reads_details_and_next_episode() {
         e.key = ItemKey(format!("{}-new", e.key.0));
         e.provider_id = None;
     }
-    let d2 = SeriesDetails { seasons: vec![ImportSeason { number: 1, name: Some("One".into()), cover: None, air_date: None, overview: None, episode_count: 0 }], episodes: renum, plot: None, backdrop: None };
+    let d2 = SeriesDetails {
+        seasons: vec![ImportSeason { number: 1, name: Some("One".into()), cover: None, air_date: None, overview: None, episode_count: 0 }],
+        episodes: renum,
+        plot: None,
+        backdrop: None,
+    };
     w(&s, move |c| import::store_series_details(c, sid, &d2, NOW + 2));
     let p = user::progress(&r, &ItemRef { key: ItemKey("xt:ep:102-new".into()), ..e1 }).unwrap().unwrap();
     assert_eq!(p.position_s, 60.0);
     let seasons = vod::seasons(&r, sid).unwrap();
-    assert_eq!(seasons.iter().map(|x| (x.number, x.name.clone(), x.episode_count)).collect::<Vec<_>>(), vec![(1, Some("One".into()), 2), (2, None, 1)]);
+    assert_eq!(
+        seasons.iter().map(|x| (x.number, x.name.clone(), x.episode_count)).collect::<Vec<_>>(),
+        vec![(1, Some("One".into()), 2), (2, None, 1)]
+    );
     assert_eq!(count(&r, "SELECT count(*) FROM episode"), 3, "old episodes deleted");
 
     // recently added: newest first, hidden left out
@@ -954,13 +1055,26 @@ fn delete_source_leaves_no_orphans_in_any_table() {
     let pe = w(&s, move |c| Ok(sources::ensure_provider_epg(c, src, &urls)?[0]));
     w(&s, move |c| {
         let mut imp = epg::begin_epg_import(c, pe)?;
-        let chans: Vec<epg::ImportEpgChannel> = (0..50).map(|i| epg::ImportEpgChannel { xmltv_id: format!("c{i}.tv"), display_names: vec![(format!("Chan {i}"), format!("chan{i}"))], icon: None }).collect();
+        let chans: Vec<epg::ImportEpgChannel> = (0..50)
+            .map(|i| epg::ImportEpgChannel {
+                xmltv_id: format!("c{i}.tv"),
+                display_names: vec![(format!("Chan {i}"), format!("chan{i}"))],
+                icon: None,
+            })
+            .collect();
         epg::write_epg_channels(c, &mut imp, &chans)?;
-        let progs: Vec<epg::ImportProgramme> = (0..50 * 20).map(|i| prog(&format!("c{}.tv", i % 50), NOW + (i / 50) as i64 * 1800, "News at ten")).collect();
+        let progs: Vec<epg::ImportProgramme> =
+            (0..50 * 20).map(|i| prog(&format!("c{}.tv", i % 50), NOW + (i / 50) as i64 * 1800, "News at ten")).collect();
         epg::write_programmes(c, &mut imp, &progs)?;
         epg::finish_epg_import(c, &imp, NOW)?;
         let maps: Vec<EpgMapping> = (0..10)
-            .map(|i| EpgMapping { channel: ch_ref(other, &format!("xt:live:{i}")), epg_source_id: pe, xmltv_id: format!("c{i}.tv"), method: EpgMatchMethod::TvgIdExact, confidence: 1.0 })
+            .map(|i| EpgMapping {
+                channel: ch_ref(other, &format!("xt:live:{i}")),
+                epg_source_id: pe,
+                xmltv_id: format!("c{i}.tv"),
+                method: EpgMatchMethod::TvgIdExact,
+                confidence: 1.0,
+            })
             .collect();
         epg::replace_auto_mappings(c, other, pe, &maps)?;
         epg::resolve_mappings(c)
@@ -970,7 +1084,13 @@ fn delete_source_leaves_no_orphans_in_any_table() {
     w(&s, move |c| {
         attach_all(c, &item, pe)?;
         attach_all(c, &mref, pe)?;
-        user::set_group_override(c, src, ItemKind::Channel, &group_key(ItemKind::Channel, "News"), &GroupOverride { hidden: true, ..Default::default() })?;
+        user::set_group_override(
+            c,
+            src,
+            ItemKind::Channel,
+            &group_key(ItemKind::Channel, "News"),
+            &GroupOverride { hidden: true, ..Default::default() },
+        )?;
         user::push_history(c, &HistoryEntry { item: item.clone(), at: 1, title: "x".into() })?;
         live::record_failure(c, &item, "x", 1)
     });
@@ -980,8 +1100,19 @@ fn delete_source_leaves_no_orphans_in_any_table() {
     w(&s, move |c| sources::delete_source(c, src));
 
     for t in [
-        "grp", "channel", "movie", "series", "episode", "fav_item", "item_override", "group_override", "watch_progress", "history",
-        "reminder", "stream_failure", "channel_epg_map",
+        "grp",
+        "channel",
+        "movie",
+        "series",
+        "episode",
+        "fav_item",
+        "item_override",
+        "group_override",
+        "watch_progress",
+        "history",
+        "reminder",
+        "stream_failure",
+        "channel_epg_map",
     ] {
         assert_eq!(count(&r, &format!("SELECT count(*) FROM {t} WHERE source_id = {}", src.0)), 0, "{t}");
     }

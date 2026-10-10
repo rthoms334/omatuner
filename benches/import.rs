@@ -62,11 +62,7 @@ fn datasets() -> Datasets {
     if let (Ok(m3u), Ok(xmltv_gz)) = (std::fs::read(dir.join("big.m3u")), std::fs::read(dir.join("big.xml.gz"))) {
         return Datasets { label: format!("{} (gen-big-fixtures.py)", dir.display()), m3u, xmltv_gz };
     }
-    Datasets {
-        label: "generated in memory".into(),
-        m3u: synthetic_m3u(CHANNELS),
-        xmltv_gz: synthetic_xmltv_gz(EPG_CHANNELS, EPG_DAYS),
-    }
+    Datasets { label: "generated in memory".into(), m3u: synthetic_m3u(CHANNELS), xmltv_gz: synthetic_xmltv_gz(EPG_CHANNELS, EPG_DAYS) }
 }
 
 /// Same shapes as the generator: groups, `;` lists, tvg ids shared with the guide, catch-up.
@@ -238,7 +234,9 @@ fn median(v: &mut [Duration]) -> Duration {
     v[v.len() / 2]
 }
 
-fn secs(d: Duration) -> String { format!("{:.2} s", d.as_secs_f64()) }
+fn secs(d: Duration) -> String {
+    format!("{:.2} s", d.as_secs_f64())
+}
 
 fn gate(name: &str, value: Duration, limit: Duration) -> bool {
     let ok = value < limit;
@@ -337,10 +335,17 @@ fn criterion_pipelines(rt: &tokio::runtime::Runtime, data: &Datasets) {
         ctx.store.writer().blocking(move |c| tuner::store::sources::insert_epg_source(c, "Bench guide", &kind, 0)).expect("epg source")
     };
     let run_m3u = |ctx: &JobContext, id| {
-        rt.block_on(import_source::refresh_source(ctx, id, true, &Progress::detached(), &CancellationToken::new())).expect("m3u import").summary.channels.total
+        rt.block_on(import_source::refresh_source(ctx, id, true, &Progress::detached(), &CancellationToken::new()))
+            .expect("m3u import")
+            .summary
+            .channels
+            .total
     };
     let run_xmltv = |ctx: &JobContext, id| {
-        rt.block_on(import_epg::refresh_epg(ctx, id, true, &Progress::detached(), &CancellationToken::new())).expect("xmltv import").summary.programmes
+        rt.block_on(import_epg::refresh_epg(ctx, id, true, &Progress::detached(), &CancellationToken::new()))
+            .expect("xmltv import")
+            .summary
+            .programmes
     };
 
     let mut c = Criterion::default().configure_from_args();

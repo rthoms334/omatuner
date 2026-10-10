@@ -9,13 +9,19 @@ use crate::theme::egui_style::{FAMILY_BOLD, FAMILY_MEDIUM};
 use crate::theme::{Theme, TypeToken};
 
 /// Regular weight at a type token.
-pub(super) fn font(theme: &Theme, t: TypeToken) -> FontId { FontId::proportional(theme.font(t)) }
+pub(super) fn font(theme: &Theme, t: TypeToken) -> FontId {
+    FontId::proportional(theme.font(t))
+}
 
 /// Medium weight (menu row labels, sidebar).
-pub(super) fn medium(ctx: &egui::Context, theme: &Theme, t: TypeToken) -> FontId { weighted(ctx, theme, t, FAMILY_MEDIUM) }
+pub(super) fn medium(ctx: &egui::Context, theme: &Theme, t: TypeToken) -> FontId {
+    weighted(ctx, theme, t, FAMILY_MEDIUM)
+}
 
 /// Bold weight (selected buttons, section headers).
-pub(super) fn bold(ctx: &egui::Context, theme: &Theme, t: TypeToken) -> FontId { weighted(ctx, theme, t, FAMILY_BOLD) }
+pub(super) fn bold(ctx: &egui::Context, theme: &Theme, t: TypeToken) -> FontId {
+    weighted(ctx, theme, t, FAMILY_BOLD)
+}
 
 /// A named weight registered by `fonts::install`, or the regular face while it isn't bound
 /// (egui panics on unknown families; headless harnesses and the first frames have none).
@@ -38,7 +44,15 @@ pub(super) fn galley(painter: &egui::Painter, text: impl Into<String>, font: Fon
 }
 
 /// Paint one elided line anchored at `pos`; returns the painted rect.
-pub(super) fn text(painter: &egui::Painter, pos: Pos2, anchor: Align2, text: impl Into<String>, font: FontId, color: Color32, max_width: f32) -> Rect {
+pub(super) fn text(
+    painter: &egui::Painter,
+    pos: Pos2,
+    anchor: Align2,
+    text: impl Into<String>,
+    font: FontId,
+    color: Color32,
+    max_width: f32,
+) -> Rect {
     let g = galley(painter, text, font, color, max_width);
     let rect = anchor.anchor_size(pos, g.size());
     painter.galley(rect.min, g, color);

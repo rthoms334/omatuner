@@ -12,13 +12,19 @@ pub fn local(ts: Timestamp, format: &str, fallback: &str) -> String {
 }
 
 /// Local "21:00", or "9:00 PM" with the 12-hour clock.
-pub fn hhmm(ts: Timestamp, h24: bool) -> String { local(ts, if h24 { "%H:%M" } else { "%-I:%M %p" }, "--:--") }
+pub fn hhmm(ts: Timestamp, h24: bool) -> String {
+    local(ts, if h24 { "%H:%M" } else { "%-I:%M %p" }, "--:--")
+}
 
 /// Local "Thu 21:00" / "Thu 9:00 PM".
-pub fn day_time(ts: Timestamp, h24: bool) -> String { local(ts, if h24 { "%a %H:%M" } else { "%a %-I:%M %p" }, "--") }
+pub fn day_time(ts: Timestamp, h24: bool) -> String {
+    local(ts, if h24 { "%a %H:%M" } else { "%a %-I:%M %p" }, "--")
+}
 
 /// "21:00–22:00" / "9:00 PM–10:00 PM" (compact form for row detail lines).
-pub fn span(start: Timestamp, stop: Timestamp, h24: bool) -> String { format!("{}–{}", hhmm(start, h24), hhmm(stop, h24)) }
+pub fn span(start: Timestamp, stop: Timestamp, h24: bool) -> String {
+    format!("{}–{}", hhmm(start, h24), hhmm(stop, h24))
+}
 
 #[cfg(test)]
 mod tests {

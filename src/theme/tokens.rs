@@ -187,30 +187,30 @@ pub struct Tokens {
     pub success: Color32,
     pub warning: Color32,
     // text
-    pub text_secondary: Color32,  // fg @ 0.52
+    pub text_secondary: Color32,   // fg @ 0.52
     pub text_placeholder: Color32, // fg @ 0.58
-    pub text_section: Color32,    // darker(fg, 1.4)
-    pub text_disabled: Color32,   // fg @ 0.36
+    pub text_section: Color32,     // darker(fg, 1.4)
+    pub text_disabled: Color32,    // fg @ 0.36
     // lines
-    pub separator: Color32,       // fg @ 0.12
-    pub pane_divider: Color32,    // fg @ 0.28
-    pub group_divider: Color32,   // fg @ 0.20
-    pub card_border: Color32,     // menu.border (fg) @ menu.border-alpha
-    pub popup_border: Color32,    // popups.border (accent) @ popups.border-alpha
-    pub card_border_width: f32,   // popups/menu border-width, else max(1, space(2)) = 2 px
+    pub separator: Color32,     // fg @ 0.12
+    pub pane_divider: Color32,  // fg @ 0.28
+    pub group_divider: Color32, // fg @ 0.20
+    pub card_border: Color32,   // menu.border (fg) @ menu.border-alpha
+    pub popup_border: Color32,  // popups.border (accent) @ popups.border-alpha
+    pub card_border_width: f32, // popups/menu border-width, else max(1, space(2)) = 2 px
     // state fills ([controls] state colour, default fg, @ alpha)
-    pub fill_field: Color32,      // 0.04
-    pub fill_hover: Color32,      // 0.08
-    pub fill_selected: Color32,   // 0.18
-    pub fill_pressed: Color32,    // 0.22
+    pub fill_field: Color32,          // 0.04
+    pub fill_hover: Color32,          // 0.08
+    pub fill_selected: Color32,       // 0.18
+    pub fill_pressed: Color32,        // 0.22
     pub fill_text_selection: Color32, // 0.35
-    pub border_field: Color32,    // fg @ 0.4
-    pub border_hover: Color32,    // fg @ 0.25
+    pub border_field: Color32,        // fg @ 0.4
+    pub border_hover: Color32,        // fg @ 0.25
     // lists (menu idiom)
-    pub list_cursor_bg: Color32,  // menu.selected-background @ alpha (fg @ 0.08)
-    pub list_cursor_text: Color32, // menu.selected-text (accent)
+    pub list_cursor_bg: Color32,     // menu.selected-background @ alpha (fg @ 0.08)
+    pub list_cursor_text: Color32,   // menu.selected-text (accent)
     pub list_cursor_border: Color32, // menu.selected-border @ alpha (template: fg @ 0.25; none: 0)
-    pub scrim: Color32,           // menu.scrim @ alpha (bg @ 0.5)
+    pub scrim: Color32,              // menu.scrim @ alpha (bg @ 0.5)
     /// Fixed dark scrim for video OSD regardless of theme mode (FIXED DECISION 6).
     pub osd_scrim: Color32,
     pub osd_text: Color32,
@@ -242,10 +242,14 @@ pub const OSD_EFFECTIVE_BG: Color32 = Color32::from_rgb(0x2b, 0x2b, 0x2b);
 const OSD_TEXT: Color32 = Color32::from_rgb(0xf2, 0xf2, 0xf2);
 
 /// `[font] base-size` with Style.qml semantics: `parseInt`, 1 px floor, default 12.
-fn base_size(shell: &ShellConfig) -> f32 { shell.f32("font", "base-size").map(f32::trunc).unwrap_or(12.0).max(1.0) }
+fn base_size(shell: &ShellConfig) -> f32 {
+    shell.f32("font", "base-size").map(f32::trunc).unwrap_or(12.0).max(1.0)
+}
 
 /// Config `ui_scale` guard: non-finite or non-positive values mean 1.0.
-fn sanitize_ui_scale(s: f32) -> f32 { if s.is_finite() && s > 0.0 { s } else { 1.0 } }
+fn sanitize_ui_scale(s: f32) -> f32 {
+    if s.is_finite() && s > 0.0 { s } else { 1.0 }
+}
 
 /// WCAG relative luminance of an sRGB colour.
 pub fn relative_luminance(c: Color32) -> f32 {
@@ -266,7 +270,9 @@ impl Tokens {
     /// Layout unit relative to Omarchy's default text size: `base_font / 12` (base-size × UI
     /// scale). Breakpoints, sidebar widths and guide geometry scale with it so
     /// `omarchy display text size 16` doesn't cramp the Medium layout.
-    pub fn rem(&self) -> f32 { self.base_font / 12.0 }
+    pub fn rem(&self) -> f32 {
+        self.base_font / 12.0
+    }
 
     /// Derive every token from the palette and the merged shell config (Omarchy `Style.qml` /
     /// `Color.qml` semantics; see the module docs). `ui_scale` multiplies the base font size and
@@ -306,10 +312,7 @@ impl Tokens {
         let hover_border = alpha("hover-cursor-border-alpha", 0.25);
 
         let space2 = (2.0 * scale).round().max(1.0);
-        let card_border_width = shell
-            .border_width("popups", "border-width")
-            .or_else(|| shell.border_width("menu", "border-width"))
-            .unwrap_or(space2);
+        let card_border_width = shell.border_width("popups", "border-width").or_else(|| shell.border_width("menu", "border-width")).unwrap_or(space2);
         Self {
             base_font,
             scale,
@@ -406,7 +409,8 @@ mod osd_tests {
     #[test]
     fn osd_accent_choice() {
         let shell = ShellConfig::default();
-        let pal = |accent: &str| Palette::parse(&format!("background = \"#ffffff\"\nforeground = \"#222222\"\naccent = \"{accent}\"\n"), false).unwrap();
+        let pal =
+            |accent: &str| Palette::parse(&format!("background = \"#ffffff\"\nforeground = \"#222222\"\naccent = \"{accent}\"\n"), false).unwrap();
         assert_eq!(Tokens::compute(&pal("#6e6e6e"), &shell, 0.0, 1.0).osd_accent, OSD_TEXT);
         assert_eq!(Tokens::compute(&pal("#7aa2f7"), &shell, 0.0, 1.0).osd_accent, Color32::from_rgb(0x7a, 0xa2, 0xf7));
     }
@@ -416,7 +420,9 @@ mod osd_tests {
 mod tests {
     use super::*;
 
-    fn pal() -> Palette { Palette::parse("accent = \"#F3B77B\"\nbackground = \"#151E26\"\nforeground = \"#ECE5D8\"\n", false).unwrap() }
+    fn pal() -> Palette {
+        Palette::parse("accent = \"#F3B77B\"\nbackground = \"#151E26\"\nforeground = \"#ECE5D8\"\n", false).unwrap()
+    }
 
     #[test]
     fn with_alpha_replaces_alpha_of_translucent_colours() {

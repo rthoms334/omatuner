@@ -27,7 +27,9 @@ pub struct Toasts {
 }
 
 impl Toasts {
-    pub fn push(&mut self, t: Toast) { self.items.push((t, Instant::now())); }
+    pub fn push(&mut self, t: Toast) {
+        self.items.push((t, Instant::now()));
+    }
 
     /// Draw + expire. `avoid` = the mini-player rect (toasts stack above it); `bottom` = y of
     /// the status bar top. Returns an action if a toast button was pressed.
@@ -52,43 +54,39 @@ impl Toasts {
         let mut out = None;
         let mut dismiss = None;
         let mut hovered = Vec::new();
-        egui::Area::new(egui::Id::new("toasts"))
-            .order(egui::Order::Foreground)
-            .pivot(egui::Align2::RIGHT_BOTTOM)
-            .fixed_pos(anchor)
-            .show(ctx, |ui| {
-                ui.set_max_width(width);
-                ui.spacing_mut().item_spacing.y = theme.space(SpaceToken::Md);
-                for (i, (t, _)) in self.items.iter().enumerate().skip(first) {
-                    let (glyph, color) = match t.kind {
-                        ToastKind::Info => (glyphs::INFO, tk.fg),
-                        ToastKind::Success => (glyphs::CHECK, tk.success),
-                        ToastKind::Warning => (glyphs::WARNING, tk.warning),
-                        ToastKind::Error => (glyphs::CLOSE, tk.urgent),
-                    };
-                    let card = card_frame(theme, CardKind::Popup).show(ui, |ui| {
-                        ui.set_width(width - 2.0 * theme.space(SpaceToken::PopupPadding) - 2.0 * tk.card_border_width);
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = theme.space(SpaceToken::Lg);
-                            ui.label(egui::RichText::new(glyph).font(paint::font(theme, TypeToken::Icon)).color(color));
-                            if let Some((label, action)) = &t.action {
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if button(ui, theme, None, label, ButtonStyle { primary: true, ..Default::default() }).clicked() {
-                                        out = Some(*action);
-                                        dismiss = Some(i);
-                                    }
-                                    ui.add(egui::Label::new(egui::RichText::new(&t.text).color(tk.fg).size(theme.font(TypeToken::Body))).wrap());
-                                });
-                            } else {
+        egui::Area::new(egui::Id::new("toasts")).order(egui::Order::Foreground).pivot(egui::Align2::RIGHT_BOTTOM).fixed_pos(anchor).show(ctx, |ui| {
+            ui.set_max_width(width);
+            ui.spacing_mut().item_spacing.y = theme.space(SpaceToken::Md);
+            for (i, (t, _)) in self.items.iter().enumerate().skip(first) {
+                let (glyph, color) = match t.kind {
+                    ToastKind::Info => (glyphs::INFO, tk.fg),
+                    ToastKind::Success => (glyphs::CHECK, tk.success),
+                    ToastKind::Warning => (glyphs::WARNING, tk.warning),
+                    ToastKind::Error => (glyphs::CLOSE, tk.urgent),
+                };
+                let card = card_frame(theme, CardKind::Popup).show(ui, |ui| {
+                    ui.set_width(width - 2.0 * theme.space(SpaceToken::PopupPadding) - 2.0 * tk.card_border_width);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = theme.space(SpaceToken::Lg);
+                        ui.label(egui::RichText::new(glyph).font(paint::font(theme, TypeToken::Icon)).color(color));
+                        if let Some((label, action)) = &t.action {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if button(ui, theme, None, label, ButtonStyle { primary: true, ..Default::default() }).clicked() {
+                                    out = Some(*action);
+                                    dismiss = Some(i);
+                                }
                                 ui.add(egui::Label::new(egui::RichText::new(&t.text).color(tk.fg).size(theme.font(TypeToken::Body))).wrap());
-                            }
-                        });
+                            });
+                        } else {
+                            ui.add(egui::Label::new(egui::RichText::new(&t.text).color(tk.fg).size(theme.font(TypeToken::Body))).wrap());
+                        }
                     });
-                    if card.response.contains_pointer() {
-                        hovered.push(i);
-                    }
+                });
+                if card.response.contains_pointer() {
+                    hovered.push(i);
                 }
-            });
+            }
+        });
         for i in hovered {
             self.items[i].1 = now;
         }
@@ -101,10 +99,14 @@ impl Toasts {
         out
     }
 
-    pub fn is_empty(&self) -> bool { self.items.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
 }
 
-fn ttl(t: &Toast) -> Duration { Duration::from_millis(t.ttl_ms as u64) }
+fn ttl(t: &Toast) -> Duration {
+    Duration::from_millis(t.ttl_ms as u64)
+}
 
 /// Bottom-right corner of the stack: `gap` inside the screen's right edge, above the status bar
 /// top (`bottom`) and above `avoid` when it shares the stack's column (the mini player).

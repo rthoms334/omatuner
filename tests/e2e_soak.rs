@@ -45,11 +45,7 @@ fn rss_kib() -> u64 {
     // SAFETY: plain glibc call without pointers; safe at any time.
     unsafe { malloc_trim(0) };
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-    status
-        .lines()
-        .find_map(|l| l.strip_prefix("VmRSS:"))
-        .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
-        .unwrap_or(0)
+    status.lines().find_map(|l| l.strip_prefix("VmRSS:")).and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok()).unwrap_or(0)
 }
 
 /// Memory held by SQLite's allocator (page caches, statements) in KiB.

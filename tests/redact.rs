@@ -20,10 +20,7 @@ fn xtream_urls_in_every_form() {
         ("http://h.tv:8080/movie/alice/wonder1/77.mkv", "http://h.tv:8080/movie/***/***/77.mkv"),
         ("http://h.tv:8080/series/alice/wonder1/88.mp4", "http://h.tv:8080/series/***/***/88.mp4"),
         ("http://h.tv:8080/alice/wonder1/1234", "http://h.tv:8080/***/***/1234"),
-        (
-            "http://h.tv:8080/timeshift/alice/wonder1/120/2026-10-09:20-00/1234.ts",
-            "http://h.tv:8080/timeshift/***/***/120/2026-10-09:20-00/1234.ts",
-        ),
+        ("http://h.tv:8080/timeshift/alice/wonder1/120/2026-10-09:20-00/1234.ts", "http://h.tv:8080/timeshift/***/***/120/2026-10-09:20-00/1234.ts"),
         ("https://alice:wonder1@iptv.example/list.m3u", "https://***@iptv.example/list.m3u"),
         ("http://x.tv/s.m3u8?token=abc123&expires=99", "http://x.tv/s.m3u8?token=***&expires=99"),
         ("http://x.tv/s.m3u8?SIG=abc123", "http://x.tv/s.m3u8?SIG=***"),
@@ -100,10 +97,7 @@ fn quoted_header_forms_lose_their_values() {
         assert!(r.contains("Tuner/1.0") && r.contains("10.0.0.1"), "neighbours stay readable: {r}");
     }
     assert_eq!(redact(&debug), debug.replace("sid=QUOTEDCOOKIE-5c1e", "***").replace("Bearer QUOTEDTOKEN-5c1e", "***"));
-    assert_eq!(
-        redact(r#"{"Authorization": "Bearer QUOTEDTOKEN-5c1e", "Accept": "*/*"}"#),
-        r#"{"Authorization": "***", "Accept": "*/*"}"#
-    );
+    assert_eq!(redact(r#"{"Authorization": "Bearer QUOTEDTOKEN-5c1e", "Accept": "*/*"}"#), r#"{"Authorization": "***", "Accept": "*/*"}"#);
 }
 
 #[test]

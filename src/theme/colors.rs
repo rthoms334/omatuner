@@ -92,9 +92,15 @@ const LEGACY_ANSI_ALIAS: [(&str, &str); 12] = [
 struct RawPalette(HashMap<String, String>);
 
 impl RawPalette {
-    fn has(&self, k: &str) -> bool { self.0.get(k).is_some_and(|v| !v.is_empty()) }
-    fn get(&self, k: &str) -> Option<&str> { self.0.get(k).map(String::as_str).filter(|v| !v.is_empty()) }
-    fn set(&mut self, k: &str, v: impl Into<String>) { self.0.insert(k.to_owned(), v.into()); }
+    fn has(&self, k: &str) -> bool {
+        self.0.get(k).is_some_and(|v| !v.is_empty())
+    }
+    fn get(&self, k: &str) -> Option<&str> {
+        self.0.get(k).map(String::as_str).filter(|v| !v.is_empty())
+    }
+    fn set(&mut self, k: &str, v: impl Into<String>) {
+        self.0.insert(k.to_owned(), v.into());
+    }
 
     /// `alias_theme_color key fallback`: copy `fallback` into an unset `key`.
     fn alias(&mut self, key: &str, fallback: &str) {
@@ -309,9 +315,13 @@ fn hex_rgb(s: &str) -> Option<Color32> {
     }
 }
 
-fn to_hex(c: Color32) -> String { format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b()) }
+fn to_hex(c: Color32) -> String {
+    format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b())
+}
 
-pub const fn rgb(r: u8, g: u8, b: u8) -> Color32 { Color32::from_rgb(r, g, b) }
+pub const fn rgb(r: u8, g: u8, b: u8) -> Color32 {
+    Color32::from_rgb(r, g, b)
+}
 
 /// Linear mix in sRGB space (what Omarchy's templates do): `t` = weight of `b`. Rounds half up
 /// like the awk mixer (`int(x + 0.5)`).

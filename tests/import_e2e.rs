@@ -450,9 +450,13 @@ async fn start_panel(panel: Arc<Panel>) -> (String, tokio::sync::oneshot::Sender
     (base, tx)
 }
 
-fn fixture_json(rel: &str) -> serde_json::Value { serde_json::from_slice(&std::fs::read(support::fixture(rel)).unwrap()).unwrap() }
+fn fixture_json(rel: &str) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(support::fixture(rel)).unwrap()).unwrap()
+}
 
-fn json(v: &serde_json::Value) -> Response { ([(header::CONTENT_TYPE, "application/json")], serde_json::to_vec(v).unwrap()).into_response() }
+fn json(v: &serde_json::Value) -> Response {
+    ([(header::CONTENT_TYPE, "application/json")], serde_json::to_vec(v).unwrap()).into_response()
+}
 
 fn panel_reply(p: &Panel, uri: &Uri) -> Response {
     let file = |rel: &str| std::fs::read(support::fixture(rel)).unwrap().into_response();
@@ -618,7 +622,6 @@ async fn an_onboarding_retry_saves_the_corrected_draft() {
     assert_eq!(src.status.counts.channels, 2);
     assert!(src.status.last_refresh.is_some() && src.status.last_error.is_none(), "{:?}", src.status);
 }
-
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn probing_upgrades_xtream_urls_and_classifies_playlists() {

@@ -68,11 +68,8 @@ fn main() -> anyhow::Result<()> {
 
     // Paths are made absolute HERE: a running instance receiving them over IPC has another
     // working directory.
-    let request = IpcRequest {
-        view: cli.view,
-        play: cli.play.as_deref().map(absolute_input),
-        inputs: cli.inputs.iter().map(|i| absolute_input(i)).collect(),
-    };
+    let request =
+        IpcRequest { view: cli.view, play: cli.play.as_deref().map(absolute_input), inputs: cli.inputs.iter().map(|i| absolute_input(i)).collect() };
     if tuner::ipc::try_handoff(&paths.ipc_socket(), &request)? {
         return Ok(());
     }
@@ -140,7 +137,9 @@ fn absolute_input(input: &str) -> String {
 
 /// Something listens on the instance socket (a stale file refuses the connection). Only
 /// connects — sending a request would raise that instance's window.
-fn instance_running(socket: &Path) -> bool { std::os::unix::net::UnixStream::connect(socket).is_ok() }
+fn instance_running(socket: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(socket).is_ok()
+}
 
 /// `--refresh`: store + HTTP + job manager only (no player, no window); submits
 /// `RefreshStale` and waits for it and every follow-up job. Returns how many jobs failed.
@@ -286,7 +285,8 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let (bus, events) = EventBus::new(None);
         let store = Store::open(&paths.db_file(), None).unwrap();
-        let http = HttpClient::new(&tuner::sources::http::HttpOptions { default_user_agent: "t".into(), connect_timeout_s: 1, read_timeout_s: 1 }).unwrap();
+        let http =
+            HttpClient::new(&tuner::sources::http::HttpOptions { default_user_agent: "t".into(), connect_timeout_s: 1, read_timeout_s: 1 }).unwrap();
         let jobs = JobManager::new(JobContext::new(store.clone(), http, bus, paths, Arc::default()), rt.handle().clone());
         // a root id that never finishes
         let failed = wait_for_jobs(&jobs, &events, JobId(u64::MAX), Duration::from_millis(300));

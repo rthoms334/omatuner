@@ -84,7 +84,9 @@ pub enum PlayerCommand {
     /// Zap within the current ZapList (wraps; skips channels for which
     /// `MediaResolver::skip_on_zap` is true: ≥ 2 recent failures, DRM, resolve failures). Keeps
     /// the current `PlayOrigin`.
-    Zap { forward: bool },
+    Zap {
+        forward: bool,
+    },
     /// Tune a channel by id keeping the current ZapList and origin (numeric entry, history).
     ZapTo(ChannelId),
     /// Recall the previously watched live channel (Backspace / UHF ←).
@@ -113,7 +115,10 @@ pub enum PlayerCommand {
     SetZapList(ZapList),
     /// Provider limits from account info (budget). Sent by the app at startup for every source
     /// (from stored `AccountInfo`) and after every `JobOutcome::SourceRefreshed`.
-    SetConnectionLimit { source: crate::model::SourceId, max: Option<u32> },
+    SetConnectionLimit {
+        source: crate::model::SourceId,
+        max: Option<u32>,
+    },
     /// Settings changed: re-derive `MachineConfig` and set the runtime-settable mpv properties
     /// (`hwdec`, `cache-secs`, `demuxer-readahead-secs`, `demuxer-max-bytes`,
     /// `network-timeout`, `alang`, `slang`, subtitle auto mode, `sub-scale`, user-agent).
@@ -163,15 +168,28 @@ pub struct PlayerError {
 pub enum PlayerState {
     Idle,
     /// Waiting out the zapping delay before connecting.
-    Zapping { until: Instant },
+    Zapping {
+        until: Instant,
+    },
     /// loadfile issued, waiting for the first frame.
-    Loading { since: Instant, attempt: u32 },
+    Loading {
+        since: Instant,
+        attempt: u32,
+    },
     Playing,
     Paused,
     /// Cache underrun (`paused-for-cache`), `percent` from `cache-buffering-state`.
-    Buffering { since: Instant, percent: Option<i64> },
+    Buffering {
+        since: Instant,
+        percent: Option<i64>,
+    },
     /// Waiting to retry.
-    Reconnecting { attempt: u32, max: u32, at: Instant, reason: PlayerErrorKind },
+    Reconnecting {
+        attempt: u32,
+        max: u32,
+        at: Instant,
+        reason: PlayerErrorKind,
+    },
     /// VOD reached the end.
     Ended,
     Error(PlayerError),
@@ -180,7 +198,14 @@ pub enum PlayerState {
 impl PlayerState {
     /// Video is (about to be) on screen: idle inhibit, MPRIS "Playing".
     pub fn is_active(&self) -> bool {
-        matches!(self, PlayerState::Playing | PlayerState::Buffering { .. } | PlayerState::Loading { .. } | PlayerState::Reconnecting { .. } | PlayerState::Zapping { .. })
+        matches!(
+            self,
+            PlayerState::Playing
+                | PlayerState::Buffering { .. }
+                | PlayerState::Loading { .. }
+                | PlayerState::Reconnecting { .. }
+                | PlayerState::Zapping { .. }
+        )
     }
 }
 
@@ -257,7 +282,10 @@ pub enum PlayerEvent {
     /// A new item became current (also during Zapping, so the OSD shows it immediately).
     NowPlaying(Arc<Playable>),
     /// VOD ended (`finished` = reached watched threshold).
-    Ended { item: Option<ItemRef>, finished: bool },
+    Ended {
+        item: Option<ItemRef>,
+        finished: bool,
+    },
     Failed(PlayerError),
     TracksChanged,
 }
@@ -321,11 +349,17 @@ pub struct PlayerHandle {
 }
 
 impl PlayerHandle {
-    pub fn send(&self, cmd: PlayerCommand) { let _ = self.tx.send(cmd); }
+    pub fn send(&self, cmd: PlayerCommand) {
+        let _ = self.tx.send(cmd);
+    }
     /// Latest snapshot (cheap Arc clone).
-    pub fn snapshot(&self) -> Arc<PlayerSnapshot> { self.snapshot.borrow().clone() }
+    pub fn snapshot(&self) -> Arc<PlayerSnapshot> {
+        self.snapshot.borrow().clone()
+    }
     /// For async consumers (MPRIS) that await changes.
-    pub fn subscribe(&self) -> watch::Receiver<Arc<PlayerSnapshot>> { self.snapshot.clone() }
+    pub fn subscribe(&self) -> watch::Receiver<Arc<PlayerSnapshot>> {
+        self.snapshot.clone()
+    }
 }
 
 /// Owns mpv + threads. Lives in `Services`; shut down via [`Player::shutdown`] AFTER the video
@@ -355,8 +389,8 @@ impl Player {
         let pump = events::EventPump::start(mpv.clone(), evt_tx).map_err(crate::error::Error::other)?;
         let render_clock: RenderClock = Arc::new(AtomicU64::new(0));
         let epoch = Instant::now();
-        let controller = controller::spawn(mpv.clone(), cfg, deps, cmd_rx, evt_rx, snap_tx, render_clock.clone(), epoch)
-            .map_err(crate::error::Error::other)?;
+        let controller =
+            controller::spawn(mpv.clone(), cfg, deps, cmd_rx, evt_rx, snap_tx, render_clock.clone(), epoch).map_err(crate::error::Error::other)?;
         Ok(Self {
             mpv: Some(mpv),
             handle: PlayerHandle { tx: cmd_tx, snapshot: snap_rx },
@@ -368,7 +402,9 @@ impl Player {
         })
     }
 
-    pub fn handle(&self) -> PlayerHandle { self.handle.clone() }
+    pub fn handle(&self) -> PlayerHandle {
+        self.handle.clone()
+    }
 
     /// Raw core for `VideoSurface::new` ONLY (see module docs: no other mpv access from the UI).
     pub(crate) fn render_core(&self) -> Option<RenderCore> {
@@ -388,15 +424,18 @@ impl Player {
         // A render context still alive here means `VideoSurface::destroy` was skipped (panic /
         // unwind). Destroying mpv now would be UB (render ctx must be freed first), so leak it.
         if self.render_alive.load(Ordering::Acquire)
-            && let Some(m) = self.mpv.take() {
-                tracing::error!("player dropped while the video surface is alive; leaking mpv");
-                std::mem::forget(m);
-            }
+            && let Some(m) = self.mpv.take()
+        {
+            tracing::error!("player dropped while the video surface is alive; leaking mpv");
+            std::mem::forget(m);
+        }
     }
 }
 
 impl Drop for Player {
-    fn drop(&mut self) { self.shutdown(); }
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 /// Headless controller tests against a real libmpv (`vo=null`, `ao=null`) playing libavdevice's
@@ -428,7 +467,9 @@ mod tests {
                 duration_hint: None,
             })
         }
-        fn skip_on_zap(&mut self, _ch: ChannelId) -> bool { false }
+        fn skip_on_zap(&mut self, _ch: ChannelId) -> bool {
+            false
+        }
     }
 
     fn headless_config() -> Config {
@@ -475,9 +516,7 @@ mod tests {
         cfg.player.mpv_options.insert("video-sync".into(), "display-resample".into());
         p.handle().send(PlayerCommand::ApplyConfig(Box::new(cfg)));
         // the controller sets the properties one by one: wait for the last one it applies
-        assert!(wait_until(Duration::from_secs(5), || {
-            mpv.get_property::<String>("video-sync").ok().as_deref() == Some("display-resample")
-        }));
+        assert!(wait_until(Duration::from_secs(5), || { mpv.get_property::<String>("video-sync").ok().as_deref() == Some("display-resample") }));
         assert_eq!(mpv.get_property::<f64>("cache-secs").unwrap(), 4.0);
         assert_eq!(mpv.get_property::<f64>("demuxer-readahead-secs").unwrap(), 4.0);
         assert_eq!(mpv.get_property::<f64>("network-timeout").unwrap(), 7.0);

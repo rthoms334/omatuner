@@ -39,8 +39,7 @@ const PROGRESS_STEP: u64 = 256 * 1024;
 const READ_BUF: usize = 256 * 1024;
 
 /// Copy shown when a web page arrives where data was expected (§9.1, §13.12).
-const HTML_INSTEAD_OF_DATA: &str =
-    "the server returned a web page instead of data — the account may have expired or the server is blocking this app";
+const HTML_INSTEAD_OF_DATA: &str = "the server returned a web page instead of data — the account may have expired or the server is blocking this app";
 
 #[derive(Clone)]
 pub struct HttpClient {
@@ -118,19 +117,16 @@ impl HttpClient {
     }
 
     /// The current reqwest client (an `Arc` clone).
-    fn client(&self) -> reqwest::Client { self.shared.read().unwrap_or_else(|e| e.into_inner()).client.clone() }
+    fn client(&self) -> reqwest::Client {
+        self.shared.read().unwrap_or_else(|e| e.into_inner()).client.clone()
+    }
 
     /// GET a URL and deserialize JSON. Body read fully (bounded at 512 MiB), then
     /// `serde_json::from_slice` in `spawn_blocking`. HTML bodies → `Error::BadPayload`.
     ///
     /// A leading BOM/whitespace is skipped and an empty body parses as JSON `null` (panels
     /// answer "nothing" that way; lenient target types map it to their default).
-    pub async fn get_json<T: DeserializeOwned + Send + 'static>(
-        &self,
-        url: &str,
-        headers: &HttpHeaders,
-        cancel: &CancellationToken,
-    ) -> Result<T> {
+    pub async fn get_json<T: DeserializeOwned + Send + 'static>(&self, url: &str, headers: &HttpHeaders, cancel: &CancellationToken) -> Result<T> {
         let body = trim_json_start(self.fetch(url, headers, JSON_MAX_BYTES, cancel).await?);
         match sniff_payload(&body[..body.len().min(4096)]) {
             PayloadKind::Html => return Err(Error::BadPayload(HTML_INSTEAD_OF_DATA.into())),
@@ -195,7 +191,9 @@ impl HttpClient {
         result
     }
 
-    pub fn default_user_agent(&self) -> String { self.shared.read().unwrap_or_else(|e| e.into_inner()).opts.default_user_agent.clone() }
+    pub fn default_user_agent(&self) -> String {
+        self.shared.read().unwrap_or_else(|e| e.into_inner()).opts.default_user_agent.clone()
+    }
 
     /// GET with `headers`; non-success status → `Error::Http`; body bounded at `max`.
     async fn fetch(&self, url: &str, headers: &HttpHeaders, max: u64, cancel: &CancellationToken) -> Result<Bytes> {
@@ -271,13 +269,13 @@ pub fn open_decompressed(path: &Path) -> Result<Box<dyn BufRead + Send>> {
         Compression::None => Box::new(BufReader::with_capacity(READ_BUF, file)),
         // Multi-member: concatenated (`cat a.gz b.gz`) and bgzip-style files are valid inputs.
         Compression::Gzip => Box::new(BufReader::with_capacity(READ_BUF, flate2::read::MultiGzDecoder::new(file))),
-        Compression::Xz => {
-            Box::new(BufReader::with_capacity(READ_BUF, liblzma::read::XzDecoder::new_multi_decoder(BufReader::new(file))))
-        }
+        Compression::Xz => Box::new(BufReader::with_capacity(READ_BUF, liblzma::read::XzDecoder::new_multi_decoder(BufReader::new(file)))),
     })
 }
 
-fn header_value(v: &str) -> Option<HeaderValue> { HeaderValue::from_str(v.trim()).ok() }
+fn header_value(v: &str) -> Option<HeaderValue> {
+    HeaderValue::from_str(v.trim()).ok()
+}
 
 fn header_string(resp: &reqwest::Response, name: HeaderName) -> Option<String> {
     resp.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_owned).filter(|s| !s.is_empty())
@@ -388,13 +386,7 @@ async fn create_part(part: &Path) -> Result<tokio::fs::File> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(Error::io(part, e)),
     }
-    let file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(part)
-        .await
-        .map_err(|e| Error::io(part, e))?;
+    let file = tokio::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(part).await.map_err(|e| Error::io(part, e))?;
     // The umask can only remove bits, but be explicit: nobody but the owner may read it.
     file.set_permissions(std::fs::Permissions::from_mode(0o600)).await.map_err(|e| Error::io(part, e))?;
     Ok(file)
@@ -465,9 +457,13 @@ mod tests {
         e.finish().unwrap()
     }
 
-    fn plain_body() -> Vec<u8> { (0..BIG).map(|i| b"abcdefghij\n"[i % 11]).collect() }
+    fn plain_body() -> Vec<u8> {
+        (0..BIG).map(|i| b"abcdefghij\n"[i % 11]).collect()
+    }
 
-    fn hdr(h: &HeaderMap, name: &str) -> String { h.get(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_owned() }
+    fn hdr(h: &HeaderMap, name: &str) -> String {
+        h.get(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_owned()
+    }
 
     /// 64 KiB every 20 ms for ~20 s.
     fn slow_body() -> Body {
@@ -536,9 +532,13 @@ mod tests {
         base
     }
 
-    fn client() -> HttpClient { HttpClient::new(&HttpOptions::default()).unwrap() }
+    fn client() -> HttpClient {
+        HttpClient::new(&HttpOptions::default()).unwrap()
+    }
 
-    fn none() -> HttpHeaders { HttpHeaders::default() }
+    fn none() -> HttpHeaders {
+        HttpHeaders::default()
+    }
 
     fn req(url: String, dest: PathBuf) -> DownloadRequest {
         DownloadRequest { url: Secret::new(url), dest, headers: none(), etag: None, last_modified: None }

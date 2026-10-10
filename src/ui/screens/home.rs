@@ -89,7 +89,9 @@ pub(crate) mod kit {
     }
 
     /// The parental session is open (no PIN, disabled, or unlocked and not expired).
-    pub(crate) fn unlocked(ctx: &UiCtx<'_>) -> bool { ctx.parental.is_unlocked(&ctx.config.parental) }
+    pub(crate) fn unlocked(ctx: &UiCtx<'_>) -> bool {
+        ctx.parental.is_unlocked(&ctx.config.parental)
+    }
 
     /// A channel needs the PIN right now (it or one of its groups is locked).
     pub(crate) fn channel_locked(ctx: &UiCtx<'_>, id: ChannelId) -> bool {
@@ -138,7 +140,11 @@ pub(crate) mod kit {
         };
         let on = !ctx.favs.is_fav(item);
         let (now, write_item) = (ctx.now, item.clone());
-        let _ = ctx.services.store.writer().submit_notify(DataScope::Favourites, move |c| crate::store::user::set_favourite(c, list, &write_item, on, now));
+        let _ = ctx
+            .services
+            .store
+            .writer()
+            .submit_notify(DataScope::Favourites, move |c| crate::store::user::set_favourite(c, list, &write_item, on, now));
         ctx.favs.apply_toggle(list, item, on);
         ctx.toast(Toast::info(if on { "Added to Favourites" } else { "Removed from Favourites" }));
     }
@@ -158,7 +164,9 @@ pub(crate) mod kit {
     }
 
     /// One of the groups `ids` (looked up in `groups`) is locked.
-    pub(crate) fn any_group_locked(groups: &[Group], ids: &[GroupId]) -> bool { ids.iter().any(|id| groups.iter().any(|g| g.id == *id && g.locked)) }
+    pub(crate) fn any_group_locked(groups: &[Group], ids: &[GroupId]) -> bool {
+        ids.iter().any(|id| groups.iter().any(|g| g.id == *id && g.locked))
+    }
 
     /// Ctrl+L on an item: lock / unlock it (needs a PIN; unlocking needs the open session).
     /// `locked_now` is the effective lock; when it comes from a locked category
@@ -239,7 +247,8 @@ pub(crate) mod kit {
         let _ = ctx.services.store.writer().submit_notify(DataScope::Overrides, move |c| {
             let existing = crate::store::user::group_overrides(c)?;
             for (pos, key) in keys.iter().enumerate() {
-                let mut ov = existing.iter().find(|r| r.source == source && r.kind == kind && r.key == *key).map(|r| r.ov.clone()).unwrap_or_default();
+                let mut ov =
+                    existing.iter().find(|r| r.source == source && r.kind == kind && r.key == *key).map(|r| r.ov.clone()).unwrap_or_default();
                 ov.user_order = Some(pos as i32);
                 crate::store::user::set_group_override(c, source, kind, key, &ov)?;
             }
@@ -251,7 +260,11 @@ pub(crate) mod kit {
     /// Add to / remove from one favourites list (store + optimistic index patch).
     pub(crate) fn set_in_list(ctx: &mut UiCtx<'_>, list: FavListId, item: &ItemRef, on: bool) {
         let (now, write_item) = (ctx.now, item.clone());
-        let _ = ctx.services.store.writer().submit_notify(DataScope::Favourites, move |c| crate::store::user::set_favourite(c, list, &write_item, on, now));
+        let _ = ctx
+            .services
+            .store
+            .writer()
+            .submit_notify(DataScope::Favourites, move |c| crate::store::user::set_favourite(c, list, &write_item, on, now));
         ctx.favs.apply_toggle(list, item, on);
     }
 
@@ -264,7 +277,11 @@ pub(crate) mod kit {
 
     /// F2 on an item (the overlay writes the rename).
     pub(crate) fn rename_item(ctx: &mut UiCtx<'_>, item: &ItemRef, name: &str) {
-        ctx.open(OverlayRequest::Rename(RenameSpec { title: "Rename".into(), initial: name.to_owned(), target: RenameTarget::Item { item: item.clone() } }));
+        ctx.open(OverlayRequest::Rename(RenameSpec {
+            title: "Rename".into(),
+            initial: name.to_owned(),
+            target: RenameTarget::Item { item: item.clone() },
+        }));
     }
 
     /// F2 on a category.
@@ -279,7 +296,9 @@ pub(crate) mod kit {
     }
 
     /// A shortcut from Help that has no meaning for what is focused.
-    pub(crate) fn not_here(ctx: &mut UiCtx<'_>) { ctx.toast(Toast::info("Not available here")); }
+    pub(crate) fn not_here(ctx: &mut UiCtx<'_>) {
+        ctx.toast(Toast::info("Not available here"));
+    }
 
     /// A palette colour used as TEXT on the background (source badges, the onboarding
     /// preview): the colour itself when it reads (≥ 3:1), else the foreground (yellow on a
@@ -342,7 +361,9 @@ pub(crate) mod kit {
     pub(crate) use crate::ui::widgets::time::{day_time, hhmm, local};
 
     /// Local "YYYY-MM-DD".
-    pub(crate) fn date(ts: crate::model::Timestamp) -> String { local(ts, "%Y-%m-%d", "?") }
+    pub(crate) fn date(ts: crate::model::Timestamp) -> String {
+        local(ts, "%Y-%m-%d", "?")
+    }
 
     /// "2 h ago" / "just now" / "3 d ago".
     pub(crate) fn ago(now: crate::model::Timestamp, then: crate::model::Timestamp) -> String {
@@ -409,7 +430,10 @@ enum StartAction {
 #[derive(Debug, Clone, PartialEq)]
 enum Tile {
     /// A channel; `collection` = the favourites list it was shown in (else its primary group).
-    Channel { id: ChannelId, collection: Option<Collection> },
+    Channel {
+        id: ChannelId,
+        collection: Option<Collection>,
+    },
     Vod(VodKind),
     Continue(usize),
     Start(StartAction),
@@ -496,7 +520,13 @@ impl HomeScreen {
         if self.recent_built_at != ctx.lib.built_at {
             self.recent_built_at = ctx.lib.built_at;
             let take = |movies: bool, all: &[VodSummary]| -> Vec<VodSummary> {
-                ctx.lib.vod.all_sorted(movies, SortMode::RecentlyAdded).into_iter().take(RAIL_MAX).filter_map(|i| all.get(i as usize).cloned()).collect()
+                ctx.lib
+                    .vod
+                    .all_sorted(movies, SortMode::RecentlyAdded)
+                    .into_iter()
+                    .take(RAIL_MAX)
+                    .filter_map(|i| all.get(i as usize).cloned())
+                    .collect()
             };
             self.recent_movies = take(true, &ctx.lib.vod.movies);
             self.recent_series = take(false, &ctx.lib.vod.series);
@@ -508,7 +538,12 @@ impl HomeScreen {
         }
         let mut rails = Vec::new();
         if !self.continue_items.is_empty() {
-            rails.push(Rail { kind: RailKind::Continue, title: "Continue watching".into(), list: None, tiles: (0..self.continue_items.len()).map(Tile::Continue).collect() });
+            rails.push(Rail {
+                kind: RailKind::Continue,
+                title: "Continue watching".into(),
+                list: None,
+                tiles: (0..self.continue_items.len()).map(Tile::Continue).collect(),
+            });
         }
         for list in ctx.favs.non_empty_lists() {
             let tiles: Vec<Tile> = ctx
@@ -516,7 +551,12 @@ impl HomeScreen {
                 .items(list.id)
                 .iter()
                 .filter_map(|r| match r.kind {
-                    ItemKind::Channel => ctx.lib.live.by_ref(r).filter(|id| !ctx.lib.live.hidden.contains(id)).map(|id| Tile::Channel { id, collection: Some(Collection::Favourites(list.id)) }),
+                    ItemKind::Channel => ctx
+                        .lib
+                        .live
+                        .by_ref(r)
+                        .filter(|id| !ctx.lib.live.hidden.contains(id))
+                        .map(|id| Tile::Channel { id, collection: Some(Collection::Favourites(list.id)) }),
                     _ => self.vod_refs.get(r).copied().map(Tile::Vod),
                 })
                 .take(RAIL_MAX)
@@ -539,10 +579,20 @@ impl HomeScreen {
             rails.push(Rail { kind: RailKind::Recent, title: "Recently watched".into(), list: None, tiles: recent });
         }
         if !self.recent_movies.is_empty() {
-            rails.push(Rail { kind: RailKind::Movies, title: "Recently added movies".into(), list: None, tiles: self.recent_movies.iter().map(|v| Tile::Vod(v.kind)).collect() });
+            rails.push(Rail {
+                kind: RailKind::Movies,
+                title: "Recently added movies".into(),
+                list: None,
+                tiles: self.recent_movies.iter().map(|v| Tile::Vod(v.kind)).collect(),
+            });
         }
         if !self.recent_series.is_empty() {
-            rails.push(Rail { kind: RailKind::Series, title: "Recently added series".into(), list: None, tiles: self.recent_series.iter().map(|v| Tile::Vod(v.kind)).collect() });
+            rails.push(Rail {
+                kind: RailKind::Series,
+                title: "Recently added series".into(),
+                list: None,
+                tiles: self.recent_series.iter().map(|v| Tile::Vod(v.kind)).collect(),
+            });
         }
         if rails.len() < 2 {
             let mut tiles = vec![Tile::Start(StartAction::BrowseLive), Tile::Start(StartAction::OpenGuide), Tile::Start(StartAction::AddFavourites)];
@@ -652,7 +702,9 @@ impl HomeScreen {
     /// (effective lock, locked through a category) of a tile.
     fn tile_lock(&self, ctx: &UiCtx<'_>, tile: &Tile) -> (bool, bool) {
         match tile {
-            Tile::Channel { id, .. } => ctx.lib.live.get(*id).map_or((false, false), |c| (c.locked, kit::any_group_locked(&ctx.lib.live.groups, &c.group_ids))),
+            Tile::Channel { id, .. } => {
+                ctx.lib.live.get(*id).map_or((false, false), |c| (c.locked, kit::any_group_locked(&ctx.lib.live.groups, &c.group_ids)))
+            }
             Tile::Vod(kind) => ctx.lib.vod.find(*kind).map_or((false, false), |v| (v.locked, vod_group_locked(ctx, v))),
             Tile::Continue(i) => self.continue_items.get(*i).map_or((false, false), |c| (c.card.locked, vod_group_locked(ctx, &c.card))),
             Tile::Start(_) => (false, false),
@@ -689,7 +741,9 @@ impl HomeScreen {
             (Action::OpenInGuide, Tile::Channel { id, .. }) => ctx.push(Route::Guide { collection: None, focus: Some(*id) }),
             (Action::AssignEpg, Tile::Channel { id, .. }) => ctx.push(Route::EpgMapping { channel: Some(*id) }),
             (Action::MarkWatched, Tile::Vod(VodKind::Movie(_)) | Tile::Continue(_)) => kit::mark_watched(ctx, &item, &name, true),
-            (Action::MarkWatched, Tile::Vod(VodKind::Series(_))) => ctx.toast(crate::msg::Toast::info("Open the series to mark its episodes watched")),
+            (Action::MarkWatched, Tile::Vod(VodKind::Series(_))) => {
+                ctx.toast(crate::msg::Toast::info("Open the series to mark its episodes watched"))
+            }
             (Action::Remove, _) => match rail {
                 Some((RailKind::Favourites, Some(list))) => {
                     kit::set_in_list(ctx, list, &item, false);
@@ -700,7 +754,11 @@ impl HomeScreen {
                 Some((RailKind::Recent, _)) => {
                     // History rebuilds the library (`recent_channels`), so the rail follows
                     let write_item = item.clone();
-                    let _ = ctx.services.store.writer().submit_notify(DataScope::History, move |c| crate::store::user::remove_history(c, &write_item).map(|_| ()));
+                    let _ = ctx
+                        .services
+                        .store
+                        .writer()
+                        .submit_notify(DataScope::History, move |c| crate::store::user::remove_history(c, &write_item).map(|_| ()));
                     ctx.toast(crate::msg::Toast::info(format!("Removed “{name}” from Recently watched")));
                 }
                 _ => kit::not_here(ctx),
@@ -723,13 +781,23 @@ impl HomeScreen {
             return;
         }
         let write_item = item.clone();
-        let _ = ctx.services.store.writer().submit_notify(DataScope::Favourites, move |c| crate::store::user::move_favourite(c, list, &write_item, j as usize));
+        let _ = ctx
+            .services
+            .store
+            .writer()
+            .submit_notify(DataScope::Favourites, move |c| crate::store::user::move_favourite(c, list, &write_item, j as usize));
         self.move_col(delta);
     }
 
     /// Shift+F10 / right-click: the tile's actions (each echoed back as `Chosen(action)`).
     fn menu(&self, ctx: &mut UiCtx<'_>, tile: &Tile, rail: Option<(RailKind, Option<FavListId>)>, name: &str) {
-        let mi = |icon: &'static str, label: &str, action: Action, shortcut: &str| MenuItem { icon, label: label.into(), action, enabled: true, shortcut: Some(shortcut.into()) };
+        let mi = |icon: &'static str, label: &str, action: Action, shortcut: &str| MenuItem {
+            icon,
+            label: label.into(),
+            action,
+            enabled: true,
+            shortcut: Some(shortcut.into()),
+        };
         let mut items = Vec::new();
         match tile {
             Tile::Channel { .. } => {
@@ -836,8 +904,12 @@ fn load_continue(c: &rusqlite::Connection) -> crate::error::Result<Vec<ContinueI
 }
 
 impl Screen for HomeScreen {
-    fn id(&self) -> ScreenId { ScreenId::Home }
-    fn key_contexts(&self) -> Vec<KeyContext> { vec![KeyContext::PosterGrid] }
+    fn id(&self) -> ScreenId {
+        ScreenId::Home
+    }
+    fn key_contexts(&self) -> Vec<KeyContext> {
+        vec![KeyContext::PosterGrid]
+    }
 
     fn on_enter(&mut self, ctx: &mut UiCtx<'_>, _route: &Route) {
         self.reload_continue(ctx);
@@ -846,7 +918,9 @@ impl Screen for HomeScreen {
 
     fn on_event(&mut self, ctx: &mut UiCtx<'_>, ev: &AppEvent) {
         match ev {
-            AppEvent::Data(DataScope::Progress | DataScope::History | DataScope::All | DataScope::Sources | DataScope::Vod) => self.reload_continue(ctx),
+            AppEvent::Data(DataScope::Progress | DataScope::History | DataScope::All | DataScope::Sources | DataScope::Vod) => {
+                self.reload_continue(ctx)
+            }
             AppEvent::Player(crate::player::PlayerEvent::Ended { .. }) => self.reload_continue(ctx),
             _ => {}
         }
@@ -918,9 +992,8 @@ impl Screen for HomeScreen {
 
     fn on_overlay_result(&mut self, ctx: &mut UiCtx<'_>, result: OverlayResult) {
         match result {
-            OverlayResult::Unlocked(a @ (Action::Activate | Action::ActivateAlt)) | OverlayResult::Chosen(a @ (Action::Activate | Action::ActivateAlt)) => {
-                self.activate(ctx, a == Action::ActivateAlt)
-            }
+            OverlayResult::Unlocked(a @ (Action::Activate | Action::ActivateAlt))
+            | OverlayResult::Chosen(a @ (Action::Activate | Action::ActivateAlt)) => self.activate(ctx, a == Action::ActivateAlt),
             OverlayResult::Unlocked(Action::ToggleLock) => self.item_action(ctx, Action::ToggleLock),
             // the context menu (its entries are the shortcuts themselves)
             OverlayResult::Chosen(a) if a != Action::ContextMenu => self.item_action(ctx, a),
@@ -949,7 +1022,14 @@ impl Screen for HomeScreen {
             self.rails.clear();
             self.cols.clear();
             self.rails_key = None;
-            let r = empty_state::empty_state(ui, theme, glyphs::PLAYLIST, "No playlists yet", Some("Add an M3U playlist or an Xtream login to start watching."), Some("Add playlist"));
+            let r = empty_state::empty_state(
+                ui,
+                theme,
+                glyphs::PLAYLIST,
+                "No playlists yet",
+                Some("Add an M3U playlist or an Xtream login to start watching."),
+                Some("Add playlist"),
+            );
             if r.is_some_and(|r| r.clicked()) {
                 ctx.navigate(crate::ui::NavRequest::Switch(Route::Onboarding(OnboardingStart::Welcome)));
             }
@@ -1028,7 +1108,14 @@ fn loading_rails(ui: &mut egui::Ui, theme: &Theme) {
 }
 
 /// One rail tile.
-fn draw_tile(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, continues: &[ContinueItem], tile: &Tile, cursor: bool, playing_vod: Option<VodKind>) -> egui::Response {
+fn draw_tile(
+    ui: &mut egui::Ui,
+    ctx: &mut UiCtx<'_>,
+    continues: &[ContinueItem],
+    tile: &Tile,
+    cursor: bool,
+    playing_vod: Option<VodKind>,
+) -> egui::Response {
     let theme = ctx.theme;
     let playing = ctx.player.playable.as_ref().map(|p| p.media.clone());
     let poster_w = (RAIL_POSTER_W * theme.rem()).round();
@@ -1109,9 +1196,22 @@ fn channel_tile(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, id: ChannelId, cursor: b
         left = r.right() + theme.space(SpaceToken::Sm);
     }
     if ch.locked {
-        p.text(egui::pos2(right, top_y), Align2::RIGHT_CENTER, glyphs::LOCK, egui::FontId::proportional(theme.font(TypeToken::Icon)), t.text_secondary);
+        p.text(
+            egui::pos2(right, top_y),
+            Align2::RIGHT_CENTER,
+            glyphs::LOCK,
+            egui::FontId::proportional(theme.font(TypeToken::Icon)),
+            t.text_secondary,
+        );
     }
-    elided(p, egui::pos2(left, top_y), &ch.name, egui::FontId::proportional(theme.font(TypeToken::Body)), name_color, right - left - theme.font(TypeToken::Icon));
+    elided(
+        p,
+        egui::pos2(left, top_y),
+        &ch.name,
+        egui::FontId::proportional(theme.font(TypeToken::Body)),
+        name_color,
+        right - left - theme.font(TypeToken::Icon),
+    );
     let detail_y = rect.top() + rect.height() * 0.64;
     let left = text_left;
     let nn: Option<NowNext> = ch.epg_channel_id.and_then(|e| {
@@ -1121,13 +1221,27 @@ fn channel_tile(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, id: ChannelId, cursor: b
     match (ch.epg_channel_id, nn.as_ref().and_then(|n| n.now.as_ref())) {
         (Some(_), Some(now)) => {
             let bar_w = (40.0 * rem).round();
-            elided(p, egui::pos2(left, detail_y), &now.title, egui::FontId::proportional(theme.font(TypeToken::BodySmall)), t.text_secondary, right - left - bar_w - pad);
+            elided(
+                p,
+                egui::pos2(left, detail_y),
+                &now.title,
+                egui::FontId::proportional(theme.font(TypeToken::BodySmall)),
+                t.text_secondary,
+                right - left - bar_w - pad,
+            );
             let bar = Rect::from_center_size(egui::pos2(right - bar_w / 2.0, detail_y), egui::vec2(bar_w, (3.0 * rem).round().max(2.0)));
             crate::ui::widgets::progress::paint_progress(p, bar, theme, now.progress(ctx.now), false);
         }
         (Some(_), None) if nn.is_none() => {}
         _ => {
-            elided(p, egui::pos2(left, detail_y), "No guide data", egui::FontId::proportional(theme.font(TypeToken::BodySmall)), t.text_disabled, right - left);
+            elided(
+                p,
+                egui::pos2(left, detail_y),
+                "No guide data",
+                egui::FontId::proportional(theme.font(TypeToken::BodySmall)),
+                t.text_disabled,
+                right - left,
+            );
         }
     }
     resp
@@ -1143,8 +1257,21 @@ fn action_tile(ui: &mut egui::Ui, theme: &Theme, glyph: &str, label: &str, curso
         let p = ui.painter();
         let pad = theme.space(SpaceToken::Lg);
         let color = if cursor { t.list_cursor_text } else { t.fg };
-        let r = p.text(egui::pos2(rect.left() + pad, rect.center().y), Align2::LEFT_CENTER, glyph, egui::FontId::proportional(theme.font(TypeToken::IconLarge)), t.accent);
-        elided(p, egui::pos2(r.right() + pad, rect.center().y), label, egui::FontId::proportional(theme.font(TypeToken::Body)), color, rect.right() - r.right() - 2.0 * pad);
+        let r = p.text(
+            egui::pos2(rect.left() + pad, rect.center().y),
+            Align2::LEFT_CENTER,
+            glyph,
+            egui::FontId::proportional(theme.font(TypeToken::IconLarge)),
+            t.accent,
+        );
+        elided(
+            p,
+            egui::pos2(r.right() + pad, rect.center().y),
+            label,
+            egui::FontId::proportional(theme.font(TypeToken::Body)),
+            color,
+            rect.right() - r.right() - 2.0 * pad,
+        );
     }
     resp
 }
@@ -1220,7 +1347,9 @@ pub(crate) mod testkit {
             }
             self.t.config = Arc::new(c);
         }
-        pub fn nav(&mut self) -> Vec<NavRequest> { std::mem::take(&mut self.t.nav) }
+        pub fn nav(&mut self) -> Vec<NavRequest> {
+            std::mem::take(&mut self.t.nav)
+        }
     }
 
     pub(crate) fn rig() -> (TestUi, MutexGuard<'static, ()>) {
@@ -1264,10 +1393,17 @@ pub(crate) mod testkit {
             let o = &mut self.o;
             outcome(&self.t.with_ctx(|ctx| o.on_action(ctx, a)))
         }
-        pub fn nav(&mut self) -> Vec<NavRequest> { std::mem::take(&mut self.t.nav) }
+        pub fn nav(&mut self) -> Vec<NavRequest> {
+            std::mem::take(&mut self.t.nav)
+        }
     }
 
-    pub(crate) fn overlay_harness<O: crate::ui::overlays::Overlay + 'static>(t: TestUi, one: MutexGuard<'static, ()>, o: O, size: egui::Vec2) -> Harness<'static, OvApp<O>> {
+    pub(crate) fn overlay_harness<O: crate::ui::overlays::Overlay + 'static>(
+        t: TestUi,
+        one: MutexGuard<'static, ()>,
+        o: O,
+        size: egui::Vec2,
+    ) -> Harness<'static, OvApp<O>> {
         let mut h = Harness::builder().with_size(size).with_step_dt(0.02).build_ui_state(
             |ui, app: &mut OvApp<O>| {
                 let egui_ctx = ui.ctx().clone();
@@ -1303,9 +1439,13 @@ pub(crate) mod testkit {
         }
     }
 
-    pub(crate) fn has_label<T>(h: &Harness<'static, T>, text: &str) -> bool { h.query_all_by_label(text).next().is_some() }
+    pub(crate) fn has_label<T>(h: &Harness<'static, T>, text: &str) -> bool {
+        h.query_all_by_label(text).next().is_some()
+    }
 
-    pub(crate) fn has_label_containing<T>(h: &Harness<'static, T>, text: &str) -> bool { h.query_all_by_label_contains(text).next().is_some() }
+    pub(crate) fn has_label_containing<T>(h: &Harness<'static, T>, text: &str) -> bool {
+        h.query_all_by_label_contains(text).next().is_some()
+    }
 
     /// Every text painted in the last frame (painter text isn't in the accessibility tree).
     pub(crate) fn painted<T>(h: &Harness<'static, T>) -> Vec<String> {
@@ -1346,9 +1486,15 @@ pub(crate) mod testkit {
     pub(crate) fn channels(c: &mut Connection, src: SourceId, n: usize) -> Result<Vec<ChannelId>> {
         let tx = c.transaction()?;
         let mut ids = Vec::new();
-        tx.execute("INSERT INTO grp(source_id, kind, key, name, provider_order, item_count, seen_gen) VALUES (?1,'channel','channel:all','All',0,?2,1)", params![src, n as i64])?;
+        tx.execute(
+            "INSERT INTO grp(source_id, kind, key, name, provider_order, item_count, seen_gen) VALUES (?1,'channel','channel:all','All',0,?2,1)",
+            params![src, n as i64],
+        )?;
         let all = tx.last_insert_rowid();
-        tx.execute("INSERT INTO grp(source_id, kind, key, name, provider_order, item_count, seen_gen) VALUES (?1,'channel','channel:news','News',1,?2,1)", params![src, (n / 10) as i64])?;
+        tx.execute(
+            "INSERT INTO grp(source_id, kind, key, name, provider_order, item_count, seen_gen) VALUES (?1,'channel','channel:news','News',1,?2,1)",
+            params![src, (n / 10) as i64],
+        )?;
         let news = tx.last_insert_rowid();
         for i in 0..n {
             let url = format!("http://127.0.0.1:9/live/{i}.ts");
@@ -1360,7 +1506,10 @@ pub(crate) mod testkit {
             let id = tx.last_insert_rowid();
             tx.execute("INSERT INTO channel_group(group_id, channel_id, position, is_primary) VALUES (?1, ?2, ?3, 1)", params![all, id, i as i64])?;
             if i % 10 == 0 {
-                tx.execute("INSERT INTO channel_group(group_id, channel_id, position, is_primary) VALUES (?1, ?2, ?3, 0)", params![news, id, (i / 10) as i64])?;
+                tx.execute(
+                    "INSERT INTO channel_group(group_id, channel_id, position, is_primary) VALUES (?1, ?2, ?3, 0)",
+                    params![news, id, (i / 10) as i64],
+                )?;
             }
             ids.push(ChannelId(id));
         }
@@ -1372,19 +1521,28 @@ pub(crate) mod testkit {
     /// 30-minute programmes "Show {slot % 17} on {i}" from `start` for `hours`.
     pub(crate) fn epg(c: &mut Connection, chans: &[ChannelId], start: Timestamp, hours: u32, map: bool) -> Result<()> {
         let tx = c.transaction()?;
-        tx.execute("INSERT INTO epg_source(name, kind, url, active_gen, n_channels) VALUES ('Seed EPG','url','http://127.0.0.1:9/epg.xml',1,?1)", [chans.len() as i64])?;
+        tx.execute(
+            "INSERT INTO epg_source(name, kind, url, active_gen, n_channels) VALUES ('Seed EPG','url','http://127.0.0.1:9/epg.xml',1,?1)",
+            [chans.len() as i64],
+        )?;
         let src = tx.last_insert_rowid();
         for (i, ch) in chans.iter().enumerate() {
             tx.execute("INSERT INTO epg_channel(epg_source_id, xmltv_id, seen_gen) VALUES (?1, ?2, 1)", params![src, format!("ch{i}.tv")])?;
             let eid = tx.last_insert_rowid();
-            tx.execute("INSERT INTO epg_display_name(epg_channel_id, name, norm) VALUES (?1, ?2, ?3)", params![eid, format!("Channel {i}"), format!("channel{i}")])?;
+            tx.execute(
+                "INSERT INTO epg_display_name(epg_channel_id, name, norm) VALUES (?1, ?2, ?3)",
+                params![eid, format!("Channel {i}"), format!("channel{i}")],
+            )?;
             if map {
                 tx.execute("INSERT INTO channel_epg(channel_id, epg_channel_id) VALUES (?1, ?2)", params![ch.0, eid])?;
             }
             for slot in 0..(hours * 2) as i64 {
                 let s = start + slot * 1800;
                 let title = format!("Show {} on {i}", slot % 17);
-                tx.execute("INSERT INTO programme(epg_source_id, epg_channel_id, gen, start, stop, title, sub_title) VALUES (?1, ?2, 1, ?3, ?4, ?5, NULL)", params![src, eid, s, s + 1800, title])?;
+                tx.execute(
+                    "INSERT INTO programme(epg_source_id, epg_channel_id, gen, start, stop, title, sub_title) VALUES (?1, ?2, 1, ?3, ?4, ?5, NULL)",
+                    params![src, eid, s, s + 1800, title],
+                )?;
                 tx.execute("INSERT INTO programme_fts(rowid, title, sub_title) VALUES (?1, ?2, NULL)", params![tx.last_insert_rowid(), title])?;
             }
         }
@@ -1395,7 +1553,10 @@ pub(crate) mod testkit {
     /// `n` movies "Movie {i}" (details loaded) in group "Movies".
     pub(crate) fn movies(c: &mut Connection, src: SourceId, n: usize) -> Result<Vec<MovieId>> {
         let tx = c.transaction()?;
-        tx.execute("INSERT INTO grp(source_id, kind, key, name, provider_order, item_count, seen_gen) VALUES (?1,'movie','movie:movies','Movies',0,?2,1)", params![src, n as i64])?;
+        tx.execute(
+            "INSERT INTO grp(source_id, kind, key, name, provider_order, item_count, seen_gen) VALUES (?1,'movie','movie:movies','Movies',0,?2,1)",
+            params![src, n as i64],
+        )?;
         let g = tx.last_insert_rowid();
         let mut ids = Vec::new();
         for i in 0..n {
@@ -1426,7 +1587,10 @@ pub(crate) mod testkit {
     /// `n` series "Series {i}" with `seasons` × `episodes` episodes (details loaded).
     pub(crate) fn series(c: &mut Connection, src: SourceId, n: usize, seasons: u32, episodes: u32) -> Result<Vec<SeriesId>> {
         let tx = c.transaction()?;
-        tx.execute("INSERT INTO grp(source_id, kind, key, name, provider_order, item_count, seen_gen) VALUES (?1,'series','series:shows','Shows',0,?2,1)", params![src, n as i64])?;
+        tx.execute(
+            "INSERT INTO grp(source_id, kind, key, name, provider_order, item_count, seen_gen) VALUES (?1,'series','series:shows','Shows',0,?2,1)",
+            params![src, n as i64],
+        )?;
         let g = tx.last_insert_rowid();
         let mut ids = Vec::new();
         for i in 0..n {
@@ -1461,7 +1625,9 @@ mod tests {
     use crate::model::{ItemKey, SourceId, WatchProgress};
     use crate::ui::NavRequest;
 
-    fn channel_ref(s: SourceId, i: usize) -> ItemRef { ItemRef { source: s, kind: ItemKind::Channel, key: ItemKey(format!("m3u:seed{i:011}")) } }
+    fn channel_ref(s: SourceId, i: usize) -> ItemRef {
+        ItemRef { source: s, kind: ItemKind::Channel, key: ItemKey(format!("m3u:seed{i:011}")) }
+    }
 
     /// Delete on a "Recently watched" tile forgets that channel's history (it used to say
     /// "Not available here").
@@ -1485,7 +1651,11 @@ mod tests {
         assert!(h.state_mut().act(Action::Remove));
         assert!(h.state().t.toasts.iter().all(|t| t.text != "Not available here"), "{:?}", h.state().t.toasts);
         let history = |h: &egui_kittest::Harness<'_, testkit::App<HomeScreen>>| {
-            crate::store::user::recent_channels(&h.state().t.services().store.reader().unwrap(), 10).unwrap().into_iter().map(|e| e.item.key.0).collect::<Vec<_>>()
+            crate::store::user::recent_channels(&h.state().t.services().store.reader().unwrap(), 10)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.item.key.0)
+                .collect::<Vec<_>>()
         };
         until(&mut h, "the history row is gone", |h| history(h) == vec![format!("m3u:seed{:011}", 1)]);
     }
@@ -1570,7 +1740,18 @@ mod tests {
             testkit::channels(c, s, 3)?;
             let m = testkit::movies(c, s, 1)?[0];
             let item = ItemRef { source: s, kind: ItemKind::Movie, key: ItemKey("m3u:movie0000000000".into()) };
-            crate::store::user::save_progress(c, &WatchProgress { item, position_s: 600.0, duration_s: Some(1200.0), updated_at: 5, finished: false, title: "Movie 0".into(), fingerprint: Default::default() })?;
+            crate::store::user::save_progress(
+                c,
+                &WatchProgress {
+                    item,
+                    position_s: 600.0,
+                    duration_s: Some(1200.0),
+                    updated_at: 5,
+                    finished: false,
+                    title: "Movie 0".into(),
+                    fingerprint: Default::default(),
+                },
+            )?;
             Ok(m)
         });
         let mut h = harness(t, one, HomeScreen::default(), egui::vec2(1000.0, 800.0));
@@ -1656,7 +1837,12 @@ mod tests {
             crate::store::user::set_item_override(c, &channel_ref(s, 1), &crate::model::ItemOverride { locked: true, ..Default::default() })
         });
         let mut cfg = (*t.config).clone();
-        cfg.parental = crate::config::ParentalConfig { enabled: true, pin_salt: Some("s".into()), pin_hash: Some(crate::ui::parental::hash_pin("1234", "s")), relock_min: 0 };
+        cfg.parental = crate::config::ParentalConfig {
+            enabled: true,
+            pin_salt: Some("s".into()),
+            pin_hash: Some(crate::ui::parental::hash_pin("1234", "s")),
+            relock_min: 0,
+        };
         t.config = Arc::new(cfg);
         let mut h = harness(t, one, HomeScreen::default(), egui::vec2(1000.0, 800.0));
         h.state_mut().enter(Route::Home);
@@ -1683,7 +1869,18 @@ mod tests {
             testkit::channels(c, s, 5)?;
             testkit::movies(c, s, 3)?;
             let movie = |i: usize| ItemRef { source: s, kind: ItemKind::Movie, key: ItemKey(format!("m3u:movie{i:010}")) };
-            crate::store::user::save_progress(c, &WatchProgress { item: movie(0), position_s: 600.0, duration_s: Some(1200.0), updated_at: 5, finished: false, title: "Movie 0".into(), fingerprint: Default::default() })?;
+            crate::store::user::save_progress(
+                c,
+                &WatchProgress {
+                    item: movie(0),
+                    position_s: 600.0,
+                    duration_s: Some(1200.0),
+                    updated_at: 5,
+                    finished: false,
+                    title: "Movie 0".into(),
+                    fingerprint: Default::default(),
+                },
+            )?;
             crate::store::user::set_item_override(c, &movie(0), &crate::model::ItemOverride { locked: true, ..Default::default() })?;
             let list = crate::store::user::default_fav_list(c)?;
             crate::store::user::set_favourite(c, list, &movie(1), true, 1)?;
@@ -1691,7 +1888,12 @@ mod tests {
             Ok(s)
         });
         let mut cfg = (*t.config).clone();
-        cfg.parental = crate::config::ParentalConfig { enabled: true, pin_salt: Some("s".into()), pin_hash: Some(crate::ui::parental::hash_pin("1234", "s")), relock_min: 0 };
+        cfg.parental = crate::config::ParentalConfig {
+            enabled: true,
+            pin_salt: Some("s".into()),
+            pin_hash: Some(crate::ui::parental::hash_pin("1234", "s")),
+            relock_min: 0,
+        };
         t.config = Arc::new(cfg);
         let mut h = harness(t, one, HomeScreen::default(), egui::vec2(1400.0, 900.0));
         h.state_mut().enter(Route::Home);
@@ -1717,17 +1919,24 @@ mod tests {
         // the context menu lists the tile's actions; Delete removes the movie from the list
         h.state_mut().act(Action::ContextMenu);
         let nav = h.state_mut().nav();
-        assert!(matches!(nav.as_slice(), [NavRequest::Open(OverlayRequest::ContextMenu(m))] if m.items.iter().any(|i| i.action == Action::Remove)), "{nav:?}");
+        assert!(
+            matches!(nav.as_slice(), [NavRequest::Open(OverlayRequest::ContextMenu(m))] if m.items.iter().any(|i| i.action == Action::Remove)),
+            "{nav:?}"
+        );
         h.state_mut().act(Action::Remove);
         let movie1 = ItemRef { source: src, kind: ItemKind::Movie, key: ItemKey("m3u:movie0000000001".into()) };
-        until(&mut h, "removed from the list", |h| crate::store::user::lists_containing(&h.state().t.services().store.reader().unwrap(), &movie1).unwrap().is_empty());
+        until(&mut h, "removed from the list", |h| {
+            crate::store::user::lists_containing(&h.state().t.services().store.reader().unwrap(), &movie1).unwrap().is_empty()
+        });
         h.run_steps(1);
         let rail = &h.state().s.rails[h.state().s.rail];
         assert!(matches!(rail.tiles.as_slice(), [Tile::Channel { .. }]), "the rail follows at once: {:?}", rail.tiles);
         // Ctrl+H hides the channel; Ctrl+G shows it in the guide; Ctrl+S explains itself
         h.state_mut().act(Action::ToggleHidden);
         until(&mut h, "hidden", |h| {
-            crate::store::user::item_override(&h.state().t.services().store.reader().unwrap(), &channel_ref(src, 2)).unwrap().is_some_and(|o| o.hidden)
+            crate::store::user::item_override(&h.state().t.services().store.reader().unwrap(), &channel_ref(src, 2))
+                .unwrap()
+                .is_some_and(|o| o.hidden)
         });
         h.state_mut().act(Action::OpenInGuide);
         assert!(matches!(h.state_mut().nav().as_slice(), [NavRequest::Push(Route::Guide { focus: Some(_), .. })]));
@@ -1766,12 +1975,24 @@ mod tests {
     struct Dyn(Box<dyn Screen>);
 
     impl Screen for Dyn {
-        fn id(&self) -> ScreenId { self.0.id() }
-        fn key_contexts(&self) -> Vec<KeyContext> { self.0.key_contexts() }
-        fn on_enter(&mut self, ctx: &mut UiCtx<'_>, route: &Route) { self.0.on_enter(ctx, route) }
-        fn on_event(&mut self, ctx: &mut UiCtx<'_>, ev: &AppEvent) { self.0.on_event(ctx, ev) }
-        fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool { self.0.on_action(ctx, action) }
-        fn ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) { self.0.ui(ui, ctx) }
+        fn id(&self) -> ScreenId {
+            self.0.id()
+        }
+        fn key_contexts(&self) -> Vec<KeyContext> {
+            self.0.key_contexts()
+        }
+        fn on_enter(&mut self, ctx: &mut UiCtx<'_>, route: &Route) {
+            self.0.on_enter(ctx, route)
+        }
+        fn on_event(&mut self, ctx: &mut UiCtx<'_>, ev: &AppEvent) {
+            self.0.on_event(ctx, ev)
+        }
+        fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
+            self.0.on_action(ctx, action)
+        }
+        fn ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) {
+            self.0.ui(ui, ctx)
+        }
     }
 
     /// A screen factory and the route it is entered with.

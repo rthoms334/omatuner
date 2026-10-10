@@ -59,7 +59,15 @@ fn entry(ui: &mut egui::Ui, theme: &Theme, it: &SidebarItem, size: egui::Vec2, e
             let pad = theme.space(SpaceToken::RowPaddingX);
             ui.painter().text(rect.left_center() + egui::vec2(pad, 0.0), Align2::LEFT_CENTER, it.glyph, icon_font, color);
             let x = pad + theme.font(TypeToken::IconLarge) + theme.space(SpaceToken::ControlGap);
-            paint::text(ui.painter(), rect.left_center() + egui::vec2(x, 0.0), Align2::LEFT_CENTER, it.label, paint::medium(ui.ctx(), theme, TypeToken::Title), color, (rect.width() - x - pad).max(0.0));
+            paint::text(
+                ui.painter(),
+                rect.left_center() + egui::vec2(x, 0.0),
+                Align2::LEFT_CENTER,
+                it.label,
+                paint::medium(ui.ctx(), theme, TypeToken::Title),
+                color,
+                (rect.width() - x - pad).max(0.0),
+            );
         } else {
             ui.painter().text(rect.center(), Align2::CENTER_CENTER, it.glyph, icon_font, color);
         }

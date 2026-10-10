@@ -60,7 +60,9 @@ pub struct VideoHost {
 }
 
 impl VideoHost {
-    pub fn new(surface: Option<VideoSurface>) -> Self { Self { surface, ..Default::default() } }
+    pub fn new(surface: Option<VideoSurface>) -> Self {
+        Self { surface, ..Default::default() }
+    }
 
     /// Start of frame bookkeeping (app).
     pub fn begin_frame(&mut self) {
@@ -75,14 +77,20 @@ impl VideoHost {
     }
 
     /// Where the video was shown last frame.
-    pub fn placement(&self) -> Placement { self.placed }
+    pub fn placement(&self) -> Placement {
+        self.placed
+    }
 
     /// False when libmpv/GL failed at startup (no surface).
-    pub fn available(&self) -> bool { self.surface.is_some() }
+    pub fn available(&self) -> bool {
+        self.surface.is_some()
+    }
 
     /// The mini-player rect drawn this frame or the previous one (toasts and the guide avoid
     /// it); `None` once a frame passed without the mini-player.
-    pub fn mini_rect(&self) -> Option<egui::Rect> { self.mini }
+    pub fn mini_rect(&self) -> Option<egui::Rect> {
+        self.mini
+    }
 
     /// Render mpv into the FBO (from `App::logic`, GL current). Clears to black on new loads.
     pub fn render(&mut self, gl: &glow::Context, frame: &mut eframe::Frame, snap: &PlayerSnapshot) {
@@ -97,7 +105,15 @@ impl VideoHost {
     /// Paint the video into `rect` (mpv draws black bars), plus the state overlay (with the
     /// channel logo from `images`). Returns the response over the whole rect (click /
     /// double-click handling by the caller).
-    pub fn paint(&mut self, ui: &mut egui::Ui, rect: egui::Rect, placement: Placement, theme: &Theme, images: &mut ImageCache, snap: &PlayerSnapshot) -> egui::Response {
+    pub fn paint(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        placement: Placement,
+        theme: &Theme,
+        images: &mut ImageCache,
+        snap: &PlayerSnapshot,
+    ) -> egui::Response {
         self.update_logo(images, snap);
         self.paint_video(ui, rect, placement, theme, snap)
     }
@@ -172,11 +188,25 @@ impl VideoHost {
                 let tile = 56.0 * k;
                 let block_h = tile + gap + title_font.size + gap + body_font.size + gap + 18.0 * k;
                 let mut y = rect.center().y - block_h / 2.0;
-                logo_tile(&p, theme, Rect::from_center_size(egui::pos2(rect.center().x, y + tile / 2.0), egui::vec2(tile, tile)), title, self.logo_for(snap));
+                logo_tile(
+                    &p,
+                    theme,
+                    Rect::from_center_size(egui::pos2(rect.center().x, y + tile / 2.0), egui::vec2(tile, tile)),
+                    title,
+                    self.logo_for(snap),
+                );
                 y += tile + gap;
                 osd_text(&p, egui::pos2(rect.center().x, y), Align2::CENTER_TOP, title, title_font.clone(), t.osd_text, rect.width() - 2.0 * gap);
                 y += title_font.size + gap;
-                osd_text(&p, egui::pos2(rect.center().x, y), Align2::CENTER_TOP, &detail, body_font, with_alpha(t.osd_text, 0.7), rect.width() - 2.0 * gap);
+                osd_text(
+                    &p,
+                    egui::pos2(rect.center().x, y),
+                    Align2::CENTER_TOP,
+                    &detail,
+                    body_font,
+                    with_alpha(t.osd_text, 0.7),
+                    rect.width() - 2.0 * gap,
+                );
                 y += body_font_size(theme, k) + gap;
                 spinner(&p, egui::pos2(rect.center().x, y + 9.0 * k), 9.0 * k, t.osd_accent, time);
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
@@ -189,16 +219,32 @@ impl VideoHost {
                 let pill = pill_rect(&p, rect, &label, body_font.clone(), theme, k);
                 p.rect_filled(pill, t.rounding, t.osd_scrim);
                 spinner(&p, egui::pos2(pill.left() + pill.height() / 2.0, pill.center().y), pill.height() * 0.25, t.osd_accent, time);
-                osd_text(&p, egui::pos2(pill.left() + pill.height(), pill.center().y), Align2::LEFT_CENTER, &label, body_font, t.osd_text, f32::INFINITY);
+                osd_text(
+                    &p,
+                    egui::pos2(pill.left() + pill.height(), pill.center().y),
+                    Align2::LEFT_CENTER,
+                    &label,
+                    body_font,
+                    t.osd_text,
+                    f32::INFINITY,
+                );
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
             }
             PlayerState::Reconnecting { attempt, max, at, reason } => {
                 p.rect_filled(rect, 0.0, t.osd_scrim);
                 let secs = at.saturating_duration_since(Instant::now()).as_secs_f32().ceil() as u64;
                 let head = format!("Reconnecting… ({attempt}/{max})");
-                let detail = if secs > 0 { format!("{} · retrying in {secs} s", reason_label(*reason)) } else { format!("{} · retrying now", reason_label(*reason)) };
+                let detail = if secs > 0 {
+                    format!("{} · retrying in {secs} s", reason_label(*reason))
+                } else {
+                    format!("{} · retrying now", reason_label(*reason))
+                };
                 let hint = recovery_hint(placement, live, snap.previous_live.is_some(), true);
-                let lines = [(head.as_str(), title_font, t.osd_text), (detail.as_str(), body_font, with_alpha(t.osd_text, 0.7)), (hint, small_font, t.osd_accent)];
+                let lines = [
+                    (head.as_str(), title_font, t.osd_text),
+                    (detail.as_str(), body_font, with_alpha(t.osd_text, 0.7)),
+                    (hint, small_font, t.osd_accent),
+                ];
                 stacked(&p, rect, &lines, gap);
                 spinner(&p, egui::pos2(rect.center().x, rect.center().y - 3.0 * title_font_size(theme, k)), 10.0 * k, t.osd_accent, time);
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
@@ -227,11 +273,25 @@ impl VideoHost {
                 if audio_only {
                     let tile = 72.0 * k;
                     let mut y = rect.center().y - (tile + gap + 2.0 * title_font.size) / 2.0;
-                    logo_tile(&p, theme, Rect::from_center_size(egui::pos2(rect.center().x, y + tile / 2.0), egui::vec2(tile, tile)), title, self.logo_for(snap));
+                    logo_tile(
+                        &p,
+                        theme,
+                        Rect::from_center_size(egui::pos2(rect.center().x, y + tile / 2.0), egui::vec2(tile, tile)),
+                        title,
+                        self.logo_for(snap),
+                    );
                     y += tile + gap;
                     osd_text(&p, egui::pos2(rect.center().x, y), Align2::CENTER_TOP, title, title_font.clone(), t.osd_text, rect.width() - 2.0 * gap);
                     if let Some(sub) = snap.playable.as_ref().and_then(|p| p.subtitle.as_deref()) {
-                        osd_text(&p, egui::pos2(rect.center().x, y + title_font.size + gap), Align2::CENTER_TOP, sub, body_font, with_alpha(t.osd_text, 0.7), rect.width() - 2.0 * gap);
+                        osd_text(
+                            &p,
+                            egui::pos2(rect.center().x, y + title_font.size + gap),
+                            Align2::CENTER_TOP,
+                            sub,
+                            body_font,
+                            with_alpha(t.osd_text, 0.7),
+                            rect.width() - 2.0 * gap,
+                        );
                     }
                 }
                 if snap.state == PlayerState::Paused || snap.paused {
@@ -276,13 +336,27 @@ impl VideoHost {
             if let Some(n) = snap.playable.as_ref().and_then(|p| p.number) {
                 label = format!("{title} · {n}");
             }
-            osd_text(p, egui::pos2(strip.left() + pad, strip.center().y), Align2::LEFT_CENTER, &label, FontId::proportional(theme.font(TypeToken::BodySmall)), t.fg, (close.left() - strip.left() - 2.0 * pad).max(0.0));
+            osd_text(
+                p,
+                egui::pos2(strip.left() + pad, strip.center().y),
+                Align2::LEFT_CENTER,
+                &label,
+                FontId::proportional(theme.font(TypeToken::BodySmall)),
+                t.fg,
+                (close.left() - strip.left() - 2.0 * pad).max(0.0),
+            );
             let cr = ui.interact(close, ui.id().with("mini-close"), egui::Sense::click());
             cr.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Stop playback"));
             if cr.hovered() {
                 p.rect_filled(close.shrink(2.0), t.rounding, t.fill_hover);
             }
-            p.text(close.center(), Align2::CENTER_CENTER, glyphs::CLOSE, FontId::proportional(theme.font(TypeToken::Icon)), if cr.hovered() { t.accent } else { t.text_secondary });
+            p.text(
+                close.center(),
+                Align2::CENTER_CENTER,
+                glyphs::CLOSE,
+                FontId::proportional(theme.font(TypeToken::Icon)),
+                if cr.hovered() { t.accent } else { t.text_secondary },
+            );
             if cr.clicked() {
                 result = Some(false);
             }
@@ -315,7 +389,9 @@ pub fn letterbox(rect: egui::Rect, video: Option<(i64, i64)>) -> egui::Rect {
 }
 
 /// Height of the mini-player's title strip.
-fn mini_strip_height(theme: &Theme) -> f32 { theme.space(SpaceToken::ControlHeight) + theme.space(SpaceToken::Sm) }
+fn mini_strip_height(theme: &Theme) -> f32 {
+    theme.space(SpaceToken::ControlHeight) + theme.space(SpaceToken::Sm)
+}
 
 /// Where the mini-player goes in a window: bottom-right above the status bar, 16:9, 320 pt
 /// (Wide) / 240 pt (Medium) × rem; none in Compact.
@@ -334,10 +410,16 @@ pub(crate) fn mini_rect_for(screen: Rect, theme: &Theme) -> Option<Rect> {
 }
 
 /// Overlay type scale for a video rect: small in the mini-player, larger fullscreen.
-fn overlay_scale(rect: Rect) -> f32 { (rect.width() / 900.0).clamp(0.75, 1.6) }
+fn overlay_scale(rect: Rect) -> f32 {
+    (rect.width() / 900.0).clamp(0.75, 1.6)
+}
 
-fn body_font_size(theme: &Theme, k: f32) -> f32 { (theme.font(TypeToken::Body) * k).round() }
-fn title_font_size(theme: &Theme, k: f32) -> f32 { (theme.font(TypeToken::Title) * k).round() }
+fn body_font_size(theme: &Theme, k: f32) -> f32 {
+    (theme.font(TypeToken::Body) * k).round()
+}
+fn title_font_size(theme: &Theme, k: f32) -> f32 {
+    (theme.font(TypeToken::Title) * k).round()
+}
 
 /// User-facing copy for a playback failure (DESIGN §11.4, §13.12): headline + detail.
 pub(crate) fn error_copy(kind: PlayerErrorKind, message: &str) -> (String, String) {
@@ -441,7 +523,8 @@ fn logo_tile(p: &egui::Painter, theme: &Theme, r: Rect, name: &str, logo: Option
 /// Rotating arc (OSD colours).
 fn spinner(p: &egui::Painter, c: egui::Pos2, r: f32, color: Color32, time: f64) {
     let start = (time * 4.0) as f32;
-    let pts: Vec<egui::Pos2> = (0..=24).map(|i| start + i as f32 / 24.0 * std::f32::consts::PI * 1.5).map(|a| c + r * egui::vec2(a.cos(), a.sin())).collect();
+    let pts: Vec<egui::Pos2> =
+        (0..=24).map(|i| start + i as f32 / 24.0 * std::f32::consts::PI * 1.5).map(|a| c + r * egui::vec2(a.cos(), a.sin())).collect();
     p.add(egui::Shape::line(pts, egui::Stroke::new((r * 0.22).max(2.0), color)));
 }
 
@@ -454,7 +537,9 @@ fn pill_rect(p: &egui::Painter, rect: Rect, label: &str, font: FontId, theme: &T
 }
 
 /// Is `kind` live TV (zapping applies)?
-pub(crate) fn is_live(kind: Option<&PlayableKind>) -> bool { kind.is_none_or(PlayableKind::is_live) }
+pub(crate) fn is_live(kind: Option<&PlayableKind>) -> bool {
+    kind.is_none_or(PlayableKind::is_live)
+}
 
 #[cfg(test)]
 mod tests {

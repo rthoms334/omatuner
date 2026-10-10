@@ -50,9 +50,10 @@ impl ConnectionBudget {
     pub fn try_acquire(&mut self, source: SourceId) -> Result<Lease, BudgetExceeded> {
         let in_use = *self.open.get(&source).unwrap_or(&0);
         if let Some(&limit) = self.limits.get(&source)
-            && in_use >= limit {
-                return Err(BudgetExceeded { in_use, limit });
-            }
+            && in_use >= limit
+        {
+            return Err(BudgetExceeded { in_use, limit });
+        }
         *self.open.entry(source).or_insert(0) += 1;
         Ok(Lease { source })
     }
@@ -64,7 +65,11 @@ impl ConnectionBudget {
     }
 
     /// Known provider limit (`None` = unknown / unlimited).
-    pub fn limit(&self, source: SourceId) -> Option<u32> { self.limits.get(&source).copied() }
+    pub fn limit(&self, source: SourceId) -> Option<u32> {
+        self.limits.get(&source).copied()
+    }
 
-    pub fn in_use(&self, source: SourceId) -> u32 { *self.open.get(&source).unwrap_or(&0) }
+    pub fn in_use(&self, source: SourceId) -> u32 {
+        *self.open.get(&source).unwrap_or(&0)
+    }
 }

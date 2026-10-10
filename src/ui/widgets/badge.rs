@@ -44,4 +44,6 @@ pub fn source_badge(ui: &mut egui::Ui, theme: &Theme, src: &SourceMeta, compact:
     if compact { resp.on_hover_text(egui::RichText::new(&src.name).size(theme.font(TypeToken::BodySmall))) } else { resp }
 }
 
-pub fn live_badge(ui: &mut egui::Ui, theme: &Theme) -> egui::Response { badge(ui, theme, "LIVE", theme.tokens.urgent) }
+pub fn live_badge(ui: &mut egui::Ui, theme: &Theme) -> egui::Response {
+    badge(ui, theme, "LIVE", theme.tokens.urgent)
+}

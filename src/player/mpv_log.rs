@@ -83,7 +83,9 @@ impl MpvLog {
     }
 }
 
-fn summary_of(prefix: &str, w: Window) -> Option<Summary> { (w.suppressed > 0).then(|| (prefix.to_owned(), w.suppressed, w.worst)) }
+fn summary_of(prefix: &str, w: Window) -> Option<Summary> {
+    (w.suppressed > 0).then(|| (prefix.to_owned(), w.suppressed, w.worst))
+}
 
 /// Log one forwarded line or summary (tracing needs the level at compile time).
 pub fn emit(level: Level, prefix: &str, text: &str) {
@@ -97,7 +99,9 @@ pub fn emit(level: Level, prefix: &str, text: &str) {
 }
 
 /// Log a window summary.
-pub fn emit_summary((prefix, n, level): &Summary) { emit(*level, prefix, &format!("{n} similar lines suppressed")) }
+pub fn emit_summary((prefix, n, level): &Summary) {
+    emit(*level, prefix, &format!("{n} similar lines suppressed"))
+}
 
 #[cfg(test)]
 mod tests {

@@ -75,10 +75,14 @@ impl StaticServer {
         s.files.insert(path.to_owned(), File { body: body.into(), content_type, etag });
     }
 
-    pub fn url(&self, path: &str) -> String { format!("{}{path}", self.base) }
+    pub fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.base)
+    }
 
     /// How many requests reached `path` (any status).
-    pub fn hits(&self, path: &str) -> usize { self.state.lock().unwrap_or_else(|e| e.into_inner()).hits.iter().filter(|p| *p == path).count() }
+    pub fn hits(&self, path: &str) -> usize {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).hits.iter().filter(|p| *p == path).count()
+    }
 }
 
 impl Drop for StaticServer {

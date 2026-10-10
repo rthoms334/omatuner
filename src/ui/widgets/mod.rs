@@ -46,10 +46,14 @@ pub enum RowState {
 
 impl RowState {
     /// Cursor (keyboard or hover) is on this row: text turns accent.
-    pub fn is_cursor(self) -> bool { matches!(self, RowState::Cursor | RowState::CursorSelected) }
+    pub fn is_cursor(self) -> bool {
+        matches!(self, RowState::Cursor | RowState::CursorSelected)
+    }
 
     /// The row is the pane's current selection.
-    pub fn is_selected(self) -> bool { matches!(self, RowState::Selected | RowState::CursorSelected) }
+    pub fn is_selected(self) -> bool {
+        matches!(self, RowState::Selected | RowState::CursorSelected)
+    }
 
     /// State for a row from the two flags.
     pub fn from_flags(cursor: bool, selected: bool) -> Self {

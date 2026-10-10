@@ -30,7 +30,9 @@ fn epg_channels() -> Vec<EpgChannel> {
     ]
 }
 
-fn index() -> EpgCandidateIndex { build_index(EPG, &epg_channels()) }
+fn index() -> EpgCandidateIndex {
+    build_index(EPG, &epg_channels())
+}
 
 fn row(key: &str, tvg: Option<&str>, name: &str) -> ChannelMatchRow {
     ChannelMatchRow {
@@ -50,7 +52,9 @@ fn hit(idx: &EpgCandidateIndex, r: &ChannelMatchRow, provider_guide: bool, name_
     })
 }
 
-fn h(id: &str, m: EpgMatchMethod) -> Option<(String, EpgMatchMethod)> { Some((id.into(), m)) }
+fn h(id: &str, m: EpgMatchMethod) -> Option<(String, EpgMatchMethod)> {
+    Some((id.into(), m))
+}
 
 #[test]
 fn step1_tvg_id_exact_then_caseless() {

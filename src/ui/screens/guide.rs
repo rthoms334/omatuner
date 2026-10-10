@@ -134,7 +134,12 @@ impl GuideScreen {
         let rows: Arc<[GuideRow]> = ids
             .iter()
             .filter_map(|id| ctx.lib.live.get(*id))
-            .map(|c| GuideRow { channel: c.id, epg: c.epg_channel_id, tvg_shift_min: c.tvg_shift_min, catchup_days: if c.has_catchup { c.catchup_days } else { 0 } })
+            .map(|c| GuideRow {
+                channel: c.id,
+                epg: c.epg_channel_id,
+                tvg_shift_min: c.tvg_shift_min,
+                catchup_days: if c.has_catchup { c.catchup_days } else { 0 },
+            })
             .collect();
         match &mut self.grid {
             Some(g) => {
@@ -165,7 +170,9 @@ impl GuideScreen {
         g.reminders = map;
     }
 
-    fn zap(&self, ctx: &UiCtx<'_>) -> Option<crate::model::ZapList> { self.collection.as_ref().and_then(|c| live::zap_list(ctx, c)) }
+    fn zap(&self, ctx: &UiCtx<'_>) -> Option<crate::model::ZapList> {
+        self.collection.as_ref().and_then(|c| live::zap_list(ctx, c))
+    }
 
     /// The collection is a provider group whose channels are all hidden ("Everything here is
     /// hidden" + Show hidden).
@@ -282,7 +289,9 @@ impl GuideScreen {
                 let t = g.focus_time;
                 g.jump_to(ch, t);
             }
-            None if ctx.lib.live.by_number(n).is_some() => ctx.toast(Toast::info(format!("Channel {n} isn't in this collection — press f to pick another"))),
+            None if ctx.lib.live.by_number(n).is_some() => {
+                ctx.toast(Toast::info(format!("Channel {n} isn't in this collection — press f to pick another")))
+            }
             None => ctx.toast(Toast::info(format!("No channel {n}"))),
         }
     }
@@ -300,7 +309,10 @@ impl GuideScreen {
             if !compact {
                 section::section_header(ui, theme, "TV guide");
             }
-            if button(ui, theme, None, &format!("{name} ▾"), ButtonStyle { bordered: true, ..Default::default() }).on_hover_text("Collection (f)").clicked() {
+            if button(ui, theme, None, &format!("{name} ▾"), ButtonStyle { bordered: true, ..Default::default() })
+                .on_hover_text("Collection (f)")
+                .clicked()
+            {
                 act = Some(Action::GuideCategory);
             }
             if icon_button(ui, theme, glyphs::PREVIOUS, "Previous day ([)", Default::default()).clicked() {
@@ -356,7 +368,8 @@ impl GuideScreen {
         }
         // the focused channel isn't in the guides, and they cover few channels: say so, the
         // action first (the label truncates); the cells already say it for well-covered ones
-        let unmapped = self.grid.as_ref().and_then(|g| g.focused()).and_then(|(ch, _)| ctx.lib.live.get(ch)).is_some_and(|c| c.epg_channel_id.is_none());
+        let unmapped =
+            self.grid.as_ref().and_then(|g| g.focused()).and_then(|(ch, _)| ctx.lib.live.get(ch)).is_some_and(|c| c.epg_channel_id.is_none());
         if unmapped {
             let (covered, total) = self.guide.coverage(ctx);
             let why = NoGuide::NotCovered { covered, total };
@@ -382,7 +395,8 @@ impl GuideScreen {
         });
         let pad = theme.space(SpaceToken::PopupPadding);
         let gap = theme.space(SpaceToken::Sm);
-        let inner = egui::vec2(g.size().x.max(name_g.as_ref().map_or(0.0, |n| n.size().x)), g.size().y + name_g.as_ref().map_or(0.0, |n| gap + n.size().y));
+        let inner =
+            egui::vec2(g.size().x.max(name_g.as_ref().map_or(0.0, |n| n.size().x)), g.size().y + name_g.as_ref().map_or(0.0, |n| gap + n.size().y));
         let r = Rect::from_min_size(egui::pos2(area.right() - inner.x - 3.0 * pad, area.top() + pad), inner + egui::vec2(2.0 * pad, 2.0 * pad));
         p.rect_filled(r, t.rounding, t.card_bg);
         p.rect_stroke(r, t.rounding, egui::Stroke::new(t.card_border_width, t.popup_border), egui::StrokeKind::Inside);
@@ -415,7 +429,11 @@ impl GuideScreen {
         }
         if let Some(p) = prog {
             ui.label(RichText::new(p.title.as_ref()).size(theme.font(TypeToken::Body)).color(t.fg));
-            ui.label(RichText::new(epg_grid::time_range(p.start, p.stop, ctx.config.interface.clock_24h)).size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
+            ui.label(
+                RichText::new(epg_grid::time_range(p.start, p.stop, ctx.config.interface.clock_24h))
+                    .size(theme.font(TypeToken::BodySmall))
+                    .color(t.text_secondary),
+            );
         }
     }
 
@@ -439,12 +457,20 @@ impl GuideScreen {
             return;
         }
         let zap = self.zap(ctx);
-        ctx.play(PlayerCommand::Play(PlayRequest { media: crate::model::MediaRef::Channel(ch), zap, origin: PlayOrigin::LivePreview, resume: false, immediate: true }));
+        ctx.play(PlayerCommand::Play(PlayRequest {
+            media: crate::model::MediaRef::Channel(ch),
+            zap,
+            origin: PlayOrigin::LivePreview,
+            resume: false,
+            immediate: true,
+        }));
     }
 }
 
 impl Screen for GuideScreen {
-    fn id(&self) -> ScreenId { ScreenId::Guide }
+    fn id(&self) -> ScreenId {
+        ScreenId::Guide
+    }
 
     fn key_contexts(&self) -> Vec<KeyContext> {
         if self.numeric.is_some() { vec![KeyContext::NumericEntry, KeyContext::Guide] } else { vec![KeyContext::Guide] }
@@ -458,7 +484,9 @@ impl Screen for GuideScreen {
         // back from a playback the guide started (then maybe zapped): the same route again,
         // a newer load, still the guide's stream
         let snap = ctx.player.clone();
-        let returning = self.launched.take().is_some_and(|g| g != snap.load_generation) && snap.origin == Some(PlayOrigin::Guide) && self.entered.as_ref() == Some(route);
+        let returning = self.launched.take().is_some_and(|g| g != snap.load_generation)
+            && snap.origin == Some(PlayOrigin::Guide)
+            && self.entered.as_ref() == Some(route);
         self.entered = Some(route.clone());
         if !returning && let Some(c) = collection {
             self.collection = Some(c.clone());
@@ -571,7 +599,9 @@ impl Screen for GuideScreen {
         self.refresh(ctx);
         let theme = ctx.theme;
         if ctx.lib.built_at != 0 && ctx.lib.is_empty() {
-            if empty_state(ui, theme, glyphs::PLAYLIST, "No playlists yet", Some(live::EMPTY_LIBRARY_DETAIL), Some("Add playlist")).is_some_and(|r| r.clicked()) {
+            if empty_state(ui, theme, glyphs::PLAYLIST, "No playlists yet", Some(live::EMPTY_LIBRARY_DETAIL), Some("Add playlist"))
+                .is_some_and(|r| r.clicked())
+            {
                 ctx.navigate(crate::ui::NavRequest::Switch(Route::Onboarding(crate::ui::OnboardingStart::AddSource)));
             }
             return;
@@ -593,8 +623,15 @@ impl Screen for GuideScreen {
         }
         if self.grid.as_ref().is_some_and(|g| g.rows.is_empty()) {
             if self.all_hidden(ctx) {
-                if empty_state(ui, theme, glyphs::HIDDEN, "Everything here is hidden", Some("Enter opens Settings ▸ Hidden items · f shows another collection"), Some("Show hidden"))
-                    .is_some_and(|r| r.clicked())
+                if empty_state(
+                    ui,
+                    theme,
+                    glyphs::HIDDEN,
+                    "Everything here is hidden",
+                    Some("Enter opens Settings ▸ Hidden items · f shows another collection"),
+                    Some("Show hidden"),
+                )
+                .is_some_and(|r| r.clicked())
                 {
                     ctx.push(Route::Settings(SettingsPage::Hidden));
                 }
@@ -631,7 +668,9 @@ impl Screen for GuideScreen {
             }
             let mut reader = ctx.epg_reader();
             out = ui
-                .scope_builder(egui::UiBuilder::new().max_rect(grid_rect), |ui| epg_grid::epg_grid(ui, theme, ctx.images, &mut reader, ctx.budget, &ctx.lib.live, g, metrics, ctx.now))
+                .scope_builder(egui::UiBuilder::new().max_rect(grid_rect), |ui| {
+                    epg_grid::epg_grid(ui, theme, ctx.images, &mut reader, ctx.budget, &ctx.lib.live, g, metrics, ctx.now)
+                })
                 .inner;
         }
         self.draw_numeric(ui, ctx, grid_rect);

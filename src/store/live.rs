@@ -120,9 +120,8 @@ pub(crate) fn group_from_row(r: &Row<'_>) -> rusqlite::Result<Group> {
 /// Groups of `kind` (optionally one source) with group overrides merged, in display order
 /// (user_order, then provider_order). Hidden groups included (callers filter).
 pub fn groups(conn: &Connection, kind: ItemKind, source: Option<SourceId>) -> Result<Vec<Group>> {
-    let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {GROUP_COLS} {GROUP_FROM} WHERE g.kind = ?1 AND (?2 IS NULL OR g.source_id = ?2) ORDER BY {GROUP_ORDER}"
-    ))?;
+    let mut stmt = conn
+        .prepare_cached(&format!("SELECT {GROUP_COLS} {GROUP_FROM} WHERE g.kind = ?1 AND (?2 IS NULL OR g.source_id = ?2) ORDER BY {GROUP_ORDER}"))?;
     let rows = stmt.query_map(params![kind.as_str(), source], group_from_row)?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }

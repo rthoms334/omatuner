@@ -67,7 +67,14 @@ pub async fn probe(ctx: &JobContext, draft: &SourceDraft, progress: &Progress, c
             let path = draft.path.clone().ok_or_else(|| Error::Config("choose a playlist file".into()))?;
             let suggested = path.file_stem().map(|s| s.to_string_lossy().into_owned());
             let (count, epg_urls) = count_entries(path, None, progress.clone(), cancel.clone()).await?;
-            Ok(ProbeResult { kind: SourceKind::M3uFile, xtream: None, account: None, estimate_channels: Some(count), suggested_name: suggested, epg_urls })
+            Ok(ProbeResult {
+                kind: SourceKind::M3uFile,
+                xtream: None,
+                account: None,
+                estimate_channels: Some(count),
+                suggested_name: suggested,
+                epg_urls,
+            })
         }
         SourceKind::M3uUrl => {
             let url = draft.url.as_deref().map(str::trim).filter(|u| !u.is_empty()).ok_or_else(|| Error::Config("enter the playlist URL".into()))?;
@@ -112,7 +119,9 @@ pub async fn probe(ctx: &JobContext, draft: &SourceDraft, progress: &Progress, c
 struct Remove(PathBuf);
 
 impl Drop for Remove {
-    fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// "http://panel.example:8080/x" → "panel.example".

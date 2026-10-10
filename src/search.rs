@@ -31,8 +31,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use nucleo::pattern::{CaseMatching, Normalization};
 use nucleo::Utf32String;
+use nucleo::pattern::{CaseMatching, Normalization};
 
 use crate::model::{ChannelId, GroupId, MovieId, ProgrammeHit, SeriesId, SourceId, Timestamp, VodKind};
 use crate::store::library::Library;
@@ -74,8 +74,7 @@ pub enum SearchSection {
 }
 
 impl SearchSection {
-    pub const ALL: [SearchSection; 5] =
-        [SearchSection::All, SearchSection::Live, SearchSection::Movies, SearchSection::Series, SearchSection::Guide];
+    pub const ALL: [SearchSection; 5] = [SearchSection::All, SearchSection::Live, SearchSection::Movies, SearchSection::Series, SearchSection::Guide];
 
     fn accepts(self, t: SearchTarget) -> bool {
         matches!(
@@ -104,7 +103,9 @@ pub struct SearchHit {
     pub indices: Vec<u32>,
 }
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> { m.lock().unwrap_or_else(|e| e.into_inner()) }
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Global search state (owned by the search overlay; UI thread).
 pub struct SearchIndex {
@@ -195,8 +196,7 @@ impl SearchIndex {
         // nucleo may only narrow the previous matches when the old text is a prefix, and not
         // when the old text ends in a postfix anchor (`foo$` → `foo$x`) or an escape (`foo\` →
         // `foo\ bar`): there the appended text changes what the old atom meant
-        let append =
-            !self.query.is_empty() && q.starts_with(self.query.as_str()) && !self.query.ends_with(['$', '\\']);
+        let append = !self.query.is_empty() && q.starts_with(self.query.as_str()) && !self.query.ends_with(['$', '\\']);
         self.nucleo.pattern.reparse(0, q, CaseMatching::Ignore, Normalization::Smart, append);
         self.query = q.to_owned();
     }
@@ -246,11 +246,15 @@ impl SearchIndex {
         hits
     }
 
-    pub fn query(&self) -> &str { &self.query }
+    pub fn query(&self) -> &str {
+        &self.query
+    }
 }
 
 impl Drop for SearchIndex {
-    fn drop(&mut self) { self.inject_cancel.store(true, Ordering::Relaxed); }
+    fn drop(&mut self) {
+        self.inject_cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Highlight positions that fall inside the name (the first part of the haystack), as char
@@ -467,7 +471,9 @@ impl EpgSearch {
 
     /// Results of the most recent search that finished. Earlier results stay until the newer
     /// query's results arrive; a blank query clears them at once.
-    pub fn results(&self) -> Vec<ProgrammeHit> { lock(&self.results).1.clone() }
+    pub fn results(&self) -> Vec<ProgrammeHit> {
+        lock(&self.results).1.clone()
+    }
 }
 
 impl Drop for EpgSearch {
@@ -485,31 +491,41 @@ pub struct ListFilter {
 }
 
 impl Default for ListFilter {
-    fn default() -> Self { Self { matcher: nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT), query: String::new() } }
+    fn default() -> Self {
+        Self { matcher: nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT), query: String::new() }
+    }
 }
 
 impl ListFilter {
-    pub fn query(&self) -> &str { &self.query }
-    pub fn is_active(&self) -> bool { !self.query.is_empty() }
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+    pub fn is_active(&self) -> bool {
+        !self.query.is_empty()
+    }
     pub fn push(&mut self, c: char) {
         if !(self.query.is_empty() && c.is_whitespace()) {
             self.query.push(c);
         }
     }
-    pub fn backspace(&mut self) { self.query.pop(); }
+    pub fn backspace(&mut self) {
+        self.query.pop();
+    }
     /// Delete the last word (Ctrl+Backspace).
     pub fn delete_word(&mut self) {
         let trimmed = self.query.trim_end();
         let cut = trimmed.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
         self.query.truncate(cut);
     }
-    pub fn clear(&mut self) { self.query.clear(); }
+    pub fn clear(&mut self) {
+        self.query.clear();
+    }
 
     /// Indices of `items` matching the query, best first (all, in order, when inactive).
     /// An all-digit query puts items whose first token equals it (channel number) first.
     pub fn apply<'a>(&mut self, items: impl Iterator<Item = &'a str>) -> Vec<u32> {
-        use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
         use nucleo_matcher::Utf32Str;
+        use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
         let q = self.query.trim();
         if q.is_empty() {
             return items.enumerate().map(|(i, _)| i as u32).collect();
@@ -730,9 +746,13 @@ mod tests {
     impl EpgRig {
         fn set(&mut self, q: &str) {
             let r = self.repaints.clone();
-            self.search.set_query(q, 0, Arc::new(move || {
-                r.fetch_add(1, Ordering::SeqCst);
-            }));
+            self.search.set_query(
+                q,
+                0,
+                Arc::new(move || {
+                    r.fetch_add(1, Ordering::SeqCst);
+                }),
+            );
         }
         fn wait_for(&self, title: &str) {
             let deadline = Instant::now() + Duration::from_secs(10);

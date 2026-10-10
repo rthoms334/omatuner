@@ -37,7 +37,9 @@ impl XtreamClient {
         Self { http, creds, headers: HttpHeaders { user_agent, ..Default::default() } }
     }
 
-    pub fn credentials(&self) -> &XtreamCredentials { &self.creds }
+    pub fn credentials(&self) -> &XtreamCredentials {
+        &self.creds
+    }
 
     /// `player_api.php` with no action. Maps to [`AccountInfo`] (status, expiry, connections,
     /// formats, server tz, clock skew vs `now`).
@@ -174,9 +176,7 @@ impl XtreamClient {
             .filter(|s| s.len() >= 3)
             .flat_map(|s| [urls::enc(s), s.to_owned()])
             .collect();
-        let clean = |m: String| {
-            secrets.iter().fold(m, |m, s| if m.contains(s.as_str()) { m.replace(s.as_str(), "***") } else { m })
-        };
+        let clean = |m: String| secrets.iter().fold(m, |m, s| if m.contains(s.as_str()) { m.replace(s.as_str(), "***") } else { m });
         match e {
             Error::Network(m) => Error::Network(clean(m)),
             Error::Http { status, url } => Error::Http { status, url: clean(url) },
@@ -190,10 +190,14 @@ impl XtreamClient {
     }
 }
 
-fn is_empty_series(s: &XtSeriesInfo) -> bool { s.episodes.is_empty() && s.seasons.is_empty() }
+fn is_empty_series(s: &XtSeriesInfo) -> bool {
+    s.episodes.is_empty() && s.seasons.is_empty()
+}
 
 /// The login object in place of data (`{"user_info":…}`), as an error.
-fn login_reply(v: &Value) -> Option<Error> { v.get("user_info").map(login_reply_error) }
+fn login_reply(v: &Value) -> Option<Error> {
+    v.get("user_info").map(login_reply_error)
+}
 
 /// Panels answer actions with the login object when the credentials are rejected or the account
 /// is unusable; some forks also send it, account fine, for actions they don't support. Never
@@ -262,7 +266,9 @@ fn account_info(auth: &XtAuth, now: i64) -> AccountInfo {
 mod tests {
     use super::*;
 
-    fn auth(json: &str) -> XtAuth { serde_json::from_str(json).unwrap() }
+    fn auth(json: &str) -> XtAuth {
+        serde_json::from_str(json).unwrap()
+    }
 
     #[test]
     fn account_info_maps_every_field() {

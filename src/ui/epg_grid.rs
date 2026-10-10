@@ -102,7 +102,9 @@ impl ProgrammeCache {
     pub const LOADS_PER_FRAME: u32 = 24;
 
     /// Reset the per-frame load budget (call once per frame).
-    pub fn begin_frame(&mut self) { self.loads_this_frame = 0; }
+    pub fn begin_frame(&mut self) {
+        self.loads_this_frame = 0;
+    }
     /// Programmes of `ch` overlapping [from, to) as DISPLAYED on a channel with tvg-shift
     /// `shift_min` (queries `[from − shift, to − shift)` in EPG time, shifts after the cache).
     /// `None` while some bucket is still unloaded (budget exhausted) — caller paints skeleton
@@ -169,11 +171,15 @@ impl ProgrammeCache {
         }
         Some(out)
     }
-    pub fn invalidate(&mut self) { self.buckets.clear(); }
+    pub fn invalidate(&mut self) {
+        self.buckets.clear();
+    }
 
     /// Buckets held.
     #[cfg(test)]
-    fn len(&self) -> usize { self.buckets.len() }
+    fn len(&self) -> usize {
+        self.buckets.len()
+    }
 
     /// Drop the least recently used tenth once over capacity (amortised O(1) per insert).
     fn evict(&mut self) {
@@ -202,10 +208,19 @@ pub enum GridOutcome {
     None,
     FocusChanged,
     /// Enter / double-click on a programme.
-    Open { programme: ProgrammeId, channel: ChannelId },
+    Open {
+        programme: ProgrammeId,
+        channel: ChannelId,
+    },
     Watch(ChannelId),
-    Catchup { channel: ChannelId, programme: ProgrammeSlim },
-    Remind { channel: ChannelId, programme: ProgrammeSlim },
+    Catchup {
+        channel: ChannelId,
+        programme: ProgrammeSlim,
+    },
+    Remind {
+        channel: ChannelId,
+        programme: ProgrammeSlim,
+    },
 }
 
 /// How far back / ahead a Left/Right step looks for the neighbouring programme.
@@ -360,7 +375,14 @@ impl EpgGridState {
 
     /// Programmes of `row` overlapping [from, to) (displayed time); a row without guide data
     /// has none. `None` = still loading.
-    fn programmes(&mut self, row: usize, from: Timestamp, to: Timestamp, reader: &mut dyn EpgReader, budget: &mut FrameBudget) -> Option<Vec<ProgrammeSlim>> {
+    fn programmes(
+        &mut self,
+        row: usize,
+        from: Timestamp,
+        to: Timestamp,
+        reader: &mut dyn EpgReader,
+        budget: &mut FrameBudget,
+    ) -> Option<Vec<ProgrammeSlim>> {
         let r = self.rows.get(row)?;
         let (epg, shift) = (r.epg, r.tvg_shift_min);
         match epg {
@@ -398,7 +420,15 @@ impl EpgGridState {
             return;
         };
         self.refocus = false;
-        let distance = |p: &ProgrammeSlim| if p.contains(t) { 0 } else if p.start > t { p.start - t } else { t - p.stop + 1 };
+        let distance = |p: &ProgrammeSlim| {
+            if p.contains(t) {
+                0
+            } else if p.start > t {
+                p.start - t
+            } else {
+                t - p.stop + 1
+            }
+        };
         self.focused = progs.into_iter().min_by_key(distance);
         if let Some(p) = &self.focused {
             let (s, e) = (p.start, p.stop);
@@ -495,7 +525,9 @@ pub(crate) fn day_label(ts: Timestamp) -> String {
 }
 
 /// "20:00 – 21:00".
-pub(crate) fn time_range(start: Timestamp, stop: Timestamp, h24: bool) -> String { format!("{} – {}", hhmm(start, h24), hhmm(stop, h24)) }
+pub(crate) fn time_range(start: Timestamp, stop: Timestamp, h24: bool) -> String {
+    format!("{} – {}", hhmm(start, h24), hhmm(stop, h24))
+}
 
 /// "34 min left" / "1 h 05 left".
 pub(crate) fn time_left(secs: i64) -> String {
@@ -533,7 +565,9 @@ struct Frame<'a> {
 }
 
 impl Frame<'_> {
-    fn x_of(&self, t: Timestamp) -> f32 { self.grid.left() + (t - self.view_start) as f32 / 60.0 * self.m.px_per_min }
+    fn x_of(&self, t: Timestamp) -> f32 {
+        self.grid.left() + (t - self.view_start) as f32 / 60.0 * self.m.px_per_min
+    }
 }
 
 /// Draw the grid into the available rect.
@@ -759,7 +793,16 @@ fn excerpt(s: &str, n: usize) -> String {
 }
 
 /// Sticky channel column: logo (+ number + name at Wide, name at Medium, logo only Compact).
-fn paint_header(ui: &mut egui::Ui, p: &egui::Painter, theme: &Theme, images: &mut ImageCache, live: &LiveIndex, row: &GuideRow, r: Rect, focus_row: bool) {
+fn paint_header(
+    ui: &mut egui::Ui,
+    p: &egui::Painter,
+    theme: &Theme,
+    images: &mut ImageCache,
+    live: &LiveIndex,
+    row: &GuideRow,
+    r: Rect,
+    focus_row: bool,
+) {
     let t = &theme.tokens;
     if !ui.is_rect_visible(r) {
         return;
@@ -784,10 +827,26 @@ fn paint_header(ui: &mut egui::Ui, p: &egui::Painter, theme: &Theme, images: &mu
     let color = if focus_row { t.list_cursor_text } else { t.fg };
     let wide = r.width() >= 180.0 * theme.rem();
     if wide && let Some(n) = ch.number {
-        let nr = text(p, egui::pos2(x, r.center().y), Align2::LEFT_CENTER, n.to_string(), FontId::proportional(theme.font(TypeToken::Body)), t.text_secondary, f32::INFINITY);
+        let nr = text(
+            p,
+            egui::pos2(x, r.center().y),
+            Align2::LEFT_CENTER,
+            n.to_string(),
+            FontId::proportional(theme.font(TypeToken::Body)),
+            t.text_secondary,
+            f32::INFINITY,
+        );
         x = nr.right() + theme.space(SpaceToken::Md);
     }
-    text(p, egui::pos2(x, r.center().y), Align2::LEFT_CENTER, ch.name.to_string(), FontId::proportional(theme.font(TypeToken::Body)), color, (r.right() - pad - x).max(0.0));
+    text(
+        p,
+        egui::pos2(x, r.center().y),
+        Align2::LEFT_CENTER,
+        ch.name.to_string(),
+        FontId::proportional(theme.font(TypeToken::Body)),
+        color,
+        (r.right() - pad - x).max(0.0),
+    );
 }
 
 /// One programme / gap / skeleton cell.
@@ -797,7 +856,10 @@ fn paint_cell(p: &egui::Painter, f: &Frame<'_>, row: &GuideRow, cell: &Cell, r: 
     let t = &theme.tokens;
     let inner = Rect::from_min_max(egui::pos2(r.left(), r.top() + 1.0), egui::pos2(r.right() - 1.0, r.bottom() - 1.0));
     if skeleton {
-        let bar = Rect::from_center_size(egui::pos2(f.grid.center().x, inner.center().y), egui::vec2(f.grid.width() * 0.8, (theme.font(TypeToken::Body) * 0.8).round()));
+        let bar = Rect::from_center_size(
+            egui::pos2(f.grid.center().x, inner.center().y),
+            egui::vec2(f.grid.width() * 0.8, (theme.font(TypeToken::Body) * 0.8).round()),
+        );
         p.rect_filled(bar, t.rounding, t.fill_field);
         return;
     }
@@ -812,7 +874,15 @@ fn paint_cell(p: &egui::Painter, f: &Frame<'_>, row: &GuideRow, cell: &Cell, r: 
         let label = if row.epg.is_none() { f.no_guide } else { "No information" };
         let color = if focused { t.list_cursor_text } else { t.text_disabled };
         if text_w > 12.0 {
-            text(p, egui::pos2(text_left, inner.center().y), Align2::LEFT_CENTER, label, FontId::proportional(theme.font(TypeToken::Body)), color, text_w);
+            text(
+                p,
+                egui::pos2(text_left, inner.center().y),
+                Align2::LEFT_CENTER,
+                label,
+                FontId::proportional(theme.font(TypeToken::Body)),
+                color,
+                text_w,
+            );
         }
         p.vline(inner.right() + 0.5, inner.y_range(), egui::Stroke::new(1.0, t.separator));
         return;
@@ -850,13 +920,37 @@ fn paint_cell(p: &egui::Painter, f: &Frame<'_>, row: &GuideRow, cell: &Cell, r: 
         left = g.right() + theme.space(SpaceToken::Sm);
     }
     if reminder && right - left > 24.0 {
-        let g = text(p, egui::pos2(right, title_y), Align2::RIGHT_CENTER, glyphs::REMINDER, icon_font, if focused { t.list_cursor_text } else { t.accent }, f32::INFINITY);
+        let g = text(
+            p,
+            egui::pos2(right, title_y),
+            Align2::RIGHT_CENTER,
+            glyphs::REMINDER,
+            icon_font,
+            if focused { t.list_cursor_text } else { t.accent },
+            f32::INFINITY,
+        );
         right = g.left() - theme.space(SpaceToken::Sm);
     }
-    text(p, egui::pos2(left, title_y), Align2::LEFT_CENTER, prog.title.to_string(), FontId::proportional(theme.font(TypeToken::Body)), title_color, (right - left).max(0.0));
+    text(
+        p,
+        egui::pos2(left, title_y),
+        Align2::LEFT_CENTER,
+        prog.title.to_string(),
+        FontId::proportional(theme.font(TypeToken::Body)),
+        title_color,
+        (right - left).max(0.0),
+    );
     if show_time {
         let y = inner.top() + inner.height() * 0.70;
-        text(p, egui::pos2(text_left, y), Align2::LEFT_CENTER, time_range(prog.start, prog.stop, h24), FontId::proportional(theme.font(TypeToken::BodySmall)), t.text_secondary, text_w);
+        text(
+            p,
+            egui::pos2(text_left, y),
+            Align2::LEFT_CENTER,
+            time_range(prog.start, prog.stop, h24),
+            FontId::proportional(theme.font(TypeToken::BodySmall)),
+            t.text_secondary,
+            text_w,
+        );
     }
 }
 
@@ -867,14 +961,30 @@ fn paint_ruler(p: &egui::Painter, f: &Frame<'_>, corner: Rect, ruler: Rect, h24:
     let t = &theme.tokens;
     let font = FontId::proportional(theme.font(TypeToken::BodySmall));
     let pad = theme.space(SpaceToken::Lg);
-    text(p, egui::pos2(corner.left() + pad, corner.center().y), Align2::LEFT_CENTER, day_label(view_start.max(f.now.min(f.view_end))), FontId::proportional(theme.font(TypeToken::Body)), t.fg, (corner.width() - 2.0 * pad).max(0.0));
+    text(
+        p,
+        egui::pos2(corner.left() + pad, corner.center().y),
+        Align2::LEFT_CENTER,
+        day_label(view_start.max(f.now.min(f.view_end))),
+        FontId::proportional(theme.font(TypeToken::Body)),
+        t.fg,
+        (corner.width() - 2.0 * pad).max(0.0),
+    );
     let rp = p.with_clip_rect(Rect::from_min_max(egui::pos2(f.grid.left(), ruler.top()), ruler.max));
     let mut tick = view_start - view_start.rem_euclid(1800);
     while tick < f.view_end {
         let x = f.x_of(tick);
         if x >= f.grid.left() - 1.0 {
             rp.vline(x, egui::Rangef::new(ruler.bottom() - theme.space(SpaceToken::Md), ruler.bottom()), egui::Stroke::new(1.0, t.separator));
-            text(&rp, egui::pos2(x + theme.space(SpaceToken::Sm), ruler.center().y), Align2::LEFT_CENTER, hhmm(tick, h24), font.clone(), t.text_secondary, f32::INFINITY);
+            text(
+                &rp,
+                egui::pos2(x + theme.space(SpaceToken::Sm), ruler.center().y),
+                Align2::LEFT_CENTER,
+                hhmm(tick, h24),
+                font.clone(),
+                t.text_secondary,
+                f32::INFINITY,
+            );
         }
         tick += 1800;
     }
@@ -906,20 +1016,31 @@ mod tests {
             while s < to {
                 let gap = ch.0 == 2 && (T0 + 3600..T0 + 7200).contains(&s);
                 if !gap {
-                    out.push(ProgrammeSlim { id: ProgrammeId(ch.0 * 1_000_000 + (s - T0) / 1800 + 500_000), start: s, stop: s + 1800, title: format!("P{}", (s - T0) / 1800).into(), sub_title: None, flags: ProgrammeFlags::default() });
+                    out.push(ProgrammeSlim {
+                        id: ProgrammeId(ch.0 * 1_000_000 + (s - T0) / 1800 + 500_000),
+                        start: s,
+                        stop: s + 1800,
+                        title: format!("P{}", (s - T0) / 1800).into(),
+                        sub_title: None,
+                        flags: ProgrammeFlags::default(),
+                    });
                 }
                 s += 1800;
             }
             Ok(out)
         }
-        fn now_next(&mut self, _: &[(EpgChannelId, i32)], _: Timestamp) -> crate::error::Result<HashMap<(EpgChannelId, i32), crate::model::NowNext>> { Ok(HashMap::new()) }
+        fn now_next(&mut self, _: &[(EpgChannelId, i32)], _: Timestamp) -> crate::error::Result<HashMap<(EpgChannelId, i32), crate::model::NowNext>> {
+            Ok(HashMap::new())
+        }
     }
 
     fn rows(n: i64) -> Arc<[GuideRow]> {
         (1..=n).map(|i| GuideRow { channel: ChannelId(i), epg: Some(EpgChannelId(i)), tvg_shift_min: 0, catchup_days: 7 }).collect()
     }
 
-    fn big() -> FrameBudget { FrameBudget::new(std::time::Duration::from_secs(10)) }
+    fn big() -> FrameBudget {
+        FrameBudget::new(std::time::Duration::from_secs(10))
+    }
 
     #[test]
     fn cache_buckets_dedupe_shift_and_limit_loads() {
@@ -1081,7 +1202,10 @@ mod tests {
         assert!(matches!(s.handle(Action::GuideRemind, &mut r, &mut b, now), GridOutcome::Remind { channel: ChannelId(1), .. }));
         assert_eq!(s.handle(Action::GuideWatch, &mut r, &mut b, now), GridOutcome::Watch(ChannelId(1)));
         // no catch-up without archive
-        let mut s = EpgGridState::new(Arc::from(vec![GuideRow { channel: ChannelId(1), epg: Some(EpgChannelId(1)), tvg_shift_min: 0, catchup_days: 0 }]), now);
+        let mut s = EpgGridState::new(
+            Arc::from(vec![GuideRow { channel: ChannelId(1), epg: Some(EpgChannelId(1)), tvg_shift_min: 0, catchup_days: 0 }]),
+            now,
+        );
         s.handle(Action::GuideNow, &mut r, &mut b, now);
         s.handle(Action::Left, &mut r, &mut b, now);
         assert_eq!(s.handle(Action::GuideCatchup, &mut r, &mut b, now), GridOutcome::None);
@@ -1123,7 +1247,14 @@ mod tests {
 
     #[test]
     fn cells_cover_gaps() {
-        let p = |s: i64, e: i64| ProgrammeSlim { id: ProgrammeId(s), start: s, stop: e, title: "x".into(), sub_title: None, flags: ProgrammeFlags::default() };
+        let p = |s: i64, e: i64| ProgrammeSlim {
+            id: ProgrammeId(s),
+            start: s,
+            stop: e,
+            title: "x".into(),
+            sub_title: None,
+            flags: ProgrammeFlags::default(),
+        };
         let cells = cells_of(Some(&[p(10, 20), p(30, 40)]), 0, 50);
         let spans: Vec<(i64, i64, bool)> = cells.iter().map(|c| (c.start, c.stop, c.programme.is_some())).collect();
         assert_eq!(spans, [(0, 10, false), (10, 20, true), (20, 30, false), (30, 40, true), (40, 50, false)]);
