@@ -869,7 +869,6 @@ fn step_until(h: &mut Harness<'static, OvApp>, done: impl Fn(&OvApp) -> bool) {
 
 /// Rename and favourites-list writes go through the store and are visible afterwards.
 #[test]
-#[ignore = "needs WP-02 (store::user / store::sources bodies)"]
 fn dialogs_write_through_the_store() {
     let t = TestUi::new().expect("TestUi");
     let (source, channel) = t
