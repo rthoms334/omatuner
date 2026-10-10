@@ -31,7 +31,7 @@ use crate::model::{
     SourceKind, StreamLocator, Timestamp, Unsupported, XtreamCredentials, XtreamStreamKind,
 };
 use crate::sources::identity::xtream_key;
-use crate::sources::xtream::detect::parse_stream_url;
+use crate::sources::xtream::detect::{parse_stream_url, short_live_id};
 use crate::store::sql::{self, atomic, enum_str, fp_from_json, fp_opt, from_json_opt, kind_from_sql, or_not_found, u32_of};
 
 /// An in-progress catalogue import.
@@ -40,9 +40,6 @@ pub struct CatalogueImport {
     pub source: SourceId,
     pub generation: i64,
     pub started_at: Timestamp,
-    /// `grp.id`s from here on were created by this import (group locks carry over to them,
-    /// DESIGN §27.4).
-    pub new_groups_from: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -254,8 +251,7 @@ pub fn begin_catalogue(conn: &Connection, source: SourceId, now: Timestamp) -> R
     let generation: i64 = or_not_found(conn.query_row("SELECT generation FROM source WHERE id = ?1", [source], |r| r.get(0)), "source", source)?;
     // counters of an earlier cancelled run
     conn.execute("DELETE FROM meta WHERE key LIKE ?1", [format!("import:{}:%", source.0)])?;
-    let new_groups_from: i64 = conn.query_row("SELECT COALESCE(max(id), 0) + 1 FROM grp", [], |r| r.get(0))?;
-    Ok(CatalogueImport { source, generation: generation + 1, started_at: now, new_groups_from })
+    Ok(CatalogueImport { source, generation: generation + 1, started_at: now })
 }
 
 /// `GroupKey → grp.id` of one kind of a source.
@@ -267,7 +263,8 @@ fn group_ids(conn: &Connection, imp: &CatalogueImport, kind: ItemKind) -> Result
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// Upsert one group; returns (id, inserted).
+/// Upsert one group; returns (id, inserted). A new movie / series group inherits the lock and
+/// hidden flags of the source's `channel:X` group of the same name (`carry_group_locks`).
 fn upsert_group(conn: &Connection, imp: &CatalogueImport, g: &ImportGroup) -> Result<(GroupId, bool)> {
     let existed: bool = conn
         .prepare_cached("SELECT 1 FROM grp WHERE source_id = ?1 AND kind = ?2 AND key = ?3")?
@@ -282,6 +279,9 @@ fn upsert_group(conn: &Connection, imp: &CatalogueImport, g: &ImportGroup) -> Re
              RETURNING id",
         )?
         .query_row(params![imp.source, g.kind.as_str(), g.key.0, g.name, g.provider_id, g.provider_order, imp.generation], |r| r.get(0))?;
+    if !existed {
+        carry_group_locks(conn, imp.source, g)?;
+    }
     Ok((id, !existed))
 }
 
@@ -651,9 +651,10 @@ fn move_across_kinds(conn: &Connection, from: &ItemRef, to: &ItemRef) -> Result<
 
 /// M3U → Xtream moves (DESIGN §27.4), from the rows present before an upgrade: every channel,
 /// movie or episode holding user data whose stream URL is an Xtream stream URL goes to the
-/// Xtream key of that stream (`live` → channel, `movie` → movie, `series` → episode). This
-/// also moves the channel-kind data of legacy movie / episode entries to the right kind.
-pub fn m3u_to_xtream_moves(conn: &Connection, source: SourceId) -> Result<Vec<KeyMove>> {
+/// Xtream key of that stream (`live` → channel, `movie` → movie, `series` → episode), and so
+/// does a channel in the short live form of `login`. This also moves the channel-kind data of
+/// legacy movie / episode entries to the right kind.
+pub fn m3u_to_xtream_moves(conn: &Connection, source: SourceId, login: &XtreamCredentials) -> Result<Vec<KeyMove>> {
     let mut moves = Vec::new();
     for (kind, key) in user_data_keys(conn, source)? {
         if kind == ItemKind::Series || key.0.starts_with("xt:") {
@@ -664,13 +665,18 @@ pub fn m3u_to_xtream_moves(conn: &Connection, source: SourceId) -> Result<Vec<Ke
             .query_row(params![source, key.as_str()], |r| r.get(0))
             .optional()?;
         let Some(Ok(StreamLocator::Url { url })) = stream.map(|s| serde_json::from_str::<StreamLocator>(&s)) else { continue };
-        let Some(s) = parse_stream_url(&url) else { continue };
-        let to_kind = match s.kind {
-            XtreamStreamKind::Live => ItemKind::Channel,
-            XtreamStreamKind::Movie => ItemKind::Movie,
-            XtreamStreamKind::Series => ItemKind::Episode,
+        let (to_kind, id) = match parse_stream_url(&url) {
+            Some(s) => match s.kind {
+                XtreamStreamKind::Live => (ItemKind::Channel, s.stream_id),
+                XtreamStreamKind::Movie => (ItemKind::Movie, s.stream_id),
+                XtreamStreamKind::Series => (ItemKind::Episode, s.stream_id),
+            },
+            None => match short_live_id(&url, login) {
+                Some(id) => (ItemKind::Channel, id),
+                None => continue,
+            },
         };
-        let to = ItemRef { source, kind: to_kind, key: xtream_key(to_kind, s.stream_id) };
+        let to = ItemRef { source, kind: to_kind, key: xtream_key(to_kind, id) };
         moves.push(KeyMove { from: ItemRef { source, kind, key }, to });
     }
     moves.sort_by(|a, b| a.from.cmp(&b.from));
@@ -729,19 +735,22 @@ fn kind_fixup_moves(conn: &Connection, source: SourceId) -> Result<Vec<KeyMove>>
     Ok(moves)
 }
 
-/// Copy the lock / hidden flags of `channel:X` group overrides to the `movie:X` / `series:X`
-/// groups this import created, unless they have an override already: reclassifying entries
-/// never weakens a parental lock (DESIGN §27.4), and a group the user unlocked stays unlocked.
-fn carry_group_locks(conn: &Connection, imp: &CatalogueImport, kind: ItemKind) -> Result<()> {
-    conn.execute(
+/// Copy the lock / hidden flags of the `channel:X` group override to the new `movie:X` /
+/// `series:X` group `g`: reclassifying entries never weakens a parental lock (DESIGN §27.4).
+/// Done when the group is created, in the same transaction, so an import that never finishes
+/// cannot leave it unlocked; a group the user unlocks later is not created again and stays so.
+fn carry_group_locks(conn: &Connection, source: SourceId, g: &ImportGroup) -> Result<()> {
+    if !matches!(g.kind, ItemKind::Movie | ItemKind::Series) {
+        return Ok(());
+    }
+    let Some(name) = g.key.0.strip_prefix(g.kind.as_str()).and_then(|k| k.strip_prefix(':')) else { return Ok(()) };
+    conn.prepare_cached(
         "INSERT INTO group_override(source_id, kind, group_key, hidden, locked)
-         SELECT o.source_id, g.kind, g.key, o.hidden, o.locked
-         FROM group_override o
-         JOIN grp g ON g.source_id = o.source_id AND g.kind = ?2 AND g.key = ?2 || substr(o.group_key, 8)
-         WHERE o.source_id = ?1 AND o.kind = 'channel' AND o.group_key LIKE 'channel:%' AND (o.locked OR o.hidden) AND g.id >= ?3
+         SELECT source_id, ?2, ?3, hidden, locked FROM group_override
+         WHERE source_id = ?1 AND kind = 'channel' AND group_key = ?4 AND (locked OR hidden)
          ON CONFLICT(source_id, kind, group_key) DO NOTHING",
-        params![imp.source, kind.as_str(), imp.new_groups_from],
-    )?;
+    )?
+    .execute(params![source, g.kind.as_str(), g.key.0, format!("channel:{name}")])?;
     Ok(())
 }
 
@@ -790,8 +799,7 @@ pub struct FinishOptions {
     pub m3u: bool,
 }
 
-/// [`finish_catalogue`] with the [`FinishOptions`]. Also copies group locks to the movie /
-/// series groups created by this import (`carry_group_locks`).
+/// [`finish_catalogue`] with the [`FinishOptions`].
 pub fn finish_catalogue_with(
     conn: &mut Connection,
     imp: &CatalogueImport,
@@ -862,9 +870,6 @@ pub fn finish_catalogue_with(
     let (outcomes, newly_orphaned) = reattach(&tx, imp.source, reattach_kinds, now)?;
     summary.reattached = outcomes.iter().filter(|(_, o)| matches!(o, ReattachOutcome::Reattached { .. })).count() as u32;
     summary.orphaned = newly_orphaned;
-    for kind in [ItemKind::Movie, ItemKind::Series].into_iter().filter(|k| completed.contains(k)) {
-        carry_group_locks(&tx, imp, kind)?;
-    }
 
     tx.execute(
         "UPDATE source SET generation = ?2, n_channels = ?3, n_movies = ?4, n_series = ?5, n_groups = ?6 WHERE id = ?1",

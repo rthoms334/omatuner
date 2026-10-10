@@ -2661,7 +2661,11 @@ scheme://host[:port][/prefix…]/{live|movie|series}/<user>/<pass>/<id>[.<ext>][
   when absent;
 * `server` = `scheme://host[:port]` + the prefix segments joined with `/` (no trailing `/`);
 * not matched: `timeshift/…`, the short live form `host/<user>/<pass>/<id>` (too ambiguous —
-  any CDN path `a/b/123.ts` would qualify), anything with fewer segments.
+  any CDN path `a/b/123.ts` would qualify), anything with fewer segments. The short form counts
+  only with the login of the full stream URLs: `PlaylistScan` accepts short-form entries whose
+  two segments are that login (and gives up on any other pair), so a panel playlist whose live
+  section uses the short form still upgrades; `m3u_to_xtream_moves` maps such channels to
+  `xt:live:<id>` (`detect::short_live_id`).
 
 **Whole playlist** (`detect::PlaylistScan`, fed every entry URL in file order): the playlist
 is one Xtream account iff

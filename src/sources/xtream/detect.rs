@@ -11,9 +11,15 @@
 //!
 //! Details fixed by the implementation:
 //! * Non-stream entries are allowed only on a host that also serves stream URLs. One seen
-//!   before the first stream URL is held until [`PlaylistScan::finish`], but only among the
-//!   first [`LEADING_EXTRAS`] entries: a plain playlist (iptv-org, Free-TV) is given up after
-//!   that many entries instead of being scanned to the end.
+//!   before the first stream URL is held until [`PlaylistScan::finish`], but only the first
+//!   [`LEADING_EXTRAS`] of them: a plain playlist (iptv-org, Free-TV) is given up after that
+//!   many entries instead of being scanned to the end.
+//! * The short live form `host[:port][/prefix]/<user>/<pass>/<id>[.<ext>]` proves nothing on
+//!   its own (any CDN path `a/b/123.ts` has that shape), but panels often write their live
+//!   section that way, ahead of the `/movie/` and `/series/` entries. An entry of that shape
+//!   whose two segments are the playlist's login is one of the account's streams
+//!   ([`short_live_id`]); one with any other pair is another account's (a merge) and gives up.
+//!   Before the first stream URL the scan holds the one pair seen and `finish` checks it.
 
 use url::Url;
 
@@ -39,10 +45,7 @@ pub struct XtreamStreamUrl {
 /// matched case-insensitively; query and fragment ignored). `timeshift/…` and the short live
 /// form `host/<user>/<pass>/<id>` are NOT matched (§27.2).
 pub fn parse_stream_url(url: &str) -> Option<XtreamStreamUrl> {
-    let u = Url::parse(url.trim()).ok()?;
-    if !matches!(u.scheme(), "http" | "https") {
-        return None;
-    }
+    let u = http_url(url)?;
     let segs: Vec<&str> = u.path_segments()?.collect();
     let [prefix @ .., kind, user, pass, last] = segs.as_slice() else { return None };
     let kind = match kind.to_ascii_lowercase().as_str() {
@@ -55,19 +58,49 @@ pub fn parse_stream_url(url: &str) -> Option<XtreamStreamUrl> {
     if prefix.iter().any(|s| s.eq_ignore_ascii_case("timeshift")) {
         return None;
     }
-    let (stem, ext) = match last.split_once('.') {
-        Some((stem, ext)) => (stem, Some(ext.to_ascii_lowercase()).filter(|e| !e.is_empty())),
-        None => (*last, None),
-    };
-    if stem.is_empty() || !stem.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let stream_id = stem.parse::<i64>().ok().filter(|id| *id > 0)?;
+    let (stream_id, ext) = stream_id(last)?;
     let (username, password) = (percent_decode(user), percent_decode(pass));
     if username.is_empty() || password.is_empty() {
         return None;
     }
     Some(XtreamStreamUrl { creds: XtreamCredentials { server: server_url(&u, prefix)?, username, password: password.into() }, kind, stream_id, ext })
+}
+
+/// The stream id of a short live URL `scheme://host[:port][/prefix…]/<user>/<pass>/<id>[.<ext>]`
+/// of `login` (its two segments before the id, percent-decoded, are exactly that login's).
+pub fn short_live_id(url: &str, login: &XtreamCredentials) -> Option<i64> {
+    let (user, pass, id) = parse_short_url(url)?;
+    (user == login.username && pass == *login.password.expose()).then_some(id)
+}
+
+/// `(user, pass, id)` of a URL shaped like the short live form; not a stream URL itself.
+fn parse_short_url(url: &str) -> Option<(String, String, i64)> {
+    let u = http_url(url)?;
+    let segs: Vec<&str> = u.path_segments()?.collect();
+    let [prefix @ .., user, pass, last] = segs.as_slice() else { return None };
+    if prefix.iter().any(|s| s.eq_ignore_ascii_case("timeshift")) {
+        return None;
+    }
+    let (id, _) = stream_id(last)?;
+    let (user, pass) = (percent_decode(user), percent_decode(pass));
+    (!user.is_empty() && !pass.is_empty()).then_some((user, pass, id))
+}
+
+/// An absolute http(s) URL.
+fn http_url(url: &str) -> Option<Url> {
+    Url::parse(url.trim()).ok().filter(|u| matches!(u.scheme(), "http" | "https"))
+}
+
+/// `<id>[.<ext>]`: the stem all ASCII digits, > 0; the extension lowercased, `None` if empty.
+fn stream_id(last: &str) -> Option<(i64, Option<String>)> {
+    let (stem, ext) = match last.split_once('.') {
+        Some((stem, ext)) => (stem, Some(ext.to_ascii_lowercase()).filter(|e| !e.is_empty())),
+        None => (last, None),
+    };
+    if stem.is_empty() || !stem.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((stem.parse::<i64>().ok().filter(|id| *id > 0)?, ext))
 }
 
 /// `scheme://host[:port]` + the non-empty `prefix` segments (no trailing `/`). Also used by
@@ -107,10 +140,7 @@ fn percent_decode(s: &str) -> String {
 
 /// `host[:port]` of an http(s) URL (lowercased by the URL parser).
 fn host_port(url: &str) -> Option<String> {
-    let u = Url::parse(url.trim()).ok()?;
-    if !matches!(u.scheme(), "http" | "https") {
-        return None;
-    }
+    let u = http_url(url)?;
     let host = u.host_str().filter(|h| !h.is_empty())?;
     Some(match u.port() {
         Some(p) => format!("{host}:{p}"),
@@ -121,8 +151,9 @@ fn host_port(url: &str) -> Option<String> {
 /// Whole-playlist detection (§27.2). Feed every entry URL in file order with [`push`]; stop
 /// early when it returns `false`. The playlist is one Xtream account when it has at least one
 /// stream URL, all of them carry the same username + password, and every other entry is
-/// served by a host that also serves stream URLs. The API is then tried on the most frequent
-/// `server` (first seen on ties).
+/// served by a host that also serves stream URLs, or is the short live form of that login (any
+/// other short-form entry rules the playlist out). The
+/// API is then tried on the most frequent `server` (first seen on ties).
 ///
 /// [`push`]: PlaylistScan::push
 #[derive(Debug, Default)]
@@ -135,7 +166,8 @@ pub struct PlaylistScan {
     stream_hosts: Vec<String>,
     /// Hosts of leading non-stream entries, checked by `finish`.
     pending: Vec<String>,
-    entries: usize,
+    /// The (user, pass) of short-form entries before the first stream URL, checked by `finish`.
+    short: Option<(String, String)>,
     failed: bool,
 }
 
@@ -145,7 +177,6 @@ impl PlaylistScan {
         if self.failed {
             return false;
         }
-        self.entries += 1;
         self.failed = !self.accept(url);
         !self.failed
     }
@@ -153,13 +184,27 @@ impl PlaylistScan {
     fn accept(&mut self, url: &str) -> bool {
         let Some(host) = host_port(url) else { return false };
         let Some(s) = parse_stream_url(url) else {
+            if let Some((user, pass, _)) = parse_short_url(url) {
+                let pair = (user, pass);
+                return match self.login.as_ref().or(self.short.as_ref()) {
+                    // the account's own short live form: its host serves the account
+                    Some(l) if *l == pair => {
+                        push_new(&mut self.stream_hosts, host);
+                        true
+                    }
+                    Some(_) => false,
+                    None => {
+                        push_new(&mut self.stream_hosts, host);
+                        self.short = Some(pair);
+                        true
+                    }
+                };
+            }
             if self.stream_hosts.contains(&host) {
                 return true;
             }
-            if self.login.is_none() && self.entries <= LEADING_EXTRAS {
-                if !self.pending.contains(&host) {
-                    self.pending.push(host);
-                }
+            if self.login.is_none() && self.pending.len() < LEADING_EXTRAS {
+                self.pending.push(host);
                 return true;
             }
             return false;
@@ -174,21 +219,26 @@ impl PlaylistScan {
             Some((_, n)) => *n += 1,
             None => self.servers.push((s.creds.server, 1)),
         }
-        if !self.stream_hosts.contains(&host) {
-            self.stream_hosts.push(host);
-        }
+        push_new(&mut self.stream_hosts, host);
         true
     }
 
     /// The login to try, if the playlist qualified.
     pub fn finish(self) -> Option<XtreamCredentials> {
-        if self.failed || self.pending.iter().any(|h| !self.stream_hosts.contains(h)) {
+        let (username, password) = self.login?;
+        let short_ok = self.short.is_none_or(|(u, p)| u == username && p == password);
+        if self.failed || !short_ok || self.pending.iter().any(|h| !self.stream_hosts.contains(h)) {
             return None;
         }
-        let (username, password) = self.login?;
         // `max_by_key` keeps the last maximum: walk backwards so the first seen wins ties
         let server = self.servers.into_iter().rev().max_by_key(|(_, n)| *n)?.0;
         Some(XtreamCredentials { server, username, password: password.into() })
+    }
+}
+
+fn push_new(v: &mut Vec<String>, s: String) {
+    if !v.contains(&s) {
+        v.push(s);
     }
 }
 
@@ -269,5 +319,25 @@ mod tests {
         assert_eq!(plain.iter().position(|u| !s.push(u)), Some(LEADING_EXTRAS));
         // a local file entry is never served by the panel
         assert_eq!(scan(&["http://h/live/u/p/1.ts", "/home/me/clip.ts"]), (false, None));
+
+        // a live section in the short form, longer than the leading extras, then the VOD
+        let mut panel: Vec<String> = (1..=2 * LEADING_EXTRAS).map(|i| format!("http://h:8080/u/p/{i}.ts")).collect();
+        panel.push("http://h:8080/movie/u/p/5001.mkv".into());
+        panel.push("http://h:8080/u/p/99".into());
+        let panel: Vec<&str> = panel.iter().map(String::as_str).collect();
+        let (ok, c) = scan(&panel);
+        assert!(ok);
+        assert_eq!(c.map(|c| c.server).as_deref(), Some("http://h:8080"));
+        // ... but only with the login of the stream URLs; a second pair gives up at once
+        assert_eq!(scan(&["http://h/u/p/1.ts", "http://h/movie/u2/p2/5001.mkv"]).1, None);
+        assert_eq!(scan(&["http://h/u/p/1.ts", "http://h/u2/p/2.ts"]), (false, None));
+        assert_eq!(scan(&["http://h/live/u/p/1.ts", "http://h/u2/p/2.ts"]), (false, None));
+        // a catch-up URL is not the short form
+        assert!(scan(&["http://h/live/u/p/1.ts", "http://h/timeshift/u/p/60/2026-10-09:20-00/1.ts"]).1.is_some());
+        // the short form alone proves nothing
+        assert_eq!(scan(&["http://h/u/p/1.ts", "http://h/u/p/2.ts"]), (true, None));
+        let login = XtreamCredentials { server: "http://h".into(), username: "u@x".into(), password: String::from("p").into() };
+        assert_eq!(short_live_id("http://other/pre/u%40x/p/42.m3u8", &login), Some(42));
+        assert_eq!(short_live_id("http://h/u/q/42.ts", &login), None);
     }
 }

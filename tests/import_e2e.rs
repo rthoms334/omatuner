@@ -950,10 +950,17 @@ async fn a_playlist_whose_login_fails_stays_m3u_and_checks_again_weekly() {
         let mut d = draft(name, SourceKind::M3uUrl);
         d.url = Some(format!("{}/get.php?username={user}&password={PASSWORD}", mock.base));
         d.settings.use_provider_epg = Some(false);
+        // imported before this release: an ETag on record
+        d.settings.keep_m3u = true;
         let source = h.insert(d).await;
+        assert!(h.refresh(source).await.is_ok(), "{name}");
+        let mut s = h.source(source).await;
+        s.settings.keep_m3u = false;
+        h.update(s).await;
         let logins = || mock.recorded().iter().filter(|r| r.starts_with("/player_api.php") && !r.contains("action=") && r.contains(user)).count();
+        // the first check downloads the playlist in full (the old import may predate the fallback)
         match h.refresh(source).await {
-            Ok(JobOutcome::SourceRefreshed { summary, upgraded: false, .. }) => {
+            Ok(JobOutcome::SourceRefreshed { summary, upgraded: false, not_modified: false, .. }) => {
                 assert_eq!((summary.channels.total, summary.movies.total, summary.series.total), (2, 2, 1), "{name}");
             }
             other => panic!("{name}: {other:?}"),
@@ -1028,6 +1035,16 @@ async fn legacy_channels_of_a_kept_playlist_become_movies_and_series_with_their_
             user::push_history(c, &HistoryEntry { item: ch(2), at: 3, title: "Example Show".into() })?;
             let adult = group_key(ItemKind::Channel, "Adult");
             user::set_group_override(c, source, ItemKind::Channel, &adult, &GroupOverride { locked: true, ..Default::default() })?;
+            // a first refresh that wrote its movie groups and was then cancelled (no finish)
+            let cancelled = import::begin_catalogue(c, source, 4)?;
+            let movies = import::ImportGroup {
+                kind: ItemKind::Movie,
+                key: group_key(ItemKind::Movie, "Adult"),
+                name: "Adult".into(),
+                provider_id: None,
+                provider_order: 0,
+            };
+            import::upsert_groups(c, &cancelled, &[movies])?;
             Ok(channels.iter().map(|c| c.key.0.clone()).collect())
         })
         .await
@@ -1054,7 +1071,8 @@ async fn legacy_channels_of_a_kept_playlist_become_movies_and_series_with_their_
         [format!("movie {}", keys[1])]
     );
     assert_eq!(h.strings("SELECT kind || ' ' || item_key FROM history WHERE source_id = ?1", source).await, [format!("episode {}", keys[2])]);
-    // a locked group of channels stays locked as a group of movies
+    // a locked group of channels stays locked as a group of movies, even one an unfinished
+    // import created
     assert_eq!(h.scalar("SELECT locked FROM group_override WHERE source_id = ?1 AND group_key = 'movie:adult'", source).await, 1);
 
     // series by title, seasons and episodes from the S01E02 markers (file order without one)

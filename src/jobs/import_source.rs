@@ -305,6 +305,9 @@ async fn refresh_playlist(
     if !force && last.as_ref().is_some_and(|l| now - l.at < UPGRADE_RETRY_S) {
         return refresh_m3u(ctx, src, src.kind, force, cfg, progress, cancel, opts).await;
     }
+    // a `get.php` playlist kept after its login failed: downloaded in full the first time, as
+    // the import before this check may predate the movies / series fallback
+    let refetch = force || last.is_none();
 
     // 1. the login: from a `get.php` URL, else from the entries (§27.2)
     let get_php = match src.kind {
@@ -342,17 +345,18 @@ async fn refresh_playlist(
         Err(Error::Cancelled) => return Err(Error::Cancelled),
         Err(e) => {
             upgrade_failed(ctx, src, &creds, &e).await?;
-            return keep_playlist(ctx, src, playlist, force, cfg, progress, cancel).await;
+            return keep_playlist(ctx, src, playlist, refetch, cfg, progress, cancel).await;
         }
     };
 
     // 3. switch: the Xtream import commits it at its first finish
-    let moves = read(ctx, move |c| import::m3u_to_xtream_moves(c, id)).await?;
+    let login = creds.clone();
+    let moves = read(ctx, move |c| import::m3u_to_xtream_moves(c, id, &login)).await?;
     let mut upgrade = Upgrade { creds, account, moves, committed: false };
     match refresh_xtream(ctx, src, cfg, progress, cancel, Some(&mut upgrade)).await {
         Err(e) if !upgrade.committed && !matches!(e, Error::Cancelled) => {
             upgrade_failed(ctx, src, &upgrade.creds, &e).await?;
-            keep_playlist(ctx, src, playlist, force, cfg, progress, cancel).await
+            keep_playlist(ctx, src, playlist, refetch, cfg, progress, cancel).await
         }
         r => r,
     }
