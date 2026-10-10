@@ -397,3 +397,130 @@ impl Player {
 impl Drop for Player {
     fn drop(&mut self) { self.shutdown(); }
 }
+
+/// Headless controller tests against a real libmpv (`vo=null`, `ao=null`) playing libavdevice's
+/// `lavfi` test source (no files, no network). File/HTTP scenarios live in `tests/player_mpv.rs`.
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::model::{ChannelId, PlayableKind};
+    use crate::redact::Secret;
+
+    struct Lavfi;
+
+    impl MediaResolver for Lavfi {
+        fn resolve(&mut self, media: &MediaRef, _resume: bool) -> std::result::Result<Playable, PlayerError> {
+            Ok(Playable {
+                media: media.clone(),
+                kind: PlayableKind::Live,
+                item: None,
+                source_id: None,
+                title: "lavfi".into(),
+                subtitle: None,
+                logo: None,
+                number: None,
+                url: Secret::new("av://lavfi:testsrc2=size=160x90:rate=25".into()),
+                headers: Default::default(),
+                start_at: None,
+                duration_hint: None,
+            })
+        }
+        fn skip_on_zap(&mut self, _ch: ChannelId) -> bool { false }
+    }
+
+    fn headless_config() -> Config {
+        let mut cfg = Config::default();
+        cfg.player.mpv_options.insert("vo".into(), "null".into());
+        cfg.player.mpv_options.insert("ao".into(), "null".into());
+        cfg
+    }
+
+    fn start() -> Player {
+        let deps = PlayerDeps { bus: EventBus::new(None).0, store: Box::new(NullPlayerStore), resolver: Box::new(Lavfi) };
+        Player::start(&headless_config(), deps).expect("headless mpv")
+    }
+
+    fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        f()
+    }
+
+    fn play(p: &Player) {
+        p.handle().send(PlayerCommand::Play(PlayRequest {
+            media: MediaRef::Channel(ChannelId(1)),
+            zap: None,
+            origin: PlayOrigin::Cli,
+            resume: false,
+            immediate: true,
+        }));
+    }
+
+    #[test]
+    fn apply_config_reaches_mpv() {
+        let p = start();
+        let mpv = p.mpv.clone().expect("mpv");
+        let mut cfg = headless_config();
+        cfg.player.cache_secs = 4;
+        cfg.player.network_timeout_s = 7;
+        cfg.player.user_agent = "ApplyConfig/1".into();
+        cfg.player.mpv_options.insert("video-sync".into(), "display-resample".into());
+        p.handle().send(PlayerCommand::ApplyConfig(Box::new(cfg)));
+        // the controller sets the properties one by one: wait for the last one it applies
+        assert!(wait_until(Duration::from_secs(5), || {
+            mpv.get_property::<String>("video-sync").ok().as_deref() == Some("display-resample")
+        }));
+        assert_eq!(mpv.get_property::<f64>("cache-secs").unwrap(), 4.0);
+        assert_eq!(mpv.get_property::<f64>("demuxer-readahead-secs").unwrap(), 4.0);
+        assert_eq!(mpv.get_property::<f64>("network-timeout").unwrap(), 7.0);
+        assert_eq!(mpv.get_property::<String>("user-agent").unwrap(), "ApplyConfig/1");
+    }
+
+    #[test]
+    fn video_is_suspended_while_nothing_renders_and_resumed_on_request() {
+        let p = start();
+        let mpv = p.mpv.clone().expect("mpv");
+        let h = p.handle();
+        play(&p);
+        assert!(
+            wait_until(Duration::from_secs(20), || {
+                let s = h.snapshot();
+                s.state == PlayerState::Playing && s.video_size.is_some()
+            }),
+            "lavfi playback: {:?}",
+            h.snapshot().state
+        );
+        // no surface yet (clock 0): never suspended
+        std::thread::sleep(Duration::from_millis(2300));
+        assert!(!h.snapshot().video_suspended);
+
+        // one frame rendered "now", then nothing (hidden window)
+        let core = p.render_core().expect("core");
+        core.clock.store(core.epoch.elapsed().as_millis().max(1) as u64, Ordering::Relaxed);
+        assert!(wait_until(Duration::from_secs(6), || h.snapshot().video_suspended), "suspended after 2 s");
+        assert_eq!(mpv.get_property::<String>("vid").unwrap(), "no");
+        assert_eq!(h.snapshot().state, PlayerState::Playing, "audio keeps playing");
+
+        h.send(PlayerCommand::ResumeVideo);
+        assert!(wait_until(Duration::from_secs(5), || !h.snapshot().video_suspended));
+        assert_ne!(mpv.get_property::<String>("vid").unwrap(), "no");
+    }
+
+    #[test]
+    fn shutdown_stops_and_joins() {
+        let mut p = start();
+        play(&p);
+        let h = p.handle();
+        assert!(wait_until(Duration::from_secs(20), || h.snapshot().state == PlayerState::Playing));
+        p.shutdown();
+        assert_eq!(h.snapshot().state, PlayerState::Idle, "final snapshot published on shutdown");
+        p.shutdown(); // idempotent
+    }
+}
