@@ -2,14 +2,13 @@
 //! Tab moves between buttons / seasons / episodes) + episode list opened at
 //! `store::vod::next_episode`; Enter plays, Shift+Enter from the start, Ctrl+W marks watched,
 //! bulk "mark season watched" in the context menu. Key context `[Detail]`. End of an episode:
-//! "Next episode in 10 s" card (Enter = now, Esc = cancel). Owner: WP-12.
+//! the page follows along (cursor on the next episode). Owner: WP-12.
 //!
 //! Data is read off the UI thread (series, seasons, episodes, per-episode progress and the
 //! episode to open at) and re-read on `DataScope::{VodDetails, Progress, Overrides}`; Xtream
 //! series without loaded details submit `JobKind::LoadSeriesDetails` and show a skeleton.
-//! This screen (always alive) also drives the end of EVERY episode: when one ends (watched)
-//! while the fullscreen player shows it — started here, from a grid, Home or search — the
-//! resume overlay opens in its "Next episode in 10 s" mode for the following episode.
+//! The "Next episode in 10 s" card itself is the fullscreen player's (WP-11, drawn over the
+//! video in OSD colours, for an episode started anywhere); this page only moves its cursor.
 
 use std::collections::HashMap;
 
@@ -23,8 +22,7 @@ use crate::model::{Episode, EpisodeId, ItemKey, ItemKind, ItemRef, MediaRef, Pla
 use crate::msg::{AppEvent, DataScope};
 use crate::player::PlayerEvent;
 use crate::theme::{SpaceToken, TypeToken};
-use crate::ui::overlays::{ContextMenuSpec, MenuItem, OverlayResult, ResumeSpec};
-use crate::ui::video_host::Placement;
+use crate::ui::overlays::{ContextMenuSpec, MenuItem, OverlayResult};
 use crate::ui::widgets::button::{ButtonStyle, button};
 use crate::ui::widgets::{RowState, empty_state, glyphs, rows, section};
 use crate::ui::{OverlayRequest, Route, Screen, ScreenId, UiCtx};
@@ -85,24 +83,6 @@ fn load(c: &rusqlite::Connection, id: SeriesId) -> crate::error::Result<Data> {
 }
 
 fn episode_ref(e: &Episode) -> ItemRef { ItemRef { source: e.source_id, kind: ItemKind::Episode, key: e.key.clone() } }
-
-/// The episode after `ended` in season order (an episode of a series no page has loaded).
-/// Three indexed point / range reads on the UI connection, once per finished episode (an
-/// event, not a frame) — no `Loader`: its answer would have no screen to land on while the
-/// fullscreen player is current.
-fn next_after(db: &rusqlite::Connection, ended: &ItemRef) -> Option<Episode> {
-    use crate::store::vod;
-    let read = || -> crate::error::Result<Option<Episode>> {
-        let Some(id) = vod::resolve_episode(db, ended)? else { return Ok(None) };
-        let e = vod::episode(db, id)?;
-        let eps = vod::episodes(db, e.series_id, None)?;
-        Ok(eps.iter().position(|x| x.id == id).and_then(|i| eps.get(i + 1)).cloned())
-    };
-    read().unwrap_or_else(|e| {
-        tracing::warn!("next episode: {e}");
-        None
-    })
-}
 
 /// "S01E03 · Pilot".
 fn episode_label(e: &Episode) -> String { format!("S{:02}E{:02} · {}", e.season, e.episode, e.title) }
@@ -295,29 +275,14 @@ impl Screen for SeriesDetailScreen {
             AppEvent::Job(JobEvent::Finished { kind: JobKind::LoadSeriesDetails(s), outcome: Err(msg), .. }) if Some(*s) == self.id => {
                 ctx.toast(crate::msg::Toast::error(format!("Couldn't load the episodes: {}", crate::redact::redact(msg))));
             }
-            AppEvent::Player(PlayerEvent::Ended { item: Some(item), finished }) if item.kind == ItemKind::Episode => {
+            AppEvent::Player(PlayerEvent::Ended { item: Some(item), .. }) if item.kind == ItemKind::Episode => {
                 // this page shows the series: follow along
                 let shown = self.data.as_ref().and_then(|d| d.episodes.iter().find(|e| e.key == item.key && e.source_id == item.source)).cloned();
+                // (the "Next episode in 10 s" card is the fullscreen player's, DESIGN §13.6)
                 if let Some(ended) = &shown {
                     self.reload(ctx);
                     if let Some(n) = self.after(&ended.key) {
                         self.select_episode(n.id);
-                    }
-                }
-                // DESIGN §13.6: "Next episode in 10 s" over the video (Enter = now, Esc = stay) for
-                // every episode that ends in the fullscreen player, wherever it was started
-                if *finished && ctx.video.placement() == Placement::Fullscreen {
-                    let next = match &shown {
-                        Some(ended) => self.after(&ended.key),
-                        None => next_after(ctx.db, item),
-                    };
-                    if let Some(n) = next {
-                        ctx.open(OverlayRequest::Resume(ResumeSpec {
-                            media: MediaRef::Episode(n.id),
-                            title: episode_label(&n),
-                            position_s: 0.0,
-                            duration_s: n.duration_s.map(f64::from),
-                        }));
                     }
                 }
             }
@@ -673,7 +638,7 @@ mod tests {
     }
 
     #[test]
-    fn page_opens_at_the_next_episode_seasons_marks_and_the_up_next_card() {
+    fn page_opens_at_the_next_episode_seasons_marks_and_follows_an_ended_episode() {
         let (mut t, one) = rig();
         let ids = seed(&mut t, |c| {
             let s = testkit::source(c, "My IPTV")?;
@@ -721,49 +686,14 @@ mod tests {
         assert_eq!(h.state_mut().nav(), vec![NavRequest::Push(Route::Player)]);
         let s13 = h.state().s.focused_episode().unwrap();
         assert_eq!((s13.season, s13.episode), (1, 3));
-        // it ends (watched) in the fullscreen player: "Next episode in 10 s" for S2E1
+        // it ends (watched) in the fullscreen player: the page follows along to S2E1 and opens
+        // nothing itself (the "Next episode in 10 s" card is the player's, tests/guide.rs)
         crate::ui::screens::movie_detail::tests::fullscreen_placement(&mut h.state_mut().t);
         h.state().t.services().bus.send(AppEvent::Player(PlayerEvent::Ended { item: Some(episode_ref(&s13)), finished: true }));
         h.run_steps(1);
-        let nav = h.state_mut().nav();
+        assert_eq!(h.state_mut().nav(), vec![], "no second up-next card over the player's");
         let next = h.state().s.data.as_ref().unwrap().episodes.iter().find(|e| e.season == 2 && e.episode == 1).unwrap().id;
-        assert!(
-            matches!(nav.as_slice(), [NavRequest::Open(OverlayRequest::Resume(r))] if r.position_s == 0.0 && r.media == MediaRef::Episode(next)),
-            "{nav:?}"
-        );
-    }
-
-    /// DESIGN §13.6 for every episode: one started from a grid, Home or search (no page has
-    /// its series loaded) still gets "Next episode in 10 s"; the last episode, an episode
-    /// stopped early and the mini player get none.
-    #[test]
-    fn the_up_next_card_follows_episodes_started_anywhere() {
-        let (mut t, one) = rig();
-        let src = seed(&mut t, |c| {
-            let s = testkit::source(c, "My IPTV")?;
-            testkit::series(c, s, 2, 2, 2)?;
-            Ok(s)
-        });
-        let ep = |key: &str| ItemRef { source: src, kind: ItemKind::Episode, key: ItemKey(key.into()) };
-        let id_of = |t: &crate::ui::testing::TestUi, key: &str| crate::store::vod::resolve_episode(&t.services().store.reader().unwrap(), &ep(key)).unwrap().unwrap();
-        // a fresh page (never opened): only the always-alive screen sees the event
-        let mut h = harness(t, one, SeriesDetailScreen::default(), egui::vec2(1000.0, 800.0));
-        let ended = |h: &mut egui_kittest::Harness<'static, testkit::App<SeriesDetailScreen>>, key: &str, finished: bool| {
-            h.state().t.services().bus.send(AppEvent::Player(PlayerEvent::Ended { item: Some(ep(key)), finished }));
-            h.run_steps(1);
-            h.state_mut().nav()
-        };
-        // in the mini player (no fullscreen video last frame): nothing
-        assert!(ended(&mut h, "m3u:ep1-1-1", true).is_empty());
-        crate::ui::screens::movie_detail::tests::fullscreen_placement(&mut h.state_mut().t);
-        // S1E2 of the second series ends: S2E1 is next (across seasons)
-        let next = id_of(&h.state().t, "m3u:ep1-2-1");
-        let nav = ended(&mut h, "m3u:ep1-1-2", true);
-        assert!(matches!(nav.as_slice(), [NavRequest::Open(OverlayRequest::Resume(r))] if r.position_s == 0.0 && r.media == MediaRef::Episode(next) && r.title.starts_with("S02E01")), "{nav:?}");
-        crate::ui::screens::movie_detail::tests::fullscreen_placement(&mut h.state_mut().t);
-        assert!(ended(&mut h, "m3u:ep1-1-1", false).is_empty(), "stopped early");
-        crate::ui::screens::movie_detail::tests::fullscreen_placement(&mut h.state_mut().t);
-        assert!(ended(&mut h, "m3u:ep1-2-2", true).is_empty(), "the last episode");
+        assert_eq!(h.state().s.focused_episode().map(|e| e.id), Some(next));
     }
 
     #[test]

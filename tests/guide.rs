@@ -1246,11 +1246,24 @@ fn episode_end_offers_the_next_episode() {
         })
         .unwrap();
     reload(&mut t);
+    let ended = |t: &mut TestUi, p: &mut PlayerScreen, finished: bool| {
+        draw(t, p);
+        t.video.begin_frame(); // the player placed the video last frame
+        t.with_ctx(|ctx| p.on_event(ctx, &tuner::msg::AppEvent::Player(tuner::player::PlayerEvent::Ended { item: None, finished })));
+        draw(t, p);
+    };
+    // the last episode has no successor, and an episode stopped early (not watched) gets no
+    // card: Enter / i only focus the controls
+    let mut last = player_with(&mut t, fake_playing(MediaRef::Episode(eps[2]), PlayableKind::Episode { season: 1, episode: 3 }, None, PlayOrigin::Fullscreen));
+    ended(&mut t, &mut last, true);
+    assert!(act(&mut t, &mut last, Action::FocusOsdControls));
     let mut p = player_with(&mut t, fake_playing(MediaRef::Episode(eps[0]), PlayableKind::Episode { season: 1, episode: 1 }, None, PlayOrigin::Fullscreen));
-    draw(&mut t, &mut p);
-    t.video.begin_frame(); // the player placed the video last frame
-    t.with_ctx(|ctx| p.on_event(ctx, &tuner::msg::AppEvent::Player(tuner::player::PlayerEvent::Ended { item: None, finished: true })));
-    // Enter = play now
+    ended(&mut t, &mut p, false);
+    assert!(act(&mut t, &mut p, Action::FocusOsdControls));
+    assert!(act(&mut t, &mut p, Action::LeaveOsdControls));
+    player_stays_idle(&t, 300);
+    // a watched episode, started anywhere (no detail page involved): Enter = play now
+    ended(&mut t, &mut p, true);
     act(&mut t, &mut p, Action::FocusOsdControls);
     player_until(&t, "next episode", plays(MediaRef::Episode(eps[1])));
 }

@@ -10,8 +10,9 @@
 //!   `[List|ListFiltering, PlayerLive]`; ↑/↓ move the cursor (no zap), Enter tunes, ←/Esc close.
 //!   Stream info `I`.
 //! * Numeric entry (digits): stack `[NumericEntry, PlayerLive]`, 1.5 s auto-commit.
-//! * End of playback: episode → "Next episode in 10 s" card; movie → marked watched, back to
-//!   its detail page.
+//! * End of playback: a finished episode → "Next episode in 10 s" card over the video. A
+//!   finished movie (marked watched by the player) returns to its detail page; that part is
+//!   driven by the always-alive movie detail screen, so it is done once.
 //! * Mouse: double-click toggles window fullscreen; wheel = volume (only here).
 //! * Controls row: transport controls (previous / play / next, skips, fullscreen) are glyphs,
 //!   the rest glyph + label; when that doesn't fit every control is a glyph, and controls
@@ -448,18 +449,11 @@ impl PlayerScreen {
     }
 
     fn end_of_playback(&mut self, ctx: &mut UiCtx<'_>) {
-        let media = ctx.player.playable.as_ref().map(|p| p.media.clone());
-        match media {
-            Some(MediaRef::Episode(id)) => {
-                self.next_lookup = Some(id);
-                self.find_next_episode(ctx);
-            }
-            Some(MediaRef::Movie(id)) => {
-                // watched is recorded by the player (progress `finished`); back to the movie
-                ctx.navigate(NavRequest::Back);
-                ctx.push(Route::MovieDetail(id));
-            }
-            _ => {}
+        // a finished movie goes back to its page from `movie_detail` (one owner for that
+        // navigation); an episode gets the up-next card here, over the video
+        if let Some(MediaRef::Episode(id)) = ctx.player.playable.as_ref().map(|p| &p.media) {
+            self.next_lookup = Some(*id);
+            self.find_next_episode(ctx);
         }
     }
 
@@ -964,7 +958,8 @@ impl Screen for PlayerScreen {
             return;
         }
         match ev {
-            AppEvent::Player(PlayerEvent::Ended { .. }) => self.end_of_playback(ctx),
+            // an episode stopped early (not watched) gets no up-next card
+            AppEvent::Player(PlayerEvent::Ended { finished: true, .. }) => self.end_of_playback(ctx),
             AppEvent::Player(PlayerEvent::NowPlaying(p)) => {
                 self.live_ctx = p.kind.is_live();
                 self.next_episode = None;
