@@ -269,10 +269,14 @@ impl MediaResolver for DbResolver {
                 Err(PlayerError { kind: PlayerErrorKind::Resolve, message: "couldn't work out the stream address (see Logs)".into() })
             }
         };
-        if r.is_err()
-            && let MediaRef::Channel(c) = media {
+        // a channel that resolves again (e.g. its source was re-enabled) is zappable again
+        if let MediaRef::Channel(c) = media {
+            if r.is_err() {
                 self.unresolvable.insert(*c);
+            } else {
+                self.unresolvable.remove(c);
             }
+        }
         r
     }
 
@@ -376,6 +380,23 @@ mod tests {
         let err = resolver.resolve(&MediaRef::Channel(missing), false).unwrap_err();
         assert_eq!(err.kind, PlayerErrorKind::Resolve);
         assert!(resolver.skip_on_zap(missing));
+        assert!(store.close(Duration::from_secs(5)));
+    }
+
+    /// A channel of a disabled source is refused and skipped; once the source is enabled again
+    /// a direct play resolves it and zapping stops skipping it.
+    #[test]
+    fn a_channel_that_resolves_again_is_no_longer_skipped() {
+        let store = seeded("tuner-services-reenable", None, vec![None]);
+        let ch: ChannelId = store.reader().unwrap().query_row("SELECT id FROM channel", [], |r| r.get(0)).unwrap();
+        let set_enabled = |on: bool| store.writer().blocking(move |c| Ok(c.execute("UPDATE source SET enabled = ?1", [on])?)).unwrap();
+        let mut resolver = DbResolver::new(store.clone(), shared_default());
+        set_enabled(false);
+        assert!(resolver.resolve(&MediaRef::Channel(ch), false).is_err());
+        assert!(resolver.skip_on_zap(ch));
+        set_enabled(true);
+        resolver.resolve(&MediaRef::Channel(ch), false).unwrap();
+        assert!(!resolver.skip_on_zap(ch));
         assert!(store.close(Duration::from_secs(5)));
     }
 }
