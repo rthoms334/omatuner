@@ -649,7 +649,7 @@ fn guide_says_a_channel_is_not_in_the_guide() {
     t.with_ctx(|ctx| g.on_enter(ctx, &Route::Guide { collection: None, focus: Some(ids[2]) }));
     let mut h = screen_harness(t, g, 1600.0);
     h.run_steps(3);
-    assert!(h.query_by_label_contains("Not in your guide · Your guides cover 1 of 4 channels").is_some(), "header");
+    assert!(h.query_by_label_contains("Not in your guide — Ctrl+E maps it · guides cover 1 of 4 channels").is_some(), "header");
     let painted: Vec<String> = h
         .output()
         .shapes
@@ -664,7 +664,7 @@ fn guide_says_a_channel_is_not_in_the_guide() {
     assert!(pushed(&h.state().t, &Route::EpgMapping { channel: Some(ids[2]) }));
 }
 
-/// Without a zap list (e.g. opened from search) Watch zaps through the primary group.
+/// Watch zaps through the zap list the opener put on the request.
 #[test]
 fn programme_popover_watch_uses_the_requested_zap_list() {
     let _one = one();
@@ -867,7 +867,8 @@ fn live_preview_says_why_a_channel_has_no_guide() {
     let mut h = screen_harness(t, s, 1600.0);
     h.run_steps(3);
     assert!(h.query_by_label("Not in your guide").is_some(), "the reason");
-    assert!(h.query_by_label_contains("cover 1 of 4 channels · Ctrl+E maps this one").is_some(), "coverage + the way forward");
+    // a guide that lists few of the channels: add one that lists them, or map this one
+    assert!(h.query_by_label_contains("cover 1 of 4 channels — add one that lists yours in Settings ▸ EPG · Ctrl+E maps this one").is_some(), "coverage + the way forward");
     assert!(hact(&mut h, Action::AssignEpg));
     assert!(pushed(&h.state().t, &Route::EpgMapping { channel: Some(ids[1]) }));
     drop(h);

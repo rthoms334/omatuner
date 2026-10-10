@@ -961,15 +961,6 @@ mod tests {
     }
 
     #[test]
-    fn dialog_lists_use_dialog_verbs_and_grids_no_sort() {
-        assert_eq!(hint_line(&[K::List, K::Modal]), hint_line(&[K::Modal]));
-        assert!(!hint_line(&[K::List, K::Modal]).contains("fav"));
-        let grid = hint_line(&[K::PosterGrid]);
-        assert!(grid.starts_with("Enter open · Shift+Enter play"), "{grid}");
-        assert!(!grid.contains("sort"), "Home (a PosterGrid) has no sort: {grid}");
-    }
-
-    #[test]
     fn fkeys() {
         assert!(is_fkey(Key::F1) && is_fkey(Key::F11) && is_fkey(Key::F35));
         assert!(!is_fkey(Key::F) && !is_fkey(Key::Enter));

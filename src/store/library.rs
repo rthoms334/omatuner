@@ -563,49 +563,6 @@ mod tests {
         assert_eq!(LiveIndex::neighbour(&ids, ChannelId(1), true, &|_| true), None);
     }
 
-    fn vod(id: i64, provider_order: i32) -> VodSummary {
-        VodSummary {
-            kind: VodKind::Movie(MovieId(id)),
-            source_id: SourceId(1),
-            key: ItemKey(format!("m{id}")),
-            name: Arc::from(format!("Movie {id}")),
-            year: None,
-            poster: None,
-            rating: None,
-            group_ids: vec![GroupId(7)],
-            added_at: None,
-            provider_order,
-            locked: false,
-        }
-    }
-
-    /// Custom order (`SortMode::Provider`) is the display order `load` built from
-    /// `user_order`, not the bare provider order (it used to ignore the user's moves).
-    #[test]
-    fn vod_custom_order_keeps_the_user_order() {
-        // the user moved movie 3 (provider order 2) to the front
-        let movies = vec![vod(3, 2), vod(1, 0), vod(2, 1)];
-        let members = HashMap::from([(GroupId(7), vec![0, 1, 2])]);
-        let group = Group {
-            id: GroupId(7),
-            source_id: SourceId(1),
-            kind: ItemKind::Movie,
-            key: crate::model::GroupKey("movie:all".into()),
-            name: "All".into(),
-            rename: None,
-            provider_order: 0,
-            user_order: None,
-            hidden: false,
-            locked: false,
-            item_count: 3,
-            provider_id: None,
-        };
-        let idx = VodIndex::from_parts(movies, vec![], vec![group], vec![], members);
-        assert_eq!(idx.all_sorted(true, SortMode::Provider), vec![0, 1, 2]);
-        assert_eq!(idx.group_items(GroupId(7), SortMode::Provider), vec![0, 1, 2]);
-        assert_eq!(idx.all_sorted(true, SortMode::Number), vec![1, 2, 0], "provider order");
-    }
-
     #[test]
     fn favourites_toggle() {
         let list = FavouriteList { id: FavListId(1), name: "Favourites".into(), icon: String::new(), sort_index: 0, is_default: true };

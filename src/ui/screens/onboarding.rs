@@ -810,7 +810,11 @@ impl Screen for OnboardingScreen {
                 });
             }
             // a guide import finished (or mappings changed): the Done summary re-reads coverage
-            AppEvent::Data(DataScope::Epg | DataScope::Live | DataScope::All) => self.guides = None,
+            // (a read already running may predate the change: drop it)
+            AppEvent::Data(DataScope::Epg | DataScope::Live | DataScope::All) => {
+                self.guides = None;
+                self.guides_loader = None;
+            }
             AppEvent::Platform(PlatformEvent::FilePicked { purpose, path }) if self.asked == Some(*purpose) => match (purpose, path) {
                 (_, None) => self.asked = None,
                 (PickPurpose::OpenPlaylist, Some(path)) if self.step == Step::Details => {
@@ -1247,7 +1251,11 @@ impl OnboardingScreen {
         if let Some(r) = kit::poll(&mut self.guides_loader) {
             match r {
                 Ok(g) => self.guides = Some(g),
-                Err(e) => tracing::debug!("guide summary: {e}"),
+                Err(e) => {
+                    // an empty summary until the next data change (not a read per frame)
+                    tracing::debug!("guide summary: {e}");
+                    self.guides = Some(Default::default());
+                }
             }
         }
         if self.guides.is_none() && self.guides_loader.is_none() {
@@ -1276,14 +1284,15 @@ impl OnboardingScreen {
             }
         }
         let poor = self.guides.is_some() && !importing && total > 0 && covered * 2 < total;
-        if poor && !guides.is_empty() {
+        // only once a guide has loaded: with none, there is nothing to map to
+        if poor && guides.iter().any(|g| g.last_refresh.is_some()) {
             line(
                 ui,
                 glyphs::INFO,
                 format!(
-                    "Only {} of {} channels have a guide. Map them with Ctrl+E in Live TV, or add a guide that lists them.",
-                    super::live::count(covered),
-                    super::live::count(total)
+                    "Only {} of {} channels have a guide. Add a guide that lists them, or map them with Ctrl+E in Live TV.",
+                    crate::ui::widgets::rows::grouped(covered),
+                    crate::ui::widgets::rows::grouped(total)
                 ),
                 t.text_secondary,
             );

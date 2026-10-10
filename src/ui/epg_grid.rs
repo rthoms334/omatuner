@@ -1133,8 +1133,6 @@ mod tests {
 
     #[test]
     fn formatting() {
-        assert_eq!(hhmm(T0, true).len(), 5);
-        assert!(hhmm(T0, false).ends_with('M'));
         assert_eq!(time_left(34 * 60), "34 min left");
         assert_eq!(time_left(65 * 60), "1 h 05 left");
         assert_eq!(excerpt("one two three", 7), "one two…");

@@ -246,7 +246,7 @@ fn problem_row(ui: &mut egui::Ui, theme: &Theme, line: &LogLine, index: usize, e
     let t = &theme.tokens;
     let pad = theme.space(SpaceToken::Lg);
     let color = if cursor { t.list_cursor_text } else { t.fg };
-    let time = crate::ui::widgets::time::local(line.at, if h24 { "%H:%M" } else { "%-I:%M %p" }, "");
+    let time = crate::ui::widgets::time::hhmm(line.at, h24);
     let width = ui.available_width();
     let inner = ui.scope(|ui| {
         let top = ui.cursor().min;

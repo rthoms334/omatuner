@@ -700,7 +700,7 @@ impl HomeScreen {
                     // History rebuilds the library (`recent_channels`), so the rail follows
                     let write_item = item.clone();
                     let _ = ctx.services.store.writer().submit_notify(DataScope::History, move |c| crate::store::user::remove_history(c, &write_item).map(|_| ()));
-                    ctx.toast(crate::msg::Toast::info(format!("Removed {name} from Recently watched")));
+                    ctx.toast(crate::msg::Toast::info(format!("Removed “{name}” from Recently watched")));
                 }
                 _ => kit::not_here(ctx),
             },
@@ -1818,17 +1818,6 @@ mod tests {
         assert_eq!(kit::ago(1000, 990), "just now");
         assert_eq!(kit::ago(10_000, 10_000 - 7200), "2 h ago");
         assert_eq!(kit::ago(1_000_000, 1_000_000 - 3 * 86_400), "3 d ago");
-        assert_eq!(kit::hhmm(1_791_576_000, true).len(), 5);
         assert_eq!(kit::date(1_791_576_000).len(), 10);
-        // Settings ▸ Interface ▸ Clock: the 12-hour clock has no leading zero and an AM/PM
-        for h in 0..24 {
-            let ts = 1_791_576_000 + h * 3600;
-            let twelve = kit::hhmm(ts, false);
-            assert!(twelve.ends_with(" AM") || twelve.ends_with(" PM"), "{twelve}");
-            assert!(!twelve.starts_with('0') && twelve.len() <= 8, "{twelve}");
-            let (day24, day12) = (kit::day_time(ts, true), kit::day_time(ts, false));
-            assert_eq!(day24.len(), 9, "{day24}");
-            assert!(day12.ends_with('M') && day12[..3] == day24[..3], "{day12} / {day24}");
-        }
     }
 }

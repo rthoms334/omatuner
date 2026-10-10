@@ -254,7 +254,7 @@ pub fn group_row(ui: &mut egui::Ui, theme: &Theme, g: &Group, state: RowState) -
     let left = rect.left() + inset + theme.space(SpaceToken::Sm);
     let mut right = rect.right() - inset;
     let y = rect.center().y;
-    let count = paint::text(p, egui::pos2(right, y), Align2::RIGHT_CENTER, group_count(g.item_count), paint::font(theme, TypeToken::Body), t.text_secondary, f32::INFINITY);
+    let count = paint::text(p, egui::pos2(right, y), Align2::RIGHT_CENTER, grouped(g.item_count as usize), paint::font(theme, TypeToken::Body), t.text_secondary, f32::INFINITY);
     right = count.left() - theme.space(SpaceToken::Lg);
     if g.locked {
         let r = paint::text(p, egui::pos2(right, y), Align2::RIGHT_CENTER, glyphs::LOCK, paint::font(theme, TypeToken::Icon), t.text_secondary, f32::INFINITY);
@@ -269,7 +269,7 @@ pub fn group_row(ui: &mut egui::Ui, theme: &Theme, g: &Group, state: RowState) -
 }
 
 /// "9 812" — thin-space grouped counts like the design mocks.
-fn group_count(n: u32) -> String {
+pub(crate) fn grouped(n: usize) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, c) in s.chars().enumerate() {
@@ -375,10 +375,10 @@ mod tests {
 
     #[test]
     fn counts_are_grouped() {
-        assert_eq!(group_count(0), "0");
-        assert_eq!(group_count(42), "42");
-        assert_eq!(group_count(9812), "9\u{2009}812");
-        assert_eq!(group_count(1_234_567), "1\u{2009}234\u{2009}567");
+        assert_eq!(grouped(0), "0");
+        assert_eq!(grouped(42), "42");
+        assert_eq!(grouped(9812), "9\u{2009}812");
+        assert_eq!(grouped(1_234_567), "1\u{2009}234\u{2009}567");
     }
 
     fn chan(epg: bool) -> ChannelSummary {

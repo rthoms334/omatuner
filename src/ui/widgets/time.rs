@@ -24,16 +24,20 @@ pub fn span(start: Timestamp, stop: Timestamp, h24: bool) -> String { format!("{
 mod tests {
     use super::*;
 
+    /// Settings ▸ Interface ▸ Clock: 24-hour "21:00", or a 12-hour clock with no leading zero
+    /// and an AM/PM.
     #[test]
     fn both_clocks() {
-        let ts = 1_791_576_000;
-        assert_eq!(hhmm(ts, true).len(), 5);
         for h in 0..24 {
-            let twelve = hhmm(ts + h * 3600, false);
+            let ts = 1_791_576_000 + h * 3600;
+            assert_eq!(hhmm(ts, true).len(), 5);
+            let twelve = hhmm(ts, false);
             assert!(twelve.ends_with(" AM") || twelve.ends_with(" PM"), "{twelve}");
-            assert!(!twelve.starts_with('0'), "{twelve}");
+            assert!(!twelve.starts_with('0') && twelve.len() <= 8, "{twelve}");
+            let (day24, day12) = (day_time(ts, true), day_time(ts, false));
+            assert_eq!(day24.len(), 9, "{day24}");
+            assert!(day12.ends_with('M') && day12[..3] == day24[..3], "{day12} / {day24}");
         }
-        assert!(span(ts, ts + 3600, false).contains("M–"));
         assert_eq!(hhmm(i64::MAX, true), "--:--");
     }
 }

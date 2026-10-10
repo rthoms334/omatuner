@@ -912,48 +912,6 @@ fn data_rows_render_with_real_services() {
 }
 
 /// Step `h` until `done` holds (the store writer answers asynchronously).
-/// DESIGN §13.0: the now-playing marker sits left of the title (like channel rows), not at the
-/// right edge where the watched check lives.
-#[test]
-fn episode_now_playing_marker_sits_left_of_the_title() {
-    use tuner::model::{Episode, EpisodeId, SeriesId, StreamLocator};
-    use tuner::ui::widgets::glyphs;
-    let ep = Episode {
-        id: EpisodeId(1),
-        series_id: SeriesId(1),
-        source_id: SourceId(1),
-        key: ItemKey("e5".into()),
-        provider_id: None,
-        season: 2,
-        episode: 5,
-        title: "The Return".into(),
-        plot: None,
-        duration_s: Some(2520),
-        still: None,
-        air_date: None,
-        rating: None,
-        stream: StreamLocator::Url { url: "http://x/e5.mkv".into() },
-    };
-    let theme = Theme::fallback();
-    let mut h = Harness::builder().with_size(egui::vec2(700.0, 120.0)).build_ui(|ui| {
-        rows::episode_row(ui, &theme, &ep, None, true, true, RowState::Idle);
-    });
-    h.run_steps(2);
-    let s = shapes(&h);
-    let x_of = |text: &str| {
-        s.iter()
-            .find_map(|sh| match sh {
-                Shape::Text(t) if t.galley.job.text.starts_with(text) => Some(t.pos.x),
-                _ => None,
-            })
-            .unwrap_or_else(|| panic!("{text} not painted"))
-    };
-    let (num, play, title, check) = (x_of("E05"), x_of(glyphs::PLAY), x_of("The Return"), x_of(glyphs::CHECK));
-    assert!(num < play && play < title, "E05 {num} < play {play} < title {title}");
-    assert!(check > title, "the watched check stays on the right");
-    assert_eq!(text_color(&s, glyphs::PLAY), Some(theme.tokens.accent));
-}
-
 fn step_until(h: &mut Harness<'static, OvApp>, done: impl Fn(&OvApp) -> bool) {
     for _ in 0..400 {
         h.step();

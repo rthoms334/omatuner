@@ -29,6 +29,7 @@ use crate::ui::overlays::{ContextMenuSpec, MenuItem, OverlayResult};
 use crate::ui::screens::live::{self, GuideStatus, NoGuide, choice_action, choice_index, playing_channel};
 use crate::ui::video_host::Placement;
 use crate::ui::widgets::button::{ButtonStyle, button, icon_button};
+use crate::ui::widgets::rows::grouped;
 use crate::ui::widgets::{empty_state::empty_state, glyphs, section};
 use crate::ui::{LayoutClass, OverlayRequest, Route, Screen, ScreenId, SettingsPage, UiCtx};
 
@@ -353,11 +354,15 @@ impl GuideScreen {
         if let Some(at) = info.last_refresh.filter(|at| ctx.now - at >= GUIDE_STALE_S) {
             return (format!("{} Guide updated {} · {refresh} refresh", glyphs::WARNING, live::age_label(ctx.now, at)), t.warning);
         }
-        // the focused channel isn't in any guide: say so, with the way forward
+        // the focused channel isn't in the guides, and they cover few channels: say so, the
+        // action first (the label truncates); the cells already say it for well-covered ones
         let unmapped = self.grid.as_ref().and_then(|g| g.focused()).and_then(|(ch, _)| ctx.lib.live.get(ch)).is_some_and(|c| c.epg_channel_id.is_none());
         if unmapped {
             let (covered, total) = self.guide.coverage(ctx);
-            return (joined(NoGuide::NotCovered { covered, total }), t.text_secondary);
+            let why = NoGuide::NotCovered { covered, total };
+            if why.poor() {
+                return (format!("{} · guides cover {} of {} channels", why.short(), grouped(covered), grouped(total)), t.text_secondary);
+            }
         }
         hints
     }

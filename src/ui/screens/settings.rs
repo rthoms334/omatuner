@@ -41,6 +41,7 @@ use crate::ui::widgets::button::{ButtonStyle, icon_button};
 use crate::ui::widgets::list::paint_row_state;
 use crate::ui::widgets::text_field::text_field;
 use crate::ui::widgets::toggle::toggle;
+use crate::ui::widgets::rows::grouped;
 use crate::ui::widgets::{RowState, empty_state, glyphs, rows, section};
 use crate::ui::{LayoutClass, OnboardingStart, OverlayRequest, Route, Screen, ScreenId, SettingsPage, UiCtx};
 
@@ -1508,7 +1509,6 @@ static PARENTAL_ENABLED: CfgToggle = toggle_row!("Parental lock", parental.enabl
 /// A restored Xtream source without its password.
 fn needs_credentials(s: &Source) -> bool { s.xtream.as_ref().is_some_and(|x| x.password.expose().is_empty()) }
 
-/// "Xtream · 9 812 ch · 48 211 movies · Updated 2 h ago · Active, expires 2027-01-01".
 /// The guides with the playlist channels each one matches.
 pub(crate) type GuideList = (Vec<EpgSource>, HashMap<EpgSourceId, usize>);
 
@@ -1539,11 +1539,11 @@ pub(crate) fn guide_matches(c: &rusqlite::Connection) -> crate::error::Result<Ha
 
 /// "Matches 3 of 11 249 channels · guide lists 2 channels, 312 programmes".
 pub(crate) fn coverage_text(e: &EpgSource, matched: usize, total: usize) -> String {
-    let n = |v: u32| super::live::count(v as usize);
+    let n = |v: u32| grouped(v as usize);
     format!(
         "Matches {} of {} channels · guide lists {} channel{}, {} programme{}",
-        super::live::count(matched.min(total)),
-        super::live::count(total),
+        grouped(matched.min(total)),
+        grouped(total),
         n(e.channel_count),
         if e.channel_count == 1 { "" } else { "s" },
         n(e.programme_count),
@@ -1560,12 +1560,14 @@ fn coverage_note(guides: &[EpgSource], covered: usize, total: usize) -> Option<S
     (covered * 2 < total).then(|| {
         format!(
             "Your guides cover {} of {} channels. Add an XMLTV guide that lists your channels, or map them in EPG mapping (below).",
-            super::live::count(covered),
-            super::live::count(total)
+            grouped(covered),
+            grouped(total)
         )
     })
 }
 
+/// "Xtream · 9 812 ch (3 with guide) · 48 211 movies · Updated 2 h ago · Active, expires
+/// 2027-01-01".
 fn source_detail(s: &Source, now: crate::model::Timestamp, running: Option<String>, with_guide: Option<usize>) -> String {
     let kind = match s.kind {
         SourceKind::Xtream => "Xtream",
@@ -1580,15 +1582,16 @@ fn source_detail(s: &Source, now: crate::model::Timestamp, running: Option<Strin
         parts.insert(0, "Needs credentials".into());
     }
     let c = s.status.counts;
+    let channels = c.channels as usize;
     match with_guide {
-        Some(g) if c.channels > 0 => parts.push(format!("{} ch ({} with guide)", c.channels, g.min(c.channels as usize))),
-        _ => parts.push(format!("{} ch", c.channels)),
+        Some(g) if channels > 0 => parts.push(format!("{} ch ({} with guide)", grouped(channels), grouped(g.min(channels)))),
+        _ => parts.push(format!("{} ch", grouped(channels))),
     }
     if c.movies > 0 {
-        parts.push(format!("{} movies", c.movies));
+        parts.push(format!("{} movies", grouped(c.movies as usize)));
     }
     if c.series > 0 {
-        parts.push(format!("{} series", c.series));
+        parts.push(format!("{} series", grouped(c.series as usize)));
     }
     match (running, &s.status.last_error, s.status.last_refresh) {
         (Some(p), _, _) => parts.push(format!("Refreshing: {p}")),
@@ -2770,11 +2773,6 @@ mod tests {
         assert!(!needs_credentials(&src));
         let detail = source_detail(&src, 1000, None, Some(0));
         assert!(detail.starts_with("Xtream · 0 ch") && detail.ends_with("Never refreshed"), "{detail}");
-        // the playlist row says how many of its channels have a guide
-        let mut big = src.clone();
-        big.status.counts.channels = 11_249;
-        let detail = source_detail(&big, 1000, None, Some(3));
-        assert!(detail.contains("11249 ch (3 with guide)"), "{detail}");
     }
 
     /// The iptv-org case: a guide that lists 2 channels matching 3 of 11 249 says so.
@@ -2802,6 +2800,30 @@ mod tests {
         assert!(note.starts_with("Your guides cover 3 of 11\u{2009}249 channels") && note.contains("EPG mapping"), "{note}");
         assert_eq!(coverage_note(std::slice::from_ref(&e), 9_000, 11_249), None, "good coverage needs no note");
         assert_eq!(coverage_note(&[], 0, 11_249), None, "no guide: the page says so already");
+    }
+
+    /// The "Matches N" count takes only live mappings: channels of enabled playlists, mapped
+    /// to the guide's current data, not orphaned.
+    #[test]
+    fn guide_matches_counts_live_mappings_only() {
+        let mut c = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::migrations::migrate(&mut c).unwrap();
+        c.execute_batch(
+            "INSERT INTO source(id, name, kind, created_at, enabled) VALUES (1, 'on', 'm3u-url', 0, 1), (2, 'off', 'm3u-url', 0, 0);
+             INSERT INTO channel(source_id, key, name, clean_name, norm_name, stream, provider_order, seen_gen) VALUES
+               (1, 'a', 'A', 'A', 'a', '{}', 0, 1), (1, 'b', 'B', 'B', 'b', '{}', 1, 1), (1, 'c', 'C', 'C', 'c', '{}', 2, 1),
+               (1, 'd', 'D', 'D', 'd', '{}', 3, 1), (2, 'e', 'E', 'E', 'e', '{}', 0, 1);
+             INSERT INTO epg_source(id, name, kind, active_gen) VALUES (1, 'g', 'url', 2);
+             INSERT INTO epg_channel(epg_source_id, xmltv_id, seen_gen) VALUES (1, 'x', 2), (1, 'y', 2), (1, 'old', 1);
+             INSERT INTO channel_epg_map(source_id, channel_key, epg_source_id, xmltv_id, method, orphaned_since) VALUES
+               (1, 'a', 1, 'x', 'tvg-id', NULL),   -- automatic
+               (1, 'b', 1, 'y', 'manual', NULL),   -- manual
+               (1, 'c', 1, 'x', 'manual', 5),      -- orphaned
+               (1, 'd', 1, 'old', 'tvg-id', NULL), -- the guide's previous data
+               (2, 'e', 1, 'x', 'tvg-id', NULL);   -- a disabled playlist",
+        )
+        .unwrap();
+        assert_eq!(guide_matches(&c).unwrap(), HashMap::from([(EpgSourceId(1), 2)]));
     }
 
     #[test]

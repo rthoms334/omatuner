@@ -37,7 +37,7 @@ use crate::ui::epg_grid::{hhmm, time_left, time_range};
 use crate::ui::overlays::{ConfirmSpec, ContextMenuSpec, ListPickerSpec, MenuItem, OverlayResult, RenameSpec, RenameTarget};
 use crate::ui::video_host::Placement;
 use crate::ui::widgets::list::{ListOutcome, ListState, virtual_list};
-use crate::ui::widgets::rows::{ChannelRowOpts, channel_row, group_row, menu_row, row_height};
+use crate::ui::widgets::rows::{ChannelRowOpts, channel_row, group_row, grouped, menu_row, row_height};
 use crate::ui::widgets::{RowState, badge, empty_state::empty_state, glyphs, logo, progress, section, text_field};
 use crate::ui::{LayoutClass, OverlayRequest, Route, Screen, ScreenId, SettingsPage, UiCtx};
 
@@ -208,25 +208,25 @@ impl NoGuide {
             NoGuide::Loading(l) => (l.clone(), None),
             NoGuide::Missing => ("No TV guide yet".into(), Some("Ctrl+E adds an XMLTV guide in Settings ▸ EPG".into())),
             NoGuide::NotLoaded => ("The guide hasn't loaded".into(), Some("Ctrl+E shows it in Settings ▸ EPG".into())),
+            // a guide that lists few of the channels (iptv-org: 2 of 11 249): mapping won't
+            // help much, a guide that lists them will
+            NoGuide::NotCovered { covered, total } if self.poor() => (
+                "Not in your guide".into(),
+                Some(format!(
+                    "Your guides cover {} of {} channels — add one that lists yours in Settings ▸ EPG · Ctrl+E maps this one",
+                    grouped(*covered),
+                    grouped(*total)
+                )),
+            ),
             NoGuide::NotCovered { covered, total } => (
                 "Not in your guide".into(),
-                Some(format!("Your guides cover {} of {} channels · Ctrl+E maps this one", count(*covered), count(*total))),
+                Some(format!("Your guides cover {} of {} channels · Ctrl+E maps this one", grouped(*covered), grouped(*total))),
             ),
         }
     }
-}
 
-/// "11 249" — thin-space grouped like the design mocks.
-pub(crate) fn count(n: usize) -> String {
-    let s = n.to_string();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i).is_multiple_of(3) {
-            out.push('\u{2009}');
-        }
-        out.push(c);
-    }
-    out
+    /// The guides cover under half the channels.
+    pub(crate) fn poor(&self) -> bool { matches!(self, NoGuide::NotCovered { covered, total } if covered * 2 < *total) }
 }
 
 impl GuideStatus {
@@ -295,6 +295,20 @@ impl GuideStatus {
         let pct = job.fraction.filter(|f| f.is_finite()).map(|f| format!(" {:.0} %", f.clamp(0.0, 1.0) * 100.0)).unwrap_or_default();
         Some(format!("Loading guide…{pct}"))
     }
+}
+
+/// Channels the resolver's zap skips for failures (`store::live::should_skip`: ≥ 2 failures
+/// in the last 24 h), read inside the frame budget (`None` when it is spent).
+pub(crate) fn failing_set(ctx: &mut UiCtx<'_>) -> Option<HashSet<ItemRef>> {
+    let (db, since) = (ctx.db, ctx.now - 86_400);
+    let r = ctx.budget.run(|| crate::store::live::failures(db, since))?;
+    Some(match r {
+        Ok(m) => m.into_iter().filter(|(_, f)| f.count >= 2).map(|(k, _)| k).collect(),
+        Err(e) => {
+            tracing::debug!("zap failures: {e}");
+            HashSet::new()
+        }
+    })
 }
 
 /// Ctrl+E on a channel: the EPG mapping screen for it — or, while no guide is loaded (there is
@@ -599,12 +613,11 @@ impl LiveScreen {
             self.failed_dirty = true;
             self.reminders_dirty = true;
         }
-        if self.failed_dirty {
-            let (db, since) = (ctx.db, ctx.now - 86_400);
-            if let Some(r) = ctx.budget.run(|| crate::store::live::failures(db, since)) {
-                self.failed = r.map(|m| m.into_iter().filter(|(_, f)| f.count >= 2).map(|(k, _)| k).collect()).unwrap_or_default();
-                self.failed_dirty = false;
-            }
+        if self.failed_dirty
+            && let Some(f) = failing_set(ctx)
+        {
+            self.failed = f;
+            self.failed_dirty = false;
         }
         if self.reminders_dirty
             && let Some(r) = load_reminders(ctx)
@@ -676,6 +689,8 @@ impl LiveScreen {
     /// Channels of the open group (sorted like the zap order) + filter haystacks.
     fn rebuild_channels(&mut self, ctx: &UiCtx<'_>, reset_cursor: bool) {
         let keep = self.cursor_channel();
+        // Reminders: keep the reminder (a channel can have several)
+        let keep_reminder = self.cursor_reminder().map(|r| r.id);
         self.reminder_rows.clear();
         self.channels = match &self.open {
             Some(Entry::Reminders) => {
@@ -693,7 +708,10 @@ impl LiveScreen {
             None => Vec::new(),
         };
         self.rebuild_haystacks(ctx);
-        match keep.and_then(|k| self.row_of(k)).filter(|_| !reset_cursor) {
+        let reminder_row = keep_reminder.and_then(|id| {
+            self.channel_rows.iter().position(|&i| self.reminder_rows.get(i as usize).and_then(|r| self.reminders.get(*r)).is_some_and(|r| r.id == id))
+        });
+        match reminder_row.or_else(|| keep.and_then(|k| self.row_of(k))).filter(|_| !reset_cursor) {
             Some(i) => self.chan_list.select(i),
             None if reset_cursor => self.chan_list.select(0),
             None => {}

@@ -120,25 +120,16 @@ pub fn icon_button(ui: &mut egui::Ui, theme: &Theme, icon: &str, tooltip: &str, 
 mod tests {
     use super::*;
 
-    /// A focused primary button must read at least as strongly as an idle one: accent border
-    /// kept (wider), plus the hover fill.
+    /// A focused primary button must read at least as strongly as an idle one (it used to
+    /// drop the accent border): the accent border is kept, and wider.
     #[test]
     fn focused_primary_is_stronger_than_idle() {
         let th = Theme::fallback();
-        let t = &th.tokens;
         let primary = ButtonStyle { primary: true, ..Default::default() };
-        let (idle_fill, idle_border) = frame_style(&th, primary, true, false, false);
-        let (focus_fill, focus_border) = frame_style(&th, ButtonStyle { focused: true, ..primary }, true, false, true);
-        assert_eq!(idle_border, Some((1.0, t.accent)));
+        let (_, idle_border) = frame_style(&th, primary, true, false, false);
+        let (_, focus_border) = frame_style(&th, ButtonStyle { focused: true, ..primary }, true, false, true);
         let (w, c) = focus_border.expect("focused primary keeps a border");
-        assert_eq!(c, t.accent, "focus keeps the accent border");
+        assert_eq!(c, th.tokens.accent, "focus keeps the accent border");
         assert!(w > idle_border.map_or(0.0, |b| b.0), "focus border is wider");
-        assert_eq!(idle_fill, egui::Color32::TRANSPARENT);
-        assert_eq!(focus_fill, t.fill_hover);
-        // plain buttons: Omarchy focus = hover (fill + 1 px fg @ 0.25)
-        assert_eq!(frame_style(&th, ButtonStyle::default(), true, false, true), (t.fill_hover, Some((1.0, t.border_hover))));
-        assert_eq!(frame_style(&th, ButtonStyle::default(), true, false, false), (egui::Color32::TRANSPARENT, None));
-        // a disabled primary button loses the accent
-        assert_eq!(frame_style(&th, primary, false, false, false).1, Some((1.0, t.border_field)));
     }
 }

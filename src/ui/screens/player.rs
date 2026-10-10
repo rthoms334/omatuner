@@ -209,20 +209,6 @@ fn zap_target(live_idx: &LiveIndex, snap: &PlayerSnapshot, forward: bool, failin
     LiveIndex::neighbour(&zap.channels, current, forward, &skip)
 }
 
-/// Channels the resolver's zap skips for failures (`store::live::should_skip`: ≥ 2 failures
-/// in the last 24 h), read inside the frame budget (empty when it is spent).
-fn failing_channels(ctx: &mut UiCtx<'_>) -> HashSet<ItemRef> {
-    let (db, since) = (ctx.db, ctx.now - 86_400);
-    match ctx.budget.run(|| crate::store::live::failures(db, since)) {
-        Some(Ok(m)) => m.into_iter().filter(|(_, f)| f.count >= 2).map(|(k, _)| k).collect(),
-        Some(Err(e)) => {
-            tracing::debug!("zap failures: {e}");
-            HashSet::new()
-        }
-        None => HashSet::new(),
-    }
-}
-
 impl PlayerScreen {
     fn show_banner(&mut self, ctx: &UiCtx<'_>) {
         self.banner_until = Some(Instant::now() + Duration::from_millis(u64::from(ctx.config.interface.osd_timeout_ms)));
@@ -266,7 +252,7 @@ impl PlayerScreen {
             ctx.play(PlayerCommand::Zap { forward });
             return;
         }
-        let failing = failing_channels(ctx);
+        let failing = super::live::failing_set(ctx).unwrap_or_default();
         if let Some(target) = zap_target(&ctx.lib.live, &snap, forward, &failing) {
             ctx.play(PlayerCommand::ZapTo(target));
         }
