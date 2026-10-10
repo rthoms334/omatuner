@@ -14,18 +14,25 @@
 //! not complete (network error mid-way) is NOT swept, so a failed refresh never empties a list.
 //! If the job is cancelled, nothing is swept and `source.generation` is not bumped; rows already
 //! upserted simply carry the newer data.
+//!
+//! Phase 5 (DESIGN §27.4–27.5): M3U series arrive whole through [`write_series_episodes`];
+//! [`finish_catalogue_with`] can switch the source's kind and move user data between keys
+//! (also across kinds) in its transaction, before reattach.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::model::{
-    CatchupSpec, Fingerprint, GroupId, GroupKey, HttpHeaders, ItemKey, ItemKind, ItemRef, ReattachOutcome, SeriesId, SourceId, StreamLocator,
-    Timestamp, Unsupported,
+    AccountInfo, CatchupSpec, Fingerprint, GroupId, GroupKey, HttpHeaders, ItemKey, ItemKind, ItemRef, ReattachOutcome, SeriesId, SourceId,
+    SourceKind, StreamLocator, Timestamp, Unsupported, XtreamCredentials, XtreamStreamKind,
 };
-use crate::store::sql::{self, atomic, enum_str, fp_from_json, from_json_opt, or_not_found, u32_of};
+use crate::sources::identity::xtream_key;
+use crate::sources::xtream::detect::parse_stream_url;
+use crate::store::sql::{self, atomic, enum_str, fp_from_json, fp_opt, from_json_opt, kind_from_sql, or_not_found, u32_of};
 
 /// An in-progress catalogue import.
 #[derive(Debug, Clone)]
@@ -33,6 +40,9 @@ pub struct CatalogueImport {
     pub source: SourceId,
     pub generation: i64,
     pub started_at: Timestamp,
+    /// `grp.id`s from here on were created by this import (group locks carry over to them,
+    /// DESIGN §27.4).
+    pub new_groups_from: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -244,7 +254,8 @@ pub fn begin_catalogue(conn: &Connection, source: SourceId, now: Timestamp) -> R
     let generation: i64 = or_not_found(conn.query_row("SELECT generation FROM source WHERE id = ?1", [source], |r| r.get(0)), "source", source)?;
     // counters of an earlier cancelled run
     conn.execute("DELETE FROM meta WHERE key LIKE ?1", [format!("import:{}:%", source.0)])?;
-    Ok(CatalogueImport { source, generation: generation + 1, started_at: now })
+    let new_groups_from: i64 = conn.query_row("SELECT COALESCE(max(id), 0) + 1 FROM grp", [], |r| r.get(0))?;
+    Ok(CatalogueImport { source, generation: generation + 1, started_at: now, new_groups_from })
 }
 
 /// `GroupKey → grp.id` of one kind of a source.
@@ -483,10 +494,23 @@ pub fn write_series(conn: &mut Connection, imp: &CatalogueImport, batch: &[Impor
     let mut groups = group_ids(&tx, imp, ItemKind::Series)?;
     let (mut added, mut updated) = (0u32, 0u32);
     for s in batch {
-        let fresh = !exists(&tx, "series", imp.source, &s.key)?;
-        let id: i64 = tx
-            .prepare_cached(
-                "INSERT INTO series(source_id, key, provider_id, name, clean_name, norm_name, year, cover, backdrop, rating, plot,
+        if upsert_series(&tx, imp, s, &mut groups)?.1 {
+            added += 1;
+        } else {
+            updated += 1;
+        }
+    }
+    bump_counters(&tx, imp, "series", added, updated)?;
+    tx.commit()?;
+    Ok((added, updated))
+}
+
+/// Upsert one series row and its group memberships; returns (id, inserted).
+fn upsert_series(tx: &Connection, imp: &CatalogueImport, s: &ImportSeries, groups: &mut HashMap<String, GroupId>) -> Result<(SeriesId, bool)> {
+    let fresh = !exists(tx, "series", imp.source, &s.key)?;
+    let id: i64 = tx
+        .prepare_cached(
+            "INSERT INTO series(source_id, key, provider_id, name, clean_name, norm_name, year, cover, backdrop, rating, plot,
                                     genre, cast_, director, release_date, last_modified, provider_order, added_at, seen_gen)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, COALESCE(?18, ?19), ?20)
                  ON CONFLICT(source_id, key) DO UPDATE SET
@@ -503,34 +527,49 @@ pub fn write_series(conn: &mut Connection, imp: &CatalogueImport, batch: &[Impor
                    provider_order = excluded.provider_order, added_at = COALESCE(?18, series.added_at),
                    seen_gen = excluded.seen_gen
                  RETURNING id",
-            )?
-            .query_row(
-                params![
-                    imp.source,
-                    s.key.as_str(),
-                    s.provider_id,
-                    s.name,
-                    s.clean_name,
-                    s.norm_name,
-                    s.year,
-                    s.cover,
-                    s.backdrop,
-                    s.rating.map(f64::from),
-                    s.plot,
-                    s.genre,
-                    s.cast,
-                    s.director,
-                    s.release_date,
-                    s.last_modified,
-                    s.provider_order,
-                    s.added_at,
-                    imp.started_at,
-                    imp.generation,
-                ],
-                |r| r.get(0),
-            )?;
-        let gids = resolve_groups(&tx, imp, ItemKind::Series, &s.groups, &mut groups)?;
-        write_memberships(&tx, "series_group", "series_id", id, &gids, s.provider_order, fresh)?;
+        )?
+        .query_row(
+            params![
+                imp.source,
+                s.key.as_str(),
+                s.provider_id,
+                s.name,
+                s.clean_name,
+                s.norm_name,
+                s.year,
+                s.cover,
+                s.backdrop,
+                s.rating.map(f64::from),
+                s.plot,
+                s.genre,
+                s.cast,
+                s.director,
+                s.release_date,
+                s.last_modified,
+                s.provider_order,
+                s.added_at,
+                imp.started_at,
+                imp.generation,
+            ],
+            |r| r.get(0),
+        )?;
+    let gids = resolve_groups(tx, imp, ItemKind::Series, &s.groups, groups)?;
+    write_memberships(tx, "series_group", "series_id", id, &gids, s.provider_order, fresh)?;
+    Ok((SeriesId(id), fresh))
+}
+
+/// Upsert M3U series (like [`write_series`]) and replace each one's episodes and seasons
+/// (seasons synthesized from the episodes; `details_at` = the import's start, so detail pages
+/// never ask the provider). One transaction per batch; returns series (added, updated).
+/// DESIGN §27.5.
+pub fn write_series_episodes(conn: &mut Connection, imp: &CatalogueImport, batch: &[ImportSeriesEpisodes]) -> Result<(u32, u32)> {
+    let tx = conn.transaction()?;
+    let mut groups = group_ids(&tx, imp, ItemKind::Series)?;
+    let (mut added, mut updated) = (0u32, 0u32);
+    for b in batch {
+        let (id, fresh) = upsert_series(&tx, imp, &b.series, &mut groups)?;
+        replace_episodes(&tx, id, imp.source, &b.episodes, &[])?;
+        tx.prepare_cached("UPDATE series SET details_at = ?2 WHERE id = ?1")?.execute(params![id, imp.started_at])?;
         if fresh {
             added += 1;
         } else {
@@ -542,23 +581,168 @@ pub fn write_series(conn: &mut Connection, imp: &CatalogueImport, batch: &[Impor
     Ok((added, updated))
 }
 
-/// Upsert M3U series (like [`write_series`]) and replace each one's episodes and seasons
-/// (seasons synthesized from the episodes; `details_at` = the import's start, so detail pages
-/// never ask the provider). One transaction per batch; returns series (added, updated).
-/// DESIGN §27.5.
-pub fn write_series_episodes(conn: &mut Connection, imp: &CatalogueImport, batch: &[ImportSeriesEpisodes]) -> Result<(u32, u32)> {
-    let _ = (conn, imp, batch);
-    todo!("P5-sources")
-}
-
 /// Apply `moves` inside the caller's transaction: every user-data row of `from` (favourites,
 /// overrides, progress, history; reminders and manual EPG mappings only channel → channel)
 /// is re-pointed to `to`, across kinds; where `to` already has a row the existing one wins.
 /// Moves whose `from` holds no user data are skipped cheaply. Returns the items moved.
 /// DESIGN §27.4.
 pub fn apply_key_moves(conn: &Connection, moves: &[KeyMove]) -> Result<u32> {
-    let _ = (conn, moves);
-    todo!("P5-sources")
+    let mut held: HashMap<SourceId, HashSet<(ItemKind, ItemKey)>> = HashMap::new();
+    let mut moved = 0;
+    for m in moves.iter().filter(|m| m.from != m.to) {
+        let keys = match held.entry(m.from.source) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => e.insert(user_data_keys(conn, m.from.source)?),
+        };
+        if !keys.remove(&(m.from.kind, m.from.key.clone())) {
+            continue;
+        }
+        if m.from.kind == m.to.kind {
+            crate::store::user::move_user_data(conn, &m.from, &m.to)?;
+        } else {
+            move_across_kinds(conn, &m.from, &m.to)?;
+        }
+        moved += 1;
+    }
+    Ok(moved)
+}
+
+/// (kind, key) of every item of `source` holding user data (history included).
+fn user_data_keys(conn: &Connection, source: SourceId) -> Result<HashSet<(ItemKind, ItemKey)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT kind, item_key FROM fav_item WHERE source_id = ?1
+         UNION SELECT kind, item_key FROM item_override WHERE source_id = ?1
+         UNION SELECT kind, item_key FROM watch_progress WHERE source_id = ?1
+         UNION SELECT kind, item_key FROM history WHERE source_id = ?1
+         UNION SELECT 'channel', channel_key FROM reminder WHERE source_id = ?1
+         UNION SELECT 'channel', channel_key FROM channel_epg_map WHERE source_id = ?1 AND method = 'manual'",
+    )?;
+    let rows = stmt.query_map([source], |r| Ok((kind_from_sql(&r.get::<_, String>(0)?)?, ItemKey(r.get(1)?))))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// `move_user_data` to an item of another kind: favourites, overrides, progress and history
+/// change kind; reminders, EPG mappings and the failure cache are for channels only and are
+/// dropped. Where `to` already has a row, the existing one wins.
+fn move_across_kinds(conn: &Connection, from: &ItemRef, to: &ItemRef) -> Result<()> {
+    let fp = fp_opt(&crate::store::user::fingerprint_of(conn, to)?);
+    let (f, t) = ((from.source, from.kind.as_str(), from.key.as_str()), (to.source, to.kind.as_str(), to.key.as_str()));
+    for table in ["fav_item", "item_override", "watch_progress"] {
+        conn.execute(
+            &format!(
+                "UPDATE OR IGNORE {table} SET source_id = ?4, kind = ?5, item_key = ?6, fp = COALESCE(?7, fp), orphaned_since = NULL
+                 WHERE source_id = ?1 AND kind = ?2 AND item_key = ?3"
+            ),
+            params![f.0, f.1, f.2, t.0, t.1, t.2, fp],
+        )?;
+        conn.execute(&format!("DELETE FROM {table} WHERE source_id = ?1 AND kind = ?2 AND item_key = ?3"), params![f.0, f.1, f.2])?;
+    }
+    conn.execute(
+        "UPDATE history SET source_id = ?4, kind = ?5, item_key = ?6 WHERE source_id = ?1 AND kind = ?2 AND item_key = ?3",
+        params![f.0, f.1, f.2, t.0, t.1, t.2],
+    )?;
+    if from.kind == ItemKind::Channel {
+        for (table, key) in [("reminder", "channel_key"), ("channel_epg_map", "channel_key"), ("stream_failure", "item_key")] {
+            conn.execute(&format!("DELETE FROM {table} WHERE source_id = ?1 AND {key} = ?2"), params![f.0, f.2])?;
+        }
+    }
+    Ok(())
+}
+
+/// M3U → Xtream moves (DESIGN §27.4), from the rows present before an upgrade: every channel,
+/// movie or episode holding user data whose stream URL is an Xtream stream URL goes to the
+/// Xtream key of that stream (`live` → channel, `movie` → movie, `series` → episode). This
+/// also moves the channel-kind data of legacy movie / episode entries to the right kind.
+pub fn m3u_to_xtream_moves(conn: &Connection, source: SourceId) -> Result<Vec<KeyMove>> {
+    let mut moves = Vec::new();
+    for (kind, key) in user_data_keys(conn, source)? {
+        if kind == ItemKind::Series || key.0.starts_with("xt:") {
+            continue;
+        }
+        let stream: Option<String> = conn
+            .prepare_cached(&format!("SELECT stream FROM {} WHERE source_id = ?1 AND key = ?2", table_of(kind)))?
+            .query_row(params![source, key.as_str()], |r| r.get(0))
+            .optional()?;
+        let Some(Ok(StreamLocator::Url { url })) = stream.map(|s| serde_json::from_str::<StreamLocator>(&s)) else { continue };
+        let Some(s) = parse_stream_url(&url) else { continue };
+        let to_kind = match s.kind {
+            XtreamStreamKind::Live => ItemKind::Channel,
+            XtreamStreamKind::Movie => ItemKind::Movie,
+            XtreamStreamKind::Series => ItemKind::Episode,
+        };
+        let to = ItemRef { source, kind: to_kind, key: xtream_key(to_kind, s.stream_id) };
+        moves.push(KeyMove { from: ItemRef { source, kind, key }, to });
+    }
+    moves.sort_by(|a, b| a.from.cmp(&b.from));
+    Ok(moves)
+}
+
+/// Xtream → M3U moves (switching back, DESIGN §27.4): user data on `xt:` keys goes to the M3U
+/// row carrying that Xtream id in `provider_id` (the first in provider order).
+fn xtream_to_m3u_moves(conn: &Connection, source: SourceId) -> Result<Vec<KeyMove>> {
+    let held = user_data_keys(conn, source)?;
+    let mut moves = Vec::new();
+    for kind in [ItemKind::Channel, ItemKind::Movie, ItemKind::Episode] {
+        let base = xtream_key(kind, 0).0;
+        let prefix = base.trim_end_matches('0');
+        let mut wanted: Vec<&ItemKey> = held.iter().filter(|(k, key)| *k == kind && key.0.starts_with(prefix)).map(|(_, key)| key).collect();
+        if wanted.is_empty() {
+            continue;
+        }
+        wanted.sort();
+        let order = if kind == ItemKind::Episode { "id" } else { "provider_order, id" };
+        let mut stmt = conn.prepare(&format!(
+            "SELECT provider_id, key FROM {} WHERE source_id = ?1 AND key LIKE 'm3u:%' AND provider_id IS NOT NULL ORDER BY {order}",
+            table_of(kind)
+        ))?;
+        let mut by_id: HashMap<String, ItemKey> = HashMap::new();
+        for row in stmt.query_map([source], |r| Ok((r.get::<_, String>(0)?, ItemKey(r.get(1)?))))? {
+            let (id, key) = row?;
+            by_id.entry(id).or_insert(key);
+        }
+        for key in wanted {
+            if let Some(to) = by_id.get(&key.0[prefix.len()..]) {
+                moves.push(KeyMove { from: ItemRef { source, kind, key: key.clone() }, to: ItemRef { source, kind, key: to.clone() } });
+            }
+        }
+    }
+    Ok(moves)
+}
+
+/// Legacy M3U channels reclassified as movies / episodes keep their key: their channel-kind
+/// user data moves to the new kind (DESIGN §27.4 "kind fix-up").
+fn kind_fixup_moves(conn: &Connection, source: SourceId) -> Result<Vec<KeyMove>> {
+    let mut moves = Vec::new();
+    for (kind, key) in user_data_keys(conn, source)? {
+        if kind != ItemKind::Channel || exists(conn, "channel", source, &key)? {
+            continue;
+        }
+        let to_kind = if exists(conn, "movie", source, &key)? {
+            ItemKind::Movie
+        } else if exists(conn, "episode", source, &key)? {
+            ItemKind::Episode
+        } else {
+            continue;
+        };
+        moves.push(KeyMove { from: ItemRef { source, kind, key: key.clone() }, to: ItemRef { source, kind: to_kind, key } });
+    }
+    Ok(moves)
+}
+
+/// Copy the lock / hidden flags of `channel:X` group overrides to the `movie:X` / `series:X`
+/// groups this import created, unless they have an override already: reclassifying entries
+/// never weakens a parental lock (DESIGN §27.4), and a group the user unlocked stays unlocked.
+fn carry_group_locks(conn: &Connection, imp: &CatalogueImport, kind: ItemKind) -> Result<()> {
+    conn.execute(
+        "INSERT INTO group_override(source_id, kind, group_key, hidden, locked)
+         SELECT o.source_id, g.kind, g.key, o.hidden, o.locked
+         FROM group_override o
+         JOIN grp g ON g.source_id = o.source_id AND g.kind = ?2 AND g.key = ?2 || substr(o.group_key, 8)
+         WHERE o.source_id = ?1 AND o.kind = 'channel' AND o.group_key LIKE 'channel:%' AND (o.locked OR o.hidden) AND g.id >= ?3
+         ON CONFLICT(source_id, kind, group_key) DO NOTHING",
+        params![imp.source, kind.as_str(), imp.new_groups_from],
+    )?;
+    Ok(())
 }
 
 /// Delete rows of `kind` not seen by this import, in chunks (one transaction each). Returns
@@ -584,6 +768,37 @@ fn sweep_kind(conn: &Connection, imp: &CatalogueImport, kind: ItemKind) -> Resul
 /// that a provider dropping 50k items cannot stall user writes; everything after it is one
 /// transaction. If the process dies in between, the next import simply sweeps again.
 pub fn finish_catalogue(conn: &mut Connection, imp: &CatalogueImport, completed: &[ItemKind], now: Timestamp) -> Result<ImportSummary> {
+    finish_catalogue_with(conn, imp, completed, now, &FinishOptions::default())
+}
+
+/// Extra work of one [`finish_catalogue_with`] (DESIGN §27.3–27.5), all of it inside the
+/// finish transaction, before reattach.
+#[derive(Debug, Clone, Default)]
+pub struct FinishOptions {
+    /// Switch the source to this kind (and login): the commit point of an Xtream upgrade or a
+    /// switch back to the playlist (`store::sources::set_source_kind`).
+    pub switch_kind: Option<(SourceKind, Option<XtreamCredentials>)>,
+    /// Account info stored with the switch (`store::sources::set_account`).
+    pub account: Option<AccountInfo>,
+    /// User data to move first ([`apply_key_moves`]).
+    pub moves: Vec<KeyMove>,
+    /// The rows come from an M3U playlist: user data on `xt:` keys moves to the M3U rows
+    /// carrying those Xtream ids, channel-kind data of entries reclassified as movies /
+    /// episodes follows them, and episode user data is reattached over the whole source (M3U
+    /// episodes are complete at import; Xtream episodes load lazily and are never reattached
+    /// here).
+    pub m3u: bool,
+}
+
+/// [`finish_catalogue`] with the [`FinishOptions`]. Also copies group locks to the movie /
+/// series groups created by this import (`carry_group_locks`).
+pub fn finish_catalogue_with(
+    conn: &mut Connection,
+    imp: &CatalogueImport,
+    completed: &[ItemKind],
+    now: Timestamp,
+    opts: &FinishOptions,
+) -> Result<ImportSummary> {
     let kinds = [ItemKind::Channel, ItemKind::Movie, ItemKind::Series];
     let mut removed: HashMap<ItemKind, u32> = HashMap::new();
     let mut groups_removed = 0u32;
@@ -596,6 +811,17 @@ pub fn finish_catalogue(conn: &mut Connection, imp: &CatalogueImport, completed:
     }
 
     let tx = conn.transaction()?;
+    if let Some((kind, login)) = &opts.switch_kind {
+        crate::store::sources::set_source_kind(&tx, imp.source, *kind, login.as_ref())?;
+    }
+    if let Some(a) = &opts.account {
+        crate::store::sources::set_account(&tx, imp.source, a)?;
+    }
+    apply_key_moves(&tx, &opts.moves)?;
+    if opts.m3u {
+        apply_key_moves(&tx, &xtream_to_m3u_moves(&tx, imp.source)?)?;
+        apply_key_moves(&tx, &kind_fixup_moves(&tx, imp.source)?)?;
+    }
     let mut summary = ImportSummary::default();
     for (kind, link) in [(ItemKind::Channel, "channel_group"), (ItemKind::Movie, "movie_group"), (ItemKind::Series, "series_group")] {
         tx.execute(
@@ -632,9 +858,13 @@ pub fn finish_catalogue(conn: &mut Connection, imp: &CatalogueImport, completed:
         )?;
     }
 
-    let (outcomes, newly_orphaned) = reattach(&tx, imp.source, &kinds, now)?;
+    let reattach_kinds: &[ItemKind] = if opts.m3u { &[ItemKind::Channel, ItemKind::Movie, ItemKind::Series, ItemKind::Episode] } else { &kinds };
+    let (outcomes, newly_orphaned) = reattach(&tx, imp.source, reattach_kinds, now)?;
     summary.reattached = outcomes.iter().filter(|(_, o)| matches!(o, ReattachOutcome::Reattached { .. })).count() as u32;
     summary.orphaned = newly_orphaned;
+    for kind in [ItemKind::Movie, ItemKind::Series].into_iter().filter(|k| completed.contains(k)) {
+        carry_group_locks(&tx, imp, kind)?;
+    }
 
     tx.execute(
         "UPDATE source SET generation = ?2, n_channels = ?3, n_movies = ?4, n_series = ?5, n_groups = ?6 WHERE id = ?1",
@@ -869,6 +1099,20 @@ pub fn store_series_details(conn: &mut Connection, series: crate::model::SeriesI
         "series",
         series,
     )?;
+    replace_episodes(&tx, series, source, &d.episodes, &d.seasons)?;
+    tx.execute(
+        "UPDATE series SET plot = COALESCE(?2, plot), backdrop = COALESCE(?3, backdrop), details_at = ?4 WHERE id = ?1",
+        params![series, d.plot, d.backdrop, now],
+    )?;
+    let mut outcomes = Vec::new();
+    reattach_kind(&tx, source, ItemKind::Episode, Some((series, &norm)), now, &mut outcomes)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Upsert the episodes of one series (by key), delete its other episodes and rebuild its
+/// seasons: as sent, or synthesized from the episodes; counts fall back to the episodes.
+fn replace_episodes(tx: &Connection, series: SeriesId, source: SourceId, episodes: &[ImportEpisode], seasons: &[ImportSeason]) -> Result<()> {
     {
         let mut up = tx.prepare_cached(
             "INSERT INTO episode(series_id, source_id, key, provider_id, season, episode, title, plot, duration_s, still, air_date,
@@ -879,7 +1123,7 @@ pub fn store_series_details(conn: &mut Connection, series: crate::model::SeriesI
                episode = excluded.episode, title = excluded.title, plot = excluded.plot, duration_s = excluded.duration_s,
                still = excluded.still, air_date = excluded.air_date, rating = excluded.rating, stream = excluded.stream",
         )?;
-        for e in &d.episodes {
+        for e in episodes {
             up.execute(params![
                 series,
                 source,
@@ -897,57 +1141,26 @@ pub fn store_series_details(conn: &mut Connection, series: crate::model::SeriesI
             ])?;
         }
     }
-    let keys: Vec<&str> = d.episodes.iter().map(|e| e.key.as_str()).collect();
+    let keys: Vec<&str> = episodes.iter().map(|e| e.key.as_str()).collect();
     tx.execute("DELETE FROM episode WHERE series_id = ?1 AND key NOT IN (SELECT value FROM json_each(?2))", params![series, sql::to_json(&keys)?])?;
 
-    // seasons: as sent, or synthesized from the episodes; counts fall back to the episodes
     let mut per_season: BTreeMap<u32, u32> = BTreeMap::new();
-    for e in &d.episodes {
+    for e in episodes {
         *per_season.entry(e.season).or_default() += 1;
     }
     tx.execute("DELETE FROM season WHERE series_id = ?1", [series])?;
-    {
-        let mut ins = tx.prepare_cached(
-            "INSERT INTO season(series_id, number, name, cover, air_date, overview, episode_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(series_id, number) DO NOTHING",
-        )?;
-        if d.seasons.is_empty() {
-            for (n, count) in &per_season {
-                ins.execute(params![
-                    series,
-                    n,
-                    Option::<String>::None,
-                    Option::<String>::None,
-                    Option::<String>::None,
-                    Option::<String>::None,
-                    count
-                ])?;
-            }
-        } else {
-            for s in &d.seasons {
-                let count = if s.episode_count > 0 { s.episode_count } else { per_season.get(&s.number).copied().unwrap_or(0) };
-                ins.execute(params![series, s.number, s.name, s.cover, s.air_date, s.overview, count])?;
-            }
-            // episodes of seasons the provider did not list still get a season row
-            for (n, count) in per_season.iter().filter(|(n, _)| !d.seasons.iter().any(|s| s.number == **n)) {
-                ins.execute(params![
-                    series,
-                    n,
-                    Option::<String>::None,
-                    Option::<String>::None,
-                    Option::<String>::None,
-                    Option::<String>::None,
-                    count
-                ])?;
-            }
-        }
-    }
-    tx.execute(
-        "UPDATE series SET plot = COALESCE(?2, plot), backdrop = COALESCE(?3, backdrop), details_at = ?4 WHERE id = ?1",
-        params![series, d.plot, d.backdrop, now],
+    let mut ins = tx.prepare_cached(
+        "INSERT INTO season(series_id, number, name, cover, air_date, overview, episode_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(series_id, number) DO NOTHING",
     )?;
-    let mut outcomes = Vec::new();
-    reattach_kind(&tx, source, ItemKind::Episode, Some((series, &norm)), now, &mut outcomes)?;
-    tx.commit()?;
+    for s in seasons {
+        let count = if s.episode_count > 0 { s.episode_count } else { per_season.get(&s.number).copied().unwrap_or(0) };
+        ins.execute(params![series, s.number, s.name, s.cover, s.air_date, s.overview, count])?;
+    }
+    // seasons the provider did not list (or no season list at all) still get a row
+    let none = Option::<String>::None;
+    for (n, count) in per_season.iter().filter(|(n, _)| !seasons.iter().any(|s| s.number == **n)) {
+        ins.execute(params![series, n, none, none, none, none, count])?;
+    }
     Ok(())
 }

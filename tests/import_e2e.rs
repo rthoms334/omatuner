@@ -138,6 +138,23 @@ impl Harness {
         self.store.writer().run(move |c| tuner::store::sources::update_source(c, &src)).await.expect("update source");
     }
 
+    /// First column of every row as text, on a reader (`?1` = the source).
+    async fn strings(&self, sql: &'static str, source: SourceId) -> Vec<String> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            let c = store.reader().unwrap();
+            let mut stmt = c.prepare(sql).unwrap();
+            stmt.query_map([source], |r| r.get::<_, String>(0)).unwrap().map(Result::unwrap).collect()
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn refresh_forced(&self, source: SourceId) -> Result<JobOutcome, String> {
+        self.jobs.submit(JobKind::RefreshSource { source, force: true });
+        self.finished(|k| matches!(k, JobKind::RefreshSource { source: s, .. } if *s == source)).await.1
+    }
+
     /// `SELECT count(*)`-style scalar on a reader.
     async fn scalar(&self, sql: &'static str, source: SourceId) -> i64 {
         let store = self.store.clone();
@@ -340,15 +357,18 @@ async fn m3u_url_import_uses_conditional_downloads_and_the_url_tvg_guide() {
     let h = harness();
     let mut d = draft("Playlist", SourceKind::M3uUrl);
     d.url = Some(format!("{}/get.php?username=demo&password={PASSWORD}&type=m3u_plus&output=ts", mock.base));
+    d.settings.keep_m3u = true; // else it switches to its Xtream login
     let source = h.insert(d).await;
 
     match h.refresh(source).await {
-        Ok(JobOutcome::SourceRefreshed { summary, not_modified: false, account: None, .. }) => {
+        Ok(JobOutcome::SourceRefreshed { summary, not_modified: false, account: None, upgraded: false, .. }) => {
             assert_eq!(summary.channels.total, 2);
             assert_eq!(summary.channels.added, 2);
+            assert_eq!((summary.movies.total, summary.series.total), (2, 1), "the playlist's movies and series");
         }
         other => panic!("{other:?}"),
     }
+    assert_eq!(mock.count("/player_api.php"), 0, "a kept playlist never tries its login");
     // url-tvg → provider guide (xmltv.php) imported as a follow-up
     match h.finished(|k| matches!(k, JobKind::RefreshEpg { .. })).await.1 {
         Ok(JobOutcome::EpgRefreshed { summary, .. }) => assert!(summary.programmes > 0 && summary.mapped_channels == 2, "{summary:?}"),
@@ -605,8 +625,10 @@ async fn an_onboarding_retry_saves_the_corrected_draft() {
     let err = h.finished(|k| matches!(k, JobKind::AddSource(_))).await.1.expect_err("UA filtered");
     assert_clean(&err);
     let saved = h.scalar("SELECT max(id) FROM source WHERE ?1 = ?1", SourceId(0)).await;
+    // as a restored source waiting for its credentials is
+    h.store.writer().run(move |c| Ok(c.execute("UPDATE source SET enabled = 0 WHERE id = ?1", [saved])?)).await.unwrap();
 
-    // the retry names the User-Agent (and a new name): same row, updated, imported
+    // the retry names the User-Agent (and a new name): same row, updated, enabled, imported
     let mut retry = xtream_draft("Picky TV", panel_creds(&base), false);
     retry.settings.user_agent = Some(UA.into());
     h.jobs.submit(JobKind::AddSource(retry));
@@ -619,6 +641,7 @@ async fn an_onboarding_retry_saves_the_corrected_draft() {
     let src = h.source(id).await;
     assert_eq!(src.name, "Picky TV");
     assert_eq!(src.settings.user_agent.as_deref(), Some(UA));
+    assert!(src.enabled, "entering the credentials enables the source");
     assert_eq!(src.status.counts.channels, 2);
     assert!(src.status.last_refresh.is_some() && src.status.last_error.is_none(), "{:?}", src.status);
 }
@@ -645,8 +668,35 @@ async fn probing_upgrades_xtream_urls_and_classifies_playlists() {
             assert_eq!(p.estimate_channels, Some(3), "live categories");
             assert_eq!(p.suggested_name.as_deref(), Some("127.0.0.1"));
             assert!(p.epg_urls.is_empty());
+            assert_eq!(p.upgraded_from, Some(SourceKind::M3uUrl));
         }
         other => panic!("{other:?}"),
+    }
+
+    // a playlist whose entries are one account's stream URLs is upgraded too...
+    let entry_shaped = format!("{}/playlist.m3u?username=demo&password={PASSWORD}", mock.base);
+    h.jobs.submit(probe(entry_shaped.clone()));
+    match h.finished(|k| matches!(k, JobKind::ProbeSource(_))).await.1 {
+        Ok(JobOutcome::Probe(p)) => {
+            assert_eq!((p.kind, p.upgraded_from), (SourceKind::Xtream, Some(SourceKind::M3uUrl)));
+            assert_eq!(p.xtream.map(|x| x.server), Some(mock.base.clone()));
+        }
+        other => panic!("{other:?}"),
+    }
+    // ...unless the draft keeps the playlist; a login that fails never fails the probe
+    let mut kept = draft("Probe", SourceKind::M3uUrl);
+    kept.url = Some(entry_shaped);
+    kept.settings.keep_m3u = true;
+    h.jobs.submit(JobKind::ProbeSource(kept));
+    h.jobs.submit(probe(format!("{}/get.php?username=http401&password={PASSWORD}", mock.base)));
+    for _ in 0..2 {
+        match h.finished(|k| matches!(k, JobKind::ProbeSource(_))).await.1 {
+            Ok(JobOutcome::Probe(p)) => {
+                assert_eq!((p.kind, p.upgraded_from, p.estimate_channels), (SourceKind::M3uUrl, None, Some(6)), "2 live, 2 movies, 2 episodes");
+                assert!(p.xtream.is_none() && p.account.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     // a plain playlist: counted exactly, url-tvg reported, nothing left in the cache
@@ -731,4 +781,292 @@ async fn maintenance_backup_and_restore_jobs() {
     }
     // restore → every enabled source is refreshed
     assert!(h.finished(|k| matches!(k, JobKind::RefreshSource { source: s, .. } if *s == source)).await.1.is_ok());
+}
+
+// ---------------------------------------------------------------------------------------------
+// phase 5: Xtream upgrade of M3U sources, movies and series in playlists (DESIGN §27)
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn an_xtream_playlist_upgrades_silently_keeping_user_data_and_can_switch_back() {
+    use tuner::model::{HistoryEntry, Reminder, ReminderId, ReminderState, WatchProgress};
+    let mock = mock_xtream::start(MockOptions::default()).await;
+    let h = harness();
+    let mut d = draft("Provider list", SourceKind::M3uUrl);
+    d.url = Some(format!("{}/playlist.m3u?username=demo&password={PASSWORD}", mock.base));
+    d.settings.use_provider_epg = Some(false);
+    d.settings.keep_m3u = true;
+    let source = h.insert(d).await;
+
+    // kept as a playlist: its movies and series come from the entries
+    match h.refresh(source).await {
+        Ok(JobOutcome::SourceRefreshed { summary, upgraded: false, .. }) => {
+            assert_eq!((summary.channels.total, summary.movies.total, summary.series.total), (2, 2, 1));
+        }
+        other => panic!("{other:?}"),
+    }
+    let one = |mut v: Vec<String>| {
+        assert_eq!(v.len(), 1, "{v:?}");
+        v.remove(0)
+    };
+    let bbc = one(h.strings("SELECT key FROM channel WHERE source_id = ?1 AND provider_id = '1001'", source).await);
+    let matrix = one(h.strings("SELECT key FROM movie WHERE source_id = ?1 AND provider_id = '5001'", source).await);
+    let pilot = one(h.strings("SELECT key FROM episode WHERE source_id = ?1 AND provider_id = '9001'", source).await);
+    let item = |kind, key: &str| ItemRef { source, kind, key: ItemKey(key.into()) };
+    let (b, m, p) = (item(ItemKind::Channel, &bbc), item(ItemKind::Movie, &matrix), item(ItemKind::Episode, &pilot));
+    h.store
+        .writer()
+        .run(move |c| {
+            use tuner::store::user;
+            let list = user::default_fav_list(c)?;
+            user::set_favourite(c, list, &b, true, 1)?;
+            user::set_favourite(c, list, &m, true, 2)?;
+            let progress = WatchProgress {
+                item: p,
+                position_s: 300.0,
+                duration_s: Some(2520.0),
+                updated_at: 3,
+                finished: false,
+                title: "Pilot".into(),
+                fingerprint: Default::default(),
+            };
+            user::save_progress(c, &progress)?;
+            user::push_history(c, &HistoryEntry { item: m, at: 4, title: "The Matrix".into() })?;
+            let r = Reminder {
+                id: ReminderId(0),
+                channel: b,
+                channel_name: "BBC One".into(),
+                programme_title: "News".into(),
+                start: 2_000_000_000,
+                stop: 2_000_003_600,
+                lead_s: 120,
+                state: ReminderState::Pending,
+            };
+            user::add_reminder(c, &r)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let user_data = || async {
+        let mut v = h.strings("SELECT kind || ' ' || item_key FROM fav_item WHERE source_id = ?1 AND orphaned_since IS NULL", source).await;
+        v.sort();
+        for sql in [
+            "SELECT 'progress ' || kind || ' ' || item_key FROM watch_progress WHERE source_id = ?1 AND orphaned_since IS NULL",
+            "SELECT 'history ' || kind || ' ' || item_key FROM history WHERE source_id = ?1",
+            "SELECT 'reminder ' || channel_key FROM reminder WHERE source_id = ?1 AND orphaned_since IS NULL",
+        ] {
+            v.extend(h.strings(sql, source).await);
+        }
+        v
+    };
+    let on_playlist_keys = vec![
+        format!("channel {bbc}"),
+        format!("movie {matrix}"),
+        format!("progress episode {pilot}"),
+        format!("history movie {matrix}"),
+        format!("reminder {bbc}"),
+    ];
+    assert_eq!(user_data().await, on_playlist_keys);
+
+    // a source from before this release: its next refresh switches to the login, the stored
+    // ETag ignored once (a 304 would skip the check)
+    let mut s = h.source(source).await;
+    s.settings.keep_m3u = false;
+    h.update(s).await;
+    let stale = h.source(source).await; // a settings editor's copy from before the switch
+    match h.refresh(source).await {
+        Ok(JobOutcome::SourceRefreshed { summary, upgraded: true, not_modified: false, account: Some(_), .. }) => {
+            assert_eq!((summary.channels.total, summary.movies.total, summary.series.total), (2, 2, 1));
+        }
+        other => panic!("{other:?}"),
+    }
+    let src = h.source(source).await;
+    assert_eq!((src.kind, src.m3u_origin()), (SourceKind::Xtream, Some(SourceKind::M3uUrl)));
+    assert_eq!(src.xtream.as_ref().map(|x| x.server.as_str()), Some(mock.base.as_str()));
+    assert_eq!(src.status.account.and_then(|a| a.max_connections), Some(2));
+    assert_eq!(
+        user_data().await,
+        ["channel xt:live:1001", "movie xt:vod:5001", "progress episode xt:ep:9001", "history movie xt:vod:5001", "reminder xt:live:1001"]
+    );
+    let m3u_rows = "SELECT (SELECT count(*) FROM channel WHERE source_id = ?1 AND key LIKE 'm3u:%')
+                         + (SELECT count(*) FROM movie WHERE source_id = ?1 AND key LIKE 'm3u:%')
+                         + (SELECT count(*) FROM series WHERE source_id = ?1 AND key LIKE 'm3u:%')";
+    assert_eq!(h.scalar(m3u_rows, source).await, 0);
+
+    // saving the stale copy (no login) keeps the new login
+    h.update(stale).await;
+    assert!(h.source(source).await.xtream.is_some());
+
+    // "Keep as M3U" in the source's settings: back to the playlist and its keys
+    let mut s = h.source(source).await;
+    s.settings.keep_m3u = true;
+    h.update(s).await;
+    assert!(matches!(h.refresh_forced(source).await, Ok(JobOutcome::SourceRefreshed { upgraded: false, .. })));
+    let src = h.source(source).await;
+    assert_eq!(src.kind, SourceKind::M3uUrl);
+    assert!(src.xtream.is_some(), "the login is kept for switching again");
+    assert_eq!(user_data().await, on_playlist_keys);
+    assert_eq!(h.scalar("SELECT count(*) FROM movie WHERE source_id = ?1 AND key LIKE 'xt:%'", source).await, 0);
+    for line in job_warnings() {
+        assert_clean(&line);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn a_provider_file_and_a_prefixed_get_php_url_switch_to_the_api_behind_the_prefix() {
+    let mock = mock_xtream::start(MockOptions { path_prefix: Some("/panel".into()), ..Default::default() }).await;
+    let h = harness();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("provider.m3u");
+    std::fs::write(&file, mock.playlist("demo", PASSWORD)).unwrap();
+    let mut f = draft("Provider file", SourceKind::M3uFile);
+    f.path = Some(file.clone());
+    let mut u = draft("Provider URL", SourceKind::M3uUrl);
+    u.url = Some(format!("{}/get.php?username=demo&password={PASSWORD}&type=m3u_plus&output=ts", mock.server()));
+    for mut d in [f, u] {
+        d.settings.use_provider_epg = Some(false);
+        let kind = d.kind;
+        let source = h.insert(d).await;
+        match h.refresh(source).await {
+            Ok(JobOutcome::SourceRefreshed { summary, upgraded: true, .. }) => {
+                assert_eq!((summary.channels.total, summary.movies.total, summary.series.total), (2, 2, 1), "{kind:?}");
+            }
+            other => panic!("{kind:?}: {other:?}"),
+        }
+        let src = h.source(source).await;
+        assert_eq!((src.kind, src.m3u_origin()), (SourceKind::Xtream, Some(kind)));
+        assert_eq!(src.xtream.map(|x| x.server), Some(mock.server()), "the path prefix is part of the server");
+        assert_eq!(h.scalar("SELECT count(*) FROM movie WHERE source_id = ?1 AND key LIKE 'xt:vod:%'", source).await, 2);
+    }
+    assert!(file.exists(), "a playlist file is never removed");
+    assert_eq!(mock.count("/get.php"), 0, "a get.php login is tried before any download");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn a_playlist_whose_login_fails_stays_m3u_and_checks_again_weekly() {
+    let mock = mock_xtream::start(MockOptions::default()).await;
+    let h = harness();
+    // login refused (401) / signed in but every list fails: the M3U import runs in the same job
+    for (name, user) in [("Refused", "http401"), ("Broken lists", "listempty")] {
+        let mut d = draft(name, SourceKind::M3uUrl);
+        d.url = Some(format!("{}/get.php?username={user}&password={PASSWORD}", mock.base));
+        d.settings.use_provider_epg = Some(false);
+        let source = h.insert(d).await;
+        let logins = || mock.recorded().iter().filter(|r| r.starts_with("/player_api.php") && !r.contains("action=") && r.contains(user)).count();
+        match h.refresh(source).await {
+            Ok(JobOutcome::SourceRefreshed { summary, upgraded: false, .. }) => {
+                assert_eq!((summary.channels.total, summary.movies.total, summary.series.total), (2, 2, 1), "{name}");
+            }
+            other => panic!("{name}: {other:?}"),
+        }
+        let src = h.source(source).await;
+        assert_eq!(src.kind, SourceKind::M3uUrl, "{name}");
+        assert!(src.status.last_error.is_none(), "{name}: {:?}", src.status.last_error);
+        assert_eq!(logins(), 1, "{name}");
+        assert_eq!(h.scalar("SELECT count(*) FROM meta WHERE key = 'xtream-upgrade:' || ?1", source).await, 1, "{name}");
+
+        // within the week: a plain (conditional) refresh, no login
+        assert!(matches!(h.refresh(source).await, Ok(JobOutcome::SourceRefreshed { not_modified: true, upgraded: false, .. })), "{name}");
+        assert_eq!(logins(), 1, "{name}");
+        // Settings ▸ Refresh tries again
+        assert!(h.refresh_forced(source).await.is_ok(), "{name}");
+        assert_eq!(logins(), 2, "{name}");
+        assert_eq!(h.source(source).await.kind, SourceKind::M3uUrl, "{name}");
+    }
+    let lines = logs().snapshot(tracing::Level::INFO);
+    assert!(lines.iter().any(|l| l.message.contains("Couldn't use the Xtream login of Refused")), "the reason is logged");
+    for l in &lines {
+        assert_clean(&l.message);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn legacy_channels_of_a_kept_playlist_become_movies_and_series_with_their_user_data() {
+    use tuner::model::{GroupOverride, HistoryEntry, ItemOverride};
+    use tuner::sources::identity::{KeyAllocator, group_key};
+    let h = harness();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("legacy.m3u");
+    std::fs::write(
+        &file,
+        "#EXTM3U\n\
+         #EXTINF:-1 group-title=\"News\",BBC One\nhttp://panel.example/live/u/pw/1001.ts\n\
+         #EXTINF:-1 tvg-logo=\"http://img.example/f.jpg\" group-title=\"Adult\",Late Film (1999)\nhttp://panel.example/movie/u/pw/5001.mkv\n\
+         #EXTINF:-1 tvg-logo=\"http://img.example/s.jpg\" group-title=\"Drama\",Example Show S01 E02 - Second\nhttp://panel.example/series/u/pw/9002.mp4\n\
+         #EXTINF:-1 group-title=\"Drama\",Example Show S01E01\nhttp://panel.example/series/u/pw/9001.mp4\n\
+         #EXTINF:-1 group-title=\"Docs\",Nature Hour\nhttp://panel.example/series/u/pw/9100.mp4\n\
+         #EXTINF:-1 group-title=\"Films\",Needs a referrer\n#EXTVLCOPT:http-referrer=http://panel.example/\nhttp://panel.example/movie/u/pw/5002.mp4\n",
+    )
+    .unwrap();
+    let mut d = draft("Legacy", SourceKind::M3uFile);
+    d.path = Some(file.clone());
+    d.settings.keep_m3u = true;
+    d.settings.use_provider_epg = Some(false);
+    let source = h.insert(d).await;
+
+    // the database of an older Tuner: every entry was a channel, with user data on some
+    let keys: Vec<String> = h
+        .store
+        .writer()
+        .run(move |c| {
+            use tuner::store::{import, user};
+            let text = std::fs::read(&file).unwrap();
+            let entries: Vec<_> = tuner::sources::m3u::parse(&text[..], None).unwrap().map(Result::unwrap).collect();
+            let (mut keys, mut groups) = (KeyAllocator::default(), Vec::new());
+            let channels: Vec<_> = entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| tuner::jobs::import_source::m3u_entry_to_channel(e, i as i32, true, &mut keys, &mut groups))
+                .collect();
+            let imp = import::begin_catalogue(c, source, 1)?;
+            import::upsert_groups(c, &imp, &groups)?;
+            import::write_channels(c, &imp, &channels)?;
+            import::finish_catalogue(c, &imp, &[ItemKind::Channel], 1)?;
+            let ch = |i: usize| ItemRef { source, kind: ItemKind::Channel, key: channels[i].key.clone() };
+            let list = user::default_fav_list(c)?;
+            user::set_favourite(c, list, &ch(1), true, 2)?;
+            user::set_item_override(c, &ch(1), &ItemOverride { locked: true, ..Default::default() })?;
+            user::push_history(c, &HistoryEntry { item: ch(2), at: 3, title: "Example Show".into() })?;
+            let adult = group_key(ItemKind::Channel, "Adult");
+            user::set_group_override(c, source, ItemKind::Channel, &adult, &GroupOverride { locked: true, ..Default::default() })?;
+            Ok(channels.iter().map(|c| c.key.0.clone()).collect())
+        })
+        .await
+        .unwrap();
+
+    match h.refresh(source).await {
+        Ok(JobOutcome::SourceRefreshed { summary, upgraded: false, .. }) => {
+            // the entry with its own HTTP headers stays a channel
+            assert_eq!((summary.channels.total, summary.movies.total, summary.series.total), (2, 1, 2));
+            assert_eq!(summary.orphaned, 0);
+        }
+        other => panic!("{other:?}"),
+    }
+    // same keys, new kinds, user data with them
+    assert_eq!(h.strings("SELECT key FROM movie WHERE source_id = ?1", source).await, [keys[1].clone()]);
+    let mut episodes = h.strings("SELECT key FROM episode WHERE source_id = ?1", source).await;
+    episodes.sort();
+    let mut expected = vec![keys[2].clone(), keys[3].clone(), keys[4].clone()];
+    expected.sort();
+    assert_eq!(episodes, expected);
+    assert_eq!(h.strings("SELECT kind || ' ' || item_key FROM fav_item WHERE source_id = ?1", source).await, [format!("movie {}", keys[1])]);
+    assert_eq!(
+        h.strings("SELECT kind || ' ' || item_key FROM item_override WHERE source_id = ?1 AND locked = 1", source).await,
+        [format!("movie {}", keys[1])]
+    );
+    assert_eq!(h.strings("SELECT kind || ' ' || item_key FROM history WHERE source_id = ?1", source).await, [format!("episode {}", keys[2])]);
+    // a locked group of channels stays locked as a group of movies
+    assert_eq!(h.scalar("SELECT locked FROM group_override WHERE source_id = ?1 AND group_key = 'movie:adult'", source).await, 1);
+
+    // series by title, seasons and episodes from the S01E02 markers (file order without one)
+    let series = h
+        .strings(
+            "SELECT s.name || ' |' || (SELECT group_concat(x, ',') FROM
+                 (SELECT e.season || 'x' || e.episode || ':' || e.title AS x FROM episode e WHERE e.series_id = s.id ORDER BY e.season, e.episode))
+             FROM series s WHERE s.source_id = ?1 ORDER BY s.provider_order",
+            source,
+        )
+        .await;
+    assert_eq!(series, ["Example Show |1x1:,1x2:Second", "Nature Hour |1x1:"]);
+    assert_eq!(h.scalar("SELECT count(*) FROM series WHERE source_id = ?1 AND details_at IS NULL", source).await, 0, "nothing to fetch");
+    assert_eq!(h.scalar("SELECT count(*) FROM season WHERE series_id IN (SELECT id FROM series WHERE source_id = ?1)", source).await, 2);
 }

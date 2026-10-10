@@ -734,7 +734,8 @@ impl CatchupFields {
 }
 
 /// Recognise an Xtream `get.php?username=..&password=..` (or `player_api.php`) URL pasted as
-/// an M3U URL, so onboarding can offer the richer Xtream login.
+/// an M3U URL, so the source can use the richer Xtream login (DESIGN §27.2). The server keeps
+/// any path before that last segment (`https://h/sub/get.php?…` → `https://h/sub`).
 pub fn detect_xtream_url(url: &str) -> Option<XtreamCredentials> {
     let t = url.trim();
     let with_scheme: Cow<'_, str> = if t.contains("://") { Cow::Borrowed(t) } else { Cow::Owned(format!("http://{t}")) };
@@ -756,7 +757,10 @@ pub fn detect_xtream_url(url: &str) -> Option<XtreamCredentials> {
     }
     let username = username.filter(|s| !s.is_empty())?;
     let password = password.filter(|s| !s.is_empty())?;
-    let server = super::xtream::urls::normalize_server(&with_scheme)?;
+    // panels behind a path prefix serve `player_api.php` and the streams under it (§27.2)
+    let segs: Vec<&str> = u.path_segments()?.collect();
+    let last_at = segs.iter().rposition(|s| !s.is_empty())?;
+    let server = super::xtream::detect::server_url(&u, &segs[..last_at])?;
     Some(XtreamCredentials { server, username, password: password.into() })
 }
 
@@ -989,7 +993,7 @@ mod tests {
         let c = detect_xtream_url(" panel.example/player_api.php?password=b&username=a ").unwrap();
         assert_eq!((c.server.as_str(), c.username.as_str(), c.password.expose().as_str()), ("http://panel.example", "a", "b"));
         let c = detect_xtream_url("https://H.example/sub/GET.PHP?username=a&password=b").unwrap();
-        assert_eq!(c.server, "https://h.example");
+        assert_eq!(c.server, "https://h.example/sub");
         assert!(detect_xtream_url("http://h/get.php?username=a").is_none());
         assert!(detect_xtream_url("http://h/get.php?username=&password=b").is_none());
         assert!(detect_xtream_url("http://h/list.m3u?username=a&password=b").is_none());

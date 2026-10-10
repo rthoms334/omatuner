@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use rusqlite::{Connection, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::error::Result;
 use crate::model::{
@@ -121,11 +121,17 @@ pub fn insert_source(conn: &Connection, draft: &SourceDraft, now: Timestamp) -> 
 }
 
 /// Update user-editable fields (name, icon, color, url/path/credentials, settings, enabled).
+///
+/// Never clears the Xtream login of a row whose stored kind is `xtream` (DESIGN §27.3): a copy
+/// read before a silent upgrade has `xtream: None` and would otherwise wipe the new login.
 pub fn update_source(conn: &Connection, src: &Source) -> Result<()> {
     let x = src.xtream.as_ref();
     let n = conn.execute(
-        "UPDATE source SET name = ?2, icon = ?3, color = ?4, url = ?5, path = ?6, xt_server = ?7, xt_username = ?8,
-                xt_password = ?9, settings = ?10, enabled = ?11
+        "UPDATE source SET name = ?2, icon = ?3, color = ?4, url = ?5, path = ?6,
+                xt_server = CASE WHEN ?7 IS NULL AND kind = 'xtream' THEN xt_server ELSE ?7 END,
+                xt_username = CASE WHEN ?7 IS NULL AND kind = 'xtream' THEN xt_username ELSE ?8 END,
+                xt_password = CASE WHEN ?7 IS NULL AND kind = 'xtream' THEN xt_password ELSE ?9 END,
+                settings = ?10, enabled = ?11
          WHERE id = ?1",
         params![
             src.id,
@@ -152,9 +158,51 @@ pub fn update_source(conn: &Connection, src: &Source) -> Result<()> {
 /// `xtream` when given (credential columns are otherwise kept, so switching back and forth
 /// needs no new detection), clears the ETag / Last-Modified validators (the next M3U download
 /// must be complete) and registers the secrets. The M3U URL / file is never cleared.
+///
+/// Also forgets the recorded upgrade attempt ([`record_upgrade_attempt`]).
 pub fn set_source_kind(conn: &Connection, id: SourceId, kind: SourceKind, xtream: Option<&XtreamCredentials>) -> Result<()> {
-    let _ = (conn, id, kind, xtream);
-    todo!("P5-sources")
+    let n = conn.execute("UPDATE source SET kind = ?2, etag = NULL, last_modified = NULL WHERE id = ?1", params![id, kind.as_str()])?;
+    if n == 0 {
+        return Err(sql::not_found("source", id));
+    }
+    if let Some(x) = xtream {
+        conn.execute(
+            "UPDATE source SET xt_server = ?2, xt_username = ?3, xt_password = ?4 WHERE id = ?1",
+            params![id, x.server, x.username, x.password.expose()],
+        )?;
+        register_values(None, Some(x));
+    }
+    conn.execute("DELETE FROM meta WHERE key = ?1", [upgrade_key(id)])?;
+    Ok(())
+}
+
+/// `meta` key of the last unsuccessful Xtream upgrade check of an M3U source (DESIGN §27.3).
+fn upgrade_key(id: SourceId) -> String {
+    format!("xtream-upgrade:{}", id.0)
+}
+
+/// The last check of an M3U source for an Xtream login that left it M3U.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UpgradeAttempt {
+    pub at: Timestamp,
+    /// A login was found but did not work (`false`: the playlist carries none).
+    #[serde(default)]
+    pub login_failed: bool,
+}
+
+/// The last upgrade check of an M3U source (DESIGN §27.3). `None`: never, or it switched since.
+pub fn upgrade_attempted_at(conn: &Connection, id: SourceId) -> Result<Option<UpgradeAttempt>> {
+    let v: Option<String> = conn.query_row("SELECT value FROM meta WHERE key = ?1", [upgrade_key(id)], |r| r.get(0)).optional()?;
+    Ok(from_json_opt(v))
+}
+
+/// Record an upgrade check that left the source M3U (see [`upgrade_attempted_at`]).
+pub fn record_upgrade_attempt(conn: &Connection, id: SourceId, at: Timestamp, login_failed: bool) -> Result<()> {
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![upgrade_key(id), sql::to_json(&UpgradeAttempt { at, login_failed })?],
+    )?;
+    Ok(())
 }
 
 /// Delete `table` rows matching `cond` (which binds `?1`) in chunks, one savepoint each.
@@ -180,7 +228,7 @@ pub(crate) fn purge_source(conn: &Connection, id: SourceId) -> Result<()> {
         delete_chunked(conn, t, "source_id = ?1", id.0)?;
     }
     atomic(conn, |c| {
-        c.execute("DELETE FROM meta WHERE key LIKE ?1", [format!("import:{}:%", id.0)])?;
+        c.execute("DELETE FROM meta WHERE key LIKE ?1 OR key = ?2", params![format!("import:{}:%", id.0), upgrade_key(id)])?;
         c.execute("DELETE FROM source WHERE id = ?1", [id])?;
         Ok(())
     })
