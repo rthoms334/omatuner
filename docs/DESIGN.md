@@ -2219,7 +2219,7 @@ Reminders fire only while Tuner runs (v1).
 ### 21.4 Single instance & CLI
 `$XDG_RUNTIME_DIR/tuner/tuner.sock`; a second `tuner [--view guide] [--play …] [file/url]`
 hands its request over and exits 0 (stale socket removed). Works with `omarchy-launch-or-focus
-tuner` and the omarchy-menu entries. Request handling (`TunerApp::handle_ipc`, also for the
+'^tuner$'` (anchored: the pattern also matches window titles) and the omarchy-menu entries. Request handling (`TunerApp::handle_ipc`, also for the
 first instance's own CLI): `--view` switches route; `--play X` and positional URLs / media files
 play immediately (`MediaRef::Url`, fullscreen player); positional `.m3u`/`.m3u8` files open the
 onboarding card at Details (`Route::Onboarding(PlaylistFile)`).

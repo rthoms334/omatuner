@@ -21,7 +21,9 @@ optdepends=('hyprland: window rules from /usr/share/tuner/hypr, raising the wind
             'xdg-desktop-portal-gtk: file pickers (add a playlist file, backup, log export)'
             'noto-fonts-cjk: CJK channel and programme names'
             'noto-fonts: Arabic, Hebrew and Indic fallbacks')
-options=('!lto')
+# Cargo's release profile already strips debuginfo and keeps the symbols for coredump backtraces
+# (Cargo.toml), so makepkg must not strip again, and a split -debug package would be empty.
+options=('!lto' '!debug' '!strip')
 source=()
 _srcdir="$(realpath "$startdir/..")"
 

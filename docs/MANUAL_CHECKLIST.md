@@ -8,7 +8,8 @@ checkbox.
 
 Each item lists the steps (**Do**) and what should happen (**Expect**). "Wide" means a
 full-width window (≈ 1600 pt on the 2560×1600 @ 1.6 panel). "Tiled" means a half-width tile
-(≈ 790 pt). "Text 12/16" means Omarchy's base font size at 12 and at 16.
+(≈ 790 pt). "Text 12/16" means Omarchy's base font size at 12 and at 16 (`[font]` `base-size`
+in `~/.config/omarchy/shell.toml`; Tuner applies it live).
 
 ## 0. Setup
 
@@ -17,20 +18,34 @@ full-width window (≈ 1600 pt on the 2560×1600 @ 1.6 panel). "Tiled" means a h
 - [ ] **Isolated profile:** use `--profile-dir /tmp/tuner-check` everywhere unless an item says
   otherwise. Delete it between runs that need a fresh start. The Omarchy theme is still read
   from the real home.
+  - Every follow-up command that talks to a running Tuner (`tuner --view`, `--refresh`,
+    `--play`, opening a file) needs the same `--profile-dir`. The socket is per profile
+    (`/tmp/tuner-check/run/tuner.sock`), so without it the command reaches the default profile.
+  - The launcher entry, the Omarchy menu, the Super+Shift+T binding and the media-key items
+    always use the **default** profile. Those items say so: start Tuner from the launcher, not
+    with `--profile-dir`.
 - [ ] **Test media:** run `scripts/gen-test-media.sh` (needs ffmpeg). It writes
   `target/test-media/{testsrc.mp4,bars.ts,hls/,long/}`.
 - [ ] **Local "fault server"** for reconnect and error checks:
   1. Terminal 1: `scripts/gen-test-media.sh target/test-media --live` writes a rolling live HLS
      until you stop it.
   2. Terminal 2: `python3 -m http.server 8765 -d target/test-media`.
-  3. Write `/tmp/tuner-check/fault.m3u` with three entries:
+  3. Write `/tmp/tuner-fault.m3u` (outside the profile, so it survives a fresh start) with three
+     entries:
      - `Live` → `http://127.0.0.1:8765/live/index.m3u8`
      - `VOD` → `http://127.0.0.1:8765/hls/index.m3u8`
      - `Missing` → `http://127.0.0.1:8765/missing.m3u8`
   4. Add that file as a playlist.
-- [ ] **Big library:** `scripts/gen-big-fixtures.py --channels 5000 /tmp/tuner-big`, then add
-  `/tmp/tuner-big/big.m3u` as a playlist file in its own profile (`--profile-dir
-  /tmp/tuner-5k`). If you can, also use a real provider with about 5 000 channels.
+- [ ] **Big library:**
+  1. `scripts/gen-big-fixtures.py --channels 5000 /tmp/tuner-big`.
+  2. In its own profile (`--profile-dir /tmp/tuner-5k`), add `/tmp/tuner-big/big.m3u` as a
+     playlist file.
+  3. The playlist's header guide (`http://127.0.0.1/big.xml.gz`) is not served, so it fails:
+     ignore it. Settings ▸ EPG ▸ *Add a guide file…* → `/tmp/tuner-big/big.xml.gz`, and move it
+     first.
+  - The fixture guide covers 2026-10-09 plus 7 days. After that its rows show *Guide data
+    ended*, which is still useful for §4 "Stale or ended guide".
+  - If you can, also use a real provider with about 5 000 channels.
 - [ ] **Real providers at hand:**
   - an Xtream account (with catch-up channels and VOD)
   - the iptv-org playlist (`https://iptv-org.github.io/iptv/index.m3u`)
@@ -52,7 +67,7 @@ full-width window (≈ 1600 pt on the 2560×1600 @ 1.6 panel). "Tiled" means a h
 - [ ] **Desktop file:**
   - **Do:** `desktop-file-validate packaging/tuner.desktop`.
   - **Expect:** no output and exit status 0.
-- [ ] **Launcher entry:**
+- [ ] **Launcher entry** (default profile):
   - **Do:** once installed, open Super+Space → Apps.
   - **Expect:** *Tuner* is listed with its icon. The right-click actions *TV Guide* and
     *Live TV* open those screens.
@@ -62,7 +77,8 @@ full-width window (≈ 1600 pt on the 2560×1600 @ 1.6 panel). "Tiled" means a h
     2. Visit every screen with the sidebar and with Alt+1…5 and Alt+0.
     3. Open help (`?`), then Jobs (Ctrl+J).
     4. Switch the Omarchy theme once.
-    5. Play `target/test-media/testsrc.mp4` (`tuner target/test-media/testsrc.mp4`).
+    5. Play `target/test-media/testsrc.mp4`
+       (`tuner --profile-dir /tmp/tuner-check target/test-media/testsrc.mp4`).
   - **Expect:**
     - Each screen draws. Help and Jobs close when requested again, and switching screens closes
       them.
@@ -70,7 +86,9 @@ full-width window (≈ 1600 pt on the 2560×1600 @ 1.6 panel). "Tiled" means a h
     - The file plays fullscreen, and Esc returns to the screen you came from.
     - The first frame appears in well under a second.
 - [ ] **Single instance:**
-  - **Do:** with Tuner running, run `tuner --view guide`, then `tuner --refresh`.
+  - **Do:** with Tuner running on `/tmp/tuner-check`, run
+    `tuner --profile-dir /tmp/tuner-check --view guide`, then
+    `tuner --profile-dir /tmp/tuner-check --refresh`.
   - **Expect:**
     - The first command switches the running window to the guide and exits 0.
     - `--refresh` logs that Tuner is running and exits 0 without touching anything.
@@ -98,22 +116,27 @@ full-width window (≈ 1600 pt on the 2560×1600 @ 1.6 panel). "Tiled" means a h
     font menu), then switch back.
   - **Expect:** the UI font changes live. CJK and Arabic names still render through the
     fallbacks.
-- [ ] **Omarchy config created after start:**
+- [ ] **Omarchy config created after start** (throwaway home, so the desktop is untouched):
   - **Do:**
-    1. Start with `~/.config/omarchy/` temporarily renamed away.
-    2. Restore it, then edit `shell.toml`.
-  - **Expect:** the log says "exists now; watching it", and the change applies live (no more 5 s
-    polling).
+    1. `H=$(mktemp -d); HOME=$H target/release/tuner --profile-dir /tmp/tuner-check`
+    2. `mkdir -p $H/.config/omarchy`, then write `$H/.config/omarchy/shell.toml` containing
+       `[font]` and `base-size = 16`.
+  - **Expect:**
+    - The fallback palette until then (the throwaway home has no Omarchy theme).
+    - Within about 5 s the log says "… exists now; watching it instead of polling", and the
+      text grows. Later edits to `shell.toml` apply immediately.
 
 ## 3. Layouts and text sizes
 
 Run each item at **Wide** and **Tiled**, at **text 12** and **text 16**, in a **dark** and a
-**light** theme (8 combinations; note any that fail).
+**light** theme (8 combinations; note any that fail). The width class follows from both:
+**Wide** is Wide (3 panes) at either text size; **Tiled at text 12** is Medium (icon rail,
+2 panes, categories drawer); **Tiled at text 16** is Compact (a single stack).
 
 - [ ] **Live TV:**
   - **Expect:**
     - Wide shows 3 panes. Medium shows 2 panes with the categories drawer, which opens, filters
-      and closes from the keyboard. Narrow shows a stack.
+      and closes from the keyboard. Compact shows a stack.
     - Nothing is clipped or overlapping. Rows and the preview caption (channel · number ·
       badges · now/next) fit or ellipsize cleanly.
 - [ ] **TV guide:**
@@ -123,7 +146,7 @@ Run each item at **Wide** and **Tiled**, at **text 12** and **text 16**, in a **
     - Cells too short for their title ellipsize.
 - [ ] **Player:**
   - **Expect:**
-    - At narrow widths the OSD controls row shows glyph-only buttons, with nothing cut off.
+    - At Medium and Compact the OSD controls row shows glyph-only buttons, with nothing cut off.
     - The tracks panel (audio, subtitles, delay, size) fits and scrolls.
     - The next-episode card does not cover the controls.
 - [ ] **Settings:**
@@ -223,8 +246,8 @@ Run each item at **Wide** and **Tiled**, at **text 12** and **text 16**, in a **
       compositor's state) → leave the player (the mini-player keeps playing) → previous screen.
     - Ctrl+P reopens the player only while something plays.
 - [ ] **Up-next card and finished-movie return:**
-  - **Do:** play the second-to-last minute of a series episode, then the last minutes of a
-    movie (seek near the end).
+  - **Do:** play a series episode, seek into its last minute and let it end. Then do the same
+    with a movie.
   - **Expect:**
     - The episode shows the up-next card, which plays the next episode or can be dismissed.
     - The movie returns to its details page when finished and is marked watched.
@@ -257,15 +280,20 @@ Run each item at **Wide** and **Tiled**, at **text 12** and **text 16**, in a **
     - Settings ▸ Reminders lists the reminder, and Delete cancels it.
 - [ ] **Locked `--play` and reminder PIN prompt:**
   - **Do:**
-    1. Lock a channel (Ctrl+L) and relock the session.
-    2. Run `tuner --play <ref of that channel>`.
-    3. Let a reminder for a locked channel fire, then press *Watch*.
+    1. Lock a channel (Ctrl+L), then relock the session with Settings ▸ Parental ▸ *Lock now*.
+    2. Find the channel's reference:
+       `sqlite3 -readonly /tmp/tuner-check/data/tuner.db "SELECT source_id||':'||key FROM channel WHERE name LIKE '%…%'"`.
+    3. Run `tuner --profile-dir /tmp/tuner-check --play <ref>`.
+    4. Let a reminder for a locked channel fire, then press *Watch*.
   - **Expect:**
     - Both ask for the PIN before playing, and a wrong PIN plays nothing.
     - Three wrong PINs start a 30 s cooldown.
     - While locked, zapping with ↑/↓ skips the locked channel and recently failing channels.
 
 ## 8. Desktop integration
+
+These items use the **default** profile: start Tuner from the launcher, not with
+`--profile-dir`.
 
 - [ ] **Media keys and MPRIS:**
   - **Do:** while playing, check `busctl --user list | grep mpris` and `playerctl -p tuner
@@ -277,21 +305,13 @@ Run each item at **Wide** and **Tiled**, at **text 12** and **text 16**, in a **
     - Play/pause works. Next and previous zap on live channels.
     - The keys work while Tuner is hidden, and the bar's media widget follows.
 - [ ] **Idle inhibitor:**
-  - **Do:** temporarily lower the screensaver/idle timeout to 30 s. Play a video for 2 minutes
-    without touching anything, then pause for 2 minutes. Restore the timeout afterwards.
-  - **Expect:** no screensaver while video plays. Once paused, the screensaver starts after
-    about 30 s.
-- [ ] **Playback on another workspace (60 s), with the Hyprland snippet:**
-  - **Do:** play a live channel, switch to another workspace for 60 s, then come back. Watch
-    `top -p $(pgrep -x tuner)`.
+  - **Do:** play a video, run `omarchy debug idle` and read its *Idle inhibitors* section.
+    Pause, then run it again. If you want to watch the screensaver itself, lower the idle timeout
+    temporarily, leave the video playing untouched for twice that long, then pause for the same
+    time, and restore the timeout afterwards.
   - **Expect:**
-    - The audio never stops, and the video is live (not frozen) when you come back.
-    - CPU stays at the playback level. Record the dropped frames from stream info.
-- [ ] **Playback on another workspace (60 s), without the snippet:**
-  - **Do:** remove the `render_unfocused` rule, reload Hyprland, and repeat.
-  - **Expect:**
-    - The audio continues. Video decoding is suspended after about 2 s (CPU drops).
-    - The video resumes within a moment of coming back.
+    - While video plays, class `tuner` is listed there and no screensaver starts.
+    - Once paused, the inhibitor is gone and the screensaver starts after the timeout.
 - [ ] **Applying the Hyprland snippet:**
   - **Do:** copy `packaging/hypr/tuner.lua` to `~/.config/hypr/tuner.lua` and add
     `require("hypr.tuner")` below `require("default.hypr.toggles")`. Reload Hyprland.
@@ -299,8 +319,19 @@ Run each item at **Wide** and **Tiled**, at **text 12** and **text 16**, in a **
     - The config loads without errors.
     - `hyprctl clients` shows class `tuner`.
     - Tuner's video is fully opaque (no wallpaper bleeding through, unlike a terminal).
-    - Playback on another workspace behaves as in the "with the snippet" item.
     - The optional Super+Shift+T binding, when uncommented, launches or focuses Tuner.
+- [ ] **Playback on another workspace (60 s), with the Hyprland snippet:**
+  - **Do:** play a live channel, switch to another workspace for 60 s, then come back. Watch
+    `top -p $(pgrep -x tuner)`.
+  - **Expect:**
+    - The audio never stops, and the video is live (not frozen) when you come back.
+    - CPU stays at the playback level. Record the dropped frames from stream info.
+- [ ] **Playback on another workspace (60 s), without the snippet:**
+  - **Do:** comment out the snippet's `render_unfocused` rule, reload Hyprland, and repeat.
+    Restore the rule afterwards.
+  - **Expect:**
+    - The audio continues. Video decoding is suspended after about 2 s (CPU drops).
+    - The video resumes within a moment of coming back.
 - [ ] **Omarchy menu:**
   - **Do:** merge `packaging/omarchy/omarchy-menu.jsonc` into
     `~/.config/omarchy/extensions/omarchy-menu.jsonc`, then run `omarchy menu summon tv`.
@@ -333,7 +364,8 @@ Run each item at **Wide** and **Tiled**, at **text 12** and **text 16**, in a **
     later in Settings ▸ EPG.
 - [ ] **M3U file from the desktop:**
   - **Do:** open an `.m3u` from the file manager, or run `tuner ~/list.m3u` and `tuner
-    file:///path/list.m3u` with Tuner running.
+    file:///path/list.m3u` with Tuner running (add `--profile-dir /tmp/tuner-check` to both
+    when that is the running profile).
   - **Expect:** the onboarding card opens at Details with the name filled in, in the running
     window.
 

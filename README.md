@@ -67,7 +67,7 @@ on-screen controls, and a light theme (catppuccin-latte).
 
 - Omarchy 4 / Hyprland (another Wayland compositor works, but the integration snippets are for
   Hyprland), with a GPU that supports OpenGL (Mesa).
-- `mpv` with libmpv ≥ 0.38 (client API 2.5). On this hardware (Apple M2, Asahi) video is
+- `mpv` with libmpv ≥ 0.38 (client API 2.5). On Apple Silicon under Asahi Linux, video is
   decoded in software. Expect about half a core per 1080p50 stream.
 - `fontconfig`, and JetBrains Mono Nerd Font as the monospace font (Omarchy's default). Optional
   font packages: `noto-fonts-cjk` for CJK names, `noto-fonts` for Arabic, Hebrew and Indic names.
@@ -99,7 +99,8 @@ cargo build --release          # → target/release/tuner
 cargo install --path .         # → ~/.cargo/bin/tuner
 ```
 
-For the launcher entry and icon, copy two files:
+For the launcher entry and icon, copy two files. The desktop entry runs `Exec=tuner`, so make
+sure `~/.cargo/bin` is on your session PATH, or edit `Exec=` to the full path:
 
 - `packaging/tuner.desktop` to `~/.local/share/applications/`
 - `packaging/icons/tuner.svg` to `~/.local/share/icons/hicolor/scalable/apps/`
@@ -205,7 +206,8 @@ Tuner is built for the keyboard, and everything is also clickable. The basics:
 - **`?` or F1** shows every key for the screen you're on. The status bar shows a short hint line
   for the same screen.
 - **Esc** steps out one level: filter → panel → fullscreen → player → previous screen.
-- **Alt+1…5** switch screens. **Ctrl+K** or **/** searches. **Ctrl+Q** quits.
+- **Alt+1…5** switch screens, and **Alt+0** or **Ctrl+,** opens Settings. **Ctrl+K** or **/**
+  searches. **Ctrl+Q** quits.
 - Super is left to Omarchy. Media keys arrive through MPRIS.
 
 The full reference is generated from `src/keymap.rs`:
@@ -232,9 +234,16 @@ tuner [--view home|live|guide|movies|series|search|settings] [--play <ref>]
 | `PLAYLIST_OR_URL…` | An `.m3u`/`.m3u8` file opens the add-playlist card. A stream URL or media file plays straight away. `file://` URIs are treated as paths. |
 | `--help`, `--version` | Usage and version. |
 
-Only one Tuner runs at a time. A second `tuner …` hands its request to the running window over
-`$XDG_RUNTIME_DIR/tuner/tuner.sock` and exits. `omarchy-launch-or-focus` and the menu entries
-rely on this.
+No screen shows a channel's `--play` reference yet. With the `sqlite3` tool you can look it up:
+
+```sh
+sqlite3 -readonly ~/.local/share/tuner/tuner.db \
+  "SELECT source_id || ':' || key, name FROM channel WHERE name LIKE '%News%'"
+```
+
+Only one Tuner runs per profile. A second `tuner …` hands its request to the running window over
+`$XDG_RUNTIME_DIR/tuner/tuner.sock` (`<dir>/run/tuner.sock` with `--profile-dir`) and exits.
+`omarchy-launch-or-focus` and the menu entries rely on this.
 
 ## Files and profiles
 
