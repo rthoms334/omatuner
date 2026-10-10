@@ -5,7 +5,8 @@
 //! async consumer submits `write_epg_channels` / `write_programmes` batches of 5 000 to the
 //! writer → re-match this EPG source against all playlist sources (`epg_match::match_all` +
 //! `replace_auto_mappings`) → `finish_epg_import` (flip + `resolve_mappings`) →
-//! `sweep_old_generations` in chunks → `DataScope::Epg`.
+//! `sweep_old_generations` in chunks → FTS compaction (`merge_fts_step` until done) →
+//! `DataScope::Epg`.
 //! Back-pressure: the parser blocks when the channel is full, so memory stays bounded
 //! (~4 × 5 000 programmes) regardless of file size. Target: 415k programmes < 8 s total.
 //!
@@ -304,11 +305,30 @@ fn preferred_langs(cfg: &Config) -> Vec<String> {
     out
 }
 
-/// Sweep inactive generations of `id` in chunks (one transaction each).
+/// Sweep inactive generations of `id` in chunks (one transaction each), then compact the search
+/// index if anything was removed.
 async fn sweep_old(ctx: &JobContext, id: EpgSourceId, cancel: &CancellationToken) -> Result<()> {
+    let mut deleted = 0;
     loop {
         check(cancel)?;
-        if write(ctx, move |c| store_epg::sweep_old_generations(c, id, SWEEP_CHUNK)).await? == 0 {
+        match write(ctx, move |c| store_epg::sweep_old_generations(c, id, SWEEP_CHUNK)).await? {
+            0 => break,
+            n => deleted += n,
+        }
+    }
+    if deleted > 0 {
+        compact_fts(ctx, cancel).await?;
+    }
+    Ok(())
+}
+
+/// Drop deleted entries from the programme search index in short transactions (sweeps leave
+/// them behind: 'deletemerge' is off). A cancellation leaves a partial merge that the next
+/// compaction finishes.
+pub(super) async fn compact_fts(ctx: &JobContext, cancel: &CancellationToken) -> Result<()> {
+    loop {
+        check(cancel)?;
+        if !write(ctx, store_epg::merge_fts_step).await? {
             return Ok(());
         }
     }

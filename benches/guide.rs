@@ -97,9 +97,10 @@ fn main() {
         budget.begin_frame();
         // holding ↓: one row per frame
         state.handle(Action::Down, &mut reader, &mut budget, now);
-        let out = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
+        let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
             epg_grid(ui, &theme, &mut images, &mut reader, &mut budget, &live, &mut state, metrics, now);
         });
+        out.textures_delta.clear(); // no renderer (epaint debug-asserts on unapplied deltas)
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
         std::hint::black_box(prims);
         if frame >= WARMUP {
@@ -110,7 +111,9 @@ fn main() {
     let median = times[times.len() / 2];
     let p95 = times[times.len() * 95 / 100];
     let focus = state.focused().map(|(c, _)| c.0).unwrap_or_default();
-    println!("guide: {CHANNELS} channels, {FRAMES} frames holding ↓ (focus now on channel {focus}): median {median:?}, p95 {p95:?}, max {:?} (gate: median < {GATE:?})", times[times.len() - 1]);
+    println!("guide: {CHANNELS} channels, {FRAMES} frames holding ↓ (focus now on channel {focus}): median {median:?}, p95 {p95:?}, max {:?}", times[times.len() - 1]);
+    let verdict = if median < GATE { "PASS" } else { "FAIL" };
+    println!("gate {:<24} {:>8.2} ms   (< {} ms)   {verdict}", "guide frame (median)", median.as_secs_f64() * 1e3, GATE.as_millis());
     let _ = std::fs::remove_dir_all(&dir);
     if median >= GATE {
         eprintln!("guide bench FAILED the gate");

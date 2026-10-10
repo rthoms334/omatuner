@@ -33,7 +33,8 @@ pub async fn rebuild_library(ctx: &JobContext) -> Result<Arc<Library>> {
 }
 
 /// Prune programmes older than max(keep_past_days, max catch-up days), sweep inactive EPG
-/// generations, prune history, `PRAGMA optimize`, `wal_checkpoint(TRUNCATE)`.
+/// generations, compact the guide search index, prune history, `PRAGMA optimize`,
+/// `wal_checkpoint(TRUNCATE)`.
 pub async fn maintenance(ctx: &JobContext, progress: &Progress, cancel: &CancellationToken) -> Result<()> {
     let cfg = crate::config::current(&ctx.config);
     let now = crate::model::now();
@@ -61,6 +62,9 @@ pub async fn maintenance(ctx: &JobContext, progress: &Progress, cancel: &Cancell
             }
         }
     }
+    // also catches deletions made elsewhere (prunes, removed sources, deferred sweeps);
+    // a single no-op step when the index is already compact
+    super::import_epg::compact_fts(ctx, cancel).await?;
 
     progress.set(JobPhase::Finishing);
     let orphans = write(ctx, |c| crate::store::epg::fts_cleanup(c)).await?;

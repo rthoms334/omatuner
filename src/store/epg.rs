@@ -13,6 +13,8 @@
 //!                                                    //   max_stop, resolve mappings
 //! while sweep_old_generations(conn, id, 20_000)? > 0 {}   // FTS rows by rowid, then programmes,
 //!                                                    //   then epg channels unseen in active gen
+//! while merge_fts_step(conn)? {}                     // if anything was swept: compact the FTS
+//!                                                    //   index (~20 ms per call, one tx each)
 //! ```
 //! Readers always filter `programme.gen = epg_source.active_gen`, so the flip is atomic for
 //! the UI and an aborted import ([`abort_epg_import`]) leaves the old guide intact.
@@ -196,8 +198,7 @@ pub fn write_programmes(conn: &mut Connection, imp: &mut EpgImport, batch: &[Imp
             "INSERT INTO programme(epg_source_id, epg_channel_id, gen, start, stop, title, sub_title, descr, categories, icon,
                                    season, episode, rating, star_rating, catchup_id, flags)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
-             ON CONFLICT(epg_channel_id, gen, start) DO NOTHING
-             RETURNING id",
+             ON CONFLICT(epg_channel_id, gen, start) DO NOTHING",
         )?;
         let mut fts = tx.prepare_cached("INSERT INTO programme_fts(rowid, title, sub_title) VALUES (?1, ?2, ?3)")?;
         for p in batch {
@@ -214,7 +215,7 @@ pub fn write_programmes(conn: &mut Connection, imp: &mut EpgImport, batch: &[Imp
                 | (if p.previously_shown { FLAG_PREVIOUSLY_SHOWN } else { 0 });
             let categories = (!p.categories.is_empty()).then(|| p.categories.join("\x1f"));
             let (start, stop) = (p.start + imp.offset_s, p.stop + imp.offset_s);
-            let mut rows = ins.query(params![
+            let changed = ins.execute(params![
                 imp.epg_source,
                 ch,
                 imp.generation,
@@ -232,9 +233,12 @@ pub fn write_programmes(conn: &mut Connection, imp: &mut EpgImport, batch: &[Imp
                 p.catchup_id,
                 flags,
             ])?;
-            let Some(row) = rows.next()? else { continue };
-            let id: i64 = row.get(0)?;
-            drop(rows);
+            // 0 rows: a duplicate (channel, start), first one wins. Not `RETURNING id`: SQLite runs
+            // that as a trigger per row, which made this insert ~6× slower (benches/import.rs).
+            if changed == 0 {
+                continue;
+            }
+            let id = tx.last_insert_rowid();
             fts.execute(params![id, p.title, p.sub_title])?;
             inserted += 1;
             max_stop = Some(max_stop.map_or(stop, |m| m.max(stop)));
@@ -332,8 +336,19 @@ const ABORT_CHUNK: i64 = 20_000;
 ///
 /// "Inactive" means older than the active generation: a newer generation is an import in
 /// progress (or the leftovers of a crashed one, swept after the next flip).
+///
+/// Turns FTS5's 'deletemerge' off first (persistent; written only while it is still on): by
+/// default FTS5 rewrites a segment whenever a commit leaves more than 10 % of it deleted, so
+/// sweeping a 415k-programme generation in chunks rewrote the big segments over and over (≈ 8 s
+/// and writer stalls of up to 2 s per chunk). The deleted entries are dropped afterwards by
+/// [`merge_fts_step`] (import job and `Maintenance`).
 pub fn sweep_old_generations(conn: &mut Connection, id: EpgSourceId, chunk: usize) -> Result<usize> {
     let active: i64 = or_not_found(conn.query_row("SELECT active_gen FROM epg_source WHERE id = ?1", [id], |r| r.get(0)), "EPG source", id)?;
+    let deletemerge: Option<i64> =
+        conn.query_row("SELECT v FROM programme_fts_config WHERE k = 'deletemerge'", [], |r| r.get(0)).optional()?;
+    if deletemerge != Some(0) {
+        conn.execute("INSERT INTO programme_fts(programme_fts, rank) VALUES('deletemerge', 0)", [])?;
+    }
     let sel = "SELECT id FROM programme WHERE epg_source_id = ?1 AND gen < ?2 LIMIT ?3";
     let n = delete_selected(conn, sel, params![id, active, chunk as i64])?;
     if n > 0 {
@@ -344,6 +359,18 @@ pub fn sweep_old_generations(conn: &mut Connection, id: EpgSourceId, chunk: usiz
            AND NOT EXISTS (SELECT 1 FROM programme p WHERE p.epg_channel_id = epg_channel.id)",
         params![id, active],
     )?)
+}
+
+/// One step of merging the programme search index down to a single segment, dropping deleted
+/// entries (FTS5 'merge' with a negative page budget: all segments, even a lone one holding
+/// deletions). Writes ≈ 400 pages (~20 ms) in its own transaction; returns false once there was
+/// nothing left to merge — call until false after deleting programmes (≈ 15 steps, 0.3 s in
+/// total, for 415k programmes; the same work as one 'optimize' without the long transaction).
+pub fn merge_fts_step(conn: &mut Connection) -> Result<bool> {
+    let before = conn.total_changes();
+    conn.execute("INSERT INTO programme_fts(programme_fts, rank) VALUES('merge', -400)", [])?;
+    // SQLite docs: a change count below 2 means the merge was a no-op
+    Ok(conn.total_changes() - before >= 2)
 }
 
 /// Delete programmes with `stop < before` (keeps catch-up windows: caller passes

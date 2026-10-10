@@ -67,7 +67,8 @@ fn hourly(ids: &[&str], from: Timestamp, n: i64, prefix: &str) -> Vec<ImportProg
     ids.iter().flat_map(|id| (0..n).map(move |i| prog(id, from + i * H, from + (i + 1) * H, &format!("{prefix} {i}")))).collect()
 }
 
-/// A complete EPG import: channels, programmes in batches of 5 000, flip, sweep.
+/// A complete EPG import: channels, programmes in batches of 5 000, flip, sweep, FTS compaction
+/// (as `jobs::import_epg` does; later FTS checks and searches run on the compacted index).
 fn import_guide(s: &Store, src: EpgSourceId, chans: Vec<ImportEpgChannel>, progs: Vec<ImportProgramme>, now: Timestamp) -> EpgImportSummary {
     w(s, move |c| {
         let mut imp = epg::begin_epg_import(c, src)?;
@@ -77,6 +78,7 @@ fn import_guide(s: &Store, src: EpgSourceId, chans: Vec<ImportEpgChannel>, progs
         }
         let sum = epg::finish_epg_import(c, &imp, now)?;
         while epg::sweep_old_generations(c, src, 20_000)? > 0 {}
+        while epg::merge_fts_step(c)? {}
         Ok(sum)
     })
 }
