@@ -53,9 +53,11 @@ const DEFAULT_DURATION_S: i64 = 3600;
 /// `scheme://host` / channel path / file stem / `mpegts` | `.m3u8` / query (Kodi-compatible).
 static FLUSSONIC_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(https?://[^/]+)/(.*)/([^/]*)(mpegts|\.m3u8)(\?.+=.+)?$").expect("static regex"));
-/// `scheme://host` / user / pass / stream id / extension; `live/` optional, query ignored.
+/// `scheme://host` / panel path (only before an explicit `live/`) / user / pass / stream id /
+/// extension; `live/` optional, query ignored.
 static XC_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(https?://[^/]+)/(?:live/)?([^/]+)/([^/]+)/([^/.?]+)(?:\.([A-Za-z0-9]+))?(?:\?.*)?$").expect("static regex")
+    Regex::new(r"^(https?://[^/]+)(?:(/.+?)/live)??/(?:live/)?([^/]+)/([^/]+)/([^/.?]+)(?:\.([A-Za-z0-9]+))?(?:\?.*)?$")
+        .expect("static regex")
 });
 
 /// Build the URL. Errors: `NotFound` when outside the archive window, `Parse` when a
@@ -277,8 +279,9 @@ fn flussonic(live: &str, req: &CatchupRequest<'_>) -> Result<String> {
 
 fn xc(live: &str, req: &CatchupRequest<'_>) -> Result<String> {
     let c = XC_RE.captures(live).ok_or_else(|| Error::parse(None, "catch-up: live URL is not an Xtream stream URL"))?;
-    let (host, user, pass, id) = (&c[1], &c[2], &c[3], &c[4]);
-    let ext = match c.get(5).map(|m| m.as_str()) {
+    let (user, pass, id) = (&c[3], &c[4], &c[5]);
+    let host = format!("{}{}", &c[1], c.get(2).map_or("", |m| m.as_str()));
+    let ext = match c.get(6).map(|m| m.as_str()) {
         Some(e) if e.eq_ignore_ascii_case("m3u8") => "m3u8",
         _ => "ts",
     };

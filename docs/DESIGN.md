@@ -1007,7 +1007,7 @@ unknown), capped at `now`. Granularity: 1 s if the template uses `{utc}`, `${sta
 | Append | live URL + expand(`catchup-source`) | `?utc={utc}&lutc={lutc}` appended |
 | Shift / timeshift | live URL + `?`/`&` + `utc={utc}&lutc={lutc}` | `http://h/ch/index.m3u8?utc=1791576000&lutc=…` |
 | Flussonic (fs, -hls, -ts) | rewrite: `…/mpegts` → `…/timeshift_abs-{utc}.ts`; `…/index.m3u8` → `…/timeshift_rel-{offset:1}.m3u8`; `…/mono.m3u8` → `…/mono-timeshift_rel-{offset:1}.m3u8` | `http://h/ch/timeshift_rel-5400.m3u8` |
-| Xc (M3U `xc`/`xtream`) | parse `host/(live/)?u/p/id(.ext)` → `host/timeshift/u/p/{duration:60}/{Y}-{m}-{d}:{H}-{M}/id.ext` | `/timeshift/u/p/60/2026-10-09:21-00/1234.ts` (server tz Europe/London, BST) |
+| Xc (M3U `xc`/`xtream`) | parse `host/(live/)?u/p/id(.ext)` or `host/path/live/u/p/id(.ext)` → `host(/path)/timeshift/u/p/{duration:60}/{Y}-{m}-{d}:{H}-{M}/id.ext` | `/timeshift/u/p/60/2026-10-09:21-00/1234.ts` (server tz Europe/London, BST) |
 | Native Xtream source | `xtream::urls::timeshift_url(creds, stream_id, start_in_server_tz, ceil(min), ext)` | same as Xc; tz = source override → `AccountInfo.server_tz` → local |
 | Vod | expand(`catchup-source`) or `{catchup-id}` | — |
 

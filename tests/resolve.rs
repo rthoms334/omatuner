@@ -655,11 +655,9 @@ fn catchup_subtitle_is_the_archived_programme() {
     assert_eq!(live.subtitle.as_deref(), Some("Show 10 on 0"));
 }
 
-/// The Xc flavour cannot parse an M3U live URL with a path before `live/` (`catchup::XC_RE`
-/// follows DESIGN §10's `host/(live/)?u/p/id(.ext)`). Enable if the change request to accept a
-/// path prefix there is approved.
+/// The Xc flavour parses an M3U live URL with a panel path before `live/` (DESIGN §10,
+/// `host/path/live/u/p/id(.ext)`) and keeps that path in the timeshift URL.
 #[test]
-#[ignore = "pending change request: catchup::XC_RE path prefix (beyond DESIGN §10)"]
 fn m3u_xc_catchup_with_a_path_prefix() {
     let s = store("resolve-m3u-xc-path");
     let src = m3u_source(&s, london());
