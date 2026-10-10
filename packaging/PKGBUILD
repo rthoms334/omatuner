@@ -7,8 +7,10 @@ pkgdesc="Keyboard-first IPTV player for Omarchy (M3U, Xtream, XMLTV, catch-up)"
 arch=('x86_64' 'aarch64')
 url="https://example.invalid/tuner"
 license=('GPL-3.0-or-later')
-# mpv provides libmpv.so (client API >= 2.5). fontconfig for fc-match/fc-list; hyprland optional.
-depends=('mpv' 'fontconfig' 'wayland' 'libxkbcommon' 'mesa' 'gcc-libs' 'glibc')
+# mpv provides libmpv.so (client API >= 2.5). fontconfig for fc-match/fc-list; dbus for the
+# portal file pickers (libdbus is loaded at runtime; MPRIS and notifications use zbus).
+# hyprland optional.
+depends=('mpv' 'fontconfig' 'wayland' 'libxkbcommon' 'mesa' 'dbus' 'gcc-libs' 'glibc')
 makedepends=('cargo' 'clang' 'git')
 optdepends=('ffmpeg: generate test media'
             'noto-fonts-cjk: CJK channel names'
