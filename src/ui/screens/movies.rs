@@ -95,7 +95,7 @@ const MENU_OPEN_CAT: u8 = 22;
 
 /// Identity of the library snapshot (indices into it are only valid for that snapshot; two
 /// rebuilds can share a `built_at` second).
-fn lib_id(ctx: &UiCtx<'_>) -> usize { std::sync::Arc::as_ptr(ctx.lib) as usize }
+fn lib_id(ctx: &UiCtx<'_>) -> u64 { ctx.lib.generation }
 
 fn sort_label(s: SortMode) -> &'static str { SORTS.iter().find(|(m, _)| *m == s).map(|(_, l)| *l).unwrap_or("Custom order") }
 
@@ -159,14 +159,14 @@ pub(super) struct VodBrowser {
     /// `items` after the grid filter.
     shown: Vec<u32>,
     /// What `items` was computed from: (category, sort, library build).
-    items_key: Option<(Cat, SortMode, usize)>,
+    items_key: Option<(Cat, SortMode, u64)>,
     progress: ProgressInfo,
     progress_loader: Option<Loader<ProgressInfo>>,
     /// Watch progress by index into the kind's list (rebuilt with `progress` / `index`).
     progress_idx: HashMap<u32, f32>,
     /// (source, key) → index, per library build.
     index: HashMap<(SourceId, ItemKey), u32>,
-    index_built: usize,
+    index_built: u64,
     /// A locked category waiting for the PIN (cleared by any other open / item action).
     pending_cat: Option<Cat>,
     /// The sort just chosen, until the config edit lands at the end of the frame (the items
@@ -189,7 +189,7 @@ struct Moved {
     /// The `user_order` writes still running.
     writes: Vec<crate::store::Ticket<()>>,
     /// The library last compared with `order` (once the writes answered).
-    checked: usize,
+    checked: u64,
 }
 
 impl Moved {

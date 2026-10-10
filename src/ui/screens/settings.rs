@@ -18,7 +18,6 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use eframe::egui::{self, RichText};
 
@@ -512,7 +511,7 @@ pub struct SettingsScreen {
     epg_matches: HashMap<EpgSourceId, usize>,
     epg_loader: Option<Loader<GuideList>>,
     /// Channels with a guide per playlist, for the library build in `.0` (Playlists rows).
-    guide_counts: (usize, HashMap<SourceId, usize>),
+    guide_counts: (u64, HashMap<SourceId, usize>),
     reminders: Vec<Reminder>,
     reminders_loader: Option<Loader<Vec<Reminder>>>,
     orphans: Vec<Orphan>,
@@ -1906,7 +1905,7 @@ impl SettingsScreen {
             }
         }
         // channels with a guide per playlist (one pass per library build)
-        let built = Arc::as_ptr(ctx.lib) as usize;
+        let built = ctx.lib.generation;
         if matches!(self.page, SettingsPage::Playlists | SettingsPage::Epg) && self.guide_counts.0 != built {
             let mut m: HashMap<SourceId, usize> = HashMap::new();
             for c in ctx.lib.live.channels.iter().filter(|c| c.epg_channel_id.is_some()) {

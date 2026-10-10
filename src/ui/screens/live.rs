@@ -174,7 +174,7 @@ pub(crate) struct GuideInfo {
 pub(crate) struct GuideStatus {
     info: Option<GuideInfo>,
     /// (library snapshot, channels with a guide, all channels).
-    coverage: Option<(usize, usize, usize)>,
+    coverage: Option<(u64, usize, usize)>,
 }
 
 /// Why a channel has no programmes (DESIGN §13.12), so the copy can say what to do about it.
@@ -238,7 +238,7 @@ impl GuideStatus {
 
     /// (channels with a guide, all channels) of the library (cached per snapshot).
     pub(crate) fn coverage(&mut self, ctx: &UiCtx<'_>) -> (usize, usize) {
-        let key = Arc::as_ptr(ctx.lib) as usize;
+        let key = ctx.lib.generation;
         match self.coverage {
             Some((k, covered, total)) if k == key => (covered, total),
             _ => {
