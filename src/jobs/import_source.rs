@@ -42,7 +42,9 @@
 //!   by scanning the downloaded / local playlist. A working login runs the Xtream import, whose
 //!   first finish switches the source (`Upgrade`); a failed login, or an Xtream import failing
 //!   before that finish, records the check and imports the same playlist in the same job
-//!   (checked again in a week, or in an hour when the server couldn't answer).
+//!   (checked again in a week, or in an hour when the server couldn't answer). After that
+//!   finish the upgrade stands: a later fatal kind failure or a cancel still reports it, and
+//!   the next Xtream refresh of the source applies the user-data moves it left undone.
 //!   A playlist without a login records the check too, so it is scanned weekly, not on every
 //!   refresh; while it has no failed login on record, the weekly download stays conditional.
 //! * An upgraded source the user keeps as M3U goes back to its playlist with a forced import
@@ -957,7 +959,8 @@ impl XtKind {
     }
 }
 
-/// An M3U source switching to its Xtream login in this refresh (DESIGN §27.3).
+/// An M3U source switching to its Xtream login in this refresh (DESIGN §27.3), or — already
+/// `committed` — an upgraded source whose earlier refresh left M3U → Xtream moves undone.
 struct Upgrade {
     creds: XtreamCredentials,
     /// From the login of the upgrade check (stored with the switch).
@@ -1005,25 +1008,42 @@ async fn finish_xtream(
     Ok(summary)
 }
 
+/// An Xtream import; with `upgrade`, the one that switches an M3U source (DESIGN §27.3). Once
+/// that switch committed, the refresh reports success (`upgraded`) even when a later kind
+/// fails fatally or the job is cancelled: those kinds keep their rows and the next refresh
+/// imports them, with the user-data moves still pending.
 async fn refresh_xtream(
     ctx: &JobContext,
     src: &Source,
     cfg: &Config,
     progress: &Progress,
     cancel: &CancellationToken,
-    mut upgrade: Option<&mut Upgrade>,
+    upgrade: Option<&mut Upgrade>,
 ) -> Result<RefreshResult> {
+    let switching = upgrade.as_ref().is_some_and(|u| !u.committed);
     let creds = match &upgrade {
         Some(u) => u.creds.clone(),
         None => src.xtream.clone().ok_or_else(|| Error::Config("this source has no Xtream login".into()))?,
     };
     let client = XtreamClient::new(ctx.http.clone(), creds.clone(), source_headers(src, cfg).user_agent);
     let id = src.id;
+    let mut leftover = None;
     if upgrade.is_none() {
         progress.set(JobPhase::Connecting);
         let (_, account) = client.authenticate(crate::model::now(), cancel).await?;
         write(ctx, move |c| crate::store::sources::set_account(c, id, &account)).await?;
+        // an upgrade whose import stopped after the switch: the kinds it did not finish still
+        // have their M3U rows, and the user data on them moves with this import's finishes
+        if src.m3u_origin().is_some() {
+            let login = creds.clone();
+            let moves = read(ctx, move |c| import::m3u_to_xtream_moves(c, id, &login)).await?;
+            if !moves.is_empty() {
+                leftover = Some(Upgrade { creds: creds.clone(), account: AccountInfo::default(), moves, committed: true });
+            }
+        }
     }
+    let mut upgrade = upgrade.or(leftover.as_mut());
+    let committed_here = |u: &Option<&mut Upgrade>| switching && u.as_ref().is_some_and(|u| u.committed);
 
     let now = crate::model::now();
     let imp = write(ctx, move |c| import::begin_catalogue(c, id, now)).await?;
@@ -1047,7 +1067,18 @@ async fn refresh_xtream(
         for kind in [XtKind::Movies, XtKind::Series] {
             match import_xt_kind(ctx, &client, &imp, kind, smart, progress, cancel).await {
                 Ok(()) => vod_done.push(kind.item_kind()),
-                Err(e) if is_fatal(&e) => return Err(e),
+                Err(e) if is_fatal(&e) && !committed_here(&upgrade) => return Err(e),
+                // switched at the live finish: the upgrade stands, the rest waits for the next
+                // refresh (no sweep, no bookkeeping: the source stays due)
+                Err(Error::Cancelled) => {
+                    tracing::info!("{} now uses its Xtream login ({}); import cancelled", src.name, crate::redact::redact_url(&creds.server));
+                    let summary = live.unwrap_or_default();
+                    return Ok(RefreshResult { summary, not_modified: false, epg_urls: Vec::new(), upgraded: true });
+                }
+                Err(e) if is_fatal(&e) => {
+                    failures.push((kind, e));
+                    break;
+                }
                 Err(e) => failures.push((kind, e)),
             }
         }
@@ -1086,7 +1117,7 @@ async fn refresh_xtream(
     let epg_urls = vec![urls::xmltv_url(&creds)];
     provider_epg(ctx, src, epg_urls.clone(), cfg).await?;
     (ctx.submit)(JobKind::RebuildLibrary);
-    let upgraded = upgrade.is_some_and(|u| u.committed);
+    let upgraded = committed_here(&upgrade);
     if upgraded {
         tracing::info!("{} now uses its Xtream login ({})", src.name, crate::redact::redact_url(&creds.server));
     }

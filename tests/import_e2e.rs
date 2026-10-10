@@ -922,6 +922,61 @@ async fn an_xtream_playlist_upgrades_silently_keeping_user_data_and_can_switch_b
     }
 }
 
+/// The switch commits at the live finish; a movie list then answering 401 (fatal) or a cancel
+/// must not hide the upgrade, and the user data of the kinds not imported yet moves with the
+/// next refresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn an_upgrade_stands_when_vod_fails_after_the_switch_and_the_next_refresh_moves_the_rest() {
+    use tuner::model::WatchProgress;
+    let opts = MockOptions::default();
+    let vod_401 = opts.vod_401.clone();
+    let mock = mock_xtream::start(opts).await;
+    let h = harness();
+    let mut d = draft("Provider list", SourceKind::M3uUrl);
+    d.url = Some(format!("{}/playlist.m3u?username=demo&password={PASSWORD}", mock.base));
+    d.settings.use_provider_epg = Some(false);
+    d.settings.keep_m3u = true;
+    let source = h.insert(d).await;
+    assert!(h.refresh(source).await.is_ok());
+    let pilot = h.strings("SELECT key FROM episode WHERE source_id = ?1 AND provider_id = '9001'", source).await.remove(0);
+    let p = ItemRef { source, kind: ItemKind::Episode, key: ItemKey(pilot.clone()) };
+    h.store
+        .writer()
+        .run(move |c| {
+            let progress = WatchProgress {
+                item: p,
+                position_s: 300.0,
+                duration_s: Some(2520.0),
+                updated_at: 3,
+                finished: false,
+                title: "Pilot".into(),
+                fingerprint: Default::default(),
+            };
+            tuner::store::user::save_progress(c, &progress)
+        })
+        .await
+        .unwrap();
+    let progress = || h.strings("SELECT kind || ' ' || item_key FROM watch_progress WHERE source_id = ?1 AND orphaned_since IS NULL", source);
+
+    let mut s = h.source(source).await;
+    s.settings.keep_m3u = false;
+    h.update(s).await;
+    vod_401.store(true, Ordering::SeqCst);
+    match h.refresh(source).await {
+        Ok(JobOutcome::SourceRefreshed { summary, upgraded: true, .. }) => assert_eq!(summary.channels.total, 2),
+        other => panic!("{other:?}"),
+    }
+    let src = h.source(source).await;
+    assert_eq!(src.kind, SourceKind::Xtream);
+    assert!(src.status.last_error.as_deref().is_some_and(|e| e.contains("Movies")), "{:?}", src.status.last_error);
+    assert_eq!(progress().await, [format!("episode {pilot}")], "series not imported yet: the episode's data waits");
+
+    vod_401.store(false, Ordering::SeqCst);
+    assert!(matches!(h.refresh(source).await, Ok(JobOutcome::SourceRefreshed { upgraded: false, .. })));
+    assert_eq!(progress().await, ["episode xt:ep:9001"]);
+    assert!(h.source(source).await.status.last_error.is_none());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn a_provider_file_and_a_prefixed_get_php_url_switch_to_the_api_behind_the_prefix() {
     let mock = mock_xtream::start(MockOptions { path_prefix: Some("/panel".into()), ..Default::default() }).await;

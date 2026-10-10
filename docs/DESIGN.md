@@ -2753,7 +2753,14 @@ Attempt:
    true`.
 4. The Xtream import fails before any finish (every kind failed — nothing was written, since
    kinds fail at fetch time) → no commit; record the attempt; `info!`; run the M3U import from
-   the same file in the same job. A cancel at any point → no commit, no sweep (as today).
+   the same file in the same job. A cancel before the commit → no commit, no sweep (as today).
+5. After the commit the refresh succeeds (`upgraded = true`, so the toast is shown) whatever
+   follows: a kind failing fatally (a VOD list answering 401) is recorded in `last_error` like
+   any partial failure and the remaining kinds are skipped; a cancel returns at once (no
+   sweep, no bookkeeping — the source stays due). Moves of the kinds not finished are not
+   lost: every Xtream refresh of an upgraded source (`m3u_origin()`) first recomputes
+   `m3u_to_xtream_moves`, which finds user data still on M3U keys whose rows are still there,
+   and applies them with the finishes of their kinds.
 
 The outcome is `JobOutcome::SourceRefreshed { upgraded, account, … }`; the app shows
 `Toast::info("Upgraded to Xtream login — movies & series now available")` whenever `upgraded`

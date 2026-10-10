@@ -52,6 +52,8 @@
 //! * `MockOptions::path_prefix` (`/panel`): every endpoint lives under it, as on panels behind
 //!   a reverse proxy; [`MockXtream::server`] is the base with the prefix.
 //!
+//! `MockOptions::vod_401` makes the movie and series list actions answer 401 while it is set.
+//!
 //! With `MockAuth::Rejected` every action answers the login-failure object; with `Http403`
 //! every path answers 403 (stream paths too: the "too many connections" case). `html_200`
 //! applies to list/detail actions, `xmltv.php` and `get.php` — not to the login.
@@ -74,6 +76,8 @@ pub struct MockOptions {
     pub media_base: Option<String>,
     /// Serve everything under this path (`/panel`); other paths answer 404.
     pub path_prefix: Option<String>,
+    /// While set, the movie and series list actions answer 401 (live keeps working).
+    pub vod_401: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -232,6 +236,10 @@ fn player_api<'a>(st: &State, user: &str, param: &impl Fn(&str) -> Option<&'a st
     };
     if let Some(body) = list_quirk.filter(|_| is_list) {
         return json(body.to_vec());
+    }
+    let vod_list = matches!(action, "get_vod_categories" | "get_series_categories" | "get_vod_streams" | "get_series");
+    if vod_list && st.opts.vod_401.load(std::sync::atomic::Ordering::SeqCst) {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
     let id = |k: &str| param(k).and_then(|v| v.parse::<i64>().ok());
     match action {
