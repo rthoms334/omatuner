@@ -524,7 +524,6 @@ mod tests {
     /// carries the channel's ItemRef, which the app's `LiveIndex::by_ref` resolves; the row
     /// ends up `fired`.
     #[test]
-    #[ignore = "needs WP-02 (store::user reminders, store::library::load)"]
     fn reminder_e2e_with_the_store() {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
         let store = Store::open_temp("tuner-reminder-e2e", None).unwrap();
