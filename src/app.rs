@@ -107,6 +107,10 @@ pub struct TunerApp {
     /// A channel played before the library knew it (`--play` at startup) and its primary
     /// group: the zap list follows once the library lands.
     pending_zap: Option<(ChannelId, GroupId)>,
+    /// A locked channel waiting for the parental PIN (CLI/IPC `--play`, a reminder's Watch):
+    /// played when the PIN overlay answers `Unlocked(OpenPlayer)` (DESIGN §13.12 "PIN prompt on
+    /// play"). No screen opens `Pin { then: OpenPlayer }`, so it can't take over a screen's PIN.
+    pending_locked: Option<(ChannelId, PlayOrigin)>,
     /// Route whose `on_enter` ran last (a new route — even of the same screen — re-enters).
     entered: Option<Route>,
     layout: LayoutClass,
@@ -179,6 +183,7 @@ impl TunerApp {
             idle,
             window_fullscreen: false,
             pending_zap: None,
+            pending_locked: None,
             entered: None,
             layout: LayoutClass::Wide,
             epg_updated: None,
@@ -462,7 +467,8 @@ impl TunerApp {
             }
         });
         if locked && !self.parental.is_unlocked(&cfg.parental) {
-            self.toast(Toast::info("This channel is locked — unlock it with your PIN first"));
+            self.pending_locked = Some((id, origin));
+            self.nav.push(NavRequest::Open(OverlayRequest::Pin { then: Box::new(Action::OpenPlayer), reason: "This channel is locked".into() }));
             return;
         }
         let zap = group.and_then(|g| self.zap_list(g, &cfg));
@@ -586,6 +592,14 @@ impl TunerApp {
                 self.overlays.pop();
             }
             OverlayOutcome::CloseWith(result) => {
+                // the PIN asked for by `play_channel` (not a screen's): play it now
+                if matches!(result, overlays::OverlayResult::Unlocked(Action::OpenPlayer))
+                    && let Some((id, origin)) = self.pending_locked.take()
+                {
+                    self.overlays.pop();
+                    self.play_channel(id, origin);
+                    return;
+                }
                 if let Some(o) = self.overlays.pop() {
                     let idx = self.screen_index(o.opener);
                     self.with_ctx(|ctx, screens, _| screens[idx].on_overlay_result(ctx, result));
@@ -1666,7 +1680,7 @@ mod tests {
         cfg.parental.pin_hash = Some(crate::ui::parental::hash_pin("1234", &salt));
         cfg.parental.pin_salt = Some(salt);
         let req = IpcRequest { play: Some("1:m3u:ch0".into()), ..live() };
-        let rig = Rig::with(cfg, req, 1.0, |c| {
+        let mut rig = Rig::with(cfg, req, 1.0, |c| {
             seed_channels(c, 2, None)?;
             c.execute("INSERT INTO item_override(source_id, kind, item_key, locked, fp) VALUES (1, 'channel', 'm3u:ch0', 1, '')", [])?;
             Ok(())
@@ -1674,8 +1688,17 @@ mod tests {
         // `TunerApp::new` handles the request before any frame could deliver the library (the
         // real RebuildLibrary job may land during the rig's first frame, so don't assert on it)
         assert_eq!(played(&rig.log()), []);
-        assert!(rig.log().toasts.iter().any(|t| t.text.contains("locked")));
         assert_eq!(rig.route(), &Route::Live { group: None, channel: None });
+        let pin = std::mem::discriminant(&OverlayRequest::Pin { then: Box::new(Action::OpenPlayer), reason: String::new() });
+        rig.frame_with(vec![]);
+        assert_eq!(rig.overlay_kinds(), [pin], "the PIN prompt is open");
+        // the right PIN: the channel plays (fullscreen, still a CLI play)
+        rig.frame_with(vec![Event::Text("1234".into())]);
+        rig.press(Key::Enter, NONE);
+        rig.frame_with(vec![]);
+        assert!(rig.app.overlays.is_empty());
+        assert!(matches!(played(&rig.log()).as_slice(), [(MediaRef::Channel(_), PlayOrigin::Cli)]), "{:?}", played(&rig.log()));
+        assert_eq!(rig.route(), &Route::Player);
     }
 
     #[test]

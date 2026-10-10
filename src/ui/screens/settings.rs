@@ -35,7 +35,7 @@ use crate::store::user::Orphan;
 use crate::theme::{SpaceToken, Theme, TypeToken};
 use crate::ui::overlays::{ConfirmSpec, ContextMenuSpec, MenuItem, OverlayResult, RenameSpec, RenameTarget};
 use crate::ui::parental::{hash_pin, new_salt};
-use crate::ui::widgets::button::{ButtonStyle, button, icon_button};
+use crate::ui::widgets::button::{ButtonStyle, icon_button};
 use crate::ui::widgets::list::paint_row_state;
 use crate::ui::widgets::text_field::text_field;
 use crate::ui::widgets::toggle::toggle;

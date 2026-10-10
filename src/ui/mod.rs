@@ -280,10 +280,10 @@ pub trait Screen {
     fn key_contexts(&self) -> Vec<KeyContext>;
 
     /// Called when the screen becomes current (with its route arguments).
-    fn on_enter(&mut self, ctx: &mut UiCtx<'_>, route: &Route) {}
+    fn on_enter(&mut self, _ctx: &mut UiCtx<'_>, _route: &Route) {}
 
     /// Called for every app event while the screen exists (current or not).
-    fn on_event(&mut self, ctx: &mut UiCtx<'_>, ev: &AppEvent) {}
+    fn on_event(&mut self, _ctx: &mut UiCtx<'_>, _ev: &AppEvent) {}
 
     /// A resolved key action. Return true if handled (otherwise the app handles globals).
     fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool;
@@ -292,7 +292,7 @@ pub trait Screen {
     fn ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>);
 
     /// Result of an overlay this screen opened (confirm token, chosen menu action...).
-    fn on_overlay_result(&mut self, ctx: &mut UiCtx<'_>, result: overlays::OverlayResult) {}
+    fn on_overlay_result(&mut self, _ctx: &mut UiCtx<'_>, _result: overlays::OverlayResult) {}
 
     /// Whether the corner mini-player may show over this screen while something plays.
     /// False for Onboarding and the Player itself.
