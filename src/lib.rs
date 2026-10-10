@@ -27,7 +27,6 @@ pub mod ipc;
 #[allow(dead_code, unused_variables, unused_imports)] // WP stubs (see crate docs)
 pub mod jobs;
 pub mod player;
-#[allow(dead_code, unused_variables, unused_imports)] // WP stubs (see crate docs)
 pub mod sources;
 pub mod store;
 
