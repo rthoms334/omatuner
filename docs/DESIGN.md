@@ -305,8 +305,12 @@ context is alive — never UB on a panic path.
 `JobKind` enumerates every background operation (refresh source/EPG, refresh stale, probe/add
 source, lazy VOD/series details, rematch EPG, rebuild library, maintenance, backup export/
 import). `submit` returns a `JobId` immediately. Coalescing: identical jobs (`dedupe_key`)
-coalesce only while the existing one is `Queued`/`Connecting`; later, a `rerun` flag resubmits
-it after it finishes (a newer request is never dropped). Follow-ups go through
+coalesce only while the existing one is `Queued`/`Connecting` **and has not read its inputs
+yet**; later, a `rerun` flag resubmits it after it finishes (a newer request is never dropped).
+*Decided in phase 2:* a refresh stays `Connecting` while it talks to the server, so it marks the
+moment it reads its source row (`Progress::mark_inputs_read`); a request arriving after that
+runs again in full after the current run instead of being merged into it (it may carry edits
+the running job never saw). Follow-ups go through
 `JobContext::submit` (refresh → provider EPG → RebuildLibrary; restore → refresh each source;
 AddSource → RefreshSource). `JobContext::player_busy` (set by the app from each snapshot) makes
 the scheduler skip ticks while a stream is Loading/Zapping. Semaphores: playlists 2, EPG 1,
@@ -990,8 +994,12 @@ there for the focused channel).
 * Daily: `Maintenance`.
 * Staleness UI: status bar "Guide updated 3 h ago" (warning glyph when > 48 h or `max_stop`
   passed: "Guide data ended — refresh"); per-source "Updated … / Failed … (reason)" in
-  Settings; channel rows show "No guide data" rather than empty space.
-* Closed app: no refresh in v1 (`tuner --refresh` reserved for a user timer).
+  Settings; channel rows show "No guide data" rather than empty space ("Loading guide… n %"
+  during the first guide import).
+* Closed app: no background refresh in v1. `tuner --refresh` (for a future user timer) refreshes
+  stale sources headlessly and exits (status 1 if a job failed). *Decided in phase 2:* while a
+  windowed instance is running it does nothing and exits 0 — that instance owns the database
+  writer and its scheduler refreshes on its own.
 
 ---
 
@@ -1596,6 +1604,9 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
   filter text; Ctrl+S view menu: minimum level, Export…) are full screens.
 * **Rule: no screen reads raw keys** — every key a screen reacts to is in a keymap table, so
   the help overlay and the hint line are complete.
+* *Decided in phase 3:* Help and Jobs are toggles — requesting the one on top again (`?`/F1,
+  Ctrl+J, a status-bar click) closes it. Switching screens (sidebar, Alt+digits, `--view`)
+  closes every open overlay; overlays belong to the screen that opened them.
 
 ### 13.12 States (copy and behaviour)
 
@@ -1605,6 +1616,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | Empty library | Home/Live | empty state 󰐹 "No playlists yet" + "Add playlist" (→ onboarding) |
 | Empty group / no matches | lists | 󰍉 "No matches for “abc”" / "This group is empty" (+ "Show hidden" if items hidden) |
 | No guide data | rows / grid | "No guide data" (@ 0.36); grid: one gap cell; Ctrl+E assign EPG hint |
+| Guide doesn't cover the channel (WP-13) | preview, grid, guide header, Settings ▸ EPG, onboarding Done | says *why*: loading / no guide at all / guide not loaded / "Not in your guide" with the coverage ("Your guides cover 3 of 11 249 channels"); Ctrl+E = EPG mapping, or Settings ▸ EPG when there is nothing to map to. Settings ▸ EPG rows: "Matches N of M channels · guide lists X channels, Y programmes" (+ a note when under half are covered); Playlists rows "N ch (M with guide)" |
 | Guide stale / ended | status bar, guide header | warning glyph "Guide updated 3 d ago · Refresh" |
 | Import running | status bar, settings row | phase + % ; lists keep showing old data |
 | Import failed | toast + settings row | "Couldn't refresh My IPTV: HTTP 404" (redacted), old data kept |
@@ -1684,6 +1696,11 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 * **Esc ladder**: clear filter → close overlay/side panel → leave OSD controls focus → hide the
   info banner → leave window fullscreen → leave the player (mini player keeps playing) → back
   in the route stack. Esc never shows the banner. Alt+← and the mouse back button = Back.
+  *Decided in phase 3:* Back on a lone sub-page (nothing beneath it in the route stack, e.g. a
+  restored last screen) goes to its parent screen: movie / series details → Movies / Series,
+  Logs and EPG mapping → Settings, the player → Live TV.
+* *Decided in phase 3:* Ctrl+P (open the player) acts only while something is playing (any
+  non-Idle player state); with nothing playing it does nothing rather than open an empty player.
 * **Mouse parity**: everything is clickable; hover moves list cursors only after real pointer
   motion (Omarchy `pointerGate`); right-click = context menu; wheel = volume only in the
   fullscreen player; double-click on video = window fullscreen.
@@ -2214,10 +2231,15 @@ Reminders fire only while Tuner runs (v1).
 ### 21.4 Single instance & CLI
 `$XDG_RUNTIME_DIR/tuner/tuner.sock`; a second `tuner [--view guide] [--play …] [file/url]`
 hands its request over and exits 0 (stale socket removed). Works with `omarchy-launch-or-focus
-tuner` and the omarchy-menu entries. Request handling (`TunerApp::handle_ipc`, also for the
+'^tuner$'` (anchored: the pattern also matches window titles) and the omarchy-menu entries. Request handling (`TunerApp::handle_ipc`, also for the
 first instance's own CLI): `--view` switches route; `--play X` and positional URLs / media files
 play immediately (`MediaRef::Url`, fullscreen player); positional `.m3u`/`.m3u8` files open the
 onboarding card at Details (`Route::Onboarding(PlaylistFile)`).
+*Decided in phase 2:* inputs are made absolute by the invoking process before the handoff (the
+running instance has another working directory); a local `file://` URI (desktop `%U`, file
+managers, `gio open`) is decoded to its path and treated like any other path, while
+`file://host/…` stays a URL. `tuner --refresh` never hands off: with an instance running it
+does nothing (§9.5).
 
 ### 21.5 Files & windows
 File pickers through the XDG portal (`rfd` xdg-portal → portal-gtk, auto-floated, follows
@@ -2237,10 +2259,16 @@ prefer-dark/light). `hypr::focus_self` uses Hyprland 0.56's Lua dispatcher
   (`-default-opacity` tag + `opacity "1 1"`, **`render_unfocused = true`** so playback keeps
   rendering on other workspaces (§11.1), optional idle fallback and Super+Shift+T binding),
   `packaging/omarchy/omarchy-menu.jsonc` (TV submenu), `packaging/PKGBUILD` (x86_64 + aarch64,
-  depends mpv/fontconfig/wayland/mesa; builds the local checkout).
+  depends mpv/xz/fontconfig/JetBrains Mono Nerd/wayland/mesa; builds the local checkout into
+  `packaging/src/target`, installs the snippets under `/usr/share/tuner/` and the docs under
+  `/usr/share/doc/tuner/`; the licence is the common SPDX text, so no licence file is installed).
 * User install without a package: `cargo install --path .`, copy the desktop file to
   `~/.local/share/applications/`, icon to `~/.local/share/icons/hicolor/scalable/apps/`, merge the
-  Hyprland and menu snippets.
+  Hyprland and menu snippets. The Hyprland snippet is a module: `~/.config/hypr/tuner.lua` +
+  `require("hypr.tuner")` (Omarchy's bootstrap puts `~/.config/?.lua` on `package.path`).
+* User-facing docs: `README.md` (install, sources, guide coverage, keys — the table between the
+  `keymap` markers is regenerated with `cargo run --example keymap_md`), the manual test
+  checklist `docs/MANUAL_CHECKLIST.md` (§23).
 
 ---
 
@@ -2256,7 +2284,7 @@ prefer-dark/light). `hypr::focus_self` uses Hyprland 0.56's Lua dispatcher
 | UI | `tuner::ui::testing::TestUi` (real services in a temp profile, headless mpv, owns every `UiCtx` part) + `egui_kittest` harnesses built by the test; fake `EpgReader` for the guide; key dispatch layers, Esc ladder, list navigation & filter, guide focus model, help overlay rows | `tests/{keymap,widgets,guide,onboarding,parental}.rs` |
 | Smoke (skeleton) | store opens private/migrated, caches 0700, seeders consistent, every screen and overlay handles actions and draws without panicking | `tests/smoke.rs` |
 | Benchmarks | criterion targets declared in `Cargo.toml`, one owner each (§24.2), on `scripts/gen-big-fixtures.py` output (100k M3U, 415k-programme XMLTV) and seeded DBs (5 000 channels) | `benches/{m3u,xmltv,store,search,import,guide}.rs` |
-| Manual checklist | theme switch live (dark ↔ light, `white` theme OSD), font change, tiled/half/full layouts at text size 12 and 16, media keys, idle (lower screensaver timeout to 30 s), other-workspace playback 60 s with and without `render_unfocused`, 1 h soak, fullscreen toggle, real providers (iptv-org, Pluto via i.mjh.nz EPG) | WP-13 |
+| Manual checklist | theme switch live (dark ↔ light, `white` theme OSD), font change, tiled/half/full layouts at text size 12 and 16, media keys, idle (lower screensaver timeout to 30 s), other-workspace playback 60 s with and without `render_unfocused`, 1 h soak, fullscreen toggle, real providers (iptv-org, Pluto via i.mjh.nz EPG) | WP-13: `docs/MANUAL_CHECKLIST.md` |
 
 `cargo test` must stay green without network, ffmpeg or a Wayland session (those tests skip).
 Lint gate: `cargo clippy --all-targets -- -D warnings` (baseline is zero; stub modules carry a
@@ -2577,3 +2605,12 @@ in the skeleton code. Listed: points rejected or implemented differently, with t
 * *Minor 10 — `save_progress(final_)`*: `PlayerStore::save_progress` takes no flag; final saves
   are guaranteed by the Stop/EndFile/switch effects plus the joined writer at shutdown. WP-07
   verifies with a recording `PlayerStore`.
+
+**Implementation decisions (phases 2–3, recorded in WP-13)** — folded into the sections named:
+* Job coalescing is stricter than "while Queued/Connecting": a request made after the running
+  job read its source row runs again in full (§5.2).
+* `tuner --refresh` does nothing while a windowed instance runs (§9.5, §21.4).
+* Help and Jobs close when requested again; switching screens closes overlays (§13.11).
+* Back on a lone sub-page goes to the parent screen; Ctrl+P works only while something is
+  playing (§15.1).
+* `file://` inputs are treated as paths (§21.4).

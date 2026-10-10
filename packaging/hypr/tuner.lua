@@ -1,6 +1,8 @@
 -- Tuner window rules for Omarchy 4 (Hyprland Lua config).
--- Install: append to ~/.config/hypr/hyprland.lua BELOW `require("default.hypr.toggles")`,
--- or `require("tuner")` after copying this file to ~/.config/hypr/tuner.lua.
+-- Install: copy this file to ~/.config/hypr/tuner.lua and add `require("hypr.tuner")` to
+-- ~/.config/hypr/hyprland.lua BELOW `require("default.hypr.toggles")` (or paste its lines
+-- there). The rules must come after Omarchy's defaults, which tag every window for opacity.
+-- Window class = Tuner's Wayland app id, `tuner`.
 
 -- Video must be fully opaque: opt out of Omarchy's default 0.985/0.96 opacity (like mpv/vlc).
 o.window("^(tuner)$", { tag = "-default-opacity" })
@@ -16,4 +18,4 @@ o.window("^(tuner)$", { render_unfocused = true })
 -- o.window("^(tuner)$", { idle_inhibit = "fullscreen" })
 
 -- Optional launcher binding (Super+Shift+T is free in Omarchy 4 defaults):
--- o.bind("SUPER + SHIFT + T", "Tuner", o.launch_sole("tuner", "tuner"))
+-- o.bind("SUPER + SHIFT + T", "Tuner", o.launch_sole("^tuner$", "tuner"))
