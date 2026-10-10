@@ -329,7 +329,7 @@ fn epg_search_against_the_store() {
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(repaints.load(Ordering::SeqCst), 1, "debounced to a single search");
     let hits = s.results();
-    assert!(hits.iter().all(|h| h.programme.title.to_lowercase().contains("show 1")));
+    assert!(hits.iter().all(|h| fts_matches(&h.programme.title, "show 1")), "{hits:?}");
     assert!(hits.iter().all(|h| !h.channel_ids.is_empty()), "joined to playlist channels");
     // airing first
     assert!(hits[0].programme.start <= now && now < hits[0].programme.stop);
@@ -337,10 +337,23 @@ fn epg_search_against_the_store() {
     // a newer query supersedes; results switch to it
     s.set_query("show 16", now, repaint.clone());
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !s.results().iter().all(|h| h.programme.title.starts_with("Show 16")) {
-        assert!(Instant::now() < deadline);
+    while repaints.load(Ordering::SeqCst) < 2 {
+        assert!(Instant::now() < deadline, "no results for the newer query");
         std::thread::sleep(Duration::from_millis(10));
     }
+    let hits = s.results();
+    assert!(!hits.is_empty());
+    assert!(hits.iter().all(|h| fts_matches(&h.programme.title, "show 16")), "{hits:?}");
     s.set_query("", now, repaint);
     assert!(s.results().is_empty());
+}
+
+/// FTS5 semantics of the store's query (each token quoted, the last one a prefix): every query
+/// token but the last equals a title token; the last is a prefix of one.
+fn fts_matches(title: &str, query: &str) -> bool {
+    let words: Vec<String> =
+        title.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_owned).collect();
+    let q: Vec<&str> = query.split_whitespace().collect();
+    let Some((last, rest)) = q.split_last() else { return false };
+    rest.iter().all(|t| words.iter().any(|w| w == t)) && words.iter().any(|w| w.starts_with(last))
 }

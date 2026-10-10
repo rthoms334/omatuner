@@ -7,8 +7,9 @@
 //!  wanted-set (url → last frame requested) ──▶ tokio: disk cache? ──no──▶ HTTP (Semaphore 6,
 //!                                               │ yes                     ≤ 2 per host, 8 MiB cap)
 //!                                               ▼                          │ write ~/.cache/tuner/img/ab/<blake3>.bin
-//!                                     spawn_blocking decode (Semaphore 2): image / resvg (SVG),
-//!                                     downscale with fast_image_resize to kind's box, premultiply
+//!                                     spawn_blocking decode: image (Semaphore 2, shared with disk
+//!                                     reads) / resvg (own Semaphore 1, so slow SVGs never starve
+//!                                     raster decodes); downscale with fast_image_resize to kind's box
 //!                                               ▼
 //!                                     decoded queue ──▶ UI `pump`: ≤ 4 MiB of texture uploads per
 //!                                                       frame (one backdrop ≈ 3.7 MB), ctx.load_texture
@@ -17,8 +18,10 @@
 //!   max_image_height: 8192, max_alloc: 64 MiB }` (a 20k×20k PNG must not allocate GBs); SVG:
 //!   reject sources > 1 MiB, `usvg::Options` with an EMPTY fontdb (never `load_system_fonts`),
 //!   no external or embedded `<image>` references (no local file reads, no nested decoders
-//!   outside our limits), raster size clamped to the kind's box. gzip-compressed SVG (svgz) is
-//!   not accepted. Downloads are capped at 8 MiB.
+//!   outside our limits), at most 16 filter primitives (blurs over a large canvas take seconds),
+//!   raster size clamped to the kind's box. gzip-compressed SVG (svgz) is not accepted.
+//!   Downloads are capped at 8 MiB.
+//! * A decoder panic (hostile input) counts as an undecodable file: `.fail` marker, no retry.
 //! * Fetching goes through a private `trait Fetch` (implemented for `HttpClient`) so WP-09's
 //!   tests run without WP-04. Only `http`/`https` URLs are fetched.
 //! * The wanted-map is pruned of entries older than 2 s on every `pump`.
@@ -52,15 +55,18 @@ use crate::sources::http::HttpClient;
 const MAX_DOWNLOAD_BYTES: u64 = 8 << 20;
 /// SVG sources above this size are rejected.
 const MAX_SVG_BYTES: usize = 1 << 20;
+/// SVGs applying more filter primitives than this are rejected (rendering time).
+const MAX_SVG_FILTER_PRIMITIVES: usize = 16;
 /// Raster decode limits (untrusted input).
 const MAX_DIMENSION: u32 = 8192;
 const MAX_DECODE_ALLOC: u64 = 64 << 20;
 /// Texture upload budget per frame (one 1280×720 backdrop ≈ 3.7 MB).
 const UPLOAD_BYTES_PER_FRAME: usize = 4 << 20;
-/// Concurrency: downloads overall / per host / decodes (incl. disk reads).
+/// Concurrency: downloads overall / per host / raster decodes (incl. disk reads) / SVG renders.
 const MAX_FETCHES: usize = 6;
 const MAX_FETCHES_PER_HOST: usize = 2;
 const MAX_DECODES: usize = 2;
+const MAX_SVG_RENDERS: usize = 1;
 /// Entries used within this many frames are never evicted.
 const EVICT_IDLE_FRAMES: u64 = 2;
 
@@ -181,6 +187,9 @@ struct Shared {
     net: Semaphore,
     hosts: Mutex<HashMap<String, Arc<Semaphore>>>,
     decode: Semaphore,
+    svg: Semaphore,
+    /// [`decode`]; a seam so tests can simulate a decoder panic.
+    decoder: fn(&[u8], ImageKind) -> Result<egui::ColorImage>,
     tx: crossbeam_channel::Sender<Done>,
     egui: egui::Context,
 }
@@ -274,6 +283,8 @@ impl ImageCache {
             net: Semaphore::new(MAX_FETCHES),
             hosts: Mutex::default(),
             decode: Semaphore::new(MAX_DECODES),
+            svg: Semaphore::new(MAX_SVG_RENDERS),
+            decoder: decode,
             tx,
             egui: egui.clone(),
         });
@@ -412,8 +423,9 @@ async fn load(reply: Reply, url: String, kind: ImageKind) {
 }
 
 enum DiskResult {
-    Hit(egui::ColorImage),
-    /// A fresh `.fail` marker, or a cached file that no longer decodes.
+    /// The cached original bytes.
+    Hit(Vec<u8>),
+    /// A fresh `.fail` marker.
     Failed,
     Miss,
 }
@@ -424,20 +436,20 @@ async fn run_load(shared: &Arc<Shared>, key: Key, url: &str, kind: ImageKind) ->
     }
     let path = cache_path(&shared.dir, url);
 
-    // 1. disk cache (read + decode under the decode permit: bounded blocking-pool use)
+    // 1. disk cache (read under the decode permit: bounded blocking-pool use)
     let disk = {
         let Ok(_permit) = shared.decode.acquire().await else { return Outcome::Failed { transient: true } };
         if shared.is_stale(key) {
             return Outcome::Skipped;
         }
         let (p, ttl) = (path.clone(), shared.tuning.disk_fail_ttl);
-        match tokio::task::spawn_blocking(move || read_disk(&p, kind, ttl)).await {
+        match tokio::task::spawn_blocking(move || read_disk(&p, ttl)).await {
             Ok(r) => r,
             Err(_) => return Outcome::Failed { transient: true },
         }
     };
     match disk {
-        DiskResult::Hit(img) => return Outcome::Ready(img),
+        DiskResult::Hit(bytes) => return decode_and_settle(shared, path, bytes.into(), kind, true).await,
         DiskResult::Failed => return Outcome::Failed { transient: false },
         DiskResult::Miss => {}
     }
@@ -474,15 +486,44 @@ async fn run_load(shared: &Arc<Shared>, key: Key, url: &str, kind: ImageKind) ->
     };
 
     // 3. decode, then persist the original bytes
-    let Ok(_permit) = shared.decode.acquire().await else { return Outcome::Failed { transient: true } };
-    match tokio::task::spawn_blocking(move || store_and_decode(&path, &bytes, kind)).await {
-        Ok(Some(img)) => Outcome::Ready(img),
-        Ok(None) => Outcome::Failed { transient: false },
-        Err(_) => Outcome::Failed { transient: true },
-    }
+    decode_and_settle(shared, path, bytes, kind, false).await
 }
 
-fn read_disk(path: &Path, kind: ImageKind, fail_ttl: Duration) -> DiskResult {
+/// Decode off the UI thread under the matching permit (SVG renders have their own), then
+/// settle the disk cache: a cached file is touched (LRU by mtime for `prune_disk`), fetched
+/// bytes are persisted. Undecodable input, including a decoder panic on hostile data, drops
+/// the cached file and leaves a `.fail` marker, so it is not decoded again.
+async fn decode_and_settle(shared: &Shared, path: PathBuf, bytes: bytes::Bytes, kind: ImageKind, cached: bool) -> Outcome {
+    let permits = if looks_like_svg(&bytes) { &shared.svg } else { &shared.decode };
+    let Ok(_permit) = permits.acquire().await else { return Outcome::Failed { transient: true } };
+    let (decoder, p) = (shared.decoder, path.clone());
+    let joined = tokio::task::spawn_blocking(move || {
+        let img = decoder(&bytes, kind)?;
+        if cached {
+            let _ = std::fs::File::open(&p).and_then(|f| f.set_modified(SystemTime::now()));
+        } else if let Err(e) = write_atomic(&p, &bytes) {
+            tracing::debug!(error = %e, "image cache write failed");
+        }
+        Ok::<_, Error>(img)
+    })
+    .await;
+    match joined {
+        Ok(Ok(img)) => return Outcome::Ready(img),
+        Ok(Err(e)) => tracing::debug!(error = %e, cached, "image decode failed"),
+        Err(e) if e.is_panic() => tracing::warn!(cached, "image decoder panicked; treating the image as invalid"),
+        Err(_) => return Outcome::Failed { transient: true }, // runtime shutting down
+    }
+    let _ = tokio::task::spawn_blocking(move || {
+        if cached {
+            let _ = std::fs::remove_file(&path);
+        }
+        write_fail_marker(&path.with_extension("fail"));
+    })
+    .await;
+    Outcome::Failed { transient: false }
+}
+
+fn read_disk(path: &Path, fail_ttl: Duration) -> DiskResult {
     let marker = path.with_extension("fail");
     if let Ok(meta) = std::fs::metadata(&marker) {
         let age = meta.modified().ok().and_then(|m| m.elapsed().ok()).unwrap_or(Duration::MAX);
@@ -501,37 +542,7 @@ fn read_disk(path: &Path, kind: ImageKind, fail_ttl: Duration) -> DiskResult {
     if std::io::Read::read_to_end(&mut &file, &mut bytes).is_err() {
         return DiskResult::Miss;
     }
-    match decode(&bytes, kind) {
-        Ok(img) => {
-            // keep frequently used files young for `prune_disk` (LRU by mtime)
-            let _ = file.set_modified(SystemTime::now());
-            DiskResult::Hit(img)
-        }
-        Err(e) => {
-            tracing::debug!(error = %e, "cached image no longer decodes");
-            let _ = std::fs::remove_file(path);
-            write_fail_marker(&marker);
-            DiskResult::Failed
-        }
-    }
-}
-
-/// Decode fetched bytes; on success persist them (best effort), on failure leave a `.fail`
-/// marker. Returns `None` when the bytes are not a usable image.
-fn store_and_decode(path: &Path, bytes: &[u8], kind: ImageKind) -> Option<egui::ColorImage> {
-    match decode(bytes, kind) {
-        Ok(img) => {
-            if let Err(e) = write_atomic(path, bytes) {
-                tracing::debug!(error = %e, "image cache write failed");
-            }
-            Some(img)
-        }
-        Err(e) => {
-            tracing::debug!(error = %e, "image decode failed");
-            write_fail_marker(&path.with_extension("fail"));
-            None
-        }
-    }
+    DiskResult::Hit(bytes)
 }
 
 fn write_fail_marker(marker: &Path) {
@@ -634,11 +645,34 @@ fn decode_svg(bytes: &[u8], kind: ImageKind) -> Result<egui::ColorImage> {
         ..usvg::Options::default()
     };
     let tree = usvg::Tree::from_data(bytes, &opt).map_err(|e| Error::BadPayload(format!("svg: {e}")))?;
+    // counted on the resolved tree, so `<use>` copies of a filtered element count too
+    let primitives = filter_primitives(tree.root());
+    if primitives > MAX_SVG_FILTER_PRIMITIVES {
+        return Err(Error::BadPayload(format!("svg: {primitives} filter primitives")));
+    }
     let size = tree.size();
     let (dw, dh, scale) = fit(size.width(), size.height(), kind.max_size(), true);
     let mut pixmap = tiny_skia::Pixmap::new(dw, dh).ok_or_else(|| Error::BadPayload("svg: empty canvas".into()))?;
     resvg::render(&tree, tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
     Ok(egui::ColorImage::from_rgba_premultiplied([dw as usize, dh as usize], pixmap.data()))
+}
+
+/// Filter primitives applied anywhere in the tree (groups, and patterns/masks/clips/filter
+/// content via subroots).
+fn filter_primitives(group: &resvg::usvg::Group) -> usize {
+    let own: usize = group.filters().iter().map(|f| f.primitives().len()).sum();
+    group
+        .children()
+        .iter()
+        .map(|node| {
+            let mut n = 0;
+            if let resvg::usvg::Node::Group(g) = node {
+                n += filter_primitives(g);
+            }
+            node.subroots(|sub| n += filter_primitives(sub));
+            n
+        })
+        .fold(own, usize::saturating_add)
 }
 
 /// Delete least-recently-modified cache files until the directory is under `max_bytes`
@@ -991,6 +1025,85 @@ mod tests {
         assert_eq!(fake.calls(), 0);
         assert!(matches!(drive(&mut r.cache, "http://boom.example/x.png", ImageKind::Logo), ImageState::Failed));
         assert!(r.cache.inflight.is_empty());
+    }
+
+    fn with_decoder(r: &mut Rig, decoder: fn(&[u8], ImageKind) -> Result<egui::ColorImage>) {
+        Arc::get_mut(&mut r.cache.shared).expect("no task started yet").decoder = decoder;
+    }
+
+    fn panicking_decoder(_: &[u8], _: ImageKind) -> Result<egui::ColorImage> { panic!("decoder exploded") }
+
+    #[test]
+    fn decoder_panics_are_permanent_failures_with_a_disk_marker() {
+        // fetched bytes
+        let fake = FakeFetch::new(png(4, 4), Answer::Bytes, Duration::ZERO);
+        let mut r = rig(fake.clone(), 1 << 20, Tuning::default());
+        with_decoder(&mut r, panicking_decoder);
+        let url = "http://x.example/evil.png";
+        assert!(matches!(drive(&mut r.cache, url, ImageKind::Logo), ImageState::Failed));
+        let p = cache_path(r.dir.path(), url);
+        assert!(!p.exists(), "not cached");
+        assert!(p.with_extension("fail").is_file(), "marker written");
+        let until = r.cache.failed[&key_of(url, ImageKind::Logo)];
+        assert!(until > Instant::now() + Duration::from_secs(600), "memory ttl of a permanent failure");
+
+        // a cached file that panics the decoder is dropped and marked
+        let mut r = rig(fake.clone(), 1 << 20, Tuning::default());
+        with_decoder(&mut r, panicking_decoder);
+        let url = "http://x.example/cached.png";
+        let p = cache_path(r.dir.path(), url);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, png(4, 4)).unwrap();
+        assert!(matches!(drive(&mut r.cache, url, ImageKind::Logo), ImageState::Failed));
+        assert!(!p.exists());
+        assert!(p.with_extension("fail").is_file());
+        assert_eq!(fake.calls(), 1, "only the first rig fetched");
+    }
+
+    static SVG_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    static SVG_MAX_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+    /// Real decoder, but SVG renders take 600 ms (a pathological vector file).
+    fn slow_svg_decoder(bytes: &[u8], kind: ImageKind) -> Result<egui::ColorImage> {
+        if looks_like_svg(bytes) {
+            let now = SVG_ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
+            SVG_MAX_ACTIVE.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(600));
+            SVG_ACTIVE.fetch_sub(1, Ordering::SeqCst);
+        }
+        decode(bytes, kind)
+    }
+
+    #[test]
+    fn slow_svgs_render_one_at_a_time_and_never_block_rasters() {
+        let fake = FakeFetch::new(vec![], Answer::NotFound, Duration::ZERO);
+        let mut r = rig(fake.clone(), 64 << 20, Tuning::default());
+        with_decoder(&mut r, slow_svg_decoder);
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10"/></svg>"#;
+        let svgs: Vec<String> = (0..3).map(|i| format!("http://s.example/{i}.svg")).collect();
+        let raster = "http://r.example/logo.png".to_owned();
+        for (u, bytes) in svgs.iter().map(|u| (u, svg.to_vec())).chain([(&raster, png(8, 8))]) {
+            let p = cache_path(r.dir.path(), u);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, bytes).unwrap();
+        }
+        // SVGs requested first, so they would take both decode permits
+        let all: Vec<&String> = svgs.iter().chain([&raster]).collect();
+        let t = Instant::now();
+        let raster_ready = loop {
+            let states: Vec<ImageState> = all.iter().map(|u| r.cache.get(u, ImageKind::Logo)).collect();
+            if matches!(states[3], ImageState::Ready(_)) {
+                break t.elapsed();
+            }
+            assert!(t.elapsed() < Duration::from_secs(10), "raster never loaded");
+            r.cache.pump();
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert!(raster_ready < Duration::from_millis(500), "raster waited for SVG renders: {raster_ready:?}");
+        drive_all(&mut r.cache, &svgs, ImageKind::Logo);
+        assert!(svgs.iter().all(|u| matches!(r.cache.get(u, ImageKind::Logo), ImageState::Ready(_))));
+        assert_eq!(SVG_MAX_ACTIVE.load(Ordering::SeqCst), MAX_SVG_RENDERS);
+        assert_eq!(fake.calls(), 0);
     }
 
     #[test]

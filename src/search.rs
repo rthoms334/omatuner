@@ -6,14 +6,17 @@
 //!   ("name  group  source"); rebuilt (new injector) when the `Library` snapshot changes.
 //!   Small libraries are injected inline; large ones (> 4 096 items) from a short-lived
 //!   "search-inject" thread so the UI thread only pays for collecting the items (Arc clones).
-//!   `set_query` uses `reparse` with `append = true` when the new query extends the old one.
+//!   `set_query` uses `reparse` with `append = true` when the new query extends the old one
+//!   (except after a trailing `$` or `\`, whose meaning changes when text follows).
 //!   `tick(10)` each frame while the overlay is open; results read from the snapshot (top 200).
 //!   A blank query has no results. `notify` is debounced: it fires at most once between two
 //!   `tick`s (nucleo would call it for every injected item).
 //! * EPG search: debounced 150 ms; runs `store::epg::search` on the runtime with its own reader
-//!   connection; results replace the "Guide" section when they arrive (stale queries dropped:
-//!   the pending task is aborted and late results never overwrite newer ones). Until the new
-//!   query's results arrive, the previous ones stay visible; a blank query clears immediately.
+//!   connection; results replace the "Guide" section when they arrive. Stale queries are
+//!   dropped: the pending task is aborted, a superseded search that already reached the blocking
+//!   pool is interrupted (or skipped before it starts), and only the latest query's results are
+//!   published. Until the new query's results arrive, the previous ones stay visible; a blank
+//!   query clears immediately.
 //! * List filter: [`ListFilter`] keeps a `nucleo_matcher::Matcher` and returns matching row
 //!   indices sorted by score (ties keep list order); < 5 ms for 20k rows, so it runs inline.
 //!   IMPLEMENTED IN THE SKELETON (every list uses it). Channel haystacks are
@@ -24,12 +27,12 @@
 //! hidden) never appear.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use nucleo::pattern::{CaseMatching, Normalization};
-use nucleo::{Utf32Str, Utf32String};
+use nucleo::Utf32String;
 
 use crate::model::{ChannelId, GroupId, MovieId, ProgrammeHit, SeriesId, SourceId, Timestamp, VodKind};
 use crate::store::library::Library;
@@ -189,8 +192,11 @@ impl SearchIndex {
         if q == self.query {
             return;
         }
-        // nucleo may only narrow the previous matches when the old text is a prefix
-        let append = !self.query.is_empty() && q.starts_with(self.query.as_str());
+        // nucleo may only narrow the previous matches when the old text is a prefix, and not
+        // when the old text ends in a postfix anchor (`foo$` → `foo$x`) or an escape (`foo\` →
+        // `foo\ bar`): there the appended text changes what the old atom meant
+        let append =
+            !self.query.is_empty() && q.starts_with(self.query.as_str()) && !self.query.ends_with(['$', '\\']);
         self.nucleo.pattern.reparse(0, q, CaseMatching::Ignore, Normalization::Smart, append);
         self.query = q.to_owned();
     }
@@ -247,15 +253,33 @@ impl Drop for SearchIndex {
     fn drop(&mut self) { self.inject_cancel.store(true, Ordering::Relaxed); }
 }
 
-/// Highlight positions that fall inside the name (the first part of the haystack), sorted and
-/// deduplicated (multi-word patterns report per-atom indices).
+/// Highlight positions that fall inside the name (the first part of the haystack), as char
+/// indices, sorted and deduplicated (multi-word patterns report per-atom indices).
 fn name_indices(name: &str, idx: &mut Vec<u32>) -> Vec<u32> {
-    // positions are in nucleo's units (one per grapheme for non-ASCII text)
-    let mut tmp = Vec::new();
-    let name_len = Utf32Str::new(name, &mut tmp).len() as u32;
     idx.sort_unstable();
     idx.dedup();
-    idx.iter().copied().filter(|i| *i < name_len).collect()
+    if name.is_ascii() {
+        let name_len = name.len() as u32;
+        return idx.iter().copied().filter(|i| *i < name_len).collect();
+    }
+    // nucleo counts graphemes for non-ASCII text: map each grapheme to its first char
+    let first_char = grapheme_starts(name);
+    idx.iter().filter_map(|&g| first_char.get(g as usize).copied()).collect()
+}
+
+/// Char index of the first char of every grapheme of `name`, in nucleo's segmentation.
+/// (Counted with `Utf32String` like the haystack: `Utf32Str::new` switches to byte units when
+/// every grapheme starts with an ASCII char, e.g. "Cafe\u{301}".)
+fn grapheme_starts(name: &str) -> Vec<u32> {
+    let mut starts = Vec::new();
+    for (ci, (b, c)) in name.char_indices().enumerate() {
+        // the prefix ending with this char has (index of this char's grapheme + 1) graphemes
+        let g = Utf32String::from(&name[..b + c.len_utf8()]).len();
+        if g > starts.len() {
+            starts.push(ci as u32);
+        }
+    }
+    starts
 }
 
 /// Visible items of a snapshot, in library order (channels, movies, series).
@@ -338,8 +362,12 @@ pub struct EpgSearch {
     pending: Option<tokio::task::JoinHandle<()>>,
     results: Arc<std::sync::Mutex<(u64, Vec<ProgrammeHit>)>>,
     seq: u64,
-    /// Lazily opened reader, reused across searches (one search runs at a time per query).
+    /// The newest `seq`, readable by the search tasks (superseded ones skip or are discarded).
+    latest: Arc<AtomicU64>,
+    /// Lazily opened reader, reused across searches (one search runs at a time).
     reader: Arc<Mutex<Option<rusqlite::Connection>>>,
+    /// Interrupts the query running on `reader` (set once the reader is open).
+    interrupt: Arc<Mutex<Option<rusqlite::InterruptHandle>>>,
     search: Arc<EpgSearchFn>,
     debounce: Duration,
 }
@@ -350,36 +378,76 @@ impl EpgSearch {
     }
 
     fn with_search(rt: tokio::runtime::Handle, store: crate::store::Store, search: Arc<EpgSearchFn>, debounce: Duration) -> Self {
-        Self { rt, store, pending: None, results: Arc::default(), seq: 0, reader: Arc::default(), search, debounce }
+        Self {
+            rt,
+            store,
+            pending: None,
+            results: Arc::default(),
+            seq: 0,
+            latest: Arc::default(),
+            reader: Arc::default(),
+            interrupt: Arc::default(),
+            search,
+            debounce,
+        }
     }
 
     /// Start (debounced 150 ms) a search; previous pending one is aborted.
     pub fn set_query(&mut self, q: &str, now: crate::model::Timestamp, repaint: Arc<dyn Fn() + Send + Sync>) {
         self.seq += 1;
         let seq = self.seq;
+        self.latest.store(seq, Ordering::Release);
         if let Some(h) = self.pending.take() {
             h.abort();
+        }
+        // a search already on the blocking pool can't be aborted: stop its SQLite query (a no-op
+        // when the reader is idle; this query's own search is still in its debounce)
+        if let Some(h) = lock(&self.interrupt).as_ref() {
+            h.interrupt();
         }
         let q = q.trim().to_owned();
         if q.is_empty() {
             *lock(&self.results) = (seq, Vec::new());
             return;
         }
-        let (results, reader, store, search, debounce) =
-            (self.results.clone(), self.reader.clone(), self.store.clone(), self.search.clone(), self.debounce);
+        let (results, latest, reader, interrupt, store, search, debounce) = (
+            self.results.clone(),
+            self.latest.clone(),
+            self.reader.clone(),
+            self.interrupt.clone(),
+            self.store.clone(),
+            self.search.clone(),
+            self.debounce,
+        );
         self.pending = Some(self.rt.spawn(async move {
             tokio::time::sleep(debounce).await;
+            let current = latest.clone();
             let run = tokio::task::spawn_blocking(move || {
                 let mut conn = lock(&reader);
-                if conn.is_none() {
-                    *conn = Some(store.reader()?);
+                // superseded while queued behind an older search: don't run the query at all
+                if current.load(Ordering::Acquire) != seq {
+                    return None;
                 }
-                let Some(c) = conn.as_ref() else { return Ok(Vec::new()) };
-                search(c, &q, now, EPG_LIMIT)
+                if conn.is_none() {
+                    match store.reader() {
+                        Ok(c) => {
+                            *lock(&interrupt) = Some(c.get_interrupt_handle());
+                            *conn = Some(c);
+                        }
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
+                let c = conn.as_ref()?;
+                Some(search(c, &q, now, EPG_LIMIT))
             });
-            let hits = match run.await {
-                Ok(Ok(hits)) => hits,
-                Ok(Err(e)) => {
+            let outcome = run.await;
+            if latest.load(Ordering::Acquire) != seq {
+                return; // superseded: never published (an interrupted query's error is expected)
+            }
+            let hits = match outcome {
+                Ok(Some(Ok(hits))) => hits,
+                Ok(None) => return,
+                Ok(Some(Err(e))) => {
                     tracing::warn!(error = %e, "EPG search failed");
                     Vec::new()
                 }
@@ -397,7 +465,8 @@ impl EpgSearch {
         }));
     }
 
-    /// Latest finished results for the latest query.
+    /// Results of the most recent search that finished. Earlier results stay until the newer
+    /// query's results arrive; a blank query clears them at once.
     pub fn results(&self) -> Vec<ProgrammeHit> { lock(&self.results).1.clone() }
 }
 
@@ -554,7 +623,67 @@ mod tests {
         let mut v = vec![9, 1, 1, 0, 40];
         assert_eq!(name_indices("BBC One", &mut v), vec![0, 1]);
         let mut v = vec![0, 3, 4];
-        assert_eq!(name_indices("Café", &mut v), vec![0, 3], "unicode name: units are chars here");
+        assert_eq!(name_indices("Café", &mut v), vec![0, 3], "precomposed é: one char, one grapheme");
+        // decomposed "e\u{301}" is one grapheme (nucleo index 3) but two chars
+        let name = "Cafe\u{301} Noir";
+        let chars: Vec<char> = name.chars().collect();
+        let mut v = vec![6, 5, 3];
+        assert_eq!(name_indices(name, &mut v), vec![3, 6, 7], "grapheme indices mapped to chars");
+        assert_eq!((chars[3], chars[6], chars[7]), ('e', 'N', 'o'));
+        let mut v = vec![8, 9, 10];
+        assert_eq!(name_indices(name, &mut v), vec![9], "past the name is dropped");
+    }
+
+    #[test]
+    fn highlights_match_the_haystack_for_decomposed_names() {
+        let lib = Library {
+            live: LiveIndex::from_parts(vec![channel(1, "Cafe\u{301} Noir")], vec![], HashMap::new(), HashSet::new()),
+            ..Library::default()
+        };
+        let mut idx = SearchIndex::new(Arc::new(|| {}));
+        idx.rebuild(&lib, false);
+        idx.set_query("noir");
+        settle(&mut idx, 1);
+        let hits = idx.results(SearchSection::Live, 10);
+        let chars: Vec<char> = hits[0].item.name.chars().collect();
+        let lit: String = hits[0].indices.iter().map(|&i| chars[i as usize]).collect();
+        assert_eq!(lit, "Noir");
+    }
+
+    #[test]
+    fn append_is_not_used_after_anchors_or_escapes() {
+        let names = ["foo", "foo$x", "foo\\ bar", "foo bar", "xfoo"];
+        let lib = Library {
+            live: LiveIndex::from_parts(
+                names.iter().enumerate().map(|(i, n)| channel(i as i64, n)).collect(),
+                vec![],
+                HashMap::new(),
+                HashSet::new(),
+            ),
+            ..Library::default()
+        };
+        let ids = |idx: &SearchIndex| {
+            let mut v: Vec<SearchTarget> = idx.results(SearchSection::Live, 100).iter().map(|h| h.item.target).collect();
+            v.sort_by_key(|t| match t {
+                SearchTarget::Channel(c) => c.0,
+                _ => i64::MAX,
+            });
+            v
+        };
+        for (old, new) in [("foo$", "foo$x"), ("foo\\", "foo\\ bar"), ("foo", "foo bar")] {
+            let mut idx = SearchIndex::new(Arc::new(|| {}));
+            idx.rebuild(&lib, false);
+            idx.set_query(old);
+            settle(&mut idx, names.len() as u32);
+            idx.set_query(new);
+            settle(&mut idx, names.len() as u32);
+            let mut fresh = SearchIndex::new(Arc::new(|| {}));
+            fresh.rebuild(&lib, false);
+            fresh.set_query(new);
+            settle(&mut fresh, names.len() as u32);
+            assert!(!ids(&fresh).is_empty(), "{new:?} matches something");
+            assert_eq!(ids(&idx), ids(&fresh), "{old:?} → {new:?}");
+        }
     }
 
     fn hit(id: i64, title: &str) -> ProgrammeHit {
@@ -651,6 +780,26 @@ mod tests {
         r.set("faster");
         assert_eq!(&*r.search.results()[0].programme.title, "fast");
         r.wait_for("faster");
+    }
+
+    #[test]
+    fn epg_superseded_searches_queued_behind_a_slow_one_never_run() {
+        let mut r = epg_rig();
+        r.set("slow query");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while lock(&r.calls).is_empty() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // "a" passes its debounce and waits for the reader behind the slow search …
+        r.set("a");
+        std::thread::sleep(Duration::from_millis(150));
+        // … and is superseded before it gets it
+        r.set("b");
+        r.wait_for("b");
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(*lock(&r.calls), vec!["slow query".to_owned(), "b".to_owned()]);
+        assert_eq!(r.repaints.load(Ordering::SeqCst), 1, "only the latest query published");
     }
 
     #[test]

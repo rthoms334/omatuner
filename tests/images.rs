@@ -69,6 +69,65 @@ fn svg_is_rasterized_at_the_box_without_fonts_or_external_images() {
     assert!(fits(&backdrop, ImageKind::Backdrop));
 }
 
+/// Blue rect with a red raster `<image>` (`href`) covering its top-left quarter.
+fn svg_with_image(href: &str) -> String {
+    format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100">
+  <rect width="200" height="100" fill="#1e88e5"/>
+  <image href="{href}" x="0" y="0" width="100" height="50" preserveAspectRatio="none"/>
+</svg>"##
+    )
+}
+
+#[test]
+fn svg_never_loads_local_files_or_embedded_images() {
+    use base64::Engine as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let red = png(40, 20, [255, 0, 0, 255]);
+    let file = tmp.path().join("red.png");
+    std::fs::write(&file, &red).unwrap();
+    let data = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(&red));
+
+    for href in [file.to_str().unwrap().to_owned(), format!("file://{}", file.display()), data] {
+        let svg = svg_with_image(&href);
+        // sanity: a default renderer draws the image, so this SVG would expose a file read
+        let opt = resvg::usvg::Options::default();
+        let tree = resvg::usvg::Tree::from_str(&svg, &opt).unwrap();
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(200, 100).unwrap();
+        resvg::render(&tree, resvg::tiny_skia::Transform::identity(), &mut pixmap.as_mut());
+        let drawn = pixmap.pixel(20, 10).unwrap();
+        let default_draws = drawn.red() > 200 && drawn.blue() < 50;
+
+        let img = decode(svg.as_bytes(), ImageKind::Logo).unwrap();
+        assert_eq!(img.size, [128, 64]);
+        let c = px(&img, 16, 8);
+        assert!(c.b() > 200 && c.r() < 60, "{href:.40}: rect colour under the image, got {c:?}");
+        if href.starts_with('/') || href.starts_with("data:") {
+            assert!(default_draws, "{href:.40}: fixture must be drawable by default ({drawn:?})");
+        }
+    }
+}
+
+#[test]
+fn svg_filter_primitives_are_capped() {
+    let svg = |uses: usize| {
+        let mut s = String::from(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="20" height="20">
+  <defs><filter id="b"><feGaussianBlur stdDeviation="1"/></filter></defs>
+  <rect id="r" width="10" height="10" fill="#1e88e5" filter="url(#b)"/>"##,
+        );
+        for i in 0..uses {
+            s.push_str(&format!(r##"<use xlink:href="#r" x="{}" y="1"/>"##, i % 10));
+        }
+        s.push_str("</svg>");
+        s
+    };
+    assert!(decode(svg(3).as_bytes(), ImageKind::Logo).is_ok(), "a few filters are fine");
+    // one filter definition, applied 1 + 20 times through `<use>`
+    let err = decode(svg(20).as_bytes(), ImageKind::Logo).unwrap_err();
+    assert!(err.to_string().contains("filter"), "{err}");
+}
+
 #[test]
 fn every_kind_respects_its_box() {
     for kind in [ImageKind::Logo, ImageKind::Poster, ImageKind::Backdrop, ImageKind::Still] {
@@ -80,12 +139,46 @@ fn every_kind_respects_its_box() {
     }
 }
 
+fn png(w: u32, h: u32, rgba: [u8; 4]) -> Vec<u8> {
+    let img = image::RgbaImage::from_pixel(w, h, image::Rgba(rgba));
+    let mut out = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+    out.into_inner()
+}
+
+/// A PNG whose IHDR claims `w`×`h` RGBA but which carries a single pixel of data.
+fn png_header_only(w: u32, h: u32) -> Vec<u8> {
+    let mut b = png(1, 1, [0, 0, 0, 255]);
+    // signature (8) + chunk length (4) + "IHDR" (4) + width/height; CRC over type + 13 data bytes
+    assert_eq!(&b[12..16], b"IHDR");
+    b[16..20].copy_from_slice(&w.to_be_bytes());
+    b[20..24].copy_from_slice(&h.to_be_bytes());
+    let mut crc = flate2::Crc::new();
+    crc.update(&b[12..29]);
+    b[29..33].copy_from_slice(&crc.sum().to_be_bytes());
+    b
+}
+
+fn is_limit_error(err: &tuner::error::Error) -> bool {
+    matches!(err, tuner::error::Error::BadPayload(m) if m.to_lowercase().contains("limit"))
+}
+
 #[test]
 fn oversized_dimensions_are_rejected_before_allocating() {
     let t = Instant::now();
     let err = decode(&fixture("huge_header_20000x20000.png"), ImageKind::Backdrop).unwrap_err();
     assert!(t.elapsed() < Duration::from_secs(2), "rejected from the header");
     assert!(matches!(err, tuner::error::Error::BadPayload(_)), "{err}");
+
+    // our own limits, not the image crate's defaults (512 MiB alloc, no dimension cap):
+    // 9000 px wide but tiny in bytes, rejected by the 8192 px cap …
+    let err = decode(&png(9000, 8, [1, 2, 3, 255]), ImageKind::Backdrop).unwrap_err();
+    assert!(is_limit_error(&err), "{err}");
+    // … the cap itself is allowed …
+    assert_eq!(decode(&png(8192, 8, [1, 2, 3, 255]), ImageKind::Backdrop).unwrap().size, [1280, 1]);
+    // … and 5000×5000 RGBA (≈ 95 MiB) is over the 64 MiB allocation limit
+    let err = decode(&png_header_only(5000, 5000), ImageKind::Backdrop).unwrap_err();
+    assert!(is_limit_error(&err), "{err}");
 }
 
 #[test]
