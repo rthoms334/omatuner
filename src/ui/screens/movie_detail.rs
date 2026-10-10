@@ -1,7 +1,8 @@
 //! Movie detail (DESIGN §13.6): backdrop (dimmed), poster, title, year · duration · rating ·
 //! genre, plot, cast/director, buttons Play/Resume · Start over · Favourite · Mark watched.
 //! Loads details lazily (`JobKind::LoadMovieDetails`) with a skeleton state. Key context
-//! `[Detail]`. When a movie ends it is marked watched and the player returns here. Owner: WP-12.
+//! `[Detail]`. When a movie ends in the fullscreen player (marked watched by the player) the
+//! app leaves the player for its page, wherever it was started. Owner: WP-12.
 //!
 //! Data: the list-level row (`Library`) shows at once; the full row and its progress are read
 //! off the UI thread (`kit::Loader`) and re-read on `DataScope::{VodDetails, Progress,
@@ -18,7 +19,7 @@ use crate::model::{ItemKind, ItemRef, MediaRef, Movie, MovieId, PlayOrigin, Sour
 use crate::msg::{AppEvent, DataScope};
 use crate::player::PlayerEvent;
 use crate::theme::{SpaceToken, Theme, TypeToken, with_alpha};
-use crate::ui::overlays::{OverlayResult, ResumeSpec};
+use crate::ui::overlays::{ContextMenuSpec, MenuItem, OverlayResult, ResumeSpec};
 use crate::ui::video_host::Placement;
 use crate::ui::widgets::button::{ButtonStyle, button};
 use crate::ui::widgets::{empty_state, glyphs};
@@ -80,8 +81,6 @@ pub struct MovieDetailScreen {
     /// `LoadMovieDetails` was submitted for this id.
     details_requested: Option<MovieId>,
     focus: usize,
-    /// The movie this page started (end of playback returns here).
-    started: Option<MovieId>,
 }
 
 impl MovieDetailScreen {
@@ -142,9 +141,66 @@ impl MovieDetailScreen {
             kit::ask_pin(ctx, if resume { Action::Activate } else { Action::ActivateAlt }, "This title is locked");
             return;
         }
-        self.started = Some(id);
         kit::play_media(ctx, MediaRef::Movie(id), resume, PlayOrigin::Fullscreen);
     }
+
+    /// (effective lock, locked through a category) of the movie.
+    fn lock_state(&self, ctx: &UiCtx<'_>) -> (bool, bool) {
+        let groups = &ctx.lib.vod.movie_groups;
+        match (&self.movie, self.summary(ctx)) {
+            (Some(m), _) => (m.locked, kit::any_group_locked(groups, &m.group_ids)),
+            (None, Some(v)) => (v.locked, kit::any_group_locked(groups, &v.group_ids)),
+            _ => (false, false),
+        }
+    }
+
+    /// Item shortcuts of the page (and its context menu).
+    fn item_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) {
+        let Some(item) = self.item(ctx) else { return };
+        let title = self.title(ctx);
+        match action {
+            Action::AddToList => kit::list_picker(ctx, &item, &title),
+            Action::Rename => kit::rename_item(ctx, &item, &title),
+            Action::ToggleHidden => kit::hide_item(ctx, &item, &title),
+            Action::ToggleLock => {
+                let (locked, by_group) = self.lock_state(ctx);
+                kit::toggle_lock(ctx, &item, locked, by_group);
+            }
+            Action::ContextMenu => {
+                let fav = ctx.favs.is_fav(&item);
+                let mi = |icon: &'static str, label: &str, action: Action, shortcut: &str| MenuItem { icon, label: label.into(), action, enabled: true, shortcut: Some(shortcut.into()) };
+                let items = vec![
+                    mi(glyphs::PLAY, if self.resume_at(ctx).is_some() { "Resume" } else { "Play" }, Action::Activate, "Enter"),
+                    mi(glyphs::SKIP_BACK, "Play from the start", Action::ActivateAlt, "Shift+Enter"),
+                    mi(glyphs::FAVOURITE, if fav { "Remove from Favourites" } else { "Add to Favourites" }, Action::ToggleFavourite, "Ctrl+F"),
+                    mi(glyphs::FAV_LIST, "Favourites lists…", Action::AddToList, "Ctrl+Shift+F"),
+                    mi(glyphs::CHECK, if self.watched() { "Mark unwatched" } else { "Mark watched" }, Action::MarkWatched, "Ctrl+W"),
+                    mi(glyphs::TAG, "Rename…", Action::Rename, "F2"),
+                    mi(glyphs::LOCK, "Lock / unlock", Action::ToggleLock, "Ctrl+L"),
+                    mi(glyphs::HIDDEN, "Hide", Action::ToggleHidden, "Ctrl+H"),
+                ];
+                ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title, items }));
+            }
+            _ => kit::not_here(ctx),
+        }
+    }
+}
+
+/// End of a movie in the fullscreen player: leave the player for the movie's page (no-op push
+/// when the page is already under the player).
+fn return_to_page(ctx: &mut UiCtx<'_>, item: &ItemRef) {
+    // one pass over the in-memory list, once per finished movie
+    let Some(id) = ctx.lib.vod.movies.iter().find(|v| v.source_id == item.source && v.key == item.key).and_then(|v| match v.kind {
+        VodKind::Movie(id) => Some(id),
+        VodKind::Series(_) => None,
+    }) else {
+        return;
+    };
+    ctx.navigate(NavRequest::Back);
+    ctx.push(Route::MovieDetail(id));
+}
+
+impl MovieDetailScreen {
 
     fn press(&mut self, ctx: &mut UiCtx<'_>, b: Btn) {
         match b {
@@ -200,18 +256,19 @@ impl Screen for MovieDetailScreen {
     }
 
     fn on_event(&mut self, ctx: &mut UiCtx<'_>, ev: &AppEvent) {
-        let Some(id) = self.id else { return };
         match ev {
             AppEvent::Data(DataScope::VodDetails | DataScope::Progress | DataScope::Overrides | DataScope::Vod | DataScope::All) => self.reload(ctx),
-            AppEvent::Job(JobEvent::Finished { kind: JobKind::LoadMovieDetails(m), outcome: Err(msg), .. }) if *m == id => {
+            AppEvent::Job(JobEvent::Finished { kind: JobKind::LoadMovieDetails(m), outcome: Err(msg), .. }) if Some(*m) == self.id => {
                 ctx.toast(crate::msg::Toast::error(format!("Couldn't load the details: {}", crate::redact::redact(msg))));
             }
-            AppEvent::Player(PlayerEvent::Ended { item: Some(item), .. }) if Some(item) == self.item(ctx).as_ref() => {
-                self.reload(ctx);
-                // DESIGN §13.6: a finished movie returns from the player to its page
-                if self.started == Some(id) && ctx.video.placement() == Placement::Fullscreen {
-                    self.started = None;
-                    ctx.navigate(NavRequest::Back);
+            AppEvent::Player(PlayerEvent::Ended { item: Some(item), finished }) if item.kind == ItemKind::Movie => {
+                if Some(item) == self.item(ctx).as_ref() {
+                    self.reload(ctx);
+                }
+                // DESIGN §13.6: a finished movie returns from the fullscreen player to its page,
+                // wherever it was started (grid, Home, search, this page)
+                if *finished && ctx.video.placement() == Placement::Fullscreen {
+                    return_to_page(ctx, item);
                 }
             }
             _ => {}
@@ -255,28 +312,28 @@ impl Screen for MovieDetailScreen {
                 self.press(ctx, Btn::Favourite);
                 true
             }
-            Action::ToggleLock => {
-                if let Some(item) = self.item(ctx) {
-                    let locked = self.movie.as_ref().map(|m| m.locked).unwrap_or(false);
-                    kit::toggle_lock(ctx, &item, locked);
-                }
+            Action::AddToList | Action::Rename | Action::ToggleHidden | Action::ToggleLock | Action::ContextMenu => {
+                self.item_action(ctx, action);
                 true
             }
-            Action::TabPrev | Action::TabNext => true,
+            // this is the details page already
+            Action::ShowDetails | Action::TabPrev | Action::TabNext => true,
+            Action::MoveUp | Action::MoveDown | Action::SortMenu | Action::OpenInGuide | Action::AssignEpg | Action::Remove => {
+                kit::not_here(ctx);
+                true
+            }
             _ => false,
         }
     }
 
     fn on_overlay_result(&mut self, ctx: &mut UiCtx<'_>, result: OverlayResult) {
         match result {
-            OverlayResult::Unlocked(Action::Activate) => self.play(ctx, true),
-            OverlayResult::Unlocked(Action::ActivateAlt) => self.play(ctx, false),
-            OverlayResult::Unlocked(Action::ToggleLock) => {
-                if let Some(item) = self.item(ctx) {
-                    let locked = self.movie.as_ref().map(|m| m.locked).unwrap_or(false);
-                    kit::toggle_lock(ctx, &item, locked);
-                }
-            }
+            OverlayResult::Unlocked(Action::Activate) | OverlayResult::Chosen(Action::Activate) => self.play(ctx, true),
+            OverlayResult::Unlocked(Action::ActivateAlt) | OverlayResult::Chosen(Action::ActivateAlt) => self.play(ctx, false),
+            OverlayResult::Unlocked(Action::ToggleLock) => self.item_action(ctx, Action::ToggleLock),
+            OverlayResult::Chosen(Action::ToggleFavourite) => self.press(ctx, Btn::Favourite),
+            OverlayResult::Chosen(Action::MarkWatched) => self.toggle_watched(ctx),
+            OverlayResult::Chosen(a) if a != Action::ContextMenu => self.item_action(ctx, a),
             _ => {}
         }
     }
@@ -535,7 +592,17 @@ pub(crate) mod tests {
         let item = ItemRef { source: SourceId(1), kind: ItemKind::Movie, key: ItemKey("m3u:movie0000000000".into()) };
         h.state().t.services().bus.send(AppEvent::Player(PlayerEvent::Ended { item: Some(item), finished: true }));
         h.run_steps(1);
-        assert!(h.state_mut().nav().contains(&crate::ui::NavRequest::Back), "returns to the detail page");
+        // (leave the player; the page is already under it, so the push is a no-op for the app)
+        assert_eq!(h.state_mut().nav(), vec![crate::ui::NavRequest::Back, crate::ui::NavRequest::Push(Route::MovieDetail(ids[0]))], "returns to the detail page");
+        // a movie started anywhere else (grid, Home, search) also ends on its page
+        let other = ItemRef { source: SourceId(1), kind: ItemKind::Movie, key: ItemKey("m3u:movie0000000001".into()) };
+        h.state().t.services().bus.send(AppEvent::Player(PlayerEvent::Ended { item: Some(other.clone()), finished: true }));
+        h.run_steps(1);
+        assert_eq!(h.state_mut().nav(), vec![crate::ui::NavRequest::Back, crate::ui::NavRequest::Push(Route::MovieDetail(ids[1]))]);
+        // stopped before the end, or in the mini player: nothing moves
+        h.state().t.services().bus.send(AppEvent::Player(PlayerEvent::Ended { item: Some(other), finished: false }));
+        h.run_steps(1);
+        assert!(h.state_mut().nav().is_empty());
         // a vanished movie
         h.state_mut().enter(Route::MovieDetail(MovieId(999)));
         until(&mut h, "the missing state", |h| has_label(h, "This movie is no longer in your playlists"));

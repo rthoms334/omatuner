@@ -6,11 +6,20 @@
 //!   reordered / hidden per overrides; locked ones show 󰌾 and need the PIN). Moving the
 //!   cursor opens the category (locked ones only on Enter + PIN). Key context `[List]` /
 //!   `[ListFiltering]` (typing filters the categories).
+//!   Category shortcuts: Ctrl+L lock (PIN), F2 rename, Ctrl+H hide, Alt+↑/↓ reorder within
+//!   its playlist, Shift+F10 menu.
 //! * Grid: `[PosterGrid]` / `[PosterGridFiltering]` — typing filters the posters (launcher
 //!   idiom), Enter opens details, Shift+Enter plays/resumes fullscreen, Ctrl+S opens the sort
 //!   menu (the choice is saved as `interface.movie_sort` / `series_sort`), ← on the first
-//!   column / Backspace returns to the categories, Tab switches panes.
-//! * Compact: one pane at a time (categories → grid).
+//!   column / Backspace returns to the categories, Tab switches panes. Item shortcuts: Ctrl+F
+//!   / Ctrl+Shift+F favourites, Ctrl+W watched, Ctrl+L lock, Ctrl+H hide, F2 rename, Ctrl+I
+//!   details, Delete removes from Favourites / Continue watching, Alt+↑/↓ switches a sorted
+//!   grid to Custom order (DESIGN §13.0).
+//! * Only the focused pane shows the cursor; the other shows its current row "selected".
+//! * Wide: categories | grid. Medium (a tiled half): the categories are a drawer (← on the
+//!   first column, Backspace, or the header button) so the grid keeps 4–5 columns; Esc
+//!   closes the drawer. Compact: one pane at a time (categories → grid; Esc in the grid goes
+//!   back to the categories).
 //! * Progress bars and Continue watching come from one background read of the unfinished
 //!   progress rows, refreshed on `DataScope::Progress`.
 
@@ -24,7 +33,7 @@ use crate::model::{GroupId, ItemKey, ItemKind, SortMode, SourceId, Timestamp, Vo
 use crate::msg::{AppEvent, DataScope};
 use crate::theme::{SpaceToken, TypeToken};
 use crate::ui::overlays::{ContextMenuSpec, MenuItem, OverlayResult};
-use crate::ui::widgets::button::{ButtonStyle, button};
+use crate::ui::widgets::button::{ButtonStyle, button, icon_button};
 use crate::ui::widgets::list::{ListOutcome, ListState, virtual_list};
 use crate::ui::widgets::poster::{self, GridState, TileDecor};
 use crate::ui::widgets::text_field::search_header;
@@ -80,6 +89,8 @@ const SORTS: [(SortMode, &str); 6] = [
 /// Grid context-menu choices (Digit codes above the sort codes).
 const MENU_OPEN: u8 = 20;
 const MENU_PLAY: u8 = 21;
+/// Category context-menu "Open".
+const MENU_OPEN_CAT: u8 = 22;
 
 fn sort_label(s: SortMode) -> &'static str { SORTS.iter().find(|(m, _)| *m == s).map(|(_, l)| *l).unwrap_or("Custom order") }
 
@@ -146,10 +157,12 @@ pub(super) struct VodBrowser {
     items_key: Option<(Cat, SortMode, Timestamp)>,
     progress: ProgressInfo,
     progress_loader: Option<Loader<ProgressInfo>>,
+    /// Watch progress by index into the kind's list (rebuilt with `progress` / `index`).
+    progress_idx: HashMap<u32, f32>,
     /// (source, key) → index, per library build.
     index: HashMap<(SourceId, ItemKey), u32>,
     index_built: Timestamp,
-    /// A locked category waiting for the PIN.
+    /// A locked category waiting for the PIN (cleared by any other open / item action).
     pending_cat: Option<Cat>,
     playing: kit::PlayingVod,
 }
@@ -184,10 +197,13 @@ impl VodBrowser {
 
     fn all<'l>(&self, ctx: &'l UiCtx<'_>) -> &'l [VodSummary] { if self.movies { &ctx.lib.vod.movies } else { &ctx.lib.vod.series } }
 
+    /// All categories of the kind (hidden ones included).
+    fn all_groups<'l>(&self, ctx: &'l UiCtx<'_>) -> &'l [crate::model::Group] { if self.movies { &ctx.lib.vod.movie_groups } else { &ctx.lib.vod.series_groups } }
+
+    /// The categories shown in the pane.
     fn groups<'l>(&self, ctx: &'l UiCtx<'_>) -> Vec<&'l crate::model::Group> {
-        let gs = if self.movies { &ctx.lib.vod.movie_groups } else { &ctx.lib.vod.series_groups };
         let hide_empty = ctx.config.interface.hide_empty_groups;
-        gs.iter().filter(|g| !g.hidden && !(hide_empty && g.item_count == 0)).collect()
+        self.all_groups(ctx).iter().filter(|g| !g.hidden && !(hide_empty && g.item_count == 0)).collect()
     }
 
     fn sort(&self, ctx: &UiCtx<'_>) -> SortMode { if self.movies { ctx.config.interface.movie_sort } else { ctx.config.interface.series_sort } }
@@ -226,11 +242,17 @@ impl VodBrowser {
         self.cats.set_len(self.cat_rows.len());
     }
 
+    /// Progress by list index (posters look it up per visible card, without cloning keys).
+    fn rebuild_progress_idx(&mut self) {
+        self.progress_idx = self.progress.fraction.iter().filter_map(|(k, f)| self.index.get(k).map(|i| (*i, *f))).collect();
+    }
+
     /// Recompute the open category's items when its inputs changed.
     fn refresh_items(&mut self, ctx: &UiCtx<'_>) {
         if self.index_built != ctx.lib.built_at {
             self.index_built = ctx.lib.built_at;
             self.index = self.all(ctx).iter().enumerate().map(|(i, v)| ((v.source_id, v.key.clone()), i as u32)).collect();
+            self.rebuild_progress_idx();
             self.items_key = None;
         }
         let key = (self.open, self.sort(ctx), ctx.lib.built_at);
@@ -264,6 +286,7 @@ impl VodBrowser {
     }
 
     fn open_cat(&mut self, ctx: &mut UiCtx<'_>, c: Cat, focus_grid: bool) {
+        self.pending_cat = None;
         if self.cat_locked(ctx, c) {
             self.pending_cat = Some(c);
             kit::ask_pin(ctx, Action::Activate, "This category is locked");
@@ -286,7 +309,16 @@ impl VodBrowser {
         self.shown.get(self.grid.cursor).and_then(|i| self.all(ctx).get(*i as usize)).cloned()
     }
 
+    /// The provider category under the categories cursor (virtual ones have none).
+    fn current_group<'l>(&self, ctx: &'l UiCtx<'_>) -> Option<&'l crate::model::Group> {
+        match self.cat_rows.get(self.cats.cursor) {
+            Some(Cat::Group(g)) => self.all_groups(ctx).iter().find(|x| x.id == *g),
+            _ => None,
+        }
+    }
+
     fn open_item(&mut self, ctx: &mut UiCtx<'_>, v: &VodSummary, play: bool) {
+        self.pending_cat = None;
         if v.locked && !kit::unlocked(ctx) {
             kit::ask_pin(ctx, if play { Action::ActivateAlt } else { Action::Activate }, "This title is locked");
             return;
@@ -311,34 +343,163 @@ impl VodBrowser {
 
     fn item_menu(&self, ctx: &mut UiCtx<'_>, v: &VodSummary) {
         let fav = ctx.favs.is_fav(&super::home::vod_ref(v));
-        let items = vec![
-            MenuItem { icon: glyphs::INFO, label: "Details".into(), action: Action::Digit(MENU_OPEN), enabled: true, shortcut: Some("Enter".into()) },
-            MenuItem { icon: glyphs::PLAY, label: "Play".into(), action: Action::Digit(MENU_PLAY), enabled: true, shortcut: Some("Shift+Enter".into()) },
-            MenuItem {
-                icon: glyphs::FAVOURITE,
-                label: if fav { "Remove from Favourites".into() } else { "Add to Favourites".into() },
-                action: Action::ToggleFavourite,
-                enabled: true,
-                shortcut: Some("Ctrl+F".into()),
-            },
-            MenuItem { icon: glyphs::FAV_LIST, label: "Favourites lists…".into(), action: Action::AddToList, enabled: true, shortcut: Some("Ctrl+Shift+F".into()) },
-            MenuItem { icon: glyphs::LOCK, label: "Lock / unlock".into(), action: Action::ToggleLock, enabled: true, shortcut: Some("Ctrl+L".into()) },
-            MenuItem { icon: glyphs::SORT, label: "Sort & view options…".into(), action: Action::SortMenu, enabled: true, shortcut: Some("Ctrl+S".into()) },
+        let mi = |icon: &'static str, label: &str, action: Action, shortcut: &str| MenuItem { icon, label: label.into(), action, enabled: true, shortcut: Some(shortcut.into()) };
+        let mut items = vec![
+            mi(glyphs::INFO, "Details", Action::Digit(MENU_OPEN), "Enter"),
+            mi(glyphs::PLAY, "Play", Action::Digit(MENU_PLAY), "Shift+Enter"),
+            mi(glyphs::FAVOURITE, if fav { "Remove from Favourites" } else { "Add to Favourites" }, Action::ToggleFavourite, "Ctrl+F"),
+            mi(glyphs::FAV_LIST, "Favourites lists…", Action::AddToList, "Ctrl+Shift+F"),
         ];
+        if matches!(v.kind, VodKind::Movie(_)) {
+            items.push(mi(glyphs::CHECK, "Mark watched", Action::MarkWatched, "Ctrl+W"));
+        }
+        match self.open {
+            Cat::Favourites => items.push(mi(glyphs::CLOSE, "Remove from Favourites", Action::Remove, "Delete")),
+            Cat::Continue => items.push(mi(glyphs::CLOSE, "Remove from Continue watching", Action::Remove, "Delete")),
+            _ => {}
+        }
+        items.extend([
+            mi(glyphs::TAG, "Rename…", Action::Rename, "F2"),
+            mi(glyphs::LOCK, "Lock / unlock", Action::ToggleLock, "Ctrl+L"),
+            mi(glyphs::HIDDEN, "Hide", Action::ToggleHidden, "Ctrl+H"),
+            mi(glyphs::SORT, "Sort & view options…", Action::SortMenu, "Ctrl+S"),
+        ]);
         ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: v.name.to_string(), items }));
     }
 
     /// Item actions shared by the grid keys and the context menu.
     fn item_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
-        let Some(v) = self.current(ctx) else { return matches!(action, Action::ToggleFavourite | Action::AddToList | Action::ToggleLock) };
+        self.pending_cat = None;
+        let item_actions = [
+            Action::ToggleFavourite,
+            Action::AddToList,
+            Action::ToggleLock,
+            Action::ToggleHidden,
+            Action::Rename,
+            Action::ShowDetails,
+            Action::MarkWatched,
+            Action::Remove,
+            Action::MoveUp,
+            Action::MoveDown,
+            Action::OpenInGuide,
+            Action::AssignEpg,
+        ];
+        if !item_actions.contains(&action) {
+            return false;
+        }
+        if matches!(action, Action::MoveUp | Action::MoveDown) {
+            self.reorder_hint(ctx);
+            return true;
+        }
+        let Some(v) = self.current(ctx) else { return true };
         let item = super::home::vod_ref(&v);
         match action {
             Action::ToggleFavourite => kit::toggle_favourite(ctx, &item),
-            Action::AddToList => ctx.open(OverlayRequest::ListPicker(crate::ui::overlays::ListPickerSpec { item, title: v.name.to_string() })),
-            Action::ToggleLock => kit::toggle_lock(ctx, &item, v.locked),
-            _ => return false,
+            Action::AddToList => kit::list_picker(ctx, &item, &v.name),
+            Action::ToggleLock => {
+                let groups = self.all_groups(ctx);
+                let by_group = kit::any_group_locked(groups, &v.group_ids);
+                kit::toggle_lock(ctx, &item, v.locked, by_group);
+            }
+            Action::ToggleHidden => kit::hide_item(ctx, &item, &v.name),
+            Action::Rename => kit::rename_item(ctx, &item, &v.name),
+            Action::ShowDetails => self.open_item(ctx, &v, false),
+            Action::MarkWatched => match v.kind {
+                VodKind::Movie(_) => kit::mark_watched(ctx, &item, &v.name, true),
+                VodKind::Series(_) => ctx.toast(crate::msg::Toast::info("Open the series to mark its episodes watched")),
+            },
+            Action::Remove => match self.open {
+                Cat::Favourites => kit::toggle_favourite(ctx, &item),
+                Cat::Continue => self.forget_progress(ctx, &v),
+                _ => kit::not_here(ctx),
+            },
+            _ => kit::not_here(ctx),
         }
         true
+    }
+
+    /// Delete in "Continue watching": forget the progress (for a series, of its episodes).
+    fn forget_progress(&mut self, ctx: &mut UiCtx<'_>, v: &VodSummary) {
+        match v.kind {
+            VodKind::Movie(_) => kit::mark_watched(ctx, &super::home::vod_ref(v), &v.name, false),
+            VodKind::Series(id) => {
+                let now = ctx.now;
+                let _ = ctx.services.store.writer().submit_notify(DataScope::Progress, move |c| {
+                    let items: Vec<(crate::model::ItemRef, String)> = crate::store::vod::episodes(c, id, None)?
+                        .into_iter()
+                        .map(|e| (crate::model::ItemRef { source: e.source_id, kind: ItemKind::Episode, key: e.key }, e.title))
+                        .collect();
+                    crate::store::user::mark_watched(c, &items, false, now)
+                });
+                ctx.toast(crate::msg::Toast::info("Removed from Continue watching"));
+            }
+        }
+    }
+
+    /// Alt+↑/↓ on a poster (DESIGN §13.0): a sorted grid switches to Custom order first.
+    fn reorder_hint(&mut self, ctx: &mut UiCtx<'_>) {
+        if self.sort(ctx) != SortMode::Provider {
+            let movies = self.movies;
+            ctx.edit_config(move |c| if movies { c.interface.movie_sort = SortMode::Provider } else { c.interface.series_sort = SortMode::Provider });
+            self.items_key = None;
+            ctx.toast(crate::msg::Toast::info("Switched to custom order"));
+        } else {
+            ctx.toast(crate::msg::Toast::info("Titles keep the provider's order; reorder their categories instead"));
+        }
+    }
+
+    /// Category shortcuts (lock, rename, hide, reorder, context menu) in the categories pane.
+    fn category_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
+        if !matches!(action, Action::ToggleLock | Action::Rename | Action::ToggleHidden | Action::MoveUp | Action::MoveDown | Action::ContextMenu) {
+            return false;
+        }
+        self.pending_cat = None;
+        let Some(g) = self.current_group(ctx).cloned() else {
+            ctx.toast(crate::msg::Toast::info("Built-in categories can't be changed"));
+            return true;
+        };
+        match action {
+            Action::ToggleLock => kit::toggle_group_lock(ctx, &g),
+            Action::Rename => kit::rename_group(ctx, &g),
+            Action::ToggleHidden => kit::hide_group(ctx, &g),
+            Action::MoveUp | Action::MoveDown => {
+                let delta = if action == Action::MoveUp { -1 } else { 1 };
+                let visible = self.groups(ctx);
+                if kit::reorder_group(&*ctx, &visible, g.id, delta) {
+                    // the cursor follows the category (the library rebuild reorders the rows)
+                    let next = (self.cats.cursor as isize + delta).max(0) as usize;
+                    self.cats.select(next);
+                }
+            }
+            _ => {
+                let mi = |icon: &'static str, label: &str, action: Action, shortcut: &str| MenuItem { icon, label: label.into(), action, enabled: true, shortcut: Some(shortcut.into()) };
+                let items = vec![
+                    mi(glyphs::CHEVRON_RIGHT, "Open", Action::Digit(MENU_OPEN_CAT), "Enter"),
+                    mi(glyphs::TAG, "Rename…", Action::Rename, "F2"),
+                    mi(if g.locked { glyphs::UNLOCK } else { glyphs::LOCK }, if g.locked { "Unlock" } else { "Lock with PIN" }, Action::ToggleLock, "Ctrl+L"),
+                    mi(glyphs::HIDDEN, "Hide", Action::ToggleHidden, "Ctrl+H"),
+                    mi(glyphs::REORDER, "Move up", Action::MoveUp, "Alt+↑"),
+                    mi(glyphs::REORDER, "Move down", Action::MoveDown, "Alt+↓"),
+                ];
+                ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: g.display_name().to_owned(), items }));
+            }
+        }
+        true
+    }
+
+    /// Esc: the drawer / pane steps back before the screen is left (Medium, Compact).
+    fn back(&mut self, ctx: &UiCtx<'_>) -> bool {
+        match (ctx.layout, self.pane) {
+            (LayoutClass::Medium, Pane::Categories) => {
+                self.pane = Pane::Grid;
+                true
+            }
+            (LayoutClass::Compact, Pane::Grid) => {
+                self.pane = Pane::Categories;
+                true
+            }
+            _ => false,
+        }
     }
 
     pub(super) fn action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
@@ -349,6 +510,9 @@ impl VodBrowser {
         if matches!(action, Action::FocusNext | Action::FocusPrev) {
             self.pane = if self.pane == Pane::Grid { Pane::Categories } else { Pane::Grid };
             return true;
+        }
+        if action == Action::Back {
+            return self.back(ctx);
         }
         match self.pane {
             Pane::Categories => match self.cats.handle(action) {
@@ -370,8 +534,18 @@ impl VodBrowser {
                     }
                     true
                 }
-                ListOutcome::Parent | ListOutcome::ContextMenu(_) => true,
-                ListOutcome::None => matches!(action, Action::Up | Action::Down | Action::PageUp | Action::PageDown | Action::Home | Action::End | Action::FilterInput(_)),
+                ListOutcome::ContextMenu(_) => self.category_action(ctx, Action::ContextMenu),
+                ListOutcome::Parent => true,
+                ListOutcome::None => {
+                    matches!(action, Action::Up | Action::Down | Action::PageUp | Action::PageDown | Action::Home | Action::End | Action::FilterInput(_)) || self.category_action(ctx, action) || {
+                        // the other item shortcuts mean nothing for a category
+                        let item_shortcut = matches!(action, Action::ToggleFavourite | Action::AddToList | Action::ShowDetails | Action::MarkWatched | Action::Remove | Action::OpenInGuide | Action::AssignEpg);
+                        if item_shortcut {
+                            kit::not_here(ctx);
+                        }
+                        item_shortcut
+                    }
+                }
             },
             Pane::Grid => match self.grid.handle(action) {
                 ListOutcome::Moved => true,
@@ -397,15 +571,6 @@ impl VodBrowser {
                 }
                 ListOutcome::None => match action {
                     Action::Up | Action::Down | Action::Left | Action::Right | Action::PageUp | Action::PageDown | Action::Home | Action::End | Action::FilterInput(_) => true,
-                    Action::MarkWatched => {
-                        if let Some(v) = self.current(ctx).filter(|v| matches!(v.kind, VodKind::Movie(_))) {
-                            let item = super::home::vod_ref(&v);
-                            let (now, title) = (ctx.now, v.name.to_string());
-                            let _ = ctx.services.store.writer().submit_notify(DataScope::Progress, move |c| crate::store::user::mark_watched(c, &[(item, title)], true, now));
-                            ctx.toast(crate::msg::Toast::info("Marked as watched"));
-                        }
-                        true
-                    }
                     a => self.item_action(ctx, a),
                 },
             },
@@ -426,21 +591,37 @@ impl VodBrowser {
                     self.open_item(ctx, &v, play);
                 }
             }
+            OverlayResult::Chosen(Action::Digit(MENU_OPEN_CAT)) => {
+                if let Some(c) = self.cat_rows.get(self.cats.cursor).copied() {
+                    self.open_cat(ctx, c, true);
+                }
+            }
             OverlayResult::Chosen(Action::SortMenu) => self.sort_menu(ctx),
             OverlayResult::Chosen(a) => {
-                self.item_action(ctx, a);
+                if self.pane == Pane::Categories {
+                    self.category_action(ctx, a);
+                } else {
+                    self.item_action(ctx, a);
+                }
             }
             OverlayResult::Unlocked(a) => {
-                if let Some(c) = self.pending_cat.take() {
-                    self.open_cat(ctx, c, true);
-                } else if let Some(v) = self.current(ctx) {
-                    match a {
-                        Action::Activate => self.open_item(ctx, &v, false),
-                        Action::ActivateAlt => self.open_item(ctx, &v, true),
-                        Action::ToggleLock => {
-                            self.item_action(ctx, Action::ToggleLock);
+                // a category asked with `Activate`; anything else retries what the pane asked for
+                match self.pending_cat.take() {
+                    Some(c) if a == Action::Activate => self.open_cat(ctx, c, true),
+                    _ if self.pane == Pane::Categories && a == Action::ToggleLock => {
+                        self.category_action(ctx, a);
+                    }
+                    _ => {
+                        if let Some(v) = self.current(ctx) {
+                            match a {
+                                Action::Activate => self.open_item(ctx, &v, false),
+                                Action::ActivateAlt => self.open_item(ctx, &v, true),
+                                Action::ToggleLock => {
+                                    self.item_action(ctx, Action::ToggleLock);
+                                }
+                                _ => {}
+                            }
                         }
-                        _ => {}
                     }
                 }
             }
@@ -452,6 +633,7 @@ impl VodBrowser {
         match kit::poll(&mut self.progress_loader) {
             Some(Ok(p)) => {
                 self.progress = p;
+                self.rebuild_progress_idx();
                 if self.open == Cat::Continue {
                     self.items_key = None;
                 }
@@ -461,8 +643,7 @@ impl VodBrowser {
         }
         let theme = ctx.theme;
         // no titles and no categories: nothing imported (hidden titles keep their categories)
-        let groups = if self.movies { &ctx.lib.vod.movie_groups } else { &ctx.lib.vod.series_groups };
-        if ctx.lib.built_at != 0 && self.all(ctx).is_empty() && groups.iter().all(|g| g.item_count == 0) {
+        if ctx.lib.built_at != 0 && self.all(ctx).is_empty() && self.all_groups(ctx).iter().all(|g| g.item_count == 0) {
             let title = format!("Your playlists have no {}", self.kind_label());
             empty_state::empty_state(ui, theme, if self.movies { glyphs::MOVIES } else { glyphs::SERIES }, &title, Some("Xtream logins usually include movies and series; M3U playlists rarely do."), None);
             return;
@@ -476,21 +657,26 @@ impl VodBrowser {
             self.items_key = None;
             self.refresh_items(ctx);
         }
-        let compact = ctx.layout == LayoutClass::Compact;
+        // Wide: categories | grid. Medium: the categories are a drawer over the left edge (the
+        // grid gets the width: 4–5 columns at a tiled half). Compact: one pane at a time.
+        let layout = ctx.layout;
         let rem = theme.rem();
-        let cats_w = if compact { ui.available_width() } else { (if ctx.layout == LayoutClass::Wide { 240.0 } else { 200.0 } * rem).round() };
         let full = ui.available_rect_before_wrap();
-        let show_cats = !compact || self.pane == Pane::Categories;
-        let show_grid = !compact || self.pane == Pane::Grid;
+        let (show_cats, show_grid) = match layout {
+            LayoutClass::Wide => (true, true),
+            LayoutClass::Medium => (self.pane == Pane::Categories, true),
+            LayoutClass::Compact => (self.pane == Pane::Categories, self.pane == Pane::Grid),
+        };
+        let cats_w = if layout == LayoutClass::Compact { full.width() } else { (if layout == LayoutClass::Wide { 240.0 } else { 200.0 } * rem).round().min(full.width()) };
         let gap = theme.space(SpaceToken::PanelPadding);
         let mut cats_rect = full;
-        cats_rect.set_width(cats_w.min(full.width()));
-        let grid_rect = if compact { full } else { egui::Rect::from_min_max(egui::pos2(cats_rect.right() + gap, full.top()), full.max) };
+        cats_rect.set_width(cats_w);
+        let grid_rect = if show_cats && layout != LayoutClass::Compact { egui::Rect::from_min_max(egui::pos2(cats_rect.right() + gap, full.top()), full.max) } else { full };
 
         if show_cats {
             let mut child = ui.new_child(egui::UiBuilder::new().id_salt(("vod-cats", self.movies)).max_rect(cats_rect).layout(egui::Layout::top_down(egui::Align::Min)));
             self.cats_pane(&mut child, ctx);
-            if !compact {
+            if layout != LayoutClass::Compact {
                 crate::ui::widgets::section::pane_divider(ui.painter(), cats_rect.right() + gap / 2.0, full.y_range(), theme);
             }
         }
@@ -513,7 +699,7 @@ impl VodBrowser {
             empty_state::empty_state(ui, theme, glyphs::SEARCH, &format!("No matches for “{q}”"), None, None);
             return;
         }
-        let row_h = rows::row_height(theme, crate::config::Density::Comfortable, false);
+        let row_h = rows::row_height(theme, ctx.config.interface.density, false);
         let focused = self.pane == Pane::Categories;
         let open = self.open;
         let rows_snapshot = self.cat_rows.clone();
@@ -573,6 +759,10 @@ impl VodBrowser {
                     self.open_cat(ctx, c, true);
                 }
             }
+            ListOutcome::ContextMenu(_) => {
+                self.pane = Pane::Categories;
+                self.category_action(ctx, Action::ContextMenu);
+            }
             _ => {}
         }
     }
@@ -581,23 +771,32 @@ impl VodBrowser {
         let theme = ctx.theme;
         let name = self.cat_name(ctx, self.open);
         let sort = self.sort(ctx);
+        let drawer = ctx.layout == LayoutClass::Medium;
         let mut sort_clicked = false;
+        let mut drawer_clicked = false;
+        let mut header_clicked = false;
+        // the sort button is laid out first (right to left) so the header gets what is left
         ui.horizontal(|ui| {
-            let w = ui.available_width();
-            let sort_w = (230.0 * theme.rem()).min(w * 0.45);
-            ui.allocate_ui(egui::vec2(w - sort_w, ui.available_height()), |ui| {
-                let h = search_header(ui, theme, self.grid.filter.query(), &format!("{name} (type to filter)"), None);
-                if h.clicked() {
-                    self.pane = Pane::Grid;
-                }
-            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let label = format!("Sort: {} ▾ (Ctrl+S)", sort_label(sort));
-                sort_clicked = button(ui, theme, Some(glyphs::SORT), &label, ButtonStyle::default()).clicked();
+                let label = format!("Sort: {} ▾", sort_label(sort));
+                let style = ButtonStyle::default();
+                sort_clicked = if ui.available_width() < 520.0 * theme.rem() { icon_button(ui, theme, glyphs::SORT, &label, style) } else { button(ui, theme, Some(glyphs::SORT), &label, style) }.clicked();
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    if drawer {
+                        // Medium: the categories drawer (also ← on the first column / Backspace)
+                        drawer_clicked = icon_button(ui, theme, glyphs::FILMSTRIP, "Categories", ButtonStyle { selected: self.pane == Pane::Categories, ..Default::default() }).clicked();
+                    }
+                    header_clicked = search_header(ui, theme, self.grid.filter.query(), &format!("{name} — type to filter"), None).clicked();
+                });
             });
         });
         if sort_clicked {
             self.sort_menu(ctx);
+        }
+        if drawer_clicked {
+            self.pane = if self.pane == Pane::Categories { Pane::Grid } else { Pane::Categories };
+        } else if header_clicked {
+            self.pane = Pane::Grid;
         }
         ui.add_space(theme.space(SpaceToken::Md));
         if self.cat_locked(ctx, self.open) {
@@ -632,13 +831,15 @@ impl VodBrowser {
             return;
         }
         let playing = self.playing.get(ctx);
-        let progress = &self.progress.fraction;
+        let progress = &self.progress_idx;
         let movies = self.movies;
         let all: &[VodSummary] = if movies { &ctx.lib.vod.movies } else { &ctx.lib.vod.series };
-        let outcome = poster::poster_grid_with(ui, theme, ctx.images, &mut self.grid, all, &self.shown, |v| TileDecor {
-            progress: progress.get(&(v.source_id, v.key.clone())).copied(),
+        // only the focused pane shows the cursor (DESIGN §13.0); the other shows "selected"
+        let focused = self.pane == Pane::Grid;
+        let outcome = poster::poster_grid_with(ui, theme, ctx.images, &mut self.grid, all, &self.shown, focused, |i, v| TileDecor {
+            progress: progress.get(&i).copied(),
             playing: playing == Some(v.kind),
-            watched: false,
+            ..Default::default()
         });
         match outcome {
             ListOutcome::Moved => self.pane = Pane::Grid,
@@ -649,6 +850,7 @@ impl VodBrowser {
                 }
             }
             ListOutcome::ContextMenu(_) => {
+                self.pane = Pane::Grid;
                 if let Some(v) = self.current(ctx) {
                     self.item_menu(ctx, &v);
                 }
@@ -681,7 +883,7 @@ mod tests {
     use super::*;
     use crate::ui::NavRequest;
     use egui_kittest::kittest::Queryable;
-    use crate::ui::screens::home::testkit::{self, harness, has_label, rig, seed};
+    use crate::ui::screens::home::testkit::{self, harness, has_label, rig, seed, until};
 
     #[test]
     fn grid_navigation_type_to_filter_sort_menu_and_categories() {
@@ -695,7 +897,7 @@ mod tests {
         h.run_steps(2);
         assert_eq!(h.state().s.key_contexts(), vec![KeyContext::PosterGrid]);
         assert!(has_label(&h, "Movie 29"), "recently added first");
-        assert!(has_label(&h, "Sort: Recently added ▾ (Ctrl+S)"));
+        assert!(has_label(&h, "Sort: Recently added ▾"));
         let cols = h.state().s.browser.grid.columns;
         assert!((6..=9).contains(&cols), "wide grid columns: {cols}");
         // ↓ moves a row, → one card; Enter opens the page
@@ -768,6 +970,186 @@ mod tests {
         app.t.set_library(crate::store::library::Library { built_at: 1, ..Default::default() });
         h.run_steps(2);
         assert!(has_label(&h, "Your playlists have no series"));
+    }
+
+    /// Seed: 6 movies in "Movies" plus a second category "Drama" (movies 0 and 1).
+    fn two_categories(t: &mut crate::ui::testing::TestUi) -> SourceId {
+        seed(t, |c| {
+            let s = testkit::source(c, "My IPTV")?;
+            let ids = testkit::movies(c, s, 6)?;
+            c.execute("INSERT INTO grp(source_id, kind, key, name, provider_order, item_count, seen_gen) VALUES (?1,'movie','movie:drama','Drama',1,2,1)", [s])?;
+            let g = c.last_insert_rowid();
+            for (i, id) in ids[..2].iter().enumerate() {
+                c.execute("INSERT INTO movie_group(group_id, movie_id, position) VALUES (?1, ?2, ?3)", rusqlite::params![g, id.0, i as i64])?;
+            }
+            Ok(s)
+        })
+    }
+
+    fn group_ov(t: &crate::ui::testing::TestUi, key: &str) -> Option<crate::model::GroupOverride> {
+        crate::store::user::group_overrides(&t.services().store.reader().unwrap()).unwrap().into_iter().find(|r| r.key.0 == key).map(|r| r.ov)
+    }
+
+    fn with_pin(t: &mut crate::ui::testing::TestUi) {
+        let mut cfg = (*t.config).clone();
+        cfg.parental = crate::config::ParentalConfig { enabled: true, pin_salt: Some("s".into()), pin_hash: Some(crate::ui::parental::hash_pin("1234", "s")), relock_min: 0 };
+        t.config = std::sync::Arc::new(cfg);
+    }
+
+    /// The category shortcuts listed in Help (lock, rename, hide, reorder, menu), and the
+    /// grid's Alt+↑/↓ switching a sorted grid to Custom order (DESIGN §13.0).
+    #[test]
+    fn category_and_grid_shortcuts() {
+        let (mut t, one) = rig();
+        two_categories(&mut t);
+        with_pin(&mut t);
+        let p = t.config.parental.clone();
+        assert!(t.parental.unlock("1234", &p));
+        let mut h = harness(t, one, MoviesScreen::default(), egui::vec2(1400.0, 900.0));
+        h.state_mut().enter(Route::Movies { group: None });
+        h.run_steps(2);
+        // Tab to the categories; ↓↓↓ to "Movies" (after All, Continue watching, Favourites)
+        h.state_mut().act(Action::FocusNext);
+        for _ in 0..3 {
+            h.state_mut().act(Action::Down);
+        }
+        h.state_mut().act(Action::ToggleLock);
+        until(&mut h, "the category lock", |h| group_ov(&h.state().t, "movie:movies").is_some_and(|o| o.locked));
+        h.state_mut().act(Action::MoveDown);
+        until(&mut h, "the category order", |h| {
+            let t = &h.state().t;
+            group_ov(t, "movie:movies").and_then(|o| o.user_order) == Some(1) && group_ov(t, "movie:drama").and_then(|o| o.user_order) == Some(0)
+        });
+        assert!(group_ov(&h.state().t, "movie:movies").is_some_and(|o| o.locked), "reordering keeps the lock");
+        h.state_mut().act(Action::Rename);
+        let nav = h.state_mut().nav();
+        assert!(matches!(nav.as_slice(), [NavRequest::Open(OverlayRequest::Rename(r))] if matches!(r.target, crate::ui::overlays::RenameTarget::Group { .. })), "{nav:?}");
+        h.state_mut().act(Action::ContextMenu);
+        let nav = h.state_mut().nav();
+        assert!(matches!(nav.as_slice(), [NavRequest::Open(OverlayRequest::ContextMenu(m))] if m.items.iter().any(|i| i.action == Action::ToggleHidden)), "{nav:?}");
+        // a built-in category can't be locked
+        h.state_mut().act(Action::Home);
+        h.state_mut().act(Action::ToggleLock);
+        assert!(h.state_mut().nav().is_empty());
+        assert!(h.state().t.toasts.iter().any(|t| t.text.contains("Built-in categories")), "{:?}", h.state().t.toasts);
+        // the grid: Alt+↓ on a sorted grid switches to Custom order (with a toast)
+        h.state_mut().act(Action::FocusNext);
+        h.state_mut().act(Action::MoveDown);
+        h.state_mut().apply_config();
+        assert_eq!(h.state().t.config.interface.movie_sort, SortMode::Provider);
+        assert!(h.state().t.toasts.iter().any(|t| t.text == "Switched to custom order"));
+        // Ctrl+I opens the page of the title under the cursor; Ctrl+H hides it
+        h.run_steps(1);
+        h.state_mut().act(Action::ShowDetails);
+        assert!(matches!(h.state_mut().nav().as_slice(), [NavRequest::Push(Route::MovieDetail(_))]));
+        h.state_mut().act(Action::ToggleHidden);
+        until(&mut h, "a hidden title", |h| {
+            crate::store::user::item_overrides(&h.state().t.services().store.reader().unwrap(), None).unwrap().iter().any(|r| r.item.kind == ItemKind::Movie && r.ov.hidden)
+        });
+    }
+
+    /// DESIGN §12.1 density: 4–5 columns at a tiled half (the categories in a drawer), 7+ at
+    /// full screen; the sort button never covers the filter header; only the focused pane
+    /// shows the poster cursor.
+    #[test]
+    fn grid_density_header_layout_and_one_cursor() {
+        let (mut t, one) = rig();
+        seed(&mut t, |c| {
+            let s = testkit::source(c, "My IPTV")?;
+            testkit::movies(c, s, 40)
+        });
+        // content width = window − sidebar − 2 × panel padding (the harness has no chrome)
+        let mut h = harness(t, one, MoviesScreen::default(), egui::vec2(706.0, 900.0));
+        for (window, content, scale, cols) in [(790.0, 706.0, 1.0, 4..=5), (1600.0, 1380.0, 1.0, 7..=9), (1600.0, 1380.0, 4.0 / 3.0, 4..=6)] {
+            let base = crate::theme::Theme::fallback();
+            let theme = crate::theme::Theme::from_parts(base.name.clone(), base.palette.clone(), base.shell.clone(), 0.0, scale);
+            h.set_size(egui::vec2(content, 900.0));
+            let app = h.state_mut();
+            app.t.layout = LayoutClass::from_width(window, theme.rem());
+            app.t.theme = theme;
+            app.s = MoviesScreen::default();
+            app.enter(Route::Movies { group: None });
+            h.run_steps(3);
+            let n = h.state().s.browser.grid.columns;
+            assert!(cols.contains(&n), "{window} pt × {scale}: {n} columns");
+            let header = h.query_all_by_label_contains("type to filter").next().expect("the filter header").rect();
+            let sort = h.query_all_by_label_contains("Sort: ").next().expect("the sort button").rect();
+            assert!(!header.intersects(sort.shrink(1.0)), "{window} pt × {scale}: header {header:?} under the sort button {sort:?}");
+            assert!(sort.right() <= content + 1.0);
+        }
+        // one cursor: with the categories focused the poster cursor (2 px accent) is gone
+        let accent_outlines = |h: &egui_kittest::Harness<'static, testkit::App<MoviesScreen>>| {
+            let accent = h.state().t.theme.tokens.accent;
+            fn walk(s: &egui::Shape, accent: egui::Color32, n: &mut usize) {
+                match s {
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, accent, n)),
+                    egui::Shape::Rect(r) if r.stroke.width == 2.0 && r.stroke.color == accent => *n += 1,
+                    _ => {}
+                }
+            }
+            let mut n = 0;
+            h.output().shapes.iter().for_each(|c| walk(&c.shape, accent, &mut n));
+            n
+        };
+        h.run_steps(1);
+        assert_eq!(accent_outlines(&h), 1, "the grid has the keyboard: one cursor");
+        h.state_mut().act(Action::FocusNext);
+        h.run_steps(2);
+        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::List]);
+        assert_eq!(accent_outlines(&h), 0, "the categories have it: the poster shows 'selected' only");
+    }
+
+    /// Medium: the categories are a drawer (← opens it, Esc closes it); Compact: Esc in the
+    /// grid goes back to the categories. A cancelled category PIN doesn't hijack a later
+    /// title PIN.
+    #[test]
+    fn drawer_compact_back_and_a_stale_category_pin() {
+        let (mut t, one) = rig();
+        let ids = seed(&mut t, |c| {
+            let s = testkit::source(c, "My IPTV")?;
+            let ids = testkit::movies(c, s, 4)?;
+            crate::store::user::set_group_override(c, s, ItemKind::Movie, &crate::model::GroupKey("movie:movies".into()), &crate::model::GroupOverride { locked: true, ..Default::default() })?;
+            let item = crate::model::ItemRef { source: s, kind: ItemKind::Movie, key: ItemKey("m3u:movie0000000003".into()) };
+            crate::store::user::set_item_override(c, &item, &crate::model::ItemOverride { locked: true, ..Default::default() })?;
+            Ok(ids)
+        });
+        with_pin(&mut t);
+        t.layout = LayoutClass::Medium;
+        let mut h = harness(t, one, MoviesScreen::default(), egui::vec2(706.0, 800.0));
+        h.state_mut().enter(Route::Movies { group: None });
+        h.run_steps(2);
+        assert!(!has_label(&h, "All movies"), "Medium: the drawer starts closed");
+        assert!(h.state_mut().act(Action::Parent));
+        h.run_steps(1);
+        assert!(has_label(&h, "All movies"), "Backspace opens the drawer");
+        // the locked category asks for the PIN; the prompt is cancelled (Esc: no result)
+        for _ in 0..3 {
+            h.state_mut().act(Action::Down);
+        }
+        h.state_mut().act(Action::Activate);
+        assert!(matches!(h.state_mut().nav().as_slice(), [NavRequest::Open(OverlayRequest::Pin { .. })]));
+        assert!(h.state_mut().act(Action::Back), "Esc closes the drawer first");
+        h.run_steps(1);
+        assert!(!has_label(&h, "All movies"));
+        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::PosterGrid]);
+        // later (All movies), a locked title (Movie 3, newest first) asks for the PIN: the
+        // answer opens it
+        for a in [Action::Parent, Action::Home, Action::Activate, Action::Home, Action::Activate] {
+            h.state_mut().act(a);
+            h.run_steps(1);
+        }
+        assert!(matches!(h.state_mut().nav().as_slice(), [NavRequest::Open(OverlayRequest::Pin { .. })]));
+        let app = h.state_mut();
+        let p = app.t.config.parental.clone();
+        assert!(app.t.parental.unlock("1234", &p));
+        app.result(OverlayResult::Unlocked(Action::Activate));
+        assert_eq!(h.state_mut().nav(), vec![NavRequest::Push(Route::MovieDetail(ids[3]))], "the title, not the stale category");
+        // Compact: Esc in the grid steps back to the categories, then leaves
+        h.state_mut().t.layout = LayoutClass::Compact;
+        h.run_steps(1);
+        assert!(h.state_mut().act(Action::Back));
+        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::List]);
+        assert!(!h.state_mut().act(Action::Back), "the app's Back leaves the screen");
     }
 
     /// DESIGN §13.12: skeleton posters while the first library loads; a category whose every

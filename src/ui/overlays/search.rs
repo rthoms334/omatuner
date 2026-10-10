@@ -13,21 +13,31 @@
 //!   list never shows under a newer query.
 //! * Enter: channels play FULLSCREEN, zapping through their primary group (DESIGN §13.0);
 //!   movies/series open their page; guide hits watch (airing), catch up (past, archive) or set
-//!   a reminder (future). Shift+Enter plays movies/series directly. Ctrl+F toggles the
-//!   highlighted item's favourite. Esc clears the query, then closes.
+//!   a reminder (future). Shift+Enter plays movies/series directly. Esc clears the query,
+//!   then closes.
+//! * Item shortcuts (`ITEM_ACTIONS`, listed in Help for `[Search]`) act on the highlighted
+//!   hit: Ctrl+F favourite, Ctrl+Shift+F lists, Ctrl+G guide, Ctrl+I details / edit
+//!   information, Ctrl+E assign EPG, Ctrl+W watched, F2 rename, Ctrl+H hide, Ctrl+L lock.
+//!   Overlays opened from here (rename, lists, edit information) write by themselves; menus
+//!   and PIN prompts would answer the screen BELOW the search, so the overlay never opens
+//!   them (a locked hit — only reachable when the session relocks while the card is open —
+//!   toasts instead).
+//! * Rows are rebuilt only when the query, section, lock state or library change, or when
+//!   the fuzzy matcher / the guide search report new results — not every frame.
 
 use std::cell::Cell;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui::{self, Align2, Rect, RichText};
 
 use super::dialogs::{card_area, scrim};
 use super::{Overlay, OverlayOutcome};
 use crate::keymap::{Action, KeyContext};
-use crate::model::{ItemKind, ItemRef, MediaRef, PlayOrigin, ProgrammeHit, ProgrammeSlim};
+use crate::model::{ItemKind, ItemRef, MediaRef, PlayOrigin, ProgrammeHit, ProgrammeSlim, VodKind};
 use crate::search::{EpgSearch, SearchHit, SearchIndex, SearchSection, SearchTarget};
 use crate::theme::{SpaceToken, TypeToken};
-use crate::ui::screens::home::kit;
+use crate::ui::screens::home::{kit, vod_ref};
 use crate::ui::widgets::button::{ButtonStyle, button};
 use crate::ui::widgets::card::CardKind;
 use crate::ui::widgets::list::paint_row_state;
@@ -69,8 +79,12 @@ pub struct SearchOverlay {
     epg: Option<EpgSearch>,
     /// The query the EPG search was last given.
     epg_query: String,
-    /// Rows of the last frame (actions resolve against what the user saw).
+    /// Rows the user sees (actions resolve against them).
     rows: Vec<Row>,
+    /// (query, section, session unlocked, library build) the rows were built for.
+    rows_key: Option<(String, SearchSection, bool, crate::model::Timestamp)>,
+    /// Set by the guide search when new results landed (rows must be rebuilt).
+    epg_dirty: Arc<AtomicBool>,
     /// Card top edge, frozen once typing starts (the card grows downward only).
     top: Option<f32>,
     last_top: Option<f32>,
@@ -79,7 +93,19 @@ pub struct SearchOverlay {
 
 impl SearchOverlay {
     pub fn new(initial: String) -> Self {
-        Self { query: initial, section: SearchSection::All, cursor: 0, epg: None, epg_query: String::new(), rows: Vec::new(), top: None, last_top: None, scroll_to_cursor: false }
+        Self {
+            query: initial,
+            section: SearchSection::All,
+            cursor: 0,
+            epg: None,
+            epg_query: String::new(),
+            rows: Vec::new(),
+            rows_key: None,
+            epg_dirty: Arc::default(),
+            top: None,
+            last_top: None,
+            scroll_to_cursor: false,
+        }
     }
 
     fn selectable(&self) -> Vec<usize> { self.rows.iter().enumerate().filter(|(_, r)| r.selectable()).map(|(i, _)| i).collect() }
@@ -121,7 +147,7 @@ impl SearchOverlay {
             Row::Hit(h) => match h.item.target {
                 SearchTarget::Channel(id) => {
                     if !kit::play_channel(ctx, id, None, PlayOrigin::Search) {
-                        kit::ask_pin(ctx, Action::Activate, "This channel is locked");
+                        locked_toast(ctx);
                         return OverlayOutcome::Keep;
                     }
                     OverlayOutcome::Close
@@ -150,12 +176,12 @@ impl SearchOverlay {
                     if kit::play_channel(ctx, ch, None, PlayOrigin::Search) {
                         return OverlayOutcome::Close;
                     }
-                    kit::ask_pin(ctx, Action::Activate, "This channel is locked");
+                    locked_toast(ctx);
                     OverlayOutcome::Keep
                 } else if p.stop <= now {
                     if catchup_available(ctx, ch, &p) {
                         if kit::channel_locked(ctx, ch) {
-                            kit::ask_pin(ctx, Action::Activate, "This channel is locked");
+                            locked_toast(ctx);
                             return OverlayOutcome::Keep;
                         }
                         kit::play_media(ctx, MediaRef::Catchup { channel: ch, start: p.start, stop: p.stop, catchup_id: None }, false, PlayOrigin::Search);
@@ -172,16 +198,68 @@ impl SearchOverlay {
         }
     }
 
-    fn favourite(&mut self, ctx: &mut UiCtx<'_>) {
-        let Some(Row::Hit(h)) = self.current() else { return };
-        let item = match h.item.target {
-            SearchTarget::Channel(id) => ctx.lib.live.get(id).map(|c| ItemRef { source: c.source_id, kind: ItemKind::Channel, key: c.key.clone() }),
-            SearchTarget::Movie(id) => ctx.lib.vod.find(crate::model::VodKind::Movie(id)).map(crate::ui::screens::home::vod_ref),
-            SearchTarget::Series(id) => ctx.lib.vod.find(crate::model::VodKind::Series(id)).map(crate::ui::screens::home::vod_ref),
-        };
-        if let Some(item) = item {
-            kit::toggle_favourite(ctx, &item);
+    /// The durable reference, effective lock and lock-through-a-category of a hit.
+    fn hit_item(ctx: &UiCtx<'_>, h: &SearchHit) -> Option<(ItemRef, bool, bool)> {
+        match h.item.target {
+            SearchTarget::Channel(id) => ctx.lib.live.get(id).map(|c| {
+                let by_group = kit::any_group_locked(&ctx.lib.live.groups, &c.group_ids);
+                (ItemRef { source: c.source_id, kind: ItemKind::Channel, key: c.key.clone() }, c.locked, by_group)
+            }),
+            SearchTarget::Movie(id) => ctx.lib.vod.find(VodKind::Movie(id)).map(|v| (vod_ref(v), v.locked, kit::any_group_locked(&ctx.lib.vod.movie_groups, &v.group_ids))),
+            SearchTarget::Series(id) => ctx.lib.vod.find(VodKind::Series(id)).map(|v| (vod_ref(v), v.locked, kit::any_group_locked(&ctx.lib.vod.series_groups, &v.group_ids))),
         }
+    }
+
+    /// An item shortcut on the highlighted row (see the module docs).
+    fn item_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> OverlayOutcome {
+        let row = self.current();
+        // the guide section: Ctrl+G shows the programme's channel in the guide
+        if let (Some(Row::Guide(g)), Action::OpenInGuide) = (&row, action) {
+            if let Some((ch, _)) = guide_channel(ctx, g) {
+                ctx.push(Route::Guide { collection: None, focus: Some(ch) });
+                return OverlayOutcome::Close;
+            }
+            return OverlayOutcome::Keep;
+        }
+        if action == Action::ContextMenu {
+            ctx.toast(crate::msg::Toast::info("Ctrl+F favourite · Ctrl+G guide · Ctrl+I details · F2 rename · Ctrl+H hide"));
+            return OverlayOutcome::Keep;
+        }
+        let Some(Row::Hit(h)) = row else {
+            kit::not_here(ctx);
+            return OverlayOutcome::Keep;
+        };
+        let Some((item, locked, by_group)) = Self::hit_item(ctx, &h) else { return OverlayOutcome::Keep };
+        let name = h.item.name.to_string();
+        match (action, h.item.target) {
+            (Action::ToggleFavourite, _) => kit::toggle_favourite(ctx, &item),
+            (Action::AddToList, _) => kit::list_picker(ctx, &item, &name),
+            (Action::Rename, _) => kit::rename_item(ctx, &item, &name),
+            (Action::ToggleHidden, _) => kit::hide_item(ctx, &item, &name),
+            // the PIN prompt would answer the screen below
+            (Action::ToggleLock, _) if !kit::unlocked(ctx) => ctx.toast(crate::msg::Toast::info("Locks change with the PIN — press Ctrl+L in a list")),
+            (Action::ToggleLock, _) => kit::toggle_lock(ctx, &item, locked, by_group),
+            (Action::ShowDetails, SearchTarget::Channel(_)) => ctx.open(crate::ui::OverlayRequest::EditItem(item)),
+            (Action::ShowDetails, SearchTarget::Movie(id)) => {
+                ctx.push(Route::MovieDetail(id));
+                return OverlayOutcome::Close;
+            }
+            (Action::ShowDetails, SearchTarget::Series(id)) => {
+                ctx.push(Route::SeriesDetail(id));
+                return OverlayOutcome::Close;
+            }
+            (Action::OpenInGuide, SearchTarget::Channel(id)) => {
+                ctx.push(Route::Guide { collection: None, focus: Some(id) });
+                return OverlayOutcome::Close;
+            }
+            (Action::AssignEpg, SearchTarget::Channel(id)) => {
+                ctx.push(Route::EpgMapping { channel: Some(id) });
+                return OverlayOutcome::Close;
+            }
+            (Action::MarkWatched, SearchTarget::Movie(_)) => kit::mark_watched(ctx, &item, &name, true),
+            _ => kit::not_here(ctx),
+        }
+        OverlayOutcome::Keep
     }
 
     /// Build or refresh the shared index (lazily, also after a lock change).
@@ -209,8 +287,15 @@ impl SearchOverlay {
             return;
         }
         let epg = self.epg.get_or_insert_with(|| EpgSearch::new(ctx.services.rt.handle().clone(), ctx.services.store.clone()));
-        let repaint = egui_ctx.clone();
-        epg.set_query(&q, ctx.now, Arc::new(move || repaint.request_repaint()));
+        let (repaint, dirty) = (egui_ctx.clone(), self.epg_dirty.clone());
+        epg.set_query(
+            &q,
+            ctx.now,
+            Arc::new(move || {
+                dirty.store(true, Ordering::Release);
+                repaint.request_repaint();
+            }),
+        );
         self.epg_query = q;
     }
 
@@ -325,8 +410,18 @@ impl Overlay for SearchOverlay {
                 Some(row) => self.activate(ctx, row, action == Action::ActivateAlt),
                 None => OverlayOutcome::Keep,
             },
-            Action::ToggleFavourite => {
-                self.favourite(ctx);
+            Action::ToggleFavourite
+            | Action::AddToList
+            | Action::ToggleHidden
+            | Action::Rename
+            | Action::ToggleLock
+            | Action::OpenInGuide
+            | Action::ShowDetails
+            | Action::AssignEpg
+            | Action::MarkWatched
+            | Action::ContextMenu => self.item_action(ctx, action),
+            Action::MoveUp | Action::MoveDown | Action::SortMenu | Action::Remove => {
+                kit::not_here(ctx);
                 OverlayOutcome::Keep
             }
             _ => OverlayOutcome::Ignored,
@@ -335,12 +430,18 @@ impl Overlay for SearchOverlay {
 
     fn ui(&mut self, egui_ctx: &egui::Context, ctx: &mut UiCtx<'_>) -> OverlayOutcome {
         self.ensure_index(egui_ctx, ctx);
+        let mut matched = false;
         if let Some(idx) = ctx.search_index.as_mut() {
             idx.set_query(&self.query);
-            idx.tick(10);
+            matched = idx.tick(10);
         }
         self.update_epg(egui_ctx, ctx);
-        self.build_rows(ctx);
+        let key = (self.query.clone(), self.section, kit::unlocked(ctx), ctx.lib.built_at);
+        let epg_new = self.epg_dirty.swap(false, Ordering::AcqRel);
+        if matched || epg_new || self.rows_key.as_ref() != Some(&key) {
+            self.build_rows(ctx);
+            self.rows_key = Some(key);
+        }
         let theme = ctx.theme;
         if scrim(egui_ctx, theme, "search") {
             return OverlayOutcome::Close;
@@ -449,12 +550,17 @@ fn paint_hit(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, h: &SearchHit, 
     let theme = ctx.theme;
     let t = &theme.tokens;
     let pad = theme.space(SpaceToken::Lg);
-    let icon = rect.height() - 2.0 * theme.space(SpaceToken::Md);
-    let logo_rect = Rect::from_min_size(egui::pos2(rect.left() + pad, rect.center().y - icon / 2.0), egui::vec2(icon, icon));
-    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(logo_rect));
-    crate::ui::widgets::logo::logo(&mut child, theme, ctx.images, h.item.logo.as_deref(), &h.item.name, icon);
+    // Settings ▸ Interface ▸ Channel logos (posters of movies / series always show)
+    let logos = ctx.config.interface.show_logos || !matches!(h.item.target, SearchTarget::Channel(_));
+    let mut left = rect.left() + pad;
+    if logos {
+        let icon = rect.height() - 2.0 * theme.space(SpaceToken::Md);
+        let logo_rect = Rect::from_min_size(egui::pos2(left, rect.center().y - icon / 2.0), egui::vec2(icon, icon));
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(logo_rect));
+        crate::ui::widgets::logo::logo(&mut child, theme, ctx.images, h.item.logo.as_deref(), &h.item.name, icon);
+        left = logo_rect.right() + pad;
+    }
     let p = ui.painter().clone();
-    let mut left = logo_rect.right() + pad;
     let mut right = rect.right() - pad;
     let y = rect.center().y;
     let small = egui::FontId::proportional(theme.font(TypeToken::BodySmall));
@@ -475,7 +581,7 @@ fn paint_hit(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, h: &SearchHit, 
                 let bar = Rect::from_center_size(egui::pos2(right - bar_w / 2.0, y), egui::vec2(bar_w, (3.0 * theme.rem()).round().max(2.0)));
                 crate::ui::widgets::progress::paint_progress(&p, bar, theme, cur.progress(now), false);
                 right -= bar_w + pad;
-                let text = format!("{} · {}", cur.title, kit::hhmm(cur.start));
+                let text = format!("{} · {}", cur.title, kit::hhmm(cur.start, ctx.config.interface.clock_24h));
                 let g = elided(&p, &text, small.clone(), t.text_secondary, (rect.width() * 0.32).max(60.0));
                 let r = Align2::RIGHT_CENTER.anchor_size(egui::pos2(right, y), g.size());
                 p.galley(r.min, g, t.text_secondary);
@@ -487,11 +593,13 @@ fn paint_hit(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, h: &SearchHit, 
         let glyph = if src.icon.is_empty() { glyphs::PLAYLIST } else { src.icon.as_str() };
         let text = format!("{glyph} {}", src.name);
         let color = theme.source_color(src.color);
-        let g = elided(&p, &text, egui::FontId::proportional(theme.font(TypeToken::Caption)), color, 140.0 * theme.rem());
+        // the border keeps the source colour; the text falls back to fg where it wouldn't read
+        let text_color = kit::legible(theme, color);
+        let g = elided(&p, &text, egui::FontId::proportional(theme.font(TypeToken::Caption)), text_color, 140.0 * theme.rem());
         let size = g.size() + egui::vec2(2.0 * theme.space(SpaceToken::Sm), 2.0 * theme.space(SpaceToken::Xxs));
         let r = Align2::RIGHT_CENTER.anchor_size(egui::pos2(right, y), size);
         p.rect_stroke(r, t.rounding, egui::Stroke::new(1.0, crate::theme::with_alpha(color, 0.6)), egui::StrokeKind::Inside);
-        p.galley(r.center() - g.size() / 2.0, g, color);
+        p.galley(r.center() - g.size() / 2.0, g, text_color);
         right = r.left() - pad;
     }
     // name with the matched characters in accent
@@ -536,7 +644,7 @@ fn paint_guide(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, g: &Programme
         right = r.left() - pad;
     }
     let time_font = egui::FontId::proportional(theme.font(TypeToken::Body));
-    let time = kit::day_time(prog.start);
+    let time = kit::day_time(prog.start, ctx.config.interface.clock_24h);
     let tg = elided(p, &time, time_font, t.text_secondary, f32::INFINITY);
     let tw = tg.size().x;
     p.galley(egui::pos2(rect.left() + pad, y - tg.size().y / 2.0), tg, t.text_secondary);
@@ -547,6 +655,10 @@ fn paint_guide(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, g: &Programme
     let g = elided(p, &title, egui::FontId::proportional(theme.font(TypeToken::Title)), c, (right - left).max(0.0));
     p.galley(egui::pos2(left, y - g.size().y / 2.0), g, c);
 }
+
+/// A locked hit (the session relocked while the card was open): a PIN prompt from here would
+/// answer the screen below, so the user unlocks from a list instead.
+fn locked_toast(ctx: &mut UiCtx<'_>) { ctx.toast(crate::msg::Toast::info("This is locked — open it from its list to enter the PIN")); }
 
 fn elided(p: &egui::Painter, text: &str, font: egui::FontId, color: egui::Color32, max_w: f32) -> Arc<egui::Galley> {
     let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
@@ -654,6 +766,53 @@ mod tests {
         let cfg = app.t.config.clone();
         assert!(app.t.parental.unlock("1234", &cfg.parental));
         until_ov(&mut h, "the unlocked channel", |h| has_label(h, "Channel 2"));
+    }
+
+    /// The item shortcuts Help lists for `[Search]` act on the highlighted hit; a hit that is
+    /// locked by a relock while the card is open toasts instead of opening a PIN prompt
+    /// (whose answer would go to the screen below).
+    #[test]
+    fn item_shortcuts_and_a_relocked_hit() {
+        let (mut t, one) = rig();
+        let movies = seed(&mut t, |c| {
+            let s = testkit::source(c, "My IPTV")?;
+            testkit::channels(c, s, 5)?;
+            let item = ItemRef { source: s, kind: ItemKind::Channel, key: ItemKey(format!("m3u:seed{:011}", 2)) };
+            crate::store::user::set_item_override(c, &item, &ItemOverride { locked: true, ..Default::default() })?;
+            testkit::movies(c, s, 3)
+        });
+        let mut cfg = (*t.config).clone();
+        cfg.parental = crate::config::ParentalConfig { enabled: true, pin_salt: Some("s".into()), pin_hash: Some(crate::ui::parental::hash_pin("1234", "s")), relock_min: 0 };
+        t.config = Arc::new(cfg);
+        let p = t.config.parental.clone();
+        assert!(t.parental.unlock("1234", &p));
+        let mut h = overlay_harness(t, one, SearchOverlay::new("Channel 2".into()), egui::vec2(1000.0, 900.0));
+        until_ov(&mut h, "the locked channel (session open)", |h| has_label(h, "Channel 2"));
+        // Ctrl+G: the channel in the guide
+        assert_eq!(h.state_mut().act(Action::OpenInGuide), "Close");
+        assert!(matches!(h.state_mut().nav().as_slice(), [NavRequest::Push(Route::Guide { focus: Some(_), .. })]));
+        // the session relocks with the card open: Enter toasts, no PIN prompt
+        h.state_mut().t.parental.lock();
+        assert_eq!(h.state_mut().act(Action::Activate), "Keep");
+        assert!(h.state_mut().nav().is_empty(), "no PIN overlay from inside the search");
+        assert!(h.state().t.toasts.iter().any(|t| t.text.contains("locked")), "{:?}", h.state().t.toasts);
+        // the context menu would answer the screen below: it explains the shortcuts instead
+        assert_eq!(h.state_mut().act(Action::ContextMenu), "Keep");
+        assert!(h.state_mut().nav().is_empty());
+        // movies: Ctrl+I opens the page; Ctrl+Shift+F the lists picker; Ctrl+W marks it watched
+        let app = h.state_mut();
+        app.act(Action::FilterClear);
+        for c in "movie 1".chars() {
+            app.act(Action::FilterInput(c));
+        }
+        until_ov(&mut h, "the movie", |h| has_label(h, "Movie 1"));
+        h.state_mut().act(Action::FocusNext);
+        h.state_mut().act(Action::FocusNext);
+        h.run_steps(1);
+        assert_eq!(h.state_mut().act(Action::AddToList), "Keep");
+        assert!(matches!(h.state_mut().nav().as_slice(), [NavRequest::Open(crate::ui::OverlayRequest::ListPicker(_))]));
+        assert_eq!(h.state_mut().act(Action::ShowDetails), "Close");
+        assert_eq!(h.state_mut().nav(), vec![NavRequest::Push(Route::MovieDetail(movies[1]))]);
     }
 
     #[test]

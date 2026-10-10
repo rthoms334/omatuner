@@ -7,8 +7,9 @@
 //! Data is read off the UI thread (series, seasons, episodes, per-episode progress and the
 //! episode to open at) and re-read on `DataScope::{VodDetails, Progress, Overrides}`; Xtream
 //! series without loaded details submit `JobKind::LoadSeriesDetails` and show a skeleton.
-//! When an episode this page started ends (watched) while the fullscreen player shows it,
-//! the resume overlay opens in its "Next episode in 10 s" mode for the following episode.
+//! This screen (always alive) also drives the end of EVERY episode: when one ends (watched)
+//! while the fullscreen player shows it — started here, from a grid, Home or search — the
+//! resume overlay opens in its "Next episode in 10 s" mode for the following episode.
 
 use std::collections::HashMap;
 
@@ -85,6 +86,24 @@ fn load(c: &rusqlite::Connection, id: SeriesId) -> crate::error::Result<Data> {
 
 fn episode_ref(e: &Episode) -> ItemRef { ItemRef { source: e.source_id, kind: ItemKind::Episode, key: e.key.clone() } }
 
+/// The episode after `ended` in season order (an episode of a series no page has loaded).
+/// Three indexed point / range reads on the UI connection, once per finished episode (an
+/// event, not a frame) — no `Loader`: its answer would have no screen to land on while the
+/// fullscreen player is current.
+fn next_after(db: &rusqlite::Connection, ended: &ItemRef) -> Option<Episode> {
+    use crate::store::vod;
+    let read = || -> crate::error::Result<Option<Episode>> {
+        let Some(id) = vod::resolve_episode(db, ended)? else { return Ok(None) };
+        let e = vod::episode(db, id)?;
+        let eps = vod::episodes(db, e.series_id, None)?;
+        Ok(eps.iter().position(|x| x.id == id).and_then(|i| eps.get(i + 1)).cloned())
+    };
+    read().unwrap_or_else(|e| {
+        tracing::warn!("next episode: {e}");
+        None
+    })
+}
+
 /// "S01E03 · Pilot".
 fn episode_label(e: &Episode) -> String { format!("S{:02}E{:02} · {}", e.season, e.episode, e.title) }
 
@@ -103,8 +122,6 @@ pub struct SeriesDetailScreen {
     /// Place the cursor on the next episode when the data arrives (first load of a series).
     position_pending: bool,
     scroll_to_cursor: bool,
-    /// The episode this page started (end-of-playback card).
-    started: Option<EpisodeId>,
 }
 
 impl SeriesDetailScreen {
@@ -168,7 +185,6 @@ impl SeriesDetailScreen {
             kit::ask_pin(ctx, if alt { Action::ActivateAlt } else { Action::Activate }, "This series is locked");
             return;
         }
-        self.started = Some(e.id);
         if from_start {
             kit::play_media(ctx, MediaRef::Episode(e.id), false, PlayOrigin::Fullscreen);
         } else {
@@ -274,22 +290,27 @@ impl Screen for SeriesDetailScreen {
     }
 
     fn on_event(&mut self, ctx: &mut UiCtx<'_>, ev: &AppEvent) {
-        let Some(id) = self.id else { return };
         match ev {
             AppEvent::Data(DataScope::VodDetails | DataScope::Progress | DataScope::Overrides | DataScope::Vod | DataScope::All) => self.reload(ctx),
-            AppEvent::Job(JobEvent::Finished { kind: JobKind::LoadSeriesDetails(s), outcome: Err(msg), .. }) if *s == id => {
+            AppEvent::Job(JobEvent::Finished { kind: JobKind::LoadSeriesDetails(s), outcome: Err(msg), .. }) if Some(*s) == self.id => {
                 ctx.toast(crate::msg::Toast::error(format!("Couldn't load the episodes: {}", crate::redact::redact(msg))));
             }
             AppEvent::Player(PlayerEvent::Ended { item: Some(item), finished }) if item.kind == ItemKind::Episode => {
-                let Some(ended) = self.data.as_ref().and_then(|d| d.episodes.iter().find(|e| e.key == item.key && e.source_id == item.source)).cloned() else { return };
-                self.reload(ctx);
-                let next = self.after(&ended.key);
-                if let Some(n) = &next {
-                    self.select_episode(n.id);
+                // this page shows the series: follow along
+                let shown = self.data.as_ref().and_then(|d| d.episodes.iter().find(|e| e.key == item.key && e.source_id == item.source)).cloned();
+                if let Some(ended) = &shown {
+                    self.reload(ctx);
+                    if let Some(n) = self.after(&ended.key) {
+                        self.select_episode(n.id);
+                    }
                 }
-                // DESIGN §13.6: "Next episode in 10 s" over the video (Enter = now, Esc = stay)
-                if *finished && self.started == Some(ended.id) && ctx.video.placement() == Placement::Fullscreen {
-                    self.started = next.as_ref().map(|n| n.id);
+                // DESIGN §13.6: "Next episode in 10 s" over the video (Enter = now, Esc = stay) for
+                // every episode that ends in the fullscreen player, wherever it was started
+                if *finished && ctx.video.placement() == Placement::Fullscreen {
+                    let next = match &shown {
+                        Some(ended) => self.after(&ended.key),
+                        None => next_after(ctx.db, item),
+                    };
                     if let Some(n) = next {
                         ctx.open(OverlayRequest::Resume(ResumeSpec {
                             media: MediaRef::Episode(n.id),
@@ -358,20 +379,40 @@ impl Screen for SeriesDetailScreen {
             }
             Action::ToggleFavourite => self.press(ctx, Btn::Favourite),
             Action::ToggleLock => {
-                if let Some(item) = self.series_ref() {
-                    let locked = self.data.as_ref().is_some_and(|d| d.series.locked);
-                    kit::toggle_lock(ctx, &item, locked);
+                if let Some((item, d)) = self.series_ref().zip(self.data.as_ref()) {
+                    let by_group = kit::any_group_locked(&ctx.lib.vod.series_groups, &d.series.group_ids);
+                    kit::toggle_lock(ctx, &item, d.series.locked, by_group);
+                }
+            }
+            Action::AddToList | Action::Rename | Action::ToggleHidden => {
+                if let Some((item, d)) = self.series_ref().zip(self.data.as_ref()) {
+                    let name = d.series.display_name().to_owned();
+                    match action {
+                        Action::AddToList => kit::list_picker(ctx, &item, &name),
+                        Action::Rename => kit::rename_item(ctx, &item, &name),
+                        _ => kit::hide_item(ctx, &item, &name),
+                    }
                 }
             }
             Action::ContextMenu => {
+                let mi = |icon: &'static str, label: &str, action: Action, shortcut: Option<&str>| MenuItem { icon, label: label.into(), action, enabled: true, shortcut: shortcut.map(str::to_owned) };
+                let mut episode = mi(glyphs::CHECK, "Mark episode watched / unwatched", Action::MarkWatched, Some("Ctrl+W"));
+                episode.enabled = self.focused_episode().is_some();
                 let items = vec![
-                    MenuItem { icon: glyphs::CHECK, label: "Mark season watched".into(), action: Action::Digit(MENU_SEASON_WATCHED), enabled: true, shortcut: None },
-                    MenuItem { icon: glyphs::CLOSE, label: "Mark season unwatched".into(), action: Action::Digit(MENU_SEASON_UNWATCHED), enabled: true, shortcut: None },
-                    MenuItem { icon: glyphs::CHECK, label: "Mark episode watched / unwatched".into(), action: Action::MarkWatched, enabled: self.focused_episode().is_some(), shortcut: Some("Ctrl+W".into()) },
-                    MenuItem { icon: glyphs::FAVOURITE, label: "Add to / remove from Favourites".into(), action: Action::ToggleFavourite, enabled: true, shortcut: Some("Ctrl+F".into()) },
+                    mi(glyphs::CHECK, "Mark season watched", Action::Digit(MENU_SEASON_WATCHED), None),
+                    mi(glyphs::CLOSE, "Mark season unwatched", Action::Digit(MENU_SEASON_UNWATCHED), None),
+                    episode,
+                    mi(glyphs::FAVOURITE, "Add to / remove from Favourites", Action::ToggleFavourite, Some("Ctrl+F")),
+                    mi(glyphs::FAV_LIST, "Favourites lists…", Action::AddToList, Some("Ctrl+Shift+F")),
+                    mi(glyphs::TAG, "Rename…", Action::Rename, Some("F2")),
+                    mi(glyphs::LOCK, "Lock / unlock", Action::ToggleLock, Some("Ctrl+L")),
+                    mi(glyphs::HIDDEN, "Hide", Action::ToggleHidden, Some("Ctrl+H")),
                 ];
                 ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: "Series".into(), items }));
             }
+            // this is the details page already
+            Action::ShowDetails => {}
+            Action::MoveUp | Action::MoveDown | Action::SortMenu | Action::OpenInGuide | Action::AssignEpg | Action::Remove => kit::not_here(ctx),
             _ => return false,
         }
         true
@@ -387,7 +428,7 @@ impl Screen for SeriesDetailScreen {
                 let eps = self.current_episodes().into_iter().cloned().collect();
                 self.mark(ctx, eps, false);
             }
-            OverlayResult::Chosen(a @ (Action::MarkWatched | Action::ToggleFavourite)) => {
+            OverlayResult::Chosen(a @ (Action::MarkWatched | Action::ToggleFavourite | Action::AddToList | Action::Rename | Action::ToggleLock | Action::ToggleHidden)) => {
                 self.on_action(ctx, a);
             }
             OverlayResult::Unlocked(a @ (Action::Activate | Action::ActivateAlt | Action::ToggleLock)) => {
@@ -501,7 +542,7 @@ impl Screen for SeriesDetailScreen {
                 if loading {
                     section::section_header(ui, theme, "Episodes");
                     for _ in 0..4 {
-                        let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), rows::row_height(theme, crate::config::Density::Comfortable, false) - 4.0), egui::Sense::hover());
+                        let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), rows::row_height(theme, ctx.config.interface.density, false) - 4.0), egui::Sense::hover());
                         ui.painter().rect_filled(r, t.rounding, t.fill_field);
                         ui.add_space(4.0);
                     }
@@ -690,6 +731,39 @@ mod tests {
             matches!(nav.as_slice(), [NavRequest::Open(OverlayRequest::Resume(r))] if r.position_s == 0.0 && r.media == MediaRef::Episode(next)),
             "{nav:?}"
         );
+    }
+
+    /// DESIGN §13.6 for every episode: one started from a grid, Home or search (no page has
+    /// its series loaded) still gets "Next episode in 10 s"; the last episode, an episode
+    /// stopped early and the mini player get none.
+    #[test]
+    fn the_up_next_card_follows_episodes_started_anywhere() {
+        let (mut t, one) = rig();
+        let src = seed(&mut t, |c| {
+            let s = testkit::source(c, "My IPTV")?;
+            testkit::series(c, s, 2, 2, 2)?;
+            Ok(s)
+        });
+        let ep = |key: &str| ItemRef { source: src, kind: ItemKind::Episode, key: ItemKey(key.into()) };
+        let id_of = |t: &crate::ui::testing::TestUi, key: &str| crate::store::vod::resolve_episode(&t.services().store.reader().unwrap(), &ep(key)).unwrap().unwrap();
+        // a fresh page (never opened): only the always-alive screen sees the event
+        let mut h = harness(t, one, SeriesDetailScreen::default(), egui::vec2(1000.0, 800.0));
+        let ended = |h: &mut egui_kittest::Harness<'static, testkit::App<SeriesDetailScreen>>, key: &str, finished: bool| {
+            h.state().t.services().bus.send(AppEvent::Player(PlayerEvent::Ended { item: Some(ep(key)), finished }));
+            h.run_steps(1);
+            h.state_mut().nav()
+        };
+        // in the mini player (no fullscreen video last frame): nothing
+        assert!(ended(&mut h, "m3u:ep1-1-1", true).is_empty());
+        crate::ui::screens::movie_detail::tests::fullscreen_placement(&mut h.state_mut().t);
+        // S1E2 of the second series ends: S2E1 is next (across seasons)
+        let next = id_of(&h.state().t, "m3u:ep1-2-1");
+        let nav = ended(&mut h, "m3u:ep1-1-2", true);
+        assert!(matches!(nav.as_slice(), [NavRequest::Open(OverlayRequest::Resume(r))] if r.position_s == 0.0 && r.media == MediaRef::Episode(next) && r.title.starts_with("S02E01")), "{nav:?}");
+        crate::ui::screens::movie_detail::tests::fullscreen_placement(&mut h.state_mut().t);
+        assert!(ended(&mut h, "m3u:ep1-1-1", false).is_empty(), "stopped early");
+        crate::ui::screens::movie_detail::tests::fullscreen_placement(&mut h.state_mut().t);
+        assert!(ended(&mut h, "m3u:ep1-2-2", true).is_empty(), "the last episode");
     }
 
     #[test]

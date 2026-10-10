@@ -7,6 +7,13 @@
 //! "Get started" rail (Browse Live TV · Open guide · Add favourites (Ctrl+F) · first group's
 //! channels with now/next). Owner: WP-12.
 //!
+//! Item shortcuts on the focused tile (all listed in Help for `[PosterGrid]`): Ctrl+F /
+//! Ctrl+Shift+F favourites, Delete removes from the favourites list of the rail / from
+//! Continue watching, Alt+↑/↓ moves a tile within its favourites list, Ctrl+W watched,
+//! Ctrl+L lock, Ctrl+H hide, F2 rename, Ctrl+I details / edit information, Ctrl+G guide,
+//! Ctrl+E assign EPG, Shift+F10 the menu of all of them; the rest toast "Not available here".
+//! Rails are rebuilt only when the library, the favourites or Continue watching change.
+//!
 //! Data: everything but "Continue watching" comes from the in-memory `Library` and the
 //! app-owned favourites; Continue watching is read off the UI thread ([`kit::Loader`]) on enter
 //! and whenever progress/history/the library changes. An empty library (no sources) shows the
@@ -15,14 +22,18 @@
 //! This file also hosts [`kit`]: helpers shared by the WP-12 screens and overlays (background
 //! reads, fullscreen playback with the right zap list, favourites, parental checks).
 
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use eframe::egui::{self, Align2, Rect};
 
 use crate::keymap::{Action, KeyContext};
-use crate::model::{ChannelId, Collection, ItemKind, ItemRef, MediaRef, NowNext, PlayOrigin, SortMode, Timestamp, VodKind, VodSummary};
+use crate::model::{ChannelId, Collection, FavListId, ItemKind, ItemRef, MediaRef, NowNext, PlayOrigin, SortMode, Timestamp, VodKind, VodSummary};
 use crate::msg::{AppEvent, DataScope};
+use crate::store::library::FavIndex;
 use crate::theme::{SpaceToken, Theme, TypeToken};
+use crate::ui::overlays::{ContextMenuSpec, MenuItem, OverlayResult};
 use crate::ui::widgets::poster::{self, TileDecor};
 use crate::ui::widgets::{empty_state, glyphs, section};
 use crate::ui::{OnboardingStart, OverlayRequest, Route, Screen, ScreenId, UiCtx};
@@ -33,9 +44,10 @@ use kit::Loader;
 pub(crate) mod kit {
     use crate::error::Result;
     use crate::keymap::Action;
-    use crate::model::{ChannelId, Collection, ItemRef, MediaRef, PlayOrigin, ZapList};
+    use crate::model::{ChannelId, Collection, FavListId, Group, GroupId, GroupOverride, ItemRef, MediaRef, PlayOrigin, ZapList};
     use crate::msg::{DataScope, Toast};
     use crate::player::{PlayRequest, PlayerCommand};
+    use crate::ui::overlays::{ListPickerSpec, RenameSpec, RenameTarget};
     use crate::ui::{OverlayRequest, Route, UiCtx};
 
     /// A read on a fresh reader connection on the runtime's blocking pool (never on the UI
@@ -131,14 +143,32 @@ pub(crate) mod kit {
         ctx.toast(Toast::info(if on { "Added to Favourites" } else { "Removed from Favourites" }));
     }
 
-    /// Ctrl+L on an item: lock / unlock it (needs a PIN; unlocking needs the open session).
-    pub(crate) fn toggle_lock(ctx: &mut UiCtx<'_>, item: &ItemRef, locked_now: bool) {
+    /// Locks can change: a PIN exists and the session is open (else a toast / the PIN prompt,
+    /// answered with `OverlayResult::Unlocked(ToggleLock)`).
+    fn may_change_locks(ctx: &mut UiCtx<'_>) -> bool {
         if ctx.config.parental.pin_hash.is_none() || !ctx.config.parental.enabled {
             ctx.toast(Toast::info("Set a PIN in Settings ▸ Parental first"));
-            return;
+            return false;
         }
         if !unlocked(ctx) {
             ask_pin(ctx, Action::ToggleLock, "Enter the PIN to change locks");
+            return false;
+        }
+        true
+    }
+
+    /// One of the groups `ids` (looked up in `groups`) is locked.
+    pub(crate) fn any_group_locked(groups: &[Group], ids: &[GroupId]) -> bool { ids.iter().any(|id| groups.iter().any(|g| g.id == *id && g.locked)) }
+
+    /// Ctrl+L on an item: lock / unlock it (needs a PIN; unlocking needs the open session).
+    /// `locked_now` is the effective lock; when it comes from a locked category
+    /// (`group_locked`) the item's own lock changes nothing, so the user is told instead.
+    pub(crate) fn toggle_lock(ctx: &mut UiCtx<'_>, item: &ItemRef, locked_now: bool, group_locked: bool) {
+        if !may_change_locks(ctx) {
+            return;
+        }
+        if group_locked {
+            ctx.toast(Toast::info("Locked by its category — unlock the category with Ctrl+L"));
             return;
         }
         let write_item = item.clone();
@@ -149,6 +179,114 @@ pub(crate) mod kit {
             crate::store::user::set_item_override(c, &write_item, &ov)
         });
         ctx.toast(Toast::info(if on { "Locked" } else { "Unlocked" }));
+    }
+
+    /// Change a group's override (read in the write, so fields this screen doesn't know
+    /// about — `pinned_home` — survive).
+    fn edit_group_override(ctx: &UiCtx<'_>, g: &Group, f: impl FnOnce(&mut GroupOverride) + Send + 'static) {
+        let (source, kind, key) = (g.source_id, g.kind, g.key.clone());
+        let _ = ctx.services.store.writer().submit_notify(DataScope::Overrides, move |c| {
+            let mut ov = crate::store::user::group_overrides(c)?
+                .into_iter()
+                .find(|r| r.source == source && r.kind == kind && r.key == key)
+                .map(|r| r.ov)
+                .unwrap_or_default();
+            f(&mut ov);
+            crate::store::user::set_group_override(c, source, kind, &key, &ov)
+        });
+    }
+
+    /// Ctrl+L on a category.
+    pub(crate) fn toggle_group_lock(ctx: &mut UiCtx<'_>, g: &Group) {
+        if !may_change_locks(ctx) {
+            return;
+        }
+        let on = !g.locked;
+        edit_group_override(ctx, g, move |ov| ov.locked = on);
+        ctx.toast(Toast::info(if on { format!("Locked {}", g.display_name()) } else { format!("Unlocked {}", g.display_name()) }));
+    }
+
+    /// Ctrl+H on a category (Settings ▸ Hidden items shows it again).
+    pub(crate) fn hide_group(ctx: &mut UiCtx<'_>, g: &Group) {
+        edit_group_override(ctx, g, |ov| ov.hidden = true);
+        ctx.toast(Toast::info(format!("Hid {} — Settings ▸ Hidden items shows it again", g.display_name())));
+    }
+
+    /// Ctrl+H on an item (Settings ▸ Hidden items shows it again).
+    pub(crate) fn hide_item(ctx: &mut UiCtx<'_>, item: &ItemRef, name: &str) {
+        let write_item = item.clone();
+        let _ = ctx.services.store.writer().submit_notify(DataScope::Overrides, move |c| {
+            let mut ov = crate::store::user::item_override(c, &write_item)?.unwrap_or_default();
+            ov.hidden = true;
+            crate::store::user::set_item_override(c, &write_item, &ov)
+        });
+        ctx.toast(Toast::info(format!("Hid {name} — Settings ▸ Hidden items shows it again")));
+    }
+
+    /// Alt+↑/↓ on a category: move it among the categories of its playlist (`visible` in display
+    /// order) and store the order as `user_order`. False when it can't move that way.
+    pub(crate) fn reorder_group(ctx: &UiCtx<'_>, visible: &[&Group], id: GroupId, delta: isize) -> bool {
+        let Some(g) = visible.iter().find(|g| g.id == id) else { return false };
+        let mut order: Vec<&Group> = visible.iter().copied().filter(|x| x.source_id == g.source_id && x.kind == g.kind).collect();
+        let Some(i) = order.iter().position(|x| x.id == id) else { return false };
+        let j = i as isize + delta;
+        if j < 0 || j as usize >= order.len() {
+            return false;
+        }
+        order.swap(i, j as usize);
+        let (source, kind) = (g.source_id, g.kind);
+        let keys: Vec<crate::model::GroupKey> = order.iter().map(|x| x.key.clone()).collect();
+        let _ = ctx.services.store.writer().submit_notify(DataScope::Overrides, move |c| {
+            let existing = crate::store::user::group_overrides(c)?;
+            for (pos, key) in keys.iter().enumerate() {
+                let mut ov = existing.iter().find(|r| r.source == source && r.kind == kind && r.key == *key).map(|r| r.ov.clone()).unwrap_or_default();
+                ov.user_order = Some(pos as i32);
+                crate::store::user::set_group_override(c, source, kind, key, &ov)?;
+            }
+            Ok(())
+        });
+        true
+    }
+
+    /// Add to / remove from one favourites list (store + optimistic index patch).
+    pub(crate) fn set_in_list(ctx: &mut UiCtx<'_>, list: FavListId, item: &ItemRef, on: bool) {
+        let (now, write_item) = (ctx.now, item.clone());
+        let _ = ctx.services.store.writer().submit_notify(DataScope::Favourites, move |c| crate::store::user::set_favourite(c, list, &write_item, on, now));
+        ctx.favs.apply_toggle(list, item, on);
+    }
+
+    /// Ctrl+W (`on`) / "remove from Continue watching" (`!on`, which forgets the progress).
+    pub(crate) fn mark_watched(ctx: &mut UiCtx<'_>, item: &ItemRef, title: &str, on: bool) {
+        let (now, items) = (ctx.now, vec![(item.clone(), title.to_owned())]);
+        let _ = ctx.services.store.writer().submit_notify(DataScope::Progress, move |c| crate::store::user::mark_watched(c, &items, on, now));
+        ctx.toast(Toast::info(if on { "Marked as watched" } else { "Removed from Continue watching" }));
+    }
+
+    /// F2 on an item (the overlay writes the rename).
+    pub(crate) fn rename_item(ctx: &mut UiCtx<'_>, item: &ItemRef, name: &str) {
+        ctx.open(OverlayRequest::Rename(RenameSpec { title: "Rename".into(), initial: name.to_owned(), target: RenameTarget::Item { item: item.clone() } }));
+    }
+
+    /// F2 on a category.
+    pub(crate) fn rename_group(ctx: &mut UiCtx<'_>, g: &Group) {
+        let target = RenameTarget::Group { source: g.source_id, kind: g.kind, key: g.key.clone() };
+        ctx.open(OverlayRequest::Rename(RenameSpec { title: "Rename category".into(), initial: g.display_name().to_owned(), target }));
+    }
+
+    /// Ctrl+Shift+F: the favourites-list picker (the overlay writes the membership).
+    pub(crate) fn list_picker(ctx: &mut UiCtx<'_>, item: &ItemRef, title: &str) {
+        ctx.open(OverlayRequest::ListPicker(ListPickerSpec { item: item.clone(), title: title.to_owned() }));
+    }
+
+    /// A shortcut from Help that has no meaning for what is focused.
+    pub(crate) fn not_here(ctx: &mut UiCtx<'_>) { ctx.toast(Toast::info("Not available here")); }
+
+    /// A palette colour used as TEXT on the background (source badges, the onboarding
+    /// preview): the colour itself when it reads (≥ 3:1), else the foreground (yellow on a
+    /// light theme).
+    pub(crate) fn legible(theme: &crate::theme::Theme, color: eframe::egui::Color32) -> eframe::egui::Color32 {
+        let t = &theme.tokens;
+        if crate::theme::tokens::contrast_ratio(color, t.bg) >= 3.0 { color } else { t.fg }
     }
 
     /// Set a reminder for a future programme on `channel` (times as displayed, i.e. shifted).
@@ -165,7 +303,7 @@ pub(crate) mod kit {
             state: crate::model::ReminderState::Pending,
         };
         let _ = ctx.services.store.writer().submit_notify(DataScope::Reminders, move |c| crate::store::user::add_reminder(c, &r).map(|_| ()));
-        ctx.toast(Toast::info(format!("Reminder set: {title} at {}", hhmm(start))));
+        ctx.toast(Toast::info(format!("Reminder set: {title} at {}", hhmm(start, ctx.config.interface.clock_24h))));
     }
 
     /// Open a file dialog (portal) for `purpose`; the answer arrives as
@@ -200,29 +338,22 @@ pub(crate) mod kit {
         if m >= 60 { format!("{} h {:02}", m / 60, m % 60) } else { format!("{m} min") }
     }
 
-    /// Local "HH:MM".
-    pub(crate) fn hhmm(ts: crate::model::Timestamp) -> String {
+    /// `ts` in local time with a strftime format (`fallback` for an out-of-range stamp).
+    fn local(ts: crate::model::Timestamp, format: &str, fallback: &str) -> String {
         match jiff::Timestamp::from_second(ts) {
-            Ok(t) => t.to_zoned(jiff::tz::TimeZone::system()).strftime("%H:%M").to_string(),
-            Err(_) => "--:--".into(),
+            Ok(t) => t.to_zoned(jiff::tz::TimeZone::system()).strftime(format).to_string(),
+            Err(_) => fallback.into(),
         }
     }
 
-    /// Local "Thu 21:00".
-    pub(crate) fn day_time(ts: crate::model::Timestamp) -> String {
-        match jiff::Timestamp::from_second(ts) {
-            Ok(t) => t.to_zoned(jiff::tz::TimeZone::system()).strftime("%a %H:%M").to_string(),
-            Err(_) => "--".into(),
-        }
-    }
+    /// Local "21:00", or "9:00 PM" with the 12-hour clock (Settings ▸ Interface ▸ Clock).
+    pub(crate) fn hhmm(ts: crate::model::Timestamp, h24: bool) -> String { local(ts, if h24 { "%H:%M" } else { "%-I:%M %p" }, "--:--") }
+
+    /// Local "Thu 21:00" / "Thu 9:00 PM".
+    pub(crate) fn day_time(ts: crate::model::Timestamp, h24: bool) -> String { local(ts, if h24 { "%a %H:%M" } else { "%a %-I:%M %p" }, "--") }
 
     /// Local "YYYY-MM-DD".
-    pub(crate) fn date(ts: crate::model::Timestamp) -> String {
-        match jiff::Timestamp::from_second(ts) {
-            Ok(t) => t.to_zoned(jiff::tz::TimeZone::system()).strftime("%Y-%m-%d").to_string(),
-            Err(_) => "?".into(),
-        }
-    }
+    pub(crate) fn date(ts: crate::model::Timestamp) -> String { local(ts, "%Y-%m-%d", "?") }
 
     /// "2 h ago" / "just now" / "3 d ago".
     pub(crate) fn ago(now: crate::model::Timestamp, then: crate::model::Timestamp) -> String {
@@ -308,6 +439,8 @@ enum RailKind {
 struct Rail {
     kind: RailKind,
     title: String,
+    /// The favourites list of a favourites rail (Delete removes from it, Alt+←/→ reorders).
+    list: Option<FavListId>,
     tiles: Vec<Tile>,
 }
 
@@ -318,21 +451,44 @@ const CHANNEL_TILE_W: f32 = 230.0;
 /// Poster width in rails (pt × rem).
 const RAIL_POSTER_W: f32 = 120.0;
 
+/// What the rails were built from: rebuilt only when one of these changes, never per frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RailsKey {
+    built_at: Timestamp,
+    favs: u64,
+    continue_gen: u64,
+}
+
 #[derive(Default)]
 pub struct HomeScreen {
     /// (rail index, per-rail column).
     rail: usize,
     cols: Vec<(RailKind, String, usize)>,
     continue_items: Vec<ContinueItem>,
+    /// Bumped whenever `continue_items` is replaced.
+    continue_gen: u64,
     continue_loader: Option<Loader<Vec<ContinueItem>>>,
-    /// Library build the "recently added" lists were taken from.
+    /// Library build the "recently added" lists and `vod_refs` were taken from.
     recent_built_at: Timestamp,
     recent_movies: Vec<VodSummary>,
     recent_series: Vec<VodSummary>,
-    /// Rails of the last frame (actions resolve against what the user saw).
+    /// (kind, source, key) → movie / series of the library build (favourited VOD lookups).
+    vod_refs: HashMap<ItemRef, VodKind>,
+    /// The rails the user sees (actions resolve against them).
     rails: Vec<Rail>,
+    rails_key: Option<RailsKey>,
     scroll_to_cursor: bool,
     playing: kit::PlayingVod,
+}
+
+/// A cheap fingerprint of the favourites lists (their order, names and items).
+fn favs_signature(favs: &FavIndex) -> u64 {
+    let mut h = std::hash::DefaultHasher::new();
+    for l in &favs.lists {
+        (l.id, &l.name, l.is_default).hash(&mut h);
+        favs.items(l.id).hash(&mut h);
+    }
+    h.finish()
 }
 
 impl HomeScreen {
@@ -340,8 +496,13 @@ impl HomeScreen {
         self.continue_loader = Some(Loader::start(ctx, load_continue));
     }
 
-    /// Rebuild the rails from the library, favourites and the cached reads.
+    /// Rebuild the rails when the library, the favourites or Continue watching changed.
     fn build_rails(&mut self, ctx: &mut UiCtx<'_>) {
+        let key = RailsKey { built_at: ctx.lib.built_at, favs: favs_signature(ctx.favs), continue_gen: self.continue_gen };
+        if self.rails_key == Some(key) {
+            return;
+        }
+        self.rails_key = Some(key);
         if self.recent_built_at != ctx.lib.built_at {
             self.recent_built_at = ctx.lib.built_at;
             let take = |movies: bool, all: &[VodSummary]| -> Vec<VodSummary> {
@@ -349,10 +510,15 @@ impl HomeScreen {
             };
             self.recent_movies = take(true, &ctx.lib.vod.movies);
             self.recent_series = take(false, &ctx.lib.vod.series);
+            self.vod_refs.clear();
+        }
+        let has_vod_favs = ctx.favs.lists.iter().any(|l| ctx.favs.items(l.id).iter().any(|r| matches!(r.kind, ItemKind::Movie | ItemKind::Series)));
+        if has_vod_favs && self.vod_refs.is_empty() {
+            self.vod_refs = ctx.lib.vod.movies.iter().chain(&ctx.lib.vod.series).map(|v| (vod_ref(v), v.kind)).collect();
         }
         let mut rails = Vec::new();
         if !self.continue_items.is_empty() {
-            rails.push(Rail { kind: RailKind::Continue, title: "Continue watching".into(), tiles: (0..self.continue_items.len()).map(Tile::Continue).collect() });
+            rails.push(Rail { kind: RailKind::Continue, title: "Continue watching".into(), list: None, tiles: (0..self.continue_items.len()).map(Tile::Continue).collect() });
         }
         for list in ctx.favs.non_empty_lists() {
             let tiles: Vec<Tile> = ctx
@@ -361,13 +527,14 @@ impl HomeScreen {
                 .iter()
                 .filter_map(|r| match r.kind {
                     ItemKind::Channel => ctx.lib.live.by_ref(r).filter(|id| !ctx.lib.live.hidden.contains(id)).map(|id| Tile::Channel { id, collection: Some(Collection::Favourites(list.id)) }),
-                    _ => vod_by_ref(ctx, r).map(Tile::Vod),
+                    _ => self.vod_refs.get(r).copied().map(Tile::Vod),
                 })
                 .take(RAIL_MAX)
                 .collect();
             if !tiles.is_empty() {
-                let title = if list.is_default { "Favourite channels".to_owned() } else { list.name.clone() };
-                rails.push(Rail { kind: RailKind::Favourites, title, tiles });
+                // the default list holds channels and titles alike
+                let title = if list.is_default { "Favourites".to_owned() } else { list.name.clone() };
+                rails.push(Rail { kind: RailKind::Favourites, title, list: Some(list.id), tiles });
             }
         }
         let recent: Vec<Tile> = ctx
@@ -379,20 +546,20 @@ impl HomeScreen {
             .map(|id| Tile::Channel { id: *id, collection: None })
             .collect();
         if !recent.is_empty() {
-            rails.push(Rail { kind: RailKind::Recent, title: "Recently watched".into(), tiles: recent });
+            rails.push(Rail { kind: RailKind::Recent, title: "Recently watched".into(), list: None, tiles: recent });
         }
         if !self.recent_movies.is_empty() {
-            rails.push(Rail { kind: RailKind::Movies, title: "Recently added movies".into(), tiles: self.recent_movies.iter().map(|v| Tile::Vod(v.kind)).collect() });
+            rails.push(Rail { kind: RailKind::Movies, title: "Recently added movies".into(), list: None, tiles: self.recent_movies.iter().map(|v| Tile::Vod(v.kind)).collect() });
         }
         if !self.recent_series.is_empty() {
-            rails.push(Rail { kind: RailKind::Series, title: "Recently added series".into(), tiles: self.recent_series.iter().map(|v| Tile::Vod(v.kind)).collect() });
+            rails.push(Rail { kind: RailKind::Series, title: "Recently added series".into(), list: None, tiles: self.recent_series.iter().map(|v| Tile::Vod(v.kind)).collect() });
         }
         if rails.len() < 2 {
             let mut tiles = vec![Tile::Start(StartAction::BrowseLive), Tile::Start(StartAction::OpenGuide), Tile::Start(StartAction::AddFavourites)];
             if let Some(g) = ctx.lib.live.visible_groups(None, true).first() {
                 tiles.extend(ctx.lib.live.group_members(g.id).iter().take(RAIL_MAX).map(|id| Tile::Channel { id: *id, collection: None }));
             }
-            rails.push(Rail { kind: RailKind::GetStarted, title: "Get started".into(), tiles });
+            rails.push(Rail { kind: RailKind::GetStarted, title: "Get started".into(), list: None, tiles });
         }
         // keep the cursor on the same rail (by kind + title) across rebuilds
         let current = self.cols.get(self.rail).map(|(k, t, _)| (*k, t.clone()));
@@ -451,6 +618,11 @@ impl HomeScreen {
             }
             Tile::Continue(i) => {
                 let Some(c) = self.continue_items.get(i).cloned() else { return };
+                // `card.locked` is the effective lock (the title or one of its categories)
+                if c.card.locked && !kit::unlocked(ctx) {
+                    kit::ask_pin(ctx, if alt { Action::ActivateAlt } else { Action::Activate }, "This title is locked");
+                    return;
+                }
                 if alt {
                     // Shift+Enter resumes directly
                     kit::play_media(ctx, c.media, true, PlayOrigin::Home);
@@ -461,7 +633,7 @@ impl HomeScreen {
             Tile::Start(StartAction::BrowseLive) => ctx.navigate(crate::ui::NavRequest::Switch(Route::Live { group: None, channel: None })),
             Tile::Start(StartAction::OpenGuide) => ctx.navigate(crate::ui::NavRequest::Switch(Route::Guide { collection: None, focus: None })),
             Tile::Start(StartAction::AddFavourites) => {
-                ctx.toast(crate::msg::Toast::info("Press Ctrl+F on any channel to add it here"));
+                ctx.toast(crate::msg::Toast::info("Press Ctrl+F on any channel to add it to your favourites"));
                 ctx.navigate(crate::ui::NavRequest::Switch(Route::Live { group: None, channel: None }));
             }
         }
@@ -475,6 +647,136 @@ impl HomeScreen {
             Tile::Start(_) => None,
         }
     }
+
+    /// Display name of a tile (rename / hide / menu titles).
+    fn tile_name(&self, ctx: &UiCtx<'_>, tile: &Tile) -> String {
+        match tile {
+            Tile::Channel { id, .. } => ctx.lib.live.get(*id).map(|c| c.name.to_string()),
+            Tile::Vod(kind) => ctx.lib.vod.find(*kind).map(|v| v.name.to_string()),
+            Tile::Continue(i) => self.continue_items.get(*i).map(|c| c.card.name.to_string()),
+            Tile::Start(_) => None,
+        }
+        .unwrap_or_default()
+    }
+
+    /// (effective lock, locked through a category) of a tile.
+    fn tile_lock(&self, ctx: &UiCtx<'_>, tile: &Tile) -> (bool, bool) {
+        match tile {
+            Tile::Channel { id, .. } => ctx.lib.live.get(*id).map_or((false, false), |c| (c.locked, kit::any_group_locked(&ctx.lib.live.groups, &c.group_ids))),
+            Tile::Vod(kind) => ctx.lib.vod.find(*kind).map_or((false, false), |v| (v.locked, vod_group_locked(ctx, v))),
+            Tile::Continue(i) => self.continue_items.get(*i).map_or((false, false), |c| (c.card.locked, vod_group_locked(ctx, &c.card))),
+            Tile::Start(_) => (false, false),
+        }
+    }
+
+    /// Item shortcuts (Help lists them for `[PosterGrid]`) and the context menu.
+    fn item_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) {
+        if action == Action::SortMenu {
+            ctx.toast(crate::msg::Toast::info("Home follows your lists — sort in Live TV, Movies or Series"));
+            return;
+        }
+        let Some(tile) = self.current_tile().map(|(_, t)| t.clone()) else { return kit::not_here(ctx) };
+        let rail = self.rails.get(self.rail).map(|r| (r.kind, r.list));
+        let Some(item) = self.tile_item(ctx, &tile) else { return kit::not_here(ctx) };
+        let name = self.tile_name(ctx, &tile);
+        match (action, &tile) {
+            (Action::ToggleFavourite, _) => kit::toggle_favourite(ctx, &item),
+            (Action::AddToList, _) => kit::list_picker(ctx, &item, &name),
+            (Action::ToggleHidden, _) => kit::hide_item(ctx, &item, &name),
+            (Action::Rename, _) => kit::rename_item(ctx, &item, &name),
+            (Action::ToggleLock, _) => {
+                let (locked, by_group) = self.tile_lock(ctx, &tile);
+                kit::toggle_lock(ctx, &item, locked, by_group);
+            }
+            (Action::ShowDetails, Tile::Channel { .. }) => ctx.open(OverlayRequest::EditItem(item)),
+            (Action::ShowDetails, Tile::Vod(VodKind::Movie(id))) => ctx.push(Route::MovieDetail(*id)),
+            (Action::ShowDetails, Tile::Vod(VodKind::Series(id))) => ctx.push(Route::SeriesDetail(*id)),
+            (Action::ShowDetails, Tile::Continue(i)) => {
+                if let Some(c) = self.continue_items.get(*i) {
+                    ctx.push(c.open.clone());
+                }
+            }
+            (Action::OpenInGuide, Tile::Channel { id, .. }) => ctx.push(Route::Guide { collection: None, focus: Some(*id) }),
+            (Action::AssignEpg, Tile::Channel { id, .. }) => ctx.push(Route::EpgMapping { channel: Some(*id) }),
+            (Action::MarkWatched, Tile::Vod(VodKind::Movie(_)) | Tile::Continue(_)) => kit::mark_watched(ctx, &item, &name, true),
+            (Action::MarkWatched, Tile::Vod(VodKind::Series(_))) => ctx.toast(crate::msg::Toast::info("Open the series to mark its episodes watched")),
+            (Action::Remove, _) => match rail {
+                Some((RailKind::Favourites, Some(list))) => {
+                    kit::set_in_list(ctx, list, &item, false);
+                    let list_name = ctx.favs.lists.iter().find(|l| l.id == list).map(|l| l.name.clone()).unwrap_or_default();
+                    ctx.toast(crate::msg::Toast::info(format!("Removed from {list_name}")));
+                }
+                Some((RailKind::Continue, _)) => kit::mark_watched(ctx, &item, &name, false),
+                _ => kit::not_here(ctx),
+            },
+            (Action::MoveUp | Action::MoveDown, _) => match rail {
+                Some((RailKind::Favourites, Some(list))) => self.move_in_list(ctx, list, &item, if action == Action::MoveUp { -1 } else { 1 }),
+                _ => kit::not_here(ctx),
+            },
+            (Action::ContextMenu, _) => self.menu(ctx, &tile, rail, &name),
+            _ => kit::not_here(ctx),
+        }
+    }
+
+    /// Alt+↑/↓ on a favourites rail: move the tile within its list (the cursor follows).
+    fn move_in_list(&mut self, ctx: &mut UiCtx<'_>, list: FavListId, item: &ItemRef, delta: isize) {
+        let items = ctx.favs.items(list);
+        let Some(i) = items.iter().position(|r| r == item) else { return };
+        let j = i as isize + delta;
+        if j < 0 || j as usize >= items.len() {
+            return;
+        }
+        let write_item = item.clone();
+        let _ = ctx.services.store.writer().submit_notify(DataScope::Favourites, move |c| crate::store::user::move_favourite(c, list, &write_item, j as usize));
+        self.move_col(delta);
+    }
+
+    /// Shift+F10 / right-click: the tile's actions (each echoed back as `Chosen(action)`).
+    fn menu(&self, ctx: &mut UiCtx<'_>, tile: &Tile, rail: Option<(RailKind, Option<FavListId>)>, name: &str) {
+        let mi = |icon: &'static str, label: &str, action: Action, shortcut: &str| MenuItem { icon, label: label.into(), action, enabled: true, shortcut: Some(shortcut.into()) };
+        let mut items = Vec::new();
+        match tile {
+            Tile::Channel { .. } => {
+                items.push(mi(glyphs::PLAY, "Play", Action::Activate, "Enter"));
+                items.push(mi(glyphs::GUIDE, "Show in TV guide", Action::OpenInGuide, "Ctrl+G"));
+                items.push(mi(glyphs::INFO, "Edit information…", Action::ShowDetails, "Ctrl+I"));
+                items.push(mi(glyphs::GUIDE, "Assign EPG channel…", Action::AssignEpg, "Ctrl+E"));
+            }
+            Tile::Vod(_) | Tile::Continue(_) => {
+                items.push(mi(glyphs::INFO, "Details", Action::Activate, "Enter"));
+                items.push(mi(glyphs::PLAY, "Play / resume", Action::ActivateAlt, "Shift+Enter"));
+                if !matches!(tile, Tile::Vod(VodKind::Series(_))) {
+                    items.push(mi(glyphs::CHECK, "Mark watched", Action::MarkWatched, "Ctrl+W"));
+                }
+            }
+            Tile::Start(_) => return,
+        }
+        let fav = self.tile_item(ctx, tile).is_some_and(|i| ctx.favs.is_fav(&i));
+        items.push(mi(glyphs::FAVOURITE, if fav { "Remove from Favourites" } else { "Add to Favourites" }, Action::ToggleFavourite, "Ctrl+F"));
+        items.push(mi(glyphs::FAV_LIST, "Favourites lists…", Action::AddToList, "Ctrl+Shift+F"));
+        match rail {
+            Some((RailKind::Favourites, Some(_))) => {
+                items.push(mi(glyphs::CLOSE, "Remove from this list", Action::Remove, "Delete"));
+                items.push(mi(glyphs::REORDER, "Move earlier", Action::MoveUp, "Alt+↑"));
+                items.push(mi(glyphs::REORDER, "Move later", Action::MoveDown, "Alt+↓"));
+            }
+            Some((RailKind::Continue, _)) => items.push(mi(glyphs::CLOSE, "Remove from Continue watching", Action::Remove, "Delete")),
+            _ => {}
+        }
+        items.push(mi(glyphs::TAG, "Rename…", Action::Rename, "F2"));
+        items.push(mi(glyphs::LOCK, "Lock / unlock", Action::ToggleLock, "Ctrl+L"));
+        items.push(mi(glyphs::HIDDEN, "Hide", Action::ToggleHidden, "Ctrl+H"));
+        ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: name.to_owned(), items }));
+    }
+}
+
+/// A title is locked through one of its categories.
+fn vod_group_locked(ctx: &UiCtx<'_>, v: &VodSummary) -> bool {
+    let groups = match v.kind {
+        VodKind::Movie(_) => &ctx.lib.vod.movie_groups,
+        VodKind::Series(_) => &ctx.lib.vod.series_groups,
+    };
+    kit::any_group_locked(groups, &v.group_ids)
 }
 
 /// The durable reference of a poster-grid row.
@@ -484,16 +786,6 @@ pub(crate) fn vod_ref(v: &VodSummary) -> ItemRef {
         VodKind::Series(_) => ItemKind::Series,
     };
     ItemRef { source: v.source_id, kind, key: v.key.clone() }
-}
-
-/// A favourited movie/series in the library (linear scan of one kind; favourites lists are short).
-fn vod_by_ref(ctx: &UiCtx<'_>, r: &ItemRef) -> Option<VodKind> {
-    let all = match r.kind {
-        ItemKind::Movie => &ctx.lib.vod.movies,
-        ItemKind::Series => &ctx.lib.vod.series,
-        _ => return None,
-    };
-    all.iter().find(|v| v.source_id == r.source && v.key == r.key).map(|v| v.kind)
 }
 
 /// Continue watching: unfinished movies and episodes with their posters (blocking pool).
@@ -564,6 +856,14 @@ impl Screen for HomeScreen {
     }
 
     fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
+        if ctx.lib.built_at != 0 && ctx.lib.sources.is_empty() {
+            // "No playlists yet": Enter is the "Add playlist" button
+            if action == Action::Activate {
+                ctx.navigate(crate::ui::NavRequest::Switch(Route::Onboarding(OnboardingStart::Welcome)));
+                return true;
+            }
+            return matches!(action, Action::Up | Action::Down | Action::Left | Action::Right | Action::FilterInput(_));
+        }
         match action {
             Action::Up | Action::Down => {
                 let n = self.rails.len();
@@ -596,10 +896,21 @@ impl Screen for HomeScreen {
                 self.activate(ctx, true);
                 true
             }
-            Action::ToggleFavourite => {
-                if let Some(item) = self.current_tile().and_then(|(_, t)| self.tile_item(ctx, t)) {
-                    kit::toggle_favourite(ctx, &item);
-                }
+            Action::ToggleFavourite
+            | Action::AddToList
+            | Action::ToggleHidden
+            | Action::Rename
+            | Action::ToggleLock
+            | Action::MoveUp
+            | Action::MoveDown
+            | Action::SortMenu
+            | Action::OpenInGuide
+            | Action::ShowDetails
+            | Action::AssignEpg
+            | Action::MarkWatched
+            | Action::Remove
+            | Action::ContextMenu => {
+                self.item_action(ctx, action);
                 true
             }
             // letters never filter on Home (DESIGN §13.3)
@@ -608,15 +919,26 @@ impl Screen for HomeScreen {
         }
     }
 
-    fn on_overlay_result(&mut self, ctx: &mut UiCtx<'_>, result: crate::ui::overlays::OverlayResult) {
-        if let crate::ui::overlays::OverlayResult::Unlocked(a @ (Action::Activate | Action::ActivateAlt)) = result {
-            self.activate(ctx, a == Action::ActivateAlt);
+    fn on_overlay_result(&mut self, ctx: &mut UiCtx<'_>, result: OverlayResult) {
+        match result {
+            OverlayResult::Unlocked(a @ (Action::Activate | Action::ActivateAlt)) | OverlayResult::Chosen(a @ (Action::Activate | Action::ActivateAlt)) => {
+                self.activate(ctx, a == Action::ActivateAlt)
+            }
+            OverlayResult::Unlocked(Action::ToggleLock) => self.item_action(ctx, Action::ToggleLock),
+            // the context menu (its entries are the shortcuts themselves)
+            OverlayResult::Chosen(a) if a != Action::ContextMenu => self.item_action(ctx, a),
+            _ => {}
         }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) {
         match kit::poll(&mut self.continue_loader) {
-            Some(Ok(items)) => self.continue_items = items,
+            Some(Ok(items)) => {
+                if items != self.continue_items {
+                    self.continue_items = items;
+                    self.continue_gen += 1;
+                }
+            }
             Some(Err(e)) => tracing::warn!("continue watching: {e}"),
             None => {}
         }
@@ -626,6 +948,10 @@ impl Screen for HomeScreen {
             return;
         }
         if ctx.lib.sources.is_empty() {
+            // nothing to act on: no stale tile of a deleted playlist stays reachable
+            self.rails.clear();
+            self.cols.clear();
+            self.rails_key = None;
             let r = empty_state::empty_state(ui, theme, glyphs::PLAYLIST, "No playlists yet", Some("Add an M3U playlist or an Xtream login to start watching."), Some("Add playlist"));
             if r.is_some_and(|r| r.clicked()) {
                 ctx.navigate(crate::ui::NavRequest::Switch(Route::Onboarding(OnboardingStart::Welcome)));
@@ -719,7 +1045,7 @@ fn draw_tile(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, continues: &[ContinueItem],
         },
         Tile::Continue(i) => match continues.get(*i) {
             Some(c) => {
-                let decor = TileDecor { progress: Some(c.progress), playing: playing.as_ref() == Some(&c.media), watched: false };
+                let decor = TileDecor { progress: Some(c.progress), playing: playing.as_ref() == Some(&c.media), ..Default::default() };
                 poster::poster_tile(ui, theme, ctx.images, &c.card, poster_w, cursor, decor)
             }
             None => ui.allocate_exact_size(egui::vec2(poster_w, poster_w), egui::Sense::hover()).1,
@@ -766,11 +1092,17 @@ fn channel_tile(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, id: ChannelId, cursor: b
         return resp;
     }
     let pad = theme.space(SpaceToken::Lg);
-    let logo_size = rect.height() - 2.0 * pad;
-    let logo_rect = Rect::from_min_size(rect.min + egui::vec2(pad, pad), egui::vec2(logo_size, logo_size));
-    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(logo_rect));
-    crate::ui::widgets::logo::logo(&mut child, theme, ctx.images, ch.logo.as_deref(), &ch.name, logo_size);
-    let mut left = logo_rect.right() + pad;
+    // Settings ▸ Interface ▸ Channel logos
+    let text_left = if ctx.config.interface.show_logos {
+        let logo_size = rect.height() - 2.0 * pad;
+        let logo_rect = Rect::from_min_size(rect.min + egui::vec2(pad, pad), egui::vec2(logo_size, logo_size));
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(logo_rect));
+        crate::ui::widgets::logo::logo(&mut child, theme, ctx.images, ch.logo.as_deref(), &ch.name, logo_size);
+        logo_rect.right() + pad
+    } else {
+        rect.left() + pad
+    };
+    let mut left = text_left;
     let right = rect.right() - pad;
     let p = ui.painter();
     let top_y = rect.top() + rect.height() * 0.32;
@@ -784,7 +1116,7 @@ fn channel_tile(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, id: ChannelId, cursor: b
     }
     elided(p, egui::pos2(left, top_y), &ch.name, egui::FontId::proportional(theme.font(TypeToken::Body)), name_color, right - left - theme.font(TypeToken::Icon));
     let detail_y = rect.top() + rect.height() * 0.64;
-    let left = logo_rect.right() + pad;
+    let left = text_left;
     let nn: Option<NowNext> = ch.epg_channel_id.and_then(|e| {
         let mut reader = ctx.epg_reader();
         ctx.now_next.get((e, ch.tvg_shift_min), ctx.now, &mut reader, ctx.budget).cloned()
@@ -1151,7 +1483,7 @@ mod tests {
         let mut h = harness(t, one, HomeScreen::default(), egui::vec2(1400.0, 900.0));
         h.state_mut().enter(Route::Home);
         h.run_steps(3);
-        assert!(has_label(&h, "FAVOURITE CHANNELS"), "favourites rail");
+        assert!(has_label(&h, "FAVOURITES"), "favourites rail");
         assert!(has_label(&h, "RECENTLY ADDED MOVIES"));
         assert!(!has_label(&h, "GET STARTED"), "two rails: no get-started rail");
         assert_eq!(h.state().s.key_contexts(), vec![KeyContext::PosterGrid]);
@@ -1233,6 +1565,10 @@ mod tests {
         h.get_by_label("Add playlist").click();
         h.run_steps(2);
         assert_eq!(h.state_mut().nav(), vec![NavRequest::Switch(Route::Onboarding(OnboardingStart::Welcome))]);
+        // …and by keyboard: Enter is "Add playlist"; no tile of the deleted playlist is left
+        assert!(h.state().s.rails.is_empty(), "stale rails dropped");
+        h.state_mut().act(Action::Activate);
+        assert_eq!(h.state_mut().nav(), vec![NavRequest::Switch(Route::Onboarding(OnboardingStart::Welcome))]);
     }
 
     #[test]
@@ -1260,6 +1596,96 @@ mod tests {
         assert!(app.t.parental.unlock("1234", &cfg.parental));
         app.result(crate::ui::overlays::OverlayResult::Unlocked(Action::Activate));
         assert_eq!(h.state_mut().nav(), vec![NavRequest::Push(Route::Player)]);
+    }
+
+    /// Review fixes: a locked title on Continue watching asks for the PIN before Shift+Enter
+    /// resumes it; favourited titles get a rail; Delete removes a tile from its favourites
+    /// list; Ctrl+H hides; the item shortcuts and the context menu work on tiles.
+    #[test]
+    fn continue_watching_respects_locks_and_tiles_take_the_item_shortcuts() {
+        let (mut t, one) = rig();
+        let src = seed(&mut t, |c| {
+            let s = testkit::source(c, "My IPTV")?;
+            testkit::channels(c, s, 5)?;
+            testkit::movies(c, s, 3)?;
+            let movie = |i: usize| ItemRef { source: s, kind: ItemKind::Movie, key: ItemKey(format!("m3u:movie{i:010}")) };
+            crate::store::user::save_progress(c, &WatchProgress { item: movie(0), position_s: 600.0, duration_s: Some(1200.0), updated_at: 5, finished: false, title: "Movie 0".into(), fingerprint: Default::default() })?;
+            crate::store::user::set_item_override(c, &movie(0), &crate::model::ItemOverride { locked: true, ..Default::default() })?;
+            let list = crate::store::user::default_fav_list(c)?;
+            crate::store::user::set_favourite(c, list, &movie(1), true, 1)?;
+            crate::store::user::set_favourite(c, list, &channel_ref(s, 2), true, 2)?;
+            Ok(s)
+        });
+        let mut cfg = (*t.config).clone();
+        cfg.parental = crate::config::ParentalConfig { enabled: true, pin_salt: Some("s".into()), pin_hash: Some(crate::ui::parental::hash_pin("1234", "s")), relock_min: 0 };
+        t.config = Arc::new(cfg);
+        let mut h = harness(t, one, HomeScreen::default(), egui::vec2(1400.0, 900.0));
+        h.state_mut().enter(Route::Home);
+        until(&mut h, "continue watching", |h| has_label(h, "CONTINUE WATCHING"));
+        assert_eq!(h.state().s.rails[0].kind, RailKind::Continue);
+        h.state_mut().s.rail = 0;
+        // the locked movie: Shift+Enter asks for the PIN instead of playing
+        h.state_mut().act(Action::ActivateAlt);
+        let nav = h.state_mut().nav();
+        assert!(matches!(nav.as_slice(), [NavRequest::Open(OverlayRequest::Pin { then, .. })] if **then == Action::ActivateAlt), "{nav:?}");
+        let app = h.state_mut();
+        let p = app.t.config.parental.clone();
+        assert!(app.t.parental.unlock("1234", &p));
+        app.result(OverlayResult::Unlocked(Action::ActivateAlt));
+        assert_eq!(h.state_mut().nav(), vec![NavRequest::Push(Route::Player)], "resumed once unlocked");
+
+        // the favourites rail holds the movie and the channel (in list order)
+        assert!(has_label(&h, "FAVOURITES"));
+        h.state_mut().act(Action::Down);
+        let rail = &h.state().s.rails[h.state().s.rail];
+        assert_eq!(rail.kind, RailKind::Favourites);
+        assert!(matches!(rail.tiles.as_slice(), [Tile::Vod(VodKind::Movie(_)), Tile::Channel { .. }]), "{:?}", rail.tiles);
+        // the context menu lists the tile's actions; Delete removes the movie from the list
+        h.state_mut().act(Action::ContextMenu);
+        let nav = h.state_mut().nav();
+        assert!(matches!(nav.as_slice(), [NavRequest::Open(OverlayRequest::ContextMenu(m))] if m.items.iter().any(|i| i.action == Action::Remove)), "{nav:?}");
+        h.state_mut().act(Action::Remove);
+        let movie1 = ItemRef { source: src, kind: ItemKind::Movie, key: ItemKey("m3u:movie0000000001".into()) };
+        until(&mut h, "removed from the list", |h| crate::store::user::lists_containing(&h.state().t.services().store.reader().unwrap(), &movie1).unwrap().is_empty());
+        h.run_steps(1);
+        let rail = &h.state().s.rails[h.state().s.rail];
+        assert!(matches!(rail.tiles.as_slice(), [Tile::Channel { .. }]), "the rail follows at once: {:?}", rail.tiles);
+        // Ctrl+H hides the channel; Ctrl+G shows it in the guide; Ctrl+S explains itself
+        h.state_mut().act(Action::ToggleHidden);
+        until(&mut h, "hidden", |h| {
+            crate::store::user::item_override(&h.state().t.services().store.reader().unwrap(), &channel_ref(src, 2)).unwrap().is_some_and(|o| o.hidden)
+        });
+        h.state_mut().act(Action::OpenInGuide);
+        assert!(matches!(h.state_mut().nav().as_slice(), [NavRequest::Push(Route::Guide { focus: Some(_), .. })]));
+        let toasts = h.state().t.toasts.len();
+        assert!(h.state_mut().act(Action::SortMenu));
+        assert_eq!(h.state().t.toasts.len(), toasts + 1, "Ctrl+S on Home says why nothing sorts");
+        assert!(h.state_mut().nav().is_empty());
+    }
+
+    /// The rails are rebuilt only when their inputs change (not per frame).
+    #[test]
+    fn rails_are_cached_until_the_library_or_favourites_change() {
+        let (mut t, one) = rig();
+        let src = seed(&mut t, |c| {
+            let s = testkit::source(c, "My IPTV")?;
+            testkit::channels(c, s, 3)?;
+            testkit::movies(c, s, 2)?;
+            Ok(s)
+        });
+        let mut h = harness(t, one, HomeScreen::default(), egui::vec2(1200.0, 800.0));
+        h.state_mut().enter(Route::Home);
+        h.run_steps(2);
+        let key = h.state().s.rails_key;
+        assert!(key.is_some());
+        h.run_steps(3);
+        assert_eq!(h.state().s.rails_key, key, "same inputs, same rails");
+        let app = h.state_mut();
+        let list = app.t.favs.default_list().unwrap();
+        app.t.favs.apply_toggle(list, &channel_ref(src, 1), true);
+        h.run_steps(1);
+        assert_ne!(h.state().s.rails_key, key, "a favourite rebuilds them");
+        assert!(has_label(&h, "FAVOURITES"));
     }
 
     /// A boxed screen as a `Screen` (one harness type for every screen).
@@ -1340,7 +1766,17 @@ mod tests {
         assert_eq!(kit::ago(1000, 990), "just now");
         assert_eq!(kit::ago(10_000, 10_000 - 7200), "2 h ago");
         assert_eq!(kit::ago(1_000_000, 1_000_000 - 3 * 86_400), "3 d ago");
-        assert_eq!(kit::hhmm(1_791_576_000).len(), 5);
+        assert_eq!(kit::hhmm(1_791_576_000, true).len(), 5);
         assert_eq!(kit::date(1_791_576_000).len(), 10);
+        // Settings ▸ Interface ▸ Clock: the 12-hour clock has no leading zero and an AM/PM
+        for h in 0..24 {
+            let ts = 1_791_576_000 + h * 3600;
+            let twelve = kit::hhmm(ts, false);
+            assert!(twelve.ends_with(" AM") || twelve.ends_with(" PM"), "{twelve}");
+            assert!(!twelve.starts_with('0') && twelve.len() <= 8, "{twelve}");
+            let (day24, day12) = (kit::day_time(ts, true), kit::day_time(ts, false));
+            assert_eq!(day24.len(), 9, "{day24}");
+            assert!(day12.ends_with('M') && day12[..3] == day24[..3], "{day12} / {day24}");
+        }
     }
 }

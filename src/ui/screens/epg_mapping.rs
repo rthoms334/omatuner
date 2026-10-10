@@ -361,6 +361,11 @@ impl Screen for EpgMappingScreen {
             }
             _ => {}
         }
+        // Esc in the candidates pane returns to the channel list (then leaves the screen)
+        if action == Action::Back && self.pane == Pane::Candidates {
+            self.pane = Pane::Channels;
+            return true;
+        }
         match self.pane {
             Pane::Channels => match self.channels.handle(action) {
                 ListOutcome::Moved => {
@@ -435,7 +440,11 @@ impl Screen for EpgMappingScreen {
             return;
         }
         if self.catalog.as_ref().is_some_and(|c| c.entries.is_empty()) {
-            empty_state::empty_state(ui, theme, glyphs::GUIDE, "No guide data", Some("Add an XMLTV guide in Settings ▸ EPG, then map channels here."), None);
+            if empty_state::empty_state(ui, theme, glyphs::GUIDE, "No guide data", Some("Add an XMLTV guide in Settings ▸ EPG, then map channels here."), Some("Open EPG settings"))
+                .is_some_and(|r| r.clicked())
+            {
+                ctx.push(Route::Settings(crate::ui::SettingsPage::Epg));
+            }
             return;
         }
         let compact = ctx.layout == LayoutClass::Compact;
@@ -444,10 +453,10 @@ impl Screen for EpgMappingScreen {
         let left_w = if compact { full.width() } else { (full.width() * 0.48).round() };
         let left = egui::Rect::from_min_size(full.min, egui::vec2(left_w, full.height()));
         let right = if compact { full } else { egui::Rect::from_min_max(egui::pos2(left.right() + gap, full.top()), full.max) };
-        let row_h = rows::row_height(theme, crate::config::Density::Comfortable, true);
+        let row_h = rows::row_height(theme, ctx.config.interface.density, true);
         if !compact || self.pane == Pane::Channels {
             let mut ui_l = ui.new_child(egui::UiBuilder::new().id_salt("map-chans").max_rect(left).layout(egui::Layout::top_down(egui::Align::Min)));
-            let header = format!("{} channels (Ctrl+S)", self.mode.label());
+            let header = format!("{} channels — Ctrl+S changes the view", self.mode.label());
             search_header(&mut ui_l, theme, self.channels.filter.query(), &header, Some(glyphs::SEARCH));
             ui_l.add_space(theme.space(SpaceToken::Md));
             if self.chan_rows.is_empty() {
@@ -599,6 +608,10 @@ mod tests {
         // Enter on the channel → the candidates pane; Enter there assigns the best suggestion
         h.state_mut().act(Action::Activate);
         assert_eq!(h.state().s.pane, Pane::Candidates);
+        // Esc there returns to the channel list (it doesn't leave the screen)
+        assert!(h.state_mut().act(Action::Back));
+        assert_eq!(h.state().s.pane, Pane::Channels);
+        h.state_mut().act(Action::Activate);
         assert!(matches!(h.state().s.cand_rows.first(), Some(Cand::Suggestion(_))));
         h.state_mut().act(Action::Activate);
         until(&mut h, "the manual mapping", |h| manual(&h.state().t, 3).len() == 1);

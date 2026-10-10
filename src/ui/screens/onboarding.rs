@@ -426,12 +426,28 @@ impl OnboardingScreen {
     }
 
     /// Back one step; false when there is nothing before (the app's Back then leaves).
-    fn back(&mut self) -> bool {
-        let first = match self.start {
+    /// The Back / Cancel button under the card (`None` where Esc does nothing: first-run
+    /// Welcome, a running import, the end of a restore).
+    fn back_label(&self) -> Option<&'static str> {
+        match self.step {
+            Step::Welcome | Step::Importing | Step::Done | Step::Restoring => None,
+            Step::Test if self.probe.is_some() => Some("Cancel"),
+            _ if self.step == self.first_step() => Some("Cancel"),
+            _ => Some("Back"),
+        }
+    }
+
+    /// Where this card starts for its route.
+    fn first_step(&self) -> Step {
+        match self.start {
             OnboardingStart::Welcome => Step::Welcome,
             OnboardingStart::AddSource => Step::Type,
             OnboardingStart::PlaylistFile(_) | OnboardingStart::NeedsCredentials(_) => Step::Details,
-        };
+        }
+    }
+
+    fn back(&mut self) -> bool {
+        let first = self.first_step();
         let prev = match self.step {
             s if s == first => return false,
             Step::Welcome => return false,
@@ -877,6 +893,7 @@ impl Screen for OnboardingScreen {
         let card_rect = egui::Rect::from_min_size(egui::pos2(full.center().x - width / 2.0, top), egui::vec2(width, full.bottom() - top));
         let mut card_ui = ui.new_child(egui::UiBuilder::new().id_salt("onboarding-card").max_rect(card_rect).layout(egui::Layout::top_down(egui::Align::Min)));
         let mut clicked: Option<usize> = None;
+        let mut back_clicked = false;
         frame.show(&mut card_ui, |ui| {
             ui.set_width(width - chrome);
             egui::ScrollArea::vertical().id_salt("onboarding").max_height(full.height() - 2.0 * theme.space(SpaceToken::PanelPadding)).show(ui, |ui| {
@@ -903,11 +920,22 @@ impl Screen for OnboardingScreen {
                     Step::Restoring => self.restoring_ui(ui, ctx),
                 };
                 ui.add_space(theme.space(SpaceToken::Lg));
-                let hint = if self.editing { "Enter next · Tab next field · Esc leave the field" } else { "↑/↓ move · Enter choose · Esc back" };
-                ui.label(RichText::new(hint).size(theme.font(TypeToken::BodySmall)).color(t.text_disabled));
+                // the mouse twin of Esc: a step back, or out of the card where it was opened
+                // from Settings / a file / a restored playlist
+                ui.horizontal(|ui| {
+                    if let Some(label) = self.back_label() {
+                        back_clicked = button(ui, theme, Some(glyphs::PREVIOUS), label, ButtonStyle::default()).clicked();
+                        ui.add_space(theme.space(SpaceToken::Lg));
+                    }
+                    let hint = if self.editing { "Enter next · Tab next field · Esc leave the field" } else { "↑/↓ move · Enter choose · Esc back" };
+                    ui.label(RichText::new(hint).size(theme.font(TypeToken::BodySmall)).color(t.text_disabled));
+                });
             });
         });
         ui.allocate_rect(full, egui::Sense::hover());
+        if back_clicked && !self.back() {
+            ctx.navigate(crate::ui::NavRequest::Back);
+        }
         if let Some(i) = clicked {
             self.focus = i;
             self.editing = self.current_field().is_some_and(Field::is_text);
@@ -965,8 +993,9 @@ fn picker_row(ui: &mut egui::Ui, theme: &Theme, label: &str, value: &str, color:
         ui.label(RichText::new(label).size(theme.font(TypeToken::Body)).color(if focused { t.accent } else { t.text_secondary }));
         ui.add_space(theme.space(SpaceToken::Lg));
         let b = button(ui, theme, None, &format!("‹  {value}  ›"), ButtonStyle { focused, bordered: true, ..Default::default() });
-        // a swatch of the value's colour (icons: fg)
-        let sw = egui::Rect::from_min_size(egui::pos2(b.rect.right() + theme.space(SpaceToken::Lg), b.rect.center().y - 6.0), egui::vec2(12.0, 12.0));
+        // a swatch of the value's colour (icons: fg), as tall as the text
+        let side = theme.font(TypeToken::Body).round();
+        let sw = egui::Rect::from_min_size(egui::pos2(b.rect.right() + theme.space(SpaceToken::Lg), b.rect.center().y - side / 2.0), egui::vec2(side, side));
         ui.allocate_rect(sw, egui::Sense::hover());
         ui.painter().rect_filled(sw, t.rounding, color);
         b.clicked()
@@ -1009,7 +1038,9 @@ impl OnboardingScreen {
                     let col = theme.source_color(c);
                     let g = glyphs::SOURCE_ICONS.get(self.form.icon).copied().unwrap_or(glyphs::PLAYLIST);
                     let r = picker_row(ui, theme, "Colour", name, col, focused);
-                    ui.label(RichText::new(format!("{g}  {}", if self.form.name.trim().is_empty() { self.form.default_name() } else { self.form.name.trim().to_owned() })).size(theme.font(TypeToken::Body)).color(col));
+                    // the preview is text: yellow on a light theme falls back to fg
+                    let text = kit::legible(theme, col);
+                    ui.label(RichText::new(format!("{g}  {}", if self.form.name.trim().is_empty() { self.form.default_name() } else { self.form.name.trim().to_owned() })).size(theme.font(TypeToken::Body)).color(text));
                     ui.add_space(theme.space(SpaceToken::Md));
                     r
                 }
@@ -1201,7 +1232,7 @@ impl OnboardingScreen {
                 None
             }
             Some(Ok(r)) => {
-                ui.label(RichText::new(format!("{}  Restored {} playlist(s) ({} matched existing ones)", glyphs::CHECK, r.sources_added, r.sources_matched)).size(theme.font(TypeToken::Body)).color(t.fg));
+                ui.label(RichText::new(format!("{}  {}", glyphs::CHECK, restored_text(r.sources_added, r.sources_matched))).size(theme.font(TypeToken::Body)).color(t.fg));
                 if !r.needs_credentials.is_empty() {
                     ui.label(RichText::new(format!("Needs credentials: {} — enter them in Settings ▸ Playlists.", r.needs_credentials.join(", "))).size(theme.font(TypeToken::BodySmall)).color(t.warning));
                 }
@@ -1221,6 +1252,16 @@ impl OnboardingScreen {
             }
         }
     }
+}
+
+/// "Restored 2 playlists (1 matched an existing one)".
+fn restored_text(added: u32, matched: u32) -> String {
+    let plural = |n: u32, one: &str, many: &str| if n == 1 { format!("{n} {one}") } else { format!("{n} {many}") };
+    let mut s = format!("Restored {}", plural(added, "playlist", "playlists"));
+    if matched > 0 {
+        s.push_str(&format!(" ({} matched {})", matched, if matched == 1 { "an existing one" } else { "existing ones" }));
+    }
+    s
 }
 
 /// A row of buttons (focus ring on `focus`); returns the clicked index.
@@ -1353,6 +1394,29 @@ mod tests {
         assert_eq!(s.key_contexts(), vec![KeyContext::Modal]);
         assert!(s.back());
         assert_eq!(s.step, Step::Type);
+    }
+
+    /// Mouse users get the Esc rung as a button: Back between steps, Cancel on the first step
+    /// of a card opened from Settings / a file / a restored playlist, none on first-run Welcome
+    /// or while importing. Restore copy is pluralised.
+    #[test]
+    fn back_button_labels_and_restore_copy() {
+        let mut s = OnboardingScreen::default();
+        s.go(Step::Welcome);
+        assert_eq!(s.back_label(), None);
+        s.go(Step::Type);
+        assert_eq!(s.back_label(), Some("Back"));
+        s.go(Step::Importing);
+        assert_eq!(s.back_label(), None);
+        s.start = OnboardingStart::AddSource;
+        s.go(Step::Type);
+        assert_eq!(s.back_label(), Some("Cancel"), "Settings ▸ Add: leaves the card");
+        assert!(!s.back(), "…through the app's Back");
+        s.go(Step::Details);
+        assert_eq!(s.back_label(), Some("Back"));
+        assert_eq!(restored_text(1, 0), "Restored 1 playlist");
+        assert_eq!(restored_text(2, 1), "Restored 2 playlists (1 matched an existing one)");
+        assert_eq!(restored_text(3, 2), "Restored 3 playlists (2 matched existing ones)");
     }
 
     /// DESIGN §13.10: "Open Live TV" works as soon as the new source's channels are in the

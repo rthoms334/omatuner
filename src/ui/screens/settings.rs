@@ -124,7 +124,7 @@ static EPG_T: CfgToggle = toggle_row!("Match channels by name automatically", ep
 
 static PLAYER_HWDEC: CfgChoice = CfgChoice {
     label: "Hardware decoding",
-    options: &["Auto", "auto-safe", "Off", "vaapi", "nvdec", "vulkan"],
+    options: &["Auto", "Auto (safe)", "Off", "VA-API", "NVDEC", "Vulkan"],
     get: |c| pos(&["auto", "auto-safe", "no", "vaapi", "nvdec", "vulkan"], &c.player.hwdec.as_str()),
     set: |c, i| c.player.hwdec = ["auto", "auto-safe", "no", "vaapi", "nvdec", "vulkan"][i].to_owned(),
 };
@@ -260,7 +260,10 @@ fn number_text(n: &CfgNumber, v: f64) -> String {
 
 // ------------------------------------------------------------------ rows
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// A row's subject. Orphans and hidden titles are keyed by their durable reference, not by
+/// position: their lists are re-read whenever a refresh finishes, possibly while a menu or a
+/// confirmation about one of them is open.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Item {
     Source(SourceId),
     Epg(EpgSourceId),
@@ -268,8 +271,9 @@ enum Item {
     Reminder(ReminderId),
     HiddenGroup(GroupId),
     HiddenChannel(ChannelId),
-    HiddenVod(usize),
-    Orphan(usize),
+    HiddenVod(ItemRef),
+    Orphan(ItemRef),
+    /// Index into the attach view's candidates (rebuilt only by its own filter).
     AttachTarget(usize),
 }
 
@@ -448,7 +452,7 @@ impl SourceEditor {
 /// Orphans ▸ "Attach to…": pick a library item of the same kind.
 #[derive(Debug, Clone)]
 struct Attach {
-    orphan: usize,
+    orphan: Orphan,
     filter: String,
     /// (ItemRef, label) candidates for the current filter.
     candidates: Vec<(ItemRef, String)>,
@@ -460,10 +464,12 @@ enum Pending {
     DeleteSource(SourceId),
     DeleteEpg(EpgSourceId),
     DeleteList(FavListId),
-    ForgetOrphan(usize),
+    ForgetOrphan(ItemRef),
     Restore(PathBuf),
     RemovePin,
     Menu(Item),
+    /// ←/→ on a parental row waiting for the PIN (retried as the same adjustment).
+    Adjust(i32),
 }
 
 const MENU_EDIT: u8 = 1;
@@ -526,7 +532,18 @@ pub struct SettingsScreen {
     drag_from: Option<usize>,
     /// Text-field row whose egui focus must be released this frame.
     release_focus: bool,
+    /// A guide offset changed with ←/→ that isn't saved yet (and when it last changed).
+    offset_pending: Option<(EpgSourceId, std::time::Instant)>,
+    /// Hidden channels of the library build `hidden_built` (Settings ▸ Hidden items).
+    hidden_channels: Vec<(ChannelId, String)>,
+    hidden_built: crate::model::Timestamp,
 }
+
+/// How long ←/→ on a guide's offset must rest before the change is saved and re-imported.
+const OFFSET_SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// "channel 1" (the name the orphan had) or its key.
+fn orphan_name(o: &Orphan) -> String { if o.fingerprint.norm_name.is_empty() { o.item.key.to_string() } else { o.fingerprint.norm_name.clone() } }
 
 impl SettingsScreen {
     fn reload(&mut self, ctx: &UiCtx<'_>) {
@@ -540,8 +557,9 @@ impl SettingsScreen {
         }
     }
 
-    fn set_page(&mut self, ctx: &UiCtx<'_>, page: SettingsPage) {
+    fn set_page(&mut self, ctx: &mut UiCtx<'_>, page: SettingsPage) {
         if self.page != page {
+            self.flush_epg_offset(ctx);
             self.page = page;
             self.row = 0;
             self.editing = false;
@@ -688,7 +706,7 @@ impl SettingsScreen {
                     v.push(Row::Note("No reminders. Press r on a future programme in the guide.".into(), false));
                 }
                 for r in &self.reminders {
-                    v.push(item(Item::Reminder(r.id), glyphs::REMINDER, r.programme_title.clone(), Some(format!("{} · {} · {}", r.channel_name, kit::day_time(r.start), kit::date(r.start)))));
+                    v.push(item(Item::Reminder(r.id), glyphs::REMINDER, r.programme_title.clone(), Some(format!("{} · {} · {}", r.channel_name, kit::day_time(r.start, ctx.config.interface.clock_24h), kit::date(r.start)))));
                 }
             }
             SettingsPage::Parental => {
@@ -738,20 +756,18 @@ impl SettingsScreen {
                     v.push(item(Item::HiddenGroup(g.id), glyphs::HIDDEN, g.display_name().to_owned(), Some(format!("{kind} · Enter unhides"))));
                 }
                 v.push(Row::Section("Hidden channels".into()));
-                let mut hidden: Vec<&crate::model::ChannelSummary> = ctx.lib.live.channels.iter().filter(|c| ctx.lib.live.hidden.contains(&c.id)).collect();
-                hidden.truncate(500);
-                if hidden.is_empty() {
+                if self.hidden_channels.is_empty() {
                     v.push(Row::Note("Nothing hidden.".into(), false));
                 }
-                for c in hidden {
-                    v.push(item(Item::HiddenChannel(c.id), glyphs::HIDDEN, c.name.to_string(), Some("Enter unhides".into())));
+                for (id, name) in &self.hidden_channels {
+                    v.push(item(Item::HiddenChannel(*id), glyphs::HIDDEN, name.clone(), Some("Enter unhides".into())));
                 }
                 v.push(Row::Section("Hidden movies & series".into()));
                 if self.hidden_items.is_empty() && self.hidden_loader.is_none() {
                     v.push(Row::Note("Nothing hidden.".into(), false));
                 }
-                for (i, (_, name)) in self.hidden_items.iter().enumerate() {
-                    v.push(item(Item::HiddenVod(i), glyphs::HIDDEN, name.clone(), Some("Enter unhides".into())));
+                for (r, name) in &self.hidden_items {
+                    v.push(item(Item::HiddenVod(r.clone()), glyphs::HIDDEN, name.clone(), Some("Enter unhides".into())));
                 }
             }
             SettingsPage::Orphans => {
@@ -760,10 +776,9 @@ impl SettingsScreen {
                 if self.orphans.is_empty() && self.orphans_loader.is_none() {
                     v.push(Row::Note("No orphans.".into(), false));
                 }
-                for (i, o) in self.orphans.iter().enumerate() {
-                    let name = if o.fingerprint.norm_name.is_empty() { o.item.key.to_string() } else { o.fingerprint.norm_name.clone() };
+                for o in &self.orphans {
                     let detail = format!("{} · {} · since {}", o.item.kind.as_str(), o.holders.join(", "), kit::date(o.since));
-                    v.push(item(Item::Orphan(i), glyphs::WARNING, name, Some(detail)));
+                    v.push(item(Item::Orphan(o.item.clone()), glyphs::WARNING, orphan_name(o), Some(detail)));
                 }
             }
             SettingsPage::About => {
@@ -818,9 +833,8 @@ impl SettingsScreen {
 
     fn attach_rows(&self, a: &Attach) -> Vec<Row> {
         let mut v = vec![Row::Section("Attach to…".into())];
-        if let Some(o) = self.orphans.get(a.orphan) {
-            v.push(Row::Note(format!("{} ({}) — pick the item it became", o.fingerprint.norm_name, o.item.kind.as_str()), false));
-        }
+        let o = &a.orphan;
+        v.push(Row::Note(format!("{} ({}) — pick the item it became", orphan_name(o), o.item.kind.as_str()), false));
         v.push(Row::Local { field: Local::AttachFilter, label: "Filter" });
         for (i, (_, label)) in a.candidates.iter().enumerate().take(200) {
             v.push(Row::Item { item: Item::AttachTarget(i), icon: glyphs::CHEVRON_RIGHT.into(), color: None, label: label.clone(), detail: None, reorder: false });
@@ -943,6 +957,7 @@ impl SettingsScreen {
     /// ←/→ on a row.
     fn adjust(&mut self, ctx: &mut UiCtx<'_>, row: &Row, dir: i32) {
         if self.page == SettingsPage::Parental && self.parental_locked(ctx) && !matches!(row, Row::Local { .. }) {
+            self.pending = Some(Pending::Adjust(dir));
             kit::ask_pin(ctx, Action::Activate, "Enter the PIN to change parental settings");
             return;
         }
@@ -990,9 +1005,7 @@ impl SettingsScreen {
             Row::Choice(_) | Row::Number(_) => self.adjust(ctx, row, 1),
             Row::Text(t) => {
                 if self.editing {
-                    let v = std::mem::take(&mut self.edit_buf);
-                    let set = t.set;
-                    ctx.edit_config(move |c| set(c, v));
+                    self.commit_text(ctx, t);
                     self.editing = false;
                 } else {
                     self.edit_buf = (t.get)(ctx.config);
@@ -1009,8 +1022,17 @@ impl SettingsScreen {
             }
             Row::Local { field, .. } => self.adjust_local(*field, 1),
             Row::Act { act, .. } => self.act(ctx, *act),
-            Row::Item { item, .. } => self.item_default(ctx, *item),
+            Row::Item { item, .. } => self.item_default(ctx, item.clone()),
             Row::Section(_) | Row::Note(..) => {}
+        }
+    }
+
+    /// Save the text being edited into its config row (only when it changed).
+    fn commit_text(&mut self, ctx: &mut UiCtx<'_>, t: &CfgText) {
+        let v = std::mem::take(&mut self.edit_buf);
+        if v != (t.get)(ctx.config) {
+            let set = t.set;
+            ctx.edit_config(move |c| set(c, v));
         }
     }
 
@@ -1184,17 +1206,29 @@ impl SettingsScreen {
         }));
     }
 
+    /// ←/→ on a guide: shift its offset. Applied (saved + the guide re-imported, the offset
+    /// applies at import time) once the presses stop for [`OFFSET_SETTLE`], or when the page is
+    /// left — not once per press.
     fn epg_offset(&mut self, ctx: &mut UiCtx<'_>, id: EpgSourceId, delta_min: i32) {
         let Some(e) = self.epg_sources.iter_mut().find(|e| e.id == id) else { return };
         e.offset_min = (e.offset_min + delta_min).clamp(-24 * 60, 24 * 60);
-        let src = e.clone();
+        if self.offset_pending.is_some_and(|(p, _)| p != id) {
+            self.flush_epg_offset(ctx);
+        }
+        self.offset_pending = Some((id, std::time::Instant::now()));
+    }
+
+    /// Write a pending offset change now.
+    fn flush_epg_offset(&mut self, ctx: &mut UiCtx<'_>) {
+        let Some((id, _)) = self.offset_pending.take() else { return };
+        let Some(src) = self.epg_sources.iter().find(|e| e.id == id).cloned() else { return };
         let jobs = ctx.services.jobs.clone();
         let _ = ctx.services.store.writer().submit_notify(DataScope::Epg, move |c| {
             crate::store::sources::update_epg_source(c, &src)?;
-            // the offset applies at import time: re-import this guide
             jobs.submit(JobKind::RefreshEpg { epg_source: src.id, force: true });
             Ok(())
         });
+        ctx.toast(Toast::info("Guide offset saved — re-importing the guide"));
     }
 
     /// Enter on an item row.
@@ -1215,11 +1249,11 @@ impl SettingsScreen {
             Item::List(id) => self.rename_list(ctx, id),
             Item::HiddenGroup(g) => self.unhide_group(ctx, g),
             Item::HiddenChannel(c) => self.unhide_item(ctx, ctx.lib.live.get(c).map(|c| ItemRef { source: c.source_id, kind: ItemKind::Channel, key: c.key.clone() })),
-            Item::HiddenVod(i) => {
-                let r = self.hidden_items.get(i).map(|(r, _)| r.clone());
-                self.unhide_item(ctx, r);
+            Item::HiddenVod(r) => {
+                self.hidden_items.retain(|(x, _)| *x != r);
+                self.unhide_item(ctx, Some(r));
             }
-            Item::Orphan(i) => self.start_attach(ctx, i),
+            Item::Orphan(r) => self.start_attach(ctx, &r),
             Item::AttachTarget(i) => self.attach_to(ctx, i),
             Item::Reminder(_) => self.item_menu(ctx, item),
         }
@@ -1264,9 +1298,11 @@ impl SettingsScreen {
         ctx.toast(Toast::info("Shown again"));
     }
 
-    fn start_attach(&mut self, ctx: &mut UiCtx<'_>, i: usize) {
-        let Some(o) = self.orphans.get(i) else { return };
-        self.attach = Some(Attach { orphan: i, filter: o.fingerprint.norm_name.clone(), candidates: Vec::new() });
+    fn start_attach(&mut self, ctx: &mut UiCtx<'_>, r: &ItemRef) {
+        // gone meanwhile (reattached by a refresh, forgotten): nothing to attach
+        let Some(o) = self.orphans.iter().find(|o| o.item == *r).cloned() else { return };
+        let filter = o.fingerprint.norm_name.clone();
+        self.attach = Some(Attach { orphan: o, filter, candidates: Vec::new() });
         self.refilter_attach(ctx);
         self.row = 0;
     }
@@ -1274,8 +1310,7 @@ impl SettingsScreen {
     /// Library items of the orphan's kind matching the filter (best first, ≤ 200).
     fn refilter_attach(&mut self, ctx: &UiCtx<'_>) {
         let Some(a) = &mut self.attach else { return };
-        let Some(o) = self.orphans.get(a.orphan) else { return };
-        let all: Vec<(ItemRef, String)> = match o.item.kind {
+        let all: Vec<(ItemRef, String)> = match a.orphan.item.kind {
             ItemKind::Channel => ctx.lib.live.channels.iter().map(|c| (ItemRef { source: c.source_id, kind: ItemKind::Channel, key: c.key.clone() }, c.name.to_string())).collect(),
             ItemKind::Movie => ctx.lib.vod.movies.iter().map(|v| (super::home::vod_ref(v), v.name.to_string())).collect(),
             ItemKind::Series => ctx.lib.vod.series.iter().map(|v| (super::home::vod_ref(v), v.name.to_string())).collect(),
@@ -1290,8 +1325,8 @@ impl SettingsScreen {
 
     fn attach_to(&mut self, ctx: &mut UiCtx<'_>, i: usize) {
         let Some(a) = &self.attach else { return };
-        let (Some(o), Some((to, name))) = (self.orphans.get(a.orphan), a.candidates.get(i)) else { return };
-        let (from, to) = (o.item.clone(), to.clone());
+        let Some((to, name)) = a.candidates.get(i) else { return };
+        let (from, to) = (a.orphan.item.clone(), to.clone());
         let _ = ctx.services.store.writer().submit_notify(DataScope::All, move |c| crate::store::user::reassign(c, &from, &to));
         ctx.toast(Toast::info(format!("Attached to {name}")));
         self.attach = None;
@@ -1336,7 +1371,11 @@ impl SettingsScreen {
                 v.push(del);
                 (l.name.clone(), v)
             }
-            Item::Reminder(_) => ("Reminder".into(), vec![mi(glyphs::CLOSE, "Cancel reminder", MENU_DELETE)]),
+            // Delete cancels a reminder directly (DESIGN §13.9); no one-item menu
+            Item::Reminder(id) => {
+                self.cancel_reminder(ctx, id);
+                return;
+            }
             Item::Orphan(_) => ("Orphan".into(), vec![mi(glyphs::CHEVRON_RIGHT, "Attach to…", MENU_ATTACH), mi(glyphs::CLOSE, "Forget…", MENU_DELETE)]),
             Item::HiddenGroup(_) | Item::HiddenChannel(_) | Item::HiddenVod(_) => ("Hidden".into(), vec![mi(glyphs::CHECK, "Unhide", MENU_TOGGLE)]),
             Item::AttachTarget(_) => return,
@@ -1385,19 +1424,21 @@ impl SettingsScreen {
                 ctx.open(OverlayRequest::Confirm(ConfirmSpec { title: format!("Delete the list {name}?"), body: "The channels stay in your playlists.".into(), confirm_label: "Delete".into(), destructive: true, token }));
             }
             (item, MENU_UP) | (item, MENU_DOWN) => self.reorder(ctx, item, if code == MENU_UP { -1 } else { 1 }),
-            (Item::Reminder(id), MENU_DELETE) => {
-                self.reminders.retain(|r| r.id != id);
-                let _ = ctx.services.store.writer().submit_notify(DataScope::Reminders, move |c| crate::store::user::remove_reminder(c, id));
-                ctx.toast(Toast::info("Reminder cancelled"));
-            }
-            (Item::Orphan(i), MENU_ATTACH) => self.start_attach(ctx, i),
-            (Item::Orphan(i), MENU_DELETE) => {
-                let token = self.token(Pending::ForgetOrphan(i));
+            (Item::Reminder(id), MENU_DELETE) => self.cancel_reminder(ctx, id),
+            (Item::Orphan(r), MENU_ATTACH) => self.start_attach(ctx, &r),
+            (Item::Orphan(r), MENU_DELETE) => {
+                let token = self.token(Pending::ForgetOrphan(r));
                 ctx.open(OverlayRequest::Confirm(ConfirmSpec { title: "Forget this item's data?".into(), body: "Its favourites, progress and settings are deleted.".into(), confirm_label: "Forget".into(), destructive: true, token }));
             }
             (item @ (Item::HiddenGroup(_) | Item::HiddenChannel(_) | Item::HiddenVod(_)), MENU_TOGGLE) => self.item_default(ctx, item),
             _ => {}
         }
+    }
+
+    fn cancel_reminder(&mut self, ctx: &mut UiCtx<'_>, id: ReminderId) {
+        self.reminders.retain(|r| r.id != id);
+        let _ = ctx.services.store.writer().submit_notify(DataScope::Reminders, move |c| crate::store::user::remove_reminder(c, id));
+        ctx.toast(Toast::info("Reminder cancelled"));
     }
 
     /// Alt+↑/↓ / K/J / drag: move an item within its list and persist the order.
@@ -1524,9 +1565,9 @@ impl Screen for SettingsScreen {
             Route::Settings(p) => *p,
             _ => self.page,
         };
-        self.page = page;
+        self.flush_epg_offset(ctx);
+        self.set_page(ctx, page);
         self.editing = false;
-        self.reload(ctx);
     }
 
     fn on_event(&mut self, ctx: &mut UiCtx<'_>, ev: &AppEvent) {
@@ -1623,6 +1664,11 @@ impl Screen for SettingsScreen {
                     self.submit = true;
                 }
                 Action::Back => {
+                    // leaving a field keeps what was typed (as Tab does, and as the form
+                    // fields keep their text)
+                    if let Some(Row::Text(t)) = &row {
+                        self.commit_text(ctx, t);
+                    }
                     self.editing = false;
                     self.release_focus = true;
                     if let Some(Row::Local { field: Local::AttachFilter, .. }) = row {
@@ -1631,9 +1677,7 @@ impl Screen for SettingsScreen {
                 }
                 Action::FocusNext | Action::FocusPrev => {
                     if let Some(Row::Text(t)) = &row {
-                        let v = std::mem::take(&mut self.edit_buf);
-                        let set = t.set;
-                        ctx.edit_config(move |c| set(c, v));
+                        self.commit_text(ctx, t);
                     }
                     self.move_row(&rows, if action == Action::FocusNext { 1 } else { -1 });
                     self.editing = rows.get(self.row).is_some_and(Row::is_text) && matches!(rows.get(self.row), Some(Row::Local { .. }));
@@ -1700,10 +1744,11 @@ impl Screen for SettingsScreen {
                 Pending::DeleteList(id) => {
                     let _ = ctx.services.store.writer().submit_notify(DataScope::Favourites, move |c| crate::store::user::delete_fav_list(c, id));
                 }
-                Pending::ForgetOrphan(i) => {
-                    if let Some(o) = self.orphans.get(i).cloned() {
-                        let _ = ctx.services.store.writer().submit_notify(DataScope::All, move |c| crate::store::user::forget_orphan(c, &o.item));
-                        self.orphans.remove(i);
+                Pending::ForgetOrphan(r) => {
+                    // only what the dialog named, and only while it is still an orphan
+                    if self.orphans.iter().any(|o| o.item == r) {
+                        self.orphans.retain(|o| o.item != r);
+                        let _ = ctx.services.store.writer().submit_notify(DataScope::All, move |c| crate::store::user::forget_orphan(c, &r));
                     }
                 }
                 Pending::Restore(path) => {
@@ -1718,12 +1763,15 @@ impl Screen for SettingsScreen {
                     });
                     ctx.toast(Toast::info("PIN removed"));
                 }
-                Pending::Menu(_) => {}
+                Pending::Menu(_) | Pending::Adjust(_) => {}
             },
-            // the PIN was entered: retry what needed it
-            (OverlayResult::Unlocked(_), _) => {
+            // the PIN was entered: retry what needed it (the same ←/→, else Enter)
+            (OverlayResult::Unlocked(_), pending) => {
                 if let Some(r) = self.current_row(ctx) {
-                    self.activate(ctx, &r);
+                    match pending {
+                        Some(Pending::Adjust(dir)) => self.adjust(ctx, &r, dir),
+                        _ => self.activate(ctx, &r),
+                    }
                 }
             }
             _ => {}
@@ -1756,6 +1804,17 @@ impl Screen for SettingsScreen {
 
 impl SettingsScreen {
     fn poll_loaders(&mut self, ctx: &mut UiCtx<'_>) {
+        if self.page == SettingsPage::Hidden && self.hidden_built != ctx.lib.built_at {
+            // one pass per library build, not one per `rows()` call
+            self.hidden_built = ctx.lib.built_at;
+            let live = &ctx.lib.live;
+            self.hidden_channels = live.channels.iter().filter(|c| live.hidden.contains(&c.id)).take(500).map(|c| (c.id, c.name.to_string())).collect();
+        }
+        if self.offset_pending.is_some_and(|(_, at)| at.elapsed() >= OFFSET_SETTLE) {
+            self.flush_epg_offset(ctx);
+        } else if self.offset_pending.is_some() {
+            ctx.services.bus.request_repaint();
+        }
         if let Some(r) = kit::poll(&mut self.sources_loader) {
             match r {
                 Ok(v) => self.sources = v,
@@ -1845,7 +1904,7 @@ impl SettingsScreen {
                     _ => {}
                 }
                 let is_text = row.is_text();
-                let item_h = if matches!(row, Row::Item { detail: Some(_), .. }) { rows::row_height(theme, Density::Comfortable, true) } else { row_h };
+                let item_h = if matches!(row, Row::Item { detail: Some(_), .. }) { rows::row_height(theme, ctx.config.interface.density, true) } else { row_h };
                 let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), if is_text { row_h + theme.font(TypeToken::Body) } else { item_h }), egui::Sense::click());
                 if focused && scroll {
                     ui.scroll_to_rect(rect, None);
@@ -1858,7 +1917,7 @@ impl SettingsScreen {
                     clicked = Some((i, 0));
                 } else if resp.secondary_clicked() {
                     clicked = Some((i, 2));
-                } else if pointer_moved && resp.hovered() && i != self.row {
+                } else if pointer_moved && resp.hovered() && i != self.row && !self.editing {
                     hovered = Some(i);
                 }
                 let mut inner = ui.new_child(egui::UiBuilder::new().id_salt(("row", i)).max_rect(rect.shrink2(egui::vec2(theme.space(SpaceToken::Lg), theme.space(SpaceToken::Xs)))).layout(egui::Layout::left_to_right(egui::Align::Center)));
@@ -1866,7 +1925,7 @@ impl SettingsScreen {
                 match row {
                     Row::Toggle(tg) => {
                         let mut v = (tg.get)(ctx.config);
-                        if toggle(&mut inner, theme, &mut v, tg.label, false).changed() {
+                        if toggle_row(&mut inner, theme, &mut v, tg.label, label_color) {
                             clicked = Some((i, if v { 1 } else { -1 }));
                         }
                     }
@@ -1923,7 +1982,7 @@ impl SettingsScreen {
                             }
                         } else if field.is_toggle() {
                             let mut v = self.local_toggle(field).map(|b| *b).unwrap_or(false);
-                            if toggle(&mut inner, theme, &mut v, label, false).changed() {
+                            if toggle_row(&mut inner, theme, &mut v, label, label_color) {
                                 clicked = Some((i, 1));
                             }
                         } else {
@@ -1950,21 +2009,28 @@ impl SettingsScreen {
                         }
                         let c = color.map(|c| theme.source_color(c)).unwrap_or(t.text_secondary);
                         inner.label(RichText::new(icon).size(theme.font(TypeToken::IconLarge)).color(c));
-                        inner.vertical(|ui| {
-                            ui.label(RichText::new(label).size(theme.font(TypeToken::Title)).color(label_color));
-                            if let Some(d) = detail {
-                                let mut job = egui::text::LayoutJob::simple_singleline(d.clone(), egui::FontId::proportional(theme.font(TypeToken::BodySmall)), t.text_secondary);
-                                job.wrap = egui::text::TextWrapping::truncate_at_width(ui.available_width().max(0.0));
-                                ui.label(job);
-                            }
-                        });
-                        if matches!(item, Item::Source(_) | Item::Epg(_) | Item::List(_) | Item::Orphan(_) | Item::Reminder(_)) {
-                            inner.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if icon_button(ui, theme, glyphs::SETTINGS, "More (x)", ButtonStyle::default()).clicked() {
+                        let more = matches!(item, Item::Source(_) | Item::Epg(_) | Item::List(_) | Item::Orphan(_) | Item::Reminder(_));
+                        // the button is laid out first so long names and errors end before it
+                        inner.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if more {
+                                let (glyph, tip) = if matches!(item, Item::Reminder(_)) { (glyphs::CLOSE, "Cancel reminder (Delete)") } else { (glyphs::SETTINGS, "More (x)") };
+                                if icon_button(ui, theme, glyph, tip, ButtonStyle::default()).clicked() {
                                     clicked = Some((i, 2));
                                 }
+                            }
+                            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                                let w = ui.available_width().max(0.0);
+                                let line = |text: &str, size: f32, color: egui::Color32| {
+                                    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), egui::FontId::proportional(size), color);
+                                    job.wrap = egui::text::TextWrapping::truncate_at_width(w);
+                                    job
+                                };
+                                ui.label(line(label, theme.font(TypeToken::Title), label_color));
+                                if let Some(d) = detail {
+                                    ui.label(line(d, theme.font(TypeToken::BodySmall), t.text_secondary));
+                                }
                             });
-                        }
+                        });
                     }
                     Row::Section(_) | Row::Note(..) => {}
                 }
@@ -1990,11 +2056,11 @@ impl SettingsScreen {
                 && let (Some(Row::Item { item, .. }), true) = (rows.get(from), from != to)
             {
                 let delta = rows[from.min(to)..=from.max(to)].iter().filter(|r| matches!(r, Row::Item { reorder: true, .. })).count() as isize - 1;
-                self.reorder(ctx, *item, if to > from { delta } else { -delta });
+                self.reorder(ctx, item.clone(), if to > from { delta } else { -delta });
             }
             self.drag_from = None;
         }
-        if let Some(i) = hovered {
+        if let Some(i) = hovered.filter(|_| !self.editing) {
             self.row = i;
         }
         if let Some(i) = text_clicked {
@@ -2039,16 +2105,27 @@ fn value_row(ui: &mut egui::Ui, theme: &Theme, label: &str, value: &str, color: 
     ui.label(RichText::new(label).size(theme.font(TypeToken::Body)).color(color));
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         let mut r = None;
-        if icon_button(ui, theme, glyphs::CHEVRON_RIGHT, "", ButtonStyle::default()).clicked() {
+        if icon_button(ui, theme, glyphs::CHEVRON_RIGHT, "Increase", ButtonStyle::default()).clicked() {
             r = Some(1);
         }
         ui.label(RichText::new(value).size(theme.font(TypeToken::Body)).color(t.fg));
-        if icon_button(ui, theme, "‹", "", ButtonStyle::default()).clicked() {
+        if icon_button(ui, theme, CHEVRON_LEFT, "Decrease", ButtonStyle::default()).clicked() {
             r = Some(-1);
         }
         r
     })
     .inner
+}
+
+/// `nf-md-chevron_left`, the twin of `glyphs::CHEVRON_RIGHT` (the shared glyph table has no
+/// left chevron).
+const CHEVRON_LEFT: &str = "\u{f0141}";
+
+/// `Label                       [switch]` with the label in the row's colour (accent when
+/// focused, like the other rows). True when the switch was clicked.
+fn toggle_row(ui: &mut egui::Ui, theme: &Theme, on: &mut bool, label: &str, color: egui::Color32) -> bool {
+    ui.label(RichText::new(label).size(theme.font(TypeToken::Body)).color(color));
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| toggle(ui, theme, on, "", false).changed()).inner
 }
 
 /// Label above a text field that follows the settings focus. Returns (clicked, changed).
@@ -2149,13 +2226,20 @@ mod tests {
         h.state_mut().apply_config();
         assert_eq!(h.state().t.config.player.mpv_options.get("profile").map(String::as_str), Some("fast"));
         assert_eq!(h.state().s.key_contexts(), vec![KeyContext::Panel]);
-        // Esc leaves a field without saving
+        // Esc leaves a field keeping what was typed (like Tab, and like the form fields)
         h.state_mut().act(Action::Activate);
         h.run_steps(1);
-        type_text(&mut h, "; junk=1");
+        type_text(&mut h, "; cache=no");
         h.state_mut().act(Action::Back);
         h.run_steps(1);
-        assert!(h.state().t.config_edits.is_empty(), "Esc discards the edit");
+        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::Panel]);
+        h.state_mut().apply_config();
+        assert_eq!(h.state().t.config.player.mpv_options.get("cache").map(String::as_str), Some("no"), "Esc keeps the edit");
+        // leaving a field unchanged queues nothing
+        h.state_mut().act(Action::Activate);
+        h.run_steps(1);
+        h.state_mut().act(Action::Back);
+        assert!(h.state().t.config_edits.is_empty());
         // Tab to the page list, ↓ switches pages; Esc there leaves Settings (the app's Back)
         h.state_mut().act(Action::FocusNext);
         h.state_mut().act(Action::Down);
@@ -2376,6 +2460,161 @@ mod tests {
     }
 
     fn has(h: &H, label: &str) -> bool { has_label(h, label) }
+
+    /// A Forget confirmed after the orphans were re-read in another order (a refresh finished
+    /// while the dialog was open) forgets the orphan the dialog named; Delete on a reminder
+    /// cancels it at once; a page opened by route drops another page's source editor.
+    #[test]
+    fn orphans_are_keyed_by_item_reminders_cancel_on_delete_and_routes_reset_the_editor() {
+        let (mut t, one) = rig();
+        seed(&mut t, |c| {
+            let s = testkit::source(c, "My IPTV")?;
+            testkit::channels(c, s, 2)?;
+            let list = crate::store::user::default_fav_list(c)?;
+            for (i, name) in ["alpha one", "beta two"].iter().enumerate() {
+                c.execute(
+                    "INSERT INTO fav_item(list_id, source_id, kind, item_key, position, added_at, fp, orphaned_since) VALUES (?1, ?2, 'channel', ?3, ?4, 1, ?5, 5)",
+                    rusqlite::params![list, s, format!("m3u:gone{i}"), i as i64, format!("{{\"norm_name\":\"{name}\"}}")],
+                )?;
+            }
+            let channel = ItemRef { source: s, kind: ItemKind::Channel, key: ItemKey(format!("m3u:seed{:011}", 0)) };
+            let r = Reminder {
+                id: ReminderId(0),
+                channel,
+                channel_name: "Channel 0".into(),
+                programme_title: "Late Show".into(),
+                start: 4_000_000_000,
+                stop: 4_000_003_600,
+                lead_s: 120,
+                state: crate::model::ReminderState::Pending,
+            };
+            crate::store::user::add_reminder(c, &r).map(|_| ())
+        });
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 1000.0));
+        let orphans = |h: &H| crate::store::user::orphans(&h.state().t.services().store.reader().unwrap()).unwrap().into_iter().map(|o| o.fingerprint.norm_name).collect::<Vec<_>>();
+        h.state_mut().enter(Route::Settings(SettingsPage::Orphans));
+        until(&mut h, "the orphans", |h| has_label(h, "alpha one") && has_label(h, "beta two"));
+        focus(&mut h, "beta two");
+        h.state_mut().act(Action::ContextMenu);
+        h.state_mut().nav();
+        h.state_mut().result(OverlayResult::Chosen(Action::Digit(MENU_DELETE)));
+        let token = match h.state_mut().nav().as_slice() {
+            [NavRequest::Open(OverlayRequest::Confirm(c))] if c.destructive => c.token,
+            other => panic!("{other:?}"),
+        };
+        // a refresh re-read the orphans in another order while the dialog was open
+        h.state_mut().s.orphans.reverse();
+        h.state_mut().result(OverlayResult::Confirmed(token));
+        until(&mut h, "only the named orphan forgotten", |h| orphans(h) == ["alpha one"]);
+
+        // Delete (x) on a reminder cancels it directly: no one-item menu
+        h.state_mut().enter(Route::Settings(SettingsPage::Reminders));
+        until(&mut h, "the reminder", |h| has_label(h, "Late Show"));
+        focus(&mut h, "Late Show");
+        h.state_mut().act(Action::ContextMenu);
+        assert!(h.state_mut().nav().is_empty(), "no menu");
+        until(&mut h, "cancelled", |h| crate::store::user::all_reminders(&h.state().t.services().store.reader().unwrap()).unwrap().is_empty());
+
+        // the source editor of Playlists doesn't leak into Movies ▸ "Show hidden"
+        h.state_mut().enter(Route::Settings(SettingsPage::Playlists));
+        until(&mut h, "the playlist", |h| has_label(h, "My IPTV"));
+        focus(&mut h, "My IPTV");
+        h.state_mut().act(Action::Activate);
+        h.run_steps(2);
+        assert!(has_label(&h, "EDIT MY IPTV"));
+        h.state_mut().enter(Route::Settings(SettingsPage::Hidden));
+        h.run_steps(2);
+        assert!(h.state().s.editor.is_none() && !has_label(&h, "EDIT MY IPTV"));
+        assert!(has_label(&h, "HIDDEN GROUPS"));
+    }
+
+    /// ← on a parental row that needed the PIN is retried as the same ← (not as Enter), the
+    /// relock time is editable from its row, and "Lock now" locks the session.
+    #[test]
+    fn parental_rows_retry_the_same_adjustment_after_the_pin_and_lock_now_locks() {
+        let (mut t, one) = rig();
+        let mut cfg = (*t.config).clone();
+        cfg.parental = crate::config::ParentalConfig { enabled: true, pin_salt: Some("s".into()), pin_hash: Some(hash_pin("1234", "s")), relock_min: 30 };
+        t.config = std::sync::Arc::new(cfg);
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1200.0, 1000.0));
+        h.state_mut().enter(Route::Settings(SettingsPage::Parental));
+        h.run_steps(1);
+        focus(&mut h, "Lock again after");
+        h.state_mut().act(Action::Left);
+        let nav = h.state_mut().nav();
+        assert!(matches!(nav.as_slice(), [NavRequest::Open(OverlayRequest::Pin { .. })]), "{nav:?}");
+        // the PIN overlay unlocks and answers Unlocked(Activate)
+        let app = h.state_mut();
+        let p = app.t.config.parental.clone();
+        assert!(app.t.parental.unlock("1234", &p));
+        app.result(OverlayResult::Unlocked(Action::Activate));
+        app.apply_config();
+        assert_eq!(h.state().t.config.parental.relock_min, 25, "the ← was retried (Enter would have added 5)");
+        // the session is open now: → applies directly
+        h.state_mut().act(Action::Right);
+        h.state_mut().act(Action::Right);
+        h.state_mut().apply_config();
+        assert_eq!(h.state().t.config.parental.relock_min, 35);
+        assert!(h.state().t.parental.is_unlocked(&h.state().t.config.parental));
+        // "Lock now" (Enter on the row) closes the session
+        focus(&mut h, "Lock now");
+        h.state_mut().act(Action::Activate);
+        h.run_steps(1);
+        let app = h.state();
+        assert!(!app.t.parental.is_unlocked(&app.t.config.parental), "locked again");
+    }
+
+    /// While a text field is being edited, pointer motion over other rows doesn't move the
+    /// focus — the typed text lands in the field that has it (UX review M1).
+    #[test]
+    fn hover_never_moves_the_focus_while_a_field_is_edited() {
+        let (t, one) = rig();
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1200.0, 1600.0));
+        h.state_mut().enter(Route::Settings(SettingsPage::Player));
+        h.run_steps(2);
+        focus(&mut h, "Subtitle languages");
+        let row = h.state().s.row;
+        h.state_mut().act(Action::Activate);
+        h.run_steps(2);
+        // the empty right end of the user-agent row (labels and fields take the hover themselves)
+        let y = h.query_all_by_label("Default User-Agent").next().expect("the user-agent row").rect().center().y;
+        for x in [1100.0, 1106.0, 1112.0] {
+            h.hover_at(egui::pos2(x, y));
+            h.run_steps(1);
+        }
+        assert_eq!(h.state().s.row, row, "the focus stays on the edited field");
+        type_text(&mut h, ", de");
+        h.state_mut().act(Action::Activate);
+        h.run_steps(1);
+        h.state_mut().apply_config();
+        let c = h.state().t.config.clone();
+        assert!(c.player.sub_langs.iter().any(|l| l == "de"), "{:?}", c.player.sub_langs);
+        assert!(!c.player.user_agent.contains("de"), "{}", c.player.user_agent);
+    }
+
+    /// ←/→ on a guide's offset shows at once but is saved (and the guide re-imported) once the
+    /// presses settle, not per press.
+    #[test]
+    fn epg_offset_presses_are_saved_once_they_settle() {
+        let (mut t, one) = rig();
+        seed(&mut t, |c| {
+            let s = testkit::source(c, "My IPTV")?;
+            let ch = testkit::channels(c, s, 2)?;
+            testkit::epg(c, &ch, 0, 1, true)
+        });
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1200.0, 900.0));
+        let stored = |h: &H| crate::store::sources::list_epg_sources(&h.state().t.services().store.reader().unwrap()).unwrap()[0].offset_min;
+        h.state_mut().enter(Route::Settings(SettingsPage::Epg));
+        until(&mut h, "the guide", |h| has_label(h, "Seed EPG"));
+        focus(&mut h, "Seed EPG");
+        for _ in 0..3 {
+            h.state_mut().act(Action::Right);
+        }
+        assert_eq!(h.state().s.epg_sources[0].offset_min, 45, "shown at once");
+        h.run_steps(1);
+        assert_eq!(stored(&h), 0, "not written per press");
+        until(&mut h, "saved after the presses settle", |h| stored(h) == 45);
+    }
 
     #[test]
     fn config_rows_round_trip_through_their_setters() {

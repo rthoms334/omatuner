@@ -158,6 +158,9 @@ pub(crate) struct TileDecor {
     pub playing: bool,
     /// Finished: a check glyph on the poster.
     pub watched: bool,
+    /// The current card of a pane without keyboard focus ("selected": 1 px outline, no
+    /// accent — only the focused pane shows the cursor, DESIGN §13.0).
+    pub selected: bool,
 }
 
 /// Card height for a card `width` (poster 2:3 + two title lines + meta line).
@@ -169,7 +172,8 @@ pub(crate) fn card_height(theme: &Theme, width: f32) -> f32 {
 /// Columns and card width for an available grid width.
 pub(crate) fn grid_metrics(theme: &Theme, avail: f32) -> (usize, f32, f32) {
     let rem = theme.rem().max(0.5);
-    let gap = theme.space(SpaceToken::Xxl);
+    // Lg keeps DESIGN §12.1's density: 4–5 columns at a tiled half, 7+ at full screen
+    let gap = theme.space(SpaceToken::Lg);
     let min_w = if avail >= WIDE_GRID_FROM * rem { MIN_CARD_WIDE } else { MIN_CARD_MEDIUM } * rem;
     let cols = (((avail + gap) / (min_w + gap)).floor() as usize).max(1);
     let card_w = ((avail - gap * (cols as f32 - 1.0)) / cols as f32).max(40.0);
@@ -258,9 +262,10 @@ pub(crate) fn poster_tile(
         let bar = Rect::from_min_max(egui::pos2(poster.left(), poster.bottom() - h), poster.right_bottom());
         super::progress::paint_progress(p, bar, theme, f, true);
     }
-    if cursor || resp.hovered() {
+    if cursor || decor.selected || resp.hovered() {
+        // inside the poster: a scroll area clips nothing of the first row / column
         let stroke = if cursor { egui::Stroke::new(2.0, t.accent) } else { egui::Stroke::new(1.0, t.border_hover) };
-        p.rect_stroke(poster, t.rounding, stroke, egui::StrokeKind::Outside);
+        p.rect_stroke(poster, t.rounding, stroke, egui::StrokeKind::Inside);
     }
 
     // title (≤ 2 lines, now-playing marker first), then the meta line
@@ -308,10 +313,13 @@ pub fn poster_grid(
     all: &[VodSummary],
     items: &[u32],
 ) -> ListOutcome {
-    poster_grid_with(ui, theme, images, state, all, items, |_| TileDecor::default())
+    poster_grid_with(ui, theme, images, state, all, items, true, |_, _| TileDecor::default())
 }
 
-/// [`poster_grid`] with per-card decorations (progress, now playing, watched).
+/// [`poster_grid`] with per-card decorations (progress, now playing, watched; `decor` gets the
+/// index into `all` and the item). `focused`: the grid has the keyboard (else its current card
+/// shows the "selected" outline instead of the cursor).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn poster_grid_with(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -319,7 +327,8 @@ pub(crate) fn poster_grid_with(
     state: &mut GridState,
     all: &[VodSummary],
     items: &[u32],
-    decor: impl Fn(&VodSummary) -> TileDecor,
+    focused: bool,
+    decor: impl Fn(u32, &VodSummary) -> TileDecor,
 ) -> ListOutcome {
     state.set_len(items.len());
     let (cols, card_w, gap) = grid_metrics(theme, ui.available_width());
@@ -352,7 +361,9 @@ pub(crate) fn poster_grid_with(
                         let x = row_rect.left() + col as f32 * (card_w + gap);
                         let cell = Rect::from_min_size(egui::pos2(x, row_rect.top()), egui::vec2(card_w, row_h - gap));
                         let mut child = ui.new_child(egui::UiBuilder::new().id_salt(("poster", i)).max_rect(cell).layout(egui::Layout::top_down(egui::Align::Min)));
-                        let resp = poster_tile(&mut child, theme, images, item, card_w, i == cursor, decor(item));
+                        let current = i == cursor;
+                        let d = TileDecor { selected: current && !focused, ..decor(idx, item) };
+                        let resp = poster_tile(&mut child, theme, images, item, card_w, current && focused, d);
                         if resp.double_clicked() {
                             state.cursor = i;
                             outcome = ListOutcome::Activated(i);

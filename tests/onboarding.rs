@@ -284,8 +284,11 @@ fn m3u_file_without_a_guide_asks_for_one_and_imports() {
     assert!(epg.is_empty(), "skipped: no guide added");
 }
 
+/// A one-channel local file imports too fast to observe the disabled "Open Live TV" here;
+/// that it waits for the channels phase is covered by the unit test
+/// `onboarding::tests::open_live_tv_enables_after_the_channels_phase`.
 #[test]
-fn m3u_file_with_url_tvg_skips_the_guide_step_and_open_live_tv_waits_for_channels() {
+fn m3u_file_with_url_tvg_skips_the_guide_step_and_imports_its_guide() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("withguide.m3u");
     std::fs::write(&path, "#EXTM3U url-tvg=\"http://127.0.0.1:9/guide.xml\"\n#EXTINF:-1 tvg-id=\"a.tv\",Alpha\nhttp://127.0.0.1:9/a.ts\n").unwrap();
