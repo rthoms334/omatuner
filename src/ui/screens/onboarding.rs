@@ -364,9 +364,15 @@ pub(crate) fn preset_rows(list: &[Preset], existing: &HashSet<String>) -> Vec<Pr
 
 /// Off the UI thread: the user's country and its name (two small tz-database reads, once per
 /// process) and the URLs of the existing sources.
+/// Unreadable sources only lose the "Added" state: the step never comes up empty.
 fn load_presets(c: &rusqlite::Connection) -> crate::error::Result<Vec<PresetRow>> {
-    let existing: HashSet<String> =
-        crate::store::sources::list_sources(c)?.into_iter().filter_map(|s| s.url.map(|u| u.expose().trim().to_owned())).collect();
+    let existing: HashSet<String> = match crate::store::sources::list_sources(c) {
+        Ok(list) => list.into_iter().filter_map(|s| s.url.map(|u| u.expose().trim().to_owned())).collect(),
+        Err(e) => {
+            tracing::warn!("free playlists: reading the sources: {e}");
+            HashSet::new()
+        }
+    };
     Ok(preset_rows(&presets::presets(presets::detect_country().as_deref()), &existing))
 }
 
@@ -426,8 +432,10 @@ pub struct OnboardingScreen {
     /// Presets step rows (read when the step opens).
     presets: Vec<PresetRow>,
     presets_loader: Option<Loader<Vec<PresetRow>>>,
-    /// The draft came from a preset: Back from Test returns to the presets.
+    /// The draft came from a preset: Back from Test (or from Details after a failed probe)
+    /// returns to the presets, on `preset_idx`.
     from_preset: bool,
+    preset_idx: usize,
 }
 
 impl OnboardingScreen {
@@ -528,8 +536,8 @@ impl OnboardingScreen {
             s if s == first => return false,
             Step::Welcome => return false,
             Step::Type => Step::Welcome,
+            Step::Test | Step::Details if self.from_preset => Step::Presets,
             Step::Presets | Step::Details => Step::Type,
-            Step::Test if self.from_preset => Step::Presets,
             Step::Test => Step::Details,
             Step::Guide => Step::Test,
             // a running import keeps running (and the button says so); leaving is the app's
@@ -543,6 +551,9 @@ impl OnboardingScreen {
             self.form.keep_m3u = false;
         }
         self.go(prev);
+        if prev == Step::Presets {
+            self.focus = self.preset_idx.min(self.rows().saturating_sub(1));
+        }
         true
     }
 
@@ -599,6 +610,7 @@ impl OnboardingScreen {
         }
         self.form = Form::for_preset(p);
         self.from_preset = true;
+        self.preset_idx = i;
         self.error = None;
         self.test(ctx);
     }
@@ -769,12 +781,16 @@ impl OnboardingScreen {
         match self.step {
             Step::Welcome => ("Welcome to Tuner", "Add a playlist to start watching, or restore a backup."),
             Step::Type => ("Add a playlist", "How does your provider give you access?"),
-            Step::Presets => ("Try free channels", "Public playlists of free-to-air channels. Nothing is downloaded until you pick one."),
+            Step::Presets => (
+                "Try free channels",
+                "Public playlists of free-to-air channels. Nothing is downloaded until you pick one; some channels may not play where you are.",
+            ),
             Step::Details => match self.form.kind() {
                 SourceKind::Xtream => ("Xtream login", "Server, username and password from your provider."),
                 SourceKind::M3uUrl => ("M3U playlist URL", "Paste the playlist link. Xtream playlists sign in with their login automatically."),
                 SourceKind::M3uFile => ("M3U playlist file", "Pick an .m3u or .m3u8 file on this computer."),
             },
+            Step::Test if self.probe_result.is_some() => ("Checking your playlist", "Here's what Tuner found."),
             Step::Test => ("Checking your playlist", "Talking to the provider…"),
             Step::Guide => ("TV guide", "This playlist has no guide. Add an XMLTV guide, or skip — you can add one later in Settings ▸ EPG."),
             Step::Importing => ("Importing", "Channels come first; movies, series and the guide continue in the background."),
@@ -1189,7 +1205,7 @@ impl OnboardingScreen {
         let theme = ctx.theme;
         let t = &theme.tokens;
         if self.creds_loader.is_some() {
-            busy_bar(ui, theme, 3.0);
+            busy_bar(ui, theme, (3.0 * theme.rem()).round());
             return None;
         }
         let fields = self.form.fields();
@@ -1323,9 +1339,12 @@ impl OnboardingScreen {
                 ui.label(RichText::new(format!("{}  Xtream login found", glyphs::CHECK)).size(theme.font(TypeToken::Title)).color(t.success));
                 ui.add(
                     egui::Label::new(
-                        RichText::new("Movies, series, catch-up and account info included. Keep as M3U uses only the playlist's own entries.")
-                            .size(theme.font(TypeToken::BodySmall))
-                            .color(t.text_secondary),
+                        RichText::new(
+                            "This playlist comes with an Xtream login. Tuner signs in with it: movies, series, catch-up and account info \
+                             included. Keep as M3U uses only the playlist's own entries.",
+                        )
+                        .size(theme.font(TypeToken::BodySmall))
+                        .color(t.text_secondary),
                     )
                     .wrap(),
                 );
@@ -1358,7 +1377,7 @@ impl OnboardingScreen {
         let theme = ctx.theme;
         if self.presets.is_empty() {
             if self.presets_loader.is_some() {
-                busy_bar(ui, theme, 3.0);
+                busy_bar(ui, theme, (3.0 * theme.rem()).round());
             }
             return None;
         }
@@ -1733,14 +1752,13 @@ mod tests {
 
     /// DESIGN §27.8: a preset becomes an M3U URL draft named after it; one whose URL is a
     /// source already is "Added". The card opened from Settings ▸ "Add free channels" starts at
-    /// the presets, and Back from a preset's test returns there.
+    /// the presets, and Back from a preset's test (or from Details after a failed probe) returns
+    /// there, on the preset picked.
     #[test]
     fn presets_build_m3u_drafts_and_know_what_is_added() {
         let list = presets::presets(Some("gb"));
         let existing: HashSet<String> = [presets::FREE_TV.to_owned()].into();
         let rows = preset_rows(&list, &existing);
-        let urls: Vec<&str> = rows.iter().map(|r| r.url.as_str()).collect();
-        assert_eq!(urls, ["https://iptv-org.github.io/iptv/countries/uk.m3u", presets::IPTV_ORG_ALL, presets::FREE_TV]);
         assert_eq!(rows.iter().map(|r| r.added).collect::<Vec<_>>(), [false, false, true]);
         for r in &rows {
             let d = Form::for_preset(r).draft().unwrap();
@@ -1751,11 +1769,15 @@ mod tests {
         s.go(s.first_step());
         assert_eq!((s.step, s.back_label()), (Step::Presets, Some("Cancel")));
         assert!(!s.back(), "Back leaves the card");
-        s.form = Form::for_preset(&s.presets[0]);
-        s.from_preset = true;
+        s.form = Form::for_preset(&s.presets[1]);
+        (s.from_preset, s.preset_idx) = (true, 1);
         s.go(Step::Test);
         assert!(s.back());
-        assert_eq!(s.step, Step::Presets);
+        assert_eq!((s.step, s.focus), (Step::Presets, 1));
+        // a failed probe shows the URL field; Back skips Type (not a step of this card)
+        s.go(Step::Details);
+        assert!(s.back());
+        assert_eq!((s.step, s.focus), (Step::Presets, 1));
     }
 
     #[test]

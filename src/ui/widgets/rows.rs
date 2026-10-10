@@ -427,13 +427,13 @@ pub fn programme_row(
     resp
 }
 
-/// `E05  Title · 42 min` with watched check / progress bar; `playing` puts the accent 󰐊
-/// marker left of the title, like channel rows (DESIGN §13.0).
 /// An episode's title; a playlist episode without one reads "Episode 2" (DESIGN §27.7).
 pub fn episode_title(e: &Episode) -> std::borrow::Cow<'_, str> {
     if e.title.trim().is_empty() { format!("Episode {}", e.episode).into() } else { e.title.as_str().into() }
 }
 
+/// `E05  Title · 42 min` with watched check / progress bar; `playing` puts the accent 󰐊
+/// marker left of the title, like channel rows (DESIGN §13.0).
 pub fn episode_row(
     ui: &mut egui::Ui,
     theme: &Theme,

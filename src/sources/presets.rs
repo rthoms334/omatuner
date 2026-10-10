@@ -100,8 +100,12 @@ pub fn country_from(tz: Option<&str>, zone_tab: Option<&str>, locale: Option<&st
     })
 }
 
-/// Display name of a country from the tz database's `iso3166.tab` ("GB" → "Britain (UK)").
+/// Display name of a country from the tz database's `iso3166.tab`, except where its short form
+/// reads oddly as a playlist name (tzdata's "GB" is "Britain (UK)").
 pub fn country_name(iso: &str) -> Option<String> {
+    if iso.eq_ignore_ascii_case("GB") {
+        return Some("United Kingdom".to_owned());
+    }
     static NAMES: OnceLock<HashMap<String, String>> = OnceLock::new();
     let names = NAMES.get_or_init(|| {
         let tab = std::fs::read_to_string(ISO3166_TAB).unwrap_or_default();

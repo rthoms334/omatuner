@@ -579,6 +579,8 @@ enum Pending {
     Menu(Item),
     /// ←/→ on a parental row waiting for the PIN (retried as the same adjustment).
     Adjust(i32),
+    /// "Use the Xtream login" turned off: the playlist replaces the Xtream catalogue.
+    UsePlaylist(SourceId),
 }
 
 const MENU_EDIT: u8 = 1;
@@ -1402,12 +1404,29 @@ impl SettingsScreen {
 
     /// Editor ▸ "Use the Xtream login" (DESIGN §27.3): save `keep_m3u` now and run a forced
     /// refresh, which performs the switch (both ways). Turning it on for a playlist that is
-    /// still M3U is checked when that refresh finishes.
+    /// still M3U is checked when that refresh finishes; switching an Xtream source back to its
+    /// playlist drops what only the login had, so it asks first.
     fn set_use_xtream(&mut self, ctx: &mut UiCtx<'_>, on: bool) {
-        let Some(e) = &mut self.editor else { return };
+        let Some(e) = &self.editor else { return };
         if !e.offers_xtream_switch() || e.use_xtream == on {
             return;
         }
+        if !on && e.original.kind == SourceKind::Xtream {
+            let token = self.token(Pending::UsePlaylist(e.original.id));
+            ctx.open(OverlayRequest::Confirm(ConfirmSpec {
+                title: "Use the playlist instead of the Xtream login?".into(),
+                body: "Movies and series not in the playlist will be removed. Favourites carry over where the playlist has them.".into(),
+                confirm_label: "Use playlist".into(),
+                destructive: false,
+                token,
+            }));
+            return;
+        }
+        self.apply_use_xtream(ctx, on);
+    }
+
+    fn apply_use_xtream(&mut self, ctx: &mut UiCtx<'_>, on: bool) {
+        let Some(e) = &mut self.editor else { return };
         e.use_xtream = on;
         // a later Save keeps it (and doesn't count it as a change)
         e.original.settings.keep_m3u = !on;
@@ -1426,6 +1445,27 @@ impl SettingsScreen {
         } else {
             format!("Switching {name} back to its playlist…")
         }));
+    }
+
+    /// The open editor follows its stored row. Across a kind change (a silent upgrade, the
+    /// switch) the fields differ: an edit in progress ends and the cursor stays on its field,
+    /// else goes to the name.
+    fn rebase_editor(&mut self, s: &Source) {
+        let Some(e) = &self.editor else { return };
+        let kind_changed = s.kind != e.original.kind;
+        let field = match self.editor_rows(e).get(self.row) {
+            Some(Row::Local { field, .. }) => Some(*field),
+            _ => None,
+        };
+        if let Some(e) = &mut self.editor {
+            e.rebase(s);
+        }
+        if kind_changed && self.attach.is_none() {
+            self.editing = false;
+            let rows = self.editor.as_ref().map(|e| self.editor_rows(e)).unwrap_or_default();
+            let at = |f: Local| rows.iter().position(|r| matches!(r, Row::Local { field, .. } if *field == f));
+            self.row = field.and_then(at).or_else(|| at(Local::SrcName)).unwrap_or(0);
+        }
     }
 
     fn confirm_delete_source(&mut self, ctx: &mut UiCtx<'_>, id: SourceId, name: &str) {
@@ -1955,6 +1995,18 @@ impl Screen for SettingsScreen {
                 if matches!(outcome, Ok(JobOutcome::SourceRefreshed { upgraded: false, .. })) {
                     ctx.toast(Toast::error("Couldn't sign in with this playlist's Xtream login — still using the playlist"));
                 }
+                // still a playlist: it stays kept (no upgrade attempts behind the user's back) and
+                // the toggle stays offered
+                if !matches!(outcome, Ok(JobOutcome::SourceRefreshed { upgraded: true, .. })) {
+                    let id = *source;
+                    let _ = ctx.services.store.writer().submit_notify(DataScope::Sources, move |c| {
+                        let s = crate::store::sources::get_source(c, id)?;
+                        if s.kind != SourceKind::Xtream && !s.settings.keep_m3u {
+                            crate::store::sources::set_source_settings(c, id, &crate::model::SourceSettings { keep_m3u: true, ..s.settings })?;
+                        }
+                        Ok(())
+                    });
+                }
                 if self.editor.is_none() {
                     self.reload(ctx);
                 }
@@ -2138,6 +2190,11 @@ impl Screen for SettingsScreen {
                     });
                     ctx.toast(Toast::info("PIN removed"));
                 }
+                Pending::UsePlaylist(id) => {
+                    if self.editor.as_ref().is_some_and(|e| e.original.id == id) {
+                        self.apply_use_xtream(ctx, false);
+                    }
+                }
                 Pending::Menu(_) | Pending::Adjust(_) => {}
             },
             // the PIN was entered: retry what needed it (the same ←/→, else Enter)
@@ -2201,10 +2258,9 @@ impl SettingsScreen {
         if let Some(r) = kit::poll(&mut self.sources_loader) {
             match r {
                 Ok(v) => {
-                    if let Some(e) = &mut self.editor
-                        && let Some(s) = v.iter().find(|s| s.id == e.original.id && **s != e.original)
-                    {
-                        e.rebase(s);
+                    let changed = self.editor.as_ref().and_then(|e| v.iter().find(|s| s.id == e.original.id && **s != e.original).cloned());
+                    if let Some(s) = changed {
+                        self.rebase_editor(&s);
                     }
                     self.sources = v;
                 }
@@ -3221,6 +3277,60 @@ mod tests {
         let kept = Source { settings: crate::model::SourceSettings { keep_m3u: true, ..Default::default() }, ..m3u };
         let e = SourceEditor::new(&kept);
         assert!(e.offers_xtream_switch() && !e.use_xtream);
+    }
+
+    /// DESIGN §27.3: "Use the Xtream login" on a playlist kept as M3U saves the choice and runs
+    /// a forced refresh; while the playlist is still M3U afterwards it stays kept (no upgrade
+    /// attempts the user didn't ask for) and the open editor follows the row, still offering
+    /// the toggle. A sign-in that didn't happen says so.
+    #[test]
+    fn use_the_xtream_login_reports_a_failed_sign_in_and_stays_kept() {
+        let (mut t, one) = rig();
+        let id = seed(&mut t, |c| {
+            let id = testkit::source(c, "Kept")?;
+            crate::store::sources::set_source_settings(c, id, &crate::model::SourceSettings { keep_m3u: true, ..Default::default() })?;
+            Ok(id)
+        });
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 1000.0));
+        h.state_mut().enter(Route::Settings(SettingsPage::Playlists));
+        until(&mut h, "the source", |h| has_label(h, "Kept"));
+        focus(&mut h, "Kept");
+        h.state_mut().act(Action::Activate);
+        h.run_steps(2);
+        let use_xtream = |h: &H| h.state().s.editor.as_ref().is_some_and(|e| e.use_xtream);
+        let sign_in_failed = |h: &H| {
+            h.state().t.toasts.iter().filter(|t| t.text == "Couldn't sign in with this playlist's Xtream login — still using the playlist").count()
+        };
+        // the real refresh fails (nothing listens on the playlist's port)
+        focus(&mut h, "Use the Xtream login");
+        h.state_mut().act(Action::Activate);
+        h.run_steps(1); // acted on in the frame
+        assert!(use_xtream(&h) && h.state().s.login_switch == Some(id));
+        until(&mut h, "the refresh, then the playlist kept again", |h| {
+            h.state().s.login_switch.is_none() && sources(h)[0].settings.keep_m3u && h.state().s.editor.as_ref().is_some_and(|e| !e.use_xtream)
+        });
+        assert!(h.state().s.editor.as_ref().is_some_and(SourceEditor::offers_xtream_switch));
+        // the refresh answered without signing in
+        let finished = |upgraded| {
+            AppEvent::Job(JobEvent::Finished {
+                id: JobId(99),
+                kind: JobKind::RefreshSource { source: id, force: true },
+                outcome: Ok(JobOutcome::SourceRefreshed { source: id, summary: Default::default(), not_modified: false, account: None, upgraded }),
+                failure: None,
+            })
+        };
+        let deliver = |h: &mut H, ev: AppEvent| {
+            let app = h.state_mut();
+            app.t.with_ctx(|ctx| app.s.on_event(ctx, &ev));
+        };
+        focus(&mut h, "Use the Xtream login");
+        h.state_mut().act(Action::Activate);
+        h.run_steps(1);
+        deliver(&mut h, finished(false)); // before the next frame pumps the real answer
+        assert_eq!(sign_in_failed(&h), 1);
+        h.state_mut().s.login_switch = Some(id);
+        deliver(&mut h, finished(true));
+        assert_eq!(sign_in_failed(&h), 1, "an upgrade is the app's toast");
     }
 
     /// The iptv-org case: a guide that lists 2 channels matching 3 of 11 249 says so.
