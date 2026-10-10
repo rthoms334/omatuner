@@ -1,6 +1,4 @@
-//! Long-lived services shared by the UI. Owner: WP-10b (core start/stop implemented in the
-//! skeleton; every integration call site is wired — the integrations themselves return `Err`
-//! until their WP lands, which is logged and ignored).
+//! Long-lived services shared by the UI. Owner: WP-10b.
 //!
 //! Start order (DESIGN §5.1): paths → config → logging → tokio runtime → store (migrate,
 //! register secrets) → HTTP client → job manager → player (mpv + threads) → [window] →
@@ -8,6 +6,11 @@
 //! connection limits).
 //! Shutdown order: integrations → jobs.cancel_all → video surface destroy (GL, done by the app)
 //! → player shutdown (mpv) → runtime (shutdown_timeout 2 s) → store writer drains + joins.
+//!
+//! Every optional integration may fail to start (no session bus, socket in use…): the failure
+//! is logged and the app runs without it. Settings edits re-apply live
+//! ([`Services::apply_config`]): toggling the theme follower, MPRIS or reminders starts/stops
+//! them, a reminder lead change restarts the scheduler, a font change reloads fonts on a worker.
 
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
@@ -18,11 +21,12 @@ use crate::error::{Error, Result};
 use crate::jobs::{JobContext, JobManager};
 use crate::logging::LogBuffer;
 use crate::model::{ChannelId, HistoryEntry, ItemRef, MediaRef, Playable, WatchProgress};
-use crate::msg::{DataScope, EventBus};
+use crate::msg::{AppEvent, DataScope, EventBus};
 use crate::paths::AppPaths;
 use crate::player::{MediaResolver, Player, PlayerCommand, PlayerDeps, PlayerError, PlayerErrorKind, PlayerStore};
 use crate::sources::http::{HttpClient, HttpOptions};
 use crate::store::{Store, Writer};
+use crate::theme::ThemeEvent;
 
 /// Optional desktop integrations (each may be absent if its start failed).
 #[derive(Default)]
@@ -85,32 +89,74 @@ impl Services {
     /// player's connection budget from stored account info.
     pub fn start_integrations(&mut self) {
         let cfg = self.config();
-        let rt = self.rt.handle().clone();
-        fn ok<T>(what: &str, r: Result<T>) -> Option<T> {
-            r.map_err(|e| tracing::info!("{what}: {e}")).ok()
-        }
         if cfg.integration.follow_omarchy_theme {
-            self.integrations.theme_watch =
-                ok("theme watcher", crate::theme::watch::ThemeWatcher::start(self.paths.clone(), cfg.interface.ui_scale, self.bus.clone()));
+            self.start_theme_watch(&cfg);
         }
-        self.integrations.ipc = ok("IPC server", crate::ipc::IpcServer::start(&rt, &self.paths.ipc_socket(), self.bus.clone()));
+        self.integrations.ipc = ok("IPC server", crate::ipc::IpcServer::start(self.rt.handle(), &self.paths.ipc_socket(), self.bus.clone()));
         if cfg.integration.mpris {
-            self.integrations.mpris = ok("MPRIS", crate::platform::mpris::MprisService::start(&rt, self.player.handle(), self.bus.clone()));
+            self.start_mpris();
         }
         if cfg.reminders.enabled {
-            self.integrations.reminders = ok(
-                "reminders",
-                crate::platform::notify::ReminderScheduler::start(&rt, self.store.clone(), self.bus.clone(), cfg.reminders.lead_min as i64 * 60),
-            );
+            self.start_reminders(&cfg);
         }
         self.integrations.scheduler = Some(crate::jobs::scheduler::spawn(self.jobs.clone()));
-        match self.store.reader().and_then(|c| crate::store::sources::account_limits(&c)) {
-            Ok(limits) => {
-                for (source, max) in limits {
-                    self.player.handle().send(PlayerCommand::SetConnectionLimit { source, max });
-                }
-            }
+        match self.store.reader().and_then(|c| connection_limits(&c)) {
+            Ok(cmds) => cmds.into_iter().for_each(|c| self.player.handle().send(c)),
             Err(e) => tracing::warn!("connection limits: {e}"),
+        }
+    }
+
+    fn start_theme_watch(&mut self, cfg: &Config) {
+        self.integrations.theme_watch =
+            ok("theme watcher", crate::theme::watch::ThemeWatcher::start(self.paths.clone(), cfg.interface.ui_scale, self.bus.clone()));
+    }
+
+    fn start_mpris(&mut self) {
+        self.integrations.mpris = ok("MPRIS", crate::platform::mpris::MprisService::start(self.rt.handle(), self.player.handle(), self.bus.clone()));
+    }
+
+    fn start_reminders(&mut self, cfg: &Config) {
+        let lead_s = cfg.reminders.lead_min as i64 * 60;
+        self.integrations.reminders =
+            ok("reminders", crate::platform::notify::ReminderScheduler::start(self.rt.handle(), self.store.clone(), self.bus.clone(), lead_s));
+    }
+
+    /// Re-apply a Settings edit to the integrations (the app calls it after swapping the shared
+    /// config; the player gets `PlayerCommand::ApplyConfig` from the app). Never blocks: theme
+    /// and font loading run on the blocking pool and arrive as `ThemeEvent`s.
+    pub(crate) fn apply_config(&mut self, old: &Config, new: &Config) {
+        if old.integration.follow_omarchy_theme != new.integration.follow_omarchy_theme {
+            if new.integration.follow_omarchy_theme {
+                self.start_theme_watch(new);
+                let (paths, scale, bus) = (self.paths.clone(), new.interface.ui_scale, self.bus.clone());
+                self.rt.spawn_blocking(move || {
+                    let theme = crate::theme::Theme::load(&paths, scale);
+                    bus.send(AppEvent::Theme(ThemeEvent::Changed(Arc::new(theme))));
+                });
+            } else {
+                self.integrations.theme_watch = None;
+            }
+        }
+        if old.integration.mpris != new.integration.mpris {
+            if let Some(mut m) = self.integrations.mpris.take() {
+                m.stop();
+            }
+            if new.integration.mpris {
+                self.start_mpris();
+            }
+        }
+        if old.reminders != new.reminders {
+            self.integrations.reminders = None; // dropping the scheduler aborts its task
+            if new.reminders.enabled {
+                self.start_reminders(new);
+            }
+        }
+        if old.fonts != new.fonts {
+            let (fonts, bus) = (new.fonts.clone(), self.bus.clone());
+            self.rt.spawn_blocking(move || {
+                let loaded = crate::fonts::FontSet::resolve(&fonts).load();
+                bus.send(AppEvent::Theme(ThemeEvent::FontsChanged(Arc::new(loaded))));
+            });
         }
     }
 
@@ -135,6 +181,16 @@ impl Services {
     }
 }
 
+/// Log an optional integration's start failure and carry on without it.
+fn ok<T>(what: &str, r: Result<T>) -> Option<T> { r.map_err(|e| tracing::info!("{what}: {e}")).ok() }
+
+/// `SetConnectionLimit` for every source with stored account info, so the budget is known
+/// before the first play rather than after the next refresh (DESIGN §11.5).
+fn connection_limits(conn: &rusqlite::Connection) -> Result<Vec<PlayerCommand>> {
+    let limits = crate::store::sources::account_limits(conn)?;
+    Ok(limits.into_iter().map(|(source, max)| PlayerCommand::SetConnectionLimit { source, max }).collect())
+}
+
 /// Player persistence → store writer (fire-and-forget; DataScope notifications for the UI).
 struct WriterPlayerStore(Writer);
 
@@ -147,15 +203,32 @@ impl PlayerStore for WriterPlayerStore {
     }
     fn record_failure(&mut self, item: ItemRef, kind: Option<PlayerErrorKind>) {
         let _ = self.0.submit(move |c| match kind {
-            Some(k) => crate::store::live::record_failure(c, &item, &format!("{k:?}"), crate::model::now()),
+            Some(k) => crate::store::live::record_failure(c, &item, &failure_reason(k), crate::model::now()),
             None => crate::store::live::clear_failure(c, &item),
         });
     }
 }
 
+/// `stream_failure.reason`: the kind in kebab case (`HttpForbidden` → `http-forbidden`,
+/// `HttpOther(502)` → `http-other(502)`).
+fn failure_reason(kind: PlayerErrorKind) -> String {
+    let mut out = String::new();
+    for (i, ch) in format!("{kind:?}").chars().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('-');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// Resolver for the player controller thread: its own lazily opened reader + live config.
-/// Panics inside WP code (e.g. `todo!` before WP-05b lands) are caught and become resolve
-/// errors so they can never kill the player thread.
+/// A panic while resolving (a bug, or a body not merged yet) is caught and becomes a resolve
+/// error so it can never kill the player thread.
 struct DbResolver {
     store: Store,
     config: SharedConfig,
@@ -191,7 +264,10 @@ impl MediaResolver for DbResolver {
                 };
                 PlayerError { kind, message: e.to_string() }
             }),
-            Err(_) => Err(PlayerError { kind: PlayerErrorKind::Resolve, message: "stream resolution is not implemented yet".into() }),
+            Err(_) => {
+                tracing::error!("stream resolution panicked");
+                Err(PlayerError { kind: PlayerErrorKind::Resolve, message: "couldn't work out the stream address (see Logs)".into() })
+            }
         };
         if r.is_err()
             && let MediaRef::Channel(c) = media {
@@ -210,5 +286,96 @@ impl MediaResolver for DbResolver {
             .ok()
             .and_then(|r| r.ok())
             .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ItemKey, ItemKind, SourceId};
+
+    /// One source per `accounts` entry (account JSON or none) and a channel `m3u:ch` on the
+    /// first one.
+    fn seeded(name: &str, bus: Option<EventBus>, accounts: Vec<Option<String>>) -> Store {
+        let store = Store::open_temp(name, bus).unwrap();
+        store
+            .writer()
+            .blocking(move |c| {
+                for a in &accounts {
+                    c.execute("INSERT INTO source(name, kind, url, created_at, account) VALUES ('S', 'm3u-url', 'http://127.0.0.1/p.m3u', 0, ?1)", [a])?;
+                }
+                c.execute(
+                    "INSERT INTO channel(source_id, key, name, clean_name, norm_name, stream, provider_order, seen_gen)
+                     VALUES (1, 'm3u:ch', 'C', 'C', 'c', '{\"t\":\"url\",\"url\":\"http://127.0.0.1/c.ts\"}', 0, 1)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        store
+    }
+
+    fn shared_default() -> SharedConfig { Arc::new(RwLock::new(Arc::new(Config::default()))) }
+
+    #[test]
+    fn stored_account_limits_become_connection_limit_commands() {
+        let account = |max| serde_json::to_string(&crate::model::AccountInfo { max_connections: max, ..Default::default() }).ok();
+        let store = seeded("tuner-services-limits", None, vec![account(Some(1)), account(None), None, Some("not json".into())]);
+        let cmds = connection_limits(&store.reader().unwrap()).unwrap();
+        let limit = |s, max| PlayerCommand::SetConnectionLimit { source: SourceId(s), max };
+        assert_eq!(cmds, [limit(1, Some(1)), limit(2, None), limit(3, None), limit(4, None)]);
+        assert!(store.close(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn failure_reasons_are_kebab_case() {
+        assert_eq!(failure_reason(PlayerErrorKind::HttpForbidden), "http-forbidden");
+        assert_eq!(failure_reason(PlayerErrorKind::HttpOther(502)), "http-other(502)");
+        assert_eq!(failure_reason(PlayerErrorKind::Network), "network");
+    }
+
+    /// Player persistence goes through the writer and notifies the UI; two failures make
+    /// zapping skip the channel, a successful play clears it.
+    #[test]
+    fn player_store_and_resolver_share_the_failure_cache() {
+        let (bus, events) = EventBus::new(None);
+        let store = seeded("tuner-services-fail", Some(bus), vec![None]);
+        let item = ItemRef { source: SourceId(1), kind: ItemKind::Channel, key: ItemKey("m3u:ch".into()) };
+        let ch: ChannelId = store.reader().unwrap().query_row("SELECT id FROM channel", [], |r| r.get(0)).unwrap();
+        let mut ps = WriterPlayerStore(store.writer().clone());
+        let mut resolver = DbResolver::new(store.clone(), shared_default());
+        let flush = || store.writer().blocking(|_| Ok(())).unwrap();
+
+        ps.record_failure(item.clone(), Some(PlayerErrorKind::HttpNotFound));
+        flush();
+        assert!(!resolver.skip_on_zap(ch), "one failure is not enough");
+        ps.record_failure(item.clone(), Some(PlayerErrorKind::HttpNotFound));
+        flush();
+        assert!(resolver.skip_on_zap(ch));
+        let reason: String = store.reader().unwrap().query_row("SELECT reason FROM stream_failure", [], |r| r.get(0)).unwrap();
+        assert_eq!(reason, "http-not-found");
+        ps.record_failure(item.clone(), None);
+        flush();
+        assert!(!resolver.skip_on_zap(ch));
+
+        ps.push_history(HistoryEntry { item, at: 1, title: "C".into() });
+        flush();
+        let scopes: Vec<_> = events.try_iter().filter_map(|e| if let AppEvent::Data(s) = e { Some(s) } else { None }).collect();
+        assert_eq!(scopes, [DataScope::History]);
+        assert!(store.close(Duration::from_secs(5)));
+    }
+
+    /// Whatever resolution does with an unknown channel (an error, or a panic from a body not
+    /// merged yet), the player gets an error and zapping skips that channel afterwards.
+    #[test]
+    fn unresolvable_channels_error_and_are_skipped_when_zapping() {
+        let store = seeded("tuner-services-resolve", None, vec![None]);
+        let mut resolver = DbResolver::new(store.clone(), shared_default());
+        let missing = ChannelId(4242);
+        assert!(!resolver.skip_on_zap(missing));
+        let err = resolver.resolve(&MediaRef::Channel(missing), false).unwrap_err();
+        assert_eq!(err.kind, PlayerErrorKind::Resolve);
+        assert!(resolver.skip_on_zap(missing));
+        assert!(store.close(Duration::from_secs(5)));
     }
 }
