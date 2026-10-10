@@ -23,6 +23,7 @@ use std::io::{BufWriter, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use tracing::Level;
@@ -188,17 +189,24 @@ impl FileSink {
     }
 }
 
+/// What the `log-writer` thread is asked to do.
+enum FileCmd {
+    Line(String),
+    /// Answer once everything queued before it is on disk.
+    Flush(Sender<()>),
+}
+
 /// Feeds a [`FileSink`] from its own thread. Lines that don't fit the queue are counted and
 /// reported in the file once the writer catches up.
 #[derive(Clone)]
 struct FileWriter {
-    tx: Sender<String>,
+    tx: Sender<FileCmd>,
     dropped: Arc<AtomicU64>,
 }
 
 impl FileWriter {
     fn spawn(mut sink: FileSink) -> std::io::Result<Self> {
-        let (tx, rx): (Sender<String>, Receiver<String>) = crossbeam_channel::bounded(FILE_QUEUE);
+        let (tx, rx): (Sender<FileCmd>, Receiver<FileCmd>) = crossbeam_channel::bounded(FILE_QUEUE);
         let dropped = Arc::new(AtomicU64::new(0));
         let lost = dropped.clone();
         std::thread::Builder::new().name("log-writer".into()).spawn(move || {
@@ -209,9 +217,12 @@ impl FileWriter {
                 if n > 0 {
                     let _ = sink.write_line(&format!("[{n} log lines dropped: writer fell behind]"));
                 }
-                let mut r = sink.write_line(&first);
-                while let Ok(line) = rx.try_recv() {
-                    r = r.and(sink.write_line(&line));
+                let (mut r, mut acks) = (Ok(()), Vec::new());
+                for cmd in std::iter::once(first).chain(rx.try_iter()) {
+                    match cmd {
+                        FileCmd::Line(line) => r = r.and(sink.write_line(&line)),
+                        FileCmd::Flush(ack) => acks.push(ack),
+                    }
                 }
                 r = r.and(sink.flush());
                 match r {
@@ -223,18 +234,29 @@ impl FileWriter {
                     }
                     Err(_) => sink.file = None,
                 }
+                for ack in acks {
+                    let _ = ack.send(());
+                }
             }
         })?;
         Ok(Self { tx, dropped })
     }
 
     fn send(&self, line: String) {
-        match self.tx.try_send(line) {
+        match self.tx.try_send(FileCmd::Line(line)) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
             }
             Err(TrySendError::Disconnected(_)) => {}
+        }
+    }
+
+    /// Block until the lines sent so far are written, or for at most about `timeout`.
+    fn flush(&self, timeout: Duration) {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        if self.tx.send_timeout(FileCmd::Flush(tx), timeout).is_ok() {
+            let _ = rx.recv_timeout(timeout);
         }
     }
 }
@@ -334,6 +356,16 @@ impl FilterControl {
 }
 
 static FILTER: OnceLock<FilterControl> = OnceLock::new();
+/// The installed subscriber's file writer, for [`flush`].
+static FILE: OnceLock<FileWriter> = OnceLock::new();
+
+/// Wait (at most about `timeout`) until the lines logged so far are in the log file: for a
+/// direct `exit`, which skips the writer thread's own drain.
+pub fn flush(timeout: Duration) {
+    if let Some(w) = FILE.get() {
+        w.flush(timeout);
+    }
+}
 
 /// Apply `general.debug_log` to the running subscriber (Settings edit; no restart needed).
 pub fn set_debug(debug: bool) {
@@ -368,9 +400,12 @@ pub fn init(paths: &AppPaths, debug: bool) -> LogBuffer {
             None
         }
     };
-    let layer = RingLayer { buf: buf.clone(), stderr: true, file };
+    let layer = RingLayer { buf: buf.clone(), stderr: true, file: file.clone() };
     if tracing_subscriber::registry().with(filter).with(layer).try_init().is_ok() {
         let _ = FILTER.set(FilterControl { handle, from_env, pinned: AtomicBool::new(false) });
+        if let Some(f) = file {
+            let _ = FILE.set(f);
+        }
     }
     buf
 }
@@ -378,7 +413,6 @@ pub fn init(paths: &AppPaths, debug: bool) -> LogBuffer {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
-    use std::time::{Duration, Instant};
 
     use super::*;
 
@@ -439,7 +473,7 @@ mod tests {
         crate::redact::register_secret("layer-secret-91c2");
         let buf = LogBuffer::new(10);
         let file = FileWriter::spawn(FileSink::open(&path, ROTATE_BYTES).unwrap()).unwrap();
-        let layer = RingLayer { buf: buf.clone(), stderr: false, file: Some(file) };
+        let layer = RingLayer { buf: buf.clone(), stderr: false, file: Some(file.clone()) };
         let subscriber = tracing_subscriber::registry().with(layer);
         tracing::subscriber::with_default(subscriber, || {
             tracing::warn!(url = "http://h.tv/get.php?username=bob&password=hunter2", "refresh failed for layer-secret-91c2");
@@ -451,14 +485,8 @@ mod tests {
         assert!(lines[0].message.contains("url=http://h.tv/get.php?username=***&password=***"), "{}", lines[0].message);
         assert_eq!(lines[0].level, Level::WARN);
         assert_eq!(buf.snapshot(Level::WARN).len(), 1);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let text = loop {
-            let t = std::fs::read_to_string(&path).unwrap_or_default();
-            if t.lines().count() >= 2 || Instant::now() > deadline {
-                break t;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
+        file.flush(Duration::from_secs(5)); // what a direct exit relies on
+        let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("WARN tuner::logging::tests: "), "{text}");
         assert!(text.contains("refresh failed for ***"), "{text}");
         assert!(text.contains("INFO tuner::logging::tests: plain line"), "{text}");

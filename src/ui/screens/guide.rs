@@ -50,7 +50,7 @@ fn played_channel(snap: &PlayerSnapshot) -> Option<ChannelId> {
 pub struct GuideScreen {
     grid: Option<EpgGridState>,
     collection: Option<Collection>,
-    built: Option<(usize, u64, SortMode, Option<Collection>)>,
+    built: Option<(u64, u64, SortMode, Option<Collection>)>,
     dirty: bool,
     reminders: Vec<Reminder>,
     reminders_dirty: bool,
@@ -112,7 +112,7 @@ impl GuideScreen {
     /// Rebuild rows when the library, favourites, sort or collection changed.
     fn refresh(&mut self, ctx: &mut UiCtx<'_>) {
         let coll = self.default_collection(ctx);
-        let sig = (Arc::as_ptr(ctx.lib) as usize, fav_signature(ctx), ctx.config.interface.live_sort, Some(coll.clone()));
+        let sig = (ctx.lib.generation, fav_signature(ctx), ctx.config.interface.live_sort, Some(coll.clone()));
         if self.grid.is_none() {
             self.reminders_dirty = true;
         }

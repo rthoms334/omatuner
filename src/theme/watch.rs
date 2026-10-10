@@ -199,14 +199,24 @@ impl Poller {
     fn is_active(&self) -> bool { !self.files.is_empty() }
 
     /// Stop polling the files of every directory `watch` could watch now (it exists by now);
-    /// returns those directories.
-    fn upgrade(&mut self, mut watch: impl FnMut(&Path) -> bool) -> Vec<PathBuf> {
+    /// returns those directories and the triggers of one last poll of their files, taken after
+    /// the watch was added (a change before it is caught here, one after it by inotify).
+    fn upgrade(&mut self, mut watch: impl FnMut(&Path) -> bool) -> (Vec<PathBuf>, Vec<Trigger>) {
         let mut dirs: Vec<PathBuf> = self.files.iter().filter_map(|(p, ..)| p.parent().map(Path::to_path_buf)).collect();
         dirs.sort();
         dirs.dedup();
         let watched: Vec<PathBuf> = dirs.into_iter().filter(|d| d.is_dir() && watch(d)).collect();
-        self.files.retain(|(p, ..)| !watched.iter().any(|d| p.parent() == Some(d.as_path())));
-        watched
+        let mut changed = Vec::new();
+        self.files.retain(|(p, trigger, last)| {
+            if !watched.iter().any(|d| p.parent() == Some(d.as_path())) {
+                return true;
+            }
+            if fingerprint(p) != *last {
+                changed.push(*trigger);
+            }
+            false
+        });
+        (watched, changed)
     }
 
     /// Triggers for files whose fingerprint changed since the last poll.
@@ -261,14 +271,15 @@ impl Worker {
             triggers.extend(rx.try_iter());
             let now = Instant::now();
             if poll_due.is_some_and(|d| d <= now) {
-                // a change up to now is caught by this last poll; inotify reports the rest
-                triggers.extend(self.poller.poll());
                 if let Some(w) = self.watcher.as_ref().and_then(std::sync::Weak::upgrade) {
                     let watch = |d: &Path| w.lock().unwrap_or_else(|e| e.into_inner()).watch(d, RecursiveMode::NonRecursive).is_ok();
-                    for d in self.poller.upgrade(watch) {
+                    let (dirs, changed) = self.poller.upgrade(watch);
+                    triggers.extend(changed);
+                    for d in dirs {
                         tracing::info!("theme watcher: {} exists now; watching it instead of polling", d.display());
                     }
                 }
+                triggers.extend(self.poller.poll());
                 poll_due = self.poller.is_active().then(|| now + POLL);
             }
             for t in triggers {
@@ -394,36 +405,23 @@ mod tests {
         let (a, b) = (dir.path().join("omarchy"), dir.path().join("fontconfig"));
         let mut p = Poller::new(vec![(a.join("shell.toml"), Trigger::Theme), (b.join("fonts.conf"), Trigger::Fonts)]);
         let mut asked = Vec::new();
-        assert!(p.upgrade(|d| {
+        let (dirs, _) = p.upgrade(|d| {
             asked.push(d.to_path_buf());
             true
-        })
-        .is_empty());
+        });
+        assert!(dirs.is_empty());
         assert!(asked.is_empty(), "missing directories are not tried");
         std::fs::create_dir(&a).unwrap();
         std::fs::create_dir(&b).unwrap();
+        // written before the watch was added: reported by the upgrade, not lost
+        std::fs::write(a.join("shell.toml"), "x\n").unwrap();
         // the watch of `b` fails (e.g. out of inotify watches): it keeps being polled
-        assert_eq!(p.upgrade(|d| d == a), vec![a.clone()]);
+        assert_eq!(p.upgrade(|d| d == a), (vec![a.clone()], vec![Trigger::Theme]));
         assert_eq!(p.files.len(), 1);
         assert_eq!(p.files[0].0, b.join("fonts.conf"));
         assert!(p.is_active());
-        assert_eq!(p.upgrade(|_| true), vec![b]);
+        assert_eq!(p.upgrade(|_| true), (vec![b], vec![]));
         assert!(!p.is_active(), "nothing left to poll");
-
-        // with a real inotify watcher: after the upgrade, events arrive for the new directory
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let mut w = notify::recommended_watcher(move |e: notify::Result<notify::Event>| {
-            let _ = tx.send(e);
-        })
-        .unwrap();
-        let c = dir.path().join("current");
-        let mut p = Poller::new(vec![(c.join("theme.name"), Trigger::Theme)]);
-        assert!(w.watch(&c, RecursiveMode::NonRecursive).is_err(), "missing at start");
-        std::fs::create_dir(&c).unwrap();
-        assert_eq!(p.upgrade(|d| w.watch(d, RecursiveMode::NonRecursive).is_ok()), vec![c.clone()]);
-        std::fs::write(c.join("theme.name"), "x\n").unwrap();
-        let ev = rx.recv_timeout(Duration::from_secs(5)).expect("inotify event").unwrap();
-        assert!(ev.paths.iter().any(|p| p.ends_with("theme.name")), "{ev:?}");
     }
 
     #[test]

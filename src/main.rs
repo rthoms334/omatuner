@@ -91,7 +91,7 @@ fn main() -> anyhow::Result<()> {
             Theme::from_parts(t.name, t.palette, t.shell, t.tokens.rounding, ui_scale)
         }
     })?;
-    let mut services = Services::start(paths.clone(), config, logs, bus.clone())?;
+    let services = Services::start(paths.clone(), config, logs, bus.clone())?;
     services.watch_signals();
 
     let options = eframe::NativeOptions {

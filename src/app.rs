@@ -323,11 +323,11 @@ impl TunerApp {
                 }
             }
             // AddSource ran the first import inline (no `SourceRefreshed`): its stored account
-            // limit is known now, before the first play of the new playlist
+            // limit is known now, before the first play of the new playlist (its image
+            // User-Agent followed the `DataScope::Sources` the insert sent)
             Ok(JobOutcome::SourceAdded(source)) => {
                 self.offline = false;
                 self.send_connection_limit(*source);
-                self.refresh_image_agents();
             }
             Ok(JobOutcome::EpgRefreshed { .. }) => self.offline = false,
             Ok(_) => {}
@@ -419,7 +419,8 @@ impl TunerApp {
     /// Re-read the recently watched channels (one aggregate over the ≤ 500-row history table)
     /// and swap in a snapshot that shares the library's indexes when they changed: the
     /// incremental reaction to `DataScope::History` (DESIGN §5.4). `built_at` stays, so screens
-    /// keyed on it (VOD grids, search, Home's recently added) don't rebuild for a zap.
+    /// keyed on it (VOD grids, search, Home's recently added) don't rebuild for a zap; those
+    /// showing the recent list follow `Library::generation`.
     fn refresh_recent_channels(&mut self) {
         match crate::store::library::load_recent_channels(&self.db, &self.lib.live) {
             Ok(recent) if recent != self.lib.recent_channels => self.lib = Arc::new(self.lib.with_recent_channels(recent)),
@@ -1576,6 +1577,7 @@ mod tests {
         assert_eq!(after.recent_channels, [after.live.by_ref(&channel_ref(2)).unwrap()]);
         assert!(Arc::ptr_eq(&before.live, &after.live) && Arc::ptr_eq(&before.vod, &after.vod));
         assert_eq!(after.built_at, before.built_at, "screens keyed on the build don't rebuild");
+        assert_ne!(after.generation, before.generation, "screens showing the recent list do");
         // nothing new: the snapshot stays the same
         rig.event(AppEvent::Data(DataScope::History));
         assert!(Arc::ptr_eq(&after, &rig.app.lib));

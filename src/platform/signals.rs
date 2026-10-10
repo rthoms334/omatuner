@@ -7,6 +7,9 @@
 //!    so if the app has not started shutting down within [`GRACE`] — or a second signal
 //!    arrives — the watcher exits by itself: the player stops (its final progress save goes to
 //!    the writer), the writer queue is flushed, the socket is removed, `exit(0)`.
+//! 3. Once the app is shutting down (`closing`), the watcher keeps running until the runtime
+//!    stops: a signal then means that shutdown is stuck (mpv on a dead stream), and it exits
+//!    directly the same way.
 //!
 //! Only `main` installs the handlers (tests never replace the process's signal handling).
 
@@ -54,11 +57,19 @@ where
     Fut: Future<Output = ()>,
 {
     let Some(name) = signals.recv().await else { return };
+    if closing.load(Ordering::SeqCst) {
+        tracing::warn!("{name} while shutting down: exiting directly");
+        return emergency().await;
+    }
     tracing::info!("{name}: quitting");
     bus.send(AppEvent::Platform(PlatformEvent::Quit));
     match tokio::time::timeout(grace, signals.recv()).await {
-        // the window closed and the app is shutting down: its own path does the rest
-        Err(_) if closing.load(Ordering::SeqCst) => return,
+        // the window closed and the app is shutting down: its own path does the rest, unless
+        // another signal says it is stuck
+        Err(_) if closing.load(Ordering::SeqCst) => match signals.recv().await {
+            Some(again) => tracing::warn!("{again} while shutting down: exiting directly"),
+            None => return,
+        },
         Err(_) => tracing::warn!("the window did not close within {} s (hidden workspace?); exiting directly", grace.as_secs()),
         Ok(Some(again)) => tracing::warn!("{again} again: exiting directly"),
         Ok(None) => return,
@@ -91,8 +102,12 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert_eq!(quits(&events), 1);
         closing.store(true, Ordering::SeqCst); // what on_exit → Services::shutdown does
-        task.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(!fired.load(Ordering::SeqCst), "the normal path does the cleanup");
+        // …but a signal while that shutdown hangs still exits directly
+        tx.send("SIGINT").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+        assert!(fired.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -108,12 +123,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_second_signal_exits_at_once_even_while_closing() {
+    async fn a_second_signal_exits_at_once() {
         let (tx, rx, bus, _events) = rig();
         let fired = Arc::new(AtomicBool::new(false));
         let f = fired.clone();
-        let closing = Arc::new(AtomicBool::new(true));
-        let task = tokio::spawn(quit_on_signals(rx, bus, closing, Duration::from_secs(60), move || async move { f.store(true, Ordering::SeqCst) }));
+        let task = tokio::spawn(quit_on_signals(rx, bus, Arc::default(), Duration::from_secs(60), move || async move { f.store(true, Ordering::SeqCst) }));
         tx.send("SIGTERM").unwrap();
         tx.send("SIGTERM").unwrap();
         tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();

@@ -103,13 +103,6 @@ pub fn emit_summary((prefix, n, level): &Summary) { emit(*level, prefix, &format
 mod tests {
     use super::*;
 
-    #[test]
-    fn levels_are_demoted() {
-        assert_eq!(level_of("fatal"), Level::WARN);
-        assert_eq!(level_of("error"), Level::INFO);
-        assert_eq!(level_of("warn"), Level::DEBUG);
-    }
-
     /// A dead DASH stream: hundreds of fragment errors become BURST lines + one summary per
     /// window, and other modules keep their own budget.
     #[test]

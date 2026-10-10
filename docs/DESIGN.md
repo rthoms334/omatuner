@@ -294,8 +294,8 @@ save), checkpoints the WAL (TRUNCATE) and is joined. (WP-13: `jobs.shutdown` ref
 and cancels; after the player, the app waits ≤ 5 s for cancelled jobs to wind down — an aborted
 guide import discards its partial generation and restores channel matches — before the runtime
 goes. SIGTERM/SIGINT/SIGHUP close the window the same way; if no frame runs within 3 s (hidden
-workspace) or a second signal arrives, the signal watcher stops the player, flushes the writer,
-removes `run/tuner.sock` and exits 0.)
+workspace) or a second signal arrives — also during a stuck shutdown — the signal watcher stops
+the player, flushes the writer and the log file, removes `run/tuner.sock` and exits 0.)
 Unwind safety: `TunerApp` declares `video` before `services`; `MpvGl` frees its context only in
 an explicit `destroy` (GL current) and otherwise leaks it; `Player` leaks mpv while a render
 context is alive — never UB on a panic path.
@@ -356,7 +356,7 @@ recent, sort)`) happens here, so zapping order == list order.
 | `DataScope` | App reaction |
 |---|---|
 | Live, Vod, Overrides, Sources, All | `RebuildLibrary` |
-| History (every zap) | re-read `recent_channels` (≤ 500 history rows) → `Library::with_recent_channels` (shares the `Arc` indexes, keeps `built_at`); no rebuild (WP-13) |
+| History (every zap) | re-read `recent_channels` (≤ 500 history rows) → `Library::with_recent_channels` (shares the `Arc` indexes, keeps `built_at`, new `generation` for screens showing the recent list); no rebuild (WP-13) |
 | Epg | `NowNextCache::invalidate` + `RebuildLibrary` (`ChannelSummary.epg_channel_id` is a snapshot of `channel_epg`) |
 | Favourites | `load_favs` → `TunerApp.favs` |
 | Reminders | `ReminderScheduler::refresh` |

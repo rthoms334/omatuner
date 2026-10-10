@@ -43,8 +43,6 @@ pub struct Integrations {
     pub mpris: Option<crate::platform::mpris::MprisService>,
     pub reminders: Option<crate::platform::notify::ReminderScheduler>,
     pub scheduler: Option<tokio::task::AbortHandle>,
-    /// SIGTERM/SIGINT/SIGHUP forwarder + watcher (installed by `main` only).
-    pub signals: Vec<tokio::task::AbortHandle>,
 }
 
 pub struct Services {
@@ -58,7 +56,8 @@ pub struct Services {
     pub player: Player,
     pub logs: LogBuffer,
     pub integrations: Integrations,
-    /// Set when [`Services::shutdown`] begins (the signal watcher then leaves the exit to it).
+    /// Set when [`Services::shutdown`] begins (the signal watcher leaves the exit to it; a
+    /// signal after that means it is stuck).
     closing: Arc<AtomicBool>,
     /// The IPC socket we bound, for the signal watcher's direct exit.
     socket: Arc<Mutex<Option<crate::ipc::SocketGuard>>>,
@@ -197,10 +196,10 @@ impl Services {
 
     /// Quit cleanly on SIGTERM / SIGINT / SIGHUP (`platform::signals`): close the window, or
     /// exit directly when it can't close. Called by `main` only — tests keep the default
-    /// signal handling.
-    pub fn watch_signals(&mut self) {
+    /// signal handling. Both tasks run until the runtime stops, past `shutdown`'s slow steps.
+    pub fn watch_signals(&self) {
         let _rt = self.rt.enter();
-        let (signals, forwarder) = match crate::platform::signals::forward() {
+        let (signals, _forwarder) = match crate::platform::signals::forward() {
             Ok(s) => s,
             Err(e) => {
                 tracing::info!("signal handling: {e}");
@@ -208,17 +207,17 @@ impl Services {
             }
         };
         let cleanup = self.exit_cleanup();
-        let watcher = self.rt.spawn(crate::platform::signals::quit_on_signals(
+        self.rt.spawn(crate::platform::signals::quit_on_signals(
             signals,
             self.bus.clone(),
             self.closing.clone(),
             crate::platform::signals::GRACE,
             move || async move {
                 cleanup.await;
+                crate::logging::flush(Duration::from_millis(500));
                 std::process::exit(0);
             },
         ));
-        self.integrations.signals = vec![forwarder.abort_handle(), watcher.abort_handle()];
     }
 
     /// What the direct exit does instead of [`Services::shutdown`] (the UI thread can't run
@@ -241,10 +240,9 @@ impl Services {
 
     /// Orderly shutdown (see module docs). The video surface must already be destroyed.
     pub fn shutdown(mut self) {
+        // the signal watcher stays until the runtime stops: a signal during a stuck shutdown
+        // still exits directly (`platform::signals`)
         self.closing.store(true, Ordering::SeqCst);
-        for t in self.integrations.signals.drain(..) {
-            t.abort();
-        }
         if let Some(m) = &mut self.integrations.mpris {
             m.stop();
         }

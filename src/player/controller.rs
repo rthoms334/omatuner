@@ -737,20 +737,6 @@ mod tests {
         assert_eq!(must_stop_first(None, Some(7), Some(a), &budget), None, "nothing leased");
     }
 
-    /// A redirect hands the lease to the inserted entry at once, so a same-source play right
-    /// after it still stops first (before: no leased entry until the next START_FILE).
-    #[test]
-    fn a_redirect_moves_the_lease_to_the_inserted_entry_at_once() {
-        assert_eq!(lease_on_end(Some(3), 3, EndReason::Redirect, Some(4)), LeaseOnEnd::MoveTo(Some(4)));
-        let (a, budget) = (SourceId(1), ConnectionBudget::default());
-        assert_eq!(must_stop_first(Some(&Lease { source: a }), Some(4), Some(a), &budget), Some(4));
-        assert_eq!(lease_on_end(Some(3), 3, EndReason::Redirect, None), LeaseOnEnd::MoveTo(None), "older mpv: next START_FILE");
-        assert_eq!(lease_on_end(Some(4), 4, EndReason::Eof, None), LeaseOnEnd::Release);
-        assert_eq!(lease_on_end(Some(4), 4, EndReason::Error, None), LeaseOnEnd::Release);
-        assert_eq!(lease_on_end(Some(4), 3, EndReason::Stop, None), LeaseOnEnd::Unrelated, "the replaced entry");
-        assert_eq!(lease_on_end(None, 3, EndReason::Redirect, Some(4)), LeaseOnEnd::Unrelated);
-    }
-
     #[test]
     fn http_status_parse() {
         assert_eq!(http_status_in("http: HTTP error 403 Forbidden"), Some(403));

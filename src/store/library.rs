@@ -21,6 +21,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusqlite::Connection;
 
@@ -290,6 +291,10 @@ pub struct Library {
     /// Distinct recently watched channels, most recent first (`Collection::History`, Home).
     pub recent_channels: Vec<ChannelId>,
     pub built_at: Timestamp,
+    /// Unique per snapshot (a build or a [`Library::with_recent_channels`] copy; 0 = the empty
+    /// default): what screens compare to notice a swap. Never the `Arc` address — a dropped
+    /// snapshot's allocation is often reused by the next one.
+    pub generation: u64,
 }
 
 impl Library {
@@ -299,7 +304,8 @@ impl Library {
     pub fn has_series(&self) -> bool { !self.vod.series.is_empty() }
 
     /// This catalogue with another recently-watched list: the indexes are shared, not copied,
-    /// and `built_at` is kept (screens keyed on it don't rebuild for a zap).
+    /// and `built_at` is kept (screens keyed on it don't rebuild for a zap); `generation` is new
+    /// (screens showing the recent list do).
     pub fn with_recent_channels(&self, recent_channels: Vec<ChannelId>) -> Library {
         Library {
             sources: self.sources.clone(),
@@ -308,8 +314,14 @@ impl Library {
             favs: self.favs.clone(),
             recent_channels,
             built_at: self.built_at,
+            generation: next_generation(),
         }
     }
+}
+
+fn next_generation() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Recently watched channels kept in the snapshot (`Collection::History`, Home rail).
@@ -515,7 +527,7 @@ pub fn load(conn: &Connection) -> Result<Library> {
     let vod = VodIndex::from_parts(movies, series, movie_groups, series_groups, members);
     let favs = load_favs(conn)?;
     let recent_channels = load_recent_channels(conn, &live)?;
-    Ok(Library { sources, live: Arc::new(live), vod: Arc::new(vod), favs, recent_channels, built_at: crate::model::now() })
+    Ok(Library { sources, live: Arc::new(live), vod: Arc::new(vod), favs, recent_channels, built_at: crate::model::now(), generation: next_generation() })
 }
 
 /// Distinct recently watched channels of `live`, most recent first (one aggregate over the
