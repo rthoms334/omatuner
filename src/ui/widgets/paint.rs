@@ -63,14 +63,6 @@ pub(super) fn fit_height(ui: &egui::Ui, natural: f32) -> f32 {
     if slot.is_finite() && slot >= 16.0 && slot < natural { slot } else { natural }
 }
 
-/// Local wall-clock "HH:MM" for a unix timestamp.
-pub(super) fn hhmm(ts: crate::model::Timestamp) -> String {
-    match jiff::Timestamp::from_second(ts) {
-        Ok(t) => t.to_zoned(jiff::tz::TimeZone::system()).strftime("%H:%M").to_string(),
-        Err(_) => "--:--".into(),
-    }
-}
-
 /// Media duration "1:02:13" / "41:20" (negative and NaN clamp to 0).
 pub(super) fn clock(seconds: f64) -> String {
     let s = if seconds.is_finite() { seconds.max(0.0) as u64 } else { 0 };
@@ -95,10 +87,5 @@ mod tests {
     fn margin_rounds_and_clamps() {
         assert_eq!(margin(10.4, 7.6), egui::Margin::symmetric(10, 8));
         assert_eq!(margin(500.0, -3.0), egui::Margin::symmetric(127, 0));
-    }
-
-    #[test]
-    fn hhmm_is_five_chars() {
-        assert_eq!(hhmm(1_791_576_000).len(), 5);
     }
 }

@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use eframe::egui::{self, Align2};
+use eframe::egui;
 
 use super::home::kit::{self, Loader};
 use super::movie_detail::{DetailHeader, fraction, resumable, resume_or_play};
@@ -535,12 +535,7 @@ impl Screen for SeriesDetailScreen {
                 let watched = p.is_some_and(|p| p.finished);
                 let cursor = section == Section::Episodes && i == ep_idx;
                 let selected = section != Section::Episodes && i == ep_idx;
-                let resp = rows::episode_row(ui, theme, e, p.and_then(fraction), watched, RowState::from_flags(cursor, selected));
-                if playing_ep == Some(e.id) {
-                    // now-playing marker (DESIGN §13.0), right of the watched check
-                    let x = resp.rect.right() - theme.space(SpaceToken::Lg) - if watched { theme.font(TypeToken::Icon) + theme.space(SpaceToken::Md) } else { 0.0 };
-                    ui.painter().text(egui::pos2(x, resp.rect.center().y), Align2::RIGHT_CENTER, glyphs::PLAY, egui::FontId::proportional(theme.font(TypeToken::Icon)), t.accent);
-                }
+                let resp = rows::episode_row(ui, theme, e, p.and_then(fraction), watched, playing_ep == Some(e.id), RowState::from_flags(cursor, selected));
                 if (cursor || selected) && scroll {
                     ui.scroll_to_rect(resp.rect, None);
                 }

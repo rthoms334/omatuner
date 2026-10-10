@@ -13,8 +13,9 @@
 //!   menu (the choice is saved as `interface.movie_sort` / `series_sort`), ← on the first
 //!   column / Backspace returns to the categories, Tab switches panes. Item shortcuts: Ctrl+F
 //!   / Ctrl+Shift+F favourites, Ctrl+W watched, Ctrl+L lock, Ctrl+H hide, F2 rename, Ctrl+I
-//!   details, Delete removes from Favourites / Continue watching, Alt+↑/↓ switches a sorted
-//!   grid to Custom order (DESIGN §13.0).
+//!   details, Delete removes from Favourites / Continue watching, Alt+↑/↓ moves the title in
+//!   Custom order (`item_override.user_order`, per title — DESIGN §8.3), switching a sorted
+//!   grid to Custom order first (DESIGN §13.0); the cursor follows the title.
 //! * Only the focused pane shows the cursor; the other shows its current row "selected".
 //! * Wide: categories | grid. Medium (a tiled half): the categories are a drawer (← on the
 //!   first column, Backspace, or the header button) so the grid keeps 4–5 columns; Esc
@@ -29,7 +30,7 @@ use eframe::egui;
 
 use super::home::kit::{self, Loader};
 use crate::keymap::{Action, KeyContext};
-use crate::model::{GroupId, ItemKey, ItemKind, SortMode, SourceId, Timestamp, VodKind, VodSummary};
+use crate::model::{GroupId, ItemKey, ItemKind, SortMode, SourceId, VodKind, VodSummary};
 use crate::msg::{AppEvent, DataScope};
 use crate::theme::{SpaceToken, TypeToken};
 use crate::ui::overlays::{ContextMenuSpec, MenuItem, OverlayResult};
@@ -91,6 +92,10 @@ const MENU_OPEN: u8 = 20;
 const MENU_PLAY: u8 = 21;
 /// Category context-menu "Open".
 const MENU_OPEN_CAT: u8 = 22;
+
+/// Identity of the library snapshot (indices into it are only valid for that snapshot; two
+/// rebuilds can share a `built_at` second).
+fn lib_id(ctx: &UiCtx<'_>) -> usize { std::sync::Arc::as_ptr(ctx.lib) as usize }
 
 fn sort_label(s: SortMode) -> &'static str { SORTS.iter().find(|(m, _)| *m == s).map(|(_, l)| *l).unwrap_or("Custom order") }
 
@@ -154,16 +159,18 @@ pub(super) struct VodBrowser {
     /// `items` after the grid filter.
     shown: Vec<u32>,
     /// What `items` was computed from: (category, sort, library build).
-    items_key: Option<(Cat, SortMode, Timestamp)>,
+    items_key: Option<(Cat, SortMode, usize)>,
     progress: ProgressInfo,
     progress_loader: Option<Loader<ProgressInfo>>,
     /// Watch progress by index into the kind's list (rebuilt with `progress` / `index`).
     progress_idx: HashMap<u32, f32>,
     /// (source, key) → index, per library build.
     index: HashMap<(SourceId, ItemKey), u32>,
-    index_built: Timestamp,
+    index_built: usize,
     /// A locked category waiting for the PIN (cleared by any other open / item action).
     pending_cat: Option<Cat>,
+    /// A title just moved with Alt+↑/↓: the cursor follows it when the items are rebuilt.
+    follow: Option<(SourceId, ItemKey)>,
     playing: kit::PlayingVod,
 }
 
@@ -249,13 +256,13 @@ impl VodBrowser {
 
     /// Recompute the open category's items when its inputs changed.
     fn refresh_items(&mut self, ctx: &UiCtx<'_>) {
-        if self.index_built != ctx.lib.built_at {
-            self.index_built = ctx.lib.built_at;
+        if self.index_built != lib_id(ctx) {
+            self.index_built = lib_id(ctx);
             self.index = self.all(ctx).iter().enumerate().map(|(i, v)| ((v.source_id, v.key.clone()), i as u32)).collect();
             self.rebuild_progress_idx();
             self.items_key = None;
         }
-        let key = (self.open, self.sort(ctx), ctx.lib.built_at);
+        let key = (self.open, self.sort(ctx), lib_id(ctx));
         // favourites change without a library rebuild: recompute that category every frame
         if self.items_key == Some(key) && self.open != Cat::Favourites {
             return;
@@ -275,6 +282,12 @@ impl VodBrowser {
         if items != self.items {
             self.items = items;
             self.apply_filter(ctx);
+        }
+        if let Some((src, key)) = self.follow.take() {
+            let all = self.all(ctx);
+            if let Some(i) = self.shown.iter().position(|x| all.get(*x as usize).is_some_and(|v| v.source_id == src && v.key == key)) {
+                self.grid.select(i);
+            }
         }
     }
 
@@ -388,7 +401,7 @@ impl VodBrowser {
             return false;
         }
         if matches!(action, Action::MoveUp | Action::MoveDown) {
-            self.reorder_hint(ctx);
+            self.reorder(ctx, action == Action::MoveUp);
             return true;
         }
         let Some(v) = self.current(ctx) else { return true };
@@ -436,16 +449,51 @@ impl VodBrowser {
         }
     }
 
-    /// Alt+↑/↓ on a poster (DESIGN §13.0): a sorted grid switches to Custom order first.
-    fn reorder_hint(&mut self, ctx: &mut UiCtx<'_>) {
-        if self.sort(ctx) != SortMode::Provider {
-            let movies = self.movies;
-            ctx.edit_config(move |c| if movies { c.interface.movie_sort = SortMode::Provider } else { c.interface.series_sort = SortMode::Provider });
-            self.items_key = None;
-            ctx.toast(crate::msg::Toast::info("Switched to custom order"));
-        } else {
-            ctx.toast(crate::msg::Toast::info("Titles keep the provider's order; reorder their categories instead"));
+    /// Alt+↑/↓ on a poster: move the title one place in Custom order. A sorted grid switches
+    /// to Custom order first (DESIGN §13.0) and the move happens in that order — the one the
+    /// user is about to see. Stored as `user_order` of this playlist's titles up to the moved
+    /// pair (positions; the titles further down keep theirs), shown at once, confirmed by the
+    /// library rebuild.
+    fn reorder(&mut self, ctx: &mut UiCtx<'_>, up: bool) {
+        let Some(cur) = self.current(ctx) else { return };
+        if !matches!(self.open, Cat::All | Cat::Group(_)) {
+            ctx.toast(crate::msg::Toast::info("This list keeps its own order"));
+            return;
         }
+        if self.grid.filter.is_active() {
+            ctx.toast(crate::msg::Toast::info("Clear the filter to reorder"));
+            return;
+        }
+        let movies = self.movies;
+        if self.sort(ctx) != SortMode::Provider {
+            ctx.edit_config(move |c| if movies { c.interface.movie_sort = SortMode::Provider } else { c.interface.series_sort = SortMode::Provider });
+            ctx.toast(crate::msg::Toast::info("Switched to custom order"));
+            self.items = match self.open {
+                Cat::Group(g) => ctx.lib.vod.group_items(g, SortMode::Provider),
+                _ => ctx.lib.vod.all_sorted(movies, SortMode::Provider),
+            };
+            self.items_key = Some((self.open, SortMode::Provider, lib_id(ctx)));
+            self.apply_filter(ctx);
+        }
+        let all = self.all(ctx);
+        let Some(i) = self.items.iter().position(|x| all.get(*x as usize).is_some_and(|v| v.kind == cur.kind)) else { return };
+        let j = if up { i.checked_sub(1) } else { (i + 1 < self.items.len()).then_some(i + 1) };
+        let Some(j) = j.filter(|j| all.get(self.items[*j] as usize).is_some_and(|v| v.source_id == cur.source_id)) else {
+            // the first / last title (of its playlist: titles stay with their playlist)
+            if let Some(r) = self.shown.iter().position(|x| *x == self.items[i]) {
+                self.grid.select(r);
+            }
+            return;
+        };
+        let mut order = self.items.clone();
+        order.swap(i, j);
+        let keys: Vec<ItemKey> = order[..=i.max(j)].iter().filter_map(|x| all.get(*x as usize)).filter(|v| v.source_id == cur.source_id).map(|v| v.key.clone()).collect();
+        let (src, kind) = (cur.source_id, if movies { ItemKind::Movie } else { ItemKind::Series });
+        let _ = ctx.services.store.writer().submit_notify(DataScope::Overrides, move |c| crate::store::user::reorder_items(c, src, kind, &keys));
+        self.items = order;
+        self.apply_filter(ctx);
+        self.grid.select(j);
+        self.follow = Some((cur.source_id, cur.key.clone()));
     }
 
     /// Category shortcuts (lock, rename, hide, reorder, context menu) in the categories pane.
@@ -648,7 +696,7 @@ impl VodBrowser {
             empty_state::empty_state(ui, theme, if self.movies { glyphs::MOVIES } else { glyphs::SERIES }, &title, Some("Xtream logins usually include movies and series; M3U playlists rarely do."), None);
             return;
         }
-        if self.cat_rows.is_empty() || self.cat_rows.len() != self.cats.len || ctx.lib.built_at != self.index_built {
+        if self.cat_rows.is_empty() || self.cat_rows.len() != self.cats.len || lib_id(ctx) != self.index_built {
             self.refilter_cats(ctx);
         }
         self.refresh_items(ctx);
@@ -885,6 +933,57 @@ mod tests {
     use egui_kittest::kittest::Queryable;
     use crate::ui::screens::home::testkit::{self, harness, has_label, rig, seed, until};
 
+    /// Custom order works for titles: Alt+↑ in a sorted grid switches to Custom order and
+    /// moves the title there, the order is stored per title and survives the library rebuild,
+    /// and the cursor follows the title.
+    #[test]
+    fn titles_reorder_in_custom_order() {
+        let (mut t, one) = rig();
+        seed(&mut t, |c| {
+            let s = testkit::source(c, "My IPTV")?;
+            testkit::movies(c, s, 5)
+        });
+        let mut h = harness(t, one, MoviesScreen::default(), egui::vec2(1400.0, 900.0));
+        h.state_mut().enter(Route::Movies { group: None });
+        h.run_steps(2);
+        let shown = |h: &egui_kittest::Harness<'_, testkit::App<MoviesScreen>>| {
+            let app = h.state();
+            let all = &app.t.lib.vod.movies;
+            app.s.browser.shown.iter().map(|i| all[*i as usize].name.to_string()).collect::<Vec<_>>()
+        };
+        let cursor = |h: &egui_kittest::Harness<'_, testkit::App<MoviesScreen>>| shown(h)[h.state().s.browser.grid.cursor].clone();
+        assert_eq!(cursor(&h), "Movie 4", "recently added first");
+        // Alt+↑: custom order (provider order 0..4), Movie 4 moves before Movie 3
+        h.state_mut().act(Action::MoveUp);
+        h.state_mut().apply_config();
+        assert_eq!(h.state().t.config.interface.movie_sort, SortMode::Provider);
+        assert_eq!(shown(&h), ["Movie 0", "Movie 1", "Movie 2", "Movie 4", "Movie 3"], "shown at once");
+        assert_eq!(cursor(&h), "Movie 4");
+        let order = |h: &egui_kittest::Harness<'_, testkit::App<MoviesScreen>>, key: &str| {
+            crate::store::user::item_overrides(&h.state().t.services().store.reader().unwrap(), None)
+                .unwrap()
+                .into_iter()
+                .find(|r| r.item.key.0 == key)
+                .and_then(|r| r.ov.user_order)
+        };
+        until(&mut h, "the stored order", |h| order(h, "m3u:movie0000000004") == Some(3) && order(h, "m3u:movie0000000003") == Some(4));
+        // a new library (the app rebuilds it on Overrides): the order holds, the cursor too
+        testkit::reload_library(&mut h.state_mut().t);
+        h.run_steps(2);
+        assert_eq!(shown(&h), ["Movie 0", "Movie 1", "Movie 2", "Movie 4", "Movie 3"], "after the rebuild");
+        assert_eq!(cursor(&h), "Movie 4");
+        // Alt+↑ again, now in custom order: no toast, one more place
+        h.state_mut().t.toasts.clear();
+        h.state_mut().act(Action::MoveUp);
+        assert_eq!(shown(&h), ["Movie 0", "Movie 1", "Movie 4", "Movie 2", "Movie 3"]);
+        assert!(h.state().t.toasts.is_empty(), "{:?}", h.state().t.toasts);
+        until(&mut h, "the second move", |h| order(h, "m3u:movie0000000004") == Some(2));
+        testkit::reload_library(&mut h.state_mut().t);
+        h.run_steps(2);
+        assert_eq!(shown(&h), ["Movie 0", "Movie 1", "Movie 4", "Movie 2", "Movie 3"]);
+        assert_eq!(cursor(&h), "Movie 4");
+    }
+
     #[test]
     fn grid_navigation_type_to_filter_sort_menu_and_categories() {
         let (mut t, one) = rig();
@@ -1038,6 +1137,7 @@ mod tests {
         h.state_mut().apply_config();
         assert_eq!(h.state().t.config.interface.movie_sort, SortMode::Provider);
         assert!(h.state().t.toasts.iter().any(|t| t.text == "Switched to custom order"));
+        h.run_steps(1);
         // Ctrl+I opens the page of the title under the cursor; Ctrl+H hides it
         h.run_steps(1);
         h.state_mut().act(Action::ShowDetails);

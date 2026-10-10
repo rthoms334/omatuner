@@ -338,19 +338,8 @@ pub(crate) mod kit {
         if m >= 60 { format!("{} h {:02}", m / 60, m % 60) } else { format!("{m} min") }
     }
 
-    /// `ts` in local time with a strftime format (`fallback` for an out-of-range stamp).
-    fn local(ts: crate::model::Timestamp, format: &str, fallback: &str) -> String {
-        match jiff::Timestamp::from_second(ts) {
-            Ok(t) => t.to_zoned(jiff::tz::TimeZone::system()).strftime(format).to_string(),
-            Err(_) => fallback.into(),
-        }
-    }
-
-    /// Local "21:00", or "9:00 PM" with the 12-hour clock (Settings ▸ Interface ▸ Clock).
-    pub(crate) fn hhmm(ts: crate::model::Timestamp, h24: bool) -> String { local(ts, if h24 { "%H:%M" } else { "%-I:%M %p" }, "--:--") }
-
-    /// Local "Thu 21:00" / "Thu 9:00 PM".
-    pub(crate) fn day_time(ts: crate::model::Timestamp, h24: bool) -> String { local(ts, if h24 { "%a %H:%M" } else { "%a %-I:%M %p" }, "--") }
+    /// Local "21:00" / "9:00 PM" and "Thu 21:00" (Settings ▸ Interface ▸ Clock).
+    pub(crate) use crate::ui::widgets::time::{day_time, hhmm, local};
 
     /// Local "YYYY-MM-DD".
     pub(crate) fn date(ts: crate::model::Timestamp) -> String { local(ts, "%Y-%m-%d", "?") }
@@ -707,6 +696,12 @@ impl HomeScreen {
                     ctx.toast(crate::msg::Toast::info(format!("Removed from {list_name}")));
                 }
                 Some((RailKind::Continue, _)) => kit::mark_watched(ctx, &item, &name, false),
+                Some((RailKind::Recent, _)) => {
+                    // History rebuilds the library (`recent_channels`), so the rail follows
+                    let write_item = item.clone();
+                    let _ = ctx.services.store.writer().submit_notify(DataScope::History, move |c| crate::store::user::remove_history(c, &write_item).map(|_| ()));
+                    ctx.toast(crate::msg::Toast::info(format!("Removed {name} from Recently watched")));
+                }
                 _ => kit::not_here(ctx),
             },
             (Action::MoveUp | Action::MoveDown, _) => match rail {
@@ -761,6 +756,7 @@ impl HomeScreen {
                 items.push(mi(glyphs::REORDER, "Move later", Action::MoveDown, "Alt+↓"));
             }
             Some((RailKind::Continue, _)) => items.push(mi(glyphs::CLOSE, "Remove from Continue watching", Action::Remove, "Delete")),
+            Some((RailKind::Recent, _)) => items.push(mi(glyphs::CLOSE, "Remove from Recently watched", Action::Remove, "Delete")),
             _ => {}
         }
         items.push(mi(glyphs::TAG, "Rename…", Action::Rename, "F2"));
@@ -1465,6 +1461,62 @@ mod tests {
     use crate::ui::NavRequest;
 
     fn channel_ref(s: SourceId, i: usize) -> ItemRef { ItemRef { source: s, kind: ItemKind::Channel, key: ItemKey(format!("m3u:seed{i:011}")) } }
+
+    /// Delete on a "Recently watched" tile forgets that channel's history (it used to say
+    /// "Not available here").
+    #[test]
+    fn delete_removes_a_recently_watched_channel() {
+        let (mut t, one) = rig();
+        seed(&mut t, |c| {
+            let s = testkit::source(c, "My IPTV")?;
+            testkit::channels(c, s, 4)?;
+            testkit::movies(c, s, 3)?;
+            for (i, at) in [(1usize, 100), (2, 200)] {
+                crate::store::user::push_history(c, &crate::model::HistoryEntry { item: channel_ref(s, i), title: format!("Channel {i}"), at })?;
+            }
+            Ok(())
+        });
+        let mut h = harness(t, one, HomeScreen::default(), egui::vec2(1400.0, 900.0));
+        h.state_mut().enter(Route::Home);
+        h.run_steps(3);
+        assert!(has_label(&h, "RECENTLY WATCHED"));
+        // the first rail is Recently watched; its first tile the latest channel (2)
+        assert!(h.state_mut().act(Action::Remove));
+        assert!(h.state().t.toasts.iter().all(|t| t.text != "Not available here"), "{:?}", h.state().t.toasts);
+        let history = |h: &egui_kittest::Harness<'_, testkit::App<HomeScreen>>| {
+            crate::store::user::recent_channels(&h.state().t.services().store.reader().unwrap(), 10).unwrap().into_iter().map(|e| e.item.key.0).collect::<Vec<_>>()
+        };
+        until(&mut h, "the history row is gone", |h| history(h) == vec![format!("m3u:seed{:011}", 1)]);
+    }
+
+    /// The status-bar hint line on Home names only keys Home acts on (it used to offer
+    /// "Enter details · Ctrl+S sort"; Home plays channels and has no sort).
+    #[test]
+    fn hint_line_names_only_what_home_does() {
+        let (mut t, one) = rig();
+        seed(&mut t, |c| {
+            let s = testkit::source(c, "My IPTV")?;
+            testkit::channels(c, s, 4)?;
+            testkit::movies(c, s, 3)?;
+            let list = crate::store::user::default_fav_list(c)?;
+            crate::store::user::set_favourite(c, list, &channel_ref(s, 1), true, 1)
+        });
+        let mut h = harness(t, one, HomeScreen::default(), egui::vec2(1400.0, 900.0));
+        h.state_mut().enter(Route::Home);
+        h.run_steps(3);
+        let stack = h.state().s.key_contexts();
+        let line = crate::keymap::hint_line(&stack);
+        assert!(!line.contains("sort") && !line.contains("details"), "{line}");
+        for (action, chord, verb) in crate::keymap::hints(&stack) {
+            if action == Action::ToggleHelp {
+                continue; // the app's global
+            }
+            assert!(h.state_mut().act(action), "Home handles “{} {verb}”", chord.label());
+            let toasts = std::mem::take(&mut h.state_mut().t.toasts);
+            assert!(!toasts.iter().any(|t| t.text == "Not available here"), "“{} {verb}”: {toasts:?}", chord.label());
+            h.state_mut().nav();
+        }
+    }
 
     #[test]
     fn rails_navigate_in_two_dimensions_and_channels_play_fullscreen_with_the_list_zap() {

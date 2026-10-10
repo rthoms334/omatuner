@@ -1,7 +1,6 @@
 //! Overlay layer (modal stack above screens). FROZEN (skeleton): this file, including the
 //! fully wired [`build`] factory. Owners of the overlay files: help/jobs/dialogs = WP-10a,
-//! search/resume = WP-12, programme/tracks/edit_item = WP-11. Until an owner lands, its overlay
-//! uses [`placeholder_action`] / [`placeholder_ui`] (Esc closes) — never `todo!()`.
+//! search/resume = WP-12, programme/tracks/edit_item = WP-11.
 //!
 //! Visuals: scrim = background @ 0.5 (clicking it cancels); card per Omarchy menu/popup
 //! (2 px border; popups use the accent border); opens centred, grows downward only once
@@ -122,37 +121,9 @@ pub fn build(req: OverlayRequest, _ctx: &mut UiCtx<'_>) -> Box<dyn Overlay> {
         OverlayRequest::Pin { then, reason } => Box::new(dialogs::PinOverlay::new(*then, reason)),
         OverlayRequest::Rename(spec) => Box::new(dialogs::RenameOverlay::new(spec)),
         OverlayRequest::ListPicker(spec) => Box::new(dialogs::ListPickerOverlay::new(spec)),
-        OverlayRequest::Programme { programme, channel } => Box::new(programme::ProgrammeOverlay::new(programme, channel)),
+        OverlayRequest::Programme { programme, channel, zap } => Box::new(programme::ProgrammeOverlay::new(programme, channel, zap)),
         OverlayRequest::Resume(spec) => Box::new(resume::ResumeOverlay::new(spec)),
         OverlayRequest::Tracks { audio } => Box::new(tracks::TracksOverlay::new(audio)),
         OverlayRequest::EditItem(item) => Box::new(edit_item::EditItemOverlay::new(item)),
     }
-}
-
-/// Default key handling of a not-yet-implemented overlay: Esc/Enter close, everything else is
-/// `Ignored` (so globals keep working).
-pub fn placeholder_action(action: Action) -> OverlayOutcome {
-    if matches!(action, Action::Back | Action::Activate) { OverlayOutcome::Close } else { OverlayOutcome::Ignored }
-}
-
-/// Default drawing of a not-yet-implemented overlay: scrim + card "Not implemented yet".
-pub fn placeholder_ui(egui_ctx: &egui::Context, ctx: &mut UiCtx<'_>, title: &str, owner: &str) -> OverlayOutcome {
-    let t = &ctx.theme.tokens;
-    let screen = egui_ctx.content_rect();
-    let mut close = false;
-    egui::Area::new(egui::Id::new("placeholder-scrim")).order(egui::Order::Foreground).fixed_pos(screen.min).show(egui_ctx, |ui| {
-        let r = ui.allocate_rect(screen, egui::Sense::click());
-        ui.painter().rect_filled(screen, 0.0, t.scrim);
-        close = r.clicked();
-    });
-    egui::Area::new(egui::Id::new("placeholder-overlay"))
-        .order(egui::Order::Tooltip)
-        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-        .show(egui_ctx, |ui| {
-            egui::Frame::NONE.fill(t.card_bg).stroke(egui::Stroke::new(t.card_border_width, t.popup_border)).inner_margin(18.0).show(ui, |ui| {
-                ui.label(egui::RichText::new(title).color(t.fg));
-                ui.label(egui::RichText::new(format!("Not implemented yet ({owner}) — Esc to close")).color(t.text_secondary));
-            });
-        });
-    if close { OverlayOutcome::Close } else { OverlayOutcome::Keep }
 }

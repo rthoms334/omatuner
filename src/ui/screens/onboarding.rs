@@ -45,7 +45,7 @@ use crate::ui::widgets::card::{CardKind, card_frame};
 use crate::ui::widgets::progress::{busy_bar, progress_bar};
 use crate::ui::widgets::text_field::text_field;
 use crate::ui::widgets::{RowState, glyphs, rows};
-use crate::ui::{NavRequest, OnboardingStart, Route, Screen, ScreenId, UiCtx};
+use crate::ui::{NavRequest, OnboardingStart, Route, Screen, ScreenId, SettingsPage, UiCtx};
 
 /// Card width (pt × rem).
 const CARD_W: f32 = 560.0;
@@ -357,6 +357,11 @@ pub struct OnboardingScreen {
     creds_loader: Option<Loader<Source>>,
     /// The file dialog this card opened (answers to other screens' dialogs are ignored).
     asked: Option<PickPurpose>,
+    /// Done: the guides and how many channels each matches (re-read when the guide changes).
+    guides: Option<super::settings::GuideList>,
+    guides_loader: Option<Loader<super::settings::GuideList>>,
+    /// Done offers "TV guide settings" (no guide, or it covers under half the channels).
+    guide_action: bool,
 }
 
 impl OnboardingScreen {
@@ -369,7 +374,7 @@ impl OnboardingScreen {
             Step::Guide => self.guide_fields().len(),
             Step::Test => self.test_buttons().len(),
             Step::Importing => 2,
-            Step::Done => 3,
+            Step::Done => 3 + usize::from(self.guide_action),
             Step::Restoring => 1,
         }
     }
@@ -636,6 +641,7 @@ impl OnboardingScreen {
             Step::Done => match self.focus {
                 0 => self.open_live(ctx),
                 1 => self.reset_for_another(),
+                3 => ctx.navigate(NavRequest::Switch(Route::Settings(SettingsPage::Epg))),
                 _ => ctx.navigate(NavRequest::Switch(Route::Home)),
             },
             Step::Restoring => {
@@ -803,6 +809,8 @@ impl Screen for OnboardingScreen {
                     Err(e) => Err(e.clone()),
                 });
             }
+            // a guide import finished (or mappings changed): the Done summary re-reads coverage
+            AppEvent::Data(DataScope::Epg | DataScope::Live | DataScope::All) => self.guides = None,
             AppEvent::Platform(PlatformEvent::FilePicked { purpose, path }) if self.asked == Some(*purpose) => match (purpose, path) {
                 (_, None) => self.asked = None,
                 (PickPurpose::OpenPlaylist, Some(path)) if self.step == Step::Details => {
@@ -1218,9 +1226,72 @@ impl OnboardingScreen {
                 parts.push(format!("{series} series"));
             }
             ui.label(RichText::new(format!("{}  {}", glyphs::CHECK, parts.join(" · "))).size(theme.font(TypeToken::Title)).color(t.fg));
-            ui.add_space(theme.space(SpaceToken::Lg));
+            ui.add_space(theme.space(SpaceToken::Md));
         }
-        button_row(ui, theme, &["Open Live TV", "Add another playlist", "Go to Home"], self.focus)
+        self.guide_summary(ui, ctx);
+        ui.add_space(theme.space(SpaceToken::Lg));
+        let mut labels = vec!["Open Live TV", "Add another playlist", "Go to Home"];
+        if self.guide_action {
+            labels.push("TV guide settings");
+        }
+        button_row(ui, theme, &labels, self.focus)
+    }
+
+    /// The guide part of the Done summary: per guide, how many of the playlist channels it
+    /// matches, its channels and programmes — so a guide that imported fine but lists almost
+    /// none of the channels (the iptv-org playlist's own guide: 2 channels) says so, with the
+    /// way forward. Read off the UI thread; re-read when the guide changes.
+    fn guide_summary(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) {
+        let theme = ctx.theme;
+        let t = &theme.tokens;
+        if let Some(r) = kit::poll(&mut self.guides_loader) {
+            match r {
+                Ok(g) => self.guides = Some(g),
+                Err(e) => tracing::debug!("guide summary: {e}"),
+            }
+        }
+        if self.guides.is_none() && self.guides_loader.is_none() {
+            self.guides_loader = Some(Loader::start(ctx, super::settings::load_guides));
+        }
+        let line = |ui: &mut egui::Ui, glyph: &str, text: String, color: egui::Color32| {
+            ui.add(egui::Label::new(RichText::new(format!("{glyph}  {text}")).size(theme.font(TypeToken::Body)).color(color)).wrap());
+        };
+        let total = ctx.lib.live.channels.len();
+        let covered = ctx.lib.live.channels.iter().filter(|c| c.epg_channel_id.is_some()).count();
+        let importing = ctx.services.jobs.active().iter().any(|j| matches!(j.kind, JobKind::RefreshEpg { .. }));
+        let guides: Vec<&crate::model::EpgSource> = self.guides.as_ref().map(|(g, _)| g.iter().filter(|g| g.enabled).collect()).unwrap_or_default();
+        if importing {
+            line(ui, glyphs::BUSY, "TV guide: still loading in the background".into(), t.text_secondary);
+        } else if self.guides.is_some() && guides.is_empty() {
+            line(ui, glyphs::WARNING, "No TV guide — add an XMLTV guide in Settings ▸ EPG".into(), t.warning);
+        }
+        if let Some((_, matches)) = &self.guides {
+            for g in guides.iter().filter(|g| g.last_refresh.is_some()) {
+                let text = super::settings::coverage_text(g, matches.get(&g.id).copied().unwrap_or(0), total);
+                line(ui, glyphs::GUIDE, format!("{}: {}", g.name, text.replacen("Matches", "matches", 1)), t.fg);
+            }
+            for g in guides.iter().filter(|g| g.last_refresh.is_none() && !importing) {
+                let why = g.last_error.as_deref().map(crate::redact::redact).unwrap_or_else(|| "not loaded yet".into());
+                line(ui, glyphs::WARNING, format!("{}: {why}", g.name), t.warning);
+            }
+        }
+        let poor = self.guides.is_some() && !importing && total > 0 && covered * 2 < total;
+        if poor && !guides.is_empty() {
+            line(
+                ui,
+                glyphs::INFO,
+                format!(
+                    "Only {} of {} channels have a guide. Map them with Ctrl+E in Live TV, or add a guide that lists them.",
+                    super::live::count(covered),
+                    super::live::count(total)
+                ),
+                t.text_secondary,
+            );
+        }
+        self.guide_action = poor;
+        if !self.guide_action {
+            self.focus = self.focus.min(2);
+        }
     }
 
     fn restoring_ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) -> Option<usize> {

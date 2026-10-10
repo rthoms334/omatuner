@@ -145,8 +145,9 @@ pub enum OverlayRequest {
     Rename(overlays::RenameSpec),
     /// Pick favourites lists (Ctrl+Shift+F), incl. "New list…".
     ListPicker(overlays::ListPickerSpec),
-    /// Guide programme popover (WP-11).
-    Programme { programme: ProgrammeId, channel: ChannelId },
+    /// Guide programme popover (WP-11). `zap`: the list Watch zaps through (the opener's
+    /// collection, DESIGN §13.0); `None` = the channel's primary group.
+    Programme { programme: ProgrammeId, channel: ChannelId, zap: Option<crate::model::ZapList> },
     /// VOD "Resume from 41:20 / Start over" (WP-12).
     Resume(overlays::ResumeSpec),
     /// Audio / subtitle track menu (WP-11).

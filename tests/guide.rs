@@ -606,6 +606,83 @@ fn guide_enter_opens_the_programme_popover() {
     act(&mut t, &mut g, Action::Activate);
     let o = opened(&t);
     assert!(matches!(o.last(), Some(OverlayRequest::Programme { channel, .. }) if *channel == ids[0]), "{o:?}");
+    // the popover's Watch zaps through the guide's collection: the request carries it
+    match o.last() {
+        Some(OverlayRequest::Programme { zap: Some(z), .. }) => {
+            assert_eq!(z.collection, Collection::AllChannels);
+            assert_eq!(z.channels.as_ref(), ids.as_slice());
+        }
+        other => panic!("no zap list on the popover request: {other:?}"),
+    }
+}
+
+/// A group whose channels are all hidden: "Everything here is hidden" + Show hidden, and Enter
+/// opens Settings ▸ Hidden items (it used to be "This group is empty" with no way forward).
+#[test]
+fn guide_all_hidden_group_offers_show_hidden() {
+    let _one = one();
+    let (mut t, _ids) = seeded(10, 0, None);
+    // channel 0 is the only member of "News"
+    t.services()
+        .store
+        .writer()
+        .blocking(|c| Ok(c.execute("INSERT INTO item_override(source_id, kind, item_key, hidden, fp) VALUES (1, 'channel', ?1, 1, '')", [format!("m3u:seed{:011}", 0)])?))
+        .unwrap();
+    reload(&mut t);
+    let news = t.lib.live.groups.iter().find(|g| g.name == "News").map(|g| g.id).expect("News");
+    let mut g = GuideScreen::default();
+    t.with_ctx(|ctx| g.on_enter(ctx, &Route::Guide { collection: Some(Collection::Group(news)), focus: None }));
+    let mut h = screen_harness(t, g, 1400.0);
+    h.run_steps(2);
+    assert!(has(&h, "Everything here is hidden") && has(&h, "Show hidden"));
+    assert!(hact(&mut h, Action::Activate));
+    assert!(pushed(&h.state().t, &Route::Settings(tuner::ui::SettingsPage::Hidden)));
+}
+
+/// The guide cell of an unlisted channel and the header say why there is no data.
+#[test]
+fn guide_says_a_channel_is_not_in_the_guide() {
+    let _one = one();
+    let (mut t, ids) = seeded(4, 1, None);
+    guide_imported(&mut t);
+    let mut g = GuideScreen::default();
+    t.with_ctx(|ctx| g.on_enter(ctx, &Route::Guide { collection: None, focus: Some(ids[2]) }));
+    let mut h = screen_harness(t, g, 1600.0);
+    h.run_steps(3);
+    assert!(h.query_by_label_contains("Not in your guide · Your guides cover 1 of 4 channels").is_some(), "header");
+    let painted: Vec<String> = h
+        .output()
+        .shapes
+        .iter()
+        .filter_map(|c| match &c.shape {
+            Shape::Text(x) => Some(x.galley.job.text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(painted.iter().any(|x| x == "Not in your guide — Ctrl+E maps it"), "cells: {painted:?}");
+    assert!(hact(&mut h, Action::AssignEpg));
+    assert!(pushed(&h.state().t, &Route::EpgMapping { channel: Some(ids[2]) }));
+}
+
+/// Without a zap list (e.g. opened from search) Watch zaps through the primary group.
+#[test]
+fn programme_popover_watch_uses_the_requested_zap_list() {
+    let _one = one();
+    let (mut t, ids) = seeded(4, 4, None);
+    let now = t.now;
+    let p = programme_at(&t, ids[1], now);
+    let zap = ZapList { collection: Collection::Adhoc(vec![ids[3], ids[1]]), channels: Arc::from(vec![ids[3], ids[1]]) };
+    let mut o = t.with_ctx(|ctx| overlays::build(OverlayRequest::Programme { programme: p, channel: ids[1], zap: Some(zap.clone()) }, ctx));
+    let egui = t.egui.clone();
+    let mut out = egui.run_ui(Default::default(), |_| {
+        t.with_ctx(|ctx| {
+            let _ = o.ui(&egui, ctx);
+        })
+    });
+    out.textures_delta.clear();
+    assert!(matches!(t.with_ctx(|ctx| o.on_action(ctx, Action::Activate)), OverlayOutcome::Close));
+    let s = player_until(&t, "watch", plays(MediaRef::Channel(ids[1])));
+    assert_eq!(s.zap.as_ref().map(|z| z.channels.to_vec()), Some(vec![ids[3], ids[1]]), "the opener's zap list");
 }
 
 // ====================================================================== programme popover
@@ -620,7 +697,7 @@ fn programme_at(t: &TestUi, ch: ChannelId, at: Timestamp) -> tuner::model::Progr
 }
 
 fn popover(t: &mut TestUi, programme: ProgrammeId, channel: ChannelId) -> Box<dyn Overlay> {
-    let mut o = t.with_ctx(|ctx| overlays::build(OverlayRequest::Programme { programme, channel }, ctx));
+    let mut o = t.with_ctx(|ctx| overlays::build(OverlayRequest::Programme { programme, channel, zap: None }, ctx));
     let egui = t.egui.clone();
     let mut out = egui.run_ui(Default::default(), |_| {
         t.with_ctx(|ctx| {
@@ -758,6 +835,138 @@ fn live_enter_rule_plays_here_then_opens_the_player() {
     act(&mut t, &mut s, Action::Down);
     act(&mut t, &mut s, Action::Activate);
     assert!(pushed(&t, &Route::Player));
+}
+
+/// An action on a screen inside its harness.
+fn hact<S: Screen>(h: &mut Harness<'static, ScreenApp<S>>, a: Action) -> bool {
+    let ScreenApp { t, s } = h.state_mut();
+    t.with_ctx(|ctx| s.on_action(ctx, a))
+}
+
+/// Mark the seeded guide as imported (the seeder leaves `max_stop` / `last_refresh` unset).
+fn guide_imported(t: &mut TestUi) {
+    let now = t.now;
+    t.services()
+        .store
+        .writer()
+        .blocking(move |c| Ok(c.execute("UPDATE epg_source SET max_stop = ?1, last_refresh = ?2", rusqlite::params![now + 8 * 3600, now])?))
+        .unwrap();
+}
+
+/// The iptv-org case (a guide that lists a few of the playlist's channels): the preview of an
+/// unlisted channel says the guide doesn't cover it, how much it covers, and Ctrl+E maps it;
+/// without any guide it says so and Ctrl+E opens Settings ▸ EPG to add one.
+#[test]
+fn live_preview_says_why_a_channel_has_no_guide() {
+    let _one = one();
+    let (mut t, ids) = seeded(4, 1, None);
+    guide_imported(&mut t);
+    t.layout = LayoutClass::Wide;
+    let mut s = LiveScreen::default();
+    t.with_ctx(|ctx| s.on_enter(ctx, &Route::Live { group: None, channel: Some(ids[1]) }));
+    let mut h = screen_harness(t, s, 1600.0);
+    h.run_steps(3);
+    assert!(h.query_by_label("Not in your guide").is_some(), "the reason");
+    assert!(h.query_by_label_contains("cover 1 of 4 channels · Ctrl+E maps this one").is_some(), "coverage + the way forward");
+    assert!(hact(&mut h, Action::AssignEpg));
+    assert!(pushed(&h.state().t, &Route::EpgMapping { channel: Some(ids[1]) }));
+    drop(h);
+
+    let (mut t, ids) = seeded(4, 0, None);
+    let mut s = LiveScreen::default();
+    t.with_ctx(|ctx| s.on_enter(ctx, &Route::Live { group: None, channel: Some(ids[1]) }));
+    let mut h = screen_harness(t, s, 1600.0);
+    h.run_steps(3);
+    assert!(h.query_by_label("No TV guide yet").is_some());
+    assert!(h.query_by_label_contains("Ctrl+E adds an XMLTV guide").is_some());
+    assert!(hact(&mut h, Action::AssignEpg));
+    assert!(pushed(&h.state().t, &Route::Settings(tuner::ui::SettingsPage::Epg)), "nothing to map to: add a guide");
+}
+
+/// DESIGN §13.2 mock "[HD]": the preview shows the quality from the provider name before
+/// anything plays (smart names drop the word from the display name).
+#[test]
+fn live_preview_shows_the_quality_badge_before_playback() {
+    let _one = one();
+    let (mut t, ids) = seeded(3, 3, None);
+    t.services().store.writer().blocking(|c| Ok(c.execute("UPDATE channel SET name = 'BBC One HD' WHERE number = 1", [])?)).unwrap();
+    reload(&mut t);
+    let mut s = LiveScreen::default();
+    t.with_ctx(|ctx| s.on_enter(ctx, &Route::Live { group: None, channel: Some(ids[0]) }));
+    let mut h = screen_harness(t, s, 1600.0);
+    h.run_steps(3);
+    assert!(has(&h, "Channel 0 · 1"), "the display name stays clean");
+    assert!(has(&h, "HD"), "quality badge");
+    hact(&mut h, Action::Down);
+    h.run_steps(2);
+    assert!(!has(&h, "HD"), "no quality word, no badge");
+}
+
+/// The Reminders group lists every reminder (not one row per channel); Delete cancels the
+/// one under the cursor. Provider groups move with Alt+↑/↓ (`group_override.user_order`).
+#[test]
+fn live_reminders_rows_and_group_reorder() {
+    let _one = one();
+    let (mut t, ids) = seeded(4, 0, None);
+    let now = t.now;
+    t.services()
+        .store
+        .writer()
+        .blocking(move |c| {
+            let item = |i: usize| ItemRef { source: SourceId(1), kind: ItemKind::Channel, key: ItemKey(format!("m3u:seed{i:011}")) };
+            for (i, title, start) in [(0usize, "Prog A", now + 3600), (0, "Prog B", now + 7200), (1, "Prog C", now + 5400)] {
+                let r = tuner::model::Reminder {
+                    id: tuner::model::ReminderId(0),
+                    channel: item(i),
+                    channel_name: format!("Channel {i}"),
+                    programme_title: title.into(),
+                    start,
+                    stop: start + 1800,
+                    lead_s: 120,
+                    state: tuner::model::ReminderState::Pending,
+                };
+                tuner::store::user::add_reminder(c, &r)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    let mut s = LiveScreen::default();
+    t.with_ctx(|ctx| s.on_enter(ctx, &Route::Live { group: None, channel: None }));
+    let mut h = screen_harness(t, s, 1600.0);
+    h.run_steps(2);
+    // groups: Favourites, History, Reminders, All channels (open), All, News
+    hact(&mut h, Action::FocusNext);
+    hact(&mut h, Action::Up);
+    hact(&mut h, Action::Activate);
+    h.run_steps(2);
+    for label in ["Prog A · Channel 0", "Prog C · Channel 1", "Prog B · Channel 0"] {
+        assert!(has(&h, label), "{label}");
+    }
+    // the second row (by start) is Prog C: Delete cancels exactly it
+    hact(&mut h, Action::Down);
+    hact(&mut h, Action::Remove);
+    let titles = |t: &TestUi| tuner::store::user::all_reminders(&t.db).unwrap().into_iter().map(|r| r.programme_title).collect::<Vec<_>>();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while titles(&h.state().t).len() == 3 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(titles(&h.state().t), ["Prog A", "Prog B"]);
+
+    // provider groups: "All" (first) moves below "News"
+    hact(&mut h, Action::FocusNext);
+    for _ in 0..2 {
+        hact(&mut h, Action::Down);
+    }
+    assert!(hact(&mut h, Action::MoveDown));
+    let order = |t: &TestUi, key: &str| {
+        tuner::store::user::group_overrides(&t.db).unwrap().into_iter().find(|r| r.key.0 == key).and_then(|r| r.ov.user_order)
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while order(&h.state().t, "channel:all").is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!((order(&h.state().t, "channel:news"), order(&h.state().t, "channel:all")), (Some(0), Some(1)));
+    let _ = ids;
 }
 
 #[test]
@@ -1137,6 +1346,35 @@ fn zapping_uses_the_zap_list_and_skips_locked_channels_while_locked() {
     player_until(&t, "skips the locked channel 1", plays(MediaRef::Channel(ids[2])));
 }
 
+/// While the session is locked the UI picks the neighbour itself (`ZapTo`), so it must also
+/// skip what the resolver's zap skips: channels that failed twice in the last day.
+#[test]
+fn locked_session_zaps_also_skip_failing_channels() {
+    let _one = one();
+    let mut cfg = tuner::config::Config::default();
+    let salt = "00".repeat(16);
+    cfg.parental.enabled = true;
+    cfg.parental.pin_hash = Some(tuner::ui::parental::hash_pin("1234", &salt));
+    cfg.parental.pin_salt = Some(salt);
+    let (mut t, ids) = seeded(4, 0, Some(cfg));
+    let now = t.now;
+    t.services()
+        .store
+        .writer()
+        .blocking(move |c| {
+            // channel 1 is locked, channel 2 failed twice recently: ↓ from 0 lands on 3
+            c.execute("INSERT INTO item_override(source_id, kind, item_key, locked, fp) VALUES (1, 'channel', ?1, 1, '')", [format!("m3u:seed{:011}", 1)])?;
+            c.execute("INSERT INTO stream_failure(source_id, item_key, reason, at, count) VALUES (1, ?1, 'http-404', ?2, 2)", rusqlite::params![format!("m3u:seed{:011}", 2), now - 60])?;
+            Ok(())
+        })
+        .unwrap();
+    reload(&mut t);
+    let zap = ZapList { collection: Collection::AllChannels, channels: ids.clone().into() };
+    let mut p = player_with(&mut t, fake_playing(MediaRef::Channel(ids[0]), PlayableKind::Live, Some(zap), PlayOrigin::Fullscreen));
+    act(&mut t, &mut p, Action::ZapNext);
+    player_until(&t, "skips locked channel 1 and failing channel 2", plays(MediaRef::Channel(ids[3])));
+}
+
 #[test]
 fn side_panels_move_without_zapping_and_enter_tunes() {
     let _one = one();
@@ -1373,6 +1611,79 @@ fn mini_player_sits_bottom_right_and_toasts_avoid_it() {
     h.state_mut().snap = Arc::new(PlayerSnapshot::default());
     h.step();
     assert!(h.state().host.mini_rect().is_none());
+}
+
+/// The Loading overlay shows the channel logo through the image cache (the monogram only
+/// when there is none), also in the mini-player, which the app draws without the cache.
+#[test]
+fn state_overlay_shows_the_channel_logo() {
+    let _one = one();
+    let mut t = TestUi::new().unwrap();
+    let url = "http://logos.example/bbc-one.png";
+    let cached = tuner::images::cache_path(&t.services().paths.image_cache(), url);
+    std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
+    std::fs::copy(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/images/logo_600x300.png"), &cached).unwrap();
+    let mut snap = (*fake_playing(MediaRef::Channel(ChannelId(1)), PlayableKind::Live, None, PlayOrigin::Fullscreen)).clone();
+    let mut playable = (**snap.playable.as_ref().unwrap()).clone();
+    playable.title = "BBC One".into();
+    playable.logo = Some(url.into());
+    snap.playable = Some(Arc::new(playable));
+    snap.state = PlayerState::Loading { since: Instant::now(), attempt: 0 };
+    let snap = Arc::new(snap);
+    let theme = Theme::fallback();
+    // (logo images painted, monogram painted) over a few frames of the fullscreen placement
+    let frame = |t: &mut TestUi, host: &mut VideoHost, mini: bool| {
+        let egui = t.egui.clone();
+        let images = &mut t.images;
+        let mut out = egui.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0))), ..Default::default() }, |ui| {
+            images.pump();
+            host.begin_frame();
+            if mini {
+                host.mini_player(ui.ctx(), &theme, &snap);
+            } else {
+                host.paint(ui, Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0)), tuner::ui::video_host::Placement::Fullscreen, &theme, images, &snap);
+            }
+        });
+        let mut flat = Vec::new();
+        fn walk(s: &Shape, out: &mut Vec<Shape>) {
+            match s {
+                Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                s => out.push(s.clone()),
+            }
+        }
+        for c in &out.shapes {
+            walk(&c.shape, &mut flat);
+        }
+        out.textures_delta.clear();
+        let image = flat.iter().any(|s| matches!(s, Shape::Mesh(m) if m.texture_id != egui::TextureId::default()));
+        let monogram = flat.iter().any(|s| matches!(s, Shape::Text(x) if x.galley.job.text == "BO"));
+        (image, monogram)
+    };
+    let mut host = VideoHost::new(None);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = frame(&mut t, &mut host, false);
+    while !seen.0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+        seen = frame(&mut t, &mut host, false);
+    }
+    assert_eq!(seen, (true, false), "(logo, monogram) once the logo loaded");
+    // (an egui area is invisible in its first frame)
+    frame(&mut t, &mut host, true);
+    assert_eq!(frame(&mut t, &mut host, true), (true, false), "the mini-player keeps the logo");
+    // a channel without a logo: the monogram
+    let mut no_logo = (*snap).clone();
+    let mut p = (**no_logo.playable.as_ref().unwrap()).clone();
+    p.logo = None;
+    no_logo.playable = Some(Arc::new(p));
+    let snap2 = Arc::new(no_logo);
+    let egui = t.egui.clone();
+    let images = &mut t.images;
+    let mut out = egui.run_ui(Default::default(), |ui| {
+        host.paint(ui, Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0)), tuner::ui::video_host::Placement::Fullscreen, &theme, images, &snap2);
+    });
+    let texts: Vec<String> = out.shapes.iter().filter_map(|c| match &c.shape { Shape::Text(x) => Some(x.galley.job.text.clone()), _ => None }).collect();
+    out.textures_delta.clear();
+    assert!(texts.iter().any(|x| x == "BO"), "monogram fallback: {texts:?}");
 }
 
 #[test]

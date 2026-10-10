@@ -346,6 +346,11 @@ impl Screen for EpgMappingScreen {
     }
 
     fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
+        // "No guide data": Enter is the "Open EPG settings" button
+        if action == Action::Activate && self.catalog.as_ref().is_some_and(|c| c.entries.is_empty()) && !ctx.lib.live.channels.is_empty() {
+            ctx.push(Route::Settings(crate::ui::SettingsPage::Epg));
+            return true;
+        }
         match action {
             Action::SortMenu => {
                 self.mode_menu(ctx);

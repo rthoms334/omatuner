@@ -102,14 +102,21 @@ pub struct ChannelRowOpts<'a> {
     pub failed: bool,
     /// The playing channel: accent 󰐊 glyph left of the name (§13.0).
     pub playing: bool,
+    /// Times on the 12-hour clock ("9:00 PM"; Settings ▸ Interface ▸ Clock). Default: 24 h.
+    pub twelve_hour: bool,
+    /// Replaces "No guide data" on the detail line, e.g. "Loading guide… 45 %" while the first
+    /// guide import runs (DESIGN §13.12).
+    pub no_guide_label: Option<&'a str>,
 }
 
 /// The detail line of a channel row for a row `width`: "title · 20:00–21:00 · next: X",
 /// dropping the time range, then the next programme, as the row gets narrower. `None` while
 /// now/next isn't known yet (no "No guide data" flicker while the cache loads).
-fn channel_detail(ch: &ChannelSummary, now_next: Option<&NowNext>, width: f32, rem: f32) -> Option<(String, bool)> {
+fn channel_detail(ch: &ChannelSummary, now_next: Option<&NowNext>, width: f32, rem: f32, opts: &ChannelRowOpts<'_>) -> Option<(String, bool)> {
+    let h24 = !opts.twelve_hour;
+    let no_data = || Some((opts.no_guide_label.unwrap_or("No guide data").to_owned(), false));
     if ch.epg_channel_id.is_none() {
-        return Some(("No guide data".into(), false));
+        return no_data();
     }
     let nn = now_next?;
     let next = nn.next.as_ref().map(|n| format!("next: {}", n.title));
@@ -117,7 +124,7 @@ fn channel_detail(ch: &ChannelSummary, now_next: Option<&NowNext>, width: f32, r
         Some(p) => {
             let mut parts = vec![p.title.to_string()];
             if width >= DETAIL_FULL_W * rem {
-                parts.push(format!("{}–{}", paint::hhmm(p.start), paint::hhmm(p.stop)));
+                parts.push(super::time::span(p.start, p.stop, h24));
             }
             if width >= DETAIL_NEXT_W * rem
                 && let Some(n) = next
@@ -127,8 +134,8 @@ fn channel_detail(ch: &ChannelSummary, now_next: Option<&NowNext>, width: f32, r
             parts.join(" · ")
         }
         None => match nn.next.as_ref() {
-            Some(n) => format!("{} {}", paint::hhmm(n.start), n.title),
-            None => return Some(("No guide data".into(), false)),
+            Some(n) => format!("{} {}", super::time::hhmm(n.start, h24), n.title),
+            None => return no_data(),
         },
     };
     Some((line, true))
@@ -169,7 +176,7 @@ pub fn channel_row(
 
     let p = ui.painter().clone();
     let line_font = paint::medium(ui.ctx(), theme, TypeToken::Heading);
-    let detail = if comfortable { channel_detail(ch, now_next, rect.width(), theme.rem()) } else { None };
+    let detail = if comfortable { channel_detail(ch, now_next, rect.width(), theme.rem(), &opts) } else { None };
     let line_y = if detail.is_some() { rect.top() + rect.height() * 0.36 } else { rect.center().y };
 
     // right side, from the edge inwards: progress bar, favourite, lock, source badge
@@ -275,7 +282,7 @@ fn group_count(n: u32) -> String {
 }
 
 /// `20:00  News at Eight` (+ catch-up glyph when available, + live progress).
-pub fn programme_row(ui: &mut egui::Ui, theme: &Theme, p: &ProgrammeSlim, now: Timestamp, catchup: bool, state: RowState) -> egui::Response {
+pub fn programme_row(ui: &mut egui::Ui, theme: &Theme, p: &ProgrammeSlim, now: Timestamp, catchup: bool, h24: bool, state: RowState) -> egui::Response {
     let t = &theme.tokens;
     let (rect, resp) = allocate_row(ui, theme, row_height(theme, Density::Comfortable, false), state, &p.title);
     if !ui.is_rect_visible(rect) {
@@ -291,8 +298,8 @@ pub fn programme_row(ui: &mut egui::Ui, theme: &Theme, p: &ProgrammeSlim, now: T
     let mut left = rect.left() + inset + theme.space(SpaceToken::Sm);
     let mut right = rect.right() - inset;
     let time_font = paint::font(theme, TypeToken::Body);
-    let col = paint::galley(painter, "00:00", time_font.clone(), t.text_secondary, f32::INFINITY).size().x;
-    paint::text(painter, egui::pos2(left, y), Align2::LEFT_CENTER, paint::hhmm(p.start), time_font, if airing { t.fg } else { t.text_secondary }, col);
+    let col = paint::galley(painter, if h24 { "00:00" } else { "00:00 PM" }, time_font.clone(), t.text_secondary, f32::INFINITY).size().x;
+    paint::text(painter, egui::pos2(left, y), Align2::LEFT_CENTER, super::time::hhmm(p.start, h24), time_font, if airing { t.fg } else { t.text_secondary }, col);
     left += col + gap;
     if catchup && p.start <= now {
         let r = paint::text(painter, egui::pos2(right, y), Align2::RIGHT_CENTER, glyphs::CATCHUP, paint::font(theme, TypeToken::Icon), t.text_secondary, f32::INFINITY);
@@ -314,8 +321,9 @@ pub fn programme_row(ui: &mut egui::Ui, theme: &Theme, p: &ProgrammeSlim, now: T
     resp
 }
 
-/// `E05  Title · 42 min` with watched check / progress bar.
-pub fn episode_row(ui: &mut egui::Ui, theme: &Theme, e: &Episode, progress: Option<f32>, watched: bool, state: RowState) -> egui::Response {
+/// `E05  Title · 42 min` with watched check / progress bar; `playing` puts the accent 󰐊
+/// marker left of the title, like channel rows (DESIGN §13.0).
+pub fn episode_row(ui: &mut egui::Ui, theme: &Theme, e: &Episode, progress: Option<f32>, watched: bool, playing: bool, state: RowState) -> egui::Response {
     let t = &theme.tokens;
     let (rect, resp) = allocate_row(ui, theme, row_height(theme, Density::Comfortable, false), state, &e.title);
     if !ui.is_rect_visible(rect) {
@@ -332,6 +340,10 @@ pub fn episode_row(ui: &mut egui::Ui, theme: &Theme, e: &Episode, progress: Opti
     let col = paint::galley(painter, "E000", num_font.clone(), t.text_secondary, f32::INFINITY).size().x;
     paint::text(painter, egui::pos2(left, y), Align2::LEFT_CENTER, format!("E{:02}", e.episode), num_font, t.text_secondary, col);
     left += col + gap;
+    if playing {
+        let r = paint::text(painter, egui::pos2(left, y), Align2::LEFT_CENTER, glyphs::PLAY, paint::font(theme, TypeToken::Icon), t.accent, f32::INFINITY);
+        left = r.right() + theme.space(SpaceToken::Md);
+    }
     if watched {
         let r = paint::text(painter, egui::pos2(right, y), Align2::RIGHT_CENTER, glyphs::CHECK, paint::font(theme, TypeToken::Icon), t.accent, f32::INFINITY);
         right = r.left() - theme.space(SpaceToken::Md);
@@ -397,14 +409,36 @@ mod tests {
 
     #[test]
     fn channel_detail_degrades_with_width() {
+        let o = ChannelRowOpts::default();
         let nn = NowNext { now: Some(prog("News", 0, 3600)), next: Some(prog("Drama", 3600, 7200)) };
-        let wide = channel_detail(&chan(true), Some(&nn), 800.0, 1.0).unwrap().0;
+        let wide = channel_detail(&chan(true), Some(&nn), 800.0, 1.0, &o).unwrap().0;
         assert!(wide.starts_with("News · ") && wide.ends_with(" · next: Drama"), "{wide}");
-        assert_eq!(channel_detail(&chan(true), Some(&nn), 400.0, 1.0).unwrap().0, "News · next: Drama");
-        assert_eq!(channel_detail(&chan(true), Some(&nn), 300.0, 1.0).unwrap().0, "News");
+        assert_eq!(channel_detail(&chan(true), Some(&nn), 400.0, 1.0, &o).unwrap().0, "News · next: Drama");
+        assert_eq!(channel_detail(&chan(true), Some(&nn), 300.0, 1.0, &o).unwrap().0, "News");
         // unknown yet → nothing (no flicker); no mapping or no data → "No guide data"
-        assert!(channel_detail(&chan(true), None, 800.0, 1.0).is_none());
-        assert_eq!(channel_detail(&chan(false), None, 800.0, 1.0), Some(("No guide data".into(), false)));
-        assert_eq!(channel_detail(&chan(true), Some(&NowNext::default()), 800.0, 1.0), Some(("No guide data".into(), false)));
+        assert!(channel_detail(&chan(true), None, 800.0, 1.0, &o).is_none());
+        assert_eq!(channel_detail(&chan(false), None, 800.0, 1.0, &o), Some(("No guide data".into(), false)));
+        assert_eq!(channel_detail(&chan(true), Some(&NowNext::default()), 800.0, 1.0, &o), Some(("No guide data".into(), false)));
+    }
+
+    /// The first guide import shows its progress instead of "No guide data" (DESIGN §13.12).
+    #[test]
+    fn channel_detail_says_the_guide_is_loading() {
+        let o = ChannelRowOpts { no_guide_label: Some("Loading guide… 45 %"), ..Default::default() };
+        assert_eq!(channel_detail(&chan(false), None, 800.0, 1.0, &o), Some(("Loading guide… 45 %".into(), false)));
+        assert_eq!(channel_detail(&chan(true), Some(&NowNext::default()), 800.0, 1.0, &o), Some(("Loading guide… 45 %".into(), false)));
+    }
+
+    /// Settings ▸ Interface ▸ Clock applies to row times too.
+    #[test]
+    fn channel_detail_follows_the_clock_setting() {
+        let nn = NowNext { now: Some(prog("News", 0, 3600)), next: None };
+        let twelve = channel_detail(&chan(true), Some(&nn), 800.0, 1.0, &ChannelRowOpts { twelve_hour: true, ..Default::default() }).unwrap().0;
+        assert!(twelve.contains("M–") && (twelve.ends_with("AM") || twelve.ends_with("PM")), "{twelve}");
+        let h24 = channel_detail(&chan(true), Some(&nn), 800.0, 1.0, &ChannelRowOpts::default()).unwrap().0;
+        assert!(!h24.contains('M'), "{h24}");
+        let soon = NowNext { now: None, next: Some(prog("Drama", 3600, 7200)) };
+        let line = channel_detail(&chan(true), Some(&soon), 800.0, 1.0, &ChannelRowOpts { twelve_hour: true, ..Default::default() }).unwrap().0;
+        assert!(line.ends_with("M Drama"), "{line}");
     }
 }
