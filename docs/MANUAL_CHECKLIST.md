@@ -58,7 +58,7 @@ in `~/.config/omarchy/shell.toml`; Tuner applies it live).
 - [ ] **makepkg:**
   - **Do:** in a temporary copy of the checkout, run `cd packaging && makepkg -f` (no install).
   - **Expect:**
-    - `prepare`, `build`, `check` (library tests) and `package` all succeed.
+    - `prepare`, `build`, `check` (runs `tuner --version`) and `package` all succeed.
     - The package contains `/usr/bin/tuner`, `/usr/share/applications/tuner.desktop`,
       `/usr/share/icons/hicolor/scalable/apps/tuner.svg`,
       `/usr/share/tuner/{hypr/tuner.lua,omarchy/omarchy-menu.jsonc}` and

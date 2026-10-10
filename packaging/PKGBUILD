@@ -27,6 +27,15 @@ options=('!lto' '!debug' '!strip')
 source=()
 _srcdir="$(realpath "$startdir/..")"
 
+# aws-lc-sys (rustls' crypto) compiles jitterentropy with -O0 and refuses any optimisation, but
+# cc-rs appends makepkg's CFLAGS (-O2) after it. Drop the -O flags: cc-rs passes the crate
+# profile's own -O level to every C dependency anyway.
+_cflags() {
+  local _f _kept=()
+  for _f in $CFLAGS; do [[ $_f == -O* ]] || _kept+=("$_f"); done
+  export CFLAGS="${_kept[*]}"
+}
+
 prepare() {
   cd "$_srcdir"
   if [[ ! -f Cargo.toml ]]; then
@@ -45,15 +54,16 @@ prepare() {
 
 build() {
   cd "$_srcdir"
+  _cflags
   export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR="$srcdir/target"
   cargo build --frozen --release
 }
 
 check() {
-  cd "$_srcdir"
-  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR="$srcdir/target"
-  # Library unit tests: no network, ffmpeg or Wayland session needed.
-  cargo test --frozen --release --lib
+  # A smoke test of the built binary (it loads libmpv and parses the command line). The test
+  # suite is the developer gate (`cargo test`, see README "Development"): built here it would be
+  # a second thin-LTO release binary, which took over an hour on a 16 GB machine.
+  "$srcdir/target/release/tuner" --version
 }
 
 package() {

@@ -82,10 +82,10 @@ on-screen controls, and a light theme (catppuccin-latte).
 
 ```sh
 cd packaging
-makepkg -si          # builds this checkout, runs the library tests, installs the package
+makepkg -si          # builds this checkout, smoke-tests the binary, installs the package
 ```
 
-- `makepkg --nocheck -si` skips the tests.
+- `makepkg --nocheck -si` skips the smoke test. The test suite is `cargo test` (see Development).
 - The package installs:
   - `/usr/bin/tuner`
   - the desktop entry and icon
