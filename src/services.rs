@@ -384,6 +384,14 @@ impl MediaResolver for DbResolver {
             .and_then(|r| r.ok())
             .unwrap_or(false)
     }
+
+    fn is_locked(&mut self, ch: ChannelId) -> bool {
+        let Ok(conn) = self.conn() else { return true };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::store::live::channel(conn, ch)))
+            .ok()
+            .and_then(|r| r.ok())
+            .is_none_or(|c| c.locked)
+    }
 }
 
 #[cfg(test)]

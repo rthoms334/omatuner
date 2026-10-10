@@ -247,13 +247,13 @@ impl RootInterface for Imp {
 impl PlayerInterface for Imp {
     async fn next(&self) -> fdo::Result<()> {
         if can_zap(&self.snap()) {
-            self.cmds.send(PlayerCommand::Zap { forward: true });
+            self.cmds.send(PlayerCommand::Zap { forward: true, unlocked: false });
         }
         Ok(())
     }
     async fn previous(&self) -> fdo::Result<()> {
         if can_zap(&self.snap()) {
-            self.cmds.send(PlayerCommand::Zap { forward: false });
+            self.cmds.send(PlayerCommand::Zap { forward: false, unlocked: false });
         }
         Ok(())
     }
@@ -649,7 +649,12 @@ mod tests {
         });
         assert_eq!(
             *rec.0.lock().unwrap(),
-            vec![PlayerCommand::TogglePause, PlayerCommand::Zap { forward: true }, PlayerCommand::Zap { forward: false }, PlayerCommand::Stop]
+            vec![
+                PlayerCommand::TogglePause,
+                PlayerCommand::Zap { forward: true, unlocked: false },
+                PlayerCommand::Zap { forward: false, unlocked: false },
+                PlayerCommand::Stop
+            ]
         );
         assert!(matches!(events.try_recv(), Ok(AppEvent::Platform(PlatformEvent::Raise))));
 

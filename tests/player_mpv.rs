@@ -61,6 +61,9 @@ impl MediaResolver for TableResolver {
     fn skip_on_zap(&mut self, _ch: ChannelId) -> bool {
         false
     }
+    fn is_locked(&mut self, _ch: ChannelId) -> bool {
+        false
+    }
 }
 
 fn item(key: &str, kind: ItemKind) -> ItemRef {
@@ -527,7 +530,7 @@ fn fast_zaps_coalesce_into_one_connection() {
     h.wait_state(LONG, is_playing);
     let mark = h.mark();
     for _ in 0..2 {
-        h.handle.send(PlayerCommand::Zap { forward: true });
+        h.handle.send(PlayerCommand::Zap { forward: true, unlocked: true });
     }
     let s = h.wait_snapshot(LONG, |s| s.playable.as_ref().is_some_and(|p| p.media == chans[2].media));
     assert!(matches!(s.state, PlayerState::Zapping { .. }), "zaps wait out the delay: {:?}", s.state);
@@ -538,7 +541,7 @@ fn fast_zaps_coalesce_into_one_connection() {
     // Backspace recalls the channel that really played before, not the one zapped over
     assert_eq!(h.snapshot().previous_live.as_ref().map(|p| p.media.clone()), Some(chans[0].media.clone()));
     let mark = h.mark();
-    h.handle.send(PlayerCommand::LastChannel);
+    h.handle.send(PlayerCommand::LastChannel { unlocked: true });
     h.wait_snapshot(LONG, |s| s.playable.as_ref().is_some_and(|p| p.media == chans[0].media));
     h.wait_state_from(mark, LONG, is_playing);
     assert_eq!(h.snapshot().previous_live.as_ref().map(|p| p.media.clone()), Some(chans[2].media.clone()));

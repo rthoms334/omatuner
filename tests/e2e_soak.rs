@@ -141,7 +141,7 @@ fn memory_stays_flat_over_2000_zaps_and_guide_scrolls() {
     let (mut baseline, mut samples, mut failed, mut scrolls) = (None, Vec::new(), 0usize, 0usize);
     for z in 1..=zaps {
         let generation = player.snapshot().load_generation;
-        player.send(PlayerCommand::Zap { forward: true });
+        player.send(PlayerCommand::Zap { forward: true, unlocked: true });
         // frames run meanwhile: one guide row down per frame (back up at the end of the list)
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {

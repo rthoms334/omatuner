@@ -4,7 +4,9 @@
 //! (or `{"ok":false,"error":"…"}` for a malformed request).
 //! Startup: `try_handoff` connects; if a server answers, the request is delivered and the new
 //! process exits 0. Otherwise (no socket / ECONNREFUSED → stale file removed) this process
-//! becomes the server. Requests arrive in the UI as `AppEvent::Ipc` and also trigger
+//! becomes the server — once it holds the instance lock (`run/tuner.lock`, taken by `main`
+//! before the store opens): the socket is only bound once the window is up, so a second quick
+//! launch finds the lock held and keeps retrying the handoff instead of opening the database. Requests arrive in the UI as `AppEvent::Ipc` and also trigger
 //! `hypr::focus_self` right away — the UI may not be running `logic` while the window sits on
 //! another workspace, so raising cannot wait for it.
 //!

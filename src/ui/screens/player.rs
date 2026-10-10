@@ -263,7 +263,7 @@ impl PlayerScreen {
             return;
         }
         if ctx.parental.is_unlocked(&ctx.config.parental) {
-            ctx.play(PlayerCommand::Zap { forward });
+            ctx.play(PlayerCommand::Zap { forward, unlocked: true });
             return;
         }
         let failing = super::live::failing_set(ctx).unwrap_or_default();
@@ -1282,7 +1282,7 @@ impl Screen for PlayerScreen {
             Action::ZapPrev | Action::ZapNext if live => self.zap(ctx, action == Action::ZapNext),
             Action::LastChannel if live => {
                 if ctx.player.previous_live.is_some() {
-                    ctx.play(PlayerCommand::LastChannel);
+                    ctx.play(PlayerCommand::LastChannel { unlocked: ctx.parental.is_unlocked(&ctx.config.parental) });
                 }
             }
             Action::ChannelHistory if live => self.open_panel(ctx, PanelKind::History),

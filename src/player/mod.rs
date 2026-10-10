@@ -86,11 +86,18 @@ pub enum PlayerCommand {
     /// the current `PlayOrigin`.
     Zap {
         forward: bool,
+        /// The sender's parental session is unlocked (`ParentalSession::is_unlocked`). When
+        /// false and a PIN is set, PIN-locked channels are skipped too (MPRIS always sends
+        /// false: it can't ask for the PIN).
+        unlocked: bool,
     },
     /// Tune a channel by id keeping the current ZapList and origin (numeric entry, history).
     ZapTo(ChannelId),
-    /// Recall the previously watched live channel (Backspace / UHF ←).
-    LastChannel,
+    /// Recall the previously watched live channel (Backspace / UHF ←). Ignored when that
+    /// channel is PIN-locked, a PIN is set and `unlocked` is false (the session re-locked since).
+    LastChannel {
+        unlocked: bool,
+    },
     /// From catch-up back to the live stream of the same channel.
     JumpToLive,
     SetVolume(f64),
@@ -298,6 +305,9 @@ pub trait MediaResolver: Send {
     /// Should zapping skip this channel? (≥ 2 failures in 24 h from `stream_failure`, DRM, or
     /// a resolve failure earlier in this session.)
     fn skip_on_zap(&mut self, ch: ChannelId) -> bool;
+    /// Is this channel PIN-locked (its own lock or any of its groups')? A channel whose lock
+    /// can't be read counts as locked.
+    fn is_locked(&mut self, ch: ChannelId) -> bool;
 }
 
 /// Persistence the controller needs. `Services` adapts it to the store `Writer`
@@ -448,7 +458,8 @@ mod tests {
     use crate::model::{ChannelId, PlayableKind};
     use crate::redact::Secret;
 
-    struct Lavfi;
+    /// Plays lavfi's test source for any media; the listed channels are PIN-locked.
+    struct Lavfi(Vec<ChannelId>);
 
     impl MediaResolver for Lavfi {
         fn resolve(&mut self, media: &MediaRef, _resume: bool) -> std::result::Result<Playable, PlayerError> {
@@ -470,6 +481,9 @@ mod tests {
         fn skip_on_zap(&mut self, _ch: ChannelId) -> bool {
             false
         }
+        fn is_locked(&mut self, ch: ChannelId) -> bool {
+            self.0.contains(&ch)
+        }
     }
 
     fn headless_config() -> Config {
@@ -480,8 +494,12 @@ mod tests {
     }
 
     fn start() -> Player {
-        let deps = PlayerDeps { bus: EventBus::new(None).0, store: Box::new(NullPlayerStore), resolver: Box::new(Lavfi) };
-        Player::start(&headless_config(), deps).expect("headless mpv")
+        start_with(&headless_config(), Lavfi(Vec::new()))
+    }
+
+    fn start_with(cfg: &Config, resolver: Lavfi) -> Player {
+        let deps = PlayerDeps { bus: EventBus::new(None).0, store: Box::new(NullPlayerStore), resolver: Box::new(resolver) };
+        Player::start(cfg, deps).expect("headless mpv")
     }
 
     fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
@@ -551,6 +569,41 @@ mod tests {
         h.send(PlayerCommand::ResumeVideo);
         assert!(wait_until(Duration::from_secs(5), || !h.snapshot().video_suspended));
         assert_ne!(mpv.get_property::<String>("vid").unwrap(), "no");
+    }
+
+    /// Audit fix: MPRIS Next/Previous (which can't ask for the PIN) and a Backspace recall after
+    /// the session re-locked must never tune a PIN-locked channel; an unlocked UI still can.
+    #[test]
+    fn zap_and_recall_skip_locked_channels_while_locked() {
+        let mut cfg = headless_config();
+        cfg.parental = crate::config::ParentalConfig { enabled: true, pin_hash: Some("h".into()), pin_salt: Some("s".into()), relock_min: 0 };
+        let p = start_with(&cfg, Lavfi(vec![ChannelId(2)]));
+        let h = p.handle();
+        let playing = |id: i64| {
+            wait_until(Duration::from_secs(20), || {
+                let s = h.snapshot();
+                s.state == PlayerState::Playing && s.playable.as_ref().is_some_and(|p| p.media == MediaRef::Channel(ChannelId(id)))
+            })
+        };
+        let zap = ZapList { collection: crate::model::Collection::AllChannels, channels: vec![ChannelId(1), ChannelId(2), ChannelId(3)].into() };
+        let media = MediaRef::Channel(ChannelId(1));
+        h.send(PlayerCommand::Play(PlayRequest { media, zap: Some(zap), origin: PlayOrigin::Fullscreen, resume: false, immediate: true }));
+        assert!(playing(1));
+
+        h.send(PlayerCommand::Zap { forward: true, unlocked: false });
+        assert!(playing(3), "locked channel 2 skipped: {:?}", h.snapshot().playable);
+        h.send(PlayerCommand::Zap { forward: false, unlocked: true });
+        assert!(playing(2), "an unlocked session zaps onto it");
+        h.send(PlayerCommand::Zap { forward: true, unlocked: false });
+        assert!(playing(3));
+
+        // the recall target is the locked channel: refused while locked
+        assert_eq!(h.snapshot().previous_live.as_ref().map(|p| p.media.clone()), Some(MediaRef::Channel(ChannelId(2))));
+        h.send(PlayerCommand::LastChannel { unlocked: false });
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(h.snapshot().playable.as_ref().map(|p| p.media.clone()), Some(MediaRef::Channel(ChannelId(3))));
+        h.send(PlayerCommand::LastChannel { unlocked: true });
+        assert!(playing(2));
     }
 
     #[test]

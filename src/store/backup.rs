@@ -103,6 +103,10 @@ pub struct RestoreReport {
     pub user_rows: u32,
     /// Sources restored without credentials (user must re-enter them).
     pub needs_credentials: Vec<String>,
+    /// The backup's settings for this machine (`Config::restored`; set by the restore job when
+    /// the backup has a readable `config.toml`). The job doesn't apply them: the app does, as a
+    /// Settings change (saves `config.toml`, applies live), when the user restores settings.
+    pub settings: Option<Box<crate::config::Config>>,
 }
 
 /// Credential-free form of a URL (userinfo, credential query values and Xtream path
@@ -271,10 +275,14 @@ pub fn restore(conn: &mut Connection, b: &Backup, mode: RestoreMode) -> Result<R
             .then(|| {
                 existing.iter().find(|e| {
                     let url = e.url.as_ref().map(|u| u.expose().as_str());
-                    e.kind == s.kind
-                        && e.name == s.name
-                        && (url == s.url.as_deref() || url.map(strip_credentials).as_deref() == s.url.as_deref())
-                        && e.xtream.as_ref().map(|x| x.server.as_str()) == s.xt_server.as_deref()
+                    let same_url = url == s.url.as_deref() || url.map(strip_credentials).as_deref() == s.url.as_deref();
+                    let server = e.xtream.as_ref().map(|x| x.server.as_str()) == s.xt_server.as_deref();
+                    // a playlist upgraded to its Xtream login (or switched back) since the backup
+                    // is still the same source: same name and playlist URL / file (§27.3)
+                    let origin = (e.kind == SourceKind::Xtream) != (s.kind == SourceKind::Xtream)
+                        && same_url
+                        && e.path.as_ref().map(|p| p.to_string_lossy()).as_deref() == s.path.as_deref();
+                    e.name == s.name && ((e.kind == s.kind && same_url && server) || origin)
                 })
             })
             .flatten();

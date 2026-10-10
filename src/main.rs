@@ -11,7 +11,7 @@
 //! windowed instance runs it does nothing — that instance owns the database writer and its
 //! scheduler refreshes on its own.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -32,6 +32,8 @@ use tuner::sources::http::HttpClient;
 use tuner::store::Store;
 use tuner::theme::Theme;
 
+/// How long a launch waits for a starting instance to serve its socket before giving up.
+const HANDOFF_WAIT: Duration = Duration::from_secs(10);
 /// Upper bound for a headless refresh (a stuck download must not keep a timer unit alive).
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// Quiet period with no running jobs before a headless refresh counts as done (follow-up jobs
@@ -52,12 +54,12 @@ fn main() -> anyhow::Result<()> {
     if cli.debug {
         tuner::logging::pin_debug();
     }
-    if let Some(e) = config_err {
-        tracing::error!("{e}; using defaults (your file was not modified)");
-    }
 
     if cli.refresh {
-        if instance_running(&paths.ipc_socket()) {
+        if let Some(e) = config_err {
+            tracing::error!("{e}; using defaults (your file was not modified)");
+        }
+        if instance_running(&paths) {
             tracing::info!("Tuner is running; it refreshes stale sources itself");
             return Ok(());
         }
@@ -70,11 +72,18 @@ fn main() -> anyhow::Result<()> {
     // working directory.
     let request =
         IpcRequest { view: cli.view, play: cli.play.as_deref().map(absolute_input), inputs: cli.inputs.iter().map(|i| absolute_input(i)).collect() };
-    if tuner::ipc::try_handoff(&paths.ipc_socket(), &request)? {
+    // held until the process exits: the database has one owner
+    let Some(_instance) = become_primary(&paths, &request, HANDOFF_WAIT)? else {
         return Ok(());
-    }
+    };
 
     let (bus, events) = EventBus::new(None);
+    // only the primary instance: the first Settings change saves over config.toml
+    if let Some(e) = config_err {
+        let bad = Config::set_aside(&paths.config_file(), e);
+        tracing::error!("{}", bad.log_line());
+        bus.toast(tuner::msg::Toast::error(bad.toast_text()));
+    }
     let ui_scale = config.interface.ui_scale;
     let follow_theme = config.integration.follow_omarchy_theme;
     let font_cfg = config.fonts.clone();
@@ -135,10 +144,56 @@ fn absolute_input(input: &str) -> String {
     }
 }
 
-/// Something listens on the instance socket (a stale file refuses the connection). Only
-/// connects — sending a request would raise that instance's window.
-fn instance_running(socket: &Path) -> bool {
-    std::os::unix::net::UnixStream::connect(socket).is_ok()
+/// Something listens on the instance socket (a stale file refuses the connection), or an
+/// instance is starting (it holds the instance lock). Only connects — sending a request would
+/// raise that instance's window.
+fn instance_running(paths: &AppPaths) -> bool {
+    std::os::unix::net::UnixStream::connect(paths.ipc_socket()).is_ok() || matches!(instance_lock(paths), Ok(None))
+}
+
+/// Hand `request` to the running instance, or become it: `Some(lock)` = this process is the
+/// primary instance and must hold the lock until it exits; `None` = delivered (exit).
+///
+/// Single instance: the IPC server only binds once the window is up, so two quick launches
+/// would both miss the socket and open the same database. The lock is taken before anything
+/// opens the store; a launch that finds it held keeps retrying the handoff while the other
+/// instance starts, and gives up after `wait` (that instance never served its socket).
+fn become_primary(paths: &AppPaths, request: &IpcRequest, wait: Duration) -> anyhow::Result<Option<InstanceLock>> {
+    let deadline = Instant::now() + wait;
+    loop {
+        if tuner::ipc::try_handoff(&paths.ipc_socket(), request)? {
+            return Ok(None);
+        }
+        match instance_lock(paths) {
+            Ok(Some(lock)) => return Ok(Some(InstanceLock { _file: Some(lock) })),
+            Ok(None) => {}
+            Err(e) => {
+                // e.g. a filesystem without locks: run as before, unguarded
+                tracing::warn!("single-instance lock {}: {e}", paths.runtime_dir.display());
+                return Ok(Some(InstanceLock { _file: None }));
+            }
+        }
+        anyhow::ensure!(Instant::now() < deadline, "{} is already running but doesn't answer (try again in a moment)", tuner::APP_NAME);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Held by the primary instance until it exits (`None` inside: locking failed, unguarded).
+struct InstanceLock {
+    _file: Option<std::fs::File>,
+}
+
+/// Take the exclusive instance lock (`<runtime dir>/tuner.lock`, released when the returned file
+/// closes, i.e. at the latest when the process exits). `Ok(None)` = another process holds it.
+fn instance_lock(paths: &AppPaths) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&paths.runtime_dir)?;
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(paths.runtime_dir.join("tuner.lock"))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
 }
 
 /// `--refresh`: store + HTTP + job manager only (no player, no window); submits
@@ -205,6 +260,7 @@ fn wait_for_jobs(jobs: &JobManager, events: &Receiver<AppEvent>, root: JobId, ti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn inputs_become_absolute_only_for_existing_files() {
@@ -247,13 +303,50 @@ mod tests {
     #[test]
     fn no_instance_on_a_missing_or_stale_socket() {
         let dir = tempfile::tempdir().unwrap();
-        let sock = dir.path().join("tuner.sock");
-        assert!(!instance_running(&sock));
+        let paths = AppPaths::rooted(dir.path());
+        std::fs::create_dir_all(&paths.runtime_dir).unwrap();
+        let sock = paths.ipc_socket();
+        assert!(!instance_running(&paths));
         // a bound-then-closed socket file refuses connections
         drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
-        assert!(!instance_running(&sock));
-        let _live = std::os::unix::net::UnixListener::bind(dir.path().join("live.sock")).unwrap();
-        assert!(instance_running(&dir.path().join("live.sock")));
+        assert!(!instance_running(&paths));
+        std::fs::remove_file(&sock).unwrap();
+        let live = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        assert!(instance_running(&paths));
+        // an instance still starting holds the lock but serves no socket yet
+        drop(live);
+        let _starting = instance_lock(&paths).unwrap().expect("lock");
+        assert!(instance_running(&paths));
+    }
+
+    /// Audit fix: two quick launches both missed the socket (bound only once the window is up)
+    /// and opened the same database. The second one now waits for the first to serve its socket
+    /// and hands off, or gives up — it never becomes a second primary.
+    #[test]
+    fn a_second_launch_hands_off_to_a_starting_instance_or_exits() {
+        use std::io::{BufRead, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::rooted(dir.path());
+        let req = IpcRequest::default();
+        let first = become_primary(&paths, &req, Duration::ZERO).unwrap();
+        assert!(first.is_some(), "nobody running: primary");
+        assert!(become_primary(&paths, &req, Duration::from_millis(300)).is_err(), "never two primaries");
+
+        // the first instance binds its socket a moment later: the waiting launch hands off
+        let sock = paths.ipc_socket();
+        let server = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            std::io::BufReader::new(&stream).read_line(&mut String::new()).unwrap();
+            (&stream).write_all(b"{\"ok\":true}\n").unwrap();
+        });
+        assert!(become_primary(&paths, &req, Duration::from_secs(10)).unwrap().is_none(), "handed off");
+        server.join().unwrap();
+
+        // the first instance is gone (lock released, stale socket): the next launch is primary
+        drop(first);
+        assert!(become_primary(&paths, &req, Duration::ZERO).unwrap().is_some());
     }
 
     /// The headless refresh terminates and reports the outcome of `RefreshStale` (with the

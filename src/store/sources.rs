@@ -258,17 +258,56 @@ pub fn set_account(conn: &Connection, id: SourceId, account: &AccountInfo) -> Re
     Ok(())
 }
 
-/// Sources whose `last_refresh` is older than their `refresh_h` (or `default_h`), enabled only.
+/// Shortest wait before the scheduler retries a failed refresh (just under its 15-min tick).
+const RETRY_MIN_S: i64 = 10 * 60;
+/// Longest wait between scheduled retries of a failing refresh, whatever its interval.
+const RETRY_MAX_S: i64 = 86_400;
+
+/// Back-off of a refresh whose last attempt failed: the scheduler waits as long after the last
+/// attempt as the refresh has been failing, so the gaps double — at least [`RETRY_MIN_S`], at
+/// most its interval (and [`RETRY_MAX_S`]). `due_since` = when it became due; `None` (unknown)
+/// waits the longest. The start of the failing streak isn't stored: a refresh that was long
+/// overdue when it started failing (app closed meanwhile) backs off the most. A manual Refresh
+/// (`force`) never goes through here.
+fn retry_due(now: Timestamp, last_attempt: Timestamp, due_since: Option<Timestamp>, interval_s: i64) -> bool {
+    let cap = interval_s.clamp(RETRY_MIN_S, RETRY_MAX_S);
+    let wait = due_since.map_or(cap, |d| (last_attempt - d).clamp(RETRY_MIN_S, cap));
+    now - last_attempt >= wait
+}
+
+/// Sources whose `last_refresh` is older than their `refresh_h` (or `default_h`), enabled only;
+/// one whose last refresh failed only once its back-off is over ([`retry_due`]).
 pub fn stale_sources(conn: &Connection, now: Timestamp, default_h: u32) -> Result<Vec<SourceId>> {
-    let mut stmt = conn.prepare_cached("SELECT id, settings, last_refresh FROM source WHERE enabled = 1 ORDER BY sort_index, id")?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, SourceId>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<Timestamp>>(2)?)))?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, settings, created_at, last_refresh, last_attempt, last_error IS NOT NULL FROM source
+         WHERE enabled = 1 ORDER BY sort_index, id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, SourceId>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, Timestamp>(2)?,
+            r.get::<_, Option<Timestamp>>(3)?,
+            r.get::<_, Option<Timestamp>>(4)?,
+            r.get::<_, bool>(5)?,
+        ))
+    })?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, settings, last) = row?;
+        let (id, settings, created, last, attempt, failed) = row?;
         let h = from_json_opt::<SourceSettings>(settings).and_then(|s| s.refresh_h).unwrap_or(default_h);
-        if last.is_none_or(|t| t <= now - i64::from(h) * 3600) {
-            out.push(id);
+        let interval = i64::from(h) * 3600;
+        if last.is_some_and(|t| now < t.saturating_add(interval)) {
+            continue;
         }
+        // never imported: due since it was added
+        let due_since = last.map_or(created, |t| t.saturating_add(interval));
+        if let Some(at) = attempt.filter(|_| failed)
+            && !retry_due(now, at, Some(due_since), interval)
+        {
+            continue;
+        }
+        out.push(id);
     }
     Ok(out)
 }
@@ -462,22 +501,49 @@ pub fn mark_epg_failed(conn: &Connection, id: EpgSourceId, error: &str, now: Tim
     Ok(())
 }
 
-/// Enabled EPG sources due for refresh, or whose `max_stop` is < now + 12 h (guide running out).
+/// Enabled EPG sources due for refresh, or whose `max_stop` is < now + 12 h (guide running out);
+/// one whose last refresh failed only once its back-off is over ([`retry_due`]).
 ///
 /// The "running out" rule only applies once the last successful refresh is at least an hour
 /// old: a provider whose guide always covers less than 12 h must not be re-downloaded on every
 /// 15-minute scheduler tick.
 pub fn stale_epg_sources(conn: &Connection, now: Timestamp, default_h: u32) -> Result<Vec<EpgSourceId>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT id FROM epg_source
+        "SELECT id, COALESCE(refresh_h, ?2), last_refresh, max_stop, last_attempt, last_error IS NOT NULL FROM epg_source
          WHERE enabled = 1
            AND (last_refresh IS NULL
                 OR last_refresh <= ?1 - COALESCE(refresh_h, ?2) * 3600
                 OR (max_stop IS NOT NULL AND max_stop < ?1 + 43200 AND last_refresh <= ?1 - 3600))
          ORDER BY priority, id",
     )?;
-    let rows = stmt.query_map(params![now, default_h], |r| r.get(0))?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+    let rows = stmt.query_map(params![now, default_h], |r| {
+        Ok((
+            r.get::<_, EpgSourceId>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, Option<Timestamp>>(2)?,
+            r.get::<_, Option<Timestamp>>(3)?,
+            r.get::<_, Option<Timestamp>>(4)?,
+            r.get::<_, bool>(5)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, h, last, max_stop, attempt, failed) = row?;
+        let interval = h.saturating_mul(3600);
+        if let Some(at) = attempt.filter(|_| failed) {
+            // when it became due (the WHERE above, solved for `now`): by age or by running out;
+            // never imported → unknown
+            let due_since = last.map(|t| {
+                let by_age = t.saturating_add(interval);
+                max_stop.map_or(by_age, |m| by_age.min((t + 3600).max(m - 43_200 + 1)))
+            });
+            if !retry_due(now, at, due_since, interval) {
+                continue;
+            }
+        }
+        out.push(id);
+    }
+    Ok(out)
 }
 
 /// Stored provider connection limits (`AccountInfo.max_connections`) per source, for the

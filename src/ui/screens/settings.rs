@@ -1857,6 +1857,11 @@ impl Screen for SettingsScreen {
                         if !r.needs_credentials.is_empty() {
                             s.push_str(&format!(" · needs credentials: {}", r.needs_credentials.join(", ")));
                         }
+                        // "Restore settings" (default on): applied like any Settings change
+                        if let Some(cfg) = r.settings.clone() {
+                            ctx.edit_config(move |c| *c = *cfg);
+                            s.push_str(" · settings restored");
+                        }
                         (true, s)
                     }
                     Ok(_) => (true, "Done".into()),
