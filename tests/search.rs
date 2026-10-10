@@ -297,7 +297,6 @@ fn notify_fires_when_results_change() {
 
 /// [e2e after WP-02] real FTS through `store::epg::search`: debounce + stale-result drop.
 #[test]
-#[ignore = "needs WP-02 (store::epg::search)"]
 fn epg_search_against_the_store() {
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
     let store = tuner::store::Store::open_temp("tuner-search-e2e", None).unwrap();

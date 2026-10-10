@@ -831,6 +831,7 @@ fn data_rows_render_with_real_services() {
     };
     let theme = Theme::fallback();
     let mut h = Harness::builder().with_size(egui::vec2(900.0, 700.0)).build_ui(|ui| {
+        t.images.pump();
         let opts = rows::ChannelRowOpts { density: Density::Comfortable, show_number: true, show_logo: true, source: None, favourite: true, failed: false };
         rows::channel_row(ui, &theme, &mut t.images, &ch, Some(&nn), now, opts, RowState::Cursor);
         rows::channel_row(ui, &theme, &mut t.images, &ch, None, now, rows::ChannelRowOpts { density: Density::Compact, ..opts }, RowState::Idle);
@@ -842,6 +843,15 @@ fn data_rows_render_with_real_services() {
         tuner::ui::widgets::text_field::search_header(ui, &theme, "", "Search channels", Some("󰍉"));
     });
     h.run_steps(2);
+    // The logo URL is unreachable: the real image cache fails it asynchronously.
+    let monogram = |h: &Harness<'_>| shapes(h).iter().any(|s| matches!(s, Shape::Text(t) if t.galley.job.text == "BO"));
+    for _ in 0..400 {
+        if monogram(&h) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        h.step();
+    }
     let role = egui::accesskit::Role::Button;
     let channel_rows: Vec<_> = h.query_all_by_role_and_label(role, "BBC One HD").map(|n| n.rect().height().round()).collect();
     assert_eq!(channel_rows, vec![58.0, 36.0], "comfortable then compact row");
@@ -853,7 +863,7 @@ fn data_rows_render_with_real_services() {
     assert!(h.query_by_label("Search channels…").is_some());
     let s = shapes(&h);
     assert!(s.iter().any(|s| matches!(s, Shape::Text(t) if t.galley.job.text.starts_with("News at Eight · ") && t.galley.job.text.ends_with("next: Panorama"))));
-    assert!(s.iter().any(|s| matches!(s, Shape::Text(t) if t.galley.job.text == "BO")), "monogram for a failed logo");
+    assert!(monogram(&h), "monogram for a failed logo");
 }
 
 /// Step `h` until `done` holds (the store writer answers asynchronously).

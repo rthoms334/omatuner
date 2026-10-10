@@ -275,7 +275,6 @@ fn image_cache_serves_disk_hits_without_network() {
 
 /// [e2e after WP-04] the real HTTP path: download, cache on disk, decode.
 #[test]
-#[ignore = "needs WP-04 (HttpClient::get_bytes)"]
 fn image_cache_downloads_over_http_and_caches_on_disk() {
     let tmp = tempfile::tempdir().unwrap();
     let paths = tuner::paths::AppPaths::rooted(tmp.path());
