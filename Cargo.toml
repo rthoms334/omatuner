@@ -43,6 +43,10 @@ harness = false
 name = "guide"      # WP-11: epg_grid layout+paint, headless egui, fake EpgReader
 harness = false
 
+[[bench]]
+name = "startup"    # WP-13: first frame + library load on a 100k-channel profile
+harness = false
+
 # ---------------------------------------------------------------------------
 # Every v1 dependency is declared here. Work packages MUST NOT edit this file;
 # if you need a crate, ask the architect (see docs/DESIGN.md §24 "Frozen files").

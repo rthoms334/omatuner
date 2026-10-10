@@ -304,14 +304,21 @@ fn preferred_langs(cfg: &Config) -> Vec<String> {
     out
 }
 
-/// Sweep inactive generations of `id` in chunks (one transaction each).
+/// Sweep inactive generations of `id` in chunks (one transaction each), then compact the search
+/// index once if anything was removed.
 async fn sweep_old(ctx: &JobContext, id: EpgSourceId, cancel: &CancellationToken) -> Result<()> {
+    let mut deleted = 0;
     loop {
         check(cancel)?;
-        if write(ctx, move |c| store_epg::sweep_old_generations(c, id, SWEEP_CHUNK)).await? == 0 {
-            return Ok(());
+        match write(ctx, move |c| store_epg::sweep_old_generations(c, id, SWEEP_CHUNK)).await? {
+            0 => break,
+            n => deleted += n,
         }
     }
+    if deleted > 0 {
+        write(ctx, store_epg::optimize_fts).await?;
+    }
+    Ok(())
 }
 
 /// Match guide `id` against every playlist source and replace its automatic mappings (no
