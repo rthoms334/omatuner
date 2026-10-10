@@ -164,7 +164,7 @@ fn track_id(s: &PlayerSnapshot) -> TrackId {
 /// Logos are public URLs; anything that would need redaction (credentials) is left out.
 fn art_url(logo: Option<&str>) -> Option<String> {
     let logo = logo?.trim();
-    let scheme_ok = ["http://", "https://", "file://"].iter().any(|p| logo.get(..p.len()).is_some_and(|h| h.eq_ignore_ascii_case(p)));
+    let scheme_ok = ["http://", "https://"].iter().any(|p| logo.get(..p.len()).is_some_and(|h| h.eq_ignore_ascii_case(p)));
     (scheme_ok && crate::redact::redact(logo) == logo).then(|| logo.to_owned())
 }
 
@@ -476,6 +476,7 @@ mod tests {
         assert_eq!(m.length(), Some(Time::from_secs(5400)));
         assert_eq!(m.art_url(), None, "a logo URL with userinfo is not exported");
         assert_eq!(art_url(Some("data:image/png;base64,xx")), None);
+        assert_eq!(art_url(Some("file:///home/u/logos/bbc1.png")), None, "local paths stay private");
         assert_eq!(art_url(Some("HTTPS://x.tv/l.png")).as_deref(), Some("HTTPS://x.tv/l.png"));
     }
 

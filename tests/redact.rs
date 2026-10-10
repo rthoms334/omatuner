@@ -79,6 +79,33 @@ fn credential_headers_lose_their_values() {
     }
 }
 
+/// Per-stream header values are not registered secrets, so the quoted forms a `{:?}` or a
+/// serialised `HttpHeaders` produces must be caught by pattern.
+#[test]
+fn quoted_header_forms_lose_their_values() {
+    let h = tuner::model::HttpHeaders {
+        user_agent: Some("Tuner/1.0".into()),
+        extra: vec![
+            ("Cookie".into(), "sid=QUOTEDCOOKIE-5c1e".into()),
+            ("Authorization".into(), "Bearer QUOTEDTOKEN-5c1e".into()),
+            ("X-Forwarded-For".into(), "10.0.0.1".into()),
+        ],
+        ..Default::default()
+    };
+    let debug = format!("{h:?}");
+    let json = serde_json::to_string(&h).expect("serialise headers");
+    for s in [&debug, &json] {
+        let r = redact(s);
+        assert!(!r.contains("QUOTEDCOOKIE") && !r.contains("QUOTEDTOKEN"), "{s} -> {r}");
+        assert!(r.contains("Tuner/1.0") && r.contains("10.0.0.1"), "neighbours stay readable: {r}");
+    }
+    assert_eq!(redact(&debug), debug.replace("sid=QUOTEDCOOKIE-5c1e", "***").replace("Bearer QUOTEDTOKEN-5c1e", "***"));
+    assert_eq!(
+        redact(r#"{"Authorization": "Bearer QUOTEDTOKEN-5c1e", "Accept": "*/*"}"#),
+        r#"{"Authorization": "***", "Accept": "*/*"}"#
+    );
+}
+
 #[test]
 fn mpv_log_lines() {
     let secret = "mpv-secret-8a77";

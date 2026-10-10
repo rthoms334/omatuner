@@ -210,7 +210,7 @@ impl FileWriter {
                     Ok(()) => failed = false,
                     Err(e) if !failed => {
                         failed = true;
-                        eprintln!("tuner: writing {}: {e}", sink.path.display());
+                        stderr_line(format_args!("tuner: writing {}: {e}", sink.path.display()));
                         sink.file = None; // reopened on the next line
                     }
                     Err(_) => sink.file = None,
@@ -229,6 +229,12 @@ impl FileWriter {
             Err(TrySendError::Disconnected(_)) => {}
         }
     }
+}
+
+/// `eprintln!` without the panic: stderr may be a closed terminal (EIO) or a pipe whose reader
+/// has exited (EPIPE), and a log call must never take the calling thread down with it.
+fn stderr_line(args: std::fmt::Arguments<'_>) {
+    let _ = writeln!(std::io::stderr().lock(), "{args}");
 }
 
 struct RingLayer {
@@ -263,7 +269,7 @@ impl<S: tracing::Subscriber> Layer<S> for RingLayer {
         let message = crate::redact::redact(&v.0).into_owned();
         let meta = event.metadata();
         if self.stderr {
-            eprintln!("{:>5} {}: {}", meta.level(), meta.target(), message);
+            stderr_line(format_args!("{:>5} {}: {}", meta.level(), meta.target(), message));
         }
         let line = LogLine { at: crate::model::now(), level: *meta.level(), target: meta.target().to_owned(), message };
         if let Some(f) = &self.file {
@@ -285,7 +291,7 @@ pub fn init(paths: &AppPaths, debug: bool) -> LogBuffer {
     let file = match FileSink::open(&log_file, ROTATE_BYTES).and_then(FileWriter::spawn) {
         Ok(w) => Some(w),
         Err(e) => {
-            eprintln!("tuner: log file {} unavailable: {e}", log_file.display());
+            stderr_line(format_args!("tuner: log file {} unavailable: {e}", log_file.display()));
             None
         }
     };

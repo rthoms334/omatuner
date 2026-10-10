@@ -104,7 +104,9 @@ const CRED_NAMES: &str = "username|user|password|passwd|pass|pwd|token|auth|key|
                           access_token|refresh_token|id_token|client_secret|secret";
 
 static USERINFO: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\b([a-z][a-z0-9+.-]*://)([^/@\s:]+)(:[^/@\s]*)?@").unwrap());
+    // The password runs to the last `@` before the path: an unencoded `@` inside it must not
+    // leave the rest readable.
+    LazyLock::new(|| Regex::new(r"(?i)\b([a-z][a-z0-9+.-]*://)([^/@\s:]+)(:[^/\s]*)?@").unwrap());
 /// `?name=value`, `&name=value`, `;name=value` and free-standing `name=value` (form bodies,
 /// mpv option strings). The value stops at separators and quotes.
 static QUERY_CRED: LazyLock<Regex> = LazyLock::new(|| {
@@ -119,7 +121,9 @@ static XTREAM_BARE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static HEADER_CRED: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)\b(authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token|x-access-token)(\s*[:=]\s*)([^\r\n,"']+)"#,
+        // Separators: `Name: v` / `Name=v`, and the quoted forms `"Name": "v"` (JSON object)
+        // and `"Name", "v"` (`Debug`/serde of a `(name, value)` header pair).
+        r#"(?i)\b(authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token|x-access-token)("\s*[:,]\s*"|\s*[:=]\s*)([^\r\n,"']+)"#,
     )
     .unwrap()
 });
@@ -170,6 +174,9 @@ mod tests {
     #[test]
     fn redact_userinfo_query_and_xtream_paths() {
         assert_eq!(redact_url("http://bob:hunter2@h.tv/x"), "http://***@h.tv/x");
+        // an unencoded `@` in the password: masked up to the last one before the host
+        assert_eq!(redact_url("http://bob:p@ss@h.tv/list.m3u"), "http://***@h.tv/list.m3u");
+        assert_eq!(redact_url("see http://bob@h.tv/a and mail@example.com"), "see http://***@h.tv/a and mail@example.com");
         assert_eq!(
             redact_url("http://h.tv:8080/get.php?username=bob&password=hunter2&type=m3u_plus"),
             "http://h.tv:8080/get.php?username=***&password=***&type=m3u_plus"

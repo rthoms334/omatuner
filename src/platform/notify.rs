@@ -182,10 +182,16 @@ impl Notifier for DesktopNotifier {
         let bus = self.bus.clone();
         Box::pin(async move {
             let n = build(&note.summary, &note.body, false, &[("default", "Watch"), ("watch", "Watch")]);
-            let handle = match show(&n, bus.as_deref()).await {
-                Ok(h) => h,
-                Err(e) => {
+            // zbus calls have no timeout of their own: a wedged notification server must not
+            // stall the scheduler (the caller falls back to a toast).
+            let handle = match tokio::time::timeout(NOTIFY_TIMEOUT, show(&n, bus.as_deref())).await {
+                Ok(Ok(h)) => h,
+                Ok(Err(e)) => {
                     tracing::info!("reminder notification not shown: {e}");
+                    return false;
+                }
+                Err(_) => {
+                    tracing::info!("reminder notification timed out");
                     return false;
                 }
             };
@@ -297,8 +303,12 @@ async fn run(
                     let note = note_for(&r, now);
                     let watch_bus = bus.clone();
                     let (id, channel) = (r.id, r.channel.clone());
-                    let on_watch: Box<dyn FnOnce() + Send> =
-                        Box::new(move || watch_bus.send(AppEvent::Platform(PlatformEvent::ReminderWatch { reminder: id, channel })));
+                    // Raise right away as well (DESIGN §21.3): the UI may not be running while
+                    // the window sits on another workspace, so the event alone could wait.
+                    let on_watch: Box<dyn FnOnce() + Send> = Box::new(move || {
+                        watch_bus.send(AppEvent::Platform(PlatformEvent::ReminderWatch { reminder: id, channel }));
+                        crate::platform::hypr::focus_self();
+                    });
                     if !notifier.show_reminder(note.clone(), on_watch).await {
                         bus.toast(Toast { kind: ToastKind::Info, text: note.toast_text(), action: None, ttl_ms: 10_000 });
                     }
@@ -653,5 +663,25 @@ mod tests {
         let calls = calls.lock().unwrap().clone();
         assert_eq!(calls[0].0, "News");
         assert_eq!(calls[0].2, vec!["default", "Watch", "watch", "Watch"]);
+    }
+
+    #[test]
+    fn a_wedged_notification_server_does_not_stall_reminders() {
+        if !session_bus_available() {
+            eprintln!("skipped: no session bus");
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let suffix = format!("tuner_wedged_{}", std::process::id());
+        // Owns the name and never answers a call (no object server on this connection).
+        let _conn = rt.block_on(async {
+            zbus::conn::Builder::session().unwrap().name(format!("de.hoodie.Notification.{suffix}")).unwrap().build().await.unwrap()
+        });
+        let notifier = DesktopNotifier { bus: Some(suffix) };
+        let note = Note { summary: "News".into(), body: "Starts in 2 min".into() };
+        let t = Instant::now();
+        assert!(!rt.block_on(notifier.show_reminder(note, Box::new(|| {}))));
+        let took = t.elapsed();
+        assert!(took >= NOTIFY_TIMEOUT && took < NOTIFY_TIMEOUT * 2, "gave up after {took:?}");
     }
 }
