@@ -1044,6 +1044,8 @@ mod tests {
         c.integration.mpris = false;
         c.integration.follow_omarchy_theme = false;
         c.reminders.enabled = false;
+        // the real scheduler (WP-06) must not refresh the seeded 127.0.0.1 sources mid-test
+        c.general.refresh_on_launch_after_h = 0;
         c
     }
 
@@ -1107,6 +1109,12 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
                 self.frame_with(vec![]);
             }
+        }
+
+        /// Wait until the startup jobs (the real `RebuildLibrary`) are done and delivered, so
+        /// neither a late library nor the job summary in the status bar races the test.
+        fn settle(&mut self) {
+            self.until("startup jobs", |r| r.app.lib.built_at != 0 && r.app.services().jobs.active().is_empty());
         }
 
         fn route(&self) -> &Route { self.app.current_route() }
@@ -1663,7 +1671,8 @@ mod tests {
             c.execute("INSERT INTO item_override(source_id, kind, item_key, locked, fp) VALUES (1, 'channel', 'm3u:ch0', 1, '')", [])?;
             Ok(())
         });
-        assert!(rig.app.lib.live.channels.is_empty(), "the library hasn't loaded");
+        // `TunerApp::new` handles the request before any frame could deliver the library (the
+        // real RebuildLibrary job may land during the rig's first frame, so don't assert on it)
         assert_eq!(played(&rig.log()), []);
         assert!(rig.log().toasts.iter().any(|t| t.text.contains("locked")));
         assert_eq!(rig.route(), &Route::Live { group: None, channel: None });
@@ -1747,6 +1756,9 @@ mod tests {
     #[test]
     fn tab_globals_and_vod_absence() {
         let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_channels(c, 1, None));
+        // the startup library would otherwise land at an arbitrary frame; start from "not loaded"
+        rig.settle();
+        rig.app.lib = Arc::new(Library::default());
         rig.press(Key::Num1, ALT);
         assert_eq!(rig.route(), &Route::Home);
         rig.press(Key::Num0, ALT);
@@ -1889,6 +1901,7 @@ mod tests {
         for (w, scale, classes, sidebar) in cases {
             let mut rig = Rig::with(test_config(), live(), scale, |_| Ok(()));
             rig.size = egui::vec2(w, 800.0);
+            rig.settle(); // a running job replaces the hint line
             rig.frame_with(vec![]);
             let out = rig.frame_with(vec![]);
             assert!(classes.contains(&rig.app.layout), "{w} pt @ {scale}: {:?}", rig.app.layout);

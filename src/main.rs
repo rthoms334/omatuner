@@ -272,7 +272,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs WP-06"]
     fn headless_refresh_of_nothing_stale_succeeds() {
         let dir = tempfile::tempdir().unwrap();
         let failed = refresh_headless(AppPaths::rooted(dir.path()), Config::default(), Duration::from_secs(60)).unwrap();
