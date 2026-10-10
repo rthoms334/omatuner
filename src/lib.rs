@@ -34,10 +34,8 @@ pub mod sources;
 pub mod store;
 
 pub mod fonts;
-#[allow(dead_code, unused_variables, unused_imports)] // WP stubs (see crate docs)
 pub mod images;
 pub mod keymap;
-#[allow(dead_code, unused_variables, unused_imports)] // WP stubs (see crate docs)
 pub mod search;
 pub mod theme;
 
