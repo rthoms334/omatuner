@@ -15,6 +15,12 @@
 //! field, then the page. Config rows apply through `ctx.edit_config` (saved, applied live);
 //! store rows go through the writer and its `DataScope` notification. Changing parental
 //! settings needs the open PIN session once a PIN exists.
+//!
+//! Xtream upgrade (DESIGN §27.3): a playlist that signed in with its Xtream login reads
+//! "Xtream (from M3U)"; its editor (and that of a playlist kept as M3U) has "Use the Xtream
+//! login", which saves `keep_m3u` and runs a forced refresh that performs the switch. The open
+//! editor follows `DataScope::Sources` (a silent upgrade must not be undone by its Save), and
+//! an unchanged server is saved as stored (an upgraded server may carry a path prefix).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -307,6 +313,7 @@ enum Item {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Act {
     AddSource,
+    AddFreeChannels,
     AddEpgUrl,
     AddEpgFile,
     EpgMapping,
@@ -349,6 +356,8 @@ enum Local {
     SrcProviderEpg,
     SrcSmartNames,
     SrcImportVod,
+    /// "Use the Xtream login" (= `!keep_m3u`): applied at once, not on Save.
+    SrcUseXtream,
     AttachFilter,
 }
 
@@ -371,7 +380,10 @@ impl Local {
         )
     }
     fn is_toggle(self) -> bool {
-        matches!(self, Local::BackupPasswords | Local::BackupHistory | Local::SrcProviderEpg | Local::SrcSmartNames | Local::SrcImportVod)
+        matches!(
+            self,
+            Local::BackupPasswords | Local::BackupHistory | Local::SrcProviderEpg | Local::SrcSmartNames | Local::SrcImportVod | Local::SrcUseXtream
+        )
     }
 }
 
@@ -416,6 +428,15 @@ struct SourceEditor {
     provider_epg: bool,
     smart_names: bool,
     import_vod: bool,
+    /// `!keep_m3u` (shown for upgraded playlists and playlists kept as M3U).
+    use_xtream: bool,
+}
+
+/// Take `new` unless the user changed `mine` from `old` (a field edited in an open editor).
+fn rebased<T: PartialEq + Clone>(mine: &mut T, old: &T, new: &T) {
+    if mine == old {
+        *mine = new.clone();
+    }
 }
 
 impl SourceEditor {
@@ -437,7 +458,37 @@ impl SourceEditor {
             provider_epg: s.settings.use_provider_epg.unwrap_or(true),
             smart_names: s.settings.smart_names.unwrap_or(true),
             import_vod: s.settings.import_vod.unwrap_or(true),
+            use_xtream: !s.settings.keep_m3u,
         }
+    }
+
+    /// The stored row changed under the open editor (a refresh upgraded the playlist, the
+    /// switch toggle, a rename elsewhere): follow it, keeping what the user edited.
+    fn rebase(&mut self, s: &Source) {
+        let old = SourceEditor::new(&self.original);
+        let new = SourceEditor::new(s);
+        rebased(&mut self.name, &old.name, &new.name);
+        rebased(&mut self.icon, &old.icon, &new.icon);
+        rebased(&mut self.color, &old.color, &new.color);
+        rebased(&mut self.url, &old.url, &new.url);
+        rebased(&mut self.server, &old.server, &new.server);
+        rebased(&mut self.user, &old.user, &new.user);
+        rebased(&mut self.ua, &old.ua, &new.ua);
+        rebased(&mut self.live_format, &old.live_format, &new.live_format);
+        rebased(&mut self.refresh_h, &old.refresh_h, &new.refresh_h);
+        rebased(&mut self.tz, &old.tz, &new.tz);
+        rebased(&mut self.provider_epg, &old.provider_epg, &new.provider_epg);
+        rebased(&mut self.smart_names, &old.smart_names, &new.smart_names);
+        rebased(&mut self.import_vod, &old.import_vod, &new.import_vod);
+        self.use_xtream = new.use_xtream;
+        self.original = s.clone();
+    }
+
+    /// "Use the Xtream login" applies to playlists that signed in with it and to playlists
+    /// the user kept as M3U (other M3U playlists upgrade on their own).
+    fn offers_xtream_switch(&self) -> bool {
+        let s = &self.original;
+        s.m3u_origin().is_some() || (s.kind != SourceKind::Xtream && s.settings.keep_m3u)
     }
 
     /// The edited source, or the field that is wrong. Also: whether a refresh is needed.
@@ -452,7 +503,11 @@ impl SourceEditor {
         s.color = super::onboarding::COLORS.get(self.color).map(|c| c.0).unwrap_or_default();
         match s.kind {
             SourceKind::Xtream => {
-                let server = crate::sources::xtream::urls::normalize_server(&self.server)
+                // an unchanged server is kept as stored: an upgraded playlist's may carry a
+                // path prefix that normalizing would strip (DESIGN §27.11)
+                let stored = s.xtream.as_ref().map(|x| x.server.clone()).filter(|st| *st == self.server.trim());
+                let server = stored
+                    .or_else(|| crate::sources::xtream::urls::normalize_server(&self.server))
                     .ok_or((Local::SrcServer, "Enter the server address, e.g. panel.example.com:8080".to_owned()))?;
                 if self.user.trim().is_empty() {
                     return Err((Local::SrcUser, "Enter the username".into()));
@@ -592,9 +647,12 @@ pub struct SettingsScreen {
     release_focus: bool,
     /// A guide offset changed with ←/→ that isn't saved yet (and when it last changed).
     offset_pending: Option<(EpgSourceId, std::time::Instant)>,
-    /// Hidden channels of the library build `hidden_built` (Settings ▸ Hidden items).
+    /// Hidden channels of the library generation `hidden_built` (Settings ▸ Hidden items).
     hidden_channels: Vec<(ChannelId, String)>,
-    hidden_built: crate::model::Timestamp,
+    hidden_built: u64,
+    /// A playlist kept as M3U that the user asked to sign in with its Xtream login: its next
+    /// forced refresh says whether that worked.
+    login_switch: Option<SourceId>,
 }
 
 /// How long ←/→ on a guide's offset must rest before the change is saved and re-imported.
@@ -683,6 +741,7 @@ impl SettingsScreen {
                     });
                 }
                 v.push(Row::Act { act: Act::AddSource, icon: glyphs::ADD, label: "Add playlist…".into(), danger: false });
+                v.push(Row::Act { act: Act::AddFreeChannels, icon: glyphs::LIVE_TV, label: "Add free channels…".into(), danger: false });
                 v.push(Row::Section("Refresh".into()));
                 v.extend(PLAYLIST_CFG_N.iter().map(Row::Number));
                 v.push(Row::Choice(&PLAYLIST_CFG_C));
@@ -919,6 +978,15 @@ impl SettingsScreen {
             SourceKind::M3uUrl => v.push(l(Local::SrcUrl, "Playlist URL")),
             SourceKind::M3uFile => v.push(l(Local::SrcUrl, "Playlist file")),
         }
+        if e.offers_xtream_switch() {
+            v.push(l(Local::SrcUseXtream, "Use the Xtream login"));
+            let note = if e.original.kind == SourceKind::Xtream {
+                "Signed in with the Xtream login this playlist carries: movies, series, catch-up and account info. Turn off to use the playlist as it is."
+            } else {
+                "This playlist carries an Xtream login. Turn on to sign in with it for movies, series, catch-up and account info."
+            };
+            v.push(Row::Note(note.into(), false));
+        }
         v.push(Row::Section("Options".into()));
         v.push(l(Local::SrcUa, "User-Agent (empty = default)"));
         if e.original.kind == SourceKind::Xtream {
@@ -1023,6 +1091,7 @@ impl SettingsScreen {
             Local::SrcProviderEpg => &mut self.editor.as_mut()?.provider_epg,
             Local::SrcSmartNames => &mut self.editor.as_mut()?.smart_names,
             Local::SrcImportVod => &mut self.editor.as_mut()?.import_vod,
+            Local::SrcUseXtream => &mut self.editor.as_mut()?.use_xtream,
             _ => return None,
         })
     }
@@ -1106,6 +1175,7 @@ impl SettingsScreen {
                     set(c, ((v / step).round() * step).clamp(min, max));
                 });
             }
+            Row::Local { field: Local::SrcUseXtream, .. } => self.set_use_xtream(ctx, dir > 0),
             Row::Local { field, .. } => self.adjust_local(*field, dir),
             Row::Item { item: Item::Epg(id), .. } => self.epg_offset(ctx, *id, dir * 15),
             _ => {}
@@ -1141,6 +1211,10 @@ impl SettingsScreen {
                     self.editing = true;
                 }
             }
+            Row::Local { field: Local::SrcUseXtream, .. } => {
+                let on = self.editor.as_ref().is_some_and(|e| e.use_xtream);
+                self.set_use_xtream(ctx, !on);
+            }
             Row::Local { field, .. } => self.adjust_local(*field, 1),
             Row::Act { act, .. } => self.act(ctx, *act),
             Row::Item { item, .. } => self.item_default(ctx, item.clone()),
@@ -1171,6 +1245,7 @@ impl SettingsScreen {
     fn act(&mut self, ctx: &mut UiCtx<'_>, act: Act) {
         match act {
             Act::AddSource => ctx.push(Route::Onboarding(OnboardingStart::AddSource)),
+            Act::AddFreeChannels => ctx.push(Route::Onboarding(OnboardingStart::FreeChannels)),
             Act::EpgMapping => ctx.push(Route::EpgMapping { channel: None }),
             Act::OpenLogs => ctx.push(Route::Logs),
             // the app writes the log when the dialog answers
@@ -1323,6 +1398,34 @@ impl SettingsScreen {
                 self.row = 0;
             }
         }
+    }
+
+    /// Editor ▸ "Use the Xtream login" (DESIGN §27.3): save `keep_m3u` now and run a forced
+    /// refresh, which performs the switch (both ways). Turning it on for a playlist that is
+    /// still M3U is checked when that refresh finishes.
+    fn set_use_xtream(&mut self, ctx: &mut UiCtx<'_>, on: bool) {
+        let Some(e) = &mut self.editor else { return };
+        if !e.offers_xtream_switch() || e.use_xtream == on {
+            return;
+        }
+        e.use_xtream = on;
+        // a later Save keeps it (and doesn't count it as a change)
+        e.original.settings.keep_m3u = !on;
+        let (id, name) = (e.original.id, e.original.name.clone());
+        self.login_switch = (on && e.original.kind != SourceKind::Xtream).then_some(id);
+        let jobs = ctx.services.jobs.clone();
+        let _ = ctx.services.store.writer().submit_notify(DataScope::Sources, move |c| {
+            let mut settings = crate::store::sources::get_source(c, id)?.settings;
+            settings.keep_m3u = !on;
+            crate::store::sources::set_source_settings(c, id, &settings)?;
+            jobs.submit(JobKind::RefreshSource { source: id, force: true });
+            Ok(())
+        });
+        ctx.toast(Toast::info(if on {
+            format!("Signing in to {name} with its Xtream login…")
+        } else {
+            format!("Switching {name} back to its playlist…")
+        }));
     }
 
     fn confirm_delete_source(&mut self, ctx: &mut UiCtx<'_>, id: SourceId, name: &str) {
@@ -1739,6 +1842,7 @@ fn coverage_note(guides: &[EpgSource], covered: usize, total: usize) -> Option<S
 /// 2027-01-01".
 fn source_detail(s: &Source, now: crate::model::Timestamp, running: Option<String>, with_guide: Option<usize>) -> String {
     let kind = match s.kind {
+        SourceKind::Xtream if s.m3u_origin().is_some() => "Xtream (from M3U)",
         SourceKind::Xtream => "Xtream",
         SourceKind::M3uUrl => "M3U URL",
         SourceKind::M3uFile => "M3U file",
@@ -1838,7 +1942,20 @@ impl Screen for SettingsScreen {
                     DataScope::All => true,
                     _ => false,
                 };
-                if relevant && self.editor.is_none() {
+                // an open source editor follows its row (a silent upgrade, the switch toggle)
+                if relevant && (self.editor.is_none() || matches!(scope, DataScope::Sources | DataScope::All)) {
+                    self.reload(ctx);
+                }
+            }
+            // the forced refresh after "Use the Xtream login" was turned on (DESIGN §27.3)
+            AppEvent::Job(JobEvent::Finished { kind: JobKind::RefreshSource { source, force: true }, outcome, .. })
+                if self.login_switch == Some(*source) =>
+            {
+                self.login_switch = None;
+                if matches!(outcome, Ok(JobOutcome::SourceRefreshed { upgraded: false, .. })) {
+                    ctx.toast(Toast::error("Couldn't sign in with this playlist's Xtream login — still using the playlist"));
+                }
+                if self.editor.is_none() {
                     self.reload(ctx);
                 }
             }
@@ -2068,9 +2185,10 @@ impl Screen for SettingsScreen {
 
 impl SettingsScreen {
     fn poll_loaders(&mut self, ctx: &mut UiCtx<'_>) {
-        if self.page == SettingsPage::Hidden && self.hidden_built != ctx.lib.built_at {
+        // `generation`, not `built_at`: two builds within a second (hide, then unhide) share it
+        if self.page == SettingsPage::Hidden && self.hidden_built != ctx.lib.generation {
             // one pass per library build, not one per `rows()` call
-            self.hidden_built = ctx.lib.built_at;
+            self.hidden_built = ctx.lib.generation;
             let live = &ctx.lib.live;
             self.hidden_channels =
                 live.channels.iter().filter(|c| live.hidden.contains(&c.id)).take(500).map(|c| (c.id, c.name.to_string())).collect();
@@ -2082,7 +2200,14 @@ impl SettingsScreen {
         }
         if let Some(r) = kit::poll(&mut self.sources_loader) {
             match r {
-                Ok(v) => self.sources = v,
+                Ok(v) => {
+                    if let Some(e) = &mut self.editor
+                        && let Some(s) = v.iter().find(|s| s.id == e.original.id && **s != e.original)
+                    {
+                        e.rebase(s);
+                    }
+                    self.sources = v;
+                }
                 Err(e) => kit::error_toast(ctx, "Couldn't read the playlists", &e),
             }
         }
@@ -2280,7 +2405,8 @@ impl SettingsScreen {
                         } else if field.is_toggle() {
                             let mut v = self.local_toggle(field).map(|b| *b).unwrap_or(false);
                             if toggle_row(&mut inner, theme, &mut v, label, label_color) {
-                                clicked = Some((i, 1));
+                                // the new state, as ←/→ would set it
+                                clicked = Some((i, if v { 1 } else { -1 }));
                             }
                         } else {
                             let value = self.local_value(field);
@@ -3047,6 +3173,54 @@ mod tests {
         assert!(!needs_credentials(&src));
         let detail = source_detail(&src, 1000, None, Some(0));
         assert!(detail.starts_with("Xtream · 0 ch") && detail.ends_with("Never refreshed"), "{detail}");
+    }
+
+    /// DESIGN §27.3/§27.11: an editor opened on an M3U playlist that a refresh then upgrades
+    /// follows the row (Save must not drop the new login), keeps what the user typed, offers
+    /// the switch back, and saves the panel's path-prefixed server untouched.
+    #[test]
+    fn source_editor_follows_a_silent_upgrade() {
+        let url = "http://p.example/sub/get.php?username=u&password=pw";
+        let m3u = Source {
+            id: SourceId(1),
+            name: "Provider".into(),
+            kind: SourceKind::M3uUrl,
+            icon: glyphs::PLAYLIST.into(),
+            color: SourceColor::Blue,
+            url: Some(crate::redact::Secret::new(url.into())),
+            path: None,
+            xtream: None,
+            settings: Default::default(),
+            enabled: true,
+            sort_index: 0,
+            created_at: 0,
+            status: Default::default(),
+        };
+        let mut e = SourceEditor::new(&m3u);
+        assert!(!e.offers_xtream_switch(), "an M3U playlist upgrades on its own");
+        e.name = "Renamed".into();
+        let upgraded = Source {
+            kind: SourceKind::Xtream,
+            xtream: Some(crate::model::XtreamCredentials {
+                server: "http://p.example/sub".into(),
+                username: "u".into(),
+                password: crate::redact::Secret::new("pw".into()),
+            }),
+            ..m3u.clone()
+        };
+        e.rebase(&upgraded);
+        assert!(e.offers_xtream_switch() && e.use_xtream);
+        let (s, refresh) = e.apply().unwrap();
+        assert_eq!(s.name, "Renamed", "the user's edit is kept");
+        assert_eq!(s.kind, SourceKind::Xtream);
+        assert_eq!(s.xtream.as_ref().map(|x| x.server.as_str()), Some("http://p.example/sub"), "an unchanged server isn't normalized");
+        assert_eq!(s.url.as_ref().map(|u| u.expose().as_str()), Some(url), "the playlist stays for switching back");
+        assert!(!refresh);
+        assert!(source_detail(&upgraded, 1000, None, None).starts_with("Xtream (from M3U) · "));
+        // a playlist the user kept as M3U offers the login
+        let kept = Source { settings: crate::model::SourceSettings { keep_m3u: true, ..Default::default() }, ..m3u };
+        let e = SourceEditor::new(&kept);
+        assert!(e.offers_xtream_switch() && !e.use_xtream);
     }
 
     /// The iptv-org case: a guide that lists 2 channels matching 3 of 11 249 says so.

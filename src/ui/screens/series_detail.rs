@@ -6,7 +6,8 @@
 //!
 //! Data is read off the UI thread (series, seasons, episodes, per-episode progress and the
 //! episode to open at) and re-read on `DataScope::{VodDetails, Progress, Overrides}`; Xtream
-//! series without loaded details submit `JobKind::LoadSeriesDetails` and show a skeleton.
+//! series without loaded details submit `JobKind::LoadSeriesDetails` and show a skeleton;
+//! playlist (M3U) series are complete at import and get the sparse header (DESIGN §27.7).
 //! The "Next episode in 10 s" card itself is the fullscreen player's (WP-11, drawn over the
 //! video in OSD colours, for an episode started anywhere); this page only moves its cursor.
 
@@ -15,7 +16,7 @@ use std::collections::HashMap;
 use eframe::egui;
 
 use super::home::kit::{self, Loader};
-use super::movie_detail::{DetailHeader, fraction, resumable, resume_or_play};
+use super::movie_detail::{DetailHeader, NO_DESCRIPTION, fraction, resumable, resume_or_play, sparse_meta};
 use crate::jobs::{JobEvent, JobKind};
 use crate::keymap::{Action, KeyContext};
 use crate::model::{Episode, EpisodeId, ItemKey, ItemKind, ItemRef, MediaRef, PlayOrigin, Series, SeriesId, SourceKind, VodKind, WatchProgress};
@@ -88,9 +89,9 @@ fn episode_ref(e: &Episode) -> ItemRef {
     ItemRef { source: e.source_id, kind: ItemKind::Episode, key: e.key.clone() }
 }
 
-/// "S01E03 · Pilot".
+/// "S01E03 · Pilot" ("S01E03 · Episode 3" for an untitled playlist episode).
 fn episode_label(e: &Episode) -> String {
-    format!("S{:02}E{:02} · {}", e.season, e.episode, e.title)
+    format!("S{:02}E{:02} · {}", e.season, e.episode, rows::episode_title(e))
 }
 
 #[derive(Default)]
@@ -465,6 +466,9 @@ impl Screen for SeriesDetailScreen {
             return;
         }
         let summary = self.id.and_then(|id| ctx.lib.vod.find(VodKind::Series(id))).cloned();
+        // DESIGN §27.7: a playlist series is complete at import (no details to wait for)
+        let source = self.data.as_ref().map(|d| d.series.source_id).or(summary.as_ref().map(|s| s.source_id));
+        let sparse = !source.and_then(|s| ctx.lib.source(s)).is_some_and(|s| s.kind == SourceKind::Xtream);
         let Some(data) = self.data.clone() else {
             // list-level data while the page loads
             let title = summary.as_ref().map(|s| s.name.to_string()).unwrap_or_default();
@@ -476,7 +480,7 @@ impl Screen for SeriesDetailScreen {
                 backdrop: None,
                 playing: false,
                 locked: false,
-                loading: true,
+                loading: !sparse,
             };
             header.show(ui, ctx, |_, _| {});
             return;
@@ -499,6 +503,12 @@ impl Screen for SeriesDetailScreen {
         if let Some(c) = s.cast.as_deref().filter(|c| !c.trim().is_empty()) {
             text.push((format!("Cast: {c}"), true));
         }
+        if sparse {
+            meta.extend(sparse_meta(ctx, &s.group_ids, Some(s.source_id)));
+            if text.is_empty() {
+                text.push((NO_DESCRIPTION.to_owned(), true));
+            }
+        }
         let playing_ep = ctx.player.playable.as_ref().and_then(|p| match p.media {
             MediaRef::Episode(id) => Some(id),
             _ => None,
@@ -509,7 +519,7 @@ impl Screen for SeriesDetailScreen {
         let resume_at =
             next.as_ref().and_then(|e| data.progress.get(&e.key)).filter(|p| resumable(p, ctx.config.player.resume_min_s)).map(|p| p.position_s);
         let season_watched = self.season_watched();
-        let loading = self.loader.is_some() && data.episodes.is_empty() || s.details_loaded_at.is_none() && data.episodes.is_empty();
+        let loading = data.episodes.is_empty() && (self.loader.is_some() || !sparse && s.details_loaded_at.is_none());
         let (section, btn_focus, season_idx, ep_idx) = (self.section, self.btn, self.season, self.ep);
         let scroll = std::mem::take(&mut self.scroll_to_cursor);
         let mut clicked_btn = None;
@@ -813,5 +823,7 @@ mod tests {
         }
         assert!(s.season_watched());
         assert_eq!(episode_label(&ep(7, 1, 3)), "S01E03 · Episode 3");
+        // a playlist episode without a title (DESIGN §27.7)
+        assert_eq!(episode_label(&Episode { title: String::new(), ..ep(8, 2, 4) }), "S02E04 · Episode 4");
     }
 }

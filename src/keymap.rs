@@ -344,8 +344,8 @@ pub static GLOBAL: &[Binding] = &[
     b(C::key(Key::F1), A::ToggleHelp, "Keyboard help"),
 ];
 
-/// Shared by List / ListFiltering / PosterGrid(Filtering) / Detail / Search: item actions on
-/// Ctrl chords and Delete.
+/// Shared by List / ListFiltering / PosterGrid(Filtering) / Detail: item actions on Ctrl
+/// chords and Delete (Search has its own subset, [`SEARCH_ITEM_ACTIONS`]).
 pub static ITEM_ACTIONS: &[Binding] = &[
     b(C::ctrl(Key::F), A::ToggleFavourite, "Add to / remove from Favourites"),
     b(C::ctrl_shift(Key::F), A::AddToList, "Favourites lists… (add, new list)"),
@@ -494,7 +494,14 @@ pub static GUIDE: &[Binding] = &[
     b(C::ch('8'), A::Digit(8), "Jump to channel number"),
     b(C::ch('9'), A::Digit(9), "Jump to channel number"),
     b(C::ctrl(Key::F), A::ToggleFavourite, "Add channel to Favourites"),
+    b(C::ctrl_shift(Key::F), A::AddToList, "Favourites lists… (add, new list)"),
     b(C::ctrl(Key::E), A::AssignEpg, "Assign EPG channel"),
+    b(C::ctrl(Key::I), A::ShowDetails, "Edit channel information"),
+    b(C::key(Key::F2), A::Rename, "Rename channel"),
+    b(C::ctrl(Key::H), A::ToggleHidden, "Hide channel"),
+    b(C::ctrl(Key::L), A::ToggleLock, "Lock channel with PIN / unlock"),
+    b(C::shift(Key::F10), A::ContextMenu, "Channel menu"),
+    b(C::ctrl(Key::Enter), A::ContextMenu, "Channel menu"),
     b(C::ch('/'), A::OpenSearch, "Search everything"),
     b(C::ch('?'), A::ToggleHelp, "Keyboard help"),
     b(C::key(Key::Escape), A::Back, "Back"),
@@ -618,6 +625,22 @@ pub static SEARCH: &[Binding] = &[
     b(C::key(Key::Escape), A::Back, "Clear, then close"),
 ];
 
+/// The item shortcuts the search overlay acts on (no reorder, sort or remove there: a hit
+/// list has no order of its own and nothing to remove from).
+pub static SEARCH_ITEM_ACTIONS: &[Binding] = &[
+    b(C::ctrl(Key::F), A::ToggleFavourite, "Add to / remove from Favourites"),
+    b(C::ctrl_shift(Key::F), A::AddToList, "Favourites lists… (add, new list)"),
+    b(C::ctrl(Key::H), A::ToggleHidden, "Hide / unhide"),
+    b(C::key(Key::F2), A::Rename, "Rename"),
+    b(C::ctrl(Key::L), A::ToggleLock, "Lock with PIN / unlock"),
+    b(C::ctrl(Key::G), A::OpenInGuide, "Show in TV guide"),
+    b(C::ctrl(Key::I), A::ShowDetails, "Details / edit information"),
+    b(C::ctrl(Key::E), A::AssignEpg, "Assign EPG channel"),
+    b(C::ctrl(Key::W), A::MarkWatched, "Mark watched / unwatched"),
+    b(C::shift(Key::F10), A::ContextMenu, "List these shortcuts"),
+    b(C::ctrl(Key::Enter), A::ContextMenu, "List these shortcuts"),
+];
+
 pub static MODAL: &[Binding] = &[
     b(C::key(Key::ArrowUp), A::Up, "Move"),
     b(C::key(Key::ArrowDown), A::Down, "Move"),
@@ -675,7 +698,7 @@ pub fn tables(ctx: KeyContext) -> Vec<&'static [Binding]> {
         KeyContext::PlayerOsd => vec![PLAYER_OSD],
         KeyContext::NumericEntry => vec![NUMERIC_ENTRY],
         KeyContext::EpgMapping => vec![EPG_MAPPING],
-        KeyContext::Search => vec![SEARCH, ITEM_ACTIONS],
+        KeyContext::Search => vec![SEARCH, SEARCH_ITEM_ACTIONS],
         KeyContext::Modal => vec![MODAL],
         KeyContext::TextInput => vec![TEXT_INPUT],
         KeyContext::Panel => vec![PANEL],

@@ -554,6 +554,9 @@ pub struct LiveScreen {
     drawer: bool,
     /// Library snapshot + favourites signature the lists were built from.
     built: Option<(u64, u64, SortMode, bool)>,
+    /// The sort a reorder switched to and the config sort it replaced, until the config edit
+    /// lands at the end of the frame.
+    sort_pending: Option<(SortMode, SortMode)>,
     /// Rebuild groups and channels on the next frame.
     dirty: bool,
     /// Re-read the failure cache (a zap succeeded or failed) — nothing else.
@@ -569,6 +572,47 @@ pub struct LiveScreen {
     /// Delete-list confirmation token → list.
     confirm: Option<(u64, FavListId)>,
     layout: Option<LayoutClass>,
+}
+
+/// Channel management shared by Live and the Guide: favourite, lists, hide, rename, lock (the
+/// PIN first; its `Unlocked(ToggleLock)` comes back to the screen) and edit information.
+pub(crate) fn channel_item_action(ctx: &mut UiCtx<'_>, ch: &ChannelSummary, action: Action) {
+    match action {
+        Action::ToggleFavourite => toggle_favourite(ctx, channel_ref(ch), &ch.name),
+        Action::AddToList => {
+            ctx.open(OverlayRequest::ListPicker(ListPickerSpec { item: channel_ref(ch), title: format!("Lists for “{}”", ch.name) }));
+        }
+        Action::ToggleHidden => {
+            let item = channel_ref(ch);
+            let _ = ctx.services.store.writer().submit_notify(DataScope::Overrides, move |c| {
+                let mut ov = crate::store::user::item_override(c, &item)?.unwrap_or_default();
+                ov.hidden = !ov.hidden;
+                crate::store::user::set_item_override(c, &item, &ov)
+            });
+            ctx.toast(Toast::info(format!("Hid “{}” — Settings ▸ Hidden items brings it back", ch.name)));
+        }
+        Action::Rename => ctx.open(OverlayRequest::Rename(RenameSpec {
+            title: "Rename channel".into(),
+            initial: ch.name.to_string(),
+            target: RenameTarget::Item { item: channel_ref(ch) },
+        })),
+        Action::ToggleLock if !ctx.parental.is_unlocked(&ctx.config.parental) => {
+            ctx.open(OverlayRequest::Pin { then: Box::new(Action::ToggleLock), reason: "Enter your PIN to change locks".into() });
+        }
+        Action::ToggleLock => {
+            let item = channel_ref(ch);
+            let lock = !ch.locked;
+            let _ = ctx.services.store.writer().submit_notify(DataScope::Overrides, move |c| {
+                let mut ov = crate::store::user::item_override(c, &item)?.unwrap_or_default();
+                ov.locked = lock;
+                crate::store::user::set_item_override(c, &item, &ov)
+            });
+            let hint = pin_hint(ctx);
+            ctx.toast(Toast::info(format!("{} “{}”{hint}", if lock { "Locked" } else { "Unlocked" }, ch.name)));
+        }
+        Action::ShowDetails => ctx.open(OverlayRequest::EditItem(channel_ref(ch))),
+        _ => {}
+    }
 }
 
 /// Appended to lock toasts while no PIN is set (locks do nothing without one).
@@ -620,6 +664,11 @@ impl LiveScreen {
         (ctx.lib.generation, fav_signature(ctx.favs), sort, ctx.config.interface.hide_empty_groups)
     }
 
+    /// The channel sort in effect: the config's, or the one a reorder just switched to.
+    fn sort(&self, ctx: &UiCtx<'_>) -> SortMode {
+        self.sort_pending.map_or(ctx.config.interface.live_sort, |(s, _)| s)
+    }
+
     /// Rebuild when the library, the favourites, the sort or the hide-empty setting changed.
     /// Side tables (failures, reminders) are re-read only when their own events say so, inside
     /// the frame budget — a zap never rebuilds the channel list.
@@ -642,7 +691,11 @@ impl LiveScreen {
             // the Reminders group comes and goes with them (rare: a full rebuild is fine)
             self.dirty = true;
         }
-        let sig = Self::signature(ctx, ctx.config.interface.live_sort);
+        // the config changed since (the edit landed, or something else set the sort)
+        if self.sort_pending.is_some_and(|(_, was)| was != ctx.config.interface.live_sort) {
+            self.sort_pending = None;
+        }
+        let sig = Self::signature(ctx, self.sort(ctx));
         if self.built == Some(sig) && !self.dirty {
             return;
         }
@@ -723,10 +776,7 @@ impl LiveScreen {
                 }
                 v
             }
-            Some(e) => e
-                .collection()
-                .map(|c| ctx.lib.live.collection(&c, ctx.favs, &ctx.lib.recent_channels, ctx.config.interface.live_sort))
-                .unwrap_or_default(),
+            Some(e) => e.collection().map(|c| ctx.lib.live.collection(&c, ctx.favs, &ctx.lib.recent_channels, self.sort(ctx))).unwrap_or_default(),
             None => Vec::new(),
         };
         self.rebuild_haystacks(ctx);
@@ -1101,55 +1151,9 @@ impl LiveScreen {
                 self.close_drawer();
                 true
             }
-            Action::ToggleFavourite => {
+            Action::ToggleFavourite | Action::AddToList | Action::ToggleHidden | Action::Rename | Action::ToggleLock | Action::ShowDetails => {
                 if let Some(ch) = cur {
-                    toggle_favourite(ctx, channel_ref(&ch), &ch.name);
-                }
-                true
-            }
-            Action::AddToList => {
-                if let Some(ch) = cur {
-                    ctx.open(OverlayRequest::ListPicker(ListPickerSpec { item: channel_ref(&ch), title: format!("Lists for “{}”", ch.name) }));
-                }
-                true
-            }
-            Action::ToggleHidden => {
-                if let Some(ch) = cur {
-                    let item = channel_ref(&ch);
-                    let _ = ctx.services.store.writer().submit_notify(DataScope::Overrides, move |c| {
-                        let mut ov = crate::store::user::item_override(c, &item)?.unwrap_or_default();
-                        ov.hidden = !ov.hidden;
-                        crate::store::user::set_item_override(c, &item, &ov)
-                    });
-                    ctx.toast(Toast::info(format!("Hid “{}” — Settings ▸ Hidden items brings it back", ch.name)));
-                }
-                true
-            }
-            Action::Rename => {
-                if let Some(ch) = cur {
-                    ctx.open(OverlayRequest::Rename(RenameSpec {
-                        title: "Rename channel".into(),
-                        initial: ch.name.to_string(),
-                        target: RenameTarget::Item { item: channel_ref(&ch) },
-                    }));
-                }
-                true
-            }
-            Action::ToggleLock => {
-                if let Some(ch) = cur {
-                    if !ctx.parental.is_unlocked(&ctx.config.parental) {
-                        ctx.open(OverlayRequest::Pin { then: Box::new(Action::ToggleLock), reason: "Enter your PIN to change locks".into() });
-                    } else {
-                        let item = channel_ref(&ch);
-                        let lock = !ch.locked;
-                        let _ = ctx.services.store.writer().submit_notify(DataScope::Overrides, move |c| {
-                            let mut ov = crate::store::user::item_override(c, &item)?.unwrap_or_default();
-                            ov.locked = lock;
-                            crate::store::user::set_item_override(c, &item, &ov)
-                        });
-                        let hint = pin_hint(ctx);
-                        ctx.toast(Toast::info(format!("{} “{}”{hint}", if lock { "Locked" } else { "Unlocked" }, ch.name)));
-                    }
+                    channel_item_action(ctx, &ch, action);
                 }
                 true
             }
@@ -1177,12 +1181,6 @@ impl LiveScreen {
             Action::OpenInGuide => {
                 if let Some(ch) = cur {
                     ctx.push(Route::Guide { collection: self.open_collection(), focus: Some(ch.id) });
-                }
-                true
-            }
-            Action::ShowDetails => {
-                if let Some(ch) = cur {
-                    ctx.open(OverlayRequest::EditItem(channel_ref(&ch)));
                 }
                 true
             }
@@ -1256,11 +1254,13 @@ impl LiveScreen {
                 return;
             }
         };
-        if ctx.config.interface.live_sort != SortMode::Provider {
+        if self.sort(ctx) != SortMode::Provider {
             ctx.edit_config(|c| c.interface.live_sort = SortMode::Provider);
             ctx.toast(Toast::info("Switched to custom order"));
-            // the list below already is in custom order: the sort change must not rebuild it
-            // from a library that doesn't carry the move yet
+            // the list below already is in custom order: neither this frame (old config) nor
+            // the sort change may rebuild it from a library that doesn't carry the move yet —
+            // the next move would save that order over this one
+            self.sort_pending = Some((SortMode::Provider, ctx.config.interface.live_sort));
             self.built = Some(Self::signature(ctx, SortMode::Provider));
             self.channels = ctx.lib.live.collection(&coll, ctx.favs, &ctx.lib.recent_channels, SortMode::Provider);
             self.rebuild_haystacks(ctx);
@@ -1774,7 +1774,7 @@ impl Screen for LiveScreen {
         if ctx.lib.built_at != 0 && ctx.lib.is_empty() {
             // "No playlists yet": Enter is the "Add playlist" button
             if action == Action::Activate {
-                ctx.navigate(crate::ui::NavRequest::Switch(Route::Onboarding(crate::ui::OnboardingStart::AddSource)));
+                ctx.push(Route::Onboarding(crate::ui::OnboardingStart::AddSource));
                 return true;
             }
             return false;
@@ -1805,7 +1805,7 @@ impl Screen for LiveScreen {
             if empty_state(ui, theme, glyphs::PLAYLIST, "No playlists yet", Some(EMPTY_LIBRARY_DETAIL), Some("Add playlist"))
                 .is_some_and(|r| r.clicked())
             {
-                ctx.navigate(crate::ui::NavRequest::Switch(Route::Onboarding(crate::ui::OnboardingStart::AddSource)));
+                ctx.push(Route::Onboarding(crate::ui::OnboardingStart::AddSource));
             }
             return;
         }

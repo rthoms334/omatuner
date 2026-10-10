@@ -255,6 +255,8 @@ pub struct EpgGridState {
     /// Displayed start times of pending reminders per channel (bell glyph).
     pub(crate) reminders: HashMap<ChannelId, HashSet<Timestamp>>,
     pub(crate) clock_24h: bool,
+    /// `interface.show_channel_numbers`: the channel column shows numbers (Wide).
+    pub(crate) show_numbers: bool,
     /// Programme under the pointer (the screen loads its description into `hover_detail`).
     pub(crate) hovered: Option<ProgrammeId>,
     pub(crate) hover_detail: Option<(ProgrammeId, String)>,
@@ -281,6 +283,7 @@ impl EpgGridState {
             avoid: None,
             reminders: HashMap::new(),
             clock_24h: true,
+            show_numbers: true,
             hovered: None,
             hover_detail: None,
             no_guide_label: None,
@@ -654,7 +657,7 @@ pub fn epg_grid(
         let row = state.rows[i].clone();
         // header (sticky channel column)
         let header = Rect::from_min_max(egui::pos2(rect.left(), y), egui::pos2(grid.left(), y + row_h));
-        paint_header(ui, &header_painter, theme, images, live, &row, header, focus_row);
+        paint_header(ui, &header_painter, theme, images, live, &row, header, focus_row, state.show_numbers);
         if pointer.is_some_and(|p| header.contains(p) && grid.y_range().contains(p.y)) {
             header_hit = Some(i);
         }
@@ -792,7 +795,9 @@ fn excerpt(s: &str, n: usize) -> String {
     format!("{}…", cut.trim_end())
 }
 
-/// Sticky channel column: logo (+ number + name at Wide, name at Medium, logo only Compact).
+/// Sticky channel column: logo (+ number + name at Wide, name at Medium, logo only Compact;
+/// the number only with `show_numbers`).
+#[allow(clippy::too_many_arguments)]
 fn paint_header(
     ui: &mut egui::Ui,
     p: &egui::Painter,
@@ -802,6 +807,7 @@ fn paint_header(
     row: &GuideRow,
     r: Rect,
     focus_row: bool,
+    show_numbers: bool,
 ) {
     let t = &theme.tokens;
     if !ui.is_rect_visible(r) {
@@ -826,7 +832,10 @@ fn paint_header(
     let mut x = logo_rect.right() + pad;
     let color = if focus_row { t.list_cursor_text } else { t.fg };
     let wide = r.width() >= 180.0 * theme.rem();
-    if wide && let Some(n) = ch.number {
+    if wide
+        && show_numbers
+        && let Some(n) = ch.number
+    {
         let nr = text(
             p,
             egui::pos2(x, r.center().y),

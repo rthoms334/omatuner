@@ -732,6 +732,37 @@ fn guide_says_a_channel_is_not_in_the_guide() {
     assert!(pushed(&h.state().t, &Route::EpgMapping { channel: Some(ids[2]) }));
 }
 
+/// The guide manages the focused channel like Live: Ctrl+I edits its information, Shift+F10
+/// opens its menu (shortcuts from the guide's own keys), and the menu's Hide writes like
+/// Live's Ctrl+H.
+#[test]
+fn guide_manages_the_focused_channel_like_live() {
+    let _one = one();
+    let (mut t, ids) = seeded(4, 0, None);
+    let key = format!("m3u:seed{:011}", 1);
+    let mut g = GuideScreen::default();
+    t.with_ctx(|ctx| g.on_enter(ctx, &Route::Guide { collection: None, focus: Some(ids[1]) }));
+    assert!(act(&mut t, &mut g, Action::ShowDetails));
+    assert!(matches!(opened(&t).as_slice(), [OverlayRequest::EditItem(r)] if r.key.0 == key), "{:?}", t.nav);
+    t.nav.clear();
+    assert!(act(&mut t, &mut g, Action::ContextMenu));
+    let menu = match opened(&t).as_slice() {
+        [OverlayRequest::ContextMenu(m)] => m.clone(),
+        other => panic!("{other:?}"),
+    };
+    let hide = menu.items.iter().find(|i| i.action == Action::ToggleHidden).expect("Hide");
+    assert_eq!(hide.shortcut.as_deref(), Some("Ctrl+H"));
+    assert!(menu.items.iter().any(|i| i.action == Action::ToggleLock) && menu.items.iter().any(|i| i.action == Action::Rename));
+    t.with_ctx(|ctx| g.on_overlay_result(ctx, tuner::ui::overlays::OverlayResult::Chosen(Action::ToggleHidden)));
+    let hidden =
+        |t: &TestUi| t.db.query_row("SELECT hidden FROM item_override WHERE item_key = ?1", [&key], |r| r.get::<_, bool>(0)).unwrap_or(false);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !hidden(&t) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(hidden(&t), "the focused channel is hidden");
+}
+
 /// Watch zaps through the zap list the opener put on the request.
 #[test]
 fn programme_popover_watch_uses_the_requested_zap_list() {
@@ -1158,16 +1189,16 @@ fn live_empty_states() {
     assert!(has(&h, "Everything here is hidden") && has(&h, "Show hidden"));
     drop(h);
 
-    // empty library → onboarding, by click or Enter
+    // empty library → onboarding, by click or Enter (pushed: Cancel / Esc come back here)
     let mut t = TestUi::new().unwrap();
     t.set_library(tuner::store::library::Library { built_at: 1, ..Default::default() });
     let mut s = LiveScreen::default();
     assert!(act(&mut t, &mut s, Action::Activate));
-    assert!(t.nav.iter().any(|n| matches!(n, NavRequest::Switch(Route::Onboarding(_)))), "{:?}", t.nav);
+    assert!(t.nav.iter().any(|n| matches!(n, NavRequest::Push(Route::Onboarding(_)))), "{:?}", t.nav);
     let mut g = GuideScreen::default();
     t.nav.clear();
     assert!(act(&mut t, &mut g, Action::Activate));
-    assert!(t.nav.iter().any(|n| matches!(n, NavRequest::Switch(Route::Onboarding(_)))), "guide: {:?}", t.nav);
+    assert!(t.nav.iter().any(|n| matches!(n, NavRequest::Push(Route::Onboarding(_)))), "guide: {:?}", t.nav);
     let mut h = screen_harness(t, LiveScreen::default(), 1600.0);
     h.step();
     assert!(has(&h, "No playlists yet"));
@@ -1200,6 +1231,16 @@ fn live_reorder_under_a_sort_moves_the_cursor_channel_in_custom_order() {
     }
     assert_eq!((order(&t, key(10)), order(&t, key(11))), (Some(11), Some(10)), "Channel 10 moved below Channel 11");
     assert_eq!(order(&t, key(2)), Some(2), "Channel 2 stays");
+    // Alt+↑ before the sort switch lands (key repeat, same frame): the list stays in custom
+    // order with the first move, so this one undoes it (it used to be rebuilt in the old sort
+    // and then from the library without the move, which the second move saved over)
+    act(&mut t, &mut s, Action::MoveUp);
+    assert_eq!(t.config_edits.len(), 1, "one sort switch");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while order(&t, key(10)) != Some(10) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!((order(&t, key(9)), order(&t, key(10)), order(&t, key(11))), (Some(9), Some(10), Some(11)), "back where it was");
     // the cursor stays on the moved channel: Shift+Enter plays it
     act(&mut t, &mut s, Action::ActivateAlt);
     player_until(&t, "the moved channel", plays(MediaRef::Channel(ids[10])));

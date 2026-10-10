@@ -1,6 +1,7 @@
 //! Movie detail (DESIGN §13.6): backdrop (dimmed), poster, title, year · duration · rating ·
 //! genre, plot, cast/director, buttons Play/Resume · Start over · Favourite · Mark watched.
-//! Loads details lazily (`JobKind::LoadMovieDetails`) with a skeleton state. Key context
+//! Loads details lazily (`JobKind::LoadMovieDetails`) with a skeleton state; a playlist (M3U)
+//! movie has none to load and shows a sparse page instead (DESIGN §27.7). Key context
 //! `[Detail]`. When a movie ends in the fullscreen player (marked watched by the player) the
 //! app leaves the player for its page, wherever it was started. Owner: WP-12.
 //!
@@ -380,6 +381,10 @@ impl Screen for MovieDetailScreen {
             return;
         }
         let m = self.movie.clone();
+        // DESIGN §27.7: only Xtream movies have details to load; a playlist's movie has a title,
+        // a poster and a category, and its page says so instead of waiting for more
+        let source = m.as_ref().map(|m| m.source_id).or(summary.as_ref().map(|s| s.source_id));
+        let sparse = !source.and_then(|s| ctx.lib.source(s)).is_some_and(|s| s.kind == SourceKind::Xtream);
         let backdrop = m.as_ref().and_then(|m| m.backdrop.clone());
         let poster_url = m.as_ref().and_then(|m| m.poster.clone()).or(summary.as_ref().and_then(|s| s.poster.as_deref().map(str::to_owned)));
         let title = self.title(ctx);
@@ -396,6 +401,14 @@ impl Screen for MovieDetailScreen {
         if let Some(g) = m.as_ref().and_then(|m| m.genre.clone()).filter(|g| !g.is_empty()) {
             meta.push(g);
         }
+        if sparse {
+            let groups = match (&m, &summary) {
+                (Some(m), _) => m.group_ids.as_slice(),
+                (None, Some(s)) => s.group_ids.as_slice(),
+                _ => &[],
+            };
+            meta.extend(sparse_meta(ctx, groups, source));
+        }
         let mut text = Vec::new();
         if let Some(m) = &m {
             if let Some(p) = m.plot.as_deref().filter(|p| !p.trim().is_empty()) {
@@ -408,7 +421,10 @@ impl Screen for MovieDetailScreen {
                 text.push((format!("Director: {d}"), true));
             }
         }
-        let loading = m.is_none() || self.loader.is_some() && m.as_ref().is_some_and(|m| m.details_loaded_at.is_none());
+        if sparse && text.is_empty() {
+            text.push((NO_DESCRIPTION.to_owned(), true));
+        }
+        let loading = !sparse && (m.is_none() || self.loader.is_some() && m.as_ref().is_some_and(|m| m.details_loaded_at.is_none()));
         let playing = ctx.player.playable.as_ref().is_some_and(|p| self.id.is_some_and(|id| p.media == MediaRef::Movie(id)));
         let buttons = self.buttons(ctx);
         let resume_at = self.resume_at(ctx);
@@ -463,6 +479,27 @@ impl Screen for MovieDetailScreen {
         }
         self.focus = self.focus.min(self.buttons(ctx).len().saturating_sub(1));
     }
+}
+
+/// Where a playlist movie or series has no plot (DESIGN §27.7).
+pub(super) const NO_DESCRIPTION: &str = "No description in this playlist";
+
+/// The meta of a page without provider details: its category (first group) and, with
+/// several playlists, which one it comes from.
+pub(super) fn sparse_meta(ctx: &UiCtx<'_>, group_ids: &[crate::model::GroupId], source: Option<crate::model::SourceId>) -> Vec<String> {
+    let vod = &ctx.lib.vod;
+    let mut v: Vec<String> = group_ids
+        .first()
+        .and_then(|g| vod.movie_groups.iter().chain(&vod.series_groups).find(|x| x.id == *g))
+        .map(|g| g.display_name().to_owned())
+        .into_iter()
+        .collect();
+    if ctx.lib.sources.len() > 1
+        && let Some(s) = source.and_then(|s| ctx.lib.source(s))
+    {
+        v.push(s.name.clone());
+    }
+    v
 }
 
 /// The shared header of the detail pages: dimmed backdrop, poster, title, meta, text blocks
@@ -611,6 +648,8 @@ pub(crate) mod tests {
                     fingerprint: Default::default(),
                 },
             )?;
+            // a playlist movie as the M3U import writes it: no plot, no details
+            c.execute("UPDATE movie SET plot = NULL, details_at = NULL WHERE id = ?1", [ids[1].0])?;
             Ok(ids)
         });
         let mut h = harness(t, one, MovieDetailScreen::default(), egui::vec2(1400.0, 900.0));
@@ -656,6 +695,11 @@ pub(crate) mod tests {
         h.state().t.services().bus.send(AppEvent::Player(PlayerEvent::Ended { item: Some(other), finished: false }));
         h.run_steps(1);
         assert!(h.state_mut().nav().is_empty());
+        // DESIGN §27.7: the playlist movie's page has nothing to load: year · category, and a
+        // muted "no description" where the plot (or a loading skeleton) would be
+        h.state_mut().enter(Route::MovieDetail(ids[1]));
+        until(&mut h, "the sparse page", |h| has_label(h, NO_DESCRIPTION));
+        assert!(has_label(&h, "1981 · ★ 1.0 · Movies"), "year · rating · category");
         // a vanished movie
         h.state_mut().enter(Route::MovieDetail(MovieId(999)));
         until(&mut h, "the missing state", |h| has_label(h, "This movie is no longer in your playlists"));
