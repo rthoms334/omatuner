@@ -17,14 +17,12 @@
 pub mod cli;
 pub mod config;
 pub mod error;
-#[allow(dead_code, unused_variables, unused_imports)] // WP stubs (see crate docs)
 pub mod logging;
 pub mod model;
 pub mod msg;
 pub mod paths;
 pub mod redact;
 
-#[allow(dead_code, unused_variables, unused_imports)] // WP stubs (see crate docs)
 pub mod ipc;
 #[allow(dead_code, unused_variables, unused_imports)] // WP stubs (see crate docs)
 pub mod jobs;
@@ -39,7 +37,6 @@ pub mod keymap;
 pub mod search;
 pub mod theme;
 
-#[allow(dead_code, unused_variables, unused_imports)] // WP stubs (see crate docs)
 pub mod platform;
 
 pub mod app;
