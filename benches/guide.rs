@@ -97,9 +97,10 @@ fn main() {
         budget.begin_frame();
         // holding ↓: one row per frame
         state.handle(Action::Down, &mut reader, &mut budget, now);
-        let out = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
+        let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
             epg_grid(ui, &theme, &mut images, &mut reader, &mut budget, &live, &mut state, metrics, now);
         });
+        out.textures_delta.clear(); // no renderer (epaint debug-asserts on unapplied deltas)
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
         std::hint::black_box(prims);
         if frame >= WARMUP {

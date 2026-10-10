@@ -5,7 +5,8 @@
 //!
 //! * an iptv-org style playlist (`x-tvg-url` header, `Name.cc@Feed` ids, a guide that covers
 //!   only a couple of its thousands of channels) → playlist + guide imported → matching →
-//!   now/next for exactly the covered channels, coverage numbers queryable;
+//!   now/next for exactly the covered channels, coverage numbers queryable; forced refreshes
+//!   of that guide keep its search index compact;
 //! * restart: an Xtream panel added through `AddSource`, services shut down and started again
 //!   on the same profile keep sources (with their secrets), favourites, history, progress,
 //!   overrides and settings; a refresh after the panel renumbered every stream then moves all
@@ -326,6 +327,20 @@ fn iptv_org_style_playlist_imports_its_guide_and_maps_only_the_covered_channels(
     }
     let unmapped = lib.live.channels.iter().find(|c| c.epg_channel_id.is_none()).expect("an unmapped channel");
     assert!(tuner::store::epg::epg_channel_for(&conn, unmapped.id).expect("query").is_none());
+
+    // daily refreshes of the same guide: the sweep leaves deleted entries in the search index
+    // ('deletemerge' is off), so the job must compact it or it grows with every refresh
+    let mut fts_pages = Vec::new();
+    for _ in 0..3 {
+        app.services().jobs.submit(JobKind::RefreshEpg { epg_source: epg, force: true });
+        match app.finished("forced guide refresh", |k| matches!(k, JobKind::RefreshEpg { .. })) {
+            Ok(JobOutcome::EpgRefreshed { not_modified: false, .. }) => {}
+            other => panic!("{other:?}"),
+        }
+        fts_pages.push(conn.query_row("SELECT count(*) FROM programme_fts_data", [], |r| r.get::<_, i64>(0)).expect("fts pages"));
+    }
+    assert_eq!(fts_pages[1], fts_pages[0], "{fts_pages:?}");
+    assert_eq!(fts_pages[2], fts_pages[0], "{fts_pages:?}");
     drop(conn);
     app.shutdown();
 }

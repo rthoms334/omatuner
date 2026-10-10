@@ -131,10 +131,11 @@ fn launch(seeded_db: &Path, root: &Path, view: Option<ViewArg>) -> Run {
     let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0));
     let mut run_frame = |app: &mut tuner::app::TunerApp| {
         let raw = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
-        let out = ctx.run_ui(raw, |ui| {
+        let mut out = ctx.run_ui(raw, |ui| {
             app.logic(ui.ctx(), &mut frame);
             app.ui(ui, &mut frame);
         });
+        out.textures_delta.clear(); // no renderer (epaint debug-asserts on unapplied deltas)
         std::hint::black_box(ctx.tessellate(out.shapes, out.pixels_per_point));
     };
     run_frame(&mut app);
@@ -195,7 +196,10 @@ fn main() {
     let mut firsts = Vec::new();
     for (label, view) in [("auto (Home)", None), ("live", Some(ViewArg::Live)), ("guide", Some(ViewArg::Guide))] {
         for i in 0..RUNS {
-            let r = launch(&db, &tmp.path().join(format!("run-{label}-{i}").replace(' ', "")), view);
+            let run_root = tmp.path().join(format!("run-{label}-{i}").replace(' ', ""));
+            let r = launch(&db, &run_root, view);
+            // each run copies the seeded database; keep at most one copy on disk
+            let _ = std::fs::remove_dir_all(&run_root);
             println!(
                 "launch {label:<11} #{i}: services {:>5.0} ms, first frame {:>5.0} ms, library in app {:>5.0} ms, frame with library {:>5.1} ms",
                 r.services.as_secs_f64() * 1e3,
@@ -209,6 +213,7 @@ fn main() {
     let worst_median = firsts.chunks(RUNS).map(|c| median(&mut c.to_vec())).max().unwrap_or_default();
     let ok = [gate("first frame (100k ch)", worst_median, FIRST_FRAME_GATE), gate("library load (100k ch)", load, LIBRARY_GATE)];
     if ok.contains(&false) {
+        drop(tmp); // `exit` skips destructors
         std::process::exit(1);
     }
 }

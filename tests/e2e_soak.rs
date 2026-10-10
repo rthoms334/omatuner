@@ -4,7 +4,9 @@
 //! through local test streams and scrolls the guide one row per frame. RSS is sampled every
 //! 100 zaps (after `malloc_trim`, so allocator retention is not counted); after a warm-up
 //! (caches, mpv demuxer buffers and egui galleys reach their steady size) it must stay within
-//! +10 % of the post-warm-up value.
+//! +10 % of the post-warm-up value. SQLite's heap is reported next to it and left out of the
+//! comparison: its page caches (up to 16 MB per reader, 32 MB for the writer) are bounded, so
+//! filling them is not a leak (measured: ≈ 1 MiB in this probe).
 //!
 //! Too slow for the normal gate (≈ 2 000 real stream loads), so it is ignored:
 //! `cargo test --release --test e2e_soak -- --ignored --nocapture`
@@ -48,6 +50,12 @@ fn rss_kib() -> u64 {
         .find_map(|l| l.strip_prefix("VmRSS:"))
         .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
         .unwrap_or(0)
+}
+
+/// Memory held by SQLite's allocator (page caches, statements) in KiB.
+fn sqlite_kib() -> u64 {
+    // SAFETY: reads SQLite's global memory counter; safe from any thread.
+    (unsafe { rusqlite::ffi::sqlite3_memory_used() }).max(0) as u64 / 1024
 }
 
 #[test]
@@ -111,10 +119,11 @@ fn memory_stays_flat_over_2000_zaps_and_guide_scrolls() {
             .unwrap_or_default();
         let mut raw = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
         app.raw_input_hook(&ctx, &mut raw);
-        let out = ctx.run_ui(raw, |ui| {
+        let mut out = ctx.run_ui(raw, |ui| {
             app.logic(ui.ctx(), &mut frame);
             app.ui(ui, &mut frame);
         });
+        out.textures_delta.clear(); // no renderer (epaint debug-asserts on unapplied deltas)
         std::hint::black_box(ctx.tessellate(out.shapes, out.pixels_per_point));
     };
     // let the startup library load land
@@ -159,12 +168,17 @@ fn memory_stays_flat_over_2000_zaps_and_guide_scrolls() {
             }
         }
         if z == warmup {
-            baseline = Some(rss_kib());
+            baseline = Some(rss_kib().saturating_sub(sqlite_kib()));
         }
         if z % 100 == 0 || z == zaps {
-            let rss = rss_kib();
-            samples.push((z, rss));
-            println!("zap {z:>5}: RSS {:>7.1} MiB ({scrolls} guide scrolls/frames, {failed} failed loads, {:.0} s)", rss as f64 / 1024.0, started.elapsed().as_secs_f64());
+            let (rss, sqlite) = (rss_kib(), sqlite_kib());
+            samples.push((z, rss.saturating_sub(sqlite)));
+            println!(
+                "zap {z:>5}: RSS {:>7.1} MiB, of which SQLite {:>5.1} MiB ({scrolls} guide scrolls/frames, {failed} failed loads, {:.0} s)",
+                rss as f64 / 1024.0,
+                sqlite as f64 / 1024.0,
+                started.elapsed().as_secs_f64()
+            );
         }
     }
     app.on_exit(None);
@@ -175,12 +189,12 @@ fn memory_stays_flat_over_2000_zaps_and_guide_scrolls() {
     let peak = samples.iter().filter(|(z, _)| *z >= warmup).map(|(_, r)| *r).max().unwrap_or(last);
     let growth = (last as f64 / baseline as f64 - 1.0) * 100.0;
     println!(
-        "soak: {zaps} zaps, {scrolls} guide scrolls in {:.0} s; RSS after warm-up {:.1} MiB, end {:.1} MiB ({growth:+.1} %), peak {:.1} MiB; {failed} loads failed",
+        "soak: {zaps} zaps, {scrolls} guide scrolls in {:.0} s; RSS without SQLite after warm-up {:.1} MiB, end {:.1} MiB ({growth:+.1} %), peak {:.1} MiB; {failed} loads failed",
         started.elapsed().as_secs_f64(),
         baseline as f64 / 1024.0,
         last as f64 / 1024.0,
         peak as f64 / 1024.0
     );
     assert!(failed * 20 <= zaps, "too many failed loads ({failed}) — the probe did not exercise playback");
-    assert!(last as f64 <= baseline as f64 * 1.10, "RSS grew {growth:+.1} % after warm-up (limit +10 %)");
+    assert!(last as f64 <= baseline as f64 * 1.10, "RSS without SQLite grew {growth:+.1} % after warm-up (limit +10 %)");
 }
