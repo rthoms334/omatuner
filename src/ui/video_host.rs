@@ -16,12 +16,24 @@
 //! (channel logo + name + spinner), Buffering (percent), Reconnecting (attempt n/max +
 //! countdown), Error (glyph + message + "r Retry · Backspace Last channel"), Radio (logo +
 //! now playing instead of black).
+//!
+//! The state overlay has no image cache, so "logo" is the channel monogram tile (the OSD of the
+//! fullscreen player shows the real logo). The mini-player is drawn as a card (theme colours
+//! for its title strip, OSD colours inside the video) and is NOT recorded as a placement: the
+//! app shows it only when no screen placed the video in the previous frame, so recording it
+//! would make it blink every other frame.
 
-use eframe::egui;
+use std::sync::Arc;
+use std::time::Instant;
+
+use eframe::egui::{self, Align2, Color32, FontId, Rect};
 use eframe::glow;
 
-use crate::player::{PlayerSnapshot, VideoSurface};
-use crate::theme::Theme;
+use crate::model::PlayableKind;
+use crate::player::{PlayerErrorKind, PlayerSnapshot, PlayerState, VideoSurface};
+use crate::theme::{SpaceToken, Theme, TypeToken, with_alpha};
+use crate::ui::LayoutClass;
+use crate::ui::widgets::{glyphs, logo};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Placement {
@@ -39,6 +51,8 @@ pub struct VideoHost {
     placed_this_frame: Placement,
     last_generation: u64,
     mini: Option<egui::Rect>,
+    /// `mini_player` ran since the last `begin_frame` (a rect nobody redraws is dropped).
+    mini_drawn: bool,
 }
 
 impl VideoHost {
@@ -48,6 +62,12 @@ impl VideoHost {
     pub fn begin_frame(&mut self) {
         self.placed = self.placed_this_frame;
         self.placed_this_frame = Placement::None;
+        // the mini-player wasn't drawn last frame (a screen placed the video, playback
+        // stopped, Compact…): toasts and the guide must stop avoiding its old rect
+        if !self.mini_drawn {
+            self.mini = None;
+        }
+        self.mini_drawn = false;
     }
 
     /// Where the video was shown last frame.
@@ -56,7 +76,8 @@ impl VideoHost {
     /// False when libmpv/GL failed at startup (no surface).
     pub fn available(&self) -> bool { self.surface.is_some() }
 
-    /// The mini-player rect drawn last frame (toasts and the guide avoid it).
+    /// The mini-player rect drawn this frame or the previous one (toasts and the guide avoid
+    /// it); `None` once a frame passed without the mini-player.
     pub fn mini_rect(&self) -> Option<egui::Rect> { self.mini }
 
     /// Render mpv into the FBO (from `App::logic`, GL current). Clears to black on new loads.
@@ -94,22 +115,154 @@ impl VideoHost {
                 theme.tokens.osd_text,
             );
         }
-        self.paint_state_overlay(ui, rect, theme, snap);
+        self.paint_state_overlay(ui, rect, placement, theme, snap);
         resp
     }
 
     /// Loading / buffering / reconnecting / error overlay (fixed dark scrim). WP-11.
-    fn paint_state_overlay(&self, ui: &mut egui::Ui, rect: egui::Rect, theme: &Theme, snap: &PlayerSnapshot) {
-        // WP-11: implement per module docs. Skeleton: nothing.
+    fn paint_state_overlay(&self, ui: &mut egui::Ui, rect: egui::Rect, placement: Placement, theme: &Theme, snap: &PlayerSnapshot) {
+        let t = &theme.tokens;
+        let p = ui.painter_at(rect);
+        let k = overlay_scale(rect);
+        let title_font = FontId::proportional((theme.font(TypeToken::Title) * k).round());
+        let body_font = FontId::proportional((theme.font(TypeToken::Body) * k).round());
+        let small_font = FontId::proportional((theme.font(TypeToken::BodySmall) * k).round());
+        let gap = theme.space(SpaceToken::Md) * k;
+        let title = snap.playable.as_ref().map(|p| p.title.as_str()).unwrap_or("");
+        let live = snap.playable.as_ref().is_none_or(|p| p.kind.is_live());
+        let time = ui.input(|i| i.time);
+        match &snap.state {
+            PlayerState::Idle => {}
+            PlayerState::Zapping { .. } | PlayerState::Loading { .. } => {
+                p.rect_filled(rect, 0.0, t.osd_scrim);
+                let detail = match &snap.state {
+                    PlayerState::Loading { attempt, .. } if *attempt > 0 => format!("Connecting… (attempt {})", attempt + 1),
+                    _ => "Connecting…".to_owned(),
+                };
+                let tile = 56.0 * k;
+                let block_h = tile + gap + title_font.size + gap + body_font.size + gap + 18.0 * k;
+                let mut y = rect.center().y - block_h / 2.0;
+                monogram_tile(&p, theme, Rect::from_center_size(egui::pos2(rect.center().x, y + tile / 2.0), egui::vec2(tile, tile)), title);
+                y += tile + gap;
+                osd_text(&p, egui::pos2(rect.center().x, y), Align2::CENTER_TOP, title, title_font.clone(), t.osd_text, rect.width() - 2.0 * gap);
+                y += title_font.size + gap;
+                osd_text(&p, egui::pos2(rect.center().x, y), Align2::CENTER_TOP, &detail, body_font, with_alpha(t.osd_text, 0.7), rect.width() - 2.0 * gap);
+                y += body_font_size(theme, k) + gap;
+                spinner(&p, egui::pos2(rect.center().x, y + 9.0 * k), 9.0 * k, t.osd_accent, time);
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+            }
+            PlayerState::Buffering { percent, .. } => {
+                let label = match percent {
+                    Some(pc) => format!("Buffering… {pc} %"),
+                    None => "Buffering…".to_owned(),
+                };
+                let pill = pill_rect(&p, rect, &label, body_font.clone(), theme, k);
+                p.rect_filled(pill, t.rounding, t.osd_scrim);
+                spinner(&p, egui::pos2(pill.left() + pill.height() / 2.0, pill.center().y), pill.height() * 0.25, t.osd_accent, time);
+                osd_text(&p, egui::pos2(pill.left() + pill.height(), pill.center().y), Align2::LEFT_CENTER, &label, body_font, t.osd_text, f32::INFINITY);
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+            }
+            PlayerState::Reconnecting { attempt, max, at, reason } => {
+                p.rect_filled(rect, 0.0, t.osd_scrim);
+                let secs = at.saturating_duration_since(Instant::now()).as_secs_f32().ceil() as u64;
+                let head = format!("Reconnecting… ({attempt}/{max})");
+                let detail = if secs > 0 { format!("{} · retrying in {secs} s", reason_label(*reason)) } else { format!("{} · retrying now", reason_label(*reason)) };
+                let hint = recovery_hint(placement, live, snap.previous_live.is_some(), true);
+                let lines = [(head.as_str(), title_font, t.osd_text), (detail.as_str(), body_font, with_alpha(t.osd_text, 0.7)), (hint, small_font, t.osd_accent)];
+                stacked(&p, rect, &lines, gap);
+                spinner(&p, egui::pos2(rect.center().x, rect.center().y - 3.0 * title_font_size(theme, k)), 10.0 * k, t.osd_accent, time);
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+            }
+            PlayerState::Error(e) => {
+                p.rect_filled(rect, 0.0, t.osd_scrim);
+                let (head, detail) = error_copy(e.kind, &e.message);
+                let hint = recovery_hint(placement, live, snap.previous_live.is_some(), false);
+                let glyph_font = FontId::proportional((theme.font(TypeToken::DisplayLarge) * k).round());
+                let lines = [
+                    (glyphs::WARNING, glyph_font, t.osd_accent),
+                    (head.as_str(), title_font, t.osd_text),
+                    (detail.as_str(), body_font, with_alpha(t.osd_text, 0.7)),
+                    (hint, small_font, t.osd_accent),
+                ];
+                stacked(&p, rect, &lines, gap);
+            }
+            PlayerState::Ended => {
+                p.rect_filled(rect, 0.0, t.osd_scrim);
+                let lines = [(title, title_font, t.osd_text), ("Finished", body_font, with_alpha(t.osd_text, 0.7))];
+                stacked(&p, rect, &lines, gap);
+            }
+            PlayerState::Playing | PlayerState::Paused => {
+                // audio-only (radio) streams: logo + now playing instead of black
+                let audio_only = snap.video_size.is_none() && snap.position.is_some_and(|s| s >= 1.0) && snap.tracks.video.is_empty();
+                if audio_only {
+                    let tile = 72.0 * k;
+                    let mut y = rect.center().y - (tile + gap + 2.0 * title_font.size) / 2.0;
+                    monogram_tile(&p, theme, Rect::from_center_size(egui::pos2(rect.center().x, y + tile / 2.0), egui::vec2(tile, tile)), title);
+                    y += tile + gap;
+                    osd_text(&p, egui::pos2(rect.center().x, y), Align2::CENTER_TOP, title, title_font.clone(), t.osd_text, rect.width() - 2.0 * gap);
+                    if let Some(sub) = snap.playable.as_ref().and_then(|p| p.subtitle.as_deref()) {
+                        osd_text(&p, egui::pos2(rect.center().x, y + title_font.size + gap), Align2::CENTER_TOP, sub, body_font, with_alpha(t.osd_text, 0.7), rect.width() - 2.0 * gap);
+                    }
+                }
+                if snap.state == PlayerState::Paused || snap.paused {
+                    let s = (36.0 * k).round();
+                    let r = Rect::from_center_size(rect.center(), egui::vec2(s * 1.6, s * 1.6));
+                    if !audio_only {
+                        p.rect_filled(r, t.rounding, t.osd_scrim);
+                        p.text(r.center(), Align2::CENTER_CENTER, glyphs::PAUSE, FontId::proportional(s), t.osd_text);
+                    }
+                }
+            }
+        }
     }
 
     /// Corner mini-player (app calls when nothing else placed the video, the screen allows it,
     /// the layout isn't Compact and `interface.mini_player` is on). Returns `Some(true)` = open
     /// fullscreen player, `Some(false)` = stop. Records [`VideoHost::mini_rect`].
-    /// SKELETON SAFE DEFAULT: draws nothing, returns `None`.
     pub fn mini_player(&mut self, ctx: &egui::Context, theme: &Theme, snap: &PlayerSnapshot) -> Option<bool> {
         self.mini = None;
-        None
+        if snap.state == PlayerState::Idle {
+            return None;
+        }
+        let total = mini_rect_for(ctx.content_rect(), theme)?;
+        let t = &theme.tokens;
+        let strip_h = mini_strip_height(theme);
+        let mut result = None;
+        let restore = self.placed_this_frame;
+        egui::Area::new(egui::Id::new("mini-player")).movable(false).order(egui::Order::Foreground).fixed_pos(total.min).show(ctx, |ui| {
+            ui.set_min_size(total.size());
+            let video = Rect::from_min_size(total.min, egui::vec2(total.width(), total.height() - strip_h));
+            let resp = self.paint(ui, video, Placement::Mini, theme, snap);
+            if resp.on_hover_text("Open the player").clicked() {
+                result = Some(true);
+            }
+            let strip = Rect::from_min_max(egui::pos2(total.left(), video.bottom()), total.max);
+            let p = ui.painter();
+            p.rect_filled(strip, 0.0, t.card_bg);
+            let pad = theme.space(SpaceToken::Lg);
+            let close = Rect::from_center_size(egui::pos2(strip.right() - strip_h / 2.0, strip.center().y), egui::vec2(strip_h, strip_h));
+            let title = snap.playable.as_ref().map(|p| p.title.as_str()).unwrap_or("");
+            let mut label = title.to_owned();
+            if let Some(n) = snap.playable.as_ref().and_then(|p| p.number) {
+                label = format!("{title} · {n}");
+            }
+            osd_text(p, egui::pos2(strip.left() + pad, strip.center().y), Align2::LEFT_CENTER, &label, FontId::proportional(theme.font(TypeToken::BodySmall)), t.fg, (close.left() - strip.left() - 2.0 * pad).max(0.0));
+            let cr = ui.interact(close, ui.id().with("mini-close"), egui::Sense::click());
+            cr.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Stop playback"));
+            if cr.hovered() {
+                p.rect_filled(close.shrink(2.0), t.rounding, t.fill_hover);
+            }
+            p.text(close.center(), Align2::CENTER_CENTER, glyphs::CLOSE, FontId::proportional(theme.font(TypeToken::Icon)), if cr.hovered() { t.accent } else { t.text_secondary });
+            if cr.clicked() {
+                result = Some(false);
+            }
+            p.rect_stroke(total, t.rounding, egui::Stroke::new(t.card_border_width.min(2.0), t.card_border), egui::StrokeKind::Outside);
+        });
+        // not a placement (see module docs)
+        self.placed_this_frame = restore;
+        self.mini = Some(total);
+        self.mini_drawn = true;
+        result
     }
 
     /// Free GL resources (from `App::on_exit`, before the player shuts down).
@@ -129,4 +282,185 @@ pub fn letterbox(rect: egui::Rect, video: Option<(i64, i64)>) -> egui::Rect {
     let (rw, rh) = (rect.width(), rect.height());
     let (tw, th) = if rw / rh > ar { (rh * ar, rh) } else { (rw, rw / ar) };
     egui::Rect::from_center_size(rect.center(), egui::vec2(tw, th))
+}
+
+/// Height of the mini-player's title strip.
+fn mini_strip_height(theme: &Theme) -> f32 { theme.space(SpaceToken::ControlHeight) + theme.space(SpaceToken::Sm) }
+
+/// Where the mini-player goes in a window: bottom-right above the status bar, 16:9, 320 pt
+/// (Wide) / 240 pt (Medium) × rem; none in Compact.
+pub(crate) fn mini_rect_for(screen: Rect, theme: &Theme) -> Option<Rect> {
+    let rem = theme.rem();
+    let w = match LayoutClass::from_width(screen.width(), rem) {
+        LayoutClass::Wide => 320.0,
+        LayoutClass::Medium => 240.0,
+        LayoutClass::Compact => return None,
+    } * rem;
+    let h = (w * 9.0 / 16.0).round() + mini_strip_height(theme);
+    let margin = theme.space(SpaceToken::PanelPadding);
+    let status = (26.0 * rem).round();
+    let max = egui::pos2(screen.right() - margin, screen.bottom() - status - margin);
+    Some(Rect::from_min_max(egui::pos2(max.x - w.round(), max.y - h), max))
+}
+
+/// Overlay type scale for a video rect: small in the mini-player, larger fullscreen.
+fn overlay_scale(rect: Rect) -> f32 { (rect.width() / 900.0).clamp(0.75, 1.6) }
+
+fn body_font_size(theme: &Theme, k: f32) -> f32 { (theme.font(TypeToken::Body) * k).round() }
+fn title_font_size(theme: &Theme, k: f32) -> f32 { (theme.font(TypeToken::Title) * k).round() }
+
+/// User-facing copy for a playback failure (DESIGN §11.4, §13.12): headline + detail.
+pub(crate) fn error_copy(kind: PlayerErrorKind, message: &str) -> (String, String) {
+    let detail = crate::redact::redact(message).into_owned();
+    let head = match kind {
+        PlayerErrorKind::HttpForbidden => "The provider refused the stream (account expired or too many connections)",
+        PlayerErrorKind::HttpNotFound => "Channel offline",
+        PlayerErrorKind::Drm => "DRM-protected — can't be played",
+        PlayerErrorKind::Timeout => "The stream didn't start in time",
+        PlayerErrorKind::Network => "Network error",
+        PlayerErrorKind::Stalled => "The stream stalled",
+        PlayerErrorKind::StreamEnded => "The stream ended",
+        PlayerErrorKind::Unsupported => "This stream's format isn't supported",
+        PlayerErrorKind::Resolve => "Couldn't open this item",
+        PlayerErrorKind::Budget => "Connection limit reached for this playlist",
+        PlayerErrorKind::HttpOther(_) | PlayerErrorKind::Mpv => "Playback failed",
+    };
+    let detail = if detail.is_empty() || detail == head { String::new() } else { detail };
+    (head.to_owned(), detail)
+}
+
+/// Short reason for the reconnect line.
+fn reason_label(kind: PlayerErrorKind) -> &'static str {
+    match kind {
+        PlayerErrorKind::HttpForbidden => "Refused by the provider",
+        PlayerErrorKind::HttpNotFound => "Not found",
+        PlayerErrorKind::Timeout => "Timed out",
+        PlayerErrorKind::Stalled => "Stalled",
+        PlayerErrorKind::StreamEnded => "Stream ended",
+        _ => "Connection lost",
+    }
+}
+
+/// The key hint under a failed / reconnecting stream. The player's keys (`r`, Backspace) only
+/// work in the fullscreen player: in the Live list `r` types into the filter and Backspace
+/// goes back a pane, so the preview and the mini-player name what works there.
+pub(crate) fn recovery_hint(placement: Placement, live: bool, has_last_channel: bool, reconnecting: bool) -> &'static str {
+    match placement {
+        Placement::Mini => "Click to open the player",
+        // Enter on a failed channel plays it again (`playing_channel` ignores the error);
+        // while reconnecting the player retries by itself
+        Placement::Preview if reconnecting => "Shift+Enter fullscreen",
+        Placement::Preview => "Enter retries · Shift+Enter fullscreen",
+        Placement::Fullscreen | Placement::None => match (reconnecting, live && has_last_channel) {
+            (true, true) => "r Retry now · Backspace Last channel",
+            (true, false) => "r Retry now",
+            (false, true) => "r Retry · Backspace Last channel",
+            (false, false) => "r Retry",
+        },
+    }
+}
+
+/// One OSD text line, elided.
+pub(crate) fn osd_text(p: &egui::Painter, pos: egui::Pos2, anchor: Align2, s: &str, font: FontId, color: Color32, max_w: f32) -> Rect {
+    let mut job = egui::text::LayoutJob::simple_singleline(s.to_owned(), font, color);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(max_w.max(0.0));
+    let g: Arc<egui::Galley> = p.layout_job(job);
+    let r = anchor.anchor_size(pos, g.size());
+    p.galley(r.min, g, color);
+    r
+}
+
+/// Lines stacked and centred in `rect`; each wraps to at most two rows (a long error
+/// headline keeps its tail — "…or too many connections" is the part users need).
+fn stacked(p: &egui::Painter, rect: Rect, lines: &[(&str, FontId, Color32)], gap: f32) {
+    let max_w = (rect.width() - 2.0 * gap).max(0.0);
+    let galleys: Vec<Arc<egui::Galley>> = lines
+        .iter()
+        .filter(|(s, _, _)| !s.is_empty())
+        .map(|(s, f, c)| {
+            let mut job = egui::text::LayoutJob::simple((*s).to_owned(), f.clone(), *c, max_w);
+            job.halign = egui::Align::Center;
+            job.wrap.max_rows = 2;
+            p.layout_job(job)
+        })
+        .collect();
+    let h: f32 = galleys.iter().map(|g| g.size().y).sum::<f32>() + gap * galleys.len().saturating_sub(1) as f32;
+    let mut y = rect.center().y - h / 2.0;
+    for g in galleys {
+        let gh = g.size().y;
+        // a centre-aligned galley is laid out around x = 0
+        p.galley(egui::pos2(rect.center().x, y), g, Color32::PLACEHOLDER);
+        y += gh + gap;
+    }
+}
+
+/// Monogram tile on the OSD scrim (logo stand-in).
+fn monogram_tile(p: &egui::Painter, theme: &Theme, r: Rect, name: &str) {
+    let t = &theme.tokens;
+    p.rect_filled(r, t.rounding, with_alpha(t.osd_text, 0.12));
+    p.text(r.center(), Align2::CENTER_CENTER, logo::monogram(name), FontId::proportional((r.height() * 0.4).round().max(6.0)), t.osd_text);
+}
+
+/// Rotating arc (OSD colours).
+fn spinner(p: &egui::Painter, c: egui::Pos2, r: f32, color: Color32, time: f64) {
+    let start = (time * 4.0) as f32;
+    let pts: Vec<egui::Pos2> = (0..=24).map(|i| start + i as f32 / 24.0 * std::f32::consts::PI * 1.5).map(|a| c + r * egui::vec2(a.cos(), a.sin())).collect();
+    p.add(egui::Shape::line(pts, egui::Stroke::new((r * 0.22).max(2.0), color)));
+}
+
+/// A pill at the bottom centre of `rect` sized for `label`.
+fn pill_rect(p: &egui::Painter, rect: Rect, label: &str, font: FontId, theme: &Theme, k: f32) -> Rect {
+    let g = p.layout_no_wrap(label.to_owned(), font, Color32::WHITE);
+    let h = g.size().y + 2.0 * theme.space(SpaceToken::Md) * k;
+    let w = g.size().x + h * 1.5;
+    Rect::from_center_size(egui::pos2(rect.center().x, rect.bottom() - h - theme.space(SpaceToken::Huge) * k), egui::vec2(w, h))
+}
+
+/// Is `kind` live TV (zapping applies)?
+pub(crate) fn is_live(kind: Option<&PlayableKind>) -> bool { kind.is_none_or(PlayableKind::is_live) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mini_rect_sits_bottom_right_above_the_status_bar() {
+        let th = Theme::fallback();
+        let wide = mini_rect_for(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0)), &th).unwrap();
+        assert_eq!(wide.width(), 320.0);
+        assert!(wide.right() < 1600.0 && wide.bottom() <= 900.0 - 26.0);
+        let medium = mini_rect_for(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(790.0, 600.0)), &th).unwrap();
+        assert_eq!(medium.width(), 240.0);
+        assert!(mini_rect_for(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 600.0)), &th).is_none());
+    }
+
+    #[test]
+    fn error_copy_per_kind() {
+        let (h, d) = error_copy(PlayerErrorKind::HttpForbidden, "HTTP 403");
+        assert!(h.contains("too many connections"));
+        assert_eq!(d, "HTTP 403");
+        assert_eq!(error_copy(PlayerErrorKind::HttpNotFound, "").0, "Channel offline");
+        assert!(error_copy(PlayerErrorKind::Drm, "x").0.starts_with("DRM"));
+    }
+
+    #[test]
+    fn recovery_hints_name_keys_that_work_where_the_video_is() {
+        assert_eq!(recovery_hint(Placement::Fullscreen, true, true, false), "r Retry · Backspace Last channel");
+        assert_eq!(recovery_hint(Placement::Fullscreen, true, false, false), "r Retry", "no last channel to go back to");
+        assert_eq!(recovery_hint(Placement::Fullscreen, false, true, true), "r Retry now");
+        // the Live list: `r` types into the filter, Backspace goes back a pane
+        for reconnecting in [false, true] {
+            let h = recovery_hint(Placement::Preview, true, true, reconnecting);
+            assert!(!h.contains("r Retry") && !h.contains("Backspace"), "{h}");
+        }
+        assert_eq!(recovery_hint(Placement::Mini, true, true, false), "Click to open the player");
+    }
+
+    #[test]
+    fn letterbox_fits() {
+        let r = letterbox(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 400.0)), Some((1920, 1080)));
+        assert_eq!(r.width(), 400.0);
+        assert_eq!(r.height(), 225.0);
+        assert_eq!(letterbox(r, None), r);
+    }
 }
