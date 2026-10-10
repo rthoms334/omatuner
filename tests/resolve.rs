@@ -655,10 +655,11 @@ fn catchup_subtitle_is_the_archived_programme() {
     assert_eq!(live.subtitle.as_deref(), Some("Show 10 on 0"));
 }
 
-/// WP-05a gap: the Xc flavour cannot parse an M3U live URL with a path before `live/`
-/// (`catchup::XC_RE`). Enable once `sources::catchup` accepts a path prefix.
+/// The Xc flavour cannot parse an M3U live URL with a path before `live/` (`catchup::XC_RE`
+/// follows DESIGN §10's `host/(live/)?u/p/id(.ext)`). Enable if the change request to accept a
+/// path prefix there is approved.
 #[test]
-#[ignore = "needs WP-05a: Xc catch-up with a path before live/"]
+#[ignore = "pending change request: catchup::XC_RE path prefix (beyond DESIGN §10)"]
 fn m3u_xc_catchup_with_a_path_prefix() {
     let s = store("resolve-m3u-xc-path");
     let src = m3u_source(&s, london());

@@ -413,14 +413,22 @@ fn local_path(addr: &str) -> Option<PathBuf> {
     Some(PathBuf::from(addr))
 }
 
-/// Display title of an ad-hoc network URL: the last path segment (percent-decoded), else the
+/// Display title of an ad-hoc network URL: the final path segment (percent-decoded), else the
 /// host. Never shows userinfo, the query or anything the redactor would hide.
+///
+/// Only the real final segment counts (a trailing `/` means there is none): stepping back to an
+/// earlier one could pick the password of `http://panel/live/user/pass/`. The segment must also
+/// survive redaction of the whole URL, which catches credentials that are only recognisable by
+/// their position (Xtream paths), not just registered secrets.
 fn url_title(addr: &str) -> String {
     let Ok(u) = url::Url::parse(addr) else { return "Stream".into() };
     let host = u.host_str().map(str::to_owned);
+    let redacted = url::Url::parse(&crate::redact::redact(u.as_str())).ok();
+    let redacted_last = redacted.as_ref().and_then(|r| r.path_segments()?.next_back());
     let segment = u
         .path_segments()
-        .and_then(|mut s| s.rfind(|s| !s.is_empty()))
+        .and_then(|mut s| s.next_back())
+        .filter(|s| !s.is_empty() && redacted_last == Some(*s))
         .map(percent_decode)
         .filter(|s| !s.trim().is_empty() && crate::redact::redact(s) == s.as_str());
     segment.or(host).unwrap_or_else(|| "Stream".into())
@@ -560,6 +568,12 @@ mod tests {
         let secret = "resolve-unit-secret-7f3a";
         crate::redact::register_secret(secret);
         assert_eq!(url_title(&format!("http://h/{secret}")), "h", "a secret segment is never a title");
+        // Unregistered Xtream credentials: a trailing `/` never steps back to the password, and a
+        // segment the full-URL redaction hides is not used.
+        assert_eq!(url_title("http://panel.example/live/user/pw-sekrit/"), "panel.example");
+        assert_eq!(url_title("http://panel.example:8080/user/pw-sekrit/"), "panel.example");
+        assert_eq!(url_title("http://h/live/user/pw/123.ts"), "123.ts");
+        assert_eq!(url_title("http://h/a/b/"), "h");
 
         assert!(is_local("/tmp/a.mp4") && is_local("a.mp4") && is_local("FILE:///tmp/a.mp4"));
         assert!(!is_local("http://h/a.mp4") && !is_local("rtmp://h/x"));
