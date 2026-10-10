@@ -15,7 +15,8 @@
 //!   `epg_urls` stays empty for Xtream (the guide URL carries the password and is created by
 //!   the import).
 //! * `add_source` validates nothing (the draft was probed); see the module docs of `jobs` for
-//!   the never-refreshed duplicate reuse.
+//!   the never-refreshed duplicate reuse. A reused row takes the retried draft (name, password,
+//!   User-Agent, settings…) before its import: the retry exists to fix those.
 
 use std::path::PathBuf;
 
@@ -76,7 +77,8 @@ pub async fn probe(ctx: &JobContext, draft: &SourceDraft, progress: &Progress, c
                     crate::redact::register_secret(&v);
                 }
             }
-            let dest = ctx.paths.playlist_cache().join(format!("probe-{}.m3u", blake3::hash(url.as_bytes()).to_hex().get(..16).unwrap_or("x")));
+            let digest = blake3::hash(url.as_bytes()).to_hex();
+            let dest = ctx.paths.playlist_cache().join(format!("probe-{}-{}.m3u", digest.get(..16).unwrap_or("x"), progress.id.0));
             let req = DownloadRequest {
                 url: url.to_owned().into(),
                 dest: dest.clone(),
@@ -158,17 +160,32 @@ fn same_locator(s: &Source, draft: &SourceDraft) -> bool {
         }
 }
 
+/// Overwrite the user-editable fields of `src` with `draft` (status, order and id stay).
+fn apply_draft(src: &mut Source, draft: &SourceDraft) {
+    src.name = draft.name.clone();
+    src.icon = draft.icon.clone();
+    src.color = draft.color;
+    src.url = draft.url.clone().map(Into::into);
+    src.path = draft.path.clone();
+    src.xtream = draft.xtream.clone();
+    src.settings = draft.settings.clone();
+}
+
 /// Insert the source and run its first refresh inline (progress continues on the same job).
 pub async fn add_source(ctx: &JobContext, draft: &SourceDraft, progress: &Progress, cancel: &CancellationToken) -> Result<SourceId> {
     check(cancel)?;
     let d = draft.clone();
     let reuse = read(ctx, move |c| {
-        Ok(crate::store::sources::list_sources(c)?.into_iter().find(|s| s.status.last_refresh.is_none() && same_locator(s, &d)).map(|s| s.id))
+        Ok(crate::store::sources::list_sources(c)?.into_iter().find(|s| s.status.last_refresh.is_none() && same_locator(s, &d)))
     })
     .await?;
     let id = match reuse {
-        Some(id) => {
+        Some(mut src) => {
             tracing::info!("adding {}: retrying the import of the source saved by an earlier attempt", draft.name);
+            apply_draft(&mut src, draft);
+            let id = src.id;
+            write(ctx, move |c| crate::store::sources::update_source(c, &src)).await?;
+            notify(ctx, DataScope::Sources);
             id
         }
         None => {

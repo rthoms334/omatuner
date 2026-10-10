@@ -1,8 +1,8 @@
 //! Background job system on the tokio runtime. Owner: WP-06. DESIGN §5.2, §9.
 //!
 //! * `JobManager::submit` is non-blocking and callable from any thread (UI included).
-//! * Identical jobs coalesce ONLY while the existing one is `Queued` or `Connecting` (it has not
-//!   read its inputs yet): the call returns its id (a `force` request upgrades it). Once it is
+//! * Identical jobs coalesce ONLY while the existing one is `Queued` or `Connecting` and has not
+//!   read its inputs yet: the call returns its id (a `force` request upgrades it). Once it is
 //!   further along, a `rerun` flag is set and the job is submitted again when it finishes —
 //!   a newer request is never dropped.
 //! * Concurrency limits (semaphores): playlist refreshes 2, EPG refreshes 1 (DB-write heavy),
@@ -23,9 +23,13 @@
 //! Details fixed by the implementation:
 //! * A job is `Queued` until it holds its semaphore permit; it turns `Connecting` (and reads its
 //!   — possibly upgraded — `JobKind`) atomically with respect to `submit`, so a coalesced request
-//!   is either merged into the job or rerun after it, never lost.
+//!   is either merged into the job or rerun after it, never lost. Refreshes stay `Connecting`
+//!   while they talk to the server, so they mark the moment they read their source row
+//!   (`Progress::mark_inputs_read`): from then on an identical request is rerun, not merged.
 //! * Merging: `RefreshSource`/`RefreshEpg` OR their `force` flags; every other kind takes the
-//!   newer request. A cancelled job drops its pending rerun (cancelling is the newer intent).
+//!   newer request. Cancelling a job drops the reruns requested before it; a request arriving
+//!   after the cancel (while the cancelled job winds down) becomes its rerun, so runs of one key
+//!   never overlap and that request is not lost.
 //! * Every failure is logged at WARN under target `tuner::jobs` as one redacted sentence
 //!   ("Couldn't refresh My IPTV: HTTP 404 from …"); the Jobs overlay lists these lines as
 //!   "Recent problems" (there is no separate job history). Cancellation is logged at INFO.
@@ -285,6 +289,8 @@ pub struct Progress {
     last_sent: Arc<Mutex<Instant>>,
     /// What the job works on ("My IPTV"), once known: label + failure sentence.
     subject: Arc<Mutex<Option<String>>>,
+    /// The job has read its inputs (source row…): identical requests no longer coalesce.
+    inputs_read: Arc<AtomicBool>,
 }
 
 impl Progress {
@@ -310,6 +316,7 @@ impl Progress {
             status: Arc::new(Mutex::new(status)),
             last_sent: Arc::new(Mutex::new(last)),
             subject: Arc::default(),
+            inputs_read: Arc::default(),
         }
     }
 
@@ -351,6 +358,12 @@ impl Progress {
     }
 
     fn subject(&self) -> Option<String> { lock(&self.subject).clone() }
+
+    /// Called right BEFORE a job reads the inputs a newer request could change (its source
+    /// row): a request submitted after this is rerun instead of merged into this run.
+    fn mark_inputs_read(&self) { self.inputs_read.store(true, Ordering::SeqCst); }
+
+    fn has_read_inputs(&self) -> bool { self.inputs_read.load(Ordering::SeqCst) }
 
     fn emit(&self, status: JobStatus, always: bool) {
         {
@@ -436,6 +449,24 @@ struct Entry {
     rerun: Option<JobKind>,
 }
 
+impl Entry {
+    /// Run `kind` once this job has finished (merged with an already pending rerun).
+    fn queue_rerun(&mut self, kind: JobKind) {
+        let rerun = match &self.rerun {
+            Some(r) => r.merged_with(&kind),
+            None => kind,
+        };
+        tracing::debug!("job {:?} busy; rerun queued", self.progress.id);
+        self.rerun = Some(rerun);
+    }
+
+    /// Cancel this run; requests made before the cancel go with it.
+    fn cancel_run(&mut self) {
+        self.cancel.cancel();
+        self.rerun = None;
+    }
+}
+
 /// Concurrency limits (DESIGN §5.2).
 struct Limits {
     playlists: Arc<Semaphore>,
@@ -488,20 +519,15 @@ impl JobManager {
         {
             let phase = lock(&e.progress.status).phase.clone();
             match phase {
+                // cancelled (winding down): never merge into it, run afterwards
+                _ if e.cancel.is_cancelled() => e.queue_rerun(kind),
                 JobPhase::Queued => {
                     // not started: the job will run the merged request
                     e.kind = e.kind.merged_with(&kind);
                     lock(&e.progress.status).kind = e.kind.clone();
                 }
-                JobPhase::Connecting if e.kind.merged_with(&kind) == e.kind => {}
-                _ => {
-                    let rerun = match &e.rerun {
-                        Some(r) => r.merged_with(&kind),
-                        None => kind,
-                    };
-                    tracing::debug!("job {id:?} busy; rerun queued");
-                    e.rerun = Some(rerun);
-                }
+                JobPhase::Connecting if !e.progress.has_read_inputs() && e.kind.merged_with(&kind) == e.kind => {}
+                _ => e.queue_rerun(kind),
             }
             return id;
         }
@@ -528,17 +554,17 @@ impl JobManager {
         id
     }
 
-    /// Request cancellation (no-op if finished).
+    /// Request cancellation (no-op if finished). Reruns requested so far are dropped.
     pub fn cancel(&self, id: JobId) {
-        if let Some(e) = lock(&self.inner.jobs).by_id.get(&id) {
-            e.cancel.cancel();
+        if let Some(e) = lock(&self.inner.jobs).by_id.get_mut(&id) {
+            e.cancel_run();
         }
     }
 
     /// Cancel everything (shutdown, backup restore).
     pub fn cancel_all(&self) {
-        for e in lock(&self.inner.jobs).by_id.values() {
-            e.cancel.cancel();
+        for e in lock(&self.inner.jobs).by_id.values_mut() {
+            e.cancel_run();
         }
     }
 
@@ -579,7 +605,7 @@ impl ManagerInner {
                 (kind, r)
             }
         };
-        self.finish(id, kind, result, &progress, &cancel);
+        self.finish(id, kind, result, &progress);
     }
 
     /// Leave `Queued`: read the (possibly merged) kind and turn `Connecting`, under the jobs
@@ -594,7 +620,7 @@ impl ManagerInner {
         Some(e.kind.clone())
     }
 
-    fn finish(&self, id: JobId, kind: JobKind, result: Result<JobOutcome>, progress: &Progress, cancel: &CancellationToken) {
+    fn finish(&self, id: JobId, kind: JobKind, result: Result<JobOutcome>, progress: &Progress) {
         let rerun = {
             let mut jobs = lock(&self.jobs);
             let entry = jobs.by_id.remove(&id);
@@ -625,7 +651,8 @@ impl ManagerInner {
             }
         };
         self.ctx.bus.send(AppEvent::Job(JobEvent::Finished { id, kind, outcome }));
-        if let Some(k) = rerun.filter(|_| !cancel.is_cancelled()) {
+        // (reruns of a cancelled job were requested after the cancel)
+        if let Some(k) = rerun {
             (self.ctx.submit)(k);
         }
     }

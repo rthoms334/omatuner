@@ -421,14 +421,23 @@ struct Panel {
     vod_broken: AtomicBool,
     /// Status of `get_live_streams` (0 = 200 with data).
     live_status: AtomicU16,
+    /// The API answers 403 to any other User-Agent (a provider's player filter).
+    required_ua: Mutex<Option<String>>,
 }
 
 async fn start_panel(panel: Arc<Panel>) -> (String, tokio::sync::oneshot::Sender<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let app = axum::Router::new().fallback(move |uri: Uri| {
+    let app = axum::Router::new().fallback(move |uri: Uri, headers: axum::http::HeaderMap| {
         let panel = panel.clone();
-        async move { panel_reply(&panel, &uri) }
+        async move {
+            let required = panel.required_ua.lock().unwrap().clone();
+            let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
+            match required {
+                Some(r) if uri.path() == "/player_api.php" && ua != Some(r.as_str()) => (StatusCode::FORBIDDEN, "").into_response(),
+                _ => panel_reply(&panel, &uri),
+            }
+        }
     });
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
@@ -577,6 +586,37 @@ async fn one_failing_kind_keeps_its_rows_while_the_others_import() {
     let err = h.refresh(source).await.expect_err("401");
     assert!(err.contains("login rejected"), "{err}");
     assert_eq!(h.scalar("SELECT count(*) FROM movie WHERE source_id = ?1", source).await, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn an_onboarding_retry_saves_the_corrected_draft() {
+    const UA: &str = "Tuner-e2e-player/2";
+    let panel = Arc::new(Panel::default());
+    *panel.required_ua.lock().unwrap() = Some(UA.into());
+    let (base, _stop) = start_panel(panel).await;
+    let h = harness();
+
+    // first attempt: the provider refuses the default User-Agent; the source stays saved
+    h.jobs.submit(JobKind::AddSource(xtream_draft("Picky", panel_creds(&base), false)));
+    let err = h.finished(|k| matches!(k, JobKind::AddSource(_))).await.1.expect_err("UA filtered");
+    assert_clean(&err);
+    let saved = h.scalar("SELECT max(id) FROM source WHERE ?1 = ?1", SourceId(0)).await;
+
+    // the retry names the User-Agent (and a new name): same row, updated, imported
+    let mut retry = xtream_draft("Picky TV", panel_creds(&base), false);
+    retry.settings.user_agent = Some(UA.into());
+    h.jobs.submit(JobKind::AddSource(retry));
+    let id = match h.finished(|k| matches!(k, JobKind::AddSource(_))).await.1 {
+        Ok(JobOutcome::SourceAdded(id)) => id,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(id.0, saved, "the source saved by the first attempt is reused");
+    assert_eq!(h.scalar("SELECT count(*) FROM source WHERE ?1 = ?1", id).await, 1);
+    let src = h.source(id).await;
+    assert_eq!(src.name, "Picky TV");
+    assert_eq!(src.settings.user_agent.as_deref(), Some(UA));
+    assert_eq!(src.status.counts.channels, 2);
+    assert!(src.status.last_refresh.is_some() && src.status.last_error.is_none(), "{:?}", src.status);
 }
 
 

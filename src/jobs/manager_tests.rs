@@ -1,6 +1,6 @@
 //! JobManager behaviour against a real temp store and a scripted local HTTP server:
-//! coalescing (Queued / Connecting / later → rerun), force upgrades, cancellation without a
-//! sweep, follow-up submits.
+//! coalescing (Queued / Connecting / later → rerun), force upgrades, cancellation (no sweep, no
+//! lost request), one import per source, follow-up submits, a guide that survives a late cancel.
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
@@ -11,7 +11,7 @@ use tokio::sync::watch;
 
 use super::*;
 use crate::config::Config;
-use crate::model::{SourceColor, SourceSettings};
+use crate::model::{EpgSourceKind, SourceColor, SourceSettings};
 use crate::sources::http::HttpOptions;
 
 /// How the scripted server answers one path.
@@ -21,6 +21,8 @@ enum Script {
     Hang,
     /// Send headers + the first 300 KiB, wait for the gate, then the rest.
     Gated(Arc<Vec<u8>>),
+    /// Wait for the gate, then answer 404 (the job stays `Connecting` until then).
+    Late404,
 }
 
 struct Server {
@@ -67,6 +69,10 @@ async fn server(scripts: HashMap<&'static str, Script>) -> Server {
                         let _ = gate_rx.wait_for(|open| *open).await;
                         let _ = sock.write_all(&body[split..]).await;
                         let _ = sock.shutdown().await;
+                    }
+                    Some(Script::Late404) => {
+                        let _ = gate_rx.wait_for(|open| *open).await;
+                        let _ = sock.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
                     }
                     None => {
                         let _ = sock.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
@@ -200,7 +206,8 @@ async fn coalesces_while_queued_or_connecting_and_upgrades_force() {
     // queued: same id, and a force request upgrades the waiting job
     assert_eq!(h.jobs.submit(refresh(c, true)), jc);
     assert_eq!(h.status(jc).unwrap().kind, refresh(c, true));
-    // connecting (inputs not read yet): an identical request coalesces silently
+    // A is still connecting but has read its source row: same id, a rerun is flagged (and
+    // dropped by the cancel below — requests made before a cancel go with it)
     assert_eq!(h.jobs.submit(refresh(a, false)), ja);
     assert_eq!(h.jobs.active().len(), 3);
     assert!(h.status(ja).unwrap().label.starts_with("Refreshing A"), "{:?}", h.status(ja));
@@ -329,4 +336,168 @@ async fn failures_finish_with_a_redacted_message_and_the_manager_keeps_going() {
     assert!(h.finished(|k| *k == refresh(SourceId(999), false)).await.1.is_err());
     h.jobs.submit(JobKind::RebuildLibrary);
     assert!(matches!(h.finished(|k| *k == JobKind::RebuildLibrary).await.1, Ok(JobOutcome::Library(_))));
+}
+
+fn probe_draft(url: &str) -> SourceDraft {
+    SourceDraft {
+        name: "Probe".into(),
+        kind: SourceKind::M3uUrl,
+        icon: String::new(),
+        color: SourceColor::Accent,
+        url: Some(url.into()),
+        path: None,
+        xtream: None,
+        settings: SourceSettings::default(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn a_connecting_job_that_has_not_read_inputs_absorbs_identical_requests() {
+    let srv = server(HashMap::from([("/late.m3u", Script::Late404)])).await;
+    let h = harness();
+    let kind = JobKind::ProbeSource(probe_draft(&format!("{}/late.m3u", srv.base)));
+    let job = h.jobs.submit(kind.clone());
+    h.wait_phase(job, |p| *p == JobPhase::Connecting).await;
+    assert_eq!(h.jobs.submit(kind.clone()), job);
+    assert_eq!(h.jobs.active().len(), 1);
+    srv.gate.send(true).unwrap();
+    let (id, outcome) = h.finished(|k| *k == kind).await;
+    assert_eq!(id, job);
+    assert!(outcome.is_err());
+    // merged, not rerun: one request reached the server
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(h.jobs.active().is_empty(), "{:?}", h.jobs.active());
+    assert_eq!(srv.hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn a_request_after_a_cancel_runs_once_the_cancelled_job_is_gone() {
+    let srv = server(HashMap::from([("/hang.m3u", Script::Hang)])).await;
+    let h = harness();
+    let a = h.add_url_source("A", &format!("{}/hang.m3u", srv.base)).await;
+    let first = h.jobs.submit(refresh(a, false));
+    h.wait_phase(first, |p| *p == JobPhase::Connecting).await;
+    h.jobs.cancel(first);
+    // "Refresh" clicked again right away, while the cancelled run still winds down
+    h.jobs.submit(refresh(a, true));
+    let (id, outcome) = h.finished(|k| matches!(k, JobKind::RefreshSource { .. })).await;
+    assert_eq!((id, outcome.unwrap_err()), (first, "Cancelled".to_owned()));
+
+    let mut second = None;
+    for _ in 0..2000 {
+        second = h.jobs.active().into_iter().find(|s| s.id != first && s.kind == refresh(a, true) && s.phase == JobPhase::Connecting);
+        if second.is_some() && srv.hits.load(Ordering::SeqCst) == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let second = second.expect("the newer request runs as a new job");
+    assert_eq!(srv.hits.load(Ordering::SeqCst), 2);
+    h.jobs.cancel_all();
+    let (id, outcome) = h.finished(|k| matches!(k, JobKind::RefreshSource { .. })).await;
+    assert_eq!((id, outcome.unwrap_err()), (second.id, "Cancelled".to_owned()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn imports_of_one_source_never_overlap() {
+    let body = Arc::new(playlist(50, "Ch"));
+    let srv = server(HashMap::from([("/slow.m3u", Script::Gated(body))])).await;
+    let h = harness();
+    let s = h.add_url_source("Slow", &format!("{}/slow.m3u", srv.base)).await;
+    let first = h.jobs.submit(refresh(s, false));
+    h.wait_phase(first, |p| matches!(p, JobPhase::Downloading { .. })).await;
+
+    // a second import of the same row under another job key (AddSource's inline refresh)
+    let ctx = h.jobs.context().clone();
+    let second = tokio::spawn(async move {
+        import_source::refresh_source(&ctx, s, true, &Progress::detached(), &CancellationToken::new()).await.map(|r| r.summary.channels.total)
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(srv.hits.load(Ordering::SeqCst), 1, "the second import waits for the first");
+    srv.gate.send(true).unwrap();
+
+    match h.finished(|k| matches!(k, JobKind::RefreshSource { .. })).await.1 {
+        Ok(JobOutcome::SourceRefreshed { summary, .. }) => assert_eq!(summary.channels.total, 50),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(second.await.unwrap().unwrap(), 50);
+    assert_eq!(srv.hits.load(Ordering::SeqCst), 2);
+    assert_eq!(h.count("SELECT count(*) FROM channel WHERE source_id = ?1", s), 50);
+    let cache = h.jobs.context().paths.playlist_cache();
+    assert_eq!(std::fs::read_dir(cache).unwrap().count(), 0);
+}
+
+/// An XMLTV guide of `channels` × `per_channel` one-hour programmes starting an hour ago.
+fn guide(channels: usize, per_channel: usize, title: &str) -> String {
+    let start = crate::model::now() - 3_600;
+    let fmt = |t: i64| format!("{} +0000", jiff::Timestamp::from_second(t).unwrap().strftime("%Y%m%d%H%M%S"));
+    let mut s = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<tv>\n");
+    for c in 0..channels {
+        s.push_str(&format!("<channel id=\"c{c}.tv\"><display-name>Channel {c}</display-name></channel>\n"));
+    }
+    for c in 0..channels {
+        for i in 0..per_channel {
+            let t = start + i as i64 * 3_600;
+            s.push_str(&format!(
+                "<programme start=\"{}\" stop=\"{}\" channel=\"c{c}.tv\"><title>{title} {i}</title></programme>\n",
+                fmt(t),
+                fmt(t + 3_600)
+            ));
+        }
+    }
+    s.push_str("</tv>\n");
+    s
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn a_cancel_after_the_flip_keeps_the_new_guide() {
+    let h = harness();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("guide.xml");
+    let (channels, per_channel) = (100, 300);
+    let total = (channels * per_channel) as i64;
+    std::fs::write(&file, guide(channels, per_channel, "Old")).unwrap();
+    let kind = EpgSourceKind::File { path: file.clone() };
+    let g = h.jobs.context().store.writer().run(move |c| crate::store::sources::insert_epg_source(c, "Guide", &kind, 0)).await.unwrap();
+    let epg = |force| JobKind::RefreshEpg { epg_source: g, force };
+    h.jobs.submit(epg(false));
+    assert!(h.finished(|k| matches!(k, JobKind::RefreshEpg { .. })).await.1.is_ok());
+    let scalar = |sql: &str| -> i64 { h.jobs.context().store.reader().unwrap().query_row(sql, [g], |r| r.get(0)).unwrap() };
+    let gen_sql = "SELECT active_gen FROM epg_source WHERE id = ?1";
+    let active_sql = "SELECT count(*) FROM programme p JOIN epg_source es ON es.id = p.epg_source_id
+                      WHERE es.id = ?1 AND p.gen = es.active_gen";
+    let gen0 = scalar(gen_sql);
+    assert_eq!(scalar(active_sql), total);
+
+    // the next import is cancelled the moment it flipped, while the old guide is being swept
+    std::fs::write(&file, guide(channels, per_channel, "New")).unwrap();
+    let job = h.jobs.submit(epg(true));
+    let mut cancelled_after_flip = false;
+    for _ in 0..20_000 {
+        if scalar(gen_sql) != gen0 {
+            cancelled_after_flip = h.status(job).is_some();
+            h.jobs.cancel(job);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(cancelled_after_flip, "the import finished before the test saw the flip");
+    match h.finished(|k| matches!(k, JobKind::RefreshEpg { .. })).await {
+        (id, Ok(JobOutcome::EpgRefreshed { summary, not_modified: false, .. })) => {
+            assert_eq!(id, job);
+            assert_eq!(i64::from(summary.programmes), total);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(scalar(active_sql), total, "the new guide is complete and active");
+    let new_titles = scalar(
+        "SELECT count(*) FROM programme p JOIN epg_source es ON es.id = p.epg_source_id
+         WHERE es.id = ?1 AND p.gen = es.active_gen AND p.title LIKE 'New %'",
+    );
+    assert_eq!(new_titles, total);
+
+    // whatever the cancel left of the old generation, maintenance sweeps it
+    h.jobs.submit(JobKind::Maintenance);
+    assert!(h.finished(|k| *k == JobKind::Maintenance).await.1.is_ok());
+    assert_eq!(scalar("SELECT count(*) FROM programme WHERE epg_source_id = ?1"), total);
 }

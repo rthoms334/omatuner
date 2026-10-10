@@ -27,9 +27,14 @@
 //!   is submitted right away, so Live TV is usable while movies and series still import.
 //! * Xtream group keys come from category NAMES (`identity::group_key`); streams whose category
 //!   is unknown go to an "Uncategorized" group.
+//! * One import per source at a time: `AddSource` runs `refresh_source` under its own job key, so
+//!   the manager's coalescing alone cannot keep it apart from a `RefreshSource` of the same row
+//!   (or from a second onboarding attempt). A per-source async lock serializes them, and each run
+//!   downloads to its own file (`<source>-<job>.m3u`).
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use tokio_util::sync::CancellationToken;
 
@@ -66,6 +71,13 @@ pub struct RefreshResult {
 }
 
 pub async fn refresh_source(ctx: &JobContext, source: SourceId, force: bool, progress: &Progress, cancel: &CancellationToken) -> Result<RefreshResult> {
+    let lock = source_lock(ctx, source);
+    let _running = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err(Error::Cancelled),
+        g = lock.lock_owned() => g,
+    };
+    progress.mark_inputs_read();
     let src = read(ctx, move |c| crate::store::sources::get_source(c, source)).await?;
     progress.set_subject(&src.name);
     let started = crate::model::now();
@@ -86,6 +98,16 @@ pub async fn refresh_source(ctx: &JobContext, source: SourceId, force: bool, pro
         }
     }
     result
+}
+
+/// The import lock of one source (keyed by database file too: tests run several stores in one
+/// process). Idle entries are dropped on the next lookup.
+fn source_lock(ctx: &JobContext, id: SourceId) -> Arc<tokio::sync::Mutex<()>> {
+    type Locks = HashMap<(PathBuf, SourceId), Arc<tokio::sync::Mutex<()>>>;
+    static LOCKS: LazyLock<Mutex<Locks>> = LazyLock::new(Mutex::default);
+    let mut locks = super::lock(&LOCKS);
+    locks.retain(|_, l| Arc::strong_count(l) > 1);
+    locks.entry((ctx.store.path().to_path_buf(), id)).or_default().clone()
 }
 
 /// Smart-name cleanup for this source (its own setting, else the global one).
@@ -181,7 +203,7 @@ async fn refresh_m3u(ctx: &JobContext, src: &Source, force: bool, cfg: &Config, 
         _ => {
             let url = src.url.clone().ok_or_else(|| Error::Config("this playlist has no URL".into()))?;
             progress.set(JobPhase::Connecting);
-            let dest = ctx.paths.playlist_cache().join(format!("{}.m3u", src.id.0));
+            let dest = ctx.paths.playlist_cache().join(format!("{}-{}.m3u", src.id.0, progress.id.0));
             let req = DownloadRequest {
                 url: url.clone(),
                 dest,
@@ -980,5 +1002,5 @@ mod tests {
         let rows = Rows::Channels(vec![ch; BATCH * 2 + 5]);
         let chunks = rows.into_chunks();
         assert_eq!(chunks.iter().map(Rows::len).collect::<Vec<_>>(), [BATCH, BATCH, 5]);
-            }
+    }
 }

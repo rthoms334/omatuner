@@ -3,8 +3,8 @@
 //! download (conditional, to `~/.cache/tuner/epg/<id>.xml[.gz]`) → `open_decompressed` →
 //! `xmltv::parse` on a blocking thread feeding a bounded channel (cap 4 batches) →
 //! async consumer submits `write_epg_channels` / `write_programmes` batches of 5 000 to the
-//! writer → `finish_epg_import` → re-match this EPG source against all playlist sources
-//! (`epg_match::match_all` + `replace_auto_mappings` + `resolve_mappings`) →
+//! writer → re-match this EPG source against all playlist sources (`epg_match::match_all` +
+//! `replace_auto_mappings`) → `finish_epg_import` (flip + `resolve_mappings`) →
 //! `sweep_old_generations` in chunks → `DataScope::Epg`.
 //! Back-pressure: the parser blocks when the channel is full, so memory stays bounded
 //! (~4 × 5 000 programmes) regardless of file size. Target: 415k programmes < 8 s total.
@@ -14,8 +14,13 @@
 //!   `resolve_mappings` then applies them in the same short flip transaction (one resolve pass,
 //!   and the returned `mapped_channels` already counts them). The matcher sees the new
 //!   generation's channels (`store::epg::epg_channels` includes an import in progress).
-//! * Any failure or cancellation after `begin_epg_import` runs `abort_epg_import`: the
-//!   previous guide stays active. Failures (not cancellations) are recorded in `last_error`.
+//! * Any failure or cancellation after `begin_epg_import` and BEFORE the flip runs
+//!   `abort_epg_import`: the previous guide stays active. If the automatic mappings were already
+//!   replaced from the aborted file, they are matched again against the active guide (best
+//!   effort, not cancellable). Failures (not cancellations) are recorded in `last_error`.
+//! * Once `finish_epg_import` committed, the new guide is live and is never aborted: the sweep of
+//!   the old generations is best effort (a cancellation or error defers it to the next import or
+//!   `Maintenance`, which sweep the rest), and the job reports success.
 //! * The downloaded file is deleted after the import (its URL may carry credentials, and the
 //!   ETag kept in the DB makes the next download conditional). Validators are stored only after
 //!   a successful import, so a failed one is retried in full.
@@ -54,6 +59,7 @@ pub struct EpgRefreshResult {
 }
 
 pub async fn refresh_epg(ctx: &JobContext, id: EpgSourceId, force: bool, progress: &Progress, cancel: &CancellationToken) -> Result<EpgRefreshResult> {
+    progress.mark_inputs_read();
     let src = read(ctx, move |c| crate::store::sources::get_epg_source(c, id)).await?;
     progress.set_subject(&src.name);
     let result = run(ctx, &src, force, progress, cancel).await;
@@ -116,10 +122,32 @@ async fn run(ctx: &JobContext, src: &EpgSource, force: bool, progress: &Progress
 
     let imp = write(ctx, move |c| store_epg::begin_epg_import(c, id)).await?;
     let abort_imp = EpgImport { channel_ids: Default::default(), ..imp.clone() };
-    match import(ctx, src, path, imp, &cfg, progress, cancel).await {
+    let now = crate::model::now();
+    let mut remapped = false;
+    let flipped = async {
+        let keep_days = read(ctx, super::db::max_catchup_days).await?.max(cfg.general.epg_keep_past_days);
+        let opts = XmltvOptions {
+            preferred_langs: preferred_langs(&cfg),
+            min_stop: Some(now - i64::from(keep_days) * 86_400),
+            max_start: Some(now + MAX_AHEAD_S),
+        };
+        let imp = write_guide(ctx, src, path, imp, opts, progress, cancel).await?;
+        progress.set(JobPhase::Matching);
+        remapped = true;
+        rematch_source(ctx, id, provider_of(src), cfg.epg.auto_name_match, cancel).await?;
+        progress.set(JobPhase::Finishing);
+        write(ctx, move |c| store_epg::finish_epg_import(c, &imp, now)).await
+    };
+    match flipped.await {
         Ok(summary) => {
-            if let Some((etag, lm)) = validators {
-                write(ctx, move |c| super::db::set_epg_validators(c, id, etag.as_deref(), lm.as_deref())).await?;
+            // the new guide is live from here on: nothing below may undo it
+            if let Err(e) = sweep_old(ctx, id, cancel).await {
+                tracing::info!(target: "tuner::jobs", "{}: removing the previous guide data was deferred ({e})", src.name);
+            }
+            if let Some((etag, lm)) = validators
+                && let Err(e) = write(ctx, move |c| super::db::set_epg_validators(c, id, etag.as_deref(), lm.as_deref())).await
+            {
+                tracing::warn!("storing the guide's download validators: {e}");
             }
             notify(ctx, DataScope::Epg);
             Ok(EpgRefreshResult { summary, not_modified: false })
@@ -128,8 +156,31 @@ async fn run(ctx: &JobContext, src: &EpgSource, force: bool, progress: &Progress
             if let Err(e2) = write(ctx, move |c| store_epg::abort_epg_import(c, &abort_imp)).await {
                 tracing::warn!("discarding the partial guide import: {e2}");
             }
+            if remapped {
+                restore_mappings(ctx, src, &cfg).await;
+            }
             Err(e)
         }
+    }
+}
+
+/// After an abort: automatic mappings were rebuilt from the discarded file; match the active
+/// guide again (not cancellable — the job is already winding down) and resolve.
+async fn restore_mappings(ctx: &JobContext, src: &EpgSource, cfg: &Config) {
+    let restored = async {
+        rematch_source(ctx, src.id, provider_of(src), cfg.epg.auto_name_match, &CancellationToken::new()).await?;
+        write(ctx, |c| store_epg::resolve_mappings(c)).await
+    };
+    if let Err(e) = restored.await {
+        tracing::warn!("{}: restoring the guide channel matches failed ({e}); use “Match again” in the guide settings", src.name);
+    }
+}
+
+/// The playlist source whose provider guide `src` is.
+fn provider_of(src: &EpgSource) -> Option<SourceId> {
+    match &src.kind {
+        EpgSourceKind::Provider { source_id, .. } => Some(*source_id),
+        _ => None,
     }
 }
 
@@ -148,24 +199,17 @@ enum EpgBatch {
     Programmes(Vec<ImportProgramme>),
 }
 
-/// Parse + write + match + flip + sweep. On error the caller aborts the import.
-async fn import(
+/// Parse the file and write its channels and programmes into the new generation (not active
+/// yet). On error the caller aborts the import.
+async fn write_guide(
     ctx: &JobContext,
     src: &EpgSource,
     path: PathBuf,
     mut imp: EpgImport,
-    cfg: &Config,
+    opts: XmltvOptions,
     progress: &Progress,
     cancel: &CancellationToken,
-) -> Result<EpgImportSummary> {
-    let id = src.id;
-    let now = crate::model::now();
-    let keep_days = read(ctx, super::db::max_catchup_days).await?.max(cfg.general.epg_keep_past_days);
-    let opts = XmltvOptions {
-        preferred_langs: preferred_langs(cfg),
-        min_stop: Some(now - i64::from(keep_days) * 86_400),
-        max_start: Some(now + MAX_AHEAD_S),
-    };
+) -> Result<EpgImport> {
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<EpgBatch>(CHANNEL_CAP);
     let parse_cancel = cancel.clone();
@@ -193,18 +237,7 @@ async fn import(
     if stats.skipped > 0 {
         tracing::info!("{}: skipped {} unusable programmes", src.name, stats.skipped);
     }
-
-    progress.set(JobPhase::Matching);
-    let provider_of = match &src.kind {
-        EpgSourceKind::Provider { source_id, .. } => Some(*source_id),
-        _ => None,
-    };
-    rematch_source(ctx, id, provider_of, cfg.epg.auto_name_match, cancel).await?;
-
-    progress.set(JobPhase::Finishing);
-    let summary = write(ctx, move |c| store_epg::finish_epg_import(c, &imp, now)).await?;
-    sweep_old(ctx, id, cancel).await?;
-    Ok(summary)
+    Ok(imp)
 }
 
 /// Blocking: parse into batches. Channels are flushed before the first following programme.
@@ -312,11 +345,7 @@ pub async fn rematch_all(ctx: &JobContext, progress: &Progress, cancel: &Cancell
     let guides = read(ctx, crate::store::sources::list_epg_sources).await?;
     let mut total = 0;
     for g in guides.iter().filter(|g| g.enabled) {
-        let provider_of = match &g.kind {
-            EpgSourceKind::Provider { source_id, .. } => Some(*source_id),
-            _ => None,
-        };
-        total += rematch_source(ctx, g.id, provider_of, cfg.epg.auto_name_match, cancel).await?;
+        total += rematch_source(ctx, g.id, provider_of(g), cfg.epg.auto_name_match, cancel).await?;
     }
     progress.set(JobPhase::Finishing);
     write(ctx, |c| store_epg::resolve_mappings(c)).await?;

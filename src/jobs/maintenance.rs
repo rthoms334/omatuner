@@ -3,8 +3,9 @@
 //! Details fixed by the implementation:
 //! * Maintenance prunes in chunks of 20 000 programmes (one writer transaction each, FTS rows
 //!   first — `store::epg::prune`), sweeps inactive EPG generations, runs `fts_cleanup`, trims the
-//!   image cache to 500 MiB, then `PRAGMA optimize` + a PASSIVE WAL checkpoint (TRUNCATE could
-//!   hold the writer while a reader is open). The finish time is kept in `meta` for the
+//!   image cache to 500 MiB, then `PRAGMA optimize` + `wal_checkpoint(TRUNCATE)` (DESIGN §7.4;
+//!   readers never keep statements open, and the busy timeout bounds the wait — a checkpoint
+//!   that could not finish is logged, not an error). The finish time is kept in `meta` for the
 //!   scheduler. History is already capped at 500 rows by `store::user::push_history`.
 //! * A backup export includes `config.toml` when it exists; a restore registers the restored
 //!   secrets with the redactor, emits `DataScope::All` and submits `RefreshSource` for every
@@ -32,7 +33,7 @@ pub async fn rebuild_library(ctx: &JobContext) -> Result<Arc<Library>> {
 }
 
 /// Prune programmes older than max(keep_past_days, max catch-up days), sweep inactive EPG
-/// generations, prune history, `PRAGMA optimize`, `wal_checkpoint(PASSIVE)`.
+/// generations, prune history, `PRAGMA optimize`, `wal_checkpoint(TRUNCATE)`.
 pub async fn maintenance(ctx: &JobContext, progress: &Progress, cancel: &CancellationToken) -> Result<()> {
     let cfg = crate::config::current(&ctx.config);
     let now = crate::model::now();
@@ -73,12 +74,16 @@ pub async fn maintenance(ctx: &JobContext, progress: &Progress, cancel: &Cancell
         Err(e) => tracing::warn!("trimming the image cache: {e}"),
     }
     check(cancel)?;
-    write(ctx, move |c| {
+    let busy = write(ctx, move |c| {
         c.execute_batch("PRAGMA optimize;")?;
-        c.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))?;
-        super::db::set_last_maintenance(c, now)
+        let busy: i64 = c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+        super::db::set_last_maintenance(c, now)?;
+        Ok(busy != 0)
     })
     .await?;
+    if busy {
+        tracing::info!("maintenance: the WAL checkpoint was cut short by an open reader");
+    }
     tracing::info!("maintenance done: {done} old programmes pruned");
     Ok(())
 }
