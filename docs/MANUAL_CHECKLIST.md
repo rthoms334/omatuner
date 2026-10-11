@@ -59,11 +59,32 @@ in `~/.config/omarchy/shell.toml`; Tuner applies it live).
   - **Do:** in a temporary copy of the checkout, run `cd packaging && makepkg -f` (no install).
   - **Expect:**
     - `prepare`, `build`, `check` (runs `tuner --version`) and `package` all succeed.
+    - It writes `packaging/omatuner-<version>-1-<arch>.pkg.tar.zst`.
     - The package contains `/usr/bin/tuner`, `/usr/share/applications/tuner.desktop`,
       `/usr/share/icons/hicolor/scalable/apps/tuner.svg`,
-      `/usr/share/tuner/{hypr/tuner.lua,omarchy/omarchy-menu.jsonc}` and
-      `/usr/share/doc/tuner/{README.md,DESIGN.md,MANUAL_CHECKLIST.md}`.
+      `/usr/share/tuner/{hypr/tuner.lua,omarchy/omarchy-menu.jsonc}`,
+      `/usr/share/doc/tuner/{README.md,DESIGN.md,MANUAL_CHECKLIST.md}` and
+      `/usr/share/licenses/omatuner/LICENSE` (`pacman -Qlp omatuner-*.pkg.tar.zst`).
     - `pkgver` matches `Cargo.toml`.
+- [ ] **CI and release workflows:**
+  - **Do:** check that the last CI run on `main` is green for both x86_64 and aarch64
+    (<https://github.com/rthoms334/omatuner/actions/workflows/ci.yml>). Before tagging, run the
+    release workflow by hand with `publish` off (`gh workflow run release.yml --ref main -f
+    publish=false`) and download its artifacts.
+  - **Expect:**
+    - Both architectures produce `omatuner-<version>-1-<arch>.pkg.tar.zst`,
+      `omatuner-<version>-<arch>.tar.gz` and their `.sha256` files.
+    - The tarball holds `tuner`, `tuner.desktop`, `tuner.svg`, the snippets, `README.md` and
+      `LICENSE`.
+- [ ] **Release package install** (after `git tag vX.Y.Z && git push origin vX.Y.Z`):
+  - **Do:** download the package for this machine and `SHA256SUMS` from
+    <https://github.com/rthoms334/omatuner/releases>, run
+    `sha256sum -c --ignore-missing SHA256SUMS`, then
+    `sudo pacman -U omatuner-<pkgver>-1-$(uname -m).pkg.tar.zst` (`<pkgver>` is the tag without
+    its `v` and the suffix's dash: `0.1.0` for `v0.1.0`, `0.1.0rc4` for `v0.1.0-rc4`).
+  - **Expect:** the checksum is OK, pacman installs it with its dependencies (a final release
+    over its pre-release is an upgrade, not a reinstall), and `tuner --version` prints the
+    tag's version without any pre-release suffix.
 - [ ] **Desktop file:**
   - **Do:** `desktop-file-validate packaging/tuner.desktop`.
   - **Expect:** no output and exit status 0.

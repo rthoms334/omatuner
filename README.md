@@ -1,5 +1,8 @@
 # Tuner
 
+[![CI](https://github.com/rthoms334/omatuner/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/rthoms334/omatuner/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/rthoms334/omatuner?include_prereleases)](https://github.com/rthoms334/omatuner/releases)
+
 Tuner is a keyboard-first IPTV player for [Omarchy](https://omarchy.org) (Hyprland). It plays
 live TV, catch-up, movies and series from M3U playlists and Xtream Codes accounts, and has an
 XMLTV programme guide. It looks like the rest of your Omarchy desktop: colours follow the
@@ -83,19 +86,45 @@ on-screen controls, and a light theme (catppuccin-latte).
 
 ## Build and install
 
-### As an Arch package (recommended on Omarchy)
+The project and its Arch package are called **omatuner**; the app is *Tuner* and the command is
+`tuner`.
+
+### From a GitHub Release (recommended on Omarchy)
+
+Each [release](https://github.com/rthoms334/omatuner/releases) has Arch packages for x86_64 and
+aarch64 (Asahi), plain binary tarballs, and a `SHA256SUMS` file. Download the package for your
+machine (`uname -m`) and install it with pacman, which also pulls in the dependencies (mpv,
+fontconfig, JetBrains Mono Nerd Font, …):
 
 ```sh
-cd packaging
+sha256sum -c --ignore-missing SHA256SUMS
+sudo pacman -U omatuner-0.1.0-1-x86_64.pkg.tar.zst     # or …-aarch64.pkg.tar.zst
+```
+
+The package installs:
+
+- `/usr/bin/tuner`
+- the desktop entry and icon
+- the opt-in snippets under `/usr/share/tuner/`
+- this README and the design notes under `/usr/share/doc/tuner/`, the licence under
+  `/usr/share/licenses/omatuner/`
+
+`omatuner-<version>-<arch>.tar.gz` holds the same binary, desktop entry, icon, snippets, README
+and LICENSE for other setups. The binary links against the system libmpv, so install `mpv`
+first. Copy `tuner` to a directory on your session PATH (e.g. `~/.local/bin`), then install the
+desktop entry and icon as described under [With cargo](#with-cargo).
+
+### Build the Arch package from source
+
+```sh
+git clone https://github.com/rthoms334/omatuner.git
+cd omatuner/packaging
 makepkg -si          # builds this checkout, smoke-tests the binary, installs the package
 ```
 
 - `makepkg --nocheck -si` skips the smoke test. The test suite is `cargo test` (see Development).
-- The package installs:
-  - `/usr/bin/tuner`
-  - the desktop entry and icon
-  - the opt-in snippets under `/usr/share/tuner/`
-  - this README and the design notes under `/usr/share/doc/tuner/`
+- The PKGBUILD builds the checkout it sits in (no download of the app itself), so check out the
+  tag you want first, e.g. `git checkout v0.1.0`.
 
 ### With cargo
 
@@ -802,6 +831,17 @@ scripts/gen-big-fixtures.py                   # 100k-channel M3U + 415k-programm
 
 - The architecture, data model and decisions are in [`docs/DESIGN.md`](docs/DESIGN.md).
 - The manual release checklist is [`docs/MANUAL_CHECKLIST.md`](docs/MANUAL_CHECKLIST.md).
+- **CI** (`.github/workflows/ci.yml`) runs on every pull request and push to `main`, natively on
+  x86_64 and aarch64 in Arch Linux (ARM) containers: `cargo fmt --check`, clippy with
+  `-D warnings`, the build, and `cargo test` with ffmpeg test media under a D-Bus session bus.
+- **Releases** (`.github/workflows/release.yml`): pushing a tag `vX.Y.Z` (matching `Cargo.toml`
+  and the PKGBUILD's `pkgver`) builds the PKGBUILD with makepkg on both architectures and
+  publishes a GitHub Release with the packages, tarballs and `SHA256SUMS`. A tag with a suffix
+  (`v0.1.1-rc1` for version 0.1.1; lowercase letters, digits and dots, starting with a letter)
+  becomes a pre-release whose package version is `0.1.1rc1`, which pacman orders before `0.1.1`,
+  so the final release upgrades it. *Run workflow* with `publish` off is a dry run that only
+  uploads the files as workflow artifacts; pull requests that change `packaging/`, `Cargo.*` or
+  the workflow get the same dry run.
 
 ## Licence
 
