@@ -134,6 +134,8 @@ const MENU_COUNTRIES: u8 = 23;
 const MENU_EXPLICIT: u8 = 24;
 /// A fanned-out copy's "Not the same title".
 const MENU_SPLIT: u8 = 25;
+/// "Same title as…" (DESIGN §29.16).
+const MENU_SAME_TITLE: u8 = 26;
 /// "Play from…": copy `k` of the menu is `MENU_COPY + k`.
 const MENU_COPY: u8 = 40;
 /// Copies listed in "Play from…".
@@ -830,6 +832,12 @@ impl VodBrowser {
         } else if self.stacked && copies.len() > 1 {
             items.push(MenuItem { shortcut: None, ..mi(glyphs::CLOSE, "Not the same title", Action::Digit(MENU_SPLIT), "") });
         }
+        // combine it with a title the matcher kept apart (copies combine in All; with two
+        // playlists of this kind or more)
+        let kind = if self.movies { ItemKind::Movie } else { ItemKind::Series };
+        if st::combine(ctx.config) && ctx.lib.eligible(kind).len() > 1 {
+            items.push(MenuItem { shortcut: None, ..mi(glyphs::PLAYLIST, "Same title as…", Action::Digit(MENU_SAME_TITLE), "") });
+        }
         let fav =
             fav || (stack.is_some() && copies.iter().any(|c| self.all(ctx).get(*c as usize).is_some_and(|x| ctx.favs.is_fav(&st::item_ref(x)))));
         items.extend([
@@ -891,25 +899,9 @@ impl VodBrowser {
                 Action::MarkWatched => ctx.toast(crate::msg::Toast::info("Open the series to mark its episodes watched")),
                 Action::Remove if self.open == Cat::Continue && self.movies => crate::ui::copies::mark_watched(ctx, &plan, &v.name, false),
                 Action::Remove if self.open == Cat::Continue => crate::ui::copies::forget_series(ctx, &plan),
-                Action::ToggleLock => {
-                    let (all, groups) = (self.all(ctx), self.all_groups(ctx));
-                    let copies: Vec<&VodSummary> = plan.copies.iter().filter_map(|c| all.get(c.item as usize)).collect();
-                    // every copy is locked (its own lock or a category's): unlock them, else lock them
-                    let on = !copies.iter().all(|x| x.locked);
-                    let by_group = !on && copies.iter().any(|x| kit::any_group_locked(groups, &x.group_ids));
-                    if kit::may_change_locks(ctx) {
-                        if by_group {
-                            ctx.toast(crate::msg::Toast::info("A copy is locked by its category — unlock the category with Ctrl+L"));
-                        }
-                        crate::ui::copies::set_locked(ctx, &plan, on);
-                    }
-                }
+                Action::ToggleLock => crate::ui::copies::toggle_lock(ctx, &plan, self.movies),
                 Action::ToggleHidden => crate::ui::copies::hide(ctx, &plan, &v.name),
-                Action::Rename => ctx.open(OverlayRequest::Rename(crate::ui::overlays::RenameSpec {
-                    title: "Rename every copy".into(),
-                    initial: v.name.to_string(),
-                    target: crate::ui::overlays::RenameTarget::Copies { items: plan.refs() },
-                })),
+                Action::Rename => crate::ui::copies::rename_dialog(ctx, &plan, &v.name),
                 Action::AddToList => kit::list_picker(ctx, &item, &v.name),
                 Action::ShowDetails => self.open_item(ctx, &v, false),
                 _ => kit::not_here(ctx),
@@ -1254,6 +1246,11 @@ impl VodBrowser {
             OverlayResult::Chosen(Action::Digit(MENU_SPLIT)) => {
                 if let Some(v) = self.current(ctx) {
                     crate::ui::copies::split(ctx, &st::item_ref(&v), &v.name);
+                }
+            }
+            OverlayResult::Chosen(Action::Digit(MENU_SAME_TITLE)) => {
+                if let Some(v) = self.current(ctx) {
+                    crate::ui::copies::same_title_picker(ctx, st::item_ref(&v), &v.name);
                 }
             }
             OverlayResult::Chosen(Action::FanOut) => self.toggle_fan(ctx, self.grid.cursor),
@@ -2162,7 +2159,7 @@ mod tests {
         let fav = |h: &egui_kittest::Harness<'_, testkit::App<MoviesScreen>>, r: crate::model::ItemRef| h.state().t.favs.is_fav(&r);
         assert!(!fav(&h, named(a, 1)) && !fav(&h, named(b, 0)), "every copy left Favourites");
         let toast = h.state_mut().undo_toast().expect("an Undo toast");
-        assert_eq!(toast.text, "Removed from Favourites");
+        assert_eq!(toast.text, "Removed from Favourites in Alpha and Bravo");
         h.state_mut().act(toast.action.unwrap().1);
         until(&mut h, "Undo puts them back", |h| {
             let favs = crate::store::library::load_favs(&h.state().t.services().store.reader().unwrap()).unwrap();

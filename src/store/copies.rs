@@ -11,6 +11,7 @@
 //! | Lock / unlock | every copy ([`lock`]) |
 //! | Hide | every copy ([`hide`]) |
 //! | Rename | copies without their own rename ([`rename`]); [`rename_conflicts`] lists the others to ask about |
+//! | Same title as… | a join of two copies and their stacks ([`join`], P3) |
 //! | Progress | the copy being played (the player saves it as before) |
 //!
 //! Every action returns an [`Undo`]: the rows of its table as they were, put back exactly by
@@ -305,6 +306,479 @@ pub fn same_episode(conn: &Connection, series: SeriesId, season: u32, episode: u
 }
 
 // ---------------------------------------------------------------------------------------------
+// Series: episodes matched across copies (P3)
+
+/// The series copies among `ids` whose episodes aren't loaded yet: Xtream series load them
+/// lazily (`JobKind::LoadSeriesDetails`); a playlist's series has them from its import.
+pub fn unloaded_series(conn: &Connection, ids: &[SeriesId]) -> Result<Vec<SeriesId>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT s.details_at IS NULL AND src.kind = 'xtream' AND NOT EXISTS (SELECT 1 FROM episode e WHERE e.series_id = s.id)
+         FROM series s JOIN source src ON src.id = s.source_id WHERE s.id = ?1",
+    )?;
+    let mut out = Vec::new();
+    for &id in ids {
+        if stmt.query_row([id], |r| r.get::<_, bool>(0)).optional()?.unwrap_or(false) {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+/// The watch progress of the episodes of the series copies `ids`, matched by (season,
+/// episode): a watched mark wins (any copy watched → watched), else the latest progress.
+pub fn episode_progress(conn: &Connection, ids: &[SeriesId]) -> Result<HashMap<(u32, u32), crate::model::WatchProgress>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT e.season, e.episode, {} FROM watch_progress p JOIN episode e ON e.source_id = p.source_id AND e.key = p.item_key
+         WHERE p.kind = 'episode' AND e.series_id = ?1",
+        user::PROGRESS_COLS.split(", ").map(|c| format!("p.{c}")).collect::<Vec<_>>().join(", ")
+    ))?;
+    let mut out: HashMap<(u32, u32), crate::model::WatchProgress> = HashMap::new();
+    for &id in ids {
+        let rows = stmt.query_map([id], |r| {
+            let at = (r.get::<_, u32>(0)?, r.get::<_, u32>(1)?);
+            // the progress columns follow the two episode columns
+            let p = user::progress_from_offset(r, 2)?;
+            Ok((at, p))
+        })?;
+        for row in rows {
+            let (at, p) = row?;
+            match out.get(&at) {
+                Some(have) if (have.finished, have.updated_at) >= (p.finished, p.updated_at) => {}
+                _ => {
+                    out.insert(at, p);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Mark the episodes `eps` (season, episode) of every series copy in `copies` watched, or
+/// forget their progress (`on` false) — the series page's ✓ and "Mark season watched" on a
+/// combined series. Episodes are matched by season and number (a copy that lacks one is
+/// skipped). Returns the Undo (the rows as they were) and how many episodes it wrote.
+pub fn mark_episodes(conn: &Connection, copies: &[SeriesId], eps: &[(u32, u32)], on: bool, now: Timestamp) -> Result<(Undo, usize)> {
+    atomic(conn, |c| {
+        let mut items: Vec<(ItemRef, String)> = Vec::new();
+        let mut find = c.prepare_cached(
+            "SELECT e.source_id, e.key, COALESCE(NULLIF(e.title, ''), 'Episode ' || e.episode) FROM episode e
+             WHERE e.series_id = ?1 AND e.season = ?2 AND e.episode = ?3 ORDER BY e.id LIMIT 1",
+        )?;
+        for &s in copies {
+            for &(season, number) in eps {
+                if let Some((source, key, title)) = find
+                    .query_row(params![s, season, number], |r| Ok((r.get::<_, SourceId>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+                    .optional()?
+                {
+                    let title = format!("S{season:02}E{number:02} · {title}");
+                    items.push((ItemRef { source, kind: ItemKind::Episode, key: ItemKey(key) }, title));
+                }
+            }
+        }
+        let refs: Vec<ItemRef> = items.iter().map(|(r, _)| r.clone()).collect();
+        let before = snapshot(c, Table::Progress, &refs)?;
+        let mut del = c.prepare_cached("DELETE FROM watch_progress WHERE source_id = ?1 AND kind = 'episode' AND item_key = ?2")?;
+        let mut up = c.prepare_cached(
+            "INSERT INTO watch_progress(source_id, kind, item_key, position_s, finished, updated_at, title, fp)
+             VALUES (?1, 'episode', ?2, 0, 1, ?3, ?4, COALESCE(?5, '{}'))
+             ON CONFLICT(source_id, kind, item_key) DO UPDATE SET finished = 1, updated_at = excluded.updated_at,
+               title = excluded.title, fp = COALESCE(?5, watch_progress.fp)",
+        )?;
+        for (r, title) in &items {
+            if on {
+                let fp = user::fingerprint_of(c, r)?;
+                up.execute(params![r.source, r.key.as_str(), now, title, crate::store::sql::fp_opt(&fp)])?;
+            } else {
+                del.execute(params![r.source, r.key.as_str()])?;
+            }
+        }
+        Ok((before, items.len()))
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Deleting a playlist: moving its favourites and progress to another playlist's copy (P3)
+
+/// How a copy in another playlist was found to be the same title.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchedBy {
+    Tmdb,
+    /// Same match key and the same known year.
+    KeyYear,
+    /// The user combined them ("Same title as…").
+    Joined,
+}
+
+/// One title (or episode) whose data can move to another playlist's copy.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MoveItem {
+    pub from: ItemRef,
+    pub to: ItemRef,
+    /// "Dune (2021)", "Severance S01E03".
+    pub title: String,
+    /// The copy's own title when it reads differently ("Dune: Part One (2021)", a TMDB or
+    /// joined match), else `None`.
+    pub to_title: Option<String>,
+    /// The movie or series it belongs to in the deleted playlist (an episode's series): the
+    /// dialog doesn't name a title concealed while the session is locked.
+    pub title_ref: ItemRef,
+    pub matched: MatchedBy,
+    /// Favourites lists holding it.
+    pub lists: Vec<FavListId>,
+    /// Its progress row (position, watched) when the plan was made; [`move_titles`] moves the
+    /// row as it is when it runs.
+    pub progress: Option<crate::model::WatchProgress>,
+}
+
+/// Something [`move_plan`] can't move, with why.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CantMove {
+    /// "Dune (2021)", "1 channel favourite".
+    pub what: String,
+    /// "no copy in another playlist", "channels aren't matched across playlists".
+    pub why: String,
+    /// The movie or series it is about (`None` for channels): the dialog doesn't name a
+    /// concealed one.
+    pub title_ref: Option<ItemRef>,
+}
+
+/// What [`move_plan`] found for a playlist about to be deleted.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MovePlan {
+    pub items: Vec<MoveItem>,
+    pub cannot: Vec<CantMove>,
+    /// Series copies (in other playlists) whose episodes must load before their episodes'
+    /// progress can move.
+    pub waiting: Vec<SeriesId>,
+    /// The episodes that wait for them ("Severance S01E03") with their series.
+    pub pending: Vec<(String, ItemRef)>,
+}
+
+impl MovePlan {
+    /// Anything to say about the user's data (the dialog shows its move section).
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty() && self.cannot.is_empty() && self.pending.is_empty()
+    }
+}
+
+/// A movie or series row's matching facts.
+#[derive(Debug, Clone, PartialEq)]
+struct TitleRow {
+    id: i64,
+    source: SourceId,
+    key: String,
+    /// Display name (the user's rename, else the clean name).
+    name: String,
+    year: Option<i64>,
+    hash: Option<i64>,
+    tmdb: Option<i64>,
+    /// An explicit origin ("US", "GB"): remakes of different origins never match.
+    origin: Option<String>,
+}
+
+const TITLE_COLS: &str =
+    "x.id, x.source_id, x.key, COALESCE(o.rename, x.clean_name), x.year, x.match_hash, NULLIF(CAST(x.tmdb_id AS INTEGER), 0), x.match_origin";
+
+fn title_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<TitleRow> {
+    Ok(TitleRow {
+        id: r.get(0)?,
+        source: r.get(1)?,
+        key: r.get(2)?,
+        name: r.get(3)?,
+        year: r.get(4)?,
+        hash: r.get(5)?,
+        tmdb: r.get(6)?,
+        origin: r.get(7)?,
+    })
+}
+
+fn title_row(conn: &Connection, table: &str, source: SourceId, key: &str) -> Result<Option<TitleRow>> {
+    let sql = format!(
+        "SELECT {TITLE_COLS} FROM {table} x LEFT JOIN item_override o ON o.source_id = x.source_id AND o.kind = '{table}' AND o.item_key = x.key
+         WHERE x.source_id = ?1 AND x.key = ?2"
+    );
+    Ok(conn.prepare_cached(&sql)?.query_row(params![source, key], title_from).optional()?)
+}
+
+/// The movies or series of the other playlists, read once per [`move_plan`] (a scan of the
+/// table, instead of one per favourite / progress row) and indexed by TMDB id and match hash,
+/// in the playlist order.
+struct Candidates {
+    rows: Vec<TitleRow>,
+    by_tmdb: HashMap<i64, Vec<usize>>,
+    by_hash: HashMap<i64, Vec<usize>>,
+    /// (source, key) → row index, for join partners.
+    by_key: HashMap<(SourceId, String), usize>,
+    /// Copies split off by the user ("Not the same title").
+    split: std::collections::HashSet<(SourceId, String)>,
+}
+
+impl Candidates {
+    fn read(conn: &Connection, table: &str, from: SourceId) -> Result<Self> {
+        let sql = format!(
+            "SELECT {TITLE_COLS} FROM {table} x JOIN source s ON s.id = x.source_id
+             LEFT JOIN item_override o ON o.source_id = x.source_id AND o.kind = '{table}' AND o.item_key = x.key
+             WHERE x.source_id != ?1 AND (x.match_hash IS NOT NULL OR NULLIF(CAST(x.tmdb_id AS INTEGER), 0) IS NOT NULL
+                                          OR EXISTS (SELECT 1 FROM title_link t WHERE t.source_id = x.source_id AND t.kind = '{table}'
+                                                       AND t.item_key = x.key AND t.action = 'join'))
+             ORDER BY s.enabled DESC, s.sort_index, s.id, x.provider_order, x.id"
+        );
+        let mut c =
+            Candidates { rows: Vec::new(), by_tmdb: HashMap::new(), by_hash: HashMap::new(), by_key: HashMap::new(), split: Default::default() };
+        let mut stmt = conn.prepare(&sql)?;
+        for row in stmt.query_map([from], title_from)? {
+            let row = row?;
+            let i = c.rows.len();
+            if let Some(t) = row.tmdb {
+                c.by_tmdb.entry(t).or_default().push(i);
+            }
+            if let Some(h) = row.hash {
+                c.by_hash.entry(h).or_default().push(i);
+            }
+            c.by_key.insert((row.source, row.key.clone()), i);
+            c.rows.push(row);
+        }
+        let mut stmt = conn.prepare("SELECT source_id, item_key FROM title_link WHERE kind = ?1 AND action = 'split'")?;
+        for r in stmt.query_map([table], |r| Ok((r.get::<_, SourceId>(0)?, r.get::<_, String>(1)?)))? {
+            c.split.insert(r?);
+        }
+        Ok(c)
+    }
+
+    /// The copy of `t` (a title of the deleted playlist) its data moves to — matched by TMDB
+    /// id, by match hash (key and year; never against a different TMDB id or another explicit
+    /// origin), or joined by the user; never a copy either side split off ("Not the same
+    /// title"). The first in the playlist order.
+    fn other_copy_of(&self, conn: &Connection, kind: ItemKind, t: &TitleRow) -> Result<Option<(TitleRow, MatchedBy)>> {
+        if self.split.contains(&(t.source, t.key.clone())) {
+            return Ok(None);
+        }
+        let me = ItemRef { source: t.source, kind, key: ItemKey(t.key.clone()) };
+        let joined: Vec<usize> = crate::store::titles::group_members(conn, std::slice::from_ref(&me))?
+            .into_iter()
+            .filter(|r| r.source != t.source)
+            .filter_map(|r| self.by_key.get(&(r.source, r.key.0)).copied())
+            .collect();
+        let by_tmdb = t.tmdb.and_then(|x| self.by_tmdb.get(&x)).map(Vec::as_slice).unwrap_or_default();
+        let by_hash = t.hash.and_then(|x| self.by_hash.get(&x)).map(Vec::as_slice).unwrap_or_default();
+        let compatible = |o: &TitleRow| {
+            (t.tmdb.is_none() || o.tmdb.is_none() || t.tmdb == o.tmdb) && (t.origin.is_none() || o.origin.is_none() || t.origin == o.origin)
+        };
+        let mut found: Vec<usize> =
+            by_tmdb.iter().chain(joined.iter()).copied().chain(by_hash.iter().copied().filter(|i| compatible(&self.rows[*i]))).collect();
+        found.sort_unstable();
+        found.dedup();
+        let Some(i) = found.into_iter().find(|i| !self.split.contains(&(self.rows[*i].source, self.rows[*i].key.clone()))) else {
+            return Ok(None);
+        };
+        let o = self.rows[i].clone();
+        let how = if t.tmdb.is_some() && o.tmdb == t.tmdb {
+            MatchedBy::Tmdb
+        } else if joined.contains(&i) {
+            MatchedBy::Joined
+        } else {
+            MatchedBy::KeyYear
+        };
+        Ok(Some((o, how)))
+    }
+}
+
+/// A series of the deleted playlist and its other copy (if any).
+type SeriesCopy = (TitleRow, Option<(TitleRow, MatchedBy)>);
+
+fn with_year(name: &str, year: Option<i64>) -> String {
+    match year {
+        Some(y) => format!("{name} ({y})"),
+        None => name.to_owned(),
+    }
+}
+
+/// What moving the favourites and progress of playlist `from` would do before it is deleted
+/// (the delete dialog lists it; nothing is written). Movies and series move to their copy in
+/// another playlist — matched by TMDB id, or by match key and the same known year, or joined
+/// by the user — never to a copy either side split off. Episode progress moves to the same
+/// season and episode of the series' other copy, once that copy's episodes are loaded
+/// (`waiting` names the copies to load first). Channels never move (they aren't matched
+/// across playlists).
+pub fn move_plan(conn: &Connection, from: SourceId) -> Result<MovePlan> {
+    let mut plan = MovePlan::default();
+    // the user data of the playlist: favourites (any list) and progress, by item
+    let mut favs: Vec<(ItemRef, FavListId)> = Vec::new();
+    let mut stmt = conn.prepare_cached("SELECT kind, item_key, list_id FROM fav_item WHERE source_id = ?1 ORDER BY list_id, position")?;
+    for row in stmt.query_map([from], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, FavListId>(2)?)))? {
+        let (kind, key, list) = row?;
+        let Some(kind) = ItemKind::parse(&kind) else { continue };
+        favs.push((ItemRef { source: from, kind, key: ItemKey(key) }, list));
+    }
+    let mut progress: Vec<crate::model::WatchProgress> = Vec::new();
+    let mut stmt =
+        conn.prepare_cached(&format!("SELECT {} FROM watch_progress WHERE source_id = ?1 ORDER BY updated_at DESC", user::PROGRESS_COLS))?;
+    for p in stmt.query_map([from], user::progress_from_row)? {
+        progress.push(p?);
+    }
+    let channels = favs.iter().filter(|(r, _)| r.kind == ItemKind::Channel).count();
+    if channels > 0 {
+        let what = if channels == 1 { "1 channel favourite".to_owned() } else { format!("{channels} channel favourites") };
+        plan.cannot.push(CantMove { what, why: "channels aren't matched across playlists".to_owned(), title_ref: None });
+    }
+    // every movie / series / episode with data, in a stable order
+    let mut refs: Vec<ItemRef> = Vec::new();
+    for r in favs.iter().map(|(r, _)| r).chain(progress.iter().map(|p| &p.item)) {
+        if r.kind != ItemKind::Channel && !refs.contains(r) {
+            refs.push(r.clone());
+        }
+    }
+    // the other playlists' titles, read once per table when needed
+    let (mut movies, mut series): (Option<Candidates>, Option<Candidates>) = (None, None);
+    // a series' row and its other copy, once per series (its episodes share them)
+    let mut series_copy: HashMap<i64, Option<SeriesCopy>> = HashMap::new();
+    let mut waiting_titles: HashMap<SeriesId, Vec<(String, ItemRef)>> = HashMap::new();
+    let gone = |prog: Option<crate::model::WatchProgress>, r: &ItemRef, title_ref: Option<ItemRef>| CantMove {
+        what: prog.map(|p| p.title).filter(|t| !t.is_empty()).unwrap_or_else(|| r.key.to_string()),
+        why: "no longer in the playlist".to_owned(),
+        title_ref,
+    };
+    let differs = |a: &TitleRow, b: &TitleRow| (b.name != a.name || b.year != a.year).then(|| with_year(&b.name, b.year));
+    for r in refs {
+        let lists: Vec<FavListId> = favs.iter().filter(|(f, _)| *f == r).map(|(_, l)| *l).collect();
+        let prog = progress.iter().find(|p| p.item == r).cloned();
+        match r.kind {
+            ItemKind::Movie | ItemKind::Series => {
+                let (table, cands) = if r.kind == ItemKind::Movie { ("movie", &mut movies) } else { ("series", &mut series) };
+                let Some(t) = title_row(conn, table, from, r.key.as_str())? else {
+                    plan.cannot.push(gone(prog, &r, Some(r.clone())));
+                    continue;
+                };
+                if cands.is_none() {
+                    *cands = Some(Candidates::read(conn, table, from)?);
+                }
+                let title = with_year(&t.name, t.year);
+                match cands.as_ref().map(|c| c.other_copy_of(conn, r.kind, &t)).transpose()?.flatten() {
+                    Some((o, matched)) => plan.items.push(MoveItem {
+                        to: ItemRef { source: o.source, kind: r.kind, key: ItemKey(o.key.clone()) },
+                        to_title: differs(&t, &o),
+                        title_ref: r.clone(),
+                        from: r,
+                        title,
+                        matched,
+                        lists,
+                        progress: prog,
+                    }),
+                    None => plan.cannot.push(CantMove { what: title, why: "no copy in another playlist".to_owned(), title_ref: Some(r) }),
+                }
+            }
+            ItemKind::Episode => {
+                let ep: Option<(i64, u32, u32)> = conn
+                    .prepare_cached("SELECT series_id, season, episode FROM episode WHERE source_id = ?1 AND key = ?2")?
+                    .query_row(params![from, r.key.as_str()], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?)))
+                    .optional()?;
+                let Some((series_id, season, number)) = ep else {
+                    plan.cannot.push(gone(prog, &r, None));
+                    continue;
+                };
+                if let std::collections::hash_map::Entry::Vacant(slot) = series_copy.entry(series_id) {
+                    let key: Option<String> =
+                        conn.prepare_cached("SELECT key FROM series WHERE id = ?1")?.query_row([series_id], |x| x.get(0)).optional()?;
+                    let found = match key.map(|k| title_row(conn, "series", from, &k)).transpose()?.flatten() {
+                        Some(t) => {
+                            if series.is_none() {
+                                series = Some(Candidates::read(conn, "series", from)?);
+                            }
+                            let other = series.as_ref().map(|c| c.other_copy_of(conn, ItemKind::Series, &t)).transpose()?.flatten();
+                            Some((t, other))
+                        }
+                        None => None,
+                    };
+                    slot.insert(found);
+                }
+                let Some((t, other)) = series_copy.get(&series_id).cloned().flatten() else {
+                    plan.cannot.push(gone(prog, &r, None));
+                    continue;
+                };
+                let title_ref = ItemRef { source: from, kind: ItemKind::Series, key: ItemKey(t.key.clone()) };
+                let title = format!("{} S{season:02}E{number:02}", t.name);
+                let Some((o, matched)) = other else {
+                    plan.cannot.push(CantMove { what: title, why: "no copy in another playlist".to_owned(), title_ref: Some(title_ref) });
+                    continue;
+                };
+                let other = SeriesId(o.id);
+                if !unloaded_series(conn, &[other])?.is_empty() {
+                    waiting_titles.entry(other).or_default().push((title, title_ref));
+                    continue;
+                }
+                match same_episode(conn, other, season, number)? {
+                    Some(e) => {
+                        let key: String = conn.query_row("SELECT key FROM episode WHERE id = ?1", [e], |x| x.get(0))?;
+                        plan.items.push(MoveItem {
+                            from: r,
+                            to: ItemRef { source: o.source, kind: ItemKind::Episode, key: ItemKey(key) },
+                            to_title: differs(&t, &o).map(|n| format!("{n} S{season:02}E{number:02}")),
+                            title_ref,
+                            title,
+                            matched,
+                            lists,
+                            progress: prog,
+                        });
+                    }
+                    None => {
+                        plan.cannot.push(CantMove { what: title, why: "that episode isn't in the other copy".to_owned(), title_ref: Some(title_ref) })
+                    }
+                }
+            }
+            ItemKind::Channel => {}
+        }
+    }
+    let mut waiting: Vec<SeriesId> = waiting_titles.keys().copied().collect();
+    waiting.sort_unstable();
+    plan.pending = waiting.iter().flat_map(|s| waiting_titles.remove(s).unwrap_or_default()).collect();
+    plan.waiting = waiting;
+    Ok(plan)
+}
+
+/// What [`move_titles`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Moved {
+    pub favourites: usize,
+    pub progress: usize,
+}
+
+/// Copy the favourites and progress of `items` to their other copies (before their playlist
+/// is deleted, which takes the originals with it): a favourite joins the same list at the same
+/// place (unless the copy is already there); progress replaces the copy's own only when it is
+/// newer (or the copy has none).
+pub fn move_titles(conn: &Connection, items: &[MoveItem]) -> Result<Moved> {
+    atomic(conn, |c| {
+        let mut moved = Moved::default();
+        for m in items {
+            for &list in &m.lists {
+                let fp = crate::store::sql::fp_opt(&user::fingerprint_of(c, &m.to)?);
+                moved.favourites += c.execute(
+                    "INSERT INTO fav_item(list_id, source_id, kind, item_key, position, added_at, fp)
+                     SELECT ?1, ?2, ?3, ?4, f.position, f.added_at, COALESCE(?5, '{}') FROM fav_item f
+                      WHERE f.list_id = ?1 AND f.source_id = ?6 AND f.kind = ?3 AND f.item_key = ?7
+                     ON CONFLICT(list_id, source_id, kind, item_key) DO NOTHING",
+                    params![list, m.to.source, m.to.kind.as_str(), m.to.key.as_str(), fp, m.from.source, m.from.key.as_str()],
+                )?;
+            }
+            if m.progress.is_some() {
+                // the row as it is now (playback may have saved progress since the plan)
+                let fp = crate::store::sql::fp_opt(&user::fingerprint_of(c, &m.to)?);
+                moved.progress += c.execute(
+                    "INSERT INTO watch_progress(source_id, kind, item_key, position_s, duration_s, finished, updated_at, title, fp)
+                     SELECT ?1, ?2, ?3, p.position_s, p.duration_s, p.finished, p.updated_at, p.title, COALESCE(?4, '{}')
+                       FROM watch_progress p WHERE p.source_id = ?5 AND p.kind = ?2 AND p.item_key = ?6
+                     ON CONFLICT(source_id, kind, item_key) DO UPDATE SET position_s = excluded.position_s, duration_s = excluded.duration_s,
+                       finished = excluded.finished, updated_at = excluded.updated_at, title = excluded.title
+                     WHERE excluded.updated_at > watch_progress.updated_at",
+                    params![m.to.source, m.to.kind.as_str(), m.to.key.as_str(), fp, m.from.source, m.from.key.as_str()],
+                )?;
+            }
+        }
+        Ok(moved)
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
 // Combined writes
 
 /// The user-data table an [`Undo`] restores.
@@ -549,6 +1023,17 @@ pub fn split(conn: &Connection, item: &ItemRef, on: bool, now: Timestamp) -> Res
     atomic(conn, |c| {
         let before = snapshot(c, Table::Links, std::slice::from_ref(item))?;
         crate::store::titles::set_split(c, item, on, now)?;
+        Ok(before)
+    })
+}
+
+/// "Same title as…" (P3): `item` and `other` stack together from now on, with the stacks
+/// they are in (`titles::join`). The Undo covers every copy of both join groups.
+pub fn join(conn: &Connection, item: &ItemRef, other: &ItemRef, now: Timestamp) -> Result<Undo> {
+    atomic(conn, |c| {
+        let refs = crate::store::titles::group_members(c, &[item.clone(), other.clone()])?;
+        let before = snapshot(c, Table::Links, &refs)?;
+        crate::store::titles::join(c, item, other, now)?;
         Ok(before)
     })
 }

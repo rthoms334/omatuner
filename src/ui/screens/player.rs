@@ -2386,6 +2386,48 @@ mod tests {
         assert_eq!(real(&h).playable.as_ref().and_then(|p| p.start_at), Some(2480.0), "from where it stopped");
     }
 
+    /// Ctrl+O while a combined movie plays (no error): "Play from" lists the title's other
+    /// copies from where playback is ("Play from TV 2 at 10:00"); picking one plays that copy
+    /// there. A title with one copy says so instead of opening an empty menu.
+    #[test]
+    fn ctrl_o_during_playback_switches_to_another_copy_where_playback_is() {
+        use crate::ui::screens::home::testkit::{movies, seed, source};
+        let (mut t, one) = rig();
+        let (first, other, alone) = seed(&mut t, |c| {
+            let (a, b) = (source(c, "TV")?, source(c, "TV 2")?);
+            let (ma, mb) = (movies(c, a, 3)?, movies(c, b, 2)?);
+            crate::store::titles::refresh_all(c)?;
+            // "Movie 2" is only in TV
+            Ok((ma[0], mb[0], ma[2]))
+        });
+        let mut h = harness(t, one, PlayerScreen::default(), WIDE);
+        let playing = |h: &mut H, media: MediaRef, at: f64| {
+            let mut s = (*real(h)).clone();
+            s.state = PlayerState::Playing;
+            s.playable = Some(Arc::new(Playable { media, kind: PlayableKind::Movie, title: "Movie".into(), ..(*playable()).clone() }));
+            s.position = Some(at);
+            h.state_mut().t.snapshot = Arc::new(s);
+        };
+        playing(&mut h, MediaRef::Movie(first), 600.0);
+        h.state_mut().enter(Route::Player);
+        h.run_steps(2);
+        h.state_mut().nav();
+        assert!(h.state_mut().act(Action::PlayFrom));
+        let nav = h.state_mut().nav();
+        let Some(NavRequest::Open(OverlayRequest::ContextMenu(menu))) = nav.last() else { panic!("no menu: {nav:?}") };
+        assert_eq!(menu.items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(), vec!["Play from TV 2 at 10:00"]);
+        let pick = menu.items[0].action;
+        h.state_mut().result(OverlayResult::Chosen(pick));
+        until(&mut h, "the other copy", |h| real(h).playable.as_ref().is_some_and(|p| p.media == MediaRef::Movie(other)));
+        assert_eq!(real(&h).playable.as_ref().and_then(|p| p.start_at), Some(600.0), "from where playback was");
+        // a title with one copy: a toast, no menu
+        playing(&mut h, MediaRef::Movie(alone), 30.0);
+        h.state_mut().t.toasts.clear();
+        assert!(h.state_mut().act(Action::PlayFrom));
+        assert!(!h.state_mut().nav().iter().any(|n| matches!(n, NavRequest::Open(_))));
+        assert!(h.state().t.toasts.iter().any(|t| t.text == "This title has no other copy"), "{:?}", h.state().t.toasts);
+    }
+
     /// Field fix: a live channel that played keeps reconnecting until stopped, so the overlay
     /// reads "attempt n" (never "(12/0)") and offers an obvious Stop that stops and leaves.
     #[test]

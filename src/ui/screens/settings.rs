@@ -1220,14 +1220,18 @@ impl SettingsScreen {
                 for (r, name) in self.hidden_items.iter().filter(|(r, _)| !ctx.lib.conceals(r)) {
                     v.push(item(Item::HiddenVod(r.clone()), glyphs::HIDDEN, name.clone(), Some("Enter unhides".into())));
                 }
-                // DESIGN §29.14: "Not the same title" and "Always play from" — for someone with
-                // two playlists of movies or series, or with corrections to list
+                // DESIGN §29.14, §29.16: "Not the same title", "Same title as…" and "Always play
+                // from" — for someone with two playlists of movies or series, or with
+                // corrections to list
                 let multi = [ItemKind::Movie, ItemKind::Series].iter().any(|k| ctx.lib.eligible(*k).len() > 1);
                 if multi || !self.title_links.is_empty() {
-                    v.push(Row::Section("Titles you separated or pinned".into()));
+                    v.push(Row::Section("Titles you separated, combined or pinned".into()));
                 }
                 if multi && self.title_links.is_empty() && self.links_loader.is_none() {
-                    v.push(Row::Note("Nothing changed — “Not the same title” on a copy of a movie or series shows it on its own.".into(), false));
+                    v.push(Row::Note(
+                        "Nothing changed — “Not the same title” on a copy shows it on its own, “Same title as…” combines two titles.".into(),
+                        false,
+                    ));
                 }
                 for l in self.title_links.iter().filter(|l| !ctx.lib.conceals(&l.item)) {
                     let playlist = ctx.lib.source(l.item.source).map(|s| s.name.clone()).unwrap_or_else(|| "a removed playlist".into());
@@ -1235,6 +1239,25 @@ impl SettingsScreen {
                     let (icon, detail) = match l.action {
                         LinkAction::Split => (glyphs::CLOSE, format!("{playlist} · shown on its own · Enter combines it again")),
                         LinkAction::Pin => (glyphs::PIN, format!("{playlist} · always plays first · Enter undoes")),
+                        LinkAction::Join => {
+                            // the other copies of its group, by playlist
+                            let with: Vec<String> = self
+                                .title_links
+                                .iter()
+                                .filter(|o| o.action == LinkAction::Join && o.group == l.group && o.item != l.item)
+                                // an explicit partner isn't named while the session is locked
+                                .filter(|o| !ctx.lib.conceals(&o.item))
+                                .map(|o| {
+                                    let n = o.name.clone().unwrap_or_else(|| o.item.key.to_string());
+                                    match ctx.lib.source(o.item.source) {
+                                        Some(s) => format!("{n} ({})", s.name),
+                                        None => n,
+                                    }
+                                })
+                                .collect();
+                            let with = if with.is_empty() { String::new() } else { format!(" with {}", with.join(", ")) };
+                            (glyphs::PLAYLIST, format!("{playlist} · combined{with} · Enter separates it"))
+                        }
                     };
                     v.push(item(Item::TitleLink(l.item.clone(), l.action), icon, name, Some(detail)));
                 }
@@ -1909,15 +1932,11 @@ impl SettingsScreen {
         }
     }
 
-    fn confirm_delete_source(&mut self, ctx: &mut UiCtx<'_>, id: SourceId, name: &str) {
+    /// "Delete playlist…": the dialog offers to move favourites and progress to the same titles
+    /// in other playlists first (DESIGN §29.16), then deletes it itself.
+    fn confirm_delete_source(&mut self, ctx: &mut UiCtx<'_>, id: SourceId, _name: &str) {
         let token = self.token(Pending::DeleteSource(id));
-        ctx.open(OverlayRequest::Confirm(ConfirmSpec {
-            title: format!("Delete {name}?"),
-            body: "Its channels, movies, series and guide are removed. Favourites and progress are kept as orphans in case you add it again.".into(),
-            confirm_label: "Delete".into(),
-            destructive: true,
-            token,
-        }));
+        ctx.open(OverlayRequest::DeletePlaylist { source: id, token });
     }
 
     /// Shift+←/→ (→) on a guide: shift its offset. Applied (saved + the guide re-imported, the
@@ -1975,16 +1994,25 @@ impl SettingsScreen {
                 self.unhide_item(ctx, Some(r));
             }
             Item::TitleLink(r, action) => {
+                let group = self.title_links.iter().find(|l| l.item == r && l.action == action).and_then(|l| l.group);
                 self.title_links.retain(|l| !(l.item == r && l.action == action));
                 let now = ctx.now;
                 let write = r.clone();
                 let _ = ctx.services.store.writer().submit_notify(DataScope::Overrides, move |c| match action {
                     LinkAction::Split => crate::store::titles::set_split(c, &write, false, now),
                     LinkAction::Pin => crate::store::titles::set_pin(c, &write, &[], false, now),
+                    LinkAction::Join => crate::store::titles::unjoin(c, &write),
                 });
+                if action == LinkAction::Join {
+                    // a group left with one copy is gone too (`titles::unjoin`)
+                    if self.title_links.iter().filter(|l| l.action == LinkAction::Join && l.group == group).count() < 2 {
+                        self.title_links.retain(|l| !(l.action == LinkAction::Join && l.group == group));
+                    }
+                }
                 ctx.toast(Toast::info(match action {
                     LinkAction::Split => "Combined again",
                     LinkAction::Pin => "Plays from the best copy again",
+                    LinkAction::Join => "Shown on its own again",
                 }));
             }
             Item::Orphan(r) => self.start_attach(ctx, &r),
@@ -2688,11 +2716,10 @@ impl Screen for SettingsScreen {
             }
             (OverlayResult::Confirmed(_), Some(p)) => match p {
                 Pending::DeleteSource(id) => {
-                    let _ = ctx.services.store.writer().submit_notify(DataScope::Sources, move |c| crate::store::sources::delete_source(c, id));
+                    // the dialog moved what the user asked for and deleted it (and toasts)
                     self.sources.retain(|s| s.id != id);
                     self.editor = None;
                     self.row = 0;
-                    ctx.toast(Toast::info("Playlist deleted"));
                 }
                 Pending::DeleteEpg(id) => {
                     let _ = ctx.services.store.writer().submit_notify(DataScope::Epg, move |c| crate::store::sources::delete_epg_source(c, id));
@@ -3458,13 +3485,13 @@ mod tests {
         );
         h.state_mut().result(OverlayResult::Chosen(Action::Digit(MENU_DELETE)));
         let nav = h.state_mut().nav();
-        let token = match nav.as_slice() {
-            [NavRequest::Open(OverlayRequest::Confirm(c))] => {
-                assert!(c.destructive);
-                c.token
-            }
+        // the delete dialog (`overlays::delete_playlist`, tested there) deletes it itself and
+        // answers with the token
+        let (source, token) = match nav.as_slice() {
+            [NavRequest::Open(OverlayRequest::DeletePlaylist { source, token })] => (*source, *token),
             other => panic!("{other:?}"),
         };
+        h.state().t.services().store.writer().blocking(move |c| crate::store::sources::delete_source(c, source)).unwrap();
         h.state_mut().result(OverlayResult::Confirmed(token));
         until(&mut h, "the deletion", |h| sources(h).len() == 1);
         // "+ Add playlist…" opens the onboarding card at Type
@@ -4119,31 +4146,64 @@ mod tests {
         until(&mut h, "saved after the presses settle", |h| stored(h) == 45);
     }
 
-    /// DESIGN §29.14: Hidden ▸ "Titles you separated or pinned" lists the copies taken out of
-    /// their stack and the pinned ones; Enter undoes one (stored at once). Interface ▸ "Same
-    /// title in several playlists" switches between Combine and Show each copy.
+    /// DESIGN §29.14, §29.16: Hidden ▸ "Titles you separated, combined or pinned" lists the
+    /// copies taken out of their stack, the ones combined with another title ("Same title
+    /// as…", naming the other copy) and the pinned ones; Enter undoes one (stored at once; a
+    /// join left with one copy goes too). Interface ▸ "Same title in several playlists"
+    /// switches between Combine and Show each copy.
     #[test]
     fn split_and_pinned_titles_are_listed_with_undo_and_the_combine_setting() {
-        use crate::store::titles::{LinkAction, links, set_pin, set_split};
+        use crate::store::titles::{LinkAction, join, links, set_pin, set_split};
         let (mut t, one) = rig();
         seed(&mut t, |c| {
             let a = testkit::source(c, "Alpha")?;
             let b = testkit::source(c, "Bravo")?;
-            testkit::named_movies(c, a, &[("EN ★ Dune - 2021", "Dune"), ("EN ★ Heat - 1995", "Heat")])?;
-            testkit::named_movies(c, b, &[("EN - Dune (2021)", "Dune (Bravo)"), ("EN - Heat (1995)", "Heat (Bravo)")])?;
+            testkit::named_movies(c, a, &[("EN ★ Dune - 2021", "Dune"), ("EN ★ Heat - 1995", "Heat"), ("EN ★ Incendies - 2010", "Incendies")])?;
+            testkit::named_movies(
+                c,
+                b,
+                &[
+                    ("EN - Dune (2021)", "Dune (Bravo)"),
+                    ("EN - Heat (1995)", "Heat (Bravo)"),
+                    ("DE - Die Frau die singt (2010)", "Die Frau die singt"),
+                ],
+            )?;
             let r = |s: SourceId, i: usize| ItemRef { source: s, kind: ItemKind::Movie, key: ItemKey(format!("m3u:named{i:04}")) };
             set_split(c, &r(b, 0), true, 5)?;
-            set_pin(c, &r(a, 1), &[r(b, 1)], true, 6)
+            set_pin(c, &r(a, 1), &[r(b, 1)], true, 6)?;
+            join(c, &r(a, 2), &r(b, 2), 7)
         });
         let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 900.0));
         h.state_mut().enter(Route::Settings(SettingsPage::Hidden));
         until(&mut h, "the titles", |h| has_label(h, "Dune (Bravo)") && has_label(h, "Heat"));
-        assert!(has_label(&h, "TITLES YOU SEPARATED OR PINNED"));
+        assert!(has_label(&h, "TITLES YOU SEPARATED, COMBINED OR PINNED"));
         assert!(testkit::has_label_containing(&h, "Bravo · shown on its own") && testkit::has_label_containing(&h, "Alpha · always plays first"));
+        assert!(testkit::has_label_containing(&h, "Alpha · combined with Die Frau die singt (Bravo) · Enter separates it"));
+        // an explicit partner isn't named while explicit content is hidden
+        let load = |h: &H, v| crate::store::library::load_visible(&h.state().t.services().store.reader().unwrap(), v).unwrap();
+        seed(&mut h.state_mut().t, |c| {
+            c.execute("UPDATE movie SET explicit = 1 WHERE name = 'DE - Die Frau die singt (2010)'", [])?;
+            Ok(())
+        });
+        let hidden = load(&h, crate::store::library::Visibility::NO_EXPLICIT);
+        h.state_mut().t.set_library(hidden);
+        h.run_steps(2);
+        assert!(testkit::has_label_containing(&h, "Alpha · combined · Enter separates it"));
+        assert!(!testkit::has_label_containing(&h, "Die Frau die singt"), "never named while hidden");
+        let all = load(&h, crate::store::library::Visibility::ALL);
+        h.state_mut().t.set_library(all);
+        h.run_steps(2);
         focus(&mut h, "Dune (Bravo)");
         h.state_mut().act(Action::Activate);
         let stored = |h: &H| links(&h.state().t.services().store.reader().unwrap()).unwrap();
         until(&mut h, "combined again", |h| stored(h).iter().all(|l| l.action != LinkAction::Split));
+        assert_eq!(stored(&h).len(), 3, "the pin and the join stay");
+        // separate the combined title again: both join rows go
+        focus(&mut h, "Incendies");
+        h.state_mut().act(Action::Activate);
+        until(&mut h, "separated", |h| stored(h).iter().all(|l| l.action != LinkAction::Join));
+        h.run_steps(1);
+        assert!(!has_label(&h, "Die Frau die singt"), "the group's other row went too");
         assert_eq!(stored(&h).len(), 1, "the pin stays");
         // Interface: Combine → Show each copy
         h.state_mut().enter(Route::Settings(SettingsPage::Interface));

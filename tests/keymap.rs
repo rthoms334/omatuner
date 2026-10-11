@@ -256,8 +256,9 @@ fn group_marks_and_tick_lists() {
 
 /// Stacks of copies (DESIGN §29.14): Space fans a stack out in the movie / series grid only
 /// while nothing is typed (then it types, like the group marks); it never marks there. Ctrl+O
-/// ("Play from…") works in the grid, while filtering and on detail pages, and nowhere it would
-/// shadow something (Ctrl+Shift+O stays the pop-out).
+/// ("Play from…") works in the grid, while filtering and on detail pages — and in lists, where
+/// Live TV offers the same channel in another playlist ("Also on", §29.16) — and nowhere it
+/// would shadow something (Ctrl+Shift+O stays the pop-out).
 #[test]
 fn stack_fan_out_and_play_from() {
     let ctrl_shift = |k: Key| key_mods(k, Modifiers::CTRL | Modifiers::COMMAND | Modifiers::SHIFT, false);
@@ -265,11 +266,10 @@ fn stack_fan_out_and_play_from() {
     assert_eq!(resolve(&[K::PosterGrid], &key(Key::Space)), None, "the key twin reaches nothing");
     assert_eq!(resolve(&[K::PosterGridFiltering], &text(" ")), Some(Action::FilterInput(' ')), "filters have spaces");
     assert_eq!(resolve(&[K::List], &text(" ")), Some(Action::ToggleMark), "group lists keep marking");
-    for stack in [vec![K::PosterGrid], vec![K::PosterGridFiltering], vec![K::Detail], vec![K::PlayerVod]] {
+    for stack in [vec![K::PosterGrid], vec![K::PosterGridFiltering], vec![K::Detail], vec![K::PlayerVod], vec![K::List], vec![K::ListFiltering]] {
         assert_eq!(resolve(&stack, &ctrl(Key::O)), Some(Action::PlayFrom), "{stack:?}");
         assert_eq!(resolve(&stack, &ctrl_shift(Key::O)), Some(Action::TogglePopOut), "{stack:?}");
     }
-    assert_eq!(resolve(&[K::List], &ctrl(Key::O)), None, "channels have no copies");
     assert!(help_rows(K::PosterGrid).iter().any(|r| r.0 == "Space" && r.1.starts_with("Show each copy")));
 }
 

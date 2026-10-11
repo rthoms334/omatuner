@@ -295,6 +295,8 @@ pub(crate) fn purge_source(conn: &Connection, id: SourceId) -> Result<()> {
             params![format!("import:{}:%", id.0), upgrade_key(id), playlist_logins_key(id), unseen_upgrade_key(id)],
         )?;
         c.execute("DELETE FROM source WHERE id = ?1", [id])?;
+        // a join with a copy of this playlist is left with one copy
+        crate::store::titles::prune_joins(c)?;
         Ok(())
     })
 }

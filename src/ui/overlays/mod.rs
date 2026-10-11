@@ -8,6 +8,7 @@
 //! typing starts (launcher idiom).
 
 pub mod categories;
+pub mod delete_playlist;
 pub mod dialogs;
 pub mod edit_item;
 pub mod help;
@@ -15,6 +16,7 @@ pub mod jobs;
 pub mod playlists;
 pub mod programme;
 pub mod resume;
+pub mod same_title;
 pub mod search;
 pub mod tracks;
 
@@ -157,5 +159,7 @@ pub fn build(req: OverlayRequest, ctx: &mut UiCtx<'_>) -> Box<dyn Overlay> {
         OverlayRequest::Categories(source) => Box::new(categories::CategoriesOverlay::new(source)),
         OverlayRequest::PlaylistPicker(kind) => Box::new(playlists::PlaylistPickerOverlay::new(kind)),
         OverlayRequest::PlaylistMenu(source, kind) => Box::new(playlists::PlaylistMenuOverlay::new(source, kind, ctx)),
+        OverlayRequest::SameTitle(spec) => Box::new(same_title::SameTitleOverlay::new(spec)),
+        OverlayRequest::DeletePlaylist { source, token } => Box::new(delete_playlist::DeletePlaylistOverlay::new(source, token)),
     }
 }

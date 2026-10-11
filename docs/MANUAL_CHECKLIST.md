@@ -1042,7 +1042,7 @@ PIN set, English audio first. Every check in *All playlists* unless it says othe
     also after a playlist refresh.
 - [ ] **Not the same title, Undo:**
   - **Do:** on a page, a copy's menu ▸ Not the same title; click the toast's Undo. Do it again,
-    open another page, then go to Settings ▸ Hidden ▸ Titles you separated or pinned and press
+    open another page, then go to Settings ▸ Hidden ▸ Titles you separated, combined or pinned and press
     Enter on it. Remove a stack from Favourites (Ctrl+F) and click Undo after opening a page.
   - **Expect:** the copy leaves the stack (the card count drops), Undo puts it back; the Hidden
     list shows the split and Enter combines it again; a refresh keeps a split. Each toast's Undo
@@ -1113,3 +1113,59 @@ layout. Use only the keyboard.
   - **Expect:** the guide moves between programmes (← goes into the past), detail pages walk
     their buttons, the player zaps / seeks, text fields move the cursor, onboarding and Edit
     information change values. The filtered side panel closes with ← (no channel change).
+
+## 20. Several playlists: copies everywhere (P3, real catalogue)
+
+Same setup as §18: two Xtream playlists (TV, TV 2) with overlapping titles, a PIN set, copies
+combined (Settings ▸ Interface). Undo toasts last 8 s.
+
+- [ ] **A stacked title's page acts on every copy:**
+  - **Do:** open the page of a movie in both playlists (from All). Add it to Favourites, then
+    remove it; Undo. Mark watched, unmark; Undo. Ctrl+L (PIN), Ctrl+H; Undo. F2. Then fan the
+    stack out in the grid, Enter on TV 2's copy and press Ctrl+F / F2 there.
+  - **Expect:** ★ and ✓ show when any copy has them; adding favourites / marking watched writes
+    the copy Play would use, removing / unmarking clears every copy, and Undo brings each row
+    back; lock and hide cover every copy (the toast names both playlists); F2 says "Rename every
+    copy". From the fanned-out copy everything acts on that copy only.
+- [ ] **Series watched across copies:**
+  - **Do:** watch an episode of a series in TV 2's copy (to the end); open TV's copy of the same
+    series from All. Mark season 1 watched from its menu; click Undo. Pick a series whose TV 2
+    copy you never opened (episodes not loaded yet) and mark a season watched in TV's copy.
+  - **Expect:** TV's page shows that episode watched and opens at the next one; the season mark
+    covers both copies (open TV 2's page to check) and Undo restores both. With the unloaded
+    copy TV's episodes are marked at once ("Marked S01 watched in TV"), the page says "Loading
+    the other copy's episodes to mark them too…", then TV 2's are marked (a second toast); with
+    the network off a warning names TV 2. Stop TV 2's copy halfway through an episode, then on
+    TV's page (pin TV: Always play from TV) the button says "Resume S01E0x mm:ss" and plays TV's
+    copy from there.
+- [ ] **Same title as…:**
+  - **Do:** find a film that shows twice in All (different names, or a copy without a year).
+    On one card ▸ menu ▸ *Same title as…*, type the other's name, Enter. Click Undo. Do it again,
+    then Ctrl+R (refresh both playlists). Settings ▸ Hidden ▸ Titles you separated, combined or
+    pinned: Enter on the joined row.
+  - **Expect:** the picker lists one row per title (never the title itself) with year and
+    playlists; after Enter the two cards are one stack, its page says "Combined by you"; Undo
+    separates them; the join survives the refresh; the Hidden list names the other copy
+    ("combined with … (TV 2)") and Enter separates them again.
+- [ ] **Deleting a playlist moves your data (use a throwaway copy of a playlist):**
+  - **Do:** add a second copy of TV (Settings ▸ Playlists ▸ add, same login, name "TV old"),
+    favourite two films and watch one halfway in "TV old", plus an episode of a series. Delete
+    "TV old": read the dialog, press ↑ three times and Enter (it ticks *Move favourites,
+    progress and watched marks…*), press Delete. Repeat with the box unticked on another
+    throwaway playlist.
+  - **Expect:** the box is unticked at first and ↑ never wraps onto Delete; the subtitle says
+    "This can't be undone."; the dialog lists "Title (year) → TV · ★ · 41:20"
+    and what can't move (channel favourites, titles without a copy elsewhere); ticking it loads
+    the other series copy's episodes first (a spinner, Delete waits). After Delete the toast
+    says how much moved; TV's copies are favourites with the same progress, the episode too.
+    Unticked, nothing moves.
+- [ ] **Live TV "Also on":**
+  - **Do:** in Live TV ▸ All, move onto a channel both playlists carry (BBC One). Click the
+    "Also on" chip; press Ctrl+O and pick it from the menu; lock TV 2's copy and pick it again
+    with the session locked; hide TV 2's copy.
+  - **Expect:** the preview shows `Also on ● TV 2 (FHD)` (the quality when known), the hint line
+    "Ctrl+O also on"; a click plays TV 2's copy in the preview while the cursor stays on TV's;
+    the chip of the channel playing shows ▶ (no focus ring); Ctrl+O works in Compact too (no
+    preview); the locked one shows the lock and asks for the PIN; a hidden one, a different channel with
+    the same name but another tvg-id, and explicit channels with the session locked are never
+    offered. Nothing ever switches channel by itself.
