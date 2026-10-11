@@ -8,7 +8,8 @@
 //! * Esc ladder (no focus mode): hide banner → leave window fullscreen → leave the player
 //!   (mini-player keeps playing). Esc never SHOWS the banner.
 //! * Side panels (`c` channels, `g` mini guide, `h`/→ history): stack
-//!   `[List|ListFiltering, PlayerLive]`; ↑/↓ move the cursor (no zap), Enter tunes, ←/Esc close.
+//!   `[List|ListFiltering, PlayerLive]`; ↑/↓ move the cursor (no zap), Enter tunes, ←/Esc close
+//!   (← also while the panel filters; Esc clears the filter first).
 //!   Stream info `I`.
 //! * Numeric entry (digits): stack `[NumericEntry, PlayerLive]`, 1.5 s auto-commit.
 //! * End of playback: a finished episode → "Next episode in 10 s" card over the video. A
@@ -2318,6 +2319,22 @@ mod tests {
         assert!(labels.contains(&"Pop out") && labels.contains(&"Stop and close"), "{labels:?}");
         h.state_mut().result(OverlayResult::Chosen(Action::TogglePopOut));
         assert_eq!(h.state_mut().nav(), vec![NavRequest::TogglePopOut]);
+    }
+
+    /// ← closes a side panel while it filters too: `[ListFiltering, PlayerLive]` resolves ← to
+    /// the list's `Left` (not the player's last channel), which steps out like Esc.
+    #[test]
+    fn left_closes_a_filtered_side_panel() {
+        let mut h = player(WIDE);
+        assert!(h.state_mut().act(Action::ChannelList));
+        h.run_steps(2);
+        assert!(h.state_mut().act(Action::FilterInput('x')));
+        let stack = h.state().s.key_contexts();
+        assert_eq!(stack[0], KeyContext::ListFiltering, "{stack:?}");
+        let left = egui::Event::Key { key: egui::Key::ArrowLeft, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        assert_eq!(crate::keymap::resolve(&stack, &left), Some(Action::Left));
+        assert!(h.state_mut().act(Action::Left));
+        assert!(h.state().s.panel.is_none());
     }
 
     /// A side panel closes with its ✕ and with a click on the video beside it.

@@ -11,11 +11,13 @@
 //! * Grid: `[PosterGrid]` / `[PosterGridFiltering]` — typing filters the posters (launcher
 //!   idiom), Enter opens details, Shift+Enter plays/resumes fullscreen, Ctrl+S opens the sort
 //!   menu (the choice is saved as `interface.movie_sort` / `series_sort`), ← on the first
-//!   column / Backspace returns to the categories, Tab switches panes. Item shortcuts: Ctrl+F
-//!   / Ctrl+Shift+F favourites, Ctrl+W watched, Ctrl+L lock, Ctrl+H hide, F2 rename, Ctrl+I
-//!   details, Delete removes from Favourites / Continue watching, Alt+↑/↓ moves the title in
-//!   Custom order (`item_override.user_order`, per title — DESIGN §8.3), switching a sorted
-//!   grid to Custom order first (DESIGN §13.0); the cursor follows the title.
+//!   column (also while filtering — the filter is kept — or on an empty grid) / Backspace
+//!   returns to the categories (DESIGN §15.1 spatial panes), Tab switches panes. Item
+//!   shortcuts: Ctrl+F / Ctrl+Shift+F favourites, Ctrl+W watched, Ctrl+L lock, Ctrl+H hide, F2
+//!   rename, Ctrl+I details, Delete removes from Favourites / Continue watching, Alt+↑/↓ moves
+//!   the title in Custom order (`item_override.user_order`, per title — DESIGN §8.3),
+//!   switching a sorted grid to Custom order first (DESIGN §13.0); the cursor follows the
+//!   title.
 //! * Only the focused pane shows the cursor; the other shows its current row "selected".
 //! * Wide: categories | grid. Medium (a tiled half): the categories are a drawer (← on the
 //!   first column, Backspace, or the "{category} ▾" header button) so the grid keeps 4–5
@@ -2588,6 +2590,51 @@ mod tests {
         h.run_steps(2);
         assert_eq!(h.state().s.key_contexts(), vec![KeyContext::List]);
         assert_eq!(accent_outlines(&h), 0, "the categories have it: the poster shows 'selected' only");
+    }
+
+    /// Spatial panes (DESIGN §15.1) at Medium: ← inside a row moves between posters; on the
+    /// first column it opens the categories drawer — also while the grid filters (the filter is
+    /// kept) and on an empty grid.
+    #[test]
+    fn left_on_the_first_column_opens_the_categories_while_filtering_and_when_empty() {
+        let (mut t, one) = rig();
+        seed(&mut t, |c| {
+            let s = testkit::source(c, "My IPTV")?;
+            testkit::movies(c, s, 30).map(|_| ())
+        });
+        t.layout = LayoutClass::Medium;
+        let mut h = harness(t, one, MoviesScreen::default(), egui::vec2(706.0, 800.0));
+        h.state_mut().enter(Route::Movies { group: None });
+        h.run_steps(2);
+        h.state_mut().act(Action::FilterInput('2'));
+        h.run_steps(1);
+        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::PosterGridFiltering]);
+        let n = h.state().s.browser.shown.len();
+        assert!(n > 1, "{n}");
+        h.state_mut().act(Action::Right);
+        assert!(h.state_mut().act(Action::Left));
+        assert_eq!(h.state().s.browser.grid.cursor, 0, "inside the row: the poster on the left");
+        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::PosterGridFiltering]);
+        assert!(!has_label(&h, "All movies"), "the drawer is closed");
+        assert!(h.state_mut().act(Action::Left));
+        h.run_steps(1);
+        assert!(has_label(&h, "All movies"), "first column: the drawer opens");
+        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::List]);
+        assert_eq!((h.state().s.browser.grid.filter.query(), h.state().s.browser.shown.len()), ("2", n), "the filter is kept");
+        // Esc closes the drawer: the same filtered grid
+        assert!(h.state_mut().act(Action::Back));
+        h.run_steps(1);
+        assert!(!has_label(&h, "All movies"));
+        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::PosterGridFiltering]);
+        // nothing matches: ← still leads to the categories
+        for c in "zzz".chars() {
+            h.state_mut().act(Action::FilterInput(c));
+        }
+        h.run_steps(1);
+        assert!(h.state().s.browser.shown.is_empty());
+        assert!(h.state_mut().act(Action::Left));
+        h.run_steps(1);
+        assert!(has_label(&h, "All movies"), "an empty grid: the drawer opens");
     }
 
     /// Medium: the categories are a drawer (← opens it, Esc closes it); Compact: Esc in the
