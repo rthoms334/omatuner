@@ -1706,6 +1706,46 @@ mod tests {
         assert_eq!(rig.overlay_kinds(), [kind(OverlayRequest::Help)]);
     }
 
+    /// Help filters as you type (Omarchy's keybindings menu): letters, `/` and `?` go to the
+    /// filter instead of running shortcuts; Esc and F1 clear the filter before they close it;
+    /// `?` closes only while the filter is empty.
+    #[test]
+    fn help_types_to_filter_and_esc_clears_before_closing() {
+        let mut rig = Rig::new();
+        rig.size = egui::vec2(600.0, 2400.0);
+        let probe = rig.probe(ScreenId::Live, vec![KeyContext::List]);
+        rig.frame_with(vec![]);
+        rig.press(Key::F1, NONE);
+        let typed = |rig: &mut Rig, s: &str| {
+            for c in s.chars() {
+                rig.frame_with(vec![Event::Text(c.to_string())]);
+            }
+            texts(&rig.frame_with(vec![]))
+        };
+        let t = typed(&mut rig, "mute");
+        assert!(find(&t, "Mute").is_some() && find(&t, "PLAYER — LIVE TV").is_some());
+        assert!(find(&t, "LISTS").is_none(), "sections without a match are hidden");
+        assert!(t.iter().any(|(s, _, _)| s.starts_with("2 of ")), "count");
+        let t = typed(&mut rig, "/?");
+        assert_eq!(rig.overlay_kinds(), [kind(OverlayRequest::Help)], "`/` and `?` are typed, not run");
+        assert!(find(&t, "mute/?").is_some() && find(&t, "No matching shortcuts").is_some());
+        // Esc: clear, then close
+        rig.press(Key::Escape, NONE);
+        let t = texts(&rig.frame_with(vec![]));
+        assert_eq!(rig.overlay_kinds(), [kind(OverlayRequest::Help)]);
+        assert!(find(&t, "LISTS").is_some(), "cleared");
+        rig.press(Key::Escape, NONE);
+        assert!(rig.app.overlays.is_empty());
+        // F1 the same; `?` closes once the filter is empty
+        rig.press(Key::F1, NONE);
+        typed(&mut rig, "q");
+        rig.press(Key::F1, NONE);
+        assert_eq!(rig.overlay_kinds(), [kind(OverlayRequest::Help)]);
+        typed(&mut rig, "?");
+        assert!(rig.app.overlays.is_empty());
+        assert!(probe.borrow().actions.iter().all(|a| *a == Action::ToggleHelp), "only the F1s that opened help reached the screen");
+    }
+
     #[test]
     fn help_from_an_overlay_lists_that_overlays_contexts() {
         let mut rig = Rig::new();

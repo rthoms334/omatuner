@@ -1602,7 +1602,19 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 
 ### 13.11 Help, jobs, dialogs, EPG mapping, logs
 * Help (`?`, F1): generated from `keymap::help_rows`; current contexts first; two columns ≥
-  760 px.
+  760 px. *Added after rc3:* **type to filter**, like Omarchy's keybindings menu — the
+  overlay's `Help` context is filterable, so every printable key (j/k, `/`, digits) types into
+  a launcher header ("Type to filter keyboard shortcuts…") and no shortcut fires while help is
+  open. A row matches when every whitespace-separated term is a case-insensitive substring of
+  its keys ("ctrl+h", "f5", "alt"; arrows also answer to up/down/left/right, Esc to "escape"),
+  its description or its section title ("guide" keeps the whole TV guide section). Results
+  stay grouped by section in the same order (current contexts first) — the same key means
+  different things per context, so a flat ranked list would lose that; empty sections are
+  hidden, matches are marked with the text-selection fill, a count reads "12 of 269", and no
+  match shows "No matching shortcuts". The card's top edge freezes once typing starts (it
+  shrinks downward only). Keys: Backspace / Ctrl+Backspace (word) / Ctrl+U edit; Esc and F1
+  clear the filter, then close; `?` closes only while the filter is empty (otherwise it is
+  typed); Enter closes; ↑/↓, PgUp/PgDn, Home/End scroll.
 * Jobs (Ctrl+J, `[List, Modal]`): running jobs with phase + progress; Delete cancels the
   highlighted job; last 20 finished (Enter expands errors).
 * Context menu (Shift+F10 / Ctrl+Enter / right-click): launcher-style, filterable, shortcuts
@@ -1676,7 +1688,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 ### 15.1 Model & layers
 * **Contexts** (`keymap::KeyContext`): Global, List, ListFiltering, PosterGrid,
   PosterGridFiltering, Detail, Guide, PlayerLive, PlayerVod, PlayerOsd, NumericEntry,
-  EpgMapping, Search, Modal, TextInput, Panel.
+  EpgMapping, Search, Modal, TextInput, Panel, Help.
 * **Stack per frame**: topmost overlay's contexts, else the current screen's focused-element
   contexts (e.g. `[ListFiltering]`, `[PlayerOsd, PlayerLive]`, `[NumericEntry, Guide]`,
   `[List, PlayerLive]` for a player side panel, `[TextInput, Modal]` for a focused field), then
@@ -1690,8 +1702,8 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 * **Rules** (`keymap::resolve`): first matching binding wins, innermost context first;
   printable symbols match `Event::Text` (layout-independent, shift applied), named keys and
   Ctrl/Alt chords match `Event::Key`.
-  * Filterable contexts (List, ListFiltering, PosterGrid, PosterGridFiltering, Search): an
-    unbound printable char becomes `FilterInput(c)` — **launcher idiom: letters type in lists
+  * Filterable contexts (List, ListFiltering, PosterGrid, PosterGridFiltering, Search, Help):
+    an unbound printable char becomes `FilterInput(c)` — **launcher idiom: letters type in lists
     and grids, so no j/k there**; vim keys exist only in the guide, the player and settings
     panels.
   * **TextInput owns the keyboard**: after its own table only Ctrl/Alt chords and F-keys may
@@ -2059,6 +2071,21 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `x` / `Delete` | Delete / more actions |
 | `Esc` | Back |
 | `?` | Keyboard help |
+
+#### Keyboard help (`Help`)
+
+| Keys | Action |
+|---|---|
+| `↑` / `↓` | Scroll |
+| `PgUp` / `PgDn` | Page up / down |
+| `Home` / `End` | Top / bottom |
+| `Backspace` | Delete character |
+| `Ctrl+Backspace` | Delete word |
+| `Ctrl+U` | Clear filter |
+| `Esc` / `F1` | Clear the filter, then close |
+| `?` | Close (types ? while filtering) |
+| `Enter` | Close |
+| `a–z, 0–9 …` | Type to filter |
 
 ---
 

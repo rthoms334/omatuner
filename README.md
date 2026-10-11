@@ -259,8 +259,9 @@ Tuner is built for the keyboard, and everything is also clickable. The basics:
 
 - **In lists and grids, letters type into a filter** (launcher style). Vim keys work only in the
   guide, the player and Settings.
-- **`?` or F1** shows every key for the screen you're on. The status bar shows a short hint line
-  for the same screen.
+- **`?` or F1** shows every key, the screen you're on first. Type to filter it, like Omarchy's
+  keybindings menu: "ctrl+h", "f5" or "mute" narrow the list as you type, Esc clears the filter
+  and then closes. The status bar shows a short hint line for the same screen.
 - **Esc** steps out one level: filter → panel → fullscreen → player → previous screen.
 - **Alt+1…5** switch screens, and **Alt+0** or **Ctrl+,** opens Settings. **Ctrl+K** or **/**
   searches. **Ctrl+Q** quits.
@@ -607,6 +608,22 @@ The full reference is generated from `src/keymap.rs`:
 | `x` / `Delete` | Delete / more actions |
 | `Esc` | Back |
 | `?` | Keyboard help |
+
+### Keyboard help (`Help`)
+
+| Keys | Action |
+|---|---|
+| `↑` / `↓` | Scroll |
+| `PgUp` / `PgDn` | Page up / down |
+| `Home` / `End` | Top / bottom |
+| `Backspace` | Delete character |
+| `Ctrl+Backspace` | Delete word |
+| `Ctrl+U` | Clear filter |
+| `Esc` / `F1` | Clear the filter, then close |
+| `?` | Close (types ? while filtering) |
+| `Enter` | Close |
+| `a–z, 0–9 …` | Type to filter |
+
 <!-- keymap:end -->
 
 ## Command line
