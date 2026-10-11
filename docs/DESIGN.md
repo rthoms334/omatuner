@@ -4618,6 +4618,17 @@ itself provides.
   `ErrorCode::Loading` replies are retried every 250 ms for ≤ 20 s. A reply without `"v"` (a
   pre-v2 Tuner answering `bad request`) → "restart Tuner to update it". Status without Tuner →
   `{"running": false}` as a normal result.
+* As built (bridge track): an unknown tool name is JSON-RPC −32602 (the spec's example), bad
+  arguments stay a tool error. Client failures are tool errors with their own codes
+  (`not_running`, `did_not_start`, `loading`, `too_old`, `connection_failed`). A result after a
+  launch carries a second text block "Tuner wasn't running, so it was started."; `status` from a
+  running Tuner gets `running: true`. The bridge also withholds any result containing `"://"`
+  (`internal`), behind the server's own check. `Launcher::failed` lets the wait end early: the
+  `ExeLauncher` reaps its child on a thread and a non-zero exit before the socket appears is
+  `did_not_start` with the exit status, at once (exit 0 = it handed off to an instance starting
+  at the same time: keep waiting). After a package upgrade `/proc/self/exe` ends in
+  " (deleted)": the launcher runs the new file at that path. `--profile-dir` is made absolute
+  before it is passed on.
 
 ### 30.3 IPC v2 protocol (`agent::proto`, implemented in the skeleton)
 ```text

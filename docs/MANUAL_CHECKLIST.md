@@ -1077,8 +1077,11 @@ PIN set, English audio first. Every check in *All playlists* unless it says othe
 
 ## 19. Use Tuner from Claude (MCP)
 
-Default profile, Claude Code installed, `claude mcp add tuner -- tuner mcp` done once (`claude
-mcp list` shows `tuner` connected).
+Default profile, Claude Code installed, `claude mcp add --scope user tuner -- tuner mcp` done
+once (`claude mcp list` shows `tuner` connected).
+
+- [ ] **Not running → status doesn't start it:** quit Tuner. Ask Claude "what's playing?".
+  **Expect:** Claude says Tuner isn't running; Tuner does not open.
 
 - [ ] **Not running → starts:** quit Tuner. Ask Claude "what's on now?".
   **Expect:** Tuner opens on the current workspace within a few seconds; Claude lists programmes
@@ -1106,4 +1109,9 @@ mcp list` shows `tuner` connected).
   while Tuner sits on another workspace.
 - [ ] **Window hidden:** move Tuner to another workspace, ask "what's on BBC One at 9?".
   **Expect:** an answer without Tuner coming forward; "play it" brings it forward.
+- [ ] **Outlives Claude:** with Tuner started by Claude (first check), quit Claude Code (and
+  close its terminal). **Expect:** Tuner keeps running and playing.
+- [ ] **Old instance:** with a Tuner from before this feature running (or simulate: keep an old
+  build open), ask Claude anything. **Expect:** Claude says to restart Tuner; after a restart it
+  works.
 

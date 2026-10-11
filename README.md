@@ -930,8 +930,11 @@ another MCP client) in a terminal to find something and play it, instead of brow
 once:
 
 ```sh
-claude mcp add tuner -- tuner mcp
+claude mcp add --scope user tuner -- tuner mcp
 ```
+
+`--scope user` makes it available in every directory; without it, Claude Code only offers it
+in the directory you ran the command in. `claude mcp list` shows whether it is connected.
 
 Then ask, for example:
 
@@ -945,7 +948,12 @@ Then ask, for example:
 How it works and what it can't do:
 
 - `tuner mcp` talks to the running Tuner over its local socket. Only programs running as your
-  user can reach it. If Tuner isn't open, the first request starts it.
+  user can reach it.
+- If Tuner isn't open, the first request that searches or plays something starts it and waits
+  a few seconds for it. Asking what is playing, or pause and volume requests, never start it.
+  A Tuner started this way keeps running when you close Claude.
+- After updating Tuner, restart it once: an older Tuner that is still running can't answer the
+  new `tuner mcp`, and Claude tells you so.
 - Claude only sees what Tuner shows you: hidden channels and categories, categories your country
   filter hides, and explicit content hidden by parental control stay out of every answer.
 - Locked items are listed as locked. Playing one makes Tuner ask for your PIN **on its own
@@ -953,6 +961,8 @@ How it works and what it can't do:
 - Claude gets names, times and programme details, never stream addresses or your logins.
 - Use `tuner mcp --profile-dir <dir>` (and `claude mcp add tuner -- tuner mcp --profile-dir
   <dir>`) to reach a Tuner started with that profile.
+- `tuner mcp` writes its own messages to stderr, which Claude Code keeps in its MCP server log. Add `--debug` (`tuner mcp --debug`) for more detail. What Tuner itself
+  did is in its normal log.
 
 ## Files and profiles
 
