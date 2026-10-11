@@ -3266,7 +3266,7 @@ FR→fr, DE/AT→de, ES/MX/AR…→es, IT→it, PT/BR→pt, NL→nl, TR→tr, PL
   pane still lists (group ids are stable) and drops the others. The tag code also filters
   ("uk" finds the UK groups smart names renamed).
 * **Ctrl+H** with marks hides all marked groups in one write (`hide_groups`), toast "Hid 5
-  groups · Settings ▸ Hidden shows them again"; without marks it is unchanged (the focused
+  groups · Settings ▸ Hidden items shows them again"; without marks it is unchanged (the focused
   group).
 * **Ctrl+Shift+H** (ListFiltering only) "Hide these N groups": the provider groups the filter
   shows **whose names (with the tag code) have a word starting with each word typed** — the
