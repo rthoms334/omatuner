@@ -1005,7 +1005,8 @@ there for the focused channel).
   lock (§21.4) for the whole refresh, marked `refresh` in the lock file, so the database keeps one
   owner: a window launched meanwhile waits as for a starting instance (10 s) and then exits
   with "a background refresh (tuner --refresh) is running; start Tuner again once it has
-  finished". Upgrades it performs are toasted by the next window (§27.3).
+  finished", on stderr and as a desktop notification (a launcher has no terminal). Upgrades it
+  performs are toasted by the next window (§27.3).
 
 ---
 
@@ -2187,7 +2188,8 @@ the current settings; the onboarding restore always applies them). Machine-speci
   stream URLs) — `Debug` prints `Secret(***)`.
 * **Redaction** (`redact::redact`, implemented + tests): registered secrets (all usernames/
   passwords/URL tokens loaded at startup and on source edits, plus the Xtream logins an M3U
-  import finds in its stream URLs — registered as found and kept in `meta`
+  import finds in its stream URLs — a pair counts once two entries with different stream ids
+  carry it, so a CDN path shaped like one never becomes a secret; registered as found and kept in `meta`
   (`playlist-logins:<id>`) for the next start, so a playlist that stays M3U has its prefixed
   short-form URLs `host/<prefix>/<u>/<p>/<id>` masked too), URL userinfo, credential query
   parameters (`username password pass token auth key sig…`), Xtream path segments
@@ -2734,8 +2736,11 @@ after reading the row:
 
 *Due* ⇔ the refresh is forced (Settings ▸ Refresh, the switch toggle) OR there is no failed
 attempt on record OR the last one is ≥ 7 days old — ≥ 1 hour when the server couldn't answer
-(network error, timeout, HTTP 5xx or 429: `transient`, which says nothing about the login; a
-rejected login, an unusable account or a bad payload keep the week). Failed attempts are
+(network error, timeout, HTTP 5xx or 429: `transient`, which says nothing about the login —
+also when the login worked but every list failed only that way; a rejected login, an unusable
+account or a bad payload keep the week). The hour is a floor, not a timer: the M3U import of
+the same refresh usually succeeds and the source is then not due before `playlist_refresh_h`,
+so the check normally comes with the next scheduled refresh (or Ctrl+R / *Refresh now*). Failed attempts are
 recorded in `meta` as `xtream-upgrade:<source id>` = `{"at": <unix s>, "login_failed": bool,
 "transient": bool}` (deleted on success and on switching).
 
@@ -2769,10 +2774,14 @@ Attempt:
 The outcome is `JobOutcome::SourceRefreshed { upgraded, account, … }`; the app shows
 `Toast::info("Upgraded to Xtream login — movies & series now available")` whenever `upgraded`
 (silent refreshes from the scheduler included) and forwards `account` to the connection budget
-as before. `tuner --refresh` has no window to toast in: it notes each upgraded source in `meta`
-(`xtream-upgraded-unseen:<id>`, `note_unseen_upgrade`) and the next window's start takes them
-(`take_unseen_upgrades`: sources still Xtream, by name, once). `AddSource` runs the same refresh inline (an "Add anyway" M3U may upgrade during its
-first import; onboarding's Done step shows the counts, no toast).
+as before. The commit itself notes the source in `meta` (`xtream-upgraded-unseen:<id>`,
+`note_unseen_upgrade`, in the finish transaction with `set_source_kind`); the app deletes it
+when it shows the toast (`forget_unseen_upgrade`). Whatever is left — `tuner --refresh` has no
+window, and a window that quit (or a headless run that timed out) cancels the job before its
+outcome is shown — the next window's start takes (`take_unseen_upgrades`: sources still Xtream,
+once; named when there are several playlists). `AddSource` runs the same refresh inline (an "Add anyway" M3U may upgrade during its
+first import; onboarding's Done step shows the counts, no toast, and `add_source` drops the
+`xtream-upgraded-unseen` note).
 
 **Switching in Settings ▸ Playlists ▸ source** (UI): a toggle row "Use the Xtream login"
 (= `!keep_m3u`) appears for Xtream sources with `m3u_origin()` and for M3U sources with

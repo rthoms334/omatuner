@@ -190,8 +190,10 @@ these and signs in with the Xtream API (`player_api.php`) without asking:
   ("Upgraded to Xtream login — movies & series now available"). Favourites, history, progress,
   renames and locks carry over. Settings ▸ Playlists shows them as *Xtream (from M3U)*.
 - **If the login fails** the playlist simply stays M3U and Tuner tries again after a week (or
-  at once with *Refresh now* in the playlist's editor). If the server couldn't be reached at
-  all (offline, a timeout, a server error), it tries again after an hour.
+  at once with *Refresh now* in the playlist's editor). If the server couldn't answer at all
+  (offline, a timeout, a server error), it tries again at the next refresh at least an hour
+  later — normally the next scheduled one, as the playlist itself was refreshed meanwhile.
+  If you quit Tuner just after a playlist switched, the toast is shown the next time it opens.
 - **Keep as M3U:** choose it in the Test step, or turn off **Use the Xtream login** in the
   playlist's editor (it asks first, since movies and series that are not in the playlist go
   away). Turning it back on signs in right away and says so if the login is refused.
@@ -620,7 +622,7 @@ tuner [--view home|live|guide|movies|series|search|settings] [--play <ref>]
 | `--play <ref>` | Play a channel by its stable reference `<source-id>:<item-key>` (e.g. `2:xt:live:1234`), a stream URL or a media file. |
 | `--debug` | Debug logging for this session, whatever the setting says. |
 | `--profile-dir <dir>` | Keep config, data, cache, logs and the socket under `<dir>`. Use it for testing, or for a second profile. |
-| `--refresh` | Refresh stale playlists and guides without a window, then exit (status 1 if a refresh failed). Does nothing while Tuner is running, because the open window refreshes on its own. While it runs, starting Tuner waits a few seconds and then says a background refresh is running. A playlist it upgraded to its Xtream login is announced the next time Tuner opens. |
+| `--refresh` | Refresh stale playlists and guides without a window, then exit (status 1 if a refresh failed). Does nothing while Tuner is running, because the open window refreshes on its own. While it runs, starting Tuner waits a few seconds and then says (also as a desktop notification) that a background refresh is running. A playlist it upgraded to its Xtream login is announced the next time Tuner opens. |
 | `PLAYLIST_OR_URL…` | An `.m3u`/`.m3u8` file opens the add-playlist card. A stream URL or media file plays straight away. `file://` URIs are treated as paths. |
 | `--help`, `--version` | Usage and version. |
 

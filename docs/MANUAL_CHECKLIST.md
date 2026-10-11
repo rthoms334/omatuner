@@ -462,8 +462,19 @@ These items use the **default** profile: start Tuner from the launcher, not with
 - [ ] **Backspace onto a locked channel:** with a PIN set, unlock, watch a locked channel, zap
   away and let the session relock. **Expect:** Backspace opens the PIN prompt; the right PIN goes
   back to that channel.
-- [ ] **Restore while leaving Settings:** start a backup restore and leave Settings before it
-  finishes. **Expect:** the restored preferences are applied and saved to `config.toml`.
+- [ ] **Restore while leaving Settings:** start a backup restore with **Restore settings** on
+  and leave Settings before it finishes. **Expect:** the restored preferences are applied and
+  saved to `config.toml`.
+- [ ] **Restore settings on Merge vs Replace:**
+  - **Do:** back up, then change a preference (e.g. the layout) and set a PIN. In Settings ▸
+    Backup choose *Merge*, then *Replace everything*, then *Merge* again, watching **Restore
+    settings**. Restore with *Merge* and the toggle off; then with *Merge* and the toggle on;
+    then with *Replace everything* (toggle on).
+  - **Expect:**
+    - The toggle reads off for Merge and on for Replace each time the mode changes.
+    - Merge with it off keeps your current layout; with it on, and with Replace, the backup's
+      layout comes back and `config.toml` is rewritten.
+    - Your PIN is never replaced by the backup's.
 
 ## 11. Soak
 
@@ -527,6 +538,21 @@ These items use the **default** profile: start Tuner from the launcher, not with
   deliberate short page (title, poster, group, and the playlist when there are several) with no
   loading skeleton and no request to the provider; an untitled episode reads
   "S01E03 · Episode 3", also on the next-episode card.
+- [ ] **Offline at launch:**
+  - **Do:** add a provider's `get.php` URL as M3U with the previous release (not upgraded yet).
+    Install this build, disconnect the network and start Tuner. Reconnect a few minutes later and
+    press Ctrl+R; press Ctrl+R again more than an hour later.
+  - **Expect:**
+    - At launch the refresh fails offline (one toast, "Offline — showing saved data"), and the
+      log says "Couldn't use the Xtream login of … (network error …)".
+    - The first Ctrl+R imports the playlist as M3U without signing in again.
+    - The Ctrl+R an hour later signs in and upgrades, with the toast — not a week later.
+- [ ] **Quit right after the switch:** on a playlist not upgraded yet, refresh and quit as soon
+  as Live TV has its new channels (while movies and series still import). **Expect:** the next
+  start shows the upgrade toast once.
+- [ ] **Launch from the desktop during a background refresh:** run `tuner --refresh` on a slow
+  provider and start Tuner from the app launcher. **Expect:** after about 10 s a desktop
+  notification says a background refresh is running.
 - [ ] **Login refused:** use a playlist whose panel rejects the API login. **Expect:** it stays
   M3U with movies and series sorted out of the playlist, and the next automatic check is a week
   later (*Refresh now* in its editor retries at once).
