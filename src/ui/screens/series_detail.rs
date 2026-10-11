@@ -586,6 +586,10 @@ impl Screen for SeriesDetailScreen {
                     mi(glyphs::LOCK, if every { "Lock / unlock every copy" } else { "Lock / unlock" }, Action::ToggleLock, Some("Ctrl+L")),
                     mi(glyphs::HIDDEN, if every { "Hide every copy" } else { "Hide" }, Action::ToggleHidden, Some("Ctrl+H")),
                 ]);
+                // combine it with a title the matcher kept apart (DESIGN §29.16)
+                if crate::ui::stacks::combine(ctx.config) {
+                    items.push(mi(glyphs::PLAYLIST, "Same title as…", Action::Digit(super::copies::SAME_TITLE), None));
+                }
                 ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: "Series".into(), items }));
             }
             // this is the details page already
@@ -607,6 +611,12 @@ impl Screen for SeriesDetailScreen {
         }
         match result {
             OverlayResult::Chosen(Action::PlayFrom) => self.copies.play_from_menu(ctx),
+            OverlayResult::Chosen(Action::Digit(super::copies::SAME_TITLE)) => {
+                if let Some((item, d)) = self.series_ref().zip(self.data.as_ref()) {
+                    let name = d.series.display_name().to_owned();
+                    crate::ui::copies::same_title_picker(ctx, item, &name);
+                }
+            }
             OverlayResult::Chosen(Action::Digit(MENU_SEASON_WATCHED)) => {
                 let eps = self.current_episodes().into_iter().cloned().collect();
                 self.mark(ctx, eps, true);
@@ -1167,7 +1177,9 @@ mod tests {
         let Some((_, undo)) = toast.action else { unreachable!() };
         h.state_mut().act(undo);
         until(&mut h, "the rows as they were", |h| {
-            named_ep(h, a, 1).is_none() && named_ep(h, b, 2).is_some_and(|p| !p.finished && p.position_s == 600.0) && named_ep(h, b, 1).is_some_and(|p| p.finished)
+            named_ep(h, a, 1).is_none()
+                && named_ep(h, b, 2).is_some_and(|p| !p.finished && p.position_s == 600.0)
+                && named_ep(h, b, 1).is_some_and(|p| p.finished)
         });
     }
 

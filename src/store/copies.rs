@@ -11,6 +11,7 @@
 //! | Lock / unlock | every copy ([`lock`]) |
 //! | Hide | every copy ([`hide`]) |
 //! | Rename | copies without their own rename ([`rename`]); [`rename_conflicts`] lists the others to ask about |
+//! | Same title as… | a join of two copies and their stacks ([`join`], P3) |
 //! | Progress | the copy being played (the player saves it as before) |
 //!
 //! Every action returns an [`Undo`]: the rows of its table as they were, put back exactly by
@@ -640,6 +641,17 @@ pub fn split(conn: &Connection, item: &ItemRef, on: bool, now: Timestamp) -> Res
     atomic(conn, |c| {
         let before = snapshot(c, Table::Links, std::slice::from_ref(item))?;
         crate::store::titles::set_split(c, item, on, now)?;
+        Ok(before)
+    })
+}
+
+/// "Same title as…" (P3): `item` and `other` stack together from now on, with the stacks
+/// they are in (`titles::join`). The Undo covers every copy of both join groups.
+pub fn join(conn: &Connection, item: &ItemRef, other: &ItemRef, now: Timestamp) -> Result<Undo> {
+    atomic(conn, |c| {
+        let refs = crate::store::titles::group_members(c, &[item.clone(), other.clone()])?;
+        let before = snapshot(c, Table::Links, &refs)?;
+        crate::store::titles::join(c, item, other, now)?;
         Ok(before)
     })
 }

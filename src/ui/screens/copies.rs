@@ -41,6 +41,8 @@ pub(super) const CARD_PLAY: u8 = 90;
 pub(super) const CARD_PIN: u8 = 91;
 pub(super) const CARD_SPLIT: u8 = 92;
 pub(super) const CARD_PAGE: u8 = 93;
+/// A detail page's "Same title as…" (DESIGN §29.16).
+pub(super) const SAME_TITLE: u8 = 94;
 
 /// What the page does after a Copies action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,7 +315,9 @@ impl Copies {
             }
         });
         // how the copies were matched; how to take one apart
+        let joined = self.members.iter().any(|m| stacks.meta(*m).joined);
         let how = match self.page.and_then(|p| stacks.meta(p).tmdb) {
+            _ if joined => "Combined by you (Same title as…)".to_owned(),
             Some(_) => "Matched by TMDB id".to_owned(),
             None => match self.page.and_then(|p| all.get(p as usize)).and_then(|v| v.year) {
                 Some(y) => format!("Matched by title and year ({y})"),

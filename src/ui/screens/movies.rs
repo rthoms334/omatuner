@@ -132,6 +132,8 @@ const MENU_COUNTRIES: u8 = 23;
 const MENU_EXPLICIT: u8 = 24;
 /// A fanned-out copy's "Not the same title".
 const MENU_SPLIT: u8 = 25;
+/// "Same title as…" (DESIGN §29.16).
+const MENU_SAME_TITLE: u8 = 26;
 /// "Play from…": copy `k` of the menu is `MENU_COPY + k`.
 const MENU_COPY: u8 = 40;
 /// Copies listed in "Play from…".
@@ -828,6 +830,10 @@ impl VodBrowser {
         } else if self.stacked && copies.len() > 1 {
             items.push(MenuItem { shortcut: None, ..mi(glyphs::CLOSE, "Not the same title", Action::Digit(MENU_SPLIT), "") });
         }
+        // combine it with a title the matcher kept apart (copies combine in All)
+        if st::combine(ctx.config) {
+            items.push(MenuItem { shortcut: None, ..mi(glyphs::PLAYLIST, "Same title as…", Action::Digit(MENU_SAME_TITLE), "") });
+        }
         let fav =
             fav || (stack.is_some() && copies.iter().any(|c| self.all(ctx).get(*c as usize).is_some_and(|x| ctx.favs.is_fav(&st::item_ref(x)))));
         items.extend([
@@ -1236,6 +1242,11 @@ impl VodBrowser {
             OverlayResult::Chosen(Action::Digit(MENU_SPLIT)) => {
                 if let Some(v) = self.current(ctx) {
                     crate::ui::copies::split(ctx, &st::item_ref(&v), &v.name);
+                }
+            }
+            OverlayResult::Chosen(Action::Digit(MENU_SAME_TITLE)) => {
+                if let Some(v) = self.current(ctx) {
+                    crate::ui::copies::same_title_picker(ctx, st::item_ref(&v), &v.name);
                 }
             }
             OverlayResult::Chosen(Action::FanOut) => self.toggle_fan(ctx, self.grid.cursor),

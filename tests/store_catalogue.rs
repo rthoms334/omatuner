@@ -1789,6 +1789,50 @@ fn a_split_follows_its_copy_to_a_new_key() {
     assert_eq!(lib.vod.stacks(true).len(), 0, "still not the same title");
 }
 
+/// "Same title as…" (DESIGN §29.16, P3): two copies the matcher keeps apart (different TMDB
+/// ids) stack once the user joins them — across a refresh, and after the provider re-keys
+/// one of them (the join is user data, re-attached by fingerprint); joining a third title to
+/// one of them merges the groups; separating a copy leaves the others joined until one is
+/// left.
+#[test]
+fn a_join_stacks_two_titles_and_follows_its_copy_to_a_new_key() {
+    use tuner::store::titles::{self, LinkAction};
+    let s = store("tuner-st-join");
+    let (a, b) = w(&s, |c| Ok((seed::seed_source(c, "TV")?, seed::seed_source(c, "TV 2")?)));
+    let tv = vec![listed("a1", "EN ★ Incendies - 2010", "EN", 0, Some(46738)), listed("a2", "EN ★ Heat - 1995", "EN", 1, None)];
+    run_import(&s, a, vec![], tv.clone(), vec![], vec![ItemKind::Movie], NOW);
+    let frau = listed("b1", "DE - Die Frau die singt (2010)", "Films", 0, Some(99));
+    run_import(&s, b, vec![], vec![frau.clone()], vec![], vec![ItemKind::Movie], NOW);
+    let r = s.reader().unwrap();
+    let stacked = |keys: &[&str]| {
+        let lib = library::load(&r).unwrap();
+        let st = lib.vod.stacks(true);
+        let at = |k: &str| lib.vod.movies.iter().position(|m| m.key.0 == k).map(|i| i as u32).unwrap();
+        let first = st.stack_of(at(keys[0]));
+        first.is_some() && keys.iter().all(|k| st.stack_of(at(k)) == first) && st.members(first.unwrap()).len() == keys.len()
+    };
+    assert!(!stacked(&["a1", "b1"]), "two TMDB ids: two titles");
+    w(&s, move |c| titles::join(c, &mref(a, "a1"), &mref(b, "b1"), NOW));
+    assert!(stacked(&["a1", "b1"]), "joined");
+    // a refresh that re-keys TV 2's copy keeps the join
+    run_import(&s, b, vec![], vec![ImportMovie { key: ItemKey("b1-new".into()), ..frau }], vec![], vec![ItemKind::Movie], NOW + 10);
+    run_import(&s, a, vec![], tv, vec![], vec![ItemKind::Movie], NOW + 10);
+    let joins: Vec<String> = titles::links(&r).unwrap().into_iter().filter(|l| l.action == LinkAction::Join).map(|l| l.item.key.0).collect();
+    assert_eq!(joins, ["a1", "b1-new"]);
+    assert!(stacked(&["a1", "b1-new"]), "still one title");
+    // Heat joined to the German copy: one group of three
+    w(&s, move |c| titles::join(c, &mref(a, "a2"), &mref(b, "b1-new"), NOW + 20));
+    assert!(stacked(&["a1", "a2", "b1-new"]));
+    let groups: std::collections::HashSet<i64> = titles::links(&r).unwrap().into_iter().filter_map(|l| l.group).collect();
+    assert_eq!(groups.len(), 1);
+    // separating Heat leaves the other two; separating one of those ends the group
+    w(&s, move |c| titles::unjoin(c, &mref(a, "a2")));
+    assert!(stacked(&["a1", "b1-new"]));
+    w(&s, move |c| titles::unjoin(c, &mref(a, "a1")));
+    assert!(titles::links(&r).unwrap().is_empty(), "a group of one is gone");
+    assert!(!stacked(&["a1", "b1-new"]));
+}
+
 /// A movie's failure orders its copies ("failed 2 h ago", DESIGN §29.15): a refresh that also
 /// imports channels keeps it; a movie that is gone takes its failure along.
 #[test]

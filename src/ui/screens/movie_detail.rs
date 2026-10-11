@@ -262,6 +262,10 @@ impl MovieDetailScreen {
                     items.push(MenuItem { shortcut: None, ..mi(glyphs::CLOSE, "Not the same title", Action::Digit(super::copies::CARD_SPLIT), "") });
                     self.copies.aim_at_page();
                 }
+                // combine it with a title the matcher kept apart (DESIGN §29.16)
+                if crate::ui::stacks::combine(ctx.config) {
+                    items.push(MenuItem { shortcut: None, ..mi(glyphs::PLAYLIST, "Same title as…", Action::Digit(super::copies::SAME_TITLE), "") });
+                }
                 items.extend([
                     mi(glyphs::FAVOURITE, if fav { "Remove from Favourites" } else { "Add to Favourites" }, Action::ToggleFavourite, "Ctrl+F"),
                     mi(glyphs::FAV_LIST, "Favourites lists…", Action::AddToList, "Ctrl+Shift+F"),
@@ -464,6 +468,12 @@ impl Screen for MovieDetailScreen {
         }
         match result {
             OverlayResult::Chosen(Action::PlayFrom) => self.copies.play_from_menu(ctx),
+            OverlayResult::Chosen(Action::Digit(super::copies::SAME_TITLE)) => {
+                if let Some(item) = self.item(ctx) {
+                    let name = self.title(ctx);
+                    crate::ui::copies::same_title_picker(ctx, item, &name);
+                }
+            }
             OverlayResult::Unlocked(Action::Activate) | OverlayResult::Chosen(Action::Activate) => self.play(ctx, true),
             OverlayResult::Unlocked(Action::ActivateAlt) | OverlayResult::Chosen(Action::ActivateAlt) => self.play(ctx, false),
             OverlayResult::Unlocked(Action::ToggleLock) => self.item_action(ctx, Action::ToggleLock),

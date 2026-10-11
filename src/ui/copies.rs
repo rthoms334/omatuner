@@ -409,6 +409,17 @@ pub fn split(ctx: &mut crate::ui::UiCtx<'_>, item: &ItemRef, name: &str) {
     write_with_undo(ctx, DataScope::Overrides, text, move |c| copies::split(c, &item, true, now));
 }
 
+/// "Same title as…" (P3): `item`'s title and `other`'s stack together from now on, with Undo.
+pub fn join(ctx: &crate::ui::UiCtx<'_>, item: &ItemRef, other: &ItemRef, text: String) {
+    let (item, other, now) = (item.clone(), other.clone(), ctx.now);
+    write_with_undo(ctx, DataScope::Overrides, text, move |c| copies::join(c, &item, &other, now));
+}
+
+/// The "Same title as…" picker for a copy (a card's or a detail page's menu).
+pub fn same_title_picker(ctx: &mut crate::ui::UiCtx<'_>, item: ItemRef, name: &str) {
+    ctx.open(OverlayRequest::SameTitle(crate::ui::overlays::same_title::SameTitleSpec { item, name: name.to_owned() }));
+}
+
 /// "Always play from <playlist>" on a copy of `plan` (or off), with Undo.
 pub fn pin(ctx: &mut crate::ui::UiCtx<'_>, plan: &CopyPlan, item: &ItemRef, on: bool) {
     let playlist = ctx.lib.source(item.source).map_or_else(|| "this playlist".to_owned(), |s| s.name.clone());

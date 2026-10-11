@@ -1060,6 +1060,7 @@ fn load_vod(conn: &Connection, movies: bool, groups: &[Group], x: &mut ExplicitI
     let links = load_memberships(conn, &format!("SELECT l.{col}, l.group_id, 0 FROM {link} l"), &flags)?;
     let split = crate::store::titles::linked_ids(conn, item_kind, LinkAction::Split)?;
     let pinned = crate::store::titles::linked_ids(conn, item_kind, LinkAction::Pin)?;
+    let joins = crate::store::titles::join_groups(conn, item_kind)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT x.id, x.source_id, x.key, COALESCE(o.rename, x.clean_name), x.year, x.{poster}, x.rating, x.added_at,
                 x.provider_order, COALESCE(o.locked, 0), COALESCE(o.hidden, 0),
@@ -1127,6 +1128,7 @@ fn load_vod(conn: &Connection, movies: bool, groups: &[Group], x: &mut ExplicitI
             tmdb,
             split: split.contains(&id),
             pinned: pinned.contains(&id),
+            join: joins.get(&id).copied(),
         });
         let idx = items.len() as u32;
         for g in &v.group_ids {

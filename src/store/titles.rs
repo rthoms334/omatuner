@@ -9,10 +9,15 @@
 //!   migration 0005. Only rows not computed yet (`match_tags IS NULL`: new, or the import saw
 //!   another name or year) are parsed — unless the rules version or the playlist's prefixes
 //!   changed (`meta` `vod_match:<id>`), then all of them. Only changed rows are written.
-//! * A split or a pin changes stacks: write it with `DataScope::Overrides` (the library
-//!   rebuilds).
+//! * A split, a pin or a join changes stacks: write it with `DataScope::Overrides` (the
+//!   library rebuilds).
+//! * "Same title as…" ([`join`], P3): the user combines two titles the matcher kept apart.
+//!   Each copy gets a `join` row with a shared `join_group`; the library build stacks the
+//!   copies of one group together with the stacks they are in (`stacks::build`). Joining a
+//!   copy that is already joined merges the two groups. Like splits and pins the rows carry
+//!   fingerprints, so a refresh that re-keys a copy re-attaches them.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -103,6 +108,8 @@ pub enum LinkAction {
     Split,
     /// "Always play from …": the copy plays first in its stack.
     Pin,
+    /// "Same title as…": the copy stacks with the other copies of its join group.
+    Join,
 }
 
 impl LinkAction {
@@ -110,11 +117,21 @@ impl LinkAction {
         match self {
             LinkAction::Split => "split",
             LinkAction::Pin => "pin",
+            LinkAction::Join => "join",
+        }
+    }
+
+    fn parse(s: &str) -> Self {
+        match s {
+            "split" => LinkAction::Split,
+            "join" => LinkAction::Join,
+            _ => LinkAction::Pin,
         }
     }
 }
 
-/// One stored correction, for Settings ▸ Hidden ▸ "Titles you separated or pinned".
+/// One stored correction, for Settings ▸ Hidden ▸ "Titles you separated, combined or
+/// pinned".
 #[derive(Debug, Clone, PartialEq)]
 pub struct TitleLink {
     pub item: ItemRef,
@@ -122,6 +139,8 @@ pub struct TitleLink {
     pub at: Timestamp,
     /// The copy's display name, when it still exists.
     pub name: Option<String>,
+    /// A join's group (the copies combined with it share it).
+    pub group: Option<i64>,
 }
 
 fn vod_kind_str(kind: ItemKind) -> Option<&'static str> {
@@ -169,26 +188,107 @@ fn set_link(conn: &Connection, item: &ItemRef, action: LinkAction, on: bool, now
     Ok(())
 }
 
+/// "Same title as…": `item` and `other` (copies of two titles) stack together from now on —
+/// with the stacks they are in. A copy already joined brings its group along (the groups
+/// merge). Write with `DataScope::Overrides`.
+pub fn join(conn: &Connection, item: &ItemRef, other: &ItemRef, now: Timestamp) -> Result<()> {
+    if item == other || vod_kind_str(item.kind).is_none() || item.kind != other.kind {
+        return Ok(());
+    }
+    let (a, b) = (group_of(conn, item)?, group_of(conn, other)?);
+    let group = match (a, b) {
+        (Some(g), _) | (None, Some(g)) => g,
+        (None, None) => conn.query_row("SELECT COALESCE(max(join_group), 0) + 1 FROM title_link", [], |r| r.get(0))?,
+    };
+    if let (Some(a), Some(b)) = (a, b)
+        && a != b
+    {
+        conn.execute("UPDATE title_link SET join_group = ?1 WHERE action = 'join' AND join_group = ?2", params![a, b])?;
+    }
+    for r in [item, other] {
+        set_link(conn, r, LinkAction::Join, true, now)?;
+        conn.execute(
+            "UPDATE title_link SET join_group = ?4 WHERE source_id = ?1 AND kind = ?2 AND item_key = ?3 AND action = 'join'",
+            params![r.source, vod_kind_str(r.kind), r.key.as_str(), group],
+        )?;
+    }
+    Ok(())
+}
+
+/// Take `item` out of its join group (Settings ▸ Hidden's Enter); a group left with one copy
+/// goes too.
+pub fn unjoin(conn: &Connection, item: &ItemRef) -> Result<()> {
+    let Some(group) = group_of(conn, item)? else { return Ok(()) };
+    set_link(conn, item, LinkAction::Join, false, 0)?;
+    let left: i64 = conn.query_row("SELECT count(*) FROM title_link WHERE action = 'join' AND join_group = ?1", [group], |r| r.get(0))?;
+    if left < 2 {
+        conn.execute("DELETE FROM title_link WHERE action = 'join' AND join_group = ?1", [group])?;
+    }
+    Ok(())
+}
+
+/// The join group of a copy.
+pub fn group_of(conn: &Connection, item: &ItemRef) -> Result<Option<i64>> {
+    let Some(kind) = vod_kind_str(item.kind) else { return Ok(None) };
+    Ok(conn
+        .prepare_cached("SELECT join_group FROM title_link WHERE source_id = ?1 AND kind = ?2 AND item_key = ?3 AND action = 'join'")?
+        .query_row(params![item.source, kind, item.key.as_str()], |r| r.get::<_, Option<i64>>(0))
+        .optional()?
+        .flatten())
+}
+
+/// The copies in the join groups of `items` (an Undo snapshot of a join covers them all).
+pub fn group_members(conn: &Connection, items: &[ItemRef]) -> Result<Vec<ItemRef>> {
+    let mut out: Vec<ItemRef> = items.to_vec();
+    let mut stmt = conn
+        .prepare_cached("SELECT source_id, kind, item_key FROM title_link WHERE action = 'join' AND join_group = ?1 ORDER BY source_id, item_key")?;
+    for i in items {
+        let Some(g) = group_of(conn, i)? else { continue };
+        for r in stmt.query_map([g], |r| {
+            let kind: String = r.get(1)?;
+            Ok(ItemRef { source: r.get(0)?, kind: if kind == "movie" { ItemKind::Movie } else { ItemKind::Series }, key: ItemKey(r.get(2)?) })
+        })? {
+            let r = r?;
+            if !out.contains(&r) {
+                out.push(r);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Row id → join group of the joined copies of `kind` (the library build).
+pub fn join_groups(conn: &Connection, kind: ItemKind) -> Result<HashMap<i64, i64>> {
+    let Some(k) = vod_kind_str(kind) else { return Ok(HashMap::new()) };
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT x.id, t.join_group FROM title_link t JOIN {k} x ON x.source_id = t.source_id AND x.key = t.item_key
+         WHERE t.kind = ?1 AND t.action = 'join' AND t.join_group IS NOT NULL"
+    ))?;
+    let rows = stmt.query_map([k], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
 /// Every correction, newest first, with the copy's display name.
 pub fn links(conn: &Connection) -> Result<Vec<TitleLink>> {
     let mut stmt = conn.prepare(
-        "SELECT t.source_id, t.kind, t.item_key, t.action, t.at,
+        "SELECT t.source_id, t.kind, t.item_key, t.action, t.at, t.join_group,
                 COALESCE((SELECT COALESCE(o.rename, m.clean_name) FROM movie m
                             LEFT JOIN item_override o ON o.source_id = m.source_id AND o.kind = 'movie' AND o.item_key = m.key
                            WHERE t.kind = 'movie' AND m.source_id = t.source_id AND m.key = t.item_key),
                          (SELECT COALESCE(o.rename, s.clean_name) FROM series s
                             LEFT JOIN item_override o ON o.source_id = s.source_id AND o.kind = 'series' AND o.item_key = s.key
                            WHERE t.kind = 'series' AND s.source_id = t.source_id AND s.key = t.item_key))
-         FROM title_link t ORDER BY t.at DESC, t.source_id, t.item_key",
+         FROM title_link t ORDER BY t.at DESC, t.join_group, t.source_id, t.item_key",
     )?;
     let rows = stmt.query_map([], |r| {
         let kind: String = r.get(1)?;
         let action: String = r.get(3)?;
         Ok(TitleLink {
             item: ItemRef { source: r.get(0)?, kind: if kind == "movie" { ItemKind::Movie } else { ItemKind::Series }, key: ItemKey(r.get(2)?) },
-            action: if action == "split" { LinkAction::Split } else { LinkAction::Pin },
+            action: LinkAction::parse(&action),
             at: r.get(4)?,
-            name: r.get(5)?,
+            group: r.get(5)?,
+            name: r.get(6)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
