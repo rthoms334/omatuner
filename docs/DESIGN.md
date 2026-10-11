@@ -2293,7 +2293,8 @@ prefer-dark/light). `hypr::focus_self` uses Hyprland 0.56's Lua dispatcher
   (aarch64, natively on `ubuntu-24.04-arm`), and publishes a GitHub Release (`--generate-notes`;
   a tag with a suffix is a pre-release) with `omatuner-<ver>-<rel>-<arch>.pkg.tar.zst`,
   `omatuner-<ver>-<arch>.tar.gz` (binary, desktop entry, icon, snippets, README, LICENSE) and
-  `SHA256SUMS`. A manual run with `publish=false` is a dry run (workflow artifacts only).
+  `SHA256SUMS`. A manual run with `publish=false`, and every pull request that touches
+  `packaging/`, `Cargo.*` or the workflow, is a dry run (workflow artifacts only).
 * **CI** (`.github/workflows/ci.yml`): pull requests and pushes to `main`, same two containers:
   `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo build
   --all-targets --locked`, `scripts/gen-test-media.sh`, then `dbus-run-session -- cargo test

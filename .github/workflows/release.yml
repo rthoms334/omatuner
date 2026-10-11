@@ -4,10 +4,17 @@ name: Release
 # and tarballs for x86_64 and aarch64 and publishes a GitHub Release. `<version>` must equal
 # Cargo.toml's version (the PKGBUILD checks its pkgver against it too).
 # Run by hand with `publish` off for a dry run on any branch: the files are only uploaded as
-# workflow artifacts.
+# workflow artifacts. Pull requests that change the packaging or this workflow get the same dry
+# run (build only; the publish job never runs for them).
 on:
   push:
     tags: ["v*"]
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "packaging/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
   workflow_dispatch:
     inputs:
       publish:
@@ -20,7 +27,7 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -133,7 +140,7 @@ jobs:
 
   publish:
     needs: build
-    if: github.event_name == 'push' || inputs.publish
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish)
     runs-on: ubuntu-24.04
     permissions:
       contents: write

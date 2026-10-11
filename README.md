@@ -794,7 +794,8 @@ scripts/gen-big-fixtures.py                   # 100k-channel M3U + 415k-programm
   and the PKGBUILD's `pkgver`) builds the PKGBUILD with makepkg on both architectures and
   publishes a GitHub Release with the packages, tarballs and `SHA256SUMS`. A tag with a suffix
   (`v0.1.1-rc1` for version 0.1.1) becomes a pre-release. *Run workflow* with `publish` off is a dry run that only
-  uploads the files as workflow artifacts.
+  uploads the files as workflow artifacts; pull requests that change `packaging/`, `Cargo.*` or
+  the workflow get the same dry run.
 
 ## Licence
 
