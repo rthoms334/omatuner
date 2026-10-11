@@ -10,6 +10,11 @@
 //! playlist (M3U) series are complete at import and get the sparse header (DESIGN §27.7).
 //! The "Next episode in 10 s" card itself is the fullscreen player's (WP-11, drawn over the
 //! video in OSD colours, for an episode started anywhere); this page only moves its cursor.
+//!
+//! A series with several copies (DESIGN §29.14) gets a Copies section of mini-cards between
+//! the buttons and the seasons (`copies::Copies`; ↑/↓ and Tab reach it, ←/→ walk it, Enter
+//! picks the copy Play uses — Play then opens at that copy's next episode — the menu key opens
+//! its menu, "Open its page" included) and a "Play from" button (Ctrl+O).
 
 use std::collections::HashMap;
 
@@ -31,6 +36,8 @@ use crate::ui::{OverlayRequest, Route, Screen, ScreenId, UiCtx};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Section {
     Buttons,
+    /// The Copies mini-cards (only while the series has several copies).
+    Copies,
     Seasons,
     #[default]
     Episodes,
@@ -39,6 +46,8 @@ enum Section {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Btn {
     Play,
+    /// "Play from ▾": the series' copies (DESIGN §29.14).
+    PlayFrom,
     Favourite,
     SeasonWatched,
 }
@@ -109,6 +118,7 @@ pub struct SeriesDetailScreen {
     /// Place the cursor on the next episode when the data arrives (first load of a series).
     position_pending: bool,
     scroll_to_cursor: bool,
+    copies: super::copies::Copies,
 }
 
 impl SeriesDetailScreen {
@@ -181,6 +191,12 @@ impl SeriesDetailScreen {
             kit::ask_pin(ctx, if alt { Action::ActivateAlt } else { Action::Activate }, "This series is locked");
             return;
         }
+        // several copies: the same episode of the next copy is the fallback (DESIGN §29.15)
+        if let Some(id) = self.id.filter(|_| self.copies.is_stacked()) {
+            let plan = self.copies.plan().clone();
+            crate::ui::copies::play_episode(ctx, &plan, id, e, from_start, true);
+            return;
+        }
         if from_start {
             kit::play_media(ctx, MediaRef::Episode(e.id), false, PlayOrigin::Fullscreen);
         } else {
@@ -188,8 +204,41 @@ impl SeriesDetailScreen {
         }
     }
 
-    fn buttons(&self) -> [Btn; 3] {
-        [Btn::Play, Btn::Favourite, Btn::SeasonWatched]
+    fn buttons(&self) -> Vec<Btn> {
+        if self.copies.is_stacked() {
+            vec![Btn::Play, Btn::PlayFrom, Btn::Favourite, Btn::SeasonWatched]
+        } else {
+            vec![Btn::Play, Btn::Favourite, Btn::SeasonWatched]
+        }
+    }
+
+    /// The copy Play uses when it isn't this page's (DESIGN §29.14).
+    fn other_copy(&self) -> Option<u32> {
+        self.copies.plays().filter(|c| Some(*c) != self.copies.page())
+    }
+
+    /// Play another copy: the episode its page would open at.
+    fn play_copy(&mut self, ctx: &mut UiCtx<'_>, c: u32) {
+        let Some(v) = ctx.lib.vod.series.get(c as usize).cloned() else { return };
+        let VodKind::Series(id) = v.kind else { return };
+        // a locked copy: the PIN first (its answer comes back through the Copies section)
+        if v.locked && !kit::unlocked(ctx) {
+            self.copies.request_play(ctx, c);
+            return;
+        }
+        // its own next episode, with the next copy's as the fallback
+        if !crate::ui::copies::play_title(ctx, false, c, Some(c), true) {
+            super::movies::play_series(ctx, id, &v.name);
+        }
+    }
+
+    /// The sections ↑/↓ and Tab walk, in order.
+    fn sections(&self) -> Vec<Section> {
+        if self.copies.is_stacked() {
+            vec![Section::Buttons, Section::Copies, Section::Seasons, Section::Episodes]
+        } else {
+            vec![Section::Buttons, Section::Seasons, Section::Episodes]
+        }
     }
 
     fn season_watched(&self) -> bool {
@@ -229,10 +278,13 @@ impl SeriesDetailScreen {
     fn press(&mut self, ctx: &mut UiCtx<'_>, b: Btn) {
         match b {
             Btn::Play => {
-                if let Some(e) = self.next_episode() {
+                if let Some(c) = self.other_copy() {
+                    self.play_copy(ctx, c);
+                } else if let Some(e) = self.next_episode() {
                     self.play(ctx, &e, false, false);
                 }
             }
+            Btn::PlayFrom => self.copies.play_from_menu(ctx),
             Btn::Favourite => {
                 if let Some(item) = self.series_ref() {
                     kit::toggle_favourite(ctx, &item);
@@ -248,14 +300,16 @@ impl SeriesDetailScreen {
 
     fn move_vertical(&mut self, down: bool) {
         let n_eps = self.current_episodes().len();
+        let sections = self.sections();
+        let at = sections.iter().position(|s| *s == self.section).unwrap_or(0);
         match (self.section, down) {
-            (Section::Buttons, true) => self.section = Section::Seasons,
-            (Section::Seasons, true) => self.section = Section::Episodes,
-            (Section::Seasons, false) => self.section = Section::Buttons,
-            (Section::Episodes, false) if self.ep == 0 => self.section = Section::Seasons,
-            (Section::Episodes, false) => self.ep -= 1,
+            (Section::Episodes, false) if self.ep > 0 => self.ep -= 1,
             (Section::Episodes, true) => self.ep = (self.ep + 1).min(n_eps.saturating_sub(1)),
-            (Section::Buttons, false) => {}
+            (_, true) => self.section = sections[(at + 1).min(sections.len() - 1)],
+            (_, false) => self.section = sections[at.saturating_sub(1)],
+        }
+        if self.section == Section::Copies && self.copies.focus.is_none() {
+            self.copies.focus = Some(0);
         }
         self.scroll_to_cursor = true;
     }
@@ -271,6 +325,9 @@ impl SeriesDetailScreen {
 impl Screen for SeriesDetailScreen {
     fn id(&self) -> ScreenId {
         ScreenId::SeriesDetail
+    }
+    fn hint_extras(&self) -> Vec<(Action, &'static str)> {
+        if self.copies.is_stacked() { vec![(Action::PlayFrom, "play from")] } else { Vec::new() }
     }
     fn key_contexts(&self) -> Vec<KeyContext> {
         vec![KeyContext::Detail]
@@ -293,7 +350,10 @@ impl Screen for SeriesDetailScreen {
 
     fn on_event(&mut self, ctx: &mut UiCtx<'_>, ev: &AppEvent) {
         match ev {
-            AppEvent::Data(DataScope::VodDetails | DataScope::Progress | DataScope::Overrides | DataScope::Vod | DataScope::All) => self.reload(ctx),
+            AppEvent::Data(DataScope::VodDetails | DataScope::Progress | DataScope::Overrides | DataScope::Vod | DataScope::All) => {
+                self.reload(ctx);
+                self.copies.reload(ctx);
+            }
             AppEvent::Job(JobEvent::Finished { kind: JobKind::LoadSeriesDetails(s), outcome: Err(msg), .. }) if Some(*s) == self.id => {
                 ctx.toast(crate::msg::Toast::error(format!("Couldn't load the episodes: {}", crate::redact::redact(msg))));
             }
@@ -320,6 +380,10 @@ impl Screen for SeriesDetailScreen {
                 let d: isize = if action == Action::Left { -1 } else { 1 };
                 match self.section {
                     Section::Buttons => self.btn = (self.btn as isize + d).clamp(0, self.buttons().len() as isize - 1) as usize,
+                    Section::Copies => {
+                        let k = self.copies.focus.unwrap_or(0) as isize + d;
+                        self.copies.focus = Some(k.clamp(0, self.copies.len().saturating_sub(1) as isize) as usize);
+                    }
                     Section::Seasons => self.set_season((self.season as isize + d).max(0) as usize),
                     Section::Episodes => {}
                 }
@@ -327,11 +391,22 @@ impl Screen for SeriesDetailScreen {
             Action::TabPrev => self.set_season(self.season.saturating_sub(1)),
             Action::TabNext => self.set_season(self.season + 1),
             Action::FocusNext | Action::FocusPrev => {
-                let order = [Section::Buttons, Section::Seasons, Section::Episodes];
+                let order = self.sections();
+                let n = order.len();
                 let i = order.iter().position(|s| *s == self.section).unwrap_or(0);
-                let next = if action == Action::FocusNext { (i + 1) % 3 } else { (i + 2) % 3 };
+                let next = if action == Action::FocusNext { (i + 1) % n } else { (i + n - 1) % n };
                 self.section = order[next];
+                if self.section == Section::Copies && self.copies.focus.is_none() {
+                    self.copies.focus = Some(0);
+                }
             }
+            // a mini-card: Enter picks the copy Play uses, the menu key opens its menu
+            Action::Activate | Action::ContextMenu if self.section == Section::Copies => {
+                let k = self.copies.focus.unwrap_or(0);
+                let click = if action == Action::Activate { super::copies::Click::Pick(k) } else { super::copies::Click::Menu(k) };
+                self.copies.click(ctx, click);
+            }
+            Action::PlayFrom => self.copies.play_from_menu(ctx),
             Action::PageUp | Action::Home if self.section == Section::Episodes => {
                 self.ep = 0;
                 self.scroll_to_cursor = true;
@@ -342,10 +417,11 @@ impl Screen for SeriesDetailScreen {
             }
             Action::Activate => match self.section {
                 Section::Buttons => {
-                    let b = self.buttons()[self.btn.min(2)];
-                    self.press(ctx, b);
+                    if let Some(b) = self.buttons().get(self.btn).copied() {
+                        self.press(ctx, b);
+                    }
                 }
-                Section::Seasons => self.section = Section::Episodes,
+                Section::Copies | Section::Seasons => self.section = Section::Episodes,
                 Section::Episodes => {
                     if let Some(e) = self.focused_episode() {
                         self.play(ctx, &e, false, false);
@@ -391,7 +467,14 @@ impl Screen for SeriesDetailScreen {
                 };
                 let mut episode = mi(glyphs::CHECK, "Mark episode watched / unwatched", Action::MarkWatched, Some("Ctrl+W"));
                 episode.enabled = self.focused_episode().is_some();
-                let items = vec![
+                let mut items = Vec::new();
+                // several copies (DESIGN §29.14): pick one; take this one apart
+                if self.copies.is_stacked() {
+                    items.push(mi(glyphs::PLAY, "Play from…", Action::PlayFrom, Some("Ctrl+O")));
+                    items.push(mi(glyphs::CLOSE, "Not the same title", Action::Digit(super::copies::CARD_SPLIT), None));
+                    self.copies.aim_at_page();
+                }
+                items.extend([
                     mi(glyphs::CHECK, "Mark season watched", Action::Digit(MENU_SEASON_WATCHED), None),
                     mi(glyphs::CLOSE, "Mark season unwatched", Action::Digit(MENU_SEASON_UNWATCHED), None),
                     episode,
@@ -400,7 +483,7 @@ impl Screen for SeriesDetailScreen {
                     mi(glyphs::TAG, "Rename…", Action::Rename, Some("F2")),
                     mi(glyphs::LOCK, "Lock / unlock", Action::ToggleLock, Some("Ctrl+L")),
                     mi(glyphs::HIDDEN, "Hide", Action::ToggleHidden, Some("Ctrl+H")),
-                ];
+                ]);
                 ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: "Series".into(), items }));
             }
             // this is the details page already
@@ -412,7 +495,16 @@ impl Screen for SeriesDetailScreen {
     }
 
     fn on_overlay_result(&mut self, ctx: &mut UiCtx<'_>, result: OverlayResult) {
+        // the Copies section's menus and PIN answers first (DESIGN §29.14)
+        match self.copies.on_result(ctx, &result) {
+            super::copies::Outcome::NotMine => {}
+            super::copies::Outcome::Done => return,
+            super::copies::Outcome::Act(super::copies::CopyAct::Play(c)) => return self.play_copy(ctx, c),
+            super::copies::Outcome::Act(super::copies::CopyAct::Open(VodKind::Series(id))) => return ctx.push(Route::SeriesDetail(id)),
+            super::copies::Outcome::Act(super::copies::CopyAct::Open(VodKind::Movie(id))) => return ctx.push(Route::MovieDetail(id)),
+        }
         match result {
+            OverlayResult::Chosen(Action::PlayFrom) => self.copies.play_from_menu(ctx),
             OverlayResult::Chosen(Action::Digit(MENU_SEASON_WATCHED)) => {
                 let eps = self.current_episodes().into_iter().cloned().collect();
                 self.mark(ctx, eps, true);
@@ -466,6 +558,13 @@ impl Screen for SeriesDetailScreen {
             empty_state::empty_state(ui, theme, glyphs::SERIES, "This series is no longer in your playlists", None, None);
             return;
         }
+        if let Some(id) = self.id {
+            self.copies.sync(ctx, VodKind::Series(id));
+        }
+        if self.section == Section::Copies && !self.copies.is_stacked() {
+            self.section = Section::Buttons;
+        }
+        self.btn = self.btn.min(self.buttons().len() - 1);
         let summary = self.id.and_then(|id| ctx.lib.vod.find(VodKind::Series(id))).cloned();
         // DESIGN §27.7: a playlist series is complete at import (no details to wait for)
         let source = self.data.as_ref().map(|d| d.series.source_id).or(summary.as_ref().map(|s| s.source_id));
@@ -526,6 +625,12 @@ impl Screen for SeriesDetailScreen {
         let loading = data.episodes.is_empty() && (self.loader.is_some() || !sparse && s.details_loaded_at.is_none());
         let (section, btn_focus, season_idx, ep_idx) = (self.section, self.btn, self.season, self.ep);
         let scroll = std::mem::take(&mut self.scroll_to_cursor);
+        let buttons = self.buttons();
+        // several copies: Play names the playlist it plays from; another copy opens at its own
+        // next episode
+        let other = self.other_copy();
+        let plays_from = self.copies.plays().and_then(|c| self.copies.playlist(ctx, c)).map(str::to_owned);
+        let mut copy_click = None;
         let mut clicked_btn = None;
         let mut clicked_season = None;
         let mut clicked_ep: Option<(usize, bool)> = None;
@@ -547,16 +652,22 @@ impl Screen for SeriesDetailScreen {
             menu |= header.show(ui, ctx, |ui, ctx| {
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(theme.space(SpaceToken::Lg), theme.space(SpaceToken::Md));
-                    for (i, b) in self.buttons().iter().enumerate() {
+                    for (i, b) in buttons.iter().enumerate() {
                         let (icon, label, primary, selected) = match b {
                             Btn::Play => {
                                 let label = match (&next, resume_at) {
+                                    _ if other.is_some() => "Play".into(),
                                     (Some(e), Some(at)) => format!("Resume S{:02}E{:02} {}", e.season, e.episode, kit::clock(at)),
                                     (Some(e), None) => format!("Play S{:02}E{:02}", e.season, e.episode),
                                     (None, _) => "Play".into(),
                                 };
+                                let label = match &plays_from {
+                                    Some(p) => format!("{label} · {p}"),
+                                    None => label,
+                                };
                                 (glyphs::PLAY, label, true, false)
                             }
+                            Btn::PlayFrom => (glyphs::PLAYLIST, "Play from ▾".into(), false, false),
                             Btn::Favourite => (
                                 if fav { glyphs::FAVOURITE } else { glyphs::FAVOURITE_OFF },
                                 if fav { "Favourite".into() } else { "Add to Favourites".into() },
@@ -577,13 +688,17 @@ impl Screen for SeriesDetailScreen {
                             focused: section == Section::Buttons && i == btn_focus,
                             ..Default::default()
                         };
-                        let enabled = !matches!(b, Btn::Play) || next.is_some();
+                        let enabled = !matches!(b, Btn::Play) || next.is_some() || other.is_some();
                         if ui.add_enabled_ui(enabled, |ui| button(ui, ctx.theme, Some(icon), &label, style)).inner.clicked() {
                             clicked_btn = Some(i);
                         }
                     }
                 });
             });
+            if section != Section::Copies {
+                self.copies.focus = None;
+            }
+            copy_click = self.copies.show(ui, ctx);
             ui.add_space(theme.space(SpaceToken::Xxl));
             if data.seasons.is_empty() {
                 if loading {
@@ -647,6 +762,11 @@ impl Screen for SeriesDetailScreen {
             self.btn = i;
             let b = self.buttons()[i];
             self.press(ctx, b);
+        }
+        if let Some(click) = copy_click {
+            self.section = Section::Copies;
+            self.copies.click(ctx, click);
+            menu = false;
         }
         if let Some(i) = clicked_season {
             self.section = Section::Seasons;
@@ -818,6 +938,47 @@ mod tests {
         assert_eq!(s.season, 1, "clamped to the last season");
         assert_eq!(s.after(&ItemKey("e2".into())).map(|e| e.id), Some(EpisodeId(3)), "the next episode crosses seasons");
         assert!(s.after(&ItemKey("e5".into())).is_none());
+    }
+
+    /// A series in two playlists (DESIGN §29.14): its page has the Copies section between the
+    /// buttons and the seasons (↓ reaches it); picking the other playlist's copy makes Play name
+    /// it and play that copy's next episode; its menu opens that copy's own page.
+    #[test]
+    fn copies_of_a_series_pick_the_copy_play_uses() {
+        let (mut t, one) = rig();
+        let (a_ids, b_ids) = seed(&mut t, |c| {
+            let a = testkit::source(c, "Alpha")?;
+            let b = testkit::source(c, "Bravo")?;
+            let a_ids = testkit::named_series(c, a, &[("EN ★ Severance - 2022", "Severance")], 3)?;
+            let b_ids = testkit::named_series(c, b, &[("EN - Severance (2022)", "Severance")], 2)?;
+            Ok((a_ids, b_ids))
+        });
+        let mut h = harness(t, one, SeriesDetailScreen::default(), egui::vec2(1200.0, 900.0));
+        h.state_mut().enter(Route::SeriesDetail(a_ids[0]));
+        until(&mut h, "the page", |h| has_label(h, "COPIES · 2") && has_label(h, "Season 1"));
+        assert!(has_label(&h, "Alpha · EN · plays first") && has_label(&h, "Play S01E01 · Alpha"));
+        // ↑ to the buttons, ↓ to the copies, → to Bravo's, Enter picks it
+        h.state_mut().act(Action::Up);
+        h.state_mut().act(Action::Up);
+        assert_eq!(h.state().s.section, Section::Copies);
+        h.state_mut().act(Action::Right);
+        h.state_mut().act(Action::Activate);
+        h.run_steps(1);
+        assert!(has_label(&h, "Play · Bravo") && has_label(&h, "Bravo · EN · plays first"));
+        h.state_mut().act(Action::Up);
+        h.state_mut().s.btn = 0;
+        h.state_mut().act(Action::Activate);
+        assert_eq!(h.state_mut().nav(), vec![NavRequest::Push(Route::Player)], "Bravo's next episode plays");
+        // Bravo's copy has its own page (its own episodes)
+        h.state_mut().act(Action::Down);
+        h.state_mut().act(Action::ContextMenu);
+        let nav = h.state_mut().nav();
+        assert!(
+            matches!(nav.as_slice(), [NavRequest::Open(OverlayRequest::ContextMenu(m))] if m.items.iter().any(|i| i.label == "Open its page")),
+            "{nav:?}"
+        );
+        h.state_mut().result(OverlayResult::Chosen(Action::Digit(super::super::copies::CARD_PAGE)));
+        assert_eq!(h.state_mut().nav(), vec![NavRequest::Push(Route::SeriesDetail(b_ids[0]))]);
     }
 
     #[test]

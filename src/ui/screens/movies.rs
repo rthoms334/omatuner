@@ -29,8 +29,17 @@
 //!   Continue watching and Favourites to one playlist; the grid header leads with the
 //!   breadcrumb "TV 2 › Action", and a 2 px stripe in the playlist's colour runs under the bar.
 //!   In All, categories and cards carry the playlist's name in its colour.
+//! * Copies of one title (DESIGN §29.14): in All (with Settings ▸ Interface ▸ "Same title in
+//!   several playlists" on Combine) each stack is one **stack card** (`ui::stacks::collapse`):
+//!   Enter opens its page (Copies section there), Shift+Enter plays the copy that plays first,
+//!   Space or a click on its copy-count badge fans the copies out right after it (Space on any
+//!   of them, or Esc, folds it), Ctrl+O "Play from…" picks a copy. A stack card's ★ / watched /
+//!   progress / lock follow `stacks::stack_marks`; Ctrl+F adds the copy that would play or
+//!   takes every copy out (Undo), Delete in Continue watching forgets every copy (Undo). A
+//!   fanned-out copy's menu has "Not the same title" (Undo). Inside one playlist nothing
+//!   stacks; a title that is also elsewhere shows "+1".
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use eframe::egui;
 
@@ -39,12 +48,14 @@ use super::home::kit::{self, Loader};
 use crate::keymap::{Action, KeyContext};
 use crate::model::{GroupId, ItemKey, ItemKind, SortMode, SourceId, VodKind, VodSummary};
 use crate::msg::{AppEvent, DataScope};
+use crate::store::stacks::StackId;
 use crate::theme::{SpaceToken, TypeToken};
 use crate::ui::overlays::{ContextMenuSpec, MenuItem, OverlayResult};
 use crate::ui::scope::{self, Scope, ScopeFilter, ScopeKind};
+use crate::ui::stacks as st;
 use crate::ui::widgets::button::{ButtonStyle, LABEL_MAX_CHARS, button, icon_button, short_label};
 use crate::ui::widgets::list::{ListOutcome, ListState, virtual_list};
-use crate::ui::widgets::poster::{self, GridState, TileDecor};
+use crate::ui::widgets::poster::{self, Elsewhere, GridState, StackDecor, TileDecor};
 use crate::ui::widgets::text_field::search_header;
 use crate::ui::widgets::{RowState, empty_state, glyphs, rows, scope_bar};
 use crate::ui::{LayoutClass, OverlayRequest, Route, Screen, ScreenId, UiCtx};
@@ -79,6 +90,9 @@ impl Screen for MoviesScreen {
     }
     fn ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) {
         self.browser.ui(ui, ctx)
+    }
+    fn hint_extras(&self) -> Vec<(Action, &'static str)> {
+        self.browser.hint_extras()
     }
 }
 
@@ -116,6 +130,12 @@ const MENU_OPEN_CAT: u8 = 22;
 const MENU_COUNTRIES: u8 = 23;
 /// The category menu's "Mark as explicit" / "Not explicit" (DESIGN §20.3).
 const MENU_EXPLICIT: u8 = 24;
+/// A fanned-out copy's "Not the same title".
+const MENU_SPLIT: u8 = 25;
+/// "Play from…": copy `k` of the menu is `MENU_COPY + k`.
+const MENU_COPY: u8 = 40;
+/// Copies listed in "Play from…".
+const MAX_COPIES: usize = 200;
 
 /// Identity of the library snapshot (indices into it are only valid for that snapshot; two
 /// rebuilds can share a `built_at` second).
@@ -186,8 +206,26 @@ pub(super) struct VodBrowser {
     items: Vec<u32>,
     /// `items` after the grid filter.
     shown: Vec<u32>,
-    /// What `items` was computed from: (category, sort, library build, playlist scope).
-    items_key: Option<(Cat, SortMode, u64, ScopeFilter)>,
+    /// What `items` was computed from: (category, sort, library build, playlist scope,
+    /// copies combined, stacks fanned out).
+    items_key: Option<(Cat, SortMode, u64, ScopeFilter, bool, Vec<StackId>)>,
+    /// `items` combines the copies of a title into stack cards (All, Combine).
+    stacked: bool,
+    /// Stacks fanned out in the grid (ids of the library `index_built`).
+    open_stacks: Vec<StackId>,
+    /// The cards of the fanned-out stacks (their other copies follow them).
+    fan_heads: HashSet<u32>,
+    /// Language / version of the copies shown fanned out ("EN · 4K"), by list index.
+    copy_labels: HashMap<u32, String>,
+    /// How recently each title was played (0 = latest), by list index: the copy a stack card
+    /// shows progress of and that plays first.
+    played_rank: HashMap<u32, usize>,
+    /// The copies "Play from…" listed, and the library they index.
+    play_from: (u64, Vec<u32>),
+    /// A locked copy picked in "Play from…" waiting for the PIN.
+    pending_copy: Option<u32>,
+    /// The focused card heads a stack / has other copies (the hint line, last frame).
+    hint: (bool, bool),
     /// The playlist scope the categories were listed for.
     cats_scope: Option<ScopeFilter>,
     progress: ProgressInfo,
@@ -430,6 +468,7 @@ impl VodBrowser {
     /// Progress by list index (posters look it up per visible card, without cloning keys).
     fn rebuild_progress_idx(&mut self) {
         self.progress_idx = self.progress.fraction.iter().filter_map(|(k, f)| self.index.get(k).map(|i| (*i, *f))).collect();
+        self.played_rank = self.progress.order.iter().enumerate().filter_map(|(r, k)| self.index.get(k).map(|i| (*i, r))).collect();
     }
 
     /// Recompute the open category's items when its inputs changed.
@@ -442,14 +481,19 @@ impl VodBrowser {
             self.index = self.all(ctx).iter().enumerate().map(|(i, v)| ((v.source_id, v.key.clone()), i as u32)).collect();
             self.rebuild_progress_idx();
             self.items_key = None;
+            // stack ids belong to their snapshot
+            self.open_stacks.clear();
         }
-        let key = (self.open, self.sort(ctx), lib_id(ctx), self.scope(ctx).filter());
+        // copies stack in All only (DESIGN §29.14)
+        let stacked = self.scope(ctx).selected.is_none() && st::combine(ctx.config);
+        let key = (self.open, self.sort(ctx), lib_id(ctx), self.scope(ctx).filter(), stacked, self.open_stacks.clone());
         // favourites change without a library rebuild: recompute that category every frame
         if self.items_key.as_ref() == Some(&key) && self.open != Cat::Favourites {
             return;
         }
         let (sort, scope) = (key.1, key.3.clone());
         self.items_key = Some(key);
+        self.stacked = stacked;
         let movies = self.movies;
         let mut items: Vec<u32> = match self.open {
             Cat::All => ctx.lib.vod.all_sorted(movies, sort),
@@ -476,6 +520,23 @@ impl VodBrowser {
             && matches!(self.open, Cat::All | Cat::Group(_))
         {
             m.apply(self.all(ctx), &mut items);
+        }
+        if stacked {
+            let (stacks, all) = (ctx.lib.vod.stacks(movies), self.all(ctx));
+            let cards = st::collapse(stacks, &items, all);
+            self.fan_heads = cards.iter().copied().filter(|i| stacks.stack_of(*i).is_some_and(|s| self.open_stacks.contains(&s))).collect();
+            // a stack folded away (gone from the list) stays closed
+            self.open_stacks.retain(|s| self.fan_heads.iter().any(|h| stacks.stack_of(*h) == Some(*s)));
+            items = st::fan_out(stacks, &cards, &self.open_stacks);
+            self.copy_labels = self
+                .open_stacks
+                .iter()
+                .flat_map(|s| stacks.members(*s).iter().copied())
+                .filter_map(|m| st::copy_facts_label(stacks, m).map(|l| (m, l)))
+                .collect();
+        } else {
+            self.fan_heads.clear();
+            self.copy_labels.clear();
         }
         if items != self.items {
             self.items = items;
@@ -514,6 +575,114 @@ impl VodBrowser {
         self.shown.get(self.grid.cursor).and_then(|i| self.all(ctx).get(*i as usize)).cloned()
     }
 
+    /// The list index of the card under the cursor.
+    fn current_idx(&self) -> Option<u32> {
+        self.shown.get(self.grid.cursor).copied()
+    }
+
+    /// The stack a card stands for: a stack card of All (folded, or the head of its fan).
+    fn card_stack(&self, ctx: &UiCtx<'_>, idx: u32) -> Option<StackId> {
+        if !self.stacked {
+            return None;
+        }
+        let s = ctx.lib.vod.stacks(self.movies).stack_of(idx)?;
+        (!self.open_stacks.contains(&s) || self.fan_heads.contains(&idx)).then_some(s)
+    }
+
+    /// The copies of the title under the cursor (several only while copies combine).
+    fn current_copies(&self, ctx: &UiCtx<'_>) -> Vec<u32> {
+        self.current_idx().map(|i| st::copies_of(ctx.lib, ctx.config, self.movies, i)).unwrap_or_default()
+    }
+
+    /// The copies of title `idx` with their state and play order (`store::copies::plan`: a
+    /// few indexed rows per copy, on a key press).
+    fn plan_of(&self, ctx: &UiCtx<'_>, idx: u32) -> crate::store::copies::CopyPlan {
+        crate::ui::copies::plan(ctx, self.movies, idx).unwrap_or_else(|e| {
+            tracing::warn!("copies: {e}");
+            Default::default()
+        })
+    }
+
+    /// Play one copy fullscreen (the resume prompt when a copy has progress, the episode a
+    /// series' copy is at), the next copy as its fallback.
+    fn play_copy(&mut self, ctx: &mut UiCtx<'_>, copy: u32) {
+        let Some(v) = self.all(ctx).get(copy as usize).cloned() else { return };
+        if v.locked && !kit::unlocked(ctx) {
+            self.pending_copy = Some(copy);
+            kit::ask_pin(ctx, Action::PlayFrom, "This copy is locked");
+            return;
+        }
+        crate::ui::copies::play_title(ctx, self.movies, copy, Some(copy), true);
+    }
+
+    /// Space / a click on the badge: fan the stack of card `at` out, or fold it (the cursor
+    /// stays on the stack's card).
+    fn toggle_fan(&mut self, ctx: &mut UiCtx<'_>, at: usize) {
+        let Some(idx) = self.shown.get(at).copied() else { return };
+        let Some(s) = self.stacked.then(|| ctx.lib.vod.stacks(self.movies).stack_of(idx)).flatten() else { return };
+        let head = if let Some(p) = self.open_stacks.iter().position(|x| *x == s) {
+            self.open_stacks.remove(p);
+            self.shown.iter().copied().find(|i| self.fan_heads.contains(i) && ctx.lib.vod.stacks(self.movies).stack_of(*i) == Some(s))
+        } else {
+            self.open_stacks.push(s);
+            Some(idx)
+        };
+        self.refresh_items(ctx);
+        if let Some(r) = head.and_then(|h| self.shown.iter().position(|x| *x == h)) {
+            self.grid.select(r);
+        }
+    }
+
+    /// Esc: fold every fanned-out stack (the cursor stays on its card or copy's stack card).
+    fn fold_all(&mut self, ctx: &mut UiCtx<'_>) -> bool {
+        if self.open_stacks.is_empty() {
+            return false;
+        }
+        let stacks = ctx.lib.vod.stacks(self.movies);
+        let cur = self.current_idx();
+        let head = cur.and_then(|c| match stacks.stack_of(c) {
+            Some(s) if self.open_stacks.contains(&s) => {
+                self.shown.iter().copied().find(|i| self.fan_heads.contains(i) && stacks.stack_of(*i) == Some(s))
+            }
+            _ => Some(c),
+        });
+        self.open_stacks.clear();
+        self.refresh_items(ctx);
+        if let Some(r) = head.and_then(|h| self.shown.iter().position(|x| *x == h)) {
+            self.grid.select(r);
+        }
+        true
+    }
+
+    /// Ctrl+O: "Play from…" — the title's copies with their playlist, language and version, the
+    /// one that plays first marked.
+    fn play_from_menu(&mut self, ctx: &mut UiCtx<'_>) {
+        let copies = self.current_copies(ctx);
+        if copies.len() < 2 {
+            ctx.toast(crate::msg::Toast::info("This title has one copy"));
+            return;
+        }
+        let first = self.current_idx().and_then(|i| self.plan_of(ctx, i).first());
+        let all = self.all(ctx);
+        let items = copies
+            .iter()
+            .take(MAX_COPIES)
+            .enumerate()
+            .map(|(k, &c)| {
+                let locked = all.get(c as usize).is_some_and(|v| v.locked) && !kit::unlocked(ctx);
+                MenuItem {
+                    icon: if locked { glyphs::LOCK } else { glyphs::PLAY },
+                    label: st::copy_label(ctx.lib, self.movies, c),
+                    action: Action::Digit(MENU_COPY + k as u8),
+                    enabled: true,
+                    shortcut: (Some(c) == first).then(|| "plays first".to_owned()),
+                }
+            })
+            .collect();
+        self.play_from = (lib_id(ctx), copies);
+        ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: "Play from".into(), items }));
+    }
+
     /// The provider category under the categories cursor (virtual ones have none).
     fn current_group<'l>(&self, ctx: &'l UiCtx<'_>) -> Option<&'l crate::model::Group> {
         match self.cat_rows.get(self.cats.cursor) {
@@ -524,14 +693,41 @@ impl VodBrowser {
 
     fn open_item(&mut self, ctx: &mut UiCtx<'_>, v: &VodSummary, play: bool) {
         self.pending_cat = None;
-        if v.locked && !kit::unlocked(ctx) {
-            kit::ask_pin(ctx, if play { Action::ActivateAlt } else { Action::Activate }, "This title is locked");
+        let idx = self.current_idx().filter(|i| self.all(ctx).get(*i as usize).is_some_and(|x| x.kind == v.kind));
+        let asked = if play { Action::ActivateAlt } else { Action::Activate };
+        // a stack card (DESIGN §29.12): Shift+Enter plays the copy that plays first, with its
+        // fallback; Enter opens the card's page — its PIN when that copy is locked
+        if let Some(i) = idx.filter(|i| self.card_stack(ctx, *i).is_some()) {
+            if play {
+                if !crate::ui::copies::play_title(ctx, self.movies, i, None, true) {
+                    kit::ask_pin(ctx, asked, "Every copy of this title is locked");
+                }
+            } else if v.locked && !kit::unlocked(ctx) {
+                kit::ask_pin(ctx, asked, "This copy is locked");
+            } else {
+                match v.kind {
+                    VodKind::Movie(id) => ctx.push(Route::MovieDetail(id)),
+                    VodKind::Series(id) => ctx.push(Route::SeriesDetail(id)),
+                }
+            }
             return;
         }
+        if v.locked && !kit::unlocked(ctx) {
+            kit::ask_pin(ctx, asked, "This title is locked");
+            return;
+        }
+        // a copy shown on its own (fanned out, one playlist's list): its page and Play use it
+        let copies = idx.map(|i| st::copies_of(ctx.lib, ctx.config, self.movies, i).len()).unwrap_or(0);
         match (v.kind, play) {
+            (_, false) if copies > 1 => st::open_copy(ctx, v.kind),
             (VodKind::Movie(id), false) => ctx.push(Route::MovieDetail(id)),
-            (VodKind::Movie(id), true) => super::movie_detail::play_movie(ctx, id),
             (VodKind::Series(id), false) => ctx.push(Route::SeriesDetail(id)),
+            (_, true) if copies > 1 && self.stacked => {
+                if let Some(i) = idx {
+                    crate::ui::copies::play_title(ctx, self.movies, i, Some(i), true);
+                }
+            }
+            (VodKind::Movie(id), true) => super::movie_detail::play_movie(ctx, id),
             (VodKind::Series(id), true) => play_series(ctx, id, &v.name),
         }
     }
@@ -561,12 +757,27 @@ impl VodBrowser {
             enabled: true,
             shortcut: Some(shortcut.into()),
         };
-        let mut items = vec![
-            mi(glyphs::INFO, "Details", Action::Digit(MENU_OPEN), "Enter"),
-            mi(glyphs::PLAY, "Play", Action::Digit(MENU_PLAY), "Shift+Enter"),
+        let mut items =
+            vec![mi(glyphs::INFO, "Details", Action::Digit(MENU_OPEN), "Enter"), mi(glyphs::PLAY, "Play", Action::Digit(MENU_PLAY), "Shift+Enter")];
+        // copies of the title (DESIGN §29.14): pick one, fan them out, or take one apart
+        let idx = self.current_idx().filter(|i| self.all(ctx).get(*i as usize).is_some_and(|x| x.kind == v.kind));
+        let copies = idx.map(|i| st::copies_of(ctx.lib, ctx.config, self.movies, i)).unwrap_or_default();
+        let stack = idx.and_then(|i| self.card_stack(ctx, i));
+        if copies.len() > 1 {
+            items.push(mi(glyphs::PLAY, "Play from…", Action::PlayFrom, "Ctrl+O"));
+        }
+        if let Some(s) = stack {
+            let open = self.open_stacks.contains(&s);
+            items.push(mi(glyphs::FILMSTRIP, if open { "Fold the copies" } else { "Show each copy" }, Action::FanOut, "Space"));
+        } else if self.stacked && copies.len() > 1 {
+            items.push(MenuItem { shortcut: None, ..mi(glyphs::CLOSE, "Not the same title", Action::Digit(MENU_SPLIT), "") });
+        }
+        let fav =
+            fav || (stack.is_some() && copies.iter().any(|c| self.all(ctx).get(*c as usize).is_some_and(|x| ctx.favs.is_fav(&st::item_ref(x)))));
+        items.extend([
             mi(glyphs::FAVOURITE, if fav { "Remove from Favourites" } else { "Add to Favourites" }, Action::ToggleFavourite, "Ctrl+F"),
             mi(glyphs::FAV_LIST, "Favourites lists…", Action::AddToList, "Ctrl+Shift+F"),
-        ];
+        ]);
         if matches!(v.kind, VodKind::Movie(_)) {
             items.push(mi(glyphs::CHECK, "Mark watched", Action::MarkWatched, "Ctrl+W"));
         }
@@ -610,6 +821,43 @@ impl VodBrowser {
         }
         let Some(v) = self.current(ctx) else { return true };
         let item = super::home::vod_ref(&v);
+        // a stack card: every action covers the title's copies (DESIGN §29.12, §29.15)
+        if let Some(i) = self.current_idx().filter(|i| self.card_stack(ctx, *i).is_some()) {
+            let plan = self.plan_of(ctx, i);
+            match action {
+                // Delete in Favourites takes every copy out, like Ctrl+F on a favourite stack
+                Action::ToggleFavourite | Action::Remove if action == Action::ToggleFavourite || self.open == Cat::Favourites => {
+                    crate::ui::copies::toggle_favourite(ctx, &plan)
+                }
+                Action::MarkWatched if self.movies => crate::ui::copies::mark_watched(ctx, &plan, &v.name, true),
+                Action::MarkWatched => ctx.toast(crate::msg::Toast::info("Open the series to mark its episodes watched")),
+                Action::Remove if self.open == Cat::Continue && self.movies => crate::ui::copies::mark_watched(ctx, &plan, &v.name, false),
+                Action::Remove if self.open == Cat::Continue => crate::ui::copies::forget_series(ctx, &plan),
+                Action::ToggleLock => {
+                    let (all, groups) = (self.all(ctx), self.all_groups(ctx));
+                    let copies: Vec<&VodSummary> = plan.copies.iter().filter_map(|c| all.get(c.item as usize)).collect();
+                    // every copy is locked (its own lock or a category's): unlock them, else lock them
+                    let on = !copies.iter().all(|x| x.locked);
+                    let by_group = !on && copies.iter().any(|x| kit::any_group_locked(groups, &x.group_ids));
+                    if kit::may_change_locks(ctx) {
+                        if by_group {
+                            ctx.toast(crate::msg::Toast::info("A copy is locked by its category — unlock the category with Ctrl+L"));
+                        }
+                        crate::ui::copies::set_locked(ctx, &plan, on);
+                    }
+                }
+                Action::ToggleHidden => crate::ui::copies::hide(ctx, &plan, &v.name),
+                Action::Rename => ctx.open(OverlayRequest::Rename(crate::ui::overlays::RenameSpec {
+                    title: "Rename every copy".into(),
+                    initial: v.name.to_string(),
+                    target: crate::ui::overlays::RenameTarget::Copies { items: plan.refs() },
+                })),
+                Action::AddToList => kit::list_picker(ctx, &item, &v.name),
+                Action::ShowDetails => self.open_item(ctx, &v, false),
+                _ => kit::not_here(ctx),
+            }
+            return true;
+        }
         match action {
             Action::ToggleFavourite => kit::toggle_favourite(ctx, &item),
             Action::AddToList => kit::list_picker(ctx, &item, &v.name),
@@ -822,8 +1070,8 @@ impl VodBrowser {
             return true;
         }
         if action == Action::Back {
-            // Esc ladder: the marks go first
-            return self.marks.clear() || self.back(ctx);
+            // Esc ladder: the marks go first, then fanned-out stacks
+            return self.marks.clear() || (self.pane == Pane::Grid && self.fold_all(ctx)) || self.back(ctx);
         }
         match self.pane {
             Pane::Categories => match self.cats.handle(action) {
@@ -903,6 +1151,14 @@ impl VodBrowser {
                     | Action::Home
                     | Action::End
                     | Action::FilterInput(_) => true,
+                    Action::FanOut => {
+                        self.toggle_fan(ctx, self.grid.cursor);
+                        true
+                    }
+                    Action::PlayFrom => {
+                        self.play_from_menu(ctx);
+                        true
+                    }
                     a => self.item_action(ctx, a),
                 },
             },
@@ -928,6 +1184,25 @@ impl VodBrowser {
             OverlayResult::Chosen(Action::Digit(MENU_COUNTRIES)) => {
                 if let Some(g) = self.current_group(ctx) {
                     ctx.open(OverlayRequest::Categories(g.source_id));
+                }
+            }
+            OverlayResult::Chosen(Action::Digit(d)) if d >= MENU_COPY => {
+                // a copy of "Play from…" (of the library the menu listed)
+                let (lib, copies) = &self.play_from;
+                if let Some(c) = copies.get(usize::from(d - MENU_COPY)).copied().filter(|_| *lib == lib_id(ctx)) {
+                    self.play_copy(ctx, c);
+                }
+            }
+            OverlayResult::Chosen(Action::Digit(MENU_SPLIT)) => {
+                if let Some(v) = self.current(ctx) {
+                    crate::ui::copies::split(ctx, &st::item_ref(&v), &v.name);
+                }
+            }
+            OverlayResult::Chosen(Action::FanOut) => self.toggle_fan(ctx, self.grid.cursor),
+            OverlayResult::Chosen(Action::PlayFrom) => self.play_from_menu(ctx),
+            OverlayResult::Unlocked(Action::PlayFrom) => {
+                if let Some(c) = self.pending_copy.take() {
+                    self.play_copy(ctx, c);
                 }
             }
             OverlayResult::Chosen(Action::Digit(MENU_EXPLICIT)) => {
@@ -974,7 +1249,21 @@ impl VodBrowser {
         }
     }
 
+    /// The status bar's extra hints: Space and Ctrl+O on a stack card, Ctrl+O on a copy.
+    pub(super) fn hint_extras(&self) -> Vec<(Action, &'static str)> {
+        match self.hint {
+            (true, _) => vec![(Action::FanOut, "copies"), (Action::PlayFrom, "play from")],
+            (false, true) => vec![(Action::PlayFrom, "play from")],
+            _ => Vec::new(),
+        }
+    }
+
     pub(super) fn ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) {
+        // what the focused card offers (one lookup per frame)
+        let idx = self.current_idx().filter(|_| self.pane == Pane::Grid);
+        let kind = idx.and_then(|i| self.all(ctx).get(i as usize)).map(|v| v.kind);
+        self.hint =
+            (idx.is_some_and(|i| self.card_stack(ctx, i).is_some()), kind.is_some_and(|k| st::stack_of_kind(ctx.lib, ctx.config, k).is_some()));
         match kit::poll(&mut self.progress_loader) {
             Some(Ok(p)) => {
                 self.progress = p;
@@ -1311,12 +1600,65 @@ impl VodBrowser {
         // only the focused pane shows the cursor (DESIGN §13.0); the other shows "selected"
         let focused = self.pane == Pane::Grid;
         let sources = scope.marks(ctx);
-        let outcome = poster::poster_grid_with(ui, theme, ctx.images, &mut self.grid, all, &self.shown, focused, |i, v| TileDecor {
-            progress: progress.get(&i).copied(),
-            playing: playing == Some(v.kind),
-            source: sources.of(v.source_id),
-            ..Default::default()
+        // stacks (DESIGN §29.14): the cards of All, "+1" inside one playlist
+        let stacks = ctx.lib.vod.stacks(movies);
+        let unlocked = kit::unlocked(ctx);
+        let (stacked, single) = (self.stacked, scope.selected.is_some());
+        let named = ctx.config.interface.playlist_on_cards != crate::config::PlaylistOnCards::Never;
+        let (lib, config) = (ctx.lib, ctx.config);
+        let (open, heads, labels, rank) = (&self.open_stacks, &self.fan_heads, &self.copy_labels, &self.played_rank);
+        let outcome = poster::poster_grid_with(ui, theme, ctx.images, &mut self.grid, all, &self.shown, focused, |i, v| {
+            let mut d = TileDecor {
+                progress: progress.get(&i).copied(),
+                playing: playing == Some(v.kind),
+                source: sources.of(v.source_id),
+                ..Default::default()
+            };
+            match stacks.stack_of(i) {
+                Some(s) if stacked && (!open.contains(&s) || heads.contains(&i)) => {
+                    let members = stacks.members(s);
+                    let others: Vec<SourceId> = st::playlists_of(stacks, members, all).into_iter().filter(|p| *p != v.source_id).collect();
+                    let marks = crate::store::stacks::stack_marks(
+                        members,
+                        |_| false,
+                        |_| false,
+                        |m| rank.get(&m).map(|r| -(*r as i64)),
+                        |m| all.get(m as usize).is_some_and(|x| x.locked),
+                    );
+                    d.stack = Some(StackDecor {
+                        count: members.len(),
+                        open: open.contains(&s),
+                        fan: true,
+                        second: others.first().and_then(|p| sources.of(*p)),
+                        others: others.len(),
+                    });
+                    // the progress of the copy played last
+                    d.progress = marks.resume.and_then(|m| progress.get(&m)).copied();
+                    d.dimmed = marks.locked && !unlocked;
+                    // fanned out: the head card is one of the copies too — say which
+                    if open.contains(&s) {
+                        d.copy = labels.get(&i).map(String::as_str);
+                    }
+                }
+                Some(_) if stacked => {
+                    d.copy = labels.get(&i).map(String::as_str);
+                    d.dimmed = v.locked && !unlocked;
+                }
+                Some(_) if single => {
+                    let also = st::elsewhere(config, stacks, i, all);
+                    if !also.is_empty() {
+                        d.elsewhere = Some(Elsewhere { count: also.len(), first: lib.source(also[0]).filter(|_| named) });
+                    }
+                }
+                _ => {}
+            }
+            d
         });
+        if let Some(at) = self.grid.take_badge_click() {
+            self.pane = Pane::Grid;
+            self.toggle_fan(ctx, at);
+            return;
+        }
         // the second click of the double-click that opened the category lands on a poster
         // that just appeared under the pointer: it doesn't open that title
         let outcome = match outcome {
@@ -1452,6 +1794,291 @@ mod tests {
         h.state_mut().apply_config();
         h.run_steps(2);
         assert_eq!(h.state().s.browser.shown.len(), 2, "Favourites of every playlist");
+    }
+
+    /// Two playlists sharing "Dune" (DESIGN §29.14): Alpha has it in English and French, Bravo
+    /// in English; Heat is Alpha's only, Solo Bravo's. Returns (Alpha, Bravo).
+    fn dune(t: &mut crate::ui::testing::TestUi) -> (SourceId, SourceId) {
+        seed(t, |c| {
+            let a = testkit::source(c, "Alpha")?;
+            let b = testkit::source(c, "Bravo")?;
+            testkit::named_movies(c, a, &[("EN ★ Dune - 2021", "Dune"), ("FR ★ Dune - 2021", "Dune (FR)"), ("EN ★ Heat - 1995", "Heat")])?;
+            testkit::named_movies(c, b, &[("EN - Dune (2021)", "Dune"), ("EN - Solo (2018)", "Solo")])?;
+            Ok((a, b))
+        })
+    }
+
+    fn named(s: SourceId, i: usize) -> crate::model::ItemRef {
+        crate::model::ItemRef { source: s, kind: ItemKind::Movie, key: ItemKey(format!("m3u:named{i:04}")) }
+    }
+
+    fn shown_names(h: &egui_kittest::Harness<'_, testkit::App<MoviesScreen>>) -> Vec<String> {
+        let app = h.state();
+        app.s.browser.shown.iter().map(|i| app.t.lib.vod.movies[*i as usize].name.to_string()).collect()
+    }
+
+    /// All playlists: the three copies of Dune are one stack card (its top, the first English
+    /// copy, named with both playlists and its count) where its newest copy sorts; Space fans the
+    /// copies out after it (English before French, each with its language) and Esc folds them;
+    /// the badge does the same with the mouse; Ctrl+O lists every copy with the one that plays
+    /// first marked and plays the one picked; "Show each copy" lists every copy; inside one
+    /// playlist nothing stacks and a title also in Bravo says "+1".
+    #[test]
+    fn stacks_in_all_fan_out_fold_and_play_from() {
+        let (mut t, one) = rig();
+        let (a, _) = dune(&mut t);
+        let mut h = harness(t, one, MoviesScreen::default(), egui::vec2(1400.0, 900.0));
+        h.state_mut().enter(Route::Movies { group: None });
+        h.run_steps(2);
+        assert_eq!(shown_names(&h), ["Heat", "Dune", "Solo"], "one card per title; Dune where its newest copy sorts");
+        assert!(has_label(&h, "Dune · Alpha + Bravo · 3 copies"), "the stack card names both playlists and its count");
+        let all = h.state_mut().t.with_ctx(|ctx| crate::ui::scope::Scope::current(ctx, crate::ui::scope::ScopeKind::Movies).count(ctx.lib, None));
+        assert_eq!(all, 3, "the scope bar's All counts cards, not the five copies");
+        // Space on the stack card: the copies follow it; Esc folds them. The hint line says so.
+        h.state_mut().act(Action::Right);
+        h.run_steps(1);
+        let line = crate::keymap::hint_line_with(&h.state().s.key_contexts(), &h.state().s.hint_extras());
+        assert!(line.contains("Space copies · Ctrl+O play from"), "{line}");
+        assert!(h.state_mut().act(Action::FanOut));
+        h.run_steps(1);
+        assert_eq!(shown_names(&h), ["Heat", "Dune", "Dune", "Dune (FR)", "Solo"]);
+        assert!(has_label(&h, "Dune · Bravo · EN") && has_label(&h, "Dune (FR) · Alpha · FR"), "each copy names its language");
+        assert!(has_label(&h, "Dune · Alpha · 3 copies · EN"), "the head card too, with the stack's count");
+        h.state_mut().act(Action::Right); // onto a fanned-out copy: Space folds its stack too
+        h.state_mut().act(Action::FanOut);
+        assert_eq!(shown_names(&h).len(), 3);
+        assert_eq!(h.state().s.browser.grid.cursor, 1, "the cursor stays on the stack");
+        h.state_mut().act(Action::FanOut);
+        assert!(h.state_mut().act(Action::Back), "Esc folds first");
+        assert_eq!(shown_names(&h).len(), 3);
+        // the mouse: the badge fans out and folds
+        h.run_steps(1);
+        h.get_by_label("3 copies — show each").click();
+        h.run_steps(2);
+        assert_eq!(shown_names(&h).len(), 5);
+        h.get_by_label("3 copies — fold them").click();
+        h.run_steps(2);
+        assert_eq!(shown_names(&h).len(), 3);
+        // Ctrl+O: every copy, the first English copy plays first; picking Bravo's plays it
+        h.state_mut().nav();
+        h.state_mut().s.browser.grid.select(1);
+        h.state_mut().act(Action::PlayFrom);
+        let nav = h.state_mut().nav();
+        let [NavRequest::Open(OverlayRequest::ContextMenu(m))] = nav.as_slice() else { panic!("{nav:?}") };
+        let labels: Vec<(&str, Option<&str>)> = m.items.iter().map(|i| (i.label.as_str(), i.shortcut.as_deref())).collect();
+        assert_eq!(labels, [("Alpha · EN", Some("plays first")), ("Bravo · EN", None), ("Alpha · FR", None)]);
+        let bravo = m.items[1].action;
+        h.state_mut().result(OverlayResult::Chosen(bravo));
+        assert_eq!(h.state_mut().nav(), vec![NavRequest::Push(Route::Player)]);
+        // "Show each copy": every copy is a card
+        h.state_mut().t.config_edits.push(Box::new(|c| c.interface.same_title = crate::config::SameTitle::ShowEach));
+        h.state_mut().apply_config();
+        h.run_steps(1);
+        assert_eq!(shown_names(&h).len(), 5);
+        h.state_mut().t.config_edits.push(Box::new(|c| c.interface.same_title = crate::config::SameTitle::Combine));
+        h.state_mut().apply_config();
+        // one playlist: Alpha's three movies, nothing stacked; its Dunes are also in Bravo
+        h.state_mut().act(Action::NextPlaylist);
+        h.state_mut().apply_config();
+        h.run_steps(2);
+        assert_eq!(h.state().t.config.interface.playlist_scope.movies, Some(a));
+        assert_eq!(shown_names(&h), ["Heat", "Dune (FR)", "Dune"]);
+        assert!(has_label(&h, "Dune · +1") && has_label(&h, "Dune (FR) · +1") && has_label(&h, "Heat"), "+1 = also in Bravo");
+        h.state_mut().s.browser.grid.select(2);
+        h.state_mut().act(Action::FanOut);
+        assert_eq!(shown_names(&h).len(), 3, "nothing to fan out inside one playlist");
+    }
+
+    /// Locked copies stay in their stack, drawn disabled while the session is locked: the top
+    /// card is the first unlocked copy; a stack whose every copy is locked shows locked and asks
+    /// for the PIN. Hidden copies and copies the visibility hook rejects (explicit content) are
+    /// not in the stack at all.
+    #[test]
+    fn stacks_keep_locked_copies_and_drop_hidden_and_rejected_ones() {
+        let (mut t, one) = rig();
+        let (a, b) = dune(&mut t);
+        with_pin(&mut t);
+        let set = |t: &mut crate::ui::testing::TestUi, item: crate::model::ItemRef, ov: crate::model::ItemOverride| {
+            seed(t, move |c| crate::store::user::set_item_override(c, &item, &ov))
+        };
+        let locked = crate::model::ItemOverride { locked: true, ..Default::default() };
+        set(&mut t, named(a, 0), locked.clone());
+        let mut h = harness(t, one, MoviesScreen::default(), egui::vec2(1400.0, 900.0));
+        h.state_mut().enter(Route::Movies { group: None });
+        h.run_steps(2);
+        assert!(has_label(&h, "Dune · Bravo + Alpha · 3 copies"), "Alpha's English copy is locked: Bravo's is the card");
+        h.state_mut().s.browser.grid.select(1);
+        h.state_mut().act(Action::FanOut);
+        h.run_steps(1);
+        assert!(has_label(&h, "Dune · Alpha · EN · locked"), "the locked copy stays, drawn disabled");
+        h.state_mut().act(Action::Back);
+        // every copy locked: the card is locked and Enter asks for the PIN
+        set(&mut h.state_mut().t, named(a, 1), locked.clone());
+        set(&mut h.state_mut().t, named(b, 0), locked);
+        h.run_steps(2);
+        assert!(has_label_containing(&h, "· 3 copies · locked"));
+        h.state_mut().s.browser.grid.select(1);
+        h.state_mut().nav();
+        h.state_mut().act(Action::Activate);
+        assert!(matches!(h.state_mut().nav().as_slice(), [NavRequest::Open(OverlayRequest::Pin { .. })]));
+        // a hidden copy leaves the stack (and the snapshot)
+        let hidden = crate::model::ItemOverride { hidden: true, locked: true, ..Default::default() };
+        set(&mut h.state_mut().t, named(a, 1), hidden);
+        h.run_steps(2);
+        assert!(has_label_containing(&h, "Dune · Alpha + Bravo · 2 copies · locked"), "the French copy left the stack");
+        // explicit content hidden by parental control drops a copy the same way (DESIGN §20.3)
+        let bravo_dune = named(b, 0);
+        seed(&mut h.state_mut().t, move |c| {
+            c.execute(
+                "UPDATE movie SET explicit = 1 WHERE source_id = ?1 AND key = ?2",
+                rusqlite::params![bravo_dune.source, bravo_dune.key.as_str()],
+            )?;
+            Ok(())
+        });
+        let reader = h.state().t.services().store.reader().unwrap();
+        h.state_mut().t.set_library(crate::store::library::load_visible(&reader, crate::store::library::Visibility::NO_EXPLICIT).unwrap());
+        h.run_steps(2);
+        assert_eq!(shown_names(&h), ["Heat", "Solo", "Dune"], "Bravo's copy is explicit: Alpha's English copy stands alone");
+        assert!(!has_label_containing(&h, "copies"));
+    }
+
+    /// A narrow window (790 pt) with long playlist names: the stack card's meta line falls back
+    /// to "Alphaville Premium +1" when both names don't fit, and its count badge is still there
+    /// to click.
+    #[test]
+    fn a_narrow_stack_card_shortens_its_playlists_and_keeps_its_badge() {
+        let (mut t, one) = rig();
+        seed(&mut t, |c| {
+            let a = testkit::source(c, "Alphaville Premium")?;
+            let b = testkit::source(c, "Bravo Sports Extra")?;
+            testkit::named_movies(c, a, &[("EN ★ Dune - 2021", "Dune"), ("FR ★ Dune - 2021", "Dune (FR)")])?;
+            testkit::named_movies(c, b, &[("EN - Dune (2021)", "Dune")])
+        });
+        let mut h = harness(t, one, MoviesScreen::default(), egui::vec2(790.0, 900.0));
+        h.state_mut().enter(Route::Movies { group: None });
+        h.run_steps(2);
+        let painted = testkit::painted(&h);
+        assert!(painted.iter().any(|p| p == " +1"), "{painted:?}");
+        assert!(has_label(&h, "3 copies — show each"), "the badge");
+    }
+
+    /// Ctrl+H, Ctrl+L and F2 on a stack card cover every copy (DESIGN §29.15): Hide takes the
+    /// title out of All, the toast naming its playlists, and its Undo brings every copy back;
+    /// Lock locks them all; F2 renames every copy.
+    #[test]
+    fn hide_lock_and_rename_on_a_stack_card_cover_every_copy() {
+        let (mut t, one) = rig();
+        let (a, b) = dune(&mut t);
+        with_pin(&mut t);
+        let p = t.config.parental.clone();
+        assert!(t.parental.unlock("1234", &p));
+        let mut h = harness(t, one, MoviesScreen::default(), egui::vec2(1400.0, 900.0));
+        h.state_mut().enter(Route::Movies { group: None });
+        h.run_steps(2);
+        h.state_mut().act(Action::Right); // Dune
+        let ov = |h: &egui_kittest::Harness<'_, testkit::App<MoviesScreen>>, r: crate::model::ItemRef| {
+            crate::store::user::item_override(&h.state().t.services().store.reader().unwrap(), &r).unwrap().unwrap_or_default()
+        };
+        let copies = [named(a, 0), named(a, 1), named(b, 0)];
+        h.state_mut().act(Action::ToggleHidden);
+        until(&mut h, "every copy hidden", |h| copies.iter().all(|r| ov(h, r.clone()).hidden));
+        let toast = h.state_mut().undo_toast().expect("an Undo toast");
+        assert_eq!(toast.text, "Hid Dune in Alpha and Bravo — Settings ▸ Hidden items shows it again");
+        testkit::reload_library(&mut h.state_mut().t);
+        h.run_steps(2);
+        assert_eq!(shown_names(&h), ["Heat", "Solo"], "the title is gone, not just its top copy");
+        h.state_mut().act(toast.action.unwrap().1);
+        until(&mut h, "every copy back", |h| copies.iter().all(|r| !ov(h, r.clone()).hidden));
+        testkit::reload_library(&mut h.state_mut().t);
+        h.run_steps(2);
+        h.state_mut().s.browser.grid.select(1);
+        h.state_mut().act(Action::ToggleLock);
+        until(&mut h, "every copy locked", |h| copies.iter().all(|r| ov(h, r.clone()).locked));
+        // F2: the rename dialog for every copy (`dialogs` tests what it writes)
+        h.state_mut().nav();
+        h.state_mut().act(Action::Rename);
+        let nav = h.state_mut().nav();
+        let [NavRequest::Open(OverlayRequest::Rename(spec))] = nav.as_slice() else { panic!("{nav:?}") };
+        let crate::ui::overlays::RenameTarget::Copies { items } = &spec.target else { panic!("{spec:?}") };
+        assert_eq!((spec.title.as_str(), items.len()), ("Rename every copy", 3));
+    }
+
+    /// Favourites and Continue watching of a stack (DESIGN §29.12): Favourites shows one card
+    /// for the title; Ctrl+F on it takes every favourite copy out with an Undo that puts them
+    /// back, and on a stack without favourites adds the copy that plays first; Delete in
+    /// Continue watching forgets every copy's progress, and Undo restores the rows.
+    #[test]
+    fn stack_favourites_and_continue_watching_cover_every_copy_with_undo() {
+        let (mut t, one) = rig();
+        let (a, b) = dune(&mut t);
+        seed(&mut t, move |c| {
+            let list = crate::store::user::default_fav_list(c)?;
+            crate::store::user::set_favourite(c, list, &named(a, 1), true, 1)?;
+            crate::store::user::set_favourite(c, list, &named(b, 0), true, 2)?;
+            for (i, item) in [named(a, 0), named(b, 0)].into_iter().enumerate() {
+                let p = crate::model::WatchProgress {
+                    item,
+                    position_s: 600.0,
+                    duration_s: Some(6000.0),
+                    updated_at: 10 + i as i64,
+                    finished: false,
+                    title: "Dune".into(),
+                    fingerprint: Default::default(),
+                };
+                crate::store::user::save_progress(c, &p)?;
+            }
+            Ok(())
+        });
+        let mut h = harness(t, one, MoviesScreen::default(), egui::vec2(1400.0, 900.0));
+        h.state_mut().enter(Route::Movies { group: None });
+        h.run_steps(2);
+        h.state_mut().act(Action::FocusNext);
+        h.state_mut().act(Action::Down);
+        h.state_mut().act(Action::Down); // Favourites
+        h.run_steps(1);
+        assert_eq!(shown_names(&h), ["Dune"], "two favourite copies, one card");
+        h.state_mut().act(Action::FocusNext);
+        h.state_mut().act(Action::ToggleFavourite);
+        let fav = |h: &egui_kittest::Harness<'_, testkit::App<MoviesScreen>>, r: crate::model::ItemRef| h.state().t.favs.is_fav(&r);
+        assert!(!fav(&h, named(a, 1)) && !fav(&h, named(b, 0)), "every copy left Favourites");
+        let toast = h.state_mut().undo_toast().expect("an Undo toast");
+        assert_eq!(toast.text, "Removed from Favourites");
+        h.state_mut().act(toast.action.unwrap().1);
+        until(&mut h, "Undo puts them back", |h| {
+            let favs = crate::store::library::load_favs(&h.state().t.services().store.reader().unwrap()).unwrap();
+            favs.is_fav(&named(a, 1)) && favs.is_fav(&named(b, 0))
+        });
+        let favs = crate::store::library::load_favs(&h.state().t.services().store.reader().unwrap()).unwrap();
+        h.state_mut().t.favs = favs;
+        // Ctrl+F again: out again (no Undo taken); then on the stack in All, with no favourite
+        // copy, Ctrl+F adds the copy that plays first — Bravo's, the one watched last
+        h.state_mut().act(Action::ToggleFavourite);
+        h.state_mut().act(Action::FocusNext);
+        h.state_mut().act(Action::Home);
+        h.run_steps(1);
+        h.state_mut().act(Action::FocusNext);
+        h.state_mut().act(Action::Home);
+        h.state_mut().act(Action::Right); // All movies: Dune
+        h.state_mut().act(Action::ToggleFavourite);
+        assert!(fav(&h, named(b, 0)) && !fav(&h, named(a, 0)) && !fav(&h, named(a, 1)), "the copy that would play");
+        // Continue watching: one card (the copy played last); Delete forgets both copies
+        h.state_mut().act(Action::FocusNext);
+        h.state_mut().act(Action::Home);
+        h.state_mut().act(Action::Down);
+        h.run_steps(1);
+        until(&mut h, "Continue watching", |h| shown_names(h) == ["Dune"]);
+        h.state_mut().act(Action::FocusNext);
+        h.state_mut().act(Action::Remove);
+        let progress = |h: &egui_kittest::Harness<'_, testkit::App<MoviesScreen>>, r: crate::model::ItemRef| {
+            crate::store::user::progress(&h.state().t.services().store.reader().unwrap(), &r).unwrap()
+        };
+        until(&mut h, "both copies forgotten", |h| progress(h, named(a, 0)).is_none() && progress(h, named(b, 0)).is_none());
+        let toast = h.state_mut().undo_toast().expect("an Undo toast");
+        assert_eq!(toast.text, "Removed from Continue watching");
+        h.state_mut().act(toast.action.unwrap().1);
+        until(&mut h, "the rows restored", |h| {
+            progress(h, named(a, 0)).is_some_and(|p| p.position_s == 600.0) && progress(h, named(b, 0)).is_some_and(|p| p.updated_at == 11)
+        });
     }
 
     /// The Alt+P picker: digits jump (0 = All, 1… = the playlists in order) while nothing is

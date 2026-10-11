@@ -56,6 +56,8 @@ pub struct Services {
     pub player: Player,
     pub logs: LogBuffer,
     pub integrations: Integrations,
+    /// Combined actions on a title's copies that a toast can still undo (DESIGN §29.15).
+    pub undo: crate::store::copies::UndoStash,
     /// Set when [`Services::shutdown`] begins (the signal watcher leaves the exit to it; a
     /// signal after that means it is stuck).
     closing: Arc<AtomicBool>,
@@ -107,6 +109,7 @@ impl Services {
             player,
             logs,
             integrations: Integrations::default(),
+            undo: Default::default(),
             closing: Arc::default(),
             socket: Arc::default(),
         })
@@ -189,6 +192,10 @@ impl Services {
         }
         if old.general.debug_log != new.general.debug_log {
             crate::logging::set_debug(new.general.debug_log);
+        }
+        // the audio languages pick the top copy of every stack (DESIGN §29.11)
+        if old.player.audio_langs != new.player.audio_langs {
+            self.jobs.submit(crate::jobs::JobKind::RebuildLibrary);
         }
         // User-Agent / timeout: every clone of the client (jobs, image fetches) follows
         if http_options(old) != http_options(new)

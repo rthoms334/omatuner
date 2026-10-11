@@ -41,4 +41,7 @@ impl Screen for SeriesScreen {
     fn ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) {
         self.browser.ui(ui, ctx)
     }
+    fn hint_extras(&self) -> Vec<(Action, &'static str)> {
+        self.browser.hint_extras()
+    }
 }

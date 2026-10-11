@@ -28,6 +28,7 @@
 //! SQLite opens it (SQLite copies the mode to `-wal`/`-shm`).
 
 pub mod backup;
+pub mod copies;
 pub mod epg;
 pub mod import;
 pub mod library;
@@ -35,6 +36,8 @@ pub mod live;
 pub mod migrations;
 pub mod sources;
 pub mod sql;
+pub mod stacks;
+pub mod titles;
 pub mod user;
 pub mod vod;
 

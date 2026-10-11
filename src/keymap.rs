@@ -208,6 +208,15 @@ pub enum Action {
     /// Delete: remove from a favourites list / cancel a job / forget an orphan / cancel a
     /// reminder (whatever "remove" means for the focused row).
     Remove,
+    /// Space on a stack card in Movies / Series: fan the copies out in the grid, or fold them
+    /// back (DESIGN §29.14).
+    FanOut,
+    /// Ctrl+O on a title with several copies (grid card, detail page, the player): "Play
+    /// from…" a chosen copy (DESIGN §29.14, §29.15).
+    PlayFrom,
+    /// A toast's Undo button (never bound to a key): the app puts back what a combined action
+    /// on a title's copies wrote (`ui::copies`; the number names the action).
+    Undo(u16),
     // ---- guide
     GuidePrevDay,
     GuideNextDay,
@@ -461,6 +470,10 @@ pub static POSTER_GRID: &[Binding] = &[
     b(C::key(Key::Escape), A::Back, "Back"),
     b(C::ch('/'), A::OpenSearch, "Search everything"),
     b(C::ch('?'), A::ToggleHelp, "Keyboard help"),
+    // the Text event, like the group lists' marks (a leading space never filters anyway);
+    // only a stack card reacts (DESIGN §29.14)
+    b(C::ch(' '), A::FanOut, "Show each copy / fold them (stack card)"),
+    b(C::ctrl(Key::O), A::PlayFrom, "Play from another copy…"),
     // any other printable key starts filtering (FilterInput)
 ];
 
@@ -479,6 +492,8 @@ pub static POSTER_GRID_FILTERING: &[Binding] = &[
     b(C::key(Key::Escape), A::FilterClear, "Clear filter"),
     b(C::key(Key::Tab), A::FocusNext, "Next / previous pane"),
     b(C::shift(Key::Tab), A::FocusPrev, "Next / previous pane"),
+    // Space types here (filters have spaces)
+    b(C::ctrl(Key::O), A::PlayFrom, "Play from another copy…"),
 ];
 
 pub static DETAIL: &[Binding] = &[
@@ -498,6 +513,7 @@ pub static DETAIL: &[Binding] = &[
     b(C::key(Key::Escape), A::Back, "Back"),
     b(C::ch('/'), A::OpenSearch, "Search everything"),
     b(C::ch('?'), A::ToggleHelp, "Keyboard help"),
+    b(C::ctrl(Key::O), A::PlayFrom, "Play from another copy…"),
 ];
 
 pub static GUIDE: &[Binding] = &[
@@ -621,6 +637,7 @@ pub static PLAYER_VOD: &[Binding] = &[
     b(C::key(Key::ArrowDown), A::SeekBackBig, "Skip back / forward (big step)"),
     b(C::ch('L'), A::JumpToLive, "Jump to live (from catch-up)"),
     b(C::key(Key::Home), A::Home, "Go to start"),
+    b(C::ctrl(Key::O), A::PlayFrom, "Play from another copy…"),
 ];
 
 /// Controls focus mode only (never pushed by the passive banner).
@@ -963,13 +980,17 @@ pub fn hint_line(stack: &[KeyContext]) -> String {
     hint_line_with(stack, &[])
 }
 
-/// [`hint_line`] with global `extra` hints the screen adds (Movies with two playlists: "Alt+P
-/// playlist"), before "help". Not inside dialogs and text fields, whose keys come first.
+/// [`hint_line`] with `extra` hints the screen adds (Movies with two playlists: "Alt+P
+/// playlist"; a stack card: "Space copies · Ctrl+O play from"), before "help" — keys looked up
+/// in the stack's own tables, then the global one. Not inside dialogs and text fields, whose
+/// keys come first.
 pub fn hint_line_with(stack: &[KeyContext], extra: &[(Action, &'static str)]) -> String {
     let mut v = hints(stack);
     if !stack.iter().any(|c| matches!(c, KeyContext::Modal | KeyContext::TextInput | KeyContext::Search | KeyContext::Help)) {
         let at = v.iter().position(|(a, ..)| *a == A::ToggleHelp).unwrap_or(v.len());
-        let add = extra.iter().filter_map(|(a, verb)| GLOBAL.iter().find(|bd| bd.action == *a).map(|bd| (*a, bd.chord, *verb)));
+        let bound =
+            |a: Action| stack.iter().flat_map(|c| tables(*c)).chain(std::iter::once(GLOBAL)).find_map(|tb| tb.iter().find(|bd| bd.action == a));
+        let add: Vec<_> = extra.iter().filter_map(|(a, verb)| bound(*a).map(|bd| (*a, bd.chord, *verb))).collect();
         v.splice(at..at, add);
     }
     v.iter().map(|(_, chord, verb)| format!("{} {verb}", chord.label())).collect::<Vec<_>>().join(" · ")

@@ -7,7 +7,8 @@
 //! (real disk, like a user's profile): 100k channels, 50k movies, 20k series (the §5.4 budget),
 //! 24 h of guide for 5 000 channels, a few favourites and history (so `StartScreen::Auto`
 //! opens Home, the busiest start screen), quality words on most channels and a measured
-//! picture size on one in five.
+//! picture size on one in five; movies and series come in pairs of copies of one title, keyed
+//! like an import keys them, so the build stacks them (DESIGN §29.11).
 //!
 //! "First frame" follows `main` minus the window: from before the font/theme helper threads
 //! are spawned, through `Services::start` (store open + migrate, mpv init, …), the creation
@@ -85,6 +86,13 @@ fn seed_profile(paths: &AppPaths) {
                  INSERT INTO channel_video(source_id, item_key, name, url_key, width, height, at)
                    SELECT source_id, key, name, url_key, 1920, 1080, 0 FROM channel WHERE id % 5 = 1;",
             )?;
+            // P2 stacks (DESIGN §29.11): titles as a provider names them, in pairs (an HD and a 4K
+            // copy of each), keyed like an import does
+            c.execute_batch(
+                "UPDATE movie SET name = 'EN ★ Title ' || (id / 2) || ' - 2001' || CASE WHEN id % 2 = 1 THEN ' [4K]' ELSE '' END, year = 2001;
+                 UPDATE series SET name = 'EN - Show ' || (id / 2) || ' (2010)', year = 2010;",
+            )?;
+            tuner::store::titles::refresh_all(c)?;
             c.execute_batch("ANALYZE")?;
             Ok(())
         })

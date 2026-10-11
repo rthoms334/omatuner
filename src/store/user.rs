@@ -656,6 +656,8 @@ const HOLDERS: &[(&str, &str, &str, &str, &str)] = &[
     ("progress", "watch_progress", "kind", "item_key", ""),
     ("reminder", "reminder", "'channel'", "channel_key", ""),
     ("epg", "channel_epg_map", "'channel'", "channel_key", " AND method = 'manual'"),
+    // "Not the same title" / "Always play from" (DESIGN §29.11)
+    ("split or pin", "title_link", "kind", "item_key", ""),
 ];
 
 fn holder_name(s: &str) -> &'static str {

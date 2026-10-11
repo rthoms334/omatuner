@@ -254,6 +254,25 @@ fn group_marks_and_tick_lists() {
     assert!(help_rows(K::Checklist).iter().any(|r| r.1 == "Type to filter"));
 }
 
+/// Stacks of copies (DESIGN §29.14): Space fans a stack out in the movie / series grid only
+/// while nothing is typed (then it types, like the group marks); it never marks there. Ctrl+O
+/// ("Play from…") works in the grid, while filtering and on detail pages, and nowhere it would
+/// shadow something (Ctrl+Shift+O stays the pop-out).
+#[test]
+fn stack_fan_out_and_play_from() {
+    let ctrl_shift = |k: Key| key_mods(k, Modifiers::CTRL | Modifiers::COMMAND | Modifiers::SHIFT, false);
+    assert_eq!(resolve(&[K::PosterGrid], &text(" ")), Some(Action::FanOut));
+    assert_eq!(resolve(&[K::PosterGrid], &key(Key::Space)), None, "the key twin reaches nothing");
+    assert_eq!(resolve(&[K::PosterGridFiltering], &text(" ")), Some(Action::FilterInput(' ')), "filters have spaces");
+    assert_eq!(resolve(&[K::List], &text(" ")), Some(Action::ToggleMark), "group lists keep marking");
+    for stack in [vec![K::PosterGrid], vec![K::PosterGridFiltering], vec![K::Detail], vec![K::PlayerVod]] {
+        assert_eq!(resolve(&stack, &ctrl(Key::O)), Some(Action::PlayFrom), "{stack:?}");
+        assert_eq!(resolve(&stack, &ctrl_shift(Key::O)), Some(Action::TogglePopOut), "{stack:?}");
+    }
+    assert_eq!(resolve(&[K::List], &ctrl(Key::O)), None, "channels have no copies");
+    assert!(help_rows(K::PosterGrid).iter().any(|r| r.0 == "Space" && r.1.starts_with("Show each copy")));
+}
+
 // ------------------------------------------------------------------ tables, help, hints
 
 #[test]

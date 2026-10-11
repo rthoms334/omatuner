@@ -84,8 +84,21 @@ pub struct Backup {
     pub history: Vec<HistoryEntry>,
     pub reminders: Vec<Reminder>,
     pub manual_mappings: Vec<BackupManualMapping>,
+    /// "Not the same title" splits and "Always play from" pins (DESIGN §29.11; absent in
+    /// backups from before P2).
+    #[serde(default)]
+    pub title_links: Vec<BackupTitleLink>,
     /// Raw `config.toml` text.
     pub config: Option<String>,
+}
+
+/// One `title_link` row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackupTitleLink {
+    pub item: crate::model::ItemRef,
+    /// `split` or `pin`.
+    pub action: String,
+    pub at: Timestamp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,6 +211,10 @@ pub fn export(conn: &Connection, opts: BackupOptions, config_toml: Option<String
         history: if opts.include_history { user::all_history(conn)? } else { Vec::new() },
         reminders: user::every_reminder(conn)?,
         manual_mappings,
+        title_links: crate::store::titles::links(conn)?
+            .into_iter()
+            .map(|l| BackupTitleLink { item: l.item, action: l.action.as_str().to_owned(), at: l.at })
+            .collect(),
         config: config_toml,
     })
 }
@@ -429,6 +446,20 @@ pub fn restore(conn: &mut Connection, b: &Backup, mode: RestoreMode) -> Result<R
                 g.ov.shown,
                 g.ov.explicit
             ],
+        )?;
+    }
+
+    for t in &b.title_links {
+        let Some(item) = remap(&t.item) else { continue };
+        let kind = match item.kind {
+            crate::model::ItemKind::Movie => "movie",
+            crate::model::ItemKind::Series => "series",
+            _ => continue,
+        };
+        rows += tx.execute(
+            "INSERT INTO title_link(source_id, kind, item_key, action, at) SELECT ?1, ?2, ?3, ?4, ?5
+             WHERE ?4 IN ('split', 'pin') ON CONFLICT(source_id, kind, item_key, action) DO NOTHING",
+            params![item.source, kind, item.key.as_str(), t.action, t.at],
         )?;
     }
 

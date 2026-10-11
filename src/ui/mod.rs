@@ -14,6 +14,7 @@
 //! * UI code never calls mpv: player control is `ctx.play(PlayerCommand)` (non-blocking),
 //!   state is `ctx.player` (snapshot).
 
+pub mod copies;
 pub mod data;
 pub mod epg_grid;
 pub mod layout;
@@ -22,6 +23,7 @@ pub mod parental;
 pub mod popout;
 pub mod scope;
 pub mod screens;
+pub mod stacks;
 #[doc(hidden)]
 pub mod testing;
 pub mod video_host;
@@ -410,6 +412,12 @@ pub trait Screen {
 
     /// Result of an overlay this screen opened (confirm token, chosen menu action...).
     fn on_overlay_result(&mut self, _ctx: &mut UiCtx<'_>, _result: overlays::OverlayResult) {}
+
+    /// Hints the focused element adds to the status bar's (a stack card: "Space copies ·
+    /// Ctrl+O play from"), as of the last frame.
+    fn hint_extras(&self) -> Vec<(crate::keymap::Action, &'static str)> {
+        Vec::new()
+    }
 
     /// Whether the corner mini-player may show over this screen while something plays.
     /// False for Onboarding and the Player itself.

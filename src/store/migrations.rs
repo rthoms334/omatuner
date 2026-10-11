@@ -19,6 +19,7 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("0003_quality", include_str!("migrations/0003_quality.sql")),
     ("0004_name_rules", include_str!("migrations/0004_name_rules.sql")),
     ("0005_explicit", include_str!("migrations/0005_explicit.sql")),
+    ("0006_title_stacks", include_str!("migrations/0006_title_stacks.sql")),
 ];
 
 /// Current schema version after all migrations.
@@ -51,7 +52,17 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
 /// branch is at v2 with *its* `0002_quality` applied, not `0002_category_filter`. Such a
 /// database (v2+ without `grp.raw_name`) gets the category-filter columns here; the
 /// renumbered `0003_quality` then re-runs harmlessly (it is idempotent).
+///
+/// Likewise a development database of the stacks branch is at v5 with its `0005_title_stacks`
+/// (now 0006, re-run harmlessly) instead of `0005_explicit`: the explicit columns are added and
+/// backfilled here.
 fn reconcile_renumbered(conn: &mut Connection, current: i64) -> Result<()> {
+    if current >= 5 && !has_column(conn, "grp", "explicit")? {
+        tracing::info!("applying migration 0005_explicit (database had another branch's 0005)");
+        let tx = conn.transaction()?;
+        backfill_explicit(&tx)?;
+        tx.commit()?;
+    }
     if current < 2 || has_column(conn, "grp", "raw_name")? {
         return Ok(());
     }
@@ -83,8 +94,28 @@ fn backfill(conn: &Connection, name: &str) -> Result<()> {
             reclean_names(conn)
         }
         "0005_explicit" => backfill_explicit(conn),
+        "0006_title_stacks" => {
+            add_title_columns(conn)?;
+            crate::store::titles::refresh_all(conn).map(|_| ())
+        }
         _ => Ok(()),
     }
+}
+
+/// The match columns of movies and series and `series.tmdb_id` (0006; only the missing ones,
+/// so a renumbered re-run is harmless).
+fn add_title_columns(conn: &Connection) -> Result<()> {
+    for table in ["movie", "series"] {
+        for (col, decl) in
+            [("match_key", "TEXT"), ("match_hash", "INTEGER"), ("match_lang", "TEXT"), ("match_tags", "INTEGER"), ("match_origin", "TEXT")]
+        {
+            add_column_if_missing(conn, table, col, decl)?;
+        }
+    }
+    add_column_if_missing(conn, "series", "tmdb_id", "INTEGER")?;
+    // a database that ran this migration before it gained the user-data columns
+    add_column_if_missing(conn, "title_link", "fp", "TEXT NOT NULL DEFAULT '{}'")?;
+    add_column_if_missing(conn, "title_link", "orphaned_since", "INTEGER")
 }
 
 /// The explicit-content columns (DESIGN §20.3; added here when missing, so the migration is safe
@@ -240,7 +271,7 @@ mod tests {
         let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v, latest_version());
         let names: Vec<&str> = MIGRATIONS.iter().map(|m| m.0).collect();
-        assert_eq!(names, ["0001_init", "0002_category_filter", "0003_quality", "0004_name_rules", "0005_explicit"]);
+        assert_eq!(names, ["0001_init", "0002_category_filter", "0003_quality", "0004_name_rules", "0005_explicit", "0006_title_stacks"]);
         for (t, col) in [
             ("grp", "raw_name"),
             ("group_override", "shown"),
@@ -431,6 +462,68 @@ mod tests {
         check(&c);
     }
 
+    /// A database from before the stacks keys every stored movie and series from its provider
+    /// name (no refresh needed), adds `series.tmdb_id` and `title_link`; running it again
+    /// (renumbered after another branch's 0005) changes nothing.
+    #[test]
+    fn title_stacks_migration_keys_existing_titles() {
+        let mut c = migrated_to(5);
+        assert_eq!(MIGRATIONS[5].0, "0006_title_stacks");
+        c.execute_batch(
+            r#"INSERT INTO source(id,name,kind,created_at) VALUES (1,'TV','xtream',0), (2,'TV 2','xtream',0);
+               INSERT INTO movie(source_id,key,name,clean_name,norm_name,year,stream,provider_order,seen_gen) VALUES
+                 (1,'a','EN ★ Dune - 2021 [4k]','Dune','dune',2021,'{}',0,1),
+                 (2,'b','AR-SUBS - Dune (2021)','Dune','dune',NULL,'{}',0,1),
+                 (2,'c','SE - Gold','Gold','gold',NULL,'{}',1,1);
+               INSERT INTO series(source_id,key,name,clean_name,norm_name,year,provider_order,seen_gen) VALUES
+                 (2,'s','EN - Lewis (2007) (GB)','Lewis','lewis',NULL,0,1);"#,
+        )
+        .unwrap();
+        let check = |c: &Connection| {
+            let row = |t: &str, k: &str| {
+                c.query_row(&format!("SELECT match_key, match_hash, match_lang, match_tags, match_origin FROM {t} WHERE key = ?1"), [k], |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<i64>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                    ))
+                })
+                .unwrap()
+            };
+            let (a, b, gold, lewis) = (row("movie", "a"), row("movie", "b"), row("movie", "c"), row("series", "s"));
+            assert_eq!((a.0.as_deref(), a.2.as_deref(), a.3), (Some("dune"), Some("EN"), i64::from(Quality::Uhd.code())));
+            assert_eq!(a.1, b.1, "one stack across languages, the year from the name");
+            assert_eq!(b.2.as_deref(), Some("AR-SUBS"));
+            assert_eq!(gold.1, None, "no year: no key stacking");
+            assert_eq!((lewis.0.as_deref(), lewis.4.as_deref()), (Some("lewis"), Some("GB")));
+            let n: i64 = c.query_row("SELECT count(*) FROM pragma_table_info('series') WHERE name = 'tmdb_id'", [], |r| r.get(0)).unwrap();
+            assert_eq!(n, 1);
+            let stamps: i64 = c.query_row("SELECT count(*) FROM meta WHERE key LIKE 'vod_match:%'", [], |r| r.get(0)).unwrap();
+            assert_eq!(stamps, 2);
+        };
+        migrate(&mut c).unwrap();
+        check(&c);
+        c.execute("INSERT INTO title_link(source_id,kind,item_key,action,at) VALUES (1,'movie','a','split',5)", []).unwrap();
+        c.pragma_update(None, "user_version", 5).unwrap();
+        migrate(&mut c).unwrap();
+        check(&c);
+        let kept: i64 = c.query_row("SELECT count(*) FROM title_link", [], |r| r.get(0)).unwrap();
+        assert_eq!(kept, 1, "a re-run keeps the user's corrections");
+        // a development database of the stacks branch, where this migration was 0005: the
+        // explicit-content migration it skipped is applied on open
+        let mut d = migrated_to(4);
+        let tx = d.transaction().unwrap();
+        tx.execute_batch(MIGRATIONS[5].1).unwrap();
+        backfill(&tx, MIGRATIONS[5].0).unwrap();
+        tx.pragma_update(None, "user_version", 5).unwrap();
+        tx.commit().unwrap();
+        assert!(!has_column(&d, "grp", "explicit").unwrap());
+        migrate(&mut d).unwrap();
+        assert!(has_column(&d, "grp", "explicit").unwrap() && has_column(&d, "movie", "explicit").unwrap());
+    }
+
     /// 0005: categories whose stored names read as adult content are explicit without a
     /// refresh (raw name first, display name for groups imported before P6); innocent ones
     /// aren't. Safe to run again.
@@ -475,7 +568,7 @@ mod tests {
     #[test]
     fn user_data_tables_carry_fingerprints() {
         let c = fresh();
-        for t in ["fav_item", "item_override", "watch_progress", "reminder", "channel_epg_map"] {
+        for t in ["fav_item", "item_override", "watch_progress", "reminder", "channel_epg_map", "title_link"] {
             for col in ["fp", "orphaned_since"] {
                 let n: i64 = c.query_row(&format!("SELECT count(*) FROM pragma_table_info('{t}') WHERE name='{col}'"), [], |r| r.get(0)).unwrap();
                 assert_eq!(n, 1, "{t}.{col}");

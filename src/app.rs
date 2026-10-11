@@ -398,6 +398,10 @@ impl TunerApp {
                 PlatformEvent::FilePicked { .. } | PlatformEvent::ReminderFired(_) => {}
                 PlatformEvent::PopOut(ev) => self.on_popout_event(ev, egui_ctx),
             },
+            // the first copy of a title failed before its first frame (DESIGN §29.15)
+            AppEvent::Player(crate::player::PlayerEvent::FellBack { title, from, to, .. }) => {
+                self.toast(crate::ui::copies::fell_back_toast(&self.lib, title, *from, *to));
+            }
             AppEvent::Player(_) => {}
         }
         self.with_ctx(|ctx, screens, _| {
@@ -819,6 +823,11 @@ impl TunerApp {
                 self.toggle_popout(egui_ctx);
             }
             Action::Back => self.back(egui_ctx),
+            // a combined action's Undo (`ui::copies`)
+            Action::Undo(n) => {
+                let undone = crate::ui::copies::undo(self.services(), n);
+                self.toast(Toast::info(if undone { "Undone" } else { "That can no longer be undone" }));
+            }
             _ => {}
         }
     }
@@ -1232,9 +1241,14 @@ impl TunerApp {
     fn hint_now(&self) -> String {
         use crate::ui::scope::{Scope, ScopeKind};
         let stack = self.key_stack();
+        // the focused element's (a stack card: Space, Ctrl+O), then the playlist picker
+        let mut extra = if self.overlays.is_empty() { self.screens[self.screen_index(self.view_screen())].hint_extras() } else { Vec::new() };
         let multi = ScopeKind::of_screen(self.view_screen())
             .is_some_and(|k| Scope::of(&self.lib, &self.services().config().interface.playlist_scope, k).multi());
-        if multi { keymap::hint_line_with(&stack, &[(Action::PlaylistPicker, "playlist")]) } else { keymap::hint_line(&stack) }
+        if multi {
+            extra.push((Action::PlaylistPicker, "playlist"));
+        }
+        keymap::hint_line_with(&stack, &extra)
     }
 
     /// `StartScreen::Last`: store the main screen the user leaves on (written at exit only).
@@ -2549,6 +2563,58 @@ mod tests {
         assert_eq!(rig.log().jobs.len(), 1, "favourites never rebuild the library");
     }
 
+    /// Copies of a title (DESIGN §29.15): the player's fallback becomes a toast naming both
+    /// playlists, and a toast's Undo writes back the rows its own combined action found — once,
+    /// whatever was done since.
+    #[test]
+    fn fallback_toast_and_undo_of_a_combined_action() {
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| {
+            for name in ["TV", "TV 2"] {
+                c.execute(
+                    "INSERT INTO source(name, kind, url, created_at, generation) VALUES (?1, 'm3u-url', 'http://127.0.0.1/p.m3u', 0, 1)",
+                    [name],
+                )?;
+            }
+            Ok(())
+        });
+        rig.settle();
+        rig.event(AppEvent::Player(crate::player::PlayerEvent::FellBack {
+            title: "Dune".into(),
+            from: Some(SourceId(1)),
+            to: Some(SourceId(2)),
+            error: crate::player::PlayerErrorKind::Timeout,
+        }));
+        assert_eq!(rig.log().toasts.last().unwrap().text, "TV couldn't play Dune — playing from TV 2");
+
+        // ★ removed from both copies; the toast's Undo puts both back
+        let copy = |s: i64| ItemRef { source: SourceId(s), kind: ItemKind::Movie, key: ItemKey(format!("m{s}")) };
+        let (a, b) = (copy(1), copy(2));
+        let undo = rig
+            .writer()
+            .blocking(move |c| {
+                let list = crate::store::user::default_fav_list(c)?;
+                crate::store::user::set_favourite(c, list, &a, true, 1)?;
+                crate::store::user::set_favourite(c, list, &b, true, 2)?;
+                crate::store::copies::favourite(c, list, &[a, b], &copy(1), false, 3)
+            })
+            .unwrap();
+        let favs = |rig: &Rig| crate::store::library::load_favs(&rig.app.db).unwrap().items(rig.app.favs.default_list().unwrap()).len();
+        assert_eq!(favs(&rig), 0);
+        let n = rig.app.services().undo.stash(undo);
+        // a newer combined action (on another page, say) doesn't change what the older toast
+        // undoes: the split stays
+        let split = rig.writer().blocking(move |c| crate::store::copies::split(c, &copy(2), true, 4)).unwrap();
+        rig.app.services().undo.stash(split);
+        let ctx = rig.ctx.clone();
+        rig.app.global_action(Action::Undo(n), &[], &ctx);
+        rig.writer().blocking(|_| Ok(())).unwrap();
+        assert_eq!(favs(&rig), 2);
+        assert_eq!(crate::store::titles::links(&rig.app.db).unwrap().len(), 1, "the split stays");
+        assert_eq!(rig.log().toasts.last().unwrap().text, "Undone");
+        rig.app.global_action(Action::Undo(n), &[], &ctx);
+        assert_eq!(rig.log().toasts.last().unwrap().text, "That can no longer be undone");
+    }
+
     /// A playlist picked on a screen (DESIGN §29): the window title names it and the hint line
     /// offers Alt+P (two playlists with channels); once it is disabled, Live TV shows All
     /// playlists again with a toast saying why, and the title drops it. With one playlist
@@ -3363,6 +3429,7 @@ mod tests {
                 title: "t".into(),
                 position_s: 10.0,
                 duration_s: None,
+                copy: None,
             }),
         ];
         for o in overlays {

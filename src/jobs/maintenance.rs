@@ -30,11 +30,12 @@ const PRUNE_CHUNK: usize = 20_000;
 /// Image cache budget on disk (DESIGN §7.4).
 const IMAGE_CACHE_BYTES: u64 = 500 * 1024 * 1024;
 
-/// Build a new `Library` from a fresh reader connection on a blocking thread.
+/// Build a new `Library` from a fresh reader connection on a blocking thread, with the
+/// current config's options (the audio languages order the copies of a stack).
 pub async fn rebuild_library(ctx: &JobContext) -> Result<Arc<Library>> {
-    // read at the start: the app rebuilds again when its parental state changed meanwhile
-    let visibility = ctx.explicit.visibility();
-    read(ctx, move |c| crate::store::library::load_visible(c, visibility)).await.map(Arc::new)
+    // visibility read at the start: the app rebuilds again when its parental state changed meanwhile
+    let opts = crate::store::library::LoadOptions::from_config(&crate::config::current(&ctx.config), ctx.explicit.visibility());
+    read(ctx, move |c| crate::store::library::load_with(c, &opts)).await.map(Arc::new)
 }
 
 /// Prune programmes older than max(keep_past_days, max catch-up days), sweep inactive EPG

@@ -802,6 +802,7 @@ fn m3u_entry_to_movie(
         provider_order: order,
         added_at: None,
         groups: entry_groups(e, ItemKind::Movie, smart, groups_out),
+        tmdb: None,
         adult: false,
         name,
     }
@@ -930,6 +931,7 @@ impl EpisodeCollector {
                     provider_order: s.order,
                     added_at: None,
                     groups: s.groups,
+                    tmdb: None,
                     adult: false,
                     name: s.title,
                 },
@@ -1439,6 +1441,7 @@ pub fn xt_vod_to_movie(s: &XtVodStream, order: i32, smart: bool, cats: &[XtCateg
         provider_order: order,
         added_at: positive(s.added),
         groups: xt_group_keys(ItemKind::Movie, &s.category_id, &s.category_ids, cats),
+        tmdb: crate::sources::xtream::types::tmdb_of(&s.tmdb, &s.tmdb_id),
         adult: s.is_adult,
         name,
     })
@@ -1467,6 +1470,7 @@ pub fn xt_series_to_series(s: &XtSeries, order: i32, smart: bool, cats: &[XtCate
         provider_order: order,
         added_at: positive(s.last_modified),
         groups: xt_group_keys(ItemKind::Series, &s.category_id, &s.category_ids, cats),
+        tmdb: crate::sources::xtream::types::tmdb_of(&s.tmdb, &s.tmdb_id),
         adult: s.is_adult,
         name,
     })
@@ -1662,6 +1666,15 @@ mod tests {
         assert_eq!(mv.groups, vec![GroupKey("movie:moviesaction".into())]);
         let unrated: XtVodStream = serde_json::from_str(r#"{"name":"Plain","stream_id":5002,"rating":""}"#).unwrap();
         assert_eq!(xt_vod_to_movie(&unrated, 1, true, &c).unwrap().rating, None);
+        // TMDB ids from the list (DESIGN §29.10): `tmdb` or `tmdb_id`, string or number; "" and
+        // "0" are none
+        let tmdb = |json: &str| xt_vod_to_movie(&serde_json::from_str::<XtVodStream>(json).unwrap(), 0, true, &c).unwrap().tmdb;
+        assert_eq!(tmdb(r#"{"name":"A","stream_id":1,"tmdb":"603"}"#), Some(603));
+        assert_eq!(tmdb(r#"{"name":"A","stream_id":1,"tmdb":603}"#), Some(603));
+        assert_eq!(tmdb(r#"{"name":"A","stream_id":1,"tmdb":"","tmdb_id":"604"}"#), Some(604));
+        assert_eq!(tmdb(r#"{"name":"A","stream_id":1,"tmdb":"0"}"#), None);
+        assert_eq!(tmdb(r#"{"name":"A","stream_id":1,"tmdb":null}"#), None);
+        assert_eq!(mv.tmdb, None);
 
         let s: XtSeries = serde_json::from_str(
             r#"{"name":"Example Show (2020)","series_id":"700","cover":"http://i/s.jpg","plot":"","genre":"Drama",
@@ -1676,6 +1689,8 @@ mod tests {
         assert_eq!(se.backdrop.as_deref(), Some("http://i/b.jpg"));
         assert_eq!(se.last_modified, Some(1_700_000_400));
         assert_eq!(se.groups, vec![GroupKey("series:uncategorized".into())]);
+        let s: XtSeries = serde_json::from_str(r#"{"name":"Lewis","series_id":701,"tmdb":"1871"}"#).unwrap();
+        assert_eq!(xt_series_to_series(&s, 0, true, &[]).unwrap().tmdb, Some(1871));
     }
 
     #[test]

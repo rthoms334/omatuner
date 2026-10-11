@@ -83,6 +83,7 @@ fn movie(key: &str, name: &str, group: &str, adult: bool) -> ImportMovie {
         provider_order: 0,
         added_at: None,
         groups: vec![group_key(ItemKind::Movie, group)],
+        tmdb: None,
         adult,
     }
 }
@@ -108,6 +109,7 @@ fn series(key: &str, name: &str, group: &str) -> ImportSeriesEpisodes {
             last_modified: None,
             provider_order: 0,
             added_at: None,
+            tmdb: None,
             groups: vec![group_key(ItemKind::Series, group)],
             adult: false,
         },

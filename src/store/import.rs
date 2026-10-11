@@ -118,6 +118,8 @@ pub struct ImportMovie {
     pub provider_order: i32,
     pub added_at: Option<Timestamp>,
     pub groups: Vec<GroupKey>,
+    /// The provider's TMDB id from the list (`tmdb`), when it sends one (DESIGN §29.10).
+    pub tmdb: Option<u32>,
     /// The provider flags the movie as adult content (`movie.explicit`; DESIGN §20.3).
     pub adult: bool,
 }
@@ -142,6 +144,8 @@ pub struct ImportSeries {
     pub provider_order: i32,
     pub added_at: Option<Timestamp>,
     pub groups: Vec<GroupKey>,
+    /// The provider's TMDB id from the list (`tmdb`), when it sends one (DESIGN §29.10).
+    pub tmdb: Option<u32>,
     /// The provider flags the series as adult content (`series.explicit`; DESIGN §20.3).
     pub adult: bool,
 }
@@ -197,6 +201,8 @@ pub struct SeriesDetails {
     pub episodes: Vec<ImportEpisode>,
     pub plot: Option<String>,
     pub backdrop: Option<String>,
+    /// `info.tmdb` / `info.tmdb_id` (DESIGN §29.10).
+    pub tmdb_id: Option<u32>,
 }
 
 /// A series assembled from M3U episode entries, with every episode the playlist lists
@@ -499,9 +505,12 @@ pub fn write_movies(conn: &mut Connection, imp: &CatalogueImport, batch: &[Impor
         let id: i64 = tx
             .prepare_cached(
                 "INSERT INTO movie(source_id, key, provider_id, name, clean_name, norm_name, year, poster, rating, stream, url_key,
-                                   provider_order, added_at, seen_gen, explicit)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, COALESCE(?13, ?14), ?15, ?16)
+                                   provider_order, added_at, seen_gen, tmdb_id, explicit)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, COALESCE(?13, ?14), ?15, ?16, ?17)
                  ON CONFLICT(source_id, key) DO UPDATE SET
+                   match_tags = CASE WHEN excluded.name IS movie.name AND (excluded.year IS NULL OR excluded.year IS movie.year)
+                                     THEN movie.match_tags END,
+                   tmdb_id = COALESCE(excluded.tmdb_id, movie.tmdb_id),
                    provider_id = excluded.provider_id, name = excluded.name, clean_name = excluded.clean_name,
                    norm_name = excluded.norm_name, year = COALESCE(excluded.year, movie.year),
                    poster = COALESCE(excluded.poster, movie.poster), rating = COALESCE(excluded.rating, movie.rating),
@@ -526,6 +535,7 @@ pub fn write_movies(conn: &mut Connection, imp: &CatalogueImport, batch: &[Impor
                     m.added_at,
                     imp.started_at,
                     imp.generation,
+                    m.tmdb.map(|t| t.to_string()),
                     m.adult,
                 ],
                 |r| r.get(0),
@@ -567,9 +577,12 @@ fn upsert_series(tx: &Connection, imp: &CatalogueImport, s: &ImportSeries, group
     let id: i64 = tx
         .prepare_cached(
             "INSERT INTO series(source_id, key, provider_id, name, clean_name, norm_name, year, cover, backdrop, rating, plot,
-                                    genre, cast_, director, release_date, last_modified, provider_order, added_at, seen_gen, explicit)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, COALESCE(?18, ?19), ?20, ?21)
+                                    genre, cast_, director, release_date, last_modified, provider_order, added_at, seen_gen, tmdb_id, explicit)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, COALESCE(?18, ?19), ?20, ?21, ?22)
                  ON CONFLICT(source_id, key) DO UPDATE SET
+                   match_tags = CASE WHEN excluded.name IS series.name AND (excluded.year IS NULL OR excluded.year IS series.year)
+                                     THEN series.match_tags END,
+                   tmdb_id = COALESCE(excluded.tmdb_id, series.tmdb_id),
                    provider_id = excluded.provider_id, name = excluded.name, clean_name = excluded.clean_name,
                    norm_name = excluded.norm_name, year = COALESCE(excluded.year, series.year),
                    cover = COALESCE(excluded.cover, series.cover), backdrop = COALESCE(excluded.backdrop, series.backdrop),
@@ -606,6 +619,7 @@ fn upsert_series(tx: &Connection, imp: &CatalogueImport, s: &ImportSeries, group
                 s.added_at,
                 imp.started_at,
                 imp.generation,
+                s.tmdb,
                 s.adult,
             ],
             |r| r.get(0),
@@ -911,17 +925,26 @@ pub fn finish_catalogue_with(
         }
     }
     distinguish_group_names(&tx, imp.source, Some(imp.generation))?;
+    if completed.iter().any(|k| matches!(k, ItemKind::Movie | ItemKind::Series)) {
+        // match keys of new / renamed titles (DESIGN §29.10)
+        crate::store::titles::refresh_source(&tx, imp.source)?;
+    }
     let gc = take_counters(&tx, imp, "group")?;
     let n_groups: i64 = tx.query_row("SELECT count(*) FROM grp WHERE source_id = ?1", [imp.source], |r| r.get(0))?;
     summary.groups = KindCounts { added: gc.added, updated: gc.updated, removed: groups_removed, total: u32_of(n_groups) };
 
-    if completed.contains(&ItemKind::Channel) {
-        // per-stream state of channels that are gone for good (user data is reattached below)
+    if !completed.is_empty() {
+        // per-stream state of channels, movies and episodes that are gone for good (user data
+        // is reattached below); a movie's failure orders its copies (DESIGN §29.15)
         tx.execute(
             "DELETE FROM stream_failure WHERE source_id = ?1
-               AND NOT EXISTS (SELECT 1 FROM channel c WHERE c.source_id = ?1 AND c.key = stream_failure.item_key)",
+               AND NOT EXISTS (SELECT 1 FROM channel c WHERE c.source_id = ?1 AND c.key = stream_failure.item_key)
+               AND NOT EXISTS (SELECT 1 FROM movie m WHERE m.source_id = ?1 AND m.key = stream_failure.item_key)
+               AND NOT EXISTS (SELECT 1 FROM episode e WHERE e.source_id = ?1 AND e.key = stream_failure.item_key)",
             [imp.source],
         )?;
+    }
+    if completed.contains(&ItemKind::Channel) {
         tx.execute(
             "DELETE FROM channel_epg_map WHERE source_id = ?1 AND method != 'manual'
                AND NOT EXISTS (SELECT 1 FROM channel c WHERE c.source_id = ?1 AND c.key = channel_epg_map.channel_key)",
@@ -1257,8 +1280,9 @@ pub fn store_series_details(conn: &mut Connection, series: crate::model::SeriesI
     )?;
     replace_episodes(&tx, series, source, &d.episodes, &d.seasons)?;
     tx.execute(
-        "UPDATE series SET plot = COALESCE(?2, plot), backdrop = COALESCE(?3, backdrop), details_at = ?4 WHERE id = ?1",
-        params![series, d.plot, d.backdrop, now],
+        "UPDATE series SET plot = COALESCE(?2, plot), backdrop = COALESCE(?3, backdrop), details_at = ?4, tmdb_id = COALESCE(?5, tmdb_id)
+         WHERE id = ?1",
+        params![series, d.plot, d.backdrop, now, d.tmdb_id],
     )?;
     let mut outcomes = Vec::new();
     reattach_kind(&tx, source, ItemKind::Episode, Some((series, &norm)), now, &mut outcomes)?;

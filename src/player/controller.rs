@@ -21,7 +21,7 @@ use super::events::{EndReason, MpvEvent, PropId, PropValue};
 use super::mpv_log::{self, MpvLog};
 use super::state::{Effect, Input, MachineConfig, PlayerMachine};
 use super::tracks::{AspectMode, parse_track_list, query_stream_info};
-use super::{PlayRequest, PlayerCommand, PlayerDeps, PlayerError, PlayerErrorKind, PlayerEvent, PlayerSnapshot, PlayerState, RenderClock};
+use super::{CopyPlay, PlayRequest, PlayerCommand, PlayerDeps, PlayerError, PlayerErrorKind, PlayerEvent, PlayerSnapshot, PlayerState, RenderClock};
 use crate::config::Config;
 use crate::model::{ChannelId, HistoryEntry, ItemRef, MediaRef, PlayOrigin, Playable, PlayableKind, SourceId, WatchProgress};
 use crate::msg::AppEvent;
@@ -73,6 +73,8 @@ pub fn spawn(
         epoch,
         mpv_log: MpvLog::default(),
         recorded_video: None,
+        fallback: None,
+        elsewhere: None,
     };
     std::thread::Builder::new().name("player".into()).spawn(move || c.run(cmd_rx, evt_rx))
 }
@@ -115,6 +117,11 @@ struct Controller {
     mpv_log: MpvLog,
     /// The live channel and picture size last handed to `PlayerStore::record_video`.
     recorded_video: Option<(ItemRef, (i64, i64))>,
+    /// The other copy of the current title, for one fallback before the first frame
+    /// ([`CopyPlay::fallback`]; the machine is armed while it is set).
+    fallback: Option<MediaRef>,
+    /// [`CopyPlay::elsewhere`] of the current title.
+    elsewhere: Option<MediaRef>,
 }
 
 impl Controller {
@@ -210,6 +217,7 @@ impl Controller {
                 }
                 Effect::RecordFailure(p, kind) => self.record_failure(&p, Some(kind)),
                 Effect::ClearFailure(p) => self.record_failure(&p, None),
+                Effect::Fallback(err) => self.fall_back(err),
             }
         }
         self.dirty = true;
@@ -289,17 +297,87 @@ impl Controller {
     }
 
     fn resolve_and_play(&mut self, req: PlayRequest) -> bool {
+        self.play_copy(CopyPlay { req, fallback: None, elsewhere: None, start_at: None })
+    }
+
+    /// Resolve and play; a copy with a fallback that can't be resolved goes straight to the
+    /// fallback (once). The machine is armed only for the target that actually plays.
+    fn play_copy(&mut self, c: CopyPlay) -> bool {
+        let CopyPlay { req, fallback, elsewhere, start_at } = c;
         if let Some(z) = req.zap.clone() {
             self.snap.zap = Some(z);
         }
-        match self.deps.resolver.resolve(&req.media, req.resume) {
-            Ok(p) => {
+        let resume = req.resume && start_at.is_none();
+        let resolved = self.deps.resolver.resolve(&req.media, resume).map(|mut p| {
+            if start_at.is_some() {
+                p.start_at = start_at.filter(|s| *s > 0.0);
+            }
+            p
+        });
+        match (resolved, fallback) {
+            (Ok(p), fallback) => {
                 self.snap.origin = Some(req.origin);
+                self.fallback = fallback;
+                self.elsewhere = elsewhere;
+                self.machine.arm_fallback(self.fallback.is_some());
                 self.feed(Input::Play { target: Arc::new(p), immediate: req.immediate }, Instant::now())
             }
-            Err(err) => {
+            (Err(err), Some(other)) => match self.deps.resolver.resolve(&other, resume) {
+                Ok(mut p) => {
+                    tracing::info!("the first copy can't be resolved ({}); playing the next one", err.message);
+                    if start_at.is_some() {
+                        p.start_at = start_at.filter(|s| *s > 0.0);
+                    }
+                    // nothing played to name the first copy by: the toast names the next one
+                    let ev = PlayerEvent::FellBack { title: p.title.clone(), from: None, to: p.source_id, error: err.kind };
+                    self.snap.origin = Some(req.origin);
+                    self.fallback = None;
+                    self.elsewhere = None;
+                    self.machine.arm_fallback(false);
+                    let changed = self.feed(Input::Play { target: Arc::new(p), immediate: req.immediate }, Instant::now());
+                    self.deps.bus.send(AppEvent::Player(ev));
+                    changed
+                }
+                Err(_) => {
+                    self.snap.last_error = Some(err.clone());
+                    self.feed(Input::ResolveFailed(err), Instant::now())
+                }
+            },
+            (Err(err), None) => {
                 self.snap.last_error = Some(err.clone());
                 self.feed(Input::ResolveFailed(err), Instant::now())
+            }
+        }
+    }
+
+    /// The armed target failed before its first frame ([`Effect::Fallback`]): play the other
+    /// copy once, at the position the first one was asked to start at; if that can't even be
+    /// resolved, the first failure stands.
+    fn fall_back(&mut self, err: PlayerError) {
+        let failed = self.machine.target().cloned();
+        // a playlist that refused (403, its connection budget): a copy elsewhere
+        let next = CopyPlay::fallback_for(self.fallback.take(), self.elsewhere.take(), err.kind).map(|m| (self.deps.resolver.resolve(&m, false), m));
+        match next {
+            Some((Ok(mut p), _)) => {
+                let failed = failed.as_deref();
+                p.start_at = failed.and_then(|f| f.start_at);
+                tracing::info!("{} failed before its first frame ({:?}); playing the next copy", failed.map_or("", |f| f.title.as_str()), err.kind);
+                let ev = PlayerEvent::FellBack {
+                    title: failed.map_or_else(|| p.title.clone(), |f| f.title.clone()),
+                    from: failed.and_then(|f| f.source_id),
+                    to: p.source_id,
+                    error: err.kind,
+                };
+                self.machine.arm_fallback(false);
+                self.feed(Input::Play { target: Arc::new(p), immediate: true }, Instant::now());
+                self.deps.bus.send(AppEvent::Player(ev));
+            }
+            Some((Err(e), m)) => {
+                tracing::warn!("the next copy {m:?} can't be resolved either: {}", e.message);
+                self.feed(Input::GiveUp(err), Instant::now());
+            }
+            None => {
+                self.feed(Input::GiveUp(err), Instant::now());
             }
         }
     }
@@ -312,6 +390,7 @@ impl Controller {
         let m = self.mpv.clone();
         match cmd {
             PlayerCommand::Play(req) => return self.resolve_and_play(req),
+            PlayerCommand::PlayCopy(c) => return self.play_copy(c),
             PlayerCommand::Stop => return self.feed(Input::Stop, Instant::now()),
             PlayerCommand::TogglePause => {
                 let _ = m.command("cycle", &["pause"]);
@@ -695,6 +774,7 @@ impl Controller {
             return;
         }
         self.snap.state = self.machine.state().clone();
+        self.snap.last_position = self.machine.last_position();
         if let PlayerState::Error(e) = &self.snap.state {
             self.snap.last_error = Some(e.clone());
         }

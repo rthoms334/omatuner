@@ -155,6 +155,7 @@ fn movie(key: &str, name: &str, stream: StreamLocator) -> ImportMovie {
         provider_order: 0,
         added_at: None,
         groups: vec![group_key(ItemKind::Movie, "Films")],
+        tmdb: None,
     }
 }
 
@@ -204,6 +205,7 @@ fn import_series(s: &Store, source: SourceId, name: &str, episodes: Vec<ImportEp
         provider_order: 0,
         added_at: None,
         groups: vec![group_key(ItemKind::Series, "Shows")],
+        tmdb: None,
     };
     let id = w(s, move |c| {
         let imp = import::begin_catalogue(c, source, T20)?;

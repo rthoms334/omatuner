@@ -9,6 +9,13 @@
 //! at the start of the meta line (Settings ▸ Interface ▸ Playlist on cards, DESIGN §13.0).
 //! The item that is playing carries the accent 󰐊 now-playing marker left of its title
 //! (DESIGN §13.0, §13.1 "Now playing marker").
+//! A **stack card** (copies of one title in "All playlists", DESIGN §29.14) has two offset card
+//! edges behind its poster and a copy-count badge in the poster's bottom-right corner (a click
+//! on it fans the stack out in the grid, or folds it); its meta line names the playlists
+//! ("TV + TV 2 · 1999", "TV +1" when narrow). A copy shown fanned out names its language and
+//! version instead of year and rating ("TV 2 · EN · 4K"). Inside one playlist a title that is
+//! also elsewhere gets one edge and "+1" (tooltip "Also in TV"). Locked copies and all-locked
+//! stacks are drawn disabled (dimmed, with the lock) while the session is locked.
 //!
 //! Keyboard: [`GridState::handle`] turns `PosterGrid` actions into cursor moves (↑/↓ by a row,
 //! ←/→ by one card, ← on the first column = back to the categories pane) and filter edits —
@@ -43,6 +50,9 @@ const SOURCE_NAME_SHARE: f32 = 0.6;
 
 #[derive(Default)]
 pub struct GridState {
+    /// A click on a stack card's copy-count badge in the last frame (the card's index): the
+    /// screen fans the stack out or folds it ([`GridState::take_badge_click`]).
+    badge_clicked: Option<usize>,
     pub cursor: usize,
     pub len: usize,
     pub columns: usize,
@@ -113,6 +123,11 @@ impl GridState {
         }
     }
 
+    /// The card whose copy-count badge was clicked in the last frame (once).
+    pub(crate) fn take_badge_click(&mut self) -> Option<usize> {
+        self.badge_clicked.take()
+    }
+
     /// `PosterGrid` or `PosterGridFiltering` depending on the filter.
     pub(crate) fn key_context(&self) -> KeyContext {
         if self.filter.is_active() { KeyContext::PosterGridFiltering } else { KeyContext::PosterGrid }
@@ -161,6 +176,30 @@ impl GridState {
     }
 }
 
+/// A stack card's stack (DESIGN §29.14).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct StackDecor<'a> {
+    /// Copies in the stack (the badge).
+    pub count: usize,
+    /// The stack is fanned out in the grid (the badge folds it).
+    pub open: bool,
+    /// A click on the badge fans the stack out (grids; Home's rails only show the count).
+    pub fan: bool,
+    /// The playlist named after the card's own on the meta line ("TV + TV 2"), when cards
+    /// name playlists.
+    pub second: Option<&'a SourceMeta>,
+    /// Playlists of the stack besides the card's own ("TV +2").
+    pub others: usize,
+}
+
+/// Inside one playlist: the other playlists a title is also in ("+1").
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct Elsewhere<'a> {
+    pub count: usize,
+    /// The first of them, named in the tooltip (`None` while cards don't name playlists).
+    pub first: Option<&'a SourceMeta>,
+}
+
 /// Per-card decorations a screen knows about (the frozen `poster_card` has none).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct TileDecor<'a> {
@@ -175,6 +214,40 @@ pub(crate) struct TileDecor<'a> {
     pub selected: bool,
     /// The playlist the item comes from, when cards show it (`UiCtx::source_of`).
     pub source: Option<&'a SourceMeta>,
+    /// The card stands for a stack of copies.
+    pub stack: Option<StackDecor<'a>>,
+    /// A copy shown in a fanned-out stack: its language and version ("EN · 4K"), on the meta
+    /// line instead of year and rating.
+    pub copy: Option<&'a str>,
+    /// Inside one playlist: the title is also in other playlists.
+    pub elsewhere: Option<Elsewhere<'a>>,
+    /// Drawn disabled: a locked copy, or a stack whose every copy is locked, while the session
+    /// is locked.
+    pub dimmed: bool,
+}
+
+/// The accessible label of a card: "Dune · TV + TV 2 · 3 copies", "Dune · TV 2 · EN · 4K".
+pub(crate) fn tile_label(item: &VodSummary, decor: &TileDecor<'_>) -> String {
+    let mut label = label_with_source(&item.name, decor.source);
+    if let Some(s) = decor.stack {
+        if decor.source.is_some()
+            && !s.open
+            && let Some(second) = s.second
+        {
+            label = if s.others > 1 { format!("{label} +{}", s.others) } else { format!("{label} + {}", second.name) };
+        }
+        label = format!("{label} · {} copies", s.count);
+    }
+    if let Some(c) = decor.copy {
+        label = format!("{label} · {c}");
+    }
+    if let Some(e) = decor.elsewhere {
+        label = format!("{label} · +{}", e.count);
+    }
+    if decor.dimmed {
+        label = format!("{label} · locked");
+    }
+    label
 }
 
 /// Card height for a card `width` (poster 2:3 + two title lines + meta line).
@@ -247,16 +320,52 @@ pub(crate) fn poster_tile(
     cursor: bool,
     decor: TileDecor<'_>,
 ) -> egui::Response {
+    poster_tile_ex(ui, theme, images, item, width, cursor, decor).0
+}
+
+/// [`poster_tile`], and whether its stack's copy-count badge was clicked.
+pub(crate) fn poster_tile_ex(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    images: &mut ImageCache,
+    item: &VodSummary,
+    width: f32,
+    cursor: bool,
+    decor: TileDecor<'_>,
+) -> (egui::Response, bool) {
     let t = &theme.tokens;
     let width = width.max(40.0);
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, card_height(theme, width)), egui::Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label_with_source(&item.name, decor.source)));
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tile_label(item, &decor)));
     if !ui.is_rect_visible(rect) {
-        return resp;
+        return (resp, false);
     }
-    let poster = Rect::from_min_size(rect.min, egui::vec2(width, (width * 1.5).round()));
+    let full = Rect::from_min_size(rect.min, egui::vec2(width, (width * 1.5).round()));
+    // a stack: two card edges behind the poster, offset down and right (one for "+1"); the
+    // card keeps its footprint, so titles stay in line
+    let edges: u8 = if decor.stack.is_some() {
+        2
+    } else if decor.elsewhere.is_some() {
+        1
+    } else {
+        0
+    };
+    let off = (3.0 * theme.rem()).round().max(2.0);
+    let poster = Rect::from_min_max(full.min, full.max - egui::Vec2::splat(off * f32::from(edges)));
+    // drawn disabled: a locked copy or an all-locked stack (`decor.dimmed`), and any locked
+    // title, until the PIN opens the session (DESIGN §20.3) — its card edges too
+    let dim = decor.dimmed || (item.locked && paint::session_locked(ui.ctx()));
+    for k in (1..=edges).rev() {
+        let edge = poster.translate(egui::Vec2::splat(off * f32::from(k)));
+        let (fill, stroke) = if dim { (with_alpha(t.raised_bg, 0.5), with_alpha(t.border_hover, 0.5)) } else { (t.raised_bg, t.border_hover) };
+        ui.painter().rect_filled(edge, t.rounding, fill);
+        ui.painter().rect_stroke(edge, t.rounding, egui::Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+    }
     paint_poster_image(ui, theme, images, item.poster.as_deref(), &item.name, poster, ImageKind::Poster);
+    if dim {
+        ui.painter().rect_filled(poster, t.rounding, with_alpha(t.bg, 0.6));
+    }
     let chip = theme.font(TypeToken::Icon) + 2.0 * theme.space(SpaceToken::Xs);
     if let Some(src) = decor.source {
         // top-left: the lock / watched chips grow from the top-right corner
@@ -275,11 +384,6 @@ pub(crate) fn poster_tile(
         p.rect_filled(r, t.rounding, with_alpha(t.bg, 0.85));
         p.text(r.center(), Align2::CENTER_CENTER, glyph, paint::font(theme, TypeToken::Icon), color);
     };
-    // a locked title stays in the grid, dimmed, until the PIN opens the session (DESIGN §20.3)
-    let locked_dim = item.locked && paint::session_locked(ui.ctx());
-    if locked_dim {
-        p.rect_filled(poster, t.rounding, with_alpha(t.bg, 0.55));
-    }
     let mut slot = 0.0;
     if item.locked {
         corner(p, glyphs::LOCK, t.fg, slot);
@@ -288,11 +392,36 @@ pub(crate) fn poster_tile(
     if decor.watched {
         corner(p, glyphs::CHECK, t.accent, slot);
     }
+    let bar_h = (3.0 * theme.rem()).round().max(2.0);
     if let Some(f) = decor.progress.filter(|f| *f > 0.0 && *f < 1.0 && !decor.watched) {
-        let h = (3.0 * theme.rem()).round().max(2.0);
-        let bar = Rect::from_min_max(egui::pos2(poster.left(), poster.bottom() - h), poster.right_bottom());
+        let bar = Rect::from_min_max(egui::pos2(poster.left(), poster.bottom() - bar_h), poster.right_bottom());
         super::progress::paint_progress(p, bar, theme, f, true);
     }
+    // the copy count, bottom-right above the progress bar; a click fans the stack out / folds it
+    let mut badge_clicked = false;
+    if let Some(st) = decor.stack {
+        let ink = if st.open { t.bg } else { t.fg };
+        let g = paint::galley(p, st.count.to_string(), paint::font(theme, TypeToken::BodySmall), ink, f32::INFINITY);
+        let size = egui::vec2((g.size().x + 2.0 * theme.space(SpaceToken::Sm)).max(chip), chip);
+        let at = poster.right_bottom() - size - egui::vec2(theme.space(SpaceToken::Xs), bar_h + theme.space(SpaceToken::Xs));
+        let r = Rect::from_min_size(at, size);
+        p.rect_filled(r, t.rounding, if st.open { t.accent } else { with_alpha(t.bg, 0.85) });
+        p.rect_stroke(r, t.rounding, egui::Stroke::new(1.0, if st.open { t.accent } else { t.border_field }), egui::StrokeKind::Inside);
+        p.galley(r.center() - g.size() / 2.0, g, ink);
+        if st.fan {
+            let what = if st.open { "fold them" } else { "show each" };
+            let b = ui.interact(r, resp.id.with("stack-badge"), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+            b.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("{} copies — {what}", st.count)));
+            let key = crate::keymap::tables(crate::keymap::KeyContext::PosterGrid)
+                .iter()
+                .find_map(|t| t.iter().find(|b| b.action == crate::keymap::Action::FanOut))
+                .map(|b| format!(" ({})", b.chord.label()))
+                .unwrap_or_default();
+            let tip = egui::RichText::new(format!("{} copies — click to {what}{key}", st.count)).size(theme.font(TypeToken::BodySmall));
+            badge_clicked = b.on_hover_text(tip).clicked();
+        }
+    }
+    let p = ui.painter();
     if cursor || decor.selected || resp.hovered() {
         // inside the poster: a scroll area clips nothing of the first row / column
         let stroke = if cursor { egui::Stroke::new(2.0, t.accent) } else { egui::Stroke::new(1.0, t.border_hover) };
@@ -300,11 +429,11 @@ pub(crate) fn poster_tile(
     }
 
     // title (≤ 2 lines, now-playing marker first), then the meta line
-    let mut y = poster.bottom() + theme.space(SpaceToken::Md);
+    let mut y = full.bottom() + theme.space(SpaceToken::Md);
     let mut left = rect.left();
     let title_color = if cursor {
         t.list_cursor_text
-    } else if locked_dim {
+    } else if dim {
         t.text_disabled
     } else {
         t.fg
@@ -322,7 +451,14 @@ pub(crate) fn poster_tile(
     let h = g.size().y;
     p.galley(egui::pos2(left, y), g, title_color);
     y += h + theme.space(SpaceToken::Xxs);
-    let mut meta = meta_line(item);
+    // a fanned-out copy says which version it is; "+1" inside one playlist
+    let mut meta = match decor.copy {
+        Some(c) => c.to_owned(),
+        None => meta_line(item),
+    };
+    if let Some(e) = decor.elsewhere {
+        meta = if meta.is_empty() { format!("+{}", e.count) } else { format!("{meta} · +{}", e.count) };
+    }
     let font = paint::font(theme, TypeToken::BodySmall);
     let mut left = rect.left();
     if let Some(src) = decor.source {
@@ -330,14 +466,43 @@ pub(crate) fn poster_tile(
         let max_w = if meta.is_empty() { rect.width() } else { (rect.width() * SOURCE_NAME_SHARE).round() };
         let color = legible(theme, theme.source_color(src.color));
         left = paint::text(p, egui::pos2(left, y), Align2::LEFT_TOP, src.name.as_str(), font.clone(), color, max_w).right();
+        // a stack: "TV + TV 2" (each in its colour) when it fits, else "TV +1"; fanned out,
+        // the head card names its own copy instead (the badge still marks the stack)
+        if let Some(st) = decor.stack.filter(|s| s.others > 0 && !s.open) {
+            let room = (rect.left() + max_w - left).max(0.0);
+            let second = st
+                .second
+                .filter(|b| st.others == 1 && paint::galley(p, format!(" + {}", b.name), font.clone(), t.fg, f32::INFINITY).size().x <= room);
+            left = match second {
+                Some(b) => {
+                    let plus = paint::text(p, egui::pos2(left, y), Align2::LEFT_TOP, " + ", font.clone(), t.text_secondary, f32::INFINITY).right();
+                    let color = legible(theme, theme.source_color(b.color));
+                    paint::text(p, egui::pos2(plus, y), Align2::LEFT_TOP, b.name.as_str(), font.clone(), color, room).right()
+                }
+                None => {
+                    paint::text(p, egui::pos2(left, y), Align2::LEFT_TOP, format!(" +{}", st.others), font.clone(), t.text_secondary, f32::INFINITY)
+                        .right()
+                }
+            };
+        }
         if !meta.is_empty() {
             meta = format!(" · {meta}");
         }
     }
     if !meta.is_empty() {
-        paint::text(p, egui::pos2(left, y), Align2::LEFT_TOP, meta, font, t.text_secondary, (rect.right() - left).max(0.0));
+        let r = paint::text(p, egui::pos2(left, y), Align2::LEFT_TOP, meta, font, t.text_secondary, (rect.right() - left).max(0.0));
+        if let Some(e) = decor.elsewhere {
+            let also = match (e.first, e.count) {
+                (Some(s), 1) => format!("Also in {}", s.name),
+                (Some(s), n) => format!("Also in {} and {} more", s.name, n - 1),
+                (None, 1) => "Also in another playlist".to_owned(),
+                (None, n) => format!("Also in {n} other playlists"),
+            };
+            ui.interact(r, resp.id.with("elsewhere"), egui::Sense::hover())
+                .on_hover_text(egui::RichText::new(also).size(theme.font(TypeToken::BodySmall)));
+        }
     }
-    resp
+    (resp, badge_clicked)
 }
 
 pub fn poster_card(
@@ -413,8 +578,11 @@ pub(crate) fn poster_grid_with<'s>(
                             .new_child(egui::UiBuilder::new().id_salt(("poster", i)).max_rect(cell).layout(egui::Layout::top_down(egui::Align::Min)));
                         let current = i == cursor;
                         let d = TileDecor { selected: current && !focused, ..decor(idx, item) };
-                        let resp = poster_tile(&mut child, theme, images, item, card_w, current && focused, d);
-                        if resp.double_clicked() {
+                        let (resp, badge) = poster_tile_ex(&mut child, theme, images, item, card_w, current && focused, d);
+                        if badge {
+                            state.cursor = i;
+                            state.badge_clicked = Some(i);
+                        } else if resp.double_clicked() {
                             state.cursor = i;
                             outcome = ListOutcome::Activated(i);
                         } else if resp.secondary_clicked() {

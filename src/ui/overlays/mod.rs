@@ -59,6 +59,11 @@ pub enum RenameTarget {
     Item {
         item: ItemRef,
     },
+    /// Every copy of a combined title (DESIGN §29.15): copies with a name of their own keep it
+    /// unless the user confirms; the toast offers Undo.
+    Copies {
+        items: Vec<ItemRef>,
+    },
     Group {
         source: SourceId,
         kind: ItemKind,
@@ -89,6 +94,9 @@ pub struct ResumeSpec {
     pub title: String,
     pub position_s: f64,
     pub duration_s: Option<f64>,
+    /// A combined title (DESIGN §29.15): `media` is the copy that plays, this its fallback and
+    /// the position to start at when the latest progress is another copy's.
+    pub copy: Option<Box<crate::player::CopyPlay>>,
 }
 
 /// What an overlay reports back to the screen that opened it.
