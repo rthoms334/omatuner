@@ -8,9 +8,11 @@
 //!   `Text` of the bare key; when the Key resolves, that Text is dropped too (Alt+1 must not
 //!   also type "1" into a filter). Also maps the mouse back button to `Back`.
 //! * `logic()`: drain `AppEvent`s, refresh the player snapshot, render mpv into the FBO (GL
-//!   current), idle inhibitor. NOTE: eframe calls `logic` only when the compositor sends frame
-//!   callbacks — on Hyprland NOT for windows on hidden workspaces unless the window has the
-//!   `render_unfocused` rule (`packaging/hypr/tuner.lua`). Nothing that must keep running
+//!   current), idle inhibitor. NOTE: frames are paced by compositor frame callbacks (vsync
+//!   off; `ui` calls `pre_present_notify`, DESIGN §11.1), so `logic` runs only when the
+//!   compositor sends them — on Hyprland NOT for windows on hidden workspaces unless the window
+//!   has the `render_unfocused` rule (`packaging/hypr/tuner.lua`); meanwhile the UI thread
+//!   idles in its event loop and keeps answering the compositor's pings. Nothing that must keep running
 //!   while hidden lives here (mpv events, reconnects, MPRIS, reminders run on other threads;
 //!   the player suspends video decoding when no frames are rendered).
 //! * `ui()`: dispatch the resolved actions (overlay → screen → globals; `Ignored` overlay
@@ -972,7 +974,17 @@ impl eframe::App for TunerApp {
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        // Frame pacing (vsync is off, see `main`): ask winit for a frame callback with the
+        // commit eframe's swap makes after this pass. Until the compositor sends it, winit
+        // holds back the next `RedrawRequested`, so repaints run at most once per compositor
+        // frame — and not at all while Hyprland hides the window, with the UI thread idle in
+        // its event loop (answering pings) instead of blocked in eglSwapBuffers. eframe runs
+        // `ui` only for frames it paints and presents (`logic` alone while invisible), so a
+        // requested callback always has a commit to ride on.
+        if let Some(w) = frame.winit_window() {
+            w.pre_present_notify();
+        }
         let egui_ctx = ui.ctx().clone();
         let width = egui_ctx.content_rect().width();
         self.layout = LayoutClass::from_width(width, self.theme.rem());

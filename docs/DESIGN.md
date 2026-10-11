@@ -117,7 +117,7 @@ rate, background refresh while closed (`tuner --refresh` flag reserved for a sys
 | Keymap collisions | Per-context tables (§15): `f` = fullscreen in player, favourite = Ctrl+F everywhere; `←` = last channel (live) / seek (VOD); `h` = history (live) / left (guide); digits = channel entry in the live player and the guide. |
 | Adaptive frame rate claim | No VRR here → judder of 25/50 fps on 60 Hz is a known v1 limitation; measured in WP-07; `mpv_options` lets users try `video-sync=display-resample` (§11.8). |
 | Spike "verified" too narrow | WP-07/WP-13 acceptance adds hidden-workspace, fullscreen, 1-hour soak, audio, frame-pacing measurements (§25). |
-| Event draining in `ui()` | Moved to dedicated threads (D2). **Correction (review round 2):** eframe's `logic` does NOT run while the window is on a hidden Hyprland workspace — winit-wayland reports no visibility and `RedrawRequested` needs a compositor frame callback, which Hyprland withholds from hidden workspaces. Mitigations: the `render_unfocused` window rule (frame callbacks at `misc:render_unfocused_fps`, default 15) and the controller's video watchdog (`vid=no` after 2 s without a rendered frame, resumed when the UI renders again) — §11.1. |
+| Event draining in `ui()` | Moved to dedicated threads (D2). **Correction (review round 2):** eframe's `logic` does NOT run while the window is on a hidden Hyprland workspace — winit-wayland reports no visibility and `RedrawRequested` needs a compositor frame callback, which Hyprland withholds from hidden workspaces. Mitigations: the `render_unfocused` window rule (frame callbacks at `misc:render_unfocused_fps`, default 15) and the controller's video watchdog (`vid=no` after 2 s without a rendered frame, resumed when the UI renders again) — §11.1. **Correction (hidden-workspace ANR):** with eframe's default vsync the UI thread did not merely idle there — it **blocked** in Mesa's `eglSwapBuffers` (swap interval 1 waits for the previous frame's callback), stopped answering `xdg_wm_base` pings, and after `misc:anr_missed_pings` Hyprland showed "application not responding" while mpv played on. Now vsync is off and frames are paced by winit frame callbacks (`pre_present_notify` in `App::ui`): hidden, the UI thread sits in its event loop and answers pings, with or without the window rule (§11.1). |
 | `report_swap` omitted | Kept omitted (measured win); consequence documented in §11.8. |
 | XMLTV "0.61 s" is parse-only | Import budget is end-to-end (< 8 s for 415k programmes) with batched writes + progress (§9.3); bench `benches/import.rs`, gate run by WP-13. |
 | FTS schema broken (contentless + WITHOUT ROWID) | `programme` is an AUTOINCREMENT rowid table with `UNIQUE(epg_channel_id, gen, start)`; `programme_fts` is **contentless FTS5 with `contentless_delete=1`**, written in the same transaction as each programme batch and deleted by rowid before programmes are deleted; no cascades from `epg_channel` to `programme` (§6.3). Verified by `store::migrations` tests. |
@@ -1051,12 +1051,31 @@ CLI `--play`, MPRIS and Compact without a mini-player would otherwise stall the 
 load the FBO is cleared to black. Teardown order: render ctx → FBO → mpv (explicit
 `MpvGl::destroy` with GL current; a plain drop leaks, see §5.1).
 
-**Hidden windows (corrected in review round 2).** eframe calls `logic` only after a compositor
-frame callback (winit-wayland reports no visibility, so `update_logic_only` never runs).
-Hyprland sends no frame callbacks to windows on hidden workspaces unless the window has the
-`render_unfocused` rule — shipped in `packaging/hypr/tuner.lua` (callbacks at
-`misc:render_unfocused_fps`, default 15). Without it nothing renders, mpv's VO waits ~200 ms
-per frame and drops it, and decoding burns CPU for nothing. Safety net: every render stamps the
+**Frame pacing and hidden windows (corrected twice).** The window's frames are paced by
+Wayland frame callbacks, never by a blocking swap:
+* `main` sets `glow_options.vsync = false` (swap interval 0). With eframe's default (1), Mesa's
+  `eglSwapBuffers` waits for the frame callback of the *previous* frame
+  (`dri2_wl_swap_buffers_with_damage` dispatches its queue until the throttle callback fires).
+  Hyprland withholds frame callbacks from windows on hidden workspaces, so the first swap after
+  the workspace was left blocked the UI thread indefinitely: winit no longer dispatched the
+  Wayland socket, `xdg_wm_base` pings went unanswered, and after `misc:anr_missed_pings`
+  Hyprland put up its "application not responding" dialog — while mpv kept playing on its
+  own threads.
+* `App::ui` calls `winit::Window::pre_present_notify()` (eframe 0.36 never does —
+  `native/glow_integration.rs` only swaps). winit-wayland then requests a `wl_surface.frame`
+  with the commit of eframe's swap and withholds the next `RedrawRequested` until that callback
+  arrives (`platform_impl/linux/wayland/event_loop/mod.rs`: `FrameCallbackState::Requested`
+  → no redraw). Repaint requests (mpv's update callback, timers) therefore coalesce to one
+  frame per compositor frame — the same cadence vsync gave, without blocking, and no spin:
+  with nothing to repaint the loop sleeps in `epoll`. eframe runs `ui` only for frames it
+  presents (an invisible root viewport gets `logic` alone), so a requested callback always
+  rides on a commit.
+* Hidden: no frame callback → no `RedrawRequested` → neither `logic` nor `ui` runs, and the UI
+  thread waits in `epoll` on the Wayland fd and answers pings. Hyprland sends no frame
+  callbacks there unless the window has the `render_unfocused` rule — shipped in
+  `packaging/hypr/tuner.lua` (callbacks at `misc:render_unfocused_fps`, default 15). Without
+  the rule nothing renders, mpv's VO waits ~200 ms per frame and drops it, and decoding burns
+  CPU for nothing. Safety net: every render stamps the
 player's `RenderClock`; the controller tick sets `vid=no` after 2 s without a rendered frame
 while Playing (audio continues, `snapshot.video_suspended = true`), and the app sends
 `PlayerCommand::ResumeVideo` (`vid=auto`) as soon as `logic` runs again. Nothing else that must
@@ -1167,6 +1186,9 @@ force-media-title=%n%…,user-agent=…,referrer=…,http-header-fields=…,star
 quoted). The title never comes from the URL (credentials).
 
 ### 11.8 Frame pacing (known limitation)
+UI frames follow the compositor's frame callbacks (§11.1: vsync off, `pre_present_notify`), so
+mpv's update callback is served once per display refresh at most, aligned to the compositor's
+repaint like the old blocking vsync swap but without blocking the UI thread.
 Without a post-swap hook `report_swap` is omitted (it halved throughput in the spike) and the
 panel is fixed 60 Hz, so 25/50 fps content shows cadence judder; `video-sync=audio` (default)
 keeps A/V sync. WP-07 records drops/s and `vo-delayed-frame-count` for 25/30/50/60 fps samples;
@@ -2536,7 +2558,7 @@ keys, idle, other-workspace 60 s, 1-hour soak with RSS ± 10 %, real providers);
 
 | Risk | Mitigation / owner |
 |---|---|
-| Hidden-workspace playback (no frame callbacks → no `logic`) | `render_unfocused` window rule shipped; controller video watchdog (`vid=no` after 2 s, resumed on the next render); everything correctness-critical off the UI thread. WP-07 + WP-13 measure 60 s on another workspace with and without the rule (audio, `frame-drop-count`, CPU). |
+| Hidden-workspace playback (no frame callbacks → no `logic`) | `render_unfocused` window rule shipped; controller video watchdog (`vid=no` after 2 s, resumed on the next render); everything correctness-critical off the UI thread; vsync off + `pre_present_notify` pacing so the UI thread never blocks in a swap and keeps answering pings (no ANR dialog, §11.1). WP-07 + WP-13 measure 60 s on another workspace with and without the rule (audio, `frame-drop-count`, CPU). |
 | Render-thread rule (UI calling mpv) | `Player::mpv()` removed; UI gets only `render_core()` for context creation; controller-only `Arc<Mpv>`; D2. |
 | Text shaping (RTL, Indic) in egui | Fallback fonts + reshaper/bidi for labels (WP-01); accept Indic limitation; revisit if egui adds shaping. |
 | Provider connection limits | One stream, stop-before-start waiting for END_FILE, zap delay, budget fed from stored account info, preview autoplay and guide preview off by default (§11.5). |

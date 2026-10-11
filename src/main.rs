@@ -114,6 +114,14 @@ fn main() -> anyhow::Result<()> {
 
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
+        // Swap interval 0: with vsync, Mesa's eglSwapBuffers waits for the compositor's frame
+        // callback of the previous frame, which Hyprland withholds while the window is on a
+        // hidden workspace — the UI thread then hangs in the swap, stops answering the
+        // compositor's pings and Hyprland shows "application not responding". Frames are paced
+        // by frame callbacks requested through winit instead (`TunerApp::ui` calls
+        // `pre_present_notify`), which keep the thread in its event loop while hidden
+        // (DESIGN §11.1).
+        glow_options: eframe::egui_glow::GlowConfiguration { vsync: false, ..Default::default() },
         viewport: egui::ViewportBuilder::default()
             .with_title(tuner::APP_NAME)
             .with_app_id(tuner::APP_ID)

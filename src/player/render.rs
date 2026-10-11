@@ -15,8 +15,8 @@
 //!   current); a plain `Drop` (panic/unwind path) detaches the callback and LEAKS the context,
 //!   and the liveness flag makes `Player` leak mpv too — never UB.
 //! * Rendering happens in `App::logic`, which runs ONLY when the compositor sends frame
-//!   callbacks (on Hyprland: not on hidden workspaces unless the window has the
-//!   `render_unfocused` rule; see DESIGN §11.1). Each render stamps the player's
+//!   callbacks (vsync is off and `App::ui` requests them; on Hyprland: not on hidden
+//!   workspaces unless the window has the `render_unfocused` rule; see DESIGN §11.1). Each render stamps the player's
 //!   `RenderClock`, which the controller uses to suspend video decoding when nothing renders.
 //! * Until a screen places the video, frames are rendered into a 640×360 sink so the VO never
 //!   waits (CLI `--play`, MPRIS, Compact without mini-player). `mpv_render_context_update`

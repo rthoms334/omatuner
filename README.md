@@ -720,7 +720,12 @@ play-pause` and Omarchy's media keys and bar widget work, also while the window 
 - **"No guide data" everywhere:** see [guide coverage](#tv-guide-and-guide-coverage). Check
   Settings ▸ EPG for "Matches N of M channels".
 - **Playback stops or stutters on another workspace:** install the Hyprland snippet
-  (`render_unfocused`).
+  (`render_unfocused`). Without it the audio keeps playing and video decoding pauses until you
+  come back.
+- **"Application not responding" for Tuner after switching workspaces:** fixed in this version.
+  Older builds blocked waiting for the hidden window's next frame and missed Hyprland's pings,
+  although playback continued. Tuner now never waits for a frame, with or without the
+  snippet.
 - **"The provider refused the stream":** the account has expired, or it is already using all
   its connections. Tuner plays one stream at a time and waits for the old one to close before
   starting the next. The account row in Settings ▸ Playlists shows the connection count.
