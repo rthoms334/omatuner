@@ -1185,6 +1185,11 @@ impl SettingsScreen {
         v.push(l(Local::SrcSmartNames, "Smart names"));
         // several playlists (DESIGN §29): off keeps e.g. free channels out of Live TV's All
         v.push(l(Local::SrcInAll, "Show in All playlists"));
+        v.push(Row::Note(
+            "Off: this playlist only shows on its own tab in Movies, Series, Live TV and the guide. Your favourites and history still list it."
+                .into(),
+            false,
+        ));
         // the stored rule (the picker writes it; the editor's Save keeps it)
         let rule = self.sources.iter().find(|s| s.id == e.original.id).and_then(|s| s.settings.category_filter.as_ref());
         v.push(Row::Item {

@@ -47,15 +47,28 @@ fn allocate_row(ui: &mut egui::Ui, theme: &Theme, natural_h: f32, state: RowStat
     (rect, resp)
 }
 
-/// A row's playlist glyph, right-aligned at `right_center` (the source colour, fg with an
-/// underline where it wouldn't read), with the playlist's name as its tooltip.
-fn source_mark(ui: &egui::Ui, theme: &Theme, right_center: egui::Pos2, src: &SourceMeta, row: egui::Id) -> Rect {
+/// A row's playlist mark, right-aligned at `right_center` (DESIGN §29 "marks always include
+/// the name"): the playlist's name in its colour (`legible`), elided to `name_w`; with
+/// `name_w = None` (compact rows) its glyph (the source colour, fg with an underline where it
+/// wouldn't read). The name is also the tooltip.
+fn source_mark(ui: &egui::Ui, theme: &Theme, right_center: egui::Pos2, src: &SourceMeta, row: egui::Id, name_w: Option<f32>) -> Rect {
     let t = &theme.tokens;
-    let font = paint::font(theme, TypeToken::Icon);
-    let r = super::badge::paint_source_mark(ui.painter(), theme, right_center, Align2::RIGHT_CENTER, src, font, t.bg, t.fg);
+    let r = match name_w {
+        Some(w) => {
+            let color = super::badge::legible(theme, theme.source_color(src.color));
+            paint::text(ui.painter(), right_center, Align2::RIGHT_CENTER, src.name.as_str(), paint::font(theme, TypeToken::BodySmall), color, w)
+        }
+        None => {
+            let font = paint::font(theme, TypeToken::Icon);
+            super::badge::paint_source_mark(ui.painter(), theme, right_center, Align2::RIGHT_CENTER, src, font, t.bg, t.fg)
+        }
+    };
     ui.interact(r, row.with("source"), egui::Sense::hover()).on_hover_text(egui::RichText::new(&src.name).size(theme.font(TypeToken::BodySmall)));
     r
 }
+
+/// The share of a row's width a playlist's name may take (channel, reminder rows).
+const ROW_SOURCE_SHARE: f32 = 0.2;
 
 /// Thin progress bar height (programme / watch progress inside rows).
 fn bar_h(theme: &Theme) -> f32 {
@@ -75,7 +88,7 @@ pub fn menu_row(
     menu_row_with(ui, theme, icon, label, detail, chevron, None, state)
 }
 
-/// [`menu_row`] of an item from a playlist: the source's glyph at the right edge when `source`
+/// [`menu_row`] of an item from a playlist: the playlist's name at the right edge when `source`
 /// is shown (Live ▸ Reminders mixes playlists, DESIGN §13.0).
 pub fn menu_row_source(
     ui: &mut egui::Ui,
@@ -130,7 +143,8 @@ fn menu_row_with(
         right = r.left() - theme.space(SpaceToken::Lg);
     }
     if let Some(src) = source {
-        right = source_mark(ui, theme, egui::pos2(right, rect.center().y), src, resp.id).left() - theme.space(SpaceToken::Lg);
+        let w = (rect.width() * ROW_SOURCE_SHARE).round();
+        right = source_mark(ui, theme, egui::pos2(right, rect.center().y), src, resp.id, Some(w)).left() - theme.space(SpaceToken::Lg);
     }
     let p = ui.painter();
     let max_w = (right - left).max(0.0);
@@ -156,7 +170,8 @@ pub struct ChannelRowOpts<'a> {
     pub density: Density,
     pub show_number: bool,
     pub show_logo: bool,
-    /// The playlist's glyph (`UiCtx::source_of`: several playlists, DESIGN §13.0).
+    /// The playlist, named at the right (its glyph in Compact density; `Scope::marks`: several
+    /// playlists, DESIGN §13.0 / §29).
     pub source: Option<&'a SourceMeta>,
     pub favourite: bool,
     /// Dim + warning glyph (recent failures).
@@ -242,7 +257,7 @@ pub fn channel_row(
     let detail = if comfortable { channel_detail(ch, now_next, rect.width(), theme.rem(), &opts) } else { None };
     let line_y = if detail.is_some() { rect.top() + rect.height() * 0.36 } else { rect.center().y };
 
-    // right side, from the edge inwards: progress bar, favourite, lock, source badge
+    // right side, from the edge inwards: progress bar, favourite, lock, playlist
     if let Some(prog) = now_next.and_then(|nn| nn.now.as_ref()).filter(|p| p.contains(now)) {
         let w = (48.0 * theme.rem()).round();
         let bar = Rect::from_center_size(egui::pos2(right - w / 2.0, line_y), egui::vec2(w, bar_h(theme)));
@@ -260,7 +275,8 @@ pub fn channel_row(
         glyph(glyphs::LOCK, t.text_secondary);
     }
     if let Some(src) = opts.source {
-        right = source_mark(ui, theme, egui::pos2(right, line_y), src, resp.id).left() - theme.space(SpaceToken::Md);
+        let w = (opts.density != Density::Compact).then(|| (rect.width() * ROW_SOURCE_SHARE).round());
+        right = source_mark(ui, theme, egui::pos2(right, line_y), src, resp.id, w).left() - theme.space(SpaceToken::Md);
     }
 
     if opts.show_number {

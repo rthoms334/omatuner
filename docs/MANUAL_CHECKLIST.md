@@ -177,7 +177,7 @@ in `~/.config/omarchy/shell.toml`; Tuner applies it live).
       line in B's colour runs under the bar; cards have no playlist marks; the Omarchy bar
       shows "Tuner — Movies · B".
     - The right-click menu offers "Edit playlist…" (opens B's editor in Settings ▸ Playlists)
-      and "Move up / Move down" (the tabs reorder).
+      and "Move up / Move down" (the tabs reorder, also past a playlist that has no tab here).
   - **Do:** go to Series, Live TV and the guide; press `Alt+P` on each and pick with a digit.
   - **Expect:** Series still shows All (each screen keeps its own); the picker lists All + the
     playlists with counts, `0`–`9` pick at once, typing filters. Live TV narrows groups, All
@@ -199,7 +199,16 @@ in `~/.config/omarchy/shell.toml`; Tuner applies it live).
   - **Do:** add free channels (Settings ▸ Playlists ▸ Add free channels…), edit that playlist,
     turn off "Show in All playlists", Save.
   - **Expect:** "Saved …" without a refresh; Live TV ▸ All playlists no longer lists its groups
-    or channels, but its own tab still shows them.
+    or channels, but its own tab still shows them, and a channel of it in your favourites or
+    History still shows there in All.
+- [ ] **Across playlists in All:**
+  - **Do:** on Live TV ▸ All playlists, open a provider group; then on Movies type a playlist's
+    name in the category filter, open a category and press `Ctrl+PgDn`.
+  - **Expect:** channel rows name their playlist at the right in its colour; the header reads
+    "All playlists › Sports · B"; the filter finds that playlist's categories; after
+    `Ctrl+PgDn` the filter is gone and the grid shows the new playlist's All movies.
+  - **Do:** with Live TV set to B, search a channel of A and choose "Open in guide".
+  - **Expect:** a toast "Showing all playlists" and the guide focused on that channel.
 - [ ] **Font change:**
   - **Do:** change the monospace font in `~/.config/fontconfig/fonts.conf` (or with Omarchy's
     font menu), then switch back.

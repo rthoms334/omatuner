@@ -957,7 +957,13 @@ impl PlayerScreen {
         }
         let pointer_moved = ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO);
         let mut activate = None;
-        let sources = ctx.source_marks(crate::model::ItemKind::Channel);
+        // the panel lists Live TV's channels: marks as Live TV shows them (none inside one playlist)
+        let sources = crate::ui::data::SourceMarks::for_view(
+            ctx.config.interface.playlist_on_cards,
+            &ctx.lib.sources,
+            crate::model::ItemKind::Channel,
+            crate::ui::scope::Scope::current(ctx, crate::ui::scope::ScopeKind::Live).is_all(),
+        );
         for (k, ri) in (first..panel.rows.len()).take(visible).enumerate() {
             let id = panel.items[panel.rows[ri] as usize];
             let Some(ch) = ctx.lib.live.get(id).cloned() else { continue };
@@ -996,19 +1002,11 @@ impl PlayerScreen {
                 let g = osd_text(&p, egui::pos2(x, line_y), Align2::LEFT_CENTER, glyphs::PLAY, small.clone(), t.osd_accent, f32::INFINITY);
                 x = g.right() + pad / 3.0;
             }
-            // the playlist's glyph at the right edge (several playlists, DESIGN §13.0)
+            // the playlist's name at the right edge, in its colour (several playlists, DESIGN §29)
             let mut right = r.right() - pad / 2.0;
             if let Some(src) = source {
-                let m = badge::paint_source_mark(
-                    &p,
-                    theme,
-                    egui::pos2(right, line_y),
-                    Align2::RIGHT_CENTER,
-                    src,
-                    small.clone(),
-                    t.osd_scrim.to_opaque(),
-                    t.osd_text,
-                );
+                let color = badge::legible_on(theme.source_color(src.color), t.osd_scrim.to_opaque(), t.osd_text);
+                let m = osd_text(&p, egui::pos2(right, line_y), Align2::RIGHT_CENTER, &src.name, small.clone(), color, (r.width() * 0.2).round());
                 right = m.left() - pad / 2.0;
             }
             let quality = ctx.quality(&ch).map(|q| InlineBadge::quality(&p, theme, q, with_alpha(t.osd_text, 0.7), s));

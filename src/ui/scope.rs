@@ -6,7 +6,9 @@
 //!   and with movies / series / channels). With fewer than two there is no choice: no bar, no
 //!   picker, no marks, and the stored choice is ignored.
 //! * "All playlists" is every eligible playlist except those whose "Show in All playlists" is
-//!   off (`SourceSettings::in_all`) — unless that would leave nothing.
+//!   off (`SourceSettings::in_all`) — unless that would leave nothing. That only narrows the
+//!   provider lists (All, categories / groups); the user's own lists (favourites, history,
+//!   reminders, continue watching) show every playlist in All ([`ScopeFilter::for_user_list`]).
 //! * The choice is applied through `ctx.edit_config` (it lands at the end of the frame); a
 //!   playlist that disappears falls back to All with a toast (`TunerApp`, on the library swap).
 
@@ -104,6 +106,16 @@ impl ScopeFilter {
             ScopeFilter::Everything => true,
             ScopeFilter::Only(s) => *s == source,
             ScopeFilter::Except(out) => !out.contains(&source),
+        }
+    }
+
+    /// The filter of the user's own lists (favourites, history, reminders, continue watching):
+    /// "Show in All playlists" only keeps a playlist out of All's provider lists, never out of
+    /// what the user saved — so in All those lists show every playlist.
+    pub fn for_user_list(&self) -> ScopeFilter {
+        match self {
+            ScopeFilter::Except(_) => ScopeFilter::Everything,
+            f => f.clone(),
         }
     }
 }
@@ -342,6 +354,8 @@ mod tests {
         let live = Scope::of(&lib, &PlaylistScopes::default(), ScopeKind::Live);
         let all = live.filter();
         assert!(all.admits(SourceId(1)) && !all.admits(SourceId(4)), "Free-TV is out of All");
+        assert!(all.for_user_list().admits(SourceId(4)), "but not out of your favourites");
+        assert_eq!(ScopeFilter::Only(SourceId(2)).for_user_list(), ScopeFilter::Only(SourceId(2)));
         assert_eq!(Scope::of(&lib, &pick(ScopeKind::Live, Some(4)), ScopeKind::Live).filter(), ScopeFilter::Only(SourceId(4)));
         // Ctrl+PgDn walks All → TV → TV 2 → Free-TV → All
         assert_eq!(live.step(true), Some(SourceId(1)));

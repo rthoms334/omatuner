@@ -157,7 +157,8 @@ impl Overlay for PlaylistPickerOverlay {
                 // right: digit key, then the count
                 let small = egui::FontId::proportional(theme.font(TypeToken::BodySmall));
                 let mut right = rect.right() - inset;
-                if i < 10 {
+                // the jump digit, only while digits jump (typing filters otherwise)
+                if i < 10 && !self.list.filter.is_active() {
                     right = p.text(egui::pos2(right, y), Align2::RIGHT_CENTER, i.to_string(), small.clone(), t.text_secondary).left()
                         - theme.space(SpaceToken::Lg);
                 }
@@ -188,19 +189,33 @@ impl Overlay for PlaylistPickerOverlay {
     }
 }
 
+/// The playlist order with `source` moved past its neighbouring tab of `kind` (up: just
+/// before the previous eligible playlist; down: just after the next one); `None` at the end.
+fn moved_order(lib: &crate::store::library::Library, kind: ScopeKind, source: SourceId, up: bool) -> Option<Vec<SourceId>> {
+    let tabs: Vec<SourceId> = lib.eligible(kind.item_kind()).iter().map(|s| s.id).collect();
+    let at = tabs.iter().position(|s| *s == source)?;
+    let neighbour = if up { tabs.get(at.checked_sub(1)?) } else { tabs.get(at + 1) }.copied()?;
+    let mut order: Vec<SourceId> = lib.sources.iter().map(|s| s.id).filter(|s| *s != source).collect();
+    let j = order.iter().position(|s| *s == neighbour)?;
+    order.insert(if up { j } else { j + 1 }, source);
+    Some(order)
+}
+
 const MENU_EDIT: u8 = 0;
 const MENU_UP: u8 = 1;
 const MENU_DOWN: u8 = 2;
 
 /// A scope tab's right-click menu: "Edit playlist…", "Move up", "Move down" (the playlist
-/// order of Settings ▸ Playlists, which is also the tab order).
+/// order of Settings ▸ Playlists, which is also the tab order). A move passes the neighbouring
+/// *tab* of the screen (`kind`), not a playlist without a tab there.
 pub struct PlaylistMenuOverlay {
     source: SourceId,
+    kind: ScopeKind,
     menu: ContextMenuOverlay,
 }
 
 impl PlaylistMenuOverlay {
-    pub fn new(source: SourceId, ctx: &UiCtx<'_>) -> Self {
+    pub fn new(source: SourceId, kind: ScopeKind, ctx: &UiCtx<'_>) -> Self {
         let name = ctx.lib.source(source).map_or_else(|| "Playlist".to_owned(), |s| s.name.clone());
         let item = |icon: &'static str, label: &str, code: u8| MenuItem {
             icon,
@@ -217,26 +232,19 @@ impl PlaylistMenuOverlay {
                 item(glyphs::REORDER, "Move down", MENU_DOWN),
             ],
         };
-        Self { source, menu: ContextMenuOverlay::new(spec) }
+        Self { source, kind, menu: ContextMenuOverlay::new(spec) }
     }
 
     fn act(&self, ctx: &mut UiCtx<'_>, outcome: OverlayOutcome) -> OverlayOutcome {
         let OverlayOutcome::CloseWith(OverlayResult::Chosen(Action::Digit(code))) = outcome else { return outcome };
         match code {
             MENU_EDIT => ctx.push(Route::EditPlaylist(self.source)),
-            _ => {
-                let mut order: Vec<SourceId> = ctx.lib.sources.iter().map(|s| s.id).collect();
-                let Some(i) = order.iter().position(|s| *s == self.source) else { return OverlayOutcome::Close };
-                let j = if code == MENU_UP { i.checked_sub(1) } else { (i + 1 < order.len()).then_some(i + 1) };
-                match j {
-                    Some(j) => {
-                        order.swap(i, j);
-                        let _ =
-                            ctx.services.store.writer().submit_notify(DataScope::Sources, move |c| crate::store::sources::reorder_sources(c, &order));
-                    }
-                    None => ctx.toast(Toast::info(if code == MENU_UP { "Already the first playlist" } else { "Already the last playlist" })),
+            _ => match moved_order(ctx.lib, self.kind, self.source, code == MENU_UP) {
+                Some(order) => {
+                    let _ = ctx.services.store.writer().submit_notify(DataScope::Sources, move |c| crate::store::sources::reorder_sources(c, &order));
                 }
-            }
+                None => ctx.toast(Toast::info(if code == MENU_UP { "Already the first playlist" } else { "Already the last playlist" })),
+            },
         }
         OverlayOutcome::Close
     }
@@ -253,5 +261,40 @@ impl Overlay for PlaylistMenuOverlay {
     fn ui(&mut self, egui_ctx: &egui::Context, ctx: &mut UiCtx<'_>) -> OverlayOutcome {
         let out = self.menu.ui(egui_ctx, ctx);
         self.act(ctx, out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{SourceColor, SourceKind};
+    use crate::store::library::{Library, SourceMeta};
+
+    /// "Move up / down" on a tab passes the neighbouring *tab*: with TV, iptv-org (channels
+    /// only), TV 2, moving TV 2 up on Movies puts it before TV — not merely before iptv-org,
+    /// which has no Movies tab and would leave the tabs unchanged.
+    #[test]
+    fn a_tab_moves_past_its_neighbouring_tab() {
+        let meta = |id: i64, vod: bool| SourceMeta {
+            id: SourceId(id),
+            name: format!("P{id}"),
+            icon: String::new(),
+            color: SourceColor::Accent,
+            kind: SourceKind::Xtream,
+            enabled: true,
+            last_refresh: None,
+            has_vod: vod,
+            has_series: false,
+            has_live: true,
+            in_all: true,
+            category_filter: None,
+        };
+        let lib = Library { sources: vec![meta(1, true), meta(2, false), meta(3, true)], ..Default::default() };
+        let ids = |v: Option<Vec<SourceId>>| v.map(|v| v.into_iter().map(|s| s.0).collect::<Vec<_>>());
+        assert_eq!(ids(moved_order(&lib, ScopeKind::Movies, SourceId(3), true)), Some(vec![3, 1, 2]));
+        assert_eq!(ids(moved_order(&lib, ScopeKind::Movies, SourceId(1), false)), Some(vec![2, 3, 1]));
+        assert_eq!(ids(moved_order(&lib, ScopeKind::Movies, SourceId(1), true)), None, "already the first tab");
+        // Live TV has three tabs: the plain neighbour
+        assert_eq!(ids(moved_order(&lib, ScopeKind::Live, SourceId(3), true)), Some(vec![1, 3, 2]));
     }
 }

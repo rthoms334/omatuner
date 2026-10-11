@@ -135,6 +135,6 @@ pub fn build(req: OverlayRequest, ctx: &mut UiCtx<'_>) -> Box<dyn Overlay> {
         OverlayRequest::EditItem(item) => Box::new(edit_item::EditItemOverlay::new(item)),
         OverlayRequest::Categories(source) => Box::new(categories::CategoriesOverlay::new(source)),
         OverlayRequest::PlaylistPicker(kind) => Box::new(playlists::PlaylistPickerOverlay::new(kind)),
-        OverlayRequest::PlaylistMenu(source) => Box::new(playlists::PlaylistMenuOverlay::new(source, ctx)),
+        OverlayRequest::PlaylistMenu(source, kind) => Box::new(playlists::PlaylistMenuOverlay::new(source, kind, ctx)),
     }
 }

@@ -1617,8 +1617,9 @@ provider groups (renamed/reordered/hidden per overrides; locked show 󰌾 and re
 * **Several playlists with channels** (§29): the scope bar runs across the top (tabs at Wide,
   `● TV 2 ▾` otherwise). One playlist picked: its groups, and All channels / favourites lists
   / History / Reminders narrowed to its channels — so are the zap lists (`zap_list_in`); the
-  channel header reads `TV 2 › UK News`. In All, group rows name their playlist in its colour
-  and channel rows carry its glyph.
+  channel header reads `TV 2 › UK News`. In All, group and channel rows name their playlist in
+  its colour (channel rows: its glyph at Compact density), and an open group's header names
+  its playlist: `All playlists › Sports · TV 2`.
 
 Medium (≈ 790): the preview stays on the RIGHT; groups become a drawer (← / Backspace on the
 channel list, or click the breadcrumb):
@@ -3877,6 +3878,12 @@ come from the snapshot (`LiveIndex` / `VodIndex` build them; `Library::count`).
   while the playlist stays eligible).
 * `ScopeFilter`: `Only(id)`, or for All `Except(the playlists whose "Show in All playlists" is
   off)` — `Everything` when that would leave nothing. Screens key their rebuilds on it.
+  `Except` narrows only the provider lists (All, categories / groups): the user's own lists
+  (favourites, History, Reminders, Continue watching) show every playlist in All
+  (`ScopeFilter::for_user_list`) — switching the free presets out of All never hides a
+  favourite.
+* **Changing the scope** clears the category / group and list filters and starts at the top,
+  so a category of the old playlist never stays open under the new name.
 * **Disappearing playlist**: on each library swap the app checks the three stored scopes; one
   that is no longer eligible is reset to All with a toast — "TV 2 is disabled — showing All
   playlists", "… was removed …", "… has no movies now …".
@@ -3884,11 +3891,12 @@ come from the snapshot (`LiveIndex` / `VodIndex` build them; `Library::count`).
 ### 29.4 What the scope changes
 | Screen | One playlist picked | All playlists |
 |---|---|---|
-| Movies / Series | its categories (custom order, rename, Alt+↑/↓ as before); All, Continue watching and Favourites narrowed to its titles; breadcrumb `TV 2 › Action`; no card marks | every eligible playlist in `in_all`; category rows and cards carry the playlist (§13.0) |
-| Live TV | its groups; All channels, favourites lists, History, Reminders and the **zap lists** narrowed to its channels (`live::zap_list_in`); header `TV 2 › UK News` | groups name their playlist in colour; channel rows carry the glyph |
-| Guide | follows Live TV: rows, collection picker, zap lists; a group of another playlist falls back | picker groups the groups under each playlist's name |
+| Movies / Series | its categories (custom order, rename, Alt+↑/↓ as before); All, Continue watching and Favourites narrowed to its titles; breadcrumb `TV 2 › Action`; no card marks | every eligible playlist in `in_all`; category rows and cards carry the playlist (§13.0); typing a playlist's name in the category filter finds its categories; breadcrumb `All playlists › Action · TV 2` |
+| Live TV | its groups; All channels, favourites lists, History, Reminders and the **zap lists** narrowed to its channels (`live::zap_list_in`); header `TV 2 › UK News`; another playlist's channel (from Search, or what plays) never opens a group the scope doesn't list | groups and channel rows name their playlist in colour; header `All playlists › UK News · TV 2` |
+| Guide | follows Live TV: rows, collection picker, zap lists; a group of another playlist falls back; "Open in guide" on another playlist's channel switches Live TV to All (or to that playlist when it is out of All), with a toast, and focuses it | picker groups the groups under each playlist's name |
 
-Search, Home, popovers and the player's "primary group" zaps are not scoped (P1).
+Search, Home, popovers and the player's "primary group" zaps are not scoped (P1). The player's
+channel panel shows playlist names as Live TV does (none while Live TV shows one playlist).
 
 ### 29.5 Showing it
 * **Scope bar** (`widgets::scope_bar`) on Movies, Series and Live TV when two or more playlists
@@ -3896,7 +3904,8 @@ Search, Home, popovers and the player's "primary group" zaps are not scoped (P1)
   `● TV 2 ▾` button (opens the picker) at Medium / Compact, or when the tabs don't fit. The
   guide has the button before its collection button. Right side at Wide: "Alt+P playlist".
 * **Stripe**: 2 px in the picked playlist's colour under the bar (the guide: under its
-  header); none for All.
+  header); none for All. The selected tab is underlined only for All (the stripe marks a
+  picked playlist).
 * **Window title**: `Tuner — Movies · TV 2` while a scoped screen shows one playlist (the
   Omarchy bar shows it), else `Tuner` (`TunerApp::title_now`, sent only on change).
 * **Marks** (§13.0 "Playlist on cards"): Auto = two or more eligible playlists for the item's
@@ -3909,7 +3918,7 @@ Search, Home, popovers and the player's "primary group" zaps are not scoped (P1)
 | `Alt+P` | the picker (`overlays::playlists`): All + each eligible playlist with dot and count; ↑/↓ Enter, click, **digits jump** (0 = All, 1–9 in order) while nothing is typed, typing filters; it saves the choice itself |
 | `Ctrl+PgDn` / `Ctrl+PgUp` | next / previous (All → TV → TV 2 → All), toast "Showing TV 2 only" / "Showing all playlists" |
 | click a tab | that playlist |
-| right-click a tab | menu: Edit playlist… (`Route::EditPlaylist` → Settings ▸ Playlists with its editor open), Move up / Move down (the playlist order, also the tab order) |
+| right-click a tab | menu: Edit playlist… (`Route::EditPlaylist` → Settings ▸ Playlists with its editor open), Move up / Move down (the playlist order, also the tab order: the playlist moves past the neighbouring *tab*, skipping playlists without one on that screen) |
 
 Keys are in `GLOBAL` (Ctrl/Alt chords only) and act only on Movies, Series, Live TV and the
 guide; with one eligible playlist they say "Only one playlist has movies". Rejected: Ctrl+0
@@ -3926,7 +3935,9 @@ adds "Alt+P playlist" (before "help") only on those screens with two or more eli
   **Give each its own colour** action that keeps the first of each group and gives the others
   the first free colours (`scope::distinct_colors`; toast). Nothing changes until it is
   pressed.
-* Marks always carry the name (accessible label, meta line, group rows, tooltips).
+* Marks always carry the name (accessible label, meta line, group and channel rows, the
+  player's channel panel, tooltips); only the poster corner chip and Compact channel rows are
+  glyph-only (name as tooltip).
 
 ### 29.8 Changes to the "playlist on cards" work it folds in
 Kept: `PlaylistOnCards`, `SourceMarks` (now `for_view(mode, sources, kind, all)`), the coloured
@@ -3935,11 +3946,15 @@ Xtream pages too). Deferred to P2 (they need matched copies): `SourceSet` / seve
 card, the stack edge and `+1` counts, `DetailHeader` copies and "also in TV".
 
 ### 29.9 Tests
-`ui::scope` (eligibility, stored choice, `in_all`, cycling, look-alikes, free colours),
-`ui::data` (the Auto rule per kind and scope), Movies (bar, Ctrl+PgDn + toast, per-screen
-persistence, narrowed categories / Favourites, breadcrumb, marks, tab click / right-click,
-Alt+P), the picker (digits, filter), Live (groups, All channels and zap lists per scope,
-`in_all`), the guide (follows Live, grouped picker), Settings (look-alike fix, edit route,
-`in_all` saved without a refresh), the app (fallback toast, window title, hint), keymap
+`ui::scope` (eligibility, stored choice, `in_all` incl. the user's own lists, cycling,
+look-alikes, free colours), `ui::data` (the Auto rule per kind and scope), Movies (bar,
+Ctrl+PgDn + toast, per-screen persistence, filters cleared on a scope change, narrowed
+categories / Favourites, breadcrumb in All and in one playlist, finding categories by playlist
+name, marks, tab click / right-click, Alt+P), the picker (digits, filter), tab moves past the
+neighbouring tab (`overlays::playlists`), Live (groups, All channels and zap lists per scope,
+`in_all` vs favourites, painted channel-row names, breadcrumb, another playlist's channel),
+the guide (follows Live, grouped picker, "Open in guide" across playlists), Settings
+(look-alike fix, edit route, `in_all` saved without a refresh), the app (disabled / removed
+fallback toasts, window title, hint), keymap
 (chords, hint placement), and the 790 / 1600 pt × text 12 / 16 layout test with Live and the
 guide scoped.

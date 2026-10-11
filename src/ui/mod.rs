@@ -189,7 +189,7 @@ pub enum OverlayRequest {
     /// Alt+P: which playlist a screen shows (DESIGN §29). The overlay applies the choice.
     PlaylistPicker(scope::ScopeKind),
     /// A scope tab's right-click menu: edit the playlist, move it up / down (DESIGN §29).
-    PlaylistMenu(SourceId),
+    PlaylistMenu(SourceId, scope::ScopeKind),
 }
 
 /// Requests a screen makes during a frame; the app applies them after the frame.

@@ -74,6 +74,9 @@ pub struct GuideScreen {
     /// Keyboard focus rest (optional guide preview autoplay).
     rest: Option<(ChannelId, Instant)>,
     guide: GuideStatus,
+    /// A channel to focus once the rows of a new playlist scope are built ("Open in guide" on
+    /// another playlist's channel switches the scope first, DESIGN §29).
+    pending_focus: Option<ChannelId>,
 }
 
 fn fav_signature(ctx: &UiCtx<'_>) -> u64 {
@@ -184,6 +187,9 @@ impl GuideScreen {
         }
         self.collection = Some(coll);
         self.apply_reminders(ctx);
+        if let (Some(ch), Some(g)) = (self.pending_focus.take(), &mut self.grid) {
+            g.jump_to(ch, ctx.now);
+        }
     }
 
     fn apply_reminders(&mut self, ctx: &UiCtx<'_>) {
@@ -578,6 +584,18 @@ impl Screen for GuideScreen {
         self.refresh(ctx);
         let now = ctx.now;
         let target = if returning { played_channel(&snap).or(*focus) } else { *focus };
+        self.pending_focus = None;
+        // another playlist's channel: show a scope that has it (All, or that playlist when it is
+        // out of All), then focus it once those rows are built
+        if let Some(src) = target.and_then(|ch| ctx.lib.live.get(ch)).map(|c| c.source_id) {
+            let scope = Self::scope(ctx);
+            if !scope.filter().admits(src) {
+                let all = Scope { selected: None, ..scope }.filter();
+                scope::choose(ctx, ScopeKind::Live, (!all.admits(src)).then_some(src), true);
+                self.pending_focus = target;
+                return;
+            }
+        }
         if let (Some(ch), Some(g)) = (target, &mut self.grid) {
             g.jump_to(ch, now);
         }
@@ -856,5 +874,14 @@ mod tests {
         let items = picker(&mut h);
         assert!(!items.iter().any(|i| i.0 == "Alpha" || i.0 == "Bravo"), "one playlist: no headings");
         assert_eq!(items.iter().filter(|i| i.0 == "All" || i.0 == "News").count(), 2, "Bravo's groups only");
+
+        // "Open in guide" on Alpha's last channel (Search, Home): All playlists, focused on it
+        let ch = h.state().t.lib.live.channels.iter().rfind(|c| c.source_id == a).map(|c| c.id).expect("a channel");
+        h.state_mut().enter(Route::Guide { collection: None, focus: Some(ch) });
+        assert_eq!(h.state().t.toasts.last().map(|t| t.text.as_str()), Some("Showing all playlists"));
+        h.state_mut().apply_config();
+        h.run_steps(2);
+        let g = h.state().s.grid.as_ref().expect("grid");
+        assert_eq!(g.rows.get(g.focus_row).map(|r| r.channel), Some(ch));
     }
 }

@@ -48,7 +48,7 @@ on-screen controls, and a light theme (catppuccin-latte).
   channel rows, group rows and search results say which playlist each item comes from (the
   glyph in a corner of the poster and the playlist's name under the title); detail pages and
   the player always do. A playlist's *Show in All playlists* switch keeps, say, free channels
-  out of the All view. Settings ▸ Interface ▸ Playlist on cards switches the marks to Always or
+  out of the All view (your favourites and history still list them). Settings ▸ Interface ▸ Playlist on cards switches the marks to Always or
   Never.
   A provider's M3U (a `get.php?username=…` link or a downloaded file) switches to its Xtream
   login automatically, so movies, series and catch-up appear; providers that don't allow that

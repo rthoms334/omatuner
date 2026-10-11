@@ -2,8 +2,8 @@
 //! show. Drawn only with two or more eligible playlists (`Scope::multi`).
 //!
 //! * Tabs (Wide): `All playlists 214 380 · ● TV 151 022 · ● TV 2 98 117`, the selected tab
-//!   underlined (2 px, the playlist's colour; accent for All) with fg text, the others
-//!   `text_secondary`. Left click picks a tab, right click opens its menu (edit, move).
+//!   in fg text (All also underlined, 2 px accent; a picked playlist has the stripe), the
+//!   others `text_secondary`. Left click picks a tab, right click opens its menu (edit, move).
 //! * Button (Medium / Compact, or when the tabs don't fit): `● TV 2 ▾`, opening the Alt+P
 //!   picker.
 //! * Stripe: with one playlist picked, a 2 px line in its colour across the content area
@@ -109,9 +109,10 @@ pub fn scope_bar(ui: &mut egui::Ui, theme: &Theme, scope: &Scope<'_>, counts: &[
         }
         tx = paint::text(&p, egui::pos2(tx, y), Align2::LEFT_CENTER, tab.name.clone(), name_font.clone(), text, f32::INFINITY).right() + gap;
         paint::text(&p, egui::pos2(tx, y), Align2::LEFT_CENTER, tab.count.clone(), count_font.clone(), t.text_secondary, f32::INFINITY);
-        if tab.selected {
+        // All is underlined; a picked playlist has the stripe under the bar already
+        if tab.selected && tab.dot.is_none() {
             let line = Rect::from_min_max(egui::pos2(rect.left(), rect.bottom() - 2.0), rect.right_bottom());
-            p.rect_filled(line, 1.0, tab.dot.unwrap_or(t.accent));
+            p.rect_filled(line, 1.0, t.accent);
         }
     }
     // the key, when there is room for it

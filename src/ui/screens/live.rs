@@ -15,8 +15,9 @@
 //! * Several playlists with channels (DESIGN §29): the scope bar on top (tabs at Wide, the
 //!   `● TV 2 ▾` button otherwise; Alt+P, Ctrl+PgDn/PgUp) narrows the groups, All channels,
 //!   the favourites lists, History and Reminders — and so the zap lists — to one playlist;
-//!   the guide follows. In All, group rows name their playlist in its colour and channel rows
-//!   carry its glyph.
+//!   the guide follows. In All, group and channel rows name their playlist in its colour.
+//!   "Show in All playlists" off keeps a playlist out of All channels and the groups, not out
+//!   of the favourites lists, History or Reminders.
 //!
 //! Also home of the playback helpers the other WP-11 views share (guide, player, programme
 //! popover, edit information): the Enter rule, locked/DRM checks, zap lists, favourites and
@@ -77,11 +78,16 @@ pub(crate) fn zap_list_in(ctx: &UiCtx<'_>, collection: &Collection, scope: &Scop
     (!channels.is_empty()).then(|| ZapList { collection: collection.clone(), channels: channels.into() })
 }
 
-/// A collection's channels (`LiveIndex::collection`) from the playlists `scope` shows.
+/// A collection's channels (`LiveIndex::collection`) from the playlists `scope` shows (the
+/// user's own lists: [`ScopeFilter::for_user_list`]).
 pub(crate) fn scoped_collection(ctx: &UiCtx<'_>, collection: &Collection, sort: SortMode, scope: &ScopeFilter) -> Vec<ChannelId> {
     let live = &ctx.lib.live;
     let mut ids = live.collection(collection, ctx.favs, &ctx.lib.recent_channels, sort);
-    if *scope != ScopeFilter::Everything {
+    let scope = match collection {
+        Collection::Favourites(_) | Collection::History => scope.for_user_list(),
+        _ => scope.clone(),
+    };
+    if scope != ScopeFilter::Everything {
         ids.retain(|id| live.get(*id).is_some_and(|c| scope.admits(c.source_id)));
     }
     ids
@@ -765,18 +771,16 @@ impl LiveScreen {
         let live = &ctx.lib.live;
         let scope = Self::scope(ctx);
         let filter = scope.filter();
+        // the user's own lists: every playlist in All, even one switched out of it
+        let mine = filter.for_user_list();
         let marks = scope.marks(ctx);
         // channel references in scope (favourites lists may hold movies and other playlists')
-        let in_scope = |r: &ItemRef| r.kind == ItemKind::Channel && filter.admits(r.source);
+        let in_scope = |r: &ItemRef| r.kind == ItemKind::Channel && mine.admits(r.source);
         let mut v = Vec::new();
         if !ctx.lib.is_empty() || !live.channels.is_empty() {
             for l in &ctx.favs.lists {
                 let name = format!("{} {}", glyphs::FAVOURITE, l.name);
-                let n = if filter == ScopeFilter::Everything {
-                    ctx.favs.items(l.id).len()
-                } else {
-                    ctx.favs.items(l.id).iter().filter(|r| in_scope(r)).count()
-                };
+                let n = ctx.favs.items(l.id).iter().filter(|r| in_scope(r)).count();
                 v.push(GroupItem {
                     entry: Entry::FavList(l.id),
                     group: synthetic_group(name.clone(), n),
@@ -787,11 +791,11 @@ impl LiveScreen {
                 });
             }
             let name = format!("{} History", glyphs::HISTORY);
-            let n = ctx.lib.recent_channels.iter().filter(|id| live.get(**id).is_some_and(|c| filter.admits(c.source_id))).count();
+            let n = ctx.lib.recent_channels.iter().filter(|id| live.get(**id).is_some_and(|c| mine.admits(c.source_id))).count();
             v.push(GroupItem { entry: Entry::History, group: synthetic_group(name.clone(), n), name, tag: None, words: String::new(), source: None });
             if !self.reminders.is_empty() {
                 let name = format!("{} Reminders", glyphs::REMINDER);
-                let n = self.reminders.iter().filter(|r| filter.admits(r.channel.source)).count();
+                let n = self.reminders.iter().filter(|r| mine.admits(r.channel.source)).count();
                 v.push(GroupItem {
                     entry: Entry::Reminders,
                     group: synthetic_group(name.clone(), n),
@@ -872,7 +876,7 @@ impl LiveScreen {
             Some(Entry::Reminders) => {
                 // one row per reminder (several on one channel are separate programmes)
                 let mut v = Vec::new();
-                let scope = Self::scope(ctx).filter();
+                let scope = Self::scope(ctx).filter().for_user_list();
                 for (i, r) in self.reminders.iter().enumerate().filter(|(_, r)| scope.admits(r.channel.source)) {
                     if let Some(c) = ctx.lib.live.by_ref(&r.channel) {
                         v.push(c);
@@ -966,9 +970,10 @@ impl LiveScreen {
                 self.refilter_channels();
             }
             if self.row_of(id).is_none() {
-                let entry = prefer
-                    .filter(|e| self.groups.iter().any(|g| &g.entry == e))
-                    .or_else(|| ctx.lib.live.get(id).and_then(|c| c.group_ids.first()).map(|g| Entry::Group(*g)));
+                // only a group this scope lists (another playlist's group would show nothing)
+                let listed = |e: &Entry| self.groups.iter().any(|g| &g.entry == e);
+                let entry =
+                    prefer.filter(listed).or_else(|| ctx.lib.live.get(id).and_then(|c| c.group_ids.first()).map(|g| Entry::Group(*g)).filter(listed));
                 if let Some(e) = entry {
                     self.open_entry(ctx, e);
                 }
@@ -1560,10 +1565,15 @@ impl LiveScreen {
 
     fn draw_channels(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, focused: bool) {
         let theme = ctx.theme;
-        let mut group_name = self.open_index().map(|i| self.groups[i].group.display_name().to_owned()).unwrap_or_else(|| "Channels".into());
+        let open = self.open_index().map(|i| &self.groups[i]);
+        let mut group_name = open.map(|g| g.group.display_name().to_owned()).unwrap_or_else(|| "Channels".into());
         let scope = Self::scope(ctx);
         if scope.multi() {
-            // the breadcrumb: which playlist, then the group (DESIGN §29)
+            // the breadcrumb: which playlist, then the group (DESIGN §29); in All a provider
+            // group is one playlist's, so it names that one too ("All playlists › Sports · TV 2")
+            if let Some(src) = open.and_then(|g| g.source).and_then(|s| scope.marks(ctx).of(s)) {
+                group_name = format!("{group_name} · {}", src.name);
+            }
             group_name = format!("{} › {group_name}", scope.label());
         }
         let breadcrumb = ctx.layout != LayoutClass::Wide;
@@ -1982,7 +1992,7 @@ impl Screen for LiveScreen {
             ui.add_space(theme.space(SpaceToken::Md));
             match click {
                 scope_bar::BarClick::Choose(c) => scope::choose(ctx, ScopeKind::Live, c, false),
-                scope_bar::BarClick::Menu(id) => ctx.open(OverlayRequest::PlaylistMenu(id)),
+                scope_bar::BarClick::Menu(id) => ctx.open(OverlayRequest::PlaylistMenu(id, ScopeKind::Live)),
                 scope_bar::BarClick::Picker => ctx.open(OverlayRequest::PlaylistPicker(ScopeKind::Live)),
                 scope_bar::BarClick::None => {}
             }
@@ -2077,25 +2087,30 @@ impl Screen for LiveScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::screens::home::testkit::{self, harness, has_label, rig, seed};
+    use crate::ui::screens::home::testkit::{self, harness, has_label, has_label_containing, rig, seed};
 
-    /// Several playlists with channels (DESIGN §29): in All, group rows name their playlist
-    /// (two "All" groups told apart) and a playlist whose "Show in All playlists" is off stays
-    /// out of All channels and its groups; picking one playlist narrows the groups, All
-    /// channels and the zap list to it (marks off inside it); a playlist out of All still
-    /// shows when picked.
+    /// Several playlists with channels (DESIGN §29): in All, group and channel rows name their
+    /// playlist (two "All" groups told apart), the breadcrumb of a provider group names its
+    /// playlist, and a playlist whose "Show in All playlists" is off stays out of All channels
+    /// and its groups but not out of your favourites; picking one playlist narrows the groups,
+    /// All channels and the zap list to it (marks off inside it); another playlist's channel
+    /// never opens a group this scope doesn't list; a playlist out of All still shows when
+    /// picked.
     #[test]
     fn the_playlist_scope_narrows_groups_lists_and_zap_lists() {
         let (mut t, one) = rig();
-        let (b, free) = seed(&mut t, |c| {
+        let (a_ch, b, free) = seed(&mut t, |c| {
             let a = testkit::source(c, "Alpha")?;
             let b = testkit::source(c, "Bravo")?;
             let free = testkit::source(c, "Free")?;
-            testkit::channels(c, a, 3)?;
+            let a_ch = testkit::channels(c, a, 3)?;
             testkit::channels(c, b, 2)?;
             testkit::channels(c, free, 4)?;
             c.execute(r#"UPDATE source SET settings = '{"in_all":false}' WHERE id = ?1"#, [free])?;
-            Ok((b, free))
+            let list = crate::store::user::default_fav_list(c)?;
+            let fav = ItemRef { source: free, kind: ItemKind::Channel, key: crate::model::ItemKey("m3u:seed00000000000".into()) };
+            crate::store::user::set_favourite(c, list, &fav, true, 1)?;
+            Ok((a_ch[0], b, free))
         });
         let mut h = harness(t, one, LiveScreen::default(), egui::vec2(1600.0, 900.0));
         h.state_mut().enter(Route::Live { group: None, channel: None });
@@ -2105,11 +2120,28 @@ mod tests {
             let (s, id) = (&app.s, app.s.channels[0]);
             app.t.with_ctx(|ctx| s.zap_for_open(ctx, id)).map_or(0, |z| z.channels.len())
         };
-        assert_eq!(h.state().s.open, Some(Entry::All));
+        // a favourites list opens first: Free's favourite is still yours in All
+        assert!(matches!(h.state().s.open, Some(Entry::FavList(_))));
+        assert_eq!(h.state().s.channels.len(), 1, "Free is out of All, not out of your favourites");
+        assert_eq!(h.state().s.groups[0].group.item_count, 1);
+        let open = |h: &mut egui_kittest::Harness<'static, testkit::App<LiveScreen>>, e: Entry| {
+            let app = h.state_mut();
+            let s = &mut app.s;
+            app.t.with_ctx(|ctx| s.open_entry(ctx, e));
+            h.run_steps(2);
+        };
+        open(&mut h, Entry::All);
         assert_eq!(h.state().s.channels.len(), 5, "Free is out of All");
         assert_eq!(zap_len(&mut h), 5, "the zap list too");
         assert!(has_label(&h, "All · Alpha") && has_label(&h, "All · Bravo"), "groups name their playlist");
         assert!(!has_label(&h, "All · Free"), "Free's groups are out of All");
+        // channel rows paint the name, not just a glyph: Bravo's tab, its 2 groups, its 2 channels
+        let painted = testkit::painted(&h);
+        assert!(painted.iter().filter(|p| *p == "Bravo").count() >= 5, "{painted:?}");
+        let news = h.state().s.groups.iter().rev().find(|g| g.group.display_name() == "News").map(|g| g.entry.clone()).unwrap();
+        open(&mut h, news);
+        assert!(has_label_containing(&h, "All playlists › News · Bravo"), "the breadcrumb names the group's playlist");
+        open(&mut h, Entry::All);
 
         let pick = |h: &mut egui_kittest::Harness<'static, testkit::App<LiveScreen>>, id| {
             h.state_mut().t.config_edits.push(Box::new(move |c| c.interface.playlist_scope.live = Some(id)));
@@ -2124,6 +2156,11 @@ mod tests {
         };
         assert_eq!(provider_groups(&h), 2, "Bravo's All and News");
         assert!(has_label(&h, "All") && !has_label(&h, "All · Bravo"), "no marks inside one playlist");
+        // Alpha's channel (from Search, or what plays) never opens Alpha's group under "Bravo ›"
+        h.state_mut().enter(Route::Live { group: None, channel: Some(a_ch) });
+        h.run_steps(1);
+        let s = &h.state().s;
+        assert!(!s.channels.is_empty() && s.open_index().is_some(), "{:?}", s.open);
         pick(&mut h, free);
         assert_eq!(h.state().s.channels.len(), 4, "out of All, but its own tab shows it");
     }

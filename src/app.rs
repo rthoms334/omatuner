@@ -2217,7 +2217,7 @@ mod tests {
     /// A playlist picked on a screen (DESIGN §29): the window title names it and the hint line
     /// offers Alt+P (two playlists with channels); once it is disabled, Live TV shows All
     /// playlists again with a toast saying why, and the title drops it. With one playlist
-    /// left there is nothing to choose: no "Alt+P playlist".
+    /// left there is nothing to choose: no "Alt+P playlist". A removed playlist says so.
     #[test]
     fn a_disabled_picked_playlist_falls_back_to_all_with_a_toast() {
         let mut cfg = test_config();
@@ -2239,6 +2239,19 @@ mod tests {
         assert_eq!(rig.app.services().config().interface.playlist_scope.live, None, "saved");
         assert_eq!(rig.app.window_title, "Tuner");
         assert!(!rig.app.hint_now().contains("Alt+P"), "one playlist: nothing to choose");
+
+        // picked again, then removed
+        rig.writer().blocking(|c| Ok(c.execute("UPDATE source SET enabled = 1 WHERE id = 2", [])?)).unwrap();
+        deliver_library(&mut rig);
+        rig.app.config_edits.push(Box::new(|c: &mut Config| c.interface.playlist_scope.live = Some(SourceId(2))));
+        rig.frame_with(vec![]);
+        rig.frame_with(vec![]);
+        assert_eq!(rig.app.window_title, "Tuner — Live TV · Bravo");
+        rig.writer().blocking(|c| crate::store::sources::delete_source(c, SourceId(2))).unwrap();
+        deliver_library(&mut rig);
+        assert_eq!(rig.log().toasts.last().map(|t| t.text.as_str()), Some("Bravo was removed — showing All playlists"));
+        rig.frame_with(vec![]);
+        assert_eq!(rig.app.services().config().interface.playlist_scope.live, None);
     }
 
     #[test]
