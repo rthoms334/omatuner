@@ -56,6 +56,16 @@ pub struct Cli {
     pub inputs: Vec<String>,
 }
 
+impl Cli {
+    /// `tuner mcp`. Global flags put first (`tuner --debug mcp`, `tuner --profile-dir D mcp`) make
+    /// clap read `mcp` as an input file (`args_conflicts_with_subcommands`); a lone `mcp` input
+    /// with no player flag is the bridge too. `tuner ./mcp` opens a file of that name.
+    pub fn is_mcp(&self) -> bool {
+        self.command == Some(Command::Mcp)
+            || (self.command.is_none() && self.inputs == ["mcp"] && self.view.is_none() && self.play.is_none() && !self.refresh)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Command {
     /// Serve the Model Context Protocol on stdin/stdout so an AI assistant (Claude Code:
@@ -78,6 +88,17 @@ mod tests {
         assert_eq!((cli.command, cli.inputs), (None, vec!["list.m3u".to_owned(), "./mcp".to_owned()]));
         // after a player flag, `mcp` is an input like any other word: never the bridge by accident
         let cli = Cli::try_parse_from(["tuner", "--view", "guide", "mcp"]).unwrap();
+        assert!(!cli.is_mcp());
         assert_eq!((cli.command, cli.inputs), (None, vec!["mcp".to_owned()]));
+        // global flags first: still the bridge
+        let cli = Cli::try_parse_from(["tuner", "--debug", "mcp"]).unwrap();
+        assert!(cli.is_mcp() && cli.debug);
+        let cli = Cli::try_parse_from(["tuner", "--profile-dir", "/p", "mcp"]).unwrap();
+        assert!(cli.is_mcp());
+        assert_eq!(cli.profile_dir, Some(PathBuf::from("/p")));
+        assert!(Cli::try_parse_from(["tuner", "mcp"]).unwrap().is_mcp());
+        for not in [&["tuner", "./mcp"][..], &["tuner", "--refresh", "mcp"], &["tuner", "--play", "1:a", "mcp"]] {
+            assert!(!Cli::try_parse_from(not).unwrap().is_mcp(), "{not:?}");
+        }
     }
 }

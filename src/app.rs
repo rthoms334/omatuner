@@ -625,6 +625,7 @@ impl TunerApp {
                 if let Some(r) = &self.services().integrations.reminders {
                     r.refresh();
                 }
+                self.drop_cancelled_switch_toasts();
             }
             DataScope::Sources | DataScope::All => {
                 self.refresh_epg_updated();
@@ -827,6 +828,7 @@ impl TunerApp {
         if in_lib.is_none() && self.parental.hides_explicit(&cfg.parental) && crate::store::live::channel_explicit(&self.db, id).unwrap_or(true) {
             if cfg.parental.pin_active() {
                 self.pending_locked = Some((id, origin));
+                self.pending_agent = None;
                 self.nav.push(NavRequest::Open(OverlayRequest::Pin { then: Box::new(Action::OpenPlayer), reason: "This channel is locked".into() }));
             } else {
                 self.toast(Toast::info("This channel is hidden by parental control (Settings ▸ Parental)"));
@@ -842,6 +844,7 @@ impl TunerApp {
         });
         if locked && !self.parental.is_unlocked(&cfg.parental) {
             self.pending_locked = Some((id, origin));
+            self.pending_agent = None;
             self.nav.push(NavRequest::Open(OverlayRequest::Pin { then: Box::new(Action::OpenPlayer), reason: "This channel is locked".into() }));
             return;
         }
@@ -949,7 +952,10 @@ impl TunerApp {
     }
 
     /// The PIN prompt for an agent's `play` of a locked item; it plays once the PIN is typed.
+    /// Only the newest prompt's target plays (a stale `pending_locked` from a prompt closed
+    /// without the PIN never takes its place).
     fn ask_pin_for(&mut self, p: crate::agent::AgentPlay, reason: &str) {
+        self.pending_locked = None;
         self.pending_agent = Some(p);
         self.nav.push(NavRequest::Open(OverlayRequest::Pin { then: Box::new(Action::OpenPlayer), reason: reason.into() }));
     }
@@ -957,7 +963,7 @@ impl TunerApp {
     /// An automatic switch is due shortly: "Switching to ‹channel› in 10 s · ‹programme›" with
     /// Cancel (DESIGN §30.8). Nothing for a channel parental control hides.
     fn on_switch_soon(&mut self, id: crate::model::ReminderId, channel: &ItemRef, start: Timestamp) {
-        if self.lib.conceals(channel) {
+        if self.lib.conceals(channel) || self.switch_hidden(channel) {
             return;
         }
         let row = crate::store::user::reminder(&self.db, id).ok().flatten();
@@ -977,7 +983,7 @@ impl TunerApp {
 
     /// An automatic switch's start: play the channel unless it was cancelled or already plays.
     fn on_switch_now(&mut self, id: crate::model::ReminderId, channel: &ItemRef) {
-        if self.cancelled_switches.remove(&id) {
+        if self.cancelled_switches.remove(&id) || self.switch_hidden(channel) {
             return;
         }
         match self.channel_for(channel) {
@@ -990,6 +996,33 @@ impl TunerApp {
             }
             None => self.toast(Toast::info("That channel is no longer in your playlists")),
         }
+    }
+
+    /// A switch to a channel parental control hides right now (checked against the clock and
+    /// the store, not the snapshot: the session may have relocked by its timer with no frame
+    /// since the switch was scheduled; one that can't be read counts as hidden).
+    fn switch_hidden(&self, channel: &ItemRef) -> bool {
+        let cfg = self.services().config();
+        self.parental.hides_explicit(&cfg.parental) && crate::store::live::item_explicit(&self.db, channel).unwrap_or(true)
+    }
+
+    /// A switch cancelled elsewhere (an MCP client's `cancel_switch`, Settings ▸ Reminders): its
+    /// "Switching to … in N s" toast goes, and a `SwitchNow` already on its way is ignored.
+    fn drop_cancelled_switch_toasts(&mut self) {
+        let db = &self.db;
+        let mut gone = Vec::new();
+        self.toasts.retain(|t| match &t.action {
+            Some((_, Action::CancelSwitch(id))) => {
+                // removed = cancelled (a fired switch keeps its row, `Fired`, and its toast)
+                let removed = matches!(crate::store::user::reminder(db, *id), Ok(None));
+                if removed {
+                    gone.push(*id);
+                }
+                !removed
+            }
+            _ => true,
+        });
+        self.cancelled_switches.extend(gone);
     }
 
     /// The Cancel of a switch's toast: the row goes, a `SwitchNow` on its way is ignored.
@@ -1590,6 +1623,9 @@ impl eframe::App for TunerApp {
     }
 
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // parental state first: an event (an automatic switch, an agent's play, `--play`) that
+        // arrives in the frame the session relocked must see the hiding snapshot
+        self.sync_explicit(ctx);
         while let Ok(ev) = self.events.try_recv() {
             self.handle_event(ev, ctx);
         }
@@ -3616,6 +3652,100 @@ mod tests {
             st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().collect::<Result<_, _>>().unwrap()
         };
         assert_eq!(states, [(touring.0, "fired".to_owned())], "the cancelled row is gone");
+    }
+
+    /// `cancel_switch` from an MCP client while the "Switching to … in N s" toast shows: the
+    /// toast goes (nothing will switch) and a `SwitchNow` already on its way is ignored.
+    #[test]
+    fn a_switch_cancelled_by_the_agent_drops_its_toast() {
+        use crate::agent::proto::{Call, CancelSwitch, GuideSearch, ScheduleSwitch};
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_agent(c, 12));
+        rig.settle();
+        let found = ask(&rig, Call::GuideSearch(GuideSearch { query: "touring".into(), ..Default::default() }));
+        let item = found["programmes"][0]["ref"].as_str().unwrap().to_owned();
+        let id = crate::model::ReminderId(ask(&rig, Call::ScheduleSwitch(ScheduleSwitch { item, at: None }))["id"].as_i64().unwrap());
+        let showing = |r: &mut Rig| {
+            let mut n = 0;
+            r.app.toasts.retain(|t| {
+                n += usize::from(matches!(t.action, Some((_, Action::CancelSwitch(_)))));
+                true
+            });
+            n
+        };
+        rig.until_within("the switch toast", Duration::from_secs(15), |r| showing(r) == 1);
+        assert_eq!(ask(&rig, Call::CancelSwitch(CancelSwitch { id: id.0 })), serde_json::json!({"cancelled": true}));
+        rig.until("the toast to go", |r| showing(r) == 0);
+        rig.event(AppEvent::Platform(PlatformEvent::SwitchNow { reminder: id, channel: channel_ref(1) }));
+        assert!(played(&rig.log()).is_empty());
+    }
+
+    /// The relock timer ran out while no frame ran (Tuner on another workspace): a switch to an
+    /// explicit channel scheduled while unlocked, and an agent's play of it, arriving in the
+    /// next frame meet the hiding snapshot — no toast names it, nothing plays.
+    #[test]
+    fn an_explicit_switch_after_an_unattended_relock_plays_nothing() {
+        use crate::agent::{AgentCommand, AgentPlay, PlayTarget};
+        let mut cfg = pin_config();
+        cfg.parental.relock_min = 1;
+        let mut rig = Rig::with(cfg, live(), 1.0, |c| {
+            seed_channels(c, 2, None)?;
+            c.execute("UPDATE grp SET explicit = 1", [])?;
+            Ok(())
+        });
+        rig.app.parental = crate::ui::parental::ParentalSession::with_unlocked_at(Some(Instant::now()));
+        rig.until("the explicit channels", |r| r.app.lib.live.by_ref(&channel_ref(1)).is_some());
+        let ch1 = rig.app.lib.live.by_ref(&channel_ref(1)).unwrap();
+        let before = rig.log().toasts.len();
+        rig.app.parental = crate::ui::parental::ParentalSession::with_unlocked_at(Instant::now().checked_sub(Duration::from_secs(120)));
+        let bus = rig.app.services().bus.clone();
+        let id = crate::model::ReminderId(1);
+        bus.send(AppEvent::Platform(PlatformEvent::SwitchSoon { reminder: id, channel: channel_ref(1), start: crate::model::now() + 10 }));
+        bus.send(AppEvent::Platform(PlatformEvent::SwitchNow { reminder: id, channel: channel_ref(1) }));
+        rig.frame_with(vec![]);
+        assert!(played(&rig.log()).is_empty(), "{:?}", played(&rig.log()));
+        assert!(rig.log().toasts[before..].iter().all(|t| !t.text.contains("Channel 1") && !t.text.contains("Switching")));
+        bus.send(AppEvent::Agent(AgentCommand::Play(AgentPlay { target: PlayTarget::Media(MediaRef::Channel(ch1)), from_start: false })));
+        rig.frame_with(vec![]);
+        assert!(played(&rig.log()).is_empty(), "the PIN first");
+        // the direct paths refuse too (store check), whatever the snapshot says
+        rig.event(AppEvent::Platform(PlatformEvent::SwitchNow { reminder: id, channel: channel_ref(1) }));
+        assert!(played(&rig.log()).is_empty());
+    }
+
+    /// A PIN prompt closed without the PIN leaves its channel behind; an agent's prompt opened
+    /// after it plays the agent's title once the PIN is typed, not that channel.
+    #[test]
+    fn an_agent_pin_prompt_after_a_dismissed_one_plays_the_agents_title() {
+        let mut rig = Rig::with(pin_config(), live(), 1.0, |c| {
+            seed_channels(c, 1, None)?;
+            c.execute("INSERT INTO item_override(source_id, kind, item_key, locked, fp) VALUES (1, 'channel', 'm3u:ch0', 1, '')", [])?;
+            c.execute("INSERT INTO grp(source_id, kind, key, name, provider_order, item_count, seen_gen) VALUES (1, 'movie', 'movie:films', 'Films', 0, 1, 1)", [])?;
+            let g = c.last_insert_rowid();
+            c.execute(
+                "INSERT INTO movie(source_id, key, name, clean_name, norm_name, stream, provider_order, seen_gen)
+                 VALUES (1, 'm3u:film', 'Film', 'Film', 'film', '{\"t\":\"url\",\"url\":\"http://127.0.0.1/film.mp4\"}', 0, 1)",
+                [],
+            )?;
+            c.execute("INSERT INTO movie_group(group_id, movie_id, position) VALUES (?1, ?2, 0)", [g, c.last_insert_rowid()])?;
+            c.execute("INSERT INTO item_override(source_id, kind, item_key, locked, fp) VALUES (1, 'movie', 'm3u:film', 1, '')", [])?;
+            Ok(())
+        });
+        rig.settle();
+        let ch0 = rig.app.lib.live.by_ref(&channel_ref(0)).unwrap();
+        rig.app.play_channel(ch0, PlayOrigin::Fullscreen);
+        rig.frame_with(vec![]);
+        assert_eq!(rig.overlay_kinds(), [pin_prompt()]);
+        rig.press(Key::Escape, NONE);
+        assert!(rig.overlay_kinds().is_empty() && rig.app.pending_locked.is_some(), "a dismissed prompt leaves its channel");
+        let id = crate::model::MovieId(1);
+        let play = crate::agent::AgentPlay { target: crate::agent::PlayTarget::Media(MediaRef::Movie(id)), from_start: false };
+        rig.event(AppEvent::Agent(crate::agent::AgentCommand::Play(play)));
+        rig.frame_with(vec![]);
+        assert_eq!(rig.overlay_kinds(), [pin_prompt()]);
+        type_pin(&mut rig);
+        assert!(played(&rig.log()).is_empty(), "not the dismissed channel");
+        assert!(rig.log().commands.iter().any(|c| matches!(c, PlayerCommand::PlayCopy(c) if c.req.media == MediaRef::Movie(id))));
+        assert!(rig.app.pending_agent.is_none() && rig.app.pending_locked.is_none());
     }
 
     /// A `SwitchNow` for a channel that already plays changes nothing; one for a channel that

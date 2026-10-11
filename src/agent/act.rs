@@ -7,7 +7,7 @@ use super::proto::{
     AgentRef, Airing, CancelSwitch, ErrorCode, NowPlayingOut, Play, PlayOut, PlayOutcome, PlayerStateOut, ScheduleSwitch, StatusOut, SwitchOut,
     fmt_time, item_ref,
 };
-use super::query::{Fail, Out, Q, channel_ref, parse_ref, when};
+use super::query::{Fail, Out, Q, channel_ref, clean, parse_ref, when};
 use super::{AgentCommand, AgentPlay, PlayTarget};
 use crate::jobs::JobKind;
 use crate::model::{ItemKind, MediaRef, PlayableKind, Reminder, ReminderId, ReminderState, VodKind};
@@ -15,6 +15,14 @@ use crate::player::{PlayerErrorKind, PlayerSnapshot, PlayerState};
 
 /// Pending automatic switches allowed at once.
 pub const MAX_SWITCHES: usize = 20;
+/// How far ahead a switch may be scheduled.
+pub const MAX_SWITCH_AHEAD_S: i64 = 14 * 86_400;
+
+/// `HH:MM` alone (no date): today's, or tomorrow's once it has passed.
+fn is_clock_time(s: &str) -> bool {
+    let digits = |x: &str| !x.is_empty() && x.len() <= 2 && x.bytes().all(|b| b.is_ascii_digit());
+    s.trim().split_once(':').is_some_and(|(h, m)| digits(h) && m.len() == 2 && digits(m))
+}
 
 /// What `play` decided.
 #[derive(Debug, Clone, PartialEq)]
@@ -31,7 +39,7 @@ pub fn plan_play(q: &Q, p: &Play) -> Out<PlayStep> {
     let log_ref = r.to_string();
     let ready = |target: PlayTarget, out: PlayOut| PlayStep::Ready {
         command: AgentCommand::Play(AgentPlay { target, from_start }),
-        out,
+        out: clean_play(out),
         log_ref: log_ref.clone(),
     };
     let pin = |title: &str| format!("Tuner is asking for the parental PIN on its screen; {title} plays once it is typed there.");
@@ -60,21 +68,26 @@ pub fn plan_play(q: &Q, p: &Play) -> Out<PlayStep> {
             match q.airing(&prog) {
                 Airing::Upcoming => Err(Fail::new(
                     ErrorCode::NotStarted,
-                    format!("{} starts at {} on {}: use schedule_switch to switch then.", prog.title, fmt_time(prog.start), c.name),
+                    clean(&format!("{} starts at {} on {}: use schedule_switch to switch then.", prog.title, fmt_time(prog.start), c.name)),
                 )),
                 Airing::Past if q.catchup(c, &prog) => archive(PlayOutcome::CatchUp),
-                Airing::Past => Err(Fail::new(ErrorCode::Unavailable, format!("{} has ended and {} has no catch-up for it.", prog.title, c.name))),
+                Airing::Past => {
+                    Err(Fail::new(ErrorCode::Unavailable, clean(&format!("{} has ended and {} has no catch-up for it.", prog.title, c.name))))
+                }
                 Airing::Live if from_start && q.catchup(c, &prog) => archive(PlayOutcome::CatchUp),
-                Airing::Live => Ok(ready(
-                    PlayTarget::Media(MediaRef::Channel(c.id)),
-                    PlayOut {
-                        outcome: if locked { PlayOutcome::PinRequired } else { PlayOutcome::Playing },
-                        item: item_ref(&channel_ref(c)),
-                        title: prog.title.to_string(),
-                        resume_at_min: None,
-                        message: if locked { pin(&c.name) } else { format!("Switched to {} for {}.", c.name, prog.title) },
-                    },
-                )),
+                Airing::Live => {
+                    let live_only = if from_start { format!(" {} can't restart programmes, so it plays live.", c.name) } else { String::new() };
+                    Ok(ready(
+                        PlayTarget::Media(MediaRef::Channel(c.id)),
+                        PlayOut {
+                            outcome: if locked { PlayOutcome::PinRequired } else { PlayOutcome::Playing },
+                            item: item_ref(&channel_ref(c)),
+                            title: prog.title.to_string(),
+                            resume_at_min: None,
+                            message: if locked { pin(&c.name) } else { format!("Switched to {} for {}.{live_only}", c.name, prog.title) },
+                        },
+                    ))
+                }
             }
         }
         AgentRef::Item(item) => match item.kind {
@@ -141,7 +154,7 @@ pub fn plan_play(q: &Q, p: &Play) -> Out<PlayStep> {
                     if lazy {
                         return Ok(PlayStep::NeedsDetails(JobKind::LoadSeriesDetails(id)));
                     }
-                    return Err(Fail::new(ErrorCode::Unavailable, format!("{} has no episodes to play.", v.name)));
+                    return Err(Fail::new(ErrorCode::Unavailable, clean(&format!("{} has no episodes to play.", v.name))));
                 };
                 episode_step(q, &ep, v.name.as_ref(), from_start, PlayTarget::Series(id), &log_ref)
             }
@@ -171,9 +184,14 @@ fn episode_step(q: &Q, ep: &crate::model::Episode, series: &str, from_start: boo
     };
     Ok(PlayStep::Ready {
         command: AgentCommand::Play(AgentPlay { target, from_start }),
-        out: PlayOut { outcome: PlayOutcome::Playing, item: out.item, title, resume_at_min: resume, message },
+        out: clean_play(PlayOut { outcome: PlayOutcome::Playing, item: out.item, title, resume_at_min: resume, message }),
         log_ref: log_ref.to_owned(),
     })
+}
+
+/// Provider names in a `play` answer without their links (`query::clean`).
+fn clean_play(out: PlayOut) -> PlayOut {
+    PlayOut { title: clean(&out.title), message: clean(&out.message), ..out }
 }
 
 /// What `schedule_switch` writes and replies (the id comes from the write).
@@ -198,11 +216,18 @@ pub fn plan_switch(q: &Q, p: &ScheduleSwitch) -> Out<SwitchPlan> {
         }
         AgentRef::Item(item) if item.kind == ItemKind::Channel => {
             let c = q.channel_by_ref(item).ok_or_else(|| Fail::not_found("channel"))?;
-            let at = p.at.as_deref().ok_or_else(|| Fail::bad("a channel ref needs at (when to switch)"))?;
-            let at = when("at", at, q.now)?;
+            let at_text = p.at.as_deref().ok_or_else(|| Fail::bad("a channel ref needs at (when to switch)"))?;
+            let mut at = when("at", at_text, q.now)?;
+            // a bare clock time that has passed today means tomorrow ("21:00" asked at 22:00)
+            if at <= q.now && is_clock_time(at_text) {
+                at += 86_400;
+            }
+            if at > q.now.saturating_add(MAX_SWITCH_AHEAD_S) {
+                return Err(Fail::bad("at is more than 14 days ahead"));
+            }
             // the programme starting then, when the guide has one
             let prog = q.programme_at(c, at)?;
-            let stop = prog.as_ref().map_or(at + 3600, |p| p.stop);
+            let stop = prog.as_ref().map_or(at.saturating_add(3600), |p| p.stop);
             (c, prog.map(|p| p.title.to_string()), at, stop)
         }
         AgentRef::Item(_) => return Err(Fail::bad("schedule_switch takes a programme ref, or a channel ref with at")),
@@ -220,7 +245,13 @@ pub fn plan_switch(q: &Q, p: &ScheduleSwitch) -> Out<SwitchPlan> {
         lead_s: Reminder::SWITCH_LEAD,
         state: ReminderState::Pending,
     };
-    let out = SwitchOut { id: 0, channel: q.channel_out(c), title, start: fmt_time(start), warn_at: fmt_time(start - Reminder::SWITCH_WARN_S) };
+    let out = SwitchOut {
+        id: 0,
+        channel: q.channel_out(c),
+        title: title.as_deref().map(clean),
+        start: fmt_time(start),
+        warn_at: fmt_time(start - Reminder::SWITCH_WARN_S),
+    };
     Ok(SwitchPlan { reminder, out, log_ref })
 }
 
@@ -228,7 +259,7 @@ pub fn plan_switch(q: &Q, p: &ScheduleSwitch) -> Out<SwitchPlan> {
 pub fn check_cancel(q: &Q, p: &CancelSwitch) -> Out<ReminderId> {
     let id = ReminderId(p.id);
     match crate::store::user::reminder(q.conn, id)? {
-        Some(r) if r.switches() && r.state == ReminderState::Pending && !q.lib.conceals(&r.channel) => Ok(id),
+        Some(r) if r.switches() && r.state == ReminderState::Pending && !q.conceals(&r.channel) && q.channel_by_ref(&r.channel).is_some() => Ok(id),
         _ => Err(Fail::not_found("scheduled switch")),
     }
 }
@@ -240,8 +271,11 @@ pub fn scheduled(q: &Q) -> Out<Vec<SwitchOut>> {
         .into_iter()
         .filter(|r| r.start >= late)
         .filter_map(|r| {
+            if q.conceals(&r.channel) {
+                return None;
+            }
             let c = q.channel_by_ref(&r.channel)?;
-            let title = Some(r.programme_title.clone()).filter(|t| !t.trim().is_empty());
+            let title = Some(clean(&r.programme_title)).filter(|t| !t.trim().is_empty());
             Some(SwitchOut {
                 id: r.id.0,
                 channel: q.channel_out(c),
@@ -266,8 +300,15 @@ pub fn status(q: &Q, snap: &PlayerSnapshot) -> Out<StatusOut> {
     };
     let idle = state == PlayerStateOut::Idle;
     let now_playing = snap.playable.as_ref().filter(|_| !idle).and_then(|p| {
-        // concealed (explicit while hidden): say nothing about it
-        if p.item.as_ref().is_some_and(|i| q.lib.conceals(i)) {
+        // concealed (explicit while hidden): say nothing about it. The snapshot's explicit
+        // index has no episodes and the store is asked too (the session may have relocked by
+        // its timer while it played, with no frame to stop it); a stream of no known item
+        // (an archive with its channel gone) counts as concealed while explicit is hidden
+        let concealed = match &p.item {
+            Some(i) => q.conceals(i),
+            None => q.view.hides_explicit && p.kind != PlayableKind::Url,
+        };
+        if concealed {
             return None;
         }
         let kind = match p.kind {
@@ -280,12 +321,12 @@ pub fn status(q: &Q, snap: &PlayerSnapshot) -> Out<StatusOut> {
         let title = match p.kind {
             // a file or URL: its last path segment, never the address
             PlayableKind::Url => p.title.rsplit(['/', '\\']).next().unwrap_or_default().split(['?', '#']).next().unwrap_or_default().to_owned(),
-            _ => p.title.clone(),
+            _ => clean(&p.title),
         };
         Some(NowPlayingOut {
             item: p.item.as_ref().map(item_ref),
             title,
-            subtitle: p.subtitle.clone().filter(|s| !s.trim().is_empty()),
+            subtitle: p.subtitle.as_deref().map(clean).filter(|s| !s.trim().is_empty()),
             kind: kind.into(),
         })
     });

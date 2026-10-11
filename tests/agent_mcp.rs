@@ -376,6 +376,8 @@ fn an_old_tuner_is_reported() {
     let dir = tempfile::tempdir().unwrap();
     let sock = socket_in(&dir);
     std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+    // private, like every Tuner's runtime directory (the bridge refuses others)
+    std::fs::set_permissions(sock.parent().unwrap(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
     let listener = UnixListener::bind(&sock).unwrap();
     std::thread::spawn(move || {
         for stream in listener.incoming() {

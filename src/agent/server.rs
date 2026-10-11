@@ -186,10 +186,14 @@ impl Inner {
     /// (blocking: a copy of the indexes; call on the blocking pool).
     fn library(&self, view: ParentalView) -> Arc<Library> {
         let lib = self.shared.library();
+        let mut cached = self.concealed.lock().unwrap_or_else(|e| e.into_inner());
         if !(view.hides_explicit && lib.shows_explicit()) {
+            // a copy made for an older snapshot (or before an unlock) isn't needed any more
+            if cached.as_ref().is_some_and(|(generation, _)| *generation != lib.generation || !view.hides_explicit) {
+                drop(cached.take());
+            }
             return lib;
         }
-        let mut cached = self.concealed.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((generation, hidden)) = cached.as_ref()
             && *generation == lib.generation
         {
@@ -283,6 +287,7 @@ impl Inner {
     async fn schedule_switch(self: &Arc<Self>, p: super::proto::ScheduleSwitch) -> Out<serde_json::Value> {
         let plan = self.run(true, move |q| act::plan_switch(q, &p)).await?;
         let reminder = plan.reminder.clone();
+        let late = crate::model::now() - crate::platform::notify::LATE_SWITCH_S;
         let written = self
             .store
             .writer()
@@ -291,7 +296,8 @@ impl Inner {
                 if let Some(same) = pending.iter().find(|x| x.channel == reminder.channel && x.start == reminder.start) {
                     return Ok(Some(same.id));
                 }
-                if pending.len() >= act::MAX_SWITCHES {
+                // rows that will still fire (hidden ones count too; the message names no number)
+                if pending.iter().filter(|x| x.start >= late).count() >= act::MAX_SWITCHES {
                     return Ok(None);
                 }
                 // a notification reminder of the same programme becomes the switch
@@ -303,10 +309,7 @@ impl Inner {
             .await
             .map_err(Fail::from)?;
         let Some(id) = written else {
-            return Err(Fail::new(
-                ErrorCode::Unavailable,
-                format!("{} switches are already scheduled; cancel one first (status lists them)", act::MAX_SWITCHES),
-            ));
+            return Err(Fail::new(ErrorCode::Unavailable, "Too many switches are scheduled; cancel one first"));
         };
         self.shared.wake_reminders();
         tracing::info!("agent: schedule_switch {} → reminder {}", plan.log_ref, id.0);
@@ -340,10 +343,28 @@ impl Inner {
             return Err(Fail::bad("value is only for volume"));
         }
         if let Some(cmd) = cmd {
+            let was_paused = snap.paused;
+            // the change this asked for, as the player shows it
+            let done = |s: &crate::player::PlayerSnapshot| match c.action {
+                ControlAction::Pause => s.paused,
+                ControlAction::Resume => !s.paused,
+                ControlAction::TogglePause => s.paused != was_paused,
+                ControlAction::Stop => matches!(s.state, crate::player::PlayerState::Idle | crate::player::PlayerState::Ended),
+                ControlAction::Volume => c.value.is_some_and(|v| (s.volume - v).abs() < 0.5),
+                ControlAction::Mute => s.muted,
+                ControlAction::Unmute => !s.muted,
+            };
             let mut rx = self.player.subscribe();
             rx.borrow_and_update();
             self.player.send(cmd);
-            let _ = tokio::time::timeout(CONTROL_WAIT, rx.changed()).await;
+            let _ = tokio::time::timeout(CONTROL_WAIT, async {
+                while !done(&rx.borrow_and_update()) {
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await;
             tracing::info!("agent: control {:?}", c.action);
         }
         let snap = self.player.snapshot();

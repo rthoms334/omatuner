@@ -959,10 +959,16 @@ How it works and what it can't do:
 - Locked items are listed as locked. Playing one makes Tuner ask for your PIN **on its own
   screen**. The PIN never goes through Claude, and Claude will not ask you for it.
 - Claude gets names, times and programme details, never stream addresses or your logins.
+  Playlist names are shared too, and a playlist you didn't rename is named after its server:
+  rename it (Settings ▸ Playlists) if you'd rather Claude didn't see that. Web links inside
+  programme descriptions show as `[link]`.
+- Titles and descriptions come from your providers. Claude is told to treat them as data, not
+  as instructions.
 - Use `tuner mcp --profile-dir <dir>` (and `claude mcp add tuner -- tuner mcp --profile-dir
   <dir>`) to reach a Tuner started with that profile.
-- `tuner mcp` writes its own messages to stderr, which Claude Code keeps in its MCP server log. Add `--debug` (`tuner mcp --debug`) for more detail. What Tuner itself
-  did is in its normal log.
+- `tuner mcp` writes its own messages to stderr, which Claude Code keeps in its MCP server log.
+  Add `--debug` (`tuner mcp --debug`) for more detail. What Tuner itself did is in its normal
+  log.
 
 ## Files and profiles
 

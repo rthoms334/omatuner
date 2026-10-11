@@ -199,11 +199,24 @@ pub struct Q<'a> {
     groups: OnceCell<HashMap<GroupId, (String, bool)>>,
     progress: OnceCell<Progress>,
     runtimes: OnceCell<HashMap<MovieId, u32>>,
+    /// Playlists of channels the user keeps out of All (`in_all`).
+    out_of_all: OnceCell<Vec<SourceId>>,
 }
 
 impl<'a> Q<'a> {
     pub fn new(lib: &'a Library, conn: &'a Connection, view: ParentalView, now: Timestamp, cfg: &'a Config) -> Self {
-        Self { lib, conn, view, now, cfg, favs: OnceCell::new(), groups: OnceCell::new(), progress: OnceCell::new(), runtimes: OnceCell::new() }
+        Self {
+            lib,
+            conn,
+            view,
+            now,
+            cfg,
+            favs: OnceCell::new(),
+            groups: OnceCell::new(),
+            progress: OnceCell::new(),
+            runtimes: OnceCell::new(),
+            out_of_all: OnceCell::new(),
+        }
     }
 
     /// The favourites now (the snapshot's may be older than a toggle).
@@ -255,7 +268,14 @@ impl<'a> Q<'a> {
 
     /// The first visible group's name of an item.
     fn group_name(&self, ids: &[GroupId]) -> Option<String> {
-        ids.iter().filter_map(|g| self.groups().get(g)).find(|(_, hidden)| !hidden).map(|(n, _)| n.clone())
+        ids.iter().filter_map(|g| self.groups().get(g)).find(|(_, hidden)| !hidden).map(|(n, _)| clean(n))
+    }
+
+    /// Hidden by parental control now: in the snapshot's explicit index, or (episodes, items
+    /// newer than the snapshot) explicit in the store while explicit content is hidden. An item
+    /// that can't be read counts as hidden then.
+    pub fn conceals(&self, item: &ItemRef) -> bool {
+        self.lib.conceals(item) || (self.view.hides_explicit && crate::store::live::item_explicit(self.conn, item).unwrap_or(true))
     }
 
     /// Needs the PIN now.
@@ -264,7 +284,7 @@ impl<'a> Q<'a> {
     }
 
     fn source_name(&self, s: SourceId) -> String {
-        self.lib.source(s).map(|m| m.name.clone()).unwrap_or_default()
+        self.lib.source(s).map(|m| clean(&m.name)).unwrap_or_default()
     }
 
     // ---------------------------------------------------------------- channels
@@ -283,7 +303,7 @@ impl<'a> Q<'a> {
         let r = channel_ref(c);
         ChannelOut {
             item: item_ref(&r),
-            name: c.name.to_string(),
+            name: clean(&c.name),
             number: c.number,
             playlist: self.source_name(c.source_id),
             group: self.group_name(&c.group_ids),
@@ -295,7 +315,7 @@ impl<'a> Q<'a> {
     }
 
     fn channel_item(&self, c: &ChannelSummary) -> ItemOut {
-        let now = self.now_on(c, self.now).ok().flatten().map(|p| p.title.to_string());
+        let now = self.now_on(c, self.now).ok().flatten().map(|p| clean(&p.title));
         ItemOut::Channel(ChannelItemOut { kind: Kind::Channel, channel: self.channel_out(c), now })
     }
 
@@ -345,11 +365,16 @@ impl<'a> Q<'a> {
         }
     }
 
-    /// Preference among channels showing the same programme: favourite, playable without the
-    /// PIN, best quality, display order.
-    fn channel_rank(&self, c: &ChannelSummary) -> (bool, bool, i8, ChannelId) {
+    /// `c` is in a playlist the user keeps out of All.
+    fn out_of_all(&self, c: &ChannelSummary) -> bool {
+        self.out_of_all.get_or_init(|| crate::store::library::out_of_all_of(&self.lib.eligible(ItemKind::Channel))).contains(&c.source_id)
+    }
+
+    /// Preference among channels showing the same programme: in All, favourite, playable
+    /// without the PIN, best quality, display order.
+    fn channel_rank(&self, c: &ChannelSummary) -> (bool, bool, bool, i8, ChannelId) {
         let q = c.quality.map_or(-10, |q| 2 * q.class as i8 - i8::from(q.doubtful));
-        (!self.favs().is_fav(&channel_ref(c)), self.needs_pin(c.locked), -q, c.id)
+        (self.out_of_all(c), !self.favs().is_fav(&channel_ref(c)), self.needs_pin(c.locked), -q, c.id)
     }
 
     // ---------------------------------------------------------------- movies / series
@@ -384,7 +409,7 @@ impl<'a> Q<'a> {
         TitleOut {
             item: item_ref(&crate::store::copies::vod_ref(v)),
             kind: if movies { Kind::Movie } else { Kind::Series },
-            name: v.name.to_string(),
+            name: clean(&v.name),
             year: v.year,
             rating: v.rating.filter(|r| *r > 0.0),
             runtime_min,
@@ -480,8 +505,9 @@ pub fn parse_ref(s: &str) -> Out<AgentRef> {
 
 // ------------------------------------------------------------------ guide_search
 
-/// FTS hits read before time filtering and merging.
-const GUIDE_FETCH: usize = 200;
+/// FTS hits read before visibility / time filtering and merging (`truncated` when reached: hidden
+/// channels' matches may have taken the room).
+const GUIDE_FETCH: usize = 500;
 /// Other channels listed with a programme.
 const MAX_ALSO_ON: usize = 10;
 
@@ -522,7 +548,7 @@ pub fn guide_search(q: &Q, p: &GuideSearch) -> Out<GuideSearchOut> {
         Airing::Upcoming => (1, prog.start),
         Airing::Past => (2, -prog.start),
     });
-    let truncated = rows.len() > limit;
+    let truncated = rows.len() > limit || hits.len() >= GUIDE_FETCH;
     let programmes = rows
         .into_iter()
         .take(limit)
@@ -613,7 +639,10 @@ pub fn search(q: &Q, p: &Search) -> Out<SearchOut> {
     if kinds.contains(&Kind::Channel) {
         for (i, c) in q.lib.live.channels.iter().enumerate().filter(|(_, c)| !q.lib.live.hidden.contains(&c.id)) {
             if let Some(s) = score(&c.name) {
-                hits.push((s, 0, i, Cand::Channel(c.id)));
+                // a playlist kept out of All: after every other match of the same score (the same
+                // channel in an All playlist first)
+                let order = if q.out_of_all(c) { 3 } else { 0 };
+                hits.push((s, order, i, Cand::Channel(c.id)));
             }
         }
     }
@@ -676,7 +705,7 @@ pub fn categories(q: &Q, p: &Categories) -> Out<CategoriesOut> {
                 _ => q.lib.vod.group_items(g.id, crate::model::SortMode::Provider).len(),
             };
             (count > 0).then(|| CategoryOut {
-                name: g.display_name().to_owned(),
+                name: clean(g.display_name()),
                 playlist: q.source_name(g.source_id),
                 count: count as u32,
                 locked: q.needs_pin(g.locked),
@@ -879,7 +908,7 @@ pub fn favourites(q: &Q, p: &Favourites) -> Out<FavouritesOut> {
             }
         }
         if !items.is_empty() {
-            out.push(FavListOut { name: l.name.clone(), items });
+            out.push(FavListOut { name: clean(&l.name), items });
         }
     }
     Ok(FavouritesOut { lists: out })
@@ -900,7 +929,7 @@ pub fn details(q: &Q, p: &Details) -> Out<(DetailsOut, Option<JobKind>)> {
             let mut out = DetailsOut {
                 item: p.item.trim().to_owned(),
                 kind: "programme".into(),
-                name: prog.title.to_string(),
+                name: clean(&prog.title),
                 locked: q.needs_pin(c.locked),
                 ..Default::default()
             };
@@ -921,7 +950,7 @@ pub fn details(q: &Q, p: &Details) -> Out<(DetailsOut, Option<JobKind>)> {
                 let mut out = DetailsOut {
                     item: item_ref(&r),
                     kind: "channel".into(),
-                    name: c.name.to_string(),
+                    name: clean(&c.name),
                     locked: q.needs_pin(c.locked),
                     ..Default::default()
                 };
@@ -945,7 +974,7 @@ pub fn details(q: &Q, p: &Details) -> Out<(DetailsOut, Option<JobKind>)> {
                 let v = &q.lib.vod.movies[idx as usize];
                 let title = q.title_out(true, idx);
                 let mut out =
-                    DetailsOut { item: item_ref(&r), kind: "movie".into(), name: v.name.to_string(), locked: title.locked, ..Default::default() };
+                    DetailsOut { item: item_ref(&r), kind: "movie".into(), name: clean(&v.name), locked: title.locked, ..Default::default() };
                 if out.locked {
                     return Ok((out, None));
                 }
@@ -969,7 +998,7 @@ pub fn details(q: &Q, p: &Details) -> Out<(DetailsOut, Option<JobKind>)> {
                 let v = &q.lib.vod.series[idx as usize];
                 let title = q.title_out(false, idx);
                 let mut out =
-                    DetailsOut { item: item_ref(&r), kind: "series".into(), name: v.name.to_string(), locked: title.locked, ..Default::default() };
+                    DetailsOut { item: item_ref(&r), kind: "series".into(), name: clean(&v.name), locked: title.locked, ..Default::default() };
                 if out.locked {
                     return Ok((out, None));
                 }
@@ -994,7 +1023,7 @@ pub fn details(q: &Q, p: &Details) -> Out<(DetailsOut, Option<JobKind>)> {
                 let (ep, idx) = q.episode(&r)?.ok_or_else(|| Fail::not_found("episode"))?;
                 let series = &q.lib.vod.series[idx as usize];
                 let locked = q.needs_pin(q.title_locked(false, idx));
-                let name = format!("{} — S{:02}E{:02} · {}", series.name, ep.season, ep.episode, ep.title);
+                let name = clean(&format!("{} — S{:02}E{:02} · {}", series.name, ep.season, ep.episode, ep.title));
                 let mut out = DetailsOut { item: item_ref(&r), kind: "episode".into(), name, locked, ..Default::default() };
                 if locked {
                     return Ok((out, None));

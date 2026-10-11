@@ -13,6 +13,7 @@
 //! A running Tuner from before v2 answers with a v1 error line (no `"v"`): "restart Tuner".
 
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -83,6 +84,9 @@ impl Launcher for ExeLauncher {
         // own process group: Claude ending the bridge (or the terminal hanging up its
         // foreground group) doesn't take Tuner with it; stdio never touches the MCP stream
         cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).process_group(0);
+        // the bridge's `RUST_LOG` is for its stderr, not tuner.log; Claude's working directory
+        // isn't Tuner's
+        cmd.env_remove("RUST_LOG").current_dir("/");
         let mut child = cmd.spawn()?;
         tracing::info!("mcp: started Tuner (pid {})", child.id());
         *self.exit.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -238,6 +242,9 @@ impl Client {
 
     /// One connection: send `line`, read the reply line.
     fn attempt(&self, id: u64, line: &str) -> Result<Attempt, ClientError> {
+        if !socket_is_ours(&self.socket)? {
+            return Ok(Attempt::NotListening);
+        }
         let stream = match UnixStream::connect(&self.socket) {
             Ok(s) => s,
             Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) => return Ok(Attempt::NotListening),
@@ -272,9 +279,49 @@ impl Client {
     }
 }
 
+/// The socket belongs to this user, in a directory only this user can enter (Tuner's own
+/// runtime directory, mode 0700). Without `XDG_RUNTIME_DIR` the path is under the shared temp
+/// directory, where another user could create it first and answer as "Tuner" (feeding made-up
+/// results to the model). `false`: no socket (nothing listens).
+fn socket_is_ours(socket: &Path) -> Result<bool, ClientError> {
+    let not_ours = |what: &str| Err(ClientError::Failed(format!("the Tuner socket's {what} isn't yours alone; not connecting")));
+    let me = std::fs::metadata("/proc/self").map_err(|e| ClientError::Failed(format!("can't tell who I am: {e}")))?.uid();
+    let meta = match std::fs::symlink_metadata(socket) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(ClientError::Failed(e.to_string())),
+    };
+    if meta.uid() != me {
+        return not_ours("owner");
+    }
+    let dir = socket.parent().unwrap_or(Path::new("/"));
+    match std::fs::metadata(dir) {
+        Ok(d) if d.uid() == me && d.permissions().mode() & 0o077 == 0 => Ok(true),
+        Ok(_) => not_ours("directory"),
+        Err(e) => Err(ClientError::Failed(e.to_string())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A socket in a directory others can enter is refused (another user may have made it);
+    /// the same socket in a private directory is used.
+    #[test]
+    fn a_socket_in_a_shared_directory_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("tuner.sock");
+        assert_eq!(socket_is_ours(&sock), Ok(false), "no socket: not listening");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(socket_is_ours(&sock), Ok(true));
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        match Client::new(&sock, Box::new(ExeLauncher::new("/bin/false".into(), None))).call(Call::Status(Default::default()), true) {
+            Err(ClientError::Failed(why)) => assert!(why.contains("isn't yours"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+    }
 
     #[test]
     fn client_errors_have_codes_and_plain_messages() {

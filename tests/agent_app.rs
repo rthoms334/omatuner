@@ -683,3 +683,182 @@ fn requests_are_rate_limited() {
     assert_eq!(w.ok("play", json!({"ref": "channel:1:m3u:itv4"}))["outcome"], "playing");
     assert_eq!(w.err("play", json!({"ref": "channel:1:m3u:itv4"})), ErrorCode::RateLimited, "actions have a tighter budget");
 }
+
+/// `status` while explicit content is hidden names nothing explicit that still plays — an
+/// explicit channel, movie or an episode of an explicit series (the snapshot's explicit index
+/// has no episodes) — also when the snapshot was built unlocked and the session relocked by
+/// its timer with no frame since; a normal episode is named.
+#[test]
+fn status_names_nothing_explicit_that_still_plays() {
+    use tuner::agent::query::Q;
+    use tuner::agent::shared::ParentalView;
+    use tuner::model::{Playable, PlayableKind};
+    use tuner::player::{PlayerSnapshot, PlayerState};
+    let w = World::new(pin_config());
+    w.ui.services()
+        .store
+        .writer()
+        .blocking(|c| {
+            c.execute("INSERT INTO grp(source_id, kind, key, name, raw_name, provider_order, item_count, seen_gen, explicit) VALUES (1, 'series', 'series:adult shows', 'Adult Shows', 'Adult Shows', 0, 1, 1, 1)", [])?;
+            let g = c.last_insert_rowid();
+            c.execute(
+                "INSERT INTO series(source_id, key, name, clean_name, norm_name, provider_order, added_at, details_at, seen_gen) VALUES (1, 'm3u:adultshow', 'Adult Show', 'Adult Show', 'adult show', 1, 1, 1, 1)",
+                [],
+            )?;
+            let s = c.last_insert_rowid();
+            c.execute("INSERT INTO series_group(group_id, series_id, position) VALUES (?1, ?2, 0)", params![g, s])?;
+            c.execute(
+                "INSERT INTO episode(series_id, source_id, key, season, episode, title, duration_s, stream) VALUES (?1, 1, 'm3u:adultshow-1-1', 1, 1, 'Night One', 2700, '{\"t\":\"url\",\"url\":\"http://127.0.0.1/a.mp4\"}')",
+                [s],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let conn = w.ui.services().store.reader().unwrap();
+    let unlocked_build = tuner::store::library::load_with(&conn, &LoadOptions { visibility: Visibility::ALL, ..Default::default() }).unwrap();
+    assert!(unlocked_build.shows_explicit());
+    let cfg = pin_config();
+    let item = |kind, key: &str| ItemRef { source: SourceId(1), kind, key: ItemKey(key.into()) };
+    let playing = |kind: PlayableKind, item: ItemRef, title: &str, subtitle: Option<&str>| PlayerSnapshot {
+        state: PlayerState::Playing,
+        playable: Some(Arc::new(Playable {
+            media: MediaRef::Channel(tuner::model::ChannelId(1)),
+            kind,
+            item: Some(item),
+            source_id: Some(SourceId(1)),
+            title: title.into(),
+            subtitle: subtitle.map(str::to_owned),
+            logo: None,
+            number: None,
+            url: tuner::redact::Secret::new("http://127.0.0.1/x".into()),
+            headers: Default::default(),
+            start_at: None,
+            duration_hint: None,
+        })),
+        ..Default::default()
+    };
+    let episode = || PlayableKind::Episode { season: 1, episode: 1 };
+    let cases = [
+        (playing(PlayableKind::Live, item(ItemKind::Channel, "m3u:late"), "Late Night", None), "Late Night"),
+        (playing(PlayableKind::Movie, item(ItemKind::Movie, "m3u:adult"), "Adult Film", None), "Adult Film"),
+        (playing(episode(), item(ItemKind::Episode, "m3u:adultshow-1-1"), "Adult Show", Some("S01E01 · Night One")), "Night One"),
+    ];
+    // relocked (hiding) with the unlocked build still published, and a hiding build
+    let hiding = ParentalView { unlocked: false, hides_explicit: true, pin_active: true };
+    let hidden_build = unlocked_build.hiding_explicit();
+    for lib in [&unlocked_build, &hidden_build] {
+        for (snap, name) in &cases {
+            let q = Q::new(lib, &conn, hiding, w.now, &cfg);
+            let st = serde_json::to_value(tuner::agent::act::status(&q, snap).unwrap()).unwrap();
+            assert!(st["now_playing"].is_null(), "{name}: {st}");
+            assert!(!mentions(&st, name) && !mentions(&st, "Adult"), "{st}");
+        }
+    }
+    // unlocked: named; a normal episode is named while locked too
+    let open = ParentalView { unlocked: true, hides_explicit: false, pin_active: true };
+    let q = Q::new(&unlocked_build, &conn, open, w.now, &cfg);
+    let st = serde_json::to_value(tuner::agent::act::status(&q, &cases[2].0).unwrap()).unwrap();
+    assert_eq!(st["now_playing"]["title"], "Adult Show");
+    let q = Q::new(&hidden_build, &conn, hiding, w.now, &cfg);
+    let show = playing(episode(), item(ItemKind::Episode, "m3u:show-1-2"), "The Show", Some("S01E02 · Episode 2"));
+    let st = serde_json::to_value(tuner::agent::act::status(&q, &show).unwrap()).unwrap();
+    assert_eq!(st["now_playing"]["title"], "The Show");
+}
+
+/// A switch to an explicit channel scheduled while unlocked vanishes from `status` after the
+/// relock (no frame needed), can't be cancelled by ref-guessing, and the switch limit's
+/// message names no count; `at` too far ahead is refused, a passed `HH:MM` means tomorrow.
+#[test]
+fn explicit_switches_vanish_on_relock_and_at_is_bounded() {
+    let mut w = World::new(pin_config());
+    w.unlock(Some(Instant::now()));
+    w.publish(Visibility::ALL);
+    let s = w.ok("schedule_switch", json!({"ref": "channel:1:m3u:late", "at": (w.now + 600).to_string()}));
+    let id = s["id"].as_i64().unwrap();
+    assert_eq!(w.ok("status", json!({}))["scheduled"].as_array().unwrap().len(), 1);
+    w.unlock(Instant::now().checked_sub(Duration::from_secs(120)));
+    let st = w.ok("status", json!({}));
+    assert!(st["scheduled"].as_array().is_none_or(Vec::is_empty) && !mentions(&st, "Late Night"), "{st}");
+    assert_eq!(w.err("cancel_switch", json!({"id": id})), ErrorCode::NotFound);
+    // fill up to the limit with visible switches: the refusal names no number
+    for i in 1..20 {
+        w.ok("schedule_switch", json!({"ref": "channel:1:m3u:bbc1", "at": (w.now + 3600 + i * 60).to_string()}));
+    }
+    let r = w.reply("schedule_switch", json!({"ref": "channel:1:m3u:bbc1", "at": (w.now + 9000).to_string()}));
+    let e = r.error.unwrap_or_else(|| panic!("over the limit: {:?}", r.result));
+    assert_eq!(e.code, ErrorCode::Unavailable);
+    assert!(!e.message.chars().any(|c| c.is_ascii_digit()), "{}", e.message);
+    // bounds of at (a fresh world: below the limit)
+    let mut w = World::new(pin_config());
+    w.publish(Visibility::NO_EXPLICIT);
+    assert_eq!(w.err("schedule_switch", json!({"ref": "channel:1:m3u:bbc1", "at": (w.now + 15 * 86_400).to_string()})), ErrorCode::BadRequest);
+    assert_eq!(w.err("schedule_switch", json!({"ref": "channel:1:m3u:bbc1", "at": i64::MAX.to_string()})), ErrorCode::BadRequest);
+    // a clock time that has passed today: tomorrow
+    let past = jiff::Timestamp::from_second(w.now - 120).unwrap().to_zoned(jiff::tz::TimeZone::system()).strftime("%H:%M").to_string();
+    let s = w.ok("schedule_switch", json!({"ref": "channel:1:m3u:bbc1", "at": past}));
+    let start = s["start"].as_str().unwrap();
+    assert!(start > tuner::agent::proto::fmt_time(w.now + 82_000).as_str(), "{start}");
+}
+
+/// A provider name holding a web address shows `[link]`; it never turns the answer into
+/// `internal`.
+#[test]
+fn names_with_links_are_cleaned_not_fatal() {
+    let mut w = World::new(pin_config());
+    w.ui.services()
+        .store
+        .writer()
+        .blocking(|c| {
+            let news = c.query_row("SELECT id FROM grp WHERE key = 'channel:news'", [], |r| r.get::<_, i64>(0))?;
+            c.execute(
+                "INSERT INTO channel(source_id, key, name, clean_name, norm_name, number, stream, url_key, provider_order, seen_gen)
+                 VALUES (1, 'm3u:promo', 'Promo https://x.y/z', 'Promo https://x.y/z', 'promo', 50, '{\"t\":\"url\",\"url\":\"http://127.0.0.1/p.ts\"}', 'http://127.0.0.1/p.ts', 50, 1)",
+                [],
+            )?;
+            c.execute("INSERT INTO channel_group(group_id, channel_id, position, is_primary) VALUES (?1, ?2, 9, 1)", params![news, c.last_insert_rowid()])?;
+            c.execute(
+                "INSERT INTO movie(source_id, key, name, clean_name, norm_name, stream, provider_order, seen_gen) VALUES (1, 'm3u:linkfilm', 'See http://a.b/c now', 'See http://a.b/c now', 'see now', '{\"t\":\"url\",\"url\":\"http://127.0.0.1/f.mp4\"}', 99, 1)",
+                [],
+            )?;
+            let comedy = c.query_row("SELECT id FROM grp WHERE key = 'movie:comedy'", [], |r| r.get::<_, i64>(0))?;
+            c.execute("INSERT INTO movie_group(group_id, movie_id, position) VALUES (?1, ?2, 9)", params![comedy, c.last_insert_rowid()])?;
+            Ok(())
+        })
+        .unwrap();
+    w.publish(Visibility::NO_EXPLICIT);
+    let r = w.ok("search", json!({"query": "promo"}));
+    assert_eq!(r["results"][0]["name"], "Promo [link]", "{r}");
+    let r = w.ok("browse", json!({"kind": "movie", "group": "comedy", "limit": 50}));
+    assert!(names(&r, "items", "name").contains(&"See [link] now".to_owned()), "{r}");
+    w.ok("browse", json!({"kind": "channel", "group": "news"}));
+    w.ok("whats_on", json!({}));
+    assert_eq!(w.ok("play", json!({"ref": "channel:1:m3u:promo"}))["title"], "Promo [link]");
+}
+
+/// The same programme on a better channel of a playlist kept out of All: the All playlist's
+/// channel is the one picked (and played), the other is only in `also_on`; `search` lists the
+/// All playlist's channel first too.
+#[test]
+fn guide_search_and_search_prefer_playlists_in_all() {
+    let mut w = World::new(pin_config());
+    w.ui.services()
+        .store
+        .writer()
+        .blocking(|c| {
+            c.execute("UPDATE channel SET quality = 3 WHERE key = 'm3u:extra'", [])?;
+            c.execute(
+                "UPDATE channel SET quality = 0, name = 'Extra News', clean_name = 'Extra News', norm_name = 'extra news' WHERE key = 'm3u:bbc1'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    w.publish(Visibility::NO_EXPLICIT);
+    let r = w.ok("guide_search", json!({"query": "news at six"}));
+    let first = &r["programmes"][0];
+    assert_eq!(first["channel"]["ref"], "channel:1:m3u:bbc1", "{first}");
+    assert!(first["also_on"].as_array().unwrap().iter().any(|c| c["ref"] == "channel:3:m3u:extra"), "{first}");
+    let r = w.ok("search", json!({"query": "extra news", "kinds": ["channel"]}));
+    let refs: Vec<&str> = r["results"].as_array().unwrap().iter().map(|x| x["ref"].as_str().unwrap()).collect();
+    assert_eq!(refs[..2], ["channel:1:m3u:bbc1", "channel:3:m3u:extra"], "{r}");
+}

@@ -1111,6 +1111,12 @@ once (`claude mcp list` shows `tuner` connected).
   **Expect:** an answer without Tuner coming forward; "play it" brings it forward.
 - [ ] **Outlives Claude:** with Tuner started by Claude (first check), quit Claude Code (and
   close its terminal). **Expect:** Tuner keeps running and playing.
+- [ ] **Relock while away:** set a PIN with a 1-minute relock, unlock, ask Claude to switch to an
+  explicit channel in 3 minutes, then move Tuner to another workspace and wait. **Expect:** no
+  toast or switch for it after the relock; "what's playing?" and the scheduled list don't name
+  it.
+- [ ] **Flags first:** `claude mcp add tuner-debug -- tuner --debug mcp`, then ask "what's
+  playing?". **Expect:** an answer (not a Tuner window opening); remove it afterwards.
 - [ ] **Old instance:** with a Tuner from before this feature running (or simulate: keep an old
   build open), ask Claude anything. **Expect:** Claude says to restart Tuner; after a restart it
   works.

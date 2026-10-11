@@ -38,12 +38,27 @@ pub fn main(paths: &crate::paths::AppPaths, profile_dir: Option<&std::path::Path
     init_stderr_logging(debug);
     // the launched Tuner gets the same profile; make it absolute in case its cwd differs
     let profile_dir = profile_dir.map(std::path::absolute).transpose()?;
-    let launcher = ExeLauncher::current(profile_dir)?;
-    let client = Client::new(&paths.ipc_socket(), Box::new(launcher));
+    // `TUNER_MCP_NO_LAUNCH=1`: never start Tuner (tests driving the real binary against a
+    // headless instance must never open a window if that instance went away)
+    let launcher: Box<dyn super::client::Launcher> = if std::env::var_os("TUNER_MCP_NO_LAUNCH").is_some_and(|v| v == "1") {
+        Box::new(NoLaunch)
+    } else {
+        Box::new(ExeLauncher::current(profile_dir)?)
+    };
+    let client = Client::new(&paths.ipc_socket(), launcher);
     tracing::debug!("mcp: serving on stdio, socket {}", paths.ipc_socket().display());
     serve(std::io::stdin().lock(), std::io::stdout().lock(), &client)?;
     tracing::debug!("mcp: stdin closed");
     Ok(())
+}
+
+/// The launcher of `TUNER_MCP_NO_LAUNCH=1`.
+struct NoLaunch;
+
+impl super::client::Launcher for NoLaunch {
+    fn launch(&self) -> std::io::Result<()> {
+        Err(std::io::Error::other("starting Tuner is turned off (TUNER_MCP_NO_LAUNCH)"))
+    }
 }
 
 /// stderr only (no ANSI, no `tuner.log`); `RUST_LOG` overrides.

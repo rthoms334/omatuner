@@ -54,7 +54,7 @@ fn main() -> anyhow::Result<()> {
     };
     // the MCP bridge (DESIGN §30): stdout is its protocol channel, it logs to stderr only, never
     // takes the instance lock and never opens the database
-    if cli.command == Some(tuner::cli::Command::Mcp) {
+    if cli.is_mcp() {
         return tuner::agent::mcp::main(&paths, cli.profile_dir.as_deref(), cli.debug);
     }
     let (config, config_err) = match Config::load(&paths.config_file()) {

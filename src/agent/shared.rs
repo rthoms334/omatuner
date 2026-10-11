@@ -44,6 +44,10 @@ impl AgentShared {
     /// UI thread), `None` when `lib` is already the published one.
     #[must_use = "drop the old snapshot through `TunerApp::release`"]
     pub fn publish_library(&self, lib: &Arc<Library>) -> Option<Arc<Library>> {
+        // every frame: the usual "unchanged" answer takes only the read lock
+        if Arc::ptr_eq(&self.lib.read().unwrap_or_else(|e| e.into_inner()), lib) {
+            return None;
+        }
         let mut cur = self.lib.write().unwrap_or_else(|e| e.into_inner());
         if Arc::ptr_eq(&cur, lib) {
             return None;

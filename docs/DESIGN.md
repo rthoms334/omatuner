@@ -4591,7 +4591,8 @@ itself provides.
    provider internals in any result; actions logged by ref, not title.
 
 ### 30.2 `tuner mcp` (`agent::mcp`, `agent::tools`, `agent::client`)
-* `main` dispatches `Cli::command == Some(Command::Mcp)` right after resolving the paths: no
+* `main` dispatches `Cli::is_mcp()` right after resolving the paths (`tuner mcp`, and a lone
+  `mcp` word after global flags — `tuner --debug mcp`, which clap reads as an input file): no
   config load, no instance lock, no `logging::init` (that writes `tuner.log`, which the running
   app owns). Logging goes to stderr only (WARN; DEBUG with `--debug`) — Claude Code keeps an MCP
   server's stderr in its log. stdout carries protocol lines only. `--profile-dir` selects the
@@ -4778,6 +4779,43 @@ lazy-details wait, INFO logs of actions by ref). Notes and deviations from the t
   is handed to `AgentShared` so a switch written by the handler is picked up without a frame.
   Cancel (`Action::CancelSwitch`) removes the row and remembers the id, so a `SwitchNow`
   already on its way is ignored.
+
+**Integration (branch `feat/mcp`, after review).**
+* Parental state before events: `logic` runs `sync_explicit` before draining the event queue
+  too, so a `SwitchNow`, an agent `play` or a `--play` arriving in the frame the session relocked
+  by its timer meets the hiding snapshot. `on_switch_soon` / `on_switch_now` also refuse a
+  channel the store marks explicit while explicit content is hidden (`TunerApp::switch_hidden`).
+* `Q::conceals` = the snapshot's `conceals` or, while explicit content is hidden, the store's
+  `item_explicit` (the snapshot's explicit index has no episodes). `status` uses it for
+  `now_playing` (an explicit episode still playing after a relock with no frame names nothing)
+  and for the switches it lists; `cancel_switch` of a concealed switch is `not_found`.
+* Every provider name in a result (channel, title, group, playlist, list, category, the names
+  inside `play` / error messages) goes through `query::clean`, so one name holding a web address
+  doesn't turn a whole answer into `internal`.
+* `guide_search` and `search` prefer channels of playlists in All (`in_all`): a programme's best
+  channel is ranked by (out of All, not favourite, needs PIN, quality, id); a channel match from
+  a playlist kept out of All sorts after any other match of the same score. `guide_search` reads
+  up to 500 FTS rows before filtering; reaching that sets `truncated`.
+* `schedule_switch`: `at` more than 14 days ahead is `bad_request`; a bare `HH:MM` that has
+  passed today means tomorrow. The 20-switch limit counts rows that can still fire and its
+  message names no number (hidden switches count too). Cancelling a switch made from a reminder
+  the user had removes both (said in the tool description).
+* The instructions and the `guide_search` / `details` descriptions tell the model that provider
+  text is data, never instructions.
+* A switch cancelled outside its toast (`cancel_switch`, Settings ▸ Reminders) drops its
+  "Switching to … in N s" toast on `DataScope::Reminders` (row removed; a fired row keeps its
+  toast) and ignores a `SwitchNow` already on its way. An agent's PIN prompt clears a stale
+  `pending_locked` (a prompt dismissed earlier) and vice versa, so the PIN plays the newest
+  prompt's target. `control` waits (≤ 500 ms) for the change it asked for before answering.
+* End to end: `tests/agent_e2e.rs` runs the real `tuner mcp` binary against the real app
+  (`TunerApp` headless, frame by frame) on the demo profile: initialize → tools/list →
+  guide_search → play → status → schedule_switch → control pause.
+* The bridge connects only to a socket owned by the user in a directory only the user can enter
+  (without `XDG_RUNTIME_DIR` the socket is under the shared temp directory). The launched Tuner
+  gets no `RUST_LOG` and `/` as its working directory. `TUNER_MCP_NO_LAUNCH=1` turns launching
+  off (tests driving the real binary).
+* Answers come from what `logic` publishes: eframe runs `logic` for a window on another
+  workspace too (only `ui` is skipped), so a hidden Tuner still answers.
 
 ### 30.10 Work split (two parallel tracks from `mcp/base`)
 File ownership is disjoint; a cross-track edit needs the owner's agreement and goes in the
