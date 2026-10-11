@@ -87,6 +87,21 @@ async fn server(scripts: HashMap<&'static str, Script>) -> Server {
     Server { base, hits, gate }
 }
 
+impl Server {
+    /// Wait until `n` connections have reached the server. A job turns `Connecting` before it
+    /// has read its source row and sent the request; a job cancelled before that never connects,
+    /// so tests that count connections wait for them before cancelling.
+    async fn wait_hits(&self, n: usize) {
+        for _ in 0..2000 {
+            if self.hits.load(Ordering::SeqCst) >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("{} of {n} connections reached the server", self.hits.load(Ordering::SeqCst));
+    }
+}
+
 /// A playlist of `n` channels, padded past 300 KiB so the gate falls mid-download.
 fn playlist(n: usize, prefix: &str) -> Vec<u8> {
     let mut s = String::from("#EXTM3U\n");
@@ -206,6 +221,7 @@ async fn coalesces_while_queued_or_connecting_and_upgrades_force() {
     let jb = h.jobs.submit(refresh(b, false));
     h.wait_phase(ja, |p| *p == JobPhase::Connecting).await;
     h.wait_phase(jb, |p| *p == JobPhase::Connecting).await;
+    srv.wait_hits(2).await;
     // both playlist permits are taken: C waits
     let jc = h.jobs.submit(refresh(c, false));
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -225,6 +241,7 @@ async fn coalesces_while_queued_or_connecting_and_upgrades_force() {
     assert_eq!((id, outcome.unwrap_err()), (ja, "cancelled".to_owned()));
     h.wait_phase(jc, |p| *p == JobPhase::Connecting).await;
     assert_eq!(h.status(jc).unwrap().kind, refresh(c, true));
+    srv.wait_hits(3).await;
 
     // a cancelled QUEUED job finishes without ever starting
     let d = h.add_url_source("D", &url).await;
@@ -400,6 +417,7 @@ async fn a_request_after_a_cancel_runs_once_the_cancelled_job_is_gone() {
     let a = h.add_url_source("A", &format!("{}/hang.m3u", srv.base)).await;
     let first = h.jobs.submit(refresh(a, false));
     h.wait_phase(first, |p| *p == JobPhase::Connecting).await;
+    srv.wait_hits(1).await;
     h.jobs.cancel(first);
     // "Refresh" clicked again right away, while the cancelled run still winds down
     h.jobs.submit(refresh(a, true));
