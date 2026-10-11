@@ -3,7 +3,8 @@
 //! Start order (DESIGN §5.1): paths → config → logging → tokio runtime → store (migrate,
 //! register secrets) → HTTP client → job manager → player (mpv + threads) → [window] →
 //! video surface → integrations (theme watcher, IPC server, MPRIS, reminders, scheduler,
-//! connection limits).
+//! connection limits). The memory maintenance thread (`platform::memory`) starts with the
+//! player and follows its snapshots.
 //! Shutdown order: video surface destroy (GL, done by the app) → integrations → jobs.shutdown
 //! (cancel all, refuse new ones) → player shutdown (mpv; final progress save) → wait ≤ 5 s for
 //! the cancelled jobs' wind-down → runtime (shutdown_timeout 2 s) → store writer drains + joins.
@@ -58,6 +59,9 @@ pub struct Services {
     pub integrations: Integrations,
     /// Combined actions on a title's copies that a toast can still undo (DESIGN §29.15).
     pub undo: crate::store::copies::UndoStash,
+    /// Drops big snapshots off the UI thread and gives freed heap back to the OS
+    /// (`platform::memory`); follows the player's snapshots.
+    pub memory: crate::platform::memory::Maintenance,
     /// Set when [`Services::shutdown`] begins (the signal watcher leaves the exit to it; a
     /// signal after that means it is stuck).
     closing: Arc<AtomicBool>,
@@ -98,6 +102,8 @@ impl Services {
             };
             Player::start(&cfg, deps)?
         };
+        let mut memory = crate::platform::memory::Maintenance::start();
+        memory.watch_player(rt.handle(), player.handle().subscribe());
         Ok(Self {
             paths,
             config,
@@ -110,6 +116,7 @@ impl Services {
             logs,
             integrations: Integrations::default(),
             undo: Default::default(),
+            memory,
             closing: Arc::default(),
             socket: Arc::default(),
         })

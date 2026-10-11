@@ -673,6 +673,17 @@ These items use the **default** profile: start Tuner from the launcher, not with
     from CPU or lock contention (stream info). With `GLIBC_TUNABLES=glibc.malloc.arena_max=8`
     the user's limit is kept.
 
+- [ ] **Memory upkeep (big library):**
+  - **Do:** with a large Xtream library (100k+ titles) and debug logging on, play a 4K channel,
+    open and close search, refresh the playlist twice, hide the window for a minute, then stop.
+    Record `RssAnon` and `VmSwap` from `/proc/$(pgrep -x tuner)/status` before and after.
+  - **Expect:**
+    - No frame hitch when a refresh lands (the old library is freed on the "tuner-mem" thread).
+    - The log shows `memory: trimmed after …` lines for the library swap, "search closed",
+      "video off" and "playback stopped", each taking well under 100 ms.
+    - RSS returns to roughly the library plus what mpv needs for the stream; it doesn't climb
+      with each refresh.
+
 ## 12. Real providers (summary)
 
 - [ ] **Xtream account:**

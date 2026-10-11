@@ -3,9 +3,10 @@
 //! badges (colour + glyph), match highlighting, live now/next on channel hits. Enter plays /
 //! opens; Shift+Enter plays fullscreen / opens details. Owner: WP-12. DESIGN §13.7.
 //!
-//! * The fuzzy index is the app-owned `ctx.search_index` (kept across opens, reset by the app
-//!   when the library changes); it is (re)built lazily here, also when the parental session
-//!   opens or closes (locked items are excluded while locked, DESIGN §20.3).
+//! * The fuzzy index is the app-owned `ctx.search_index`, built here when the card opens (in
+//!   the background for a big library: results stream in) and again when the parental session
+//!   opens or closes (locked items are excluded while locked, DESIGN §20.3). The app frees it
+//!   when the card closes or the library changes (~110 MiB for 460k items).
 //! * Guide results come from `search::EpgSearch` (FTS on a runtime task, debounced 150 ms,
 //!   older searches never overwrite newer ones). The overlay only sends queries of 2+
 //!   characters (a one-letter prefix scans most of the FTS index) and hides results that no
@@ -407,7 +408,7 @@ impl SearchOverlay {
         }
         let repaint = egui_ctx.clone();
         let mut idx = ctx.search_index.take().unwrap_or_else(|| SearchIndex::new(Arc::new(move || repaint.request_repaint())));
-        idx.rebuild(ctx.lib, unlocked);
+        idx.rebuild_shared(ctx.lib, unlocked);
         BUILT_UNLOCKED.set(Some(unlocked));
         *ctx.search_index = Some(idx);
     }

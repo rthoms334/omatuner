@@ -230,10 +230,17 @@ pub(super) struct VodBrowser {
     cats_scope: Option<ScopeFilter>,
     progress: ProgressInfo,
     progress_loader: Option<Loader<ProgressInfo>>,
+    /// Bumped whenever `progress` is replaced.
+    progress_gen: u64,
     /// Watch progress by index into the kind's list (rebuilt with `progress` / `index`).
     progress_idx: HashMap<u32, f32>,
-    /// (source, key) → index, per library build.
+    /// (source, key) → index of the titles with progress or in the default favourites list:
+    /// all this screen looks up by key (an index of every title cloned every key: ~30 MiB for
+    /// 300k movies).
     index: HashMap<(SourceId, ItemKey), u32>,
+    /// What `index` was resolved for: (library build, `progress_gen`, favourites fingerprint).
+    index_for: Option<(u64, u64, u64)>,
+    /// The library build the screen's indices belong to.
     index_built: u64,
     /// A locked category waiting for the PIN (cleared by any other open / item action).
     pending_cat: Option<Cat>,
@@ -471,6 +478,40 @@ impl VodBrowser {
         self.played_rank = self.progress.order.iter().enumerate().filter_map(|(r, k)| self.index.get(k).map(|i| (*i, r))).collect();
     }
 
+    /// Resolve the keys of the titles with progress and of the favourites to list indices,
+    /// when the library, the progress or the favourites changed (one pass over the list; only
+    /// the matches' keys are cloned).
+    fn refresh_index(&mut self, ctx: &UiCtx<'_>) {
+        let kind = if self.movies { ItemKind::Movie } else { ItemKind::Series };
+        let favs: Vec<&crate::model::ItemRef> =
+            ctx.favs.default_list().map(|l| ctx.favs.items(l).iter().filter(|r| r.kind == kind).collect()).unwrap_or_default();
+        let fingerprint = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::hash::DefaultHasher::new();
+            favs.hash(&mut h);
+            h.finish()
+        };
+        let want = (lib_id(ctx), self.progress_gen, fingerprint);
+        if self.index_for == Some(want) {
+            return;
+        }
+        self.index_for = Some(want);
+        let wanted: HashSet<(SourceId, &str)> =
+            self.progress.order.iter().map(|(s, k)| (*s, k.0.as_str())).chain(favs.iter().map(|r| (r.source, r.key.0.as_str()))).collect();
+        let index = if wanted.is_empty() {
+            HashMap::new()
+        } else {
+            let all = self.all(ctx);
+            all.iter()
+                .enumerate()
+                .filter(|(_, v)| wanted.contains(&(v.source_id, v.key.0.as_str())))
+                .map(|(i, v)| ((v.source_id, v.key.clone()), i as u32))
+                .collect()
+        };
+        self.index = index;
+        self.rebuild_progress_idx();
+    }
+
     /// Recompute the open category's items when its inputs changed.
     fn refresh_items(&mut self, ctx: &UiCtx<'_>) {
         if self.sort_pending == Some(self.config_sort(ctx)) {
@@ -478,12 +519,11 @@ impl VodBrowser {
         }
         if self.index_built != lib_id(ctx) {
             self.index_built = lib_id(ctx);
-            self.index = self.all(ctx).iter().enumerate().map(|(i, v)| ((v.source_id, v.key.clone()), i as u32)).collect();
-            self.rebuild_progress_idx();
             self.items_key = None;
             // stack ids belong to their snapshot
             self.open_stacks.clear();
         }
+        self.refresh_index(ctx);
         // copies stack in All only (DESIGN §29.14)
         let stacked = self.scope(ctx).selected.is_none() && st::combine(ctx.config);
         let key = (self.open, self.sort(ctx), lib_id(ctx), self.scope(ctx).filter(), stacked, self.open_stacks.clone());
@@ -1267,7 +1307,8 @@ impl VodBrowser {
         match kit::poll(&mut self.progress_loader) {
             Some(Ok(p)) => {
                 self.progress = p;
-                self.rebuild_progress_idx();
+                // `refresh_items` resolves its keys (below, before any card is drawn)
+                self.progress_gen += 1;
                 if self.open == Cat::Continue {
                     self.items_key = None;
                 }
@@ -2001,6 +2042,44 @@ mod tests {
         let [NavRequest::Open(OverlayRequest::Rename(spec))] = nav.as_slice() else { panic!("{nav:?}") };
         let crate::ui::overlays::RenameTarget::Copies { items } = &spec.target else { panic!("{spec:?}") };
         assert_eq!((spec.title.as_str(), items.len()), ("Rename every copy", 3));
+    }
+
+    /// Only titles with progress or in Favourites are looked up by key (indexing every title
+    /// cloned every key: ~30 MiB for 300k movies); a favourite added since the library was
+    /// built, and progress that arrives later, are resolved too.
+    #[test]
+    fn only_titles_with_progress_or_favourites_are_indexed_by_key() {
+        let (mut t, one) = rig();
+        let (a, b) = dune(&mut t);
+        seed(&mut t, move |c| {
+            let p = crate::model::WatchProgress {
+                item: named(b, 1),
+                position_s: 60.0,
+                duration_s: Some(600.0),
+                updated_at: 5,
+                finished: false,
+                title: "Solo".into(),
+                fingerprint: Default::default(),
+            };
+            crate::store::user::save_progress(c, &p)
+        });
+        let mut h = harness(t, one, MoviesScreen::default(), egui::vec2(1400.0, 900.0));
+        h.state_mut().enter(Route::Movies { group: None });
+        let keys = |h: &egui_kittest::Harness<'_, testkit::App<MoviesScreen>>| {
+            let mut k: Vec<String> = h.state().s.browser.index.keys().map(|(s, k)| format!("{}:{}", s.0, k.0)).collect();
+            k.sort();
+            k
+        };
+        until(&mut h, "the progress loaded", |h| !h.state().s.browser.progress_idx.is_empty());
+        assert_eq!(keys(&h), [format!("{}:m3u:named0001", b.0)], "the title with progress only");
+        let solo = h.state().t.lib.vod.movies.iter().position(|v| v.name.as_ref() == "Solo").unwrap() as u32;
+        assert_eq!(h.state().s.browser.progress_idx.get(&solo), Some(&0.1));
+        // a favourite toggled without a library rebuild
+        let app = h.state_mut();
+        let list = app.t.favs.default_list().unwrap();
+        app.t.favs.apply_toggle(list, &named(a, 2), true);
+        h.run_steps(1);
+        assert_eq!(keys(&h), [format!("{}:m3u:named0002", a.0), format!("{}:m3u:named0001", b.0)]);
     }
 
     /// Favourites and Continue watching of a stack (DESIGN §29.12): Favourites shows one card
