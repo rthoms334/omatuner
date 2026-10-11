@@ -1041,6 +1041,33 @@ leaves the pop-out where it is ("Nothing playing"); its page is waiting when you
 - **"The provider refused the stream":** the account has expired, or it is already using all
   its connections. Tuner plays one stream at a time and waits for the old one to close before
   starting the next. The account row in Settings ▸ Playlists shows the connection count.
+  Right after a channel change, a provider that still counts the old stream refuses the new one
+  for up to ~45 s; Tuner retries every 3 s during that time and only then shows this error.
+- **A channel drops out while you watch:** a channel that has played keeps reconnecting until
+  it comes back or you stop it (`q`, the Stop button, or Ctrl+Shift+S). The overlay reads
+  "Reconnecting… attempt n"; it retries quickly at first, every 15 s for about 5 minutes, then
+  every 30 s. A channel that never started gives up after *Reconnect attempts* (Settings ▸
+  Player). When the provider sends a message instead of the stream (e.g. "Cannot read …"),
+  the error shows its words.
+- **What the log shows about playback:** each player state change is an INFO line, e.g.
+  `player: source 2 xt:live:717661 Playing → Reconnecting(attempt 1, StreamEnded) after
+  1h12m03s; retry in 0.5 s`, then `player: recovered after 3 attempts in 41.2 s` (or `gave up
+  after …`). These lines name the playlist id and the item key, never the address or the title.
+  HTTP errors (rate-limited), provider messages (WARN) and the mpv/FFmpeg versions at start are
+  there too, and every 10 minutes a `health:` line with the cache, dropped frames and memory
+  (RSS, swap, peak, heap).
+- **HLS segment fetches log "End of file" or stall every few seconds:** Tuner turns HTTP
+  keep-alive off for streams (`demuxer-lavf-o=http_persistent=0`) because many providers drop
+  idle keep-alive connections or leave them half-open. To turn it back on, add to
+  `config.toml`:
+  ```toml
+  [player.mpv_options]
+  "demuxer-lavf-o" = "http_persistent=1"
+  ```
+- **Memory:** Tuner hands freed memory back to the system after a library refresh, when
+  playback stops or video is switched off, and every 5 minutes. Expect roughly 0.4 GB with
+  video off and a large library, and up to ~0.7–0.8 GB while playing 4K. The `health:` lines
+  show the trend.
 - **A provider rejects Tuner:** set a User-Agent for that playlist (Edit), or a default one in
   Settings ▸ Player (default: VLC's).
 - **"Video unavailable — libmpv failed to start":** check that `mpv` is installed and look in

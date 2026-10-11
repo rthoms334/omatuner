@@ -684,6 +684,41 @@ These items use the **default** profile: start Tuner from the launcher, not with
     - RSS returns to roughly the library plus what mpv needs for the stream; it doesn't climb
       with each refresh.
 
+- [ ] **All-day watch through provider outages (field report 2026-10-11):**
+  - **Do:** play a live channel of a restreaming Xtream provider for a working day (6 h+) at
+    default settings, with the log at INFO. If no outage happens on its own, pull the network
+    cable (or `nmcli networking off`) for 3 minutes, twice, an hour apart.
+  - **Expect:**
+    - Playback never ends in an error and the channel is never dimmed. During an outage the
+      overlay reads "Reconnecting… attempt n" (no "/8") with a Stop button, and the picture
+      comes back on its own within ~30 s of the network or provider returning.
+    - The log has `player: … Playing → Reconnecting(…)` and `player: recovered after n attempts
+      in t` for each outage, `health:` lines every 10 minutes, and no "Error reading HTTP
+      response: End of file" lines at INFO. No INFO line contains a channel title or a stream
+      address.
+    - A channel whose provider answers "Cannot read …" on first play shows "The provider can't
+      deliver this channel right now" with the provider's words after ~10 s.
+- [ ] **Zap on a one-connection account:**
+  - **Do:** with an Xtream account limited to 1 connection, play a channel for a minute, then
+    zap to another channel of the same playlist; repeat ten times, including Stop followed by
+    playing the same channel again at once.
+  - **Expect:** every zap and restart ends up playing (a refused first attempt is retried every
+    3 s, "Reconnecting… attempt n", for up to ~45 s). A channel the provider really refuses
+    (expired account, a second device using the connection) shows "The provider refused the
+    stream" after ~45 s instead of retrying forever.
+- [ ] **Memory over a day:**
+  - **Do:** during the all-day watch above (4K HEVC in software if available, a 100k+ title
+    library), note the `health:` lines' `rss`, `anon` and `swap` every hour; refresh the
+    playlist and open/close search a few times.
+  - **Expect:** RSS + swap stays under ~0.7–0.8 GB while playing 4K and falls to ~0.4 GB with
+    video off or stopped; it doesn't climb hour over hour (was ~1.1–1.3 GB after 6.5 h).
+- [ ] **Workspace switch picture:**
+  - **Do:** while a 4K HEVC channel plays (software decoding), switch to another workspace for
+    5 s, come back; then for 30 s, come back. Repeat a few times.
+  - **Expect:** after the 5 s visit the picture continues with no broken frames (video is only
+    switched off after 10 s hidden). After the 30 s visit the picture returns within a couple
+    of seconds; any blocky frames clear at the next keyframe.
+
 ## 12. Real providers (summary)
 
 - [ ] **Xtream account:**

@@ -2168,9 +2168,17 @@ mod tests {
         });
         let favs = crate::store::library::load_favs(&h.state().t.services().store.reader().unwrap()).unwrap();
         h.state_mut().t.favs = favs;
+        // (the frames `until` stepped while the Undo was being written showed an empty
+        // Favourites list: wait for the card to be back before acting on it)
+        until(&mut h, "the restored favourites listed", |h| shown_names(h) == ["Dune"]);
         // Ctrl+F again: out again (no Undo taken); then on the stack in All, with no favourite
         // copy, Ctrl+F adds the copy that plays first — Bravo's, the one watched last
         h.state_mut().act(Action::ToggleFavourite);
+        assert!(!fav(&h, named(a, 1)) && !fav(&h, named(b, 0)), "out again");
+        until(&mut h, "the removal written", |h| {
+            let favs = crate::store::library::load_favs(&h.state().t.services().store.reader().unwrap()).unwrap();
+            !favs.is_fav(&named(a, 1)) && !favs.is_fav(&named(b, 0))
+        });
         h.state_mut().act(Action::FocusNext);
         h.state_mut().act(Action::Home);
         h.run_steps(1);

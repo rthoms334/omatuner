@@ -382,11 +382,18 @@ global search index (~110 MiB), mpv's decoder frames (hundreds of MiB at 4K 10-b
 on every swap — dropping it in the frame took 20–400 ms — and the search index) and calls
 `malloc_trim(0)` afterwards, after the player stops, switches video off (`vid=no`) or (re)loads
 a stream (it follows the player's snapshot channel), and every 5 min; triggers coalesce (2 s
-settle, ≥ 10 s apart). The search index exists only while the search card is open (rebuilt in
-the background when it opens). Screens resolve keys only for what they look up (Movies/Series:
-titles with progress or in Favourites; Home: favourited titles), never a map of every title.
-`platform::memstats::MemStats` (RSS, anon, swap, peak, `mallinfo2` in use / free) feeds the 10-min
-health line in the log.
+settle, ≥ 10 s apart; `malloc_trim` itself takes 0.1–50 ms). The search index exists only while
+the search card is open (rebuilt in the background when it opens; closing the card cancels a
+collection still running). Screens resolve keys only for what they look up (Movies/Series:
+titles with progress or in Favourites; Home: favourited titles), never a map of every title,
+keyed on the snapshot's VOD lists (`Library::vod_identity`: a zap's copy shares them, so a zap
+rescans nothing; a progress save that brings no new key only remaps).
+`platform::memstats::MemStats` (RSS, anon, swap, peak, `mallinfo2` in use / free) feeds the
+10-min health line in the log. Measured on the field library with a 4K HEVC stream (8 min,
+second half): RssAnon 1121 → 742 MiB on average, peak RSS 1311 → 1017 MiB; with video off
+after a trim the process sits at ~320–430 MiB; 4K playback has a floor of ~700 MiB (the
+library ~240 MiB + mpv ~450 MiB). Not done on purpose: `shrink_to_fit` (frees no pages),
+capping decoder threads, a fixed mmap threshold.
 
 ---
 
@@ -1359,10 +1366,13 @@ attempt n" (never "(n/0)") with an obvious **Stop** button (`q`; `Ctrl+Shift+S` 
 **Connection-limit race window.** Xtream panels keep counting a closed connection for a while
 (reproduced: HLS sessions held 30 s, TS connections 10 s), so on a source whose limit is 1 or
 unknown a zap is often refused at first. When a *different* stream of the same source closed
-less than 45 s before a Play's first load, a 403 is retried every 3 s until 45 s after that
-close; the next 403 is final (Error, recorded). The window is armed once per Play from that
-close — never by the target's own failed attempts — so a channel the provider really refuses
-still reaches Error.
+less than 45 s before a Play's first load — or the *same* channel after it had played (stop,
+then restart it) — a 403 is retried every 3 s until 45 s after that close; the next 403 is
+final (Error, recorded). The window is armed once per Play from that close — never by the
+target's own failed attempts, which never played — so a channel the provider really refuses
+still reaches Error. Race retries, the one 401/403/404 retry, provider-message retries and the
+network backoff each count on their own: a long window doesn't leave a first open that then
+times out without its 8 attempts.
 
 **Provider messages.** A restreamer that lost a channel answers the playlist address with 200
 and a line of text ("Cannot read /home/…/streams/123_.m3u8"). mpv's playlist parser reads the
@@ -1378,11 +1388,15 @@ value replaces it): providers close idle keep-alive connections between segment 
 costs nothing.
 
 **Logging.** Every state change of the current target is logged at INFO with its source id,
-item key, title and the time spent in the previous state, plus "recovered after n attempts in
-t" / "gave up after …"; END_FILE reasons of our file; HTTP statuses (≤ 5 per status per 10 s);
-provider messages; app, mpv and FFmpeg versions at start; and every 10 minutes a health line
-(state, cache, `cache-speed`, dropped frames, FFmpeg's own reconnects, hwdec, RSS, swap, peak
-and glibc heap in use / free). Stream addresses never appear.
+item key and the time spent in the previous state (`player: source 2 xt:live:717661 Playing →
+Reconnecting(attempt 1, StreamEnded) after 1h12m03s; retry in 0.5 s; cache 0.0 s`), plus
+"recovered after n attempts in t" (attempts of that outage) / "gave up after …"; END_FILE
+reasons of our file; HTTP statuses (≤ 5 per status per 10 s, then a summary); a provider
+message at WARN when it first appears (DEBUG while it repeats); app, mpv and FFmpeg versions at
+start; and every 10 minutes a health line (state, cache, `cache-speed`, dropped frames, FFmpeg's
+own reconnects, hwdec, RSS, swap, peak and glibc heap in use / free). Titles are not in INFO
+lines (explicit titles never reach the log, §20.3): a DEBUG line names the title once per new
+target. Stream addresses never appear.
 
 HTTP statuses (parsed from mpv/ffmpeg log lines) classify a failure only while **Loading**
 (they are cleared on PlaybackRestart): a storm of HLS segment 404s while Playing is a Network
@@ -1431,7 +1445,8 @@ Init (`player/mpv.rs`): `vo=libmpv`, hwdec (D1), `idle=yes`, `keep-open=no` (liv
 end the file), `config=no`, no OSC/input/ytdl, `video-timing-offset=0`, cache on,
 `demuxer-readahead-secs`/`cache-secs` = `cache_secs` (1 when instant load), `demuxer-max-bytes`,
 `demuxer-max-back-bytes=32MiB`, `network-timeout`, `stream-lavf-o=reconnect=1,
-reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=5`, `user-agent`,
+reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=5`,
+`demuxer-lavf-o=http_persistent=0` (§11.4; `mpv_options` can set it back), `user-agent`,
 `alang`/`slang`, subtitle auto mode, `sub-scale`, `volume`, `mute`, `audio-client-name=tuner`,
 then user `player.mpv_options`. Per file: `loadfile <url> replace -1
 force-media-title=%n%…,user-agent=…,referrer=…,http-header-fields=…,start=…` (values `%len%`
@@ -2661,9 +2676,10 @@ can't be installed. No hooks written into the user's config. Until WP-01 lands,
   honoured; **de-duplicated by file path** (one CJK collection covers ja/zh/ko: ~19 MB once,
   not three times). Verified here: `NotoSansCJK-Regular.ttc`, `NotoSansArabic-Regular.ttf`.
 * Threading: `FontSet::resolve` (~145 ms of subprocesses for 12 languages) and `FontSet::load`
-  (memory-maps each font file once for the process; egui borrows the mapped bytes through
-  `FontData::from_static`, so the ~25 MB of fallbacks are page cache, not two heap copies) run
-  off the UI thread — at
+  (memory-maps each packaged font file under `/usr` once for the process; egui borrows the
+  mapped bytes through `FontData::from_static`, so the ~25 MB of fallbacks are page cache, not
+  two heap copies; a font elsewhere, e.g. `~/.local/share/fonts`, which a `cp` can overwrite in
+  place under a live mapping, is read once and kept) run off the UI thread — at
   startup on a helper thread joined in the creation callback, on reload in the theme watcher;
   the UI only calls `LoadedFonts::install`.
 * egui families: Proportional = Monospace = [primary, fallbacks…, egui defaults];
