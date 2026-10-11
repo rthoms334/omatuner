@@ -208,6 +208,15 @@ pub enum Action {
     /// Delete: remove from a favourites list / cancel a job / forget an orphan / cancel a
     /// reminder (whatever "remove" means for the focused row).
     Remove,
+    /// Space on a stack card in Movies / Series: fan the copies out in the grid, or fold them
+    /// back (DESIGN §29.14).
+    FanOut,
+    /// Ctrl+O on a title with several copies (grid card, detail page): "Play from…" a chosen
+    /// copy.
+    PlayFrom,
+    /// A toast's "Undo" (never bound to a key): the screen that showed the toast reverts its
+    /// last change ("Not the same title", removing every copy from Favourites…).
+    Undo,
     // ---- guide
     GuidePrevDay,
     GuideNextDay,
@@ -461,6 +470,10 @@ pub static POSTER_GRID: &[Binding] = &[
     b(C::key(Key::Escape), A::Back, "Back"),
     b(C::ch('/'), A::OpenSearch, "Search everything"),
     b(C::ch('?'), A::ToggleHelp, "Keyboard help"),
+    // the Text event, like the group lists' marks (a leading space never filters anyway);
+    // only a stack card reacts (DESIGN §29.14)
+    b(C::ch(' '), A::FanOut, "Fan out / fold the copies of a stack"),
+    b(C::ctrl(Key::O), A::PlayFrom, "Play from another copy…"),
     // any other printable key starts filtering (FilterInput)
 ];
 
@@ -479,6 +492,8 @@ pub static POSTER_GRID_FILTERING: &[Binding] = &[
     b(C::key(Key::Escape), A::FilterClear, "Clear filter"),
     b(C::key(Key::Tab), A::FocusNext, "Next / previous pane"),
     b(C::shift(Key::Tab), A::FocusPrev, "Next / previous pane"),
+    // Space types here (filters have spaces)
+    b(C::ctrl(Key::O), A::PlayFrom, "Play from another copy…"),
 ];
 
 pub static DETAIL: &[Binding] = &[
@@ -498,6 +513,7 @@ pub static DETAIL: &[Binding] = &[
     b(C::key(Key::Escape), A::Back, "Back"),
     b(C::ch('/'), A::OpenSearch, "Search everything"),
     b(C::ch('?'), A::ToggleHelp, "Keyboard help"),
+    b(C::ctrl(Key::O), A::PlayFrom, "Play from another copy…"),
 ];
 
 pub static GUIDE: &[Binding] = &[

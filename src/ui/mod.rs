@@ -22,6 +22,7 @@ pub mod parental;
 pub mod popout;
 pub mod scope;
 pub mod screens;
+pub mod stacks;
 #[doc(hidden)]
 pub mod testing;
 pub mod video_host;

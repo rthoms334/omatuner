@@ -1,5 +1,6 @@
 //! Screens (one file = one owner). Wireframes and behaviour: DESIGN §13.
 
+pub(crate) mod copies;
 pub mod epg_mapping;
 pub(crate) mod group_marks;
 pub mod guide;

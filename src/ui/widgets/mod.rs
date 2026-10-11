@@ -15,6 +15,7 @@ use eframe::egui;
 pub mod badge;
 pub mod button;
 pub mod card;
+pub mod copy_card;
 pub mod empty_state;
 pub mod glyphs;
 pub mod list;

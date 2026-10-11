@@ -14,6 +14,14 @@
 //! Ctrl+E assign EPG, Shift+F10 the menu of all of them; the rest toast "Not available here".
 //! Rails are rebuilt only when the library, the favourites or Continue watching change.
 //!
+//! Copies of one title (DESIGN §29.14) are one tile wherever Home lists titles — Recently
+//! added, Recently updated series, the favourites rails and Continue watching (the most recent
+//! copy) — while Settings ▸ Interface ▸ "Same title in several playlists" is Combine. A stack
+//! tile shows its copy count and playlists; Enter opens the page of the tile's copy (Copies
+//! section there), Shift+Enter plays the copy that plays first, Ctrl+F follows the stack rules
+//! (the copy that would play is added; a favourite stack leaves Favourites with every copy,
+//! Undo).
+//!
 //! Data: everything but "Continue watching" comes from the in-memory `Library` and the
 //! app-owned favourites; Continue watching is read off the UI thread ([`kit::Loader`]) on enter
 //! and whenever progress/history/the library changes. An empty library (no sources) shows the
@@ -34,8 +42,9 @@ use crate::msg::{AppEvent, DataScope};
 use crate::store::library::FavIndex;
 use crate::theme::{SpaceToken, Theme, TypeToken};
 use crate::ui::overlays::{ContextMenuSpec, MenuItem, OverlayResult};
+use crate::ui::stacks as st;
 use crate::ui::widgets::badge::{InlineBadge, name_with_quality};
-use crate::ui::widgets::poster::{self, TileDecor};
+use crate::ui::widgets::poster::{self, StackDecor, TileDecor};
 use crate::ui::widgets::{badge, empty_state, glyphs, section};
 use crate::ui::{OnboardingStart, OverlayRequest, Route, Screen, ScreenId, UiCtx};
 
@@ -465,6 +474,8 @@ struct RailsKey {
     generation: u64,
     favs: u64,
     continue_gen: u64,
+    /// Copies of one title are one tile (`interface.same_title`).
+    combine: bool,
 }
 
 #[derive(Default)]
@@ -487,6 +498,8 @@ pub struct HomeScreen {
     rails_key: Option<RailsKey>,
     scroll_to_cursor: bool,
     playing: kit::PlayingVod,
+    /// What the last Undo toast reverts.
+    undo: Option<st::Undo>,
 }
 
 /// A cheap fingerprint of the favourites lists (their order, names and items).
@@ -506,18 +519,26 @@ impl HomeScreen {
 
     /// Rebuild the rails when the library, the favourites or Continue watching changed.
     fn build_rails(&mut self, ctx: &mut UiCtx<'_>) {
-        let key = RailsKey { generation: ctx.lib.generation, favs: favs_signature(ctx.favs), continue_gen: self.continue_gen };
+        let combine = st::combine(ctx.config);
+        let key = RailsKey { generation: ctx.lib.generation, favs: favs_signature(ctx.favs), continue_gen: self.continue_gen, combine };
         if self.rails_key == Some(key) {
             return;
         }
-        self.rails_key = Some(key);
-        if self.recent_built_at != ctx.lib.built_at {
+        let old_key = self.rails_key.replace(key);
+        if self.recent_built_at != ctx.lib.built_at || old_key.is_some_and(|k| k.combine != combine) {
             self.recent_built_at = ctx.lib.built_at;
+            // one tile per stack, its top copy, where its newest copy comes (DESIGN §29.14)
             let take = |movies: bool, all: &[VodSummary]| -> Vec<VodSummary> {
+                let stacks = ctx.lib.vod.stacks(movies);
+                let mut seen = std::collections::HashSet::new();
                 ctx.lib
                     .vod
                     .all_sorted(movies, SortMode::RecentlyAdded)
                     .into_iter()
+                    .filter_map(|i| match stacks.stack_of(i).filter(|_| combine) {
+                        Some(s) => seen.insert(s).then(|| stacks.top(s)),
+                        None => Some(i),
+                    })
                     .take(RAIL_MAX)
                     .filter_map(|i| all.get(i as usize).cloned())
                     .collect()
@@ -531,15 +552,22 @@ impl HomeScreen {
             self.vod_refs = ctx.lib.vod.movies.iter().chain(&ctx.lib.vod.series).map(|v| (vod_ref(v), v.kind)).collect();
         }
         let mut rails = Vec::new();
-        if !self.continue_items.is_empty() {
-            rails.push(Rail {
-                kind: RailKind::Continue,
-                title: "Continue watching".into(),
-                list: None,
-                tiles: (0..self.continue_items.len()).map(Tile::Continue).collect(),
-            });
+        // a title's copies are one tile: the first (newest) of them in Continue watching, the
+        // first in a favourites list
+        let stack_key = |kind: VodKind| -> Option<(bool, crate::store::stacks::StackId)> {
+            let movies = st::is_movie(kind);
+            combine.then(|| st::index_of(ctx.lib, kind).and_then(|i| ctx.lib.vod.stacks(movies).stack_of(i)).map(|s| (movies, s))).flatten()
+        };
+        let mut seen = std::collections::HashSet::new();
+        let continues: Vec<Tile> = (0..self.continue_items.len())
+            .filter(|i| stack_key(self.continue_items[*i].card.kind).is_none_or(|k| seen.insert(k)))
+            .map(Tile::Continue)
+            .collect();
+        if !continues.is_empty() {
+            rails.push(Rail { kind: RailKind::Continue, title: "Continue watching".into(), list: None, tiles: continues });
         }
         for list in ctx.favs.non_empty_lists() {
+            let mut seen = std::collections::HashSet::new();
             let tiles: Vec<Tile> = ctx
                 .favs
                 .items(list.id)
@@ -551,7 +579,7 @@ impl HomeScreen {
                         .by_ref(r)
                         .filter(|id| !ctx.lib.live.hidden.contains(id))
                         .map(|id| Tile::Channel { id, collection: Some(Collection::Favourites(list.id)) }),
-                    _ => self.vod_refs.get(r).copied().map(Tile::Vod),
+                    _ => self.vod_refs.get(r).copied().filter(|k| stack_key(*k).is_none_or(|s| seen.insert(s))).map(Tile::Vod),
                 })
                 .take(RAIL_MAX)
                 .collect();
@@ -583,7 +611,7 @@ impl HomeScreen {
         if !self.recent_series.is_empty() {
             rails.push(Rail {
                 kind: RailKind::Series,
-                title: "Recently added series".into(),
+                title: "Recently updated series".into(),
                 list: None,
                 tiles: self.recent_series.iter().map(|v| Tile::Vod(v.kind)).collect(),
             });
@@ -614,6 +642,13 @@ impl HomeScreen {
         self.rails = rails;
     }
 
+    /// How recently a copy was played, from Continue watching (newest first): the copy you
+    /// were watching plays first (DESIGN §29.12).
+    fn played_at(&self, ctx: &UiCtx<'_>, movies: bool, copy: u32) -> Option<Timestamp> {
+        let kind = st::all(ctx.lib, movies).get(copy as usize)?.kind;
+        self.continue_items.iter().position(|c| c.card.kind == kind).map(|r| -(r as Timestamp))
+    }
+
     fn current_tile(&self) -> Option<(usize, &Tile)> {
         let rail = self.rails.get(self.rail)?;
         let col = self.cols.get(self.rail)?.2;
@@ -636,6 +671,23 @@ impl HomeScreen {
             Tile::Channel { id, collection } => {
                 if !kit::play_channel(ctx, id, collection, PlayOrigin::Home) {
                     kit::ask_pin(ctx, if alt { Action::ActivateAlt } else { Action::Activate }, "This channel is locked");
+                }
+            }
+            // a stack tile: locked only when every copy is; Shift+Enter plays the copy that
+            // plays first (DESIGN §29.12)
+            Tile::Vod(kind) if st::stack_of_kind(ctx.lib, ctx.config, kind).is_some() => {
+                let movies = st::is_movie(kind);
+                let Some(s) = st::stack_of_kind(ctx.lib, ctx.config, kind) else { return };
+                let copies = ctx.lib.vod.stacks(movies).members(s).to_vec();
+                let order = st::play_order(ctx.lib, ctx.config, movies, &copies, kit::unlocked(ctx), |c| self.played_at(ctx, movies, c), |_| None);
+                let Some(first) = order.first().and_then(|c| st::all(ctx.lib, movies).get(*c as usize)).map(|v| v.kind) else {
+                    kit::ask_pin(ctx, if alt { Action::ActivateAlt } else { Action::Activate }, "Every copy of this title is locked");
+                    return;
+                };
+                match (kind, first, alt) {
+                    (_, VodKind::Movie(id), true) => super::movie_detail::play_movie(ctx, id),
+                    (VodKind::Movie(id), _, _) => ctx.push(Route::MovieDetail(id)),
+                    (VodKind::Series(id), _, _) => ctx.push(Route::SeriesDetail(id)),
                 }
             }
             Tile::Vod(kind) => {
@@ -715,6 +767,20 @@ impl HomeScreen {
         let rail = self.rails.get(self.rail).map(|r| (r.kind, r.list));
         let Some(item) = self.tile_item(ctx, &tile) else { return kit::not_here(ctx) };
         let name = self.tile_name(ctx, &tile);
+        // a stack tile's ★ (DESIGN §29.12): add the copy that would play, or take every copy out
+        if let (Action::ToggleFavourite, Tile::Vod(kind)) = (action, &tile)
+            && let Some(s) = st::stack_of_kind(ctx.lib, ctx.config, *kind)
+        {
+            let movies = st::is_movie(*kind);
+            let (all, copies) = (st::all(ctx.lib, movies), ctx.lib.vod.stacks(movies).members(s).to_vec());
+            let refs: Vec<ItemRef> = copies.iter().filter_map(|c| all.get(*c as usize)).map(st::item_ref).collect();
+            let order = st::play_order(ctx.lib, ctx.config, movies, &copies, kit::unlocked(ctx), |c| self.played_at(ctx, movies, c), |_| None);
+            let plays = order.first().and_then(|c| all.get(*c as usize)).map(st::item_ref).unwrap_or(item);
+            if let Some(u) = st::toggle_favourite(ctx, &refs, &plays) {
+                self.undo = Some(u);
+            }
+            return;
+        }
         match (action, &tile) {
             (Action::ToggleFavourite, _) => kit::toggle_favourite(ctx, &item),
             (Action::AddToList, _) => kit::list_picker(ctx, &item, &name),
@@ -980,6 +1046,12 @@ impl Screen for HomeScreen {
             }
             // letters never filter on Home (DESIGN §13.3)
             Action::FilterInput(_) | Action::Parent => true,
+            Action::Undo => {
+                if let Some(u) = self.undo.take() {
+                    st::undo(ctx, u);
+                }
+                true
+            }
             _ => false,
         }
     }
@@ -1127,11 +1199,24 @@ fn draw_tile(
     match tile {
         Tile::Vod(kind) => match ctx.lib.vod.find(*kind) {
             Some(v) => {
-                let decor = TileDecor {
-                    playing: playing_vod == Some(*kind),
-                    source: ctx.source_of(crate::ui::scope::vod_item_kind(v.kind), v.source_id),
-                    ..Default::default()
-                };
+                let item_kind = crate::ui::scope::vod_item_kind(v.kind);
+                let mut decor =
+                    TileDecor { playing: playing_vod == Some(*kind), source: ctx.source_of(item_kind, v.source_id), ..Default::default() };
+                // a stack tile: its copy count and playlists (no fan-out in a rail)
+                if let Some(c) = st::index_of(ctx.lib, *kind).filter(|_| st::combine(ctx.config)).and_then(|i| {
+                    let movies = st::is_movie(*kind);
+                    st::card_stack(ctx.lib.vod.stacks(movies), i, st::all(ctx.lib, movies))
+                }) {
+                    let others: Vec<_> = c.playlists.iter().filter(|p| **p != v.source_id).collect();
+                    decor.stack = Some(StackDecor {
+                        count: c.count,
+                        open: false,
+                        fan: false,
+                        second: others.first().and_then(|p| ctx.source_of(item_kind, **p)),
+                        others: others.len(),
+                    });
+                    decor.dimmed = c.all_locked && !kit::unlocked(ctx);
+                }
                 poster::poster_tile(ui, theme, ctx.images, v, poster_w, cursor, decor)
             }
             None => ui.allocate_exact_size(egui::vec2(poster_w, poster_w), egui::Sense::hover()).1,
@@ -1607,6 +1692,73 @@ pub(crate) mod testkit {
         Ok(ids)
     }
 
+    /// Movies of one playlist named like a provider names them (`(provider name, display
+    /// name)`), in a category "Films", newest last, with their match keys computed as an
+    /// import computes them (so copies stack, DESIGN §29.11). Keys `m3u:named{i}`.
+    pub(crate) fn named_movies(c: &mut Connection, src: SourceId, names: &[(&str, &str)]) -> Result<Vec<MovieId>> {
+        let tx = c.transaction()?;
+        tx.execute(
+            "INSERT INTO grp(source_id, kind, key, name, provider_order, item_count, seen_gen) VALUES (?1,'movie','movie:films','Films',0,?2,1)",
+            params![src, names.len() as i64],
+        )?;
+        let g = tx.last_insert_rowid();
+        let mut ids = Vec::new();
+        for (i, (raw, clean)) in names.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO movie(source_id, key, name, clean_name, norm_name, stream, provider_order, added_at, seen_gen, plot, details_at, year)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, 'A plot.', 1, ?9)",
+                params![
+                    src,
+                    format!("m3u:named{i:04}"),
+                    raw,
+                    clean,
+                    clean.to_lowercase(),
+                    format!(r#"{{"t":"url","url":"http://127.0.0.1:9/movie/{}/{i}.mkv"}}"#, src.0),
+                    i as i64,
+                    1_700_000_000 + i as i64,
+                    crate::sources::vod_match::parse(raw, None, &Default::default()).year,
+                ],
+            )?;
+            let id = tx.last_insert_rowid();
+            tx.execute("INSERT INTO movie_group(group_id, movie_id, position) VALUES (?1, ?2, ?3)", params![g, id, i as i64])?;
+            ids.push(MovieId(id));
+        }
+        crate::store::titles::refresh_source(&tx, src)?;
+        tx.commit()?;
+        Ok(ids)
+    }
+
+    /// Series of one playlist named like a provider names them, with one season of
+    /// `episodes` episodes each, match keys computed (see [`named_movies`]).
+    pub(crate) fn named_series(c: &mut Connection, src: SourceId, names: &[(&str, &str)], episodes: u32) -> Result<Vec<SeriesId>> {
+        let tx = c.transaction()?;
+        tx.execute(
+            "INSERT INTO grp(source_id, kind, key, name, provider_order, item_count, seen_gen) VALUES (?1,'series','series:shows','Shows',0,?2,1)",
+            params![src, names.len() as i64],
+        )?;
+        let g = tx.last_insert_rowid();
+        let mut ids = Vec::new();
+        for (i, (raw, clean)) in names.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO series(source_id, key, name, clean_name, norm_name, provider_order, added_at, details_at, seen_gen) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 1)",
+                params![src, format!("m3u:named{i:04}"), raw, clean, clean.to_lowercase(), i as i64, 1_700_000_000 + i as i64],
+            )?;
+            let sid = tx.last_insert_rowid();
+            tx.execute("INSERT INTO series_group(group_id, series_id, position) VALUES (?1, ?2, ?3)", params![g, sid, i as i64])?;
+            tx.execute("INSERT INTO season(series_id, number, episode_count) VALUES (?1, 1, ?2)", params![sid, episodes])?;
+            for e in 1..=episodes {
+                tx.execute(
+                    "INSERT INTO episode(series_id, source_id, key, season, episode, title, duration_s, stream) VALUES (?1, ?2, ?3, 1, ?4, ?5, 2700, ?6)",
+                    params![sid, src, format!("m3u:named-ep{i}-{e}"), e, format!("Episode {e}"), format!(r#"{{"t":"url","url":"http://127.0.0.1:9/series/{}/{i}/{e}.mp4"}}"#, src.0)],
+                )?;
+            }
+            ids.push(SeriesId(sid));
+        }
+        crate::store::titles::refresh_source(&tx, src)?;
+        tx.commit()?;
+        Ok(ids)
+    }
+
     /// `n` series "Series {i}" with `seasons` × `episodes` episodes (details loaded).
     pub(crate) fn series(c: &mut Connection, src: SourceId, n: usize, seasons: u32, episodes: u32) -> Result<Vec<SeriesId>> {
         let tx = c.transaction()?;
@@ -2045,6 +2197,70 @@ mod tests {
         assert!(has_label(&h, "Movie 0") && !has_label_containing(&h, "· Alpha"), "Auto: one enabled playlist");
         set(&mut h, PlaylistOnCards::Always);
         assert!(has_label(&h, "Movie 0 · Alpha"), "Always: even a single playlist");
+    }
+
+    /// Copies of one title are one Home tile (DESIGN §29.14): Recently added shows the stack's
+    /// top copy once with its count and playlists, Continue watching the copy played last, a
+    /// favourites list the first favourite copy; Ctrl+F on a stack tile without favourites adds
+    /// the copy that plays first. "Show each copy" brings every copy back. The series rail is
+    /// "Recently updated series".
+    #[test]
+    fn titles_in_several_playlists_are_one_tile() {
+        let (mut t, one) = rig();
+        let (a, b) = seed(&mut t, |c| {
+            let a = testkit::source(c, "Alpha")?;
+            let b = testkit::source(c, "Bravo")?;
+            testkit::named_movies(c, a, &[("EN ★ Dune - 2021", "Dune"), ("FR ★ Dune - 2021", "Dune (FR)"), ("EN ★ Heat - 1995", "Heat")])?;
+            testkit::named_movies(c, b, &[("EN - Dune (2021)", "Dune"), ("EN - Solo (2018)", "Solo")])?;
+            testkit::series(c, a, 1, 1, 1)?;
+            for (i, (src, key)) in [(a, "m3u:named0001"), (b, "m3u:named0000")].into_iter().enumerate() {
+                let item = ItemRef { source: src, kind: ItemKind::Movie, key: ItemKey(key.into()) };
+                let p = WatchProgress {
+                    item,
+                    position_s: 600.0,
+                    duration_s: Some(6000.0),
+                    updated_at: 10 + i as i64,
+                    finished: false,
+                    title: String::new(),
+                    fingerprint: Default::default(),
+                };
+                crate::store::user::save_progress(c, &p)?;
+            }
+            Ok((a, b))
+        });
+        let mut h = harness(t, one, HomeScreen::default(), egui::vec2(1400.0, 900.0));
+        h.state_mut().enter(Route::Home);
+        until(&mut h, "Continue watching", |h| h.state().s.rails.iter().any(|r| r.kind == RailKind::Continue));
+        let rail = |h: &egui_kittest::Harness<'static, testkit::App<HomeScreen>>, k: RailKind| {
+            h.state().s.rails.iter().find(|r| r.kind == k).map(|r| r.tiles.len()).unwrap_or(0)
+        };
+        assert_eq!(rail(&h, RailKind::Movies), 3, "Heat, Dune, Solo");
+        assert_eq!(rail(&h, RailKind::Continue), 1, "two copies in progress, one tile");
+        assert!(has_label(&h, "Dune · Alpha + Bravo · 3 copies"));
+        assert!(h.state().s.rails.iter().any(|r| r.kind == RailKind::Series && r.title == "Recently updated series"));
+        // Ctrl+F on the stack tile: the copy that plays first (Bravo's, the one watched last)
+        let rail_at = h.state().s.rails.iter().position(|r| r.kind == RailKind::Movies).unwrap();
+        h.state_mut().s.rail = rail_at;
+        let col = h.state().s.rails[rail_at]
+            .tiles
+            .iter()
+            .position(|t| matches!(t, Tile::Vod(k) if h.state().t.lib.vod.find(*k).is_some_and(|v| &*v.name == "Dune")))
+            .unwrap();
+        h.state_mut().s.cols[rail_at].2 = col;
+        h.state_mut().act(Action::ToggleFavourite);
+        let r = |s: SourceId, i: usize| ItemRef { source: s, kind: ItemKind::Movie, key: ItemKey(format!("m3u:named{i:04}")) };
+        assert!(h.state().t.favs.is_fav(&r(b, 0)) && !h.state().t.favs.is_fav(&r(a, 0)));
+        h.run_steps(2);
+        let favs = h.state().s.rails.iter().find(|x| x.kind == RailKind::Favourites).map(|x| x.tiles.len());
+        assert_eq!(favs, Some(1));
+        // show each copy
+        let app = h.state_mut();
+        let mut c = (*app.t.config).clone();
+        c.interface.same_title = crate::config::SameTitle::ShowEach;
+        app.t.config = std::sync::Arc::new(c);
+        h.run_steps(2);
+        assert_eq!(rail(&h, RailKind::Movies), 5);
+        assert_eq!(rail(&h, RailKind::Continue), 2);
     }
 
     /// A boxed screen as a `Screen` (one harness type for every screen).
