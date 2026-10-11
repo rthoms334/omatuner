@@ -42,6 +42,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, RichText};
 
@@ -66,6 +67,9 @@ use crate::ui::{NavRequest, OnboardingStart, Route, Screen, ScreenId, SettingsPa
 
 /// Card width (pt × rem).
 const CARD_W: f32 = 560.0;
+/// Enter is ignored this long after "Choose what to show" appears (it appears on its own,
+/// as "Open Live TV" turns on).
+const CATEGORIES_SETTLE: Duration = Duration::from_millis(400);
 
 pub(crate) const COLORS: [(SourceColor, &str); 10] = [
     (SourceColor::Accent, "Accent"),
@@ -448,8 +452,9 @@ pub struct OnboardingScreen {
     preset_idx: usize,
     /// The new playlist's category summary (read once its channels are in).
     categories_loader: Option<Loader<PickerData>>,
-    /// The Categories step's picker.
-    picker: Option<CategoryPicker>,
+    /// The Categories step's picker, and when it appeared (an Enter meant for "Open Live TV"
+    /// right then must not save the defaults unseen).
+    picker: Option<(CategoryPicker, Instant)>,
 }
 
 impl OnboardingScreen {
@@ -799,7 +804,8 @@ impl OnboardingScreen {
     /// still shows the import.
     fn offer_categories(&mut self, ctx: &UiCtx<'_>, source: SourceId, data: PickerData) {
         if data.summary.tag_count() >= 2 && data.rule.is_none() && matches!(self.step, Step::Importing | Step::Done) {
-            self.picker = Some(CategoryPicker::from_data(source, data, Some(ctx.lib.generation)).cancel_label("Show everything"));
+            let picker = CategoryPicker::from_data(source, data, Some(ctx.lib.generation)).cancel_label("Show everything");
+            self.picker = Some((picker, Instant::now()));
             self.go(Step::Categories);
         }
     }
@@ -935,8 +941,10 @@ impl Screen for OnboardingScreen {
 
     fn on_enter(&mut self, ctx: &mut UiCtx<'_>, route: &Route) {
         let Route::Onboarding(start) = route else { return };
-        // keep a running import / restore when the card is shown again
-        if matches!(self.step, Step::Importing | Step::Restoring) && (self.import.job.is_some() || self.restore.is_some()) && *start == self.start {
+        // keep a running import / restore, or the open "Choose what to show", when the card is
+        // shown again
+        let running = matches!(self.step, Step::Importing | Step::Restoring) && (self.import.job.is_some() || self.restore.is_some());
+        if (running || self.step == Step::Categories) && *start == self.start {
             return;
         }
         *self = Self { start: start.clone(), ..Default::default() };
@@ -1057,8 +1065,13 @@ impl Screen for OnboardingScreen {
 
     fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
         if self.step == Step::Categories
-            && let Some(p) = &mut self.picker
+            && let Some((p, shown)) = &mut self.picker
         {
+            // the step appears when "Open Live TV" turns on: an Enter meant for that button
+            // must not save the defaults before the list was seen
+            if action == Action::Activate && shown.elapsed() < CATEGORIES_SETTLE {
+                return true;
+            }
             return match p.on_action(ctx, action) {
                 PickerOutcome::None => true,
                 PickerOutcome::Ignored => false,
@@ -1135,9 +1148,9 @@ impl Screen for OnboardingScreen {
                 ui,
                 |ui| {
                     let (title, sub) = self.step_title();
-                    let sub = match self.picker.as_ref().and_then(|p| p.summary()).filter(|_| self.step == Step::Categories) {
+                    let sub = match self.picker.as_ref().and_then(|(p, _)| p.summary()).filter(|_| self.step == Step::Categories) {
                         Some(s) => format!(
-                            "This playlist has channels for {} countries. Pick the ones you want — you can change this later in Settings ▸ Playlists.",
+                            "This playlist has categories in {} countries and languages. Pick the ones you want — you can change this later in Settings ▸ Playlists.",
                             s.tag_count()
                         ),
                         None => sub.to_owned(),
@@ -1184,14 +1197,17 @@ impl Screen for OnboardingScreen {
                             back_clicked = button(ui, theme, Some(glyphs::PREVIOUS), label, ButtonStyle::default()).clicked();
                             ui.add_space(theme.space(SpaceToken::Lg));
                         }
+                        // (the picker draws its own key line)
                         let hint = if self.editing {
-                            "Enter next · Tab next field · Esc leave the field"
+                            Some("Enter next · Tab next field · Esc leave the field")
                         } else if self.step == Step::Categories {
-                            "Esc shows everything"
+                            None
                         } else {
-                            "↑/↓ move · Enter choose · Esc back"
+                            Some("↑/↓ move · Enter choose · Esc back")
                         };
-                        ui.label(RichText::new(hint).size(theme.font(TypeToken::BodySmall)).color(t.text_disabled));
+                        if let Some(hint) = hint {
+                            ui.label(RichText::new(hint).size(theme.font(TypeToken::BodySmall)).color(t.text_disabled));
+                        }
                     });
                 },
             );
@@ -1593,7 +1609,7 @@ impl OnboardingScreen {
 
     /// The picker, with the import's progress line under it (the import goes on).
     fn categories_ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) -> Option<usize> {
-        let Some(p) = &mut self.picker else { return None };
+        let Some((p, _)) = &mut self.picker else { return None };
         if matches!(p.ui(ui, ctx), PickerOutcome::Saved | PickerOutcome::Cancelled) {
             self.leave_categories();
             return None;
@@ -2020,7 +2036,8 @@ mod tests {
 
     /// DESIGN §28.6: "Choose what to show" follows the import only when the categories name two
     /// or more countries / languages; Esc shows everything (nothing stored), Enter stores the
-    /// rule (no rule yet: the user's country + English + untagged), and the card goes back.
+    /// rule (no rule yet: the user's country + English + untagged), and the card goes back. An
+    /// Enter right as the step appears (meant for "Open Live TV") is ignored.
     #[test]
     fn choose_what_to_show_needs_two_tags_and_stores_the_rule() {
         use super::super::home::testkit::{self, harness, has_label, has_label_containing, rig, until};
@@ -2057,15 +2074,19 @@ mod tests {
         offer(&mut h, &["GB", "FR"]);
         assert_eq!(h.state().s.step, Step::Categories);
         assert_eq!(h.state().s.key_contexts(), vec![KeyContext::Checklist, KeyContext::Modal]);
-        assert!(has_label(&h, "Choose what to show") && has_label_containing(&h, "channels for 2 countries"));
+        assert!(has_label(&h, "Choose what to show") && has_label_containing(&h, "categories in 2 countries and languages"));
         assert!(has_label(&h, "Show everything"), "the button Esc mirrors");
         // Esc: show everything
         h.state_mut().act(Action::Back);
         h.run_steps(1);
         assert_eq!(h.state().s.step, Step::Done);
         assert_eq!(rule(&h), None);
-        // Enter: the defaults are stored
+        // Enter: the defaults are stored, once the step has settled
         offer(&mut h, &["GB", "FR"]);
+        h.state_mut().act(Action::Activate);
+        h.run_steps(1);
+        assert_eq!(h.state().s.step, Step::Categories, "too soon: not for the picker");
+        h.state_mut().s.picker.as_mut().unwrap().1 -= CATEGORIES_SETTLE;
         h.state_mut().act(Action::Activate);
         until(&mut h, "the saved rule", |h| h.state().s.step == Step::Done);
         let r = rule(&h).expect("a rule");

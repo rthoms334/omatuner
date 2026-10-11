@@ -613,6 +613,7 @@ const MENU_CREDENTIALS: u8 = 8;
 const MENU_ATTACH: u8 = 9;
 const MENU_OFFSET_MINUS: u8 = 10;
 const MENU_OFFSET_PLUS: u8 = 11;
+const MENU_CATEGORIES: u8 = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Pane {
@@ -1017,16 +1018,30 @@ impl SettingsScreen {
     }
 
     /// Hidden ▸ "Hidden by the category filter" (DESIGN §28.5): per filtered playlist, a row
-    /// per hidden tag (biggest first; → lists its categories), then "Choose countries…".
+    /// per hidden tag (biggest first; → lists its categories), then "Choose countries…"; a
+    /// playlist with several tags and nothing filtered gets just "Choose countries…".
     fn filtered_rows(&self, ctx: &UiCtx<'_>, v: &mut Vec<Row>) {
         let mut by_tag: HashMap<(SourceId, Option<CategoryTag>), Vec<&Group>> = HashMap::new();
         for g in all_groups(ctx).filter(|g| g.filter == GroupFilter::Hidden) {
             by_tag.entry((g.source_id, g.tag.clone())).or_default().push(g);
         }
+        let multi = categories::multi_tag_sources(ctx.lib);
         for src in &ctx.lib.sources {
             let mut tags: Vec<(&Option<CategoryTag>, &Vec<&Group>)> =
                 by_tag.iter().filter(|((s, _), _)| *s == src.id).map(|((_, t), groups)| (t, groups)).collect();
             if tags.is_empty() {
+                // a playlist in several countries / languages that shows them all: the way in
+                if multi.contains(&src.id) {
+                    v.push(Row::Section(format!("{}: countries and languages", src.name)));
+                    v.push(Row::Item {
+                        item: Item::Categories(src.id),
+                        icon: glyphs::EARTH.to_owned(),
+                        color: None,
+                        label: "Choose countries…".into(),
+                        detail: Some("All countries and languages are shown — hide the ones you don't watch".into()),
+                        reorder: false,
+                    });
+                }
                 continue;
             }
             let items = |gs: &[&Group]| gs.iter().map(|g| g.item_count as u64).sum::<u64>();
@@ -1036,20 +1051,22 @@ impl SettingsScreen {
                 let open = self.expanded.contains(&(src.id, tag.clone()));
                 v.push(Row::Item {
                     item: Item::HiddenTag(src.id, tag.clone()),
-                    icon: if open { glyphs::CHEVRON_LEFT } else { glyphs::CHEVRON_RIGHT }.to_owned(),
+                    icon: if open { glyphs::CHEVRON_DOWN } else { glyphs::CHEVRON_RIGHT }.to_owned(),
                     color: None,
                     label: tag_name(tag.as_ref()),
                     detail: Some(format!("{} · Enter shows · {}", hidden_tag_detail(groups), if open { "← hides the list" } else { "→ lists them" })),
                     reorder: false,
                 });
                 if open {
+                    // the tag leads each detail: these rows belong to the one above
+                    let name = tag_name(tag.as_ref());
                     for g in groups {
                         v.push(Row::Item {
                             item: Item::HiddenGroup(g.id),
                             icon: glyphs::HIDDEN.to_owned(),
                             color: None,
                             label: g.display_name().to_owned(),
-                            detail: Some(format!("{} · Enter shows just this one", kind_name(g.kind))),
+                            detail: Some(format!("{name} · {} · Enter shows just this one", kind_name(g.kind))),
                             reorder: false,
                         });
                     }
@@ -1103,7 +1120,7 @@ impl SettingsScreen {
             icon: glyphs::EARTH.to_owned(),
             color: None,
             label: "Categories…".into(),
-            detail: Some(format!("Countries and languages shown: {}", categories::showing_text(ctx.lib, e.original.id, rule))),
+            detail: Some(categories::showing_text(ctx.lib, e.original.id, rule)),
             reorder: false,
         });
         if let Some(a) = &e.original.status.account {
@@ -1753,6 +1770,7 @@ impl SettingsScreen {
                 }
                 v.push(mi(if s.enabled { glyphs::HIDDEN } else { glyphs::CHECK }, if s.enabled { "Disable" } else { "Enable" }, MENU_TOGGLE));
                 v.push(mi(glyphs::TAG, "Rename…", MENU_RENAME));
+                v.push(mi(glyphs::EARTH, "Countries & languages…", MENU_CATEGORIES));
                 v.extend([
                     mi(glyphs::REORDER, "Move up", MENU_UP),
                     mi(glyphs::REORDER, "Move down", MENU_DOWN),
@@ -1807,6 +1825,7 @@ impl SettingsScreen {
     fn menu_choice(&mut self, ctx: &mut UiCtx<'_>, item: Item, code: u8) {
         match (item, code) {
             (Item::Source(id), MENU_EDIT) => self.item_default(ctx, Item::Source(id)),
+            (Item::Source(id), MENU_CATEGORIES) => ctx.open(OverlayRequest::Categories(id)),
             (Item::Source(id), MENU_CREDENTIALS) => ctx.push(Route::Onboarding(OnboardingStart::NeedsCredentials(id))),
             (Item::Source(id), MENU_REFRESH) => {
                 ctx.services.jobs.submit(JobKind::RefreshSource { source: id, force: true });

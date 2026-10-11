@@ -44,6 +44,8 @@ pub const PLAYLIST: &str = "\u{f0411}";
 pub const INFO: &str = "\u{f02fd}";
 pub const CHEVRON_LEFT: &str = "\u{f0141}";
 pub const CHEVRON_RIGHT: &str = "\u{f0142}";
+/// An expanded row (nf-md-chevron_down).
+pub const CHEVRON_DOWN: &str = "\u{f0140}";
 pub const CHECK: &str = "\u{f012c}";
 /// Tick-list boxes (nf-md-checkbox_marked / nf-md-checkbox_blank_outline).
 pub const CHECKBOX_ON: &str = "\u{f0132}";

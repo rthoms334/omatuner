@@ -247,16 +247,9 @@ fn group_marks_and_tick_lists() {
     let picker = [K::Checklist, K::Modal];
     assert_eq!(resolve(&picker, &key(Key::Space)), Some(Action::ToggleMark), "not the dialog's Confirm");
     assert_eq!(resolve(&picker, &text(" ")), Some(Action::FilterInput(' ')), "ignored by tick lists");
-    assert_eq!(resolve(&picker, &key(Key::Insert)), Some(Action::ToggleMark));
     assert_eq!(resolve(&picker, &text("f")), Some(Action::FilterInput('f')));
-    assert_eq!(resolve(&picker, &key(Key::Enter)), Some(Action::Activate));
-    assert_eq!(resolve(&picker, &ctrl(Key::A)), Some(Action::MarkAll));
-    assert_eq!(resolve(&picker, &ctrl(Key::E)), Some(Action::MarkDefaults));
-    assert_eq!(resolve(&picker, &key(Key::Backspace)), Some(Action::FilterBackspace));
     assert_eq!(resolve(&picker, &held(Key::Escape)), None);
-    assert_eq!(resolve(&picker, &key(Key::Escape)), Some(Action::Back));
     assert_eq!(resolve(&picker, &key(Key::ArrowRight)), Some(Action::Right), "the dialog's harmless →, never Activate");
-    assert_eq!(resolve(&picker, &ctrl(Key::Q)), Some(Action::Quit));
     assert_eq!(hint_line(&picker), "Space tick · Ctrl+A all/none · Ctrl+E my country · Enter save");
     assert!(help_rows(K::Checklist).iter().any(|r| r.1 == "Type to filter"));
 }

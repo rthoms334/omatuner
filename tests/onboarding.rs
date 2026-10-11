@@ -333,7 +333,9 @@ fn m3u_file_with_several_countries_asks_what_to_show() {
     press(&mut h, Action::Activate);
     until(&mut h, "the picker", |h| has(h, "Choose what to show"));
     assert_eq!(h.state().s.key_contexts(), vec![KeyContext::Checklist, KeyContext::Modal]);
-    assert!(has_containing(&h, "channels for 3 countries"), "UK, France, Arabic");
+    assert!(has_containing(&h, "categories in 3 countries and languages"), "UK, France, Arabic");
+    // Enter is ignored for a moment after the step appears on its own
+    std::thread::sleep(std::time::Duration::from_millis(450));
     press(&mut h, Action::Activate);
     until(&mut h, "the import", |h| has(h, "All set"));
     let rule = h.state().sources()[0].settings.category_filter.clone().expect("a rule");

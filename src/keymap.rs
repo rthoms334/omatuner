@@ -188,7 +188,8 @@ pub enum Action {
     MarkAll,
     /// Ctrl+E in the category picker: just the user's country + English.
     MarkDefaults,
-    /// Ctrl+Shift+H while a group pane is filtered: hide every provider group it shows.
+    /// Ctrl+Shift+H while a group pane is filtered: hide the provider groups it shows whose
+    /// names have a word starting with each word typed (not every fuzzy match).
     HideShown,
     /// Delete: remove from a favourites list / cancel a job / forget an orphan / cancel a
     /// reminder (whatever "remove" means for the focused row).
@@ -363,7 +364,7 @@ pub static GLOBAL: &[Binding] = &[
 pub static ITEM_ACTIONS: &[Binding] = &[
     b(C::ctrl(Key::F), A::ToggleFavourite, "Add to / remove from Favourites"),
     b(C::ctrl_shift(Key::F), A::AddToList, "Favourites lists… (add, new list)"),
-    b(C::ctrl(Key::H), A::ToggleHidden, "Hide / unhide (groups: every marked one)"),
+    b(C::ctrl(Key::H), A::ToggleHidden, "Hide / unhide"),
     b(C::key(Key::F2), A::Rename, "Rename"),
     b(C::ctrl(Key::L), A::ToggleLock, "Lock with PIN / unlock"),
     b(C::alt(Key::ArrowUp), A::MoveUp, "Move up (reorder)"),
@@ -417,7 +418,7 @@ pub static LIST_FILTERING: &[Binding] = &[
     b(C::shift(Key::Tab), A::FocusPrev, "Next / previous pane"),
     // Space types here (filters have spaces); Insert still marks
     b(C::key(Key::Insert), A::ToggleMark, "Mark group (Ctrl+H then hides all marked)"),
-    b(C::ctrl_shift(Key::H), A::HideShown, "Hide all groups shown"),
+    b(C::ctrl_shift(Key::H), A::HideShown, "Hide the groups with the words typed"),
     // printable keys → FilterInput
 ];
 

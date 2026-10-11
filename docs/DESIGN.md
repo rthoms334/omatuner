@@ -1759,7 +1759,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Space` / `Insert` | Mark group (Ctrl+H then hides all marked) |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
-| `Ctrl+H` | Hide / unhide (groups: every marked one) |
+| `Ctrl+H` | Hide / unhide |
 | `F2` | Rename |
 | `Ctrl+L` | Lock with PIN / unlock |
 | `Alt+↑` | Move up (reorder) |
@@ -1786,10 +1786,10 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Ctrl+U` / `Esc` | Clear filter |
 | `Tab` / `Shift+Tab` | Next / previous pane |
 | `Insert` | Mark group (Ctrl+H then hides all marked) |
-| `Ctrl+Shift+H` | Hide all groups shown |
+| `Ctrl+Shift+H` | Hide the groups with the words typed |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
-| `Ctrl+H` | Hide / unhide (groups: every marked one) |
+| `Ctrl+H` | Hide / unhide |
 | `F2` | Rename |
 | `Ctrl+L` | Lock with PIN / unlock |
 | `Alt+↑` | Move up (reorder) |
@@ -1836,7 +1836,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `?` | Keyboard help |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
-| `Ctrl+H` | Hide / unhide (groups: every marked one) |
+| `Ctrl+H` | Hide / unhide |
 | `F2` | Rename |
 | `Ctrl+L` | Lock with PIN / unlock |
 | `Alt+↑` | Move up (reorder) |
@@ -1864,7 +1864,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Tab` / `Shift+Tab` | Next / previous pane |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
-| `Ctrl+H` | Hide / unhide (groups: every marked one) |
+| `Ctrl+H` | Hide / unhide |
 | `F2` | Rename |
 | `Ctrl+L` | Lock with PIN / unlock |
 | `Alt+↑` | Move up (reorder) |
@@ -1893,7 +1893,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `?` | Keyboard help |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
-| `Ctrl+H` | Hide / unhide (groups: every marked one) |
+| `Ctrl+H` | Hide / unhide |
 | `F2` | Rename |
 | `Ctrl+L` | Lock with PIN / unlock |
 | `Alt+↑` | Move up (reorder) |
@@ -3186,8 +3186,10 @@ FR→fr, DE/AT→de, ES/MX/AR…→es, IT→it, PT/BR→pt, NL→nl, TR→tr, PL
 * **Hidden by the category filter** — one section per filtered source: a row per hidden tag
   ("Arabic · 112 categories · 4 380 channels"), Enter = **show this country** (adds the tag
   to `keep`; toast "Arabic shown"), → expands the tag's categories in place (← collapses);
-  Enter on a category row shows just that one (`show_group(…, exempt: true)`). A last row
-  "Choose countries…" opens the picker.
+  Enter on a category row shows just that one (`show_group(…, exempt: true)`). Expanded tags
+  show a down chevron and their category rows' detail starts with the tag ("Arabic · Live TV ·
+  Enter shows just this one"). A last row "Choose countries…" opens the picker. A playlist
+  with ≥ 2 tags and nothing filtered gets a section with just "Choose countries…".
 * **Hidden groups**: only groups the user hid (`hidden && filter != Hidden`), Enter unhides
   (`show_group(…, exempt: filter != Kept)`).
 * **Hidden channels**: only channels hidden by their own override, i.e. channels of
@@ -3211,17 +3213,32 @@ FR→fr, DE/AT→de, ES/MX/AR…→es, IT→it, PT/BR→pt, NL→nl, TR→tr, PL
   absent tags such as the English defaults survive; `known` = present tags), Esc clears the
   filter, then cancels. Buttons under the list mirror the keys (Select all · None · My country +
   English · Save · Cancel). Saving with every tag and untagged ticked stores `None` (no rule).
-  Live: the library rebuild after save applies it.
+  Live: the library rebuild after save applies it. A line above the buttons shows the effect of
+  the ticks ("6 of 42 ticked · 3 210 of 48 900 channels"); ticks that keep nothing of the
+  playlist add a `warning` line "Nothing from this playlist will show." and the first Enter on
+  them only arms it ("— Enter again to save anyway"). Copy says "countries and languages"
+  (tags are also languages and regions); the save toast: "Showing 6 of 41 countries and
+  languages · Settings ▸ Hidden items shows the rest". The key line under the buttons is
+  `keymap::hint_line([Checklist, Modal])` + "Esc cancel" / "Esc show everything".
 * **Onboarding** (§13.10): after the Import step's channels phase, the wizard loads the summary
   of the new source; with `tag_count() ≥ 2` it shows the **Choose what to show** step (the
   import continues; its progress line stays visible under the list). Enter saves and returns to
   the import / Done step; Esc ("Show everything") saves nothing. Card copy: "This playlist has
-  channels for 41 countries. Pick the ones you want — you can change this later in Settings ▸
-  Playlists." Same for Settings ▸ Add (same card).
-* **Settings ▸ Playlists ▸ <playlist>**: a "Categories…" row (detail: "All countries" /
-  "4 of 41 countries") opens the same picker as an overlay
-  (`OverlayRequest::Categories(SourceId)`); with `needs_refresh` the picker shows a note and a
-  "Refresh now" button.
+  categories in 41 countries and languages. Pick the ones you want — you can change this later
+  in Settings ▸ Playlists." Same for Settings ▸ Add (same card). The step appears on its own
+  just as "Open Live TV" turns on, so Enter is ignored for its first 400 ms (an Enter meant for
+  that button must not save the defaults unseen); leaving and re-entering the card keeps the
+  step. Not offered when the playlist already has a rule (a restored one).
+* **Settings ▸ Playlists ▸ <playlist>**: a "Categories…" row (detail: "All countries and
+  languages" / "4 of 41 countries and languages") opens the same picker as an overlay
+  (`OverlayRequest::Categories(SourceId)`); with `needs_refresh` the picker shows a note ("…
+  refresh to find them all (Ctrl+R)") and a "Refresh now" button, and Ctrl+R / F5 in the picker
+  runs a **forced** refresh of that playlist (an unforced one may get "304 Not Modified" and
+  never write the raw names).
+* **Ways in for playlists added before this phase** (the user's case): "Countries &
+  languages…" in the playlist row's menu (Settings ▸ Playlists), in the Live group menu and the
+  Movies / Series category menu (groups of a playlist with ≥ 2 tags), and Settings ▸ Hidden
+  lists "Choose countries…" for every playlist with ≥ 2 tags, filtered or not.
 
 ### 28.7 Bulk hide in group panes (Live groups, Movies / Series categories)
 * **Marks**: Space (List context, empty filter — a leading space is ignored by the filter
@@ -3235,12 +3252,19 @@ FR→fr, DE/AT→de, ES/MX/AR…→es, IT→it, PT/BR→pt, NL→nl, TR→tr, PL
   groups · Settings ▸ Hidden shows them again"; without marks it is unchanged (the focused
   group).
 * **Ctrl+Shift+H** (ListFiltering only) "Hide these N groups": the provider groups the filter
-  shows, after a Confirm ("Hide 37 groups?", not destructive) when N > 1. The pane footer shows
-  "37 groups · Ctrl+Shift+H hides them" while filtering and "5 marked · Ctrl+H hides · Esc
-  clears" while marks exist; the context menu (Ctrl+Enter) lists both actions.
+  shows **whose names (with the tag code) have a word starting with each word typed** — the
+  fuzzy filter also shows "Cartoons", "Documentary" for "ar", which a bulk hide must not take —
+  after a Confirm ("Hide 37 groups?", not destructive; the body names the first 5 "… and 32
+  more") when N > 1. The pane footer shows "37 groups with “ar” · Ctrl+Shift+H hides them" while
+  filtering and "5 marked · Ctrl+H hides · Esc clears" while marks exist (keys from the keymap);
+  the context menu (Ctrl+Enter) lists both actions. Movies / Series say "categories".
+* A resolved plain `Key::Space` drops its `Text(" ")` twin in `raw_input_hook` (like Alt
+  chords): Space choosing a menu item closes the menu in that frame, and the twin would
+  otherwise reach the pane below as ToggleMark.
 * Ctrl+Space is not used (fcitx5's input-method toggle on Omarchy).
 * Group rows show the tag's short code as a muted suffix badge when their source has ≥ 2 tags
-  (smart names drop "UK |", so "UK | Sports" and "US | Sports" otherwise both read "Sports").
+  (smart names drop "UK |", so "UK | Sports" and "US | Sports" otherwise both read "Sports"),
+  unless the name already shows the code as a word ("|UK| Sports" with smart names off).
 
 **Keymap changes** (`src/keymap.rs`; §15.2 regenerated with `cargo run --example keymap_md`):
 new actions `ToggleMark`, `MarkAll`, `MarkDefaults`, `HideShown`; new context
@@ -3249,11 +3273,12 @@ new actions `ToggleMark`, `MarkAll`, `MarkDefaults`, `HideShown`; new context
 Backspace, Ctrl+Backspace, Ctrl+U, Esc → Back "Clear the filter, then cancel") instead of
 stacking on `List`, where → would be Activate (save) and Backspace Parent. `Key::Space` / Insert →
 ToggleMark "Tick / untick" (the KEY, because `Modal` below binds `Key::Space` to Confirm; the
-`Text(" ")` twin arrives as `FilterInput(' ')`, which the picker ignores), Ctrl+A → MarkAll
+`Text(" ")` twin is dropped by `raw_input_hook`), Ctrl+A → MarkAll
 "Tick all / none", Ctrl+E → MarkDefaults "Just my country + English", Enter → Activate "Save";
 hints `tick · all/none · my country · save`.
 LIST: `Char(' ')` and Insert → ToggleMark "Mark group (Ctrl+H then hides all marked)";
-LIST_FILTERING: Insert → ToggleMark, Ctrl+Shift+H → HideShown "Hide all groups shown". Space is
+LIST_FILTERING: Insert → ToggleMark, Ctrl+Shift+H → HideShown "Hide the groups with the words
+typed". Space is
 bound as `Char(' ')` (the Text event), never `Key::Space`, so it never also types into the
 filter. Screens without marks ignore ToggleMark; the jobs overlay (`[List, Modal]`) too.
 

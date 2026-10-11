@@ -506,8 +506,12 @@ struct GroupItem {
     group: Group,
     /// Filter haystack.
     name: String,
-    /// Short code of the group's country / language tag, when its playlist has several.
+    /// Short code of the group's country / language tag, when its playlist has several and
+    /// the name doesn't show it already.
     tag: Option<String>,
+    /// What "Hide these N groups" matches words against: the name and the tag's code
+    /// (provider groups only).
+    words: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -523,6 +527,10 @@ enum Menu {
     Context,
     Sort,
 }
+
+/// The groups menu's "Countries & languages…" (echoed back as `Action::Digit`; channel numbers
+/// never come from a menu).
+const MENU_COUNTRIES: u8 = 200;
 
 /// Detail line of the "No playlists yet" empty state (Live and the guide).
 pub(crate) const EMPTY_LIBRARY_DETAIL: &str = "Add an M3U playlist or an Xtream login to start watching — press Enter.";
@@ -578,6 +586,9 @@ pub struct LiveScreen {
     layout: Option<LayoutClass>,
     /// Groups marked for a bulk hide (DESIGN §28.7).
     marks: GroupMarks,
+    /// Indices into `groups` of the provider groups the filter shows whose names have the
+    /// words typed: what "Hide these N groups" hides.
+    matching: Vec<u32>,
 }
 
 /// Channel management shared by Live and the Guide: favourite, lists, hide, rename, lock (the
@@ -731,16 +742,40 @@ impl LiveScreen {
         if !ctx.lib.is_empty() || !live.channels.is_empty() {
             for l in &ctx.favs.lists {
                 let name = format!("{} {}", glyphs::FAVOURITE, l.name);
-                v.push(GroupItem { entry: Entry::FavList(l.id), group: synthetic_group(name.clone(), ctx.favs.items(l.id).len()), name, tag: None });
+                v.push(GroupItem {
+                    entry: Entry::FavList(l.id),
+                    group: synthetic_group(name.clone(), ctx.favs.items(l.id).len()),
+                    name,
+                    tag: None,
+                    words: String::new(),
+                });
             }
             let name = format!("{} History", glyphs::HISTORY);
-            v.push(GroupItem { entry: Entry::History, group: synthetic_group(name.clone(), ctx.lib.recent_channels.len()), name, tag: None });
+            v.push(GroupItem {
+                entry: Entry::History,
+                group: synthetic_group(name.clone(), ctx.lib.recent_channels.len()),
+                name,
+                tag: None,
+                words: String::new(),
+            });
             if !self.reminders.is_empty() {
                 let name = format!("{} Reminders", glyphs::REMINDER);
-                v.push(GroupItem { entry: Entry::Reminders, group: synthetic_group(name.clone(), self.reminders.len()), name, tag: None });
+                v.push(GroupItem {
+                    entry: Entry::Reminders,
+                    group: synthetic_group(name.clone(), self.reminders.len()),
+                    name,
+                    tag: None,
+                    words: String::new(),
+                });
             }
             let visible = live.channels.len().saturating_sub(live.hidden.len());
-            v.push(GroupItem { entry: Entry::All, group: synthetic_group("All channels".into(), visible), name: "All channels".into(), tag: None });
+            v.push(GroupItem {
+                entry: Entry::All,
+                group: synthetic_group("All channels".into(), visible),
+                name: "All channels".into(),
+                tag: None,
+                words: String::new(),
+            });
             let multi = ctx.lib.sources.len() > 1;
             let tagged = crate::ui::overlays::categories::multi_tag_sources(ctx.lib);
             for g in live.visible_groups(None, ctx.config.interface.hide_empty_groups) {
@@ -751,12 +786,17 @@ impl LiveScreen {
                     name = format!("{name} · {}", s.name);
                     group.rename = Some(name.clone());
                 }
-                let tag = g.tag.as_ref().filter(|_| tagged.contains(&g.source_id)).map(crate::sources::category_tags::tag_short);
+                let code = g.tag.as_ref().filter(|_| tagged.contains(&g.source_id)).map(crate::sources::category_tags::tag_short);
                 // the code filters too ("uk" finds the UK groups smart names renamed to "Sports")
-                if let Some(code) = &tag {
-                    name = format!("{name} {code}");
-                }
-                v.push(GroupItem { entry: Entry::Group(g.id), group, name, tag });
+                let words = match &code {
+                    Some(code) => {
+                        name = format!("{name} {code}");
+                        format!("{} {code}", g.display_name())
+                    }
+                    None => g.display_name().to_owned(),
+                };
+                let tag = code.filter(|c| !group_marks::has_words(g.display_name(), c));
+                v.push(GroupItem { entry: Entry::Group(g.id), group, name, tag, words });
             }
         }
         self.groups = v;
@@ -772,6 +812,17 @@ impl LiveScreen {
     fn refilter_groups(&mut self) {
         self.group_rows = self.group_list.filter.apply(self.groups.iter().map(|g| g.name.as_str()));
         self.group_list.set_len(self.group_rows.len());
+        let q = self.group_list.filter.query();
+        self.matching = if q.is_empty() {
+            Vec::new()
+        } else {
+            let groups = &self.groups;
+            self.group_rows
+                .iter()
+                .copied()
+                .filter(|&r| groups.get(r as usize).is_some_and(|g| matches!(g.entry, Entry::Group(_)) && group_marks::word_match(q, &g.words)))
+                .collect()
+        };
     }
 
     /// Channels of the open group (sorted like the zap order) + filter haystacks.
@@ -855,11 +906,6 @@ impl LiveScreen {
     fn cursor_provider_group(&self, ctx: &UiCtx<'_>) -> Option<Group> {
         let Some(Entry::Group(id)) = self.cursor_group().map(|g| &g.entry) else { return None };
         ctx.lib.live.groups.iter().find(|x| x.id == *id).cloned()
-    }
-
-    /// Provider groups the groups filter shows ("Hide these N groups").
-    fn shown_provider_groups(&self) -> usize {
-        self.group_rows.iter().filter(|&&r| self.groups.get(r as usize).is_some_and(|g| matches!(g.entry, Entry::Group(_)))).count()
     }
 
     /// Open a group: list its channels, cursor on the first.
@@ -973,7 +1019,7 @@ impl LiveScreen {
                     if !self.marks.hide_marked(ctx)
                         && let Some(g) = self.cursor_provider_group(ctx)
                     {
-                        group_marks::hide(ctx, vec![crate::model::GroupRef::from(&g)], Some(g.display_name()));
+                        group_marks::hide(ctx, group_marks::Noun::Group, vec![crate::model::GroupRef::from(&g)], Some(g.display_name()));
                     }
                     true
                 }
@@ -989,15 +1035,9 @@ impl LiveScreen {
                     true
                 }
                 Action::HideShown => {
-                    let shown: Vec<Group> = self
-                        .group_rows
-                        .iter()
-                        .filter_map(|&r| match self.groups.get(r as usize).map(|g| &g.entry) {
-                            Some(Entry::Group(id)) => ctx.lib.live.groups.iter().find(|x| x.id == *id).cloned(),
-                            _ => None,
-                        })
-                        .collect();
-                    self.marks.hide_shown(ctx, &shown);
+                    // the row's group carries the source, kind and key the hide needs
+                    let shown: Vec<&Group> = self.matching.iter().filter_map(|&r| self.groups.get(r as usize)).map(|g| &g.group).collect();
+                    self.marks.hide_shown(ctx, self.group_list.filter.query(), &shown);
                     true
                 }
                 Action::ToggleLock => {
@@ -1068,8 +1108,18 @@ impl LiveScreen {
                     menu_item(glyphs::CHECK, if self.marks.is_marked(*id) { "Unmark" } else { "Mark for hiding" }, Action::ToggleMark, true, k),
                 ];
                 if self.group_list.filter.is_active() {
-                    let n = self.shown_provider_groups();
+                    let n = self.matching.len();
                     v.push(menu_item(glyphs::HIDDEN, format!("Hide these {n} groups"), Action::HideShown, n > 0, KeyContext::ListFiltering));
+                }
+                // the category filter of the group's playlist (DESIGN §28.6)
+                if crate::ui::overlays::categories::multi_tag_sources(ctx.lib).contains(&g.group.source_id) {
+                    v.push(MenuItem {
+                        icon: glyphs::EARTH,
+                        label: "Countries & languages…".into(),
+                        action: Action::Digit(MENU_COUNTRIES),
+                        enabled: true,
+                        shortcut: None,
+                    });
                 }
                 v.extend([
                     menu_item(glyphs::LOCK, if g.group.locked { "Unlock group" } else { "Lock group" }, Action::ToggleLock, true, k),
@@ -1425,7 +1475,7 @@ impl LiveScreen {
         let row_h = row_height(theme, ctx.config.interface.density, false);
         let open = self.open_index();
         let virtual_count = self.groups.iter().take_while(|g| !matches!(g.entry, Entry::Group(_))).count();
-        let footer = self.marks.footer(self.group_list.filter.is_active(), self.shown_provider_groups());
+        let footer = self.marks.footer(self.group_list.filter.query(), self.matching.len());
         let (groups, rows, marks) = (&self.groups, &self.group_rows, &self.marks);
         let mut clicked = None;
         let list = &mut self.group_list;
@@ -1941,6 +1991,11 @@ impl Screen for LiveScreen {
                     if let Some((_, mode)) = choice_index(action).and_then(|i| SORTS.get(i)) {
                         let mode = *mode;
                         ctx.edit_config(move |c| c.interface.live_sort = mode);
+                    }
+                }
+                Some(Menu::Context) if action == Action::Digit(MENU_COUNTRIES) => {
+                    if let Some(g) = self.cursor_provider_group(ctx) {
+                        ctx.open(OverlayRequest::Categories(g.source_id));
                     }
                 }
                 _ => {

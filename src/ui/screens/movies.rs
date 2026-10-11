@@ -105,6 +105,8 @@ const MENU_OPEN: u8 = 20;
 const MENU_PLAY: u8 = 21;
 /// Category context-menu "Open".
 const MENU_OPEN_CAT: u8 = 22;
+/// The categories menu's "Countries & languages…".
+const MENU_COUNTRIES: u8 = 23;
 
 /// Identity of the library snapshot (indices into it are only valid for that snapshot; two
 /// rebuilds can share a `built_at` second).
@@ -196,6 +198,9 @@ pub(super) struct VodBrowser {
     marks: GroupMarks,
     /// Short tag codes of the categories of playlists with several tags, per library build.
     tags: (u64, HashMap<GroupId, String>),
+    /// The categories the filter shows whose names have the words typed: what "Hide these N
+    /// categories" hides.
+    matching: Vec<GroupId>,
 }
 
 /// One playlist's titles in the custom order the user arranged with Alt+↑/↓ (the whole
@@ -252,6 +257,7 @@ impl VodBrowser {
 
     pub(super) fn enter(&mut self, ctx: &mut UiCtx<'_>, movies: bool, group: Option<GroupId>) {
         self.movies = movies;
+        self.marks.set_noun(group_marks::Noun::Category);
         if let Some(g) = group {
             self.open = Cat::Group(g);
             self.pane = Pane::Grid;
@@ -370,21 +376,21 @@ impl VodBrowser {
             Some(code) => format!("{} {code}", g.display_name()),
             None => g.display_name().to_owned(),
         }));
-        self.cat_rows = self.cats.filter.apply(names.iter().map(String::as_str)).into_iter().map(|i| all[i as usize]).collect();
-        self.cats.set_len(self.cat_rows.len());
-        self.marks.retain(|id| groups.iter().any(|g| g.id == id));
-    }
-
-    /// Provider categories the categories filter shows ("Hide these N groups").
-    fn shown_groups<'l>(&self, ctx: &'l UiCtx<'_>) -> Vec<&'l crate::model::Group> {
-        let all = self.all_groups(ctx);
-        self.cat_rows
+        let shown = self.cats.filter.apply(names.iter().map(String::as_str));
+        let q = self.cats.filter.query();
+        self.matching = shown
             .iter()
-            .filter_map(|c| match c {
-                Cat::Group(g) => all.iter().find(|x| x.id == *g),
+            .map(|&i| i as usize)
+            .filter(|&i| i >= 3 && group_marks::word_match(q, &names[i]))
+            .filter_map(|i| match all[i] {
+                Cat::Group(id) => Some(id),
                 _ => None,
             })
-            .collect()
+            .collect();
+        self.cat_rows = shown.into_iter().map(|i| all[i as usize]).collect();
+        self.cats.set_len(self.cat_rows.len());
+        let listed: std::collections::HashSet<GroupId> = groups.iter().map(|g| g.id).collect();
+        self.marks.retain(|id| listed.contains(&id));
     }
 
     /// Progress by list index (posters look it up per visible card, without cloning keys).
@@ -682,8 +688,9 @@ impl VodBrowser {
             return true;
         }
         if action == Action::HideShown {
-            let shown: Vec<crate::model::Group> = self.shown_groups(ctx).into_iter().cloned().collect();
-            self.marks.hide_shown(ctx, &shown);
+            let by_id: HashMap<GroupId, &crate::model::Group> = self.all_groups(ctx).iter().map(|g| (g.id, g)).collect();
+            let shown: Vec<crate::model::Group> = self.matching.iter().filter_map(|id| by_id.get(id).map(|g| (*g).clone())).collect();
+            self.marks.hide_shown(ctx, self.cats.filter.query(), &shown.iter().collect::<Vec<_>>());
             return true;
         }
         let Some(g) = self.current_group(ctx).cloned() else {
@@ -693,7 +700,9 @@ impl VodBrowser {
         match action {
             Action::ToggleLock => kit::toggle_group_lock(ctx, &g),
             Action::Rename => kit::rename_group(ctx, &g),
-            Action::ToggleHidden => group_marks::hide(ctx, vec![crate::model::GroupRef::from(&g)], Some(g.display_name())),
+            Action::ToggleHidden => {
+                group_marks::hide(ctx, group_marks::Noun::Category, vec![crate::model::GroupRef::from(&g)], Some(g.display_name()))
+            }
             Action::ToggleMark => {
                 self.marks.toggle(&g);
                 self.action(ctx, Action::Down);
@@ -728,8 +737,12 @@ impl VodBrowser {
                     mi(glyphs::CHECK, if self.marks.is_marked(g.id) { "Unmark" } else { "Mark for hiding" }, Action::ToggleMark, "Space"),
                 ];
                 if self.cats.filter.is_active() {
-                    let n = self.shown_groups(ctx).len();
+                    let n = self.matching.len();
                     items.push(mi(glyphs::HIDDEN, &format!("Hide these {n} categories"), Action::HideShown, "Ctrl+Shift+H"));
+                }
+                // the category filter of the category's playlist (DESIGN §28.6)
+                if self.tags.1.contains_key(&g.id) {
+                    items.push(MenuItem { shortcut: None, ..mi(glyphs::EARTH, "Countries & languages…", Action::Digit(MENU_COUNTRIES), "") });
                 }
                 items.extend([mi(glyphs::REORDER, "Move up", Action::MoveUp, "Alt+↑"), mi(glyphs::REORDER, "Move down", Action::MoveDown, "Alt+↓")]);
                 ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: g.display_name().to_owned(), items }));
@@ -864,6 +877,11 @@ impl VodBrowser {
             OverlayResult::Chosen(Action::Digit(MENU_OPEN_CAT)) => {
                 if let Some(c) = self.cat_rows.get(self.cats.cursor).copied() {
                     self.open_cat(ctx, c, true);
+                }
+            }
+            OverlayResult::Chosen(Action::Digit(MENU_COUNTRIES)) => {
+                if let Some(g) = self.current_group(ctx) {
+                    ctx.open(OverlayRequest::Categories(g.source_id));
                 }
             }
             OverlayResult::Chosen(Action::SortMenu) => self.sort_menu(ctx),
@@ -1003,7 +1021,7 @@ impl VodBrowser {
         let groups: HashMap<GroupId, &crate::model::Group> = self.groups(ctx).into_iter().map(|g| (g.id, g)).collect();
         let virtual_names = [self.virtual_name(Cat::All), self.virtual_name(Cat::Continue), self.virtual_name(Cat::Favourites)];
         let total = self.all(ctx).len();
-        let footer = self.marks.footer(self.cats.filter.is_active(), rows_snapshot.iter().filter(|c| matches!(c, Cat::Group(_))).count());
+        let footer = self.marks.footer(self.cats.filter.query(), self.matching.len());
         let (marks, tags, movies, cats) = (&self.marks, &self.tags.1, self.movies, &mut self.cats);
         let outcome = group_marks::with_footer(ui, theme, footer.as_deref(), |ui| {
             virtual_list(ui, theme, ("vod-cats", movies), cats, row_h, |ui, rc| {
@@ -1019,7 +1037,11 @@ impl VodBrowser {
                         theme,
                         g,
                         state,
-                        rows::GroupDecor { marked: marks.is_marked(g.id), tag: tags.get(&g.id).map(String::as_str) },
+                        rows::GroupDecor {
+                            marked: marks.is_marked(g.id),
+                            // no badge where the name shows the code already ("|UK| Sports")
+                            tag: tags.get(&g.id).map(String::as_str).filter(|c| !group_marks::has_words(g.display_name(), c)),
+                        },
                     ),
                     None => {
                         let name = match cat {

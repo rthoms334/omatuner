@@ -1074,17 +1074,18 @@ fn live_reminders_rows_and_group_reorder() {
 
 /// DESIGN §28.7 bulk hide in the groups pane: Space marks provider groups (never the virtual
 /// rows) and moves down; Esc clears the marks before it leaves the pane; Ctrl+H hides every
-/// marked group; while filtering, Ctrl+Shift+H hides exactly the groups shown, once confirmed.
+/// marked group; while filtering, Ctrl+Shift+H hides the groups shown that have the words
+/// typed (not every fuzzy match: "ar" never takes "Cartoons"), once confirmed.
 #[test]
 fn live_bulk_hide_of_marked_and_filtered_groups() {
     let _one = one();
     let (mut t, _ids) = seeded(10, 0, None);
-    // groups: All, News (seeded), then Sport 1, Sport 2, Kids
+    // groups: All, News (seeded), then Sport 1, Sport 2, Kids, Cartoons, Arabic News, AR | Movies
     t.services()
         .store
         .writer()
         .blocking(|c| {
-            for (i, name) in ["Sport 1", "Sport 2", "Kids"].iter().enumerate() {
+            for (i, name) in ["Sport 1", "Sport 2", "Kids", "Cartoons", "Arabic News", "AR | Movies"].iter().enumerate() {
                 c.execute(
                     "INSERT INTO grp(source_id, kind, key, name, provider_order, item_count, seen_gen) VALUES (1,'channel',?1,?2,?3,1,1)",
                     rusqlite::params![format!("channel:x{i}"), name, 2 + i as i64],
@@ -1119,7 +1120,7 @@ fn live_bulk_hide_of_marked_and_filtered_groups() {
     hact(&mut h, Action::FocusNext);
     assert!(hact(&mut h, Action::ToggleMark));
     assert!(h.state().t.toasts.iter().any(|t| t.text == "Only playlist groups can be marked"));
-    // All and News marked (Space moves down)
+    // News and Sport 1 marked (Space moves down)
     hact(&mut h, Action::Down);
     hact(&mut h, Action::ToggleMark);
     hact(&mut h, Action::ToggleMark);
@@ -1146,7 +1147,7 @@ fn live_bulk_hide_of_marked_and_filtered_groups() {
         hact(&mut h, Action::FilterInput(c));
     }
     h.run_steps(2);
-    assert!(has(&h, "2 groups · Ctrl+Shift+H hides them"));
+    assert!(has(&h, "2 groups with “sport” · Ctrl+Shift+H hides them"));
     h.state_mut().t.nav.clear();
     assert!(hact(&mut h, Action::HideShown));
     let token = match opened(&h.state().t).as_slice() {
@@ -1163,6 +1164,29 @@ fn live_bulk_hide_of_marked_and_filtered_groups() {
     }
     wait_hidden(&h, &["channel:news", "channel:x0", "channel:x1", "channel:x2"]);
     assert_eq!(h.state().s.key_contexts(), [KeyContext::List], "the filter is cleared");
+    // "ar" also shows "Cartoons" (fuzzy), but only the groups with a word starting "ar" go
+    reload(&mut h.state_mut().t);
+    h.run_steps(2);
+    for c in "ar".chars() {
+        hact(&mut h, Action::FilterInput(c));
+    }
+    h.run_steps(2);
+    assert!(has(&h, "Cartoons"));
+    assert!(has(&h, "2 groups with “ar” · Ctrl+Shift+H hides them"));
+    h.state_mut().t.nav.clear();
+    hact(&mut h, Action::HideShown);
+    let token = match opened(&h.state().t).as_slice() {
+        [OverlayRequest::Confirm(c)] => {
+            assert!(c.body.contains("Arabic News") && c.body.contains("AR | Movies") && !c.body.contains("Cartoons"), "{}", c.body);
+            c.token
+        }
+        other => panic!("{other:?}"),
+    };
+    {
+        let ScreenApp { t, s } = h.state_mut();
+        t.with_ctx(|ctx| s.on_overlay_result(ctx, overlays::OverlayResult::Confirmed(token)));
+    }
+    wait_hidden(&h, &["channel:news", "channel:x0", "channel:x1", "channel:x2", "channel:x4", "channel:x5"]);
 }
 
 #[test]

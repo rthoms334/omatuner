@@ -13,7 +13,11 @@
 //!   present. Everything ticked stores no rule at all.
 //! * Keys (`[Checklist, Modal]`): ↑/↓ move, Space / Insert tick, Ctrl+A all / none of the rows
 //!   shown, Ctrl+E just my country + English, typing filters, Enter saves, Esc clears the
-//!   filter, then cancels.
+//!   filter, then cancels. F5 / Ctrl+R on a playlist imported before tags were recognised
+//!   (`needs_refresh`) runs a forced refresh of it (an unforced one may get "304 Not Modified"
+//!   and never write the raw names).
+//! * A line above the buttons says what the ticks show ("6 of 42 ticked · 3 210 of 48 900
+//!   channels"). Ticks that show nothing of the playlist warn, and Enter then asks once more.
 //! * Data is read off the UI thread and re-read whenever the library changes while the picker
 //!   is open (Xtream movie / series categories import after the channels); the ticks survive.
 
@@ -103,7 +107,8 @@ pub(crate) fn multi_tag_sources(lib: &Library) -> HashSet<SourceId> {
     multi
 }
 
-/// "All countries" / "4 of 41 countries" for a playlist (its tags in the library).
+/// "All countries and languages" / "4 of 41 countries and languages" for a playlist (its tags
+/// in the library).
 pub(crate) fn showing_text(lib: &Library, source: SourceId, rule: Option<&CategoryFilter>) -> String {
     let present: BTreeSet<&CategoryTag> = lib
         .live
@@ -115,8 +120,8 @@ pub(crate) fn showing_text(lib: &Library, source: SourceId, rule: Option<&Catego
         .filter_map(|g| g.tag.as_ref())
         .collect();
     match rule {
-        None => "All countries".into(),
-        Some(r) => format!("{} of {} countries", present.iter().filter(|t| r.keep.contains(**t)).count(), present.len()),
+        None => "All countries and languages".into(),
+        Some(r) => format!("{} of {} countries and languages", present.iter().filter(|t| r.keep.contains(**t)).count(), present.len()),
     }
 }
 
@@ -175,6 +180,9 @@ pub struct CategoryPicker {
     error: Option<String>,
     /// The button Esc mirrors ("Cancel"; onboarding: "Show everything").
     cancel: &'static str,
+    /// Enter was pressed on ticks that show nothing of the playlist: the next Enter on these
+    /// same ticks saves them.
+    armed_empty: Option<(BTreeSet<CategoryTag>, bool)>,
 }
 
 impl CategoryPicker {
@@ -197,6 +205,7 @@ impl CategoryPicker {
             saving: None,
             error: None,
             cancel: "Cancel",
+            armed_empty: None,
         }
     }
 
@@ -321,10 +330,41 @@ impl CategoryPicker {
         (!everything).then(|| CategoryFilter { keep: self.keep.clone(), keep_untagged: self.keep_untagged, known: present })
     }
 
+    /// The ticks show nothing of the playlist (no present tag ticked, untagged off or absent).
+    fn shows_nothing(&self) -> bool {
+        let Some(s) = &self.summary else { return false };
+        !s.tags.is_empty() && s.tags.iter().all(|t| !self.ticked(t.tag.as_ref()))
+    }
+
+    /// "6 of 42 ticked · 3 210 of 48 900 channels" for the ticks as they are.
+    fn effect_text(&self) -> Option<String> {
+        let s = self.summary.as_ref()?;
+        let kept: Vec<&TagSummary> = s.tags.iter().filter(|t| self.ticked(t.tag.as_ref())).collect();
+        let sum = |v: &mut dyn Iterator<Item = &TagSummary>| v.map(|t| t.items() as usize).sum::<usize>();
+        let vod = s.tags.iter().any(|t| t.movies + t.series > 0);
+        Some(format!(
+            "{} of {} ticked · {} of {} {}",
+            kept.len(),
+            s.tags.len(),
+            grouped(sum(&mut kept.iter().copied())),
+            grouped(sum(&mut s.tags.iter())),
+            if vod { "channels and titles" } else { "channels" }
+        ))
+    }
+
     fn save(&mut self, ctx: &mut UiCtx<'_>) {
         if self.saving.is_some() || self.summary.is_none() {
             return;
         }
+        // nothing of the playlist would show: say so, and save on a second Enter
+        if self.shows_nothing() {
+            let ticks = (self.keep.clone(), self.keep_untagged);
+            if self.armed_empty.as_ref() != Some(&ticks) {
+                self.armed_empty = Some(ticks);
+                return;
+            }
+        }
+        self.armed_empty = None;
         let filter = self.to_save();
         let (id, f) = (self.source, filter.clone());
         let ticket =
@@ -361,10 +401,18 @@ impl CategoryPicker {
                     self.refilter();
                 }
             }
+            // a playlist imported before tags were recognised: refresh it for real (an unforced
+            // refresh may get "304 Not Modified" and never write the raw names)
+            Action::RefreshSource if self.summary.as_ref().is_some_and(|s| s.needs_refresh) => self.refresh(ctx),
             Action::Left | Action::Right | Action::FocusNext | Action::FocusPrev | Action::ActivateAlt => {}
             _ => return PickerOutcome::Ignored,
         }
         PickerOutcome::None
+    }
+
+    fn refresh(&mut self, ctx: &mut UiCtx<'_>) {
+        ctx.services.jobs.submit(JobKind::RefreshSource { source: self.source, force: true });
+        ctx.toast(Toast::info("Refreshing the playlist…"));
     }
 
     /// Reads and the pending write; `Saved` once the write answered.
@@ -386,9 +434,13 @@ impl CategoryPicker {
                     let text = match (filter, &self.summary) {
                         (Some(f), Some(s)) => {
                             let present = s.present();
-                            format!("Showing {} of {} countries", present.iter().filter(|t| f.keep.contains(*t)).count(), present.len())
+                            format!(
+                                "Showing {} of {} countries and languages · Settings ▸ Hidden items shows the rest",
+                                present.iter().filter(|t| f.keep.contains(*t)).count(),
+                                present.len()
+                            )
                         }
-                        _ => "Showing every country".to_owned(),
+                        _ => "Showing every country and language".to_owned(),
                     };
                     self.saving = None;
                     ctx.toast(Toast::info(text));
@@ -418,17 +470,18 @@ impl CategoryPicker {
             ui.add(egui::Label::new(RichText::new(text).size(theme.font(TypeToken::BodySmall)).color(color)).wrap());
         };
         let mut toggled = None;
+        let mut refresh = false;
         match &self.summary {
             None if self.error.is_none() => small(ui, "Reading the categories…", t.text_secondary),
             None => {}
             Some(s) => {
                 if s.needs_refresh {
                     ui.horizontal_wrapped(|ui| {
-                        small(ui, "Some categories were imported before countries were recognised — refresh to find them all.", t.warning);
-                        if button(ui, theme, Some(glyphs::REFRESH), "Refresh now", ButtonStyle { bordered: true, ..Default::default() }).clicked() {
-                            ctx.services.jobs.submit(JobKind::RefreshSource { source: self.source, force: true });
-                            ctx.toast(Toast::info("Refreshing the playlist…"));
-                        }
+                        let key = crate::ui::screens::live::shortcut(KeyContext::Global, Action::RefreshSource).unwrap_or_default();
+                        let note = format!("Some categories were imported before countries were recognised — refresh to find them all ({key}).");
+                        small(ui, &note, t.warning);
+                        refresh =
+                            button(ui, theme, Some(glyphs::REFRESH), "Refresh now", ButtonStyle { bordered: true, ..Default::default() }).clicked();
                     });
                     ui.add_space(theme.space(SpaceToken::Sm));
                 }
@@ -467,7 +520,19 @@ impl CategoryPicker {
             self.list.select(row);
             self.toggle_row(row);
         }
+        if refresh {
+            self.refresh(ctx);
+        }
         ui.add_space(theme.space(SpaceToken::Sm));
+        if let Some(text) = self.effect_text() {
+            small(ui, &text, t.text_secondary);
+        }
+        if self.shows_nothing() {
+            let armed = self.armed_empty.as_ref() == Some(&(self.keep.clone(), self.keep_untagged));
+            let text =
+                if armed { "Nothing from this playlist will show — Enter again to save anyway." } else { "Nothing from this playlist will show." };
+            small(ui, text, t.warning);
+        }
         small(ui, "Favourites in hidden countries are hidden too. Settings ▸ Hidden items shows any of them again.", t.text_disabled);
         if let Some(e) = &self.error {
             small(ui, e, t.urgent);
@@ -505,7 +570,7 @@ impl CategoryPicker {
             }
         });
         ui.add_space(theme.space(SpaceToken::Sm));
-        let keys = format!("Space tick · Ctrl+A all / none · Ctrl+E my country + English · Enter save · Esc {}", self.cancel.to_lowercase());
+        let keys = format!("{} · Esc {}", crate::keymap::hint_line(&[KeyContext::Checklist, KeyContext::Modal]), self.cancel.to_lowercase());
         small(ui, &keys, t.text_disabled);
         out
     }
@@ -550,7 +615,9 @@ impl Overlay for CategoriesOverlay {
             ui.label(RichText::new("Choose what to show").size(theme.font(TypeToken::Heading)).color(t.fg));
             ui.add_space(theme.space(SpaceToken::Xs));
             let sub = match picker.summary() {
-                Some(s) => format!("{}: categories for {} countries. Untick what you don't want to see.", picker.name, s.tag_count()),
+                Some(s) => {
+                    format!("{}: categories in {} countries and languages. Untick what you don't want to see.", picker.name, s.tag_count())
+                }
                 None => picker.name.clone(),
             };
             ui.add(egui::Label::new(RichText::new(sub).size(theme.font(TypeToken::Body)).color(t.text_secondary)).wrap());
@@ -627,6 +694,11 @@ mod tests {
             assert!(ticks(&p).is_empty());
             let none = p.to_save().unwrap();
             assert!(!none.keep_untagged && none.keep.iter().all(|t| !p.summary().unwrap().present().contains(t)));
+            // ticks that show nothing of the playlist: the first Enter only warns, the second saves
+            p.on_action(ctx, Action::Activate);
+            assert!(p.saving.is_none() && p.shows_nothing());
+            p.on_action(ctx, Action::Activate);
+            assert!(p.saving.take().is_some());
             // Ctrl+E: back to my country + English
             p.on_action(ctx, Action::MarkDefaults);
             assert_eq!(ticks(&p), ["GB", "US", "lang:en", "-"]);
@@ -644,8 +716,22 @@ mod tests {
         assert_eq!(rule.known, ["lang:ar", "FR", "GB", "US", "lang:en"].into_iter().map(tag).collect::<BTreeSet<_>>());
         // a saved rule is where the ticks start (not the defaults); tags it didn't know are "new"
         let saved = CategoryFilter { keep: [tag("FR")].into(), keep_untagged: false, known: [tag("FR"), tag("GB")].into() };
-        let p2 = CategoryPicker::from_data(SourceId(1), data(Some(saved)), None);
+        let mut p2 = CategoryPicker::from_data(SourceId(1), data(Some(saved)), None);
         assert_eq!(ticks(&p2), ["FR"]);
+        // F5 on a playlist imported before tags were recognised: a forced refresh of it (an
+        // unforced one may be "304 Not Modified" and never write the raw names); otherwise the
+        // app's own refresh
+        let mut stale = data(None);
+        stale.summary.needs_refresh = true;
+        let mut p3 = CategoryPicker::from_data(SourceId(7), stale, None);
+        t.with_ctx(|ctx| {
+            assert_eq!(p2.on_action(ctx, Action::RefreshSource), PickerOutcome::Ignored);
+            assert_eq!(p3.on_action(ctx, Action::RefreshSource), PickerOutcome::None);
+        });
+        let forced = t.events.try_iter().any(|e| {
+            matches!(e, crate::msg::AppEvent::Job(crate::jobs::JobEvent::Updated(st)) if st.kind == JobKind::RefreshSource { source: SourceId(7), force: true })
+        });
+        assert!(forced);
         drop((t, one));
     }
 
@@ -657,7 +743,8 @@ mod tests {
         let (mut t, one) = rig();
         let src = seed(&mut t, |c| {
             let s = testkit::source(c, "My IPTV")?;
-            for (i, raw) in ["UK | News", "FR | Sport", "Sports"].iter().enumerate() {
+            // EX-YU: never anyone's default, whatever country the machine is in
+            for (i, raw) in ["UK | News", "EX-YU | Sport", "Sports"].iter().enumerate() {
                 c.execute(
                     "INSERT INTO grp(source_id, kind, key, name, raw_name, provider_order, item_count, seen_gen) VALUES (?1,'channel',?2,?3,?3,?4,3,1)",
                     rusqlite::params![s, format!("channel:g{i}"), raw, i as i64],
@@ -666,8 +753,8 @@ mod tests {
             Ok(s)
         });
         let mut h = testkit::overlay_harness(t, one, CategoriesOverlay::new(src), egui::vec2(1200.0, 900.0));
-        let (uk, fr) = (tag_name(Some(&tag("GB"))), tag_name(Some(&tag("FR"))));
-        testkit::until_ov(&mut h, "the categories", |h| testkit::has_label(h, &fr));
+        let (uk, yu) = (tag_name(Some(&tag("GB"))), tag_name(Some(&tag("region:exyu"))));
+        testkit::until_ov(&mut h, "the categories", |h| testkit::has_label(h, &yu));
         assert!(testkit::has_label(&h, "Choose what to show") && testkit::has_label(&h, &uk) && testkit::has_label(&h, UNTAGGED));
         assert_eq!(h.state().o.key_contexts(), [KeyContext::Checklist, KeyContext::Modal]);
         // the UK is ticked by default (English); filter to it and untick it
@@ -679,8 +766,8 @@ mod tests {
         testkit::until_ov(&mut h, "the dialog to close", |h| h.state().last == "Close");
         let rule = crate::store::sources::get_source(&h.state().t.services().store.reader().unwrap(), src).unwrap().settings.category_filter;
         let rule = rule.expect("a rule");
-        assert!(!rule.keep.contains(&tag("FR")) && !rule.keep.contains(&tag("GB")) && rule.keep_untagged);
-        assert_eq!(rule.known, [tag("GB"), tag("FR")].into());
-        assert!(h.state().t.toasts.iter().any(|x| x.text == "Showing 0 of 2 countries"), "{:?}", h.state().t.toasts);
+        assert!(!rule.keep.contains(&tag("region:exyu")) && !rule.keep.contains(&tag("GB")) && rule.keep_untagged);
+        assert_eq!(rule.known, [tag("GB"), tag("region:exyu")].into());
+        assert!(h.state().t.toasts.iter().any(|x| x.text.starts_with("Showing 0 of 2 countries and languages")), "{:?}", h.state().t.toasts);
     }
 }
