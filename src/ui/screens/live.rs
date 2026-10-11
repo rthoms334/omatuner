@@ -560,26 +560,23 @@ pub(crate) fn explicit_menu_item(g: &Group, code: u8) -> MenuItem {
 
 /// "Mark as explicit" / "Not explicit" on a provider category (DESIGN §20.3): the user's word
 /// beats the playlist's flag and the name rules, and survives refreshes (`group_override`).
-/// Going back to what was detected stores no override. "Not explicit" is only offered while
-/// explicit content shows (unlocked, or shown without a PIN).
+/// The word is always stored, never "as detected": what was detected may have changed since
+/// (a renamed category, a provider flag dropped), and the toast must hold. "Not explicit" is
+/// only offered while explicit content shows (unlocked, or shown without a PIN).
 pub(crate) fn toggle_group_explicit(ctx: &mut UiCtx<'_>, g: &Group) {
-    use crate::model::Explicit;
     let mark = !g.explicit.is_explicit();
     if !mark && ctx.parental.hides_explicit(&ctx.config.parental) {
         return;
     }
-    let value = match (mark, g.explicit) {
-        (true, Explicit::Cleared) | (false, Explicit::Marked) => None,
-        (true, _) => Some(true),
-        (false, _) => Some(false),
-    };
+    let value = Some(mark);
     let target = crate::model::GroupRef::from(g);
     let _ = ctx.services.store.writer().submit_notify(DataScope::Overrides, move |c| crate::store::user::set_group_explicit(c, &target, value));
     let name = g.display_name();
     ctx.toast(Toast::info(if !mark {
         format!("“{name}” is no longer treated as explicit")
     } else if ctx.parental.hides_explicit(&ctx.config.parental) {
-        format!("“{name}” is explicit — hidden by parental control")
+        // hidden from now on: the toast doesn't name it (DESIGN §20.3)
+        "Category marked as explicit — hidden by parental control".to_owned()
     } else if ctx.config.parental.pin_active() {
         format!("“{name}” is explicit — hidden once parental control locks again")
     } else {
@@ -2269,7 +2266,7 @@ mod tests {
         app.result(OverlayResult::Chosen(action));
         assert_eq!(
             app.t.toasts.last().map(|t| t.text.as_str()),
-            Some("“News” is explicit — hidden by parental control"),
+            Some("Category marked as explicit — hidden by parental control"),
             "no PIN and not shown: hidden by default"
         );
         let reader = app.t.services().store.reader().unwrap();

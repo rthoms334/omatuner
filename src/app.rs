@@ -654,6 +654,7 @@ impl TunerApp {
     fn sync_explicit(&mut self, egui_ctx: &egui::Context) {
         let cfg = self.services().config();
         let visible = !self.parental.hides_explicit(&cfg.parental);
+        crate::ui::widgets::set_session_locked(egui_ctx, !self.parental.is_unlocked(&cfg.parental));
         self.services().jobs.context().explicit.set(Visibility { explicit: visible });
         if visible && let Some(d) = self.parental.relocks_in(&cfg.parental) {
             // nothing else may repaint when the timer runs out

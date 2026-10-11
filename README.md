@@ -822,7 +822,9 @@ Settings ▸ Parental sets a 4–8 digit PIN. It is a speed bump for children, n
 - `tuner --play` of a hidden channel asks for the PIN, or says the channel is hidden, without
   naming it. Reminders for hidden channels wait. Notifications, the jobs list, the log, MPRIS
   and the pop-out never show an adult title while it is hidden. If one is playing when the
-  session locks, playback stops.
+  session locks, playback stops. Settings ▸ Orphans only counts the saved data of vanished
+  adult titles.
+- A backup export is a full copy of your data, adult titles included. Keep the file private.
 
 ## Command line
 

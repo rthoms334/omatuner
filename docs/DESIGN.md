@@ -2695,8 +2695,10 @@ behind parental control: absent, as if the playlist didn't have it.
   the provider flags it (Xtream `is_adult` on `get_*_categories`, read leniently: `"1"`, `1`,
   `true`; `"0"`, `0`, missing = no) or its raw provider name has one of the words `XXX`, `18+`
   / `+18` (also `18 +`), `Porn` / `Porno`, `Erotic` / `Erotica` / `Erotik` / `Érotique` /
-  `Erotico`, `Adult` / `Adults` / `Adulto(s)` / `Adulte(s)` — whole words through the shared
-  tokenizer (`name_tokens`: `|XXX|`, `★ 18+ ★`, `ᴬᴰᵁᴸᵀ`, `XXX-Movies`, Cyrillic `ХХХ`), except
+  `Erotico`, `Adult` / `Adults` / `Adulto(s)` / `Adulte(s)` / `Adulti` / `Erwachsene`,
+  Cyrillic `ЭРОТИКА` / `ПОРНО` / `Взрослые` / `Взрослых` — whole words through the shared
+  tokenizer (`name_tokens`: `|XXX|`, `★ 18+ ★`, `ᴬᴰᵁᴸᵀ`, `XXX-Movies`, `18+XXX`, Cyrillic
+  `ХХХ`; circled, squared, fullwidth and mathematical letters `ⓍⓍⓍ` / `𝐗𝐗𝐗` read as ASCII), except
   `Young Adult(s)`, `New Adult`, `Adult Swim`, `Adult Animation` / `Animated` / `Cartoon(s)` /
   `Education` / `Learning` / `Contemporary`. Not `Essex`, `XXXL`, `U18`, `Adultery`. Item
   names are never classified. An **item** is explicit when one of its categories is, or the
@@ -2704,8 +2706,9 @@ behind parental control: absent, as if the playlist didn't have it.
   categories is marked "Not explicit".
 * **The user's word** per category (`group_override.explicit`): "Mark as explicit" / "Not
   explicit" in the group / category menus (Live, Movies, Series) and Settings ▸ Parental's
-  list; it beats the provider and the names and survives refreshes. Going back to what was
-  detected stores nothing.
+  list; it beats the provider and the names and survives refreshes. The word is always
+  stored (never "back to as detected": the detection may have changed since, and the toast
+  must hold). While hidden, the toast doesn't name the category.
 * **When it is hidden** — `ParentalConfig::hides_explicit(unlocked)`: with a PIN (parental lock
   on), while the session is locked; without one, unless Settings ▸ Parental ▸ **Show explicit
   content** is on (off by default; turning it on offers "Set a PIN first (recommended)" or
@@ -2716,9 +2719,14 @@ behind parental control: absent, as if the playlist didn't have it.
   `SourceMeta::has_*`, so a playlist with only explicit movies isn't `eligible`). Everything
   built from the snapshot — lists, collections and zap lists, numeric entry, search, Home,
   favourites / History lookups (`by_ref`) — follows without asking. `Library::explicit`
-  (`ExplicitIndex`) records what is explicit either way; `Library::conceals(&ItemRef)` is the
-  check for rows read from the database (Continue watching, Reminders, Settings ▸ Hidden /
-  Favourites counts). P2's merged stacks ask `Visibility::admits` per copy.
+  (`ExplicitIndex`) records what is explicit either way — disabled playlists' items too —
+  and `Library::conceals(&ItemRef)` is the check for rows read from the database (Continue
+  watching, Reminders, Settings ▸ Hidden / Favourites counts); it fails closed before the
+  first build. Group counts (`item_count`, so hide-empty too) leave explicit members out, and
+  the "Choose what to show" totals leave explicit categories out. Settings ▸ Orphans leaves
+  out orphans whose category (`fingerprint.norm_group`: the stored category and the user's
+  word on it, or its name) is explicit, with a count. P2's merged stacks ask
+  `Visibility::admits` per copy.
 * **Switching.** The app keeps an `ExplicitGate` (shared with the jobs and the reminder
   scheduler) in step with the parental state every frame (`TunerApp::sync_explicit`; the
   relock timer repaints on time). Unlock → a `RebuildLibrary` that shows it (arrives < 0.4 s;
@@ -2731,7 +2739,13 @@ behind parental control: absent, as if the playlist didn't have it.
   locked); `--play` / a reminder's Watch ask for the PIN (or toast "hidden by parental
   control") without naming it; reminders on explicit channels stay silent while hidden
   (pending, announced if still airing once shown); detail-load jobs never name an explicit
-  title (jobs overlay, log lines), and no INFO+ log line carries one.
+  title (jobs overlay, log lines), and no INFO+ log line carries one (mpv's own lines are
+  requested at `warn`, so its `info` stream tags never reach the log).
+* **Locked rows are dimmed** while the session is locked: the app records the session state
+  each frame (`widgets::set_session_locked`), and channel / group rows paint locked entries in
+  `text_disabled` and posters under a scrim; they paint normally once the PIN opens it.
+* **Not covered:** a backup export is a full dump — favourites, progress and reminders of
+  explicit titles included, whatever the lock. Keep backup files private.
 
 ---
 

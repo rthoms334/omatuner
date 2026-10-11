@@ -414,7 +414,16 @@ Run each item at **Wide** and **Tiled**, at **text 12** and **text 16**, in a **
   - **Expect:** in the same moment playback stops ("Playback stopped — parental control is
     on"), the categories are gone, and no toast, notification, MPRIS title, pop-out strip or
     jobs entry shows an adult title. `grep -i '<title>' /tmp/tuner-check/state/tuner.log` finds no
-    INFO or higher line with it. A reminder set on an adult channel stays silent while locked.
+    INFO or higher line with it written while locked. A reminder set on an adult channel stays
+    silent while locked.
+  - **Do:** with a PIN set and the session locked, look at a group, channel and movie you
+    locked with Ctrl+L, then enter the PIN.
+  - **Expect:** while locked they stay listed, dimmed, with the lock glyph; after the PIN they
+    paint normally (the lock glyph stays).
+  - **Do:** watch half an adult movie, disable its playlist, lock. Open Home and Settings ▸
+    Orphans (after a refresh dropped an adult favourite).
+  - **Expect:** Continue watching doesn't show it; Orphans says "N more hidden as explicit"
+    and names none.
 
 ## 8. Desktop integration
 

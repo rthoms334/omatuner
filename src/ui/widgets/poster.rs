@@ -275,6 +275,11 @@ pub(crate) fn poster_tile(
         p.rect_filled(r, t.rounding, with_alpha(t.bg, 0.85));
         p.text(r.center(), Align2::CENTER_CENTER, glyph, paint::font(theme, TypeToken::Icon), color);
     };
+    // a locked title stays in the grid, dimmed, until the PIN opens the session (DESIGN §20.3)
+    let locked_dim = item.locked && paint::session_locked(ui.ctx());
+    if locked_dim {
+        p.rect_filled(poster, t.rounding, with_alpha(t.bg, 0.55));
+    }
     let mut slot = 0.0;
     if item.locked {
         corner(p, glyphs::LOCK, t.fg, slot);
@@ -297,7 +302,13 @@ pub(crate) fn poster_tile(
     // title (≤ 2 lines, now-playing marker first), then the meta line
     let mut y = poster.bottom() + theme.space(SpaceToken::Md);
     let mut left = rect.left();
-    let title_color = if cursor { t.list_cursor_text } else { t.fg };
+    let title_color = if cursor {
+        t.list_cursor_text
+    } else if locked_dim {
+        t.text_disabled
+    } else {
+        t.fg
+    };
     if decor.playing {
         let r = paint::text(p, egui::pos2(left, y), Align2::LEFT_TOP, glyphs::PLAY, paint::font(theme, TypeToken::Body), t.accent, f32::INFINITY);
         left = r.right() + theme.space(SpaceToken::Sm);

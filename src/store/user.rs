@@ -642,6 +642,10 @@ pub struct Orphan {
     /// Which tables hold data for it: "favourite", "override", "progress", "reminder", "epg"
     /// (every one of them has `fp` + `orphaned_since` columns).
     pub holders: Vec<&'static str>,
+    /// Its category (`fingerprint.norm_group`) is explicit content (DESIGN §20.3): the
+    /// category as stored now and the user's word on it, or — the category gone too — its
+    /// name. Settings ▸ Orphans leaves these out while explicit content is hidden.
+    pub explicit: bool,
 }
 
 /// The user-data tables carrying `fp` + `orphaned_since`: (holder name, table, kind column
@@ -693,12 +697,29 @@ pub fn orphans(conn: &Connection) -> Result<Vec<Orphan>> {
             }
             None => {
                 index.insert(item.clone(), out.len());
-                out.push(Orphan { item, fingerprint: fp, since, holders: vec![holder] });
+                out.push(Orphan { item, fingerprint: fp, since, holders: vec![holder], explicit: false });
             }
         }
     }
+    for o in &mut out {
+        o.explicit = orphan_explicit(conn, o)?;
+    }
     out.sort_by(|a, b| b.since.cmp(&a.since).then_with(|| a.item.cmp(&b.item)));
     Ok(out)
+}
+
+/// An orphan's category is explicit content ([`Orphan::explicit`]).
+fn orphan_explicit(conn: &Connection, o: &Orphan) -> Result<bool> {
+    let Some(group) = o.fingerprint.norm_group.as_deref() else { return Ok(false) };
+    let kind = if o.item.kind == ItemKind::Episode { ItemKind::Series } else { o.item.kind };
+    let key = format!("{}:{group}", kind.as_str());
+    let stored: Option<bool> = conn
+        .prepare_cached(
+            "SELECT COALESCE((SELECT o.explicit FROM group_override o WHERE o.source_id = ?1 AND o.kind = ?2 AND o.group_key = ?3),
+                             (SELECT g.explicit > 0 FROM grp g WHERE g.source_id = ?1 AND g.kind = ?2 AND g.key = ?3))",
+        )?
+        .query_row(params![o.item.source, kind.as_str(), key], |r| r.get(0))?;
+    Ok(stored.unwrap_or_else(|| crate::sources::explicit::is_explicit_name(group)))
 }
 
 /// `(table, key column, extra condition)` of the holders storing data for items of `kind`.

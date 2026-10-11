@@ -1159,9 +1159,16 @@ impl SettingsScreen {
                 if self.orphans.is_empty() && self.orphans_loader.is_none() {
                     v.push(Row::Note("No orphans.".into(), false));
                 }
-                for o in &self.orphans {
+                // explicit titles aren't named while explicit content is hidden (DESIGN §20.3)
+                let hide = ctx.parental.hides_explicit(&ctx.config.parental);
+                let concealed = if hide { self.orphans.iter().filter(|o| o.explicit).count() } else { 0 };
+                for o in self.orphans.iter().filter(|o| !(hide && o.explicit)) {
                     let detail = format!("{} · {} · since {}", o.item.kind.as_str(), o.holders.join(", "), kit::date(o.since));
                     v.push(item(Item::Orphan(o.item.clone()), glyphs::WARNING, orphan_name(o), Some(detail)));
+                }
+                if concealed > 0 {
+                    let how = if ctx.config.parental.pin_active() { "Enter the PIN to review them" } else { "Show explicit content to review them" };
+                    v.push(Row::Note(format!("{concealed} more hidden as explicit. {how}."), false));
                 }
             }
             SettingsPage::About => {
@@ -3709,6 +3716,34 @@ mod tests {
             c.query_row("SELECT explicit FROM group_override WHERE group_key = 'channel:xxx'", [], |r| r.get::<_, Option<i64>>(0)).ok().flatten()
                 == Some(0)
         });
+    }
+
+    /// Orphans of explicit categories aren't named while explicit content is hidden: a note
+    /// counts them; shown, they are listed.
+    #[test]
+    fn orphans_of_explicit_categories_stay_unnamed_while_hidden() {
+        let (mut t, one) = rig();
+        seed(&mut t, |c| {
+            let s = testkit::source(c, "TV")?;
+            let list = crate::store::user::default_fav_list(c)?;
+            for (i, (name, group)) in [("blue film", "xxx live"), ("news hour", "uk news")].iter().enumerate() {
+                c.execute(
+                    "INSERT INTO fav_item(list_id, source_id, kind, item_key, position, added_at, fp, orphaned_since) VALUES (?1, ?2, 'channel', ?3, ?4, 1, ?5, 5)",
+                    rusqlite::params![list, s, format!("m3u:gone{i}"), i as i64, format!("{{\"norm_name\":\"{name}\",\"norm_group\":\"{group}\"}}")],
+                )?;
+            }
+            Ok(())
+        });
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 1000.0));
+        h.state_mut().enter(Route::Settings(SettingsPage::Orphans));
+        until(&mut h, "the orphans", |h| has_label(h, "news hour"));
+        assert!(!has_label(&h, "blue film"), "no PIN, switch off: hidden by default");
+        assert!(has_label(&h, "1 more hidden as explicit. Show explicit content to review them."));
+
+        std::sync::Arc::make_mut(&mut h.state_mut().t.config).parental.show_explicit = true;
+        h.run_steps(2);
+        assert!(has_label(&h, "blue film") && has_label(&h, "news hour"), "shown: listed");
+        assert!(!has_label(&h, "1 more hidden as explicit. Show explicit content to review them."));
     }
 
     /// While a text field is being edited, pointer motion over other rows doesn't move the

@@ -1304,7 +1304,7 @@ fn category_filter_hides_tagged_groups_everywhere_and_follows_refreshes() {
     let stale = w(&s, move |c| sources::get_source(c, src));
 
     let r = s.reader().unwrap();
-    let summary = library::category_summary(&r, src).unwrap();
+    let summary = library::category_summary(&r, src, false).unwrap();
     let tags: Vec<Option<&str>> = summary.tags.iter().map(|t| t.tag.as_ref().map(|t| t.0.as_str())).collect();
     assert_eq!(tags, [Some("lang:ar"), Some("GB"), None], "AR has 2 channels + 1 movie, GB 2 channels, untagged last");
     assert_eq!((summary.tags[0].live_groups, summary.tags[0].movie_groups, summary.needs_refresh), (1, 1, false));
@@ -1394,7 +1394,7 @@ fn category_filter_hides_tagged_groups_everywhere_and_follows_refreshes() {
     // a group imported before raw names were stored: "needs refresh", and detection reads the
     // (smart-cleaned, untagged) display name, so the rule keeps it as untagged
     w(&s, move |c| Ok(c.execute("UPDATE grp SET raw_name = NULL WHERE source_id = ?1 AND name = 'Info'", [src])?));
-    assert!(library::category_summary(&r, src).unwrap().needs_refresh);
+    assert!(library::category_summary(&r, src, false).unwrap().needs_refresh);
     let fr = group(&library::load(&r).unwrap(), "|FR| Info");
     assert_eq!((fr.tag, fr.filter, fr.hidden), (None, GroupFilter::Kept, false));
 }

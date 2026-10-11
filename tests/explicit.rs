@@ -377,3 +377,58 @@ fn point_lookups_agree_with_the_library() {
     assert!(!live::item_explicit(&c, &episode("m3u-series:drama:e1")).unwrap());
     assert!(!live::item_explicit(&c, &ch(tv2, "m3u:none")).unwrap(), "unknown rows aren't");
 }
+
+/// Rows read straight from the database (continue watching, reminders, Settings lists) don't
+/// filter by enabled playlist: a disabled playlist's explicit titles stay concealed, and
+/// nothing is shown before the first build.
+#[test]
+fn disabled_playlists_stay_concealed() {
+    let (s, tv, tv2) = setup("tuner-explicit-disabled");
+    w(&s, |c| Ok(c.execute("UPDATE source SET enabled = 0", [])?));
+    let c = s.reader().unwrap();
+    let hidden = library::load_visible(&c, Visibility::NO_EXPLICIT).unwrap();
+    assert!(hidden.live.channels.is_empty(), "disabled playlists list nothing");
+    let movie = |src: SourceId, key: &str| ItemRef { source: src, kind: ItemKind::Movie, key: ItemKey(key.into()) };
+    let show = |key: &str| ItemRef { source: tv, kind: ItemKind::Series, key: ItemKey(key.into()) };
+    assert!(hidden.conceals(&movie(tv, "m3u:blue")), "a half-watched explicit movie stays off Continue watching");
+    assert!(hidden.conceals(&movie(tv2, "m3u:x2")));
+    assert!(hidden.conceals(&ch(tv, "m3u:late")) && hidden.conceals(&ch(tv, "m3u:flagged")));
+    assert!(hidden.conceals(&show("m3u-series:hot")));
+    assert!(!hidden.conceals(&movie(tv, "m3u:dune")) && !hidden.conceals(&ch(tv, "m3u:news")) && !hidden.conceals(&show("m3u-series:drama")));
+    let shown = library::load_visible(&c, Visibility::ALL).unwrap();
+    assert!(!shown.conceals(&movie(tv, "m3u:blue")), "shown: nothing concealed");
+    assert!(Library::default().conceals(&ch(tv, "m3u:news")), "before the first build: fail closed");
+}
+
+/// Category counts (the number on each row, hide-empty) leave explicit titles out while
+/// hidden: an ordinary category holding a provider-flagged title counts one less.
+#[test]
+fn category_counts_leave_explicit_titles_out() {
+    let (s, _, _) = setup("tuner-explicit-counts");
+    let tv3 = w(&s, |c| {
+        let id = sources::insert_source(c, &draft("TV 3"), NOW)?;
+        let imp = import::begin_catalogue(c, id, NOW)?;
+        import::upsert_groups(c, &imp, &[grp(ItemKind::Movie, "Films", false, 0), grp(ItemKind::Channel, "Mixed", false, 0)])?;
+        import::write_movies(c, &imp, &[movie("m3u:plain", "Plain Film", "Films", false), movie("m3u:flag", "Flagged Film", "Films", true)])?;
+        import::write_channels(c, &imp, &[chan("m3u:a", "Plain TV", 1, &["Mixed"], false), chan("m3u:b", "Flagged TV", 2, &["Mixed"], true)])?;
+        import::finish_catalogue(c, &imp, &[ItemKind::Channel, ItemKind::Movie, ItemKind::Series], NOW)?;
+        Ok(id)
+    });
+    let c = s.reader().unwrap();
+    let count = |lib: &Library, name: &str| {
+        lib.live.groups.iter().chain(&lib.vod.movie_groups).find(|g| g.source_id == tv3 && g.name == name).map(|g| g.item_count)
+    };
+    let shown = library::load_visible(&c, Visibility::ALL).unwrap();
+    assert_eq!((count(&shown, "Films"), count(&shown, "Mixed")), (Some(2), Some(2)));
+    let hidden = library::load_visible(&c, Visibility::NO_EXPLICIT).unwrap();
+    assert_eq!((count(&hidden, "Films"), count(&hidden, "Mixed")), (Some(1), Some(1)));
+    let refiltered = shown.hiding_explicit();
+    assert_eq!((count(&refiltered, "Films"), count(&refiltered, "Mixed")), (Some(1), Some(1)));
+    // the "Choose what to show" totals leave explicit categories out while hidden
+    let tv = shown.sources[0].id;
+    let total = |hide: bool| {
+        let s = library::category_summary(&c, tv, hide).unwrap();
+        s.tags.iter().map(|t| t.live_groups + t.movie_groups + t.series_groups).sum::<u32>()
+    };
+    assert_eq!(total(false) - total(true), 4, "|XXX| Live, Hot Stuff, For Adults, Erotic");
+}

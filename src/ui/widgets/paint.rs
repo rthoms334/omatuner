@@ -8,6 +8,22 @@ use super::RowState;
 use crate::theme::egui_style::{FAMILY_BOLD, FAMILY_MEDIUM};
 use crate::theme::{Theme, TypeToken};
 
+/// Where the app records each frame whether the parental session is locked.
+fn session_locked_id() -> egui::Id {
+    egui::Id::new("tuner.parental.session-locked")
+}
+
+/// Record that the parental session is locked (`true`) or open this frame. The app calls this
+/// every frame (DESIGN §20.3) so locked rows and posters paint dimmed until the PIN is entered.
+pub fn set_session_locked(ctx: &egui::Context, locked: bool) {
+    ctx.data_mut(|d| d.insert_temp(session_locked_id(), locked));
+}
+
+/// The parental session is locked this frame ([`set_session_locked`]; open when never set).
+pub fn session_locked(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp(session_locked_id())).unwrap_or(false)
+}
+
 /// Regular weight at a type token.
 pub(super) fn font(theme: &Theme, t: TypeToken) -> FontId {
     FontId::proportional(theme.font(t))

@@ -140,7 +140,7 @@ pub struct ExplicitIndex {
 
 impl ExplicitIndex {
     pub fn is_empty(&self) -> bool {
-        self.groups.is_empty() && self.channels.is_empty() && self.vod.is_empty()
+        self.groups.is_empty() && self.channels.is_empty() && self.vod.is_empty() && self.refs.is_empty()
     }
     pub fn contains(&self, item: &ItemRef) -> bool {
         self.refs.contains(item)
@@ -290,12 +290,16 @@ impl LiveIndex {
     fn without(self, x: &ExplicitIndex) -> LiveIndex {
         let Self { channels, hidden, groups, mut members, .. } = self;
         members.retain(|g, _| !x.groups.contains(g));
-        for v in members.values_mut() {
+        // the counts the rows print leave the explicit channels out too
+        let mut dropped: HashMap<GroupId, u32> = HashMap::new();
+        for (g, v) in members.iter_mut() {
+            let before = v.len();
             v.retain(|c| !x.channels.contains(c));
+            dropped.insert(*g, (before - v.len()) as u32);
         }
         LiveIndex::from_parts(
             channels.into_iter().filter(|c| !x.channels.contains(&c.id)).collect(),
-            groups.into_iter().filter(|g| !x.groups.contains(&g.id)).collect(),
+            groups.into_iter().filter(|g| !x.groups.contains(&g.id)).map(|g| uncount(g, &dropped)).collect(),
             members,
             hidden.into_iter().filter(|c| !x.channels.contains(c)).collect(),
         )
@@ -411,17 +415,28 @@ impl VodIndex {
         let (movies, movie_map) = keep(movies);
         let (series, series_map) = keep(series);
         let movie_group_ids: HashSet<GroupId> = movie_groups.iter().map(|g| g.id).collect();
+        let mut dropped: HashMap<GroupId, u32> = HashMap::new();
         let members = members
             .into_iter()
             .filter(|(g, _)| !x.groups.contains(g))
             .map(|(g, v)| {
                 let map = if movie_group_ids.contains(&g) { &movie_map } else { &series_map };
-                (g, v.into_iter().filter_map(|i| map.get(i as usize).copied().flatten()).collect())
+                let before = v.len();
+                let v: Vec<u32> = v.into_iter().filter_map(|i| map.get(i as usize).copied().flatten()).collect();
+                dropped.insert(g, (before - v.len()) as u32);
+                (g, v)
             })
             .collect();
-        let drop_groups = |v: Vec<Group>| v.into_iter().filter(|g| !x.groups.contains(&g.id)).collect();
+        // the counts the rows print (and hide-empty) leave the explicit titles out too
+        let drop_groups = |v: Vec<Group>| v.into_iter().filter(|g| !x.groups.contains(&g.id)).map(|g| uncount(g, &dropped)).collect();
         VodIndex::from_parts(movies, series, drop_groups(movie_groups), drop_groups(series_groups), members)
     }
+}
+
+/// `g` without the explicit members a hidden snapshot dropped from it (`dropped`, per group).
+fn uncount(mut g: Group, dropped: &HashMap<GroupId, u32>) -> Group {
+    g.item_count = g.item_count.saturating_sub(dropped.get(&g.id).copied().unwrap_or(0));
+    g
 }
 
 #[derive(Debug, Default, Clone)]
@@ -561,8 +576,11 @@ impl Library {
     /// `item` (a channel, movie or series) is explicit content this snapshot leaves out: rows
     /// read from the database (continue watching, reminders, Settings lists, `--play`) check
     /// it before they show or play anything.
+    ///
+    /// Fails closed: before the first build (`built_at` 0, nothing known yet) every item is
+    /// concealed, so no row read from the database flashes up at startup.
     pub fn conceals(&self, item: &ItemRef) -> bool {
-        !self.visibility.explicit && self.explicit.contains(item)
+        self.built_at == 0 || (!self.visibility.explicit && self.explicit.contains(item))
     }
 
     /// This snapshot without its explicit content: the UI thread's re-filter when the parental
@@ -677,11 +695,18 @@ pub fn apply_category_filter(g: &mut Group, filter: Option<&CategoryFilter>) {
 
 /// Per-tag summary of one source's categories (all kinds, the source enabled or not) for the
 /// "Choose what to show" picker (DESIGN §28.6). Reads `grp` only (≤ a few thousand rows): run
-/// it off the UI thread (a `Loader`), never per frame.
-pub fn category_summary(conn: &Connection, source: SourceId) -> Result<CategorySummary> {
-    let mut stmt = conn.prepare_cached("SELECT kind, COALESCE(raw_name, name), item_count, raw_name IS NULL FROM grp WHERE source_id = ?1")?;
+/// it off the UI thread (a `Loader`), never per frame. `hide_explicit`: leave explicit
+/// categories out of the totals (DESIGN §20.3).
+pub fn category_summary(conn: &Connection, source: SourceId, hide_explicit: bool) -> Result<CategorySummary> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT g.kind, COALESCE(g.raw_name, g.name), g.item_count, g.raw_name IS NULL FROM grp g
+         LEFT JOIN group_override o ON o.source_id = g.source_id AND o.kind = g.kind AND o.group_key = g.key
+         WHERE g.source_id = ?1 AND NOT (?2 AND COALESCE(o.explicit, g.explicit > 0) = 1)",
+    )?;
     let rows: Vec<(ItemKind, String, u32, bool)> = stmt
-        .query_map([source], |r| Ok((kind_from_sql(&r.get::<_, String>(0)?)?, r.get(1)?, u32_of(r.get(2)?), r.get(3)?)))?
+        .query_map(rusqlite::params![source, hide_explicit], |r| {
+            Ok((kind_from_sql(&r.get::<_, String>(0)?)?, r.get(1)?, u32_of(r.get(2)?), r.get(3)?))
+        })?
         .collect::<rusqlite::Result<_>>()?;
     Ok(CategorySummary {
         tags: category_tags::summarize(rows.iter().map(|(kind, name, n, _)| (*kind, name.as_str(), *n))),
@@ -962,6 +987,7 @@ pub fn load_visible(conn: &Connection, visibility: Visibility) -> Result<Library
     let (movies, mut members) = load_vod(conn, true, &movie_groups, &mut explicit)?;
     let (series, series_members) = load_vod(conn, false, &series_groups, &mut explicit)?;
     members.extend(series_members);
+    disabled_explicit_refs(conn, &mut explicit)?;
     let vod = VodIndex::from_parts(movies, series, movie_groups, series_groups, members);
     let favs = load_favs(conn)?;
     let recent_channels = load_recent_channels(conn, &live)?;
@@ -977,6 +1003,34 @@ pub fn load_visible(conn: &Connection, visibility: Visibility) -> Result<Library
         explicit: Arc::new(explicit),
     };
     Ok(lib.with_visibility(visibility))
+}
+
+/// Explicit channels, movies and series of DISABLED playlists into `x.refs` (the enabled ones
+/// came with `load_live` / `load_vod`): rows read straight from the database — continue
+/// watching, reminders, Settings lists — don't filter by enabled playlist, and must not name
+/// an explicit title of a playlist switched off ([`Library::conceals`]). The predicate is
+/// `store::live::explicit_row`'s, set-based.
+fn disabled_explicit_refs(conn: &Connection, x: &mut ExplicitIndex) -> Result<()> {
+    for (table, link, col, kind) in [
+        ("channel", "channel_group", "channel_id", ItemKind::Channel),
+        ("movie", "movie_group", "movie_id", ItemKind::Movie),
+        ("series", "series_group", "series_id", ItemKind::Series),
+    ] {
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT x.source_id, x.key FROM {table} x JOIN source s ON s.id = x.source_id AND s.enabled = 0
+             WHERE EXISTS (SELECT 1 FROM {link} l JOIN grp g ON g.id = l.group_id
+                             LEFT JOIN group_override o ON o.source_id = g.source_id AND o.kind = g.kind AND o.group_key = g.key
+                           WHERE l.{col} = x.id AND COALESCE(o.explicit, g.explicit > 0) = 1)
+                OR (x.explicit = 1 AND NOT EXISTS (SELECT 1 FROM {link} l JOIN grp g ON g.id = l.group_id
+                             JOIN group_override o ON o.source_id = g.source_id AND o.kind = g.kind AND o.group_key = g.key
+                           WHERE l.{col} = x.id AND o.explicit = 0))"
+        ))?;
+        let rows = stmt.query_map([], |r| Ok(ItemRef { source: r.get(0)?, kind, key: ItemKey(r.get(1)?) }))?;
+        for r in rows {
+            x.refs.insert(r?);
+        }
+    }
+    Ok(())
 }
 
 /// Distinct recently watched channels of `live`, most recent first (one aggregate over the
