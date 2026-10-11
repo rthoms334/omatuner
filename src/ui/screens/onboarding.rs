@@ -809,10 +809,21 @@ impl OnboardingScreen {
     }
 
     /// The new playlist's categories were read: offer the picker when they name two or more
-    /// countries / languages, the playlist has no rule yet (a restored one may) and the card
-    /// still shows the import.
-    fn offer_categories(&mut self, ctx: &UiCtx<'_>, source: SourceId, data: PickerData) {
-        if data.summary.tag_count() >= 2 && data.rule.is_none() && matches!(self.step, Step::Importing | Step::Done) {
+    /// countries / languages, no rule applies to it yet (the shared rule covers a new playlist;
+    /// a restored one may have its own) and the card still shows the import. With a shared rule
+    /// a toast says the new playlist follows it.
+    fn offer_categories(&mut self, ctx: &mut UiCtx<'_>, source: SourceId, data: PickerData) {
+        if data.own_summary.tag_count() < 2 || data.own.is_some() {
+            return;
+        }
+        if data.rule.is_some() {
+            ctx.toast(crate::msg::Toast::info(format!(
+                "{} shows the countries and languages you chose for your playlists · Settings ▸ Playlists changes it",
+                data.name
+            )));
+            return;
+        }
+        if matches!(self.step, Step::Importing | Step::Done) {
             let picker = CategoryPicker::from_data(source, data, Some(ctx.lib.generation)).cancel_label("Show everything");
             self.picker = Some((picker, Instant::now()));
             self.go(Step::Categories);
@@ -2071,20 +2082,27 @@ mod tests {
         use crate::sources::category_tags::{CategorySummary, TagSummary};
         let (mut t, one) = rig();
         let src = testkit::seed(&mut t, |c| testkit::source(c, "World TV"));
-        let data = |tags: &[&str]| PickerData {
-            summary: CategorySummary {
+        let data = |tags: &[&str]| {
+            let summary = CategorySummary {
                 tags: tags
                     .iter()
                     .map(|t| TagSummary { tag: Some(CategoryTag((*t).into())), live_groups: 1, channels: 10, ..Default::default() })
                     .collect(),
                 needs_refresh: false,
-            },
-            rule: None,
-            name: "World TV".into(),
-            country: Some("GB".into()),
+            };
+            PickerData {
+                own_summary: summary.clone(),
+                summary,
+                rule: None,
+                own: None,
+                name: "World TV".into(),
+                playlists: 1,
+                country: Some("GB".into()),
+            }
         };
+        // the picker stores the rule every playlist shares (DESIGN §28.3)
         let rule = |h: &egui_kittest::Harness<'static, testkit::App<OnboardingScreen>>| {
-            crate::store::sources::get_source(&h.state().t.services().store.reader().unwrap(), src).unwrap().settings.category_filter
+            crate::store::sources::shared_category_filter(&h.state().t.services().store.reader().unwrap()).unwrap()
         };
         let mut h = harness(t, one, OnboardingScreen::default(), egui::vec2(1000.0, 900.0));
         let offer = |h: &mut egui_kittest::Harness<'static, testkit::App<OnboardingScreen>>, tags: &[&str]| {
@@ -2118,6 +2136,15 @@ mod tests {
         let r = rule(&h).expect("a rule");
         assert!(r.keep.contains(&CategoryTag("GB".into())) && !r.keep.contains(&CategoryTag("FR".into())));
         assert!(r.keep_untagged);
+        // another playlist added later follows that rule: no step, a toast says so
+        let mut shared = data(&["GB", "FR"]);
+        shared.rule = Some(r);
+        let app = h.state_mut();
+        let s = &mut app.s;
+        app.t.with_ctx(|ctx| s.offer_categories(ctx, src, shared));
+        h.run_steps(2);
+        assert_eq!(h.state().s.step, Step::Done, "the shared rule covers a new playlist");
+        assert!(h.state().t.toasts.iter().any(|x| x.text.starts_with("World TV shows the countries and languages you chose")));
     }
 
     #[test]

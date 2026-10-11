@@ -86,13 +86,31 @@ pub struct SourceSettings {
     /// "Keep as M3U" in onboarding and the source's settings. On an upgraded source (Xtream
     /// with [`Source::m3u_origin`]) it switches the source back to its playlist.
     pub keep_m3u: bool,
-    /// Which countries / languages of category names are shown (DESIGN §28); `None` = all.
-    /// Written only by `store::sources::set_category_filter` (other settings writes keep it).
+    /// This playlist's own category rule (DESIGN §28.3): used only when
+    /// [`SourceSettings::own_category_filter`] says so; `None` there = show everything.
+    /// Written only by `store::sources::set_category_rule` (other settings writes keep it).
     pub category_filter: Option<super::CategoryFilter>,
+    /// "Use a different rule for this playlist": `Some(true)` = `category_filter` is this
+    /// playlist's rule; `Some(false)` = the shared rule applies. `None` = written before the rule
+    /// was shared: a stored `category_filter` is the playlist's own (until
+    /// `store::sources::adopt_legacy_category_filters` decides), none = the shared rule.
+    pub own_category_filter: Option<bool>,
     /// "Show in All playlists" (DESIGN §29): `Some(false)` keeps this playlist's items out of
     /// the "All playlists" scope of Movies, Series, Live TV and the guide (they still show when
     /// it is the playlist picked). `None` = shown.
     pub in_all: Option<bool>,
+}
+
+impl SourceSettings {
+    /// This playlist has its own category rule (or its own "show everything").
+    pub fn has_own_category_filter(&self) -> bool {
+        self.own_category_filter.unwrap_or(self.category_filter.is_some())
+    }
+
+    /// The category rule that applies to this playlist, given the shared one.
+    pub fn effective_category_filter<'a>(&'a self, shared: Option<&'a super::CategoryFilter>) -> Option<&'a super::CategoryFilter> {
+        if self.has_own_category_filter() { self.category_filter.as_ref() } else { shared }
+    }
 }
 
 /// Account information from Xtream `user_info`/`server_info` (UHF "server info").

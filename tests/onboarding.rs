@@ -338,7 +338,9 @@ fn m3u_file_with_several_countries_asks_what_to_show() {
     std::thread::sleep(std::time::Duration::from_millis(450));
     press(&mut h, Action::Activate);
     until(&mut h, "the import", |h| has(h, "All set"));
-    let rule = h.state().sources()[0].settings.category_filter.clone().expect("a rule");
+    // the rule every playlist shares (DESIGN §28.3); the new playlist follows it
+    let rule = tuner::store::sources::shared_category_filter(&h.state().t.services().store.reader().unwrap()).unwrap().expect("a rule");
+    assert!(!h.state().sources()[0].settings.has_own_category_filter());
     let tag = |s: &str| tuner::model::CategoryTag(s.into());
     assert!(rule.keep.contains(&tag("GB")) && rule.keep.contains(&tag("lang:en")) && rule.keep_untagged);
     assert_eq!(rule.known, [tag("GB"), tag("FR"), tag("lang:ar")].into_iter().collect());

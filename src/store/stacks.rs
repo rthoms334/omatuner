@@ -343,6 +343,39 @@ pub fn build(items: &[VodSummary], raw: Vec<CopyRaw>, in_all: impl Fn(SourceId) 
     Stacks { meta, langs, of, spans, flat, tops, playlists }
 }
 
+/// Per category, the language its tagged titles are mostly for (the same ≥ 80 % of ≥ 10 rule
+/// as the stacks' inference): `market[i]` is item `i`'s `vod_match::market_lang`, `tagged[i]`
+/// says it has a tag at all (a multi-audio or regional tag counts against every language).
+/// "Also hide titles in other languages" gives an untagged title its category's market
+/// (DESIGN §28.12).
+pub fn dominant_market(items: &[VodSummary], market: &[Option<&'static str>], tagged: &[bool]) -> HashMap<GroupId, &'static str> {
+    // per category: tagged titles, and their count per market
+    type Counts = (u32, Vec<(&'static str, u32)>);
+    let mut counts: HashMap<GroupId, Counts> = HashMap::new();
+    for ((v, m), t) in items.iter().zip(market).zip(tagged) {
+        if !*t {
+            continue;
+        }
+        for g in &v.group_ids {
+            let (total, c) = counts.entry(*g).or_default();
+            *total += 1;
+            if let Some(l) = m {
+                match c.iter_mut().find(|(x, _)| x == l) {
+                    Some((_, n)) => *n += 1,
+                    None => c.push((l, 1)),
+                }
+            }
+        }
+    }
+    counts
+        .into_iter()
+        .filter_map(|(g, (total, c))| {
+            let &(lang, top) = c.iter().max_by_key(|(l, n)| (*n, std::cmp::Reverse(*l)))?;
+            (total >= DOMINANT_MIN && top as f32 >= DOMINANT_SHARE * total as f32).then_some((g, lang))
+        })
+        .collect()
+}
+
 /// The user's joins ("Same title as…", P3) on top of the clusters: the copies of one join
 /// group, and every copy of the stacks they are in, become one stack. Clusters no join
 /// touches keep their place; merged ones follow. O(joined + flat) — nothing when there are

@@ -325,6 +325,8 @@ mod tests {
             has_live: live,
             in_all,
             category_filter: None,
+            own_category_filter: false,
+            language_hidden: 0,
         }
     }
 

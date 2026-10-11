@@ -92,6 +92,12 @@ impl Services {
                 Ok(names) => names.iter().for_each(|n| toasts.toast(crate::msg::Toast::upgraded(several.then_some(n.as_str())))),
                 Err(e) => tracing::warn!("upgrades of the last background refresh: {e}"),
             }
+            // a playlist's old country choice that now covers every playlist (DESIGN §28.3)
+            match crate::store::sources::take_adopted_category_rule(c) {
+                Ok(Some(text)) => toasts.toast(crate::msg::Toast::info(text)),
+                Ok(None) => {}
+                Err(e) => tracing::warn!("adopted category rule: {e}"),
+            }
             Ok(())
         });
         let http = HttpClient::new(&http_options(&config))?;

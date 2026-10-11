@@ -350,6 +350,8 @@ mod tests {
             has_live: true,
             in_all: true,
             category_filter: None,
+            own_category_filter: false,
+            language_hidden: 0,
         };
         let one_on = [src(1, true, true), src(2, false, true)];
         let two_on = [src(1, true, true), src(2, true, true)];

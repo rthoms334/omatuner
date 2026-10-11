@@ -816,6 +816,39 @@ Use a real Xtream account whose categories cover many countries (≈ 60 tags: "U
 - [ ] **Playlist added before this version:** with a profile from v0.1.0-rc3, open the picker.
   **Expect:** the note "… refresh to find them all (Ctrl+R)"; Ctrl+R refreshes and the note
   goes away, and most categories now have tags.
+- [ ] **One rule for every playlist (field report: foreign stacked cards):**
+  - **Do:** a profile from v0.1.0 with two Xtream playlists ("TV" with English chosen in
+    *Countries & languages…*, "TV 2" never asked). Start this version; open Movies ▸ All
+    playlists; open a stacked title (e.g. "Dracula") and its copies.
+  - **Expect:** TV 2's German, French, Italian, Greek… categories are gone without doing
+    anything; no card shows a foreign copy on top and the copy lists are English (plus
+    untagged ones). Settings ▸ Playlists: both rows say "Showing …"; the editor's
+    *Categories…* reads "… · the choice every playlist shares". Settings ▸ Hidden has one
+    "Your playlists: hidden by the category filter" section with an "N titles in other
+    languages" row.
+  - **Do:** add a third playlist with several countries.
+  - **Expect:** no *Choose what to show* step; a toast says it shows the countries you chose;
+    its foreign categories are hidden at once.
+  - **Do:** open its *Countries & languages…*, tick **Only for <playlist>**, tick everything,
+    Enter. Then reopen, untick **Only for**, Enter.
+  - **Expect:** only that playlist shows everything ("· own choice" on its row); the others
+    are unchanged; unticking "Only for" shows the shared ticks again (not the playlist's), and
+    Enter makes it follow the shared choice without changing it for the other playlists.
+  - **Do (upgrade):** start this build on a v0.1.0 profile where only one playlist had a
+    country choice.
+  - **Expect:** one toast "Your choice of countries from <playlist> now applies to all your
+    playlists · titles in other languages hidden · Settings ▸ Hidden items"; not on the next
+    start.
+- [ ] **Titles in other languages:**
+  - **Do:** with the English choice, look at "EN ✪ MULTI-SUB", "CA ✪ QUEBEC …", an untagged
+    Icelandic-named category, and Series ▸ All for Arabic-named categories ("مسلسلات …"); favourite a "DE - …" title and start an
+    "FR - …" one first (with the option off), then turn **Also hide titles in other
+    languages** back on.
+  - **Expect:** Arabic-named categories (and "VIP ✪ كأس العالم …") are hidden as Arabic;
+    Dutch, Québec, Icelandic, "EX - …" and bare "SUBS - …" titles are gone from those
+    categories (an emptied untagged category shows no titles); the favourite and the started
+    title stay; multi-audio and untagged titles stay. Add `nld` to Settings ▸ Player ▸ audio
+    languages: Dutch titles come back.
 - [ ] **Bulk hide (Live groups):**
   - **Do:** Space on three groups (check marks, footer "3 marked · Ctrl+H hides · Esc clears"),
     Ctrl+H. Then type "ar" and press Ctrl+Shift+H.
@@ -1062,7 +1095,7 @@ PIN set, English audio first. Every check in *All playlists* unless it says othe
     copy that would play, the second Ctrl+F removes every copy; Delete forgets every copy's
     progress. Each with Undo.
 - [ ] **Filters, hidden and explicit content:**
-  - **Do:** with the category filter (UK + English) on one playlist, open All movies; hide a
+  - **Do:** with the category filter (UK + English, shared by every playlist), open All movies; hide a
     category holding one copy of a stack; mark a category explicit; lock the session; unlock.
   - **Expect:** filtered-out, hidden and explicit copies never join a stack (counts drop by
     them); explicit copies leave stacks the moment the session locks and come back after the

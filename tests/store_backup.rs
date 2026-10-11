@@ -122,7 +122,10 @@ fn populate(s: &Store, creds: &Creds) -> Fixture {
                         keep: [CategoryTag::country("GB"), CategoryTag::language("en")].into(),
                         keep_untagged: false,
                         known: [CategoryTag::country("GB"), CategoryTag::country("FR")].into(),
+                        ..Default::default()
                     }),
+                    // its own rule (DESIGN §28.3); the other playlist follows the shared one
+                    own_category_filter: Some(true),
                     ..Default::default()
                 },
             },
@@ -141,6 +144,10 @@ fn populate(s: &Store, creds: &Creds) -> Fixture {
                 settings: SourceSettings::default(),
             },
             NOW,
+        )?;
+        sources::set_shared_category_filter(
+            c,
+            Some(&CategoryFilter { keep: [CategoryTag::country("US")].into(), hide_other_languages: Some(true), ..Default::default() }),
         )?;
         let guide =
             sources::insert_epg_source(c, "My guide", &EpgSourceKind::Url { url: Secret::new(format!("http://epg.test/g.xml?apikey={key}")) }, -30)?;

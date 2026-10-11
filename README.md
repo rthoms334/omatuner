@@ -48,7 +48,7 @@ preview playing](docs/screenshots/live.png)
 <td width="50%"><img src="docs/screenshots/player.png" alt="Player with controls"><br><b>Player</b> with the on-screen controls and the volume slider.</td>
 </tr>
 <tr>
-<td width="50%"><img src="docs/screenshots/categories.png" alt="Choose what to show"><br><b>Choose what to show</b>: keep only the countries and languages you want from a playlist.</td>
+<td width="50%"><img src="docs/screenshots/categories.png" alt="Choose what to show"><br><b>Choose what to show</b>: keep only the countries and languages you want from your playlists.</td>
 <td width="50%"><img src="docs/screenshots/help.png" alt="Keyboard help filtered"><br><b>Keyboard help</b> (<code>F1</code> or <code>?</code>), filtered by typing.</td>
 </tr>
 <tr>
@@ -95,7 +95,8 @@ takes the pictures. The theme is Omarchy's Tokyo Night unless noted. The video i
   - Keep several favourites lists.
   - Hide, rename and reorder channels and groups; mark several groups and hide them at once.
   - Keep only the countries and languages you want from a provider's categories
-    ("UK | Sports", "[FR] Films", "AR: News"…), including categories the provider adds later.
+    ("UK | Sports", "[FR] Films", "AR: News"…), including categories the provider adds later —
+    one choice for all your playlists, and optionally titles in other languages hidden too.
   - Type a channel number to jump to it.
   - Quality badges (SD, HD, FHD, 4K) next to channel names, so the SD/HD/4K copies of a channel
     are told apart without playing each one; the best copy is listed first. A badge comes from
@@ -271,7 +272,8 @@ With no playlists, Tuner opens a single onboarding card with these steps:
    series and the guide keep loading in the background (status bar, Ctrl+J).
    - **Choose what to show:** when the playlist's categories carry two or more countries or
      languages, the card asks which to keep (see
-     [Countries and languages](#countries-and-languages)). Esc shows everything.
+     [Countries and languages](#countries-and-languages)). Esc shows everything. Once you have
+     chosen, playlists you add later follow the same choice without asking.
 7. **Done:** counts per kind, and how much of the playlist the guide covers (see below).
 
 Esc steps back. Everything works from the keyboard.
@@ -356,9 +358,23 @@ Ordinary playlists such as iptv-org or Free-TV are not affected.
 Many Xtream panels (and M3U playlists) carry categories for dozens of countries: "UK | Sports",
 "|DE| Filme", "[FR] Cinéma", "AR: News", "EX-YU Filmovi", "🇵🇹 Desporto". Tuner reads the country,
 language or region at the start (or end) of each category name and lets you keep only the ones
-you want. It is a **rule** stored per playlist, not a one-off hide: it is applied every time the
-library is built, so categories the provider adds later for a country you didn't tick stay
-hidden. One rule covers live groups, movie and series categories.
+you want. It is a **rule**, not a one-off hide: it is applied every time the library is built,
+so categories the provider adds later for a country you didn't tick stay hidden. One rule covers
+live groups, movie and series categories — and **every playlist**: playlists you add later
+follow it too.
+
+- **One rule for all playlists:** the picker edits the choice your playlists share. Tick
+  **Only for <playlist>** (the first row) to give one playlist its own choice instead (for
+  example "show everything" for a free-channels list); untick it to go back to the shared one.
+  A rule saved per playlist by an earlier version becomes the shared one on the first start
+  (when several playlists had different rules, the first is shared and the others keep theirs).
+- **Also hide titles in other languages** (second row, movies and series): hides titles whose
+  own name marks another language — "DE - …", "NL ✪ …", "AR-SUBS - …", "QC - …" — also inside
+  the categories you keep and in categories without a tag (an untagged title in a category
+  that is mostly one language counts as that language). It keeps your audio languages
+  (Settings ▸ Player), the languages of the countries you ticked, untagged and multi-audio
+  titles, and never hides a favourite or a title you started. It is on by itself when you
+  keep only English-speaking countries; Settings ▸ Hidden says how many titles it hides.
 
 - **Where:** offered during onboarding right after the channels import (only when two or more
   tags are found), and later from **Settings ▸ Playlists**: the playlist's row menu
@@ -381,11 +397,13 @@ hidden. One rule covers live groups, movie and series categories.
   flag, full names (`ENGLISH`, `FRANCE`, `ARABIC`, `LATINO`,
   `EX-YU`, `AFRICA`) and trailing `… (UK)` / `… | UK`. UK, GB, ENGLAND, SCOTLAND and WALES are
   all the UK; EN, ENG and ENGLISH are the English *language*; AR is Arabic (Argentina is ARG or
-  🇦🇷). Prefixes such as 4K, HD, FHD, ᴴᴰ, VIP, SAT, RAW, PPV, VOD, NEW, 24/7, XXX and ADULT are skipped, and
+  🇦🇷). A name with no code written mostly in Arabic, Greek, Hebrew, Thai, Korean or Japanese
+  kana script counts as that language ("مسلسلات شاهد" is Arabic). Prefixes such as 4K, HD, FHD, ᴴᴰ, VIP, SAT, RAW, PPV, VOD, NEW, 24/7, XXX and ADULT are skipped, and
   unknown words never count: "4K | Sports", "BT Sport", "FA Cup" and "IT Crowd" are untagged
   and stay shown.
 - **Exceptions:** Ctrl+H on a group always hides it. **Settings ▸ Hidden** lists the hidden
-  countries: Enter shows a whole country again, → expands it so you can show single categories.
+  countries ("Your playlists" for the shared rule): Enter shows a whole country again (in every
+  playlist that shares the rule), → expands it so you can show single categories.
 - **Playlists added before this version** need one refresh before most tags are found (the
   picker says so; Ctrl+R there refreshes).
 - **Hiding several groups at once:** in Live groups and the Movies/Series category list, Space
