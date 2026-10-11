@@ -249,6 +249,7 @@ Every row is one work package's territory (§24.2 is the authoritative ownership
 | `ui/{epg_grid,video_host}.rs`, `ui/screens/{live,guide,player}.rs`, `ui/overlays/{programme,tracks,edit_item}.rs` | WP-11 | Live TV, guide grid, fullscreen player/OSD, mini-player, Edit information. |
 | `ui/screens/{home,movies,series,movie_detail,series_detail,settings,onboarding,epg_mapping,logs}.rs`, `ui/widgets/poster.rs`, `ui/overlays/{search,resume}.rs` | WP-12 | Home, VOD, settings, onboarding, search UI, PIN UI, logs, EPG mapping. |
 | `theme/**`, `fonts.rs` | WP-01 | Theme parsing/tokens/egui mapping (implemented core), live reload, fonts + fallbacks + RTL helper. |
+| `ui/scope.rs`, `ui/widgets/scope_bar.rs`, `ui/overlays/playlists.rs` | §29 | Which playlist a screen shows: eligibility, the stored scope, look-alikes and free colours; the scope bar / button / stripe; the Alt+P picker and a tab's menu. |
 
 Cross-module contracts worth repeating:
 * `UiCtx` (ui/mod.rs) is the only thing screens get; config changes go through
@@ -1352,10 +1353,14 @@ when at least 360 px wide) shows for the usual OSD time after popping out.
   banner's title badge shows until the channel plays; then the decoded badge on the right
   says it.
 * **Playlist on cards** (Settings ▸ Interface ▸ Playlist on cards: **Auto** / Always / Never,
-  applied live; Auto = only while **two or more enabled** playlists exist — with one it's
-  noise): every item says which playlist it comes from, from the snapshot's `SourceMeta`
-  (user-chosen glyph + colour; no DB access per frame; `UiCtx::source_of` /
-  `ui::data::SourceMarks`).
+  applied live): every item says which playlist it comes from, from the snapshot's `SourceMeta`
+  (user-chosen glyph + colour; no DB access per frame; `ui::data::SourceMarks::for_view`).
+  **Auto** shows the playlist only while **two or more playlists are eligible for that kind
+  of item** (`Library::eligible`: enabled and with channels / movies / series — a disabled
+  playlist or a free-channel preset without movies doesn't count) **and the view shows all of
+  them**: a scoped screen (§29) shows marks only in "All playlists"; views without a scope
+  (Home, Search, detail pages, the Live preview, the player) count as All
+  (`UiCtx::source_of(kind, source)`; scoped screens use `Scope::marks`).
   * *Poster cards* (Movies / Series grids, every Home poster rail — Continue watching,
     favourites, Recently added): a **top-left corner chip** (the lock / watched chips grow from
     the top-right, so they never collide), same size and bg @ 0.85 as those chips, the source
@@ -1369,8 +1374,14 @@ when at least 360 px wide) shows for the usual OSD time after popping out.
     history / mini-guide panels): the **compact glyph** at the right edge (left of the lock on
     tiles), name as tooltip — rows have no room for a name, and the list header / preview
     already says the rest. Search results keep their glyph + name pill (wide rows).
-  * *Detail pages* (movie, series) and the Live preview: a source badge (glyph + name) leads
-    the meta line. (Sparse playlist pages no longer append the name to the meta.)
+  * *Group rows* (Live groups, Movies / Series categories) in All: the playlist's name, short
+    (elided at 30 % of the row), in its colour (fg where it doesn't read), right of the group
+    name — the two "Sports" are told apart (replaces the old " · TV 2" suffix).
+  * *Detail pages* (movie, series — Xtream pages too, not only playlist ones) and the Live
+    preview: a source badge (glyph + name) leads the meta line. (Sparse playlist pages no
+    longer append the name to the meta.)
+  * *Player*: the top bar shows `● TV` left of the clock (name in its colour where it reads on
+    the scrim) for channels, movies and episodes.
   * *Accessibility*: the item's accesskit label carries the playlist ("The Matrix · Provider
     A") on cards, tiles, rows and search hits.
   * *Contrast*: a source colour is used for text or a glyph only where it reaches 3:1 on its
@@ -1401,6 +1412,7 @@ when at least 360 px wide) shows for the usual OSD time after popping out.
 | Slider / seek bar | `slider::*` | track max(4, 0.11·control-height) fg @ 0.18, fill fg, knob max(14, 0.38·ch) ×1.15 hover; seek bar over video uses OSD colours |
 | Progress | `progress::*` | programme progress fg; watch progress accent; busy bar for unknown totals |
 | Badge | `badge::*` | caption, 1 px border colour @ 0.6; LIVE = urgent; source = source colour (palette role) + glyph, text fg where the colour is < 3:1 on bg |
+| Scope bar | `scope_bar::scope_bar` (tabs), `scope_bar::scope_button` (`● TV 2 ▾`), `scope_bar::paint_stripe` | control-height row; tab = dot (palette colour, non-text) · name (fg selected / hovered, `text_secondary` otherwise) · count (body-small @ 0.52); selected tab underlined 2 px in its colour (accent for All); hover fill fg @ 0.08; button = bordered button with the dot; stripe 2 px in the picked playlist's colour (§29) |
 | Source mark | `badge::paint_source_chip` (poster corner chip), `badge::paint_source_mark` (rows, tiles, OSD lists), `badge::source_badge` (detail pages, preview) | glyph icon 14 in the source colour; chip = bg @ 0.85, top-left, size of the lock chip; colour < 3:1 → fg glyph + 1.5 px colour edge (chip) / 2 px colour underline (glyph); tooltip = playlist name (§13.0 "Playlist on cards") |
 | Quality badge | `badge::InlineBadge::quality` + `name_with_quality` (rows, grid, search, OSD lists), `badge::quality_badge` (preview, guide side panel) | monospace caption, text @ 0.52 (`text_secondary`; `text_disabled` on dimmed rows; OSD text in the player), 1 px border at 0.6 × the text's opacity, Md gap after the name |
 | Logo / monogram | `logo::logo` | square, aspect kept; monogram on fg @ 0.04, text @ 0.52 |
@@ -1463,6 +1475,11 @@ provider groups (renamed/reordered/hidden per overrides; locked show 󰌾 and re
   channel — a duplicate of unknown quality, or one the user placed (`user_order`) — keeps its
   own (`LiveIndex::collection`, All channels and provider groups; favourites, history and
   search keep their order). The zap order is the list order, as everywhere.
+* **Several playlists with channels** (§29): the scope bar runs across the top (tabs at Wide,
+  `● TV 2 ▾` otherwise). One playlist picked: its groups, and All channels / favourites lists
+  / History / Reminders narrowed to its channels — so are the zap lists (`zap_list_in`); the
+  channel header reads `TV 2 › UK News`. In All, group rows name their playlist in its colour
+  and channel rows carry its glyph.
 
 Medium (≈ 790): the preview stays on the RIGHT; groups become a drawer (← / Backspace on the
 channel list, or click the breadcrumb):
@@ -1524,6 +1541,11 @@ Medium: rails narrower, same structure.
 * **Collection**: header button "Favourites ▾" (click or `f`) picks favourites lists, groups or
   All. Default: the first non-empty favourites list, else the last-used group. ‹ › and Now are
   clickable buttons too.
+* **Several playlists** (§29): the guide shows Live TV's playlist — a `● TV 2 ▾` button before
+  the collection button (Alt+P) and the stripe under the header; rows, collections and zap
+  lists follow it, and a group of another playlist falls back to the default collection. In
+  All the picker lists each playlist's groups under the playlist's name (a heading row nothing
+  chooses) and the header names the group's playlist ("Sports · TV 2").
 * **2-D virtualization**: paint/query only rows in view ± 2 and times in view ± 1 h.
   `ProgrammeCache` keys `(epg_channel, 6 h bucket)` in EPG time (tvg-shift applied after the
   lookup); misses load synchronously while the frame's 2 ms DB budget allows (≤ 24 buckets),
@@ -1569,6 +1591,10 @@ Backspace deletes while filtering, Esc clears), Enter → detail; Shift+Enter �
 fullscreen; Ctrl+S → sort & view menu (recently added, A–Z, Z–A, year, rating, custom order).
 Series identical with series posters. With no VOD in any source, Movies/Series are hidden in
 the sidebar and Alt+4/5 toast "Your playlists have no movies or series".
+**Several playlists with movies (series)** (§29): the scope bar sits above both panes; one
+playlist picked narrows the categories, All, Continue watching and Favourites to it, the grid
+header reads `TV 2 › Action — type to filter` (`All playlists › Action` in All) and cards lose
+their playlist marks; in All, cards and category rows carry them.
 
 ### 13.6 Details
 ```
@@ -1585,6 +1611,8 @@ Movie                                           Series
 Key context `[Detail]` for both pages: ↑/↓/←/→ move between buttons and episodes, `[`/`]`
 switch seasons, Tab cycles sections (buttons · seasons · episodes), Enter plays/resumes,
 Shift+Enter plays from the start, Ctrl+W marks watched, Ctrl+F favourite, Backspace/Esc back.
+With two or more playlists of that kind (Auto, §13.0) the playlist's badge leads the meta
+line — Xtream pages included.
 Details load lazily with a skeleton; failures keep list-level data with a toast. Resume prompt
 (overlay) when progress > `resume_min_s`: "Resume from 41:20" (focused) / "Start over".
 **End of playback**: an episode shows a "Next episode in 10 s" card over the video (Enter = now,
@@ -1638,6 +1666,8 @@ The OSD has two layers (UX review B1):
   Unbound keys fall through (Space still pauses).
 * **Esc ladder in the player**: leave controls focus → hide the banner → leave window
   fullscreen → leave the player (mini-player keeps playing). Esc never *shows* the banner.
+* **Which playlist**: with two or more playlists of the item's kind, the top bar shows
+  `● TV` left of the clock (§13.0, §29).
 * Type: title Display·s, body Title·s, badges Caption·s; `osd_accent` for progress/focus. Below
   700 pt the controls row collapses to play/pause · audio · subtitles · info.
 
@@ -1695,6 +1725,8 @@ favourites lists) show a 󰇙 drag grip and move with Alt+↑/↓ or K/J. Every 
 | | Refresh interval | `SourceSettings.refresh_h` | `general.playlist_refresh_h` = 24 |
 | | Server timezone override | `SourceSettings.server_tz` | from account |
 | | Use provider EPG · smart names · import VOD | `SourceSettings.*` | on |
+| | Show in All playlists (§29; a view setting — saving it doesn't refresh) | `SourceSettings.in_all` | on |
+| | look-alike notice + "Give each its own colour" (§29) | `source.color` | — |
 | | Account info (read-only) | `AccountInfo` | — |
 | EPG | sources (add URL/file, enable, **priority order** — grip / Alt+↑/↓, offset minutes, refresh) | `epg_source` | — |
 | | Refresh interval | `general.epg_refresh_h` | 12 |
@@ -1713,7 +1745,8 @@ favourites lists) show a 󰇙 drag grip and move with Alt+↑/↓ or K/J. Every 
 | | Pop-out size · corner (Hyprland, §21.6) | `player.popout_size`, `popout_corner` (+ `popout_last`, remembered at pop-in) | small 480 × 270 · bottom right |
 | Interface | Start screen | `general.start_screen` | Auto (Live until favourites/history exist, then Home) |
 | | Sidebar · density · channel numbers · logos · quality badges · 24 h clock | `interface.*` (`quality_badges`) | auto · comfortable · on · on · on · on |
-| | Playlist on cards: Auto (2+ enabled playlists) · Always · Never (§13.0) | `interface.playlist_on_cards` | auto |
+| | Playlist on cards: Auto (2+ eligible playlists, in All) · Always · Never (§13.0, §29) | `interface.playlist_on_cards` | auto |
+| | The playlist Movies / Series / Live TV show (the scope bar, Alt+P; the guide follows Live TV) | `interface.playlist_scope.{movies,series,live}` | none = All playlists |
 | | Live preview autoplay · preview delay · guide preview · mini player · OSD timeout | `interface.*` | **off** · 1200 ms · off · on · 3500 ms |
 | | UI scale (on top of Omarchy base size) · hide empty groups | `interface.ui_scale`, `hide_empty_groups` | 1.0 · on |
 | | Default sort live / movies / series | `interface.*_sort` | provider / recent / recent |
@@ -1917,6 +1950,8 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Ctrl+R` / `F5` | Refresh playlists & guide |
 | `Ctrl+J` | Show background tasks |
 | `F1` | Keyboard help |
+| `Alt+P` | Choose the playlist shown (Movies, Series, Live TV, guide) |
+| `Ctrl+PgDn` / `Ctrl+PgUp` | Next / previous playlist (Movies, Series, Live TV, guide) |
 
 #### Lists (`List`)
 
@@ -3668,3 +3703,98 @@ integrator runs the one full gate.
   countries are hidden too").
 * **Space binding in `List`**: every list now maps Space to ToggleMark; screens that don't mark
   must ignore it (they do: unhandled actions are no-ops) — keymap test pins it.
+
+## 29. Several playlists (phase P1: what am I browsing)
+
+With two providers ("TV" and "TV 2", often both Xtream) nothing said which playlist a list,
+card or page came from, two "Action" categories looked alike, and "is there more than one
+playlist?" was `sources.len() > 1` — counting disabled playlists and free-channel presets. P1
+answers *what am I browsing*; combining duplicate titles in "All" (P2) and the other screens
+(P3) come later. In P1 "All playlists" is exactly the old list, plus playlist marks.
+
+### 29.1 Decisions (user, authoritative)
+1. Each screen remembers its own playlist: Movies, Series and Live TV; the guide follows Live TV.
+2. Free presets stay in Live TV's All, with a per-playlist **"Show in All playlists"** switch.
+3. (P2) duplicates combine in All, the copy that plays follows the playlist order — not in P1.
+
+### 29.2 Eligibility (`Library::eligible(kind)`)
+A playlist is *eligible* for a screen when it is **enabled and has that kind of item**
+(`SourceMeta::has`: `has_live` / `has_vod` / `has_series`, read with the snapshot's sources).
+Every "several playlists?" question uses `eligible(kind).len() > 1`. Per-source visible counts
+come from the snapshot (`LiveIndex` / `VodIndex` build them; `Library::count`).
+
+### 29.3 The scope (`ui::scope`)
+* `ScopeKind::{Movies, Series, Live}` (`of_screen`: the guide maps to Live). The choice is
+  stored in `interface.playlist_scope.{movies,series,live}` (`None` = All) and changed through
+  `ctx.edit_config` (`scope::choose`), so it lands at the end of the frame and is saved.
+* `Scope::of(lib, scopes, kind)`: the eligible playlists and the one picked — a stored id that
+  isn't eligible, or fewer than two eligible playlists, reads as All (the stored id is kept
+  while the playlist stays eligible).
+* `ScopeFilter`: `Only(id)`, or for All `Except(the playlists whose "Show in All playlists" is
+  off)` — `Everything` when that would leave nothing. Screens key their rebuilds on it.
+* **Disappearing playlist**: on each library swap the app checks the three stored scopes; one
+  that is no longer eligible is reset to All with a toast — "TV 2 is disabled — showing All
+  playlists", "… was removed …", "… has no movies now …".
+
+### 29.4 What the scope changes
+| Screen | One playlist picked | All playlists |
+|---|---|---|
+| Movies / Series | its categories (custom order, rename, Alt+↑/↓ as before); All, Continue watching and Favourites narrowed to its titles; breadcrumb `TV 2 › Action`; no card marks | every eligible playlist in `in_all`; category rows and cards carry the playlist (§13.0) |
+| Live TV | its groups; All channels, favourites lists, History, Reminders and the **zap lists** narrowed to its channels (`live::zap_list_in`); header `TV 2 › UK News` | groups name their playlist in colour; channel rows carry the glyph |
+| Guide | follows Live TV: rows, collection picker, zap lists; a group of another playlist falls back | picker groups the groups under each playlist's name |
+
+Search, Home, popovers and the player's "primary group" zaps are not scoped (P1).
+
+### 29.5 Showing it
+* **Scope bar** (`widgets::scope_bar`) on Movies, Series and Live TV when two or more playlists
+  are eligible: `All playlists 214 380 · ● TV 151 022 · ● TV 2 98 117` at Wide; the single
+  `● TV 2 ▾` button (opens the picker) at Medium / Compact, or when the tabs don't fit. The
+  guide has the button before its collection button. Right side at Wide: "Alt+P playlist".
+* **Stripe**: 2 px in the picked playlist's colour under the bar (the guide: under its
+  header); none for All.
+* **Window title**: `Tuner — Movies · TV 2` while a scoped screen shows one playlist (the
+  Omarchy bar shows it), else `Tuner` (`TunerApp::title_now`, sent only on change).
+* **Marks** (§13.0 "Playlist on cards"): Auto = two or more eligible playlists for the item's
+  kind and a view of All; detail pages (Xtream too) and the player show the playlist whenever
+  two or more are eligible.
+
+### 29.6 Choosing
+| Input | Effect |
+|---|---|
+| `Alt+P` | the picker (`overlays::playlists`): All + each eligible playlist with dot and count; ↑/↓ Enter, click, **digits jump** (0 = All, 1–9 in order) while nothing is typed, typing filters; it saves the choice itself |
+| `Ctrl+PgDn` / `Ctrl+PgUp` | next / previous (All → TV → TV 2 → All), toast "Showing TV 2 only" / "Showing all playlists" |
+| click a tab | that playlist |
+| right-click a tab | menu: Edit playlist… (`Route::EditPlaylist` → Settings ▸ Playlists with its editor open), Move up / Move down (the playlist order, also the tab order) |
+
+Keys are in `GLOBAL` (Ctrl/Alt chords only) and act only on Movies, Series, Live TV and the
+guide; with one eligible playlist they say "Only one playlist has movies". Rejected: Ctrl+0
+(egui's zoom reset), Alt+[ / Alt+] (AltGr chords on German / French keyboards). The status bar
+adds "Alt+P playlist" (before "help") only on those screens with two or more eligible playlists
+(`keymap::hint_line_with`); help rows and §15.2 come from the table.
+
+### 29.7 Telling playlists apart
+* A new playlist (onboarding, free presets) starts in the **first colour no playlist uses**,
+  compared as the theme draws them — Accent is often the theme's blue
+  (`scope::first_free_color`).
+* Settings ▸ Playlists lists playlists that **look the same** (same glyph and same drawn
+  colour, `scope::look_alikes`): "TV and TV 2 look the same on cards and in lists", with a
+  **Give each its own colour** action that keeps the first of each group and gives the others
+  the first free colours (`scope::distinct_colors`; toast). Nothing changes until it is
+  pressed.
+* Marks always carry the name (accessible label, meta line, group rows, tooltips).
+
+### 29.8 Changes to the "playlist on cards" work it folds in
+Kept: `PlaylistOnCards`, `SourceMarks` (now `for_view(mode, sources, kind, all)`), the coloured
+name on the meta line, `TileDecor.source`, `paint_source_chip`, the detail badge (now on
+Xtream pages too). Deferred to P2 (they need matched copies): `SourceSet` / several chips per
+card, the stack edge and `+1` counts, `DetailHeader` copies and "also in TV".
+
+### 29.9 Tests
+`ui::scope` (eligibility, stored choice, `in_all`, cycling, look-alikes, free colours),
+`ui::data` (the Auto rule per kind and scope), Movies (bar, Ctrl+PgDn + toast, per-screen
+persistence, narrowed categories / Favourites, breadcrumb, marks, tab click / right-click,
+Alt+P), the picker (digits, filter), Live (groups, All channels and zap lists per scope,
+`in_all`), the guide (follows Live, grouped picker), Settings (look-alike fix, edit route,
+`in_all` saved without a refresh), the app (fallback toast, window title, hint), keymap
+(chords, hint placement), and the 790 / 1600 pt × text 12 / 16 layout test with Live and the
+guide scoped.
