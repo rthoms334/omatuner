@@ -11,6 +11,9 @@ current theme live, corners are square, and the font is JetBrains Mono Nerd Font
 The video is rendered by an embedded libmpv inside a native Rust window (egui), so there is no
 browser or Electron runtime and no separate player window.
 
+![Live TV: groups from three playlists, channels with now/next and quality badges, and the
+preview playing](docs/screenshots/live.png)
+
 - [Screenshots](#screenshots)
 - [Features](#features)
 - [Requirements](#requirements)
@@ -30,8 +33,39 @@ browser or Electron runtime and no separate player window.
 
 ## Screenshots
 
-*No screenshots yet.* Planned: Live TV at full width, the TV guide, the player with its
-on-screen controls, and a light theme (catppuccin-latte).
+<table>
+<tr>
+<td width="50%"><img src="docs/screenshots/home.png" alt="Home screen"><br><b>Home</b>: Continue watching, favourites lists and recently added titles.</td>
+<td width="50%"><img src="docs/screenshots/guide.png" alt="TV guide"><br><b>Guide</b>: a day of programmes; the bell marks a reminder.</td>
+</tr>
+<tr>
+<td width="50%"><img src="docs/screenshots/movies.png" alt="Movies in All playlists"><br><b>Movies</b> in <i>All playlists</i>: the scope bar on top, and the same title from several playlists stacked into one card.</td>
+<td width="50%"><img src="docs/screenshots/stack.png" alt="A stack fanned out"><br><code>Space</code> fans a stack out into its copies, each with its playlist, language and quality.</td>
+</tr>
+<tr>
+<td width="50%"><img src="docs/screenshots/detail.png" alt="Series page"><br><b>Series page</b> with its copies: which one plays first, and the others to pick from.</td>
+<td width="50%"><img src="docs/screenshots/player.png" alt="Player with controls"><br><b>Player</b> with the on-screen controls and the volume slider.</td>
+</tr>
+<tr>
+<td width="50%"><img src="docs/screenshots/categories.png" alt="Choose what to show"><br><b>Choose what to show</b>: keep only the countries and languages you want from a playlist.</td>
+<td width="50%"><img src="docs/screenshots/help.png" alt="Keyboard help filtered"><br><b>Keyboard help</b> (<code>F1</code> or <code>?</code>), filtered by typing.</td>
+</tr>
+<tr>
+<td width="50%"><img src="docs/screenshots/live-half.png" alt="Live TV in half a screen"><br>Live TV in <b>half a screen</b>: the sidebar folds into icons.</td>
+<td width="50%"><img src="docs/screenshots/settings.png" alt="Settings, Playlists, light theme"><br><b>Settings ▸ Playlists</b> in a light theme (Catppuccin Latte).</td>
+</tr>
+<tr>
+<td width="50%"><img src="docs/screenshots/popout.png" alt="Pop-out player"><br><b>Pop-out</b> (<code>o</code>): a small player pinned on every workspace (Hyprland).</td>
+<td width="50%"></td>
+</tr>
+</table>
+
+Everything in these screenshots is made up: the playlists, channels, programmes, logos and
+posters come from a demo profile (`examples/demo_profile.rs`), and `scripts/screenshots.sh`
+takes the pictures. The theme is Omarchy's Tokyo Night unless noted. The video is from the
+*Sintel* trailer, © copyright Blender Foundation |
+[durian.blender.org](https://durian.blender.org/sharing/), licensed under
+[CC BY 3.0](https://creativecommons.org/licenses/by/3.0/).
 
 ## Features
 
@@ -1037,6 +1071,8 @@ cargo clippy --all-targets -- -D warnings     # lint gate (zero warnings)
 cargo run --example keymap_md                 # regenerate the key tables (README, DESIGN §15.2)
 scripts/gen-test-media.sh                     # ffmpeg test media for the player tests
 scripts/gen-big-fixtures.py                   # 100k-channel M3U + 415k-programme XMLTV for benches
+cargo run --example demo_profile -- /tmp/demo # made-up demo profile (then --profile-dir /tmp/demo)
+scripts/screenshots.sh                        # README screenshots from it (Hyprland; DESIGN §23.1)
 ```
 
 - The architecture, data model and decisions are in [`docs/DESIGN.md`](docs/DESIGN.md).

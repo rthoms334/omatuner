@@ -105,9 +105,14 @@ impl Theme {
     /// caller keeps the current theme and retries. Cascade: theme `shell.toml` → theme
     /// `shell.<section>.toml` files → user `~/.config/omarchy/shell.toml` (last, key by key).
     pub fn try_load(paths: &AppPaths, ui_scale: f32) -> Result<Self, String> {
-        let dir = paths.omarchy_theme_dir();
-        let name =
-            std::fs::read_to_string(paths.omarchy_current().join("theme.name")).map(|s| s.trim().to_owned()).unwrap_or_else(|_| "fallback".into());
+        let fixed = fixed_theme_dir();
+        let dir = fixed.clone().unwrap_or_else(|| paths.omarchy_theme_dir());
+        let name = match &fixed {
+            Some(d) => d.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "fixed".into()),
+            None => {
+                std::fs::read_to_string(paths.omarchy_current().join("theme.name")).map(|s| s.trim().to_owned()).unwrap_or_else(|_| "fallback".into())
+            }
+        };
         let colors = std::fs::read_to_string(dir.join("colors.toml")).map_err(|e| format!("colors.toml: {e}"))?;
         let palette = Palette::parse(&colors, dir.join("light.mode").exists()).map_err(|e| format!("colors.toml: {e}"))?;
         let theme_shell = std::fs::read_to_string(dir.join("shell.toml")).unwrap_or_default();
@@ -127,7 +132,8 @@ impl Theme {
                 }
             }
         }
-        if let Ok(u) = std::fs::read_to_string(paths.omarchy_config().join("shell.toml"))
+        if fixed.is_none()
+            && let Ok(u) = std::fs::read_to_string(paths.omarchy_config().join("shell.toml"))
             && let Err(e) = shell.merge_override(&u)
         {
             tracing::warn!("~/.config/omarchy/shell.toml: {e}");
@@ -137,7 +143,8 @@ impl Theme {
         if !dir.join("colors.toml").is_file() {
             return Err("theme directory replaced while loading".into());
         }
-        let rounding = query_rounding().unwrap_or(0.0);
+        // a fixed theme ignores the compositor's rounding too (Omarchy's default is square)
+        let rounding = if fixed.is_some() { 0.0 } else { query_rounding().unwrap_or(0.0) };
         Ok(Self::from_parts(name, palette, shell, rounding, ui_scale))
     }
 
@@ -172,6 +179,17 @@ impl Theme {
             SourceColor::Muted => p.muted,
         }
     }
+}
+
+/// Developer override (screenshots, DESIGN §23.1): an Omarchy theme directory (`colors.toml`,
+/// optional `shell*.toml`, `light.mode`) used instead of the live theme. Nothing of the user's
+/// desktop then reaches the look — no `~/.config/omarchy/shell.toml`, no Hyprland rounding —
+/// and the theme watcher stays off.
+pub const THEME_DIR_ENV: &str = "TUNER_THEME_DIR";
+
+/// The directory named by [`THEME_DIR_ENV`], if set.
+pub fn fixed_theme_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os(THEME_DIR_ENV).filter(|d| !d.is_empty()).map(std::path::PathBuf::from)
 }
 
 /// `hyprctl -j getoption decoration:rounding` → `.int`. `None` if hyprctl is unavailable.
