@@ -18,7 +18,8 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("0002_category_filter", include_str!("migrations/0002_category_filter.sql")),
     ("0003_quality", include_str!("migrations/0003_quality.sql")),
     ("0004_name_rules", include_str!("migrations/0004_name_rules.sql")),
-    ("0005_title_stacks", include_str!("migrations/0005_title_stacks.sql")),
+    ("0005_explicit", include_str!("migrations/0005_explicit.sql")),
+    ("0006_title_stacks", include_str!("migrations/0006_title_stacks.sql")),
 ];
 
 /// Current schema version after all migrations.
@@ -51,7 +52,17 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
 /// branch is at v2 with *its* `0002_quality` applied, not `0002_category_filter`. Such a
 /// database (v2+ without `grp.raw_name`) gets the category-filter columns here; the
 /// renumbered `0003_quality` then re-runs harmlessly (it is idempotent).
+///
+/// Likewise a development database of the stacks branch is at v5 with its `0005_title_stacks`
+/// (now 0006, re-run harmlessly) instead of `0005_explicit`: the explicit columns are added and
+/// backfilled here.
 fn reconcile_renumbered(conn: &mut Connection, current: i64) -> Result<()> {
+    if current >= 5 && !has_column(conn, "grp", "explicit")? {
+        tracing::info!("applying migration 0005_explicit (database had another branch's 0005)");
+        let tx = conn.transaction()?;
+        backfill_explicit(&tx)?;
+        tx.commit()?;
+    }
     if current < 2 || has_column(conn, "grp", "raw_name")? {
         return Ok(());
     }
@@ -82,7 +93,8 @@ fn backfill(conn: &Connection, name: &str) -> Result<()> {
             seed_quality_checks(conn)?;
             reclean_names(conn)
         }
-        "0005_title_stacks" => {
+        "0005_explicit" => backfill_explicit(conn),
+        "0006_title_stacks" => {
             add_title_columns(conn)?;
             crate::store::titles::refresh_all(conn).map(|_| ())
         }
@@ -90,7 +102,7 @@ fn backfill(conn: &Connection, name: &str) -> Result<()> {
     }
 }
 
-/// The match columns of movies and series and `series.tmdb_id` (0005; only the missing ones,
+/// The match columns of movies and series and `series.tmdb_id` (0006; only the missing ones,
 /// so a renumbered re-run is harmless).
 fn add_title_columns(conn: &Connection) -> Result<()> {
     for table in ["movie", "series"] {
@@ -100,7 +112,34 @@ fn add_title_columns(conn: &Connection) -> Result<()> {
             add_column_if_missing(conn, table, col, decl)?;
         }
     }
-    add_column_if_missing(conn, "series", "tmdb_id", "INTEGER")
+    add_column_if_missing(conn, "series", "tmdb_id", "INTEGER")?;
+    // a database that ran this migration before it gained the user-data columns
+    add_column_if_missing(conn, "title_link", "fp", "TEXT NOT NULL DEFAULT '{}'")?;
+    add_column_if_missing(conn, "title_link", "orphaned_since", "INTEGER")
+}
+
+/// The explicit-content columns (DESIGN §20.3; added here when missing, so the migration is safe
+/// to re-run) and `grp.explicit` from the stored category names: the provider's raw name, else
+/// the display name (groups imported before P6). A provider flag (code 2) is never lowered.
+fn backfill_explicit(conn: &Connection) -> Result<()> {
+    for (table, col, decl) in [
+        ("grp", "explicit", "INTEGER NOT NULL DEFAULT 0"),
+        ("channel", "explicit", "INTEGER NOT NULL DEFAULT 0"),
+        ("movie", "explicit", "INTEGER NOT NULL DEFAULT 0"),
+        ("series", "explicit", "INTEGER NOT NULL DEFAULT 0"),
+        ("group_override", "explicit", "INTEGER"),
+    ] {
+        add_column_if_missing(conn, table, col, decl)?;
+    }
+    let mut read = conn.prepare("SELECT id, COALESCE(raw_name, name) FROM grp WHERE explicit = 0")?;
+    let mut write = conn.prepare("UPDATE grp SET explicit = ?2 WHERE id = ?1")?;
+    let mut rows = read.query([])?;
+    while let Some(r) = rows.next()? {
+        if crate::sources::explicit::is_explicit_name(&r.get::<_, String>(1)?) {
+            write.execute(params![r.get::<_, i64>(0)?, crate::sources::explicit::GROUP_BY_NAME])?;
+        }
+    }
+    Ok(())
 }
 
 /// `quality_check` from the picture sizes measured before 0004 (`channel_video`): the claim is
@@ -232,7 +271,7 @@ mod tests {
         let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v, latest_version());
         let names: Vec<&str> = MIGRATIONS.iter().map(|m| m.0).collect();
-        assert_eq!(names, ["0001_init", "0002_category_filter", "0003_quality", "0004_name_rules", "0005_title_stacks"]);
+        assert_eq!(names, ["0001_init", "0002_category_filter", "0003_quality", "0004_name_rules", "0005_explicit", "0006_title_stacks"]);
         for (t, col) in [
             ("grp", "raw_name"),
             ("group_override", "shown"),
@@ -240,6 +279,11 @@ mod tests {
             ("channel", "family"),
             ("channel_video", "width"),
             ("quality_check", "claimed"),
+            ("grp", "explicit"),
+            ("channel", "explicit"),
+            ("movie", "explicit"),
+            ("series", "explicit"),
+            ("group_override", "explicit"),
         ] {
             assert!(has_column(&c, t, col).unwrap(), "{t}.{col}");
         }
@@ -423,8 +467,8 @@ mod tests {
     /// (renumbered after another branch's 0005) changes nothing.
     #[test]
     fn title_stacks_migration_keys_existing_titles() {
-        let mut c = migrated_to(4);
-        assert_eq!(MIGRATIONS[4].0, "0005_title_stacks");
+        let mut c = migrated_to(5);
+        assert_eq!(MIGRATIONS[5].0, "0006_title_stacks");
         c.execute_batch(
             r#"INSERT INTO source(id,name,kind,created_at) VALUES (1,'TV','xtream',0), (2,'TV 2','xtream',0);
                INSERT INTO movie(source_id,key,name,clean_name,norm_name,year,stream,provider_order,seen_gen) VALUES
@@ -462,17 +506,69 @@ mod tests {
         migrate(&mut c).unwrap();
         check(&c);
         c.execute("INSERT INTO title_link(source_id,kind,item_key,action,at) VALUES (1,'movie','a','split',5)", []).unwrap();
-        c.pragma_update(None, "user_version", 4).unwrap();
+        c.pragma_update(None, "user_version", 5).unwrap();
         migrate(&mut c).unwrap();
         check(&c);
         let kept: i64 = c.query_row("SELECT count(*) FROM title_link", [], |r| r.get(0)).unwrap();
         assert_eq!(kept, 1, "a re-run keeps the user's corrections");
+        // a development database of the stacks branch, where this migration was 0005: the
+        // explicit-content migration it skipped is applied on open
+        let mut d = migrated_to(4);
+        let tx = d.transaction().unwrap();
+        tx.execute_batch(MIGRATIONS[5].1).unwrap();
+        backfill(&tx, MIGRATIONS[5].0).unwrap();
+        tx.pragma_update(None, "user_version", 5).unwrap();
+        tx.commit().unwrap();
+        assert!(!has_column(&d, "grp", "explicit").unwrap());
+        migrate(&mut d).unwrap();
+        assert!(has_column(&d, "grp", "explicit").unwrap() && has_column(&d, "movie", "explicit").unwrap());
+    }
+
+    /// 0005: categories whose stored names read as adult content are explicit without a
+    /// refresh (raw name first, display name for groups imported before P6); innocent ones
+    /// aren't. Safe to run again.
+    #[test]
+    fn explicit_migration_backfills_from_stored_names() {
+        let mut c = migrated_to(4);
+        assert_eq!(MIGRATIONS[4].0, "0005_explicit");
+        c.execute_batch(
+            "INSERT INTO source(id,name,kind,created_at) VALUES (1,'s','m3u-url',0);
+             INSERT INTO grp(source_id,kind,key,name,raw_name,provider_order,seen_gen) VALUES
+               (1,'channel','channel:xxx','Movies','|XXX| Movies',0,1),
+               (1,'channel','channel:adults','For Adults',NULL,1,1),
+               (1,'movie','movie:swim','Adult Swim','US | Adult Swim',2,1),
+               (1,'series','series:news','News','UK: News',3,1);
+             INSERT INTO group_override(source_id,kind,group_key,hidden) VALUES (1,'channel','channel:xxx',1);",
+        )
+        .unwrap();
+        let check = |c: &Connection| {
+            let codes: Vec<(String, i64)> = c
+                .prepare("SELECT key, explicit FROM grp ORDER BY provider_order")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(codes, [("channel:xxx".into(), 1), ("channel:adults".into(), 1), ("movie:swim".into(), 0), ("series:news".into(), 0)]);
+            let ov: Option<i64> = c.query_row("SELECT explicit FROM group_override", [], |r| r.get(0)).unwrap();
+            assert_eq!(ov, None, "no user override until the user says so");
+        };
+        migrate(&mut c).unwrap();
+        check(&c);
+        c.execute("UPDATE grp SET explicit = 2 WHERE key = 'series:news'", []).unwrap();
+        c.pragma_update(None, "user_version", 4).unwrap();
+        migrate(&mut c).unwrap();
+        assert_eq!(
+            c.query_row("SELECT explicit FROM grp WHERE key = 'series:news'", [], |r| r.get::<_, i64>(0)).unwrap(),
+            2,
+            "a provider flag stays"
+        );
     }
 
     #[test]
     fn user_data_tables_carry_fingerprints() {
         let c = fresh();
-        for t in ["fav_item", "item_override", "watch_progress", "reminder", "channel_epg_map"] {
+        for t in ["fav_item", "item_override", "watch_progress", "reminder", "channel_epg_map", "title_link"] {
             for col in ["fp", "orphaned_since"] {
                 let n: i64 = c.query_row(&format!("SELECT count(*) FROM pragma_table_info('{t}') WHERE name='{col}'"), [], |r| r.get(0)).unwrap();
                 assert_eq!(n, 1, "{t}.{col}");

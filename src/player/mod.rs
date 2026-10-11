@@ -103,7 +103,8 @@ pub enum PlayerCommand {
         forward: bool,
         /// The sender's parental session is unlocked (`ParentalSession::is_unlocked`). When
         /// false and a PIN is set, PIN-locked channels are skipped too (MPRIS always sends
-        /// false: it can't ask for the PIN).
+        /// false: it can't ask for the PIN); explicit channels are skipped whenever
+        /// `ParentalConfig::hides_explicit(unlocked)`.
         unlocked: bool,
     },
     /// Tune a channel by id keeping the current ZapList and origin (numeric entry, history).
@@ -336,6 +337,11 @@ pub trait MediaResolver: Send {
     /// Is this channel PIN-locked (its own lock or any of its groups')? A channel whose lock
     /// can't be read counts as locked.
     fn is_locked(&mut self, ch: ChannelId) -> bool;
+    /// Is this channel explicit content (DESIGN §20.3)? Zapping and recall skip it while
+    /// parental control hides explicit content. A channel that can't be read counts as explicit.
+    fn is_explicit(&mut self, _ch: ChannelId) -> bool {
+        false
+    }
 }
 
 /// Persistence the controller needs. `Services` adapts it to the store `Writer`
@@ -489,8 +495,9 @@ mod tests {
     use crate::model::{ChannelId, PlayableKind};
     use crate::redact::Secret;
 
-    /// Plays lavfi's test source for any media; the listed channels are PIN-locked.
-    struct Lavfi(Vec<ChannelId>);
+    /// Plays lavfi's test source for any media; the listed channels are PIN-locked (`.0`) or
+    /// explicit content (`.1`).
+    struct Lavfi(Vec<ChannelId>, Vec<ChannelId>);
 
     impl MediaResolver for Lavfi {
         fn resolve(&mut self, media: &MediaRef, _resume: bool) -> std::result::Result<Playable, PlayerError> {
@@ -515,6 +522,9 @@ mod tests {
         fn is_locked(&mut self, ch: ChannelId) -> bool {
             self.0.contains(&ch)
         }
+        fn is_explicit(&mut self, ch: ChannelId) -> bool {
+            self.1.contains(&ch)
+        }
     }
 
     fn headless_config() -> Config {
@@ -525,7 +535,7 @@ mod tests {
     }
 
     fn start() -> Player {
-        start_with(&headless_config(), Lavfi(Vec::new()))
+        start_with(&headless_config(), Lavfi(Vec::new(), Vec::new()))
     }
 
     fn start_with(cfg: &Config, resolver: Lavfi) -> Player {
@@ -607,8 +617,14 @@ mod tests {
     #[test]
     fn zap_and_recall_skip_locked_channels_while_locked() {
         let mut cfg = headless_config();
-        cfg.parental = crate::config::ParentalConfig { enabled: true, pin_hash: Some("h".into()), pin_salt: Some("s".into()), relock_min: 0 };
-        let p = start_with(&cfg, Lavfi(vec![ChannelId(2)]));
+        cfg.parental = crate::config::ParentalConfig {
+            show_explicit: false,
+            enabled: true,
+            pin_hash: Some("h".into()),
+            pin_salt: Some("s".into()),
+            relock_min: 0,
+        };
+        let p = start_with(&cfg, Lavfi(vec![ChannelId(2)], Vec::new()));
         let h = p.handle();
         let playing = |id: i64| {
             wait_until(Duration::from_secs(20), || {
@@ -717,6 +733,47 @@ mod tests {
         h.send(copy(3, None, None));
         assert!(wait_until(Duration::from_secs(5), || matches!(h.snapshot().last_error, Some(PlayerError { kind: PlayerErrorKind::Resolve, .. }))));
         assert_eq!(fell_back(), None);
+    }
+
+    /// Explicit channels (DESIGN §20.3): zapping and recall skip them while parental control
+    /// hides explicit content — with a PIN while the sender's session is locked (MPRIS always),
+    /// without one unless "Show explicit content" is on.
+    #[test]
+    fn zap_and_recall_skip_explicit_channels_while_hidden() {
+        let mut cfg = headless_config();
+        cfg.parental = crate::config::ParentalConfig { enabled: true, pin_hash: Some("h".into()), pin_salt: Some("s".into()), ..Default::default() };
+        let p = start_with(&cfg, Lavfi(Vec::new(), vec![ChannelId(2)]));
+        let h = p.handle();
+        let playing = |id: i64| {
+            wait_until(Duration::from_secs(20), || {
+                let s = h.snapshot();
+                s.state == PlayerState::Playing && s.playable.as_ref().is_some_and(|p| p.media == MediaRef::Channel(ChannelId(id)))
+            })
+        };
+        let zap = ZapList { collection: crate::model::Collection::AllChannels, channels: vec![ChannelId(1), ChannelId(2), ChannelId(3)].into() };
+        let media = MediaRef::Channel(ChannelId(1));
+        h.send(PlayerCommand::Play(PlayRequest { media, zap: Some(zap), origin: PlayOrigin::Fullscreen, resume: false, immediate: true }));
+        assert!(playing(1));
+        h.send(PlayerCommand::Zap { forward: true, unlocked: false });
+        assert!(playing(3), "explicit channel 2 skipped while locked: {:?}", h.snapshot().playable);
+        h.send(PlayerCommand::Zap { forward: false, unlocked: true });
+        assert!(playing(2), "an unlocked session zaps onto it");
+        h.send(PlayerCommand::Zap { forward: true, unlocked: true });
+        assert!(playing(3));
+        h.send(PlayerCommand::LastChannel { unlocked: false });
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(h.snapshot().playable.as_ref().map(|p| p.media.clone()), Some(MediaRef::Channel(ChannelId(3))), "no recall while locked");
+
+        // no PIN: the "Show explicit content" switch decides, whatever the sender says
+        let mut none = headless_config();
+        none.parental = crate::config::ParentalConfig::default();
+        h.send(PlayerCommand::ApplyConfig(Box::new(none.clone())));
+        h.send(PlayerCommand::Zap { forward: false, unlocked: true });
+        assert!(playing(1), "hidden by default without a PIN: {:?}", h.snapshot().playable);
+        none.parental.show_explicit = true;
+        h.send(PlayerCommand::ApplyConfig(Box::new(none)));
+        h.send(PlayerCommand::Zap { forward: true, unlocked: false });
+        assert!(playing(2));
     }
 
     #[test]

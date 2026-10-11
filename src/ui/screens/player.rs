@@ -466,7 +466,9 @@ impl PlayerScreen {
         let items: Vec<ChannelId> = match kind {
             PanelKind::History => ctx.lib.recent_channels.clone(),
             PanelKind::Channels | PanelKind::MiniGuide => match &snap.zap {
-                Some(z) if !z.channels.is_empty() => z.channels.to_vec(),
+                // a zap list sent before parental control relocked may hold explicit channels
+                // the library no longer has (DESIGN §20.3)
+                Some(z) if !z.channels.is_empty() => z.channels.iter().copied().filter(|c| ctx.lib.live.get(*c).is_some()).collect(),
                 _ => {
                     let g = current.and_then(|c| ctx.lib.live.get(c)).and_then(|c| c.group_ids.first().copied());
                     let coll = g.map_or(Collection::AllChannels, Collection::Group);

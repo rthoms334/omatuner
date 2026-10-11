@@ -246,7 +246,8 @@ pub fn channel_row(
     if !ui.is_rect_visible(rect) {
         return resp;
     }
-    let dim = opts.failed || ch.unsupported;
+    // a locked channel stays listed, dimmed, until the PIN opens the session (DESIGN §20.3)
+    let dim = opts.failed || ch.unsupported || (ch.locked && paint::session_locked(ui.ctx()));
     let color = if dim { t.text_disabled } else { paint::row_text(theme, state) };
     let inset = theme.space(SpaceToken::Lg);
     let gap = theme.space(SpaceToken::Lg);
@@ -382,7 +383,8 @@ pub fn group_row_decor(ui: &mut egui::Ui, theme: &Theme, g: &Group, state: RowSt
     if decor.marked {
         p.rect_filled(rect, t.rounding, with_alpha(t.accent, 0.14));
     }
-    let color = if g.hidden { t.text_disabled } else { paint::row_text(theme, state) };
+    let locked_dim = g.locked && paint::session_locked(ui.ctx());
+    let color = if g.hidden || locked_dim { t.text_disabled } else { paint::row_text(theme, state) };
     let inset = theme.space(SpaceToken::Lg);
     let left = rect.left() + inset + theme.space(SpaceToken::Sm);
     let mut right = rect.right() - inset;

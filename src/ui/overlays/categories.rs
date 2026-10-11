@@ -59,8 +59,8 @@ pub(crate) struct PickerData {
 }
 
 /// Read a playlist's category summary and rule (a `Loader` body).
-pub(crate) fn load(c: &rusqlite::Connection, id: SourceId) -> crate::error::Result<PickerData> {
-    let summary = crate::store::library::category_summary(c, id)?;
+pub(crate) fn load(c: &rusqlite::Connection, id: SourceId, hide_explicit: bool) -> crate::error::Result<PickerData> {
+    let summary = crate::store::library::category_summary(c, id, hide_explicit)?;
     let src = crate::store::sources::get_source(c, id)?;
     Ok(PickerData { summary, rule: src.settings.category_filter, name: src.name, country: crate::sources::presets::detect_country() })
 }
@@ -430,7 +430,8 @@ impl CategoryPicker {
         if self.follow && self.loader.is_none() && self.loaded_for != Some(generation) {
             self.loaded_for = Some(generation);
             let id = self.source;
-            self.loader = Some(Loader::start(ctx, move |c| load(c, id)));
+            let hide_explicit = ctx.parental.hides_explicit(&ctx.config.parental);
+            self.loader = Some(Loader::start(ctx, move |c| load(c, id, hide_explicit)));
         }
         match kit::poll(&mut self.loader) {
             Some(Ok(d)) => self.set_data(d),

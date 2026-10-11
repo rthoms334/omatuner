@@ -19,6 +19,20 @@ pub fn lenient_i64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Er
     })
 }
 
+/// A yes/no flag (`is_adult`): `1` / `"1"` / `true` / `"true"` / `"yes"` → true; `0`, `"0"`,
+/// `""`, `false`, null, missing or anything else → false.
+pub fn lenient_flag<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    Ok(match Value::deserialize(d)? {
+        Value::Bool(b) => b,
+        Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
+        Value::String(s) => {
+            let s = s.trim();
+            s.parse::<f64>().is_ok_and(|f| f != 0.0) || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
+        }
+        _ => false,
+    })
+}
+
 /// number | "number" → f64.
 pub fn lenient_f64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
     Ok(match Value::deserialize(d)? {
@@ -276,6 +290,9 @@ pub struct XtCategory {
     pub category_name: Option<String>,
     #[serde(default, deserialize_with = "lenient_i64")]
     pub parent_id: Option<i64>,
+    /// Adult content (`is_adult`; DESIGN §20.3).
+    #[serde(default, deserialize_with = "lenient_flag")]
+    pub is_adult: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -303,6 +320,9 @@ pub struct XtLiveStream {
     pub tv_archive_duration: Option<i64>,
     #[serde(default, deserialize_with = "lenient_string")]
     pub direct_source: Option<String>,
+    /// Adult content (`is_adult`; DESIGN §20.3).
+    #[serde(default, deserialize_with = "lenient_flag")]
+    pub is_adult: bool,
 }
 
 /// Like `string_or_vec` but also accepts numbers inside the array (`category_ids: [1, 2]`).
@@ -354,6 +374,9 @@ pub struct XtVodStream {
     pub tmdb: Option<String>,
     #[serde(default, deserialize_with = "lenient_string")]
     pub tmdb_id: Option<String>,
+    /// Adult content (`is_adult`; DESIGN §20.3).
+    #[serde(default, deserialize_with = "lenient_flag")]
+    pub is_adult: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -391,6 +414,9 @@ pub struct XtSeries {
     pub tmdb: Option<String>,
     #[serde(default, deserialize_with = "lenient_string")]
     pub tmdb_id: Option<String>,
+    /// Adult content (`is_adult`; DESIGN §20.3).
+    #[serde(default, deserialize_with = "lenient_flag")]
+    pub is_adult: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -598,6 +624,30 @@ mod tests {
         assert_eq!((s.a, s.b, s.c), (None, None, None));
         let s: S = serde_json::from_str(r#"{"a":true}"#).unwrap();
         assert_eq!(s.a, Some(1));
+    }
+
+    /// `is_adult` comes as "0"/"1", 0/1, booleans, or not at all (DESIGN §20.3).
+    #[test]
+    fn adult_flags_in_every_shape() {
+        let adult = |json: &str| serde_json::from_str::<XtLiveStream>(json).unwrap().is_adult;
+        for yes in [r#"{"is_adult":"1"}"#, r#"{"is_adult":1}"#, r#"{"is_adult":true}"#, r#"{"is_adult":" 1 "}"#, r#"{"is_adult":"true"}"#] {
+            assert!(adult(yes), "{yes}");
+        }
+        for no in [
+            r#"{"is_adult":"0"}"#,
+            r#"{"is_adult":0}"#,
+            r#"{"is_adult":false}"#,
+            r#"{"is_adult":null}"#,
+            r#"{"is_adult":""}"#,
+            "{}",
+            r#"{"is_adult":[]}"#,
+        ] {
+            assert!(!adult(no), "{no}");
+        }
+        assert!(serde_json::from_str::<XtCategory>(r#"{"category_id":"1","is_adult":"1"}"#).unwrap().is_adult);
+        assert!(serde_json::from_str::<XtVodStream>(r#"{"stream_id":1,"is_adult":1}"#).unwrap().is_adult);
+        assert!(serde_json::from_str::<XtSeries>(r#"{"series_id":1,"is_adult":"1"}"#).unwrap().is_adult);
+        assert!(!serde_json::from_str::<XtSeries>(r#"{"series_id":1}"#).unwrap().is_adult);
     }
 
     #[test]

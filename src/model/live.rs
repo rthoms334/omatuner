@@ -34,11 +34,53 @@ pub struct Group {
     pub tag: Option<super::CategoryTag>,
     /// What the source's category filter does to this group (DESIGN §28.3).
     pub filter: super::GroupFilter,
+    /// Explicit (adult) content, and why (DESIGN §20.3).
+    pub explicit: Explicit,
 }
 
 impl Group {
     pub fn display_name(&self) -> &str {
         self.rename.as_deref().unwrap_or(&self.name)
+    }
+}
+
+/// Is a category explicit (adult) content, and why (DESIGN §20.3)? Explicit categories and
+/// their items are absent from every list while parental control hides them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Explicit {
+    #[default]
+    No,
+    /// Its provider name reads as adult content (`sources::explicit::is_explicit_name`).
+    Name,
+    /// The provider flags it (Xtream `is_adult`).
+    Provider,
+    /// The user marked it ("Mark as explicit").
+    Marked,
+    /// Detected or not, the user said "Not explicit".
+    Cleared,
+}
+
+impl Explicit {
+    /// From `grp.explicit` (what the import found) and `group_override.explicit` (the user's
+    /// word, which wins).
+    pub fn of(stored: i64, user: Option<bool>) -> Self {
+        match (user, stored) {
+            (Some(true), _) => Explicit::Marked,
+            (Some(false), _) => Explicit::Cleared,
+            (None, 0) => Explicit::No,
+            (None, 2) => Explicit::Provider,
+            (None, _) => Explicit::Name,
+        }
+    }
+
+    /// Hidden while parental control hides explicit content.
+    pub fn is_explicit(self) -> bool {
+        matches!(self, Explicit::Name | Explicit::Provider | Explicit::Marked)
+    }
+
+    /// Detected or marked at some point (Settings ▸ Parental lists it).
+    pub fn is_listed(self) -> bool {
+        self != Explicit::No
     }
 }
 

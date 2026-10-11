@@ -707,6 +707,7 @@ fn confirm_context_menu_and_rename_dialogs() {
 fn pin_prompt_and_list_picker() {
     let salt = tuner::ui::parental::new_salt();
     let parental = tuner::config::ParentalConfig {
+        show_explicit: false,
         enabled: true,
         pin_hash: Some(tuner::ui::parental::hash_pin("1234", &salt)),
         pin_salt: Some(salt),
@@ -900,6 +901,7 @@ fn data_rows_render_with_real_services() {
         provider_id: None,
         tag: None,
         filter: Default::default(),
+        explicit: Default::default(),
     };
     let ep = Episode {
         id: EpisodeId(1),
@@ -1035,4 +1037,82 @@ fn dialogs_write_through_the_store() {
     let new = h.state().t.favs.lists.iter().find(|l| l.name == "Sport").expect("new list shown").id;
     let stored = tuner::store::user::lists_containing(&h.state().t.db, &item).expect("lists");
     assert!(stored.contains(&new));
+}
+
+/// Locked channels and groups stay listed while the parental session is locked — dimmed, with
+/// the lock glyph (DESIGN §20.3) — and paint normally once the PIN opens the session.
+#[test]
+fn locked_rows_dim_while_the_session_is_locked() {
+    use tuner::model::{ChannelId, ChannelSummary, Group, GroupId, GroupKey};
+    let mut t = TestUi::new().expect("TestUi");
+    let theme = Theme::fallback();
+    let tok = theme.tokens.clone();
+    let ch = |id: i64, name: &str, locked: bool| ChannelSummary {
+        id: ChannelId(id),
+        source_id: SourceId(1),
+        key: ItemKey(format!("c{id}")),
+        name: Arc::from(name),
+        provider_name: None,
+        number: None,
+        logo: None,
+        group_ids: vec![GroupId(1)],
+        epg_channel_id: None,
+        tvg_shift_min: 0,
+        has_catchup: false,
+        catchup_days: 0,
+        radio: false,
+        locked,
+        unsupported: false,
+        provider_order: id as i32,
+        user_order: None,
+        added_at: None,
+        quality: None,
+        family: 0,
+    };
+    let grp = |id: i64, name: &str, locked: bool| Group {
+        id: GroupId(id),
+        source_id: SourceId(1),
+        kind: ItemKind::Channel,
+        key: GroupKey(format!("channel:{id}")),
+        name: name.into(),
+        rename: None,
+        provider_order: id as i32,
+        user_order: None,
+        hidden: false,
+        user_hidden: false,
+        locked,
+        item_count: 3,
+        provider_id: None,
+        tag: None,
+        filter: Default::default(),
+        explicit: Default::default(),
+    };
+    let (locked_ch, open_ch) = (ch(1, "Locked Channel", true), ch(2, "Open Channel", false));
+    let (locked_g, open_g) = (grp(1, "Locked Group", true), grp(2, "Open Group", false));
+    let session_locked = std::cell::Cell::new(true);
+    let mut h = Harness::builder().with_size(egui::vec2(700.0, 400.0)).build_ui(|ui| {
+        tuner::ui::widgets::set_session_locked(ui.ctx(), session_locked.get());
+        let opts = rows::ChannelRowOpts { density: Density::Compact, ..Default::default() };
+        for c in [&locked_ch, &open_ch] {
+            rows::channel_row(ui, &theme, &mut t.images, c, None, 0, opts, RowState::Idle);
+        }
+        for g in [&locked_g, &open_g] {
+            rows::group_row(ui, &theme, g, RowState::Idle);
+        }
+    });
+    h.run();
+    let s = shapes(&h);
+    assert_eq!(text_color(&s, "Locked Channel"), Some(tok.text_disabled), "locked channel dimmed while locked");
+    assert_eq!(text_color(&s, "Locked Group"), Some(tok.text_disabled), "locked group dimmed while locked");
+    assert_eq!(text_color(&s, "Open Channel"), Some(tok.fg));
+    assert_eq!(text_color(&s, "Open Group"), Some(tok.fg));
+    let locks = s.iter().filter(|s| matches!(s, Shape::Text(t) if t.galley.job.text == tuner::ui::widgets::glyphs::LOCK)).count();
+    assert_eq!(locks, 2, "the lock glyph stays on both locked rows");
+
+    // the PIN opens the session: the same rows paint normally
+    session_locked.set(false);
+    h.run();
+    let s = shapes(&h);
+    assert_eq!(text_color(&s, "Locked Channel"), Some(tok.fg));
+    assert_eq!(text_color(&s, "Locked Group"), Some(tok.fg));
 }

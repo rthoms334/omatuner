@@ -505,10 +505,12 @@ impl Controller {
     }
 
     /// Parental gate of zapping and recall (DESIGN §20.3), authoritative for every sender: with
-    /// a PIN set and the sender's session locked, a PIN-locked channel is never tuned.
+    /// a PIN set and the sender's session locked, a PIN-locked channel is never tuned, and
+    /// explicit content is never tuned while it is hidden (`ParentalConfig::hides_explicit`).
     fn locked_out(&mut self, ch: ChannelId, unlocked: bool) -> bool {
         let p = &self.applied.parental;
-        !unlocked && p.enabled && p.pin_hash.is_some() && self.deps.resolver.is_locked(ch)
+        let (pin_locks, hides_explicit) = (!unlocked && p.pin_active(), p.hides_explicit(unlocked));
+        (pin_locks && self.deps.resolver.is_locked(ch)) || (hides_explicit && self.deps.resolver.is_explicit(ch))
     }
 
     /// Next/previous channel of the ZapList, skipping what the resolver says to skip and, while

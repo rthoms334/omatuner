@@ -40,6 +40,7 @@ fn m3u_draft(name: &str, url: &str) -> SourceDraft {
 
 fn chan(key: &str, name: &str, tvg: Option<&str>, grp: &str, url: &str, order: i32) -> ImportChannel {
     ImportChannel {
+        adult: false,
         key: ItemKey(key.into()),
         provider_id: key.strip_prefix("xt:live:").map(str::to_owned),
         name: name.into(),
@@ -66,6 +67,7 @@ fn chan(key: &str, name: &str, tvg: Option<&str>, grp: &str, url: &str, order: i
 fn movie(key: &str, name: &str, grp: &str, order: i32) -> ImportMovie {
     let url = format!("http://h.tv/movie/{key}.mp4");
     ImportMovie {
+        adult: false,
         key: ItemKey(key.into()),
         provider_id: key.strip_prefix("xt:vod:").map(str::to_owned),
         name: name.into(),
@@ -85,6 +87,7 @@ fn movie(key: &str, name: &str, grp: &str, order: i32) -> ImportMovie {
 
 fn series(key: &str, name: &str, grp: &str, order: i32) -> ImportSeries {
     ImportSeries {
+        adult: false,
         key: ItemKey(key.into()),
         provider_id: key.strip_prefix("xt:series:").map(str::to_owned),
         name: name.into(),
@@ -124,7 +127,15 @@ fn run_import(
             for k in keys {
                 if !groups.iter().any(|g| g.kind == kind && &g.key == k) {
                     let name = k.0.split_once(':').unwrap().1.to_owned();
-                    groups.push(ImportGroup { kind, key: k.clone(), name, raw_name: None, provider_id: None, provider_order: groups.len() as i32 });
+                    groups.push(ImportGroup {
+                        adult: false,
+                        kind,
+                        key: k.clone(),
+                        name,
+                        raw_name: None,
+                        provider_id: None,
+                        provider_order: groups.len() as i32,
+                    });
                 }
             }
         };
@@ -1255,7 +1266,7 @@ fn mref(src: SourceId, key: &str) -> ItemRef {
 /// The copies of one title stack in All across playlists and languages, from match keys the
 /// import stores: hidden copies (category hidden) and playlists out of All don't join, a
 /// locked copy does (and isn't the top card), the English copy is the top, different TMDB ids
-/// never stack, the visibility hook (explicit content) keeps an item out of everything. The
+/// never stack, hidden explicit content is left out of everything (at build and on relock). The
 /// user's split survives a refresh and its Undo restores the stack; a renamed copy is keyed
 /// again.
 #[test]
@@ -1298,16 +1309,26 @@ fn copies_stack_across_playlists_and_follow_the_users_corrections() {
     assert_eq!(names(&[st.top(dune)]), ["a1"]);
     assert_eq!(st.stack_of(at("a4").unwrap()), None, "two TMDB ids: two titles");
     assert_eq!(st.len(), 2, "Dune and Heat");
-    assert_eq!(names(&st.collapse(&lib.vod.all_sorted(true, SortMode::Provider))), ["a1", "a3", "a4", "b4", "c1"]);
+    assert_eq!(lib.vod.movies.len() - st.saved(), 5, "All: a1 (Dune), a3 (Heat), a4, b4, c1");
 
-    // the visibility hook: an item it rejects is nowhere, so it never stacks
-    let opts = library::LoadOptions {
-        vod_visible: Some(std::sync::Arc::new(|f: &library::VodFacts<'_>| !f.provider_name.contains("Heat (1995)"))),
-        ..Default::default()
-    };
-    let hooked = library::load_with(&r, &opts).unwrap();
-    assert!(hooked.vod.movies.iter().all(|m| m.key.0 != "b3"));
-    assert_eq!(hooked.vod.stacks(true).len(), 1, "Heat has one copy left");
+    // explicit content hidden by parental control (DESIGN §20.3): an explicit copy is nowhere,
+    // so it never stacks — at build time, and when a snapshot re-filters on relock
+    w(&s, |c| Ok(c.execute("UPDATE movie SET explicit = 1 WHERE key = 'b3'", []).map(|_| ())?));
+    let hidden = library::load_visible(&r, library::Visibility::NO_EXPLICIT).unwrap();
+    assert!(hidden.vod.movies.iter().all(|m| m.key.0 != "b3"));
+    assert_eq!(hidden.vod.stacks(true).len(), 1, "Heat has one copy left");
+    let shown = library::load(&r).unwrap();
+    assert_eq!(shown.vod.stacks(true).len(), 2, "an unlocked session stacks it");
+    let relocked = shown.hiding_explicit();
+    let (vod, st) = (&relocked.vod, relocked.vod.stacks(true));
+    assert_eq!((st.len(), vod.movies.len() - st.saved()), (1, 5), "Heat is a lone card, Dune one card for three copies");
+    let at = |key: &str| vod.movies.iter().position(|m| m.key.0 == key).map(|i| i as u32);
+    assert_eq!(at("b3"), None);
+    assert_eq!(st.stack_of(at("a3").unwrap()), None);
+    let dune = st.stack_of(at("a1").unwrap()).unwrap();
+    let keys: Vec<&str> = st.members(dune).iter().map(|i| vod.movies[*i as usize].key.0.as_str()).collect();
+    assert_eq!((keys, vod.movies[st.top(dune) as usize].key.0.as_str()), (vec!["a1", "b2", "a2"], "a1"), "re-pointed at the shorter vector");
+    w(&s, |c| Ok(c.execute("UPDATE movie SET explicit = 0 WHERE key = 'b3'", []).map(|_| ())?));
 
     // "Not the same title": the copy leaves its stack, a refresh keeps it out, Undo restores
     w(&s, move |c| tuner::store::titles::set_split(c, &mref(a, "a2"), true, NOW));
@@ -1757,6 +1778,7 @@ fn play_commands_and_the_error_cards_other_copy() {
 /// displayed smart-cleaned like the importer does.
 fn import_tagged(s: &Store, src: SourceId, channels: Vec<(&str, &str, Vec<&str>)>, movies: Vec<(&str, &str)>, now: Timestamp) {
     let grp = |kind: ItemKind, raw: &str, order: usize| ImportGroup {
+        adult: false,
         kind,
         key: group_key(kind, raw),
         name: raw.rsplit(['|', ':']).next().unwrap().trim().to_owned(),
@@ -1806,7 +1828,7 @@ fn category_filter_hides_tagged_groups_everywhere_and_follows_refreshes() {
     let stale = w(&s, move |c| sources::get_source(c, src));
 
     let r = s.reader().unwrap();
-    let summary = library::category_summary(&r, src).unwrap();
+    let summary = library::category_summary(&r, src, false).unwrap();
     let tags: Vec<Option<&str>> = summary.tags.iter().map(|t| t.tag.as_ref().map(|t| t.0.as_str())).collect();
     assert_eq!(tags, [Some("lang:ar"), Some("GB"), None], "AR has 2 channels + 1 movie, GB 2 channels, untagged last");
     assert_eq!((summary.tags[0].live_groups, summary.tags[0].movie_groups, summary.needs_refresh), (1, 1, false));
@@ -1896,7 +1918,7 @@ fn category_filter_hides_tagged_groups_everywhere_and_follows_refreshes() {
     // a group imported before raw names were stored: "needs refresh", and detection reads the
     // (smart-cleaned, untagged) display name, so the rule keeps it as untagged
     w(&s, move |c| Ok(c.execute("UPDATE grp SET raw_name = NULL WHERE source_id = ?1 AND name = 'Info'", [src])?));
-    assert!(library::category_summary(&r, src).unwrap().needs_refresh);
+    assert!(library::category_summary(&r, src, false).unwrap().needs_refresh);
     let fr = group(&library::load(&r).unwrap(), "|FR| Info");
     assert_eq!((fr.tag, fr.filter, fr.hidden), (None, GroupFilter::Kept, false));
 }

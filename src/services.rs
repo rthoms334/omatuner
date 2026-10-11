@@ -145,8 +145,16 @@ impl Services {
 
     fn start_reminders(&mut self, cfg: &Config) {
         let lead_s = cfg.reminders.lead_min as i64 * 60;
-        self.integrations.reminders =
-            ok("reminders", crate::platform::notify::ReminderScheduler::start(self.rt.handle(), self.store.clone(), self.bus.clone(), lead_s));
+        self.integrations.reminders = ok(
+            "reminders",
+            crate::platform::notify::ReminderScheduler::start(
+                self.rt.handle(),
+                self.store.clone(),
+                self.bus.clone(),
+                lead_s,
+                self.jobs.context().explicit.clone(),
+            ),
+        );
     }
 
     /// Re-apply a Settings edit to the integrations (the app calls it after swapping the shared
@@ -410,6 +418,14 @@ impl MediaResolver for DbResolver {
             .ok()
             .and_then(|r| r.ok())
             .is_none_or(|c| c.locked)
+    }
+
+    fn is_explicit(&mut self, ch: ChannelId) -> bool {
+        let Ok(conn) = self.conn() else { return true };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::store::live::channel_explicit(conn, ch)))
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or(true)
     }
 }
 

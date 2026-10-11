@@ -54,6 +54,9 @@ pub struct ImportGroup {
     pub raw_name: Option<String>,
     pub provider_id: Option<String>,
     pub provider_order: i32,
+    /// The provider flags the category as adult content (Xtream `is_adult`; DESIGN §20.3).
+    /// `grp.explicit` also reads the raw name (`sources::explicit::group_code`).
+    pub adult: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -80,6 +83,8 @@ pub struct ImportChannel {
     pub groups: Vec<GroupKey>,
     /// The quality word of the provider name (`smart_names`), whether or not cleanup is on.
     pub quality: Option<NameQuality>,
+    /// The provider flags the stream as adult content (`channel.explicit`; DESIGN §20.3).
+    pub adult: bool,
 }
 
 /// The quality word of a provider name (`channel.quality`) and the family of duplicates the
@@ -115,6 +120,8 @@ pub struct ImportMovie {
     pub groups: Vec<GroupKey>,
     /// The provider's TMDB id from the list (`tmdb`), when it sends one (DESIGN §29.10).
     pub tmdb: Option<u32>,
+    /// The provider flags the movie as adult content (`movie.explicit`; DESIGN §20.3).
+    pub adult: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -139,6 +146,8 @@ pub struct ImportSeries {
     pub groups: Vec<GroupKey>,
     /// The provider's TMDB id from the list (`tmdb`), when it sends one (DESIGN §29.10).
     pub tmdb: Option<u32>,
+    /// The provider flags the series as adult content (`series.explicit`; DESIGN §20.3).
+    pub adult: bool,
 }
 
 /// Lazy movie details (`get_vod_info`).
@@ -302,9 +311,11 @@ fn upsert_group(conn: &Connection, imp: &CatalogueImport, g: &ImportGroup) -> Re
         .is_some();
     let id = conn
         .prepare_cached(
-            "INSERT INTO grp(source_id, kind, key, name, raw_name, provider_id, provider_order, seen_gen) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO grp(source_id, kind, key, name, raw_name, provider_id, provider_order, seen_gen, explicit)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(source_id, kind, key) DO UPDATE SET name = excluded.name, raw_name = excluded.raw_name,
-               provider_id = excluded.provider_id, provider_order = excluded.provider_order, seen_gen = excluded.seen_gen
+               provider_id = excluded.provider_id, provider_order = excluded.provider_order, seen_gen = excluded.seen_gen,
+               explicit = excluded.explicit
              RETURNING id",
         )?
         .query_row(
@@ -316,7 +327,8 @@ fn upsert_group(conn: &Connection, imp: &CatalogueImport, g: &ImportGroup) -> Re
                 g.raw_name.as_deref().unwrap_or(&g.name),
                 g.provider_id,
                 g.provider_order,
-                imp.generation
+                imp.generation,
+                crate::sources::explicit::group_code(g.adult, g.raw_name.as_deref().unwrap_or(&g.name)),
             ],
             |r| r.get(0),
         )?;
@@ -353,7 +365,7 @@ fn resolve_groups(
                     Some(id) => id,
                     None => {
                         let name = sql::group_norm(&k.0);
-                        let g = ImportGroup { kind, key: k.clone(), name, raw_name: None, provider_id: None, provider_order: i32::MAX };
+                        let g = ImportGroup { kind, key: k.clone(), name, raw_name: None, provider_id: None, provider_order: i32::MAX, adult: false };
                         upsert_group(conn, imp, &g)?.0
                     }
                 };
@@ -430,8 +442,8 @@ pub fn write_channels(conn: &mut Connection, imp: &CatalogueImport, batch: &[Imp
             .prepare_cached(
                 "INSERT INTO channel(source_id, key, provider_id, name, clean_name, norm_name, number, logo, tvg_id, tvg_name,
                                      tvg_shift_min, stream, url_key, headers, catchup, radio, unsupported, provider_order,
-                                     added_at, seen_gen, quality, family)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, COALESCE(?19, ?20), ?21, ?22, ?23)
+                                     added_at, seen_gen, quality, family, explicit)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, COALESCE(?19, ?20), ?21, ?22, ?23, ?24)
                  ON CONFLICT(source_id, key) DO UPDATE SET
                    provider_id = excluded.provider_id, name = excluded.name, clean_name = excluded.clean_name,
                    norm_name = excluded.norm_name, number = excluded.number, logo = excluded.logo, tvg_id = excluded.tvg_id,
@@ -439,7 +451,7 @@ pub fn write_channels(conn: &mut Connection, imp: &CatalogueImport, batch: &[Imp
                    url_key = excluded.url_key, headers = excluded.headers, catchup = excluded.catchup, radio = excluded.radio,
                    unsupported = excluded.unsupported, provider_order = excluded.provider_order,
                    added_at = COALESCE(?19, channel.added_at), seen_gen = excluded.seen_gen, quality = excluded.quality,
-                   family = excluded.family
+                   family = excluded.family, explicit = excluded.explicit
                  RETURNING id",
             )?
             .query_row(
@@ -467,6 +479,7 @@ pub fn write_channels(conn: &mut Connection, imp: &CatalogueImport, batch: &[Imp
                     imp.generation,
                     ch.quality.as_ref().map(|q| q.class.code()),
                     ch.quality.as_ref().map(|q| q.family.as_str()),
+                    ch.adult,
                 ],
                 |r| r.get(0),
             )?;
@@ -492,8 +505,8 @@ pub fn write_movies(conn: &mut Connection, imp: &CatalogueImport, batch: &[Impor
         let id: i64 = tx
             .prepare_cached(
                 "INSERT INTO movie(source_id, key, provider_id, name, clean_name, norm_name, year, poster, rating, stream, url_key,
-                                   provider_order, added_at, seen_gen, tmdb_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, COALESCE(?13, ?14), ?15, ?16)
+                                   provider_order, added_at, seen_gen, tmdb_id, explicit)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, COALESCE(?13, ?14), ?15, ?16, ?17)
                  ON CONFLICT(source_id, key) DO UPDATE SET
                    match_tags = CASE WHEN excluded.name IS movie.name AND (excluded.year IS NULL OR excluded.year IS movie.year)
                                      THEN movie.match_tags END,
@@ -502,7 +515,7 @@ pub fn write_movies(conn: &mut Connection, imp: &CatalogueImport, batch: &[Impor
                    norm_name = excluded.norm_name, year = COALESCE(excluded.year, movie.year),
                    poster = COALESCE(excluded.poster, movie.poster), rating = COALESCE(excluded.rating, movie.rating),
                    stream = excluded.stream, url_key = excluded.url_key, provider_order = excluded.provider_order,
-                   added_at = COALESCE(?13, movie.added_at), seen_gen = excluded.seen_gen
+                   added_at = COALESCE(?13, movie.added_at), seen_gen = excluded.seen_gen, explicit = excluded.explicit
                  RETURNING id",
             )?
             .query_row(
@@ -523,6 +536,7 @@ pub fn write_movies(conn: &mut Connection, imp: &CatalogueImport, batch: &[Impor
                     imp.started_at,
                     imp.generation,
                     m.tmdb.map(|t| t.to_string()),
+                    m.adult,
                 ],
                 |r| r.get(0),
             )?;
@@ -563,8 +577,8 @@ fn upsert_series(tx: &Connection, imp: &CatalogueImport, s: &ImportSeries, group
     let id: i64 = tx
         .prepare_cached(
             "INSERT INTO series(source_id, key, provider_id, name, clean_name, norm_name, year, cover, backdrop, rating, plot,
-                                    genre, cast_, director, release_date, last_modified, provider_order, added_at, seen_gen, tmdb_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, COALESCE(?18, ?19), ?20, ?21)
+                                    genre, cast_, director, release_date, last_modified, provider_order, added_at, seen_gen, tmdb_id, explicit)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, COALESCE(?18, ?19), ?20, ?21, ?22)
                  ON CONFLICT(source_id, key) DO UPDATE SET
                    match_tags = CASE WHEN excluded.name IS series.name AND (excluded.year IS NULL OR excluded.year IS series.year)
                                      THEN series.match_tags END,
@@ -580,7 +594,7 @@ fn upsert_series(tx: &Connection, imp: &CatalogueImport, s: &ImportSeries, group
                                      THEN NULL ELSE series.details_at END,
                    last_modified = COALESCE(excluded.last_modified, series.last_modified),
                    provider_order = excluded.provider_order, added_at = COALESCE(?18, series.added_at),
-                   seen_gen = excluded.seen_gen
+                   seen_gen = excluded.seen_gen, explicit = excluded.explicit
                  RETURNING id",
         )?
         .query_row(
@@ -606,6 +620,7 @@ fn upsert_series(tx: &Connection, imp: &CatalogueImport, s: &ImportSeries, group
                 imp.started_at,
                 imp.generation,
                 s.tmdb,
+                s.adult,
             ],
             |r| r.get(0),
         )?;
@@ -791,8 +806,9 @@ fn kind_fixup_moves(conn: &Connection, source: SourceId) -> Result<Vec<KeyMove>>
     Ok(moves)
 }
 
-/// Copy the lock / hidden flags of the `channel:X` group override to the new `movie:X` /
-/// `series:X` group `g`: reclassifying entries never weakens a parental lock (DESIGN §27.4).
+/// Copy the lock / hidden flags (and a "Mark as explicit", DESIGN §20.3) of the `channel:X`
+/// group override to the new `movie:X` / `series:X` group `g`: reclassifying entries never
+/// weakens a parental lock (DESIGN §27.4).
 /// Done when the group is created, in the same transaction, so an import that never finishes
 /// cannot leave it unlocked; a group the user unlocks later is not created again and stays so.
 fn carry_group_locks(conn: &Connection, source: SourceId, g: &ImportGroup) -> Result<()> {
@@ -801,9 +817,9 @@ fn carry_group_locks(conn: &Connection, source: SourceId, g: &ImportGroup) -> Re
     }
     let Some(name) = g.key.0.strip_prefix(g.kind.as_str()).and_then(|k| k.strip_prefix(':')) else { return Ok(()) };
     conn.prepare_cached(
-        "INSERT INTO group_override(source_id, kind, group_key, hidden, locked)
-         SELECT source_id, ?2, ?3, hidden, locked FROM group_override
-         WHERE source_id = ?1 AND kind = 'channel' AND group_key = ?4 AND (locked OR hidden)
+        "INSERT INTO group_override(source_id, kind, group_key, hidden, locked, explicit)
+         SELECT source_id, ?2, ?3, hidden, locked, CASE WHEN explicit = 1 THEN 1 END FROM group_override
+         WHERE source_id = ?1 AND kind = 'channel' AND group_key = ?4 AND (locked OR hidden OR explicit = 1)
          ON CONFLICT(source_id, kind, group_key) DO NOTHING",
     )?
     .execute(params![source, g.kind.as_str(), g.key.0, format!("channel:{name}")])?;
@@ -917,13 +933,18 @@ pub fn finish_catalogue_with(
     let n_groups: i64 = tx.query_row("SELECT count(*) FROM grp WHERE source_id = ?1", [imp.source], |r| r.get(0))?;
     summary.groups = KindCounts { added: gc.added, updated: gc.updated, removed: groups_removed, total: u32_of(n_groups) };
 
-    if completed.contains(&ItemKind::Channel) {
-        // per-stream state of channels that are gone for good (user data is reattached below)
+    if !completed.is_empty() {
+        // per-stream state of channels, movies and episodes that are gone for good (user data
+        // is reattached below); a movie's failure orders its copies (DESIGN §29.15)
         tx.execute(
             "DELETE FROM stream_failure WHERE source_id = ?1
-               AND NOT EXISTS (SELECT 1 FROM channel c WHERE c.source_id = ?1 AND c.key = stream_failure.item_key)",
+               AND NOT EXISTS (SELECT 1 FROM channel c WHERE c.source_id = ?1 AND c.key = stream_failure.item_key)
+               AND NOT EXISTS (SELECT 1 FROM movie m WHERE m.source_id = ?1 AND m.key = stream_failure.item_key)
+               AND NOT EXISTS (SELECT 1 FROM episode e WHERE e.source_id = ?1 AND e.key = stream_failure.item_key)",
             [imp.source],
         )?;
+    }
+    if completed.contains(&ItemKind::Channel) {
         tx.execute(
             "DELETE FROM channel_epg_map WHERE source_id = ?1 AND method != 'manual'
                AND NOT EXISTS (SELECT 1 FROM channel c WHERE c.source_id = ?1 AND c.key = channel_epg_map.channel_key)",

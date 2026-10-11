@@ -33,6 +33,12 @@ impl Toasts {
         self.items.push((t, Instant::now()));
     }
 
+    /// Drop every toast (parental control relocked: one may name an explicit title).
+    pub fn clear(&mut self) {
+        self.items.clear();
+        self.hovered = None;
+    }
+
     /// Draw + expire. `avoid` = the mini-player rect (toasts stack above it); `bottom` = y of
     /// the status bar top. Returns an action if a toast button was pressed.
     pub fn show(&mut self, ctx: &egui::Context, theme: &Theme, avoid: Option<egui::Rect>, bottom: f32) -> Option<Action> {

@@ -47,13 +47,18 @@ fn provider_id(stream: Option<&StreamLocator>, provider_id: Option<&str>) -> Opt
 }
 
 pub async fn load_movie(ctx: &JobContext, id: MovieId, progress: &Progress, cancel: &CancellationToken) -> Result<()> {
-    let (movie, src) = read(ctx, move |c| {
+    let (movie, src, explicit) = read(ctx, move |c| {
         let m = crate::store::vod::movie(c, id)?;
         let s = crate::store::sources::get_source(c, m.source_id)?;
-        Ok((m, s))
+        let item = crate::model::ItemRef { source: m.source_id, kind: crate::model::ItemKind::Movie, key: m.key.clone() };
+        let explicit = crate::store::live::item_explicit(c, &item)?;
+        Ok((m, s, explicit))
     })
     .await?;
-    progress.set_subject(movie.display_name());
+    // an explicit title is never named in the jobs overlay or the log (DESIGN §20.3)
+    if !explicit {
+        progress.set_subject(movie.display_name());
+    }
     let now = crate::model::now();
     let Some(client) = client(ctx, &src) else { return Ok(()) };
     if fresh(movie.details_loaded_at, now) {
@@ -113,14 +118,19 @@ fn movie_details(info: &XtVodInfo) -> MovieDetails {
 }
 
 pub async fn load_series(ctx: &JobContext, id: SeriesId, progress: &Progress, cancel: &CancellationToken) -> Result<()> {
-    let (series, src, old_tmdb) = read(ctx, move |c| {
+    let (series, src, old_tmdb, explicit) = read(ctx, move |c| {
         let s = crate::store::vod::series(c, id)?;
         let src = crate::store::sources::get_source(c, s.source_id)?;
         let tmdb: Option<i64> = c.query_row("SELECT tmdb_id FROM series WHERE id = ?1", [id], |r| r.get(0))?;
-        Ok((s, src, tmdb.and_then(|t| u32::try_from(t).ok())))
+        let item = crate::model::ItemRef { source: s.source_id, kind: crate::model::ItemKind::Series, key: s.key.clone() };
+        let explicit = crate::store::live::item_explicit(c, &item)?;
+        Ok((s, src, tmdb.and_then(|t| u32::try_from(t).ok()), explicit))
     })
     .await?;
-    progress.set_subject(series.display_name());
+    // an explicit title is never named in the jobs overlay or the log (DESIGN §20.3)
+    if !explicit {
+        progress.set_subject(series.display_name());
+    }
     let now = crate::model::now();
     let Some(client) = client(ctx, &src) else { return Ok(()) };
     if fresh(series.details_loaded_at, now) {

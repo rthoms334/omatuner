@@ -27,6 +27,7 @@ fn groups() -> Vec<ImportGroup> {
         .map(|i| {
             let name = format!("Country {} | Category {}", i / 10, i % 10);
             ImportGroup {
+                adult: false,
                 kind: ItemKind::Channel,
                 key: group_key(ItemKind::Channel, &name),
                 name,
@@ -50,6 +51,7 @@ fn channels(n: usize, groups: &[ImportGroup]) -> Vec<ImportChannel> {
                 member.dedup();
             }
             ImportChannel {
+                adult: false,
                 key: ItemKey(format!("xt:live:{i}")),
                 provider_id: Some(i.to_string()),
                 clean_name: format!("Channel {i}"),

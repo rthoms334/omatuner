@@ -152,10 +152,13 @@ pub fn set_pin(conn: &Connection, item: &ItemRef, others: &[ItemRef], pin: bool,
 fn set_link(conn: &Connection, item: &ItemRef, action: LinkAction, on: bool, now: Timestamp) -> Result<()> {
     let Some(kind) = vod_kind_str(item.kind) else { return Ok(()) };
     if on {
+        // fingerprinted like other user data: a refresh that re-keys the copy re-attaches it
+        let fp = crate::store::sql::fp_opt(&crate::store::user::fingerprint_of(conn, item)?);
         conn.execute(
-            "INSERT INTO title_link(source_id, kind, item_key, action, at) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(source_id, kind, item_key, action) DO UPDATE SET at = excluded.at",
-            params![item.source, kind, item.key.as_str(), action.as_str(), now],
+            "INSERT INTO title_link(source_id, kind, item_key, action, at, fp) VALUES (?1, ?2, ?3, ?4, ?5, COALESCE(?6, '{}'))
+             ON CONFLICT(source_id, kind, item_key, action) DO UPDATE SET at = excluded.at, fp = COALESCE(?6, title_link.fp),
+               orphaned_since = NULL",
+            params![item.source, kind, item.key.as_str(), action.as_str(), now, fp],
         )?;
     } else {
         conn.execute(

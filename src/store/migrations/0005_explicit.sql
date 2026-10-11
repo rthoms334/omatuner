@@ -1,0 +1,17 @@
+-- Explicit (adult) content behind parental control (DESIGN §20.3). Owner: P14.
+--
+-- The columns are added by the Rust step of this migration (`migrations::backfill_explicit`,
+-- `add_column_if_missing`, so it is safe to re-run), then `grp.explicit` is filled from the
+-- stored category names:
+--
+--   grp.explicit            INTEGER NOT NULL DEFAULT 0  -- what the import found: 0 = no,
+--                                                       -- 1 = the name reads as adult content
+--                                                       -- (`sources::explicit`), 2 = the provider
+--                                                       -- flags it (Xtream `is_adult`)
+--   channel.explicit        INTEGER NOT NULL DEFAULT 0  -- the provider flags the item itself
+--   movie.explicit          INTEGER NOT NULL DEFAULT 0
+--   series.explicit         INTEGER NOT NULL DEFAULT 0
+--   group_override.explicit INTEGER                     -- the user's word: NULL = as detected,
+--                                                       -- 1 = "Mark as explicit", 0 = "Not explicit"
+--
+-- Provider flags arrive with each playlist's next refresh.

@@ -34,6 +34,8 @@ pub mod time;
 pub mod toast;
 pub mod toggle;
 
+pub use paint::{session_locked, set_session_locked};
+
 /// The second click of a double-click whose first click (at `first`, egui time) swapped what is
 /// under the pointer — a category opening its grid, the page list opening a page. It must not
 /// act on what appeared there (it would open a title or flip a setting). Screens record the

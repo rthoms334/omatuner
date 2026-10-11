@@ -932,6 +932,7 @@ pub(crate) mod tests {
             pin_salt: Some("s".into()),
             pin_hash: Some(crate::ui::parental::hash_pin("1234", "s")),
             relock_min: 0,
+            ..Default::default()
         };
         h.state_mut().t.config = std::sync::Arc::new(cfg);
         h.run_steps(1);

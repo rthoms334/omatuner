@@ -352,13 +352,17 @@ pub(crate) fn poster_tile_ex(
     };
     let off = (3.0 * theme.rem()).round().max(2.0);
     let poster = Rect::from_min_max(full.min, full.max - egui::Vec2::splat(off * f32::from(edges)));
+    // drawn disabled: a locked copy or an all-locked stack (`decor.dimmed`), and any locked
+    // title, until the PIN opens the session (DESIGN §20.3) — its card edges too
+    let dim = decor.dimmed || (item.locked && paint::session_locked(ui.ctx()));
     for k in (1..=edges).rev() {
         let edge = poster.translate(egui::Vec2::splat(off * f32::from(k)));
-        ui.painter().rect_filled(edge, t.rounding, t.raised_bg);
-        ui.painter().rect_stroke(edge, t.rounding, egui::Stroke::new(1.0, t.border_hover), egui::StrokeKind::Inside);
+        let (fill, stroke) = if dim { (with_alpha(t.raised_bg, 0.5), with_alpha(t.border_hover, 0.5)) } else { (t.raised_bg, t.border_hover) };
+        ui.painter().rect_filled(edge, t.rounding, fill);
+        ui.painter().rect_stroke(edge, t.rounding, egui::Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
     }
     paint_poster_image(ui, theme, images, item.poster.as_deref(), &item.name, poster, ImageKind::Poster);
-    if decor.dimmed {
+    if dim {
         ui.painter().rect_filled(poster, t.rounding, with_alpha(t.bg, 0.6));
     }
     let chip = theme.font(TypeToken::Icon) + 2.0 * theme.space(SpaceToken::Xs);
@@ -423,8 +427,8 @@ pub(crate) fn poster_tile_ex(
     let mut left = rect.left();
     let title_color = if cursor {
         t.list_cursor_text
-    } else if decor.dimmed {
-        t.text_secondary
+    } else if dim {
+        t.text_disabled
     } else {
         t.fg
     };

@@ -6,24 +6,26 @@
 //!   [`CopyMeta`] (language tag, dub, version tags, origin, TMDB id, pin); per stack its
 //!   members in copy order and its **top** copy (the card's poster, title and metadata).
 //! * Only items in the snapshot stack — hidden items (their own flag, every category hidden,
-//!   the category filter) and items the `LoadOptions::vod_visible` hook rejects (explicit
-//!   content) are not in it — and only from playlists in All (`in_all`). Locked copies stay
-//!   (drawn disabled; the PIN on pick). A copy the user split off stands alone.
+//!   the category filter) and explicit content while parental control hides it
+//!   (`LoadOptions::visibility`, DESIGN §20.3) are not in it — and only from playlists in All
+//!   (`in_all`). Locked copies stay (drawn disabled; the PIN on pick). A copy the user split
+//!   off stands alone. [`Stacks::retain`] drops copies from built stacks (the relock re-filter).
 //! * Copy order: language rank (the user's audio languages first, then untagged / multi-audio
-//!   copies, then subtitled markets, then other languages), then playlist order, CAM / TS after
-//!   the other copies of their playlist, then the playlist's own order (the vectors are in
-//!   playlist order). The top is the first **unlocked** copy; with every copy locked, the
-//!   first.
+//!   copies, then subtitled markets, then other languages), then CAM / TS after the clean
+//!   copies of that language, then playlist order, then the playlist's own order (the vectors
+//!   are in playlist order). The top is the first **unlocked** copy; with every copy locked,
+//!   the first.
 //! * An untagged copy in a category whose tagged titles are ≥ 80 % one market (≥ 10 of them)
 //!   takes that market as its language (`CopyMeta::inferred`): it never passes as the user's
 //!   language just because the provider left the prefix off.
 //! * [`play_order`] / [`fallback`]: which copy plays (pin > latest progress > troubled copies
-//!   last > language > playlist order or best quality > mkv / mp4 > CAM / TS), and the one
+//!   last > language > CAM / TS last > playlist order or best quality > mkv / mp4), and the one
 //!   tried once when the first fails before its first frame. [`stack_marks`]: what a stack
 //!   card shows of the copies' favourites, watched marks, progress and locks.
 //!
-//! Inside one playlist nothing is combined: the grids call [`Stacks::collapse`] only for All
-//! (and with `interface.same_title = combine`); [`Stacks::elsewhere`] gives "+1 also in TV".
+//! Inside one playlist nothing is combined: the grids collapse lists only for All (and with
+//! `interface.same_title = combine`, `ui::stacks::collapse`); [`Stacks::elsewhere`] gives "+1
+//! also in TV".
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -72,7 +74,7 @@ pub struct CopyMeta {
 }
 
 /// The stacks of one kind (movies or series). `Default` = no stacks.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Stacks {
     meta: Vec<CopyMeta>,
     /// Language codes (`EN`, `AR-SUBS`); index 0 = none.
@@ -154,41 +156,37 @@ impl Stacks {
         }
     }
 
-    /// Collapse a list for All: each stack once, as its top copy, where the first of its
-    /// members comes in `items` (the list's sort holds); other items unchanged. O(n).
-    pub fn collapse(&self, items: &[u32]) -> Vec<u32> {
-        if self.spans.is_empty() {
-            return items.to_vec();
-        }
-        let mut seen = vec![false; self.spans.len()];
-        let mut out = Vec::with_capacity(items.len());
-        for &i in items {
-            match self.stack_of(i) {
-                Some(s) if seen[s.0 as usize] => {}
-                Some(s) => {
-                    seen[s.0 as usize] = true;
-                    out.push(self.top(s));
-                }
-                None => out.push(i),
+    /// These stacks for the items left after a removal (explicit content hidden on relock):
+    /// `map[old]` is the item's new index (`None`: removed), `items` the new vector. Members
+    /// keep their copy order; a stack left with one copy dissolves; the top is again the first
+    /// unlocked member. Removing items never joins titles, so this equals a rebuild's stacks
+    /// up to the rare TMDB-run split a removed copy decided. O(items).
+    pub fn retain(self, map: &[Option<u32>], items: &[VodSummary]) -> Stacks {
+        let Stacks { meta, langs, flat, spans, playlists, .. } = self;
+        let mut new_meta = vec![CopyMeta::default(); items.len()];
+        for (old, m) in meta.into_iter().enumerate() {
+            if let Some(Some(new)) = map.get(old)
+                && let Some(slot) = new_meta.get_mut(*new as usize)
+            {
+                *slot = m;
             }
         }
-        out
-    }
-
-    /// A collapsed list with the stacks in `open` fanned out in place: the top, then the other
-    /// members in copy order.
-    pub fn fan_out(&self, collapsed: &[u32], open: &[StackId]) -> Vec<u32> {
-        let mut out = Vec::with_capacity(collapsed.len());
-        for &i in collapsed {
-            match self.stack_of(i).filter(|s| open.contains(s) && self.top(*s) == i) {
-                Some(s) => {
-                    out.push(i);
-                    out.extend(self.members(s).iter().copied().filter(|m| *m != i));
-                }
-                None => out.push(i),
+        let mut of = vec![NONE; items.len()];
+        let (mut new_flat, mut new_spans, mut tops) = (Vec::with_capacity(flat.len()), Vec::new(), Vec::new());
+        for &(a, b) in &spans {
+            let start = new_flat.len();
+            new_flat.extend(flat[a as usize..b as usize].iter().filter_map(|i| map.get(*i as usize).copied().flatten()));
+            if new_flat.len() - start < 2 {
+                new_flat.truncate(start);
+                continue;
             }
+            let members = &new_flat[start..];
+            let s = new_spans.len() as u32;
+            members.iter().for_each(|&i| of[i as usize] = s);
+            tops.push(members.iter().copied().find(|&i| !items[i as usize].locked).unwrap_or(members[0]));
+            new_spans.push((start as u32, new_flat.len() as u32));
         }
-        out
+        Stacks { meta: new_meta, langs, of, spans: new_spans, flat: new_flat, tops, playlists }
     }
 
     /// The other playlists `item`'s title is in ("+1 also in TV" inside one playlist), in
@@ -313,7 +311,7 @@ pub fn build(items: &[VodSummary], raw: Vec<CopyRaw>, in_all: impl Fn(SourceId) 
         let members = &mut flat[a as usize..b as usize];
         members.sort_unstable_by_key(|&i| {
             let m = &meta[i as usize];
-            (m.lang_rank, rank_of(items[i as usize].source_id), m.tags.is_cam(), i)
+            (m.lang_rank, m.tags.is_cam(), rank_of(items[i as usize].source_id), i)
         });
         tops.push(members.iter().copied().find(|&i| !items[i as usize].locked).unwrap_or(members[0]));
         for &i in members.iter() {
@@ -404,9 +402,10 @@ pub struct CopyFacts {
 }
 
 /// The order copies are tried in (the first plays): a pinned copy, then the latest progress,
-/// troubled copies last, then the audio language, then the playlist order — or the best quality
-/// first with [`CopyOrder::BestQuality`](crate::config::CopyOrder) — then mkv / mp4 before other
-/// containers, CAM / TS last. Locked copies are left out unless the session is `unlocked`.
+/// troubled copies last, then the audio language, CAM / TS after the clean copies of that
+/// language, then the playlist order — or the best quality first with
+/// [`CopyOrder::BestQuality`](crate::config::CopyOrder) — then mkv / mp4 before other
+/// containers. Locked copies are left out unless the session is `unlocked`.
 pub fn play_order(copies: &[CopyFacts], unlocked: bool, order: crate::config::CopyOrder) -> Vec<u32> {
     let mut v: Vec<&CopyFacts> = copies.iter().filter(|c| unlocked || !c.locked).collect();
     let best = order == crate::config::CopyOrder::BestQuality;
@@ -416,6 +415,8 @@ pub fn play_order(copies: &[CopyFacts], unlocked: bool, order: crate::config::Co
             std::cmp::Reverse(c.last_played.unwrap_or(i64::MIN)),
             c.trouble,
             c.lang_rank,
+            // CAM / TS last within the language, whichever playlist has the clean copy
+            c.cam,
             if best { std::cmp::Reverse(c.quality.map_or(0, |q| q.code())) } else { std::cmp::Reverse(0) },
             c.playlist_rank,
             match c.container_ok {
@@ -423,7 +424,6 @@ pub fn play_order(copies: &[CopyFacts], unlocked: bool, order: crate::config::Co
                 None => 1,
                 Some(false) => 2,
             },
-            c.cam,
             c.item,
         )
     });
@@ -521,10 +521,12 @@ mod tests {
             (2, "DE - Heat (1995)", 5, false),      // 5
             (1, "EN ★ Alien - 1979", 2, true),      // 6 all locked
             (2, "EN - Alien (1979)", 3, true),      // 7
+            (1, "EN-CAM - Brave the Dark (2025)", 2, false), // 8 CAM in the first playlist
+            (2, "EN - Brave the Dark (2025) [4K]", 3, false), // 9
         ]);
         let s = build(&items, raw, |_| true, &en());
-        assert_eq!(s.len(), 3);
-        assert_eq!(s.saved(), 8 - 3, "eight copies, three cards");
+        assert_eq!(s.len(), 4);
+        assert_eq!(s.saved(), 10 - 4, "ten copies, four cards");
         let dune = s.stack_of(0).unwrap();
         assert_eq!(s.members(dune), &[1, 2, 3, 0], "English first, then subtitled, then French");
         assert_eq!(s.top(dune), 2, "the first unlocked English copy");
@@ -533,11 +535,33 @@ mod tests {
         assert_eq!(s.top(s.stack_of(6).unwrap()), 6, "every copy locked: the first");
         assert_eq!(s.elsewhere(2, &items), vec![SourceId(1)]);
         assert_eq!(s.lang_label(3).as_deref(), Some("AR-SUBS"));
-        // All collapses each stack where its first member comes, as its top; fan-out reopens it
-        let all: Vec<u32> = (0..8).collect();
-        assert_eq!(s.collapse(&all), vec![2, 4, 6]);
-        assert_eq!(s.collapse(&[5, 3, 4]), vec![4, 2], "the list's order holds");
-        assert_eq!(s.fan_out(&[2, 4, 6], &[dune]), vec![2, 1, 3, 0, 4, 6]);
+        let brave = s.stack_of(8).unwrap();
+        assert_eq!((s.members(brave), s.top(brave)), (&[9, 8][..], 9), "a clean copy in a later playlist beats a CAM copy");
+    }
+
+    /// Removing copies (explicit content hidden on relock) re-points the stacks at the shorter
+    /// vector: members keep their order, the top is re-chosen among the unlocked copies left,
+    /// and a stack left with one copy dissolves.
+    #[test]
+    fn retain_after_removing_copies() {
+        let (items, raw) = copies(&[
+            (1, "FR ★ Dune - 2021", 1, false),     // 0
+            (1, "EN ★ Dune - 2021", 2, true),      // 1 locked
+            (2, "EN - Dune (2021)", 3, false),     // 2 top, removed
+            (2, "AR-SUBS - Dune (2021)", 4, false), // 3
+            (1, "EN ★ Heat - 1995", 2, false),     // 4
+            (2, "DE - Heat (1995)", 5, false),     // 5 removed
+        ]);
+        let s = build(&items, raw, |_| true, &en());
+        let map = [Some(0), Some(1), None, Some(2), Some(3), None];
+        let kept: Vec<VodSummary> = items.iter().zip(&map).filter(|(_, m)| m.is_some()).map(|(v, _)| v.clone()).collect();
+        let r = s.retain(&map, &kept);
+        assert_eq!(r.len(), 1, "Heat is alone now");
+        let dune = r.stack_of(0).unwrap();
+        assert_eq!(r.members(dune), &[1, 2, 0], "English (locked), subtitled, French");
+        assert_eq!(r.top(dune), 2, "the first unlocked copy left");
+        assert_eq!((r.stack_of(3), r.saved()), (None, 2));
+        assert_eq!(r.lang_label(2).as_deref(), Some("AR-SUBS"), "copy facts follow the copy");
     }
 
     /// Only copies of playlists in All stack; a copy the user split off stands alone; hidden
@@ -577,8 +601,8 @@ mod tests {
         assert_eq!(s.members(ziam), &[12, 13], "AR-SUBS (audio unknown) before Greek");
     }
 
-    /// Which copy plays: pin > latest progress > trouble last > language > playlist order (or
-    /// best quality) > mkv/mp4 > CAM; locked copies only when the session is unlocked; one
+    /// Which copy plays: pin > latest progress > trouble last > language > CAM last > playlist
+    /// order (or best quality) > mkv/mp4; locked copies only when the session is unlocked; one
     /// fallback.
     #[test]
     fn play_order_rules() {
@@ -607,6 +631,9 @@ mod tests {
         let mut v = base.clone();
         v[1].cam = true;
         assert_eq!(order(&v), vec![2, 1, 3, 0], "CAM after an equal copy");
+        let mut w = base.clone();
+        (w[0].lang_rank, w[1].cam, w[2].cam) = (0, true, true);
+        assert_eq!(order(&w), vec![0, 1, 2, 3], "a clean copy of a later playlist before CAM copies");
         v[2].trouble = true;
         assert_eq!(order(&v), vec![1, 3, 0, 2], "a failed / at-limit / expired copy goes last");
         v[0].last_played = Some(100);

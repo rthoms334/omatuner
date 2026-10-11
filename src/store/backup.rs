@@ -432,9 +432,20 @@ pub fn restore(conn: &mut Connection, b: &Backup, mode: RestoreMode) -> Result<R
     for g in &b.group_overrides {
         let Some(source) = source_map.get(&g.source.0) else { continue };
         rows += tx.execute(
-            "INSERT INTO group_override(source_id, kind, group_key, rename, hidden, locked, user_order, pinned_home, shown)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(source_id, kind, group_key) DO NOTHING",
-            params![source, g.kind.as_str(), g.key.0, g.ov.rename, g.ov.hidden, g.ov.locked, g.ov.user_order, g.ov.pinned_home, g.ov.shown],
+            "INSERT INTO group_override(source_id, kind, group_key, rename, hidden, locked, user_order, pinned_home, shown, explicit)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) ON CONFLICT(source_id, kind, group_key) DO NOTHING",
+            params![
+                source,
+                g.kind.as_str(),
+                g.key.0,
+                g.ov.rename,
+                g.ov.hidden,
+                g.ov.locked,
+                g.ov.user_order,
+                g.ov.pinned_home,
+                g.ov.shown,
+                g.ov.explicit
+            ],
         )?;
     }
 

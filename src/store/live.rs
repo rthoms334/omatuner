@@ -91,7 +91,7 @@ pub fn channel_by_ref(conn: &Connection, item: &ItemRef) -> Result<Option<Channe
 }
 
 pub(crate) const GROUP_COLS: &str = "g.id, g.source_id, g.kind, g.key, g.name, o.rename, g.provider_order, o.user_order, \
-     COALESCE(o.hidden, 0), COALESCE(o.locked, 0), g.item_count, g.provider_id, COALESCE(g.raw_name, g.name), COALESCE(o.shown, 0)";
+     COALESCE(o.hidden, 0), COALESCE(o.locked, 0), g.item_count, g.provider_id, COALESCE(g.raw_name, g.name), COALESCE(o.shown, 0), g.explicit, o.explicit";
 
 pub(crate) const GROUP_FROM: &str = "FROM grp g JOIN source s ON s.id = g.source_id
      LEFT JOIN group_override o ON o.source_id = g.source_id AND o.kind = g.kind AND o.group_key = g.key";
@@ -119,6 +119,7 @@ pub(crate) fn group_from_row(r: &Row<'_>) -> rusqlite::Result<Group> {
         tag: crate::sources::category_tags::detect_tag(&r.get::<_, String>(12)?),
         // the user's "show anyway"; `library::load` applies the source's rule (DESIGN §28.4)
         filter: if r.get(13)? { crate::model::GroupFilter::Exempt } else { crate::model::GroupFilter::Kept },
+        explicit: crate::model::Explicit::of(r.get(14)?, r.get(15)?),
     })
 }
 
@@ -134,6 +135,55 @@ pub fn groups(conn: &Connection, kind: ItemKind, source: Option<SourceId>) -> Re
 pub fn group(conn: &Connection, id: GroupId) -> Result<Group> {
     let r = conn.prepare_cached(&format!("SELECT {GROUP_COLS} {GROUP_FROM} WHERE g.id = ?1"))?.query_row([id], group_from_row);
     or_not_found(r, "group", id)
+}
+
+/// Is a channel / movie / series row explicit content (DESIGN §20.3), by the library's rule
+/// (`library::Inherited::explicit`): one of its categories is (`grp.explicit`, the user's word
+/// first), or the provider flags the item and none of its categories is marked "Not
+/// explicit". `table` / `link` / `col`: the item table, its group link table and column.
+fn explicit_row(conn: &Connection, table: &str, link: &str, col: &str, id: i64) -> Result<bool> {
+    let sql = format!(
+        "SELECT EXISTS (SELECT 1 FROM {link} l JOIN grp g ON g.id = l.group_id
+                          LEFT JOIN group_override o ON o.source_id = g.source_id AND o.kind = g.kind AND o.group_key = g.key
+                        WHERE l.{col} = x.id AND COALESCE(o.explicit, g.explicit > 0) = 1)
+             OR (x.explicit = 1 AND NOT EXISTS (SELECT 1 FROM {link} l JOIN grp g ON g.id = l.group_id
+                          JOIN group_override o ON o.source_id = g.source_id AND o.kind = g.kind AND o.group_key = g.key
+                        WHERE l.{col} = x.id AND o.explicit = 0))
+         FROM {table} x WHERE x.id = ?1"
+    );
+    Ok(conn.prepare_cached(&sql)?.query_row([id], |r| r.get(0)).optional()?.unwrap_or(false))
+}
+
+/// A channel is explicit content (DESIGN §20.3; see `explicit_row`). Unknown ids aren't.
+pub fn channel_explicit(conn: &Connection, id: ChannelId) -> Result<bool> {
+    explicit_row(conn, "channel", "channel_group", "channel_id", id.0)
+}
+
+/// A channel, movie, series or episode (its series) is explicit content (DESIGN §20.3). Rows
+/// that no longer exist aren't.
+pub fn item_explicit(conn: &Connection, item: &ItemRef) -> Result<bool> {
+    let id_of = |table: &str| -> Result<Option<i64>> {
+        Ok(conn
+            .prepare_cached(&format!("SELECT id FROM {table} WHERE source_id = ?1 AND key = ?2"))?
+            .query_row(params![item.source, item.key.as_str()], |r| r.get(0))
+            .optional()?)
+    };
+    let (table, link, col, id) = match item.kind {
+        ItemKind::Channel => ("channel", "channel_group", "channel_id", id_of("channel")?),
+        ItemKind::Movie => ("movie", "movie_group", "movie_id", id_of("movie")?),
+        ItemKind::Series => ("series", "series_group", "series_id", id_of("series")?),
+        ItemKind::Episode => {
+            let series: Option<i64> = conn
+                .prepare_cached("SELECT series_id FROM episode WHERE source_id = ?1 AND key = ?2")?
+                .query_row(params![item.source, item.key.as_str()], |r| r.get(0))
+                .optional()?;
+            ("series", "series_group", "series_id", series)
+        }
+    };
+    match id {
+        Some(id) => explicit_row(conn, table, link, col, id),
+        None => Ok(false),
+    }
 }
 
 /// Why a stream failed (persisted per channel; DESIGN §11.6).

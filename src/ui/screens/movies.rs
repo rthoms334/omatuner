@@ -125,8 +125,10 @@ const MENU_PLAY: u8 = 21;
 const MENU_OPEN_CAT: u8 = 22;
 /// The categories menu's "Countries & languages…".
 const MENU_COUNTRIES: u8 = 23;
+/// The category menu's "Mark as explicit" / "Not explicit" (DESIGN §20.3).
+const MENU_EXPLICIT: u8 = 24;
 /// A fanned-out copy's "Not the same title".
-const MENU_SPLIT: u8 = 24;
+const MENU_SPLIT: u8 = 25;
 /// "Play from…": copy `k` of the menu is `MENU_COPY + k`.
 const MENU_COPY: u8 = 40;
 /// Copies listed in "Play from…".
@@ -1007,6 +1009,7 @@ impl VodBrowser {
                 if self.tags.1.contains_key(&g.id) {
                     items.push(MenuItem { shortcut: None, ..mi(glyphs::EARTH, "Countries & languages…", Action::Digit(MENU_COUNTRIES), "") });
                 }
+                items.push(super::live::explicit_menu_item(&g, MENU_EXPLICIT));
                 items.extend([mi(glyphs::REORDER, "Move up", Action::MoveUp, "Alt+↑"), mi(glyphs::REORDER, "Move down", Action::MoveDown, "Alt+↓")]);
                 ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: g.display_name().to_owned(), items }));
             }
@@ -1181,6 +1184,11 @@ impl VodBrowser {
             OverlayResult::Unlocked(Action::PlayFrom) => {
                 if let Some(c) = self.pending_copy.take() {
                     self.play_copy(ctx, c);
+                }
+            }
+            OverlayResult::Chosen(Action::Digit(MENU_EXPLICIT)) => {
+                if let Some(g) = self.current_group(ctx).cloned() {
+                    super::live::toggle_group_explicit(ctx, &g);
                 }
             }
             OverlayResult::Chosen(Action::SortMenu) => self.sort_menu(ctx),
@@ -1875,15 +1883,16 @@ mod tests {
         set(&mut h.state_mut().t, named(a, 1), hidden);
         h.run_steps(2);
         assert!(has_label_containing(&h, "Dune · Alpha + Bravo · 2 copies · locked"), "the French copy left the stack");
-        // the visibility hook (explicit content behind parental control) drops a copy the same way
+        // explicit content hidden by parental control drops a copy the same way (DESIGN §20.3)
+        let bravo_dune = named(b, 0);
+        seed(&mut h.state_mut().t, move |c| {
+            c.execute("UPDATE movie SET explicit = 1 WHERE source_id = ?1 AND key = ?2", rusqlite::params![bravo_dune.source, bravo_dune.key.as_str()])?;
+            Ok(())
+        });
         let reader = h.state().t.services().store.reader().unwrap();
-        let opts = crate::store::library::LoadOptions {
-            vod_visible: Some(std::sync::Arc::new(|f: &crate::store::library::VodFacts<'_>| !f.provider_name.starts_with("EN - Dune"))),
-            ..Default::default()
-        };
-        h.state_mut().t.set_library(crate::store::library::load_with(&reader, &opts).unwrap());
+        h.state_mut().t.set_library(crate::store::library::load_visible(&reader, crate::store::library::Visibility::NO_EXPLICIT).unwrap());
         h.run_steps(2);
-        assert_eq!(shown_names(&h), ["Heat", "Solo", "Dune"], "Bravo's copy rejected: Alpha's English copy stands alone");
+        assert_eq!(shown_names(&h), ["Heat", "Solo", "Dune"], "Bravo's copy is explicit: Alpha's English copy stands alone");
         assert!(!has_label_containing(&h, "copies"));
     }
 
@@ -2191,6 +2200,7 @@ mod tests {
     fn with_pin(t: &mut crate::ui::testing::TestUi) {
         let mut cfg = (*t.config).clone();
         cfg.parental = crate::config::ParentalConfig {
+            show_explicit: false,
             enabled: true,
             pin_salt: Some("s".into()),
             pin_hash: Some(crate::ui::parental::hash_pin("1234", "s")),

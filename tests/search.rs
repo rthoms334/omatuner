@@ -33,6 +33,7 @@ fn source(id: i64, name: &str) -> SourceMeta {
 
 fn group(id: i64, kind: ItemKind, name: &str, hidden: bool, locked: bool) -> Group {
     Group {
+        explicit: Default::default(),
         id: GroupId(id),
         source_id: SourceId(1),
         kind,

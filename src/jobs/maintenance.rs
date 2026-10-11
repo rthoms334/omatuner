@@ -33,7 +33,8 @@ const IMAGE_CACHE_BYTES: u64 = 500 * 1024 * 1024;
 /// Build a new `Library` from a fresh reader connection on a blocking thread, with the
 /// current config's options (the audio languages order the copies of a stack).
 pub async fn rebuild_library(ctx: &JobContext) -> Result<Arc<Library>> {
-    let opts = crate::store::library::LoadOptions::from_config(&crate::config::current(&ctx.config));
+    // visibility read at the start: the app rebuilds again when its parental state changed meanwhile
+    let opts = crate::store::library::LoadOptions::from_config(&crate::config::current(&ctx.config), ctx.explicit.visibility());
     read(ctx, move |c| crate::store::library::load_with(c, &opts)).await.map(Arc::new)
 }
 
