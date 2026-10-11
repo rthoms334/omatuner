@@ -10,6 +10,8 @@
 //! * Row renderers (`rows::*`) paint their own state background from the `RowState` they get, so
 //!   they look right inside [`list::virtual_list`] and anywhere else (menus, side panels).
 
+use eframe::egui;
+
 pub mod badge;
 pub mod button;
 pub mod card;
@@ -30,6 +32,16 @@ pub mod text_field;
 pub mod time;
 pub mod toast;
 pub mod toggle;
+
+/// The second click of a double-click whose first click (at `first`, egui time) swapped what is
+/// under the pointer — a category opening its grid, the page list opening a page. It must not
+/// act on what appeared there (it would open a title or flip a setting). Screens record the
+/// time of such a click and drop clicks for which this is true.
+pub fn second_click_after(ui: &egui::Ui, first: Option<f64>) -> bool {
+    let Some(first) = first else { return false };
+    let max = ui.ctx().options(|o| o.input_options.max_double_click_delay);
+    ui.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary) && i.time - first <= max + 0.05)
+}
 
 /// Visual state of a row/control (Omarchy paint priority: pressed > focus > hover/cursor >
 /// selected > active > idle).

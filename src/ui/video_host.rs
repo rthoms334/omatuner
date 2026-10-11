@@ -46,6 +46,35 @@ pub enum Placement {
     Mini,
 }
 
+/// What a click on the corner mini player asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MiniAction {
+    /// The video: open the fullscreen player.
+    Open,
+    /// Pop the player out (small window on every workspace).
+    PopOut,
+    /// ✕: stop playback.
+    Stop,
+}
+
+/// A recovery action offered as a button under a failed / reconnecting stream in the
+/// fullscreen player (the keys `r` / Backspace do the same).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateAction {
+    Retry,
+    LastChannel,
+}
+
+/// Where the player draws a [`StateAction`] button this frame (laid out by the state overlay,
+/// drawn and handled by the player with its OSD buttons).
+#[derive(Debug, Clone)]
+pub struct StateButton {
+    pub action: StateAction,
+    pub rect: Rect,
+    pub text: String,
+    pub font: FontId,
+}
+
 #[derive(Default)]
 pub struct VideoHost {
     surface: Option<VideoSurface>,
@@ -57,6 +86,8 @@ pub struct VideoHost {
     mini_drawn: bool,
     /// Logo of what plays (url, texture), resolved through the image cache by `paint`.
     logo: Option<(String, egui::TextureHandle)>,
+    /// Recovery buttons of the last fullscreen `paint` (empty unless failed / reconnecting).
+    buttons: Vec<StateButton>,
 }
 
 impl VideoHost {
@@ -104,7 +135,8 @@ impl VideoHost {
 
     /// Paint the video into `rect` (mpv draws black bars), plus the state overlay (with the
     /// channel logo from `images`). Returns the response over the whole rect (click /
-    /// double-click handling by the caller).
+    /// double-click handling by the caller). A fullscreen failed / reconnecting
+    /// stream also lays out its recovery buttons ([`VideoHost::state_buttons`]).
     pub fn paint(
         &mut self,
         ui: &mut egui::Ui,
@@ -138,6 +170,11 @@ impl VideoHost {
         self.logo.as_ref().filter(|(u, _)| u == url).map(|(_, t)| t)
     }
 
+    /// The recovery buttons laid out by the last fullscreen [`paint`](Self::paint).
+    pub fn state_buttons(&self) -> &[StateButton] {
+        &self.buttons
+    }
+
     fn paint_video(&mut self, ui: &mut egui::Ui, rect: egui::Rect, placement: Placement, theme: &Theme, snap: &PlayerSnapshot) -> egui::Response {
         self.placed_this_frame = placement;
         let resp = ui.allocate_rect(rect, egui::Sense::click());
@@ -161,12 +198,20 @@ impl VideoHost {
                 theme.tokens.osd_text,
             );
         }
-        self.paint_state_overlay(ui, rect, placement, theme, snap);
+        self.buttons = self.paint_state_overlay(ui, rect, placement, theme, snap);
         resp
     }
 
-    /// Loading / buffering / reconnecting / error overlay (fixed dark scrim). WP-11.
-    fn paint_state_overlay(&self, ui: &mut egui::Ui, rect: egui::Rect, placement: Placement, theme: &Theme, snap: &PlayerSnapshot) {
+    /// Loading / buffering / reconnecting / error overlay (fixed dark scrim). WP-11. Returns
+    /// the recovery buttons to draw under a failed / reconnecting stream (fullscreen only).
+    fn paint_state_overlay(
+        &self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        placement: Placement,
+        theme: &Theme,
+        snap: &PlayerSnapshot,
+    ) -> Vec<StateButton> {
         let t = &theme.tokens;
         let p = ui.painter_at(rect);
         let k = overlay_scale(rect);
@@ -177,6 +222,30 @@ impl VideoHost {
         let title = snap.playable.as_ref().map(|p| p.title.as_str()).unwrap_or("");
         let live = snap.playable.as_ref().is_none_or(|p| p.kind.is_live());
         let time = ui.input(|i| i.time);
+        // recovery buttons centred under the text (the fullscreen player handles them)
+        let buttons = |bottom: f32, reconnecting: bool| -> Vec<StateButton> {
+            if placement != Placement::Fullscreen {
+                return Vec::new();
+            }
+            let font = FontId::proportional((theme.font(TypeToken::Body) * k).round());
+            let retry = if reconnecting { "Retry now" } else { "Retry" };
+            let mut list = vec![(StateAction::Retry, format!("{}  {retry}", glyphs::REFRESH))];
+            if live && snap.previous_live.is_some() {
+                list.push((StateAction::LastChannel, format!("{}  Last channel", glyphs::HISTORY)));
+            }
+            let pad = egui::vec2(gap, gap / 2.0);
+            let sizes: Vec<egui::Vec2> = list.iter().map(|(_, s)| p.layout_no_wrap(s.clone(), font.clone(), t.osd_text).size() + 2.0 * pad).collect();
+            let total = sizes.iter().map(|s| s.x).sum::<f32>() + gap * (sizes.len() as f32 - 1.0);
+            let mut x = rect.center().x - total / 2.0;
+            list.into_iter()
+                .zip(sizes)
+                .map(|((action, text), size)| {
+                    let r = Rect::from_min_size(egui::pos2(x, bottom + gap), size);
+                    x = r.right() + gap;
+                    StateButton { action, rect: r, text, font: font.clone() }
+                })
+                .collect()
+        };
         match &snap.state {
             PlayerState::Idle => {}
             PlayerState::Zapping { .. } | PlayerState::Loading { .. } => {
@@ -245,9 +314,10 @@ impl VideoHost {
                     (detail.as_str(), body_font, with_alpha(t.osd_text, 0.7)),
                     (hint, small_font, t.osd_accent),
                 ];
-                stacked(&p, rect, &lines, gap);
+                let bottom = stacked(&p, rect, &lines, gap);
                 spinner(&p, egui::pos2(rect.center().x, rect.center().y - 3.0 * title_font_size(theme, k)), 10.0 * k, t.osd_accent, time);
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+                return buttons(bottom, true);
             }
             PlayerState::Error(e) => {
                 p.rect_filled(rect, 0.0, t.osd_scrim);
@@ -260,7 +330,8 @@ impl VideoHost {
                     (detail.as_str(), body_font, with_alpha(t.osd_text, 0.7)),
                     (hint, small_font, t.osd_accent),
                 ];
-                stacked(&p, rect, &lines, gap);
+                let bottom = stacked(&p, rect, &lines, gap);
+                return buttons(bottom, false);
             }
             PlayerState::Ended => {
                 p.rect_filled(rect, 0.0, t.osd_scrim);
@@ -304,12 +375,14 @@ impl VideoHost {
                 }
             }
         }
+        Vec::new()
     }
 
     /// Corner mini-player (app calls when nothing else placed the video, the screen allows it,
-    /// the layout isn't Compact and `interface.mini_player` is on). Returns `Some(true)` = open
-    /// fullscreen player, `Some(false)` = stop. Records [`VideoHost::mini_rect`].
-    pub fn mini_player(&mut self, ctx: &egui::Context, theme: &Theme, snap: &PlayerSnapshot) -> Option<bool> {
+    /// the layout isn't Compact and `interface.mini_player` is on). Returns what was clicked:
+    /// the video opens the fullscreen player, the strip pops the player out or stops it.
+    /// Records [`VideoHost::mini_rect`].
+    pub fn mini_player(&mut self, ctx: &egui::Context, theme: &Theme, snap: &PlayerSnapshot) -> Option<MiniAction> {
         self.mini = None;
         if snap.state == PlayerState::Idle {
             return None;
@@ -323,14 +396,15 @@ impl VideoHost {
             ui.set_min_size(total.size());
             let video = Rect::from_min_size(total.min, egui::vec2(total.width(), total.height() - strip_h));
             let resp = self.paint_video(ui, video, Placement::Mini, theme, snap);
-            if resp.on_hover_text("Open the player").clicked() {
-                result = Some(true);
+            if resp.on_hover_text("Open the player").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                result = Some(MiniAction::Open);
             }
             let strip = Rect::from_min_max(egui::pos2(total.left(), video.bottom()), total.max);
             let p = ui.painter();
             p.rect_filled(strip, 0.0, t.card_bg);
             let pad = theme.space(SpaceToken::Lg);
             let close = Rect::from_center_size(egui::pos2(strip.right() - strip_h / 2.0, strip.center().y), egui::vec2(strip_h, strip_h));
+            let pop = close.translate(egui::vec2(-strip_h, 0.0));
             let title = snap.playable.as_ref().map(|p| p.title.as_str()).unwrap_or("");
             let mut label = title.to_owned();
             if let Some(n) = snap.playable.as_ref().and_then(|p| p.number) {
@@ -343,23 +417,27 @@ impl VideoHost {
                 &label,
                 FontId::proportional(theme.font(TypeToken::BodySmall)),
                 t.fg,
-                (close.left() - strip.left() - 2.0 * pad).max(0.0),
+                (pop.left() - strip.left() - 2.0 * pad).max(0.0),
             );
-            let cr = ui.interact(close, ui.id().with("mini-close"), egui::Sense::click());
-            cr.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Stop playback"));
-            if cr.hovered() {
-                p.rect_filled(close.shrink(2.0), t.rounding, t.fill_hover);
+            // strip buttons: pop out, stop
+            let strip_button = |ui: &egui::Ui, r: Rect, id: &str, glyph: &str, label: &str, tip: &str| {
+                let resp = ui.interact(r, ui.id().with(id), egui::Sense::click()).on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand);
+                resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+                let p = ui.painter();
+                if resp.hovered() {
+                    p.rect_filled(r.shrink(2.0), t.rounding, t.fill_hover);
+                }
+                let color = if resp.hovered() { t.accent } else { t.text_secondary };
+                p.text(r.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(theme.font(TypeToken::Icon)), color);
+                resp.clicked()
+            };
+            if strip_button(ui, pop, "mini-pop-out", glyphs::POP_OUT, "Pop out", "Pop out (Ctrl+Shift+O)") {
+                result = Some(MiniAction::PopOut);
             }
-            p.text(
-                close.center(),
-                Align2::CENTER_CENTER,
-                glyphs::CLOSE,
-                FontId::proportional(theme.font(TypeToken::Icon)),
-                if cr.hovered() { t.accent } else { t.text_secondary },
-            );
-            if cr.clicked() {
-                result = Some(false);
+            if strip_button(ui, close, "mini-close", glyphs::CLOSE, "Stop playback", "Stop playback") {
+                result = Some(MiniAction::Stop);
             }
+            let p = ui.painter();
             p.rect_stroke(total, t.rounding, egui::Stroke::new(t.card_border_width.min(2.0), t.card_border), egui::StrokeKind::Outside);
         });
         // not a placement (see module docs)
@@ -483,8 +561,9 @@ pub(crate) fn osd_text(p: &egui::Painter, pos: egui::Pos2, anchor: Align2, s: &s
 }
 
 /// Lines stacked and centred in `rect`; each wraps to at most two rows (a long error
-/// headline keeps its tail — "…or too many connections" is the part users need).
-fn stacked(p: &egui::Painter, rect: Rect, lines: &[(&str, FontId, Color32)], gap: f32) {
+/// headline keeps its tail — "…or too many connections" is the part users need). Returns the
+/// bottom of the last line.
+fn stacked(p: &egui::Painter, rect: Rect, lines: &[(&str, FontId, Color32)], gap: f32) -> f32 {
     let max_w = (rect.width() - 2.0 * gap).max(0.0);
     let galleys: Vec<Arc<egui::Galley>> = lines
         .iter()
@@ -498,12 +577,15 @@ fn stacked(p: &egui::Painter, rect: Rect, lines: &[(&str, FontId, Color32)], gap
         .collect();
     let h: f32 = galleys.iter().map(|g| g.size().y).sum::<f32>() + gap * galleys.len().saturating_sub(1) as f32;
     let mut y = rect.center().y - h / 2.0;
+    let mut bottom = y;
     for g in galleys {
         let gh = g.size().y;
         // a centre-aligned galley is laid out around x = 0
         p.galley(egui::pos2(rect.center().x, y), g, Color32::PLACEHOLDER);
+        bottom = y + gh;
         y += gh + gap;
     }
+    bottom
 }
 
 /// The channel logo (aspect kept, fit into `r`) on the OSD scrim, or its monogram tile.

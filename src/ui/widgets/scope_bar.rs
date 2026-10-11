@@ -3,7 +3,8 @@
 //!
 //! * Tabs (Wide): `All playlists 214 380 · ● TV 151 022 · ● TV 2 98 117`, the selected tab
 //!   in fg text (All also underlined, 2 px accent; a picked playlist has the stripe), the
-//!   others `text_secondary`. Left click picks a tab, right click opens its menu (edit, move).
+//!   others `text_secondary`. Left click picks a tab, right click opens its menu (edit, move) at
+//!   the pointer.
 //! * Button (Medium / Compact, or when the tabs don't fit): `● TV 2 ▾`, opening the Alt+P
 //!   picker.
 //! * Stripe: with one playlist picked, a 2 px line in its colour across the content area
@@ -88,7 +89,7 @@ pub fn scope_bar(ui: &mut egui::Ui, theme: &Theme, scope: &Scope<'_>, counts: &[
     for (i, (tab, w)) in list.iter().zip(&widths).enumerate() {
         let rect = Rect::from_min_size(egui::pos2(x, row.top()), egui::vec2(*w, h));
         x += w + gap;
-        let resp = ui.interact(rect, ui.id().with(("scope-tab", i)), egui::Sense::click());
+        let resp = ui.interact(rect, ui.id().with(("scope-tab", i)), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
         resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, tab.selected, &tab.name));
         if resp.clicked() {
             click = BarClick::Choose(tab.choice);
@@ -142,6 +143,7 @@ pub fn scope_button(ui: &mut egui::Ui, theme: &Theme, scope: &Scope<'_>, max_w: 
     let text_w = name.size().x + arrow.size().x;
     let size = egui::vec2(dot_w + text_w + 2.0 * pad.x + 2.0, (name.size().y + 2.0 * pad.y + 2.0).max(theme.space(SpaceToken::ControlHeight)));
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
     if ui.is_rect_visible(rect) {
         button::paint_frame(&p, rect, theme, &resp, button::ButtonStyle { bordered: true, ..Default::default() });

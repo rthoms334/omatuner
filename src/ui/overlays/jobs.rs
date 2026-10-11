@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, RichText};
 
-use super::dialogs::{card_area, scrim};
+use super::dialogs::{card_area, scrim, with_close};
 use super::{Overlay, OverlayOutcome};
 use crate::jobs::{JobPhase, JobStatus};
 use crate::keymap::{Action, KeyContext};
@@ -19,9 +19,10 @@ use crate::model::{JobId, Timestamp};
 use crate::msg::Toast;
 use crate::theme::{SpaceToken, Theme, TypeToken};
 use crate::ui::UiCtx;
+use crate::ui::widgets::button::{ButtonStyle, icon_button};
 use crate::ui::widgets::card::CardKind;
 use crate::ui::widgets::progress::{busy_bar, progress_bar};
-use crate::ui::widgets::section;
+use crate::ui::widgets::{glyphs, section};
 
 /// Problems listed (newest first).
 const MAX_PROBLEMS: usize = 20;
@@ -167,10 +168,16 @@ impl Overlay for JobsOverlay {
         }
         let now = ctx.now;
         let h24 = ctx.config.interface.clock_24h;
+        let pointer_moved = egui_ctx.input(|i| i.pointer.delta() != egui::Vec2::ZERO);
         let mut clicked = None;
+        let mut hovered = None;
+        let mut cancel = None;
+        let mut close = false;
         card_area(egui_ctx, theme, "jobs", CardKind::Menu, 560.0 * theme.rem(), None, |ui| {
             let t = &theme.tokens;
-            ui.label(RichText::new("Background tasks").size(theme.font(TypeToken::Heading)).color(t.fg));
+            close = with_close(ui, theme, |ui| {
+                ui.label(RichText::new("Background tasks").size(theme.font(TypeToken::Heading)).color(t.fg));
+            });
             ui.add_space(theme.space(SpaceToken::Md));
             egui::ScrollArea::vertical().max_height(egui_ctx.content_rect().height() * 0.65).show(ui, |ui| {
                 section::section_header(ui, theme, "Running");
@@ -178,8 +185,13 @@ impl Overlay for JobsOverlay {
                     ui.label(RichText::new("Nothing is running").size(theme.font(TypeToken::Body)).color(t.text_secondary));
                 }
                 for (i, job) in self.running.iter().enumerate() {
-                    if running_row(ui, theme, job, now, i == self.cursor).clicked() {
+                    let (resp, cancelled) = running_row(ui, theme, job, now, i == self.cursor);
+                    if cancelled {
+                        cancel = Some(i);
+                    } else if resp.clicked() {
                         clicked = Some(i);
+                    } else if pointer_moved && resp.hovered() {
+                        hovered = Some(i);
                     }
                 }
                 ui.add_space(theme.space(SpaceToken::Lg));
@@ -190,14 +202,28 @@ impl Overlay for JobsOverlay {
                 for (p, line) in self.problems.iter().enumerate() {
                     let row = self.running.len() + p;
                     let expanded = self.expanded.iter().any(|(at, msg)| *at == line.at && *msg == line.message);
-                    if problem_row(ui, theme, line, p, expanded, row == self.cursor, h24).clicked() {
+                    let resp = problem_row(ui, theme, line, p, expanded, row == self.cursor, h24);
+                    if resp.clicked() {
                         clicked = Some(row);
+                    } else if pointer_moved && resp.hovered() {
+                        hovered = Some(row);
                     }
                 }
             });
             ui.add_space(theme.space(SpaceToken::Md));
             ui.label(RichText::new("Delete cancel · Enter show details · Esc close").size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
         });
+        if close {
+            return OverlayOutcome::Close;
+        }
+        // the menu idiom: the pointer moves the cursor (only when it moves)
+        if let Some(row) = hovered {
+            self.cursor = row;
+        }
+        if let Some(row) = cancel {
+            self.cursor = row;
+            return self.on_action(ctx, Action::Remove);
+        }
         if let Some(row) = clicked {
             self.cursor = row;
             if row >= self.running.len() {
@@ -208,10 +234,13 @@ impl Overlay for JobsOverlay {
     }
 }
 
-/// Label + phase + elapsed, with a progress (or busy) bar below.
-fn running_row(ui: &mut egui::Ui, theme: &Theme, job: &JobStatus, now: Timestamp, cursor: bool) -> egui::Response {
+/// Label + phase + elapsed + a cancel button, with a progress (or busy) bar below. Returns the
+/// row's response and whether its cancel button was clicked.
+fn running_row(ui: &mut egui::Ui, theme: &Theme, job: &JobStatus, now: Timestamp, cursor: bool) -> (egui::Response, bool) {
     let t = &theme.tokens;
     let pad = theme.space(SpaceToken::Lg);
+    let side = theme.space(SpaceToken::ControlHeight);
+    let mut cancel_rect = egui::Rect::NOTHING;
     let inner = ui.scope(|ui| {
         let top = ui.cursor().min;
         let bg = ui.painter().add(egui::Shape::Noop);
@@ -221,6 +250,8 @@ fn running_row(ui: &mut egui::Ui, theme: &Theme, job: &JobStatus, now: Timestamp
             ui.label(RichText::new(&job.label).size(theme.font(TypeToken::Title)).color(if cursor { t.list_cursor_text } else { t.fg }));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(pad);
+                // room for the cancel button, drawn over the row below (so it gets its clicks)
+                cancel_rect = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover()).0;
                 ui.label(RichText::new(elapsed_text(now, job.started_at)).size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
             });
         });
@@ -244,7 +275,10 @@ fn running_row(ui: &mut egui::Ui, theme: &Theme, job: &JobStatus, now: Timestamp
         rect
     });
     // registered after the labels, so it gets the clicks; the labels carry the accesskit text
-    ui.interact(inner.inner, ui.id().with(("job", job.id)), egui::Sense::click())
+    let row = ui.interact(inner.inner, ui.id().with(("job", job.id)), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+    let mut over = ui.new_child(egui::UiBuilder::new().id_salt(("cancel", job.id)).max_rect(cancel_rect));
+    let cancel = icon_button(&mut over, theme, glyphs::CLOSE, "Cancel task (Delete)", ButtonStyle::default()).clicked();
+    (row, cancel)
 }
 
 /// "20:14  Couldn't refresh My IPTV: HTTP 404" (one line, or the full message when expanded;
@@ -277,7 +311,7 @@ fn problem_row(ui: &mut egui::Ui, theme: &Theme, line: &LogLine, index: usize, e
         ui.painter().set(bg, row_bg(theme, rect, cursor));
         rect
     });
-    ui.interact(inner.inner, ui.id().with(("problem", index)), egui::Sense::click())
+    ui.interact(inner.inner, ui.id().with(("problem", index)), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// Cursor background for a row whose height is only known after its content was laid out

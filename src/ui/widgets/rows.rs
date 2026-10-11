@@ -40,6 +40,7 @@ pub fn row_height(theme: &Theme, density: Density, with_detail: bool) -> f32 {
 fn allocate_row(ui: &mut egui::Ui, theme: &Theme, natural_h: f32, state: RowState, label: &str) -> (Rect, egui::Response) {
     let h = paint::fit_height(ui, natural_h);
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
     if ui.is_rect_visible(rect) {
         paint_row_state(ui.painter(), rect, theme, state);
@@ -69,6 +70,14 @@ fn source_mark(ui: &egui::Ui, theme: &Theme, right_center: egui::Pos2, src: &Sou
 
 /// The share of a row's width a playlist's name may take (channel, reminder rows).
 const ROW_SOURCE_SHARE: f32 = 0.2;
+
+/// `state` with the hover of the [`menu_row`] about to be drawn next in `ui` (top-down): hover
+/// lights a row like the cursor. For rows outside a [`virtual_list`](super::list::virtual_list)
+/// (there the cursor itself follows the pointer).
+pub fn with_hover(ui: &egui::Ui, theme: &Theme, with_detail: bool, state: RowState) -> RowState {
+    let next = Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), row_height(theme, Density::Comfortable, with_detail)));
+    if ui.rect_contains_pointer(next) { RowState::from_flags(true, state.is_selected()) } else { state }
+}
 
 /// Thin progress bar height (programme / watch progress inside rows).
 fn bar_h(theme: &Theme) -> f32 {

@@ -13,7 +13,7 @@
 
 use eframe::egui::{self, RichText};
 
-use super::dialogs::{card_area, scrim};
+use super::dialogs::{card_area, scrim_guarded};
 use super::{Overlay, OverlayOutcome};
 use crate::keymap::{Action, KeyContext};
 use crate::model::{ChannelId, ItemKind, ItemOverride, ItemRef};
@@ -221,6 +221,13 @@ impl Overlay for EditItemOverlay {
         if self.editing { vec![KeyContext::TextInput, KeyContext::Modal] } else { vec![KeyContext::Modal] }
     }
 
+    /// Any field differs from what was loaded (nothing is saved before Save).
+    fn is_dirty(&self) -> bool {
+        let Some(Ok(l)) = &self.loaded else { return false };
+        let name = l.ov.rename.as_deref().unwrap_or(&l.provider_name);
+        self.name != name || self.offset_min != l.ov.catchup_offset_s.unwrap_or(0) / 60 || self.locked != l.ov.locked || self.hidden != l.ov.hidden
+    }
+
     fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> OverlayOutcome {
         self.load(ctx);
         if self.editing {
@@ -282,7 +289,7 @@ impl Overlay for EditItemOverlay {
         }
         let theme = ctx.theme;
         let t = &theme.tokens;
-        if scrim(egui_ctx, theme, "edit-item") {
+        if scrim_guarded(egui_ctx, theme, "edit-item", self.is_dirty()) {
             return OverlayOutcome::Close;
         }
         let fields = self.fields();
@@ -373,12 +380,15 @@ impl Overlay for EditItemOverlay {
                     }
                     Field::Locked => {
                         ui.add_space(theme.space(SpaceToken::Md));
-                        ui.add_enabled_ui(lock_ok, |ui| {
-                            let mut v = self.locked;
-                            if toggle(ui, theme, &mut v, &lock_label, focused).changed() {
+                        // clickable without the PIN too: the click says what it needs (as Enter)
+                        let mut v = self.locked;
+                        if toggle(ui, theme, &mut v, &lock_label, focused).changed() {
+                            if lock_ok {
                                 self.locked = v;
+                            } else {
+                                clicked = Some(Field::Locked);
                             }
-                        });
+                        }
                     }
                     Field::Hidden => {
                         let mut v = self.hidden;
@@ -418,5 +428,53 @@ impl Overlay for EditItemOverlay {
             outcome = self.save(ctx);
         }
         outcome
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use eframe::egui;
+
+    use super::*;
+    use crate::ui::screens::home::testkit::{self, OvApp, overlay_harness, rig, seed, until_ov};
+
+    fn click_outside(h: &egui_kittest::Harness<'static, OvApp<EditItemOverlay>>) {
+        let pos = egui::pos2(4.0, 4.0);
+        h.hover_at(pos);
+        for pressed in [true, false] {
+            h.event(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE });
+        }
+    }
+
+    /// A click outside closes Edit information as it loaded, but not once a field differs
+    /// from it (Esc still does).
+    #[test]
+    fn a_click_outside_closes_it_unless_a_field_was_changed() {
+        let (mut t, one) = rig();
+        let ch = seed(&mut t, |c| {
+            let s = testkit::source(c, "My IPTV")?;
+            testkit::channels(c, s, 1)
+        });
+        let item = crate::ui::screens::live::channel_ref(t.lib.live.get(ch[0]).expect("seeded"));
+        let size = egui::vec2(1200.0, 900.0);
+        let mut h = overlay_harness(t, one, EditItemOverlay::new(item.clone()), size);
+        until_ov(&mut h, "loaded", |h| matches!(h.state().o.loaded, Some(Ok(_))));
+        click_outside(&h);
+        h.run_steps(2);
+        assert_eq!(h.state().last, "Close", "unchanged: closes");
+        // opened again
+        h.state_mut().o = EditItemOverlay::new(item);
+        h.state_mut().last.clear();
+        until_ov(&mut h, "loaded", |h| matches!(h.state().o.loaded, Some(Ok(_))));
+        // a letter added to the name
+        h.state_mut().act(Action::Activate);
+        h.run_steps(2);
+        h.event(egui::Event::Text("x".into()));
+        h.run_steps(2);
+        assert!(h.state().o.is_dirty());
+        click_outside(&h);
+        h.run_steps(2);
+        assert_ne!(h.state().last, "Close", "an edit survives a stray click");
+        assert_eq!(h.state_mut().act(Action::Back), "Close", "Esc still closes");
     }
 }

@@ -222,6 +222,8 @@ pub enum GridOutcome {
         channel: ChannelId,
         programme: ProgrammeSlim,
     },
+    /// Right-click on a channel or a programme: focus it and open the menu (the menu key).
+    Menu,
 }
 
 /// How far back / ahead a Left/Right step looks for the neighbouring programme.
@@ -702,14 +704,15 @@ pub fn epg_grid(
         painter.rect_filled(marker, 0.0, t.accent);
     }
 
-    // ---- clicks: the channel column watches, cells focus / open
+    // ---- clicks: the channel column watches, cells focus / open; a right-click on either
+    //      focuses it and asks for the menu
     if let Some(i) = header_hit
-        && resp.clicked()
+        && (resp.clicked() || resp.secondary_clicked())
     {
         // focus the row first: a locked channel's PIN retry (`GuideWatch`) watches the focus
         state.focus_at(i, state.focus_time, None);
         state.refocus = true;
-        outcome = GridOutcome::Watch(state.rows[i].channel);
+        outcome = if resp.secondary_clicked() { GridOutcome::Menu } else { GridOutcome::Watch(state.rows[i].channel) };
     }
     if let Some((row, tp, prog)) = hovered.clone() {
         state.hovered = prog.as_ref().map(|p| p.id);
@@ -719,6 +722,9 @@ pub fn epg_grid(
                 Some(p) => GridOutcome::Open { programme: p.id, channel: state.rows[row].channel },
                 None => GridOutcome::Watch(state.rows[row].channel),
             };
+        } else if resp.secondary_clicked() {
+            state.focus_at(row, tp, prog);
+            outcome = GridOutcome::Menu;
         } else if resp.clicked() {
             state.focus_at(row, tp, prog);
             if outcome == GridOutcome::None {

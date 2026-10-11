@@ -1703,7 +1703,8 @@ Medium: rails narrower, same structure.
   (`[NumericEntry, Guide]`) and jump to that channel number. Focus/scroll targets keep clear of
   the mini-player rect.
 * **Mouse**: wheel = rows, Shift+wheel / horizontal trackpad = time, click = focus,
-  double-click = details, click on the channel column = watch, hover tooltip (title, time,
+  double-click = details, click on the channel column = watch, right-click on a cell or a
+  channel = focus it and open the channel menu (the menu key), hover tooltip (title, time,
   description excerpt).
 * **Actions**: Enter → programme popover (Watch if airing · Catch up if past & archive ·
   Remind me / Cancel reminder if future · Assign EPG); `w` watch, `c` catch-up, `r` toggles a
@@ -1782,7 +1783,7 @@ No results: "No matches — Ctrl+K searches everything, Tab switches sections".
 ### 13.8 Player & OSD
 ```
 ┌──────────────────────────────────────────────────────────────────────────────────────────┐
-│ ▣ 101  BBC One HD                                                      20:26   󰕾 80 %   │ ← top OSD
+│ 󰁍 ▣ 101  BBC One HD                                                              20:26  │ ← top OSD
 │                                                                                          │
 │                                        VIDEO                                             │
 │                                                                    ┌ CHANNELS (c) ─────┐ │
@@ -1791,7 +1792,7 @@ No results: "No matches — Ctrl+K searches everything, Tab switches sections".
 │ News at Eight                                     20:00 – 21:00    │ 102 BBC Two        │ │
 │ ▕██████████████████░░░░░░░░░░░░░░░▏                34 min left     └────────────────────┘ │
 │ Next  21:00 Drama                                    [HD] [5.1] [CC] [⟲]                  │
-│ 󰒮  󰐊  󰒭    󰗅 English (AC-3 5.1)   󰨖 Off   󰃰 Guide   󰋚 History   󰋽 Info   󰊓              │
+│ 󰒮 󰐊 󰒭  󰗅 English (AC-3 5.1)  󰨖 Off  󰐑 Channels  󰃰 Guide  󰋚 History  󰋽 Info 󰊓 󰏌  󰕾 ━━━●─┊─ 80 % │
 └──────────────────────────────────────────────────────────────────────────────────────────┘
 VOD bottom: title · S02E05 · [━━━━━━━━●───────── 41:20 / 1:02:13] · −10 / +10 s · tracks
 ```
@@ -1800,20 +1801,43 @@ The OSD has two layers (UX review B1):
   on mouse motion; hides after `osd_timeout_ms` (3.5 s) and never while a side panel/menu is
   open. It **does not change the key context**: ↑/↓ keep zapping, ←/→ keep recalling/seeking,
   however often they are pressed.
-* **Controls focus mode**: entered only with Enter, `i`, Tab or a mouse click on a control
-  (`FocusOsdControls`); pushes `PlayerOsd` (arrows move between controls / scrub, Enter
-  activates); Esc leaves focus mode (`LeaveOsdControls`) and the banner times out normally.
-  Unbound keys fall through (Space still pauses).
+* **Controls focus mode**: entered only with Enter, `i` or Tab (`FocusOsdControls`) — a mouse
+  click on a control just activates it, so the arrows keep zapping / seeking; pushes
+  `PlayerOsd` (arrows move between controls / scrub, Enter activates); Esc
+  (`LeaveOsdControls`) or Back (Alt+←, the mouse back button) leaves focus mode and the banner
+  times out normally. Unbound keys fall through (Space still pauses).
 * **Esc ladder in the player**: leave controls focus → hide the banner → leave window
   fullscreen → leave the player (mini-player keeps playing). Esc never *shows* the banner.
 * **Which playlist**: with two or more playlists of the item's kind, the top bar shows
   `● TV` left of the clock (§13.0, §29).
 * Type: title Display·s, body Title·s, badges Caption·s; `osd_accent` for progress/focus. Below
-  700 pt the controls row collapses to play/pause · audio · subtitles · info.
+  700 pt the controls row collapses to previous · play/pause · next (live) · audio · subtitles
+  · info, and the volume to its speaker (the level stays in the top bar).
+* **Mouse** (every control is an OSD button: hover fill, pointing hand, tooltip with its key):
+  ← at the left of the top bar leaves the player like `p`; the controls row adds Channels
+  (live) and Pop out (not in the popped-out window); the row ends with the volume — the
+  speaker (glyph by level; click = mute, tooltip "Mute (m)"), a slider 0–130 % with a mark
+  at 100 % (click sets, drag scrubs, wheel ±5; moving it while muted unmutes; 112 pt × s wide,
+  80 pt × s from 1200 pt down) and the level ("80 %", "Muted"), its room reserved before the
+  controls'. The wheel over the speaker / slider steps the volume once (the video's own wheel
+  handling runs after the controls, which consume the scroll). Right-click on the video opens
+  the player menu (Channels…, Now / next…, History…, Last channel, favourite, aspect, zoom,
+  audio…, subtitles…, stream info, jump to live, pop out / back to the full window, keep
+  playing in the mini player, stop and close) — the way to every side panel in a narrow
+  window; a click on the video closes a side panel or leaves focus mode. The banner stays
+  while the pointer is *in use* on a bar (a button held, or moved within the last 10 s), so
+  it never vanishes under a drag of the volume or the seek bar, yet a pointer parked on a bar
+  (a keyboard user's, pushed out of the way) doesn't hold it for good; with the banner gone
+  the pointer hides over the video (not over a control that set its own cursor). A failed /
+  reconnecting stream shows Retry (and Last channel) buttons under the message; the
+  next-episode card has "Play now · Enter" / "Cancel · Esc" buttons and plays on a click.
+  Nothing playing: a "‹ Back to {where}" button, and a click anywhere goes back.
 
 Side panels: channel list `c` (current collection with now), mini guide `g` (now/next for the
 group), history `h`/→ — each with key contexts `[List|ListFiltering, PlayerLive]`: ↑/↓ move the
-panel cursor (no zap), Enter tunes, ←/Esc close, letters filter. Stream info `I` (codec,
+panel cursor (no zap), Enter tunes, ←/Esc close, letters filter. Mouse: a ✕ in the header, the
+wheel scrolls, hovering moves the cursor only with real pointer motion, one click tunes and
+keeps the panel open for the next channel. Stream info `I` (codec,
 resolution, fps, pixel format, HDR badge from gamma pq/hlg, audio codec/layout/rate, bitrates,
 hwdec, dropped frames, cache seconds). Digits open numeric entry (`[NumericEntry, PlayerLive]`:
 digits, Enter = go now, Backspace = delete digit, Esc = cancel; auto-commit after 1.5 s).
@@ -1823,15 +1847,22 @@ now playing on black), Video unavailable (no surface). Mouse: wheel = volume (fu
 only — not over the Live preview), double-click toggles window fullscreen, a single click on the
 Live preview opens the player. End of playback per §13.6. Esc leaves to the previous screen;
 playback continues in the mini player (bottom-right 16:9, 320 Wide / 240 Medium × rem, hidden
-in Compact → status-bar chip; click = back to player, ✕ = stop).
+in Compact → status-bar chip; click = back to player, ✕ = stop; a pop-out button beside the ✕).
 
 **Video-only (popped-out window, §12.3).** Same screen, same keys (zap ↑/↓, volume, pause,
 mute, tracks, `c`/`g`/`h` panels) plus `PopOut` (Esc / `o` = back to the full window). The
 passive banner is one bottom strip — title (⏸ when paused) and volume, then the programme on
 now (live) or position / duration (VOD), Body/Caption type, no scale factor; the full OSD
-returns only in controls focus mode or with a side panel open. Double-click pops back in
-(instead of window fullscreen). Nothing playing: "Nothing playing · o or Esc: back to the full
-window" on black.
+returns only in controls focus mode or with a side panel open. With the pointer in the window
+(or paused) the strip's right side holds buttons instead of the volume and the key hint:
+previous / play / next (live) or skip back / play / skip forward (VOD), the speaker (+ a
+64 pt × rem volume slider from 560 pt × rem of strip; changing it flashes the level, since the
+strip then has no readout), back to the full window, stop and close; below 420 pt × rem
+previous / next drop out so the title and position keep room. Double-click pops back in
+(instead of window fullscreen); a drag on the video moves the window (only the video-only
+video senses drags: a drag-sensing video would count as hovered under every button drawn on
+it). Nothing playing: "Nothing playing · o · Esc" on black, with a "Back to the full window"
+button.
 
 
 ### 13.9 Settings
@@ -1952,7 +1983,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 * Jobs (Ctrl+J, `[List, Modal]`): running jobs with phase + progress; Delete cancels the
   highlighted job; last 20 finished (Enter expands errors).
 * Context menu (Shift+F10 / Ctrl+Enter / right-click): launcher-style, filterable, shortcuts
-  right-aligned.
+  right-aligned; opened by a right-click it hangs from the pointer (kept on the window).
 * Confirm (destructive = urgent button, Cancel focused), PIN (`[TextInput, Modal]`), Rename
   (`[TextInput, Modal]` — Space types a space), favourites-list picker (checklist + "New
   list…"), Edit information (Ctrl+I).
@@ -2052,7 +2083,11 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
   * **No screen reads raw keys**: every key is in a table, so help and hints are complete.
 * **Esc ladder**: clear filter → close overlay/side panel → leave OSD controls focus → hide the
   info banner → leave window fullscreen → leave the player (mini player keeps playing) → back
-  in the route stack. Esc never shows the banner. Alt+← and the mouse back button = Back.
+  in the route stack. Esc never shows the banner. Alt+← = Back. The mouse back button IS Esc:
+  the app resolves a synthetic Esc against the same context stack, so it walks this whole
+  ladder (clears a filter, leaves the OSD controls or a text field, closes an overlay, pops the
+  video-only player back in) rather than skipping to the route stack. The forward button is
+  swallowed and does nothing (there is no forward history).
   *Decided in phase 3:* Back on a lone sub-page (nothing beneath it in the route stack, e.g. a
   restored last screen) goes to its parent screen: movie / series details → Movies / Series,
   Logs and EPG mapping → Settings, the player → Live TV.
@@ -2061,7 +2096,38 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 * **Mouse parity**: everything is clickable; hover moves list cursors only after real pointer
   motion (Omarchy `pointerGate`); right-click = context menu; wheel = volume only in the
   fullscreen player; double-click on video = window fullscreen (in the video-only player: pop
-  back in).
+  back in). *Decided in the mouse pass:*
+  * **Back affordance**: a page or pane that Esc leaves shows a borderless `‹ {where}` button
+    (`widgets::button::back_button`, accessible name "Back to {where}"): detail pages, Logs,
+    EPG mapping and Settings when something is below them (`UiCtx::back`: the route below, or
+    a lone sub-page's parent — the same target as Esc), and the one-pane-at-a-time views of
+    Compact (Settings page → page list, EPG candidates → channels, Live groups → channels).
+    A click on the lit sidebar tab of a sub-page (Movies on a movie's page, Settings on Logs)
+    goes back down to that tab where it is on the stack instead of opening it afresh.
+  * **Overlays**: a ✕ "Close (Esc)" in the card header (Help, Jobs, Search, Resume, the
+    tracks panel); a click or right-click outside closes the overlay — except while it holds
+    an unsaved edit (`Overlay::is_dirty`: a typed rename, a new list's name, Edit information,
+    changed category ticks), when the card border flashes instead (and the pointer's tooltip
+    says "Unsaved changes — Cancel or Esc to discard") and Esc / Cancel close.
+  * **Right-click** opens the same menu as the menu key, at the pointer (lists, grids, Home
+    tiles, guide cells and channels, episode rows, the detail pages' header, search hits).
+    A menu opened by an overlay (search's item menu: "Play now", then the item shortcuts)
+    answers that overlay, never the screen below. Detail pages also have a `⋯` button.
+  * A back button runs exactly what Esc runs there (Settings' sub-views leave a field being
+    edited first, keeping its text). A pushed TV guide (Ctrl+G from Home / Search) has one
+    too. Long labels are cut to 24 characters on screen ("‹ |UK| SKY CINEMA PREMIE…"); the
+    accessible name keeps the whole label.
+  * **Double-click safety**: where one click swaps what is under the pointer (a category
+    opening its grid, the Compact page list opening a page), the second click of a
+    double-click is dropped (`widgets::second_click_after`) — it would open a title or flip a
+    setting.
+  * Clickable widgets show the pointing hand; Settings pages light on hover while the keyboard
+    cursor is in the page's content (never a second cursor); the onboarding choices move the
+    focus with real pointer motion, like menus; below Wide one click on a Movies / Series
+    category opens it (the drawer closes);
+    the Live groups drawer has a close button and closes on a click beside it; group panes'
+    bulk-hide footer has `[Hide N]` / `[Clear]`; the Jobs panel has a cancel button per running
+    task; toasts show a ✕ on hover.
 * **Discoverability**: `?`/F1 help overlay (current contexts first) and the status-bar hint line
   (`keymap::hint_line`: curated verbs, keys looked up in the tables).
 * No Super bindings inside the app (Omarchy owns Super). `Ctrl+Space` is avoided (fcitx5 IME
@@ -2081,7 +2147,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Alt+4` | Movies |
 | `Alt+5` | Series |
 | `Ctrl+Comma` / `Alt+0` | Settings |
-| `Alt+←` | Back (also the mouse back button) |
+| `Alt+←` | Back |
 | `F11` | Toggle window fullscreen |
 | `Ctrl+P` | Open the player (from the mini player) |
 | `Ctrl+Shift+P` | Play / pause |

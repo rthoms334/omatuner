@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use eframe::egui::{self, RichText};
 
-use super::dialogs::{card_area, scrim};
+use super::dialogs::{card_area, scrim_guarded};
 use super::{Overlay, OverlayOutcome};
 use crate::jobs::JobKind;
 use crate::keymap::{Action, KeyContext};
@@ -183,6 +183,8 @@ pub struct CategoryPicker {
     /// Enter was pressed on ticks that show nothing of the playlist: the next Enter on these
     /// same ticks saves them.
     armed_empty: Option<(BTreeSet<CategoryTag>, bool)>,
+    /// The ticks as they were set up (unsaved changes = the ticks differ).
+    initial: Option<(BTreeSet<CategoryTag>, bool)>,
 }
 
 impl CategoryPicker {
@@ -206,7 +208,13 @@ impl CategoryPicker {
             error: None,
             cancel: "Cancel",
             armed_empty: None,
+            initial: None,
         }
+    }
+
+    /// Ticks changed and not saved.
+    pub fn is_edited(&self) -> bool {
+        self.initial.as_ref().is_some_and(|(keep, untagged)| *keep != self.keep || *untagged != self.keep_untagged)
     }
 
     /// Name the button that Esc mirrors.
@@ -248,6 +256,7 @@ impl CategoryPicker {
                 }
             }
             self.stored = d.rule;
+            self.initial = Some((self.keep.clone(), self.keep_untagged));
         }
         // the cursor stays on its entry when a re-read reorders the rows
         let at = self.cursor_entry().map(|t| t.tag.clone());
@@ -530,7 +539,7 @@ impl CategoryPicker {
         if self.shows_nothing() {
             let armed = self.armed_empty.as_ref() == Some(&(self.keep.clone(), self.keep_untagged));
             let text =
-                if armed { "Nothing from this playlist will show — Enter again to save anyway." } else { "Nothing from this playlist will show." };
+                if armed { "Nothing from this playlist will show — save again to save anyway." } else { "Nothing from this playlist will show." };
             small(ui, text, t.warning);
         }
         small(ui, "Favourites in hidden countries are hidden too. Settings ▸ Hidden items shows any of them again.", t.text_disabled);
@@ -604,9 +613,13 @@ impl Overlay for CategoriesOverlay {
         outcome(self.picker.on_action(ctx, action))
     }
 
+    fn is_dirty(&self) -> bool {
+        self.picker.is_edited()
+    }
+
     fn ui(&mut self, egui_ctx: &egui::Context, ctx: &mut UiCtx<'_>) -> OverlayOutcome {
         let theme = ctx.theme;
-        if scrim(egui_ctx, theme, "categories") {
+        if scrim_guarded(egui_ctx, theme, "categories", self.is_dirty()) {
             return OverlayOutcome::Close;
         }
         let picker = &mut self.picker;

@@ -364,7 +364,7 @@ pub static GLOBAL: &[Binding] = &[
     b(C::alt(Key::Num5), A::GoSeries, "Series"),
     b(C::ctrl(Key::Comma), A::GoSettings, "Settings"),
     b(C::alt(Key::Num0), A::GoSettings, "Settings"),
-    b(C::alt(Key::ArrowLeft), A::Back, "Back (also the mouse back button)"),
+    b(C::alt(Key::ArrowLeft), A::Back, "Back"),
     b(C::key(Key::F11), A::ToggleWindowFullscreen, "Toggle window fullscreen"),
     b(C::ctrl(Key::P), A::OpenPlayer, "Open the player (from the mini player)"),
     // not Ctrl+Space: that is fcitx5's input-method toggle on Omarchy

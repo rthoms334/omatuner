@@ -63,7 +63,9 @@ fn guide_freshness(now: Timestamp, at: Timestamp) -> (String, bool) {
 
 /// Clickable status text (sized to its text, elided at `max_w`).
 fn chip(ui: &mut egui::Ui, text: impl Into<String>, color: egui::Color32, size: f32, label: &str) -> egui::Response {
-    let resp = ui.add(egui::Label::new(egui::RichText::new(text).size(size).color(color)).sense(egui::Sense::click()).truncate());
+    let resp = ui
+        .add(egui::Label::new(egui::RichText::new(text).size(size).color(color)).sense(egui::Sense::click()).truncate())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
     resp
 }

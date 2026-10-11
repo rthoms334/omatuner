@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use eframe::egui;
 
 use super::home::kit::{self, Loader};
-use super::movie_detail::{DetailHeader, NO_DESCRIPTION, fraction, resumable, resume_or_play, sparse_meta};
+use super::movie_detail::{DetailHeader, NO_DESCRIPTION, detail_bar, fraction, resumable, resume_or_play, sparse_meta};
 use crate::jobs::{JobEvent, JobKind};
 use crate::keymap::{Action, KeyContext};
 use crate::model::{Episode, EpisodeId, ItemKey, ItemKind, ItemRef, MediaRef, PlayOrigin, Series, SeriesId, SourceKind, VodKind, WatchProgress};
@@ -462,6 +462,7 @@ impl Screen for SeriesDetailScreen {
         let theme = ctx.theme;
         let t = &theme.tokens;
         if self.missing || self.id.is_none() {
+            detail_bar(ui, ctx, false);
             empty_state::empty_state(ui, theme, glyphs::SERIES, "This series is no longer in your playlists", None, None);
             return;
         }
@@ -472,6 +473,7 @@ impl Screen for SeriesDetailScreen {
         let Some(data) = self.data.clone() else {
             // list-level data while the page loads
             let title = summary.as_ref().map(|s| s.name.to_string()).unwrap_or_default();
+            detail_bar(ui, ctx, false);
             let header = DetailHeader {
                 title: &title,
                 meta: "",
@@ -527,6 +529,8 @@ impl Screen for SeriesDetailScreen {
         let mut clicked_btn = None;
         let mut clicked_season = None;
         let mut clicked_ep: Option<(usize, bool)> = None;
+        let mut menu = detail_bar(ui, ctx, true);
+        let mut ep_menu = None;
         egui::ScrollArea::vertical().id_salt("series-detail").auto_shrink([false, false]).show(ui, |ui| {
             let header = DetailHeader {
                 title: s.display_name(),
@@ -540,7 +544,7 @@ impl Screen for SeriesDetailScreen {
                 source: Some(s.source_id),
                 kind: ItemKind::Series,
             };
-            header.show(ui, ctx, |ui, ctx| {
+            menu |= header.show(ui, ctx, |ui, ctx| {
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(theme.space(SpaceToken::Lg), theme.space(SpaceToken::Md));
                     for (i, b) in self.buttons().iter().enumerate() {
@@ -631,6 +635,8 @@ impl Screen for SeriesDetailScreen {
                 }
                 if resp.double_clicked() {
                     clicked_ep = Some((i, true));
+                } else if resp.secondary_clicked() {
+                    ep_menu = Some(i);
                 } else if resp.clicked() {
                     clicked_ep = Some((i, false));
                 }
@@ -652,6 +658,15 @@ impl Screen for SeriesDetailScreen {
             if play && let Some(e) = self.focused_episode() {
                 self.play(ctx, &e, false, false);
             }
+        }
+        // right-click on an episode: the menu key on it (its watched item applies to it)
+        if let Some(i) = ep_menu {
+            self.section = Section::Episodes;
+            self.ep = i;
+            menu = true;
+        }
+        if menu {
+            self.on_action(ctx, Action::ContextMenu);
         }
     }
 }

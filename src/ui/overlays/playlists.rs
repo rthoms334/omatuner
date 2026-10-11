@@ -8,7 +8,7 @@
 
 use eframe::egui::{self, Align2, RichText};
 
-use super::dialogs::{ContextMenuOverlay, card_area, scrim};
+use super::dialogs::{ContextMenuOverlay, card_area, scrim, with_close};
 use super::{ContextMenuSpec, MenuItem, Overlay, OverlayOutcome, OverlayResult};
 use crate::keymap::{Action, KeyContext};
 use crate::model::SourceId;
@@ -116,8 +116,11 @@ impl Overlay for PlaylistPickerOverlay {
         let pointer_moved = egui_ctx.input(|i| i.pointer.delta() != egui::Vec2::ZERO);
         let row_h = theme.space(SpaceToken::PopupRowHeight) + theme.space(SpaceToken::Lg);
         let mut chosen = None;
+        let mut close = false;
         card_area(egui_ctx, theme, "playlist-picker", CardKind::Menu, 380.0 * theme.rem(), None, |ui| {
-            search_header(ui, theme, self.list.filter.query(), "Show which playlist? — 0–9 jump", None);
+            close = with_close(ui, theme, |ui| {
+                search_header(ui, theme, self.list.filter.query(), "Show which playlist? — 0–9 jump", None);
+            });
             ui.add_space(theme.space(SpaceToken::Md));
             if self.rows.is_empty() {
                 let q = self.list.filter.query();
@@ -129,6 +132,7 @@ impl Overlay for PlaylistPickerOverlay {
                 let Some(choice) = choices.get(i).copied() else { continue };
                 let name = self.names.get(i).map_or("", String::as_str);
                 let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), egui::Sense::click());
+                let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
                 resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, choice.map(|s| s.id) == current, name));
                 let cursor = row == self.list.cursor;
                 if pointer_moved && resp.hovered() && !cursor {
@@ -185,6 +189,9 @@ impl Overlay for PlaylistPickerOverlay {
                 p.galley(egui::pos2(left, y - g.size().y / 2.0), g, text);
             }
         });
+        if close {
+            return OverlayOutcome::Close;
+        }
         chosen.map_or(OverlayOutcome::Keep, |i| self.choose(ctx, i))
     }
 }
@@ -261,6 +268,10 @@ impl Overlay for PlaylistMenuOverlay {
     fn ui(&mut self, egui_ctx: &egui::Context, ctx: &mut UiCtx<'_>) -> OverlayOutcome {
         let out = self.menu.ui(egui_ctx, ctx);
         self.act(ctx, out)
+    }
+    /// A tab's right-click: the menu opens at the pointer like every other right-click menu.
+    fn anchor_at(&mut self, pos: egui::Pos2) {
+        self.menu.anchor_at(pos);
     }
 }
 
