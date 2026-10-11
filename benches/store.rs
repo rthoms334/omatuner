@@ -30,6 +30,7 @@ fn groups() -> Vec<ImportGroup> {
                 kind: ItemKind::Channel,
                 key: group_key(ItemKind::Channel, &name),
                 name,
+                raw_name: None,
                 provider_id: Some(i.to_string()),
                 provider_order: i as i32,
             }

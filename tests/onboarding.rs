@@ -306,6 +306,44 @@ fn m3u_file_without_a_guide_asks_for_one_and_imports() {
     assert!(nav.contains(&NavRequest::Switch(Route::Settings(tuner::ui::SettingsPage::Epg))), "{nav:?}");
 }
 
+/// DESIGN §28.6 end to end (tag detection, raw names and the summary are the core's): a
+/// playlist whose categories name several countries asks what to show once its channels are
+/// in; Enter stores the defaults (the user's country, every English-language tag, untagged)
+/// with the tags it had as `known`; then the card finishes as usual.
+#[test]
+fn m3u_file_with_several_countries_asks_what_to_show() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("World.m3u");
+    std::fs::write(
+        &path,
+        "#EXTM3U\n\
+         #EXTINF:-1 group-title=\"UK | News\",UK News\nhttp://127.0.0.1:9/1.ts\n\
+         #EXTINF:-1 group-title=\"FR | Sport\",FR Sport\nhttp://127.0.0.1:9/2.ts\n\
+         #EXTINF:-1 group-title=\"AR | Kids\",AR Kids\nhttp://127.0.0.1:9/3.ts\n\
+         #EXTINF:-1 group-title=\"Sports\",Sports One\nhttp://127.0.0.1:9/4.ts\n",
+    )
+    .unwrap();
+    let mut h = harness(OnboardingStart::PlaylistFile(path));
+    press(&mut h, Action::Activate);
+    until(&mut h, "the probe", |h| has(h, "4 channels in the playlist"));
+    press(&mut h, Action::Activate); // Continue → the Guide step: Tab to Skip
+    for _ in 0..3 {
+        press(&mut h, Action::FocusNext);
+    }
+    press(&mut h, Action::Activate);
+    until(&mut h, "the picker", |h| has(h, "Choose what to show"));
+    assert_eq!(h.state().s.key_contexts(), vec![KeyContext::Checklist, KeyContext::Modal]);
+    assert!(has_containing(&h, "categories in 3 countries and languages"), "UK, France, Arabic");
+    // Enter is ignored for a moment after the step appears on its own
+    std::thread::sleep(std::time::Duration::from_millis(450));
+    press(&mut h, Action::Activate);
+    until(&mut h, "the import", |h| has(h, "All set"));
+    let rule = h.state().sources()[0].settings.category_filter.clone().expect("a rule");
+    let tag = |s: &str| tuner::model::CategoryTag(s.into());
+    assert!(rule.keep.contains(&tag("GB")) && rule.keep.contains(&tag("lang:en")) && rule.keep_untagged);
+    assert_eq!(rule.known, [tag("GB"), tag("FR"), tag("lang:ar")].into_iter().collect());
+}
+
 /// A one-channel local file imports too fast to observe the disabled "Open Live TV" here;
 /// that it waits for the channels phase is covered by the unit test
 /// `onboarding::tests::open_live_tv_enables_after_the_channels_phase`.

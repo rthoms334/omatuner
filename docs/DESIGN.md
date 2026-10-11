@@ -800,7 +800,7 @@ CREATE TABLE stream_failure (
 ) WITHOUT ROWID;
 ```
 
-### 6.2.1 `0002_quality.sql` (quality badges, §13.0)
+### 6.2.1 `0003_quality.sql` (quality badges, §13.0)
 
 ```sql
 -- added by the migration's Rust step only when missing (the migration is safe to re-run)
@@ -822,7 +822,7 @@ CREATE TABLE IF NOT EXISTS channel_video (        -- what mpv decoded when the c
   are on). `family` is `normalize_name` of the smart-cleaned name, so "BBC One SD" and
   "UK: BBC One 2160p" share it where identity's `norm_name` (whose quality-tag list keys depend
   on, so it stays) does not; NULL (no quality word) reads as `norm_name`. Databases from
-  before 0002 get both from the stored names by the migration's Rust backfill (same
+  before 0003 get both from the stored names by the migration's Rust backfill (same
   transaction, once).
 * `channel_video` is written by the player controller through the writer
   (`PlayerStore::record_video` → `store::live::record_video`) once per channel and size, only
@@ -847,9 +847,11 @@ CREATE TABLE IF NOT EXISTS channel_video (        -- what mpv decoded when the c
   ≥ 1900, ≥ 1260) say, so cropped 1920×800 and anamorphic 1440×1080 read FHD. **1440p is
   FHD**: four classes keep the badge narrow, and QHD is closer to FHD than to the 4K it would
   otherwise claim.
-* **Migration numbering**: `user_version` is positional, so two branches that each add a
-  `0002` must not both reach one database; whichever merges second is renumbered (`0003_*`,
-  and its `backfill` name match). This one is safe to re-run for that reason.
+* **Migration numbering**: `user_version` is positional. This migration was written as
+  `0002_quality` alongside `0002_category_filter` (§28) and renumbered to `0003` when both
+  merged (with its `backfill` name match). It is safe to re-run, and a database from a
+  pre-merge build of this branch (v2 with the quality columns but no `grp.raw_name`) gets the
+  category-filter columns from `migrations::reconcile_renumbered` before `0003` re-runs.
 
 ### 6.3 FTS approach and write rules (fixes the critique and review B2)
 
@@ -900,7 +902,7 @@ transaction; a DB newer than the binary is refused (never downgraded silently). 
 is frozen at tag `skeleton-v1` (nothing has shipped before it, which is why review round 2
 edited it in place); later changes are new `000N_*.sql` entries appended by WP-02 with
 architect sign-off. A migration whose new columns need data SQL can't compute gets a Rust
-`backfill` step that runs in the same transaction right after its script (0002: channel
+`backfill` step that runs in the same transaction right after its script (0003: channel
 quality and family from the stored provider names, ~0.1 s per 100k channels, once).
 
 ### 7.2 Mark-and-sweep imports (catalogue)
@@ -1679,7 +1681,20 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 
 ### 13.11 Help, jobs, dialogs, EPG mapping, logs
 * Help (`?`, F1): generated from `keymap::help_rows`; current contexts first; two columns ≥
-  760 px.
+  760 px. *Added after rc3:* **type to filter**, like Omarchy's keybindings menu — the
+  overlay's `Help` context is filterable, so every printable key (j/k, `/`, digits) types into
+  a launcher header ("Type to filter keyboard shortcuts…") and no shortcut fires while help is
+  open. A row matches when every whitespace-separated term is a case-insensitive substring of
+  its keys ("ctrl+h", "f5", "alt"; arrows also answer to up/down/left/right, Esc to "escape"),
+  its description or its section title ("guide" keeps the whole TV guide section). Results
+  stay grouped by section in the same order (current contexts first) — the same key means
+  different things per context, so a flat ranked list would lose that; empty sections are
+  hidden, matches are marked with the text-selection fill, a count reads "12 of 269
+  shortcuts", and no match shows "No matching shortcuts". The card's top edge freezes once
+  typing starts (it shrinks downward only) and re-centres when the filter is empty again;
+  typed whitespace (NBSP from AltGr+Space too) is stored as a plain space. Keys: Backspace / Ctrl+Backspace (word) / Ctrl+U edit; Esc and F1
+  clear the filter, then close; `?` closes only while the filter is empty (otherwise it is
+  typed); Enter closes; ↑/↓, PgUp/PgDn, Home/End scroll.
 * Jobs (Ctrl+J, `[List, Modal]`): running jobs with phase + progress; Delete cancels the
   highlighted job; last 20 finished (Enter expands errors).
 * Context menu (Shift+F10 / Ctrl+Enter / right-click): launcher-style, filterable, shortcuts
@@ -1753,7 +1768,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 ### 15.1 Model & layers
 * **Contexts** (`keymap::KeyContext`): Global, List, ListFiltering, PosterGrid,
   PosterGridFiltering, Detail, Guide, PlayerLive, PlayerVod, PlayerOsd, NumericEntry,
-  EpgMapping, Search, Modal, TextInput, Panel.
+  EpgMapping, Search, Modal, TextInput, Panel, Help.
 * **Stack per frame**: topmost overlay's contexts, else the current screen's focused-element
   contexts (e.g. `[ListFiltering]`, `[PlayerOsd, PlayerLive]`, `[NumericEntry, Guide]`,
   `[List, PlayerLive]` for a player side panel, `[TextInput, Modal]` for a focused field), then
@@ -1767,8 +1782,8 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 * **Rules** (`keymap::resolve`): first matching binding wins, innermost context first;
   printable symbols match `Event::Text` (layout-independent, shift applied), named keys and
   Ctrl/Alt chords match `Event::Key`.
-  * Filterable contexts (List, ListFiltering, PosterGrid, PosterGridFiltering, Search): an
-    unbound printable char becomes `FilterInput(c)` — **launcher idiom: letters type in lists
+  * Filterable contexts (List, ListFiltering, PosterGrid, PosterGridFiltering, Search, Help):
+    an unbound printable char becomes `FilterInput(c)` — **launcher idiom: letters type in lists
     and grids, so no j/k there**; vim keys exist only in the guide, the player and settings
     panels.
   * **TextInput owns the keyboard**: after its own table only Ctrl/Alt chords and F-keys may
@@ -1833,6 +1848,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Esc` | Back |
 | `/` | Search everything |
 | `?` | Keyboard help |
+| `Space` / `Insert` | Mark group (Ctrl+H then hides all marked) |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
 | `Ctrl+H` | Hide / unhide |
@@ -1861,6 +1877,8 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Ctrl+Backspace` | Delete word |
 | `Ctrl+U` / `Esc` | Clear filter |
 | `Tab` / `Shift+Tab` | Next / previous pane |
+| `Insert` | Mark group (Ctrl+H then hides all marked) |
+| `Ctrl+Shift+H` | Hide the groups with the words typed |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
 | `Ctrl+H` | Hide / unhide |
@@ -1875,6 +1893,23 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Ctrl+W` | Mark watched / unwatched |
 | `Delete` | Remove (from list / cancel task / forget) |
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
+| `a–z, 0–9 …` | Type to filter |
+
+#### Tick lists (`Checklist`)
+
+| Keys | Action |
+|---|---|
+| `↑` / `↓` | Move |
+| `PgUp` / `PgDn` | Page up / down |
+| `Home` / `End` | First / last |
+| `Space` / `Insert` | Tick / untick |
+| `Ctrl+A` | Tick all / none (of the rows shown) |
+| `Ctrl+E` | Just my country + English |
+| `Enter` | Save |
+| `Backspace` | Delete character |
+| `Ctrl+Backspace` | Delete word |
+| `Ctrl+U` | Clear filter |
+| `Esc` | Clear the filter, then cancel |
 | `a–z, 0–9 …` | Type to filter |
 
 #### Movies & series grid (`PosterGrid`)
@@ -2136,6 +2171,21 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `x` / `Delete` | Delete / more actions |
 | `Esc` | Back |
 | `?` | Keyboard help |
+
+#### Keyboard help (`Help`)
+
+| Keys | Action |
+|---|---|
+| `↑` / `↓` | Scroll |
+| `PgUp` / `PgDn` | Page up / down |
+| `Home` / `End` | Top / bottom |
+| `Backspace` | Delete character |
+| `Ctrl+Backspace` | Delete word |
+| `Ctrl+U` | Clear filter |
+| `Esc` / `F1` | Clear the filter, then close |
+| `?` | Close (types ? while filtering) |
+| `Enter` | Close |
+| `a–z, 0–9 …` | Type to filter |
 
 ---
 
@@ -3124,3 +3174,355 @@ track's files, listed in that track's merge note.
   with a temp table if a real 1M-entry list shows up.
 * **First-refresh download**: existing M3U URL sources re-download fully once (no 304) to be
   scanned — one extra download per source, then normal conditional refreshes.
+
+## 28. Phase 6: category filter (countries & languages) and bulk hide
+
+Base: branch pointer `p6-base` on `feat/category-filter` (from `v0.1.0-rc3`; this section +
+the skeleton of §28.9). Where this section disagrees with an earlier one, this section wins
+(§13.2 / §13.5 group panes, §13.9 Settings ▸ Hidden and the playlist editor, §13.10 the
+onboarding steps, §15 tables — regenerated).
+
+User problem: Xtream (and many M3U) playlists carry hundreds of categories for dozens of
+countries ("AR | News", "FR | Sport", "|DE| Filme"…) and the only tool was Ctrl+H on one group
+at a time — which also misses every category the provider adds later.
+
+### 28.1 Decisions
+1. **A rule, not hide flags.** Each source stores a *category filter*: a keep-list of
+   country / language / region tags plus "keep untagged" (`SourceSettings::category_filter`).
+   It is applied on every library build, so categories a provider adds later for unticked tags
+   stay hidden without the user doing anything. `None` (the default; every source before P6) =
+   no filtering.
+2. **Same rule for live, movie and series categories** of a source (one keep-list per source).
+3. **Defaults** (user decision): the user's country (`presets::detect_country`: timezone, then
+   locale — GB here) and its main language, plus every English-language tag (GB, US, CA, AU,
+   IE, NZ, `lang:en`), plus untagged. Everything else starts unticked; the user can change it
+   before saving.
+4. **The user's own per-group choice beats the rule**: Ctrl+H on a group always hides it; showing
+   a filtered group from Settings ▸ Hidden exempts that one group (`GroupOverride::shown`).
+5. **Filtered = hidden, everywhere**: a filtered group behaves exactly like a group the user hid
+   (Live / Guide / Movies / Series / Home / search / zap lists / counts), so every existing
+   consumer of `Group::hidden` and `LiveIndex::hidden` follows without change. This includes
+   favourites in filtered categories (same as Ctrl+H on their group today); Settings ▸ Hidden
+   reverses it.
+6. **Bulk hide** in group panes: mark several groups, Ctrl+H hides all marked; while the pane is
+   filtered, "Hide these N groups" (Ctrl+Shift+H).
+
+### 28.2 Tag detection (`sources::category_tags::detect_tag`)
+Input: the provider's **raw** category name (`grp.raw_name`; smart-name cleanup strips the
+prefix from `grp.name`, and `identity::normalize_group` squashes separators out of the key).
+A name has at most one tag; the first match wins.
+
+**Canonical tags** (`model::CategoryTag`, its string is also the stored form):
+country = ISO 3166-1 alpha-2 upper case (`GB`, never `UK`); language = `lang:` + ISO 639-1
+(`lang:en`); region = `region:` + id (`region:latam`). Display: `tag_short` (GB → `UK`,
+`lang:en` → `EN`, `region:exyu` → `EX-YU`) and `tag_label` (country names from
+`presets::country_name`, built-in names for languages / regions). No flag emoji in the UI:
+egui's bundled emoji font has no flag sequences — the short code is shown as a badge.
+
+**Grammar** (applied to the trimmed raw name; ASCII case-insensitive unless noted):
+1. Leading decoration is skipped: any run of characters that are neither letters/digits nor
+   an opening bracket / pipe (`★ ✦ ◉ • ▎ # »` …).
+2. *Flag*: a leading pair of regional-indicator symbols → that country, read as an ISO code
+   first (`🇬🇧` → GB, `🇦🇷` → Argentina, not Arabic; `🇪🇺` → Europe via the synonyms); the
+   England / Scotland / Wales tag sequences (`🏴 + tags`) → GB.
+3. *Bracketed token* at the start: `[X]`, `(X)`, `{X}`, `|X|` (also `| X |`), where X is a
+   token or a flag (`[🇬🇧] Sports`).
+4. *Separated token* at the start: a token followed by optional spaces and a **separator** —
+   any character that is not a letter, digit, space or one of `( & ' + .` (so `|`, `:`, `-`,
+   `–`, `—`, `/`, `▎`, `✦`, `•`, `·`, `»`, `>`, `*`, `~`…). `"UK | Sports"`, `"UK: News"`,
+   `"UK - Docs"`, `"EN ▎Movies"`, `"UK ✦ Kids"`, `"UK/US Sports"` (first tag wins). A `.` or a
+   `-` with no space before it and a letter after it joins words (`"Sci-Fi"`, `"No. 1"`) and
+   only separates after a short code accepted by rule 6 (`"UK-DOCS"`, `"UK.Sports"` → GB;
+   `"AL-JAZEERA"` stays untagged).
+5. *Whole name* is a token: `"ENGLISH"`, `"FRANCE"`, `"EX-YU"`, `"UK"`.
+6. *Space-only separator* (`"UK SPORTS"`, `"ARABIC NEWS"`) is accepted only for (a) full names
+   (≥ 4 letters: ENGLISH, FRANCE, ARABIC, LATINO, AFRICA…) — in mixed case only country and
+   region names, not languages or nationality adjectives (`DEMONYMS`: INDIAN BRITISH IRISH
+   AFRICAN ASIAN LATIN CARIBBEAN NORDIC), so `"Latino Peliculas"` is Latin America but
+   `"German Bundesliga"`, `"French Open"`, `"Indian Premier League"` stay untagged; (b) codes
+   written in upper case in the raw name: two-letter codes only from an allow-list of usual
+   IPTV prefixes (`SPACED_CODES`: UK GB US CA AU NZ IE EN AR DE FR ES PT NL TR GR RU … EU AF
+   YU), three-letter codes unless they are English words (`AMBIGUOUS`: CAN SPA BRA PER MAR DEN
+   FIN RUM…). `"IT Crowd"`, `"Us Weekly"`, `"In Cinemas"`, `"AL JAZEERA"`, `"BT Sport"`,
+   `"FA Cup"`, `"CL Matches"`, `"CH 5"` stay untagged; `"IT: Sport"` is Italy.
+7. *Non-tags* (and plain numbers) are skipped — bracketed, separated or followed by a space —
+   and detection continues with the next token (at most 3 leading tokens): `4K 8K HD FHD UHD
+   SD HDR HEVC H265 VIP PPV VOD NEW XXX ADULT 18+ 24/7 TV FM LIVE RADIO MULTI INT INTL
+   INTERNATIONAL WORLD TOP PREMIUM EX`. So `"VIP | UK | Sports"`, `"VIP UK | Sports"` and
+   `"[4K] UK: Movies"` → GB; `"4K | Sports"` → untagged; `"NEW ZEALAND"` → NZ (`ZEALAND` is
+   listed); `"EX YU"` → Ex-Yugoslavia.
+8. *Trailing* forms, only when nothing leads: a bracketed last token (`"Sports (UK)"`,
+   `"Movies [EN]"`) or a separated last token (`"NETFLIX - EN"`, `"Sports | UK"`), trailing
+   non-tags skipped (`"Sports | UK | HD"`). No space-only form at the end; `PL` and `CL` are
+   not read at the end (`"Football | PL"` is the Premier League; `"PL | Polsat"` is Poland).
+9. A token is a tag only when it is in the tables below — unknown words never become tags
+   (`"CNN: Live"`, `"SKY | Movies"`, `"NBA: Games"` are untagged). Tokens may contain one inner
+   `-` or `/` when the whole is listed (`EX-YU`, `24/7`). A `-` between two letters is a
+   hyphenated word, not a separator (`"Sci-Fi"`, `"Re-Runs"`, `"Al-Jazeera"` are untagged;
+   `"UK - Docs"` is GB).
+
+**Synonyms** (token → tag; full table in code, tested):
+| tokens | tag |
+|---|---|
+| UK, GB, GBR, BRITAIN, BRITISH, ENGLAND, SCOTLAND, WALES, 🇬🇧, 🏴 England/Scotland/Wales | `GB` |
+| US, USA, AMERICA | `US` |
+| CA, CAN, CANADA · AU, AUS, AUSTRALIA · IE, IRL, IRELAND, IRISH · NZ, NZL, ZEALAND | `CA` · `AU` · `IE` · `NZ` |
+| EN, ENG, ENGLISH | `lang:en` (ENG is English, not England: providers use it for the language) |
+| AR, ARA, ARAB, ARABIC | `lang:ar` (IPTV convention; Argentina is ARG / ARGENTINA → `AR`) |
+| any other ISO 3166-1 alpha-2 code (embedded list), DEU/GER, FRA, ITA, ESP/SPA, POR/PRT, BRA, MEX, TUR, … (the three-letter set of `smart_names::COUNTRY3`), and English country names (FRANCE, GERMANY, DEUTSCHLAND, ITALIA, ESPANA, PORTUGAL, BRASIL, TURKEY/TURKIYE, POLAND/POLSKA, NETHERLANDS/HOLLAND, INDIA, PAKISTAN, …) | that country |
+| FRENCH, GERMAN/DEUTSCH, ITALIAN, SPANISH/ESPANOL, PORTUGUESE, TURKISH, RUSSIAN, POLISH, HINDI/HIN, URDU/URD, TAMIL/TAM, TELUGU/TEL, PUNJABI, BANGLA/BENGALI, KURD/KURDISH/KU, PERSIAN/FARSI/PER/FA | `lang:…` |
+| LAT, LATIN, LATINO, LATINA, LATAM | `region:latam` |
+| EX-YU, EXYU, YU, BALKAN(S) | `region:exyu` |
+| AF, AFR, AFRICA, AFRIKA, AFRICAN (`AF| NIGERIA`; Afghanistan is AFG) · ASIA, ASIAN · CARIB, CARIBBEAN · NORDIC, SCANDINAVIA, SCANDI · EU, EUROPE | `region:africa` · `asia` · `caribbean` · `nordic` · `europe` |
+
+Language names are not merged into countries (`FRENCH` ≠ `FR`): the picker lists both, and
+the defaults add the main language of the user's country (`country_language`, a small table:
+FR→fr, DE/AT→de, ES/MX/AR…→es, IT→it, PT/BR→pt, NL→nl, TR→tr, PL→pl, RU→ru, IN→hi, PK→ur…).
+
+### 28.3 Rule storage and semantics
+* `SourceSettings::category_filter: Option<CategoryFilter>` (settings JSON, serde default
+  `None`). `CategoryFilter { keep: BTreeSet<CategoryTag>, keep_untagged: bool (default true),
+  known: BTreeSet<CategoryTag> }`. `known` = the tags present when the rule was last saved;
+  the picker marks other tags "new" (no toast).
+* `CategoryFilter::keeps(tag)`: tagged → `keep` contains it; untagged → `keep_untagged`.
+  **Tags that first appear later are hidden** (keep-list semantics) unless they are in `keep`
+  — the defaults store the whole English set, so e.g. a later `NZ |` category is shown.
+* Written only by `store::sources::set_category_filter` (read-modify-write in the writer).
+  `update_source` and `set_source_settings` **preserve** the stored `category_filter` (a source
+  editor opened before a picker save must not wipe it — same race as §27.3).
+* Per-group precedence (`library::apply_category_filter`): the user's hide
+  (`GroupOverride::hidden`) > the user's show (`GroupOverride::shown`) > the rule > shown.
+  `Group::hidden` is the effective flag; `Group::user_hidden` is the user's own hide (kept
+  apart so a group hidden by both still counts as hidden by the user); `Group::filter`
+  (`Kept` / `Hidden` / `Exempt`) says what the rule did; `Group::tag` is the detected tag.
+* Hiding a group clears `shown`; showing a group sets `shown` only when the rule hides it
+  (`store::user::hide_groups`, `show_group(…, exempt)`), so an unhidden group that the rule
+  keeps does not become a permanent exception.
+* Items: unchanged rules (§5.4) — hidden when hidden themselves or when **all** their groups are
+  hidden; a channel in a kept and a filtered group (M3U `;` lists) stays visible.
+* Backup: settings JSON and `group_override.shown` round-trip (`GroupOverride` has
+  `#[serde(default)]`, older backups restore with `shown = false`).
+
+### 28.4 Where the rule is applied
+* **Import**: `ImportGroup::raw_name` → `grp.raw_name` (migration `0002_category_filter`:
+  `grp.raw_name TEXT`, `group_override.shown INTEGER NOT NULL DEFAULT 0`). Groups imported
+  before P6 have `raw_name` NULL until the next refresh; detection then falls back to `name`
+  (finds tags only when smart names are off) and the picker shows "Refresh to find all
+  countries" (`CategorySummary::needs_refresh`). A refresh that reaches such a group only
+  through an item (the provider no longer lists the category) stores `name` as its raw name,
+  since the real one cannot be learned; groups of a kind the refresh did not import stay NULL.
+* **Library build** (`store::library::load`, off the UI thread): `load_sources` parses
+  `settings` → `SourceMeta::category_filter`; `GROUP_COLS` gains `g.raw_name` and `o.shown`;
+  `group_from_row` sets `tag = detect_tag(raw_name ?? name)` and `filter = Exempt` when
+  `shown`, else `Kept`; `load_groups` calls `apply_category_filter` with the group's source
+  rule **before** `group_flags`, so `members`, `collection`, `visible_groups`, `by_number`, the
+  VOD vectors and zap lists all exclude filtered groups' items. Cost: one detection per group
+  per build (a few thousand short strings, < 5 ms).
+* **Search** (`search.rs`): reads `Group::hidden` and `LiveIndex::hidden` — no change; a test
+  pins that filtered items are not indexed.
+* **Counts**: group panes count visible members (unchanged code). Settings ▸ Playlists keeps
+  the imported totals and adds "Showing 4 of 41 countries" for a filtered source.
+* **Settings ▸ Hidden** (§28.5).
+* `store::live::groups` / `group` (point lookups) return the user's override only (no rule):
+  they are used by tests and point reads, never for lists.
+* Writes: picker save → `set_category_filter` + `DataScope::Sources` (rebuilds the library and
+  reloads the source editor); bulk hide / show → `DataScope::Overrides`.
+
+### 28.5 Settings ▸ Hidden
+* **Hidden by the category filter** — one section per filtered source: a row per hidden tag
+  ("Arabic · 112 categories · 4 380 channels"), Enter = **show this country** (adds the tag
+  to `keep`; toast "Arabic shown"), → expands the tag's categories in place (← collapses);
+  Enter on a category row shows just that one (`show_group(…, exempt: true)`). Expanded tags
+  show a down chevron and their category rows' detail starts with the tag ("Arabic · Live TV ·
+  Enter shows just this one"). A last row "Choose countries…" opens the picker. A playlist
+  with ≥ 2 tags and nothing filtered gets a section with just "Choose countries…".
+* **Hidden groups**: only groups the user hid (`user_hidden`), Enter unhides
+  (`show_group(…, exempt: filter != Kept)`).
+* **Hidden channels**: only channels hidden by their own override, i.e. channels of
+  `LiveIndex::hidden` that have at least one visible group or no group (a filtered source would
+  otherwise list thousands).
+
+### 28.6 "Choose what to show" (the picker)
+* Data: `store::library::category_summary(conn, source)` (loader, off the UI thread; reloaded on
+  `DataScope::Live | Vod | Sources` while open, so Xtream VOD categories that import after the
+  channels join the list) → `CategorySummary { tags: Vec<TagSummary>, needs_refresh }`; tagged
+  entries by item count descending, then "No country tag". Each row: short-code badge, label,
+  counts ("38 live groups · 2 140 channels · 12 movie / 9 series categories"), a "new" badge for
+  tags not in `known`, a tick box.
+* Initial ticks: the saved rule; with no rule, `default_keep(detect_country())` (only the
+  present tags are displayed; the stored `keep` is the full default set, see §28.3) and
+  untagged ticked.
+* Keys (context stack `[Checklist, Modal]`, see the keymap note in §28.7): Space / Insert tick, Ctrl+A
+  all / none (of the rows shown by the filter), Ctrl+E "just my country + English" (the
+  defaults), type to filter (label + short code; Space is not typable here — tag names are one
+  word), Enter **save** (`keep` = ticked tags ∪ (stored `keep` − present tags), so ticks of
+  absent tags such as the English defaults survive; `known` = present tags), Esc clears the
+  filter, then cancels. Buttons under the list mirror the keys (Select all · None · My country +
+  English · Save · Cancel). Saving with every tag and untagged ticked stores `None` (no rule).
+  Live: the library rebuild after save applies it. A line above the buttons shows the effect of
+  the ticks ("6 of 42 ticked · 3 210 of 48 900 channels"); ticks that keep nothing of the
+  playlist add a `warning` line "Nothing from this playlist will show." and the first Enter on
+  them only arms it ("— Enter again to save anyway"). Copy says "countries and languages"
+  (tags are also languages and regions); the save toast: "Showing 6 of 41 countries and
+  languages · Settings ▸ Hidden items shows the rest". The key line under the buttons is
+  `keymap::hint_line([Checklist, Modal])` + "Esc cancel" / "Esc show everything".
+* **Onboarding** (§13.10): after the Import step's channels phase, the wizard loads the summary
+  of the new source; with `tag_count() ≥ 2` it shows the **Choose what to show** step (the
+  import continues; its progress line stays visible under the list). Enter saves and returns to
+  the import / Done step; Esc ("Show everything") saves nothing. Card copy: "This playlist has
+  categories in 41 countries and languages. Pick the ones you want — you can change this later
+  in Settings ▸ Playlists." Same for Settings ▸ Add (same card). The step appears on its own
+  just as "Open Live TV" turns on, so Enter is ignored for its first 400 ms (an Enter meant for
+  that button must not save the defaults unseen); leaving and re-entering the card keeps the
+  step. Not offered when the playlist already has a rule (a restored one).
+* **Settings ▸ Playlists ▸ <playlist>**: a "Categories…" row (detail: "All countries and
+  languages" / "4 of 41 countries and languages") opens the same picker as an overlay
+  (`OverlayRequest::Categories(SourceId)`); with `needs_refresh` the picker shows a note ("…
+  refresh to find them all (Ctrl+R)") and a "Refresh now" button, and Ctrl+R / F5 in the picker
+  runs a **forced** refresh of that playlist (an unforced one may get "304 Not Modified" and
+  never write the raw names).
+* **Ways in for playlists added before this phase** (the user's case): "Countries &
+  languages…" in the playlist row's menu (Settings ▸ Playlists), in the Live group menu and the
+  Movies / Series category menu (groups of a playlist with ≥ 2 tags), and Settings ▸ Hidden
+  lists "Choose countries…" for every playlist with ≥ 2 tags, filtered or not.
+
+### 28.7 Bulk hide in group panes (Live groups, Movies / Series categories)
+* **Marks**: Space (List context, empty filter — a leading space is ignored by the filter
+  anyway) or Insert (List and ListFiltering) toggles the mark of the focused provider group and
+  moves down; marked rows show a check glyph (`glyphs::CHECK`) and the accent tint. Virtual rows
+  (favourites lists, History, All channels…) cannot be marked. Marks are per pane, cleared on
+  hide and on Esc (first rung of the Esc ladder); a library rebuild keeps the marks of groups the
+  pane still lists (group ids are stable) and drops the others. The tag code also filters
+  ("uk" finds the UK groups smart names renamed).
+* **Ctrl+H** with marks hides all marked groups in one write (`hide_groups`), toast "Hid 5
+  groups · Settings ▸ Hidden items shows them again"; without marks it is unchanged (the focused
+  group).
+* **Ctrl+Shift+H** (ListFiltering only) "Hide these N groups": the provider groups the filter
+  shows **whose names (with the tag code) have a word starting with each word typed** — the
+  fuzzy filter also shows "Cartoons", "Documentary" for "ar", which a bulk hide must not take —
+  after a Confirm ("Hide 37 groups?", not destructive; the body names the first 5 "… and 32
+  more") when N > 1. The pane footer shows "37 groups with “ar” · Ctrl+Shift+H hides them" while
+  filtering and "5 marked · Ctrl+H hides · Esc clears" while marks exist (keys from the keymap);
+  the context menu (Ctrl+Enter) lists both actions. Movies / Series say "categories".
+* A resolved plain `Key::Space` drops its `Text(" ")` twin in `raw_input_hook` (like Alt
+  chords): Space choosing a menu item closes the menu in that frame, and the twin would
+  otherwise reach the pane below as ToggleMark.
+* Ctrl+Space is not used (fcitx5's input-method toggle on Omarchy).
+* Group rows show the tag's short code as a muted suffix badge when their source has ≥ 2 tags
+  (smart names drop "UK |", so "UK | Sports" and "US | Sports" otherwise both read "Sports"),
+  unless the name already shows the code as a word ("|UK| Sports" with smart names off).
+
+**Keymap changes** (`src/keymap.rs`; §15.2 regenerated with `cargo run --example keymap_md`):
+new actions `ToggleMark`, `MarkAll`, `MarkDefaults`, `HideShown`; new context
+`KeyContext::Checklist` (title "Tick lists"), stacked `[Checklist, Modal]` and filterable
+(letters type). It binds its own navigation and filter keys (↑/↓/PgUp/PgDn/Home/End,
+Backspace, Ctrl+Backspace, Ctrl+U, Esc → Back "Clear the filter, then cancel") instead of
+stacking on `List`, where → would be Activate (save) and Backspace Parent. `Key::Space` / Insert →
+ToggleMark "Tick / untick" (the KEY, because `Modal` below binds `Key::Space` to Confirm; the
+`Text(" ")` twin is dropped by `raw_input_hook`), Ctrl+A → MarkAll
+"Tick all / none", Ctrl+E → MarkDefaults "Just my country + English", Enter → Activate "Save";
+hints `tick · all/none · my country · save`.
+LIST: `Char(' ')` and Insert → ToggleMark "Mark group (Ctrl+H then hides all marked)";
+LIST_FILTERING: Insert → ToggleMark, Ctrl+Shift+H → HideShown "Hide the groups with the words
+typed". Space is
+bound as `Char(' ')` (the Text event), never `Key::Space`, so it never also types into the
+filter. Screens without marks ignore ToggleMark; the jobs overlay (`[List, Modal]`) too.
+
+### 28.8 Not in scope
+Per-kind rules, auto-detected language of channel names (no tag in the category), the M3U
+`tvg-country` attribute, toasts about new tags after a refresh, flag emoji.
+
+### 28.9 Skeleton API (branch `p6-base`)
+Compiled from the start; `todo!("P6-core")` only where nothing calls it yet:
+* `model::category::{CategoryTag (country/language/region/kind/code), TagKind, CategoryFilter
+  (Default: keep_untagged = true; keeps), GroupFilter {Kept, Hidden, Exempt}}` — implemented.
+* `model::SourceSettings::category_filter: Option<CategoryFilter>`; `model::Group::{tag,
+  filter}`; `model::GroupOverride::shown`; `model::GroupRef {source, kind, key}` +
+  `From<&Group>`.
+* `sources::category_tags::{ENGLISH_COUNTRIES, is_english, default_keep, tag_short, TagSummary
+  (items, groups), CategorySummary (tag_count, present)}` — implemented; `tag_label`
+  (countries only; languages/regions fall back to the short code) and `country_language`
+  (returns `None`) — placeholders for core; `detect_tag`, `summarize` — todo.
+* Migration `0002_category_filter.sql`; `store::import::ImportGroup::raw_name` (set by the M3U
+  and Xtream converters; not yet written by `upsert_group`).
+* `store::user::{hide_groups, show_group}` and `set_group_override` / `group_overrides` with
+  `shown` — implemented. `store::sources::set_category_filter` — implemented.
+* `store::library::{SourceMeta::category_filter (None until core parses it),
+  apply_category_filter}` — implemented; `category_summary` — todo; `group_from_row` sets
+  `tag: None`, `filter: Kept` until core.
+
+### 28.10 Work split (two parallel tracks)
+File ownership is disjoint; a cross-track edit needs the owner's agreement and is listed in the
+merge note. Both tracks branch from `p6-base`. Lean: clippy + the tests you touched; the
+integrator runs the one full gate.
+
+**core track** — owns `src/sources/**`, `src/store/**` (incl. `backup.rs`, migrations),
+`src/model/**`, `src/search.rs`, `src/jobs/**`, `benches/**` (compile fixes only),
+`tests/{store_catalogue,store_backup,import_e2e,search,m3u,xtream,resolve,store_epg}.rs`.
+1. `category_tags`: `detect_tag` per §28.2 (embedded ISO alpha-2 list, synonym / non-tag /
+   ambiguous tables), `tag_label` names for languages & regions, `country_language`,
+   `summarize`. Tests (one table-driven unit test, extend it rather than adding many): every
+   pattern of §28.2 incl. flags, `|UK|`, `[UK]`, `UK ✦`, `EN ▎`, trailing forms, `VIP | UK |`,
+   negatives (`4K | Sports`, `24/7 Movies`, `CNN: Live`, `IT Crowd`, `Us Weekly`, `HD`,
+   `XXX`, `ADULT`), synonyms (UK/GB/GBR → GB; EN/ENG/ENGLISH → lang:en; AR → lang:ar; ARG →
+   AR; EX-YU/YU → region:exyu); `summarize` counts per kind and order.
+2. Import writes `grp.raw_name` = `raw_name ?? name` (`upsert_group` insert + `DO UPDATE`), so
+   NULL means "imported before P6" and nothing else.
+3. Library: `load_sources` parses `settings` → `category_filter`; `GROUP_COLS` + `group_from_row`
+   (`raw_name`, `shown`, tag); `load_groups` applies the rule before `group_flags`;
+   `category_summary` (all kinds, enabled or not; `needs_refresh` = any group of the source
+   with NULL `raw_name`).
+4. `update_source` / `set_source_settings` preserve the stored `category_filter`.
+5. Backup: `GroupOverride::shown` exported / restored (Replace and Merge); settings JSON already
+   round-trips — extend the existing backup test literal.
+6. Tests (extend `tests/store_catalogue.rs`): a source with groups `UK | News`, `AR | News`,
+   `Sports` (untagged) and a filter keeping GB → AR group hidden with `filter == Hidden`, its
+   channels absent from `collection(AllChannels)` and from a `SearchIndex` built on the
+   loaded library, untagged kept; a refresh that adds `|FR| Films` → hidden without touching
+   the rule; `show_group(exempt)` on the AR group → visible (`Exempt`); `hide_groups` on a kept
+   group → hidden and `shown` cleared; a channel in a kept and a filtered group stays visible;
+   `update_source` with a stale copy keeps the rule.
+
+**ui track** — owns `src/ui/**`, `src/keymap.rs`, `src/app.rs`, `examples/keymap_md.rs`,
+`tests/{onboarding,guide,widgets,keymap}.rs`, the regenerated §15.2 tables.
+1. Keymap (§28.7): actions, `Checklist` context (+ `ALL`, title, `tables`, hints), LIST /
+   LIST_FILTERING bindings, Ctrl+H help text. Tests (extend `tests/keymap.rs`): Space in `List`
+   → ToggleMark but in `ListFiltering` → FilterInput; `[Checklist, ListFiltering, Modal]` Space →
+   ToggleMark, letters → FilterInput, Enter → Activate; Ctrl+Shift+H only while filtering;
+   existing "no shadowing" / "help complete" tests cover the rest.
+2. Picker: one implementation (`ui/overlays/categories.rs` overlay + a reusable state/view used
+   by the onboarding step), `OverlayRequest::Categories(SourceId)` wired in `overlays::build`.
+   Tests: defaults pre-tick GB + English + untagged and nothing else; Space / Ctrl+A / Ctrl+E;
+   filter then Ctrl+A ticks only the shown rows; Enter saves the expected `CategoryFilter`
+   (`keep` keeps absent default tags, `known` = present) via `set_category_filter`; all ticked
+   → `None`. Build summaries directly (`CategorySummary`) — `category_summary` is todo until core
+   lands.
+3. Onboarding step (§28.6): trigger after the channels phase when `tag_count() ≥ 2`; Esc = show
+   everything. Test (extend `tests/onboarding.rs`): ≥ 2 tags → step shown, Enter saves; 1 tag →
+   no step.
+4. Settings: playlist "Categories…" row + status detail; Hidden page sections (§28.5). Test
+   (extend the existing Hidden-page test in `settings.rs`): a library with a filtered group shows
+   the tag row, Enter shows the tag (writes the rule); user-hidden list excludes filtered groups.
+5. Group panes (Live, Movies / Series categories): marks, Ctrl+H on marks, Ctrl+Shift+H with
+   Confirm, footer lines, Esc clears marks, tag suffix badge. Tests (extend the existing
+   `live.rs` / `movies.rs` screen tests): mark two groups + Ctrl+H → one write hiding both;
+   filter + Ctrl+Shift+H + confirm → exactly the filtered groups; Esc clears marks before
+   leaving the pane.
+6. Help rows / hint lines: generated from the tables; check the status-bar hint for
+   `Checklist`.
+
+### 28.11 Risks
+* **False positives** hide content the user wants: detection only accepts listed tokens, with
+  separators for short codes and the AMBIGUOUS list; untagged is kept by default; every hidden
+  tag is one Enter away in Settings ▸ Hidden. The table-driven test is the guard — add every
+  reported mis-detection to it.
+* **Stale raw names**: groups imported before P6 have no raw name until the next refresh (the
+  picker says so); the rule then applies to more groups after that refresh.
+* **New-tag surprise**: a provider renaming "UK |" to "GB:" keeps working (synonyms); a provider
+  switching to a format we don't parse makes categories untagged → shown (safe side).
+* **Editor race** wiping the rule: `update_source` / `set_source_settings` preserve it (§28.3).
+* **Favourites in filtered categories disappear** from favourites lists (decision 5) — same
+  as hiding their group today; documented in the picker's footnote ("Favourites in hidden
+  countries are hidden too").
+* **Space binding in `List`**: every list now maps Space to ToggleMark; screens that don't mark
+  must ignore it (they do: unhandled actions are no-ops) — keymap test pins it.

@@ -21,12 +21,19 @@ pub struct Group {
     pub provider_order: i32,
     /// User ordering (lower first); `None` = provider order.
     pub user_order: Option<i32>,
+    /// Effective: the user's hide, or the source's category filter (see `filter`).
     pub hidden: bool,
+    /// The user's own hide (`GroupOverride::hidden`), whatever the rule does.
+    pub user_hidden: bool,
     /// PIN-locked (parental).
     pub locked: bool,
     pub item_count: u32,
     /// Xtream category id, if any.
     pub provider_id: Option<String>,
+    /// Country / language tag of the provider's raw category name (DESIGN §28.2).
+    pub tag: Option<super::CategoryTag>,
+    /// What the source's category filter does to this group (DESIGN §28.3).
+    pub filter: super::GroupFilter,
 }
 
 impl Group {

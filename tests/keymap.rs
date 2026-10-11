@@ -228,6 +228,32 @@ fn list_parent_and_filter_keys() {
     assert_eq!(resolve(&[K::List], &ctrl(Key::ArrowDown)), None);
 }
 
+/// Bulk hide in group panes and the "Choose what to show" tick list (DESIGN §28.7): Space marks
+/// only while the filter is empty (then it types), Insert always marks; "hide these N groups"
+/// only exists while filtering. The tick list owns its keys above `Modal`: Space ticks instead
+/// of confirming the dialog, → doesn't save and Backspace doesn't leave (as `List` would).
+#[test]
+fn group_marks_and_tick_lists() {
+    let ctrl_shift = |k: Key| key_mods(k, Modifiers::CTRL | Modifiers::COMMAND | Modifiers::SHIFT, false);
+    assert_eq!(resolve(&[K::List], &text(" ")), Some(Action::ToggleMark));
+    assert_eq!(resolve(&[K::List], &key(Key::Space)), None, "the key twin reaches nothing");
+    assert_eq!(resolve(&[K::List], &key(Key::Insert)), Some(Action::ToggleMark));
+    assert_eq!(resolve(&[K::ListFiltering], &text(" ")), Some(Action::FilterInput(' ')), "filters have spaces");
+    assert_eq!(resolve(&[K::ListFiltering], &key(Key::Insert)), Some(Action::ToggleMark));
+    assert_eq!(resolve(&[K::ListFiltering], &ctrl_shift(Key::H)), Some(Action::HideShown));
+    assert_eq!(resolve(&[K::List], &ctrl_shift(Key::H)), None, "only while filtering");
+    assert_eq!(resolve(&[K::List], &ctrl(Key::H)), Some(Action::ToggleHidden));
+
+    let picker = [K::Checklist, K::Modal];
+    assert_eq!(resolve(&picker, &key(Key::Space)), Some(Action::ToggleMark), "not the dialog's Confirm");
+    assert_eq!(resolve(&picker, &text(" ")), Some(Action::FilterInput(' ')), "ignored by tick lists");
+    assert_eq!(resolve(&picker, &text("f")), Some(Action::FilterInput('f')));
+    assert_eq!(resolve(&picker, &held(Key::Escape)), None);
+    assert_eq!(resolve(&picker, &key(Key::ArrowRight)), Some(Action::Right), "the dialog's harmless →, never Activate");
+    assert_eq!(hint_line(&picker), "Space tick · Ctrl+A all/none · Ctrl+E my country · Enter save");
+    assert!(help_rows(K::Checklist).iter().any(|r| r.1 == "Type to filter"));
+}
+
 // ------------------------------------------------------------------ tables, help, hints
 
 #[test]

@@ -1,6 +1,7 @@
 -- Quality badges (DESIGN §6, §13.0). Owner: WP-02.
--- Safe to re-run (another branch's 0002 may already have bumped `user_version`; whichever
--- lands second is renumbered): the two `channel` columns are added by the Rust step of this
+-- Written as 0002_quality, renumbered after 0002_category_filter; safe to re-run (a pre-merge
+-- build's database is at v2 with this applied, see `migrations::reconcile_renumbered`): the
+-- two `channel` columns are added by the Rust step of this
 -- migration (`migrations::backfill`) only when missing, and it fills them from the stored
 -- provider names, so an existing database needs no refresh:
 --   channel.quality INTEGER — the quality word of the provider name (smart_names: 1 SD, 2 HD,

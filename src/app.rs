@@ -944,7 +944,10 @@ impl eframe::App for TunerApp {
             }
             match keymap::resolve(&stack, ev) {
                 Some(a) => {
-                    drop_text = matches!(ev, egui::Event::Key { modifiers, .. } if modifiers.alt);
+                    // ... and of a resolved plain Space: a menu's Space (Activate) closes it, and
+                    // its " " would then reach the pane below (List: mark the group)
+                    drop_text = matches!(ev, egui::Event::Key { modifiers, .. } if modifiers.alt)
+                        || matches!(ev, egui::Event::Key { key: egui::Key::Space, pressed: true, modifiers, .. } if !modifiers.ctrl && !modifiers.alt);
                     resolved.push((a, stack.clone()));
                     false // consumed: egui never sees it
                 }
@@ -1619,6 +1622,28 @@ mod tests {
         assert_eq!(probe.borrow().actions.last(), Some(&Action::FilterInput('z')));
     }
 
+    /// A menu chosen with Space closes in that frame: the `Text(" ")` twin must not reach the
+    /// group pane below (where it marks the group for Ctrl+H, DESIGN §28.7).
+    #[test]
+    fn space_in_a_menu_never_also_marks_the_group_below() {
+        let mut rig = Rig::new();
+        let probe = rig.probe(ScreenId::Live, vec![KeyContext::List]);
+        let item = crate::ui::overlays::MenuItem { icon: "", label: "Rename".into(), action: Action::Rename, enabled: true, shortcut: None };
+        rig.app
+            .nav
+            .push(NavRequest::Open(OverlayRequest::ContextMenu(crate::ui::overlays::ContextMenuSpec { title: "News".into(), items: vec![item] })));
+        rig.frame_with(vec![]);
+        let mut evs = key_events(Key::Space, NONE);
+        evs.insert(1, Event::Text(" ".into()));
+        rig.frame_with(evs);
+        assert!(rig.app.overlays.is_empty());
+        assert_eq!(probe.borrow().results, [OverlayResult::Chosen(Action::Rename)]);
+        assert_eq!(probe.borrow().actions, [], "no ToggleMark");
+        // control: in the pane itself the space marks
+        rig.frame_with(vec![Event::Text(" ".into())]);
+        assert_eq!(probe.borrow().actions, [Action::ToggleMark]);
+    }
+
     #[test]
     fn mouse_back_button_is_back() {
         let mut rig = Rig::new();
@@ -1711,6 +1736,51 @@ mod tests {
         rig.app.nav.push(NavRequest::Open(OverlayRequest::Help));
         rig.frame_with(vec![]);
         assert_eq!(rig.overlay_kinds(), [kind(OverlayRequest::Help)]);
+    }
+
+    /// Help filters as you type (Omarchy's keybindings menu): letters, `/` and `?` go to the
+    /// filter instead of running shortcuts; Esc and F1 clear the filter before they close it;
+    /// `?` closes only while the filter is empty.
+    #[test]
+    fn help_types_to_filter_and_esc_clears_before_closing() {
+        let mut rig = Rig::new();
+        rig.size = egui::vec2(600.0, 2400.0);
+        let probe = rig.probe(ScreenId::Live, vec![KeyContext::List]);
+        rig.frame_with(vec![]);
+        rig.press(Key::F1, NONE);
+        let typed = |rig: &mut Rig, s: &str| {
+            for c in s.chars() {
+                rig.frame_with(vec![Event::Text(c.to_string())]);
+            }
+            texts(&rig.frame_with(vec![]))
+        };
+        let t = typed(&mut rig, "mute");
+        assert!(find(&t, "Mute").is_some() && find(&t, "PLAYER — LIVE TV").is_some());
+        assert!(find(&t, "LISTS").is_none(), "sections without a match are hidden");
+        assert!(t.iter().any(|(s, _, _)| s.starts_with("2 of ")), "count");
+        let t = typed(&mut rig, "/?");
+        assert_eq!(rig.overlay_kinds(), [kind(OverlayRequest::Help)], "`/` and `?` are typed, not run");
+        assert!(find(&t, "mute/?").is_some() && find(&t, "No matching shortcuts").is_some());
+        // NBSP (AltGr+Space) then Ctrl+Backspace deletes the word without splitting a char
+        typed(&mut rig, "\u{a0}x");
+        rig.press(Key::Backspace, CTRL);
+        typed(&mut rig, "y");
+        assert!(find(&typed(&mut rig, ""), "mute/? y").is_some());
+        // Esc: clear, then close
+        rig.press(Key::Escape, NONE);
+        let t = texts(&rig.frame_with(vec![]));
+        assert_eq!(rig.overlay_kinds(), [kind(OverlayRequest::Help)]);
+        assert!(find(&t, "LISTS").is_some(), "cleared");
+        rig.press(Key::Escape, NONE);
+        assert!(rig.app.overlays.is_empty());
+        // F1 the same; `?` closes once the filter is empty
+        rig.press(Key::F1, NONE);
+        typed(&mut rig, "q");
+        rig.press(Key::F1, NONE);
+        assert_eq!(rig.overlay_kinds(), [kind(OverlayRequest::Help)]);
+        typed(&mut rig, "?");
+        assert!(rig.app.overlays.is_empty());
+        assert!(probe.borrow().actions.iter().all(|a| *a == Action::ToggleHelp), "only the F1s that opened help reached the screen");
     }
 
     #[test]

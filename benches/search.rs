@@ -37,9 +37,12 @@ fn group(id: i64, kind: ItemKind, name: &str) -> Group {
         provider_order: id as i32,
         user_order: None,
         hidden: false,
+        user_hidden: false,
         locked: false,
         item_count: 0,
         provider_id: None,
+        tag: None,
+        filter: Default::default(),
     }
 }
 
@@ -94,6 +97,7 @@ fn library() -> Library {
         last_refresh: None,
         has_vod: true,
         has_series: true,
+        category_filter: None,
     };
     Library {
         sources: vec![source(1, "My IPTV"), source(2, "Backup")],

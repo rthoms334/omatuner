@@ -45,7 +45,9 @@ on-screen controls, and a light theme (catppuccin-latte).
 - **Live TV:** groups, channel rows with now/next and progress, and a preview pane.
   - Zap with ↑/↓, recall the last channel, and browse your history.
   - Keep several favourites lists.
-  - Hide, rename and reorder channels and groups.
+  - Hide, rename and reorder channels and groups; mark several groups and hide them at once.
+  - Keep only the countries and languages you want from a provider's categories
+    ("UK | Sports", "[FR] Films", "AR: News"…), including categories the provider adds later.
   - Type a channel number to jump to it.
   - Quality badges (SD, HD, FHD, 4K) next to channel names, so the SD/HD/4K copies of a channel
     are told apart without playing each one; the best copy is listed first. A badge comes from
@@ -163,6 +165,9 @@ With no playlists, Tuner opens a single onboarding card with these steps:
    file, or skip (you can add one later in Settings ▸ EPG).
 6. **Importing:** **Open Live TV** becomes available as soon as the channels are in. Movies,
    series and the guide keep loading in the background (status bar, Ctrl+J).
+   - **Choose what to show:** when the playlist's categories carry two or more countries or
+     languages, the card asks which to keep (see
+     [Countries and languages](#countries-and-languages)). Esc shows everything.
 7. **Done:** counts per kind, and how much of the playlist the guide covers (see below).
 
 Esc steps back. Everything works from the keyboard.
@@ -242,6 +247,50 @@ season 1 in playlist order. Everything else stays a live channel. These pages on
 playlist carries (title, poster, group), so they show a short page with no plot or cast.
 Ordinary playlists such as iptv-org or Free-TV are not affected.
 
+### Countries and languages
+
+Many Xtream panels (and M3U playlists) carry categories for dozens of countries: "UK | Sports",
+"|DE| Filme", "[FR] Cinéma", "AR: News", "EX-YU Filmovi", "🇵🇹 Desporto". Tuner reads the country,
+language or region at the start (or end) of each category name and lets you keep only the ones
+you want. It is a **rule** stored per playlist, not a one-off hide: it is applied every time the
+library is built, so categories the provider adds later for a country you didn't tick stay
+hidden. One rule covers live groups, movie and series categories.
+
+- **Where:** offered during onboarding right after the channels import (only when two or more
+  tags are found), and later from **Settings ▸ Playlists**: the playlist's row menu
+  (*Countries & languages…*) or its editor (*Categories…*). Also from the Live group or
+  Movies/Series category menu (Ctrl+Enter) and **Settings ▸ Hidden ▸ Choose countries…**.
+- **The list:** one row per tag with a code badge, its name and counts (live groups, channels,
+  movie and series categories), plus **No country tag** for categories without one. A line shows
+  the effect ("6 of 42 ticked · 3 210 of 48 900 channels"). Tags that appeared since the last
+  save are marked *new*.
+- **Defaults:** your country (from the time zone, then the locale) and its main language, the
+  English-speaking countries (UK, US, Canada, Australia, Ireland, New Zealand), English, and
+  untagged categories. Everything else starts unticked. These stay in the rule even when the
+  playlist doesn't have them yet, so a later "NZ |" category still shows.
+- **Keys:** Space or Insert ticks, type to filter, Ctrl+A ticks all / none of the rows shown,
+  Ctrl+E goes back to "my country + English", Enter saves, Esc clears the filter, then cancels.
+  Ticking nothing that the playlist has asks for a second Enter. Ticking everything removes the
+  rule.
+- **Recognised forms:** `UK | …`, `UK: …`, `UK - …`, `UK-…`, `|UK| …`, `[UK] …`, `(UK) …`,
+  `EN ▎…`, `UK ✦ …`, a leading flag, full names (`ENGLISH`, `FRANCE`, `ARABIC`, `LATINO`,
+  `EX-YU`, `AFRICA`) and trailing `… (UK)` / `… | UK`. UK, GB, ENGLAND, SCOTLAND and WALES are
+  all the UK; EN, ENG and ENGLISH are the English *language*; AR is Arabic (Argentina is ARG or
+  🇦🇷). Prefixes such as 4K, HD, FHD, VIP, PPV, VOD, NEW, 24/7, XXX and ADULT are skipped, and
+  unknown words never count: "4K | Sports", "BT Sport", "FA Cup" and "IT Crowd" are untagged
+  and stay shown.
+- **Exceptions:** Ctrl+H on a group always hides it. **Settings ▸ Hidden** lists the hidden
+  countries: Enter shows a whole country again, → expands it so you can show single categories.
+- **Playlists added before this version** need one refresh before most tags are found (the
+  picker says so; Ctrl+R there refreshes).
+- **Hiding several groups at once:** in Live groups and the Movies/Series category list, Space
+  (or Insert) marks groups and Ctrl+H hides all marked ones (Esc clears the marks). While
+  filtering, Ctrl+Shift+H hides every group whose name has words starting with what you typed
+  ("ar" takes "AR | Movies" and "Arabic News", not "Cartoons"), after a confirm.
+
+Group names carry a muted code badge ("UK") when the playlist has several tags, since smart
+names turn "UK | Sports" and "US | Sports" into "Sports".
+
 ## TV guide and guide coverage
 
 A guide only helps the channels it lists. Tuner matches playlist channels to guide channels in
@@ -293,8 +342,9 @@ Tuner is built for the keyboard, and everything is also clickable. The basics:
 
 - **In lists and grids, letters type into a filter** (launcher style). Vim keys work only in the
   guide, the player and Settings.
-- **`?` or F1** shows every key for the screen you're on. The status bar shows a short hint line
-  for the same screen.
+- **`?` or F1** shows every key, the screen you're on first. Type to filter it, like Omarchy's
+  keybindings menu: "ctrl+h", "f5" or "mute" narrow the list as you type, Esc clears the filter
+  and then closes. The status bar shows a short hint line for the same screen.
 - **Esc** steps out one level: filter → panel → fullscreen → player → previous screen.
 - **Alt+1…5** switch screens, and **Alt+0** or **Ctrl+,** opens Settings. **Ctrl+K** or **/**
   searches. **Ctrl+Q** quits.
@@ -338,6 +388,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Esc` | Back |
 | `/` | Search everything |
 | `?` | Keyboard help |
+| `Space` / `Insert` | Mark group (Ctrl+H then hides all marked) |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
 | `Ctrl+H` | Hide / unhide |
@@ -366,6 +417,8 @@ The full reference is generated from `src/keymap.rs`:
 | `Ctrl+Backspace` | Delete word |
 | `Ctrl+U` / `Esc` | Clear filter |
 | `Tab` / `Shift+Tab` | Next / previous pane |
+| `Insert` | Mark group (Ctrl+H then hides all marked) |
+| `Ctrl+Shift+H` | Hide the groups with the words typed |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
 | `Ctrl+H` | Hide / unhide |
@@ -380,6 +433,23 @@ The full reference is generated from `src/keymap.rs`:
 | `Ctrl+W` | Mark watched / unwatched |
 | `Delete` | Remove (from list / cancel task / forget) |
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
+| `a–z, 0–9 …` | Type to filter |
+
+### Tick lists (`Checklist`)
+
+| Keys | Action |
+|---|---|
+| `↑` / `↓` | Move |
+| `PgUp` / `PgDn` | Page up / down |
+| `Home` / `End` | First / last |
+| `Space` / `Insert` | Tick / untick |
+| `Ctrl+A` | Tick all / none (of the rows shown) |
+| `Ctrl+E` | Just my country + English |
+| `Enter` | Save |
+| `Backspace` | Delete character |
+| `Ctrl+Backspace` | Delete word |
+| `Ctrl+U` | Clear filter |
+| `Esc` | Clear the filter, then cancel |
 | `a–z, 0–9 …` | Type to filter |
 
 ### Movies & series grid (`PosterGrid`)
@@ -641,6 +711,22 @@ The full reference is generated from `src/keymap.rs`:
 | `x` / `Delete` | Delete / more actions |
 | `Esc` | Back |
 | `?` | Keyboard help |
+
+### Keyboard help (`Help`)
+
+| Keys | Action |
+|---|---|
+| `↑` / `↓` | Scroll |
+| `PgUp` / `PgDn` | Page up / down |
+| `Home` / `End` | Top / bottom |
+| `Backspace` | Delete character |
+| `Ctrl+Backspace` | Delete word |
+| `Ctrl+U` | Clear filter |
+| `Esc` / `F1` | Clear the filter, then close |
+| `?` | Close (types ? while filtering) |
+| `Enter` | Close |
+| `a–z, 0–9 …` | Type to filter |
+
 <!-- keymap:end -->
 
 ## Command line

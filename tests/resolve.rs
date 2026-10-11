@@ -119,6 +119,7 @@ fn import_channels(s: &Store, source: SourceId, channels: Vec<ImportChannel>) ->
             kind: ItemKind::Channel,
             key: group_key(ItemKind::Channel, "News"),
             name: "News".into(),
+            raw_name: None,
             provider_id: None,
             provider_order: 0,
         };
@@ -162,6 +163,7 @@ fn import_movies(s: &Store, source: SourceId, movies: Vec<ImportMovie>) -> Vec<M
             kind: ItemKind::Movie,
             key: group_key(ItemKind::Movie, "Films"),
             name: "Films".into(),
+            raw_name: None,
             provider_id: None,
             provider_order: 0,
         };
@@ -204,6 +206,7 @@ fn import_series(s: &Store, source: SourceId, name: &str, episodes: Vec<ImportEp
             kind: ItemKind::Series,
             key: group_key(ItemKind::Series, "Shows"),
             name: "Shows".into(),
+            raw_name: None,
             provider_id: None,
             provider_order: 0,
         };

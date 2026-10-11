@@ -86,6 +86,9 @@ pub struct SourceSettings {
     /// "Keep as M3U" in onboarding and the source's settings. On an upgraded source (Xtream
     /// with [`Source::m3u_origin`]) it switches the source back to its playlist.
     pub keep_m3u: bool,
+    /// Which countries / languages of category names are shown (DESIGN §28); `None` = all.
+    /// Written only by `store::sources::set_category_filter` (other settings writes keep it).
+    pub category_filter: Option<super::CategoryFilter>,
 }
 
 /// Account information from Xtream `user_info`/`server_info` (UHF "server info").

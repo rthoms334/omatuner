@@ -139,6 +139,7 @@ fn playlist(s: &Store, chans: &[(&str, &str, Option<&str>, i32)]) -> SourceId {
             kind: ItemKind::Channel,
             key: group_key(ItemKind::Channel, "All"),
             name: "All".into(),
+            raw_name: None,
             provider_id: None,
             provider_order: 0,
         };
