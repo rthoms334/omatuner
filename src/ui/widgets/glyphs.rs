@@ -25,12 +25,18 @@ pub const PREVIOUS: &str = "\u{f04ae}";
 pub const SKIP_BACK: &str = "\u{f0d6a}";
 pub const SKIP_FORWARD: &str = "\u{f0d3d}";
 pub const VOLUME: &str = "\u{f057e}";
+/// Speaker by level (nf-md-volume_low / nf-md-volume_medium; `VOLUME` is volume_high).
+pub const VOLUME_LOW: &str = "\u{f057f}";
+pub const VOLUME_MEDIUM: &str = "\u{f0580}";
 pub const MUTED: &str = "\u{f0581}";
 pub const AUDIO_TRACK: &str = "\u{f0597}";
 pub const SUBTITLES: &str = "\u{f0a16}";
 pub const ASPECT: &str = "\u{f0e5c}";
 pub const FULLSCREEN: &str = "\u{f0293}";
 pub const MINI_PLAYER: &str = "\u{f0e57}";
+/// Pop the player out (nf-md-open_in_new) / back in to the full window (nf-md-arrow_collapse).
+pub const POP_OUT: &str = "\u{f03cc}";
+pub const POP_IN: &str = "\u{f0615}";
 pub const HISTORY: &str = "\u{f02da}";
 pub const CATCHUP: &str = "\u{f0459}";
 pub const LIVE_DOT: &str = "\u{f0003}";
@@ -43,6 +49,8 @@ pub const NO_VIDEO: &str = "\u{f0568}";
 pub const PLAYLIST: &str = "\u{f0411}";
 pub const INFO: &str = "\u{f02fd}";
 pub const CHEVRON_LEFT: &str = "\u{f0141}";
+/// Leave the player (nf-md-arrow_left).
+pub const ARROW_LEFT: &str = "\u{f004d}";
 pub const CHEVRON_RIGHT: &str = "\u{f0142}";
 /// An expanded row (nf-md-chevron_down).
 pub const CHEVRON_DOWN: &str = "\u{f0140}";
