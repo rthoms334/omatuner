@@ -25,6 +25,7 @@ fn source(id: i64, name: &str) -> SourceMeta {
         last_refresh: None,
         has_vod: true,
         has_series: true,
+        category_filter: None,
     }
 }
 
@@ -42,6 +43,8 @@ fn group(id: i64, kind: ItemKind, name: &str, hidden: bool, locked: bool) -> Gro
         locked,
         item_count: 0,
         provider_id: None,
+        tag: None,
+        filter: Default::default(),
     }
 }
 

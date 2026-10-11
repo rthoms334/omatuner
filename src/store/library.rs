@@ -27,8 +27,8 @@ use rusqlite::Connection;
 
 use crate::error::Result;
 use crate::model::{
-    ChannelId, ChannelSummary, Collection, FavListId, FavouriteEntry, FavouriteList, Group, GroupId, ItemKey, ItemKind, ItemRef, MovieId, SeriesId,
-    SortMode, SourceColor, SourceId, SourceKind, Timestamp, VodKind, VodSummary,
+    CategoryFilter, ChannelId, ChannelSummary, Collection, FavListId, FavouriteEntry, FavouriteList, Group, GroupFilter, GroupId, ItemKey, ItemKind,
+    ItemRef, MovieId, SeriesId, SortMode, SourceColor, SourceId, SourceKind, Timestamp, VodKind, VodSummary,
 };
 use crate::store::live::{GROUP_COLS, GROUP_FROM, GROUP_ORDER, group_from_row};
 use crate::store::sql::{enum_parse, u32_of};
@@ -45,6 +45,8 @@ pub struct SourceMeta {
     pub last_refresh: Option<Timestamp>,
     pub has_vod: bool,
     pub has_series: bool,
+    /// The source's category filter (`SourceSettings::category_filter`, DESIGN §28).
+    pub category_filter: Option<CategoryFilter>,
 }
 
 #[derive(Debug, Default)]
@@ -371,6 +373,8 @@ fn load_sources(conn: &Connection) -> Result<Vec<SourceMeta>> {
             last_refresh: r.get(6)?,
             has_vod: r.get(7)?,
             has_series: r.get(8)?,
+            // P6-core: parsed from `s.settings` (DESIGN §28.4)
+            category_filter: None,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -390,6 +394,28 @@ fn load_groups(conn: &Connection) -> Result<(Vec<Group>, Vec<Group>, Vec<Group>)
         }
     }
     Ok((ch, mv, se))
+}
+
+/// Apply a source's category filter to one of its groups, loaded with its override flags
+/// (`hidden` = the user's hide; `filter` = `Exempt` when the override has `shown`, else `Kept`).
+/// Precedence (DESIGN §28.3): the user's hide > the user's show > the rule. Afterwards
+/// `hidden` is the effective flag and `filter` says what the rule did.
+pub fn apply_category_filter(g: &mut Group, filter: Option<&CategoryFilter>) {
+    let rule_hides = filter.is_some_and(|f| !f.keeps(g.tag.as_ref()));
+    g.filter = match (rule_hides, g.filter) {
+        (false, _) => GroupFilter::Kept,
+        (true, GroupFilter::Exempt) => GroupFilter::Exempt,
+        (true, _) => GroupFilter::Hidden,
+    };
+    g.hidden |= g.filter == GroupFilter::Hidden;
+}
+
+/// Per-tag summary of one source's categories (all kinds, the source enabled or not) for the
+/// "Choose what to show" picker (DESIGN §28.6). Reads `grp` only (≤ a few thousand rows): run
+/// it off the UI thread (a `Loader`), never per frame.
+pub fn category_summary(conn: &Connection, source: SourceId) -> Result<crate::sources::category_tags::CategorySummary> {
+    let _ = (conn, source);
+    todo!("P6-core")
 }
 
 /// Per group: (display position, hidden, locked).

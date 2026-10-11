@@ -5,6 +5,7 @@
 //! progress, history, reminders) is keyed by [`ItemRef`] = (source, kind, key) so it survives
 //! refreshes and re-numbering (see DESIGN §8 "Identity & reattach").
 
+pub mod category;
 pub mod epg;
 pub mod ids;
 pub mod live;
@@ -13,6 +14,7 @@ pub mod source;
 pub mod user;
 pub mod vod;
 
+pub use category::*;
 pub use epg::*;
 pub use ids::*;
 pub use live::*;

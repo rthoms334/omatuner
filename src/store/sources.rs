@@ -6,8 +6,8 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::error::Result;
 use crate::model::{
-    AccountInfo, EpgSource, EpgSourceId, EpgSourceKind, Source, SourceCounts, SourceDraft, SourceId, SourceKind, SourceSettings, SourceStatus,
-    Timestamp, XtreamCredentials,
+    AccountInfo, CategoryFilter, EpgSource, EpgSourceId, EpgSourceKind, Source, SourceCounts, SourceDraft, SourceId, SourceKind, SourceSettings,
+    SourceStatus, Timestamp, XtreamCredentials,
 };
 use crate::redact::Secret;
 use crate::store::sql::{self, atomic, enum_parse, enum_str, from_json_opt, or_not_found, u32_of};
@@ -321,6 +321,17 @@ pub fn set_source_settings(conn: &Connection, id: SourceId, settings: &SourceSet
     if n == 0 {
         return Err(sql::not_found("source", id));
     }
+    Ok(())
+}
+
+/// Set or clear a source's category filter (DESIGN §28.3): read-modify-write of the settings
+/// JSON inside the writer, so the other settings are untouched. Callers notify
+/// `DataScope::Sources` (the library is rebuilt with the new rule).
+pub fn set_category_filter(conn: &Connection, id: SourceId, filter: Option<&CategoryFilter>) -> Result<()> {
+    let settings: String = or_not_found(conn.query_row("SELECT settings FROM source WHERE id = ?1", [id], |r| r.get(0)), "source", id)?;
+    let mut settings: SourceSettings = from_json_opt(Some(settings)).unwrap_or_default();
+    settings.category_filter = filter.cloned();
+    conn.execute("UPDATE source SET settings = ?2 WHERE id = ?1", params![id, sql::to_json(&settings)?])?;
     Ok(())
 }
 

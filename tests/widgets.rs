@@ -894,6 +894,8 @@ fn data_rows_render_with_real_services() {
         locked: true,
         item_count: 9812,
         provider_id: None,
+        tag: None,
+        filter: Default::default(),
     };
     let ep = Episode {
         id: EpisodeId(1),

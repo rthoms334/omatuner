@@ -9,7 +9,8 @@ use rusqlite::Connection;
 use crate::error::Result;
 
 /// Ordered migration scripts.
-pub const MIGRATIONS: &[(&str, &str)] = &[("0001_init", include_str!("migrations/0001_init.sql"))];
+pub const MIGRATIONS: &[(&str, &str)] =
+    &[("0001_init", include_str!("migrations/0001_init.sql")), ("0002_category_filter", include_str!("migrations/0002_category_filter.sql"))];
 
 /// Current schema version after all migrations.
 pub fn latest_version() -> i64 {

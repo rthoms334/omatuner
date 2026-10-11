@@ -644,6 +644,8 @@ fn synthetic_group(name: String, count: usize) -> Group {
         locked: false,
         item_count: count as u32,
         provider_id: None,
+        tag: None,
+        filter: Default::default(),
     }
 }
 

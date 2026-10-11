@@ -46,7 +46,12 @@ pub struct CatalogueImport {
 pub struct ImportGroup {
     pub kind: ItemKind,
     pub key: GroupKey,
+    /// Display name (smart-cleaned when enabled).
     pub name: String,
+    /// The provider's category name as received (`grp.raw_name`, tag detection; DESIGN §28.2).
+    /// `None` for groups made up by the importer ("Uncategorized", unseen keys): stored as
+    /// `name`, so a NULL `grp.raw_name` only ever means "imported before P6".
+    pub raw_name: Option<String>,
     pub provider_id: Option<String>,
     pub provider_order: i32,
 }
@@ -308,7 +313,7 @@ fn resolve_groups(
                     Some(id) => id,
                     None => {
                         let name = sql::group_norm(&k.0);
-                        let g = ImportGroup { kind, key: k.clone(), name, provider_id: None, provider_order: i32::MAX };
+                        let g = ImportGroup { kind, key: k.clone(), name, raw_name: None, provider_id: None, provider_order: i32::MAX };
                         upsert_group(conn, imp, &g)?.0
                     }
                 };

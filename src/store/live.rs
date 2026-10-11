@@ -114,6 +114,10 @@ pub(crate) fn group_from_row(r: &Row<'_>) -> rusqlite::Result<Group> {
         locked: r.get(9)?,
         item_count: u32_of(r.get(10)?),
         provider_id: r.get(11)?,
+        // P6-core: detected from `g.raw_name` (fallback `g.name`); `filter` from `o.shown` and
+        // the source's rule in `library::load` (DESIGN §28.4)
+        tag: None,
+        filter: crate::model::GroupFilter::Kept,
     })
 }
 

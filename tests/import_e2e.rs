@@ -1149,6 +1149,7 @@ async fn legacy_channels_of_a_kept_playlist_become_movies_and_series_with_their_
                 kind: ItemKind::Movie,
                 key: group_key(ItemKind::Movie, "Adult"),
                 name: "Adult".into(),
+                raw_name: None,
                 provider_id: None,
                 provider_order: 0,
             };

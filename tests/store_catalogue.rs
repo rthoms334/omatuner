@@ -120,7 +120,7 @@ fn run_import(
             for k in keys {
                 if !groups.iter().any(|g| g.kind == kind && &g.key == k) {
                     let name = k.0.split_once(':').unwrap().1.to_owned();
-                    groups.push(ImportGroup { kind, key: k.clone(), name, provider_id: None, provider_order: groups.len() as i32 });
+                    groups.push(ImportGroup { kind, key: k.clone(), name, raw_name: None, provider_id: None, provider_order: groups.len() as i32 });
                 }
             }
         };
