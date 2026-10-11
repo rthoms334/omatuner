@@ -9,10 +9,10 @@
 //!
 //! Rules:
 //! * For each event the first matching binding wins, innermost context first.
-//! * Filterable contexts (`List`, `ListFiltering`, `PosterGrid`, `PosterGridFiltering`,
-//!   `Search`): an unbound printable character (no Ctrl/Alt) becomes [`Action::FilterInput`] —
-//!   the launcher idiom: in filterable lists letters type, so there is NO j/k there; vim keys
-//!   live in the guide grid, the player and settings panels.
+//! * Filterable contexts (`List`, `ListFiltering`, `PosterGrid`, `PosterGridFiltering`, `Checklist`,
+//!   `Search`, `Help`): an unbound printable character (no Ctrl/Alt) becomes
+//!   [`Action::FilterInput`] — the launcher idiom: in filterable lists letters type, so there is
+//!   NO j/k there; vim keys live in the guide grid, the player and settings panels.
 //! * `TextInput` owns the keyboard: after its own table, only Ctrl/Alt chords and F-keys may
 //!   reach `Global`; every other event (Space, ←/→, Delete, Backspace…) returns `None` so the
 //!   focused egui text widget edits text. Contexts below `TextInput` are never consulted.
@@ -71,14 +71,21 @@ pub enum KeyContext {
     /// The video-only player of a popped-out window, stacked right above `PlayerLive` /
     /// `PlayerVod` (Esc pops back in instead of leaving the player).
     PopOut,
+    /// A tick list with type-to-filter ("Choose what to show"), innermost above `Modal`: it
+    /// binds its own navigation and filter keys, so → never activates and Backspace never
+    /// leaves (as `List` would).
+    Checklist,
+    /// The keyboard help overlay: typing filters the shortcuts (Omarchy's keybindings menu).
+    Help,
 }
 
 impl KeyContext {
     /// Every context, in help-overlay / documentation order.
-    pub const ALL: [KeyContext; 17] = [
+    pub const ALL: [KeyContext; 19] = [
         KeyContext::Global,
         KeyContext::List,
         KeyContext::ListFiltering,
+        KeyContext::Checklist,
         KeyContext::PosterGrid,
         KeyContext::PosterGridFiltering,
         KeyContext::Detail,
@@ -93,6 +100,7 @@ impl KeyContext {
         KeyContext::Modal,
         KeyContext::TextInput,
         KeyContext::Panel,
+        KeyContext::Help,
     ];
 
     pub fn title(self) -> &'static str {
@@ -114,6 +122,8 @@ impl KeyContext {
             KeyContext::Modal => "Dialogs & menus",
             KeyContext::TextInput => "Text fields",
             KeyContext::Panel => "Settings",
+            KeyContext::Checklist => "Tick lists",
+            KeyContext::Help => "Keyboard help",
         }
     }
 }
@@ -181,6 +191,15 @@ pub enum Action {
     /// Delete in the EPG mapping screen: clear the manual assignment.
     ClearEpg,
     MarkWatched,
+    /// Space / Insert: mark the focused group for a bulk hide; tick a row of a tick list.
+    ToggleMark,
+    /// Ctrl+A in a tick list: tick all shown rows, or none when all are ticked.
+    MarkAll,
+    /// Ctrl+E in the category picker: just the user's country + English.
+    MarkDefaults,
+    /// Ctrl+Shift+H while a group pane is filtered: hide the provider groups it shows whose
+    /// names have a word starting with each word typed (not every fuzzy match).
+    HideShown,
     /// Delete: remove from a favourites list / cancel a job / forget an orphan / cancel a
     /// reminder (whatever "remove" means for the focused row).
     Remove,
@@ -390,6 +409,10 @@ pub static LIST: &[Binding] = &[
     b(C::key(Key::Escape), A::Back, "Back"),
     b(C::ch('/'), A::OpenSearch, "Search everything"),
     b(C::ch('?'), A::ToggleHelp, "Keyboard help"),
+    // the Text event, never Key::Space: the space is then never also typed into the filter
+    // (and a leading space doesn't filter anyway)
+    b(C::ch(' '), A::ToggleMark, "Mark group (Ctrl+H then hides all marked)"),
+    b(C::key(Key::Insert), A::ToggleMark, "Mark group (Ctrl+H then hides all marked)"),
     // any other printable key starts filtering (FilterInput)
 ];
 
@@ -406,6 +429,9 @@ pub static LIST_FILTERING: &[Binding] = &[
     b(C::key(Key::Escape), A::FilterClear, "Clear filter"),
     b(C::key(Key::Tab), A::FocusNext, "Next / previous pane"),
     b(C::shift(Key::Tab), A::FocusPrev, "Next / previous pane"),
+    // Space types here (filters have spaces); Insert still marks
+    b(C::key(Key::Insert), A::ToggleMark, "Mark group (Ctrl+H then hides all marked)"),
+    b(C::ctrl_shift(Key::H), A::HideShown, "Hide the groups with the words typed"),
     // printable keys → FilterInput
 ];
 
@@ -672,6 +698,28 @@ pub static MODAL: &[Binding] = &[
     b(C::key(Key::Escape), A::Back, "Cancel"),
 ];
 
+/// Tick lists ("Choose what to show"), stacked above `Modal`. Space is bound as the KEY (the
+/// `Modal` below would take it as Confirm); its `Text` twin arrives as `FilterInput(' ')`,
+/// which tick lists ignore (their entries are one word).
+pub static CHECKLIST: &[Binding] = &[
+    b(C::key(Key::ArrowUp), A::Up, "Move"),
+    b(C::key(Key::ArrowDown), A::Down, "Move"),
+    b(C::key(Key::PageUp), A::PageUp, "Page up / down"),
+    b(C::key(Key::PageDown), A::PageDown, "Page up / down"),
+    b(C::key(Key::Home), A::Home, "First / last"),
+    b(C::key(Key::End), A::End, "First / last"),
+    b(C::key(Key::Space), A::ToggleMark, "Tick / untick"),
+    b(C::key(Key::Insert), A::ToggleMark, "Tick / untick"),
+    b(C::ctrl(Key::A), A::MarkAll, "Tick all / none (of the rows shown)"),
+    b(C::ctrl(Key::E), A::MarkDefaults, "Just my country + English"),
+    b(C::key(Key::Enter), A::Activate, "Save"),
+    b(C::key(Key::Backspace), A::FilterBackspace, "Delete character"),
+    b(C::ctrl(Key::Backspace), A::FilterDeleteWord, "Delete word"),
+    b(C::ctrl(Key::U), A::FilterClear, "Clear filter"),
+    b(C::key(Key::Escape), A::Back, "Clear the filter, then cancel"),
+    // any other printable key filters (FilterInput)
+];
+
 pub static TEXT_INPUT: &[Binding] = &[
     b(C::key(Key::Tab), A::FocusNext, "Next / previous field"),
     b(C::shift(Key::Tab), A::FocusPrev, "Next / previous field"),
@@ -702,6 +750,24 @@ pub static PANEL: &[Binding] = &[
     b(C::ch('?'), A::ToggleHelp, "Keyboard help"),
 ];
 
+/// The help overlay. Every printable key types into its filter (`?` too: it closes the overlay
+/// only while the filter is empty), so no letter shortcut can fire while help is open.
+pub static HELP: &[Binding] = &[
+    b(C::key(Key::ArrowUp), A::Up, "Scroll"),
+    b(C::key(Key::ArrowDown), A::Down, "Scroll"),
+    b(C::key(Key::PageUp), A::PageUp, "Page up / down"),
+    b(C::key(Key::PageDown), A::PageDown, "Page up / down"),
+    b(C::key(Key::Home), A::Home, "Top / bottom"),
+    b(C::key(Key::End), A::End, "Top / bottom"),
+    b(C::key(Key::Backspace), A::FilterBackspace, "Delete character"),
+    b(C::ctrl(Key::Backspace), A::FilterDeleteWord, "Delete word"),
+    b(C::ctrl(Key::U), A::FilterClear, "Clear filter"),
+    b(C::key(Key::Escape), A::Back, "Clear the filter, then close"),
+    b(C::key(Key::F1), A::ToggleHelp, "Clear the filter, then close"),
+    b(C::ch('?'), A::FilterInput('?'), "Close (types ? while filtering)"),
+    b(C::key(Key::Enter), A::Activate, "Close"),
+];
+
 /// The bindings of one context, in priority order (context-specific first).
 pub fn tables(ctx: KeyContext) -> Vec<&'static [Binding]> {
     match ctx {
@@ -722,12 +788,23 @@ pub fn tables(ctx: KeyContext) -> Vec<&'static [Binding]> {
         KeyContext::Modal => vec![MODAL],
         KeyContext::TextInput => vec![TEXT_INPUT],
         KeyContext::Panel => vec![PANEL],
+        KeyContext::Checklist => vec![CHECKLIST],
+        KeyContext::Help => vec![HELP],
     }
 }
 
 /// Contexts whose unbound printable characters become `FilterInput`.
 pub fn is_filtering(ctx: KeyContext) -> bool {
-    matches!(ctx, KeyContext::List | KeyContext::ListFiltering | KeyContext::PosterGrid | KeyContext::PosterGridFiltering | KeyContext::Search)
+    matches!(
+        ctx,
+        KeyContext::List
+            | KeyContext::ListFiltering
+            | KeyContext::PosterGrid
+            | KeyContext::PosterGridFiltering
+            | KeyContext::Search
+            | KeyContext::Checklist
+            | KeyContext::Help
+    )
 }
 
 fn find(tables: &[&'static [Binding]], ev: &egui::Event) -> Option<Action> {
@@ -839,6 +916,8 @@ const HINTS: &[(KeyContext, &[(Action, &str)])] = &[
     (KeyContext::Search, &[(A::Activate, "open"), (A::ActivateAlt, "details"), (A::FocusNext, "section"), (A::Back, "close")]),
     (KeyContext::TextInput, &[(A::Activate, "confirm"), (A::FocusNext, "next field"), (A::Back, "leave")]),
     (KeyContext::Modal, &[(A::Activate, "confirm"), (A::Back, "cancel")]),
+    (KeyContext::Checklist, &[(A::ToggleMark, "tick"), (A::MarkAll, "all/none"), (A::MarkDefaults, "my country"), (A::Activate, "save")]),
+    (KeyContext::Help, &[(A::Back, "clear / close"), (A::FilterClear, "clear filter")]),
 ];
 
 /// Hints of a filtering list inside a dialog or menu (Esc clears the filter there).
@@ -1017,6 +1096,22 @@ mod tests {
                 assert_eq!(resolve(stack, &event_of(chord)), Some(action), "{stack:?}: “{} {verb}”", chord.label());
             }
         }
+    }
+
+    /// Help filters as you type: every printable key (`?`, `/`, j/k, digits) goes to the filter,
+    /// so no letter shortcut of the screen below or of a list can fire while help is open.
+    #[test]
+    fn help_types_every_printable_key() {
+        for c in ' '..='~' {
+            assert_eq!(resolve(&[K::Help], &egui::Event::Text(c.to_string())), Some(Action::FilterInput(c)), "{c:?}");
+        }
+        assert_eq!(resolve(&[K::Help], &egui::Event::Text("é".into())), Some(Action::FilterInput('é')));
+        assert_eq!(resolve(&[K::Help], &key(Key::Backspace, false)), Some(Action::FilterBackspace));
+        assert_eq!(resolve(&[K::Help], &key(Key::Backspace, true)), Some(Action::FilterDeleteWord));
+        assert_eq!(resolve(&[K::Help], &key(Key::U, true)), Some(Action::FilterClear));
+        assert_eq!(resolve(&[K::Help], &key(Key::Escape, false)), Some(Action::Back));
+        assert_eq!(resolve(&[K::Help], &key(Key::F1, false)), Some(Action::ToggleHelp));
+        assert_eq!(resolve(&[K::Help], &key(Key::Q, true)), Some(Action::Quit), "globals keep working");
     }
 
     #[test]

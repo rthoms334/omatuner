@@ -15,8 +15,8 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::error::{Error, Result};
 use crate::model::{
-    FavListId, FavouriteEntry, FavouriteList, Fingerprint, GroupKey, GroupOverride, GroupOverrideRow, HistoryEntry, ItemKey, ItemKind, ItemOverride,
-    ItemOverrideRow, ItemRef, Reminder, ReminderId, ReminderState, SourceId, Timestamp, WatchProgress,
+    FavListId, FavouriteEntry, FavouriteList, Fingerprint, GroupKey, GroupOverride, GroupOverrideRow, GroupRef, HistoryEntry, ItemKey, ItemKind,
+    ItemOverride, ItemOverrideRow, ItemRef, Reminder, ReminderId, ReminderState, SourceId, Timestamp, WatchProgress,
 };
 use crate::store::sql::{self, atomic, enum_parse, enum_str, fp_from_json, fp_opt, group_norm, kind_from_sql, or_not_found};
 
@@ -306,18 +306,59 @@ pub fn set_group_override(conn: &Connection, source: SourceId, kind: ItemKind, k
         return Ok(());
     }
     conn.execute(
-        "INSERT INTO group_override(source_id, kind, group_key, rename, hidden, locked, user_order, pinned_home)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "INSERT INTO group_override(source_id, kind, group_key, rename, hidden, locked, user_order, pinned_home, shown)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(source_id, kind, group_key) DO UPDATE SET rename = excluded.rename, hidden = excluded.hidden,
-           locked = excluded.locked, user_order = excluded.user_order, pinned_home = excluded.pinned_home",
-        params![source, kind.as_str(), key.0, ov.rename, ov.hidden, ov.locked, ov.user_order, ov.pinned_home],
+           locked = excluded.locked, user_order = excluded.user_order, pinned_home = excluded.pinned_home, shown = excluded.shown",
+        params![source, kind.as_str(), key.0, ov.rename, ov.hidden, ov.locked, ov.user_order, ov.pinned_home, ov.shown],
     )?;
     Ok(())
 }
 
+/// One group's override (default when it has none).
+fn group_override_of(conn: &Connection, g: &GroupRef) -> Result<GroupOverride> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT rename, hidden, locked, user_order, pinned_home, shown FROM group_override
+             WHERE source_id = ?1 AND kind = ?2 AND group_key = ?3",
+        )?
+        .query_row(params![g.source, g.kind.as_str(), g.key.0], |r| {
+            Ok(GroupOverride {
+                rename: r.get(0)?,
+                hidden: r.get(1)?,
+                locked: r.get(2)?,
+                user_order: r.get(3)?,
+                pinned_home: r.get(4)?,
+                shown: r.get(5)?,
+            })
+        })
+        .optional()?
+        .unwrap_or_default())
+}
+
+/// Hide groups in one transaction (Ctrl+H on one or several marked groups, "Hide these N
+/// groups"; DESIGN §28.7): sets `hidden`, clears `shown`, keeps the rest of each override.
+pub fn hide_groups(conn: &Connection, groups: &[GroupRef]) -> Result<()> {
+    atomic(conn, |c| {
+        for g in groups {
+            let ov = GroupOverride { hidden: true, shown: false, ..group_override_of(c, g)? };
+            set_group_override(c, g.source, g.kind, &g.key, &ov)?;
+        }
+        Ok(())
+    })
+}
+
+/// Show one group again (Settings ▸ Hidden; DESIGN §28.5): clears `hidden` and sets `shown`
+/// to `exempt` — true when the source's category filter hides the group (`GroupFilter::Hidden`
+/// or `Exempt`), so the user's choice beats the rule.
+pub fn show_group(conn: &Connection, g: &GroupRef, exempt: bool) -> Result<()> {
+    let ov = GroupOverride { hidden: false, shown: exempt, ..group_override_of(conn, g)? };
+    set_group_override(conn, g.source, g.kind, &g.key, &ov)
+}
+
 pub fn group_overrides(conn: &Connection) -> Result<Vec<GroupOverrideRow>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT source_id, kind, group_key, rename, hidden, locked, user_order, pinned_home FROM group_override
+        "SELECT source_id, kind, group_key, rename, hidden, locked, user_order, pinned_home, shown FROM group_override
          ORDER BY source_id, kind, group_key",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -325,7 +366,14 @@ pub fn group_overrides(conn: &Connection) -> Result<Vec<GroupOverrideRow>> {
             source: r.get(0)?,
             kind: kind_from_sql(&r.get::<_, String>(1)?)?,
             key: GroupKey(r.get(2)?),
-            ov: GroupOverride { rename: r.get(3)?, hidden: r.get(4)?, locked: r.get(5)?, user_order: r.get(6)?, pinned_home: r.get(7)? },
+            ov: GroupOverride {
+                rename: r.get(3)?,
+                hidden: r.get(4)?,
+                locked: r.get(5)?,
+                user_order: r.get(6)?,
+                pinned_home: r.get(7)?,
+                shown: r.get(8)?,
+            },
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)

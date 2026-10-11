@@ -629,3 +629,85 @@ These items use the **default** profile: start Tuner from the launcher, not with
 - [ ] **Login refused:** use a playlist whose panel rejects the API login. **Expect:** it stays
   M3U with movies and series sorted out of the playlist, and the next automatic check is a week
   later (*Refresh now* in its editor retries at once).
+
+## 14. Countries and languages (category filter) and bulk hide (real provider)
+
+Use a real Xtream account whose categories cover many countries (≈ 60 tags: "UK | …", "|DE| …",
+"AR: …", "EX-YU …", "4K | …", "VIP | UK | …"), with the time zone set to Europe/London.
+
+- [ ] **Onboarding defaults:**
+  - **Do:** fresh profile; add the Xtream account. When **Open Live TV** turns on, press Enter
+    at once, then look at the **Choose what to show** step.
+  - **Expect:**
+    - The immediate Enter does not save (the step ignores Enter for its first moment).
+    - Ticked: UK, English and the other English-speaking countries present (US, CA, AU, IE, NZ),
+      and **No country tag**; everything else unticked. "N of M ticked · X of Y channels" is
+      right. Rows read "UK · United Kingdom", not "GB".
+    - Movie and series categories join the counts while they import, without the list jumping.
+    - "4K | Sports", "BT Sport", "FA Cup", "Premier League"-style categories are under **No
+      country tag**; `UK-…`, `UK.…`, `[🇬🇧] …`, `EX YU …` sit under the right tag.
+    - Enter saves; Live TV, the guide, Movies, Series, Home rails, search (Ctrl+K) and zapping
+      (↑/↓ in the player) show nothing from unticked countries; group and channel counts match.
+- [ ] **Picker keys:** in Settings ▸ Playlists ▸ (playlist) ▸ *Countries & languages…*: type
+  "fr" to filter, Space ticks, Ctrl+A all / none of the rows shown, Ctrl+E back to the defaults,
+  Esc clears the filter then cancels. Untick everything + Enter: the warning line, and only a
+  second Enter saves. Tick everything + Enter: the rule is removed (everything shows).
+- [ ] **New categories after a refresh stay hidden:**
+  - **Do:** keep the defaults. Wait for the provider to add categories (or use a panel where
+    you can add "DE | New Test" and "NZ | New Test"), then Ctrl+R.
+  - **Expect:** "DE | New Test" never appears; "NZ | New Test" does (NZ is in the defaults even
+    when the playlist didn't have it). The picker marks newly seen tags *new*.
+- [ ] **Exceptions and Settings ▸ Hidden:**
+  - **Expect:** Settings ▸ Hidden lists each hidden tag with its counts. Enter on "Arabic" shows
+    all Arabic categories again (toast "Arabic shown"). → expands a tag (down chevron); Enter on
+    one category shows just that one, and it stays shown after a refresh. Ctrl+H on a kept
+    group hides it and it is listed under *Hidden groups*.
+- [ ] **Playlist added before this version:** with a profile from v0.1.0-rc3, open the picker.
+  **Expect:** the note "… refresh to find them all (Ctrl+R)"; Ctrl+R refreshes and the note
+  goes away, and most categories now have tags.
+- [ ] **Bulk hide (Live groups):**
+  - **Do:** Space on three groups (check marks, footer "3 marked · Ctrl+H hides · Esc clears"),
+    Ctrl+H. Then type "ar" and press Ctrl+Shift+H.
+  - **Expect:** the three groups go in one step with "Hid 3 groups · Settings ▸ Hidden items shows
+    them again". The footer reads "N groups with “ar” · Ctrl+Shift+H hides them"; the confirm
+    names the first five; "AR | …" and "Arabic …" groups go, "Cartoons" and "Documentary" stay.
+    Choosing a menu item with Space never marks the group behind the menu.
+- [ ] **Bulk hide (Movies / Series):** the same with categories. **Expect:** the toast, confirm
+  and footer say "categories".
+- [ ] **Badges:** with smart names on, "UK | Sports" and "US | Sports" read "Sports" with a
+  muted UK / US badge; with smart names off, "|UK| Sports" has no extra badge.
+
+## 15. Quality badges (real provider)
+
+Use a provider that lists the same channel several times in different qualities (e.g.
+"UK: BBC One SD / HD / FHD / 4K", often also "ᴴᴰ" or "1080p" names), at **Wide** and **Tiled**,
+**text 12** and **text 16**.
+
+- [ ] **Duplicates show distinct badges:**
+  - **Do:** after this build's first start (the migration fills the badges of the existing
+    library without a refresh), open the group with the duplicates in Live TV, the guide, Search
+    (`/` + the channel name), the player's channel list (`c`) and mini guide (`g`), and a Home
+    favourites rail holding two of them.
+  - **Expect:**
+    - Each copy shows its badge (SD, HD, FHD, 4K) right after the same name, in the muted badge
+      look (monospace, thin border), never clipped. A channel with no quality word has none.
+    - The copies are listed best first (4K, FHD, HD, SD) in their group; other channels keep
+      the provider's order (also "2160p" / "576p" names). ↑/↓ in the player zaps in that order,
+      and the zap banner shows the badge of the copy it tunes to until the picture comes up
+      (then only the decoded badge on the right, no second "FHD").
+    - In a narrow list (Home tiles, the guide column at Tiled, the player's list) a long name
+      gets the ellipsis and the badge stays; only in a very narrow cell does the name keep the
+      room. Radio channels have no badge.
+- [ ] **The measured value replaces a wrong name tag after playback:**
+  - **Do:** play a copy whose name claims more than it delivers (a "4K" that plays at 1080p;
+    stream info, `I`, shows the real size), and a channel without a quality word.
+    Leave the player and look at their rows; then restart Tuner and refresh the playlist.
+  - **Expect:** as soon as each plays, its badge shows the real class (FHD for the 1080p "4K";
+    SD/HD/FHD for the untagged one) in every list, and it stays so after the restart and the
+    refresh. A 1440p stream reads FHD. If the provider reorders its copies (or adds one), each
+    copy keeps its own measured badge after the next refresh; a copy the provider renames
+    ("HD" → "FHD") shows its new name's badge until it plays again.
+- [ ] **Setting:**
+  - **Do:** Settings ▸ Interface ▸ Quality badges off, then on.
+  - **Expect:** the badges disappear from every list at once and come back; the Live preview
+    and the player OSD still show the stream's quality.

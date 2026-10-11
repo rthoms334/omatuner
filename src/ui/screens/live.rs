@@ -29,16 +29,17 @@ use crate::model::{
 };
 use crate::msg::{AppEvent, DataScope, Toast};
 use crate::player::{PlayRequest, PlayerCommand, PlayerEvent, PlayerSnapshot, PlayerState};
-use crate::sources::smart_names::Quality;
 use crate::store::library::FavIndex;
 use crate::theme::{SpaceToken, Theme, TypeToken};
 use crate::ui::epg_grid::{hhmm, time_left, time_range};
 use crate::ui::overlays::{ConfirmSpec, ContextMenuSpec, ListPickerSpec, MenuItem, OverlayResult, RenameSpec, RenameTarget};
 use crate::ui::video_host::Placement;
 use crate::ui::widgets::list::{ListOutcome, ListState, virtual_list};
-use crate::ui::widgets::rows::{ChannelRowOpts, channel_row, group_row, grouped, menu_row, row_height};
+use crate::ui::widgets::rows::{ChannelRowOpts, GroupDecor, channel_row, group_row_decor, grouped, menu_row, row_height};
 use crate::ui::widgets::{RowState, badge, empty_state::empty_state, glyphs, logo, progress, section, text_field};
 use crate::ui::{LayoutClass, OverlayRequest, Route, Screen, ScreenId, SettingsPage, UiCtx};
+
+use super::group_marks::{self, GroupMarks};
 
 // ====================================================================== shared helpers
 
@@ -323,23 +324,6 @@ pub(crate) fn assign_epg(ctx: &mut UiCtx<'_>, guide: &mut GuideStatus, channel: 
     }
 }
 
-/// The quality badge of a channel: from the decoded video when it plays, else from its
-/// provider name ("BBC One HD", "ESPN 4K", smart names keep the word in the raw name).
-pub(crate) fn quality_label(video_size: Option<(i64, i64)>, name: Option<Quality>) -> Option<&'static str> {
-    if let Some((_, h)) = video_size {
-        return Some(match h {
-            h if h >= 2000 => "4K",
-            h if h >= 700 => "HD",
-            _ => "SD",
-        });
-    }
-    name.map(|q| match q {
-        Quality::Uhd => "4K",
-        Quality::Fhd | Quality::Hd => "HD",
-        Quality::Sd => "SD",
-    })
-}
-
 /// "3 h ago" / "2 d ago" (the status bar's freshness wording).
 pub(crate) fn age_label(now: Timestamp, at: Timestamp) -> String {
     let age = (now - at).max(0);
@@ -504,6 +488,12 @@ struct GroupItem {
     group: Group,
     /// Filter haystack.
     name: String,
+    /// Short code of the group's country / language tag, when its playlist has several and
+    /// the name doesn't show it already.
+    tag: Option<String>,
+    /// What "Hide these N groups" matches words against: the name and the tag's code
+    /// (provider groups only).
+    words: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -519,6 +509,10 @@ enum Menu {
     Context,
     Sort,
 }
+
+/// The groups menu's "Countries & languages…" (echoed back as `Action::Digit`; channel numbers
+/// never come from a menu).
+const MENU_COUNTRIES: u8 = 200;
 
 /// Detail line of the "No playlists yet" empty state (Live and the guide).
 pub(crate) const EMPTY_LIBRARY_DETAIL: &str = "Add an M3U playlist or an Xtream login to start watching — press Enter.";
@@ -547,8 +541,6 @@ pub struct LiveScreen {
     /// The Reminders group lists one row per reminder: `reminders` index of each `channels`
     /// entry while it is open.
     reminder_rows: Vec<usize>,
-    /// Quality word of the cursor channel's provider name (one point read per channel).
-    quality: Option<(ChannelId, Option<Quality>)>,
     focus: Pane,
     /// Medium: the groups drawer is open; Compact: the groups list is shown.
     drawer: bool,
@@ -572,6 +564,11 @@ pub struct LiveScreen {
     /// Delete-list confirmation token → list.
     confirm: Option<(u64, FavListId)>,
     layout: Option<LayoutClass>,
+    /// Groups marked for a bulk hide (DESIGN §28.7).
+    marks: GroupMarks,
+    /// Indices into `groups` of the provider groups the filter shows whose names have the
+    /// words typed: what "Hide these N groups" hides.
+    matching: Vec<u32>,
 }
 
 /// Channel management shared by Live and the Guide: favourite, lists, hide, rename, lock (the
@@ -641,9 +638,12 @@ fn synthetic_group(name: String, count: usize) -> Group {
         provider_order: 0,
         user_order: None,
         hidden: false,
+        user_hidden: false,
         locked: false,
         item_count: count as u32,
         provider_id: None,
+        tag: None,
+        filter: Default::default(),
     }
 }
 
@@ -723,17 +723,42 @@ impl LiveScreen {
         if !ctx.lib.is_empty() || !live.channels.is_empty() {
             for l in &ctx.favs.lists {
                 let name = format!("{} {}", glyphs::FAVOURITE, l.name);
-                v.push(GroupItem { entry: Entry::FavList(l.id), group: synthetic_group(name.clone(), ctx.favs.items(l.id).len()), name });
+                v.push(GroupItem {
+                    entry: Entry::FavList(l.id),
+                    group: synthetic_group(name.clone(), ctx.favs.items(l.id).len()),
+                    name,
+                    tag: None,
+                    words: String::new(),
+                });
             }
             let name = format!("{} History", glyphs::HISTORY);
-            v.push(GroupItem { entry: Entry::History, group: synthetic_group(name.clone(), ctx.lib.recent_channels.len()), name });
+            v.push(GroupItem {
+                entry: Entry::History,
+                group: synthetic_group(name.clone(), ctx.lib.recent_channels.len()),
+                name,
+                tag: None,
+                words: String::new(),
+            });
             if !self.reminders.is_empty() {
                 let name = format!("{} Reminders", glyphs::REMINDER);
-                v.push(GroupItem { entry: Entry::Reminders, group: synthetic_group(name.clone(), self.reminders.len()), name });
+                v.push(GroupItem {
+                    entry: Entry::Reminders,
+                    group: synthetic_group(name.clone(), self.reminders.len()),
+                    name,
+                    tag: None,
+                    words: String::new(),
+                });
             }
             let visible = live.channels.len().saturating_sub(live.hidden.len());
-            v.push(GroupItem { entry: Entry::All, group: synthetic_group("All channels".into(), visible), name: "All channels".into() });
+            v.push(GroupItem {
+                entry: Entry::All,
+                group: synthetic_group("All channels".into(), visible),
+                name: "All channels".into(),
+                tag: None,
+                words: String::new(),
+            });
             let multi = ctx.lib.sources.len() > 1;
+            let tagged = crate::ui::overlays::categories::multi_tag_sources(ctx.lib);
             for g in live.visible_groups(None, ctx.config.interface.hide_empty_groups) {
                 let mut group = g.clone();
                 group.item_count = live.group_members(g.id).len() as u32;
@@ -742,10 +767,22 @@ impl LiveScreen {
                     name = format!("{name} · {}", s.name);
                     group.rename = Some(name.clone());
                 }
-                v.push(GroupItem { entry: Entry::Group(g.id), group, name });
+                let code = g.tag.as_ref().filter(|_| tagged.contains(&g.source_id)).map(crate::sources::category_tags::tag_short);
+                // the code filters too ("uk" finds the UK groups smart names renamed to "Sports")
+                let words = match &code {
+                    Some(code) => {
+                        name = format!("{name} {code}");
+                        format!("{} {code}", g.display_name())
+                    }
+                    None => g.display_name().to_owned(),
+                };
+                let tag = code.filter(|c| !group_marks::has_words(g.display_name(), c));
+                v.push(GroupItem { entry: Entry::Group(g.id), group, name, tag, words });
             }
         }
         self.groups = v;
+        let listed: HashSet<GroupId> = self.groups.iter().filter_map(|g| if let Entry::Group(id) = g.entry { Some(id) } else { None }).collect();
+        self.marks.retain(|id| listed.contains(&id));
         self.refilter_groups();
         // the cursor stays on its group (a reorder moves it)
         if let Some(i) = keep.and_then(|e| self.group_rows.iter().position(|&r| self.groups.get(r as usize).is_some_and(|g| g.entry == e))) {
@@ -756,6 +793,17 @@ impl LiveScreen {
     fn refilter_groups(&mut self) {
         self.group_rows = self.group_list.filter.apply(self.groups.iter().map(|g| g.name.as_str()));
         self.group_list.set_len(self.group_rows.len());
+        let q = self.group_list.filter.query();
+        self.matching = if q.is_empty() {
+            Vec::new()
+        } else {
+            let groups = &self.groups;
+            self.group_rows
+                .iter()
+                .copied()
+                .filter(|&r| groups.get(r as usize).is_some_and(|g| matches!(g.entry, Entry::Group(_)) && group_marks::word_match(q, &g.words)))
+                .collect()
+        };
     }
 
     /// Channels of the open group (sorted like the zap order) + filter haystacks.
@@ -833,6 +881,12 @@ impl LiveScreen {
 
     fn cursor_group(&self) -> Option<&GroupItem> {
         self.group_rows.get(self.group_list.cursor).and_then(|&i| self.groups.get(i as usize))
+    }
+
+    /// The provider group under the groups cursor (as the library has it).
+    fn cursor_provider_group(&self, ctx: &UiCtx<'_>) -> Option<Group> {
+        let Some(Entry::Group(id)) = self.cursor_group().map(|g| &g.entry) else { return None };
+        ctx.lib.live.groups.iter().find(|x| x.id == *id).cloned()
     }
 
     /// Open a group: list its channels, cursor on the first.
@@ -942,9 +996,29 @@ impl LiveScreen {
                     true
                 }
                 Action::ToggleHidden => {
-                    if let Some(name) = self.group_override(ctx, |o| o.hidden = !o.hidden) {
-                        ctx.toast(Toast::info(format!("Hid “{name}” — Settings ▸ Hidden items brings it back")));
+                    // the marked groups, else the focused one
+                    if !self.marks.hide_marked(ctx)
+                        && let Some(g) = self.cursor_provider_group(ctx)
+                    {
+                        group_marks::hide(ctx, group_marks::Noun::Group, vec![crate::model::GroupRef::from(&g)], Some(g.display_name()));
                     }
+                    true
+                }
+                Action::ToggleMark => {
+                    match self.cursor_provider_group(ctx) {
+                        Some(g) => {
+                            self.marks.toggle(&g);
+                            self.group_list.handle(Action::Down);
+                        }
+                        None if self.cursor_group().is_some() => ctx.toast(Toast::info("Only playlist groups can be marked")),
+                        None => {}
+                    }
+                    true
+                }
+                Action::HideShown => {
+                    // the row's group carries the source, kind and key the hide needs
+                    let shown: Vec<&Group> = self.matching.iter().filter_map(|&r| self.groups.get(r as usize)).map(|g| &g.group).collect();
+                    self.marks.hide_shown(ctx, self.group_list.filter.query(), &shown);
                     true
                 }
                 Action::ToggleLock => {
@@ -1004,13 +1078,37 @@ impl LiveScreen {
                     menu_item(glyphs::REORDER, "Move down", Action::MoveDown, true, k),
                 ]
             }
-            Entry::Group(_) => vec![
-                menu_item(glyphs::TAG, "Rename group", Action::Rename, true, k),
-                menu_item(glyphs::HIDDEN, "Hide group", Action::ToggleHidden, true, k),
-                menu_item(glyphs::LOCK, if g.group.locked { "Unlock group" } else { "Lock group" }, Action::ToggleLock, true, k),
-                menu_item(glyphs::REORDER, "Move up", Action::MoveUp, true, k),
-                menu_item(glyphs::REORDER, "Move down", Action::MoveDown, true, k),
-            ],
+            Entry::Group(id) => {
+                let mut v = vec![
+                    menu_item(glyphs::TAG, "Rename group", Action::Rename, true, k),
+                    if self.marks.is_empty() {
+                        menu_item(glyphs::HIDDEN, "Hide group", Action::ToggleHidden, true, k)
+                    } else {
+                        menu_item(glyphs::HIDDEN, "Hide the marked groups", Action::ToggleHidden, true, k)
+                    },
+                    menu_item(glyphs::CHECK, if self.marks.is_marked(*id) { "Unmark" } else { "Mark for hiding" }, Action::ToggleMark, true, k),
+                ];
+                if self.group_list.filter.is_active() {
+                    let n = self.matching.len();
+                    v.push(menu_item(glyphs::HIDDEN, format!("Hide these {n} groups"), Action::HideShown, n > 0, KeyContext::ListFiltering));
+                }
+                // the category filter of the group's playlist (DESIGN §28.6)
+                if crate::ui::overlays::categories::multi_tag_sources(ctx.lib).contains(&g.group.source_id) {
+                    v.push(MenuItem {
+                        icon: glyphs::EARTH,
+                        label: "Countries & languages…".into(),
+                        action: Action::Digit(MENU_COUNTRIES),
+                        enabled: true,
+                        shortcut: None,
+                    });
+                }
+                v.extend([
+                    menu_item(glyphs::LOCK, if g.group.locked { "Unlock group" } else { "Lock group" }, Action::ToggleLock, true, k),
+                    menu_item(glyphs::REORDER, "Move up", Action::MoveUp, true, k),
+                    menu_item(glyphs::REORDER, "Move down", Action::MoveDown, true, k),
+                ]);
+                v
+            }
             _ => return,
         };
         let title = g.group.display_name().to_owned();
@@ -1358,23 +1456,28 @@ impl LiveScreen {
         let row_h = row_height(theme, ctx.config.interface.density, false);
         let open = self.open_index();
         let virtual_count = self.groups.iter().take_while(|g| !matches!(g.entry, Entry::Group(_))).count();
-        let (groups, rows) = (&self.groups, &self.group_rows);
+        let footer = self.marks.footer(self.group_list.filter.query(), self.matching.len());
+        let (groups, rows, marks) = (&self.groups, &self.group_rows, &self.marks);
         let mut clicked = None;
-        let out = virtual_list(ui, theme, "live-groups", &mut self.group_list, row_h, |ui, rc| {
-            let gi = rows[rc.index] as usize;
-            let g = &groups[gi];
-            let state = RowState::from_flags(focused && rc.state.is_cursor(), open == Some(gi));
-            let resp = group_row(ui, theme, &g.group, state);
-            if gi + 1 == virtual_count {
-                let r = resp.rect;
-                ui.painter().hline(r.x_range(), r.bottom() - 0.5, egui::Stroke::new(1.0, theme.tokens.group_divider));
-            }
-            // the list reports `Moved` only when the cursor wasn't there yet, and a hover with
-            // real pointer motion has already put it there before the click
-            if resp.clicked() {
-                clicked = Some(rc.index);
-            }
-            resp
+        let list = &mut self.group_list;
+        let out = group_marks::with_footer(ui, theme, footer.as_deref(), |ui| {
+            virtual_list(ui, theme, "live-groups", list, row_h, |ui, rc| {
+                let gi = rows[rc.index] as usize;
+                let g = &groups[gi];
+                let state = RowState::from_flags(focused && rc.state.is_cursor(), open == Some(gi));
+                let marked = matches!(g.entry, Entry::Group(id) if marks.is_marked(id));
+                let resp = group_row_decor(ui, theme, &g.group, state, GroupDecor { marked, tag: g.tag.as_deref() });
+                if gi + 1 == virtual_count {
+                    let r = resp.rect;
+                    ui.painter().hline(r.x_range(), r.bottom() - 0.5, egui::Stroke::new(1.0, theme.tokens.group_divider));
+                }
+                // the list reports `Moved` only when the cursor wasn't there yet, and a hover
+                // with real pointer motion has already put it there before the click
+                if resp.clicked() {
+                    clicked = Some(rc.index);
+                }
+                resp
+            })
         });
         if let Some(i) = clicked.filter(|_| !matches!(out, ListOutcome::ContextMenu(_))) {
             // a click (not a hover) focuses the pane and opens the group
@@ -1455,6 +1558,7 @@ impl LiveScreen {
                 favourite: ctx.favs.is_fav(&item),
                 failed: failed.contains(&item),
                 playing: playing == Some(id),
+                quality: ctx.quality(ch),
                 ..opts
             };
             let state = if focused {
@@ -1578,8 +1682,8 @@ impl LiveScreen {
         ui.add_space(theme.space(SpaceToken::Lg));
         let Some(ch) = cursor.and_then(|id| ctx.lib.live.get(id).cloned()) else { return };
         let h24 = ctx.config.interface.clock_24h;
-        let playing_here = playing_channel(&snap) == Some(ch.id);
-        let quality = quality_label(snap.video_size.filter(|_| playing_here), self.name_quality(ctx, ch.id));
+        // the preview always says it (stream info, like the player's OSD), whatever the list setting
+        let quality = ctx.measured.get(&ch).or(ch.quality);
         // name · number + badges
         ui.horizontal_wrapped(|ui| {
             let size = (theme.font(TypeToken::Heading) * 1.6).round();
@@ -1590,7 +1694,7 @@ impl LiveScreen {
             }
             ui.label(egui::RichText::new(title).size(theme.font(TypeToken::Heading)).color(t.fg));
             if let Some(q) = quality {
-                badge::badge(ui, theme, q, t.fg);
+                badge::quality_badge(ui, theme, q, t.fg);
             }
             if ch.has_catchup && ch.catchup_days > 0 {
                 badge::badge(ui, theme, &format!("{} {} d", glyphs::CATCHUP, ch.catchup_days), t.fg);
@@ -1682,18 +1786,6 @@ impl LiveScreen {
         }
     }
 
-    /// The quality word in the provider name of `id` (one indexed point read inside the frame
-    /// budget, kept while the cursor stays on the channel).
-    fn name_quality(&mut self, ctx: &mut UiCtx<'_>, id: ChannelId) -> Option<Quality> {
-        if self.quality.is_none_or(|(c, _)| c != id) {
-            let db = ctx.db;
-            let raw = ctx.budget.run(|| crate::store::live::channel(db, id))?;
-            let q = raw.ok().and_then(|c| crate::sources::smart_names::clean_channel_name(&c.name).quality);
-            self.quality = Some((id, q));
-        }
-        self.quality.and_then(|(_, q)| q)
-    }
-
     /// Opt-in preview autoplay after the keyboard cursor rested.
     fn autoplay(&mut self, ctx: &mut UiCtx<'_>, ui: &egui::Ui) {
         let Some((ch, at)) = self.rest else { return };
@@ -1782,6 +1874,10 @@ impl Screen for LiveScreen {
         if self.layout == Some(LayoutClass::Wide) && self.drawer {
             self.drawer = false;
         }
+        // Esc ladder: the marks go first
+        if action == Action::Back && self.marks.clear() {
+            return true;
+        }
         match self.focus {
             Pane::Groups => self.groups_action(ctx, action),
             Pane::Channels => self.channels_action(ctx, action),
@@ -1867,10 +1963,19 @@ impl Screen for LiveScreen {
                         ctx.edit_config(move |c| c.interface.live_sort = mode);
                     }
                 }
+                Some(Menu::Context) if action == Action::Digit(MENU_COUNTRIES) => {
+                    if let Some(g) = self.cursor_provider_group(ctx) {
+                        ctx.open(OverlayRequest::Categories(g.source_id));
+                    }
+                }
                 _ => {
                     self.on_action(ctx, action);
                 }
             },
+            OverlayResult::Confirmed(token) if self.marks.confirmed(ctx, token) => {
+                self.group_list.filter.clear();
+                self.refilter_groups();
+            }
             OverlayResult::Confirmed(token) => {
                 if let Some((_, list)) = self.confirm.take().filter(|(t, _)| *t == token) {
                     let _ = ctx.services.store.writer().submit_notify(DataScope::Favourites, move |c| crate::store::user::delete_fav_list(c, list));
@@ -1879,7 +1984,10 @@ impl Screen for LiveScreen {
                     }
                 }
             }
-            OverlayResult::Cancelled(_) => self.confirm = None,
+            OverlayResult::Cancelled(token) => {
+                self.marks.cancelled(token);
+                self.confirm = None;
+            }
         }
     }
 }

@@ -584,7 +584,7 @@ fn help_and_jobs_overlays() {
     assert_eq!(h.state_mut().act(Action::Down), "Keep");
     assert_eq!(h.state_mut().act(Action::Quit), "Ignored", "globals keep working");
     assert_eq!(h.state_mut().act(Action::ToggleHelp), "Close");
-    assert_eq!(h.state().ov.key_contexts(), vec![KeyContext::Panel]);
+    assert_eq!(h.state().ov.key_contexts(), vec![KeyContext::Help]);
 
     // jobs: nothing running, the logged failure listed, Enter expands it, Ctrl+J closes
     let t = h.into_state().t;
@@ -871,6 +871,8 @@ fn data_rows_render_with_real_services() {
         provider_order: 0,
         user_order: None,
         added_at: None,
+        quality: None,
+        family: 0,
     };
     let prog = |id, title: &str, start, stop| ProgrammeSlim {
         id: ProgrammeId(id),
@@ -891,9 +893,12 @@ fn data_rows_render_with_real_services() {
         provider_order: 0,
         user_order: None,
         hidden: false,
+        user_hidden: false,
         locked: true,
         item_count: 9812,
         provider_id: None,
+        tag: None,
+        filter: Default::default(),
     };
     let ep = Episode {
         id: EpisodeId(1),

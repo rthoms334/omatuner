@@ -28,15 +28,9 @@
 // Implemented: opt back into the lints that `lib.rs` silences for the still-stubbed `sources`.
 #![warn(dead_code, unused_variables, unused_imports)]
 
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Quality {
-    Sd,
-    Hd,
-    Fhd,
-    Uhd,
-}
+/// The quality word of a name is the channel's name-derived badge (stored at import,
+/// `channel.quality`); the type lives in the model next to the measured one.
+pub use crate::model::Quality;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CleanName {
@@ -96,7 +90,7 @@ struct Cleaned<'a> {
 
 impl Cleaned<'_> {
     fn add_quality(&mut self, q: Quality) {
-        if self.quality.is_none_or(|old| rank(q) > rank(old)) {
+        if self.quality.is_none_or(|old| q > old) {
             self.quality = Some(q);
         }
     }
@@ -198,15 +192,6 @@ fn year_of(w: &str) -> Option<u16> {
         return None;
     }
     w.parse::<u16>().ok().filter(|y| (1900..=2100).contains(y))
-}
-
-fn rank(q: Quality) -> u8 {
-    match q {
-        Quality::Sd => 0,
-        Quality::Hd => 1,
-        Quality::Fhd => 2,
-        Quality::Uhd => 3,
-    }
 }
 
 /// Superscript / modifier / small-capital letters used as decoration (`ᴴᴰ`, `ꜰʜᴅ`, `⁴ᴷ`).

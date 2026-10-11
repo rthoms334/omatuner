@@ -38,6 +38,7 @@ use crate::model::{ItemKind, ItemRef, MediaRef, PlayOrigin, ProgrammeHit, Progra
 use crate::search::{EpgSearch, SearchHit, SearchIndex, SearchSection, SearchTarget};
 use crate::theme::{SpaceToken, TypeToken};
 use crate::ui::screens::home::{kit, vod_ref};
+use crate::ui::widgets::badge::{InlineBadge, job_with_quality};
 use crate::ui::widgets::button::{ButtonStyle, button};
 use crate::ui::widgets::card::CardKind;
 use crate::ui::widgets::list::paint_row_state;
@@ -642,9 +643,13 @@ fn paint_hit(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, h: &SearchHit, 
     if h.item.locked {
         job.append(&format!("  {}", glyphs::LOCK), 0.0, egui::TextFormat::simple(font.clone(), t.text_secondary));
     }
-    job.wrap = egui::text::TextWrapping::truncate_at_width((right - left).max(0.0));
-    let g = p.layout_job(job);
-    p.galley(egui::pos2(left, y - g.size().y / 2.0), g, base);
+    // the quality badge after the name (DESIGN §13.0)
+    let quality = match h.item.target {
+        SearchTarget::Channel(id) => ctx.lib.live.get(id).and_then(|c| ctx.quality(c)),
+        _ => None,
+    };
+    let badge = quality.map(|q| InlineBadge::quality(&p, theme, q, t.text_secondary, 1.0));
+    job_with_quality(&p, theme, egui::pos2(left, y), job, badge, (right - left).max(0.0));
 }
 
 /// `Thu 21:00  Bbc Proms · BBC Four     󰂚 / ⟲ / LIVE`.

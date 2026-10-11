@@ -76,7 +76,7 @@ use crate::sources::xtream::types::{XtCategory, XtLiveStream, XtSeries, XtVodStr
 use crate::sources::xtream::urls;
 use crate::store::import::{
     self, CatalogueImport, FinishOptions, ImportChannel, ImportEpisode, ImportGroup, ImportMovie, ImportSeries, ImportSeriesEpisodes, ImportSummary,
-    KeyMove, KindCounts,
+    KeyMove, KindCounts, NameQuality,
 };
 use crate::store::sources::UpgradeAttempt;
 
@@ -704,7 +704,9 @@ pub fn m3u_entry_to_channel(
     groups_out: &mut Vec<ImportGroup>,
 ) -> ImportChannel {
     let EntryIdentity { name, norm_name, tvg_id, key } = entry_identity(e, keys);
-    let clean_name = if smart { clean_channel_name(&name).name } else { name.clone() };
+    let cleaned = clean_channel_name(&name);
+    let quality = NameQuality::of(&cleaned);
+    let clean_name = if smart { cleaned.name } else { name.clone() };
     let groups = entry_groups(e, ItemKind::Channel, smart, groups_out);
     // the Xtream id of a live stream URL: switching back from Xtream finds the channel by it
     let provider_id = parse_stream_url(&e.url).filter(|s| s.kind == XtreamStreamKind::Live).map(|s| s.stream_id.to_string());
@@ -729,6 +731,7 @@ pub fn m3u_entry_to_channel(
         provider_order: order,
         added_at: None,
         groups,
+        quality,
     }
 }
 
@@ -765,7 +768,14 @@ fn entry_groups(e: &M3uEntry, kind: ItemKind, smart: bool, groups_out: &mut Vec<
         // playlists are grouped: the newest group is the likeliest hit
         if !groups_out.iter().rev().any(|g| g.key == k) {
             let provider_order = i32::try_from(groups_out.len()).unwrap_or(i32::MAX);
-            groups_out.push(ImportGroup { kind, key: k.clone(), name: group_display(raw, smart), provider_id: None, provider_order });
+            groups_out.push(ImportGroup {
+                kind,
+                key: k.clone(),
+                name: group_display(raw, smart),
+                raw_name: non_empty(Some(raw)),
+                provider_id: None,
+                provider_order,
+            });
         }
         groups.push(k);
     }
@@ -1305,7 +1315,7 @@ where
     let uncategorized = group_key(kind, "");
     if !groups.iter().any(|g| g.key == uncategorized) && rows.iter().any(|r| r.group_keys().contains(&uncategorized)) {
         let provider_order = i32::try_from(groups.len()).unwrap_or(i32::MAX);
-        groups.push(ImportGroup { kind, key: uncategorized, name: "Uncategorized".into(), provider_id: None, provider_order });
+        groups.push(ImportGroup { kind, key: uncategorized, name: "Uncategorized".into(), raw_name: None, provider_id: None, provider_order });
     }
     (groups, rows)
 }
@@ -1358,7 +1368,9 @@ fn xt_name(name: &Option<String>, fallback: impl FnOnce() -> String) -> String {
 pub fn xt_live_to_channel(s: &XtLiveStream, order: i32, smart: bool, cats: &[XtCategory]) -> Option<ImportChannel> {
     let id = positive(s.stream_id)?;
     let name = xt_name(&s.name, || format!("Channel {id}"));
-    let clean_name = if smart { clean_channel_name(&name).name } else { name.clone() };
+    let cleaned = clean_channel_name(&name);
+    let quality = NameQuality::of(&cleaned);
+    let clean_name = if smart { cleaned.name } else { name.clone() };
     let catchup = match (positive(s.tv_archive), positive(s.tv_archive_duration)) {
         (Some(_), Some(days)) => {
             Some(CatchupSpec { kind: CatchupKind::Xc, template: None, days: u32::try_from(days).unwrap_or(u32::MAX), correction_s: 0 })
@@ -1385,6 +1397,7 @@ pub fn xt_live_to_channel(s: &XtLiveStream, order: i32, smart: bool, cats: &[XtC
         provider_order: order,
         added_at: positive(s.added),
         groups: xt_group_keys(ItemKind::Channel, &s.category_id, &s.category_ids, cats),
+        quality,
         name,
     })
 }
@@ -1461,7 +1474,7 @@ pub fn xt_categories_to_groups(kind: crate::model::ItemKind, cats: &[XtCategory]
             continue;
         }
         let provider_order = i32::try_from(out.len()).unwrap_or(i32::MAX);
-        out.push(ImportGroup { kind, key, name: group_display(raw, smart), provider_id: Some(id), provider_order });
+        out.push(ImportGroup { kind, key, name: group_display(raw, smart), raw_name: non_empty(Some(raw)), provider_id: Some(id), provider_order });
     }
     out
 }
@@ -1469,7 +1482,7 @@ pub fn xt_categories_to_groups(kind: crate::model::ItemKind, cats: &[XtCategory]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::GroupKey;
+    use crate::model::{GroupKey, Quality};
 
     fn entry(title: &str, tvg: Option<&str>, groups: &[&str], url: &str) -> M3uEntry {
         M3uEntry {
@@ -1511,6 +1524,7 @@ mod tests {
         assert_eq!(a.name, "UK | BBC One FHD");
         assert_eq!(a.clean_name, "BBC One");
         assert_eq!(a.norm_name, "bbcone");
+        assert_eq!(a.quality, Some(NameQuality { class: Quality::Fhd, family: "bbcone".into() }));
         assert_eq!(a.number, Some(101));
         assert_eq!(a.tvg_shift_min, 90);
         assert_eq!(a.unsupported, Some(Unsupported::Drm));
@@ -1524,6 +1538,7 @@ mod tests {
             m3u_entry_to_channel(&entry("UK | BBC One FHD", Some("bbc1.uk"), &["UK | News"], "http://other/2.ts"), 1, false, &mut keys, &mut groups);
         assert_eq!(b.key.0, format!("{}#2", a.key.0));
         assert_eq!(b.clean_name, "UK | BBC One FHD", "smart names off keeps the raw name");
+        assert_eq!(b.quality, a.quality, "the quality word counts with smart names off too");
         assert_eq!(groups.len(), 2, "known groups are not repeated");
         // no group → uncategorized
         let c = m3u_entry_to_channel(&entry("Bare", None, &[], "http://h/bare.ts"), 2, true, &mut keys, &mut groups);
@@ -1574,6 +1589,7 @@ mod tests {
         assert_eq!(a.key.0, "xt:live:1001");
         assert_eq!(a.provider_id.as_deref(), Some("1001"));
         assert_eq!(a.clean_name, "BBC One");
+        assert_eq!(a.quality.map(|q| q.class), Some(Quality::Hd));
         assert_eq!(a.number, Some(1));
         assert_eq!(a.tvg_id.as_deref(), Some("bbc1.uk"));
         assert_eq!(a.added_at, Some(1_700_000_000));
@@ -1581,6 +1597,7 @@ mod tests {
         assert_eq!(a.catchup, Some(CatchupSpec { kind: CatchupKind::Xc, template: None, days: 7, correction_s: 0 }));
         assert_eq!(a.groups, vec![GroupKey("channel:uknews".into())]);
         let b = xt_live_to_channel(&s[1], 1, true, &c).unwrap();
+        assert_eq!(b.quality, None);
         assert_eq!(b.catchup, None);
         assert_eq!(b.groups, vec![GroupKey("channel:sports".into()), GroupKey("channel:uknews".into())]);
         assert_eq!(xt_live_to_channel(&s[2], 2, true, &c).unwrap().groups, vec![GroupKey("channel:uncategorized".into())]);

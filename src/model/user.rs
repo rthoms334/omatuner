@@ -58,6 +58,9 @@ pub struct GroupOverride {
     pub user_order: Option<i32>,
     /// Pinned to Home as a section.
     pub pinned_home: bool,
+    /// Shown although the source's category filter hides its tag (DESIGN §28.3). Cleared by
+    /// hiding the group.
+    pub shown: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -66,6 +69,20 @@ pub struct GroupOverrideRow {
     pub kind: ItemKind,
     pub key: GroupKey,
     pub ov: GroupOverride,
+}
+
+/// A group by its stable identity (bulk hide, Settings ▸ Hidden).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GroupRef {
+    pub source: SourceId,
+    pub kind: ItemKind,
+    pub key: GroupKey,
+}
+
+impl From<&super::Group> for GroupRef {
+    fn from(g: &super::Group) -> Self {
+        Self { source: g.source_id, kind: g.kind, key: g.key.clone() }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

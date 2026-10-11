@@ -25,6 +25,7 @@ fn source(id: i64, name: &str) -> SourceMeta {
         last_refresh: None,
         has_vod: true,
         has_series: true,
+        category_filter: None,
     }
 }
 
@@ -39,9 +40,12 @@ fn group(id: i64, kind: ItemKind, name: &str, hidden: bool, locked: bool) -> Gro
         provider_order: id as i32,
         user_order: None,
         hidden,
+        user_hidden: hidden,
         locked,
         item_count: 0,
         provider_id: None,
+        tag: None,
+        filter: Default::default(),
     }
 }
 
@@ -64,6 +68,8 @@ fn channel(id: i64, source: i64, name: &str, groups: &[i64], locked: bool) -> Ch
         provider_order: id as i32,
         user_order: None,
         added_at: None,
+        quality: None,
+        family: 0,
     }
 }
 

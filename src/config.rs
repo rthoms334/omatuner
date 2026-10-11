@@ -116,6 +116,8 @@ pub struct InterfaceConfig {
     pub density: Density,
     pub show_channel_numbers: bool,
     pub show_logos: bool,
+    /// SD / HD / FHD / 4K badges next to channel names (DESIGN §13.0).
+    pub quality_badges: bool,
     pub clock_24h: bool,
     /// Live TV: resting the keyboard cursor on a channel for `preview_delay_ms` plays it in the
     /// preview pane. OFF by default (each autoplay opens a provider connection; Xtream accounts
@@ -148,6 +150,7 @@ impl Default for InterfaceConfig {
             density: Density::Comfortable,
             show_channel_numbers: true,
             show_logos: true,
+            quality_badges: true,
             clock_24h: true,
             live_preview_autoplay: false,
             preview_delay_ms: 1200,

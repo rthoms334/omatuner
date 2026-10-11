@@ -33,7 +33,7 @@ use eframe::egui;
 
 use crate::config::Config;
 use crate::keymap::{Action, KeyContext};
-use crate::model::{ChannelId, Collection, GroupId, ItemRef, MovieId, ProgrammeId, SeriesId, SourceId, Timestamp};
+use crate::model::{ChannelId, ChannelSummary, Collection, GroupId, ItemRef, MovieId, ProgrammeId, Quality, SeriesId, SourceId, Timestamp};
 use crate::msg::{AppEvent, Toast};
 use crate::player::PlayerSnapshot;
 use crate::services::Services;
@@ -181,6 +181,8 @@ pub enum OverlayRequest {
     /// Ctrl+I "Edit information": rename, per-channel catch-up offset, EPG assignment, lock,
     /// hide (WP-11).
     EditItem(ItemRef),
+    /// "Choose what to show": a playlist's category filter (DESIGN §28.6).
+    Categories(SourceId),
 }
 
 /// Requests a screen makes during a frame; the app applies them after the frame.
@@ -222,6 +224,8 @@ pub struct UiCtx<'a> {
     /// Read-only view of the config; mutate via [`UiCtx::edit_config`].
     pub config: &'a Config,
     pub player: &'a Arc<PlayerSnapshot>,
+    /// Quality badges measured this session (read through [`UiCtx::quality`]).
+    pub measured: &'a data::MeasuredQuality,
     pub images: &'a mut crate::images::ImageCache,
     pub video: &'a mut video_host::VideoHost,
     pub parental: &'a mut ParentalSession,
@@ -251,6 +255,7 @@ pub struct UiParts<'a> {
     pub now_next: &'a mut data::NowNextCache,
     pub config: &'a Config,
     pub player: &'a Arc<PlayerSnapshot>,
+    pub measured: &'a data::MeasuredQuality,
     pub images: &'a mut crate::images::ImageCache,
     pub video: &'a mut video_host::VideoHost,
     pub parental: &'a mut ParentalSession,
@@ -277,6 +282,7 @@ impl<'a> UiCtx<'a> {
             now_next: p.now_next,
             config: p.config,
             player: p.player,
+            measured: p.measured,
             images: p.images,
             video: p.video,
             parental: p.parental,
@@ -312,6 +318,17 @@ impl<'a> UiCtx<'a> {
     pub fn play(&self, cmd: crate::player::PlayerCommand) {
         self.services.player.handle().send(cmd);
     }
+    /// The quality badge of a channel (measured this session, else the library's: measured
+    /// earlier, else from the name), or `None` while Settings ▸ Interface ▸ Quality badges
+    /// is off.
+    pub fn quality(&self, ch: &ChannelSummary) -> Option<Quality> {
+        self.quality_badges().of(ch)
+    }
+    /// [`UiCtx::quality`] as a `Copy` value (for painters that can't borrow the context).
+    pub fn quality_badges(&self) -> data::QualityBadges<'a> {
+        data::QualityBadges(self.config.interface.quality_badges.then_some(self.measured))
+    }
+
     /// An `EpgReader` over the UI connection (guide grid, now/next cache).
     pub fn epg_reader(&self) -> data::DbEpg<'a> {
         data::DbEpg(self.db)

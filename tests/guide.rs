@@ -28,7 +28,7 @@ use tuner::model::{
 use tuner::player::{PlayerSnapshot, PlayerState};
 use tuner::store::library::LiveIndex;
 use tuner::theme::Theme;
-use tuner::ui::data::{EpgReader, FrameBudget};
+use tuner::ui::data::{EpgReader, FrameBudget, QualityBadges};
 use tuner::ui::epg_grid::{self, EpgGridState, GridMetrics, GridOutcome, GuideRow, ProgrammeCache};
 use tuner::ui::overlays::{self, Overlay, OverlayOutcome};
 use tuner::ui::screens::{guide::GuideScreen, live::LiveScreen, player::PlayerScreen};
@@ -248,6 +248,8 @@ fn summary(i: i64) -> ChannelSummary {
         provider_order: i as i32,
         user_order: None,
         added_at: None,
+        quality: None,
+        family: 0,
     }
 }
 
@@ -388,7 +390,7 @@ fn grid_harness(n: i64, now: Timestamp, budget: Duration) -> Harness<'static, Gr
             let mut b = FrameBudget::new(budget);
             let m = GridMetrics::for_layout(LayoutClass::Wide, false, &a.theme);
             let before = a.reader.calls;
-            let out = epg_grid::epg_grid(ui, &a.theme, &mut a.images, &mut a.reader, &mut b, &a.live, &mut a.state, m, a.now);
+            let out = epg_grid::epg_grid(ui, &a.theme, &mut a.images, &mut a.reader, &mut b, &a.live, QualityBadges(None), &mut a.state, m, a.now);
             a.loads.push(a.reader.calls - before);
             if out != GridOutcome::None {
                 a.outcomes.push(out);
@@ -987,12 +989,13 @@ fn live_preview_says_why_a_channel_has_no_guide() {
 }
 
 /// DESIGN §13.2 mock "[HD]": the preview shows the quality from the provider name before
-/// anything plays (smart names drop the word from the display name).
+/// anything plays (smart names drop the word from the display name; the import stores it in
+/// `channel.quality`).
 #[test]
 fn live_preview_shows_the_quality_badge_before_playback() {
     let _one = one();
     let (mut t, ids) = seeded(3, 3, None);
-    t.services().store.writer().blocking(|c| Ok(c.execute("UPDATE channel SET name = 'BBC One HD' WHERE number = 1", [])?)).unwrap();
+    t.services().store.writer().blocking(|c| Ok(c.execute("UPDATE channel SET name = 'BBC One HD', quality = 2 WHERE number = 1", [])?)).unwrap();
     reload(&mut t);
     let mut s = LiveScreen::default();
     t.with_ctx(|ctx| s.on_enter(ctx, &Route::Live { group: None, channel: Some(ids[0]) }));
@@ -1070,6 +1073,123 @@ fn live_reminders_rows_and_group_reorder() {
     }
     assert_eq!((order(&h.state().t, "channel:news"), order(&h.state().t, "channel:all")), (Some(0), Some(1)));
     let _ = ids;
+}
+
+/// DESIGN §28.7 bulk hide in the groups pane: Space marks provider groups (never the virtual
+/// rows) and moves down; Esc clears the marks before it leaves the pane; Ctrl+H hides every
+/// marked group; while filtering, Ctrl+Shift+H hides the groups shown that have the words
+/// typed (not every fuzzy match: "ar" never takes "Cartoons"), once confirmed.
+#[test]
+fn live_bulk_hide_of_marked_and_filtered_groups() {
+    let _one = one();
+    let (mut t, _ids) = seeded(10, 0, None);
+    // groups: All, News (seeded), then Sport 1, Sport 2, Kids, Cartoons, Arabic News, AR | Movies
+    t.services()
+        .store
+        .writer()
+        .blocking(|c| {
+            for (i, name) in ["Sport 1", "Sport 2", "Kids", "Cartoons", "Arabic News", "AR | Movies"].iter().enumerate() {
+                c.execute(
+                    "INSERT INTO grp(source_id, kind, key, name, provider_order, item_count, seen_gen) VALUES (1,'channel',?1,?2,?3,1,1)",
+                    rusqlite::params![format!("channel:x{i}"), name, 2 + i as i64],
+                )?;
+                let g = c.last_insert_rowid();
+                c.execute(
+                    "INSERT INTO channel_group(group_id, channel_id, position, is_primary) SELECT ?1, id, 0, 0 FROM channel WHERE key = ?2",
+                    rusqlite::params![g, format!("m3u:seed{:011}", i + 1)],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    reload(&mut t);
+    let hidden = |t: &TestUi| {
+        let mut v: Vec<String> = tuner::store::user::group_overrides(&t.db).unwrap().into_iter().filter(|r| r.ov.hidden).map(|r| r.key.0).collect();
+        v.sort();
+        v
+    };
+    let wait_hidden = |h: &Harness<'static, ScreenApp<LiveScreen>>, want: &[&str]| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while hidden(&h.state().t) != want && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(hidden(&h.state().t), want);
+    };
+    let mut s = LiveScreen::default();
+    t.with_ctx(|ctx| s.on_enter(ctx, &Route::Live { group: None, channel: None }));
+    let mut h = screen_harness(t, s, 1600.0);
+    h.run_steps(2);
+    // the groups pane, on "All channels" (virtual: can't be marked)
+    hact(&mut h, Action::FocusNext);
+    assert!(hact(&mut h, Action::ToggleMark));
+    assert!(h.state().t.toasts.iter().any(|t| t.text == "Only playlist groups can be marked"));
+    // News and Sport 1 marked (Space moves down)
+    hact(&mut h, Action::Down);
+    hact(&mut h, Action::ToggleMark);
+    hact(&mut h, Action::ToggleMark);
+    h.run_steps(2);
+    assert!(has(&h, "2 marked · Ctrl+H hides · Esc clears"));
+    // Esc clears the marks; the next Esc leaves the pane (the app's Back)
+    assert!(hact(&mut h, Action::Back));
+    h.run_steps(2);
+    assert!(!has(&h, "2 marked · Ctrl+H hides · Esc clears"));
+    assert!(!hact(&mut h, Action::Back));
+    // News and Kids marked (the cursor is on Sport 1): Ctrl+H hides both
+    hact(&mut h, Action::Up);
+    hact(&mut h, Action::ToggleMark);
+    hact(&mut h, Action::Down);
+    hact(&mut h, Action::Down);
+    hact(&mut h, Action::ToggleMark);
+    hact(&mut h, Action::ToggleHidden);
+    wait_hidden(&h, &["channel:news", "channel:x2"]);
+    assert!(h.state().t.toasts.iter().any(|t| t.text.starts_with("Hid 2 groups")), "{:?}", h.state().t.toasts);
+    // the rebuilt library: filter "sport", then Ctrl+Shift+H → confirm → exactly those two
+    reload(&mut h.state_mut().t);
+    h.run_steps(2);
+    for c in "sport".chars() {
+        hact(&mut h, Action::FilterInput(c));
+    }
+    h.run_steps(2);
+    assert!(has(&h, "2 groups with “sport” · Ctrl+Shift+H hides them"));
+    h.state_mut().t.nav.clear();
+    assert!(hact(&mut h, Action::HideShown));
+    let token = match opened(&h.state().t).as_slice() {
+        [OverlayRequest::Confirm(c)] => {
+            assert_eq!(c.title, "Hide 2 groups?");
+            assert!(!c.destructive);
+            c.token
+        }
+        other => panic!("{other:?}"),
+    };
+    {
+        let ScreenApp { t, s } = h.state_mut();
+        t.with_ctx(|ctx| s.on_overlay_result(ctx, overlays::OverlayResult::Confirmed(token)));
+    }
+    wait_hidden(&h, &["channel:news", "channel:x0", "channel:x1", "channel:x2"]);
+    assert_eq!(h.state().s.key_contexts(), [KeyContext::List], "the filter is cleared");
+    // "ar" also shows "Cartoons" (fuzzy), but only the groups with a word starting "ar" go
+    reload(&mut h.state_mut().t);
+    h.run_steps(2);
+    for c in "ar".chars() {
+        hact(&mut h, Action::FilterInput(c));
+    }
+    h.run_steps(2);
+    assert!(has(&h, "Cartoons"));
+    assert!(has(&h, "2 groups with “ar” · Ctrl+Shift+H hides them"));
+    h.state_mut().t.nav.clear();
+    hact(&mut h, Action::HideShown);
+    let token = match opened(&h.state().t).as_slice() {
+        [OverlayRequest::Confirm(c)] => {
+            assert!(c.body.contains("Arabic News") && c.body.contains("AR | Movies") && !c.body.contains("Cartoons"), "{}", c.body);
+            c.token
+        }
+        other => panic!("{other:?}"),
+    };
+    {
+        let ScreenApp { t, s } = h.state_mut();
+        t.with_ctx(|ctx| s.on_overlay_result(ctx, overlays::OverlayResult::Confirmed(token)));
+    }
+    wait_hidden(&h, &["channel:news", "channel:x0", "channel:x1", "channel:x2", "channel:x4", "channel:x5"]);
 }
 
 #[test]

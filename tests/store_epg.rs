@@ -116,6 +116,7 @@ fn playlist(s: &Store, chans: &[(&str, &str, Option<&str>, i32)]) -> SourceId {
             provider_order: i as i32,
             added_at: None,
             groups: vec![group_key(ItemKind::Channel, "All")],
+            quality: None,
         })
         .collect();
     w(s, move |c| {
@@ -138,6 +139,7 @@ fn playlist(s: &Store, chans: &[(&str, &str, Option<&str>, i32)]) -> SourceId {
             kind: ItemKind::Channel,
             key: group_key(ItemKind::Channel, "All"),
             name: "All".into(),
+            raw_name: None,
             provider_id: None,
             provider_order: 0,
         };

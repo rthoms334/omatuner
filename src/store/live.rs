@@ -91,7 +91,7 @@ pub fn channel_by_ref(conn: &Connection, item: &ItemRef) -> Result<Option<Channe
 }
 
 pub(crate) const GROUP_COLS: &str = "g.id, g.source_id, g.kind, g.key, g.name, o.rename, g.provider_order, o.user_order, \
-     COALESCE(o.hidden, 0), COALESCE(o.locked, 0), g.item_count, g.provider_id";
+     COALESCE(o.hidden, 0), COALESCE(o.locked, 0), g.item_count, g.provider_id, COALESCE(g.raw_name, g.name), COALESCE(o.shown, 0)";
 
 pub(crate) const GROUP_FROM: &str = "FROM grp g JOIN source s ON s.id = g.source_id
      LEFT JOIN group_override o ON o.source_id = g.source_id AND o.kind = g.kind AND o.group_key = g.key";
@@ -111,9 +111,14 @@ pub(crate) fn group_from_row(r: &Row<'_>) -> rusqlite::Result<Group> {
         provider_order: r.get(6)?,
         user_order: r.get(7)?,
         hidden: r.get(8)?,
+        user_hidden: r.get(8)?,
         locked: r.get(9)?,
         item_count: u32_of(r.get(10)?),
         provider_id: r.get(11)?,
+        // the provider's raw name; groups imported before P6 fall back to the display name
+        tag: crate::sources::category_tags::detect_tag(&r.get::<_, String>(12)?),
+        // the user's "show anyway"; `library::load` applies the source's rule (DESIGN §28.4)
+        filter: if r.get(13)? { crate::model::GroupFilter::Exempt } else { crate::model::GroupFilter::Kept },
     })
 }
 
@@ -152,6 +157,24 @@ pub fn record_failure(conn: &Connection, item: &ItemRef, reason: &str, now: Time
 /// Clear on successful playback.
 pub fn clear_failure(conn: &Connection, item: &ItemRef) -> Result<()> {
     conn.prepare_cached("DELETE FROM stream_failure WHERE source_id = ?1 AND item_key = ?2")?.execute(params![item.source, item.key.as_str()])?;
+    Ok(())
+}
+
+/// Remember the picture size mpv decoded for a live channel (`channel_video`; its class wins
+/// over the quality word of the name, DESIGN §6), with the provider name and `url_key` it was
+/// measured under: it applies only while the channel at that key still has them
+/// (`store::import` moves it with the channel). Not a channel, or gone → nothing.
+pub fn record_video(conn: &Connection, item: &ItemRef, width: i64, height: i64, now: Timestamp) -> Result<()> {
+    if item.kind != ItemKind::Channel {
+        return Ok(());
+    }
+    conn.prepare_cached(
+        "INSERT INTO channel_video(source_id, item_key, name, url_key, width, height, at)
+         SELECT c.source_id, c.key, c.name, c.url_key, ?3, ?4, ?5 FROM channel c WHERE c.source_id = ?1 AND c.key = ?2
+         ON CONFLICT(source_id, item_key) DO UPDATE SET name = excluded.name, url_key = excluded.url_key,
+           width = excluded.width, height = excluded.height, at = excluded.at",
+    )?
+    .execute(params![item.source, item.key.as_str(), width, height, now])?;
     Ok(())
 }
 

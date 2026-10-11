@@ -20,7 +20,7 @@ use tuner::model::{
 use tuner::store::library::LiveIndex;
 use tuner::theme::Theme;
 use tuner::ui::LayoutClass;
-use tuner::ui::data::{EpgReader, FrameBudget};
+use tuner::ui::data::{EpgReader, FrameBudget, QualityBadges};
 use tuner::ui::epg_grid::{EpgGridState, GridMetrics, GuideRow, epg_grid};
 
 const CHANNELS: i64 = 5_000;
@@ -79,6 +79,8 @@ fn live() -> LiveIndex {
             provider_order: i as i32,
             user_order: None,
             added_at: None,
+            quality: None,
+            family: 0,
         })
         .collect();
     let members = HashMap::from([(GroupId(1), chans.iter().map(|c| c.id).collect())]);
@@ -111,7 +113,7 @@ fn main() {
         // holding ↓: one row per frame
         state.handle(Action::Down, &mut reader, &mut budget, now);
         let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
-            epg_grid(ui, &theme, &mut images, &mut reader, &mut budget, &live, &mut state, metrics, now);
+            epg_grid(ui, &theme, &mut images, &mut reader, &mut budget, &live, QualityBadges(None), &mut state, metrics, now);
         });
         out.textures_delta.clear(); // no renderer (epaint debug-asserts on unapplied deltas)
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
