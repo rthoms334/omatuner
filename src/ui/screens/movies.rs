@@ -238,8 +238,14 @@ pub(super) struct VodBrowser {
     /// all this screen looks up by key (an index of every title cloned every key: ~30 MiB for
     /// 300k movies).
     index: HashMap<(SourceId, ItemKey), u32>,
-    /// What `index` was resolved for: (library build, `progress_gen`, favourites fingerprint).
-    index_for: Option<(u64, u64, u64)>,
+    /// What `index` was resolved for: (VOD lists, `progress_gen`, favourites fingerprint). A
+    /// zap's library copy shares the lists: nothing to redo.
+    index_for: Option<(crate::store::library::VodIdentity, u64, u64)>,
+    /// Keys looked for in the last scan of these lists that they don't hold (progress of a
+    /// title the playlist dropped): a progress save that adds no new key rescans nothing.
+    index_absent: HashSet<(SourceId, ItemKey)>,
+    /// Full scans of the lists for `index` (tests).
+    index_scans: u32,
     /// The library build the screen's indices belong to.
     index_built: u64,
     /// A locked category waiting for the PIN (cleared by any other open / item action).
@@ -491,23 +497,33 @@ impl VodBrowser {
             favs.hash(&mut h);
             h.finish()
         };
-        let want = (lib_id(ctx), self.progress_gen, fingerprint);
-        if self.index_for == Some(want) {
+        let want = (ctx.lib.vod_identity(), self.progress_gen, fingerprint);
+        if self.index_for.as_ref() == Some(&want) {
             return;
         }
+        let same_lists = self.index_for.as_ref().is_some_and(|f| f.0 == want.0);
         self.index_for = Some(want);
-        let wanted: HashSet<(SourceId, &str)> =
-            self.progress.order.iter().map(|(s, k)| (*s, k.0.as_str())).chain(favs.iter().map(|r| (r.source, r.key.0.as_str()))).collect();
-        let index = if wanted.is_empty() {
+        let wanted: HashSet<(SourceId, &ItemKey)> =
+            self.progress.order.iter().map(|(s, k)| (*s, k)).chain(favs.iter().map(|r| (r.source, &r.key))).collect();
+        // the same lists and no key it hasn't looked for (a progress save of a known title, a
+        // favourite taken out): the stale extra entries are harmless, lookups go by these keys
+        let known = |k: &(SourceId, ItemKey)| self.index.contains_key(k) || self.index_absent.contains(k);
+        if same_lists && wanted.iter().all(|(s, k)| known(&(*s, (*k).clone()))) {
+            self.rebuild_progress_idx();
+            return;
+        }
+        let index: HashMap<(SourceId, ItemKey), u32> = if wanted.is_empty() {
             HashMap::new()
         } else {
+            self.index_scans += 1;
             let all = self.all(ctx);
             all.iter()
                 .enumerate()
-                .filter(|(_, v)| wanted.contains(&(v.source_id, v.key.0.as_str())))
+                .filter(|(_, v)| wanted.contains(&(v.source_id, &v.key)))
                 .map(|(i, v)| ((v.source_id, v.key.clone()), i as u32))
                 .collect()
         };
+        self.index_absent = wanted.into_iter().filter(|(s, k)| !index.contains_key(&(*s, (*k).clone()))).map(|(s, k)| (s, k.clone())).collect();
         self.index = index;
         self.rebuild_progress_idx();
     }
@@ -2080,6 +2096,29 @@ mod tests {
         app.t.favs.apply_toggle(list, &named(a, 2), true);
         h.run_steps(1);
         assert_eq!(keys(&h), [format!("{}:m3u:named0002", a.0), format!("{}:m3u:named0001", b.0)]);
+
+        // a zap copies the library with another recent list and shares the VOD lists: nothing
+        // is rescanned (review: every zap scanned every title)
+        let (scans, resolved) = (h.state().s.browser.index_scans, h.state().s.browser.index_for.clone());
+        let app = h.state_mut();
+        app.t.lib = std::sync::Arc::new(app.t.lib.with_recent_channels(Vec::new()));
+        h.run_steps(2);
+        assert_eq!(h.state().s.browser.index_for, resolved);
+        assert_eq!(h.state().s.browser.index_scans, scans, "a zap rescans nothing");
+        // progress reloaded (saved every 10 s while a title plays) with no new key: remapped,
+        // not rescanned
+        let generation = h.state().s.browser.progress_gen;
+        let app = h.state_mut();
+        let s = &mut app.s;
+        app.t.with_ctx(|ctx| s.on_event(ctx, &AppEvent::Data(DataScope::Progress)));
+        until(&mut h, "the progress reloaded", |h| h.state().s.browser.progress_gen > generation);
+        h.run_steps(1);
+        assert_eq!(h.state().s.browser.index_scans, scans, "a progress save rescans nothing");
+        assert_eq!(h.state().s.browser.progress_idx.get(&solo), Some(&0.1));
+        // a rebuild has new lists: scanned again
+        testkit::reload_library(&mut h.state_mut().t);
+        h.run_steps(2);
+        assert_eq!(h.state().s.browser.index_scans, scans + 1);
     }
 
     /// Favourites and Continue watching of a stack (DESIGN §29.12): Favourites shows one card

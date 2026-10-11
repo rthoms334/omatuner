@@ -592,7 +592,23 @@ pub struct Library {
     pub explicit: Arc<ExplicitIndex>,
 }
 
+/// Identity of a snapshot's VOD lists: a zap's copy ([`Library::with_recent_channels`]) shares
+/// it, a rebuild or an explicit-content hide doesn't; indices into the lists stay valid while
+/// it is equal. Holds a `Weak`, so the address can't be reused while it is compared.
+#[derive(Debug, Clone)]
+pub struct VodIdentity(std::sync::Weak<VodIndex>);
+
+impl PartialEq for VodIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Weak::ptr_eq(&self.0, &other.0)
+    }
+}
+
 impl Library {
+    pub fn vod_identity(&self) -> VodIdentity {
+        VodIdentity(Arc::downgrade(&self.vod))
+    }
+
     pub fn source(&self, id: SourceId) -> Option<&SourceMeta> {
         self.sources.iter().find(|s| s.id == id)
     }

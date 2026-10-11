@@ -434,6 +434,9 @@ impl TunerApp {
     /// search card closed (it rebuilds in the background when the card opens again).
     fn drop_search_index(&mut self, why: &'static str) {
         if let Some(idx) = self.search_index.take() {
+            // stop its background collection now: the maintenance thread may be busy dropping
+            // a library for a second before it drops this
+            idx.cancel();
             self.release(idx, why);
         }
     }

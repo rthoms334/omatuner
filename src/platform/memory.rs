@@ -1,5 +1,4 @@
-//! Memory upkeep: give freed heap back to the OS, off the UI thread, and report the process's
-//! memory for the log.
+//! Memory upkeep: give freed heap back to the OS, off the UI thread.
 //!
 //! glibc's allocator returns memory to the OS only from the top of a heap; what is freed in the
 //! middle of an arena stays resident (field report: ~1.1 GB after a day of 4K HEVC in software
@@ -18,8 +17,7 @@
 //! `malloc_trim(0)` takes 1–30 ms here (once 213 ms); it locks one arena at a time, so a thread
 //! allocating in that arena meanwhile waits for it.
 //!
-//! [`MemStats`] reads `/proc/self/status` and `mallinfo2` for the periodic health line in the
-//! log (RSS, swap, heap in use and free).
+//! The memory figures of the periodic health line come from [`super::memstats`].
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -50,49 +48,6 @@ pub fn trim() -> bool {
     false
 }
 
-/// The process's memory (the health line in the log). Sizes in bytes; `None` where the
-/// platform doesn't say.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct MemStats {
-    /// Resident set (`VmRSS`).
-    pub rss: Option<u64>,
-    /// Anonymous part of it (`RssAnon`: heap, mpv's frames; not mapped files such as fonts).
-    pub anon: Option<u64>,
-    /// Swapped out (`VmSwap`).
-    pub swap: Option<u64>,
-    /// glibc heap in use (`mallinfo2`: `uordblks + hblkhd`).
-    pub heap_in_use: Option<u64>,
-    /// glibc heap free but still held (`mallinfo2`: `fordblks`): what a trim can give back.
-    pub heap_free: Option<u64>,
-}
-
-impl MemStats {
-    /// Read now (a small /proc read; `mallinfo2` walks the arenas' free lists: ≤ 1 ms).
-    pub fn now() -> Self {
-        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-        let (heap_in_use, heap_free) = heap();
-        Self {
-            rss: status_kib(&status, "VmRSS:").map(|k| k * 1024),
-            anon: status_kib(&status, "RssAnon:").map(|k| k * 1024),
-            swap: status_kib(&status, "VmSwap:").map(|k| k * 1024),
-            heap_in_use,
-            heap_free,
-        }
-    }
-}
-
-impl std::fmt::Display for MemStats {
-    /// `RSS 690 MiB (anon 610 MiB), swap 12 MiB, heap 420 MiB in use + 35 MiB free`
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mib = |b: Option<u64>| b.map_or_else(|| "?".to_owned(), |b| format!("{} MiB", b >> 20));
-        write!(f, "RSS {} (anon {}), swap {}", mib(self.rss), mib(self.anon), mib(self.swap))?;
-        if self.heap_in_use.is_some() {
-            write!(f, ", heap {} in use + {} free", mib(self.heap_in_use), mib(self.heap_free))?;
-        }
-        Ok(())
-    }
-}
-
 /// A `/proc/self/status` field in KiB (`VmRSS:   12345 kB`).
 fn status_kib(status: &str, field: &str) -> Option<u64> {
     status.lines().find_map(|l| l.strip_prefix(field)).and_then(|v| v.split_whitespace().next()).and_then(|v| v.parse().ok())
@@ -101,35 +56,6 @@ fn status_kib(status: &str, field: &str) -> Option<u64> {
 /// `RssAnon` in MiB (0 where unknown): the trim log line, without `mallinfo2`'s arena walk.
 fn anon_mib() -> u64 {
     std::fs::read_to_string("/proc/self/status").ok().and_then(|s| status_kib(&s, "RssAnon:")).map_or(0, |k| k >> 10)
-}
-
-/// (in use, free) of the glibc heap.
-fn heap() -> (Option<u64>, Option<u64>) {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    {
-        /// `struct mallinfo2` (glibc ≥ 2.33).
-        #[repr(C)]
-        struct MallInfo2 {
-            arena: usize,
-            ordblks: usize,
-            smblks: usize,
-            hblks: usize,
-            hblkhd: usize,
-            usmblks: usize,
-            fsmblks: usize,
-            uordblks: usize,
-            fordblks: usize,
-            keepcost: usize,
-        }
-        unsafe extern "C" {
-            fn mallinfo2() -> MallInfo2;
-        }
-        // SAFETY: returns a plain struct by value; it only reads allocator statistics.
-        let m = unsafe { mallinfo2() };
-        (Some((m.uordblks + m.hblkhd) as u64), Some(m.fordblks as u64))
-    }
-    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-    (None, None)
 }
 
 /// What the player did that freed memory worth trimming (`None`: nothing). Pure, for tests.
@@ -392,14 +318,9 @@ mod tests {
     }
 
     #[test]
-    fn stats_read_this_process() {
-        let s = MemStats::now();
-        assert!(s.rss.is_some_and(|r| r > 0) && s.anon.is_some() && s.swap.is_some(), "{s:?}");
-        #[cfg(all(target_os = "linux", target_env = "gnu"))]
-        assert!(s.heap_in_use.is_some_and(|h| h > 0) && s.heap_free.is_some());
-        let line = s.to_string();
-        assert!(line.starts_with("RSS ") && line.contains("swap"), "{line}");
+    fn status_fields_are_read_in_kib() {
         assert_eq!(status_kib("VmRSS:\t  2048 kB\nVmSwap:\t 0 kB\n", "VmRSS:"), Some(2048));
         assert_eq!(status_kib("VmRSS:\t  2048 kB\n", "VmSwap:"), None);
+        assert!(anon_mib() > 0, "this process has anonymous memory");
     }
 }

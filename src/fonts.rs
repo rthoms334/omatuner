@@ -125,7 +125,9 @@ static MAPPED: LazyLock<Mutex<HashMap<FileId, &'static [u8]>>> = LazyLock::new(M
 /// Mapping the same unchanged file again reuses its mapping, so a `fonts.conf` reload doesn't
 /// map anything twice; a replaced file is mapped anew and the old mapping stays (address space
 /// only — egui may still hold it). Package updates replace font files (new inode), which the
-/// mapping survives; a font file truncated in place while mapped would fault on access.
+/// mapping survives; a font file truncated in place while mapped would fault on access, so only
+/// files under `/usr` (the package manager's) are mapped: a user's own fonts (`cp new.ttf
+/// ~/.local/share/fonts/old.ttf` overwrites in place) are read once and kept instead.
 fn map_font(path: &Path) -> std::io::Result<&'static [u8]> {
     let file = std::fs::File::open(path)?;
     let meta = file.metadata()?;
@@ -144,9 +146,17 @@ fn map_font(path: &Path) -> std::io::Result<&'static [u8]> {
         return Ok(bytes);
     }
     let len = usize::try_from(meta.len()).map_err(|_| std::io::Error::other("font file too big"))?;
-    let bytes = map_read_only(&file, len)?;
+    let bytes = if path.starts_with("/usr/") { map_read_only(&file, len)? } else { read_leaked(&file, len)? };
     mapped.insert(id, bytes);
     Ok(bytes)
+}
+
+/// Read the whole file and keep the bytes for the process (still no second copy inside egui).
+fn read_leaked(file: &std::fs::File, len: usize) -> std::io::Result<&'static [u8]> {
+    use std::io::Read;
+    let mut bytes = Vec::with_capacity(len);
+    (&*file).read_to_end(&mut bytes)?;
+    Ok(Box::leak(bytes.into_boxed_slice()))
 }
 
 /// `mmap(PROT_READ, MAP_PRIVATE)` of the whole file, never unmapped.
@@ -172,13 +182,10 @@ fn map_read_only(file: &std::fs::File, len: usize) -> std::io::Result<&'static [
     Ok(unsafe { std::slice::from_raw_parts(p.cast::<u8>(), len) })
 }
 
-/// Elsewhere: read once and keep (still no second copy inside egui).
+/// Elsewhere: read once and keep.
 #[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
 fn map_read_only(file: &std::fs::File, len: usize) -> std::io::Result<&'static [u8]> {
-    use std::io::Read;
-    let mut bytes = Vec::with_capacity(len);
-    (&*file).read_to_end(&mut bytes)?;
-    Ok(Box::leak(bytes.into_boxed_slice()))
+    read_leaked(file, len)
 }
 
 /// Font data ready to install (bytes already in memory).
@@ -470,8 +477,9 @@ mod tests {
         out.textures_delta.clear();
     }
 
-    /// Font bytes are the file's mapping, borrowed by egui (no heap copy, none inside epaint);
-    /// a reload maps an unchanged file once, a replaced file (an update) anew.
+    /// Font bytes are borrowed by egui (no copy inside epaint); a reload reads an unchanged
+    /// file once, a replaced file (an update) anew. A file outside `/usr` is read, not mapped:
+    /// overwriting it in place (same inode) leaves the bytes egui holds alone.
     #[test]
     fn font_files_are_mapped_not_copied() {
         let dir = tempfile::tempdir().unwrap();
@@ -492,6 +500,9 @@ mod tests {
         let third = set.load();
         assert_eq!(bytes(&third), updated.as_slice(), "the new file is mapped");
         assert_eq!(bytes(&first), &updated[..updated.len() - 16], "the old mapping stays readable");
+        // `cp other.ttf mapped.ttf`: truncated and rewritten in place
+        std::fs::write(&face.path, b"short").unwrap();
+        assert_eq!(bytes(&third), updated.as_slice(), "egui's bytes untouched by an in-place overwrite");
         let ctx = egui::Context::default();
         third.install(&ctx);
         let mut out = ctx.run_ui(Default::default(), |ui| {
@@ -499,6 +510,38 @@ mod tests {
         });
         assert!(!out.textures_delta.set.is_empty(), "font atlas built from the mapped bytes");
         out.textures_delta.clear();
+    }
+
+    /// A packaged font (under `/usr`) is memory-mapped: page cache, not heap. Skipped where no
+    /// font is installed there.
+    #[test]
+    fn packaged_fonts_are_mapped() {
+        let Some(path) = ["/usr/share/fonts"].iter().find_map(|d| find_font(Path::new(d), 3)) else {
+            eprintln!("no font under /usr/share/fonts; skipping");
+            return;
+        };
+        let bytes = map_font(&path).unwrap();
+        assert_eq!(bytes, std::fs::read(&path).unwrap().as_slice());
+        assert_eq!(map_font(&path).unwrap().as_ptr(), bytes.as_ptr(), "mapped once");
+        #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+        {
+            let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+            assert!(maps.lines().any(|l| l.ends_with(path.to_str().unwrap())), "{} is a file mapping", path.display());
+        }
+    }
+
+    fn find_font(dir: &Path, depth: u32) -> Option<PathBuf> {
+        let mut dirs = Vec::new();
+        for e in std::fs::read_dir(dir).ok()?.flatten() {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x == "ttf" || x == "otf") && e.metadata().is_ok_and(|m| m.is_file() && m.len() > 0) {
+                return Some(p);
+            }
+            if p.is_dir() {
+                dirs.push(p);
+            }
+        }
+        (depth > 0).then(|| dirs.iter().find_map(|d| find_font(d, depth - 1))).flatten()
     }
 
     #[test]

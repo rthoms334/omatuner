@@ -492,10 +492,11 @@ pub struct HomeScreen {
     recent_movies: Vec<VodSummary>,
     recent_series: Vec<VodSummary>,
     /// (kind, source, key) → movie / series of the favourited titles (all lists), and the
-    /// (library generation, favourites fingerprint) they were resolved for. Only favourites:
-    /// a map of every title cloned every key (~40 MiB for 380k titles).
+    /// (VOD lists, favourites fingerprint) they were resolved for: a zap's library copy shares
+    /// the lists and rescans nothing. Only favourites: a map of every title cloned every key
+    /// (~40 MiB for 380k titles).
     vod_refs: HashMap<ItemRef, VodKind>,
-    vod_refs_for: Option<(u64, u64)>,
+    vod_refs_for: Option<(crate::store::library::VodIdentity, u64)>,
     /// The rails the user sees (actions resolve against them).
     rails: Vec<Rail>,
     rails_key: Option<RailsKey>,
@@ -547,8 +548,9 @@ impl HomeScreen {
             self.recent_movies = take(true, &ctx.lib.vod.movies);
             self.recent_series = take(false, &ctx.lib.vod.series);
         }
-        if self.vod_refs_for != Some((key.generation, key.favs)) {
-            self.vod_refs_for = Some((key.generation, key.favs));
+        let refs_for = (ctx.lib.vod_identity(), key.favs);
+        if self.vod_refs_for.as_ref() != Some(&refs_for) {
+            self.vod_refs_for = Some(refs_for);
             self.vod_refs = favourite_vod(ctx.lib, ctx.favs);
         }
         let mut rails = Vec::new();
@@ -2275,6 +2277,18 @@ mod tests {
         assert_eq!(h.state().s.vod_refs.len(), 2);
         let favs = h.state().s.rails.iter().find(|r| r.kind == RailKind::Favourites).map(|r| r.tiles.len());
         assert_eq!(favs, Some(2), "both favourites have a tile");
+        // a zap (the library copied with another recent list) shares the VOD lists: the rails
+        // are rebuilt for the recent list, the titles are not resolved again
+        let resolved = h.state().s.vod_refs_for.clone();
+        let app = h.state_mut();
+        app.t.lib = Arc::new(app.t.lib.with_recent_channels(Vec::new()));
+        h.run_steps(2);
+        assert!(resolved.is_some() && h.state().s.vod_refs_for == resolved, "no rescan for a zap");
+        // a rebuild has new lists (and the favourites as stored: the toggle above was in memory)
+        testkit::reload_library(&mut h.state_mut().t);
+        h.run_steps(2);
+        assert!(h.state().s.vod_refs_for != resolved);
+        assert_eq!(h.state().s.vod_refs.keys().collect::<Vec<_>>(), [&movie_ref(src, 1)]);
     }
 
     fn movie_ref(s: SourceId, i: usize) -> ItemRef {

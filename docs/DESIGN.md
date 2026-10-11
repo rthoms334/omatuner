@@ -384,7 +384,8 @@ a stream (it follows the player's snapshot channel), and every 5 min; triggers c
 settle, ≥ 10 s apart). The search index exists only while the search card is open (rebuilt in
 the background when it opens). Screens resolve keys only for what they look up (Movies/Series:
 titles with progress or in Favourites; Home: favourited titles), never a map of every title.
-`MemStats` (RSS, swap, `mallinfo2` in use / free) feeds the periodic health line in the log.
+`platform::memstats::MemStats` (RSS, anon, swap, peak, `mallinfo2` in use / free) feeds the 10-min
+health line in the log.
 
 ---
 

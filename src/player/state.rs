@@ -170,6 +170,14 @@ pub struct PlayerMachine {
     race_until: Option<Instant>,
     /// The first [`Input::SourceClosed`] of this Play arrived (the window is armed at most once).
     race_considered: bool,
+    /// Retries spent inside the race window. Counted apart from `attempt` and the one HTTP
+    /// retry: a long window must not use up the budget of other failures before the first frame.
+    race_retries: u32,
+    /// A 403 was retried through the race window: one after the window ends is final.
+    race_spent: bool,
+    /// First-play retries of a provider message ([`super::reconnect::PROVIDER_RETRIES`]),
+    /// counted apart from network reconnects.
+    provider_retries: u32,
     /// The provider's text behind the last `ProviderError`.
     provider_message: Option<String>,
     /// Mirrors of mpv's `pause` / `paused-for-cache` (both persist across files and only fire
@@ -202,6 +210,9 @@ impl PlayerMachine {
             failing_since: None,
             race_until: None,
             race_considered: false,
+            race_retries: 0,
+            race_spent: false,
+            provider_retries: 0,
             provider_message: None,
             paused: false,
             paused_for_cache: false,
@@ -262,6 +273,9 @@ impl PlayerMachine {
                 self.failing_since = None;
                 self.race_until = None;
                 self.race_considered = false;
+                self.race_retries = 0;
+                self.race_spent = false;
+                self.provider_retries = 0;
                 self.provider_message = None;
                 self.last_http = None;
                 self.last_pos = None;
@@ -296,6 +310,8 @@ impl PlayerMachine {
                 if matches!(self.state, PlayerState::Error(_) | PlayerState::Reconnecting { .. }) && self.target.is_some() {
                     self.attempt = 0;
                     self.http_retry_used = false;
+                    self.race_spent = false;
+                    self.provider_retries = 0;
                     self.failing_since = None;
                     self.begin_load(now, &mut fx);
                 }
@@ -490,12 +506,13 @@ impl PlayerMachine {
                     self.fail(PlayerErrorKind::Stalled, now, fx);
                     return;
                 }
-                if (self.attempt > 0 || self.http_retry_used)
+                if (self.attempt > 0 || self.http_retry_used || self.provider_retries > 0)
                     && let Some(s) = self.playing_since
                     && now.duration_since(s) >= self.cfg.policy.stable_after
                 {
                     self.attempt = 0;
                     self.http_retry_used = false;
+                    self.provider_retries = 0;
                     self.failing_since = None;
                 }
             }
@@ -535,8 +552,19 @@ impl PlayerMachine {
         // a 403 right after a zap on the same source: the provider still counts the old stream
         let race = !sticky && !early && kind == PlayerErrorKind::HttpForbidden && self.race_until.is_some_and(|until| now < until);
         let http_once = !sticky && !race && matches!(kind, PlayerErrorKind::HttpForbidden | PlayerErrorKind::HttpNotFound);
-        // the one-shot HTTP retry has its own counter (see `http_retry_used`)
-        let next = if http_once { 1 + u32::from(self.http_retry_used) } else { self.attempt + 1 };
+        let provider = !sticky && kind == PlayerErrorKind::ProviderError;
+        // the one-shot HTTP retry, the race window and a provider message on a first play each
+        // count on their own (see the fields): one never spends another's budget
+        let next = if race {
+            self.race_retries + 1
+        } else if http_once {
+            // a 403 right after the window: the window was its retry
+            if kind == PlayerErrorKind::HttpForbidden && self.race_spent { 2 } else { 1 + u32::from(self.http_retry_used) }
+        } else if provider {
+            self.provider_retries + 1
+        } else {
+            self.attempt + 1
+        };
         let failing_for = now.saturating_duration_since(*self.failing_since.get_or_insert(now));
         fx.push(Effect::StopMpv);
         self.clear_entries();
@@ -555,14 +583,17 @@ impl PlayerMachine {
                 let max = if http_once {
                     self.http_retry_used = true;
                     1
+                } else if race {
+                    self.race_retries = next;
+                    self.race_spent = true;
+                    0
+                } else if provider {
+                    self.provider_retries = next;
+                    super::reconnect::PROVIDER_RETRIES
                 } else {
                     self.attempt = next;
-                    if sticky || race {
-                        // the window spends the 403 retry: a refusal after it ends is final
-                        self.http_retry_used |= race;
+                    if sticky {
                         0
-                    } else if kind == PlayerErrorKind::ProviderError {
-                        super::reconnect::PROVIDER_RETRIES
                     } else if live {
                         self.cfg.policy.max_attempts_live
                     } else {
@@ -1030,6 +1061,84 @@ mod tests {
         m.handle(Input::HttpStatus(403), t0 + secs(3));
         m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry: 2 }, t0 + secs(3));
         assert!(matches!(m.state(), PlayerState::Error(_)), "our own close never arms the window: {:?}", m.state());
+    }
+
+    /// Review fix: a long race window must not use up the first-play budget of other failures.
+    /// After 10 refused attempts inside the window, the provider lets go and the next open times
+    /// out (Network), answers 404, or sends its message: each still gets its own retries. A 403
+    /// after the window stays final.
+    #[test]
+    fn race_window_retries_leave_the_other_budgets_alone() {
+        let t0 = Instant::now();
+        let after_race = |m: &mut PlayerMachine| {
+            m.handle(Input::Play { target: live(), immediate: true }, t0);
+            m.handle(Input::Loaded { entry: Some(1) }, t0);
+            m.handle(Input::SourceClosed(Some(t0)), t0);
+            m.handle(Input::StartFile { entry: 1 }, t0);
+            m.handle(Input::HttpStatus(403), t0);
+            m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry: 1 }, t0);
+            for entry in 2..=10 {
+                let PlayerState::Reconnecting { at, attempt, max: 0, reason: PlayerErrorKind::HttpForbidden } = m.state().clone() else {
+                    panic!("{:?}", m.state())
+                };
+                assert_eq!(attempt, entry as u32 - 1);
+                m.handle(Input::Tick, at);
+                fail_load(m, entry, Some(403), at);
+            }
+            assert!(matches!(m.state(), PlayerState::Reconnecting { attempt: 10, max: 0, .. }), "{:?}", m.state());
+            let PlayerState::Reconnecting { at, .. } = m.state().clone() else { unreachable!() };
+            m.handle(Input::Tick, at);
+            at
+        };
+
+        let mut m = machine();
+        let t = after_race(&mut m);
+        let fx = fail_load(&mut m, 11, None, t);
+        assert!(matches!(m.state(), PlayerState::Reconnecting { attempt: 1, max: 8, reason: PlayerErrorKind::Network, .. }), "{:?}", m.state());
+        assert!(recorded(&fx).is_none());
+
+        let mut m = machine();
+        let t = after_race(&mut m);
+        fail_load(&mut m, 11, Some(404), t);
+        assert!(matches!(m.state(), PlayerState::Reconnecting { attempt: 1, max: 1, reason: PlayerErrorKind::HttpNotFound, .. }), "{:?}", m.state());
+
+        let mut m = machine();
+        let t = after_race(&mut m);
+        m.handle(Input::Loaded { entry: Some(11) }, t);
+        m.handle(Input::ProviderMessage("Max connections reached".into()), t);
+        assert!(matches!(m.state(), PlayerState::Reconnecting { attempt: 1, max: 3, reason: PlayerErrorKind::ProviderError, .. }), "{:?}", m.state());
+
+        // the window is over (t0 + 45 s): a 403 now is final, the window was its retry
+        let mut m = machine();
+        after_race(&mut m);
+        let late = t0 + secs(46);
+        m.handle(Input::Tick, late);
+        let fx = fail_load(&mut m, 11, Some(403), late);
+        assert!(matches!(m.state(), PlayerState::Error(PlayerError { kind: PlayerErrorKind::HttpForbidden, .. })), "{:?}", m.state());
+        assert_eq!(recorded(&fx), Some(PlayerErrorKind::HttpForbidden));
+    }
+
+    /// A provider message on a first play has its own 3 retries, whatever network reconnects
+    /// came before it.
+    #[test]
+    fn provider_retries_survive_earlier_network_reconnects() {
+        let mut t = Instant::now();
+        let mut m = machine();
+        m.handle(Input::Play { target: live(), immediate: true }, t);
+        for entry in 1..=3 {
+            fail_load(&mut m, entry, None, t);
+            let PlayerState::Reconnecting { at, .. } = m.state().clone() else { panic!("{:?}", m.state()) };
+            t = at;
+            m.handle(Input::Tick, t);
+        }
+        m.handle(Input::Loaded { entry: Some(4) }, t);
+        m.handle(Input::ProviderMessage("Cannot read".into()), t);
+        assert!(matches!(m.state(), PlayerState::Reconnecting { attempt: 1, max: 3, reason: PlayerErrorKind::ProviderError, .. }), "{:?}", m.state());
+        // and the network budget carries on where it was
+        let PlayerState::Reconnecting { at, .. } = m.state().clone() else { unreachable!() };
+        m.handle(Input::Tick, at);
+        fail_load(&mut m, 5, None, at);
+        assert!(matches!(m.state(), PlayerState::Reconnecting { attempt: 4, max: 8, .. }), "{:?}", m.state());
     }
 
     /// The provider's text instead of a stream: 3 retries 3 s apart on a first play, then an

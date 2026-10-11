@@ -261,7 +261,8 @@ pub struct PlayerConfig {
     pub sub_langs: Vec<String>,
     pub sub_auto: SubtitleAuto,
     pub sub_scale: f64,
-    /// Reconnect attempts before giving up (live).
+    /// Reconnect attempts before giving up on a live channel that has not played yet (one that
+    /// played keeps reconnecting until stopped, DESIGN §11.4).
     pub reconnect_max_attempts: u32,
     /// Default User-Agent when neither the playlist nor the source sets one.
     pub user_agent: String,

@@ -219,6 +219,8 @@ const LONG: Duration = Duration::from_secs(30);
 
 /// Debug messages of the player controller, in order (see [`controller_log`]).
 static CONTROLLER_LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// The INFO-and-above part of [`CONTROLLER_LOG`] (what a user's log file holds).
+static INFO_LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Records the `message` of every event it is given into [`CONTROLLER_LOG`].
 struct CaptureLayer;
@@ -235,6 +237,9 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
         }
         let mut m = Message(String::new());
         event.record(&mut m);
+        if *event.metadata().level() <= tracing::Level::INFO {
+            INFO_LOG.lock().unwrap_or_else(|e| e.into_inner()).push(m.0.clone());
+        }
         CONTROLLER_LOG.lock().unwrap_or_else(|e| e.into_inner()).push(m.0);
     }
 }
@@ -263,6 +268,7 @@ fn setup() -> Option<(PathBuf, MutexGuard<'static, ()>)> {
     let media = ensure_media()?;
     let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     controller_log(); // earlier tests' lines
+    INFO_LOG.lock().unwrap_or_else(|e| e.into_inner()).clear();
     Some((media, guard))
 }
 
@@ -734,7 +740,12 @@ fn a_played_channel_keeps_reconnecting_through_a_provider_outage_and_recovers() 
         std::thread::sleep(Duration::from_millis(50));
         log.extend(controller_log());
     }
-    assert!(log.iter().any(|l| l.contains("\"Test stream\" Playing → Reconnecting(attempt 1, ")), "{log:#?}");
+    let key = &ch.item.as_ref().unwrap().key.0;
+    assert!(log.iter().any(|l| l.contains(&format!("source 1 {key} Playing → Reconnecting(attempt 1, "))), "{log:#?}");
+    // titles stay out of INFO lines (explicit titles must never reach the log file)
+    let info = std::mem::take(&mut *INFO_LOG.lock().unwrap_or_else(|e| e.into_inner()));
+    assert!(!info.iter().any(|l| l.contains("Test stream")), "{info:#?}");
+    assert!(info.iter().any(|l| l.starts_with("player: recovered after ")), "{info:#?}");
     assert!(log.iter().any(|l| l.starts_with("player: the provider answered with a message") && l.contains(PROVIDER_TEXT)), "{log:#?}");
     assert!(log.iter().any(|l| l.starts_with("player: recovered after ")), "{log:#?}");
     assert!(!log.iter().any(|l| l.contains("http://")), "no stream addresses: {log:#?}");

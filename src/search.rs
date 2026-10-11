@@ -193,10 +193,24 @@ impl SearchIndex {
         let (injector, cancel) = self.restart(include_locked);
         let lib = lib.clone();
         spawn_inject(move || {
+            // opened and closed again before this thread ran: don't collect at all
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
             let items = collect_items(&lib);
             drop(lib);
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
             inject(items, &injector, &cancel)
         });
+    }
+
+    /// Stop the background collection and injection now (the index is about to be dropped on
+    /// another thread, which may be busy for a while: quick reopen-and-close would otherwise
+    /// run several full collections at once).
+    pub fn cancel(&self) {
+        self.inject_cancel.store(true, Ordering::Relaxed);
     }
 
     /// Cancel the previous injection and empty the index: the new injector and its cancel flag.
@@ -706,6 +720,14 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         settle(&mut idx, 10);
         assert_eq!(idx.results(SearchSection::Live, 100).len(), 10);
+        idx.rebuild_shared(&lib, false);
+        // the card closed: cancelled before the index is handed to the maintenance thread
+        idx.cancel();
+        let t = Instant::now();
+        while Arc::strong_count(&lib) > 1 {
+            assert!(t.elapsed() < Duration::from_secs(10), "a cancelled collection lets go of the snapshot");
+            std::thread::sleep(Duration::from_millis(5));
+        }
         idx.rebuild_shared(&lib, false);
         drop(idx);
         let t = Instant::now();
