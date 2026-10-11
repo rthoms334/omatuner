@@ -63,7 +63,7 @@ use crate::theme::{SpaceToken, Theme, ThemeEvent};
 use crate::ui::data::{FrameBudget, NowNextCache};
 use crate::ui::overlays::{self, Overlay, OverlayOutcome};
 use crate::ui::popout::{PopOut, Toggle};
-use crate::ui::video_host::{Placement, VideoHost};
+use crate::ui::video_host::{MiniAction, Placement, VideoHost};
 use crate::ui::widgets::status_bar::{StatusClick, StatusInfo};
 use crate::ui::widgets::toast::Toasts;
 use crate::ui::{BackTarget, LayoutClass, NavRequest, OnboardingStart, OverlayRequest, ParentalSession, Route, Screen, ScreenId, UiCtx, UiParts};
@@ -1268,8 +1268,9 @@ impl eframe::App for TunerApp {
         {
             let snap = self.snapshot.clone();
             match self.video.mini_player(&egui_ctx, &theme, &snap) {
-                Some(true) => self.nav.push(NavRequest::Push(Route::Player)),
-                Some(false) => self.send_player(PlayerCommand::Stop),
+                Some(MiniAction::Open) => self.nav.push(NavRequest::Push(Route::Player)),
+                Some(MiniAction::PopOut) => self.nav.push(NavRequest::TogglePopOut),
+                Some(MiniAction::Stop) => self.send_player(PlayerCommand::Stop),
                 None => {}
             }
         }
@@ -3102,6 +3103,21 @@ mod tests {
         rig.frame_with(vec![]);
         assert!(rig.app.window_fullscreen);
         assert_eq!(rig.app.services().config().player.popout_last, None, "unmoved: follow the corner again");
+    }
+
+    /// Popped out, the mouse back button is Esc there too: it puts the window back in.
+    #[test]
+    fn the_mouse_back_button_pops_the_player_back_in() {
+        let mut rig = Rig::new();
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        rig.app.popout_backend = Some(Box::new(PopRecorder(sent.clone())));
+        rig.press(Key::O, Modifiers { shift: true, ..CTRL });
+        rig.size = egui::vec2(480.0, 270.0);
+        rig.frame_with(vec![]);
+        rig.event(pop_event(PopOutEvent::PoppedOut));
+        assert!(rig.app.video_only);
+        rig.mouse_button(egui::PointerButton::Extra1);
+        assert_eq!(sent.borrow().last(), Some(&PopRequest::In { ours: true }));
     }
 
     /// A movie finishing while popped out doesn't pull the window back in: its page lands

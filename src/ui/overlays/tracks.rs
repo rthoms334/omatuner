@@ -314,6 +314,11 @@ impl Look<'_> {
             if self.target(ui, r, ("tab", tab), label, Some(tab == audio)).on_hover_text("Tab switches").clicked() {
                 click = Some(Click::Tab(tab));
             }
+            // the open tab is underlined, so the two read as tabs, not as a title
+            if tab == audio {
+                let y = head.bottom() - 1.0;
+                ui.painter().line_segment([egui::pos2(x, y), egui::pos2(x + g.size().x, y)], egui::Stroke::new(2.0, t.osd_accent));
+            }
             ui.painter().galley(egui::pos2(x, head.center().y - g.size().y / 2.0), g, color);
             x = r.right() + self.pad / 2.0;
         }
@@ -321,7 +326,7 @@ impl Look<'_> {
         if self.target(ui, close, "close", "Close (Esc)", None).on_hover_text("Close (Esc)").clicked() {
             click = Some(Click::Close);
         }
-        osd_text(ui.painter(), close.center(), Align2::CENTER_CENTER, glyphs::CLOSE, self.caption.clone(), t.osd_text, f32::INFINITY);
+        osd_text(ui.painter(), close.center(), Align2::CENTER_CENTER, glyphs::CLOSE, self.font.clone(), t.osd_text, f32::INFINITY);
         click
     }
 
@@ -373,12 +378,15 @@ impl Look<'_> {
         let less = Rect::from_min_size(egui::pos2(val.left() - side, r.top()), egui::vec2(side, side));
         let delay = name == "Delay";
         let mut click = None;
-        for (rect, text, tip, step) in [
+        for (slot, (rect, text, tip, step)) in [
             (less, glyphs::CHEVRON_LEFT, if delay { "Earlier (←)" } else { "Smaller (←)" }, Some(false)),
             (val, value.as_str(), "Reset (Enter)", None),
             (more, glyphs::CHEVRON_RIGHT, if delay { "Later (→)" } else { "Larger (→)" }, Some(true)),
-        ] {
-            if self.target(ui, rect, ("step", i, rect.left() as i32), &format!("{name}: {tip}"), None).on_hover_text(tip).clicked() {
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if self.target(ui, rect, ("step", i, slot), &format!("{name}: {tip}"), None).on_hover_text(tip).clicked() {
                 click = Some(step.map_or(Click::Row(i), |up| Click::Step(i, up)));
             }
             osd_text(ui.painter(), rect.center(), Align2::CENTER_CENTER, text, self.font.clone(), color, rect.width());

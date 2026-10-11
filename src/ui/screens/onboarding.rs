@@ -1168,7 +1168,7 @@ impl Screen for OnboardingScreen {
                         Step::Welcome => choice_rows(
                             ui,
                             theme,
-                            self.focus,
+                            &mut self.focus,
                             &[
                                 (glyphs::ADD, "Add a playlist", "Xtream login, M3U playlist or free channels"),
                                 (glyphs::BACKUP, "Restore a backup", "A Tuner backup file (.json)"),
@@ -1177,7 +1177,7 @@ impl Screen for OnboardingScreen {
                         Step::Type => choice_rows(
                             ui,
                             theme,
-                            self.focus,
+                            &mut self.focus,
                             &[
                                 (glyphs::SOURCE_XTREAM, "Xtream login", "Server, username and password"),
                                 (glyphs::SOURCE_URL, "M3U URL", "A playlist link (Xtream playlists sign in automatically)"),
@@ -1201,11 +1201,11 @@ impl Screen for OnboardingScreen {
             // from Settings / a file / a restored playlist
             ui.horizontal(|ui| {
                 if let Some(label) = self.back_label() {
-                    back_clicked = button(ui, theme, Some(glyphs::PREVIOUS), label, ButtonStyle::default()).clicked();
+                    back_clicked = button(ui, theme, Some(glyphs::CHEVRON_LEFT), label, ButtonStyle::default()).clicked();
                     ui.add_space(theme.space(SpaceToken::Lg));
                 } else if self.step == Step::Importing && self.start != OnboardingStart::Welcome {
                     // a card opened over the app: the import goes on without it (Esc)
-                    leave_clicked = button(ui, theme, Some(glyphs::PREVIOUS), "Continue in background", ButtonStyle::default()).clicked();
+                    leave_clicked = button(ui, theme, Some(glyphs::CHEVRON_LEFT), "Continue in background", ButtonStyle::default()).clicked();
                     ui.add_space(theme.space(SpaceToken::Lg));
                 }
                 // (the picker draws its own key line)
@@ -1242,12 +1242,17 @@ impl Screen for OnboardingScreen {
     }
 }
 
-/// Launcher-style choice rows; returns the clicked row.
-fn choice_rows(ui: &mut egui::Ui, theme: &Theme, focus: usize, items: &[(&str, &str, &str)]) -> Option<usize> {
+/// Launcher-style choice rows; returns the clicked row. The pointer moving over a row moves the
+/// focus there (one cursor, as in menus; a still pointer leaves the keyboard's alone).
+fn choice_rows(ui: &mut egui::Ui, theme: &Theme, focus: &mut usize, items: &[(&str, &str, &str)]) -> Option<usize> {
     let mut clicked = None;
+    let moved = ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO);
     for (i, (icon, label, detail)) in items.iter().enumerate() {
-        let state = rows::with_hover(ui, theme, true, if i == focus { RowState::Cursor } else { RowState::Idle });
-        if rows::menu_row(ui, theme, Some(icon), label, Some(detail), true, state).clicked() {
+        let resp = rows::menu_row(ui, theme, Some(icon), label, Some(detail), true, if i == *focus { RowState::Cursor } else { RowState::Idle });
+        if moved && resp.hovered() {
+            *focus = i;
+        }
+        if resp.clicked() {
             clicked = Some(i);
         }
     }

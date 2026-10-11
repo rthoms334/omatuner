@@ -118,10 +118,24 @@ pub fn icon_button(ui: &mut egui::Ui, theme: &Theme, icon: &str, tooltip: &str, 
     if tooltip.is_empty() { resp } else { resp.on_hover_text(egui::RichText::new(tooltip).size(theme.font(TypeToken::BodySmall))) }
 }
 
+/// Longest label a breadcrumb-like button shows (an IPTV category name can run to 60 chars and
+/// would squeeze the filter beside it to nothing).
+pub const LABEL_MAX_CHARS: usize = 24;
+
+/// `label` cut to `max` characters with "…" (the accessible name keeps the whole label).
+pub fn short_label(label: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    if label.chars().count() <= max {
+        return label.into();
+    }
+    let cut: String = label.chars().take(max.saturating_sub(1)).collect();
+    format!("{}…", cut.trim_end()).into()
+}
+
 /// `‹ Settings`: the borderless back button of a page or pane. Its accessible name is "Back to
-/// {label}"; the screen decides what a click does (usually `NavRequest::Back`).
+/// {label}"; the screen decides what a click does (usually `NavRequest::Back`). A long label
+/// is shortened on screen.
 pub fn back_button(ui: &mut egui::Ui, theme: &Theme, label: &str) -> egui::Response {
-    let resp = button(ui, theme, Some(super::glyphs::CHEVRON_LEFT), label, ButtonStyle::default());
+    let resp = button(ui, theme, Some(super::glyphs::CHEVRON_LEFT), &short_label(label, LABEL_MAX_CHARS), ButtonStyle::default());
     let name = format!("Back to {label}");
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &name));
     resp.on_hover_text(egui::RichText::new("Back (Esc · Alt+← · mouse back)").size(theme.font(TypeToken::BodySmall)))

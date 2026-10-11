@@ -655,6 +655,9 @@ enum Pane {
 pub struct SettingsScreen {
     page: SettingsPage,
     pane: Pane,
+    /// When a click on the page list last opened a page (egui time): at Compact the page
+    /// replaces the list, and the second click of a double-click mustn't act on its rows.
+    page_clicked_at: Option<f64>,
     /// Focused row (index into the page's rows; only focusable rows are chosen).
     row: usize,
     editing: bool,
@@ -2537,7 +2540,10 @@ impl SettingsScreen {
         egui::ScrollArea::vertical().id_salt("settings-pages-scroll").auto_shrink([false, false]).show(ui, |ui| {
             for (page, icon, label) in PAGES {
                 let selected = page == self.page;
-                let state = rows::with_hover(ui, theme, false, RowState::from_flags(selected && self.pane == Pane::Pages, selected));
+                // hover lights a page only while the keyboard cursor is in the content (one
+                // cursor at a time; moving it here would switch the page under the pointer)
+                let state = RowState::from_flags(selected && self.pane == Pane::Pages, selected);
+                let state = if self.pane == Pane::Pages { state } else { rows::with_hover(ui, theme, false, state) };
                 if rows::menu_row(ui, theme, Some(icon), label, None, false, state).clicked() {
                     clicked = Some(page);
                 }
@@ -2546,6 +2552,7 @@ impl SettingsScreen {
         if let Some(p) = clicked {
             self.set_page(ctx, p);
             self.pane = Pane::Content;
+            self.page_clicked_at = Some(ui.input(|i| i.time));
         }
     }
 
@@ -2578,14 +2585,13 @@ impl SettingsScreen {
         };
         if let Some(label) = back_to {
             if back_button(ui, theme, label).clicked() {
-                // what Esc does from the page (a field being edited is left as it is)
-                self.editing = false;
-                if self.attach.take().is_some() || self.editor.take().is_some() {
-                    self.error = None;
-                    self.row = 0;
-                } else {
-                    self.pane = Pane::Pages;
+                // exactly what Esc does from the page: a field being edited is left first
+                // (keeping what was typed), then the sub-view / the page
+                self.pane = Pane::Content;
+                if self.editing {
+                    self.on_action(ctx, Action::Back);
                 }
+                self.on_action(ctx, Action::Back);
             }
             ui.add_space(theme.space(SpaceToken::Xs));
         }
@@ -2805,6 +2811,10 @@ impl SettingsScreen {
         }
         if let Some(i) = hovered.filter(|_| !self.editing) {
             self.row = i;
+        }
+        if crate::ui::widgets::second_click_after(ui, self.page_clicked_at) {
+            text_clicked = None;
+            clicked = None;
         }
         if let Some(i) = text_clicked {
             self.pane = Pane::Content;
@@ -3432,13 +3442,38 @@ mod tests {
         h.state_mut().enter(Route::Settings(SettingsPage::Player));
         h.run_steps(2);
         assert!(has_label(&h, "Hardware decoding") && !has_label(&h, "Hidden items"), "the page, alone");
+        // left mid-edit, like Esc: what was typed is kept
+        focus(&mut h, "Subtitle languages");
+        h.state_mut().act(Action::Activate);
+        h.run_steps(2);
+        type_text(&mut h, ", de");
         h.get_by_label("Back to Settings").click();
         h.run_steps(2);
         assert!(has_label(&h, "Hidden items") && !has_label(&h, "Hardware decoding"), "the page list");
+        h.state_mut().apply_config();
+        assert!(h.state().t.config.player.sub_langs.iter().any(|l| l == "de"), "{:?}", h.state().t.config.player.sub_langs);
         h.get_by_label("Interface").click();
         h.run_steps(2);
         assert_eq!(h.state().s.page, SettingsPage::Interface);
         assert!(has_label(&h, "Back to Settings"));
+    }
+
+    /// A sub-view's `‹ {page}` button closes it like Esc: the source editor goes, the page's
+    /// rows are back.
+    #[test]
+    fn the_source_editor_back_button_closes_it_like_esc() {
+        let (mut t, one) = rig();
+        seed(&mut t, |c| testkit::source(c, "Alpha").map(|_| ()));
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 1000.0));
+        h.state_mut().enter(Route::Settings(SettingsPage::Playlists));
+        until(&mut h, "the source", |h| has_label(h, "Alpha"));
+        focus(&mut h, "Alpha");
+        h.state_mut().act(Action::Activate);
+        h.run_steps(2);
+        assert!(has_label(&h, "EDIT ALPHA"));
+        h.get_by_label("Back to Playlists").click();
+        h.run_steps(2);
+        assert!(!has_label(&h, "EDIT ALPHA") && has_label(&h, "Alpha"), "the editor closed");
     }
 
     /// ←/→ on a guide's offset shows at once but is saved (and the guide re-imported) once the

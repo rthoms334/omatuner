@@ -38,6 +38,8 @@ pub(super) fn scrim(egui_ctx: &egui::Context, theme: &Theme, id: &str) -> bool {
 
 /// How long the card border flashes when a click outside can't close a dirty overlay.
 const FLASH_S: f64 = 0.3;
+/// How long after that flash the pointer's tooltip says why.
+const FLASH_HINT_S: f64 = 3.0;
 
 fn flash_id(id: &str) -> egui::Id {
     egui::Id::new((id, "flash"))
@@ -54,6 +56,13 @@ pub(super) fn scrim_guarded(egui_ctx: &egui::Context, theme: &Theme, id: &str, d
         .show(egui_ctx, |ui| {
             let r = ui.allocate_rect(screen, egui::Sense::click());
             ui.painter().rect_filled(screen, 0.0, theme.tokens.scrim);
+            // after a flash, the pointer says why the click outside did nothing
+            let flashed = ui.data(|d| d.get_temp::<f64>(flash_id(id))).is_some_and(|at| ui.input(|i| i.time) - at < FLASH_HINT_S);
+            let r = if dirty && flashed {
+                r.on_hover_text(RichText::new("Unsaved changes — Cancel or Esc to discard").size(theme.font(TypeToken::BodySmall)))
+            } else {
+                r
+            };
             r.clicked() || r.secondary_clicked()
         })
         .inner;

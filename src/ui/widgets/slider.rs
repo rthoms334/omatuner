@@ -137,7 +137,12 @@ pub fn slider_in(ui: &egui::Ui, rect: Rect, id: egui::Id, theme: &Theme, value: 
 pub fn wheel_notches(ui: &egui::Ui, id: egui::Id) -> f32 {
     let key = id.with("wheel");
     let delta = ui.input(|i| i.smooth_scroll_delta.y);
-    let mut acc = ui.data(|d| d.get_temp::<f32>(key)).unwrap_or(0.0) + delta;
+    let mut acc = ui.data(|d| d.get_temp::<f32>(key)).unwrap_or(0.0);
+    // a remainder left from scrolling the other way would swallow this notch
+    if delta != 0.0 && acc.signum() != delta.signum() {
+        acc = 0.0;
+    }
+    acc += delta;
     // smoothing splits a notch into parts whose sum can miss it by a rounding error
     let notches = (acc / WHEEL_NOTCH + 1e-3 * acc.signum()).trunc();
     acc -= notches * WHEEL_NOTCH;

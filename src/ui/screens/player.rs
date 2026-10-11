@@ -74,6 +74,8 @@ const VOLUME_MAX: f32 = 130.0;
 const VOLUME_WHEEL: f32 = 5.0;
 /// How long the volume the user just set is shown while mpv's echo is on its way.
 const VOLUME_ECHO: Duration = Duration::from_secs(1);
+/// A pointer still for this long (s) on an OSD bar no longer holds the banner up.
+const POINTER_REST: f32 = 10.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PanelKind {
@@ -321,6 +323,10 @@ impl PlayerScreen {
         }
         ctx.play(PlayerCommand::SetVolume(f64::from(v)));
         self.volume_local = Some((v, Instant::now()));
+        // the pop-out strip's slider has no level readout next to it
+        if ctx.video_only {
+            self.flash = Some((Flash::Volume, Instant::now()));
+        }
         self.show_banner(ctx);
     }
 
@@ -375,8 +381,14 @@ impl PlayerScreen {
         }
         let spec = SliderSpec { range: 0.0..=VOLUME_MAX, step: 1.0, marks: &[100.0], wheel_step: Some(VOLUME_WHEEL), label: "Volume", look };
         let mut v = level;
-        if slider::slider_in(ui, sr, ui.id().with("osd-volume"), theme, &mut v, false, &spec).changed() {
+        let r = slider::slider_in(ui, sr, ui.id().with("osd-volume"), theme, &mut v, false, &spec);
+        if r.changed() {
             self.set_volume(ctx, v);
+        } else if muted && (r.clicked() || r.drag_started()) && self.unmuting.is_none() {
+            // a click on the knob itself sets nothing new, but still means "unmute"
+            ctx.play(PlayerCommand::ToggleMute);
+            self.unmuting = Some(Instant::now());
+            self.show_banner(ctx);
         }
         if let Some(lr) = label_rect {
             let text = if muted { "Muted".to_owned() } else { format!("{v:.0} %") };
@@ -587,6 +599,8 @@ impl PlayerScreen {
         let mut items = Vec::new();
         if live {
             items.push(menu_item(glyphs::PLAYLIST, "Channels…", Action::ChannelList, true, k));
+            items.push(menu_item(glyphs::GUIDE, "Now / next…", Action::MiniGuide, true, k));
+            items.push(menu_item(glyphs::HISTORY, "History…", Action::ChannelHistory, true, k));
             items.push(menu_item(glyphs::HISTORY, "Last channel", Action::LastChannel, snap.previous_live.is_some(), k));
             if let Some(ch) = playing_channel(snap).and_then(|id| ctx.lib.live.get(id)) {
                 let fav = ctx.favs.is_fav(&live::channel_ref(ch));
@@ -1001,7 +1015,7 @@ impl PlayerScreen {
         let inner = strip.shrink(pad);
         let buttons = snap.paused || ui.ctx().pointer_hover_pos().is_some_and(|pos| rect.contains(pos));
         let text_right = if buttons {
-            self.draw_strip_buttons(ui, ctx, &p, inner, title_font.clone(), snap, strip.width() >= 360.0) - pad
+            self.draw_strip_buttons(ui, ctx, &p, inner, title_font.clone(), snap) - pad
         } else {
             let vol = if snap.muted { format!("{} muted", glyphs::MUTED) } else { format!("{} {:.0} %", glyphs::VOLUME, snap.volume) };
             osd_text(&p, inner.right_top(), Align2::RIGHT_TOP, &vol, small_font.clone(), t.osd_text, f32::INFINITY).left() - pad
@@ -1042,17 +1056,9 @@ impl PlayerScreen {
     }
 
     /// The pop-out strip's buttons, right-aligned in `inner` (the strip's two text lines high);
-    /// returns their left edge.
-    fn draw_strip_buttons(
-        &mut self,
-        ui: &egui::Ui,
-        ctx: &mut UiCtx<'_>,
-        p: &egui::Painter,
-        inner: Rect,
-        font: FontId,
-        snap: &PlayerSnapshot,
-        with_slider: bool,
-    ) -> f32 {
+    /// returns their left edge. The text keeps room: the slider only from 560 pt, previous /
+    /// next only from 420 pt (the wheel over the speaker still steps the volume).
+    fn draw_strip_buttons(&mut self, ui: &egui::Ui, ctx: &mut UiCtx<'_>, p: &egui::Painter, inner: Rect, font: FontId, snap: &PlayerSnapshot) -> f32 {
         #[derive(Clone, Copy)]
         enum B {
             Prev,
@@ -1066,13 +1072,17 @@ impl PlayerScreen {
         let side = inner.height();
         let gap = theme.space(SpaceToken::Xxs);
         let square = |right: f32| Rect::from_min_size(egui::pos2(right - side, inner.top()), egui::vec2(side, side));
+        let rem = theme.rem();
+        let wide = inner.width() >= 560.0 * rem;
+        let skips = inner.width() >= 420.0 * rem;
         // right to left: stop, pop in, volume, next, play, previous
         let stop = square(inner.right());
         let pop_in = square(stop.left() - gap);
-        let slider = with_slider.then(|| Rect::from_min_size(egui::pos2(pop_in.left() - gap - 64.0, inner.top()), egui::vec2(64.0, side)));
+        let slider_w = 64.0 * rem;
+        let slider = wide.then(|| Rect::from_min_size(egui::pos2(pop_in.left() - gap - slider_w, inner.top()), egui::vec2(slider_w, side)));
         let speaker = square(slider.map_or(pop_in.left(), |s| s.left()) - gap);
         let next = square(speaker.left() - gap);
-        let play = square(next.left() - gap);
+        let play = if skips { square(next.left() - gap) } else { next };
         let prev = square(play.left() - gap);
         self.draw_volume(ui, ctx, p, speaker, slider.map(|s| (s, None)), font.clone(), snap);
         let (prev_label, next_label) =
@@ -1087,6 +1097,9 @@ impl PlayerScreen {
         ];
         let mut clicked = None;
         for (i, (b, r, glyph, label, tip)) in buttons.into_iter().enumerate() {
+            if !skips && matches!(b, B::Prev | B::Next) {
+                continue;
+            }
             if osd_button(ui, p, theme, r, ui.id().with(("strip-button", i)), glyph, font.clone(), label, Some(tip), false).clicked() {
                 clicked = Some(b);
             }
@@ -1105,7 +1118,7 @@ impl PlayerScreen {
         if clicked.is_some() {
             self.show_banner(ctx);
         }
-        prev.left()
+        if skips { prev.left() } else { play.left() }
     }
 
     /// `[HD] [5.1] [CC] [⟲]` right-aligned at `right_center`; returns their extent.
@@ -1355,7 +1368,7 @@ impl PlayerScreen {
         let p = ui.painter_at(rect);
         p.rect_filled(rect, 0.0, Color32::BLACK);
         let (title, hint, title_font, hint_font) = if ctx.video_only {
-            ("Nothing playing", "o or Esc: back to the full window", TypeToken::Subtitle, TypeToken::BodySmall)
+            ("Nothing playing", "o · Esc", TypeToken::Subtitle, TypeToken::BodySmall)
         } else {
             ("Nothing is playing", "Esc goes back", TypeToken::Title, TypeToken::Body)
         };
@@ -1365,15 +1378,17 @@ impl PlayerScreen {
         let hr =
             osd_text(&p, rect.center() + egui::vec2(0.0, 8.0), Align2::CENTER_TOP, hint, font.clone(), with_alpha(t.osd_text, 0.7), rect.width());
         let (text, label) = if ctx.video_only {
-            (format!("{}  Back to the full window", glyphs::POP_IN), "Back to the full window")
+            (format!("{}  Back to the full window", glyphs::POP_IN), "Back to the full window".to_owned())
         } else {
-            (format!("{}  Back", glyphs::ARROW_LEFT), "Back")
+            // like every other back button: says where it goes
+            let label = ctx.back.map_or_else(|| "Back".to_owned(), |b| format!("Back to {}", b.label));
+            (format!("{}  {label}", glyphs::CHEVRON_LEFT), label)
         };
         let pad = theme.space(SpaceToken::Md);
         let size = p.layout_no_wrap(text.clone(), font.clone(), t.osd_text).size() + egui::vec2(2.0 * pad, pad);
         let br = Rect::from_center_size(egui::pos2(rect.center().x, hr.bottom() + pad + size.y / 2.0), size);
         p.rect_stroke(br, t.rounding, egui::Stroke::new(1.0, with_alpha(t.osd_text, 0.6)), egui::StrokeKind::Inside);
-        let button = osd_button(ui, &p, theme, br, ui.id().with("player-idle-back"), &text, font, label, None, false).clicked();
+        let button = osd_button(ui, &p, theme, br, ui.id().with("player-idle-back"), &text, font, &label, None, false).clicked();
         if ctx.video_only {
             if button || background.double_clicked() {
                 ctx.navigate(NavRequest::TogglePopOut);
@@ -1456,8 +1471,9 @@ impl PlayerScreen {
                 x = br.right() + pad / 2.0;
                 osd_button(ui, &p, theme, br, ui.id().with(("next-episode-button", i)), &text, small.clone(), label, Some(tip), false).clicked()
             };
-            let play = button(format!("{}  Play now", glyphs::PLAY), "Play now", "Play now (Enter)", 0);
-            let cancel = button(format!("{}  Cancel", glyphs::CLOSE), "Cancel", "Cancel (Esc)", 1);
+            // the keys stay on the buttons (the card used to be keys only)
+            let play = button(format!("{}  Play now · Enter", glyphs::PLAY), "Play now", "Play now (Enter)", 0);
+            let cancel = button(format!("{}  Cancel · Esc", glyphs::CLOSE), "Cancel", "Cancel (Esc)", 1);
             if cancel {
                 self.next_episode = None;
             } else if play || card.clicked() {
@@ -1784,6 +1800,9 @@ impl Screen for PlayerScreen {
             return;
         }
         let resp = ctx.video.paint(ui, rect, Placement::Fullscreen, theme, ctx.images, &snap);
+        // popped out, a drag on the video moves the window (only there: a drag-sensing video
+        // counts as hovered under every button drawn over it, see the wheel and cursor below)
+        let resp = if ctx.video_only { resp.interact(egui::Sense::drag()) } else { resp };
         // a failed / reconnecting stream: Retry / Last channel buttons under the message
         let p = ui.painter_at(rect);
         for (i, b) in ctx.video.state_buttons().to_vec().into_iter().enumerate() {
@@ -1817,16 +1836,6 @@ impl Screen for PlayerScreen {
         }
         if ctx.video_only && resp.drag_started_by(egui::PointerButton::Primary) {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-        }
-        if resp.hovered() {
-            self.wheel += ui.input(|i| i.smooth_scroll_delta.y);
-            let steps = (self.wheel / 40.0).trunc();
-            if steps != 0.0 {
-                self.wheel -= steps * 40.0;
-                ctx.play(PlayerCommand::AdjustVolume(f64::from(steps) * 5.0));
-                self.flash = Some((Flash::Volume, Instant::now()));
-                self.show_banner(ctx);
-            }
         }
         // numeric entry auto-commit
         if let Some((_, at)) = &self.numeric {
@@ -1873,11 +1882,30 @@ impl Screen for PlayerScreen {
         if self.flash.is_some_and(|(_, at)| at.elapsed() < FLASH) || self.flash_text.as_ref().is_some_and(|(_, at)| at.elapsed() < FLASH) {
             ui.ctx().request_repaint_after(Duration::from_millis(200));
         }
-        // the banner stays while the pointer rests on a bar (it would vanish under a drag of
-        // the volume or the seek bar); with the banner gone the pointer hides over the video
-        if self.bars.iter().any(|b| ui.rect_contains_pointer(*b)) {
+        // wheel = volume, after everything drawn over the video: the speaker / slider and the
+        // panel's list take their own scroll first (they consume it)
+        if resp.hovered() {
+            self.wheel += ui.input(|i| i.smooth_scroll_delta.y);
+            let steps = (self.wheel / 40.0).trunc();
+            if steps != 0.0 {
+                self.wheel -= steps * 40.0;
+                ctx.play(PlayerCommand::AdjustVolume(f64::from(steps) * 5.0));
+                self.flash = Some((Flash::Volume, Instant::now()));
+                self.show_banner(ctx);
+            }
+        }
+        // the banner stays while the pointer is in use on a bar (it would vanish under a drag of
+        // the volume or the seek bar) — not under a pointer parked there for good, which would
+        // keep it up for keyboard users; with the banner gone the pointer hides over the video
+        // (not over a control that asked for its own cursor)
+        let pointer_live = ui.input(|i| i.pointer.any_down() || i.pointer.time_since_last_movement() < POINTER_REST);
+        if pointer_live && self.bars.iter().any(|b| ui.rect_contains_pointer(*b)) {
             self.show_banner(ctx);
-        } else if !self.banner_visible(&snap) && self.next_episode.is_none() && resp.hovered() {
+        } else if !self.banner_visible(&snap)
+            && self.next_episode.is_none()
+            && resp.hovered()
+            && ui.ctx().output(|o| o.cursor_icon == egui::CursorIcon::Default)
+        {
             ui.ctx().set_cursor_icon(egui::CursorIcon::None);
         }
     }
@@ -1997,6 +2025,78 @@ mod tests {
             sync(h);
             !real(h).muted && real(h).volume == 65.0
         });
+        // half a notch over the video, then a notch over the speaker: the speaker's notch
+        // alone counts (the video used to take it too, +10)
+        let wheel = |h: &H, unit, dy| {
+            h.event(egui::Event::MouseWheel { unit, delta: egui::vec2(0.0, dy), phase: egui::TouchPhase::Move, modifiers: egui::Modifiers::NONE })
+        };
+        h.hover_at(egui::pos2(WIDE.x / 3.0, WIDE.y / 2.0));
+        wheel(&h, egui::MouseWheelUnit::Point, 20.0);
+        h.run_steps(30);
+        h.hover_at(h.get_by_label("Mute").rect().center());
+        wheel(&h, egui::MouseWheelUnit::Line, 1.0);
+        until(&mut h, "one notch over the speaker", |h| {
+            sync(h);
+            real(h).volume >= 70.0
+        });
+        h.run_steps(30);
+        std::thread::sleep(Duration::from_millis(100));
+        h.run_steps(2);
+        assert_eq!(real(&h).volume, 70.0, "one notch, one step");
+    }
+
+    /// The banner stays while the pointer is in use on a bar, but a pointer parked there (a
+    /// keyboard user's, pushed out of the way) doesn't keep it up for good.
+    #[test]
+    fn a_pointer_parked_on_a_bar_lets_the_banner_time_out() {
+        let mut h = player(WIDE);
+        let mut c = (*h.state().t.config).clone();
+        c.interface.osd_timeout_ms = 300;
+        h.state_mut().t.config = Arc::new(c);
+        let banner = |h: &H| h.state().s.banner_shown(&real(h));
+        // frames keep coming for 0.4 s (longer than the timeout), as they do on screen
+        let frames = |h: &mut H| {
+            for _ in 0..20 {
+                std::thread::sleep(Duration::from_millis(20));
+                h.run_steps(1);
+            }
+        };
+        // on the bottom bar, beside the controls
+        let at = h.get_by_label("Play / pause").rect().center() + egui::vec2(0.0, -40.0);
+        h.hover_at(at);
+        h.run_steps(1);
+        assert!(h.state_mut().act(Action::ZapNext));
+        frames(&mut h);
+        assert!(banner(&h), "held while the pointer was just moved there");
+        // 10 s of a still pointer (frames are 20 ms apart in egui's clock)
+        h.run_steps(520);
+        assert!(h.state_mut().act(Action::ZapNext));
+        frames(&mut h);
+        assert!(!banner(&h), "a parked pointer doesn't hold the banner");
+    }
+
+    /// Popped out: the strip under the pointer has the way back to the full window, and so does
+    /// the card shown when nothing plays.
+    #[test]
+    fn the_pop_out_strip_and_idle_card_lead_back_to_the_full_window() {
+        let (mut t, one) = rig();
+        t.video_only = true;
+        let size = egui::vec2(640.0, 360.0);
+        let mut h = harness(t, one, PlayerScreen::default(), size);
+        sync(&mut h);
+        h.state_mut().enter(Route::Player);
+        h.hover_at(egui::pos2(size.x / 2.0, size.y / 3.0));
+        h.run_steps(3);
+        assert!(has_label(&h, "Volume") && has_label(&h, "Stop and close"), "the strip's buttons");
+        h.state_mut().nav();
+        h.get_by_label("Back to the full window").click();
+        h.run_steps(1);
+        assert_eq!(h.state_mut().nav(), vec![NavRequest::TogglePopOut]);
+        h.state_mut().t.snapshot = Arc::new(PlayerSnapshot::default());
+        h.run_steps(2);
+        h.get_by_label("Back to the full window").click();
+        h.run_steps(1);
+        assert_eq!(h.state_mut().nav(), vec![NavRequest::TogglePopOut]);
     }
 
     /// Below 700 pt: the speaker alone (it mutes, the wheel over it steps), and zapping stays.

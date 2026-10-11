@@ -46,6 +46,17 @@ pub enum Placement {
     Mini,
 }
 
+/// What a click on the corner mini player asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MiniAction {
+    /// The video: open the fullscreen player.
+    Open,
+    /// Pop the player out (small window on every workspace).
+    PopOut,
+    /// ✕: stop playback.
+    Stop,
+}
+
 /// A recovery action offered as a button under a failed / reconnecting stream in the
 /// fullscreen player (the keys `r` / Backspace do the same).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,8 +135,7 @@ impl VideoHost {
 
     /// Paint the video into `rect` (mpv draws black bars), plus the state overlay (with the
     /// channel logo from `images`). Returns the response over the whole rect (click /
-    /// double-click handling by the caller; in `Fullscreen` it also senses drags, which the
-    /// popped-out player turns into moving the window). A fullscreen failed / reconnecting
+    /// double-click handling by the caller). A fullscreen failed / reconnecting
     /// stream also lays out its recovery buttons ([`VideoHost::state_buttons`]).
     pub fn paint(
         &mut self,
@@ -167,8 +177,7 @@ impl VideoHost {
 
     fn paint_video(&mut self, ui: &mut egui::Ui, rect: egui::Rect, placement: Placement, theme: &Theme, snap: &PlayerSnapshot) -> egui::Response {
         self.placed_this_frame = placement;
-        let sense = if placement == Placement::Fullscreen { egui::Sense::click_and_drag() } else { egui::Sense::click() };
-        let resp = ui.allocate_rect(rect, sense);
+        let resp = ui.allocate_rect(rect, egui::Sense::click());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, egui::Color32::BLACK);
         let ppp = ui.ctx().pixels_per_point();
@@ -370,9 +379,10 @@ impl VideoHost {
     }
 
     /// Corner mini-player (app calls when nothing else placed the video, the screen allows it,
-    /// the layout isn't Compact and `interface.mini_player` is on). Returns `Some(true)` = open
-    /// fullscreen player, `Some(false)` = stop. Records [`VideoHost::mini_rect`].
-    pub fn mini_player(&mut self, ctx: &egui::Context, theme: &Theme, snap: &PlayerSnapshot) -> Option<bool> {
+    /// the layout isn't Compact and `interface.mini_player` is on). Returns what was clicked:
+    /// the video opens the fullscreen player, the strip pops the player out or stops it.
+    /// Records [`VideoHost::mini_rect`].
+    pub fn mini_player(&mut self, ctx: &egui::Context, theme: &Theme, snap: &PlayerSnapshot) -> Option<MiniAction> {
         self.mini = None;
         if snap.state == PlayerState::Idle {
             return None;
@@ -387,13 +397,14 @@ impl VideoHost {
             let video = Rect::from_min_size(total.min, egui::vec2(total.width(), total.height() - strip_h));
             let resp = self.paint_video(ui, video, Placement::Mini, theme, snap);
             if resp.on_hover_text("Open the player").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                result = Some(true);
+                result = Some(MiniAction::Open);
             }
             let strip = Rect::from_min_max(egui::pos2(total.left(), video.bottom()), total.max);
             let p = ui.painter();
             p.rect_filled(strip, 0.0, t.card_bg);
             let pad = theme.space(SpaceToken::Lg);
             let close = Rect::from_center_size(egui::pos2(strip.right() - strip_h / 2.0, strip.center().y), egui::vec2(strip_h, strip_h));
+            let pop = close.translate(egui::vec2(-strip_h, 0.0));
             let title = snap.playable.as_ref().map(|p| p.title.as_str()).unwrap_or("");
             let mut label = title.to_owned();
             if let Some(n) = snap.playable.as_ref().and_then(|p| p.number) {
@@ -406,26 +417,27 @@ impl VideoHost {
                 &label,
                 FontId::proportional(theme.font(TypeToken::BodySmall)),
                 t.fg,
-                (close.left() - strip.left() - 2.0 * pad).max(0.0),
+                (pop.left() - strip.left() - 2.0 * pad).max(0.0),
             );
-            let cr = ui
-                .interact(close, ui.id().with("mini-close"), egui::Sense::click())
-                .on_hover_text("Stop playback")
-                .on_hover_cursor(egui::CursorIcon::PointingHand);
-            cr.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Stop playback"));
-            if cr.hovered() {
-                p.rect_filled(close.shrink(2.0), t.rounding, t.fill_hover);
+            // strip buttons: pop out, stop
+            let strip_button = |ui: &egui::Ui, r: Rect, id: &str, glyph: &str, label: &str, tip: &str| {
+                let resp = ui.interact(r, ui.id().with(id), egui::Sense::click()).on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand);
+                resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+                let p = ui.painter();
+                if resp.hovered() {
+                    p.rect_filled(r.shrink(2.0), t.rounding, t.fill_hover);
+                }
+                let color = if resp.hovered() { t.accent } else { t.text_secondary };
+                p.text(r.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(theme.font(TypeToken::Icon)), color);
+                resp.clicked()
+            };
+            if strip_button(ui, pop, "mini-pop-out", glyphs::POP_OUT, "Pop out", "Pop out (Ctrl+Shift+O)") {
+                result = Some(MiniAction::PopOut);
             }
-            p.text(
-                close.center(),
-                Align2::CENTER_CENTER,
-                glyphs::CLOSE,
-                FontId::proportional(theme.font(TypeToken::Icon)),
-                if cr.hovered() { t.accent } else { t.text_secondary },
-            );
-            if cr.clicked() {
-                result = Some(false);
+            if strip_button(ui, close, "mini-close", glyphs::CLOSE, "Stop playback", "Stop playback") {
+                result = Some(MiniAction::Stop);
             }
+            let p = ui.painter();
             p.rect_stroke(total, t.rounding, egui::Stroke::new(t.card_border_width.min(2.0), t.card_border), egui::StrokeKind::Outside);
         });
         // not a placement (see module docs)

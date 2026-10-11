@@ -504,6 +504,15 @@ impl Screen for EpgMappingScreen {
         self.pump_mappings(ctx);
         let theme = ctx.theme;
         let t = &theme.tokens;
+        let full_page = !(ctx.lib.built_at != 0 && ctx.lib.live.channels.is_empty()) && !self.catalog.as_ref().is_some_and(|c| c.entries.is_empty());
+        // the way back shows on the empty states too; the view menu only with channels to view
+        let mut mode_menu = false;
+        let mode = self.mode.label();
+        section::page_header(ui, ctx, "EPG mapping", |ui| {
+            if full_page {
+                mode_menu = button(ui, theme, None, &format!("{mode} ▾"), ButtonStyle::default()).on_hover_text("Show channels (Ctrl+S)").clicked();
+            }
+        });
         if ctx.lib.built_at != 0 && ctx.lib.live.channels.is_empty() {
             empty_state::empty_state(ui, theme, glyphs::GUIDE, "No channels to map", Some("Add a playlist first."), None);
             return;
@@ -524,11 +533,6 @@ impl Screen for EpgMappingScreen {
             return;
         }
         let compact = ctx.layout == LayoutClass::Compact;
-        let mut mode_menu = false;
-        let mode = self.mode.label();
-        section::page_header(ui, ctx, "EPG mapping", |ui| {
-            mode_menu = button(ui, theme, None, &format!("{mode} ▾"), ButtonStyle::default()).on_hover_text("Show channels (Ctrl+S)").clicked();
-        });
         if mode_menu {
             self.mode_menu(ctx);
         }

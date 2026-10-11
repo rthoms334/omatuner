@@ -430,3 +430,51 @@ impl Overlay for EditItemOverlay {
         outcome
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use eframe::egui;
+
+    use super::*;
+    use crate::ui::screens::home::testkit::{self, OvApp, overlay_harness, rig, seed, until_ov};
+
+    fn click_outside(h: &egui_kittest::Harness<'static, OvApp<EditItemOverlay>>) {
+        let pos = egui::pos2(4.0, 4.0);
+        h.hover_at(pos);
+        for pressed in [true, false] {
+            h.event(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE });
+        }
+    }
+
+    /// A click outside closes Edit information as it loaded, but not once a field differs
+    /// from it (Esc still does).
+    #[test]
+    fn a_click_outside_closes_it_unless_a_field_was_changed() {
+        let (mut t, one) = rig();
+        let ch = seed(&mut t, |c| {
+            let s = testkit::source(c, "My IPTV")?;
+            testkit::channels(c, s, 1)
+        });
+        let item = crate::ui::screens::live::channel_ref(t.lib.live.get(ch[0]).expect("seeded"));
+        let size = egui::vec2(1200.0, 900.0);
+        let mut h = overlay_harness(t, one, EditItemOverlay::new(item.clone()), size);
+        until_ov(&mut h, "loaded", |h| matches!(h.state().o.loaded, Some(Ok(_))));
+        click_outside(&h);
+        h.run_steps(2);
+        assert_eq!(h.state().last, "Close", "unchanged: closes");
+        // opened again
+        h.state_mut().o = EditItemOverlay::new(item);
+        h.state_mut().last.clear();
+        until_ov(&mut h, "loaded", |h| matches!(h.state().o.loaded, Some(Ok(_))));
+        // a letter added to the name
+        h.state_mut().act(Action::Activate);
+        h.run_steps(2);
+        h.event(egui::Event::Text("x".into()));
+        h.run_steps(2);
+        assert!(h.state().o.is_dirty());
+        click_outside(&h);
+        h.run_steps(2);
+        assert_ne!(h.state().last, "Close", "an edit survives a stray click");
+        assert_eq!(h.state_mut().act(Action::Back), "Close", "Esc still closes");
+    }
+}
