@@ -155,9 +155,10 @@ impl<'a> Scope<'a> {
         if let Some(s) = self.selected {
             return ScopeFilter::Only(s.id);
         }
-        let out: Vec<SourceId> = self.eligible.iter().filter(|s| !s.in_all).map(|s| s.id).collect();
-        // every playlist switched out of All: All shows them anyway (it never shows nothing)
-        if out.is_empty() || !self.multi() || out.len() == self.eligible.len() { ScopeFilter::Everything } else { ScopeFilter::Except(out) }
+        // every playlist switched out of All: All shows them anyway (it never shows nothing);
+        // the library's stacks use the same rule
+        let out: Vec<SourceId> = crate::store::library::out_of_all_of(&self.eligible);
+        if out.is_empty() { ScopeFilter::Everything } else { ScopeFilter::Except(out) }
     }
 
     /// "TV 2" or "All playlists".

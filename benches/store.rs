@@ -168,6 +168,12 @@ fn bench_library_load(c: &mut Criterion) {
             seed::seed_channels(c, src, CHANNELS)?;
             seed::seed_movies(c, src, 50_000)?;
             seed::seed_series_with_episodes(c, src, 20_000, 0, 0)?;
+            // pairs of copies of one title, keyed like an import (stacks, DESIGN §29.11)
+            c.execute_batch(
+                "UPDATE movie SET name = 'EN ★ Title ' || (id / 2) || ' - 2001', year = 2001;
+                 UPDATE series SET name = 'EN - Show ' || (id / 2) || ' (2010)', year = 2010;",
+            )?;
+            tuner::store::titles::refresh_all(c)?;
             Ok(())
         })
         .expect("seed");
@@ -186,5 +192,67 @@ fn bench_library_load(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench_imports, bench_epg_reads, bench_library_load);
+/// A real-size VOD catalogue for the stacks (DESIGN §29.11): 300k movies over two playlists,
+/// most titles in several language / market copies (the snapshot this was tuned on stacks
+/// 46 %), every 50th with a TMDB id, every 7th untagged, 40 categories.
+fn stack_inputs(n: usize) -> (Vec<tuner::model::VodSummary>, Vec<tuner::store::stacks::CopyRaw>) {
+    use std::sync::Arc;
+    use tuner::model::{GroupId, MovieId, VodKind, VodSummary};
+    use tuner::sources::vod_match::{self, PrefixCodes};
+    const LANGS: [&str; 8] = ["EN", "FR", "DE", "AR-SUBS", "ALB", "GR", "NL", "EAR"];
+    let codes = PrefixCodes::default();
+    // one `Arc` per distinct language text, as `library::load` reads them
+    let mut texts: std::collections::HashMap<String, Arc<str>> = std::collections::HashMap::new();
+    (0..n)
+        .map(|i| {
+            let title = i / 2 + (i % 7) * 13; // ~2 copies per title, spread
+            let lang = LANGS[(i * 7 + i / 3) % LANGS.len()];
+            let name = if i % 7 == 0 {
+                format!("NF - Title {title} ({})", 1960 + title % 60)
+            } else {
+                format!("{lang} ★ Title {title} - {}", 1960 + title % 60)
+            };
+            let m = vod_match::parse(&name, None, &codes);
+            let v = VodSummary {
+                kind: VodKind::Movie(MovieId(i as i64)),
+                source_id: SourceId(1 + (i % 2) as i64),
+                key: ItemKey(format!("xt:vod:{i}")),
+                name: Arc::from(name.as_str()),
+                year: m.year,
+                poster: None,
+                rating: None,
+                group_ids: vec![GroupId((i % 40) as i64)],
+                added_at: None,
+                provider_order: i as i32,
+                locked: i % 97 == 0,
+            };
+            let raw = tuner::store::stacks::CopyRaw {
+                hash: m.stack_hash(ItemKind::Movie),
+                lang: m.lang_text().map(|t| texts.entry(t.clone()).or_insert_with(|| Arc::from(t.as_str())).clone()),
+                tags: m.tags,
+                origin: m.origin,
+                tmdb: (i % 50 == 0).then_some(title as u32 + 1),
+                ..Default::default()
+            };
+            (v, raw)
+        })
+        .collect()
+}
+
+fn bench_stacks(c: &mut Criterion) {
+    let (items, raw) = stack_inputs(300_000);
+    let prefs = vec!["en".to_owned()];
+    let clusters: Vec<tuner::sources::vod_match::ClusterItem> =
+        raw.iter().map(|r| tuner::sources::vod_match::ClusterItem { hash: r.hash, tmdb: r.tmdb, origin: r.origin }).collect();
+    let mut g = c.benchmark_group("stacks");
+    g.sample_size(20).measurement_time(Duration::from_secs(8));
+    // gate: < 60 ms release (the whole build: languages, categories, clustering, copy order)
+    g.bench_function("build_300k_movies", |b| {
+        b.iter_batched(|| raw.clone(), |raw| black_box(tuner::store::stacks::build(&items, raw, |_| true, &prefs)), BatchSize::LargeInput)
+    });
+    g.bench_function("cluster_300k_movies", |b| b.iter(|| black_box(tuner::sources::vod_match::cluster(&clusters))));
+    g.finish();
+}
+
+criterion_group!(benches, bench_imports, bench_epg_reads, bench_library_load, bench_stacks);
 criterion_main!(benches);

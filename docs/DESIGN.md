@@ -351,6 +351,9 @@ summaries, groups, ordered members, by-id/by-ref maps, hidden set) + `VodIndex` 
 (build-time copy) + `recent_channels`. Built off-thread (`RebuildLibrary`), swapped as
 `Arc<Library>`. Budget: 100k channels + 50k movies + 20k series → < 400 ms, < 60 MB. The index
 types and accessors are implemented in the skeleton and built with `from_parts`.
+`load_with(conn, &LoadOptions)` (the job passes `LoadOptions::from_config`: audio languages, the
+`vod_visible` hook) also builds `VodIndex::stacks` — the copies of one title in "All playlists"
+(§29.11).
 
 Favourites live OUTSIDE the immutable snapshot: the app owns `favs: FavIndex` (copied from each
 new `Library`), exposed as `UiCtx::favs`; a toggle submits `store::user::set_favourite` and
@@ -365,7 +368,9 @@ recent, sort)`) happens here, so zapping order == list order.
 | Epg | `NowNextCache::invalidate` + `RebuildLibrary` (`ChannelSummary.epg_channel_id` is a snapshot of `channel_epg`) |
 | Favourites | `load_favs` → `TunerApp.favs` |
 | Reminders | `ReminderScheduler::refresh` |
-| VodDetails, Progress | screens react in `on_event` |
+| VodDetails, Progress | screens react in `on_event` (details that bring a new TMDB id also submit `RebuildLibrary`: ids decide stacks, §29.10) |
+
+A change of `player.audio_langs` submits `RebuildLibrary` (it picks every stack's top copy).
 
 ---
 
@@ -3916,7 +3921,7 @@ integrator runs the one full gate.
 * **Space binding in `List`**: every list now maps Space to ToggleMark; screens that don't mark
   must ignore it (they do: unhandled actions are no-ops) — keymap test pins it.
 
-## 29. Several playlists (phase P1: what am I browsing)
+## 29. Several playlists (P1: what am I browsing; P2: stacks in All)
 
 With two providers ("TV" and "TV 2", often both Xtream) nothing said which playlist a list,
 card or page came from, two "Action" categories looked alike, and "is there more than one
@@ -3928,6 +3933,17 @@ answers *what am I browsing*; combining duplicate titles in "All" (P2) and the o
 1. Each screen remembers its own playlist: Movies, Series and Live TV; the guide follows Live TV.
 2. Free presets stay in Live TV's All, with a per-playlist **"Show in All playlists"** switch.
 3. (P2) duplicates combine in All, the copy that plays follows the playlist order — not in P1.
+4. (P2, 2026-10-11) Combined titles are **stacks**: a stack card (offset edges, copy count) whose
+   detail page lists the copies as mini-cards; Space (or the count badge) fans the stack out
+   in the grid; Shift+Enter plays the preferred copy. Same-playlist duplicates stack too.
+5. (P2) **One stack across languages and markets**: same title + year; TMDB ids decide when
+   known; different ids never stack. Language and dub rules order and label the copies inside.
+6. (P2) The **top card** is the copy in the user's audio language (`en` by default), unlocked
+   first; with none, the playlist order decides.
+7. (P2) **Hidden copies never stack** (category filter, hidden categories or items,
+   playlists out of All, and explicit content behind parental control); **locked copies do**,
+   drawn disabled with the lock (PIN on pick); an all-locked stack shows locked; the copy that
+   plays skips locked copies unless the session is unlocked.
 
 ### 29.2 Eligibility (`Library::eligible(kind)`)
 A playlist is *eligible* for a screen when it is **enabled and has that kind of item**
@@ -4024,3 +4040,129 @@ the guide (follows Live, grouped picker, "Open in guide" across playlists), Sett
 fallback toasts, window title, hint), keymap
 (chords, hint placement), and the 790 / 1600 pt × text 12 / 16 layout test with Live and the
 guide scoped.
+
+### 29.10 P2: matching copies (`sources::vod_match`)
+
+The dedup report on the real catalogue (302k movies, 78k series, two Xtream playlists) and its
+skeptical review set these rules; `examples/dedup_report.rs` re-runs the numbers on any
+database (read-only: names, years, TMDB ids, category names — never logins, URLs or streams).
+
+**Match key** of a copy, from the provider's RAW name (`movie.name` / `series.name`; smart
+names and renames never change it), by `vod_match::parse(name, year, &PrefixCodes)`:
+
+| Step | Rule | Example |
+|---|---|---|
+| prefixes | up to three leading codes `CODE ★ ` / `CODE - ` / `CODE: ` (`[A-Z0-9+]`, parts joined by `-` or `/`); taken when every part is a known quality / brand / label / marker word, a market code (not with `:`), or (code, separator) opens ≥ 20 names of the playlist (`PrefixCodes`, data-driven like category tags); a chained prefix uses the first one's separator | `EN ★ `, `4K-NF - `, `NF: `, `UK/US - `; `EN - IT: Welcome to Derry` and `IN - KD – The Devil` keep `IT` / `KD`; `IT: Welcome to Derry` alone is a title |
+| language / market | the code minus quality, brand and label parts, spelled one way (`MARKET_ALIASES`, data: `ALB`=`AL`, `EAR`=`AR-SUBS`, `TAM`=`IN-TL`, `EG`=`AR-EG`, `SW`=`SE`, `UK`=`EN`…); dub / sub markers join it as `Dub` (`[مدبلج]`, `Dubbed`, `VF` → dub; `VOSTFR`, `[Multi-Sub]`, `VO` → sub; `[Multi-Audio]` → multi) | `FR ★ A Working Man - 2025 [VOSTFR]` → `FR+SUB` |
+| rank numbers | `NN.` after a `TOP` label goes | `DE-TOP - 38. Prinzessin Mononoke` |
+| brackets | a year is the name's year (`( 2024 )` too); quality / format-only groups and tags go (recorded as `VersionTags`: quality word, HDR, DV, CAM, 3D); a round `(XX)` ISO country is the **origin**, out of the key; any other text stays | `Lewis (2007) (GB)` → key `lewis`, origin GB; `[Extended]`, `(and Everybody Else)` stay |
+| year | the `year` column, else the name's (`(2021)`, `- 2021`, a broken `[4k[` end) | |
+| title end | quality words come off only at the end (`Sin City HD`), or alone in brackets; `The Vision` keeps its word; `Dolby Vision` at the end goes | |
+| markers | a dotted acronym (`S.W.A.T.`) marks the key (never meets `Swat`); a `3D` prefix part too | `swat|acr`, `avatar|3d` |
+| fold | lower-case letters and digits; Latin diacritics folded (`Opération` = `Operation`), other scripts kept | |
+
+**Stacking** (`vod_match::cluster_flat`, per kind; inputs: the stored hash, TMDB id, origin):
+* Same key + same **known** year → one stack, **across languages and markets** (§29.1 #5).
+  A missing year never stacks by key; years are never fuzzy (`Worth` 2020 / 2021 stay apart —
+  the provider itself is inconsistent; 4 197 same-key pairs ≥ 2 years apart are remakes).
+* Short (< 3), all-digit and stop-list titles (`It`, `1917`, `Live`) stack only with a year
+  (which every key-stack has).
+* **TMDB ids decide when present**: the same id stacks whatever the names or years
+  (`Incendies` / `Die Frau die singt`); a same-key run with two ids splits by id, its id-less
+  copies form their own stack; two different explicit origins split the same way
+  (*The Office* (US) / (GB)).
+* A copy the user split off stands alone (§29.11).
+* The ratings check (report rule F) is dropped: provider ratings are too noisy.
+
+Hash: `match_hash` = blake3 over (kind, key, year) with separators, cut to 64 bits (the
+report's weak hash collided once on this data; this one doesn't by accident).
+
+On the snapshot (every copy, before hiding): movies 301 965 → **163 481 cards (−45.9 %)**,
+40 513 stacks (31 603 across playlists, 8 910 inside one; 29 793 hold two or more languages);
+series 77 665 → **41 140 (−47.0 %)**, 11 786 stacks; 109 same-key series kept apart by two
+origins; 42 834 movies and 3 052 series have no year (they stack only by TMDB id, which this
+snapshot doesn't have yet). The app stacks only visible copies, so with the UK + English
+filter the stacks are mostly English copies.
+
+### 29.11 P2: stacks in the library (`store::stacks`, `store::titles`)
+
+**Data** (migration `0005_title_stacks`, idempotent — columns added by its Rust step only when
+missing, so it survives a renumber):
+* `movie` / `series`: `match_key` (folded key, diagnostics and P3 "Same title as…"),
+  `match_hash` (NULL = can't stack by key), `match_lang` (`EN`, `AR-SUBS`, `FR+SUB`,
+  `+MULTI`), `match_tags` (`VersionTags`; NULL = not computed), `match_origin`;
+  `series.tmdb_id INTEGER` (movies keep `tmdb_id TEXT`).
+* TMDB ids come from the movie and series **lists** (`tmdb` or `tmdb_id`, string or number;
+  `""` / `"0"` = none) at import, and from `get_series_info` / `get_vod_info` details; details
+  that bring a new id rebuild the library.
+* `store::titles::refresh_source(conn, source)` computes the match columns per playlist (its
+  frequent prefixes are part of the rules) at the end of every catalogue import
+  (`finish_catalogue_with`) and once for every playlist in the migration's backfill. Only rows
+  with `match_tags IS NULL` are parsed — the upsert clears it when the provider name or year
+  changes — unless `meta` `vod_match:<id>` (rules version + prefix fingerprint) changed; only
+  changed rows are written.
+* `title_link(source_id, kind, item_key, action ∈ {split, pin}, at)`: the user's corrections,
+  keyed like user data (a refresh keeps them; a vanished copy leaves an inert row).
+  `titles::set_split` ("Not the same title", Undo = `false`), `titles::set_pin` (one pin per
+  stack: pinning clears the other copies'), `titles::links` (Settings ▸ Hidden ▸ "Titles you
+  split or combined"). Write them with `DataScope::Overrides` (the library rebuilds).
+
+**Build** (`stacks::build`, inside `library::load_with`, per kind): only copies in the snapshot
+— hidden items (own flag, every category hidden, the category filter) are not, nor items the
+**`LoadOptions::vod_visible` hook** rejects (the one place explicit content plugs in: an item
+it rejects is never listed, counted, searched or stacked) — and only from playlists in All
+(`library::out_of_all`, shared with `ui::scope`). Locked copies stay (`VodSummary.locked`).
+* Language of a copy: its tag; an untagged copy in a category whose tagged copies are ≥ 80 %
+  one market (≥ 10) takes that market (`CopyMeta::inferred`, label `AR-SUBS?`) — it never
+  passes as the user's language because the provider left the prefix off.
+* Language rank (`vod_match::lang_rank`, user's `player.audio_langs` normalised `eng` → `en`):
+  the user's languages in order, then untagged / multi-audio copies, then subtitled markets
+  whose audio the tag doesn't say (`AR-SUBS`, `+SUB`), then other languages.
+* Copy order inside a stack: language rank, playlist order, CAM / TS after the other copies
+  of their playlist, the playlist's own order. **Top** = the first unlocked copy; all locked →
+  the first.
+
+**API** (`lib.vod.stacks(movies) -> &Stacks`; item = index into `vod.movies` / `vod.series`):
+`stack_of(item) -> Option<StackId>`, `members(s)`, `top(s)`, `copies(item)`, `len()`,
+`saved()` (All's card count = copies − saved), `collapse(&items)` (each stack once, as its
+top, where its first member comes: the list's sort holds), `fan_out(&collapsed, &[open])`,
+`elsewhere(item, &items)` ("+1 also in TV" inside one playlist), `meta(item) -> CopyMeta`
+(dub, version tags, origin, TMDB id, rank, pin, split), `lang(item)`, `lang_label(item)`
+(`EN`, `FR · sub`, `AR?`), `playlist_rank(source)`, `facts(item, &items) -> CopyFacts`.
+All views call `collapse` when `interface.same_title = combine` (default; `show-each` = every
+copy is a card); one playlist never collapses. `VodIndex` also caches name sort ranks per
+snapshot (a name sort is an integer sort).
+
+### 29.12 P2: which copy plays, marks (`stacks::play_order`, `stack_marks`)
+
+`play_order(&[CopyFacts], session_unlocked, interface.copy_order)` → copy indices, first plays:
+1. the pinned copy ("Always play from TV 2"); 2. the latest progress; 3. copies that failed
+recently, whose account is at its connection limit or expired go last (`trouble`, the caller
+knows); 4. language rank; 5. playlist order (`copy-order = playlist-order`, default) — or best
+quality first (`best-quality`) — copies of one playlist tie here; 6. mkv / mp4 before other
+containers (`container_ok`, unknown between); 7. CAM / TS last. Locked copies are left out
+unless the session is unlocked. `fallback(&order, failed)`: the next copy, tried **once** when
+the first fails before its first frame (the player decides "once" and the toast).
+
+`stack_marks(members, fav, watched, played_at, locked)`: ★ when any copy is a favourite, ✓ when
+any is watched, progress from the latest played copy, the lock only when every copy is locked.
+Writes from a stack card follow §3 of the recommendation: favourite / mark watched → the copy
+that would play; unfavourite / unmark → every copy (with Undo).
+
+### 29.13 P2 core: performance and tests
+
+Measured (release): clustering the real 301 965 movies 10–16 ms, the whole stacking step
+(`stacks::build`: languages, categories, clustering, order) **30 ms** (series 7 ms) — budget
+60 ms; synthetic 300k (`benches/store.rs` `stacks/*`) in the same range. Parsing a name ≈ 1.6 µs
+(import / migration only: 0.5 s for 302k). No per-frame work: stacks are built with the
+snapshot; `collapse` runs when a list is rebuilt. `benches/startup.rs` and `benches/store.rs`
+seed paired copies keyed like an import, so the library-load gate includes stacking.
+
+Tests: `vod_match` (the report's provider spellings per rule, false-merge cases as tables —
+namesakes across industries, remakes by origin, TMDB override, missing / near years, generic
+titles; dub / sub / version tags; frequent prefixes; language ranks), `stacks` (top card with
+locked / CAM / foreign copies, in-All and split, category-inferred markets, play order and
+fallback, stack marks), `store_catalogue` (import keys and TMDB ids, hidden vs locked vs out of
+All vs the visibility hook, split surviving a refresh and its Undo, one pin per stack, a
+renamed copy re-keyed), the 0005 migration (backfill, re-run), Xtream list / info TMDB parsing.
+

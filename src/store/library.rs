@@ -21,8 +21,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use rusqlite::Connection;
 
@@ -32,8 +32,11 @@ use crate::model::{
     ItemRef, MovieId, Quality, QualityBadge, SeriesId, SortMode, SourceColor, SourceId, SourceKind, SourceSettings, Timestamp, VodKind, VodSummary,
 };
 use crate::sources::category_tags::{self, CategorySummary};
+use crate::sources::vod_match::{self, VersionTags};
 use crate::store::live::{GROUP_COLS, GROUP_FROM, GROUP_ORDER, group_from_row};
 use crate::store::sql::{enum_parse, from_json_opt, kind_from_sql, u32_of};
+use crate::store::stacks::{CopyRaw, Stacks};
+use crate::store::titles::LinkAction;
 
 /// Non-secret source facts for badges/filters.
 #[derive(Debug, Clone, PartialEq)]
@@ -221,6 +224,11 @@ pub struct VodIndex {
     series_idx: HashMap<SeriesId, u32>,
     /// (movies, series) per source (the scope bar's counts, DESIGN §29).
     per_source: HashMap<SourceId, (usize, usize)>,
+    /// Copies of one title in All (DESIGN §29.11); empty until [`VodIndex::with_stacks`].
+    movie_stacks: Stacks,
+    series_stacks: Stacks,
+    /// Name sort ranks (movies, series), computed on first use and kept for the snapshot.
+    name_rank: [OnceLock<Vec<u32>>; 2],
 }
 
 impl VodIndex {
@@ -254,7 +262,51 @@ impl VodIndex {
         for v in &series {
             per_source.entry(v.source_id).or_default().1 += 1;
         }
-        Self { movies, series, movie_groups, series_groups, members, movie_idx, series_idx, per_source }
+        Self {
+            movies,
+            series,
+            movie_groups,
+            series_groups,
+            members,
+            movie_idx,
+            series_idx,
+            per_source,
+            movie_stacks: Stacks::default(),
+            series_stacks: Stacks::default(),
+            name_rank: Default::default(),
+        }
+    }
+
+    /// This index with the stacks of its movies and series ([`crate::store::stacks::build`]).
+    pub fn with_stacks(mut self, movies: Stacks, series: Stacks) -> Self {
+        self.movie_stacks = movies;
+        self.series_stacks = series;
+        self
+    }
+
+    /// The stacks of movies (`true`) or series: copies of one title in All (DESIGN §29.11).
+    pub fn stacks(&self, movies: bool) -> &Stacks {
+        if movies { &self.movie_stacks } else { &self.series_stacks }
+    }
+
+    /// Each item's place in name order (case-insensitive; equal names share it), computed
+    /// once per snapshot: a name sort is then an integer sort.
+    fn name_rank(&self, movies: bool) -> &[u32] {
+        self.name_rank[usize::from(!movies)].get_or_init(|| {
+            let all = if movies { &self.movies } else { &self.series };
+            let lower: Vec<String> = all.iter().map(|v| v.name.to_lowercase()).collect();
+            let mut order: Vec<u32> = (0..all.len() as u32).collect();
+            order.sort_unstable_by(|a, b| lower[*a as usize].cmp(&lower[*b as usize]));
+            let mut rank = vec![0u32; all.len()];
+            let mut r = 0u32;
+            for (k, w) in order.iter().enumerate() {
+                if k > 0 && lower[*w as usize] != lower[order[k - 1] as usize] {
+                    r += 1;
+                }
+                rank[*w as usize] = r;
+            }
+            rank
+        })
     }
 
     fn sort(&self, items: &mut [u32], movies: bool, sort: SortMode) {
@@ -264,8 +316,14 @@ impl VodIndex {
             // custom order: the display order of the vectors (user order applied by `load`)
             SortMode::Provider => items.sort_unstable(),
             SortMode::Number => items.sort_by_key(|i| v(i).provider_order),
-            SortMode::NameAsc => items.sort_by_cached_key(|i| v(i).name.to_lowercase()),
-            SortMode::NameDesc => items.sort_by_cached_key(|i| std::cmp::Reverse(v(i).name.to_lowercase())),
+            SortMode::NameAsc => {
+                let rank = self.name_rank(movies);
+                items.sort_by_key(|i| rank[*i as usize]);
+            }
+            SortMode::NameDesc => {
+                let rank = self.name_rank(movies);
+                items.sort_by_key(|i| std::cmp::Reverse(rank[*i as usize]));
+            }
             SortMode::RecentlyAdded => items.sort_by_key(|i| std::cmp::Reverse(v(i).added_at.unwrap_or(i64::MIN))),
             SortMode::Rating => items.sort_by(|a, b| v(b).rating.unwrap_or(-1.0).total_cmp(&v(a).rating.unwrap_or(-1.0))),
             SortMode::Year => items.sort_by_key(|i| std::cmp::Reverse(v(i).year.unwrap_or(0))),
@@ -649,72 +707,187 @@ fn text_hash(v: rusqlite::types::ValueRef<'_>) -> u64 {
 /// Group id → indices into the matching `VodIndex` vector.
 type VodMembers = HashMap<GroupId, Vec<u32>>;
 
-/// Visible movies or series + group members (indices into the returned vector).
-fn load_vod(conn: &Connection, movies: bool, groups: &[Group]) -> Result<(Vec<VodSummary>, VodMembers)> {
+/// What the library build is told besides the database (from the config; `Default` = English,
+/// no extra filter).
+#[derive(Clone, Default)]
+pub struct LoadOptions {
+    /// The user's audio languages, most preferred first (`player.audio_langs`; any ISO 639
+    /// form): the top card of a stack is a copy in one of them (DESIGN §29.11). Empty = `en`.
+    pub audio_langs: Vec<String>,
+    /// **The one visibility hook for movies and series.** An item it rejects is left out of
+    /// the snapshot exactly like a hidden one: never listed, counted, searched or stacked
+    /// (DESIGN §29.11 — explicit content behind parental control plugs in here). Runs once
+    /// per item per build, after the hidden checks.
+    pub vod_visible: Option<VodVisible>,
+}
+
+/// See [`LoadOptions::vod_visible`].
+pub type VodVisible = Arc<dyn Fn(&VodFacts<'_>) -> bool + Send + Sync>;
+
+/// One movie or series as [`LoadOptions::vod_visible`] sees it.
+pub struct VodFacts<'a> {
+    pub item: &'a VodSummary,
+    /// The provider's raw name.
+    pub provider_name: &'a str,
+    /// Its categories (effective flags), primary first.
+    pub groups: Vec<&'a Group>,
+}
+
+impl std::fmt::Debug for LoadOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadOptions").field("audio_langs", &self.audio_langs).field("vod_visible", &self.vod_visible.is_some()).finish()
+    }
+}
+
+impl LoadOptions {
+    /// The options the app builds with.
+    pub fn from_config(c: &crate::config::Config) -> Self {
+        Self { audio_langs: c.player.audio_langs.clone(), vod_visible: None }
+    }
+
+    /// The audio languages as `vod_match::norm_lang` codes, deduplicated (`en` when none).
+    pub fn lang_prefs(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for l in self.audio_langs.iter().map(|l| vod_match::norm_lang(l)).filter(|l| !l.is_empty()) {
+            if !out.contains(&l) {
+                out.push(l);
+            }
+        }
+        if out.is_empty() {
+            out.push("en".to_owned());
+        }
+        out
+    }
+}
+
+/// The playlists "All playlists" leaves out for `kind`: eligible ones with "Show in All
+/// playlists" off — none when that would leave All empty (DESIGN §29.3; `ui::scope` and the
+/// stacks use it).
+pub fn out_of_all(sources: &[SourceMeta], kind: ItemKind) -> Vec<SourceId> {
+    out_of_all_of(&sources.iter().filter(|s| s.enabled && s.has(kind)).collect::<Vec<_>>())
+}
+
+/// [`out_of_all`] of the eligible playlists of a kind.
+pub fn out_of_all_of(eligible: &[&SourceMeta]) -> Vec<SourceId> {
+    let out: Vec<SourceId> = eligible.iter().filter(|s| !s.in_all).map(|s| s.id).collect();
+    if eligible.len() < 2 || out.len() == eligible.len() { Vec::new() } else { out }
+}
+
+/// Visible movies or series + group members (indices into the returned vector) + their match
+/// data (same order).
+fn load_vod(conn: &Connection, movies: bool, groups: &[Group], opts: &LoadOptions) -> Result<(Vec<VodSummary>, VodMembers, Vec<CopyRaw>)> {
     let flags = group_flags(groups);
     let (table, link, col, kind, poster) =
         if movies { ("movie", "movie_group", "movie_id", "movie", "poster") } else { ("series", "series_group", "series_id", "series", "cover") };
+    let item_kind = if movies { ItemKind::Movie } else { ItemKind::Series };
     let links = load_memberships(conn, &format!("SELECT l.{col}, l.group_id, 0 FROM {link} l"), &flags)?;
+    let split = crate::store::titles::linked_ids(conn, item_kind, LinkAction::Split)?;
+    let pinned = crate::store::titles::linked_ids(conn, item_kind, LinkAction::Pin)?;
+    let by_id: HashMap<GroupId, &Group> = if opts.vod_visible.is_some() { groups.iter().map(|g| (g.id, g)).collect() } else { HashMap::new() };
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT x.id, x.source_id, x.key, COALESCE(o.rename, x.clean_name), x.year, x.{poster}, x.rating, x.added_at,
-                x.provider_order, COALESCE(o.locked, 0), COALESCE(o.hidden, 0)
+                x.provider_order, COALESCE(o.locked, 0), COALESCE(o.hidden, 0),
+                x.match_hash, x.match_lang, x.match_tags, x.match_origin, x.tmdb_id, x.name
          FROM {table} x JOIN source s ON s.id = x.source_id AND s.enabled = 1
          LEFT JOIN item_override o ON o.source_id = x.source_id AND o.kind = '{kind}' AND o.item_key = x.key
          ORDER BY s.sort_index, s.id, (o.user_order IS NULL), o.user_order, x.provider_order, x.id"
     ))?;
     let mut items = Vec::new();
+    let mut raws = Vec::new();
     let mut members = VodMembers::new();
-    let rows = stmt.query_map([], |r| {
+    // `match_lang` values are few: one allocation each
+    let mut langs: HashMap<Vec<u8>, Arc<str>> = HashMap::new();
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
         let id: i64 = r.get(0)?;
-        Ok((
-            VodSummary {
-                kind: if movies { VodKind::Movie(MovieId(id)) } else { VodKind::Series(SeriesId(id)) },
-                source_id: r.get(1)?,
-                key: ItemKey(r.get(2)?),
-                name: Arc::from(r.get::<_, String>(3)?),
-                year: r.get(4)?,
-                poster: r.get::<_, Option<String>>(5)?.map(Arc::from),
-                rating: r.get::<_, Option<f64>>(6)?.map(|v| v as f32),
-                group_ids: Vec::new(),
-                added_at: r.get(7)?,
-                provider_order: r.get(8)?,
-                locked: r.get(9)?,
-            },
-            id,
-            r.get::<_, bool>(10)?,
-        ))
-    })?;
-    for row in rows {
-        let (mut v, id, item_hidden) = row?;
+        let item_hidden: bool = r.get(10)?;
         let (gids, all_hidden, any_locked) = effective_groups(links.get(&id), &flags);
         if item_hidden || all_hidden {
             continue;
         }
-        v.locked |= any_locked;
+        let mut v = VodSummary {
+            kind: if movies { VodKind::Movie(MovieId(id)) } else { VodKind::Series(SeriesId(id)) },
+            source_id: r.get(1)?,
+            key: ItemKey(r.get(2)?),
+            name: Arc::from(r.get::<_, String>(3)?),
+            year: r.get(4)?,
+            poster: r.get::<_, Option<String>>(5)?.map(Arc::from),
+            rating: r.get::<_, Option<f64>>(6)?.map(|v| v as f32),
+            group_ids: gids,
+            added_at: r.get(7)?,
+            provider_order: r.get(8)?,
+            locked: r.get::<_, bool>(9)? || any_locked,
+        };
+        if let Some(visible) = &opts.vod_visible {
+            let provider_name = match r.get_ref(16)? {
+                rusqlite::types::ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
+                _ => String::new(),
+            };
+            let facts =
+                VodFacts { item: &v, provider_name: &provider_name, groups: v.group_ids.iter().filter_map(|g| by_id.get(g).copied()).collect() };
+            if !visible(&facts) {
+                continue;
+            }
+        }
+        let lang = match r.get_ref(12)? {
+            rusqlite::types::ValueRef::Text(t) if !t.is_empty() => {
+                Some(langs.entry(t.to_vec()).or_insert_with(|| Arc::from(String::from_utf8_lossy(t).as_ref())).clone())
+            }
+            _ => None,
+        };
+        let tmdb = match r.get_ref(15)? {
+            rusqlite::types::ValueRef::Integer(n) => u32::try_from(n).ok().filter(|n| *n > 0),
+            rusqlite::types::ValueRef::Text(t) => std::str::from_utf8(t).ok().and_then(vod_match::tmdb_id),
+            _ => None,
+        };
+        let origin = match r.get_ref(14)? {
+            rusqlite::types::ValueRef::Text([a, b]) => Some([*a, *b]),
+            _ => None,
+        };
+        raws.push(CopyRaw {
+            hash: r.get(11)?,
+            lang,
+            tags: VersionTags(r.get::<_, Option<i64>>(13)?.and_then(|t| u16::try_from(t).ok()).unwrap_or(0)),
+            origin,
+            tmdb,
+            split: split.contains(&id),
+            pinned: pinned.contains(&id),
+        });
         let idx = items.len() as u32;
-        for g in &gids {
+        for g in &v.group_ids {
             members.entry(*g).or_default().push(idx);
         }
-        v.group_ids = gids;
+        v.group_ids.shrink_to_fit();
         items.push(v);
     }
-    Ok((items, members))
+    Ok((items, members, raws))
 }
 
-/// Build a full snapshot from a reader connection (uses the `from_parts` constructors). Never
-/// call on the UI thread.
+/// Build a full snapshot from a reader connection (uses the `from_parts` constructors) with
+/// the default [`LoadOptions`]. Never call on the UI thread.
+pub fn load(conn: &Connection) -> Result<Library> {
+    load_with(conn, &LoadOptions::default())
+}
+
+/// [`load`] with options (the app passes [`LoadOptions::from_config`]).
 ///
 /// Only enabled sources contribute channels/VOD/groups (`sources` lists every source).
 /// Effective flags: an item is hidden when it is hidden itself or every one of its groups is
-/// hidden; it is locked when it or any of its groups is locked.
-pub fn load(conn: &Connection) -> Result<Library> {
+/// hidden; it is locked when it or any of its groups is locked. Movies and series of the
+/// playlists in All stack (DESIGN §29.11).
+pub fn load_with(conn: &Connection, opts: &LoadOptions) -> Result<Library> {
     let sources = load_sources(conn)?;
     let (ch_groups, movie_groups, series_groups) = load_groups(conn, &sources)?;
     let live = load_live(conn, ch_groups)?;
-    let (movies, mut members) = load_vod(conn, true, &movie_groups)?;
-    let (series, series_members) = load_vod(conn, false, &series_groups)?;
+    let (movies, mut members, movie_raw) = load_vod(conn, true, &movie_groups, opts)?;
+    let (series, series_members, series_raw) = load_vod(conn, false, &series_groups, opts)?;
     members.extend(series_members);
-    let vod = VodIndex::from_parts(movies, series, movie_groups, series_groups, members);
+    let prefs = opts.lang_prefs();
+    let out_movies = out_of_all(&sources, ItemKind::Movie);
+    let out_series = out_of_all(&sources, ItemKind::Series);
+    let movie_stacks = crate::store::stacks::build(&movies, movie_raw, |s| !out_movies.contains(&s), &prefs);
+    let series_stacks = crate::store::stacks::build(&series, series_raw, |s| !out_series.contains(&s), &prefs);
+    let vod = VodIndex::from_parts(movies, series, movie_groups, series_groups, members).with_stacks(movie_stacks, series_stacks);
     let favs = load_favs(conn)?;
     let recent_channels = load_recent_channels(conn, &live)?;
     Ok(Library {

@@ -121,6 +121,28 @@ pub enum PlaylistOnCards {
     Never,
 }
 
+/// Settings ▸ Interface ▸ "Same title in several playlists" (DESIGN §29.11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SameTitle {
+    /// "All playlists" shows the copies of one movie or series as one stack.
+    #[default]
+    Combine,
+    /// Every copy is its own card, as inside one playlist.
+    ShowEach,
+}
+
+/// Which copy of a stacked title plays first, after the pin, your progress, troubled copies
+/// and your audio language (DESIGN §29.12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CopyOrder {
+    /// The playlist order of Settings ▸ Playlists.
+    #[default]
+    PlaylistOrder,
+    BestQuality,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InterfaceConfig {
@@ -157,6 +179,10 @@ pub struct InterfaceConfig {
     pub last_screen: Option<String>,
     /// The playlist each screen shows (DESIGN §29); `None` = All playlists.
     pub playlist_scope: PlaylistScopes,
+    /// Copies of one title in "All playlists": one stack, or each its own card (DESIGN §29.11).
+    pub same_title: SameTitle,
+    /// Which copy of a stack plays first after the stronger rules (DESIGN §29.12).
+    pub copy_order: CopyOrder,
 }
 
 /// The playlist Movies, Series and Live TV each show (the guide follows Live TV); `None` = All
@@ -191,6 +217,8 @@ impl Default for InterfaceConfig {
             series_sort: SortMode::RecentlyAdded,
             last_screen: None,
             playlist_scope: PlaylistScopes::default(),
+            same_title: SameTitle::Combine,
+            copy_order: CopyOrder::PlaylistOrder,
         }
     }
 }

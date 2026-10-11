@@ -182,6 +182,10 @@ impl Services {
         if old.general.debug_log != new.general.debug_log {
             crate::logging::set_debug(new.general.debug_log);
         }
+        // the audio languages pick the top copy of every stack (DESIGN §29.11)
+        if old.player.audio_langs != new.player.audio_langs {
+            self.jobs.submit(crate::jobs::JobKind::RebuildLibrary);
+        }
         // User-Agent / timeout: every clone of the client (jobs, image fetches) follows
         if http_options(old) != http_options(new)
             && let Err(e) = self.http.reconfigure(&http_options(new))

@@ -18,6 +18,7 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("0002_category_filter", include_str!("migrations/0002_category_filter.sql")),
     ("0003_quality", include_str!("migrations/0003_quality.sql")),
     ("0004_name_rules", include_str!("migrations/0004_name_rules.sql")),
+    ("0005_title_stacks", include_str!("migrations/0005_title_stacks.sql")),
 ];
 
 /// Current schema version after all migrations.
@@ -81,8 +82,25 @@ fn backfill(conn: &Connection, name: &str) -> Result<()> {
             seed_quality_checks(conn)?;
             reclean_names(conn)
         }
+        "0005_title_stacks" => {
+            add_title_columns(conn)?;
+            crate::store::titles::refresh_all(conn).map(|_| ())
+        }
         _ => Ok(()),
     }
+}
+
+/// The match columns of movies and series and `series.tmdb_id` (0005; only the missing ones,
+/// so a renumbered re-run is harmless).
+fn add_title_columns(conn: &Connection) -> Result<()> {
+    for table in ["movie", "series"] {
+        for (col, decl) in
+            [("match_key", "TEXT"), ("match_hash", "INTEGER"), ("match_lang", "TEXT"), ("match_tags", "INTEGER"), ("match_origin", "TEXT")]
+        {
+            add_column_if_missing(conn, table, col, decl)?;
+        }
+    }
+    add_column_if_missing(conn, "series", "tmdb_id", "INTEGER")
 }
 
 /// `quality_check` from the picture sizes measured before 0004 (`channel_video`): the claim is
@@ -214,7 +232,7 @@ mod tests {
         let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v, latest_version());
         let names: Vec<&str> = MIGRATIONS.iter().map(|m| m.0).collect();
-        assert_eq!(names, ["0001_init", "0002_category_filter", "0003_quality", "0004_name_rules"]);
+        assert_eq!(names, ["0001_init", "0002_category_filter", "0003_quality", "0004_name_rules", "0005_title_stacks"]);
         for (t, col) in [
             ("grp", "raw_name"),
             ("group_override", "shown"),
@@ -398,6 +416,57 @@ mod tests {
         c.pragma_update(None, "user_version", 3).unwrap();
         migrate(&mut c).unwrap();
         check(&c);
+    }
+
+    /// A database from before the stacks keys every stored movie and series from its provider
+    /// name (no refresh needed), adds `series.tmdb_id` and `title_link`; running it again
+    /// (renumbered after another branch's 0005) changes nothing.
+    #[test]
+    fn title_stacks_migration_keys_existing_titles() {
+        let mut c = migrated_to(4);
+        assert_eq!(MIGRATIONS[4].0, "0005_title_stacks");
+        c.execute_batch(
+            r#"INSERT INTO source(id,name,kind,created_at) VALUES (1,'TV','xtream',0), (2,'TV 2','xtream',0);
+               INSERT INTO movie(source_id,key,name,clean_name,norm_name,year,stream,provider_order,seen_gen) VALUES
+                 (1,'a','EN ★ Dune - 2021 [4k]','Dune','dune',2021,'{}',0,1),
+                 (2,'b','AR-SUBS - Dune (2021)','Dune','dune',NULL,'{}',0,1),
+                 (2,'c','SE - Gold','Gold','gold',NULL,'{}',1,1);
+               INSERT INTO series(source_id,key,name,clean_name,norm_name,year,provider_order,seen_gen) VALUES
+                 (2,'s','EN - Lewis (2007) (GB)','Lewis','lewis',NULL,0,1);"#,
+        )
+        .unwrap();
+        let check = |c: &Connection| {
+            let row = |t: &str, k: &str| {
+                c.query_row(&format!("SELECT match_key, match_hash, match_lang, match_tags, match_origin FROM {t} WHERE key = ?1"), [k], |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<i64>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                    ))
+                })
+                .unwrap()
+            };
+            let (a, b, gold, lewis) = (row("movie", "a"), row("movie", "b"), row("movie", "c"), row("series", "s"));
+            assert_eq!((a.0.as_deref(), a.2.as_deref(), a.3), (Some("dune"), Some("EN"), i64::from(Quality::Uhd.code())));
+            assert_eq!(a.1, b.1, "one stack across languages, the year from the name");
+            assert_eq!(b.2.as_deref(), Some("AR-SUBS"));
+            assert_eq!(gold.1, None, "no year: no key stacking");
+            assert_eq!((lewis.0.as_deref(), lewis.4.as_deref()), (Some("lewis"), Some("GB")));
+            let n: i64 = c.query_row("SELECT count(*) FROM pragma_table_info('series') WHERE name = 'tmdb_id'", [], |r| r.get(0)).unwrap();
+            assert_eq!(n, 1);
+            let stamps: i64 = c.query_row("SELECT count(*) FROM meta WHERE key LIKE 'vod_match:%'", [], |r| r.get(0)).unwrap();
+            assert_eq!(stamps, 2);
+        };
+        migrate(&mut c).unwrap();
+        check(&c);
+        c.execute("INSERT INTO title_link(source_id,kind,item_key,action,at) VALUES (1,'movie','a','split',5)", []).unwrap();
+        c.pragma_update(None, "user_version", 4).unwrap();
+        migrate(&mut c).unwrap();
+        check(&c);
+        let kept: i64 = c.query_row("SELECT count(*) FROM title_link", [], |r| r.get(0)).unwrap();
+        assert_eq!(kept, 1, "a re-run keeps the user's corrections");
     }
 
     #[test]

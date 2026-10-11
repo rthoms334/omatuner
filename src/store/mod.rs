@@ -35,6 +35,8 @@ pub mod live;
 pub mod migrations;
 pub mod sources;
 pub mod sql;
+pub mod stacks;
+pub mod titles;
 pub mod user;
 pub mod vod;
 

@@ -10,6 +10,7 @@
 //! | `presets.rs`      | P5 sources | free-channel playlists + country detection (§27.8) |
 //! | `category_tags.rs`| P6 core | country / language tags of category names (§28.2) |
 //! | `smart_names.rs`  | WP-03 | name cleanup ("UK | BBC One FHD" → "BBC One") |
+//! | `vod_match.rs`    | P2 core | match keys, languages and stacking rules of movies / series (§29.10) |
 //! | `name_tokens.rs`  | P6 names | the name tokenizer shared by smart names and category tags (§13.1) |
 //! | `identity.rs`     | skeleton (frozen) | ItemKey / normalization / fingerprints (WP-03 owns its tests) |
 //! | `xmltv.rs`        | WP-05a | streaming XMLTV parser |
@@ -28,6 +29,7 @@ pub mod name_tokens;
 pub mod presets;
 pub mod resolve;
 pub mod smart_names;
+pub mod vod_match;
 pub mod xmltv;
 pub mod xtream;
 

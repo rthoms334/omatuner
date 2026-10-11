@@ -79,6 +79,7 @@ fn movie(key: &str, name: &str, grp: &str, order: i32) -> ImportMovie {
         provider_order: order,
         added_at: Some(1_700_000_000 + order as i64),
         groups: vec![group_key(ItemKind::Movie, grp)],
+        tmdb: None,
     }
 }
 
@@ -102,6 +103,7 @@ fn series(key: &str, name: &str, grp: &str, order: i32) -> ImportSeries {
         provider_order: order,
         added_at: None,
         groups: vec![group_key(ItemKind::Series, grp)],
+        tmdb: None,
     }
 }
 
@@ -1103,7 +1105,8 @@ fn vod_reads_details_and_next_episode() {
         rating: None,
         stream: StreamLocator::Xtream { kind: XtreamStreamKind::Series, stream_id: (season * 100 + e) as i64, ext: Some("mp4".into()) },
     };
-    let d = SeriesDetails { seasons: vec![], episodes: vec![ep(1, 1), ep(1, 2), ep(2, 1)], plot: Some("Island".into()), backdrop: None };
+    let d =
+        SeriesDetails { seasons: vec![], episodes: vec![ep(1, 1), ep(1, 2), ep(2, 1)], plot: Some("Island".into()), backdrop: None, tmdb_id: None };
     w(&s, move |c| import::store_series_details(c, sid, &d, NOW));
     let seasons = vod::seasons(&r, sid).unwrap();
     assert_eq!(seasons.iter().map(|x| (x.number, x.episode_count)).collect::<Vec<_>>(), vec![(1, 2), (2, 1)]);
@@ -1142,6 +1145,7 @@ fn vod_reads_details_and_next_episode() {
         episodes: renum,
         plot: None,
         backdrop: None,
+        tmdb_id: None,
     };
     w(&s, move |c| import::store_series_details(c, sid, &d2, NOW + 2));
     let p = user::progress(&r, &ItemRef { key: ItemKey("xt:ep:102-new".into()), ..e1 }).unwrap().unwrap();
@@ -1235,6 +1239,104 @@ fn library_load_merges_overrides_and_skips_disabled_sources() {
     assert!(lib.live.hidden.contains(&chans[1]) && lib.live.hidden.contains(&chans[5]));
     assert!(!lib.live.hidden.contains(&chans[0]), "still visible through News");
     assert!(lib.vod.movies.is_empty());
+}
+
+// ------------------------------------------------------------------ stacks (DESIGN §29.10)
+
+/// A movie as an Xtream list sends it: the year only in the name, maybe a TMDB id.
+fn listed(key: &str, name: &str, grp: &str, order: i32, tmdb: Option<u32>) -> ImportMovie {
+    ImportMovie { year: None, tmdb, ..movie(key, name, grp, order) }
+}
+
+fn mref(src: SourceId, key: &str) -> ItemRef {
+    ItemRef { source: src, kind: ItemKind::Movie, key: ItemKey(key.into()) }
+}
+
+/// The copies of one title stack in All across playlists and languages, from match keys the
+/// import stores: hidden copies (category hidden) and playlists out of All don't join, a
+/// locked copy does (and isn't the top card), the English copy is the top, different TMDB ids
+/// never stack, the visibility hook (explicit content) keeps an item out of everything. The
+/// user's split survives a refresh and its Undo restores the stack; a renamed copy is keyed
+/// again.
+#[test]
+fn copies_stack_across_playlists_and_follow_the_users_corrections() {
+    let s = store("tuner-st-stacks");
+    let (a, b, c3) = w(&s, |c| Ok((seed::seed_source(c, "TV")?, seed::seed_source(c, "TV 2")?, seed::seed_source(c, "Free")?)));
+    let tv = vec![
+        listed("a1", "EN ★ Dune - 2021", "EN Movies", 0, None),
+        listed("a2", "FR ★ Dune - 2021", "FR Films", 1, None),
+        listed("a3", "EN ★ Heat - 1995", "EN Movies", 2, None),
+        listed("a4", "EN ★ Leo - 2023", "EN Movies", 3, Some(1_075_794)),
+    ];
+    let tv2 = vec![
+        listed("b1", "EN - Dune (2021)", "Hidden", 0, None),
+        listed("b2", "AR-SUBS - Dune (2021)", "Locked", 1, None),
+        listed("b3", "EN - Heat (1995)", "Films", 2, None),
+        listed("b4", "IN-TL - Leo (2023)", "Films", 3, Some(1_000_837)),
+    ];
+    run_import(&s, a, vec![], tv.clone(), vec![], vec![ItemKind::Movie], NOW);
+    run_import(&s, b, vec![], tv2, vec![], vec![ItemKind::Movie], NOW);
+    run_import(&s, c3, vec![], vec![listed("c1", "EN - Dune (2021)", "Films", 0, None)], vec![], vec![ItemKind::Movie], NOW);
+    w(&s, move |c| {
+        user::set_group_override(c, b, ItemKind::Movie, &GroupKey("movie:hidden".into()), &GroupOverride { hidden: true, ..Default::default() })?;
+        user::set_group_override(c, b, ItemKind::Movie, &GroupKey("movie:locked".into()), &GroupOverride { locked: true, ..Default::default() })?;
+        sources::set_source_settings(c, c3, &SourceSettings { in_all: Some(false), ..Default::default() })
+    });
+    let r = s.reader().unwrap();
+    assert_eq!(count(&r, "SELECT count(*) FROM movie WHERE match_hash IS NULL OR match_tags IS NULL"), 0, "keyed at import");
+    assert_eq!(r.query_row("SELECT tmdb_id FROM movie WHERE key = 'a4'", [], |x| x.get::<_, String>(0)).unwrap(), "1075794");
+
+    let lib = library::load(&r).unwrap();
+    let at = |key: &str| lib.vod.movies.iter().position(|m| m.key.0 == key).map(|i| i as u32);
+    let st = lib.vod.stacks(true);
+    let names = |v: &[u32]| v.iter().map(|i| lib.vod.movies[*i as usize].key.0.clone()).collect::<Vec<_>>();
+    let dune = st.stack_of(at("a1").unwrap()).unwrap();
+    assert_eq!(names(st.members(dune)), ["a1", "b2", "a2"], "English, then subtitled, then French; hidden b1 and out-of-All c1 left out");
+    assert_eq!(at("b1"), None, "hidden");
+    assert_eq!(st.stack_of(at("c1").unwrap()), None, "Free is out of All");
+    assert!(lib.vod.movies[at("b2").unwrap() as usize].locked, "the locked copy stays in the stack");
+    assert_eq!(names(&[st.top(dune)]), ["a1"]);
+    assert_eq!(st.stack_of(at("a4").unwrap()), None, "two TMDB ids: two titles");
+    assert_eq!(st.len(), 2, "Dune and Heat");
+    assert_eq!(names(&st.collapse(&lib.vod.all_sorted(true, SortMode::Provider))), ["a1", "a3", "a4", "b4", "c1"]);
+
+    // the visibility hook: an item it rejects is nowhere, so it never stacks
+    let opts = library::LoadOptions {
+        vod_visible: Some(std::sync::Arc::new(|f: &library::VodFacts<'_>| !f.provider_name.contains("Heat (1995)"))),
+        ..Default::default()
+    };
+    let hooked = library::load_with(&r, &opts).unwrap();
+    assert!(hooked.vod.movies.iter().all(|m| m.key.0 != "b3"));
+    assert_eq!(hooked.vod.stacks(true).len(), 1, "Heat has one copy left");
+
+    // "Not the same title": the copy leaves its stack, a refresh keeps it out, Undo restores
+    w(&s, move |c| tuner::store::titles::set_split(c, &mref(a, "a2"), true, NOW));
+    run_import(&s, a, vec![], tv.clone(), vec![], vec![ItemKind::Movie], NOW + 10);
+    let lib = library::load(&r).unwrap();
+    let a2 = lib.vod.movies.iter().position(|m| m.key.0 == "a2").unwrap() as u32;
+    assert_eq!(lib.vod.stacks(true).stack_of(a2), None);
+    assert_eq!(tuner::store::titles::links(&r).unwrap()[0].name.as_deref(), Some("FR ★ Dune - 2021"));
+    w(&s, move |c| tuner::store::titles::set_split(c, &mref(a, "a2"), false, NOW));
+    let lib = library::load(&r).unwrap();
+    let a2 = lib.vod.movies.iter().position(|m| m.key.0 == "a2").unwrap() as u32;
+    assert!(lib.vod.stacks(true).stack_of(a2).is_some());
+
+    // a pin is one per stack
+    w(&s, move |c| {
+        tuner::store::titles::set_pin(c, &mref(b, "b2"), &[], true, NOW)?;
+        tuner::store::titles::set_pin(c, &mref(a, "a1"), &[mref(b, "b2"), mref(a, "a2")], true, NOW)
+    });
+    let lib = library::load(&r).unwrap();
+    let pinned: Vec<&str> =
+        lib.vod.movies.iter().enumerate().filter(|(i, _)| lib.vod.stacks(true).meta(*i as u32).pinned).map(|(_, m)| &*m.key.0).collect();
+    assert_eq!(pinned, ["a1"]);
+
+    // the provider renames a copy: its key follows (Heat 1996 is another film)
+    let mut renamed = tv;
+    renamed[2] = listed("a3", "EN ★ Heat - 1996", "EN Movies", 2, None);
+    run_import(&s, a, vec![], renamed, vec![], vec![ItemKind::Movie], NOW + 20);
+    let lib = library::load(&r).unwrap();
+    assert_eq!(lib.vod.stacks(true).len(), 1, "only Dune");
 }
 
 // ------------------------------------------------------------------ category filter

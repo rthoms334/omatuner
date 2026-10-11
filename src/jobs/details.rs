@@ -6,19 +6,20 @@
 //! * Only Xtream items have details; for M3U items (and fresh details) the job is a no-op.
 //! * A panel without data for the item (`NotFound`, empty series info) still stores an empty
 //!   detail record, so the page does not re-ask on every visit for 7 days.
-//! * Writes go through `submit_notify(DataScope::VodDetails)`.
+//! * Writes go through `submit_notify(DataScope::VodDetails)`. Details that bring a new TMDB
+//!   id also rebuild the library: ids decide stacks (DESIGN §29.10).
 //! * Episodes without a numeric id cannot be played (Xtream locators carry a number) and are
 //!   skipped; an episode without a number is numbered by its position in its season.
 
 use tokio_util::sync::CancellationToken;
 
-use super::{JobContext, JobPhase, Progress, check, read};
+use super::{JobContext, JobKind, JobPhase, Progress, check, read};
 use crate::error::{Error, Result};
 use crate::model::{ItemKind, MovieId, SeriesId, Source, SourceKind, StreamLocator, Timestamp, XtreamStreamKind};
 use crate::msg::DataScope;
-use crate::sources::identity;
 use crate::sources::xtream::XtreamClient;
 use crate::sources::xtream::types::{XtSeriesInfo, XtVodInfo};
+use crate::sources::{identity, vod_match};
 use crate::store::import::{ImportEpisode, ImportSeason, MovieDetails, SeriesDetails};
 
 /// Details are re-fetched after this long.
@@ -68,7 +69,17 @@ pub async fn load_movie(ctx: &JobContext, id: MovieId, progress: &Progress, canc
     check(cancel)?;
     progress.set(JobPhase::Finishing);
     let d = movie_details(&info);
-    ctx.store.writer().submit_notify(DataScope::VodDetails, move |c| crate::store::import::store_movie_details(c, id, &d, now)).recv().await
+    let restack = tmdb_changed(movie.tmdb_id.as_deref().and_then(vod_match::tmdb_id), d.tmdb_id.as_deref().and_then(vod_match::tmdb_id));
+    ctx.store.writer().submit_notify(DataScope::VodDetails, move |c| crate::store::import::store_movie_details(c, id, &d, now)).recv().await?;
+    if restack {
+        (ctx.submit)(JobKind::RebuildLibrary);
+    }
+    Ok(())
+}
+
+/// A new TMDB id decides stacks (DESIGN §29.10): the library rebuilds when details bring one.
+fn tmdb_changed(old: Option<u32>, new: Option<u32>) -> bool {
+    new.is_some() && new != old
 }
 
 fn text(s: &Option<String>) -> Option<String> {
@@ -102,10 +113,11 @@ fn movie_details(info: &XtVodInfo) -> MovieDetails {
 }
 
 pub async fn load_series(ctx: &JobContext, id: SeriesId, progress: &Progress, cancel: &CancellationToken) -> Result<()> {
-    let (series, src) = read(ctx, move |c| {
+    let (series, src, old_tmdb) = read(ctx, move |c| {
         let s = crate::store::vod::series(c, id)?;
         let src = crate::store::sources::get_source(c, s.source_id)?;
-        Ok((s, src))
+        let tmdb: Option<i64> = c.query_row("SELECT tmdb_id FROM series WHERE id = ?1", [id], |r| r.get(0))?;
+        Ok((s, src, tmdb.and_then(|t| u32::try_from(t).ok())))
     })
     .await?;
     progress.set_subject(series.display_name());
@@ -122,7 +134,12 @@ pub async fn load_series(ctx: &JobContext, id: SeriesId, progress: &Progress, ca
     check(cancel)?;
     progress.set(JobPhase::Finishing);
     let d = series_details(&info);
-    ctx.store.writer().submit_notify(DataScope::VodDetails, move |c| crate::store::import::store_series_details(c, id, &d, now)).recv().await
+    let restack = tmdb_changed(old_tmdb, d.tmdb_id);
+    ctx.store.writer().submit_notify(DataScope::VodDetails, move |c| crate::store::import::store_series_details(c, id, &d, now)).recv().await?;
+    if restack {
+        (ctx.submit)(JobKind::RebuildLibrary);
+    }
+    Ok(())
 }
 
 fn series_details(info: &XtSeriesInfo) -> SeriesDetails {
@@ -162,7 +179,13 @@ fn series_details(info: &XtSeriesInfo) -> SeriesDetails {
             });
         }
     }
-    SeriesDetails { seasons, episodes, plot: text(&info.info.plot), backdrop: info.info.backdrop_path.iter().find_map(|b| text(&Some(b.clone()))) }
+    SeriesDetails {
+        seasons,
+        episodes,
+        plot: text(&info.info.plot),
+        backdrop: info.info.backdrop_path.iter().find_map(|b| text(&Some(b.clone()))),
+        tmdb_id: crate::sources::xtream::types::tmdb_of(&info.info.tmdb, &info.info.tmdb_id),
+    }
 }
 
 #[cfg(test)]
@@ -189,6 +212,11 @@ mod tests {
         .unwrap();
         let d = series_details(&info);
         assert_eq!(d.plot.as_deref(), Some("Plot"));
+        assert_eq!(d.tmdb_id, None);
+        let with_id: XtSeriesInfo = serde_json::from_str(r#"{"info":{"tmdb":"1871"}}"#).unwrap();
+        assert_eq!(series_details(&with_id).tmdb_id, Some(1871));
+        assert!(tmdb_changed(None, Some(1871)) && tmdb_changed(Some(1), Some(1871)));
+        assert!(!tmdb_changed(Some(1871), Some(1871)) && !tmdb_changed(Some(1871), None), "no new id: no rebuild");
         assert_eq!(d.backdrop.as_deref(), Some("http://i/b.jpg"));
         assert_eq!(d.seasons.len(), 1);
         assert_eq!(d.seasons[0].cover.as_deref(), Some("http://i/c.jpg"));

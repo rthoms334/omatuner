@@ -85,6 +85,7 @@ fn movie(key: &str, name: &str) -> ImportMovie {
         provider_order: 0,
         added_at: None,
         groups: vec![group_key(ItemKind::Movie, "Films")],
+        tmdb: None,
     }
 }
 
@@ -221,6 +222,8 @@ fn populate(s: &Store, creds: &Creds) -> Fixture {
             },
         )?;
         epg::set_manual_mapping(c, &ch(m3u, "m3u:aa"), guide, "arte.de")?;
+        // "Not the same title" (DESIGN §29.11): the split survives a restore
+        tuner::store::titles::set_split(c, &mv(xt, "xt:vod:7"), true, NOW + 4)?;
         Ok(Fixture { xt, m3u })
     })
 }
@@ -247,6 +250,7 @@ fn normalized(mut b: Backup) -> Backup {
         r.channel.source = src(r.channel.source);
     });
     b.manual_mappings.iter_mut().for_each(|m| m.source_id = sources[&m.source_id]);
+    b.title_links.iter_mut().for_each(|t| t.item.source = src(t.item.source));
     b
 }
 
@@ -266,6 +270,7 @@ fn export_wipe_restore_round_trip_is_lossless() {
     assert_eq!((b1.item_overrides.len(), b1.group_overrides.len(), b1.progress.len()), (2, 1, 1));
     assert_eq!((b1.history.len(), b1.reminders.len(), b1.manual_mappings.len()), (3, 1, 1));
     assert_eq!(b1.manual_mappings[0].epg_source_name, "My guide");
+    assert_eq!((b1.title_links.len(), b1.title_links[0].action.as_str()), (1, "split"));
     assert!(b1.fav_items.iter().all(|e| !e.fingerprint.norm_name.is_empty()), "fingerprints travel with the data");
 
     // file round trip, written 0600
@@ -284,7 +289,7 @@ fn export_wipe_restore_round_trip_is_lossless() {
         let report = w(target, move |c| backup::restore(c, &b, RestoreMode::Replace));
         assert_eq!((report.sources_added, report.sources_matched), (2, 0));
         assert!(report.needs_credentials.is_empty());
-        assert!(report.user_rows >= 13, "{report:?}");
+        assert!(report.user_rows >= 14, "{report:?}");
         let b2 = w(target, |c| backup::export(c, FULL, Some("[general]\nui_scale = 1.25\n".into()), NOW + 99));
         assert_eq!(normalized(b2), normalized(b1.clone()));
         let r = target.reader().unwrap();

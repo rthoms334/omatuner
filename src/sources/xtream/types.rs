@@ -322,6 +322,11 @@ pub fn string_or_vec_lenient<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Stri
     })
 }
 
+/// The TMDB id of a list or info entry (`tmdb`, else `tmdb_id`), when it is a positive number.
+pub fn tmdb_of(tmdb: &Option<String>, tmdb_id: &Option<String>) -> Option<u32> {
+    [tmdb, tmdb_id].into_iter().flatten().find_map(|s| crate::sources::vod_match::tmdb_id(s))
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct XtVodStream {
     #[serde(default, deserialize_with = "lenient_i64")]
@@ -344,6 +349,11 @@ pub struct XtVodStream {
     pub container_extension: Option<String>,
     #[serde(default, deserialize_with = "lenient_string")]
     pub year: Option<String>,
+    /// TMDB id (XUI / XC panels: `tmdb`, some `tmdb_id`; string or number, `""` / `"0"` = none).
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub tmdb: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub tmdb_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -376,6 +386,11 @@ pub struct XtSeries {
     pub category_id: Option<String>,
     #[serde(default, deserialize_with = "string_or_vec_lenient")]
     pub category_ids: Vec<String>,
+    /// TMDB id, as for movies.
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub tmdb: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub tmdb_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -434,6 +449,11 @@ pub struct XtSeriesInfo {
 pub struct XtSeriesInfoInner {
     #[serde(default, deserialize_with = "lenient_string")]
     pub plot: Option<String>,
+    /// TMDB id (`tmdb` or `tmdb_id`).
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub tmdb: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub tmdb_id: Option<String>,
     #[serde(default, deserialize_with = "string_or_vec")]
     pub backdrop_path: Vec<String>,
 }
