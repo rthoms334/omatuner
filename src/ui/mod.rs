@@ -19,6 +19,7 @@ pub mod epg_grid;
 pub mod layout;
 pub mod overlays;
 pub mod parental;
+pub mod popout;
 pub mod screens;
 #[doc(hidden)]
 pub mod testing;
@@ -193,6 +194,9 @@ pub enum NavRequest {
     Back,
     Open(OverlayRequest),
     CloseOverlay,
+    /// Pop the window out to the video-only player on every workspace, or back in (the
+    /// player's double-click; DESIGN §21.6).
+    TogglePopOut,
 }
 
 /// A queued Settings change (applied by the app after the frame).
@@ -232,6 +236,8 @@ pub struct UiCtx<'a> {
     /// Mini-player rect of the previous frame (screens keep focus/scroll targets clear of it,
     /// e.g. the guide's bottom-right cells).
     pub mini_rect: Option<egui::Rect>,
+    /// The window is popped out: the player draws its video-only layout (DESIGN §12.3).
+    pub video_only: bool,
     pub now: Timestamp,
     nav: &'a mut Vec<NavRequest>,
     toasts: &'a mut Vec<Toast>,
@@ -256,6 +262,7 @@ pub struct UiParts<'a> {
     pub search_index: &'a mut Option<crate::search::SearchIndex>,
     pub layout: LayoutClass,
     pub mini_rect: Option<egui::Rect>,
+    pub video_only: bool,
     pub now: Timestamp,
     pub nav: &'a mut Vec<NavRequest>,
     pub toasts: &'a mut Vec<Toast>,
@@ -282,6 +289,7 @@ impl<'a> UiCtx<'a> {
             search_index: p.search_index,
             layout: p.layout,
             mini_rect: p.mini_rect,
+            video_only: p.video_only,
             now: p.now,
             nav: p.nav,
             toasts: p.toasts,
