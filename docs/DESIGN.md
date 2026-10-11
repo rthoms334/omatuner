@@ -879,6 +879,24 @@ CREATE TABLE IF NOT EXISTS quality_check (       -- trust evidence: one row per 
 * The migration's Rust step seeds it from `channel_video` (claim = the quality word of the
   name each size was measured under) and runs `migrations::reclean_names` (§9.6).
 
+### 6.2.3 `0005_explicit.sql` (explicit content behind parental control, §20.3)
+
+The SQL file is comments only; its Rust step (`migrations::backfill_explicit`) adds the
+columns when missing (safe to re-run) and fills `grp.explicit` from the stored names:
+```sql
+grp.explicit            INTEGER NOT NULL DEFAULT 0 -- import's finding: 0 no, 1 name, 2 provider is_adult
+channel.explicit        INTEGER NOT NULL DEFAULT 0 -- the provider flags the item (Xtream is_adult)
+movie.explicit          INTEGER NOT NULL DEFAULT 0
+series.explicit         INTEGER NOT NULL DEFAULT 0
+group_override.explicit INTEGER                    -- user: NULL as detected, 1 marked, 0 "Not explicit"
+```
+* Backfill: `sources::explicit::is_explicit_name(COALESCE(raw_name, name))` → 1 for groups
+  still at 0 (a provider's 2 is never lowered). Provider flags arrive with the next refresh.
+* Every import rewrites `grp.explicit` (`group_code(adult, raw_name)`) and the items' flag;
+  the user's word lives in `group_override` (keyed by group key: survives refreshes, backed up,
+  carried to `movie:X` / `series:X` with the locks when entries are reclassified, §27.4 —
+  only "Mark as explicit", never "Not explicit").
+
 ### 6.3 FTS approach and write rules (fixes the critique and review B2)
 
 * `programme` is an `INTEGER PRIMARY KEY AUTOINCREMENT` rowid table: ids are never reused, so
@@ -1928,7 +1946,7 @@ favourites lists) show a 󰇙 drag grip and move with Alt+↑/↓ or K/J. Every 
 | | MPRIS · idle inhibit mode | `integration.mpris`, `idle_inhibit` | on · while playing |
 | Favourites | lists: create, rename (F2), delete (Confirm), reorder (grip / Alt+↑/↓) | `fav_list` | "Favourites" (default, not deletable) |
 | Reminders | pending reminders (programme, channel, time); Delete cancels | `reminder` | — |
-| Parental | enable · set/change PIN · relock after · lock groups/channels (from lists via Ctrl+L) | `parental.*`, overrides | off |
+| Parental | enable · set/change PIN · relock after · lock groups/channels (from lists via Ctrl+L) · Explicit content: "Show explicit content" without a PIN (offers a PIN first), the categories treated as explicit (only while shown; Enter = Not explicit / Mark as explicit) | `parental.*`, overrides | off; explicit hidden |
 | Backup | export (include passwords? history?) · import (merge/replace, restore settings?) | §19 | — |
 | Hidden items | unhide groups/channels/VOD | overrides | — |
 | Orphans | Enter = attach to…, Delete/x → menu with Forget | §8.3 | — |
@@ -2012,7 +2030,9 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | Too many connections | player error | "The provider refused the stream (account expired or too many connections)" |
 | Channel offline (404) / geo-blocked (403 without account issue) | player error, row dimmed | copy per §11.4; failure cache dims row |
 | DRM channel | row badge, player | "DRM-protected — can't be played" (never attempts) |
-| Locked (parental) | rows, search | lock glyph, PIN prompt on open/play; hidden from search while locked |
+| Locked (parental) | rows, search | lock glyph, PIN prompt on open/play; hidden from search while locked — a lock stays visible (dimmed, glyph) |
+| Explicit content hidden (parental, §20.3) | everywhere | ABSENT, not dimmed: Live, guide (grid + collection picker), Movies, Series, Home rails, search, counts (group panes, scope tabs, `Library::eligible`), zap lists, favourites / History / Continue watching / Reminders, Settings lists. `--play` of it: the PIN prompt ("This channel is locked"), or without a PIN the toast "This channel is hidden by parental control (Settings ▸ Parental)" — never its name. Relock: gone in the same frame; if it plays, playback stops ("Playback stopped — parental control is on"), its pages close, open dialogs and toasts go |
+| Explicit content shown | everywhere | like any content (a PIN unlock, or "Show explicit content" without a PIN); groups' menus offer "Not explicit" |
 | Reconnecting / Buffering / Loading | video rect | §13.8 |
 | First guide import running | rows, grid, preview | "Loading guide… 45 %" (not "No guide data") |
 | Guide day without data | grid | "No guide data for Fri 17 Oct" |
@@ -2666,6 +2686,66 @@ the current settings; the onboarding restore always applies them). Machine-speci
 channels/VOD require the PIN to open/play; unlock lasts until restart or `relock_min`; three
 wrong attempts → 30 s cooldown; locked items hidden from search while locked. It's a speed bump
 for children, not security (documented in Settings).
+
+**Locked ≠ explicit (user decision).** A *lock* is the user's own: the item stays visible —
+dimmed, lock glyph — and asks for the PIN on open/play. *Explicit* (adult) content is hidden
+behind parental control: absent, as if the playlist didn't have it.
+
+* **Detection** (`sources::explicit`, at import; stored, §6.2.3). A category is explicit when
+  the provider flags it (Xtream `is_adult` on `get_*_categories`, read leniently: `"1"`, `1`,
+  `true`; `"0"`, `0`, missing = no) or its raw provider name has one of the words `XXX`, `18+`
+  / `+18` (also `18 +`), `Porn` / `Porno`, `Erotic` / `Erotica` / `Erotik` / `Érotique` /
+  `Erotico`, `Adult` / `Adults` / `Adulto(s)` / `Adulte(s)` / `Adulti` / `Erwachsene`,
+  Cyrillic `ЭРОТИКА` / `ПОРНО` / `Взрослые` / `Взрослых` — whole words through the shared
+  tokenizer (`name_tokens`: `|XXX|`, `★ 18+ ★`, `ᴬᴰᵁᴸᵀ`, `XXX-Movies`, `18+XXX`, Cyrillic
+  `ХХХ`; circled, squared, fullwidth and mathematical letters `ⓍⓍⓍ` / `𝐗𝐗𝐗` read as ASCII), except
+  `Young Adult(s)`, `New Adult`, `Adult Swim`, `Adult Animation` / `Animated` / `Cartoon(s)` /
+  `Education` / `Learning` / `Contemporary`. Not `Essex`, `XXXL`, `U18`, `Adultery`. Item
+  names are never classified. An **item** is explicit when one of its categories is, or the
+  provider flags the item itself (`is_adult` on live / VOD / series streams) and none of its
+  categories is marked "Not explicit".
+* **The user's word** per category (`group_override.explicit`): "Mark as explicit" / "Not
+  explicit" in the group / category menus (Live, Movies, Series) and Settings ▸ Parental's
+  list; it beats the provider and the names and survives refreshes. The word is always
+  stored (never "back to as detected": the detection may have changed since, and the toast
+  must hold). While hidden, the toast doesn't name the category.
+* **When it is hidden** — `ParentalConfig::hides_explicit(unlocked)`: with a PIN (parental lock
+  on), while the session is locked; without one, unless Settings ▸ Parental ▸ **Show explicit
+  content** is on (off by default; turning it on offers "Set a PIN first (recommended)" or
+  "Show without a PIN"; removing the PIN turns it off again).
+* **One predicate.** `store::library::Visibility` is the library build's only visibility rule:
+  `load_visible` leaves explicit groups and items out of the snapshot entirely (`channels`,
+  `groups`, VOD vectors, `members`, `per_source` counts, `recent_channels`, and
+  `SourceMeta::has_*`, so a playlist with only explicit movies isn't `eligible`). Everything
+  built from the snapshot — lists, collections and zap lists, numeric entry, search, Home,
+  favourites / History lookups (`by_ref`) — follows without asking. `Library::explicit`
+  (`ExplicitIndex`) records what is explicit either way — disabled playlists' items too —
+  and `Library::conceals(&ItemRef)` is the check for rows read from the database (Continue
+  watching, Reminders, Settings ▸ Hidden / Favourites counts); it fails closed before the
+  first build. Group counts (`item_count`, so hide-empty too) leave explicit members out, and
+  the "Choose what to show" totals leave explicit categories out. Settings ▸ Orphans leaves
+  out orphans whose category (`fingerprint.norm_group`: the stored category and the user's
+  word on it, or its name) is explicit, with a count. P2's merged stacks ask
+  `Visibility::admits` per copy.
+* **Switching.** The app keeps an `ExplicitGate` (shared with the jobs and the reminder
+  scheduler) in step with the parental state every frame (`TunerApp::sync_explicit`; the
+  relock timer repaints on time). Unlock → a `RebuildLibrary` that shows it (arrives < 0.4 s;
+  nothing else changes, no flicker). Relock → `Library::hiding_explicit` re-filters the
+  snapshot on the UI thread in the same frame (a copy of the indexes; no rebuild to wait for),
+  a build that started before is filtered on arrival, explicit playback stops, its detail pages
+  and groups close, open dialogs and toasts go.
+* **Authoritative elsewhere.** The player controller never zaps or recalls onto an explicit
+  channel while hidden (`MediaResolver::is_explicit`, any sender — MPRIS always counts as
+  locked); `--play` / a reminder's Watch ask for the PIN (or toast "hidden by parental
+  control") without naming it; reminders on explicit channels stay silent while hidden
+  (pending, announced if still airing once shown); detail-load jobs never name an explicit
+  title (jobs overlay, log lines), and no INFO+ log line carries one (mpv's own lines are
+  requested at `warn`, so its `info` stream tags never reach the log).
+* **Locked rows are dimmed** while the session is locked: the app records the session state
+  each frame (`widgets::set_session_locked`), and channel / group rows paint locked entries in
+  `text_disabled` and posters under a scrim; they paint normally once the PIN opens it.
+* **Not covered:** a backup export is a full dump — favourites, progress and reminders of
+  explicit titles included, whatever the lock. Keep backup files private.
 
 ---
 

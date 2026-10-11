@@ -97,6 +97,7 @@ fn playlist(s: &Store, chans: &[(&str, &str, Option<&str>, i32)]) -> SourceId {
         .iter()
         .enumerate()
         .map(|(i, (key, name, tvg, shift))| ImportChannel {
+            adult: false,
             key: ItemKey((*key).into()),
             provider_id: None,
             name: (*name).into(),
@@ -136,6 +137,7 @@ fn playlist(s: &Store, chans: &[(&str, &str, Option<&str>, i32)]) -> SourceId {
         )?;
         let imp = import::begin_catalogue(c, src, T0)?;
         let g = ImportGroup {
+            adult: false,
             kind: ItemKind::Channel,
             key: group_key(ItemKind::Channel, "All"),
             name: "All".into(),

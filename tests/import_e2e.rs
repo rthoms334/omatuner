@@ -1146,6 +1146,7 @@ async fn legacy_channels_of_a_kept_playlist_become_movies_and_series_with_their_
             // a first refresh that wrote its movie groups and was then cancelled (no finish)
             let cancelled = import::begin_catalogue(c, source, 4)?;
             let movies = import::ImportGroup {
+                adult: false,
                 kind: ItemKind::Movie,
                 key: group_key(ItemKind::Movie, "Adult"),
                 name: "Adult".into(),

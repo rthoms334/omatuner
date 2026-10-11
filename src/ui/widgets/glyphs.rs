@@ -17,6 +17,8 @@ pub const HEART: &str = "\u{f02d1}";
 pub const LOCK: &str = "\u{f033e}";
 pub const UNLOCK: &str = "\u{f033f}";
 pub const HIDDEN: &str = "\u{f0209}";
+/// Explicit content (parental control hides it): the eye-off of hiding.
+pub const EXPLICIT: &str = HIDDEN;
 pub const PLAY: &str = "\u{f040a}";
 pub const PAUSE: &str = "\u{f03e4}";
 pub const STOP: &str = "\u{f04db}";

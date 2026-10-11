@@ -349,12 +349,14 @@ pub struct JobContext {
     pub submit: JobSubmitter,
     /// Set by the app while the player is Loading/Zapping (scheduler skips its tick).
     pub player_busy: Arc<AtomicBool>,
+    /// Whether library builds show explicit content (DESIGN §20.3), kept by the app.
+    pub explicit: crate::store::library::ExplicitGate,
 }
 
 impl JobContext {
     /// `submit` is a no-op placeholder until [`JobManager::new`] installs the real one.
     pub fn new(store: Store, http: HttpClient, bus: EventBus, paths: AppPaths, config: SharedConfig) -> Self {
-        Self { store, http, bus, paths, config, submit: Arc::new(|_| JobId(0)), player_busy: Arc::default() }
+        Self { store, http, bus, paths, config, submit: Arc::new(|_| JobId(0)), player_busy: Arc::default(), explicit: Default::default() }
     }
 }
 

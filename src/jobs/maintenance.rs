@@ -32,7 +32,9 @@ const IMAGE_CACHE_BYTES: u64 = 500 * 1024 * 1024;
 
 /// Build a new `Library` from a fresh reader connection on a blocking thread.
 pub async fn rebuild_library(ctx: &JobContext) -> Result<Arc<Library>> {
-    read(ctx, crate::store::library::load).await.map(Arc::new)
+    // read at the start: the app rebuilds again when its parental state changed meanwhile
+    let visibility = ctx.explicit.visibility();
+    read(ctx, move |c| crate::store::library::load_visible(c, visibility)).await.map(Arc::new)
 }
 
 /// Prune programmes older than max(keep_past_days, max catch-up days), sweep inactive EPG

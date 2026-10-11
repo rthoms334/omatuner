@@ -114,6 +114,8 @@ const MENU_PLAY: u8 = 21;
 const MENU_OPEN_CAT: u8 = 22;
 /// The categories menu's "Countries & languages…".
 const MENU_COUNTRIES: u8 = 23;
+/// The category menu's "Mark as explicit" / "Not explicit" (DESIGN §20.3).
+const MENU_EXPLICIT: u8 = 24;
 
 /// Identity of the library snapshot (indices into it are only valid for that snapshot; two
 /// rebuilds can share a `built_at` second).
@@ -784,6 +786,7 @@ impl VodBrowser {
                 if self.tags.1.contains_key(&g.id) {
                     items.push(MenuItem { shortcut: None, ..mi(glyphs::EARTH, "Countries & languages…", Action::Digit(MENU_COUNTRIES), "") });
                 }
+                items.push(super::live::explicit_menu_item(&g, MENU_EXPLICIT));
                 items.extend([mi(glyphs::REORDER, "Move up", Action::MoveUp, "Alt+↑"), mi(glyphs::REORDER, "Move down", Action::MoveDown, "Alt+↓")]);
                 ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: g.display_name().to_owned(), items }));
             }
@@ -925,6 +928,11 @@ impl VodBrowser {
             OverlayResult::Chosen(Action::Digit(MENU_COUNTRIES)) => {
                 if let Some(g) = self.current_group(ctx) {
                     ctx.open(OverlayRequest::Categories(g.source_id));
+                }
+            }
+            OverlayResult::Chosen(Action::Digit(MENU_EXPLICIT)) => {
+                if let Some(g) = self.current_group(ctx).cloned() {
+                    super::live::toggle_group_explicit(ctx, &g);
                 }
             }
             OverlayResult::Chosen(Action::SortMenu) => self.sort_menu(ctx),
@@ -1679,6 +1687,7 @@ mod tests {
     fn with_pin(t: &mut crate::ui::testing::TestUi) {
         let mut cfg = (*t.config).clone();
         cfg.parental = crate::config::ParentalConfig {
+            show_explicit: false,
             enabled: true,
             pin_salt: Some("s".into()),
             pin_hash: Some(crate::ui::parental::hash_pin("1234", "s")),

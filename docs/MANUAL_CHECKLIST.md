@@ -387,6 +387,43 @@ Run each item at **Wide** and **Tiled**, at **text 12** and **text 16**, in a **
     - Both ask for the PIN before playing, and a wrong PIN plays nothing.
     - Three wrong PINs start a 30 s cooldown.
     - While locked, zapping with ↑/↓ skips the locked channel and recently failing channels.
+- [ ] **Explicit content (a playlist with adult categories, e.g. `XXX`, `18+`, `For Adults`,
+  or Xtream categories flagged `is_adult`):**
+  - **Do:** start with no PIN and *Show explicit content* off.
+  - **Expect:** the adult categories and their channels and titles are missing everywhere:
+    Live TV groups and *All channels*, the guide grid and its collection picker, Movies and
+    Series categories and grids, Home rails (Continue watching, Favourites, Recently added),
+    search (`/` and Ctrl+K, guide section too), the counts in group panes and on the playlist
+    tabs, and ↑/↓ zapping. A playlist that only has adult movies has no Movies tab. *Adult Swim*
+    and *Young Adult* categories still show. Settings ▸ Parental says "N categories are hidden
+    as explicit" and names none.
+  - **Do:** turn on Settings ▸ Parental ▸ *Show explicit content*.
+  - **Expect:** a menu offers *Set a PIN first (recommended)*, which moves to the New PIN field,
+    or *Show without a PIN*. After *Show without a PIN*, everything appears within a second with
+    no flicker. Settings ▸ Parental lists each explicit category with the reason (its name, the
+    playlist, you).
+  - **Do:** right-click an ordinary group and choose *Mark as explicit*. Right-click an adult
+    one and choose *Not explicit*. Turn *Show explicit content* off, then refresh the playlist.
+  - **Expect:** the marked group disappears and the cleared one stays, before and after the
+    refresh.
+  - **Do:** set a PIN. Lock now. Run `tuner --play <ref of an adult channel>`.
+  - **Expect:** it asks for the PIN and doesn't name the channel. The right PIN plays it, and
+    the adult categories appear.
+  - **Do:** with an adult channel playing (MPRIS widget and pop-out showing its title),
+    Settings ▸ Parental ▸ *Lock now*, or wait out *Lock again after*.
+  - **Expect:** in the same moment playback stops ("Playback stopped — parental control is
+    on"), the categories are gone, and no toast, notification, MPRIS title, pop-out strip or
+    jobs entry shows an adult title. `grep -i '<title>' /tmp/tuner-check/state/tuner.log` finds no
+    INFO or higher line with it written while locked. A reminder set on an adult channel stays
+    silent while locked.
+  - **Do:** with a PIN set and the session locked, look at a group, channel and movie you
+    locked with Ctrl+L, then enter the PIN.
+  - **Expect:** while locked they stay listed, dimmed, with the lock glyph; after the PIN they
+    paint normally (the lock glyph stays).
+  - **Do:** watch half an adult movie, disable its playlist, lock. Open Home and Settings ▸
+    Orphans (after a refresh dropped an adult favourite).
+  - **Expect:** Continue watching doesn't show it; Orphans says "N more hidden as explicit"
+    and names none.
 
 ## 8. Desktop integration
 

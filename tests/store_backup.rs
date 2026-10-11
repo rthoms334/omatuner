@@ -47,6 +47,7 @@ struct Fixture {
 
 fn chan(key: &str, name: &str) -> ImportChannel {
     ImportChannel {
+        adult: false,
         key: ItemKey(key.into()),
         provider_id: key.strip_prefix("xt:live:").map(str::to_owned),
         name: name.into(),
@@ -72,6 +73,7 @@ fn chan(key: &str, name: &str) -> ImportChannel {
 
 fn movie(key: &str, name: &str) -> ImportMovie {
     ImportMovie {
+        adult: false,
         key: ItemKey(key.into()),
         provider_id: None,
         name: name.into(),
@@ -150,6 +152,7 @@ fn populate(s: &Store, creds: &Creds) -> Fixture {
             let imp = import::begin_catalogue(c, src, NOW)?;
             let groups = [
                 ImportGroup {
+                    adult: false,
                     kind: ItemKind::Channel,
                     key: group_key(ItemKind::Channel, "News"),
                     name: "News".into(),
@@ -158,6 +161,7 @@ fn populate(s: &Store, creds: &Creds) -> Fixture {
                     provider_order: 0,
                 },
                 ImportGroup {
+                    adult: false,
                     kind: ItemKind::Movie,
                     key: group_key(ItemKind::Movie, "Films"),
                     name: "Films".into(),
@@ -190,7 +194,15 @@ fn populate(s: &Store, creds: &Creds) -> Fixture {
             m3u,
             ItemKind::Channel,
             &group_key(ItemKind::Channel, "News"),
-            &GroupOverride { rename: Some("Nachrichten".into()), hidden: false, locked: false, user_order: Some(1), pinned_home: true, shown: true },
+            &GroupOverride {
+                rename: Some("Nachrichten".into()),
+                hidden: false,
+                locked: false,
+                user_order: Some(1),
+                pinned_home: true,
+                shown: true,
+                explicit: Some(false),
+            },
         )?;
         user::save_progress(
             c,

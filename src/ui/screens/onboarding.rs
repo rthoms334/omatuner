@@ -866,7 +866,8 @@ impl OnboardingScreen {
             && let Some(src) = self.import.source
         {
             self.import.categories_asked = true;
-            self.categories_loader = Some(Loader::start(ctx, move |c| categories::load(c, src)));
+            let hide_explicit = ctx.parental.hides_explicit(&ctx.config.parental);
+            self.categories_loader = Some(Loader::start(ctx, move |c| categories::load(c, src, hide_explicit)));
         }
         match kit::poll(&mut self.categories_loader) {
             Some(Ok(d)) => {

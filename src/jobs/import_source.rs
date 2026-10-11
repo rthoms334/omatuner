@@ -726,6 +726,7 @@ pub fn m3u_entry_to_channel(
         added_at: None,
         groups,
         quality,
+        adult: false,
     }
 }
 
@@ -769,6 +770,7 @@ fn entry_groups(e: &M3uEntry, kind: ItemKind, smart: bool, groups_out: &mut Vec<
                 raw_name: non_empty(Some(raw)),
                 provider_id: None,
                 provider_order,
+                adult: false,
             });
         }
         groups.push(k);
@@ -800,6 +802,7 @@ fn m3u_entry_to_movie(
         provider_order: order,
         added_at: None,
         groups: entry_groups(e, ItemKind::Movie, smart, groups_out),
+        adult: false,
         name,
     }
 }
@@ -927,6 +930,7 @@ impl EpisodeCollector {
                     provider_order: s.order,
                     added_at: None,
                     groups: s.groups,
+                    adult: false,
                     name: s.title,
                 },
                 episodes,
@@ -1309,7 +1313,15 @@ where
     let uncategorized = group_key(kind, "");
     if !groups.iter().any(|g| g.key == uncategorized) && rows.iter().any(|r| r.group_keys().contains(&uncategorized)) {
         let provider_order = i32::try_from(groups.len()).unwrap_or(i32::MAX);
-        groups.push(ImportGroup { kind, key: uncategorized, name: "Uncategorized".into(), raw_name: None, provider_id: None, provider_order });
+        groups.push(ImportGroup {
+            kind,
+            key: uncategorized,
+            name: "Uncategorized".into(),
+            raw_name: None,
+            provider_id: None,
+            provider_order,
+            adult: false,
+        });
     }
     (groups, rows)
 }
@@ -1392,6 +1404,7 @@ pub fn xt_live_to_channel(s: &XtLiveStream, order: i32, smart: bool, cats: &[XtC
         added_at: positive(s.added),
         groups: xt_group_keys(ItemKind::Channel, &s.category_id, &s.category_ids, cats),
         quality,
+        adult: s.is_adult,
         name,
     })
 }
@@ -1426,6 +1439,7 @@ pub fn xt_vod_to_movie(s: &XtVodStream, order: i32, smart: bool, cats: &[XtCateg
         provider_order: order,
         added_at: positive(s.added),
         groups: xt_group_keys(ItemKind::Movie, &s.category_id, &s.category_ids, cats),
+        adult: s.is_adult,
         name,
     })
 }
@@ -1453,6 +1467,7 @@ pub fn xt_series_to_series(s: &XtSeries, order: i32, smart: bool, cats: &[XtCate
         provider_order: order,
         added_at: positive(s.last_modified),
         groups: xt_group_keys(ItemKind::Series, &s.category_id, &s.category_ids, cats),
+        adult: s.is_adult,
         name,
     })
 }
@@ -1468,7 +1483,15 @@ pub fn xt_categories_to_groups(kind: crate::model::ItemKind, cats: &[XtCategory]
             continue;
         }
         let provider_order = i32::try_from(out.len()).unwrap_or(i32::MAX);
-        out.push(ImportGroup { kind, key, name: group_display(raw, smart), raw_name: non_empty(Some(raw)), provider_id: Some(id), provider_order });
+        out.push(ImportGroup {
+            kind,
+            key,
+            name: group_display(raw, smart),
+            raw_name: non_empty(Some(raw)),
+            provider_id: Some(id),
+            provider_order,
+            adult: c.is_adult,
+        });
     }
     out
 }
@@ -1601,6 +1624,25 @@ mod tests {
             convert_xt(ItemKind::Channel, &c, &s, true, xt_live_to_channel, |s: &XtLiveStream| ids_of(&s.category_id, &s.category_ids));
         assert_eq!(rows.len(), 3);
         assert_eq!(groups.last().map(|g| g.key.0.as_str()), Some("channel:uncategorized"), "added for the lost stream");
+    }
+
+    /// `is_adult` on categories and on live / movie / series streams reaches the import rows
+    /// the store classifies with (DESIGN §20.3); missing means not adult.
+    #[test]
+    fn xtream_adult_flags_reach_the_import_rows() {
+        let c = cats(
+            r#"[{"category_id":"1","category_name":"Hot","is_adult":"1"},{"category_id":"2","category_name":"News","is_adult":0},{"category_id":"3","category_name":"Kids"}]"#,
+        );
+        let groups = xt_categories_to_groups(ItemKind::Channel, &c, true);
+        assert_eq!(groups.iter().map(|g| g.adult).collect::<Vec<_>>(), [true, false, false]);
+        let live: Vec<XtLiveStream> =
+            serde_json::from_str(r#"[{"stream_id":5,"name":"A","category_id":"2","is_adult":"1"},{"stream_id":6,"name":"B","category_id":"2"}]"#)
+                .unwrap();
+        assert_eq!(live.iter().map(|s| xt_live_to_channel(s, 0, true, &c).unwrap().adult).collect::<Vec<_>>(), [true, false]);
+        let m: XtVodStream = serde_json::from_str(r#"{"stream_id":7,"name":"M","category_id":"2","is_adult":1}"#).unwrap();
+        assert!(xt_vod_to_movie(&m, 0, true, &c).unwrap().adult);
+        let x: XtSeries = serde_json::from_str(r#"{"series_id":8,"name":"S","category_id":"2","is_adult":true}"#).unwrap();
+        assert!(xt_series_to_series(&x, 0, true, &c).unwrap().adult);
     }
 
     #[test]

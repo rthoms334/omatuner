@@ -352,6 +352,22 @@ pub struct ParentalConfig {
     pub pin_salt: Option<String>,
     /// Re-lock after this many minutes of the unlocked session (0 = until restart).
     pub relock_min: u32,
+    /// Without a PIN: show explicit (adult) content anyway (DESIGN §20.3). With a PIN it is
+    /// shown while the session is unlocked, whatever this says.
+    pub show_explicit: bool,
+}
+
+impl ParentalConfig {
+    /// The PIN guards locked items: parental lock on and a PIN set.
+    pub fn pin_active(&self) -> bool {
+        self.enabled && self.pin_hash.is_some()
+    }
+
+    /// Explicit content is hidden (DESIGN §20.3): with a PIN, while the session is locked
+    /// (`unlocked` false); without one, unless "Show explicit content" is on.
+    pub fn hides_explicit(&self, unlocked: bool) -> bool {
+        if self.pin_active() { !unlocked } else { !self.show_explicit }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -528,7 +544,8 @@ mod tests {
         backup.player.hwdec = "vaapi".into();
         backup.interface.ui_scale = 1.5;
         backup.fonts.family = "Other Mono".into();
-        backup.parental = ParentalConfig { enabled: true, pin_hash: Some("backup".into()), pin_salt: Some("s1".into()), relock_min: 5 };
+        backup.parental =
+            ParentalConfig { show_explicit: false, enabled: true, pin_hash: Some("backup".into()), pin_salt: Some("s1".into()), relock_min: 5 };
         let raw = toml::to_string_pretty(&backup).unwrap();
         let mut local = Config::default();
         local.player.hwdec = "no".into();
@@ -542,7 +559,8 @@ mod tests {
         assert_eq!(c.player.mpv_options, local.player.mpv_options);
         assert_eq!(c.fonts, local.fonts);
 
-        local.parental = ParentalConfig { enabled: true, pin_hash: Some("local".into()), pin_salt: Some("s2".into()), relock_min: 0 };
+        local.parental =
+            ParentalConfig { show_explicit: false, enabled: true, pin_hash: Some("local".into()), pin_salt: Some("s2".into()), relock_min: 0 };
         let mut no_pin = backup.clone();
         no_pin.parental = ParentalConfig::default();
         assert_eq!(Config::restored(&toml::to_string_pretty(&no_pin).unwrap(), &local).unwrap().parental, local.parental);

@@ -352,6 +352,9 @@ enum Item {
     Categories(SourceId),
     HiddenChannel(ChannelId),
     HiddenVod(ItemRef),
+    /// A category detected or marked as explicit content, or cleared by the user (Settings ▸
+    /// Parental; DESIGN §20.3).
+    Explicit(GroupId),
     Orphan(ItemRef),
     /// Index into the attach view's candidates (rebuilt only by its own filter).
     AttachTarget(usize),
@@ -649,6 +652,8 @@ enum Pending {
     Adjust(i32),
     /// "Use the Xtream login" turned off: the playlist replaces the Xtream catalogue.
     UsePlaylist(SourceId),
+    /// "Show explicit content" turned on without a PIN: set one first, or show anyway.
+    ShowExplicit,
 }
 
 const MENU_EDIT: u8 = 1;
@@ -663,6 +668,8 @@ const MENU_ATTACH: u8 = 9;
 const MENU_OFFSET_MINUS: u8 = 10;
 const MENU_OFFSET_PLUS: u8 = 11;
 const MENU_CATEGORIES: u8 = 12;
+const MENU_PIN_FIRST: u8 = 13;
+const MENU_SHOW_EXPLICIT: u8 = 14;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Pane {
@@ -789,6 +796,87 @@ impl SettingsScreen {
             self.scroll_to_row = true;
         }
         self.reload(ctx);
+    }
+
+    /// Settings ▸ Parental ▸ Explicit content (DESIGN §20.3): what hides it, the switch when
+    /// there is no PIN, and — only while it shows — the categories treated as explicit (Enter
+    /// toggles "Not explicit" / "Mark as explicit").
+    fn explicit_rows(&self, ctx: &UiCtx<'_>, v: &mut Vec<Row>) {
+        let item = |item: Item, label: String, detail: String| Row::Item {
+            item,
+            icon: glyphs::EXPLICIT.into(),
+            color: None,
+            label,
+            detail: Some(detail),
+            reorder: false,
+        };
+        let p = &ctx.config.parental;
+        v.push(Row::Section("Explicit content".into()));
+        if p.pin_active() {
+            v.push(Row::Note(
+                "Adult categories — named XXX, 18+, Adult, Porn… or flagged by the playlist — are hidden everywhere (lists, guide, search, Home, counts) until the PIN is entered.".into(),
+                false,
+            ));
+        } else {
+            v.push(Row::Toggle(&PARENTAL_SHOW_EXPLICIT));
+            v.push(Row::Note(
+                "Adult categories — named XXX, 18+, Adult, Porn… or flagged by the playlist — are hidden everywhere unless this is on. Set a PIN to keep them behind it instead.".into(),
+                false,
+            ));
+        }
+        if ctx.parental.hides_explicit(p) {
+            let n = ctx.lib.explicit.groups.len();
+            if n > 0 {
+                let how = if p.pin_active() { "Enter the PIN to review them" } else { "Show explicit content to review them" };
+                v.push(Row::Note(format!("{n} {} hidden as explicit. {how}.", if n == 1 { "category is" } else { "categories are" }), false));
+            }
+            return;
+        }
+        let several = ctx.lib.sources.iter().filter(|s| s.enabled).nth(1).is_some();
+        let mut any = false;
+        for g in all_groups(ctx).filter(|g| g.explicit.is_listed()) {
+            any = true;
+            use crate::model::Explicit;
+            let why = match g.explicit {
+                Explicit::Name => "its name",
+                Explicit::Provider => "the playlist says so",
+                Explicit::Marked => "marked by you",
+                Explicit::Cleared | Explicit::No => "not explicit (your choice)",
+            };
+            let action = if g.explicit.is_explicit() { "Enter: not explicit" } else { "Enter: explicit again" };
+            let source = if several { ctx.lib.source(g.source_id).map(|s| format!(" · {}", s.name)).unwrap_or_default() } else { String::new() };
+            v.push(item(Item::Explicit(g.id), g.display_name().to_owned(), format!("{}{source} · {why} · {action}", kind_name(g.kind))));
+        }
+        if !any {
+            v.push(Row::Note("No category is treated as explicit. Mark one from its list's menu (right-click).".into(), false));
+        }
+    }
+
+    /// Enter on a category of the explicit list: toggle the user's word.
+    fn toggle_explicit_item(&mut self, ctx: &mut UiCtx<'_>, id: GroupId) {
+        let g = all_groups(ctx).find(|g| g.id == id).cloned();
+        if let Some(g) = g {
+            super::live::toggle_group_explicit(ctx, &g);
+        }
+    }
+
+    /// "Show explicit content" turned on without a PIN: recommend setting one first.
+    fn offer_pin_for_explicit(&mut self, ctx: &mut UiCtx<'_>) {
+        let mi = |icon: &'static str, label: &str, code: u8| MenuItem {
+            icon,
+            label: label.into(),
+            action: Action::Digit(code),
+            enabled: true,
+            shortcut: None,
+        };
+        self.pending = Some(Pending::ShowExplicit);
+        ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec {
+            title: "Show explicit content?".into(),
+            items: vec![
+                mi(glyphs::LOCK, "Set a PIN first (recommended)", MENU_PIN_FIRST),
+                mi(glyphs::EXPLICIT, "Show without a PIN", MENU_SHOW_EXPLICIT),
+            ],
+        }));
     }
 
     fn parental_locked(&self, ctx: &UiCtx<'_>) -> bool {
@@ -965,7 +1053,8 @@ impl SettingsScreen {
             SettingsPage::Favourites => {
                 v.push(Row::Section("Favourites lists".into()));
                 for l in &ctx.favs.lists {
-                    let n = ctx.favs.items(l.id).len();
+                    // explicit titles parental control hides don't count (DESIGN §20.3)
+                    let n = ctx.favs.items(l.id).iter().filter(|r| !ctx.lib.conceals(r)).count();
                     let detail = if l.is_default { format!("{n} items · the default list (Ctrl+F)") } else { format!("{n} items") };
                     v.push(Row::Item {
                         item: Item::List(l.id),
@@ -984,7 +1073,8 @@ impl SettingsScreen {
                 if self.reminders.is_empty() && self.reminders_loader.is_none() {
                     v.push(Row::Note("No reminders. Press r on a future programme in the guide.".into(), false));
                 }
-                for r in &self.reminders {
+                // explicit channels' reminders while parental control hides them (DESIGN §20.3)
+                for r in self.reminders.iter().filter(|r| !ctx.lib.conceals(&r.channel)) {
                     v.push(item(
                         Item::Reminder(r.id),
                         glyphs::REMINDER,
@@ -1017,6 +1107,7 @@ impl SettingsScreen {
                     v.push(Row::Act { act: Act::RemovePin, icon: glyphs::UNLOCK, label: "Remove PIN…".into(), danger: true });
                 }
                 v.push(Row::Note("Lock a group, channel or title from its list with Ctrl+L.".into(), false));
+                self.explicit_rows(ctx, &mut v);
             }
             SettingsPage::Backup => {
                 v.push(Row::Section("Export".into()));
@@ -1058,7 +1149,7 @@ impl SettingsScreen {
                 if self.hidden_items.is_empty() && self.hidden_loader.is_none() {
                     v.push(Row::Note("Nothing hidden.".into(), false));
                 }
-                for (r, name) in &self.hidden_items {
+                for (r, name) in self.hidden_items.iter().filter(|(r, _)| !ctx.lib.conceals(r)) {
                     v.push(item(Item::HiddenVod(r.clone()), glyphs::HIDDEN, name.clone(), Some("Enter unhides".into())));
                 }
             }
@@ -1068,9 +1159,16 @@ impl SettingsScreen {
                 if self.orphans.is_empty() && self.orphans_loader.is_none() {
                     v.push(Row::Note("No orphans.".into(), false));
                 }
-                for o in &self.orphans {
+                // explicit titles aren't named while explicit content is hidden (DESIGN §20.3)
+                let hide = ctx.parental.hides_explicit(&ctx.config.parental);
+                let concealed = if hide { self.orphans.iter().filter(|o| o.explicit).count() } else { 0 };
+                for o in self.orphans.iter().filter(|o| !(hide && o.explicit)) {
                     let detail = format!("{} · {} · since {}", o.item.kind.as_str(), o.holders.join(", "), kit::date(o.since));
                     v.push(item(Item::Orphan(o.item.clone()), glyphs::WARNING, orphan_name(o), Some(detail)));
+                }
+                if concealed > 0 {
+                    let how = if ctx.config.parental.pin_active() { "Enter the PIN to review them" } else { "Show explicit content to review them" };
+                    v.push(Row::Note(format!("{concealed} more hidden as explicit. {how}."), false));
                 }
             }
             SettingsPage::About => {
@@ -1363,6 +1461,9 @@ impl SettingsScreen {
             return;
         }
         match row {
+            Row::Toggle(t) if std::ptr::eq(*t, &PARENTAL_SHOW_EXPLICIT) && dir > 0 && !ctx.config.parental.show_explicit => {
+                self.offer_pin_for_explicit(ctx);
+            }
             Row::Toggle(t) => {
                 let set = t.set;
                 let on = dir > 0;
@@ -1535,7 +1636,7 @@ impl SettingsScreen {
                 let token = self.token(Pending::RemovePin);
                 ctx.open(OverlayRequest::Confirm(ConfirmSpec {
                     title: "Remove the PIN?".into(),
-                    body: "Locked items open without a PIN until you set one again.".into(),
+                    body: "Locked items open without a PIN until you set one again. Explicit content stays hidden unless you show it.".into(),
                     confirm_label: "Remove PIN".into(),
                     destructive: true,
                     token,
@@ -1608,6 +1709,7 @@ impl SettingsScreen {
             pin_hash: Some(hash_pin(&pin, &salt)),
             pin_salt: Some(salt),
             relock_min: ctx.config.parental.relock_min,
+            show_explicit: ctx.config.parental.show_explicit,
         };
         // the session that set the PIN stays unlocked (relock rules apply from here)
         ctx.parental.unlock(&pin, &cfg);
@@ -1784,6 +1886,7 @@ impl SettingsScreen {
             Item::Orphan(r) => self.start_attach(ctx, &r),
             Item::AttachTarget(i) => self.attach_to(ctx, i),
             Item::Reminder(_) => self.item_menu(ctx, item),
+            Item::Explicit(id) => self.toggle_explicit_item(ctx, id),
         }
     }
 
@@ -1926,6 +2029,10 @@ impl SettingsScreen {
             Item::HiddenGroup(_) | Item::HiddenChannel(_) | Item::HiddenVod(_) | Item::HiddenTag(..) => {
                 ("Hidden".into(), vec![mi(glyphs::CHECK, "Unhide", MENU_TOGGLE)])
             }
+            Item::Explicit(id) => {
+                let Some(g) = all_groups(ctx).find(|g| g.id == id) else { return };
+                (g.display_name().to_owned(), vec![super::live::explicit_menu_item(g, MENU_TOGGLE)])
+            }
             Item::AttachTarget(_) | Item::Categories(_) => return,
         };
         self.pending = Some(Pending::Menu(item));
@@ -1986,6 +2093,7 @@ impl SettingsScreen {
             }
             (item, MENU_UP) | (item, MENU_DOWN) => self.reorder(ctx, item, if code == MENU_UP { -1 } else { 1 }),
             (Item::Reminder(id), MENU_DELETE) => self.cancel_reminder(ctx, id),
+            (Item::Explicit(id), MENU_TOGGLE) => self.toggle_explicit_item(ctx, id),
             (Item::Orphan(r), MENU_ATTACH) => self.start_attach(ctx, &r),
             (Item::Orphan(r), MENU_DELETE) => {
                 let token = self.token(Pending::ForgetOrphan(r));
@@ -2064,6 +2172,7 @@ impl SettingsScreen {
 }
 
 static PARENTAL_ENABLED: CfgToggle = toggle_row!("Parental lock", parental.enabled);
+static PARENTAL_SHOW_EXPLICIT: CfgToggle = toggle_row!("Show explicit content", parental.show_explicit);
 
 /// Every group of the library (live, movie and series categories).
 fn all_groups<'l>(ctx: &'l UiCtx<'_>) -> impl Iterator<Item = &'l Group> {
@@ -2448,6 +2557,19 @@ impl Screen for SettingsScreen {
         let pending = self.pending.take();
         match (result, pending) {
             (OverlayResult::Chosen(Action::Digit(code)), Some(Pending::Menu(item))) => self.menu_choice(ctx, item, code),
+            (OverlayResult::Chosen(Action::Digit(MENU_SHOW_EXPLICIT)), Some(Pending::ShowExplicit)) => {
+                ctx.edit_config(|c| c.parental.show_explicit = true);
+                ctx.toast(Toast::info("Explicit content is shown — anyone using Tuner can see it"));
+            }
+            (OverlayResult::Chosen(Action::Digit(MENU_PIN_FIRST)), Some(Pending::ShowExplicit)) => {
+                // to the New PIN field: explicit content then shows while the PIN is entered
+                if let Some(i) = self.rows(ctx).iter().position(|r| matches!(r, Row::Local { field: Local::PinNew, .. })) {
+                    self.row = i;
+                    self.scroll_to_row = true;
+                    self.editing = true;
+                }
+                ctx.toast(Toast::info("Set a PIN — explicit content then shows after the PIN is entered"));
+            }
             (OverlayResult::Confirmed(_), Some(p)) => match p {
                 Pending::DeleteSource(id) => {
                     let _ = ctx.services.store.writer().submit_notify(DataScope::Sources, move |c| crate::store::sources::delete_source(c, id));
@@ -2479,6 +2601,8 @@ impl Screen for SettingsScreen {
                         c.parental.pin_hash = None;
                         c.parental.pin_salt = None;
                         c.parental.enabled = false;
+                        // explicit content goes back to hidden (DESIGN §20.3)
+                        c.parental.show_explicit = false;
                     });
                     ctx.toast(Toast::info("PIN removed"));
                 }
@@ -2487,7 +2611,7 @@ impl Screen for SettingsScreen {
                         self.apply_use_xtream(ctx, false);
                     }
                 }
-                Pending::Menu(_) | Pending::Adjust(_) => {}
+                Pending::Menu(_) | Pending::Adjust(_) | Pending::ShowExplicit => {}
             },
             // the PIN was entered: retry what needed it (the same ←/→, else Enter)
             (OverlayResult::Unlocked(_), pending) => {
@@ -3496,8 +3620,13 @@ mod tests {
     fn parental_rows_retry_the_same_adjustment_after_the_pin_and_lock_now_locks() {
         let (mut t, one) = rig();
         let mut cfg = (*t.config).clone();
-        cfg.parental =
-            crate::config::ParentalConfig { enabled: true, pin_salt: Some("s".into()), pin_hash: Some(hash_pin("1234", "s")), relock_min: 30 };
+        cfg.parental = crate::config::ParentalConfig {
+            show_explicit: false,
+            enabled: true,
+            pin_salt: Some("s".into()),
+            pin_hash: Some(hash_pin("1234", "s")),
+            relock_min: 30,
+        };
         t.config = std::sync::Arc::new(cfg);
         let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1200.0, 1000.0));
         h.state_mut().enter(Route::Settings(SettingsPage::Parental));
@@ -3525,6 +3654,96 @@ mod tests {
         h.run_steps(1);
         let app = h.state();
         assert!(!app.t.parental.is_unlocked(&app.t.config.parental), "locked again");
+    }
+
+    /// DESIGN §20.3, Settings ▸ Parental without a PIN: hidden explicit categories are only
+    /// counted; "Show explicit content" first offers a PIN (which focuses the New PIN field) or
+    /// shows without one; once shown, the categories are listed and Enter says "Not explicit",
+    /// which the store keeps.
+    #[test]
+    fn show_explicit_content_offers_a_pin_then_lists_the_categories() {
+        let (mut t, one) = rig();
+        seed(&mut t, |c| {
+            let src = testkit::source(c, "TV")?;
+            c.execute(
+                "INSERT INTO grp(source_id, kind, key, name, raw_name, provider_order, item_count, seen_gen, explicit)
+                 VALUES (?1, 'channel', 'channel:xxx', 'XXX', 'XXX', 0, 0, 1, 1)",
+                [src],
+            )?;
+            Ok(())
+        });
+        let shown = crate::store::library::load(&t.services().store.reader().unwrap()).unwrap();
+        t.set_library(shown.hiding_explicit());
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1200.0, 1600.0));
+        h.state_mut().enter(Route::Settings(SettingsPage::Parental));
+        h.run_steps(1);
+        let rows = |h: &mut H| {
+            let app = h.state_mut();
+            app.t.with_ctx(|ctx| app.s.rows(ctx))
+        };
+        let notes = |rows: &[Row]| rows.iter().filter_map(|r| if let Row::Note(n, _) = r { Some(n.clone()) } else { None }).collect::<Vec<_>>();
+        let r = rows(&mut h);
+        assert!(notes(&r).iter().any(|n| n == "1 category is hidden as explicit. Show explicit content to review them."), "{:?}", notes(&r));
+        assert!(!r.iter().any(|r| matches!(r, Row::Item { item: Item::Explicit(_), .. })), "no names while hidden");
+
+        focus(&mut h, "Show explicit content");
+        h.state_mut().act(Action::Activate);
+        h.run_steps(1);
+        let nav = h.state_mut().nav();
+        let [NavRequest::Open(OverlayRequest::ContextMenu(menu))] = nav.as_slice() else { panic!("{nav:?}") };
+        assert_eq!(menu.title, "Show explicit content?");
+        assert_eq!(menu.items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(), ["Set a PIN first (recommended)", "Show without a PIN"]);
+        h.state_mut().result(OverlayResult::Chosen(Action::Digit(MENU_PIN_FIRST)));
+        h.state_mut().apply_config();
+        assert!(!h.state().t.config.parental.show_explicit, "a PIN first: nothing shown yet");
+        assert!(matches!(rows(&mut h).get(h.state().s.row), Some(Row::Local { field: Local::PinNew, .. })), "on the New PIN field");
+
+        focus(&mut h, "Show explicit content");
+        h.state_mut().act(Action::Activate);
+        h.run_steps(1);
+        h.state_mut().nav();
+        h.state_mut().result(OverlayResult::Chosen(Action::Digit(MENU_SHOW_EXPLICIT)));
+        h.state_mut().apply_config();
+        assert!(h.state().t.config.parental.show_explicit);
+        // the app's rebuild shows it: the categories are listed
+        h.state_mut().t.set_library(shown);
+        h.run_steps(1);
+        focus(&mut h, "XXX");
+        h.state_mut().act(Action::Activate);
+        h.run_steps(1);
+        until(&mut h, "the override", |h| {
+            let c = h.state().t.services().store.reader().unwrap();
+            c.query_row("SELECT explicit FROM group_override WHERE group_key = 'channel:xxx'", [], |r| r.get::<_, Option<i64>>(0)).ok().flatten()
+                == Some(0)
+        });
+    }
+
+    /// Orphans of explicit categories aren't named while explicit content is hidden: a note
+    /// counts them; shown, they are listed.
+    #[test]
+    fn orphans_of_explicit_categories_stay_unnamed_while_hidden() {
+        let (mut t, one) = rig();
+        seed(&mut t, |c| {
+            let s = testkit::source(c, "TV")?;
+            let list = crate::store::user::default_fav_list(c)?;
+            for (i, (name, group)) in [("blue film", "xxx live"), ("news hour", "uk news")].iter().enumerate() {
+                c.execute(
+                    "INSERT INTO fav_item(list_id, source_id, kind, item_key, position, added_at, fp, orphaned_since) VALUES (?1, ?2, 'channel', ?3, ?4, 1, ?5, 5)",
+                    rusqlite::params![list, s, format!("m3u:gone{i}"), i as i64, format!("{{\"norm_name\":\"{name}\",\"norm_group\":\"{group}\"}}")],
+                )?;
+            }
+            Ok(())
+        });
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 1000.0));
+        h.state_mut().enter(Route::Settings(SettingsPage::Orphans));
+        until(&mut h, "the orphans", |h| has_label(h, "news hour"));
+        assert!(!has_label(&h, "blue film"), "no PIN, switch off: hidden by default");
+        assert!(has_label(&h, "1 more hidden as explicit. Show explicit content to review them."));
+
+        std::sync::Arc::make_mut(&mut h.state_mut().t.config).parental.show_explicit = true;
+        h.run_steps(2);
+        assert!(has_label(&h, "blue film") && has_label(&h, "news hour"), "shown: listed");
+        assert!(!has_label(&h, "1 more hidden as explicit. Show explicit content to review them."));
     }
 
     /// While a text field is being edited, pointer motion over other rows doesn't move the
