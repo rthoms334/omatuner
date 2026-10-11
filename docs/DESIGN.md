@@ -205,7 +205,8 @@ Rules:
   (progress events) → parse in `spawn_blocking` → batches of 2 000 rows → writer (one tx each) →
   `finish_catalogue` (sweep, reattach, counts, resolve EPG) → provider EPG refresh if stale
   (follow-up job via `JobContext::submit`) → `RebuildLibrary` → `JobOutcome::Library(Arc<Library>)`
-  → UI swaps the snapshot and its `FavIndex`, clears the search index;
+  → UI swaps the snapshot and its `FavIndex`, hands the old snapshot and the search index to
+  the memory maintenance thread (§5.4);
   `JobOutcome::SourceRefreshed { account }` → `PlayerCommand::SetConnectionLimit`.
 * **Play**: UI `PlayerCommand::Play{media, zap, origin, immediate}` → controller resolves
   `MediaRef → Playable` with its own reader → `PlayerMachine` (Zapping → Loading) →
@@ -371,6 +372,19 @@ recent, sort)`) happens here, so zapping order == list order.
 | VodDetails, Progress | screens react in `on_event` (details that bring a new TMDB id also submit `RebuildLibrary`: ids decide stacks, §29.10) |
 
 A change of `player.audio_langs` submits `RebuildLibrary` (it picks every stack's top copy).
+
+**Memory upkeep** (`platform::memory`, field report: 1.1 GB after a day of 4K HEVC in software
+with a 460k-item library). glibc keeps freed heap resident unless it is at the top of an arena,
+and this app frees in bursts: a replaced snapshot (~2 M allocations, ~240 MiB at that scale), the
+global search index (~110 MiB), mpv's decoder frames (hundreds of MiB at 4K 10-bit). One
+"tuner-mem" thread (`Services::memory`) drops what the UI hands it (`release`: the old snapshot
+on every swap — dropping it in the frame took 20–400 ms — and the search index) and calls
+`malloc_trim(0)` afterwards, after the player stops, switches video off (`vid=no`) or (re)loads
+a stream (it follows the player's snapshot channel), and every 5 min; triggers coalesce (2 s
+settle, ≥ 10 s apart). The search index exists only while the search card is open (rebuilt in
+the background when it opens). Screens resolve keys only for what they look up (Movies/Series:
+titles with progress or in Favourites; Home: favourited titles), never a map of every title.
+`MemStats` (RSS, swap, `mallinfo2` in use / free) feeds the periodic health line in the log.
 
 ---
 
@@ -2645,7 +2659,9 @@ can't be installed. No hooks written into the user's config. Until WP-01 lands,
   honoured; **de-duplicated by file path** (one CJK collection covers ja/zh/ko: ~19 MB once,
   not three times). Verified here: `NotoSansCJK-Regular.ttc`, `NotoSansArabic-Regular.ttf`.
 * Threading: `FontSet::resolve` (~145 ms of subprocesses for 12 languages) and `FontSet::load`
-  (file reads; bytes cached per (path, index) for the process) run off the UI thread — at
+  (memory-maps each font file once for the process; egui borrows the mapped bytes through
+  `FontData::from_static`, so the ~25 MB of fallbacks are page cache, not two heap copies) run
+  off the UI thread — at
   startup on a helper thread joined in the creation callback, on reload in the theme watcher;
   the UI only calls `LoadedFonts::install`.
 * egui families: Proportional = Monospace = [primary, fallbacks…, egui defaults];

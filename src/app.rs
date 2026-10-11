@@ -33,6 +33,9 @@
 //! Blocking work never runs here: log export goes to the blocking pool, the theme / fonts are
 //! (re)loaded on workers, the only I/O is indexed SQLite reads on the UI reader and the
 //! sub-millisecond `Config::save` of a Settings edit (DESIGN §3.1, `config.rs` contract).
+//! Big frees don't either: a replaced library snapshot and a freed search index (dropped when
+//! the search card closes) are dropped on the memory maintenance thread, which then gives the
+//! heap back to the OS (`platform::memory`).
 //!
 //! Only ONE native viewport is allowed (eframe makes the GL context current before `logic`
 //! only for a single viewport; `VideoHost::render` relies on it).
@@ -409,6 +412,38 @@ impl TunerApp {
                 s.on_event(ctx, &ev);
             }
         });
+        // the snapshot as built, when parental control had a filtered copy made of it
+        if matches!(&ev, AppEvent::Job(crate::jobs::JobEvent::Finished { outcome: Ok(JobOutcome::Library(_)), .. })) {
+            self.release(ev, "library build");
+        }
+    }
+
+    /// Drop `what` on the memory maintenance thread, which then gives the freed heap back to the
+    /// OS (`platform::memory`): dropping a big library snapshot takes 20–400 ms, a frame hitch
+    /// on the UI thread.
+    fn release<T: Send + 'static>(&self, what: T, why: &'static str) {
+        #[cfg(test)]
+        self.log.borrow_mut().releases.push(why);
+        match &self.services {
+            Some(s) => s.memory.release(what, why),
+            None => drop(what),
+        }
+    }
+
+    /// Free the global search index (~110 MiB with a big library): the library changed, or the
+    /// search card closed (it rebuilds in the background when the card opens again).
+    fn drop_search_index(&mut self, why: &'static str) {
+        if let Some(idx) = self.search_index.take() {
+            self.release(idx, why);
+        }
+    }
+
+    /// The search card is no longer open (closed, or left by a tab switch): free its index.
+    fn free_closed_search(&mut self) {
+        let search = std::mem::discriminant(&OverlayRequest::Search { initial: String::new() });
+        if self.search_index.is_some() && !self.overlays.iter().any(|o| o.kind == search) {
+            self.drop_search_index("search closed");
+        }
     }
 
     fn on_job_finished(&mut self, kind: &JobKind, outcome: &Result<JobOutcome, String>, failure: Option<FailureKind>) {
@@ -422,6 +457,7 @@ impl TunerApp {
                 let lib = self.fit_visibility(lib.clone());
                 let old = std::mem::replace(&mut self.lib, lib.clone());
                 self.check_scopes(&old);
+                self.release(old, "library swap");
                 // the playing channel is noted again next frame
                 self.measured.clear();
                 // A favourite toggled while this library was being built is newer than
@@ -432,7 +468,7 @@ impl TunerApp {
                 });
                 // likewise a zap during the build (its `DataScope::History` patched the old one)
                 self.refresh_recent_channels();
-                self.search_index = None;
+                self.drop_search_index("library swap");
                 self.refresh_epg_updated();
                 self.send_pending_zap();
             }
@@ -692,7 +728,8 @@ impl TunerApp {
             // a playlist left with only explicit movies isn't eligible any more (its toast names
             // the playlist, not a title)
             self.check_scopes(&old);
-            self.search_index = None;
+            self.release(old, "library swap");
+            self.drop_search_index("library swap");
         }
         let x = self.lib.explicit.clone();
         let playing = self.snapshot.playable.as_ref().filter(|_| self.snapshot.state != PlayerState::Idle).and_then(|p| p.item.clone());
@@ -1488,6 +1525,7 @@ impl eframe::App for TunerApp {
         self.apply_config_edits(&egui_ctx);
         // "Lock now", a PIN typed or set this frame: not one more frame of the old state
         self.sync_explicit(&egui_ctx);
+        self.free_closed_search();
         if self.budget.deferred() || self.now_next.pending() || !self.pending_actions.is_empty() {
             egui_ctx.request_repaint();
         }
@@ -1681,6 +1719,8 @@ mod tests {
         pub commands: Vec<PlayerCommand>,
         pub jobs: Vec<JobKind>,
         pub toasts: Vec<Toast>,
+        /// What was handed to the memory maintenance thread (`TunerApp::release`).
+        pub releases: Vec<&'static str>,
     }
 
     /// One app (mpv + runtime + store) at a time keeps the test binary's memory flat.
@@ -2667,6 +2707,55 @@ mod tests {
         assert_eq!(rig.app.lib.live.channels.len(), 2);
         assert!(rig.app.favs.is_fav(&channel_ref(0)));
         assert!(rig.app.search_index.is_none());
+    }
+
+    /// A library swap drops the old snapshot and the search index on the memory maintenance
+    /// thread, not in the frame (dropping 2 M allocations took up to 400 ms there), and they
+    /// are freed.
+    #[test]
+    fn library_swap_frees_the_old_snapshot_off_the_ui_thread() {
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_channels(c, 3, None));
+        rig.settle();
+        let old = Arc::downgrade(&rig.app.lib);
+        rig.app.search_index = Some(SearchIndex::new(Arc::new(|| {})));
+        rig.app.log.borrow_mut().releases.clear();
+        deliver_library(&mut rig);
+        assert_eq!(rig.log().releases, ["library swap", "library swap", "library build"], "old snapshot, search index, build event");
+        rig.until("the old snapshot freed", |_| old.strong_count() == 0);
+        assert!(rig.app.search_index.is_none());
+    }
+
+    /// The search card owns a big index (~110 MiB for 460k titles): it is built when the card
+    /// opens, kept while a menu or dialog of the card sits on top, and freed (off the UI
+    /// thread) when the card closes; opening it again builds it again.
+    #[test]
+    fn search_index_is_freed_when_the_search_card_closes() {
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_channels(c, 3, None));
+        rig.settle();
+        rig.app.log.borrow_mut().releases.clear();
+        let open = |rig: &mut Rig| {
+            rig.app.nav.push(NavRequest::Open(OverlayRequest::Search { initial: "Channel 1".into() }));
+            rig.until("the search hit", |r| button(&texts(&r.frame_with(vec![])), "Channel 1").is_some());
+        };
+        open(&mut rig);
+        assert!(rig.app.search_index.is_some());
+        rig.press(Key::F10, Modifiers::SHIFT); // the hit's menu, over the card
+        rig.frame_with(vec![]);
+        assert_eq!(rig.app.overlays.len(), 2);
+        assert!(rig.app.search_index.is_some(), "kept under the card's menu");
+        rig.press(Key::Escape, NONE); // the menu
+        rig.press(Key::Escape, NONE); // the query
+        rig.press(Key::Escape, NONE); // the card
+        assert!(rig.app.overlays.is_empty());
+        assert!(rig.app.search_index.is_none());
+        assert_eq!(rig.log().releases, ["search closed"]);
+        open(&mut rig);
+        assert!(rig.app.search_index.is_some(), "built again");
+        // a tab switch closes the card too
+        rig.app.nav.push(NavRequest::Switch(Route::Movies { group: None }));
+        rig.frame_with(vec![]);
+        assert!(rig.app.search_index.is_none());
+        assert_eq!(rig.log().releases, ["search closed", "search closed"]);
     }
 
     #[test]
