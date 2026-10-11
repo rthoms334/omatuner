@@ -13,7 +13,7 @@
 
 use eframe::egui::{self, RichText};
 
-use super::dialogs::{card_area, scrim};
+use super::dialogs::{card_area, scrim_guarded};
 use super::{Overlay, OverlayOutcome};
 use crate::keymap::{Action, KeyContext};
 use crate::model::{ChannelId, ItemKind, ItemOverride, ItemRef};
@@ -221,6 +221,13 @@ impl Overlay for EditItemOverlay {
         if self.editing { vec![KeyContext::TextInput, KeyContext::Modal] } else { vec![KeyContext::Modal] }
     }
 
+    /// Any field differs from what was loaded (nothing is saved before Save).
+    fn is_dirty(&self) -> bool {
+        let Some(Ok(l)) = &self.loaded else { return false };
+        let name = l.ov.rename.as_deref().unwrap_or(&l.provider_name);
+        self.name != name || self.offset_min != l.ov.catchup_offset_s.unwrap_or(0) / 60 || self.locked != l.ov.locked || self.hidden != l.ov.hidden
+    }
+
     fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> OverlayOutcome {
         self.load(ctx);
         if self.editing {
@@ -282,7 +289,7 @@ impl Overlay for EditItemOverlay {
         }
         let theme = ctx.theme;
         let t = &theme.tokens;
-        if scrim(egui_ctx, theme, "edit-item") {
+        if scrim_guarded(egui_ctx, theme, "edit-item", self.is_dirty()) {
             return OverlayOutcome::Close;
         }
         let fields = self.fields();
@@ -373,12 +380,15 @@ impl Overlay for EditItemOverlay {
                     }
                     Field::Locked => {
                         ui.add_space(theme.space(SpaceToken::Md));
-                        ui.add_enabled_ui(lock_ok, |ui| {
-                            let mut v = self.locked;
-                            if toggle(ui, theme, &mut v, &lock_label, focused).changed() {
+                        // clickable without the PIN too: the click says what it needs (as Enter)
+                        let mut v = self.locked;
+                        if toggle(ui, theme, &mut v, &lock_label, focused).changed() {
+                            if lock_ok {
                                 self.locked = v;
+                            } else {
+                                clicked = Some(Field::Locked);
                             }
-                        });
+                        }
                     }
                     Field::Hidden => {
                         let mut v = self.hidden;

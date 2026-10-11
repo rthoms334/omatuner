@@ -16,7 +16,7 @@
 
 use eframe::egui::{self, RichText, text::LayoutJob};
 
-use super::dialogs::{card_area, scrim};
+use super::dialogs::{card_area, scrim, with_close};
 use super::{Overlay, OverlayOutcome};
 use crate::keymap::{self, Action, KeyContext};
 use crate::theme::{SpaceToken, Theme, TypeToken};
@@ -251,8 +251,11 @@ impl Overlay for HelpOverlay {
         let filtering = !terms.is_empty();
         let matched: usize = contexts.iter().map(|(_, r)| r.len()).sum();
         let small = |s: String| RichText::new(s).size(theme.font(TypeToken::BodySmall)).color(t.text_secondary);
+        let mut close = false;
         let r = card_area(egui_ctx, theme, "help", CardKind::Menu, 1040.0 * theme.rem(), self.top, |ui| {
-            search_header(ui, theme, &self.query, "Type to filter keyboard shortcuts", Some(glyphs::SEARCH));
+            close = with_close(ui, theme, |ui| {
+                search_header(ui, theme, &self.query, "Type to filter keyboard shortcuts", Some(glyphs::SEARCH));
+            });
             ui.add_space(theme.space(SpaceToken::Xs));
             ui.horizontal(|ui| {
                 let count = if filtering { format!("{matched} of {total} shortcuts") } else { format!("{total} shortcuts") };
@@ -295,7 +298,7 @@ impl Overlay for HelpOverlay {
             }
             None => (self.scroll, self.max_scroll) = (0.0, 0.0),
         }
-        OverlayOutcome::Keep
+        if close { OverlayOutcome::Close } else { OverlayOutcome::Keep }
     }
 }
 

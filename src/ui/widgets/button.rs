@@ -87,6 +87,7 @@ pub fn button(ui: &mut egui::Ui, theme: &Theme, icon: Option<&str>, label: &str,
     // + 2 px: the border width is always reserved (hover never shifts the layout)
     let size = egui::vec2(content_w + 2.0 * pad.x + 2.0, (content_h + 2.0 * pad.y + 2.0).max(theme.space(SpaceToken::ControlHeight)));
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let resp = if enabled { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp };
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
     if ui.is_rect_visible(rect) {
         paint_frame(&painter, rect, theme, &resp, style);
@@ -108,12 +109,22 @@ pub fn icon_button(ui: &mut egui::Ui, theme: &Theme, icon: &str, tooltip: &str, 
     let color = text_color(theme, style, enabled);
     let side = theme.space(SpaceToken::ControlHeight);
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
+    let resp = if enabled { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp };
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, tooltip));
     if ui.is_rect_visible(rect) {
         paint_frame(ui.painter(), rect, theme, &resp, style);
         ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, icon, paint::font(theme, TypeToken::Icon), color);
     }
     if tooltip.is_empty() { resp } else { resp.on_hover_text(egui::RichText::new(tooltip).size(theme.font(TypeToken::BodySmall))) }
+}
+
+/// `‹ Settings`: the borderless back button of a page or pane. Its accessible name is "Back to
+/// {label}"; the screen decides what a click does (usually `NavRequest::Back`).
+pub fn back_button(ui: &mut egui::Ui, theme: &Theme, label: &str) -> egui::Response {
+    let resp = button(ui, theme, Some(super::glyphs::CHEVRON_LEFT), label, ButtonStyle::default());
+    let name = format!("Back to {label}");
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &name));
+    resp.on_hover_text(egui::RichText::new("Back (Esc · Alt+← · mouse back)").size(theme.font(TypeToken::BodySmall)))
 }
 
 #[cfg(test)]

@@ -33,9 +33,13 @@ pub const ITEMS: &[SidebarItem] = &[
 /// Pseudo-entry for the search button (drawn before Settings).
 const SEARCH: SidebarItem = SidebarItem { id: ScreenId::Home, glyph: glyphs::SEARCH, label: "Search" };
 
-/// Whether `current` highlights entry `id` (detail pages belong to their grid).
-fn is_current(id: ScreenId, current: ScreenId) -> bool {
-    current == id || (id == ScreenId::Movies && current == ScreenId::MovieDetail) || (id == ScreenId::Series && current == ScreenId::SeriesDetail)
+/// Whether `current` highlights entry `id` (detail pages belong to their grid, Logs and EPG
+/// mapping to Settings).
+pub fn is_current(id: ScreenId, current: ScreenId) -> bool {
+    current == id
+        || (id == ScreenId::Movies && current == ScreenId::MovieDetail)
+        || (id == ScreenId::Series && current == ScreenId::SeriesDetail)
+        || (id == ScreenId::Settings && matches!(current, ScreenId::Logs | ScreenId::EpgMapping))
 }
 
 /// The visible entries in order; `None` marks the search button.
@@ -50,6 +54,7 @@ fn entries(has_vod: bool) -> impl Iterator<Item = Option<&'static SidebarItem>> 
 fn entry(ui: &mut egui::Ui, theme: &Theme, it: &SidebarItem, size: egui::Vec2, expanded: bool, selected: bool) -> bool {
     let t = &theme.tokens;
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, it.label));
     if ui.is_rect_visible(rect) {
         paint_row_state(ui.painter(), rect, theme, RowState::from_flags(resp.hovered(), selected));

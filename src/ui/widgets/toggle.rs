@@ -31,7 +31,8 @@ pub fn toggle(ui: &mut egui::Ui, theme: &Theme, on: &mut bool, label: &str, focu
         None => track.x,
     };
     let height = theme.space(SpaceToken::ControlHeight).max(track.y);
-    let (rect, mut resp) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    let mut resp = if ui.is_enabled() { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp };
     if resp.clicked() {
         *on = !*on;
         resp.mark_changed();

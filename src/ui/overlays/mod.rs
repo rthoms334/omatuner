@@ -2,7 +2,8 @@
 //! fully wired [`build`] factory. Owners of the overlay files: help/jobs/dialogs = WP-10a,
 //! search/resume = WP-12, programme/tracks/edit_item = WP-11.
 //!
-//! Visuals: scrim = background @ 0.5 (clicking it cancels); card per Omarchy menu/popup
+//! Visuals: scrim = background @ 0.5 (a click or right-click on it cancels, except while the
+//! overlay holds an unsaved edit: [`Overlay::is_dirty`]); card per Omarchy menu/popup
 //! (2 px border; popups use the accent border); opens centred, grows downward only once
 //! typing starts (launcher idiom).
 
@@ -115,6 +116,18 @@ pub trait Overlay {
     fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> OverlayOutcome;
     /// Draw (scrim + card) using `egui::Area`s on `egui_ctx`.
     fn ui(&mut self, egui_ctx: &egui::Context, ctx: &mut UiCtx<'_>) -> OverlayOutcome;
+    /// Holds an edit that a stray click outside the card must not throw away: the scrim then
+    /// ignores the click (and flashes the card) instead of closing.
+    fn is_dirty(&self) -> bool {
+        false
+    }
+    /// Opened by a right-click: show the card at the pointer (menus) instead of centred.
+    fn anchor_at(&mut self, _pos: egui::Pos2) {}
+    /// Result of a menu THIS overlay opened (e.g. search's item menu); the outcome applies to
+    /// this overlay.
+    fn on_overlay_result(&mut self, _ctx: &mut UiCtx<'_>, _result: OverlayResult) -> OverlayOutcome {
+        OverlayOutcome::Keep
+    }
 }
 
 /// Build an overlay for a request (every variant wired; frozen).

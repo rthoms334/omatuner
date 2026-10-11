@@ -18,9 +18,10 @@
 //!   grid to Custom order first (DESIGN §13.0); the cursor follows the title.
 //! * Only the focused pane shows the cursor; the other shows its current row "selected".
 //! * Wide: categories | grid. Medium (a tiled half): the categories are a drawer (← on the
-//!   first column, Backspace, or the header button) so the grid keeps 4–5 columns; Esc
-//!   closes the drawer. Compact: one pane at a time (categories → grid; Esc in the grid goes
-//!   back to the categories).
+//!   first column, Backspace, or the "{category} ▾" header button) so the grid keeps 4–5
+//!   columns; Esc closes the drawer. Compact: one pane at a time (categories → grid; Esc or
+//!   the header button in the grid go back to the categories). Below Wide one click on a
+//!   category opens it (the drawer closes / the grid shows).
 //! * Progress bars and Continue watching come from one background read of the unfinished
 //!   progress rows, refreshed on `DataScope::Progress`.
 
@@ -1022,16 +1023,19 @@ impl VodBrowser {
         let virtual_names = [self.virtual_name(Cat::All), self.virtual_name(Cat::Continue), self.virtual_name(Cat::Favourites)];
         let total = self.all(ctx).len();
         let footer = self.marks.footer(self.cats.filter.query(), self.matching.len());
+        let hide_n = self.marks.hide_count(self.matching.len());
         let (marks, tags, movies, cats) = (&self.marks, &self.tags.1, self.movies, &mut self.cats);
-        let outcome = group_marks::with_footer(ui, theme, footer.as_deref(), |ui| {
+        let mut clicked = None;
+        let (outcome, footer_click) = group_marks::with_footer(ui, theme, footer.as_deref(), Some(hide_n), |ui| {
             virtual_list(ui, theme, ("vod-cats", movies), cats, row_h, |ui, rc| {
+                let index = rc.index;
                 let cat = rows_snapshot[rc.index];
                 let state = RowState::from_flags(focused && rc.state.is_cursor(), cat == open);
                 let group = match cat {
                     Cat::Group(g) => groups.get(&g).copied(),
                     _ => None,
                 };
-                match group {
+                let r = match group {
                     Some(g) => rows::group_row_decor(
                         ui,
                         theme,
@@ -1070,9 +1074,28 @@ impl VodBrowser {
                         }
                         r
                     }
+                };
+                if r.clicked() {
+                    clicked = Some(index);
                 }
+                r
             })
         });
+        // the footer's Hide N / Clear: its keys, on this pane
+        if let Some(hide) = footer_click {
+            self.pane = Pane::Categories;
+            let a = self.marks.footer_action(hide);
+            self.action(ctx, a);
+            return;
+        }
+        // a tiled half or narrower: a click on a category opens it and shows its titles (the
+        // drawer closes, Compact turns to the grid); in Wide both panes show anyway
+        if ctx.layout != LayoutClass::Wide
+            && let Some(c) = clicked.and_then(|i| self.cat_rows.get(i).copied())
+        {
+            self.open_cat(ctx, c, true);
+            return;
+        }
         match outcome {
             ListOutcome::Moved => {
                 self.pane = Pane::Categories;
@@ -1099,7 +1122,8 @@ impl VodBrowser {
         let theme = ctx.theme;
         let name = self.cat_name(ctx, self.open);
         let sort = self.sort(ctx);
-        let drawer = ctx.layout == LayoutClass::Medium;
+        // a tiled half (drawer) or Compact (one pane): the way to the categories
+        let breadcrumb = ctx.layout != LayoutClass::Wide;
         let mut sort_clicked = false;
         let mut drawer_clicked = false;
         let mut header_clicked = false;
@@ -1115,15 +1139,16 @@ impl VodBrowser {
                 }
                 .clicked();
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    if drawer {
-                        // Medium: the categories drawer (also ← on the first column / Backspace)
-                        drawer_clicked = icon_button(
+                    if breadcrumb {
+                        // the categories drawer / pane (also ← on the first column / Backspace)
+                        drawer_clicked = button(
                             ui,
                             theme,
-                            glyphs::FILMSTRIP,
-                            "Categories",
+                            Some(glyphs::FILMSTRIP),
+                            &format!("{name} ▾"),
                             ButtonStyle { selected: self.pane == Pane::Categories, ..Default::default() },
                         )
+                        .on_hover_text("Categories")
                         .clicked();
                     }
                     // the sort key, like the hint line of a list would say it (Home's rails share
@@ -1639,6 +1664,33 @@ mod tests {
         assert!(h.state_mut().act(Action::Back));
         assert_eq!(h.state().s.key_contexts(), vec![KeyContext::List]);
         assert!(!h.state_mut().act(Action::Back), "the app's Back leaves the screen");
+    }
+
+    /// Below Wide, the "{category} ▾" button leads to the categories and one click on a category
+    /// opens it with its titles: Compact turns to the grid, the Medium drawer closes.
+    #[test]
+    fn categories_open_with_one_click_below_wide() {
+        let (mut t, one) = rig();
+        two_categories(&mut t);
+        t.layout = LayoutClass::Compact;
+        let mut h = harness(t, one, MoviesScreen::default(), egui::vec2(420.0, 800.0));
+        h.state_mut().enter(Route::Movies { group: None });
+        h.run_steps(2);
+        h.get_by_label("All movies ▾").click();
+        h.run_steps(2);
+        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::List], "the categories pane");
+        h.get_by_label("Drama").click();
+        h.run_steps(2);
+        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::PosterGrid], "one click: the grid");
+        assert!(has_label(&h, "Movie 1") && !has_label(&h, "Movie 4"), "of Drama");
+        h.state_mut().t.layout = LayoutClass::Medium;
+        h.run_steps(2);
+        h.get_by_label("Drama ▾").click();
+        h.run_steps(2);
+        assert!(has_label(&h, "All movies"), "the drawer");
+        h.get_by_label("All movies").click();
+        h.run_steps(2);
+        assert!(!has_label(&h, "All movies") && has_label(&h, "Movie 4"), "the drawer closed on All movies");
     }
 
     /// DESIGN §13.12: skeleton posters while the first library loads; a category whose every

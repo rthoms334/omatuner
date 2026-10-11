@@ -69,6 +69,8 @@ pub const DISPLAY: &str = "\u{f0379}";
 pub const THEME: &str = "\u{f03d8}";
 pub const REORDER: &str = "\u{f01dd}";
 pub const ACCOUNT: &str = "\u{f0306}";
+/// A page's menu (nf-md-dots_horizontal).
+pub const MORE: &str = "\u{f01d8}";
 
 /// Icons offered when creating a playlist source (UHF "choose an icon").
 pub const SOURCE_ICONS: &[&str] = &[PLAYLIST, LIVE_TV, SOURCE_XTREAM, SOURCE_URL, MOVIES, SERIES, RADIO, MUSIC, FAVOURITE, HEART, FOLDER, TAG];
