@@ -23,7 +23,7 @@ use super::state::{Effect, Input, MachineConfig, PlayerMachine};
 use super::tracks::{AspectMode, parse_track_list, query_stream_info};
 use super::{PlayRequest, PlayerCommand, PlayerDeps, PlayerError, PlayerErrorKind, PlayerEvent, PlayerSnapshot, PlayerState, RenderClock};
 use crate::config::Config;
-use crate::model::{ChannelId, HistoryEntry, MediaRef, PlayOrigin, Playable, PlayableKind, SourceId, WatchProgress};
+use crate::model::{ChannelId, HistoryEntry, ItemRef, MediaRef, PlayOrigin, Playable, PlayableKind, SourceId, WatchProgress};
 use crate::msg::AppEvent;
 
 const PROGRESS_EVERY: Duration = Duration::from_secs(10);
@@ -72,6 +72,7 @@ pub fn spawn(
         render_clock,
         epoch,
         mpv_log: MpvLog::default(),
+        recorded_video: None,
     };
     std::thread::Builder::new().name("player".into()).spawn(move || c.run(cmd_rx, evt_rx))
 }
@@ -112,6 +113,8 @@ struct Controller {
     epoch: Instant,
     /// Rate limiter of forwarded mpv log lines.
     mpv_log: MpvLog,
+    /// The live channel and picture size last handed to `PlayerStore::record_video`.
+    recorded_video: Option<(ItemRef, (i64, i64))>,
 }
 
 impl Controller {
@@ -658,6 +661,19 @@ impl Controller {
         self.deps.store.record_failure(item, kind);
     }
 
+    /// A live channel that is Playing records the size it decodes at, once per channel and
+    /// size. Only while Playing: during a zap or a reconnect the snapshot can still hold the
+    /// previous stream's size. Catch-up archives may be encoded differently and are skipped.
+    fn record_video(&mut self) {
+        let Some(p) = self.snap.playable.as_ref().filter(|p| p.kind.is_live()) else { return };
+        let (Some(item), Some(size)) = (p.item.as_ref(), self.snap.video_size) else { return };
+        if self.snap.state != PlayerState::Playing || self.recorded_video.as_ref().is_some_and(|(i, s)| i == item && *s == size) {
+            return;
+        }
+        self.recorded_video = Some((item.clone(), size));
+        self.deps.store.record_video(item.clone(), size.0, size.1);
+    }
+
     fn publish(&mut self, state_changed: bool) {
         if !self.dirty && !state_changed && !self.force_publish {
             return;
@@ -670,6 +686,7 @@ impl Controller {
         if let PlayerState::Error(e) = &self.snap.state {
             self.snap.last_error = Some(e.clone());
         }
+        self.record_video();
         let _ = self.snap_tx.send(Arc::new(self.snap.clone()));
         if urgent {
             self.deps.bus.request_repaint();

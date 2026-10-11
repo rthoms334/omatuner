@@ -95,6 +95,8 @@ pub struct TunerApp {
     parental: ParentalSession,
     search_index: Option<SearchIndex>,
     snapshot: Arc<PlayerSnapshot>,
+    /// Quality badges measured this session (fed from `snapshot` every frame).
+    measured: crate::ui::data::MeasuredQuality,
     nav: Vec<NavRequest>,
     pending_toasts: Vec<Toast>,
     config_edits: Vec<crate::ui::ConfigEdit>,
@@ -191,6 +193,7 @@ impl TunerApp {
             parental: ParentalSession::default(),
             search_index: None,
             snapshot,
+            measured: Default::default(),
             nav: Vec::new(),
             pending_toasts: Vec::new(),
             config_edits: Vec::new(),
@@ -274,6 +277,7 @@ impl TunerApp {
             now_next: &mut self.now_next,
             config: &cfg,
             player: &self.snapshot,
+            measured: &self.measured,
             images: &mut self.images,
             video: &mut self.video,
             parental: &mut self.parental,
@@ -955,6 +959,7 @@ impl eframe::App for TunerApp {
             self.handle_event(ev, ctx);
         }
         self.snapshot = self.services().player.handle().snapshot();
+        self.measured.observe(&self.snapshot);
         let busy = matches!(self.snapshot.state, PlayerState::Loading { .. } | PlayerState::Zapping { .. });
         self.services().jobs.context().player_busy.store(busy, Ordering::Relaxed);
         if self.snapshot.video_suspended {

@@ -46,7 +46,8 @@ use crate::model::{ChannelId, EpgChannelId, ProgrammeId, ProgrammeSlim, Timestam
 use crate::store::library::LiveIndex;
 use crate::theme::{SpaceToken, Theme, TypeToken};
 use crate::ui::LayoutClass;
-use crate::ui::data::{EpgReader, FrameBudget};
+use crate::ui::data::{EpgReader, FrameBudget, QualityBadges};
+use crate::ui::widgets::badge::{InlineBadge, name_with_quality};
 use crate::ui::widgets::list::paint_row_state;
 use crate::ui::widgets::{RowState, glyphs};
 
@@ -582,6 +583,7 @@ pub fn epg_grid(
     reader: &mut dyn EpgReader,
     budget: &mut FrameBudget,
     live: &LiveIndex,
+    badges: QualityBadges<'_>,
     state: &mut EpgGridState,
     metrics: GridMetrics,
     now: Timestamp,
@@ -657,7 +659,7 @@ pub fn epg_grid(
         let row = state.rows[i].clone();
         // header (sticky channel column)
         let header = Rect::from_min_max(egui::pos2(rect.left(), y), egui::pos2(grid.left(), y + row_h));
-        paint_header(ui, &header_painter, theme, images, live, &row, header, focus_row, state.show_numbers);
+        paint_header(ui, &header_painter, theme, images, live, badges, &row, header, focus_row, state.show_numbers);
         if pointer.is_some_and(|p| header.contains(p) && grid.y_range().contains(p.y)) {
             header_hit = Some(i);
         }
@@ -796,7 +798,7 @@ fn excerpt(s: &str, n: usize) -> String {
 }
 
 /// Sticky channel column: logo (+ number + name at Wide, name at Medium, logo only Compact;
-/// the number only with `show_numbers`).
+/// the number only with `show_numbers`); the quality badge follows the name while it fits.
 #[allow(clippy::too_many_arguments)]
 fn paint_header(
     ui: &mut egui::Ui,
@@ -804,6 +806,7 @@ fn paint_header(
     theme: &Theme,
     images: &mut ImageCache,
     live: &LiveIndex,
+    badges: QualityBadges<'_>,
     row: &GuideRow,
     r: Rect,
     focus_row: bool,
@@ -847,13 +850,15 @@ fn paint_header(
         );
         x = nr.right() + theme.space(SpaceToken::Md);
     }
-    text(
+    let badge = badges.of(ch).map(|q| InlineBadge::quality(p, theme, q, t.text_secondary, 1.0));
+    name_with_quality(
         p,
+        theme,
         egui::pos2(x, r.center().y),
-        Align2::LEFT_CENTER,
-        ch.name.to_string(),
+        &ch.name,
         FontId::proportional(theme.font(TypeToken::Body)),
         color,
+        badge,
         (r.right() - pad - x).max(0.0),
     );
 }

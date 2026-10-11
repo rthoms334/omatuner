@@ -113,6 +113,63 @@ pub enum Unsupported {
     Drm,
 }
 
+/// Video quality class of a channel: the SD / HD / FHD / 4K badge next to its name
+/// (DESIGN §13.0). Ordered worst → best.
+///
+/// From the provider name at import (`smart_names`: "BBC One FHD", "ESPN ᴴᴰ", "2160p"…), or
+/// measured: the size mpv decoded the last time the channel played, which wins (DESIGN §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum Quality {
+    Sd,
+    Hd,
+    Fhd,
+    Uhd,
+}
+
+impl Quality {
+    /// The badge text.
+    pub fn label(self) -> &'static str {
+        match self {
+            Quality::Sd => "SD",
+            Quality::Hd => "HD",
+            Quality::Fhd => "FHD",
+            Quality::Uhd => "4K",
+        }
+    }
+
+    /// The class of a decoded `w`×`h` picture (mpv `video-params`): the better of what the
+    /// height and the width say, so cropped (1920×800) and anamorphic (1440×1080) frames read
+    /// right. 1440p is FHD: four classes keep the badge narrow, and a QHD stream is closer to
+    /// FHD than to the 4K it would otherwise claim. `None` for a size that isn't one.
+    pub fn of_video(w: i64, h: i64) -> Option<Quality> {
+        if w <= 0 || h <= 0 {
+            return None;
+        }
+        let by_h = match h {
+            2000.. => Quality::Uhd,
+            1000.. => Quality::Fhd,
+            700.. => Quality::Hd,
+            _ => Quality::Sd,
+        };
+        let by_w = match w {
+            3800.. => Quality::Uhd,
+            1900.. => Quality::Fhd,
+            1260.. => Quality::Hd,
+            _ => Quality::Sd,
+        };
+        Some(by_h.max(by_w))
+    }
+
+    /// `channel.quality` (1 = SD … 4 = 4K).
+    pub fn code(self) -> u8 {
+        self as u8 + 1
+    }
+
+    pub fn from_code(c: i64) -> Option<Quality> {
+        [Quality::Sd, Quality::Hd, Quality::Fhd, Quality::Uhd].get(usize::try_from(c.checked_sub(1)?).ok()?).copied()
+    }
+}
+
 /// A live channel, fully loaded (detail views, playback). Lists use [`ChannelSummary`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Channel {
@@ -180,6 +237,12 @@ pub struct ChannelSummary {
     pub provider_order: i32,
     pub user_order: Option<i32>,
     pub added_at: Option<Timestamp>,
+    /// The quality badge: measured when the channel has played (`channel_video`), else from
+    /// its provider name (`channel.quality`); `None` = unknown.
+    pub quality: Option<Quality>,
+    /// Hash of the normalised provider name (`channel.norm_name`, quality words dropped): the
+    /// SD / HD / 4K duplicates of one channel share it (best-first ordering, DESIGN §13.2).
+    pub family: u64,
 }
 
 /// Ordering choices for lists (UHF users asked for date added / year / rating).
@@ -210,4 +273,24 @@ pub enum Collection {
     History,
     /// Ad-hoc (search results).
     Adhoc(Vec<ChannelId>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Decoded size → badge: the better of height and width, 1440p counts as FHD.
+    #[test]
+    fn video_size_classes() {
+        let q = |w, h| Quality::of_video(w, h).map(Quality::label);
+        assert_eq!(q(720, 576), Some("SD"));
+        assert_eq!(q(1280, 720), Some("HD"));
+        assert_eq!(q(1920, 1080), Some("FHD"));
+        assert_eq!(q(1920, 800), Some("FHD"), "cropped");
+        assert_eq!(q(1440, 1080), Some("FHD"), "anamorphic");
+        assert_eq!(q(2560, 1440), Some("FHD"));
+        assert_eq!(q(3840, 2160), Some("4K"));
+        assert_eq!(q(0, 0), None);
+        assert!([Quality::Sd, Quality::Hd, Quality::Fhd, Quality::Uhd].iter().all(|x| Quality::from_code(x.code().into()) == Some(*x)));
+    }
 }

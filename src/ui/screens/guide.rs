@@ -457,7 +457,13 @@ impl GuideScreen {
         ui.add_space(theme.space(SpaceToken::Lg));
         let Some((ch, prog)) = self.grid.as_ref().and_then(|g| g.focused()).map(|(c, p)| (c, p.cloned())) else { return };
         if let Some(c) = ctx.lib.live.get(ch) {
-            ui.label(RichText::new(c.name.as_ref()).size(theme.font(TypeToken::Title)).color(t.fg));
+            let quality = ctx.quality(c);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(c.name.as_ref()).size(theme.font(TypeToken::Title)).color(t.fg));
+                if let Some(q) = quality {
+                    crate::ui::widgets::badge::badge(ui, theme, q.label(), t.text_secondary);
+                }
+            });
         }
         if let Some(p) = prog {
             ui.label(RichText::new(p.title.as_ref()).size(theme.font(TypeToken::Body)).color(t.fg));
@@ -705,9 +711,10 @@ impl Screen for GuideScreen {
                 }
             }
             let mut reader = ctx.epg_reader();
+            let badges = ctx.quality_badges();
             out = ui
                 .scope_builder(egui::UiBuilder::new().max_rect(grid_rect), |ui| {
-                    epg_grid::epg_grid(ui, theme, ctx.images, &mut reader, ctx.budget, &ctx.lib.live, g, metrics, ctx.now)
+                    epg_grid::epg_grid(ui, theme, ctx.images, &mut reader, ctx.budget, &ctx.lib.live, badges, g, metrics, ctx.now)
                 })
                 .inner;
         }

@@ -68,6 +68,7 @@ fn channels(n: usize, groups: &[ImportGroup]) -> Vec<ImportChannel> {
                 provider_order: i as i32,
                 added_at: Some(T0 - i as i64),
                 groups: member,
+                quality: None,
             }
         })
         .collect()

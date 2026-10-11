@@ -28,7 +28,7 @@ use tuner::model::{
 use tuner::player::{PlayerSnapshot, PlayerState};
 use tuner::store::library::LiveIndex;
 use tuner::theme::Theme;
-use tuner::ui::data::{EpgReader, FrameBudget};
+use tuner::ui::data::{EpgReader, FrameBudget, QualityBadges};
 use tuner::ui::epg_grid::{self, EpgGridState, GridMetrics, GridOutcome, GuideRow, ProgrammeCache};
 use tuner::ui::overlays::{self, Overlay, OverlayOutcome};
 use tuner::ui::screens::{guide::GuideScreen, live::LiveScreen, player::PlayerScreen};
@@ -248,6 +248,8 @@ fn summary(i: i64) -> ChannelSummary {
         provider_order: i as i32,
         user_order: None,
         added_at: None,
+        quality: None,
+        family: 0,
     }
 }
 
@@ -388,7 +390,7 @@ fn grid_harness(n: i64, now: Timestamp, budget: Duration) -> Harness<'static, Gr
             let mut b = FrameBudget::new(budget);
             let m = GridMetrics::for_layout(LayoutClass::Wide, false, &a.theme);
             let before = a.reader.calls;
-            let out = epg_grid::epg_grid(ui, &a.theme, &mut a.images, &mut a.reader, &mut b, &a.live, &mut a.state, m, a.now);
+            let out = epg_grid::epg_grid(ui, &a.theme, &mut a.images, &mut a.reader, &mut b, &a.live, QualityBadges(None), &mut a.state, m, a.now);
             a.loads.push(a.reader.calls - before);
             if out != GridOutcome::None {
                 a.outcomes.push(out);

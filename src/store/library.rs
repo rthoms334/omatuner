@@ -20,6 +20,7 @@
 //! Hidden lists them); locked items are flagged, not removed (the UI asks for the PIN).
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -27,8 +28,8 @@ use rusqlite::Connection;
 
 use crate::error::Result;
 use crate::model::{
-    ChannelId, ChannelSummary, Collection, FavListId, FavouriteEntry, FavouriteList, Group, GroupId, ItemKey, ItemKind, ItemRef, MovieId, SeriesId,
-    SortMode, SourceColor, SourceId, SourceKind, Timestamp, VodKind, VodSummary,
+    ChannelId, ChannelSummary, Collection, FavListId, FavouriteEntry, FavouriteList, Group, GroupId, ItemKey, ItemKind, ItemRef, MovieId, Quality,
+    SeriesId, SortMode, SourceColor, SourceId, SourceKind, Timestamp, VodKind, VodSummary,
 };
 use crate::store::live::{GROUP_COLS, GROUP_FROM, GROUP_ORDER, group_from_row};
 use crate::store::sql::{enum_parse, u32_of};
@@ -103,7 +104,8 @@ impl LiveIndex {
     }
 
     /// Ordered channel ids of a collection (hidden removed), sorted by `sort` (`Provider` =
-    /// display order: user order then provider order; favourites keep list order; history
+    /// display order: user order then provider order, with the quality duplicates of a channel
+    /// best first — see [`Self::best_quality_first`]; favourites keep list order; history
     /// keeps recency). This is also the zap order.
     pub fn collection(&self, c: &Collection, favs: &FavIndex, recent: &[ChannelId], sort: SortMode) -> Vec<ChannelId> {
         let visible = |id: &ChannelId| !self.hidden.contains(id) && self.by_id.contains_key(id);
@@ -116,6 +118,7 @@ impl LiveIndex {
         };
         let key = |id: &ChannelId| self.get(*id);
         match sort {
+            SortMode::Provider if matches!(c, Collection::AllChannels | Collection::Group(_)) => self.best_quality_first(&mut ids),
             SortMode::Provider | SortMode::Rating | SortMode::Year => {}
             SortMode::Number => ids.sort_by_key(|id| key(id).and_then(|c| c.number).unwrap_or(u32::MAX)),
             SortMode::NameAsc => ids.sort_by_cached_key(|id| key(id).map(|c| c.name.to_lowercase()).unwrap_or_default()),
@@ -123,6 +126,27 @@ impl LiveIndex {
             SortMode::RecentlyAdded => ids.sort_by_key(|id| std::cmp::Reverse(key(id).and_then(|c| c.added_at).unwrap_or(i64::MIN))),
         }
         ids
+    }
+
+    /// Duplicates of one channel in several qualities ("BBC One SD / HD / 4K": same
+    /// normalised name, same primary group) trade places so the best known quality comes
+    /// first; they keep the slots they had between them, and every other channel — a
+    /// duplicate of unknown quality, or one the user placed (`user_order`), too — keeps its
+    /// own (DESIGN §13.2). Stable for equal qualities.
+    fn best_quality_first(&self, ids: &mut [ChannelId]) {
+        let mut families: HashMap<(u64, Option<GroupId>), Vec<usize>> = HashMap::new();
+        for (i, id) in ids.iter().enumerate() {
+            if let Some(c) = self.get(*id).filter(|c| c.quality.is_some() && c.user_order.is_none()) {
+                families.entry((c.family, c.group_ids.first().copied())).or_default().push(i);
+            }
+        }
+        for slots in families.values().filter(|s| s.len() > 1) {
+            let mut members: Vec<ChannelId> = slots.iter().map(|&i| ids[i]).collect();
+            members.sort_by_key(|id| std::cmp::Reverse(self.get(*id).and_then(|c| c.quality)));
+            for (&slot, id) in slots.iter().zip(members) {
+                ids[slot] = id;
+            }
+        }
     }
 
     /// Next/previous channel in `ids` relative to `current`, wrapping, skipping `skip`.
@@ -427,10 +451,12 @@ fn load_live(conn: &Connection, groups: Vec<Group>) -> Result<LiveIndex> {
     let mut stmt = conn.prepare_cached(
         "SELECT c.id, c.source_id, c.key, COALESCE(o.rename, c.clean_name), c.number, c.logo, ce.epg_channel_id, c.tvg_shift_min,
                 c.catchup IS NOT NULL, COALESCE(json_extract(c.catchup, '$.days'), 0), c.radio, c.unsupported IS NOT NULL,
-                c.provider_order, o.user_order, c.added_at, COALESCE(o.hidden, 0), COALESCE(o.locked, 0)
+                c.provider_order, o.user_order, c.added_at, COALESCE(o.hidden, 0), COALESCE(o.locked, 0),
+                c.quality, v.width, v.height, c.norm_name
          FROM channel c JOIN source s ON s.id = c.source_id AND s.enabled = 1
          LEFT JOIN item_override o ON o.source_id = c.source_id AND o.kind = 'channel' AND o.item_key = c.key
          LEFT JOIN channel_epg ce ON ce.channel_id = c.id
+         LEFT JOIN channel_video v ON v.source_id = c.source_id AND v.item_key = c.key
          ORDER BY s.sort_index, s.id, (o.user_order IS NULL), o.user_order, c.provider_order, c.id",
     )?;
     let mut channels = Vec::new();
@@ -456,6 +482,13 @@ fn load_live(conn: &Connection, groups: Vec<Group>) -> Result<LiveIndex> {
                 provider_order: r.get(12)?,
                 user_order: r.get(13)?,
                 added_at: r.get(14)?,
+                // measured beats the name
+                quality: match (r.get::<_, Option<i64>>(18)?, r.get::<_, Option<i64>>(19)?) {
+                    (Some(w), Some(h)) => Quality::of_video(w, h),
+                    _ => None,
+                }
+                .or(r.get::<_, Option<i64>>(17)?.and_then(Quality::from_code)),
+                family: text_hash(r.get_ref(20)?),
             },
             r.get::<_, bool>(15)?,
         ))
@@ -474,6 +507,15 @@ fn load_live(conn: &Connection, groups: Vec<Group>) -> Result<LiveIndex> {
         channels.push(c);
     }
     Ok(LiveIndex::from_parts(channels, groups, members, hidden))
+}
+
+/// Stable-within-a-build hash of a text column (no allocation per row).
+fn text_hash(v: rusqlite::types::ValueRef<'_>) -> u64 {
+    let mut h = std::hash::DefaultHasher::new();
+    if let rusqlite::types::ValueRef::Text(b) = v {
+        b.hash(&mut h);
+    }
+    h.finish()
 }
 
 /// Group id → indices into the matching `VodIndex` vector.
@@ -597,6 +639,8 @@ mod tests {
             provider_order: id as i32,
             user_order: None,
             added_at: Some(id),
+            quality: None,
+            family: id as u64,
         }
     }
 
@@ -616,6 +660,37 @@ mod tests {
         assert_eq!(LiveIndex::neighbour(&ids, ChannelId(1), true, &skip2), Some(ChannelId(3)));
         assert_eq!(LiveIndex::neighbour(&ids, ChannelId(1), false, &|_| false), Some(ChannelId(3)));
         assert_eq!(LiveIndex::neighbour(&ids, ChannelId(1), true, &|_| true), None);
+    }
+
+    /// Default sort: the SD / HD / 4K duplicates of a channel trade places best first, inside
+    /// the slots they occupy; other channels (and an untagged duplicate) don't move. Other
+    /// sorts and favourites keep their order.
+    #[test]
+    fn duplicates_sort_best_quality_first() {
+        let dup = |id: i64, q: Option<Quality>| ChannelSummary { quality: q, family: 7, ..ch(id, id as u32, "BBC One") };
+        let chans = vec![
+            dup(1, Some(Quality::Sd)),
+            ch(2, 2, "ITV"),
+            dup(3, None),
+            dup(4, Some(Quality::Uhd)),
+            dup(5, Some(Quality::Hd)),
+            ChannelSummary { group_ids: vec![GroupId(2)], ..dup(6, Some(Quality::Fhd)) },
+        ];
+        let ids = |v: &[i64]| v.iter().map(|i| ChannelId(*i)).collect::<Vec<_>>();
+        let members = HashMap::from([(GroupId(1), ids(&[1, 2, 3, 4, 5])), (GroupId(2), ids(&[6]))]);
+        let live = LiveIndex::from_parts(chans, vec![], members, HashSet::new());
+        let favs = FavIndex::default();
+        let g = Collection::Group(GroupId(1));
+        assert_eq!(live.collection(&g, &favs, &[], SortMode::Provider), ids(&[4, 2, 3, 5, 1]));
+        // all channels: 6 is the same name in another group, so not a duplicate
+        assert_eq!(live.collection(&Collection::AllChannels, &favs, &[], SortMode::Provider), ids(&[4, 2, 3, 5, 1, 6]));
+        assert_eq!(live.collection(&g, &favs, &[], SortMode::Number), ids(&[1, 2, 3, 4, 5]));
+        assert_eq!(live.collection(&Collection::History, &favs, &ids(&[1, 4]), SortMode::Provider), ids(&[1, 4]));
+        // a custom order (Alt+↑/↓ wrote `user_order`) is the user's: no reshuffle
+        let placed: Vec<ChannelSummary> = live.channels.iter().map(|c| ChannelSummary { user_order: Some(c.id.0 as i32), ..c.clone() }).collect();
+        let members = HashMap::from([(GroupId(1), ids(&[1, 2, 3, 4, 5]))]);
+        let live = LiveIndex::from_parts(placed, vec![], members, HashSet::new());
+        assert_eq!(live.collection(&g, &favs, &[], SortMode::Provider), ids(&[1, 2, 3, 4, 5]));
     }
 
     #[test]

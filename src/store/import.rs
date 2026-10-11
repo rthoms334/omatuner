@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::model::{
-    AccountInfo, CatchupSpec, Fingerprint, GroupId, GroupKey, HttpHeaders, ItemKey, ItemKind, ItemRef, ReattachOutcome, SeriesId, SourceId,
+    AccountInfo, CatchupSpec, Fingerprint, GroupId, GroupKey, HttpHeaders, ItemKey, ItemKind, ItemRef, Quality, ReattachOutcome, SeriesId, SourceId,
     SourceKind, StreamLocator, Timestamp, Unsupported, XtreamCredentials, XtreamStreamKind,
 };
 use crate::sources::identity::xtream_key;
@@ -73,6 +73,8 @@ pub struct ImportChannel {
     pub added_at: Option<Timestamp>,
     /// Group keys, primary first (must have been passed to `upsert_groups`).
     pub groups: Vec<GroupKey>,
+    /// The quality word of the provider name (`smart_names`), whether or not cleanup is on.
+    pub quality: Option<Quality>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -385,15 +387,15 @@ pub fn write_channels(conn: &mut Connection, imp: &CatalogueImport, batch: &[Imp
             .prepare_cached(
                 "INSERT INTO channel(source_id, key, provider_id, name, clean_name, norm_name, number, logo, tvg_id, tvg_name,
                                      tvg_shift_min, stream, url_key, headers, catchup, radio, unsupported, provider_order,
-                                     added_at, seen_gen)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, COALESCE(?19, ?20), ?21)
+                                     added_at, seen_gen, quality)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, COALESCE(?19, ?20), ?21, ?22)
                  ON CONFLICT(source_id, key) DO UPDATE SET
                    provider_id = excluded.provider_id, name = excluded.name, clean_name = excluded.clean_name,
                    norm_name = excluded.norm_name, number = excluded.number, logo = excluded.logo, tvg_id = excluded.tvg_id,
                    tvg_name = excluded.tvg_name, tvg_shift_min = excluded.tvg_shift_min, stream = excluded.stream,
                    url_key = excluded.url_key, headers = excluded.headers, catchup = excluded.catchup, radio = excluded.radio,
                    unsupported = excluded.unsupported, provider_order = excluded.provider_order,
-                   added_at = COALESCE(?19, channel.added_at), seen_gen = excluded.seen_gen
+                   added_at = COALESCE(?19, channel.added_at), seen_gen = excluded.seen_gen, quality = excluded.quality
                  RETURNING id",
             )?
             .query_row(
@@ -419,6 +421,7 @@ pub fn write_channels(conn: &mut Connection, imp: &CatalogueImport, batch: &[Imp
                     ch.added_at,
                     imp.started_at,
                     imp.generation,
+                    ch.quality.map(Quality::code),
                 ],
                 |r| r.get(0),
             )?;
@@ -872,6 +875,9 @@ pub fn finish_catalogue_with(
 
     let reattach_kinds: &[ItemKind] = if opts.m3u { &[ItemKind::Channel, ItemKind::Movie, ItemKind::Series, ItemKind::Episode] } else { &kinds };
     let (outcomes, newly_orphaned) = reattach(&tx, imp.source, reattach_kinds, now)?;
+    if completed.contains(&ItemKind::Channel) {
+        carry_video_sizes(&tx, imp.source)?;
+    }
     summary.reattached = outcomes.iter().filter(|(_, o)| matches!(o, ReattachOutcome::Reattached { .. })).count() as u32;
     summary.orphaned = newly_orphaned;
 
@@ -1059,6 +1065,32 @@ fn reattach_kind(
         }
     }
     Ok(newly)
+}
+
+/// Measured picture sizes (`channel_video`) of channel keys that are gone: re-keyed to the
+/// channel their fingerprint finds with the reattach steps (§8.3), else dropped — a
+/// measurement is not user data, it is never listed as an orphan. A channel that already has
+/// its own measurement keeps it.
+fn carry_video_sizes(conn: &Connection, source: SourceId) -> Result<()> {
+    const GONE: &str = "source_id = ?1 AND NOT EXISTS (SELECT 1 FROM channel c WHERE c.source_id = ?1 AND c.key = channel_video.item_key)";
+    let gone = conn
+        .prepare_cached(&format!("SELECT item_key, fp FROM channel_video WHERE {GONE}"))?
+        .query_map([source], |r| Ok((r.get::<_, String>(0)?, fp_from_json(&r.get::<_, String>(1)?))))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if gone.is_empty() {
+        return Ok(());
+    }
+    let candidates = Candidates::load(conn, &crate::store::user::facts_sql(ItemKind::Channel, false), [source])?;
+    for (key, fp) in &gone {
+        if let Some((to, _)) = candidates.find(fp) {
+            conn.execute(
+                "UPDATE OR IGNORE channel_video SET item_key = ?3 WHERE source_id = ?1 AND item_key = ?2",
+                params![source, key, to.as_str()],
+            )?;
+        }
+    }
+    conn.execute(&format!("DELETE FROM channel_video WHERE {GONE}"), [source])?;
+    Ok(())
 }
 
 /// Store lazily fetched movie details.

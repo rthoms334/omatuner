@@ -704,7 +704,8 @@ pub fn m3u_entry_to_channel(
     groups_out: &mut Vec<ImportGroup>,
 ) -> ImportChannel {
     let EntryIdentity { name, norm_name, tvg_id, key } = entry_identity(e, keys);
-    let clean_name = if smart { clean_channel_name(&name).name } else { name.clone() };
+    let cleaned = clean_channel_name(&name);
+    let clean_name = if smart { cleaned.name } else { name.clone() };
     let groups = entry_groups(e, ItemKind::Channel, smart, groups_out);
     // the Xtream id of a live stream URL: switching back from Xtream finds the channel by it
     let provider_id = parse_stream_url(&e.url).filter(|s| s.kind == XtreamStreamKind::Live).map(|s| s.stream_id.to_string());
@@ -729,6 +730,7 @@ pub fn m3u_entry_to_channel(
         provider_order: order,
         added_at: None,
         groups,
+        quality: cleaned.quality,
     }
 }
 
@@ -1358,7 +1360,8 @@ fn xt_name(name: &Option<String>, fallback: impl FnOnce() -> String) -> String {
 pub fn xt_live_to_channel(s: &XtLiveStream, order: i32, smart: bool, cats: &[XtCategory]) -> Option<ImportChannel> {
     let id = positive(s.stream_id)?;
     let name = xt_name(&s.name, || format!("Channel {id}"));
-    let clean_name = if smart { clean_channel_name(&name).name } else { name.clone() };
+    let cleaned = clean_channel_name(&name);
+    let clean_name = if smart { cleaned.name } else { name.clone() };
     let catchup = match (positive(s.tv_archive), positive(s.tv_archive_duration)) {
         (Some(_), Some(days)) => {
             Some(CatchupSpec { kind: CatchupKind::Xc, template: None, days: u32::try_from(days).unwrap_or(u32::MAX), correction_s: 0 })
@@ -1385,6 +1388,7 @@ pub fn xt_live_to_channel(s: &XtLiveStream, order: i32, smart: bool, cats: &[XtC
         provider_order: order,
         added_at: positive(s.added),
         groups: xt_group_keys(ItemKind::Channel, &s.category_id, &s.category_ids, cats),
+        quality: cleaned.quality,
         name,
     })
 }

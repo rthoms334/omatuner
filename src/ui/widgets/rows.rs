@@ -9,12 +9,13 @@
 
 use eframe::egui::{self, Align2, Color32, Rect};
 
+use super::badge::{InlineBadge, name_with_quality};
 use super::list::paint_row_state;
 use super::progress::paint_progress;
 use super::{RowState, glyphs, paint};
 use crate::config::Density;
 use crate::images::ImageCache;
-use crate::model::{ChannelSummary, Episode, Group, NowNext, ProgrammeSlim, Timestamp};
+use crate::model::{ChannelSummary, Episode, Group, NowNext, ProgrammeSlim, Quality, Timestamp};
 use crate::store::library::SourceMeta;
 use crate::theme::{SpaceToken, Theme, TypeToken};
 
@@ -125,6 +126,8 @@ pub struct ChannelRowOpts<'a> {
     /// Replaces "No guide data" on the detail line, e.g. "Loading guide… 45 %" while the first
     /// guide import runs (DESIGN §13.12).
     pub no_guide_label: Option<&'a str>,
+    /// The quality badge after the name (`UiCtx::quality`; `None` = unknown or badges off).
+    pub quality: Option<Quality>,
 }
 
 /// The detail line of a channel row for a row `width`: "title · 20:00–21:00 · next: X",
@@ -248,21 +251,18 @@ pub fn channel_row(
     } else if ch.radio {
         suffix.push_str(glyphs::RADIO);
     }
-    if !suffix.is_empty() {
-        let sg = paint::galley(
-            &p,
-            suffix.trim(),
-            paint::font(theme, TypeToken::BodySmall),
-            if opts.failed { t.warning } else { t.text_secondary },
-            f32::INFINITY,
-        );
+    let suffix = (!suffix.is_empty()).then(|| {
+        let c = if opts.failed { t.warning } else { t.text_secondary };
+        paint::galley(&p, suffix.trim(), paint::font(theme, TypeToken::BodySmall), c, f32::INFINITY)
+    });
+    if let Some(sg) = &suffix {
         name_right -= sg.size().x + theme.space(SpaceToken::Md);
-        let name_g = paint::galley(&p, ch.name.to_string(), line_font.clone(), color, (name_right - left).max(0.0));
-        let sx = left + name_g.size().x + theme.space(SpaceToken::Md);
-        p.galley(egui::pos2(sx, line_y - sg.size().y / 2.0), sg, color);
-        p.galley(egui::pos2(left, line_y - name_g.size().y / 2.0), name_g, color);
-    } else {
-        paint::text(&p, egui::pos2(left, line_y), Align2::LEFT_CENTER, ch.name.to_string(), line_font, color, (name_right - left).max(0.0));
+    }
+    // name [HD] ⚠: the badge gives way before the name elides
+    let badge = opts.quality.map(|q| InlineBadge::quality(&p, theme, q, if dim { t.text_disabled } else { t.text_secondary }, 1.0));
+    let named = name_with_quality(&p, theme, egui::pos2(left, line_y), &ch.name, line_font, color, badge, (name_right - left).max(0.0));
+    if let Some(sg) = suffix {
+        p.galley(egui::pos2(named.right() + theme.space(SpaceToken::Md), line_y - sg.size().y / 2.0), sg, color);
     }
     if let Some((line, has_data)) = detail {
         let c = if has_data { t.text_secondary } else { t.text_disabled };
@@ -539,6 +539,8 @@ mod tests {
             provider_order: 0,
             user_order: None,
             added_at: None,
+            quality: None,
+            family: 0,
         }
     }
 

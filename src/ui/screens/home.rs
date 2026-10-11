@@ -34,6 +34,7 @@ use crate::msg::{AppEvent, DataScope};
 use crate::store::library::FavIndex;
 use crate::theme::{SpaceToken, Theme, TypeToken};
 use crate::ui::overlays::{ContextMenuSpec, MenuItem, OverlayResult};
+use crate::ui::widgets::badge::{InlineBadge, name_with_quality};
 use crate::ui::widgets::poster::{self, TileDecor};
 use crate::ui::widgets::{empty_state, glyphs, section};
 use crate::ui::{OnboardingStart, OverlayRequest, Route, Screen, ScreenId, UiCtx};
@@ -1204,14 +1205,9 @@ fn channel_tile(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, id: ChannelId, cursor: b
             t.text_secondary,
         );
     }
-    elided(
-        p,
-        egui::pos2(left, top_y),
-        &ch.name,
-        egui::FontId::proportional(theme.font(TypeToken::Body)),
-        name_color,
-        right - left - theme.font(TypeToken::Icon),
-    );
+    let badge = ctx.quality(&ch).map(|q| InlineBadge::quality(p, theme, q, t.text_secondary, 1.0));
+    let font = egui::FontId::proportional(theme.font(TypeToken::Body));
+    name_with_quality(p, theme, egui::pos2(left, top_y), &ch.name, font, name_color, badge, right - left - theme.font(TypeToken::Icon));
     let detail_y = rect.top() + rect.height() * 0.64;
     let left = text_left;
     let nn: Option<NowNext> = ch.epg_channel_id.and_then(|e| {

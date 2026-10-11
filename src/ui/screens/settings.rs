@@ -235,7 +235,7 @@ static IFACE_C: [CfgChoice; 8] = [
         set: |c, i| c.interface.clock_24h = i == 0,
     },
 ];
-static IFACE_T: [CfgToggle; 12] = [
+static IFACE_T: [CfgToggle; 13] = [
     toggle_row!("Channel numbers", interface.show_channel_numbers),
     toggle_row!("Channel logos", interface.show_logos),
     toggle_row!("Live preview autoplay (uses a provider connection)", interface.live_preview_autoplay),
@@ -248,6 +248,7 @@ static IFACE_T: [CfgToggle; 12] = [
     toggle_row!("Media keys & playerctl (MPRIS)", integration.mpris),
     toggle_row!("Smart names (default for new playlists)", general.smart_names),
     toggle_row!("Debug logging", general.debug_log),
+    toggle_row!("Show quality badges", interface.quality_badges),
 ];
 static IFACE_N: [CfgNumber; 4] = [
     number_row!("Preview delay", "ms", 300.0, 5000.0, 100.0, u32, interface.preview_delay_ms),
@@ -855,6 +856,7 @@ impl SettingsScreen {
                 v.extend(IFACE_C[..3].iter().map(Row::Choice));
                 v.push(Row::Number(&IFACE_N[2]));
                 v.extend(IFACE_T[..2].iter().map(Row::Toggle));
+                v.push(Row::Toggle(&IFACE_T[12]));
                 v.push(Row::Choice(&IFACE_C[7]));
                 v.push(Row::Toggle(&IFACE_T[5]));
                 v.push(Row::Section("Playback".into()));

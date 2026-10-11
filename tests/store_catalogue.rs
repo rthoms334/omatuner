@@ -3,13 +3,14 @@
 
 mod support;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::Connection;
 use support::seed;
 use tuner::model::*;
 use tuner::redact::Secret;
 use tuner::sources::identity::{group_key, normalize_name, url_key};
+use tuner::sources::smart_names::clean_channel_name;
 use tuner::store::import::{self, ImportChannel, ImportGroup, ImportMovie, ImportSeries, ImportSummary};
 use tuner::store::{Store, epg, library, live, sources, user, vod};
 
@@ -58,6 +59,7 @@ fn chan(key: &str, name: &str, tvg: Option<&str>, grp: &str, url: &str, order: i
         provider_order: order,
         added_at: None,
         groups: vec![group_key(ItemKind::Channel, grp)],
+        quality: None,
     }
 }
 
@@ -577,6 +579,45 @@ fn reattach_steps_renamed_group_url_and_ambiguous_names() {
     let (from, to) = (ch_ref(src, "m3u:b"), ch_ref(src, "m3u:b3"));
     w(&s, move |c| user::reassign(c, &from, &to));
     assert_eq!(holders(&r, &ch_ref(src, "m3u:b3")).len(), 5);
+    assert!(user::orphans(&r).unwrap().is_empty());
+}
+
+/// Quality badges (DESIGN §6): the name's quality word is stored at import; a measured size
+/// beats it in the library, survives a refresh, follows the channel to a new key (reattach
+/// steps) and is dropped with a channel that is gone — never listed as an orphan.
+#[test]
+fn measured_quality_beats_the_name_and_follows_the_channel() {
+    let (s, src, _) = reattach_setup("tuner-st-quality");
+    let named = |key: &str, name: &str, url: &str, order| ImportChannel {
+        quality: clean_channel_name(name).quality,
+        ..chan(key, name, None, "UK", url, order)
+    };
+    let v1 = vec![
+        named("m3u:a", "BBC One 4K", "http://cdn/bbc4k.ts", 0),
+        named("m3u:b", "BBC One HD", "http://cdn/bbchd.ts", 1),
+        named("m3u:c", "ITV", "http://cdn/itv.ts", 2),
+    ];
+    run_import(&s, src, v1.clone(), vec![], vec![], vec![ItemKind::Channel], NOW);
+    let r = s.reader().unwrap();
+    let quality =
+        || -> HashMap<String, Option<Quality>> { library::load(&r).unwrap().live.channels.iter().map(|c| (c.key.0.clone(), c.quality)).collect() };
+    assert_eq!(quality(), HashMap::from([("m3u:a".into(), Some(Quality::Uhd)), ("m3u:b".into(), Some(Quality::Hd)), ("m3u:c".into(), None)]));
+
+    // the "4K" one plays at 1080p, the untagged one turns out SD
+    w(&s, move |c| {
+        live::record_video(c, &ch_ref(src, "m3u:a"), 1920, 1080, NOW)?;
+        live::record_video(c, &ch_ref(src, "m3u:c"), 720, 576, NOW)
+    });
+    let measured = HashMap::from([("m3u:a".into(), Some(Quality::Fhd)), ("m3u:b".into(), Some(Quality::Hd)), ("m3u:c".into(), Some(Quality::Sd))]);
+    assert_eq!(quality(), measured);
+    run_import(&s, src, v1, vec![], vec![], vec![ItemKind::Channel], NOW + 10);
+    assert_eq!(quality(), measured, "a refresh keeps both");
+
+    // re-keyed (same stream path, rotated token): the measurement follows; ITV is gone
+    let v2 = vec![named("m3u:a2", "BBC One 4K", "http://cdn/bbc4k.ts?token=2", 0), named("m3u:b", "BBC One HD", "http://cdn/bbchd.ts", 1)];
+    run_import(&s, src, v2, vec![], vec![], vec![ItemKind::Channel], NOW + 20);
+    assert_eq!(quality(), HashMap::from([("m3u:a2".into(), Some(Quality::Fhd)), ("m3u:b".into(), Some(Quality::Hd))]));
+    assert_eq!(count(&r, "SELECT count(*) FROM channel_video"), 1);
     assert!(user::orphans(&r).unwrap().is_empty());
 }
 

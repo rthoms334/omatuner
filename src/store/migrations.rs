@@ -2,14 +2,17 @@
 //!
 //! FROZEN (skeleton). Contract: migrations are append-only (WP-02 appends entries after the
 //! `skeleton-v1` tag, with architect sign-off). Each entry runs inside one transaction and bumps
-//! `user_version` to its index + 1. Never edit a shipped migration; add `000N_*.sql`.
+//! `user_version` to its index + 1. Never edit a shipped migration; add `000N_*.sql`. A
+//! migration whose new columns need data SQL can't compute (it needs Rust parsing) has a
+//! [`backfill`] step, run in the same transaction right after its script.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 
 use crate::error::Result;
 
 /// Ordered migration scripts.
-pub const MIGRATIONS: &[(&str, &str)] = &[("0001_init", include_str!("migrations/0001_init.sql"))];
+pub const MIGRATIONS: &[(&str, &str)] =
+    &[("0001_init", include_str!("migrations/0001_init.sql")), ("0002_quality", include_str!("migrations/0002_quality.sql"))];
 
 /// Current schema version after all migrations.
 pub fn latest_version() -> i64 {
@@ -29,8 +32,32 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
         tracing::info!("applying migration {name}");
         let tx = conn.transaction()?;
         tx.execute_batch(sql)?;
+        backfill(&tx, name)?;
         tx.pragma_update(None, "user_version", (i + 1) as i64)?;
         tx.commit()?;
+    }
+    Ok(())
+}
+
+/// The Rust part of migration `name`, if it has one.
+fn backfill(conn: &Connection, name: &str) -> Result<()> {
+    if name == "0002_quality" {
+        backfill_channel_quality(conn)?;
+    }
+    Ok(())
+}
+
+/// `channel.quality` of the channels imported before 0002, from their stored provider name
+/// (the same parse the import does; ~0.1 s per 100k channels, once).
+fn backfill_channel_quality(conn: &Connection) -> Result<()> {
+    let mut read = conn.prepare("SELECT id, name FROM channel")?;
+    let mut write = conn.prepare("UPDATE channel SET quality = ?2 WHERE id = ?1")?;
+    let mut rows = read.query([])?;
+    while let Some(r) = rows.next()? {
+        let name: String = r.get(1)?;
+        if let Some(q) = crate::sources::smart_names::clean_channel_name(&name).quality {
+            write.execute(params![r.get::<_, i64>(0)?, q.code()])?;
+        }
     }
     Ok(())
 }
@@ -106,6 +133,31 @@ mod tests {
              DELETE FROM programme WHERE epg_source_id=1; DELETE FROM epg_source WHERE id=1;",
         )
         .unwrap();
+    }
+
+    /// A database from before 0002 gets the quality word of every stored channel name.
+    #[test]
+    fn quality_migration_backfills_from_the_provider_name() {
+        let mut c = Connection::open_in_memory().unwrap();
+        let (name, sql) = MIGRATIONS[0];
+        let tx = c.transaction().unwrap();
+        tx.execute_batch(sql).unwrap();
+        tx.pragma_update(None, "user_version", 1).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(name, "0001_init");
+        c.execute_batch(
+            "INSERT INTO source(id,name,kind,created_at) VALUES (1,'s','m3u-url',0);
+             INSERT INTO channel(source_id,key,name,clean_name,norm_name,stream,provider_order,seen_gen) VALUES
+               (1,'a','UK: BBC One FHD','BBC One','bbcone','{}',0,1),
+               (1,'b','BBC One ᴴᴰ','BBC One','bbcone','{}',1,1),
+               (1,'c','BBC One','BBC One','bbcone','{}',2,1);",
+        )
+        .unwrap();
+        migrate(&mut c).unwrap();
+        let q = |k: &str| c.query_row("SELECT quality FROM channel WHERE key = ?1", [k], |r| r.get::<_, Option<i64>>(0)).unwrap();
+        assert_eq!(q("a"), Some(3));
+        assert_eq!(q("b"), Some(2));
+        assert_eq!(q("c"), None);
     }
 
     #[test]

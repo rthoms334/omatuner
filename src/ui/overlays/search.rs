@@ -38,6 +38,7 @@ use crate::model::{ItemKind, ItemRef, MediaRef, PlayOrigin, ProgrammeHit, Progra
 use crate::search::{EpgSearch, SearchHit, SearchIndex, SearchSection, SearchTarget};
 use crate::theme::{SpaceToken, TypeToken};
 use crate::ui::screens::home::{kit, vod_ref};
+use crate::ui::widgets::badge::InlineBadge;
 use crate::ui::widgets::button::{ButtonStyle, button};
 use crate::ui::widgets::card::CardKind;
 use crate::ui::widgets::list::paint_row_state;
@@ -642,9 +643,27 @@ fn paint_hit(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, h: &SearchHit, 
     if h.item.locked {
         job.append(&format!("  {}", glyphs::LOCK), 0.0, egui::TextFormat::simple(font.clone(), t.text_secondary));
     }
-    job.wrap = egui::text::TextWrapping::truncate_at_width((right - left).max(0.0));
-    let g = p.layout_job(job);
+    // the quality badge follows the name while the whole name fits beside it (DESIGN §13.0)
+    let quality = match h.item.target {
+        SearchTarget::Channel(id) => ctx.lib.live.get(id).and_then(|c| ctx.quality(c)),
+        _ => None,
+    };
+    let max_w = (right - left).max(0.0);
+    let gap = theme.space(SpaceToken::Md);
+    let badge = quality.map(|q| InlineBadge::quality(&p, theme, q, t.text_secondary, 1.0));
+    let full = badge.as_ref().map(|_| p.layout_job(job.clone()));
+    let (g, badge) = match (full, badge) {
+        (Some(full), Some(b)) if full.size().x + gap + b.size().x <= max_w => (full, Some(b)),
+        _ => {
+            job.wrap = egui::text::TextWrapping::truncate_at_width(max_w);
+            (p.layout_job(job), None)
+        }
+    };
+    let name_right = left + g.size().x;
     p.galley(egui::pos2(left, y - g.size().y / 2.0), g, base);
+    if let Some(b) = badge {
+        b.paint(&p, theme, egui::pos2(name_right + gap, y), Align2::LEFT_CENTER);
+    }
 }
 
 /// `Thu 21:00  Bbc Proms · BBC Four     󰂚 / ⟲ / LIVE`.

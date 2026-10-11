@@ -10,12 +10,14 @@
 //!   grid and rows are testable without WP-02.
 //! * [`NowNextCache`]: `(epg channel, tvg-shift) → NowNext` valid until the current programme
 //!   ends; at most 8 misses per frame; invalidated on `DataScope::Epg`.
+//! * [`MeasuredQuality`]: quality badges measured this session, ahead of the library.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::error::Result;
-use crate::model::{EpgChannelId, NowNext, ProgrammeSlim, Timestamp};
+use crate::model::{ChannelId, ChannelSummary, EpgChannelId, ItemKey, MediaRef, NowNext, ProgrammeSlim, Quality, SourceId, Timestamp};
+use crate::player::{PlayerSnapshot, PlayerState};
 
 /// Per-frame time budget for synchronous UI-thread DB work.
 #[derive(Debug)]
@@ -154,6 +156,47 @@ impl NowNextCache {
     }
 }
 
+/// The quality class each channel played this session decoded at (DESIGN §13.0 badges). The
+/// player stores it (`channel_video`) without a library rebuild, so until the next build the
+/// rows read it from here: a badge follows what mpv decoded as soon as the channel plays.
+/// Owned by the app, fed every frame from the player snapshot.
+#[derive(Debug, Default)]
+pub struct MeasuredQuality {
+    /// With the channel's identity: a later library may give the id to another channel.
+    by_channel: HashMap<ChannelId, (SourceId, ItemKey, Quality)>,
+}
+
+impl MeasuredQuality {
+    /// Note the playing live channel's decoded size (same rule as the controller's
+    /// `record_video`: live, Playing, a known size).
+    pub fn observe(&mut self, snap: &PlayerSnapshot) {
+        let Some(p) = snap.playable.as_ref().filter(|p| p.kind.is_live()) else { return };
+        let (MediaRef::Channel(id), Some(item), Some((w, h))) = (&p.media, &p.item, snap.video_size) else { return };
+        let Some(q) = Quality::of_video(w, h).filter(|_| snap.state == PlayerState::Playing) else { return };
+        if self.by_channel.get(id).is_none_or(|(_, _, old)| *old != q) {
+            self.by_channel.insert(*id, (item.source, item.key.clone(), q));
+        }
+    }
+
+    /// Measured this session, if this channel (same identity) played.
+    pub fn get(&self, ch: &ChannelSummary) -> Option<Quality> {
+        self.by_channel.get(&ch.id).filter(|(s, k, _)| *s == ch.source_id && *k == ch.key).map(|e| e.2)
+    }
+}
+
+/// What a channel's quality badge says, copied out of the `UiCtx` for painter-level code that
+/// can't hold it (the guide grid): `None` inside while Settings ▸ Interface ▸ Show quality
+/// badges is off.
+#[derive(Debug, Clone, Copy)]
+pub struct QualityBadges<'a>(pub Option<&'a MeasuredQuality>);
+
+impl QualityBadges<'_> {
+    /// Measured this session, else the library's (measured earlier, else from the name).
+    pub fn of(&self, ch: &ChannelSummary) -> Option<Quality> {
+        self.0.and_then(|m| m.get(ch).or(ch.quality))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +239,57 @@ mod tests {
         c.begin_frame();
         let nn = c.get((EpgChannelId(1), 60), 10, &mut r, &mut b).unwrap();
         assert_eq!(nn.now.as_ref().unwrap().start, 3600);
+    }
+
+    /// The session's measurement beats the library's value, only once the channel is really
+    /// Playing (a zap still shows the old picture), and never for another channel that got the
+    /// same row id in a later library.
+    #[test]
+    fn measured_quality_waits_for_playing_and_checks_identity() {
+        let ch = |key: &str| ChannelSummary {
+            id: ChannelId(4),
+            source_id: SourceId(1),
+            key: ItemKey(key.into()),
+            name: Arc::from("BBC One"),
+            number: None,
+            logo: None,
+            group_ids: vec![],
+            epg_channel_id: None,
+            tvg_shift_min: 0,
+            has_catchup: false,
+            catchup_days: 0,
+            radio: false,
+            locked: false,
+            unsupported: false,
+            provider_order: 0,
+            user_order: None,
+            added_at: None,
+            quality: Some(Quality::Uhd),
+            family: 0,
+        };
+        let mut snap = PlayerSnapshot { state: PlayerState::Zapping { until: Instant::now() }, video_size: Some((1920, 1080)), ..Default::default() };
+        snap.playable = Some(Arc::new(crate::model::Playable {
+            media: MediaRef::Channel(ChannelId(4)),
+            kind: crate::model::PlayableKind::Live,
+            item: Some(crate::model::ItemRef { source: SourceId(1), kind: crate::model::ItemKind::Channel, key: ItemKey("a".into()) }),
+            source_id: Some(SourceId(1)),
+            title: "BBC One".into(),
+            subtitle: None,
+            logo: None,
+            number: None,
+            url: crate::redact::Secret::new(String::new()),
+            headers: Default::default(),
+            start_at: None,
+            duration_hint: None,
+        }));
+        let mut m = MeasuredQuality::default();
+        m.observe(&snap);
+        assert_eq!(m.get(&ch("a")), None, "not while zapping");
+        snap.state = PlayerState::Playing;
+        m.observe(&snap);
+        let on = QualityBadges(Some(&m));
+        assert_eq!(on.of(&ch("a")), Some(Quality::Fhd), "measured beats the name");
+        assert_eq!(on.of(&ch("b")), Some(Quality::Uhd), "same id, another channel");
+        assert_eq!(QualityBadges(None).of(&ch("a")), None, "badges off");
     }
 }

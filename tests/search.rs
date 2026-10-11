@@ -64,6 +64,8 @@ fn channel(id: i64, source: i64, name: &str, groups: &[i64], locked: bool) -> Ch
         provider_order: id as i32,
         user_order: None,
         added_at: None,
+        quality: None,
+        family: 0,
     }
 }
 

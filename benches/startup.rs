@@ -6,7 +6,8 @@
 //! The profile is generated here, deterministically, into a temp dir under the target dir
 //! (real disk, like a user's profile): 100k channels, 50k movies, 20k series (the §5.4 budget),
 //! 24 h of guide for 5 000 channels, a few favourites and history (so `StartScreen::Auto`
-//! opens Home, the busiest start screen).
+//! opens Home, the busiest start screen), quality words on most channels and a measured
+//! picture size on one in five.
 //!
 //! "First frame" follows `main` minus the window: from before the font/theme helper threads
 //! are spawned, through `Services::start` (store open + migrate, mpv init, …), the creation
@@ -78,6 +79,12 @@ fn seed_profile(paths: &AppPaths) {
                 let entry = tuner::model::HistoryEntry { item, at: now - i as i64, title: format!("Channel {i}") };
                 tuner::store::user::push_history(c, &entry)?;
             }
+            // quality badges: a word in 4 names out of 5, and one channel in 5 measured
+            c.execute_batch(
+                "UPDATE channel SET quality = NULLIF(id % 5, 0);
+                 INSERT INTO channel_video(source_id, item_key, width, height, at)
+                   SELECT source_id, key, 1920, 1080, 0 FROM channel WHERE id % 5 = 1;",
+            )?;
             c.execute_batch("ANALYZE")?;
             Ok(())
         })

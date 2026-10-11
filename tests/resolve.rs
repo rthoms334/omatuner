@@ -94,6 +94,7 @@ fn chan(key: &str, name: &str, stream: StreamLocator) -> ImportChannel {
         provider_order: 0,
         added_at: None,
         groups: vec![group_key(ItemKind::Channel, "News")],
+        quality: None,
     }
 }
 
