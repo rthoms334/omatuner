@@ -20,6 +20,7 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("0004_name_rules", include_str!("migrations/0004_name_rules.sql")),
     ("0005_explicit", include_str!("migrations/0005_explicit.sql")),
     ("0006_title_stacks", include_str!("migrations/0006_title_stacks.sql")),
+    ("0007_title_join", include_str!("migrations/0007_title_join.sql")),
 ];
 
 /// Current schema version after all migrations.
@@ -98,8 +99,34 @@ fn backfill(conn: &Connection, name: &str) -> Result<()> {
             add_title_columns(conn)?;
             crate::store::titles::refresh_all(conn).map(|_| ())
         }
+        "0007_title_join" => rebuild_title_link(conn),
         _ => Ok(()),
     }
+}
+
+/// 0007: `title_link` rebuilt to accept `join` rows with a `join_group` (a CHECK constraint
+/// only changes with a new table). Its rows are copied, `join_group` too when a re-run finds
+/// the column already there.
+fn rebuild_title_link(conn: &Connection) -> Result<()> {
+    let group = if has_column(conn, "title_link", "join_group")? { "join_group" } else { "NULL" };
+    conn.execute_batch(&format!(
+        "CREATE TABLE title_link_new (
+           source_id  INTEGER NOT NULL REFERENCES source(id) ON DELETE CASCADE,
+           kind       TEXT    NOT NULL CHECK (kind IN ('movie', 'series')),
+           item_key   TEXT    NOT NULL,
+           action     TEXT    NOT NULL CHECK (action IN ('split', 'pin', 'join')),
+           at         INTEGER NOT NULL,
+           fp         TEXT    NOT NULL DEFAULT '{{}}',
+           orphaned_since INTEGER,
+           join_group INTEGER,
+           PRIMARY KEY (source_id, kind, item_key, action)
+         ) WITHOUT ROWID;
+         INSERT INTO title_link_new(source_id, kind, item_key, action, at, fp, orphaned_since, join_group)
+           SELECT source_id, kind, item_key, action, at, fp, orphaned_since, {group} FROM title_link;
+         DROP TABLE title_link;
+         ALTER TABLE title_link_new RENAME TO title_link;"
+    ))?;
+    Ok(())
 }
 
 /// The match columns of movies and series and `series.tmdb_id` (0006; only the missing ones,
@@ -271,7 +298,10 @@ mod tests {
         let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v, latest_version());
         let names: Vec<&str> = MIGRATIONS.iter().map(|m| m.0).collect();
-        assert_eq!(names, ["0001_init", "0002_category_filter", "0003_quality", "0004_name_rules", "0005_explicit", "0006_title_stacks"]);
+        assert_eq!(
+            names,
+            ["0001_init", "0002_category_filter", "0003_quality", "0004_name_rules", "0005_explicit", "0006_title_stacks", "0007_title_join"]
+        );
         for (t, col) in [
             ("grp", "raw_name"),
             ("group_override", "shown"),
@@ -522,6 +552,41 @@ mod tests {
         assert!(!has_column(&d, "grp", "explicit").unwrap());
         migrate(&mut d).unwrap();
         assert!(has_column(&d, "grp", "explicit").unwrap() && has_column(&d, "movie", "explicit").unwrap());
+    }
+
+    /// 0007: `title_link` accepts "join" rows with a `join_group` and keeps the splits and pins
+    /// it had (with their fingerprints); running it again changes nothing.
+    #[test]
+    fn title_join_migration_keeps_corrections_and_accepts_joins() {
+        let mut c = migrated_to(6);
+        assert_eq!(MIGRATIONS[6].0, "0007_title_join");
+        c.execute_batch(
+            r#"INSERT INTO source(id,name,kind,created_at) VALUES (1,'TV','xtream',0);
+               INSERT INTO title_link(source_id,kind,item_key,action,at,fp) VALUES (1,'movie','a','split',5,'{"n":"x"}'), (1,'series','s','pin',6,'{}');"#,
+        )
+        .unwrap();
+        assert!(
+            c.execute("INSERT INTO title_link(source_id,kind,item_key,action,at) VALUES (1,'movie','b','join',7)", []).is_err(),
+            "v6 has no joins"
+        );
+        let rows = |c: &Connection| -> Vec<(String, String, i64, String, Option<i64>)> {
+            c.prepare("SELECT item_key, action, at, fp, join_group FROM title_link ORDER BY item_key")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        migrate(&mut c).unwrap();
+        let kept = vec![("a".to_owned(), "split".to_owned(), 5, r#"{"n":"x"}"#.to_owned(), None), ("s".into(), "pin".into(), 6, "{}".into(), None)];
+        assert_eq!(rows(&c), kept);
+        c.execute("INSERT INTO title_link(source_id,kind,item_key,action,at,join_group) VALUES (1,'movie','b','join',7,3)", []).unwrap();
+        c.pragma_update(None, "user_version", 6).unwrap();
+        migrate(&mut c).unwrap();
+        assert_eq!(rows(&c).len(), 3, "a re-run keeps every row");
+        assert_eq!(rows(&c)[1].4, Some(3), "and the join's group");
+        c.execute_batch("PRAGMA foreign_keys=ON; DELETE FROM source WHERE id = 1").unwrap();
+        assert!(rows(&c).is_empty(), "still cascades with its playlist");
     }
 
     /// 0005: categories whose stored names read as adult content are explicit without a

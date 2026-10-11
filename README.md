@@ -147,11 +147,23 @@ takes the pictures. The theme is Omarchy's Tokyo Night unless noted. The video i
     plays first* — and mkv / mp4 before other files. If it fails before the first frame, Tuner
     plays the next copy once and says so; if it fails later, the error offers *Play from TV 2
     at 41:20*. `Ctrl+O` in the player switches copy where you are.
-  - ★, watched, lock, hide and rename on a stack act on the title (the toast has **Undo**).
-    *Not the same title* (a copy's menu) takes a wrongly combined copy out for good;
-    Settings ▸ Hidden ▸ *Titles you separated or pinned* undoes it. Settings ▸ Interface ▸
-    *Same title in several playlists: Show each copy* turns stacks off. Inside one playlist
-    nothing is combined; a title that is also in another playlist says `+1`.
+  - ★, watched, lock, hide and rename on a stack — and on its page — act on the title (the
+    toast has **Undo**). *Not the same title* (a copy's menu) takes a wrongly combined copy out
+    for good; *Same title as…* (a card's or page's menu) combines two titles Tuner kept apart —
+    type the other one's name. Settings ▸ Hidden ▸ *Titles you separated, combined or pinned*
+    undoes either. Settings ▸ Interface ▸ *Same title in several playlists: Show each copy*
+    turns stacks off. Inside one playlist nothing is combined; a title that is also in another
+    playlist says `+1`.
+  - A series in two playlists shares its watched marks: an episode watched in one copy shows
+    watched in the other, the page opens at the next episode of the copy you watched last,
+    and *Mark season watched* marks the season in every copy (it loads the other copy's
+    episodes first when needed).
+  - **Deleting a playlist** offers (unticked) to move its favourites, progress and watched
+    marks to the same titles in your other playlists — matched by TMDB id, title and year, or
+    by you — and lists what moves and what can't.
+- **Live TV, "Also on":** the preview names the same channel in your other playlists
+  (`Also on ● TV 2 (FHD)`) — click one, or press `Ctrl+O`, to play it from there. They are
+  alternatives you pick; Tuner never merges channels or switches by itself.
 - **Search:** global fuzzy search over channels, movies, series and programmes (`/` or Ctrl+K),
   plus type-to-filter in every list.
 - **Player:**
@@ -439,6 +451,12 @@ Tuner is built for the keyboard, and everything is also clickable. The basics:
   keybindings menu: "ctrl+h", "f5" or "mute" narrow the list as you type, Esc clears the filter
   and then closes. The status bar shows a short hint line for the same screen.
 - **Esc** steps out one level: filter → panel → fullscreen → player → previous screen.
+- **← and → move between side-by-side panes** (Omarchy style): ← at the left edge of a pane
+  steps to the pane on its left — Settings content → the page list, channels → groups, the
+  first grid column → categories — even while a filter is typed (the filter is kept); → or
+  Enter go right again. Inside a pane ←/→ keep their meaning (posters, the guide's timeline,
+  the player, text fields). In Settings → raises a value or picks the next option, and
+  Shift+← / Shift+→ (or H / L) step it down or up. Tab and Shift+Tab still switch panes.
 - **Alt+1…5** switch screens, and **Alt+0** or **Ctrl+,** opens Settings. **Ctrl+K** or **/**
   searches. **Ctrl+Q** quits.
 - Super is left to Omarchy. Media keys arrive through MPRIS.
@@ -485,6 +503,7 @@ The full reference is generated from `src/keymap.rs`:
 | `/` | Search everything |
 | `?` | Keyboard help |
 | `Space` / `Insert` | Mark group (Ctrl+H then hides all marked) |
+| `Ctrl+O` | Play from another playlist (Also on)… |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
 | `Ctrl+H` | Hide / unhide |
@@ -509,12 +528,14 @@ The full reference is generated from `src/keymap.rs`:
 | `PgUp` / `PgDn` | Page up / down |
 | `Enter` | Play here / open (playing → fullscreen) |
 | `Shift+Enter` | Play fullscreen |
+| `←` | Back to the previous pane |
 | `Backspace` | Delete character |
 | `Ctrl+Backspace` | Delete word |
 | `Ctrl+U` / `Esc` | Clear filter |
 | `Tab` / `Shift+Tab` | Next / previous pane |
 | `Insert` | Mark group (Ctrl+H then hides all marked) |
 | `Ctrl+Shift+H` | Hide the groups with the words typed |
+| `Ctrl+O` | Play from another playlist (Also on)… |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
 | `Ctrl+H` | Hide / unhide |
@@ -813,8 +834,9 @@ The full reference is generated from `src/keymap.rs`:
 | Keys | Action |
 |---|---|
 | `↑` / `k` / `↓` / `j` | Move |
-| `←` / `h` | Decrease / previous option |
-| `→` / `l` | Increase / next option |
+| `←` / `h` | Back to the page list |
+| `→` / `l` / `Shift+→` / `L` | Increase / next option |
+| `Shift+←` / `H` | Decrease / previous option |
 | `Alt+↑` / `K` / `Alt+↓` / `J` | Move up / down (reorder: EPG priority, playlists, lists) |
 | `Tab` / `Shift+Tab` | Next / previous section |
 | `Enter` / `Space` | Toggle / open |

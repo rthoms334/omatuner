@@ -395,14 +395,19 @@ pub fn group_overrides(conn: &Connection) -> Result<Vec<GroupOverrideRow>> {
 pub(crate) const PROGRESS_COLS: &str = "source_id, kind, item_key, position_s, duration_s, finished, updated_at, title, fp";
 
 pub(crate) fn progress_from_row(r: &Row<'_>) -> rusqlite::Result<WatchProgress> {
+    progress_from_offset(r, 0)
+}
+
+/// [`progress_from_row`] for a row whose [`PROGRESS_COLS`] start at column `at`.
+pub(crate) fn progress_from_offset(r: &Row<'_>, at: usize) -> rusqlite::Result<WatchProgress> {
     Ok(WatchProgress {
-        item: ItemRef { source: r.get(0)?, kind: kind_from_sql(&r.get::<_, String>(1)?)?, key: ItemKey(r.get(2)?) },
-        position_s: r.get(3)?,
-        duration_s: r.get(4)?,
-        finished: r.get(5)?,
-        updated_at: r.get(6)?,
-        title: r.get(7)?,
-        fingerprint: fp_from_json(&r.get::<_, String>(8)?),
+        item: ItemRef { source: r.get(at)?, kind: kind_from_sql(&r.get::<_, String>(at + 1)?)?, key: ItemKey(r.get(at + 2)?) },
+        position_s: r.get(at + 3)?,
+        duration_s: r.get(at + 4)?,
+        finished: r.get(at + 5)?,
+        updated_at: r.get(at + 6)?,
+        title: r.get(at + 7)?,
+        fingerprint: fp_from_json(&r.get::<_, String>(at + 8)?),
     })
 }
 
@@ -677,7 +682,7 @@ const HOLDERS: &[(&str, &str, &str, &str, &str)] = &[
     ("reminder", "reminder", "'channel'", "channel_key", ""),
     ("epg", "channel_epg_map", "'channel'", "channel_key", " AND method = 'manual'"),
     // "Not the same title" / "Always play from" (DESIGN §29.11)
-    ("split or pin", "title_link", "kind", "item_key", ""),
+    ("split, pin or join", "title_link", "kind", "item_key", ""),
 ];
 
 fn holder_name(s: &str) -> &'static str {

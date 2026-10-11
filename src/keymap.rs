@@ -17,8 +17,14 @@
 //!   reach `Global`; every other event (Space, ←/→, Delete, Backspace…) returns `None` so the
 //!   focused egui text widget edits text. Contexts below `TextInput` are never consulted.
 //! * `Modal` swallows printable text that it does not bind.
-//! * Key auto-repeat never triggers `Parent`/`Back` (holding Backspace to clear a filter must
-//!   not continue into "leave the pane").
+//! * Spatial panes (DESIGN §15.1): ← at the left edge of the focused pane steps to the pane on
+//!   its left (lists: `Parent`, or `Left` while filtering; Settings: `Left`; grids: `Left` on
+//!   the first column); → / Enter go right. Where ←/→ mean something inside the pane (a grid,
+//!   the guide, the player, a text field) they keep it; Settings values change with → and
+//!   Shift+←/→.
+//! * Key auto-repeat never triggers `Parent`/`Back`, a filtered list's ← or `LastChannel`
+//!   (holding Backspace to clear a filter must not continue into "leave the pane"; holding the
+//!   ← that closed a player side panel must not zap).
 //! * `Global` contains only Ctrl/Alt/F-key chords so it never steals typing.
 //! * No screen reads raw keys: every key a screen reacts to is in a table (so help is complete).
 //!
@@ -145,8 +151,13 @@ pub enum Action {
     ActivateAlt,
     /// Esc / Alt+← / mouse back: step out one layer (DESIGN §15.1 Esc ladder).
     Back,
-    /// Left/Backspace on an empty filter: go to the parent pane.
+    /// ← / Backspace in a list (Backspace only on an empty filter), ← on a grid's first
+    /// column, ← in Settings: step to the pane on the left (DESIGN §15.1 "Spatial panes").
     Parent,
+    /// Settings value rows (Shift+← / H): previous option, smaller number, switch off.
+    Decrease,
+    /// Settings value rows (→ / l / Shift+→ / L): next option, larger number, switch on.
+    Increase,
     FocusNext,
     FocusPrev,
     /// `[` / `]` on detail pages: previous / next season (tab strip).
@@ -434,6 +445,8 @@ pub static LIST: &[Binding] = &[
     // (and a leading space doesn't filter anyway)
     b(C::ch(' '), A::ToggleMark, "Mark group (Ctrl+H then hides all marked)"),
     b(C::key(Key::Insert), A::ToggleMark, "Mark group (Ctrl+H then hides all marked)"),
+    // Live TV: the same channel in another playlist ("Also on", DESIGN §29.16)
+    b(C::ctrl(Key::O), A::PlayFrom, "Play from another playlist (Also on)…"),
     // any other printable key starts filtering (FilterInput)
 ];
 
@@ -444,6 +457,9 @@ pub static LIST_FILTERING: &[Binding] = &[
     b(C::key(Key::PageDown), A::PageDown, "Page up / down"),
     b(C::key(Key::Enter), A::Activate, "Play here / open (playing → fullscreen)"),
     b(C::shift(Key::Enter), A::ActivateAlt, "Play fullscreen"),
+    // `Left`, not `Parent`: the list steps out whatever the filter (Backspace edits it), and
+    // the filter is kept for when the pane is focused again
+    b(C::key(Key::ArrowLeft), A::Left, "Back to the previous pane"),
     b(C::key(Key::Backspace), A::FilterBackspace, "Delete character"),
     b(C::ctrl(Key::Backspace), A::FilterDeleteWord, "Delete word"),
     b(C::ctrl(Key::U), A::FilterClear, "Clear filter"),
@@ -453,6 +469,7 @@ pub static LIST_FILTERING: &[Binding] = &[
     // Space types here (filters have spaces); Insert still marks
     b(C::key(Key::Insert), A::ToggleMark, "Mark group (Ctrl+H then hides all marked)"),
     b(C::ctrl_shift(Key::H), A::HideShown, "Hide the groups with the words typed"),
+    b(C::ctrl(Key::O), A::PlayFrom, "Play from another playlist (Also on)…"),
     // printable keys → FilterInput
 ];
 
@@ -761,10 +778,17 @@ pub static PANEL: &[Binding] = &[
     b(C::ch('k'), A::Up, "Move"),
     b(C::key(Key::ArrowDown), A::Down, "Move"),
     b(C::ch('j'), A::Down, "Move"),
-    b(C::key(Key::ArrowLeft), A::Left, "Decrease / previous option"),
-    b(C::ch('h'), A::Left, "Decrease / previous option"),
+    // ← always steps to the page list (spatial panes, DESIGN §15.1); values change with →
+    // and Shift+←/→ (H/L) — on Interface almost every row has a value, so "← changes the
+    // value where there is one" would almost never reach the page list
+    b(C::key(Key::ArrowLeft), A::Left, "Back to the page list"),
+    b(C::ch('h'), A::Left, "Back to the page list"),
     b(C::key(Key::ArrowRight), A::Right, "Increase / next option"),
     b(C::ch('l'), A::Right, "Increase / next option"),
+    b(C::shift(Key::ArrowRight), A::Increase, "Increase / next option"),
+    b(C::ch('L'), A::Increase, "Increase / next option"),
+    b(C::shift(Key::ArrowLeft), A::Decrease, "Decrease / previous option"),
+    b(C::ch('H'), A::Decrease, "Decrease / previous option"),
     b(C::alt(Key::ArrowUp), A::MoveUp, "Move up / down (reorder: EPG priority, playlists, lists)"),
     b(C::ch('K'), A::MoveUp, "Move up / down (reorder: EPG priority, playlists, lists)"),
     b(C::alt(Key::ArrowDown), A::MoveDown, "Move up / down (reorder: EPG priority, playlists, lists)"),
@@ -857,8 +881,12 @@ fn is_chord_or_fkey(ev: &egui::Event) -> bool {
 /// automatically). Returns `None` for unbound events (they flow to egui widgets).
 pub fn resolve(stack: &[KeyContext], ev: &egui::Event) -> Option<Action> {
     let action = resolve_inner(stack, ev)?;
-    // Auto-repeat never steps out of a pane/layer (holding Backspace to clear a filter).
-    if matches!(action, Action::Parent | Action::Back) && matches!(ev, egui::Event::Key { repeat: true, .. }) {
+    // Auto-repeat never steps out of a pane/layer (holding Backspace to clear a filter; a
+    // filtered list's ← has no movement to repeat) and never flips between the last two
+    // channels (the ← that closed a player side panel, held on).
+    let steps_out = matches!(action, Action::Parent | Action::Back | Action::LastChannel)
+        || (action == Action::Left && stack.first() == Some(&KeyContext::ListFiltering));
+    if steps_out && matches!(ev, egui::Event::Key { repeat: true, .. }) {
         return None;
     }
     Some(action)
@@ -939,7 +967,7 @@ const HINTS: &[(KeyContext, &[(Action, &str)])] = &[
         KeyContext::Guide,
         &[(A::Activate, "details"), (A::GuideWatch, "watch"), (A::GuideRemind, "remind"), (A::GuideNow, "now"), (A::ToggleHelp, "help")],
     ),
-    (KeyContext::Panel, &[(A::Activate, "toggle"), (A::MoveUp, "reorder"), (A::ContextMenu, "more"), (A::ToggleHelp, "help")]),
+    (KeyContext::Panel, &[(A::Activate, "toggle"), (A::Right, "change"), (A::MoveUp, "reorder"), (A::ContextMenu, "more"), (A::ToggleHelp, "help")]),
     (KeyContext::EpgMapping, &[(A::Activate, "assign"), (A::ClearEpg, "clear")]),
     (KeyContext::NumericEntry, &[(A::Activate, "go"), (A::FilterBackspace, "delete"), (A::Back, "cancel")]),
     (KeyContext::Search, &[(A::Activate, "open"), (A::ActivateAlt, "details"), (A::FocusNext, "section"), (A::Back, "close")]),
@@ -1074,6 +1102,15 @@ mod tests {
         assert_eq!(resolve(&[K::List], &key_ev(Key::Backspace, false, false, false, true)), None);
         assert_eq!(resolve(&[K::List], &key_ev(Key::Backspace, false, false, false, false)), Some(Action::Parent));
         assert_eq!(resolve(&[K::ListFiltering], &key_ev(Key::Backspace, false, false, false, true)), Some(Action::FilterBackspace));
+        // a held ←: a filtered list steps out once, the player behind it never zaps on repeat;
+        // held arrows still move in a grid and still change a Settings value
+        let held = |k, shift| key_ev(k, false, false, shift, true);
+        assert_eq!(resolve(&[K::ListFiltering], &held(Key::ArrowLeft, false)), None);
+        assert_eq!(resolve(&[K::ListFiltering, K::PlayerLive], &held(Key::ArrowLeft, false)), None);
+        assert_eq!(resolve(&[K::PlayerLive], &held(Key::ArrowLeft, false)), None, "no LastChannel flip-flop");
+        assert_eq!(resolve(&[K::PlayerLive], &key(Key::ArrowLeft, false)), Some(Action::LastChannel));
+        assert_eq!(resolve(&[K::PosterGrid], &held(Key::ArrowLeft, false)), Some(Action::Left));
+        assert_eq!(resolve(&[K::Panel], &held(Key::ArrowLeft, true)), Some(Action::Decrease));
     }
 
     #[test]
@@ -1083,6 +1120,36 @@ mod tests {
         assert_eq!(resolve(&[K::Detail], &egui::Event::Text("]".into())), Some(Action::TabNext));
         assert_eq!(resolve(&[K::Detail], &key(Key::W, true)), Some(Action::MarkWatched));
         assert!(help_rows(K::PosterGrid).iter().any(|(_, h)| *h == "Type to filter"));
+    }
+
+    /// Spatial panes: ← steps left in Settings (values change with → and Shift+←/→ / H/L) and
+    /// in a filtered list (Backspace still edits the filter); a text field keeps its arrows.
+    #[test]
+    fn left_steps_to_the_pane_on_the_left() {
+        let shift = |k| key_ev(k, false, false, true, false);
+        assert_eq!(resolve(&[K::Panel], &key(Key::ArrowLeft, false)), Some(Action::Left));
+        assert_eq!(resolve(&[K::Panel], &egui::Event::Text("h".into())), Some(Action::Left));
+        assert_eq!(resolve(&[K::Panel], &key(Key::ArrowRight, false)), Some(Action::Right));
+        assert_eq!(resolve(&[K::Panel], &shift(Key::ArrowLeft)), Some(Action::Decrease));
+        assert_eq!(resolve(&[K::Panel], &egui::Event::Text("H".into())), Some(Action::Decrease));
+        assert_eq!(resolve(&[K::Panel], &shift(Key::ArrowRight)), Some(Action::Increase));
+        assert_eq!(resolve(&[K::Panel], &egui::Event::Text("L".into())), Some(Action::Increase));
+        // a text field owns its arrows, shifted (selection) too, and its letters
+        assert_eq!(resolve(&[K::TextInput, K::Panel], &key(Key::ArrowLeft, false)), None);
+        assert_eq!(resolve(&[K::TextInput, K::Panel], &shift(Key::ArrowLeft)), None);
+        assert_eq!(resolve(&[K::TextInput, K::Panel], &egui::Event::Text("H".into())), None);
+        // filtered lists: ← leaves the pane, Backspace edits the filter
+        assert_eq!(resolve(&[K::ListFiltering], &key(Key::ArrowLeft, false)), Some(Action::Left));
+        assert_eq!(resolve(&[K::ListFiltering, K::Modal], &key(Key::ArrowLeft, false)), Some(Action::Left));
+        assert_eq!(resolve(&[K::ListFiltering, K::PlayerLive], &key(Key::ArrowLeft, false)), Some(Action::Left), "not the player's ←");
+        assert_eq!(resolve(&[K::ListFiltering], &key(Key::Backspace, false)), Some(Action::FilterBackspace));
+        assert_eq!(resolve(&[K::List], &key(Key::ArrowLeft, false)), Some(Action::Parent));
+        // help: one row per meaning
+        let rows = help_rows(K::Panel);
+        assert!(rows.iter().any(|(k, h)| *h == "Back to the page list" && k == "← / h"), "{rows:?}");
+        assert!(rows.iter().any(|(k, h)| *h == "Increase / next option" && k == "→ / l / Shift+→ / L"), "{rows:?}");
+        assert!(rows.iter().any(|(k, h)| *h == "Decrease / previous option" && k == "Shift+← / H"), "{rows:?}");
+        assert!(hint_line(&[K::Panel]).contains("→ change") && !hint_line(&[K::Panel]).contains("Shift+"), "{}", hint_line(&[K::Panel]));
     }
 
     #[test]

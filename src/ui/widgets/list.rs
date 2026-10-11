@@ -48,7 +48,8 @@ pub enum ListOutcome {
     Activated(usize),
     /// Shift+Enter.
     ActivatedAlt(usize),
-    /// Left / Backspace on an empty filter.
+    /// ← (with or without a filter; the filter is kept) or Backspace on an empty filter: the
+    /// pane on the left (DESIGN §15.1 "Spatial panes").
     Parent,
     FilterChanged,
     /// Right-click / Shift+F10 / Ctrl+Enter.
@@ -96,7 +97,11 @@ impl ListState {
             Action::Activate if self.len > 0 => ListOutcome::Activated(self.cursor),
             Action::ActivateAlt if self.len > 0 => ListOutcome::ActivatedAlt(self.cursor),
             Action::ContextMenu if self.len > 0 => ListOutcome::ContextMenu(self.cursor),
+            // `Parent` (← / Backspace in `List`) only on an empty filter: the stack is resolved
+            // once per frame, so a typed "a" + Backspace in one frame must not also step out;
+            // ← while filtering arrives as `Left` and steps out (keeping the filter)
             Action::Parent if !self.filter.is_active() => ListOutcome::Parent,
+            Action::Left => ListOutcome::Parent,
             Action::FilterInput(c) => self.edit_filter(|f| f.push(c)),
             Action::FilterBackspace => self.edit_filter(ListFilter::backspace),
             Action::FilterDeleteWord => self.edit_filter(ListFilter::delete_word),
@@ -262,6 +267,7 @@ mod tests {
             assert_eq!(s.handle(a), ListOutcome::None, "{a:?}");
         }
         assert_eq!(s.handle(Action::Parent), ListOutcome::Parent);
+        assert_eq!(s.handle(Action::Left), ListOutcome::Parent);
     }
 
     #[test]
@@ -277,8 +283,12 @@ mod tests {
         assert_eq!(s.handle(Action::FilterInput(' ')), ListOutcome::FilterChanged);
         assert_eq!(s.handle(Action::FilterInput('c')), ListOutcome::FilterChanged);
         assert_eq!(s.filter.query(), "b c");
-        // Parent is only reported on an empty filter
+        // Parent (Backspace's) only on an empty filter; ← (`Left` while filtering) steps out
+        // and keeps the filter and the cursor
         assert_eq!(s.handle(Action::Parent), ListOutcome::None);
+        s.select(1);
+        assert_eq!(s.handle(Action::Left), ListOutcome::Parent);
+        assert_eq!((s.filter.query(), s.cursor), ("b c", 1));
         assert_eq!(s.handle(Action::FilterDeleteWord), ListOutcome::FilterChanged);
         assert_eq!(s.filter.query(), "b ");
         assert_eq!(s.handle(Action::FilterClear), ListOutcome::FilterChanged);

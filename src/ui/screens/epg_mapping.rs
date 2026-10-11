@@ -10,7 +10,8 @@
 //!   have none cached yet (one batch in flight at a time); "Has suggestions" lists the
 //!   channels whose cached suggestions are non-empty (the prefilter's results so far).
 //! * Ctrl+S picks the channel filter; Tab switches between the channel list and the EPG
-//!   list (which has its own type-to-filter); Enter on a channel moves to its candidates.
+//!   list (which has its own type-to-filter); Enter / → on a channel moves to its candidates,
+//!   ← (also while they filter) / Backspace / Esc return (DESIGN §15.1 spatial panes).
 //! * Writes: `store::epg::set_manual_mapping` / `clear_manual_mapping` through the writer,
 //!   then `DataScope::Epg` (the app flushes guide caches and rebuilds the library).
 
@@ -788,6 +789,16 @@ mod tests {
         h.state_mut().enter(Route::EpgMapping { channel: Some(chans[4]) });
         h.run_steps(2);
         assert_eq!(h.state().s.highlighted(), Some(chans[4]));
+        // spatial panes (DESIGN §15.1): ← returns from the candidates to the channels, also
+        // while the candidates filter (`Left` from `[ListFiltering]`; the filter is kept)
+        h.state_mut().act(Action::Activate);
+        assert_eq!(h.state().s.pane, Pane::Candidates);
+        h.state_mut().act(Action::FilterInput('c'));
+        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::EpgMapping, KeyContext::ListFiltering]);
+        assert!(h.state_mut().act(Action::Left));
+        assert_eq!(h.state().s.pane, Pane::Channels);
+        assert_eq!(h.state().s.cands.filter.query(), "c");
+        assert_eq!(h.state().s.highlighted(), Some(chans[4]), "nothing assigned or moved");
     }
 
     #[test]

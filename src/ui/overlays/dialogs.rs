@@ -171,7 +171,7 @@ pub(super) fn close_button(ui: &mut egui::Ui, theme: &Theme) -> bool {
 }
 
 /// Dialog title + optional secondary line.
-fn title(ui: &mut egui::Ui, theme: &Theme, title: &str, detail: Option<&str>) {
+pub(super) fn title(ui: &mut egui::Ui, theme: &Theme, title: &str, detail: Option<&str>) {
     ui.label(RichText::new(title).size(theme.font(TypeToken::Heading)).color(theme.tokens.fg));
     if let Some(d) = detail.filter(|d| !d.is_empty()) {
         ui.add_space(theme.space(SpaceToken::Xs));
@@ -188,7 +188,7 @@ fn error_line(ui: &mut egui::Ui, theme: &Theme, error: Option<&str>) {
 }
 
 /// Right-aligned button row; returns (cancel clicked, confirm clicked).
-fn buttons(ui: &mut egui::Ui, theme: &Theme, confirm: &str, style: ButtonStyle, focus_confirm: Option<bool>) -> (bool, bool) {
+pub(super) fn buttons(ui: &mut egui::Ui, theme: &Theme, confirm: &str, style: ButtonStyle, focus_confirm: Option<bool>) -> (bool, bool) {
     ui.add_space(theme.space(SpaceToken::Lg));
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         ui.spacing_mut().item_spacing.x = theme.space(SpaceToken::Lg);
@@ -312,7 +312,7 @@ impl Overlay for ContextMenuOverlay {
                 Action::Up | Action::Down | Action::PageUp | Action::PageDown | Action::Home | Action::End | Action::FilterInput(_) => {
                     OverlayOutcome::Keep
                 }
-                Action::Activate | Action::ActivateAlt | Action::Left | Action::Right => OverlayOutcome::Keep,
+                Action::Activate | Action::ActivateAlt | Action::Right => OverlayOutcome::Keep,
                 _ => OverlayOutcome::Ignored,
             },
         }

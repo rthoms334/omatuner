@@ -1716,7 +1716,7 @@ provider groups (renamed/reordered/hidden per overrides; locked show 󰌾 and re
   its playlist: `All playlists › Sports · TV 2`.
 
 Medium (≈ 790): the preview stays on the RIGHT; groups become a drawer (← / Backspace on the
-channel list, or click the breadcrumb):
+channel list — ← also while it filters, keeping the filter — or click the breadcrumb):
 ```
 ┌──┬────────────────────────────────┬─────────────────────────────┐
 │󰋜 │ UK News ▾  (filter…)           │ ┌─────────────────────────┐ │
@@ -1929,7 +1929,8 @@ The OSD has two layers (UX review B1):
 
 Side panels: channel list `c` (current collection with now), mini guide `g` (now/next for the
 group), history `h`/→ — each with key contexts `[List|ListFiltering, PlayerLive]`: ↑/↓ move the
-panel cursor (no zap), Enter tunes, ←/Esc close, letters filter. Mouse: a ✕ in the header, the
+panel cursor (no zap), Enter tunes, ←/Esc close (← also while the panel filters; Esc clears the
+filter first), letters filter. Mouse: a ✕ in the header, the
 wheel scrolls, hovering moves the cursor only with real pointer motion, one click tunes and
 keeps the panel open for the next channel. Stream info `I` (codec,
 resolution, fps, pixel format, HDR badge from gamma pq/hlg, audio codec/layout/rate, bitrates,
@@ -1976,8 +1977,14 @@ button.
 │        │   About & logs       │                                                             │
 └────────┴──────────────────────┴─────────────────────────────────────────────────────────────┘
 ```
-Panel idiom (h/j/k/l allowed, Enter toggles, ←/→ adjust; focused text fields push
-`TextInput`, which owns ←/→/Delete/Space). Reorderable rows (playlists, **EPG source priority**,
+Panel idiom (h/j/k/l allowed, Enter toggles; ← / h steps back to the page list from every row
+(§15.1 spatial panes; the source editor and the attach view stay open), → / l / Shift+→ / L
+increase or pick the next option, Shift+← / H decrease or pick the previous one; → / Enter / Tab
+in the page list return to the page; focused text fields push `TextInput`, which owns
+←/→/Delete/Space). A source editor with unsaved changes keeps its page: ↑/↓, Esc or a click in
+the page list show "Unsaved playlist changes: Enter on Save, or Esc to discard" and return the
+highlight to the editor instead of dropping them (Esc there then discards).
+Reorderable rows (playlists, **EPG source priority**,
 favourites lists) show a 󰇙 drag grip and move with Alt+↑/↓ or K/J. Every edit goes through
 `ctx.edit_config` / the store and applies live (`PlayerCommand::ApplyConfig`). Settings list:
 
@@ -2173,8 +2180,27 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
     contexts below it are never consulted (typing a space in Rename can't confirm the dialog).
   * Modal swallows printable text it doesn't bind; PlayerOsd, PopOut, NumericEntry and
     EpgMapping fall through to the context below.
-  * Key auto-repeat never produces `Parent`/`Back` (holding Backspace to clear a filter stops at
-    the empty filter).
+  * Key auto-repeat never produces `Parent`/`Back`, a filtered list's `Left` or `LastChannel`
+    (holding Backspace to clear a filter stops at the empty filter; holding ← steps out of a
+    filtered list once, and the ← that closed a player side panel never zaps).
+* **Spatial panes** (Omarchy style: arrows move the highlight between side-by-side panes): ← at
+  the left edge of the focused pane steps to the pane on its left wherever one exists; → (or
+  Enter) opens / moves right; Tab, Shift+Tab and Esc are unchanged; the mouse is unaffected.
+  * Lists: ← is `Parent` in `List`; in `ListFiltering` it is `Left`, which `ListState` turns
+    into `Parent` whatever the filter (the filter is kept for when the pane is focused again).
+    Backspace stays `Parent` only on an empty filter (one frame can carry "a" + Backspace).
+    Live: channels → groups (the drawer at Medium, the groups pane at Compact); EPG mapping:
+    candidates → channels; menus and pickers close; a player side panel closes.
+  * Grids: ←/→ move between posters; ← on the first column is `Parent` → the categories
+    (drawer at Medium) — also while filtering (the filter is kept) and on an empty grid.
+  * Settings: ← / h is the page list from every content row; values change with → / l and
+    Shift+←/→ / H / L (Interface is almost all value rows, so "← changes a value where there
+    is one" would almost never reach the page list). The page list has nothing on its left.
+  * ←/→ keep their own meaning where there is no pane to the left or they move within the
+    pane: the guide (← is the previous programme, into the past for catch-up; the channel
+    column never takes focus), Home rails, detail pages, the player (seek / zap / OSD), text
+    fields (cursor), onboarding and Edit information (values), Search (no cursor; sections
+    are Tab filters). The app sidebar is never reached with ← (Alt+digits switch screens).
   * `Global` contains only Ctrl/Alt/F-key chords so it never steals typing.
   * **No screen reads raw keys**: every key is in a table, so help and hints are complete.
 * **Esc ladder**: clear filter → close overlay/side panel → leave OSD controls focus → hide the
@@ -2270,6 +2296,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `/` | Search everything |
 | `?` | Keyboard help |
 | `Space` / `Insert` | Mark group (Ctrl+H then hides all marked) |
+| `Ctrl+O` | Play from another playlist (Also on)… |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
 | `Ctrl+H` | Hide / unhide |
@@ -2294,12 +2321,14 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `PgUp` / `PgDn` | Page up / down |
 | `Enter` | Play here / open (playing → fullscreen) |
 | `Shift+Enter` | Play fullscreen |
+| `←` | Back to the previous pane |
 | `Backspace` | Delete character |
 | `Ctrl+Backspace` | Delete word |
 | `Ctrl+U` / `Esc` | Clear filter |
 | `Tab` / `Shift+Tab` | Next / previous pane |
 | `Insert` | Mark group (Ctrl+H then hides all marked) |
 | `Ctrl+Shift+H` | Hide the groups with the words typed |
+| `Ctrl+O` | Play from another playlist (Also on)… |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
 | `Ctrl+H` | Hide / unhide |
@@ -2598,8 +2627,9 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | Keys | Action |
 |---|---|
 | `↑` / `k` / `↓` / `j` | Move |
-| `←` / `h` | Decrease / previous option |
-| `→` / `l` | Increase / next option |
+| `←` / `h` | Back to the page list |
+| `→` / `l` / `Shift+→` / `L` | Increase / next option |
+| `Shift+←` / `H` | Decrease / previous option |
 | `Alt+↑` / `K` / `Alt+↓` / `J` | Move up / down (reorder: EPG priority, playlists, lists) |
 | `Tab` / `Shift+Tab` | Next / previous section |
 | `Enter` / `Space` | Toggle / open |
@@ -3919,7 +3949,8 @@ FR→fr, DE/AT→de, ES/MX/AR…→es, IT→it, PT/BR→pt, NL→nl, TR→tr, PL
 ### 28.5 Settings ▸ Hidden
 * **Hidden by the category filter** — one section per filtered source: a row per hidden tag
   ("Arabic · 112 categories · 4 380 channels"), Enter = **show this country** (adds the tag
-  to `keep`; toast "Arabic shown"), → expands the tag's categories in place (← collapses);
+  to `keep`; toast "Arabic shown"), → expands the tag's categories in place (Shift+← collapses;
+  ← is the page list);
   Enter on a category row shows just that one (`show_group(…, exempt: true)`). Expanded tags
   show a down chevron and their category rows' detail starts with the tag ("Arabic · Live TV ·
   Enter shows just this one"). A last row "Choose countries…" opens the picker. A playlist
@@ -4115,7 +4146,7 @@ integrator runs the one full gate.
 * **Space binding in `List`**: every list now maps Space to ToggleMark; screens that don't mark
   must ignore it (they do: unhandled actions are no-ops) — keymap test pins it.
 
-## 29. Several playlists (P1: what am I browsing; P2: stacks in All)
+## 29. Several playlists (P1: what am I browsing; P2: stacks in All; P3: copies everywhere)
 
 With two providers ("TV" and "TV 2", often both Xtream) nothing said which playlist a list,
 card or page came from, two "Action" categories looked alike, and "is there more than one
@@ -4307,12 +4338,13 @@ v5 with it gets `0005_explicit` applied on open, `migrations::reconcile_renumber
   with `match_tags IS NULL` are parsed — the upsert clears it when the provider name or year
   changes — unless `meta` `vod_match:<id>` (rules version + prefix fingerprint) changed; only
   changed rows are written.
-* `title_link(source_id, kind, item_key, action ∈ {split, pin}, at, fp, orphaned_since)`: the
+* `title_link(source_id, kind, item_key, action ∈ {split, pin, join}, at, fp, orphaned_since,
+  join_group)` (`join` and `join_group` from migration 0007, P3 §29.16): the
   user's corrections, **user data** like a favourite (`store::user` HOLDERS): a refresh that
   re-keys the copy re-attaches them by fingerprint (else they are listed in Settings ▸
   Orphans), so a split never quietly comes undone. `titles::set_split` ("Not the same title",
   Undo = `false`), `titles::set_pin` (one pin per stack: pinning clears the other copies'),
-  `titles::links` (Settings ▸ Hidden ▸ "Titles you separated or pinned"). Write them with
+  `titles::links` (Settings ▸ Hidden ▸ "Titles you separated, combined or pinned"). Write them with
   `DataScope::Overrides` (the library rebuilds); backups carry them.
 
 **Build** (`stacks::build`, the last step of `library::load_with`, per kind): only copies in the
@@ -4468,7 +4500,7 @@ title and year (2021) · Not the same title? Shift+F10 on a copy".
 **Settings** (only with two or more playlists of movies or series). Interface ▸ *Several
 playlists*: "Same title in several playlists" (Combine / Show each copy) and "Which copy plays
 first" (Playlist order / Best quality — `interface.copy_order`; language, CAM, pin, progress
-and trouble still come first). Hidden ▸ "Titles you separated or pinned" lists `titles::links`
+and trouble still come first). Hidden ▸ "Titles you separated, combined or pinned" lists `titles::links`
 (split: "TV 2 · shown on its own · Enter combines it again"; pin, with the pin glyph: "TV ·
 always plays first · Enter undoes"); Enter or the row's menu undoes. It shows for one
 playlist too while it has rows.
@@ -4548,6 +4580,136 @@ runs the write on the store writer and, once it succeeded, stashes the rows in t
 `Action::Undo(n)`; the app writes action `n`'s rows back with the right `DataScope` — whatever
 screen shows and whatever was done since. Inside one playlist the screens keep `kit`'s one-copy
 actions.
+
+### 29.16 P3: copies everywhere else (`store::copies`, `ui::copies`, `overlays::{same_title,delete_playlist}`)
+
+P3 finishes recommendation §7's last phase. (Home and Search combined, and the "Recently
+updated series" rename, shipped with P2.)
+
+**Detail pages act on every copy.** A movie or series page whose title has several copies
+(`screens::copies::Copies::combined`: a stack while copies combine, and the page wasn't opened
+for one copy on purpose — a fanned-out copy or one playlist's list, `ui::stacks::open_copy`)
+takes the stack card's rules (§29.14, §29.15): ★ shows when any copy is a favourite; adding
+puts **the copy Play would use** (the one picked on the page, else the first in play order) in
+Favourites, removing takes every copy out; ✓ (movies) shows when any copy is watched, marking
+marks the copy Play would use, unmarking forgets every copy's progress; Ctrl+L / Ctrl+H / F2
+lock, hide or rename every copy (`ui::copies::{toggle_lock, hide, rename_dialog}`, shared with
+the grid, Home and Search). Each write has its Undo toast, naming the playlists when it covers
+every copy ("Removed from Favourites in TV and TV 2", "Marked unwatched in …", "Locked Dune in
+…"; a Continue-watching card's Remove keeps "Removed from Continue watching"); the menu says
+"… every copy". A page
+opened for one copy on purpose keeps acting on that copy, like the card that led there.
+
+**Series: episodes matched across copies.** A combined series page reads, with its own
+episodes, the progress of the other copies' episodes by (season, episode)
+(`copies::episode_progress`: a watched mark wins, else the latest progress) and shows it merged:
+an episode watched in TV 2's copy shows ✓ here, "Mark season watched" says *Season watched*.
+The page opens at the next episode of **the copy with the newest progress**
+(`copies::next_episode`, the same rule Play and Shift+Enter on a card use — verified), as this
+copy's episode. ✓ on an episode and "Mark season watched / unwatched" write the same episodes
+of **every copy** in one write with Undo (`copies::mark_episodes`; a copy without that episode
+is skipped; "Marked S01 watched in TV and TV 2"). Xtream series load episodes lazily: when
+another copy's aren't loaded (`copies::unloaded_series`) the page writes this copy and the
+loaded ones **at once** (nothing is lost if the user leaves or quits) and submits
+`LoadSeriesDetails` for the others (`ui::copies::EpisodeFetch`: polls the job list and the
+database at most four times a second), shows "Loading the other copy's episodes to mark them
+too…" with a spinner, then writes them with a second Undo toast. Each waiting mark carries the
+copies it was made for (a list, in order: two marks during one load both land; leaving for
+another series never redirects them); a copy that couldn't load is named in a warning ("TV 2
+couldn't load its episodes — marked in the other copies only"). Play from a combined page
+resumes from **the newest progress of that episode in any copy**: the button says "Resume
+S01E04 12:00" and `ui::copies::play_episode` prompts at that position and starts this copy there
+(`CopyPlay::start_at`), as movies do.
+
+**"Same title as…".** The user combines a title with another the matcher kept apart (another
+name, a missing year, two TMDB ids): a card's menu (Movies / Series grid) or a detail page's ⋯
+menu (while copies combine) opens `overlays::same_title` — type to find the other title (one
+row per title: a stack's top, never the title's own copies; ≤ 200 matches, name · year ·
+playlists · copies), Enter or a click combines them (`copies::join` → `titles::join`, Undo toast
+"Dune and Die Frau die singt are one title now"). Stored as `title_link` rows with action
+`join` for both copies and a shared `join_group` (migration `0007_title_join` rebuilds the table
+for the new CHECK in its Rust step, which copies `join_group` too on a re-run); joining a copy
+already joined merges the groups; a group left with one copy (its partner's playlist deleted,
+a backup merge meeting joins already here) is dropped (`titles::prune_joins`). The menu item
+shows with two playlists of that kind or more; the toast adds "in All playlists" when one
+playlist is in scope (nothing changes there). The build
+(`stacks::build` → `apply_joins`) stacks a group's copies **with the stacks they are in**, after
+clustering and on top of splits (a split copy can still be joined elsewhere), only in All; the
+copy order inside is the usual one. Like splits and pins the rows carry fingerprints, so a
+refresh that re-keys a copy re-attaches them; backups carry the group (renumbered after the
+groups already there on a merge restore). The page says "Combined by you (Same title as…)";
+Settings ▸ Hidden ▸ **"Titles you separated, combined or pinned"** lists each joined copy
+("TV · combined with Die Frau die singt (TV 2) · Enter separates it"; an explicit partner isn't
+named while explicit content is hidden); Enter takes that copy out
+(`titles::unjoin`; a group left with one copy goes too).
+
+**Deleting a playlist.** Settings ▸ Playlists ▸ Delete playlist… opens
+`overlays::delete_playlist` instead of a plain confirm. It reads `copies::move_plan(source)`
+(off the UI thread) and, when the playlist has favourites or progress, **offers — unticked —**
+"Move favourites, progress and watched marks to the same titles in other playlists", listing
+what would move ("Dune (2021) → TV 2 · ★ · 41:20"; "… → TV 2: Dune: Part One (2021)" when the
+copy reads differently) and what can't ("Gold (2022) — no copy in another playlist", "3 channel
+favourites — channels aren't matched across playlists"); titles concealed while explicit content
+is hidden move like the others but are only counted ("And 2 hidden titles"). The subtitle says
+"This can't be undone."; a plan that can't be read says so ("Delete removes everything"). The
+focus (box → Cancel → Delete) stops at the ends — ↑ never wraps onto Delete. Matching: the
+other copy with the **same TMDB id**, or the **same match key and known year** (`match_hash`,
+never against a different TMDB id or another explicit origin, `match_origin`), or **joined by
+the user**; never a copy either side split off; the first in the playlist order (enabled
+first). The other playlists' titles are read once per kind (one scan, indexed in memory) and a
+series' copy once for all its episodes, so a big catalogue doesn't make Delete wait. Episode progress moves to the same season and episode of
+the series' other copy **only once that copy's episodes are loaded**: ticking the box starts
+`EpisodeFetch` for them ("Loading the other copies' episodes (1 of 2 series)…"; Delete waits),
+then the plan is read again; episodes whose copy couldn't load are listed as not moving. Delete
+runs one writer job: `copies::move_titles` (a favourite joins the same list at the same place
+unless the copy is already there; progress — read when Delete runs, so playback saved since
+the dialog opened counts — replaces the copy's own only when newer) then
+`sources::delete_source`; the toast says "Deleted TV — moved 3 favourites and 2 progress marks
+to the other playlists; 2 couldn't move". **No Undo**: the playlist and its catalogue are gone
+(feasible only for the moved rows, which are ordinary data of the other copies). The old
+confirm's "kept as orphans" was wrong — the rows cascade with the playlist — and is gone.
+
+**Live TV: "Also on ● TV 2 (FHD)".** The preview pane lists the cursor channel in other
+playlists (`live::also_on`): the same `family` (normalised cleaned name, quality words dropped),
+another playlist, not hidden (`LiveIndex::hidden`), not DRM-only; explicit channels hidden by
+parental control aren't in the snapshot; a channel whose **tvg-id differs** from the cursor
+channel's (both known; one indexed read in the frame budget for the chips — Ctrl+O, a key press,
+reads it at once) is another channel. Best quality
+first within a playlist, playlists in their order, ≤ 12. Each is a chip in its playlist's colour
+— `TV 2 (FHD)`, plus the alternative's name when it differs, the lock when locked, ▶ on the one
+playing — that plays
+it here on a click (`widgets::badge::source_chip_button`); **Ctrl+O** in the channel list
+(bound in `[List]` / `[ListFiltering]`, "Play from another playlist (Also on)…") opens them as
+a menu "Channel 0 is also on". A locked alternative asks for the PIN (`Unlocked(PlayFrom)`).
+Never merged, never switched to by itself; the cursor stays where it was. The hint line adds
+"Ctrl+O also on" while the cursor channel has alternatives.
+
+**Chores.** `store::vod::recently_added` (dead since Home moved to the library) is removed.
+Ctrl+O during normal playback (the player's "Play from" menu) has its UI test. The AR-DE ranking
+note (§29.11's language ranks) stays as it is.
+
+**Tests** (real behaviour): the movie page's combined ★ / ✓ / rename / lock / hide with Undo and
+a copy opened on purpose (`movie_detail`); series marks across copies, next episode from the
+newest-progress copy, a season marked in every copy with Undo, a lazily loaded copy fetched
+first and a copy that can't load named (`series_detail`); joins in the build — whole stacks
+merge, out of All ignored, a split copy joined elsewhere (`store::stacks`); a join stacking two
+TMDB ids, surviving a refresh and a re-keyed copy, merging groups, separating
+(`store_catalogue`); the 0007 migration (rows and fingerprints kept, joins accepted, re-run,
+cascade); the picker (own copies never offered, Enter joins, the library stacks, Undo); the
+Hidden list's join rows and Enter; backups carrying a join; the move plan (TMDB / key + year /
+joined matches, a different TMDB id and a split copy refused, channels and missing copies
+listed, episodes waiting for the other copy's episodes) and the move itself (list places,
+newer progress kept) (`store_catalogue`); the delete dialog (unticked by default, listed, moved
+when ticked, nothing moved unticked, episodes loaded first) (`overlays::delete_playlist`); Live's
+"Also on" (same name, another tvg-id refused, hidden refused, click plays, Ctrl+O menu, PIN for
+a locked one, explicit refused while hidden, Ctrl+O with the frame budget spent) (`live`);
+Ctrl+O during playback (`player`); keymap (Ctrl+O in lists). Review fixes add: marks made
+during a load land in order and never on another series, this copy written at once
+(`series_detail`); resume from the other copy's position (`series_detail`); the dialog's focus
+never wraps onto Delete and explicit titles counted, not named (`overlays::delete_playlist`);
+an explicit join partner unnamed in Settings ▸ Hidden (`settings`); origins refused, progress
+read at Delete, a join of one dropped (`store_catalogue`); 0007's re-run keeps `join_group`
+(`migrations`).
 
 ---
 
@@ -4822,7 +4984,7 @@ File ownership is disjoint; a cross-track edit needs the owner's agreement and g
 merge note. Lean: clippy + the tests you touched; the integrator runs the full gate.
 
 **bridge track** — owns `src/agent/{mcp,client,tools}.rs`, `src/main.rs` (the mcp branch only),
-`tests/agent_mcp.rs` (new), README "Use Tuner from Claude", MANUAL_CHECKLIST §19.
+`tests/agent_mcp.rs` (new), README "Use Tuner from Claude", MANUAL_CHECKLIST §21.
 1. `mcp::serve`: the JSON-RPC loop of §30.2 (version negotiation, errors, 1 MiB cap, ordered
    handling); `mcp::main`: stderr logging, `Client` with `ExeLauncher`, stdin/stdout.
 2. `client`: connect / send / read (caps, timeouts), launch-if-needed, loading retries,
