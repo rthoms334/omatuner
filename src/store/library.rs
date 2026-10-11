@@ -452,17 +452,19 @@ fn load_live(conn: &Connection, groups: Vec<Group>) -> Result<LiveIndex> {
         "SELECT c.id, c.source_id, c.key, COALESCE(o.rename, c.clean_name), c.number, c.logo, ce.epg_channel_id, c.tvg_shift_min,
                 c.catchup IS NOT NULL, COALESCE(json_extract(c.catchup, '$.days'), 0), c.radio, c.unsupported IS NOT NULL,
                 c.provider_order, o.user_order, c.added_at, COALESCE(o.hidden, 0), COALESCE(o.locked, 0),
-                c.quality, v.width, v.height, c.norm_name
+                c.quality, v.width, v.height, COALESCE(c.family, c.norm_name)
          FROM channel c JOIN source s ON s.id = c.source_id AND s.enabled = 1
          LEFT JOIN item_override o ON o.source_id = c.source_id AND o.kind = 'channel' AND o.item_key = c.key
          LEFT JOIN channel_epg ce ON ce.channel_id = c.id
-         LEFT JOIN channel_video v ON v.source_id = c.source_id AND v.item_key = c.key
+         LEFT JOIN channel_video v ON v.source_id = c.source_id AND v.item_key = c.key AND v.name = c.name
+                   AND (v.url_key IS NULL OR c.url_key IS NULL OR v.url_key = c.url_key)
          ORDER BY s.sort_index, s.id, (o.user_order IS NULL), o.user_order, c.provider_order, c.id",
     )?;
     let mut channels = Vec::new();
     let mut hidden = HashSet::new();
     let mut members: HashMap<GroupId, Vec<ChannelId>> = HashMap::new();
     let rows = stmt.query_map([], |r| {
+        let radio: bool = r.get(10)?;
         Ok((
             ChannelSummary {
                 id: r.get(0)?,
@@ -476,18 +478,19 @@ fn load_live(conn: &Connection, groups: Vec<Group>) -> Result<LiveIndex> {
                 tvg_shift_min: r.get(7)?,
                 has_catchup: r.get(8)?,
                 catchup_days: u32_of(r.get(9)?),
-                radio: r.get(10)?,
+                radio,
                 locked: r.get(16)?,
                 unsupported: r.get(11)?,
                 provider_order: r.get(12)?,
                 user_order: r.get(13)?,
                 added_at: r.get(14)?,
-                // measured beats the name
+                // measured beats the name; radio has none (a cover picture is no video)
                 quality: match (r.get::<_, Option<i64>>(18)?, r.get::<_, Option<i64>>(19)?) {
                     (Some(w), Some(h)) => Quality::of_video(w, h),
                     _ => None,
                 }
-                .or(r.get::<_, Option<i64>>(17)?.and_then(Quality::from_code)),
+                .or(r.get::<_, Option<i64>>(17)?.and_then(Quality::from_code))
+                .filter(|_| !radio),
                 family: text_hash(r.get_ref(20)?),
             },
             r.get::<_, bool>(15)?,

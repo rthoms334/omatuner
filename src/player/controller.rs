@@ -513,7 +513,12 @@ impl Controller {
                 self.feed(Input::StartFile { entry: entry_id }, now)
             }
             MpvEvent::FileLoaded => self.feed(Input::FileLoaded, now),
-            MpvEvent::PlaybackRestart => self.feed(Input::PlaybackRestart, now),
+            MpvEvent::PlaybackRestart => {
+                // the new stream's size before the Playing publish records it (`record_video`),
+                // whatever order mpv delivers the `video-params` change in
+                self.read_video_size();
+                self.feed(Input::PlaybackRestart, now)
+            }
             MpvEvent::EndFile { reason, error, entry_id, inserted } => {
                 let changed = self.flush_deferred_end();
                 if reason == EndReason::Error && matches!(self.machine.state(), PlayerState::Loading { .. }) {
@@ -605,11 +610,7 @@ impl Controller {
             }
             PropId::SubDelay => self.snap.sub_delay = f(&v).unwrap_or(0.0),
             PropId::SubScale => self.snap.sub_scale = f(&v).unwrap_or(1.0),
-            PropId::VideoParamsW | PropId::VideoParamsH => {
-                let w = self.mpv.get_property::<i64>("video-params/w").ok();
-                let h = self.mpv.get_property::<i64>("video-params/h").ok();
-                self.snap.video_size = w.zip(h);
-            }
+            PropId::VideoParamsW | PropId::VideoParamsH => self.read_video_size(),
             PropId::HwdecCurrent => {
                 self.snap.hwdec = match v {
                     PropValue::Str(s) if !s.is_empty() => Some(s),
@@ -659,6 +660,15 @@ impl Controller {
             self.snap.last_error = Some(PlayerError { kind: k, message: super::state::describe(k).into() });
         }
         self.deps.store.record_failure(item, kind);
+    }
+
+    fn read_video_size(&mut self) {
+        let w = self.mpv.get_property::<i64>("video-params/w").ok();
+        let h = self.mpv.get_property::<i64>("video-params/h").ok();
+        if self.snap.video_size != w.zip(h) {
+            self.snap.video_size = w.zip(h);
+            self.dirty = true;
+        }
     }
 
     /// A live channel that is Playing records the size it decodes at, once per channel and

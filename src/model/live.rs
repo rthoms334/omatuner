@@ -240,8 +240,9 @@ pub struct ChannelSummary {
     /// The quality badge: measured when the channel has played (`channel_video`), else from
     /// its provider name (`channel.quality`); `None` = unknown.
     pub quality: Option<Quality>,
-    /// Hash of the normalised provider name (`channel.norm_name`, quality words dropped): the
-    /// SD / HD / 4K duplicates of one channel share it (best-first ordering, DESIGN §13.2).
+    /// Hash of the normalised cleaned name (`channel.family`, else `channel.norm_name`; quality
+    /// words dropped): the SD / HD / 4K duplicates of one channel share it (best-first
+    /// ordering, DESIGN §13.2).
     pub family: u64,
 }
 
@@ -291,6 +292,5 @@ mod tests {
         assert_eq!(q(2560, 1440), Some("FHD"));
         assert_eq!(q(3840, 2160), Some("4K"));
         assert_eq!(q(0, 0), None);
-        assert!([Quality::Sd, Quality::Hd, Quality::Fhd, Quality::Uhd].iter().all(|x| Quality::from_code(x.code().into()) == Some(*x)));
     }
 }

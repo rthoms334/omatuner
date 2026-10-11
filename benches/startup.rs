@@ -81,9 +81,9 @@ fn seed_profile(paths: &AppPaths) {
             }
             // quality badges: a word in 4 names out of 5, and one channel in 5 measured
             c.execute_batch(
-                "UPDATE channel SET quality = NULLIF(id % 5, 0);
-                 INSERT INTO channel_video(source_id, item_key, width, height, at)
-                   SELECT source_id, key, 1920, 1080, 0 FROM channel WHERE id % 5 = 1;",
+                "UPDATE channel SET quality = NULLIF(id % 5, 0), family = CASE WHEN id % 5 <> 0 THEN norm_name END;
+                 INSERT INTO channel_video(source_id, item_key, name, url_key, width, height, at)
+                   SELECT source_id, key, name, url_key, 1920, 1080, 0 FROM channel WHERE id % 5 = 1;",
             )?;
             c.execute_batch("ANALYZE")?;
             Ok(())

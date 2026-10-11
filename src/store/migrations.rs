@@ -47,16 +47,23 @@ fn backfill(conn: &Connection, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// `channel.quality` of the channels imported before 0002, from their stored provider name
-/// (the same parse the import does; ~0.1 s per 100k channels, once).
+/// `channel.quality` / `channel.family` (added here when missing, so the migration is safe to
+/// re-run), filled for the channels imported before 0002 from their stored provider name with
+/// the import's parse (`import_source::name_quality`; ~0.1 s per 100k channels, once).
 fn backfill_channel_quality(conn: &Connection) -> Result<()> {
-    let mut read = conn.prepare("SELECT id, name FROM channel")?;
-    let mut write = conn.prepare("UPDATE channel SET quality = ?2 WHERE id = ?1")?;
+    for (col, ty) in [("quality", "INTEGER"), ("family", "TEXT")] {
+        let has: bool = conn.query_row("SELECT count(*) > 0 FROM pragma_table_info('channel') WHERE name = ?1", [col], |r| r.get(0))?;
+        if !has {
+            conn.execute_batch(&format!("ALTER TABLE channel ADD COLUMN {col} {ty}"))?;
+        }
+    }
+    let mut read = conn.prepare("SELECT id, name FROM channel WHERE quality IS NULL")?;
+    let mut write = conn.prepare("UPDATE channel SET quality = ?2, family = ?3 WHERE id = ?1")?;
     let mut rows = read.query([])?;
     while let Some(r) = rows.next()? {
         let name: String = r.get(1)?;
-        if let Some(q) = crate::sources::smart_names::clean_channel_name(&name).quality {
-            write.execute(params![r.get::<_, i64>(0)?, q.code()])?;
+        if let Some(q) = crate::store::import::NameQuality::of(&crate::sources::smart_names::clean_channel_name(&name)) {
+            write.execute(params![r.get::<_, i64>(0)?, q.class.code(), q.family])?;
         }
     }
     Ok(())
@@ -135,7 +142,8 @@ mod tests {
         .unwrap();
     }
 
-    /// A database from before 0002 gets the quality word of every stored channel name.
+    /// A database from before 0002 gets the quality word (and family) of every stored channel
+    /// name; the migration is safe to run again.
     #[test]
     fn quality_migration_backfills_from_the_provider_name() {
         let mut c = Connection::open_in_memory().unwrap();
@@ -154,10 +162,19 @@ mod tests {
         )
         .unwrap();
         migrate(&mut c).unwrap();
-        let q = |k: &str| c.query_row("SELECT quality FROM channel WHERE key = ?1", [k], |r| r.get::<_, Option<i64>>(0)).unwrap();
-        assert_eq!(q("a"), Some(3));
-        assert_eq!(q("b"), Some(2));
-        assert_eq!(q("c"), None);
+        let q = |c: &Connection, k: &str| {
+            c.query_row("SELECT quality, family FROM channel WHERE key = ?1", [k], |r| {
+                Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<String>>(1)?))
+            })
+            .unwrap()
+        };
+        assert_eq!(q(&c, "a"), (Some(3), Some("bbcone".into())));
+        assert_eq!(q(&c, "b"), (Some(2), Some("bbcone".into())));
+        assert_eq!(q(&c, "c"), (None, None));
+        // another branch's 0002 at the same `user_version`, renumbered later: this one re-runs
+        c.pragma_update(None, "user_version", 1).unwrap();
+        migrate(&mut c).unwrap();
+        assert_eq!(q(&c, "a"), (Some(3), Some("bbcone".into())));
     }
 
     #[test]

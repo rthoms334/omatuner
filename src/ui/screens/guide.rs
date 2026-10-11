@@ -461,7 +461,7 @@ impl GuideScreen {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(c.name.as_ref()).size(theme.font(TypeToken::Title)).color(t.fg));
                 if let Some(q) = quality {
-                    crate::ui::widgets::badge::badge(ui, theme, q.label(), t.text_secondary);
+                    crate::ui::widgets::badge::quality_badge(ui, theme, q, t.text_secondary);
                 }
             });
         }

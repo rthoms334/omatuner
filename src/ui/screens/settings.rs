@@ -248,7 +248,7 @@ static IFACE_T: [CfgToggle; 13] = [
     toggle_row!("Media keys & playerctl (MPRIS)", integration.mpris),
     toggle_row!("Smart names (default for new playlists)", general.smart_names),
     toggle_row!("Debug logging", general.debug_log),
-    toggle_row!("Show quality badges", interface.quality_badges),
+    toggle_row!("Quality badges", interface.quality_badges),
 ];
 static IFACE_N: [CfgNumber; 4] = [
     number_row!("Preview delay", "ms", 300.0, 5000.0, 100.0, u32, interface.preview_delay_ms),

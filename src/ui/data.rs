@@ -178,15 +178,22 @@ impl MeasuredQuality {
         }
     }
 
-    /// Measured this session, if this channel (same identity) played.
+    /// Measured this session, if this channel (same identity) played; never for radio (a
+    /// cover picture is no video).
     pub fn get(&self, ch: &ChannelSummary) -> Option<Quality> {
-        self.by_channel.get(&ch.id).filter(|(s, k, _)| *s == ch.source_id && *k == ch.key).map(|e| e.2)
+        self.by_channel.get(&ch.id).filter(|(s, k, _)| !ch.radio && *s == ch.source_id && *k == ch.key).map(|e| e.2)
+    }
+
+    /// A new library: its own values include everything measured so far, and a refresh may
+    /// have moved a key between the quality duplicates of a channel (`store::import`).
+    pub fn clear(&mut self) {
+        self.by_channel.clear();
     }
 }
 
 /// What a channel's quality badge says, copied out of the `UiCtx` for painter-level code that
-/// can't hold it (the guide grid): `None` inside while Settings ▸ Interface ▸ Show quality
-/// badges is off.
+/// can't hold it (the guide grid): `None` inside while Settings ▸ Interface ▸ Quality badges
+/// is off.
 #[derive(Debug, Clone, Copy)]
 pub struct QualityBadges<'a>(pub Option<&'a MeasuredQuality>);
 

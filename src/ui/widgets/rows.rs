@@ -258,7 +258,7 @@ pub fn channel_row(
     if let Some(sg) = &suffix {
         name_right -= sg.size().x + theme.space(SpaceToken::Md);
     }
-    // name [HD] ⚠: the badge gives way before the name elides
+    // name [HD] ⚠: the name elides before the badge goes
     let badge = opts.quality.map(|q| InlineBadge::quality(&p, theme, q, if dim { t.text_disabled } else { t.text_secondary }, 1.0));
     let named = name_with_quality(&p, theme, egui::pos2(left, line_y), &ch.name, line_font, color, badge, (name_right - left).max(0.0));
     if let Some(sg) = suffix {

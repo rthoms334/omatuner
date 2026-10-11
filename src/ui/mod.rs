@@ -309,7 +309,7 @@ impl<'a> UiCtx<'a> {
         self.services.player.handle().send(cmd);
     }
     /// The quality badge of a channel (measured this session, else the library's: measured
-    /// earlier, else from the name), or `None` while Settings ▸ Interface ▸ Show quality badges
+    /// earlier, else from the name), or `None` while Settings ▸ Interface ▸ Quality badges
     /// is off.
     pub fn quality(&self, ch: &ChannelSummary) -> Option<Quality> {
         self.quality_badges().of(ch)

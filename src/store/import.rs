@@ -74,7 +74,23 @@ pub struct ImportChannel {
     /// Group keys, primary first (must have been passed to `upsert_groups`).
     pub groups: Vec<GroupKey>,
     /// The quality word of the provider name (`smart_names`), whether or not cleanup is on.
-    pub quality: Option<Quality>,
+    pub quality: Option<NameQuality>,
+}
+
+/// The quality word of a provider name (`channel.quality`) and the family of duplicates the
+/// channel belongs to (`channel.family`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NameQuality {
+    pub class: Quality,
+    /// `normalize_name` of the smart-cleaned name: "BBC One SD" and "UK: BBC One 2160p" share
+    /// it (identity's `norm_name` keeps the quality words it doesn't know).
+    pub family: String,
+}
+
+impl NameQuality {
+    pub fn of(cleaned: &crate::sources::smart_names::CleanName) -> Option<Self> {
+        cleaned.quality.map(|class| Self { class, family: crate::sources::identity::normalize_name(&cleaned.name) })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -387,15 +403,16 @@ pub fn write_channels(conn: &mut Connection, imp: &CatalogueImport, batch: &[Imp
             .prepare_cached(
                 "INSERT INTO channel(source_id, key, provider_id, name, clean_name, norm_name, number, logo, tvg_id, tvg_name,
                                      tvg_shift_min, stream, url_key, headers, catchup, radio, unsupported, provider_order,
-                                     added_at, seen_gen, quality)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, COALESCE(?19, ?20), ?21, ?22)
+                                     added_at, seen_gen, quality, family)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, COALESCE(?19, ?20), ?21, ?22, ?23)
                  ON CONFLICT(source_id, key) DO UPDATE SET
                    provider_id = excluded.provider_id, name = excluded.name, clean_name = excluded.clean_name,
                    norm_name = excluded.norm_name, number = excluded.number, logo = excluded.logo, tvg_id = excluded.tvg_id,
                    tvg_name = excluded.tvg_name, tvg_shift_min = excluded.tvg_shift_min, stream = excluded.stream,
                    url_key = excluded.url_key, headers = excluded.headers, catchup = excluded.catchup, radio = excluded.radio,
                    unsupported = excluded.unsupported, provider_order = excluded.provider_order,
-                   added_at = COALESCE(?19, channel.added_at), seen_gen = excluded.seen_gen, quality = excluded.quality
+                   added_at = COALESCE(?19, channel.added_at), seen_gen = excluded.seen_gen, quality = excluded.quality,
+                   family = excluded.family
                  RETURNING id",
             )?
             .query_row(
@@ -421,7 +438,8 @@ pub fn write_channels(conn: &mut Connection, imp: &CatalogueImport, batch: &[Imp
                     ch.added_at,
                     imp.started_at,
                     imp.generation,
-                    ch.quality.map(Quality::code),
+                    ch.quality.as_ref().map(|q| q.class.code()),
+                    ch.quality.as_ref().map(|q| q.family.as_str()),
                 ],
                 |r| r.get(0),
             )?;
@@ -1067,29 +1085,59 @@ fn reattach_kind(
     Ok(newly)
 }
 
-/// Measured picture sizes (`channel_video`) of channel keys that are gone: re-keyed to the
-/// channel their fingerprint finds with the reattach steps (§8.3), else dropped — a
-/// measurement is not user data, it is never listed as an orphan. A channel that already has
-/// its own measurement keeps it.
+/// Measured picture sizes (`channel_video`) whose key no longer holds the channel they were
+/// measured on — the key is gone, or now has another provider name (the quality duplicates of
+/// an M3U channel share a base key and are numbered by playlist position, so a reordered or
+/// grown playlist moves keys between them) or another stream: moved to the one channel that
+/// has their name (and, among same-named channels, their `url_key`), else dropped. A
+/// measurement is not user data: never listed as an orphan, never moved onto a channel that
+/// has its own.
 fn carry_video_sizes(conn: &Connection, source: SourceId) -> Result<()> {
-    const GONE: &str = "source_id = ?1 AND NOT EXISTS (SELECT 1 FROM channel c WHERE c.source_id = ?1 AND c.key = channel_video.item_key)";
-    let gone = conn
-        .prepare_cached(&format!("SELECT item_key, fp FROM channel_video WHERE {GONE}"))?
-        .query_map([source], |r| Ok((r.get::<_, String>(0)?, fp_from_json(&r.get::<_, String>(1)?))))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    if gone.is_empty() {
+    type Stale = (String, String, Option<String>, i64, i64, i64);
+    let stale: Vec<Stale> = conn
+        .prepare_cached(
+            "SELECT v.item_key, v.name, v.url_key, v.width, v.height, v.at FROM channel_video v
+             WHERE v.source_id = ?1 AND NOT EXISTS (SELECT 1 FROM channel c WHERE c.source_id = ?1 AND c.key = v.item_key
+                   AND c.name = v.name AND (v.url_key IS NULL OR c.url_key IS NULL OR c.url_key = v.url_key))",
+        )?
+        .query_map([source], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    if stale.is_empty() {
         return Ok(());
     }
-    let candidates = Candidates::load(conn, &crate::store::user::facts_sql(ItemKind::Channel, false), [source])?;
-    for (key, fp) in &gone {
-        if let Some((to, _)) = candidates.find(fp) {
-            conn.execute(
-                "UPDATE OR IGNORE channel_video SET item_key = ?3 WHERE source_id = ?1 AND item_key = ?2",
-                params![source, key, to.as_str()],
-            )?;
+    // all out first, then back in: two duplicates that swapped keys both find their channel
+    let mut out = conn.prepare_cached("DELETE FROM channel_video WHERE source_id = ?1 AND item_key = ?2")?;
+    for (key, ..) in &stale {
+        out.execute(params![source, key])?;
+    }
+    // the source's channels by provider name (one pass; only the names looked for are kept)
+    let wanted: HashSet<&str> = stale.iter().map(|s| s.1.as_str()).collect();
+    let mut named: HashMap<String, Vec<(String, Option<String>)>> = HashMap::new();
+    let mut rows = conn.prepare_cached("SELECT name, key, url_key FROM channel WHERE source_id = ?1")?;
+    let mut rows = rows.query([source])?;
+    while let Some(r) = rows.next()? {
+        if let rusqlite::types::ValueRef::Text(n) = r.get_ref(0)?
+            && let Ok(n) = std::str::from_utf8(n)
+            && wanted.contains(n)
+        {
+            named.entry(n.to_owned()).or_default().push((r.get(1)?, r.get(2)?));
         }
     }
-    conn.execute(&format!("DELETE FROM channel_video WHERE {GONE}"), [source])?;
+    let mut put = conn.prepare_cached(
+        "INSERT OR IGNORE INTO channel_video(source_id, item_key, name, url_key, width, height, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?;
+    for (_, name, url_key, w, h, at) in &stale {
+        let to = match named.get(name).map(Vec::as_slice).unwrap_or_default() {
+            [one] => Some(one),
+            many => {
+                let mut by_url = many.iter().filter(|(_, u)| url_key.is_some() && u == url_key);
+                by_url.next().filter(|_| by_url.next().is_none())
+            }
+        };
+        if let Some((key, url)) = to {
+            put.execute(params![source, key, name, url, w, h, at])?;
+        }
+    }
     Ok(())
 }
 

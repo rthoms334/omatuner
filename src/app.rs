@@ -337,6 +337,8 @@ impl TunerApp {
         match outcome {
             Ok(JobOutcome::Library(lib)) => {
                 self.lib = lib.clone();
+                // the playing channel is noted again next frame
+                self.measured.clear();
                 // A favourite toggled while this library was being built is newer than
                 // `lib.favs`: re-read the set (the same ≤ 5 ms query as `DataScope::Favourites`).
                 self.favs = crate::store::library::load_favs(&self.db).unwrap_or_else(|e| {

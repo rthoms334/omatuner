@@ -803,34 +803,53 @@ CREATE TABLE stream_failure (
 ### 6.2.1 `0002_quality.sql` (quality badges, §13.0)
 
 ```sql
+-- added by the migration's Rust step only when missing (the migration is safe to re-run)
 ALTER TABLE channel ADD COLUMN quality INTEGER;   -- name's quality word: 1 SD 2 HD 3 FHD 4 4K
-CREATE TABLE channel_video (                      -- what mpv decoded when the channel last played
+ALTER TABLE channel ADD COLUMN family  TEXT;      -- with a quality word: normalize_name(cleaned name)
+CREATE TABLE IF NOT EXISTS channel_video (        -- what mpv decoded when the channel last played
   source_id INTEGER NOT NULL REFERENCES source(id) ON DELETE CASCADE,
   item_key  TEXT    NOT NULL,
+  name      TEXT    NOT NULL,                     -- channel.name (raw provider name) when measured
+  url_key   TEXT,                                 -- channel.url_key when measured
   width     INTEGER NOT NULL,
   height    INTEGER NOT NULL,
   at        INTEGER NOT NULL,
-  fp        TEXT    NOT NULL DEFAULT '{}',        -- channel Fingerprint at measurement time
   PRIMARY KEY (source_id, item_key)
 ) WITHOUT ROWID;
 ```
-* `channel.quality` is written by every import (`ImportChannel.quality` = the `smart_names`
-  parse of the provider name, whether or not smart names are on). Databases from before 0002
-  get it from the stored names by the migration's Rust backfill (same transaction, once).
+* `channel.quality` / `channel.family` are written by every import (`ImportChannel.quality` =
+  `NameQuality::of` the `smart_names` parse of the provider name, whether or not smart names
+  are on). `family` is `normalize_name` of the smart-cleaned name, so "BBC One SD" and
+  "UK: BBC One 2160p" share it where identity's `norm_name` (whose quality-tag list keys depend
+  on, so it stays) does not; NULL (no quality word) reads as `norm_name`. Databases from
+  before 0002 get both from the stored names by the migration's Rust backfill (same
+  transaction, once).
 * `channel_video` is written by the player controller through the writer
   (`PlayerStore::record_video` → `store::live::record_video`) once per channel and size, only
   while a **live** channel is `Playing` (a zap or a reconnect can still show the previous
-  picture; catch-up archives may be encoded differently). No `DataScope` is sent: the UI keeps
-  this session's measurements itself (`ui::data::MeasuredQuality`) until the next library build.
-* Keyed by identity like `stream_failure`, so refreshes keep it. A row whose key is gone after
-  a completed channel import is re-keyed with the §8.3 steps from its `fp` (a channel that has
-  its own measurement keeps it), else dropped — never an orphan.
-* `library::load` reads both (`LEFT JOIN channel_video`); `ChannelSummary.quality` = the
-  measured class if any, else the name's. Class of a decoded `w×h` (`Quality::of_video`): the
+  picture, so the controller re-reads `video-params` at PLAYBACK_RESTART rather than trust
+  mpv's event order; catch-up archives may be encoded differently). No `DataScope` is sent:
+  the UI keeps this session's measurements itself (`ui::data::MeasuredQuality`, cleared when
+  a new library lands — it has them, and a refresh may have moved keys) until the next build.
+* Keyed by identity like `stream_failure`, so refreshes keep it — but **valid only while the
+  channel at that key still has the provider `name` (and `url_key`, when both are known) it was
+  measured under**: the quality duplicates of an M3U channel share a base key (`normalize_name`
+  drops the quality words) and are numbered by playlist position (`KeyAllocator`: `K`, `K#2`),
+  so a reordered or grown playlist moves keys between them, and a renamed channel ("BBC One
+  HD" → "BBC One FHD") must not keep the old size. After a completed channel import, a row
+  whose key is gone or no longer matches is moved to the one channel of the source that has
+  its name (several: the one that also has its `url_key`) unless that channel has its own
+  measurement, else dropped — never an orphan. Two duplicates that swapped keys both follow.
+* `library::load` reads both (`LEFT JOIN channel_video` on key, name and url_key);
+  `ChannelSummary.quality` = the measured class if any, else the name's; none for radio (a
+  cover picture is no video). Class of a decoded `w×h` (`Quality::of_video`): the
   better of what the height (≥ 2000 4K, ≥ 1000 FHD, ≥ 700 HD, else SD) and the width (≥ 3800,
   ≥ 1900, ≥ 1260) say, so cropped 1920×800 and anamorphic 1440×1080 read FHD. **1440p is
   FHD**: four classes keep the badge narrow, and QHD is closer to FHD than to the 4K it would
   otherwise claim.
+* **Migration numbering**: `user_version` is positional, so two branches that each add a
+  `0002` must not both reach one database; whichever merges second is renumbered (`0003_*`,
+  and its `backfill` name match). This one is safe to re-run for that reason.
 
 ### 6.3 FTS approach and write rules (fixes the critique and review B2)
 
@@ -882,7 +901,7 @@ is frozen at tag `skeleton-v1` (nothing has shipped before it, which is why revi
 edited it in place); later changes are new `000N_*.sql` entries appended by WP-02 with
 architect sign-off. A migration whose new columns need data SQL can't compute gets a Rust
 `backfill` step that runs in the same transaction right after its script (0002: channel
-quality from the stored provider names, ~0.1 s per 100k channels, once).
+quality and family from the stored provider names, ~0.1 s per 100k channels, once).
 
 ### 7.2 Mark-and-sweep imports (catalogue)
 `source.generation` = last completed import. An import uses `generation + 1`, **upserts** rows
@@ -1272,7 +1291,7 @@ Overlays centre with a bg @ 0.5 scrim.
 * **Hover** moves list cursors only after real pointer motion (Omarchy `Menu.qml`
   `pointerGate.moved()`), never because rows scroll under a still pointer, and never triggers
   playback.
-* **Quality badges** (Settings ▸ Interface ▸ Show quality badges, default on, applied live):
+* **Quality badges** (Settings ▸ Interface ▸ Quality badges, default on, applied live):
   `SD` / `HD` / `FHD` / `4K` after the channel name — Live rows, the guide's channel column and
   side panel, Search results, the player's channel list / mini guide / zap banner, Home channel
   tiles (favourites rails included). Source: what mpv decoded the last time the channel played
@@ -1280,9 +1299,13 @@ Overlays centre with a bg @ 0.5 scrim.
   quality word of the provider name (`channel.quality`) — so "BBC One 4K" that plays at 1080p
   shows FHD, and an untagged channel gets a badge once it played (§6.2.1). No marker tells a
   measured value from a name one: two looks for one word is noise, and the player's OSD and
-  the Live preview show the decoded value anyway (those show it whatever the setting). The
-  badge follows the name and gives way first: it shows only while the whole name fits beside
-  it, then the name elides (`widgets::badge::name_with_quality`).
+  the Live preview show the decoded value anyway (those show it whatever the setting). Radio
+  channels have none. The badge follows the name and **stays when space runs out — the name
+  elides beside it** (duplicates share a name, so the badge is what tells them apart); only
+  when that would leave the name less than max(2 × badge, 6 em) does the name get the room
+  (`widgets::badge::name_with_quality` / `job_with_quality`, also search hits). The zap
+  banner's title badge shows until the channel plays; then the decoded badge on the right
+  says it.
 * **Reorder vs sort**: Alt+↑/↓ while the list is sorted by anything other than *Custom order*
   (`SortMode::Provider` = provider order with user reordering) switches it to Custom order with
   a toast "Switched to custom order". Ctrl+S opens a small sort & view menu (launcher card),
@@ -1306,7 +1329,7 @@ Overlays centre with a bg @ 0.5 scrim.
 | Slider / seek bar | `slider::*` | track max(4, 0.11·control-height) fg @ 0.18, fill fg, knob max(14, 0.38·ch) ×1.15 hover; seek bar over video uses OSD colours |
 | Progress | `progress::*` | programme progress fg; watch progress accent; busy bar for unknown totals |
 | Badge | `badge::*` | caption, 1 px border colour @ 0.6; LIVE = urgent; source = source colour (palette role) + glyph |
-| Quality badge | `badge::InlineBadge::quality` + `name_with_quality` (rows, grid, OSD lists), `badge::badge` (panels) | monospace caption, text @ 0.52 (`text_secondary`; `text_disabled` on dimmed rows; OSD text in the player), 1 px border @ 0.6, Md gap after the name |
+| Quality badge | `badge::InlineBadge::quality` + `name_with_quality` (rows, grid, search, OSD lists), `badge::quality_badge` (preview, guide side panel) | monospace caption, text @ 0.52 (`text_secondary`; `text_disabled` on dimmed rows; OSD text in the player), 1 px border at 0.6 × the text's opacity, Md gap after the name |
 | Logo / monogram | `logo::logo` | square, aspect kept; monogram on fg @ 0.04, text @ 0.52 |
 | Poster card | `poster::poster_card` | 2:3; title body; meta body-small @ 0.52; progress accent; cursor 2 px accent outline |
 | Empty / error state | `empty_state::empty_state` | glyph display-large 28 accent @ 0.8; title 14 fg @ 0.7; detail @ 0.52 |
@@ -1362,7 +1385,7 @@ provider groups (renamed/reordered/hidden per overrides; locked show 󰌾 and re
 * Reorder (Alt+↑/↓) inside a provider group writes `item_override.user_order` (§8 limitation
   for `;` multi-group channels).
 * **Duplicates best first**: with the default sort (custom order), the SD / HD / FHD / 4K
-  duplicates of one channel (same `norm_name`, same primary group) trade places so the best
+  duplicates of one channel (same `channel.family`, same primary group) trade places so the best
   known quality comes first; they keep the slots they had between them, and every other
   channel — a duplicate of unknown quality, or one the user placed (`user_order`) — keeps its
   own (`LiveIndex::collection`, All channels and provider groups; favourites, history and

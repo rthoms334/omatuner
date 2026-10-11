@@ -29,7 +29,6 @@ use crate::model::{
 };
 use crate::msg::{AppEvent, DataScope, Toast};
 use crate::player::{PlayRequest, PlayerCommand, PlayerEvent, PlayerSnapshot, PlayerState};
-use crate::sources::smart_names::Quality;
 use crate::store::library::FavIndex;
 use crate::theme::{SpaceToken, Theme, TypeToken};
 use crate::ui::epg_grid::{hhmm, time_left, time_range};
@@ -1561,7 +1560,7 @@ impl LiveScreen {
         let Some(ch) = cursor.and_then(|id| ctx.lib.live.get(id).cloned()) else { return };
         let h24 = ctx.config.interface.clock_24h;
         // the preview always says it (stream info, like the player's OSD), whatever the list setting
-        let quality = ctx.measured.get(&ch).or(ch.quality).map(Quality::label);
+        let quality = ctx.measured.get(&ch).or(ch.quality);
         // name · number + badges
         ui.horizontal_wrapped(|ui| {
             let size = (theme.font(TypeToken::Heading) * 1.6).round();
@@ -1572,7 +1571,7 @@ impl LiveScreen {
             }
             ui.label(egui::RichText::new(title).size(theme.font(TypeToken::Heading)).color(t.fg));
             if let Some(q) = quality {
-                badge::badge(ui, theme, q, t.fg);
+                badge::quality_badge(ui, theme, q, t.fg);
             }
             if ch.has_catchup && ch.catchup_days > 0 {
                 badge::badge(ui, theme, &format!("{} {} d", glyphs::CATCHUP, ch.catchup_days), t.fg);

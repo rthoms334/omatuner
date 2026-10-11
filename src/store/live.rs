@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::error::Result;
 use crate::model::{Channel, ChannelId, Group, GroupId, ItemKey, ItemKind, ItemRef, SourceId, Timestamp};
-use crate::store::sql::{Json, enum_parse, fp_opt, from_json_opt, kind_from_sql, or_not_found, u32_of};
+use crate::store::sql::{Json, enum_parse, from_json_opt, kind_from_sql, or_not_found, u32_of};
 
 const CHANNEL_COLS: &str = "c.id, c.source_id, c.key, c.provider_id, c.name, c.clean_name, c.number, c.logo, c.tvg_id, c.tvg_name, \
      c.tvg_shift_min, c.stream, c.headers, c.catchup, c.radio, c.unsupported, c.provider_order, c.added_at, o.rename, \
@@ -156,19 +156,20 @@ pub fn clear_failure(conn: &Connection, item: &ItemRef) -> Result<()> {
 }
 
 /// Remember the picture size mpv decoded for a live channel (`channel_video`; its class wins
-/// over the quality word of the name, DESIGN §6). Keeps the channel's fingerprint so the row
-/// follows the channel to a new key (`store::import`). Not a channel → nothing.
+/// over the quality word of the name, DESIGN §6), with the provider name and `url_key` it was
+/// measured under: it applies only while the channel at that key still has them
+/// (`store::import` moves it with the channel). Not a channel, or gone → nothing.
 pub fn record_video(conn: &Connection, item: &ItemRef, width: i64, height: i64, now: Timestamp) -> Result<()> {
     if item.kind != ItemKind::Channel {
         return Ok(());
     }
-    let fp = fp_opt(&crate::store::user::fingerprint_of(conn, item)?);
     conn.prepare_cached(
-        "INSERT INTO channel_video(source_id, item_key, width, height, at, fp) VALUES (?1, ?2, ?3, ?4, ?5, COALESCE(?6, '{}'))
-         ON CONFLICT(source_id, item_key) DO UPDATE SET width = excluded.width, height = excluded.height, at = excluded.at,
-           fp = COALESCE(?6, channel_video.fp)",
+        "INSERT INTO channel_video(source_id, item_key, name, url_key, width, height, at)
+         SELECT c.source_id, c.key, c.name, c.url_key, ?3, ?4, ?5 FROM channel c WHERE c.source_id = ?1 AND c.key = ?2
+         ON CONFLICT(source_id, item_key) DO UPDATE SET name = excluded.name, url_key = excluded.url_key,
+           width = excluded.width, height = excluded.height, at = excluded.at",
     )?
-    .execute(params![item.source, item.key.as_str(), width, height, now, fp])?;
+    .execute(params![item.source, item.key.as_str(), width, height, now])?;
     Ok(())
 }
 

@@ -582,8 +582,10 @@ impl PlayerScreen {
             _ => None,
         });
         let title = playable.as_ref().map(|p| p.title.as_str()).unwrap_or("");
-        // a zap shows which of the SD / HD / 4K duplicates this is before the picture does
-        let quality = ch.as_ref().filter(|_| live).and_then(|c| ctx.quality(c));
+        // a zap shows which of the SD / HD / 4K duplicates this is before the picture does;
+        // once it plays, the decoded badge on the right says it
+        let decoded = snap.state == PlayerState::Playing && snap.video_size.is_some();
+        let quality = ch.as_ref().filter(|_| live && !decoded).and_then(|c| ctx.quality(c));
         let badge = quality.map(|q| InlineBadge::quality(&p, theme, q, t.osd_text, s));
         let max_w = (cr.left() - pad - x).max(0.0);
         name_with_quality(&p, theme, egui::pos2(x, top.center().y), title, title_font.clone(), t.osd_text, badge, max_w);

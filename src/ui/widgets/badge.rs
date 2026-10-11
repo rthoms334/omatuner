@@ -50,8 +50,21 @@ pub fn live_badge(ui: &mut egui::Ui, theme: &Theme) -> egui::Response {
     badge(ui, theme, "LIVE", theme.tokens.urgent)
 }
 
+/// A channel's quality badge in a `Ui` flow (preview, guide side panel): the [`InlineBadge`]
+/// the lists paint, so "FHD" looks the same everywhere.
+pub fn quality_badge(ui: &mut egui::Ui, theme: &Theme, q: Quality, color: Color32) -> egui::Response {
+    let b = InlineBadge::quality(ui.painter(), theme, q, color, 1.0);
+    let (rect, resp) = ui.allocate_exact_size(b.size(), egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        b.paint(ui.painter(), theme, rect.min, Align2::LEFT_TOP);
+    }
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, q.label()));
+    resp
+}
+
 /// The painter-level [`badge`] (rows, grid headers, OSD lists): `text` in `font`, 1 px border
-/// in its colour @ 0.6, the same padding. Laid out up front so a row can measure it first.
+/// in its colour at 0.6 of the text's opacity (lighter than the text, also for a dimmed
+/// colour), the same padding. Laid out up front so a row can measure it first.
 pub struct InlineBadge {
     galley: Arc<egui::Galley>,
     pad: egui::Vec2,
@@ -77,16 +90,15 @@ impl InlineBadge {
     /// Paint at `pos` with `anchor`; returns the badge rect.
     pub fn paint(self, p: &egui::Painter, theme: &Theme, pos: Pos2, anchor: Align2) -> Rect {
         let rect = anchor.anchor_size(pos, self.size());
-        p.rect_stroke(rect, theme.tokens.rounding, egui::Stroke::new(1.0, with_alpha(self.color, 0.6)), egui::StrokeKind::Inside);
+        let border = with_alpha(self.color, 0.6 * f32::from(self.color.a()) / 255.0);
+        p.rect_stroke(rect, theme.tokens.rounding, egui::Stroke::new(1.0, border), egui::StrokeKind::Inside);
         p.galley(rect.center() - self.galley.size() / 2.0, self.galley, self.color);
         rect
     }
 }
 
 /// A channel name followed by its quality badge, left-aligned at `left_center` within `max_w`
-/// (DESIGN §13.0). The badge only shows while the whole name fits beside it: it never
-/// truncates the name — when space runs out the badge goes first, then the name elides.
-/// Returns the painted extent.
+/// (DESIGN §13.0). See [`job_with_quality`].
 #[allow(clippy::too_many_arguments)]
 pub fn name_with_quality(
     p: &egui::Painter,
@@ -98,10 +110,33 @@ pub fn name_with_quality(
     badge: Option<InlineBadge>,
     max_w: f32,
 ) -> Rect {
-    let full = paint::galley(p, name, font.clone(), color, f32::INFINITY);
+    job_with_quality(p, theme, left_center, egui::text::LayoutJob::simple_singleline(name.to_owned(), font, color), badge, max_w)
+}
+
+/// A laid-out name (`job`: one line, e.g. with the matched characters of a search hit)
+/// followed by its quality badge. The badge tells the duplicates of a channel apart, so it
+/// stays and the name elides beside it; only when that would leave the name less than
+/// `max(2 × badge, 6 em)` is the badge dropped for the name. Returns the painted extent.
+pub fn job_with_quality(
+    p: &egui::Painter,
+    theme: &Theme,
+    left_center: Pos2,
+    mut job: egui::text::LayoutJob,
+    badge: Option<InlineBadge>,
+    max_w: f32,
+) -> Rect {
+    let (em, color) = job.sections.first().map(|s| (s.format.font_id.size, s.format.color)).unwrap_or((0.0, Color32::PLACEHOLDER));
     let gap = theme.space(SpaceToken::Md);
-    let badge = badge.filter(|b| full.size().x + gap + b.size().x <= max_w);
-    let name_g = if badge.is_some() { full } else { paint::galley(p, name, font, color, max_w) };
+    let full = p.layout_job(job.clone());
+    let name_w = |b: &InlineBadge| max_w - gap - b.size().x;
+    let badge = badge.filter(|b| full.size().x <= name_w(b) || name_w(b) >= (2.0 * b.size().x).max(6.0 * em));
+    let room = badge.as_ref().map_or(max_w, name_w);
+    let name_g = if full.size().x <= room {
+        full
+    } else {
+        job.wrap = egui::text::TextWrapping::truncate_at_width(room.max(0.0));
+        p.layout_job(job)
+    };
     let name_rect = Align2::LEFT_CENTER.anchor_size(left_center, name_g.size());
     p.galley(name_rect.min, name_g, color);
     match badge {
@@ -114,24 +149,34 @@ pub fn name_with_quality(
 mod tests {
     use super::*;
 
-    /// The badge goes before the name is cut: shown while the whole name fits beside it, then
-    /// the full name alone, then the name elided — never past `max_w`.
+    /// The badge stays and the name elides beside it, down to a readable floor; below that
+    /// the name gets the room — never past `max_w`.
     #[test]
-    fn quality_badge_gives_way_before_the_name_elides() {
+    fn quality_badge_stays_while_the_name_elides() {
         let theme = Theme::fallback();
-        let ctx = egui::Context::default();
-        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
-            let p = ui.painter();
-            let font = FontId::proportional(theme.font(TypeToken::Heading));
-            let name_w = paint::galley(p, "BBC One", font.clone(), Color32::WHITE, f32::INFINITY).size().x;
-            let draw = |max_w: f32| {
+        let font = FontId::proportional(theme.font(TypeToken::Body));
+        // (painted width, badge painted?) of `name` within `max_w`
+        let draw = |name: &str, max_w: f32| {
+            let ctx = egui::Context::default();
+            let mut w = 0.0;
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let p = ui.painter();
                 let badge = InlineBadge::quality(p, &theme, Quality::Hd, Color32::GRAY, 1.0);
-                name_with_quality(p, &theme, Pos2::ZERO, "BBC One", font.clone(), Color32::WHITE, Some(badge), max_w).width()
-            };
-            assert!(draw(name_w * 3.0) > name_w + theme.space(SpaceToken::Md), "room: name and badge");
-            assert_eq!(draw(name_w + 4.0), name_w, "no room for the badge: the whole name, no badge");
-            assert!(draw(name_w / 2.0) <= name_w / 2.0 + 0.5, "then the name elides");
-        });
-        out.textures_delta.clear();
+                w = name_with_quality(p, &theme, Pos2::new(0.0, 50.0), name, font.clone(), Color32::WHITE, Some(badge), max_w).width();
+            });
+            out.textures_delta.clear();
+            (w, out.shapes.iter().any(|s| matches!(s.shape, egui::Shape::Rect(_))))
+        };
+        let long = "Sky Sports Main Event";
+        // name + gap + badge, and gap + badge
+        let ((full_w, _), (badge_w, _)) = (draw(long, f32::INFINITY), draw("", f32::INFINITY));
+        let floor = 6.0 * font.size + badge_w;
+        assert!(full_w > floor + 8.0, "the long name needs eliding at the floor");
+        assert_eq!(draw(long, full_w), (full_w, true), "room: name and badge");
+        let (w, badge) = draw(long, floor + 4.0);
+        assert!(badge && w <= floor + 4.5, "the name elides, the badge stays: {w}");
+        let (w, badge) = draw(long, floor - 4.0);
+        assert!(!badge && w <= floor - 3.5, "below the floor the name gets the room: {w}");
+        assert!(draw("BBC", floor - 4.0).1, "a short name that fits keeps its badge");
     }
 }

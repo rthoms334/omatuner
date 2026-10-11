@@ -572,18 +572,22 @@ Use a provider that lists the same channel several times in different qualities 
     - Each copy shows its badge (SD, HD, FHD, 4K) right after the same name, in the muted badge
       look (monospace, thin border), never clipped. A channel with no quality word has none.
     - The copies are listed best first (4K, FHD, HD, SD) in their group; other channels keep
-      the provider's order. ↑/↓ in the player zaps in that order, and the zap banner shows the
-      badge of the copy it tunes to.
-    - In a narrow list a long name keeps its full text while it fits; the badge disappears
-      before the name gets an ellipsis.
+      the provider's order (also "2160p" / "576p" names). ↑/↓ in the player zaps in that order,
+      and the zap banner shows the badge of the copy it tunes to until the picture comes up
+      (then only the decoded badge on the right, no second "FHD").
+    - In a narrow list (Home tiles, the guide column at Tiled, the player's list) a long name
+      gets the ellipsis and the badge stays; only in a very narrow cell does the name keep the
+      room. Radio channels have no badge.
 - [ ] **The measured value replaces a wrong name tag after playback:**
   - **Do:** play a copy whose name claims more than it delivers (a "4K" that plays at 1080p;
     stream info, `I`, shows the real size), and a channel without a quality word.
     Leave the player and look at their rows; then restart Tuner and refresh the playlist.
   - **Expect:** as soon as each plays, its badge shows the real class (FHD for the 1080p "4K";
     SD/HD/FHD for the untagged one) in every list, and it stays so after the restart and the
-    refresh. A 1440p stream reads FHD.
+    refresh. A 1440p stream reads FHD. If the provider reorders its copies (or adds one), each
+    copy keeps its own measured badge after the next refresh; a copy the provider renames
+    ("HD" → "FHD") shows its new name's badge until it plays again.
 - [ ] **Setting:**
-  - **Do:** Settings ▸ Interface ▸ Show quality badges off, then on.
+  - **Do:** Settings ▸ Interface ▸ Quality badges off, then on.
   - **Expect:** the badges disappear from every list at once and come back; the Live preview
     and the player OSD still show the stream's quality.
