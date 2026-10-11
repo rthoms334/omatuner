@@ -38,6 +38,7 @@ pub mod mpv_log;
 pub mod reconnect;
 pub mod render;
 pub mod state;
+pub mod tiles;
 pub mod tracks;
 
 use std::ptr::NonNull;

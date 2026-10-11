@@ -92,8 +92,34 @@ pub struct Backup {
     /// was shared — their playlists' own rules are adopted on restore).
     #[serde(default)]
     pub shared_category_filter: Option<crate::model::CategoryFilter>,
+    /// The batch features' user data (DESIGN §31–§34): Up next rows, Following rules (not their
+    /// ledger), spoiler-guard rules and seen events — each owner's `export` / `import`.
+    #[serde(default, skip_serializing_if = "FeatureBackup::is_empty")]
+    pub features: FeatureBackup,
     /// Raw `config.toml` text.
     pub config: Option<String>,
+}
+
+/// The batch features' user data, as each owner store module writes it (opaque JSON here, so a
+/// feature's format is its own; `None` = nothing to restore).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FeatureBackup {
+    /// `store::queue::export` (Q-core).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue: Option<serde_json::Value>,
+    /// `store::follow::export` (F-AB).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub follow: Option<serde_json::Value>,
+    /// `store::spoiler::export` (S1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spoiler: Option<serde_json::Value>,
+}
+
+impl FeatureBackup {
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_none() && self.follow.is_none() && self.spoiler.is_none()
+    }
 }
 
 /// One `title_link` row.
@@ -223,6 +249,11 @@ pub fn export(conn: &Connection, opts: BackupOptions, config_toml: Option<String
             .map(|l| BackupTitleLink { item: l.item, action: l.action.as_str().to_owned(), at: l.at, group: l.group })
             .collect(),
         shared_category_filter: crate::store::sources::shared_category_filter(conn)?,
+        features: FeatureBackup {
+            queue: crate::store::queue::export(conn)?,
+            follow: crate::store::follow::export(conn)?,
+            spoiler: crate::store::spoiler::export(conn)?,
+        },
         config: config_toml,
     })
 }
@@ -515,10 +546,32 @@ pub fn restore(conn: &mut Connection, b: &Backup, mode: RestoreMode) -> Result<R
     for r in &b.reminders {
         let Some(item) = remap(&r.channel) else { continue };
         rows += tx.execute(
-            "INSERT INTO reminder(source_id, channel_key, channel_name, title, start, stop, lead_s, state)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(source_id, channel_key, start) DO NOTHING",
-            params![item.source, item.key.as_str(), r.channel_name, r.programme_title, r.start, r.stop, r.lead_s, enum_str(&r.state)],
+            "INSERT INTO reminder(source_id, channel_key, channel_name, title, start, stop, lead_s, state, mode, offset_s, open_in)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT(source_id, channel_key, start) DO NOTHING",
+            params![
+                item.source,
+                item.key.as_str(),
+                r.channel_name,
+                r.programme_title,
+                r.start,
+                r.stop,
+                r.lead_s,
+                enum_str(&r.state),
+                enum_str(&r.mode),
+                r.offset_s,
+                r.open_in.as_ref().map(enum_str)
+            ],
         )?;
+    }
+    // ---- the batch features (each owner remaps its own refs; rule ids never carry over)
+    if let Some(v) = &b.features.queue {
+        rows += crate::store::queue::import(&tx, v, &remap)?;
+    }
+    if let Some(v) = &b.features.follow {
+        rows += crate::store::follow::import(&tx, v, &remap)?;
+    }
+    if let Some(v) = &b.features.spoiler {
+        rows += crate::store::spoiler::import(&tx, v, &remap)?;
     }
 
     // ---- manual EPG mappings (by guide name)

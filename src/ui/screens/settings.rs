@@ -2318,7 +2318,11 @@ impl SettingsScreen {
 
     fn cancel_reminder(&mut self, ctx: &mut UiCtx<'_>, id: ReminderId) {
         self.reminders.retain(|r| r.id != id);
-        let _ = ctx.services.store.writer().submit_notify(DataScope::Reminders, move |c| crate::store::user::remove_reminder(c, id));
+        let _ = ctx
+            .services
+            .store
+            .writer()
+            .submit_notify(DataScope::Reminders, move |c| crate::store::user::remove_reminder(c, id, crate::model::RemoveWhy::User));
         ctx.toast(Toast::info("Reminder cancelled"));
     }
 
@@ -3641,6 +3645,10 @@ mod tests {
                     stop: 4_000_003_600,
                     lead_s: 120,
                     state: crate::model::ReminderState::Pending,
+                    mode: Default::default(),
+                    offset_s: 0,
+                    open_in: None,
+                    rule_id: None,
                 },
             )?;
             // an orphaned favourite of a channel that vanished
@@ -3805,6 +3813,10 @@ mod tests {
                 stop: 4_000_003_600,
                 lead_s: 120,
                 state: crate::model::ReminderState::Pending,
+                mode: Default::default(),
+                offset_s: 0,
+                open_in: None,
+                rule_id: None,
             };
             crate::store::user::add_reminder(c, &r).map(|_| ())
         });

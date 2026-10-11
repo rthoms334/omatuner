@@ -1059,6 +1059,179 @@ pub fn rename(conn: &Connection, copies: &[ItemRef], name: &str, overwrite: bool
     })
 }
 
+// ------------------------------------------------------------------ channel copies (B5)
+
+/// The same live channel in another playlist (P3's "Also on" rule, B5): Live "Also on", the
+/// multi-view planner, Following's channel choice, Up next's live slots, Guide fixes' "Copy has
+/// guide", MCP `details.copies`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelCopy {
+    pub id: crate::model::ChannelId,
+    pub source: SourceId,
+    pub quality: Option<crate::model::Quality>,
+    pub locked: bool,
+    pub explicit: bool,
+}
+
+/// The copies of `ch` in `lib`: same `family` (normalised name, quality words dropped), another
+/// playlist, not hidden, not unsupported, and no tvg-id veto (a copy with another tvg-id than
+/// `ch`'s is another channel — shared or wrong tvg-ids never make copies, and "E4 +1" is never a
+/// copy of "E4"). In playlist order, the best quality first inside one, then provider order.
+/// `tvg` reads the tvg-ids of the ids it is given; `None` (no frame budget now) → `None`.
+pub fn channel_copies_with(
+    lib: &crate::store::library::Library,
+    ch: &crate::model::ChannelSummary,
+    tvg: impl FnOnce(&[crate::model::ChannelId]) -> Option<HashMap<crate::model::ChannelId, String>>,
+) -> Option<Vec<ChannelCopy>> {
+    let live = &lib.live;
+    let mut alts: Vec<&crate::model::ChannelSummary> = live
+        .channels
+        .iter()
+        .filter(|c| c.family == ch.family && c.source_id != ch.source_id && !c.unsupported && !live.hidden.contains(&c.id))
+        .collect();
+    if alts.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut ids: Vec<crate::model::ChannelId> = alts.iter().map(|c| c.id).collect();
+    ids.push(ch.id);
+    let tvg = tvg(&ids)?;
+    let id_of = |c: crate::model::ChannelId| tvg.get(&c).map(|t| t.trim()).filter(|t| !t.is_empty());
+    if let Some(own) = id_of(ch.id) {
+        alts.retain(|c| id_of(c.id).is_none_or(|t| t.eq_ignore_ascii_case(own)));
+    }
+    let rank = |s: SourceId| lib.sources.iter().position(|m| m.id == s).unwrap_or(usize::MAX);
+    alts.sort_by_key(|c| (rank(c.source_id), std::cmp::Reverse(c.quality.map(|q| q.class as u8)), c.provider_order));
+    Some(
+        alts.into_iter()
+            .map(|c| ChannelCopy {
+                id: c.id,
+                source: c.source_id,
+                quality: c.quality.map(|q| q.class),
+                locked: c.locked,
+                explicit: lib.explicit.channels.contains(&c.id),
+            })
+            .collect(),
+    )
+}
+
+/// [`channel_copies_with`] reading the tvg-ids from `conn` (off the UI thread: the multi-view
+/// controller's zap substitution, Following, the agent).
+pub fn channel_copies(lib: &crate::store::library::Library, conn: &Connection, ch: crate::model::ChannelId) -> Result<Vec<ChannelCopy>> {
+    let Some(summary) = lib.live.get(ch) else { return Ok(Vec::new()) };
+    let mut err = None;
+    let copies = channel_copies_with(lib, summary, |ids| tvg_ids(conn, ids).map_err(|e| err = Some(e)).ok());
+    match err {
+        Some(e) => Err(e),
+        None => Ok(copies.unwrap_or_default()),
+    }
+}
+
+/// The tvg-ids of `ids` (one indexed read each).
+pub fn tvg_ids(conn: &Connection, ids: &[crate::model::ChannelId]) -> Result<HashMap<crate::model::ChannelId, String>> {
+    let mut stmt = conn.prepare_cached("SELECT tvg_id FROM channel WHERE id = ?1")?;
+    let mut out = HashMap::new();
+    for id in ids {
+        if let Some(t) = stmt.query_row([id.0], |r| r.get::<_, Option<String>>(0)).optional()?.flatten() {
+            out.insert(*id, t);
+        }
+    }
+    Ok(out)
+}
+
+/// One channel to rank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RankCand {
+    pub id: crate::model::ChannelId,
+    pub source: SourceId,
+    pub quality: Option<crate::model::Quality>,
+    pub locked: bool,
+    pub provider_order: i32,
+}
+
+impl From<&crate::model::ChannelSummary> for RankCand {
+    fn from(c: &crate::model::ChannelSummary) -> Self {
+        Self { id: c.id, source: c.source_id, quality: c.quality.map(|q| q.class), locked: c.locked, provider_order: c.provider_order }
+    }
+}
+
+/// What the ranking weighs (B5).
+#[derive(Debug, Clone, Default)]
+pub struct RankCtx {
+    /// A rule's / row's pinned channel.
+    pub pinned: Option<crate::model::ChannelId>,
+    /// The parental session is locked (unlocked channels first).
+    pub session_locked: bool,
+    /// Channels with trouble in the last 24 h (`skip_on_zap` / `stream_failure`).
+    pub trouble: std::collections::HashSet<crate::model::ChannelId>,
+    /// (list position, position in the list) of favourite channels.
+    pub favourites: HashMap<crate::model::ChannelId, (usize, usize)>,
+    /// Best quality wanted (e.g. a Following rule's `prefer.max_quality`).
+    pub max_quality: Option<crate::model::Quality>,
+    /// Fit to this picture height (physical px; multi-view's small picture): the lowest quality
+    /// at least this tall first.
+    pub target_px: Option<u32>,
+    /// Playlist order (`Library::sources`).
+    pub source_order: Vec<SourceId>,
+}
+
+/// A channel's place in the ranking (smaller first).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RankKey {
+    not_pinned: bool,
+    locked: bool,
+    trouble: bool,
+    favourite: (bool, usize, usize),
+    quality: (u8, i32),
+    playlist: usize,
+    provider_order: i32,
+}
+
+/// Nominal picture height of a quality class.
+fn height(q: crate::model::Quality) -> i32 {
+    match q {
+        crate::model::Quality::Sd => 576,
+        crate::model::Quality::Hd => 720,
+        crate::model::Quality::Fhd => 1080,
+        crate::model::Quality::Uhd => 2160,
+    }
+}
+
+/// The ONE channel ordering (B5): pinned; unlocked (while locked); no trouble in 24 h; in
+/// favourites (earlier list and position first); quality (best, capped by `max_quality`, or
+/// fitted to `target_px`; unknown last); playlist order; provider order.
+pub fn rank_channels(cands: &[RankCand], ctx: &RankCtx) -> Vec<(crate::model::ChannelId, RankKey)> {
+    let quality = |q: Option<crate::model::Quality>| -> (u8, i32) {
+        let Some(q) = q else { return (3, 0) };
+        let h = height(q);
+        match (ctx.target_px, ctx.max_quality) {
+            (Some(t), _) if h >= t as i32 => (0, h),
+            (Some(_), _) => (1, -h),
+            (None, Some(cap)) if q > cap => (1, h),
+            _ => (0, -h),
+        }
+    };
+    let mut out: Vec<(crate::model::ChannelId, RankKey)> = cands
+        .iter()
+        .map(|c| {
+            let fav = ctx.favourites.get(&c.id).copied();
+            (
+                c.id,
+                RankKey {
+                    not_pinned: ctx.pinned != Some(c.id),
+                    locked: ctx.session_locked && c.locked,
+                    trouble: ctx.trouble.contains(&c.id),
+                    favourite: (fav.is_none(), fav.map_or(0, |f| f.0), fav.map_or(0, |f| f.1)),
+                    quality: quality(c.quality),
+                    playlist: ctx.source_order.iter().position(|s| *s == c.source).unwrap_or(usize::MAX),
+                    provider_order: c.provider_order,
+                },
+            )
+        })
+        .collect();
+    out.sort_by_key(|(_, k)| *k);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1072,6 +1245,54 @@ mod tests {
         assert!(stash.take(first).is_none(), "pushed out by {UNDO_KEEP} newer actions");
         assert!(stash.take(kept[UNDO_KEEP - 1]).is_some());
         assert!(stash.take(kept[UNDO_KEEP - 1]).is_none(), "once");
+    }
+
+    /// One ordering for every feature (B5): pinned, unlocked while locked, no trouble,
+    /// favourites, quality (capped or fitted), playlist order, provider order.
+    #[test]
+    fn rank_channels_orders_by_the_shared_rule() {
+        use crate::model::{ChannelId, Quality};
+        let c = |id: i64, src: i64, q: Option<Quality>, locked: bool| RankCand {
+            id: ChannelId(id),
+            source: SourceId(src),
+            quality: q,
+            locked,
+            provider_order: 0,
+        };
+        let cands = [
+            c(1, 2, Some(Quality::Hd), false),
+            c(2, 1, Some(Quality::Uhd), false),
+            c(3, 1, Some(Quality::Fhd), true),
+            c(4, 2, None, false),
+            c(5, 1, Some(Quality::Hd), false),
+        ];
+        let order = |ctx: &RankCtx| rank_channels(&cands, ctx).into_iter().map(|(id, _)| id.0).collect::<Vec<_>>();
+        let base = RankCtx { source_order: vec![SourceId(1), SourceId(2)], ..Default::default() };
+        // quality first, then playlist order; unknown quality last
+        assert_eq!(order(&base), [2, 3, 5, 1, 4]);
+        // a favourite beats quality; a channel with recent trouble goes after every other
+        let mut ctx = base.clone();
+        ctx.favourites.insert(ChannelId(1), (0, 3));
+        ctx.trouble.insert(ChannelId(2));
+        assert_eq!(order(&ctx), [1, 3, 5, 4, 2]);
+        // while locked, locked channels go after unlocked ones; a pin wins over everything
+        let ctx = RankCtx { session_locked: true, pinned: Some(ChannelId(4)), ..base.clone() };
+        assert_eq!(order(&ctx), [4, 2, 5, 1, 3]);
+        // a small picture fits the lowest quality at least its height (HD for 700 px)
+        let ctx = RankCtx { target_px: Some(700), ..base.clone() };
+        assert_eq!(order(&ctx)[..2], [5, 1]);
+        // a cap of FHD puts 4K after FHD and HD
+        let ctx = RankCtx { max_quality: Some(Quality::Fhd), ..base };
+        assert_eq!(order(&ctx), [3, 5, 1, 2, 4]);
+    }
+
+    /// "E4" and "E4 +1" are different families: a +1 channel is never a copy of its base (it
+    /// airs an hour later), whatever their guide mapping says.
+    #[test]
+    fn a_plus_one_channel_is_not_a_copy_of_its_base() {
+        let n = crate::sources::identity::normalize_name;
+        assert_ne!(n("E4"), n("E4 +1"));
+        assert_eq!(n("E4"), n("e4"));
     }
 
     #[test]

@@ -73,3 +73,77 @@ impl ConnectionBudget {
         *self.open.get(&source).unwrap_or(&0)
     }
 }
+
+/// The connection budget shared by every picture's controller (multi-view, DESIGN §35 §4.4):
+/// limits, the source each picture claims (kept through Reconnecting), open leases, the race
+/// window and limits learned from a refused second stream. Batch base: the API; MV-1 moves the
+/// controller's own [`ConnectionBudget`] and the race window here. OWNER: MV-1.
+#[derive(Debug, Clone, Default)]
+pub struct SharedBudget(std::sync::Arc<std::sync::Mutex<SharedState>>);
+
+#[derive(Debug, Default)]
+struct SharedState {
+    limits: HashMap<SourceId, u32>,
+    claims: HashMap<crate::model::TileId, SourceId>,
+}
+
+/// What the multi-view planner and MCP `status.streams` see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamUse {
+    pub source: SourceId,
+    /// `None` = unknown / unlimited.
+    pub limit: Option<u32>,
+    pub in_use: u32,
+}
+
+impl SharedBudget {
+    fn state(&self) -> std::sync::MutexGuard<'_, SharedState> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `AccountInfo.max_connections` (None ⇒ unknown; 0 is treated as 1).
+    pub fn set_limit(&self, source: SourceId, max: Option<u32>) {
+        let mut s = self.state();
+        match max {
+            Some(m) => s.limits.insert(source, m.max(1)),
+            None => s.limits.remove(&source),
+        };
+    }
+
+    pub fn limit(&self, source: SourceId) -> Option<u32> {
+        self.state().limits.get(&source).copied()
+    }
+
+    /// The source `tile` targets (set on play / zap, kept through Reconnecting, cleared on
+    /// stop, end, final error or a retarget).
+    pub fn claim(&self, tile: crate::model::TileId, source: Option<SourceId>) {
+        let mut s = self.state();
+        match source {
+            Some(src) => s.claims.insert(tile, src),
+            None => s.claims.remove(&tile),
+        };
+    }
+
+    /// May `tile` open a stream on `source`: the OTHER pictures' claims stay under its limit.
+    pub fn admits(&self, tile: crate::model::TileId, source: SourceId) -> bool {
+        let s = self.state();
+        let others = s.claims.iter().filter(|(t, src)| **t != tile && **src == source).count() as u32;
+        s.limits.get(&source).is_none_or(|limit| others < *limit)
+    }
+
+    /// Per playlist with a known limit or a claim: limit and streams in use.
+    pub fn usage(&self) -> Vec<StreamUse> {
+        let s = self.state();
+        let mut sources: Vec<SourceId> = s.limits.keys().chain(s.claims.values()).copied().collect();
+        sources.sort();
+        sources.dedup();
+        sources
+            .into_iter()
+            .map(|source| StreamUse {
+                source,
+                limit: s.limits.get(&source).copied(),
+                in_use: s.claims.values().filter(|c| **c == source).count() as u32,
+            })
+            .collect()
+    }
+}

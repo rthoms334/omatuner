@@ -55,7 +55,11 @@ pub struct Services {
     pub store: Store,
     pub http: HttpClient,
     pub jobs: JobManager,
-    pub player: Player,
+    /// The pictures (tile A always; tile B once multi-view starts it, DESIGN §35). Single view
+    /// is tile A: `tiles.focused()` / `tiles.handle(TileId::A)`.
+    pub tiles: crate::player::tiles::Tiles,
+    /// Up next's engine (DESIGN §32; idle until Q-core).
+    pub queue: Option<crate::queue::QueueHandle>,
     pub logs: LogBuffer,
     pub integrations: Integrations,
     /// Combined actions on a title's copies that a toast can still undo (DESIGN §29.15).
@@ -63,9 +67,10 @@ pub struct Services {
     /// Drops big snapshots off the UI thread and gives freed heap back to the OS
     /// (`platform::memory`); follows the player's snapshots.
     pub memory: crate::platform::memory::Maintenance,
-    /// What the app publishes for the agent handler (library snapshot, parental unlock;
-    /// DESIGN §30.4). The handler itself lives in the IPC server.
-    pub agent: Arc<crate::agent::shared::AgentShared>,
+    /// What the app publishes for code off the UI thread (B2: library snapshot, parental
+    /// unlock, the guard, the pictures, Up next; DESIGN §30.4). The agent handler itself lives in
+    /// the IPC server.
+    pub agent: Arc<crate::shared::AppShared>,
     /// Set when [`Services::shutdown`] begins (the signal watcher leaves the exit to it; a
     /// signal after that means it is stuck).
     closing: Arc<AtomicBool>,
@@ -114,6 +119,9 @@ impl Services {
         };
         let mut memory = crate::platform::memory::Maintenance::start();
         memory.watch_player(rt.handle(), player.handle().subscribe());
+        let tiles = crate::player::tiles::Tiles::single(player);
+        let agent = Arc::new(crate::shared::AppShared::new(jobs.context().explicit.clone()));
+        agent.set_main_player(tiles.main_watch());
         Ok(Self {
             paths,
             config,
@@ -122,12 +130,13 @@ impl Services {
             store,
             http,
             jobs,
-            player,
+            tiles,
+            queue: None,
             logs,
             integrations: Integrations::default(),
             undo: Default::default(),
             memory,
-            agent: Arc::default(),
+            agent,
             closing: Arc::default(),
             socket: Arc::default(),
         })
@@ -144,7 +153,7 @@ impl Services {
             self.agent.clone(),
             self.store.clone(),
             self.config.clone(),
-            self.player.handle(),
+            self.tiles.handle(crate::model::TileId::A),
             self.bus.clone(),
             self.jobs.clone(),
         ));
@@ -158,8 +167,20 @@ impl Services {
         self.start_reminders(&cfg);
         self.integrations.scheduler = Some(crate::jobs::scheduler::spawn(self.jobs.clone()));
         match self.store.reader().and_then(|c| connection_limits(&c)) {
-            Ok(cmds) => cmds.into_iter().for_each(|c| self.player.handle().send(c)),
+            Ok(cmds) => cmds.into_iter().for_each(|c| {
+                if let PlayerCommand::SetConnectionLimit { source, max } = &c {
+                    self.tiles.budget().set_limit(*source, *max);
+                }
+                self.tiles.handles().iter().for_each(|h| h.send(c.clone()));
+            }),
             Err(e) => tracing::warn!("connection limits: {e}"),
+        }
+        // the batch features' background parts (each a no-op until its track turns it on)
+        if crate::queue::ENABLED {
+            self.queue = Some(crate::queue::service::start(self.rt.handle(), self.agent.clone()));
+        }
+        if crate::spoiler::ENABLED {
+            crate::spoiler::tracker::start(self.rt.handle(), self.agent.clone(), self.store.clone());
         }
     }
 
@@ -172,7 +193,8 @@ impl Services {
     }
 
     fn start_mpris(&mut self) {
-        self.integrations.mpris = ok("MPRIS", crate::platform::mpris::MprisService::start(self.rt.handle(), self.player.handle(), self.bus.clone()));
+        self.integrations.mpris =
+            ok("MPRIS", crate::platform::mpris::MprisService::start(self.rt.handle(), self.tiles.handle(crate::model::TileId::A), self.bus.clone()));
     }
 
     fn start_reminders(&mut self, cfg: &Config) {
@@ -276,11 +298,15 @@ impl Services {
     /// it): stop the player (its final progress save goes to the writer), flush the writer
     /// queue, remove the IPC socket. mpv and the WAL are left to process exit / the next open.
     pub(crate) fn exit_cleanup(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
-        let (player, writer, socket) = (self.player.handle(), self.store.writer().clone(), self.socket.clone());
+        let (players, writer, socket) = (self.tiles.handles(), self.store.writer().clone(), self.socket.clone());
         async move {
-            player.send(PlayerCommand::Shutdown);
-            let mut snap = player.subscribe();
-            let _ = tokio::time::timeout(Duration::from_secs(1), snap.wait_for(|s| s.state == crate::player::PlayerState::Idle)).await;
+            for player in &players {
+                player.send(PlayerCommand::Shutdown);
+            }
+            for player in &players {
+                let mut snap = player.subscribe();
+                let _ = tokio::time::timeout(Duration::from_secs(1), snap.wait_for(|s| s.state == crate::player::PlayerState::Idle)).await;
+            }
             if tokio::time::timeout(Duration::from_secs(2), writer.run(|_| Ok(()))).await.is_err() {
                 tracing::warn!("database writer busy at exit");
             }
@@ -303,7 +329,7 @@ impl Services {
         }
         self.integrations = Integrations::default();
         self.jobs.shutdown();
-        self.player.shutdown(); // final progress save is submitted to the writer here
+        self.tiles.shutdown(); // final progress saves are submitted to the writer here
         // cancelled jobs finish their wind-down (an aborted guide import discards its partial
         // data and restores the channel matches) before the runtime drops their tasks
         if !self.jobs.wait_idle(JOBS_WIND_DOWN) {

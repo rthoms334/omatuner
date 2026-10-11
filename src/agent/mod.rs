@@ -6,7 +6,8 @@
 //!                                         (bridge track)                     (app track)
 //! ```
 //! * [`proto`] — the IPC v2 wire types, params, results, refs and time formats (shared).
-//! * [`shared`] — what the app publishes for the handler (library snapshot, parental unlock).
+//! * [`crate::shared`] — what the app publishes for the handler (library snapshot, parental
+//!   unlock, the guard, the pictures, Up next).
 //! * [`server`] — the running app's handler (queries, play, switches, control, guardrails).
 //! * [`tools`] — the MCP tool list: names, descriptions, input schemas (the model's contract).
 //! * [`client`] — `tuner mcp`'s IPC v2 client: connect, launch Tuner when needed, retry while
@@ -14,14 +15,16 @@
 //! * [`mcp`] — the MCP stdio server (`tuner mcp`).
 
 pub mod act;
+pub mod actions;
 pub mod client;
 pub mod guard;
 pub mod mcp;
+pub mod params;
 pub mod proto;
 pub mod query;
 pub mod server;
-pub mod shared;
 pub mod tools;
+pub mod tools_batch;
 
 use crate::model::{MediaRef, SeriesId};
 

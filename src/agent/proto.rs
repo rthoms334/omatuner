@@ -24,6 +24,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+pub use super::params::*;
 use crate::model::{ItemKey, ItemKind, ItemRef, SourceId, Timestamp};
 
 /// Protocol version of this build.
@@ -76,6 +77,23 @@ pub enum Call {
     ScheduleSwitch(ScheduleSwitch),
     CancelSwitch(CancelSwitch),
     Control(Control),
+    // ---- the batch (DESIGN §31–§35, the skill plan): action-shaped feature tools…
+    Queue(Queue),
+    Follow(Follow),
+    SpoilerGuard(SpoilerGuard),
+    GuideFix(GuideFix),
+    Multiview(MultiView),
+    Reminders(Reminders),
+    SleepTimer(SleepTimer),
+    // …and library / health tools
+    MatchTitles(MatchTitles),
+    History(History),
+    Episodes(Episodes),
+    FavouritesEdit(FavouritesEdit),
+    ParentalStatus(Empty),
+    Lock(Lock),
+    Diagnose(Diagnose),
+    Sources(Empty),
 }
 
 impl Call {
@@ -95,12 +113,40 @@ impl Call {
             Call::ScheduleSwitch(_) => "schedule_switch",
             Call::CancelSwitch(_) => "cancel_switch",
             Call::Control(_) => "control",
+            Call::Queue(_) => "queue",
+            Call::Follow(_) => "follow",
+            Call::SpoilerGuard(_) => "spoiler_guard",
+            Call::GuideFix(_) => "guide_fix",
+            Call::Multiview(_) => "multiview",
+            Call::Reminders(_) => "reminders",
+            Call::SleepTimer(_) => "sleep_timer",
+            Call::MatchTitles(_) => "match_titles",
+            Call::History(_) => "history",
+            Call::Episodes(_) => "episodes",
+            Call::FavouritesEdit(_) => "favourites_edit",
+            Call::ParentalStatus(_) => "parental_status",
+            Call::Lock(_) => "lock",
+            Call::Diagnose(_) => "diagnose",
+            Call::Sources(_) => "sources",
         }
     }
 
-    /// Changes something (playback, reminders): rate-limited separately, logged at INFO.
+    /// Changes something (playback, reminders, rules, guide data, locks): rate-limited
+    /// separately, logged at INFO. Action-shaped tools decide per verb.
     pub fn is_action(&self) -> bool {
-        matches!(self, Call::Play(_) | Call::ScheduleSwitch(_) | Call::CancelSwitch(_) | Call::Control(_))
+        use super::actions::ToolAction;
+        match self {
+            Call::Play(_) | Call::ScheduleSwitch(_) | Call::CancelSwitch(_) | Call::Control(_) => true,
+            Call::FavouritesEdit(_) | Call::Lock(_) => true,
+            Call::Queue(p) => p.action.mutates(),
+            Call::Follow(p) => p.action.mutates(),
+            Call::SpoilerGuard(p) => p.action.mutates(),
+            Call::GuideFix(p) => p.action.mutates(),
+            Call::Multiview(p) => p.action.mutates(),
+            Call::Reminders(p) => p.action.mutates(),
+            Call::SleepTimer(p) => p.action.mutates(),
+            _ => false,
+        }
     }
 
     /// Build a call from a tool name and its arguments (`tools/call`). `Err`: unknown tool, or

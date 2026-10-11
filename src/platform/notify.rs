@@ -458,6 +458,10 @@ mod tests {
             stop,
             lead_s,
             state: ReminderState::Pending,
+            mode: Default::default(),
+            offset_s: 0,
+            open_in: None,
+            rule_id: None,
         }
     }
 

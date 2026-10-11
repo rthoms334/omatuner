@@ -153,6 +153,7 @@ async fn run(ctx: &JobContext, src: &EpgSource, force: bool, progress: &Progress
                 tracing::warn!("storing the guide's download validators: {e}");
             }
             notify(ctx, DataScope::Epg);
+            super::after_guide(ctx, crate::follow::FollowReason::Guide);
             Ok(EpgRefreshResult { summary, not_modified: false })
         }
         Err(e) => {
@@ -377,6 +378,7 @@ pub async fn rematch_all(ctx: &JobContext, progress: &Progress, cancel: &Cancell
     progress.set(JobPhase::Finishing);
     write(ctx, |c| store_epg::resolve_mappings(c)).await?;
     notify(ctx, DataScope::Epg);
+    super::after_guide(ctx, crate::follow::FollowReason::Guide);
     Ok(total)
 }
 

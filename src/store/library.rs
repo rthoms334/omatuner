@@ -911,10 +911,14 @@ fn effective_groups(links: Option<&Vec<(GroupId, bool)>>, flags: &HashMap<GroupI
 
 fn load_live(conn: &Connection, groups: Vec<Group>, x: &mut ExplicitIndex) -> Result<LiveIndex> {
     let flags = group_flags(&groups);
+    // `tvg_shift_min` is the EFFECTIVE shift (B8, DESIGN §31): the user's override, else the
+    // Guide fixes rule row's, else the provider's tvg-shift — every reader of
+    // `ChannelSummary::tvg_shift_min` / `ProgrammeSlim::shifted` gets it; only the catch-up
+    // request uses the provider's alone (`sources::resolve`).
     let trust = crate::store::live::label_trust(conn)?;
     let links = load_memberships(conn, "SELECT cg.channel_id, cg.group_id, cg.is_primary FROM channel_group cg", &flags)?;
     let mut stmt = conn.prepare_cached(
-        "SELECT c.id, c.source_id, c.key, COALESCE(o.rename, c.clean_name), c.number, c.logo, ce.epg_channel_id, c.tvg_shift_min,
+        "SELECT c.id, c.source_id, c.key, COALESCE(o.rename, c.clean_name), c.number, c.logo, ce.epg_channel_id, COALESCE(o.shift_min, ce.shift_min, c.tvg_shift_min),
                 c.catchup IS NOT NULL, COALESCE(json_extract(c.catchup, '$.days'), 0), c.radio, c.unsupported IS NOT NULL,
                 c.provider_order, o.user_order, c.added_at, COALESCE(o.hidden, 0), COALESCE(o.locked, 0),
                 c.quality, v.width, v.height, COALESCE(c.family, c.norm_name), c.name, o.rename IS NOT NULL, c.explicit

@@ -74,7 +74,7 @@ impl TestUi {
         let egui = egui::Context::default();
         let images = crate::images::ImageCache::new(&services.paths, services.http.clone(), services.rt.handle().clone(), egui.clone(), 16 << 20);
         let config = services.config();
-        let snapshot = services.player.handle().snapshot();
+        let snapshot = services.tiles.focused().snapshot();
         Ok(Self {
             services: Some(services),
             events,
@@ -114,7 +114,7 @@ impl TestUi {
 
     /// Refresh `snapshot` from the player (after sending commands).
     pub fn refresh_snapshot(&mut self) {
-        self.snapshot = self.services().player.handle().snapshot();
+        self.snapshot = self.services().tiles.focused().snapshot();
     }
 
     /// Run `f` with a `UiCtx` over the owned parts.

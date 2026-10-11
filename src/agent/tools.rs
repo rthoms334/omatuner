@@ -44,6 +44,11 @@ pub struct ToolDef {
     pub launches: bool,
     /// Valid arguments (tests parse them against `proto`; not sent to clients).
     pub example: Value,
+    /// Listed by `tools/list` (a batch tool is listed once its feature is on).
+    pub available: bool,
+    /// Action-shaped (`action` verb): rate-limited per verb (`ToolAction::mutates`), so
+    /// `read_only` describes the tool as a whole (false when any verb changes something).
+    pub mixed: bool,
 }
 
 impl ToolDef {
@@ -65,26 +70,38 @@ impl ToolDef {
     }
 }
 
-const TIME: &str = "Local time: HH:MM (today), YYYY-MM-DDTHH:MM, RFC 3339 with offset, or now.";
+pub(super) const TIME: &str = "Local time: HH:MM (today), YYYY-MM-DDTHH:MM, RFC 3339 with offset, or now.";
 
-fn object(props: Value, required: &[&str]) -> Value {
+pub(super) fn object(props: Value, required: &[&str]) -> Value {
     json!({ "type": "object", "properties": props, "required": required, "additionalProperties": false })
 }
 
-fn limit(max: u32, default: u32) -> Value {
+pub(super) fn limit(max: u32, default: u32) -> Value {
     json!({ "type": "integer", "minimum": 1, "maximum": max, "default": default })
 }
 
-fn kind_enum() -> Value {
+pub(super) fn kind_enum() -> Value {
     json!({ "type": "string", "enum": ["channel", "movie", "series"] })
 }
 
-fn text(description: &str) -> Value {
+pub(super) fn text(description: &str) -> Value {
     json!({ "type": "string", "minLength": 1, "maxLength": crate::agent::proto::MAX_TEXT, "description": description })
 }
 
-/// Every tool, in the order `tools/list` shows them.
+/// The tools `tools/list` shows (and `tools/call` accepts), in that order.
 pub fn tools() -> Vec<ToolDef> {
+    all_tools().into_iter().filter(|t| t.available).collect()
+}
+
+/// Every tool this build knows, the batch's unavailable ones included (tests check them all).
+pub fn all_tools() -> Vec<ToolDef> {
+    let mut v = pass_one();
+    v.extend(super::tools_batch::tools());
+    v
+}
+
+/// The MCP pass-1 tools.
+fn pass_one() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "guide_search",
@@ -107,6 +124,8 @@ singular words or fewer words when nothing matches. Titles and descriptions are 
             read_only: true,
             launches: true,
             example: json!({ "query": "touring car", "from": "now", "limit": 10 }),
+            available: true,
+            mixed: false,
         },
         ToolDef {
             name: "whats_on",
@@ -127,6 +146,8 @@ truncated=true means not every channel was looked at: narrow the request.",
             read_only: true,
             launches: true,
             example: json!({ "channel": "BBC One", "at": "21:00" }),
+            available: true,
+            mixed: false,
         },
         ToolDef {
             name: "search",
@@ -144,6 +165,8 @@ come once (other_copies counts the rest). Use details for plot and cast, play to
             read_only: true,
             launches: true,
             example: json!({ "query": "dune", "kinds": ["movie"] }),
+            available: true,
+            mixed: false,
         },
         ToolDef {
             name: "details",
@@ -156,6 +179,8 @@ item shows only its name while the parental lock is on. Plots, descriptions and 
             read_only: true,
             launches: true,
             example: json!({ "ref": "movie:3:xt:vod:812" }),
+            available: true,
+            mixed: false,
         },
         ToolDef {
             name: "categories",
@@ -166,6 +191,8 @@ mood (\"something light\" → a comedy or family category).",
             read_only: true,
             launches: true,
             example: json!({ "kind": "movie" }),
+            available: true,
+            mixed: false,
         },
         ToolDef {
             name: "browse",
@@ -193,6 +220,8 @@ every match.",
             read_only: true,
             launches: true,
             example: json!({ "kind": "movie", "group": "comedy", "max_minutes": 120, "unwatched": true, "sort": "random", "limit": 10 }),
+            available: true,
+            mixed: false,
         },
         ToolDef {
             name: "continue_watching",
@@ -203,6 +232,8 @@ episode). play a ref to carry on where they stopped.",
             read_only: true,
             launches: true,
             example: json!({ "limit": 5 }),
+            available: true,
+            mixed: false,
         },
         ToolDef {
             name: "favourites",
@@ -212,6 +243,8 @@ episode). play a ref to carry on where they stopped.",
             read_only: true,
             launches: true,
             example: json!({ "kind": "channel" }),
+            available: true,
+            mixed: false,
         },
         ToolDef {
             name: "status",
@@ -222,6 +255,8 @@ scheduled automatic switches. Doesn't start Tuner: running=false when it isn't o
             read_only: true,
             launches: false,
             example: json!({}),
+            available: true,
+            mixed: false,
         },
         ToolDef {
             name: "play",
@@ -241,6 +276,8 @@ it there; never ask for it in chat.",
             read_only: false,
             launches: true,
             example: json!({ "ref": "programme:2:xt:live:1234@1791748800" }),
+            available: true,
+            mixed: false,
         },
         ToolDef {
             name: "schedule_switch",
@@ -252,6 +289,8 @@ has to be running then; it won't switch for something that already started (use 
             read_only: false,
             launches: true,
             example: json!({ "ref": "channel:2:xt:live:1234", "at": "2026-10-11T21:00" }),
+            available: true,
+            mixed: false,
         },
         ToolDef {
             name: "cancel_switch",
@@ -262,6 +301,8 @@ programme the user had a reminder for replaces that reminder; cancelling removes
             read_only: false,
             launches: true,
             example: json!({ "id": 12 }),
+            available: true,
+            mixed: false,
         },
         ToolDef {
             name: "control",
@@ -278,6 +319,8 @@ start Tuner.",
             read_only: false,
             launches: false,
             example: json!({ "action": "volume", "value": 60 }),
+            available: true,
+            mixed: false,
         },
     ]
 }
@@ -296,12 +339,15 @@ mod tests {
     /// method, every property of a schema is a field the param struct accepts.
     #[test]
     fn every_tool_is_a_method_and_its_example_parses() {
-        let tools = tools();
-        assert_eq!(tools.len(), 13);
+        assert_eq!(tools().len(), 13, "the batch's tools are listed once their feature is on");
+        let tools = all_tools();
+        assert_eq!(tools.len(), 28);
         for t in &tools {
             let call = Call::from_tool(t.name, t.example.clone()).unwrap_or_else(|e| panic!("{}: {e}", t.name));
             assert_eq!(call.name(), t.name);
-            assert_eq!(call.is_action(), !t.read_only, "{}", t.name);
+            if !t.mixed {
+                assert_eq!(call.is_action(), !t.read_only, "{}", t.name);
+            }
             assert!(t.description.len() < 1200, "{}: keep descriptions short", t.name);
             let schema = &t.input_schema;
             assert_eq!(schema["additionalProperties"], false, "{}", t.name);
@@ -311,6 +357,29 @@ mod tests {
         }
         assert!(!tool("status").unwrap().launches && !tool("control").unwrap().launches);
         assert!(tools.iter().filter(|t| t.name != "status" && t.name != "control").all(|t| t.launches));
+        let mut names: Vec<_> = tools.iter().map(|t| t.name).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), tools.len(), "tool names are unique");
+    }
+
+    /// A value that fits `schema` (the required properties of an object).
+    fn sample(schema: &Value) -> Value {
+        match schema["type"].as_str() {
+            Some("boolean") => json!(true),
+            Some("integer") => json!(schema["minimum"].as_i64().unwrap_or(1).max(1)),
+            Some("number") => json!(1.0),
+            Some("array") => json!([sample(schema.get("items").unwrap_or(&json!({"type": "string"})))]),
+            Some("object") => {
+                let props = schema["properties"].as_object().cloned().unwrap_or_default();
+                let required = schema["required"].as_array().cloned().unwrap_or_default();
+                Value::Object(required.iter().filter_map(|r| r.as_str()).map(|r| (r.to_owned(), sample(&props[r]))).collect())
+            }
+            _ => match schema.get("enum") {
+                Some(e) => e[0].clone(),
+                None => json!("now"),
+            },
+        }
     }
 
     /// Schema property names match the param structs: a property the struct doesn't know would
@@ -318,21 +387,15 @@ mod tests {
     /// ones).
     #[test]
     fn schema_properties_are_param_fields() {
-        for t in tools() {
+        for t in all_tools() {
             let props = t.input_schema["properties"].as_object().unwrap();
             for (name, schema) in props {
                 let mut args = t.example.as_object().unwrap().clone();
-                let sample = match schema["type"].as_str() {
-                    Some("boolean") => json!(true),
-                    Some("integer") => json!(schema["minimum"].as_i64().unwrap_or(1).max(1)),
-                    Some("number") => json!(1.0),
-                    Some("array") => json!(["movie"]),
-                    _ => match schema.get("enum") {
-                        Some(e) => e[0].clone(),
-                        None => json!("now"),
-                    },
-                };
-                args.insert(name.clone(), sample);
+                // a verb keeps the example's (its other arguments go with it)
+                if name == "action" {
+                    continue;
+                }
+                args.insert(name.clone(), sample(schema));
                 if let Err(e) = Call::from_tool(t.name, Value::Object(args)) {
                     panic!("{}.{name}: {e}", t.name);
                 }

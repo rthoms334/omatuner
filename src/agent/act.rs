@@ -244,6 +244,10 @@ pub fn plan_switch(q: &Q, p: &ScheduleSwitch) -> Out<SwitchPlan> {
         stop,
         lead_s: Reminder::SWITCH_LEAD,
         state: ReminderState::Pending,
+        mode: Default::default(),
+        offset_s: 0,
+        open_in: None,
+        rule_id: None,
     };
     let out = SwitchOut {
         id: 0,

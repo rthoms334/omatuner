@@ -346,6 +346,8 @@ fn method_label(m: EpgMatchMethod) -> &'static str {
         EpgMatchMethod::FeedStripped => "id without feed",
         EpgMatchMethod::NormalizedName => "name",
         EpgMatchMethod::Fuzzy => "similar name",
+        EpgMatchMethod::Sibling => "+1 of its base channel",
+        EpgMatchMethod::Copy => "same channel in another playlist",
     }
 }
 

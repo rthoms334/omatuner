@@ -3,8 +3,8 @@
 //! `ipc.rs` hands every v2 request line to an [`AgentService`]; production uses
 //! [`AgentHandler`]. The handler runs on the tokio runtime (blocking store reads on the blocking
 //! pool, a small pool of lazily opened readers), never on the UI thread:
-//! * queries read the snapshot the app published (`AgentShared::library`), a store reader (EPG,
-//!   progress, favourites, details) and the parental state computed now (`AgentShared::parental`)
+//! * queries read the snapshot the app published (`AppShared::library`), a store reader (EPG,
+//!   progress, favourites, details) and the parental state computed now (`AppShared::parental`)
 //!   — `agent::query`. A snapshot built while unlocked loses its explicit content here when the
 //!   session relocked since (`Library::hiding_explicit`, cached per snapshot);
 //! * `play` validates the target (`agent::act::plan_play`: exists, visible, catch-up window…),
@@ -29,11 +29,11 @@ use super::act::{self, PlayStep};
 use super::guard::{self, Limits};
 use super::proto::{Call, CancelOut, Control, ControlAction, ErrorCode, Reply, Request};
 use super::query::{self, Fail, Out, Q};
-use super::shared::{AgentShared, ParentalView};
 use crate::config::SharedConfig;
 use crate::jobs::JobManager;
 use crate::msg::{AppEvent, DataScope, EventBus};
 use crate::player::{PlayerCommand, PlayerHandle};
+use crate::shared::{AppShared, ParentalView};
 use crate::store::Store;
 use crate::store::library::Library;
 
@@ -61,7 +61,7 @@ pub struct AgentHandler {
 }
 
 struct Inner {
-    shared: Arc<AgentShared>,
+    shared: Arc<AppShared>,
     store: Store,
     config: SharedConfig,
     player: PlayerHandle,
@@ -75,13 +75,13 @@ struct Inner {
 }
 
 impl AgentHandler {
-    pub fn new(shared: Arc<AgentShared>, store: Store, config: SharedConfig, player: PlayerHandle, bus: EventBus, jobs: JobManager) -> Self {
+    pub fn new(shared: Arc<AppShared>, store: Store, config: SharedConfig, player: PlayerHandle, bus: EventBus, jobs: JobManager) -> Self {
         Self::with_limits(shared, store, config, player, bus, jobs, Limits::default())
     }
 
     /// [`AgentHandler::new`] with other request limits (tests).
     pub fn with_limits(
-        shared: Arc<AgentShared>,
+        shared: Arc<AppShared>,
         store: Store,
         config: SharedConfig,
         player: PlayerHandle,
@@ -109,7 +109,11 @@ impl AgentService for AgentHandler {
             };
             let started = Instant::now();
             let reply = match tokio::time::timeout(HANDLER_BUDGET, inner.clone().dispatch(req.call)).await {
-                Ok(Ok(v)) => Reply::ok(id, v),
+                // every result passes the spoiler guard's one choke point (B4)
+                Ok(Ok(mut v)) => {
+                    guard::guard_reply(&mut v, &inner.shared.guard(), crate::guard::Policy::Normal);
+                    Reply::ok(id, v)
+                }
                 Ok(Err(f)) => Reply::err(id, f.code, f.message),
                 Err(_) => {
                     tracing::warn!("agent: {method} took longer than {} s", HANDLER_BUDGET.as_secs());
@@ -164,7 +168,7 @@ impl Inner {
                 let id = self.run(true, move |q| act::check_cancel(q, &p)).await?;
                 self.store
                     .writer()
-                    .submit_notify(DataScope::Reminders, move |c| crate::store::user::remove_reminder(c, id))
+                    .submit_notify(DataScope::Reminders, move |c| crate::store::user::remove_reminder(c, id, crate::model::RemoveWhy::Agent))
                     .recv()
                     .await
                     .map_err(Fail::from)?;
@@ -173,6 +177,23 @@ impl Inner {
                 to_value(&CancelOut { cancelled: true })
             }
             Call::Control(c) => self.control(c).await,
+            // the batch's tools: listed by `tools::tools()` only once their feature is on; until
+            // then a client that calls one anyway hears so (owner: agent track)
+            call @ (Call::Queue(_)
+            | Call::Follow(_)
+            | Call::SpoilerGuard(_)
+            | Call::GuideFix(_)
+            | Call::Multiview(_)
+            | Call::Reminders(_)
+            | Call::SleepTimer(_)
+            | Call::MatchTitles(_)
+            | Call::History(_)
+            | Call::Episodes(_)
+            | Call::FavouritesEdit(_)
+            | Call::ParentalStatus(_)
+            | Call::Lock(_)
+            | Call::Diagnose(_)
+            | Call::Sources(_)) => Err(Fail::new(ErrorCode::Unsupported, format!("{} isn't available in this Tuner yet", call.name()))),
         }
     }
 

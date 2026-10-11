@@ -323,6 +323,10 @@ pub(crate) mod kit {
             stop,
             lead_s: i64::from(ctx.config.reminders.lead_min) * 60,
             state: crate::model::ReminderState::Pending,
+            mode: Default::default(),
+            offset_s: 0,
+            open_in: None,
+            rule_id: None,
         };
         let _ = ctx.services.store.writer().submit_notify(DataScope::Reminders, move |c| crate::store::user::add_reminder(c, &r).map(|_| ()));
         ctx.toast(Toast::info(format!("Reminder set: {title} at {}", hhmm(start, ctx.config.interface.clock_24h))));
@@ -1995,7 +1999,7 @@ mod tests {
 
         // a library without favourites, history or VOD gets the get-started rail
         let app = h.state_mut();
-        app.t.services().player.handle().send(crate::player::PlayerCommand::Stop);
+        app.t.services().tiles.focused().send(crate::player::PlayerCommand::Stop);
         std::thread::sleep(std::time::Duration::from_millis(300));
         app.t.services().store.writer().blocking(|c| Ok(c.execute("DELETE FROM watch_progress", [])?)).unwrap();
         let mut lib = crate::store::library::load(&app.t.services().store.reader().unwrap()).unwrap();

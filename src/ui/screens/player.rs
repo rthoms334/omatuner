@@ -2118,7 +2118,7 @@ mod tests {
     }
 
     fn real(h: &H) -> Arc<PlayerSnapshot> {
-        h.state().t.services().player.handle().snapshot()
+        h.state().t.services().tiles.focused().snapshot()
     }
 
     /// The screen's snapshot: mpv's volume / mute / pause, playing a live channel.

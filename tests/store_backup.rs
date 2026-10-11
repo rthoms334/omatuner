@@ -238,6 +238,10 @@ fn populate(s: &Store, creds: &Creds) -> Fixture {
                 stop: NOW + 7200,
                 lead_s: 300,
                 state: ReminderState::Pending,
+                mode: Default::default(),
+                offset_s: 0,
+                open_in: None,
+                rule_id: None,
             },
         )?;
         epg::set_manual_mapping(c, &ch(m3u, "m3u:aa"), guide, "arte.de")?;

@@ -21,6 +21,13 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("0005_explicit", include_str!("migrations/0005_explicit.sql")),
     ("0006_title_stacks", include_str!("migrations/0006_title_stacks.sql")),
     ("0007_title_join", include_str!("migrations/0007_title_join.sql")),
+    // the big-features batch (numbers fixed by merge order, each idempotent; owners in each
+    // file's header and in the step functions below)
+    ("0008_reminder_modes", include_str!("migrations/0008_reminder_modes.sql")),
+    ("0009_guide_fixes", include_str!("migrations/0009_guide_fixes.sql")),
+    ("0010_play_queue", include_str!("migrations/0010_play_queue.sql")),
+    ("0011_follow", include_str!("migrations/0011_follow.sql")),
+    ("0012_spoiler_guard", include_str!("migrations/0012_spoiler_guard.sql")),
 ];
 
 /// Current schema version after all migrations.
@@ -75,11 +82,11 @@ fn reconcile_renumbered(conn: &mut Connection, current: i64) -> Result<()> {
     Ok(())
 }
 
-fn has_column(conn: &Connection, table: &str, col: &str) -> Result<bool> {
+pub(crate) fn has_column(conn: &Connection, table: &str, col: &str) -> Result<bool> {
     Ok(conn.query_row("SELECT count(*) > 0 FROM pragma_table_info(?1) WHERE name = ?2", [table, col], |r| r.get(0))?)
 }
 
-fn add_column_if_missing(conn: &Connection, table: &str, col: &str, decl: &str) -> Result<()> {
+pub(crate) fn add_column_if_missing(conn: &Connection, table: &str, col: &str, decl: &str) -> Result<()> {
     if !has_column(conn, table, col)? {
         conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {col} {decl}"))?;
     }
@@ -100,8 +107,36 @@ fn backfill(conn: &Connection, name: &str) -> Result<()> {
             crate::store::titles::refresh_all(conn).map(|_| ())
         }
         "0007_title_join" => rebuild_title_link(conn),
+        "0008_reminder_modes" => reminder_modes(conn),
+        "0009_guide_fixes" => guide_fix_columns(conn),
+        "0011_follow" => follow_columns(conn),
         _ => Ok(()),
     }
+}
+
+/// 0008 (owner: remind track): the reminder's mode, start offset and where it opens; rows made
+/// with the old switch marker (`lead_s = Reminder::SWITCH_LEAD`) become `mode = 'switch'`.
+fn reminder_modes(conn: &Connection) -> Result<()> {
+    add_column_if_missing(conn, "reminder", "mode", "TEXT NOT NULL DEFAULT 'notify'")?;
+    add_column_if_missing(conn, "reminder", "offset_s", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "reminder", "open_in", "TEXT")?;
+    conn.execute("UPDATE reminder SET mode = 'switch' WHERE lead_s = ?1 AND mode <> 'switch'", [crate::model::Reminder::SWITCH_LEAD])?;
+    Ok(())
+}
+
+/// 0009 (owner: G-core): the Guide fixes columns (see the script's header).
+fn guide_fix_columns(conn: &Connection) -> Result<()> {
+    add_column_if_missing(conn, "item_override", "shift_min", "INTEGER")?;
+    add_column_if_missing(conn, "item_override", "guide_ok", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "channel_epg_map", "shift_min", "INTEGER")?;
+    add_column_if_missing(conn, "channel_epg_map", "epg_name", "TEXT")?;
+    add_column_if_missing(conn, "channel_epg_map", "actor", "TEXT")?;
+    add_column_if_missing(conn, "channel_epg", "shift_min", "INTEGER")
+}
+
+/// 0011 (owner: F-AB): the Following rule that made a reminder.
+fn follow_columns(conn: &Connection) -> Result<()> {
+    add_column_if_missing(conn, "reminder", "rule_id", "INTEGER REFERENCES follow_rule(id) ON DELETE SET NULL")
 }
 
 /// 0007: `title_link` rebuilt to accept `join` rows with a `join_group` (a CHECK constraint
@@ -300,7 +335,20 @@ mod tests {
         let names: Vec<&str> = MIGRATIONS.iter().map(|m| m.0).collect();
         assert_eq!(
             names,
-            ["0001_init", "0002_category_filter", "0003_quality", "0004_name_rules", "0005_explicit", "0006_title_stacks", "0007_title_join"]
+            [
+                "0001_init",
+                "0002_category_filter",
+                "0003_quality",
+                "0004_name_rules",
+                "0005_explicit",
+                "0006_title_stacks",
+                "0007_title_join",
+                "0008_reminder_modes",
+                "0009_guide_fixes",
+                "0010_play_queue",
+                "0011_follow",
+                "0012_spoiler_guard"
+            ]
         );
         for (t, col) in [
             ("grp", "raw_name"),
@@ -314,9 +362,43 @@ mod tests {
             ("movie", "explicit"),
             ("series", "explicit"),
             ("group_override", "explicit"),
+            ("reminder", "mode"),
+            ("reminder", "offset_s"),
+            ("reminder", "open_in"),
+            ("reminder", "rule_id"),
+            ("item_override", "shift_min"),
+            ("item_override", "guide_ok"),
+            ("channel_epg_map", "shift_min"),
+            ("channel_epg", "shift_min"),
+            ("queue_item", "any_copy"),
+            ("follow_match", "event_key"),
+            ("spoiler_seen", "event_key"),
+            ("guide_fix_log", "actor"),
         ] {
             assert!(has_column(&c, t, col).unwrap(), "{t}.{col}");
         }
+    }
+
+    /// The batch's migrations (0008–0012) are safe to re-run, the way a renumbered branch
+    /// database re-runs them: every script and Rust step again on a migrated database changes
+    /// nothing and fails nothing; an old switch row (`lead_s = -1`) reads as mode 'switch'.
+    #[test]
+    fn batch_migrations_are_idempotent() {
+        let mut c = fresh();
+        c.execute_batch(
+            "INSERT INTO source(name, kind, url, created_at) VALUES ('S', 'm3u-url', 'http://127.0.0.1/p.m3u', 0);
+             INSERT INTO reminder(source_id, channel_key, channel_name, title, start, stop, lead_s) VALUES (1, 'k', 'C', 'T', 10, 20, -1);
+             UPDATE reminder SET mode = 'notify';",
+        )
+        .unwrap();
+        let tx = c.transaction().unwrap();
+        for (name, sql) in MIGRATIONS.iter().skip(7) {
+            tx.execute_batch(sql).unwrap_or_else(|e| panic!("{name}: {e}"));
+            backfill(&tx, name).unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+        tx.commit().unwrap();
+        let mode: String = c.query_row("SELECT mode FROM reminder", [], |r| r.get(0)).unwrap();
+        assert_eq!(mode, "switch");
     }
 
     /// The FTS contract of DESIGN §6.3: contentless FTS keyed by programme.id, inserted with the

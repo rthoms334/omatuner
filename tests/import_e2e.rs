@@ -851,6 +851,10 @@ async fn an_xtream_playlist_upgrades_silently_keeping_user_data_and_can_switch_b
                 stop: 2_000_003_600,
                 lead_s: 120,
                 state: ReminderState::Pending,
+                mode: Default::default(),
+                offset_s: 0,
+                open_in: None,
+                rule_id: None,
             };
             user::add_reminder(c, &r)?;
             Ok(())

@@ -42,6 +42,12 @@ pub struct IpcRequest {
     pub view: Option<ViewArg>,
     pub play: Option<String>,
     pub inputs: Vec<String>,
+    /// `--popout` with `--play`: open in the pop-out without taking focus.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub popout: bool,
+    /// `--reminder <id>`: a reminder timer fired (B6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reminder: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -270,7 +276,7 @@ mod tests {
 
     #[test]
     fn request_and_reply_wire_format() {
-        let req = IpcRequest { view: Some(ViewArg::Guide), play: Some("2:xt:live:1".into()), inputs: vec!["a.m3u".into()] };
+        let req = IpcRequest { view: Some(ViewArg::Guide), play: Some("2:xt:live:1".into()), inputs: vec!["a.m3u".into()], ..Default::default() };
         let s = serde_json::to_string(&req).unwrap();
         assert_eq!(s, r#"{"view":"guide","play":"2:xt:live:1","inputs":["a.m3u"]}"#);
         assert_eq!(serde_json::from_str::<IpcRequest>(&s).unwrap(), req);

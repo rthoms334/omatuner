@@ -82,8 +82,13 @@ fn main() -> anyhow::Result<()> {
 
     // Paths are made absolute HERE: a running instance receiving them over IPC has another
     // working directory.
-    let request =
-        IpcRequest { view: cli.view, play: cli.play.as_deref().map(absolute_input), inputs: cli.inputs.iter().map(|i| absolute_input(i)).collect() };
+    let request = IpcRequest {
+        view: cli.view,
+        play: cli.play.as_deref().map(absolute_input),
+        inputs: cli.inputs.iter().map(|i| absolute_input(i)).collect(),
+        popout: cli.popout,
+        reminder: cli.reminder,
+    };
     // held until the process exits: the database has one owner
     let primary = become_primary(&paths, &request, HANDOFF_WAIT);
     if let Err(e) = &primary

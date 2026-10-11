@@ -196,7 +196,7 @@ impl TunerApp {
     ) -> Self {
         fonts.install(&cc.egui_ctx);
         crate::theme::egui_style::apply(&cc.egui_ctx, &theme);
-        let surface = match services.player.render_core().map(|core| crate::player::VideoSurface::new(core, cc)) {
+        let surface = match services.tiles.a().render_core().map(|core| crate::player::VideoSurface::new(core, cc)) {
             Some(Ok(s)) => Some(s),
             Some(Err(e)) => {
                 tracing::error!("video surface: {e}");
@@ -217,7 +217,7 @@ impl TunerApp {
             }
         };
         let start = start_route(&services.config(), &initial, &db);
-        let snapshot = services.player.handle().snapshot();
+        let snapshot = services.tiles.focused().snapshot();
         let mut app = Self {
             video: VideoHost::new(surface),
             services: Some(services),
@@ -343,7 +343,7 @@ impl TunerApp {
     fn send_player(&self, cmd: PlayerCommand) {
         #[cfg(test)]
         self.log.borrow_mut().commands.push(cmd.clone());
-        self.services().player.handle().send(cmd);
+        self.services().tiles.focused().send(cmd);
     }
 
     /// Every job the app submits goes through here (tests record them).
@@ -422,6 +422,8 @@ impl TunerApp {
             AppEvent::Ipc(req) => self.handle_ipc(req),
             // the handler raised the window (`hypr::focus_self`) and validated the target
             AppEvent::Agent(crate::agent::AgentCommand::Play(p)) => self.on_agent_play(p.clone()),
+            // the batch features' events (owners: F-C, rui, MV-2) — nothing to do until they land
+            AppEvent::Follow(_) | AppEvent::Reminder(_) | AppEvent::Tile(_) => {}
             AppEvent::Platform(p) => match p {
                 PlatformEvent::Quit => egui_ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 PlatformEvent::Raise => crate::platform::hypr::focus_self(),
@@ -638,6 +640,9 @@ impl TunerApp {
             // every zap writes history: patch the recently watched list, never rebuild
             DataScope::History => self.refresh_recent_channels(),
             DataScope::VodDetails | DataScope::Progress => {}
+            // the batch features' own data: their screens and services react (Following's job
+            // raises `Reminders` too; the guard rebuilds in S1's service)
+            DataScope::Follow | DataScope::Spoiler | DataScope::GuideIssues => {}
         }
     }
 
@@ -683,6 +688,12 @@ impl TunerApp {
     /// card at Details; other files/URLs play fullscreen). `main` made file paths absolute in
     /// the invoking process (its working directory may differ from ours).
     fn handle_ipc(&mut self, req: &IpcRequest) {
+        // a reminder timer fired while Tuner was closed or running (B6): the scheduler re-reads
+        // its reminders and fires the due one (routed by `reminders::fire_policy`); the remind /
+        // rui tracks own this branch and `req.popout` (scheduled playback in the pop-out)
+        if req.reminder.is_some() {
+            self.services().agent.wake_reminders();
+        }
         match req.view {
             Some(crate::cli::ViewArg::Search) => self.nav.push(NavRequest::Open(OverlayRequest::Search { initial: String::new() })),
             Some(v) => self.nav.push(NavRequest::Switch(route_for_view(v))),
@@ -1029,7 +1040,7 @@ impl TunerApp {
     fn cancel_switch(&mut self, id: crate::model::ReminderId) {
         self.cancelled_switches.insert(id);
         let _ = self.services().store.writer().submit_notify(DataScope::Reminders, move |c| match crate::store::user::reminder(c, id)? {
-            Some(r) if r.switches() => crate::store::user::remove_reminder(c, id),
+            Some(r) if r.switches() => crate::store::user::remove_reminder(c, id, crate::model::RemoveWhy::User),
             _ => Ok(()),
         });
         self.toast(Toast::info("Switch cancelled"));
@@ -1629,7 +1640,7 @@ impl eframe::App for TunerApp {
         while let Ok(ev) = self.events.try_recv() {
             self.handle_event(ev, ctx);
         }
-        self.snapshot = self.services().player.handle().snapshot();
+        self.snapshot = self.services().tiles.focused().snapshot();
         self.sync_explicit(ctx);
         self.publish_for_agent();
         self.measured.observe(&self.snapshot);
@@ -3242,7 +3253,8 @@ mod tests {
     fn cli_and_ipc_requests() {
         let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_channels(c, 3, None));
         let ipc = |rig: &mut Rig, view, play: Option<&str>, inputs: &[&str]| {
-            let req = IpcRequest { view, play: play.map(str::to_owned), inputs: inputs.iter().map(|s| s.to_string()).collect() };
+            let req =
+                IpcRequest { view, play: play.map(str::to_owned), inputs: inputs.iter().map(|s| s.to_string()).collect(), ..Default::default() };
             rig.event(AppEvent::Ipc(req));
             rig.frame_with(vec![]);
         };
@@ -3283,7 +3295,7 @@ mod tests {
 
     #[test]
     fn initial_cli_request_applies_at_startup() {
-        let req = IpcRequest { view: Some(crate::cli::ViewArg::Settings), play: Some("http://127.0.0.1:9/x.ts".into()), inputs: vec![] };
+        let req = IpcRequest { view: Some(crate::cli::ViewArg::Settings), play: Some("http://127.0.0.1:9/x.ts".into()), ..Default::default() };
         let rig = Rig::with(test_config(), req, 1.0, |_| Ok(()));
         assert_eq!(rig.app.routes, [Route::Settings(Default::default()), Route::Player]);
         assert_eq!(played(&rig.log()), [(MediaRef::Url("http://127.0.0.1:9/x.ts".into()), PlayOrigin::Cli)]);
@@ -3549,7 +3561,7 @@ mod tests {
             s.agent.clone(),
             s.store.clone(),
             s.config.clone(),
-            s.player.handle(),
+            s.tiles.focused(),
             s.bus.clone(),
             s.jobs.clone(),
         );
@@ -3877,7 +3889,7 @@ mod tests {
         let cleanup = rig.app.services().exit_cleanup();
         rig.app.services().rt.block_on(cleanup);
         assert!(!sock.exists());
-        assert_eq!(rig.app.services().player.handle().snapshot().state, PlayerState::Idle);
+        assert_eq!(rig.app.services().tiles.focused().snapshot().state, PlayerState::Idle);
     }
 
     #[test]

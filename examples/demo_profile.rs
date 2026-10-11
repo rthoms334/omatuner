@@ -1099,6 +1099,10 @@ fn user_data(c: &mut Connection, now: Timestamp, progs: &[Prog]) -> tuner::error
                 stop: p.stop,
                 lead_s: 300,
                 state: ReminderState::Pending,
+                mode: Default::default(),
+                offset_s: 0,
+                open_in: None,
+                rule_id: None,
             },
         )?;
     }

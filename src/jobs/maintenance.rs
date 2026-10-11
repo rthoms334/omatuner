@@ -41,6 +41,16 @@ pub async fn rebuild_library(ctx: &JobContext) -> Result<Arc<Library>> {
 /// Prune programmes older than max(keep_past_days, max catch-up days), sweep inactive EPG
 /// generations, compact the guide search index, prune history, `PRAGMA optimize`,
 /// `wal_checkpoint(TRUNCATE)`.
+/// Each feature owner's pruning (DESIGN §2.3 of the batch plan): Up next played rows 7 d, the
+/// Following ledger 30 d (show rules 2 y), spoiler-guard seen rows 30 d after the window, the
+/// guide-fix log 90 d / 200 batches. One transaction.
+pub fn prune_features(conn: &rusqlite::Connection, now: crate::model::Timestamp) -> Result<usize> {
+    Ok(crate::store::queue::prune(conn, now)?
+        + crate::store::follow::prune(conn, now)?
+        + crate::store::spoiler::prune(conn, now)?
+        + crate::store::guide_fix::prune(conn, now)?)
+}
+
 pub async fn maintenance(ctx: &JobContext, progress: &Progress, cancel: &CancellationToken) -> Result<()> {
     let cfg = crate::config::current(&ctx.config);
     let now = crate::model::now();
@@ -71,6 +81,13 @@ pub async fn maintenance(ctx: &JobContext, progress: &Progress, cancel: &Cancell
     // also catches deletions made elsewhere (prunes, removed sources, deferred sweeps);
     // a single no-op step when the index is already compact
     super::import_epg::compact_fts(ctx, cancel).await?;
+
+    let pruned = write(ctx, move |c| prune_features(c, now)).await?;
+    if pruned > 0 {
+        tracing::info!("maintenance pruned {pruned} old Up next / Following / spoiler-guard / guide-fix rows");
+    }
+    // the daily tick: Following marks aired rows and re-arms reminders (B6)
+    super::after_guide_daily(ctx);
 
     progress.set(JobPhase::Finishing);
     let orphans = write(ctx, |c| crate::store::epg::fts_cleanup(c)).await?;

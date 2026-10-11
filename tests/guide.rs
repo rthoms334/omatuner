@@ -97,7 +97,7 @@ fn act(t: &mut TestUi, screen: &mut dyn Screen, a: Action) -> bool {
 
 /// Wait for the REAL player (commands sent by the UI) to satisfy `f`.
 fn player_until(t: &TestUi, what: &str, f: impl Fn(&PlayerSnapshot) -> bool) -> Arc<PlayerSnapshot> {
-    let h = t.services().player.handle();
+    let h = t.services().tiles.focused();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let s = h.snapshot();
@@ -112,7 +112,7 @@ fn player_until(t: &TestUi, what: &str, f: impl Fn(&PlayerSnapshot) -> bool) -> 
 /// The real player received nothing for `ms`.
 fn player_stays_idle(t: &TestUi, ms: u64) {
     std::thread::sleep(Duration::from_millis(ms));
-    let s = t.services().player.handle().snapshot();
+    let s = t.services().tiles.focused().snapshot();
     assert!(s.playable.is_none(), "nothing may play: {:?}", s.playable.as_ref().map(|p| &p.media));
 }
 
@@ -1031,6 +1031,10 @@ fn live_reminders_rows_and_group_reorder() {
                     stop: start + 1800,
                     lead_s: 120,
                     state: tuner::model::ReminderState::Pending,
+                    mode: Default::default(),
+                    offset_s: 0,
+                    open_in: None,
+                    rule_id: None,
                 };
                 tuner::store::user::add_reminder(c, &r)?;
             }
@@ -2027,7 +2031,7 @@ fn tracks_overlay_selects_tracks_and_adjusts_subtitles() {
     assert!(matches!(t.with_ctx(|ctx| o.on_action(ctx, Action::Right)), OverlayOutcome::Keep));
     player_until(&t, "sub scale 1.1", |s| (s.sub_scale - 1.1).abs() < 1e-6);
     // drawn over the video in OSD colours; Esc closes
-    let player = t.services().player.handle();
+    let player = t.services().tiles.focused();
     let mut h = Harness::builder().with_size(egui::vec2(1280.0, 720.0)).build_ui(|ui| {
         let egui_ctx = ui.ctx().clone();
         let _ = t.with_ctx(|ctx| o.ui(&egui_ctx, ctx));

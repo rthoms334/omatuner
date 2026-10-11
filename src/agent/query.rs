@@ -22,13 +22,13 @@ use super::proto::{
     ContinueOut, Details, DetailsOut, EpisodeOut, ErrorCode, FavListOut, Favourites, FavouritesOut, GuideSearch, GuideSearchOut, ItemOut, Kind,
     Limit, ProgrammeOut, ProgressOut, Search, SearchOut, SeasonOut, TitleOut, WhatsOn, WhatsOnOut, fmt_time, item_ref,
 };
-use super::shared::ParentalView;
 use crate::config::Config;
 use crate::jobs::JobKind;
 use crate::model::{
     ChannelId, ChannelSummary, Episode, GroupId, ItemKind, ItemRef, MovieId, ProgrammeSlim, SeriesId, SourceId, SourceKind, Timestamp, VodKind,
     VodSummary, WatchProgress,
 };
+use crate::shared::ParentalView;
 use crate::store::library::{FavIndex, Library, SourceMeta};
 
 /// A request that can't be answered: the error code and a sentence for the model.

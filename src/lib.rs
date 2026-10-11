@@ -40,7 +40,18 @@ pub mod agent;
 pub mod app;
 pub mod devshot;
 pub mod services;
+pub mod shared;
 pub mod ui;
+
+// the big-features batch (DESIGN §31–§35): shared blocks and feature modules
+pub mod follow;
+pub mod guard;
+pub mod guide_fix;
+pub mod playback;
+pub mod queue;
+pub mod reminders;
+pub mod spoiler;
+pub mod textmatch;
 
 /// Application id: binary name, Wayland `app_id` (= Hyprland `class`), MPRIS bus suffix,
 /// `.desktop` basename, XDG directory name.

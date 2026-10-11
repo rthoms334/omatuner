@@ -553,7 +553,8 @@ pub(crate) fn all_history(conn: &Connection) -> Result<Vec<HistoryEntry>> {
 
 // ------------------------------------------------------------------ reminders
 
-pub(crate) const REMINDER_COLS: &str = "id, source_id, channel_key, channel_name, title, start, stop, lead_s, state";
+pub(crate) const REMINDER_COLS: &str =
+    "id, source_id, channel_key, channel_name, title, start, stop, lead_s, state, mode, offset_s, open_in, rule_id";
 
 pub(crate) fn reminder_from_row(r: &Row<'_>) -> rusqlite::Result<Reminder> {
     Ok(Reminder {
@@ -565,6 +566,10 @@ pub(crate) fn reminder_from_row(r: &Row<'_>) -> rusqlite::Result<Reminder> {
         stop: r.get(6)?,
         lead_s: r.get(7)?,
         state: enum_parse(&r.get::<_, String>(8)?).unwrap_or(ReminderState::Pending),
+        mode: enum_parse(&r.get::<_, String>(9)?).unwrap_or_default(),
+        offset_s: r.get(10)?,
+        open_in: r.get::<_, Option<String>>(11)?.and_then(|s| enum_parse(&s)),
+        rule_id: r.get(12)?,
     })
 }
 
@@ -582,8 +587,8 @@ pub fn add_reminder(conn: &Connection, r: &Reminder) -> Result<ReminderId> {
     }
     let fp = fingerprint_of(conn, &r.channel)?;
     conn.execute(
-        "INSERT INTO reminder(source_id, channel_key, channel_name, title, start, stop, lead_s, state, fp)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, COALESCE(?9, '{}'))
+        "INSERT INTO reminder(source_id, channel_key, channel_name, title, start, stop, lead_s, state, fp, mode, offset_s, open_in, rule_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, COALESCE(?9, '{}'), ?10, ?11, ?12, ?13)
          ON CONFLICT(source_id, channel_key, start) DO NOTHING",
         params![
             r.channel.source,
@@ -594,7 +599,11 @@ pub fn add_reminder(conn: &Connection, r: &Reminder) -> Result<ReminderId> {
             r.stop,
             r.lead_s,
             enum_str(&r.state),
-            fp_opt(&fp)
+            fp_opt(&fp),
+            enum_str(&r.mode),
+            r.offset_s,
+            r.open_in.as_ref().map(enum_str),
+            r.rule_id
         ],
     )?;
     Ok(conn.query_row(
@@ -604,9 +613,22 @@ pub fn add_reminder(conn: &Connection, r: &Reminder) -> Result<ReminderId> {
     )?)
 }
 
-pub fn remove_reminder(conn: &Connection, id: ReminderId) -> Result<()> {
+/// Remove a reminder — the ONLY delete path (B6): Settings, the guide's `r` toggle, Cancel
+/// toasts, MCP and maintenance all come here, so Following learns in the same transaction that
+/// the user skipped a match it made (`store::follow::on_reminder_removed`).
+pub fn remove_reminder(conn: &Connection, id: ReminderId, why: crate::model::RemoveWhy) -> Result<()> {
+    crate::store::follow::on_reminder_removed(conn, id, why)?;
     conn.execute("DELETE FROM reminder WHERE id = ?1", [id])?;
     Ok(())
+}
+
+/// Move the pending reminders of one channel by `delta_s` (a time-shift change, B8; called by
+/// `store::retime::channel_shift` in the same transaction). Returns how many moved.
+pub fn retime_reminders(conn: &Connection, source: SourceId, channel_key: &str, delta_s: i64) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE reminder SET start = start + ?3, stop = stop + ?3 WHERE source_id = ?1 AND channel_key = ?2 AND state = 'pending'",
+        params![source, channel_key, delta_s],
+    )?)
 }
 
 pub fn set_reminder_state(conn: &Connection, id: ReminderId, state: ReminderState) -> Result<()> {
@@ -635,7 +657,7 @@ pub fn all_reminders(conn: &Connection) -> Result<Vec<Reminder>> {
 /// pending again. An agent's `schedule_switch` on a programme that already had a notification
 /// reminder (rows are unique per channel + start).
 pub fn set_reminder_switch(conn: &Connection, id: ReminderId) -> Result<()> {
-    if conn.execute("UPDATE reminder SET lead_s = ?2, state = 'pending' WHERE id = ?1", params![id, Reminder::SWITCH_LEAD])? == 0 {
+    if conn.execute("UPDATE reminder SET lead_s = ?2, mode = 'switch', state = 'pending' WHERE id = ?1", params![id, Reminder::SWITCH_LEAD])? == 0 {
         return Err(sql::not_found("reminder", id));
     }
     Ok(())
@@ -643,7 +665,7 @@ pub fn set_reminder_switch(conn: &Connection, id: ReminderId) -> Result<()> {
 
 /// Pending automatic switches (`Reminder::switches`), soonest first.
 pub fn pending_switches(conn: &Connection) -> Result<Vec<Reminder>> {
-    reminders_where(conn, "state = 'pending' AND lead_s = ?1 ORDER BY start, id", [Reminder::SWITCH_LEAD])
+    reminders_where(conn, "state = 'pending' AND (lead_s = ?1 OR mode = 'switch') ORDER BY start, id", [Reminder::SWITCH_LEAD])
 }
 
 /// One reminder by id (any state), if it exists.
@@ -683,6 +705,8 @@ const HOLDERS: &[(&str, &str, &str, &str, &str)] = &[
     ("epg", "channel_epg_map", "'channel'", "channel_key", " AND method = 'manual'"),
     // "Not the same title" / "Always play from" (DESIGN §29.11)
     ("split, pin or join", "title_link", "kind", "item_key", ""),
+    // Up next rows (DESIGN §32): re-keyed items reattach, vanished ones list under Orphans
+    ("queue", "queue_item", "kind", "item_key", ""),
 ];
 
 fn holder_name(s: &str) -> &'static str {

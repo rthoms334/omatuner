@@ -220,7 +220,7 @@ impl World {
         ui.services().store.writer().blocking(move |c| seed(c, now)).unwrap();
         let s = ui.services();
         let handler =
-            AgentHandler::with_limits(s.agent.clone(), s.store.clone(), s.config.clone(), s.player.handle(), s.bus.clone(), s.jobs.clone(), limits);
+            AgentHandler::with_limits(s.agent.clone(), s.store.clone(), s.config.clone(), s.tiles.focused(), s.bus.clone(), s.jobs.clone(), limits);
         Self { ui, handler, now, next: 1 }
     }
 
@@ -691,9 +691,9 @@ fn requests_are_rate_limited() {
 #[test]
 fn status_names_nothing_explicit_that_still_plays() {
     use tuner::agent::query::Q;
-    use tuner::agent::shared::ParentalView;
     use tuner::model::{Playable, PlayableKind};
     use tuner::player::{PlayerSnapshot, PlayerState};
+    use tuner::shared::ParentalView;
     let w = World::new(pin_config());
     w.ui.services()
         .store

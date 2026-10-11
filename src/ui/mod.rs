@@ -18,6 +18,7 @@ pub mod copies;
 pub mod data;
 pub mod epg_grid;
 pub mod layout;
+pub mod multiview;
 pub mod overlays;
 pub mod parental;
 pub mod popout;
@@ -367,7 +368,7 @@ impl<'a> UiCtx<'a> {
     }
     /// Send a player command (non-blocking; never call mpv from the UI thread).
     pub fn play(&self, cmd: crate::player::PlayerCommand) {
-        self.services.player.handle().send(cmd);
+        self.services.tiles.focused().send(cmd);
     }
     /// The quality badge of a channel (measured this session, else the library's: measured
     /// earlier, else from the name), or `None` while Settings ▸ Interface ▸ Quality badges

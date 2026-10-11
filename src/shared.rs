@@ -1,31 +1,62 @@
-//! What the app shares with the agent handler (DESIGN §30.4): the library snapshot it shows and
-//! when the parental session was unlocked. Implemented in the skeleton; owned by the app track.
+//! What the app shares with code that runs off the UI thread (B2; DESIGN §30.4): the MCP
+//! handler, the queue engine, the Following job, the spoiler tracker and the MPRIS router.
+//! Lifted from the MCP pass's `AgentShared` (same API: `publish_library`, `library`,
+//! `parental`); owned by the integrator.
 //!
-//! The handler answers on the tokio runtime, never on the UI thread (which may not run while the
-//! window sits on a hidden workspace). It reads:
-//! * the snapshot the app last published ([`AgentShared::publish_library`], called by the app
+//! These callers answer on the tokio runtime, never on the UI thread (which may not run while
+//! the window sits on a hidden workspace). They read:
+//! * the snapshot the app last published ([`AppShared::publish_library`], called by the app
 //!   whenever `TunerApp::lib` is replaced). The previous snapshot comes back to the caller so the
 //!   app drops it on the memory maintenance thread, never on the UI thread;
 //! * the parental state, computed at request time from the published unlock instant and the
-//!   live config ([`AgentShared::parental`]) — so a session that relocked by its timer while the
+//!   live config ([`AppShared::parental`]) — so a session that relocked by its timer while the
 //!   UI wasn't running counts as locked, and explicit content in a snapshot built while unlocked
-//!   is concealed by the handler itself (`ParentalView::hides_explicit`).
+//!   is concealed by the reader itself (`ParentalView::hides_explicit`);
+//! * the spoiler guard ([`AppShared::guard`], identity until S1), the pictures as the UI last
+//!   published them ([`AppShared::tiles`], B1), the main picture's snapshots
+//!   ([`AppShared::main_player`]) and Up next's snapshot ([`AppShared::queue`], empty until
+//!   Q-core).
+//!
+//! Never hold a snapshot across an await: take it, use it, drop it (the memory field fixes).
+//! Headless `tuner --refresh` has no published library: it uses `Library::load` and treats the
+//! session as locked.
 
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
+use tokio::sync::watch;
+
 use crate::config::ParentalConfig;
 use crate::platform::notify::ReminderWaker;
-use crate::store::library::Library;
+use crate::playback::TilesState;
+use crate::player::PlayerSnapshot;
+use crate::queue::QueueSnapshot;
+use crate::store::library::{ExplicitGate, Library};
 use crate::ui::ParentalSession;
 
-#[derive(Debug, Default)]
-pub struct AgentShared {
+#[derive(Debug)]
+pub struct AppShared {
     lib: RwLock<Arc<Library>>,
     unlocked_at: Mutex<Option<Instant>>,
     /// The reminder scheduler's waker (`Services::start_reminders`): a switch the handler
     /// wrote is picked up at once, UI frame or not.
     reminders: Mutex<Option<ReminderWaker>>,
+    /// Whether explicit content shows now (the jobs' gate; the app writes it every frame).
+    explicit: ExplicitGate,
+    /// The spoiler guard (B4).
+    guard: RwLock<crate::guard::Guard>,
+    /// The pictures (B1), published by the UI.
+    tiles: watch::Sender<TilesState>,
+    /// The main picture's snapshots (`Tiles::main_watch`); `None` before the player starts.
+    main_player: Mutex<Option<watch::Receiver<Arc<PlayerSnapshot>>>>,
+    /// Up next's snapshots (the engine publishes; empty until Q-core).
+    queue: watch::Sender<Arc<QueueSnapshot>>,
+}
+
+impl Default for AppShared {
+    fn default() -> Self {
+        Self::new(ExplicitGate::default())
+    }
 }
 
 /// The parental state at one moment.
@@ -39,7 +70,21 @@ pub struct ParentalView {
     pub pin_active: bool,
 }
 
-impl AgentShared {
+impl AppShared {
+    /// Shared state around the jobs' explicit gate.
+    pub fn new(explicit: ExplicitGate) -> Self {
+        Self {
+            lib: RwLock::default(),
+            unlocked_at: Mutex::default(),
+            reminders: Mutex::default(),
+            explicit,
+            guard: RwLock::default(),
+            tiles: watch::Sender::new(TilesState::default()),
+            main_player: Mutex::default(),
+            queue: watch::Sender::new(Arc::default()),
+        }
+    }
+
     /// Publish the app's snapshot; returns the one it replaces (the caller releases it off the
     /// UI thread), `None` when `lib` is already the published one.
     #[must_use = "drop the old snapshot through `TunerApp::release`"]
@@ -77,6 +122,61 @@ impl AgentShared {
         }
     }
 
+    /// Whether explicit content shows now.
+    pub fn explicit(&self) -> &ExplicitGate {
+        &self.explicit
+    }
+
+    /// The spoiler guard (cheap clone).
+    pub fn guard(&self) -> crate::guard::Guard {
+        self.guard.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// A new guard snapshot (S1's builder).
+    pub fn set_guard(&self, g: crate::guard::Guard) {
+        *self.guard.write().unwrap_or_else(|e| e.into_inner()) = g;
+    }
+
+    /// The pictures as the UI last published them.
+    pub fn tiles(&self) -> TilesState {
+        *self.tiles.borrow()
+    }
+
+    /// The UI publishes the pictures (focus, sound, what each plays); unchanged → no wake-up.
+    pub fn publish_tiles(&self, t: TilesState) {
+        self.tiles.send_if_modified(|cur| std::mem::replace(cur, t) != t);
+    }
+
+    /// Changes of the pictures (MPRIS router, reminder routing while hidden).
+    pub fn subscribe_tiles(&self) -> watch::Receiver<TilesState> {
+        self.tiles.subscribe()
+    }
+
+    /// The main picture's player started (`Services::start`).
+    pub fn set_main_player(&self, rx: watch::Receiver<Arc<PlayerSnapshot>>) {
+        *self.main_player.lock().unwrap_or_else(|e| e.into_inner()) = Some(rx);
+    }
+
+    /// The main picture's snapshots (the queue engine, the spoiler tracker).
+    pub fn main_player(&self) -> Option<watch::Receiver<Arc<PlayerSnapshot>>> {
+        self.main_player.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Up next's latest snapshot.
+    pub fn queue(&self) -> Arc<QueueSnapshot> {
+        self.queue.borrow().clone()
+    }
+
+    /// Changes of Up next (UI panel, MPRIS, Home, the agent).
+    pub fn subscribe_queue(&self) -> watch::Receiver<Arc<QueueSnapshot>> {
+        self.queue.subscribe()
+    }
+
+    /// The queue engine publishes.
+    pub fn publish_queue(&self, q: Arc<QueueSnapshot>) {
+        self.queue.send_replace(q);
+    }
+
     /// The parental state now, under `cfg` (the live config).
     pub fn parental(&self, cfg: &ParentalConfig) -> ParentalView {
         let at = *self.unlocked_at.lock().unwrap_or_else(|e| e.into_inner());
@@ -91,7 +191,7 @@ mod tests {
 
     #[test]
     fn publishing_hands_back_the_old_snapshot_once() {
-        let shared = AgentShared::default();
+        let shared = AppShared::default();
         assert_eq!(shared.library().built_at, 0);
         let a = Arc::new(Library { built_at: 1, ..Default::default() });
         let old = shared.publish_library(&a).expect("replaced the default");
@@ -110,7 +210,7 @@ mod tests {
             relock_min: 1,
             ..Default::default()
         };
-        let shared = AgentShared::default();
+        let shared = AppShared::default();
         assert_eq!(shared.parental(&cfg), ParentalView { unlocked: false, hides_explicit: true, pin_active: true });
         shared.set_unlocked_at(Some(Instant::now()));
         assert!(shared.parental(&cfg).unlocked && !shared.parental(&cfg).hides_explicit);

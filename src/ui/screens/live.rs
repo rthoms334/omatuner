@@ -158,7 +158,7 @@ pub(crate) fn toggle_reminder(ctx: &mut UiCtx<'_>, ch: &ChannelSummary, p: &Prog
     let writer = ctx.services.store.writer();
     match existing {
         Some(id) => {
-            let _ = writer.submit_notify(DataScope::Reminders, move |c| crate::store::user::remove_reminder(c, id));
+            let _ = writer.submit_notify(DataScope::Reminders, move |c| crate::store::user::remove_reminder(c, id, crate::model::RemoveWhy::User));
             ctx.toast(Toast::info(format!("Reminder cancelled: {}", p.title)));
         }
         None => {
@@ -175,6 +175,10 @@ pub(crate) fn toggle_reminder(ctx: &mut UiCtx<'_>, ch: &ChannelSummary, p: &Prog
                 stop: p.stop,
                 lead_s: i64::from(ctx.config.reminders.lead_min) * 60,
                 state: ReminderState::Pending,
+                mode: Default::default(),
+                offset_s: 0,
+                open_in: None,
+                rule_id: None,
             };
             let _ = writer.submit_notify(DataScope::Reminders, move |c| crate::store::user::add_reminder(c, &r).map(|_| ()));
             let when = hhmm(p.start, ctx.config.interface.clock_24h);
@@ -665,44 +669,20 @@ pub struct LiveScreen {
 /// words dropped), another playlist, not hidden, not DRM-only; a channel whose tvg-id differs
 /// from `ch`'s (both known) is another channel. Best quality first within a playlist, playlists
 /// in their order. `tvg` reads the tvg-ids of some channels (`None`: the frame budget is spent).
+/// The rule itself is `store::copies::channel_copies_with` (B5); this keeps the UI's frame
+/// budget and the list's length.
 pub(crate) fn also_on(
     lib: &crate::store::library::Library,
     ch: &ChannelSummary,
     tvg: impl FnOnce(&[ChannelId]) -> Option<std::collections::HashMap<ChannelId, String>>,
 ) -> Option<Vec<ChannelId>> {
-    let live = &lib.live;
-    let mut alts: Vec<&ChannelSummary> = live
-        .channels
-        .iter()
-        .filter(|c| c.family == ch.family && c.source_id != ch.source_id && !c.unsupported && !live.hidden.contains(&c.id))
-        .collect();
-    if alts.is_empty() {
-        return Some(Vec::new());
-    }
-    let mut ids: Vec<ChannelId> = alts.iter().map(|c| c.id).collect();
-    ids.push(ch.id);
-    let tvg = tvg(&ids)?;
-    let id_of = |c: ChannelId| tvg.get(&c).map(|t| t.trim()).filter(|t| !t.is_empty());
-    if let Some(own) = id_of(ch.id) {
-        alts.retain(|c| id_of(c.id).is_none_or(|t| t.eq_ignore_ascii_case(own)));
-    }
-    // playlists in their order (the vector's), the best quality first inside one
-    let rank = |s: SourceId| lib.sources.iter().position(|m| m.id == s).unwrap_or(usize::MAX);
-    alts.sort_by_key(|c| (rank(c.source_id), std::cmp::Reverse(c.quality.map(|q| q.class as u8)), c.provider_order));
-    Some(alts.into_iter().take(MAX_ALSO_ON).map(|c| c.id).collect())
+    let copies = crate::store::copies::channel_copies_with(lib, ch, tvg)?;
+    Some(copies.into_iter().take(MAX_ALSO_ON).map(|c| c.id).collect())
 }
 
-/// The tvg-ids of `ids` (one indexed read).
+/// The tvg-ids of `ids` (one indexed read each).
 fn tvg_ids(conn: &rusqlite::Connection, ids: &[ChannelId]) -> crate::error::Result<std::collections::HashMap<ChannelId, String>> {
-    use rusqlite::OptionalExtension;
-    let mut stmt = conn.prepare_cached("SELECT tvg_id FROM channel WHERE id = ?1")?;
-    let mut out = std::collections::HashMap::new();
-    for id in ids {
-        if let Some(t) = stmt.query_row([id.0], |r| r.get::<_, Option<String>>(0)).optional()?.flatten() {
-            out.insert(*id, t);
-        }
-    }
-    Ok(out)
+    crate::store::copies::tvg_ids(conn, ids)
 }
 
 /// Channel management shared by Live and the Guide: favourite, lists, hide, rename, lock (the
@@ -1682,7 +1662,11 @@ impl LiveScreen {
             Some(Entry::Reminders) => {
                 if let Some(r) = self.cursor_reminder().filter(|r| r.channel == channel_ref(ch)) {
                     let id = r.id;
-                    let _ = ctx.services.store.writer().submit_notify(DataScope::Reminders, move |c| crate::store::user::remove_reminder(c, id));
+                    let _ = ctx
+                        .services
+                        .store
+                        .writer()
+                        .submit_notify(DataScope::Reminders, move |c| crate::store::user::remove_reminder(c, id, crate::model::RemoveWhy::User));
                     ctx.toast(Toast::info(format!("Reminder cancelled: {}", r.programme_title)));
                 }
             }
@@ -2517,7 +2501,7 @@ mod tests {
         assert!(has_label(&h, "Also on Bravo"), "Bravo has Channel 0");
         assert!(!has_label_containing(&h, "Also on Charlie"), "a hidden channel isn't offered");
         assert_eq!(h.state().s.hint_extras(), vec![(Action::PlayFrom, "also on")]);
-        let playing = |h: &H| h.state().t.services().player.handle().snapshot().playable.as_ref().map(|p| p.media.clone());
+        let playing = |h: &H| h.state().t.services().tiles.focused().snapshot().playable.as_ref().map(|p| p.media.clone());
         // a click plays Bravo's copy here — the cursor stays on Alpha's
         h.get_by_label("Also on Bravo").click();
         h.run_steps(1);
@@ -2558,7 +2542,7 @@ mod tests {
             resume: false,
             immediate: true,
         };
-        h.state().t.services().player.handle().send(crate::player::PlayerCommand::Play(other));
+        h.state().t.services().tiles.focused().send(crate::player::PlayerCommand::Play(other));
         testkit::until(&mut h, "Alpha's Channel 2 plays", |h| playing(h) == Some(MediaRef::Channel(a_ch[2])));
         h.state_mut().enter(Route::Live { group: None, channel: Some(a_ch[0]) });
         h.run_steps(2);

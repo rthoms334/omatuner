@@ -44,6 +44,8 @@
 //!   id, no rerun).
 
 pub mod details;
+pub mod follow;
+pub mod guide_check;
 pub mod import_epg;
 pub mod import_source;
 pub mod maintenance;
@@ -118,6 +120,14 @@ pub enum JobKind {
         mode: RestoreMode,
         settings: bool,
     },
+    /// Evaluate the Following rules against the guide and write their reminders (DESIGN §33,
+    /// B7; `jobs::follow`). One dedupe key ("follows") whatever the reason.
+    EvaluateFollows {
+        reason: crate::follow::FollowReason,
+    },
+    /// Guide fixes' background check: probes, suggestions, classification cache (DESIGN §31,
+    /// B7; `jobs::guide_check`).
+    GuideCheck,
 }
 
 impl JobKind {
@@ -137,6 +147,8 @@ impl JobKind {
             JobKind::Maintenance => "maintenance".into(),
             JobKind::ExportBackup { path, .. } => format!("export-backup:{}", path.display()),
             JobKind::ImportBackup { path, .. } => format!("import-backup:{}", path.display()),
+            JobKind::EvaluateFollows { .. } => "follows".into(),
+            JobKind::GuideCheck => "guide-check".into(),
         }
     }
 
@@ -519,6 +531,8 @@ fn label_for(kind: &JobKind, subject: Option<&str>) -> String {
         JobKind::Maintenance => "Tidying up the database".into(),
         JobKind::ExportBackup { .. } => "Exporting backup".into(),
         JobKind::ImportBackup { .. } => "Restoring backup".into(),
+        JobKind::EvaluateFollows { .. } => "Checking what you follow".into(),
+        JobKind::GuideCheck => "Checking guide data".into(),
     }
 }
 
@@ -538,6 +552,8 @@ fn failure_for(kind: &JobKind, subject: Option<&str>) -> String {
         JobKind::Maintenance => "Database maintenance failed".into(),
         JobKind::ExportBackup { .. } => "Couldn't export the backup".into(),
         JobKind::ImportBackup { .. } => "Couldn't restore the backup".into(),
+        JobKind::EvaluateFollows { .. } => "Couldn't check what you follow".into(),
+        JobKind::GuideCheck => "Couldn't check the guide data".into(),
     }
 }
 
@@ -600,6 +616,9 @@ struct Limits {
     epg: Arc<Semaphore>,
     details: Arc<Semaphore>,
     other: Arc<Semaphore>,
+    /// Following's evaluation and the guide check: one at a time (B7), after the import that
+    /// submitted them.
+    features: Arc<Semaphore>,
 }
 
 impl Limits {
@@ -609,6 +628,7 @@ impl Limits {
             epg: Arc::new(Semaphore::new(1)),
             details: Arc::new(Semaphore::new(4)),
             other: Arc::new(Semaphore::new(2)),
+            features: Arc::new(Semaphore::new(1)),
         }
     }
 
@@ -617,6 +637,7 @@ impl Limits {
             JobKind::RefreshSource { .. } | JobKind::AddSource(_) | JobKind::ProbeSource(_) => self.playlists.clone(),
             JobKind::RefreshEpg { .. } | JobKind::RematchEpg => self.epg.clone(),
             JobKind::LoadMovieDetails(_) | JobKind::LoadSeriesDetails(_) => self.details.clone(),
+            JobKind::EvaluateFollows { .. } | JobKind::GuideCheck => self.features.clone(),
             _ => self.other.clone(),
         }
     }
@@ -875,12 +896,39 @@ async fn execute(ctx: &JobContext, kind: &JobKind, progress: &Progress, cancel: 
             progress.set(JobPhase::Writing { done: 0, total: None });
             Ok(JobOutcome::Restored(maintenance::import_backup(ctx, path, *mode, *settings).await?))
         }
+        JobKind::EvaluateFollows { reason } => {
+            follow::evaluate(ctx, *reason, progress, cancel).await?;
+            Ok(JobOutcome::Nothing)
+        }
+        JobKind::GuideCheck => {
+            guide_check::run(ctx, progress, cancel).await?;
+            Ok(JobOutcome::Nothing)
+        }
     }
 }
 
 /// `DataScope` notification helper for job bodies.
 fn notify(ctx: &JobContext, scope: DataScope) {
     ctx.bus.data_changed(scope)
+}
+
+/// The daily maintenance tick (B6/B7): Following marks aired rows and re-arms reminders.
+pub(crate) fn after_guide_daily(ctx: &JobContext) {
+    if crate::follow::ENABLED {
+        (ctx.submit)(JobKind::EvaluateFollows { reason: crate::follow::FollowReason::Daily });
+    }
+}
+
+/// The pipeline after a guide import, a rematch or a Guide fixes mapping change (B7): Following
+/// re-evaluates, the guide check refreshes its cache — each only once its feature is on; the
+/// "features" lane runs them one at a time.
+pub(crate) fn after_guide(ctx: &JobContext, reason: crate::follow::FollowReason) {
+    if crate::follow::ENABLED {
+        (ctx.submit)(JobKind::EvaluateFollows { reason });
+    }
+    if crate::guide_fix::ENABLED {
+        (ctx.submit)(JobKind::GuideCheck);
+    }
 }
 
 #[cfg(test)]
