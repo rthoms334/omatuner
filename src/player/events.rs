@@ -104,18 +104,33 @@ pub enum EndReason {
 /// Owned mpv event.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MpvEvent {
-    StartFile { entry_id: i64 },
+    StartFile {
+        entry_id: i64,
+    },
     FileLoaded,
-    /// `error` is an mpv error code (< 0) when `reason == Error`.
-    EndFile { reason: EndReason, error: i32, entry_id: i64 },
+    /// `error` is an mpv error code (< 0) when `reason == Error`. `inserted`: the first entry
+    /// a playlist expanded into (`reason == Redirect`), when mpv reports it.
+    EndFile {
+        reason: EndReason,
+        error: i32,
+        entry_id: i64,
+        inserted: Option<i64>,
+    },
     PlaybackRestart,
     VideoReconfig,
     AudioReconfig,
     Seek,
     Idle,
-    Prop { id: PropId, value: PropValue },
+    Prop {
+        id: PropId,
+        value: PropValue,
+    },
     /// Already redacted. Only `warn` and above are requested.
-    Log { level: String, prefix: String, text: String },
+    Log {
+        level: String,
+        prefix: String,
+        text: String,
+    },
     QueueOverflow,
     Shutdown,
 }
@@ -161,7 +176,9 @@ impl EventPump {
 }
 
 impl Drop for EventPump {
-    fn drop(&mut self) { self.stop(); }
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 fn cstr(p: *const std::os::raw::c_char) -> String {
@@ -193,7 +210,8 @@ fn pump(mpv: Arc<Mpv>, tx: Sender<MpvEvent>, stop: Arc<AtomicBool>) {
                     sys::mpv_end_file_reason_MPV_END_FILE_REASON_REDIRECT => EndReason::Redirect,
                     _ => EndReason::Unknown,
                 };
-                MpvEvent::EndFile { reason, error: d.error, entry_id: d.playlist_entry_id }
+                let inserted = (d.playlist_insert_num_entries > 0).then_some(d.playlist_insert_id);
+                MpvEvent::EndFile { reason, error: d.error, entry_id: d.playlist_entry_id, inserted }
             }
             sys::mpv_event_id_MPV_EVENT_PLAYBACK_RESTART => MpvEvent::PlaybackRestart,
             sys::mpv_event_id_MPV_EVENT_VIDEO_RECONFIG => MpvEvent::VideoReconfig,
@@ -203,11 +221,7 @@ fn pump(mpv: Arc<Mpv>, tx: Sender<MpvEvent>, stop: Arc<AtomicBool>) {
             sys::mpv_event_id_MPV_EVENT_QUEUE_OVERFLOW => MpvEvent::QueueOverflow,
             sys::mpv_event_id_MPV_EVENT_LOG_MESSAGE => {
                 let d = unsafe { &*(ev.data as *const sys::mpv_event_log_message) };
-                MpvEvent::Log {
-                    level: cstr(d.level),
-                    prefix: cstr(d.prefix),
-                    text: crate::redact::redact(cstr(d.text).trim_end()).into_owned(),
-                }
+                MpvEvent::Log { level: cstr(d.level), prefix: cstr(d.prefix), text: crate::redact::redact(cstr(d.text).trim_end()).into_owned() }
             }
             sys::mpv_event_id_MPV_EVENT_PROPERTY_CHANGE => {
                 let Some(id) = PropId::from_u64(ev.reply_userdata) else { continue };

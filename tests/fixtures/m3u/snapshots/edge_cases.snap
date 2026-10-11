@@ -1,0 +1,435 @@
+---
+source: tests/m3u.rs
+expression: "(header, entries)"
+---
+(
+    M3uHeader {
+        tvg_urls: [
+            "http://epg.example/a.xml.gz",
+            "http://epg.example/b.xml",
+        ],
+        tvg_shift_h: Some(
+            -1.5,
+        ),
+        catchup: Some(
+            CatchupSpec {
+                kind: Shift,
+                template: None,
+                days: 3,
+                correction_s: 0,
+            },
+        ),
+        attrs: [],
+    },
+    [
+        M3uEntry {
+            line: 3,
+            title: "UK | BBC One FHD",
+            attrs: [
+                (
+                    "tvg-id",
+                    "bbc1.uk",
+                ),
+                (
+                    "tvg-name",
+                    "BBC One",
+                ),
+                (
+                    "tvg-logo",
+                    "http://logos.example/bbc1.png",
+                ),
+                (
+                    "tvg-chno",
+                    "101",
+                ),
+                (
+                    "group-title",
+                    "UK;News",
+                ),
+            ],
+            tvg_id: Some(
+                "bbc1.uk",
+            ),
+            tvg_name: Some(
+                "BBC One",
+            ),
+            tvg_logo: Some(
+                "http://logos.example/bbc1.png",
+            ),
+            tvg_chno: Some(
+                101,
+            ),
+            groups: [
+                "UK",
+                "News",
+            ],
+            tvg_shift_h: Some(
+                -1.5,
+            ),
+            catchup: Some(
+                CatchupSpec {
+                    kind: Shift,
+                    template: None,
+                    days: 3,
+                    correction_s: 0,
+                },
+            ),
+            headers: HttpHeaders {
+                user_agent: None,
+                referrer: None,
+                origin: None,
+                extra: [],
+            },
+            radio: false,
+            drm: false,
+            url: "http://streams.example/live/bbc1.m3u8",
+        },
+        M3uEntry {
+            line: 8,
+            title: "CNN, International",
+            attrs: [
+                (
+                    "tvg-id",
+                    "cnn.us@SD",
+                ),
+                (
+                    "group-title",
+                    "News",
+                ),
+                (
+                    "tvg-logo",
+                    "cnn.png",
+                ),
+            ],
+            tvg_id: Some(
+                "cnn.us@SD",
+            ),
+            tvg_name: None,
+            tvg_logo: Some(
+                "http://lists.example/playlists/cnn.png",
+            ),
+            tvg_chno: None,
+            groups: [
+                "News",
+            ],
+            tvg_shift_h: Some(
+                -1.5,
+            ),
+            catchup: Some(
+                CatchupSpec {
+                    kind: Shift,
+                    template: None,
+                    days: 3,
+                    correction_s: 0,
+                },
+            ),
+            headers: HttpHeaders {
+                user_agent: Some(
+                    "Mozilla/5.0 (X11)",
+                ),
+                referrer: Some(
+                    "https://cnn.example/",
+                ),
+                origin: None,
+                extra: [],
+            },
+            radio: false,
+            drm: false,
+            url: "http://lists.example/playlists/cnn/index.m3u8",
+        },
+        M3uEntry {
+            line: 11,
+            title: "ESPN HD",
+            attrs: [
+                (
+                    "tvg-id",
+                    "espn",
+                ),
+                (
+                    "tvg-name",
+                    "ESPN, HD",
+                ),
+            ],
+            tvg_id: Some(
+                "espn",
+            ),
+            tvg_name: Some(
+                "ESPN, HD",
+            ),
+            tvg_logo: None,
+            tvg_chno: None,
+            groups: [
+                "Sports",
+            ],
+            tvg_shift_h: Some(
+                -1.5,
+            ),
+            catchup: Some(
+                CatchupSpec {
+                    kind: Shift,
+                    template: None,
+                    days: 3,
+                    correction_s: 0,
+                },
+            ),
+            headers: HttpHeaders {
+                user_agent: Some(
+                    "VLC",
+                ),
+                referrer: Some(
+                    "http://a.example/",
+                ),
+                origin: None,
+                extra: [],
+            },
+            radio: false,
+            drm: false,
+            url: "http://streams.example/espn.ts",
+        },
+        M3uEntry {
+            line: 15,
+            title: "Premium DRM",
+            attrs: [
+                (
+                    "tvg-id",
+                    "drm1",
+                ),
+                (
+                    "group-title",
+                    "Premium",
+                ),
+            ],
+            tvg_id: Some(
+                "drm1",
+            ),
+            tvg_name: None,
+            tvg_logo: None,
+            tvg_chno: None,
+            groups: [
+                "Premium",
+            ],
+            tvg_shift_h: Some(
+                -1.5,
+            ),
+            catchup: Some(
+                CatchupSpec {
+                    kind: Shift,
+                    template: None,
+                    days: 3,
+                    correction_s: 0,
+                },
+            ),
+            headers: HttpHeaders {
+                user_agent: None,
+                referrer: None,
+                origin: None,
+                extra: [],
+            },
+            radio: false,
+            drm: true,
+            url: "https://drm.example/manifest.mpd",
+        },
+        M3uEntry {
+            line: 17,
+            title: "Archive Channel",
+            attrs: [
+                (
+                    "tvg-id",
+                    "arch",
+                ),
+                (
+                    "catchup",
+                    "xc",
+                ),
+                (
+                    "catchup-days",
+                    "7",
+                ),
+                (
+                    "group-title",
+                    "Archive",
+                ),
+            ],
+            tvg_id: Some(
+                "arch",
+            ),
+            tvg_name: None,
+            tvg_logo: None,
+            tvg_chno: None,
+            groups: [
+                "Archive",
+            ],
+            tvg_shift_h: Some(
+                -1.5,
+            ),
+            catchup: Some(
+                CatchupSpec {
+                    kind: Xc,
+                    template: None,
+                    days: 7,
+                    correction_s: 0,
+                },
+            ),
+            headers: HttpHeaders {
+                user_agent: None,
+                referrer: None,
+                origin: None,
+                extra: [],
+            },
+            radio: false,
+            drm: false,
+            url: "http://panel.example:8080/live/user/pass/1234.ts",
+        },
+        M3uEntry {
+            line: 19,
+            title: "Legacy Timeshift",
+            attrs: [
+                (
+                    "timeshift",
+                    "2",
+                ),
+                (
+                    "group-title",
+                    "Archive",
+                ),
+            ],
+            tvg_id: None,
+            tvg_name: None,
+            tvg_logo: None,
+            tvg_chno: None,
+            groups: [
+                "Archive",
+            ],
+            tvg_shift_h: Some(
+                -1.5,
+            ),
+            catchup: Some(
+                CatchupSpec {
+                    kind: Shift,
+                    template: None,
+                    days: 2,
+                    correction_s: 0,
+                },
+            ),
+            headers: HttpHeaders {
+                user_agent: None,
+                referrer: None,
+                origin: None,
+                extra: [],
+            },
+            radio: false,
+            drm: false,
+            url: "http://fs.example/ch/mpegts",
+        },
+        M3uEntry {
+            line: 21,
+            title: "Radio One",
+            attrs: [
+                (
+                    "radio",
+                    "true",
+                ),
+                (
+                    "group-title",
+                    "Radio",
+                ),
+            ],
+            tvg_id: None,
+            tvg_name: None,
+            tvg_logo: None,
+            tvg_chno: None,
+            groups: [
+                "Radio",
+            ],
+            tvg_shift_h: Some(
+                -1.5,
+            ),
+            catchup: Some(
+                CatchupSpec {
+                    kind: Shift,
+                    template: None,
+                    days: 3,
+                    correction_s: 0,
+                },
+            ),
+            headers: HttpHeaders {
+                user_agent: None,
+                referrer: None,
+                origin: None,
+                extra: [],
+            },
+            radio: true,
+            drm: false,
+            url: "http://radio.example/one.aac",
+        },
+        M3uEntry {
+            line: 23,
+            title: "bare-stream.m3u8",
+            attrs: [],
+            tvg_id: None,
+            tvg_name: None,
+            tvg_logo: None,
+            tvg_chno: None,
+            groups: [
+                "Sports",
+            ],
+            tvg_shift_h: Some(
+                -1.5,
+            ),
+            catchup: Some(
+                CatchupSpec {
+                    kind: Shift,
+                    template: None,
+                    days: 3,
+                    correction_s: 0,
+                },
+            ),
+            headers: HttpHeaders {
+                user_agent: None,
+                referrer: None,
+                origin: None,
+                extra: [],
+            },
+            radio: false,
+            drm: false,
+            url: "http://bare.example/path/bare-stream.m3u8",
+        },
+        M3uEntry {
+            line: 25,
+            title: "CNN, International",
+            attrs: [
+                (
+                    "group-title",
+                    "News",
+                ),
+            ],
+            tvg_id: None,
+            tvg_name: None,
+            tvg_logo: None,
+            tvg_chno: None,
+            groups: [
+                "News",
+            ],
+            tvg_shift_h: Some(
+                -1.5,
+            ),
+            catchup: Some(
+                CatchupSpec {
+                    kind: Shift,
+                    template: None,
+                    days: 3,
+                    correction_s: 0,
+                },
+            ),
+            headers: HttpHeaders {
+                user_agent: None,
+                referrer: None,
+                origin: None,
+                extra: [],
+            },
+            radio: false,
+            drm: false,
+            url: "http://streams.example/cnn-backup.m3u8",
+        },
+    ],
+)

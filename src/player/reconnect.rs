@@ -52,7 +52,11 @@ impl ReconnectPolicy {
             K::HttpNotFound => (live && attempt <= 1).then(|| Duration::from_secs(2)),
             K::HttpOther(code) if (400..500).contains(&code) => None,
             K::Network | K::Timeout | K::Stalled | K::StreamEnded | K::HttpOther(_) | K::Mpv => {
-                if attempt > max { None } else { backoff(attempt) }
+                if attempt > max {
+                    None
+                } else {
+                    backoff(attempt)
+                }
             }
         }
     }

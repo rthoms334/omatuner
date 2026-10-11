@@ -24,6 +24,12 @@
 //!
 //! Printable symbols (`?`, `/`, `[`, `F`) are matched against `egui::Event::Text` (layout
 //! independent, shift already applied); named keys and Ctrl/Alt chords against `Event::Key`.
+//!
+//! Caller contract (`App::raw_input_hook`): egui-winit suppresses the `Event::Text` of Ctrl/Cmd
+//! chords but NOT of Alt chords, so Alt+1 arrives as `Key{Num1, alt}` (→ `GoHome`) followed by
+//! `Text("1")` (→ `Digit(1)` in the guide, `FilterInput('1')` in a list). When a Key event with
+//! `alt` resolves to an action, the hook must also drop the `Text` event that immediately
+//! follows it. `resolve` is per-event and cannot see that pairing.
 
 use eframe::egui::{self, Key};
 
@@ -239,12 +245,24 @@ pub struct KeyChord {
 }
 
 impl KeyChord {
-    pub const fn key(k: Key) -> Self { Self { trigger: Trigger::Key(k), ctrl: false, alt: false, shift: false } }
-    pub const fn ch(c: char) -> Self { Self { trigger: Trigger::Char(c), ctrl: false, alt: false, shift: false } }
-    pub const fn ctrl(k: Key) -> Self { Self { trigger: Trigger::Key(k), ctrl: true, alt: false, shift: false } }
-    pub const fn alt(k: Key) -> Self { Self { trigger: Trigger::Key(k), ctrl: false, alt: true, shift: false } }
-    pub const fn shift(k: Key) -> Self { Self { trigger: Trigger::Key(k), ctrl: false, alt: false, shift: true } }
-    pub const fn ctrl_shift(k: Key) -> Self { Self { trigger: Trigger::Key(k), ctrl: true, alt: false, shift: true } }
+    pub const fn key(k: Key) -> Self {
+        Self { trigger: Trigger::Key(k), ctrl: false, alt: false, shift: false }
+    }
+    pub const fn ch(c: char) -> Self {
+        Self { trigger: Trigger::Char(c), ctrl: false, alt: false, shift: false }
+    }
+    pub const fn ctrl(k: Key) -> Self {
+        Self { trigger: Trigger::Key(k), ctrl: true, alt: false, shift: false }
+    }
+    pub const fn alt(k: Key) -> Self {
+        Self { trigger: Trigger::Key(k), ctrl: false, alt: true, shift: false }
+    }
+    pub const fn shift(k: Key) -> Self {
+        Self { trigger: Trigger::Key(k), ctrl: false, alt: false, shift: true }
+    }
+    pub const fn ctrl_shift(k: Key) -> Self {
+        Self { trigger: Trigger::Key(k), ctrl: true, alt: false, shift: true }
+    }
 
     /// Human label: "Ctrl+K", "Shift+Enter", "?", "↑".
     pub fn label(&self) -> String {
@@ -297,7 +315,9 @@ pub struct Binding {
     pub help: &'static str,
 }
 
-const fn b(chord: KeyChord, action: Action, help: &'static str) -> Binding { Binding { chord, action, help } }
+const fn b(chord: KeyChord, action: Action, help: &'static str) -> Binding {
+    Binding { chord, action, help }
+}
 
 use Action as A;
 use KeyChord as C;
@@ -324,8 +344,8 @@ pub static GLOBAL: &[Binding] = &[
     b(C::key(Key::F1), A::ToggleHelp, "Keyboard help"),
 ];
 
-/// Shared by List / ListFiltering / PosterGrid(Filtering) / Detail / Search: item actions on
-/// Ctrl chords and Delete.
+/// Shared by List / ListFiltering / PosterGrid(Filtering) / Detail: item actions on Ctrl
+/// chords and Delete (Search has its own subset, [`SEARCH_ITEM_ACTIONS`]).
 pub static ITEM_ACTIONS: &[Binding] = &[
     b(C::ctrl(Key::F), A::ToggleFavourite, "Add to / remove from Favourites"),
     b(C::ctrl_shift(Key::F), A::AddToList, "Favourites lists… (add, new list)"),
@@ -474,7 +494,14 @@ pub static GUIDE: &[Binding] = &[
     b(C::ch('8'), A::Digit(8), "Jump to channel number"),
     b(C::ch('9'), A::Digit(9), "Jump to channel number"),
     b(C::ctrl(Key::F), A::ToggleFavourite, "Add channel to Favourites"),
+    b(C::ctrl_shift(Key::F), A::AddToList, "Favourites lists… (add, new list)"),
     b(C::ctrl(Key::E), A::AssignEpg, "Assign EPG channel"),
+    b(C::ctrl(Key::I), A::ShowDetails, "Edit channel information"),
+    b(C::key(Key::F2), A::Rename, "Rename channel"),
+    b(C::ctrl(Key::H), A::ToggleHidden, "Hide channel"),
+    b(C::ctrl(Key::L), A::ToggleLock, "Lock channel with PIN / unlock"),
+    b(C::shift(Key::F10), A::ContextMenu, "Channel menu"),
+    b(C::ctrl(Key::Enter), A::ContextMenu, "Channel menu"),
     b(C::ch('/'), A::OpenSearch, "Search everything"),
     b(C::ch('?'), A::ToggleHelp, "Keyboard help"),
     b(C::key(Key::Escape), A::Back, "Back"),
@@ -580,10 +607,8 @@ pub static NUMERIC_ENTRY: &[Binding] = &[
 ];
 
 /// Stacked above `List`/`ListFiltering` on the EPG mapping screen.
-pub static EPG_MAPPING: &[Binding] = &[
-    b(C::key(Key::Enter), A::Activate, "Assign the highlighted EPG channel"),
-    b(C::key(Key::Delete), A::ClearEpg, "Clear the manual assignment"),
-];
+pub static EPG_MAPPING: &[Binding] =
+    &[b(C::key(Key::Enter), A::Activate, "Assign the highlighted EPG channel"), b(C::key(Key::Delete), A::ClearEpg, "Clear the manual assignment")];
 
 pub static SEARCH: &[Binding] = &[
     b(C::key(Key::ArrowUp), A::Up, "Move"),
@@ -598,6 +623,22 @@ pub static SEARCH: &[Binding] = &[
     b(C::ctrl(Key::Backspace), A::FilterDeleteWord, "Delete word"),
     b(C::ctrl(Key::U), A::FilterClear, "Clear"),
     b(C::key(Key::Escape), A::Back, "Clear, then close"),
+];
+
+/// The item shortcuts the search overlay acts on (no reorder, sort or remove there: a hit
+/// list has no order of its own and nothing to remove from).
+pub static SEARCH_ITEM_ACTIONS: &[Binding] = &[
+    b(C::ctrl(Key::F), A::ToggleFavourite, "Add to / remove from Favourites"),
+    b(C::ctrl_shift(Key::F), A::AddToList, "Favourites lists… (add, new list)"),
+    b(C::ctrl(Key::H), A::ToggleHidden, "Hide / unhide"),
+    b(C::key(Key::F2), A::Rename, "Rename"),
+    b(C::ctrl(Key::L), A::ToggleLock, "Lock with PIN / unlock"),
+    b(C::ctrl(Key::G), A::OpenInGuide, "Show in TV guide"),
+    b(C::ctrl(Key::I), A::ShowDetails, "Details / edit information"),
+    b(C::ctrl(Key::E), A::AssignEpg, "Assign EPG channel"),
+    b(C::ctrl(Key::W), A::MarkWatched, "Mark watched / unwatched"),
+    b(C::shift(Key::F10), A::ContextMenu, "List these shortcuts"),
+    b(C::ctrl(Key::Enter), A::ContextMenu, "List these shortcuts"),
 ];
 
 pub static MODAL: &[Binding] = &[
@@ -657,7 +698,7 @@ pub fn tables(ctx: KeyContext) -> Vec<&'static [Binding]> {
         KeyContext::PlayerOsd => vec![PLAYER_OSD],
         KeyContext::NumericEntry => vec![NUMERIC_ENTRY],
         KeyContext::EpgMapping => vec![EPG_MAPPING],
-        KeyContext::Search => vec![SEARCH, ITEM_ACTIONS],
+        KeyContext::Search => vec![SEARCH, SEARCH_ITEM_ACTIONS],
         KeyContext::Modal => vec![MODAL],
         KeyContext::TextInput => vec![TEXT_INPUT],
         KeyContext::Panel => vec![PANEL],
@@ -666,22 +707,22 @@ pub fn tables(ctx: KeyContext) -> Vec<&'static [Binding]> {
 
 /// Contexts whose unbound printable characters become `FilterInput`.
 pub fn is_filtering(ctx: KeyContext) -> bool {
-    matches!(
-        ctx,
-        KeyContext::List | KeyContext::ListFiltering | KeyContext::PosterGrid | KeyContext::PosterGridFiltering | KeyContext::Search
-    )
+    matches!(ctx, KeyContext::List | KeyContext::ListFiltering | KeyContext::PosterGrid | KeyContext::PosterGridFiltering | KeyContext::Search)
 }
 
 fn find(tables: &[&'static [Binding]], ev: &egui::Event) -> Option<Action> {
     tables.iter().find_map(|t| t.iter().find(|bd| bd.chord.matches(ev)).map(|bd| bd.action))
 }
 
+/// F1…F35.
+fn is_fkey(key: Key) -> bool {
+    key.name().strip_prefix('F').is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Ctrl/Alt chord or F-key: the only events a focused text field lets through (to `Global`).
 fn is_chord_or_fkey(ev: &egui::Event) -> bool {
     match ev {
-        egui::Event::Key { key, modifiers, .. } => {
-            modifiers.ctrl || modifiers.alt || modifiers.command || key.name().starts_with('F') && key.name().len() > 1 && key.name()[1..].chars().all(|c| c.is_ascii_digit())
-        }
+        egui::Event::Key { key, modifiers, .. } => modifiers.ctrl || modifiers.alt || modifiers.command || is_fkey(*key),
         _ => false,
     }
 }
@@ -717,9 +758,10 @@ fn resolve_inner(stack: &[KeyContext], ev: &egui::Event) -> Option<Action> {
                 if let egui::Event::Text(t) = ev {
                     let mut it = t.chars();
                     if let (Some(c), None) = (it.next(), it.next())
-                        && !c.is_control() {
-                            return Some(Action::FilterInput(c));
-                        }
+                        && !c.is_control()
+                    {
+                        return Some(Action::FilterInput(c));
+                    }
                 }
             }
             // PlayerOsd / NumericEntry / EpgMapping / others fall through to the next context.
@@ -759,11 +801,13 @@ const HINTS: &[(KeyContext, &[(Action, &str)])] = &[
         &[(A::Activate, "play"), (A::ActivateAlt, "fullscreen"), (A::ToggleFavourite, "fav"), (A::ContextMenu, "more"), (A::ToggleHelp, "help")],
     ),
     (KeyContext::ListFiltering, &[(A::Activate, "play"), (A::FilterClear, "clear"), (A::ContextMenu, "more")]),
+    // also Home's rails (Enter plays a channel or opens a title; Home has no sort): only verbs
+    // that hold for both
     (
         KeyContext::PosterGrid,
-        &[(A::Activate, "details"), (A::ActivateAlt, "play"), (A::SortMenu, "sort"), (A::ToggleHelp, "help")],
+        &[(A::Activate, "open"), (A::ActivateAlt, "play"), (A::ToggleFavourite, "fav"), (A::ContextMenu, "more"), (A::ToggleHelp, "help")],
     ),
-    (KeyContext::PosterGridFiltering, &[(A::Activate, "details"), (A::FilterClear, "clear")]),
+    (KeyContext::PosterGridFiltering, &[(A::Activate, "open"), (A::FilterClear, "clear")]),
     (KeyContext::Detail, &[(A::Activate, "play"), (A::TabNext, "season"), (A::MarkWatched, "watched"), (A::Back, "back")]),
     (
         KeyContext::Guide,
@@ -771,24 +815,44 @@ const HINTS: &[(KeyContext, &[(Action, &str)])] = &[
     ),
     (KeyContext::Panel, &[(A::Activate, "toggle"), (A::MoveUp, "reorder"), (A::ContextMenu, "more"), (A::ToggleHelp, "help")]),
     (KeyContext::EpgMapping, &[(A::Activate, "assign"), (A::ClearEpg, "clear")]),
+    (KeyContext::NumericEntry, &[(A::Activate, "go"), (A::FilterBackspace, "delete"), (A::Back, "cancel")]),
+    (KeyContext::Search, &[(A::Activate, "open"), (A::ActivateAlt, "details"), (A::FocusNext, "section"), (A::Back, "close")]),
+    (KeyContext::TextInput, &[(A::Activate, "confirm"), (A::FocusNext, "next field"), (A::Back, "leave")]),
+    (KeyContext::Modal, &[(A::Activate, "confirm"), (A::Back, "cancel")]),
 ];
+
+/// Hints of a filtering list inside a dialog or menu (Esc clears the filter there).
+const MODAL_FILTERING_HINTS: &[(Action, &str)] = &[(A::Activate, "confirm"), (A::FilterClear, "clear")];
+
+/// The hints of a context stack: (action, key, verb) for the innermost context that has
+/// hints. A list inside a dialog or menu (`[List, Modal]`) gets the dialog's verbs: the
+/// screen-list verbs (play, fav…) don't apply there. Keys come from the stack's own tables.
+pub fn hints(stack: &[KeyContext]) -> Vec<(Action, KeyChord, &'static str)> {
+    let modal = stack.contains(&KeyContext::Modal);
+    for ctx in stack {
+        let items = match ctx {
+            KeyContext::List if modal => continue,
+            KeyContext::ListFiltering if modal => MODAL_FILTERING_HINTS,
+            _ => match HINTS.iter().find(|(c, _)| c == ctx) {
+                Some((_, items)) => *items,
+                None => continue,
+            },
+        };
+        let t = tables(*ctx);
+        return items
+            .iter()
+            .filter_map(|(a, verb)| {
+                t.iter().chain(std::iter::once(&GLOBAL)).find_map(|tb| tb.iter().find(|bd| bd.action == *a)).map(|bd| (*a, bd.chord, *verb))
+            })
+            .collect();
+    }
+    Vec::new()
+}
 
 /// Status-bar hint line for the innermost context that has hints, e.g.
 /// "Enter play · Shift+Enter fullscreen · Ctrl+F fav · Shift+F10 more · ? help".
 pub fn hint_line(stack: &[KeyContext]) -> String {
-    for ctx in stack {
-        if let Some((_, items)) = HINTS.iter().find(|(c, _)| c == ctx) {
-            let t = tables(*ctx);
-            let parts: Vec<String> = items
-                .iter()
-                .filter_map(|(a, verb)| {
-                    t.iter().chain(std::iter::once(&GLOBAL)).find_map(|tb| tb.iter().find(|bd| bd.action == *a)).map(|bd| format!("{} {verb}", bd.chord.label()))
-                })
-                .collect();
-            return parts.join(" · ");
-        }
-    }
-    String::new()
+    hints(stack).iter().map(|(_, chord, verb)| format!("{} {verb}", chord.label())).collect::<Vec<_>>().join(" · ")
 }
 
 #[cfg(test)]
@@ -804,7 +868,9 @@ mod tests {
             modifiers: egui::Modifiers { ctrl, alt, shift, command: ctrl, ..Default::default() },
         }
     }
-    fn key(k: Key, ctrl: bool) -> egui::Event { key_ev(k, ctrl, false, false, false) }
+    fn key(k: Key, ctrl: bool) -> egui::Event {
+        key_ev(k, ctrl, false, false, false)
+    }
     use KeyContext as K;
 
     #[test]
@@ -891,6 +957,52 @@ mod tests {
         let h = hint_line(&[K::List]);
         assert!(h.starts_with("Enter play"), "{h}");
         assert!(h.contains("Ctrl+F fav"), "{h}");
+    }
+
+    #[test]
+    fn every_hint_verb_finds_its_key() {
+        for (ctx, items) in HINTS {
+            let line = hint_line(&[*ctx]);
+            assert_eq!(line.split(" · ").count(), items.len(), "{ctx:?}: {line}");
+        }
+        assert_eq!(hint_line(&[K::TextInput, K::Modal]), "Enter confirm · Tab next field · Esc leave");
+        assert_eq!(hint_line(&[K::PlayerLive]), "", "no hint line in the player (no status bar)");
+    }
+
+    /// The event a chord produces (what `resolve` sees for it).
+    fn event_of(c: KeyChord) -> egui::Event {
+        match c.trigger {
+            Trigger::Key(k) => key_ev(k, c.ctrl, c.alt, c.shift, false),
+            Trigger::Char(ch) => egui::Event::Text(ch.to_string()),
+        }
+    }
+
+    /// Every hint names a key that, pressed in that stack, resolves to the hinted action (not
+    /// shadowed by an inner context, not a key of another table).
+    #[test]
+    fn hint_lines_only_name_keys_that_do_what_they_say() {
+        let mut stacks: Vec<Vec<KeyContext>> = KeyContext::ALL.iter().map(|c| vec![*c]).collect();
+        stacks.extend([
+            vec![K::List, K::Modal],
+            vec![K::ListFiltering, K::Modal],
+            vec![K::TextInput, K::Modal],
+            vec![K::TextInput, K::Panel],
+            vec![K::EpgMapping, K::List],
+            vec![K::NumericEntry, K::Guide],
+            vec![K::NumericEntry, K::PlayerLive],
+            vec![K::PlayerOsd, K::PlayerVod],
+        ]);
+        for stack in &stacks {
+            for (action, chord, verb) in hints(stack) {
+                assert_eq!(resolve(stack, &event_of(chord)), Some(action), "{stack:?}: “{} {verb}”", chord.label());
+            }
+        }
+    }
+
+    #[test]
+    fn fkeys() {
+        assert!(is_fkey(Key::F1) && is_fkey(Key::F11) && is_fkey(Key::F35));
+        assert!(!is_fkey(Key::F) && !is_fkey(Key::Enter));
     }
 
     #[test]

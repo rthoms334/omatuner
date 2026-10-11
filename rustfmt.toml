@@ -1,0 +1,4 @@
+# The tree was written ~150 columns wide with compact one-line expressions; rustfmt's
+# defaults (100 columns, small-heuristics) would rewrap ~39k lines.
+max_width = 150
+use_small_heuristics = "Max"

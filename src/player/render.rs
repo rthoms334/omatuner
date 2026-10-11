@@ -68,7 +68,12 @@ pub struct MpvGl {
 impl MpvGl {
     /// Create the render context. Must run with the GL context current (eframe's
     /// `CreationContext` callback or `App::logic`).
-    pub fn new(core: std::ptr::NonNull<sys::mpv_handle>, gpa: GetProcAddress, wl_display: Option<*mut c_void>, egui_ctx: egui::Context) -> Result<Self> {
+    pub fn new(
+        core: std::ptr::NonNull<sys::mpv_handle>,
+        gpa: GetProcAddress,
+        wl_display: Option<*mut c_void>,
+        egui_ctx: egui::Context,
+    ) -> Result<Self> {
         let gpa = Box::new(gpa);
         let mut init = sys::mpv_opengl_init_params {
             get_proc_address: Some(gpa_trampoline),
@@ -80,10 +85,7 @@ impl MpvGl {
                 type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_API_TYPE,
                 data: sys::MPV_RENDER_API_TYPE_OPENGL.as_ptr() as *mut c_void,
             },
-            sys::mpv_render_param {
-                type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_OPENGL_INIT_PARAMS,
-                data: &mut init as *mut _ as *mut c_void,
-            },
+            sys::mpv_render_param { type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, data: &mut init as *mut _ as *mut c_void },
             sys::mpv_render_param {
                 type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_ADVANCED_CONTROL,
                 data: &mut advanced as *mut _ as *mut c_void,
@@ -102,11 +104,7 @@ impl MpvGl {
         }
         let shared = Box::new(UpdateShared { egui: egui_ctx, dirty: AtomicBool::new(true), callbacks: AtomicU64::new(0) });
         unsafe {
-            sys::mpv_render_context_set_update_callback(
-                ctx,
-                Some(update_trampoline),
-                &*shared as *const UpdateShared as *mut c_void,
-            );
+            sys::mpv_render_context_set_update_callback(ctx, Some(update_trampoline), &*shared as *const UpdateShared as *mut c_void);
         }
         Ok(Self { ctx, _gpa: gpa, shared, freed: false })
     }
@@ -123,10 +121,14 @@ impl MpvGl {
     }
 
     /// True if the update callback fired since the last call (consumes it).
-    pub fn take_dirty(&self) -> bool { self.shared.dirty.swap(false, Ordering::AcqRel) }
+    pub fn take_dirty(&self) -> bool {
+        self.shared.dirty.swap(false, Ordering::AcqRel)
+    }
 
     /// `mpv_render_context_update()`; returns `MPV_RENDER_UPDATE_*` flags.
-    pub fn update(&self) -> u64 { unsafe { sys::mpv_render_context_update(self.ctx) } }
+    pub fn update(&self) -> u64 {
+        unsafe { sys::mpv_render_context_update(self.ctx) }
+    }
 
     /// Render the current frame into `fbo` (w × h). flip_y=false ⇒ FBO row 0 is the TOP of the
     /// picture, which is what egui sampling expects (VERIFIED by the spike).
@@ -148,7 +150,9 @@ impl MpvGl {
     }
 
     /// Number of update callbacks so far (diagnostics).
-    pub fn callbacks(&self) -> u64 { self.shared.callbacks.load(Ordering::Relaxed) }
+    pub fn callbacks(&self) -> u64 {
+        self.shared.callbacks.load(Ordering::Relaxed)
+    }
 }
 
 impl Drop for MpvGl {
@@ -193,17 +197,7 @@ impl VideoTarget {
     pub fn resize(&mut self, gl: &glow::Context, w: i32, h: i32) -> Result<()> {
         unsafe {
             gl.bind_texture(glow::TEXTURE_2D, Some(self.tex));
-            gl.tex_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                glow::RGBA8 as i32,
-                w,
-                h,
-                0,
-                glow::RGBA,
-                glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(None),
-            );
+            gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, w, h, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
@@ -233,10 +227,14 @@ impl VideoTarget {
         }
     }
 
-    pub fn fbo_name(&self) -> u32 { self.fbo.0.get() }
+    pub fn fbo_name(&self) -> u32 {
+        self.fbo.0.get()
+    }
 
     /// Delete the FBO. The texture is owned by eframe after registration.
-    pub fn destroy(&self, gl: &glow::Context) { unsafe { gl.delete_framebuffer(self.fbo) } }
+    pub fn destroy(&self, gl: &glow::Context) {
+        unsafe { gl.delete_framebuffer(self.fbo) }
+    }
 }
 
 /// The single video "screen": render context + target, drawn wherever the current layout puts
@@ -351,16 +349,19 @@ impl VideoSurface {
         self.target.as_ref().map(|t| (t.tex_id, [t.w, t.h]))
     }
 
-    pub fn has_frame(&self) -> bool { self.has_frame }
+    pub fn has_frame(&self) -> bool {
+        self.has_frame
+    }
 
     /// Shutdown (from `App::on_exit`, GL current): render ctx first, then FBO. The `Mpv`
     /// handle must outlive this call.
     pub fn destroy(&mut self, gl: Option<&glow::Context>) {
         if let Some(r) = self.render.take()
-            && gl.is_some() {
-                r.destroy();
-                self.core.alive.store(false, Ordering::Release);
-            } // else: dropped → leaked (see MpvGl::drop); `alive` stays set so mpv is leaked too
+            && gl.is_some()
+        {
+            r.destroy();
+            self.core.alive.store(false, Ordering::Release);
+        } // else: dropped → leaked (see MpvGl::drop); `alive` stays set so mpv is leaked too
         if let (Some(t), Some(gl)) = (self.target.take(), gl) {
             t.destroy(gl);
         }

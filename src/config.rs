@@ -23,7 +23,9 @@ use crate::model::{LiveFormat, SortMode};
 pub type SharedConfig = std::sync::Arc<std::sync::RwLock<std::sync::Arc<Config>>>;
 
 /// Current value of a [`SharedConfig`] (poison-tolerant).
-pub fn current(c: &SharedConfig) -> std::sync::Arc<Config> { c.read().unwrap_or_else(|e| e.into_inner()).clone() }
+pub fn current(c: &SharedConfig) -> std::sync::Arc<Config> {
+    c.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -248,7 +250,9 @@ pub struct EpgConfig {
 }
 
 impl Default for EpgConfig {
-    fn default() -> Self { Self { fuzzy_threshold: 0.92, auto_name_match: true } }
+    fn default() -> Self {
+        Self { fuzzy_threshold: 0.92, auto_name_match: true }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -260,7 +264,9 @@ pub struct ReminderConfig {
 }
 
 impl Default for ReminderConfig {
-    fn default() -> Self { Self { enabled: true, lead_min: 2 } }
+    fn default() -> Self {
+        Self { enabled: true, lead_min: 2 }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -329,6 +335,38 @@ impl Config {
         }
     }
 
+    /// The settings of a restored backup (`raw` = its `config.toml`) for this machine: the
+    /// backup's preferences, except what belongs to this machine and stays `local` — fonts,
+    /// hardware decoding, raw mpv options, UI scale, debug logging, the last screen. The
+    /// parental settings (PIN) come from the backup only while no PIN is set here: a restore
+    /// must not remove or replace an existing PIN.
+    pub fn restored(raw: &str, local: &Config) -> Result<Config> {
+        let mut c: Config = toml::from_str(raw).map_err(|e| Error::Config(format!("the backup's settings: {e}")))?;
+        c.fonts = local.fonts.clone();
+        c.player.hwdec.clone_from(&local.player.hwdec);
+        c.player.mpv_options.clone_from(&local.player.mpv_options);
+        c.interface.ui_scale = local.interface.ui_scale;
+        c.interface.last_screen.clone_from(&local.interface.last_screen);
+        c.general.debug_log = local.general.debug_log;
+        if local.parental.pin_hash.is_some() {
+            c.parental = local.parental.clone();
+        }
+        Ok(c)
+    }
+
+    /// Move a config file that [`Config::load`] rejected aside (`config.toml.bad`, or `.bad.1`…
+    /// when that exists), so the first Settings change — which saves the defaults the app then
+    /// runs on — can't overwrite it (it may hold the parental PIN). The primary instance does
+    /// this at startup.
+    pub fn set_aside(path: &Path, error: Error) -> SetAside {
+        let moved_to = (0..100)
+            .map(|i| path.with_extension(if i == 0 { "toml.bad".to_owned() } else { format!("toml.bad.{i}") }))
+            .find(|p| !p.exists())
+            .ok_or_else(|| std::io::Error::other("too many set-aside copies"))
+            .and_then(|bad| std::fs::rename(path, &bad).map(|()| bad));
+        SetAside { error, moved_to }
+    }
+
     /// Atomic save (write `config.toml.tmp`, fsync, rename).
     pub fn save(&self, path: &Path) -> Result<()> {
         use std::io::Write;
@@ -353,14 +391,41 @@ impl Config {
     }
 }
 
+/// A config file [`Config::load`] rejected, after [`Config::set_aside`].
+#[derive(Debug)]
+pub struct SetAside {
+    pub error: Error,
+    /// Where the file went (`Err`: it couldn't be moved; a save may then replace it).
+    pub moved_to: std::io::Result<std::path::PathBuf>,
+}
+
+impl SetAside {
+    /// For the log: the parse/read error and what happened to the file.
+    pub fn log_line(&self) -> String {
+        match &self.moved_to {
+            Ok(p) => format!("{}; using defaults (your file was moved to {})", self.error, p.display()),
+            Err(e) => format!("{}; using defaults (couldn't move your file aside: {e})", self.error),
+        }
+    }
+
+    /// For a toast: short, the details are in the log.
+    pub fn toast_text(&self) -> String {
+        match &self.moved_to {
+            Ok(p) => format!(
+                "Your settings file has an error — using defaults. It was kept as {}",
+                p.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+            ),
+            Err(_) => "Your settings file has an error — using defaults (see Logs)".to_owned(),
+        }
+    }
+}
+
 /// Detect Apple Silicon under Asahi Linux: aarch64 + device-tree compatible contains "apple,".
 pub fn is_asahi() -> bool {
     if std::env::consts::ARCH != "aarch64" {
         return false;
     }
-    std::fs::read("/proc/device-tree/compatible")
-        .map(|b| String::from_utf8_lossy(&b).contains("apple,"))
-        .unwrap_or(false)
+    std::fs::read("/proc/device-tree/compatible").map(|b| String::from_utf8_lossy(&b).contains("apple,")).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -379,5 +444,55 @@ mod tests {
         let s = toml::to_string_pretty(&c).unwrap();
         let back: Config = toml::from_str(&s).unwrap();
         assert_eq!(c, back);
+    }
+
+    /// Audit fix: restoring a backup ignored its settings. They come back except what belongs
+    /// to this machine, and never replace a PIN that is set here.
+    #[test]
+    fn restored_settings_keep_machine_specific_ones_and_an_existing_pin() {
+        let mut backup = Config::default();
+        backup.player.zap_delay_ms = 120;
+        backup.player.hwdec = "vaapi".into();
+        backup.interface.ui_scale = 1.5;
+        backup.fonts.family = "Other Mono".into();
+        backup.parental = ParentalConfig { enabled: true, pin_hash: Some("backup".into()), pin_salt: Some("s1".into()), relock_min: 5 };
+        let raw = toml::to_string_pretty(&backup).unwrap();
+        let mut local = Config::default();
+        local.player.hwdec = "no".into();
+        local.player.mpv_options.insert("vo".into(), "gpu-next".into());
+        local.interface.ui_scale = 1.1;
+
+        let c = Config::restored(&raw, &local).unwrap();
+        assert_eq!(c.player.zap_delay_ms, 120);
+        assert_eq!(c.parental, backup.parental, "no PIN here: the backup's applies");
+        assert_eq!((c.player.hwdec.as_str(), c.interface.ui_scale), ("no", 1.1));
+        assert_eq!(c.player.mpv_options, local.player.mpv_options);
+        assert_eq!(c.fonts, local.fonts);
+
+        local.parental = ParentalConfig { enabled: true, pin_hash: Some("local".into()), pin_salt: Some("s2".into()), relock_min: 0 };
+        let mut no_pin = backup.clone();
+        no_pin.parental = ParentalConfig::default();
+        assert_eq!(Config::restored(&toml::to_string_pretty(&no_pin).unwrap(), &local).unwrap().parental, local.parental);
+        assert!(Config::restored("general = 3", &local).is_err());
+    }
+
+    /// Audit fix: a typo in config.toml made Tuner start on defaults and the first Settings
+    /// change saved them over the file, losing e.g. the parental PIN.
+    #[test]
+    fn a_broken_file_is_set_aside_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let broken = "[parental]\npin_hash = \"abc\"\nenabled = tru\n";
+        let load = || Config::load(&path).map_err(|e| Config::set_aside(&path, e));
+        std::fs::write(&path, broken).unwrap();
+        let bad = load().expect_err("malformed");
+        assert_eq!(bad.moved_to.as_deref().unwrap(), dir.path().join("config.toml.bad"));
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_to_string(dir.path().join("config.toml.bad")).unwrap(), broken);
+        // the first save no longer touches it; a second broken file doesn't replace the first
+        Config::default().save(&path).unwrap();
+        std::fs::write(&path, "nonsense").unwrap();
+        assert_eq!(load().expect_err("malformed").moved_to.unwrap(), dir.path().join("config.toml.bad.1"));
+        assert_eq!(std::fs::read_to_string(dir.path().join("config.toml.bad")).unwrap(), broken);
     }
 }

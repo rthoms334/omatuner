@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{Fingerprint, FavListId, GroupKey, ItemKind, ItemRef, ReminderId, SourceId, Timestamp};
+use super::{FavListId, Fingerprint, GroupKey, ItemKind, ItemRef, ReminderId, SourceId, Timestamp};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FavouriteList {

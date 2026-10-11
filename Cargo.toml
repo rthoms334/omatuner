@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.95"
 description = "Tuner: a keyboard-first IPTV player for Omarchy (Hyprland)"
 license = "GPL-3.0-or-later" # Arch's libmpv is built with GPL components; see docs/DESIGN.md §22
-repository = "https://example.invalid/tuner"
+repository = "https://github.com/rthoms334/omatuner"
 readme = "README.md"
 default-run = "tuner"
 
@@ -41,6 +41,10 @@ harness = false
 
 [[bench]]
 name = "guide"      # WP-11: epg_grid layout+paint, headless egui, fake EpgReader
+harness = false
+
+[[bench]]
+name = "startup"    # WP-13: first frame + library load on a 100k-channel profile
 harness = false
 
 # ---------------------------------------------------------------------------

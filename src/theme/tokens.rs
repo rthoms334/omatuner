@@ -1,10 +1,14 @@
-//! Derived design tokens (Omarchy `Style.qml` type scale + spacing, state fills). Skeleton
-//! implements the formulas (omarchy.md §2, §5); WP-01 owns tests.
+//! Derived design tokens (Omarchy `Style.qml` type scale + spacing, `Color.qml` surfaces,
+//! state fills; omarchy.md §2, §5; DESIGN §16.2).
 //!
-//! * `font(t)  = override[t] ?: round(base × mult[t])`, base = `[font] base-size` (default 12)
+//! * `font(t)  = override[t] ?: max(1, round(base × mult[t]))`, base = `[font] base-size`
+//!   (integer, default 12, floor 1) × `ui_scale`; a pinned override is used as is.
 //! * `space(t) = override[t] ?: max(1, round(px[t] × scale))`,
-//!   `scale = spacing.scale × (scale-with-font ? base/12 : 1)`
-//! * All state tints are FOREGROUND at an alpha (works in light themes).
+//!   `scale = spacing.scale × (scale-with-font ? base/12 : 1)`; `hairline` can't be pinned.
+//!   So `ui_scale` reaches spacing only through `scale-with-font` (it scales `base`).
+//! * State tints are the `[controls]` state colours (default FOREGROUND) at the Omarchy alphas
+//!   (works in light themes); a state with border width 0 gets a transparent border.
+//! * Surface colours use `composed(colour, alpha)`: the `*-alpha` key replaces the colour's alpha.
 
 use eframe::egui::Color32;
 
@@ -183,30 +187,30 @@ pub struct Tokens {
     pub success: Color32,
     pub warning: Color32,
     // text
-    pub text_secondary: Color32,  // fg @ 0.52
+    pub text_secondary: Color32,   // fg @ 0.52
     pub text_placeholder: Color32, // fg @ 0.58
-    pub text_section: Color32,    // darker(fg, 1.4)
-    pub text_disabled: Color32,   // fg @ 0.36
+    pub text_section: Color32,     // darker(fg, 1.4)
+    pub text_disabled: Color32,    // fg @ 0.36
     // lines
-    pub separator: Color32,       // fg @ 0.12
-    pub pane_divider: Color32,    // fg @ 0.28
-    pub group_divider: Color32,   // fg @ 0.20
-    pub card_border: Color32,     // menu.border (fg) — 2 px
-    pub popup_border: Color32,    // popups.border (accent) — 2 px
-    pub card_border_width: f32,
-    // state fills (fg @ alpha)
-    pub fill_field: Color32,      // 0.04
-    pub fill_hover: Color32,      // 0.08
-    pub fill_selected: Color32,   // 0.18
-    pub fill_pressed: Color32,    // 0.22
+    pub separator: Color32,     // fg @ 0.12
+    pub pane_divider: Color32,  // fg @ 0.28
+    pub group_divider: Color32, // fg @ 0.20
+    pub card_border: Color32,   // menu.border (fg) @ menu.border-alpha
+    pub popup_border: Color32,  // popups.border (accent) @ popups.border-alpha
+    pub card_border_width: f32, // popups/menu border-width, else max(1, space(2)) = 2 px
+    // state fills ([controls] state colour, default fg, @ alpha)
+    pub fill_field: Color32,          // 0.04
+    pub fill_hover: Color32,          // 0.08
+    pub fill_selected: Color32,       // 0.18
+    pub fill_pressed: Color32,        // 0.22
     pub fill_text_selection: Color32, // 0.35
-    pub border_field: Color32,    // fg @ 0.4
-    pub border_hover: Color32,    // fg @ 0.25
+    pub border_field: Color32,        // fg @ 0.4
+    pub border_hover: Color32,        // fg @ 0.25
     // lists (menu idiom)
-    pub list_cursor_bg: Color32,  // menu.selected-background @ alpha (fg @ 0.08)
-    pub list_cursor_text: Color32, // menu.selected-text (accent)
-    pub list_cursor_border: Color32, // fg @ 0.25 (width 0 by default)
-    pub scrim: Color32,           // bg @ 0.5
+    pub list_cursor_bg: Color32,     // menu.selected-background @ alpha (fg @ 0.08)
+    pub list_cursor_text: Color32,   // menu.selected-text (accent)
+    pub list_cursor_border: Color32, // menu.selected-border @ alpha (template: fg @ 0.25; none: 0)
+    pub scrim: Color32,              // menu.scrim @ alpha (bg @ 0.5)
     /// Fixed dark scrim for video OSD regardless of theme mode (FIXED DECISION 6).
     pub osd_scrim: Color32,
     pub osd_text: Color32,
@@ -217,18 +221,35 @@ pub struct Tokens {
     pub osd_accent: Color32,
 }
 
+/// `c` with its alpha REPLACED by `a` (0..=1). `Color32` is premultiplied, so the RGB is
+/// unmultiplied first (exact for opaque colours, which is what the palette holds).
 pub fn with_alpha(c: Color32, a: f32) -> Color32 {
-    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (a.clamp(0.0, 1.0) * 255.0).round() as u8)
+    let [r, g, b, _] = c.to_srgba_unmultiplied();
+    Color32::from_rgba_unmultiplied(r, g, b, (a.clamp(0.0, 1.0) * 255.0).round() as u8)
 }
 
-/// Qt `darker(c, factor)`: HSV value ÷ factor.
+/// Qt `darker(c, factor)`: HSV value ÷ factor (opaque result).
 pub fn darker(c: Color32, factor: f32) -> Color32 {
     let f = 1.0 / factor.max(1e-3);
-    Color32::from_rgb((c.r() as f32 * f) as u8, (c.g() as f32 * f) as u8, (c.b() as f32 * f) as u8)
+    let [r, g, b, _] = c.to_srgba_unmultiplied();
+    Color32::from_rgb((r as f32 * f) as u8, (g as f32 * f) as u8, (b as f32 * f) as u8)
 }
 
 /// The fixed OSD scrim (`rgba(0,0,0,170)`) over mid-grey (#808080) video.
 pub const OSD_EFFECTIVE_BG: Color32 = Color32::from_rgb(0x2b, 0x2b, 0x2b);
+
+/// Near-white OSD text, also the OSD accent when the theme accent is too dark for the scrim.
+const OSD_TEXT: Color32 = Color32::from_rgb(0xf2, 0xf2, 0xf2);
+
+/// `[font] base-size` with Style.qml semantics: `parseInt`, 1 px floor, default 12.
+fn base_size(shell: &ShellConfig) -> f32 {
+    shell.f32("font", "base-size").map(f32::trunc).unwrap_or(12.0).max(1.0)
+}
+
+/// Config `ui_scale` guard: non-finite or non-positive values mean 1.0.
+fn sanitize_ui_scale(s: f32) -> f32 {
+    if s.is_finite() && s > 0.0 { s } else { 1.0 }
+}
 
 /// WCAG relative luminance of an sRGB colour.
 pub fn relative_luminance(c: Color32) -> f32 {
@@ -249,21 +270,55 @@ impl Tokens {
     /// Layout unit relative to Omarchy's default text size: `base_font / 12` (base-size × UI
     /// scale). Breakpoints, sidebar widths and guide geometry scale with it so
     /// `omarchy display text size 16` doesn't cramp the Medium layout.
-    pub fn rem(&self) -> f32 { self.base_font / 12.0 }
+    pub fn rem(&self) -> f32 {
+        self.base_font / 12.0
+    }
 
+    /// Derive every token from the palette and the merged shell config (Omarchy `Style.qml` /
+    /// `Color.qml` semantics; see the module docs). `ui_scale` multiplies the base font size and
+    /// with it every derived size.
     pub fn compute(pal: &Palette, shell: &ShellConfig, rounding: f32, ui_scale: f32) -> Self {
         let fg = pal.foreground;
-        let a = |s: &str, k: &str, d: f32| shell.f32(s, k).unwrap_or(d);
-        let base_font = shell.f32("font", "base-size").unwrap_or(12.0).max(1.0) * ui_scale;
+        let ui_scale = sanitize_ui_scale(ui_scale);
+        let base_font = base_size(shell) * ui_scale;
         let scale_with_font = shell.bool("spacing", "scale-with-font").unwrap_or(true);
-        let scale = a("spacing", "scale", 1.0) * if scale_with_font { base_font / 12.0 } else { ui_scale };
-        let menu_sel = shell.color("menu", "selected-background", pal).unwrap_or(fg);
+        let spacing_scale = shell.f32("spacing", "scale").filter(|s| *s >= 0.0).unwrap_or(1.0);
+        let scale = spacing_scale * if scale_with_font { (base_font / 12.0).max(1.0 / 12.0) } else { 1.0 };
+
+        // A colour whose alpha is about to be replaced: its unmultiplied RGB, opaque (a
+        // translucent gradient stop like `rgba(26a269ee)` keeps its exact RGB).
+        let rgb_of = |section: &str, key: &str| shell.color_rgba(section, key, pal).map(|[r, g, b, _]| Color32::from_rgb(r, g, b));
+        // `composed(colorKey, alphaKey, colorFallback, alphaFallback)`: the alpha key REPLACES the
+        // colour's own alpha (Util.alpha).
+        let composed = |section: &str, key: &str, fallback: Color32, alpha: f32| {
+            let c = rgb_of(section, key).unwrap_or(fallback);
+            with_alpha(c, shell.f32(section, &format!("{key}-alpha")).unwrap_or(alpha))
+        };
+        // `[controls]` (legacy name `[style]`): state colour tokens and alphas.
+        let ctl_f32 = |k: &str| shell.f32("controls", k).or_else(|| shell.f32("style", k));
+        let ctl_color = |k: &str| rgb_of("controls", k).or_else(|| rgb_of("style", k));
+        let alpha = |k: &str, d: f32| ctl_f32(k).unwrap_or(d).clamp(0.0, 1.0);
+        let normal = ctl_color("normal-color").unwrap_or(fg);
+        let hover = ctl_color("hover-cursor-color").unwrap_or(fg);
+        let selected = ctl_color("selected-color").unwrap_or(fg);
+        let pressed = ctl_color("pressed-color").unwrap_or(hover);
+        let selection = ctl_color("selection-color").unwrap_or(fg);
+        let normal_border_w = ctl_f32("normal-border-width").unwrap_or(1.0).round().max(0.0);
+        let hover_border_w = ctl_f32("hover-cursor-border-width").map_or(normal_border_w, |w| w.round().max(0.0));
+        // A state whose border width is 0 drops its border: keep the 1 px stroke geometry the
+        // widgets reserve, but paint it transparent.
+        let border = |c: Color32, a: f32, width: f32| if width > 0.0 { with_alpha(c, a) } else { Color32::TRANSPARENT };
+        let hover_fill = alpha("hover-cursor-fill-alpha", 0.08);
+        let hover_border = alpha("hover-cursor-border-alpha", 0.25);
+
+        let space2 = (2.0 * scale).round().max(1.0);
+        let card_border_width = shell.border_width("popups", "border-width").or_else(|| shell.border_width("menu", "border-width")).unwrap_or(space2);
         Self {
             base_font,
             scale,
-            rounding,
+            rounding: rounding.max(0.0),
             bg: pal.background,
-            card_bg: shell.color("menu", "background", pal).unwrap_or(pal.background),
+            card_bg: composed("menu", "background", pal.background, 1.0),
             raised_bg: pal.lighter_background,
             fg,
             accent: pal.accent,
@@ -277,32 +332,46 @@ impl Tokens {
             separator: with_alpha(fg, 0.12),
             pane_divider: with_alpha(fg, 0.28),
             group_divider: with_alpha(fg, 0.20),
-            card_border: with_alpha(shell.color("menu", "border", pal).unwrap_or(fg), a("menu", "border-alpha", 1.0)),
-            popup_border: with_alpha(shell.color("popups", "border", pal).unwrap_or(pal.accent), a("popups", "border-alpha", 1.0)),
-            card_border_width: 2.0,
-            fill_field: with_alpha(fg, a("controls", "normal-fill-alpha", 0.04)),
-            fill_hover: with_alpha(fg, a("controls", "hover-cursor-fill-alpha", 0.08)),
-            fill_selected: with_alpha(fg, a("controls", "selected-fill-alpha", 0.18)),
-            fill_pressed: with_alpha(fg, a("controls", "pressed-fill-alpha", 0.22)),
-            fill_text_selection: with_alpha(fg, a("controls", "selection-fill-alpha", 0.35)),
-            border_field: with_alpha(fg, a("controls", "normal-border-alpha", 0.4)),
-            border_hover: with_alpha(fg, a("controls", "hover-cursor-border-alpha", 0.25)),
-            list_cursor_bg: with_alpha(menu_sel, a("menu", "selected-background-alpha", 0.08)),
+            card_border: composed("menu", "border", fg, 1.0),
+            popup_border: composed("popups", "border", pal.accent, 1.0),
+            card_border_width,
+            fill_field: with_alpha(normal, alpha("normal-fill-alpha", 0.04)),
+            fill_hover: with_alpha(hover, hover_fill),
+            fill_selected: with_alpha(selected, alpha("selected-fill-alpha", 0.18)),
+            fill_pressed: with_alpha(pressed, alpha("pressed-fill-alpha", 0.22)),
+            fill_text_selection: with_alpha(selection, alpha("selection-fill-alpha", 0.35)),
+            border_field: border(normal, alpha("normal-border-alpha", 0.4), normal_border_w),
+            border_hover: border(hover, hover_border, hover_border_w),
+            list_cursor_bg: composed("menu", "selected-background", fg, 0.08),
             list_cursor_text: shell.color("menu", "selected-text", pal).unwrap_or(pal.accent),
-            list_cursor_border: with_alpha(fg, a("menu", "selected-border-alpha", 0.25)),
-            scrim: with_alpha(shell.color("menu", "scrim", pal).unwrap_or(pal.background), a("menu", "scrim-alpha", 0.5)),
+            list_cursor_border: composed("menu", "selected-border", fg, 0.0),
+            scrim: composed("menu", "scrim", pal.background, 0.5),
             osd_scrim: Color32::from_rgba_unmultiplied(0, 0, 0, 170),
-            osd_text: Color32::from_rgb(0xf2, 0xf2, 0xf2),
-            osd_accent: if contrast_ratio(pal.accent, OSD_EFFECTIVE_BG) >= 3.0 { pal.accent } else { Color32::from_rgb(0xf2, 0xf2, 0xf2) },
+            osd_text: OSD_TEXT,
+            osd_accent: if contrast_ratio(pal.accent, OSD_EFFECTIVE_BG) >= 3.0 { pal.accent } else { OSD_TEXT },
         }
     }
 
+    /// `[font] <token>` override (integer px > 0, pinned: not scaled) or
+    /// `max(1, round(base × mult))`.
     pub fn font(&self, shell: &ShellConfig, t: TypeToken) -> f32 {
-        shell.f32("font", t.key()).unwrap_or_else(|| (self.base_font * t.mult()).round())
+        match shell.f32("font", t.key()).map(f32::trunc).filter(|px| *px > 0.0) {
+            Some(px) => px,
+            None => (self.base_font * t.mult()).round().max(1.0),
+        }
     }
 
+    /// `[spacing] <token>` override (px ≥ 0, pinned: not scaled) or `max(1, round(px × scale))`.
+    /// `hairline` is never overridden (Style.qml).
     pub fn space(&self, shell: &ShellConfig, t: SpaceToken) -> f32 {
-        shell.f32("spacing", t.key()).unwrap_or_else(|| (t.base_px() * self.scale).round().max(1.0))
+        let computed = (t.base_px() * self.scale).round().max(1.0);
+        if t == SpaceToken::Hairline {
+            return computed;
+        }
+        match shell.f32("spacing", t.key()).filter(|px| *px >= 0.0) {
+            Some(px) => px.round(),
+            None => computed,
+        }
     }
 
     pub fn fill(&self, i: Interaction) -> Color32 {
@@ -335,5 +404,106 @@ mod osd_tests {
         // `white` theme accent → falls back; tokyo-night blue stays
         assert!(contrast_ratio(Color32::from_rgb(0x6e, 0x6e, 0x6e), OSD_EFFECTIVE_BG) < 3.0);
         assert!(contrast_ratio(Color32::from_rgb(0x7a, 0xa2, 0xf7), OSD_EFFECTIVE_BG) >= 3.0);
+    }
+
+    #[test]
+    fn osd_accent_choice() {
+        let shell = ShellConfig::default();
+        let pal =
+            |accent: &str| Palette::parse(&format!("background = \"#ffffff\"\nforeground = \"#222222\"\naccent = \"{accent}\"\n"), false).unwrap();
+        assert_eq!(Tokens::compute(&pal("#6e6e6e"), &shell, 0.0, 1.0).osd_accent, OSD_TEXT);
+        assert_eq!(Tokens::compute(&pal("#7aa2f7"), &shell, 0.0, 1.0).osd_accent, Color32::from_rgb(0x7a, 0xa2, 0xf7));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pal() -> Palette {
+        Palette::parse("accent = \"#F3B77B\"\nbackground = \"#151E26\"\nforeground = \"#ECE5D8\"\n", false).unwrap()
+    }
+
+    #[test]
+    fn with_alpha_replaces_alpha_of_translucent_colours() {
+        let c = Color32::from_rgba_unmultiplied(0x26, 0xa2, 0x69, 0xee);
+        assert_eq!(with_alpha(c, 1.0), Color32::from_rgb(0x26, 0xa2, 0x69));
+        assert_eq!(with_alpha(Color32::from_rgb(10, 20, 30), 0.5), Color32::from_rgba_unmultiplied(10, 20, 30, 128));
+        assert_eq!(with_alpha(Color32::WHITE, 7.0).a(), 255, "clamped");
+        assert_eq!(darker(Color32::from_rgb(140, 70, 14), 1.4), Color32::from_rgb(100, 50, 10));
+    }
+
+    #[test]
+    fn composed_keeps_exact_rgb_of_translucent_gradient_stops() {
+        let shell = ShellConfig::parse(
+            "[hyprland]\nactive-border = \"rgba(26a26911) rgba(2ec27eee) 45deg\"\n[popups]\nborder = \"hyprland.active-border\"\n[menu]\nscrim = \"rgba(10203040)\"\nscrim-alpha = 0.25\n",
+            None,
+        )
+        .unwrap();
+        let t = Tokens::compute(&pal(), &shell, 0.0, 1.0);
+        assert_eq!(t.popup_border, Color32::from_rgb(0x26, 0xa2, 0x69), "alpha 0x11 → border-alpha default 1.0");
+        assert_eq!(t.scrim, with_alpha(Color32::from_rgb(0x10, 0x20, 0x30), 0.25));
+    }
+
+    #[test]
+    fn controls_section_and_zero_width_borders() {
+        let shell = ShellConfig::parse(
+            "[style]\nnormal-color = \"#102030\"\nnormal-fill-alpha = 0.5\n[controls]\nhover-cursor-color = accent\nhover-cursor-border-width = 0\nnormal-border-width = 0\n",
+            None,
+        )
+        .unwrap();
+        let p = pal();
+        let t = Tokens::compute(&p, &shell, 3.0, 1.0);
+        assert_eq!(t.fill_field, with_alpha(Color32::from_rgb(0x10, 0x20, 0x30), 0.5), "legacy [style] section");
+        assert_eq!(t.fill_hover, with_alpha(p.accent, 0.08));
+        assert_eq!(t.fill_pressed, with_alpha(p.accent, 0.22), "pressed defaults to the hover colour");
+        assert_eq!(t.border_field, Color32::TRANSPARENT);
+        assert_eq!(t.border_hover, Color32::TRANSPARENT);
+        assert_eq!(t.rounding, 3.0);
+    }
+
+    #[test]
+    fn spacing_scale_and_bad_ui_scale() {
+        let shell = ShellConfig::parse("[spacing]\nscale-with-font = false\nscale = 1.5\n[font]\nbase-size = 18\n", None).unwrap();
+        let t = Tokens::compute(&pal(), &shell, 0.0, 1.0);
+        assert_eq!(t.space(&shell, SpaceToken::ControlHeight), 42.0, "scale only (font size ignored)");
+        assert_eq!(t.font(&shell, TypeToken::Body), 18.0);
+        for bad in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let t = Tokens::compute(&pal(), &ShellConfig::default(), 0.0, bad);
+            assert_eq!(t.base_font, 12.0, "{bad}");
+        }
+        let shell = ShellConfig::parse("[font]\nbase-size = 0\n", None).unwrap();
+        assert_eq!(Tokens::compute(&pal(), &shell, -2.0, 1.0).base_font, 1.0, "1 px floor");
+        assert_eq!(Tokens::compute(&pal(), &shell, -2.0, 1.0).rounding, 0.0);
+    }
+
+    /// DESIGN §16.2: `ui_scale` scales `base`; spacing follows it only via `scale-with-font`, and
+    /// pinned font/spacing tokens stay exactly as written.
+    #[test]
+    fn ui_scale_spares_pinned_tokens_and_fixed_spacing() {
+        let shell = ShellConfig::parse("[spacing]\nscale-with-font = false\npanel-padding = 5\n[font]\ntitle = 30\n", None).unwrap();
+        let t = Tokens::compute(&pal(), &shell, 0.0, 1.5);
+        assert_eq!(t.font(&shell, TypeToken::Body), 18.0, "base × ui_scale");
+        assert_eq!(t.font(&shell, TypeToken::Title), 30.0, "pinned font token");
+        assert_eq!(t.space(&shell, SpaceToken::ControlHeight), 28.0, "scale = spacing.scale × 1");
+        assert_eq!(t.space(&shell, SpaceToken::PanelPadding), 5.0, "pinned spacing token");
+        assert_eq!(t.rem(), 1.5, "layout unit still follows ui_scale");
+        let shell = ShellConfig::parse("[spacing]\npanel-padding = 5\n", None).unwrap();
+        let t = Tokens::compute(&pal(), &shell, 0.0, 1.5);
+        assert_eq!(t.space(&shell, SpaceToken::ControlHeight), 42.0, "scale-with-font: base/12");
+        assert_eq!(t.space(&shell, SpaceToken::PanelPadding), 5.0);
+    }
+
+    #[test]
+    fn card_border_width_from_popups_or_menu() {
+        let p = pal();
+        let w = |s: &str| {
+            let shell = ShellConfig::parse(s, None).unwrap();
+            Tokens::compute(&p, &shell, 0.0, 1.0).card_border_width
+        };
+        assert_eq!(w(""), 2.0);
+        assert_eq!(w("[menu]\nborder-width = 3\n"), 3.0);
+        assert_eq!(w("[popups]\nborder-width = \"1 4\"\n[menu]\nborder-width = 3\n"), 4.0);
+        assert_eq!(w("[font]\nbase-size = 24\n"), 4.0, "space(2) scales with the font");
     }
 }

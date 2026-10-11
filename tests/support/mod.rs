@@ -11,7 +11,9 @@ use std::path::PathBuf;
 
 /// `tests/fixtures/<rel>`. Fixtures are append-only for every WP; only the owner of a fixture
 /// directory may modify existing files.
-pub fn fixture(rel: &str) -> PathBuf { PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(rel) }
+pub fn fixture(rel: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(rel)
+}
 
 /// Isolated app paths in a temp dir (real home kept for theme reads; override if needed).
 pub fn temp_paths() -> (tempfile::TempDir, tuner::paths::AppPaths) {

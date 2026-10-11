@@ -12,11 +12,18 @@ use crate::redact::Secret;
 #[serde(tag = "t", rename_all = "kebab-case")]
 pub enum EpgSourceKind {
     /// User-added XMLTV URL (`.xml`, `.xml.gz`, `.xml.xz`).
-    Url { url: Secret<String> },
-    File { path: PathBuf },
+    Url {
+        url: Secret<String>,
+    },
+    File {
+        path: PathBuf,
+    },
     /// Provider guide of a playlist source: Xtream `xmltv.php` or M3U header `url-tvg`
     /// (one EpgSource per URL). Created/removed automatically with the source.
-    Provider { source_id: SourceId, url: Secret<String> },
+    Provider {
+        source_id: SourceId,
+        url: Secret<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -116,7 +123,9 @@ impl ProgrammeSlim {
         let d = shift_min as i64 * 60;
         ProgrammeSlim { start: self.start + d, stop: self.stop + d, ..self.clone() }
     }
-    pub fn contains(&self, t: Timestamp) -> bool { self.start <= t && t < self.stop }
+    pub fn contains(&self, t: Timestamp) -> bool {
+        self.start <= t && t < self.stop
+    }
     /// 0..=1 progress at `t`.
     pub fn progress(&self, t: Timestamp) -> f32 {
         let d = (self.stop - self.start).max(1) as f32;

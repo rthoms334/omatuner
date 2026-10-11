@@ -32,7 +32,11 @@ pub enum Error {
     #[error("database error: {0}")]
     Db(#[from] rusqlite::Error),
     #[error("I/O error on {path}: {source}")]
-    Io { path: PathBuf, #[source] source: std::io::Error },
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("config error: {0}")]
     Config(String),
     /// mpv returned an error code. Message is mpv's error string.

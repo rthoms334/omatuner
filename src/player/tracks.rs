@@ -55,8 +55,12 @@ pub struct Tracks {
 }
 
 impl Tracks {
-    pub fn selected_audio(&self) -> Option<&Track> { self.audio.iter().find(|t| t.selected) }
-    pub fn selected_sub(&self) -> Option<&Track> { self.subs.iter().find(|t| t.selected) }
+    pub fn selected_audio(&self) -> Option<&Track> {
+        self.audio.iter().find(|t| t.selected)
+    }
+    pub fn selected_sub(&self) -> Option<&Track> {
+        self.subs.iter().find(|t| t.selected)
+    }
 }
 
 /// Parse mpv's `track-list` (read as STRING ⇒ JSON array).
@@ -116,7 +120,9 @@ pub struct StreamInfo {
 }
 
 impl StreamInfo {
-    pub fn is_hdr(&self) -> bool { matches!(self.gamma.as_deref(), Some("pq") | Some("hlg")) }
+    pub fn is_hdr(&self) -> bool {
+        matches!(self.gamma.as_deref(), Some("pq") | Some("hlg"))
+    }
 }
 
 /// Query all stream-info properties (each missing one → None). Cheap (~20 property reads).

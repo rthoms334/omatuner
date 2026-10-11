@@ -26,19 +26,11 @@ pub struct AppPaths {
 impl AppPaths {
     /// Resolve from the environment (XDG vars honoured via `directories`).
     pub fn from_env() -> Result<Self> {
-        let dirs = directories::ProjectDirs::from("", "", crate::APP_ID)
-            .ok_or_else(|| Error::Config("cannot determine home directory".into()))?;
-        let base = directories::BaseDirs::new()
-            .ok_or_else(|| Error::Config("cannot determine home directory".into()))?;
+        let dirs = directories::ProjectDirs::from("", "", crate::APP_ID).ok_or_else(|| Error::Config("cannot determine home directory".into()))?;
+        let base = directories::BaseDirs::new().ok_or_else(|| Error::Config("cannot determine home directory".into()))?;
         let home = base.home_dir().to_path_buf();
-        let state_dir = dirs
-            .state_dir()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| home.join(".local/state").join(crate::APP_ID));
-        let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
-            .join(crate::APP_ID);
+        let state_dir = dirs.state_dir().map(Path::to_path_buf).unwrap_or_else(|| home.join(".local/state").join(crate::APP_ID));
+        let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join(crate::APP_ID);
         Ok(Self {
             config_dir: dirs.config_dir().to_path_buf(),
             data_dir: dirs.data_dir().to_path_buf(),
@@ -63,20 +55,42 @@ impl AppPaths {
         }
     }
 
-    pub fn config_file(&self) -> PathBuf { self.config_dir.join("config.toml") }
-    pub fn db_file(&self) -> PathBuf { self.data_dir.join("tuner.db") }
-    pub fn log_file(&self) -> PathBuf { self.state_dir.join("tuner.log") }
-    pub fn image_cache(&self) -> PathBuf { self.cache_dir.join("img") }
-    pub fn epg_cache(&self) -> PathBuf { self.cache_dir.join("epg") }
-    pub fn playlist_cache(&self) -> PathBuf { self.cache_dir.join("playlists") }
-    pub fn ipc_socket(&self) -> PathBuf { self.runtime_dir.join("tuner.sock") }
+    pub fn config_file(&self) -> PathBuf {
+        self.config_dir.join("config.toml")
+    }
+    pub fn db_file(&self) -> PathBuf {
+        self.data_dir.join("tuner.db")
+    }
+    pub fn log_file(&self) -> PathBuf {
+        self.state_dir.join("tuner.log")
+    }
+    pub fn image_cache(&self) -> PathBuf {
+        self.cache_dir.join("img")
+    }
+    pub fn epg_cache(&self) -> PathBuf {
+        self.cache_dir.join("epg")
+    }
+    pub fn playlist_cache(&self) -> PathBuf {
+        self.cache_dir.join("playlists")
+    }
+    pub fn ipc_socket(&self) -> PathBuf {
+        self.runtime_dir.join("tuner.sock")
+    }
 
     /// `~/.local/state/omarchy/current` — watched (non-recursively) for theme changes.
-    pub fn omarchy_current(&self) -> PathBuf { self.home.join(".local/state/omarchy/current") }
-    pub fn omarchy_theme_dir(&self) -> PathBuf { self.omarchy_current().join("theme") }
+    pub fn omarchy_current(&self) -> PathBuf {
+        self.home.join(".local/state/omarchy/current")
+    }
+    pub fn omarchy_theme_dir(&self) -> PathBuf {
+        self.omarchy_current().join("theme")
+    }
     /// `~/.config/omarchy` — user `shell.toml` override lives here.
-    pub fn omarchy_config(&self) -> PathBuf { self.home.join(".config/omarchy") }
-    pub fn fontconfig_dir(&self) -> PathBuf { self.home.join(".config/fontconfig") }
+    pub fn omarchy_config(&self) -> PathBuf {
+        self.home.join(".config/omarchy")
+    }
+    pub fn fontconfig_dir(&self) -> PathBuf {
+        self.home.join(".config/fontconfig")
+    }
 
     /// Create every app-owned directory. Data/state/runtime dirs and the playlist/EPG caches get
     /// mode 0700 because they hold credentials (DB; `get.php`/`xmltv.php` downloads carry

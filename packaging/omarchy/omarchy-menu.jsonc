@@ -1,8 +1,9 @@
 {
   // Tuner entries for the Omarchy menu. Merge into
   // ~/.config/omarchy/extensions/omarchy-menu.jsonc (the menu watches that file).
+  // Open: `omarchy menu summon tv`. Other entries hand their request to a running Tuner.
   "tv": {"icon":"󰔂","label":"TV","description":"Tuner IPTV player"},
-  "tv.open": {"icon":"󰔂","label":"Open Tuner","action":"omarchy-launch-or-focus tuner 'uwsm-app -- tuner'"},
+  "tv.open": {"icon":"󰔂","label":"Open Tuner","action":"omarchy-launch-or-focus '^tuner$' 'uwsm-app -- tuner'"},
   "tv.live": {"icon":"󰐊","label":"Live TV","action":"uwsm-app -- tuner --view live"},
   "tv.guide": {"icon":"󰃰","label":"TV Guide","action":"uwsm-app -- tuner --view guide"},
   "tv.search": {"icon":"󰍉","label":"Search TV","action":"uwsm-app -- tuner --view search"},

@@ -4,8 +4,10 @@
 //! | file              | owner | contents |
 //! |-------------------|-------|----------|
 //! | `http.rs`         | WP-04 | reqwest client, streamed downloads (`sniff_compression` frozen) |
-//! | `xtream/*`        | WP-04 | player_api client, lenient serde types (`urls.rs` frozen) |
+//! | `xtream/*`        | WP-04 | player_api client, lenient serde types (`urls.rs` frozen); `detect.rs` P5 (§27.2) |
 //! | `m3u.rs`          | WP-03 | streaming extended-M3U parser |
+//! | `m3u_vod.rs`      | P5 sources | M3U movies/series fallback classifier (DESIGN §27.5) |
+//! | `presets.rs`      | P5 sources | free-channel playlists + country detection (§27.8) |
 //! | `smart_names.rs`  | WP-03 | name cleanup ("UK | BBC One FHD" → "BBC One") |
 //! | `identity.rs`     | skeleton (frozen) | ItemKey / normalization / fingerprints (WP-03 owns its tests) |
 //! | `xmltv.rs`        | WP-05a | streaming XMLTV parser |
@@ -18,6 +20,8 @@ pub mod epg_match;
 pub mod http;
 pub mod identity;
 pub mod m3u;
+pub mod m3u_vod;
+pub mod presets;
 pub mod resolve;
 pub mod smart_names;
 pub mod xmltv;

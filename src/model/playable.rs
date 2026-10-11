@@ -14,7 +14,12 @@ use crate::redact::Secret;
 pub enum MediaRef {
     Channel(ChannelId),
     /// Catch-up of a past programme on `channel` (times are programme start/stop, UTC).
-    Catchup { channel: ChannelId, start: Timestamp, stop: Timestamp, catchup_id: Option<String> },
+    Catchup {
+        channel: ChannelId,
+        start: Timestamp,
+        stop: Timestamp,
+        catchup_id: Option<String>,
+    },
     Movie(MovieId),
     Episode(EpisodeId),
     /// Ad-hoc URL (CLI `tuner <url>` of a single stream, drag & drop).
@@ -31,9 +36,13 @@ pub enum PlayableKind {
 }
 
 impl PlayableKind {
-    pub fn is_live(&self) -> bool { matches!(self, PlayableKind::Live) }
+    pub fn is_live(&self) -> bool {
+        matches!(self, PlayableKind::Live)
+    }
     /// Seekable content (VOD, catch-up, files) — Left/Right seek instead of zap/recall.
-    pub fn is_seekable(&self) -> bool { !self.is_live() }
+    pub fn is_seekable(&self) -> bool {
+        !self.is_live()
+    }
 }
 
 /// Fully resolved playback request.

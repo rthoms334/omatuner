@@ -12,7 +12,9 @@ use crate::error::Result;
 pub const MIGRATIONS: &[(&str, &str)] = &[("0001_init", include_str!("migrations/0001_init.sql"))];
 
 /// Current schema version after all migrations.
-pub fn latest_version() -> i64 { MIGRATIONS.len() as i64 }
+pub fn latest_version() -> i64 {
+    MIGRATIONS.len() as i64
+}
 
 /// Apply pending migrations. Refuses to open a DB newer than this binary.
 pub fn migrate(conn: &mut Connection) -> Result<()> {
@@ -111,9 +113,7 @@ mod tests {
         let c = fresh();
         for t in ["fav_item", "item_override", "watch_progress", "reminder", "channel_epg_map"] {
             for col in ["fp", "orphaned_since"] {
-                let n: i64 = c
-                    .query_row(&format!("SELECT count(*) FROM pragma_table_info('{t}') WHERE name='{col}'"), [], |r| r.get(0))
-                    .unwrap();
+                let n: i64 = c.query_row(&format!("SELECT count(*) FROM pragma_table_info('{t}') WHERE name='{col}'"), [], |r| r.get(0)).unwrap();
                 assert_eq!(n, 1, "{t}.{col}");
             }
         }

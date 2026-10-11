@@ -61,6 +61,15 @@ impl Toast {
     pub fn error(text: impl Into<String>) -> Self {
         Self { kind: ToastKind::Error, text: text.into(), action: None, ttl_ms: 6000 }
     }
+    /// An M3U playlist now signs in with its Xtream login (DESIGN §27.3); `name` when it could
+    /// be any of several playlists.
+    pub fn upgraded(name: Option<&str>) -> Self {
+        const TEXT: &str = "upgraded to Xtream login — movies & series now available";
+        match name {
+            Some(n) => Self::info(format!("{n}: {TEXT}")),
+            None => Self::info("Upgraded to Xtream login — movies & series now available"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -104,7 +113,9 @@ impl EventBus {
         self.request_repaint();
     }
 
-    pub fn toast(&self, t: Toast) { self.send(AppEvent::Toast(t)) }
+    pub fn toast(&self, t: Toast) {
+        self.send(AppEvent::Toast(t))
+    }
 
     /// Ask for a frame without sending an event (continuous state changed, e.g. time-pos).
     pub fn request_repaint(&self) {
@@ -113,5 +124,7 @@ impl EventBus {
         }
     }
 
-    pub fn data_changed(&self, scope: DataScope) { self.send(AppEvent::Data(scope)) }
+    pub fn data_changed(&self, scope: DataScope) {
+        self.send(AppEvent::Data(scope))
+    }
 }

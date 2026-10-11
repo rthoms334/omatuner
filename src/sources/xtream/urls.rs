@@ -59,13 +59,17 @@ pub fn normalize_server(input: &str) -> Option<String> {
     Some(format!("{}://{host}{port}", u.scheme()))
 }
 
-fn base(c: &XtreamCredentials) -> &str { c.server.trim_end_matches('/') }
+fn base(c: &XtreamCredentials) -> &str {
+    c.server.trim_end_matches('/')
+}
 
 fn creds_path(c: &XtreamCredentials, kind: &str) -> String {
     format!("{}/{kind}/{}/{}", base(c), enc(&c.username), enc(c.password.expose()))
 }
 
-fn creds_query(c: &XtreamCredentials) -> String { format!("username={}&password={}", enc(&c.username), enc(c.password.expose())) }
+fn creds_query(c: &XtreamCredentials) -> String {
+    format!("username={}&password={}", enc(&c.username), enc(c.password.expose()))
+}
 
 /// `Auto` → m3u8 when `allowed` contains it (or is empty), else ts.
 pub fn pick_live_ext(pref: LiveFormat, allowed: &[String]) -> LiveExt {
@@ -100,7 +104,9 @@ pub fn timeshift_url(c: &XtreamCredentials, stream_id: i64, start_local: jiff::c
     format!("{}/{duration_min}/{}/{stream_id}.{}", creds_path(c, "timeshift"), start_local.strftime("%Y-%m-%d:%H-%M"), ext.as_str())
 }
 
-pub fn xmltv_url(c: &XtreamCredentials) -> String { format!("{}/xmltv.php?{}", base(c), creds_query(c)) }
+pub fn xmltv_url(c: &XtreamCredentials) -> String {
+    format!("{}/xmltv.php?{}", base(c), creds_query(c))
+}
 
 pub fn m3u_url(c: &XtreamCredentials, ext: LiveExt) -> String {
     format!("{}/get.php?{}&type=m3u_plus&output={}", base(c), creds_query(c), ext.as_str())

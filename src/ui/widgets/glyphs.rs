@@ -42,6 +42,7 @@ pub const OFFLINE: &str = "\u{f05aa}";
 pub const NO_VIDEO: &str = "\u{f0568}";
 pub const PLAYLIST: &str = "\u{f0411}";
 pub const INFO: &str = "\u{f02fd}";
+pub const CHEVRON_LEFT: &str = "\u{f0141}";
 pub const CHEVRON_RIGHT: &str = "\u{f0142}";
 pub const CHECK: &str = "\u{f012c}";
 pub const CLOSE: &str = "\u{f0156}";

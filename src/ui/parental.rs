@@ -41,7 +41,9 @@ impl ParentalSession {
         ok
     }
 
-    pub fn lock(&mut self) { self.unlocked_at = None; }
+    pub fn lock(&mut self) {
+        self.unlocked_at = None;
+    }
 }
 
 /// hex(blake3(salt_hex_bytes || pin)).

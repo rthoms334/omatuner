@@ -34,6 +34,7 @@ pub mod budget;
 pub mod controller;
 pub mod events;
 pub mod mpv;
+pub mod mpv_log;
 pub mod reconnect;
 pub mod render;
 pub mod state;
@@ -83,11 +84,20 @@ pub enum PlayerCommand {
     /// Zap within the current ZapList (wraps; skips channels for which
     /// `MediaResolver::skip_on_zap` is true: ≥ 2 recent failures, DRM, resolve failures). Keeps
     /// the current `PlayOrigin`.
-    Zap { forward: bool },
+    Zap {
+        forward: bool,
+        /// The sender's parental session is unlocked (`ParentalSession::is_unlocked`). When
+        /// false and a PIN is set, PIN-locked channels are skipped too (MPRIS always sends
+        /// false: it can't ask for the PIN).
+        unlocked: bool,
+    },
     /// Tune a channel by id keeping the current ZapList and origin (numeric entry, history).
     ZapTo(ChannelId),
-    /// Recall the previously watched live channel (Backspace / UHF ←).
-    LastChannel,
+    /// Recall the previously watched live channel (Backspace / UHF ←). Ignored when that
+    /// channel is PIN-locked, a PIN is set and `unlocked` is false (the session re-locked since).
+    LastChannel {
+        unlocked: bool,
+    },
     /// From catch-up back to the live stream of the same channel.
     JumpToLive,
     SetVolume(f64),
@@ -112,7 +122,10 @@ pub enum PlayerCommand {
     SetZapList(ZapList),
     /// Provider limits from account info (budget). Sent by the app at startup for every source
     /// (from stored `AccountInfo`) and after every `JobOutcome::SourceRefreshed`.
-    SetConnectionLimit { source: crate::model::SourceId, max: Option<u32> },
+    SetConnectionLimit {
+        source: crate::model::SourceId,
+        max: Option<u32>,
+    },
     /// Settings changed: re-derive `MachineConfig` and set the runtime-settable mpv properties
     /// (`hwdec`, `cache-secs`, `demuxer-readahead-secs`, `demuxer-max-bytes`,
     /// `network-timeout`, `alang`, `slang`, subtitle auto mode, `sub-scale`, user-agent).
@@ -162,15 +175,28 @@ pub struct PlayerError {
 pub enum PlayerState {
     Idle,
     /// Waiting out the zapping delay before connecting.
-    Zapping { until: Instant },
+    Zapping {
+        until: Instant,
+    },
     /// loadfile issued, waiting for the first frame.
-    Loading { since: Instant, attempt: u32 },
+    Loading {
+        since: Instant,
+        attempt: u32,
+    },
     Playing,
     Paused,
     /// Cache underrun (`paused-for-cache`), `percent` from `cache-buffering-state`.
-    Buffering { since: Instant, percent: Option<i64> },
+    Buffering {
+        since: Instant,
+        percent: Option<i64>,
+    },
     /// Waiting to retry.
-    Reconnecting { attempt: u32, max: u32, at: Instant, reason: PlayerErrorKind },
+    Reconnecting {
+        attempt: u32,
+        max: u32,
+        at: Instant,
+        reason: PlayerErrorKind,
+    },
     /// VOD reached the end.
     Ended,
     Error(PlayerError),
@@ -179,7 +205,14 @@ pub enum PlayerState {
 impl PlayerState {
     /// Video is (about to be) on screen: idle inhibit, MPRIS "Playing".
     pub fn is_active(&self) -> bool {
-        matches!(self, PlayerState::Playing | PlayerState::Buffering { .. } | PlayerState::Loading { .. } | PlayerState::Reconnecting { .. } | PlayerState::Zapping { .. })
+        matches!(
+            self,
+            PlayerState::Playing
+                | PlayerState::Buffering { .. }
+                | PlayerState::Loading { .. }
+                | PlayerState::Reconnecting { .. }
+                | PlayerState::Zapping { .. }
+        )
     }
 }
 
@@ -256,7 +289,10 @@ pub enum PlayerEvent {
     /// A new item became current (also during Zapping, so the OSD shows it immediately).
     NowPlaying(Arc<Playable>),
     /// VOD ended (`finished` = reached watched threshold).
-    Ended { item: Option<ItemRef>, finished: bool },
+    Ended {
+        item: Option<ItemRef>,
+        finished: bool,
+    },
     Failed(PlayerError),
     TracksChanged,
 }
@@ -269,6 +305,9 @@ pub trait MediaResolver: Send {
     /// Should zapping skip this channel? (≥ 2 failures in 24 h from `stream_failure`, DRM, or
     /// a resolve failure earlier in this session.)
     fn skip_on_zap(&mut self, ch: ChannelId) -> bool;
+    /// Is this channel PIN-locked (its own lock or any of its groups')? A channel whose lock
+    /// can't be read counts as locked.
+    fn is_locked(&mut self, ch: ChannelId) -> bool;
 }
 
 /// Persistence the controller needs. `Services` adapts it to the store `Writer`
@@ -320,11 +359,17 @@ pub struct PlayerHandle {
 }
 
 impl PlayerHandle {
-    pub fn send(&self, cmd: PlayerCommand) { let _ = self.tx.send(cmd); }
+    pub fn send(&self, cmd: PlayerCommand) {
+        let _ = self.tx.send(cmd);
+    }
     /// Latest snapshot (cheap Arc clone).
-    pub fn snapshot(&self) -> Arc<PlayerSnapshot> { self.snapshot.borrow().clone() }
+    pub fn snapshot(&self) -> Arc<PlayerSnapshot> {
+        self.snapshot.borrow().clone()
+    }
     /// For async consumers (MPRIS) that await changes.
-    pub fn subscribe(&self) -> watch::Receiver<Arc<PlayerSnapshot>> { self.snapshot.clone() }
+    pub fn subscribe(&self) -> watch::Receiver<Arc<PlayerSnapshot>> {
+        self.snapshot.clone()
+    }
 }
 
 /// Owns mpv + threads. Lives in `Services`; shut down via [`Player::shutdown`] AFTER the video
@@ -354,8 +399,8 @@ impl Player {
         let pump = events::EventPump::start(mpv.clone(), evt_tx).map_err(crate::error::Error::other)?;
         let render_clock: RenderClock = Arc::new(AtomicU64::new(0));
         let epoch = Instant::now();
-        let controller = controller::spawn(mpv.clone(), cfg, deps, cmd_rx, evt_rx, snap_tx, render_clock.clone(), epoch)
-            .map_err(crate::error::Error::other)?;
+        let controller =
+            controller::spawn(mpv.clone(), cfg, deps, cmd_rx, evt_rx, snap_tx, render_clock.clone(), epoch).map_err(crate::error::Error::other)?;
         Ok(Self {
             mpv: Some(mpv),
             handle: PlayerHandle { tx: cmd_tx, snapshot: snap_rx },
@@ -367,7 +412,9 @@ impl Player {
         })
     }
 
-    pub fn handle(&self) -> PlayerHandle { self.handle.clone() }
+    pub fn handle(&self) -> PlayerHandle {
+        self.handle.clone()
+    }
 
     /// Raw core for `VideoSurface::new` ONLY (see module docs: no other mpv access from the UI).
     pub(crate) fn render_core(&self) -> Option<RenderCore> {
@@ -387,13 +434,186 @@ impl Player {
         // A render context still alive here means `VideoSurface::destroy` was skipped (panic /
         // unwind). Destroying mpv now would be UB (render ctx must be freed first), so leak it.
         if self.render_alive.load(Ordering::Acquire)
-            && let Some(m) = self.mpv.take() {
-                tracing::error!("player dropped while the video surface is alive; leaking mpv");
-                std::mem::forget(m);
-            }
+            && let Some(m) = self.mpv.take()
+        {
+            tracing::error!("player dropped while the video surface is alive; leaking mpv");
+            std::mem::forget(m);
+        }
     }
 }
 
 impl Drop for Player {
-    fn drop(&mut self) { self.shutdown(); }
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Headless controller tests against a real libmpv (`vo=null`, `ao=null`) playing libavdevice's
+/// `lavfi` test source (no files, no network). File/HTTP scenarios live in `tests/player_mpv.rs`.
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::model::{ChannelId, PlayableKind};
+    use crate::redact::Secret;
+
+    /// Plays lavfi's test source for any media; the listed channels are PIN-locked.
+    struct Lavfi(Vec<ChannelId>);
+
+    impl MediaResolver for Lavfi {
+        fn resolve(&mut self, media: &MediaRef, _resume: bool) -> std::result::Result<Playable, PlayerError> {
+            Ok(Playable {
+                media: media.clone(),
+                kind: PlayableKind::Live,
+                item: None,
+                source_id: None,
+                title: "lavfi".into(),
+                subtitle: None,
+                logo: None,
+                number: None,
+                url: Secret::new("av://lavfi:testsrc2=size=160x90:rate=25".into()),
+                headers: Default::default(),
+                start_at: None,
+                duration_hint: None,
+            })
+        }
+        fn skip_on_zap(&mut self, _ch: ChannelId) -> bool {
+            false
+        }
+        fn is_locked(&mut self, ch: ChannelId) -> bool {
+            self.0.contains(&ch)
+        }
+    }
+
+    fn headless_config() -> Config {
+        let mut cfg = Config::default();
+        cfg.player.mpv_options.insert("vo".into(), "null".into());
+        cfg.player.mpv_options.insert("ao".into(), "null".into());
+        cfg
+    }
+
+    fn start() -> Player {
+        start_with(&headless_config(), Lavfi(Vec::new()))
+    }
+
+    fn start_with(cfg: &Config, resolver: Lavfi) -> Player {
+        let deps = PlayerDeps { bus: EventBus::new(None).0, store: Box::new(NullPlayerStore), resolver: Box::new(resolver) };
+        Player::start(cfg, deps).expect("headless mpv")
+    }
+
+    fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        f()
+    }
+
+    fn play(p: &Player) {
+        p.handle().send(PlayerCommand::Play(PlayRequest {
+            media: MediaRef::Channel(ChannelId(1)),
+            zap: None,
+            origin: PlayOrigin::Cli,
+            resume: false,
+            immediate: true,
+        }));
+    }
+
+    #[test]
+    fn apply_config_reaches_mpv() {
+        let p = start();
+        let mpv = p.mpv.clone().expect("mpv");
+        let mut cfg = headless_config();
+        cfg.player.cache_secs = 4;
+        cfg.player.network_timeout_s = 7;
+        cfg.player.user_agent = "ApplyConfig/1".into();
+        cfg.player.mpv_options.insert("video-sync".into(), "display-resample".into());
+        p.handle().send(PlayerCommand::ApplyConfig(Box::new(cfg)));
+        // the controller sets the properties one by one: wait for the last one it applies
+        assert!(wait_until(Duration::from_secs(5), || { mpv.get_property::<String>("video-sync").ok().as_deref() == Some("display-resample") }));
+        assert_eq!(mpv.get_property::<f64>("cache-secs").unwrap(), 4.0);
+        assert_eq!(mpv.get_property::<f64>("demuxer-readahead-secs").unwrap(), 4.0);
+        assert_eq!(mpv.get_property::<f64>("network-timeout").unwrap(), 7.0);
+        assert_eq!(mpv.get_property::<String>("user-agent").unwrap(), "ApplyConfig/1");
+    }
+
+    #[test]
+    fn video_is_suspended_while_nothing_renders_and_resumed_on_request() {
+        let p = start();
+        let mpv = p.mpv.clone().expect("mpv");
+        let h = p.handle();
+        play(&p);
+        assert!(
+            wait_until(Duration::from_secs(20), || {
+                let s = h.snapshot();
+                s.state == PlayerState::Playing && s.video_size.is_some()
+            }),
+            "lavfi playback: {:?}",
+            h.snapshot().state
+        );
+        // no surface yet (clock 0): never suspended
+        std::thread::sleep(Duration::from_millis(2300));
+        assert!(!h.snapshot().video_suspended);
+
+        // one frame rendered "now", then nothing (hidden window)
+        let core = p.render_core().expect("core");
+        core.clock.store(core.epoch.elapsed().as_millis().max(1) as u64, Ordering::Relaxed);
+        assert!(wait_until(Duration::from_secs(6), || h.snapshot().video_suspended), "suspended after 2 s");
+        assert_eq!(mpv.get_property::<String>("vid").unwrap(), "no");
+        assert_eq!(h.snapshot().state, PlayerState::Playing, "audio keeps playing");
+
+        h.send(PlayerCommand::ResumeVideo);
+        assert!(wait_until(Duration::from_secs(5), || !h.snapshot().video_suspended));
+        assert_ne!(mpv.get_property::<String>("vid").unwrap(), "no");
+    }
+
+    /// Audit fix: MPRIS Next/Previous (which can't ask for the PIN) and a Backspace recall after
+    /// the session re-locked must never tune a PIN-locked channel; an unlocked UI still can.
+    #[test]
+    fn zap_and_recall_skip_locked_channels_while_locked() {
+        let mut cfg = headless_config();
+        cfg.parental = crate::config::ParentalConfig { enabled: true, pin_hash: Some("h".into()), pin_salt: Some("s".into()), relock_min: 0 };
+        let p = start_with(&cfg, Lavfi(vec![ChannelId(2)]));
+        let h = p.handle();
+        let playing = |id: i64| {
+            wait_until(Duration::from_secs(20), || {
+                let s = h.snapshot();
+                s.state == PlayerState::Playing && s.playable.as_ref().is_some_and(|p| p.media == MediaRef::Channel(ChannelId(id)))
+            })
+        };
+        let zap = ZapList { collection: crate::model::Collection::AllChannels, channels: vec![ChannelId(1), ChannelId(2), ChannelId(3)].into() };
+        let media = MediaRef::Channel(ChannelId(1));
+        h.send(PlayerCommand::Play(PlayRequest { media, zap: Some(zap), origin: PlayOrigin::Fullscreen, resume: false, immediate: true }));
+        assert!(playing(1));
+
+        h.send(PlayerCommand::Zap { forward: true, unlocked: false });
+        assert!(playing(3), "locked channel 2 skipped: {:?}", h.snapshot().playable);
+        h.send(PlayerCommand::Zap { forward: false, unlocked: true });
+        assert!(playing(2), "an unlocked session zaps onto it");
+        h.send(PlayerCommand::Zap { forward: true, unlocked: false });
+        assert!(playing(3));
+
+        // the recall target is the locked channel: refused while locked
+        assert_eq!(h.snapshot().previous_live.as_ref().map(|p| p.media.clone()), Some(MediaRef::Channel(ChannelId(2))));
+        h.send(PlayerCommand::LastChannel { unlocked: false });
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(h.snapshot().playable.as_ref().map(|p| p.media.clone()), Some(MediaRef::Channel(ChannelId(3))));
+        h.send(PlayerCommand::LastChannel { unlocked: true });
+        assert!(playing(2));
+    }
+
+    #[test]
+    fn shutdown_stops_and_joins() {
+        let mut p = start();
+        play(&p);
+        let h = p.handle();
+        assert!(wait_until(Duration::from_secs(20), || h.snapshot().state == PlayerState::Playing));
+        p.shutdown();
+        assert_eq!(h.snapshot().state, PlayerState::Idle, "final snapshot published on shutdown");
+        p.shutdown(); // idempotent
+    }
 }

@@ -290,7 +290,12 @@ Shutdown (`on_exit`): `VideoSurface::destroy` (GL current: render ctx, then FBO)
 `Services::shutdown`: integrations stop → `jobs.cancel_all` → `Player::shutdown` (Stop → final
 progress save submitted, join controller, stop pump, drop mpv) → runtime `shutdown_timeout(2 s)`
 → `Store::close(3 s)`: the writer runs everything queued before the sentinel (incl. that final
-save), checkpoints the WAL (TRUNCATE) and is joined.
+save), checkpoints the WAL (TRUNCATE) and is joined. (WP-13: `jobs.shutdown` refuses new jobs
+and cancels; after the player, the app waits ≤ 5 s for cancelled jobs to wind down — an aborted
+guide import discards its partial generation and restores channel matches — before the runtime
+goes. SIGTERM/SIGINT/SIGHUP close the window the same way; if no frame runs within 3 s (hidden
+workspace) or a second signal arrives — also during a stuck shutdown — the signal watcher stops
+the player, flushes the writer and the log file, removes `run/tuner.sock` and exits 0.)
 Unwind safety: `TunerApp` declares `video` before `services`; `MpvGl` frees its context only in
 an explicit `destroy` (GL current) and otherwise leaks it; `Player` leaks mpv while a render
 context is alive — never UB on a panic path.
@@ -300,8 +305,12 @@ context is alive — never UB on a panic path.
 `JobKind` enumerates every background operation (refresh source/EPG, refresh stale, probe/add
 source, lazy VOD/series details, rematch EPG, rebuild library, maintenance, backup export/
 import). `submit` returns a `JobId` immediately. Coalescing: identical jobs (`dedupe_key`)
-coalesce only while the existing one is `Queued`/`Connecting`; later, a `rerun` flag resubmits
-it after it finishes (a newer request is never dropped). Follow-ups go through
+coalesce only while the existing one is `Queued`/`Connecting` **and has not read its inputs
+yet**; later, a `rerun` flag resubmits it after it finishes (a newer request is never dropped).
+*Decided in phase 2:* a refresh stays `Connecting` while it talks to the server, so it marks the
+moment it reads its source row (`Progress::mark_inputs_read`); a request arriving after that
+runs again in full after the current run instead of being merged into it (it may carry edits
+the running job never saw). Follow-ups go through
 `JobContext::submit` (refresh → provider EPG → RebuildLibrary; restore → refresh each source;
 AddSource → RefreshSource). `JobContext::player_busy` (set by the app from each snapshot) makes
 the scheduler skip ticks while a stream is Loading/Zapping. Semaphores: playlists 2, EPG 1,
@@ -350,7 +359,8 @@ recent, sort)`) happens here, so zapping order == list order.
 
 | `DataScope` | App reaction |
 |---|---|
-| Live, Vod, Overrides, History, Sources, All | `RebuildLibrary` |
+| Live, Vod, Overrides, Sources, All | `RebuildLibrary` |
+| History (every zap) | re-read `recent_channels` (≤ 500 history rows) → `Library::with_recent_channels` (shares the `Arc` indexes, keeps `built_at`, new `generation` for screens showing the recent list); no rebuild (WP-13) |
 | Epg | `NowNextCache::invalidate` + `RebuildLibrary` (`ChannelSummary.epg_channel_id` is a snapshot of `channel_epg`) |
 | Favourites | `load_favs` → `TunerApp.favs` |
 | Reminders | `ReminderScheduler::refresh` |
@@ -867,6 +877,8 @@ Daily `Maintenance`: programmes with `stop < now − max(epg_keep_past_days, max
 * M3U: `m3u:` + 16 hex of blake3(`tvg_id` | `normalize_name(name)` | `normalize_name(group)`);
   duplicates inside one import get `#2`, `#3`… in file order. URLs are **not** part of the key
   (tokenized URLs rotate daily on many services).
+* M3U series assembled from episode entries (phase 5, §27.5): `m3u:s:` + 16 hex of
+  blake3(`normalize_name(series title)`); M3U movies/episodes keep their entry key (§27.4).
 * Groups: `<kind>:<normalize_group(name)>` — a lighter normalization than `normalize_name`
   (country prefixes kept, so "UK | News" ≠ "US | News"); empty → `uncategorized`.
 * The bodies of `sources::identity` are implemented in the skeleton and frozen (golden test);
@@ -984,8 +996,17 @@ there for the focused channel).
 * Daily: `Maintenance`.
 * Staleness UI: status bar "Guide updated 3 h ago" (warning glyph when > 48 h or `max_stop`
   passed: "Guide data ended — refresh"); per-source "Updated … / Failed … (reason)" in
-  Settings; channel rows show "No guide data" rather than empty space.
-* Closed app: no refresh in v1 (`tuner --refresh` reserved for a user timer).
+  Settings; channel rows show "No guide data" rather than empty space ("Loading guide… n %"
+  during the first guide import).
+* Closed app: no background refresh in v1. `tuner --refresh` (for a future user timer) refreshes
+  stale sources headlessly and exits (status 1 if a job failed). *Decided in phase 2:* while a
+  windowed instance is running it does nothing and exits 0 — that instance owns the database
+  writer and its scheduler refreshes on its own. *Phase 5 audit:* it holds the single-instance
+  lock (§21.4) for the whole refresh, marked `refresh` in the lock file, so the database keeps one
+  owner: a window launched meanwhile waits as for a starting instance (10 s) and then exits
+  with "a background refresh (tuner --refresh) is running; start Tuner again once it has
+  finished", on stderr and as a desktop notification (a launcher has no terminal). Upgrades it
+  performs are toasted by the next window (§27.3).
 
 ---
 
@@ -1007,7 +1028,7 @@ unknown), capped at `now`. Granularity: 1 s if the template uses `{utc}`, `${sta
 | Append | live URL + expand(`catchup-source`) | `?utc={utc}&lutc={lutc}` appended |
 | Shift / timeshift | live URL + `?`/`&` + `utc={utc}&lutc={lutc}` | `http://h/ch/index.m3u8?utc=1791576000&lutc=…` |
 | Flussonic (fs, -hls, -ts) | rewrite: `…/mpegts` → `…/timeshift_abs-{utc}.ts`; `…/index.m3u8` → `…/timeshift_rel-{offset:1}.m3u8`; `…/mono.m3u8` → `…/mono-timeshift_rel-{offset:1}.m3u8` | `http://h/ch/timeshift_rel-5400.m3u8` |
-| Xc (M3U `xc`/`xtream`) | parse `host/(live/)?u/p/id(.ext)` → `host/timeshift/u/p/{duration:60}/{Y}-{m}-{d}:{H}-{M}/id.ext` | `/timeshift/u/p/60/2026-10-09:21-00/1234.ts` (server tz Europe/London, BST) |
+| Xc (M3U `xc`/`xtream`) | parse `host/(live/)?u/p/id(.ext)` or `host/path/live/u/p/id(.ext)` → `host(/path)/timeshift/u/p/{duration:60}/{Y}-{m}-{d}:{H}-{M}/id.ext` | `/timeshift/u/p/60/2026-10-09:21-00/1234.ts` (server tz Europe/London, BST) |
 | Native Xtream source | `xtream::urls::timeshift_url(creds, stream_id, start_in_server_tz, ceil(min), ext)` | same as Xc; tz = source override → `AccountInfo.server_tz` → local |
 | Vod | expand(`catchup-source`) or `{catchup-id}` | — |
 
@@ -1544,7 +1565,7 @@ favourites lists) show a 󰇙 drag grip and move with Alt+↑/↓ or K/J. Every 
 | Favourites | lists: create, rename (F2), delete (Confirm), reorder (grip / Alt+↑/↓) | `fav_list` | "Favourites" (default, not deletable) |
 | Reminders | pending reminders (programme, channel, time); Delete cancels | `reminder` | — |
 | Parental | enable · set/change PIN · relock after · lock groups/channels (from lists via Ctrl+L) | `parental.*`, overrides | off |
-| Backup | export (include passwords? history?) · import (merge/replace) | §19 | — |
+| Backup | export (include passwords? history?) · import (merge/replace, restore settings?) | §19 | — |
 | Hidden items | unhide groups/channels/VOD | overrides | — |
 | Orphans | Enter = attach to…, Delete/x → menu with Forget | §8.3 | — |
 | About & logs | version, paths, debug logging, log viewer, export log | `general.debug_log` | off |
@@ -1554,8 +1575,9 @@ offset (minutes), EPG assignment, lock, hide.
 ### 13.10 Onboarding
 One centred card (launcher look; **no sidebar, status bar or mini-player**), steps:
 1. **Welcome** (Add a playlist · Restore a backup) — choice card, key context `[Modal]`.
-2. **Type** (Xtream login · M3U URL · M3U file; a pasted `get.php` URL is auto-detected and
-   offered as Xtream) — `[Modal]`.
+2. **Type** (Xtream login · M3U URL · M3U file · Try free channels; an M3U that is an Xtream
+   account is upgraded automatically by the probe, with "Keep as M3U" on the Test step — §27.3,
+   §27.8) — `[Modal]`.
 3. **Details** (name, glyph from `SOURCE_ICONS`, colour, credentials; password masked) —
    `[TextInput, Modal]` while a field is focused. The Xtream server field is normalized with
    `xtream::urls::normalize_server` (adds `http://` when missing, strips path / query /
@@ -1574,7 +1596,9 @@ One centred card (launcher look; **no sidebar, status bar or mini-player**), ste
 Esc goes back a step; everything keyboard-reachable. The same card is reused via
 `Route::Onboarding(OnboardingStart)`: `AddSource` (Settings ▸ Playlists ▸ "+ Add", starts at
 Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the name prefilled),
-`NeedsCredentials(source)` (restored sources without password; Details for that source).
+`NeedsCredentials(source)` (restored sources without password; Details for that source),
+`FreeChannels` (Settings ▸ Playlists ▸ "Add free channels…"; starts at the **Presets** step that
+"Try free channels" opens, §27.8 — a pick probes the preset like a typed M3U URL).
 
 ### 13.11 Help, jobs, dialogs, EPG mapping, logs
 * Help (`?`, F1): generated from `keymap::help_rows`; current contexts first; two columns ≥
@@ -1590,6 +1614,9 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
   filter text; Ctrl+S view menu: minimum level, Export…) are full screens.
 * **Rule: no screen reads raw keys** — every key a screen reacts to is in a keymap table, so
   the help overlay and the hint line are complete.
+* *Decided in phase 3:* Help and Jobs are toggles — requesting the one on top again (`?`/F1,
+  Ctrl+J, a status-bar click) closes it. Switching screens (sidebar, Alt+digits, `--view`)
+  closes every open overlay; overlays belong to the screen that opened them.
 
 ### 13.12 States (copy and behaviour)
 
@@ -1599,6 +1626,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | Empty library | Home/Live | empty state 󰐹 "No playlists yet" + "Add playlist" (→ onboarding) |
 | Empty group / no matches | lists | 󰍉 "No matches for “abc”" / "This group is empty" (+ "Show hidden" if items hidden) |
 | No guide data | rows / grid | "No guide data" (@ 0.36); grid: one gap cell; Ctrl+E assign EPG hint |
+| Guide doesn't cover the channel (WP-13) | preview, grid, guide header, Settings ▸ EPG, onboarding Done | says *why*: loading / no guide at all / guide not loaded / "Not in your guide" with the coverage ("Your guides cover 3 of 11 249 channels"); Ctrl+E = EPG mapping, or Settings ▸ EPG when there is nothing to map to. Settings ▸ EPG rows: "Matches N of M channels · guide lists X channels, Y programmes" (+ a note when under half are covered); Playlists rows "N ch (M with guide)" |
 | Guide stale / ended | status bar, guide header | warning glyph "Guide updated 3 d ago · Refresh" |
 | Import running | status bar, settings row | phase + % ; lists keep showing old data |
 | Import failed | toast + settings row | "Couldn't refresh My IPTV: HTTP 404" (redacted), old data kept |
@@ -1678,6 +1706,11 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 * **Esc ladder**: clear filter → close overlay/side panel → leave OSD controls focus → hide the
   info banner → leave window fullscreen → leave the player (mini player keeps playing) → back
   in the route stack. Esc never shows the banner. Alt+← and the mouse back button = Back.
+  *Decided in phase 3:* Back on a lone sub-page (nothing beneath it in the route stack, e.g. a
+  restored last screen) goes to its parent screen: movie / series details → Movies / Series,
+  Logs and EPG mapping → Settings, the player → Live TV.
+* *Decided in phase 3:* Ctrl+P (open the player) acts only while something is playing (any
+  non-Idle player state); with nothing playing it does nothing rather than open an empty player.
 * **Mouse parity**: everything is clickable; hover moves list cursors only after real pointer
   motion (Omarchy `pointerGate`); right-click = context menu; wheel = volume only in the
   fullscreen player; double-click on video = window fullscreen.
@@ -1871,7 +1904,13 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `f` | Collection: favourites lists, groups, all |
 | `0` / `1` / `2` / `3` / `4` / `5` / `6` / `7` / `8` / `9` | Jump to channel number |
 | `Ctrl+F` | Add channel to Favourites |
+| `Ctrl+Shift+F` | Favourites lists… (add, new list) |
 | `Ctrl+E` | Assign EPG channel |
+| `Ctrl+I` | Edit channel information |
+| `F2` | Rename channel |
+| `Ctrl+H` | Hide channel |
+| `Ctrl+L` | Lock channel with PIN / unlock |
+| `Shift+F10` / `Ctrl+Enter` | Channel menu |
 | `/` | Search everything |
 | `?` | Keyboard help |
 | `Esc` | Back |
@@ -1984,15 +2023,11 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Ctrl+H` | Hide / unhide |
 | `F2` | Rename |
 | `Ctrl+L` | Lock with PIN / unlock |
-| `Alt+↑` | Move up (reorder) |
-| `Alt+↓` | Move down (reorder) |
-| `Ctrl+S` | Sort & view options… |
 | `Ctrl+G` | Show in TV guide |
 | `Ctrl+I` | Details / edit information |
 | `Ctrl+E` | Assign EPG channel |
 | `Ctrl+W` | Mark watched / unwatched |
-| `Delete` | Remove (from list / cancel task / forget) |
-| `Shift+F10` / `Ctrl+Enter` | Context menu |
+| `Shift+F10` / `Ctrl+Enter` | List these shortcuts |
 
 #### Dialogs & menus (`Modal`)
 
@@ -2115,7 +2150,13 @@ max_image_width: 8192, max_image_height: 8192, max_alloc: 64 MiB }`; SVG sources
 rejected, parsed with an EMPTY `usvg` fontdb (never `load_system_fonts`) and rasterized at most
 at the kind's box. Fetching goes through a private `Fetch` trait (HTTP impl + test fake).
 Until WP-09 lands `get` returns `Failed` (monogram) and `pump` is a no-op.
-Failures negative-cached (memory 1 h, `.fail` marker 24 h). Logos never show spinners (neutral
+Failures negative-cached (memory 1 h, `.fail` marker 24 h); transient network failures
+(timeouts, 5xx, offline, TLS) memory only, backing off per image 2 → 8 → 32 → 60 min (WP-13: a
+blip must not hide logos for an hour; an unreachable host is retried a few times an hour). The
+texture budget is a hard cap: an image that doesn't fit beside the visible set waits (loading)
+until something scrolls away. SVG: ≤ 10 000 nodes, render > 3 s = invalid. "Source User-Agent"
+= by host (WP-13 decision): `get(url, kind)` has no source, so images on the host a playlist is
+served from use that playlist's User-Agent, others the default. Logos never show spinners (neutral
 placeholder, then monogram on failure); posters show a skeleton. Disk cache pruned to 500 MB
 by maintenance.
 
@@ -2129,7 +2170,10 @@ watch progress, history (optional), reminders, manual EPG mappings (by EPG sourc
 raw `config.toml`. Written 0600 via the portal file picker. Restore: Merge (match sources by
 kind + name + URL/server) or Replace; then every restored source is refreshed and user data
 re-attaches through fingerprints (§8.3). Sources restored without passwords are listed as
-"needs credentials".
+"needs credentials". The backup's settings are applied only when "Restore settings" is on (it
+follows the mode: on for Replace, off for Merge, so a Merge that brings back favourites keeps
+the current settings; the onboarding restore always applies them). Machine-specific settings
+(fonts, hwdec, mpv options, UI scale, debug log) stay, and an existing PIN is never replaced.
 
 ---
 
@@ -2143,9 +2187,13 @@ re-attaches through fingerprints (§8.3). Sources restored without passwords are
 * **In memory/types**: `Secret<T>` for passwords, credential-bearing URLs (M3U URL, xmltv.php,
   stream URLs) — `Debug` prints `Secret(***)`.
 * **Redaction** (`redact::redact`, implemented + tests): registered secrets (all usernames/
-  passwords/URL tokens loaded at startup and on source edits), URL userinfo, credential query
+  passwords/URL tokens loaded at startup and on source edits, plus the Xtream logins an M3U
+  import finds in its stream URLs — a pair counts once two entries with different stream ids
+  carry it, so a CDN path shaped like one never becomes a secret; registered as found and kept in `meta`
+  (`playlist-logins:<id>`) for the next start, so a playlist that stays M3U has its prefixed
+  short-form URLs `host/<prefix>/<u>/<p>/<id>` masked too), URL userinfo, credential query
   parameters (`username password pass token auth key sig…`), Xtream path segments
-  (`/live|movie|series|timeshift/<u>/<p>/`). Applied to: every log line (tracing layer), every
+  (`/live|movie|series|timeshift/<u>/<p>/`, and the bare `host/<u>/<p>/<id>`). Applied to: every log line (tracing layer), every
   `Error` Display, mpv log messages, job errors, toasts, stream-info panel, Settings URL
   display. The secret registry is process-global: tests never call `redact::clear_secrets`
   (parallel tests race) and use a unique secret per test instead.
@@ -2202,10 +2250,15 @@ Reminders fire only while Tuner runs (v1).
 ### 21.4 Single instance & CLI
 `$XDG_RUNTIME_DIR/tuner/tuner.sock`; a second `tuner [--view guide] [--play …] [file/url]`
 hands its request over and exits 0 (stale socket removed). Works with `omarchy-launch-or-focus
-tuner` and the omarchy-menu entries. Request handling (`TunerApp::handle_ipc`, also for the
+'^tuner$'` (anchored: the pattern also matches window titles) and the omarchy-menu entries. Request handling (`TunerApp::handle_ipc`, also for the
 first instance's own CLI): `--view` switches route; `--play X` and positional URLs / media files
 play immediately (`MediaRef::Url`, fullscreen player); positional `.m3u`/`.m3u8` files open the
 onboarding card at Details (`Route::Onboarding(PlaylistFile)`).
+*Decided in phase 2:* inputs are made absolute by the invoking process before the handoff (the
+running instance has another working directory); a local `file://` URI (desktop `%U`, file
+managers, `gio open`) is decoded to its path and treated like any other path, while
+`file://host/…` stays a URL. `tuner --refresh` never hands off: with an instance running it
+does nothing (§9.5); while it runs it holds the instance lock itself.
 
 ### 21.5 Files & windows
 File pickers through the XDG portal (`rfd` xdg-portal → portal-gtk, auto-floated, follows
@@ -2225,10 +2278,38 @@ prefer-dark/light). `hypr::focus_self` uses Hyprland 0.56's Lua dispatcher
   (`-default-opacity` tag + `opacity "1 1"`, **`render_unfocused = true`** so playback keeps
   rendering on other workspaces (§11.1), optional idle fallback and Super+Shift+T binding),
   `packaging/omarchy/omarchy-menu.jsonc` (TV submenu), `packaging/PKGBUILD` (x86_64 + aarch64,
-  depends mpv/fontconfig/wayland/mesa; builds the local checkout).
+  depends mpv/xz/fontconfig/JetBrains Mono Nerd/wayland/mesa; builds the local checkout into
+  `packaging/src/target`, installs the snippets under `/usr/share/tuner/`, the docs under
+  `/usr/share/doc/tuner/` and `LICENSE` under `/usr/share/licenses/omatuner/`).
+* **Names**: the repository (<https://github.com/rthoms334/omatuner>) and the Arch package
+  (`pkgname=omatuner`) are *omatuner*; everything the user sees or configures keeps *tuner*: the
+  app name "Tuner", the command `/usr/bin/tuner`, the desktop entry/icon/app id `tuner`, the
+  config/data/state/cache folders, the MPRIS name and `/usr/share/{tuner,doc/tuner}`. No
+  `provides`/`conflicts`: no package of this app was ever published under another name.
+* **Releases** (`.github/workflows/release.yml`): a pushed tag `v<version>` or
+  `v<version>-<suffix>` (`<version>` must equal `Cargo.toml`'s; the PKGBUILD's `prepare()` checks
+  `pkgver` against it too; the suffix is lowercase letters, digits and dots starting with a letter,
+  and a pre-release builds `pkgver=<version><suffix>`, e.g. `0.1.0rc4`, which pacman orders
+  before `0.1.0`) builds the PKGBUILD with makepkg as an unprivileged user in
+  `archlinux:base-devel` (x86_64, on `ubuntu-24.04`) and `menci/archlinuxarm:base-devel`
+  (aarch64, natively on `ubuntu-24.04-arm`; pinned by digest in the release workflow, floating in
+  CI), and publishes a GitHub Release (`--generate-notes`; a tag with a suffix is a pre-release;
+  re-running a failed publish re-uploads into the existing release) with
+  `omatuner-<pkgver>-<rel>-<arch>.pkg.tar.zst`, `omatuner-<pkgver>-<arch>.tar.gz` (binary, desktop entry, icon, snippets, README, LICENSE) and
+  `SHA256SUMS`. A manual run with `publish=false`, and every pull request that touches
+  `packaging/`, `Cargo.*` or the workflow, is a dry run (workflow artifacts only).
+* **CI** (`.github/workflows/ci.yml`): pull requests and pushes to `main`, same two containers:
+  `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo build
+  --all-targets --locked`, `scripts/gen-test-media.sh`, then `dbus-run-session -- cargo test
+  --locked` (MPRIS and notification tests need a session bus; mpv runs with `vo=null`/`ao=null`;
+  kittest UI tests are headless). The soak test stays `#[ignore]`d.
 * User install without a package: `cargo install --path .`, copy the desktop file to
   `~/.local/share/applications/`, icon to `~/.local/share/icons/hicolor/scalable/apps/`, merge the
-  Hyprland and menu snippets.
+  Hyprland and menu snippets. The Hyprland snippet is a module: `~/.config/hypr/tuner.lua` +
+  `require("hypr.tuner")` (Omarchy's bootstrap puts `~/.config/?.lua` on `package.path`).
+* User-facing docs: `README.md` (install, sources, guide coverage, keys — the table between the
+  `keymap` markers is regenerated with `cargo run --example keymap_md`), the manual test
+  checklist `docs/MANUAL_CHECKLIST.md` (§23).
 
 ---
 
@@ -2244,7 +2325,7 @@ prefer-dark/light). `hypr::focus_self` uses Hyprland 0.56's Lua dispatcher
 | UI | `tuner::ui::testing::TestUi` (real services in a temp profile, headless mpv, owns every `UiCtx` part) + `egui_kittest` harnesses built by the test; fake `EpgReader` for the guide; key dispatch layers, Esc ladder, list navigation & filter, guide focus model, help overlay rows | `tests/{keymap,widgets,guide,onboarding,parental}.rs` |
 | Smoke (skeleton) | store opens private/migrated, caches 0700, seeders consistent, every screen and overlay handles actions and draws without panicking | `tests/smoke.rs` |
 | Benchmarks | criterion targets declared in `Cargo.toml`, one owner each (§24.2), on `scripts/gen-big-fixtures.py` output (100k M3U, 415k-programme XMLTV) and seeded DBs (5 000 channels) | `benches/{m3u,xmltv,store,search,import,guide}.rs` |
-| Manual checklist | theme switch live (dark ↔ light, `white` theme OSD), font change, tiled/half/full layouts at text size 12 and 16, media keys, idle (lower screensaver timeout to 30 s), other-workspace playback 60 s with and without `render_unfocused`, 1 h soak, fullscreen toggle, real providers (iptv-org, Pluto via i.mjh.nz EPG) | WP-13 |
+| Manual checklist | theme switch live (dark ↔ light, `white` theme OSD), font change, tiled/half/full layouts at text size 12 and 16, media keys, idle (lower screensaver timeout to 30 s), other-workspace playback 60 s with and without `render_unfocused`, 1 h soak, fullscreen toggle, real providers (iptv-org, Pluto via i.mjh.nz EPG) | WP-13: `docs/MANUAL_CHECKLIST.md` |
 
 `cargo test` must stay green without network, ffmpeg or a Wayland session (those tests skip).
 Lint gate: `cargo clippy --all-targets -- -D warnings` (baseline is zero; stub modules carry a
@@ -2391,7 +2472,9 @@ cancellation (no sweep), throttled progress, follow-up submits, scheduler stalen
 has channels/movies/series, provider EPG imported and mapped, account info stored and reported in
 `SourceRefreshed`; refresh with renumbered stream ids keeps favourites (reattach); M3U file
 import; failing refresh keeps the old catalogue and records a redacted error; [bench
-`benches/import.rs`] wired (gates run by WP-13).
+`benches/import.rs`] wired (gates run by WP-13). Job failures are logged at WARN or above under
+target `tuner::jobs` (the Jobs overlay's Problems list reads them from the log buffer; there is no
+job-history API — decided after phase 1).
 
 **WP-07 Player core** — milestone A: `tests/support/media.rs` + `scripts/gen-test-media.sh` by
 day 2. [unit] state machine covers every transition of §11.3 (entry tracking incl. the fast
@@ -2429,7 +2512,10 @@ gate, row states, toggle, seek bar, toast stacking above an avoid rect), help ov
 overlay `Ignored` → globals, Esc ladder, DataScope reactions (§5.4 table), CLI/IPC inputs
 (`--play`, `.m3u` file → onboarding), connection limits sent at startup and after refresh,
 `ApplyConfig` sent on edits, reminders refresh; usable at 790 and 1600 pt at text size 12 and
-16; [e2e after WP-06/08/09/01] every remaining `SKELETON-STUB` removed.
+16; [e2e after WP-06/08/09/01] every remaining `SKELETON-STUB` removed. Help is opened with
+`HelpOverlay::with_contexts(<current context stack>)` (current contexts first, §13.11) instead
+of `overlays::build(OverlayRequest::Help)`; after an Alt chord resolves, drop its text event; when
+`layout::sidebar_width` is 0 call `widgets::sidebar::sidebar` in a horizontal top panel (glyph strip).
 
 **WP-11 Live/Guide/Player UI** — [kittest with `TestUi` + seed + fake `EpgReader`] Live
 3-pane/2-pane/stack layouts; Enter rule; preview autoplay off by default, keyboard-rest only,
@@ -2517,7 +2603,9 @@ in the skeleton code. Listed: points rejected or implemented differently, with t
   per-item limitation is documented (§8.3, §13.2) instead.
 * *M6(e) — drag & drop / `tuner file.m3u`*: reuse the onboarding card
   (`Route::Onboarding(PlaylistFile)`), so `JobKind::ImportPlaylistFile` (suggested by the
-  implementability review M8) was removed — `AddSource` covers file sources.
+  implementability review M8) was removed — `AddSource` covers file sources. Dropped XMLTV
+  files are added as guides (Phase 5). Caveat: drops depend on the eframe/winit backend and
+  were not confirmed to arrive under Wayland/Hyprland (MANUAL_CHECKLIST §8).
 
 **Architecture / concurrency review**
 * *B1(d) — video watchdog*: implemented (not left optional), because users who don't install the
@@ -2560,3 +2648,402 @@ in the skeleton code. Listed: points rejected or implemented differently, with t
 * *Minor 10 — `save_progress(final_)`*: `PlayerStore::save_progress` takes no flag; final saves
   are guaranteed by the Stop/EndFile/switch effects plus the joined writer at shutdown. WP-07
   verifies with a recording `PlayerStore`.
+
+**Implementation decisions (phases 2–3, recorded in WP-13)** — folded into the sections named:
+* Job coalescing is stricter than "while Queued/Connecting": a request made after the running
+  job read its source row runs again in full (§5.2).
+* `tuner --refresh` does nothing while a windowed instance runs (§9.5, §21.4).
+* Help and Jobs close when requested again; switching screens closes overlays (§13.11).
+* Back on a lone sub-page goes to the parent screen; Ctrl+P works only while something is
+  playing (§15.1).
+* `file://` inputs are treated as paths (§21.4).
+
+---
+
+## 27. Phase 5: Xtream auto-upgrade, M3U movies/series fallback, free-channel presets
+
+Base: tag `p5-base` on `tuner-v1` (this section + the skeleton of §27.9). Where this section
+disagrees with an earlier one, this section wins; the earlier text is superseded only where
+named (§13.10 step 2 "offered as Xtream"; §9.1 step 4 "every entry is a channel"; §8.1 gains
+the M3U series key).
+
+### 27.1 Decisions (user, authoritative)
+1. **Free channels.** Onboarding's Type step offers "Try free channels" next to Xtream / M3U
+   URL / M3U file, and Settings ▸ Playlists has "Add free channels". Choices: iptv-org for the
+   user's country (default), iptv-org all countries, Free-TV. Nothing is fetched until the user
+   picks one; nothing is ever added on its own.
+2. **Auto-upgrade.** An M3U that is really an Xtream account (a `get.php` URL, or entries that
+   are Xtream stream URLs — also local files) is switched to the Xtream API without asking.
+   The user can opt out ("Keep as M3U") in the onboarding summary and in the source's settings.
+3. **Existing sources** upgrade silently on their next refresh, with a toast; user data carries
+   over; switching back is in the source's settings; a failed upgrade leaves the source M3U.
+4. **Fallback.** When a playlist stays M3U, Xtream-style `/movie/` entries become movies and
+   `/series/` entries become series episodes; plain playlists are unaffected; M3U movies have
+   only title / poster / group and their detail pages must look intentional.
+
+### 27.2 Detection (`sources::xtream::detect`, `sources::m3u::detect_xtream_url`)
+
+**Playlist URL** (`m3u::detect_xtream_url`, existing): http(s), last path segment `get.php` or
+`player_api.php` (case-insensitive), non-empty `username` and `password` query values
+(percent-decoded). **Change:** the server keeps the path prefix before that segment
+(`https://h.example/sub/get.php?…` → server `https://h.example/sub`), because panels behind a
+prefix serve `player_api.php` and the stream paths under it; `urls::*` builders already append
+to `server` verbatim. The existing test's `https://h.example` expectation changes accordingly.
+
+**Stream URL** (`detect::parse_stream_url`):
+```
+scheme://host[:port][/prefix…]/{live|movie|series}/<user>/<pass>/<id>[.<ext>][?query][#frag]
+```
+* scheme http/https; host lowercased; userinfo, query and fragment ignored;
+* the kind segment is the 4th from the end, compared case-insensitively; `<user>`/`<pass>`
+  are non-empty and percent-decoded; `<id>` = the last segment's stem before the first `.`,
+  all ASCII digits, parsed as `i64` > 0; `<ext>` = the rest after that `.` (lowercased), `None`
+  when absent;
+* `server` = `scheme://host[:port]` + the prefix segments joined with `/` (no trailing `/`);
+* not matched: `timeshift/…`, the short live form `host/<user>/<pass>/<id>` (too ambiguous —
+  any CDN path `a/b/123.ts` would qualify), anything with fewer segments. The short form counts
+  only with the login of the full stream URLs: `PlaylistScan` accepts short-form entries whose
+  two segments are that login (and gives up on any other pair), so a panel playlist whose live
+  section uses the short form still upgrades; `m3u_to_xtream_moves` maps such channels to
+  `xt:live:<id>` (`detect::short_live_id`).
+
+**Whole playlist** (`detect::PlaylistScan`, fed every entry URL in file order): the playlist
+is one Xtream account iff
+1. at least one entry is a stream URL, and every stream URL carries the same (username,
+   password);
+2. every entry that is not a stream URL is served by a `host[:port]` that also serves stream
+   URLs (provider extras such as an info clip are allowed; an entry on a foreign host means the
+   playlist is a merge and upgrading would lose entries → no upgrade).
+
+`push` returns `false` as soon as rule 1 or 2 fails (plain playlists stop at their first
+entry, so the scan is free for iptv-org / Free-TV). `finish` returns the credentials with
+`server` = the most frequent stream-URL server (first seen on ties — load-balanced panels
+list several hosts; the API is tried on one).
+
+**Redaction.** Credentials found here are registered with `redact::register_secret` (user and
+password) by the caller *before* any log line or error can contain them; detection itself never
+logs. Log lines about an attempt name the source and `redact_url(server)` only. Upgraded sources
+store the login in `xt_*` (registered at startup by `register_secrets`); the M3U URL / file is
+kept (§27.3). Stream URLs in playlists were already covered by the Xtream path-segment rule.
+
+### 27.3 Upgrade flow
+
+**New source (probe, `jobs::probe`).** A draft with `settings.keep_m3u == true` is probed as M3U,
+no attempt. Otherwise:
+* M3U URL that is a `get.php` URL → authenticate (as today). Success → `ProbeResult { kind:
+  Xtream, xtream: Some(login), account, upgraded_from: Some(M3uUrl), … }`.
+* Any other M3U URL / file → download + count as today, feeding `PlaylistScan` from
+  `count_entries`; if it qualifies → authenticate (+ live categories estimate). Success → the
+  same Xtream result with `upgraded_from: Some(kind)`.
+* **An upgrade failure never fails the probe**: auth rejected / account unusable / network /
+  HTML → `debug!` (redacted) and the M3U result (or the M3U's own error) stands. For a `get.php`
+  URL that means the probe then downloads the playlist like any M3U URL.
+
+Onboarding (Test step) for `upgraded_from.is_some()`: "Xtream login found — movies, series,
+catch-up and account info included." with the account lines, and buttons **Continue** (focused)
+· **Keep as M3U**. Continue → `AddSource` with `kind: Xtream`, `xtream: login`, and the original
+`url` / `path` KEPT (it is what "switch back" uses); "Keep as M3U" → the M3U draft with
+`settings.keep_m3u = true` (then the Guide step rules for M3U apply). The Details step's old
+"Use the Xtream login" row (`Field::UseXtream`) goes away: the probe decides.
+
+**Existing source (refresh, `jobs::import_source::refresh_source`)**, under the per-source lock,
+after reading the row:
+
+| Source row | What the refresh does |
+|---|---|
+| M3U, `keep_m3u` | M3U import with the §27.5 fallback. No attempt. |
+| M3U, not `keep_m3u` | Upgrade attempt if **due**, else M3U import (+ fallback). |
+| Xtream with `m3u_origin()`, `keep_m3u` | **Switch back**: `set_source_kind(origin)`, then a forced M3U import with the Xtream→M3U key moves (§27.4). |
+| Xtream (native, or upgraded and not `keep_m3u`) | Xtream import as today. |
+
+*Due* ⇔ the refresh is forced (Settings ▸ Refresh, the switch toggle) OR there is no failed
+attempt on record OR the last one is ≥ 7 days old — ≥ 1 hour when the server couldn't answer
+(network error, timeout, HTTP 5xx or 429: `transient`, which says nothing about the login —
+also when the login worked but every list failed only that way; a rejected login, an unusable
+account or a bad payload keep the week). The hour is a floor, not a timer: the M3U import of
+the same refresh usually succeeds and the source is then not due before `playlist_refresh_h`,
+so the check normally comes with the next scheduled refresh (or Ctrl+R / *Refresh now*). Failed attempts are
+recorded in `meta` as `xtream-upgrade:<source id>` = `{"at": <unix s>, "login_failed": bool,
+"transient": bool}` (deleted on success and on switching).
+
+Attempt:
+1. Credentials: from the URL for `get.php` (before any download); otherwise download the
+   playlist — **ignoring ETag/Last-Modified when no attempt is on record**, so the first refresh
+   after this release cannot be a 304 — or read the file, and run `PlaylistScan` over it on the
+   blocking pool (early exit). No credentials → M3U import of the same file.
+2. Register the secrets; `authenticate` with the source's User-Agent. Rejected / unusable
+   account / network / bad payload → record the attempt, `info!` "Couldn't use the Xtream login
+   of <name> (<redacted reason>); keeping the playlist", continue with the M3U import (a
+   `get.php` source downloads its playlist now). The refresh's own outcome is the M3U import's.
+3. Success → compute the M3U→Xtream key moves (§27.4) from the current rows, then run the Xtream
+   import with an *upgrade hook*: in the writer closure of the **first** `finish_catalogue` of
+   that import (live, or VOD when live failed) and before it: `apply_key_moves`,
+   `set_source_kind(Xtream, Some(login))` (clears validators), delete the meta marker. That
+   closure is the commit point: before it, nothing user-visible changed; after it, the source
+   is Xtream. `set_account` as usual; `notify(DataScope::Sources)`; `RefreshResult.upgraded =
+   true`.
+4. The Xtream import fails before any finish (every kind failed — nothing was written, since
+   kinds fail at fetch time) → no commit; record the attempt; `info!`; run the M3U import from
+   the same file in the same job. A cancel before the commit → no commit, no sweep (as today).
+5. After the commit the refresh succeeds (`upgraded = true`, so the toast is shown) whatever
+   follows: a kind failing fatally (a VOD list answering 401) is recorded in `last_error` like
+   any partial failure and the remaining kinds are skipped; a cancel returns at once (no
+   sweep, no bookkeeping — the source stays due). Moves of the kinds not finished are not
+   lost: every Xtream refresh of an upgraded source (`m3u_origin()`) first recomputes
+   `m3u_to_xtream_moves`, which finds user data still on M3U keys whose rows are still there,
+   and applies them with the finishes of their kinds.
+
+The outcome is `JobOutcome::SourceRefreshed { upgraded, account, … }`; the app shows
+`Toast::info("Upgraded to Xtream login — movies & series now available")` whenever `upgraded`
+(silent refreshes from the scheduler included) and forwards `account` to the connection budget
+as before. The commit itself notes the source in `meta` (`xtream-upgraded-unseen:<id>`,
+`note_unseen_upgrade`, in the finish transaction with `set_source_kind`); the app deletes it
+when it shows the toast (`forget_unseen_upgrade`). Whatever is left — `tuner --refresh` has no
+window, and a window that quit (or a headless run that timed out) cancels the job before its
+outcome is shown — the next window's start takes (`take_unseen_upgrades`: sources still Xtream,
+once; named when there are several playlists). `AddSource` runs the same refresh inline (an "Add anyway" M3U may upgrade during its
+first import; onboarding's Done step shows the counts, no toast, and `add_source` drops the
+`xtream-upgraded-unseen` note).
+
+**Switching in Settings ▸ Playlists ▸ source** (UI): a toggle row "Use the Xtream login"
+(= `!keep_m3u`) appears for Xtream sources with `m3u_origin()` and for M3U sources with
+`keep_m3u` (a playlist the user kept; for other M3U sources upgrading is automatic and the row
+is hidden). Changing it saves `SourceSettings.keep_m3u` (`set_source_settings`) and submits
+`RefreshSource { force: true }` once that write landed (`JobManager::submit_tracked`, which
+says whether the returned job runs the request or it runs again after that job); the refresh
+performs the switch. Only that run answers the toggle: a forced refresh already running read
+the playlist still kept, so its outcome is ignored. If the user asked for the Xtream login and
+that run does not upgrade (`upgraded == false`, or it failed), the source is kept again and,
+for an outcome without `upgraded`, the screen toasts "Couldn't sign in with this playlist's
+Xtream login — still using the playlist" (the reason is in the log / `last_error` is untouched
+by a failed attempt).
+
+**Store guard.** `store::sources::update_source` must never null the Xtream login of a row whose
+stored kind is `xtream` (keeps the stored `xt_*` when `src.xtream` is `None`): a source editor
+opened before a silent upgrade would otherwise wipe the new login on Save. The UI also reloads
+its editor copy on `DataScope::Sources`.
+
+### 27.4 Identity across the switch (`store::import`)
+
+Keys never change meaning (§8.1); user data is *moved* between keys with `KeyMove { from, to }`
+(cross-kind capable `apply_key_moves`; holders as `move_user_data`, plus: a move to another kind
+rewrites the `kind` column of `fav_item`, `item_override`, `watch_progress`, `history`; reminders,
+manual EPG mappings and `stream_failure` rows are only moved channel→channel and otherwise
+dropped; existing rows of `to` win). Moves are computed by the importer, applied inside the
+finish transaction BEFORE `reattach`, and only for keys that hold user data.
+
+* **M3U → Xtream** (`m3u_to_xtream_moves`, from the rows present before the import): every
+  channel / movie / episode row of the source whose `StreamLocator::Url` parses as a stream URL →
+  `live` ⇒ (Channel, `xt:live:<id>`), `movie` ⇒ (Movie, `xt:vod:<id>`), `series` ⇒ (Episode,
+  `xt:ep:<id>`) — exact, and it also moves legacy channel-kind data of movie/episode entries to
+  the right kind. Episode targets may not exist until the series' details load: the moved rows
+  keep their fingerprint and are not orphaned meanwhile (finish never reattaches episodes of an
+  Xtream source).
+* **Xtream → M3U** (`xtream_to_m3u_moves`, from the M3U rows just written, before finish): every
+  M3U row with `provider_id` (= the Xtream id from its URL, §27.5) → move (kind, `xt:…:<id>`) →
+  (kind, `m3u:…`).
+* **Legacy M3U channels reclassified by the fallback** (no Xtream involved): M3U movies and
+  episodes keep the key the entry had as a channel (same `KeyAllocator`, same base key, file
+  order), so the finish pre-step "kind fix-up" moves (Channel, k) → (Movie|Episode, k) for user
+  keys of kind Channel absent from `channel` but present in `movie` / `episode` of the source.
+  Xtream keys are namespaced (`xt:live:` vs `xt:vod:`), so this never fires for Xtream sources.
+* **Group overrides** (`group_override` is keyed by group key, not item): after a finish that
+  completed movies/series, for every `channel:X` override of the source with `locked` or
+  `hidden` set, the same flags are copied to existing `movie:X` / `series:X` groups that have no
+  override. Locks never get weaker by reclassifying (a locked "Adult" group of M3U movies stays
+  locked as a movie group, and as the Xtream category of the same name — `get.php` writes
+  category names as `group-title`). Renames, order and home pins are not copied.
+* Anything not covered falls back to fingerprint reattach (§8.3); e.g. a provider extra entry
+  (§27.2 rule 2) that Xtream doesn't list becomes an orphan.
+
+Preserved: favourites, renames/hidden/locked/catch-up offsets, watch progress, history,
+reminders and manual EPG mappings of live channels, parental locks of groups. Lost: the stream
+failure cache of moved channels (by design), reminders/EPG mappings that were attached to an
+M3U VOD entry seen as a channel (meaningless for a movie), group renames/order across kinds.
+
+### 27.5 M3U movies & series fallback (`sources::m3u_vod` + `jobs::import_source`)
+
+**Classification** (`m3u_vod::classify`, per entry): `parse_stream_url(url)` is `movie` ⇒ Movie,
+`series` ⇒ Episode, and the entry has **no entry-level HTTP headers and no DRM** (movies and
+episodes are played with the source User-Agent only — no `headers` column; an entry that needs
+its own headers stays a channel so playback can't regress). Everything else ⇒ Live. Plain
+playlists have no such URLs and are unaffected. Applies to every M3U import (also when an
+upgrade failed or the user kept the playlist).
+
+**Movies:** `name` = title (tvg-name when empty); `(clean_name, year)` = `clean_vod_name` (smart
+names on) / raw name; `poster` = tvg-logo; groups `movie:<group-title>` (`;` lists, cleaned like
+channel groups, "Uncategorized" fallback); `provider_id` = the Xtream id; `url_key` =
+`identity::url_key(url)`; `stream` = `Url`; key = the entry's channel key (§27.4); rating /
+plot / genre / cast none; `provider_order` = entry order.
+
+**Episodes:** marker grammar (`parse_episode_title`, case-insensitive, leftmost match, title
+first then tvg-name):
+* `S(\d{1,4})[ ._-]*E(?:P)?[ ._-]*(\d{1,4})` — `S01E02`, `S01 E02`, `S1E2`, `S01.E02`,
+  `S01_E02`, `S01-E02`, `S01 EP02`, `s01e02`;
+* `\b(\d{1,2})x(\d{1,3})\b` — `1x02` (word boundaries keep `1920x1080` out);
+* `Season\s*(\d{1,4})\s*[,.-]?\s*Episode\s*(\d{1,4})`.
+Series title = the text before the marker, trimmed of whitespace and `- – | : . _ , ( [`; when
+empty, the entry's first group-title. Episode title = the text after, trimmed likewise; `None`
+when empty (the UI shows "Episode N"). Season 0 (specials) and episode 0 are kept. No marker
+→ series = the cleaned title, season 1, episode = 1-based order among that series' unmarked
+entries.
+
+**Series:** one per `normalize_name(series title)` per source → key
+`identity::m3u_series_key(norm)` (`m3u:s:<16 hex>`); `name` = first-seen series title,
+`(clean_name, year)` via `clean_vod_name`; `cover` = first episode's tvg-logo; groups = union of
+its episodes' `series:<group-title>` in first-seen order; `provider_order` = first appearance;
+`provider_id` none. Episodes: key = the entry's channel key; `provider_id` = Xtream id; `stream` =
+`Url`; `still` = tvg-logo when different from the cover; ordered by (season, episode, file order);
+duplicates of one (season, episode) are all kept. Seasons are synthesized from the episodes.
+
+**Writing.** Channels and movies stream in 2 000-row batches as today (groups first seen per
+batch). Episode entries are collected compactly during the parse (a series index, numbers,
+title, URL, logo, key, groups) and written after it as `ImportSeriesEpisodes` batches of ~2 000
+episodes (whole series per batch) through `write_series_episodes`, which upserts the series,
+upserts its episodes (`ON CONFLICT(source_id, key) DO UPDATE`, incl. `series_id`), deletes
+episodes of that series not in the batch, rebuilds its seasons and sets `details_at` =
+`imp.started_at`. M3U imports finish with `completed = [Channel, Movie, Series]` (a playlist that
+dropped its movies sweeps them; series sweep cascades episodes), then reattach Episode user data
+over the whole source (M3U episodes are complete at import, so missing ⇒ gone). Memory: one
+compact record per episode entry until the end of the parse (~250 B each; 300k episodes ≈ 75 MB
+peak) — acceptable; noted in §27.11.
+
+### 27.6 Playback of M3U movies/episodes (`sources::resolve`)
+Unchanged code path: `StreamLocator::Url` → the URL as-is; headers = `merge_headers(default,
+source)` (source User-Agent → config default); title / subtitle / progress / resume as for
+Xtream. Entries needing their own headers stay channels (§27.5), so nothing is lost. A disabled
+source still refuses to play.
+
+### 27.7 Detail pages without Xtream metadata (UI)
+`LoadMovieDetails` / `LoadSeriesDetails` are submitted only for Xtream sources (as today);
+for M3U sources the page never shows a skeleton (the series has `details_at` set at import; the
+movie page must not treat `details_loaded_at == None` as loading for non-Xtream sources). Sparse
+layout, theme tokens only:
+* Movie: poster (or the generic poster placeholder) left; title; one meta line from what exists
+  — year · category (primary group name) · source badge; no plot block, no "Cast:" line, no
+  empty rating; the buttons row ([Play]/[Resume]/[Start over], favourite, watched) stays where
+  it is on rich pages so focus order is identical; a muted hint "No description in this
+  playlist" in the plot's place (Body small, `text_secondary`).
+* Series: same header; season tabs and episode rows as usual; an untitled episode reads
+  "Episode 2"; no duration column when unknown; progress/watched glyphs as usual; "opens at the
+  next unwatched episode" unchanged.
+* Pages of upgraded sources whose movie rows are still M3U-born (the movie kind failed on the
+  upgrade) are Xtream pages: `jobs::details` already falls back to `provider_id`, which §27.5
+  fills with the Xtream id, so details load.
+
+### 27.8 Free-channel presets (`sources::presets`, implemented in the skeleton)
+* URLs: iptv-org country `https://iptv-org.github.io/iptv/countries/<cc>.m3u` (`cc` = ISO 3166
+  alpha-2 lowercased, **GB → `uk`**), all countries `https://iptv-org.github.io/iptv/index.m3u`,
+  Free-TV `https://raw.githubusercontent.com/Free-TV/IPTV/master/playlist.m3u8`.
+* Country: `presets::detect_country()` (cached `OnceLock`, two small local reads): the system
+  timezone's IANA name looked up in `/usr/share/zoneinfo/zone.tab`, else the territory of
+  `LC_ALL` / `LANG` (`en_GB.UTF-8` → GB; `C`/`POSIX` → none). Timezone first: many systems keep
+  `en_US` wherever they are. Display name from `iso3166.tab` (`country_name`).
+* `presets::presets(country)` → [IptvOrgCountry(cc) if known, IptvOrgAll, FreeTv], each with
+  `url()`, `source_name()` ("iptv-org · United Kingdom", "iptv-org · All countries", "Free-TV")
+  and `description()`.
+* Onboarding: Type step gains "Try free channels" → a Presets step (choice rows, `[Modal]`);
+  picking one builds an M3U URL draft (name = `source_name()`, glyph/colour defaults) and
+  continues with Test → (Guide skipped when the list carries `x-tvg-url`) → Importing → Done.
+  A preset whose URL is already a source's URL shows "Added" and is not selectable. Settings ▸
+  Playlists gets "Add free channels" → `Route::Onboarding(OnboardingStart::FreeChannels)`,
+  starting at the Presets step (Esc there leaves, like `AddSource`).
+* Nothing is fetched before a pick; Free-TV's `x-tvg-url` (epgshare01) becomes provider EPG
+  sources through the existing `url-tvg` path.
+
+### 27.9 Skeleton API (tag `p5-base`)
+Shared, compiled from the start (bodies `todo!("P5-sources")` only where nothing calls them):
+* `model::SourceSettings.keep_m3u: bool` (serde default false) and `model::Source::m3u_origin()
+  -> Option<SourceKind>` (implemented).
+* `jobs::ProbeResult.upgraded_from: Option<SourceKind>` (probe sets it on today's `get.php`
+  path); `jobs::JobOutcome::SourceRefreshed.upgraded: bool` and
+  `jobs::import_source::RefreshResult.upgraded: bool` (false until the sources track lands).
+* `sources::xtream::detect::{XtreamStreamUrl, parse_stream_url, PlaylistScan::{push, finish}}`
+  — todo.
+* `sources::m3u_vod::{EntryClass, EpisodeMarker, classify, parse_episode_title}` — todo.
+* `sources::presets::{Preset, presets, iptv_org_code, detect_country, country_from,
+  country_name, IPTV_ORG_ALL, FREE_TV}` — implemented + tested.
+* `sources::identity::m3u_series_key(norm) -> ItemKey` — implemented, golden-pinned.
+* `store::import::{ImportSeriesEpisodes, KeyMove, write_series_episodes, apply_key_moves}` and
+  `store::sources::set_source_kind` — todo.
+No migration: the schema is unchanged (series `details_at`, provider ids and `meta` cover it).
+
+### 27.10 Work split (three parallel tracks + leak investigation)
+
+File ownership is disjoint; a cross-track edit needs the owner's agreement and is listed in the
+merge note. Everyone rebases on `p5-base`. Lean builds: clippy (check) + the tests you touched;
+the integrator runs the one full gate.
+
+**sources track** — owns `src/sources/**`, `src/jobs/**` except `scheduler.rs` and
+`maintenance.rs`, `src/store/**` except `backup.rs` and the stale-source queries of
+`store/sources.rs` (`stale_sources`, `stale_epg_sources`), `src/services.rs`,
+`tests/{m3u,resolve,import_e2e,e2e_flows,xtream}.rs`, additions under `tests/support/**`.
+1. `detect::parse_stream_url` + `PlaylistScan` (§27.2). Tests: URL shapes incl. prefix, port,
+   case, percent-encoded creds, query/fragment, non-matches (timeshift, short form, zero/non-digit
+   id); scan accepts one-account + same-host extras, rejects foreign host / second login, picks
+   the most frequent server.
+2. `m3u::detect_xtream_url` keeps the path prefix (update its test).
+3. `m3u_vod::parse_episode_title` + `classify` (§27.5). Tests: every grammar variant, leftmost
+   match, separators trimmed, empty series → group fallback (in the converter), `1920x1080` not
+   a marker, headers/DRM keep an entry live.
+4. M3U converter: movies, episode collection, series assembly, shared `KeyAllocator`,
+   `provider_id`/`url_key`, groups per kind; `write_series_episodes`; finish with all three
+   kinds + episode reattach + kind fix-up + group-override carry-over (§27.4–27.5). Tests (in
+   `tests/import_e2e.rs`): a provider-style M3U imports N live / M movies / S series with the
+   right seasons; a legacy DB where those entries were channels with favourites/history/locked
+   group keeps them on the new kinds; plain playlist import unchanged (counts + keys).
+5. `apply_key_moves`, `m3u_to_xtream_moves`, `xtream_to_m3u_moves`, `set_source_kind`, the
+   `update_source` guard (§27.3).
+6. Upgrade flow in `refresh_source` / `refresh_m3u` / `refresh_xtream` (hook at the first
+   finish, attempt marker, forced first download, fallback to M3U in the same job), `notify`,
+   `RefreshResult.upgraded`; probe upgrade for entry-shaped playlists, `upgraded_from`, the
+   "never fails the probe" rule; `keep_m3u` honoured everywhere. Tests (mock panel): get.php
+   source upgrades on refresh with favourite/progress/reminder carried to `xt:` keys and
+   `upgraded == true`; entry-shaped local file upgrades; auth rejected → stays M3U, imports, marker
+   written, no second attempt within 7 days unless forced; `keep_m3u` → no request to
+   `player_api.php`; switch back restores M3U keys for favourites; Xtream import failing at
+   fetch → M3U import, source still M3U.
+7. `tests/support/mock_xtream.rs`: `get.php` also emits `/movie/` and `/series/` entries
+   (m3u_plus style, `Show S01 E02` titles) and an optional path prefix.
+
+**ui track** — owns `src/ui/**`, `src/keymap.rs`, `src/app.rs`,
+`tests/{onboarding,guide,widgets,keymap,parental}.rs`.
+1. Onboarding: "Try free channels" choice + Presets step, `OnboardingStart::FreeChannels`,
+   "Added" state; drop `Field::UseXtream`; Test step copy + "Keep as M3U" for
+   `upgraded_from`; upgraded draft keeps `url`/`path`; Keep → `keep_m3u` M3U draft (§27.3, 27.8).
+   Tests: preset pick builds the right draft (country + all + Free-TV); Keep as M3U builds an M3U
+   draft with `keep_m3u`; Continue builds an Xtream draft that keeps the URL.
+2. Settings ▸ Playlists: "Add free channels"; per-source "Use the Xtream login" toggle (rules of
+   §27.3) → save + forced refresh + failure toast; editor reloads on `DataScope::Sources`;
+   source kind line shows "Xtream (from M3U)" for upgraded sources. The server field of an
+   upgraded source is not re-normalized unless edited (it may carry a path prefix).
+3. App: toast on `SourceRefreshed { upgraded: true }` (test in `app.rs`, extend the existing
+   refresh-toast test).
+4. Movie / series detail pages for M3U items (§27.7): no skeleton for non-Xtream sources, sparse
+   layout, "Episode N" titles. Test: an M3U movie page shows no loader and no empty plot/cast
+   rows (one `widgets`/screen test, extend existing ones).
+
+**fixes track** — owns `src/platform/**`, `src/player/**`, `src/main.rs`, `src/cli.rs`,
+`src/ipc.rs`, `src/config.rs`, `src/store/backup.rs`, `src/jobs/{scheduler,maintenance}.rs`, the
+stale-source queries of `src/store/sources.rs`, `tests/{ipc,player_mpv,store_backup,e2e_soak}.rs`.
+Its own fix list (not part of this section) plus, for phase 5: backup/restore keeps an upgraded
+source's M3U URL/path and `keep_m3u` (settings JSON already round-trips; verify the URL of an
+Xtream-kind source is exported and the restore Merge matching still pairs it).
+
+**leak track** — investigation only; any minimal fix lands as a cross-track edit in the owning
+track's files, listed in that track's merge note.
+
+### 27.11 Risks
+* **Losing entries on upgrade**: guarded by §27.2 rule 2 (foreign hosts block the upgrade).
+  Provider extras on the panel host are dropped by design (reattach may orphan their data).
+* **Parental bypass by reclassification**: group locks carry to the new kinds (§27.4); item
+  locks move with the item. Tests must cover the locked-group case.
+* **Editor race wiping a new login**: `update_source` guard + editor reload (§27.3).
+* **Path-prefixed servers**: `normalize_server` strips paths; only the onboarding Xtream form
+  and an *edited* server field may call it.
+* **Upgrade storms**: one `player_api.php` login per due refresh at most; failures back off 7
+  days; `keep_m3u` stops them entirely.
+* **Episode memory** in huge fallback playlists (§27.5) — bounded by the playlist size; revisit
+  with a temp table if a real 1M-entry list shows up.
+* **First-refresh download**: existing M3U URL sources re-download fully once (no 304) to be
+  scanned — one extra download per source, then normal conditional refreshes.
