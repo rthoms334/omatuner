@@ -171,6 +171,8 @@ pub struct TunerApp {
     last_network_toast: Option<std::time::Instant>,
     /// Files dropped on the window, handled after the frame's actions (DESIGN §13.10).
     dropped: Vec<PathBuf>,
+    /// Developer screenshot capture (`TUNER_SCREENSHOT`, DESIGN §23.1); `None` normally.
+    devshot: Option<crate::devshot::Driver>,
     #[cfg(test)]
     log: std::cell::RefCell<tests::Log>,
 }
@@ -255,6 +257,7 @@ impl TunerApp {
             user_refreshes: Default::default(),
             last_network_toast: None,
             dropped: Vec::new(),
+            devshot: None,
             #[cfg(test)]
             log: Default::default(),
         };
@@ -270,6 +273,27 @@ impl TunerApp {
 
     fn services(&self) -> &Services {
         self.services.as_ref().expect("services alive")
+    }
+
+    /// Turn on the developer screenshot capture (DESIGN §23.1).
+    pub fn set_devshot(&mut self, driver: crate::devshot::Driver) {
+        self.devshot = Some(driver);
+    }
+
+    /// Run the screenshot driver's step commands (see `devshot`).
+    fn devshot_commands(&mut self, cmds: Vec<crate::devshot::Command>) {
+        use crate::devshot::Command;
+        for cmd in cmds {
+            match cmd {
+                Command::View(v) => match <crate::cli::ViewArg as clap::ValueEnum>::from_str(&v, true) {
+                    Ok(view) => self.handle_ipc(&IpcRequest { view: Some(view), ..Default::default() }),
+                    Err(_) => tracing::error!("screenshot script: unknown view '{v}'"),
+                },
+                Command::Play(p) => self.handle_ipc(&IpcRequest { play: Some(p), ..Default::default() }),
+                Command::Size(w, h) => float_window_at(w, h),
+                Command::Categories(id) => self.nav.push(NavRequest::Open(OverlayRequest::Categories(crate::model::SourceId(id)))),
+            }
+        }
     }
 
     fn current_route(&self) -> &Route {
@@ -1350,7 +1374,12 @@ impl TunerApp {
 }
 
 impl eframe::App for TunerApp {
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        if let Some(mut d) = self.devshot.take() {
+            let cmds = d.hook(ctx, raw, self.lib.generation != 0, self.window_size);
+            self.devshot = Some(d);
+            self.devshot_commands(cmds);
+        }
         let stack = self.key_stack();
         let mut resolved: Vec<(Action, Vec<KeyContext>)> = Vec::new();
         let mut drop_text = self.drop_alt_text;
@@ -1425,6 +1454,12 @@ impl eframe::App for TunerApp {
                 self.popout_backend =
                     crate::platform::popout::PopOutWorker::start(self.services().bus.clone()).map(|w| Box::new(w) as Box<dyn PopOutBackend>);
             }
+            if let Some((w, h)) = self.devshot.as_mut().and_then(|d| d.initial_size()) {
+                float_window_at(w, h);
+            }
+        }
+        if let Some(d) = &mut self.devshot {
+            d.frame(ui.ctx());
         }
         let egui_ctx = ui.ctx().clone();
         let width = egui_ctx.content_rect().width();
@@ -1546,6 +1581,30 @@ impl eframe::App for TunerApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         let c = self.theme.tokens.bg;
         [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, 1.0]
+    }
+}
+
+/// Developer screenshots: float our window at `w`×`h` and centre it (Hyprland), on a helper
+/// thread that waits for Hyprland to list the window.
+fn float_window_at(w: i32, h: i32) {
+    use crate::platform::popout::{Hypr, PopError, SocketIpc};
+    let Some(ipc) = SocketIpc::from_env() else {
+        tracing::warn!("screenshot: not in Hyprland, the window keeps its size");
+        return;
+    };
+    let spawned = std::thread::Builder::new().name("devshot-size".into()).spawn(move || {
+        let mut hypr = Hypr::new(ipc);
+        for _ in 0..50 {
+            match hypr.float_centred(std::process::id(), w, h) {
+                Err(PopError::NoWindow) => std::thread::sleep(std::time::Duration::from_millis(100)),
+                Err(e) => return tracing::error!("screenshot: sizing the window: {e}"),
+                Ok(()) => return,
+            }
+        }
+        tracing::error!("screenshot: Hyprland never listed the window");
+    });
+    if let Err(e) = spawned {
+        tracing::error!("screenshot: {e}");
     }
 }
 

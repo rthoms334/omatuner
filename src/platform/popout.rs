@@ -385,6 +385,20 @@ impl<I: HyprIpc> Hypr<I> {
         Ok(())
     }
 
+    /// Developer screenshots (`devshot`): float our window at `w`×`h` logical px, centred in
+    /// its monitor's usable area.
+    pub fn float_centred(&mut self, pid: u32, w: i32, h: i32) -> Result<(), PopError> {
+        let c = self.our_client(pid)?.ok_or(PopError::NoWindow)?;
+        let area = self.monitor(c.monitor)?.usable();
+        let a = c.address.as_str();
+        if !c.floating {
+            self.dispatch(Cmd::Float(true), a)?;
+        }
+        self.dispatch(Cmd::Size(w, h), a)?;
+        self.dispatch(Cmd::Move(area.x + (area.w - w).max(0) / 2, area.y + (area.h - h).max(0) / 2), a)?;
+        Ok(())
+    }
+
     /// Undo a pop-out (`restore` = our record; `None` = undo Super+O); says what to do with
     /// the remembered place.
     pub fn pop_in(&mut self, pid: u32, restore: Option<&Restore>) -> Result<Place, PopError> {

@@ -145,6 +145,9 @@ impl Services {
     }
 
     fn start_theme_watch(&mut self, cfg: &Config) {
+        if crate::theme::fixed_theme_dir().is_some() {
+            return; // a developer's fixed theme (screenshots) never changes
+        }
         self.integrations.theme_watch =
             ok("theme watcher", crate::theme::watch::ThemeWatcher::start(self.paths.clone(), cfg.interface.ui_scale, self.bus.clone()));
     }
