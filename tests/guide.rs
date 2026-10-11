@@ -2022,12 +2022,27 @@ fn tracks_overlay_selects_tracks_and_adjusts_subtitles() {
     assert!(matches!(t.with_ctx(|ctx| o.on_action(ctx, Action::Right)), OverlayOutcome::Keep));
     player_until(&t, "sub scale 1.1", |s| (s.sub_scale - 1.1).abs() < 1e-6);
     // drawn over the video in OSD colours; Esc closes
+    let player = t.services().player.handle();
     let mut h = Harness::builder().with_size(egui::vec2(1280.0, 720.0)).build_ui(|ui| {
         let egui_ctx = ui.ctx().clone();
         let _ = t.with_ctx(|ctx| o.ui(&egui_ctx, ctx));
     });
     h.step();
     assert!(has(&h, "Off") && has(&h, "Delay  ‹ +0.0 s ›"));
+    // the mouse: the › and ‹ buttons step the size up and down (whichever part of them is hit)
+    let scale = |want: f64| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while (player.snapshot().sub_scale - want).abs() > 1e-6 {
+            assert!(Instant::now() < deadline, "sub scale {want}: {}", player.snapshot().sub_scale);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    h.get_by_label("Size: Larger (→)").click();
+    h.step();
+    scale(1.2);
+    h.get_by_label("Size: Smaller (←)").click();
+    h.step();
+    scale(1.1);
     drop(h);
     let mut o = t.with_ctx(|ctx| overlays::build(OverlayRequest::Tracks { audio: false }, ctx));
     assert!(matches!(t.with_ctx(|ctx| o.on_action(ctx, Action::Back)), OverlayOutcome::Close));

@@ -187,6 +187,8 @@ impl GuideScreen {
     fn handle_outcome(&mut self, ctx: &mut UiCtx<'_>, out: GridOutcome) {
         match out {
             GridOutcome::None => {}
+            // right-click: the focused channel's menu, as the menu key opens it
+            GridOutcome::Menu => self.channel_menu(ctx),
             GridOutcome::FocusChanged => {
                 self.rest = self.grid.as_ref().and_then(|g| g.focused()).map(|(c, _)| (c, Instant::now()));
             }

@@ -23,9 +23,9 @@ use crate::player::PlayerEvent;
 use crate::theme::{SpaceToken, Theme, TypeToken, with_alpha};
 use crate::ui::overlays::{ContextMenuSpec, MenuItem, OverlayResult, ResumeSpec};
 use crate::ui::video_host::Placement;
-use crate::ui::widgets::button::{ButtonStyle, button};
+use crate::ui::widgets::button::{ButtonStyle, button, icon_button};
 use crate::ui::widgets::poster::paint_poster_image;
-use crate::ui::widgets::{empty_state, glyphs};
+use crate::ui::widgets::{empty_state, glyphs, section};
 use crate::ui::{NavRequest, OverlayRequest, Route, Screen, ScreenId, UiCtx};
 
 /// Play a movie fullscreen from a grid/rail/search (Shift+Enter): the resume prompt when
@@ -372,14 +372,17 @@ impl Screen for MovieDetailScreen {
         }
         let theme = ctx.theme;
         if self.missing || (self.id.is_none()) {
+            detail_bar(ui, ctx, false);
             empty_state::empty_state(ui, theme, glyphs::MOVIES, "This movie is no longer in your playlists", None, None);
             return;
         }
         let summary = self.summary(ctx).cloned();
         if self.movie.is_none() && summary.is_none() {
+            detail_bar(ui, ctx, false);
             skeleton(ui, theme);
             return;
         }
+        let mut menu = detail_bar(ui, ctx, true);
         let m = self.movie.clone();
         // DESIGN §27.7: only Xtream movies have details to load; a playlist's movie has a title,
         // a poster and a category, and its page says so instead of waiting for more
@@ -443,7 +446,7 @@ impl Screen for MovieDetailScreen {
                 locked,
                 loading,
             };
-            header.show(ui, ctx, |ui, ctx| {
+            menu |= header.show(ui, ctx, |ui, ctx| {
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(theme.space(SpaceToken::Lg), theme.space(SpaceToken::Md));
                     for (i, b) in buttons.iter().enumerate() {
@@ -477,8 +480,27 @@ impl Screen for MovieDetailScreen {
             self.focus = i;
             self.press(ctx, b);
         }
+        if menu {
+            self.item_action(ctx, Action::ContextMenu);
+        }
         self.focus = self.focus.min(self.buttons(ctx).len().saturating_sub(1));
     }
+}
+
+/// The detail pages' top bar: `‹ Movies` (the app's Back, when it leads somewhere) and, with
+/// `menu`, a ⋯ button for the page's menu at the right. True when ⋯ was clicked.
+pub(super) fn detail_bar(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, menu: bool) -> bool {
+    if ctx.back.is_none() && !menu {
+        return false;
+    }
+    let theme = ctx.theme;
+    let mut clicked = false;
+    section::page_header(ui, ctx, "", |ui| {
+        if menu {
+            clicked = icon_button(ui, theme, glyphs::MORE, "More (Shift+F10)", ButtonStyle::default()).clicked();
+        }
+    });
+    clicked
 }
 
 /// Where a playlist movie or series has no plot (DESIGN §27.7).
@@ -518,7 +540,8 @@ pub(super) struct DetailHeader<'a> {
 }
 
 impl DetailHeader<'_> {
-    pub(super) fn show(&self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, buttons: impl FnOnce(&mut egui::Ui, &mut UiCtx<'_>)) {
+    /// Returns whether the header was right-clicked (the page's menu).
+    pub(super) fn show(&self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, buttons: impl FnOnce(&mut egui::Ui, &mut UiCtx<'_>)) -> bool {
         let theme = ctx.theme;
         let t = &theme.tokens;
         let rem = theme.rem();
@@ -569,6 +592,10 @@ impl DetailHeader<'_> {
                 buttons(ui, ctx);
             });
         });
+        // a right-click anywhere on the header (poster, title, text; the buttons take only the
+        // primary button) opens the page's menu, like the menu key
+        let header = egui::Rect::from_min_max(top, egui::pos2(top.x + width, ui.cursor().min.y));
+        ui.input(|i| i.pointer.secondary_clicked()) && ui.rect_contains_pointer(header)
     }
 }
 

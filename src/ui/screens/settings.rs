@@ -48,7 +48,7 @@ use crate::theme::{SpaceToken, Theme, TypeToken};
 use crate::ui::overlays::categories::{self, tag_name};
 use crate::ui::overlays::{ConfirmSpec, ContextMenuSpec, MenuItem, OverlayResult, RenameSpec, RenameTarget};
 use crate::ui::parental::{hash_pin, new_salt};
-use crate::ui::widgets::button::{ButtonStyle, icon_button};
+use crate::ui::widgets::button::{ButtonStyle, back_button, icon_button};
 use crate::ui::widgets::list::paint_row_state;
 use crate::ui::widgets::rows::grouped;
 use crate::ui::widgets::text_field::text_field;
@@ -2526,13 +2526,18 @@ impl SettingsScreen {
 
     fn pages_ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) {
         let theme = ctx.theme;
+        // pushed over another screen (Movies ▸ Hidden…): the way back to it
+        if ctx.back.is_some() {
+            section::page_header(ui, ctx, "", |_| {});
+            ui.add_space(theme.space(SpaceToken::Sm));
+        }
         section::section_header(ui, theme, "Settings");
         ui.add_space(theme.space(SpaceToken::Md));
         let mut clicked = None;
         egui::ScrollArea::vertical().id_salt("settings-pages-scroll").auto_shrink([false, false]).show(ui, |ui| {
             for (page, icon, label) in PAGES {
                 let selected = page == self.page;
-                let state = RowState::from_flags(selected && self.pane == Pane::Pages, selected);
+                let state = rows::with_hover(ui, theme, false, RowState::from_flags(selected && self.pane == Pane::Pages, selected));
                 if rows::menu_row(ui, theme, Some(icon), label, None, false, state).clicked() {
                     clicked = Some(page);
                 }
@@ -2561,6 +2566,29 @@ impl SettingsScreen {
         let mut drag_started = None;
         let mut drag_released = false;
         let mut item_rects: Vec<(usize, egui::Rect)> = Vec::new();
+        // the way out of a sub-view (Esc): the source editor or attach view to their page, and
+        // in Compact (one pane at a time) the page to the page list
+        let page_label = PAGES.iter().find(|p| p.0 == self.page).map_or("Settings", |p| p.2);
+        let back_to = if self.attach.is_some() || self.editor.is_some() {
+            Some(page_label)
+        } else if ctx.layout == LayoutClass::Compact {
+            Some("Settings")
+        } else {
+            None
+        };
+        if let Some(label) = back_to {
+            if back_button(ui, theme, label).clicked() {
+                // what Esc does from the page (a field being edited is left as it is)
+                self.editing = false;
+                if self.attach.take().is_some() || self.editor.take().is_some() {
+                    self.error = None;
+                    self.row = 0;
+                } else {
+                    self.pane = Pane::Pages;
+                }
+            }
+            ui.add_space(theme.space(SpaceToken::Xs));
+        }
         egui::ScrollArea::vertical().id_salt(("settings-content-scroll", self.page as u8)).auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = theme.space(SpaceToken::Xxs);
             for (i, row) in rows.iter().enumerate() {
@@ -2709,7 +2737,17 @@ impl SettingsScreen {
                             item_rects.push((i, rect));
                         }
                         let c = color.map(|c| theme.source_color(c)).unwrap_or(t.text_secondary);
-                        inner.label(RichText::new(icon).size(theme.font(TypeToken::IconLarge)).color(c));
+                        if let Item::HiddenTag(..) = item {
+                            // the chevron lists / hides the tag's categories (→ / ←); the row
+                            // itself shows them all (Enter)
+                            let open = icon == glyphs::CHEVRON_DOWN;
+                            let tip = if open { "Hide the list (←)" } else { "List them (→)" };
+                            if icon_button(&mut inner, theme, icon, tip, ButtonStyle::default()).clicked() {
+                                clicked = Some((i, if open { -1 } else { 1 }));
+                            }
+                        } else {
+                            inner.label(RichText::new(icon).size(theme.font(TypeToken::IconLarge)).color(c));
+                        }
                         let more = matches!(item, Item::Source(_) | Item::Epg(_) | Item::List(_) | Item::Orphan(_) | Item::Reminder(_));
                         // the button is laid out first so long names and errors end before it
                         inner.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3382,6 +3420,25 @@ mod tests {
         let c = h.state().t.config.clone();
         assert!(c.player.sub_langs.iter().any(|l| l == "de"), "{:?}", c.player.sub_langs);
         assert!(!c.player.user_agent.contains("de"), "{}", c.player.user_agent);
+    }
+
+    /// Compact shows one pane at a time: `‹ Settings` above a page leads back to the page list
+    /// (the mouse twin of Esc there), and a page from the list opens it again.
+    #[test]
+    fn compact_pages_are_reached_by_the_back_button() {
+        let (mut t, one) = rig();
+        t.layout = LayoutClass::Compact;
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(420.0, 900.0));
+        h.state_mut().enter(Route::Settings(SettingsPage::Player));
+        h.run_steps(2);
+        assert!(has_label(&h, "Hardware decoding") && !has_label(&h, "Hidden items"), "the page, alone");
+        h.get_by_label("Back to Settings").click();
+        h.run_steps(2);
+        assert!(has_label(&h, "Hidden items") && !has_label(&h, "Hardware decoding"), "the page list");
+        h.get_by_label("Interface").click();
+        h.run_steps(2);
+        assert_eq!(h.state().s.page, SettingsPage::Interface);
+        assert!(has_label(&h, "Back to Settings"));
     }
 
     /// ←/→ on a guide's offset shows at once but is saved (and the guide re-imported) once the

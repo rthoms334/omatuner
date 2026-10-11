@@ -1142,9 +1142,14 @@ impl Screen for OnboardingScreen {
             ui.new_child(egui::UiBuilder::new().id_salt("onboarding-card").max_rect(card_rect).layout(egui::Layout::top_down(egui::Align::Min)));
         let mut clicked: Option<usize> = None;
         let mut back_clicked = false;
+        let mut leave_clicked = false;
+        // the Back / Cancel row stays at the card's bottom edge, under the scrolling steps (a
+        // long form must not push the way out below the window)
+        let footer_h = theme.space(SpaceToken::ControlHeight).max(theme.font(TypeToken::BodySmall)) + theme.space(SpaceToken::Lg);
+        let scroll_h = (card_rect.height() - frame.total_margin().sum().y - footer_h - theme.space(SpaceToken::PanelPadding)).max(footer_h);
         frame.show(&mut card_ui, |ui| {
             ui.set_width(width - chrome);
-            egui::ScrollArea::vertical().id_salt("onboarding").max_height(full.height() - 2.0 * theme.space(SpaceToken::PanelPadding)).show(
+            egui::ScrollArea::vertical().id_salt("onboarding").max_height(scroll_h).show(
                 ui,
                 |ui| {
                     let (title, sub) = self.step_title();
@@ -1189,31 +1194,35 @@ impl Screen for OnboardingScreen {
                         Step::Done => self.done_ui(ui, ctx),
                         Step::Restoring => self.restoring_ui(ui, ctx),
                     };
-                    ui.add_space(theme.space(SpaceToken::Lg));
-                    // the mouse twin of Esc: a step back, or out of the card where it was opened
-                    // from Settings / a file / a restored playlist
-                    ui.horizontal(|ui| {
-                        if let Some(label) = self.back_label() {
-                            back_clicked = button(ui, theme, Some(glyphs::PREVIOUS), label, ButtonStyle::default()).clicked();
-                            ui.add_space(theme.space(SpaceToken::Lg));
-                        }
-                        // (the picker draws its own key line)
-                        let hint = if self.editing {
-                            Some("Enter next · Tab next field · Esc leave the field")
-                        } else if self.step == Step::Categories {
-                            None
-                        } else {
-                            Some("↑/↓ move · Enter choose · Esc back")
-                        };
-                        if let Some(hint) = hint {
-                            ui.label(RichText::new(hint).size(theme.font(TypeToken::BodySmall)).color(t.text_disabled));
-                        }
-                    });
                 },
             );
+            ui.add_space(theme.space(SpaceToken::Lg));
+            // the mouse twin of Esc: a step back, or out of the card where it was opened
+            // from Settings / a file / a restored playlist
+            ui.horizontal(|ui| {
+                if let Some(label) = self.back_label() {
+                    back_clicked = button(ui, theme, Some(glyphs::PREVIOUS), label, ButtonStyle::default()).clicked();
+                    ui.add_space(theme.space(SpaceToken::Lg));
+                } else if self.step == Step::Importing && self.start != OnboardingStart::Welcome {
+                    // a card opened over the app: the import goes on without it (Esc)
+                    leave_clicked = button(ui, theme, Some(glyphs::PREVIOUS), "Continue in background", ButtonStyle::default()).clicked();
+                    ui.add_space(theme.space(SpaceToken::Lg));
+                }
+                // (the picker draws its own key line)
+                let hint = if self.editing {
+                    Some("Enter next · Tab next field · Esc leave the field")
+                } else if self.step == Step::Categories {
+                    None
+                } else {
+                    Some("↑/↓ move · Enter choose · Esc back")
+                };
+                if let Some(hint) = hint {
+                    ui.add(egui::Label::new(RichText::new(hint).size(theme.font(TypeToken::BodySmall)).color(t.text_disabled)).truncate());
+                }
+            });
         });
         ui.allocate_rect(full, egui::Sense::hover());
-        if back_clicked && !self.back() {
+        if (back_clicked && !self.back()) || leave_clicked {
             ctx.navigate(crate::ui::NavRequest::Back);
         }
         if let Some(i) = clicked {
@@ -1237,7 +1246,7 @@ impl Screen for OnboardingScreen {
 fn choice_rows(ui: &mut egui::Ui, theme: &Theme, focus: usize, items: &[(&str, &str, &str)]) -> Option<usize> {
     let mut clicked = None;
     for (i, (icon, label, detail)) in items.iter().enumerate() {
-        let state = if i == focus { RowState::Cursor } else { RowState::Idle };
+        let state = rows::with_hover(ui, theme, true, if i == focus { RowState::Cursor } else { RowState::Idle });
         if rows::menu_row(ui, theme, Some(icon), label, Some(detail), true, state).clicked() {
             clicked = Some(i);
         }

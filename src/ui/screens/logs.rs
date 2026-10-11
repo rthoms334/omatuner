@@ -21,7 +21,7 @@ use crate::ui::overlays::{ContextMenuSpec, MenuItem, OverlayResult};
 use crate::ui::widgets::button::{ButtonStyle, button};
 use crate::ui::widgets::list::{ListOutcome, ListState, paint_row_state, virtual_list};
 use crate::ui::widgets::text_field::search_header;
-use crate::ui::widgets::{empty_state, glyphs};
+use crate::ui::widgets::{empty_state, glyphs, section};
 use crate::ui::{OverlayRequest, Route, Screen, ScreenId, UiCtx};
 
 /// (minimum level, menu label, button label).
@@ -219,6 +219,8 @@ impl Screen for LogsScreen {
         let t = &theme.tokens;
         let mut menu = false;
         let mut export = false;
+        section::page_header(ui, ctx, "Logs", |_| {});
+        ui.add_space(theme.space(SpaceToken::Sm));
         // buttons first (right to left), the filter header gets the rest of the row
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -230,7 +232,7 @@ impl Screen for LogsScreen {
                 });
             });
         });
-        if menu {
+        if std::mem::take(&mut menu) {
             self.view_menu(ctx);
         }
         if export {
@@ -291,12 +293,18 @@ impl Screen for LogsScreen {
                 p.galley(egui::pos2(r.right() + theme.space(SpaceToken::Lg), rect.center().y - g.size().y / 2.0), g, color);
                 resp
             });
-            if let ListOutcome::Activated(i) = out {
-                activated = Some(i);
+            match out {
+                ListOutcome::Activated(i) => activated = Some(i),
+                // right-click: the menu key's view menu
+                ListOutcome::ContextMenu(_) => menu = true,
+                _ => {}
             }
         });
         if let Some(i) = activated {
             self.expanded = self.line_at(i).map(LineId::of);
+        }
+        if menu {
+            self.view_menu(ctx);
         }
         if let Some(line) = self.expanded.as_ref().and_then(|id| self.row_of(id)).and_then(|i| self.line_at(i)) {
             ui.add_space(theme.space(SpaceToken::Md));

@@ -34,6 +34,7 @@ use crate::theme::{SpaceToken, Theme, TypeToken};
 use crate::ui::epg_grid::{hhmm, time_left, time_range};
 use crate::ui::overlays::{ConfirmSpec, ContextMenuSpec, ListPickerSpec, MenuItem, OverlayResult, RenameSpec, RenameTarget};
 use crate::ui::video_host::Placement;
+use crate::ui::widgets::button::{ButtonStyle, back_button, icon_button};
 use crate::ui::widgets::list::{ListOutcome, ListState, virtual_list};
 use crate::ui::widgets::rows::{ChannelRowOpts, GroupDecor, channel_row, group_row_decor, grouped, menu_row, row_height};
 use crate::ui::widgets::{RowState, badge, empty_state::empty_state, glyphs, logo, progress, section, text_field};
@@ -1444,7 +1445,20 @@ impl LiveScreen {
 
     fn draw_groups(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, focused: bool) {
         let theme = ctx.theme;
-        text_field::search_header(ui, theme, self.group_list.filter.query(), "Groups", Some(glyphs::SEARCH));
+        let mut close = false;
+        ui.horizontal(|ui| {
+            // the drawer (Medium) / the groups pane (Compact) closes back to the channels (Esc)
+            if self.drawer && ctx.layout == LayoutClass::Medium {
+                close = icon_button(ui, theme, glyphs::CHEVRON_LEFT, "Close (Esc)", ButtonStyle::default()).clicked();
+            } else if self.drawer {
+                let open = self.open_index().map(|i| self.groups[i].group.display_name().to_owned()).unwrap_or_else(|| "Channels".into());
+                close = back_button(ui, theme, &open).clicked();
+            }
+            text_field::search_header(ui, theme, self.group_list.filter.query(), "Groups", Some(glyphs::SEARCH));
+        });
+        if close {
+            self.close_drawer();
+        }
         ui.add_space(theme.space(SpaceToken::Sm));
         if self.group_rows.is_empty() {
             let q = self.group_list.filter.query();
@@ -1457,10 +1471,11 @@ impl LiveScreen {
         let open = self.open_index();
         let virtual_count = self.groups.iter().take_while(|g| !matches!(g.entry, Entry::Group(_))).count();
         let footer = self.marks.footer(self.group_list.filter.query(), self.matching.len());
+        let hide_n = self.marks.hide_count(self.matching.len());
         let (groups, rows, marks) = (&self.groups, &self.group_rows, &self.marks);
         let mut clicked = None;
         let list = &mut self.group_list;
-        let out = group_marks::with_footer(ui, theme, footer.as_deref(), |ui| {
+        let (out, footer_click) = group_marks::with_footer(ui, theme, footer.as_deref(), Some(hide_n), |ui| {
             virtual_list(ui, theme, "live-groups", list, row_h, |ui, rc| {
                 let gi = rows[rc.index] as usize;
                 let g = &groups[gi];
@@ -1479,6 +1494,13 @@ impl LiveScreen {
                 resp
             })
         });
+        // the footer's Hide N / Clear: its keys, on this pane
+        if let Some(hide) = footer_click {
+            self.focus = Pane::Groups;
+            let a = self.marks.footer_action(hide);
+            self.on_action(ctx, a);
+            return;
+        }
         if let Some(i) = clicked.filter(|_| !matches!(out, ListOutcome::ContextMenu(_))) {
             // a click (not a hover) focuses the pane and opens the group
             self.group_list.select(i);
@@ -1670,7 +1692,7 @@ impl LiveScreen {
         } else {
             let r = ui.allocate_rect(video_rect, egui::Sense::hover()).rect;
             ui.painter().rect_filled(r, t.rounding, t.fill_field);
-            let hint = if cursor.is_some() { "Enter plays here · Shift+Enter fullscreen" } else { "" };
+            let hint = if cursor.is_some() { "Enter or double-click plays here · Shift+Enter fullscreen" } else { "" };
             ui.painter().text(
                 r.center(),
                 egui::Align2::CENTER_CENTER,
@@ -1938,6 +1960,12 @@ impl Screen for LiveScreen {
                     ui.painter().rect_filled(d.expand(theme.space(SpaceToken::Sm)), 0.0, theme.tokens.bg);
                     ui.scope_builder(egui::UiBuilder::new().max_rect(d), |ui| self.draw_groups(ui, ctx, true));
                     section::pane_divider(ui.painter(), d.right() + theme.space(SpaceToken::Sm), full.y_range(), theme);
+                    // a click beside the drawer closes it (and doesn't reach the list under it)
+                    let rest = Rect::from_min_max(egui::pos2(d.right() + theme.space(SpaceToken::Sm), full.top()), full.max);
+                    let outside = ui.interact(rest, ui.id().with("live-drawer-outside"), egui::Sense::click());
+                    if self.drawer && (outside.clicked() || outside.secondary_clicked()) {
+                        self.close_drawer();
+                    }
                 }
             }
             LayoutClass::Compact => {

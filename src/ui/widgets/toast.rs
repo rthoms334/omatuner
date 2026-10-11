@@ -3,13 +3,13 @@
 //!
 //! Newest toast at the bottom (next to the anchor), at most [`MAX_VISIBLE`] at once (older ones
 //! wait their turn, and their timer only starts once shown); hovering a toast restarts its
-//! timer; pressing its action dismisses it.
+//! timer and shows a ✕ that dismisses it; pressing its action dismisses it.
 
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use super::button::{ButtonStyle, button};
+use super::button::{ButtonStyle, button, icon_button};
 use super::card::{CardKind, card_frame};
 use super::{glyphs, paint};
 use crate::keymap::Action;
@@ -24,6 +24,8 @@ const MAX_WIDTH: f32 = 360.0;
 #[derive(Default)]
 pub struct Toasts {
     items: Vec<(Toast, Instant)>,
+    /// The toast under the pointer last frame (it shows its ✕).
+    hovered: Option<usize>,
 }
 
 impl Toasts {
@@ -41,7 +43,11 @@ impl Toasts {
         for (_, at) in &mut self.items[..queued] {
             *at = now;
         }
+        let before = self.items.len();
         self.items.retain(|(t, at)| now.duration_since(*at) < ttl(t));
+        if self.items.len() != before {
+            self.hovered = None;
+        }
         if self.items.is_empty() {
             return None;
         }
@@ -54,6 +60,7 @@ impl Toasts {
         let mut out = None;
         let mut dismiss = None;
         let mut hovered = Vec::new();
+        let prev_hover = self.hovered;
         egui::Area::new(egui::Id::new("toasts")).order(egui::Order::Foreground).pivot(egui::Align2::RIGHT_BOTTOM).fixed_pos(anchor).show(ctx, |ui| {
             ui.set_max_width(width);
             ui.spacing_mut().item_spacing.y = theme.space(SpaceToken::Md);
@@ -69,17 +76,27 @@ impl Toasts {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = theme.space(SpaceToken::Lg);
                         ui.label(egui::RichText::new(glyph).font(paint::font(theme, TypeToken::Icon)).color(color));
-                        if let Some((label, action)) = &t.action {
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if button(ui, theme, None, label, ButtonStyle { primary: true, ..Default::default() }).clicked() {
-                                    out = Some(*action);
-                                    dismiss = Some(i);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // its room is kept while hidden, so showing it never moves the action
+                            let close = ui.scope(|ui| {
+                                if prev_hover != Some(i) {
+                                    ui.set_invisible();
                                 }
+                                icon_button(ui, theme, glyphs::CLOSE, "Dismiss", ButtonStyle::default())
+                            });
+                            if close.inner.clicked() {
+                                dismiss = Some(i);
+                            }
+                            if let Some((label, action)) = &t.action
+                                && button(ui, theme, None, label, ButtonStyle { primary: true, ..Default::default() }).clicked()
+                            {
+                                out = Some(*action);
+                                dismiss = Some(i);
+                            }
+                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                 ui.add(egui::Label::new(egui::RichText::new(&t.text).color(tk.fg).size(theme.font(TypeToken::Body))).wrap());
                             });
-                        } else {
-                            ui.add(egui::Label::new(egui::RichText::new(&t.text).color(tk.fg).size(theme.font(TypeToken::Body))).wrap());
-                        }
+                        });
                     });
                 });
                 if card.response.contains_pointer() {
@@ -87,11 +104,13 @@ impl Toasts {
                 }
             }
         });
+        self.hovered = hovered.last().copied();
         for i in hovered {
             self.items[i].1 = now;
         }
         if let Some(i) = dismiss {
             self.items.remove(i);
+            self.hovered = None;
         }
         // wake up for the next expiry (and keep hover restarts responsive)
         let next = self.items.iter().map(|(t, at)| ttl(t).saturating_sub(now.duration_since(*at))).min().unwrap_or_default();

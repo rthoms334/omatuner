@@ -1513,7 +1513,8 @@ Medium: rails narrower, same structure.
   (`[NumericEntry, Guide]`) and jump to that channel number. Focus/scroll targets keep clear of
   the mini-player rect.
 * **Mouse**: wheel = rows, Shift+wheel / horizontal trackpad = time, click = focus,
-  double-click = details, click on the channel column = watch, hover tooltip (title, time,
+  double-click = details, click on the channel column = watch, right-click on a cell or a
+  channel = focus it and open the channel menu (the menu key), hover tooltip (title, time,
   description excerpt).
 * **Actions**: Enter → programme popover (Watch if airing · Catch up if past & archive ·
   Remind me / Cancel reminder if future · Assign EPG); `w` watch, `c` catch-up, `r` toggles a
@@ -1750,7 +1751,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 * Jobs (Ctrl+J, `[List, Modal]`): running jobs with phase + progress; Delete cancels the
   highlighted job; last 20 finished (Enter expands errors).
 * Context menu (Shift+F10 / Ctrl+Enter / right-click): launcher-style, filterable, shortcuts
-  right-aligned.
+  right-aligned; opened by a right-click it hangs from the pointer (kept on the window).
 * Confirm (destructive = urgent button, Cancel focused), PIN (`[TextInput, Modal]`), Rename
   (`[TextInput, Modal]` — Space types a space), favourites-list picker (checklist + "New
   list…"), Edit information (Ctrl+I).
@@ -1850,7 +1851,11 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
   * **No screen reads raw keys**: every key is in a table, so help and hints are complete.
 * **Esc ladder**: clear filter → close overlay/side panel → leave OSD controls focus → hide the
   info banner → leave window fullscreen → leave the player (mini player keeps playing) → back
-  in the route stack. Esc never shows the banner. Alt+← and the mouse back button = Back.
+  in the route stack. Esc never shows the banner. Alt+← = Back. The mouse back button IS Esc:
+  the app resolves a synthetic Esc against the same context stack, so it walks this whole
+  ladder (clears a filter, leaves the OSD controls or a text field, closes an overlay, pops the
+  video-only player back in) rather than skipping to the route stack. The forward button is
+  swallowed and does nothing (there is no forward history).
   *Decided in phase 3:* Back on a lone sub-page (nothing beneath it in the route stack, e.g. a
   restored last screen) goes to its parent screen: movie / series details → Movies / Series,
   Logs and EPG mapping → Settings, the player → Live TV.
@@ -1859,7 +1864,27 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 * **Mouse parity**: everything is clickable; hover moves list cursors only after real pointer
   motion (Omarchy `pointerGate`); right-click = context menu; wheel = volume only in the
   fullscreen player; double-click on video = window fullscreen (in the video-only player: pop
-  back in).
+  back in). *Decided in the mouse pass:*
+  * **Back affordance**: a page or pane that Esc leaves shows a borderless `‹ {where}` button
+    (`widgets::button::back_button`, accessible name "Back to {where}"): detail pages, Logs,
+    EPG mapping and Settings when something is below them (`UiCtx::back`: the route below, or
+    a lone sub-page's parent — the same target as Esc), and the one-pane-at-a-time views of
+    Compact (Settings page → page list, EPG candidates → channels, Live groups → channels).
+    A click on the lit sidebar tab of a sub-page (Movies on a movie's page, Settings on Logs)
+    goes back down to that tab where it is on the stack instead of opening it afresh.
+  * **Overlays**: a ✕ "Close (Esc)" in the card header (Help, Jobs, Search, Resume, the
+    tracks panel); a click or right-click outside closes the overlay — except while it holds
+    an unsaved edit (`Overlay::is_dirty`: a typed rename, a new list's name, Edit information,
+    changed category ticks), when the card border flashes instead and Esc / Cancel close.
+  * **Right-click** opens the same menu as the menu key, at the pointer (lists, grids, Home
+    tiles, guide cells and channels, episode rows, the detail pages' header, search hits).
+    A menu opened by an overlay (search's item menu: "Play now", then the item shortcuts)
+    answers that overlay, never the screen below. Detail pages also have a `⋯` button.
+  * Clickable widgets show the pointing hand; Settings pages and the onboarding choices light
+    on hover; below Wide one click on a Movies / Series category opens it (the drawer closes);
+    the Live groups drawer has a close button and closes on a click beside it; group panes'
+    bulk-hide footer has `[Hide N]` / `[Clear]`; the Jobs panel has a cancel button per running
+    task; toasts show a ✕ on hover.
 * **Discoverability**: `?`/F1 help overlay (current contexts first) and the status-bar hint line
   (`keymap::hint_line`: curated verbs, keys looked up in the tables).
 * No Super bindings inside the app (Omarchy owns Super). `Ctrl+Space` is avoided (fcitx5 IME
