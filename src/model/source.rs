@@ -89,6 +89,10 @@ pub struct SourceSettings {
     /// Which countries / languages of category names are shown (DESIGN §28); `None` = all.
     /// Written only by `store::sources::set_category_filter` (other settings writes keep it).
     pub category_filter: Option<super::CategoryFilter>,
+    /// "Show in All playlists" (DESIGN §29): `Some(false)` keeps this playlist's items out of
+    /// the "All playlists" scope of Movies, Series, Live TV and the guide (they still show when
+    /// it is the playlist picked). `None` = shown.
+    pub in_all: Option<bool>,
 }
 
 /// Account information from Xtream `user_info`/`server_info` (UHF "server info").

@@ -141,6 +141,74 @@ in `~/.config/omarchy/shell.toml`; Tuner applies it live).
     have different colours.
   - **Expect:** the badge glyphs and colours are distinguishable and readable on the light
     background.
+- [ ] **Playlist on cards (two playlists, light and dark):**
+  - **Do:** add two playlists with movies, series and channels and give them different glyphs
+    and colours in their editors, one of them yellow. Watch something from each, favourite a
+    channel and a movie from each. Then, in a dark theme and in `catppuccin-latte`, look at:
+    Movies and Series grids; every Home rail (Continue watching, Recently watched,
+    Favourites, Recently added movies / series, channel tiles); a movie and a series page;
+    Search (`/`) results; Live ▸ Favourites, History, Reminders and All channels; the Live
+    preview; the player's channel (c), mini guide (g) and history (h) panels.
+  - **Expect:**
+    - Each poster has a small chip in its top-left corner with its own playlist's glyph (the
+      lock and watched chips stay top-right); hovering the chip shows the playlist's name.
+    - The line under each card's title starts with the playlist's name ("Provider A · 2019 ·
+      ★ 7.1"); a long name ends in "…" and leaves room for the year.
+    - Rows, channel tiles and the player panels show the glyph at the right; detail pages (an
+      Xtream movie too) and the preview show glyph + name; the player's top bar shows "● name"
+      left of the clock.
+    - Group rows in Live and the Movies / Series categories show the playlist's name in its
+      colour, so the two playlists' "Action" (or "Sports") rows can be told apart.
+    - On the light theme the yellow playlist's glyph and name are drawn in the text colour,
+      with a yellow edge on the chip and a yellow underline under row glyphs; nothing is
+      unreadable.
+    - Disable one playlist (Settings ▸ Playlists): the marks disappear at once (Auto). Settings
+      ▸ Interface ▸ Playlist on cards ▸ Always brings them back; Never hides them, with no
+      restart.
+    - At a tiled half (790 pt) and with text size 16, nothing overlaps or leaves its card.
+- [ ] **Choosing a playlist (two playlists with movies, series and channels; DESIGN §29):**
+  - **Do:** open Movies at full width.
+  - **Expect:** a bar on top reads "All playlists · ● A · ● B" with counts; All is underlined.
+  - **Do:** press `Ctrl+PgDn`, then `Ctrl+PgUp` twice; click B's tab; right-click A's tab.
+  - **Expect:**
+    - A toast "Showing A only", then "Showing all playlists", then "Showing B only".
+    - With one playlist: only its categories; All movies / Continue watching / Favourites
+      hold only its titles; the grid header reads "B › All movies — type to filter"; a 2 px
+      line in B's colour runs under the bar; cards have no playlist marks; the Omarchy bar
+      shows "Tuner — Movies · B".
+    - The right-click menu offers "Edit playlist…" (opens B's editor in Settings ▸ Playlists)
+      and "Move up / Move down" (the tabs reorder, also past a playlist that has no tab here).
+  - **Do:** go to Series, Live TV and the guide; press `Alt+P` on each and pick with a digit.
+  - **Expect:** Series still shows All (each screen keeps its own); the picker lists All + the
+    playlists with counts, `0`–`9` pick at once, typing filters. Live TV narrows groups, All
+    channels, favourites and History to the playlist, and ↑/↓ in the player zaps only through
+    it. The guide shows the same playlist as Live TV (its "● B ▾" button sits before the
+    collection button); with All, its collection picker (`f`) lists the groups under each
+    playlist's name.
+  - **Do:** at a tiled half (790 pt), with text size 16, look at the same screens.
+  - **Expect:** the bar is a single "● B ▾" button that opens the picker; nothing overflows.
+  - **Do:** pick B on Live TV, then disable B in Settings ▸ Playlists.
+  - **Expect:** a toast "B is disabled — showing All playlists"; Live TV shows everything; with
+    one playlist left the bar and "Alt+P playlist" in the status bar disappear.
+- [ ] **Telling playlists apart and "Show in All playlists":**
+  - **Do:** add two Xtream logins (or two URL playlists) without changing their colour.
+  - **Expect:** the second gets a different colour from the first. If two playlists still look
+    the same (same glyph and colour), Settings ▸ Playlists says "A and B look the same on
+    cards and in lists" and offers "Give each its own colour"; nothing changes until it is
+    pressed, then the second gets a new colour.
+  - **Do:** add free channels (Settings ▸ Playlists ▸ Add free channels…), edit that playlist,
+    turn off "Show in All playlists", Save.
+  - **Expect:** "Saved …" without a refresh; Live TV ▸ All playlists no longer lists its groups
+    or channels, but its own tab still shows them, and a channel of it in your favourites or
+    History still shows there in All.
+- [ ] **Across playlists in All:**
+  - **Do:** on Live TV ▸ All playlists, open a provider group; then on Movies type a playlist's
+    name in the category filter, open a category and press `Ctrl+PgDn`.
+  - **Expect:** channel rows name their playlist at the right in its colour; the header reads
+    "All playlists › Sports · B"; the filter finds that playlist's categories; after
+    `Ctrl+PgDn` the filter is gone and the grid shows the new playlist's All movies.
+  - **Do:** with Live TV set to B, search a channel of A and choose "Open in guide".
+  - **Expect:** a toast "Showing all playlists" and the guide focused on that channel.
 - [ ] **Font change:**
   - **Do:** change the monospace font in `~/.config/fontconfig/fonts.conf` (or with Omarchy's
     font menu), then switch back.

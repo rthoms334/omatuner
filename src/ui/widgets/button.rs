@@ -60,7 +60,7 @@ fn frame_style(theme: &Theme, style: ButtonStyle, enabled: bool, pressed: bool, 
 
 /// Paint the state fill + border of a button-like rect; the border is always inset, so it
 /// never shifts the layout.
-fn paint_frame(painter: &egui::Painter, rect: egui::Rect, theme: &Theme, resp: &egui::Response, style: ButtonStyle) {
+pub(super) fn paint_frame(painter: &egui::Painter, rect: egui::Rect, theme: &Theme, resp: &egui::Response, style: ButtonStyle) {
     let enabled = resp.enabled();
     let pressed = enabled && resp.is_pointer_button_down_on();
     let hot = enabled && (style.focused || resp.hovered() || resp.has_focus());

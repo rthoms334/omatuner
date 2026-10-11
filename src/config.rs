@@ -109,6 +109,18 @@ pub enum Density {
     Compact,
 }
 
+/// Settings ▸ Interface ▸ Playlist on cards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlaylistOnCards {
+    /// Only while two or more playlists have that kind of item and a screen shows them all
+    /// (DESIGN §29: inside one playlist, or with only one, the mark is noise).
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InterfaceConfig {
@@ -118,6 +130,8 @@ pub struct InterfaceConfig {
     pub show_logos: bool,
     /// SD / HD / FHD / 4K badges next to channel names (DESIGN §13.0).
     pub quality_badges: bool,
+    /// The playlist an item comes from on cards, rails, rows and detail pages (DESIGN §13.0).
+    pub playlist_on_cards: PlaylistOnCards,
     pub clock_24h: bool,
     /// Live TV: resting the keyboard cursor on a channel for `preview_delay_ms` plays it in the
     /// preview pane. OFF by default (each autoplay opens a provider connection; Xtream accounts
@@ -141,6 +155,18 @@ pub struct InterfaceConfig {
     pub series_sort: SortMode,
     /// Remember last screen etc. (used by StartScreen::Last).
     pub last_screen: Option<String>,
+    /// The playlist each screen shows (DESIGN §29); `None` = All playlists.
+    pub playlist_scope: PlaylistScopes,
+}
+
+/// The playlist Movies, Series and Live TV each show (the guide follows Live TV); `None` = All
+/// playlists. A playlist that is gone, disabled or empty for that screen falls back to All.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PlaylistScopes {
+    pub movies: Option<crate::model::SourceId>,
+    pub series: Option<crate::model::SourceId>,
+    pub live: Option<crate::model::SourceId>,
 }
 
 impl Default for InterfaceConfig {
@@ -151,6 +177,7 @@ impl Default for InterfaceConfig {
             show_channel_numbers: true,
             show_logos: true,
             quality_badges: true,
+            playlist_on_cards: PlaylistOnCards::Auto,
             clock_24h: true,
             live_preview_autoplay: false,
             preview_delay_ms: 1200,
@@ -163,6 +190,7 @@ impl Default for InterfaceConfig {
             movie_sort: SortMode::RecentlyAdded,
             series_sort: SortMode::RecentlyAdded,
             last_screen: None,
+            playlist_scope: PlaylistScopes::default(),
         }
     }
 }

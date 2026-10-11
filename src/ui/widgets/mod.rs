@@ -23,6 +23,7 @@ mod paint;
 pub mod poster;
 pub mod progress;
 pub mod rows;
+pub mod scope_bar;
 pub mod section;
 pub mod sidebar;
 pub mod slider;

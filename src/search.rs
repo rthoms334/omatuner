@@ -52,6 +52,16 @@ pub enum SearchTarget {
     Series(SeriesId),
 }
 
+impl SearchTarget {
+    pub fn item_kind(self) -> crate::model::ItemKind {
+        match self {
+            SearchTarget::Channel(_) => crate::model::ItemKind::Channel,
+            SearchTarget::Movie(_) => crate::model::ItemKind::Movie,
+            SearchTarget::Series(_) => crate::model::ItemKind::Series,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchItem {
     pub target: SearchTarget,

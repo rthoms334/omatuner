@@ -24,6 +24,11 @@
 //!   category opens it (the drawer closes / the grid shows).
 //! * Progress bars and Continue watching come from one background read of the unfinished
 //!   progress rows, refreshed on `DataScope::Progress`.
+//! * Several playlists with movies (series) (DESIGN §29): the scope bar on top (tabs at Wide,
+//!   the `● TV 2 ▾` button otherwise; Alt+P picker, Ctrl+PgDn/PgUp) narrows the categories, All,
+//!   Continue watching and Favourites to one playlist; the grid header leads with the
+//!   breadcrumb "TV 2 › Action", and a 2 px stripe in the playlist's colour runs under the bar.
+//!   In All, categories and cards carry the playlist's name in its colour.
 
 use std::collections::HashMap;
 
@@ -36,11 +41,12 @@ use crate::model::{GroupId, ItemKey, ItemKind, SortMode, SourceId, VodKind, VodS
 use crate::msg::{AppEvent, DataScope};
 use crate::theme::{SpaceToken, TypeToken};
 use crate::ui::overlays::{ContextMenuSpec, MenuItem, OverlayResult};
+use crate::ui::scope::{self, Scope, ScopeFilter, ScopeKind};
 use crate::ui::widgets::button::{ButtonStyle, LABEL_MAX_CHARS, button, icon_button, short_label};
 use crate::ui::widgets::list::{ListOutcome, ListState, virtual_list};
 use crate::ui::widgets::poster::{self, GridState, TileDecor};
 use crate::ui::widgets::text_field::search_header;
-use crate::ui::widgets::{RowState, empty_state, glyphs, rows};
+use crate::ui::widgets::{RowState, empty_state, glyphs, rows, scope_bar};
 use crate::ui::{LayoutClass, OverlayRequest, Route, Screen, ScreenId, UiCtx};
 
 #[derive(Default)]
@@ -178,8 +184,10 @@ pub(super) struct VodBrowser {
     items: Vec<u32>,
     /// `items` after the grid filter.
     shown: Vec<u32>,
-    /// What `items` was computed from: (category, sort, library build).
-    items_key: Option<(Cat, SortMode, u64)>,
+    /// What `items` was computed from: (category, sort, library build, playlist scope).
+    items_key: Option<(Cat, SortMode, u64, ScopeFilter)>,
+    /// The playlist scope the categories were listed for.
+    cats_scope: Option<ScopeFilter>,
     progress: ProgressInfo,
     progress_loader: Option<Loader<ProgressInfo>>,
     /// Watch progress by index into the kind's list (rebuilt with `progress` / `index`).
@@ -252,6 +260,15 @@ impl VodBrowser {
         if self.movies { "movies" } else { "series" }
     }
 
+    fn scope_kind(&self) -> ScopeKind {
+        if self.movies { ScopeKind::Movies } else { ScopeKind::Series }
+    }
+
+    /// The playlist scope this frame (DESIGN §29).
+    fn scope<'l>(&self, ctx: &UiCtx<'l>) -> Scope<'l> {
+        Scope::current(ctx, self.scope_kind())
+    }
+
     pub(super) fn key_contexts(&self) -> Vec<KeyContext> {
         match self.pane {
             Pane::Categories => vec![self.cats.key_context()],
@@ -287,10 +304,11 @@ impl VodBrowser {
         if self.movies { &ctx.lib.vod.movie_groups } else { &ctx.lib.vod.series_groups }
     }
 
-    /// The categories shown in the pane.
+    /// The categories shown in the pane (those of the playlists in scope).
     fn groups<'l>(&self, ctx: &'l UiCtx<'_>) -> Vec<&'l crate::model::Group> {
         let hide_empty = ctx.config.interface.hide_empty_groups;
-        self.all_groups(ctx).iter().filter(|g| !g.hidden && !(hide_empty && g.item_count == 0)).collect()
+        let scope = self.scope(ctx).filter();
+        self.all_groups(ctx).iter().filter(|g| !g.hidden && !(hide_empty && g.item_count == 0) && scope.admits(g.source_id)).collect()
     }
 
     fn sort(&self, ctx: &UiCtx<'_>) -> SortMode {
@@ -375,17 +393,27 @@ impl VodBrowser {
         let mut all = vec![Cat::All, Cat::Continue, Cat::Favourites];
         all.extend(groups.iter().map(|g| Cat::Group(g.id)));
         let mut names: Vec<String> = all[..3].iter().map(|c| self.virtual_name(*c).to_owned()).collect();
-        // the tag code filters too ("uk" finds the UK categories smart names renamed)
-        names.extend(groups.iter().map(|g| match self.tags.1.get(&g.id) {
-            Some(code) => format!("{} {code}", g.display_name()),
-            None => g.display_name().to_owned(),
+        // the tag code filters too ("uk" finds the UK categories smart names renamed), and in
+        // All the playlist's name ("tv 2" finds TV 2's categories, like Live TV's groups)
+        // (bulk marking matches the category's own words only, not the playlist's name)
+        let sources = self.scope(ctx).marks(ctx);
+        let words: Vec<String> = groups
+            .iter()
+            .map(|g| match self.tags.1.get(&g.id) {
+                Some(code) => format!("{} {code}", g.display_name()),
+                None => g.display_name().to_owned(),
+            })
+            .collect();
+        names.extend(groups.iter().zip(&words).map(|(g, w)| match sources.of(g.source_id) {
+            Some(src) => format!("{w} {}", src.name),
+            None => w.clone(),
         }));
         let shown = self.cats.filter.apply(names.iter().map(String::as_str));
         let q = self.cats.filter.query();
         self.matching = shown
             .iter()
             .map(|&i| i as usize)
-            .filter(|&i| i >= 3 && group_marks::word_match(q, &names[i]))
+            .filter(|&i| i >= 3 && group_marks::word_match(q, &words[i - 3]))
             .filter_map(|i| match all[i] {
                 Cat::Group(id) => Some(id),
                 _ => None,
@@ -413,16 +441,17 @@ impl VodBrowser {
             self.rebuild_progress_idx();
             self.items_key = None;
         }
-        let key = (self.open, self.sort(ctx), lib_id(ctx));
+        let key = (self.open, self.sort(ctx), lib_id(ctx), self.scope(ctx).filter());
         // favourites change without a library rebuild: recompute that category every frame
-        if self.items_key == Some(key) && self.open != Cat::Favourites {
+        if self.items_key.as_ref() == Some(&key) && self.open != Cat::Favourites {
             return;
         }
+        let (sort, scope) = (key.1, key.3.clone());
         self.items_key = Some(key);
         let movies = self.movies;
         let mut items: Vec<u32> = match self.open {
-            Cat::All => ctx.lib.vod.all_sorted(movies, key.1),
-            Cat::Group(g) => ctx.lib.vod.group_items(g, key.1),
+            Cat::All => ctx.lib.vod.all_sorted(movies, sort),
+            Cat::Group(g) => ctx.lib.vod.group_items(g, sort),
             Cat::Continue => self.progress.order.iter().filter_map(|k| self.index.get(k).copied()).collect(),
             Cat::Favourites => {
                 let kind = if movies { ItemKind::Movie } else { ItemKind::Series };
@@ -433,8 +462,15 @@ impl VodBrowser {
                 .unwrap_or_default()
             }
         };
+        // the virtual categories show the playlists in scope (a category is one playlist's);
+        // your own lists show every playlist in All, even one switched out of it
+        let scope = if matches!(self.open, Cat::Continue | Cat::Favourites) { scope.for_user_list() } else { scope };
+        if scope != ScopeFilter::Everything && !matches!(self.open, Cat::Group(_)) {
+            let all = self.all(ctx);
+            items.retain(|i| all.get(*i as usize).is_some_and(|v| scope.admits(v.source_id)));
+        }
         if let Some(m) = &self.moved
-            && key.1 == SortMode::Provider
+            && sort == SortMode::Provider
             && matches!(self.open, Cat::All | Cat::Group(_))
         {
             m.apply(self.all(ctx), &mut items);
@@ -771,6 +807,9 @@ impl VodBrowser {
     }
 
     pub(super) fn action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
+        if scope::on_action(ctx, self.scope_kind(), action) {
+            return true;
+        }
         if action == Action::SortMenu {
             self.sort_menu(ctx);
             return true;
@@ -953,7 +992,20 @@ impl VodBrowser {
             );
             return;
         }
-        if self.cat_rows.is_empty() || self.cat_rows.len() != self.cats.len || lib_id(ctx) != self.index_built {
+        let scope = self.scope(ctx);
+        let filter = scope.filter();
+        if self.cats_scope.as_ref() != Some(&filter) {
+            // another playlist: its categories, from the top of the grid (a filter typed for
+            // the old one would keep its category open under the new name)
+            if self.cats_scope.is_some() {
+                self.cats.filter.clear();
+                self.grid.filter.clear();
+                self.grid.select(0);
+                self.cats.select(0);
+            }
+            self.cats_scope = Some(filter);
+            self.refilter_cats(ctx);
+        } else if self.cat_rows.is_empty() || self.cat_rows.len() != self.cats.len || lib_id(ctx) != self.index_built {
             self.refilter_cats(ctx);
         }
         self.settle_moves(ctx);
@@ -967,6 +1019,9 @@ impl VodBrowser {
         // grid gets the width: 4–5 columns at a tiled half). Compact: one pane at a time.
         let layout = ctx.layout;
         let rem = theme.rem();
+        if scope.multi() {
+            self.scope_bar(ui, ctx, &scope);
+        }
         let full = ui.available_rect_before_wrap();
         let (show_cats, show_grid) = match layout {
             LayoutClass::Wide => (true, true),
@@ -1005,6 +1060,23 @@ impl VodBrowser {
         ui.allocate_rect(full, egui::Sense::hover());
     }
 
+    /// The scope bar + the stripe of a picked playlist (DESIGN §29).
+    fn scope_bar(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, scope: &Scope<'_>) {
+        let theme = ctx.theme;
+        let counts: Vec<usize> = scope.choices().iter().map(|c| scope.count(ctx.lib, c.map(|s| s.id))).collect();
+        let hint = super::live::shortcut(KeyContext::Global, Action::PlaylistPicker).map(|k| format!("{k} playlist")).unwrap_or_default();
+        let click = scope_bar::scope_bar(ui, theme, scope, &counts, ctx.layout == LayoutClass::Wide, &hint);
+        let y = ui.cursor().top();
+        scope_bar::paint_stripe(ui.painter(), theme, ui.max_rect().x_range(), y, scope);
+        ui.add_space(theme.space(SpaceToken::Md));
+        match click {
+            scope_bar::BarClick::Choose(c) => scope::choose(ctx, self.scope_kind(), c, false),
+            scope_bar::BarClick::Menu(id) => ctx.open(OverlayRequest::PlaylistMenu(id, self.scope_kind())),
+            scope_bar::BarClick::Picker => ctx.open(OverlayRequest::PlaylistPicker(self.scope_kind())),
+            scope_bar::BarClick::None => {}
+        }
+    }
+
     fn cats_pane(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) {
         let theme = ctx.theme;
         let h = search_header(ui, theme, self.cats.filter.query(), "Categories", Some(glyphs::SEARCH));
@@ -1024,7 +1096,10 @@ impl VodBrowser {
         // one map per frame; rows are drawn (and named) only when visible
         let groups: HashMap<GroupId, &crate::model::Group> = self.groups(ctx).into_iter().map(|g| (g.id, g)).collect();
         let virtual_names = [self.virtual_name(Cat::All), self.virtual_name(Cat::Continue), self.virtual_name(Cat::Favourites)];
-        let total = self.all(ctx).len();
+        let scope = self.scope(ctx);
+        let total = scope.count(ctx.lib, scope.selected.map(|s| s.id));
+        // in All with several playlists, each category names its playlist (DESIGN §29)
+        let sources = scope.marks(ctx);
         let footer = self.marks.footer(self.cats.filter.query(), self.matching.len());
         let hide_n = self.marks.hide_count(self.matching.len());
         let (marks, tags, movies, cats) = (&self.marks, &self.tags.1, self.movies, &mut self.cats);
@@ -1048,6 +1123,7 @@ impl VodBrowser {
                             marked: marks.is_marked(g.id),
                             // no badge where the name shows the code already ("|UK| Sports")
                             tag: tags.get(&g.id).map(String::as_str).filter(|c| !group_marks::has_words(g.display_name(), c)),
+                            source: sources.of(g.source_id),
                         },
                     ),
                     None => {
@@ -1124,7 +1200,18 @@ impl VodBrowser {
 
     fn grid_pane(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) {
         let theme = ctx.theme;
-        let name = self.cat_name(ctx, self.open);
+        let scope = self.scope(ctx);
+        // the breadcrumb: which playlist, then the category (DESIGN §29)
+        let mut name = self.cat_name(ctx, self.open);
+        if scope.multi() {
+            // in All a category is still one playlist's: name it ("All playlists › Action · TV 2")
+            if let Cat::Group(g) = self.open
+                && let Some(src) = self.groups(ctx).iter().find(|x| x.id == g).and_then(|x| scope.marks(ctx).of(x.source_id))
+            {
+                name = format!("{name} · {}", src.name);
+            }
+            name = format!("{} › {name}", scope.label());
+        }
         let sort = self.sort(ctx);
         // a tiled half (drawer) or Compact (one pane): the way to the categories
         let breadcrumb = ctx.layout != LayoutClass::Wide;
@@ -1215,9 +1302,11 @@ impl VodBrowser {
         let all: &[VodSummary] = if movies { &ctx.lib.vod.movies } else { &ctx.lib.vod.series };
         // only the focused pane shows the cursor (DESIGN §13.0); the other shows "selected"
         let focused = self.pane == Pane::Grid;
+        let sources = scope.marks(ctx);
         let outcome = poster::poster_grid_with(ui, theme, ctx.images, &mut self.grid, all, &self.shown, focused, |i, v| TileDecor {
             progress: progress.get(&i).copied(),
             playing: playing == Some(v.kind),
+            source: sources.of(v.source_id),
             ..Default::default()
         });
         // the second click of the double-click that opened the category lands on a poster
@@ -1270,8 +1359,132 @@ fn loading_grid(ui: &mut egui::Ui, theme: &crate::theme::Theme) {
 mod tests {
     use super::*;
     use crate::ui::NavRequest;
-    use crate::ui::screens::home::testkit::{self, harness, has_label, rig, seed, until};
+    use crate::ui::screens::home::testkit::{self, harness, has_label, has_label_containing, rig, seed, until};
     use egui_kittest::kittest::Queryable;
+
+    /// Several playlists with movies (DESIGN §29): the bar offers All + each playlist with
+    /// movies (a free-channel preset is no tab) with counts; in All the playlist's name finds
+    /// its categories and an open category's breadcrumb names it; Ctrl+PgDn shows one playlist —
+    /// a toast says so, the choice is saved for Movies only — and its categories, All and
+    /// Favourites are that playlist's, the breadcrumb names it and cards drop their marks;
+    /// a click on a tab picks it, a right click opens its menu; Alt+P opens the picker; a
+    /// saved playlist that has no movies reads as All.
+    #[test]
+    fn the_scope_bar_narrows_movies_to_one_playlist() {
+        let (mut t, one) = rig();
+        let (a, b, free) = seed(&mut t, |c| {
+            let a = testkit::source(c, "Alpha")?;
+            let b = testkit::source(c, "Bravo")?;
+            let free = testkit::source(c, "Free")?;
+            testkit::movies(c, a, 3)?;
+            testkit::movies(c, b, 2)?;
+            testkit::channels(c, free, 2)?;
+            let list = crate::store::user::default_fav_list(c)?;
+            let fav = |s: SourceId, i: usize| crate::model::ItemRef { source: s, kind: ItemKind::Movie, key: ItemKey(format!("m3u:movie{i:010}")) };
+            crate::store::user::set_favourite(c, list, &fav(a, 0), true, 1)?;
+            crate::store::user::set_favourite(c, list, &fav(b, 0), true, 2)?;
+            Ok((a, b, free))
+        });
+        let mut h = harness(t, one, MoviesScreen::default(), egui::vec2(1400.0, 900.0));
+        h.state_mut().enter(Route::Movies { group: None });
+        h.run_steps(2);
+        assert!(has_label(&h, "All playlists") && has_label(&h, "Alpha") && has_label(&h, "Bravo"), "tabs");
+        assert!(!has_label(&h, "Free"), "no movies, no tab");
+        let painted = testkit::painted(&h);
+        assert!(["5", "3", "2"].iter().all(|n| painted.iter().any(|p| p == n)), "counts: {painted:?}");
+        assert_eq!(h.state().s.browser.shown.len(), 5);
+        assert!(has_label(&h, "Movie 0 · Alpha") && has_label(&h, "Movie 0 · Bravo"), "All: each card names its playlist");
+        assert!(has_label(&h, "Movies · Alpha") && has_label(&h, "Movies · Bravo"), "two “Movies” categories told apart");
+        // typing the playlist's name finds its categories; the breadcrumb names it
+        h.state_mut().act(Action::Left);
+        for c in "bravo".chars() {
+            h.state_mut().act(Action::FilterInput(c));
+        }
+        h.run_steps(1);
+        assert_eq!(h.state().s.browser.cat_rows.len(), 1, "Bravo's “Movies”");
+        h.state_mut().act(Action::Activate);
+        h.run_steps(2);
+        assert_eq!(h.state().s.browser.shown.len(), 2);
+        assert!(has_label_containing(&h, "All playlists › Movies · Bravo"), "breadcrumb in All");
+
+        // Ctrl+PgDn: the next playlist, with a toast; saved for Movies only (the filter typed
+        // for All goes: Bravo's category never stays open under "Alpha ›")
+        assert!(h.state_mut().act(Action::NextPlaylist));
+        assert_eq!(h.state().t.toasts.last().map(|t| t.text.as_str()), Some("Showing Alpha only"));
+        h.state_mut().apply_config();
+        let scopes = h.state().t.config.interface.playlist_scope;
+        assert_eq!((scopes.movies, scopes.series), (Some(a), None), "per screen");
+        h.run_steps(2);
+        assert_eq!(h.state().s.browser.open, Cat::All);
+        assert!(!h.state().s.browser.cats.filter.is_active());
+        assert_eq!(h.state().s.browser.shown.len(), 3, "Alpha's movies");
+        assert!(has_label(&h, "Movie 0") && !has_label_containing(&h, "· Alpha"), "no marks inside one playlist");
+        assert!(has_label_containing(&h, "Alpha › All movies"), "breadcrumb");
+        assert_eq!(h.state().s.browser.cat_rows.iter().filter(|c| matches!(c, Cat::Group(_))).count(), 1, "Alpha's categories");
+        h.state_mut().act(Action::Left);
+        h.state_mut().act(Action::Down);
+        h.state_mut().act(Action::Down); // Favourites
+        h.run_steps(1);
+        assert_eq!(h.state().s.browser.shown.len(), 1, "Alpha's favourite only");
+
+        // mouse: a tab picks its playlist; a right click opens its menu
+        h.get_by_label("Bravo").click();
+        h.run_steps(1);
+        h.state_mut().apply_config();
+        assert_eq!(h.state().t.config.interface.playlist_scope.movies, Some(b));
+        h.get_by_label("Alpha").click_secondary();
+        h.run_steps(1);
+        assert!(h.state_mut().nav().contains(&NavRequest::Open(OverlayRequest::PlaylistMenu(a, ScopeKind::Movies))));
+        // Alt+P: the picker
+        h.state_mut().act(Action::PlaylistPicker);
+        assert_eq!(h.state_mut().nav(), vec![NavRequest::Open(OverlayRequest::PlaylistPicker(ScopeKind::Movies))]);
+
+        // a saved playlist without movies: All
+        h.state_mut().t.config_edits.push(Box::new(move |c| c.interface.playlist_scope.movies = Some(free)));
+        h.state_mut().apply_config();
+        h.run_steps(2);
+        assert_eq!(h.state().s.browser.shown.len(), 2, "Favourites of every playlist");
+    }
+
+    /// The Alt+P picker: digits jump (0 = All, 1… = the playlists in order) while nothing is
+    /// typed, typing filters by name and Enter picks; the choice is saved for its screen.
+    #[test]
+    fn the_playlist_picker_jumps_by_digit_and_filters_by_name() {
+        use crate::ui::overlays::playlists::PlaylistPickerOverlay;
+        use crate::ui::screens::home::testkit::overlay_harness;
+        let (mut t, one) = rig();
+        let (_, b) = seed(&mut t, |c| {
+            let a = testkit::source(c, "Alpha")?;
+            let b = testkit::source(c, "Bravo")?;
+            testkit::series(c, a, 1, 1, 1)?;
+            testkit::series(c, b, 1, 1, 1)?;
+            Ok((a, b))
+        });
+        let saved = |h: &mut egui_kittest::Harness<'static, testkit::OvApp<PlaylistPickerOverlay>>| {
+            let mut c = (*h.state().t.config).clone();
+            for e in h.state_mut().t.config_edits.drain(..) {
+                e(&mut c);
+            }
+            c.interface.playlist_scope
+        };
+        let mut h = overlay_harness(t, one, PlaylistPickerOverlay::new(ScopeKind::Series), egui::vec2(1000.0, 700.0));
+        assert!(has_label(&h, "All playlists") && has_label(&h, "Alpha") && has_label(&h, "Bravo"));
+        // typing filters ("b" leaves Bravo); a digit types while filtering
+        assert_eq!(h.state_mut().act(Action::FilterInput('b')), "Keep");
+        assert_eq!(h.state_mut().act(Action::FilterInput('2')), "Keep", "filtering: digits type");
+        h.state_mut().act(Action::FilterBackspace);
+        assert_eq!(h.state_mut().act(Action::Activate), "Close");
+        assert_eq!(saved(&mut h).series, Some(b));
+        // digits jump while nothing is typed: 0 = All, 1… = the playlists in order
+        h.state_mut().o = PlaylistPickerOverlay::new(ScopeKind::Series);
+        h.run_steps(1);
+        assert_eq!(h.state_mut().act(Action::FilterInput('9')), "Keep", "no ninth playlist");
+        assert_eq!(h.state_mut().act(Action::FilterInput('2')), "Close");
+        assert_eq!(saved(&mut h).series, Some(b), "2 = the second playlist");
+        h.state_mut().o = PlaylistPickerOverlay::new(ScopeKind::Series);
+        assert_eq!(h.state_mut().act(Action::FilterInput('0')), "Close");
+        assert_eq!(saved(&mut h).series, None, "0 = All playlists");
+    }
 
     /// Custom order works for titles: Alt+↑ in a sorted grid switches to Custom order and
     /// moves the title there (also in the frames before the config edit and the library

@@ -98,6 +98,8 @@ fn library() -> Library {
         last_refresh: None,
         has_vod: true,
         has_series: true,
+        has_live: true,
+        in_all: true,
         category_filter: None,
     };
     Library {

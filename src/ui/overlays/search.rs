@@ -616,7 +616,11 @@ impl Overlay for SearchOverlay {
                     paint_row_state(ui.painter(), rect, theme, if is_cursor { RowState::Cursor } else { RowState::Idle });
                     match row {
                         Row::Hit(h) => {
-                            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &*h.item.name));
+                            let label = crate::ui::widgets::badge::label_with_source(
+                                &h.item.name,
+                                ctx.source_of(h.item.target.item_kind(), h.item.source_id),
+                            );
+                            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
                             paint_hit(ui, ctx, rect, h, is_cursor);
                         }
                         Row::Guide(g) => {
@@ -702,8 +706,9 @@ fn paint_hit(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, h: &SearchHit, 
             }
         }
     }
-    if let Some(src) = ctx.lib.source(h.item.source_id) {
-        let glyph = if src.icon.is_empty() { glyphs::PLAYLIST } else { src.icon.as_str() };
+    // the playlist, with several (Settings ▸ Interface ▸ Playlist on cards, DESIGN §13.0)
+    if let Some(src) = ctx.source_of(h.item.target.item_kind(), h.item.source_id) {
+        let glyph = crate::ui::widgets::badge::source_glyph(src);
         let text = format!("{glyph} {}", src.name);
         let color = theme.source_color(src.color);
         // the border keeps the source colour; the text falls back to fg where it wouldn't read
@@ -816,9 +821,10 @@ mod tests {
         assert_eq!(h.state().o.key_contexts(), vec![KeyContext::Search]);
         assert!(has_label(&h, "LIVE"), "results grouped by kind");
         assert!(has_label(&h, "Tab cycles"));
-        // the source badge and the now-playing programme of a mapped channel
+        // no source badge with a single playlist (Playlist on cards: Auto, DESIGN §13.0); the
+        // now-playing programme of a mapped channel
         let texts = testkit::painted(&h);
-        assert!(texts.iter().any(|t| t.contains("My IPTV")), "source badge: {texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("My IPTV")), "one playlist, no badge: {texts:?}");
         assert!(texts.iter().any(|t| t.starts_with("Show ")), "now playing on the mapped channel: {texts:?}");
         // Enter on the first hit plays it FULLSCREEN, zapping through its primary group
         assert_eq!(h.state_mut().act(Action::Activate), "Close");

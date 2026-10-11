@@ -77,6 +77,8 @@ pub const DISPLAY: &str = "\u{f0379}";
 pub const THEME: &str = "\u{f03d8}";
 pub const REORDER: &str = "\u{f01dd}";
 pub const ACCOUNT: &str = "\u{f0306}";
+/// A playlist's colour dot (U+25CF, in JetBrains Mono): scope tabs, the playlist picker.
+pub const DOT: &str = "\u{25cf}";
 /// A page's menu (nf-md-dots_horizontal).
 pub const MORE: &str = "\u{f01d8}";
 

@@ -37,6 +37,19 @@ on-screen controls, and a light theme (catppuccin-latte).
 
 - **Sources:** M3U by URL or local file, and Xtream Codes (live, movies, series and the
   provider's guide). You can add several playlists, each with its own colour and glyph badge.
+  A new playlist gets a colour no other playlist uses, and Settings ▸ Playlists offers to fix
+  two playlists that look the same.
+- **Several playlists:** when two or more playlists have movies, series or channels, Movies,
+  Series and Live TV get a bar on top: *All playlists* or one playlist, each with its count.
+  Pick one with a click, `Alt+P` (a picker; digits jump) or `Ctrl+PgDn` / `Ctrl+PgUp`. Each
+  screen remembers its own choice and the guide follows Live TV. One playlist shows only its
+  categories, groups and channels (zapping too), with a stripe in its colour, a breadcrumb
+  (`TV 2 › Action`) and the window title `Tuner — Movies · TV 2`. In *All playlists*, cards,
+  channel rows, group rows and search results say which playlist each item comes from (the
+  glyph in a corner of the poster and the playlist's name under the title); detail pages and
+  the player always do. A playlist's *Show in All playlists* switch keeps, say, free channels
+  out of the All view (your favourites and history still list them). Settings ▸ Interface ▸ Playlist on cards switches the marks to Always or
+  Never.
   A provider's M3U (a `get.php?username=…` link or a downloaded file) switches to its Xtream
   login automatically, so movies, series and catch-up appear; providers that don't allow that
   still get their movies and series sorted out of the playlist. *Try free channels* adds a
@@ -393,6 +406,8 @@ The full reference is generated from `src/keymap.rs`:
 | `Ctrl+R` / `F5` | Refresh playlists & guide |
 | `Ctrl+J` | Show background tasks |
 | `F1` | Keyboard help |
+| `Alt+P` | Choose the playlist shown (Movies, Series, Live TV, guide) |
+| `Ctrl+PgDn` / `Ctrl+PgUp` | Next / previous playlist (Movies, Series, Live TV, guide) |
 
 ### Lists (`List`)
 

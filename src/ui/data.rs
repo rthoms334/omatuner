@@ -15,9 +15,13 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use crate::config::PlaylistOnCards;
 use crate::error::Result;
-use crate::model::{ChannelId, ChannelSummary, EpgChannelId, ItemKey, MediaRef, NowNext, ProgrammeSlim, Quality, QualityBadge, SourceId, Timestamp};
+use crate::model::{
+    ChannelId, ChannelSummary, EpgChannelId, ItemKey, ItemKind, MediaRef, NowNext, ProgrammeSlim, Quality, QualityBadge, SourceId, Timestamp,
+};
 use crate::player::{PlayerSnapshot, PlayerState};
+use crate::store::library::SourceMeta;
 
 /// Per-frame time budget for synchronous UI-thread DB work.
 #[derive(Debug)]
@@ -205,6 +209,32 @@ impl QualityBadges<'_> {
     }
 }
 
+/// Which playlist an item comes from, copied out of the `UiCtx` for painters and closures that
+/// can't hold it (Settings ▸ Interface ▸ Playlist on cards, DESIGN §13.0 / §29): `None` inside
+/// while the playlist isn't shown.
+#[derive(Debug, Clone, Copy)]
+pub struct SourceMarks<'a>(pub Option<&'a [SourceMeta]>);
+
+impl<'a> SourceMarks<'a> {
+    /// The marks of a view of `kind` items. Auto shows the playlist only while two or more
+    /// playlists are eligible for that kind (enabled, with such items) AND the view shows all
+    /// of them (`all`: the scope is All playlists, or the view has no scope — Home, Search,
+    /// detail pages, the player); inside one playlist the mark is noise.
+    pub fn for_view(mode: PlaylistOnCards, sources: &'a [SourceMeta], kind: ItemKind, all: bool) -> Self {
+        let shown = match mode {
+            PlaylistOnCards::Auto => all && sources.iter().filter(|s| s.enabled && s.has(kind)).nth(1).is_some(),
+            PlaylistOnCards::Always => true,
+            PlaylistOnCards::Never => false,
+        };
+        Self(shown.then_some(sources))
+    }
+
+    /// The playlist to show for an item of `source` (`None` = don't show one).
+    pub fn of(&self, source: SourceId) -> Option<&'a SourceMeta> {
+        self.0.and_then(|all| all.iter().find(|s| s.id == source))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,5 +330,40 @@ mod tests {
         assert_eq!(on.of(&ch("a")), Some(QualityBadge::measured(Quality::Fhd, Some(Quality::Uhd))), "measured beats the name");
         assert_eq!(on.of(&ch("b")).map(|b| b.label()), Some("4K"), "same id, another channel");
         assert_eq!(QualityBadges(None).of(&ch("a")), None, "badges off");
+    }
+
+    /// Settings ▸ Interface ▸ Playlist on cards: Auto shows the playlist only with two or more
+    /// ELIGIBLE playlists for the view's kind (enabled, with such items) and only in All;
+    /// Always / Never override; an item gets its own playlist.
+    #[test]
+    fn playlist_marks_follow_the_setting_eligibility_and_the_scope() {
+        let src = |id: i64, enabled: bool, vod: bool| SourceMeta {
+            id: SourceId(id),
+            name: format!("P{id}"),
+            icon: String::new(),
+            color: Default::default(),
+            kind: crate::model::SourceKind::M3uUrl,
+            enabled,
+            last_refresh: None,
+            has_vod: vod,
+            has_series: false,
+            has_live: true,
+            in_all: true,
+            category_filter: None,
+        };
+        let one_on = [src(1, true, true), src(2, false, true)];
+        let two_on = [src(1, true, true), src(2, true, true)];
+        // a free-channel preset: enabled, channels only
+        let preset = [src(1, true, true), src(2, true, false)];
+        let (auto, movie, live) = (PlaylistOnCards::Auto, ItemKind::Movie, ItemKind::Channel);
+        let name = |m: SourceMarks<'_>, id: i64| m.of(SourceId(id)).map(|s| s.name.clone());
+        assert_eq!(name(SourceMarks::for_view(auto, &one_on, movie, true), 1), None, "one enabled playlist = noise");
+        assert_eq!(name(SourceMarks::for_view(auto, &two_on, movie, true), 2), Some("P2".into()), "the item's own playlist");
+        assert_eq!(name(SourceMarks::for_view(auto, &two_on, movie, false), 2), None, "inside one playlist");
+        assert_eq!(name(SourceMarks::for_view(auto, &preset, movie, true), 1), None, "the preset has no movies");
+        assert_eq!(name(SourceMarks::for_view(auto, &preset, live, true), 1), Some("P1".into()), "but channels");
+        assert_eq!(name(SourceMarks::for_view(PlaylistOnCards::Always, &one_on[..1], movie, false), 1), Some("P1".into()));
+        assert_eq!(name(SourceMarks::for_view(PlaylistOnCards::Never, &two_on, movie, true), 1), None);
+        assert_eq!(name(SourceMarks::for_view(PlaylistOnCards::Always, &two_on, movie, true), 9), None, "unknown playlist");
     }
 }

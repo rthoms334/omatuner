@@ -364,6 +364,14 @@ pub(crate) struct PresetRow {
     pub added: bool,
 }
 
+/// Index in [`COLORS`] of the first colour no playlist uses, as the theme draws it (DESIGN
+/// §29 "telling playlists apart").
+fn free_color(ctx: &UiCtx<'_>) -> usize {
+    let used: Vec<SourceColor> = ctx.lib.sources.iter().map(|s| s.color).collect();
+    let c = crate::ui::scope::first_free_color(&used, |c| ctx.theme.source_color(c));
+    COLORS.iter().position(|x| x.0 == c).unwrap_or(0)
+}
+
 /// The presets with their "Added" state against the URLs of the existing sources.
 pub(crate) fn preset_rows(list: &[Preset], existing: &HashSet<String>) -> Vec<PresetRow> {
     list.iter()
@@ -629,6 +637,7 @@ impl OnboardingScreen {
             return;
         }
         self.form = Form::for_preset(p);
+        self.form.color = free_color(ctx);
         self.from_preset = true;
         self.preset_idx = i;
         self.error = None;
@@ -948,6 +957,8 @@ impl Screen for OnboardingScreen {
             return;
         }
         *self = Self { start: start.clone(), ..Default::default() };
+        // a new playlist starts in a colour no other one uses (DESIGN §29)
+        self.form.color = free_color(ctx);
         match start {
             OnboardingStart::Welcome => self.go(Step::Welcome),
             OnboardingStart::AddSource => self.go(Step::Type),

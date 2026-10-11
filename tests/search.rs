@@ -25,6 +25,8 @@ fn source(id: i64, name: &str) -> SourceMeta {
         last_refresh: None,
         has_vod: true,
         has_series: true,
+        has_live: true,
+        in_all: true,
         category_filter: None,
     }
 }

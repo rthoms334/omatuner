@@ -10,6 +10,11 @@
 //! "Last-used group": the collection picked in the guide this session; without one, the group
 //! of the channel playing (or All channels).
 //!
+//! Several playlists with channels (DESIGN §29): the guide shows Live TV's playlist scope — a
+//! `● TV 2 ▾` button before the collection picker (Alt+P, Ctrl+PgDn/PgUp) — and its collections,
+//! rows and zap lists follow it. In All, the collection picker lists the groups under each
+//! playlist's name, so two "Sports" can be told apart.
+//!
 //! Returning from the player: when the guide started the playback itself (Watch, catch-up, or
 //! the programme popover's Watch) and the same guide route is entered again after a new load,
 //! the focus follows the channel playing now (zaps included) and the collection the user
@@ -28,11 +33,12 @@ use crate::player::{PlayRequest, PlayerCommand, PlayerSnapshot, PlayerState};
 use crate::theme::{SpaceToken, TypeToken};
 use crate::ui::epg_grid::{self, EpgGridState, GridMetrics, GridOutcome, GuideRow, day_label};
 use crate::ui::overlays::{ContextMenuSpec, MenuItem, OverlayResult};
+use crate::ui::scope::{self, Scope, ScopeFilter, ScopeKind};
 use crate::ui::screens::live::{self, GuideStatus, NoGuide, choice_action, choice_index, playing_channel};
 use crate::ui::video_host::Placement;
 use crate::ui::widgets::button::{ButtonStyle, back_button, button, icon_button};
 use crate::ui::widgets::rows::grouped;
-use crate::ui::widgets::{empty_state::empty_state, glyphs, section};
+use crate::ui::widgets::{empty_state::empty_state, glyphs, scope_bar, section};
 use crate::ui::{LayoutClass, NavRequest, OverlayRequest, Route, Screen, ScreenId, SettingsPage, UiCtx};
 
 /// Numeric entry auto-commits after this long without a digit.
@@ -53,7 +59,7 @@ fn played_channel(snap: &PlayerSnapshot) -> Option<ChannelId> {
 pub struct GuideScreen {
     grid: Option<EpgGridState>,
     collection: Option<Collection>,
-    built: Option<(u64, u64, SortMode, Option<Collection>)>,
+    built: Option<(u64, u64, SortMode, Option<Collection>, ScopeFilter)>,
     dirty: bool,
     reminders: Vec<Reminder>,
     reminders_dirty: bool,
@@ -68,6 +74,9 @@ pub struct GuideScreen {
     /// Keyboard focus rest (optional guide preview autoplay).
     rest: Option<(ChannelId, Instant)>,
     guide: GuideStatus,
+    /// A channel to focus once the rows of a new playlist scope are built ("Open in guide" on
+    /// another playlist's channel switches the scope first, DESIGN §29).
+    pending_focus: Option<ChannelId>,
 }
 
 fn fav_signature(ctx: &UiCtx<'_>) -> u64 {
@@ -80,6 +89,11 @@ fn fav_signature(ctx: &UiCtx<'_>) -> u64 {
 }
 
 impl GuideScreen {
+    /// Live TV's playlist scope (DESIGN §29).
+    fn scope<'l>(ctx: &UiCtx<'l>) -> Scope<'l> {
+        Scope::current(ctx, ScopeKind::Live)
+    }
+
     fn default_collection(&self, ctx: &UiCtx<'_>) -> Collection {
         if let Some(c) = self.collection.clone().filter(|c| self.valid(ctx, c)) {
             return c;
@@ -87,9 +101,11 @@ impl GuideScreen {
         if let Some(l) = ctx.favs.non_empty_lists().next() {
             return Collection::Favourites(l.id);
         }
-        // the group of what plays, else everything
+        // the group of what plays (in scope), else everything
+        let scope = Self::scope(ctx).filter();
         playing_channel(ctx.player)
             .and_then(|id| ctx.lib.live.get(id))
+            .filter(|c| scope.admits(c.source_id))
             .and_then(|c| c.group_ids.first().copied())
             .map_or(Collection::AllChannels, Collection::Group)
     }
@@ -97,7 +113,10 @@ impl GuideScreen {
     fn valid(&self, ctx: &UiCtx<'_>, c: &Collection) -> bool {
         match c {
             Collection::Favourites(l) => ctx.favs.lists.iter().any(|x| x.id == *l),
-            Collection::Group(g) => ctx.lib.live.groups.iter().any(|x| x.id == *g && !x.hidden),
+            Collection::Group(g) => {
+                let scope = Self::scope(ctx).filter();
+                ctx.lib.live.groups.iter().any(|x| x.id == *g && !x.hidden && scope.admits(x.source_id))
+            }
             _ => true,
         }
     }
@@ -105,7 +124,14 @@ impl GuideScreen {
     fn collection_name(ctx: &UiCtx<'_>, c: &Collection) -> String {
         match c {
             Collection::AllChannels => "All channels".into(),
-            Collection::Group(g) => ctx.lib.live.groups.iter().find(|x| x.id == *g).map_or_else(|| "Group".into(), |x| x.display_name().to_owned()),
+            Collection::Group(g) => ctx.lib.live.groups.iter().find(|x| x.id == *g).map_or_else(
+                || "Group".into(),
+                // in All with several playlists, the group's playlist too ("Sports · TV 2")
+                |x| match Self::scope(ctx).marks(ctx).of(x.source_id) {
+                    Some(s) => format!("{} · {}", x.display_name(), s.name),
+                    None => x.display_name().to_owned(),
+                },
+            ),
             Collection::Favourites(l) => ctx.favs.lists.iter().find(|x| x.id == *l).map_or_else(|| "Favourites".into(), |x| x.name.clone()),
             Collection::History => "History".into(),
             Collection::Adhoc(_) => "Channels".into(),
@@ -115,7 +141,8 @@ impl GuideScreen {
     /// Rebuild rows when the library, favourites, sort or collection changed.
     fn refresh(&mut self, ctx: &mut UiCtx<'_>) {
         let coll = self.default_collection(ctx);
-        let sig = (ctx.lib.generation, fav_signature(ctx), ctx.config.interface.live_sort, Some(coll.clone()));
+        let scope = Self::scope(ctx).filter();
+        let sig = (ctx.lib.generation, fav_signature(ctx), ctx.config.interface.live_sort, Some(coll.clone()), scope.clone());
         if self.grid.is_none() {
             self.reminders_dirty = true;
         }
@@ -132,7 +159,7 @@ impl GuideScreen {
         let lib_changed = self.built.as_ref().is_none_or(|b| b.0 != sig.0) || self.dirty;
         self.built = Some(sig);
         self.dirty = false;
-        let ids = ctx.lib.live.collection(&coll, ctx.favs, &ctx.lib.recent_channels, ctx.config.interface.live_sort);
+        let ids = live::scoped_collection(ctx, &coll, ctx.config.interface.live_sort, &scope);
         let rows: Arc<[GuideRow]> = ids
             .iter()
             .filter_map(|id| ctx.lib.live.get(*id))
@@ -160,6 +187,9 @@ impl GuideScreen {
         }
         self.collection = Some(coll);
         self.apply_reminders(ctx);
+        if let (Some(ch), Some(g)) = (self.pending_focus.take(), &mut self.grid) {
+            g.jump_to(ch, ctx.now);
+        }
     }
 
     fn apply_reminders(&mut self, ctx: &UiCtx<'_>) {
@@ -174,7 +204,7 @@ impl GuideScreen {
     }
 
     fn zap(&self, ctx: &UiCtx<'_>) -> Option<crate::model::ZapList> {
-        self.collection.as_ref().and_then(|c| live::zap_list(ctx, c))
+        self.collection.as_ref().and_then(|c| live::zap_list_in(ctx, c, &Self::scope(ctx).filter()))
     }
 
     /// The collection is a provider group whose channels are all hidden ("Everything here is
@@ -229,18 +259,34 @@ impl GuideScreen {
         let mut choices = Vec::new();
         let mut items = Vec::new();
         let current = self.collection.clone();
-        let mut add = |c: Collection, icon: &'static str, label: String| {
-            let mark = if Some(&c) == current.as_ref() { glyphs::CHECK } else { icon };
-            items.push(MenuItem { icon: mark, label, action: choice_action(choices.len()), enabled: true, shortcut: None });
-            choices.push(c);
+        // `None`: a heading row nothing chooses
+        let mut add = |c: Option<Collection>, icon: &'static str, label: String| match c {
+            Some(c) => {
+                let mark = if Some(&c) == current.as_ref() { glyphs::CHECK } else { icon };
+                items.push(MenuItem { icon: mark, label, action: choice_action(choices.len()), enabled: true, shortcut: None });
+                choices.push(c);
+            }
+            None => items.push(MenuItem { icon, label, action: Action::Back, enabled: false, shortcut: None }),
         };
         for l in &ctx.favs.lists {
-            add(Collection::Favourites(l.id), glyphs::FAVOURITE, l.name.clone());
+            add(Some(Collection::Favourites(l.id)), glyphs::FAVOURITE, l.name.clone());
         }
-        add(Collection::History, glyphs::HISTORY, "History".into());
-        add(Collection::AllChannels, glyphs::LIVE_TV, "All channels".into());
-        for g in ctx.lib.live.visible_groups(None, ctx.config.interface.hide_empty_groups) {
-            add(Collection::Group(g.id), glyphs::FOLDER, g.display_name().to_owned());
+        add(Some(Collection::History), glyphs::HISTORY, "History".into());
+        add(Some(Collection::AllChannels), glyphs::LIVE_TV, "All channels".into());
+        let scope = Self::scope(ctx);
+        let (filter, grouped) = (scope.filter(), scope.multi() && scope.is_all());
+        let groups = ctx.lib.live.visible_groups(None, ctx.config.interface.hide_empty_groups);
+        let mut last = None;
+        for g in groups.into_iter().filter(|g| filter.admits(g.source_id)) {
+            // All: each playlist's groups under its name (a heading row nothing chooses)
+            if grouped
+                && last != Some(g.source_id)
+                && let Some(s) = ctx.lib.source(g.source_id)
+            {
+                last = Some(g.source_id);
+                add(None, glyphs::PLAYLIST, s.name.clone());
+            }
+            add(Some(Collection::Group(g.id)), glyphs::FOLDER, g.display_name().to_owned());
         }
         self.choices = choices;
         ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: "Show in the guide…".into(), items }));
@@ -348,6 +394,11 @@ impl GuideScreen {
             }
             if !compact {
                 section::section_header(ui, theme, "TV guide");
+            }
+            let scope = Self::scope(ctx);
+            let max_w = (if ctx.layout == LayoutClass::Wide { 280.0 } else { 140.0 } * theme.rem()).round();
+            if scope.multi() && scope_bar::scope_button(ui, theme, &scope, max_w).clicked() {
+                act = Some(Action::PlaylistPicker);
             }
             if button(ui, theme, None, &format!("{name} ▾"), ButtonStyle { bordered: true, ..Default::default() })
                 .on_hover_text("Collection (f)")
@@ -544,6 +595,18 @@ impl Screen for GuideScreen {
         self.refresh(ctx);
         let now = ctx.now;
         let target = if returning { played_channel(&snap).or(*focus) } else { *focus };
+        self.pending_focus = None;
+        // another playlist's channel: show a scope that has it (All, or that playlist when it is
+        // out of All), then focus it once those rows are built
+        if let Some(src) = target.and_then(|ch| ctx.lib.live.get(ch)).map(|c| c.source_id) {
+            let scope = Self::scope(ctx);
+            if !scope.filter().admits(src) {
+                let all = Scope { selected: None, ..scope }.filter();
+                scope::choose(ctx, ScopeKind::Live, (!all.admits(src)).then_some(src), true);
+                self.pending_focus = target;
+                return;
+            }
+        }
         if let (Some(ch), Some(g)) = (target, &mut self.grid) {
             g.jump_to(ch, now);
         }
@@ -576,6 +639,9 @@ impl Screen for GuideScreen {
         }
         if let Some(handled) = self.numeric_action(ctx, action) {
             return handled;
+        }
+        if scope::on_action(ctx, ScopeKind::Live, action) {
+            return true;
         }
         match action {
             Action::Digit(d) => {
@@ -663,6 +729,9 @@ impl Screen for GuideScreen {
         if let Some(a) = self.header(ui, ctx) {
             self.on_action(ctx, a);
         }
+        // the stripe of a picked playlist (DESIGN §29)
+        let top = ui.cursor().top() + theme.space(SpaceToken::Xs);
+        scope_bar::paint_stripe(ui.painter(), theme, ui.max_rect().x_range(), top, &Self::scope(ctx));
         ui.add_space(theme.space(SpaceToken::Md));
         if let Some((_, at)) = &self.numeric {
             if at.elapsed() >= NUMERIC_COMMIT {
@@ -762,5 +831,68 @@ impl Screen for GuideScreen {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::NavRequest;
+    use crate::ui::screens::home::testkit::{self, harness, rig, seed};
+
+    /// The guide follows Live TV's playlist (DESIGN §29): in All, its collection picker lists
+    /// each playlist's groups under the playlist's name (a heading nothing chooses), so the two
+    /// "News" can be told apart; with one playlist picked, the rows and the picker are that
+    /// playlist's, and a group of another playlist falls back.
+    #[test]
+    fn the_guide_follows_the_live_playlist_and_groups_its_picker() {
+        let (mut t, one) = rig();
+        let (a, b) = seed(&mut t, |c| {
+            let a = testkit::source(c, "Alpha")?;
+            let b = testkit::source(c, "Bravo")?;
+            testkit::channels(c, a, 3)?;
+            testkit::channels(c, b, 2)?;
+            Ok((a, b))
+        });
+        let mut h = harness(t, one, GuideScreen::default(), egui::vec2(1600.0, 900.0));
+        h.state_mut().enter(Route::Guide { collection: Some(Collection::AllChannels), focus: None });
+        h.run_steps(2);
+        let rows = |h: &egui_kittest::Harness<'static, testkit::App<GuideScreen>>| h.state().s.grid.as_ref().map_or(0, |g| g.rows.len());
+        assert_eq!(rows(&h), 5);
+        let picker = |h: &mut egui_kittest::Harness<'static, testkit::App<GuideScreen>>| {
+            h.state_mut().act(Action::GuideCategory);
+            match h.state_mut().nav().pop() {
+                Some(NavRequest::Open(OverlayRequest::ContextMenu(m))) => m.items.iter().map(|i| (i.label.clone(), i.enabled)).collect::<Vec<_>>(),
+                other => panic!("no picker: {other:?}"),
+            }
+        };
+        let items = picker(&mut h);
+        let at = |name: &str| items.iter().position(|i| i.0 == name).unwrap_or_else(|| panic!("{name} in {items:?}"));
+        assert!(!items[at("Alpha")].1 && !items[at("Bravo")].1, "headings choose nothing");
+        assert!(at("Alpha") < at("Bravo") && items[at("Alpha") + 1].0 == "All" && items[at("Bravo") + 1].0 == "All", "{items:?}");
+        let news_of_a = h.state().t.lib.live.groups.iter().find(|g| g.source_id == a && g.name == "News").map(|g| g.id).expect("news");
+        h.state_mut().enter(Route::Guide { collection: Some(Collection::Group(news_of_a)), focus: None });
+        h.run_steps(1);
+
+        // Live TV shows Bravo: so does the guide
+        h.state_mut().t.config_edits.push(Box::new(move |c| c.interface.playlist_scope.live = Some(b)));
+        h.state_mut().apply_config();
+        h.run_steps(2);
+        assert!(!matches!(h.state().s.collection, Some(Collection::Group(g)) if g == news_of_a), "Alpha's group falls back");
+        h.state_mut().enter(Route::Guide { collection: Some(Collection::AllChannels), focus: None });
+        h.run_steps(1);
+        assert_eq!(rows(&h), 2, "Bravo's channels");
+        let items = picker(&mut h);
+        assert!(!items.iter().any(|i| i.0 == "Alpha" || i.0 == "Bravo"), "one playlist: no headings");
+        assert_eq!(items.iter().filter(|i| i.0 == "All" || i.0 == "News").count(), 2, "Bravo's groups only");
+
+        // "Open in guide" on Alpha's last channel (Search, Home): All playlists, focused on it
+        let ch = h.state().t.lib.live.channels.iter().rfind(|c| c.source_id == a).map(|c| c.id).expect("a channel");
+        h.state_mut().enter(Route::Guide { collection: None, focus: Some(ch) });
+        assert_eq!(h.state().t.toasts.last().map(|t| t.text.as_str()), Some("Showing all playlists"));
+        h.state_mut().apply_config();
+        h.run_steps(2);
+        let g = h.state().s.grid.as_ref().expect("grid");
+        assert_eq!(g.rows.get(g.focus_row).map(|r| r.channel), Some(ch));
     }
 }

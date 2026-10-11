@@ -12,6 +12,7 @@ pub mod dialogs;
 pub mod edit_item;
 pub mod help;
 pub mod jobs;
+pub mod playlists;
 pub mod programme;
 pub mod resume;
 pub mod search;
@@ -131,7 +132,7 @@ pub trait Overlay {
 }
 
 /// Build an overlay for a request (every variant wired; frozen).
-pub fn build(req: OverlayRequest, _ctx: &mut UiCtx<'_>) -> Box<dyn Overlay> {
+pub fn build(req: OverlayRequest, ctx: &mut UiCtx<'_>) -> Box<dyn Overlay> {
     match req {
         OverlayRequest::Search { initial } => Box::new(search::SearchOverlay::new(initial)),
         OverlayRequest::Help => Box::new(help::HelpOverlay::new()),
@@ -146,5 +147,7 @@ pub fn build(req: OverlayRequest, _ctx: &mut UiCtx<'_>) -> Box<dyn Overlay> {
         OverlayRequest::Tracks { audio } => Box::new(tracks::TracksOverlay::new(audio)),
         OverlayRequest::EditItem(item) => Box::new(edit_item::EditItemOverlay::new(item)),
         OverlayRequest::Categories(source) => Box::new(categories::CategoriesOverlay::new(source)),
+        OverlayRequest::PlaylistPicker(kind) => Box::new(playlists::PlaylistPickerOverlay::new(kind)),
+        OverlayRequest::PlaylistMenu(source, kind) => Box::new(playlists::PlaylistMenuOverlay::new(source, kind, ctx)),
     }
 }

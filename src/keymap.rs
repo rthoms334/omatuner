@@ -175,6 +175,11 @@ pub enum Action {
     GlobalPlayPause,
     RefreshSource,
     ShowJobs,
+    /// Alt+P on Movies, Series, Live TV and the guide: pick the playlist shown (DESIGN §29).
+    PlaylistPicker,
+    /// Ctrl+PgDn / Ctrl+PgUp there: the next / previous playlist (All included).
+    NextPlaylist,
+    PrevPlaylist,
     // ---- items
     ToggleFavourite,
     AddToList,
@@ -370,6 +375,10 @@ pub static GLOBAL: &[Binding] = &[
     b(C::key(Key::F5), A::RefreshSource, "Refresh playlists & guide"),
     b(C::ctrl(Key::J), A::ShowJobs, "Show background tasks"),
     b(C::key(Key::F1), A::ToggleHelp, "Keyboard help"),
+    // not Ctrl+0 (egui's zoom reset) nor Alt+[ / Alt+] (AltGr chords on German / French keyboards)
+    b(C::alt(Key::P), A::PlaylistPicker, "Choose the playlist shown (Movies, Series, Live TV, guide)"),
+    b(C::ctrl(Key::PageDown), A::NextPlaylist, "Next / previous playlist (Movies, Series, Live TV, guide)"),
+    b(C::ctrl(Key::PageUp), A::PrevPlaylist, "Next / previous playlist (Movies, Series, Live TV, guide)"),
 ];
 
 /// Shared by List / ListFiltering / PosterGrid(Filtering) / Detail: item actions on Ctrl
@@ -951,7 +960,19 @@ pub fn hints(stack: &[KeyContext]) -> Vec<(Action, KeyChord, &'static str)> {
 /// Status-bar hint line for the innermost context that has hints, e.g.
 /// "Enter play · Shift+Enter fullscreen · Ctrl+F fav · Shift+F10 more · ? help".
 pub fn hint_line(stack: &[KeyContext]) -> String {
-    hints(stack).iter().map(|(_, chord, verb)| format!("{} {verb}", chord.label())).collect::<Vec<_>>().join(" · ")
+    hint_line_with(stack, &[])
+}
+
+/// [`hint_line`] with global `extra` hints the screen adds (Movies with two playlists: "Alt+P
+/// playlist"), before "help". Not inside dialogs and text fields, whose keys come first.
+pub fn hint_line_with(stack: &[KeyContext], extra: &[(Action, &'static str)]) -> String {
+    let mut v = hints(stack);
+    if !stack.iter().any(|c| matches!(c, KeyContext::Modal | KeyContext::TextInput | KeyContext::Search | KeyContext::Help)) {
+        let at = v.iter().position(|(a, ..)| *a == A::ToggleHelp).unwrap_or(v.len());
+        let add = extra.iter().filter_map(|(a, verb)| GLOBAL.iter().find(|bd| bd.action == *a).map(|bd| (*a, bd.chord, *verb)));
+        v.splice(at..at, add);
+    }
+    v.iter().map(|(_, chord, verb)| format!("{} {verb}", chord.label())).collect::<Vec<_>>().join(" · ")
 }
 
 #[cfg(test)]
@@ -1096,6 +1117,23 @@ mod tests {
                 assert_eq!(resolve(stack, &event_of(chord)), Some(action), "{stack:?}: “{} {verb}”", chord.label());
             }
         }
+    }
+
+    /// The playlist keys (DESIGN §29) work from every list, grid and the guide — Ctrl+PgDn is
+    /// not PgDn — and "Alt+P playlist" joins a screen's hint line before "help", never a
+    /// dialog's or a text field's.
+    #[test]
+    fn playlist_keys_and_their_hint() {
+        for stack in [vec![K::List], vec![K::PosterGrid], vec![K::Guide], vec![K::TextInput, K::Panel]] {
+            assert_eq!(resolve(&stack, &key_ev(Key::PageDown, true, false, false, false)), Some(Action::NextPlaylist), "{stack:?}");
+            assert_eq!(resolve(&stack, &key_ev(Key::PageUp, true, false, false, false)), Some(Action::PrevPlaylist), "{stack:?}");
+            assert_eq!(resolve(&stack, &key_ev(Key::P, false, true, false, false)), Some(Action::PlaylistPicker), "{stack:?}");
+        }
+        assert_eq!(resolve(&[K::List], &key(Key::PageDown, false)), Some(Action::PageDown));
+        let extra = [(Action::PlaylistPicker, "playlist")];
+        let line = hint_line_with(&[K::PosterGrid], &extra);
+        assert!(line.ends_with("Alt+P playlist · F1 help") || line.ends_with("Alt+P playlist · ? help"), "{line}");
+        assert_eq!(hint_line_with(&[K::List, K::Modal], &extra), hint_line(&[K::List, K::Modal]));
     }
 
     /// Help filters as you type: every printable key (`?`, `/`, j/k, digits) goes to the filter,

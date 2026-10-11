@@ -120,6 +120,8 @@ pub struct TunerApp {
     /// The last input event was an Alt chord that resolved: drop its `Text` twin if it comes
     /// next (possibly in the next batch of input).
     drop_alt_text: bool,
+    /// The window title last sent ("Tuner — Movies · TV 2", DESIGN §29).
+    window_title: String,
     idle: Option<crate::platform::idle::IdleInhibitor>,
     /// Window fullscreen as last requested by the app, re-synced every frame from the
     /// compositor's state (`ViewportInfo::fullscreen`) when the backend reports it.
@@ -227,6 +229,7 @@ impl TunerApp {
             config_edits: Vec::new(),
             pending_actions: Vec::new(),
             drop_alt_text: false,
+            window_title: crate::APP_NAME.to_owned(),
             idle,
             window_fullscreen: false,
             popout: PopOut::default(),
@@ -405,7 +408,8 @@ impl TunerApp {
         }
         match outcome {
             Ok(JobOutcome::Library(lib)) => {
-                self.lib = lib.clone();
+                let old = std::mem::replace(&mut self.lib, lib.clone());
+                self.check_scopes(&old);
                 // the playing channel is noted again next frame
                 self.measured.clear();
                 // A favourite toggled while this library was being built is newer than
@@ -426,9 +430,9 @@ impl TunerApp {
                     self.send_player(PlayerCommand::SetConnectionLimit { source: *source, max: a.max_connections });
                 }
                 // DESIGN §27.3: also after a silent (scheduled) refresh; named when it could be
-                // any of several playlists
+                // any of several (enabled) playlists
                 if *upgraded {
-                    let name = (self.lib.sources.len() > 1).then(|| self.source_name(*source));
+                    let name = (self.lib.sources.iter().filter(|s| s.enabled).nth(1).is_some()).then(|| self.source_name(*source));
                     self.toast(Toast::upgraded(name.as_deref()));
                     let source = *source;
                     let _ = self.services().store.writer().submit(move |c| crate::store::sources::forget_unseen_upgrade(c, source));
@@ -1059,6 +1063,75 @@ impl TunerApp {
         }
     }
 
+    /// A playlist a screen showed is gone, disabled or no longer has that kind of item: the
+    /// screen shows All playlists again, and a toast says why (DESIGN §29). A playlist that is
+    /// still eligible keeps its place even while it is the only one (the bar just hides).
+    fn check_scopes(&mut self, old: &crate::store::library::Library) {
+        use crate::ui::scope::ScopeKind;
+        if self.lib.built_at == 0 {
+            return;
+        }
+        let scopes = self.services().config().interface.playlist_scope;
+        let mut reset = Vec::new();
+        let mut told = Vec::new();
+        for kind in ScopeKind::ALL {
+            let Some(id) = kind.stored(&scopes) else { continue };
+            if self.lib.eligible(kind.item_kind()).iter().any(|s| s.id == id) {
+                continue;
+            }
+            reset.push(kind);
+            if told.contains(&id) {
+                continue;
+            }
+            told.push(id);
+            let text = match (self.lib.source(id), old.source(id)) {
+                (Some(s), _) if !s.enabled => format!("{} is disabled — showing All playlists", s.name),
+                (Some(s), _) => format!("{} has no {} now — showing All playlists", s.name, kind.noun()),
+                (None, Some(s)) => format!("{} was removed — showing All playlists", s.name),
+                (None, None) => "A playlist you picked is gone — showing All playlists".to_owned(),
+            };
+            self.toast(Toast::info(text));
+        }
+        if !reset.is_empty() {
+            self.config_edits.push(Box::new(move |c: &mut Config| {
+                for k in reset {
+                    *k.slot(&mut c.interface.playlist_scope) = None;
+                }
+            }));
+        }
+    }
+
+    /// "Tuner — Movies · TV 2" while a screen shows one playlist (the Omarchy bar shows the
+    /// window title, DESIGN §29), else "Tuner".
+    fn title_now(&self) -> String {
+        use crate::ui::scope::{Scope, ScopeKind};
+        let screen = self.view_screen();
+        let Some(kind) = ScopeKind::of_screen(screen) else { return crate::APP_NAME.to_owned() };
+        let scopes = self.services().config().interface.playlist_scope;
+        match Scope::of(&self.lib, &scopes, kind).selected {
+            Some(s) => {
+                let name = match screen {
+                    ScreenId::Movies => "Movies",
+                    ScreenId::Series => "Series",
+                    ScreenId::Guide => "TV guide",
+                    _ => "Live TV",
+                };
+                format!("{} — {name} · {}", crate::APP_NAME, s.name)
+            }
+            None => crate::APP_NAME.to_owned(),
+        }
+    }
+
+    /// The status bar's hints: the context's, plus "Alt+P playlist" on a screen with two or
+    /// more playlists to choose from (DESIGN §29).
+    fn hint_now(&self) -> String {
+        use crate::ui::scope::{Scope, ScopeKind};
+        let stack = self.key_stack();
+        let multi = ScopeKind::of_screen(self.view_screen())
+            .is_some_and(|k| Scope::of(&self.lib, &self.services().config().interface.playlist_scope, k).multi());
+        if multi { keymap::hint_line_with(&stack, &[(Action::PlaylistPicker, "playlist")]) } else { keymap::hint_line(&stack) }
+    }
+
     /// `StartScreen::Last`: store the main screen the user leaves on (written at exit only).
     fn remember_last_screen(&self) {
         let Some(services) = &self.services else { return };
@@ -1212,6 +1285,11 @@ impl eframe::App for TunerApp {
         self.handle_dropped_files();
         self.apply_nav(&egui_ctx);
 
+        let title = self.title_now();
+        if title != self.window_title {
+            egui_ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.window_title = title;
+        }
         let theme = self.theme.clone();
         let current = self.view_screen();
         let chrome = !self.chrome_hidden();
@@ -1221,7 +1299,7 @@ impl eframe::App for TunerApp {
         let mut status_top = egui_ctx.content_rect().bottom();
         if chrome {
             let jobs = self.services().jobs.active();
-            let hint = keymap::hint_line(&self.key_stack());
+            let hint = self.hint_now();
             let mini_hidden = self.layout == LayoutClass::Compact || !cfg.interface.mini_player;
             let now_playing =
                 (mini_hidden && self.snapshot.state != PlayerState::Idle).then(|| self.snapshot.playable.as_ref().map(|p| p.title.clone())).flatten();
@@ -2361,6 +2439,46 @@ mod tests {
         rig.event(AppEvent::Data(DataScope::Favourites));
         assert!(rig.app.favs.is_fav(&item));
         assert_eq!(rig.log().jobs.len(), 1, "favourites never rebuild the library");
+    }
+
+    /// A playlist picked on a screen (DESIGN §29): the window title names it and the hint line
+    /// offers Alt+P (two playlists with channels); once it is disabled, Live TV shows All
+    /// playlists again with a toast saying why, and the title drops it. With one playlist
+    /// left there is nothing to choose: no "Alt+P playlist". A removed playlist says so.
+    #[test]
+    fn a_disabled_picked_playlist_falls_back_to_all_with_a_toast() {
+        let mut cfg = test_config();
+        cfg.interface.playlist_scope.live = Some(SourceId(2));
+        let mut rig = Rig::with(cfg, live(), 1.0, |c| {
+            seed_channels(c, 2, None)?;
+            seed_channels(c, 3, None)?;
+            c.execute("UPDATE source SET name = 'Bravo' WHERE id = 2", [])?;
+            Ok(())
+        });
+        rig.settle();
+        rig.frame_with(vec![]);
+        assert_eq!(rig.app.window_title, "Tuner — Live TV · Bravo");
+        assert!(rig.app.hint_now().contains("Alt+P playlist"), "{}", rig.app.hint_now());
+        rig.writer().blocking(|c| Ok(c.execute("UPDATE source SET enabled = 0 WHERE id = 2", [])?)).unwrap();
+        deliver_library(&mut rig);
+        assert_eq!(rig.log().toasts.last().map(|t| t.text.as_str()), Some("Bravo is disabled — showing All playlists"));
+        rig.frame_with(vec![]);
+        assert_eq!(rig.app.services().config().interface.playlist_scope.live, None, "saved");
+        assert_eq!(rig.app.window_title, "Tuner");
+        assert!(!rig.app.hint_now().contains("Alt+P"), "one playlist: nothing to choose");
+
+        // picked again, then removed
+        rig.writer().blocking(|c| Ok(c.execute("UPDATE source SET enabled = 1 WHERE id = 2", [])?)).unwrap();
+        deliver_library(&mut rig);
+        rig.app.config_edits.push(Box::new(|c: &mut Config| c.interface.playlist_scope.live = Some(SourceId(2))));
+        rig.frame_with(vec![]);
+        rig.frame_with(vec![]);
+        assert_eq!(rig.app.window_title, "Tuner — Live TV · Bravo");
+        rig.writer().blocking(|c| crate::store::sources::delete_source(c, SourceId(2))).unwrap();
+        deliver_library(&mut rig);
+        assert_eq!(rig.log().toasts.last().map(|t| t.text.as_str()), Some("Bravo was removed — showing All playlists"));
+        rig.frame_with(vec![]);
+        assert_eq!(rig.app.services().config().interface.playlist_scope.live, None);
     }
 
     #[test]
