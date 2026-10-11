@@ -1957,6 +1957,7 @@ impl Screen for PlayerScreen {
                 StateAction::Retry => ("Retry", "Retry (r)", Action::Retry),
                 StateAction::LastChannel => ("Last channel", "Last channel (Backspace)", Action::LastChannel),
                 StateAction::OtherCopy => ("Play from another copy", "Play from another copy (Ctrl+O)", Action::PlayFrom),
+                StateAction::Stop => ("Stop", "Stop and close (q)", Action::StopAndClose),
             };
             if osd_button(ui, &p, theme, b.rect, ui.id().with(("state-button", i)), &b.text, b.font, label, Some(tip), false).clicked() {
                 self.on_action(ctx, action);
@@ -2366,5 +2367,31 @@ mod tests {
         h.state_mut().act(Action::PlayFrom);
         until(&mut h, "the other copy", |h| real(h).playable.as_ref().is_some_and(|p| p.media == MediaRef::Movie(other)));
         assert_eq!(real(&h).playable.as_ref().and_then(|p| p.start_at), Some(2480.0), "from where it stopped");
+    }
+
+    /// Field fix: a live channel that played keeps reconnecting until stopped, so the overlay
+    /// reads "attempt n" (never "(12/0)") and offers an obvious Stop that stops and leaves.
+    #[test]
+    fn an_endless_reconnect_shows_the_attempt_and_a_stop_button() {
+        use crate::ui::screens::home::testkit::painted;
+        let mut h = player(WIDE);
+        let mut s = (*h.state().t.snapshot).clone();
+        s.state = PlayerState::Reconnecting {
+            attempt: 12,
+            max: 0,
+            at: std::time::Instant::now() + std::time::Duration::from_secs(20),
+            reason: crate::player::PlayerErrorKind::ProviderError,
+        };
+        h.state_mut().t.snapshot = Arc::new(s);
+        h.run_steps(3);
+        let texts = painted(&h);
+        assert!(texts.iter().any(|t| t == "Reconnecting… attempt 12"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("/0)")), "{texts:?}");
+        assert!(texts.iter().any(|t| t.starts_with("The provider can't deliver this channel")), "{texts:?}");
+        h.state_mut().nav();
+        h.get_by_label("Stop").click();
+        h.run_steps(2);
+        assert!(h.state_mut().nav().contains(&NavRequest::Back), "Stop leaves the player");
+        until(&mut h, "stopped", |h| real(h).state == PlayerState::Idle);
     }
 }

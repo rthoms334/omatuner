@@ -21,6 +21,18 @@
 //! HTTP statuses from log lines classify failures only while Loading (a 404 storm of HLS
 //! segments while Playing is a network problem, not "channel offline"); cleared on
 //! PlaybackRestart.
+//!
+//! Reconnects (DESIGN §11.4, field fixes 2026-10-11):
+//! * A live channel that reached Playing since it was asked for ("played") keeps reconnecting
+//!   ([`ReconnectPolicy::sticky_delay`], `max: 0`) and is never recorded as failing: provider
+//!   outages and connection-limit races outlast any fixed budget, and the user is watching.
+//! * Connection-limit race window: right after a stream of the same source closed (a zap), the
+//!   provider may still count it, so a 403 is retried every few seconds until
+//!   [`ReconnectPolicy::race_window`] after that close. It is armed once per Play
+//!   ([`Input::SourceClosed`]), never by our own failed attempts, so a channel the provider
+//!   really refuses still reaches Error when the window ends.
+//! * A provider message instead of a stream ([`Input::ProviderMessage`]) is a
+//!   `ProviderError` carrying the provider's text.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -92,6 +104,13 @@ pub enum Input {
     TimePos(f64),
     /// From mpv/ffmpeg log lines ("HTTP error 403 Forbidden").
     HttpStatus(u16),
+    /// The controller found the provider's text where the stream should be (the playlist
+    /// "expanded" into lines of prose, see `controller`); already redacted.
+    ProviderMessage(String),
+    /// Sent by the controller after the `Loaded` of every load: when a DIFFERENT stream of the
+    /// target's source (whose limit is 1 or unknown) closed recently, the instant it closed. Only
+    /// the first after a Play counts (arms the connection-limit race window, see module docs).
+    SourceClosed(Option<Instant>),
     Tick,
     /// The controller could not start the other copy an [`Effect::Fallback`] asked for: the
     /// failure stands (Error, nothing recorded again).
@@ -142,6 +161,17 @@ pub struct PlayerMachine {
     last_pos_change: Option<Instant>,
     last_http: Option<u16>,
     history_pushed: bool,
+    /// The current live target reached Playing since its Play: failures keep reconnecting.
+    played: bool,
+    /// First failure of the current run of reconnects (the sticky schedule slows down after a
+    /// while); cleared by stable playback.
+    failing_since: Option<Instant>,
+    /// 403s before this instant are the connection-limit race (see module docs).
+    race_until: Option<Instant>,
+    /// The first [`Input::SourceClosed`] of this Play arrived (the window is armed at most once).
+    race_considered: bool,
+    /// The provider's text behind the last `ProviderError`.
+    provider_message: Option<String>,
     /// Mirrors of mpv's `pause` / `paused-for-cache` (both persist across files and only fire
     /// on change), so PLAYBACK_RESTART and unpause land in the right state.
     paused: bool,
@@ -168,6 +198,11 @@ impl PlayerMachine {
             last_pos_change: None,
             last_http: None,
             history_pushed: false,
+            played: false,
+            failing_since: None,
+            race_until: None,
+            race_considered: false,
+            provider_message: None,
             paused: false,
             paused_for_cache: false,
             fallback: false,
@@ -198,6 +233,18 @@ impl PlayerMachine {
     pub fn started(&self) -> bool {
         self.history_pushed
     }
+    /// The reconnect policy in force (the controller gates the race window with it).
+    pub fn policy(&self) -> &ReconnectPolicy {
+        &self.cfg.policy
+    }
+    /// Is `entry` the playlist entry of the current target (loaded or playing)?
+    pub fn owns_entry(&self, entry: i64) -> bool {
+        self.current_entry == Some(entry) || self.expected_entry == Some(entry)
+    }
+    /// When the time position of the current target last moved (`None` before it played).
+    pub fn position_changed_at(&self) -> Option<Instant> {
+        self.last_pos_change
+    }
 
     /// Feed one input; returns effects for the controller to execute in order.
     pub fn handle(&mut self, input: Input, now: Instant) -> Vec<Effect> {
@@ -211,6 +258,11 @@ impl PlayerMachine {
                 self.attempt = 0;
                 self.http_retry_used = false;
                 self.history_pushed = false;
+                self.played = false;
+                self.failing_since = None;
+                self.race_until = None;
+                self.race_considered = false;
+                self.provider_message = None;
                 self.last_http = None;
                 self.last_pos = None;
                 self.last_pos_change = None;
@@ -236,12 +288,15 @@ impl PlayerMachine {
                 self.target = None;
                 self.attempt = 0;
                 self.http_retry_used = false;
+                self.played = false;
+                self.failing_since = None;
                 self.set_state(PlayerState::Idle, &mut fx);
             }
             Input::Retry => {
                 if matches!(self.state, PlayerState::Error(_) | PlayerState::Reconnecting { .. }) && self.target.is_some() {
                     self.attempt = 0;
                     self.http_retry_used = false;
+                    self.failing_since = None;
                     self.begin_load(now, &mut fx);
                 }
             }
@@ -293,6 +348,7 @@ impl PlayerMachine {
                 // replaced file must not mark the new one as playing)
                 PlayerState::Loading { .. } if self.current_entry.is_some() => {
                     self.last_http = None;
+                    self.played = true;
                     self.playing_since = Some(now);
                     self.last_pos_change = Some(now);
                     if let Some(t) = self.target.clone() {
@@ -396,6 +452,19 @@ impl PlayerMachine {
                     self.last_http = Some(code);
                 }
             }
+            Input::ProviderMessage(text) => {
+                let live = self.target.as_ref().is_some_and(|t| t.kind.is_live());
+                if live && matches!(self.state, PlayerState::Loading { .. }) {
+                    self.provider_message = Some(text);
+                    self.fail(PlayerErrorKind::ProviderError, now, &mut fx);
+                }
+            }
+            Input::SourceClosed(at) => {
+                if !self.race_considered {
+                    self.race_considered = true;
+                    self.race_until = at.map(|at| at + self.cfg.policy.race_window);
+                }
+            }
             Input::Tick => self.tick(now, &mut fx),
         }
         fx
@@ -427,6 +496,7 @@ impl PlayerMachine {
                 {
                     self.attempt = 0;
                     self.http_retry_used = false;
+                    self.failing_since = None;
                 }
             }
             PlayerState::Reconnecting { at, .. } if now >= at => self.begin_load(now, fx),
@@ -459,16 +529,23 @@ impl PlayerMachine {
 
     fn fail(&mut self, kind: PlayerErrorKind, now: Instant, fx: &mut Vec<Effect>) {
         let live = self.target.as_ref().map(|t| t.kind.is_live()).unwrap_or(true);
-        let http_once = matches!(kind, PlayerErrorKind::HttpForbidden | PlayerErrorKind::HttpNotFound);
+        let early = self.fallback_due();
+        // a live channel the user has been watching: keep trying (module docs)
+        let sticky = live && self.played && ReconnectPolicy::sticky(kind);
+        // a 403 right after a zap on the same source: the provider still counts the old stream
+        let race = !sticky && !early && kind == PlayerErrorKind::HttpForbidden && self.race_until.is_some_and(|until| now < until);
+        let http_once = !sticky && !race && matches!(kind, PlayerErrorKind::HttpForbidden | PlayerErrorKind::HttpNotFound);
         // the one-shot HTTP retry has its own counter (see `http_retry_used`)
         let next = if http_once { 1 + u32::from(self.http_retry_used) } else { self.attempt + 1 };
+        let failing_for = now.saturating_duration_since(*self.failing_since.get_or_insert(now));
         fx.push(Effect::StopMpv);
         self.clear_entries();
-        let early = self.fallback_due();
         // with another copy waiting, a copy that never started isn't retried for long: a load
         // timeout already waited, other failures get one quick retry (the 403 retry stays: a
         // connection-limit race right after a stop)
         let delay = match kind {
+            _ if sticky => self.cfg.policy.sticky_delay(next, kind, failing_for),
+            _ if race => Some(self.cfg.policy.race_retry),
             PlayerErrorKind::Timeout if early => None,
             _ if early && !http_once && next > 1 => None,
             _ => self.cfg.policy.delay(next, kind, live),
@@ -480,12 +557,22 @@ impl PlayerMachine {
                     1
                 } else {
                     self.attempt = next;
-                    if live { self.cfg.policy.max_attempts_live } else { self.cfg.policy.max_attempts_vod }
+                    if sticky || race {
+                        // the window spends the 403 retry: a refusal after it ends is final
+                        self.http_retry_used |= race;
+                        0
+                    } else if kind == PlayerErrorKind::ProviderError {
+                        super::reconnect::PROVIDER_RETRIES
+                    } else if live {
+                        self.cfg.policy.max_attempts_live
+                    } else {
+                        self.cfg.policy.max_attempts_vod
+                    }
                 };
                 self.set_state(PlayerState::Reconnecting { attempt: next, max, at: now + d, reason: kind }, fx);
             }
             None => {
-                let err = PlayerError { kind, message: describe(kind).to_owned() };
+                let err = PlayerError { kind, message: self.error_message(kind) };
                 if let Some(t) = &self.target {
                     fx.push(Effect::RecordFailure(t.clone(), kind));
                 }
@@ -497,6 +584,14 @@ impl PlayerMachine {
                 fx.push(Effect::Emit(PlayerEvent::Failed(err.clone())));
                 self.set_state(PlayerState::Error(err), fx);
             }
+        }
+    }
+
+    /// The error card's detail: the provider's own words for a provider message.
+    fn error_message(&self, kind: PlayerErrorKind) -> String {
+        match (kind, &self.provider_message) {
+            (PlayerErrorKind::ProviderError, Some(text)) => format!("The provider said: “{text}”"),
+            _ => describe(kind).to_owned(),
         }
     }
 
@@ -552,6 +647,7 @@ pub fn describe(kind: PlayerErrorKind) -> &'static str {
         PlayerErrorKind::Drm => "This channel is DRM-protected and can't be played",
         PlayerErrorKind::Resolve => "Couldn't build the stream address",
         PlayerErrorKind::Budget => "Connection limit reached for this provider",
+        PlayerErrorKind::ProviderError => "The provider can't deliver this channel right now",
         PlayerErrorKind::Mpv => "Playback failed",
     }
 }
@@ -687,36 +783,55 @@ mod tests {
         assert!(has_load(&m.handle(Input::Tick, t0 + Duration::from_millis(2001))));
     }
 
+    /// A network error reconnects after the 0.5 s backoff: bounded (8 attempts) on a first
+    /// play, unbounded (`max: 0`) once the channel played.
     #[test]
     fn live_error_reconnects_with_backoff() {
-        let mut m = machine();
         let t0 = Instant::now();
+        let mut m = machine();
+        m.handle(Input::Play { target: live(), immediate: true }, t0);
+        m.handle(Input::Loaded { entry: Some(1) }, t0);
+        m.handle(Input::StartFile { entry: 1 }, t0);
+        m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry: 1 }, t0);
+        assert!(matches!(m.state(), PlayerState::Reconnecting { attempt: 1, max: 8, reason: PlayerErrorKind::Network, .. }), "{:?}", m.state());
+
+        let mut m = machine();
         start_playing(&mut m, live(), 1, t0);
         let fx = m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry: 1 }, t0);
         assert!(fx.iter().any(|e| matches!(e, Effect::StopMpv)));
         assert!(recorded(&fx).is_none(), "no failure recorded while retrying");
-        assert!(matches!(m.state(), PlayerState::Reconnecting { attempt: 1, max: 8, reason: PlayerErrorKind::Network, .. }));
+        assert!(matches!(m.state(), PlayerState::Reconnecting { attempt: 1, max: 0, reason: PlayerErrorKind::Network, .. }), "{:?}", m.state());
         assert!(!has_load(&m.handle(Input::Tick, t0 + Duration::from_millis(400))), "backoff 0.5 s");
         let fx = m.handle(Input::Tick, t0 + Duration::from_secs(1));
         assert!(has_load(&fx));
         assert!(matches!(m.state(), PlayerState::Loading { attempt: 1, .. }));
     }
 
+    /// Fail the current load (entry `entry`) with `kind`; returns the effects. `None` = a
+    /// network error (mpv -13), otherwise the HTTP status seen while loading.
+    fn fail_load(m: &mut PlayerMachine, entry: i64, http: Option<u16>, t: Instant) -> Vec<Effect> {
+        m.handle(Input::Loaded { entry: Some(entry) }, t);
+        m.handle(Input::StartFile { entry }, t);
+        if let Some(code) = http {
+            m.handle(Input::HttpStatus(code), t);
+        }
+        m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry }, t)
+    }
+
+    /// A channel that never played gives up after 8 attempts and is recorded as failing.
     #[test]
-    fn live_gives_up_after_max_attempts_and_records_the_failure() {
-        let mut m = machine();
+    fn live_first_play_gives_up_after_max_attempts_and_records_the_failure() {
         let mut t = Instant::now();
-        start_playing(&mut m, live(), 1, t);
+        let mut m = machine();
+        m.handle(Input::Play { target: live(), immediate: true }, t);
         let mut delays = Vec::new();
         for entry in 1..=9 {
-            let fx = m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry }, t);
-            if let PlayerState::Reconnecting { at, attempt, .. } = m.state().clone() {
-                assert_eq!(attempt, entry as u32);
+            let fx = fail_load(&mut m, entry, None, t);
+            if let PlayerState::Reconnecting { at, attempt, max, .. } = m.state().clone() {
+                assert_eq!((attempt, max), (entry as u32, 8));
                 delays.push(at - t);
                 t = at;
                 assert!(has_load(&m.handle(Input::Tick, t)));
-                m.handle(Input::Loaded { entry: Some(entry + 1) }, t);
-                m.handle(Input::StartFile { entry: entry + 1 }, t);
             } else {
                 assert_eq!(entry, 9, "8 attempts, the 9th failure gives up");
                 assert_eq!(recorded(&fx), Some(PlayerErrorKind::Network));
@@ -726,6 +841,70 @@ mod tests {
         let ms: Vec<u64> = delays.iter().map(|d| d.as_millis() as u64).collect();
         assert_eq!(ms, vec![500, 1000, 2000, 4000, 8000, 15000, 15000, 15000]);
         assert!(matches!(m.state(), PlayerState::Error(PlayerError { kind: PlayerErrorKind::Network, .. })));
+    }
+
+    /// Field report: a channel that played for hours gave up after ~60 s of an outage and was
+    /// dimmed. Once played it keeps reconnecting through every transient kind (refusals and
+    /// offline answers included), slows to 30 s after ~5 min, records nothing, and plays again
+    /// when the provider is back.
+    #[test]
+    fn a_live_channel_that_played_keeps_reconnecting_and_recovers() {
+        let mut t = Instant::now();
+        let start = t;
+        let mut m = machine();
+        start_playing(&mut m, live(), 1, t);
+        let kinds = [None, Some(403), Some(404), Some(502), Some(401)];
+        let mut delays = Vec::new();
+        for entry in 1..=40 {
+            let fx = if entry == 1 {
+                m.handle(Input::EndFile { reason: EndReason::Eof, error: 0, entry: 1 }, t)
+            } else {
+                fail_load(&mut m, entry, kinds[entry as usize % kinds.len()], t)
+            };
+            assert_eq!(recorded(&fx), None, "attempt {entry}: never recorded as failing");
+            assert!(!fx.iter().any(|e| matches!(e, Effect::Emit(PlayerEvent::Failed(_)))));
+            let PlayerState::Reconnecting { at, attempt, max: 0, .. } = m.state().clone() else { panic!("attempt {entry}: {:?}", m.state()) };
+            assert_eq!(attempt, entry as u32);
+            delays.push((t - start, at - t));
+            t = at;
+            assert!(has_load(&m.handle(Input::Tick, t)));
+        }
+        // 0.5 s … 15 s (refusals ≥ 3 s) for the first ~5 min, then every 30 s
+        assert_eq!(delays[0].1, Duration::from_millis(500));
+        assert!(delays.iter().all(|(_, d)| *d <= secs(30)));
+        let (fast, slow): (Vec<_>, Vec<_>) = delays.iter().partition(|(since, _)| *since < secs(300));
+        assert!(fast.iter().skip(6).all(|(_, d)| *d == secs(15)), "{fast:?}");
+        assert!(!slow.is_empty() && slow.iter().all(|(_, d)| *d == secs(30)), "{slow:?}");
+        // the provider is back
+        let entry = 41;
+        m.handle(Input::Loaded { entry: Some(entry) }, t);
+        m.handle(Input::StartFile { entry }, t);
+        let fx = m.handle(Input::PlaybackRestart, t);
+        assert_eq!(m.state(), &PlayerState::Playing);
+        assert!(fx.iter().any(|e| matches!(e, Effect::ClearFailure(_))));
+        // DRM / unsupported still end it
+        let fx = m.handle(Input::EndFile { reason: EndReason::Error, error: -17, entry }, t);
+        assert!(matches!(m.state(), PlayerState::Error(PlayerError { kind: PlayerErrorKind::Unsupported, .. })), "{:?}", m.state());
+        assert_eq!(recorded(&fx), Some(PlayerErrorKind::Unsupported));
+    }
+
+    /// The played flag belongs to the target: a new Play starts bounded again, Stop forgets it.
+    #[test]
+    fn played_is_per_target() {
+        let t = Instant::now();
+        let mut m = machine();
+        start_playing(&mut m, live(), 1, t);
+        m.handle(Input::Play { target: live(), immediate: true }, t);
+        fail_load(&mut m, 2, Some(404), t);
+        assert!(matches!(m.state(), PlayerState::Reconnecting { max: 1, reason: PlayerErrorKind::HttpNotFound, .. }), "{:?}", m.state());
+        assert!(has_load(&m.handle(Input::Tick, t + secs(2))));
+        fail_load(&mut m, 3, Some(404), t + secs(2));
+        assert!(matches!(m.state(), PlayerState::Error(_)), "{:?}", m.state());
+        // VOD that played keeps its 3 retries
+        let mut m = machine();
+        start_playing(&mut m, vod(), 1, t);
+        m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry: 1 }, t);
+        assert!(matches!(m.state(), PlayerState::Reconnecting { max: 3, .. }), "{:?}", m.state());
     }
 
     #[test]
@@ -746,43 +925,154 @@ mod tests {
         assert!(matches!(m.state(), PlayerState::Error(PlayerError { kind: PlayerErrorKind::HttpForbidden, .. })));
     }
 
-    /// Review fix: the 3 s retry of a 403 is not used up by earlier network reconnects (the
-    /// provider may still count the dropped connection), and a 404 likewise keeps its retry.
+    /// Review fix: on a first play, the 3 s retry of a 403 is not used up by earlier network
+    /// reconnects (the provider may still count the dropped connection), and a 404 likewise
+    /// keeps its retry.
     #[test]
     fn http_retry_survives_earlier_network_reconnects() {
         for (code, kind) in [(403, PlayerErrorKind::HttpForbidden), (404, PlayerErrorKind::HttpNotFound)] {
-            let mut m = machine();
             let mut t = Instant::now();
-            start_playing(&mut m, live(), 1, t);
-            // two network drops → backoff attempts 1 and 2
+            let mut m = machine();
+            m.handle(Input::Play { target: live(), immediate: true }, t);
+            // two network failures → backoff attempts 1 and 2
             for entry in 1..=2 {
-                m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry }, t);
+                fail_load(&mut m, entry, None, t);
                 let PlayerState::Reconnecting { at, attempt, reason: PlayerErrorKind::Network, .. } = m.state().clone() else {
                     panic!("{:?}", m.state())
                 };
                 assert_eq!(attempt, entry as u32);
                 t = at;
                 assert!(has_load(&m.handle(Input::Tick, t)));
-                m.handle(Input::Loaded { entry: Some(entry + 1) }, t);
-                m.handle(Input::StartFile { entry: entry + 1 }, t);
             }
-            // the reconnect is refused: one HTTP retry, then Error
-            m.handle(Input::HttpStatus(code), t);
-            let fx = m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry: 3 }, t);
+            // refused: one HTTP retry, then Error
+            let fx = fail_load(&mut m, 3, Some(code), t);
             assert!(recorded(&fx).is_none(), "{code}: no failure recorded while retrying");
             let PlayerState::Reconnecting { at, attempt: 1, max: 1, reason, .. } = m.state().clone() else { panic!("{code}: {:?}", m.state()) };
             assert_eq!(reason, kind);
             t = at;
             assert!(has_load(&m.handle(Input::Tick, t)));
-            m.handle(Input::Loaded { entry: Some(4) }, t);
-            m.handle(Input::StartFile { entry: 4 }, t);
-            m.handle(Input::HttpStatus(code), t);
-            let fx = m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry: 4 }, t);
+            let fx = fail_load(&mut m, 4, Some(code), t);
             assert!(matches!(m.state(), PlayerState::Error(PlayerError { kind: k, .. }) if *k == kind), "{code}: {:?}", m.state());
             assert_eq!(recorded(&fx), Some(kind));
             m.handle(Input::Retry, t);
             assert!(matches!(m.state(), PlayerState::Loading { attempt: 0, .. }), "user retry resets both counters");
         }
+    }
+
+    /// The zap race window (user decision 2026-10-11): a 403 right after a different stream of
+    /// the same source closed is retried every 3 s until 45 s after that close; then the
+    /// refusal is final (Error, recorded). Our own failed attempts never re-arm the window, and
+    /// only the first `SourceClosed` of a Play counts.
+    #[test]
+    fn a_refused_zap_is_retried_through_the_race_window_then_errors() {
+        let t0 = Instant::now();
+        let closed = t0 - secs(1);
+        let mut m = machine();
+        m.handle(Input::Play { target: live(), immediate: true }, t0);
+        m.handle(Input::Loaded { entry: Some(1) }, t0);
+        m.handle(Input::SourceClosed(Some(closed)), t0);
+        let mut t = t0;
+        let mut entry = 1;
+        let mut retries = 0;
+        loop {
+            if entry > 1 {
+                m.handle(Input::Loaded { entry: Some(entry) }, t);
+                // every later load reports its own (our) close: ignored
+                m.handle(Input::SourceClosed(Some(t)), t);
+            }
+            m.handle(Input::StartFile { entry }, t);
+            m.handle(Input::HttpStatus(403), t);
+            let fx = m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry }, t);
+            match m.state().clone() {
+                PlayerState::Reconnecting { at, max: 0, reason: PlayerErrorKind::HttpForbidden, .. } => {
+                    assert_eq!(at - t, secs(3));
+                    assert!(recorded(&fx).is_none());
+                    retries += 1;
+                    t = at;
+                    assert!(has_load(&m.handle(Input::Tick, t)));
+                    entry += 1;
+                }
+                PlayerState::Error(PlayerError { kind: PlayerErrorKind::HttpForbidden, .. }) => {
+                    assert!(t >= closed + secs(45), "gave up inside the window at {:?}", t - closed);
+                    assert_eq!(recorded(&fx), Some(PlayerErrorKind::HttpForbidden));
+                    break;
+                }
+                s => panic!("{s:?}"),
+            }
+            assert!(retries < 20, "the window must end");
+        }
+        assert_eq!(retries, 15, "1 s after the close, every 3 s until 45 s");
+
+        // the provider let go inside the window: playing
+        let mut m = machine();
+        m.handle(Input::Play { target: live(), immediate: true }, t0);
+        m.handle(Input::Loaded { entry: Some(1) }, t0);
+        m.handle(Input::SourceClosed(Some(t0)), t0);
+        m.handle(Input::StartFile { entry: 1 }, t0);
+        m.handle(Input::HttpStatus(403), t0);
+        m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry: 1 }, t0);
+        m.handle(Input::Tick, t0 + secs(3));
+        reload_playing(&mut m, 2, t0 + secs(3));
+
+        // no close before this Play (or the first load had none): the plain single retry
+        let mut m = machine();
+        m.handle(Input::Play { target: live(), immediate: true }, t0);
+        m.handle(Input::Loaded { entry: Some(1) }, t0);
+        m.handle(Input::SourceClosed(None), t0);
+        m.handle(Input::StartFile { entry: 1 }, t0);
+        m.handle(Input::HttpStatus(403), t0);
+        m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry: 1 }, t0);
+        assert!(matches!(m.state(), PlayerState::Reconnecting { max: 1, .. }), "{:?}", m.state());
+        m.handle(Input::Tick, t0 + secs(3));
+        m.handle(Input::Loaded { entry: Some(2) }, t0 + secs(3));
+        m.handle(Input::SourceClosed(Some(t0 + secs(3))), t0 + secs(3));
+        m.handle(Input::StartFile { entry: 2 }, t0 + secs(3));
+        m.handle(Input::HttpStatus(403), t0 + secs(3));
+        m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry: 2 }, t0 + secs(3));
+        assert!(matches!(m.state(), PlayerState::Error(_)), "our own close never arms the window: {:?}", m.state());
+    }
+
+    /// The provider's text instead of a stream: 3 retries 3 s apart on a first play, then an
+    /// Error that carries the text; a channel that played keeps trying.
+    #[test]
+    fn provider_message_is_a_provider_error_with_the_text() {
+        let text = "Cannot read /home/nxt/storage/streams/717661_.m3u8".to_owned();
+        let mut t = Instant::now();
+        let mut m = machine();
+        m.handle(Input::Play { target: live(), immediate: true }, t);
+        for entry in 1..=4 {
+            m.handle(Input::Loaded { entry: Some(entry) }, t);
+            m.handle(Input::StartFile { entry }, t);
+            m.handle(Input::EndFile { reason: EndReason::Redirect, error: 0, entry }, t);
+            let fx = m.handle(Input::ProviderMessage(text.clone()), t);
+            match m.state().clone() {
+                PlayerState::Reconnecting { at, attempt, max, reason: PlayerErrorKind::ProviderError } => {
+                    assert_eq!((attempt, max, at - t), (entry as u32, 3, secs(3)));
+                    t = at;
+                    m.handle(Input::Tick, t);
+                }
+                PlayerState::Error(e) => {
+                    assert_eq!(entry, 4);
+                    assert_eq!(e.kind, PlayerErrorKind::ProviderError);
+                    assert!(e.message.contains(&text), "{e:?}");
+                    assert_eq!(recorded(&fx), Some(PlayerErrorKind::ProviderError));
+                }
+                s => panic!("{s:?}"),
+            }
+        }
+        // only while loading a live target
+        let mut m = machine();
+        start_playing(&mut m, live(), 1, t);
+        assert!(m.handle(Input::ProviderMessage(text.clone()), t).is_empty());
+        m.handle(Input::EndFile { reason: EndReason::Eof, error: 0, entry: 1 }, t);
+        m.handle(Input::Tick, t + secs(1));
+        m.handle(Input::Loaded { entry: Some(2) }, t + secs(1));
+        m.handle(Input::ProviderMessage(text.clone()), t + secs(1));
+        assert!(matches!(m.state(), PlayerState::Reconnecting { max: 0, reason: PlayerErrorKind::ProviderError, .. }), "{:?}", m.state());
+        let mut m = machine();
+        m.handle(Input::Play { target: vod(), immediate: true }, t);
+        m.handle(Input::Loaded { entry: Some(1) }, t);
+        assert!(m.handle(Input::ProviderMessage(text), t).is_empty(), "VOD playlists are left to mpv");
     }
 
     #[test]

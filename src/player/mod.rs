@@ -25,7 +25,7 @@
 //! Hidden windows (DESIGN §11.1): `App::logic` only runs when the compositor sends frame
 //! callbacks. Hyprland sends none to windows on hidden workspaces unless the window has the
 //! `render_unfocused` rule (shipped in `packaging/hypr/tuner.lua`). As a safety net the
-//! controller watches the [`RenderClock`]: while Playing with no rendered frame for 2 s it sets
+//! controller watches the [`RenderClock`]: while Playing with no rendered frame for 10 s it sets
 //! `vid=no` (audio continues, no decode cost, no VO stalls) and publishes
 //! `video_suspended = true`; the app sends [`PlayerCommand::ResumeVideo`] as soon as it runs
 //! `logic` again.
@@ -189,6 +189,10 @@ pub enum PlayerErrorKind {
     Resolve,
     /// Connection budget exceeded.
     Budget,
+    /// The provider answered the stream request with a message instead of a stream (its
+    /// restreamer lost the channel: "Cannot read /home/…/streams/123_.m3u8"), usually for a
+    /// while. The message is in [`PlayerError::message`].
+    ProviderError,
     /// Other mpv error.
     Mpv,
 }
@@ -223,6 +227,9 @@ pub enum PlayerState {
     /// Waiting to retry.
     Reconnecting {
         attempt: u32,
+        /// Attempts allowed before giving up; 0 = no limit (a live channel that already played
+        /// keeps reconnecting until stopped, and the connection-limit race window is bounded by
+        /// time — the overlay reads "attempt n").
         max: u32,
         at: Instant,
         reason: PlayerErrorKind,
@@ -277,7 +284,7 @@ pub struct PlayerSnapshot {
     /// Where the current item was started from (preview autoplay may only replace a stream it
     /// started itself; zaps keep the origin).
     pub origin: Option<PlayOrigin>,
-    /// Video decoding is paused because nothing rendered for 2 s (hidden window, see module
+    /// Video decoding is paused because nothing rendered for 10 s (hidden window, see module
     /// docs). The app sends `ResumeVideo` when it renders again.
     pub video_suspended: bool,
     /// Last position of the current target, kept across reconnects (`position` is cleared by
@@ -439,6 +446,8 @@ impl Player {
     /// Create mpv with options from `cfg`, start the event pump and controller threads.
     pub fn start(cfg: &Config, deps: PlayerDeps) -> Result<Self> {
         let mpv = Arc::new(mpv::create(cfg)?);
+        let version = |p: &str| mpv.get_property::<String>(p).unwrap_or_else(|_| "?".into());
+        tracing::info!("Tuner {}, {}, FFmpeg {}", env!("CARGO_PKG_VERSION"), version("mpv-version"), version("ffmpeg-version"));
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
         let (evt_tx, evt_rx) = crossbeam_channel::unbounded();
         let (snap_tx, snap_rx) = watch::channel(Arc::new(PlayerSnapshot {
@@ -617,7 +626,10 @@ mod tests {
         // one frame rendered "now", then nothing (hidden window)
         let core = p.render_core().expect("core");
         core.clock.store(core.epoch.elapsed().as_millis().max(1) as u64, Ordering::Relaxed);
-        assert!(wait_until(Duration::from_secs(6), || h.snapshot().video_suspended), "suspended after 2 s");
+        // a quick workspace switch (< 10 s) never suspends: decoding would restart mid-GOP
+        std::thread::sleep(Duration::from_secs(8));
+        assert!(!h.snapshot().video_suspended, "not after 8 s");
+        assert!(wait_until(Duration::from_secs(6), || h.snapshot().video_suspended), "suspended after 10 s");
         assert_eq!(mpv.get_property::<String>("vid").unwrap(), "no");
         assert_eq!(h.snapshot().state, PlayerState::Playing, "audio keeps playing");
 
