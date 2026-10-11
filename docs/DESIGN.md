@@ -1586,7 +1586,7 @@ No results: "No matches — Ctrl+K searches everything, Tab switches sections".
 ### 13.8 Player & OSD
 ```
 ┌──────────────────────────────────────────────────────────────────────────────────────────┐
-│ ▣ 101  BBC One HD                                                      20:26   󰕾 80 %   │ ← top OSD
+│ 󰁍 ▣ 101  BBC One HD                                                              20:26  │ ← top OSD
 │                                                                                          │
 │                                        VIDEO                                             │
 │                                                                    ┌ CHANNELS (c) ─────┐ │
@@ -1595,7 +1595,7 @@ No results: "No matches — Ctrl+K searches everything, Tab switches sections".
 │ News at Eight                                     20:00 – 21:00    │ 102 BBC Two        │ │
 │ ▕██████████████████░░░░░░░░░░░░░░░▏                34 min left     └────────────────────┘ │
 │ Next  21:00 Drama                                    [HD] [5.1] [CC] [⟲]                  │
-│ 󰒮  󰐊  󰒭    󰗅 English (AC-3 5.1)   󰨖 Off   󰃰 Guide   󰋚 History   󰋽 Info   󰊓              │
+│ 󰒮 󰐊 󰒭  󰗅 English (AC-3 5.1)  󰨖 Off  󰐑 Channels  󰃰 Guide  󰋚 History  󰋽 Info 󰊓 󰏌  󰕾 ━━━●─┊─ 80 % │
 └──────────────────────────────────────────────────────────────────────────────────────────┘
 VOD bottom: title · S02E05 · [━━━━━━━━●───────── 41:20 / 1:02:13] · −10 / +10 s · tracks
 ```
@@ -1604,18 +1604,35 @@ The OSD has two layers (UX review B1):
   on mouse motion; hides after `osd_timeout_ms` (3.5 s) and never while a side panel/menu is
   open. It **does not change the key context**: ↑/↓ keep zapping, ←/→ keep recalling/seeking,
   however often they are pressed.
-* **Controls focus mode**: entered only with Enter, `i`, Tab or a mouse click on a control
-  (`FocusOsdControls`); pushes `PlayerOsd` (arrows move between controls / scrub, Enter
-  activates); Esc leaves focus mode (`LeaveOsdControls`) and the banner times out normally.
-  Unbound keys fall through (Space still pauses).
+* **Controls focus mode**: entered only with Enter, `i` or Tab (`FocusOsdControls`) — a mouse
+  click on a control just activates it, so the arrows keep zapping / seeking; pushes
+  `PlayerOsd` (arrows move between controls / scrub, Enter activates); Esc
+  (`LeaveOsdControls`) or Back (Alt+←, the mouse back button) leaves focus mode and the banner
+  times out normally. Unbound keys fall through (Space still pauses).
 * **Esc ladder in the player**: leave controls focus → hide the banner → leave window
   fullscreen → leave the player (mini-player keeps playing). Esc never *shows* the banner.
 * Type: title Display·s, body Title·s, badges Caption·s; `osd_accent` for progress/focus. Below
-  700 pt the controls row collapses to play/pause · audio · subtitles · info.
+  700 pt the controls row collapses to previous · play/pause · next (live) · audio · subtitles
+  · info, and the volume to its speaker (the level stays in the top bar).
+* **Mouse** (every control is an OSD button: hover fill, pointing hand, tooltip with its key):
+  ← at the left of the top bar leaves the player like `p`; the controls row adds Channels
+  (live) and Pop out (not in the popped-out window); the row ends with the volume — the
+  speaker (glyph by level; click = mute, tooltip "Mute (m)"), a slider 0–130 % with a mark
+  at 100 % (click sets, drag scrubs, wheel ±5; moving it while muted unmutes; 112 pt × s wide,
+  80 pt × s from 1200 pt down) and the level ("80 %", "Muted"), its room reserved before the
+  controls'. Right-click on the video opens the player menu (Channels…, Last channel,
+  favourite, aspect, zoom, audio…, subtitles…, stream info, jump to live, pop out / back to the
+  full window, keep playing in the mini player, stop and close); a click on the video closes
+  a side panel or leaves focus mode. The banner stays while the pointer is on a bar; with the
+  banner gone the pointer hides over the video. A failed / reconnecting stream shows Retry
+  (and Last channel) buttons under the message; the next-episode card has Play now / Cancel
+  and plays on a click. Nothing playing: a Back button, and a click anywhere goes back.
 
 Side panels: channel list `c` (current collection with now), mini guide `g` (now/next for the
 group), history `h`/→ — each with key contexts `[List|ListFiltering, PlayerLive]`: ↑/↓ move the
-panel cursor (no zap), Enter tunes, ←/Esc close, letters filter. Stream info `I` (codec,
+panel cursor (no zap), Enter tunes, ←/Esc close, letters filter. Mouse: a ✕ in the header, the
+wheel scrolls, hovering moves the cursor only with real pointer motion, one click tunes and
+keeps the panel open for the next channel. Stream info `I` (codec,
 resolution, fps, pixel format, HDR badge from gamma pq/hlg, audio codec/layout/rate, bitrates,
 hwdec, dropped frames, cache seconds). Digits open numeric entry (`[NumericEntry, PlayerLive]`:
 digits, Enter = go now, Backspace = delete digit, Esc = cancel; auto-commit after 1.5 s).
@@ -1631,9 +1648,13 @@ in Compact → status-bar chip; click = back to player, ✕ = stop).
 mute, tracks, `c`/`g`/`h` panels) plus `PopOut` (Esc / `o` = back to the full window). The
 passive banner is one bottom strip — title (⏸ when paused) and volume, then the programme on
 now (live) or position / duration (VOD), Body/Caption type, no scale factor; the full OSD
-returns only in controls focus mode or with a side panel open. Double-click pops back in
-(instead of window fullscreen). Nothing playing: "Nothing playing · o or Esc: back to the full
-window" on black.
+returns only in controls focus mode or with a side panel open. With the pointer in the window
+(or paused) the strip's right side holds buttons instead of the volume and the key hint:
+previous / play / next (live) or skip back / play / skip forward (VOD), the speaker (+ a 64 pt
+volume slider when the strip is at least 360 px wide), back to the full window, stop and
+close. Double-click pops back in (instead of window fullscreen); a drag on the video moves
+the window. Nothing playing: "Nothing playing · o or Esc: back to the full window" on black,
+with a "Back to the full window" button.
 
 
 ### 13.9 Settings
