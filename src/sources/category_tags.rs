@@ -559,10 +559,10 @@ fn script_tag(raw: &str) -> Option<CategoryTag> {
     let decoration = |c: char| matches!(c as u32, 0x02B0..=0x02FF | 0x1D00..=0x1DBF | 0x2070..=0x209F);
     for c in raw.chars().filter(|c| c.is_alphabetic() && !decoration(*c)) {
         letters += 1;
-        if let Some(s) = script(c) {
-            if let Some(e) = counts.iter_mut().find(|(l, _)| *l == s) {
-                e.1 += 1;
-            }
+        if let Some(s) = script(c)
+            && let Some(e) = counts.iter_mut().find(|(l, _)| *l == s)
+        {
+            e.1 += 1;
         }
     }
     let (lang, n) = counts.into_iter().max_by_key(|(_, n)| *n)?;
