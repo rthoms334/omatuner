@@ -1169,3 +1169,50 @@ combined (Settings ▸ Interface). Undo toasts last 8 s.
     preview); the locked one shows the lock and asks for the PIN; a hidden one, a different channel with
     the same name but another tvg-id, and explicit channels with the session locked are never
     offered. Nothing ever switches channel by itself.
+
+## 21. Use Tuner from Claude (MCP)
+
+Default profile, Claude Code installed, `claude mcp add --scope user tuner -- tuner mcp` done
+once (`claude mcp list` shows `tuner` connected).
+
+- [ ] **Not running → status doesn't start it:** quit Tuner. Ask Claude "what's playing?".
+  **Expect:** Claude says Tuner isn't running; Tuner does not open.
+
+- [ ] **Not running → starts:** quit Tuner. Ask Claude "what's on now?".
+  **Expect:** Tuner opens on the current workspace within a few seconds; Claude lists programmes
+  with channels and times in your local time.
+- [ ] **"Touring cars is on" (or any live sport / show in your guide):**
+  **Expect:** Claude finds the live programme and Tuner plays the channel fullscreen and comes to
+  the front. Backspace returns to the previous channel.
+- [ ] **Upcoming → automatic switch:** ask for something starting in 2–3 minutes and accept the
+  switch. **Expect:** Claude reports the start time; 10 s before, Tuner toasts "Switching to …
+  in 10 s" with Cancel; at the start it switches by itself. Repeat and press Cancel: no switch.
+  Settings ▸ Reminders lists the pending switch with its own label until then.
+- [ ] **Mood pick:** "something light under 2 hours, I haven't seen". **Expect:** Claude names a
+  film from a fitting category with its runtime; on "play it" Tuner starts it (resuming saved
+  progress for a started film).
+- [ ] **Catch-up:** ask for a programme that ended today on a channel with catch-up.
+  **Expect:** it plays from the archive; on a channel without catch-up Claude says it can't.
+- [ ] **Parental lock:** set a PIN, lock a channel, lock the session. Ask Claude to play that
+  channel. **Expect:** Tuner shows its PIN prompt; Claude tells you to type the PIN in Tuner
+  and does not ask for it. With explicit content present and hidden: ask Claude to search for an
+  explicit channel or category by name — nothing found, no counts that give it away. Unlock in
+  Tuner → it is found.
+- [ ] **No addresses:** ask Claude for the stream URL of a channel. **Expect:** it can't give
+  one (no tool result contains a URL).
+- [ ] **Control:** "pause", "resume", "volume to 30", "stop". **Expect:** each happens, also
+  while Tuner sits on another workspace.
+- [ ] **Window hidden:** move Tuner to another workspace, ask "what's on BBC One at 9?".
+  **Expect:** an answer without Tuner coming forward; "play it" brings it forward.
+- [ ] **Outlives Claude:** with Tuner started by Claude (first check), quit Claude Code (and
+  close its terminal). **Expect:** Tuner keeps running and playing.
+- [ ] **Relock while away:** set a PIN with a 1-minute relock, unlock, ask Claude to switch to an
+  explicit channel in 3 minutes, then move Tuner to another workspace and wait. **Expect:** no
+  toast or switch for it after the relock; "what's playing?" and the scheduled list don't name
+  it.
+- [ ] **Flags first:** `claude mcp add tuner-debug -- tuner --debug mcp`, then ask "what's
+  playing?". **Expect:** an answer (not a Tuner window opening); remove it afterwards.
+- [ ] **Old instance:** with a Tuner from before this feature running (or simulate: keep an old
+  build open), ask Claude anything. **Expect:** Claude says to restart Tuner; after a restart it
+  works.
+

@@ -128,6 +128,21 @@ pub struct Reminder {
     pub state: ReminderState,
 }
 
+impl Reminder {
+    /// `lead_s` of an automatic switch (DESIGN §30.8): at `start` Tuner switches to the channel
+    /// by itself (a Cancel toast [`Reminder::SWITCH_WARN_S`] before) instead of notifying. A
+    /// marker in an existing column, not a migration: older builds read it as "default lead"
+    /// and simply notify.
+    pub const SWITCH_LEAD: i64 = -1;
+    /// How long before an automatic switch its Cancel toast shows.
+    pub const SWITCH_WARN_S: i64 = 10;
+
+    /// An automatic switch rather than a notification.
+    pub fn switches(&self) -> bool {
+        self.lead_s == Self::SWITCH_LEAD
+    }
+}
+
 /// Reattach outcome for one orphan candidate (reported in import job results).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReattachOutcome {

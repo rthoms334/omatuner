@@ -36,6 +36,7 @@ pub mod theme;
 
 pub mod platform;
 
+pub mod agent;
 pub mod app;
 pub mod devshot;
 pub mod services;

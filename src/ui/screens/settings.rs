@@ -1143,11 +1143,19 @@ impl SettingsScreen {
                 }
                 // explicit channels' reminders while parental control hides them (DESIGN §20.3)
                 for r in self.reminders.iter().filter(|r| !ctx.lib.conceals(&r.channel)) {
+                    // an automatic switch (an MCP client's `schedule_switch`, DESIGN §30.8)
+                    let (glyph, how) = if r.switches() { (glyphs::LIVE_TV, "Switch · ") } else { (glyphs::REMINDER, "") };
+                    let title = if r.programme_title.trim().is_empty() { r.channel_name.clone() } else { r.programme_title.clone() };
                     v.push(item(
                         Item::Reminder(r.id),
-                        glyphs::REMINDER,
-                        r.programme_title.clone(),
-                        Some(format!("{} · {} · {}", r.channel_name, kit::day_time(r.start, ctx.config.interface.clock_24h), kit::date(r.start))),
+                        glyph,
+                        title,
+                        Some(format!(
+                            "{how}{} · {} · {}",
+                            r.channel_name,
+                            kit::day_time(r.start, ctx.config.interface.clock_24h),
+                            kit::date(r.start)
+                        )),
                     ));
                 }
             }

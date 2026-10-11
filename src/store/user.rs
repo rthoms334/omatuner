@@ -631,6 +631,26 @@ pub fn all_reminders(conn: &Connection) -> Result<Vec<Reminder>> {
     reminders_where(conn, "state = 'pending' ORDER BY start, id", [])
 }
 
+/// Make reminder `id` an automatic switch (DESIGN §30.8): `lead_s` = `Reminder::SWITCH_LEAD`,
+/// pending again. An agent's `schedule_switch` on a programme that already had a notification
+/// reminder (rows are unique per channel + start).
+pub fn set_reminder_switch(conn: &Connection, id: ReminderId) -> Result<()> {
+    if conn.execute("UPDATE reminder SET lead_s = ?2, state = 'pending' WHERE id = ?1", params![id, Reminder::SWITCH_LEAD])? == 0 {
+        return Err(sql::not_found("reminder", id));
+    }
+    Ok(())
+}
+
+/// Pending automatic switches (`Reminder::switches`), soonest first.
+pub fn pending_switches(conn: &Connection) -> Result<Vec<Reminder>> {
+    reminders_where(conn, "state = 'pending' AND lead_s = ?1 ORDER BY start, id", [Reminder::SWITCH_LEAD])
+}
+
+/// One reminder by id (any state), if it exists.
+pub fn reminder(conn: &Connection, id: ReminderId) -> Result<Option<Reminder>> {
+    Ok(reminders_where(conn, "id = ?1", [id])?.into_iter().next())
+}
+
 /// Every reminder in any state (backup).
 pub(crate) fn every_reminder(conn: &Connection) -> Result<Vec<Reminder>> {
     reminders_where(conn, "1 ORDER BY start, id", [])

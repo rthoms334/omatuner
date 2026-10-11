@@ -28,6 +28,13 @@ pub enum PlatformEvent {
     /// User clicked "Watch" on a reminder notification → the app resolves the channel by its
     /// stable ref (`LiveIndex::by_ref`), plays it and raises the window.
     ReminderWatch { reminder: ReminderId, channel: ItemRef },
+    /// An automatic switch (`Reminder::switches`, made by an MCP client's `schedule_switch`)
+    /// is due in `SWITCH_WARN_S`: the app toasts "Switching to ‹channel› in 10 s" with Cancel
+    /// (`Action::CancelSwitch`). DESIGN §30.8.
+    SwitchSoon { reminder: ReminderId, channel: ItemRef, start: crate::model::Timestamp },
+    /// The programme starts: the app plays the channel (PIN rules apply) unless the switch was
+    /// cancelled; the scheduler has already raised the window.
+    SwitchNow { reminder: ReminderId, channel: ItemRef },
     /// File picker result (None = cancelled). `purpose` echoes the request.
     FilePicked { purpose: PickPurpose, path: Option<std::path::PathBuf> },
     /// Pop-out player: Hyprland window state and request results (`platform::popout`).

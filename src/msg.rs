@@ -81,6 +81,8 @@ pub enum AppEvent {
     Data(DataScope),
     Platform(PlatformEvent),
     Ipc(IpcRequest),
+    /// An MCP client asked for something only the UI can do (DESIGN §30.4).
+    Agent(crate::agent::AgentCommand),
     Toast(Toast),
 }
 
