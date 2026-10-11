@@ -192,6 +192,16 @@ pub enum OverlayRequest {
     PlaylistPicker(scope::ScopeKind),
     /// A scope tab's right-click menu: edit the playlist, move it up / down (DESIGN §29).
     PlaylistMenu(SourceId, scope::ScopeKind),
+    /// "Same title as…": combine a movie or series with another title (DESIGN §29.16). The
+    /// overlay writes the join.
+    SameTitle(overlays::same_title::SameTitleSpec),
+    /// "Delete playlist…" with the offer to move favourites and progress to the same titles
+    /// in other playlists (DESIGN §29.16). The overlay deletes; `token` comes back in
+    /// `Confirmed` / `Cancelled`.
+    DeletePlaylist {
+        source: SourceId,
+        token: u64,
+    },
 }
 
 /// Requests a screen makes during a frame; the app applies them after the frame.

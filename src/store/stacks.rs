@@ -54,6 +54,9 @@ pub struct CopyRaw {
     pub split: bool,
     /// The user's "Always play from" copy.
     pub pinned: bool,
+    /// "Same title as…" (P3): the user's join group; copies of one group stack together,
+    /// with the stacks they are in.
+    pub join: Option<i64>,
 }
 
 /// Per-copy facts for labels and ordering.
@@ -71,6 +74,8 @@ pub struct CopyMeta {
     pub lang_rank: u8,
     pub pinned: bool,
     pub split: bool,
+    /// The user combined this copy with another title ("Same title as…").
+    pub joined: bool,
 }
 
 /// The stacks of one kind (movies or series). `Default` = no stacks.
@@ -276,7 +281,17 @@ pub fn build(items: &[VodSummary], raw: Vec<CopyRaw>, in_all: impl Fn(SourceId) 
             },
             None => (0, Dub::None),
         };
-        meta.push(CopyMeta { lang, dub, tags: r.tags, origin: r.origin, tmdb: r.tmdb, pinned: r.pinned, split: r.split, ..Default::default() });
+        meta.push(CopyMeta {
+            lang,
+            dub,
+            tags: r.tags,
+            origin: r.origin,
+            tmdb: r.tmdb,
+            pinned: r.pinned,
+            split: r.split,
+            joined: r.join.is_some(),
+            ..Default::default()
+        });
     }
     infer_from_categories(items, &mut meta);
     // one rank per (language, dub): few distinct pairs
@@ -298,9 +313,13 @@ pub fn build(items: &[VodSummary], raw: Vec<CopyRaw>, in_all: impl Fn(SourceId) 
             (false, _) => ClusterItem { hash: None, tmdb: None, origin: None },
         })
         .collect();
+    // "Same title as…": (item, group) of the joined copies in All
+    let joined: Vec<(u32, i64)> =
+        items.iter().zip(&raw).enumerate().filter_map(|(i, (v, r))| r.join.filter(|_| in_all(v.source_id)).map(|g| (i as u32, g))).collect();
     drop(raw);
-    let vod_match::Clusters { mut flat, spans } = vod_match::cluster_flat(&cluster_items);
+    let vod_match::Clusters { flat, spans } = vod_match::cluster_flat(&cluster_items);
     drop(cluster_items);
+    let (mut flat, spans) = apply_joins(flat, spans, &joined);
     let mut playlists: Vec<SourceId> = Vec::new();
     for v in items {
         if playlists.last() != Some(&v.source_id) && !playlists.contains(&v.source_id) {
@@ -355,6 +374,86 @@ pub fn dominant_market(items: &[VodSummary], market: &[Option<&'static str>], ta
             (total >= DOMINANT_MIN && top as f32 >= DOMINANT_SHARE * total as f32).then_some((g, lang))
         })
         .collect()
+}
+
+/// The user's joins ("Same title as…", P3) on top of the clusters: the copies of one join
+/// group, and every copy of the stacks they are in, become one stack. Clusters no join
+/// touches keep their place; merged ones follow. O(joined + flat) — nothing when there are
+/// no joins.
+fn apply_joins(flat: Vec<u32>, spans: Vec<(u32, u32)>, joined: &[(u32, i64)]) -> (Vec<u32>, Vec<(u32, u32)>) {
+    if joined.is_empty() {
+        return (flat, spans);
+    }
+    // a unit is a cluster (its index) or a copy standing alone (`spans.len() + item`)
+    let wanted: std::collections::HashSet<u32> = joined.iter().map(|(i, _)| *i).collect();
+    let mut cluster_of: HashMap<u32, u64> = HashMap::new();
+    for (c, &(a, b)) in spans.iter().enumerate() {
+        for &i in &flat[a as usize..b as usize] {
+            if wanted.contains(&i) {
+                cluster_of.insert(i, c as u64);
+            }
+        }
+    }
+    let unit = |i: u32| cluster_of.get(&i).copied().unwrap_or(spans.len() as u64 + u64::from(i));
+    let mut parent: HashMap<u64, u64> = HashMap::new();
+    fn root(parent: &mut HashMap<u64, u64>, mut u: u64) -> u64 {
+        while let Some(&p) = parent.get(&u).filter(|p| **p != u) {
+            u = p;
+        }
+        u
+    }
+    let mut first_of: HashMap<i64, u64> = HashMap::new();
+    for &(i, g) in joined {
+        let u = unit(i);
+        parent.entry(u).or_insert(u);
+        match first_of.get(&g) {
+            None => {
+                first_of.insert(g, u);
+            }
+            Some(&f) => {
+                let (a, b) = (root(&mut parent, f), root(&mut parent, u));
+                if a != b {
+                    parent.insert(b, a.min(b));
+                    parent.insert(a, a.min(b));
+                }
+            }
+        }
+    }
+    // the units of each merged component (two or more units)
+    let mut comps: HashMap<u64, Vec<u64>> = HashMap::new();
+    let units: Vec<u64> = parent.keys().copied().collect();
+    for u in units {
+        let r = root(&mut parent, u);
+        comps.entry(r).or_default().push(u);
+    }
+    comps.retain(|_, v| v.len() > 1);
+    if comps.is_empty() {
+        return (flat, spans);
+    }
+    let merged: std::collections::HashSet<u64> = comps.values().flatten().copied().collect();
+    let (mut out_flat, mut out_spans) = (Vec::with_capacity(flat.len() + joined.len()), Vec::with_capacity(spans.len()));
+    for (c, &(a, b)) in spans.iter().enumerate() {
+        if !merged.contains(&(c as u64)) {
+            let start = out_flat.len() as u32;
+            out_flat.extend_from_slice(&flat[a as usize..b as usize]);
+            out_spans.push((start, out_flat.len() as u32));
+        }
+    }
+    let mut roots: Vec<u64> = comps.keys().copied().collect();
+    roots.sort_unstable();
+    for r in roots {
+        let start = out_flat.len() as u32;
+        let mut units = comps.remove(&r).unwrap_or_default();
+        units.sort_unstable();
+        for u in units {
+            match usize::try_from(u).ok().filter(|u| *u < spans.len()) {
+                Some(c) => out_flat.extend_from_slice(&flat[spans[c].0 as usize..spans[c].1 as usize]),
+                None => out_flat.push((u - spans.len() as u64) as u32),
+            }
+        }
+        out_spans.push((start, out_flat.len() as u32));
+    }
+    (out_flat, out_spans)
 }
 
 /// Untagged copies in a category whose tagged copies are mostly one market take that market
@@ -618,6 +717,42 @@ mod tests {
         raw[2].split = true;
         let s = build(&items, raw, |_| true, &en());
         assert_eq!((s.stack_of(0), s.members(s.stack_of(1).unwrap())), (None, &[1, 2][..]));
+    }
+
+    /// "Same title as…" (P3): copies of one join group stack together with the stacks they
+    /// are in — whatever their names, years or TMDB ids — and still order by language; a join
+    /// with a copy out of All does nothing; a split copy can be joined elsewhere.
+    #[test]
+    fn joins_merge_titles_with_their_stacks() {
+        let (items, mut raw) = copies(&[
+            (1, "EN ★ Incendies - 2010", 1, false),          // 0
+            (2, "EN - Incendies (2010)", 2, false),          // 1 stacks with 0 by key
+            (2, "DE - Die Frau die singt (2010)", 3, false), // 2 another name: alone
+            (1, "EN ★ Heat - 1995", 1, false),               // 3 alone
+            (3, "EN - Heat 2 (1995)", 4, false),             // 4 out of All
+        ]);
+        raw[0].tmdb = Some(1);
+        raw[2].tmdb = Some(2);
+        let s = build(&items, raw.clone(), |src| src != SourceId(3), &en());
+        assert_eq!((s.len(), s.stack_of(2)), (1, None), "different ids, different names: apart");
+        // the user joins the German copy with Incendies' English copy in playlist 2
+        raw[1].join = Some(7);
+        raw[2].join = Some(7);
+        // and Heat with a copy out of All (no effect)
+        raw[3].join = Some(9);
+        raw[4].join = Some(9);
+        let s = build(&items, raw.clone(), |src| src != SourceId(3), &en());
+        let st = s.stack_of(2).expect("joined");
+        assert_eq!(s.members(st), &[0, 1, 2], "the whole stack, English first");
+        assert!(s.meta(2).joined && !s.meta(0).joined);
+        assert_eq!((s.stack_of(3), s.stack_of(4), s.len()), (None, None, 1));
+        // a copy split off its stack can still be joined to another title
+        raw[0].split = true;
+        raw[0].join = Some(9);
+        raw[3].join = Some(9);
+        let s = build(&items, raw, |src| src != SourceId(3), &en());
+        assert_eq!(s.members(s.stack_of(1).unwrap()), &[1, 2], "Incendies without the split copy");
+        assert_eq!(s.members(s.stack_of(0).unwrap()), &[0, 3], "the split copy joined Heat");
     }
 
     /// An untagged copy in a category that is ≥ 80 % one market takes that market: it is not

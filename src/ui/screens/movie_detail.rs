@@ -131,8 +131,20 @@ impl MovieDetailScreen {
         locked && !kit::unlocked(ctx)
     }
 
+    /// ✓: the page's copy is watched — for a combined title, any copy (DESIGN §29.15).
     fn watched(&self) -> bool {
+        if self.copies.combined() {
+            return self.copies.any_watched();
+        }
         self.progress.as_ref().is_some_and(|p| p.finished)
+    }
+
+    /// ★: the page's copy is a favourite — for a combined title, any copy.
+    fn favourite(&self, ctx: &UiCtx<'_>) -> bool {
+        if self.copies.combined() {
+            return self.copies.any_favourite(ctx);
+        }
+        self.item(ctx).is_some_and(|i| ctx.favs.is_fav(&i))
     }
 
     /// Where Play resumes: the latest progress of any of the title's copies (whichever copy
@@ -212,6 +224,16 @@ impl MovieDetailScreen {
     fn item_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) {
         let Some(item) = self.item(ctx) else { return };
         let title = self.title(ctx);
+        // a combined title (DESIGN §29.15, P3): lock, hide and rename cover every copy, with Undo
+        if self.copies.combined() && matches!(action, Action::Rename | Action::ToggleHidden | Action::ToggleLock) {
+            let plan = self.copies.plan().clone();
+            match action {
+                Action::Rename => crate::ui::copies::rename_dialog(ctx, &plan, &title),
+                Action::ToggleHidden => crate::ui::copies::hide(ctx, &plan, &title),
+                _ => crate::ui::copies::toggle_lock(ctx, &plan, true),
+            }
+            return;
+        }
         match action {
             Action::AddToList => kit::list_picker(ctx, &item, &title),
             Action::Rename => kit::rename_item(ctx, &item, &title),
@@ -221,7 +243,8 @@ impl MovieDetailScreen {
                 kit::toggle_lock(ctx, &item, locked, by_group);
             }
             Action::ContextMenu => {
-                let fav = ctx.favs.is_fav(&item);
+                let fav = self.favourite(ctx);
+                let every = self.copies.combined();
                 let mi = |icon: &'static str, label: &str, action: Action, shortcut: &str| MenuItem {
                     icon,
                     label: label.into(),
@@ -239,13 +262,18 @@ impl MovieDetailScreen {
                     items.push(MenuItem { shortcut: None, ..mi(glyphs::CLOSE, "Not the same title", Action::Digit(super::copies::CARD_SPLIT), "") });
                     self.copies.aim_at_page();
                 }
+                // combine it with a title the matcher kept apart (DESIGN §29.16; two movie
+                // playlists or more)
+                if crate::ui::stacks::combine(ctx.config) && ctx.lib.eligible(ItemKind::Movie).len() > 1 {
+                    items.push(MenuItem { shortcut: None, ..mi(glyphs::PLAYLIST, "Same title as…", Action::Digit(super::copies::SAME_TITLE), "") });
+                }
                 items.extend([
                     mi(glyphs::FAVOURITE, if fav { "Remove from Favourites" } else { "Add to Favourites" }, Action::ToggleFavourite, "Ctrl+F"),
                     mi(glyphs::FAV_LIST, "Favourites lists…", Action::AddToList, "Ctrl+Shift+F"),
                     mi(glyphs::CHECK, if self.watched() { "Mark unwatched" } else { "Mark watched" }, Action::MarkWatched, "Ctrl+W"),
-                    mi(glyphs::TAG, "Rename…", Action::Rename, "F2"),
-                    mi(glyphs::LOCK, "Lock / unlock", Action::ToggleLock, "Ctrl+L"),
-                    mi(glyphs::HIDDEN, "Hide", Action::ToggleHidden, "Ctrl+H"),
+                    mi(glyphs::TAG, if every { "Rename every copy…" } else { "Rename…" }, Action::Rename, "F2"),
+                    mi(glyphs::LOCK, if every { "Lock / unlock every copy" } else { "Lock / unlock" }, Action::ToggleLock, "Ctrl+L"),
+                    mi(glyphs::HIDDEN, if every { "Hide every copy" } else { "Hide" }, Action::ToggleHidden, "Ctrl+H"),
                 ]);
                 ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title, items }));
             }
@@ -274,6 +302,11 @@ impl MovieDetailScreen {
             Btn::Play => self.play(ctx, true),
             Btn::StartOver => self.play(ctx, false),
             Btn::PlayFrom => self.copies.play_from_menu(ctx),
+            Btn::Favourite if self.copies.combined() => {
+                // add: the copy Play would use; remove: every copy, with Undo
+                let plan = self.copies.plan().clone();
+                crate::ui::copies::toggle_favourite_of(ctx, &plan, self.copies.plays());
+            }
             Btn::Favourite => {
                 if let Some(item) = self.item(ctx) {
                     kit::toggle_favourite(ctx, &item);
@@ -287,6 +320,13 @@ impl MovieDetailScreen {
         let Some(item) = self.item(ctx) else { return };
         let on = !self.watched();
         let title = self.title(ctx);
+        if self.copies.combined() {
+            // mark: the copy Play would use; unmark: every copy's progress, with Undo
+            let plan = self.copies.plan().clone();
+            crate::ui::copies::mark_watched_of(ctx, &plan, self.copies.plays(), &title, on);
+            self.focus = self.focus.min(self.focus_len(ctx) - 1);
+            return;
+        }
         let (now, write_item) = (ctx.now, item.clone());
         let _ = ctx
             .services
@@ -429,6 +469,12 @@ impl Screen for MovieDetailScreen {
         }
         match result {
             OverlayResult::Chosen(Action::PlayFrom) => self.copies.play_from_menu(ctx),
+            OverlayResult::Chosen(Action::Digit(super::copies::SAME_TITLE)) => {
+                if let Some(item) = self.item(ctx) {
+                    let name = self.title(ctx);
+                    crate::ui::copies::same_title_picker(ctx, item, &name);
+                }
+            }
             OverlayResult::Unlocked(Action::Activate) | OverlayResult::Chosen(Action::Activate) => self.play(ctx, true),
             OverlayResult::Unlocked(Action::ActivateAlt) | OverlayResult::Chosen(Action::ActivateAlt) => self.play(ctx, false),
             OverlayResult::Unlocked(Action::ToggleLock) => self.item_action(ctx, Action::ToggleLock),
@@ -519,7 +565,7 @@ impl Screen for MovieDetailScreen {
         let playing = ctx.player.playable.as_ref().is_some_and(|p| self.id.is_some_and(|id| p.media == MediaRef::Movie(id)));
         let buttons = self.buttons(ctx);
         let resume_at = self.resume_at(ctx);
-        let fav = self.item(ctx).is_some_and(|i| ctx.favs.is_fav(&i));
+        let fav = self.favourite(ctx);
         let watched = self.watched();
         let locked = m.as_ref().map(|m| m.locked).or(summary.as_ref().map(|s| s.locked)).unwrap_or(false);
         // several copies: the Play button names the playlist it plays from
@@ -962,6 +1008,124 @@ pub(crate) mod tests {
         app.result(OverlayResult::Unlocked(Action::PlayFrom));
         h.run_steps(1);
         assert!(has_label(&h, "Play · Bravo"), "picked after the PIN");
+    }
+
+    /// P3 (DESIGN §29.15): on the page of a combined title ★ / ✓ / hide / lock / rename act
+    /// like on its stack card — ★ shows for a favourite copy and removing it takes every copy
+    /// out, with an Undo that puts them back; ✓ marks the copy Play uses and unmarking forgets
+    /// every copy's progress (Undo restores the rows); hide and lock cover every copy; F2
+    /// renames every copy. A page opened for one copy on purpose keeps acting on that copy.
+    #[test]
+    fn a_combined_pages_actions_cover_every_copy_with_undo() {
+        let (mut t, one) = rig();
+        let (a, b, alpha, bravo) = seed(&mut t, |c| {
+            let a = testkit::source(c, "Alpha")?;
+            let b = testkit::source(c, "Bravo")?;
+            let alpha = testkit::named_movies(c, a, &[("EN ★ Dune - 2021", "Dune")])?[0];
+            let bravo = testkit::named_movies(c, b, &[("EN - Dune (2021)", "Dune")])?[0];
+            let list = crate::store::user::default_fav_list(c)?;
+            let fav = ItemRef { source: b, kind: ItemKind::Movie, key: ItemKey("m3u:named0000".into()) };
+            crate::store::user::set_favourite(c, list, &fav, true, 1)?;
+            Ok((a, b, alpha, bravo))
+        });
+        let copy = |s: SourceId| ItemRef { source: s, kind: ItemKind::Movie, key: ItemKey("m3u:named0000".into()) };
+        type H = egui_kittest::Harness<'static, testkit::App<MovieDetailScreen>>;
+        let reader = |h: &H| h.state().t.services().store.reader().unwrap();
+        let fav_rows = |h: &H| {
+            let r = reader(h);
+            let n = |s: SourceId| -> i64 { r.query_row("SELECT count(*) FROM fav_item WHERE source_id = ?1", [s.0], |r| r.get(0)).unwrap() };
+            [a, b].into_iter().filter(|s| n(*s) > 0).collect::<Vec<_>>()
+        };
+        let mut h = harness(t, one, MovieDetailScreen::default(), egui::vec2(1400.0, 900.0));
+        h.state_mut().enter(Route::MovieDetail(alpha));
+        until(&mut h, "the copies", |h| has_label(h, "COPIES · 2"));
+        assert!(has_label(&h, "Favourite"), "Bravo's copy is a favourite: the title is");
+        // ★ off: every copy leaves Favourites; Undo puts Bravo's back
+        h.state_mut().act(Action::ToggleFavourite);
+        let toast = h.state_mut().undo_toast().expect("an Undo toast");
+        assert_eq!(toast.text, "Removed from Favourites in Alpha and Bravo");
+        assert!(fav_rows(&h).is_empty());
+        let Some((_, undo)) = toast.action else { unreachable!() };
+        h.state_mut().act(undo);
+        until(&mut h, "Bravo's favourite back", |h| fav_rows(h) == vec![b]);
+        // ✓: the copy Play uses (Alpha's) is marked; the button follows
+        h.state_mut().t.toasts.clear();
+        h.state_mut().act(Action::MarkWatched);
+        until(&mut h, "Alpha's copy watched", |h| progress_row(&h.state().t, "m3u:named0000").is_some_and(|p| p.finished));
+        until(&mut h, "the button follows", |h| has_label(h, "Watched"));
+        let bravo_progress = || {
+            let p = WatchProgress {
+                item: copy(b),
+                position_s: 300.0,
+                duration_s: Some(6000.0),
+                updated_at: 2,
+                finished: false,
+                title: "Dune".into(),
+                fingerprint: Default::default(),
+            };
+            move |c: &mut rusqlite::Connection| crate::store::user::save_progress(c, &p)
+        };
+        seed(&mut h.state_mut().t, bravo_progress());
+        // ✓ off: every copy's progress is forgotten, Undo restores both rows
+        h.state_mut().act(Action::MarkWatched);
+        let toast = h.state_mut().undo_toast().expect("an Undo toast");
+        assert_eq!(toast.text, "Marked unwatched in Alpha and Bravo");
+        let progress_of = |h: &H, s: SourceId| crate::store::user::progress(&reader(h), &copy(s)).unwrap();
+        assert!(progress_of(&h, a).is_none() && progress_of(&h, b).is_none());
+        let Some((_, undo)) = toast.action else { unreachable!() };
+        h.state_mut().act(undo);
+        until(&mut h, "both rows back", |h| {
+            progress_of(h, a).is_some_and(|p| p.finished) && progress_of(h, b).is_some_and(|p| p.position_s == 300.0)
+        });
+        // F2: rename every copy
+        h.state_mut().nav();
+        h.state_mut().act(Action::Rename);
+        let nav = h.state_mut().nav();
+        assert!(
+            matches!(nav.as_slice(), [NavRequest::Open(OverlayRequest::Rename(r))]
+                if matches!(&r.target, crate::ui::overlays::RenameTarget::Copies { items } if items.len() == 2)),
+            "{nav:?}"
+        );
+        // Ctrl+L (PIN set, session open): every copy locked
+        let mut cfg = (*h.state().t.config).clone();
+        cfg.parental = crate::config::ParentalConfig {
+            enabled: true,
+            pin_salt: Some("s".into()),
+            pin_hash: Some(crate::ui::parental::hash_pin("1234", "s")),
+            relock_min: 0,
+            ..Default::default()
+        };
+        h.state_mut().t.config = std::sync::Arc::new(cfg);
+        let app = h.state_mut();
+        let p = app.t.config.parental.clone();
+        assert!(app.t.parental.unlock("1234", &p));
+        h.state_mut().t.toasts.clear();
+        h.state_mut().act(Action::ToggleLock);
+        let ov = |h: &H, s: SourceId| crate::store::user::item_override(&reader(h), &copy(s)).unwrap().unwrap_or_default();
+        until(&mut h, "both copies locked", |h| ov(h, a).locked && ov(h, b).locked);
+        let toast = h.state_mut().undo_toast().expect("an Undo toast");
+        assert_eq!(toast.text, "Locked Dune in Alpha and Bravo");
+        // Ctrl+H: every copy hidden, the toast names both playlists
+        h.state_mut().t.toasts.clear();
+        h.state_mut().act(Action::ToggleHidden);
+        let toast = h.state_mut().undo_toast().expect("an Undo toast");
+        assert!(toast.text.starts_with("Hid Dune in Alpha and Bravo"), "{}", toast.text);
+        until(&mut h, "both copies hidden", |h| ov(h, a).hidden && ov(h, b).hidden);
+        let Some((_, undo)) = toast.action else { unreachable!() };
+        h.state_mut().act(undo);
+        until(&mut h, "unhidden", |h| !ov(h, a).hidden && !ov(h, b).hidden);
+        // Bravo's copy opened on purpose (fanned out, its playlist's list): F2 renames it alone
+        h.state_mut().t.with_ctx(|ctx| crate::ui::stacks::open_copy(ctx, VodKind::Movie(bravo)));
+        h.state_mut().nav();
+        h.state_mut().enter(Route::MovieDetail(bravo));
+        h.run_steps(2);
+        h.state_mut().act(Action::Rename);
+        let nav = h.state_mut().nav();
+        assert!(
+            matches!(nav.as_slice(), [NavRequest::Open(OverlayRequest::Rename(r))]
+                if r.target == crate::ui::overlays::RenameTarget::Item { item: copy(b) }),
+            "{nav:?}"
+        );
     }
 
     #[test]

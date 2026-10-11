@@ -292,18 +292,8 @@ impl SearchOverlay {
             match action {
                 Action::ToggleFavourite => crate::ui::copies::toggle_favourite(ctx, &plan),
                 Action::ToggleHidden => crate::ui::copies::hide(ctx, &plan, &name),
-                Action::Rename => ctx.open(crate::ui::OverlayRequest::Rename(crate::ui::overlays::RenameSpec {
-                    title: "Rename every copy".into(),
-                    initial: name.clone(),
-                    target: crate::ui::overlays::RenameTarget::Copies { items: plan.refs() },
-                })),
-                _ => {
-                    let all = st::all(ctx.lib, movies);
-                    let on = !plan.copies.iter().all(|c| all.get(c.item as usize).is_some_and(|v| v.locked));
-                    if kit::may_change_locks(ctx) {
-                        crate::ui::copies::set_locked(ctx, &plan, on);
-                    }
-                }
+                Action::Rename => crate::ui::copies::rename_dialog(ctx, &plan, &name),
+                _ => crate::ui::copies::toggle_lock(ctx, &plan, movies),
             }
             return OverlayOutcome::Keep;
         }

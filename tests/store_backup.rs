@@ -155,7 +155,7 @@ fn populate(s: &Store, creds: &Creds) -> Fixture {
 
         for (src, chans, movies) in [
             (xt, vec![chan("xt:live:1", "BBC One"), chan("xt:live:2", "ITV")], vec![movie("xt:vod:7", "Heat")]),
-            (m3u, vec![chan("m3u:aa", "Arte")], vec![]),
+            (m3u, vec![chan("m3u:aa", "Arte")], vec![movie("m3u:mv1", "Heat (playlist)")]),
         ] {
             let imp = import::begin_catalogue(c, src, NOW)?;
             let groups = [
@@ -243,6 +243,8 @@ fn populate(s: &Store, creds: &Creds) -> Fixture {
         epg::set_manual_mapping(c, &ch(m3u, "m3u:aa"), guide, "arte.de")?;
         // "Not the same title" (DESIGN §29.11): the split survives a restore
         tuner::store::titles::set_split(c, &mv(xt, "xt:vod:7"), true, NOW + 4)?;
+        // "Same title as…" (DESIGN §29.16): the join (both copies, one group) survives too
+        tuner::store::titles::join(c, &mv(xt, "xt:vod:7"), &mv(m3u, "m3u:mv1"), NOW + 5)?;
         Ok(Fixture { xt, m3u })
     })
 }
@@ -289,7 +291,8 @@ fn export_wipe_restore_round_trip_is_lossless() {
     assert_eq!((b1.item_overrides.len(), b1.group_overrides.len(), b1.progress.len()), (2, 1, 1));
     assert_eq!((b1.history.len(), b1.reminders.len(), b1.manual_mappings.len()), (3, 1, 1));
     assert_eq!(b1.manual_mappings[0].epg_source_name, "My guide");
-    assert_eq!((b1.title_links.len(), b1.title_links[0].action.as_str()), (1, "split"));
+    let actions: Vec<(&str, Option<i64>)> = b1.title_links.iter().map(|t| (t.action.as_str(), t.group)).collect();
+    assert_eq!(actions, [("join", Some(1)), ("join", Some(1)), ("split", None)]);
     assert!(b1.fav_items.iter().all(|e| !e.fingerprint.norm_name.is_empty()), "fingerprints travel with the data");
 
     // file round trip, written 0600

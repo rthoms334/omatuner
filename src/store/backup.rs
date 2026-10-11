@@ -84,8 +84,8 @@ pub struct Backup {
     pub history: Vec<HistoryEntry>,
     pub reminders: Vec<Reminder>,
     pub manual_mappings: Vec<BackupManualMapping>,
-    /// "Not the same title" splits and "Always play from" pins (DESIGN §29.11; absent in
-    /// backups from before P2).
+    /// "Not the same title" splits, "Always play from" pins (DESIGN §29.11; absent in backups
+    /// from before P2) and "Same title as…" joins (§29.16, P3).
     #[serde(default)]
     pub title_links: Vec<BackupTitleLink>,
     /// The category rule every playlist shares (DESIGN §28.3; absent in backups from before it
@@ -100,9 +100,12 @@ pub struct Backup {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BackupTitleLink {
     pub item: crate::model::ItemRef,
-    /// `split` or `pin`.
+    /// `split`, `pin` or `join`.
     pub action: String,
     pub at: Timestamp,
+    /// A join's group (copies with the same group stack together).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,7 +220,7 @@ pub fn export(conn: &Connection, opts: BackupOptions, config_toml: Option<String
         manual_mappings,
         title_links: crate::store::titles::links(conn)?
             .into_iter()
-            .map(|l| BackupTitleLink { item: l.item, action: l.action.as_str().to_owned(), at: l.at })
+            .map(|l| BackupTitleLink { item: l.item, action: l.action.as_str().to_owned(), at: l.at, group: l.group })
             .collect(),
         shared_category_filter: crate::store::sources::shared_category_filter(conn)?,
         config: config_toml,
@@ -454,6 +457,9 @@ pub fn restore(conn: &mut Connection, b: &Backup, mode: RestoreMode) -> Result<R
         )?;
     }
 
+    // a backup's join groups are numbered after the groups already here (a merge never
+    // combines its groups with unrelated ones)
+    let group_base: i64 = tx.query_row("SELECT COALESCE(max(join_group), 0) FROM title_link", [], |r| r.get(0))?;
     for t in &b.title_links {
         let Some(item) = remap(&t.item) else { continue };
         let kind = match item.kind {
@@ -461,12 +467,18 @@ pub fn restore(conn: &mut Connection, b: &Backup, mode: RestoreMode) -> Result<R
             crate::model::ItemKind::Series => "series",
             _ => continue,
         };
+        let group = t.group.filter(|_| t.action == "join").map(|g| group_base + g);
+        if t.action == "join" && group.is_none() {
+            continue;
+        }
         rows += tx.execute(
-            "INSERT INTO title_link(source_id, kind, item_key, action, at) SELECT ?1, ?2, ?3, ?4, ?5
-             WHERE ?4 IN ('split', 'pin') ON CONFLICT(source_id, kind, item_key, action) DO NOTHING",
-            params![item.source, kind, item.key.as_str(), t.action, t.at],
+            "INSERT INTO title_link(source_id, kind, item_key, action, at, join_group) SELECT ?1, ?2, ?3, ?4, ?5, ?6
+             WHERE ?4 IN ('split', 'pin', 'join') ON CONFLICT(source_id, kind, item_key, action) DO NOTHING",
+            params![item.source, kind, item.key.as_str(), t.action, t.at, group],
         )?;
     }
+    // a merge whose join rows met joins already here leaves groups of one
+    crate::store::titles::prune_joins(&tx)?;
 
     // ---- progress (newer wins), history, reminders
     for p in &b.progress {
