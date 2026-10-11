@@ -251,6 +251,7 @@ Every row is one work package's territory (§24.2 is the authoritative ownership
 | `ui/screens/{home,movies,series,movie_detail,series_detail,settings,onboarding,epg_mapping,logs}.rs`, `ui/widgets/poster.rs`, `ui/overlays/{search,resume}.rs` | WP-12 | Home, VOD, settings, onboarding, search UI, PIN UI, logs, EPG mapping. |
 | `theme/**`, `fonts.rs` | WP-01 | Theme parsing/tokens/egui mapping (implemented core), live reload, fonts + fallbacks + RTL helper. |
 | `ui/scope.rs`, `ui/widgets/scope_bar.rs`, `ui/overlays/playlists.rs` | §29 | Which playlist a screen shows: eligibility, the stored scope, look-alikes and free colours; the scope bar / button / stripe; the Alt+P picker and a tab's menu. |
+| `agent/**` (`proto`, `shared`, `server`, `tools`, `client`, `mcp`) | §30 | Agent control: IPC v2 protocol, the running app's handler, the `tuner mcp` stdio MCP server and its tools. |
 | `devshot.rs`, `examples/demo_profile.rs`, `scripts/screenshots.sh` | dev tooling | README screenshots: env-only capture driver, made-up demo profile, capture script (§23.1). |
 
 Cross-module contracts worth repeating:
@@ -4826,3 +4827,329 @@ never wraps onto Delete and explicit titles counted, not named (`overlays::delet
 an explicit join partner unnamed in Settings ▸ Hidden (`settings`); origins refused, progress
 read at Delete, a join of one dropped (`store_catalogue`); 0007's re-run keeps `join_group`
 (`migrations`).
+
+---
+
+## 30. Agent control (MCP): use Tuner from Claude
+
+"Touring cars is on" → Claude finds the race in the guide and Tuner switches to it; "something
+light under 2 hours" → Claude browses the library, picks a film and starts it. The user prompts
+Claude Code in a terminal; Claude talks to Tuner through an MCP server that the `tuner` binary
+itself provides.
+
+### 30.1 Decisions
+1. **`tuner mcp`** is an MCP server over stdio (`claude mcp add tuner -- tuner mcp`). It is a
+   thin bridge: it never opens the database. Every answer comes from the **running** Tuner over
+   the existing IPC socket, so it uses the app's in-memory library and guide and honours every
+   visibility rule the screens honour.
+2. **Hand-rolled protocol, no `rmcp`.** Checked on crates.io (2026-10-11): `rmcp` 3.5.1 (the
+   official SDK, MSRV 1.88; pinnable at most to 3.4.1 under the two-week rule) is mature but
+   would add `schemars` 1, `chrono`, `uuid`, `rmcp-macros`/`pastey`, `indexmap` and the
+   `tokio/io-std` feature to a desktop binary, and has had three major versions in a year. We
+   need five methods of a JSON-RPC protocol that has been stable since 2024-11-05
+   (`initialize`, `notifications/initialized`, `ping`, `tools/list`, `tools/call`), and want
+   hand-written schemas and descriptions anyway. ~300 lines of `serde_json`, no `Cargo.toml`
+   change (frozen, and three branches are in flight). Revisit if we ever need resources,
+   prompts, sampling or the HTTP transport.
+3. **IPC v2** on the same socket: a versioned request/response line next to the v1 handoff.
+   Same-uid peers only (`SO_PEERCRED`), 64 KiB / 5 s per connection, unchanged.
+4. **Answers off the UI thread.** The UI thread may not run while the window sits on a hidden
+   workspace (§11.1), so the handler runs on the tokio runtime with the library snapshot the app
+   publishes, its own store readers, the player handle and the parental state computed at
+   request time. Only `play` needs the UI (PIN prompt, zap list, resume rules): the handler
+   validates, then sends an `AppEvent` and raises the window.
+5. **Launch if needed.** Every tool except `status` and `control` starts Tuner when it isn't
+   running (detached) and waits for it; `status` says `running: false`, `control` says it isn't
+   running.
+6. **Auto-switch** is a reminder whose action is "switch": at the programme's start Tuner plays
+   the channel by itself, after a "Switching in 10 s · Cancel" toast. No migration: the marker
+   lives in `reminder.lead_s` (`Reminder::SWITCH_LEAD` = −1; older builds read it as "default
+   lead" and just notify). `user_version` is positional and `feat/p3-copies` holds 0007.
+7. **Guardrails first** (§30.6): nothing parental control hides, ever, in any field or count;
+   locked items are flagged and the PIN is only ever typed into Tuner; no URLs, logins or
+   provider internals in any result; actions logged by ref, not title.
+
+### 30.2 `tuner mcp` (`agent::mcp`, `agent::tools`, `agent::client`)
+* `main` dispatches `Cli::is_mcp()` right after resolving the paths (`tuner mcp`, and a lone
+  `mcp` word after global flags — `tuner --debug mcp`, which clap reads as an input file): no
+  config load, no instance lock, no `logging::init` (that writes `tuner.log`, which the running
+  app owns). Logging goes to stderr only (WARN; DEBUG with `--debug`) — Claude Code keeps an MCP
+  server's stderr in its log. stdout carries protocol lines only. `--profile-dir` selects the
+  profile's socket (tests, second profiles) and is passed on when launching.
+* JSON-RPC 2.0, one message per line. `initialize`: `protocolVersion` = the client's if it is in
+  `tools::PROTOCOL_VERSIONS` (2025-11-25, 2025-06-18, 2025-03-26, 2024-11-05), else the newest;
+  `capabilities: {tools: {listChanged: false}}`; `serverInfo: {name: "tuner", title: "Tuner",
+  version}`; `instructions` = `tools::INSTRUCTIONS` (the workflow: guide_search → play /
+  schedule_switch; categories → browse → details → play; refs are opaque; the PIN rule).
+  Notifications are ignored; `ping` → `{}`; unknown method → −32601; unparsable → −32700; a
+  line over 1 MiB → −32600 (not buffered whole). Requests are handled in order.
+* `tools/list` → `tools::tools()` (name, title, description, `inputSchema`, `annotations`:
+  `readOnlyHint`, `destructiveHint: false`, `idempotentHint`, `openWorldHint: false`). No
+  `outputSchema` (results are documented below; `structuredContent` is sent regardless).
+* `tools/call` → `proto::Call::from_tool(name, arguments)`: the arguments are the IPC params,
+  unchanged. A schema mismatch or an IPC error is a **tool error result** (`isError: true`,
+  text `"<code>: <message>"`), not a JSON-RPC error, so the model can correct itself. Success:
+  `{content: [{type: "text", text: <compact result JSON>}], structuredContent: <result>,
+  isError: false}`.
+* `client::Client::call(call, launch)`: one connection per request, 6 s timeout, reply ≤ 1 MiB.
+  No socket / refused + `launch` → `Launcher::launch` (production `ExeLauncher`: this executable,
+  `--profile-dir` if given, own process group, stdio `/dev/null`, so it survives Claude and
+  never writes into the protocol stream), then poll the socket every 100 ms for ≤ 15 s;
+  `ErrorCode::Loading` replies are retried every 250 ms for ≤ 20 s. A reply without `"v"` (a
+  pre-v2 Tuner answering `bad request`) → "restart Tuner to update it". Status without Tuner →
+  `{"running": false}` as a normal result.
+* As built (bridge track): an unknown tool name is JSON-RPC −32602 (the spec's example), bad
+  arguments stay a tool error. Client failures are tool errors with their own codes
+  (`not_running`, `did_not_start`, `loading`, `too_old`, `connection_failed`). A result after a
+  launch carries a second text block "Tuner wasn't running, so it was started."; `status` from a
+  running Tuner gets `running: true`. The bridge also withholds any result containing `"://"`
+  (`internal`), behind the server's own check. `Launcher::failed` lets the wait end early: the
+  `ExeLauncher` reaps its child on a thread and a non-zero exit before the socket appears is
+  `did_not_start` with the exit status, at once (exit 0 = it handed off to an instance starting
+  at the same time: keep waiting). After a package upgrade `/proc/self/exe` ends in
+  " (deleted)": the launcher runs the new file at that path. `--profile-dir` is made absolute
+  before it is passed on.
+
+### 30.3 IPC v2 protocol (`agent::proto`, implemented in the skeleton)
+```text
+→ {"v":2,"id":7,"method":"guide_search","params":{"query":"touring car"}}
+← {"v":2,"id":7,"ok":true,"result":{"programmes":[…],"truncated":false}}
+← {"v":2,"id":7,"ok":false,"error":{"code":"not_started","message":"…"}}
+```
+* One line per connection, newline-terminated. `ipc.rs` peeks `"v"`: absent → v1
+  `IpcRequest` (unchanged); 2 → `AgentService::handle`; other → `unsupported`. v2 requests never
+  send `AppEvent::Ipc` and never raise the window by themselves.
+* `params` use `deny_unknown_fields`; every numeric limit is clamped by the handler; free text ≤
+  200 chars (`proto::MAX_TEXT`).
+* Error codes: `bad_request`, `not_found` (also for anything concealed — indistinguishable on
+  purpose), `unavailable`, `not_started`, `loading`, `rate_limited`, `busy`, `unsupported`,
+  `internal`.
+* **Refs** (`proto::AgentRef`): `channel:2:xt:live:1234`, `movie:3:m3u:0123…`,
+  `series:2:xt:series:9`, `episode:2:xt:ep:77` (`<kind>:<source>:<item key>`: M3U movie and
+  channel keys look alike, so the kind is part of the ref); `programme:2:xt:live:1234@<start>`
+  (the channel and the programme's start as shown on it, tvg-shift applied — stable across EPG
+  re-imports, unlike `programme.id`). A bare `2:xt:live:1234` (`--play`) reads as a channel.
+* **Times**: results `2026-10-11T21:00+01:00` (local, offset); params accept `now`, `HH:MM`
+  (today), local `YYYY-MM-DDTHH:MM`, RFC 3339, unix seconds (`proto::parse_when`).
+
+### 30.4 The app side (`agent::server`, `agent::shared`, `app.rs`)
+* `Services::agent: Arc<AgentShared>`; `start_integrations` builds the `AgentHandler` (shared,
+  store, config, player handle, bus, jobs) and starts the IPC server with it.
+* The app publishes `AgentShared::publish_library(&self.lib)` wherever `TunerApp::lib` is
+  replaced (one helper; the returned old snapshot goes through `release`, never dropped on the
+  UI thread) and `set_unlocked_at(parental.unlocked_at())` after PIN entry / lock (every frame in
+  `sync_explicit` is fine — it's a mutex store).
+* `AgentShared::parental(cfg)` → `ParentalView { unlocked, hides_explicit, pin_active }` from the
+  published unlock instant and the live config: a session that relocked by timer while the UI
+  slept counts as locked.
+* Readers: a small pool (≤ 3) of lazily opened store readers behind a mutex; every query runs on
+  `spawn_blocking` inside `HANDLER_BUDGET` (4 s).
+* `play`: resolve the ref against the snapshot (fallback: the DB like `channel_for`), apply the
+  guards, compute the outcome (`pin_required` when locked and `!unlocked`), send
+  `AppEvent::Agent(AgentCommand::Play(AgentPlay { target, from_start }))`, call
+  `hypr::focus_self()`, reply. The app's `on_agent` plays exactly like the UI: channels via
+  `play_channel(id, PlayOrigin::Cli)` (PIN prompt, zap list, fullscreen); catch-up like
+  `live::play_catchup`; movies / episodes with `PlayRequest { resume: !from_start }` (copies:
+  `ui::copies` play order and fallback, as Enter on a card); series → next episode over its
+  copies (`store::copies::next_episode`).
+* `control` → `PlayerCommand::{SetPause, TogglePause, Stop, SetVolume, ToggleMute}` (mute /
+  unmute only toggle when needed); `status` ← `PlayerHandle::snapshot()` + pending switches.
+
+### 30.5 Tools (`agent::tools` — schemas there are the contract; params = `proto` structs)
+| Tool | Params | Result | Notes |
+|---|---|---|---|
+| `guide_search` | `query`, `from?`, `to?`, `include_past?` (true), `limit?` (20, ≤ 50) | `{programmes: [ProgrammeOut], truncated}` | `store::epg::search` (FTS; live, upcoming, past order) fetched wider (≤ 200) then time-filtered; one row per programme with the best visible channel (favourite, unlocked, best quality) and `also_on`. |
+| `whats_on` | `at?` (now), `channel?`, `group?`, `favourites_only?`, `limit?` (30, ≤ 100) | `{at, programmes, truncated}` | Channels with a guide, favourites → recently watched → display order, scan capped at 1 500 channels (`truncated`); `channel` matches name words or number. |
+| `search` | `query`, `kinds?`, `limit?` (20, ≤ 50) | `{results: [ItemOut]}` | `nucleo-matcher` over the snapshot's visible names (like `search::collect_items`); one row per stack. Not scoped (like the Search card). |
+| `details` | `ref` | `DetailsOut` | Movie/series: lazy `LoadMovieDetails` / `LoadSeriesDetails` when not loaded, waits ≤ 3 s, else `details_pending`. Channel: now/next/5 upcoming. Programme: description, categories, catch-up. Locked + session locked → name + `locked` only. |
+| `categories` | `kind`, `playlist?` | `{categories: [CategoryOut]}` | Visible groups (not hidden, non-empty), All-scope playlists (`in_all`). |
+| `browse` | `kind`, `group?`, `playlist?`, `unwatched?`, `max_minutes?`, `min_rating?`, `year_from?`, `year_to?`, `sort?`, `limit?`, `offset?` | `{items: [ItemOut], total}` | All scope (`ScopeFilter` for All: `in_all` off excluded unless nothing is left) or the named playlist; stacks collapsed; unknown runtimes after known ones under `max_minutes`. |
+| `continue_watching` | `limit?` (10, ≤ 30) | `{items: [ContinueItem]}` | `store::user::continue_watching`, every playlist (a user list), `Library::conceals` + live parental check. |
+| `favourites` | `kind?`, `list?`, `limit?` (50, ≤ 100) | `{lists: [FavListOut]}` | `load_favs` on a handler reader; via `by_ref` / VOD lookups, so hidden and concealed items drop out. |
+| `status` | — | `StatusOut` (+ `running: false` from the bridge) | Never launches. |
+| `play` | `ref`, `from_start?` | `PlayOut {outcome: playing / catch_up / pin_required, ref, title, resume_at_min?, message}` | Programme: live → channel (with `from_start` + catch-up → restart from the archive); past → catch-up if `in_window` else `unavailable`; upcoming → `not_started`. |
+| `schedule_switch` | `ref` (programme, or channel + `at`) | `SwitchOut {id, channel, title?, start, warn_at}` | Not for something already started (`unavailable`: use play); ≤ 20 pending switches; an existing reminder of that programme becomes a switch. |
+| `cancel_switch` | `id` | `{cancelled}` | Only switch reminders. |
+| `control` | `action` (pause, resume, toggle_pause, stop, volume, mute, unmute), `value?` | `StatusOut` | Never launches; volume clamped 0–130. |
+
+Example flows: "touring cars is on" → `guide_search{query:"touring car"}` → a `live` hit →
+`play{ref}`; an `upcoming` one → "It starts at 13:15 on ITV4 — want me to switch then?" →
+`schedule_switch{ref}`. "Something light under 2 hours" → `categories{kind:"movie"}` →
+`browse{kind:"movie", group:"comedy", max_minutes:120, unwatched:true, sort:"random"}` →
+`details` → `play`. "What's on BBC One at 9" → `whats_on{channel:"BBC One", at:"21:00"}`.
+
+### 30.6 Guardrails
+* **Visibility = the screens' rules.** Results only contain what the snapshot shows: hidden
+  channels / groups, the category filter (§28), explicit content while hidden (§20.3), stacks
+  (one row per title, §29.11), `in_all` for provider lists (`categories`, `browse`). The handler
+  additionally conceals the snapshot's explicit items when `ParentalView::hides_explicit` (a
+  snapshot built while unlocked, relocked since) and checks DB rows with `Library::conceals`
+  semantics under the live view. Concealed things are `not_found`, never "locked", never counted
+  (`total`, `count`, `truncated`, `other_copies` are computed after filtering), never named in
+  errors.
+* **Locked ≠ hidden.** Locked items are returned with `locked: true` (like the dimmed rows);
+  their details are withheld while the session is locked; `play` sends the play request and the
+  app shows its PIN prompt (`outcome: pin_required`). No tool takes a PIN; the descriptions and
+  the instructions tell the model never to ask for it.
+* **No URLs, logins or internals.** Result structs have no URL fields (no logos, posters,
+  stream or guide URLs, no provider ids, no `programme.id`); every reply is checked on the wire
+  (`"://"` → replaced by `internal`, logged at WARN) and passed through `redact`. Player errors
+  are reported as the kind (`http-forbidden`), never the provider's message.
+* **Peers and limits.** Same-uid only (existing). At most 4 agent requests in flight (`busy`),
+  queries ≤ 20/s (burst 40), actions ≤ 2/s (burst 5) (`rate_limited`); limits clamped; text ≤ 200
+  chars; reply ≤ 1 MiB.
+* **Logging.** Actions at INFO by method and ref only (`agent: play channel:2:xt:live:1 →
+  pin_required`), queries at DEBUG without their query text at INFO+; never a title.
+
+### 30.7 Launch, loading, old instances
+* No instance: `ExeLauncher` → wait for the socket (≤ 15 s; a background `--refresh` holding the
+  lock shows up as "didn't start" with its reason) → `loading` until the first library build
+  (≤ 20 s). A started-by-MCP Tuner opens its normal start screen on the current workspace.
+* An instance from before v2 → `TooOld` ("restart Tuner to update it").
+
+### 30.8 Auto-switch reminders (`platform::notify`, `store::user`, `app.rs`)
+* Row: a reminder with `lead_s = Reminder::SWITCH_LEAD`; `add_reminder` as today (unique per
+  channel + start); `schedule_switch` on a programme that already has a notify reminder turns it
+  into a switch (`store::user::set_reminder_switch`).
+* Scheduler: switch reminders run whatever `reminders.enabled` says (the scheduler starts
+  always; disabled notification reminders are skipped, not switch ones). At `start −
+  SWITCH_WARN_S` → `PlatformEvent::SwitchSoon` (the app toasts "Switching to ‹channel› in 10 s ·
+  ‹programme›" with `("Cancel", Action::CancelSwitch(id))`, 10 s); at `start` →
+  `hypr::focus_self()` + `PlatformEvent::SwitchNow` → the app plays the channel
+  (`play_channel(.., PlayOrigin::Reminder)`: PIN rules apply) unless it is already playing it;
+  the row becomes `Fired`. Cancel → row removed, scheduler refreshed. Tuner closed at the start:
+  on the next start a switch up to 15 min late still happens, older ones are dismissed
+  silently. Explicit channels' switches wait while hidden, like their notifications.
+* Settings ▸ Reminders lists switches with their own glyph ("Switch") and Delete cancels them.
+
+### 30.9 Skeleton API (branch `mcp/base`)
+Implemented: `agent::proto` (all wire types, params, results, `AgentRef`, `parse_when`,
+`fmt_time`), `agent::shared` (`AgentShared`, `ParentalView`), `agent::tools` (13 tools,
+`INSTRUCTIONS`, `PROTOCOL_VERSIONS`), `agent::{AgentCommand, AgentPlay, PlayTarget}`,
+`ipc::IpcServer::start_with_agent` + v2 dispatch, `cli::Command::Mcp` + `main` dispatch,
+`ParentalSession::{with_unlocked_at, unlocked_at}`, `Reminder::{SWITCH_LEAD, SWITCH_WARN_S,
+switches}`, `PlatformEvent::{SwitchSoon, SwitchNow}`, `Action::CancelSwitch`,
+`AppEvent::Agent`, `Services::agent` + the handler wired into the IPC server.
+Safe defaults: `AgentHandler::handle` → `unsupported` for every method; the app ignores
+`AppEvent::Agent` and `Switch*`. `todo!("MCP-bridge")`: `client::{ExeLauncher::launch,
+Client::call}`, `mcp::{main, serve}` (only `tuner mcp` reaches them).
+
+**App side (implemented, branch `mcp/app`).** Modules: `agent::query` (the read-only tools over
+a `Q` = effective snapshot + reader + `ParentalView` + clock + config), `agent::act` (what
+`play` / `schedule_switch` / `cancel_switch` decide, `status`), `agent::guard` (in-flight and
+token-bucket limits, the reply check), `agent::server` (dispatch, reader pool, budget, the
+lazy-details wait, INFO logs of actions by ref). Notes and deviations from the text above:
+* The app publishes the snapshot and the unlock instant every frame (`TunerApp::
+  publish_for_agent`, after each `sync_explicit`); a replaced snapshot goes to the memory
+  maintenance thread. The handler conceals explicit content of a snapshot built while unlocked
+  with `Library::hiding_explicit` (cached per `generation`) when the session relocked since.
+* `whats_on` covers the All-playlists scope (`in_all`) unless a channel is named; `guide_search`
+  merges a programme's rows by (title, start as shown) across the channels showing it (≤ 10
+  `also_on`); `locked` in results means "needs the PIN now" (locked and the session locked).
+* Provider text (titles, descriptions, plots, cast…) has its links replaced by `[link]`
+  (`query::clean`): EPG descriptions often carry a web address, which the wire check would
+  turn into an `internal` error for the whole answer. The wire check stays the backstop.
+* `play` of an Xtream series whose episodes aren't loaded submits `LoadSeriesDetails`, waits
+  ≤ 3 s and decides again (`unavailable` if still loading). The app plays agent targets with
+  `PlayOrigin::Cli` (channels, catch-up) / `Fullscreen` (titles, as Enter on a card); a locked
+  title or catch-up waits in `TunerApp::pending_agent` behind `Pin { then: OpenPlayer }`.
+* The reminder scheduler always runs (`ReminderScheduler::start(.., notify, ..)`): notification
+  reminders are skipped while `reminders.enabled` is off, switches never. Its `ReminderWaker`
+  is handed to `AgentShared` so a switch written by the handler is picked up without a frame.
+  Cancel (`Action::CancelSwitch`) removes the row and remembers the id, so a `SwitchNow`
+  already on its way is ignored.
+
+**Integration (branch `feat/mcp`, after review).**
+* Parental state before events: `logic` runs `sync_explicit` before draining the event queue
+  too, so a `SwitchNow`, an agent `play` or a `--play` arriving in the frame the session relocked
+  by its timer meets the hiding snapshot. `on_switch_soon` / `on_switch_now` also refuse a
+  channel the store marks explicit while explicit content is hidden (`TunerApp::switch_hidden`).
+* `Q::conceals` = the snapshot's `conceals` or, while explicit content is hidden, the store's
+  `item_explicit` (the snapshot's explicit index has no episodes). `status` uses it for
+  `now_playing` (an explicit episode still playing after a relock with no frame names nothing)
+  and for the switches it lists; `cancel_switch` of a concealed switch is `not_found`.
+* Every provider name in a result (channel, title, group, playlist, list, category, the names
+  inside `play` / error messages) goes through `query::clean`, so one name holding a web address
+  doesn't turn a whole answer into `internal`.
+* `guide_search` and `search` prefer channels of playlists in All (`in_all`): a programme's best
+  channel is ranked by (out of All, not favourite, needs PIN, quality, id); a channel match from
+  a playlist kept out of All sorts after any other match of the same score. `guide_search` reads
+  up to 500 FTS rows before filtering; reaching that sets `truncated`.
+* `schedule_switch`: `at` more than 14 days ahead is `bad_request`; a bare `HH:MM` that has
+  passed today means tomorrow. The 20-switch limit counts rows that can still fire and its
+  message names no number (hidden switches count too). Cancelling a switch made from a reminder
+  the user had removes both (said in the tool description).
+* The instructions and the `guide_search` / `details` descriptions tell the model that provider
+  text is data, never instructions.
+* A switch cancelled outside its toast (`cancel_switch`, Settings ▸ Reminders) drops its
+  "Switching to … in N s" toast on `DataScope::Reminders` (row removed; a fired row keeps its
+  toast) and ignores a `SwitchNow` already on its way. An agent's PIN prompt clears a stale
+  `pending_locked` (a prompt dismissed earlier) and vice versa, so the PIN plays the newest
+  prompt's target. `control` waits (≤ 500 ms) for the change it asked for before answering.
+* End to end: `tests/agent_e2e.rs` runs the real `tuner mcp` binary against the real app
+  (`TunerApp` headless, frame by frame) on the demo profile: initialize → tools/list →
+  guide_search → play → status → schedule_switch → control pause.
+* The bridge connects only to a socket owned by the user in a directory only the user can enter
+  (without `XDG_RUNTIME_DIR` the socket is under the shared temp directory). The launched Tuner
+  gets no `RUST_LOG` and `/` as its working directory. `TUNER_MCP_NO_LAUNCH=1` turns launching
+  off (tests driving the real binary).
+* Answers come from what `logic` publishes: eframe runs `logic` for a window on another
+  workspace too (only `ui` is skipped), so a hidden Tuner still answers.
+
+### 30.10 Work split (two parallel tracks from `mcp/base`)
+File ownership is disjoint; a cross-track edit needs the owner's agreement and goes in the
+merge note. Lean: clippy + the tests you touched; the integrator runs the full gate.
+
+**bridge track** — owns `src/agent/{mcp,client,tools}.rs`, `src/main.rs` (the mcp branch only),
+`tests/agent_mcp.rs` (new), README "Use Tuner from Claude", MANUAL_CHECKLIST §21.
+1. `mcp::serve`: the JSON-RPC loop of §30.2 (version negotiation, errors, 1 MiB cap, ordered
+   handling); `mcp::main`: stderr logging, `Client` with `ExeLauncher`, stdin/stdout.
+2. `client`: connect / send / read (caps, timeouts), launch-if-needed, loading retries,
+   old-instance detection, `status` without Tuner → `{"running": false}`.
+3. `tools`: tune descriptions (keep them < 1 200 chars, keep names and argument shapes).
+4. Tests (`tests/agent_mcp.rs`, real protocol): `serve` over in-memory pipes — initialize
+   (known / unknown / old version), `tools/list` (13 tools, schemas), `tools/call` round trip
+   against a **real `IpcServer::start_with_agent` with a fake `AgentService`** on a temp socket
+   (ok → `structuredContent` + text; error → `isError`), bad arguments → `isError` without an IPC
+   call, unknown method −32601, garbage −32700, notifications produce no output; launch-if-not-
+   running with a fake `Launcher` that binds the server after 300 ms (call succeeds; `status`
+   and `control` don't launch); `loading` retried until ready; a v1-only server → `TooOld`; and
+   one test of the real binary (`CARGO_BIN_EXE_tuner mcp --profile-dir <tmp>`: initialize +
+   `tools/list` + `status` → `running: false`, nothing but JSON on stdout).
+
+**app track** — owns `src/agent/{server,shared}.rs` + any new `src/agent/*.rs` it adds
+(`query.rs`, `guard.rs`…), `src/ipc.rs`, `src/app.rs`, `src/services.rs`,
+`src/platform/notify.rs`, `src/store/user.rs` (switch helpers), `src/ui/screens/settings.rs`
+(Reminders glyph), `tests/agent_app.rs` (new).
+1. Handler: dispatch, readers, budget, concurrency / rate limits, reply checks (no `"://"`,
+   redact), INFO logging of actions by ref.
+2. Queries: every tool of §30.5 over the snapshot + readers, with the guards of §30.6.
+3. App: publish the snapshot and the unlock instant; `on_agent` play paths; `Switch*` events,
+   Cancel toast, `Action::CancelSwitch`.
+4. Switch reminders: scheduler changes, `set_reminder_switch`, Settings glyph.
+5. Tests (real behaviour, seeded store / app `Rig`): each tool against a seeded library
+   (channels in two playlists incl. `in_all` off, a hidden group, a category-filtered group, a
+   locked channel, an explicit group, movies stacked across playlists, a series with progress,
+   EPG with past / live / upcoming programmes incl. a tvg-shift channel); explicit content
+   absent from every tool and every count while locked, present once unlocked, absent again
+   after the relock timer **without a UI frame**; `play` of a locked channel → `pin_required` and
+   the app opens the PIN overlay (no player command until the PIN); play of past programme with
+   / without catch-up; `schedule_switch` → `SwitchSoon` toast with Cancel → `SwitchNow` plays the
+   channel (and Cancel prevents it); no `"://"` in any tool's output on a library whose every
+   row carries URLs; rate limit and `busy`.
+
+**Integration**: merge app, then bridge; extend `tests/agent_mcp.rs` with one end-to-end run of
+the real binary against a headless `Services` on a seeded temp profile (search → play →
+`status`); full gate.
+
+### 30.11 Risks
+* **The model acts on a wrong match** ("touring car" → a documentary): the tool returns
+  `airing` and channel, the instructions ask to confirm upcoming switches; `play` is undoable
+  with Backspace (last channel).
+* **Hidden content leaking through a side channel** (counts, `also_on`, errors): every count is
+  computed after filtering; the tests check counts and errors with explicit content present.
+* **Stale snapshot while hidden**: the handler's parental check doesn't depend on the UI; a
+  library rebuilt while the window was hidden arrives when the UI runs (focus on `play`).
+* **Spec drift**: the MCP subset is small and version-negotiated; unknown versions get our
+  newest and the client decides.
+* **Launch surprises**: only tools that lead to watching launch Tuner; `status` never does.

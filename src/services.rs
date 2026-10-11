@@ -11,8 +11,9 @@
 //!
 //! Every optional integration may fail to start (no session bus, socket in use…): the failure
 //! is logged and the app runs without it. Settings edits re-apply live
-//! ([`Services::apply_config`]): toggling the theme follower, MPRIS or reminders starts/stops
-//! them, a reminder lead change restarts the scheduler, a font change reloads fonts on a worker,
+//! ([`Services::apply_config`]): toggling the theme follower or MPRIS starts/stops them, a
+//! reminder setting restarts the reminder scheduler (it always runs: automatic switches, DESIGN
+//! §30.8, don't depend on notification reminders), a font change reloads fonts on a worker,
 //! a User-Agent / network timeout change rebuilds the shared HTTP client (jobs and image
 //! fetches), and debug logging switches the log filter.
 
@@ -62,6 +63,9 @@ pub struct Services {
     /// Drops big snapshots off the UI thread and gives freed heap back to the OS
     /// (`platform::memory`); follows the player's snapshots.
     pub memory: crate::platform::memory::Maintenance,
+    /// What the app publishes for the agent handler (library snapshot, parental unlock;
+    /// DESIGN §30.4). The handler itself lives in the IPC server.
+    pub agent: Arc<crate::agent::shared::AgentShared>,
     /// Set when [`Services::shutdown`] begins (the signal watcher leaves the exit to it; a
     /// signal after that means it is stuck).
     closing: Arc<AtomicBool>,
@@ -123,6 +127,7 @@ impl Services {
             integrations: Integrations::default(),
             undo: Default::default(),
             memory,
+            agent: Arc::default(),
             closing: Arc::default(),
             socket: Arc::default(),
         })
@@ -135,14 +140,22 @@ impl Services {
         if cfg.integration.follow_omarchy_theme {
             self.start_theme_watch(&cfg);
         }
-        self.integrations.ipc = ok("IPC server", crate::ipc::IpcServer::start(self.rt.handle(), &self.paths.ipc_socket(), self.bus.clone()));
+        let agent: Arc<dyn crate::agent::server::AgentService> = Arc::new(crate::agent::server::AgentHandler::new(
+            self.agent.clone(),
+            self.store.clone(),
+            self.config.clone(),
+            self.player.handle(),
+            self.bus.clone(),
+            self.jobs.clone(),
+        ));
+        self.integrations.ipc =
+            ok("IPC server", crate::ipc::IpcServer::start_with_agent(self.rt.handle(), &self.paths.ipc_socket(), self.bus.clone(), Some(agent)));
         *self.socket.lock().unwrap_or_else(|e| e.into_inner()) = self.integrations.ipc.as_ref().map(|s| s.socket());
         if cfg.integration.mpris {
             self.start_mpris();
         }
-        if cfg.reminders.enabled {
-            self.start_reminders(&cfg);
-        }
+        // always: automatic switches (DESIGN §30.8) run with notification reminders off too
+        self.start_reminders(&cfg);
         self.integrations.scheduler = Some(crate::jobs::scheduler::spawn(self.jobs.clone()));
         match self.store.reader().and_then(|c| connection_limits(&c)) {
             Ok(cmds) => cmds.into_iter().for_each(|c| self.player.handle().send(c)),
@@ -171,9 +184,11 @@ impl Services {
                 self.store.clone(),
                 self.bus.clone(),
                 lead_s,
+                cfg.reminders.enabled,
                 self.jobs.context().explicit.clone(),
             ),
         );
+        self.agent.set_reminder_waker(self.integrations.reminders.as_ref().map(|r| r.waker()));
     }
 
     /// Re-apply a Settings edit to the integrations (the app calls it after swapping the shared
@@ -202,9 +217,7 @@ impl Services {
         }
         if old.reminders != new.reminders {
             self.integrations.reminders = None; // dropping the scheduler aborts its task
-            if new.reminders.enabled {
-                self.start_reminders(new);
-            }
+            self.start_reminders(new);
         }
         if old.general.debug_log != new.general.debug_log {
             crate::logging::set_debug(new.general.debug_log);

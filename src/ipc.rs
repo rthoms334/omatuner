@@ -14,16 +14,25 @@
 //!
 //! Security: the socket is 0600 inside the 0700 runtime dir, and the server only accepts peers
 //! with the socket owner's uid (`SO_PEERCRED`). Requests are capped at 64 KiB and 5 s.
+//!
+//! IPC v2 (DESIGN §30.3, `agent::proto`): a line with `"v":2` is an agent request
+//! (`tuner mcp`). It is answered by the [`AgentService`] the server was started with — with
+//! the reply line (≤ `proto::MAX_REPLY`) instead of `{"ok":true}` — and never raises the window
+//! by itself (`play` does, in the handler). Without a service, or for another version, the reply
+//! is a v2 error.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
+use crate::agent::proto::{self, ErrorCode, Reply, Request};
+use crate::agent::server::AgentService;
 use crate::cli::ViewArg;
 use crate::error::{Error, Result};
 use crate::msg::{AppEvent, EventBus};
@@ -136,8 +145,14 @@ impl SocketGuard {
 impl IpcServer {
     /// Bind (mode 0600) and serve on the runtime, forwarding requests to the bus.
     /// Fails when another live instance already serves `socket` (the caller logs and runs
-    /// without single-instance handoff) or the socket cannot be created.
+    /// without single-instance handoff) or the socket cannot be created. v2 (agent) requests
+    /// are refused; see [`IpcServer::start_with_agent`].
     pub fn start(rt: &tokio::runtime::Handle, socket: &Path, bus: EventBus) -> Result<Self> {
+        Self::start_with_agent(rt, socket, bus, None)
+    }
+
+    /// [`IpcServer::start`], answering v2 requests with `agent`.
+    pub fn start_with_agent(rt: &tokio::runtime::Handle, socket: &Path, bus: EventBus, agent: Option<Arc<dyn AgentService>>) -> Result<Self> {
         if let Some(dir) = socket.parent() {
             std::fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| Error::io(dir, e))?;
@@ -156,7 +171,7 @@ impl IpcServer {
             let _rt = rt.enter();
             tokio::net::UnixListener::from_std(listener).map_err(|e| Error::io(socket, e))?
         };
-        let task = rt.spawn(serve(listener, meta.uid(), bus));
+        let task = rt.spawn(serve(listener, meta.uid(), bus, agent));
         Ok(Self { task: Some(task), socket: SocketGuard { path: socket.to_path_buf(), ident: (meta.dev(), meta.ino()) } })
     }
 
@@ -175,13 +190,13 @@ impl Drop for IpcServer {
     }
 }
 
-async fn serve(listener: tokio::net::UnixListener, owner: u32, bus: EventBus) {
+async fn serve(listener: tokio::net::UnixListener, owner: u32, bus: EventBus, agent: Option<Arc<dyn AgentService>>) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                let bus = bus.clone();
+                let (bus, agent) = (bus.clone(), agent.clone());
                 tokio::spawn(async move {
-                    match tokio::time::timeout(IO_TIMEOUT, handle(stream, owner, &bus)).await {
+                    match tokio::time::timeout(IO_TIMEOUT, handle(stream, owner, &bus, agent)).await {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => tracing::debug!("IPC connection: {e}"),
                         Err(_) => tracing::debug!("IPC connection timed out"),
@@ -197,7 +212,7 @@ async fn serve(listener: tokio::net::UnixListener, owner: u32, bus: EventBus) {
     }
 }
 
-async fn handle(stream: tokio::net::UnixStream, owner: u32, bus: &EventBus) -> std::io::Result<()> {
+async fn handle(stream: tokio::net::UnixStream, owner: u32, bus: &EventBus, agent: Option<Arc<dyn AgentService>>) -> std::io::Result<()> {
     let uid = stream.peer_cred()?.uid();
     if uid != owner {
         tracing::warn!("IPC: rejected connection from uid {uid}");
@@ -206,7 +221,18 @@ async fn handle(stream: tokio::net::UnixStream, owner: u32, bus: &EventBus) -> s
     let (rd, mut wr) = stream.into_split();
     let mut line = String::new();
     tokio::io::BufReader::new(rd.take(MAX_REQUEST)).read_line(&mut line).await?;
-    let reply = match serde_json::from_str::<IpcRequest>(line.trim()) {
+    let mut out = match Request::peek_version(line.trim()) {
+        Some(v) if v >= 2 => agent_reply(line.trim(), v, agent).await,
+        _ => v1_reply(line.trim(), bus)?,
+    };
+    out.push('\n');
+    wr.write_all(out.as_bytes()).await?;
+    wr.shutdown().await
+}
+
+/// A v1 request (`--view` / `--play` / inputs): forwarded to the UI, which raises the window.
+fn v1_reply(line: &str, bus: &EventBus) -> std::io::Result<String> {
+    let reply = match serde_json::from_str::<IpcRequest>(line) {
         Ok(req) => {
             tracing::info!("IPC request: view={:?} play={} inputs={}", req.view, req.play.is_some(), req.inputs.len());
             bus.send(AppEvent::Ipc(req));
@@ -215,10 +241,27 @@ async fn handle(stream: tokio::net::UnixStream, owner: u32, bus: &EventBus) -> s
         }
         Err(e) => IpcReply { ok: false, error: Some(format!("bad request: {e}")) },
     };
-    let mut out = serde_json::to_string(&reply).map_err(std::io::Error::other)?;
-    out.push('\n');
-    wr.write_all(out.as_bytes()).await?;
-    wr.shutdown().await
+    serde_json::to_string(&reply).map_err(std::io::Error::other)
+}
+
+/// A v2 (agent) request line → its reply line (without the newline).
+async fn agent_reply(line: &str, version: u64, agent: Option<Arc<dyn AgentService>>) -> String {
+    let id = Request::peek_id(line);
+    let reply = if version != u64::from(proto::VERSION) {
+        Reply::err(id, ErrorCode::Unsupported, format!("this Tuner speaks IPC v{}, not v{version}", proto::VERSION))
+    } else {
+        match (serde_json::from_str::<Request>(line), agent) {
+            (Err(e), _) => Reply::err(id, ErrorCode::BadRequest, crate::redact::redact(&e.to_string())),
+            (Ok(_), None) => Reply::err(id, ErrorCode::Unsupported, "agent control isn't available in this Tuner"),
+            (Ok(req), Some(agent)) => agent.handle(req).await,
+        }
+    };
+    let out = serde_json::to_string(&reply).unwrap_or_default();
+    if out.len() > proto::MAX_REPLY {
+        let too_big = Reply::err(id, ErrorCode::Internal, "the answer was too large; ask for fewer results");
+        return serde_json::to_string(&too_big).unwrap_or_default();
+    }
+    out
 }
 
 #[cfg(test)]
@@ -233,6 +276,48 @@ mod tests {
         assert_eq!(serde_json::from_str::<IpcRequest>(&s).unwrap(), req);
         assert_eq!(serde_json::to_string(&IpcReply { ok: true, error: None }).unwrap(), r#"{"ok":true}"#);
         assert!(!serde_json::from_str::<IpcReply>(r#"{"ok":false,"error":"x"}"#).unwrap().ok);
+    }
+
+    /// v2 lines go to the agent service and come back as v2 replies; without a service, for
+    /// another version or a malformed request the reply is a v2 error; v1 still works and v2
+    /// never reaches the UI as a handoff.
+    #[test]
+    fn v2_requests_are_answered_by_the_agent_service() {
+        struct Echo;
+        impl AgentService for Echo {
+            fn handle(&self, req: Request) -> futures_util::future::BoxFuture<'static, Reply> {
+                let reply = Reply::ok(req.id, serde_json::json!({ "method": req.call.name() }));
+                Box::pin(async move { reply })
+            }
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ask = |sock: &Path, line: &str| -> serde_json::Value {
+            let stream = UnixStream::connect(sock).unwrap();
+            stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+            (&stream).write_all(format!("{line}\n").as_bytes()).unwrap();
+            let mut reply = String::new();
+            BufReader::new(&stream).read_line(&mut reply).unwrap();
+            serde_json::from_str(&reply).unwrap()
+        };
+        let (bus, events) = EventBus::new(None);
+        let sock = dir.path().join("a").join("tuner.sock");
+        let server = IpcServer::start_with_agent(rt.handle(), &sock, bus.clone(), Some(Arc::new(Echo))).unwrap();
+        let r = ask(&sock, r#"{"v":2,"id":5,"method":"status","params":{}}"#);
+        assert_eq!(r, serde_json::json!({"v":2,"id":5,"ok":true,"result":{"method":"status"}}));
+        let r = ask(&sock, r#"{"v":2,"id":6,"method":"search","params":{}}"#);
+        assert_eq!((r["id"].as_u64(), r["error"]["code"].as_str()), (Some(6), Some("bad_request")), "{r}");
+        let r = ask(&sock, r#"{"v":3,"id":7,"method":"status","params":{}}"#);
+        assert_eq!(r["error"]["code"], "unsupported");
+        assert!(events.try_iter().next().is_none(), "agent requests never reach the UI as a handoff");
+        let r = ask(&sock, r#"{"view":"guide","play":null,"inputs":[]}"#);
+        assert_eq!(r, serde_json::json!({"ok":true}));
+        drop(server);
+
+        let sock = dir.path().join("b").join("tuner.sock");
+        let _server = IpcServer::start(rt.handle(), &sock, bus).unwrap();
+        let r = ask(&sock, r#"{"v":2,"id":8,"method":"status","params":{}}"#);
+        assert_eq!(r["error"]["code"], "unsupported");
     }
 
     #[test]

@@ -33,6 +33,15 @@ impl Toasts {
         self.items.push((t, Instant::now()));
     }
 
+    /// Keep only the toasts `keep` says yes to.
+    pub fn retain(&mut self, mut keep: impl FnMut(&Toast) -> bool) {
+        let before = self.items.len();
+        self.items.retain(|(t, _)| keep(t));
+        if self.items.len() != before {
+            self.hovered = None;
+        }
+    }
+
     /// Drop every toast (parental control relocked: one may name an explicit title).
     pub fn clear(&mut self) {
         self.items.clear();
