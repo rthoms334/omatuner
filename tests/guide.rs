@@ -989,12 +989,13 @@ fn live_preview_says_why_a_channel_has_no_guide() {
 }
 
 /// DESIGN §13.2 mock "[HD]": the preview shows the quality from the provider name before
-/// anything plays (smart names drop the word from the display name).
+/// anything plays (smart names drop the word from the display name; the import stores it in
+/// `channel.quality`).
 #[test]
 fn live_preview_shows_the_quality_badge_before_playback() {
     let _one = one();
     let (mut t, ids) = seeded(3, 3, None);
-    t.services().store.writer().blocking(|c| Ok(c.execute("UPDATE channel SET name = 'BBC One HD' WHERE number = 1", [])?)).unwrap();
+    t.services().store.writer().blocking(|c| Ok(c.execute("UPDATE channel SET name = 'BBC One HD', quality = 2 WHERE number = 1", [])?)).unwrap();
     reload(&mut t);
     let mut s = LiveScreen::default();
     t.with_ctx(|ctx| s.on_enter(ctx, &Route::Live { group: None, channel: Some(ids[0]) }));
