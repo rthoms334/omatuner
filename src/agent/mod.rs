@@ -13,9 +13,12 @@
 //!   it loads.
 //! * [`mcp`] — the MCP stdio server (`tuner mcp`).
 
+pub mod act;
 pub mod client;
+pub mod guard;
 pub mod mcp;
 pub mod proto;
+pub mod query;
 pub mod server;
 pub mod shared;
 pub mod tools;

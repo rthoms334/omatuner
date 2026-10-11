@@ -4743,6 +4743,31 @@ Safe defaults: `AgentHandler::handle` → `unsupported` for every method; the ap
 `AppEvent::Agent` and `Switch*`. `todo!("MCP-bridge")`: `client::{ExeLauncher::launch,
 Client::call}`, `mcp::{main, serve}` (only `tuner mcp` reaches them).
 
+**App side (implemented, branch `mcp/app`).** Modules: `agent::query` (the read-only tools over
+a `Q` = effective snapshot + reader + `ParentalView` + clock + config), `agent::act` (what
+`play` / `schedule_switch` / `cancel_switch` decide, `status`), `agent::guard` (in-flight and
+token-bucket limits, the reply check), `agent::server` (dispatch, reader pool, budget, the
+lazy-details wait, INFO logs of actions by ref). Notes and deviations from the text above:
+* The app publishes the snapshot and the unlock instant every frame (`TunerApp::
+  publish_for_agent`, after each `sync_explicit`); a replaced snapshot goes to the memory
+  maintenance thread. The handler conceals explicit content of a snapshot built while unlocked
+  with `Library::hiding_explicit` (cached per `generation`) when the session relocked since.
+* `whats_on` covers the All-playlists scope (`in_all`) unless a channel is named; `guide_search`
+  merges a programme's rows by (title, start as shown) across the channels showing it (≤ 10
+  `also_on`); `locked` in results means "needs the PIN now" (locked and the session locked).
+* Provider text (titles, descriptions, plots, cast…) has its links replaced by `[link]`
+  (`query::clean`): EPG descriptions often carry a web address, which the wire check would
+  turn into an `internal` error for the whole answer. The wire check stays the backstop.
+* `play` of an Xtream series whose episodes aren't loaded submits `LoadSeriesDetails`, waits
+  ≤ 3 s and decides again (`unavailable` if still loading). The app plays agent targets with
+  `PlayOrigin::Cli` (channels, catch-up) / `Fullscreen` (titles, as Enter on a card); a locked
+  title or catch-up waits in `TunerApp::pending_agent` behind `Pin { then: OpenPlayer }`.
+* The reminder scheduler always runs (`ReminderScheduler::start(.., notify, ..)`): notification
+  reminders are skipped while `reminders.enabled` is off, switches never. Its `ReminderWaker`
+  is handed to `AgentShared` so a switch written by the handler is picked up without a frame.
+  Cancel (`Action::CancelSwitch`) removes the row and remembers the id, so a `SwitchNow`
+  already on its way is ignored.
+
 ### 30.10 Work split (two parallel tracks from `mcp/base`)
 File ownership is disjoint; a cross-track edit needs the owner's agreement and goes in the
 merge note. Lean: clippy + the tests you touched; the integrator runs the full gate.

@@ -16,6 +16,14 @@
 //! `reminders.lead_min`) applies to rows without one.
 //!
 //! Reminders only fire while Tuner is running (v1 limitation, documented in Settings).
+//!
+//! Automatic switches (DESIGN §30.8, `Reminder::switches`, made by an MCP client's
+//! `schedule_switch`) run whatever `reminders.enabled` says (the scheduler always runs; with
+//! reminders off, notification reminders are just skipped): `SWITCH_WARN_S` before the start
+//! the app gets `PlatformEvent::SwitchSoon` (a toast with Cancel), at the start the window is
+//! raised and the app gets `PlatformEvent::SwitchNow` (it plays the channel); the row becomes
+//! `Fired`. A switch missed while Tuner was closed still happens up to [`LATE_SWITCH_S`] late;
+//! older ones are dismissed silently.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -38,6 +46,8 @@ const MAX_SLEEP_S: i64 = 60;
 const ACTION_WAIT: Duration = Duration::from_secs(3 * 3600);
 /// Programmes without a usable stop time are assumed to last this long.
 const DEFAULT_DURATION_S: i64 = 3600;
+/// How late an automatic switch still happens (Tuner was closed at the start, or asleep).
+pub const LATE_SWITCH_S: i64 = 900;
 
 /// Fire-and-forget notification (errors logged). Summary/body must be redacted already.
 /// Returns false when no notification server answered — callers fall back to an in-app
@@ -92,40 +102,68 @@ async fn show(n: &Notification, bus: Option<&str>) -> Result<notify_rust::Notifi
 pub struct ReminderScheduler {
     task: Option<tokio::task::JoinHandle<()>>,
     wake: tokio::sync::mpsc::UnboundedSender<()>,
+    notify: bool,
+}
+
+/// Asks a running scheduler to reload its reminders (the agent handler's switches, which
+/// must not wait for a UI frame). Harmless once the scheduler is gone.
+#[derive(Debug, Clone)]
+pub struct ReminderWaker(tokio::sync::mpsc::UnboundedSender<()>);
+
+impl ReminderWaker {
+    pub fn wake(&self) {
+        let _ = self.0.send(());
+    }
 }
 
 impl ReminderScheduler {
     /// Start the scheduler task on `rt` (store reads run on the blocking pool). Never fails
     /// today; storage errors are logged and retried on the next refresh / minute tick.
-    /// `explicit`: while it hides explicit content, reminders on explicit channels stay
-    /// silent (they are announced once it shows again, if still airing; DESIGN §20.3).
+    /// `notify`: notification reminders are on (`reminders.enabled`); automatic switches run
+    /// either way. `explicit`: while it hides explicit content, reminders on explicit
+    /// channels stay silent (they are announced once it shows again, if still airing; DESIGN
+    /// §20.3).
     pub fn start(
         rt: &tokio::runtime::Handle,
         store: Store,
         bus: EventBus,
         lead_default_s: i64,
+        notify: bool,
         explicit: crate::store::library::ExplicitGate,
     ) -> Result<Self> {
         let backend = Arc::new(StoreBackend { store, reader: Mutex::new(None), explicit });
-        Ok(Self::spawn(rt, backend, Arc::new(DesktopNotifier { bus: None }), bus, lead_default_s))
+        Ok(Self::spawn(rt, backend, Arc::new(DesktopNotifier { bus: None }), bus, Settings { lead_default_s, notify }))
     }
 
-    fn spawn(
-        rt: &tokio::runtime::Handle,
-        backend: Arc<dyn ReminderBackend>,
-        notifier: Arc<dyn Notifier>,
-        bus: EventBus,
-        lead_default_s: i64,
-    ) -> Self {
+    fn spawn(rt: &tokio::runtime::Handle, backend: Arc<dyn ReminderBackend>, notifier: Arc<dyn Notifier>, bus: EventBus, settings: Settings) -> Self {
         let (wake, rx) = tokio::sync::mpsc::unbounded_channel();
-        let task = rt.spawn(run(backend, notifier, bus, lead_default_s, rx));
-        Self { task: Some(task), wake }
+        let task = rt.spawn(run(backend, notifier, bus, settings, rx));
+        Self { task: Some(task), wake, notify: settings.notify }
     }
 
     /// Reload pending reminders (after add/remove).
     pub fn refresh(&self) {
         let _ = self.wake.send(());
     }
+
+    /// A handle that does what [`ReminderScheduler::refresh`] does, from anywhere.
+    pub fn waker(&self) -> ReminderWaker {
+        ReminderWaker(self.wake.clone())
+    }
+
+    /// Notification reminders are on (automatic switches run either way).
+    pub fn notifies(&self) -> bool {
+        self.notify
+    }
+}
+
+/// What the scheduler was started with.
+#[derive(Debug, Clone, Copy)]
+struct Settings {
+    /// `reminders.lead_min` in seconds: the lead of rows without their own.
+    lead_default_s: i64,
+    /// Notification reminders are on (switches run regardless).
+    notify: bool,
 }
 
 impl Drop for ReminderScheduler {
@@ -235,6 +273,11 @@ enum Decision {
     /// Ended while nobody was looking: mark `Dismissed`, no notification.
     Dismiss(ReminderId),
     Fire(Reminder),
+    /// An automatic switch is `SWITCH_WARN_S` away: the app's Cancel toast (the row stays
+    /// pending).
+    Warn(Reminder),
+    /// An automatic switch's start: raise the window and switch; the row becomes `Fired`.
+    Switch(Reminder),
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -249,18 +292,42 @@ fn effective_stop(r: &Reminder) -> Timestamp {
     if r.stop > r.start { r.stop } else { r.start + DEFAULT_DURATION_S }
 }
 
-/// Pure scheduling step: what to do at `now` and when to look again.
-fn plan(pending: &[Reminder], now: Timestamp, lead_default_s: i64, handled: &HashSet<ReminderId>) -> Plan {
+impl Plan {
+    fn wake_at(&mut self, t: Timestamp) {
+        self.next_at = Some(self.next_at.map_or(t, |n| n.min(t)));
+    }
+}
+
+/// Pure scheduling step: what to do at `now` and when to look again. `warned`: switches whose
+/// Cancel toast already went out.
+fn plan(pending: &[Reminder], now: Timestamp, settings: Settings, handled: &HashSet<ReminderId>, warned: &HashSet<ReminderId>) -> Plan {
     let mut p = Plan::default();
     for r in pending.iter().filter(|r| r.state == ReminderState::Pending && !handled.contains(&r.id)) {
-        let lead = if r.lead_s > 0 { r.lead_s } else { lead_default_s.max(0) };
+        if r.switches() {
+            let warn_at = r.start - Reminder::SWITCH_WARN_S;
+            if effective_stop(r) <= now || now > r.start + LATE_SWITCH_S {
+                p.now.push(Decision::Dismiss(r.id));
+            } else if now >= r.start {
+                p.now.push(Decision::Switch(r.clone()));
+            } else if now >= warn_at && !warned.contains(&r.id) {
+                p.now.push(Decision::Warn(r.clone()));
+                p.wake_at(r.start);
+            } else {
+                p.wake_at(if now >= warn_at { r.start } else { warn_at });
+            }
+            continue;
+        }
+        if !settings.notify {
+            continue;
+        }
+        let lead = if r.lead_s > 0 { r.lead_s } else { settings.lead_default_s.max(0) };
         let fire_at = r.start - lead;
         if effective_stop(r) <= now {
             p.now.push(Decision::Dismiss(r.id));
         } else if fire_at <= now {
             p.now.push(Decision::Fire(r.clone()));
         } else {
-            p.next_at = Some(p.next_at.map_or(fire_at, |t| t.min(fire_at)));
+            p.wake_at(fire_at);
         }
     }
     p
@@ -284,11 +351,13 @@ async fn run(
     backend: Arc<dyn ReminderBackend>,
     notifier: Arc<dyn Notifier>,
     bus: EventBus,
-    lead_default_s: i64,
+    settings: Settings,
     mut wake: tokio::sync::mpsc::UnboundedReceiver<()>,
 ) {
     // Fired/dismissed here but maybe not yet written: never act on them twice.
     let mut handled: HashSet<ReminderId> = HashSet::new();
+    // Switches whose Cancel toast went out.
+    let mut warned: HashSet<ReminderId> = HashSet::new();
     // Last load error, so a persistent one is logged once rather than every minute.
     let mut last_error: Option<String> = None;
     loop {
@@ -311,10 +380,24 @@ async fn run(
             }
         };
         handled.retain(|id| pending.iter().any(|r| r.id == *id));
+        warned.retain(|id| pending.iter().any(|r| r.id == *id));
         let now = crate::model::now();
-        let p = plan(&pending, now, lead_default_s, &handled);
+        let p = plan(&pending, now, settings, &handled, &warned);
         for d in p.now {
             match d {
+                Decision::Warn(r) => {
+                    warned.insert(r.id);
+                    tracing::info!("reminder {}: switching in {} s", r.id, (r.start - now).max(0));
+                    bus.send(AppEvent::Platform(PlatformEvent::SwitchSoon { reminder: r.id, channel: r.channel.clone(), start: r.start }));
+                }
+                Decision::Switch(r) => {
+                    handled.insert(r.id);
+                    backend.set_state(r.id, ReminderState::Fired);
+                    tracing::info!("reminder {}: switching now", r.id);
+                    // raise first: the UI may not run while the window sits on another workspace
+                    crate::platform::hypr::focus_self();
+                    bus.send(AppEvent::Platform(PlatformEvent::SwitchNow { reminder: r.id, channel: r.channel.clone() }));
+                }
                 Decision::Dismiss(id) => {
                     handled.insert(id);
                     backend.set_state(id, ReminderState::Dismissed);
@@ -363,6 +446,8 @@ mod tests {
     use super::*;
     use crate::model::{ItemKey, ItemKind, ItemRef, SourceId};
 
+    const ON: Settings = Settings { lead_default_s: 120, notify: true };
+
     fn reminder(id: i64, start: Timestamp, stop: Timestamp, lead_s: i64) -> Reminder {
         Reminder {
             id: ReminderId(id),
@@ -387,7 +472,7 @@ mod tests {
             reminder(5, now + 300, now + 900, 0),     // no own lead → default 240 → in 60 s
             reminder(6, now - 7200, now - 7200, 120), // no stop: assumed 1 h → ended
         ];
-        let p = plan(&pending, now, 240, &HashSet::new());
+        let p = plan(&pending, now, Settings { lead_default_s: 240, notify: true }, &HashSet::new(), &HashSet::new());
         assert_eq!(
             p.now,
             vec![
@@ -407,7 +492,35 @@ mod tests {
         fired.state = ReminderState::Fired;
         let pending = vec![reminder(1, now, now + 60, 0), fired];
         let handled: HashSet<_> = [ReminderId(1)].into();
-        assert_eq!(plan(&pending, now, 120, &handled), Plan::default());
+        assert_eq!(plan(&pending, now, ON, &handled, &HashSet::new()), Plan::default());
+    }
+
+    /// DESIGN §30.8: a switch warns `SWITCH_WARN_S` before its start (once), switches at the
+    /// start, still switches up to `LATE_SWITCH_S` late and is dismissed after; it runs with
+    /// notification reminders off, which only skips the notification rows.
+    #[test]
+    fn plan_warns_then_switches_whatever_notifications_say() {
+        let now = 1_000_000;
+        let sw = |id, start| reminder(id, start, start + 1800, Reminder::SWITCH_LEAD);
+        let pending = vec![
+            sw(1, now + 60),                       // warns at now + 50
+            sw(2, now + 5),                        // warns now, switches at now + 5
+            sw(3, now - 300),                      // 5 min late: switches
+            sw(4, now - LATE_SWITCH_S - 1),        // too late: dismissed
+            reminder(5, now + 60, now + 900, 120), // a notification due now
+        ];
+        let off = Settings { lead_default_s: 120, notify: false };
+        let p = plan(&pending, now, off, &HashSet::new(), &HashSet::new());
+        assert_eq!(p.now, vec![Decision::Warn(pending[1].clone()), Decision::Switch(pending[2].clone()), Decision::Dismiss(ReminderId(4))]);
+        assert_eq!(p.next_at, Some(now + 5));
+        // warned already: wait for the start, no second toast
+        let warned: HashSet<_> = [ReminderId(2)].into();
+        let p = plan(&pending[1..2], now, off, &HashSet::new(), &warned);
+        assert_eq!((p.now, p.next_at), (vec![], Some(now + 5)));
+        assert_eq!(plan(&pending[..1], now, off, &HashSet::new(), &HashSet::new()).next_at, Some(now + 50));
+        // notifications on: the notification row fires as before
+        let p = plan(&pending[4..], now, ON, &HashSet::new(), &HashSet::new());
+        assert_eq!(p.now, vec![Decision::Fire(pending[4].clone())]);
     }
 
     #[test]
@@ -492,7 +605,7 @@ mod tests {
         ];
         let notifier = Arc::new(FakeNotifier { shown: Mutex::new(Vec::new()), click: true, available: true });
         let (bus, rx) = EventBus::new(None);
-        let sched = ReminderScheduler::spawn(rt.handle(), backend.clone(), notifier.clone(), bus, 120);
+        let sched = ReminderScheduler::spawn(rt.handle(), backend.clone(), notifier.clone(), bus, ON);
         let mut watched = Vec::new();
         let events = recv_until(&rx, Duration::from_secs(10), |ev| {
             if let AppEvent::Platform(PlatformEvent::ReminderWatch { reminder, channel }) = ev {
@@ -519,6 +632,34 @@ mod tests {
         drop(sched);
     }
 
+    /// A switch with notification reminders off: the Cancel-toast event, then the switch at
+    /// the start; the row ends `Fired`; nothing is notified.
+    #[test]
+    fn scheduler_warns_then_switches() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let now = crate::model::now();
+        let backend = Arc::new(FakeBackend::default());
+        *backend.rows.lock().unwrap() = vec![reminder(8, now + 2, now + 1800, Reminder::SWITCH_LEAD)];
+        let notifier = Arc::new(FakeNotifier { shown: Mutex::new(Vec::new()), click: false, available: true });
+        let (bus, rx) = EventBus::new(None);
+        let _sched = ReminderScheduler::spawn(rt.handle(), backend.clone(), notifier.clone(), bus, Settings { lead_default_s: 120, notify: false });
+        let events = recv_until(&rx, Duration::from_secs(10), |ev| matches!(ev, AppEvent::Platform(PlatformEvent::SwitchNow { .. })));
+        let seen: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                AppEvent::Platform(PlatformEvent::SwitchSoon { reminder: ReminderId(8), .. }) => Some("soon"),
+                AppEvent::Platform(PlatformEvent::SwitchNow { reminder: ReminderId(8), channel }) => {
+                    assert_eq!(channel.key.0, "xt:live:8");
+                    Some("now")
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(seen, ["soon", "now"], "{events:?}");
+        assert_eq!(backend.states.lock().unwrap().clone(), [(ReminderId(8), ReminderState::Fired)]);
+        assert!(notifier.shown.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn scheduler_falls_back_to_a_toast_without_a_notification_server() {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
@@ -527,7 +668,7 @@ mod tests {
         *backend.rows.lock().unwrap() = vec![reminder(7, now + 100, now + 900, 120)];
         let notifier = Arc::new(FakeNotifier { shown: Mutex::new(Vec::new()), click: false, available: false });
         let (bus, rx) = EventBus::new(None);
-        let _sched = ReminderScheduler::spawn(rt.handle(), backend, notifier, bus, 120);
+        let _sched = ReminderScheduler::spawn(rt.handle(), backend, notifier, bus, ON);
         let events = recv_until(&rx, Duration::from_secs(5), |ev| matches!(ev, AppEvent::Toast(_)));
         let toast = events.iter().find_map(|e| if let AppEvent::Toast(t) = e { Some(t.text.clone()) } else { None });
         assert_eq!(toast.as_deref(), Some("Programme 7 — Starts in 2 min on BBC One"));
@@ -617,7 +758,7 @@ mod tests {
         let backend = Arc::new(StoreBackend { store: store.clone(), reader: Mutex::new(None), explicit: Default::default() });
         let notifier = Arc::new(FakeNotifier { shown: Mutex::new(Vec::new()), click: true, available: true });
         let (bus, rx) = EventBus::new(None);
-        let _sched = ReminderScheduler::spawn(rt.handle(), backend, notifier.clone(), bus, 120);
+        let _sched = ReminderScheduler::spawn(rt.handle(), backend, notifier.clone(), bus, ON);
         let events = recv_until(&rx, Duration::from_secs(10), |ev| matches!(ev, AppEvent::Platform(PlatformEvent::ReminderWatch { .. })));
         let channel = events
             .iter()
