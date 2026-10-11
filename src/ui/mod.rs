@@ -180,6 +180,8 @@ pub enum OverlayRequest {
     /// Ctrl+I "Edit information": rename, per-channel catch-up offset, EPG assignment, lock,
     /// hide (WP-11).
     EditItem(ItemRef),
+    /// "Choose what to show": a playlist's category filter (DESIGN §28.6).
+    Categories(SourceId),
 }
 
 /// Requests a screen makes during a frame; the app applies them after the frame.
