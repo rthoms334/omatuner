@@ -188,7 +188,7 @@ const HARBOR_LIVE: Lineup = &[
 
 /// (title, year, genre line, minutes): the movie catalogue.
 const MOVIES: &[(&str, u16, &str, u32)] = &[
-    ("The Lighthouse Keeper", 2019, "Drama, Mystery", 118),
+    ("The Keeper of Wren Point", 2019, "Drama, Mystery", 118),
     ("Midnight Orchard", 2021, "Thriller", 104),
     ("Paper Satellites", 2018, "Science Fiction", 126),
     ("Glass Harbour", 2022, "Crime, Drama", 111),
@@ -254,7 +254,7 @@ const AURORA_MOVIES: VodLineup = &[
 
 /// (title, year, seasons, episodes per season, genre).
 const SERIES: &[(&str, u16, u32, u32, &str)] = &[
-    ("Harbour Lights", 2022, 2, 6, "Drama"),
+    ("Gullhaven", 2022, 2, 6, "Drama"),
     ("The Cartographers", 2021, 1, 8, "Adventure"),
     ("Static Bloom", 2023, 2, 5, "Science Fiction"),
     ("Fernwood Station", 2019, 3, 6, "Comedy"),
@@ -330,7 +330,7 @@ fn programmes(g: Genre) -> &'static [&'static str] {
             "Cities After Dark",
         ],
         Genre::Cinema => &[
-            "The Lighthouse Keeper",
+            "The Keeper of Wren Point",
             "Copper Sky",
             "Small Hours",
             "Tin Moon",
@@ -665,6 +665,7 @@ fn guide(day_start: Timestamp) -> (String, Vec<Prog>) {
     for (name, genre, _) in BRANDS {
         let mut rng = Rng::new(name);
         let titles = programmes(*genre);
+        let mut prev = String::new();
         let mut t = day_start - 18 * 3600;
         let end = day_start + 2 * 86_400 + 6 * 3600;
         while t < end {
@@ -673,7 +674,8 @@ fn guide(day_start: Timestamp) -> (String, Vec<Prog>) {
                 Genre::News | Genre::Weather => 30 * (1 + rng.below(2) as i64),
                 _ => 30 * (1 + rng.below(3) as i64),
             } * 60;
-            let title = rng.pick(titles).to_string();
+            let title = programme_title(&mut rng, *genre, titles, (t - day_start).rem_euclid(86_400) / 3600, &prev);
+            prev.clone_from(&title);
             let _ = writeln!(
                 s,
                 "  <programme start=\"{}\" stop=\"{}\" channel=\"{}.demo\"><title>{}</title><desc>{}</desc></programme>",
@@ -689,6 +691,30 @@ fn guide(day_start: Timestamp) -> (String, Vec<Prog>) {
     }
     s.push_str("</tv>\n");
     (s, progs)
+}
+
+/// A title for a programme starting at `hour` (local): news follows the clock, and no title
+/// runs twice in a row.
+fn programme_title(rng: &mut Rng, genre: Genre, titles: &[&str], hour: i64, prev: &str) -> String {
+    let slot: &[&str] = match (genre, hour) {
+        (Genre::News, 5..=9) => &["Morning Briefing"],
+        (Genre::News, 12..=13) => &["The Midday Report"],
+        (Genre::News, 18..=20) => &["The Evening Report"],
+        (Genre::News, 22..=23 | 0..=4) => &["Late Edition", "Newsroom Live"],
+        (Genre::News, 21) => &["Week in Review", "World Desk"],
+        (Genre::News, _) => &["World Desk", "Market Watch", "Newsroom Live"],
+        _ => titles,
+    };
+    let fresh: Vec<&str> = slot.iter().copied().filter(|t| *t != prev).collect();
+    let fallback: Vec<&str> = ["World Desk", "Newsroom Live"].into_iter().filter(|t| *t != prev).collect();
+    let pool = if !fresh.is_empty() {
+        fresh
+    } else if genre == Genre::News {
+        fallback
+    } else {
+        slot.to_vec()
+    };
+    rng.pick(&pool).to_string()
 }
 
 // --------------------------------------------------------------------------------- build
@@ -843,7 +869,7 @@ fn refs(c: &Connection) -> Result<String> {
         let _ = writeln!(out, "{var}_ID={id}");
     }
     for (var, source, name) in
-        [("PLAY_DOCS", "Northwind", "Lumen Docs"), ("PLAY_SPORTS", "Aurora", "Goalpost TV"), ("PLAY_NEWS", "Northwind", "Meridian News")]
+        [("PLAY_DOCS", "Northwind", "Polar Nature"), ("PLAY_SPORTS", "Aurora", "Summit Sports"), ("PLAY_NEWS", "Northwind", "Meridian News")]
     {
         let (id, key): (i64, String) = c.query_row(
             "SELECT c.source_id, c.key FROM channel c JOIN source s ON s.id = c.source_id WHERE s.name = ?1 AND c.name LIKE ?2 || '%' ORDER BY c.id",
@@ -909,7 +935,7 @@ fn details(c: &mut Connection, now: Timestamp) -> tuner::error::Result<()> {
         let person = |rng: &mut Rng| format!("{} {}", rng.pick(FIRST_NAMES), rng.pick(LAST_NAMES));
         let cast = (0..4).map(|_| person(&mut rng)).collect::<Vec<_>>().join(", ");
         let d = MovieDetails {
-            plot: Some(movie_plot(title, genre)),
+            plot: Some(movie_plot(genre)),
             genre: Some(genre.into()),
             cast: Some(cast),
             director: Some(person(&mut rng)),
@@ -921,6 +947,8 @@ fn details(c: &mut Connection, now: Timestamp) -> tuner::error::Result<()> {
         };
         tuner::store::import::store_movie_details(c, MovieId(id), &d, now)?;
     }
+    // M3U series have no details path: `store_series_details` is the Xtream one, which
+    // replaces the episode list and carries no genre, so plots and backdrops go in directly.
     for (title, _, _, _, genre) in SERIES {
         c.execute(
             "UPDATE series SET plot = ?1, genre = ?2, backdrop = ?3 WHERE name LIKE '%' || ?4 || '%'",
@@ -930,7 +958,7 @@ fn details(c: &mut Connection, now: Timestamp) -> tuner::error::Result<()> {
     Ok(())
 }
 
-fn movie_plot(title: &str, genre: &str) -> String {
+fn movie_plot(genre: &str) -> String {
     let lead = match genre.split(',').next().unwrap_or("") {
         "Drama" | "Music" => "A family secret surfaces one winter and changes three lives for good.",
         "Thriller" | "Action" => "With forty-eight hours on the clock, an unlikely team chases a signal across the city.",
@@ -946,11 +974,11 @@ fn movie_plot(title: &str, genre: &str) -> String {
         "Western" => "A drifter and a telegraph operator stand between a town and a copper baron.",
         _ => "An unforgettable story, told with warmth and wit.",
     };
-    format!("{lead} ({title} is invented demo content.)")
+    lead.into()
 }
 
 fn series_plot(title: &str) -> String {
-    format!("Season after season, the people of {title} keep each other's secrets — until they don't. (Invented demo content.)")
+    format!("Season after season, the people of {title} keep each other's secrets — until they don't.")
 }
 
 /// Favourites, recently watched channels, Continue Watching and one reminder.
@@ -994,11 +1022,11 @@ fn user_data(c: &mut Connection, now: Timestamp, progs: &[Prog]) -> tuner::error
     }
     // titles go in a list of their own: a rail mixing channel tiles and posters leaves a gap
     // under the tiles on Home
-    let night = user::create_fav_list(c, "Movie night", tuner::ui::widgets::glyphs::FAV_LIST)?;
+    let night = user::create_fav_list(c, "Films & series", tuner::ui::widgets::glyphs::FAV_LIST)?;
     let titles = [
-        need(movie(c, north, "Lighthouse Keeper")?, "The Lighthouse Keeper")?,
+        need(movie(c, north, "Keeper of Wren Point")?, "The Keeper of Wren Point")?,
         need(movie(c, aurora, "Quiet Frequencies")?, "Quiet Frequencies")?,
-        need(series(c, north, "Harbour Lights")?, "Harbour Lights")?,
+        need(series(c, north, "Gullhaven")?, "Gullhaven")?,
         need(movie(c, aurora, "Blue Hour Express")?, "Blue Hour Express")?,
         need(movie(c, north, "Copper Sky")?, "Copper Sky")?,
     ];

@@ -19,9 +19,9 @@ fn demo_profile_builds_a_library_with_stacks() {
     assert_eq!(lib.eligible(ItemKind::Movie).len(), 2, "Harbor Free has no movies");
     assert!(s.channels >= 55 && s.programmes > 1000, "{}", s);
 
-    // "The Lighthouse Keeper": EN + FR in Northwind, 4K EN in Aurora → one stack of three
+    // "The Keeper of Wren Point": EN + FR in Northwind, 4K EN in Aurora → one stack of three
     let movies = &lib.vod.movies;
-    let keeper = movies.iter().position(|m| m.name.contains("Lighthouse Keeper")).expect("movie") as u32;
+    let keeper = movies.iter().position(|m| m.name.contains("Keeper of Wren Point")).expect("movie") as u32;
     let stack = lib.vod.stacks(true).stack_of(keeper).expect("stacked");
     assert_eq!(lib.vod.stacks(true).members(stack).len(), 3);
     assert!(lib.vod.stacks(false).len() >= 2, "series stack too");

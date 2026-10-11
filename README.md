@@ -43,7 +43,7 @@ preview playing](docs/screenshots/live.png)
 <td width="50%"><img src="docs/screenshots/stack.png" alt="A stack fanned out"><br><code>Space</code> fans a stack out into its copies, each with its playlist, language and quality.</td>
 </tr>
 <tr>
-<td width="50%"><img src="docs/screenshots/detail.png" alt="Movie page"><br><b>Movie page</b> with its copies: which one plays first, and the others to pick from.</td>
+<td width="50%"><img src="docs/screenshots/detail.png" alt="Series page"><br><b>Series page</b> with its copies: which one plays first, and the others to pick from.</td>
 <td width="50%"><img src="docs/screenshots/player.png" alt="Player with controls"><br><b>Player</b> with the on-screen controls and the volume slider.</td>
 </tr>
 <tr>

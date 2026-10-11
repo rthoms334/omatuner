@@ -5,8 +5,8 @@
 # usage: scripts/screenshots.sh [shot...]          (default: every shot listed below)
 #
 # Needs a Hyprland session (each window floats itself at an exact size, centred on the
-# current workspace; don't type while it runs), cargo, curl and ffmpeg. oxipng shrinks the
-# PNGs when installed. Nothing of your own setup reaches the images: every shot runs on a
+# current workspace; don't type while it runs), cargo, curl and ffmpeg. pngquant and oxipng
+# shrink the PNGs when installed. Nothing of your own setup reaches the images: every shot runs on a
 # fresh copy of the demo profile in target/screenshots/, with a bundled theme
 # (TUNER_THEME_DIR) instead of your Omarchy theme.
 #
@@ -25,6 +25,7 @@ clip_sha256=cb0fe73fc0a7d543459996c0cdab730997e6eac1013d3ede18796f777cb7f273
 dark=$PWD/tests/fixtures/theme/tokyo-night       # Omarchy's default theme
 light=$PWD/tests/fixtures/theme/catppuccin-latte
 big=1600x1000
+hero=1440x900   # the README's top image is shown ~880 px wide: a smaller window keeps it legible
 half=950x1000
 
 for tool in cargo ffmpeg hyprctl; do
@@ -89,18 +90,23 @@ shot() {
 
 # Scripts: steps run 0.35 s apart once the library is loaded (src/devshot.rs).
 shot home        "$big"  "$dark"  home     ""
-shot live        "$big"  "$dark"  live     "key:Down;key:Down;key:Enter;key:Down;key:Down;wait:3" 3
+shot live        "$hero" "$dark"  live     "key:Enter;wait:3" 3
 shot guide       "$big"  "$dark"  guide    "key:F;key:Down;key:Down;key:Down;key:Enter;wait:0.5;key:Down;key:Down;key:Right" 2
 shot movies      "$big"  "$dark"  movies   "key:Right;key:Left"
 shot stack       "$big"  "$dark"  movies   "key:Space;wait:1"
-shot detail      "$big"  "$dark"  movies   "key:Enter;wait:1.5"
+shot detail      "$big"  "$dark"  series   "key:Enter;wait:1.5"
 shot player      "$big"  "$dark"  live     "play:$PLAY_DOCS;wait:3;key:Enter;move:1400,940;wait:0.5" 1
 shot popout      "$big"  "$dark"  live     "play:$PLAY_SPORTS;wait:5;text:o;wait:2;move:240,200" 1
-shot live-half   "$half" "$dark"  live     "key:Down;key:Enter;key:Down;wait:3" 3
+shot live-half   "$half" "$dark"  live     "key:Down;key:Down;key:Down;key:Down;key:Enter;wait:3" 3
 shot categories  "$big"  "$dark"  live     "categories:$NORTHWIND_ID;wait:1"
 shot help        "$big"  "$dark"  home     "key:F1;text:guide;wait:0.5"
 shot settings    "$big"  "$light" settings "wait:0.5"
 
+# Every regeneration adds the images to git history again: rerun it only when the UI changes.
+# pngquant (lossy, 256 colours) roughly halves them; oxipng then recompresses losslessly.
+if command -v pngquant >/dev/null && ((${#taken[@]})); then
+  pngquant --quality 70-90 --skip-if-larger --force --ext .png "${taken[@]}" || true
+fi
 if command -v oxipng >/dev/null && ((${#taken[@]})); then
   oxipng -q -o 4 --strip safe "${taken[@]}"
 fi
