@@ -133,6 +133,7 @@ impl TestUi {
             search_index: &mut self.search_index,
             layout: self.layout,
             mini_rect: None,
+            video_only: false,
             now: self.now,
             nav: &mut self.nav,
             toasts: &mut self.toasts,

@@ -52,6 +52,7 @@ use crate::jobs::{FailureKind, JobKind, JobOutcome};
 use crate::keymap::{self, Action, KeyContext};
 use crate::model::{ChannelId, Collection, GroupId, ItemKey, ItemKind, ItemRef, MediaRef, PlayOrigin, SourceId, Timestamp, ZapList};
 use crate::msg::{AppEvent, DataScope, Toast, ToastKind};
+use crate::platform::popout::{PopOutBackend, PopOutEvent, PopRequest};
 use crate::platform::{PickPurpose, PlatformEvent};
 use crate::player::{PlayRequest, PlayerCommand, PlayerSnapshot, PlayerState};
 use crate::search::SearchIndex;
@@ -60,6 +61,7 @@ use crate::store::library::{FavIndex, Library};
 use crate::theme::{SpaceToken, Theme, ThemeEvent};
 use crate::ui::data::{FrameBudget, NowNextCache};
 use crate::ui::overlays::{self, Overlay, OverlayOutcome};
+use crate::ui::popout::{PopOut, Toggle};
 use crate::ui::video_host::{Placement, VideoHost};
 use crate::ui::widgets::status_bar::{StatusClick, StatusInfo};
 use crate::ui::widgets::toast::Toasts;
@@ -110,6 +112,15 @@ pub struct TunerApp {
     /// Window fullscreen as last requested by the app, re-synced every frame from the
     /// compositor's state (`ViewportInfo::fullscreen`) when the backend reports it.
     window_fullscreen: bool,
+    /// Pop-out state (DESIGN §21.6) and where its requests go: the Hyprland worker; `None`
+    /// outside Hyprland (and in tests, unless a test installs a recorder).
+    popout: PopOut,
+    popout_backend: Option<Box<dyn PopOutBackend>>,
+    /// This frame shows the video-only player (`PopOut::video_only` at the window's size):
+    /// the Player screen is shown and gets the keys whatever the route stack says.
+    video_only: bool,
+    /// Logical window size of the last frame (pop-out decisions outside `ui`).
+    window_size: egui::Vec2,
     /// A channel played before the library knew it (`--play` at startup) and its primary
     /// group: the zap list follows once the library lands.
     pending_zap: Option<(ChannelId, GroupId)>,
@@ -174,6 +185,12 @@ impl TunerApp {
             }
         };
         let start = start_route(&services.config(), &initial, &db);
+        // never a real compositor from unit tests (they run inside the developer's Hyprland)
+        let popout_backend = if cfg!(test) {
+            None
+        } else {
+            crate::platform::popout::PopOutWorker::start(services.bus.clone()).map(|w| Box::new(w) as Box<dyn PopOutBackend>)
+        };
         let snapshot = services.player.handle().snapshot();
         let mut app = Self {
             video: VideoHost::new(surface),
@@ -200,6 +217,10 @@ impl TunerApp {
             drop_alt_text: false,
             idle,
             window_fullscreen: false,
+            popout: PopOut::default(),
+            popout_backend,
+            video_only: false,
+            window_size: egui::vec2(1280.0, 800.0),
             pending_zap: None,
             pending_locked: None,
             entered: None,
@@ -232,12 +253,30 @@ impl TunerApp {
         self.screens.iter().position(|s| s.id() == id).expect("every ScreenId has a screen")
     }
 
-    /// The key context stack right now (topmost overlay, else the current screen); `Global`
-    /// is appended by `keymap::resolve`.
+    /// The route on screen: the Player while the window is popped out (video-only), else the
+    /// current route. The route stack below stays as it was for when the window comes back.
+    fn view_route(&self) -> Route {
+        if self.video_only { Route::Player } else { self.current_route().clone() }
+    }
+
+    fn view_screen(&self) -> ScreenId {
+        if self.video_only { ScreenId::Player } else { self.current_route().screen() }
+    }
+
+    /// The key context stack right now (topmost overlay, else the screen on view); `Global`
+    /// is appended by `keymap::resolve`. Video-only: `PopOut` sits right above the player's
+    /// base context, so Esc pops back in once side panels / number entry are done with it.
     fn key_stack(&self) -> Vec<KeyContext> {
         match self.overlays.last() {
             Some(o) => o.overlay.key_contexts(),
-            None => self.screens[self.screen_index(self.current_route().screen())].key_contexts(),
+            None => {
+                let mut stack = self.screens[self.screen_index(self.view_screen())].key_contexts();
+                if self.video_only {
+                    let at = stack.iter().position(|c| matches!(c, KeyContext::PlayerLive | KeyContext::PlayerVod)).unwrap_or(stack.len());
+                    stack.insert(at, KeyContext::PopOut);
+                }
+                stack
+            }
         }
     }
 
@@ -282,6 +321,7 @@ impl TunerApp {
             search_index: &mut self.search_index,
             layout: self.layout,
             mini_rect,
+            video_only: self.video_only,
             now: crate::model::now(),
             nav: &mut self.nav,
             toasts: &mut self.pending_toasts,
@@ -316,6 +356,7 @@ impl TunerApp {
                 PlatformEvent::FilePicked { purpose: PickPurpose::ExportLog, path: Some(path) } => self.export_log(path.clone()),
                 // Other pickers belong to the screen that opened them (`on_event` below).
                 PlatformEvent::FilePicked { .. } | PlatformEvent::ReminderFired(_) => {}
+                PlatformEvent::PopOut(ev) => self.on_popout_event(ev),
             },
             AppEvent::Player(_) => {}
         }
@@ -629,6 +670,7 @@ impl TunerApp {
             Action::GlobalPlayPause => self.send_player(PlayerCommand::TogglePause),
             Action::StopPlayback => self.send_player(PlayerCommand::Stop),
             Action::RefreshSource => self.refresh_everything(),
+            Action::TogglePopOut => self.toggle_popout(egui_ctx),
             Action::Back => self.back(egui_ctx),
             _ => {}
         }
@@ -733,7 +775,7 @@ impl TunerApp {
             self.overlays.pop();
             return;
         }
-        let opener = self.current_route().screen();
+        let opener = self.view_screen();
         self.overlays.push(OpenOverlay { overlay: Box::new(overlays::help::HelpOverlay::with_contexts(contexts)), opener, kind });
     }
 
@@ -745,7 +787,7 @@ impl TunerApp {
             }
             req => {
                 let kind = std::mem::discriminant(&req);
-                let opener = self.current_route().screen();
+                let opener = self.view_screen();
                 let overlay = self.with_ctx(|ctx, _, _| overlays::build(req, ctx));
                 self.overlays.push(OpenOverlay { overlay, opener, kind });
             }
@@ -761,7 +803,7 @@ impl TunerApp {
                 self.apply_overlay_outcome(outcome);
                 !ignored
             } else {
-                let idx = self.screen_index(self.current_route().screen());
+                let idx = self.screen_index(self.view_screen());
                 self.with_ctx(|ctx, screens, _| screens[idx].on_action(ctx, action))
             };
             if !handled {
@@ -793,10 +835,13 @@ impl TunerApp {
         }
     }
 
-    fn apply_nav(&mut self) {
+    fn apply_nav(&mut self, egui_ctx: &egui::Context) {
         let reqs: Vec<NavRequest> = std::mem::take(&mut self.nav);
         for r in reqs {
             match r {
+                // leaving the video-only player (`p`, `q`) puts the window back
+                NavRequest::Back if self.video_only => self.toggle_popout(egui_ctx),
+                NavRequest::TogglePopOut => self.toggle_popout(egui_ctx),
                 NavRequest::Push(route) => {
                     if self.current_route() != &route {
                         self.routes.push(route);
@@ -821,8 +866,8 @@ impl TunerApp {
                 }
             }
         }
-        if self.entered.as_ref() != Some(self.current_route()) {
-            let route = self.current_route().clone();
+        let route = self.view_route();
+        if self.entered.as_ref() != Some(&route) {
             self.entered = Some(route.clone());
             let idx = self.screen_index(route.screen());
             self.with_ctx(|ctx, screens, _| screens[idx].on_enter(ctx, &route));
@@ -866,7 +911,44 @@ impl TunerApp {
     }
 
     fn chrome_hidden(&self) -> bool {
-        matches!(self.current_route().screen(), ScreenId::Player | ScreenId::Onboarding)
+        matches!(self.view_screen(), ScreenId::Player | ScreenId::Onboarding)
+    }
+
+    /// The pop-out key (`o`, Ctrl+Shift+O, a double-click on the video-only player): pop out,
+    /// or back in (DESIGN §21.6). Needs Hyprland; elsewhere a toast says so.
+    fn toggle_popout(&mut self, egui_ctx: &egui::Context) {
+        if self.popout_backend.is_none() {
+            self.toast(Toast::info("The pop-out player needs Hyprland: it pins a small window on every workspace"));
+            return;
+        }
+        let Some(t) = self.popout.toggle(self.window_size) else { return };
+        let req = match t {
+            Toggle::Out => {
+                // Hyprland can't pin a fullscreen window (the worker waits for this to land)
+                if self.window_fullscreen {
+                    self.set_window_fullscreen(false, egui_ctx);
+                }
+                let p = &self.services().config().player;
+                PopRequest::Out { size: p.popout_size, corner: p.popout_corner, last: p.popout_last }
+            }
+            Toggle::In { ours } => PopRequest::In { ours },
+        };
+        if let Some(b) = &self.popout_backend {
+            b.send(req);
+        }
+        egui_ctx.request_repaint();
+    }
+
+    fn on_popout_event(&mut self, ev: &PopOutEvent) {
+        self.popout.on_event(ev);
+        match ev {
+            PopOutEvent::PoppedIn { remember: Some(r) } => {
+                let r = *r;
+                self.config_edits.push(Box::new(move |c: &mut Config| c.player.popout_last = Some(r)));
+            }
+            PopOutEvent::Failed(e) => self.toast(Toast::error(format!("Couldn't move the player window: {e}"))),
+            _ => {}
+        }
     }
 
     /// `StartScreen::Last`: store the main screen the user leaves on (written at exit only).
@@ -987,6 +1069,9 @@ impl eframe::App for TunerApp {
         }
         let egui_ctx = ui.ctx().clone();
         let width = egui_ctx.content_rect().width();
+        // egui points are logical px (no zoom factor), like Hyprland's sizes
+        self.window_size = egui_ctx.content_rect().size();
+        self.video_only = self.popout.video_only(self.window_size);
         self.layout = LayoutClass::from_width(width, self.theme.rem());
         // the compositor's toggle, a double-click on video… (only the app's own requests are
         // known otherwise)
@@ -999,10 +1084,10 @@ impl eframe::App for TunerApp {
         self.images.pump();
         self.dispatch_actions(&egui_ctx);
         self.handle_dropped_files();
-        self.apply_nav();
+        self.apply_nav(&egui_ctx);
 
         let theme = self.theme.clone();
-        let current = self.current_route().screen();
+        let current = self.view_screen();
         let chrome = !self.chrome_hidden();
         let cfg = self.services().config();
         let side_w = crate::ui::layout::sidebar_width(width, theme.rem(), cfg.interface.sidebar);
@@ -1074,7 +1159,7 @@ impl eframe::App for TunerApp {
             let stack = self.key_stack();
             self.pending_actions.push((action, stack));
         }
-        self.apply_nav();
+        self.apply_nav(&egui_ctx);
         self.apply_config_edits(&egui_ctx);
         if self.budget.deferred() || self.now_next.pending() || !self.pending_actions.is_empty() {
             egui_ctx.request_repaint();
@@ -2593,5 +2678,74 @@ mod tests {
             rig.press(Key::Escape, NONE);
             rig.frame_with(vec![]);
         }
+    }
+
+    /// Records the app's pop-out requests in place of the Hyprland worker.
+    struct PopRecorder(Rc<RefCell<Vec<PopRequest>>>);
+
+    impl PopOutBackend for PopRecorder {
+        fn send(&self, req: PopRequest) {
+            self.0.borrow_mut().push(req);
+        }
+    }
+
+    fn pop_event(ev: PopOutEvent) -> AppEvent {
+        AppEvent::Platform(PlatformEvent::PopOut(ev))
+    }
+
+    /// Outside Hyprland the pop-out key explains itself and changes nothing.
+    #[test]
+    fn pop_out_without_hyprland_only_explains() {
+        let mut rig = Rig::new();
+        let before = rig.route().clone();
+        rig.press(Key::O, Modifiers { shift: true, ..CTRL });
+        rig.frame_with(vec![]);
+        assert!(rig.log().toasts.iter().any(|t| t.text.contains("needs Hyprland")), "{:?}", rig.log().toasts);
+        assert!(!rig.app.video_only);
+        assert_eq!(rig.route(), &before);
+    }
+
+    /// Ctrl+Shift+O on Live pops out: the window shows the video-only player (Esc pops back
+    /// in) over an untouched route stack, which is on screen again after the pop-in; the
+    /// pop-out's place is remembered. Super+O's floating + pinned window is video-only up to
+    /// Omarchy's pop size only.
+    #[test]
+    fn pop_out_shows_the_video_only_player_and_comes_back_to_the_screen() {
+        let mut rig = Rig::new();
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        rig.app.popout_backend = Some(Box::new(PopRecorder(sent.clone())));
+        let before = rig.route().clone();
+
+        rig.press(Key::O, Modifiers { shift: true, ..CTRL });
+        assert_eq!(
+            *sent.borrow(),
+            [PopRequest::Out { size: crate::config::PopoutSize::Small, corner: crate::config::PopoutCorner::BottomRight, last: None }]
+        );
+        rig.size = egui::vec2(480.0, 270.0);
+        rig.frame_with(vec![]);
+        assert!(rig.app.video_only && rig.app.chrome_hidden());
+        assert_eq!(rig.app.view_screen(), ScreenId::Player);
+        assert!(rig.app.key_stack().contains(&KeyContext::PopOut), "{:?}", rig.app.key_stack());
+        assert_eq!(rig.route(), &before, "the screens under the pop-out stay");
+        rig.event(pop_event(PopOutEvent::Flags(crate::platform::popout::WindowFlags { floating: true, pinned: true })));
+        rig.event(pop_event(PopOutEvent::PoppedOut));
+
+        rig.press(Key::Escape, NONE);
+        assert_eq!(sent.borrow().last(), Some(&PopRequest::In { ours: true }));
+        rig.event(pop_event(PopOutEvent::PoppedIn { remember: Some([1424, 914, 480, 270]) }));
+        rig.size = egui::vec2(1280.0, 800.0);
+        rig.frame_with(vec![]);
+        assert!(!rig.app.video_only);
+        assert_eq!(rig.app.view_screen(), before.screen());
+        assert_eq!(rig.app.services().config().player.popout_last, Some([1424, 914, 480, 270]));
+
+        // Super+O: floating + pinned at its 1300 × 900
+        rig.event(pop_event(PopOutEvent::Flags(crate::platform::popout::WindowFlags { floating: true, pinned: true })));
+        rig.size = egui::vec2(1300.0, 900.0);
+        rig.frame_with(vec![]);
+        assert!(rig.app.video_only);
+        rig.size = egui::vec2(1600.0, 1000.0);
+        rig.frame_with(vec![]);
+        assert!(!rig.app.video_only, "a big pinned window keeps the full UI");
     }
 }

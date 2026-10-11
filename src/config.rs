@@ -212,6 +212,44 @@ pub struct PlayerConfig {
     pub watched_pct: u8,
     /// Extra raw mpv options (power users). Applied after ours at init.
     pub mpv_options: BTreeMap<String, String>,
+    /// Pop-out player (Hyprland, DESIGN §21.6): size of a new pop-out…
+    pub popout_size: PopoutSize,
+    /// …and the monitor corner it goes to.
+    pub popout_corner: PopoutCorner,
+    /// Where the last pop-out was when it was popped back in (`[x, y, w, h]`, logical px,
+    /// x/y relative to its monitor's top-left): a moved or resized pop-out comes back there.
+    /// Cleared when the size or corner is changed in Settings.
+    pub popout_last: Option<[i32; 4]>,
+}
+
+/// 16:9 pop-out sizes (logical px).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PopoutSize {
+    /// 480 × 270.
+    #[default]
+    Small,
+    /// 640 × 360.
+    Medium,
+}
+
+impl PopoutSize {
+    pub fn logical(self) -> (i32, i32) {
+        match self {
+            PopoutSize::Small => (480, 270),
+            PopoutSize::Medium => (640, 360),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PopoutCorner {
+    #[default]
+    BottomRight,
+    BottomLeft,
+    TopRight,
+    TopLeft,
 }
 
 impl Default for PlayerConfig {
@@ -236,6 +274,9 @@ impl Default for PlayerConfig {
             resume_min_s: 60,
             watched_pct: 92,
             mpv_options: BTreeMap::new(),
+            popout_size: PopoutSize::Small,
+            popout_corner: PopoutCorner::BottomRight,
+            popout_last: None,
         }
     }
 }

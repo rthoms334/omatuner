@@ -66,12 +66,14 @@ fn split_columns(contexts: &[(KeyContext, Vec<(String, &'static str)>)], cols: u
     let mut out = vec![Vec::new(); cols.max(1)];
     let (mut col, mut acc) = (0, 0);
     for (i, (_, rows)) in contexts.iter().enumerate() {
-        if acc >= per && col + 1 < out.len() {
+        let h = rows.len() + 2;
+        // next column once this block would end up more past the column's share than not
+        if acc > 0 && acc + h / 2 >= per && col + 1 < out.len() {
             col += 1;
             acc = 0;
         }
         out[col].push(i);
-        acc += rows.len() + 2;
+        acc += h;
     }
     out
 }
