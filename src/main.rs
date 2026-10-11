@@ -46,6 +46,8 @@ const REFRESH_SETTLE: Duration = Duration::from_millis(500);
 fn main() -> anyhow::Result<()> {
     tuner::platform::limit_malloc_arenas();
     let cli = Cli::parse();
+    // developer-only screenshot capture (DESIGN §23.1); a typo fails here, not after a minute
+    let devshot = tuner::devshot::ShotConfig::from_env().map_err(|e| anyhow::anyhow!("TUNER_SCREENSHOT*: {e}"))?;
     let paths = match &cli.profile_dir {
         Some(dir) => AppPaths::rooted(dir),
         None => AppPaths::from_env()?,
@@ -139,7 +141,11 @@ fn main() -> anyhow::Result<()> {
             let fonts: LoadedFonts = fonts_thread.join().unwrap_or_default();
             let theme = Arc::new(theme_thread.join().unwrap_or_else(|_| Theme::fallback()));
             tracing::info!("theme '{}' ({:?})", theme.name, theme.palette.mode);
-            Ok(Box::new(tuner::app::TunerApp::new(cc, services, events, theme, fonts, request)))
+            let mut app = tuner::app::TunerApp::new(cc, services, events, theme, fonts, request);
+            if let Some(cfg) = devshot {
+                app.set_devshot(tuner::devshot::Driver::new(cfg));
+            }
+            Ok(Box::new(app))
         }),
     )
     .map_err(|e| anyhow::anyhow!("window: {e}"))?;

@@ -250,6 +250,7 @@ Every row is one work package's territory (§24.2 is the authoritative ownership
 | `ui/screens/{home,movies,series,movie_detail,series_detail,settings,onboarding,epg_mapping,logs}.rs`, `ui/widgets/poster.rs`, `ui/overlays/{search,resume}.rs` | WP-12 | Home, VOD, settings, onboarding, search UI, PIN UI, logs, EPG mapping. |
 | `theme/**`, `fonts.rs` | WP-01 | Theme parsing/tokens/egui mapping (implemented core), live reload, fonts + fallbacks + RTL helper. |
 | `ui/scope.rs`, `ui/widgets/scope_bar.rs`, `ui/overlays/playlists.rs` | §29 | Which playlist a screen shows: eligibility, the stored scope, look-alikes and free colours; the scope bar / button / stripe; the Alt+P picker and a tab's menu. |
+| `devshot.rs`, `examples/demo_profile.rs`, `scripts/screenshots.sh` | dev tooling | README screenshots: env-only capture driver, made-up demo profile, capture script (§23.1). |
 
 Cross-module contracts worth repeating:
 * `UiCtx` (ui/mod.rs) is the only thing screens get; config changes go through
@@ -2931,6 +2932,40 @@ for any window. Tuner does it for itself with `o` in the player or Ctrl+Shift+O 
 Lint gate: `cargo clippy --all-targets -- -D warnings` (baseline is zero; stub modules carry a
 scoped allow in `lib.rs` that each WP removes for its module). Tests never call
 `redact::clear_secrets`.
+
+### 23.1 Dev notes: README screenshots
+
+`scripts/screenshots.sh [shot…]` regenerates `docs/screenshots/*.png`. The repository is
+public, so every image shows made-up content only:
+
+* **Demo profile** — `cargo run --example demo_profile -- <dir> [--media <file>] [--silent]`:
+  three fictional playlists (Northwind, Aurora, Harbor Free; distinct colours) as local M3U
+  files imported by the real `RefreshSource` job, ~60 channels with quality badges in
+  country-tagged categories (`UK | News`, `FR | Cinéma`…), a guide from an XMLTV file
+  (`RefreshEpg`) covering yesterday 06:00 to the day after tomorrow, movies and series whose
+  titles repeat across (and inside) playlists so "All playlists" stacks them, details written
+  with `store::import::store_movie_details`, and favourites, history, progress and a reminder
+  through `store::user`. Logos (monograms) and posters/backdrops (gradient landscapes + title)
+  are rendered with resvg using egui's bundled fonts and written into the profile's image
+  cache under `https://img.tuner-demo.invalid/…` URLs, which are never fetched. Content is
+  seeded; only the guide follows today's date. `demo/refs.env` names playlist ids and `--play`
+  references for the script. `tests/demo_profile.rs` builds it and checks the library.
+* **Capture** (`src/devshot.rs`, environment only, nothing in `--help`):
+  `TUNER_SCREENSHOT=<png>` captures the window with `ViewportCommand::Screenshot` and exits;
+  `TUNER_SCREENSHOT_SIZE=WxH` first floats, sizes and centres the window over Hyprland IPC
+  (`platform::popout::Hypr::float_centred`, found by pid); `TUNER_SCREENSHOT_SCRIPT` runs
+  steps (`view:`, `play:`, `key:`, `text:`, `move:`, `click:`, `size:`, `categories:`,
+  `wait:`) 0.35 s apart once the first library is in and the window has its size;
+  `TUNER_SCREENSHOT_AFTER` (default 2 s) waits after the last step. The PNG is scaled to the
+  window's logical size, so the monitor scale doesn't change the result.
+* **Fixed theme** — `TUNER_THEME_DIR=<dir>` loads that Omarchy theme directory instead of the
+  live one (no `~/.config/omarchy/shell.toml`, rounding 0, no theme watcher). The script uses
+  the bundled fixtures `tests/fixtures/theme/tokyo-night` (dark) and `catppuccin-latte`
+  (light). Fonts still come from fontconfig (Omarchy: JetBrainsMono Nerd Font).
+* **Video** — 8 s of the *Sintel* trailer (© copyright Blender Foundation |
+  durian.blender.org, CC BY 3.0), downloaded by the script into `target/screenshots/media/`
+  (sha256-checked, never committed), letterbox cropped and looped by mpv (`loop-file=inf`,
+  `ao=null` with `--silent`). Without the download an ffmpeg test pattern plays instead.
 
 ---
 
