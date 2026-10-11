@@ -28,10 +28,11 @@ use rusqlite::Connection;
 use crate::error::Result;
 use crate::model::{
     CategoryFilter, ChannelId, ChannelSummary, Collection, FavListId, FavouriteEntry, FavouriteList, Group, GroupFilter, GroupId, ItemKey, ItemKind,
-    ItemRef, MovieId, SeriesId, SortMode, SourceColor, SourceId, SourceKind, Timestamp, VodKind, VodSummary,
+    ItemRef, MovieId, SeriesId, SortMode, SourceColor, SourceId, SourceKind, SourceSettings, Timestamp, VodKind, VodSummary,
 };
+use crate::sources::category_tags::{self, CategorySummary};
 use crate::store::live::{GROUP_COLS, GROUP_FROM, GROUP_ORDER, group_from_row};
-use crate::store::sql::{enum_parse, u32_of};
+use crate::store::sql::{enum_parse, from_json_opt, kind_from_sql, u32_of};
 
 /// Non-secret source facts for badges/filters.
 #[derive(Debug, Clone, PartialEq)]
@@ -358,7 +359,8 @@ const RECENT_CHANNELS: usize = 50;
 fn load_sources(conn: &Connection) -> Result<Vec<SourceMeta>> {
     let mut stmt = conn.prepare_cached(
         "SELECT s.id, s.name, s.icon, s.color, s.kind, s.enabled, s.last_refresh,
-                EXISTS (SELECT 1 FROM movie m WHERE m.source_id = s.id), EXISTS (SELECT 1 FROM series x WHERE x.source_id = s.id)
+                EXISTS (SELECT 1 FROM movie m WHERE m.source_id = s.id), EXISTS (SELECT 1 FROM series x WHERE x.source_id = s.id),
+                s.settings
          FROM source s ORDER BY s.sort_index, s.id",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -373,19 +375,22 @@ fn load_sources(conn: &Connection) -> Result<Vec<SourceMeta>> {
             last_refresh: r.get(6)?,
             has_vod: r.get(7)?,
             has_series: r.get(8)?,
-            // P6-core: parsed from `s.settings` (DESIGN §28.4)
-            category_filter: None,
+            category_filter: from_json_opt::<SourceSettings>(r.get(9)?).and_then(|st| st.category_filter),
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// Groups of every kind of enabled sources, in display order per kind.
-fn load_groups(conn: &Connection) -> Result<(Vec<Group>, Vec<Group>, Vec<Group>)> {
+/// Groups of every kind of enabled sources, in display order per kind, with each source's
+/// category filter applied (`hidden` is effective; DESIGN §28.4).
+fn load_groups(conn: &Connection, sources: &[SourceMeta]) -> Result<(Vec<Group>, Vec<Group>, Vec<Group>)> {
+    let rules: HashMap<SourceId, &CategoryFilter> = sources.iter().filter_map(|s| Some((s.id, s.category_filter.as_ref()?))).collect();
     let mut stmt = conn.prepare_cached(&format!("SELECT {GROUP_COLS} {GROUP_FROM} WHERE s.enabled = 1 ORDER BY g.kind, {GROUP_ORDER}"))?;
     let (mut ch, mut mv, mut se) = (Vec::new(), Vec::new(), Vec::new());
     for g in stmt.query_map([], group_from_row)? {
-        let g = g?;
+        let mut g = g?;
+        let rule = rules.get(&g.source_id).copied();
+        apply_category_filter(&mut g, rule);
         match g.kind {
             ItemKind::Channel => ch.push(g),
             ItemKind::Movie => mv.push(g),
@@ -413,9 +418,15 @@ pub fn apply_category_filter(g: &mut Group, filter: Option<&CategoryFilter>) {
 /// Per-tag summary of one source's categories (all kinds, the source enabled or not) for the
 /// "Choose what to show" picker (DESIGN §28.6). Reads `grp` only (≤ a few thousand rows): run
 /// it off the UI thread (a `Loader`), never per frame.
-pub fn category_summary(conn: &Connection, source: SourceId) -> Result<crate::sources::category_tags::CategorySummary> {
-    let _ = (conn, source);
-    todo!("P6-core")
+pub fn category_summary(conn: &Connection, source: SourceId) -> Result<CategorySummary> {
+    let mut stmt = conn.prepare_cached("SELECT kind, COALESCE(raw_name, name), item_count, raw_name IS NULL FROM grp WHERE source_id = ?1")?;
+    let rows: Vec<(ItemKind, String, u32, bool)> = stmt
+        .query_map([source], |r| Ok((kind_from_sql(&r.get::<_, String>(0)?)?, r.get(1)?, u32_of(r.get(2)?), r.get(3)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(CategorySummary {
+        tags: category_tags::summarize(rows.iter().map(|(kind, name, n, _)| (*kind, name.as_str(), *n))),
+        needs_refresh: rows.iter().any(|r| r.3),
+    })
 }
 
 /// Per group: (display position, hidden, locked).
@@ -565,7 +576,7 @@ fn load_vod(conn: &Connection, movies: bool, groups: &[Group]) -> Result<(Vec<Vo
 /// hidden; it is locked when it or any of its groups is locked.
 pub fn load(conn: &Connection) -> Result<Library> {
     let sources = load_sources(conn)?;
-    let (ch_groups, movie_groups, series_groups) = load_groups(conn)?;
+    let (ch_groups, movie_groups, series_groups) = load_groups(conn, &sources)?;
     let live = load_live(conn, ch_groups)?;
     let (movies, mut members) = load_vod(conn, true, &movie_groups)?;
     let (series, series_members) = load_vod(conn, false, &series_groups)?;

@@ -3085,25 +3085,30 @@ egui's bundled emoji font has no flag sequences — the short code is shown as a
 6. *Space-only separator* (`"UK SPORTS"`, `"ARABIC NEWS"`) is accepted only for (a) full names
    (≥ 4 letters: ENGLISH, FRANCE, ARABIC, LATINO, AFRICA…) and (b) codes written in upper case
    in the raw name that are not English words (`AMBIGUOUS`: AM AN AS AT BE BY DO GO HE HI IF IN
-   IS IT ME MY NO OF ON OR SO TO UP WE, CAN…). `"IT Crowd"`, `"Us Weekly"`, `"In Cinemas"`
-   stay untagged; `"IT: Sport"` is Italy.
-7. *Non-tags* are skipped when they are bracketed or separated, and detection continues with
-   the next token (at most 3 leading tokens): `4K 8K HD FHD UHD SD HEVC VIP PPV VOD NEW XXX
-   ADULT 18+ 24/7 TV FM LIVE RADIO MULTI INT INTL INTERNATIONAL WORLD TOP PREMIUM`. So
-   `"VIP | UK | Sports"` and `"[4K] UK: Movies"` → GB; `"4K | Sports"` → untagged.
+   IS IT ME MY NO OF ON OR SO TO UP WE, abbreviations such as AD AI DJ ID LA MC PR, the Arabic
+   article AL, three-letter words CAN SPA BRA PER MAR DEN FIN…). `"IT Crowd"`, `"Us Weekly"`,
+   `"In Cinemas"`, `"AL JAZEERA"` stay untagged; `"IT: Sport"` is Italy.
+7. *Non-tags* (and plain numbers) are skipped — bracketed, separated or followed by a space —
+   and detection continues with the next token (at most 3 leading tokens): `4K 8K HD FHD UHD
+   SD HDR HEVC H265 VIP PPV VOD NEW XXX ADULT 18+ 24/7 TV FM LIVE RADIO MULTI INT INTL
+   INTERNATIONAL WORLD TOP PREMIUM`. So `"VIP | UK | Sports"`, `"VIP UK | Sports"` and
+   `"[4K] UK: Movies"` → GB; `"4K | Sports"` → untagged; `"NEW ZEALAND"` → NZ (`ZEALAND` is
+   listed).
 8. *Trailing* forms, only when nothing leads: a bracketed last token (`"Sports (UK)"`,
-   `"Movies [EN]"`) or a separated last token (`"NETFLIX - EN"`, `"Sports | UK"`). No
-   space-only form at the end.
+   `"Movies [EN]"`) or a separated last token (`"NETFLIX - EN"`, `"Sports | UK"`), trailing
+   non-tags skipped (`"Sports | UK | HD"`). No space-only form at the end.
 9. A token is a tag only when it is in the tables below — unknown words never become tags
    (`"CNN: Live"`, `"SKY | Movies"`, `"NBA: Games"` are untagged). Tokens may contain one inner
-   `-` or `/` when the whole is listed (`EX-YU`, `24/7`).
+   `-` or `/` when the whole is listed (`EX-YU`, `24/7`). A `-` between two letters is a
+   hyphenated word, not a separator (`"Sci-Fi"`, `"Re-Runs"`, `"Al-Jazeera"` are untagged;
+   `"UK - Docs"` is GB).
 
 **Synonyms** (token → tag; full table in code, tested):
 | tokens | tag |
 |---|---|
-| UK, GB, GBR, BRITAIN, ENGLAND, SCOTLAND, WALES, 🇬🇧 | `GB` |
+| UK, GB, GBR, BRITAIN, BRITISH, ENGLAND, SCOTLAND, WALES, 🇬🇧, 🏴 England/Scotland/Wales | `GB` |
 | US, USA, AMERICA | `US` |
-| CA, CAN, CANADA · AU, AUS, AUSTRALIA · IE, IRL, IRELAND · NZ, NZL | `CA` · `AU` · `IE` · `NZ` |
+| CA, CAN, CANADA · AU, AUS, AUSTRALIA · IE, IRL, IRELAND, IRISH · NZ, NZL, ZEALAND | `CA` · `AU` · `IE` · `NZ` |
 | EN, ENG, ENGLISH | `lang:en` (ENG is English, not England: providers use it for the language) |
 | AR, ARA, ARAB, ARABIC | `lang:ar` (IPTV convention; Argentina is ARG / ARGENTINA → `AR`) |
 | any other ISO 3166-1 alpha-2 code (embedded list), DEU/GER, FRA, ITA, ESP/SPA, POR/PRT, BRA, MEX, TUR, … (the three-letter set of `smart_names::COUNTRY3`), and English country names (FRANCE, GERMANY, DEUTSCHLAND, ITALIA, ESPANA, PORTUGAL, BRASIL, TURKEY/TURKIYE, POLAND/POLSKA, NETHERLANDS/HOLLAND, INDIA, PAKISTAN, …) | that country |
