@@ -305,6 +305,97 @@ pub fn same_episode(conn: &Connection, series: SeriesId, season: u32, episode: u
 }
 
 // ---------------------------------------------------------------------------------------------
+// Series: episodes matched across copies (P3)
+
+/// The series copies among `ids` whose episodes aren't loaded yet: Xtream series load them
+/// lazily (`JobKind::LoadSeriesDetails`); a playlist's series has them from its import.
+pub fn unloaded_series(conn: &Connection, ids: &[SeriesId]) -> Result<Vec<SeriesId>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT s.details_at IS NULL AND src.kind = 'xtream' AND NOT EXISTS (SELECT 1 FROM episode e WHERE e.series_id = s.id)
+         FROM series s JOIN source src ON src.id = s.source_id WHERE s.id = ?1",
+    )?;
+    let mut out = Vec::new();
+    for &id in ids {
+        if stmt.query_row([id], |r| r.get::<_, bool>(0)).optional()?.unwrap_or(false) {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+/// The watch progress of the episodes of the series copies `ids`, matched by (season,
+/// episode): a watched mark wins (any copy watched → watched), else the latest progress.
+pub fn episode_progress(conn: &Connection, ids: &[SeriesId]) -> Result<HashMap<(u32, u32), crate::model::WatchProgress>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT e.season, e.episode, {} FROM watch_progress p JOIN episode e ON e.source_id = p.source_id AND e.key = p.item_key
+         WHERE p.kind = 'episode' AND e.series_id = ?1",
+        user::PROGRESS_COLS.split(", ").map(|c| format!("p.{c}")).collect::<Vec<_>>().join(", ")
+    ))?;
+    let mut out: HashMap<(u32, u32), crate::model::WatchProgress> = HashMap::new();
+    for &id in ids {
+        let rows = stmt.query_map([id], |r| {
+            let at = (r.get::<_, u32>(0)?, r.get::<_, u32>(1)?);
+            // the progress columns follow the two episode columns
+            let p = user::progress_from_offset(r, 2)?;
+            Ok((at, p))
+        })?;
+        for row in rows {
+            let (at, p) = row?;
+            match out.get(&at) {
+                Some(have) if (have.finished, have.updated_at) >= (p.finished, p.updated_at) => {}
+                _ => {
+                    out.insert(at, p);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Mark the episodes `eps` (season, episode) of every series copy in `copies` watched, or
+/// forget their progress (`on` false) — the series page's ✓ and "Mark season watched" on a
+/// combined series. Episodes are matched by season and number (a copy that lacks one is
+/// skipped). Returns the Undo (the rows as they were) and how many episodes it wrote.
+pub fn mark_episodes(conn: &Connection, copies: &[SeriesId], eps: &[(u32, u32)], on: bool, now: Timestamp) -> Result<(Undo, usize)> {
+    atomic(conn, |c| {
+        let mut items: Vec<(ItemRef, String)> = Vec::new();
+        let mut find = c.prepare_cached(
+            "SELECT e.source_id, e.key, COALESCE(NULLIF(e.title, ''), 'Episode ' || e.episode) FROM episode e
+             WHERE e.series_id = ?1 AND e.season = ?2 AND e.episode = ?3 ORDER BY e.id LIMIT 1",
+        )?;
+        for &s in copies {
+            for &(season, number) in eps {
+                if let Some((source, key, title)) = find
+                    .query_row(params![s, season, number], |r| Ok((r.get::<_, SourceId>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+                    .optional()?
+                {
+                    let title = format!("S{season:02}E{number:02} · {title}");
+                    items.push((ItemRef { source, kind: ItemKind::Episode, key: ItemKey(key) }, title));
+                }
+            }
+        }
+        let refs: Vec<ItemRef> = items.iter().map(|(r, _)| r.clone()).collect();
+        let before = snapshot(c, Table::Progress, &refs)?;
+        let mut del = c.prepare_cached("DELETE FROM watch_progress WHERE source_id = ?1 AND kind = 'episode' AND item_key = ?2")?;
+        let mut up = c.prepare_cached(
+            "INSERT INTO watch_progress(source_id, kind, item_key, position_s, finished, updated_at, title, fp)
+             VALUES (?1, 'episode', ?2, 0, 1, ?3, ?4, COALESCE(?5, '{}'))
+             ON CONFLICT(source_id, kind, item_key) DO UPDATE SET finished = 1, updated_at = excluded.updated_at,
+               title = excluded.title, fp = COALESCE(?5, watch_progress.fp)",
+        )?;
+        for (r, title) in &items {
+            if on {
+                let fp = user::fingerprint_of(c, r)?;
+                up.execute(params![r.source, r.key.as_str(), now, title, crate::store::sql::fp_opt(&fp)])?;
+            } else {
+                del.execute(params![r.source, r.key.as_str()])?;
+            }
+        }
+        Ok((before, items.len()))
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
 // Combined writes
 
 /// The user-data table an [`Undo`] restores.

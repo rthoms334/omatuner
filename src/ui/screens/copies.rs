@@ -107,6 +107,9 @@ pub(super) struct Copies {
     separated: Option<usize>,
     /// The page copy's TMDB id when the copies were listed.
     tmdb: Option<u32>,
+    /// The page was opened for its copy on purpose (a fanned-out copy, one playlist's list):
+    /// its ★ / ✓ / lock / hide / rename touch that copy only, like the card that led here.
+    on_purpose: bool,
 }
 
 impl Copies {
@@ -157,7 +160,8 @@ impl Copies {
             self.separated = None;
             self.focus = None;
             // the copy opened on purpose plays (a fanned-out copy, one playlist's list)
-            self.chosen = (st::take_pick(kind) && !self.members.is_empty()).then_some(page).flatten();
+            self.on_purpose = st::take_pick(kind);
+            self.chosen = (self.on_purpose && !self.members.is_empty()).then_some(page).flatten();
         } else if !self.members.is_empty() {
             self.separated = None;
         } else if before > 1 && !meta.is_some_and(|m| m.split) && tmdb.is_some() && tmdb != self.tmdb {
@@ -196,6 +200,22 @@ impl Copies {
 
     pub(super) fn len(&self) -> usize {
         self.members.len()
+    }
+
+    /// The page's ★ / ✓ / lock / hide / rename cover every copy (DESIGN §29.15, P3): the title
+    /// has several copies and the page wasn't opened for one of them on purpose.
+    pub(super) fn combined(&self) -> bool {
+        !self.members.is_empty() && !self.on_purpose
+    }
+
+    /// Any copy is in the default Favourites list (a combined ★).
+    pub(super) fn any_favourite(&self, ctx: &UiCtx<'_>) -> bool {
+        self.plan.copies.iter().any(|c| ctx.favs.is_fav(&c.item_ref))
+    }
+
+    /// Any copy is watched (a combined ✓).
+    pub(super) fn any_watched(&self) -> bool {
+        self.plan.copies.iter().any(|c| c.progress.as_ref().is_some_and(|p| p.finished))
     }
 
     /// The copy Play uses (`None`: the title has one copy — the page's —, or every copy is

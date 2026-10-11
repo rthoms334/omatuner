@@ -889,25 +889,9 @@ impl VodBrowser {
                 Action::MarkWatched => ctx.toast(crate::msg::Toast::info("Open the series to mark its episodes watched")),
                 Action::Remove if self.open == Cat::Continue && self.movies => crate::ui::copies::mark_watched(ctx, &plan, &v.name, false),
                 Action::Remove if self.open == Cat::Continue => crate::ui::copies::forget_series(ctx, &plan),
-                Action::ToggleLock => {
-                    let (all, groups) = (self.all(ctx), self.all_groups(ctx));
-                    let copies: Vec<&VodSummary> = plan.copies.iter().filter_map(|c| all.get(c.item as usize)).collect();
-                    // every copy is locked (its own lock or a category's): unlock them, else lock them
-                    let on = !copies.iter().all(|x| x.locked);
-                    let by_group = !on && copies.iter().any(|x| kit::any_group_locked(groups, &x.group_ids));
-                    if kit::may_change_locks(ctx) {
-                        if by_group {
-                            ctx.toast(crate::msg::Toast::info("A copy is locked by its category — unlock the category with Ctrl+L"));
-                        }
-                        crate::ui::copies::set_locked(ctx, &plan, on);
-                    }
-                }
+                Action::ToggleLock => crate::ui::copies::toggle_lock(ctx, &plan, self.movies),
                 Action::ToggleHidden => crate::ui::copies::hide(ctx, &plan, &v.name),
-                Action::Rename => ctx.open(OverlayRequest::Rename(crate::ui::overlays::RenameSpec {
-                    title: "Rename every copy".into(),
-                    initial: v.name.to_string(),
-                    target: crate::ui::overlays::RenameTarget::Copies { items: plan.refs() },
-                })),
+                Action::Rename => crate::ui::copies::rename_dialog(ctx, &plan, &v.name),
                 Action::AddToList => kit::list_picker(ctx, &item, &v.name),
                 Action::ShowDetails => self.open_item(ctx, &v, false),
                 _ => kit::not_here(ctx),

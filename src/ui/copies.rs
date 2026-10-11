@@ -305,13 +305,21 @@ fn playlists(lib: &Library, refs: &[ItemRef]) -> String {
 /// ★ on a combined title (default Favourites list): add the copy that would play, or remove
 /// every copy — the index is patched at once, the Undo toast follows the write.
 pub fn toggle_favourite(ctx: &mut crate::ui::UiCtx<'_>, plan: &CopyPlan) {
+    toggle_favourite_of(ctx, plan, None);
+}
+
+/// [`toggle_favourite`] where `plays` is the copy that would play (a detail page's picked
+/// copy) instead of the plan's first.
+pub fn toggle_favourite_of(ctx: &mut crate::ui::UiCtx<'_>, plan: &CopyPlan, plays: Option<u32>) {
     let Some(list) = ctx.favs.default_list() else {
         ctx.toast(Toast::error("The Favourites list is missing"));
         return;
     };
     let refs = plan.refs();
     let on = !refs.iter().any(|r| ctx.favs.is_fav(r));
-    let Some(plays) = plan.first().or(plan.copies.first().map(|c| c.item)).and_then(|i| plan.get(i)).map(|c| c.item_ref.clone()) else { return };
+    let Some(plays) = plays.or(plan.first()).or(plan.copies.first().map(|c| c.item)).and_then(|i| plan.get(i)).map(|c| c.item_ref.clone()) else {
+        return;
+    };
     if on {
         ctx.favs.apply_toggle(list, &plays, true);
     } else {
@@ -329,8 +337,13 @@ fn favourite_write(ctx: &crate::ui::UiCtx<'_>, list: FavListId, refs: Vec<ItemRe
 /// ✓ on a combined movie: mark the copy that would play watched, or (`on` false) forget every
 /// copy's progress.
 pub fn mark_watched(ctx: &mut crate::ui::UiCtx<'_>, plan: &CopyPlan, title: &str, on: bool) {
+    mark_watched_of(ctx, plan, None, title, on);
+}
+
+/// [`mark_watched`] where `plays` is the copy that would play (a detail page's picked copy).
+pub fn mark_watched_of(ctx: &mut crate::ui::UiCtx<'_>, plan: &CopyPlan, plays: Option<u32>, title: &str, on: bool) {
     let refs = plan.refs();
-    let Some(plays) = plan.first().and_then(|i| plan.get(i)).or(plan.copies.first()).map(|c| c.item_ref.clone()) else { return };
+    let Some(plays) = plays.or(plan.first()).and_then(|i| plan.get(i)).or(plan.copies.first()).map(|c| c.item_ref.clone()) else { return };
     let (now, title) = (ctx.now, title.to_owned());
     let text = if on { "Marked as watched" } else { "Removed from Continue watching" };
     write_with_undo(ctx, DataScope::Progress, text.to_owned(), move |c| copies::watched(c, &refs, (&plays, &title), on, now));
@@ -354,6 +367,32 @@ pub fn set_locked(ctx: &mut crate::ui::UiCtx<'_>, plan: &CopyPlan, on: bool) {
     let refs = plan.refs();
     let text = if on { "Locked every copy" } else { "Unlocked every copy" };
     write_with_undo(ctx, DataScope::Overrides, text.into(), move |c| copies::lock(c, &refs, on));
+}
+
+/// Ctrl+L on a combined title (a grid card, a Home tile, a detail page): every copy locked
+/// (its own lock or its category's) → unlock them all, else lock them all — after the PIN
+/// checks of `kit::may_change_locks`; a copy locked by its category says so.
+pub fn toggle_lock(ctx: &mut crate::ui::UiCtx<'_>, plan: &CopyPlan, movies: bool) {
+    let all = crate::ui::stacks::all(ctx.lib, movies);
+    let groups = if movies { &ctx.lib.vod.movie_groups } else { &ctx.lib.vod.series_groups };
+    let copies: Vec<&crate::model::VodSummary> = plan.copies.iter().filter_map(|c| all.get(c.item as usize)).collect();
+    let on = !copies.iter().all(|x| x.locked);
+    let by_group = !on && copies.iter().any(|x| crate::ui::screens::home::kit::any_group_locked(groups, &x.group_ids));
+    if crate::ui::screens::home::kit::may_change_locks(ctx) {
+        if by_group {
+            ctx.toast(Toast::info("A copy is locked by its category — unlock the category with Ctrl+L"));
+        }
+        set_locked(ctx, plan, on);
+    }
+}
+
+/// F2 on a combined title: the rename dialog for every copy.
+pub fn rename_dialog(ctx: &mut crate::ui::UiCtx<'_>, plan: &CopyPlan, name: &str) {
+    ctx.open(OverlayRequest::Rename(crate::ui::overlays::RenameSpec {
+        title: "Rename every copy".into(),
+        initial: name.to_owned(),
+        target: crate::ui::overlays::RenameTarget::Copies { items: plan.refs() },
+    }));
 }
 
 /// Ctrl+H on a combined title: every copy; the toast names their playlists.
@@ -384,4 +423,100 @@ pub fn pin(ctx: &mut crate::ui::UiCtx<'_>, plan: &CopyPlan, item: &ItemRef, on: 
 pub fn rename(ctx: &mut crate::ui::UiCtx<'_>, refs: Vec<ItemRef>, name: &str, overwrite: bool) {
     let name = name.to_owned();
     write_with_undo(ctx, DataScope::Overrides, format!("Renamed to {name}"), move |c| copies::rename(c, &refs, &name, overwrite));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Series copies: episodes loaded on demand (P3)
+
+/// Waits for the episodes of series copies that aren't loaded yet (Xtream series load them
+/// lazily): [`EpisodeFetch::start`] submits `JobKind::LoadSeriesDetails` for each, and
+/// [`EpisodeFetch::poll`] (every frame; a few cheap reads at most four times a second) says
+/// when every one has settled — loaded, or its load finished without episodes (failed). Used
+/// by the series page's "mark watched in every copy" and the delete-playlist dialog's move.
+#[derive(Debug, Default)]
+pub struct EpisodeFetch {
+    pending: Vec<SeriesId>,
+    failed: Vec<SeriesId>,
+    /// How many were asked for (the progress line).
+    asked: usize,
+    next_check: Option<std::time::Instant>,
+}
+
+/// How often [`EpisodeFetch::poll`] looks at the jobs and the database.
+const FETCH_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+impl EpisodeFetch {
+    /// Load the episodes of `ids` (the caller passes the copies `copies::unloaded_series`
+    /// named). Adds to a fetch already running.
+    pub fn start(&mut self, ctx: &UiCtx<'_>, ids: &[SeriesId]) {
+        if self.pending.is_empty() {
+            self.failed.clear();
+            self.asked = 0;
+        }
+        for &id in ids {
+            if !self.pending.contains(&id) {
+                ctx.services.jobs.submit(crate::jobs::JobKind::LoadSeriesDetails(id));
+                self.pending.push(id);
+                self.asked += 1;
+            }
+        }
+        self.next_check = Some(std::time::Instant::now() + FETCH_POLL);
+    }
+
+    /// Still waiting for some copies.
+    pub fn busy(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// (loaded so far, asked for) — "Loading episodes of 1 of 2 copies…".
+    pub fn progress(&self) -> (usize, usize) {
+        (self.asked - self.pending.len(), self.asked)
+    }
+
+    /// `Some(failed)` once every copy settled (then idle again); `None` while waiting or idle.
+    pub fn poll(&mut self, ctx: &UiCtx<'_>, egui: &eframe::egui::Context) -> Option<Vec<SeriesId>> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let now = std::time::Instant::now();
+        if self.next_check.is_some_and(|t| now < t) {
+            egui.request_repaint_after(FETCH_POLL);
+            return None;
+        }
+        self.next_check = Some(now + FETCH_POLL);
+        let running: Vec<SeriesId> = ctx
+            .services
+            .jobs
+            .active()
+            .into_iter()
+            .filter_map(|j| match j.kind {
+                crate::jobs::JobKind::LoadSeriesDetails(id) => Some(id),
+                _ => None,
+            })
+            .collect();
+        let settled: Vec<SeriesId> = self.pending.iter().copied().filter(|id| !running.contains(id)).collect();
+        if !settled.is_empty() {
+            let unloaded = copies::unloaded_series(ctx.db, &settled).unwrap_or_else(|_| settled.clone());
+            self.failed.extend(unloaded);
+            self.pending.retain(|id| !settled.contains(id));
+        }
+        if self.pending.is_empty() {
+            return Some(std::mem::take(&mut self.failed));
+        }
+        egui.request_repaint_after(FETCH_POLL);
+        None
+    }
+}
+
+/// ✓ / "Mark season watched" on a combined series: the episodes `eps` (season, number) of
+/// every copy in `copies` are marked (or their progress forgotten), with an Undo toast;
+/// `missing` names the playlists whose copy couldn't load its episodes (the toast says so).
+pub fn mark_episodes(ctx: &UiCtx<'_>, copies: Vec<SeriesId>, eps: Vec<(u32, u32)>, on: bool, missing: &[String]) {
+    let what = if on { "Marked watched in every copy" } else { "Marked unwatched in every copy" };
+    let text = match missing {
+        [] => what.to_owned(),
+        names => format!("{what} — {} couldn't load its episodes", names.join(", ")),
+    };
+    let now = ctx.now;
+    write_with_undo(ctx, DataScope::Progress, text, move |c| copies::mark_episodes(c, &copies, &eps, on, now).map(|(u, _)| u));
 }
