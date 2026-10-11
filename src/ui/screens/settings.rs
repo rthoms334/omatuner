@@ -430,6 +430,8 @@ enum Local {
     SrcName,
     SrcIcon,
     SrcColor,
+    /// The playlist's short code on cards and rows (empty = derived from the name).
+    SrcCode,
     SrcUrl,
     SrcServer,
     SrcUser,
@@ -457,6 +459,7 @@ impl Local {
                 | Local::PinNew
                 | Local::PinConfirm
                 | Local::SrcName
+                | Local::SrcCode
                 | Local::SrcUrl
                 | Local::SrcServer
                 | Local::SrcUser
@@ -511,6 +514,8 @@ struct SourceEditor {
     name: String,
     icon: usize,
     color: usize,
+    /// The short code as typed (empty = automatic).
+    code: String,
     url: String,
     server: String,
     user: String,
@@ -544,6 +549,7 @@ impl SourceEditor {
             name: s.name.clone(),
             icon: glyphs::SOURCE_ICONS.iter().position(|g| *g == s.icon).unwrap_or(0),
             color: super::onboarding::COLORS.iter().position(|c| c.0 == s.color).unwrap_or(0),
+            code: s.settings.code.clone().unwrap_or_default(),
             url: s.url.as_ref().map(|u| u.expose().clone()).or_else(|| s.path.as_ref().map(|p| p.display().to_string())).unwrap_or_default(),
             server: x.map(|x| x.server.clone()).unwrap_or_default(),
             user: x.map(|x| x.username.clone()).unwrap_or_default(),
@@ -568,6 +574,7 @@ impl SourceEditor {
         rebased(&mut self.name, &old.name, &new.name);
         rebased(&mut self.icon, &old.icon, &new.icon);
         rebased(&mut self.color, &old.color, &new.color);
+        rebased(&mut self.code, &old.code, &new.code);
         rebased(&mut self.url, &old.url, &new.url);
         rebased(&mut self.server, &old.server, &new.server);
         rebased(&mut self.user, &old.user, &new.user);
@@ -598,14 +605,33 @@ impl SourceEditor {
         s.m3u_origin().is_some() || (s.kind != SourceKind::Xtream && s.settings.keep_m3u)
     }
 
-    /// The edited source, or the field that is wrong. Also: whether a refresh is needed.
-    fn apply(&self) -> Result<(Source, bool), (Local, String)> {
+    /// The code this playlist gets from its (edited) name among `sources` (all playlists, as
+    /// stored): the short code field's placeholder.
+    fn auto_code(&self, sources: &[Source]) -> String {
+        let id = self.original.id;
+        let list = sources.iter().map(|s| if s.id == id { (self.name.trim(), None) } else { (s.name.as_str(), s.settings.code.as_deref()) });
+        let codes = crate::sources::codes::assign(list);
+        sources.iter().position(|s| s.id == id).and_then(|i| codes.get(i).cloned()).unwrap_or_else(|| crate::sources::codes::auto(&self.name))
+    }
+
+    /// The edited source, or the field that is wrong (`sources`: all playlists as stored, for
+    /// the short code's uniqueness). Also: whether a refresh is needed.
+    fn apply(&self, sources: &[Source]) -> Result<(Source, bool), (Local, String)> {
         let mut s = self.original.clone();
         let name = self.name.trim();
         if name.is_empty() {
             return Err((Local::SrcName, "The name can't be empty".into()));
         }
         s.name = name.to_owned();
+        let code = crate::sources::codes::parse(&self.code).map_err(|e| (Local::SrcCode, e.to_owned()))?;
+        if let Some(c) = &code {
+            // another playlist's code as cards show it now (its own or derived)
+            let now = crate::sources::codes::assign(sources.iter().map(|x| (x.name.as_str(), x.settings.code.as_deref())));
+            if let Some((other, _)) = sources.iter().zip(&now).find(|(x, n)| x.id != s.id && *n == c) {
+                return Err((Local::SrcCode, format!("{} already uses {c}", other.name)));
+            }
+        }
+        s.settings.code = code;
         s.icon = glyphs::SOURCE_ICONS.get(self.icon).copied().unwrap_or(glyphs::PLAYLIST).to_owned();
         s.color = super::onboarding::COLORS.get(self.color).map(|c| c.0).unwrap_or_default();
         match s.kind {
@@ -657,8 +683,9 @@ impl SourceEditor {
         s.settings.import_vod = tri(s.settings.import_vod, self.import_vod);
         s.settings.in_all = tri(s.settings.in_all, self.in_all);
         let o = &self.original;
-        // "Show in All playlists" is a view setting: the library rebuild applies it, no import
-        let fetched = |st: &SourceSettings| SourceSettings { in_all: None, ..st.clone() };
+        // "Show in All playlists" and the code are view settings: the library rebuild applies
+        // them, no import
+        let fetched = |st: &SourceSettings| SourceSettings { in_all: None, code: None, ..st.clone() };
         let refresh = s.url != o.url
             || s.path != o.path
             || s.xtream.as_ref().map(|x| (&x.server, &x.username, x.password.expose()))
@@ -1347,7 +1374,8 @@ impl SettingsScreen {
     fn editor_rows(&self, ctx: &UiCtx<'_>, e: &SourceEditor) -> Vec<Row> {
         let mut v = vec![Row::Section(format!("Edit {}", e.original.name))];
         let l = |field, label| Row::Local { field, label };
-        v.extend([l(Local::SrcName, "Name"), l(Local::SrcIcon, "Icon"), l(Local::SrcColor, "Colour")]);
+        v.extend([l(Local::SrcName, "Name"), l(Local::SrcIcon, "Icon"), l(Local::SrcColor, "Colour"), l(Local::SrcCode, "Short code")]);
+        v.push(Row::Note("Up to 3 letters or digits, shown on cards and in lists in the playlist's colour. Empty: from the name.".into(), false));
         match e.original.kind {
             SourceKind::Xtream => {
                 v.extend([l(Local::SrcServer, "Server"), l(Local::SrcUser, "Username"), l(Local::SrcPassword, "Password (empty = keep)")])
@@ -1466,6 +1494,7 @@ impl SettingsScreen {
                 let e = self.editor.as_mut()?;
                 match f {
                     Local::SrcName => &mut e.name,
+                    Local::SrcCode => &mut e.code,
                     Local::SrcUrl => &mut e.url,
                     Local::SrcServer => &mut e.server,
                     Local::SrcUser => &mut e.user,
@@ -1813,7 +1842,7 @@ impl SettingsScreen {
 
     fn save_source(&mut self, ctx: &mut UiCtx<'_>) {
         let Some(e) = &self.editor else { return };
-        match e.apply() {
+        match e.apply(&self.sources) {
             Err((f, msg)) => {
                 self.error = Some((f, msg));
                 let rows = self.rows(ctx);
@@ -3019,11 +3048,16 @@ impl SettingsScreen {
                         if field.is_text() {
                             let editing = focused && self.editing;
                             let password = matches!(field, Local::PinNew | Local::PinConfirm | Local::SrcPassword);
+                            let auto = match (field, &self.editor) {
+                                (Local::SrcCode, Some(e)) => e.auto_code(&self.sources),
+                                _ => String::new(),
+                            };
                             let placeholder = match field {
                                 Local::NewEpgUrl => "http://example.com/guide.xml.gz",
                                 Local::PinNew | Local::PinConfirm => "4–8 digits",
                                 Local::SrcServer => "panel.example.com:8080",
                                 Local::AttachFilter => "type to filter",
+                                Local::SrcCode => auto.as_str(),
                                 _ => "",
                             };
                             let mut buf = self.local_text(field).map(std::mem::take).unwrap_or_default();
@@ -3032,6 +3066,15 @@ impl SettingsScreen {
                             if matches!(field, Local::PinNew | Local::PinConfirm) {
                                 buf.retain(|c| c.is_ascii_digit());
                                 buf.truncate(8);
+                            }
+                            if field == Local::SrcCode {
+                                // letters and digits, upper-case, at most 3
+                                buf = buf
+                                    .chars()
+                                    .filter(|c| c.is_alphanumeric())
+                                    .map(|c| c.to_uppercase().next().unwrap_or(c))
+                                    .take(crate::sources::codes::MAX_LEN)
+                                    .collect();
                             }
                             if let Some(slot) = self.local_text(field) {
                                 *slot = buf;
@@ -4225,14 +4268,25 @@ mod tests {
         let mut e = SourceEditor::new(&src);
         assert_eq!(e.color, 6);
         e.name = "Renamed".into();
-        let (s, refresh) = e.apply().unwrap();
+        let (s, refresh) = e.apply(&[]).unwrap();
         assert_eq!(s.name, "Renamed");
         assert_eq!(s.xtream.as_ref().unwrap().password.expose(), "pw", "an empty password field keeps the stored one");
         assert!(!refresh, "a rename needs no refresh");
+        // the short code: the derived one as placeholder, unique, a view setting (no refresh)
+        let other = Source { id: SourceId(2), name: "Northwind".into(), ..src.clone() };
+        let all = [src.clone(), other];
+        assert_eq!(e.auto_code(&all), "RE", "from the edited name");
+        e.code = "NW".into();
+        assert_eq!(e.apply(&all).unwrap_err(), (Local::SrcCode, "Northwind already uses NW".into()));
+        e.code = "tv".into();
+        let (s, refresh) = e.apply(&all).unwrap();
+        assert_eq!((s.settings.code.as_deref(), refresh), (Some("TV"), false));
+        e.code = String::new();
+        assert_eq!(e.apply(&all).unwrap().0.settings.code, None, "empty = automatic");
         e.password = "new".into();
-        assert!(e.apply().unwrap().1, "new credentials refresh");
+        assert!(e.apply(&[]).unwrap().1, "new credentials refresh");
         e.server = "".into();
-        assert_eq!(e.apply().unwrap_err().0, Local::SrcServer);
+        assert_eq!(e.apply(&[]).unwrap_err().0, Local::SrcServer);
         assert!(!needs_credentials(&src));
         let detail = source_detail(&src, 1000, None, Some(0));
         assert!(detail.starts_with("Xtream · 0 ch") && detail.ends_with("Never refreshed"), "{detail}");
@@ -4273,7 +4327,7 @@ mod tests {
         };
         e.rebase(&upgraded);
         assert!(e.offers_xtream_switch() && e.use_xtream);
-        let (s, refresh) = e.apply().unwrap();
+        let (s, refresh) = e.apply(&[]).unwrap();
         assert_eq!(s.name, "Renamed", "the user's edit is kept");
         assert_eq!(s.kind, SourceKind::Xtream);
         assert_eq!(s.xtream.as_ref().map(|x| x.server.as_str()), Some("http://p.example/sub"), "an unchanged server isn't normalized");

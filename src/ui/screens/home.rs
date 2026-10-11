@@ -1252,7 +1252,7 @@ fn draw_tile(
                         count: c.count,
                         open: false,
                         fan: false,
-                        second: others.first().and_then(|p| ctx.source_of(item_kind, **p)),
+                        next: [0, 1].map(|k| others.get(k).and_then(|p| ctx.source_of(item_kind, **p))),
                         others: others.len(),
                     });
                     decor.dimmed = c.all_locked && !kit::unlocked(ctx);
@@ -1330,14 +1330,13 @@ fn channel_tile(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, id: ChannelId, cursor: b
     let right = rect.right() - pad;
     let p = ui.painter();
     let top_y = rect.top() + rect.height() * 0.32;
-    // top line, from the right edge: lock, then the playlist's glyph (DESIGN §13.0)
+    // top line, from the right edge: lock, then the playlist's code chip (DESIGN §13.0)
     let mut name_right = right;
     if ch.locked {
         name_right -= theme.font(TypeToken::Icon) + theme.space(SpaceToken::Md);
     }
     if let Some(src) = source {
-        let icon = egui::FontId::proportional(theme.font(TypeToken::Icon));
-        let r = badge::paint_source_mark(p, theme, egui::pos2(name_right, top_y), Align2::RIGHT_CENTER, src, icon, t.bg, t.fg);
+        let r = badge::paint_code_chip(p, theme, egui::pos2(name_right, top_y), Align2::RIGHT_CENTER, src, t.bg, t.fg);
         name_right = r.left() - theme.space(SpaceToken::Md);
         ui.interact(r, resp.id.with("source"), egui::Sense::hover())
             .on_hover_text(egui::RichText::new(&src.name).size(theme.font(TypeToken::BodySmall)));
@@ -2296,7 +2295,8 @@ mod tests {
     }
 
     /// With two playlists every card and tile says which one its item comes from — its own,
-    /// in the accessible label and readable on the meta line — and Settings ▸ Interface ▸
+    /// by name in the accessible label and by code in the corner chip, the meta line keeping
+    /// year and rating (DESIGN §13.0 "Playlist codes") — and Settings ▸ Interface ▸
     /// Playlist on cards applies at once; Auto counts eligible playlists only: enabled, and
     /// with that kind of item (DESIGN §13.0, §29).
     #[test]
@@ -2318,7 +2318,9 @@ mod tests {
         assert!(has_label(&h, "Movie 0 · Alpha") && has_label(&h, "Movie 0 · Bravo"), "same title, each card its own playlist");
         // only Bravo has channels: one playlist of channels, so channel tiles carry no mark
         assert!(has_label(&h, "Channel 1") && !has_label_containing(&h, "Channel 1 ·"), "per kind: {:?}", testkit::painted(&h));
-        assert!(testkit::painted(&h).iter().any(|s| s == "Bravo"), "the meta line names it without hovering");
+        let painted = testkit::painted(&h);
+        assert!(painted.iter().any(|s| s == "BR"), "the code chip shows it without hovering: {painted:?}");
+        assert!(!painted.iter().any(|s| s.contains("Bravo")), "no names on the cards: {painted:?}");
         let set = |h: &mut egui_kittest::Harness<'static, testkit::App<HomeScreen>>, mode: PlaylistOnCards| {
             let app = h.state_mut();
             let mut c = (*app.t.config).clone();
@@ -2328,7 +2330,7 @@ mod tests {
         };
         set(&mut h, PlaylistOnCards::Never);
         assert!(has_label(&h, "Movie 0") && !has_label_containing(&h, "· Alpha"), "Never: no playlist anywhere");
-        assert!(!testkit::painted(&h).iter().any(|s| s == "Bravo"));
+        assert!(!testkit::painted(&h).iter().any(|s| s == "BR"));
         // Auto with one of the two playlists disabled: a single playlist is noise
         set(&mut h, PlaylistOnCards::Auto);
         testkit::seed(&mut h.state_mut().t, move |c| Ok(c.execute("UPDATE source SET enabled = 0 WHERE id = ?1", [bravo])?));

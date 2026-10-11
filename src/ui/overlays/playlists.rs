@@ -299,6 +299,7 @@ mod tests {
             has_live: true,
             in_all: true,
             category_filter: None,
+            code: String::new(),
         };
         let lib = Library { sources: vec![meta(1, true), meta(2, false), meta(3, true)], ..Default::default() };
         let ids = |v: Option<Vec<SourceId>>| v.map(|v| v.into_iter().map(|s| s.0).collect::<Vec<_>>());

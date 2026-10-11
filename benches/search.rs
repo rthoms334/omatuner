@@ -102,6 +102,7 @@ fn library() -> Library {
         has_live: true,
         in_all: true,
         category_filter: None,
+        code: String::new(),
     };
     Library {
         sources: vec![source(1, "My IPTV"), source(2, "Backup")],

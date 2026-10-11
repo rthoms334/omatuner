@@ -93,6 +93,9 @@ pub struct SourceSettings {
     /// the "All playlists" scope of Movies, Series, Live TV and the guide (they still show when
     /// it is the playlist picked). `None` = shown.
     pub in_all: Option<bool>,
+    /// The playlist's short code on cards and rows (DESIGN §13.0, 1–3 letters or digits,
+    /// upper-case); `None` = derived from the name (`sources::codes`).
+    pub code: Option<String>,
 }
 
 /// Account information from Xtream `user_info`/`server_info` (UHF "server info").

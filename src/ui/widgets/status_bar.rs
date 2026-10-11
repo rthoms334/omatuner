@@ -5,6 +5,11 @@
 //! now-playing chip (click = player, ✕ = stop). No clock (the Omarchy bar has one). Hidden in
 //! the fullscreen player and during onboarding. Owner: WP-10a.
 //!
+//! While the cursor or the pointer is on a card or a row that shows a playlist code chip, the
+//! left side starts with what that item is, with the playlist's full name ("Northwind · 2019 ·
+//! ★ 7.9", DESIGN §13.0 "Playlist codes"): screens [`note_focus`] it while they draw, the bar
+//! shows it on the next frame.
+//!
 //! The right side is laid out first; the left text gets the remaining width and is elided, so
 //! nothing overlaps at 360 pt.
 
@@ -28,6 +33,48 @@ pub struct StatusInfo<'a> {
     pub hint: &'a str,
     /// Title of what plays, shown as a chip when the mini-player is hidden (Compact).
     pub now_playing: Option<&'a str>,
+    /// The focused / hovered item with its playlist's full name ([`take_focus`]).
+    pub focus: Option<&'a str>,
+}
+
+/// The focus line noted this frame: (text, from the pointer). A hovered item beats the
+/// keyboard cursor's.
+#[derive(Debug, Clone, Default)]
+struct FocusSlot {
+    pending: Option<(String, bool)>,
+    shown: Option<String>,
+}
+
+fn focus_id() -> egui::Id {
+    egui::Id::new("status-bar-focus")
+}
+
+/// A card or row under the cursor (`hovered`: under the pointer) says what it is, with its
+/// playlist's full name, for the status bar's next frame.
+pub fn note_focus(ctx: &egui::Context, text: String, hovered: bool) {
+    ctx.data_mut(|d| {
+        let slot = d.get_temp_mut_or_default::<FocusSlot>(focus_id());
+        if !slot.pending.as_ref().is_some_and(|(_, h)| *h && !hovered) {
+            slot.pending = Some((text, hovered));
+        }
+    });
+}
+
+/// The focus line of the last frame (the app, before it draws the bar); starts a new frame's.
+pub fn take_focus(ctx: &egui::Context) -> Option<String> {
+    ctx.data_mut(|d| {
+        let slot = d.get_temp_mut_or_default::<FocusSlot>(focus_id());
+        slot.shown = slot.pending.take().map(|p| p.0);
+        slot.shown.clone()
+    })
+}
+
+/// End of the frame (the app): the line changed since the bar drew it — draw the bar again.
+pub fn settle_focus(ctx: &egui::Context) {
+    let changed = ctx.data(|d| d.get_temp::<FocusSlot>(focus_id()).is_some_and(|s| s.pending.as_ref().map(|p| &p.0) != s.shown.as_ref()));
+    if changed {
+        ctx.request_repaint();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,14 +151,34 @@ pub fn status_bar(ui: &mut egui::Ui, theme: &Theme, info: &StatusInfo<'_>) -> St
             }
         }
         // the left side takes whatever is left
-        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| match jobs_summary(info.jobs) {
-            Some(text) => {
-                if chip(ui, text, t.text_secondary, size, "Background tasks").clicked() {
-                    click = StatusClick::Jobs;
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            let jobs = jobs_summary(info.jobs);
+            match (info.focus, jobs.is_some()) {
+                // the item, then the hints in one line (elided together)
+                (Some(f), false) => {
+                    let mut job = egui::text::LayoutJob::default();
+                    job.append(f, 0.0, egui::TextFormat::simple(egui::FontId::proportional(size), t.fg));
+                    job.append(info.hint, gap, egui::TextFormat::simple(egui::FontId::proportional(size), t.text_secondary));
+                    ui.add(egui::Label::new(job).truncate());
                 }
+                (Some(f), true) => {
+                    ui.scope(|ui| {
+                        ui.set_max_width((ui.available_width() * 0.5).max(80.0));
+                        ui.add(egui::Label::new(egui::RichText::new(f).size(size).color(t.fg)).truncate());
+                    });
+                }
+                (None, _) => {}
             }
-            None => {
-                ui.add(egui::Label::new(egui::RichText::new(info.hint).size(size).color(t.text_secondary)).truncate());
+            match jobs {
+                Some(text) => {
+                    if chip(ui, text, t.text_secondary, size, "Background tasks").clicked() {
+                        click = StatusClick::Jobs;
+                    }
+                }
+                None if info.focus.is_none() => {
+                    ui.add(egui::Label::new(egui::RichText::new(info.hint).size(size).color(t.text_secondary)).truncate());
+                }
+                None => {}
             }
         });
     });

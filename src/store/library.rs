@@ -65,6 +65,10 @@ pub struct SourceMeta {
     pub in_all: bool,
     /// The source's category filter (`SourceSettings::category_filter`, DESIGN §28).
     pub category_filter: Option<CategoryFilter>,
+    /// Its short code on cards and rows ("NW", DESIGN §13.0): the user's
+    /// (`SourceSettings::code`) or derived from the name, unique among the playlists; resolved
+    /// once per build (`sources::codes::assign`).
+    pub code: String,
 }
 
 impl SourceMeta {
@@ -740,22 +744,29 @@ fn load_sources(conn: &Connection) -> Result<Vec<SourceMeta>> {
     let rows = stmt.query_map([], |r| {
         let kind: String = r.get(4)?;
         let settings = from_json_opt::<SourceSettings>(r.get(9)?);
-        Ok(SourceMeta {
-            id: r.get(0)?,
-            name: r.get(1)?,
-            icon: r.get(2)?,
-            color: enum_parse(&r.get::<_, String>(3)?).unwrap_or_default(),
-            kind: enum_parse(&kind).unwrap_or(SourceKind::M3uUrl),
-            enabled: r.get(5)?,
-            last_refresh: r.get(6)?,
-            has_vod: r.get(7)?,
-            has_series: r.get(8)?,
-            has_live: r.get(10)?,
-            in_all: settings.as_ref().and_then(|st| st.in_all).unwrap_or(true),
-            category_filter: settings.and_then(|st| st.category_filter),
-        })
+        let user_code = settings.as_ref().and_then(|st| st.code.clone());
+        Ok((
+            user_code,
+            SourceMeta {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                icon: r.get(2)?,
+                color: enum_parse(&r.get::<_, String>(3)?).unwrap_or_default(),
+                kind: enum_parse(&kind).unwrap_or(SourceKind::M3uUrl),
+                enabled: r.get(5)?,
+                last_refresh: r.get(6)?,
+                has_vod: r.get(7)?,
+                has_series: r.get(8)?,
+                has_live: r.get(10)?,
+                in_all: settings.as_ref().and_then(|st| st.in_all).unwrap_or(true),
+                category_filter: settings.and_then(|st| st.category_filter),
+                code: String::new(),
+            },
+        ))
     })?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+    let rows: Vec<(Option<String>, SourceMeta)> = rows.collect::<rusqlite::Result<_>>()?;
+    let codes = crate::sources::codes::assign(rows.iter().map(|(c, s)| (s.name.as_str(), c.as_deref())));
+    Ok(rows.into_iter().zip(codes).map(|((_, s), code)| SourceMeta { code, ..s }).collect())
 }
 
 /// Groups of every kind of enabled sources, in display order per kind, with each source's

@@ -1324,11 +1324,14 @@ impl PlayerScreen {
                     let g = osd_text(p, egui::pos2(x, line_y), Align2::LEFT_CENTER, glyphs::PLAY, small.clone(), t.osd_accent, f32::INFINITY);
                     x = g.right() + pad / 3.0;
                 }
-                // the playlist's name at the right edge, in its colour (several playlists, DESIGN §29)
+                // the playlist's code chip at the right edge (several playlists, DESIGN §13.0 / §29);
+                // the full name is the chip's tooltip and in the row's label
                 let mut right = r.right() - pad / 2.0;
                 if let Some(src) = source {
-                    let color = badge::legible_on(theme.source_color(src.color), t.osd_scrim.to_opaque(), t.osd_text);
-                    let m = osd_text(p, egui::pos2(right, line_y), Align2::RIGHT_CENTER, &src.name, small.clone(), color, (r.width() * 0.2).round());
+                    let chip = badge::CodeChip::new(p, theme, src, small.clone(), t.osd_scrim.to_opaque(), t.osd_text, 0.0);
+                    let m = chip.paint(p, theme, egui::pos2(right, line_y), Align2::RIGHT_CENTER, None);
+                    ui.interact(m, resp.id.with("source"), egui::Sense::hover())
+                        .on_hover_text(egui::RichText::new(&src.name).size(theme.font(TypeToken::BodySmall)));
                     right = m.left() - pad / 2.0;
                 }
                 let quality = ctx.quality(&ch).map(|q| InlineBadge::quality(p, theme, q, with_alpha(t.osd_text, 0.7), s));

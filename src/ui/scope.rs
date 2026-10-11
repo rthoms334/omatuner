@@ -325,6 +325,7 @@ mod tests {
             has_live: live,
             in_all,
             category_filter: None,
+            code: String::new(),
         }
     }
 

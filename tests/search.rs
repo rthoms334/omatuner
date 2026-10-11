@@ -28,6 +28,7 @@ fn source(id: i64, name: &str) -> SourceMeta {
         has_live: true,
         in_all: true,
         category_filter: None,
+        code: String::new(),
     }
 }
 

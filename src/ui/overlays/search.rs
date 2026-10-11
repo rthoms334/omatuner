@@ -781,19 +781,13 @@ fn paint_hit(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, h: &SearchHit, 
             }
         }
     }
-    // the playlist, with several (Settings ▸ Interface ▸ Playlist on cards, DESIGN §13.0); one
-    // chip per playlist of a stack, the first leftmost
-    for src in playlists.iter().rev().filter_map(|p| ctx.source_of(h.item.target.item_kind(), *p)) {
-        let glyph = crate::ui::widgets::badge::source_glyph(src);
-        let text = format!("{glyph} {}", src.name);
-        let color = theme.source_color(src.color);
-        // the border keeps the source colour; the text falls back to fg where it wouldn't read
-        let text_color = kit::legible(theme, color);
-        let g = elided(&p, &text, egui::FontId::proportional(theme.font(TypeToken::Caption)), text_color, 140.0 * theme.rem());
-        let size = g.size() + egui::vec2(2.0 * theme.space(SpaceToken::Sm), 2.0 * theme.space(SpaceToken::Xxs));
-        let r = Align2::RIGHT_CENTER.anchor_size(egui::pos2(right, y), size);
-        p.rect_stroke(r, t.rounding, egui::Stroke::new(1.0, crate::theme::with_alpha(color, 0.6)), egui::StrokeKind::Inside);
-        p.galley(r.center() - g.size() / 2.0, g, text_color);
+    // the playlist, with several (Settings ▸ Interface ▸ Playlist on cards, DESIGN §13.0): its
+    // code chip, one per playlist of a stack, the first leftmost; the full names are the
+    // tooltips and in the row's label
+    for (k, src) in playlists.iter().rev().filter_map(|p| ctx.source_of(h.item.target.item_kind(), *p)).enumerate() {
+        let r = crate::ui::widgets::badge::paint_code_chip(&p, theme, egui::pos2(right, y), Align2::RIGHT_CENTER, src, t.bg, t.fg);
+        ui.interact(r, ui.id().with(("hit-source", h.item.source_id, &h.item.name, k)), egui::Sense::hover())
+            .on_hover_text(egui::RichText::new(&src.name).size(theme.font(TypeToken::BodySmall)));
         right = r.left() - pad;
     }
     // name with the matched characters in accent
