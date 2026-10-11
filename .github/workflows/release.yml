@@ -72,6 +72,8 @@ jobs:
             gcc-libs glibc
 
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Check versions
         id: version
@@ -101,7 +103,9 @@ jobs:
           runuser -u builder -- rustup default stable
           cp -a "$GITHUB_WORKSPACE" /home/builder/omatuner
           chown -R builder:builder /home/builder/omatuner
-          runuser -u builder -- bash -c 'cd ~/omatuner/packaging && makepkg --force --noconfirm'
+          # Arch Linux ARM's makepkg.conf defaults to .pkg.tar.xz; release zstd on both arches.
+          runuser -u builder -- env PKGEXT=.pkg.tar.zst \
+            bash -c 'cd ~/omatuner/packaging && makepkg --force --noconfirm'
 
       - name: Assemble release files
         env:
@@ -112,6 +116,7 @@ jobs:
           set -x
           src=/home/builder/omatuner/packaging
           pkg="omatuner-$VERSION-$PKGREL-$ARCH.pkg.tar.zst"
+          ls -l "$src"
           mkdir -p dist
           cp "$src/$pkg" dist/
           # The tarball holds the packaged binary and files (same build as the package).

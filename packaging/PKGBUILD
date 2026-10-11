@@ -60,6 +60,9 @@ build() {
   cd "$_srcdir"
   _cflags
   export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR="$srcdir/target"
+  # Generated sources (e.g. glutin_egl_sys's bindings) live under $srcdir/target; keep the build
+  # directory out of the binary's panic locations and line tables.
+  export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=$srcdir=/usr/src/debug/$pkgname"
   cargo build --frozen --release
 }
 
