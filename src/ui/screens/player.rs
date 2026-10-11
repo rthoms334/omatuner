@@ -208,6 +208,9 @@ struct NextEpisode {
     at: Instant,
 }
 
+/// The player's "Play from" menu: copy `k` is `SWITCH_COPY + k` (above typed digits).
+const SWITCH_COPY: u8 = 100;
+
 #[derive(Default)]
 pub struct PlayerScreen {
     banner_until: Option<Instant>,
@@ -246,6 +249,8 @@ pub struct PlayerScreen {
     /// The other copy the error card offers for the failed load generation (looked up once per
     /// failure, within the frame budget; DESIGN §29.15).
     other_copy: Option<(u64, Option<crate::ui::copies::OtherCopy>)>,
+    /// The copies the Ctrl+O menu listed during playback (DESIGN §29.15).
+    switch_copies: Vec<crate::ui::copies::OtherCopy>,
 }
 
 /// The OSD scale of the current window.
@@ -1434,6 +1439,34 @@ impl PlayerScreen {
         }
     }
 
+    /// Ctrl+O while a movie or episode plays: the title's other copies, each from where
+    /// playback is now (a few indexed reads, once per press).
+    fn play_from_menu(&mut self, ctx: &mut UiCtx<'_>) {
+        let snap = ctx.player.clone();
+        let unlocked = ctx.parental.is_unlocked(&ctx.config.parental);
+        let (db, lib, order, now) = (ctx.db, ctx.lib, ctx.config.interface.copy_order, ctx.now);
+        let plan_of = |movies: bool, item: u32| crate::store::copies::plan(db, &lib.vod, movies, item, unlocked, order, now).ok();
+        let copies = crate::ui::copies::other_copies(db, lib, plan_of, &snap);
+        if copies.is_empty() {
+            ctx.toast(crate::msg::Toast::info("This title has no other copy"));
+            return;
+        }
+        let items = copies
+            .iter()
+            .take(usize::from(u8::MAX - SWITCH_COPY))
+            .enumerate()
+            .map(|(k, c)| crate::ui::overlays::MenuItem {
+                icon: crate::ui::widgets::glyphs::PLAY,
+                label: c.label.clone(),
+                action: Action::Digit(SWITCH_COPY + k as u8),
+                enabled: true,
+                shortcut: None,
+            })
+            .collect();
+        self.switch_copies = copies;
+        ctx.open(OverlayRequest::ContextMenu(crate::ui::overlays::ContextMenuSpec { title: "Play from".into(), items }));
+    }
+
     /// The other copy offered for the current failure, if any.
     fn offered(&self, snap: &PlayerSnapshot) -> Option<&crate::ui::copies::OtherCopy> {
         let (generation, other) = self.other_copy.as_ref()?;
@@ -1838,8 +1871,9 @@ impl Screen for PlayerScreen {
             // after an error: the title's other copy, where playback stopped (never by itself)
             Action::PlayFrom => match self.offered(ctx.player) {
                 Some(other) => ctx.play(PlayerCommand::PlayCopy(other.play.clone())),
-                None if matches!(ctx.player.state, PlayerState::Error(_)) => ctx.toast(crate::msg::Toast::info("No other playlist has this title")),
-                None => ctx.toast(crate::msg::Toast::info("Another copy can be picked once playback fails")),
+                None if matches!(ctx.player.state, PlayerState::Error(_)) => ctx.toast(crate::msg::Toast::info("This title has no other copy")),
+                // during playback: "Play from…" the title's other copies, where it is now
+                None => self.play_from_menu(ctx),
             },
             Action::ToggleFavourite => {
                 if let Some(ch) = playing_channel(ctx.player).and_then(|id| ctx.lib.live.get(id).cloned()) {
@@ -1922,7 +1956,7 @@ impl Screen for PlayerScreen {
             let (label, tip, action) = match b.action {
                 StateAction::Retry => ("Retry", "Retry (r)", Action::Retry),
                 StateAction::LastChannel => ("Last channel", "Last channel (Backspace)", Action::LastChannel),
-                StateAction::OtherCopy => ("Play from another playlist", "Play from another playlist (Ctrl+O)", Action::PlayFrom),
+                StateAction::OtherCopy => ("Play from another copy", "Play from another copy (Ctrl+O)", Action::PlayFrom),
             };
             if osd_button(ui, &p, theme, b.rect, ui.id().with(("state-button", i)), &b.text, b.font, label, Some(tip), false).clicked() {
                 self.on_action(ctx, action);
@@ -2027,6 +2061,13 @@ impl Screen for PlayerScreen {
         match result {
             // the app handles the pop-out key itself; from the menu it comes here
             OverlayResult::Chosen(Action::TogglePopOut) => ctx.navigate(NavRequest::TogglePopOut),
+            // a copy of the Ctrl+O menu (never a typed channel number)
+            OverlayResult::Chosen(Action::Digit(d)) if d >= SWITCH_COPY && !self.switch_copies.is_empty() => {
+                if let Some(c) = self.switch_copies.get(usize::from(d - SWITCH_COPY)) {
+                    ctx.play(PlayerCommand::PlayCopy(c.play.clone()));
+                }
+                self.switch_copies.clear();
+            }
             OverlayResult::Unlocked(a) | OverlayResult::Chosen(a) => {
                 self.on_action(ctx, a);
             }
@@ -2321,7 +2362,7 @@ mod tests {
         h.state_mut().enter(Route::Player);
         h.run_steps(3);
         assert!(painted(&h).iter().any(|t| t.ends_with("Play from TV 2 at 41:20")), "{:?}", painted(&h));
-        assert!(has_label(&h, "Play from another playlist"));
+        assert!(has_label(&h, "Play from another copy"));
         h.state_mut().act(Action::PlayFrom);
         until(&mut h, "the other copy", |h| real(h).playable.as_ref().is_some_and(|p| p.media == MediaRef::Movie(other)));
         assert_eq!(real(&h).playable.as_ref().and_then(|p| p.start_at), Some(2480.0), "from where it stopped");

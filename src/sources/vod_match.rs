@@ -722,7 +722,7 @@ pub fn audio_lang(code: &str, dub: Dub) -> Option<&'static str> {
             Some("KN") => "kn",
             Some("PI") => "pa",
             Some("GU") => "gu",
-            Some("EN") => "en",
+            // "IN-EN" is the Hindi-dubbed shelf ("EN Hindi", "India EN Dubbed"), not English
             _ => "hi",
         });
     }
@@ -1080,6 +1080,7 @@ mod tests {
         assert_eq!(audio_lang("UK-US", Dub::None), Some("en"));
         assert_eq!(audio_lang("GR", Dub::None), Some("el"));
         assert_eq!(audio_lang("IN-TL", Dub::None), Some("ta"));
+        assert_eq!(audio_lang("IN-EN", Dub::None), Some("hi"), "India's English shelf is Hindi-dubbed");
         assert_eq!(audio_lang("AR-SUBS", Dub::None), None);
         assert_eq!(audio_lang("FR", Dub::Subbed), None, "VOSTFR is original audio");
         assert_eq!(audio_lang("AR", Dub::Dubbed), Some("ar"));
@@ -1105,17 +1106,21 @@ mod tests {
     #[test]
     fn clustering_rules() {
         let h = |raw: &str| p(raw, None).stack_hash(ItemKind::Movie);
-        // the report's false-merge risks as a table: (copies, expected stacks)
-        let leo_en = h("EN ★ Leo - 2023");
-        let leo_tl = h("IN-TL - Leo (2023)");
-        assert_eq!(leo_en, leo_tl, "one stack across languages");
+        // one film in several languages: same key and year, one stack
+        let opp_en = h("EN ★ Oppenheimer - 2023");
+        let opp_tl = h("IN-TL - Oppenheimer (2023)");
+        assert_eq!(opp_en, opp_tl, "one stack across languages");
         let items = [
-            item(leo_en, None, None),               // 0 EN Leo (Netflix)
-            item(leo_tl, None, None),               // 1 Tamil Leo
-            item(h("EN - Leo (2024)"), None, None), // 2 another year: apart
+            item(opp_en, None, None),                       // 0 English
+            item(opp_tl, None, None),                       // 1 Tamil dub
+            item(h("EN - Oppenheimer (2024)"), None, None), // 2 another year: apart
         ];
         assert_eq!(cluster(&items), vec![vec![0, 1]]);
-        // different TMDB ids split the namesakes; an id-less copy goes with neither
+        // namesakes (the Netflix "Leo" and the Tamil "Leo", both 2023) share key and year:
+        // only TMDB ids tell them apart — different ids split them; an id-less copy goes with
+        // neither
+        let (leo_en, leo_tl) = (h("EN ★ Leo - 2023"), h("IN-TL - Leo (2023)"));
+        assert_eq!(leo_en, leo_tl);
         let items =
             [item(leo_en, Some(1075794), None), item(leo_tl, Some(1000837), None), item(leo_en, Some(1075794), None), item(leo_en, None, None)];
         assert_eq!(cluster(&items), vec![vec![0, 2]]);

@@ -7,50 +7,26 @@
 //! and detail pages call it for a title shown combined (All, `interface.same_title =
 //! combine`); inside one playlist they keep using `kit`, which touches the one copy.
 //!
-//! Undo: a combined write stashes the rows it found ([`store::copies::Undo`]) under a number
-//! and toasts "… · Undo" with `Action::Undo(n)`; the app hands that action to [`undo`], which
-//! writes the rows back. The last [`KEEP`] actions can be undone.
-
-use std::collections::VecDeque;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU16, Ordering};
+//! Undo: a combined write stashes the rows it found ([`store::copies::Undo`]) in the app's
+//! `Services::undo` under a number and toasts "… · Undo" with `Action::Undo(n)`; the app hands
+//! that action to [`undo`], which writes the rows back — whatever screen is showing. The last
+//! [`copies::UNDO_KEEP`] actions can be undone.
 
 use crate::keymap::Action;
-use crate::model::{FavListId, ItemRef, MediaRef, PlayOrigin, PlayableKind, SeriesId, SourceId, VodKind};
+use crate::model::{FavListId, ItemKind, ItemRef, MediaRef, PlayOrigin, PlayableKind, SeriesId, SourceId, VodKind};
 use crate::msg::{DataScope, Toast, ToastKind};
 use crate::player::{CopyPlay, PlayRequest, PlayerCommand, PlayerSnapshot};
 use crate::store::copies::{self, CopyPlan, Undo};
 use crate::store::library::{Library, VodIndex};
+use crate::ui::overlays::ResumeSpec;
+use crate::ui::{OverlayRequest, Route, UiCtx};
 
-/// How many combined actions can still be undone.
-pub const KEEP: usize = 8;
 /// How long an Undo toast stays.
 const UNDO_TTL_MS: u32 = 8000;
 
-static UNDO: Mutex<VecDeque<(u16, Undo)>> = Mutex::new(VecDeque::new());
-static NEXT: AtomicU16 = AtomicU16::new(1);
-
-/// Keep `u` for an Undo button; returns its number.
-pub fn stash(u: Undo) -> u16 {
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let mut q = UNDO.lock().unwrap_or_else(|e| e.into_inner());
-    q.push_back((n, u));
-    while q.len() > KEEP {
-        q.pop_front();
-    }
-    n
-}
-
-/// The stashed rows of Undo number `n` (once).
-pub fn take(n: u16) -> Option<Undo> {
-    let mut q = UNDO.lock().unwrap_or_else(|e| e.into_inner());
-    let at = q.iter().position(|(k, _)| *k == n)?;
-    q.remove(at).map(|(_, u)| u)
-}
-
 /// `Action::Undo(n)` (the app): write back what action `n` found. False when it is too old.
 pub fn undo(services: &crate::services::Services, n: u16) -> bool {
-    let Some(u) = take(n) else { return false };
+    let Some(u) = services.undo.take(n) else { return false };
     let _ = services.store.writer().submit_notify(u.scope(), move |c| copies::undo(c, &u));
     true
 }
@@ -63,9 +39,9 @@ fn write_with_undo(
     text: String,
     f: impl FnOnce(&rusqlite::Connection) -> crate::error::Result<Undo> + Send + 'static,
 ) {
-    let bus = ctx.services.bus.clone();
+    let (bus, stash) = (ctx.services.bus.clone(), ctx.services.undo.clone());
     let _ = ctx.services.store.writer().submit_notify(scope, move |c| {
-        let n = stash(f(c)?);
+        let n = stash.stash(f(c)?);
         bus.toast(Toast { kind: ToastKind::Info, text, action: Some(("Undo".into(), Action::Undo(n))), ttl_ms: UNDO_TTL_MS });
         Ok(())
     });
@@ -75,6 +51,96 @@ fn write_with_undo(
 pub fn plan(ctx: &crate::ui::UiCtx<'_>, movies: bool, item: u32) -> crate::error::Result<CopyPlan> {
     let unlocked = ctx.parental.is_unlocked(&ctx.config.parental);
     copies::plan(ctx.db, &ctx.lib.vod, movies, item, unlocked, ctx.config.interface.copy_order, ctx.now)
+}
+
+/// Play a combined title from its card (Shift+Enter in a grid, on Home or in Search; DESIGN
+/// §29.15): the copy that plays first — or `pick` — with the next one as its fallback, behind
+/// the resume prompt when the latest progress of any copy can be resumed (`prompt`; else it
+/// resumes directly). A series plays the episode its copy with the newest progress is at.
+/// False when every copy is locked (the caller asks for the PIN).
+pub fn play_title(ctx: &mut UiCtx<'_>, movies: bool, item: u32, pick: Option<u32>, prompt: bool) -> bool {
+    let plan = match plan(ctx, movies, item) {
+        Ok(p) => p,
+        Err(e) => {
+            ctx.toast(Toast::error(format!("Couldn't play: {e}")));
+            return true;
+        }
+    };
+    if pick.or(plan.first()).is_none() {
+        return false;
+    }
+    let min = f64::from(ctx.config.player.resume_min_s);
+    if movies {
+        let Some(PlayerCommand::PlayCopy(copy)) = movie_command(&ctx.lib.vod, &plan, pick, true, PlayOrigin::Fullscreen) else { return false };
+        let title = ctx.lib.vod.movies.get(item as usize).map(|v| v.name.to_string()).unwrap_or_default();
+        let latest = plan.resume().and_then(|c| c.progress.clone()).filter(|p| prompt && !p.finished && p.position_s > min);
+        match latest {
+            Some(p) => {
+                let spec = ResumeSpec {
+                    media: copy.req.media.clone(),
+                    title,
+                    position_s: p.position_s,
+                    duration_s: p.duration_s,
+                    copy: Some(Box::new(copy)),
+                };
+                ctx.open(OverlayRequest::Resume(spec));
+            }
+            None => start(ctx, copy),
+        }
+        return true;
+    }
+    // a series: the episode of the copy with the newest progress (else of the copy that
+    // plays); a picked copy plays its own next episode
+    let ids: Vec<SeriesId> = match pick {
+        Some(p) => vec![p],
+        None => plan.order.clone(),
+    }
+    .into_iter()
+    .filter_map(|c| match ctx.lib.vod.series.get(c as usize)?.kind {
+        VodKind::Series(id) => Some(id),
+        VodKind::Movie(_) => None,
+    })
+    .collect();
+    match copies::next_episode(ctx.db, &ids) {
+        Ok(Some((series, ep))) => play_episode(ctx, &plan, series, &ep, false, prompt),
+        Ok(None) => {
+            if let Some(id) = ids.first() {
+                ctx.push(Route::SeriesDetail(*id));
+            }
+        }
+        Err(e) => ctx.toast(Toast::error(format!("Couldn't play: {e}"))),
+    }
+    true
+}
+
+/// Play episode `ep` of the series copy `series` with the same episode of the next copy in
+/// `plan` as its fallback; the resume prompt first when it has progress (`prompt`, and not
+/// `from_start`).
+pub fn play_episode(ctx: &mut UiCtx<'_>, plan: &CopyPlan, series: SeriesId, ep: &crate::model::Episode, from_start: bool, prompt: bool) {
+    let db = ctx.db;
+    let PlayerCommand::PlayCopy(copy) = episode_command(db, &ctx.lib.vod, plan, series, ep, !from_start, PlayOrigin::Fullscreen) else { return };
+    let min = f64::from(ctx.config.player.resume_min_s);
+    let item = ItemRef { source: ep.source_id, kind: ItemKind::Episode, key: ep.key.clone() };
+    let p = (prompt && !from_start)
+        .then(|| crate::store::user::progress(db, &item).ok().flatten())
+        .flatten()
+        .filter(|p| !p.finished && p.position_s > min);
+    match p {
+        Some(p) => {
+            let name = ctx.lib.vod.find(VodKind::Series(series)).map(|v| v.name.to_string()).unwrap_or_default();
+            let title = format!("{name} — S{:02}E{:02}", ep.season, ep.episode);
+            let spec =
+                ResumeSpec { media: copy.req.media.clone(), title, position_s: p.position_s, duration_s: p.duration_s, copy: Some(Box::new(copy)) };
+            ctx.open(OverlayRequest::Resume(spec));
+        }
+        None => start(ctx, copy),
+    }
+}
+
+/// Start a copy fullscreen.
+pub fn start(ctx: &mut UiCtx<'_>, copy: CopyPlay) {
+    ctx.play(PlayerCommand::PlayCopy(copy));
+    ctx.push(Route::Player);
 }
 
 fn movie_media(vod: &VodIndex, item: u32) -> Option<MediaRef> {
@@ -90,7 +156,9 @@ fn movie_media(vod: &VodIndex, item: u32) -> Option<MediaRef> {
 /// recently played copy's position (the card's "Resume 41:20"), whichever copy plays.
 pub fn movie_command(vod: &VodIndex, plan: &CopyPlan, pick: Option<u32>, resume: bool, origin: PlayOrigin) -> Option<PlayerCommand> {
     let first = pick.or(plan.first())?;
-    let fallback = plan.order.iter().copied().find(|c| *c != first).and_then(|c| movie_media(vod, c));
+    let next = plan.order.iter().copied().find(|c| *c != first);
+    let fallback = next.and_then(|c| movie_media(vod, c));
+    let elsewhere = elsewhere(plan, first, next, |c| vod.movies.get(c as usize).map(|v| v.source_id)).and_then(|c| movie_media(vod, c));
     // the latest progress belongs to another copy (a pin, a pick): start this one there
     let start_at = plan
         .resume()
@@ -99,7 +167,15 @@ pub fn movie_command(vod: &VodIndex, plan: &CopyPlan, pick: Option<u32>, resume:
         .filter(|p| !p.finished && p.position_s > 0.0)
         .map(|p| p.position_s);
     let req = PlayRequest { media: movie_media(vod, first)?, zap: None, origin, resume, immediate: true };
-    Some(PlayerCommand::PlayCopy(CopyPlay { req, fallback, start_at }))
+    Some(PlayerCommand::PlayCopy(CopyPlay { req, fallback, elsewhere, start_at }))
+}
+
+/// [`CopyPlay::elsewhere`]: when the next copy `next` is in the first copy's playlist, the
+/// first copy of another playlist in play order.
+fn elsewhere(plan: &CopyPlan, first: u32, next: Option<u32>, source: impl Fn(u32) -> Option<SourceId>) -> Option<u32> {
+    let own = source(first);
+    next.filter(|n| source(*n) == own)?;
+    plan.order.iter().copied().find(|c| *c != first && source(*c) != own)
 }
 
 /// The command that plays an episode of the series copy `series` (the page's copy), with the
@@ -114,12 +190,14 @@ pub fn episode_command(
     origin: PlayOrigin,
 ) -> PlayerCommand {
     let this = vod.index_of(VodKind::Series(series));
-    let next = plan.order.iter().copied().find(|c| Some(*c) != this).and_then(|c| match vod.series.get(c as usize)?.kind {
-        VodKind::Series(id) => copies::same_episode(conn, id, episode.season, episode.episode).ok().flatten(),
+    let same = |c: u32| match vod.series.get(c as usize)?.kind {
+        VodKind::Series(id) => copies::same_episode(conn, id, episode.season, episode.episode).ok().flatten().map(MediaRef::Episode),
         VodKind::Movie(_) => None,
-    });
+    };
+    let next = plan.order.iter().copied().find(|c| Some(*c) != this);
+    let other = this.and_then(|t| elsewhere(plan, t, next, |c| vod.series.get(c as usize).map(|v| v.source_id)));
     let req = PlayRequest { media: MediaRef::Episode(episode.id), zap: None, origin, resume, immediate: true };
-    PlayerCommand::PlayCopy(CopyPlay { req, fallback: next.map(MediaRef::Episode), start_at: None })
+    PlayerCommand::PlayCopy(CopyPlay { req, fallback: next.and_then(same), elsewhere: other.and_then(same), start_at: None })
 }
 
 /// The toast of `PlayerEvent::FellBack`: "TV couldn't play Dune — playing from TV 2".
@@ -141,43 +219,67 @@ pub struct OtherCopy {
     pub play: CopyPlay,
 }
 
-/// The copy the error card offers for the failed playable in `snap` (a movie, or an episode
-/// whose other series copy has it loaded), starting where playback stopped. A few indexed
-/// reads: the player calls it once per failure.
+/// The copy the error card offers for the failed playable in `snap`: the first of
+/// [`other_copies`]. A few indexed reads: the player calls it once per failure.
 pub fn other_copy(
     conn: &rusqlite::Connection,
     lib: &Library,
     plan_of: impl Fn(bool, u32) -> Option<CopyPlan>,
     snap: &PlayerSnapshot,
 ) -> Option<OtherCopy> {
-    let p = snap.playable.as_ref()?;
+    other_copies(conn, lib, plan_of, snap).into_iter().next()
+}
+
+/// The other copies of the title `snap` plays (a movie, or an episode that another series copy
+/// has loaded), in play order, each starting where playback is ("Play from TV 2 at 41:20"):
+/// the error card's offer and the player's Ctrl+O menu. Locked copies only for an unlocked
+/// session (`plan_of` decides).
+pub fn other_copies(
+    conn: &rusqlite::Connection,
+    lib: &Library,
+    plan_of: impl Fn(bool, u32) -> Option<CopyPlan>,
+    snap: &PlayerSnapshot,
+) -> Vec<OtherCopy> {
+    let Some(p) = snap.playable.as_ref() else { return Vec::new() };
     let vod = &lib.vod;
-    let (media, source) = match (&p.media, &p.kind) {
-        (MediaRef::Movie(id), _) => {
-            let at = vod.index_of(VodKind::Movie(*id))?;
-            let other = plan_of(true, at)?.instead_of(at)?;
-            let v = vod.movies.get(other as usize)?;
-            (movie_media(vod, other)?, v.source_id)
-        }
+    let (movies, current, episode) = match (&p.media, &p.kind) {
+        (MediaRef::Movie(id), _) => (true, vod.index_of(VodKind::Movie(*id)), None),
         (MediaRef::Episode(id), PlayableKind::Episode { season, episode }) => {
-            let series = crate::store::vod::episode(conn, *id).ok()?.series_id;
-            let at = vod.index_of(VodKind::Series(series))?;
-            let other = plan_of(false, at)?.instead_of(at)?;
-            let v = vod.series.get(other as usize)?;
-            let VodKind::Series(other_id) = v.kind else { return None };
-            let ep = copies::same_episode(conn, other_id, *season, *episode).ok().flatten()?;
-            (MediaRef::Episode(ep), v.source_id)
+            let series = crate::store::vod::episode(conn, *id).ok().map(|e| e.series_id);
+            (false, series.and_then(|s| vod.index_of(VodKind::Series(s))), Some((*season, *episode)))
         }
-        _ => return None,
+        _ => return Vec::new(),
     };
+    let Some(plan) = current.and_then(|c| plan_of(movies, c)) else { return Vec::new() };
     let at = snap.last_position.or(snap.position).filter(|s| *s >= 1.0);
-    let name = lib.source(source).map_or_else(|| "another playlist".to_owned(), |s| s.name.clone());
-    let label = match at {
-        Some(s) => format!("Play from {name} at {}", crate::ui::screens::home::kit::clock(s)),
-        None => format!("Play from {name}"),
-    };
-    let req = PlayRequest { media, zap: None, origin: snap.origin.unwrap_or(PlayOrigin::Fullscreen), resume: false, immediate: true };
-    Some(OtherCopy { label, play: CopyPlay { req, fallback: None, start_at: at } })
+    let origin = snap.origin.unwrap_or(PlayOrigin::Fullscreen);
+    plan.order
+        .iter()
+        .copied()
+        .filter(|c| Some(*c) != current)
+        .filter_map(|c| {
+            let media = match episode {
+                None => movie_media(vod, c)?,
+                Some((season, number)) => {
+                    let VodKind::Series(id) = vod.series.get(c as usize)?.kind else { return None };
+                    MediaRef::Episode(copies::same_episode(conn, id, season, number).ok().flatten()?)
+                }
+            };
+            // "TV 2", or "TV · 4K" for another copy in the same playlist
+            let source = |i: u32| crate::ui::stacks::all(lib, movies).get(i as usize).map(|v| v.source_id);
+            let name = match source(c) {
+                Some(s) if current.and_then(source) != Some(s) => lib.source(s).map(|m| m.name.clone()).unwrap_or_default(),
+                _ => crate::ui::stacks::copy_label(lib, movies, c),
+            };
+            let name = if name.is_empty() { "another copy".to_owned() } else { name };
+            let label = match at {
+                Some(s) => format!("Play from {name} at {}", crate::ui::screens::home::kit::clock(s)),
+                None => format!("Play from {name}"),
+            };
+            let req = PlayRequest { media, zap: None, origin, resume: false, immediate: true };
+            Some(OtherCopy { label, play: CopyPlay { req, fallback: None, elsewhere: None, start_at: at } })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -277,24 +379,9 @@ pub fn pin(ctx: &mut crate::ui::UiCtx<'_>, plan: &CopyPlan, item: &ItemRef, on: 
 }
 
 /// F2 on a combined title, once the user typed `name`: copies without their own rename get
-/// it; with `overwrite` the others too (ask first with [`copies::rename_conflicts`]).
-pub fn rename(ctx: &mut crate::ui::UiCtx<'_>, plan: &CopyPlan, name: &str, overwrite: bool) {
-    let (refs, name) = (plan.refs(), name.to_owned());
+/// it; with `overwrite` the others too (the rename overlay asks first with
+/// [`copies::rename_conflicts`]).
+pub fn rename(ctx: &mut crate::ui::UiCtx<'_>, refs: Vec<ItemRef>, name: &str, overwrite: bool) {
+    let name = name.to_owned();
     write_with_undo(ctx, DataScope::Overrides, format!("Renamed to {name}"), move |c| copies::rename(c, &refs, &name, overwrite));
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Undo numbers are handed out once and only the last [`KEEP`] actions can be undone.
-    #[test]
-    fn undo_stash_keeps_the_last_actions_once() {
-        let empty = Undo::empty;
-        let first = stash(empty());
-        let kept: Vec<u16> = (0..KEEP).map(|_| stash(empty())).collect();
-        assert!(take(first).is_none(), "pushed out by {KEEP} newer actions");
-        assert!(take(kept[KEEP - 1]).is_some());
-        assert!(take(kept[KEEP - 1]).is_none(), "once");
-    }
 }

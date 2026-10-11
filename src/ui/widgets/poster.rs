@@ -231,6 +231,7 @@ pub(crate) fn tile_label(item: &VodSummary, decor: &TileDecor<'_>) -> String {
     let mut label = label_with_source(&item.name, decor.source);
     if let Some(s) = decor.stack {
         if decor.source.is_some()
+            && !s.open
             && let Some(second) = s.second
         {
             label = if s.others > 1 { format!("{label} +{}", s.others) } else { format!("{label} + {}", second.name) };
@@ -411,7 +412,12 @@ pub(crate) fn poster_tile_ex(
             let what = if st.open { "fold them" } else { "show each" };
             let b = ui.interact(r, resp.id.with("stack-badge"), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
             b.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("{} copies — {what}", st.count)));
-            let tip = egui::RichText::new(format!("{} copies — click to {what} (Space)", st.count)).size(theme.font(TypeToken::BodySmall));
+            let key = crate::keymap::tables(crate::keymap::KeyContext::PosterGrid)
+                .iter()
+                .find_map(|t| t.iter().find(|b| b.action == crate::keymap::Action::FanOut))
+                .map(|b| format!(" ({})", b.chord.label()))
+                .unwrap_or_default();
+            let tip = egui::RichText::new(format!("{} copies — click to {what}{key}", st.count)).size(theme.font(TypeToken::BodySmall));
             badge_clicked = b.on_hover_text(tip).clicked();
         }
     }
@@ -460,8 +466,9 @@ pub(crate) fn poster_tile_ex(
         let max_w = if meta.is_empty() { rect.width() } else { (rect.width() * SOURCE_NAME_SHARE).round() };
         let color = legible(theme, theme.source_color(src.color));
         left = paint::text(p, egui::pos2(left, y), Align2::LEFT_TOP, src.name.as_str(), font.clone(), color, max_w).right();
-        // a stack: "TV + TV 2" (each in its colour) when it fits, else "TV +1"
-        if let Some(st) = decor.stack.filter(|s| s.others > 0) {
+        // a stack: "TV + TV 2" (each in its colour) when it fits, else "TV +1"; fanned out,
+        // the head card names its own copy instead (the badge still marks the stack)
+        if let Some(st) = decor.stack.filter(|s| s.others > 0 && !s.open) {
             let room = (rect.left() + max_w - left).max(0.0);
             let second = st
                 .second

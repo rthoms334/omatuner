@@ -3,23 +3,27 @@
 //! (`widgets::copy_card`), one per copy in copy order — its playlist, language and version,
 //! progress and status ("plays first", "always plays first", "failed 2 h ago", locked).
 //!
-//! * The copy Play uses: the one picked here (a click, or Enter on a focused mini-card), else
-//!   — on the page of a stack's top card — the copy that plays first (`ui::stacks::play_order`),
-//!   else the page's own copy. Picking a locked copy asks for the PIN first.
+//! * The copies and their state come from `store::copies::plan` (`ui::copies::plan`; pin,
+//!   progress, trouble, language, playlist order…), read again when the library, progress,
+//!   the session's lock or the copy-order setting change — a few indexed rows per copy, in the
+//!   frame budget.
+//! * The copy Play uses: the one picked here (a click, Enter on a focused mini-card, "Play
+//!   from…"), or the copy opened on purpose (a fanned-out copy, one playlist's list:
+//!   `ui::stacks::open_copy`), else the title's first in play order — whichever card led to
+//!   the page, so Play and Shift+Enter on the card agree. Picking a locked copy asks for the
+//!   PIN first.
 //! * A mini-card's menu (right-click, the menu key): play from it, "Always play from" it (one
-//!   pin per stack), "Not the same title" (with Undo), and for a series its own page.
+//!   pin per stack), "Not the same title" (Undo through the app's toast), and for a series its
+//!   own page.
 //! * "Play from…" (Ctrl+O, the page's button): every copy, the one that plays first marked.
-//! * Per-copy progress, recency and container are read off the UI thread whenever the
-//!   library or progress changes.
 //! * A page whose copy left its stack because its details brought another TMDB id says so.
-
-use std::collections::HashMap;
 
 use eframe::egui;
 
-use super::home::kit::{self, Loader};
+use super::home::kit;
 use crate::keymap::Action;
-use crate::model::{ItemKind, ItemRef, StreamLocator, Timestamp, VodKind, VodSummary, WatchProgress};
+use crate::model::{VodKind, VodSummary};
+use crate::store::copies::{CopyPlan, CopyStatus};
 use crate::store::stacks::StackId;
 use crate::theme::{SpaceToken, TypeToken};
 use crate::ui::overlays::{ContextMenuSpec, MenuItem, OverlayResult};
@@ -37,19 +41,6 @@ pub(super) const CARD_PLAY: u8 = 90;
 pub(super) const CARD_PIN: u8 = 91;
 pub(super) const CARD_SPLIT: u8 = 92;
 pub(super) const CARD_PAGE: u8 = 93;
-
-/// What the page reads per copy.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-struct Facts {
-    /// Watch progress 0..1 while partly watched.
-    fraction: Option<f32>,
-    /// When it was last played (any progress row; for a series, its latest episode's).
-    played_at: Option<Timestamp>,
-    /// Where a movie resumes (past the resume threshold, unfinished).
-    resume_s: Option<f64>,
-    /// mkv / mp4 (`Some(true)`), another container, unknown.
-    container_ok: Option<bool>,
-}
 
 /// What the page does after a Copies action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,20 +76,25 @@ enum Waiting {
     Play,
 }
 
+/// What the copies were listed for: (library generation, page, combine, session unlocked,
+/// copy order).
+type Built = (u64, VodKind, bool, bool, crate::config::CopyOrder);
+
 #[derive(Default)]
 pub(super) struct Copies {
     movies: bool,
-    /// (library generation, page, combine) the copies were listed for.
-    built: Option<(u64, VodKind, bool)>,
+    built: Option<Built>,
+    /// The plan must be read again (progress or overrides changed).
+    stale: bool,
     /// The page's copy (index into the kind's list).
     page: Option<u32>,
     stack: Option<StackId>,
     /// The copies in copy order; empty when the title has one.
     members: Vec<u32>,
+    /// The copies' state and play order (`store::copies::plan`).
+    plan: CopyPlan,
     /// The copy picked for Play.
     chosen: Option<u32>,
-    facts: HashMap<ItemRef, Facts>,
-    loader: Option<(Vec<ItemRef>, Loader<Vec<Facts>>)>,
     /// The focused mini-card (keyboard), set by the page.
     pub focus: Option<usize>,
     /// The copy whose menu is open.
@@ -107,72 +103,10 @@ pub(super) struct Copies {
     play_from: Vec<u32>,
     /// A locked copy waiting for the PIN.
     waiting: Option<(u32, Waiting)>,
-    pub undo: Option<st::Undo>,
     /// The page's copy left its stack of `n + 1` copies (its details named another title).
     separated: Option<usize>,
     /// The page copy's TMDB id when the copies were listed.
     tmdb: Option<u32>,
-}
-
-/// Whether a movie's container is mkv / mp4 (DESIGN §29.12, rule 6).
-fn container_ok(stream: &StreamLocator) -> Option<bool> {
-    let ext = match stream {
-        StreamLocator::Xtream { ext, .. } => ext.clone()?,
-        StreamLocator::Url { url } => {
-            let path = url.split(['?', '#']).next().unwrap_or("");
-            let last = path.rsplit('/').next().unwrap_or("");
-            let (_, ext) = last.rsplit_once('.')?;
-            ext.to_owned()
-        }
-    };
-    let ext = ext.to_ascii_lowercase();
-    match ext.as_str() {
-        "mkv" | "mp4" => Some(true),
-        e if !e.is_empty() && e.len() <= 4 && e.chars().all(|c| c.is_ascii_alphanumeric()) => Some(false),
-        _ => None,
-    }
-}
-
-fn load_facts(c: &rusqlite::Connection, copies: Vec<(VodKind, ItemRef)>, resume_min: u32) -> crate::error::Result<Vec<Facts>> {
-    use crate::store::{user, vod};
-    let mut out = Vec::with_capacity(copies.len());
-    for (kind, r) in copies {
-        let f = match kind {
-            VodKind::Movie(id) => {
-                let container = match vod::movie(c, id) {
-                    Ok(m) => container_ok(&m.stream),
-                    Err(crate::error::Error::NotFound(_)) => None,
-                    Err(e) => return Err(e),
-                };
-                let p = user::progress(c, &r)?;
-                Facts {
-                    fraction: p.as_ref().filter(|p| !p.finished).and_then(super::movie_detail::fraction),
-                    played_at: p.as_ref().map(|p| p.updated_at),
-                    resume_s: p.as_ref().filter(|p| super::movie_detail::resumable(p, resume_min)).map(|p| p.position_s),
-                    container_ok: container,
-                }
-            }
-            VodKind::Series(id) => {
-                let mut last: Option<WatchProgress> = None;
-                for e in vod::episodes(c, id, None)? {
-                    let er = ItemRef { source: e.source_id, kind: ItemKind::Episode, key: e.key };
-                    if let Some(p) = user::progress(c, &er)?
-                        && last.as_ref().is_none_or(|l| p.updated_at > l.updated_at)
-                    {
-                        last = Some(p);
-                    }
-                }
-                Facts {
-                    fraction: last.as_ref().filter(|p| !p.finished).and_then(super::movie_detail::fraction),
-                    played_at: last.as_ref().map(|p| p.updated_at),
-                    resume_s: None,
-                    container_ok: None,
-                }
-            }
-        };
-        out.push(f);
-    }
-    Ok(out)
 }
 
 impl Copies {
@@ -180,28 +114,50 @@ impl Copies {
         st::all(ctx.lib, self.movies)
     }
 
-    /// List the copies of the page `kind` (every frame; work only when the library, the page
-    /// or the setting changed).
-    pub(super) fn sync(&mut self, ctx: &UiCtx<'_>, kind: VodKind) {
-        let key = (ctx.lib.generation, kind, st::combine(ctx.config));
-        if self.built == Some(key) {
+    /// List the copies of the page `kind` (every frame; work only when the library, the page,
+    /// a setting, the session's lock or the copies' data changed).
+    pub(super) fn sync(&mut self, ctx: &mut UiCtx<'_>, kind: VodKind) {
+        let key = (ctx.lib.generation, kind, st::combine(ctx.config), kit::unlocked(ctx), ctx.config.interface.copy_order);
+        if self.built == Some(key) && !self.stale {
             return;
         }
         let same_page = self.built.is_some_and(|b| b.1 == kind);
         let before = if same_page { self.members.len() } else { 0 };
-        self.built = Some(key);
         self.movies = st::is_movie(kind);
-        self.page = st::index_of(ctx.lib, kind);
-        let stacks = ctx.lib.vod.stacks(self.movies);
-        let members = self.page.map(|i| st::copies_of(ctx.lib, ctx.config, self.movies, i)).unwrap_or_default();
+        let page = st::index_of(ctx.lib, kind);
+        let members = page.map(|i| st::copies_of(ctx.lib, ctx.config, self.movies, i)).unwrap_or_default();
+        let plan = match page.filter(|_| members.len() > 1) {
+            Some(p) => {
+                let movies = self.movies;
+                // a few indexed rows per copy, in the frame budget (else next frame)
+                let Some(r) = ({
+                    let c: &UiCtx<'_> = ctx;
+                    let (db, lib, unlocked, order, now) = (c.db, c.lib.clone(), kit::unlocked(c), c.config.interface.copy_order, c.now);
+                    ctx.budget.run(move || crate::store::copies::plan(db, &lib.vod, movies, p, unlocked, order, now))
+                }) else {
+                    return;
+                };
+                r.unwrap_or_else(|e| {
+                    tracing::warn!("copies: {e}");
+                    CopyPlan::default()
+                })
+            }
+            None => CopyPlan::default(),
+        };
+        self.built = Some(key);
+        self.stale = false;
+        self.page = page;
+        self.plan = plan;
         self.members = if members.len() > 1 { members } else { Vec::new() };
+        let stacks = ctx.lib.vod.stacks(self.movies);
         self.stack = self.page.and_then(|p| stacks.stack_of(p)).filter(|_| !self.members.is_empty());
         let meta = self.page.map(|p| stacks.meta(p));
         let tmdb = meta.and_then(|m| m.tmdb);
         if !same_page {
             self.separated = None;
-            self.chosen = None;
             self.focus = None;
+            // the copy opened on purpose plays (a fanned-out copy, one playlist's list)
+            self.chosen = (st::take_pick(kind) && !self.members.is_empty()).then_some(page).flatten();
         } else if !self.members.is_empty() {
             self.separated = None;
         } else if before > 1 && !meta.is_some_and(|m| m.split) && tmdb.is_some() && tmdb != self.tmdb {
@@ -210,40 +166,27 @@ impl Copies {
         self.tmdb = tmdb;
         self.chosen = self.chosen.filter(|c| self.members.contains(c));
         self.focus = self.focus.filter(|f| *f < self.members.len());
-        self.reload(ctx);
     }
 
-    /// Re-read the copies' progress (the page's `DataScope::Progress`).
-    pub(super) fn reload(&mut self, ctx: &UiCtx<'_>) {
-        if self.members.is_empty() {
-            self.loader = None;
-            return;
-        }
-        let all = self.all(ctx);
-        let copies: Vec<(VodKind, ItemRef)> = self.members.iter().filter_map(|c| all.get(*c as usize)).map(|v| (v.kind, st::item_ref(v))).collect();
-        let refs = copies.iter().map(|c| c.1.clone()).collect();
-        let resume_min = ctx.config.player.resume_min_s;
-        self.loader = Some((refs, Loader::start(ctx, move |c| load_facts(c, copies, resume_min))));
+    /// Read the copies' state again (the page's `DataScope::Progress` / `Overrides`).
+    pub(super) fn reload(&mut self, _ctx: &UiCtx<'_>) {
+        self.stale = true;
     }
 
-    fn poll(&mut self) {
-        let Some((_, l)) = &mut self.loader else { return };
-        match l.poll() {
-            Some(Ok(v)) => {
-                if let Some((refs, _)) = self.loader.take() {
-                    self.facts = refs.into_iter().zip(v).collect();
-                }
-            }
-            Some(Err(e)) => {
-                tracing::warn!("copies: {e}");
-                self.loader = None;
-            }
-            None => {}
-        }
+    /// The copies' state and play order.
+    pub(super) fn plan(&self) -> &CopyPlan {
+        &self.plan
     }
 
-    fn facts(&self, ctx: &UiCtx<'_>, c: u32) -> Facts {
-        self.all(ctx).get(c as usize).and_then(|v| self.facts.get(&st::item_ref(v))).copied().unwrap_or_default()
+    /// The copy picked on the page (or opened on purpose), if any.
+    pub(super) fn chosen(&self) -> Option<u32> {
+        self.chosen
+    }
+
+    /// Watch progress 0..1 of a copy while partly watched.
+    fn fraction(&self, c: u32) -> Option<f32> {
+        let p = self.plan.get(c)?.progress.as_ref().filter(|p| !p.finished)?;
+        p.duration_s.filter(|d| *d > 0.0).map(|d| (p.position_s / d).clamp(0.0, 1.0) as f32)
     }
 
     /// The title has several copies (the section shows).
@@ -255,34 +198,20 @@ impl Copies {
         self.members.len()
     }
 
-    /// The copies in the order they are tried.
-    pub(super) fn order(&self, ctx: &UiCtx<'_>) -> Vec<u32> {
-        st::play_order(
-            ctx.lib,
-            ctx.config,
-            self.movies,
-            &self.members,
-            kit::unlocked(ctx),
-            |c| self.facts(ctx, c).played_at,
-            |c| self.facts(ctx, c).container_ok,
-        )
-    }
-
-    /// The copy Play uses (`None`: the title has one copy — the page's).
-    pub(super) fn plays(&self, ctx: &UiCtx<'_>) -> Option<u32> {
+    /// The copy Play uses (`None`: the title has one copy — the page's —, or every copy is
+    /// locked while the session is).
+    pub(super) fn plays(&self) -> Option<u32> {
         if self.members.is_empty() {
             return None;
         }
-        if self.chosen.is_some() {
-            return self.chosen;
-        }
-        let top = self.stack.map(|s| ctx.lib.vod.stacks(self.movies).top(s));
-        if top.is_some() && top == self.page { self.order(ctx).first().copied().or(self.page) } else { self.page }
+        self.chosen.or(self.plan.first())
     }
 
-    /// Where a copy resumes (movies).
-    pub(super) fn resume_at(&self, ctx: &UiCtx<'_>, c: u32) -> Option<f64> {
-        self.facts(ctx, c).resume_s
+    /// Where Play resumes a combined movie: the latest progress of any copy (whichever copy
+    /// plays, `ui::copies::movie_command` starts it there).
+    pub(super) fn resume_at(&self, ctx: &UiCtx<'_>) -> Option<f64> {
+        let p = self.plan.resume()?.progress.as_ref()?;
+        (!p.finished && p.position_s > f64::from(ctx.config.player.resume_min_s)).then_some(p.position_s)
     }
 
     /// The page's copy.
@@ -301,7 +230,6 @@ impl Copies {
 
     /// The section: "Copies · N", the mini-cards, how they were matched. Returns a click.
     pub(super) fn show(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) -> Option<Click> {
-        self.poll();
         let theme = ctx.theme;
         let t = &theme.tokens;
         if let Some(n) = self.separated.filter(|_| self.members.is_empty()) {
@@ -316,27 +244,25 @@ impl Copies {
         }
         let stacks = ctx.lib.vod.stacks(self.movies);
         let all = self.all(ctx);
-        let plays = self.plays(ctx);
+        let plays = self.plays();
         let rows: Vec<CardRow> = self
             .members
             .iter()
             .map(|&c| {
-                let v = all.get(c as usize);
                 let dimmed = self.locked(ctx, c);
                 let pinned = stacks.meta(c).pinned;
                 let status = if dimmed {
                     Some(("locked".to_owned(), StatusTone::Muted))
                 } else if Some(c) == plays {
                     Some((if pinned { "always plays first" } else { "plays first" }.to_owned(), StatusTone::Accent))
-                } else if let Some(tr) = v.and_then(|v| st::trouble(ctx.lib, v)) {
-                    let what = match tr.kind {
-                        st::TroubleKind::Failed => format!("failed {}", kit::ago(ctx.now, tr.at)),
-                        st::TroubleKind::AtLimit => "account at its limit".to_owned(),
-                        st::TroubleKind::Expired => "account expired".to_owned(),
-                    };
-                    Some((what, StatusTone::Warning))
                 } else {
-                    None
+                    match self.plan.status(c) {
+                        CopyStatus::Failed { at } => Some((format!("failed {}", kit::ago(ctx.now, at)), StatusTone::Warning)),
+                        CopyStatus::AtLimit => Some(("playlist at its connection limit".to_owned(), StatusTone::Warning)),
+                        CopyStatus::Expired => Some(("account expired".to_owned(), StatusTone::Warning)),
+                        CopyStatus::Locked => Some(("locked".to_owned(), StatusTone::Muted)),
+                        CopyStatus::PlaysFirst | CopyStatus::Plain => None,
+                    }
                 };
                 (c, st::copy_facts_label(stacks, c), status, dimmed)
             })
@@ -353,7 +279,7 @@ impl Copies {
                     source: all.get(*c as usize).and_then(|v| ctx.lib.source(v.source_id)),
                     facts: facts.as_deref(),
                     status: status.as_ref().map(|(s, tone)| (s.as_str(), *tone)),
-                    progress: self.facts(ctx, *c).fraction,
+                    progress: self.fraction(*c),
                     dimmed: *dimmed,
                     chosen: Some(*c) == plays,
                     focused: self.focus == Some(k),
@@ -408,7 +334,7 @@ impl Copies {
         items.push(if stacks.meta(c).pinned {
             mi(glyphs::CLOSE, "Don't always play from it".to_owned(), CARD_PIN)
         } else {
-            mi(glyphs::FAVOURITE, format!("Always play from {playlist}"), CARD_PIN)
+            mi(glyphs::PIN, format!("Always play from {playlist}"), CARD_PIN)
         });
         items.push(mi(glyphs::CLOSE, "Not the same title".to_owned(), CARD_SPLIT));
         if !self.movies && Some(c) != self.page {
@@ -430,7 +356,7 @@ impl Copies {
             ctx.toast(crate::msg::Toast::info("This title has one copy"));
             return;
         }
-        let plays = self.plays(ctx);
+        let plays = self.plays();
         let items = self
             .members
             .iter()
@@ -458,13 +384,6 @@ impl Copies {
         Outcome::Act(CopyAct::Play(c))
     }
 
-    /// A toast's Undo.
-    pub(super) fn undo(&mut self, ctx: &mut UiCtx<'_>) {
-        if let Some(u) = self.undo.take() {
-            st::undo(ctx, u);
-        }
-    }
-
     /// Menu choices and PIN answers of the section.
     pub(super) fn on_result(&mut self, ctx: &mut UiCtx<'_>, r: &OverlayResult) -> Outcome {
         let all = self.all(ctx);
@@ -482,13 +401,12 @@ impl Copies {
                     CARD_PLAY => self.request_play(ctx, c),
                     CARD_PIN => {
                         let on = !ctx.lib.vod.stacks(self.movies).meta(c).pinned;
-                        let others = self.members.iter().filter(|m| **m != c).filter_map(|m| all.get(*m as usize)).map(st::item_ref).collect();
-                        let playlist = self.playlist(ctx, c).unwrap_or_default().to_owned();
-                        st::set_pin(ctx, &st::item_ref(&v), others, on, &playlist);
+                        let plan = self.plan.clone();
+                        crate::ui::copies::pin(ctx, &plan, &st::item_ref(&v), on);
                         Outcome::Done
                     }
                     CARD_SPLIT => {
-                        self.undo = Some(st::split(ctx, &st::item_ref(&v), &v.name));
+                        crate::ui::copies::split(ctx, &st::item_ref(&v), &v.name);
                         if self.chosen == Some(c) {
                             self.chosen = None;
                         }
@@ -507,23 +425,5 @@ impl Copies {
             },
             _ => Outcome::NotMine,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Rule 6 of the copy order needs the container: an Xtream extension or the URL's.
-    #[test]
-    fn containers() {
-        let x = |e: Option<&str>| StreamLocator::Xtream { kind: crate::model::XtreamStreamKind::Movie, stream_id: 1, ext: e.map(str::to_owned) };
-        let u = |s: &str| StreamLocator::Url { url: s.to_owned() };
-        assert_eq!(container_ok(&x(Some("MKV"))), Some(true));
-        assert_eq!(container_ok(&x(Some("avi"))), Some(false));
-        assert_eq!(container_ok(&x(None)), None);
-        assert_eq!(container_ok(&u("http://h/movie/u/p/12.mp4?token=1")), Some(true));
-        assert_eq!(container_ok(&u("http://h/movie/12.ts")), Some(false));
-        assert_eq!(container_ok(&u("http://h/play/12")), None);
     }
 }

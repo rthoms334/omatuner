@@ -56,6 +56,8 @@ pub struct Services {
     pub player: Player,
     pub logs: LogBuffer,
     pub integrations: Integrations,
+    /// Combined actions on a title's copies that a toast can still undo (DESIGN §29.15).
+    pub undo: crate::store::copies::UndoStash,
     /// Set when [`Services::shutdown`] begins (the signal watcher leaves the exit to it; a
     /// signal after that means it is stuck).
     closing: Arc<AtomicBool>,
@@ -107,6 +109,7 @@ impl Services {
             player,
             logs,
             integrations: Integrations::default(),
+            undo: Default::default(),
             closing: Arc::default(),
             socket: Arc::default(),
         })

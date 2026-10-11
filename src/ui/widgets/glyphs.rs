@@ -56,6 +56,8 @@ pub const ARROW_LEFT: &str = "\u{f004d}";
 pub const CHEVRON_RIGHT: &str = "\u{f0142}";
 /// An expanded row (nf-md-chevron_down).
 pub const CHEVRON_DOWN: &str = "\u{f0140}";
+/// "Always play from" a copy (DESIGN §29.14).
+pub const PIN: &str = "\u{f0403}";
 pub const CHECK: &str = "\u{f012c}";
 /// Tick-list boxes (nf-md-checkbox_marked / nf-md-checkbox_blank_outline).
 pub const CHECKBOX_ON: &str = "\u{f0132}";

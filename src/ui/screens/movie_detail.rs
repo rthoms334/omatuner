@@ -24,7 +24,7 @@ use crate::jobs::{JobEvent, JobKind};
 use crate::keymap::{Action, KeyContext};
 use crate::model::{ItemKind, ItemRef, MediaRef, Movie, MovieId, PlayOrigin, SourceKind, VodKind, VodSummary, WatchProgress};
 use crate::msg::{AppEvent, DataScope};
-use crate::player::PlayerEvent;
+use crate::player::{PlayerCommand, PlayerEvent};
 use crate::theme::{SpaceToken, Theme, TypeToken, with_alpha};
 use crate::ui::overlays::{ContextMenuSpec, MenuItem, OverlayResult, ResumeSpec};
 use crate::ui::video_host::Placement;
@@ -54,7 +54,7 @@ pub(crate) fn resume_or_play(ctx: &mut UiCtx<'_>, media: MediaRef, item: &ItemRe
     let p = ctx.budget.run(|| crate::store::user::progress(db, item)).and_then(|r| r.ok()).flatten();
     match p {
         Some(p) if resumable(&p, ctx.config.player.resume_min_s) => {
-            ctx.open(OverlayRequest::Resume(ResumeSpec { media, title, position_s: p.position_s, duration_s: p.duration_s }));
+            ctx.open(OverlayRequest::Resume(ResumeSpec { media, title, position_s: p.position_s, duration_s: p.duration_s, copy: None }));
         }
         _ => kit::play_media(ctx, media, true, origin),
     }
@@ -135,17 +135,13 @@ impl MovieDetailScreen {
         self.progress.as_ref().is_some_and(|p| p.finished)
     }
 
-    /// Where Play resumes: the page's progress, or that of the other copy that plays.
+    /// Where Play resumes: the latest progress of any of the title's copies (whichever copy
+    /// plays starts there, DESIGN §29.15), else the page's own.
     fn resume_at(&self, ctx: &UiCtx<'_>) -> Option<f64> {
-        match self.other_copy(ctx) {
-            Some(c) => self.copies.resume_at(ctx, c),
-            None => self.progress.as_ref().filter(|p| resumable(p, ctx.config.player.resume_min_s)).map(|p| p.position_s),
+        if self.copies.is_stacked() {
+            return self.copies.resume_at(ctx);
         }
-    }
-
-    /// The copy Play uses when it isn't the page's own (DESIGN §29.14).
-    fn other_copy(&self, ctx: &UiCtx<'_>) -> Option<u32> {
-        self.copies.plays(ctx).filter(|c| Some(*c) != self.copies.page())
+        self.progress.as_ref().filter(|p| resumable(p, ctx.config.player.resume_min_s)).map(|p| p.position_s)
     }
 
     fn buttons(&self, ctx: &UiCtx<'_>) -> Vec<Btn> {
@@ -165,8 +161,10 @@ impl MovieDetailScreen {
         if self.missing {
             return;
         }
-        if let Some(c) = self.other_copy(ctx) {
-            self.play_copy(ctx, c, resume);
+        if self.copies.is_stacked() {
+            // the copy picked on the page, else the title's first; the next one as fallback
+            let pick = self.copies.chosen();
+            self.play_copies(ctx, pick, resume);
             return;
         }
         if self.locked(ctx) {
@@ -176,15 +174,17 @@ impl MovieDetailScreen {
         kit::play_media(ctx, MediaRef::Movie(id), resume, PlayOrigin::Fullscreen);
     }
 
-    /// Play another copy of the title (`resume`: at its saved position).
-    fn play_copy(&mut self, ctx: &mut UiCtx<'_>, c: u32, resume: bool) {
-        let Some(v) = ctx.lib.vod.movies.get(c as usize) else { return };
-        let VodKind::Movie(id) = v.kind else { return };
-        if v.locked && !kit::unlocked(ctx) {
-            kit::ask_pin(ctx, if resume { Action::Activate } else { Action::ActivateAlt }, "This copy is locked");
-            return;
+    /// Play the title's copies (`pick`: this copy first; the caller checked its PIN), with the
+    /// fallback once before the first frame (DESIGN §29.15).
+    fn play_copies(&mut self, ctx: &mut UiCtx<'_>, pick: Option<u32>, resume: bool) {
+        match crate::ui::copies::movie_command(&ctx.lib.vod, self.copies.plan(), pick, resume, PlayOrigin::Fullscreen) {
+            Some(PlayerCommand::PlayCopy(copy)) => crate::ui::copies::start(ctx, copy),
+            Some(cmd) => {
+                ctx.play(cmd);
+                ctx.push(Route::Player);
+            }
+            None => kit::ask_pin(ctx, if resume { Action::Activate } else { Action::ActivateAlt }, "Every copy of this title is locked"),
         }
-        kit::play_media(ctx, MediaRef::Movie(id), resume, PlayOrigin::Fullscreen);
     }
 
     /// Number of buttons; the Copies mini-cards follow them in the focus order.
@@ -311,6 +311,9 @@ impl Screen for MovieDetailScreen {
     fn id(&self) -> ScreenId {
         ScreenId::MovieDetail
     }
+    fn hint_extras(&self) -> Vec<(Action, &'static str)> {
+        if self.copies.is_stacked() { vec![(Action::PlayFrom, "play from")] } else { Vec::new() }
+    }
     fn key_contexts(&self) -> Vec<KeyContext> {
         vec![KeyContext::Detail]
     }
@@ -381,10 +384,6 @@ impl Screen for MovieDetailScreen {
                 self.copies.play_from_menu(ctx);
                 true
             }
-            Action::Undo(0) => {
-                self.copies.undo(ctx);
-                true
-            }
             Action::Activate => {
                 if let Some(b) = self.buttons(ctx).get(self.focus).copied() {
                     self.press(ctx, b);
@@ -424,7 +423,7 @@ impl Screen for MovieDetailScreen {
         match self.copies.on_result(ctx, &result) {
             super::copies::Outcome::NotMine => {}
             super::copies::Outcome::Done => return,
-            super::copies::Outcome::Act(super::copies::CopyAct::Play(c)) => return self.play_copy(ctx, c, true),
+            super::copies::Outcome::Act(super::copies::CopyAct::Play(c)) => return self.play_copies(ctx, Some(c), true),
             super::copies::Outcome::Act(super::copies::CopyAct::Open(VodKind::Movie(id))) => return ctx.push(Route::MovieDetail(id)),
             super::copies::Outcome::Act(super::copies::CopyAct::Open(VodKind::Series(id))) => return ctx.push(Route::SeriesDetail(id)),
         }
@@ -524,7 +523,7 @@ impl Screen for MovieDetailScreen {
         let watched = self.watched();
         let locked = m.as_ref().map(|m| m.locked).or(summary.as_ref().map(|s| s.locked)).unwrap_or(false);
         // several copies: the Play button names the playlist it plays from
-        let plays_from = self.copies.plays(ctx).and_then(|c| self.copies.playlist(ctx, c)).map(str::to_owned);
+        let plays_from = self.copies.plays().and_then(|c| self.copies.playlist(ctx, c)).map(str::to_owned);
         let mut pressed = None;
         let mut copy_click = None;
         egui::ScrollArea::vertical().id_salt("movie-detail").auto_shrink([false, false]).show(ui, |ui| {
@@ -860,12 +859,12 @@ pub(crate) mod tests {
     fn copies_section_picks_pins_and_splits_with_undo() {
         use crate::store::titles::{LinkAction, links};
         let (mut t, one) = rig();
-        let (a, b, ids) = seed(&mut t, |c| {
+        let (a, b, ids, bravo) = seed(&mut t, |c| {
             let a = testkit::source(c, "Alpha")?;
             let b = testkit::source(c, "Bravo")?;
             let ids = testkit::named_movies(c, a, &[("EN ★ Dune - 2021", "Dune"), ("FR ★ Dune - 2021", "Dune (FR)")])?;
-            testkit::named_movies(c, b, &[("EN - Dune (2021)", "Dune")])?;
-            Ok((a, b, ids))
+            let bravo = testkit::named_movies(c, b, &[("EN - Dune (2021)", "Dune")])?;
+            Ok((a, b, ids, bravo[0]))
         });
         let named = |s: SourceId, i: usize| ItemRef { source: s, kind: ItemKind::Movie, key: ItemKey(format!("m3u:named{i:04}")) };
         let mut h = harness(t, one, MovieDetailScreen::default(), egui::vec2(1400.0, 900.0));
@@ -873,6 +872,21 @@ pub(crate) mod tests {
         until(&mut h, "the copies", |h| has_label(h, "COPIES · 3"));
         assert!(has_label(&h, "Alpha · EN · plays first") && has_label(&h, "Bravo · EN") && has_label(&h, "Alpha · FR"));
         assert!(has_label(&h, "Play · Alpha") && has_label(&h, "Play from ▾"));
+        // another copy's page (Search, a category, Favourites) plays the title's first copy too;
+        // a copy opened on purpose (fanned out, one playlist's list) plays itself
+        h.state_mut().enter(Route::MovieDetail(bravo));
+        h.run_steps(1);
+        assert!(has_label(&h, "COPIES · 3") && has_label(&h, "Play · Alpha"));
+        h.state_mut().enter(Route::MovieDetail(ids[0]));
+        h.run_steps(1);
+        h.state_mut().t.with_ctx(|ctx| crate::ui::stacks::open_copy(ctx, VodKind::Movie(bravo)));
+        h.state_mut().nav();
+        h.state_mut().enter(Route::MovieDetail(bravo));
+        h.run_steps(1);
+        assert!(has_label(&h, "Play · Bravo"));
+        h.state_mut().enter(Route::MovieDetail(ids[0]));
+        h.run_steps(1);
+        assert!(has_label(&h, "Play · Alpha"));
         // → past the four buttons onto the mini-cards; Enter on Bravo's: Play uses it
         for _ in 0..5 {
             h.state_mut().act(Action::Right);
@@ -909,14 +923,15 @@ pub(crate) mod tests {
         h.state_mut().act(Action::ContextMenu);
         h.state_mut().nav();
         h.state_mut().result(OverlayResult::Chosen(Action::Digit(super::super::copies::CARD_SPLIT)));
-        let toast = h.state().t.toasts.last().cloned().unwrap();
-        assert_eq!(toast.action.map(|a| a.1), Some(Action::Undo(0)), "{}", toast.text);
+        let toast = h.state_mut().undo_toast().expect("an Undo toast");
+        assert_eq!(toast.text, "Dune is shown on its own now");
+        let Some((_, undo)) = toast.action else { unreachable!() };
         until(&mut h, "the split", |h| stored(h).iter().any(|l| l.item == named(b, 0) && l.action == LinkAction::Split));
         testkit::reload_library(&mut h.state_mut().t);
         h.run_steps(1);
         assert!(has_label(&h, "COPIES · 2") && has_label(&h, "Alpha · FR · always plays first"), "the pinned copy plays first now");
         assert!(has_label(&h, "Play · Alpha"));
-        h.state_mut().act(Action::Undo(0));
+        h.state_mut().act(undo);
         until(&mut h, "the split undone", |h| !stored(h).iter().any(|l| l.action == LinkAction::Split));
         testkit::reload_library(&mut h.state_mut().t);
         h.run_steps(1);

@@ -227,6 +227,10 @@ impl Stacks {
     }
 }
 
+/// Mixed into the key of a copy split off its stack: it never joins the copies it was split
+/// from, but copies split off the same title join each other.
+const SPLIT_SALT: i64 = 0x5b1d_c0de_7a1e_0001;
+
 /// Market dominance thresholds of a category (untagged copies take its market).
 const DOMINANT_MIN: u32 = 10;
 const DOMINANT_SHARE: f32 = 0.8;
@@ -283,16 +287,15 @@ pub fn build(items: &[VodSummary], raw: Vec<CopyRaw>, in_all: impl Fn(SourceId) 
             vod_match::lang_rank(code, m.dub, prefs)
         });
     }
-    // clustering: only copies in All that the user didn't split off
+    // clustering: only copies in All; a copy the user split off ("Not the same title") leaves
+    // its stack for good — copies split off one title stack together as the other title
     let cluster_items: Vec<ClusterItem> = items
         .iter()
         .zip(&raw)
-        .map(|(v, r)| {
-            if !r.split && in_all(v.source_id) {
-                ClusterItem { hash: r.hash, tmdb: r.tmdb, origin: r.origin }
-            } else {
-                ClusterItem { hash: None, tmdb: None, origin: None }
-            }
+        .map(|(v, r)| match (in_all(v.source_id), r.split) {
+            (true, false) => ClusterItem { hash: r.hash, tmdb: r.tmdb, origin: r.origin },
+            (true, true) => ClusterItem { hash: r.hash.map(|h| h ^ SPLIT_SALT), tmdb: None, origin: r.origin },
+            (false, _) => ClusterItem { hash: None, tmdb: None, origin: None },
         })
         .collect();
     drop(raw);
@@ -513,15 +516,15 @@ mod tests {
     #[test]
     fn top_card_and_copy_order() {
         let (items, raw) = copies(&[
-            (1, "FR ★ Dune - 2021", 1, false),      // 0
-            (1, "EN ★ Dune - 2021", 2, true),       // 1 English but locked
-            (2, "EN - Dune (2021)", 3, false),      // 2 English, unlocked: top
-            (2, "AR-SUBS - Dune (2021)", 4, false), // 3
-            (1, "EN-CAM - Heat (1995)", 2, false),  // 4 CAM
-            (2, "DE - Heat (1995)", 5, false),      // 5
-            (1, "EN ★ Alien - 1979", 2, true),      // 6 all locked
-            (2, "EN - Alien (1979)", 3, true),      // 7
-            (1, "EN-CAM - Brave the Dark (2025)", 2, false), // 8 CAM in the first playlist
+            (1, "FR ★ Dune - 2021", 1, false),                // 0
+            (1, "EN ★ Dune - 2021", 2, true),                 // 1 English but locked
+            (2, "EN - Dune (2021)", 3, false),                // 2 English, unlocked: top
+            (2, "AR-SUBS - Dune (2021)", 4, false),           // 3
+            (1, "EN-CAM - Heat (1995)", 2, false),            // 4 CAM
+            (2, "DE - Heat (1995)", 5, false),                // 5
+            (1, "EN ★ Alien - 1979", 2, true),                // 6 all locked
+            (2, "EN - Alien (1979)", 3, true),                // 7
+            (1, "EN-CAM - Brave the Dark (2025)", 2, false),  // 8 CAM in the first playlist
             (2, "EN - Brave the Dark (2025) [4K]", 3, false), // 9
         ]);
         let s = build(&items, raw, |_| true, &en());
@@ -545,12 +548,12 @@ mod tests {
     #[test]
     fn retain_after_removing_copies() {
         let (items, raw) = copies(&[
-            (1, "FR ★ Dune - 2021", 1, false),     // 0
-            (1, "EN ★ Dune - 2021", 2, true),      // 1 locked
-            (2, "EN - Dune (2021)", 3, false),     // 2 top, removed
+            (1, "FR ★ Dune - 2021", 1, false),      // 0
+            (1, "EN ★ Dune - 2021", 2, true),       // 1 locked
+            (2, "EN - Dune (2021)", 3, false),      // 2 top, removed
             (2, "AR-SUBS - Dune (2021)", 4, false), // 3
-            (1, "EN ★ Heat - 1995", 2, false),     // 4
-            (2, "DE - Heat (1995)", 5, false),     // 5 removed
+            (1, "EN ★ Heat - 1995", 2, false),      // 4
+            (2, "DE - Heat (1995)", 5, false),      // 5 removed
         ]);
         let s = build(&items, raw, |_| true, &en());
         let map = [Some(0), Some(1), None, Some(2), Some(3), None];
@@ -564,8 +567,9 @@ mod tests {
         assert_eq!(r.lang_label(2).as_deref(), Some("AR-SUBS"), "copy facts follow the copy");
     }
 
-    /// Only copies of playlists in All stack; a copy the user split off stands alone; hidden
-    /// and hook-rejected items never reach `build` (the library leaves them out).
+    /// Only copies of playlists in All stack; a copy the user split off stands alone, and copies
+    /// split off one title stack together; hidden and hidden-explicit items never reach
+    /// `build` (the library leaves them out).
     #[test]
     fn in_all_and_split() {
         let (items, mut raw) = copies(&[(1, "EN ★ Heat - 1995", 1, false), (2, "EN - Heat (1995)", 2, false), (3, "EN - Heat (1995)", 3, false)]);
@@ -573,10 +577,14 @@ mod tests {
         assert_eq!(s.members(s.stack_of(0).unwrap()), &[0, 1]);
         assert_eq!(s.stack_of(2), None, "playlist 3 is out of All");
         raw[1].split = true;
-        let s = build(&items, raw, |_| true, &en());
+        let s = build(&items, raw.clone(), |_| true, &en());
         assert_eq!(s.members(s.stack_of(0).unwrap()), &[0, 2]);
         assert_eq!(s.stack_of(1), None, "split off");
         assert!(s.meta(1).split);
+        // a second copy split off the same title joins the first: the namesake's own stack
+        raw[2].split = true;
+        let s = build(&items, raw, |_| true, &en());
+        assert_eq!((s.stack_of(0), s.members(s.stack_of(1).unwrap())), (None, &[1, 2][..]));
     }
 
     /// An untagged copy in a category that is ≥ 80 % one market takes that market: it is not

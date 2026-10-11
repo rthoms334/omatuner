@@ -79,9 +79,23 @@ pub struct CopyPlay {
     /// the same position, when `req` can't be resolved or fails before its first frame
     /// ([`PlayerEvent::FellBack`]). A failure after the first frame never switches copies.
     pub fallback: Option<MediaRef>,
+    /// When `fallback` is in the same playlist as `req`: the first copy in another playlist,
+    /// tried instead when the failure was the playlist's (HTTP 401/403, our connection budget
+    /// for it) — a copy in the same playlist would fail the same way.
+    pub elsewhere: Option<MediaRef>,
     /// Start here (seconds) instead of the copy's own saved progress: "Play from TV 2 at
     /// 41:20" after the first copy failed mid-film. Overrides `req.resume`.
     pub start_at: Option<f64>,
+}
+
+impl CopyPlay {
+    /// The copy to fall back to after a failure of `kind` before the first frame.
+    pub fn fallback_for(fallback: Option<MediaRef>, elsewhere: Option<MediaRef>, kind: PlayerErrorKind) -> Option<MediaRef> {
+        match kind {
+            PlayerErrorKind::HttpForbidden | PlayerErrorKind::Budget => elsewhere.or(fallback),
+            _ => fallback,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -704,6 +718,7 @@ mod tests {
             PlayerCommand::PlayCopy(CopyPlay {
                 req: PlayRequest { media: MediaRef::Movie(MovieId(media)), zap: None, origin: PlayOrigin::Fullscreen, resume: true, immediate: true },
                 fallback: fallback.map(|f| MediaRef::Movie(MovieId(f))),
+                elsewhere: None,
                 start_at,
             })
         };

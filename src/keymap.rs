@@ -980,13 +980,17 @@ pub fn hint_line(stack: &[KeyContext]) -> String {
     hint_line_with(stack, &[])
 }
 
-/// [`hint_line`] with global `extra` hints the screen adds (Movies with two playlists: "Alt+P
-/// playlist"), before "help". Not inside dialogs and text fields, whose keys come first.
+/// [`hint_line`] with `extra` hints the screen adds (Movies with two playlists: "Alt+P
+/// playlist"; a stack card: "Space copies · Ctrl+O play from"), before "help" — keys looked up
+/// in the stack's own tables, then the global one. Not inside dialogs and text fields, whose
+/// keys come first.
 pub fn hint_line_with(stack: &[KeyContext], extra: &[(Action, &'static str)]) -> String {
     let mut v = hints(stack);
     if !stack.iter().any(|c| matches!(c, KeyContext::Modal | KeyContext::TextInput | KeyContext::Search | KeyContext::Help)) {
         let at = v.iter().position(|(a, ..)| *a == A::ToggleHelp).unwrap_or(v.len());
-        let add = extra.iter().filter_map(|(a, verb)| GLOBAL.iter().find(|bd| bd.action == *a).map(|bd| (*a, bd.chord, *verb)));
+        let bound =
+            |a: Action| stack.iter().flat_map(|c| tables(*c)).chain(std::iter::once(GLOBAL)).find_map(|tb| tb.iter().find(|bd| bd.action == a));
+        let add: Vec<_> = extra.iter().filter_map(|(a, verb)| bound(*a).map(|bd| (*a, bd.chord, *verb))).collect();
         v.splice(at..at, add);
     }
     v.iter().map(|(_, chord, verb)| format!("{} {verb}", chord.label())).collect::<Vec<_>>().join(" · ")

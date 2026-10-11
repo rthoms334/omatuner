@@ -74,6 +74,7 @@ pub fn spawn(
         mpv_log: MpvLog::default(),
         recorded_video: None,
         fallback: None,
+        elsewhere: None,
     };
     std::thread::Builder::new().name("player".into()).spawn(move || c.run(cmd_rx, evt_rx))
 }
@@ -119,6 +120,8 @@ struct Controller {
     /// The other copy of the current title, for one fallback before the first frame
     /// ([`CopyPlay::fallback`]; the machine is armed while it is set).
     fallback: Option<MediaRef>,
+    /// [`CopyPlay::elsewhere`] of the current title.
+    elsewhere: Option<MediaRef>,
 }
 
 impl Controller {
@@ -294,13 +297,13 @@ impl Controller {
     }
 
     fn resolve_and_play(&mut self, req: PlayRequest) -> bool {
-        self.play_copy(CopyPlay { req, fallback: None, start_at: None })
+        self.play_copy(CopyPlay { req, fallback: None, elsewhere: None, start_at: None })
     }
 
     /// Resolve and play; a copy with a fallback that can't be resolved goes straight to the
     /// fallback (once). The machine is armed only for the target that actually plays.
     fn play_copy(&mut self, c: CopyPlay) -> bool {
-        let CopyPlay { req, fallback, start_at } = c;
+        let CopyPlay { req, fallback, elsewhere, start_at } = c;
         if let Some(z) = req.zap.clone() {
             self.snap.zap = Some(z);
         }
@@ -315,6 +318,7 @@ impl Controller {
             (Ok(p), fallback) => {
                 self.snap.origin = Some(req.origin);
                 self.fallback = fallback;
+                self.elsewhere = elsewhere;
                 self.machine.arm_fallback(self.fallback.is_some());
                 self.feed(Input::Play { target: Arc::new(p), immediate: req.immediate }, Instant::now())
             }
@@ -328,6 +332,7 @@ impl Controller {
                     let ev = PlayerEvent::FellBack { title: p.title.clone(), from: None, to: p.source_id, error: err.kind };
                     self.snap.origin = Some(req.origin);
                     self.fallback = None;
+                    self.elsewhere = None;
                     self.machine.arm_fallback(false);
                     let changed = self.feed(Input::Play { target: Arc::new(p), immediate: req.immediate }, Instant::now());
                     self.deps.bus.send(AppEvent::Player(ev));
@@ -350,7 +355,8 @@ impl Controller {
     /// resolved, the first failure stands.
     fn fall_back(&mut self, err: PlayerError) {
         let failed = self.machine.target().cloned();
-        let next = self.fallback.take().map(|m| (self.deps.resolver.resolve(&m, false), m));
+        // a playlist that refused (403, its connection budget): a copy elsewhere
+        let next = CopyPlay::fallback_for(self.fallback.take(), self.elsewhere.take(), err.kind).map(|m| (self.deps.resolver.resolve(&m, false), m));
         match next {
             Some((Ok(mut p), _)) => {
                 let failed = failed.as_deref();

@@ -1241,9 +1241,14 @@ impl TunerApp {
     fn hint_now(&self) -> String {
         use crate::ui::scope::{Scope, ScopeKind};
         let stack = self.key_stack();
+        // the focused element's (a stack card: Space, Ctrl+O), then the playlist picker
+        let mut extra = if self.overlays.is_empty() { self.screens[self.screen_index(self.view_screen())].hint_extras() } else { Vec::new() };
         let multi = ScopeKind::of_screen(self.view_screen())
             .is_some_and(|k| Scope::of(&self.lib, &self.services().config().interface.playlist_scope, k).multi());
-        if multi { keymap::hint_line_with(&stack, &[(Action::PlaylistPicker, "playlist")]) } else { keymap::hint_line(&stack) }
+        if multi {
+            extra.push((Action::PlaylistPicker, "playlist"));
+        }
+        keymap::hint_line_with(&stack, &extra)
     }
 
     /// `StartScreen::Last`: store the main screen the user leaves on (written at exit only).
@@ -2558,8 +2563,9 @@ mod tests {
         assert_eq!(rig.log().jobs.len(), 1, "favourites never rebuild the library");
     }
 
-    /// Copies of a title (DESIGN §29.14): the player's fallback becomes a toast naming both
-    /// playlists, and a toast's Undo writes back the rows a combined action found — once.
+    /// Copies of a title (DESIGN §29.15): the player's fallback becomes a toast naming both
+    /// playlists, and a toast's Undo writes back the rows its own combined action found — once,
+    /// whatever was done since.
     #[test]
     fn fallback_toast_and_undo_of_a_combined_action() {
         let mut rig = Rig::with(test_config(), live(), 1.0, |c| {
@@ -2594,11 +2600,16 @@ mod tests {
             .unwrap();
         let favs = |rig: &Rig| crate::store::library::load_favs(&rig.app.db).unwrap().items(rig.app.favs.default_list().unwrap()).len();
         assert_eq!(favs(&rig), 0);
-        let n = crate::ui::copies::stash(undo);
+        let n = rig.app.services().undo.stash(undo);
+        // a newer combined action (on another page, say) doesn't change what the older toast
+        // undoes: the split stays
+        let split = rig.writer().blocking(move |c| crate::store::copies::split(c, &copy(2), true, 4)).unwrap();
+        rig.app.services().undo.stash(split);
         let ctx = rig.ctx.clone();
         rig.app.global_action(Action::Undo(n), &[], &ctx);
         rig.writer().blocking(|_| Ok(())).unwrap();
         assert_eq!(favs(&rig), 2);
+        assert_eq!(crate::store::titles::links(&rig.app.db).unwrap().len(), 1, "the split stays");
         assert_eq!(rig.log().toasts.last().unwrap().text, "Undone");
         rig.app.global_action(Action::Undo(n), &[], &ctx);
         assert_eq!(rig.log().toasts.last().unwrap().text, "That can no longer be undone");
@@ -3418,6 +3429,7 @@ mod tests {
                 title: "t".into(),
                 position_s: 10.0,
                 duration_s: None,
+                copy: None,
             }),
         ];
         for o in overlays {

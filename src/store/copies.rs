@@ -383,6 +383,38 @@ fn snapshot(conn: &Connection, table: Table, refs: &[ItemRef]) -> Result<Undo> {
     Ok(Undo { table, refs: refs.to_vec(), cols, rows })
 }
 
+/// How many combined actions can still be undone.
+pub const UNDO_KEEP: usize = 8;
+
+/// The last [`UNDO_KEEP`] combined actions' [`Undo`]s, by number (a toast's `Action::Undo(n)`).
+/// Owned by the app's `Services`, shared with the store writer that fills it.
+#[derive(Debug, Clone, Default)]
+pub struct UndoStash(std::sync::Arc<std::sync::Mutex<Stashed>>);
+
+/// The last number handed out, and the kept actions by number.
+type Stashed = (u16, std::collections::VecDeque<(u16, Undo)>);
+
+impl UndoStash {
+    /// Keep `u`; returns its number.
+    pub fn stash(&self, u: Undo) -> u16 {
+        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        g.0 = g.0.wrapping_add(1).max(1);
+        let n = g.0;
+        g.1.push_back((n, u));
+        while g.1.len() > UNDO_KEEP {
+            g.1.pop_front();
+        }
+        n
+    }
+
+    /// The rows of Undo number `n` (once).
+    pub fn take(&self, n: u16) -> Option<Undo> {
+        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let at = g.1.iter().position(|(k, _)| *k == n)?;
+        g.1.remove(at).map(|(_, u)| u)
+    }
+}
+
 /// Put back the rows a combined write found (module docs).
 pub fn undo(conn: &Connection, u: &Undo) -> Result<()> {
     atomic(conn, |c| {
@@ -545,6 +577,17 @@ pub fn rename(conn: &Connection, copies: &[ItemRef], name: &str, overwrite: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Undo numbers are handed out once and only the last [`UNDO_KEEP`] actions can be undone.
+    #[test]
+    fn undo_stash_keeps_the_last_actions_once() {
+        let stash = UndoStash::default();
+        let first = stash.stash(Undo::empty());
+        let kept: Vec<u16> = (0..UNDO_KEEP).map(|_| stash.stash(Undo::empty())).collect();
+        assert!(stash.take(first).is_none(), "pushed out by {UNDO_KEEP} newer actions");
+        assert!(stash.take(kept[UNDO_KEEP - 1]).is_some());
+        assert!(stash.take(kept[UNDO_KEEP - 1]).is_none(), "once");
+    }
 
     #[test]
     fn container_of_reads_only_the_extension() {

@@ -620,6 +620,8 @@ fn save_rename(store: &Store, target: &RenameTarget, name: String) -> Ticket<()>
             ov.rename = rename;
             user::set_group_override(c, source, kind, &key, &ov)
         }),
+        // written by `RenameOverlay::save` (`ui::copies::rename`)
+        RenameTarget::Copies { .. } => w.submit(|_| Ok(())),
         RenameTarget::FavList(id) => w.submit_notify(DataScope::Favourites, move |c| {
             let icon = user::fav_lists(c)?.into_iter().find(|l| l.id == id).map(|l| l.icon).unwrap_or_else(|| glyphs::FAV_LIST.into());
             user::rename_fav_list(c, id, &name, &icon)
@@ -639,12 +641,15 @@ pub struct RenameOverlay {
     pending: Option<Ticket<()>>,
     error: Option<String>,
     enter: Submit,
+    /// Copies of a combined title with their own name: the name the user confirmed renaming
+    /// them to (Enter again).
+    overwrite: Option<String>,
 }
 
 impl RenameOverlay {
     pub fn new(spec: RenameSpec) -> Self {
         let text = spec.initial.clone();
-        Self { spec, text, pending: None, error: None, enter: Submit::default() }
+        Self { spec, text, pending: None, error: None, enter: Submit::default(), overwrite: None }
     }
 
     fn save(&mut self, ctx: &mut UiCtx<'_>) -> OverlayOutcome {
@@ -657,6 +662,23 @@ impl RenameOverlay {
             return OverlayOutcome::Keep;
         }
         if name == self.spec.initial.trim() {
+            return OverlayOutcome::Close;
+        }
+        if let RenameTarget::Copies { items } = &self.spec.target {
+            // copies with a name of their own keep it unless Enter is pressed again
+            let overwrite = self.overwrite.as_deref() == Some(name.as_str());
+            if !overwrite {
+                let db = ctx.db;
+                let own = crate::store::copies::rename_conflicts(db, items, &name).unwrap_or_default();
+                if let Some((_, first)) = own.first() {
+                    let n = own.len();
+                    let which = if n == 1 { format!("A copy is named “{first}”") } else { format!("{n} copies have names of their own") };
+                    self.error = Some(format!("{which} — Enter again renames {} too", if n == 1 { "it" } else { "them" }));
+                    self.overwrite = Some(name);
+                    return OverlayOutcome::Keep;
+                }
+            }
+            crate::ui::copies::rename(ctx, items.clone(), &name, overwrite);
             return OverlayOutcome::Close;
         }
         self.pending = Some(save_rename(&ctx.services.store, &self.spec.target, name));
@@ -694,7 +716,9 @@ impl Overlay for RenameOverlay {
         let saving = self.pending.is_some();
         let (cancel, ok) = card_area(egui_ctx, theme, "rename", CardKind::Popup, 420.0 * theme.rem(), None, |ui| {
             let hint = match self.spec.target {
-                RenameTarget::Item { .. } | RenameTarget::Group { .. } => Some("Leave empty to restore the provider's name."),
+                RenameTarget::Item { .. } | RenameTarget::Group { .. } | RenameTarget::Copies { .. } => {
+                    Some("Leave empty to restore the provider's name.")
+                }
                 _ => None,
             };
             title(ui, theme, &self.spec.title, hint);
@@ -1006,5 +1030,41 @@ mod tests {
         assert!(std::thread::spawn(pin_cooldown).join().expect("thread").is_none(), "another thread isn't locked out");
         PIN_GUARD.set(PinGuard { failures: 0, until: Some(Instant::now()) });
         assert!(pin_cooldown().is_none(), "an elapsed cooldown ends");
+    }
+
+    /// F2 on a combined title (DESIGN §29.15): copies without a name of their own take the new
+    /// one; a copy with its own name keeps it until Enter is pressed again, after the dialog
+    /// said so — then every copy is renamed, with an Undo toast.
+    #[test]
+    fn renaming_every_copy_asks_before_overwriting_a_copys_own_name() {
+        use crate::model::{ItemKey, ItemKind, ItemOverride, ItemRef, SourceId};
+        use crate::ui::screens::home::testkit::{overlay_harness, rig, seed, until_ov};
+        let (mut t, one) = rig();
+        let (a, b) = seed(&mut t, |c| {
+            let a = crate::ui::screens::home::testkit::source(c, "Alpha")?;
+            let b = crate::ui::screens::home::testkit::source(c, "Bravo")?;
+            crate::ui::screens::home::testkit::named_movies(c, a, &[("EN ★ Dune - 2021", "Dune")])?;
+            crate::ui::screens::home::testkit::named_movies(c, b, &[("EN - Dune (2021)", "Dune")])?;
+            Ok((a, b))
+        });
+        let r = |s: SourceId| ItemRef { source: s, kind: ItemKind::Movie, key: ItemKey("m3u:named0000".into()) };
+        let own = r(b);
+        seed(&mut t, move |c| {
+            crate::store::user::set_item_override(c, &own, &ItemOverride { rename: Some("Dune (Bravo)".into()), ..Default::default() })
+        });
+        let spec = RenameSpec { title: "Rename every copy".into(), initial: "Dune".into(), target: RenameTarget::Copies { items: vec![r(a), r(b)] } };
+        let mut h = overlay_harness(t, one, RenameOverlay::new(spec), egui::vec2(1000.0, 700.0));
+        h.state_mut().o.text = "Dune: Part One".into();
+        h.state_mut().act(Action::Activate);
+        h.run_steps(1);
+        assert_eq!(h.state().o.error.as_deref(), Some("A copy is named “Dune (Bravo)” — Enter again renames it too"), "asks first");
+        assert_ne!(h.state().last, "Close");
+        h.state_mut().act(Action::Activate);
+        h.run_steps(1);
+        assert_eq!(h.state().last, "Close");
+        let name = |h: &egui_kittest::Harness<'_, crate::ui::screens::home::testkit::OvApp<RenameOverlay>>, s: SourceId| {
+            crate::store::user::item_override(&h.state().t.services().store.reader().unwrap(), &r(s)).unwrap().and_then(|o| o.rename)
+        };
+        until_ov(&mut h, "both renamed", |h| name(h, a).as_deref() == Some("Dune: Part One") && name(h, b).as_deref() == Some("Dune: Part One"));
     }
 }

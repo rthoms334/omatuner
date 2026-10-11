@@ -413,6 +413,12 @@ pub trait Screen {
     /// Result of an overlay this screen opened (confirm token, chosen menu action...).
     fn on_overlay_result(&mut self, _ctx: &mut UiCtx<'_>, _result: overlays::OverlayResult) {}
 
+    /// Hints the focused element adds to the status bar's (a stack card: "Space copies ·
+    /// Ctrl+O play from"), as of the last frame.
+    fn hint_extras(&self) -> Vec<(crate::keymap::Action, &'static str)> {
+        Vec::new()
+    }
+
     /// Whether the corner mini-player may show over this screen while something plays.
     /// False for Onboarding and the Player itself.
     fn allows_mini_player(&self) -> bool {

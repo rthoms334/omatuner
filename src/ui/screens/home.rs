@@ -161,7 +161,7 @@ pub(crate) mod kit {
 
     /// Locks can change: a PIN exists and the session is open (else a toast / the PIN prompt,
     /// answered with `OverlayResult::Unlocked(ToggleLock)`).
-    fn may_change_locks(ctx: &mut UiCtx<'_>) -> bool {
+    pub(crate) fn may_change_locks(ctx: &mut UiCtx<'_>) -> bool {
         if ctx.config.parental.pin_hash.is_none() || !ctx.config.parental.enabled {
             ctx.toast(Toast::info("Set a PIN in Settings ▸ Parental first"));
             return false;
@@ -498,8 +498,6 @@ pub struct HomeScreen {
     rails_key: Option<RailsKey>,
     scroll_to_cursor: bool,
     playing: kit::PlayingVod,
-    /// What the last Undo toast reverts.
-    undo: Option<st::Undo>,
 }
 
 /// A cheap fingerprint of the favourites lists (their order, names and items).
@@ -649,13 +647,6 @@ impl HomeScreen {
         self.rails = rails;
     }
 
-    /// How recently a copy was played, from Continue watching (newest first): the copy you
-    /// were watching plays first (DESIGN §29.12).
-    fn played_at(&self, ctx: &UiCtx<'_>, movies: bool, copy: u32) -> Option<Timestamp> {
-        let kind = st::all(ctx.lib, movies).get(copy as usize)?.kind;
-        self.continue_items.iter().position(|c| c.card.kind == kind).map(|r| -(r as Timestamp))
-    }
-
     fn current_tile(&self) -> Option<(usize, &Tile)> {
         let rail = self.rails.get(self.rail)?;
         let col = self.cols.get(self.rail)?.2;
@@ -680,21 +671,12 @@ impl HomeScreen {
                     kit::ask_pin(ctx, if alt { Action::ActivateAlt } else { Action::Activate }, "This channel is locked");
                 }
             }
-            // a stack tile: locked only when every copy is; Shift+Enter plays the copy that
-            // plays first (DESIGN §29.12)
-            Tile::Vod(kind) if st::stack_of_kind(ctx.lib, ctx.config, kind).is_some() => {
-                let movies = st::is_movie(kind);
-                let Some(s) = st::stack_of_kind(ctx.lib, ctx.config, kind) else { return };
-                let copies = ctx.lib.vod.stacks(movies).members(s).to_vec();
-                let order = st::play_order(ctx.lib, ctx.config, movies, &copies, kit::unlocked(ctx), |c| self.played_at(ctx, movies, c), |_| None);
-                let Some(first) = order.first().and_then(|c| st::all(ctx.lib, movies).get(*c as usize)).map(|v| v.kind) else {
-                    kit::ask_pin(ctx, if alt { Action::ActivateAlt } else { Action::Activate }, "Every copy of this title is locked");
-                    return;
-                };
-                match (kind, first, alt) {
-                    (_, VodKind::Movie(id), true) => super::movie_detail::play_movie(ctx, id),
-                    (VodKind::Movie(id), _, _) => ctx.push(Route::MovieDetail(id)),
-                    (VodKind::Series(id), _, _) => ctx.push(Route::SeriesDetail(id)),
+            // a stack tile (DESIGN §29.12): Shift+Enter plays the copy that plays first, with
+            // its fallback; Enter opens the tile copy's page (its PIN when that copy is locked)
+            Tile::Vod(_) if alt && self.tile_stack(ctx, tile).is_some() => {
+                let Some((movies, i)) = self.tile_stack(ctx, tile) else { return };
+                if !crate::ui::copies::play_title(ctx, movies, i, None, true) {
+                    kit::ask_pin(ctx, Action::ActivateAlt, "Every copy of this title is locked");
                 }
             }
             Tile::Vod(kind) => {
@@ -717,8 +699,13 @@ impl HomeScreen {
                     return;
                 }
                 if alt {
-                    // Shift+Enter resumes directly
-                    kit::play_media(ctx, c.media, true, PlayOrigin::Home);
+                    // Shift+Enter resumes directly — a title's copies with their fallback
+                    match self.tile_stack(ctx, tile) {
+                        Some((movies, i)) => {
+                            crate::ui::copies::play_title(ctx, movies, i, None, false);
+                        }
+                        None => kit::play_media(ctx, c.media, true, PlayOrigin::Home),
+                    }
                 } else {
                     ctx.push(c.open);
                 }
@@ -730,6 +717,17 @@ impl HomeScreen {
                 ctx.navigate(crate::ui::NavRequest::Switch(Route::Live { group: None, channel: None }));
             }
         }
+    }
+
+    /// The title of a movie / series tile while its copies combine: (movies, index).
+    fn tile_stack(&self, ctx: &UiCtx<'_>, tile: &Tile) -> Option<(bool, u32)> {
+        let kind = match tile {
+            Tile::Vod(kind) => *kind,
+            Tile::Continue(i) => self.continue_items.get(*i)?.card.kind,
+            _ => return None,
+        };
+        st::stack_of_kind(ctx.lib, ctx.config, kind)?;
+        Some((st::is_movie(kind), st::index_of(ctx.lib, kind)?))
     }
 
     fn tile_item(&self, ctx: &UiCtx<'_>, tile: &Tile) -> Option<ItemRef> {
@@ -774,17 +772,31 @@ impl HomeScreen {
         let rail = self.rails.get(self.rail).map(|r| (r.kind, r.list));
         let Some(item) = self.tile_item(ctx, &tile) else { return kit::not_here(ctx) };
         let name = self.tile_name(ctx, &tile);
-        // a stack tile's ★ (DESIGN §29.12): add the copy that would play, or take every copy out
-        if let (Action::ToggleFavourite, Tile::Vod(kind)) = (action, &tile)
-            && let Some(s) = st::stack_of_kind(ctx.lib, ctx.config, *kind)
-        {
-            let movies = st::is_movie(*kind);
-            let (all, copies) = (st::all(ctx.lib, movies), ctx.lib.vod.stacks(movies).members(s).to_vec());
-            let refs: Vec<ItemRef> = copies.iter().filter_map(|c| all.get(*c as usize)).map(st::item_ref).collect();
-            let order = st::play_order(ctx.lib, ctx.config, movies, &copies, kit::unlocked(ctx), |c| self.played_at(ctx, movies, c), |_| None);
-            let plays = order.first().and_then(|c| all.get(*c as usize)).map(st::item_ref).unwrap_or(item);
-            if let Some(u) = st::toggle_favourite(ctx, &refs, &plays) {
-                self.undo = Some(u);
+        // a stack tile (DESIGN §29.12, §29.15): ★, ✓, lock, hide, rename and forgetting
+        // progress cover the title's copies
+        let combined = matches!(action, Action::ToggleFavourite | Action::ToggleHidden | Action::ToggleLock | Action::Rename | Action::MarkWatched)
+            || (action == Action::Remove && matches!(rail, Some((RailKind::Continue, _))));
+        if let Some((movies, i)) = self.tile_stack(ctx, &tile).filter(|_| combined) {
+            let plan = crate::ui::copies::plan(ctx, movies, i).unwrap_or_default();
+            match action {
+                Action::ToggleFavourite => crate::ui::copies::toggle_favourite(ctx, &plan),
+                Action::ToggleHidden => crate::ui::copies::hide(ctx, &plan, &name),
+                Action::ToggleLock => {
+                    let all = st::all(ctx.lib, movies);
+                    let on = !plan.copies.iter().all(|c| all.get(c.item as usize).is_some_and(|v| v.locked));
+                    if kit::may_change_locks(ctx) {
+                        crate::ui::copies::set_locked(ctx, &plan, on);
+                    }
+                }
+                Action::Rename => ctx.open(OverlayRequest::Rename(crate::ui::overlays::RenameSpec {
+                    title: "Rename every copy".into(),
+                    initial: name.clone(),
+                    target: crate::ui::overlays::RenameTarget::Copies { items: plan.refs() },
+                })),
+                Action::MarkWatched if movies => crate::ui::copies::mark_watched(ctx, &plan, &name, true),
+                Action::MarkWatched => ctx.toast(crate::msg::Toast::info("Open the series to mark its episodes watched")),
+                _ if movies => crate::ui::copies::mark_watched(ctx, &plan, &name, false),
+                _ => crate::ui::copies::forget_series(ctx, &plan),
             }
             return;
         }
@@ -1053,12 +1065,6 @@ impl Screen for HomeScreen {
             }
             // letters never filter on Home (DESIGN §13.3)
             Action::FilterInput(_) | Action::Parent => true,
-            Action::Undo(0) => {
-                if let Some(u) = self.undo.take() {
-                    st::undo(ctx, u);
-                }
-                true
-            }
             _ => false,
         }
     }
@@ -1431,8 +1437,18 @@ pub(crate) mod testkit {
 
     impl<S: Screen> App<S> {
         pub fn act(&mut self, a: Action) -> bool {
+            // a toast's Undo is the app's, whatever screen shows (`ui::copies::undo`)
+            if let Action::Undo(n) = a {
+                return crate::ui::copies::undo(self.t.services(), n);
+            }
             let s = &mut self.s;
             self.t.with_ctx(|ctx| s.on_action(ctx, a))
+        }
+        /// The newest toast with an Undo button, once the store write that offers it is done.
+        pub fn undo_toast(&mut self) -> Option<crate::msg::Toast> {
+            let _ = self.t.services().store.writer().blocking(|_| Ok(()));
+            self.pump();
+            self.t.toasts.iter().rev().find(|t| matches!(t.action, Some((_, Action::Undo(_))))).cloned()
         }
         pub fn enter(&mut self, r: Route) {
             let s = &mut self.s;
@@ -1449,6 +1465,9 @@ pub(crate) mod testkit {
                     self.t.lib = lib.clone();
                     self.t.favs = lib.favs.clone();
                     self.t.search_index = None;
+                }
+                if let AppEvent::Toast(t) = &ev {
+                    self.t.toasts.push(t.clone());
                 }
                 let s = &mut self.s;
                 self.t.with_ctx(|ctx| s.on_event(ctx, &ev));

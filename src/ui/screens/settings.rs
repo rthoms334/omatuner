@@ -29,7 +29,7 @@
 //!
 //! Several playlists (DESIGN §29.14): Interface ▸ "Same title in several playlists"
 //! (Combine / Show each copy) and "Which copy plays first" (Playlist order / Best quality);
-//! Hidden ▸ "Titles you split or combined" lists the copies taken out of their stack ("Not the
+//! Hidden ▸ "Titles you separated or pinned" lists the copies taken out of their stack ("Not the
 //! same title") and the "Always play from" pins — Enter undoes one.
 
 use std::collections::{HashMap, HashSet};
@@ -733,7 +733,7 @@ pub struct SettingsScreen {
     orphans_loader: Option<Loader<Vec<Orphan>>>,
     hidden_items: Vec<(ItemRef, String)>,
     hidden_loader: Option<Loader<Vec<(ItemRef, String)>>>,
-    /// Hidden ▸ "Titles you split or combined".
+    /// Hidden ▸ "Titles you separated or pinned".
     title_links: Vec<TitleLink>,
     links_loader: Option<Loader<Vec<TitleLink>>>,
     editor: Option<SourceEditor>,
@@ -1072,13 +1072,16 @@ impl SettingsScreen {
                 v.push(Row::Section("Sorting".into()));
                 v.extend(IFACE_C[3..6].iter().map(Row::Choice));
                 v.push(Row::Toggle(&IFACE_T[10]));
-                v.push(Row::Section("Several playlists".into()));
-                v.extend(STACK_C.iter().map(Row::Choice));
-                v.push(Row::Note(
-                    "In All playlists, copies of one movie or series are one card; your audio language plays first. Space on a card shows each copy."
-                        .into(),
-                    false,
-                ));
+                // only for someone with two playlists of movies or series (DESIGN §29.14)
+                if [ItemKind::Movie, ItemKind::Series].iter().any(|k| ctx.lib.eligible(*k).len() > 1) {
+                    v.push(Row::Section("Several playlists".into()));
+                    v.extend(STACK_C.iter().map(Row::Choice));
+                    v.push(Row::Note(
+                        "In All playlists, copies of one movie or series are one card; your audio language plays first. Space on a card shows each copy."
+                            .into(),
+                        false,
+                    ));
+                }
                 v.push(Row::Section("Look".into()));
                 v.push(Row::Toggle(&IFACE_T[6]));
                 v.push(Row::Text(&IFACE_TEXT[0]));
@@ -1192,9 +1195,13 @@ impl SettingsScreen {
                 for (r, name) in self.hidden_items.iter().filter(|(r, _)| !ctx.lib.conceals(r)) {
                     v.push(item(Item::HiddenVod(r.clone()), glyphs::HIDDEN, name.clone(), Some("Enter unhides".into())));
                 }
-                // DESIGN §29.14: "Not the same title" and "Always play from"
-                v.push(Row::Section("Titles you split or combined".into()));
-                if self.title_links.is_empty() && self.links_loader.is_none() {
+                // DESIGN §29.14: "Not the same title" and "Always play from" — for someone with
+                // two playlists of movies or series, or with corrections to list
+                let multi = [ItemKind::Movie, ItemKind::Series].iter().any(|k| ctx.lib.eligible(*k).len() > 1);
+                if multi || !self.title_links.is_empty() {
+                    v.push(Row::Section("Titles you separated or pinned".into()));
+                }
+                if multi && self.title_links.is_empty() && self.links_loader.is_none() {
                     v.push(Row::Note("Nothing changed — “Not the same title” on a copy of a movie or series shows it on its own.".into(), false));
                 }
                 for l in self.title_links.iter().filter(|l| !ctx.lib.conceals(&l.item)) {
@@ -1202,7 +1209,7 @@ impl SettingsScreen {
                     let name = l.name.clone().unwrap_or_else(|| l.item.key.to_string());
                     let (icon, detail) = match l.action {
                         LinkAction::Split => (glyphs::CLOSE, format!("{playlist} · shown on its own · Enter combines it again")),
-                        LinkAction::Pin => (glyphs::FAVOURITE, format!("{playlist} · always plays first · Enter undoes")),
+                        LinkAction::Pin => (glyphs::PIN, format!("{playlist} · always plays first · Enter undoes")),
                     };
                     v.push(item(Item::TitleLink(l.item.clone(), l.action), icon, name, Some(detail)));
                 }
@@ -3917,7 +3924,7 @@ mod tests {
         until(&mut h, "saved after the presses settle", |h| stored(h) == 45);
     }
 
-    /// DESIGN §29.14: Hidden ▸ "Titles you split or combined" lists the copies taken out of
+    /// DESIGN §29.14: Hidden ▸ "Titles you separated or pinned" lists the copies taken out of
     /// their stack and the pinned ones; Enter undoes one (stored at once). Interface ▸ "Same
     /// title in several playlists" switches between Combine and Show each copy.
     #[test]
@@ -3936,7 +3943,7 @@ mod tests {
         let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 900.0));
         h.state_mut().enter(Route::Settings(SettingsPage::Hidden));
         until(&mut h, "the titles", |h| has_label(h, "Dune (Bravo)") && has_label(h, "Heat"));
-        assert!(has_label(&h, "TITLES YOU SPLIT OR COMBINED"));
+        assert!(has_label(&h, "TITLES YOU SEPARATED OR PINNED"));
         assert!(testkit::has_label_containing(&h, "Bravo · shown on its own") && testkit::has_label_containing(&h, "Alpha · always plays first"));
         focus(&mut h, "Dune (Bravo)");
         h.state_mut().act(Action::Activate);

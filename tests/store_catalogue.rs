@@ -1694,11 +1694,16 @@ fn play_commands_and_the_error_cards_other_copy() {
     };
     let plan = |unlocked: bool| copies::plan(&r, &lib.vod, true, at("a1"), unlocked, CopyOrder::PlaylistOrder, NOW).unwrap();
     let copy = |cmd: Option<PlayerCommand>| match cmd {
-        Some(PlayerCommand::PlayCopy(CopyPlay { req, fallback, start_at })) => (req.media, fallback, start_at, req.resume),
+        Some(PlayerCommand::PlayCopy(CopyPlay { req, fallback, start_at, .. })) => (req.media, fallback, start_at, req.resume),
         other => panic!("not a copy play: {other:?}"),
     };
     let p = plan(false);
     assert_eq!(copy(ui::movie_command(&lib.vod, &p, None, true, PlayOrigin::Fullscreen)), (movie("a5"), Some(movie("a1")), None, true));
+    // the next copy is in the same playlist: a refusing playlist (403) falls back to TV 2's
+    let Some(PlayerCommand::PlayCopy(c)) = ui::movie_command(&lib.vod, &p, None, true, PlayOrigin::Fullscreen) else { unreachable!() };
+    assert_eq!(c.elsewhere, Some(movie("b1")));
+    assert_eq!(CopyPlay::fallback_for(c.fallback.clone(), c.elsewhere.clone(), tuner::player::PlayerErrorKind::HttpForbidden), Some(movie("b1")));
+    assert_eq!(CopyPlay::fallback_for(c.fallback, c.elsewhere, tuner::player::PlayerErrorKind::Timeout), Some(movie("a1")), "a dead copy: the next");
     let picked = ui::movie_command(&lib.vod, &p, Some(at("b1")), false, PlayOrigin::Fullscreen);
     assert_eq!(copy(picked), (movie("b1"), Some(movie("a5")), None, false), "a picked copy falls back on the best other one");
     let none = copies::CopyPlan { order: vec![], ..p.clone() };
@@ -1728,7 +1733,7 @@ fn play_commands_and_the_error_cards_other_copy() {
         ui::other_copy(&r, &lib, |m, i| copies::plan(&r, &lib.vod, m, i, unlocked, CopyOrder::PlaylistOrder, NOW).ok(), &failed(key))
     };
     let o = offer("a5", false).unwrap();
-    assert_eq!(o.label, "Play from TV at 41:20");
+    assert_eq!(o.label, "Play from TV · EN at 41:20", "another copy of the same playlist says which");
     assert_eq!((o.play.req.media.clone(), o.play.start_at, o.play.fallback.clone()), (movie("a1"), Some(2480.0), None));
     assert_eq!(offer("a1", false).unwrap().play.req.media, movie("a5"));
     assert_eq!(offer("b1", false).unwrap().label, "Play from TV at 41:20", "TV 2's copy failed: TV's best");
@@ -1769,7 +1774,52 @@ fn play_commands_and_the_error_cards_other_copy() {
     let offer =
         |unlocked: bool| ui::other_copy(&r, &lib, |m, i| copies::plan(&r, &lib.vod, m, i, unlocked, CopyOrder::PlaylistOrder, NOW).ok(), &snap);
     assert_eq!(offer(false), None, "locked while the session is");
-    assert_eq!(offer(true).map(|o| o.label), Some("Play from TV 2 at 41:20".to_owned()));
+    assert_eq!(offer(true).map(|o| o.label), Some("Play from TV 2 · AR-SUBS at 41:20".to_owned()), "its playlist's other copy");
+}
+
+/// A split is user data like a favourite (DESIGN §29.11): when the provider re-keys the copy,
+/// the refresh re-attaches the split to the new key — the wrong merge doesn't come back.
+#[test]
+fn a_split_follows_its_copy_to_a_new_key() {
+    let s = store("tuner-st-split-rekey");
+    let (a, b) = w(&s, |c| Ok((seed::seed_source(c, "TV")?, seed::seed_source(c, "TV 2")?)));
+    run_import(&s, a, vec![], vec![listed("a1", "EN ★ Leo - 2023", "EN", 0, None)], vec![], vec![ItemKind::Movie], NOW);
+    let tamil = listed("b1", "IN-TL - Leo (2023)", "Films", 0, None);
+    run_import(&s, b, vec![], vec![tamil.clone()], vec![], vec![ItemKind::Movie], NOW);
+    w(&s, move |c| tuner::store::titles::set_split(c, &mref(b, "b1"), true, NOW));
+    // the provider lists the same stream under another key
+    let moved = ImportMovie { key: ItemKey("b1-new".into()), ..tamil };
+    run_import(&s, b, vec![], vec![moved], vec![], vec![ItemKind::Movie], NOW + 10);
+    let r = s.reader().unwrap();
+    let links = tuner::store::titles::links(&r).unwrap();
+    assert_eq!(links.iter().map(|l| (l.item.key.0.as_str(), l.action)).collect::<Vec<_>>(), [("b1-new", tuner::store::titles::LinkAction::Split)]);
+    let lib = library::load(&r).unwrap();
+    assert_eq!(lib.vod.stacks(true).len(), 0, "still not the same title");
+}
+
+/// A movie's failure orders its copies ("failed 2 h ago", DESIGN §29.15): a refresh that also
+/// imports channels keeps it; a movie that is gone takes its failure along.
+#[test]
+fn movie_failures_survive_a_refresh_with_channels() {
+    let s = store("tuner-st-vod-failures");
+    let a = w(&s, |c| seed::seed_source(c, "TV"));
+    let channels = || vec![chan("c1", "News", None, "News", "http://h.tv/c1", 0)];
+    let movies = vec![movie("m1", "Dune", "Films", 0), movie("m2", "Heat", "Films", 1)];
+    run_import(&s, a, channels(), movies, vec![], vec![ItemKind::Channel, ItemKind::Movie], NOW);
+    w(&s, move |c| {
+        live::record_failure(c, &mref(a, "m1"), "timeout", NOW)?;
+        live::record_failure(c, &mref(a, "m2"), "timeout", NOW)
+    });
+    run_import(&s, a, channels(), vec![movie("m1", "Dune", "Films", 0)], vec![], vec![ItemKind::Channel, ItemKind::Movie], NOW + 10);
+    let r = s.reader().unwrap();
+    let keys: Vec<String> = r
+        .prepare("SELECT item_key FROM stream_failure ORDER BY item_key")
+        .unwrap()
+        .query_map([], |x| x.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(keys, ["m1"]);
 }
 
 // ------------------------------------------------------------------ category filter

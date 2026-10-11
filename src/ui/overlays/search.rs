@@ -170,15 +170,22 @@ impl SearchOverlay {
                     }
                     OverlayOutcome::Close
                 }
-                // a stack: the copy that plays first (DESIGN §29.12)
-                SearchTarget::Movie(_) | SearchTarget::Series(_) if alt && first_copy(ctx, h.item.target).is_some() => {
-                    match first_copy(ctx, h.item.target) {
-                        Some(VodKind::Movie(id)) => crate::ui::screens::movie_detail::play_movie(ctx, id),
-                        Some(VodKind::Series(id)) => {
-                            let name = ctx.lib.vod.find(VodKind::Series(id)).map(|v| v.name.to_string()).unwrap_or_default();
-                            crate::ui::screens::movies::play_series(ctx, id, &name)
+                // a stack (DESIGN §29.12): Shift+Enter plays the copy that plays first, with
+                // its fallback; Enter opens the stack's top card's page
+                SearchTarget::Movie(_) | SearchTarget::Series(_) if hit_stack(ctx, h.item.target).is_some() => {
+                    let Some((movies, i, s)) = hit_stack(ctx, h.item.target) else { return OverlayOutcome::Keep };
+                    if alt {
+                        if !crate::ui::copies::play_title(ctx, movies, i, None, true) {
+                            locked_toast(ctx);
+                            return OverlayOutcome::Keep;
                         }
-                        None => {}
+                    } else {
+                        let top = ctx.lib.vod.stacks(movies).top(s);
+                        match st::all(ctx.lib, movies).get(top as usize).map(|v| v.kind) {
+                            Some(VodKind::Movie(id)) => ctx.push(Route::MovieDetail(id)),
+                            Some(VodKind::Series(id)) => ctx.push(Route::SeriesDetail(id)),
+                            None => {}
+                        }
                     }
                     OverlayOutcome::Close
                 }
@@ -272,6 +279,33 @@ impl SearchOverlay {
         };
         let Some((item, locked, by_group)) = Self::hit_item(ctx, &h) else { return OverlayOutcome::Keep };
         let name = h.item.name.to_string();
+        // a stacked hit: ★, hide, rename and lock cover every copy (DESIGN §29.15)
+        if let Some((movies, i, _)) = hit_stack(ctx, h.item.target)
+            && matches!(action, Action::ToggleFavourite | Action::ToggleHidden | Action::Rename | Action::ToggleLock)
+        {
+            if action == Action::ToggleLock && !kit::unlocked(ctx) {
+                ctx.toast(crate::msg::Toast::info("Locks change with the PIN — press Ctrl+L in a list"));
+                return OverlayOutcome::Keep;
+            }
+            let plan = crate::ui::copies::plan(ctx, movies, i).unwrap_or_default();
+            match action {
+                Action::ToggleFavourite => crate::ui::copies::toggle_favourite(ctx, &plan),
+                Action::ToggleHidden => crate::ui::copies::hide(ctx, &plan, &name),
+                Action::Rename => ctx.open(crate::ui::OverlayRequest::Rename(crate::ui::overlays::RenameSpec {
+                    title: "Rename every copy".into(),
+                    initial: name.clone(),
+                    target: crate::ui::overlays::RenameTarget::Copies { items: plan.refs() },
+                })),
+                _ => {
+                    let all = st::all(ctx.lib, movies);
+                    let on = !plan.copies.iter().all(|c| all.get(c.item as usize).is_some_and(|v| v.locked));
+                    if kit::may_change_locks(ctx) {
+                        crate::ui::copies::set_locked(ctx, &plan, on);
+                    }
+                }
+            }
+            return OverlayOutcome::Keep;
+        }
         match (action, h.item.target) {
             (Action::ToggleFavourite, _) => kit::toggle_favourite(ctx, &item),
             (Action::AddToList, _) => kit::list_picker(ctx, &item, &name),
@@ -825,18 +859,15 @@ fn paint_guide(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, g: &Programme
     p.galley(egui::pos2(left, y - g.size().y / 2.0), g, c);
 }
 
-/// The copy of a stacked hit that plays first (`None`: no stack, or every copy is locked).
-fn first_copy(ctx: &UiCtx<'_>, target: SearchTarget) -> Option<VodKind> {
+/// A movie / series hit whose copies combine: (movies, its index, its stack).
+fn hit_stack(ctx: &UiCtx<'_>, target: SearchTarget) -> Option<(bool, u32, crate::store::stacks::StackId)> {
     let kind = match target {
         SearchTarget::Movie(id) => VodKind::Movie(id),
         SearchTarget::Series(id) => VodKind::Series(id),
         SearchTarget::Channel(_) => return None,
     };
-    let movies = st::is_movie(kind);
     let s = st::stack_of_kind(ctx.lib, ctx.config, kind)?;
-    let copies = ctx.lib.vod.stacks(movies).members(s).to_vec();
-    let order = st::play_order(ctx.lib, ctx.config, movies, &copies, kit::unlocked(ctx), |_| None, |_| None);
-    order.first().and_then(|c| st::all(ctx.lib, movies).get(*c as usize)).map(|v| v.kind)
+    Some((st::is_movie(kind), st::index_of(ctx.lib, kind)?, s))
 }
 
 /// A locked hit (the session relocked while the card was open): a PIN prompt from here would

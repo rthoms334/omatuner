@@ -191,6 +191,12 @@ impl SeriesDetailScreen {
             kit::ask_pin(ctx, if alt { Action::ActivateAlt } else { Action::Activate }, "This series is locked");
             return;
         }
+        // several copies: the same episode of the next copy is the fallback (DESIGN §29.15)
+        if let Some(id) = self.id.filter(|_| self.copies.is_stacked()) {
+            let plan = self.copies.plan().clone();
+            crate::ui::copies::play_episode(ctx, &plan, id, e, from_start, true);
+            return;
+        }
         if from_start {
             kit::play_media(ctx, MediaRef::Episode(e.id), false, PlayOrigin::Fullscreen);
         } else {
@@ -207,8 +213,8 @@ impl SeriesDetailScreen {
     }
 
     /// The copy Play uses when it isn't this page's (DESIGN §29.14).
-    fn other_copy(&self, ctx: &UiCtx<'_>) -> Option<u32> {
-        self.copies.plays(ctx).filter(|c| Some(*c) != self.copies.page())
+    fn other_copy(&self) -> Option<u32> {
+        self.copies.plays().filter(|c| Some(*c) != self.copies.page())
     }
 
     /// Play another copy: the episode its page would open at.
@@ -220,7 +226,10 @@ impl SeriesDetailScreen {
             self.copies.request_play(ctx, c);
             return;
         }
-        super::movies::play_series(ctx, id, &v.name);
+        // its own next episode, with the next copy's as the fallback
+        if !crate::ui::copies::play_title(ctx, false, c, Some(c), true) {
+            super::movies::play_series(ctx, id, &v.name);
+        }
     }
 
     /// The sections ↑/↓ and Tab walk, in order.
@@ -269,7 +278,7 @@ impl SeriesDetailScreen {
     fn press(&mut self, ctx: &mut UiCtx<'_>, b: Btn) {
         match b {
             Btn::Play => {
-                if let Some(c) = self.other_copy(ctx) {
+                if let Some(c) = self.other_copy() {
                     self.play_copy(ctx, c);
                 } else if let Some(e) = self.next_episode() {
                     self.play(ctx, &e, false, false);
@@ -316,6 +325,9 @@ impl SeriesDetailScreen {
 impl Screen for SeriesDetailScreen {
     fn id(&self) -> ScreenId {
         ScreenId::SeriesDetail
+    }
+    fn hint_extras(&self) -> Vec<(Action, &'static str)> {
+        if self.copies.is_stacked() { vec![(Action::PlayFrom, "play from")] } else { Vec::new() }
     }
     fn key_contexts(&self) -> Vec<KeyContext> {
         vec![KeyContext::Detail]
@@ -395,7 +407,6 @@ impl Screen for SeriesDetailScreen {
                 self.copies.click(ctx, click);
             }
             Action::PlayFrom => self.copies.play_from_menu(ctx),
-            Action::Undo(0) => self.copies.undo(ctx),
             Action::PageUp | Action::Home if self.section == Section::Episodes => {
                 self.ep = 0;
                 self.scroll_to_cursor = true;
@@ -617,8 +628,8 @@ impl Screen for SeriesDetailScreen {
         let buttons = self.buttons();
         // several copies: Play names the playlist it plays from; another copy opens at its own
         // next episode
-        let other = self.other_copy(ctx);
-        let plays_from = self.copies.plays(ctx).and_then(|c| self.copies.playlist(ctx, c)).map(str::to_owned);
+        let other = self.other_copy();
+        let plays_from = self.copies.plays().and_then(|c| self.copies.playlist(ctx, c)).map(str::to_owned);
         let mut copy_click = None;
         let mut clicked_btn = None;
         let mut clicked_season = None;

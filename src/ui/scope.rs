@@ -128,18 +128,21 @@ pub struct Scope<'a> {
     pub eligible: Vec<&'a SourceMeta>,
     /// The playlist picked (`None` = All playlists; always `None` with fewer than two).
     pub selected: Option<&'a SourceMeta>,
+    /// Copies of a title are one card in All (`interface.same_title`, DESIGN §29.14): All's
+    /// count is of cards.
+    pub combined: bool,
 }
 
 impl<'a> Scope<'a> {
     pub fn of(lib: &'a Library, scopes: &PlaylistScopes, kind: ScopeKind) -> Self {
         let eligible = lib.eligible(kind.item_kind());
         let selected = if eligible.len() > 1 { kind.stored(scopes).and_then(|id| eligible.iter().copied().find(|s| s.id == id)) } else { None };
-        Self { kind, eligible, selected }
+        Self { kind, eligible, selected, combined: false }
     }
 
     /// The scope of `kind` for this frame.
     pub fn current(ctx: &UiCtx<'a>, kind: ScopeKind) -> Self {
-        Self::of(ctx.lib, &ctx.config.interface.playlist_scope, kind)
+        Self { combined: crate::ui::stacks::combine(ctx.config), ..Self::of(ctx.lib, &ctx.config.interface.playlist_scope, kind) }
     }
 
     /// Two or more eligible playlists: the scope bar, the picker and Auto playlist marks.
@@ -188,7 +191,13 @@ impl<'a> Scope<'a> {
             Some(id) => lib.count(kind, id),
             None => {
                 let all = Scope { selected: None, ..self.clone() }.filter();
-                self.eligible.iter().filter(|s| all.admits(s.id)).map(|s| lib.count(kind, s.id)).sum()
+                let copies: usize = self.eligible.iter().filter(|s| all.admits(s.id)).map(|s| lib.count(kind, s.id)).sum();
+                // a stack is one card: every stacked copy is in All
+                let saved = match kind {
+                    ItemKind::Movie | ItemKind::Series if self.combined => lib.vod.stacks(kind == ItemKind::Movie).saved(),
+                    _ => 0,
+                };
+                copies.saturating_sub(saved)
             }
         }
     }
