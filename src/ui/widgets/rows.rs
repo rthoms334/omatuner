@@ -9,7 +9,7 @@
 
 use eframe::egui::{self, Align2, Color32, Rect};
 
-use super::badge::{InlineBadge, name_with_quality};
+use super::badge::{InlineBadge, label_with_source, name_with_quality};
 use super::list::paint_row_state;
 use super::progress::paint_progress;
 use super::{RowState, glyphs, paint};
@@ -47,6 +47,16 @@ fn allocate_row(ui: &mut egui::Ui, theme: &Theme, natural_h: f32, state: RowStat
     (rect, resp)
 }
 
+/// A row's playlist glyph, right-aligned at `right_center` (the source colour, fg with an
+/// underline where it wouldn't read), with the playlist's name as its tooltip.
+fn source_mark(ui: &egui::Ui, theme: &Theme, right_center: egui::Pos2, src: &SourceMeta, row: egui::Id) -> Rect {
+    let t = &theme.tokens;
+    let font = paint::font(theme, TypeToken::Icon);
+    let r = super::badge::paint_source_mark(ui.painter(), theme, right_center, Align2::RIGHT_CENTER, src, font, t.bg, t.fg);
+    ui.interact(r, row.with("source"), egui::Sense::hover()).on_hover_text(egui::RichText::new(&src.name).size(theme.font(TypeToken::BodySmall)));
+    r
+}
+
 /// Thin progress bar height (programme / watch progress inside rows).
 fn bar_h(theme: &Theme) -> f32 {
     (3.0 * theme.rem()).round().max(2.0)
@@ -62,8 +72,36 @@ pub fn menu_row(
     chevron: bool,
     state: RowState,
 ) -> egui::Response {
+    menu_row_with(ui, theme, icon, label, detail, chevron, None, state)
+}
+
+/// [`menu_row`] of an item from a playlist: the source's glyph at the right edge when `source`
+/// is shown (Live ▸ Reminders mixes playlists, DESIGN §13.0).
+pub fn menu_row_source(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    icon: Option<&str>,
+    label: &str,
+    detail: Option<&str>,
+    source: Option<&SourceMeta>,
+    state: RowState,
+) -> egui::Response {
+    menu_row_with(ui, theme, icon, label, detail, false, source, state)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn menu_row_with(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    icon: Option<&str>,
+    label: &str,
+    detail: Option<&str>,
+    chevron: bool,
+    source: Option<&SourceMeta>,
+    state: RowState,
+) -> egui::Response {
     let t = &theme.tokens;
-    let (rect, resp) = allocate_row(ui, theme, row_height(theme, Density::Comfortable, detail.is_some()), state, label);
+    let (rect, resp) = allocate_row(ui, theme, row_height(theme, Density::Comfortable, detail.is_some()), state, &label_with_source(label, source));
     if !ui.is_rect_visible(rect) {
         return resp;
     }
@@ -91,6 +129,10 @@ pub fn menu_row(
         );
         right = r.left() - theme.space(SpaceToken::Lg);
     }
+    if let Some(src) = source {
+        right = source_mark(ui, theme, egui::pos2(right, rect.center().y), src, resp.id).left() - theme.space(SpaceToken::Lg);
+    }
+    let p = ui.painter();
     let max_w = (right - left).max(0.0);
     let label_g = paint::galley(p, label, paint::medium(ui.ctx(), theme, TypeToken::Heading), color, max_w);
     match detail {
@@ -114,7 +156,7 @@ pub struct ChannelRowOpts<'a> {
     pub density: Density,
     pub show_number: bool,
     pub show_logo: bool,
-    /// Show a source badge (multiple sources / search results).
+    /// The playlist's glyph (`UiCtx::source_of`: several playlists, DESIGN §13.0).
     pub source: Option<&'a SourceMeta>,
     pub favourite: bool,
     /// Dim + warning glyph (recent failures).
@@ -176,7 +218,7 @@ pub fn channel_row(
 ) -> egui::Response {
     let t = &theme.tokens;
     let comfortable = opts.density == Density::Comfortable;
-    let (rect, resp) = allocate_row(ui, theme, row_height(theme, opts.density, comfortable), state, &ch.name);
+    let (rect, resp) = allocate_row(ui, theme, row_height(theme, opts.density, comfortable), state, &label_with_source(&ch.name, opts.source));
     if !ui.is_rect_visible(rect) {
         return resp;
     }
@@ -218,7 +260,7 @@ pub fn channel_row(
         glyph(glyphs::LOCK, t.text_secondary);
     }
     if let Some(src) = opts.source {
-        glyph(super::badge::source_glyph(src), theme.source_color(src.color));
+        right = source_mark(ui, theme, egui::pos2(right, line_y), src, resp.id).left() - theme.space(SpaceToken::Md);
     }
 
     if opts.show_number {
@@ -289,7 +331,14 @@ pub struct GroupDecor<'a> {
     /// playlist has several (smart names drop the "UK |" prefix, so "UK | Sports" and
     /// "US | Sports" would both read "Sports").
     pub tag: Option<&'a str>,
+    /// The group's playlist, in All with several playlists (DESIGN §29): its name, short, in
+    /// its colour (fg where the colour doesn't read), right of the group's name — so two
+    /// "Sports" groups can be told apart.
+    pub source: Option<&'a SourceMeta>,
 }
+
+/// Share of a group row the playlist's name may take before it elides.
+const GROUP_SOURCE_SHARE: f32 = 0.3;
 
 /// Group/category row: name, count, lock glyph.
 pub fn group_row(ui: &mut egui::Ui, theme: &Theme, g: &Group, state: RowState) -> egui::Response {
@@ -300,7 +349,7 @@ pub fn group_row(ui: &mut egui::Ui, theme: &Theme, g: &Group, state: RowState) -
 pub fn group_row_decor(ui: &mut egui::Ui, theme: &Theme, g: &Group, state: RowState, decor: GroupDecor<'_>) -> egui::Response {
     let t = &theme.tokens;
     let name = g.display_name();
-    let (rect, resp) = allocate_row(ui, theme, row_height(theme, Density::Comfortable, false), state, name);
+    let (rect, resp) = allocate_row(ui, theme, row_height(theme, Density::Comfortable, false), state, &label_with_source(name, decor.source));
     if !ui.is_rect_visible(rect) {
         return resp;
     }
@@ -349,6 +398,12 @@ pub fn group_row_decor(ui: &mut egui::Ui, theme: &Theme, g: &Group, state: RowSt
     }
     if let Some(code) = decor.tag {
         let r = code_badge(p, theme, egui::pos2(right, y), Align2::RIGHT_CENTER, code, t.text_secondary);
+        right = r.left() - theme.space(SpaceToken::Md);
+    }
+    if let Some(src) = decor.source {
+        let color = if g.hidden { t.text_disabled } else { super::badge::legible(theme, theme.source_color(src.color)) };
+        let max_w = (rect.width() * GROUP_SOURCE_SHARE).round();
+        let r = paint::text(p, egui::pos2(right, y), Align2::RIGHT_CENTER, src.name.as_str(), paint::font(theme, TypeToken::BodySmall), color, max_w);
         right = r.left() - theme.space(SpaceToken::Md);
     }
     if decor.marked {

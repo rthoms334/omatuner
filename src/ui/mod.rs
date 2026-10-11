@@ -20,6 +20,7 @@ pub mod layout;
 pub mod overlays;
 pub mod parental;
 pub mod popout;
+pub mod scope;
 pub mod screens;
 #[doc(hidden)]
 pub mod testing;
@@ -118,6 +119,8 @@ pub enum Route {
     /// Fullscreen player for whatever is playing.
     Player,
     Settings(SettingsPage),
+    /// Settings ▸ Playlists with one playlist's editor open (a scope tab's "Edit playlist…").
+    EditPlaylist(SourceId),
     /// Sidebar and status bar are hidden while this route is current.
     Onboarding(OnboardingStart),
     EpgMapping {
@@ -137,7 +140,7 @@ impl Route {
             Route::MovieDetail(_) => ScreenId::MovieDetail,
             Route::SeriesDetail(_) => ScreenId::SeriesDetail,
             Route::Player => ScreenId::Player,
-            Route::Settings(_) => ScreenId::Settings,
+            Route::Settings(_) | Route::EditPlaylist(_) => ScreenId::Settings,
             Route::Onboarding(_) => ScreenId::Onboarding,
             Route::EpgMapping { .. } => ScreenId::EpgMapping,
             Route::Logs => ScreenId::Logs,
@@ -183,6 +186,10 @@ pub enum OverlayRequest {
     EditItem(ItemRef),
     /// "Choose what to show": a playlist's category filter (DESIGN §28.6).
     Categories(SourceId),
+    /// Alt+P: which playlist a screen shows (DESIGN §29). The overlay applies the choice.
+    PlaylistPicker(scope::ScopeKind),
+    /// A scope tab's right-click menu: edit the playlist, move it up / down (DESIGN §29).
+    PlaylistMenu(SourceId),
 }
 
 /// Requests a screen makes during a frame; the app applies them after the frame.
@@ -327,6 +334,19 @@ impl<'a> UiCtx<'a> {
     /// [`UiCtx::quality`] as a `Copy` value (for painters that can't borrow the context).
     pub fn quality_badges(&self) -> data::QualityBadges<'a> {
         data::QualityBadges(self.config.interface.quality_badges.then_some(self.measured))
+    }
+
+    /// The playlist to show on an item of `kind` from `source` in a view without a playlist
+    /// scope (Home, Search, detail pages, the player), or `None` while Settings ▸ Interface ▸
+    /// Playlist on cards doesn't show it (DESIGN §13.0, §29). Scoped screens use
+    /// [`scope::Scope::marks`].
+    pub fn source_of(&self, kind: crate::model::ItemKind, source: SourceId) -> Option<&'a crate::store::library::SourceMeta> {
+        self.source_marks(kind).of(source)
+    }
+    /// [`UiCtx::source_of`] as a `Copy` value (for closures and painters that can't borrow the
+    /// context).
+    pub fn source_marks(&self, kind: crate::model::ItemKind) -> data::SourceMarks<'a> {
+        data::SourceMarks::for_view(self.config.interface.playlist_on_cards, &self.lib.sources, kind, true)
     }
 
     /// An `EpgReader` over the UI connection (guide grid, now/next cache).

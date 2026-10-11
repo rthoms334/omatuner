@@ -47,8 +47,23 @@ pub struct SourceMeta {
     pub last_refresh: Option<Timestamp>,
     pub has_vod: bool,
     pub has_series: bool,
+    /// Has channels (hidden ones count): Live TV / the guide offer it (DESIGN §29).
+    pub has_live: bool,
+    /// "Show in All playlists" (`SourceSettings::in_all`, DESIGN §29).
+    pub in_all: bool,
     /// The source's category filter (`SourceSettings::category_filter`, DESIGN §28).
     pub category_filter: Option<CategoryFilter>,
+}
+
+impl SourceMeta {
+    /// Has items of `kind` (episodes count as their series).
+    pub fn has(&self, kind: ItemKind) -> bool {
+        match kind {
+            ItemKind::Channel => self.has_live,
+            ItemKind::Movie => self.has_vod,
+            ItemKind::Series | ItemKind::Episode => self.has_series,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -63,6 +78,8 @@ pub struct LiveIndex {
     pub groups: Vec<Group>,
     /// Visible members per group, display order (hidden removed).
     members: HashMap<GroupId, Vec<ChannelId>>,
+    /// Visible channels per source (the scope bar's counts, DESIGN §29).
+    per_source: HashMap<SourceId, usize>,
 }
 
 impl LiveIndex {
@@ -78,7 +95,11 @@ impl LiveIndex {
         for v in members.values_mut() {
             v.retain(|c| !hidden.contains(c));
         }
-        Self { channels, hidden, by_id, by_ref, groups, members }
+        let mut per_source: HashMap<SourceId, usize> = HashMap::new();
+        for c in channels.iter().filter(|c| !hidden.contains(&c.id)) {
+            *per_source.entry(c.source_id).or_default() += 1;
+        }
+        Self { channels, hidden, by_id, by_ref, groups, members, per_source }
     }
 
     pub fn get(&self, id: ChannelId) -> Option<&ChannelSummary> {
@@ -196,6 +217,8 @@ pub struct VodIndex {
     members: HashMap<GroupId, Vec<u32>>,
     movie_idx: HashMap<MovieId, u32>,
     series_idx: HashMap<SeriesId, u32>,
+    /// (movies, series) per source (the scope bar's counts, DESIGN §29).
+    per_source: HashMap<SourceId, (usize, usize)>,
 }
 
 impl VodIndex {
@@ -222,7 +245,14 @@ impl VodIndex {
                 _ => None,
             })
             .collect();
-        Self { movies, series, movie_groups, series_groups, members, movie_idx, series_idx }
+        let mut per_source: HashMap<SourceId, (usize, usize)> = HashMap::new();
+        for v in &movies {
+            per_source.entry(v.source_id).or_default().0 += 1;
+        }
+        for v in &series {
+            per_source.entry(v.source_id).or_default().1 += 1;
+        }
+        Self { movies, series, movie_groups, series_groups, members, movie_idx, series_idx, per_source }
     }
 
     fn sort(&self, items: &mut [u32], movies: bool, sort: SortMode) {
@@ -346,6 +376,21 @@ impl Library {
     pub fn source(&self, id: SourceId) -> Option<&SourceMeta> {
         self.sources.iter().find(|s| s.id == id)
     }
+    /// The playlists a screen of `kind` can show (DESIGN §29): enabled and with items of that
+    /// kind (movies, series, channels), in playlist order. "Is there more than one playlist?"
+    /// means `eligible(kind).len() > 1` — never `sources.len()`, which counts disabled
+    /// playlists and free-channel presets without movies.
+    pub fn eligible(&self, kind: ItemKind) -> Vec<&SourceMeta> {
+        self.sources.iter().filter(|s| s.enabled && s.has(kind)).collect()
+    }
+    /// Visible (not hidden) items of `kind` from `source` in this snapshot.
+    pub fn count(&self, kind: ItemKind, source: SourceId) -> usize {
+        match kind {
+            ItemKind::Channel => self.live.per_source.get(&source).copied().unwrap_or(0),
+            ItemKind::Movie => self.vod.per_source.get(&source).map_or(0, |c| c.0),
+            ItemKind::Series | ItemKind::Episode => self.vod.per_source.get(&source).map_or(0, |c| c.1),
+        }
+    }
     pub fn is_empty(&self) -> bool {
         self.sources.is_empty()
     }
@@ -384,11 +429,12 @@ fn load_sources(conn: &Connection) -> Result<Vec<SourceMeta>> {
     let mut stmt = conn.prepare_cached(
         "SELECT s.id, s.name, s.icon, s.color, s.kind, s.enabled, s.last_refresh,
                 EXISTS (SELECT 1 FROM movie m WHERE m.source_id = s.id), EXISTS (SELECT 1 FROM series x WHERE x.source_id = s.id),
-                s.settings
+                s.settings, EXISTS (SELECT 1 FROM channel c WHERE c.source_id = s.id)
          FROM source s ORDER BY s.sort_index, s.id",
     )?;
     let rows = stmt.query_map([], |r| {
         let kind: String = r.get(4)?;
+        let settings = from_json_opt::<SourceSettings>(r.get(9)?);
         Ok(SourceMeta {
             id: r.get(0)?,
             name: r.get(1)?,
@@ -399,7 +445,9 @@ fn load_sources(conn: &Connection) -> Result<Vec<SourceMeta>> {
             last_refresh: r.get(6)?,
             has_vod: r.get(7)?,
             has_series: r.get(8)?,
-            category_filter: from_json_opt::<SourceSettings>(r.get(9)?).and_then(|st| st.category_filter),
+            has_live: r.get(10)?,
+            in_all: settings.as_ref().and_then(|st| st.in_all).unwrap_or(true),
+            category_filter: settings.and_then(|st| st.category_filter),
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)

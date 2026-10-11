@@ -52,10 +52,21 @@ use crate::ui::screens::live::{self, GuideStatus, playing_channel};
 use crate::ui::video_host::{Placement, osd_text};
 use crate::ui::widgets::badge::{InlineBadge, name_with_quality};
 use crate::ui::widgets::list::{ListOutcome, ListState};
-use crate::ui::widgets::{glyphs, logo, slider};
+use crate::ui::widgets::{badge, glyphs, logo, slider};
 use crate::ui::{NavRequest, OverlayRequest, Route, Screen, ScreenId, UiCtx};
 
 const NUMERIC_COMMIT: Duration = Duration::from_millis(1500);
+
+/// The catalogue kind of what plays (whose playlists the OSD's playlist mark counts).
+fn playable_item_kind(k: &crate::model::PlayableKind) -> Option<crate::model::ItemKind> {
+    use crate::model::{ItemKind, PlayableKind};
+    match k {
+        PlayableKind::Live | PlayableKind::Catchup { .. } => Some(ItemKind::Channel),
+        PlayableKind::Movie => Some(ItemKind::Movie),
+        PlayableKind::Episode { .. } => Some(ItemKind::Series),
+        PlayableKind::Url => None,
+    }
+}
 const NEXT_EPISODE_DELAY: Duration = Duration::from_secs(10);
 const FLASH: Duration = Duration::from_millis(1500);
 /// Zoom steps cycled by `V` (mpv `video-zoom`, log2).
@@ -591,7 +602,34 @@ impl PlayerScreen {
         let decoded = snap.state == PlayerState::Playing && snap.video_size.is_some();
         let quality = ch.as_ref().filter(|_| live && !decoded).and_then(|c| ctx.quality(c));
         let badge = quality.map(|q| InlineBadge::quality(&p, theme, q, t.osd_text, s));
-        let max_w = (cr.left() - pad - x).max(0.0);
+        // which playlist, left of the clock, whenever two or more have this kind (DESIGN §29)
+        let mut right = cr.left() - pad;
+        if let Some(src) =
+            playable.as_ref().and_then(|pl| Some((playable_item_kind(&pl.kind)?, pl.source_id?))).and_then(|(k, id)| ctx.source_of(k, id))
+        {
+            let color = theme.source_color(src.color);
+            let name_color = badge::legible_on(color, t.osd_scrim.to_opaque(), t.osd_text);
+            let r = osd_text(
+                &p,
+                egui::pos2(right, top.center().y),
+                Align2::RIGHT_CENTER,
+                &src.name,
+                small_font.clone(),
+                name_color,
+                (rect.width() * 0.25).round(),
+            );
+            let d = osd_text(
+                &p,
+                egui::pos2(r.left() - pad / 3.0, top.center().y),
+                Align2::RIGHT_CENTER,
+                glyphs::DOT,
+                small_font.clone(),
+                color,
+                f32::INFINITY,
+            );
+            right = d.left() - pad;
+        }
+        let max_w = (right - x).max(0.0);
         name_with_quality(&p, theme, egui::pos2(x, top.center().y), title, title_font.clone(), t.osd_text, badge, max_w);
 
         // ---- bottom bar
@@ -919,12 +957,14 @@ impl PlayerScreen {
         }
         let pointer_moved = ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO);
         let mut activate = None;
+        let sources = ctx.source_marks(crate::model::ItemKind::Channel);
         for (k, ri) in (first..panel.rows.len()).take(visible).enumerate() {
             let id = panel.items[panel.rows[ri] as usize];
             let Some(ch) = ctx.lib.live.get(id).cloned() else { continue };
+            let source = sources.of(ch.source_id);
             let r = Rect::from_min_size(egui::pos2(area.left() + pad / 2.0, list_top + k as f32 * row_h), egui::vec2(area.width() - pad, row_h));
             let resp = ui.interact(r, ui.id().with(("panel-row", ri)), egui::Sense::click());
-            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, ch.name.as_ref()));
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, badge::label_with_source(&ch.name, source)));
             if pointer_moved && resp.hovered() {
                 panel.list.cursor = ri;
             }
@@ -956,8 +996,23 @@ impl PlayerScreen {
                 let g = osd_text(&p, egui::pos2(x, line_y), Align2::LEFT_CENTER, glyphs::PLAY, small.clone(), t.osd_accent, f32::INFINITY);
                 x = g.right() + pad / 3.0;
             }
-            let badge = ctx.quality(&ch).map(|q| InlineBadge::quality(&p, theme, q, with_alpha(t.osd_text, 0.7), s));
-            name_with_quality(&p, theme, egui::pos2(x, line_y), &ch.name, font.clone(), color, badge, r.right() - pad / 2.0 - x);
+            // the playlist's glyph at the right edge (several playlists, DESIGN §13.0)
+            let mut right = r.right() - pad / 2.0;
+            if let Some(src) = source {
+                let m = badge::paint_source_mark(
+                    &p,
+                    theme,
+                    egui::pos2(right, line_y),
+                    Align2::RIGHT_CENTER,
+                    src,
+                    small.clone(),
+                    t.osd_scrim.to_opaque(),
+                    t.osd_text,
+                );
+                right = m.left() - pad / 2.0;
+            }
+            let quality = ctx.quality(&ch).map(|q| InlineBadge::quality(&p, theme, q, with_alpha(t.osd_text, 0.7), s));
+            name_with_quality(&p, theme, egui::pos2(x, line_y), &ch.name, font.clone(), color, quality, right - x);
             if mini {
                 let nn = live::now_next_of(ctx, &ch);
                 let h24 = ctx.config.interface.clock_24h;

@@ -25,7 +25,7 @@ use crate::ui::overlays::{ContextMenuSpec, MenuItem, OverlayResult, ResumeSpec};
 use crate::ui::video_host::Placement;
 use crate::ui::widgets::button::{ButtonStyle, button};
 use crate::ui::widgets::poster::paint_poster_image;
-use crate::ui::widgets::{empty_state, glyphs};
+use crate::ui::widgets::{badge, empty_state, glyphs};
 use crate::ui::{NavRequest, OverlayRequest, Route, Screen, ScreenId, UiCtx};
 
 /// Play a movie fullscreen from a grid/rail/search (Shift+Enter): the resume prompt when
@@ -407,7 +407,7 @@ impl Screen for MovieDetailScreen {
                 (None, Some(s)) => s.group_ids.as_slice(),
                 _ => &[],
             };
-            meta.extend(sparse_meta(ctx, groups, source));
+            meta.extend(sparse_meta(ctx, groups));
         }
         let mut text = Vec::new();
         if let Some(m) = &m {
@@ -442,6 +442,8 @@ impl Screen for MovieDetailScreen {
                 playing,
                 locked,
                 loading,
+                source,
+                kind: ItemKind::Movie,
             };
             header.show(ui, ctx, |ui, ctx| {
                 ui.horizontal_wrapped(|ui| {
@@ -484,22 +486,16 @@ impl Screen for MovieDetailScreen {
 /// Where a playlist movie or series has no plot (DESIGN §27.7).
 pub(super) const NO_DESCRIPTION: &str = "No description in this playlist";
 
-/// The meta of a page without provider details: its category (first group) and, with
-/// several playlists, which one it comes from.
-pub(super) fn sparse_meta(ctx: &UiCtx<'_>, group_ids: &[crate::model::GroupId], source: Option<crate::model::SourceId>) -> Vec<String> {
+/// The meta of a page without provider details: its category (first group). (Which playlist
+/// it comes from is the header's source badge.)
+pub(super) fn sparse_meta(ctx: &UiCtx<'_>, group_ids: &[crate::model::GroupId]) -> Vec<String> {
     let vod = &ctx.lib.vod;
-    let mut v: Vec<String> = group_ids
+    group_ids
         .first()
         .and_then(|g| vod.movie_groups.iter().chain(&vod.series_groups).find(|x| x.id == *g))
         .map(|g| g.display_name().to_owned())
         .into_iter()
-        .collect();
-    if ctx.lib.sources.len() > 1
-        && let Some(s) = source.and_then(|s| ctx.lib.source(s))
-    {
-        v.push(s.name.clone());
-    }
-    v
+        .collect()
 }
 
 /// The shared header of the detail pages: dimmed backdrop, poster, title, meta, text blocks
@@ -515,6 +511,11 @@ pub(super) struct DetailHeader<'a> {
     pub locked: bool,
     /// Details still loading: a skeleton line under the meta.
     pub loading: bool,
+    /// The playlist of the item: a source badge (glyph + name) leads the meta line while
+    /// Settings ▸ Interface ▸ Playlist on cards shows it — on Auto, whenever two or more
+    /// playlists have this `kind` of item, Xtream pages included (DESIGN §13.0, §29).
+    pub source: Option<crate::model::SourceId>,
+    pub kind: ItemKind,
 }
 
 impl DetailHeader<'_> {
@@ -551,8 +552,20 @@ impl DetailHeader<'_> {
                         ui.label(RichText::new(glyphs::LOCK).size(theme.font(TypeToken::Title)).color(t.text_secondary));
                     }
                 });
-                if !self.meta.is_empty() {
-                    ui.label(RichText::new(self.meta).size(theme.font(TypeToken::Body)).color(t.text_secondary));
+                match self.source.and_then(|s| ctx.source_of(self.kind, s)) {
+                    Some(src) => {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = theme.space(SpaceToken::Lg);
+                            badge::source_badge(ui, theme, src, false);
+                            if !self.meta.is_empty() {
+                                ui.label(RichText::new(self.meta).size(theme.font(TypeToken::Body)).color(t.text_secondary));
+                            }
+                        });
+                    }
+                    None if !self.meta.is_empty() => {
+                        ui.label(RichText::new(self.meta).size(theme.font(TypeToken::Body)).color(t.text_secondary));
+                    }
+                    None => {}
                 }
                 if self.loading && self.text.is_empty() {
                     for w in [0.9, 0.75, 0.5] {

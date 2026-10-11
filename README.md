@@ -37,6 +37,10 @@ on-screen controls, and a light theme (catppuccin-latte).
 
 - **Sources:** M3U by URL or local file, and Xtream Codes (live, movies, series and the
   provider's guide). You can add several playlists, each with its own colour and glyph badge.
+  With two or more, every movie and series card, Home rail, channel row, search result and
+  detail page shows which playlist the item comes from: the glyph in a corner of the poster and
+  the playlist's name at the start of the line under the title. Settings ▸ Interface ▸
+  Playlist on cards switches it to Always or Never.
   A provider's M3U (a `get.php?username=…` link or a downloaded file) switches to its Xtream
   login automatically, so movies, series and catch-up appear; providers that don't allow that
   still get their movies and series sorted out of the playlist. *Try free channels* adds a

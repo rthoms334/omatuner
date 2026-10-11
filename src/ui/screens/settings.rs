@@ -33,12 +33,12 @@ use std::path::PathBuf;
 use eframe::egui::{self, RichText};
 
 use super::home::kit::{self, Loader};
-use crate::config::{Config, Density, IdleInhibitMode, PopoutCorner, PopoutSize, SidebarMode, StartScreen, SubtitleAuto};
+use crate::config::{Config, Density, IdleInhibitMode, PlaylistOnCards, PopoutCorner, PopoutSize, SidebarMode, StartScreen, SubtitleAuto};
 use crate::jobs::{JobEvent, JobKind, JobOutcome, Submitted};
 use crate::keymap::{Action, KeyContext};
 use crate::model::{
     AccountStatus, CategoryTag, ChannelId, EpgSource, EpgSourceId, EpgSourceKind, FavListId, Group, GroupFilter, GroupId, GroupRef, ItemKind,
-    ItemRef, JobId, LiveFormat, Reminder, ReminderId, SortMode, Source, SourceColor, SourceId, SourceKind,
+    ItemRef, JobId, LiveFormat, Reminder, ReminderId, SortMode, Source, SourceColor, SourceId, SourceKind, SourceSettings,
 };
 use crate::msg::{AppEvent, DataScope, Toast};
 use crate::platform::{PickPurpose, PlatformEvent};
@@ -48,6 +48,7 @@ use crate::theme::{SpaceToken, Theme, TypeToken};
 use crate::ui::overlays::categories::{self, tag_name};
 use crate::ui::overlays::{ConfirmSpec, ContextMenuSpec, MenuItem, OverlayResult, RenameSpec, RenameTarget};
 use crate::ui::parental::{hash_pin, new_salt};
+use crate::ui::widgets::badge;
 use crate::ui::widgets::button::{ButtonStyle, icon_button};
 use crate::ui::widgets::list::paint_row_state;
 use crate::ui::widgets::rows::grouped;
@@ -219,7 +220,7 @@ static PLAYER_TEXT: [CfgText; 4] = [
     },
 ];
 
-static IFACE_C: [CfgChoice; 8] = [
+static IFACE_C: [CfgChoice; 9] = [
     CfgChoice {
         label: "Start screen",
         options: &["Auto", "Home", "Live TV", "Guide", "Last used"],
@@ -268,7 +269,14 @@ static IFACE_C: [CfgChoice; 8] = [
         get: |c| if c.interface.clock_24h { 0 } else { 1 },
         set: |c, i| c.interface.clock_24h = i == 0,
     },
+    CfgChoice {
+        label: "Playlist on cards",
+        options: &["Auto", "Always", "Never"],
+        get: |c| pos(&PLAYLIST_ON_CARDS, &c.interface.playlist_on_cards),
+        set: |c, i| c.interface.playlist_on_cards = PLAYLIST_ON_CARDS[i],
+    },
 ];
+const PLAYLIST_ON_CARDS: [PlaylistOnCards; 3] = [PlaylistOnCards::Auto, PlaylistOnCards::Always, PlaylistOnCards::Never];
 static IFACE_T: [CfgToggle; 13] = [
     toggle_row!("Channel numbers", interface.show_channel_numbers),
     toggle_row!("Channel logos", interface.show_logos),
@@ -369,6 +377,8 @@ enum Act {
     DeleteSource,
     CloseEditor,
     CloseAttach,
+    /// "Give each its own colour": playlists that look the same get the first free colours.
+    DistinctColours,
 }
 
 /// Local (non-config) fields: forms and the source editor.
@@ -397,6 +407,8 @@ enum Local {
     SrcProviderEpg,
     SrcSmartNames,
     SrcImportVod,
+    /// "Show in All playlists" (`SourceSettings::in_all`, DESIGN §29).
+    SrcInAll,
     /// "Use the Xtream login" (= `!keep_m3u`): applied at once, not on Save.
     SrcUseXtream,
     AttachFilter,
@@ -429,6 +441,7 @@ impl Local {
                 | Local::SrcProviderEpg
                 | Local::SrcSmartNames
                 | Local::SrcImportVod
+                | Local::SrcInAll
                 | Local::SrcUseXtream
         )
     }
@@ -475,6 +488,8 @@ struct SourceEditor {
     provider_epg: bool,
     smart_names: bool,
     import_vod: bool,
+    /// "Show in All playlists".
+    in_all: bool,
     /// `!keep_m3u` (shown for upgraded playlists and playlists kept as M3U).
     use_xtream: bool,
 }
@@ -505,6 +520,7 @@ impl SourceEditor {
             provider_epg: s.settings.use_provider_epg.unwrap_or(true),
             smart_names: s.settings.smart_names.unwrap_or(true),
             import_vod: s.settings.import_vod.unwrap_or(true),
+            in_all: s.settings.in_all.unwrap_or(true),
             use_xtream: !s.settings.keep_m3u,
         }
     }
@@ -527,6 +543,7 @@ impl SourceEditor {
         rebased(&mut self.provider_epg, &old.provider_epg, &new.provider_epg);
         rebased(&mut self.smart_names, &old.smart_names, &new.smart_names);
         rebased(&mut self.import_vod, &old.import_vod, &new.import_vod);
+        rebased(&mut self.in_all, &old.in_all, &new.in_all);
         self.use_xtream = new.use_xtream;
         self.original = s.clone();
     }
@@ -595,12 +612,15 @@ impl SourceEditor {
         s.settings.use_provider_epg = tri(s.settings.use_provider_epg, self.provider_epg);
         s.settings.smart_names = tri(s.settings.smart_names, self.smart_names);
         s.settings.import_vod = tri(s.settings.import_vod, self.import_vod);
+        s.settings.in_all = tri(s.settings.in_all, self.in_all);
         let o = &self.original;
+        // "Show in All playlists" is a view setting: the library rebuild applies it, no import
+        let fetched = |st: &SourceSettings| SourceSettings { in_all: None, ..st.clone() };
         let refresh = s.url != o.url
             || s.path != o.path
             || s.xtream.as_ref().map(|x| (&x.server, &x.username, x.password.expose()))
                 != o.xtream.as_ref().map(|x| (&x.server, &x.username, x.password.expose()))
-            || s.settings != o.settings;
+            || fetched(&s.settings) != fetched(&o.settings);
         Ok((s, refresh))
     }
 }
@@ -709,6 +729,8 @@ pub struct SettingsScreen {
     /// A playlist kept as M3U that the user asked to sign in with its Xtream login: the
     /// refresh submitted once that choice was saved says whether that worked.
     login_switch: Option<LoginSwitch>,
+    /// `Route::EditPlaylist`: open this playlist's editor once the playlists are read.
+    edit_on_load: Option<SourceId>,
 }
 
 /// "Use the Xtream login" waiting for its refresh. Only the job that runs the refresh submitted
@@ -817,6 +839,17 @@ impl SettingsScreen {
                         reorder: true,
                     });
                 }
+                // playlists that look the same (glyph and colour): a one-click fix, never silent
+                let looks = self.looks();
+                let alike = crate::ui::scope::look_alikes(&looks, |c| ctx.theme.source_color(c));
+                for g in &alike {
+                    let names: Vec<&str> = g.iter().filter_map(|i| self.sources.get(*i)).map(|s| s.name.as_str()).collect();
+                    let verb = if names.len() == 2 { "look the same" } else { "all look the same" };
+                    v.push(Row::Note(format!("{} {verb} on cards and in lists", crate::ui::scope::names_and(&names)), false));
+                }
+                if !alike.is_empty() {
+                    v.push(Row::Act { act: Act::DistinctColours, icon: glyphs::THEME, label: "Give each its own colour".into(), danger: false });
+                }
                 v.push(Row::Act { act: Act::AddSource, icon: glyphs::ADD, label: "Add playlist…".into(), danger: false });
                 v.push(Row::Act { act: Act::AddFreeChannels, icon: glyphs::LIVE_TV, label: "Add free channels…".into(), danger: false });
                 v.push(Row::Section("Refresh".into()));
@@ -904,6 +937,7 @@ impl SettingsScreen {
                 v.push(Row::Number(&IFACE_N[2]));
                 v.extend(IFACE_T[..2].iter().map(Row::Toggle));
                 v.push(Row::Toggle(&IFACE_T[12]));
+                v.push(Row::Choice(&IFACE_C[8]));
                 v.push(Row::Choice(&IFACE_C[7]));
                 v.push(Row::Toggle(&IFACE_T[5]));
                 v.push(Row::Section("Playback".into()));
@@ -1149,6 +1183,8 @@ impl SettingsScreen {
         v.push(l(Local::SrcRefresh, "Refresh every (h, 0 = default)"));
         v.push(l(Local::SrcProviderEpg, "Use the provider's guide"));
         v.push(l(Local::SrcSmartNames, "Smart names"));
+        // several playlists (DESIGN §29): off keeps e.g. free channels out of Live TV's All
+        v.push(l(Local::SrcInAll, "Show in All playlists"));
         // the stored rule (the picker writes it; the editor's Save keeps it)
         let rule = self.sources.iter().find(|s| s.id == e.original.id).and_then(|s| s.settings.category_filter.as_ref());
         v.push(Row::Item {
@@ -1254,6 +1290,7 @@ impl SettingsScreen {
             Local::SrcProviderEpg => &mut self.editor.as_mut()?.provider_epg,
             Local::SrcSmartNames => &mut self.editor.as_mut()?.smart_names,
             Local::SrcImportVod => &mut self.editor.as_mut()?.import_vod,
+            Local::SrcInAll => &mut self.editor.as_mut()?.in_all,
             Local::SrcUseXtream => &mut self.editor.as_mut()?.use_xtream,
             _ => return None,
         })
@@ -1416,8 +1453,37 @@ impl SettingsScreen {
         }
     }
 
+    /// (glyph, colour) of each playlist, as the marks draw them (look-alike check).
+    fn looks(&self) -> Vec<(&str, SourceColor)> {
+        self.sources.iter().map(|s| (badge::kind_glyph(&s.icon, s.kind), s.color)).collect()
+    }
+
     fn act(&mut self, ctx: &mut UiCtx<'_>, act: Act) {
         match act {
+            Act::DistinctColours => {
+                let theme = ctx.theme;
+                let fixes = crate::ui::scope::distinct_colors(&self.looks(), |c| theme.source_color(c));
+                let changed: Vec<Source> = fixes
+                    .into_iter()
+                    .filter_map(|(i, c)| {
+                        let s = self.sources.get_mut(i)?;
+                        s.color = c;
+                        Some(s.clone())
+                    })
+                    .collect();
+                let n = changed.len();
+                let _ = ctx.services.store.writer().submit_notify(DataScope::Sources, move |c| {
+                    for s in &changed {
+                        crate::store::sources::update_source(c, s)?;
+                    }
+                    Ok(())
+                });
+                ctx.toast(Toast::info(if n == 1 {
+                    "Gave 1 playlist its own colour".to_owned()
+                } else {
+                    format!("Gave {n} playlists their own colours")
+                }));
+            }
             Act::AddSource => ctx.push(Route::Onboarding(OnboardingStart::AddSource)),
             Act::AddFreeChannels => ctx.push(Route::Onboarding(OnboardingStart::FreeChannels)),
             Act::EpgMapping => ctx.push(Route::EpgMapping { channel: None }),
@@ -2169,11 +2235,18 @@ impl Screen for SettingsScreen {
     fn on_enter(&mut self, ctx: &mut UiCtx<'_>, route: &Route) {
         let page = match route {
             Route::Settings(p) => *p,
+            Route::EditPlaylist(_) => SettingsPage::Playlists,
             _ => self.page,
         };
         self.flush_epg_offset(ctx);
         self.set_page(ctx, page);
         self.editing = false;
+        // a scope tab's "Edit playlist…" (DESIGN §29): its editor, once the list is read
+        if let Route::EditPlaylist(id) = route {
+            self.editor = None;
+            self.attach = None;
+            self.edit_on_load = Some(*id);
+        }
     }
 
     fn on_event(&mut self, ctx: &mut UiCtx<'_>, ev: &AppEvent) {
@@ -2482,6 +2555,9 @@ impl SettingsScreen {
                         self.rebase_editor(ctx, &s);
                     }
                     self.sources = v;
+                    if let Some(id) = self.edit_on_load.take() {
+                        self.item_default(ctx, Item::Source(id));
+                    }
                 }
                 Err(e) => kit::error_toast(ctx, "Couldn't read the playlists", &e),
             }
@@ -2916,6 +2992,48 @@ mod tests {
 
     fn sources(h: &H) -> Vec<Source> {
         crate::store::sources::list_sources(&h.state().t.services().store.reader().unwrap()).unwrap()
+    }
+
+    /// Telling playlists apart (DESIGN §29): two playlists with the same glyph and colour get a
+    /// notice and a one-click fix — nothing changes until it is pressed — which keeps the first
+    /// and gives the other the first free colour; a scope tab's "Edit playlist…" opens that
+    /// playlist's editor, whose "Show in All playlists" is saved with the playlist.
+    #[test]
+    fn look_alike_playlists_get_a_fix_and_a_tab_opens_the_editor() {
+        let (mut t, one) = rig();
+        let tv2 = seed(&mut t, |c| {
+            testkit::source(c, "TV")?;
+            let tv2 = testkit::source(c, "TV 2")?;
+            let radio = testkit::source(c, "Radio")?;
+            c.execute("UPDATE source SET color = 'red' WHERE id = ?1", [radio])?;
+            Ok(tv2)
+        });
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 1000.0));
+        h.state_mut().enter(Route::Settings(SettingsPage::Playlists));
+        until(&mut h, "the sources", |h| has_label(h, "Radio"));
+        assert!(has_label(&h, "TV and TV 2 look the same on cards and in lists"));
+        let colors = |h: &H| sources(h).iter().map(|s| s.color).collect::<Vec<_>>();
+        assert_eq!(colors(&h), [SourceColor::Accent, SourceColor::Accent, SourceColor::Red], "never silently");
+        focus(&mut h, "Give each its own colour");
+        h.state_mut().act(Action::Activate);
+        until(&mut h, "the new colour", |h| colors(h)[1] != SourceColor::Accent);
+        // as the theme draws them: TV 2 now differs from TV and from Radio; the first keeps its own
+        let drawn: Vec<_> = colors(&h).iter().map(|c| h.state().t.theme.source_color(*c)).collect();
+        assert_eq!(colors(&h)[0], SourceColor::Accent);
+        assert!(drawn[1] != drawn[0] && drawn[1] != drawn[2], "{:?}", colors(&h));
+        h.state_mut().enter(Route::Settings(SettingsPage::Playlists));
+        until(&mut h, "the notice to go", |h| !has_label(h, "Give each its own colour"));
+
+        h.state_mut().enter(Route::EditPlaylist(tv2));
+        until(&mut h, "the editor", |h| has_label(h, "EDIT TV 2"));
+        focus(&mut h, "Show in All playlists");
+        h.state_mut().act(Action::Activate);
+        h.run_steps(1);
+        focus(&mut h, "Save");
+        h.state_mut().act(Action::Activate);
+        h.run_steps(1);
+        assert_eq!(h.state().t.toasts.last().map(|t| t.text.as_str()), Some("Saved TV 2"), "a view setting: no refresh");
+        until(&mut h, "the setting", |h| sources(h).iter().any(|s| s.id == tv2 && s.settings.in_all == Some(false)));
     }
 
     #[test]

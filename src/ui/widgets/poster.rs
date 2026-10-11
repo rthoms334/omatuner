@@ -4,6 +4,9 @@
 //! Card: 2:3 poster (Poster image kind), title below (2 lines max, body), year + rating
 //! (body-small @0.52), progress bar along the bottom edge (accent) when partially watched,
 //! lock glyph when locked. Cursor = 2 px accent outline (posters have no row background).
+//! With several playlists the card says which one it comes from: the source glyph in a
+//! top-left corner chip (lock / watched chips are top-right) and the source name in its colour
+//! at the start of the meta line (Settings ▸ Interface ▸ Playlist on cards, DESIGN §13.0).
 //! The item that is playing carries the accent 󰐊 now-playing marker left of its title
 //! (DESIGN §13.0, §13.1 "Now playing marker").
 //!
@@ -15,12 +18,14 @@
 
 use eframe::egui::{self, Align2, Rect};
 
+use super::badge::{label_with_source, legible, paint_source_chip};
 use super::list::ListOutcome;
 use super::{glyphs, paint};
 use crate::images::{ImageCache, ImageKind, ImageState};
 use crate::keymap::{Action, KeyContext};
 use crate::model::VodSummary;
 use crate::search::ListFilter;
+use crate::store::library::SourceMeta;
 use crate::theme::{SpaceToken, Theme, TypeToken, with_alpha};
 
 /// Minimum card width (pt × rem) in Medium / Wide layouts (DESIGN §13.5).
@@ -32,6 +37,9 @@ const WIDE_GRID_FROM: f32 = 900.0;
 const RAIL_CARD: f32 = 132.0;
 /// PageUp/PageDown step (rows) before the first frame measured the viewport.
 const DEFAULT_PAGE_ROWS: usize = 3;
+/// Share of the card width the playlist name may take on the meta line before it elides
+/// (the year and rating keep the rest).
+const SOURCE_NAME_SHARE: f32 = 0.6;
 
 #[derive(Default)]
 pub struct GridState {
@@ -155,7 +163,7 @@ impl GridState {
 
 /// Per-card decorations a screen knows about (the frozen `poster_card` has none).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub(crate) struct TileDecor {
+pub(crate) struct TileDecor<'a> {
     /// Watch progress 0..1 (shown while partially watched).
     pub progress: Option<f32>,
     /// Now-playing marker.
@@ -165,6 +173,8 @@ pub(crate) struct TileDecor {
     /// The current card of a pane without keyboard focus ("selected": 1 px outline, no
     /// accent — only the focused pane shows the cursor, DESIGN §13.0).
     pub selected: bool,
+    /// The playlist the item comes from, when cards show it (`UiCtx::source_of`).
+    pub source: Option<&'a SourceMeta>,
 }
 
 /// Card height for a card `width` (poster 2:3 + two title lines + meta line).
@@ -235,20 +245,28 @@ pub(crate) fn poster_tile(
     item: &VodSummary,
     width: f32,
     cursor: bool,
-    decor: TileDecor,
+    decor: TileDecor<'_>,
 ) -> egui::Response {
     let t = &theme.tokens;
     let width = width.max(40.0);
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, card_height(theme, width)), egui::Sense::click());
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &*item.name));
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label_with_source(&item.name, decor.source)));
     if !ui.is_rect_visible(rect) {
         return resp;
     }
     let poster = Rect::from_min_size(rect.min, egui::vec2(width, (width * 1.5).round()));
     paint_poster_image(ui, theme, images, item.poster.as_deref(), &item.name, poster, ImageKind::Poster);
+    let chip = theme.font(TypeToken::Icon) + 2.0 * theme.space(SpaceToken::Xs);
+    if let Some(src) = decor.source {
+        // top-left: the lock / watched chips grow from the top-right corner
+        let r = Rect::from_min_size(poster.min, egui::vec2(chip, chip));
+        paint_source_chip(ui.painter(), theme, r, src);
+        ui.interact(r, resp.id.with("source-chip"), egui::Sense::hover())
+            .on_hover_text(egui::RichText::new(&src.name).size(theme.font(TypeToken::BodySmall)));
+    }
     let p = ui.painter();
     let corner = |p: &egui::Painter, glyph: &str, color: egui::Color32, slot: f32| {
-        let size = theme.font(TypeToken::Icon) + 2.0 * theme.space(SpaceToken::Xs);
+        let size = chip;
         let r = Rect::from_min_size(
             egui::pos2(poster.right() - size * (slot + 1.0) - theme.space(SpaceToken::Xs) * slot, poster.top()),
             egui::vec2(size, size),
@@ -292,9 +310,20 @@ pub(crate) fn poster_tile(
     let h = g.size().y;
     p.galley(egui::pos2(left, y), g, title_color);
     y += h + theme.space(SpaceToken::Xxs);
-    let meta = meta_line(item);
+    let mut meta = meta_line(item);
+    let font = paint::font(theme, TypeToken::BodySmall);
+    let mut left = rect.left();
+    if let Some(src) = decor.source {
+        // "Provider A · 1999 · ★ 8.7": the name in its colour (fg where that wouldn't read)
+        let max_w = if meta.is_empty() { rect.width() } else { (rect.width() * SOURCE_NAME_SHARE).round() };
+        let color = legible(theme, theme.source_color(src.color));
+        left = paint::text(p, egui::pos2(left, y), Align2::LEFT_TOP, src.name.as_str(), font.clone(), color, max_w).right();
+        if !meta.is_empty() {
+            meta = format!(" · {meta}");
+        }
+    }
     if !meta.is_empty() {
-        paint::text(p, egui::pos2(rect.left(), y), Align2::LEFT_TOP, meta, paint::font(theme, TypeToken::BodySmall), t.text_secondary, rect.width());
+        paint::text(p, egui::pos2(left, y), Align2::LEFT_TOP, meta, font, t.text_secondary, (rect.right() - left).max(0.0));
     }
     resp
 }
@@ -328,7 +357,7 @@ pub fn poster_grid(
 /// index into `all` and the item). `focused`: the grid has the keyboard (else its current card
 /// shows the "selected" outline instead of the cursor).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn poster_grid_with(
+pub(crate) fn poster_grid_with<'s>(
     ui: &mut egui::Ui,
     theme: &Theme,
     images: &mut ImageCache,
@@ -336,7 +365,7 @@ pub(crate) fn poster_grid_with(
     all: &[VodSummary],
     items: &[u32],
     focused: bool,
-    decor: impl Fn(u32, &VodSummary) -> TileDecor,
+    decor: impl Fn(u32, &VodSummary) -> TileDecor<'s>,
 ) -> ListOutcome {
     state.set_len(items.len());
     let (cols, card_w, gap) = grid_metrics(theme, ui.available_width());

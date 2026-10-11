@@ -36,7 +36,7 @@ use crate::theme::{SpaceToken, Theme, TypeToken};
 use crate::ui::overlays::{ContextMenuSpec, MenuItem, OverlayResult};
 use crate::ui::widgets::badge::{InlineBadge, name_with_quality};
 use crate::ui::widgets::poster::{self, TileDecor};
-use crate::ui::widgets::{empty_state, glyphs, section};
+use crate::ui::widgets::{badge, empty_state, glyphs, section};
 use crate::ui::{OnboardingStart, OverlayRequest, Route, Screen, ScreenId, UiCtx};
 
 use kit::Loader;
@@ -299,8 +299,7 @@ pub(crate) mod kit {
     /// preview): the colour itself when it reads (≥ 3:1), else the foreground (yellow on a
     /// light theme).
     pub(crate) fn legible(theme: &crate::theme::Theme, color: eframe::egui::Color32) -> eframe::egui::Color32 {
-        let t = &theme.tokens;
-        if crate::theme::tokens::contrast_ratio(color, t.bg) >= 3.0 { color } else { t.fg }
+        crate::ui::widgets::badge::legible(theme, color)
     }
 
     /// Set a reminder for a future programme on `channel` (times as displayed, i.e. shifted).
@@ -1117,14 +1116,23 @@ fn draw_tile(
     match tile {
         Tile::Vod(kind) => match ctx.lib.vod.find(*kind) {
             Some(v) => {
-                let decor = TileDecor { playing: playing_vod == Some(*kind), ..Default::default() };
+                let decor = TileDecor {
+                    playing: playing_vod == Some(*kind),
+                    source: ctx.source_of(crate::ui::scope::vod_item_kind(v.kind), v.source_id),
+                    ..Default::default()
+                };
                 poster::poster_tile(ui, theme, ctx.images, v, poster_w, cursor, decor)
             }
             None => ui.allocate_exact_size(egui::vec2(poster_w, poster_w), egui::Sense::hover()).1,
         },
         Tile::Continue(i) => match continues.get(*i) {
             Some(c) => {
-                let decor = TileDecor { progress: Some(c.progress), playing: playing.as_ref() == Some(&c.media), ..Default::default() };
+                let decor = TileDecor {
+                    progress: Some(c.progress),
+                    playing: playing.as_ref() == Some(&c.media),
+                    source: ctx.source_of(crate::ui::scope::vod_item_kind(c.card.kind), c.card.source_id),
+                    ..Default::default()
+                };
                 poster::poster_tile(ui, theme, ctx.images, &c.card, poster_w, cursor, decor)
             }
             None => ui.allocate_exact_size(egui::vec2(poster_w, poster_w), egui::Sense::hover()).1,
@@ -1166,7 +1174,8 @@ fn channel_tile(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, id: ChannelId, cursor: b
     let rem = theme.rem();
     let size = egui::vec2((CHANNEL_TILE_W * rem).round(), (64.0 * rem).round());
     let Some(ch) = ctx.lib.live.get(id).cloned() else { return ui.allocate_exact_size(size, egui::Sense::hover()).1 };
-    let (rect, resp) = tile_frame(ui, theme, size, &ch.name, cursor);
+    let source = ctx.source_of(ItemKind::Channel, ch.source_id);
+    let (rect, resp) = tile_frame(ui, theme, size, &badge::label_with_source(&ch.name, source), cursor);
     if !ui.is_rect_visible(rect) {
         return resp;
     }
@@ -1185,6 +1194,18 @@ fn channel_tile(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, id: ChannelId, cursor: b
     let right = rect.right() - pad;
     let p = ui.painter();
     let top_y = rect.top() + rect.height() * 0.32;
+    // top line, from the right edge: lock, then the playlist's glyph (DESIGN §13.0)
+    let mut name_right = right;
+    if ch.locked {
+        name_right -= theme.font(TypeToken::Icon) + theme.space(SpaceToken::Md);
+    }
+    if let Some(src) = source {
+        let icon = egui::FontId::proportional(theme.font(TypeToken::Icon));
+        let r = badge::paint_source_mark(p, theme, egui::pos2(name_right, top_y), Align2::RIGHT_CENTER, src, icon, t.bg, t.fg);
+        name_right = r.left() - theme.space(SpaceToken::Md);
+        ui.interact(r, resp.id.with("source"), egui::Sense::hover())
+            .on_hover_text(egui::RichText::new(&src.name).size(theme.font(TypeToken::BodySmall)));
+    }
     let name_color = if cursor { t.list_cursor_text } else { t.fg };
     if playing {
         let r = p.text(egui::pos2(left, top_y), Align2::LEFT_CENTER, glyphs::PLAY, egui::FontId::proportional(theme.font(TypeToken::Icon)), t.accent);
@@ -1201,7 +1222,8 @@ fn channel_tile(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, id: ChannelId, cursor: b
     }
     let badge = ctx.quality(&ch).map(|q| InlineBadge::quality(p, theme, q, t.text_secondary, 1.0));
     let font = egui::FontId::proportional(theme.font(TypeToken::Body));
-    name_with_quality(p, theme, egui::pos2(left, top_y), &ch.name, font, name_color, badge, right - left - theme.font(TypeToken::Icon));
+    let name_w = if name_right < right { name_right - left } else { right - left - theme.font(TypeToken::Icon) };
+    name_with_quality(p, theme, egui::pos2(left, top_y), &ch.name, font, name_color, badge, name_w);
     let detail_y = rect.top() + rect.height() * 0.64;
     let left = text_left;
     let nn: Option<NowNext> = ch.epg_channel_id.and_then(|e| {
@@ -1610,8 +1632,9 @@ pub(crate) mod testkit {
 mod tests {
     use egui_kittest::kittest::Queryable;
 
-    use super::testkit::{self, harness, has_label, rig, seed, until};
+    use super::testkit::{self, harness, has_label, has_label_containing, rig, seed, until};
     use super::*;
+    use crate::config::PlaylistOnCards;
     use crate::model::{ItemKey, SourceId, WatchProgress};
     use crate::ui::NavRequest;
 
@@ -1961,6 +1984,49 @@ mod tests {
         assert!(has_label(&h, "FAVOURITES"));
     }
 
+    /// With two playlists every card and tile says which one its item comes from — its own,
+    /// in the accessible label and readable on the meta line — and Settings ▸ Interface ▸
+    /// Playlist on cards applies at once; Auto counts eligible playlists only: enabled, and
+    /// with that kind of item (DESIGN §13.0, §29).
+    #[test]
+    fn cards_name_the_playlist_of_their_own_item() {
+        let (mut t, one) = rig();
+        let bravo = seed(&mut t, |c| {
+            let a = testkit::source(c, "Alpha")?;
+            let b = testkit::source(c, "Bravo")?;
+            testkit::movies(c, a, 2)?;
+            testkit::movies(c, b, 2)?;
+            testkit::channels(c, b, 3)?;
+            let list = crate::store::user::default_fav_list(c)?;
+            crate::store::user::set_favourite(c, list, &channel_ref(b, 1), true, 1)?;
+            Ok(b)
+        });
+        let mut h = harness(t, one, HomeScreen::default(), egui::vec2(1400.0, 900.0));
+        h.state_mut().enter(Route::Home);
+        h.run_steps(3);
+        assert!(has_label(&h, "Movie 0 · Alpha") && has_label(&h, "Movie 0 · Bravo"), "same title, each card its own playlist");
+        // only Bravo has channels: one playlist of channels, so channel tiles carry no mark
+        assert!(has_label(&h, "Channel 1") && !has_label_containing(&h, "Channel 1 ·"), "per kind: {:?}", testkit::painted(&h));
+        assert!(testkit::painted(&h).iter().any(|s| s == "Bravo"), "the meta line names it without hovering");
+        let set = |h: &mut egui_kittest::Harness<'static, testkit::App<HomeScreen>>, mode: PlaylistOnCards| {
+            let app = h.state_mut();
+            let mut c = (*app.t.config).clone();
+            c.interface.playlist_on_cards = mode;
+            app.t.config = std::sync::Arc::new(c);
+            h.run_steps(2);
+        };
+        set(&mut h, PlaylistOnCards::Never);
+        assert!(has_label(&h, "Movie 0") && !has_label_containing(&h, "· Alpha"), "Never: no playlist anywhere");
+        assert!(!testkit::painted(&h).iter().any(|s| s == "Bravo"));
+        // Auto with one of the two playlists disabled: a single playlist is noise
+        set(&mut h, PlaylistOnCards::Auto);
+        testkit::seed(&mut h.state_mut().t, move |c| Ok(c.execute("UPDATE source SET enabled = 0 WHERE id = ?1", [bravo])?));
+        h.run_steps(3);
+        assert!(has_label(&h, "Movie 0") && !has_label_containing(&h, "· Alpha"), "Auto: one enabled playlist");
+        set(&mut h, PlaylistOnCards::Always);
+        assert!(has_label(&h, "Movie 0 · Alpha"), "Always: even a single playlist");
+    }
+
     /// A boxed screen as a `Screen` (one harness type for every screen).
     struct Dyn(Box<dyn Screen>);
 
@@ -1988,7 +2054,13 @@ mod tests {
     /// A screen factory and the route it is entered with.
     type ScreenCase = (fn() -> Box<dyn Screen>, Route);
 
-    /// DESIGN §12.1 / WP-12: every WP-12 screen at a tiled half (790 pt) and full screen
+    /// The id of the playlist named `name` in the rig's library.
+    fn h_source(t: &crate::ui::testing::TestUi, name: &str) -> SourceId {
+        t.lib.sources.iter().find(|s| s.name == name).map(|s| s.id).expect("source")
+    }
+
+    /// DESIGN §12.1 / WP-12: every WP-12 screen (and Live TV and the guide, with their playlist
+    /// scope, §29) at a tiled half (790 pt) and full screen
     /// (1600 pt), Omarchy text size 12 and 16 (rem 1 and 4/3): it draws without panicking and
     /// nothing it lays out leaves the window horizontally.
     #[test]
@@ -1996,18 +2068,32 @@ mod tests {
         let (mut t, one) = rig();
         let (movie, series) = seed(&mut t, |c| {
             let s = testkit::source(c, "My IPTV with a rather long playlist name")?;
+            // a second playlist of every kind: every card, rail and detail page shows its source
+            // (§13.0), and Movies, Series, Live TV and the guide get the scope bar (§29)
+            let s2 = testkit::source(c, "Another provider with an even longer playlist name")?;
+            testkit::movies(c, s2, 3)?;
+            testkit::series(c, s2, 1, 1, 1)?;
+            testkit::channels(c, s2, 3)?;
             let ch = testkit::channels(c, s, 40)?;
             testkit::epg(c, &ch[..10], 0, 2, true)?;
             let m = testkit::movies(c, s, 30)?[0];
             let sr = testkit::series(c, s, 3, 2, 4)?[0];
             let list = crate::store::user::default_fav_list(c)?;
             crate::store::user::set_favourite(c, list, &channel_ref(s, 1), true, 1)?;
+            // Live TV (and so the guide) shows one playlist: its button, stripe and breadcrumb
+            c.execute("UPDATE source SET color = 'red' WHERE id = ?1", [s2])?;
             Ok((m, sr))
         });
+        let s2 = h_source(&t, "Another provider with an even longer playlist name");
+        let mut c = (*t.config).clone();
+        c.interface.playlist_scope.live = Some(s2);
+        t.config = std::sync::Arc::new(c);
         let mut h = harness(t, one, Dyn(Box::new(HomeScreen::default())), egui::vec2(1600.0, 900.0));
         let screens: Vec<ScreenCase> = vec![
             (|| Box::new(HomeScreen::default()), Route::Home),
             (|| Box::new(super::super::movies::MoviesScreen::default()), Route::Movies { group: None }),
+            (|| Box::new(super::super::live::LiveScreen::default()), Route::Live { group: None, channel: None }),
+            (|| Box::new(super::super::guide::GuideScreen::default()), Route::Guide { collection: None, focus: None }),
             (|| Box::new(super::super::series::SeriesScreen::default()), Route::Series { group: None }),
             (|| Box::new(super::super::movie_detail::MovieDetailScreen::default()), Route::MovieDetail(movie)),
             (|| Box::new(super::super::series_detail::SeriesDetailScreen::default()), Route::SeriesDetail(series)),

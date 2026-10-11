@@ -12,6 +12,11 @@
 //! * Layouts: Wide 3 panes; Medium = channels + preview on the right, groups in a drawer
 //!   (← / Backspace or the breadcrumb); Compact = stack, Enter plays fullscreen.
 //! * Key contexts: `[List|ListFiltering]` of the focused pane. Owner: WP-11.
+//! * Several playlists with channels (DESIGN §29): the scope bar on top (tabs at Wide, the
+//!   `● TV 2 ▾` button otherwise; Alt+P, Ctrl+PgDn/PgUp) narrows the groups, All channels,
+//!   the favourites lists, History and Reminders — and so the zap lists — to one playlist;
+//!   the guide follows. In All, group rows name their playlist in its colour and channel rows
+//!   carry its glyph.
 //!
 //! Also home of the playback helpers the other WP-11 views share (guide, player, programme
 //! popover, edit information): the Enter rule, locked/DRM checks, zap lists, favourites and
@@ -33,10 +38,11 @@ use crate::store::library::FavIndex;
 use crate::theme::{SpaceToken, Theme, TypeToken};
 use crate::ui::epg_grid::{hhmm, time_left, time_range};
 use crate::ui::overlays::{ConfirmSpec, ContextMenuSpec, ListPickerSpec, MenuItem, OverlayResult, RenameSpec, RenameTarget};
+use crate::ui::scope::{self, Scope, ScopeFilter, ScopeKind};
 use crate::ui::video_host::Placement;
 use crate::ui::widgets::list::{ListOutcome, ListState, virtual_list};
-use crate::ui::widgets::rows::{ChannelRowOpts, GroupDecor, channel_row, group_row_decor, grouped, menu_row, row_height};
-use crate::ui::widgets::{RowState, badge, empty_state::empty_state, glyphs, logo, progress, section, text_field};
+use crate::ui::widgets::rows::{ChannelRowOpts, GroupDecor, channel_row, group_row_decor, grouped, menu_row_source, row_height};
+use crate::ui::widgets::{RowState, badge, empty_state::empty_state, glyphs, logo, progress, scope_bar, section, text_field};
 use crate::ui::{LayoutClass, OverlayRequest, Route, Screen, ScreenId, SettingsPage, UiCtx};
 
 use super::group_marks::{self, GroupMarks};
@@ -62,8 +68,23 @@ pub(crate) fn playing_channel(snap: &PlayerSnapshot) -> Option<ChannelId> {
 
 /// The zap list of a collection in the Live sort order (`None` when empty).
 pub(crate) fn zap_list(ctx: &UiCtx<'_>, collection: &Collection) -> Option<ZapList> {
-    let channels = ctx.lib.live.collection(collection, ctx.favs, &ctx.lib.recent_channels, ctx.config.interface.live_sort);
+    zap_list_in(ctx, collection, &ScopeFilter::Everything)
+}
+
+/// [`zap_list`] of the channels a playlist scope shows (Live TV and the guide, DESIGN §29).
+pub(crate) fn zap_list_in(ctx: &UiCtx<'_>, collection: &Collection, scope: &ScopeFilter) -> Option<ZapList> {
+    let channels = scoped_collection(ctx, collection, ctx.config.interface.live_sort, scope);
     (!channels.is_empty()).then(|| ZapList { collection: collection.clone(), channels: channels.into() })
+}
+
+/// A collection's channels (`LiveIndex::collection`) from the playlists `scope` shows.
+pub(crate) fn scoped_collection(ctx: &UiCtx<'_>, collection: &Collection, sort: SortMode, scope: &ScopeFilter) -> Vec<ChannelId> {
+    let live = &ctx.lib.live;
+    let mut ids = live.collection(collection, ctx.favs, &ctx.lib.recent_channels, sort);
+    if *scope != ScopeFilter::Everything {
+        ids.retain(|id| live.get(*id).is_some_and(|c| scope.admits(c.source_id)));
+    }
+    ids
 }
 
 /// Zap list of a channel's primary group (Search, Home, popovers — DESIGN §13.0).
@@ -494,6 +515,8 @@ struct GroupItem {
     /// What "Hide these N groups" matches words against: the name and the tag's code
     /// (provider groups only).
     words: String,
+    /// The playlist of a provider group (its name shows in All with several playlists).
+    source: Option<SourceId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -546,6 +569,8 @@ pub struct LiveScreen {
     drawer: bool,
     /// Library snapshot + favourites signature the lists were built from.
     built: Option<(u64, u64, SortMode, bool)>,
+    /// The playlist scope the lists were built for (DESIGN §29).
+    built_scope: Option<ScopeFilter>,
     /// The sort a reorder switched to and the config sort it replaced, until the config edit
     /// lands at the end of the frame.
     sort_pending: Option<(SortMode, SortMode)>,
@@ -660,6 +685,16 @@ impl LiveScreen {
         self.open.as_ref().and_then(|e| self.groups.iter().position(|g| &g.entry == e))
     }
 
+    /// The playlist scope (DESIGN §29; the guide follows it).
+    fn scope<'l>(ctx: &UiCtx<'l>) -> Scope<'l> {
+        Scope::current(ctx, ScopeKind::Live)
+    }
+
+    /// A collection's channels in this screen's scope.
+    fn collection(&self, ctx: &UiCtx<'_>, coll: &Collection, sort: SortMode) -> Vec<ChannelId> {
+        scoped_collection(ctx, coll, sort, &Self::scope(ctx).filter())
+    }
+
     fn signature(ctx: &UiCtx<'_>, sort: SortMode) -> (u64, u64, SortMode, bool) {
         (ctx.lib.generation, fav_signature(ctx.favs), sort, ctx.config.interface.hide_empty_groups)
     }
@@ -696,10 +731,19 @@ impl LiveScreen {
             self.sort_pending = None;
         }
         let sig = Self::signature(ctx, self.sort(ctx));
-        if self.built == Some(sig) && !self.dirty {
+        let scope = Self::scope(ctx).filter();
+        let rescoped = self.built_scope.as_ref() != Some(&scope);
+        if self.built == Some(sig) && !self.dirty && !rescoped {
             return;
         }
+        if rescoped && self.built_scope.is_some() {
+            // another playlist: from the top of its lists
+            self.group_list.filter.clear();
+            self.chan_list.filter.clear();
+            self.chan_list.select(0);
+        }
         self.built = Some(sig);
+        self.built_scope = Some(scope);
         self.dirty = false;
         self.rebuild_groups(ctx);
         if self.open.as_ref().is_none_or(|e| !self.groups.iter().any(|g| &g.entry == e)) {
@@ -719,53 +763,65 @@ impl LiveScreen {
     fn rebuild_groups(&mut self, ctx: &UiCtx<'_>) {
         let keep = self.cursor_group().map(|g| g.entry.clone());
         let live = &ctx.lib.live;
+        let scope = Self::scope(ctx);
+        let filter = scope.filter();
+        let marks = scope.marks(ctx);
+        // channel references in scope (favourites lists may hold movies and other playlists')
+        let in_scope = |r: &ItemRef| r.kind == ItemKind::Channel && filter.admits(r.source);
         let mut v = Vec::new();
         if !ctx.lib.is_empty() || !live.channels.is_empty() {
             for l in &ctx.favs.lists {
                 let name = format!("{} {}", glyphs::FAVOURITE, l.name);
+                let n = if filter == ScopeFilter::Everything {
+                    ctx.favs.items(l.id).len()
+                } else {
+                    ctx.favs.items(l.id).iter().filter(|r| in_scope(r)).count()
+                };
                 v.push(GroupItem {
                     entry: Entry::FavList(l.id),
-                    group: synthetic_group(name.clone(), ctx.favs.items(l.id).len()),
+                    group: synthetic_group(name.clone(), n),
                     name,
                     tag: None,
                     words: String::new(),
+                    source: None,
                 });
             }
             let name = format!("{} History", glyphs::HISTORY);
-            v.push(GroupItem {
-                entry: Entry::History,
-                group: synthetic_group(name.clone(), ctx.lib.recent_channels.len()),
-                name,
-                tag: None,
-                words: String::new(),
-            });
+            let n = ctx.lib.recent_channels.iter().filter(|id| live.get(**id).is_some_and(|c| filter.admits(c.source_id))).count();
+            v.push(GroupItem { entry: Entry::History, group: synthetic_group(name.clone(), n), name, tag: None, words: String::new(), source: None });
             if !self.reminders.is_empty() {
                 let name = format!("{} Reminders", glyphs::REMINDER);
+                let n = self.reminders.iter().filter(|r| filter.admits(r.channel.source)).count();
                 v.push(GroupItem {
                     entry: Entry::Reminders,
-                    group: synthetic_group(name.clone(), self.reminders.len()),
+                    group: synthetic_group(name.clone(), n),
                     name,
                     tag: None,
                     words: String::new(),
+                    source: None,
                 });
             }
-            let visible = live.channels.len().saturating_sub(live.hidden.len());
+            let visible = if filter == ScopeFilter::Everything {
+                live.channels.len().saturating_sub(live.hidden.len())
+            } else {
+                scope.count(ctx.lib, scope.selected.map(|s| s.id))
+            };
             v.push(GroupItem {
                 entry: Entry::All,
                 group: synthetic_group("All channels".into(), visible),
                 name: "All channels".into(),
                 tag: None,
                 words: String::new(),
+                source: None,
             });
-            let multi = ctx.lib.sources.len() > 1;
             let tagged = crate::ui::overlays::categories::multi_tag_sources(ctx.lib);
-            for g in live.visible_groups(None, ctx.config.interface.hide_empty_groups) {
+            for g in live.visible_groups(None, ctx.config.interface.hide_empty_groups).into_iter().filter(|g| filter.admits(g.source_id)) {
                 let mut group = g.clone();
                 group.item_count = live.group_members(g.id).len() as u32;
                 let mut name = g.display_name().to_owned();
-                if multi && let Some(s) = ctx.lib.source(g.source_id) {
-                    name = format!("{name} · {}", s.name);
-                    group.rename = Some(name.clone());
+                // in All, the playlist's name filters too ("tv 2" finds TV 2's groups)
+                if let Some(s) = marks.of(g.source_id) {
+                    name = format!("{name} {}", s.name);
                 }
                 let code = g.tag.as_ref().filter(|_| tagged.contains(&g.source_id)).map(crate::sources::category_tags::tag_short);
                 // the code filters too ("uk" finds the UK groups smart names renamed to "Sports")
@@ -777,7 +833,7 @@ impl LiveScreen {
                     None => g.display_name().to_owned(),
                 };
                 let tag = code.filter(|c| !group_marks::has_words(g.display_name(), c));
-                v.push(GroupItem { entry: Entry::Group(g.id), group, name, tag, words });
+                v.push(GroupItem { entry: Entry::Group(g.id), group, name, tag, words, source: Some(g.source_id) });
             }
         }
         self.groups = v;
@@ -816,7 +872,8 @@ impl LiveScreen {
             Some(Entry::Reminders) => {
                 // one row per reminder (several on one channel are separate programmes)
                 let mut v = Vec::new();
-                for (i, r) in self.reminders.iter().enumerate() {
+                let scope = Self::scope(ctx).filter();
+                for (i, r) in self.reminders.iter().enumerate().filter(|(_, r)| scope.admits(r.channel.source)) {
                     if let Some(c) = ctx.lib.live.by_ref(&r.channel) {
                         v.push(c);
                         self.reminder_rows.push(i);
@@ -824,7 +881,7 @@ impl LiveScreen {
                 }
                 v
             }
-            Some(e) => e.collection().map(|c| ctx.lib.live.collection(&c, ctx.favs, &ctx.lib.recent_channels, self.sort(ctx))).unwrap_or_default(),
+            Some(e) => e.collection().map(|c| self.collection(ctx, &c, self.sort(ctx))).unwrap_or_default(),
             None => Vec::new(),
         };
         self.rebuild_haystacks(ctx);
@@ -924,7 +981,7 @@ impl LiveScreen {
 
     fn zap_for_open(&self, ctx: &UiCtx<'_>, id: ChannelId) -> Option<ZapList> {
         match self.open_collection() {
-            Some(c) => zap_list(ctx, &c),
+            Some(c) => zap_list_in(ctx, &c, &Self::scope(ctx).filter()),
             None => primary_zap(ctx, id),
         }
     }
@@ -1360,7 +1417,7 @@ impl LiveScreen {
             // the next move would save that order over this one
             self.sort_pending = Some((SortMode::Provider, ctx.config.interface.live_sort));
             self.built = Some(Self::signature(ctx, SortMode::Provider));
-            self.channels = ctx.lib.live.collection(&coll, ctx.favs, &ctx.lib.recent_channels, SortMode::Provider);
+            self.channels = self.collection(ctx, &coll, SortMode::Provider);
             self.rebuild_haystacks(ctx);
         }
         // unfiltered and in custom order: the rows are `channels`
@@ -1457,6 +1514,7 @@ impl LiveScreen {
         let open = self.open_index();
         let virtual_count = self.groups.iter().take_while(|g| !matches!(g.entry, Entry::Group(_))).count();
         let footer = self.marks.footer(self.group_list.filter.query(), self.matching.len());
+        let sources = Self::scope(ctx).marks(ctx);
         let (groups, rows, marks) = (&self.groups, &self.group_rows, &self.marks);
         let mut clicked = None;
         let list = &mut self.group_list;
@@ -1466,7 +1524,8 @@ impl LiveScreen {
                 let g = &groups[gi];
                 let state = RowState::from_flags(focused && rc.state.is_cursor(), open == Some(gi));
                 let marked = matches!(g.entry, Entry::Group(id) if marks.is_marked(id));
-                let resp = group_row_decor(ui, theme, &g.group, state, GroupDecor { marked, tag: g.tag.as_deref() });
+                let source = g.source.and_then(|s| sources.of(s));
+                let resp = group_row_decor(ui, theme, &g.group, state, GroupDecor { marked, tag: g.tag.as_deref(), source });
                 if gi + 1 == virtual_count {
                     let r = resp.rect;
                     ui.painter().hline(r.x_range(), r.bottom() - 0.5, egui::Stroke::new(1.0, theme.tokens.group_divider));
@@ -1501,7 +1560,12 @@ impl LiveScreen {
 
     fn draw_channels(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, focused: bool) {
         let theme = ctx.theme;
-        let group_name = self.open_index().map(|i| self.groups[i].group.display_name().to_owned()).unwrap_or_else(|| "Channels".into());
+        let mut group_name = self.open_index().map(|i| self.groups[i].group.display_name().to_owned()).unwrap_or_else(|| "Channels".into());
+        let scope = Self::scope(ctx);
+        if scope.multi() {
+            // the breadcrumb: which playlist, then the group (DESIGN §29)
+            group_name = format!("{} › {group_name}", scope.label());
+        }
         let breadcrumb = ctx.layout != LayoutClass::Wide;
         ui.horizontal(|ui| {
             if breadcrumb {
@@ -1540,7 +1604,7 @@ impl LiveScreen {
             no_guide_label: loading.as_deref(),
             ..Default::default()
         };
-        let multi = ctx.lib.sources.len() > 1;
+        let sources = scope.marks(ctx);
         let (channels, rows, failed) = (&self.channels, &self.channel_rows, &self.failed);
         let lib = ctx.lib.clone();
         let now = ctx.now;
@@ -1554,7 +1618,7 @@ impl LiveScreen {
                 ctx.now_next.get((epg, ch.tvg_shift_min), now, &mut reader, ctx.budget).cloned()
             });
             let o = ChannelRowOpts {
-                source: if multi { lib.source(ch.source_id) } else { None },
+                source: sources.of(ch.source_id),
                 favourite: ctx.favs.is_fav(&item),
                 failed: failed.contains(&item),
                 playing: playing == Some(id),
@@ -1598,6 +1662,7 @@ impl LiveScreen {
         let h24 = ctx.config.interface.clock_24h;
         let (channels, rows, reminders, reminder_rows) = (&self.channels, &self.channel_rows, &self.reminders, &self.reminder_rows);
         let lib = ctx.lib.clone();
+        let sources = Self::scope(ctx).marks(ctx);
         virtual_list(ui, theme, "live-reminders", &mut self.chan_list, row_h, |ui, rc| {
             let row = rows[rc.index] as usize;
             let ch = lib.live.get(channels[row]);
@@ -1615,7 +1680,8 @@ impl LiveScreen {
             } else {
                 RowState::Idle
             };
-            menu_row(ui, theme, Some(glyphs::REMINDER), &label, detail.as_deref(), false, state)
+            let source = ch.and_then(|c| sources.of(c.source_id));
+            menu_row_source(ui, theme, Some(glyphs::REMINDER), &label, detail.as_deref(), source, state)
         });
     }
 
@@ -1702,10 +1768,9 @@ impl LiveScreen {
             if ch.radio {
                 badge::badge(ui, theme, "Radio", t.fg);
             }
-            if ctx.lib.sources.len() > 1
-                && let Some(src) = ctx.lib.source(ch.source_id)
-            {
-                badge::source_badge(ui, theme, src, true);
+            // the playlist, whenever two or more have channels (like a detail page)
+            if let Some(src) = ctx.source_of(ItemKind::Channel, ch.source_id) {
+                badge::source_badge(ui, theme, src, false);
             }
         });
         ui.add_space(theme.space(SpaceToken::Md));
@@ -1874,6 +1939,9 @@ impl Screen for LiveScreen {
         if self.layout == Some(LayoutClass::Wide) && self.drawer {
             self.drawer = false;
         }
+        if scope::on_action(ctx, ScopeKind::Live, action) {
+            return true;
+        }
         // Esc ladder: the marks go first
         if action == Action::Back && self.marks.clear() {
             return true;
@@ -1904,6 +1972,20 @@ impl Screen for LiveScreen {
                 ctx.push(Route::Onboarding(crate::ui::OnboardingStart::AddSource));
             }
             return;
+        }
+        let scope = Self::scope(ctx);
+        if scope.multi() {
+            let counts: Vec<usize> = scope.choices().iter().map(|c| scope.count(ctx.lib, c.map(|s| s.id))).collect();
+            let hint = shortcut(KeyContext::Global, Action::PlaylistPicker).map(|k| format!("{k} playlist")).unwrap_or_default();
+            let click = scope_bar::scope_bar(ui, theme, &scope, &counts, layout == LayoutClass::Wide, &hint);
+            scope_bar::paint_stripe(ui.painter(), theme, ui.max_rect().x_range(), ui.cursor().top(), &scope);
+            ui.add_space(theme.space(SpaceToken::Md));
+            match click {
+                scope_bar::BarClick::Choose(c) => scope::choose(ctx, ScopeKind::Live, c, false),
+                scope_bar::BarClick::Menu(id) => ctx.open(OverlayRequest::PlaylistMenu(id)),
+                scope_bar::BarClick::Picker => ctx.open(OverlayRequest::PlaylistPicker(ScopeKind::Live)),
+                scope_bar::BarClick::None => {}
+            }
         }
         let full = ui.available_rect_before_wrap();
         let rem = theme.rem();
@@ -1995,6 +2077,56 @@ impl Screen for LiveScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::screens::home::testkit::{self, harness, has_label, rig, seed};
+
+    /// Several playlists with channels (DESIGN §29): in All, group rows name their playlist
+    /// (two "All" groups told apart) and a playlist whose "Show in All playlists" is off stays
+    /// out of All channels and its groups; picking one playlist narrows the groups, All
+    /// channels and the zap list to it (marks off inside it); a playlist out of All still
+    /// shows when picked.
+    #[test]
+    fn the_playlist_scope_narrows_groups_lists_and_zap_lists() {
+        let (mut t, one) = rig();
+        let (b, free) = seed(&mut t, |c| {
+            let a = testkit::source(c, "Alpha")?;
+            let b = testkit::source(c, "Bravo")?;
+            let free = testkit::source(c, "Free")?;
+            testkit::channels(c, a, 3)?;
+            testkit::channels(c, b, 2)?;
+            testkit::channels(c, free, 4)?;
+            c.execute(r#"UPDATE source SET settings = '{"in_all":false}' WHERE id = ?1"#, [free])?;
+            Ok((b, free))
+        });
+        let mut h = harness(t, one, LiveScreen::default(), egui::vec2(1600.0, 900.0));
+        h.state_mut().enter(Route::Live { group: None, channel: None });
+        h.run_steps(2);
+        let zap_len = |h: &mut egui_kittest::Harness<'static, testkit::App<LiveScreen>>| {
+            let app = h.state_mut();
+            let (s, id) = (&app.s, app.s.channels[0]);
+            app.t.with_ctx(|ctx| s.zap_for_open(ctx, id)).map_or(0, |z| z.channels.len())
+        };
+        assert_eq!(h.state().s.open, Some(Entry::All));
+        assert_eq!(h.state().s.channels.len(), 5, "Free is out of All");
+        assert_eq!(zap_len(&mut h), 5, "the zap list too");
+        assert!(has_label(&h, "All · Alpha") && has_label(&h, "All · Bravo"), "groups name their playlist");
+        assert!(!has_label(&h, "All · Free"), "Free's groups are out of All");
+
+        let pick = |h: &mut egui_kittest::Harness<'static, testkit::App<LiveScreen>>, id| {
+            h.state_mut().t.config_edits.push(Box::new(move |c| c.interface.playlist_scope.live = Some(id)));
+            h.state_mut().apply_config();
+            h.run_steps(2);
+        };
+        pick(&mut h, b);
+        assert_eq!(h.state().s.channels.len(), 2, "Bravo's channels");
+        assert_eq!(zap_len(&mut h), 2);
+        let provider_groups = |h: &egui_kittest::Harness<'static, testkit::App<LiveScreen>>| {
+            h.state().s.groups.iter().filter(|g| matches!(g.entry, Entry::Group(_))).count()
+        };
+        assert_eq!(provider_groups(&h), 2, "Bravo's All and News");
+        assert!(has_label(&h, "All") && !has_label(&h, "All · Bravo"), "no marks inside one playlist");
+        pick(&mut h, free);
+        assert_eq!(h.state().s.channels.len(), 4, "out of All, but its own tab shows it");
+    }
 
     #[test]
     fn menu_choices_round_trip() {

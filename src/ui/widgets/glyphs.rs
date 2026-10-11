@@ -69,6 +69,8 @@ pub const DISPLAY: &str = "\u{f0379}";
 pub const THEME: &str = "\u{f03d8}";
 pub const REORDER: &str = "\u{f01dd}";
 pub const ACCOUNT: &str = "\u{f0306}";
+/// A playlist's colour dot (U+25CF, in JetBrains Mono): scope tabs, the playlist picker.
+pub const DOT: &str = "\u{25cf}";
 
 /// Icons offered when creating a playlist source (UHF "choose an icon").
 pub const SOURCE_ICONS: &[&str] = &[PLAYLIST, LIVE_TV, SOURCE_XTREAM, SOURCE_URL, MOVIES, SERIES, RADIO, MUSIC, FAVOURITE, HEART, FOLDER, TAG];

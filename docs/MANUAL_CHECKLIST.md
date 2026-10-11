@@ -141,6 +141,28 @@ in `~/.config/omarchy/shell.toml`; Tuner applies it live).
     have different colours.
   - **Expect:** the badge glyphs and colours are distinguishable and readable on the light
     background.
+- [ ] **Playlist on cards (two playlists, light and dark):**
+  - **Do:** add two playlists with movies, series and channels and give them different glyphs
+    and colours in their editors, one of them yellow. Watch something from each, favourite a
+    channel and a movie from each. Then, in a dark theme and in `catppuccin-latte`, look at:
+    Movies and Series grids; every Home rail (Continue watching, Recently watched,
+    Favourites, Recently added movies / series, channel tiles); a movie and a series page;
+    Search (`/`) results; Live ▸ Favourites, History, Reminders and All channels; the Live
+    preview; the player's channel (c), mini guide (g) and history (h) panels.
+  - **Expect:**
+    - Each poster has a small chip in its top-left corner with its own playlist's glyph (the
+      lock and watched chips stay top-right); hovering the chip shows the playlist's name.
+    - The line under each card's title starts with the playlist's name ("Provider A · 2019 ·
+      ★ 7.1"); a long name ends in "…" and leaves room for the year.
+    - Rows, channel tiles and the player panels show the glyph at the right; detail pages and
+      the preview show glyph + name.
+    - On the light theme the yellow playlist's glyph and name are drawn in the text colour,
+      with a yellow edge on the chip and a yellow underline under row glyphs; nothing is
+      unreadable.
+    - Disable one playlist (Settings ▸ Playlists): the marks disappear at once (Auto). Settings
+      ▸ Interface ▸ Playlist on cards ▸ Always brings them back; Never hides them, with no
+      restart.
+    - At a tiled half (790 pt) and with text size 16, nothing overlaps or leaves its card.
 - [ ] **Font change:**
   - **Do:** change the monospace font in `~/.config/fontconfig/fonts.conf` (or with Omarchy's
     font menu), then switch back.

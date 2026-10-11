@@ -1351,6 +1351,33 @@ when at least 360 px wide) shows for the usual OSD time after popping out.
   (`widgets::badge::name_with_quality` / `job_with_quality`, also search hits). The zap
   banner's title badge shows until the channel plays; then the decoded badge on the right
   says it.
+* **Playlist on cards** (Settings ▸ Interface ▸ Playlist on cards: **Auto** / Always / Never,
+  applied live; Auto = only while **two or more enabled** playlists exist — with one it's
+  noise): every item says which playlist it comes from, from the snapshot's `SourceMeta`
+  (user-chosen glyph + colour; no DB access per frame; `UiCtx::source_of` /
+  `ui::data::SourceMarks`).
+  * *Poster cards* (Movies / Series grids, every Home poster rail — Continue watching,
+    favourites, Recently added): a **top-left corner chip** (the lock / watched chips grow from
+    the top-right, so they never collide), same size and bg @ 0.85 as those chips, the source
+    glyph in the source colour; tooltip = the playlist's name. The **meta line starts with the
+    playlist's name** in its colour then " · " ("Provider A · 1999 · ★ 8.7"), so it reads
+    without hovering and never by colour alone. *Short-name rule*: the name elides with "…" at
+    60 % of the card width when a year / rating follows (they keep the rest), at the full width
+    otherwise.
+  * *Rows and tiles* (Live channel rows incl. the virtual Favourites / History / All groups,
+    Live ▸ Reminders, Home channel tiles incl. Recently watched, the player's channel /
+    history / mini-guide panels): the **compact glyph** at the right edge (left of the lock on
+    tiles), name as tooltip — rows have no room for a name, and the list header / preview
+    already says the rest. Search results keep their glyph + name pill (wide rows).
+  * *Detail pages* (movie, series) and the Live preview: a source badge (glyph + name) leads
+    the meta line. (Sparse playlist pages no longer append the name to the meta.)
+  * *Accessibility*: the item's accesskit label carries the playlist ("The Matrix · Provider
+    A") on cards, tiles, rows and search hits.
+  * *Contrast*: a source colour is used for text or a glyph only where it reaches 3:1 on its
+    background (`badge::legible_on`; window bg for cards / rows, the OSD scrim in the player).
+    Otherwise the glyph / name is fg and the colour moves to a non-text mark: a 1.5 px edge
+    on the corner chip, a 2 px underline under a row glyph, the border of a badge — e.g. a
+    yellow playlist on a light theme.
 * **Reorder vs sort**: Alt+↑/↓ while the list is sorted by anything other than *Custom order*
   (`SortMode::Provider` = provider order with user reordering) switches it to Custom order with
   a toast "Switched to custom order". Ctrl+S opens a small sort & view menu (launcher card),
@@ -1373,10 +1400,11 @@ when at least 360 px wide) shows for the usual OSD time after popping out.
 | Segmented | `toggle::segmented` | buttons; selected = fg @ 0.18 + accent bold |
 | Slider / seek bar | `slider::*` | track max(4, 0.11·control-height) fg @ 0.18, fill fg, knob max(14, 0.38·ch) ×1.15 hover; seek bar over video uses OSD colours |
 | Progress | `progress::*` | programme progress fg; watch progress accent; busy bar for unknown totals |
-| Badge | `badge::*` | caption, 1 px border colour @ 0.6; LIVE = urgent; source = source colour (palette role) + glyph |
+| Badge | `badge::*` | caption, 1 px border colour @ 0.6; LIVE = urgent; source = source colour (palette role) + glyph, text fg where the colour is < 3:1 on bg |
+| Source mark | `badge::paint_source_chip` (poster corner chip), `badge::paint_source_mark` (rows, tiles, OSD lists), `badge::source_badge` (detail pages, preview) | glyph icon 14 in the source colour; chip = bg @ 0.85, top-left, size of the lock chip; colour < 3:1 → fg glyph + 1.5 px colour edge (chip) / 2 px colour underline (glyph); tooltip = playlist name (§13.0 "Playlist on cards") |
 | Quality badge | `badge::InlineBadge::quality` + `name_with_quality` (rows, grid, search, OSD lists), `badge::quality_badge` (preview, guide side panel) | monospace caption, text @ 0.52 (`text_secondary`; `text_disabled` on dimmed rows; OSD text in the player), 1 px border at 0.6 × the text's opacity, Md gap after the name |
 | Logo / monogram | `logo::logo` | square, aspect kept; monogram on fg @ 0.04, text @ 0.52 |
-| Poster card | `poster::poster_card` | 2:3; title body; meta body-small @ 0.52; progress accent; cursor 2 px accent outline |
+| Poster card | `poster::poster_card` | 2:3; title body; meta body-small @ 0.52 (led by the playlist's name in its colour, §13.0); progress accent; cursor 2 px accent outline; corner chips: playlist top-left, lock / watched top-right |
 | Empty / error state | `empty_state::empty_state` | glyph display-large 28 accent @ 0.8; title 14 fg @ 0.7; detail @ 0.52 |
 | Sidebar | `sidebar::sidebar` | bg dark_background; row control-height + md; selected fg @ 0.18 + accent |
 | Status bar | `status_bar::status_bar` | height 26 (Omarchy bar), body-small, fg @ 0.52 |
@@ -1685,6 +1713,7 @@ favourites lists) show a 󰇙 drag grip and move with Alt+↑/↓ or K/J. Every 
 | | Pop-out size · corner (Hyprland, §21.6) | `player.popout_size`, `popout_corner` (+ `popout_last`, remembered at pop-in) | small 480 × 270 · bottom right |
 | Interface | Start screen | `general.start_screen` | Auto (Live until favourites/history exist, then Home) |
 | | Sidebar · density · channel numbers · logos · quality badges · 24 h clock | `interface.*` (`quality_badges`) | auto · comfortable · on · on · on · on |
+| | Playlist on cards: Auto (2+ enabled playlists) · Always · Never (§13.0) | `interface.playlist_on_cards` | auto |
 | | Live preview autoplay · preview delay · guide preview · mini player · OSD timeout | `interface.*` | **off** · 1200 ms · off · on · 3500 ms |
 | | UI scale (on top of Omarchy base size) · hide empty groups | `interface.ui_scale`, `hide_empty_groups` | 1.0 · on |
 | | Default sort live / movies / series | `interface.*_sort` | provider / recent / recent |
@@ -3160,7 +3189,7 @@ for M3U sources the page never shows a skeleton (the series has `details_at` set
 movie page must not treat `details_loaded_at == None` as loading for non-Xtream sources). Sparse
 layout, theme tokens only:
 * Movie: poster (or the generic poster placeholder) left; title; one meta line from what exists
-  — year · category (primary group name) · source badge; no plot block, no "Cast:" line, no
+  — source badge (§13.0, with several playlists) · year · category (primary group name); no plot block, no "Cast:" line, no
   empty rating; the buttons row ([Play]/[Resume]/[Start over], favourite, watched) stays where
   it is on rich pages so focus order is identical; a muted hint "No description in this
   playlist" in the plot's place (Body small, `text_secondary`).

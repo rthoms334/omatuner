@@ -481,6 +481,8 @@ impl Screen for SeriesDetailScreen {
                 playing: false,
                 locked: false,
                 loading: !sparse,
+                source,
+                kind: ItemKind::Series,
             };
             header.show(ui, ctx, |_, _| {});
             return;
@@ -504,7 +506,7 @@ impl Screen for SeriesDetailScreen {
             text.push((format!("Cast: {c}"), true));
         }
         if sparse {
-            meta.extend(sparse_meta(ctx, &s.group_ids, Some(s.source_id)));
+            meta.extend(sparse_meta(ctx, &s.group_ids));
             if text.is_empty() {
                 text.push((NO_DESCRIPTION.to_owned(), true));
             }
@@ -535,6 +537,8 @@ impl Screen for SeriesDetailScreen {
                 playing,
                 locked: s.locked,
                 loading: false,
+                source: Some(s.source_id),
+                kind: ItemKind::Series,
             };
             header.show(ui, ctx, |ui, ctx| {
                 ui.horizontal_wrapped(|ui| {
