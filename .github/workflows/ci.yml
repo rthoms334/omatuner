@@ -50,6 +50,9 @@ jobs:
         env:
           KEYRING: ${{ matrix.keyring }}
         run: |
+          # pacman's download sandbox (Landlock + the alpm user) is refused inside the runner's
+          # container ("restricting filesystem access failed ... Operation not permitted").
+          grep -qx DisableSandbox /etc/pacman.conf || sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf
           pacman -Sy --noconfirm --needed "$KEYRING"
           pacman -Su --noconfirm
           # Build: rustup (rust >= 1.95, clippy, rustfmt), mpv (libmpv), xz (liblzma).
