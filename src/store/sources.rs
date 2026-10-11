@@ -124,8 +124,12 @@ pub fn insert_source(conn: &Connection, draft: &SourceDraft, now: Timestamp) -> 
 ///
 /// Never clears the Xtream login of a row whose stored kind is `xtream` (DESIGN §27.3): a copy
 /// read before a silent upgrade has `xtream: None` and would otherwise wipe the new login.
+///
+/// Keeps the stored category filter (`set_category_filter` is its only writer; DESIGN §28.3): a
+/// source editor opened before the picker saved must not wipe the rule.
 pub fn update_source(conn: &Connection, src: &Source) -> Result<()> {
     let x = src.xtream.as_ref();
+    let settings = with_stored_category_filter(conn, src.id, &src.settings)?;
     let n = conn.execute(
         "UPDATE source SET name = ?2, icon = ?3, color = ?4, url = ?5, path = ?6,
                 xt_server = CASE WHEN ?7 IS NULL AND kind = 'xtream' THEN xt_server ELSE ?7 END,
@@ -143,7 +147,7 @@ pub fn update_source(conn: &Connection, src: &Source) -> Result<()> {
             x.map(|x| &x.server),
             x.map(|x| &x.username),
             x.map(|x| x.password.expose()),
-            sql::to_json(&src.settings)?,
+            sql::to_json(&settings)?,
             src.enabled,
         ],
     )?;
@@ -316,12 +320,23 @@ pub fn reorder_sources(conn: &mut Connection, order: &[SourceId]) -> Result<()> 
     Ok(())
 }
 
+/// Replace a source's settings, except the category filter (kept as stored, see
+/// [`update_source`]).
 pub fn set_source_settings(conn: &Connection, id: SourceId, settings: &SourceSettings) -> Result<()> {
-    let n = conn.execute("UPDATE source SET settings = ?2 WHERE id = ?1", params![id, sql::to_json(settings)?])?;
+    let settings = with_stored_category_filter(conn, id, settings)?;
+    let n = conn.execute("UPDATE source SET settings = ?2 WHERE id = ?1", params![id, sql::to_json(&settings)?])?;
     if n == 0 {
         return Err(sql::not_found("source", id));
     }
     Ok(())
+}
+
+/// `settings` with the category filter currently stored for `id` (none for an unknown id: the
+/// caller's update then reports it).
+fn with_stored_category_filter(conn: &Connection, id: SourceId, settings: &SourceSettings) -> Result<SourceSettings> {
+    let stored: Option<String> = conn.prepare_cached("SELECT settings FROM source WHERE id = ?1")?.query_row([id], |r| r.get(0)).optional()?;
+    let category_filter = from_json_opt::<SourceSettings>(stored).and_then(|s| s.category_filter);
+    Ok(SourceSettings { category_filter, ..settings.clone() })
 }
 
 /// Set or clear a source's category filter (DESIGN §28.3): read-modify-write of the settings

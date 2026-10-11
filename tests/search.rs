@@ -40,6 +40,7 @@ fn group(id: i64, kind: ItemKind, name: &str, hidden: bool, locked: bool) -> Gro
         provider_order: id as i32,
         user_order: None,
         hidden,
+        user_hidden: hidden,
         locked,
         item_count: 0,
         provider_id: None,

@@ -23,6 +23,8 @@ pub struct Group {
     pub user_order: Option<i32>,
     /// Effective: the user's hide, or the source's category filter (see `filter`).
     pub hidden: bool,
+    /// The user's own hide (`GroupOverride::hidden`), whatever the rule does.
+    pub user_hidden: bool,
     /// PIN-locked (parental).
     pub locked: bool,
     pub item_count: u32,

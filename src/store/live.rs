@@ -91,7 +91,7 @@ pub fn channel_by_ref(conn: &Connection, item: &ItemRef) -> Result<Option<Channe
 }
 
 pub(crate) const GROUP_COLS: &str = "g.id, g.source_id, g.kind, g.key, g.name, o.rename, g.provider_order, o.user_order, \
-     COALESCE(o.hidden, 0), COALESCE(o.locked, 0), g.item_count, g.provider_id";
+     COALESCE(o.hidden, 0), COALESCE(o.locked, 0), g.item_count, g.provider_id, COALESCE(g.raw_name, g.name), COALESCE(o.shown, 0)";
 
 pub(crate) const GROUP_FROM: &str = "FROM grp g JOIN source s ON s.id = g.source_id
      LEFT JOIN group_override o ON o.source_id = g.source_id AND o.kind = g.kind AND o.group_key = g.key";
@@ -111,13 +111,14 @@ pub(crate) fn group_from_row(r: &Row<'_>) -> rusqlite::Result<Group> {
         provider_order: r.get(6)?,
         user_order: r.get(7)?,
         hidden: r.get(8)?,
+        user_hidden: r.get(8)?,
         locked: r.get(9)?,
         item_count: u32_of(r.get(10)?),
         provider_id: r.get(11)?,
-        // P6-core: detected from `g.raw_name` (fallback `g.name`); `filter` from `o.shown` and
-        // the source's rule in `library::load` (DESIGN §28.4)
-        tag: None,
-        filter: crate::model::GroupFilter::Kept,
+        // the provider's raw name; groups imported before P6 fall back to the display name
+        tag: crate::sources::category_tags::detect_tag(&r.get::<_, String>(12)?),
+        // the user's "show anyway"; `library::load` applies the source's rule (DESIGN §28.4)
+        filter: if r.get(13)? { crate::model::GroupFilter::Exempt } else { crate::model::GroupFilter::Kept },
     })
 }
 

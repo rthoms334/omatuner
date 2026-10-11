@@ -37,6 +37,7 @@ fn group(id: i64, kind: ItemKind, name: &str) -> Group {
         provider_order: id as i32,
         user_order: None,
         hidden: false,
+        user_hidden: false,
         locked: false,
         item_count: 0,
         provider_id: None,

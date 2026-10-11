@@ -278,12 +278,24 @@ fn upsert_group(conn: &Connection, imp: &CatalogueImport, g: &ImportGroup) -> Re
         .is_some();
     let id = conn
         .prepare_cached(
-            "INSERT INTO grp(source_id, kind, key, name, provider_id, provider_order, seen_gen) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(source_id, kind, key) DO UPDATE SET name = excluded.name, provider_id = excluded.provider_id,
-               provider_order = excluded.provider_order, seen_gen = excluded.seen_gen
+            "INSERT INTO grp(source_id, kind, key, name, raw_name, provider_id, provider_order, seen_gen) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(source_id, kind, key) DO UPDATE SET name = excluded.name, raw_name = excluded.raw_name,
+               provider_id = excluded.provider_id, provider_order = excluded.provider_order, seen_gen = excluded.seen_gen
              RETURNING id",
         )?
-        .query_row(params![imp.source, g.kind.as_str(), g.key.0, g.name, g.provider_id, g.provider_order, imp.generation], |r| r.get(0))?;
+        .query_row(
+            params![
+                imp.source,
+                g.kind.as_str(),
+                g.key.0,
+                g.name,
+                g.raw_name.as_deref().unwrap_or(&g.name),
+                g.provider_id,
+                g.provider_order,
+                imp.generation
+            ],
+            |r| r.get(0),
+        )?;
     if !existed {
         carry_group_locks(conn, imp.source, g)?;
     }
@@ -305,8 +317,12 @@ fn resolve_groups(
         let id = match map.get(&k.0) {
             Some(id) => *id,
             None => {
+                // a group the provider no longer lists: its raw name cannot be learned any more, so
+                // a pre-P6 one keeps its display name as raw name (no endless "needs refresh")
                 let kept: Option<GroupId> = conn
-                    .prepare_cached("UPDATE grp SET seen_gen = ?4 WHERE source_id = ?1 AND kind = ?2 AND key = ?3 RETURNING id")?
+                    .prepare_cached(
+                        "UPDATE grp SET seen_gen = ?4, raw_name = COALESCE(raw_name, name) WHERE source_id = ?1 AND kind = ?2 AND key = ?3 RETURNING id",
+                    )?
                     .query_row(params![imp.source, kind.as_str(), k.0, imp.generation], |r| r.get(0))
                     .optional()?;
                 let id = match kept {
