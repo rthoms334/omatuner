@@ -575,6 +575,8 @@ mod tests {
             provider_order: id as i32,
             user_order: None,
             added_at: None,
+            quality: None,
+            family: 0,
         }
     }
 

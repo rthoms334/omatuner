@@ -29,7 +29,6 @@ use crate::model::{
 };
 use crate::msg::{AppEvent, DataScope, Toast};
 use crate::player::{PlayRequest, PlayerCommand, PlayerEvent, PlayerSnapshot, PlayerState};
-use crate::sources::smart_names::Quality;
 use crate::store::library::FavIndex;
 use crate::theme::{SpaceToken, Theme, TypeToken};
 use crate::ui::epg_grid::{hhmm, time_left, time_range};
@@ -325,23 +324,6 @@ pub(crate) fn assign_epg(ctx: &mut UiCtx<'_>, guide: &mut GuideStatus, channel: 
     }
 }
 
-/// The quality badge of a channel: from the decoded video when it plays, else from its
-/// provider name ("BBC One HD", "ESPN 4K", smart names keep the word in the raw name).
-pub(crate) fn quality_label(video_size: Option<(i64, i64)>, name: Option<Quality>) -> Option<&'static str> {
-    if let Some((_, h)) = video_size {
-        return Some(match h {
-            h if h >= 2000 => "4K",
-            h if h >= 700 => "HD",
-            _ => "SD",
-        });
-    }
-    name.map(|q| match q {
-        Quality::Uhd => "4K",
-        Quality::Fhd | Quality::Hd => "HD",
-        Quality::Sd => "SD",
-    })
-}
-
 /// "3 h ago" / "2 d ago" (the status bar's freshness wording).
 pub(crate) fn age_label(now: Timestamp, at: Timestamp) -> String {
     let age = (now - at).max(0);
@@ -559,8 +541,6 @@ pub struct LiveScreen {
     /// The Reminders group lists one row per reminder: `reminders` index of each `channels`
     /// entry while it is open.
     reminder_rows: Vec<usize>,
-    /// Quality word of the cursor channel's provider name (one point read per channel).
-    quality: Option<(ChannelId, Option<Quality>)>,
     focus: Pane,
     /// Medium: the groups drawer is open; Compact: the groups list is shown.
     drawer: bool,
@@ -1578,6 +1558,7 @@ impl LiveScreen {
                 favourite: ctx.favs.is_fav(&item),
                 failed: failed.contains(&item),
                 playing: playing == Some(id),
+                quality: ctx.quality(ch),
                 ..opts
             };
             let state = if focused {
@@ -1701,8 +1682,8 @@ impl LiveScreen {
         ui.add_space(theme.space(SpaceToken::Lg));
         let Some(ch) = cursor.and_then(|id| ctx.lib.live.get(id).cloned()) else { return };
         let h24 = ctx.config.interface.clock_24h;
-        let playing_here = playing_channel(&snap) == Some(ch.id);
-        let quality = quality_label(snap.video_size.filter(|_| playing_here), self.name_quality(ctx, ch.id));
+        // the preview always says it (stream info, like the player's OSD), whatever the list setting
+        let quality = ctx.measured.get(&ch).or(ch.quality);
         // name · number + badges
         ui.horizontal_wrapped(|ui| {
             let size = (theme.font(TypeToken::Heading) * 1.6).round();
@@ -1713,7 +1694,7 @@ impl LiveScreen {
             }
             ui.label(egui::RichText::new(title).size(theme.font(TypeToken::Heading)).color(t.fg));
             if let Some(q) = quality {
-                badge::badge(ui, theme, q, t.fg);
+                badge::quality_badge(ui, theme, q, t.fg);
             }
             if ch.has_catchup && ch.catchup_days > 0 {
                 badge::badge(ui, theme, &format!("{} {} d", glyphs::CATCHUP, ch.catchup_days), t.fg);
@@ -1803,18 +1784,6 @@ impl LiveScreen {
                 });
             }
         }
-    }
-
-    /// The quality word in the provider name of `id` (one indexed point read inside the frame
-    /// budget, kept while the cursor stays on the channel).
-    fn name_quality(&mut self, ctx: &mut UiCtx<'_>, id: ChannelId) -> Option<Quality> {
-        if self.quality.is_none_or(|(c, _)| c != id) {
-            let db = ctx.db;
-            let raw = ctx.budget.run(|| crate::store::live::channel(db, id))?;
-            let q = raw.ok().and_then(|c| crate::sources::smart_names::clean_channel_name(&c.name).quality);
-            self.quality = Some((id, q));
-        }
-        self.quality.and_then(|(_, q)| q)
     }
 
     /// Opt-in preview autoplay after the keyboard cursor rested.

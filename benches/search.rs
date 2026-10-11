@@ -66,6 +66,8 @@ fn library() -> Library {
             provider_order: i as i32,
             user_order: None,
             added_at: None,
+            quality: None,
+            family: 0,
         })
         .collect();
     let groups = (0..200).map(|g| group(g, ItemKind::Channel, &format!("UK | {} {g}", WORDS[g as usize % WORDS.len()]))).collect();

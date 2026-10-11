@@ -319,6 +319,8 @@ pub trait PlayerStore: Send {
     fn push_history(&mut self, e: HistoryEntry);
     /// `Some(kind)` = record a failure, `None` = clear (successful play).
     fn record_failure(&mut self, item: ItemRef, kind: Option<PlayerErrorKind>);
+    /// The picture size a live channel decodes at (its measured quality badge).
+    fn record_video(&mut self, item: ItemRef, width: i64, height: i64);
 }
 
 /// A `PlayerStore` that drops everything (headless tools, tests that don't care).
@@ -328,6 +330,7 @@ impl PlayerStore for NullPlayerStore {
     fn save_progress(&mut self, _p: WatchProgress) {}
     fn push_history(&mut self, _e: HistoryEntry) {}
     fn record_failure(&mut self, _item: ItemRef, _kind: Option<PlayerErrorKind>) {}
+    fn record_video(&mut self, _item: ItemRef, _width: i64, _height: i64) {}
 }
 
 /// Dependencies injected into the controller.

@@ -160,6 +160,24 @@ pub fn clear_failure(conn: &Connection, item: &ItemRef) -> Result<()> {
     Ok(())
 }
 
+/// Remember the picture size mpv decoded for a live channel (`channel_video`; its class wins
+/// over the quality word of the name, DESIGN §6), with the provider name and `url_key` it was
+/// measured under: it applies only while the channel at that key still has them
+/// (`store::import` moves it with the channel). Not a channel, or gone → nothing.
+pub fn record_video(conn: &Connection, item: &ItemRef, width: i64, height: i64, now: Timestamp) -> Result<()> {
+    if item.kind != ItemKind::Channel {
+        return Ok(());
+    }
+    conn.prepare_cached(
+        "INSERT INTO channel_video(source_id, item_key, name, url_key, width, height, at)
+         SELECT c.source_id, c.key, c.name, c.url_key, ?3, ?4, ?5 FROM channel c WHERE c.source_id = ?1 AND c.key = ?2
+         ON CONFLICT(source_id, item_key) DO UPDATE SET name = excluded.name, url_key = excluded.url_key,
+           width = excluded.width, height = excluded.height, at = excluded.at",
+    )?
+    .execute(params![item.source, item.key.as_str(), width, height, now])?;
+    Ok(())
+}
+
 /// Should zapping skip this channel? True when it has ≥ 2 failures newer than `since` or is
 /// DRM-flagged. Point query (controller thread, per zap step).
 ///
