@@ -53,6 +53,7 @@ fn library() -> Library {
             source_id: SourceId(1 + (i % 2) as i64),
             key: ItemKey(format!("c{i}")),
             name: Arc::from(format!("{} {} {} HD", BRANDS[i % BRANDS.len()], WORDS[(i / 7) % WORDS.len()], i % 500)),
+            provider_name: None,
             number: Some(i as u32 + 1),
             logo: None,
             group_ids: vec![GroupId((i % 200) as i64)],

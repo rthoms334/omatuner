@@ -576,6 +576,7 @@ mod tests {
             source_id: SourceId(1),
             key: ItemKey(format!("k{id}")),
             name: Arc::from(name),
+            provider_name: None,
             number: Some(id as u32),
             logo: None,
             group_ids: vec![],

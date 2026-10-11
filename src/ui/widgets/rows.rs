@@ -621,6 +621,7 @@ mod tests {
             source_id: crate::model::SourceId(1),
             key: crate::model::ItemKey("k".into()),
             name: "BBC One".into(),
+            provider_name: None,
             number: Some(101),
             logo: None,
             group_ids: vec![],

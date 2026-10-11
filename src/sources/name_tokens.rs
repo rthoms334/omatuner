@@ -270,7 +270,9 @@ pub fn is_small_caps(s: &str) -> bool {
 }
 
 /// Quality words → [`Quality`] (compared case-insensitively). 1440p / QHD count as FHD, like a
-/// measured 2560×1440 picture (`Quality::of_video`); 8K as 4K (the best class).
+/// measured 2560×1440 picture (`Quality::of_video`). `8K` / `4320p` are no claim at all
+/// ([`is_format_word`]): providers use them for event slates and placeholders, never for an
+/// 8K picture.
 const QUALITY_WORDS: &[(&str, Quality)] = &[
     ("sd", Quality::Sd),
     ("480p", Quality::Sd),
@@ -288,8 +290,6 @@ const QUALITY_WORDS: &[(&str, Quality)] = &[
     ("4k", Quality::Uhd),
     ("2160p", Quality::Uhd),
     ("3840p", Quality::Uhd),
-    ("8k", Quality::Uhd),
-    ("4320p", Quality::Uhd),
 ];
 
 /// The quality class a word names (`"FHD"`, `"2160p"`, `"4K"`), if any.
@@ -297,10 +297,11 @@ pub fn quality_word(w: &str) -> Option<Quality> {
     QUALITY_WORDS.iter().find(|(k, _)| w.eq_ignore_ascii_case(k)).map(|(_, q)| *q)
 }
 
-/// Codec / picture-format words (`HEVC`, `H.265`, `HDR`, `50fps`, `⁵⁰ FPS`): never part of a
-/// name.
+/// Codec / picture-format words (`HEVC`, `H.265`, `HDR`, `50fps`, `⁵⁰ FPS`) and the `8K` of
+/// event slates: never part of a name, no quality claim.
 pub fn is_format_word(w: &str) -> bool {
-    const FORMAT: &[&str] = &["hevc", "h265", "h.265", "h264", "h.264", "x265", "x264", "avc", "hdr", "hdr10", "hdr10+", "dolby", "fps"];
+    const FORMAT: &[&str] =
+        &["hevc", "h265", "h.265", "h264", "h.264", "x265", "x264", "avc", "hdr", "hdr10", "hdr10+", "dolby", "fps", "8k", "4320p"];
     FORMAT.iter().any(|k| w.eq_ignore_ascii_case(k))
         || w.get(w.len().saturating_sub(3)..).is_some_and(|s| s.eq_ignore_ascii_case("fps")) && w[..w.len() - 3].bytes().all(|b| b.is_ascii_digit())
 }

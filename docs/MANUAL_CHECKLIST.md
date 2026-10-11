@@ -657,15 +657,17 @@ Use a provider that lists the same channel several times in different qualities 
     ("HD" → "FHD") shows its new name's badge until it plays again.
 - [ ] **Doubtful "4K?" claims (a provider that over-labels 4K):**
   - **Do:** in a playlist whose "4K" channels mostly play at HD (stream info, `I`, shows the
-    size and a `Label` line), play two of its "4K" channels and one other channel until each
+    size and a `Quality` line), play two of its "4K" channels and one other channel until each
     shows a picture. Restart Tuner (or refresh the playlist). Hover the badge of another, not
     yet played "4K" channel in the Live preview; open stream info on one you played.
   - **Expect:** the played ones show their real class (HD). The other "4K" channels of that
     playlist now read **4K?** everywhere a badge shows; the tooltip says "The provider says 4K;
     not verified…". A "4K" channel of a different playlist stays "4K". Stream info on the
-    played "4K" channel says "Label    the provider says 4K; plays at HD". Play one of the
+    played "4K" channel says "Quality  named 4K · plays HD". Play one of the
     "4K?" channels: it shows its measured class at once. If two of the played "4K" channels
-    later play at 4K (re-play them), the "?" goes after the next restart.
+    later play at 4K (re-play them), the "?" goes after the next restart. The "4K?" never
+    appears straight after playing — only after a restart or refresh (by design, §13.0.1).
+    An "8K EXCLUSIVE" event slate shows no badge.
 - [ ] **Setting:**
   - **Do:** Settings ▸ Interface ▸ Quality badges off, then on.
   - **Expect:** the badges disappear from every list at once and come back; the Live preview
@@ -684,6 +686,11 @@ Use a provider with decorated names (e.g. "UK: ITV 4 4K ◉", "US ★ HGTV HD", 
     or glued "4K" left — with the quality as a badge; categories read "General", not "UK ❖
     General". Event names keep their fields ("NEXT | Lyon vs Nice | 15:55"). A playlist with
     smart names off keeps the provider's names.
+- [ ] **Look-alikes stay apart:** in a category with "FI: TV5" and "FI: TV5 ᴿᴬᵂ" (or the same
+  channel under two country codes) the rows read "TV5" and "TV5 · RAW" ("… · PL" / "… · AF");
+  categories "GENERAL ᴴᴰ/" and "GENERAL ʰᵉᵛᶜ" read "General · HD" and "General · HEVC";
+  "UK ❖ SPORTS 4K" reads "Sports 4K". Stream info (`I`) on a cleaned channel shows a
+  "Provider" line with the provider's own name.
 - [ ] **Names that keep their symbols:** "E! News", "AT&T …", "Sky Sports+", "Channel 4 +1",
   "5 USA", "BBC One (Scotland)" read as written (search finds them by those words too).
 - [ ] **Toggle per playlist:** Edit ▸ smart name cleanup off, refresh: the provider's raw names

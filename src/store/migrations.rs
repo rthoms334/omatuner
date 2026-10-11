@@ -142,6 +142,7 @@ fn reclean_names(conn: &Connection) -> Result<()> {
                     write.execute(params![r.get::<_, i64>(0)?, name])?;
                 }
             }
+            crate::store::import::distinguish_group_names(conn, crate::model::SourceId(id), None)?;
         }
     }
     Ok(())
@@ -351,7 +352,8 @@ mod tests {
                  (2,'c','UK ★ BBC One HD','UK ★ BBC One HD','ukbbcone','{}',0,1);
                INSERT INTO grp(source_id,kind,key,name,raw_name,provider_order,seen_gen) VALUES
                  (1,'channel','channel:ukgeneral','UK ❖ General','UK ❖ General',0,1),
-                 (1,'channel','channel:old','Old',NULL,1,1);
+                 (1,'channel','channel:old','Old',NULL,1,1),
+                 (1,'channel','channel:generalhevc','GENERAL ʰᵉᵛᶜ','GENERAL ʰᵉᵛᶜ',2,1);
                INSERT INTO movie(source_id,key,name,clean_name,norm_name,stream,provider_order,seen_gen) VALUES
                  (1,'m','EN ★ Dune 4K (2021)','EN ★ Dune','dune','{}',0,1);
                INSERT INTO channel_video(source_id,item_key,name,width,height,at) VALUES (1,'a','UK: ITV 4 4K ◉',1280,720,5);"#,
@@ -368,7 +370,11 @@ mod tests {
             assert_eq!(ch("b"), ("CNN".into(), Some(2), Some("cnn".into())));
             assert_eq!(ch("c"), ("UK ★ BBC One HD".into(), Some(2), Some("bbcone".into())), "smart names off: raw name kept");
             let grp = |k: &str| c.query_row("SELECT name FROM grp WHERE key = ?1", [k], |r| r.get::<_, String>(0)).unwrap();
-            assert_eq!((grp("channel:ukgeneral"), grp("channel:old")), ("General".into(), "Old".into()));
+            // two categories that clean to the same name keep what tells them apart
+            assert_eq!(
+                (grp("channel:ukgeneral"), grp("channel:generalhevc"), grp("channel:old")),
+                ("General · UK".into(), "General · HEVC".into(), "Old".into())
+            );
             assert_eq!(c.query_row("SELECT clean_name FROM movie", [], |r| r.get::<_, String>(0)).unwrap(), "Dune");
             let qc = c.query_row("SELECT source_id, name, claimed, measured, at FROM quality_check", [], |r| {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<i64>>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?))

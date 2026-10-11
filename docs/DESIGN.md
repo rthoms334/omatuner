@@ -1128,26 +1128,51 @@ written.
    provider line-up codes, as before), code lists (`BE/FR:`) and a code with a short
    line-up label (`IN-PREM:`, `BE-VIP:`, `AR-SUBS -`). Unknown words stop it: `CNN: Live`,
    `AT&T: …`, `MY TV: …`, `PRIME: …` stay. Something that names the channel must follow (not
-   only quality words): `"UK: HD"` → `UK`.
+   only quality words): `"UK: HD"` → `UK`. Movie / series titles take upper-case codes only
+   (`America: The Motion Picture`, `It: Chapter Two` are titles). A quality word of the
+   prefix counts only when the name has none after it (`4K: beIN SPORTS 6 ᴴᴰ` is HD).
 2. *Quality words anywhere* → `Quality`, best wins: `SD 480p 576p HD 720p FHD 1080p 1080i
-   1440p QHD UHD 4K 2160p 3840p 8K 4320p` (1440p / QHD are FHD like a measured 2560×1440),
+   1440p QHD UHD 4K 2160p 3840p` (1440p / QHD are FHD like a measured 2560×1440). `8K` /
+   `4320p` are format words, no claim: providers put them on event slates and placeholders
+   (`- NO EVENT STREAMING - | 8K EXCLUSIVE | …`, 8.4k names of the real playlist), never on an
+   8K picture.
    glued to symbols (`4K◉`), in `(…)` / `[…]` / `⁽…⁾`, or as decoration (`ᴴᴰ`, `ꜰʜᴅ`, `ᶠ ᴴᴰ`
    — a run of decoration is read joined first).
 3. *Tags* (stripped into `CleanName.tags`): codec / format words (`HEVC H.265 x265 HDR 50fps`,
-   `⁵⁰ FPS`), `RAW` (not after `WWE`), any `[…]`, superscript groups (`⁽ᴮᴷ⁾`), `(…)` groups
+   `⁵⁰ FPS`, `8K`), the upper-case `RAW` feed tag of channels (not after `WWE` / `NIGHT`;
+   titles keep `Raw Deal`), any `[…]`, superscript groups (`⁽ᴮᴷ⁾`), `(…)` groups
    that are tags (`backup`, `multi-sub`, `geo-blocked`…; `(FHD@60FPS)` is quality + format),
-   superscript text. Other `(…)` groups are part of the name (`BBC One (Scotland)`,
-   `(EAST)`); stylised small capitals that are no known word stay (`ꜱᴘᴏʀᴛꜱ 1`).
+   superscript text (a superscript country code, `ELEVEN ᴾᴸ`, is also the country). Other
+   `(…)` groups are part of the name (`BBC One (Scotland)`, `(EAST)`); stylised small
+   capitals that are no known word stay (`ꜱᴘᴏʀᴛꜱ 1`).
 4. *Ends*: separators, flags and stray brackets at either end are dropped (`◉`, `★`, `|`,
-   `:`, `##`); the full stop of an abbreviation stays (`T.I.M.`). Inside the name everything
-   stays as written (`Parijs-Tours: Mannen`, `NEXT | Lyon vs Nice | 15:55`, `Sp⚽rts`).
-5. VOD: a trailing `(YYYY)` / `[YYYY]` / `- YYYY` (1900–2100) is the year. Groups: all-caps
+   `:`, `##`; a `#` glued to a word stays: `#0`, `#12 Texas A&M vs …`); the full stop of an
+   abbreviation stays (`T.I.M.`). Inside the name everything stays as written (`Parijs-Tours:
+   Mannen`, `NEXT | Lyon vs Nice | 15:55`, `Sp⚽rts`), except that two separators left next
+   to each other become the stronger one (`STREAMING - | 8K EXCLUSIVE |` → `STREAMING |
+   EXCLUSIVE |`).
+5. VOD: a trailing `(YYYY)` / `[YYYY]` / `- YYYY` (1900–2100) is the year. Groups: a quality
+   word written as plain text is what the category is about and stays (`UK ❖ SPORTS 4K` →
+   `Sports 4K`, `UK ❖ 4K` → `4K`, `4K| Relax` → `4K Relax`; superscript ones are decoration);
+   a full country name before text in another script stays (`Lebanon ▶ لبنان`); all-caps
    names are title-cased (acronyms kept). Never empty: nothing left → the trimmed raw name.
+6. *Collisions*: names cleanup made identical although the provider names differ get what
+   it dropped and not all of them share, after ` · `
+   (`smart_names::distinguishing_suffixes`). Categories of one playlist and kind at import
+   (`store::import::distinguish_group_names`, also in migration 0004: `GENERAL ᴴᴰ/`,
+   `GENERAL ʰᵉᵛᶜ`, `General` → `General · HD`, `General · HEVC`, `General`); channels of one
+   category with the same badge at `library::load` (display only: `FI: TV5` / `FI: TV5 ᴿᴬᵂ`
+   → `TV5` / `TV5 · RAW`; `PL:` / `AF: CANAL+ SPORT 5` → `… · PL` / `… · AF`; renamed
+   channels keep the user's name). Stream info (`I`) shows the provider's name of a live
+   channel (`Provider …`) whenever it differs from the displayed one.
 
 Measured on a real 79k-channel Xtream playlist (names only, never committed): the decorations
 listed in the user report (`★` prefixes 20k names, `VIP:` 2k, `◉` 1.5k, superscripts, glued
 `4K`) are gone; what stays are unknown line-up labels (`PRIME:`, `GOLD:`, `DSTV ★`, `Jawy ★`)
-and `|` between the fields of event names. 79k names clean in ~80 ms (release).
+and `|` between the fields of event names. 79k names clean in ~80 ms (release). Channels of
+one category with the same cleaned name and badge although the provider names differ: 602
+sets after cleaning, 183 after the collision suffixes (rule 6; the rest are the provider's
+own duplicates: `4K` / `UHD`, `HD` / `HD (720P)`).
 
 **Existing data.** Names are cleaned at import, and every refresh upserts `clean_name` /
 `grp.name` (with `grp.raw_name`), so a refresh applies new rules. Databases from before these
@@ -1411,7 +1436,9 @@ Overlays centre with a bg @ 0.5 scrim.
 
 #### 13.0.1 Quality-label trust
 Providers label channels 4K that play HD (a real playlist
-labels 14k of 79k channels 4K / 8K). Measured quality always wins. Per source,
+labels about 5.7k of 79k channels 4K / UHD; its 8K labels are event slates and claim
+nothing, §9.6).
+Measured quality always wins. Per source,
 `model::LabelTrust` counts the measured channels (`quality_check`, §6.2.2) and, per claimed
 class, how many claims played lower. Once **≥ 3 channels of the source were measured
 (`MIN_MEASURED`), ≥ 2 of them claimed the class (`MIN_CLAIMS`: one bad stream is no pattern)
@@ -1422,9 +1449,10 @@ not wrong. A channel measured again replaces its evidence, so the doubt clears w
 claims turn out right. Computed at `library::load` (the doubt follows a measurement at the
 next library build — a refresh or the next start — while the played channel itself shows
 its measured class at once). Best-first ordering of duplicates puts a doubtful claim after
-a verified one of the same class. The stream info panel (`I`) adds a `Label` line on live
-channels with a quality word: "Label    the provider says 4K; plays at HD" / "4K (as the
-provider says)" / "…; not verified" before the size is known.
+the class beneath it (`4K?` after any `FHD`, before `HD`). Evidence of channel
+names the provider no longer lists is dropped at each refresh. The stream info panel (`I`)
+adds a `Quality` line on live channels with a quality word: "Quality  named 4K · plays HD" /
+"named 4K · as labelled" / "named 4K · not verified" before the size is known.
 
 ### 13.1 Component catalogue (Omarchy tokens → widgets)
 
@@ -3336,7 +3364,7 @@ case-insensitive unless noted):
    `"FA Cup"`, `"CL Matches"`, `"CH 5"` stay untagged; `"IT: Sport"` is Italy.
 7. *Non-tags* (and plain numbers) are skipped — bracketed, separated or followed by a space —
    and detection continues with the next token (at most 3 leading tokens): the quality,
-   format and service words shared with smart names (`4K 8K HD FHD UHD 1080p… HDR HEVC H265
+   format and service words shared with smart names (`4K HD FHD UHD 1080p… 8K HDR HEVC H265
    50fps VIP SAT RAW PPV 24/7`, also as decoration `ᴴᴰ`) and `SD VOD NEW XXX ADULT 18+ TV FM
    LIVE RADIO MULTI INT INTL INTERNATIONAL WORLD TOP PREMIUM EX`. So `"VIP | UK | Sports"`, `"VIP UK | Sports"` and
    `"[4K] UK: Movies"` → GB; `"4K | Sports"` → untagged; `"NEW ZEALAND"` → NZ (`ZEALAND` is

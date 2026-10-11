@@ -259,6 +259,7 @@ mod tests {
             source_id: SourceId(1),
             key: ItemKey(key.into()),
             name: Arc::from("BBC One"),
+            provider_name: None,
             number: None,
             logo: None,
             group_ids: vec![],

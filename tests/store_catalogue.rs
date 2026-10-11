@@ -622,14 +622,16 @@ fn measured_quality_beats_the_name_and_follows_the_channel() {
     assert!(user::orphans(&r).unwrap().is_empty());
 }
 
-/// Quality-label trust (DESIGN §13.0.1): once enough of a source's channels were measured and
-/// at least half of its measured 4K claims played lower, its unmeasured 4K claims are
-/// doubtful (`4K?`); a channel measured again replaces its evidence, so the doubt goes when
-/// the claims turn out right.
+/// Quality-label trust (DESIGN §13.0.1) through the store: the evidence is one row per channel
+/// (a re-measure replaces it), `library::load` turns it into `4K?` on the unmeasured claims,
+/// a re-measure clears the doubt, and a refresh drops the evidence of vanished names
+/// (thresholds: `model::live::label_trust_thresholds`). Also: channels of one category that
+/// clean to the same name and badge keep what tells them apart (`TV5` / `TV5 · RAW`).
 #[test]
 fn contradicted_4k_claims_make_the_unmeasured_ones_doubtful() {
     let (s, src, _) = reattach_setup("tuner-st-quality-trust");
     let named = |key: &str, name: &str, order| ImportChannel {
+        clean_name: clean_channel_name(name).name,
         quality: NameQuality::of(&clean_channel_name(name)),
         ..chan(key, name, None, "UK", &format!("http://cdn/{key}.ts"), order)
     };
@@ -638,38 +640,31 @@ fn contradicted_4k_claims_make_the_unmeasured_ones_doubtful() {
         named("m3u:b", "UK ★ Bravo 4K", 1),
         named("m3u:c", "UK ★ Charlie 4K", 2),
         named("m3u:d", "UK ★ Delta", 3),
-        named("m3u:e", "UK ★ Echo FHD", 4),
+        named("m3u:f", "FI: TV5", 4),
+        named("m3u:g", "FI: TV5 ᴿᴬᵂ", 5),
     ];
-    run_import(&s, src, chans, vec![], vec![], vec![ItemKind::Channel], NOW);
+    run_import(&s, src, chans.clone(), vec![], vec![], vec![ItemKind::Channel], NOW);
     let r = s.reader().unwrap();
     let badges = || -> HashMap<String, String> {
         library::load(&r).unwrap().live.channels.iter().filter_map(|c| Some((c.key.0.clone(), c.quality?.label().to_owned()))).collect()
     };
     let measure = |key: &'static str, width: i64, height: i64| w(&s, move |c| live::record_video(c, &ch_ref(src, key), width, height, NOW));
+    let names: Vec<String> = library::load(&r).unwrap().live.channels.iter().map(|c| c.name.to_string()).collect();
+    assert_eq!(names[4..], ["TV5", "TV5 · RAW"]);
 
-    // two 4K channels play at HD, but only two channels were measured: no doubt yet
     measure("m3u:a", 1280, 720);
     measure("m3u:a", 1280, 720);
     measure("m3u:b", 1280, 720);
-    assert_eq!(badges()["m3u:c"], "4K");
-    // a third measured channel: the remaining 4K claim is doubted; FHD claims are not
     measure("m3u:d", 720, 576);
-    assert_eq!(
-        badges(),
-        HashMap::from([
-            ("m3u:a".into(), "HD".into()),
-            ("m3u:b".into(), "HD".into()),
-            ("m3u:c".into(), "4K?".into()),
-            ("m3u:d".into(), "SD".into()),
-            ("m3u:e".into(), "FHD".into())
-        ])
-    );
-    assert_eq!(count(&r, "SELECT count(*) FROM quality_check"), 3, "one row per channel");
-    // re-measured at 4K: one of two claims wrong is still half; both right clears the doubt
-    measure("m3u:a", 3840, 2160);
     assert_eq!(badges()["m3u:c"], "4K?");
+    assert_eq!(count(&r, "SELECT count(*) FROM quality_check"), 3, "one row per channel");
+    measure("m3u:a", 3840, 2160);
     measure("m3u:b", 3840, 2160);
-    assert_eq!(badges()["m3u:c"], "4K");
+    assert_eq!(badges()["m3u:c"], "4K", "re-measured right: no doubt");
+
+    // a refresh without Bravo drops its evidence
+    run_import(&s, src, chans.into_iter().filter(|c| c.key.0 != "m3u:b").collect(), vec![], vec![], vec![ItemKind::Channel], NOW + 10);
+    assert_eq!(count(&r, "SELECT count(*) FROM quality_check"), 2);
 }
 
 /// The quality copies of an M3U channel share a base key and are numbered by playlist position

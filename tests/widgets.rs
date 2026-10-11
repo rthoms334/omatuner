@@ -858,6 +858,7 @@ fn data_rows_render_with_real_services() {
         source_id: SourceId(1),
         key: ItemKey("bbc".into()),
         name: Arc::from("BBC One HD"),
+        provider_name: None,
         number: Some(101),
         logo: Some(Arc::from("http://127.0.0.1:9/logo.png")),
         group_ids: vec![GroupId(1)],

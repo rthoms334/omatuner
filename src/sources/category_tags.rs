@@ -185,7 +185,8 @@ const SYNONYMS: &[(&str, &[&str])] = &[
     ("region:latam", &["LAT", "LATIN", "LATINO", "LATINA", "LATAM"]),
     ("region:exyu", &["EX-YU", "EXYU", "YU", "BALKAN", "BALKANS"]),
     ("region:africa", &["AF", "AFR", "AFRICA", "AFRIKA", "AFRICAN"]),
-    ("region:asia", &["ASI", "ASIA", "ASIAN"]),
+    // `AS ❖ Singapore`: Asia in IPTV line-ups, not American Samoa
+    ("region:asia", &["AS", "ASI", "ASIA", "ASIAN"]),
     ("region:caribbean", &["CAR", "CARIB", "CARIBBEAN"]),
     ("region:nordic", &["NORDIC", "NORDICS", "SCANDINAVIA", "SCANDI"]),
     ("region:europe", &["EU", "EUROPE"]),
@@ -847,6 +848,7 @@ mod tests {
             ("ENGLAND | Football", Some("GB")),
             ("ENG | Movies", Some("lang:en")),
             ("AR | News", Some("lang:ar")),
+            ("AS ❖ Other Asia", Some("region:asia")),
             ("ARG | Futbol", Some("AR")),
             ("ARGENTINA", Some("AR")),
             ("YU: Filmovi", Some("region:exyu")),

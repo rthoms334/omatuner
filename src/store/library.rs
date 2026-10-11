@@ -145,8 +145,9 @@ impl LiveIndex {
         }
         for slots in families.values().filter(|s| s.len() > 1) {
             let mut members: Vec<ChannelId> = slots.iter().map(|&i| ids[i]).collect();
-            // a doubtful claim (`4K?`) after a verified one of the same class
-            members.sort_by_key(|id| std::cmp::Reverse(self.get(*id).and_then(|c| c.quality).map(|q| (q.class, !q.doubtful))));
+            // a doubtful claim (`4K?`) between the class beneath it and the next (after `FHD`,
+            // before `HD`), so the first row is never the one the app itself doubts
+            members.sort_by_key(|id| std::cmp::Reverse(self.get(*id).and_then(|c| c.quality).map(|q| 2 * q.class as i8 - 3 * i8::from(q.doubtful))));
             for (&slot, id) in slots.iter().zip(members) {
                 ids[slot] = id;
             }
@@ -491,7 +492,7 @@ fn load_live(conn: &Connection, groups: Vec<Group>) -> Result<LiveIndex> {
         "SELECT c.id, c.source_id, c.key, COALESCE(o.rename, c.clean_name), c.number, c.logo, ce.epg_channel_id, c.tvg_shift_min,
                 c.catchup IS NOT NULL, COALESCE(json_extract(c.catchup, '$.days'), 0), c.radio, c.unsupported IS NOT NULL,
                 c.provider_order, o.user_order, c.added_at, COALESCE(o.hidden, 0), COALESCE(o.locked, 0),
-                c.quality, v.width, v.height, COALESCE(c.family, c.norm_name)
+                c.quality, v.width, v.height, COALESCE(c.family, c.norm_name), c.name, o.rename IS NOT NULL
          FROM channel c JOIN source s ON s.id = c.source_id AND s.enabled = 1
          LEFT JOIN item_override o ON o.source_id = c.source_id AND o.kind = 'channel' AND o.item_key = c.key
          LEFT JOIN channel_epg ce ON ce.channel_id = c.id
@@ -502,14 +503,21 @@ fn load_live(conn: &Connection, groups: Vec<Group>) -> Result<LiveIndex> {
     let mut channels = Vec::new();
     let mut hidden = HashSet::new();
     let mut members: HashMap<GroupId, Vec<ChannelId>> = HashMap::new();
+    let mut renamed = Vec::new();
     let rows = stmt.query_map([], |r| {
         let radio: bool = r.get(10)?;
+        let name: String = r.get(3)?;
+        let provider_name = match r.get_ref(21)? {
+            rusqlite::types::ValueRef::Text(raw) if raw != name.as_bytes() => Some(Arc::from(String::from_utf8_lossy(raw))),
+            _ => None,
+        };
         Ok((
             ChannelSummary {
                 id: r.get(0)?,
                 source_id: r.get(1)?,
                 key: ItemKey(r.get(2)?),
-                name: Arc::from(r.get::<_, String>(3)?),
+                name: Arc::from(name),
+                provider_name,
                 number: r.get(4)?,
                 logo: r.get::<_, Option<String>>(5)?.map(Arc::from),
                 group_ids: Vec::new(),
@@ -539,10 +547,12 @@ fn load_live(conn: &Connection, groups: Vec<Group>) -> Result<LiveIndex> {
                 family: text_hash(r.get_ref(20)?),
             },
             r.get::<_, bool>(15)?,
+            r.get::<_, bool>(22)?,
         ))
     })?;
     for row in rows {
-        let (mut c, item_hidden) = row?;
+        let (mut c, item_hidden, is_renamed) = row?;
+        renamed.push(is_renamed);
         let (gids, all_hidden, any_locked) = effective_groups(links.get(&c.id.0), &flags);
         c.locked |= any_locked;
         if item_hidden || all_hidden {
@@ -554,7 +564,29 @@ fn load_live(conn: &Connection, groups: Vec<Group>) -> Result<LiveIndex> {
         c.group_ids = gids;
         channels.push(c);
     }
+    distinguish_channels(&mut channels, &renamed);
     Ok(LiveIndex::from_parts(channels, groups, members, hidden))
+}
+
+/// Channels of one category that would show the same name and badge although the provider
+/// names differ get what smart cleanup dropped (`FI: TV5` / `FI: TV5 ᴿᴬᵂ` → `TV5` / `TV5 ·
+/// RAW`; `PL:` / `AF: CANAL+ SPORT 5` → `… · PL` / `… · AF`). Renamed channels keep the user's
+/// name. Display only: keys, families and the stored names are unchanged.
+fn distinguish_channels(channels: &mut [ChannelSummary], renamed: &[bool]) {
+    type Seen = (SourceId, Option<GroupId>, Arc<str>, &'static str);
+    let mut sets: HashMap<Seen, Vec<usize>> = HashMap::new();
+    for (i, c) in channels.iter().enumerate().filter(|(i, _)| !renamed[*i]) {
+        sets.entry((c.source_id, c.group_ids.first().copied(), c.name.clone(), c.quality.map_or("", |q| q.label()))).or_default().push(i);
+    }
+    for set in sets.into_values().filter(|s| s.len() > 1) {
+        let raws: Vec<&str> = set.iter().map(|&i| channels[i].provider_name.as_deref().unwrap_or(&channels[i].name)).collect();
+        let suffixes = crate::sources::smart_names::distinguishing_suffixes(&raws, false);
+        for (i, suffix) in set.into_iter().zip(suffixes) {
+            if let Some(suffix) = suffix {
+                channels[i].name = Arc::from(format!("{} · {suffix}", channels[i].name));
+            }
+        }
+    }
 }
 
 /// Stable-within-a-build hash of a text column (no allocation per row).
@@ -674,6 +706,7 @@ mod tests {
             source_id: SourceId(1),
             key: ItemKey(format!("k{id}")),
             name: Arc::from(name),
+            provider_name: None,
             number: Some(n),
             logo: None,
             group_ids: vec![GroupId(1)],
@@ -743,6 +776,11 @@ mod tests {
         let members = HashMap::from([(GroupId(1), ids(&[1, 2, 3, 4, 5]))]);
         let live = LiveIndex::from_parts(placed, vec![], members, HashSet::new());
         assert_eq!(live.collection(&g, &favs, &[], SortMode::Provider), ids(&[1, 2, 3, 4, 5]));
+        // a doubtful `4K?` goes after an FHD copy, before an HD one
+        let doubted = |id: i64, q: Quality, doubtful: bool| ChannelSummary { quality: Some(QualityBadge::named(q, doubtful)), ..dup(id, None) };
+        let chans = vec![doubted(1, Quality::Hd, false), doubted(2, Quality::Uhd, true), doubted(3, Quality::Fhd, false)];
+        let live = LiveIndex::from_parts(chans, vec![], HashMap::from([(GroupId(1), ids(&[1, 2, 3]))]), HashSet::new());
+        assert_eq!(live.collection(&g, &favs, &[], SortMode::Provider), ids(&[3, 2, 1]));
     }
 
     #[test]

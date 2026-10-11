@@ -315,8 +315,11 @@ pub struct ChannelSummary {
     pub id: ChannelId,
     pub source_id: SourceId,
     pub key: ItemKey,
-    /// Display name (rename > clean name).
+    /// Display name (rename > clean name; a dropped tag appended when it collides with another
+    /// channel of its category, `TV5 · RAW` — `store::library`).
     pub name: std::sync::Arc<str>,
+    /// The provider's name when it differs from `name` (stream info).
+    pub provider_name: Option<std::sync::Arc<str>>,
     pub number: Option<u32>,
     pub logo: Option<std::sync::Arc<str>>,
     pub group_ids: Vec<GroupId>,
