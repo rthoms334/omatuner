@@ -862,3 +862,81 @@ fn guide_search_and_search_prefer_playlists_in_all() {
     let refs: Vec<&str> = r["results"].as_array().unwrap().iter().map(|x| x["ref"].as_str().unwrap()).collect();
     assert_eq!(refs[..2], ["channel:1:m3u:bbc1", "channel:3:m3u:extra"], "{r}");
 }
+
+/// DESIGN §28.3 / §28.12: the agent sees what the screens show. The shared category rule (TV
+/// Two has no rule of its own) hides its German sports category and its French films category
+/// from every tool and count — their channel is no `also_on` alternative either — and "Also
+/// hide titles in other languages" (on by itself for an English-only rule) hides a Dutch title
+/// in its kept, untagged category. Without the shared rule they all return.
+#[test]
+fn the_shared_category_rule_and_title_languages_apply_to_every_tool() {
+    use tuner::model::{CategoryFilter, CategoryTag};
+    let mut w = World::new(pin_config());
+    w.ui.services()
+        .store
+        .writer()
+        .blocking(|c| {
+            let group = |name: &str, kind: &str| -> rusqlite::Result<i64> {
+                c.execute(
+                    "INSERT INTO grp(source_id, kind, key, name, raw_name, provider_order, item_count, seen_gen) VALUES (2, ?1, ?2, ?3, ?3, 1, 1, 1)",
+                    params![kind, format!("{kind}:{}", name.to_lowercase()), name],
+                )?;
+                Ok(c.last_insert_rowid())
+            };
+            let de = group("DE: Sport", "channel")?;
+            c.execute(
+                "INSERT INTO channel(source_id, key, name, clean_name, norm_name, number, tvg_shift_min, stream, url_key, provider_order, added_at, seen_gen, quality)
+                 VALUES (2, 'm3u:skyde', 'Sky Sport DE', 'Sky Sport DE', 'sky sport de', 20, 0, '{\"t\":\"url\",\"url\":\"http://127.0.0.1/live/skyde.ts\"}', 'http://127.0.0.1/live/skyde.ts', 0, 0, 1, 2)",
+                [],
+            )?;
+            let sky = c.last_insert_rowid();
+            c.execute("INSERT INTO channel_group(group_id, channel_id, position, is_primary) VALUES (?1, ?2, 0, 1)", params![de, sky])?;
+            c.execute("INSERT INTO channel_epg(channel_id, epg_channel_id) VALUES (?1, 2)", [sky])?;
+            let fr = group("FR ✪ CINEMA", "movie")?;
+            let films: i64 = c.query_row("SELECT id FROM grp WHERE source_id = 2 AND key = 'movie:films'", [], |r| r.get(0))?;
+            for (key, name, lang, grp) in [("m3u:lefilm", "Le Film", None, fr), ("m3u:nl", "NL ✪ Zwartboek", Some("NL"), films), ("m3u:heat", "Heat", None, films)] {
+                c.execute(
+                    "INSERT INTO movie(source_id, key, name, clean_name, norm_name, year, stream, provider_order, added_at, seen_gen, match_lang)
+                     VALUES (2, ?1, ?2, ?2, lower(?2), 2006, ?3, 9, 1700000100, 1, ?4)",
+                    params![key, name, format!(r#"{{"t":"url","url":"http://127.0.0.1/movie/{key}.mp4"}}"#), lang],
+                )?;
+                c.execute("INSERT INTO movie_group(group_id, movie_id, position) VALUES (?1, ?2, 0)", params![grp, c.last_insert_rowid()])?;
+            }
+            let english = CategoryFilter {
+                keep: ["AU", "CA", "GB", "IE", "NZ", "US"].into_iter().map(CategoryTag::country).chain([CategoryTag::language("en")]).collect(),
+                keep_untagged: true,
+                ..Default::default()
+            };
+            tuner::store::sources::set_shared_category_filter(c, Some(&english))
+        })
+        .unwrap();
+    w.publish(Visibility::NO_EXPLICIT);
+    for q in ["zwartboek", "le film", "sky sport"] {
+        let r = w.ok("search", json!({"query": q}));
+        assert!(!mentions(&r, q), "{q}: {r}");
+    }
+    let r = w.ok("categories", json!({"kind": "movie", "playlist": "tv two"}));
+    assert_eq!(names(&r, "categories", "name"), ["Films"], "{r}");
+    assert_eq!(r["categories"][0]["count"], 2, "Dune and Heat, not the Dutch title: {r}");
+    let r = w.ok("categories", json!({"kind": "channel"}));
+    assert!(!names(&r, "categories", "name").iter().any(|c| c == "DE: Sport"), "{r}");
+    let r = w.ok("browse", json!({"kind": "movie", "playlist": "tv two", "sort": "name"}));
+    assert_eq!((names(&r, "items", "name"), r["total"].as_u64()), (vec!["Dune".to_owned(), "Heat".to_owned()], Some(2)));
+    assert_eq!(w.err("browse", json!({"kind": "movie", "group": "cinema"})), ErrorCode::NotFound);
+    let r = w.ok("guide_search", json!({"query": "touring car"}));
+    assert!(!mentions(&r, "sky sport"), "{r}");
+
+    // no shared rule: everything of TV Two shows
+    w.ui.services().store.writer().blocking(|c| tuner::store::sources::set_shared_category_filter(c, None)).unwrap();
+    w.publish(Visibility::NO_EXPLICIT);
+    for q in ["zwartboek", "le film", "sky sport"] {
+        let r = w.ok("search", json!({"query": q}));
+        assert!(mentions(&r, q), "{q}: {r}");
+    }
+    let r = w.ok("categories", json!({"kind": "movie", "playlist": "tv two"}));
+    assert_eq!(names(&r, "categories", "name").len(), 2, "{r}");
+    let r = w.ok("browse", json!({"kind": "movie", "playlist": "tv two"}));
+    assert_eq!(r["total"], 4, "{r}");
+    let r = w.ok("guide_search", json!({"query": "british touring"}));
+    assert!(mentions(&r, "sky sport"), "{r}");
+}
