@@ -431,6 +431,8 @@ pub static LIST: &[Binding] = &[
     // (and a leading space doesn't filter anyway)
     b(C::ch(' '), A::ToggleMark, "Mark group (Ctrl+H then hides all marked)"),
     b(C::key(Key::Insert), A::ToggleMark, "Mark group (Ctrl+H then hides all marked)"),
+    // Live TV: the same channel in another playlist ("Also on", DESIGN §29.16)
+    b(C::ctrl(Key::O), A::PlayFrom, "Play from another copy…"),
     // any other printable key starts filtering (FilterInput)
 ];
 
@@ -450,6 +452,7 @@ pub static LIST_FILTERING: &[Binding] = &[
     // Space types here (filters have spaces); Insert still marks
     b(C::key(Key::Insert), A::ToggleMark, "Mark group (Ctrl+H then hides all marked)"),
     b(C::ctrl_shift(Key::H), A::HideShown, "Hide the groups with the words typed"),
+    b(C::ctrl(Key::O), A::PlayFrom, "Play from another copy…"),
     // printable keys → FilterInput
 ];
 

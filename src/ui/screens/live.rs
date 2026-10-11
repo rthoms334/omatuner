@@ -12,6 +12,11 @@
 //! * Layouts: Wide 3 panes; Medium = channels + preview on the right, groups in a drawer
 //!   (← / Backspace or the breadcrumb); Compact = stack, Enter plays fullscreen.
 //! * Key contexts: `[List|ListFiltering]` of the focused pane. Owner: WP-11.
+//! * "Also on ● TV 2 (FHD)" (DESIGN §29.16, P3): the preview lists the same channel in other
+//!   playlists — the same normalised name (quality words dropped, `ChannelSummary::family`),
+//!   never two different tvg-ids — as alternatives to pick (a click, or Ctrl+O's menu). They
+//!   are never merged and nothing switches to one by itself; hidden channels and hidden
+//!   explicit content aren't offered, a locked one asks for the PIN.
 //! * Several playlists with channels (DESIGN §29): the scope bar on top (tabs at Wide, the
 //!   `● TV 2 ▾` button otherwise; Alt+P, Ctrl+PgDn/PgUp) narrows the groups, All channels,
 //!   the favourites lists, History and Reminders — and so the zap lists — to one playlist;
@@ -538,11 +543,17 @@ enum Pane {
 enum Menu {
     Context,
     Sort,
+    /// Ctrl+O: the cursor channel in other playlists.
+    AlsoOn,
 }
 
 /// The groups menu's "Countries & languages…" (echoed back as `Action::Digit`; channel numbers
 /// never come from a menu).
 const MENU_COUNTRIES: u8 = 200;
+/// "Also on": alternative `k` is `MENU_ALSO_ON + k`.
+const MENU_ALSO_ON: u8 = 100;
+/// Alternatives listed at most (chips and menu).
+const MAX_ALSO_ON: usize = 12;
 /// The groups menu's "Mark as explicit" / "Not explicit".
 const MENU_EXPLICIT: u8 = 201;
 
@@ -641,6 +652,56 @@ pub struct LiveScreen {
     /// Indices into `groups` of the provider groups the filter shows whose names have the
     /// words typed: what "Hide these N groups" hides.
     matching: Vec<u32>,
+    /// "Also on" of the cursor channel: (library generation, channel, alternatives).
+    also_on: Option<(u64, ChannelId, Vec<ChannelId>)>,
+    /// The alternatives Ctrl+O's menu listed.
+    also_on_menu: Vec<ChannelId>,
+    /// A locked alternative waiting for the PIN.
+    also_on_pending: Option<ChannelId>,
+}
+
+/// The same channel in other playlists (module docs): same `family` (normalised name, quality
+/// words dropped), another playlist, not hidden, not DRM-only; a channel whose tvg-id differs
+/// from `ch`'s (both known) is another channel. Best quality first within a playlist, playlists
+/// in their order. `tvg` reads the tvg-ids of some channels (`None`: the frame budget is spent).
+pub(crate) fn also_on(
+    lib: &crate::store::library::Library,
+    ch: &ChannelSummary,
+    tvg: impl FnOnce(&[ChannelId]) -> Option<std::collections::HashMap<ChannelId, String>>,
+) -> Option<Vec<ChannelId>> {
+    let live = &lib.live;
+    let mut alts: Vec<&ChannelSummary> = live
+        .channels
+        .iter()
+        .filter(|c| c.family == ch.family && c.source_id != ch.source_id && !c.unsupported && !live.hidden.contains(&c.id))
+        .collect();
+    if alts.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut ids: Vec<ChannelId> = alts.iter().map(|c| c.id).collect();
+    ids.push(ch.id);
+    let tvg = tvg(&ids)?;
+    let id_of = |c: ChannelId| tvg.get(&c).map(|t| t.trim()).filter(|t| !t.is_empty());
+    if let Some(own) = id_of(ch.id) {
+        alts.retain(|c| id_of(c.id).is_none_or(|t| t.eq_ignore_ascii_case(own)));
+    }
+    // playlists in their order (the vector's), the best quality first inside one
+    let rank = |s: SourceId| lib.sources.iter().position(|m| m.id == s).unwrap_or(usize::MAX);
+    alts.sort_by_key(|c| (rank(c.source_id), std::cmp::Reverse(c.quality.map(|q| q.class as u8)), c.provider_order));
+    Some(alts.into_iter().take(MAX_ALSO_ON).map(|c| c.id).collect())
+}
+
+/// The tvg-ids of `ids` (one indexed read).
+fn tvg_ids(conn: &rusqlite::Connection, ids: &[ChannelId]) -> crate::error::Result<std::collections::HashMap<ChannelId, String>> {
+    use rusqlite::OptionalExtension;
+    let mut stmt = conn.prepare_cached("SELECT tvg_id FROM channel WHERE id = ?1")?;
+    let mut out = std::collections::HashMap::new();
+    for id in ids {
+        if let Some(t) = stmt.query_row([id.0], |r| r.get::<_, Option<String>>(0)).optional()?.flatten() {
+            out.insert(*id, t);
+        }
+    }
+    Ok(out)
 }
 
 /// Channel management shared by Live and the Guide: favourite, lists, hide, rename, lock (the
@@ -721,6 +782,75 @@ fn synthetic_group(name: String, count: usize) -> Group {
 }
 
 impl LiveScreen {
+    /// "Also on" of the cursor channel (cached per channel and library; the tvg-ids are one
+    /// indexed read in the frame budget, else the next frame).
+    fn also_on(&mut self, ctx: &mut UiCtx<'_>) -> Vec<ChannelId> {
+        let Some(id) = self.cursor_channel() else { return Vec::new() };
+        if let Some((generation, c, alts)) = &self.also_on
+            && *generation == ctx.lib.generation
+            && *c == id
+        {
+            return alts.clone();
+        }
+        let Some(ch) = ctx.lib.live.get(id).cloned() else { return Vec::new() };
+        let (db, budget) = (ctx.db, &mut *ctx.budget);
+        let Some(alts) = also_on(ctx.lib, &ch, |ids| budget.run(|| tvg_ids(db, ids)).and_then(|r| r.ok())) else { return Vec::new() };
+        self.also_on = Some((ctx.lib.generation, id, alts.clone()));
+        alts
+    }
+
+    /// "TV 2 (FHD)" — and the alternative's own name when it differs from the cursor channel's.
+    fn also_on_label(ctx: &UiCtx<'_>, ch: &ChannelSummary, alt: &ChannelSummary) -> String {
+        let playlist = ctx.lib.source(alt.source_id).map_or("another playlist", |s| s.name.as_str());
+        let mut label = playlist.to_owned();
+        if let Some(q) = crate::ui::data::QualityBadges(Some(ctx.measured)).of(alt) {
+            label.push_str(&format!(" ({})", q.label()));
+        }
+        if alt.name != ch.name {
+            label.push_str(&format!(" · {}", alt.name));
+        }
+        label
+    }
+
+    /// Play an alternative in the preview (or fullscreen without one); a locked one asks for
+    /// the PIN first (`Unlocked(PlayFrom)` comes back here).
+    fn play_also_on(&mut self, ctx: &mut UiCtx<'_>, id: ChannelId) {
+        let zap = primary_zap(ctx, id);
+        let preview = Self::preview_visible(ctx.layout);
+        if ctx.lib.live.get(id).is_some_and(|c| c.locked) && !ctx.parental.is_unlocked(&ctx.config.parental) {
+            self.also_on_pending = Some(id);
+        }
+        activate_channel(ctx, id, zap, PlayOrigin::Fullscreen, preview, Action::PlayFrom);
+    }
+
+    /// Ctrl+O on a channel: the same channel in other playlists.
+    fn also_on_menu(&mut self, ctx: &mut UiCtx<'_>) {
+        let alts = self.also_on(ctx);
+        let Some(ch) = self.cursor_channel().and_then(|id| ctx.lib.live.get(id).cloned()) else { return };
+        if alts.is_empty() {
+            ctx.toast(Toast::info("This channel isn't in your other playlists"));
+            return;
+        }
+        let unlocked = ctx.parental.is_unlocked(&ctx.config.parental);
+        let items = alts
+            .iter()
+            .enumerate()
+            .filter_map(|(k, id)| {
+                let alt = ctx.lib.live.get(*id)?;
+                Some(MenuItem {
+                    icon: if alt.locked && !unlocked { glyphs::LOCK } else { glyphs::PLAY },
+                    label: Self::also_on_label(ctx, &ch, alt),
+                    action: Action::Digit(MENU_ALSO_ON + k as u8),
+                    enabled: true,
+                    shortcut: None,
+                })
+            })
+            .collect();
+        self.also_on_menu = alts;
+        self.menu = Some(Menu::AlsoOn);
+        ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: format!("{} is also on", ch.name), items }));
+    }
+
     fn preview_visible(layout: LayoutClass) -> bool {
         layout != LayoutClass::Compact
     }
@@ -1365,6 +1495,10 @@ impl LiveScreen {
                 self.reorder(ctx, action == Action::MoveUp);
                 true
             }
+            Action::PlayFrom => {
+                self.also_on_menu(ctx);
+                true
+            }
             Action::SortMenu => {
                 let current = ctx.config.interface.live_sort;
                 let items = SORTS
@@ -1848,6 +1982,39 @@ impl LiveScreen {
                 badge::source_badge(ui, theme, src, false);
             }
         });
+        // the same channel in other playlists: alternatives to pick, never merged (P3)
+        let alts = self.also_on(ctx);
+        if !alts.is_empty() {
+            ui.add_space(theme.space(SpaceToken::Sm));
+            let unlocked = ctx.parental.is_unlocked(&ctx.config.parental);
+            let playing = playing_channel(ctx.player);
+            let mut picked = None;
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(theme.space(SpaceToken::Sm), theme.space(SpaceToken::Xs));
+                ui.label(egui::RichText::new("Also on").size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
+                for id in &alts {
+                    let (Some(alt), Some(src)) = (ctx.lib.live.get(*id), ctx.lib.live.get(*id).and_then(|a| ctx.lib.source(a.source_id))) else {
+                        continue;
+                    };
+                    let text = Self::also_on_label(ctx, &ch, alt);
+                    let locked = alt.locked && !unlocked;
+                    let label = format!("Also on {text}");
+                    let resp = badge::source_chip_button(ui, theme, src, &text, locked, playing == Some(*id), &label);
+                    let shortcut = shortcut(KeyContext::List, Action::PlayFrom).unwrap_or_default();
+                    if resp
+                        .on_hover_text(
+                            egui::RichText::new(format!("Play this channel from {} ({shortcut})", src.name)).size(theme.font(TypeToken::BodySmall)),
+                        )
+                        .clicked()
+                    {
+                        picked = Some(*id);
+                    }
+                }
+            });
+            if let Some(id) = picked {
+                self.play_also_on(ctx, id);
+            }
+        }
         ui.add_space(theme.space(SpaceToken::Md));
         if ch.unsupported {
             ui.label(egui::RichText::new("DRM-protected — can't be played").size(theme.font(TypeToken::Body)).color(t.urgent));
@@ -1969,6 +2136,11 @@ impl Screen for LiveScreen {
             Pane::Groups => vec![self.group_list.key_context()],
             Pane::Channels => vec![self.chan_list.key_context()],
         }
+    }
+
+    fn hint_extras(&self) -> Vec<(Action, &'static str)> {
+        let shown = self.also_on.as_ref().is_some_and(|(_, c, alts)| Some(*c) == self.cursor_channel() && !alts.is_empty());
+        if self.focus == Pane::Channels && shown { vec![(Action::PlayFrom, "also on")] } else { Vec::new() }
     }
 
     fn on_enter(&mut self, ctx: &mut UiCtx<'_>, route: &Route) {
@@ -2116,10 +2288,22 @@ impl Screen for LiveScreen {
 
     fn on_overlay_result(&mut self, ctx: &mut UiCtx<'_>, result: OverlayResult) {
         match result {
+            OverlayResult::Unlocked(Action::PlayFrom) => {
+                if let Some(id) = self.also_on_pending.take() {
+                    self.play_also_on(ctx, id);
+                }
+            }
             OverlayResult::Unlocked(action) => {
                 self.on_action(ctx, action);
             }
             OverlayResult::Chosen(action) => match self.menu.take() {
+                Some(Menu::AlsoOn) => {
+                    if let Action::Digit(d) = action
+                        && let Some(id) = d.checked_sub(MENU_ALSO_ON).and_then(|k| self.also_on_menu.get(usize::from(k))).copied()
+                    {
+                        self.play_also_on(ctx, id);
+                    }
+                }
                 Some(Menu::Sort) => {
                     if let Some((_, mode)) = choice_index(action).and_then(|i| SORTS.get(i)) {
                         let mode = *mode;
@@ -2164,6 +2348,7 @@ impl Screen for LiveScreen {
 mod tests {
     use super::*;
     use crate::ui::screens::home::testkit::{self, harness, has_label, has_label_containing, rig, seed};
+    use egui_kittest::kittest::Queryable;
 
     /// Several playlists with channels (DESIGN §29): in All, group and channel rows name their
     /// playlist (two "All" groups told apart), the breadcrumb of a provider group names its
@@ -2243,6 +2428,79 @@ mod tests {
 
     /// DESIGN §20.3: a group's menu offers "Mark as explicit"; choosing it stores the user's
     /// word, and the next hidden build leaves the group and its channels out.
+    /// P3 (DESIGN §29.16): the preview offers the same channel in other playlists — same name,
+    /// never another tvg-id, never a hidden channel — as "Also on" chips (a click plays it
+    /// here) and as Ctrl+O's menu; a locked alternative asks for the PIN first. Nothing is
+    /// merged and nothing switches by itself.
+    #[test]
+    fn also_on_offers_the_same_channel_in_other_playlists() {
+        type H = egui_kittest::Harness<'static, testkit::App<LiveScreen>>;
+        let (mut t, one) = rig();
+        let (a_ch, b_ch, b) = seed(&mut t, |c| {
+            let a = testkit::source(c, "Alpha")?;
+            let b = testkit::source(c, "Bravo")?;
+            let ch = testkit::source(c, "Charlie")?;
+            let a_ch = testkit::channels(c, a, 3)?;
+            let b_ch = testkit::channels(c, b, 2)?;
+            testkit::channels(c, ch, 1)?;
+            // Bravo's "Channel 1" is another channel (another tvg-id); Charlie's is hidden
+            c.execute("UPDATE channel SET tvg_id = 'other.tv' WHERE id = ?1", [b_ch[1].0])?;
+            let hidden = ItemRef { source: ch, kind: ItemKind::Channel, key: crate::model::ItemKey("m3u:seed00000000000".into()) };
+            crate::store::user::set_item_override(c, &hidden, &crate::model::ItemOverride { hidden: true, ..Default::default() })?;
+            Ok((a_ch, b_ch, b))
+        });
+        let mut h = harness(t, one, LiveScreen::default(), egui::vec2(1600.0, 900.0));
+        h.state_mut().enter(Route::Live { group: None, channel: Some(a_ch[0]) });
+        h.run_steps(3);
+        assert_eq!(h.state().s.cursor_channel(), Some(a_ch[0]));
+        assert!(has_label(&h, "Also on Bravo"), "Bravo has Channel 0");
+        assert!(!has_label_containing(&h, "Also on Charlie"), "a hidden channel isn't offered");
+        assert_eq!(h.state().s.hint_extras(), vec![(Action::PlayFrom, "also on")]);
+        let playing = |h: &H| h.state().t.services().player.handle().snapshot().playable.as_ref().map(|p| p.media.clone());
+        // a click plays Bravo's copy here — the cursor stays on Alpha's
+        h.get_by_label("Also on Bravo").click();
+        h.run_steps(1);
+        testkit::until(&mut h, "Bravo's channel plays", |h| playing(h) == Some(MediaRef::Channel(b_ch[0])));
+        assert_eq!(h.state().s.cursor_channel(), Some(a_ch[0]));
+        // Channel 1: Bravo's has another tvg-id — nothing to offer
+        h.state_mut().enter(Route::Live { group: None, channel: Some(a_ch[1]) });
+        h.run_steps(2);
+        assert!(!has_label_containing(&h, "Also on"));
+        h.state_mut().t.toasts.clear();
+        assert!(h.state_mut().act(Action::PlayFrom));
+        assert!(h.state().t.toasts.iter().any(|t| t.text == "This channel isn't in your other playlists"));
+        // a locked alternative: Ctrl+O lists it with the lock, picking it asks for the PIN
+        let locked = ItemRef { source: b, kind: ItemKind::Channel, key: crate::model::ItemKey("m3u:seed00000000000".into()) };
+        seed(&mut h.state_mut().t, move |c| {
+            crate::store::user::set_item_override(c, &locked, &crate::model::ItemOverride { locked: true, ..Default::default() })
+        });
+        let mut cfg = (*h.state().t.config).clone();
+        cfg.parental = crate::config::ParentalConfig {
+            enabled: true,
+            pin_salt: Some("s".into()),
+            pin_hash: Some(crate::ui::parental::hash_pin("1234", "s")),
+            relock_min: 0,
+            ..Default::default()
+        };
+        h.state_mut().t.config = std::sync::Arc::new(cfg);
+        h.state_mut().enter(Route::Live { group: None, channel: Some(a_ch[0]) });
+        h.run_steps(2);
+        h.state_mut().nav();
+        assert!(h.state_mut().act(Action::PlayFrom));
+        let nav = h.state_mut().nav();
+        let Some(crate::ui::NavRequest::Open(OverlayRequest::ContextMenu(m))) = nav.last() else { panic!("{nav:?}") };
+        assert_eq!((m.items.len(), m.items[0].label.as_str(), m.items[0].icon), (1, "Bravo", glyphs::LOCK));
+        let pick = m.items[0].action;
+        h.state_mut().result(OverlayResult::Chosen(pick));
+        let nav = h.state_mut().nav();
+        assert!(matches!(nav.as_slice(), [crate::ui::NavRequest::Open(OverlayRequest::Pin { then, .. })] if **then == Action::PlayFrom), "{nav:?}");
+        let app = h.state_mut();
+        let p = app.t.config.parental.clone();
+        assert!(app.t.parental.unlock("1234", &p));
+        h.state_mut().result(OverlayResult::Unlocked(Action::PlayFrom));
+        assert!(h.state().s.also_on_pending.is_none(), "played after the PIN");
+    }
+
     #[test]
     fn mark_a_group_as_explicit_from_its_menu() {
         let (mut t, one) = rig();

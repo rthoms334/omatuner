@@ -121,6 +121,43 @@ pub fn source_badge(ui: &mut egui::Ui, theme: &Theme, src: &SourceMeta, compact:
     if compact { resp.on_hover_text(egui::RichText::new(&src.name).size(theme.font(TypeToken::BodySmall))) } else { resp }
 }
 
+/// A clickable playlist chip: the source glyph + `text` ("TV 2 (FHD)") with the source colour
+/// as its edge, like [`source_badge`] — the Live preview's "Also on" alternatives (DESIGN
+/// §29.16). `focused` draws the keyboard ring; `locked` adds the lock glyph. The accessible
+/// name is `label`.
+pub fn source_chip_button(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    src: &SourceMeta,
+    text: &str,
+    locked: bool,
+    focused: bool,
+    label: &str,
+) -> egui::Response {
+    let t = &theme.tokens;
+    let color = theme.source_color(src.color);
+    let lock = if locked { format!(" {}", glyphs::LOCK) } else { String::new() };
+    let shown = format!("{} {text}{lock}", source_glyph(src));
+    let font = paint::font(theme, TypeToken::BodySmall);
+    let pad = egui::vec2(theme.space(SpaceToken::Md), theme.space(SpaceToken::Xs));
+    let g = paint::galley(ui.painter(), shown, font, legible(theme, color), f32::INFINITY);
+    let (rect, resp) = ui.allocate_exact_size(g.size() + 2.0 * pad + egui::vec2(2.0, 2.0), egui::Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        if resp.hovered() || focused {
+            p.rect_filled(rect, t.rounding, t.fill_hover);
+        }
+        p.rect_stroke(rect, t.rounding, egui::Stroke::new(1.0, with_alpha(color, 0.8)), egui::StrokeKind::Inside);
+        if focused {
+            paint::focus_ring(p, rect, theme);
+        }
+        p.galley(rect.center() - g.size() / 2.0, g, legible(theme, color));
+    }
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    resp
+}
+
 pub fn live_badge(ui: &mut egui::Ui, theme: &Theme) -> egui::Response {
     badge(ui, theme, "LIVE", theme.tokens.urgent)
 }
