@@ -1900,15 +1900,11 @@ impl SettingsScreen {
         }
     }
 
-    fn confirm_delete_source(&mut self, ctx: &mut UiCtx<'_>, id: SourceId, name: &str) {
+    /// "Delete playlist…": the dialog offers to move favourites and progress to the same titles
+    /// in other playlists first (DESIGN §29.16), then deletes it itself.
+    fn confirm_delete_source(&mut self, ctx: &mut UiCtx<'_>, id: SourceId, _name: &str) {
         let token = self.token(Pending::DeleteSource(id));
-        ctx.open(OverlayRequest::Confirm(ConfirmSpec {
-            title: format!("Delete {name}?"),
-            body: "Its channels, movies, series and guide are removed. Favourites and progress are kept as orphans in case you add it again.".into(),
-            confirm_label: "Delete".into(),
-            destructive: true,
-            token,
-        }));
+        ctx.open(OverlayRequest::DeletePlaylist { source: id, token });
     }
 
     /// ←/→ on a guide: shift its offset. Applied (saved + the guide re-imported, the offset
@@ -2678,11 +2674,10 @@ impl Screen for SettingsScreen {
             }
             (OverlayResult::Confirmed(_), Some(p)) => match p {
                 Pending::DeleteSource(id) => {
-                    let _ = ctx.services.store.writer().submit_notify(DataScope::Sources, move |c| crate::store::sources::delete_source(c, id));
+                    // the dialog moved what the user asked for and deleted it (and toasts)
                     self.sources.retain(|s| s.id != id);
                     self.editor = None;
                     self.row = 0;
-                    ctx.toast(Toast::info("Playlist deleted"));
                 }
                 Pending::DeleteEpg(id) => {
                     let _ = ctx.services.store.writer().submit_notify(DataScope::Epg, move |c| crate::store::sources::delete_epg_source(c, id));
@@ -3443,13 +3438,13 @@ mod tests {
         );
         h.state_mut().result(OverlayResult::Chosen(Action::Digit(MENU_DELETE)));
         let nav = h.state_mut().nav();
-        let token = match nav.as_slice() {
-            [NavRequest::Open(OverlayRequest::Confirm(c))] => {
-                assert!(c.destructive);
-                c.token
-            }
+        // the delete dialog (`overlays::delete_playlist`, tested there) deletes it itself and
+        // answers with the token
+        let (source, token) = match nav.as_slice() {
+            [NavRequest::Open(OverlayRequest::DeletePlaylist { source, token })] => (*source, *token),
             other => panic!("{other:?}"),
         };
+        h.state().t.services().store.writer().blocking(move |c| crate::store::sources::delete_source(c, source)).unwrap();
         h.state_mut().result(OverlayResult::Confirmed(token));
         until(&mut h, "the deletion", |h| sources(h).len() == 1);
         // "+ Add playlist…" opens the onboarding card at Type

@@ -1663,6 +1663,112 @@ fn series_copies_continue_from_the_newest_progress() {
     assert_eq!(copies::next_episode(&r, &[sa, sb]).unwrap().unwrap().1.key.0, "ep:b102");
 }
 
+/// Deleting a playlist (DESIGN §29.16, P3): its favourites and progress can move to the other
+/// playlist's copies — matched by TMDB id or by title + year (never against another TMDB id,
+/// never to a copy split off), joined copies too; an episode moves to the same episode of
+/// the other copy only once that copy's episodes are loaded; what can't move is listed. The
+/// move keeps list places and never overwrites newer progress.
+#[test]
+fn deleting_a_playlist_moves_favourites_and_progress_to_matched_copies() {
+    use tuner::store::copies::{self, MatchedBy};
+    use tuner::store::import::{ImportEpisode, SeriesDetails};
+    let s = store("tuner-st-delete-move");
+    let (a, b) = w(&s, |c| Ok((seed::seed_source(c, "TV")?, seed::seed_source(c, "TV 2")?)));
+    let tv = vec![
+        listed("a1", "EN ★ Dune - 2021", "EN", 0, None),
+        listed("a2", "EN ★ Leo - 2023", "EN", 1, Some(1_075_794)),
+        listed("a3", "EN ★ Gold - 2022", "EN", 2, None),
+        listed("a4", "EN ★ Ronin - 1998", "EN", 3, None),
+        listed("a5", "EN ★ Arrival - 2016", "EN", 4, Some(329_865)),
+    ];
+    let tv2 = vec![
+        listed("b1", "EN - Dune (2021)", "Films", 0, None),
+        listed("b2", "IN-TL - Leo (2023)", "Films", 1, Some(1_000_837)),
+        listed("b4", "EN - Ronin (1998)", "Films", 3, None),
+        listed("b5", "Story of Your Life", "Films", 4, Some(329_865)),
+    ];
+    run_import(
+        &s,
+        a,
+        vec![chan("c1", "News", None, "News", "http://h.tv/c1", 0)],
+        tv,
+        vec![series("sa", "EN ★ Lost - 2004", "EN", 0)],
+        vec![ItemKind::Channel, ItemKind::Movie, ItemKind::Series],
+        NOW,
+    );
+    run_import(&s, b, vec![], tv2, vec![series("sb", "EN - Lost (2004)", "Series", 0)], vec![ItemKind::Movie, ItemKind::Series], NOW);
+    let r = s.reader().unwrap();
+    let sid = |key: &str| r.query_row("SELECT id FROM series WHERE key = ?1", [key], |x| x.get::<_, SeriesId>(0)).unwrap();
+    let (sa, sb) = (sid("sa"), sid("sb"));
+    let ep = |p: &str, e: u32| ImportEpisode {
+        key: ItemKey(format!("ep:{p}{e}")),
+        provider_id: None,
+        season: 1,
+        episode: e,
+        title: format!("E{e}"),
+        plot: None,
+        duration_s: Some(2400),
+        still: None,
+        air_date: None,
+        rating: None,
+        stream: StreamLocator::Xtream { kind: XtreamStreamKind::Series, stream_id: e as i64, ext: Some("mkv".into()) },
+    };
+    let details =
+        move |p: &'static str| SeriesDetails { seasons: vec![], episodes: vec![ep(p, 1), ep(p, 2)], plot: None, backdrop: None, tmdb_id: None };
+    w(&s, move |c| import::store_series_details(c, sa, &details("a"), NOW));
+    // TV 2 is an Xtream playlist whose series hasn't loaded its episodes yet
+    w(&s, move |c| Ok(c.execute("UPDATE source SET kind = 'xtream' WHERE id = ?1", [b]).map(|_| ())?));
+    let list = w(&s, |c| user::default_fav_list(c));
+    let prog = |src: SourceId, kind: ItemKind, key: &str, pos: f64, at: Timestamp| WatchProgress {
+        item: ItemRef { source: src, kind, key: ItemKey(key.into()) },
+        position_s: pos,
+        duration_s: Some(6000.0),
+        updated_at: at,
+        finished: false,
+        title: key.into(),
+        fingerprint: Default::default(),
+    };
+    w(&s, move |c| {
+        for k in ["a1", "a2", "a3", "a4", "a5"] {
+            user::set_favourite(c, list, &mref(a, k), true, NOW)?;
+        }
+        user::set_favourite(c, list, &ItemRef { source: a, kind: ItemKind::Channel, key: ItemKey("c1".into()) }, true, NOW)?;
+        user::save_progress(c, &prog(a, ItemKind::Movie, "a1", 2480.0, NOW - 10))?;
+        user::save_progress(c, &prog(b, ItemKind::Movie, "b1", 100.0, NOW - 100))?; // older: replaced
+        user::save_progress(c, &prog(a, ItemKind::Movie, "a4", 600.0, NOW - 100))?;
+        user::save_progress(c, &prog(b, ItemKind::Movie, "b4", 900.0, NOW - 5))?; // newer: kept
+        user::save_progress(c, &prog(a, ItemKind::Episode, "ep:a2", 1200.0, NOW - 1))?;
+        // the user said TV 2's Ronin is not the same title
+        tuner::store::titles::set_split(c, &mref(b, "b4"), true, NOW)
+    });
+    let plan = w(&s, move |c| copies::move_plan(c, a));
+    let moved: Vec<(&str, &str, MatchedBy)> = plan.items.iter().map(|m| (m.from.key.0.as_str(), m.to.key.0.as_str(), m.matched)).collect();
+    assert_eq!(moved, [("a1", "b1", MatchedBy::KeyYear), ("a5", "b5", MatchedBy::Tmdb)]);
+    let cannot: Vec<&str> = plan.cannot.iter().map(|(t, _)| t.as_str()).collect();
+    // (named as stored: these test rows keep the provider's name as their display name)
+    assert_eq!(cannot, ["1 channel favourite", "EN ★ Leo - 2023", "EN ★ Gold - 2022", "EN ★ Ronin - 1998"], "{:?}", plan.cannot);
+    assert_eq!((plan.waiting.clone(), plan.pending.clone()), (vec![sb], vec!["EN ★ Lost - 2004 S01E02".to_owned()]), "TV 2's episodes load first");
+    // TV 2's episodes arrive: the episode moves too
+    w(&s, move |c| import::store_series_details(c, sb, &details("b"), NOW));
+    let plan = w(&s, move |c| copies::move_plan(c, a));
+    assert!(plan.waiting.is_empty());
+    assert_eq!(plan.items.last().map(|m| (m.from.key.0.as_str(), m.to.key.0.as_str())), Some(("ep:a2", "ep:b2")));
+    // "Same title as…" counts: Gold joined with TV 2's Dune (silly, but the user said so)
+    w(&s, move |c| tuner::store::titles::join(c, &mref(a, "a3"), &mref(b, "b1"), NOW));
+    let plan = w(&s, move |c| copies::move_plan(c, a));
+    assert!(plan.items.iter().any(|m| m.from.key.0 == "a3" && m.to.key.0 == "b1" && m.matched == MatchedBy::Joined));
+    let items = plan.items.clone();
+    let done = w(&s, move |c| copies::move_titles(c, &items));
+    assert_eq!(done, copies::Moved { favourites: 2, progress: 2 }, "Gold's favourite lands on Dune, already there");
+    w(&s, move |c| sources::delete_source(c, a));
+    let favs: Vec<String> = user::fav_items(&r, list).unwrap().into_iter().map(|e| e.item.key.0).collect();
+    assert_eq!(favs, ["b1", "b5"], "TV's favourites now on TV 2's copies, in their places (Gold's lands on Dune, already there)");
+    let pos = |kind: ItemKind, key: &str| user::progress(&r, &ItemRef { source: b, kind, key: ItemKey(key.into()) }).unwrap().map(|p| p.position_s);
+    assert_eq!(pos(ItemKind::Movie, "b1"), Some(2480.0), "newer progress moved over the older");
+    assert_eq!(pos(ItemKind::Movie, "b4"), Some(900.0), "split copy untouched");
+    assert_eq!(pos(ItemKind::Episode, "ep:b2"), Some(1200.0), "the same episode of the other copy");
+}
+
 /// What the UI sends to play a combined movie: the first copy with the next as its fallback
 /// (or the copy the user picked, falling back to the best other one); after a failure mid-film
 /// the error card offers the next copy from where playback stopped — never a locked one while
