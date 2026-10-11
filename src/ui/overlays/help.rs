@@ -99,7 +99,9 @@ impl HelpOverlay {
     fn edit(&mut self, f: impl FnOnce(&mut String)) {
         f(&mut self.query);
         self.scroll = 0.0;
-        if !self.query.is_empty() && self.top.is_none() {
+        if self.query.is_empty() {
+            self.top = None; // re-centre (a resize or text-scale change may have moved it)
+        } else if self.top.is_none() {
             self.top = self.last_top;
         }
     }
@@ -213,12 +215,13 @@ impl Overlay for HelpOverlay {
         match action {
             Action::FilterInput('?') if self.query.is_empty() => return OverlayOutcome::Close,
             Action::FilterInput(c) if self.query.is_empty() && c.is_whitespace() => {}
-            Action::FilterInput(c) => self.edit(|q| q.push(c)),
+            // any whitespace (AltGr+Space types NBSP) becomes a plain space: word deletion cuts at ASCII spaces
+            Action::FilterInput(c) => self.edit(|q| q.push(if c.is_whitespace() { ' ' } else { c })),
             Action::FilterBackspace => self.edit(|q| {
                 q.pop();
             }),
             Action::FilterDeleteWord => self.edit(|q| {
-                let cut = q.trim_end().rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
+                let cut = q.trim_end().rfind(' ').map_or(0, |i| i + 1);
                 q.truncate(cut);
             }),
             // Esc ladder: clear the filter, then close (F1 too: it can't be typed)
@@ -252,7 +255,7 @@ impl Overlay for HelpOverlay {
             search_header(ui, theme, &self.query, "Type to filter keyboard shortcuts", Some(glyphs::SEARCH));
             ui.add_space(theme.space(SpaceToken::Xs));
             ui.horizontal(|ui| {
-                let count = if filtering { format!("{matched} of {total}") } else { format!("{total} shortcuts") };
+                let count = if filtering { format!("{matched} of {total} shortcuts") } else { format!("{total} shortcuts") };
                 ui.label(small(count));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(small(format!("↑/↓ scroll · Esc {}", if self.query.is_empty() { "close" } else { "clear" })));

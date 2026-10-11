@@ -850,7 +850,7 @@ const HINTS: &[(KeyContext, &[(Action, &str)])] = &[
     (KeyContext::Search, &[(A::Activate, "open"), (A::ActivateAlt, "details"), (A::FocusNext, "section"), (A::Back, "close")]),
     (KeyContext::TextInput, &[(A::Activate, "confirm"), (A::FocusNext, "next field"), (A::Back, "leave")]),
     (KeyContext::Modal, &[(A::Activate, "confirm"), (A::Back, "cancel")]),
-    (KeyContext::Help, &[(A::Activate, "close"), (A::FilterClear, "clear filter")]),
+    (KeyContext::Help, &[(A::Back, "clear / close"), (A::FilterClear, "clear filter")]),
 ];
 
 /// Hints of a filtering list inside a dialog or menu (Esc clears the filter there).

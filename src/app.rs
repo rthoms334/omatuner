@@ -1729,6 +1729,11 @@ mod tests {
         let t = typed(&mut rig, "/?");
         assert_eq!(rig.overlay_kinds(), [kind(OverlayRequest::Help)], "`/` and `?` are typed, not run");
         assert!(find(&t, "mute/?").is_some() && find(&t, "No matching shortcuts").is_some());
+        // NBSP (AltGr+Space) then Ctrl+Backspace deletes the word without splitting a char
+        typed(&mut rig, "\u{a0}x");
+        rig.press(Key::Backspace, CTRL);
+        typed(&mut rig, "y");
+        assert!(find(&typed(&mut rig, ""), "mute/? y").is_some());
         // Esc: clear, then close
         rig.press(Key::Escape, NONE);
         let t = texts(&rig.frame_with(vec![]));

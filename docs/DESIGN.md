@@ -1610,9 +1610,10 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
   its description or its section title ("guide" keeps the whole TV guide section). Results
   stay grouped by section in the same order (current contexts first) — the same key means
   different things per context, so a flat ranked list would lose that; empty sections are
-  hidden, matches are marked with the text-selection fill, a count reads "12 of 269", and no
-  match shows "No matching shortcuts". The card's top edge freezes once typing starts (it
-  shrinks downward only). Keys: Backspace / Ctrl+Backspace (word) / Ctrl+U edit; Esc and F1
+  hidden, matches are marked with the text-selection fill, a count reads "12 of 269
+  shortcuts", and no match shows "No matching shortcuts". The card's top edge freezes once
+  typing starts (it shrinks downward only) and re-centres when the filter is empty again;
+  typed whitespace (NBSP from AltGr+Space too) is stored as a plain space. Keys: Backspace / Ctrl+Backspace (word) / Ctrl+U edit; Esc and F1
   clear the filter, then close; `?` closes only while the filter is empty (otherwise it is
   typed); Enter closes; ↑/↓, PgUp/PgDn, Home/End scroll.
 * Jobs (Ctrl+J, `[List, Modal]`): running jobs with phase + progress; Delete cancels the
