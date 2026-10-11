@@ -3073,30 +3073,39 @@ egui's bundled emoji font has no flag sequences — the short code is shown as a
 **Grammar** (applied to the trimmed raw name; ASCII case-insensitive unless noted):
 1. Leading decoration is skipped: any run of characters that are neither letters/digits nor
    an opening bracket / pipe (`★ ✦ ◉ • ▎ # »` …).
-2. *Flag*: a leading pair of regional-indicator symbols → that country (`🇬🇧` → GB, `🇺🇸` →
-   US); the England / Scotland / Wales tag sequences (`🏴 + tags`) → GB.
+2. *Flag*: a leading pair of regional-indicator symbols → that country, read as an ISO code
+   first (`🇬🇧` → GB, `🇦🇷` → Argentina, not Arabic; `🇪🇺` → Europe via the synonyms); the
+   England / Scotland / Wales tag sequences (`🏴 + tags`) → GB.
 3. *Bracketed token* at the start: `[X]`, `(X)`, `{X}`, `|X|` (also `| X |`), where X is a
-   token below.
+   token or a flag (`[🇬🇧] Sports`).
 4. *Separated token* at the start: a token followed by optional spaces and a **separator** —
    any character that is not a letter, digit, space or one of `( & ' + .` (so `|`, `:`, `-`,
    `–`, `—`, `/`, `▎`, `✦`, `•`, `·`, `»`, `>`, `*`, `~`…). `"UK | Sports"`, `"UK: News"`,
-   `"UK - Docs"`, `"EN ▎Movies"`, `"UK ✦ Kids"`, `"UK/US Sports"` (first tag wins).
+   `"UK - Docs"`, `"EN ▎Movies"`, `"UK ✦ Kids"`, `"UK/US Sports"` (first tag wins). A `.` or a
+   `-` with no space before it and a letter after it joins words (`"Sci-Fi"`, `"No. 1"`) and
+   only separates after a short code accepted by rule 6 (`"UK-DOCS"`, `"UK.Sports"` → GB;
+   `"AL-JAZEERA"` stays untagged).
 5. *Whole name* is a token: `"ENGLISH"`, `"FRANCE"`, `"EX-YU"`, `"UK"`.
 6. *Space-only separator* (`"UK SPORTS"`, `"ARABIC NEWS"`) is accepted only for (a) full names
-   (≥ 4 letters: ENGLISH, FRANCE, ARABIC, LATINO, AFRICA…) and (b) codes written in upper case
-   in the raw name that are not English words (`AMBIGUOUS`: AM AN AS AT BE BY DO GO HE HI IF IN
-   IS IT ME MY NO OF ON OR SO TO UP WE, abbreviations such as AD AI DJ ID LA MC PR, the Arabic
-   article AL, three-letter words CAN SPA BRA PER MAR DEN FIN…). `"IT Crowd"`, `"Us Weekly"`,
-   `"In Cinemas"`, `"AL JAZEERA"` stay untagged; `"IT: Sport"` is Italy.
+   (≥ 4 letters: ENGLISH, FRANCE, ARABIC, LATINO, AFRICA…) — in mixed case only country and
+   region names, not languages or nationality adjectives (`DEMONYMS`: INDIAN BRITISH IRISH
+   AFRICAN ASIAN LATIN CARIBBEAN NORDIC), so `"Latino Peliculas"` is Latin America but
+   `"German Bundesliga"`, `"French Open"`, `"Indian Premier League"` stay untagged; (b) codes
+   written in upper case in the raw name: two-letter codes only from an allow-list of usual
+   IPTV prefixes (`SPACED_CODES`: UK GB US CA AU NZ IE EN AR DE FR ES PT NL TR GR RU … EU AF
+   YU), three-letter codes unless they are English words (`AMBIGUOUS`: CAN SPA BRA PER MAR DEN
+   FIN RUM…). `"IT Crowd"`, `"Us Weekly"`, `"In Cinemas"`, `"AL JAZEERA"`, `"BT Sport"`,
+   `"FA Cup"`, `"CL Matches"`, `"CH 5"` stay untagged; `"IT: Sport"` is Italy.
 7. *Non-tags* (and plain numbers) are skipped — bracketed, separated or followed by a space —
    and detection continues with the next token (at most 3 leading tokens): `4K 8K HD FHD UHD
    SD HDR HEVC H265 VIP PPV VOD NEW XXX ADULT 18+ 24/7 TV FM LIVE RADIO MULTI INT INTL
-   INTERNATIONAL WORLD TOP PREMIUM`. So `"VIP | UK | Sports"`, `"VIP UK | Sports"` and
+   INTERNATIONAL WORLD TOP PREMIUM EX`. So `"VIP | UK | Sports"`, `"VIP UK | Sports"` and
    `"[4K] UK: Movies"` → GB; `"4K | Sports"` → untagged; `"NEW ZEALAND"` → NZ (`ZEALAND` is
-   listed).
+   listed); `"EX YU"` → Ex-Yugoslavia.
 8. *Trailing* forms, only when nothing leads: a bracketed last token (`"Sports (UK)"`,
    `"Movies [EN]"`) or a separated last token (`"NETFLIX - EN"`, `"Sports | UK"`), trailing
-   non-tags skipped (`"Sports | UK | HD"`). No space-only form at the end.
+   non-tags skipped (`"Sports | UK | HD"`). No space-only form at the end; `PL` and `CL` are
+   not read at the end (`"Football | PL"` is the Premier League; `"PL | Polsat"` is Poland).
 9. A token is a tag only when it is in the tables below — unknown words never become tags
    (`"CNN: Live"`, `"SKY | Movies"`, `"NBA: Games"` are untagged). Tokens may contain one inner
    `-` or `/` when the whole is listed (`EX-YU`, `24/7`). A `-` between two letters is a
@@ -3115,7 +3124,7 @@ egui's bundled emoji font has no flag sequences — the short code is shown as a
 | FRENCH, GERMAN/DEUTSCH, ITALIAN, SPANISH/ESPANOL, PORTUGUESE, TURKISH, RUSSIAN, POLISH, HINDI/HIN, URDU/URD, TAMIL/TAM, TELUGU/TEL, PUNJABI, BANGLA/BENGALI, KURD/KURDISH/KU, PERSIAN/FARSI/PER/FA | `lang:…` |
 | LAT, LATIN, LATINO, LATINA, LATAM | `region:latam` |
 | EX-YU, EXYU, YU, BALKAN(S) | `region:exyu` |
-| AFR, AFRICA, AFRIKA, AFRICAN · ASIA, ASIAN · CARIB, CARIBBEAN · NORDIC, SCANDINAVIA, SCANDI · EU, EUROPE | `region:africa` · `asia` · `caribbean` · `nordic` · `europe` |
+| AF, AFR, AFRICA, AFRIKA, AFRICAN (`AF| NIGERIA`; Afghanistan is AFG) · ASIA, ASIAN · CARIB, CARIBBEAN · NORDIC, SCANDINAVIA, SCANDI · EU, EUROPE | `region:africa` · `asia` · `caribbean` · `nordic` · `europe` |
 
 Language names are not merged into countries (`FRENCH` ≠ `FR`): the picker lists both, and
 the defaults add the main language of the user's country (`country_language`, a small table:
@@ -3134,8 +3143,9 @@ FR→fr, DE/AT→de, ES/MX/AR…→es, IT→it, PT/BR→pt, NL→nl, TR→tr, PL
   editor opened before a picker save must not wipe it — same race as §27.3).
 * Per-group precedence (`library::apply_category_filter`): the user's hide
   (`GroupOverride::hidden`) > the user's show (`GroupOverride::shown`) > the rule > shown.
-  `Group::hidden` is the effective flag; `Group::filter` (`Kept` / `Hidden` / `Exempt`) says
-  what the rule did; `Group::tag` is the detected tag.
+  `Group::hidden` is the effective flag; `Group::user_hidden` is the user's own hide (kept
+  apart so a group hidden by both still counts as hidden by the user); `Group::filter`
+  (`Kept` / `Hidden` / `Exempt`) says what the rule did; `Group::tag` is the detected tag.
 * Hiding a group clears `shown`; showing a group sets `shown` only when the rule hides it
   (`store::user::hide_groups`, `show_group(…, exempt)`), so an unhidden group that the rule
   keeps does not become a permanent exception.
@@ -3149,7 +3159,9 @@ FR→fr, DE/AT→de, ES/MX/AR…→es, IT→it, PT/BR→pt, NL→nl, TR→tr, PL
   `grp.raw_name TEXT`, `group_override.shown INTEGER NOT NULL DEFAULT 0`). Groups imported
   before P6 have `raw_name` NULL until the next refresh; detection then falls back to `name`
   (finds tags only when smart names are off) and the picker shows "Refresh to find all
-  countries" (`CategorySummary::needs_refresh`).
+  countries" (`CategorySummary::needs_refresh`). A refresh that reaches such a group only
+  through an item (the provider no longer lists the category) stores `name` as its raw name,
+  since the real one cannot be learned; groups of a kind the refresh did not import stay NULL.
 * **Library build** (`store::library::load`, off the UI thread): `load_sources` parses
   `settings` → `SourceMeta::category_filter`; `GROUP_COLS` gains `g.raw_name` and `o.shown`;
   `group_from_row` sets `tag = detect_tag(raw_name ?? name)` and `filter = Exempt` when
@@ -3173,7 +3185,7 @@ FR→fr, DE/AT→de, ES/MX/AR…→es, IT→it, PT/BR→pt, NL→nl, TR→tr, PL
   to `keep`; toast "Arabic shown"), → expands the tag's categories in place (← collapses);
   Enter on a category row shows just that one (`show_group(…, exempt: true)`). A last row
   "Choose countries…" opens the picker.
-* **Hidden groups**: only groups the user hid (`hidden && filter != Hidden`), Enter unhides
+* **Hidden groups**: only groups the user hid (`user_hidden`), Enter unhides
   (`show_group(…, exempt: filter != Kept)`).
 * **Hidden channels**: only channels hidden by their own override, i.e. channels of
   `LiveIndex::hidden` that have at least one visible group or no group (a filtered source would

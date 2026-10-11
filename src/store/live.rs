@@ -111,6 +111,7 @@ pub(crate) fn group_from_row(r: &Row<'_>) -> rusqlite::Result<Group> {
         provider_order: r.get(6)?,
         user_order: r.get(7)?,
         hidden: r.get(8)?,
+        user_hidden: r.get(8)?,
         locked: r.get(9)?,
         item_count: u32_of(r.get(10)?),
         provider_id: r.get(11)?,

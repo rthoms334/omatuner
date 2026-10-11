@@ -641,6 +641,7 @@ fn synthetic_group(name: String, count: usize) -> Group {
         provider_order: 0,
         user_order: None,
         hidden: false,
+        user_hidden: false,
         locked: false,
         item_count: count as u32,
         provider_id: None,

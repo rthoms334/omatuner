@@ -102,6 +102,7 @@ const SYNONYMS: &[(&str, &[&str])] = &[
     ("BD", &["BGD", "BANGLADESH"]),
     ("LK", &["LKA"]),
     ("NP", &["NPL", "NEPAL"]),
+    // `AF` is Africa (below): panels use `AF| NIGERIA`; Afghan categories use `AFG`
     ("AF", &["AFG", "AFGHANISTAN"]),
     ("SY", &["SYR", "SYRIA"]),
     ("LB", &["LBN", "LEBANON"]),
@@ -155,7 +156,7 @@ const SYNONYMS: &[(&str, &[&str])] = &[
     ("lang:hy", &["ARMENIAN"]),
     ("region:latam", &["LAT", "LATIN", "LATINO", "LATINA", "LATAM"]),
     ("region:exyu", &["EX-YU", "EXYU", "YU", "BALKAN", "BALKANS"]),
-    ("region:africa", &["AFR", "AFRICA", "AFRIKA", "AFRICAN"]),
+    ("region:africa", &["AF", "AFR", "AFRICA", "AFRIKA", "AFRICAN"]),
     ("region:asia", &["ASI", "ASIA", "ASIAN"]),
     ("region:caribbean", &["CARIB", "CARIBBEAN"]),
     ("region:nordic", &["NORDIC", "NORDICS", "SCANDINAVIA", "SCANDI"]),
@@ -195,16 +196,34 @@ const NON_TAGS: &[&str] = &[
     "WORLD",
     "TOP",
     "PREMIUM",
+    // `EX YU`: the `YU` after it is the tag
+    "EX",
 ];
 
-/// Codes that are also English words (or common abbreviations): not tags when followed by a
-/// space only (`"IT Crowd"`, `"IN CINEMAS"`, `"AL JAZEERA"`), still tags with a separator
-/// (`"IT: Sport"`).
-const AMBIGUOUS: &[&str] = &[
-    "AD", "AI", "AL", "AM", "AN", "AS", "AT", "BE", "BY", "CC", "CV", "DJ", "DO", "GO", "HE", "HI", "ID", "IF", "IN", "IS", "IT", "LA", "MA", "MC",
-    "MD", "ME", "MS", "MY", "NA", "NO", "OF", "ON", "OR", "PA", "PE", "PM", "PR", "PS", "SO", "ST", "TO", "UP", "VI", "WE", "ARM", "BRA", "CAN",
-    "CHI", "COL", "DEN", "EST", "FIN", "GEO", "KEN", "MAR", "PER", "ROM", "SEN", "SPA", "TAM", "TEL", "TUN",
+/// Two-letter codes that count when followed by a space only (`"UK SPORTS"`) or joined by `.` /
+/// an unspaced `-` (`"UK.Sports"`, `"UK-DOCS"`): the usual IPTV prefixes. Any other two-letter
+/// code needs a separator or a bracket — too many are words, brands or competitions (`"IT
+/// Crowd"`, `"IN CINEMAS"`, `"AL JAZEERA"`, `"BT Sport"`, `"FA Cup"`, `"CL Matches"`, `"CH 5"`,
+/// `"MK Dons"`, `"EE TV"`).
+const SPACED_CODES: &[&str] = &[
+    "UK", "GB", "US", "CA", "AU", "NZ", "IE", "EN", "AR", "DE", "FR", "ES", "PT", "NL", "TR", "GR", "RU", "UA", "RO", "BG", "HU", "CZ", "SK", "RS",
+    "SI", "DK", "FI", "IL", "IR", "IQ", "EG", "LB", "JO", "KW", "QA", "AE", "PK", "BD", "LK", "NP", "PH", "TH", "VN", "JP", "KR", "CN", "TW", "HK",
+    "MX", "BR", "VE", "UY", "NG", "GH", "KE", "ZA", "AZ", "KZ", "EU", "AF", "YU",
 ];
+
+/// Three-letter codes that are also English words: not tags with a space only or `.` / `-`
+/// joined (`"CAN SPORTS"`), still tags with a separator (`"CAN | Sports"`).
+const AMBIGUOUS: &[&str] =
+    &["ARM", "BRA", "CAN", "CHI", "COL", "DEN", "EST", "FIN", "GEO", "KEN", "MAR", "PER", "ROM", "RUM", "SEN", "SPA", "TAM", "TEL", "TUN"];
+
+/// Full names that are adjectives: with a space only, a tag only in capitals (`"INDIAN
+/// MOVIES"`), not in a title (`"Indian Premier League"`, `"African Cup"`). Language names are
+/// treated the same (`"German Bundesliga"`, `"French Open"`).
+const DEMONYMS: &[&str] = &["INDIAN", "BRITISH", "IRISH", "AFRICAN", "ASIAN", "LATIN", "CARIBBEAN", "NORDIC"];
+
+/// Codes not read at the end (`"Football | PL"`, `"Highlights - CL"`: Premier / Champions
+/// League). At the start they stay countries (`"PL | Polsat"`).
+const NOT_TRAILING: &[&str] = &["PL", "CL"];
 
 /// Leading / trailing tokens looked at (non-tags before the tag included).
 const MAX_TOKENS: usize = 3;
@@ -285,6 +304,19 @@ fn regional(c: char) -> Option<char> {
 
 const BLACK_FLAG: char = '\u{1F3F4}';
 
+/// A flag's letters are an ISO code first (`🇦🇷` is Argentina, not Arabic), else a synonym
+/// (`🇪🇺` → Europe).
+fn flag_tag(code: &str) -> Option<CategoryTag> {
+    if ISO2.split_ascii_whitespace().any(|cc| cc == code) {
+        return Some(CategoryTag::country(code));
+    }
+    classify(code).tag()
+}
+
+fn is_flag_start(c: char) -> bool {
+    regional(c).is_some() || c == BLACK_FLAG
+}
+
 /// Byte length of the leading run of letters / digits.
 fn alnum_len(s: &str) -> usize {
     s.char_indices().find(|(_, c)| !c.is_alphanumeric()).map_or(s.len(), |(i, _)| i)
@@ -344,13 +376,23 @@ fn last_word(s: &str) -> Option<(&str, &str)> {
     Some((before, &s[start..]))
 }
 
-/// The words of a bracket: a tag when every word is a tag or a non-tag (`[UK]`, `[VIP UK]`,
-/// first tag wins), a non-tag when all are non-tags (`[4K]`), unknown otherwise (`[In Cinemas]`).
+/// The words of a bracket: a tag when every word is a tag, a flag or a non-tag (`[UK]`,
+/// `[VIP UK]`, `[🇬🇧]`, first tag wins), a non-tag when all are non-tags (`[4K]`), unknown
+/// otherwise (`[In Cinemas]`).
 fn classify_inner(inner: &str) -> Token {
     let mut found = Token::NonTag;
     let mut rest = inner;
     loop {
-        rest = rest.trim_start_matches(|c: char| !c.is_alphanumeric());
+        rest = rest.trim_start_matches(|c: char| !c.is_alphanumeric() && !is_flag_start(c));
+        if let Some((tag, after)) = flag(rest) {
+            if let Some(t) = tag
+                && !matches!(found, Token::Tag(_))
+            {
+                found = Token::Tag(t);
+            }
+            rest = after;
+            continue;
+        }
         let Some((word, after)) = first_word(rest) else { break };
         match classify(word) {
             Token::Unknown => return Token::Unknown,
@@ -370,7 +412,7 @@ fn flag(s: &str) -> Option<(Option<CategoryTag>, &str)> {
     if let Some(a) = regional(first) {
         let rest = &s[first.len_utf8()..];
         return Some(match chars.next().and_then(regional) {
-            Some(b) => (classify(&format!("{a}{b}")).tag(), &rest[4..]),
+            Some(b) => (flag_tag(&format!("{a}{b}")), &rest[4..]),
             None => (None, rest),
         });
     }
@@ -399,7 +441,7 @@ fn flag(s: &str) -> Option<(Option<CategoryTag>, &str)> {
 fn skip_decoration(s: &str) -> &str {
     let mut rest = s;
     while let Some(c) = rest.chars().next() {
-        if c.is_alphanumeric() || regional(c).is_some() || c == BLACK_FLAG || (closer(c).is_some() && bracketed(rest).is_some()) {
+        if c.is_alphanumeric() || is_flag_start(c) || (closer(c).is_some() && bracketed(rest).is_some()) {
             break;
         }
         rest = &rest[c.len_utf8()..];
@@ -407,10 +449,27 @@ fn skip_decoration(s: &str) -> &str {
     rest
 }
 
-/// A code followed by a space only counts when it cannot be an ordinary word: full names
-/// (4+ letters) always, codes only in capitals and not in [`AMBIGUOUS`].
-fn space_separated_ok(word: &str) -> bool {
-    word.chars().count() >= 4 || (!word.chars().any(char::is_lowercase) && !AMBIGUOUS.contains(&word.to_uppercase().as_str()))
+/// A code joined to the rest by `.` or an unspaced `-` (`"UK.Sports"`, `"UK-DOCS"`) or followed
+/// by a space only: in capitals, and a usual prefix ([`SPACED_CODES`]) or a three-letter code
+/// that is not a word ([`AMBIGUOUS`]).
+fn short_code_ok(word: &str) -> bool {
+    !word.chars().any(char::is_lowercase)
+        && match word.chars().count() {
+            2 => SPACED_CODES.contains(&word),
+            3 => !AMBIGUOUS.contains(&word),
+            _ => false,
+        }
+}
+
+/// A tag followed by a space only counts when it cannot be an ordinary word: a short code per
+/// [`short_code_ok`], or a full name (4+ letters) — in mixed case only a country or region
+/// name, not a language or a nationality adjective (`"Latino Peliculas"` yes, `"German
+/// Bundesliga"`, `"Indian Premier League"` no).
+fn space_separated_ok(word: &str, tag: &CategoryTag) -> bool {
+    if word.chars().count() < 4 {
+        return short_code_ok(word);
+    }
+    !word.chars().any(char::is_lowercase) || (tag.kind() != TagKind::Language && !DEMONYMS.contains(&word.to_uppercase().as_str()))
 }
 
 /// A `-` between two letters is a hyphenated word (`Sci-Fi`, `Re-Runs`, `Al-Jazeera`), not a
@@ -447,13 +506,18 @@ fn leading(name: &str) -> Option<CategoryTag> {
         match next.chars().next() {
             // the whole (remaining) name: `ENGLISH`, `VIP | UK`
             None => return classify(word).tag(),
-            Some(c) if is_separator(c) && !(c == '-' && !spaced && hyphenated(word, &next[1..])) => match classify(word) {
-                Token::Tag(t) => return Some(t),
-                Token::NonTag => rest = next,
-                Token::Unknown => return None,
-            },
+            Some(c) if is_separator(c) || (c == '.' && !spaced) => {
+                // `UK-DOCS`, `UK.Sports`: only a short code joins the next word (`Sci-Fi`,
+                // `Al-Jazeera`, `No. 1` are words)
+                let joined = !spaced && (c == '.' || (c == '-' && hyphenated(word, &next[1..])));
+                match classify(word) {
+                    Token::Tag(t) if !joined || short_code_ok(word) => return Some(t),
+                    Token::NonTag if !joined => rest = next,
+                    Token::Tag(_) | Token::NonTag | Token::Unknown => return None,
+                }
+            }
             Some(_) if spaced => match classify(word) {
-                Token::Tag(t) => return space_separated_ok(word).then_some(t),
+                Token::Tag(t) => return space_separated_ok(word, &t).then_some(t),
                 // `VIP UK | Sports`, `4K UHD | UK`, `NEW ZEALAND`
                 Token::NonTag => rest = next,
                 Token::Unknown => return None,
@@ -488,7 +552,7 @@ fn trailing(name: &str) -> Option<CategoryTag> {
             return None;
         }
         match classify(word) {
-            Token::Tag(t) => return Some(t),
+            Token::Tag(t) => return (!NOT_TRAILING.contains(&word.to_uppercase().as_str())).then_some(t),
             Token::NonTag => rest = head.trim_end(),
             Token::Unknown => return None,
         }
@@ -761,6 +825,8 @@ mod tests {
             ("🇫🇷", Some("FR")),
             ("🏴\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F} Football", Some("GB")),
             ("🇪🇺 Euro News", Some("region:europe")),
+            ("🇦🇷 Futbol", Some("AR")),
+            ("[🇬🇧] Sports", Some("GB")),
             // whole names, full names with a space only, upper-case codes with a space only
             ("ENGLISH", Some("lang:en")),
             ("FRANCE", Some("FR")),
@@ -780,6 +846,11 @@ mod tests {
             ("[VIP UK] Football", Some("GB")),
             ("VIP UK | Sports", Some("GB")),
             ("NEW ZEALAND: Sport", Some("NZ")),
+            // joined by `.` or an unspaced `-` (usual prefixes only)
+            ("UK-DOCS", Some("GB")),
+            ("UK-Sky Sports", Some("GB")),
+            ("UK.Sports", Some("GB")),
+            ("UK. Sports", Some("GB")),
             // trailing forms
             ("Sports (UK)", Some("GB")),
             ("Movies [EN]", Some("lang:en")),
@@ -797,6 +868,9 @@ mod tests {
             ("ARGENTINA", Some("AR")),
             ("YU: Filmovi", Some("region:exyu")),
             ("EXYU | Sport", Some("region:exyu")),
+            ("EX YU Filmovi", Some("region:exyu")),
+            ("AF| NIGERIA", Some("region:africa")),
+            ("PL | Polsat", Some("PL")),
             ("GER | Sport", Some("DE")),
             ("DEUTSCHLAND", Some("DE")),
             ("TÜRKIYE: Diziler", Some("TR")),
@@ -815,6 +889,17 @@ mod tests {
             ("IN CINEMAS", None),
             ("AL JAZEERA", None),
             ("Al-Jazeera", None),
+            ("AL-JAZEERA", None),
+            ("No. 1 Hits", None),
+            // brands and competitions (a UK user's defaults would hide them)
+            ("BT Sport", None),
+            ("BT SPORT", None),
+            ("FA Cup", None),
+            ("CL Matches", None),
+            ("CH 5", None),
+            ("Football | PL", None),
+            ("German Bundesliga", None),
+            ("Indian Premier League", None),
             ("Movies: Sci-Fi", None),
             ("Re-Runs", None),
             ("UK's Best", None),

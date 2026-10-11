@@ -1206,6 +1206,7 @@ fn category_filter_hides_tagged_groups_everywhere_and_follows_refreshes() {
     let lib = library::load(&r).unwrap();
     let (ar, uk) = (group(&lib, "AR | News"), group(&lib, "UK | News"));
     assert_eq!((ar.filter, ar.hidden, uk.filter, uk.hidden), (GroupFilter::Hidden, true, GroupFilter::Kept, true));
+    assert!(ar.user_hidden && uk.user_hidden, "the user's hide stays visible under the rule's");
     let ov = w(&s, |c| user::group_overrides(c));
     assert!(ov.iter().all(|o| o.ov.hidden && !o.ov.shown), "{ov:?}");
     assert_eq!(visible(&lib), [id(&lib, "m3u:sp1")].into());
@@ -1220,6 +1221,13 @@ fn category_filter_hides_tagged_groups_everywhere_and_follows_refreshes() {
     assert_eq!(src_now.settings.category_filter, Some(rule));
     let lib = library::load(&r).unwrap();
     assert!(group(&lib, "|FR| Info").hidden, "still filtered after the editor saves");
+
+    // a group imported before raw names were stored: "needs refresh", and detection reads the
+    // (smart-cleaned, untagged) display name, so the rule keeps it as untagged
+    w(&s, move |c| Ok(c.execute("UPDATE grp SET raw_name = NULL WHERE source_id = ?1 AND name = 'Info'", [src])?));
+    assert!(library::category_summary(&r, src).unwrap().needs_refresh);
+    let fr = group(&library::load(&r).unwrap(), "|FR| Info");
+    assert_eq!((fr.tag, fr.filter, fr.hidden), (None, GroupFilter::Kept, false));
 }
 
 // ------------------------------------------------------------------ deletion

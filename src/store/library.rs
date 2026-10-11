@@ -402,7 +402,7 @@ fn load_groups(conn: &Connection, sources: &[SourceMeta]) -> Result<(Vec<Group>,
 }
 
 /// Apply a source's category filter to one of its groups, loaded with its override flags
-/// (`hidden` = the user's hide; `filter` = `Exempt` when the override has `shown`, else `Kept`).
+/// (`user_hidden`; `filter` = `Exempt` when the override has `shown`, else `Kept`).
 /// Precedence (DESIGN §28.3): the user's hide > the user's show > the rule. Afterwards
 /// `hidden` is the effective flag and `filter` says what the rule did.
 pub fn apply_category_filter(g: &mut Group, filter: Option<&CategoryFilter>) {
@@ -412,7 +412,7 @@ pub fn apply_category_filter(g: &mut Group, filter: Option<&CategoryFilter>) {
         (true, GroupFilter::Exempt) => GroupFilter::Exempt,
         (true, _) => GroupFilter::Hidden,
     };
-    g.hidden |= g.filter == GroupFilter::Hidden;
+    g.hidden = g.user_hidden || g.filter == GroupFilter::Hidden;
 }
 
 /// Per-tag summary of one source's categories (all kinds, the source enabled or not) for the

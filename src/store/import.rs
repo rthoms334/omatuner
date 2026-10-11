@@ -317,8 +317,12 @@ fn resolve_groups(
         let id = match map.get(&k.0) {
             Some(id) => *id,
             None => {
+                // a group the provider no longer lists: its raw name cannot be learned any more, so
+                // a pre-P6 one keeps its display name as raw name (no endless "needs refresh")
                 let kept: Option<GroupId> = conn
-                    .prepare_cached("UPDATE grp SET seen_gen = ?4 WHERE source_id = ?1 AND kind = ?2 AND key = ?3 RETURNING id")?
+                    .prepare_cached(
+                        "UPDATE grp SET seen_gen = ?4, raw_name = COALESCE(raw_name, name) WHERE source_id = ?1 AND kind = ?2 AND key = ?3 RETURNING id",
+                    )?
                     .query_row(params![imp.source, kind.as_str(), k.0, imp.generation], |r| r.get(0))
                     .optional()?;
                 let id = match kept {
