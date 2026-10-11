@@ -262,8 +262,9 @@ impl MovieDetailScreen {
                     items.push(MenuItem { shortcut: None, ..mi(glyphs::CLOSE, "Not the same title", Action::Digit(super::copies::CARD_SPLIT), "") });
                     self.copies.aim_at_page();
                 }
-                // combine it with a title the matcher kept apart (DESIGN §29.16)
-                if crate::ui::stacks::combine(ctx.config) {
+                // combine it with a title the matcher kept apart (DESIGN §29.16; two movie
+                // playlists or more)
+                if crate::ui::stacks::combine(ctx.config) && ctx.lib.eligible(ItemKind::Movie).len() > 1 {
                     items.push(MenuItem { shortcut: None, ..mi(glyphs::PLAYLIST, "Same title as…", Action::Digit(super::copies::SAME_TITLE), "") });
                 }
                 items.extend([
@@ -1042,7 +1043,7 @@ pub(crate) mod tests {
         // ★ off: every copy leaves Favourites; Undo puts Bravo's back
         h.state_mut().act(Action::ToggleFavourite);
         let toast = h.state_mut().undo_toast().expect("an Undo toast");
-        assert_eq!(toast.text, "Removed from Favourites");
+        assert_eq!(toast.text, "Removed from Favourites in Alpha and Bravo");
         assert!(fav_rows(&h).is_empty());
         let Some((_, undo)) = toast.action else { unreachable!() };
         h.state_mut().act(undo);
@@ -1068,7 +1069,7 @@ pub(crate) mod tests {
         // ✓ off: every copy's progress is forgotten, Undo restores both rows
         h.state_mut().act(Action::MarkWatched);
         let toast = h.state_mut().undo_toast().expect("an Undo toast");
-        assert_eq!(toast.text, "Removed from Continue watching");
+        assert_eq!(toast.text, "Marked unwatched in Alpha and Bravo");
         let progress_of = |h: &H, s: SourceId| crate::store::user::progress(&reader(h), &copy(s)).unwrap();
         assert!(progress_of(&h, a).is_none() && progress_of(&h, b).is_none());
         let Some((_, undo)) = toast.action else { unreachable!() };
@@ -1098,9 +1099,12 @@ pub(crate) mod tests {
         let app = h.state_mut();
         let p = app.t.config.parental.clone();
         assert!(app.t.parental.unlock("1234", &p));
+        h.state_mut().t.toasts.clear();
         h.state_mut().act(Action::ToggleLock);
         let ov = |h: &H, s: SourceId| crate::store::user::item_override(&reader(h), &copy(s)).unwrap().unwrap_or_default();
         until(&mut h, "both copies locked", |h| ov(h, a).locked && ov(h, b).locked);
+        let toast = h.state_mut().undo_toast().expect("an Undo toast");
+        assert_eq!(toast.text, "Locked Dune in Alpha and Bravo");
         // Ctrl+H: every copy hidden, the toast names both playlists
         h.state_mut().t.toasts.clear();
         h.state_mut().act(Action::ToggleHidden);

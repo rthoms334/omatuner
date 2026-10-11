@@ -1133,8 +1133,11 @@ combined (Settings ▸ Interface). Undo toasts last 8 s.
     copy you never opened (episodes not loaded yet) and mark a season watched in TV's copy.
   - **Expect:** TV's page shows that episode watched and opens at the next one; the season mark
     covers both copies (open TV 2's page to check) and Undo restores both. With the unloaded
-    copy the page says "Loading the other copy's episodes to mark them too…", then marks both;
-    with the network off it marks TV's and the toast names TV 2.
+    copy TV's episodes are marked at once ("Marked S01 watched in TV"), the page says "Loading
+    the other copy's episodes to mark them too…", then TV 2's are marked (a second toast); with
+    the network off a warning names TV 2. Stop TV 2's copy halfway through an episode, then on
+    TV's page (pin TV: Always play from TV) the button says "Resume S01E0x mm:ss" and plays TV's
+    copy from there.
 - [ ] **Same title as…:**
   - **Do:** find a film that shows twice in All (different names, or a copy without a year).
     On one card ▸ menu ▸ *Same title as…*, type the other's name, Enter. Click Undo. Do it again,
@@ -1147,9 +1150,11 @@ combined (Settings ▸ Interface). Undo toasts last 8 s.
 - [ ] **Deleting a playlist moves your data (use a throwaway copy of a playlist):**
   - **Do:** add a second copy of TV (Settings ▸ Playlists ▸ add, same login, name "TV old"),
     favourite two films and watch one halfway in "TV old", plus an episode of a series. Delete
-    "TV old": read the dialog, tick *Move favourites and progress…*, press Delete. Repeat with
-    the box unticked on another throwaway playlist.
-  - **Expect:** the box is unticked at first; the dialog lists "Title (year) → TV · ★ · 41:20"
+    "TV old": read the dialog, press ↑ three times and Enter (it ticks *Move favourites,
+    progress and watched marks…*), press Delete. Repeat with the box unticked on another
+    throwaway playlist.
+  - **Expect:** the box is unticked at first and ↑ never wraps onto Delete; the subtitle says
+    "This can't be undone."; the dialog lists "Title (year) → TV · ★ · 41:20"
     and what can't move (channel favourites, titles without a copy elsewhere); ticking it loads
     the other series copy's episodes first (a spinner, Delete waits). After Delete the toast
     says how much moved; TV's copies are favourites with the same progress, the episode too.
@@ -1160,6 +1165,7 @@ combined (Settings ▸ Interface). Undo toasts last 8 s.
     with the session locked; hide TV 2's copy.
   - **Expect:** the preview shows `Also on ● TV 2 (FHD)` (the quality when known), the hint line
     "Ctrl+O also on"; a click plays TV 2's copy in the preview while the cursor stays on TV's;
-    the locked one shows the lock and asks for the PIN; a hidden one, a different channel with
+    the chip of the channel playing shows ▶ (no focus ring); Ctrl+O works in Compact too (no
+    preview); the locked one shows the lock and asks for the PIN; a hidden one, a different channel with
     the same name but another tvg-id, and explicit channels with the session locked are never
     offered. Nothing ever switches channel by itself.

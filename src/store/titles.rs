@@ -227,6 +227,17 @@ pub fn unjoin(conn: &Connection, item: &ItemRef) -> Result<()> {
     Ok(())
 }
 
+/// Drop join groups left with fewer than two copies (a deleted playlist took the others, or a
+/// backup merge whose rows met joins already here): Settings ▸ Hidden would list a join with
+/// nobody. Returns how many rows went.
+pub fn prune_joins(conn: &Connection) -> Result<usize> {
+    Ok(conn.execute(
+        "DELETE FROM title_link WHERE action = 'join' AND (join_group IS NULL OR join_group IN
+           (SELECT join_group FROM title_link WHERE action = 'join' GROUP BY join_group HAVING count(*) < 2))",
+        [],
+    )?)
+}
+
 /// The join group of a copy.
 pub fn group_of(conn: &Connection, item: &ItemRef) -> Result<Option<i64>> {
     let Some(kind) = vod_kind_str(item.kind) else { return Ok(None) };

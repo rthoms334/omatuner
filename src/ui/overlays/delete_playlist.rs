@@ -47,13 +47,15 @@ pub struct DeletePlaylistOverlay {
     token: u64,
     loader: Option<Loader<MovePlan>>,
     plan: Option<MovePlan>,
-    /// "Move favourites and progress…" (off until the user ticks it).
+    /// "Move favourites, progress and watched marks…" (off until the user ticks it).
     pub(crate) tick: bool,
     fetch: crate::ui::copies::EpisodeFetch,
     /// Playlists whose series copies couldn't load their episodes.
     failed: Vec<String>,
     focus: Focus,
     started: bool,
+    /// Reading the plan failed: the dialog says so (Delete removes everything).
+    plan_failed: bool,
 }
 
 impl DeletePlaylistOverlay {
@@ -68,6 +70,7 @@ impl DeletePlaylistOverlay {
             failed: Vec::new(),
             focus: Focus::Cancel,
             started: false,
+            plan_failed: false,
         }
     }
 
@@ -83,6 +86,11 @@ impl DeletePlaylistOverlay {
     /// The move section shows: the playlist has favourites or progress to talk about.
     fn offers(&self) -> bool {
         self.plan.as_ref().is_some_and(|p| !p.is_empty())
+    }
+
+    /// The "Move …" box shows: something can move (now, or once episodes load).
+    fn can_move(&self) -> bool {
+        self.plan.as_ref().is_some_and(|p| !p.items.is_empty() || !p.pending.is_empty())
     }
 
     /// Delete waits for the plan (when moving) and for episodes being loaded.
@@ -131,13 +139,15 @@ impl DeletePlaylistOverlay {
     }
 
     fn focus_order(&self) -> Vec<Focus> {
-        if self.offers() { vec![Focus::Move, Focus::Cancel, Focus::Delete] } else { vec![Focus::Cancel, Focus::Delete] }
+        if self.can_move() { vec![Focus::Move, Focus::Cancel, Focus::Delete] } else { vec![Focus::Cancel, Focus::Delete] }
     }
 
+    /// Move the focus; it stops at the ends (never wraps from the box onto Delete).
     fn step(&mut self, by: isize) {
         let order = self.focus_order();
         let at = order.iter().position(|f| *f == self.focus).unwrap_or(0) as isize;
-        self.focus = order[(at + by).rem_euclid(order.len() as isize) as usize];
+        let to = (at + by).clamp(0, order.len() as isize - 1);
+        self.focus = order[to as usize];
     }
 }
 
@@ -147,10 +157,14 @@ fn moved_text(m: crate::store::copies::Moved) -> String {
     format!("{} and {}", n(m.favourites, "favourite", "favourites"), n(m.progress, "progress mark", "progress marks"))
 }
 
-/// "Dune (2021) → TV 2 · ★ · 41:20".
+/// "Dune (2021) → TV 2 · ★ · 41:20" ("… → TV 2: Dune: Part One (2021) · ★" when the copy
+/// reads differently).
 fn item_line(ctx: &UiCtx<'_>, m: &MoveItem) -> String {
     let to = ctx.lib.source(m.to.source).map_or("another playlist", |s| s.name.as_str());
-    let mut parts = vec![format!("{} → {to}", m.title)];
+    let mut parts = vec![match &m.to_title {
+        Some(t) => format!("{} → {to}: {t}", m.title),
+        None => format!("{} → {to}", m.title),
+    }];
     if !m.lists.is_empty() {
         parts.push("★".to_owned());
     }
@@ -208,6 +222,7 @@ impl Overlay for DeletePlaylistOverlay {
             Some(Err(e)) => {
                 tracing::warn!("delete playlist: {e}");
                 self.plan = Some(MovePlan::default());
+                self.plan_failed = true;
             }
             None => {}
         }
@@ -237,12 +252,20 @@ impl Overlay for DeletePlaylistOverlay {
                 ui,
                 theme,
                 &format!("Delete {name}?"),
-                Some("Its channels, movies, series and guide are removed — and with them its favourites, progress and watched marks."),
+                Some(
+                    "Its channels, movies, series and guide are removed — and with them its favourites, progress and watched marks. This can't be undone.",
+                ),
             );
             if let Some(plan) = self.plan.as_ref().filter(|_| offers) {
+                // titles concealed while the session is locked (explicit content) move like
+                // the others but are never named
+                let shown = |r: Option<&crate::model::ItemRef>| r.is_none_or(|r| !ctx.lib.conceals(r));
+                let items: Vec<&MoveItem> = plan.items.iter().filter(|m| shown(Some(&m.title_ref))).collect();
+                let cannot: Vec<_> = plan.cannot.iter().filter(|c| shown(c.title_ref.as_ref())).collect();
+                let unnamed = plan.items.len() - items.len() + plan.cannot.len() - cannot.len();
                 ui.add_space(theme.space(SpaceToken::Lg));
-                if !plan.items.is_empty() || !plan.pending.is_empty() {
-                    let label = "Move favourites and progress to the same titles in other playlists";
+                if self.can_move() {
+                    let label = "Move favourites, progress and watched marks to the same titles in other playlists";
                     tick_clicked = toggle(ui, theme, &mut tick, label, self.focus == Focus::Move).clicked();
                 }
                 let small = |ui: &mut egui::Ui, text: String, color| {
@@ -259,11 +282,11 @@ impl Overlay for DeletePlaylistOverlay {
                         ),
                         t.text_secondary,
                     );
-                    for m in plan.items.iter().take(SHOWN) {
+                    for m in items.iter().take(SHOWN) {
                         small(ui, format!("  {}", item_line(ctx, m)), if self.tick { t.fg } else { t.text_secondary });
                     }
-                    if n > SHOWN {
-                        small(ui, format!("  and {} more", n - SHOWN), t.text_secondary);
+                    if items.len() > SHOWN {
+                        small(ui, format!("  and {} more", items.len() - SHOWN), t.text_secondary);
                     }
                 }
                 if let Some((done, n)) = fetching {
@@ -275,23 +298,35 @@ impl Overlay for DeletePlaylistOverlay {
                 } else if !plan.pending.is_empty() {
                     ui.add_space(theme.space(SpaceToken::Sm));
                     let n = plan.pending.len();
-                    let why = if self.failed.is_empty() {
-                        "move once the other copy's episodes are loaded (tick the box to load them)".to_owned()
+                    let text = if self.failed.is_empty() {
+                        let what = if n == 1 { "1 episode will move".to_owned() } else { format!("{n} episodes will move") };
+                        format!("{what} once the other copy's episodes load (tick the box to load them)")
                     } else {
-                        format!("can't move: {} couldn't load the episodes", self.failed.join(", "))
+                        let what = if n == 1 { "1 episode".to_owned() } else { format!("{n} episodes") };
+                        format!("{what} can't move: {} couldn't load the episodes", self.failed.join(", "))
                     };
-                    small(ui, format!("{} {why}", if n == 1 { "1 episode".to_owned() } else { format!("{n} episodes") }), t.text_secondary);
+                    small(ui, text, t.text_secondary);
                 }
-                if !plan.cannot.is_empty() {
+                if !cannot.is_empty() {
                     ui.add_space(theme.space(SpaceToken::Sm));
                     small(ui, "Can't move:".to_owned(), t.text_secondary);
-                    for (what, why) in plan.cannot.iter().take(SHOWN) {
-                        small(ui, format!("  {what} — {why}"), t.text_disabled);
+                    for c in cannot.iter().take(SHOWN) {
+                        small(ui, format!("  {} — {}", c.what, c.why), t.text_disabled);
                     }
-                    if plan.cannot.len() > SHOWN {
-                        small(ui, format!("  and {} more", plan.cannot.len() - SHOWN), t.text_disabled);
+                    if cannot.len() > SHOWN {
+                        small(ui, format!("  and {} more", cannot.len() - SHOWN), t.text_disabled);
                     }
                 }
+                if unnamed > 0 {
+                    small(ui, format!("And {unnamed} hidden {} (unlock to see them)", if unnamed == 1 { "title" } else { "titles" }), t.text_disabled);
+                }
+            } else if self.plan_failed {
+                ui.add_space(theme.space(SpaceToken::Sm));
+                ui.label(
+                    RichText::new("Couldn't look for copies in your other playlists — Delete removes everything.")
+                        .size(theme.font(TypeToken::BodySmall))
+                        .color(t.text_secondary),
+                );
             } else if self.plan.is_none() {
                 ui.add_space(theme.space(SpaceToken::Sm));
                 ui.label(
@@ -358,7 +393,7 @@ mod tests {
         let mut h = overlay_harness(t, one, DeletePlaylistOverlay::new(a, 7), egui::vec2(1200.0, 900.0));
         until_ov(&mut h, "the plan", |h| h.state().o.plan.is_some());
         h.run_steps(1);
-        assert!(has_label(&h, "Move favourites and progress to the same titles in other playlists"));
+        assert!(has_label(&h, "Move favourites, progress and watched marks to the same titles in other playlists"));
         assert!(!h.state().o.tick, "unticked by default");
         assert!(has_label(&h, "  Dune (2021) → TV 2 · ★ · 41:20"));
         assert!(has_label_containing(&h, "Gold (2022) — no copy in another playlist"));
@@ -407,7 +442,7 @@ mod tests {
         let mut h = overlay_harness(t, one, DeletePlaylistOverlay::new(a, 9), egui::vec2(1200.0, 900.0));
         until_ov(&mut h, "the plan", |h| h.state().o.plan.is_some());
         h.run_steps(1);
-        assert!(has_label_containing(&h, "1 episode move once the other copy's episodes are loaded"));
+        assert!(has_label_containing(&h, "1 episode will move once the other copy's episodes load"));
         h.state_mut().act(Action::Up);
         h.state_mut().act(Action::Activate);
         assert!(h.state().o.fetch.busy() && !h.state().o.can_delete(), "Delete waits for the episodes");
@@ -430,6 +465,68 @@ mod tests {
         let r = h.state().t.services().store.reader().unwrap();
         let moved = ItemRef { source: b, kind: ItemKind::Episode, key: ItemKey("b-ep2".into()) };
         assert_eq!(crate::store::user::progress(&r, &moved).unwrap().map(|p| p.position_s), Some(600.0));
+    }
+
+    /// ↑ stops at the box: it never wraps onto Delete (↑ ↑ Enter only ticks the box), and ↓
+    /// stops at Delete.
+    #[test]
+    fn focus_stops_at_the_ends_and_never_wraps_onto_delete() {
+        let (mut t, one) = rig();
+        let a = seed(&mut t, |c| {
+            let a = testkit::source(c, "TV")?;
+            let b = testkit::source(c, "TV 2")?;
+            testkit::named_movies(c, a, &[("EN ★ Dune - 2021", "Dune")])?;
+            testkit::named_movies(c, b, &[("EN - Dune (2021)", "Dune")])?;
+            let list = crate::store::user::default_fav_list(c)?;
+            crate::store::user::set_favourite(c, list, &ItemRef { source: a, kind: ItemKind::Movie, key: ItemKey("m3u:named0000".into()) }, true, 1)?;
+            Ok(a)
+        });
+        let mut h = overlay_harness(t, one, DeletePlaylistOverlay::new(a, 4), egui::vec2(1200.0, 900.0));
+        until_ov(&mut h, "the plan", |h| h.state().o.plan.is_some());
+        for _ in 0..3 {
+            h.state_mut().act(Action::Up);
+        }
+        assert_eq!(h.state().o.focus, Focus::Move);
+        assert_eq!(h.state_mut().act(Action::Activate), "Keep", "ticks the box, never deletes");
+        assert!(h.state().o.tick);
+        for _ in 0..4 {
+            h.state_mut().act(Action::Down);
+        }
+        assert_eq!(h.state().o.focus, Focus::Delete);
+    }
+
+    /// While explicit content is hidden, an explicit title moves like the others but the
+    /// dialog doesn't name it: one line counts it.
+    #[test]
+    fn explicit_titles_are_counted_not_named_while_hidden() {
+        let (mut t, one) = rig();
+        let a = seed(&mut t, |c| {
+            let a = testkit::source(c, "TV")?;
+            let b = testkit::source(c, "TV 2")?;
+            testkit::named_movies(
+                c,
+                a,
+                &[("EN ★ Dune - 2021", "Dune"), ("EN ★ Blue Film - 2020", "Blue Film"), ("EN ★ Red Film - 2019", "Red Film")],
+            )?;
+            testkit::named_movies(c, b, &[("EN - Dune (2021)", "Dune"), ("EN - Blue Film (2020)", "Blue Film")])?;
+            c.execute("UPDATE movie SET explicit = 1 WHERE clean_name IN ('Blue Film', 'Red Film')", [])?;
+            let list = crate::store::user::default_fav_list(c)?;
+            for i in 0..3 {
+                let r = ItemRef { source: a, kind: ItemKind::Movie, key: ItemKey(format!("m3u:named{i:04}")) };
+                crate::store::user::set_favourite(c, list, &r, true, 1)?;
+            }
+            Ok(a)
+        });
+        let hidden =
+            crate::store::library::load_visible(&t.services().store.reader().unwrap(), crate::store::library::Visibility::NO_EXPLICIT).unwrap();
+        t.set_library(hidden);
+        let mut h = overlay_harness(t, one, DeletePlaylistOverlay::new(a, 5), egui::vec2(1200.0, 900.0));
+        until_ov(&mut h, "the plan", |h| h.state().o.plan.is_some());
+        h.run_steps(1);
+        assert_eq!(h.state().o.plan.as_ref().map(|p| (p.items.len(), p.cannot.len())), Some((2, 1)), "they still move");
+        assert!(has_label(&h, "  Dune (2021) → TV 2 · ★"));
+        assert!(!has_label_containing(&h, "Blue Film") && !has_label_containing(&h, "Red Film"), "never named");
+        assert!(has_label(&h, "And 2 hidden titles (unlock to see them)"));
     }
 
     /// Unticked (the default), Delete only deletes.

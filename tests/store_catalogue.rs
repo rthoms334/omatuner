@@ -1744,10 +1744,26 @@ fn deleting_a_playlist_moves_favourites_and_progress_to_matched_copies() {
     let plan = w(&s, move |c| copies::move_plan(c, a));
     let moved: Vec<(&str, &str, MatchedBy)> = plan.items.iter().map(|m| (m.from.key.0.as_str(), m.to.key.0.as_str(), m.matched)).collect();
     assert_eq!(moved, [("a1", "b1", MatchedBy::KeyYear), ("a5", "b5", MatchedBy::Tmdb)]);
-    let cannot: Vec<&str> = plan.cannot.iter().map(|(t, _)| t.as_str()).collect();
+    let cannot: Vec<&str> = plan.cannot.iter().map(|c| c.what.as_str()).collect();
     // (named as stored: these test rows keep the provider's name as their display name)
     assert_eq!(cannot, ["1 channel favourite", "EN ★ Leo - 2023", "EN ★ Gold - 2022", "EN ★ Ronin - 1998"], "{:?}", plan.cannot);
-    assert_eq!((plan.waiting.clone(), plan.pending.clone()), (vec![sb], vec!["EN ★ Lost - 2004 S01E02".to_owned()]), "TV 2's episodes load first");
+    let pending: Vec<&str> = plan.pending.iter().map(|(t, _)| t.as_str()).collect();
+    assert_eq!((plan.waiting.clone(), pending), (vec![sb], vec!["EN ★ Lost - 2004 S01E02"]), "TV 2's episodes load first");
+    // two explicit origins ((US) / (GB) remakes) are different titles even with the same key
+    let origins = |o: [Option<&'static str>; 2]| {
+        w(&s, move |c| {
+            c.execute("UPDATE movie SET match_origin = ?1 WHERE key = 'a1'", [o[0]])?;
+            c.execute("UPDATE movie SET match_origin = ?1 WHERE key = 'b1'", [o[1]])?;
+            Ok(())
+        })
+    };
+    origins([Some("US"), Some("GB")]);
+    let plan = w(&s, move |c| copies::move_plan(c, a));
+    assert!(plan.items.iter().all(|m| m.from.key.0 != "a1") && plan.cannot.iter().any(|c| c.what == "EN ★ Dune - 2021"), "{:?}", plan.items);
+    origins([Some("US"), None]);
+    let plan = w(&s, move |c| copies::move_plan(c, a));
+    assert!(plan.items.iter().any(|m| m.from.key.0 == "a1"), "one origin unknown: still the same title");
+    origins([None, None]);
     // TV 2's episodes arrive: the episode moves too
     w(&s, move |c| import::store_series_details(c, sb, &details("b"), NOW));
     let plan = w(&s, move |c| copies::move_plan(c, a));
@@ -1758,15 +1774,19 @@ fn deleting_a_playlist_moves_favourites_and_progress_to_matched_copies() {
     let plan = w(&s, move |c| copies::move_plan(c, a));
     assert!(plan.items.iter().any(|m| m.from.key.0 == "a3" && m.to.key.0 == "b1" && m.matched == MatchedBy::Joined));
     let items = plan.items.clone();
+    // Dune plays on in TV while the dialog is open: the move takes the progress as it is then
+    w(&s, move |c| user::save_progress(c, &prog(a, ItemKind::Movie, "a1", 3000.0, NOW - 2)));
     let done = w(&s, move |c| copies::move_titles(c, &items));
     assert_eq!(done, copies::Moved { favourites: 2, progress: 2 }, "Gold's favourite lands on Dune, already there");
     w(&s, move |c| sources::delete_source(c, a));
     let favs: Vec<String> = user::fav_items(&r, list).unwrap().into_iter().map(|e| e.item.key.0).collect();
     assert_eq!(favs, ["b1", "b5"], "TV's favourites now on TV 2's copies, in their places (Gold's lands on Dune, already there)");
     let pos = |kind: ItemKind, key: &str| user::progress(&r, &ItemRef { source: b, kind, key: ItemKey(key.into()) }).unwrap().map(|p| p.position_s);
-    assert_eq!(pos(ItemKind::Movie, "b1"), Some(2480.0), "newer progress moved over the older");
+    assert_eq!(pos(ItemKind::Movie, "b1"), Some(3000.0), "newer progress (as it was at Delete) moved over the older");
     assert_eq!(pos(ItemKind::Movie, "b4"), Some(900.0), "split copy untouched");
     assert_eq!(pos(ItemKind::Episode, "ep:b2"), Some(1200.0), "the same episode of the other copy");
+    let joins: i64 = r.query_row("SELECT count(*) FROM title_link WHERE action = 'join'", [], |x| x.get(0)).unwrap();
+    assert_eq!(joins, 0, "the join with TV's Gold went with TV (a join of one is no join)");
 }
 
 /// What the UI sends to play a combined movie: the first copy with the next as its fallback

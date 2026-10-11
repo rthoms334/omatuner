@@ -2295,7 +2295,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `/` | Search everything |
 | `?` | Keyboard help |
 | `Space` / `Insert` | Mark group (Ctrl+H then hides all marked) |
-| `Ctrl+O` | Play from another copy… |
+| `Ctrl+O` | Play from another playlist (Also on)… |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
 | `Ctrl+H` | Hide / unhide |
@@ -2327,7 +2327,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Tab` / `Shift+Tab` | Next / previous pane |
 | `Insert` | Mark group (Ctrl+H then hides all marked) |
 | `Ctrl+Shift+H` | Hide the groups with the words typed |
-| `Ctrl+O` | Play from another copy… |
+| `Ctrl+O` | Play from another playlist (Also on)… |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
 | `Ctrl+H` | Hide / unhide |
@@ -4593,7 +4593,10 @@ puts **the copy Play would use** (the one picked on the page, else the first in 
 Favourites, removing takes every copy out; ✓ (movies) shows when any copy is watched, marking
 marks the copy Play would use, unmarking forgets every copy's progress; Ctrl+L / Ctrl+H / F2
 lock, hide or rename every copy (`ui::copies::{toggle_lock, hide, rename_dialog}`, shared with
-the grid, Home and Search). Each write has its Undo toast; the menu says "… every copy". A page
+the grid, Home and Search). Each write has its Undo toast, naming the playlists when it covers
+every copy ("Removed from Favourites in TV and TV 2", "Marked unwatched in …", "Locked Dune in
+…"; a Continue-watching card's Remove keeps "Removed from Continue watching"); the menu says
+"… every copy". A page
 opened for one copy on purpose keeps acting on that copy, like the card that led there.
 
 **Series: episodes matched across copies.** A combined series page reads, with its own
@@ -4604,11 +4607,18 @@ The page opens at the next episode of **the copy with the newest progress**
 (`copies::next_episode`, the same rule Play and Shift+Enter on a card use — verified), as this
 copy's episode. ✓ on an episode and "Mark season watched / unwatched" write the same episodes
 of **every copy** in one write with Undo (`copies::mark_episodes`; a copy without that episode
-is skipped). Xtream series load episodes lazily: when another copy's aren't loaded
-(`copies::unloaded_series`) the page first submits `LoadSeriesDetails` for them
-(`ui::copies::EpisodeFetch`: polls the job list and the database at most four times a second),
-shows "Loading the other copy's episodes to mark them too…" with a spinner, then writes; a copy
-that couldn't load is named in the toast ("… — TV 2 couldn't load its episodes").
+is skipped; "Marked S01 watched in TV and TV 2"). Xtream series load episodes lazily: when
+another copy's aren't loaded (`copies::unloaded_series`) the page writes this copy and the
+loaded ones **at once** (nothing is lost if the user leaves or quits) and submits
+`LoadSeriesDetails` for the others (`ui::copies::EpisodeFetch`: polls the job list and the
+database at most four times a second), shows "Loading the other copy's episodes to mark them
+too…" with a spinner, then writes them with a second Undo toast. Each waiting mark carries the
+copies it was made for (a list, in order: two marks during one load both land; leaving for
+another series never redirects them); a copy that couldn't load is named in a warning ("TV 2
+couldn't load its episodes — marked in the other copies only"). Play from a combined page
+resumes from **the newest progress of that episode in any copy**: the button says "Resume
+S01E04 12:00" and `ui::copies::play_episode` prompts at that position and starts this copy there
+(`CopyPlay::start_at`), as movies do.
 
 **"Same title as…".** The user combines a title with another the matcher kept apart (another
 name, a missing year, two TMDB ids): a card's menu (Movies / Series grid) or a detail page's ⋯
@@ -4617,30 +4627,42 @@ row per title: a stack's top, never the title's own copies; ≤ 200 matches, nam
 playlists · copies), Enter or a click combines them (`copies::join` → `titles::join`, Undo toast
 "Dune and Die Frau die singt are one title now"). Stored as `title_link` rows with action
 `join` for both copies and a shared `join_group` (migration `0007_title_join` rebuilds the table
-for the new CHECK; idempotent); joining a copy already joined merges the groups. The build
+for the new CHECK in its Rust step, which copies `join_group` too on a re-run); joining a copy
+already joined merges the groups; a group left with one copy (its partner's playlist deleted,
+a backup merge meeting joins already here) is dropped (`titles::prune_joins`). The menu item
+shows with two playlists of that kind or more; the toast adds "in All playlists" when one
+playlist is in scope (nothing changes there). The build
 (`stacks::build` → `apply_joins`) stacks a group's copies **with the stacks they are in**, after
 clustering and on top of splits (a split copy can still be joined elsewhere), only in All; the
 copy order inside is the usual one. Like splits and pins the rows carry fingerprints, so a
 refresh that re-keys a copy re-attaches them; backups carry the group (renumbered after the
 groups already there on a merge restore). The page says "Combined by you (Same title as…)";
 Settings ▸ Hidden ▸ **"Titles you separated, combined or pinned"** lists each joined copy
-("TV · combined with Die Frau die singt (TV 2) · Enter separates it"); Enter takes that copy out
+("TV · combined with Die Frau die singt (TV 2) · Enter separates it"; an explicit partner isn't
+named while explicit content is hidden); Enter takes that copy out
 (`titles::unjoin`; a group left with one copy goes too).
 
 **Deleting a playlist.** Settings ▸ Playlists ▸ Delete playlist… opens
 `overlays::delete_playlist` instead of a plain confirm. It reads `copies::move_plan(source)`
 (off the UI thread) and, when the playlist has favourites or progress, **offers — unticked —**
-"Move favourites and progress to the same titles in other playlists", listing what would move
-("Dune (2021) → TV 2 · ★ · 41:20") and what can't ("Gold (2022) — no copy in another playlist",
-"3 channel favourites — channels aren't matched across playlists"). Matching: the other copy
-with the **same TMDB id**, or the **same match key and known year** (`match_hash`, never against
-a different TMDB id), or **joined by the user**; never a copy either side split off; the first
-in the playlist order (enabled first). Episode progress moves to the same season and episode of
+"Move favourites, progress and watched marks to the same titles in other playlists", listing
+what would move ("Dune (2021) → TV 2 · ★ · 41:20"; "… → TV 2: Dune: Part One (2021)" when the
+copy reads differently) and what can't ("Gold (2022) — no copy in another playlist", "3 channel
+favourites — channels aren't matched across playlists"); titles concealed while explicit content
+is hidden move like the others but are only counted ("And 2 hidden titles"). The subtitle says
+"This can't be undone."; a plan that can't be read says so ("Delete removes everything"). The
+focus (box → Cancel → Delete) stops at the ends — ↑ never wraps onto Delete. Matching: the
+other copy with the **same TMDB id**, or the **same match key and known year** (`match_hash`,
+never against a different TMDB id or another explicit origin, `match_origin`), or **joined by
+the user**; never a copy either side split off; the first in the playlist order (enabled
+first). The other playlists' titles are read once per kind (one scan, indexed in memory) and a
+series' copy once for all its episodes, so a big catalogue doesn't make Delete wait. Episode progress moves to the same season and episode of
 the series' other copy **only once that copy's episodes are loaded**: ticking the box starts
 `EpisodeFetch` for them ("Loading the other copies' episodes (1 of 2 series)…"; Delete waits),
 then the plan is read again; episodes whose copy couldn't load are listed as not moving. Delete
 runs one writer job: `copies::move_titles` (a favourite joins the same list at the same place
-unless the copy is already there; progress replaces the copy's own only when newer) then
+unless the copy is already there; progress — read when Delete runs, so playback saved since
+the dialog opened counts — replaces the copy's own only when newer) then
 `sources::delete_source`; the toast says "Deleted TV — moved 3 favourites and 2 progress marks
 to the other playlists; 2 couldn't move". **No Undo**: the playlist and its catalogue are gone
 (feasible only for the moved rows, which are ordinary data of the other copies). The old
@@ -4650,11 +4672,13 @@ confirm's "kept as orphans" was wrong — the rows cascade with the playlist —
 playlists (`live::also_on`): the same `family` (normalised cleaned name, quality words dropped),
 another playlist, not hidden (`LiveIndex::hidden`), not DRM-only; explicit channels hidden by
 parental control aren't in the snapshot; a channel whose **tvg-id differs** from the cursor
-channel's (both known; one indexed read in the frame budget) is another channel. Best quality
+channel's (both known; one indexed read in the frame budget for the chips — Ctrl+O, a key press,
+reads it at once) is another channel. Best quality
 first within a playlist, playlists in their order, ≤ 12. Each is a chip in its playlist's colour
-— `TV 2 (FHD)`, plus the alternative's name when it differs, the lock when locked — that plays
+— `TV 2 (FHD)`, plus the alternative's name when it differs, the lock when locked, ▶ on the one
+playing — that plays
 it here on a click (`widgets::badge::source_chip_button`); **Ctrl+O** in the channel list
-(bound in `[List]` / `[ListFiltering]`, "Play from another copy…", like the grid's) opens them as
+(bound in `[List]` / `[ListFiltering]`, "Play from another playlist (Also on)…") opens them as
 a menu "Channel 0 is also on". A locked alternative asks for the PIN (`Unlocked(PlayFrom)`).
 Never merged, never switched to by itself; the cursor stays where it was. The hint line adds
 "Ctrl+O also on" while the cursor channel has alternatives.
@@ -4677,4 +4701,11 @@ listed, episodes waiting for the other copy's episodes) and the move itself (lis
 newer progress kept) (`store_catalogue`); the delete dialog (unticked by default, listed, moved
 when ticked, nothing moved unticked, episodes loaded first) (`overlays::delete_playlist`); Live's
 "Also on" (same name, another tvg-id refused, hidden refused, click plays, Ctrl+O menu, PIN for
-a locked one) (`live`); Ctrl+O during playback (`player`); keymap (Ctrl+O in lists).
+a locked one, explicit refused while hidden, Ctrl+O with the frame budget spent) (`live`);
+Ctrl+O during playback (`player`); keymap (Ctrl+O in lists). Review fixes add: marks made
+during a load land in order and never on another series, this copy written at once
+(`series_detail`); resume from the other copy's position (`series_detail`); the dialog's focus
+never wraps onto Delete and explicit titles counted, not named (`overlays::delete_playlist`);
+an explicit join partner unnamed in Settings ▸ Hidden (`settings`); origins refused, progress
+read at Delete, a join of one dropped (`store_catalogue`); 0007's re-run keeps `join_group`
+(`migrations`).

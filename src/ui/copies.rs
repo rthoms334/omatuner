@@ -118,13 +118,31 @@ pub fn play_title(ctx: &mut UiCtx<'_>, movies: bool, item: u32, pick: Option<u32
 /// `from_start`).
 pub fn play_episode(ctx: &mut UiCtx<'_>, plan: &CopyPlan, series: SeriesId, ep: &crate::model::Episode, from_start: bool, prompt: bool) {
     let db = ctx.db;
-    let PlayerCommand::PlayCopy(copy) = episode_command(db, &ctx.lib.vod, plan, series, ep, !from_start, PlayOrigin::Fullscreen) else { return };
+    let PlayerCommand::PlayCopy(mut copy) = episode_command(db, &ctx.lib.vod, plan, series, ep, !from_start, PlayOrigin::Fullscreen) else { return };
     let min = f64::from(ctx.config.player.resume_min_s);
     let item = ItemRef { source: ep.source_id, kind: ItemKind::Episode, key: ep.key.clone() };
-    let p = (prompt && !from_start)
-        .then(|| crate::store::user::progress(db, &item).ok().flatten())
-        .flatten()
-        .filter(|p| !p.finished && p.position_s > min);
+    // the latest progress of this episode in any copy (matched by season and number): another
+    // copy's position is where this one starts
+    let ids: Vec<SeriesId> = plan
+        .copies
+        .iter()
+        .filter_map(|c| match ctx.lib.vod.series.get(c.item as usize)?.kind {
+            VodKind::Series(id) => Some(id),
+            VodKind::Movie(_) => None,
+        })
+        .collect();
+    let latest = if from_start {
+        None
+    } else if ids.len() > 1 {
+        copies::episode_progress(db, &ids).ok().and_then(|mut m| m.remove(&(ep.season, ep.episode)))
+    } else {
+        crate::store::user::progress(db, &item).ok().flatten()
+    };
+    let latest = latest.filter(|p| !p.finished && p.position_s > 0.0);
+    if let Some(p) = latest.as_ref().filter(|p| p.item != item) {
+        copy.start_at = Some(p.position_s);
+    }
+    let p = latest.filter(|p| prompt && p.position_s > min);
     match p {
         Some(p) => {
             let name = ctx.lib.vod.find(VodKind::Series(series)).map(|v| v.name.to_string()).unwrap_or_default();
@@ -302,6 +320,14 @@ fn playlists(lib: &Library, refs: &[ItemRef]) -> String {
     }
 }
 
+/// "`what` in TV and TV 2" (just `what` when no playlist is known).
+fn in_playlists(what: &str, lib: &Library, refs: &[ItemRef]) -> String {
+    match playlists(lib, refs) {
+        p if p.is_empty() => what.to_owned(),
+        p => format!("{what} in {p}"),
+    }
+}
+
 /// ★ on a combined title (default Favourites list): add the copy that would play, or remove
 /// every copy — the index is patched at once, the Undo toast follows the write.
 pub fn toggle_favourite(ctx: &mut crate::ui::UiCtx<'_>, plan: &CopyPlan) {
@@ -325,8 +351,9 @@ pub fn toggle_favourite_of(ctx: &mut crate::ui::UiCtx<'_>, plan: &CopyPlan, play
     } else {
         refs.iter().for_each(|r| ctx.favs.apply_toggle(list, r, false));
     }
-    let text = if on { "Added to Favourites" } else { "Removed from Favourites" };
-    favourite_write(ctx, list, refs, plays, on, text.to_owned());
+    // removing clears every copy: the toast names their playlists
+    let text = if on { "Added to Favourites".to_owned() } else { in_playlists("Removed from Favourites", ctx.lib, &refs) };
+    favourite_write(ctx, list, refs, plays, on, text);
 }
 
 fn favourite_write(ctx: &crate::ui::UiCtx<'_>, list: FavListId, refs: Vec<ItemRef>, plays: ItemRef, on: bool, text: String) {
@@ -335,18 +362,24 @@ fn favourite_write(ctx: &crate::ui::UiCtx<'_>, list: FavListId, refs: Vec<ItemRe
 }
 
 /// ✓ on a combined movie: mark the copy that would play watched, or (`on` false) forget every
-/// copy's progress.
+/// copy's progress (a card's Remove in Continue watching).
 pub fn mark_watched(ctx: &mut crate::ui::UiCtx<'_>, plan: &CopyPlan, title: &str, on: bool) {
-    mark_watched_of(ctx, plan, None, title, on);
+    let text = if on { "Marked as watched" } else { "Removed from Continue watching" };
+    watched_write(ctx, plan, None, title, on, text.to_owned());
 }
 
-/// [`mark_watched`] where `plays` is the copy that would play (a detail page's picked copy).
+/// [`mark_watched`] on a detail page, where `plays` is the copy that would play (its picked
+/// copy); unmarking says which playlists it covered.
 pub fn mark_watched_of(ctx: &mut crate::ui::UiCtx<'_>, plan: &CopyPlan, plays: Option<u32>, title: &str, on: bool) {
+    let text = if on { "Marked as watched".to_owned() } else { in_playlists("Marked unwatched", ctx.lib, &plan.refs()) };
+    watched_write(ctx, plan, plays, title, on, text);
+}
+
+fn watched_write(ctx: &crate::ui::UiCtx<'_>, plan: &CopyPlan, plays: Option<u32>, title: &str, on: bool, text: String) {
     let refs = plan.refs();
     let Some(plays) = plays.or(plan.first()).and_then(|i| plan.get(i)).or(plan.copies.first()).map(|c| c.item_ref.clone()) else { return };
     let (now, title) = (ctx.now, title.to_owned());
-    let text = if on { "Marked as watched" } else { "Removed from Continue watching" };
-    write_with_undo(ctx, DataScope::Progress, text.to_owned(), move |c| copies::watched(c, &refs, (&plays, &title), on, now));
+    write_with_undo(ctx, DataScope::Progress, text, move |c| copies::watched(c, &refs, (&plays, &title), on, now));
 }
 
 /// "Forget" a combined series: every episode progress of every copy.
@@ -362,11 +395,12 @@ pub fn forget_series(ctx: &mut crate::ui::UiCtx<'_>, plan: &CopyPlan) {
     write_with_undo(ctx, DataScope::Progress, "Removed from Continue watching".into(), move |c| copies::forget_series(c, &ids));
 }
 
-/// Ctrl+L on a combined title: every copy (the caller checked the PIN, as `kit::toggle_lock`).
-pub fn set_locked(ctx: &mut crate::ui::UiCtx<'_>, plan: &CopyPlan, on: bool) {
+/// Ctrl+L on a combined title named `name`: every copy (the caller checked the PIN, as
+/// `kit::toggle_lock`); "Locked Dune in TV and TV 2".
+fn set_locked(ctx: &mut crate::ui::UiCtx<'_>, plan: &CopyPlan, name: &str, on: bool) {
     let refs = plan.refs();
-    let text = if on { "Locked every copy" } else { "Unlocked every copy" };
-    write_with_undo(ctx, DataScope::Overrides, text.into(), move |c| copies::lock(c, &refs, on));
+    let text = in_playlists(&format!("{} {name}", if on { "Locked" } else { "Unlocked" }), ctx.lib, &refs);
+    write_with_undo(ctx, DataScope::Overrides, text, move |c| copies::lock(c, &refs, on));
 }
 
 /// Ctrl+L on a combined title (a grid card, a Home tile, a detail page): every copy locked
@@ -382,7 +416,8 @@ pub fn toggle_lock(ctx: &mut crate::ui::UiCtx<'_>, plan: &CopyPlan, movies: bool
         if by_group {
             ctx.toast(Toast::info("A copy is locked by its category — unlock the category with Ctrl+L"));
         }
-        set_locked(ctx, plan, on);
+        let name = copies.first().map(|x| x.name.to_string()).unwrap_or_default();
+        set_locked(ctx, plan, &name, on);
     }
 }
 
@@ -520,14 +555,32 @@ impl EpisodeFetch {
 }
 
 /// ✓ / "Mark season watched" on a combined series: the episodes `eps` (season, number) of
-/// every copy in `copies` are marked (or their progress forgotten), with an Undo toast;
-/// `missing` names the playlists whose copy couldn't load its episodes (the toast says so).
-pub fn mark_episodes(ctx: &UiCtx<'_>, copies: Vec<SeriesId>, eps: Vec<(u32, u32)>, on: bool, missing: &[String]) {
-    let what = if on { "Marked watched in every copy" } else { "Marked unwatched in every copy" };
-    let text = match missing {
-        [] => what.to_owned(),
-        names => format!("{what} — {} couldn't load its episodes", names.join(", ")),
-    };
+/// every copy in `copies` are marked (or their progress forgotten), with an Undo toast naming
+/// the episodes and the copies' playlists ("Marked S01 watched in TV and TV 2").
+pub fn mark_episodes(ctx: &UiCtx<'_>, copies: Vec<SeriesId>, eps: Vec<(u32, u32)>, on: bool) {
+    if copies.is_empty() || eps.is_empty() {
+        return;
+    }
+    let text = format!("Marked {} {} in {}", episodes_label(&eps), if on { "watched" } else { "unwatched" }, series_playlists(ctx.lib, &copies));
     let now = ctx.now;
     write_with_undo(ctx, DataScope::Progress, text, move |c| copies::mark_episodes(c, &copies, &eps, on, now).map(|(u, _)| u));
+}
+
+/// "S01E03", "S01" (a season's episodes), or "3 episodes".
+fn episodes_label(eps: &[(u32, u32)]) -> String {
+    match eps {
+        [(s, e)] => format!("S{s:02}E{e:02}"),
+        [(s, _), rest @ ..] if rest.iter().all(|(r, _)| r == s) => format!("S{s:02}"),
+        _ => format!("{} episodes", eps.len()),
+    }
+}
+
+/// The playlists of the series copies `ids`, "TV and TV 2".
+pub fn series_playlists(lib: &Library, ids: &[SeriesId]) -> String {
+    let refs: Vec<ItemRef> = ids
+        .iter()
+        .filter_map(|id| lib.vod.find(VodKind::Series(*id)))
+        .map(|v| ItemRef { source: v.source_id, kind: ItemKind::Series, key: v.key.clone() })
+        .collect();
+    playlists(lib, &refs)
 }

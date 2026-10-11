@@ -824,10 +824,19 @@ impl LiveScreen {
         activate_channel(ctx, id, zap, PlayOrigin::Fullscreen, preview, Action::PlayFrom);
     }
 
-    /// Ctrl+O on a channel: the same channel in other playlists.
+    /// Ctrl+O on a channel: the same channel in other playlists (read now, outside the frame
+    /// budget: a key press, and a spent budget must not read as "none").
     fn also_on_menu(&mut self, ctx: &mut UiCtx<'_>) {
-        let alts = self.also_on(ctx);
         let Some(ch) = self.cursor_channel().and_then(|id| ctx.lib.live.get(id).cloned()) else { return };
+        let alts = match &self.also_on {
+            Some((generation, c, alts)) if *generation == ctx.lib.generation && *c == ch.id => alts.clone(),
+            _ => {
+                let db = ctx.db;
+                let alts = also_on(ctx.lib, &ch, |ids| tvg_ids(db, ids).ok()).unwrap_or_default();
+                self.also_on = Some((ctx.lib.generation, ch.id, alts.clone()));
+                alts
+            }
+        };
         if alts.is_empty() {
             ctx.toast(Toast::info("This channel isn't in your other playlists"));
             return;
@@ -2476,9 +2485,13 @@ mod tests {
             let a = testkit::source(c, "Alpha")?;
             let b = testkit::source(c, "Bravo")?;
             let ch = testkit::source(c, "Charlie")?;
+            let d = testkit::source(c, "Delta")?;
             let a_ch = testkit::channels(c, a, 3)?;
             let b_ch = testkit::channels(c, b, 2)?;
             testkit::channels(c, ch, 1)?;
+            // Delta's "Channel 0" is explicit content
+            let d_ch = testkit::channels(c, d, 1)?;
+            c.execute("UPDATE channel SET explicit = 1 WHERE id = ?1", [d_ch[0].0])?;
             // Bravo's "Channel 1" is another channel (another tvg-id); Charlie's is hidden
             c.execute("UPDATE channel SET tvg_id = 'other.tv' WHERE id = ?1", [b_ch[1].0])?;
             let hidden = ItemRef { source: ch, kind: ItemKind::Channel, key: crate::model::ItemKey("m3u:seed00000000000".into()) };
@@ -2486,8 +2499,18 @@ mod tests {
             Ok((a_ch, b_ch, b))
         });
         let mut h = harness(t, one, LiveScreen::default(), egui::vec2(1600.0, 900.0));
+        let load = |h: &H, v| crate::store::library::load_visible(&h.state().t.services().store.reader().unwrap(), v).unwrap();
+        let all = load(&h, crate::store::library::Visibility::ALL);
+        h.state_mut().t.set_library(all);
         h.state_mut().enter(Route::Live { group: None, channel: Some(a_ch[0]) });
         h.run_steps(3);
+        assert!(has_label(&h, "Also on Delta"), "explicit content shown: offered");
+        // explicit content hidden (a locked session): never offered
+        let hidden = load(&h, crate::store::library::Visibility::NO_EXPLICIT);
+        h.state_mut().t.set_library(hidden);
+        h.state_mut().enter(Route::Live { group: None, channel: Some(a_ch[0]) });
+        h.run_steps(3);
+        assert!(!has_label_containing(&h, "Also on Delta"), "explicit content hidden: not offered");
         assert_eq!(h.state().s.cursor_channel(), Some(a_ch[0]));
         assert!(has_label(&h, "Also on Bravo"), "Bravo has Channel 0");
         assert!(!has_label_containing(&h, "Also on Charlie"), "a hidden channel isn't offered");
@@ -2519,8 +2542,25 @@ mod tests {
             ..Default::default()
         };
         h.state_mut().t.config = std::sync::Arc::new(cfg);
+        // a locked session hides explicit content (the app rebuilds the snapshot so)
+        let hidden = load(&h, crate::store::library::Visibility::NO_EXPLICIT);
+        h.state_mut().t.set_library(hidden);
+        // the frame's DB budget spent (the preview can't read the tvg-ids): Ctrl+O, a key
+        // press, still finds the alternative
+        h.state_mut().t.budget = crate::ui::data::FrameBudget::new(std::time::Duration::ZERO);
+        // something else plays first, so the PIN's playback shows
+        let other = crate::player::PlayRequest {
+            media: MediaRef::Channel(a_ch[2]),
+            zap: None,
+            origin: PlayOrigin::Fullscreen,
+            resume: false,
+            immediate: true,
+        };
+        h.state().t.services().player.handle().send(crate::player::PlayerCommand::Play(other));
+        testkit::until(&mut h, "Alpha's Channel 2 plays", |h| playing(h) == Some(MediaRef::Channel(a_ch[2])));
         h.state_mut().enter(Route::Live { group: None, channel: Some(a_ch[0]) });
         h.run_steps(2);
+        assert!(!has_label_containing(&h, "Also on"), "no chips this frame");
         h.state_mut().nav();
         assert!(h.state_mut().act(Action::PlayFrom));
         let nav = h.state_mut().nav();
@@ -2534,7 +2574,8 @@ mod tests {
         let p = app.t.config.parental.clone();
         assert!(app.t.parental.unlock("1234", &p));
         h.state_mut().result(OverlayResult::Unlocked(Action::PlayFrom));
-        assert!(h.state().s.also_on_pending.is_none(), "played after the PIN");
+        assert!(h.state().s.also_on_pending.is_none());
+        testkit::until(&mut h, "Bravo's channel plays after the PIN", |h| playing(h) == Some(MediaRef::Channel(b_ch[0])));
     }
 
     #[test]

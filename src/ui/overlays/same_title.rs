@@ -38,11 +38,13 @@ pub struct SameTitleOverlay {
     built: Option<u64>,
     /// Shown rows: indices into `cards`, best match first.
     rows: Vec<u32>,
+    /// Each shown row's (name, detail), built with `rows` (not per frame).
+    texts: Vec<(String, String)>,
 }
 
 impl SameTitleOverlay {
     pub fn new(spec: SameTitleSpec) -> Self {
-        Self { spec, list: ListState::default(), cards: Vec::new(), built: None, rows: Vec::new() }
+        Self { spec, list: ListState::default(), cards: Vec::new(), built: None, rows: Vec::new(), texts: Vec::new() }
     }
 
     fn movies(&self) -> bool {
@@ -77,6 +79,15 @@ impl SameTitleOverlay {
             let names = self.cards.iter().map(|&i| all.get(i as usize).map_or("", |v| &*v.name));
             self.rows = self.list.filter.apply(names).into_iter().take(MAX_ROWS).collect();
         }
+        let all = st::all(ctx.lib, self.movies());
+        self.texts = self
+            .rows
+            .iter()
+            .map(|&k| {
+                let i = self.cards.get(k as usize).copied().unwrap_or(u32::MAX);
+                (all.get(i as usize).map(|v| v.name.to_string()).unwrap_or_default(), self.detail(ctx, i))
+            })
+            .collect();
         self.list.set_len(self.rows.len());
     }
 
@@ -108,7 +119,10 @@ impl SameTitleOverlay {
         let movies = self.movies();
         let Some(&card) = self.rows.get(r).and_then(|k| self.cards.get(*k as usize)) else { return OverlayOutcome::Keep };
         let Some(other) = st::all(ctx.lib, movies).get(card as usize).cloned() else { return OverlayOutcome::Keep };
-        let text = format!("{} and {} are one title now", self.spec.name, other.name);
+        // inside one playlist nothing shows it: copies combine in All playlists
+        let kind = if movies { crate::ui::scope::ScopeKind::Movies } else { crate::ui::scope::ScopeKind::Series };
+        let all = crate::ui::scope::Scope::current(ctx, kind).is_all();
+        let text = format!("{} and {} are one title now{}", self.spec.name, other.name, if all { "" } else { " in All playlists" });
         crate::ui::copies::join(ctx, &self.spec.item, &st::item_ref(&other), text);
         OverlayOutcome::Close
     }
@@ -134,7 +148,7 @@ impl Overlay for SameTitleOverlay {
                 Action::Up | Action::Down | Action::PageUp | Action::PageDown | Action::Home | Action::End | Action::FilterInput(_) => {
                     OverlayOutcome::Keep
                 }
-                Action::Activate | Action::ActivateAlt | Action::Left | Action::Right | Action::ToggleMark => OverlayOutcome::Keep,
+                Action::Activate | Action::ActivateAlt | Action::Right | Action::ToggleMark => OverlayOutcome::Keep,
                 _ => OverlayOutcome::Ignored,
             },
         }
@@ -174,15 +188,7 @@ impl Overlay for SameTitleOverlay {
                 return;
             }
             let height = (row_h * self.rows.len() as f32).min(420.0 * rem);
-            let rows: Vec<(String, String)> = self
-                .rows
-                .iter()
-                .map(|&k| {
-                    let i = self.cards.get(k as usize).copied().unwrap_or(u32::MAX);
-                    let name = st::all(ctx.lib, movies).get(i as usize).map(|v| v.name.to_string()).unwrap_or_default();
-                    (name, self.detail(ctx, i))
-                })
-                .collect();
+            let rows = &self.texts;
             let out = ui
                 .allocate_ui(egui::vec2(ui.available_width(), height), |ui| {
                     virtual_list(ui, theme, "same-title-rows", &mut self.list, row_h, |ui, rc| {

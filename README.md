@@ -502,7 +502,7 @@ The full reference is generated from `src/keymap.rs`:
 | `/` | Search everything |
 | `?` | Keyboard help |
 | `Space` / `Insert` | Mark group (Ctrl+H then hides all marked) |
-| `Ctrl+O` | Play from another copy… |
+| `Ctrl+O` | Play from another playlist (Also on)… |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
 | `Ctrl+H` | Hide / unhide |
@@ -534,7 +534,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Tab` / `Shift+Tab` | Next / previous pane |
 | `Insert` | Mark group (Ctrl+H then hides all marked) |
 | `Ctrl+Shift+H` | Hide the groups with the words typed |
-| `Ctrl+O` | Play from another copy… |
+| `Ctrl+O` | Play from another playlist (Also on)… |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
 | `Ctrl+H` | Hide / unhide |

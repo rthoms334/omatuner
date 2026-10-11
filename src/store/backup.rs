@@ -472,6 +472,8 @@ pub fn restore(conn: &mut Connection, b: &Backup, mode: RestoreMode) -> Result<R
             params![item.source, kind, item.key.as_str(), t.action, t.at, group],
         )?;
     }
+    // a merge whose join rows met joins already here leaves groups of one
+    crate::store::titles::prune_joins(&tx)?;
 
     // ---- progress (newer wins), history, reminders
     for p in &b.progress {

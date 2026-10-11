@@ -1245,6 +1245,8 @@ impl SettingsScreen {
                                 .title_links
                                 .iter()
                                 .filter(|o| o.action == LinkAction::Join && o.group == l.group && o.item != l.item)
+                                // an explicit partner isn't named while the session is locked
+                                .filter(|o| !ctx.lib.conceals(&o.item))
                                 .map(|o| {
                                     let n = o.name.clone().unwrap_or_else(|| o.item.key.to_string());
                                     match ctx.lib.source(o.item.source) {
@@ -4177,6 +4179,20 @@ mod tests {
         assert!(has_label(&h, "TITLES YOU SEPARATED, COMBINED OR PINNED"));
         assert!(testkit::has_label_containing(&h, "Bravo · shown on its own") && testkit::has_label_containing(&h, "Alpha · always plays first"));
         assert!(testkit::has_label_containing(&h, "Alpha · combined with Die Frau die singt (Bravo) · Enter separates it"));
+        // an explicit partner isn't named while explicit content is hidden
+        let load = |h: &H, v| crate::store::library::load_visible(&h.state().t.services().store.reader().unwrap(), v).unwrap();
+        seed(&mut h.state_mut().t, |c| {
+            c.execute("UPDATE movie SET explicit = 1 WHERE name = 'DE - Die Frau die singt (2010)'", [])?;
+            Ok(())
+        });
+        let hidden = load(&h, crate::store::library::Visibility::NO_EXPLICIT);
+        h.state_mut().t.set_library(hidden);
+        h.run_steps(2);
+        assert!(testkit::has_label_containing(&h, "Alpha · combined · Enter separates it"));
+        assert!(!testkit::has_label_containing(&h, "Die Frau die singt"), "never named while hidden");
+        let all = load(&h, crate::store::library::Visibility::ALL);
+        h.state_mut().t.set_library(all);
+        h.run_steps(2);
         focus(&mut h, "Dune (Bravo)");
         h.state_mut().act(Action::Activate);
         let stored = |h: &H| links(&h.state().t.services().store.reader().unwrap()).unwrap();

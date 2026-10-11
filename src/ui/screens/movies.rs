@@ -832,8 +832,10 @@ impl VodBrowser {
         } else if self.stacked && copies.len() > 1 {
             items.push(MenuItem { shortcut: None, ..mi(glyphs::CLOSE, "Not the same title", Action::Digit(MENU_SPLIT), "") });
         }
-        // combine it with a title the matcher kept apart (copies combine in All)
-        if st::combine(ctx.config) {
+        // combine it with a title the matcher kept apart (copies combine in All; with two
+        // playlists of this kind or more)
+        let kind = if self.movies { ItemKind::Movie } else { ItemKind::Series };
+        if st::combine(ctx.config) && ctx.lib.eligible(kind).len() > 1 {
             items.push(MenuItem { shortcut: None, ..mi(glyphs::PLAYLIST, "Same title as…", Action::Digit(MENU_SAME_TITLE), "") });
         }
         let fav =
@@ -2157,7 +2159,7 @@ mod tests {
         let fav = |h: &egui_kittest::Harness<'_, testkit::App<MoviesScreen>>, r: crate::model::ItemRef| h.state().t.favs.is_fav(&r);
         assert!(!fav(&h, named(a, 1)) && !fav(&h, named(b, 0)), "every copy left Favourites");
         let toast = h.state_mut().undo_toast().expect("an Undo toast");
-        assert_eq!(toast.text, "Removed from Favourites");
+        assert_eq!(toast.text, "Removed from Favourites in Alpha and Bravo");
         h.state_mut().act(toast.action.unwrap().1);
         until(&mut h, "Undo puts them back", |h| {
             let favs = crate::store::library::load_favs(&h.state().t.services().store.reader().unwrap()).unwrap();

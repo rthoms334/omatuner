@@ -99,8 +99,34 @@ fn backfill(conn: &Connection, name: &str) -> Result<()> {
             add_title_columns(conn)?;
             crate::store::titles::refresh_all(conn).map(|_| ())
         }
+        "0007_title_join" => rebuild_title_link(conn),
         _ => Ok(()),
     }
+}
+
+/// 0007: `title_link` rebuilt to accept `join` rows with a `join_group` (a CHECK constraint
+/// only changes with a new table). Its rows are copied, `join_group` too when a re-run finds
+/// the column already there.
+fn rebuild_title_link(conn: &Connection) -> Result<()> {
+    let group = if has_column(conn, "title_link", "join_group")? { "join_group" } else { "NULL" };
+    conn.execute_batch(&format!(
+        "CREATE TABLE title_link_new (
+           source_id  INTEGER NOT NULL REFERENCES source(id) ON DELETE CASCADE,
+           kind       TEXT    NOT NULL CHECK (kind IN ('movie', 'series')),
+           item_key   TEXT    NOT NULL,
+           action     TEXT    NOT NULL CHECK (action IN ('split', 'pin', 'join')),
+           at         INTEGER NOT NULL,
+           fp         TEXT    NOT NULL DEFAULT '{{}}',
+           orphaned_since INTEGER,
+           join_group INTEGER,
+           PRIMARY KEY (source_id, kind, item_key, action)
+         ) WITHOUT ROWID;
+         INSERT INTO title_link_new(source_id, kind, item_key, action, at, fp, orphaned_since, join_group)
+           SELECT source_id, kind, item_key, action, at, fp, orphaned_since, {group} FROM title_link;
+         DROP TABLE title_link;
+         ALTER TABLE title_link_new RENAME TO title_link;"
+    ))?;
+    Ok(())
 }
 
 /// The match columns of movies and series and `series.tmdb_id` (0006; only the missing ones,
@@ -558,6 +584,7 @@ mod tests {
         c.pragma_update(None, "user_version", 6).unwrap();
         migrate(&mut c).unwrap();
         assert_eq!(rows(&c).len(), 3, "a re-run keeps every row");
+        assert_eq!(rows(&c)[1].4, Some(3), "and the join's group");
         c.execute_batch("PRAGMA foreign_keys=ON; DELETE FROM source WHERE id = 1").unwrap();
         assert!(rows(&c).is_empty(), "still cascades with its playlist");
     }
