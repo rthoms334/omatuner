@@ -5,7 +5,9 @@
 //! * Global index: one `nucleo::Nucleo<SearchItem>` with a single match column
 //!   ("name  group  source"); rebuilt (new injector) when the `Library` snapshot changes.
 //!   Small libraries are injected inline; large ones (> 4 096 items) from a short-lived
-//!   "search-inject" thread so the UI thread only pays for collecting the items (Arc clones).
+//!   "search-inject" thread so the UI thread only pays for collecting the items (Arc clones);
+//!   [`SearchIndex::rebuild_shared`] (the search card opening) collects them there too. The
+//!   app frees the index when the card closes (~110 MiB for 460k items).
 //!   `set_query` uses `reparse` with `append = true` when the new query extends the old one
 //!   (except after a trailing `$` or `\`, whose meaning changes when text follows).
 //!   `tick(10)` each frame while the overlay is open; results read from the snapshot (top 200).
@@ -169,34 +171,55 @@ impl SearchIndex {
         }
     }
 
-    /// Replace all items from a library snapshot (hidden excluded; locked flagged).
+    /// Replace all items from a library snapshot (hidden excluded; locked flagged). The items
+    /// are collected here; a big library is injected on a background thread.
     pub fn rebuild(&mut self, lib: &Library, include_locked: bool) {
+        let (injector, cancel) = self.restart(include_locked);
+        let items = collect_items(lib);
+        if items.len() <= SYNC_INJECT_MAX {
+            inject(items, &injector, &cancel);
+            return;
+        }
+        spawn_inject(move || inject(items, &injector, &cancel));
+    }
+
+    /// [`SearchIndex::rebuild`] for the search card opening: with a big library even collecting
+    /// the items (`Arc` clones of the name, group and logo of every item) runs on the
+    /// background thread, so the card opens at once and results stream in.
+    pub fn rebuild_shared(&mut self, lib: &Arc<Library>, include_locked: bool) {
+        if lib.live.channels.len() + lib.vod.movies.len() + lib.vod.series.len() <= SYNC_INJECT_MAX {
+            return self.rebuild(lib, include_locked);
+        }
+        let (injector, cancel) = self.restart(include_locked);
+        let lib = lib.clone();
+        spawn_inject(move || {
+            // opened and closed again before this thread ran: don't collect at all
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            let items = collect_items(&lib);
+            drop(lib);
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            inject(items, &injector, &cancel)
+        });
+    }
+
+    /// Stop the background collection and injection now (the index is about to be dropped on
+    /// another thread, which may be busy for a while: quick reopen-and-close would otherwise
+    /// run several full collections at once).
+    pub fn cancel(&self) {
+        self.inject_cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// Cancel the previous injection and empty the index: the new injector and its cancel flag.
+    fn restart(&mut self, include_locked: bool) -> (nucleo::Injector<SearchItem>, Arc<AtomicBool>) {
         self.include_locked = include_locked;
         self.inject_cancel.store(true, Ordering::Relaxed);
         self.inject_cancel = Arc::new(AtomicBool::new(false));
         self.nucleo.restart(true);
-        let items = collect_items(lib);
-        let injector = self.nucleo.injector();
-        if items.len() <= SYNC_INJECT_MAX {
-            for p in items {
-                let hay = p.haystack();
-                injector.push(p.item, |_, cols| cols[0] = hay);
-            }
-            return;
-        }
-        let cancel = self.inject_cancel.clone();
-        let spawned = std::thread::Builder::new().name("search-inject".into()).spawn(move || {
-            for (i, p) in items.into_iter().enumerate() {
-                if i % 1024 == 0 && cancel.load(Ordering::Relaxed) {
-                    return;
-                }
-                let hay = p.haystack();
-                injector.push(p.item, |_, cols| cols[0] = hay);
-            }
-        });
-        if let Err(e) = spawned {
-            tracing::warn!(error = %e, "search index: could not spawn the injection thread");
-        }
+        (self.nucleo.injector(), self.inject_cancel.clone())
     }
 
     pub fn set_query(&mut self, q: &str) {
@@ -264,6 +287,24 @@ impl SearchIndex {
 impl Drop for SearchIndex {
     fn drop(&mut self) {
         self.inject_cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Push `items` into the index, checking `cancel` every 1 024 items (a newer rebuild started,
+/// or the index was dropped).
+fn inject(items: Vec<Pending>, injector: &nucleo::Injector<SearchItem>, cancel: &AtomicBool) {
+    for (i, p) in items.into_iter().enumerate() {
+        if i % 1024 == 0 && cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        let hay = p.haystack();
+        injector.push(p.item, |_, cols| cols[0] = hay);
+    }
+}
+
+fn spawn_inject(f: impl FnOnce() + Send + 'static) {
+    if let Err(e) = std::thread::Builder::new().name("search-inject".into()).spawn(f) {
+        tracing::warn!(error = %e, "search index: could not spawn the injection thread");
     }
 }
 
@@ -659,6 +700,41 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         settle(&mut idx, 10);
         assert_eq!(idx.results(SearchSection::Live, 100).len(), 10);
+    }
+
+    /// The search card opening (`rebuild_shared`): a big library is collected and injected on
+    /// the background thread (the snapshot is shared, not walked in the frame); a newer
+    /// rebuild cancels it, and the index can be dropped while it runs.
+    #[test]
+    fn opening_search_collects_a_big_library_in_the_background() {
+        let n = SYNC_INJECT_MAX * 3;
+        let lib = Arc::new(library(n));
+        let mut idx = SearchIndex::new(Arc::new(|| {}));
+        idx.rebuild_shared(&lib, false);
+        idx.set_query(&format!("channel {:06}", n - 1));
+        settle(&mut idx, n as u32);
+        assert_eq!(idx.results(SearchSection::All, 5)[0].item.target, SearchTarget::Channel(ChannelId(n as i64 - 1)));
+        idx.rebuild_shared(&lib, false);
+        idx.rebuild_shared(&Arc::new(library(10)), false);
+        idx.set_query("channel");
+        std::thread::sleep(Duration::from_millis(50));
+        settle(&mut idx, 10);
+        assert_eq!(idx.results(SearchSection::Live, 100).len(), 10);
+        idx.rebuild_shared(&lib, false);
+        // the card closed: cancelled before the index is handed to the maintenance thread
+        idx.cancel();
+        let t = Instant::now();
+        while Arc::strong_count(&lib) > 1 {
+            assert!(t.elapsed() < Duration::from_secs(10), "a cancelled collection lets go of the snapshot");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        idx.rebuild_shared(&lib, false);
+        drop(idx);
+        let t = Instant::now();
+        while Arc::strong_count(&lib) > 1 {
+            assert!(t.elapsed() < Duration::from_secs(10), "the background thread lets go of the snapshot");
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]

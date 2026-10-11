@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
-use support::media::{Faults, TestServer, ensure_media};
+use support::media::{Faults, KeepAlive, SessionLimit, TestServer, ensure_media};
 use tuner::config::Config;
 use tuner::model::{
     ChannelId, Collection, HistoryEntry, HttpHeaders, ItemKey, ItemKind, ItemRef, MediaRef, MovieId, PlayOrigin, Playable, PlayableKind, SourceId,
@@ -219,6 +219,8 @@ const LONG: Duration = Duration::from_secs(30);
 
 /// Debug messages of the player controller, in order (see [`controller_log`]).
 static CONTROLLER_LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// The INFO-and-above part of [`CONTROLLER_LOG`] (what a user's log file holds).
+static INFO_LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Records the `message` of every event it is given into [`CONTROLLER_LOG`].
 struct CaptureLayer;
@@ -235,6 +237,9 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
         }
         let mut m = Message(String::new());
         event.record(&mut m);
+        if *event.metadata().level() <= tracing::Level::INFO {
+            INFO_LOG.lock().unwrap_or_else(|e| e.into_inner()).push(m.0.clone());
+        }
         CONTROLLER_LOG.lock().unwrap_or_else(|e| e.into_inner()).push(m.0);
     }
 }
@@ -263,6 +268,7 @@ fn setup() -> Option<(PathBuf, MutexGuard<'static, ()>)> {
     let media = ensure_media()?;
     let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     controller_log(); // earlier tests' lines
+    INFO_LOG.lock().unwrap_or_else(|e| e.into_inner()).clear();
     Some((media, guard))
 }
 
@@ -419,7 +425,9 @@ fn http_403_and_404_are_classified_from_the_fault_server() {
     let s = h.wait_state_from(mark, LONG, |s| matches!(s, PlayerState::Reconnecting { .. } | PlayerState::Error(_)));
     assert!(matches!(s, PlayerState::Error(PlayerError { kind: PlayerErrorKind::HttpNotFound, .. })), "{s:?}");
     assert!(h.rec.failures.lock().unwrap().iter().any(|(i, k)| Some(i) == vod.item.as_ref() && *k == Some(PlayerErrorKind::HttpNotFound)));
-    assert_eq!(h.snapshot().last_error.as_ref().map(|e| e.kind), Some(PlayerErrorKind::HttpNotFound));
+    // the snapshot is published after the event went out (the controller logs in between)
+    let snap = h.wait_snapshot(LONG, |s| matches!(s.state, PlayerState::Error(_)));
+    assert_eq!(snap.last_error.as_ref().map(|e| e.kind), Some(PlayerErrorKind::HttpNotFound));
 }
 
 #[test]
@@ -642,6 +650,170 @@ fn apply_config_changes_the_zap_delay() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// field report 2026-10-11: live streams that dropped out and eventually stopped
+
+/// `StateChanged`s at index ≥ `from` of the history.
+fn states_from(h: &mut Harness, from: usize) -> Vec<PlayerState> {
+    h.drain();
+    h.seen[from..].iter().filter_map(|e| if let PlayerEvent::StateChanged(s) = e { Some(s.clone()) } else { None }).collect()
+}
+
+/// The provider's restreamer error that its live playlist address answers during an outage.
+const PROVIDER_TEXT: &str = "Cannot read /home/nxt/storage/streams/1_.m3u8";
+
+/// Requests for the "address" mpv makes of the provider's text (`…/live/Cannot read …`).
+fn bogus_requests(srv: &TestServer) -> usize {
+    srv.requests().iter().filter(|r| r.path.contains("Cannot")).count()
+}
+
+/// Keep-alive: providers close idle keep-alive connections between segment fetches ("Error
+/// reading HTTP response: End of file" every 10 s in the field log) or leave them half-dead
+/// (a request that is never answered: a network-timeout stall, segments skipped). HLS opens a
+/// fresh connection for every request by default (`demuxer-lavf-o=http_persistent=0`), so
+/// neither mode buffers or reconnects, and no request ever rides a reused connection.
+#[test]
+fn hls_keepalive_idle_close_and_abandoned_connections_do_not_stall() {
+    let Some((media, _serial)) = setup() else { return };
+    for keep in [KeepAlive::IdleClose(Duration::from_millis(500)), KeepAlive::Abandon] {
+        let srv = TestServer::start(media.clone(), Faults::default());
+        srv.set_keep_alive(keep);
+        let ch = live(100, srv.url("live/index.m3u8"));
+        let mut h = Harness::start(headless_config(), vec![ch.clone()]);
+        h.play(ch.media.clone(), true);
+        h.wait_state(LONG, is_playing);
+        let first = h.wait_snapshot(LONG, |s| s.position.is_some()).position.unwrap();
+        let mark = h.mark();
+        std::thread::sleep(Duration::from_secs(12));
+        let states = states_from(&mut h, mark);
+        assert!(states.is_empty(), "{keep:?}: {states:?}");
+        let pos = h.snapshot().position.unwrap_or(0.0);
+        assert!(pos - first >= 10.0, "{keep:?}: played {:.1} s in 12 s", pos - first);
+        let reused: Vec<_> = srv.requests().into_iter().filter(|r| r.nth > 1).map(|r| r.path).collect();
+        assert!(reused.is_empty(), "{keep:?}: requests on reused connections: {reused:?}");
+    }
+}
+
+/// A provider outage while a live channel plays: its playlist address answers the
+/// restreamer's text instead of a playlist and the segments are gone, for longer than any
+/// first-play budget. The channel that played keeps reconnecting ("attempt n", no maximum),
+/// recognises the provider's message (and doesn't chase the "address" made of it more than
+/// once per attempt), never reaches Error, isn't recorded as failing, and plays again when the
+/// provider is back.
+#[test]
+fn a_played_channel_keeps_reconnecting_through_a_provider_outage_and_recovers() {
+    let Some((media, _serial)) = setup() else { return };
+    let srv = TestServer::start(media, Faults::default());
+    let ch = live(101, srv.url("live/index.m3u8"));
+    let mut h = Harness::start(headless_config(), vec![ch.clone()]);
+    h.play(ch.media.clone(), true);
+    h.wait_state(LONG, is_playing);
+    std::thread::sleep(Duration::from_secs(2));
+
+    let mark = h.mark();
+    srv.set_body("/live/index.m3u8", Some(PROVIDER_TEXT));
+    srv.set_status("/live/seg*", 404);
+    // the first-play budget of a provider message is 3 retries (~10 s): wait well past it
+    h.wait_state_from(mark, LONG, |s| matches!(s, PlayerState::Reconnecting { reason: PlayerErrorKind::ProviderError, max: 0, .. }));
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while Instant::now() < deadline {
+        assert!(!matches!(h.snapshot().state, PlayerState::Error(_)), "gave up: {:?}", states_from(&mut h, mark));
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let attempts = states_from(&mut h, mark).iter().filter(|s| matches!(s, PlayerState::Reconnecting { .. })).count();
+    assert!(attempts >= 4, "kept trying past the first-play budget: {:?}", states_from(&mut h, mark));
+    assert!(bogus_requests(&srv) <= attempts, "{} requests of the text as an address in {attempts} attempts", bogus_requests(&srv));
+
+    let back = h.mark();
+    srv.set_body("/live/index.m3u8", None);
+    srv.set_status("/live/seg*", 0);
+    h.wait_state_from(back, Duration::from_secs(45), is_playing);
+    let states = states_from(&mut h, mark);
+    assert!(!states.iter().any(|s| matches!(s, PlayerState::Error(_))), "{states:?}");
+    assert!(states.iter().all(|s| !matches!(s, PlayerState::Reconnecting { max, .. } if *max != 0)), "no attempt limit: {states:?}");
+    assert!(h.rec.failures.lock().unwrap().iter().all(|(_, k)| k.is_none()), "a channel that played is never recorded as failing");
+    // the log tells the story (INFO transitions, the provider's words, the recovery), without
+    // stream addresses
+    // (the controller logs right after it announced the state: give it a moment)
+    let mut log = controller_log();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !log.iter().any(|l| l.starts_with("player: recovered after ")) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        log.extend(controller_log());
+    }
+    let key = &ch.item.as_ref().unwrap().key.0;
+    assert!(log.iter().any(|l| l.contains(&format!("source 1 {key} Playing → Reconnecting(attempt 1, "))), "{log:#?}");
+    // titles stay out of INFO lines (explicit titles must never reach the log file)
+    let info = std::mem::take(&mut *INFO_LOG.lock().unwrap_or_else(|e| e.into_inner()));
+    assert!(!info.iter().any(|l| l.contains("Test stream")), "{info:#?}");
+    assert!(info.iter().any(|l| l.starts_with("player: recovered after ")), "{info:#?}");
+    assert!(log.iter().any(|l| l.starts_with("player: the provider answered with a message") && l.contains(PROVIDER_TEXT)), "{log:#?}");
+    assert!(log.iter().any(|l| l.starts_with("player: recovered after ")), "{log:#?}");
+    assert!(!log.iter().any(|l| l.contains("http://")), "no stream addresses: {log:#?}");
+}
+
+/// First play while the provider answers with its message: three retries, then Error with the
+/// friendly headline's kind and the provider's own words, recorded as a provider error.
+#[test]
+fn a_provider_message_on_first_play_ends_in_provider_error_with_its_text() {
+    let Some((media, _serial)) = setup() else { return };
+    let srv = TestServer::start(media, Faults::default());
+    srv.set_body("/live/index.m3u8", Some(PROVIDER_TEXT));
+    let ch = live(102, srv.url("live/index.m3u8"));
+    let mut h = Harness::start(headless_config(), vec![ch.clone()]);
+    h.play(ch.media.clone(), true);
+    let s = h.wait_state(LONG, |s| matches!(s, PlayerState::Error(_)));
+    let PlayerState::Error(err) = s else { unreachable!() };
+    assert_eq!(err.kind, PlayerErrorKind::ProviderError, "{err:?}");
+    assert!(err.message.contains(PROVIDER_TEXT), "{err:?}");
+    let reconnects: Vec<_> = h.states().into_iter().filter(|s| matches!(s, PlayerState::Reconnecting { .. })).collect();
+    assert_eq!(reconnects.len(), 3, "{reconnects:?}");
+    let fetches = srv.requests_for("/live/index.m3u8").len();
+    assert!((4..=8).contains(&fetches), "one fetch (or mpv's probe pair) per attempt: {fetches}");
+    assert!(bogus_requests(&srv) <= 4, "{} requests of the text as an address", bogus_requests(&srv));
+    assert!(h.rec.failures.lock().unwrap().iter().any(|(i, k)| Some(i) == ch.item.as_ref() && *k == Some(PlayerErrorKind::ProviderError)));
+}
+
+/// The zap race window on a one-connection account: the provider keeps counting the stream
+/// we zapped away from for a while (here 8 s), so the new channel is refused (403) at first:
+/// retried every 3 s, it plays once the old session expires — no Error, nothing recorded.
+/// A channel the provider refuses for good still reaches Error once the window (45 s after the
+/// close) ends, and is recorded.
+#[test]
+fn a_zap_inside_the_connection_limit_race_window_recovers_and_a_refused_one_errors() {
+    let Some((media, _serial)) = setup() else { return };
+    let srv = TestServer::start(media, Faults::default());
+    srv.set_session_limit(Some(SessionLimit { max: 1, linger: Duration::from_secs(8) }));
+    let a = live(103, srv.url("live/index.m3u8"));
+    let b = live(104, srv.url("long/index.m3u8"));
+    let mut h = Harness::start(headless_config(), vec![a.clone(), b.clone()]);
+    h.play(a.media.clone(), true);
+    h.wait_state(LONG, is_playing);
+    std::thread::sleep(Duration::from_secs(2));
+
+    let mark = h.mark();
+    h.play(b.media.clone(), true);
+    h.wait_state_from(mark, LONG, |s| matches!(s, PlayerState::Reconnecting { reason: PlayerErrorKind::HttpForbidden, max: 0, .. }));
+    h.wait_state_from(mark, LONG, is_playing);
+    let states = states_from(&mut h, mark);
+    assert!(!states.iter().any(|s| matches!(s, PlayerState::Error(_))), "{states:?}");
+    assert!(srv.requests_for("/long/index.m3u8").iter().filter(|r| r.status == 403).count() >= 2, "refused while the old session lingered");
+    assert!(h.rec.failures.lock().unwrap().iter().all(|(_, k)| k.is_none()), "{:?}", h.rec.failures.lock().unwrap());
+
+    // back to A, which the provider now refuses for good
+    srv.set_status("/live/index.m3u8", 403);
+    std::thread::sleep(Duration::from_secs(2));
+    let mark = h.mark();
+    let zapped = Instant::now();
+    h.play(a.media.clone(), true);
+    let s = h.wait_state_from(mark, Duration::from_secs(75), |s| matches!(s, PlayerState::Error(_)));
+    assert!(matches!(s, PlayerState::Error(PlayerError { kind: PlayerErrorKind::HttpForbidden, .. })), "{s:?}");
+    assert!(zapped.elapsed() >= Duration::from_secs(44), "gave up inside the window: {:?}", zapped.elapsed());
+    let tries = srv.requests_for("/live/index.m3u8").iter().filter(|r| r.status == 403).count();
+    assert!(tries >= 10, "retried every 3 s through the window: {tries}");
+    assert!(h.rec.failures.lock().unwrap().iter().any(|(i, k)| Some(i) == a.item.as_ref() && *k == Some(PlayerErrorKind::HttpForbidden)));
+}
+
+// ---------------------------------------------------------------------------------------------
 // the fault-injecting test server itself (no mpv)
 
 /// Plain HTTP/1.1 GET with std sockets: (status, headers lower-cased, body bytes read before
@@ -741,4 +913,79 @@ fn test_server_ranges_statuses_kill_revive_and_live_playlist() {
     }
     assert_eq!(http_get(&srv.base, "/bars.ts", "").0, 200);
     assert!(srv.max_concurrent() >= 1);
+}
+
+/// The field-report modes of the test server: keep-alive (two answers on one connection, then
+/// a silent close when idle, or an abandoned second request), a text body where a playlist
+/// should be, `prefix*` statuses, and a connection limit whose sessions linger.
+#[test]
+fn test_server_keep_alive_text_bodies_and_lingering_sessions() {
+    use std::io::{Read, Write};
+    let Some(media) = ensure_media() else { return };
+    let srv = TestServer::start(media, Faults::default());
+    let addr = srv.base.strip_prefix("http://").unwrap().to_owned();
+    // one response off a persistent connection: (status, body)
+    let read_one = |s: &mut std::net::TcpStream| -> Option<(u16, String)> {
+        let mut head = Vec::new();
+        let mut b = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if s.read(&mut b).ok()? == 0 {
+                return None;
+            }
+            head.push(b[0]);
+        }
+        let head = String::from_utf8_lossy(&head).into_owned();
+        let status = head.split_whitespace().nth(1)?.parse().ok()?;
+        let len: usize = head.lines().find_map(|l| l.strip_prefix("Content-Length: "))?.trim().parse().ok()?;
+        let mut body = vec![0u8; len];
+        s.read_exact(&mut body).ok()?;
+        Some((status, String::from_utf8_lossy(&body).into_owned()))
+    };
+    // a write to a connection the server closed may fail: the read below tells
+    let get = |s: &mut std::net::TcpStream, path: &str| {
+        let _ = write!(s, "GET {path} HTTP/1.1\r\nHost: {addr}\r\n\r\n");
+    };
+
+    srv.set_keep_alive(KeepAlive::IdleClose(Duration::from_millis(300)));
+    let mut s = std::net::TcpStream::connect(&addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    get(&mut s, "/live/index.m3u8");
+    assert_eq!(read_one(&mut s).map(|r| r.0), Some(200));
+    get(&mut s, "/live/index.m3u8");
+    assert_eq!(read_one(&mut s).map(|r| r.0), Some(200), "the same connection answers again");
+    std::thread::sleep(Duration::from_millis(600));
+    get(&mut s, "/live/index.m3u8");
+    assert_eq!(read_one(&mut s), None, "closed while idle");
+    let reqs = srv.requests_for("/live/index.m3u8");
+    assert_eq!(reqs.iter().map(|r| (r.conn, r.nth)).collect::<Vec<_>>(), [(1, 1), (1, 2)]);
+
+    srv.set_keep_alive(KeepAlive::Abandon);
+    let mut s = std::net::TcpStream::connect(&addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    get(&mut s, "/bars.ts");
+    assert_eq!(read_one(&mut s).map(|r| r.0), Some(200));
+    get(&mut s, "/bars.ts");
+    assert_eq!(read_one(&mut s), None, "the reused request is never answered");
+    drop(s);
+    srv.set_keep_alive(KeepAlive::Off);
+
+    srv.set_body("/live/index.m3u8", Some("Cannot read /home/nxt/storage/streams/1_.m3u8"));
+    srv.set_status("/live/seg*", 404);
+    let (status, h, body, _) = http_get(&srv.base, "/live/index.m3u8", "");
+    assert_eq!((status, String::from_utf8(body).unwrap()), (200, "Cannot read /home/nxt/storage/streams/1_.m3u8".to_owned()));
+    assert_eq!(header(&h, "content-type"), Some("application/vnd.apple.mpegurl"));
+    assert_eq!(http_get(&srv.base, "/live/seg001.ts", "").0, 404);
+    srv.set_body("/live/index.m3u8", None);
+    srv.set_status("/live/seg*", 0);
+    assert_eq!(http_get(&srv.base, "/live/seg001.ts", "").0, 200);
+    assert!(http_get(&srv.base, "/live/index.m3u8", "").2.starts_with(b"#EXTM3U"));
+
+    // one stream at a time; a closed stream counts for `linger`
+    srv.set_session_limit(Some(SessionLimit { max: 1, linger: Duration::from_millis(800) }));
+    std::thread::sleep(Duration::from_millis(900)); // the requests above
+    assert_eq!(http_get(&srv.base, "/live/index.m3u8", "").0, 200);
+    assert_eq!(http_get(&srv.base, "/live/seg002.ts", "").0, 200, "the same stream");
+    assert_eq!(http_get(&srv.base, "/long/index.m3u8", "").0, 403, "another stream while /live lingers");
+    std::thread::sleep(Duration::from_millis(900));
+    assert_eq!(http_get(&srv.base, "/long/index.m3u8", "").0, 200, "after the linger");
 }

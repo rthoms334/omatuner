@@ -230,10 +230,23 @@ pub(super) struct VodBrowser {
     cats_scope: Option<ScopeFilter>,
     progress: ProgressInfo,
     progress_loader: Option<Loader<ProgressInfo>>,
+    /// Bumped whenever `progress` is replaced.
+    progress_gen: u64,
     /// Watch progress by index into the kind's list (rebuilt with `progress` / `index`).
     progress_idx: HashMap<u32, f32>,
-    /// (source, key) → index, per library build.
+    /// (source, key) → index of the titles with progress or in the default favourites list:
+    /// all this screen looks up by key (an index of every title cloned every key: ~30 MiB for
+    /// 300k movies).
     index: HashMap<(SourceId, ItemKey), u32>,
+    /// What `index` was resolved for: (VOD lists, `progress_gen`, favourites fingerprint). A
+    /// zap's library copy shares the lists: nothing to redo.
+    index_for: Option<(crate::store::library::VodIdentity, u64, u64)>,
+    /// Keys looked for in the last scan of these lists that they don't hold (progress of a
+    /// title the playlist dropped): a progress save that adds no new key rescans nothing.
+    index_absent: HashSet<(SourceId, ItemKey)>,
+    /// Full scans of the lists for `index` (tests).
+    index_scans: u32,
+    /// The library build the screen's indices belong to.
     index_built: u64,
     /// A locked category waiting for the PIN (cleared by any other open / item action).
     pending_cat: Option<Cat>,
@@ -471,6 +484,50 @@ impl VodBrowser {
         self.played_rank = self.progress.order.iter().enumerate().filter_map(|(r, k)| self.index.get(k).map(|i| (*i, r))).collect();
     }
 
+    /// Resolve the keys of the titles with progress and of the favourites to list indices,
+    /// when the library, the progress or the favourites changed (one pass over the list; only
+    /// the matches' keys are cloned).
+    fn refresh_index(&mut self, ctx: &UiCtx<'_>) {
+        let kind = if self.movies { ItemKind::Movie } else { ItemKind::Series };
+        let favs: Vec<&crate::model::ItemRef> =
+            ctx.favs.default_list().map(|l| ctx.favs.items(l).iter().filter(|r| r.kind == kind).collect()).unwrap_or_default();
+        let fingerprint = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::hash::DefaultHasher::new();
+            favs.hash(&mut h);
+            h.finish()
+        };
+        let want = (ctx.lib.vod_identity(), self.progress_gen, fingerprint);
+        if self.index_for.as_ref() == Some(&want) {
+            return;
+        }
+        let same_lists = self.index_for.as_ref().is_some_and(|f| f.0 == want.0);
+        self.index_for = Some(want);
+        let wanted: HashSet<(SourceId, &ItemKey)> =
+            self.progress.order.iter().map(|(s, k)| (*s, k)).chain(favs.iter().map(|r| (r.source, &r.key))).collect();
+        // the same lists and no key it hasn't looked for (a progress save of a known title, a
+        // favourite taken out): the stale extra entries are harmless, lookups go by these keys
+        let known = |k: &(SourceId, ItemKey)| self.index.contains_key(k) || self.index_absent.contains(k);
+        if same_lists && wanted.iter().all(|(s, k)| known(&(*s, (*k).clone()))) {
+            self.rebuild_progress_idx();
+            return;
+        }
+        let index: HashMap<(SourceId, ItemKey), u32> = if wanted.is_empty() {
+            HashMap::new()
+        } else {
+            self.index_scans += 1;
+            let all = self.all(ctx);
+            all.iter()
+                .enumerate()
+                .filter(|(_, v)| wanted.contains(&(v.source_id, &v.key)))
+                .map(|(i, v)| ((v.source_id, v.key.clone()), i as u32))
+                .collect()
+        };
+        self.index_absent = wanted.into_iter().filter(|(s, k)| !index.contains_key(&(*s, (*k).clone()))).map(|(s, k)| (s, k.clone())).collect();
+        self.index = index;
+        self.rebuild_progress_idx();
+    }
+
     /// Recompute the open category's items when its inputs changed.
     fn refresh_items(&mut self, ctx: &UiCtx<'_>) {
         if self.sort_pending == Some(self.config_sort(ctx)) {
@@ -478,12 +535,11 @@ impl VodBrowser {
         }
         if self.index_built != lib_id(ctx) {
             self.index_built = lib_id(ctx);
-            self.index = self.all(ctx).iter().enumerate().map(|(i, v)| ((v.source_id, v.key.clone()), i as u32)).collect();
-            self.rebuild_progress_idx();
             self.items_key = None;
             // stack ids belong to their snapshot
             self.open_stacks.clear();
         }
+        self.refresh_index(ctx);
         // copies stack in All only (DESIGN §29.14)
         let stacked = self.scope(ctx).selected.is_none() && st::combine(ctx.config);
         let key = (self.open, self.sort(ctx), lib_id(ctx), self.scope(ctx).filter(), stacked, self.open_stacks.clone());
@@ -1267,7 +1323,8 @@ impl VodBrowser {
         match kit::poll(&mut self.progress_loader) {
             Some(Ok(p)) => {
                 self.progress = p;
-                self.rebuild_progress_idx();
+                // `refresh_items` resolves its keys (below, before any card is drawn)
+                self.progress_gen += 1;
                 if self.open == Cat::Continue {
                     self.items_key = None;
                 }
@@ -2003,6 +2060,67 @@ mod tests {
         assert_eq!((spec.title.as_str(), items.len()), ("Rename every copy", 3));
     }
 
+    /// Only titles with progress or in Favourites are looked up by key (indexing every title
+    /// cloned every key: ~30 MiB for 300k movies); a favourite added since the library was
+    /// built, and progress that arrives later, are resolved too.
+    #[test]
+    fn only_titles_with_progress_or_favourites_are_indexed_by_key() {
+        let (mut t, one) = rig();
+        let (a, b) = dune(&mut t);
+        seed(&mut t, move |c| {
+            let p = crate::model::WatchProgress {
+                item: named(b, 1),
+                position_s: 60.0,
+                duration_s: Some(600.0),
+                updated_at: 5,
+                finished: false,
+                title: "Solo".into(),
+                fingerprint: Default::default(),
+            };
+            crate::store::user::save_progress(c, &p)
+        });
+        let mut h = harness(t, one, MoviesScreen::default(), egui::vec2(1400.0, 900.0));
+        h.state_mut().enter(Route::Movies { group: None });
+        let keys = |h: &egui_kittest::Harness<'_, testkit::App<MoviesScreen>>| {
+            let mut k: Vec<String> = h.state().s.browser.index.keys().map(|(s, k)| format!("{}:{}", s.0, k.0)).collect();
+            k.sort();
+            k
+        };
+        until(&mut h, "the progress loaded", |h| !h.state().s.browser.progress_idx.is_empty());
+        assert_eq!(keys(&h), [format!("{}:m3u:named0001", b.0)], "the title with progress only");
+        let solo = h.state().t.lib.vod.movies.iter().position(|v| v.name.as_ref() == "Solo").unwrap() as u32;
+        assert_eq!(h.state().s.browser.progress_idx.get(&solo), Some(&0.1));
+        // a favourite toggled without a library rebuild
+        let app = h.state_mut();
+        let list = app.t.favs.default_list().unwrap();
+        app.t.favs.apply_toggle(list, &named(a, 2), true);
+        h.run_steps(1);
+        assert_eq!(keys(&h), [format!("{}:m3u:named0002", a.0), format!("{}:m3u:named0001", b.0)]);
+
+        // a zap copies the library with another recent list and shares the VOD lists: nothing
+        // is rescanned (review: every zap scanned every title)
+        let (scans, resolved) = (h.state().s.browser.index_scans, h.state().s.browser.index_for.clone());
+        let app = h.state_mut();
+        app.t.lib = std::sync::Arc::new(app.t.lib.with_recent_channels(Vec::new()));
+        h.run_steps(2);
+        assert_eq!(h.state().s.browser.index_for, resolved);
+        assert_eq!(h.state().s.browser.index_scans, scans, "a zap rescans nothing");
+        // progress reloaded (saved every 10 s while a title plays) with no new key: remapped,
+        // not rescanned
+        let generation = h.state().s.browser.progress_gen;
+        let app = h.state_mut();
+        let s = &mut app.s;
+        app.t.with_ctx(|ctx| s.on_event(ctx, &AppEvent::Data(DataScope::Progress)));
+        until(&mut h, "the progress reloaded", |h| h.state().s.browser.progress_gen > generation);
+        h.run_steps(1);
+        assert_eq!(h.state().s.browser.index_scans, scans, "a progress save rescans nothing");
+        assert_eq!(h.state().s.browser.progress_idx.get(&solo), Some(&0.1));
+        // a rebuild has new lists: scanned again
+        testkit::reload_library(&mut h.state_mut().t);
+        h.run_steps(2);
+        assert_eq!(h.state().s.browser.index_scans, scans + 1);
+    }
+
     /// Favourites and Continue watching of a stack (DESIGN §29.12): Favourites shows one card
     /// for the title; Ctrl+F on it takes every favourite copy out with an Undo that puts them
     /// back, and on a stack without favourites adds the copy that plays first; Delete in
@@ -2050,9 +2168,17 @@ mod tests {
         });
         let favs = crate::store::library::load_favs(&h.state().t.services().store.reader().unwrap()).unwrap();
         h.state_mut().t.favs = favs;
+        // (the frames `until` stepped while the Undo was being written showed an empty
+        // Favourites list: wait for the card to be back before acting on it)
+        until(&mut h, "the restored favourites listed", |h| shown_names(h) == ["Dune"]);
         // Ctrl+F again: out again (no Undo taken); then on the stack in All, with no favourite
         // copy, Ctrl+F adds the copy that plays first — Bravo's, the one watched last
         h.state_mut().act(Action::ToggleFavourite);
+        assert!(!fav(&h, named(a, 1)) && !fav(&h, named(b, 0)), "out again");
+        until(&mut h, "the removal written", |h| {
+            let favs = crate::store::library::load_favs(&h.state().t.services().store.reader().unwrap()).unwrap();
+            !favs.is_fav(&named(a, 1)) && !favs.is_fav(&named(b, 0))
+        });
         h.state_mut().act(Action::FocusNext);
         h.state_mut().act(Action::Home);
         h.run_steps(1);

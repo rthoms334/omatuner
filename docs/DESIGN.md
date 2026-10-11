@@ -117,7 +117,7 @@ rate, background refresh while closed (`tuner --refresh` flag reserved for a sys
 | Keymap collisions | Per-context tables (§15): `f` = fullscreen in player, favourite = Ctrl+F everywhere; `←` = last channel (live) / seek (VOD); `h` = history (live) / left (guide); digits = channel entry in the live player and the guide. |
 | Adaptive frame rate claim | No VRR here → judder of 25/50 fps on 60 Hz is a known v1 limitation; measured in WP-07; `mpv_options` lets users try `video-sync=display-resample` (§11.8). |
 | Spike "verified" too narrow | WP-07/WP-13 acceptance adds hidden-workspace, fullscreen, 1-hour soak, audio, frame-pacing measurements (§25). |
-| Event draining in `ui()` | Moved to dedicated threads (D2). **Correction (review round 2):** eframe's `logic` does NOT run while the window is on a hidden Hyprland workspace — winit-wayland reports no visibility and `RedrawRequested` needs a compositor frame callback, which Hyprland withholds from hidden workspaces. Mitigations: the `render_unfocused` window rule (frame callbacks at `misc:render_unfocused_fps`, default 15) and the controller's video watchdog (`vid=no` after 2 s without a rendered frame, resumed when the UI renders again) — §11.1. **Correction (hidden-workspace ANR):** with eframe's default vsync the UI thread did not merely idle there — it **blocked** in Mesa's `eglSwapBuffers` (swap interval 1 waits for the previous frame's callback), stopped answering `xdg_wm_base` pings, and after `misc:anr_missed_pings` Hyprland showed "application not responding" while mpv played on. Now vsync is off and frames are paced by winit frame callbacks (`pre_present_notify` in `App::ui`): hidden, the UI thread sits in its event loop and answers pings, with or without the window rule (§11.1). |
+| Event draining in `ui()` | Moved to dedicated threads (D2). **Correction (review round 2):** eframe's `logic` does NOT run while the window is on a hidden Hyprland workspace — winit-wayland reports no visibility and `RedrawRequested` needs a compositor frame callback, which Hyprland withholds from hidden workspaces. Mitigations: the `render_unfocused` window rule (frame callbacks at `misc:render_unfocused_fps`, default 15) and the controller's video watchdog (`vid=no` after 10 s without a rendered frame, resumed when the UI renders again) — §11.1. **Correction (hidden-workspace ANR):** with eframe's default vsync the UI thread did not merely idle there — it **blocked** in Mesa's `eglSwapBuffers` (swap interval 1 waits for the previous frame's callback), stopped answering `xdg_wm_base` pings, and after `misc:anr_missed_pings` Hyprland showed "application not responding" while mpv played on. Now vsync is off and frames are paced by winit frame callbacks (`pre_present_notify` in `App::ui`): hidden, the UI thread sits in its event loop and answers pings, with or without the window rule (§11.1). |
 | `report_swap` omitted | Kept omitted (measured win); consequence documented in §11.8. |
 | XMLTV "0.61 s" is parse-only | Import budget is end-to-end (< 8 s for 415k programmes) with batched writes + progress (§9.3); bench `benches/import.rs`, gate run by WP-13. |
 | FTS schema broken (contentless + WITHOUT ROWID) | `programme` is an AUTOINCREMENT rowid table with `UNIQUE(epg_channel_id, gen, start)`; `programme_fts` is **contentless FTS5 with `contentless_delete=1`**, written in the same transaction as each programme batch and deleted by rowid before programmes are deleted; no cascades from `epg_channel` to `programme` (§6.3). Verified by `store::migrations` tests. |
@@ -205,7 +205,8 @@ Rules:
   (progress events) → parse in `spawn_blocking` → batches of 2 000 rows → writer (one tx each) →
   `finish_catalogue` (sweep, reattach, counts, resolve EPG) → provider EPG refresh if stale
   (follow-up job via `JobContext::submit`) → `RebuildLibrary` → `JobOutcome::Library(Arc<Library>)`
-  → UI swaps the snapshot and its `FavIndex`, clears the search index;
+  → UI swaps the snapshot and its `FavIndex`, hands the old snapshot and the search index to
+  the memory maintenance thread (§5.4);
   `JobOutcome::SourceRefreshed { account }` → `PlayerCommand::SetConnectionLimit`.
 * **Play**: UI `PlayerCommand::Play{media, zap, origin, immediate}` → controller resolves
   `MediaRef → Playable` with its own reader → `PlayerMachine` (Zapping → Loading) →
@@ -214,7 +215,7 @@ Rules:
   current layout puts the video.
 * **Media key while hidden**: Omarchy `omarchy-shell media next` → MPRIS (tokio) →
   `PlayerCommand::Zap` → controller resolves/loads; UI not involved. Without the
-  `render_unfocused` rule no frames are rendered; after 2 s the controller sets `vid=no`
+  `render_unfocused` rule no frames are rendered; after 10 s the controller sets `vid=no`
   (audio continues) and the app sends `ResumeVideo` as soon as `logic` runs again.
 * **Theme switch**: `omarchy-theme-set` replaces `current/theme`, writes `theme.name` last →
   inotify → debounce 180 ms → `Theme::try_load` on a worker (error → keep current, retry in
@@ -372,6 +373,27 @@ recent, sort)`) happens here, so zapping order == list order.
 | VodDetails, Progress | screens react in `on_event` (details that bring a new TMDB id also submit `RebuildLibrary`: ids decide stacks, §29.10) |
 
 A change of `player.audio_langs` submits `RebuildLibrary` (it picks every stack's top copy).
+
+**Memory upkeep** (`platform::memory`, field report: 1.1 GB after a day of 4K HEVC in software
+with a 460k-item library). glibc keeps freed heap resident unless it is at the top of an arena,
+and this app frees in bursts: a replaced snapshot (~2 M allocations, ~240 MiB at that scale), the
+global search index (~110 MiB), mpv's decoder frames (hundreds of MiB at 4K 10-bit). One
+"tuner-mem" thread (`Services::memory`) drops what the UI hands it (`release`: the old snapshot
+on every swap — dropping it in the frame took 20–400 ms — and the search index) and calls
+`malloc_trim(0)` afterwards, after the player stops, switches video off (`vid=no`) or (re)loads
+a stream (it follows the player's snapshot channel), and every 5 min; triggers coalesce (2 s
+settle, ≥ 10 s apart; `malloc_trim` itself takes 0.1–50 ms). The search index exists only while
+the search card is open (rebuilt in the background when it opens; closing the card cancels a
+collection still running). Screens resolve keys only for what they look up (Movies/Series:
+titles with progress or in Favourites; Home: favourited titles), never a map of every title,
+keyed on the snapshot's VOD lists (`Library::vod_identity`: a zap's copy shares them, so a zap
+rescans nothing; a progress save that brings no new key only remaps).
+`platform::memstats::MemStats` (RSS, anon, swap, peak, `mallinfo2` in use / free) feeds the
+10-min health line in the log. Measured on the field library with a 4K HEVC stream (8 min,
+second half): RssAnon 1121 → 742 MiB on average, peak RSS 1311 → 1017 MiB; with video off
+after a trim the process sits at ~320–430 MiB; 4K playback has a floor of ~700 MiB (the
+library ~240 MiB + mpv ~450 MiB). Not done on purpose: `shrink_to_fit` (frees no pages),
+capping decoder threads, a fixed mmap threshold.
 
 ---
 
@@ -1274,8 +1296,9 @@ Wayland frame callbacks, never by a blocking swap:
   `packaging/hypr/tuner.lua` (callbacks at `misc:render_unfocused_fps`, default 15). Without
   the rule nothing renders, mpv's VO waits ~200 ms per frame and drops it, and decoding burns
   CPU for nothing. Safety net: every render stamps the
-player's `RenderClock`; the controller tick sets `vid=no` after 2 s without a rendered frame
-while Playing (audio continues, `snapshot.video_suspended = true`), and the app sends
+player's `RenderClock`; the controller tick sets `vid=no` after 10 s without a rendered frame
+while Playing (10 s, not less: decoding restarts mid-GOP on resume, and HEVC shows seconds of
+broken picture until the next keyframe, so a quick workspace switch must not suspend) (audio continues, `snapshot.video_suspended = true`), and the app sends
 `PlayerCommand::ResumeVideo` (`vid=auto`) as soon as `logic` runs again. Nothing else that must
 work while hidden lives on the UI thread (§3.1). **Verification (WP-07, repeated by WP-13)**:
 60 s on another workspace with and without the rule — audio continuity, `frame-drop-count`,
@@ -1323,19 +1346,64 @@ to the failure cache, and the resolver remembers the channel so zapping skips it
 
 ### 11.4 Reconnect policy (`player/reconnect.rs`)
 
-| Failure | Live | VOD / catch-up |
+| Failure | Live (first play) | VOD / catch-up |
 |---|---|---|
 | Network, Timeout, Stalled, StreamEnded (EOF on live), HTTP 5xx, other mpv | backoff 0.5 · 1 · 2 · 4 · 8 · 15 · 15… s, max `reconnect_max_attempts` (8) | backoff, max 3, **resume at last position − 2 s** |
-| HTTP 401/403 | 1 retry after 3 s (connection-limit race right after a zap), then Error "account expired or too many connections" | same |
+| HTTP 401/403 | 1 retry after 3 s, then Error "account expired or too many connections"; inside the **race window** every 3 s (below) | same |
 | HTTP 404/410 | 1 retry after 2 s, then Error "channel offline" | Error |
+| Provider message instead of a stream (`ProviderError`, below) | 3 retries 3 s apart, then Error "The provider can't deliver this channel right now" + the provider's text | — |
 | Other 4xx, unsupported format, DRM, resolve error, budget | Error immediately | Error |
+
+**A live channel that played keeps reconnecting** (field report 2026-10-11: restreamer outages
+of minutes and connection-limit races ended hours-long playback for good, and dimmed the
+channel). Once the current live target reached Playing, every failure except DRM, resolve,
+budget and unsupported format reconnects with no attempt limit: the backoff above, its 15 s
+step repeating for about 5 minutes after the first failure, then every 30 s (about 120 requests
+an hour while a channel stays down); refusals, 404s, other HTTP errors and provider messages
+wait at least 3 s. Nothing is recorded in the failure cache. The overlay reads "Reconnecting…
+attempt n" (never "(n/0)") with an obvious **Stop** button (`q`; `Ctrl+Shift+S` anywhere).
+
+**Connection-limit race window.** Xtream panels keep counting a closed connection for a while
+(reproduced: HLS sessions held 30 s, TS connections 10 s), so on a source whose limit is 1 or
+unknown a zap is often refused at first. When a *different* stream of the same source closed
+less than 45 s before a Play's first load — or the *same* channel after it had played (stop,
+then restart it) — a 403 is retried every 3 s until 45 s after that close; the next 403 is
+final (Error, recorded). The window is armed once per Play from that close — never by the
+target's own failed attempts, which never played — so a channel the provider really refuses
+still reaches Error. Race retries, the one 401/403/404 retry, provider-message retries and the
+network backoff each count on their own: a long window doesn't leave a first open that then
+times out without its 8 attempts.
+
+**Provider messages.** A restreamer that lost a channel answers the playlist address with 200
+and a line of text ("Cannot read /home/…/streams/123_.m3u8"). mpv's playlist parser reads the
+headerless `.m3u8` body line by line and redirects to an "address" made of each line. On that
+redirect of a live target the controller reads the inserted entries; one with whitespace is
+prose, not an address: it stops mpv at once (often before the bogus address is requested) and the
+machine fails the load as `ProviderError` with the redacted text.
+
+**HLS keep-alive off.** `demuxer-lavf-o=http_persistent=0` by default (a user `mpv_options`
+value replaces it): providers close idle keep-alive connections between segment fetches
+("Error reading HTTP response: End of file" every segment) or leave them half-dead (a
+`network-timeout` stall per fetch and skipped segments). One TCP handshake per 2–10 s fetch
+costs nothing.
+
+**Logging.** Every state change of the current target is logged at INFO with its source id,
+item key and the time spent in the previous state (`player: source 2 xt:live:717661 Playing →
+Reconnecting(attempt 1, StreamEnded) after 1h12m03s; retry in 0.5 s; cache 0.0 s`), plus
+"recovered after n attempts in t" (attempts of that outage) / "gave up after …"; END_FILE
+reasons of our file; HTTP statuses (≤ 5 per status per 10 s, then a summary); a provider
+message at WARN when it first appears (DEBUG while it repeats); app, mpv and FFmpeg versions at
+start; and every 10 minutes a health line (state, cache, `cache-speed`, dropped frames, FFmpeg's
+own reconnects, hwdec, RSS, swap, peak and glibc heap in use / free). Titles are not in INFO
+lines (explicit titles never reach the log, §20.3): a DEBUG line names the title once per new
+target. Stream addresses never appear.
 
 HTTP statuses (parsed from mpv/ffmpeg log lines) classify a failure only while **Loading**
 (they are cleared on PlaybackRestart): a storm of HLS segment 404s while Playing is a Network
 failure (backoff), not "channel offline". Attempts reset after 30 s of stable playback. mpv's `stream-lavf-o reconnect*` covers TCP
 drops inside a file; the policy covers everything that ends/stalls the file (HLS segment 404
-storms, token expiry, server kicks). Overlay: "Reconnecting… (2/8)" with countdown; `r` retries
-now; Backspace = last channel.
+storms, token expiry, server kicks). Overlay: "Reconnecting… (2/8)" (or "attempt n") with
+countdown; `r` retries now; Backspace = last channel; Stop.
 
 ### 11.5 Zapping & connection budget
 * **One stream at a time.** Every load releases the previous lease. **Stop-before-start**:
@@ -1377,7 +1445,8 @@ Init (`player/mpv.rs`): `vo=libmpv`, hwdec (D1), `idle=yes`, `keep-open=no` (liv
 end the file), `config=no`, no OSC/input/ytdl, `video-timing-offset=0`, cache on,
 `demuxer-readahead-secs`/`cache-secs` = `cache_secs` (1 when instant load), `demuxer-max-bytes`,
 `demuxer-max-back-bytes=32MiB`, `network-timeout`, `stream-lavf-o=reconnect=1,
-reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=5`, `user-agent`,
+reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=5`,
+`demuxer-lavf-o=http_persistent=0` (§11.4; `mpv_options` can set it back), `user-agent`,
 `alang`/`slang`, subtitle auto mode, `sub-scale`, `volume`, `mute`, `audio-client-name=tuner`,
 then user `player.mpv_options`. Per file: `loadfile <url> replace -1
 force-media-title=%n%…,user-agent=…,referrer=…,http-header-fields=…,start=…` (values `%len%`
@@ -2607,7 +2676,10 @@ can't be installed. No hooks written into the user's config. Until WP-01 lands,
   honoured; **de-duplicated by file path** (one CJK collection covers ja/zh/ko: ~19 MB once,
   not three times). Verified here: `NotoSansCJK-Regular.ttc`, `NotoSansArabic-Regular.ttf`.
 * Threading: `FontSet::resolve` (~145 ms of subprocesses for 12 languages) and `FontSet::load`
-  (file reads; bytes cached per (path, index) for the process) run off the UI thread — at
+  (memory-maps each packaged font file under `/usr` once for the process; egui borrows the
+  mapped bytes through `FontData::from_static`, so the ~25 MB of fallbacks are page cache, not
+  two heap copies; a font elsewhere, e.g. `~/.local/share/fonts`, which a `cp` can overwrite in
+  place under a live mapping, is read once and kept) run off the UI thread — at
   startup on a helper thread joined in the creation callback, on reload in the theme watcher;
   the UI only calls `LoadedFonts::install`.
 * egui families: Proportional = Monospace = [primary, fallbacks…, egui defaults];
@@ -3194,7 +3266,7 @@ keys, idle, other-workspace 60 s, 1-hour soak with RSS ± 10 %, real providers);
 
 | Risk | Mitigation / owner |
 |---|---|
-| Hidden-workspace playback (no frame callbacks → no `logic`) | `render_unfocused` window rule shipped; controller video watchdog (`vid=no` after 2 s, resumed on the next render); everything correctness-critical off the UI thread; vsync off + `pre_present_notify` pacing so the UI thread never blocks in a swap and keeps answering pings (no ANR dialog, §11.1). WP-07 + WP-13 measure 60 s on another workspace with and without the rule (audio, `frame-drop-count`, CPU). |
+| Hidden-workspace playback (no frame callbacks → no `logic`) | `render_unfocused` window rule shipped; controller video watchdog (`vid=no` after 10 s, resumed on the next render); everything correctness-critical off the UI thread; vsync off + `pre_present_notify` pacing so the UI thread never blocks in a swap and keeps answering pings (no ANR dialog, §11.1). WP-07 + WP-13 measure 60 s on another workspace with and without the rule (audio, `frame-drop-count`, CPU). |
 | Render-thread rule (UI calling mpv) | `Player::mpv()` removed; UI gets only `render_core()` for context creation; controller-only `Arc<Mpv>`; D2. |
 | Text shaping (RTL, Indic) in egui | Fallback fonts + reshaper/bidi for labels (WP-01); accept Indic limitation; revisit if egui adds shaping. |
 | Provider connection limits | One stream, stop-before-start waiting for END_FILE, zap delay, budget fed from stored account info, preview autoplay and guide preview off by default (§11.5). |

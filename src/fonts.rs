@@ -10,10 +10,12 @@
 //!   Sans families; de-duplicated BY PATH (one CJK collection covers ja/zh/ko: ~19 MB once
 //!   instead of three times). `.ttc` collections use the face index.
 //! * Threading: [`FontSet::resolve`] (subprocesses, ~145 ms for 12 languages) and
-//!   [`FontSet::load`] (file reads) run OFF the UI thread — at startup on a helper thread
-//!   joined in the eframe creation callback, on reload in the theme watcher. The UI thread
-//!   only calls [`LoadedFonts::install`]. Font bytes are cached per (path, index) for the
-//!   process lifetime, so reinstalls don't re-read 19 MB files.
+//!   [`FontSet::load`] (opens and maps the files) run OFF the UI thread — at startup on a
+//!   helper thread joined in the eframe creation callback, on reload in the theme watcher. The
+//!   UI thread only calls [`LoadedFonts::install`].
+//! * Memory: font files are memory-mapped once per file for the process lifetime and egui
+//!   borrows the mapped bytes (`FontData::from_static`), so the ~25 MB of fallbacks are page
+//!   cache, not two heap copies (`map_font`).
 //! * Families installed into egui: `Proportional` and `Monospace` = [primary, fallbacks…,
 //!   egui defaults]; `Name("medium")`, `Name("bold")` = [face, fallbacks…].
 //! * egui has no shaping and no bidi: [`display_text`] reshapes Arabic (presentation forms via
@@ -22,7 +24,7 @@
 //! * Reload on `ThemeEvent::FontsChanged(Arc<LoadedFonts>)` (fonts.conf changed).
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -71,23 +73,15 @@ impl FontSet {
         Self { regular, medium, bold, fallbacks }
     }
 
-    /// Read the font files (cached per path+index). Blocking I/O: never on the UI thread.
-    /// The cache keeps only this set's faces afterwards, so fonts superseded by a `fonts.conf`
-    /// change are freed once egui drops them (a reload that keeps the CJK collection doesn't
-    /// re-read its ~19 MB).
+    /// Map the font files into memory ([`map_font`]: no copy, egui borrows the mapped bytes).
+    /// Blocking I/O (open, stat, mmap): never on the UI thread.
     pub fn load(&self) -> LoadedFonts {
         let get = |f: &FontFace| -> Option<Arc<FontData>> {
-            let key = (f.path.clone(), f.index);
-            if let Some(d) = FONT_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
-                return Some(d.clone());
-            }
-            match std::fs::read(&f.path) {
+            match map_font(&f.path) {
                 Ok(bytes) => {
-                    let mut fd = FontData::from_owned(bytes);
+                    let mut fd = FontData::from_static(bytes);
                     fd.index = f.index;
-                    let fd = Arc::new(fd);
-                    FONT_CACHE.lock().unwrap_or_else(|e| e.into_inner()).insert(key, fd.clone());
-                    Some(fd)
+                    Some(Arc::new(fd))
                 }
                 Err(e) => {
                     tracing::warn!("font {}: {e}", f.path.display());
@@ -95,20 +89,12 @@ impl FontSet {
                 }
             }
         };
-        let loaded = LoadedFonts {
+        LoadedFonts {
             regular: self.regular.as_ref().and_then(get),
             medium: self.medium.as_ref().and_then(get),
             bold: self.bold.as_ref().and_then(get),
             fallbacks: self.fallbacks.iter().filter_map(get).collect(),
-        };
-        let wanted: HashSet<(&Path, u32)> = self.faces().map(|f| (f.path.as_path(), f.index)).collect();
-        FONT_CACHE.lock().unwrap_or_else(|e| e.into_inner()).retain(|(path, index), _| wanted.contains(&(path.as_path(), *index)));
-        loaded
-    }
-
-    /// Every face of the set: regular, medium, bold, then the fallbacks.
-    fn faces(&self) -> impl Iterator<Item = &FontFace> {
-        self.regular.iter().chain(&self.medium).chain(&self.bold).chain(&self.fallbacks)
+        }
     }
 
     /// Convenience for tests/tools: load + install (blocking).
@@ -117,8 +103,90 @@ impl FontSet {
     }
 }
 
-type FontCache = Mutex<HashMap<(PathBuf, u32), Arc<FontData>>>;
-static FONT_CACHE: LazyLock<FontCache> = LazyLock::new(Mutex::default);
+/// A font file as mapped: path plus what tells a replaced file apart (an update installs a new
+/// file under the same name).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FileId {
+    path: PathBuf,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    inode: (u64, u64),
+}
+
+/// Every font file mapped so far, for the process lifetime.
+static MAPPED: LazyLock<Mutex<HashMap<FileId, &'static [u8]>>> = LazyLock::new(Mutex::default);
+
+/// The bytes of a font file, memory-mapped read-only and kept mapped for the rest of the
+/// process (egui's `FontData::from_static` borrows them; epaint copies `Cow::Owned` font bytes
+/// into a second buffer). The pages are the page cache's: only those glyph lookups touched are
+/// resident, they aren't anonymous memory or swap, and the kernel can drop them under pressure
+/// (the field report's 10 script fallbacks were 24.5 MB of files, held twice: ~50 MiB of heap).
+/// Mapping the same unchanged file again reuses its mapping, so a `fonts.conf` reload doesn't
+/// map anything twice; a replaced file is mapped anew and the old mapping stays (address space
+/// only — egui may still hold it). Package updates replace font files (new inode), which the
+/// mapping survives; a font file truncated in place while mapped would fault on access, so only
+/// files under `/usr` (the package manager's) are mapped: a user's own fonts (`cp new.ttf
+/// ~/.local/share/fonts/old.ttf` overwrites in place) are read once and kept instead.
+fn map_font(path: &Path) -> std::io::Result<&'static [u8]> {
+    let file = std::fs::File::open(path)?;
+    let meta = file.metadata()?;
+    let id = FileId {
+        path: path.to_owned(),
+        len: meta.len(),
+        modified: meta.modified().ok(),
+        #[cfg(unix)]
+        inode: {
+            use std::os::unix::fs::MetadataExt;
+            (meta.dev(), meta.ino())
+        },
+    };
+    let mut mapped = MAPPED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(bytes) = mapped.get(&id) {
+        return Ok(bytes);
+    }
+    let len = usize::try_from(meta.len()).map_err(|_| std::io::Error::other("font file too big"))?;
+    let bytes = if path.starts_with("/usr/") { map_read_only(&file, len)? } else { read_leaked(&file, len)? };
+    mapped.insert(id, bytes);
+    Ok(bytes)
+}
+
+/// Read the whole file and keep the bytes for the process (still no second copy inside egui).
+fn read_leaked(file: &std::fs::File, len: usize) -> std::io::Result<&'static [u8]> {
+    use std::io::Read;
+    let mut bytes = Vec::with_capacity(len);
+    (&*file).read_to_end(&mut bytes)?;
+    Ok(Box::leak(bytes.into_boxed_slice()))
+}
+
+/// `mmap(PROT_READ, MAP_PRIVATE)` of the whole file, never unmapped.
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+fn map_read_only(file: &std::fs::File, len: usize) -> std::io::Result<&'static [u8]> {
+    use std::ffi::{c_int, c_void};
+    use std::os::fd::AsRawFd;
+    const PROT_READ: c_int = 1;
+    const MAP_PRIVATE: c_int = 2;
+    unsafe extern "C" {
+        fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, offset: i64) -> *mut c_void;
+    }
+    if len == 0 {
+        return Ok(&[]);
+    }
+    // SAFETY: a fresh read-only private mapping of an open file (the fd may close afterwards);
+    // it is never unmapped, so the slice is valid for 'static (see `map_font` on truncation).
+    let p = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, file.as_raw_fd(), 0) };
+    if p as isize == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `p` maps `len` readable bytes for the rest of the process.
+    Ok(unsafe { std::slice::from_raw_parts(p.cast::<u8>(), len) })
+}
+
+/// Elsewhere: read once and keep.
+#[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
+fn map_read_only(file: &std::fs::File, len: usize) -> std::io::Result<&'static [u8]> {
+    read_leaked(file, len)
+}
 
 /// Font data ready to install (bytes already in memory).
 #[derive(Clone, Default)]
@@ -409,18 +477,71 @@ mod tests {
         out.textures_delta.clear();
     }
 
-    /// A reload drops the faces it no longer uses from the process-wide cache. Only eviction of
-    /// this test's own temp paths is asserted: other tests load concurrently through the same
-    /// cache and prune it to their own sets, so "still cached" would be racy here.
+    /// Font bytes are borrowed by egui (no copy inside epaint); a reload reads an unchanged
+    /// file once, a replaced file (an update) anew. A file outside `/usr` is read, not mapped:
+    /// overwriting it in place (same inode) leaves the bytes egui holds alone.
     #[test]
-    fn cache_keeps_only_the_current_set() {
+    fn font_files_are_mapped_not_copied() {
         let dir = tempfile::tempdir().unwrap();
-        let (cjk, old, new) = (temp_font(dir.path(), "cjk.ttc"), temp_font(dir.path(), "old.ttf"), temp_font(dir.path(), "new.ttf"));
-        let cached = |f: &FontFace| FONT_CACHE.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&(f.path.clone(), f.index));
-        let first = FontSet { regular: Some(old.clone()), fallbacks: vec![cjk.clone()], ..Default::default() }.load();
-        let second = FontSet { regular: Some(new), fallbacks: vec![cjk], ..Default::default() }.load();
-        assert!(!cached(&old), "superseded face evicted");
-        assert!(first.regular.is_some() && second.regular.is_some() && second.fallbacks.len() == 1);
+        let face = temp_font(dir.path(), "mapped.ttf");
+        let set = FontSet { regular: Some(face.clone()), ..Default::default() };
+        let (first, second) = (set.load(), set.load());
+        let bytes = |l: &LoadedFonts| match &l.regular.as_ref().expect("loaded").font {
+            Cow::Borrowed(b) => *b,
+            Cow::Owned(_) => panic!("font bytes copied onto the heap"),
+        };
+        assert_eq!(bytes(&first), std::fs::read(&face.path).unwrap().as_slice());
+        assert_eq!(bytes(&first).as_ptr(), bytes(&second).as_ptr(), "one mapping per file");
+        // an update installs a new file under the same name
+        std::fs::remove_file(&face.path).unwrap();
+        let mut updated = bytes(&first).to_vec();
+        updated.extend_from_slice(&[0; 16]);
+        std::fs::write(&face.path, &updated).unwrap();
+        let third = set.load();
+        assert_eq!(bytes(&third), updated.as_slice(), "the new file is mapped");
+        assert_eq!(bytes(&first), &updated[..updated.len() - 16], "the old mapping stays readable");
+        // `cp other.ttf mapped.ttf`: truncated and rewritten in place
+        std::fs::write(&face.path, b"short").unwrap();
+        assert_eq!(bytes(&third), updated.as_slice(), "egui's bytes untouched by an in-place overwrite");
+        let ctx = egui::Context::default();
+        third.install(&ctx);
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            ui.label("mapped");
+        });
+        assert!(!out.textures_delta.set.is_empty(), "font atlas built from the mapped bytes");
+        out.textures_delta.clear();
+    }
+
+    /// A packaged font (under `/usr`) is memory-mapped: page cache, not heap. Skipped where no
+    /// font is installed there.
+    #[test]
+    fn packaged_fonts_are_mapped() {
+        let Some(path) = ["/usr/share/fonts"].iter().find_map(|d| find_font(Path::new(d), 3)) else {
+            eprintln!("no font under /usr/share/fonts; skipping");
+            return;
+        };
+        let bytes = map_font(&path).unwrap();
+        assert_eq!(bytes, std::fs::read(&path).unwrap().as_slice());
+        assert_eq!(map_font(&path).unwrap().as_ptr(), bytes.as_ptr(), "mapped once");
+        #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+        {
+            let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+            assert!(maps.lines().any(|l| l.ends_with(path.to_str().unwrap())), "{} is a file mapping", path.display());
+        }
+    }
+
+    fn find_font(dir: &Path, depth: u32) -> Option<PathBuf> {
+        let mut dirs = Vec::new();
+        for e in std::fs::read_dir(dir).ok()?.flatten() {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x == "ttf" || x == "otf") && e.metadata().is_ok_and(|m| m.is_file() && m.len() > 0) {
+                return Some(p);
+            }
+            if p.is_dir() {
+                dirs.push(p);
+            }
+        }
+        (depth > 0).then(|| dirs.iter().find_map(|d| find_font(d, depth - 1))).flatten()
     }
 
     #[test]

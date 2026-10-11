@@ -7,7 +7,16 @@
 //! repaint request, so e.g. a volume change while paused is visible at once); continuous values
 //! (time-pos, cache) at most every 100 ms; a repaint for time-pos only when the whole second
 //! changes (radio must not repaint the UI at audio-packet rate).
+//!
+//! Logging (field report 2026-10-11: a day of drop-outs left no trace of what the player did):
+//! every state change of the current target at INFO with its source, item key and the time
+//! spent in the previous state (no title: explicit titles never reach INFO, DESIGN §20.3; the
+//! title is a DEBUG line per new target); recoveries ("recovered after 3 attempts in 41 s"); END_FILE
+//! reasons; HTTP statuses (rate-limited); provider messages; and every 10 minutes a health line
+//! (cache, drops, FFmpeg's own reconnects, memory). Stream addresses never appear: items are
+//! named by their key, mpv's lines are redacted by the event pump.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -30,8 +39,13 @@ const PROGRESS_EVERY: Duration = Duration::from_secs(10);
 const PUBLISH_EVERY: Duration = Duration::from_millis(100);
 /// Max wait for the old stream's END_FILE before loading anyway (stop-before-start).
 const PENDING_LOAD_MAX: Duration = Duration::from_millis(1500);
-/// No rendered frame for this long while Playing → `vid=no` (hidden window safety net).
-const SUSPEND_VIDEO_AFTER: Duration = Duration::from_secs(2);
+/// No rendered frame for this long while Playing → `vid=no` (hidden window safety net). Long
+/// enough that a quick workspace switch never suspends: decoding restarts mid-GOP on resume,
+/// and HEVC shows seconds of broken picture until the next keyframe (13 of 14 suspends in the
+/// field log were followed by hundreds of HEVC reference errors).
+const SUSPEND_VIDEO_AFTER: Duration = Duration::from_secs(10);
+/// Period of the health line in the log (stream + memory).
+const HEALTH_EVERY: Duration = Duration::from_secs(10 * 60);
 /// How long an END_FILE(error) during Loading waits for the log line that explains it:
 /// `mpv_wait_event` returns queued events before log messages, so ffmpeg's "HTTP error 403"
 /// (logged before the file ended) is delivered just AFTER the END_FILE.
@@ -75,6 +89,13 @@ pub fn spawn(
         recorded_video: None,
         fallback: None,
         elsewhere: None,
+        lease_media: None,
+        lease_played: false,
+        released: HashMap::new(),
+        http_log: MpvLog::default(),
+        logged: LoggedState { label: state_label(&PlayerState::Idle), who: "nothing".into(), since: Instant::now(), outage: None, provider: None },
+        last_health: Instant::now(),
+        ffmpeg_reconnects: 0,
     };
     std::thread::Builder::new().name("player".into()).spawn(move || c.run(cmd_rx, evt_rx))
 }
@@ -122,6 +143,33 @@ struct Controller {
     fallback: Option<MediaRef>,
     /// [`CopyPlay::elsewhere`] of the current title.
     elsewhere: Option<MediaRef>,
+    /// What the current lease is streaming.
+    lease_media: Option<MediaRef>,
+    /// The current lease's stream reached Playing (a stream the provider counted for sure).
+    lease_played: bool,
+    /// When each source's last leased stream closed, and what it was (connection-limit race
+    /// window, `state` module docs).
+    released: HashMap<SourceId, Released>,
+    /// Rate limiter of the HTTP status lines.
+    http_log: MpvLog,
+    /// The state last written to the log.
+    logged: LoggedState,
+    last_health: Instant,
+    /// FFmpeg's own reconnects of dropped transfers since the last health line.
+    ffmpeg_reconnects: u32,
+}
+
+/// The state last logged (see [`Controller::log_transition`]).
+struct LoggedState {
+    label: String,
+    /// The target it was about (kept for the line after a stop forgot the target).
+    who: String,
+    since: Instant,
+    /// A reconnect run in progress: (first failure, attempts so far).
+    outage: Option<(Instant, u32)>,
+    /// The provider message last logged at WARN, with the target it was about: a long outage
+    /// repeats it every attempt (DEBUG after the first).
+    provider: Option<(String, String)>,
 }
 
 impl Controller {
@@ -155,6 +203,11 @@ impl Controller {
                     let now = Instant::now();
                     state_changed |= self.feed(Input::Tick, now);
                     self.mpv_log.expire(now).iter().for_each(mpv_log::emit_summary);
+                    self.http_log.expire(now).iter().for_each(log_http_summary);
+                    if now.duration_since(self.last_health) >= HEALTH_EVERY {
+                        self.last_health = now;
+                        self.log_health();
+                    }
                     self.pending_tick(now);
                     self.video_watchdog(now);
                     if now.duration_since(self.last_progress) >= PROGRESS_EVERY
@@ -176,7 +229,87 @@ impl Controller {
         let pos = self.machine.last_position();
         let fx = self.machine.handle(input, now);
         self.apply(fx, pos);
+        if self.lease.is_some() && matches!(self.machine.state(), PlayerState::Playing) {
+            self.lease_played = true;
+        }
+        self.log_transition(now);
         *self.machine.state() != before
+    }
+
+    /// `source 2 xt:live:717661`: the current target, without its address or title.
+    fn target_label(&self) -> String {
+        self.machine.target().map_or_else(|| "nothing".into(), |p| playable_label(p))
+    }
+
+    /// Log a state change of the current target at INFO (once, however deeply `feed` nested):
+    /// `player: source 2 xt:live:717661 "ITV 4" Playing → Reconnecting(attempt 1, StreamEnded)
+    /// after 1h12m03s; retry in 0.5 s; cache 0.0 s`, and the end of a reconnect run
+    /// ("recovered after …", "gave up after …"). The start of each reconnect attempt
+    /// (Reconnecting → Loading) is DEBUG: its outcome follows.
+    fn log_transition(&mut self, now: Instant) {
+        let state = self.machine.state().clone();
+        let label = state_label(&state);
+        if label == self.logged.label {
+            return;
+        }
+        let took = fmt_duration(now.saturating_duration_since(self.logged.since));
+        let from = std::mem::replace(&mut self.logged.label, label);
+        self.logged.since = now;
+        if let Some(p) = self.machine.target() {
+            let who = playable_label(p);
+            if who != self.logged.who {
+                tracing::debug!("player: {who} is {:?}", p.title);
+                self.logged.who = who;
+            }
+        }
+        let line = format!("player: {} {from} → {} after {took}", self.logged.who, self.logged.label);
+        match &state {
+            PlayerState::Loading { .. } if from.starts_with("Reconnecting") => tracing::debug!("{line}"),
+            PlayerState::Reconnecting { at, .. } => {
+                // attempts of THIS outage (the machine's counter carries over a short recovery)
+                let (started, n) = self.logged.outage.unwrap_or((now, 0));
+                self.logged.outage = Some((started, n + 1));
+                let wait = at.saturating_duration_since(now).as_secs_f32();
+                tracing::info!("{line}; retry in {wait:.1} s; cache {}", self.snap.cache_secs.map_or("-".into(), |c| format!("{c:.1} s")));
+            }
+            PlayerState::Playing => {
+                tracing::info!("{line}");
+                if let Some((started, attempts)) = self.logged.outage.take() {
+                    let s = if attempts == 1 { "" } else { "s" };
+                    tracing::info!("player: recovered after {attempts} attempt{s} in {}", fmt_duration(now.saturating_duration_since(started)));
+                }
+            }
+            PlayerState::Error(_) | PlayerState::Idle | PlayerState::Ended | PlayerState::Zapping { .. } => {
+                tracing::info!("{line}");
+                if let Some((started, attempts)) = self.logged.outage.take()
+                    && matches!(state, PlayerState::Error(_))
+                {
+                    tracing::info!("player: gave up after {attempts} attempts in {}", fmt_duration(now.saturating_duration_since(started)));
+                }
+            }
+            _ => tracing::info!("{line}"),
+        }
+    }
+
+    /// The 10-minute health line: what plays and how well, and the process's memory.
+    fn log_health(&mut self) {
+        let mem = crate::platform::memstats::MemStats::sample().line();
+        let state = self.machine.state();
+        let reconnects = std::mem::take(&mut self.ffmpeg_reconnects);
+        if matches!(state, PlayerState::Playing | PlayerState::Buffering { .. } | PlayerState::Paused) {
+            let int = |name: &str| self.mpv.get_property::<i64>(name).ok();
+            let speed = int("cache-speed").map_or("-".into(), |b| format!("{} KiB/s", b / 1024));
+            let (vo, dec) = (int("frame-drop-count").unwrap_or(0), int("decoder-frame-drop-count").unwrap_or(0));
+            tracing::info!(
+                "health: {} {}; cache {} at {speed}; {vo} frames dropped ({dec} by the decoder); {reconnects} FFmpeg reconnects; hwdec {}; {mem}",
+                self.target_label(),
+                state_label(state),
+                self.snap.cache_secs.map_or("-".into(), |c| format!("{c:.1} s")),
+                self.snap.hwdec.as_deref().unwrap_or("no"),
+            );
+        } else {
+            tracing::info!("health: {}; {mem}", state_label(state));
+        }
     }
 
     /// Execute effects in order. `pos` = position of the target that was current when the
@@ -225,6 +358,9 @@ impl Controller {
 
     fn release_lease(&mut self) {
         if let Some(l) = self.lease.take() {
+            if let Some(media) = self.lease_media.take() {
+                self.released.insert(l.source, Released { at: Instant::now(), media, played: std::mem::take(&mut self.lease_played) });
+            }
             self.budget.release(l);
         }
         self.lease_entry = None;
@@ -258,7 +394,11 @@ impl Controller {
         self.release_lease();
         if let Some(src) = p.source_id {
             match self.budget.try_acquire(src) {
-                Ok(l) => self.lease = Some(l),
+                Ok(l) => {
+                    self.lease = Some(l);
+                    self.lease_media = Some(p.media.clone());
+                    self.lease_played = false;
+                }
                 Err(e) => {
                     self.feed(Input::Fail(PlayerError { kind: PlayerErrorKind::Budget, message: e.to_string() }), Instant::now());
                     return;
@@ -294,6 +434,32 @@ impl Controller {
         tracing::debug!("loadfile: entry {entry:?}");
         self.lease_entry = entry;
         self.feed(Input::Loaded { entry }, Instant::now());
+        let closed = p.source_id.and_then(|s| self.other_stream_closed(s, &p.media));
+        if let Some(at) = closed {
+            tracing::debug!("another stream of this source closed {:?} ago: a 403 is the connection-limit race", at.elapsed());
+        }
+        self.feed(Input::SourceClosed(closed), Instant::now());
+    }
+
+    /// When a stream of `source` closed within the race window, on a source whose limit is one
+    /// connection or unknown (the provider may still count it): see [`race_close`].
+    fn other_stream_closed(&self, source: SourceId, media: &MediaRef) -> Option<Instant> {
+        let one = self.budget.limit(source).is_none_or(|m| m <= 1);
+        race_close(self.released.get(&source).filter(|_| one), media, Instant::now(), self.machine.policy().race_window)
+    }
+
+    /// The provider's message behind a playlist redirect, if the "playlist" was prose: mpv's
+    /// playlist parser reads a headerless `.m3u8` body line by line and makes each line an
+    /// entry (see [`provider_text`]). Only entries the redirect inserted (`inserted` = the
+    /// first one's id) are read.
+    fn provider_message(&self, inserted: Option<i64>) -> Option<String> {
+        let n = self.mpv.get_property::<i64>("playlist-count").ok()?;
+        let lines: Vec<String> = (0..n.min(16))
+            .filter(|i| inserted.is_none_or(|first| self.mpv.get_property::<i64>(&format!("playlist/{i}/id")).is_ok_and(|id| id >= first)))
+            .filter_map(|i| self.mpv.get_property::<String>(&format!("playlist/{i}/filename")).ok())
+            .filter_map(|f| provider_text(&f))
+            .collect();
+        (!lines.is_empty()).then(|| crate::redact::redact(&lines.join(" ")).into_owned())
     }
 
     fn resolve_and_play(&mut self, req: PlayRequest) -> bool {
@@ -361,7 +527,11 @@ impl Controller {
             Some((Ok(mut p), _)) => {
                 let failed = failed.as_deref();
                 p.start_at = failed.and_then(|f| f.start_at);
-                tracing::info!("{} failed before its first frame ({:?}); playing the next copy", failed.map_or("", |f| f.title.as_str()), err.kind);
+                tracing::info!(
+                    "player: {} failed before its first frame ({:?}); playing the next copy",
+                    failed.map_or_else(|| "nothing".into(), playable_label),
+                    err.kind
+                );
                 let ev = PlayerEvent::FellBack {
                     title: failed.map_or_else(|| p.title.clone(), |f| f.title.clone()),
                     from: failed.and_then(|f| f.source_id),
@@ -540,7 +710,11 @@ impl Controller {
         let since_epoch = now.duration_since(self.epoch).as_millis() as u64;
         let idle = Duration::from_millis(since_epoch.saturating_sub(last));
         if idle > SUSPEND_VIDEO_AFTER && matches!(self.machine.state(), PlayerState::Playing) {
-            tracing::info!("no frames rendered for {idle:?}; suspending video decoding");
+            // the clock is stamped per UI frame: a visible window over a stream that stopped
+            // advancing stops repainting too
+            let advancing = self.machine.position_changed_at().is_some_and(|t| now.saturating_duration_since(t) < Duration::from_secs(3));
+            let why = if advancing { "the window is hidden; playback continues" } else { "playback isn't advancing either" };
+            tracing::info!("no frames rendered for {idle:?} ({why}); suspending video decoding");
             let _ = self.mpv.set_property("vid", "no");
             self.snap.video_suspended = true;
             self.force_publish = true;
@@ -550,7 +724,12 @@ impl Controller {
     /// Feed an END_FILE and release the lease of the stream that just closed (starting a load
     /// that waited for it, see [`Controller::load`]).
     fn end_file(&mut self, reason: EndReason, error: i32, entry_id: i64, inserted: Option<i64>) -> bool {
-        tracing::debug!("END_FILE entry {entry_id}: {reason:?} ({error}) in {:?}", self.machine.state());
+        let line = format!("END_FILE entry {entry_id}: {reason:?} ({error}) in {}", state_label(self.machine.state()));
+        if self.machine.owns_entry(entry_id) && matches!(reason, EndReason::Eof | EndReason::Error | EndReason::Unknown) {
+            tracing::info!("{line}");
+        } else {
+            tracing::debug!("{line}");
+        }
         let changed = self.feed(Input::EndFile { reason, error, entry: entry_id }, Instant::now());
         match lease_on_end(self.lease_entry, entry_id, reason, inserted) {
             LeaseOnEnd::Unrelated => {}
@@ -606,14 +785,40 @@ impl Controller {
                     self.deferred_end = Some((reason, error, entry_id, now + END_FILE_LOG_GRACE));
                     return changed;
                 }
+                // a live channel's address answered with the provider's message instead of a
+                // playlist: stop before mpv requests the "address" made of it
+                if reason == EndReason::Redirect
+                    && self.machine.owns_entry(entry_id)
+                    && self.machine.target().is_some_and(|t| t.kind.is_live())
+                    && let Some(text) = self.provider_message(inserted)
+                {
+                    let about = (self.target_label(), text.clone());
+                    if self.logged.provider.as_ref() == Some(&about) {
+                        tracing::debug!("player: the provider answered with the same message again");
+                    } else {
+                        tracing::warn!("player: the provider answered with a message instead of a stream: {text:?}");
+                        self.logged.provider = Some(about);
+                    }
+                    let changed = self.end_file(reason, error, entry_id, inserted) || changed;
+                    return self.feed(Input::ProviderMessage(text), now) || changed;
+                }
                 self.end_file(reason, error, entry_id, inserted) || changed
             }
             MpvEvent::Log { level, prefix, text } => {
                 if let Some(code) = http_status_in(&text) {
-                    tracing::debug!("HTTP {code} in {:?}", self.machine.state());
+                    let (verdict, summary) = self.http_log.admit(&format!("HTTP {code}"), tracing::Level::INFO, now);
+                    if let Some(s) = summary {
+                        log_http_summary(&s);
+                    }
+                    if verdict != mpv_log::Verdict::Suppress {
+                        tracing::info!("HTTP {code} in {}", state_label(self.machine.state()));
+                    }
                     self.feed(Input::HttpStatus(code), now);
                 }
-                let (verdict, summary) = self.mpv_log.admit(&prefix, mpv_log::level_of(&level), now);
+                if mpv_log::is_internal_reconnect(&text) {
+                    self.ffmpeg_reconnects += 1;
+                }
+                let (verdict, summary) = self.mpv_log.admit(&prefix, mpv_log::level_for(&level, &text), now);
                 if let Some(s) = summary {
                     mpv_log::emit_summary(&s);
                 }
@@ -789,6 +994,76 @@ impl Controller {
     }
 }
 
+/// A state for the log: without instants and buffering percentages, so only real changes differ.
+/// A leased stream that closed (see [`race_close`]).
+#[derive(Debug, Clone)]
+struct Released {
+    at: Instant,
+    media: MediaRef,
+    /// It reached Playing: the provider counted it.
+    played: bool,
+}
+
+/// The close that opens the connection-limit race window for a load of `media`: a stream that
+/// closed less than `window` ago and was either another stream (a zap) or this one after it
+/// played (stop, then restart the same channel). Our own failed attempts never played, so a
+/// refused channel never re-arms its own window.
+fn race_close(closed: Option<&Released>, media: &MediaRef, now: Instant, window: Duration) -> Option<Instant> {
+    let c = closed?;
+    ((c.media != *media || c.played) && now.saturating_duration_since(c.at) < window).then_some(c.at)
+}
+
+/// `source 2 xt:live:717661`: a target for the log (no address, no title).
+fn playable_label(p: &Playable) -> String {
+    let source = p.source_id.map_or_else(|| "no source".to_owned(), |s| format!("source {}", s.0));
+    let item = p.item.as_ref().map_or("ad-hoc", |i| i.key.0.as_str());
+    format!("{source} {item}")
+}
+
+fn state_label(s: &PlayerState) -> String {
+    match s {
+        PlayerState::Idle => "Idle".into(),
+        PlayerState::Zapping { .. } => "Zapping".into(),
+        PlayerState::Loading { attempt: 0, .. } => "Loading".into(),
+        PlayerState::Loading { attempt, .. } => format!("Loading(attempt {attempt})"),
+        PlayerState::Playing => "Playing".into(),
+        PlayerState::Paused => "Paused".into(),
+        PlayerState::Buffering { .. } => "Buffering".into(),
+        PlayerState::Reconnecting { attempt, max, reason, .. } => {
+            let of = if *max == 0 { String::new() } else { format!("/{max}") };
+            format!("Reconnecting(attempt {attempt}{of}, {reason:?})")
+        }
+        PlayerState::Ended => "Ended".into(),
+        PlayerState::Error(e) => format!("Error({:?}: {})", e.kind, crate::redact::redact(&e.message)),
+    }
+}
+
+/// `4.2 s`, `3m05s`, `1h12m03s`.
+fn fmt_duration(d: Duration) -> String {
+    let s = d.as_secs();
+    match s {
+        0..60 => format!("{:.1} s", d.as_secs_f32()),
+        60..3600 => format!("{}m{:02}s", s / 60, s % 60),
+        _ => format!("{}h{:02}m{:02}s", s / 3600, s / 60 % 60, s % 60),
+    }
+}
+
+fn log_http_summary((what, n, _): &mpv_log::Summary) {
+    tracing::info!("{what}: {n} more in the last 10 s");
+}
+
+/// The text of a playlist "entry" that was a line of the provider's prose: mpv joins each line
+/// of a headerless `.m3u8` body onto the playlist's directory, so the provider's "Cannot read
+/// /home/nxt/storage/streams/717661_.m3u8" becomes `http://host/live/u/p/Cannot read
+/// /home/nxt/storage/streams/717661_.m3u8`. A real address has no whitespace; the text starts
+/// after the last `/` before the first whitespace. At most 200 characters.
+fn provider_text(entry: &str) -> Option<String> {
+    let ws = entry.find(char::is_whitespace)?;
+    let start = entry[..ws].rfind('/').map_or(0, |i| i + 1);
+    let text = entry[start..].split_whitespace().collect::<Vec<_>>().join(" ");
+    (!text.is_empty()).then(|| text.chars().take(200).collect())
+}
+
 /// What an END_FILE does to the connection lease.
 #[derive(Debug, PartialEq)]
 enum LeaseOnEnd {
@@ -865,6 +1140,49 @@ mod tests {
         assert_eq!(must_stop_first(Some(&lease), Some(7), None, &budget), None, "ad-hoc URL without a source");
         assert_eq!(must_stop_first(Some(&lease), None, Some(a), &budget), None, "no open entry");
         assert_eq!(must_stop_first(None, Some(7), Some(a), &budget), None, "nothing leased");
+    }
+
+    /// Review fix: stopping a channel and restarting it at once on a one-connection account is
+    /// the same race as a zap; a failed attempt of the same channel is not.
+    #[test]
+    fn race_window_opens_after_a_zap_or_a_restart_of_what_played() {
+        let now = Instant::now();
+        let w = Duration::from_secs(45);
+        let a = MediaRef::Url("a".into());
+        let b = MediaRef::Url("b".into());
+        let closed = |media: &MediaRef, played: bool, ago: u64| Released { at: now - Duration::from_secs(ago), media: media.clone(), played };
+        assert_eq!(race_close(Some(&closed(&a, false, 5)), &b, now, w), Some(now - Duration::from_secs(5)), "zap");
+        assert_eq!(race_close(Some(&closed(&a, true, 5)), &a, now, w), Some(now - Duration::from_secs(5)), "stop + restart");
+        assert_eq!(race_close(Some(&closed(&a, false, 5)), &a, now, w), None, "our own failed attempt");
+        assert_eq!(race_close(Some(&closed(&a, true, 50)), &b, now, w), None, "too long ago");
+        assert_eq!(race_close(None, &a, now, w), None);
+    }
+
+    #[test]
+    fn provider_text_is_the_prose_joined_onto_the_playlist_address() {
+        assert_eq!(
+            provider_text("http://h:8080/live/user/pass/Cannot read /home/nxt/storage/streams/717661_.m3u8").as_deref(),
+            Some("Cannot read /home/nxt/storage/streams/717661_.m3u8")
+        );
+        assert_eq!(provider_text("http://h/live/Max connections  reached\t").as_deref(), Some("Max connections reached"));
+        assert_eq!(provider_text("Stream not available"), Some("Stream not available".into()), "not joined");
+        assert_eq!(provider_text("http://h/live/u/p/717661.ts"), None, "a real address");
+        assert_eq!(provider_text("http://h/s/abc/seg001.ts?token=a%20b"), None);
+        assert_eq!(provider_text(&format!("http://h/{}", "x y".repeat(200))).map(|t| t.chars().count()), Some(200));
+    }
+
+    #[test]
+    fn log_labels_and_durations() {
+        let now = Instant::now();
+        assert_eq!(state_label(&PlayerState::Buffering { since: now, percent: Some(40) }), "Buffering");
+        assert_eq!(state_label(&PlayerState::Loading { since: now, attempt: 2 }), "Loading(attempt 2)");
+        let r = PlayerState::Reconnecting { attempt: 4, max: 0, at: now, reason: PlayerErrorKind::ProviderError };
+        assert_eq!(state_label(&r), "Reconnecting(attempt 4, ProviderError)");
+        let r = PlayerState::Reconnecting { attempt: 1, max: 8, at: now, reason: PlayerErrorKind::Network };
+        assert_eq!(state_label(&r), "Reconnecting(attempt 1/8, Network)");
+        assert_eq!(fmt_duration(Duration::from_millis(4200)), "4.2 s");
+        assert_eq!(fmt_duration(Duration::from_secs(185)), "3m05s");
+        assert_eq!(fmt_duration(Duration::from_secs(4323)), "1h12m03s");
     }
 
     #[test]

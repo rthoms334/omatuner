@@ -13,9 +13,10 @@
 //! `App::logic` then calls [`VideoHost::render`] next frame with the requested physical size
 //! (one-frame resize lag, invisible in practice; spike-verified resize path).
 //! Overlays inside the video rect use the FIXED dark scrim (never theme colours): Loading
-//! (channel logo + name + spinner), Buffering (percent), Reconnecting (attempt n/max +
-//! countdown), Error (glyph + message + "r Retry · Backspace Last channel"), Radio (logo +
-//! now playing instead of black).
+//! (channel logo + name + spinner), Buffering (percent), Reconnecting ("attempt n", or n/max
+//! while the attempts are bounded, + countdown, and a Stop button: a channel that played keeps
+//! reconnecting until stopped), Error (glyph + message + "r Retry · Backspace Last channel"),
+//! Radio (logo + now playing instead of black).
 //!
 //! The overlay's logo is the channel logo through the image cache (screens pass it to
 //! [`VideoHost::paint`]; the last texture is kept for the mini-player, which the app draws
@@ -65,6 +66,8 @@ pub enum StateAction {
     LastChannel,
     /// "Play from TV 2 at 41:20": the title's other copy after a failure (Ctrl+O; DESIGN §29.14).
     OtherCopy,
+    /// Stop the reconnects and close the player (`q`).
+    Stop,
 }
 
 /// Where the player draws a [`StateAction`] button this frame (laid out by the state overlay,
@@ -248,6 +251,9 @@ impl VideoHost {
             if live && snap.previous_live.is_some() {
                 list.push((StateAction::LastChannel, format!("{}  Last channel", glyphs::HISTORY)));
             }
+            if reconnecting {
+                list.push((StateAction::Stop, format!("{}  Stop", glyphs::STOP)));
+            }
             let pad = egui::vec2(gap, gap / 2.0);
             let sizes: Vec<egui::Vec2> = list.iter().map(|(_, s)| p.layout_no_wrap(s.clone(), font.clone(), t.osd_text).size() + 2.0 * pad).collect();
             let total = sizes.iter().map(|s| s.x).sum::<f32>() + gap * (sizes.len() as f32 - 1.0);
@@ -317,7 +323,7 @@ impl VideoHost {
             PlayerState::Reconnecting { attempt, max, at, reason } => {
                 p.rect_filled(rect, 0.0, t.osd_scrim);
                 let secs = at.saturating_duration_since(Instant::now()).as_secs_f32().ceil() as u64;
-                let head = format!("Reconnecting… ({attempt}/{max})");
+                let head = reconnecting_head(*attempt, *max);
                 let detail = if secs > 0 {
                     format!("{} · retrying in {secs} s", reason_label(*reason))
                 } else {
@@ -528,15 +534,23 @@ pub(crate) fn error_copy(kind: PlayerErrorKind, message: &str) -> (String, Strin
         PlayerErrorKind::Unsupported => "This stream's format isn't supported",
         PlayerErrorKind::Resolve => "Couldn't open this item",
         PlayerErrorKind::Budget => "Connection limit reached for this playlist",
+        PlayerErrorKind::ProviderError => "The provider can't deliver this channel right now",
         PlayerErrorKind::HttpOther(_) | PlayerErrorKind::Mpv => "Playback failed",
     };
     let detail = if detail.is_empty() || detail == head { String::new() } else { detail };
     (head.to_owned(), detail)
 }
 
+/// Headline of the reconnect overlay: "attempt n" when the player keeps trying (`max` 0: a
+/// channel that played, the connection-limit race), "n/max" while the attempts are bounded.
+pub(crate) fn reconnecting_head(attempt: u32, max: u32) -> String {
+    if max == 0 { format!("Reconnecting… attempt {attempt}") } else { format!("Reconnecting… ({attempt}/{max})") }
+}
+
 /// Short reason for the reconnect line.
 fn reason_label(kind: PlayerErrorKind) -> &'static str {
     match kind {
+        PlayerErrorKind::ProviderError => "The provider can't deliver this channel",
         PlayerErrorKind::HttpForbidden => "Refused by the provider",
         PlayerErrorKind::HttpNotFound => "Not found",
         PlayerErrorKind::Timeout => "Timed out",
@@ -553,12 +567,12 @@ pub(crate) fn recovery_hint(placement: Placement, live: bool, has_last_channel: 
     match placement {
         Placement::Mini => "Click to open the player",
         // Enter on a failed channel plays it again (`playing_channel` ignores the error);
-        // while reconnecting the player retries by itself
-        Placement::Preview if reconnecting => "Shift+Enter fullscreen",
+        // while reconnecting the player retries by itself (until stopped)
+        Placement::Preview if reconnecting => "Shift+Enter fullscreen · Ctrl+Shift+S Stop",
         Placement::Preview => "Enter retries · Shift+Enter fullscreen",
         Placement::Fullscreen | Placement::None => match (reconnecting, live && has_last_channel) {
-            (true, true) => "r Retry now · Backspace Last channel",
-            (true, false) => "r Retry now",
+            (true, true) => "r Retry now · Backspace Last channel · q Stop",
+            (true, false) => "r Retry now · q Stop",
             (false, true) => "r Retry · Backspace Last channel",
             (false, false) => "r Retry",
         },
@@ -660,13 +674,23 @@ mod tests {
         assert_eq!(d, "HTTP 403");
         assert_eq!(error_copy(PlayerErrorKind::HttpNotFound, "").0, "Channel offline");
         assert!(error_copy(PlayerErrorKind::Drm, "x").0.starts_with("DRM"));
+        let (h, d) = error_copy(PlayerErrorKind::ProviderError, "The provider said: “Cannot read /home/x/streams/1_.m3u8”");
+        assert_eq!(h, "The provider can't deliver this channel right now");
+        assert!(d.contains("Cannot read"), "the provider's own words: {d}");
+    }
+
+    /// Field fix: an unbounded reconnect reads "attempt n", never "(n/0)".
+    #[test]
+    fn reconnecting_head_never_shows_a_zero_maximum() {
+        assert_eq!(reconnecting_head(12, 0), "Reconnecting… attempt 12");
+        assert_eq!(reconnecting_head(2, 8), "Reconnecting… (2/8)");
     }
 
     #[test]
     fn recovery_hints_name_keys_that_work_where_the_video_is() {
         assert_eq!(recovery_hint(Placement::Fullscreen, true, true, false), "r Retry · Backspace Last channel");
         assert_eq!(recovery_hint(Placement::Fullscreen, true, false, false), "r Retry", "no last channel to go back to");
-        assert_eq!(recovery_hint(Placement::Fullscreen, false, true, true), "r Retry now");
+        assert_eq!(recovery_hint(Placement::Fullscreen, false, true, true), "r Retry now · q Stop");
         // the Live list: `r` types into the filter, Backspace goes back a pane
         for reconnecting in [false, true] {
             let h = recovery_hint(Placement::Preview, true, true, reconnecting);

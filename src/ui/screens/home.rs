@@ -487,12 +487,16 @@ pub struct HomeScreen {
     /// Bumped whenever `continue_items` is replaced.
     continue_gen: u64,
     continue_loader: Option<Loader<Vec<ContinueItem>>>,
-    /// Library build the "recently added" lists and `vod_refs` were taken from.
+    /// Library build the "recently added" lists were taken from.
     recent_built_at: Timestamp,
     recent_movies: Vec<VodSummary>,
     recent_series: Vec<VodSummary>,
-    /// (kind, source, key) → movie / series of the library build (favourited VOD lookups).
+    /// (kind, source, key) → movie / series of the favourited titles (all lists), and the
+    /// (VOD lists, favourites fingerprint) they were resolved for: a zap's library copy shares
+    /// the lists and rescans nothing. Only favourites: a map of every title cloned every key
+    /// (~40 MiB for 380k titles).
     vod_refs: HashMap<ItemRef, VodKind>,
+    vod_refs_for: Option<(crate::store::library::VodIdentity, u64)>,
     /// The rails the user sees (actions resolve against them).
     rails: Vec<Rail>,
     rails_key: Option<RailsKey>,
@@ -543,11 +547,11 @@ impl HomeScreen {
             };
             self.recent_movies = take(true, &ctx.lib.vod.movies);
             self.recent_series = take(false, &ctx.lib.vod.series);
-            self.vod_refs.clear();
         }
-        let has_vod_favs = ctx.favs.lists.iter().any(|l| ctx.favs.items(l.id).iter().any(|r| matches!(r.kind, ItemKind::Movie | ItemKind::Series)));
-        if has_vod_favs && self.vod_refs.is_empty() {
-            self.vod_refs = ctx.lib.vod.movies.iter().chain(&ctx.lib.vod.series).map(|v| (vod_ref(v), v.kind)).collect();
+        let refs_for = (ctx.lib.vod_identity(), key.favs);
+        if self.vod_refs_for.as_ref() != Some(&refs_for) {
+            self.vod_refs_for = Some(refs_for);
+            self.vod_refs = favourite_vod(ctx.lib, ctx.favs);
         }
         let mut rails = Vec::new();
         // a title's copies are one tile: the first (newest) of them in Continue watching, the
@@ -921,6 +925,29 @@ fn vod_group_locked(ctx: &UiCtx<'_>, v: &VodSummary) -> bool {
         VodKind::Series(_) => &ctx.lib.vod.series_groups,
     };
     kit::any_group_locked(groups, &v.group_ids)
+}
+
+/// The favourited movies and series (any list) of the library, by their refs (one pass over
+/// the titles; only the favourites' keys are cloned).
+fn favourite_vod(lib: &crate::store::library::Library, favs: &FavIndex) -> HashMap<ItemRef, VodKind> {
+    let wanted: std::collections::HashSet<(crate::model::SourceId, ItemKind, &str)> = favs
+        .lists
+        .iter()
+        .flat_map(|l| favs.items(l.id))
+        .filter(|r| matches!(r.kind, ItemKind::Movie | ItemKind::Series))
+        .map(|r| (r.source, r.kind, r.key.0.as_str()))
+        .collect();
+    if wanted.is_empty() {
+        return HashMap::new();
+    }
+    let kind_of = |v: &VodSummary| if matches!(v.kind, VodKind::Movie(_)) { ItemKind::Movie } else { ItemKind::Series };
+    lib.vod
+        .movies
+        .iter()
+        .chain(&lib.vod.series)
+        .filter(|v| wanted.contains(&(v.source_id, kind_of(v), v.key.0.as_str())))
+        .map(|v| (vod_ref(v), v.kind))
+        .collect()
 }
 
 /// The durable reference of a poster-grid row.
@@ -2224,6 +2251,48 @@ mod tests {
         h.run_steps(1);
         assert_ne!(h.state().s.rails_key, key, "a favourite rebuilds them");
         assert!(has_label(&h, "FAVOURITES"));
+    }
+
+    /// Favourited movies are resolved by key for their rail, and only they (a map of every
+    /// title cloned every key: ~40 MiB for 380k titles); one favourited later joins the rail.
+    #[test]
+    fn only_favourite_titles_are_resolved_for_the_rails() {
+        let (mut t, one) = rig();
+        let src = seed(&mut t, |c| {
+            let s = testkit::source(c, "My IPTV")?;
+            testkit::movies(c, s, 4)?;
+            let list = crate::store::user::default_fav_list(c)?;
+            crate::store::user::set_favourite(c, list, &movie_ref(s, 1), true, 1)?;
+            Ok(s)
+        });
+        let mut h = harness(t, one, HomeScreen::default(), egui::vec2(1200.0, 800.0));
+        h.state_mut().enter(Route::Home);
+        h.run_steps(2);
+        assert_eq!(h.state().s.vod_refs.keys().collect::<Vec<_>>(), [&movie_ref(src, 1)]);
+        assert!(has_label(&h, "FAVOURITES"));
+        let app = h.state_mut();
+        let list = app.t.favs.default_list().unwrap();
+        app.t.favs.apply_toggle(list, &movie_ref(src, 3), true);
+        h.run_steps(1);
+        assert_eq!(h.state().s.vod_refs.len(), 2);
+        let favs = h.state().s.rails.iter().find(|r| r.kind == RailKind::Favourites).map(|r| r.tiles.len());
+        assert_eq!(favs, Some(2), "both favourites have a tile");
+        // a zap (the library copied with another recent list) shares the VOD lists: the rails
+        // are rebuilt for the recent list, the titles are not resolved again
+        let resolved = h.state().s.vod_refs_for.clone();
+        let app = h.state_mut();
+        app.t.lib = Arc::new(app.t.lib.with_recent_channels(Vec::new()));
+        h.run_steps(2);
+        assert!(resolved.is_some() && h.state().s.vod_refs_for == resolved, "no rescan for a zap");
+        // a rebuild has new lists (and the favourites as stored: the toggle above was in memory)
+        testkit::reload_library(&mut h.state_mut().t);
+        h.run_steps(2);
+        assert!(h.state().s.vod_refs_for != resolved);
+        assert_eq!(h.state().s.vod_refs.keys().collect::<Vec<_>>(), [&movie_ref(src, 1)]);
+    }
+
+    fn movie_ref(s: SourceId, i: usize) -> ItemRef {
+        ItemRef { source: s, kind: ItemKind::Movie, key: crate::model::ItemKey(format!("m3u:movie{i:010}")) }
     }
 
     /// With two playlists every card and tile says which one its item comes from — its own,
