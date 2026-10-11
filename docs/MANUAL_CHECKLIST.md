@@ -1107,3 +1107,42 @@ PIN set, English audio first. Every check in *All playlists* unless it says othe
     TV"); Show each copy makes every copy a card again at once (no rebuild); Home's rails and
     Search show one tile / row per stack with both playlists; Shift+Enter there plays the copy
     that plays first.
+
+## 19. Keyboard: arrows between panes (Omarchy style)
+
+The keys are covered by tests; these checks are about how it feels with real key repeat, at each
+layout. Use only the keyboard.
+
+- [ ] **Settings:**
+  - **Do:** open Settings ▸ Interface, move down to a choice (Density), a toggle (Channel
+    numbers) and a number (Preview delay) and press ← on each. In the page list press ↓ to
+    Favourites, ↑ back, then →. On the same rows press →, Shift+→, Shift+← (and L / H). Hold ←.
+  - **Expect:** ← always lights the page list and never changes a value; ↓/↑ switch the page;
+    → returns to the same page. → and Shift+→ raise a value / pick the next option, Shift+←
+    lowers it; a toggle turns on with → and off with Shift+←, Enter flips it. Holding ← stays
+    in the page list. The hint line reads "→ change"; `?` lists "Back to the page list".
+- [ ] **Settings source editor:**
+  - **Do:** open a playlist's editor, change its colour with Shift+→, press ← and then ↓ in the
+    page list (hold ↓ too). Press Esc, then ← and ↓. Also click another page, and press ← then
+    Esc, while the change is unsaved.
+  - **Expect:** ← keeps the editor open; with the change unsaved, ↓ (the click, or Esc in the
+    page list) stays on Playlists with one "Unsaved playlist changes: Enter on Save, or Esc to
+    discard" and lights the editor again (holding ↓ then moves through its rows); the next Esc
+    discards the change, and after ← ↓ moves on.
+- [ ] **Live TV (Wide, Tiled, Compact):**
+  - **Do:** in the channel list type a few letters, then press ←. Press → (or Enter) on a group.
+  - **Expect:** ← moves the highlight to the groups (Tiled: the drawer opens; Compact: the
+    groups show) and the channel filter is still there when you come back. → / Enter open the
+    group in the channels.
+- [ ] **Movies and Series (Wide, Tiled):**
+  - **Do:** in the grid press ← until the first column, then once more. Type a filter that
+    matches nothing and press ←. In the categories press →.
+  - **Expect:** ← walks the posters, then lights the categories (Tiled: the drawer opens), also
+    while filtering — the filter stays — and on an empty grid. → opens the category in the grid.
+- [ ] **No change where ←/→ mean something else:**
+  - **Do:** press ←/→ in the guide, on a detail page, in the player (live and a movie), in a
+    text field (Settings, a rename), in onboarding and in Edit information. In a player side
+    panel (`c`) type a letter, then press ←.
+  - **Expect:** the guide moves between programmes (← goes into the past), detail pages walk
+    their buttons, the player zaps / seeks, text fields move the cursor, onboarding and Edit
+    information change values. The filtered side panel closes with ← (no channel change).

@@ -10,11 +10,15 @@
 //! Model: every page is a list of [`Row`]s rebuilt from the config, the library and the rows
 //! read off the UI thread (sources, EPG sources, reminders, orphans, hidden VOD — re-read on
 //! the matching `DataScope`). Keys (Panel idiom, `[Panel]` / `[TextInput, Panel]`):
-//! ↑/↓ (j/k) move, ←/→ (h/l) adjust, Enter/Space toggle or open, x/Delete the row's menu,
-//! Alt+↑/↓ (K/J) reorder, Tab switches between the page list and the page, Esc leaves a text
-//! field, then the page. Config rows apply through `ctx.edit_config` (saved, applied live);
-//! store rows go through the writer and its `DataScope` notification. Changing parental
-//! settings needs the open PIN session once a PIN exists.
+//! ↑/↓ (j/k) move, ← (h) steps back to the page list from any row (spatial panes, DESIGN
+//! §15.1), → (l) / Shift+→ (L) increase or pick the next option, Shift+← (H) decrease,
+//! Enter/Space toggle or open, x/Delete the row's menu, Alt+↑/↓ (K/J) reorder, Tab switches
+//! between the page list and the page (→ / Enter back into it), Esc leaves a text field, then
+//! the page. A source editor with unsaved changes keeps its page: ↑/↓, Esc or a click in the
+//! page list say so and return to the editor instead of dropping the changes. Config rows
+//! apply through `ctx.edit_config` (saved, applied live); store rows go through the writer and
+//! its `DataScope` notification. Changing parental settings needs the open PIN session once a
+//! PIN exists.
 //!
 //! Xtream upgrade (DESIGN §27.3): a playlist that signed in with its Xtream login reads
 //! "Xtream (from M3U)"; its editor (and that of a playlist kept as M3U) has "Use the Xtream
@@ -499,8 +503,9 @@ impl Row {
     }
 }
 
-/// The source editor's working copy.
-#[derive(Debug, Clone)]
+/// The source editor's working copy. Every field is user-editable: `is_changed` compares the
+/// whole struct, so transient UI state (a status, a validation message) must live outside it.
+#[derive(Debug, Clone, PartialEq)]
 struct SourceEditor {
     original: Source,
     name: String,
@@ -576,6 +581,14 @@ impl SourceEditor {
         rebased(&mut self.in_all, &old.in_all, &new.in_all);
         self.use_xtream = new.use_xtream;
         self.original = s.clone();
+    }
+
+    /// Whether a field differs from the stored playlist (a typed password counts; "Use the
+    /// Xtream login" doesn't: it is saved as it is switched).
+    fn is_changed(&self) -> bool {
+        let mut stored = SourceEditor::new(&self.original);
+        stored.use_xtream = self.use_xtream;
+        *self != stored
     }
 
     /// "Use the Xtream login" applies to playlists that signed in with it and to playlists
@@ -675,7 +688,8 @@ enum Pending {
     Restore(PathBuf, bool),
     RemovePin,
     Menu(Item),
-    /// ←/→ on a parental row waiting for the PIN (retried as the same adjustment).
+    /// A value change (→, Shift+←/→) on a parental row waiting for the PIN (retried as the
+    /// same change).
     Adjust(i32),
     /// "Use the Xtream login" turned off: the playlist replaces the Xtream catalogue.
     UsePlaylist(SourceId),
@@ -759,11 +773,11 @@ pub struct SettingsScreen {
     drag_from: Option<usize>,
     /// Text-field row whose egui focus must be released this frame.
     release_focus: bool,
-    /// A guide offset changed with ←/→ that isn't saved yet (and when it last changed).
+    /// A guide offset changed with Shift+←/→ that isn't saved yet (and when it last changed).
     offset_pending: Option<(EpgSourceId, std::time::Instant)>,
     /// Hidden channels of the library generation `hidden_built` (Settings ▸ Hidden items).
     hidden_channels: Vec<(ChannelId, String)>,
-    /// Hidden ▸ filtered tags whose categories are listed (→ / ←).
+    /// Hidden ▸ filtered tags whose categories are listed (→ / Shift+←).
     expanded: HashSet<(SourceId, Option<CategoryTag>)>,
     hidden_built: u64,
     /// A playlist kept as M3U that the user asked to sign in with its Xtream login: the
@@ -794,7 +808,8 @@ impl LoginSwitch {
     }
 }
 
-/// How long ←/→ on a guide's offset must rest before the change is saved and re-imported.
+/// How long Shift+←/→ (→) on a guide's offset must rest before the change is saved and
+/// re-imported.
 const OFFSET_SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// "channel 1" (the name the orphan had) or its key.
@@ -815,6 +830,16 @@ impl SettingsScreen {
             }
             _ => {}
         }
+    }
+
+    /// Whether the page may change under the source editor: not while it has unsaved changes
+    /// (switching the page drops the editor), which a toast explains instead.
+    fn may_leave_editor(&self, ctx: &mut UiCtx<'_>) -> bool {
+        if self.editor.as_ref().is_some_and(SourceEditor::is_changed) {
+            ctx.toast(Toast::info("Unsaved playlist changes: Enter on Save, or Esc to discard"));
+            return false;
+        }
+        true
     }
 
     fn set_page(&mut self, ctx: &mut UiCtx<'_>, page: SettingsPage) {
@@ -1301,7 +1326,11 @@ impl SettingsScreen {
                     icon: if open { glyphs::CHEVRON_DOWN } else { glyphs::CHEVRON_RIGHT }.to_owned(),
                     color: None,
                     label: tag_name(tag.as_ref()),
-                    detail: Some(format!("{} · Enter shows · {}", hidden_tag_detail(groups), if open { "← hides the list" } else { "→ lists them" })),
+                    detail: Some(format!(
+                        "{} · Enter shows · {}",
+                        hidden_tag_detail(groups),
+                        if open { "Shift+← hides the list" } else { "→ lists them" }
+                    )),
                     reorder: false,
                 });
                 if open {
@@ -1546,7 +1575,8 @@ impl SettingsScreen {
 
     // -------------------------------------------------------------- actions
 
-    /// ←/→ on a row.
+    /// A value change on a row: → / Shift+→ / L (`dir` 1), Shift+← / H (`dir` -1). Plain ←
+    /// never comes here: it steps back to the page list.
     fn adjust(&mut self, ctx: &mut UiCtx<'_>, row: &Row, dir: i32) {
         if self.page == SettingsPage::Parental && self.parental_locked(ctx) && !matches!(row, Row::Local { .. }) {
             self.pending = Some(Pending::Adjust(dir));
@@ -1922,9 +1952,9 @@ impl SettingsScreen {
         }));
     }
 
-    /// ←/→ on a guide: shift its offset. Applied (saved + the guide re-imported, the offset
-    /// applies at import time) once the presses stop for [`OFFSET_SETTLE`], or when the page is
-    /// left — not once per press.
+    /// Shift+←/→ (→) on a guide: shift its offset. Applied (saved + the guide re-imported, the
+    /// offset applies at import time) once the presses stop for [`OFFSET_SETTLE`], or when the
+    /// page is left — not once per press.
     fn epg_offset(&mut self, ctx: &mut UiCtx<'_>, id: EpgSourceId, delta_min: i32) {
         let Some(e) = self.epg_sources.iter_mut().find(|e| e.id == id) else { return };
         e.offset_min = (e.offset_min + delta_min).clamp(-24 * 60, 24 * 60);
@@ -2581,9 +2611,16 @@ impl Screen for SettingsScreen {
             match action {
                 Action::Up | Action::Down => {
                     let j = if action == Action::Up { i.saturating_sub(1) } else { (i + 1).min(PAGES.len() - 1) };
+                    // blocked: back to the editor, where Esc (as the toast says) discards
+                    if j != i && !self.may_leave_editor(ctx) {
+                        self.pane = Pane::Content;
+                        return true;
+                    }
                     self.set_page(ctx, PAGES[j].0);
                 }
                 Action::Activate | Action::Right | Action::FocusNext | Action::FocusPrev => self.pane = Pane::Content,
+                // leaving Settings would keep unsaved editor changes hidden behind a later visit
+                Action::Back if !self.may_leave_editor(ctx) => self.pane = Pane::Content,
                 Action::Back | Action::Left => return false,
                 Action::ToggleHelp => return false,
                 _ => {}
@@ -2627,9 +2664,12 @@ impl Screen for SettingsScreen {
             Action::Down => self.move_row(&rows, 1),
             Action::PageUp | Action::Home => self.move_row(&rows, -1000),
             Action::PageDown | Action::End => self.move_row(&rows, 1000),
-            Action::Left | Action::Right => {
+            // spatial panes (DESIGN §15.1): ← is the page list from every row, the source editor
+            // and the attach view included (both stay open); values change with → / Shift+←/→
+            Action::Left => self.pane = Pane::Pages,
+            Action::Right | Action::Increase | Action::Decrease => {
                 if let Some(r) = &row {
-                    self.adjust(ctx, r, if action == Action::Left { -1 } else { 1 });
+                    self.adjust(ctx, r, if action == Action::Decrease { -1 } else { 1 });
                 }
             }
             Action::Activate => self.submit = true,
@@ -2721,7 +2761,7 @@ impl Screen for SettingsScreen {
                 }
                 Pending::Menu(_) | Pending::Adjust(_) | Pending::ShowExplicit => {}
             },
-            // the PIN was entered: retry what needed it (the same ←/→, else Enter)
+            // the PIN was entered: retry what needed it (the same value change, else Enter)
             (OverlayResult::Unlocked(_), pending) => {
                 if let Some(r) = self.current_row(ctx) {
                     match pending {
@@ -2869,6 +2909,10 @@ impl SettingsScreen {
             }
         });
         if let Some(p) = clicked {
+            if p != self.page && !self.may_leave_editor(ctx) {
+                self.pane = Pane::Content;
+                return;
+            }
             self.set_page(ctx, p);
             self.pane = Pane::Content;
             self.page_clicked_at = Some(ui.input(|i| i.time));
@@ -3033,7 +3077,7 @@ impl SettingsScreen {
                         } else if field.is_toggle() {
                             let mut v = self.local_toggle(field).map(|b| *b).unwrap_or(false);
                             if toggle_row(&mut inner, theme, &mut v, label, label_color) {
-                                // the new state, as ←/→ would set it
+                                // the new state, as Shift+←/→ would set it
                                 clicked = Some((i, if v { 1 } else { -1 }));
                             }
                         } else {
@@ -3063,10 +3107,10 @@ impl SettingsScreen {
                         }
                         let c = color.map(|c| theme.source_color(c)).unwrap_or(t.text_secondary);
                         if let Item::HiddenTag(..) = item {
-                            // the chevron lists / hides the tag's categories (→ / ←); the row
+                            // the chevron lists / hides the tag's categories (→ / Shift+←); the row
                             // itself shows them all (Enter)
                             let open = icon == glyphs::CHEVRON_DOWN;
-                            let tip = if open { "Hide the list (←)" } else { "List them (→)" };
+                            let tip = if open { "Hide the list (Shift+←)" } else { "List them (→)" };
                             if icon_button(&mut inner, theme, icon, tip, ButtonStyle::default()).clicked() {
                                 clicked = Some((i, if open { -1 } else { 1 }));
                             }
@@ -3335,7 +3379,8 @@ mod tests {
         h.run_steps(2);
         assert_eq!(h.state().s.key_contexts(), vec![KeyContext::Panel]);
         assert!(has_label(&h, "Hardware decoding") && has_label(&h, "Zapping delay"));
-        // Enter toggles; ←/→ adjust numbers and choices; everything goes through edit_config
+        // Enter toggles; → / Shift+←/→ adjust numbers and choices; everything goes through
+        // edit_config
         focus(&mut h, "Instant load (less buffering, faster zaps)");
         h.state_mut().act(Action::Activate);
         h.run_steps(1);
@@ -3343,7 +3388,7 @@ mod tests {
         h.state_mut().act(Action::Right);
         h.state_mut().act(Action::Right);
         focus(&mut h, "Subtitles automatically");
-        h.state_mut().act(Action::Left);
+        h.state_mut().act(Action::Decrease);
         h.state_mut().apply_config();
         let c = h.state().t.config.clone();
         assert!(c.player.instant_load);
@@ -3728,8 +3773,158 @@ mod tests {
         assert!(has_label(&h, "HIDDEN GROUPS"));
     }
 
-    /// ← on a parental row that needed the PIN is retried as the same ← (not as Enter), the
-    /// relock time is editable from its row, and "Lock now" locks the session.
+    /// Spatial panes (DESIGN §15.1): ← steps from any content row back to the page list (a
+    /// choice or a toggle keeps its value), ↓ there switches the page and → / Enter return;
+    /// values change with → and Shift+←/→ (H/L); Tab and Esc are unchanged. The source editor
+    /// stays open under ←, and a page switch never drops its unsaved changes.
+    #[test]
+    fn left_steps_back_to_the_page_list_and_shift_arrows_change_values() {
+        let (mut t, one) = rig();
+        seed(&mut t, |c| testkit::source(c, "My IPTV").map(|_| ()));
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 1000.0));
+        h.state_mut().enter(Route::Settings(SettingsPage::Interface));
+        h.run_steps(2);
+        let density = h.state().t.config.interface.density;
+        let numbers = h.state().t.config.interface.show_channel_numbers;
+        // ← from a choice row and from a toggle row: the page list, the value untouched
+        for label in ["Density", "Channel numbers"] {
+            focus(&mut h, label);
+            assert!(h.state_mut().act(Action::Left));
+            assert_eq!(h.state().s.pane, Pane::Pages, "{label}");
+            assert!(h.state().t.config_edits.is_empty(), "{label}: ← changes nothing");
+        }
+        // the page list: ← stays, ↓ switches the page, → returns to the page
+        h.state_mut().act(Action::Left);
+        assert_eq!((h.state().s.pane, h.state().s.page), (Pane::Pages, SettingsPage::Interface));
+        h.state_mut().act(Action::Down);
+        assert_eq!(h.state().s.page, SettingsPage::Favourites);
+        h.state_mut().act(Action::Up);
+        h.state_mut().act(Action::Right);
+        assert_eq!((h.state().s.pane, h.state().s.page), (Pane::Content, SettingsPage::Interface));
+        // Shift+→ / Shift+← (L / H) change a choice (wrapping), a toggle and a number; → still
+        // increases
+        focus(&mut h, "Density");
+        h.state_mut().act(Action::Increase);
+        h.state_mut().apply_config();
+        assert_ne!(h.state().t.config.interface.density, density);
+        h.state_mut().act(Action::Decrease);
+        h.state_mut().apply_config();
+        assert_eq!(h.state().t.config.interface.density, density);
+        focus(&mut h, "Channel numbers");
+        h.state_mut().act(if numbers { Action::Decrease } else { Action::Increase });
+        h.state_mut().apply_config();
+        assert_eq!(h.state().t.config.interface.show_channel_numbers, !numbers);
+        focus(&mut h, "Preview delay");
+        let delay = h.state().t.config.interface.preview_delay_ms;
+        h.state_mut().act(Action::Increase);
+        h.state_mut().act(Action::Right);
+        h.state_mut().act(Action::Decrease);
+        h.state_mut().apply_config();
+        assert_eq!(h.state().t.config.interface.preview_delay_ms, delay + 100);
+        assert_eq!(h.state().s.pane, Pane::Content, "value keys never leave the page");
+        // Tab and Esc go to the page list as before
+        h.state_mut().act(Action::FocusNext);
+        assert_eq!(h.state().s.pane, Pane::Pages);
+        h.state_mut().act(Action::Activate);
+        h.state_mut().act(Action::Back);
+        assert_eq!(h.state().s.pane, Pane::Pages);
+        // the source editor: ← keeps it open; with a change, ↓ in the page list keeps the page
+        h.state_mut().enter(Route::Settings(SettingsPage::Playlists));
+        until(&mut h, "the playlist", |h| has_label(h, "My IPTV"));
+        focus(&mut h, "My IPTV");
+        h.state_mut().act(Action::Activate);
+        h.run_steps(2);
+        assert!(has_label(&h, "EDIT MY IPTV"));
+        focus(&mut h, "Icon");
+        h.state_mut().act(Action::Left);
+        assert_eq!(h.state().s.pane, Pane::Pages);
+        assert!(h.state().s.editor.is_some(), "← keeps the editor");
+        h.state_mut().act(Action::Right);
+        h.state_mut().act(Action::Increase);
+        let icon = h.state().s.editor.as_ref().map(|e| e.icon);
+        assert_ne!(icon, Some(SourceEditor::new(&h.state().s.editor.as_ref().unwrap().original).icon));
+        h.state_mut().act(Action::Left);
+        h.state_mut().act(Action::Down);
+        assert_eq!(h.state().s.page, SettingsPage::Playlists, "unsaved changes keep the page");
+        assert_eq!(h.state().s.editor.as_ref().map(|e| e.icon), icon, "and the changes");
+        assert_eq!(h.state().t.toasts.last().map(|t| t.text.as_str()), Some(UNSAVED));
+        assert_eq!(h.state().s.pane, Pane::Content, "back in the editor, where Esc discards");
+        // so a second (or held) ↓ moves through the editor instead of piling up toasts
+        let toasts = h.state().t.toasts.len();
+        h.state_mut().act(Action::Down);
+        assert_eq!((h.state().t.toasts.len(), h.state().s.pane), (toasts, Pane::Content));
+        // Esc in the page list doesn't leave Settings with the changes either
+        h.state_mut().act(Action::Left);
+        assert!(h.state_mut().act(Action::Back), "Settings stays");
+        assert_eq!(h.state().s.pane, Pane::Content);
+        assert_eq!(h.state().s.editor.as_ref().map(|e| e.icon), icon);
+        // one Esc in the editor discards them; then ← ↓ switches the page
+        h.state_mut().act(Action::Back);
+        assert!(h.state().s.editor.is_none());
+        h.state_mut().act(Action::Left);
+        h.state_mut().act(Action::Down);
+        assert_eq!(h.state().s.page, SettingsPage::Epg);
+    }
+
+    const UNSAVED: &str = "Unsaved playlist changes: Enter on Save, or Esc to discard";
+
+    /// The page-list guard holds only real changes: an untouched editor lets ↓ switch the page.
+    /// With a change, a click on another page keeps the page, the change and the editor's
+    /// highlight.
+    #[test]
+    fn the_page_list_guard_holds_only_unsaved_changes_and_covers_clicks() {
+        let (mut t, one) = rig();
+        seed(&mut t, |c| testkit::source(c, "My IPTV").map(|_| ()));
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 1000.0));
+        let open = |h: &mut H| {
+            h.state_mut().enter(Route::Settings(SettingsPage::Playlists));
+            until(h, "the playlist", |h| has_label(h, "My IPTV"));
+            focus(h, "My IPTV");
+            h.state_mut().act(Action::Activate);
+            h.run_steps(2);
+            assert!(has_label(h, "EDIT MY IPTV"));
+        };
+        open(&mut h);
+        let toasts = h.state().t.toasts.len();
+        h.state_mut().act(Action::Left);
+        h.state_mut().act(Action::Down);
+        assert_eq!(h.state().s.page, SettingsPage::Epg, "nothing to lose");
+        assert_eq!(h.state().t.toasts.len(), toasts, "no toast");
+        open(&mut h);
+        focus(&mut h, "Icon");
+        h.state_mut().act(Action::Increase);
+        let icon = h.state().s.editor.as_ref().map(|e| e.icon);
+        h.state_mut().act(Action::Left);
+        h.run_steps(1);
+        h.get_by_label("Interface").click();
+        h.run_steps(2);
+        assert_eq!((h.state().s.page, h.state().s.pane), (SettingsPage::Playlists, Pane::Content));
+        assert_eq!(h.state().s.editor.as_ref().map(|e| e.icon), icon, "the change is kept");
+        assert_eq!(h.state().t.toasts.last().map(|t| t.text.as_str()), Some(UNSAVED));
+    }
+
+    /// Compact (one pane at a time): ← from a row shows the page list alone, → brings back the
+    /// page on the same row.
+    #[test]
+    fn compact_left_shows_the_page_list_and_right_returns_to_the_row() {
+        let (mut t, one) = rig();
+        t.layout = LayoutClass::Compact;
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(420.0, 900.0));
+        h.state_mut().enter(Route::Settings(SettingsPage::Interface));
+        h.run_steps(2);
+        focus(&mut h, "Density");
+        let row = h.state().s.row;
+        h.state_mut().act(Action::Left);
+        h.run_steps(2);
+        assert!(has_label(&h, "Hidden items") && !has_label(&h, "Density"), "the page list alone");
+        h.state_mut().act(Action::Right);
+        h.run_steps(2);
+        assert!(has_label(&h, "Density") && !has_label(&h, "Hidden items"), "the page again");
+        assert_eq!((h.state().s.page, h.state().s.row), (SettingsPage::Interface, row));
+    }
+
+    /// Shift+← on a parental row that needed the PIN is retried as the same Shift+← (not as
+    /// Enter), the relock time is editable from its row, and "Lock now" locks the session.
     #[test]
     fn parental_rows_retry_the_same_adjustment_after_the_pin_and_lock_now_locks() {
         let (mut t, one) = rig();
@@ -3746,7 +3941,7 @@ mod tests {
         h.state_mut().enter(Route::Settings(SettingsPage::Parental));
         h.run_steps(1);
         focus(&mut h, "Lock again after");
-        h.state_mut().act(Action::Left);
+        h.state_mut().act(Action::Decrease);
         let nav = h.state_mut().nav();
         assert!(matches!(nav.as_slice(), [NavRequest::Open(OverlayRequest::Pin { .. })]), "{nav:?}");
         // the PIN overlay unlocks and answers Unlocked(Activate)
@@ -3755,7 +3950,7 @@ mod tests {
         assert!(app.t.parental.unlock("1234", &p));
         app.result(OverlayResult::Unlocked(Action::Activate));
         app.apply_config();
-        assert_eq!(h.state().t.config.parental.relock_min, 25, "the ← was retried (Enter would have added 5)");
+        assert_eq!(h.state().t.config.parental.relock_min, 25, "the Shift+← was retried (Enter would have added 5)");
         // the session is open now: → applies directly
         h.state_mut().act(Action::Right);
         h.state_mut().act(Action::Right);
