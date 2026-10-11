@@ -2399,6 +2399,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Shift+←` / `Shift+→` / `↑` / `↓` | Skip back / forward (big step) |
 | `L` | Jump to live (from catch-up) |
 | `Home` | Go to start |
+| `Ctrl+O` | Play from another playlist's copy (after an error) |
 | `Space` | Play / pause |
 | `m` | Mute |
 | `+` / `=` / `-` | Volume up / down |
@@ -4166,3 +4167,53 @@ fallback, stack marks), `store_catalogue` (import keys and TMDB ids, hidden vs l
 All vs the visibility hook, split surviving a refresh and its Undo, one pin per stack, a
 renamed copy re-keyed), the 0005 migration (backfill, re-run), Xtream list / info TMDB parsing.
 
+
+### 29.14 P2: playing a title's copies, and actions on them (`store::copies`, `ui::copies`)
+
+**Which copy plays** — `copies::plan(conn, &vod, movies, item, session_unlocked, copy_order,
+now) -> CopyPlan` reads, per copy of the title (a handful of indexed rows: progress, the
+`stream_failure` row, the container, the playlist's account), the facts §29.12's
+`play_order` needs and returns every copy in copy order (`copies`, locked ones included, for
+the detail page's mini-cards) plus the play order (`order`; `first()`, `fallback()`,
+`instead_of(failed)`, `resume()`, `status(item)` = plays first / locked / failed at /
+at its connection limit / account expired). Trouble: the copy's own failure in the last 24 h;
+its playlist refused a stream (401/403) in the last 10 min — at its connection limit; its
+account expired, banned or disabled. A series copy's progress and failures are those of its
+episodes. Called when a detail page opens, Play is pressed or a stream failed — never per
+frame. A series page continues from the copy with the newest episode progress
+(`copies::next_episode`); `copies::same_episode` finds an episode in another copy (loaded
+episodes only).
+
+**Fallback, once** — `PlayerCommand::PlayCopy(CopyPlay { req, fallback, start_at })`
+(`ui::copies::movie_command` / `episode_command` build it from a plan). The controller arms
+the machine (`PlayerMachine::arm_fallback`) only for a target that resolved. An armed VOD
+target that fails before its first frame gives up sooner (a load timeout at once, other
+retryable failures after one quick retry; the 403 retry stays) and emits `Effect::Fallback`
+instead of Error: the failure is recorded, the controller resolves the other copy, starts it at
+the position the first was asked to start at and sends `PlayerEvent::FellBack` → the toast
+"TV couldn't play Dune — playing from TV 2". A first copy that can't even be resolved goes to
+the fallback directly. The machine is disarmed after one fallback; if the fallback can't be
+resolved, `Input::GiveUp` puts the first failure on screen. After the first frame nothing
+switches by itself: the normal reconnects run, then the error card offers the other copy
+("Play from TV 2 at 41:20", button or `Ctrl+O` = `Action::PlayFrom`; `ui::copies::other_copy`
+looks it up once per failure within the frame budget; locked copies only for an unlocked
+session) from `PlayerSnapshot::last_position` (kept across reconnect reloads). `start_at`
+overrides the copy's own progress; "Resume 41:20" on a combined card continues the latest
+progress whichever copy plays (a pin or a pick).
+
+**Actions on a combined title** (recommendation §3; data stays per copy):
+
+| Action | Writes (`store::copies`) |
+|---|---|
+| ★ add / remove | the copy that would play (nothing when a copy already is one) / every copy (`favourite`) |
+| ✓ mark / unmark, forget | the copy that would play / every copy's progress (`watched`; `forget_series`: every copy's episodes) |
+| Lock, Hide | every copy (`lock`, `hide`; the hide toast names the playlists) |
+| Rename | copies without their own rename; `rename_conflicts` lists the others, `overwrite` takes them too |
+| Not the same title, Always play from | `split`, `pin` (one pin per title) over `titles::set_split` / `set_pin` |
+
+Every action returns an `Undo`: the rows of its table (`fav_item` of the list, `watch_progress`,
+`item_override`, `title_link`) for those copies as they were; `copies::undo` deletes the
+copies' rows and inserts these back (positions, times, fingerprints included). `ui::copies`
+runs the write on the store writer and, once it succeeded, toasts "… · Undo" with
+`Action::Undo(n)` (the last 8 are kept); the app writes the rows back with the right
+`DataScope`. Inside one playlist the screens keep `kit`'s one-copy actions.

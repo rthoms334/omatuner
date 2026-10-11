@@ -93,6 +93,9 @@ pub enum Input {
     /// From mpv/ffmpeg log lines ("HTTP error 403 Forbidden").
     HttpStatus(u16),
     Tick,
+    /// The controller could not start the other copy an [`Effect::Fallback`] asked for: the
+    /// failure stands (Error, nothing recorded again).
+    GiveUp(PlayerError),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -108,6 +111,10 @@ pub enum Effect {
     PushHistory(Arc<Playable>),
     RecordFailure(Arc<Playable>, PlayerErrorKind),
     ClearFailure(Arc<Playable>),
+    /// The armed target ([`PlayerMachine::arm_fallback`]) failed before its first frame: play
+    /// the next copy of the title instead of entering Error (DESIGN §29.14). Always the last
+    /// effect of its input; the machine is disarmed (the fallback is tried once).
+    Fallback(PlayerError),
 }
 
 #[derive(Debug)]
@@ -139,6 +146,9 @@ pub struct PlayerMachine {
     /// on change), so PLAYBACK_RESTART and unpause land in the right state.
     paused: bool,
     paused_for_cache: bool,
+    /// Another copy of this VOD target can be played instead when it fails before its first
+    /// frame ([`Effect::Fallback`]). Set by the controller for every play.
+    fallback: bool,
 }
 
 impl PlayerMachine {
@@ -160,6 +170,7 @@ impl PlayerMachine {
             history_pushed: false,
             paused: false,
             paused_for_cache: false,
+            fallback: false,
         }
     }
 
@@ -174,6 +185,18 @@ impl PlayerMachine {
     }
     pub fn set_config(&mut self, cfg: MachineConfig) {
         self.cfg = cfg;
+    }
+    /// Whether another copy can stand in for the NEXT target if it fails before its first
+    /// frame (the controller calls it right before every `Input::Play`). Armed, a VOD target
+    /// gives up sooner — a load timeout at once, other retryable failures after one retry (the
+    /// 403 retry stays) — and asks for [`Effect::Fallback`] instead of entering Error.
+    pub fn arm_fallback(&mut self, on: bool) {
+        self.fallback = on;
+    }
+    /// The current target showed its first frame (a failure now is mid-playback: the error
+    /// card offers the other copy, nothing switches by itself).
+    pub fn started(&self) -> bool {
+        self.history_pushed
     }
 
     /// Feed one input; returns effects for the controller to execute in order.
@@ -244,6 +267,15 @@ impl PlayerMachine {
                 {
                     fx.push(Effect::RecordFailure(t.clone(), err.kind));
                 }
+                if self.fallback_due() {
+                    self.fallback = false;
+                    fx.push(Effect::Fallback(err));
+                    return fx;
+                }
+                fx.push(Effect::Emit(PlayerEvent::Failed(err.clone())));
+                self.set_state(PlayerState::Error(err), &mut fx);
+            }
+            Input::GiveUp(err) => {
                 fx.push(Effect::Emit(PlayerEvent::Failed(err.clone())));
                 self.set_state(PlayerState::Error(err), &mut fx);
             }
@@ -420,6 +452,11 @@ impl PlayerMachine {
         fx.push(Effect::Load(t));
     }
 
+    /// An armed VOD target that never showed a frame: its failure plays the other copy.
+    fn fallback_due(&self) -> bool {
+        self.fallback && !self.history_pushed && self.target.as_ref().is_some_and(|t| !t.kind.is_live())
+    }
+
     fn fail(&mut self, kind: PlayerErrorKind, now: Instant, fx: &mut Vec<Effect>) {
         let live = self.target.as_ref().map(|t| t.kind.is_live()).unwrap_or(true);
         let http_once = matches!(kind, PlayerErrorKind::HttpForbidden | PlayerErrorKind::HttpNotFound);
@@ -427,7 +464,16 @@ impl PlayerMachine {
         let next = if http_once { 1 + u32::from(self.http_retry_used) } else { self.attempt + 1 };
         fx.push(Effect::StopMpv);
         self.clear_entries();
-        match self.cfg.policy.delay(next, kind, live) {
+        let early = self.fallback_due();
+        // with another copy waiting, a copy that never started isn't retried for long: a load
+        // timeout already waited, other failures get one quick retry (the 403 retry stays: a
+        // connection-limit race right after a stop)
+        let delay = match kind {
+            PlayerErrorKind::Timeout if early => None,
+            _ if early && !http_once && next > 1 => None,
+            _ => self.cfg.policy.delay(next, kind, live),
+        };
+        match delay {
             Some(d) => {
                 let max = if http_once {
                     self.http_retry_used = true;
@@ -442,6 +488,11 @@ impl PlayerMachine {
                 let err = PlayerError { kind, message: describe(kind).to_owned() };
                 if let Some(t) = &self.target {
                     fx.push(Effect::RecordFailure(t.clone(), kind));
+                }
+                if early {
+                    self.fallback = false;
+                    fx.push(Effect::Fallback(err));
+                    return;
                 }
                 fx.push(Effect::Emit(PlayerEvent::Failed(err.clone())));
                 self.set_state(PlayerState::Error(err), fx);
@@ -1157,6 +1208,119 @@ mod tests {
         start_playing(&mut m, live(), 1, t0);
         m.handle(Input::EndFile { reason: EndReason::Eof, error: 0, entry: 1 }, t0);
         assert!(has_load(&m.handle(Input::Retry, t0)));
+    }
+
+    fn fell_back(fx: &[Effect]) -> Option<PlayerErrorKind> {
+        fx.iter().find_map(|e| if let Effect::Fallback(err) = e { Some(err.kind) } else { None })
+    }
+
+    /// An armed VOD copy (another copy of the title waits, DESIGN §29.14) that fails before
+    /// its first frame asks for the fallback instead of Error: a load timeout at once, a network
+    /// error after one quick retry, a 403 after its 3 s retry, our connection budget at once
+    /// (not blamed on the copy). The failure is recorded (the copy reads "failed 2 h ago"), the
+    /// fallback is the last effect, no error is announced, and it is asked for once.
+    #[test]
+    fn an_armed_copy_that_fails_before_its_first_frame_falls_back_once() {
+        let t0 = Instant::now();
+        let armed = || {
+            let mut m = machine();
+            m.arm_fallback(true);
+            m.handle(Input::Play { target: vod(), immediate: true }, t0);
+            m.handle(Input::Loaded { entry: Some(1) }, t0);
+            m
+        };
+        // load timeout: no retry
+        let mut m = armed();
+        let fx = m.handle(Input::Tick, t0 + secs(60));
+        assert_eq!(fell_back(&fx), Some(PlayerErrorKind::Timeout));
+        assert!(matches!(fx.last(), Some(Effect::Fallback(_))));
+        assert_eq!(recorded(&fx), Some(PlayerErrorKind::Timeout));
+        assert!(!fx.iter().any(|e| matches!(e, Effect::Emit(PlayerEvent::Failed(_)))), "no error card");
+        assert!(!matches!(m.state(), PlayerState::Error(_)));
+        // the controller couldn't start the other copy: the failure stands, nothing recorded twice
+        let fx = m.handle(Input::GiveUp(PlayerError { kind: PlayerErrorKind::Timeout, message: "x".into() }), t0);
+        assert!(matches!(m.state(), PlayerState::Error(PlayerError { kind: PlayerErrorKind::Timeout, .. })));
+        assert!(fx.iter().any(|e| matches!(e, Effect::Emit(PlayerEvent::Failed(_)))));
+        assert_eq!(recorded(&fx), None);
+
+        // network error: one quick retry, then the fallback
+        let mut m = armed();
+        m.handle(Input::StartFile { entry: 1 }, t0);
+        let fx = m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry: 1 }, t0);
+        assert_eq!(fell_back(&fx), None);
+        assert!(matches!(m.state(), PlayerState::Reconnecting { attempt: 1, .. }));
+        assert!(has_load(&m.handle(Input::Tick, t0 + secs(1))));
+        m.handle(Input::Loaded { entry: Some(2) }, t0 + secs(1));
+        m.handle(Input::StartFile { entry: 2 }, t0 + secs(1));
+        let fx = m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry: 2 }, t0 + secs(1));
+        assert_eq!(fell_back(&fx), Some(PlayerErrorKind::Network));
+
+        // 403: its retry first (a connection-limit race right after a stop)
+        let mut m = armed();
+        m.handle(Input::StartFile { entry: 1 }, t0);
+        m.handle(Input::HttpStatus(403), t0);
+        let fx = m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry: 1 }, t0);
+        assert_eq!(fell_back(&fx), None);
+        assert!(matches!(m.state(), PlayerState::Reconnecting { reason: PlayerErrorKind::HttpForbidden, .. }));
+        m.handle(Input::Tick, t0 + secs(4));
+        m.handle(Input::Loaded { entry: Some(2) }, t0 + secs(4));
+        m.handle(Input::StartFile { entry: 2 }, t0 + secs(4));
+        m.handle(Input::HttpStatus(403), t0 + secs(4));
+        let fx = m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry: 2 }, t0 + secs(4));
+        assert_eq!(fell_back(&fx), Some(PlayerErrorKind::HttpForbidden));
+
+        // our connection budget: straight to the other copy, not blamed on this one
+        let mut m = armed();
+        let fx = m.handle(Input::Fail(PlayerError { kind: PlayerErrorKind::Budget, message: "limit".into() }), t0);
+        assert_eq!(fell_back(&fx), Some(PlayerErrorKind::Budget));
+        assert_eq!(recorded(&fx), None);
+
+        // once: the machine is disarmed, so the next copy's own failure is an ordinary one
+        m.handle(Input::Play { target: vod(), immediate: true }, t0);
+        m.handle(Input::Loaded { entry: Some(3) }, t0);
+        let fx = m.handle(Input::Tick, t0 + secs(60));
+        assert_eq!(fell_back(&fx), None);
+        assert!(matches!(m.state(), PlayerState::Reconnecting { reason: PlayerErrorKind::Timeout, .. }));
+    }
+
+    /// After the first frame nothing falls back by itself (the normal reconnect runs, then the
+    /// error card offers the other copy at the last position); live streams never fall back;
+    /// an unarmed VOD keeps its three retries.
+    #[test]
+    fn no_fallback_after_the_first_frame_for_live_or_unarmed() {
+        let t0 = Instant::now();
+        let mut m = machine();
+        m.arm_fallback(true);
+        start_playing(&mut m, vod(), 1, t0);
+        assert!(m.started());
+        m.handle(Input::TimePos(2480.0), t0);
+        let mut t = t0;
+        let mut fx = Vec::new();
+        for entry in 1..=4 {
+            fx = m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry }, t);
+            assert_eq!(fell_back(&fx), None);
+            if let PlayerState::Reconnecting { at, .. } = m.state().clone() {
+                t = at;
+                m.handle(Input::Tick, t);
+                m.handle(Input::Loaded { entry: Some(entry + 1) }, t);
+                m.handle(Input::StartFile { entry: entry + 1 }, t);
+            }
+        }
+        assert!(matches!(m.state(), PlayerState::Error(_)), "three reconnects, then the error card");
+        assert!(fx.iter().any(|e| matches!(e, Effect::Emit(PlayerEvent::Failed(_)))));
+        assert_eq!(m.last_position(), Some(2480.0), "where the card's other copy starts");
+
+        let mut m = machine();
+        m.arm_fallback(true);
+        m.handle(Input::Play { target: live(), immediate: true }, t0);
+        m.handle(Input::Loaded { entry: Some(1) }, t0);
+        assert_eq!(fell_back(&m.handle(Input::Tick, t0 + secs(60))), None);
+
+        let mut m = machine();
+        m.handle(Input::Play { target: vod(), immediate: true }, t0);
+        m.handle(Input::Loaded { entry: Some(1) }, t0);
+        assert_eq!(fell_back(&m.handle(Input::Tick, t0 + secs(60))), None);
+        assert!(matches!(m.state(), PlayerState::Reconnecting { attempt: 1, max: 3, .. }));
     }
 
     #[test]

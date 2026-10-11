@@ -63,6 +63,8 @@ pub enum MiniAction {
 pub enum StateAction {
     Retry,
     LastChannel,
+    /// "Play from TV 2 at 41:20": the title's other copy after a failure (Ctrl+O; DESIGN §29.14).
+    OtherCopy,
 }
 
 /// Where the player draws a [`StateAction`] button this frame (laid out by the state overlay,
@@ -88,6 +90,8 @@ pub struct VideoHost {
     logo: Option<(String, egui::TextureHandle)>,
     /// Recovery buttons of the last fullscreen `paint` (empty unless failed / reconnecting).
     buttons: Vec<StateButton>,
+    /// The label of the other copy a failed title can play from ([`VideoHost::set_other_copy`]).
+    other_copy: Option<String>,
 }
 
 impl VideoHost {
@@ -170,6 +174,12 @@ impl VideoHost {
         self.logo.as_ref().filter(|(u, _)| u == url).map(|(_, t)| t)
     }
 
+    /// Offer another copy of the failed title on the error card ("Play from TV 2 at 41:20");
+    /// the fullscreen player sets it before every `paint` (`None`: nothing to offer).
+    pub fn set_other_copy(&mut self, label: Option<String>) {
+        self.other_copy = label;
+    }
+
     /// The recovery buttons laid out by the last fullscreen [`paint`](Self::paint).
     pub fn state_buttons(&self) -> &[StateButton] {
         &self.buttons
@@ -229,7 +239,12 @@ impl VideoHost {
             }
             let font = FontId::proportional((theme.font(TypeToken::Body) * k).round());
             let retry = if reconnecting { "Retry now" } else { "Retry" };
-            let mut list = vec![(StateAction::Retry, format!("{}  {retry}", glyphs::REFRESH))];
+            let mut list = Vec::new();
+            // after the reconnects gave up, the title's other copy comes first
+            if let Some(label) = self.other_copy.as_ref().filter(|_| !reconnecting) {
+                list.push((StateAction::OtherCopy, format!("{}  {label}", glyphs::PLAY)));
+            }
+            list.push((StateAction::Retry, format!("{}  {retry}", glyphs::REFRESH)));
             if live && snap.previous_live.is_some() {
                 list.push((StateAction::LastChannel, format!("{}  Last channel", glyphs::HISTORY)));
             }

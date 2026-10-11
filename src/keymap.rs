@@ -257,6 +257,12 @@ pub enum Action {
     TogglePopOut,
     StopAndClose,
     Retry,
+    /// Ctrl+O: play the title from another of its copies (DESIGN §29.14) — in the player after
+    /// an error ("Play from TV 2 at 41:20").
+    PlayFrom,
+    /// A toast's Undo button: put back what a combined action on a title's copies wrote
+    /// (`ui::copies`; the number names the action).
+    Undo(u16),
     Digit(u8),
 }
 
@@ -621,6 +627,7 @@ pub static PLAYER_VOD: &[Binding] = &[
     b(C::key(Key::ArrowDown), A::SeekBackBig, "Skip back / forward (big step)"),
     b(C::ch('L'), A::JumpToLive, "Jump to live (from catch-up)"),
     b(C::key(Key::Home), A::Home, "Go to start"),
+    b(C::ctrl(Key::O), A::PlayFrom, "Play from another playlist's copy (after an error)"),
 ];
 
 /// Controls focus mode only (never pushed by the passive banner).

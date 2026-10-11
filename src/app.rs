@@ -391,6 +391,10 @@ impl TunerApp {
                 PlatformEvent::FilePicked { .. } | PlatformEvent::ReminderFired(_) => {}
                 PlatformEvent::PopOut(ev) => self.on_popout_event(ev, egui_ctx),
             },
+            // the first copy of a title failed before its first frame (DESIGN §29.14)
+            AppEvent::Player(crate::player::PlayerEvent::FellBack { title, from, to, .. }) => {
+                self.toast(crate::ui::copies::fell_back_toast(&self.lib, title, *from, *to));
+            }
             AppEvent::Player(_) => {}
         }
         self.with_ctx(|ctx, screens, _| {
@@ -714,6 +718,11 @@ impl TunerApp {
                 self.toggle_popout(egui_ctx);
             }
             Action::Back => self.back(egui_ctx),
+            // a combined action's Undo (`ui::copies`)
+            Action::Undo(n) => {
+                let undone = crate::ui::copies::undo(self.services(), n);
+                self.toast(Toast::info(if undone { "Undone" } else { "That can no longer be undone" }));
+            }
             _ => {}
         }
     }
@@ -2439,6 +2448,52 @@ mod tests {
         rig.event(AppEvent::Data(DataScope::Favourites));
         assert!(rig.app.favs.is_fav(&item));
         assert_eq!(rig.log().jobs.len(), 1, "favourites never rebuild the library");
+    }
+
+    /// Copies of a title (DESIGN §29.14): the player's fallback becomes a toast naming both
+    /// playlists, and a toast's Undo writes back the rows a combined action found — once.
+    #[test]
+    fn fallback_toast_and_undo_of_a_combined_action() {
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| {
+            for name in ["TV", "TV 2"] {
+                c.execute(
+                    "INSERT INTO source(name, kind, url, created_at, generation) VALUES (?1, 'm3u-url', 'http://127.0.0.1/p.m3u', 0, 1)",
+                    [name],
+                )?;
+            }
+            Ok(())
+        });
+        rig.settle();
+        rig.event(AppEvent::Player(crate::player::PlayerEvent::FellBack {
+            title: "Dune".into(),
+            from: Some(SourceId(1)),
+            to: Some(SourceId(2)),
+            error: crate::player::PlayerErrorKind::Timeout,
+        }));
+        assert_eq!(rig.log().toasts.last().unwrap().text, "TV couldn't play Dune — playing from TV 2");
+
+        // ★ removed from both copies; the toast's Undo puts both back
+        let copy = |s: i64| ItemRef { source: SourceId(s), kind: ItemKind::Movie, key: ItemKey(format!("m{s}")) };
+        let (a, b) = (copy(1), copy(2));
+        let undo = rig
+            .writer()
+            .blocking(move |c| {
+                let list = crate::store::user::default_fav_list(c)?;
+                crate::store::user::set_favourite(c, list, &a, true, 1)?;
+                crate::store::user::set_favourite(c, list, &b, true, 2)?;
+                crate::store::copies::favourite(c, list, &[a, b], &copy(1), false, 3)
+            })
+            .unwrap();
+        let favs = |rig: &Rig| crate::store::library::load_favs(&rig.app.db).unwrap().items(rig.app.favs.default_list().unwrap()).len();
+        assert_eq!(favs(&rig), 0);
+        let n = crate::ui::copies::stash(undo);
+        let ctx = rig.ctx.clone();
+        rig.app.global_action(Action::Undo(n), &[], &ctx);
+        rig.writer().blocking(|_| Ok(())).unwrap();
+        assert_eq!(favs(&rig), 2);
+        assert_eq!(rig.log().toasts.last().unwrap().text, "Undone");
+        rig.app.global_action(Action::Undo(n), &[], &ctx);
+        assert_eq!(rig.log().toasts.last().unwrap().text, "That can no longer be undone");
     }
 
     /// A playlist picked on a screen (DESIGN §29): the window title names it and the hint line

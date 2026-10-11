@@ -1339,6 +1339,418 @@ fn copies_stack_across_playlists_and_follow_the_users_corrections() {
     assert_eq!(lib.vod.stacks(true).len(), 1, "only Dune");
 }
 
+// ------------------------------------------------------------------ copies (DESIGN §29.14)
+
+/// A listed movie whose stream is an Xtream file with container `ext`.
+fn listed_ext(key: &str, name: &str, grp: &str, order: i32, ext: &str) -> ImportMovie {
+    ImportMovie {
+        stream: StreamLocator::Xtream { kind: XtreamStreamKind::Movie, stream_id: order as i64 + 1, ext: Some(ext.into()) },
+        ..listed(key, name, grp, order, None)
+    }
+}
+
+/// Two playlists with copies of Dune: TV has an English avi, an English 4K mkv and a French
+/// copy (and Heat); TV 2 an English mkv and a locked Arabic-subtitled copy.
+fn dune_copies(name: &str) -> (Store, SourceId, SourceId) {
+    let s = store(name);
+    let (a, b) = w(&s, |c| Ok((seed::seed_source(c, "TV")?, seed::seed_source(c, "TV 2")?)));
+    let tv = vec![
+        listed_ext("a1", "EN ★ Dune - 2021", "EN Movies", 0, "avi"),
+        listed_ext("a2", "FR ★ Dune - 2021", "FR Films", 1, "mkv"),
+        listed_ext("a3", "EN ★ Heat - 1995", "EN Movies", 2, "mkv"),
+        listed_ext("a5", "EN ★ Dune - 2021 [4K]", "EN Movies", 3, "mkv"),
+    ];
+    let tv2 = vec![listed_ext("b1", "EN - Dune (2021)", "Films", 0, "mkv"), listed_ext("b2", "AR-SUBS - Dune (2021)", "Locked", 1, "mp4")];
+    run_import(&s, a, vec![], tv, vec![], vec![ItemKind::Movie], NOW);
+    run_import(&s, b, vec![], tv2, vec![], vec![ItemKind::Movie], NOW);
+    w(&s, move |c| {
+        user::set_group_override(c, b, ItemKind::Movie, &GroupKey("movie:locked".into()), &GroupOverride { locked: true, ..Default::default() })
+    });
+    (s, a, b)
+}
+
+/// Which copy of a title plays (DESIGN §29.14): with nothing known, the user's language, the
+/// playlist order, then mkv / mp4 before other containers; a locked copy only once the session
+/// is unlocked; a copy that failed lately, whose playlist refused a stream in the last minutes
+/// (connection limit) or whose account expired goes last; the copy with the latest progress
+/// beats all that, and the user's pin beats the progress. The second copy is the fallback.
+#[test]
+fn copy_choice_follows_pin_progress_trouble_language_playlist_and_container() {
+    use tuner::config::CopyOrder;
+    use tuner::store::copies::{self, CopyStatus, Trouble};
+    let (s, a, b) = dune_copies("tuner-st-copy-choice");
+    let r = s.reader().unwrap();
+    let plan = |unlocked: bool| {
+        let lib = library::load(&r).unwrap();
+        let at = |key: &str| lib.vod.movies.iter().position(|m| m.key.0 == key).unwrap() as u32;
+        let p = copies::plan(&r, &lib.vod, true, at("a1"), unlocked, CopyOrder::PlaylistOrder, NOW).unwrap();
+        let keys = |v: &[u32]| v.iter().map(|i| lib.vod.movies[*i as usize].key.0.clone()).collect::<Vec<_>>();
+        let status: HashMap<String, CopyStatus> = p.copies.iter().map(|c| (c.item_ref.key.0.clone(), p.status(c.item))).collect();
+        (keys(&p.order), keys(&p.fallback().into_iter().collect::<Vec<_>>()), status, p)
+    };
+
+    let (order, fallback, status, p) = plan(false);
+    assert_eq!(order, ["a5", "a1", "b1", "a2"], "English, TV before TV 2, mkv before avi; the locked copy left out");
+    assert_eq!(fallback, ["a1"]);
+    assert_eq!((status["a5"], status["b2"], status["a1"]), (CopyStatus::PlaysFirst, CopyStatus::Locked, CopyStatus::Plain));
+    assert_eq!(p.copies.len(), 5, "the locked copy is still one of the copies");
+    assert_eq!(p.get(p.first().unwrap()).unwrap().container.as_deref(), Some("mkv"));
+    assert_eq!(plan(true).0, ["a5", "a1", "b1", "b2", "a2"], "an unlocked session plays it too");
+
+    // a copy that failed 1 h ago goes last
+    w(&s, move |c| live::record_failure(c, &mref(a, "a5"), "http-not-found", NOW - 3600));
+    let (order, _, status, _) = plan(false);
+    assert_eq!(order, ["a1", "b1", "a2", "a5"]);
+    assert_eq!(status["a5"], CopyStatus::Failed { at: NOW - 3600 });
+    // ... but not one that failed yesterday
+    w(&s, move |c| live::record_failure(c, &mref(a, "a5"), "http-not-found", NOW - 2 * 86_400));
+    assert_eq!(plan(false).0[0], "a5");
+
+    // TV's account expired: TV 2 plays first
+    let expired = AccountInfo { status: AccountStatus::Active, exp_date: Some(NOW - 60), ..Default::default() };
+    w(&s, move |c| sources::set_account(c, a, &expired));
+    let (order, _, status, p) = plan(false);
+    assert_eq!(order, ["b1", "a5", "a1", "a2"]);
+    assert_eq!(status["a1"], CopyStatus::Expired);
+    assert_eq!(p.get(p.order[1]).unwrap().trouble, Some(Trouble::Expired));
+    let active = AccountInfo { status: AccountStatus::Active, exp_date: Some(NOW + 86_400), ..Default::default() };
+    w(&s, move |c| sources::set_account(c, a, &active));
+
+    // TV refused another stream 5 min ago: at its connection limit; 20 min ago no longer
+    w(&s, move |c| live::record_failure(c, &mref(a, "a3"), "http-forbidden", NOW - 300));
+    let (order, _, status, _) = plan(false);
+    assert_eq!(order[0], "b1");
+    assert_eq!(status["a1"], CopyStatus::AtLimit);
+    w(&s, move |c| live::record_failure(c, &mref(a, "a3"), "http-forbidden", NOW - 1200));
+    assert_eq!(plan(false).0[0], "a5");
+
+    // the copy you were watching plays, failed or not; the latest progress wins
+    let watch = |item: ItemRef, at: Timestamp| WatchProgress {
+        item,
+        position_s: 2480.0,
+        duration_s: Some(9000.0),
+        updated_at: at,
+        finished: false,
+        title: "Dune".into(),
+        fingerprint: Default::default(),
+    };
+    let (p1, p2) = (watch(mref(b, "b1"), NOW - 600), watch(mref(a, "a2"), NOW - 60));
+    w(&s, move |c| user::save_progress(c, &p1));
+    assert_eq!(plan(false).0[0], "b1");
+    w(&s, move |c| live::record_failure(c, &mref(b, "b1"), "network", NOW - 30));
+    assert_eq!(plan(false).0[0], "b1", "progress beats a recent failure");
+    w(&s, move |c| user::save_progress(c, &p2));
+    let (order, _, _, p) = plan(false);
+    assert_eq!(order[0], "a2", "the French copy was watched last");
+    assert_eq!(p.resume().map(|c| c.item_ref.key.0.as_str()), Some("a2"));
+    assert_eq!(p.resume().and_then(|c| c.progress.as_ref()).map(|x| x.position_s), Some(2480.0));
+
+    // "Always play from" beats the progress (stored per title, read by the library build)
+    w(&s, move |c| tuner::store::titles::set_pin(c, &mref(a, "a1"), &[mref(a, "a2"), mref(b, "b1")], true, NOW));
+    let (order, fallback, _, p) = plan(false);
+    assert_eq!((order[0].as_str(), fallback[0].as_str()), ("a1", "a2"));
+    assert!(p.get(p.first().unwrap()).unwrap().pinned);
+    assert_eq!(p.instead_of(p.first().unwrap()), p.fallback(), "the error card offers the next copy");
+
+    // a title with one copy: itself, nothing to fall back on
+    let lib = library::load(&r).unwrap();
+    let heat = lib.vod.movies.iter().position(|m| m.key.0 == "a3").unwrap() as u32;
+    let p = copies::plan(&r, &lib.vod, true, heat, false, CopyOrder::PlaylistOrder, NOW).unwrap();
+    assert_eq!((p.order.clone(), p.fallback()), (vec![heat], None));
+}
+
+/// Actions on a combined title write per copy (the recommendation's §3 table) and Undo puts
+/// back exactly the rows that were there: ★ adds the copy that would play (nothing when a copy
+/// already is one) and removes every copy; ✓ marks the copy that would play and forgets every
+/// copy's progress; lock and hide take every copy; a rename skips copies with their own rename
+/// unless told to overwrite.
+#[test]
+fn combined_actions_write_per_copy_and_undo_restores_the_rows() {
+    use tuner::store::copies;
+    let (s, a, b) = dune_copies("tuner-st-copy-actions");
+    let r = s.reader().unwrap();
+    let (a1, b1) = (mref(a, "a1"), mref(b, "b1"));
+    let both = vec![a1.clone(), b1.clone()];
+    let list = user::default_fav_list(&r).unwrap();
+    let favs = || user::fav_items(&r, list).unwrap();
+    let undo = |u: copies::Undo| w(&s, move |c| copies::undo(c, &u));
+
+    // ★
+    let (all, plays) = (both.clone(), a1.clone());
+    w(&s, move |c| copies::favourite(c, list, &all, &plays, true, NOW));
+    assert_eq!(favs().iter().map(|f| &f.item).collect::<Vec<_>>(), [&a1]);
+    let (all, plays) = (both.clone(), b1.clone());
+    w(&s, move |c| copies::favourite(c, list, &all, &plays, true, NOW + 1));
+    assert_eq!(favs().len(), 1, "a copy already is a favourite");
+    let other = b1.clone();
+    w(&s, move |c| user::set_favourite(c, list, &other, true, NOW + 2));
+    let before = favs();
+    let all = both.clone();
+    let u = w(&s, move |c| copies::favourite(c, list, &all, &all[0], false, NOW + 3));
+    assert!(favs().is_empty(), "removed from every copy");
+    assert_eq!(u.scope(), tuner::msg::DataScope::Favourites);
+    undo(u);
+    assert_eq!(favs(), before, "positions, times and fingerprints back");
+
+    // ✓
+    let p = WatchProgress {
+        item: b1.clone(),
+        position_s: 600.0,
+        duration_s: Some(9000.0),
+        updated_at: NOW - 100,
+        finished: false,
+        title: "Dune".into(),
+        fingerprint: Default::default(),
+    };
+    w(&s, move |c| user::save_progress(c, &p));
+    let progress = |i: &ItemRef| user::progress(&r, i).unwrap();
+    let before = (progress(&a1), progress(&b1));
+    let (all, plays) = (both.clone(), a1.clone());
+    let u = w(&s, move |c| copies::watched(c, &all, (&plays, "Dune"), true, NOW));
+    assert!(progress(&a1).is_some_and(|x| x.finished), "the copy that would play");
+    assert!(progress(&b1).is_some_and(|x| !x.finished), "the other copy keeps its progress");
+    undo(u);
+    assert_eq!((progress(&a1), progress(&b1)), before);
+    let all = both.clone();
+    let u = w(&s, move |c| copies::watched(c, &all, (&all[0], "Dune"), false, NOW));
+    assert_eq!((progress(&a1), progress(&b1)), (None, None), "forgotten on every copy");
+    undo(u);
+    assert_eq!((progress(&a1), progress(&b1)), before, "Undo restores the rows");
+
+    // lock / hide every copy
+    let own = a1.clone();
+    w(&s, move |c| user::set_item_override(c, &own, &ItemOverride { rename: Some("Dune (mine)".into()), ..Default::default() }));
+    let locked = |keys: &[&str]| {
+        let lib = library::load(&r).unwrap();
+        keys.iter().map(|k| lib.vod.movies.iter().find(|m| m.key.0 == *k).map(|m| m.locked)).collect::<Vec<_>>()
+    };
+    let all = both.clone();
+    let u = w(&s, move |c| copies::lock(c, &all, true));
+    assert_eq!(locked(&["a1", "b1"]), [Some(true), Some(true)]);
+    assert_eq!(user::item_override(&r, &a1).unwrap().unwrap().rename.as_deref(), Some("Dune (mine)"), "other fields survive");
+    undo(u);
+    assert_eq!(locked(&["a1", "b1"]), [Some(false), Some(false)]);
+    assert_eq!(user::item_override(&r, &b1).unwrap(), None, "no row was there");
+    let all = both.clone();
+    let u = w(&s, move |c| copies::hide(c, &all));
+    assert_eq!(locked(&["a1", "b1"]), [None, None], "hidden");
+    undo(u);
+    assert_eq!(locked(&["a1", "b1"]), [Some(false), Some(false)]);
+
+    // rename: copies with their own rename are asked about first
+    let conflicts = copies::rename_conflicts(&r, &both, "Dune: Part One").unwrap();
+    assert_eq!(conflicts, [(a1.clone(), "Dune (mine)".to_owned())]);
+    let rename = |i: &ItemRef| user::item_override(&r, i).unwrap().and_then(|o| o.rename);
+    let all = both.clone();
+    w(&s, move |c| copies::rename(c, &all, "Dune: Part One", false));
+    assert_eq!((rename(&a1).as_deref(), rename(&b1).as_deref()), (Some("Dune (mine)"), Some("Dune: Part One")));
+    let all = both.clone();
+    let u = w(&s, move |c| copies::rename(c, &all, "Dune: Part One", true));
+    assert_eq!(rename(&a1).as_deref(), Some("Dune: Part One"));
+    undo(u);
+    assert_eq!((rename(&a1).as_deref(), rename(&b1).as_deref()), (Some("Dune (mine)"), Some("Dune: Part One")));
+
+    // "Not the same title" and "Always play from": persisted, and Undo puts the links back
+    let stacks = || {
+        let lib = library::load(&r).unwrap();
+        let st = lib.vod.stacks(true);
+        let of = |k: &str| lib.vod.movies.iter().position(|m| m.key.0 == k).map(|i| i as u32).unwrap();
+        let pinned: Vec<String> = ["a1", "b1"].iter().filter(|k| st.meta(of(k)).pinned).map(|k| k.to_string()).collect();
+        (st.stack_of(of("b1")).is_some(), pinned)
+    };
+    let one = b1.clone();
+    let u = w(&s, move |c| copies::split(c, &one, true, NOW));
+    assert_eq!(stacks(), (false, vec![]), "split off");
+    undo(u);
+    assert_eq!(stacks(), (true, vec![]));
+    let (all, one) = (both.clone(), a1.clone());
+    w(&s, move |c| copies::pin(c, &one, &all, true, NOW));
+    let (all, one) = (both.clone(), b1.clone());
+    let u = w(&s, move |c| copies::pin(c, &one, &all, true, NOW + 1));
+    assert_eq!(stacks().1, ["b1"], "one pin per title");
+    undo(u);
+    assert_eq!(stacks().1, ["a1"], "the earlier pin is back");
+}
+
+/// A series in two playlists continues from the copy with the newest episode progress (that
+/// copy also plays first); the same episode is found in the other copy (fallback, "Play from");
+/// forgetting the combined series forgets both copies' episodes, and Undo brings them back.
+#[test]
+fn series_copies_continue_from_the_newest_progress() {
+    use tuner::config::CopyOrder;
+    use tuner::store::copies;
+    use tuner::store::import::{ImportEpisode, SeriesDetails};
+    let s = store("tuner-st-copy-series");
+    let (a, b) = w(&s, |c| Ok((seed::seed_source(c, "TV")?, seed::seed_source(c, "TV 2")?)));
+    run_import(&s, a, vec![], vec![], vec![series("sa", "EN ★ Lost - 2004", "EN Series", 0)], vec![ItemKind::Series], NOW);
+    run_import(&s, b, vec![], vec![], vec![series("sb", "EN - Lost (2004)", "Series", 0)], vec![ItemKind::Series], NOW);
+    let r = s.reader().unwrap();
+    let sid = |key: &str| r.query_row("SELECT id FROM series WHERE key = ?1", [key], |x| x.get::<_, SeriesId>(0)).unwrap();
+    let (sa, sb) = (sid("sa"), sid("sb"));
+    for (series, p) in [(sa, "a"), (sb, "b")] {
+        let ep = |season: u32, e: u32| ImportEpisode {
+            key: ItemKey(format!("ep:{p}{season}{e:02}")),
+            provider_id: None,
+            season,
+            episode: e,
+            title: format!("E{e}"),
+            plot: None,
+            duration_s: Some(2400),
+            still: None,
+            air_date: None,
+            rating: None,
+            stream: StreamLocator::Xtream { kind: XtreamStreamKind::Series, stream_id: (season * 100 + e) as i64, ext: Some("mkv".into()) },
+        };
+        let d = SeriesDetails { seasons: vec![], episodes: vec![ep(1, 1), ep(1, 2), ep(2, 1)], plot: None, backdrop: None, tmdb_id: None };
+        w(&s, move |c| import::store_series_details(c, series, &d, NOW));
+    }
+    let lib = library::load(&r).unwrap();
+    let at = |id: SeriesId| lib.vod.index_of(VodKind::Series(id)).unwrap();
+    assert_eq!(lib.vod.stacks(false).stack_of(at(sa)), lib.vod.stacks(false).stack_of(at(sb)), "one stack");
+    let first = |r: &Connection| copies::plan(r, &lib.vod, false, at(sa), false, CopyOrder::PlaylistOrder, NOW).unwrap().first();
+    assert_eq!(first(&r), Some(at(sa)), "nothing watched: playlist order");
+    let (e, ep) = copies::next_episode(&r, &[sa, sb]).unwrap().unwrap();
+    assert_eq!((e, ep.season, ep.episode), (sa, 1, 1));
+
+    let epref = |src: SourceId, key: &str| ItemRef { source: src, kind: ItemKind::Episode, key: ItemKey(key.into()) };
+    let watch = |item: ItemRef, at: Timestamp, finished: bool| WatchProgress {
+        item,
+        position_s: 1200.0,
+        duration_s: Some(2400.0),
+        updated_at: at,
+        finished,
+        title: "Lost".into(),
+        fingerprint: Default::default(),
+    };
+    let (old, new) = (watch(epref(a, "ep:a101"), NOW - 1000, true), watch(epref(b, "ep:b102"), NOW - 10, false));
+    w(&s, move |c| {
+        user::save_progress(c, &old)?;
+        user::save_progress(c, &new)
+    });
+    let (e, ep) = copies::next_episode(&r, &[sa, sb]).unwrap().unwrap();
+    assert_eq!((e, ep.key.0.as_str()), (sb, "ep:b102"), "TV 2 was watched last");
+    assert_eq!(first(&r), Some(at(sb)));
+    let same = copies::same_episode(&r, sa, 1, 2).unwrap().unwrap();
+    assert_eq!(vod::episode(&r, same).unwrap().key.0, "ep:a102");
+    assert_eq!(copies::same_episode(&r, sa, 3, 1).unwrap(), None);
+    // playing TV 2's episode falls back on TV's same episode
+    let p = copies::plan(&r, &lib.vod, false, at(sb), false, CopyOrder::PlaylistOrder, NOW).unwrap();
+    match tuner::ui::copies::episode_command(&r, &lib.vod, &p, sb, &ep, true, PlayOrigin::Fullscreen) {
+        tuner::player::PlayerCommand::PlayCopy(c) => {
+            assert_eq!((c.req.media, c.fallback), (MediaRef::Episode(ep.id), Some(MediaRef::Episode(same))));
+        }
+        other => panic!("{other:?}"),
+    }
+
+    let rows = || r.query_row("SELECT count(*) FROM watch_progress WHERE kind = 'episode'", [], |x| x.get::<_, i64>(0)).unwrap();
+    let u = w(&s, move |c| copies::forget_series(c, &[sa, sb]));
+    assert_eq!(rows(), 0, "every copy's episodes forgotten");
+    w(&s, move |c| copies::undo(c, &u));
+    assert_eq!(rows(), 2);
+    assert_eq!(copies::next_episode(&r, &[sa, sb]).unwrap().unwrap().1.key.0, "ep:b102");
+}
+
+/// What the UI sends to play a combined movie: the first copy with the next as its fallback
+/// (or the copy the user picked, falling back to the best other one); after a failure mid-film
+/// the error card offers the next copy from where playback stopped — never a locked one while
+/// the session is locked — and the fallback toast names both playlists.
+#[test]
+fn play_commands_and_the_error_cards_other_copy() {
+    use std::sync::Arc;
+    use tuner::config::CopyOrder;
+    use tuner::player::{CopyPlay, PlayerCommand, PlayerSnapshot, PlayerState};
+    use tuner::store::copies;
+    use tuner::ui::copies as ui;
+    let (s, _, _) = dune_copies("tuner-st-copy-commands");
+    let r = s.reader().unwrap();
+    let lib = library::load(&r).unwrap();
+    let at = |key: &str| lib.vod.movies.iter().position(|m| m.key.0 == key).unwrap() as u32;
+    let movie = |key: &str| {
+        MediaRef::Movie(match lib.vod.movies[at(key) as usize].kind {
+            VodKind::Movie(id) => id,
+            VodKind::Series(_) => unreachable!(),
+        })
+    };
+    let plan = |unlocked: bool| copies::plan(&r, &lib.vod, true, at("a1"), unlocked, CopyOrder::PlaylistOrder, NOW).unwrap();
+    let copy = |cmd: Option<PlayerCommand>| match cmd {
+        Some(PlayerCommand::PlayCopy(CopyPlay { req, fallback, start_at })) => (req.media, fallback, start_at, req.resume),
+        other => panic!("not a copy play: {other:?}"),
+    };
+    let p = plan(false);
+    assert_eq!(copy(ui::movie_command(&lib.vod, &p, None, true, PlayOrigin::Fullscreen)), (movie("a5"), Some(movie("a1")), None, true));
+    let picked = ui::movie_command(&lib.vod, &p, Some(at("b1")), false, PlayOrigin::Fullscreen);
+    assert_eq!(copy(picked), (movie("b1"), Some(movie("a5")), None, false), "a picked copy falls back on the best other one");
+    let none = copies::CopyPlan { order: vec![], ..p.clone() };
+    assert_eq!(ui::movie_command(&lib.vod, &none, None, true, PlayOrigin::Fullscreen), None, "all locked: the PIN first");
+
+    // the 4K copy failed at 41:20: TV's avi copy is offered, starting there
+    let failed = |key: &str| PlayerSnapshot {
+        state: PlayerState::Error(tuner::player::PlayerError { kind: tuner::player::PlayerErrorKind::Network, message: "x".into() }),
+        playable: Some(Arc::new(Playable {
+            media: movie(key),
+            kind: PlayableKind::Movie,
+            item: None,
+            source_id: None,
+            title: "Dune".into(),
+            subtitle: None,
+            logo: None,
+            number: None,
+            url: Secret::new(String::new()),
+            headers: Default::default(),
+            start_at: None,
+            duration_hint: None,
+        })),
+        last_position: Some(2480.0),
+        ..Default::default()
+    };
+    let offer = |key: &str, unlocked: bool| {
+        ui::other_copy(&r, &lib, |m, i| copies::plan(&r, &lib.vod, m, i, unlocked, CopyOrder::PlaylistOrder, NOW).ok(), &failed(key))
+    };
+    let o = offer("a5", false).unwrap();
+    assert_eq!(o.label, "Play from TV at 41:20");
+    assert_eq!((o.play.req.media.clone(), o.play.start_at, o.play.fallback.clone()), (movie("a1"), Some(2480.0), None));
+    assert_eq!(offer("a1", false).unwrap().play.req.media, movie("a5"));
+    assert_eq!(offer("b1", false).unwrap().label, "Play from TV at 41:20", "TV 2's copy failed: TV's best");
+
+    // the toast of a fallback
+    let (tv, tv2) = (lib.vod.movies[at("a1") as usize].source_id, lib.vod.movies[at("b1") as usize].source_id);
+    assert_eq!(ui::fell_back_toast(&lib, "Dune", Some(tv), Some(tv2)).text, "TV couldn't play Dune — playing from TV 2");
+    assert_eq!(ui::fell_back_toast(&lib, "Dune", None, Some(tv2)).text, "Dune couldn't start — playing from TV 2");
+
+    // "Resume 41:20" continues the latest progress, also on a copy the user picked
+    let watched = WatchProgress {
+        item: mref(lib.vod.movies[at("b1") as usize].source_id, "b1"),
+        position_s: 2480.0,
+        duration_s: Some(9000.0),
+        updated_at: NOW - 60,
+        finished: false,
+        title: "Dune".into(),
+        fingerprint: Default::default(),
+    };
+    w(&s, move |c| user::save_progress(c, &watched));
+    let p = plan(false);
+    assert_eq!(copy(ui::movie_command(&lib.vod, &p, None, true, PlayOrigin::Fullscreen)), (movie("b1"), Some(movie("a5")), None, true));
+    let picked = ui::movie_command(&lib.vod, &p, Some(at("a5")), true, PlayOrigin::Fullscreen);
+    assert_eq!(copy(picked).2, Some(2480.0));
+    assert_eq!(copy(ui::movie_command(&lib.vod, &p, Some(at("a5")), false, PlayOrigin::Fullscreen)).2, None, "Start over");
+
+    // with TV's copies hidden, only the locked Arabic copy is left: offered to an open session only
+    w(&s, move |c| {
+        for k in ["a1", "a2", "a5"] {
+            user::set_item_override(c, &mref(tv, k), &ItemOverride { hidden: true, ..Default::default() })?;
+        }
+        Ok(())
+    });
+    let lib = library::load(&r).unwrap();
+    let VodKind::Movie(b1) = lib.vod.movies.iter().find(|m| m.key.0 == "b1").unwrap().kind else { unreachable!() };
+    let mut snap = failed("b1");
+    snap.playable = snap.playable.map(|p| Arc::new(Playable { media: MediaRef::Movie(b1), ..(*p).clone() }));
+    let offer =
+        |unlocked: bool| ui::other_copy(&r, &lib, |m, i| copies::plan(&r, &lib.vod, m, i, unlocked, CopyOrder::PlaylistOrder, NOW).ok(), &snap);
+    assert_eq!(offer(false), None, "locked while the session is");
+    assert_eq!(offer(true).map(|o| o.label), Some("Play from TV 2 at 41:20".to_owned()));
+}
+
 // ------------------------------------------------------------------ category filter
 
 /// One import of channels (and movies) whose groups carry provider raw names (`"UK | News"`),

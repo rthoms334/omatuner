@@ -644,6 +644,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Shift+←` / `Shift+→` / `↑` / `↓` | Skip back / forward (big step) |
 | `L` | Jump to live (from catch-up) |
 | `Home` | Go to start |
+| `Ctrl+O` | Play from another playlist's copy (after an error) |
 | `Space` | Play / pause |
 | `m` | Mute |
 | `+` / `=` / `-` | Volume up / down |
