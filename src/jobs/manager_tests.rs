@@ -210,8 +210,8 @@ async fn coalesces_while_queued_or_connecting_and_upgrades_force() {
     let jc = h.jobs.submit(refresh(c, false));
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(h.status(jc).unwrap().phase, JobPhase::Queued);
-    // queued: same id, and a force request upgrades the waiting job
-    assert_eq!(h.jobs.submit(refresh(c, true)), jc);
+    // queued: same id, and a force request upgrades the waiting job (which runs it)
+    assert_eq!(h.jobs.submit_tracked(refresh(c, true)), Submitted::In(jc));
     assert_eq!(h.status(jc).unwrap().kind, refresh(c, true));
     // A is still connecting but has read its source row: same id, a rerun is flagged (and
     // dropped by the cancel below — requests made before a cancel go with it)
@@ -255,7 +255,8 @@ async fn a_request_arriving_mid_download_reruns_the_job_afterwards() {
     let first = h.jobs.submit(refresh(s, false));
     h.wait_phase(first, |p| matches!(p, JobPhase::Downloading { .. })).await;
     // too late to coalesce: same id returned, rerun flagged, still one job
-    assert_eq!(h.jobs.submit(refresh(s, false)), first);
+    let tracked = h.jobs.submit_tracked(refresh(s, false));
+    assert_eq!(tracked, Submitted::After(first));
     assert_eq!(h.jobs.active().len(), 1);
     srv.gate.send(true).unwrap();
 
@@ -270,6 +271,7 @@ async fn a_request_arriving_mid_download_reruns_the_job_afterwards() {
     }
     let (second, outcome) = h.finished(|k| matches!(k, JobKind::RefreshSource { .. })).await;
     assert_ne!(second, first, "the rerun is a new job");
+    assert!(!tracked.ran_in(first) && tracked.ran_in(second), "the request ran in the rerun");
     assert!(outcome.is_ok(), "{outcome:?}");
     assert_eq!(srv.hits.load(Ordering::SeqCst), 2);
     // follow-up: every refresh submits RebuildLibrary

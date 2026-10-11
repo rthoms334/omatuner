@@ -2772,10 +2772,14 @@ first import; onboarding's Done step shows the counts, no toast).
 (= `!keep_m3u`) appears for Xtream sources with `m3u_origin()` and for M3U sources with
 `keep_m3u` (a playlist the user kept; for other M3U sources upgrading is automatic and the row
 is hidden). Changing it saves `SourceSettings.keep_m3u` (`set_source_settings`) and submits
-`RefreshSource { force: true }`; the refresh performs the switch. If the user asked for the
-Xtream login and the finished outcome has `upgraded == false` while the source is still M3U,
-the screen toasts "Couldn't sign in with this playlist's Xtream login — still using the
-playlist" (the reason is in the log / `last_error` is untouched by a failed attempt).
+`RefreshSource { force: true }` once that write landed (`JobManager::submit_tracked`, which
+says whether the returned job runs the request or it runs again after that job); the refresh
+performs the switch. Only that run answers the toggle: a forced refresh already running read
+the playlist still kept, so its outcome is ignored. If the user asked for the Xtream login and
+that run does not upgrade (`upgraded == false`, or it failed), the source is kept again and,
+for an outcome without `upgraded`, the screen toasts "Couldn't sign in with this playlist's
+Xtream login — still using the playlist" (the reason is in the log / `last_error` is untouched
+by a failed attempt).
 
 **Store guard.** `store::sources::update_source` must never null the Xtream login of a row whose
 stored kind is `xtream` (keeps the stored `xt_*` when `src.xtream` is `None`): a source editor

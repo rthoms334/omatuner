@@ -30,6 +30,8 @@
 //!   newer request. Cancelling a job drops the reruns requested before it; a request arriving
 //!   after the cancel (while the cancelled job winds down) becomes its rerun, so runs of one key
 //!   never overlap and that request is not lost.
+//! * `submit_tracked` also says which job runs a request (`Submitted`): the returned one, or
+//!   (rerun) the next one of its kind — for a caller waiting for the outcome of its own request.
 //! * Every failure is logged at WARN under target `tuner::jobs` as one redacted sentence
 //!   ("Couldn't refresh My IPTV: HTTP 404 from …"); the Jobs overlay lists these lines as
 //!   "Recent problems" (there is no separate job history). Cancellation is logged at INFO.
@@ -287,6 +289,32 @@ impl FailureKind {
             Error::Cancelled => FailureKind::Cancelled,
             Error::Network(_) => FailureKind::Network,
             _ => FailureKind::Other,
+        }
+    }
+}
+
+/// Which job runs a request ([`JobManager::submit_tracked`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Submitted {
+    /// This job runs it: a new one, or one that merged it before reading its inputs.
+    In(JobId),
+    /// This job had already read its inputs: the request runs again after it, as a newer job.
+    After(JobId),
+}
+
+impl Submitted {
+    pub fn id(self) -> JobId {
+        match self {
+            Submitted::In(id) | Submitted::After(id) => id,
+        }
+    }
+
+    /// Whether the finished job `id`, of the request's kind, is one that ran the request: any
+    /// job of that kind newer than the one it waited for read its inputs after the request.
+    pub fn ran_in(self, id: JobId) -> bool {
+        match self {
+            Submitted::In(j) => id == j,
+            Submitted::After(j) => id > j,
         }
     }
 }
@@ -609,9 +637,15 @@ impl JobManager {
 
     /// Queue a job (non-blocking). Returns the id (existing one when coalesced).
     pub fn submit(&self, kind: JobKind) -> JobId {
+        self.submit_tracked(kind).id()
+    }
+
+    /// [`Self::submit`], also saying whether the returned job runs this request or the request
+    /// runs again after it (for a caller that waits for the outcome of its own request).
+    pub fn submit_tracked(&self, kind: JobKind) -> Submitted {
         if self.inner.closing.load(Ordering::SeqCst) {
             tracing::debug!(target: "tuner::jobs", "shutting down: {} not started", label_for(&kind, None));
-            return JobId(0);
+            return Submitted::In(JobId(0));
         }
         let key = kind.dedupe_key();
         let mut jobs = lock(&self.inner.jobs);
@@ -626,14 +660,15 @@ impl JobManager {
                     // not started: the job will run the merged request
                     e.kind = e.kind.merged_with(&kind);
                     lock(&e.progress.status).kind = e.kind.clone();
+                    return Submitted::In(id);
                 }
-                JobPhase::Connecting if !e.progress.has_read_inputs() && e.kind.merged_with(&kind) == e.kind => {}
+                JobPhase::Connecting if !e.progress.has_read_inputs() && e.kind.merged_with(&kind) == e.kind => return Submitted::In(id),
                 // the running add answers this request too: a rerun after it would find the
                 // source already refreshed and add it a second time
-                _ if matches!(kind, JobKind::AddSource(_)) => {}
+                _ if matches!(kind, JobKind::AddSource(_)) => return Submitted::In(id),
                 _ => e.queue_rerun(kind),
             }
-            return id;
+            return Submitted::After(id);
         }
 
         let id = JobId(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
@@ -655,7 +690,7 @@ impl JobManager {
         progress.emit(status, true);
         let inner = self.inner.clone();
         self.inner.rt.spawn(async move { inner.run(id, semaphore, progress, cancel).await });
-        id
+        Submitted::In(id)
     }
 
     /// Request cancellation (no-op if finished). Reruns requested so far are dropped.

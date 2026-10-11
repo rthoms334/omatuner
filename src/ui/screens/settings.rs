@@ -29,7 +29,7 @@ use eframe::egui::{self, RichText};
 
 use super::home::kit::{self, Loader};
 use crate::config::{Config, Density, IdleInhibitMode, SidebarMode, StartScreen, SubtitleAuto};
-use crate::jobs::{JobEvent, JobKind, JobOutcome};
+use crate::jobs::{JobEvent, JobKind, JobOutcome, Submitted};
 use crate::keymap::{Action, KeyContext};
 use crate::model::{
     AccountStatus, ChannelId, EpgSource, EpgSourceId, EpgSourceKind, FavListId, GroupId, ItemKind, ItemRef, JobId, LiveFormat, Reminder, ReminderId,
@@ -663,9 +663,30 @@ pub struct SettingsScreen {
     /// Hidden channels of the library generation `hidden_built` (Settings ▸ Hidden items).
     hidden_channels: Vec<(ChannelId, String)>,
     hidden_built: u64,
-    /// A playlist kept as M3U that the user asked to sign in with its Xtream login: its next
-    /// forced refresh says whether that worked.
-    login_switch: Option<SourceId>,
+    /// A playlist kept as M3U that the user asked to sign in with its Xtream login: the
+    /// refresh submitted once that choice was saved says whether that worked.
+    login_switch: Option<LoginSwitch>,
+}
+
+/// "Use the Xtream login" waiting for its refresh. Only the job that runs the refresh submitted
+/// after `keep_m3u` was saved answers it: a forced refresh already running read the playlist
+/// still kept, so its outcome says nothing about the login (DESIGN §27.3).
+struct LoginSwitch {
+    source: SourceId,
+    /// Resolves once the setting is saved and the refresh submitted.
+    ticket: Option<crate::store::Ticket<Submitted>>,
+    submitted: Option<Submitted>,
+}
+
+impl LoginSwitch {
+    /// Whether the finished refresh `id` of this source is the one that tried the login.
+    fn answered_by(&mut self, id: JobId) -> bool {
+        if let Some(r) = self.ticket.as_mut().and_then(crate::store::Ticket::try_take) {
+            self.ticket = None;
+            self.submitted = r.ok();
+        }
+        self.submitted.is_some_and(|s| s.ran_in(id))
+    }
 }
 
 /// How long ←/→ on a guide's offset must rest before the change is saved and re-imported.
@@ -1447,15 +1468,17 @@ impl SettingsScreen {
         // a later Save keeps it (and doesn't count it as a change)
         e.original.settings.keep_m3u = !on;
         let (id, name) = (e.original.id, e.original.name.clone());
-        self.login_switch = (on && e.original.kind != SourceKind::Xtream).then_some(id);
+        let check = on && e.original.kind != SourceKind::Xtream;
         let jobs = ctx.services.jobs.clone();
-        let _ = ctx.services.store.writer().submit_notify(DataScope::Sources, move |c| {
+        let ticket = ctx.services.store.writer().submit_notify(DataScope::Sources, move |c| {
             let mut settings = crate::store::sources::get_source(c, id)?.settings;
             settings.keep_m3u = !on;
             crate::store::sources::set_source_settings(c, id, &settings)?;
-            jobs.submit(JobKind::RefreshSource { source: id, force: true });
-            Ok(())
+            // submitted once saved (autocommit): the job that runs it reads the new setting
+            Ok(jobs.submit_tracked(JobKind::RefreshSource { source: id, force: true }))
         });
+        // (the refresh writes before it can finish: the ticket is resolved by then)
+        self.login_switch = check.then(|| LoginSwitch { source: id, ticket: Some(ticket), submitted: None });
         ctx.toast(Toast::info(if on {
             format!("Signing in to {name} with its Xtream login…")
         } else {
@@ -2004,8 +2027,8 @@ impl Screen for SettingsScreen {
                 }
             }
             // the forced refresh after "Use the Xtream login" was turned on (DESIGN §27.3)
-            AppEvent::Job(JobEvent::Finished { kind: JobKind::RefreshSource { source, force: true }, outcome, .. })
-                if self.login_switch == Some(*source) =>
+            AppEvent::Job(JobEvent::Finished { id, kind: JobKind::RefreshSource { source, force: true }, outcome, .. })
+                if self.login_switch.as_mut().is_some_and(|w| w.source == *source && w.answered_by(*id)) =>
             {
                 self.login_switch = None;
                 if matches!(outcome, Ok(JobOutcome::SourceRefreshed { upgraded: false, .. })) {
@@ -3327,15 +3350,15 @@ mod tests {
         focus(&mut h, "Use the Xtream login");
         h.state_mut().act(Action::Activate);
         h.run_steps(1); // acted on in the frame
-        assert!(use_xtream(&h) && h.state().s.login_switch == Some(id));
+        assert!(use_xtream(&h) && h.state().s.login_switch.as_ref().is_some_and(|w| w.source == id));
         until(&mut h, "the refresh, then the playlist kept again", |h| {
             h.state().s.login_switch.is_none() && sources(h)[0].settings.keep_m3u && h.state().s.editor.as_ref().is_some_and(|e| !e.use_xtream)
         });
         assert!(h.state().s.editor.as_ref().is_some_and(SourceEditor::offers_xtream_switch));
         // the refresh answered without signing in
-        let finished = |upgraded| {
+        let finished = |job: JobId, upgraded| {
             AppEvent::Job(JobEvent::Finished {
-                id: JobId(99),
+                id: job,
                 kind: JobKind::RefreshSource { source: id, force: true },
                 outcome: Ok(JobOutcome::SourceRefreshed { source: id, summary: Default::default(), not_modified: false, account: None, upgraded }),
                 failure: None,
@@ -3348,10 +3371,27 @@ mod tests {
         focus(&mut h, "Use the Xtream login");
         h.state_mut().act(Action::Activate);
         h.run_steps(1);
-        deliver(&mut h, finished(false)); // before the next frame pumps the real answer
+        // the job that runs this request, once the setting is saved (before the next frame
+        // pumps the real answer)
+        let ours = {
+            let w = h.state_mut().s.login_switch.as_mut().expect("waiting for the refresh");
+            let s = w.ticket.take().expect("submitted with the setting").wait().unwrap();
+            w.submitted = Some(s);
+            match s {
+                Submitted::In(j) => j,
+                Submitted::After(j) => JobId(j.0 + 1),
+            }
+        };
+        // a forced refresh that was already running read the playlist still kept: its result
+        // is not the toggle's (no error, and the user's choice is not reverted)
+        deliver(&mut h, finished(JobId(0), false));
+        assert_eq!(sign_in_failed(&h), 0);
+        assert!(h.state().s.login_switch.is_some() && use_xtream(&h));
+        deliver(&mut h, finished(ours, false));
         assert_eq!(sign_in_failed(&h), 1);
-        h.state_mut().s.login_switch = Some(id);
-        deliver(&mut h, finished(true));
+        assert!(h.state().s.login_switch.is_none());
+        h.state_mut().s.login_switch = Some(LoginSwitch { source: id, ticket: None, submitted: Some(Submitted::In(ours)) });
+        deliver(&mut h, finished(ours, true));
         assert_eq!(sign_in_failed(&h), 1, "an upgrade is the app's toast");
     }
 
