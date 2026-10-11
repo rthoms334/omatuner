@@ -9,12 +9,15 @@
 use rusqlite::{Connection, params};
 
 use crate::error::Result;
+use crate::model::Quality;
+use crate::sources::smart_names::{clean_channel_name, clean_vod_name, group_display};
 
 /// Ordered migration scripts.
 pub const MIGRATIONS: &[(&str, &str)] = &[
     ("0001_init", include_str!("migrations/0001_init.sql")),
     ("0002_category_filter", include_str!("migrations/0002_category_filter.sql")),
     ("0003_quality", include_str!("migrations/0003_quality.sql")),
+    ("0004_name_rules", include_str!("migrations/0004_name_rules.sql")),
 ];
 
 /// Current schema version after all migrations.
@@ -72,8 +75,105 @@ fn add_column_if_missing(conn: &Connection, table: &str, col: &str, decl: &str) 
 
 /// The Rust part of migration `name`, if it has one.
 fn backfill(conn: &Connection, name: &str) -> Result<()> {
-    if name == "0003_quality" {
-        backfill_channel_quality(conn)?;
+    match name {
+        "0003_quality" => backfill_channel_quality(conn),
+        "0004_name_rules" => {
+            seed_quality_checks(conn)?;
+            reclean_names(conn)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// `quality_check` from the picture sizes measured before 0004 (`channel_video`): the claim is
+/// the quality word of the name it was measured under; radio is no evidence.
+fn seed_quality_checks(conn: &Connection) -> Result<()> {
+    let mut read = conn.prepare(
+        "SELECT v.source_id, v.name, v.width, v.height, v.at FROM channel_video v
+         WHERE NOT EXISTS (SELECT 1 FROM channel c WHERE c.source_id = v.source_id AND c.key = v.item_key AND c.radio = 1)",
+    )?;
+    let mut write = conn.prepare("INSERT OR IGNORE INTO quality_check(source_id, name, claimed, measured, at) VALUES (?1, ?2, ?3, ?4, ?5)")?;
+    let mut rows = read.query([])?;
+    while let Some(r) = rows.next()? {
+        let name: String = r.get(1)?;
+        let Some(measured) = Quality::of_video(r.get(2)?, r.get(3)?) else { continue };
+        let claimed = clean_channel_name(&name).quality;
+        write.execute(params![r.get::<_, i64>(0)?, name, claimed.map(Quality::code), measured.code(), r.get::<_, i64>(4)?])?;
+    }
+    Ok(())
+}
+
+/// Display names from the stored provider names with the current smart-name rules (names
+/// are cleaned at import, so without this an existing database would show the old cleanup
+/// until each playlist's next refresh): `channel.clean_name`, `movie` / `series.clean_name`
+/// and `grp.name` (from `grp.raw_name`; groups imported before it was stored wait for the
+/// refresh) for the sources with smart names on, and every channel's `quality` / `family`.
+/// A source's smart-names setting is its own, else inferred from its rows (the app-wide
+/// default lives in the config file): on when any stored display name differs from the
+/// provider's. Only changed rows are written. Safe to re-run.
+fn reclean_names(conn: &Connection) -> Result<()> {
+    let sources: Vec<(i64, Option<bool>)> = conn
+        .prepare("SELECT id, json_extract(settings, '$.smart_names') FROM source")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, setting) in sources {
+        let smart = match setting {
+            Some(on) => on,
+            None => conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM channel WHERE source_id = ?1 AND clean_name <> name)
+                     OR EXISTS (SELECT 1 FROM movie WHERE source_id = ?1 AND clean_name <> name)
+                     OR EXISTS (SELECT 1 FROM series WHERE source_id = ?1 AND clean_name <> name)
+                     OR EXISTS (SELECT 1 FROM grp WHERE source_id = ?1 AND raw_name IS NOT NULL AND name <> raw_name)",
+                [id],
+                |r| r.get(0),
+            )?,
+        };
+        reclean_channels(conn, id, smart)?;
+        if smart {
+            for table in ["movie", "series"] {
+                reclean_vod(conn, table, id)?;
+            }
+            let mut read = conn.prepare("SELECT id, raw_name, name FROM grp WHERE source_id = ?1 AND raw_name IS NOT NULL")?;
+            let mut write = conn.prepare("UPDATE grp SET name = ?2 WHERE id = ?1")?;
+            let mut rows = read.query([id])?;
+            while let Some(r) = rows.next()? {
+                let name = group_display(&r.get::<_, String>(1)?, true);
+                if name != r.get::<_, String>(2)? {
+                    write.execute(params![r.get::<_, i64>(0)?, name])?;
+                }
+            }
+            crate::store::import::distinguish_group_names(conn, crate::model::SourceId(id), None)?;
+        }
+    }
+    Ok(())
+}
+
+fn reclean_channels(conn: &Connection, source: i64, smart: bool) -> Result<()> {
+    let mut read = conn.prepare("SELECT id, name, clean_name, quality, family FROM channel WHERE source_id = ?1")?;
+    let mut write = conn.prepare("UPDATE channel SET clean_name = ?2, quality = ?3, family = ?4 WHERE id = ?1")?;
+    let mut rows = read.query([source])?;
+    while let Some(r) = rows.next()? {
+        let name: String = r.get(1)?;
+        let cleaned = clean_channel_name(&name);
+        let q = crate::store::import::NameQuality::of(&cleaned);
+        let (quality, family) = (q.as_ref().map(|q| i64::from(q.class.code())), q.map(|q| q.family));
+        let clean = if smart { cleaned.name } else { r.get(2)? };
+        if (&clean, quality, &family) != (&r.get::<_, String>(2)?, r.get(3)?, &r.get::<_, Option<String>>(4)?) {
+            write.execute(params![r.get::<_, i64>(0)?, clean, quality, family])?;
+        }
+    }
+    Ok(())
+}
+
+fn reclean_vod(conn: &Connection, table: &str, source: i64) -> Result<()> {
+    let mut read = conn.prepare(&format!("SELECT id, name, clean_name FROM {table} WHERE source_id = ?1"))?;
+    let mut write = conn.prepare(&format!("UPDATE {table} SET clean_name = ?2 WHERE id = ?1"))?;
+    let mut rows = read.query([source])?;
+    while let Some(r) = rows.next()? {
+        let clean = clean_vod_name(&r.get::<_, String>(1)?).0;
+        if clean != r.get::<_, String>(2)? {
+            write.execute(params![r.get::<_, i64>(0)?, clean])?;
+        }
     }
     Ok(())
 }
@@ -90,7 +190,7 @@ fn backfill_channel_quality(conn: &Connection) -> Result<()> {
     let mut rows = read.query([])?;
     while let Some(r) = rows.next()? {
         let name: String = r.get(1)?;
-        if let Some(q) = crate::store::import::NameQuality::of(&crate::sources::smart_names::clean_channel_name(&name)) {
+        if let Some(q) = crate::store::import::NameQuality::of(&clean_channel_name(&name)) {
             write.execute(params![r.get::<_, i64>(0)?, q.class.code(), q.family])?;
         }
     }
@@ -114,9 +214,15 @@ mod tests {
         let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v, latest_version());
         let names: Vec<&str> = MIGRATIONS.iter().map(|m| m.0).collect();
-        assert_eq!(names, ["0001_init", "0002_category_filter", "0003_quality"]);
-        for (t, col) in [("grp", "raw_name"), ("group_override", "shown"), ("channel", "quality"), ("channel", "family"), ("channel_video", "width")]
-        {
+        assert_eq!(names, ["0001_init", "0002_category_filter", "0003_quality", "0004_name_rules"]);
+        for (t, col) in [
+            ("grp", "raw_name"),
+            ("group_override", "shown"),
+            ("channel", "quality"),
+            ("channel", "family"),
+            ("channel_video", "width"),
+            ("quality_check", "claimed"),
+        ] {
             assert!(has_column(&c, t, col).unwrap(), "{t}.{col}");
         }
     }
@@ -240,6 +346,58 @@ mod tests {
         let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v, latest_version());
         migrate(&mut c).unwrap();
+    }
+
+    /// 0004: an existing database shows the current smart-name rules without a refresh (only
+    /// for sources with smart names on, inferred when unset; quality words for all), and the
+    /// sizes measured before it become trust evidence. Safe to run again.
+    #[test]
+    fn name_rules_migration_recleans_names_and_seeds_trust() {
+        let mut c = migrated_to(3);
+        assert_eq!(MIGRATIONS[3].0, "0004_name_rules");
+        c.execute_batch(
+            r#"INSERT INTO source(id,name,kind,created_at) VALUES (1,'s','m3u-url',0), (2,'raw','m3u-url',0);
+               UPDATE source SET settings = '{"smart_names":false}' WHERE id = 2;
+               INSERT INTO channel(source_id,key,name,clean_name,norm_name,stream,provider_order,seen_gen) VALUES
+                 (1,'a','UK: ITV 4 4K ◉','ITV 4 ◉','itv4','{}',0,1),
+                 (1,'b','US ★ CNN HD','US ★ CNN','uscnn','{}',1,1),
+                 (2,'c','UK ★ BBC One HD','UK ★ BBC One HD','ukbbcone','{}',0,1);
+               INSERT INTO grp(source_id,kind,key,name,raw_name,provider_order,seen_gen) VALUES
+                 (1,'channel','channel:ukgeneral','UK ❖ General','UK ❖ General',0,1),
+                 (1,'channel','channel:old','Old',NULL,1,1),
+                 (1,'channel','channel:generalhevc','GENERAL ʰᵉᵛᶜ','GENERAL ʰᵉᵛᶜ',2,1);
+               INSERT INTO movie(source_id,key,name,clean_name,norm_name,stream,provider_order,seen_gen) VALUES
+                 (1,'m','EN ★ Dune 4K (2021)','EN ★ Dune','dune','{}',0,1);
+               INSERT INTO channel_video(source_id,item_key,name,width,height,at) VALUES (1,'a','UK: ITV 4 4K ◉',1280,720,5);"#,
+        )
+        .unwrap();
+        let check = |c: &Connection| {
+            let ch = |k: &str| {
+                c.query_row("SELECT clean_name, quality, family FROM channel WHERE key = ?1", [k], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, Option<String>>(2)?))
+                })
+                .unwrap()
+            };
+            assert_eq!(ch("a"), ("ITV 4".into(), Some(4), Some("itv4".into())));
+            assert_eq!(ch("b"), ("CNN".into(), Some(2), Some("cnn".into())));
+            assert_eq!(ch("c"), ("UK ★ BBC One HD".into(), Some(2), Some("bbcone".into())), "smart names off: raw name kept");
+            let grp = |k: &str| c.query_row("SELECT name FROM grp WHERE key = ?1", [k], |r| r.get::<_, String>(0)).unwrap();
+            // two categories that clean to the same name keep what tells them apart
+            assert_eq!(
+                (grp("channel:ukgeneral"), grp("channel:generalhevc"), grp("channel:old")),
+                ("General · UK".into(), "General · HEVC".into(), "Old".into())
+            );
+            assert_eq!(c.query_row("SELECT clean_name FROM movie", [], |r| r.get::<_, String>(0)).unwrap(), "Dune");
+            let qc = c.query_row("SELECT source_id, name, claimed, measured, at FROM quality_check", [], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<i64>>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?))
+            });
+            assert_eq!(qc.unwrap(), (1, "UK: ITV 4 4K ◉".into(), Some(4), 2, 5));
+        };
+        migrate(&mut c).unwrap();
+        check(&c);
+        c.pragma_update(None, "user_version", 3).unwrap();
+        migrate(&mut c).unwrap();
+        check(&c);
     }
 
     #[test]

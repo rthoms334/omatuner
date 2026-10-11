@@ -1683,7 +1683,7 @@ impl LiveScreen {
         let Some(ch) = cursor.and_then(|id| ctx.lib.live.get(id).cloned()) else { return };
         let h24 = ctx.config.interface.clock_24h;
         // the preview always says it (stream info, like the player's OSD), whatever the list setting
-        let quality = ctx.measured.get(&ch).or(ch.quality);
+        let quality = crate::ui::data::QualityBadges(Some(ctx.measured)).of(&ch);
         // name · number + badges
         ui.horizontal_wrapped(|ui| {
             let size = (theme.font(TypeToken::Heading) * 1.6).round();

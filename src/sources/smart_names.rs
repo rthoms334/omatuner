@@ -13,16 +13,31 @@
 //! | `Sky Cinema +1 HD`               | `Sky Cinema +1`| —       | Hd      |
 //! | `The Matrix (1999) [MULTI-SUB]`  | `The Matrix`   | year 1999 (VOD) |
 //!
-//! Rules (no regexes, no allocation beyond the output):
-//! * Leading prefixes, repeatedly: `[XX]` / `[tag]`, `|XX|`, `XX:` / `XX |` / `XX|`, and
-//!   upper-case `XX - `. `XX` is a country/language code: any two letters, or a known
-//!   three-letter code (`USA`, `ENG`, `ARA`…) so that `CNN: Live` stays intact.
-//! * Quality words anywhere (`SD HD FHD UHD 4K 8K 480p…2160p 1080i`, also in `(…)`/`[…]` and as
-//!   superscript/small-caps `ᴴᴰ` / `ꜰʜᴅ`, attached or not) → [`Quality`] (best one wins).
-//! * Codec/format words (`HEVC H.265 H264 x265 HDR 50fps…`), any `[…]` group and `(…)` groups
-//!   that are tags (`backup`, `backup 2`, `multi-sub`, `geo-blocked`…) → `tags`. Other `(…)`
-//!   groups are part of the name (`BBC One (Scotland)`).
-//! * Dangling separators (`|`, `-`, `:`…) at either end are dropped; whitespace collapses.
+//! | `UK ★ ITV 4 4K ◉`                | `ITV 4`        | UK      | Uhd     |
+//!
+//! Rules (DESIGN §13.1), on the tokens of the shared tokenizer (`name_tokens`: words, symbol /
+//! punctuation runs, superscript decoration, flags, brackets):
+//! * Leading prefixes, repeatedly, after any decoration (`★ ◉ ## -`) and flags: `[…]` (any
+//!   tag), `(XX)` / `|XX|`, and up to three prefix words followed by any separator run (`XX:`,
+//!   `XX |`, `XX ★`, `XX ❖`, `XX ⓧ`; a dash only spaced after upper-case codes, `DE - Das
+//!   Erste`, never `Al - Jazeera`). A prefix word is a country / language / region of the
+//!   category tags (`UK`, `ALB`, `EXYU`, `LATAM`, `HINDI`, `URUGUAY`), a known three-letter
+//!   code, a service tag (`VIP SAT RAW PPV 24/7`), a quality word, or — alone — any two
+//!   letters (`RK:`) or a code with a short line-up label (`IN-PREM:`, `BE-VIP:`), so `CNN:
+//!   Live`, `AT&T: …` and `MY TV: …` stay intact. A prefix is never all that is left.
+//! * Quality words anywhere (`SD HD FHD UHD 4K 480p…2160p 3840p 1080i`, glued to symbols
+//!   `4K◉`, in `(…)` / `[…]` / `⁽…⁾`, as superscript / small caps `ᴴᴰ` `ꜰʜᴅ` `ᶠ ᴴᴰ`) →
+//!   [`Quality`] (best one wins; one of the prefix only when the name has none). Category
+//!   names keep their plain ones (`Sports 4K`).
+//! * Codec / format words (`HEVC H.265 x265 HDR 50fps ⁵⁰ FPS`, `8K`: event slates claim
+//!   nothing), the channel feed tag `RAW` (upper-case; not in `WWE RAW`), any
+//!   `[…]` group, superscript groups (`⁽ᴮᴷ⁾`) and `(…)` groups that are tags (`backup`,
+//!   `multi-sub`, `geo-blocked`…) → `tags`. Other `(…)` groups are part of the name (`BBC One
+//!   (Scotland)`); superscript text is decoration, stylised small capitals that are no known
+//!   word stay.
+//! * Separators and decoration at either end are dropped (`◉`, `★`, `|`, `:`, `##`, flags);
+//!   inside the name they stay as written (`E! News`, `AT&T`, `Sky Sports+`, `Channel 4 +1`,
+//!   `Parijs-Tours: Mannen`); whitespace collapses.
 //! * Non-Latin text is untouched (no transliteration: display, not identity).
 
 // Implemented: opt back into the lints that `lib.rs` silences for the still-stubbed `sources`.
@@ -31,11 +46,14 @@
 /// The quality word of a name is the channel's name-derived badge (stored at import,
 /// `channel.quality`); the type lives in the model next to the measured one.
 pub use crate::model::Quality;
+use crate::sources::category_tags::{self, WordTag};
+use crate::sources::name_tokens::{Kind, Token, closing, deco_ascii, is_format_word, is_service_word, is_small_caps, quality_word, tokens};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CleanName {
     pub name: String,
-    /// Country/language prefix that was stripped (upper-case, 2-3 letters).
+    /// Country / language / region prefix that was stripped, upper-case as written (`UK`,
+    /// `USA`, `EN`, `ALB`, `URUGUAY`; a flag's letters).
     pub country: Option<String>,
     pub quality: Option<Quality>,
     /// Other stripped tags: "VIP", "backup", "HEVC", "MULTI-SUB"...
@@ -44,82 +62,160 @@ pub struct CleanName {
 
 /// Clean a live channel name. Never returns an empty name (falls back to the trimmed raw).
 pub fn clean_channel_name(raw: &str) -> CleanName {
-    let c = clean(raw, false);
-    if c.words.is_empty() {
+    let c = clean(raw, Mode::Channel);
+    if c.name.is_empty() {
         return CleanName { name: raw.trim().to_owned(), country: None, quality: None, tags: Vec::new() };
     }
-    CleanName { name: c.words.join(" "), country: c.country, quality: c.quality, tags: c.tags }
+    CleanName { name: c.name, country: c.country, quality: c.quality, tags: c.tags }
 }
 
 /// Clean a movie/series title; extracts a trailing `(YYYY)` / `- YYYY` year.
 pub fn clean_vod_name(raw: &str) -> (String, Option<u16>) {
-    let c = clean(raw, true);
-    if c.words.is_empty() {
+    let c = clean(raw, Mode::Vod);
+    if c.name.is_empty() {
         return (raw.trim().to_owned(), None);
     }
-    (c.words.join(" "), c.year)
+    (c.name, c.year)
 }
 
-/// Clean a group/category name (`"UK| SPORTS ᴴᴰ"` → `"Sports"`, keeps country as prefix tag).
+/// Clean a group/category name (`"UK| SPORTS ᴴᴰ"` → `"Sports"`, `"UK ❖ General"` →
+/// `"General"`).
 ///
-/// The country only survives in the group KEY (`identity::normalize_group` keeps it); the
-/// display drops it like for channels. All-caps names are title-cased, keeping short
-/// acronyms (`TV`, `NFL`) and lower-casing joining words (`NEWS & INFO` → `News & Info`).
+/// The country only survives in the group KEY (`identity::normalize_group` keeps it) and in
+/// `grp.raw_name` (tag detection); the display drops it like for channels. A quality word
+/// written as plain text is what the category is about and stays (`"UK ❖ SPORTS 4K"` →
+/// `"Sports 4K"`, `"UK ❖ 4K"` → `"4K"`); superscript ones are decoration. A full country name
+/// before text in another script stays (`"Lebanon ▶ لبنان"`). All-caps names are title-cased,
+/// keeping short acronyms (`TV`, `NFL`) and lower-casing joining words (`NEWS & INFO` → `News
+/// & Info`).
 pub fn clean_group_name(raw: &str) -> String {
-    let c = clean(raw, false);
-    if c.words.is_empty() {
+    let c = clean(raw, Mode::Group);
+    if c.name.is_empty() {
         return raw.trim().to_owned();
     }
-    let name = c.words.join(" ");
-    let has_upper = name.chars().any(char::is_uppercase);
-    let has_lower = name.chars().any(char::is_lowercase);
-    if has_upper && !has_lower { title_case(&name) } else { name }
+    let has_upper = c.name.chars().any(char::is_uppercase);
+    let has_lower = c.name.chars().any(char::is_lowercase);
+    if has_upper && !has_lower { title_case(&c.name) } else { c.name }
+}
+
+/// Display name of a group as imported (`grp.name`): smart cleanup or the trimmed raw name,
+/// never empty ("Uncategorized").
+pub fn group_display(raw: &str, smart: bool) -> String {
+    let name = if smart { clean_group_name(raw) } else { raw.trim().to_owned() };
+    if name.trim().is_empty() { "Uncategorized".to_owned() } else { name }
+}
+
+/// Display names `(display, raw)` of one playlist's categories of one kind: the ones smart
+/// cleanup made identical although the provider names differ get what cleanup dropped
+/// (`"GENERAL ᴴᴰ/"`, `"GENERAL ʰᵉᵛᶜ"`, `"General"` → `General · HD`, `General · HEVC`,
+/// `General`). Run after [`group_display`], smart names on.
+pub fn distinguish_groups(groups: &mut [(&mut String, &str)]) {
+    let mut sets: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+    for (i, (name, _)) in groups.iter().enumerate() {
+        sets.entry((**name).clone()).or_default().push(i);
+    }
+    for set in sets.into_values().filter(|s| s.len() > 1) {
+        let raws: Vec<&str> = set.iter().map(|&i| groups[i].1).collect();
+        for (i, suffix) in set.iter().zip(distinguishing_suffixes(&raws, true)) {
+            if let Some(suffix) = suffix {
+                groups[*i].0.push_str(" · ");
+                groups[*i].0.push_str(&suffix);
+            }
+        }
+    }
+}
+
+/// For names whose cleaned display is the same, what tells each one apart: the country,
+/// tags (and, for categories, superscript quality) cleanup dropped that not all of them share
+/// (`"FI: TV5"` / `"FI: TV5 ᴿᴬᵂ"` → none / `RAW`; `"PL: CANAL+ SPORT 5"` / `"AF: …"` → `PL` /
+/// `AF`; `"STAR MAA HD²"` → `2`). `None` for a name with nothing of its own, and for all of
+/// them when the provider names are the same.
+pub fn distinguishing_suffixes(raws: &[&str], group: bool) -> Vec<Option<String>> {
+    let spaced = |r: &str| r.split_whitespace().collect::<Vec<_>>().join(" ");
+    let first = raws.first().map(|r| spaced(r));
+    if raws.iter().all(|r| Some(spaced(r)) == first) {
+        return vec![None; raws.len()];
+    }
+    let parts: Vec<Vec<String>> = raws
+        .iter()
+        .map(|raw| {
+            let c = clean(raw, if group { Mode::Group } else { Mode::Channel });
+            let mut p: Vec<String> = Vec::new();
+            let quality = c.quality.filter(|_| group).map(|q| q.label().to_owned());
+            for part in c.country.into_iter().chain(quality).chain(c.tags) {
+                let part = tag_label(part.trim());
+                if !part.is_empty() && !p.iter().any(|x| x.eq_ignore_ascii_case(&part)) {
+                    p.push(part);
+                }
+            }
+            p
+        })
+        .collect();
+    let shared = |x: &String| parts.iter().all(|o| o.iter().any(|y| y.eq_ignore_ascii_case(x)));
+    parts
+        .iter()
+        .map(|p| {
+            let own: Vec<&str> = p.iter().filter(|x| !shared(x)).map(String::as_str).collect();
+            (!own.is_empty()).then(|| own.join(" "))
+        })
+        .collect()
+}
+
+/// A dropped tag as shown after a name: codes as written (`RAW`, `HEVC`, `PL`, `H.265`),
+/// longer all-caps words capitalised (`DOLBY` → `Dolby`, `BACKUP` → `Backup`).
+fn tag_label(s: &str) -> String {
+    if s.chars().count() <= 4 || s.chars().any(char::is_lowercase) || !s.chars().all(char::is_alphabetic) {
+        return s.to_owned();
+    }
+    let lower = s.to_lowercase();
+    let mut chars = lower.chars();
+    chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------------------------
 
-/// Result of the shared cleanup pass.
+/// What is being cleaned: the rules differ a little.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Channel,
+    /// Movie / series titles: a year comes off; prefixes are upper-case codes only (`America:
+    /// The Motion Picture`, `It: Chapter Two` are titles); `Raw` is a word.
+    Vod,
+    /// Category names: plain quality words stay; a full country name before text in another
+    /// script stays.
+    Group,
+}
+
+/// Result of the shared cleanup pass (`name` empty = nothing left: callers fall back).
 #[derive(Default)]
-struct Cleaned<'a> {
-    words: Vec<&'a str>,
+struct Cleaned {
+    name: String,
     country: Option<String>,
     quality: Option<Quality>,
+    /// A quality word of the prefix (`4K: beIN SPORTS 6 ᴴᴰ`): a line-up label, so one after
+    /// it wins.
+    prefix_quality: Option<Quality>,
     tags: Vec<String>,
     year: Option<u16>,
 }
 
-impl Cleaned<'_> {
+impl Cleaned {
     fn add_quality(&mut self, q: Quality) {
         if self.quality.is_none_or(|old| q > old) {
             self.quality = Some(q);
         }
     }
+    fn add_prefix_quality(&mut self, q: Quality) {
+        if self.prefix_quality.is_none_or(|old| q > old) {
+            self.prefix_quality = Some(q);
+        }
+    }
     fn add_country(&mut self, code: &str) {
-        if self.country.is_none() {
-            self.country = Some(code.to_ascii_uppercase());
+        if self.country.is_none() && !code.is_empty() {
+            self.country = Some(code.to_uppercase());
         }
     }
 }
-
-/// Quality words → [`Quality`] (compared lower-case).
-const QUALITY_WORDS: &[(&str, Quality)] = &[
-    ("sd", Quality::Sd),
-    ("480p", Quality::Sd),
-    ("576p", Quality::Sd),
-    ("hd", Quality::Hd),
-    ("720p", Quality::Hd),
-    ("fhd", Quality::Fhd),
-    ("1080p", Quality::Fhd),
-    ("1080i", Quality::Fhd),
-    ("uhd", Quality::Uhd),
-    ("4k", Quality::Uhd),
-    ("2160p", Quality::Uhd),
-    ("8k", Quality::Uhd),
-];
-
-/// Codec / format words stripped into `tags` (compared lower-case).
-const CODEC_WORDS: &[&str] =
-    &["hevc", "h265", "h.265", "h264", "h.264", "x265", "x264", "avc", "hdr", "hdr10", "hdr10+", "dolby", "50fps", "60fps", "25fps"];
 
 /// `(…)` contents that are tags rather than part of the name (compared lower-case; `backup`
 /// matches `backup 2`, `backup-1`…).
@@ -146,44 +242,22 @@ const PAREN_TAGS: &[&str] = &[
     "alt",
 ];
 
-/// Three-letter codes accepted as country/language prefixes (two letters are always codes).
+/// Three-letter codes accepted as country/language prefixes besides the ones the category
+/// tags know (two letters are always codes).
 const COUNTRY3: &[&str] = &[
     "usa", "uae", "ksa", "gbr", "deu", "ger", "fra", "ita", "esp", "spa", "por", "prt", "bra", "arg", "mex", "can", "aus", "ind", "pak", "tur",
     "rus", "ukr", "pol", "nld", "bel", "swe", "nor", "dnk", "den", "fin", "isl", "irl", "che", "sui", "aut", "gre", "grc", "cze", "svk", "hun",
     "rou", "rom", "bgr", "bul", "srb", "hrv", "cro", "bih", "slo", "svn", "mkd", "alb", "ara", "eng", "lat", "afr", "asi", "chn", "jpn", "kor",
     "phi", "tha", "vie", "idn", "mys", "isr", "irn", "irq", "egy", "mar", "tun", "dza", "alg", "nga", "zaf", "kur", "per", "chl", "col", "ven",
     "lux", "ltu", "lva", "est", "geo", "arm", "aze", "kaz", "uzb", "bgd", "lka", "npl", "afg", "syr", "lbn", "jor", "kwt", "qat", "bhr", "omn",
-    "yem", "sau", "som", "eth", "ken", "gha", "cmr", "sen", "civ", "hin", "urd", "tam", "tel", "fre", "dut", "chi", "jap", "rum", "fil",
+    "yem", "sau", "som", "eth", "ken", "gha", "cmr", "sen", "civ", "hin", "urd", "tam", "tel", "fre", "dut", "chi", "jap", "rum", "fil", "ban",
 ];
-
-/// Separators that are noise when left dangling at either end. Not `+`: `Canal +` and
-/// `Disney +` are channels of their own.
-fn is_separator(w: &str) -> bool {
-    !w.is_empty() && w.chars().all(|c| matches!(c, '|' | '-' | '–' | '—' | ':' | '·' | '•' | '/' | '~' | '*' | '_'))
-}
-
-fn quality_of(w: &str) -> Option<Quality> {
-    let w = w.trim();
-    QUALITY_WORDS.iter().find(|(k, _)| w.eq_ignore_ascii_case(k)).map(|(_, q)| *q)
-}
-
-fn is_codec(w: &str) -> bool {
-    CODEC_WORDS.iter().any(|k| w.eq_ignore_ascii_case(k))
-}
 
 fn is_paren_tag(inner: &str) -> bool {
     let l = inner.trim().to_lowercase();
     PAREN_TAGS.contains(&l.as_str())
         || l.strip_prefix("backup").is_some_and(|rest| rest.trim_start_matches([' ', '-', '_']).chars().all(|c| c.is_ascii_digit()))
-        || is_codec(&l)
-}
-
-fn is_country(code: &str) -> bool {
-    match code.len() {
-        2 => code.bytes().all(|b| b.is_ascii_alphabetic()),
-        3 => code.bytes().all(|b| b.is_ascii_alphabetic()) && COUNTRY3.contains(&code.to_ascii_lowercase().as_str()),
-        _ => false,
-    }
+        || is_format_word(&l)
 }
 
 fn year_of(w: &str) -> Option<u16> {
@@ -194,198 +268,422 @@ fn year_of(w: &str) -> Option<u16> {
     w.parse::<u16>().ok().filter(|y| (1900..=2100).contains(y))
 }
 
-/// Superscript / modifier / small-capital letters used as decoration (`ᴴᴰ`, `ꜰʜᴅ`, `⁴ᴷ`).
-fn deco_to_ascii(c: char) -> Option<char> {
-    Some(match c {
-        'ᴬ' => 'A',
-        'ᴮ' => 'B',
-        'ᴰ' | 'ᵈ' | 'ᴅ' => 'D',
-        'ᴱ' | 'ᴇ' => 'E',
-        'ᶠ' | 'ꜰ' => 'F',
-        'ᴳ' | 'ɢ' => 'G',
-        'ᴴ' | 'ʰ' | 'ʜ' => 'H',
-        'ᴵ' | 'ⁱ' | 'ɪ' => 'I',
-        'ᴷ' | 'ᵏ' | 'ᴋ' => 'K',
-        'ᴸ' | 'ʟ' => 'L',
-        'ᴹ' | 'ᴍ' => 'M',
-        'ᴺ' | 'ⁿ' | 'ɴ' => 'N',
-        'ᴼ' | 'ᴏ' => 'O',
-        'ᴾ' | 'ᵖ' | 'ᴘ' => 'P',
-        'ᴿ' | 'ʀ' => 'R',
-        'ˢ' | 'ꜱ' => 'S',
-        'ᵀ' | 'ᴛ' => 'T',
-        'ᵁ' | 'ᴜ' => 'U',
-        'ⱽ' | 'ᵛ' | 'ᴠ' => 'V',
-        'ᵂ' | 'ʷ' | 'ᴡ' => 'W',
-        '⁰' => '0',
-        '¹' => '1',
-        '²' => '2',
-        '³' => '3',
-        '⁴' => '4',
-        '⁵' => '5',
-        '⁶' => '6',
-        '⁷' => '7',
-        '⁸' => '8',
-        '⁹' => '9',
-        '⁺' => '+',
-        _ => return None,
-    })
+/// What a leading word is, if it can be part of a prefix.
+enum PrefixWord<'a> {
+    /// A country / language / region (`UK`, `ALB`, `HINDI`), or any two-letter code alone
+    /// (`RK:`, `ZG:` — provider line-up codes). `tag` is a sub-label (`IN-PREM` → `PREM`).
+    Country {
+        code: &'a str,
+        tag: Option<&'a str>,
+    },
+    Quality(Quality),
+    /// `VIP`, `SAT`, `RAW`, `PPV`, `24/7`, `HEVC`.
+    Tag(&'a str),
 }
 
-/// Split a trailing run of decoration characters off a word: `TF1ᴴᴰ` → (`TF1`, `HD`).
-/// Returns `None` when the word has no decoration suffix.
-fn split_deco(w: &str) -> Option<(&str, String)> {
-    let start = w.char_indices().rev().take_while(|(_, c)| deco_to_ascii(*c).is_some()).last()?.0;
-    Some((&w[..start], w[start..].chars().filter_map(deco_to_ascii).collect()))
-}
-
-/// A leading prefix of a name (see [`split_prefix`]).
-enum Prefix<'a> {
-    /// `[…]` — country, quality or tag.
-    Bracket(&'a str),
-    /// `|XX|`, `XX:`, `XX |`, `XX - ` — only accepted when `XX` is a country code.
-    Code(&'a str),
-}
-
-fn split_prefix(s: &str) -> Option<(Prefix<'_>, &str)> {
-    let b = s.as_bytes();
-    if b.first() == Some(&b'[') {
-        let close = s.find(']')?;
-        return Some((Prefix::Bracket(&s[1..close]), &s[close + 1..]));
+/// `w` as a prefix word. `alone` = the only word before the separator: unknown two-letter
+/// codes and `XX-YYY` line-up labels count only then (`"MY TV: …"` is a name).
+fn prefix_word(w: &str, alone: bool) -> Option<PrefixWord<'_>> {
+    if let Some(q) = quality_word(w) {
+        return Some(PrefixWord::Quality(q));
     }
-    if b.first() == Some(&b'|') {
-        let close = s[1..].find('|')? + 1;
-        let code = s[1..close].trim();
-        return is_country(code).then_some((Prefix::Code(code), &s[close + 1..]));
+    if is_service_word(w) || is_format_word(w) {
+        return Some(PrefixWord::Tag(w));
     }
-    let letters = b.iter().take_while(|c| c.is_ascii_alphabetic()).count();
-    if !(2..=3).contains(&letters) {
-        return None;
-    }
-    let code = &s[..letters];
-    let after = &s[letters..];
-    let trimmed = after.trim_start();
-    if (trimmed.starts_with(':') || trimmed.starts_with('|')) && is_country(code) {
-        return Some((Prefix::Code(code), &trimmed[1..]));
-    }
-    // `DE - Das Erste`: two upper-case letters and a spaced dash (avoids `Al - …` names).
-    if letters == 2
-        && code.bytes().all(|c| c.is_ascii_uppercase())
-        && after.starts_with(char::is_whitespace)
-        && let Some(rest) = trimmed.strip_prefix('-').or_else(|| trimmed.strip_prefix('–'))
-        && rest.starts_with(char::is_whitespace)
+    let ascii_letters = |s: &str, n: std::ops::RangeInclusive<usize>| n.contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphabetic());
+    if matches!(category_tags::classify(w), WordTag::Tag(_))
+        || (ascii_letters(w, 3..=3) && COUNTRY3.contains(&w.to_ascii_lowercase().as_str()))
+        || (alone && ascii_letters(w, 2..=2))
     {
-        return Some((Prefix::Code(code), rest));
+        return Some(PrefixWord::Country { code: w, tag: None });
     }
-    None
+    // `BE/FR:`, `UK/US |`: codes only
+    if alone && w.contains('/') && w.split('/').all(|p| matches!(prefix_word(p, true), Some(PrefixWord::Country { tag: None, .. }))) {
+        return Some(PrefixWord::Country { code: w.split('/').next().unwrap_or(w), tag: None });
+    }
+    // `IN-PREM:`, `BE-VIP:`, `FR-REU:`: a code and a short label of the provider's line-up
+    let (head, label) = w.split_once('-').filter(|_| alone)?;
+    let short_label = label.len() <= 4 && label.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
+    match prefix_word(head, true)? {
+        PrefixWord::Country { code, .. } if ascii_letters(code, 2..=3) && (short_label || is_service_word(label)) => {
+            Some(PrefixWord::Country { code, tag: Some(label) })
+        }
+        _ => None,
+    }
 }
 
-/// Strip leading separators/whitespace left after a prefix.
-fn trim_lead(s: &str) -> &str {
-    s.trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '|' | ':' | '-' | '–' | '·' | '•'))
+/// The text from the first to the last of `toks` as written (they are slices of `raw`).
+fn span<'a>(raw: &'a str, toks: &[Token<'a>]) -> &'a str {
+    let (Some(first), Some(last)) = (toks.first(), toks.last()) else { return "" };
+    let at = |t: &Token<'_>| t.text.as_ptr() as usize - raw.as_ptr() as usize;
+    &raw[at(first)..at(last) + last.text.len()]
 }
 
-/// The shared pass: prefixes, then words and bracket groups.
-fn clean(raw: &str, vod: bool) -> Cleaned<'_> {
-    let mut out = Cleaned::default();
-    let mut s = raw.trim();
-    while let Some((prefix, rest)) = split_prefix(s) {
-        let rest = trim_lead(rest);
-        if rest.is_empty() {
-            break; // the prefix is the whole name
-        }
-        match prefix {
-            Prefix::Code(code) => out.add_country(code),
-            Prefix::Bracket(inner) => {
-                let inner = inner.trim();
-                if let Some(q) = quality_of(inner) {
-                    out.add_quality(q);
-                } else if is_country(inner) {
-                    out.add_country(inner);
-                } else if !inner.is_empty() {
-                    out.tags.push(inner.to_owned());
-                }
-            }
-        }
-        s = rest;
-    }
-
-    let mut rest = s;
+/// Leading prefixes, repeatedly: `[XX]` / `[tag]`, `(XX)`, `|XX|`, and up to three prefix
+/// words followed by a separator (`XX:`, `XX |`, `XX ★`, `XX ❖`, `PL VIP:`, `IN-PREM:`; a dash
+/// only spaced after upper-case codes: `DE - Das Erste`, not `Al - Jazeera`), after any
+/// decoration and flags. Never the whole name: something must follow. Returns the index of
+/// the first token of the rest.
+fn strip_prefixes(raw: &str, t: &[Token<'_>], mode: Mode, out: &mut Cleaned) -> usize {
+    // something must be left to name the channel (`"UK: HD"` stays `UK`; a category `4K` is
+    // a name)
+    let names = |x: &Token<'_>| x.is(Kind::Word) && !is_format_word(x.text) && (mode == Mode::Group || quality_word(x.text).is_none());
+    let has_word = |from: usize| t.get(from..).is_some_and(|r| r.iter().any(names));
+    // titles: upper-case codes only (`America: The Motion Picture` is a title)
+    let is_prefix = |w: &str, alone: bool| prefix_word(w, alone).is_some() && (mode != Mode::Vod || !w.chars().any(char::is_lowercase));
+    let mut i = 0;
     loop {
-        rest = rest.trim_start();
-        let Some(first) = rest.chars().next() else { break };
-        let close = match first {
-            '(' => Some(')'),
-            '[' => Some(']'),
+        let mut j = i;
+        while let Some(tok) = t.get(j) {
+            match tok.kind {
+                Kind::Sep if tok.text != "|" => {}
+                Kind::Close => {}
+                Kind::Flag if has_word(j + 1) => out.add_country(&crate::sources::name_tokens::flag_code(tok.text)),
+                _ => break,
+            }
+            j += 1;
+        }
+        let Some(tok) = t.get(j) else { return i };
+        // `[…]` (any tag), `(XX)` / `{XX}` / `|XX|` (prefix words only)
+        let group = match tok.kind {
+            Kind::Open => closing(t, j),
+            Kind::Sep => t[j + 1..].iter().position(|x| x.is(Kind::Sep) && x.text.starts_with('|')).map(|p| j + 1 + p),
             _ => None,
         };
-        if let Some(close) = close
-            && let Some(end) = rest[1..].find(close).map(|i| i + 1)
-        {
-            let inner = rest[1..end].trim();
-            let group = &rest[..=end];
-            rest = &rest[end + 1..];
-            if let Some(q) = quality_of(inner) {
-                out.add_quality(q);
-            } else if let (true, Some(y)) = (vod, year_of(inner)) {
-                out.year = Some(y);
-            } else if first == '[' || is_paren_tag(inner) {
-                if !inner.is_empty() {
-                    out.tags.push(inner.to_owned());
-                }
+        if let Some(close) = group {
+            let inner = &t[j + 1..close];
+            let words: Vec<&str> = inner.iter().filter(|x| x.is(Kind::Word)).map(|x| x.text).collect();
+            let all_prefix = !words.is_empty() && words.iter().all(|w| is_prefix(w, words.len() == 1));
+            if !has_word(close + 1) || !(all_prefix || matches!(tok.text, "[" | "【")) {
+                return i;
+            }
+            if all_prefix {
+                record_prefix(&words, out);
             } else {
-                out.words.push(group);
+                let text = span(raw, inner).trim();
+                match quality_word(text) {
+                    Some(q) => out.add_prefix_quality(q),
+                    None if !text.is_empty() => out.tags.push(text.to_owned()),
+                    None => {}
+                }
             }
+            i = close + 1;
             continue;
         }
-        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-        let word = &rest[..end];
-        rest = &rest[end..];
-        let (word, deco) = match split_deco(word) {
-            Some((w, d)) => (w, Some(d)),
-            None => (word, None),
+        if tok.is(Kind::Sep) {
+            // a lone `|` that opens nothing: decoration
+            i = j + 1;
+            continue;
+        }
+        // prefix words, then a separator
+        let words = t[j..].iter().take(4).take_while(|x| x.is(Kind::Word)).count().min(3);
+        let Some(sep) = t.get(j + words).filter(|x| x.is(Kind::Sep) && words > 0) else { return i };
+        let phrase: Vec<&str> = t[j..j + words].iter().map(|x| x.text).collect();
+        let dash = matches!(sep.text, "-" | "–");
+        // a category `Lebanon ▶ لبنان` names itself in two scripts
+        let latin = |w: &str| w.chars().any(|c| c.is_alphabetic() && (u32::from(c) < 0x250 || (0x1E00..0x1F00).contains(&u32::from(c))));
+        let full_name = |w: &&str| {
+            let letters = w.chars().filter(|c| c.is_alphabetic()).count();
+            letters >= 5 || (letters == 4 && w.chars().any(char::is_lowercase))
         };
-        if let Some(d) = deco {
-            if let Some(q) = quality_of(&d) {
-                out.add_quality(q);
-            } else if !d.is_empty() {
-                out.tags.push(d);
+        let bilingual = mode == Mode::Group
+            && phrase.iter().any(|w| full_name(w) && latin(w))
+            && !t[j + words + 1..].iter().any(|x| x.is(Kind::Word) && latin(x.text));
+        let ok = phrase.iter().all(|w| is_prefix(w, words == 1))
+            && !bilingual
+            && !matches!(sep.text, "." | "," | "/" | "'" | "_")
+            && (!dash || (sep.spaced && t.get(j + words + 1).is_some_and(|n| n.spaced) && phrase.iter().all(|w| !w.chars().any(char::is_lowercase))))
+            && has_word(j + words + 1);
+        if !ok {
+            return i;
+        }
+        record_prefix(&phrase, out);
+        i = j + words + 1;
+    }
+}
+
+fn record_prefix(words: &[&str], out: &mut Cleaned) {
+    for w in words {
+        match prefix_word(w, words.len() == 1) {
+            Some(PrefixWord::Country { code, tag }) => {
+                out.add_country(code);
+                out.tags.extend(tag.map(str::to_owned));
             }
-        }
-        if word.is_empty() {
-            continue;
-        }
-        if let Some(q) = quality_of(word) {
-            out.add_quality(q);
-        } else if is_codec(word) {
-            out.tags.push(word.to_owned());
-        } else {
-            out.words.push(word);
+            Some(PrefixWord::Quality(q)) => out.add_prefix_quality(q),
+            Some(PrefixWord::Tag(tag)) => out.tags.push(tag.to_owned()),
+            None => {}
         }
     }
+}
 
-    // Dangling separators, then a VOD `- 1999` suffix (and separators before it).
+/// What a bracket group in the name is.
+enum Group {
+    /// Quality / format words only (`(720p)`, `⁽ᴴᴰ⁾`, `(FHD@60FPS)`, `[4K]`) or decoration.
+    Drop,
+    Year(u16),
+    Tag,
+    /// Part of the name (`BBC One (Scotland)`).
+    Name,
+}
+
+fn group_class(raw: &str, open: &str, inner: &[Token<'_>], vod: bool, out: &mut Cleaned) -> Group {
+    let text = span(raw, inner).trim();
+    // superscript only (`⁽ᴮᴷ⁾`): decoration
+    if inner.iter().any(|x| x.is(Kind::Deco)) && inner.iter().all(|x| matches!(x.kind, Kind::Deco | Kind::Sep)) {
+        for x in inner.iter().filter(|x| x.is(Kind::Deco)) {
+            let ascii = deco_ascii(x.text);
+            match quality_word(&ascii) {
+                Some(q) => out.add_quality(q),
+                None => out.tags.push(ascii),
+            }
+        }
+        return Group::Drop;
+    }
+    let words: Vec<String> = inner
+        .iter()
+        .filter_map(|x| match x.kind {
+            Kind::Word => Some(x.text.to_owned()),
+            Kind::Deco => Some(deco_ascii(x.text)),
+            _ => None,
+        })
+        .collect();
+    if words.iter().all(|w| quality_word(w).is_some() || is_format_word(w)) {
+        for w in &words {
+            match quality_word(w) {
+                Some(q) => out.add_quality(q),
+                None => out.tags.push(w.clone()),
+            }
+        }
+        return Group::Drop;
+    }
+    if let (true, Some(y)) = (vod, year_of(text)) {
+        return Group::Year(y);
+    }
+    if matches!(open, "[" | "【") || (open == "(" && is_paren_tag(text)) {
+        out.tags.push(text.to_owned());
+        return Group::Tag;
+    }
+    Group::Name
+}
+
+/// A run of decoration tokens (`ᶠ ᴴᴰ`, `ᴴᴰ ⱽᴵᴾ`, `ᵁᴴᴰ ³⁸⁴⁰ᴾ`): quality words, tags, or kept
+/// when it is stylised small-capital text that is no known word.
+fn deco_run(run: &[Token<'_>], out: &mut Cleaned, keep: &mut [bool]) {
+    let joined: String = run.iter().map(|t| deco_ascii(t.text)).collect();
+    if let Some(q) = quality_word(&joined) {
+        out.add_quality(q);
+        keep.fill(false);
+        return;
+    }
+    for (t, k) in run.iter().zip(keep.iter_mut()) {
+        let ascii = deco_ascii(t.text);
+        if let Some(q) = quality_word(&ascii) {
+            out.add_quality(q);
+        } else if is_small_caps(t.text)
+            && !is_format_word(&ascii)
+            && !is_service_word(&ascii)
+            && !matches!(category_tags::classify(&ascii), WordTag::Tag(_))
+        {
+            continue;
+        } else if !ascii.is_empty() {
+            // a superscript country code (`ELEVEN ᴾᴸ`) is the country too
+            if ascii.len() == 2 && matches!(category_tags::classify(&ascii), WordTag::Tag(_)) {
+                out.add_country(&ascii);
+            }
+            out.tags.push(ascii);
+        }
+        *k = false;
+    }
+}
+
+/// The shared pass: prefixes, then quality / format words and bracket groups anywhere, then
+/// decoration at either end.
+fn clean(raw: &str, mode: Mode) -> Cleaned {
+    let vod = mode == Mode::Vod;
+    let raw = raw.trim();
+    let t = tokens(raw);
+    let mut out = Cleaned::default();
+    let start = strip_prefixes(raw, &t, mode, &mut out);
+    let mut keep = vec![true; t.len()];
+    // a category's plain quality words stay, in its prefix too (`4K| Relax` → `4K Relax`)
+    for (k, tok) in keep[..start].iter_mut().zip(&t) {
+        *k = mode == Mode::Group && tok.is(Kind::Word) && quality_word(tok.text).is_some();
+    }
+    // matched brackets (a stray one is decoration)
+    let mut pair = vec![None; t.len()];
+
+    let mut i = start;
+    while i < t.len() {
+        let tok = t[i];
+        match tok.kind {
+            Kind::Word => {
+                // the provider's `RAW` feed tag, not a title's `Raw` or `WWE (Monday Night) RAW`
+                let raw_word = !vod && tok.text == "RAW" && !(i > 0 && matches!(t[i - 1].text.to_ascii_uppercase().as_str(), "WWE" | "NIGHT"));
+                if let Some(q) = quality_word(tok.text) {
+                    if mode != Mode::Group {
+                        out.add_quality(q);
+                        keep[i] = false;
+                    }
+                } else if is_format_word(tok.text) || raw_word {
+                    out.tags.push(tok.text.to_owned());
+                    keep[i] = false;
+                }
+            }
+            Kind::Deco => {
+                let end = t[i..].iter().position(|x| !x.is(Kind::Deco)).map_or(t.len(), |p| i + p);
+                // inside a word (a letter glued after it): part of the word
+                if t.get(end).is_some_and(|n| n.is(Kind::Word) && !n.spaced && n.text.starts_with(char::is_alphabetic)) {
+                    i = end;
+                    continue;
+                }
+                // `sᴅ`: a plain letter glued before small capitals
+                let lead = (i > start && !tok.spaced && keep[i - 1])
+                    .then(|| t[i - 1].text)
+                    .filter(|w| w.len() == 1 && w.chars().all(|c| c.is_ascii_alphabetic()));
+                if let Some(q) = lead.and_then(|l| quality_word(&format!("{l}{}", deco_ascii(tok.text)))) {
+                    out.add_quality(q);
+                    keep[i - 1] = false;
+                    keep[i] = false;
+                    i += 1;
+                    continue;
+                }
+                // before any word of the name (`ᵁᴴᴰ: beIN SPORTS 3 ˢᵈ`): a prefix's quality
+                let leading = !(start..i).any(|k| keep[k] && t[k].is(Kind::Word));
+                let body = out.quality.take();
+                deco_run(&t[i..end], &mut out, &mut keep[i..end]);
+                if let Some(q) = std::mem::replace(&mut out.quality, body) {
+                    if leading { out.add_prefix_quality(q) } else { out.add_quality(q) }
+                }
+                // `³⁸⁴⁰ᴾ+`: a plus glued to dropped decoration goes with it
+                if !keep[end - 1] && t.get(end).is_some_and(|n| n.text == "+" && !n.spaced) {
+                    keep[end] = false;
+                    i = end + 1;
+                    continue;
+                }
+                i = end;
+                continue;
+            }
+            Kind::Open => {
+                if let Some(close) = closing(&t, i) {
+                    match group_class(raw, tok.text, &t[i + 1..close], vod, &mut out) {
+                        Group::Drop | Group::Tag => keep[i..=close].fill(false),
+                        Group::Year(y) => {
+                            out.year = Some(y);
+                            keep[i..=close].fill(false);
+                        }
+                        Group::Name => {
+                            // its words are cleaned like the rest (`(HYPER ᴴᴰ)` → `(HYPER)`)
+                            pair[i] = Some(close);
+                            pair[close] = Some(i);
+                            i += 1;
+                            continue;
+                        }
+                    }
+                    i = close + 1;
+                    continue;
+                }
+            }
+            Kind::Sep | Kind::Flag | Kind::Close => {}
+        }
+        i += 1;
+    }
+
+    // decoration at either end: separators, flags, stray brackets; then a VOD `- 1999` suffix
+    // a bracket at the front stays when it opens a group of the name, at the end when it closes
+    // one; a `#` glued to a word is part of it (`#0`, `#12 Texas A&M vs …`)
+    let removable = |front: bool, i: usize, keep: &[bool]| match t[i].kind {
+        Kind::Sep => !(front && t[i].text == "#" && t.get(i + 1).is_some_and(|n| n.is(Kind::Word) && !n.spaced && keep[i + 1])),
+        Kind::Flag => true,
+        Kind::Open => !front || pair[i].is_none(),
+        Kind::Close => front || pair[i].is_none(),
+        Kind::Word | Kind::Deco => false,
+    };
     loop {
-        while out.words.first().is_some_and(|w| is_separator(w)) {
-            out.words.remove(0);
+        let kept: Vec<usize> = (0..t.len()).filter(|&i| keep[i]).collect();
+        let (Some(&first), Some(&last)) = (kept.first(), kept.last()) else { break };
+        if removable(true, first, &keep) {
+            if t[first].is(Kind::Flag) {
+                out.add_country(&crate::sources::name_tokens::flag_code(t[first].text));
+            }
+            keep[first] = false;
+            continue;
         }
-        while out.words.last().is_some_and(|w| is_separator(w)) {
-            out.words.pop();
+        // a tag word set off at the end (`… ◉ *MULTI*`, `… | backup`)
+        if kept.len() > 2
+            && t[last].is(Kind::Word)
+            && t[kept[kept.len() - 2]].is(Kind::Sep)
+            && PAREN_TAGS.contains(&t[last].text.to_lowercase().as_str())
+        {
+            out.tags.push(t[last].text.to_owned());
+            keep[last] = false;
+            continue;
         }
-        let n = out.words.len();
+        // the full stop of an abbreviation stays (`T.I.M.`)
+        let abbreviation = t[last].text == "." && !t[last].spaced && kept.len() > 1 && t[kept[kept.len() - 2]].text.contains('.');
+        if removable(false, last, &keep) && !abbreviation {
+            keep[last] = false;
+            continue;
+        }
+        let n = kept.len();
         if vod
             && out.year.is_none()
             && n >= 3
-            && matches!(out.words[n - 2], "-" | "–")
-            && let Some(y) = year_of(out.words[n - 1])
+            && matches!(t[kept[n - 2]].text, "-" | "–")
+            && let Some(y) = year_of(t[last].text)
         {
             out.year = Some(y);
-            out.words.truncate(n - 2);
+            keep[last] = false;
+            keep[kept[n - 2]] = false;
             continue;
         }
         break;
     }
+    // two separators left next to each other (`STREAMING - | 8K EXCLUSIVE |`): the stronger one
+    let kept: Vec<usize> = (0..t.len()).filter(|&i| keep[i]).collect();
+    for w in kept.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if keep[a] && t[a].is(Kind::Sep) && t[b].is(Kind::Sep) && (t[b].spaced || b > a + 1) {
+            if matches!(t[a].text, "-" | "–" | ":") {
+                keep[a] = false;
+            } else {
+                keep[b] = false;
+            }
+        }
+    }
+    // a quality word of the prefix only counts when the name has none (a category keeps its
+    // plain ones in the name)
+    if mode != Mode::Group && out.quality.is_none() {
+        out.quality = out.prefix_quality;
+    }
+    out.name = render(&t, &keep);
     out
+}
+
+/// The kept tokens as written: a space where the name had one, or where dropped tokens with
+/// a space left a gap (`ITV 4 4K ◉ News` → `ITV 4 News`) or sat between two words
+/// (`SKY(HD)NEWS` → `SKY NEWS`) — never inside brackets or before a glued separator
+/// (`(HYPER ᴴᴰ)` → `(HYPER)`).
+fn render(t: &[Token<'_>], keep: &[bool]) -> String {
+    let mut s = String::new();
+    let mut prev: Option<usize> = None;
+    for (i, tok) in t.iter().enumerate() {
+        if !keep[i] {
+            continue;
+        }
+        if let Some(p) = prev {
+            let dropped = &t[p + 1..i];
+            let gap = !dropped.is_empty()
+                && !matches!(tok.kind, Kind::Sep | Kind::Close)
+                && !t[p].is(Kind::Open)
+                && (dropped.iter().chain([tok]).any(|x| x.spaced) || (t[p].is(Kind::Word) && tok.is(Kind::Word)));
+            if tok.spaced || gap {
+                s.push(' ');
+            }
+        }
+        s.push_str(tok.text);
+        prev = Some(i);
+    }
+    s
 }
 
 /// Title-case an all-caps name, keeping acronyms and lower-casing joining words. Acronyms are
@@ -449,6 +747,77 @@ mod tests {
         assert_eq!(ch("UK | BBC One | FHD").0, "BBC One");
         assert_eq!(ch("Channel HD 4K SD").2, Some(Quality::Uhd));
         assert_eq!(ch("  Plain   Name  ").0, "Plain Name");
+
+        // provider decorations: any symbol run separates a prefix, quality words glued to
+        // symbols or in superscript, decoration at either end; names keep their own symbols
+        let q = |s: &str| match s {
+            "SD" => Some(Quality::Sd),
+            "HD" => Some(Quality::Hd),
+            "FHD" => Some(Quality::Fhd),
+            "4K" => Some(Quality::Uhd),
+            _ => None,
+        };
+        let cases: &[(&str, &str, &str, &str)] = &[
+            ("UK: ITV 4 4K ◉", "ITV 4", "UK", "4K"),
+            ("UK ★ ITV 4 4K◉", "ITV 4", "UK", "4K"),
+            ("US ★ HGTV HD EAST ◉", "HGTV EAST", "US", "HD"),
+            ("US\u{a0}★\u{a0}Flo 31 :", "Flo 31", "US", ""),
+            ("FR ★ FRANCE 2 FHD ◉", "FRANCE 2", "FR", "FHD"),
+            ("ALB ★ TOP CHANNEL", "TOP CHANNEL", "ALB", ""),
+            ("EXYU ★ ARENA SPORT 1", "ARENA SPORT 1", "EXYU", ""),
+            ("LATAM | Canal 5", "Canal 5", "LATAM", ""),
+            ("URUGUAY ★ TELEDOCE", "TELEDOCE", "URUGUAY", ""),
+            ("UK ❖ Sky Atlantic ⓧ", "Sky Atlantic", "UK", ""),
+            ("DE ┃ Das Erste ●", "Das Erste", "DE", ""),
+            ("VIP: SKY SPORTS F1 ⁴ᵏ", "SKY SPORTS F1", "", "4K"),
+            ("SAT: PRO TV ᴿᴬᵂ", "PRO TV", "", ""),
+            ("PL VIP: ELEVEN 1 RAW 4K 3840P", "ELEVEN 1", "PL", "4K"),
+            ("IN-PREM: COMEDY CINEMA HD.", "COMEDY CINEMA", "IN", "HD"),
+            ("24/7: THE SIMPSONS", "THE SIMPSONS", "", ""),
+            ("BE/FR: TF1", "TF1", "BE", ""),
+            ("(JM) ESPN PLAY 7 (D)", "ESPN PLAY 7 (D)", "JM", ""),
+            ("## TR| BEIN SPORTS 1 ##", "BEIN SPORTS 1", "TR", ""),
+            ("DVB-T: MMN DRAMA ᶠ ᴴᴰ", "DVB-T: MMN DRAMA", "", "FHD"),
+            ("ES: LIGA 1 ᴴᴰ ⁽ᴮᴷ⁾", "LIGA 1", "ES", "HD"),
+            ("NF: NETFLIX 02 (FHD@60FPS) EVENTS", "NETFLIX 02 EVENTS", "NF", "FHD"),
+            ("GOLD: SKY ⁽ᴴᴰ⁾", "GOLD: SKY", "", "HD"),
+            ("TNT SPORTS 1 ᴿᴬᵂ ⁵⁰ FPS", "TNT SPORTS 1", "", ""),
+            ("🇬🇧 BBC One", "BBC One", "GB", ""),
+            // kept: names with their own symbols, unknown prefixes, PPV inside a name
+            ("AT&T: 5-MINUTE CRAFTS ᴿᴬᵂ", "AT&T: 5-MINUTE CRAFTS", "", ""),
+            ("E! News", "E! News", "", ""),
+            ("Sky Sports+ HD", "Sky Sports+", "", "HD"),
+            ("UK: Channel 4 +1", "Channel 4 +1", "UK", ""),
+            ("UK: ITV 4+1 ◉", "ITV 4+1", "UK", ""),
+            ("5 USA", "5 USA", "", ""),
+            ("WWE RAW", "WWE RAW", "", ""),
+            ("US: ESPN+ PPV 175", "ESPN+ PPV 175", "US", ""),
+            ("MY TV: News", "MY TV: News", "", ""),
+            // `8K` is an event slate, no claim; a quality word after the name beats the prefix's
+            ("NEXT | Lyon vs Nice | 15:55 (CEST) | 8K EXCLUSIVE", "NEXT | Lyon vs Nice | 15:55 (CEST) | EXCLUSIVE", "", ""),
+            ("- NO EVENT STREAMING - | 8K EXCLUSIVE | UK: MAX PPV 18", "NO EVENT STREAMING | EXCLUSIVE | UK: MAX PPV 18", "", ""),
+            ("8K: THMANYAH 3 ᴴᴰ", "THMANYAH 3", "", "HD"),
+            ("ᵁᴴᴰ: beIN SPORTS 3 ˢᵈ", "beIN SPORTS 3", "", "SD"),
+            ("4K: BEIN SPORTS 1 HD ◉", "BEIN SPORTS 1", "", "HD"),
+            ("ELEVEN SPORTS 1 ᴾᴸ", "ELEVEN SPORTS 1", "PL", ""),
+            // `RAW` the feed tag only: upper-case, not the show
+            ("WWE Monday Night RAW", "WWE Monday Night RAW", "", ""),
+            ("Raw Travel", "Raw Travel", "", ""),
+            ("#0", "#0", "", ""),
+            ("#12 Texas A&M vs Arkansas", "#12 Texas A&M vs Arkansas", "", ""),
+            ("beIN Sp⚽rts 8 4K", "beIN Sp⚽rts 8", "", "4K"),
+            ("ꜱᴘᴏʀᴛꜱ 1", "ꜱᴘᴏʀᴛꜱ 1", "", ""),
+            ("CH: BLUE SPORT 1 ᴅᴇ ғʜᴅ", "BLUE SPORT 1", "CH", "FHD"),
+            ("GOLD: EXXEN SPORTS 1 sᴅ", "GOLD: EXXEN SPORTS 1", "", "SD"),
+            ("SE: Nick Jr ᴴᴰ ◉ *MULTI* ⁵⁰ᶠᵖˢ", "Nick Jr", "SE", "HD"),
+            ("KZ: Қазақстан ғылым", "Қазақстан ғылым", "KZ", ""),
+            ("PH: ONE SPORTS (HYPER ᴴᴰ)", "ONE SPORTS (HYPER)", "PH", "HD"),
+            ("TNT ULTIMATE ᵁᴴᴰ ³⁸⁴⁰ᴾ+", "TNT ULTIMATE", "", "4K"),
+        ];
+        for (raw, name, country, quality) in cases {
+            let c = clean_channel_name(raw);
+            assert_eq!((c.name.as_str(), c.country.as_deref().unwrap_or(""), c.quality), (*name, *country, q(quality)), "{raw:?}");
+        }
     }
 
     #[test]
@@ -456,7 +825,8 @@ mod tests {
         assert_eq!(ch("HD").0, "HD");
         assert_eq!(ch("[VIP]").0, "[VIP]");
         assert_eq!(ch("UK |").0, "UK");
-        assert_eq!(ch(" UK: HD ").0, "UK: HD");
+        assert_eq!(ch(" UK: HD ").0, "UK", "a prefix is never all that is left");
+        assert_eq!(ch("CAR ★ FX | HD").0, "FX");
         assert_eq!(ch("").0, "");
         assert_eq!(ch("|").0, "|");
     }
@@ -470,6 +840,11 @@ mod tests {
         assert_eq!(clean_vod_name("Dune [2021]"), ("Dune".into(), Some(2021)));
         assert_eq!(clean_vod_name("Space (3000)"), ("Space (3000)".into(), None));
         assert_eq!(clean_vod_name("(2001)"), ("(2001)".into(), None));
+        assert_eq!(clean_vod_name("EN ★ The Lion King - 1994"), ("The Lion King".into(), Some(1994)));
+        assert_eq!(clean_vod_name("DE - T.I.M. (2023)"), ("T.I.M.".into(), Some(2023)));
+        // titles: `Raw` is a word, a leading country word in title case is the title
+        assert_eq!(clean_vod_name("Raw Deal (1986)"), ("Raw Deal".into(), Some(1986)));
+        assert_eq!(clean_vod_name("America: The Motion Picture (2021)"), ("America: The Motion Picture".into(), Some(2021)));
     }
 
     #[test]
@@ -489,6 +864,35 @@ mod tests {
         assert_eq!(clean_group_name("F1 & MOTOGP"), "F1 & Motogp");
         assert_eq!(clean_group_name("BBC CHANNELS (UK)"), "BBC Channels (UK)");
         assert_eq!(clean_group_name("ESPN PPV EVENTS"), "ESPN PPV Events");
+        // decorated categories
+        assert_eq!(clean_group_name("UK ❖ General"), "General");
+        assert_eq!(clean_group_name("GENERAL ᴴᴰ/"), "General");
+        assert_eq!(clean_group_name("★ FR ★ CINÉMA"), "Cinéma");
+        assert_eq!(clean_group_name("VIP ❖ Premier League+"), "Premier League+");
+        // a plain quality word is what a category is about; a superscript one is decoration
+        assert_eq!(clean_group_name("UK ❖ SPORTS 4K"), "Sports 4K");
+        assert_eq!(clean_group_name("UK ❖ 4K"), "4K");
+        assert_eq!(clean_group_name("EN ✪ 4K MOVIES"), "4K Movies");
+        assert_eq!(clean_group_name("4K|"), "4K");
+        assert_eq!(clean_group_name("4K| Relax ☼"), "4K Relax");
+        // a full country name before another script names the category twice
+        assert_eq!(clean_group_name("Lebanon ▶ لبنان"), "Lebanon ▶ لبنان");
+        assert_eq!(clean_group_name("UK ▶ لبنان"), "لبنان");
+    }
+
+    /// Names cleanup made identical keep what tells them apart.
+    #[test]
+    fn colliding_names_are_told_apart() {
+        let raws = ["GENERAL ᴴᴰ/", "GENERAL ʰᵉᵛᶜ", "General", "PPV EVENT ⁽ᴮᴷ⁾", "PPV Event", "SWEDEN ᴰᴼᴸᴮʸ", "Sweden", "News"];
+        let mut names: Vec<String> = raws.iter().map(|r| group_display(r, true)).collect();
+        let mut pairs: Vec<(&mut String, &str)> = names.iter_mut().zip(raws).collect();
+        distinguish_groups(&mut pairs);
+        assert_eq!(names, ["General · HD", "General · HEVC", "General", "PPV Event · BK", "PPV Event", "Sweden · Dolby", "Sweden", "News"]);
+        let some = |v: &[&str]| v.iter().map(|s| (!s.is_empty()).then(|| (*s).to_owned())).collect::<Vec<_>>();
+        assert_eq!(distinguishing_suffixes(&["FI: TV5", "FI: TV5 ᴿᴬᵂ"], false), some(&["", "RAW"]));
+        assert_eq!(distinguishing_suffixes(&["PL: CANAL+ SPORT 5", "AF: CANAL+ SPORT 5"], false), some(&["PL", "AF"]));
+        assert_eq!(distinguishing_suffixes(&["STAR MAA HD ◉", "STAR MAA HD²"], false), some(&["", "2"]));
+        assert_eq!(distinguishing_suffixes(&["BBC One", " BBC  One "], false), some(&["", ""]));
     }
 
     #[test]

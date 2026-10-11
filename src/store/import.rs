@@ -894,6 +894,7 @@ pub fn finish_catalogue_with(
             _ => summary.series = counts,
         }
     }
+    distinguish_group_names(&tx, imp.source, Some(imp.generation))?;
     let gc = take_counters(&tx, imp, "group")?;
     let n_groups: i64 = tx.query_row("SELECT count(*) FROM grp WHERE source_id = ?1", [imp.source], |r| r.get(0))?;
     summary.groups = KindCounts { added: gc.added, updated: gc.updated, removed: groups_removed, total: u32_of(n_groups) };
@@ -916,6 +917,8 @@ pub fn finish_catalogue_with(
     let (outcomes, newly_orphaned) = reattach(&tx, imp.source, reattach_kinds, now)?;
     if completed.contains(&ItemKind::Channel) {
         carry_video_sizes(&tx, imp.source)?;
+        // trust evidence (DESIGN §13.0.1) of channel names the provider no longer lists
+        tx.execute("DELETE FROM quality_check WHERE source_id = ?1 AND name NOT IN (SELECT name FROM channel WHERE source_id = ?1)", [imp.source])?;
     }
     summary.reattached = outcomes.iter().filter(|(_, o)| matches!(o, ReattachOutcome::Reattached { .. })).count() as u32;
     summary.orphaned = newly_orphaned;
@@ -1104,6 +1107,33 @@ fn reattach_kind(
         }
     }
     Ok(newly)
+}
+
+/// Category display names of a source that smart cleanup made identical although the provider
+/// names differ get what it dropped (`smart_names::distinguish_groups`: `General · HEVC`), per
+/// kind. With smart names off a display name is the trimmed raw one, so nothing collides.
+/// `generation`: only the groups an import just wrote (fresh names), else every group with a
+/// raw name (migration 0004).
+pub(crate) fn distinguish_group_names(conn: &Connection, source: SourceId, generation: Option<i64>) -> Result<()> {
+    let mut rows: Vec<(i64, String, String, String)> = conn
+        .prepare_cached(
+            "SELECT id, kind, name, raw_name FROM grp WHERE source_id = ?1 AND raw_name IS NOT NULL AND (?2 IS NULL OR seen_gen = ?2)
+             ORDER BY kind, id",
+        )?
+        .query_map(params![source, generation], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let before: Vec<String> = rows.iter().map(|r| r.2.clone()).collect();
+    for kind in rows.chunk_by_mut(|a, b| a.1 == b.1) {
+        let mut pairs: Vec<(&mut String, &str)> = kind.iter_mut().map(|(_, _, name, raw)| (name, raw.as_str())).collect();
+        crate::sources::smart_names::distinguish_groups(&mut pairs);
+    }
+    let mut write = conn.prepare_cached("UPDATE grp SET name = ?2 WHERE id = ?1")?;
+    for (row, old) in rows.iter().zip(before) {
+        if row.2 != old {
+            write.execute(params![row.0, row.2])?;
+        }
+    }
+    Ok(())
 }
 
 /// Measured picture sizes (`channel_video`) whose key no longer holds the channel they were

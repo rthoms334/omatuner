@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::error::Result;
-use crate::model::{Channel, ChannelId, Group, GroupId, ItemKey, ItemKind, ItemRef, SourceId, Timestamp};
+use crate::model::{Channel, ChannelId, Group, GroupId, ItemKey, ItemKind, ItemRef, LabelTrust, Quality, SourceId, Timestamp};
 use crate::store::sql::{Json, enum_parse, from_json_opt, kind_from_sql, or_not_found, u32_of};
 
 const CHANNEL_COLS: &str = "c.id, c.source_id, c.key, c.provider_id, c.name, c.clean_name, c.number, c.logo, c.tvg_id, c.tvg_name, \
@@ -163,7 +163,9 @@ pub fn clear_failure(conn: &Connection, item: &ItemRef) -> Result<()> {
 /// Remember the picture size mpv decoded for a live channel (`channel_video`; its class wins
 /// over the quality word of the name, DESIGN §6), with the provider name and `url_key` it was
 /// measured under: it applies only while the channel at that key still has them
-/// (`store::import` moves it with the channel). Not a channel, or gone → nothing.
+/// (`store::import` moves it with the channel). Also the trust evidence of the source's
+/// quality words (`quality_check`: what the name claimed, what played; DESIGN §13.0.1) — not
+/// for radio (a cover picture is no video). Not a channel, or gone → nothing.
 pub fn record_video(conn: &Connection, item: &ItemRef, width: i64, height: i64, now: Timestamp) -> Result<()> {
     if item.kind != ItemKind::Channel {
         return Ok(());
@@ -175,7 +177,32 @@ pub fn record_video(conn: &Connection, item: &ItemRef, width: i64, height: i64, 
            width = excluded.width, height = excluded.height, at = excluded.at",
     )?
     .execute(params![item.source, item.key.as_str(), width, height, now])?;
+    if let Some(class) = Quality::of_video(width, height) {
+        conn.prepare_cached(
+            "INSERT INTO quality_check(source_id, name, claimed, measured, at)
+             SELECT c.source_id, c.name, c.quality, ?3, ?4 FROM channel c WHERE c.source_id = ?1 AND c.key = ?2 AND c.radio = 0
+             ON CONFLICT(source_id, name) DO UPDATE SET claimed = excluded.claimed, measured = excluded.measured, at = excluded.at",
+        )?
+        .execute(params![item.source, item.key.as_str(), class.code(), now])?;
+    }
     Ok(())
+}
+
+/// Per source, how far its quality words held up when its channels played (`quality_check`;
+/// [`LabelTrust`]). Sources with no measurement are absent.
+pub fn label_trust(conn: &Connection) -> Result<HashMap<SourceId, LabelTrust>> {
+    let mut stmt = conn.prepare_cached("SELECT source_id, claimed, measured, count(*) FROM quality_check GROUP BY source_id, claimed, measured")?;
+    let mut out: HashMap<SourceId, LabelTrust> = HashMap::new();
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let claimed = r.get::<_, Option<i64>>(1)?.and_then(Quality::from_code);
+        let Some(measured) = Quality::from_code(r.get(2)?) else { continue };
+        let t = out.entry(r.get(0)?).or_default();
+        for _ in 0..r.get::<_, i64>(3)? {
+            t.add(claimed, measured);
+        }
+    }
+    Ok(out)
 }
 
 /// Should zapping skip this channel? True when it has ≥ 2 failures newer than `since` or is

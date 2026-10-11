@@ -1005,6 +1005,22 @@ impl PlayerScreen {
                     _ => "–".into(),
                 };
                 lines.push(format!("Video    {} · {res} · {}", opt(&i.video_codec), i.fps.map_or_else(|| "–".into(), |f| format!("{f:.2} fps"))));
+                // the provider's name and quality word against what plays (DESIGN §13.0.1)
+                let channel = snap.playable.as_ref().filter(|p| p.kind.is_live()).and_then(|p| match p.media {
+                    MediaRef::Channel(id) => ctx.lib.live.get(id),
+                    _ => None,
+                });
+                if let Some(raw) = channel.and_then(|c| c.provider_name.as_deref()) {
+                    lines.push(format!("Provider {raw}"));
+                }
+                if let Some(c) = channel.and_then(|c| c.quality?.claimed) {
+                    let played = i.width.zip(i.height).and_then(|(w, h)| Quality::of_video(w, h));
+                    lines.push(match played {
+                        Some(p) if p == c => format!("Quality  named {} · as labelled", c.label()),
+                        Some(p) => format!("Quality  named {} · plays {}", c.label(), p.label()),
+                        None => format!("Quality  named {} · not verified", c.label()),
+                    });
+                }
                 lines.push(format!("Format   {}{}", opt(&i.pixel_format), if i.is_hdr() { " · HDR" } else { "" }));
                 lines.push(format!(
                     "Audio    {} · {} · {}",
