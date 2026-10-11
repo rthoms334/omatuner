@@ -52,7 +52,7 @@ use crate::jobs::{FailureKind, JobKind, JobOutcome};
 use crate::keymap::{self, Action, KeyContext};
 use crate::model::{ChannelId, Collection, GroupId, ItemKey, ItemKind, ItemRef, MediaRef, PlayOrigin, SourceId, Timestamp, ZapList};
 use crate::msg::{AppEvent, DataScope, Toast, ToastKind};
-use crate::platform::popout::{PopOutBackend, PopOutEvent, PopRequest};
+use crate::platform::popout::{Place, PopError, PopOutBackend, PopOutEvent, PopRequest};
 use crate::platform::{PickPurpose, PlatformEvent};
 use crate::player::{PlayRequest, PlayerCommand, PlayerSnapshot, PlayerState};
 use crate::search::SearchIndex;
@@ -112,10 +112,14 @@ pub struct TunerApp {
     /// Window fullscreen as last requested by the app, re-synced every frame from the
     /// compositor's state (`ViewportInfo::fullscreen`) when the backend reports it.
     window_fullscreen: bool,
-    /// Pop-out state (DESIGN §21.6) and where its requests go: the Hyprland worker; `None`
-    /// outside Hyprland (and in tests, unless a test installs a recorder).
+    /// Pop-out state (DESIGN §21.6) and where its requests go: the Hyprland worker, started
+    /// with the first frame of a real window (never from tests or benches, which have none);
+    /// `None` outside Hyprland (tests install a recorder).
     popout: PopOut,
     popout_backend: Option<Box<dyn PopOutBackend>>,
+    popout_started: bool,
+    /// `f` on the popped-out player: pop in, then go fullscreen.
+    fullscreen_after_pop_in: bool,
     /// This frame shows the video-only player (`PopOut::video_only` at the window's size):
     /// the Player screen is shown and gets the keys whatever the route stack says.
     video_only: bool,
@@ -185,12 +189,6 @@ impl TunerApp {
             }
         };
         let start = start_route(&services.config(), &initial, &db);
-        // never a real compositor from unit tests (they run inside the developer's Hyprland)
-        let popout_backend = if cfg!(test) {
-            None
-        } else {
-            crate::platform::popout::PopOutWorker::start(services.bus.clone()).map(|w| Box::new(w) as Box<dyn PopOutBackend>)
-        };
         let snapshot = services.player.handle().snapshot();
         let mut app = Self {
             video: VideoHost::new(surface),
@@ -218,7 +216,9 @@ impl TunerApp {
             idle,
             window_fullscreen: false,
             popout: PopOut::default(),
-            popout_backend,
+            popout_backend: None,
+            popout_started: false,
+            fullscreen_after_pop_in: false,
             video_only: false,
             window_size: egui::vec2(1280.0, 800.0),
             pending_zap: None,
@@ -356,7 +356,7 @@ impl TunerApp {
                 PlatformEvent::FilePicked { purpose: PickPurpose::ExportLog, path: Some(path) } => self.export_log(path.clone()),
                 // Other pickers belong to the screen that opened them (`on_event` below).
                 PlatformEvent::FilePicked { .. } | PlatformEvent::ReminderFired(_) => {}
-                PlatformEvent::PopOut(ev) => self.on_popout_event(ev),
+                PlatformEvent::PopOut(ev) => self.on_popout_event(ev, egui_ctx),
             },
             AppEvent::Player(_) => {}
         }
@@ -665,12 +665,18 @@ impl TunerApp {
             Action::GoSeries => self.nav.push(NavRequest::Switch(Route::Series { group: None })),
             Action::GoSettings => self.nav.push(NavRequest::Switch(Route::Settings(Default::default()))),
             Action::Quit => egui_ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            // the popped-out player: back to the full window, fullscreen
+            Action::ToggleWindowFullscreen if self.video_only => {
+                self.fullscreen_after_pop_in = self.toggle_popout(egui_ctx);
+            }
             Action::ToggleWindowFullscreen => self.set_window_fullscreen(!self.window_fullscreen, egui_ctx),
             Action::OpenPlayer if self.snapshot.state != PlayerState::Idle => self.nav.push(NavRequest::Push(Route::Player)),
             Action::GlobalPlayPause => self.send_player(PlayerCommand::TogglePause),
             Action::StopPlayback => self.send_player(PlayerCommand::Stop),
             Action::RefreshSource => self.refresh_everything(),
-            Action::TogglePopOut => self.toggle_popout(egui_ctx),
+            Action::TogglePopOut => {
+                self.toggle_popout(egui_ctx);
+            }
             Action::Back => self.back(egui_ctx),
             _ => {}
         }
@@ -839,9 +845,17 @@ impl TunerApp {
         let reqs: Vec<NavRequest> = std::mem::take(&mut self.nav);
         for r in reqs {
             match r {
-                // leaving the video-only player (`p`, `q`) puts the window back
-                NavRequest::Back if self.video_only => self.toggle_popout(egui_ctx),
-                NavRequest::TogglePopOut => self.toggle_popout(egui_ctx),
+                // the video-only player isn't a route of its own: Back from it (`p`, `q`, a
+                // finished movie) leaves only a Player route under it, never the screens below
+                // (only the player's keys pop the window back in)
+                NavRequest::Back if self.video_only => {
+                    if self.routes.len() > 1 && self.current_route() == &Route::Player {
+                        self.routes.pop();
+                    }
+                }
+                NavRequest::TogglePopOut => {
+                    self.toggle_popout(egui_ctx);
+                }
                 NavRequest::Push(route) => {
                     if self.current_route() != &route {
                         self.routes.push(route);
@@ -914,19 +928,28 @@ impl TunerApp {
         matches!(self.view_screen(), ScreenId::Player | ScreenId::Onboarding)
     }
 
+    fn has_media(&self) -> bool {
+        self.snapshot.state != PlayerState::Idle
+    }
+
     /// The pop-out key (`o`, Ctrl+Shift+O, a double-click on the video-only player): pop out,
-    /// or back in (DESIGN §21.6). Needs Hyprland; elsewhere a toast says so.
-    fn toggle_popout(&mut self, egui_ctx: &egui::Context) {
+    /// or back in (DESIGN §21.6). Needs Hyprland; elsewhere a toast says so. Returns whether a
+    /// request went out.
+    fn toggle_popout(&mut self, egui_ctx: &egui::Context) -> bool {
         if self.popout_backend.is_none() {
-            self.toast(Toast::info("The pop-out player needs Hyprland: it pins a small window on every workspace"));
-            return;
+            self.toast(Toast::info("Pop-out needs Hyprland (it pins a small player on every workspace)"));
+            return false;
         }
-        let Some(t) = self.popout.toggle(self.window_size) else { return };
+        let Some(t) = self.popout.toggle(self.window_size, self.has_media()) else { return false };
+        // Hyprland can't pin or unpin a fullscreen window (the worker waits for this to land)
+        if self.window_fullscreen {
+            self.set_window_fullscreen(false, egui_ctx);
+        }
         let req = match t {
             Toggle::Out => {
-                // Hyprland can't pin a fullscreen window (the worker waits for this to land)
-                if self.window_fullscreen {
-                    self.set_window_fullscreen(false, egui_ctx);
+                // popping out of the player itself: the player is entered again, banner and all
+                if self.current_route() == &Route::Player {
+                    self.entered = None;
                 }
                 let p = &self.services().config().player;
                 PopRequest::Out { size: p.popout_size, corner: p.popout_corner, last: p.popout_last }
@@ -937,16 +960,34 @@ impl TunerApp {
             b.send(req);
         }
         egui_ctx.request_repaint();
+        true
     }
 
-    fn on_popout_event(&mut self, ev: &PopOutEvent) {
+    fn on_popout_event(&mut self, ev: &PopOutEvent, egui_ctx: &egui::Context) {
         self.popout.on_event(ev);
         match ev {
-            PopOutEvent::PoppedIn { remember: Some(r) } => {
-                let r = *r;
-                self.config_edits.push(Box::new(move |c: &mut Config| c.player.popout_last = Some(r)));
+            PopOutEvent::PoppedIn { place } => {
+                let last = match *place {
+                    Place::Remember(r) => Some(r),
+                    Place::Forget => None,
+                    Place::Keep => self.services().config().player.popout_last,
+                };
+                self.config_edits.push(Box::new(move |c: &mut Config| c.player.popout_last = last));
+                if std::mem::take(&mut self.fullscreen_after_pop_in) {
+                    self.set_window_fullscreen(true, egui_ctx);
+                }
             }
-            PopOutEvent::Failed(e) => self.toast(Toast::error(format!("Couldn't move the player window: {e}"))),
+            PopOutEvent::Failed { popping_out, error } => {
+                self.fullscreen_after_pop_in = false;
+                let what = if *popping_out { "Couldn't pop the player out" } else { "Couldn't put the player back" };
+                match error {
+                    PopError::Ipc(e) => {
+                        tracing::warn!("pop-out: {e}");
+                        self.toast(Toast::error(what));
+                    }
+                    e => self.toast(Toast::error(format!("{what}: {e}"))),
+                }
+            }
             _ => {}
         }
     }
@@ -1066,12 +1107,17 @@ impl eframe::App for TunerApp {
         // requested callback always has a commit to ride on.
         if let Some(w) = frame.winit_window() {
             w.pre_present_notify();
+            if !self.popout_started {
+                self.popout_started = true;
+                self.popout_backend =
+                    crate::platform::popout::PopOutWorker::start(self.services().bus.clone()).map(|w| Box::new(w) as Box<dyn PopOutBackend>);
+            }
         }
         let egui_ctx = ui.ctx().clone();
         let width = egui_ctx.content_rect().width();
         // egui points are logical px (no zoom factor), like Hyprland's sizes
         self.window_size = egui_ctx.content_rect().size();
-        self.video_only = self.popout.video_only(self.window_size);
+        self.video_only = self.popout.video_only(self.window_size, self.has_media());
         self.layout = LayoutClass::from_width(width, self.theme.rem());
         // the compositor's toggle, a double-click on video… (only the app's own requests are
         // known otherwise)
@@ -2706,9 +2752,9 @@ mod tests {
     }
 
     /// Ctrl+Shift+O on Live pops out: the window shows the video-only player (Esc pops back
-    /// in) over an untouched route stack, which is on screen again after the pop-in; the
-    /// pop-out's place is remembered. Super+O's floating + pinned window is video-only up to
-    /// Omarchy's pop size only.
+    /// in) over an untouched route stack, which is on screen again after the pop-in; a moved
+    /// pop-out's place is remembered, an unmoved one's forgotten. `f` while popped out pops in
+    /// and then goes fullscreen.
     #[test]
     fn pop_out_shows_the_video_only_player_and_comes_back_to_the_screen() {
         let mut rig = Rig::new();
@@ -2732,20 +2778,57 @@ mod tests {
 
         rig.press(Key::Escape, NONE);
         assert_eq!(sent.borrow().last(), Some(&PopRequest::In { ours: true }));
-        rig.event(pop_event(PopOutEvent::PoppedIn { remember: Some([1424, 914, 480, 270]) }));
+        rig.event(pop_event(PopOutEvent::PoppedIn { place: Place::Remember([100, 500, 480, 270]) }));
         rig.size = egui::vec2(1280.0, 800.0);
         rig.frame_with(vec![]);
         assert!(!rig.app.video_only);
         assert_eq!(rig.app.view_screen(), before.screen());
-        assert_eq!(rig.app.services().config().player.popout_last, Some([1424, 914, 480, 270]));
+        assert_eq!(rig.app.services().config().player.popout_last, Some([100, 500, 480, 270]));
 
-        // Super+O: floating + pinned at its 1300 × 900
-        rig.event(pop_event(PopOutEvent::Flags(crate::platform::popout::WindowFlags { floating: true, pinned: true })));
-        rig.size = egui::vec2(1300.0, 900.0);
+        rig.press(Key::O, Modifiers { shift: true, ..CTRL });
+        rig.event(pop_event(PopOutEvent::PoppedOut));
+        rig.size = egui::vec2(480.0, 270.0);
         rig.frame_with(vec![]);
+        let mut f = key_events(Key::F, NONE);
+        f.insert(1, Event::Text("f".into()));
+        rig.frame_with(f);
+        assert_eq!(sent.borrow().last(), Some(&PopRequest::In { ours: true }), "f pops in first");
+        assert!(!rig.app.window_fullscreen, "a pinned window can't go fullscreen");
+        rig.event(pop_event(PopOutEvent::PoppedIn { place: Place::Forget }));
+        rig.size = egui::vec2(1280.0, 800.0);
+        rig.frame_with(vec![]);
+        assert!(rig.app.window_fullscreen);
+        assert_eq!(rig.app.services().config().player.popout_last, None, "unmoved: follow the corner again");
+    }
+
+    /// A movie finishing while popped out doesn't pull the window back in: its page lands
+    /// under the pop-out in place of the Player route, and is on screen after the pop-in.
+    #[test]
+    fn a_movie_ending_while_popped_out_stays_out_and_its_page_waits_underneath() {
+        let mut rig = Rig::new();
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        rig.app.popout_backend = Some(Box::new(PopRecorder(sent.clone())));
+        rig.app.nav.push(NavRequest::Push(Route::Player));
+        rig.frame_with(vec![]);
+        let under = rig.app.routes[0].clone();
+        rig.press(Key::O, Modifiers { shift: true, ..CTRL });
+        rig.event(pop_event(PopOutEvent::PoppedOut));
+        rig.size = egui::vec2(480.0, 270.0);
+        rig.frame_with(vec![]);
+
+        // what `movie_detail::return_to_page` asks for at the end of the movie
+        let page = Route::MovieDetail(crate::model::MovieId(1));
+        rig.app.nav.extend([NavRequest::Back, NavRequest::Push(page.clone())]);
+        rig.frame_with(vec![]);
+        assert_eq!(sent.borrow().len(), 1, "no pop-in: {:?}", sent.borrow());
         assert!(rig.app.video_only);
-        rig.size = egui::vec2(1600.0, 1000.0);
+        assert_eq!(rig.app.routes, [under, page.clone()]);
+
+        rig.press(Key::Escape, NONE);
+        rig.event(pop_event(PopOutEvent::PoppedIn { place: Place::Keep }));
+        rig.size = egui::vec2(1280.0, 800.0);
         rig.frame_with(vec![]);
-        assert!(!rig.app.video_only, "a big pinned window keeps the full UI");
+        assert_eq!(rig.route(), &page);
+        assert!(!rig.app.routes.contains(&Route::Player));
     }
 }

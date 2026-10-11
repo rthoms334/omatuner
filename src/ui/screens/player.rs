@@ -762,7 +762,7 @@ impl PlayerScreen {
     }
 
     /// The video-only window's banner: one bottom strip — title and volume, then what's on
-    /// (live) or the position (VOD).
+    /// (live) or the position (VOD), and the way back when there is room.
     fn draw_compact_osd(&mut self, ui: &egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, snap: &PlayerSnapshot) {
         let theme = ctx.theme;
         let t = &theme.tokens;
@@ -793,7 +793,21 @@ impl PlayerScreen {
             let dur = snap.duration.or_else(|| playable.and_then(|p| p.duration_hint)).unwrap_or(0.0);
             format!("{} / {}", clock(snap.position.unwrap_or(0.0)), clock(dur))
         };
-        osd_text(&p, egui::pos2(inner.left(), inner.top() + line), Align2::LEFT_TOP, &second, small_font, with_alpha(t.osd_text, 0.8), inner.width());
+        let second_pos = egui::pos2(inner.left(), inner.top() + line);
+        let mut second_w = inner.width();
+        if strip.width() >= 360.0 {
+            let hint = osd_text(
+                &p,
+                egui::pos2(inner.right(), second_pos.y),
+                Align2::RIGHT_TOP,
+                "o · Esc  back",
+                small_font.clone(),
+                with_alpha(t.osd_text, 0.5),
+                f32::INFINITY,
+            );
+            second_w = (hint.left() - pad - inner.left()).max(0.0);
+        }
+        osd_text(&p, second_pos, Align2::LEFT_TOP, &second, small_font, with_alpha(t.osd_text, 0.8), second_w);
     }
 
     /// `[HD] [5.1] [CC] [⟲]` right-aligned at `right_center`; returns their extent.
@@ -1295,10 +1309,19 @@ impl Screen for PlayerScreen {
                 ctx.play(PlayerCommand::SetZoom(ZOOMS[self.zoom]));
                 self.flash = Some((Flash::Zoom, Instant::now()));
             }
-            Action::Minimize => ctx.navigate(NavRequest::Back),
+            // popped out: leave the player AND put the window back (`p` ends in the mini player)
+            Action::Minimize => {
+                ctx.navigate(NavRequest::Back);
+                if ctx.video_only {
+                    ctx.navigate(NavRequest::TogglePopOut);
+                }
+            }
             Action::StopAndClose => {
                 ctx.play(PlayerCommand::Stop);
                 ctx.navigate(NavRequest::Back);
+                if ctx.video_only {
+                    ctx.navigate(NavRequest::TogglePopOut);
+                }
             }
             Action::Retry => {
                 if matches!(ctx.player.state, PlayerState::Error(_) | PlayerState::Reconnecting { .. }) {

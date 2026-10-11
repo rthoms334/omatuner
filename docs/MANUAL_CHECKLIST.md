@@ -359,10 +359,14 @@ These items use the **default** profile: start Tuner from the launcher, not with
     open a browser on one of them. Zap with ↑/↓, change the volume with `+`/`-`, pause with
     Space, hover the video.
   - **Expect:**
-    - The window floats at 480 × 270 in the bottom-right corner (inside the bar and the
-      gaps), with Omarchy's rounded `pop` look, and stays on top on every workspace.
-    - Only the video shows; hovering or a key shows the strip (channel, programme, volume).
+    - The window floats at 480 × 270 in the bottom-right corner (inside the bar, 10 px from
+      the edges like tiled windows' gaps), with Omarchy's rounded `pop` look, and stays on
+      top on every workspace.
+    - Only the video shows; right after popping out, hovering or a key shows the strip
+      (channel, programme, volume and "o · Esc back").
     - All the keys work; Esc first closes a side panel (`c`), then puts the window back.
+    - `f` puts the window back and makes it fullscreen; `p` puts it back with the mini player;
+      `q` stops and puts it back.
 - [ ] **Back to tiled, remembered place:**
   - **Do:** pop out, drag the pop-out to the top-left and make it bigger (Super+drag), then
     press Esc. Pop out again. Then change Settings ▸ Player ▸ Pop-out corner and pop out again.
@@ -372,12 +376,17 @@ These items use the **default** profile: start Tuner from the launcher, not with
       after Ctrl+Shift+O there).
     - The second pop-out comes back at the dragged place and size; after changing the corner
       it goes to that corner at the preset size.
+    - Popped in without moving it, the next pop-out on a different monitor still goes to that
+      monitor's corner.
+- [ ] **Movie ending while popped out:** **Do:** pop out a movie near its end and wait.
+  **Expect:** the window stays popped out and shows "Nothing playing"; Esc tiles it and shows
+  the movie's page (Esc there goes to the screen before it, not an empty player).
 - [ ] **Super+O switches to video-only by itself:**
   - **Do:** with Tuner focused on Live TV, press Super+O. Then press Super+O again. Then press
     Super+O once more and resize the window bigger than 1300 × 900.
   - **Expect:**
-    - The 1300 × 900 pinned window shows the video-only player (or "Nothing playing" with the
-      way back), on every workspace.
+    - The 1300 × 900 pinned window shows the video-only player on every workspace. With
+      nothing playing it keeps the full interface (pinned).
     - The second Super+O brings the full interface back.
     - A pinned window bigger than 1300 × 900 shows the full interface; Esc/`o` in the player
       then unpins and tiles it.

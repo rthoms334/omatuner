@@ -546,7 +546,8 @@ The full reference is generated from `src/keymap.rs`:
 
 | Keys | Action |
 |---|---|
-| `Esc` / `o` | Back to the full window |
+| `Esc` / `o` | Back to the full window (also double-click) |
+| `f` | Back to the full window, fullscreen |
 
 ### Channel number entry (`NumericEntry`)
 
@@ -723,19 +724,24 @@ every workspace you switch to. The window then shows only the video. Moving the 
 or pressing a key, shows a short strip with the channel, what's on and the volume. All player
 keys keep working: ↑/↓ zap, Space pauses, `m` mutes, `+`/`-` set the volume, `c` lists the
 channels. Press Esc or `o`, or double-click the video, to put the window back where it was
-(tiled, on the workspace you are on now). Nothing playing? The pop-out says so and tells you
-how to get back.
+(tiled, on the workspace you are on now); `f` puts it back and goes fullscreen, `p` puts it
+back with the mini player and `q` stops and puts it back. A movie that ends while popped out
+leaves the pop-out where it is ("Nothing playing"); its page is waiting when you come back.
 
+- Move it with Super+drag, resize it with Super+right-drag.
 - Settings ▸ Player ▸ *Pop-out (Hyprland)* picks the size (Small 480 × 270 or Medium
   640 × 360) and the corner (bottom right by default). If you move or resize the pop-out, it
-  comes back there next time; changing either setting resets that.
-- **Super+O** (Omarchy's *Pop window out*) works too: a pinned Tuner window at Omarchy's pop
-  size (1300 × 900) or smaller switches to the video-only player by itself, and Esc or `o` puts
-  it back. A bigger pinned window keeps the full interface.
+  comes back there next time; changing either setting resets that. An unmoved pop-out always
+  goes to the corner (on whichever monitor the window is on).
+- **Super+O** (Omarchy's *Pop window out*) works too: while something plays, a pinned Tuner
+  window at Omarchy's pop size (1300 × 900) or smaller switches to the video-only player by
+  itself, and Esc or `o` puts it back. A bigger pinned window, or nothing playing, keeps the
+  full interface.
 - The pop-out is tagged `pop` like Omarchy's own, so it gets the same look.
 - It needs Hyprland. Elsewhere the key only says so.
-- The packaged window rules (`hypr/tuner.lua`, above) are not needed for the pop-out, but they
-  keep video rendering while a *tiled* Tuner sits on another workspace.
+- Install the packaged window rules (`hypr/tuner.lua`, above) for the pop-out too: without them
+  Omarchy draws unfocused windows at 96 % opacity, so the page behind shows through the video.
+  They also keep video rendering while a tiled Tuner sits on another workspace.
 
 ## Troubleshooting
 

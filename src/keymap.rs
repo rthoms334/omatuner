@@ -601,9 +601,13 @@ pub static PLAYER_OSD: &[Binding] = &[
 ];
 
 /// The popped-out (video-only) player, above `PlayerLive` / `PlayerVod`: every player key
-/// works; Esc and `o` (also a double-click) put the window back.
-pub static POP_OUT: &[Binding] =
-    &[b(C::key(Key::Escape), A::TogglePopOut, "Back to the full window"), b(C::ch('o'), A::TogglePopOut, "Back to the full window")];
+/// works; Esc and `o` (also a double-click) put the window back, `f` puts it back fullscreen;
+/// `p` and `q` leave the player as usual and put the window back too.
+pub static POP_OUT: &[Binding] = &[
+    b(C::key(Key::Escape), A::TogglePopOut, "Back to the full window (also double-click)"),
+    b(C::ch('o'), A::TogglePopOut, "Back to the full window (also double-click)"),
+    b(C::ch('f'), A::ToggleWindowFullscreen, "Back to the full window, fullscreen"),
+];
 
 pub static NUMERIC_ENTRY: &[Binding] = &[
     b(C::ch('0'), A::Digit(0), "Type the channel number"),

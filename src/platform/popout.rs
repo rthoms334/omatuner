@@ -14,10 +14,14 @@
 //!   works is kept for the session (a running config is either Lua or not).
 //! * Our window is found by OUR pid in `j/clients`, never by class, so another profile's Tuner
 //!   is never touched; its address is validated before it goes into a Lua string.
-//! * Pop-out: float → size → place → pin → raise → tag `pop` (Omarchy styles `tag:pop`
-//!   windows). Pop-in undoes only what pop-out changed: unpin, untag, then back to the
-//!   recorded floating geometry or tiled. A pop-in without a record (popped out by Super+O)
-//!   does what Super+O does on its second press: unpin, untag, tile.
+//! * Pop-out: (un-maximize) → float → size → place → pin → raise → tag `pop` (Omarchy styles
+//!   `tag:pop` windows); a step Hyprland refuses undoes the steps before it. Pop-in undoes
+//!   only what pop-out changed: unpin, untag, then back to the recorded floating geometry or
+//!   tiled. A pop-in without a record (popped out by Super+O) does what Super+O does on its
+//!   second press: unpin, untag, tile. A fullscreen window is neither popped out nor in (the
+//!   app leaves fullscreen first and the worker waits for Hyprland to see it).
+//! * The pop-out's place is remembered only when the user moved or resized it; an unmoved
+//!   pop-out keeps following the configured corner (another monitor, another resolution).
 //! * Everything here runs on the `hypr-popout` / `hypr-events` threads; the UI sends
 //!   [`PopRequest`]s and receives [`PopOutEvent`]s (`PlatformEvent::PopOut`).
 
@@ -32,8 +36,11 @@ use crate::config::{PopoutCorner, PopoutSize};
 use crate::msg::{AppEvent, EventBus};
 use crate::platform::PlatformEvent;
 
-/// Gap between a new pop-out and the monitor edges (logical px).
-const MARGIN: i32 = 16;
+/// Gap between a new pop-out and the monitor edges (logical px): Omarchy's `gaps_out`, so the
+/// pop-out lines up with the edges of tiled windows.
+const MARGIN: i32 = 10;
+/// A pop-out within this many px of its default place counts as not moved.
+const MOVED_SLACK: i32 = 2;
 /// Smallest pop-out a remembered geometry is clamped to.
 const MIN_SIZE: (i32, i32) = (192, 108);
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
@@ -184,6 +191,9 @@ enum Cmd {
     /// `+pop` / `-pop`.
     Tag(bool),
     Raise,
+    /// Leave maximized (Hyprland reports it as fullscreen mode 1; a maximized window can't be
+    /// pinned). Lua only: the classic `fullscreenstate` acts on the focused window.
+    Unmaximize,
 }
 
 impl Cmd {
@@ -197,11 +207,13 @@ impl Cmd {
             Cmd::Move(x, y) => format!("hl.dsp.window.move({{ {w}, x = {x}, y = {y} }})"),
             Cmd::Tag(b) => format!("hl.dsp.window.tag({{ {w}, tag = \"{}pop\" }})", if b { '+' } else { '-' }),
             Cmd::Raise => format!("hl.dsp.window.alter_zorder({{ {w}, mode = \"top\" }})"),
+            Cmd::Unmaximize => format!("hl.dsp.window.fullscreen({{ {w}, mode = \"maximized\", action = \"unset\" }})"),
         }
     }
 
-    fn classic(self, addr: &str) -> String {
-        match self {
+    /// `None`: no classic dispatcher takes a window for this.
+    fn classic(self, addr: &str) -> Option<String> {
+        Some(match self {
             Cmd::Float(true) => format!("setfloating address:{addr}"),
             Cmd::Float(false) => format!("settiled address:{addr}"),
             Cmd::Pin(_) => format!("pin address:{addr}"),
@@ -209,7 +221,8 @@ impl Cmd {
             Cmd::Move(x, y) => format!("movewindowpixel exact {x} {y},address:{addr}"),
             Cmd::Tag(b) => format!("tagwindow {}pop address:{addr}", if b { '+' } else { '-' }),
             Cmd::Raise => format!("alterzorder top,address:{addr}"),
-        }
+            Cmd::Unmaximize => return None,
+        })
     }
 }
 
@@ -220,7 +233,7 @@ enum Syntax {
     Classic,
 }
 
-/// What pop-out changed, to undo on pop-in.
+/// What pop-out changed, to undo on pop-in, and the default place it was asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Restore {
     was_floating: bool,
@@ -228,14 +241,29 @@ pub struct Restore {
     had_tag: bool,
     /// Floating geometry before (only used when it was floating).
     before: Rect,
+    size: PopoutSize,
+    corner: PopoutCorner,
+}
+
+/// What to do with the remembered pop-out place (`PlayerConfig::popout_last`) after a pop-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    /// The user moved or resized our pop-out: reuse this (`[x, y, w, h]`, monitor-relative).
+    Remember([i32; 4]),
+    /// Our pop-out sat at its default place: follow the corner next time.
+    Forget,
+    /// Not our pop-out (Super+O), or no longer floating + pinned: leave it as it is.
+    Keep,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PopError {
     /// Our window is not (yet) mapped.
     NoWindow,
-    /// Hyprland can't pin a fullscreen window.
+    /// Hyprland can't pin or unpin a fullscreen window.
     Fullscreen,
+    /// Maximized, and Hyprland's config (classic syntax) can't un-maximize it by address.
+    Maximized,
     Ipc(String),
 }
 
@@ -244,6 +272,7 @@ impl std::fmt::Display for PopError {
         match self {
             PopError::NoWindow => f.write_str("Hyprland doesn't list Tuner's window"),
             PopError::Fullscreen => f.write_str("the window is still fullscreen"),
+            PopError::Maximized => f.write_str("the window is maximized (Super+F)"),
             PopError::Ipc(e) => f.write_str(e),
         }
     }
@@ -285,31 +314,61 @@ impl<I: HyprIpc> Hypr<I> {
 
     /// One dispatcher: Lua first, then classic, until one syntax has worked (then only it).
     fn dispatch(&mut self, cmd: Cmd, addr: &str) -> Result<(), String> {
-        let mut send = |req: String| -> Result<bool, String> { Ok(self.ipc.request(&format!("/dispatch {req}"))?.trim() == "ok") };
-        match self.syntax {
-            Syntax::Lua => send(cmd.lua(addr))?.then_some(()).ok_or_else(|| format!("Hyprland refused {}", cmd.lua(addr))),
-            Syntax::Classic => send(cmd.classic(addr))?.then_some(()).ok_or_else(|| format!("Hyprland refused {}", cmd.classic(addr))),
-            Syntax::Unknown => {
-                if send(cmd.lua(addr))? {
+        let (lua, classic) = (cmd.lua(addr), cmd.classic(addr));
+        let mut send = |req: &str| -> Result<bool, String> { Ok(self.ipc.request(&format!("/dispatch {req}"))?.trim() == "ok") };
+        let refused = |req: &str| format!("Hyprland refused {req}");
+        match (self.syntax, classic) {
+            (Syntax::Lua, _) => send(&lua)?.then_some(()).ok_or_else(|| refused(&lua)),
+            (Syntax::Classic, Some(c)) => send(&c)?.then_some(()).ok_or_else(|| refused(&c)),
+            (Syntax::Classic, None) => Err(format!("no classic dispatcher for {cmd:?}")),
+            (Syntax::Unknown, classic) => {
+                if send(&lua)? {
                     self.syntax = Syntax::Lua;
-                } else if send(cmd.classic(addr))? {
+                } else if let Some(c) = classic {
+                    if !send(&c)? {
+                        return Err(refused(&c));
+                    }
                     self.syntax = Syntax::Classic;
                 } else {
-                    return Err(format!("Hyprland refused {}", cmd.classic(addr)));
+                    return Err(refused(&lua));
                 }
                 Ok(())
             }
         }
     }
 
-    /// Float, size, place, pin, raise and tag our window; returns what to undo.
+    /// Float, size, place, pin, raise and tag our window; returns what to undo. A refused
+    /// step undoes the steps before it (no half popped-out window, no wrong record).
     pub fn pop_out(&mut self, pid: u32, size: PopoutSize, corner: PopoutCorner, last: Option<[i32; 4]>) -> Result<Restore, PopError> {
-        let c = self.our_client(pid)?.ok_or(PopError::NoWindow)?;
-        if c.fullscreen != 0 {
-            return Err(PopError::Fullscreen);
+        let mut c = self.our_client(pid)?.ok_or(PopError::NoWindow)?;
+        match c.fullscreen {
+            0 => {}
+            1 => {
+                self.dispatch(Cmd::Unmaximize, &c.address).map_err(|_| PopError::Maximized)?;
+                c = self.our_client(pid)?.ok_or(PopError::NoWindow)?;
+            }
+            _ => return Err(PopError::Fullscreen),
         }
         let m = self.monitor(c.monitor)?;
         let r = place(&m, size, corner, last);
+        let restore = Restore {
+            was_floating: c.floating,
+            was_pinned: c.pinned,
+            had_tag: c.has_tag("pop"),
+            before: Rect { x: c.at[0], y: c.at[1], w: c.size[0], h: c.size[1] },
+            size,
+            corner,
+        };
+        if let Err(e) = self.float_place_pin(&c, r) {
+            if let Err(undo) = self.pop_in(pid, Some(&restore)) {
+                tracing::warn!("pop-out: undoing a refused pop-out: {undo}");
+            }
+            return Err(e.into());
+        }
+        Ok(restore)
+    }
+
+    fn float_place_pin(&mut self, c: &Client, r: Rect) -> Result<(), String> {
         let a = c.address.as_str();
         if !c.floating {
             self.dispatch(Cmd::Float(true), a)?;
@@ -323,25 +382,28 @@ impl<I: HyprIpc> Hypr<I> {
         if !c.has_tag("pop") {
             self.dispatch(Cmd::Tag(true), a)?;
         }
-        Ok(Restore {
-            was_floating: c.floating,
-            was_pinned: c.pinned,
-            had_tag: c.has_tag("pop"),
-            before: Rect { x: c.at[0], y: c.at[1], w: c.size[0], h: c.size[1] },
-        })
+        Ok(())
     }
 
-    /// Undo a pop-out (`restore` = our record; `None` = undo Super+O). Returns the pop-out's
-    /// geometry relative to its monitor, to remember, when we had popped it out.
-    pub fn pop_in(&mut self, pid: u32, restore: Option<&Restore>) -> Result<Option<[i32; 4]>, String> {
-        let Some(c) = self.our_client(pid)? else { return Ok(None) };
+    /// Undo a pop-out (`restore` = our record; `None` = undo Super+O); says what to do with
+    /// the remembered place.
+    pub fn pop_in(&mut self, pid: u32, restore: Option<&Restore>) -> Result<Place, PopError> {
+        let Some(c) = self.our_client(pid)? else { return Ok(Place::Keep) };
+        match c.fullscreen {
+            0 => {}
+            1 => self.dispatch(Cmd::Unmaximize, &c.address).map_err(|_| PopError::Maximized)?,
+            _ => return Err(PopError::Fullscreen),
+        }
         let a = c.address.as_str();
         let remember = match restore {
-            Some(_) if c.floating && c.pinned => {
+            Some(r) if c.floating && c.pinned => {
                 let m = self.monitor(c.monitor)?;
-                Some([c.at[0] - m.x, c.at[1] - m.y, c.size[0], c.size[1]])
+                let home = place(&m, r.size, r.corner, None);
+                let now = Rect { x: c.at[0], y: c.at[1], w: c.size[0], h: c.size[1] };
+                let moved = [now.x - home.x, now.y - home.y, now.w - home.w, now.h - home.h].iter().any(|d| d.abs() > MOVED_SLACK);
+                if moved { Place::Remember([now.x - m.x, now.y - m.y, now.w, now.h]) } else { Place::Forget }
             }
-            _ => None,
+            _ => Place::Keep,
         };
         if c.pinned && !restore.is_some_and(|r| r.was_pinned) {
             self.dispatch(Cmd::Pin(false), a)?;
@@ -379,11 +441,15 @@ pub enum PopOutEvent {
     /// Our window's floating / pinned state changed (any cause: us, Super+O, a mouse drag).
     Flags(WindowFlags),
     PoppedOut,
-    /// `remember`: the pop-out geometry to reuse next time (`PlayerConfig::popout_last`).
+    /// `place`: what to do with the remembered pop-out place (`PlayerConfig::popout_last`).
     PoppedIn {
-        remember: Option<[i32; 4]>,
+        place: Place,
     },
-    Failed(String),
+    /// `popping_out`: the failed request was a pop-out (else a pop-in).
+    Failed {
+        popping_out: bool,
+        error: PopError,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -439,35 +505,42 @@ fn serve<I: HyprIpc>(mut hypr: Hypr<I>, rx: &crossbeam_channel::Receiver<PopRequ
     let mut restore: Option<Restore> = None;
     for req in rx.iter() {
         let ev = match req {
-            PopRequest::Out { size, corner, last } => {
-                let mut result = hypr.pop_out(pid, size, corner, last);
-                // the app left window fullscreen just before; Hyprland may not have seen it yet
-                for _ in 0..FULLSCREEN_TRIES {
-                    if result != Err(PopError::Fullscreen) {
-                        break;
-                    }
-                    std::thread::sleep(FULLSCREEN_WAIT);
-                    result = hypr.pop_out(pid, size, corner, last);
+            PopRequest::Out { size, corner, last } => match after_fullscreen(|| hypr.pop_out(pid, size, corner, last)) {
+                Ok(r) => {
+                    restore = Some(r);
+                    PopOutEvent::PoppedOut
                 }
-                match result {
-                    Ok(r) => {
-                        restore = Some(r);
-                        PopOutEvent::PoppedOut
-                    }
-                    Err(e) => PopOutEvent::Failed(e.to_string()),
-                }
-            }
+                Err(error) => PopOutEvent::Failed { popping_out: true, error },
+            },
             PopRequest::In { ours } => {
                 let record = restore.take().filter(|_| ours);
-                match hypr.pop_in(pid, record.as_ref()) {
-                    Ok(remember) => PopOutEvent::PoppedIn { remember },
-                    Err(e) => PopOutEvent::Failed(e),
+                match after_fullscreen(|| hypr.pop_in(pid, record.as_ref())) {
+                    Ok(place) => PopOutEvent::PoppedIn { place },
+                    Err(error) => {
+                        // still popped out: the next pop-in undoes the same record
+                        restore = record;
+                        PopOutEvent::Failed { popping_out: false, error }
+                    }
                 }
             }
         };
         tracing::debug!("pop-out: {ev:?}");
         bus.send(AppEvent::Platform(PlatformEvent::PopOut(ev)));
     }
+}
+
+/// Run `step`, retrying while the window is fullscreen: the app left window fullscreen just
+/// before the request and Hyprland may not have seen it yet.
+fn after_fullscreen<T>(mut step: impl FnMut() -> Result<T, PopError>) -> Result<T, PopError> {
+    let mut result = step();
+    for _ in 0..FULLSCREEN_TRIES {
+        if !matches!(result, Err(PopError::Fullscreen)) {
+            break;
+        }
+        std::thread::sleep(FULLSCREEN_WAIT);
+        result = step();
+    }
+    result
 }
 
 /// Follows our window through Hyprland's event stream.
@@ -574,6 +647,8 @@ mod tests {
         dispatched: Vec<String>,
         /// Replies to force for the next dispatches (e.g. a refusal).
         forced: VecDeque<String>,
+        /// Dispatches containing one of these are refused (once each).
+        refuse: Vec<&'static str>,
     }
 
     const MONITORS: &str = r#"[{"id": 0, "x": 0, "y": 0, "width": 2560, "height": 1600, "scale": 1.3333334,
@@ -583,7 +658,10 @@ mod tests {
         fn new(lua: bool, ours: serde_json::Value) -> Self {
             let other = serde_json::json!({"address": "0xbbb", "pid": 1, "mapped": true, "floating": false, "pinned": false,
                 "at": [0, 0], "size": [10, 10], "monitor": 0, "fullscreen": 0, "tags": []});
-            Self { lua, state: Arc::new(Mutex::new(FakeState { clients: vec![other, ours], dispatched: vec![], forced: VecDeque::new() })) }
+            Self {
+                lua,
+                state: Arc::new(Mutex::new(FakeState { clients: vec![other, ours], dispatched: vec![], forced: VecDeque::new(), refuse: vec![] })),
+            }
         }
         fn dispatched(&self) -> Vec<String> {
             self.state.lock().unwrap().dispatched.clone()
@@ -611,13 +689,19 @@ mod tests {
                 return Ok(if is_lua { "Invalid dispatcher".into() } else { "[string]: attempt to call a nil value".into() });
             }
             st.dispatched.push(cmd.clone());
+            if let Some(i) = st.refuse.iter().position(|r| cmd.contains(r)) {
+                st.refuse.remove(i);
+                return Ok("Window does not qualify".into());
+            }
             let w = &mut st.clients[1];
             let num = |s: &str, key: &str| -> i32 {
                 let rest = &s[s.find(key).unwrap() + key.len()..];
                 rest.trim_start().split(|c: char| !(c == '-' || c.is_ascii_digit())).find(|t| !t.is_empty()).unwrap().parse().unwrap()
             };
             let words: Vec<&str> = cmd.split([' ', ',']).collect();
-            if cmd.contains("window.float") || cmd.starts_with("setfloating") || cmd.starts_with("settiled") {
+            if cmd.contains("window.fullscreen") {
+                w["fullscreen"] = 0.into();
+            } else if cmd.contains("window.float") || cmd.starts_with("setfloating") || cmd.starts_with("settiled") {
                 w["floating"] = (cmd.contains("enable") || cmd.starts_with("setfloating")).into();
             } else if cmd.contains("window.pin") || cmd.starts_with("pin ") {
                 let now = w["pinned"].as_bool().unwrap();
@@ -651,7 +735,8 @@ mod tests {
     const W: &str = "address:0xaaab07400000";
 
     /// Lua config (Omarchy 4): float, 480×270 at the bottom-right of the 1920×1200 logical
-    /// monitor (bar 26 px, margin 16), pin, raise, tag; pop-in undoes exactly that.
+    /// monitor (bar 26 px, margin 10), pin, raise, tag; pop-in undoes exactly that. An unmoved
+    /// pop-out's place isn't remembered (it follows the corner); a moved one's is.
     #[test]
     fn lua_pop_out_and_back_restores_the_tiled_window() {
         let fake = FakeHypr::new(true, tiled(PID));
@@ -662,7 +747,7 @@ mod tests {
             [
                 format!("hl.dsp.window.float({{ window = \"{W}\", action = \"enable\" }})"),
                 format!("hl.dsp.window.resize({{ window = \"{W}\", x = 480, y = 270 }})"),
-                format!("hl.dsp.window.move({{ window = \"{W}\", x = 1424, y = 914 }})"),
+                format!("hl.dsp.window.move({{ window = \"{W}\", x = 1430, y = 920 }})"),
                 format!("hl.dsp.window.pin({{ window = \"{W}\", action = \"enable\" }})"),
                 format!("hl.dsp.window.alter_zorder({{ window = \"{W}\", mode = \"top\" }})"),
                 format!("hl.dsp.window.tag({{ window = \"{W}\", tag = \"+pop\" }})"),
@@ -671,8 +756,7 @@ mod tests {
         let w = fake.ours();
         assert_eq!((w["floating"].as_bool(), w["pinned"].as_bool()), (Some(true), Some(true)));
 
-        let remember = h.pop_in(PID, Some(&restore)).unwrap();
-        assert_eq!(remember, Some([1424, 914, 480, 270]), "the pop-out's place is remembered");
+        assert_eq!(h.pop_in(PID, Some(&restore)), Ok(Place::Forget), "unmoved: follow the corner");
         assert_eq!(
             fake.dispatched()[6..],
             [
@@ -683,6 +767,10 @@ mod tests {
         );
         let w = fake.ours();
         assert_eq!((w["floating"].as_bool(), w["pinned"].as_bool(), w["tags"].as_array().unwrap().len()), (Some(false), Some(false), 1));
+
+        let restore = h.pop_out(PID, PopoutSize::Small, PopoutCorner::BottomRight, None).unwrap();
+        fake.state.lock().unwrap().clients[1]["at"] = serde_json::json!([100, 500]); // Super+drag
+        assert_eq!(h.pop_in(PID, Some(&restore)), Ok(Place::Remember([100, 500, 480, 270])));
     }
 
     /// Classic hyprlang config: the first Lua attempt is refused, the classic form works and is
@@ -735,8 +823,7 @@ mod tests {
         popped["pinned"] = true.into();
         popped["tags"] = serde_json::json!(["default-opacity*", "pop"]);
         let fake = FakeHypr::new(true, popped);
-        let remember = Hypr::new(fake.clone()).pop_in(PID, None).unwrap();
-        assert_eq!(remember, None, "only our own pop-out's place is remembered");
+        assert_eq!(Hypr::new(fake.clone()).pop_in(PID, None), Ok(Place::Keep), "only our own pop-out's place is remembered");
         assert_eq!(
             fake.dispatched(),
             [
@@ -747,8 +834,9 @@ mod tests {
         );
     }
 
-    /// Nothing is dispatched for a fullscreen window (the worker retries once the app's
-    /// unfullscreen landed), without our window, or when Hyprland refuses both syntaxes.
+    /// Nothing is dispatched for a fullscreen window, out or in (the worker retries once the
+    /// app's unfullscreen landed), without our window, or when Hyprland refuses both syntaxes;
+    /// a step refused halfway undoes the steps before it.
     #[test]
     fn refusals_dispatch_nothing_further() {
         let mut fs = tiled(PID);
@@ -756,6 +844,12 @@ mod tests {
         let fake = FakeHypr::new(true, fs);
         assert_eq!(Hypr::new(fake.clone()).pop_out(PID, PopoutSize::Small, PopoutCorner::BottomRight, None), Err(PopError::Fullscreen));
         assert_eq!(Hypr::new(fake.clone()).pop_out(7, PopoutSize::Small, PopoutCorner::BottomRight, None), Err(PopError::NoWindow));
+        let fake_in = FakeHypr::new(true, tiled(PID));
+        let restore = Hypr::new(fake_in.clone()).pop_out(PID, PopoutSize::Small, PopoutCorner::BottomRight, None).unwrap();
+        fake_in.state.lock().unwrap().clients[1]["fullscreen"] = 2.into();
+        let sent = fake_in.dispatched().len();
+        assert_eq!(Hypr::new(fake_in.clone()).pop_in(PID, Some(&restore)), Err(PopError::Fullscreen));
+        assert_eq!(fake_in.dispatched().len(), sent, "no unpin of a fullscreen window");
         assert!(fake.dispatched().is_empty());
 
         let fake = FakeHypr::new(true, tiled(PID));
@@ -763,6 +857,24 @@ mod tests {
         let err = Hypr::new(fake.clone()).pop_out(PID, PopoutSize::Small, PopoutCorner::BottomRight, None).unwrap_err();
         assert!(matches!(err, PopError::Ipc(_)), "{err:?}");
         assert_eq!(fake.dispatched().len(), 2, "stops at the first refused step: {:?}", fake.dispatched());
+
+        // pin refused after float, size and move: back to tiled, nothing recorded
+        let fake = FakeHypr::new(true, tiled(PID));
+        fake.state.lock().unwrap().refuse.push("window.pin");
+        let mut h = Hypr::new(fake.clone());
+        assert!(matches!(h.pop_out(PID, PopoutSize::Small, PopoutCorner::BottomRight, None), Err(PopError::Ipc(_))));
+        assert_eq!(fake.dispatched().last(), Some(&format!("hl.dsp.window.float({{ window = \"{W}\", action = \"disable\" }})")));
+        assert_eq!((fake.ours()["floating"].as_bool(), fake.ours()["pinned"].as_bool()), (Some(false), Some(false)));
+
+        // maximized: un-maximized by address (Lua), but classic has no dispatcher for that
+        let mut max = tiled(PID);
+        max["fullscreen"] = 1.into();
+        let fake = FakeHypr::new(true, max.clone());
+        Hypr::new(fake.clone()).pop_out(PID, PopoutSize::Small, PopoutCorner::BottomRight, None).unwrap();
+        assert_eq!(fake.dispatched()[0], format!("hl.dsp.window.fullscreen({{ window = \"{W}\", mode = \"maximized\", action = \"unset\" }})"));
+        let fake = FakeHypr::new(false, max);
+        assert_eq!(Hypr::new(fake.clone()).pop_out(PID, PopoutSize::Small, PopoutCorner::BottomRight, None), Err(PopError::Maximized));
+        assert!(fake.dispatched().is_empty());
     }
 
     /// The event stream drives the floating/pinned flags of OUR window only.

@@ -1241,18 +1241,23 @@ Overlays centre with a bg @ 0.5 scrim.
 ### 12.3 Video-only layout (pop-out, `ui/popout.rs`)
 The window shows only the player — no sidebar, status bar or mini player — while
 * our pop-out is requested or active (`o` / Ctrl+Shift+O, §21.6), whatever its size, or
-* Hyprland reports the window **floating and pinned** and it is at most Omarchy's Super+O pop
-  size, 1300 × 900 logical px (`omarchy-hyprland-window-pop`'s default). A bigger pinned
-  window keeps the full UI; floating alone never switches.
+* something is playing or paused and Hyprland reports the window **floating and pinned** and
+  it is at most Omarchy's Super+O pop size, 1300 × 900 logical px
+  (`omarchy-hyprland-window-pop`'s default). A bigger pinned window, or Super+O with nothing
+  playing (pinning the browsing UI), keeps the full UI; floating alone never switches.
 
 It never shows while a pop-in is in flight, nor between the pop-in's result and Hyprland's
 unpin event (no flash). The app draws the Player screen and gives it the keys whatever the
 route stack says (`TunerApp::view_route`); the stack itself stays, so popping back in returns
-to the screen the user left (it is entered again). In video-only mode a route step back
-(`p` keep playing, `q` stop and close, a finished movie returning to its page) pops the window
-back in instead of leaving the player. Key stack: the player's contexts with `PopOut` right
-above `PlayerLive`/`PlayerVod` — Esc pops back in once a side panel, number entry or controls
-focus has had it.
+to the screen the user left (it is entered again). The video-only player is not a route of its
+own: a route step back in video-only mode only removes a `Player` route on top of the stack,
+never the screens below. Only user keys pop the window back in: `p` (keep playing) and `q`
+(stop and close) leave the player and pop in; `f` pops in and then goes fullscreen (a pinned
+window can't); a finished movie returning to its page stays popped out ("Nothing playing")
+with the page waiting underneath. Key stack: the player's contexts with `PopOut` right above
+`PlayerLive`/`PlayerVod` — Esc pops back in once a side panel, number entry or controls focus
+has had it. The compact OSD strip (title · volume, what's on or the position, "o · Esc back"
+when at least 360 px wide) shows for the usual OSD time after popping out.
 
 ---
 
@@ -2045,7 +2050,8 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 
 | Keys | Action |
 |---|---|
-| `Esc` / `o` | Back to the full window |
+| `Esc` / `o` | Back to the full window (also double-click) |
+| `f` | Back to the full window, fullscreen |
 
 #### Channel number entry (`NumericEntry`)
 
@@ -2343,22 +2349,33 @@ for any window. Tuner does it for itself with `o` in the player or Ctrl+Shift+O 
 * **Pop-out**: (unless already) float → size → move → (unless already) pin → raise → tag `pop`
   (Omarchy rounds `tag:pop` windows). Size: Settings ▸ Player ▸ Pop-out size, Small 480 × 270
   (default) or Medium 640 × 360; place: the chosen corner (default bottom-right) of the
-  window's monitor, inside its reserved area (bar), 16 px margin. A fullscreen window is taken
-  out of fullscreen first (the worker retries for 1 s until Hyprland sees it).
+  window's monitor, inside its reserved area (bar), 10 px margin (Omarchy's `gaps_out`, so it
+  lines up with tiled windows). A refused step undoes the steps before it (no half popped-out
+  window, no record). A maximized window (Hyprland's fullscreen mode 1) is un-maximized first
+  (`hl.dsp.window.fullscreen({ window, mode = "maximized", action = "unset" })`; classic
+  syntax has no per-window form, so there the toast asks to un-maximize). The app leaves
+  window fullscreen first, before a pop-out or a pop-in (a fullscreen window can be neither
+  pinned nor unpinned); the worker retries for 1 s until Hyprland sees it.
 * **Pop-in** undoes only what pop-out changed: unpin (unless it was pinned), untag (unless it
   was tagged), then back to its floating geometry if it was floating, else tiled — on the
-  workspace the user is on now (a pinned window travels). The pop-out's place and size at
-  that moment are remembered (`player.popout_last`, relative to the monitor, clamped on
-  reuse); changing size or corner in Settings forgets it. Toggling while popped out by
-  Super+O (no record) does what Super+O's second press does: unpin, untag, tile.
+  workspace the user is on now (a pinned window travels). If the user moved or resized the
+  pop-out (more than 2 px off its default place), its place and size are remembered
+  (`player.popout_last`, relative to the monitor, clamped on reuse); an unmoved pop-out
+  clears it, so the next one follows the corner on whichever monitor (resolution) it is.
+  Changing size or corner in Settings forgets it too. A refused pop-in keeps the record and
+  the window popped out. Toggling while popped out by Super+O (no record) does what Super+O's
+  second press does: unpin, untag, tile.
 * **State**: the `hypr-events` thread reads `.socket2.sock` and reports our window's
   floating / pinned flags (`changefloatingmode>>ADDR,0|1`, `pin>>ADDR,0|1`; `openwindow`
   re-looks our window up, `closewindow` forgets it). They drive the video-only layout
-  (§12.3) and end our pop-out when someone else unpins it (Super+O pressed again).
+  (§12.3) and end our pop-out when someone else unpins or tiles it (Super+O pressed again,
+  Super+V).
 * **Outside Hyprland** (no `HYPRLAND_INSTANCE_SIGNATURE`) the key only toasts that the
-  pop-out needs Hyprland. Failures (refused dispatch, window not listed) are toasted and leave
-  the layout docked. Unit tests never talk to a compositor: `HyprIpc` has a fake that
-  answers like Hyprland in either syntax, and the app takes a recording `PopOutBackend`.
+  pop-out needs Hyprland. Failures are toasted ("Couldn't pop the player out" / "Couldn't put
+  the player back"; the refused dispatcher goes to the log) and leave the layout docked. The
+  worker and the event watcher start with the first frame of a real window, so unit tests,
+  integration tests and benches never talk to a compositor: `HyprIpc` has a fake that answers
+  like Hyprland in either syntax, and the app takes a recording `PopOutBackend`.
 * A popped-out window is always visible, so its playback never meets the hidden-workspace
   limits of §11.1.
 

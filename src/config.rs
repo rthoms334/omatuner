@@ -216,9 +216,10 @@ pub struct PlayerConfig {
     pub popout_size: PopoutSize,
     /// …and the monitor corner it goes to.
     pub popout_corner: PopoutCorner,
-    /// Where the last pop-out was when it was popped back in (`[x, y, w, h]`, logical px,
-    /// x/y relative to its monitor's top-left): a moved or resized pop-out comes back there.
-    /// Cleared when the size or corner is changed in Settings.
+    /// Where the last pop-out was when it was popped back in, if the user had moved or resized
+    /// it (`[x, y, w, h]`, logical px, x/y relative to its monitor's top-left): the next one
+    /// comes back there. Cleared by an unmoved pop-out and when the size or corner is changed in
+    /// Settings.
     pub popout_last: Option<[i32; 4]>,
 }
 
