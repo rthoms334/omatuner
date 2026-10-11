@@ -22,7 +22,7 @@ use crate::msg::DataScope;
 use crate::store::{Store, Ticket};
 use crate::theme::{SpaceToken, Theme, TypeToken};
 use crate::ui::UiCtx;
-use crate::ui::widgets::button::{ButtonStyle, button};
+use crate::ui::widgets::button::{ButtonStyle, button, icon_button};
 use crate::ui::widgets::card::{CardKind, card_frame};
 use crate::ui::widgets::list::{ListOutcome, ListState, paint_row_state};
 use crate::ui::widgets::text_field::{search_header, text_field};
@@ -30,18 +30,48 @@ use crate::ui::widgets::{RowState, glyphs};
 
 // ------------------------------------------------------------------ shared overlay drawing
 
-/// Full-window scrim (bg @ 0.5) below the overlay card. Returns true when it was clicked.
+/// Full-window scrim (bg @ 0.5) below the overlay card. Returns true when it was clicked
+/// (either button: a right-click outside a menu closes it too).
 pub(super) fn scrim(egui_ctx: &egui::Context, theme: &Theme, id: &str) -> bool {
+    scrim_guarded(egui_ctx, theme, id, false)
+}
+
+/// How long the card border flashes when a click outside can't close a dirty overlay.
+const FLASH_S: f64 = 0.3;
+/// How long after that flash the pointer's tooltip says why.
+const FLASH_HINT_S: f64 = 3.0;
+
+fn flash_id(id: &str) -> egui::Id {
+    egui::Id::new((id, "flash"))
+}
+
+/// [`scrim`] of an overlay that may hold an unsaved edit (`Overlay::is_dirty`): while `dirty`,
+/// a click outside never closes it (one stray click must not throw the edit away) and the
+/// card's border flashes instead; Esc and Cancel still close.
+pub(super) fn scrim_guarded(egui_ctx: &egui::Context, theme: &Theme, id: &str, dirty: bool) -> bool {
     let screen = egui_ctx.content_rect();
-    egui::Area::new(egui::Id::new((id, "scrim")))
+    let clicked = egui::Area::new(egui::Id::new((id, "scrim")))
         .order(egui::Order::Foreground)
         .fixed_pos(screen.min)
         .show(egui_ctx, |ui| {
             let r = ui.allocate_rect(screen, egui::Sense::click());
             ui.painter().rect_filled(screen, 0.0, theme.tokens.scrim);
-            r.clicked()
+            // after a flash, the pointer says why the click outside did nothing
+            let flashed = ui.data(|d| d.get_temp::<f64>(flash_id(id))).is_some_and(|at| ui.input(|i| i.time) - at < FLASH_HINT_S);
+            let r = if dirty && flashed {
+                r.on_hover_text(RichText::new("Unsaved changes — Cancel or Esc to discard").size(theme.font(TypeToken::BodySmall)))
+            } else {
+                r
+            };
+            r.clicked() || r.secondary_clicked()
         })
-        .inner
+        .inner;
+    if clicked && dirty {
+        let now = egui_ctx.input(|i| i.time);
+        egui_ctx.data_mut(|d| d.insert_temp(flash_id(id), now));
+        return false;
+    }
+    clicked
 }
 
 /// A card of `width` centred on the window (or hanging from `top` once a launcher froze its
@@ -55,24 +85,89 @@ pub(super) fn card_area<R>(
     top: Option<f32>,
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<R> {
+    let place = match top {
+        Some(y) => Place::Top(y),
+        None => Place::Centre,
+    };
+    card_in(egui_ctx, theme, CardSpec { id, kind, width, place }, add)
+}
+
+/// [`card_area`] with its top-left corner at `at` (a menu opened by a right-click), kept on
+/// the window.
+pub(super) fn card_area_at<R>(
+    egui_ctx: &egui::Context,
+    theme: &Theme,
+    id: &str,
+    kind: CardKind,
+    width: f32,
+    at: egui::Pos2,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
+    card_in(egui_ctx, theme, CardSpec { id, kind, width, place: Place::At(at) }, add)
+}
+
+enum Place {
+    Centre,
+    Top(f32),
+    At(egui::Pos2),
+}
+
+struct CardSpec<'a> {
+    id: &'a str,
+    kind: CardKind,
+    width: f32,
+    place: Place,
+}
+
+fn card_in<R>(egui_ctx: &egui::Context, theme: &Theme, spec: CardSpec<'_>, add: impl FnOnce(&mut egui::Ui) -> R) -> egui::InnerResponse<R> {
     let screen = egui_ctx.content_rect();
     let gap = theme.space(SpaceToken::PanelPadding);
-    let frame = card_frame(theme, kind);
+    let frame = card_frame(theme, spec.kind);
     let chrome = frame.total_margin().sum().x;
-    let width = width.min(screen.width() - 2.0 * gap).max(120.0);
-    let area = egui::Area::new(egui::Id::new((id, "card"))).order(egui::Order::Tooltip);
-    let area = match top {
-        Some(y) => area.pivot(Align2::CENTER_TOP).fixed_pos(egui::pos2(screen.center().x, y)),
-        None => area.anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO),
+    let width = spec.width.min(screen.width() - 2.0 * gap).max(120.0);
+    let area = egui::Area::new(egui::Id::new((spec.id, "card"))).order(egui::Order::Tooltip);
+    let area = match spec.place {
+        Place::Top(y) => area.pivot(Align2::CENTER_TOP).fixed_pos(egui::pos2(screen.center().x, y)),
+        Place::Centre => area.anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO),
+        // egui keeps an area on the window (`constrain`); the x is clamped here so a menu at
+        // the right edge opens leftwards of the pointer rather than shifted under it
+        Place::At(p) => area.pivot(Align2::LEFT_TOP).fixed_pos(egui::pos2(p.x.min(screen.right() - width - gap).max(screen.left() + gap), p.y)),
     };
+    let since_flash = egui_ctx.data(|d| d.get_temp::<f64>(flash_id(spec.id))).map(|at| egui_ctx.input(|i| i.time) - at);
     let r = area.show(egui_ctx, |ui| {
-        frame.show(ui, |ui| {
+        let r = frame.show(ui, |ui| {
             ui.set_width(width - chrome);
             ui.set_max_height(screen.height() - 2.0 * gap - frame.total_margin().sum().y);
             add(ui)
-        })
+        });
+        if since_flash.is_some_and(|dt| dt < FLASH_S) {
+            // a border pulse twice the usual width: finish or cancel the edit first
+            let w = 2.0 * theme.tokens.card_border_width.max(2.0);
+            ui.painter().rect_stroke(r.response.rect, theme.tokens.rounding, egui::Stroke::new(w, theme.tokens.accent), egui::StrokeKind::Inside);
+            egui_ctx.request_repaint();
+        }
+        r
     });
     egui::InnerResponse::new(r.inner.inner, r.response)
+}
+
+/// A row with the card's close button (✕ "Close (Esc)") at its right end and `add` filling the
+/// rest: a card's header line. Returns whether the button was clicked.
+pub(super) fn with_close(ui: &mut egui::Ui, theme: &Theme, add: impl FnOnce(&mut egui::Ui)) -> bool {
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let close = close_button(ui, theme);
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), add);
+            close
+        })
+        .inner
+    })
+    .inner
+}
+
+/// The ✕ of a card: does what Esc does on it.
+pub(super) fn close_button(ui: &mut egui::Ui, theme: &Theme) -> bool {
+    icon_button(ui, theme, glyphs::CLOSE, "Close (Esc)", ButtonStyle::default()).clicked()
 }
 
 /// Dialog title + optional secondary line.
@@ -157,6 +252,8 @@ pub struct ContextMenuOverlay {
     top: Option<f32>,
     last_top: Option<f32>,
     scroll_to_cursor: bool,
+    /// Opened by a right-click: the card's top-left corner (it then grows downward only).
+    at: Option<egui::Pos2>,
 }
 
 impl ContextMenuOverlay {
@@ -168,7 +265,7 @@ impl ContextMenuOverlay {
             list.select(i);
         }
         let rows = (0..spec.items.len()).collect();
-        Self { spec, list, rows, top: None, last_top: None, scroll_to_cursor: false }
+        Self { spec, list, rows, top: None, last_top: None, scroll_to_cursor: false, at: None }
     }
 
     fn refilter(&mut self) {
@@ -190,6 +287,10 @@ impl ContextMenuOverlay {
 impl Overlay for ContextMenuOverlay {
     fn key_contexts(&self) -> Vec<KeyContext> {
         vec![self.list.key_context(), KeyContext::Modal]
+    }
+
+    fn anchor_at(&mut self, pos: egui::Pos2) {
+        self.at = Some(pos);
     }
 
     fn on_action(&mut self, _ctx: &mut UiCtx<'_>, action: Action) -> OverlayOutcome {
@@ -227,7 +328,8 @@ impl Overlay for ContextMenuOverlay {
         let row_h = theme.space(SpaceToken::PopupRowHeight) + theme.space(SpaceToken::Lg);
         let mut chosen = None;
         let width = 340.0 * theme.rem();
-        let r = card_area(egui_ctx, theme, "context-menu", CardKind::Menu, width, self.top, |ui| {
+        let (at, top) = (self.at, self.top);
+        let add = |ui: &mut egui::Ui| {
             search_header(ui, theme, self.list.filter.query(), &self.spec.title, None);
             ui.add_space(theme.space(SpaceToken::Md));
             if self.rows.is_empty() {
@@ -256,7 +358,11 @@ impl Overlay for ContextMenuOverlay {
                     paint_menu_row(ui.painter(), rect, theme, it.icon, &it.label, it.shortcut.as_deref(), it.enabled, cursor);
                 }
             });
-        });
+        };
+        let r = match at {
+            Some(at) => card_area_at(egui_ctx, theme, "context-menu", CardKind::Menu, width, at, add),
+            None => card_area(egui_ctx, theme, "context-menu", CardKind::Menu, width, top, add),
+        };
         self.last_top = Some(r.response.rect.top());
         chosen.map_or(OverlayOutcome::Keep, |row| self.choose(row))
     }
@@ -563,6 +669,10 @@ impl Overlay for RenameOverlay {
         vec![KeyContext::TextInput, KeyContext::Modal]
     }
 
+    fn is_dirty(&self) -> bool {
+        self.text != self.spec.initial
+    }
+
     fn on_action(&mut self, _ctx: &mut UiCtx<'_>, action: Action) -> OverlayOutcome {
         match action {
             Action::Activate => self.enter.request(),
@@ -578,7 +688,7 @@ impl Overlay for RenameOverlay {
             None => {}
         }
         let theme = ctx.theme;
-        if scrim(egui_ctx, theme, "rename") {
+        if scrim_guarded(egui_ctx, theme, "rename", self.is_dirty()) {
             return OverlayOutcome::Close;
         }
         let saving = self.pending.is_some();
@@ -748,6 +858,11 @@ impl Overlay for ListPickerOverlay {
         if self.naming.is_some() { vec![KeyContext::TextInput, KeyContext::Modal] } else { vec![KeyContext::Modal] }
     }
 
+    /// A new list's name being typed (memberships are saved as they're toggled).
+    fn is_dirty(&self) -> bool {
+        self.naming.as_ref().is_some_and(|n| !n.trim().is_empty())
+    }
+
     fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> OverlayOutcome {
         if self.naming.is_some() {
             return match action {
@@ -792,7 +907,7 @@ impl Overlay for ListPickerOverlay {
         self.poll_toggles(egui_ctx, ctx);
         let theme = ctx.theme;
         let t = &theme.tokens;
-        if scrim(egui_ctx, theme, "list-picker") {
+        if scrim_guarded(egui_ctx, theme, "list-picker", self.is_dirty()) {
             return OverlayOutcome::Close;
         }
         self.cursor = self.cursor.min(ctx.favs.lists.len());
@@ -802,6 +917,7 @@ impl Overlay for ListPickerOverlay {
         let lists: Vec<(FavListId, String, String)> = ctx.favs.lists.iter().map(|l| (l.id, l.icon.clone(), l.name.clone())).collect();
         let mut clicked = None;
         let mut close = false;
+        let (mut create, mut cancel_naming) = (false, false);
         card_area(egui_ctx, theme, "list-picker", CardKind::Menu, 360.0 * theme.rem(), None, |ui| {
             title(ui, theme, &self.spec.title, None);
             ui.add_space(theme.space(SpaceToken::Md));
@@ -848,18 +964,31 @@ impl Overlay for ListPickerOverlay {
             }
             error_line(ui, theme, self.error.as_deref());
             ui.add_space(theme.space(SpaceToken::Md));
+            let naming = self.naming.is_some();
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Enter toggle · Esc done").size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
+                let hint = if naming { "Enter create · Esc cancel" } else { "Enter toggle · Esc done" };
+                ui.label(RichText::new(hint).size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    close = button(ui, theme, None, "Done", ButtonStyle { bordered: true, ..Default::default() }).clicked();
+                    if naming {
+                        // the name field's own buttons (Enter / Esc)
+                        ui.spacing_mut().item_spacing.x = theme.space(SpaceToken::Lg);
+                        create = button(ui, theme, Some(glyphs::CHECK), "Create", ButtonStyle { primary: true, ..Default::default() }).clicked();
+                        cancel_naming = button(ui, theme, None, "Cancel", ButtonStyle { bordered: true, ..Default::default() }).clicked();
+                    } else {
+                        close = button(ui, theme, None, "Done", ButtonStyle { bordered: true, ..Default::default() }).clicked();
+                    }
                 });
             });
         });
         if let Some(id) = clicked {
             self.toggle(ctx, id);
         }
+        if cancel_naming {
+            self.naming = None;
+            self.error = None;
+        }
         // Enter in the name field, after the field took this frame's text
-        if self.enter.take(egui_ctx) && self.naming.is_some() {
+        if (self.enter.take(egui_ctx) || create) && self.naming.is_some() {
             self.create(ctx);
         }
         if close { OverlayOutcome::Close } else { OverlayOutcome::Keep }

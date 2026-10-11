@@ -1033,6 +1033,7 @@ impl Screen for HomeScreen {
         self.build_rails(ctx);
         let pointer_moved = ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO);
         let mut clicked: Option<(usize, usize, bool)> = None;
+        let mut menu: Option<(usize, usize)> = None;
         let scroll = std::mem::take(&mut self.scroll_to_cursor);
         let rails = std::mem::take(&mut self.rails);
         let playing_vod = self.playing.get(ctx);
@@ -1055,6 +1056,8 @@ impl Screen for HomeScreen {
                                 }
                                 if resp.double_clicked() {
                                     clicked = Some((ri, ci, true));
+                                } else if resp.secondary_clicked() {
+                                    menu = Some((ri, ci));
                                 } else if resp.clicked() || (pointer_moved && resp.hovered() && !is_cursor) {
                                     clicked = Some((ri, ci, false));
                                 }
@@ -1077,6 +1080,14 @@ impl Screen for HomeScreen {
             if activate {
                 self.activate(ctx, false);
             }
+        }
+        // right-click: the tile's menu, as the menu key opens it
+        if let Some((ri, ci)) = menu {
+            self.rail = ri;
+            if let Some(c) = self.cols.get_mut(ri) {
+                c.2 = ci;
+            }
+            self.on_action(ctx, Action::ContextMenu);
         }
         if ctx.now_next.pending() || ctx.budget.deferred() {
             ui.ctx().request_repaint();
@@ -1913,6 +1924,15 @@ mod tests {
             matches!(nav.as_slice(), [NavRequest::Open(OverlayRequest::ContextMenu(m))] if m.items.iter().any(|i| i.action == Action::Remove)),
             "{nav:?}"
         );
+        // a right-click on the tile opens that same menu
+        h.state_mut().s.rail = 0;
+        h.run_steps(1);
+        // (the movie is in later rails too; the favourites rail is the first that has it)
+        let tile = h.query_all_by_label("Movie 1").min_by(|a, b| a.rect().top().total_cmp(&b.rect().top())).expect("the tile");
+        tile.click_secondary();
+        h.run_steps(1);
+        assert_eq!(h.state_mut().nav(), nav, "right-click = the menu key");
+        assert_eq!(h.state().s.rails[h.state().s.rail].kind, RailKind::Favourites, "on the clicked tile");
         h.state_mut().act(Action::Remove);
         let movie1 = ItemRef { source: src, kind: ItemKind::Movie, key: ItemKey("m3u:movie0000000001".into()) };
         until(&mut h, "removed from the list", |h| {

@@ -18,9 +18,10 @@
 //!   grid to Custom order first (DESIGN §13.0); the cursor follows the title.
 //! * Only the focused pane shows the cursor; the other shows its current row "selected".
 //! * Wide: categories | grid. Medium (a tiled half): the categories are a drawer (← on the
-//!   first column, Backspace, or the header button) so the grid keeps 4–5 columns; Esc
-//!   closes the drawer. Compact: one pane at a time (categories → grid; Esc in the grid goes
-//!   back to the categories).
+//!   first column, Backspace, or the "{category} ▾" header button) so the grid keeps 4–5
+//!   columns; Esc closes the drawer. Compact: one pane at a time (categories → grid; Esc or
+//!   the header button in the grid go back to the categories). Below Wide one click on a
+//!   category opens it (the drawer closes / the grid shows).
 //! * Progress bars and Continue watching come from one background read of the unfinished
 //!   progress rows, refreshed on `DataScope::Progress`.
 
@@ -35,7 +36,7 @@ use crate::model::{GroupId, ItemKey, ItemKind, SortMode, SourceId, VodKind, VodS
 use crate::msg::{AppEvent, DataScope};
 use crate::theme::{SpaceToken, TypeToken};
 use crate::ui::overlays::{ContextMenuSpec, MenuItem, OverlayResult};
-use crate::ui::widgets::button::{ButtonStyle, button, icon_button};
+use crate::ui::widgets::button::{ButtonStyle, LABEL_MAX_CHARS, button, icon_button, short_label};
 use crate::ui::widgets::list::{ListOutcome, ListState, virtual_list};
 use crate::ui::widgets::poster::{self, GridState, TileDecor};
 use crate::ui::widgets::text_field::search_header;
@@ -201,6 +202,9 @@ pub(super) struct VodBrowser {
     /// The categories the filter shows whose names have the words typed: what "Hide these N
     /// categories" hides.
     matching: Vec<GroupId>,
+    /// When a click on a category last opened it below Wide (egui time): the grid then takes
+    /// its place under the pointer.
+    cat_clicked_at: Option<f64>,
 }
 
 /// One playlist's titles in the custom order the user arranged with Alt+↑/↓ (the whole
@@ -1022,16 +1026,19 @@ impl VodBrowser {
         let virtual_names = [self.virtual_name(Cat::All), self.virtual_name(Cat::Continue), self.virtual_name(Cat::Favourites)];
         let total = self.all(ctx).len();
         let footer = self.marks.footer(self.cats.filter.query(), self.matching.len());
+        let hide_n = self.marks.hide_count(self.matching.len());
         let (marks, tags, movies, cats) = (&self.marks, &self.tags.1, self.movies, &mut self.cats);
-        let outcome = group_marks::with_footer(ui, theme, footer.as_deref(), |ui| {
+        let mut clicked = None;
+        let (outcome, footer_click) = group_marks::with_footer(ui, theme, footer.as_deref(), Some(hide_n), |ui| {
             virtual_list(ui, theme, ("vod-cats", movies), cats, row_h, |ui, rc| {
+                let index = rc.index;
                 let cat = rows_snapshot[rc.index];
                 let state = RowState::from_flags(focused && rc.state.is_cursor(), cat == open);
                 let group = match cat {
                     Cat::Group(g) => groups.get(&g).copied(),
                     _ => None,
                 };
-                match group {
+                let r = match group {
                     Some(g) => rows::group_row_decor(
                         ui,
                         theme,
@@ -1070,9 +1077,29 @@ impl VodBrowser {
                         }
                         r
                     }
+                };
+                if r.clicked() {
+                    clicked = Some(index);
                 }
+                r
             })
         });
+        // the footer's Hide N / Clear: its keys, on this pane
+        if let Some(hide) = footer_click {
+            self.pane = Pane::Categories;
+            let a = self.marks.footer_action(hide);
+            self.action(ctx, a);
+            return;
+        }
+        // a tiled half or narrower: a click on a category opens it and shows its titles (the
+        // drawer closes, Compact turns to the grid); in Wide both panes show anyway
+        if ctx.layout != LayoutClass::Wide
+            && let Some(c) = clicked.and_then(|i| self.cat_rows.get(i).copied())
+        {
+            self.cat_clicked_at = Some(ui.input(|i| i.time));
+            self.open_cat(ctx, c, true);
+            return;
+        }
         match outcome {
             ListOutcome::Moved => {
                 self.pane = Pane::Categories;
@@ -1099,7 +1126,8 @@ impl VodBrowser {
         let theme = ctx.theme;
         let name = self.cat_name(ctx, self.open);
         let sort = self.sort(ctx);
-        let drawer = ctx.layout == LayoutClass::Medium;
+        // a tiled half (drawer) or Compact (one pane): the way to the categories
+        let breadcrumb = ctx.layout != LayoutClass::Wide;
         let mut sort_clicked = false;
         let mut drawer_clicked = false;
         let mut header_clicked = false;
@@ -1115,23 +1143,22 @@ impl VodBrowser {
                 }
                 .clicked();
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    if drawer {
-                        // Medium: the categories drawer (also ← on the first column / Backspace)
-                        drawer_clicked = icon_button(
-                            ui,
-                            theme,
-                            glyphs::FILMSTRIP,
-                            "Categories",
-                            ButtonStyle { selected: self.pane == Pane::Categories, ..Default::default() },
-                        )
-                        .clicked();
+                    if breadcrumb {
+                        // the categories drawer / pane (also ← on the first column / Backspace),
+                        // named like Live's "{group} ▾"; a long name is shortened on screen
+                        let full = format!("{name} ▾");
+                        let shown = format!("{} ▾", short_label(&name, LABEL_MAX_CHARS));
+                        let r = button(ui, theme, None, &shown, ButtonStyle { selected: self.pane == Pane::Categories, ..Default::default() });
+                        r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &full));
+                        drawer_clicked = r.on_hover_text("Categories").clicked();
                     }
                     // the sort key, like the hint line of a list would say it (Home's rails share
                     // that hint line and have no sort, so it lives here)
                     let sort_key =
                         super::live::shortcut(KeyContext::PosterGrid, Action::SortMenu).map(|k| format!(" · {k} sort")).unwrap_or_default();
-                    header_clicked =
-                        search_header(ui, theme, self.grid.filter.query(), &format!("{name} — type to filter{sort_key}"), None).clicked();
+                    // the button already names the category
+                    let placeholder = if breadcrumb { format!("Type to filter{sort_key}") } else { format!("{name} — type to filter{sort_key}") };
+                    header_clicked = search_header(ui, theme, self.grid.filter.query(), &placeholder, None).clicked();
                 });
             });
         });
@@ -1193,6 +1220,12 @@ impl VodBrowser {
             playing: playing == Some(v.kind),
             ..Default::default()
         });
+        // the second click of the double-click that opened the category lands on a poster
+        // that just appeared under the pointer: it doesn't open that title
+        let outcome = match outcome {
+            ListOutcome::Moved | ListOutcome::Activated(_) if crate::ui::widgets::second_click_after(ui, self.cat_clicked_at) => ListOutcome::None,
+            o => o,
+        };
         match outcome {
             ListOutcome::Moved => self.pane = Pane::Grid,
             ListOutcome::Activated(_) => {
@@ -1555,7 +1588,7 @@ mod tests {
             h.run_steps(3);
             let n = h.state().s.browser.grid.columns;
             assert!(cols.contains(&n), "{window} pt × {scale}: {n} columns");
-            let header = h.query_all_by_label_contains("type to filter").next().expect("the filter header").rect();
+            let header = h.query_all_by_label_contains("to filter").next().expect("the filter header").rect();
             let sort = h.query_all_by_label_contains("Sort: ").next().expect("the sort button").rect();
             assert!(!header.intersects(sort.shrink(1.0)), "{window} pt × {scale}: header {header:?} under the sort button {sort:?}");
             assert!(sort.right() <= content + 1.0);
@@ -1639,6 +1672,52 @@ mod tests {
         assert!(h.state_mut().act(Action::Back));
         assert_eq!(h.state().s.key_contexts(), vec![KeyContext::List]);
         assert!(!h.state_mut().act(Action::Back), "the app's Back leaves the screen");
+    }
+
+    /// Below Wide, the "{category} ▾" button leads to the categories and one click on a category
+    /// opens it with its titles: Compact turns to the grid, the Medium drawer closes.
+    #[test]
+    fn categories_open_with_one_click_below_wide() {
+        let (mut t, one) = rig();
+        two_categories(&mut t);
+        t.layout = LayoutClass::Compact;
+        let mut h = harness(t, one, MoviesScreen::default(), egui::vec2(420.0, 800.0));
+        h.state_mut().enter(Route::Movies { group: None });
+        h.run_steps(2);
+        h.get_by_label("All movies ▾").click();
+        h.run_steps(2);
+        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::List], "the categories pane");
+        h.get_by_label("Drama").click();
+        h.run_steps(2);
+        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::PosterGrid], "one click: the grid");
+        assert!(has_label(&h, "Movie 1") && !has_label(&h, "Movie 4"), "of Drama");
+        // a double-click (the old way to open one): its second click lands on a poster that
+        // just appeared under the pointer, and opens nothing
+        h.get_by_label("Drama ▾").click();
+        // (long enough for that click not to make the next two a triple-click)
+        h.run_steps(40);
+        let row = h.get_by_label("Drama").rect();
+        let at = egui::pos2(row.left() + row.width() / 4.0, row.center().y);
+        h.state_mut().nav();
+        h.hover_at(at);
+        for _ in 0..2 {
+            for pressed in [true, false] {
+                h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE });
+            }
+            // frames between the clicks (the grid shows under the pointer), within the
+            // double-click time
+            h.run_steps(2);
+        }
+        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::PosterGrid], "the grid");
+        assert!(h.state_mut().nav().is_empty(), "no title opened");
+        h.state_mut().t.layout = LayoutClass::Medium;
+        h.run_steps(2);
+        h.get_by_label("Drama ▾").click();
+        h.run_steps(2);
+        assert!(has_label(&h, "All movies"), "the drawer");
+        h.get_by_label("All movies").click();
+        h.run_steps(2);
+        assert!(!has_label(&h, "All movies") && has_label(&h, "Movie 4"), "the drawer closed on All movies");
     }
 
     /// DESIGN §13.12: skeleton posters while the first library loads; a category whose every

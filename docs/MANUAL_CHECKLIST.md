@@ -752,3 +752,91 @@ Use a provider with decorated names (e.g. "UK: ITV 4 4K ◉", "US ★ HGTV HD", 
   "UK ❖ …", "ALB ★ …" categories under their countries (United States, United Kingdom, Albania).
 - [ ] **Filter typing:** in a type-to-filter list and in Search (`/`), type a word, AltGr+Space
   (no-break space) and another word, then Ctrl+Backspace twice: words go one at a time, no crash.
+
+## 17. Mouse only (every screen)
+
+Use the keyboard only to type text (and where an item says so). Use a mouse with back / forward
+side buttons, at
+**Wide**, **Tiled** and a **Compact** window (≈ 420 pt wide, e.g. a narrow float), text 12.
+
+- [ ] **Side buttons walk the Esc ladder:**
+  - **Do:** in Live TV click the channel filter and type a few letters, then press the mouse
+    **back** button; press it again. Repeat in Movies (grid filter),
+    with Help open (F1), in the player with the controls focused (Tab, then
+    the mouse back button), and popped out. Press the **forward** button anywhere.
+  - **Expect:** each back press does exactly what Esc does there: clears the filter first, then
+    leaves the screen; closes Help; leaves the controls (banner stays), then hides the banner,
+    then leaves the player; popped out, puts the window back. Forward does nothing.
+- [ ] **Back buttons on every page:**
+  - **Do:** open a movie from Home, a series from Search, a channel's EPG mapping from Settings ▸
+    EPG, Logs from Settings, Settings ▸ Hidden items from Movies' empty state, the guide from Home
+    (Ctrl+G on a tile, then put the keyboard away), and at Compact a Settings page, an EPG
+    candidates pane and a Live group. Click each `‹ Back to …` button; click the lit sidebar tab
+    on a movie page.
+  - **Expect:** every page Esc can leave has the button, labelled with where it goes, and it goes
+    exactly where Esc would (the movie page → Home, not Movies). A long category name is cut with
+    "…". At Compact, `‹ Settings` above a page shows the page list; clicking a page opens it.
+    In a Settings source editor, `‹ Playlists` closes it; a text field being edited keeps what
+    was typed.
+- [ ] **Dialogs close by mouse, edits are safe:**
+  - **Do:** open Help, Jobs, Search, Resume (a half-watched movie), the tracks panel (click the
+    Audio control in the player): close each with its ✕, then reopen and click outside. Open
+    Rename (a favourites list) and Edit information (right-click a channel → Edit information):
+    click outside untouched; then type a letter and click outside.
+  - **Expect:** ✕ and an outside click close them. Untouched Rename / Edit information close; after
+    typing, the outside click only flashes the card border (tooltip "Unsaved changes — Cancel or
+    Esc to discard"), and Cancel or Esc closes.
+- [ ] **Right-click everywhere:**
+  - **Do:** right-click a channel row, a group, a poster, a Home tile, a guide cell, a guide
+    channel, an episode, a detail page's header, a search hit, a Logs row, an EPG mapping channel,
+    the player's video.
+  - **Expect:** each opens the same menu as Shift+F10 there, hanging from the pointer (kept on the
+    window at the right edge). A search hit's menu starts with "Play now", and choosing an item
+    acts on that hit. The player menu lists Channels…, Now / next…, History… (live) through Stop
+    and close.
+- [ ] **Hover, pointer, double-click:**
+  - **Do:** hover buttons, rows, posters, toggles, the sidebar; hover the Settings page list while
+    a page has the keyboard cursor; move the mouse over onboarding's choices (Settings ▸
+    Playlists ▸ Add). At Tiled and Compact, double-click a Movies category; at Compact,
+    double-click a Settings page name.
+  - **Expect:** a pointing hand over everything clickable, never over plain text or the scrim.
+    Never two rows lit as the cursor at once. The double-click opens the category / page and
+    nothing else (no movie page, no toggled setting).
+- [ ] **Jobs, toasts, bulk hide, tracks:**
+  - **Do:** start a playlist refresh, open Jobs, click a running task's ✕. Hover a toast and click
+    its ✕. Mark two groups (right-click → Mark for hiding) and use the footer's `[Hide 2]` and
+    `[Clear]`. In the tracks panel click AUDIO / SUBTITLES, the ‹ › around Delay and Size, and the
+    value.
+  - **Expect:** the task stops; the toast goes; the footer buttons do what their keys do. The
+    open tab is underlined; ‹ › step the value (never backwards), a click on the value resets it.
+- [ ] **Volume slider (full player):**
+  - **Do:** at Wide play a channel; move the mouse to show the controls. Click the speaker; click
+    the slider's middle; drag it; scroll over it one notch at a time; scroll over the speaker;
+    mute, then click the knob. Repeat at Tiled (790 pt) and in a window under 700 pt.
+  - **Expect:** Wide: speaker · slider (mark at 100 %) · "80 %" at the right end of the controls;
+    the speaker glyph follows the level; click mutes ("Muted", greyed fill) and its tooltip says
+    Mute / Unmute (m); click sets, drag scrubs smoothly (no jump back), one notch = ±5 exactly
+    (also over the speaker — never ±10); clicking while muted unmutes. Tiled: a shorter slider,
+    controls drop to glyphs before the volume shrinks. Under 700 pt: the speaker alone (wheel over
+    it steps), the level in the top bar, previous / next still in the row.
+- [ ] **Player by mouse:**
+  - **Do:** click Play / pause, then press ↑. Click the top-left ←. Open Channels from the row,
+    click two channels, click its ✕; open it again and click the video beside it. Rest the
+    pointer on the bottom bar without moving it for 15 s. Stop the stream's network (or use a
+    dead channel) and use Retry / Last channel. Let an episode end and click Play now / Cancel.
+    Stop playback and click anywhere on "Nothing is playing".
+  - **Expect:** the click pauses and ↑ still zaps (no controls focus). ← leaves to the mini player.
+    The panel tunes each clicked channel and stays open; ✕ and the outside click close it. The
+    banner stays while the pointer moves on a bar, then times out about 10 s after it stops, and
+    the pointer hides over the video (never over a button). Retry reconnects; the next-episode
+    buttons show their keys ("Play now · Enter"). The idle screen's button reads "‹ Back to
+    Live TV" (or wherever it goes).
+- [ ] **Pop-out strip and mini player:**
+  - **Do:** pop the player out (Small 480 × 270 and Medium 640 × 360). Hover it; click each strip
+    button; drag the video; double-click it. Stop playback while popped out and use the card's
+    button. In the full window, click the mini player's pop-out button.
+  - **Expect:** with the pointer over it the strip shows previous / play / next (skips for VOD),
+    the speaker, a slider at Medium only, back to the full window and stop; at Small the title and
+    position keep readable room (previous / next drop out below 420 pt). A slider change flashes
+    the level. The drag moves the window; a click on a strip button acts without moving the window. The
+    mini player's button pops the player out.

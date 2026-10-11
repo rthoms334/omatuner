@@ -16,8 +16,10 @@ use eframe::egui;
 use crate::keymap::{Action, KeyContext};
 use crate::model::{Group, GroupId, GroupRef};
 use crate::msg::{DataScope, Toast};
-use crate::theme::{Theme, TypeToken};
+use crate::theme::{SpaceToken, Theme, TypeToken};
 use crate::ui::overlays::ConfirmSpec;
+use crate::ui::widgets::button::{ButtonStyle, button};
+use crate::ui::widgets::glyphs;
 use crate::ui::{OverlayRequest, UiCtx};
 
 /// Confirm tokens of "Hide these N groups" (other confirmations of the panes use other ranges).
@@ -203,18 +205,60 @@ impl GroupMarks {
             None
         }
     }
+
+    /// What the footer's buttons do, as the pane's keys: `hide` = Hide N (Ctrl+H on the marks,
+    /// else Ctrl+Shift+H on the filter), else Clear (Esc on the marks, else Ctrl+U).
+    pub(crate) fn footer_action(&self, hide: bool) -> Action {
+        match (self.marked.is_empty(), hide) {
+            (false, true) => Action::ToggleHidden,
+            (false, false) => Action::Back,
+            (true, true) => Action::HideShown,
+            (true, false) => Action::FilterClear,
+        }
+    }
+
+    /// How many groups the footer's Hide button hides (`matching` as for [`Self::footer`]).
+    pub(crate) fn hide_count(&self, matching: usize) -> usize {
+        if self.marked.is_empty() { matching } else { self.marked.len() }
+    }
 }
 
-/// Run `body` above a one-line footer at the bottom of `ui` (none: the whole area).
-pub(crate) fn with_footer<R>(ui: &mut egui::Ui, theme: &Theme, footer: Option<&str>, body: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    let Some(text) = footer else { return body(ui) };
+/// A click on a footer button: `Some(true)` = Hide, `Some(false)` = Clear.
+pub(crate) type FooterClick = Option<bool>;
+
+/// Run `body` above a one-line footer at the bottom of `ui` (none: the whole area). With
+/// `hide_n`, the footer also has `[Hide N]` and `[Clear]` buttons (the mouse twins of its keys).
+pub(crate) fn with_footer<R>(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    footer: Option<&str>,
+    hide_n: Option<usize>,
+    body: impl FnOnce(&mut egui::Ui) -> R,
+) -> (R, FooterClick) {
+    let Some(text) = footer else { return (body(ui), None) };
     let area = ui.available_rect_before_wrap();
-    let h = (theme.font(TypeToken::BodySmall) * 2.0).round();
+    let mut h = (theme.font(TypeToken::BodySmall) * 2.0).round();
+    if hide_n.is_some() {
+        h = h.max(theme.space(SpaceToken::ControlHeight) + theme.space(SpaceToken::Xs));
+    }
     let list = egui::Rect::from_min_max(area.min, egui::pos2(area.right(), (area.bottom() - h).max(area.top())));
     let r = ui.scope_builder(egui::UiBuilder::new().max_rect(list), body).inner;
     let line = egui::Rect::from_min_max(egui::pos2(area.left(), list.bottom()), area.max);
-    ui.scope_builder(egui::UiBuilder::new().max_rect(line).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
-        ui.add(egui::Label::new(egui::RichText::new(text).size(theme.font(TypeToken::BodySmall)).color(theme.tokens.text_secondary)).truncate());
+    let mut click = None;
+    ui.scope_builder(egui::UiBuilder::new().max_rect(line).layout(egui::Layout::right_to_left(egui::Align::Center)), |ui| {
+        if let Some(n) = hide_n {
+            ui.spacing_mut().item_spacing.x = theme.space(SpaceToken::Sm);
+            if button(ui, theme, None, "Clear", ButtonStyle::default()).clicked() {
+                click = Some(false);
+            }
+            if n > 0 && button(ui, theme, Some(glyphs::HIDDEN), &format!("Hide {n}"), ButtonStyle { bordered: true, ..Default::default() }).clicked()
+            {
+                click = Some(true);
+            }
+        }
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.add(egui::Label::new(egui::RichText::new(text).size(theme.font(TypeToken::BodySmall)).color(theme.tokens.text_secondary)).truncate());
+        });
     });
-    r
+    (r, click)
 }

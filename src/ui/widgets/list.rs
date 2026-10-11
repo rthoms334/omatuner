@@ -184,7 +184,7 @@ pub fn virtual_list(
                     let row_state = if index == state.cursor { RowState::Cursor } else { RowState::Idle };
                     let mut child =
                         ui.new_child(egui::UiBuilder::new().id_salt(index).max_rect(rect).layout(egui::Layout::top_down(egui::Align::Min)));
-                    let resp = row(&mut child, RowCtx { index, state: row_state });
+                    let resp = row(&mut child, RowCtx { index, state: row_state }).on_hover_cursor(egui::CursorIcon::PointingHand);
                     if resp.double_clicked() {
                         state.cursor = index;
                         outcome = ListOutcome::Activated(index);

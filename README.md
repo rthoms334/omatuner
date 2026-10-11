@@ -384,7 +384,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Alt+4` | Movies |
 | `Alt+5` | Series |
 | `Ctrl+Comma` / `Alt+0` | Settings |
-| `Alt+←` | Back (also the mouse back button) |
+| `Alt+←` | Back |
 | `F11` | Toggle window fullscreen |
 | `Ctrl+P` | Open the player (from the mini player) |
 | `Ctrl+Shift+P` | Play / pause |
@@ -758,6 +758,33 @@ The full reference is generated from `src/keymap.rs`:
 
 <!-- keymap:end -->
 
+## Mouse
+
+Everything the keys do can be done with the mouse too:
+
+- **Back:** the mouse's back (side) button is Esc — it clears a filter, closes a panel or
+  dialog, leaves the player's controls, and only then goes back a screen. The forward button
+  does nothing. Pages that Esc leaves have a **‹ Back to …** button at the top (movie and
+  series pages, Logs, EPG mapping, Settings opened from another screen, a guide opened from
+  Home or Search), and so do the one-pane views of a narrow window (`‹ Settings`,
+  `‹ Channels`). Clicking the lit tab in the sidebar goes back to that tab.
+- **Right-click** opens the same menu as the menu key (Shift+F10), at the pointer: on channels,
+  groups, posters, Home tiles, guide cells, episodes, search results, the player's video.
+  Detail pages also have a `⋯` button for it.
+- **Dialogs** close with their ✕ or a click outside — except one with an unsaved edit (a typed
+  name, changed fields or ticks), which stays open until you Save, Cancel or press Esc.
+- **Player:** the ← at the top left leaves the player (it keeps playing in the mini player).
+  The bottom bar ends with the volume: click the speaker to mute, click or drag the slider
+  (0–130 %, a mark at 100 %), or scroll over it (±5). Scrolling anywhere over the video also
+  sets the volume. A click on a control just does it — the arrow keys keep zapping. Side panels
+  have a ✕ and tune on one click; a failed stream has Retry / Last channel buttons; the
+  next-episode card has Play now / Cancel. Double-click toggles fullscreen.
+- **Pop-out:** hover the small window for previous / play / next, the volume, back to the full
+  window and stop; drag the video to move it; double-click to put it back. The corner mini
+  player has a pop-out button next to its ✕.
+- **Movies and series:** below full width, the "{category} ▾" button opens the categories and
+  one click on a category opens it.
+
 ## Command line
 
 ```text
@@ -858,7 +885,9 @@ play-pause` and Omarchy's media keys and bar widget work, also while the window 
 Press `o` in the player, or Ctrl+Shift+O anywhere, to pop the player out: Tuner floats its
 window, makes it small (16:9), puts it in a corner and **pins** it, so it stays on screen on
 every workspace you switch to. The window then shows only the video. Moving the mouse over it,
-or pressing a key, shows a short strip with the channel, what's on and the volume. All player
+or pressing a key, shows a short strip with the channel, what's on and the volume (with the
+pointer over the window, buttons for previous / play / next, the volume, back to the full
+window and stop; drag the video to move the window). All player
 keys keep working: ↑/↓ zap, Space pauses, `m` mutes, `+`/`-` set the volume, `c` lists the
 channels. Press Esc or `o`, or double-click the video, to put the window back where it was
 (tiled, on the workspace you are on now); `f` puts it back and goes fullscreen, `p` puts it

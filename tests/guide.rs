@@ -33,7 +33,7 @@ use tuner::ui::epg_grid::{self, EpgGridState, GridMetrics, GridOutcome, GuideRow
 use tuner::ui::overlays::{self, Overlay, OverlayOutcome};
 use tuner::ui::screens::{guide::GuideScreen, live::LiveScreen, player::PlayerScreen};
 use tuner::ui::testing::TestUi;
-use tuner::ui::video_host::VideoHost;
+use tuner::ui::video_host::{MiniAction, VideoHost};
 use tuner::ui::{LayoutClass, NavRequest, OverlayRequest, Route, Screen};
 
 // ====================================================================== helpers
@@ -1834,7 +1834,7 @@ fn mini_player_sits_bottom_right_and_toasts_avoid_it() {
         theme: Theme,
         snap: Arc<PlayerSnapshot>,
         toasts: tuner::ui::widgets::toast::Toasts,
-        result: Vec<Option<bool>>,
+        result: Vec<Option<MiniAction>>,
         /// The app draws the mini-player (nothing else placed the video).
         mini: bool,
     }
@@ -1860,11 +1860,15 @@ fn mini_player_sits_bottom_right_and_toasts_avoid_it() {
     assert_eq!(h.state().host.placement(), tuner::ui::video_host::Placement::None, "the mini player isn't a placement (it would blink)");
     let toast = h.get_by_label("Reminder set").rect();
     assert!(toast.bottom() <= mini.top(), "toast {toast:?} above the mini player {mini:?}");
-    // ✕ stops, a click on the video opens the player
+    // ✕ stops, the pop-out button pops out, a click on the video opens the player
     h.get_by_label("Stop playback").click();
     h.step();
     h.step();
-    assert!(h.state().result.contains(&Some(false)));
+    assert!(h.state().result.contains(&Some(MiniAction::Stop)));
+    h.get_by_label("Pop out").click();
+    h.step();
+    h.step();
+    assert!(h.state().result.contains(&Some(MiniAction::PopOut)));
     let video = egui::pos2(mini.center().x, mini.top() + mini.height() * 0.3);
     h.input_mut().events.push(egui::Event::PointerMoved(video));
     h.step();
@@ -1877,7 +1881,7 @@ fn mini_player_sits_bottom_right_and_toasts_avoid_it() {
         });
         h.step();
     }
-    assert!(h.state().result.contains(&Some(true)), "a click on the video opens the player");
+    assert!(h.state().result.contains(&Some(MiniAction::Open)), "a click on the video opens the player");
     // a frame without the mini-player (a screen placed the video, Compact…): its rect goes
     h.state_mut().mini = false;
     h.step();
@@ -2023,12 +2027,27 @@ fn tracks_overlay_selects_tracks_and_adjusts_subtitles() {
     assert!(matches!(t.with_ctx(|ctx| o.on_action(ctx, Action::Right)), OverlayOutcome::Keep));
     player_until(&t, "sub scale 1.1", |s| (s.sub_scale - 1.1).abs() < 1e-6);
     // drawn over the video in OSD colours; Esc closes
+    let player = t.services().player.handle();
     let mut h = Harness::builder().with_size(egui::vec2(1280.0, 720.0)).build_ui(|ui| {
         let egui_ctx = ui.ctx().clone();
         let _ = t.with_ctx(|ctx| o.ui(&egui_ctx, ctx));
     });
     h.step();
     assert!(has(&h, "Off") && has(&h, "Delay  ‹ +0.0 s ›"));
+    // the mouse: the › and ‹ buttons step the size up and down (whichever part of them is hit)
+    let scale = |want: f64| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while (player.snapshot().sub_scale - want).abs() > 1e-6 {
+            assert!(Instant::now() < deadline, "sub scale {want}: {}", player.snapshot().sub_scale);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    h.get_by_label("Size: Larger (→)").click();
+    h.step();
+    scale(1.2);
+    h.get_by_label("Size: Smaller (←)").click();
+    h.step();
+    scale(1.1);
     drop(h);
     let mut o = t.with_ctx(|ctx| overlays::build(OverlayRequest::Tracks { audio: false }, ctx));
     assert!(matches!(t.with_ctx(|ctx| o.on_action(ctx, Action::Back)), OverlayOutcome::Close));

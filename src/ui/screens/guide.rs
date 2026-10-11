@@ -30,10 +30,10 @@ use crate::ui::epg_grid::{self, EpgGridState, GridMetrics, GridOutcome, GuideRow
 use crate::ui::overlays::{ContextMenuSpec, MenuItem, OverlayResult};
 use crate::ui::screens::live::{self, GuideStatus, NoGuide, choice_action, choice_index, playing_channel};
 use crate::ui::video_host::Placement;
-use crate::ui::widgets::button::{ButtonStyle, button, icon_button};
+use crate::ui::widgets::button::{ButtonStyle, back_button, button, icon_button};
 use crate::ui::widgets::rows::grouped;
 use crate::ui::widgets::{empty_state::empty_state, glyphs, section};
-use crate::ui::{LayoutClass, OverlayRequest, Route, Screen, ScreenId, SettingsPage, UiCtx};
+use crate::ui::{LayoutClass, NavRequest, OverlayRequest, Route, Screen, ScreenId, SettingsPage, UiCtx};
 
 /// Numeric entry auto-commits after this long without a digit.
 const NUMERIC_COMMIT: Duration = Duration::from_millis(1500);
@@ -187,6 +187,8 @@ impl GuideScreen {
     fn handle_outcome(&mut self, ctx: &mut UiCtx<'_>, out: GridOutcome) {
         match out {
             GridOutcome::None => {}
+            // right-click: the focused channel's menu, as the menu key opens it
+            GridOutcome::Menu => self.channel_menu(ctx),
             GridOutcome::FocusChanged => {
                 self.rest = self.grid.as_ref().and_then(|g| g.focused()).map(|(c, _)| (c, Instant::now()));
             }
@@ -336,8 +338,14 @@ impl GuideScreen {
         let name = self.collection.as_ref().map(|c| Self::collection_name(ctx, c)).unwrap_or_default();
         let view_start = self.grid.as_ref().map_or(ctx.now, |g| g.view_start);
         let compact = ctx.layout == LayoutClass::Compact;
+        let mut back = false;
+        let back_to = ctx.back;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = theme.space(SpaceToken::Md);
+            // pushed (Ctrl+G from Home / Search…): the way back to that screen
+            if let Some(b) = back_to {
+                back = back_button(ui, theme, b.label).clicked();
+            }
             if !compact {
                 section::section_header(ui, theme, "TV guide");
             }
@@ -363,6 +371,9 @@ impl GuideScreen {
                 ui.add(egui::Label::new(RichText::new(text).size(theme.font(TypeToken::BodySmall)).color(color)).truncate());
             });
         });
+        if back {
+            ctx.navigate(NavRequest::Back);
+        }
         act
     }
 

@@ -48,7 +48,7 @@ use crate::theme::{SpaceToken, Theme, TypeToken};
 use crate::ui::overlays::categories::{self, tag_name};
 use crate::ui::overlays::{ConfirmSpec, ContextMenuSpec, MenuItem, OverlayResult, RenameSpec, RenameTarget};
 use crate::ui::parental::{hash_pin, new_salt};
-use crate::ui::widgets::button::{ButtonStyle, icon_button};
+use crate::ui::widgets::button::{ButtonStyle, back_button, icon_button};
 use crate::ui::widgets::list::paint_row_state;
 use crate::ui::widgets::rows::grouped;
 use crate::ui::widgets::text_field::text_field;
@@ -655,6 +655,9 @@ enum Pane {
 pub struct SettingsScreen {
     page: SettingsPage,
     pane: Pane,
+    /// When a click on the page list last opened a page (egui time): at Compact the page
+    /// replaces the list, and the second click of a double-click mustn't act on its rows.
+    page_clicked_at: Option<f64>,
     /// Focused row (index into the page's rows; only focusable rows are chosen).
     row: usize,
     editing: bool,
@@ -2526,13 +2529,21 @@ impl SettingsScreen {
 
     fn pages_ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) {
         let theme = ctx.theme;
+        // pushed over another screen (Movies ▸ Hidden…): the way back to it
+        if ctx.back.is_some() {
+            section::page_header(ui, ctx, "", |_| {});
+            ui.add_space(theme.space(SpaceToken::Sm));
+        }
         section::section_header(ui, theme, "Settings");
         ui.add_space(theme.space(SpaceToken::Md));
         let mut clicked = None;
         egui::ScrollArea::vertical().id_salt("settings-pages-scroll").auto_shrink([false, false]).show(ui, |ui| {
             for (page, icon, label) in PAGES {
                 let selected = page == self.page;
+                // hover lights a page only while the keyboard cursor is in the content (one
+                // cursor at a time; moving it here would switch the page under the pointer)
                 let state = RowState::from_flags(selected && self.pane == Pane::Pages, selected);
+                let state = if self.pane == Pane::Pages { state } else { rows::with_hover(ui, theme, false, state) };
                 if rows::menu_row(ui, theme, Some(icon), label, None, false, state).clicked() {
                     clicked = Some(page);
                 }
@@ -2541,6 +2552,7 @@ impl SettingsScreen {
         if let Some(p) = clicked {
             self.set_page(ctx, p);
             self.pane = Pane::Content;
+            self.page_clicked_at = Some(ui.input(|i| i.time));
         }
     }
 
@@ -2561,6 +2573,28 @@ impl SettingsScreen {
         let mut drag_started = None;
         let mut drag_released = false;
         let mut item_rects: Vec<(usize, egui::Rect)> = Vec::new();
+        // the way out of a sub-view (Esc): the source editor or attach view to their page, and
+        // in Compact (one pane at a time) the page to the page list
+        let page_label = PAGES.iter().find(|p| p.0 == self.page).map_or("Settings", |p| p.2);
+        let back_to = if self.attach.is_some() || self.editor.is_some() {
+            Some(page_label)
+        } else if ctx.layout == LayoutClass::Compact {
+            Some("Settings")
+        } else {
+            None
+        };
+        if let Some(label) = back_to {
+            if back_button(ui, theme, label).clicked() {
+                // exactly what Esc does from the page: a field being edited is left first
+                // (keeping what was typed), then the sub-view / the page
+                self.pane = Pane::Content;
+                if self.editing {
+                    self.on_action(ctx, Action::Back);
+                }
+                self.on_action(ctx, Action::Back);
+            }
+            ui.add_space(theme.space(SpaceToken::Xs));
+        }
         egui::ScrollArea::vertical().id_salt(("settings-content-scroll", self.page as u8)).auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = theme.space(SpaceToken::Xxs);
             for (i, row) in rows.iter().enumerate() {
@@ -2709,7 +2743,17 @@ impl SettingsScreen {
                             item_rects.push((i, rect));
                         }
                         let c = color.map(|c| theme.source_color(c)).unwrap_or(t.text_secondary);
-                        inner.label(RichText::new(icon).size(theme.font(TypeToken::IconLarge)).color(c));
+                        if let Item::HiddenTag(..) = item {
+                            // the chevron lists / hides the tag's categories (→ / ←); the row
+                            // itself shows them all (Enter)
+                            let open = icon == glyphs::CHEVRON_DOWN;
+                            let tip = if open { "Hide the list (←)" } else { "List them (→)" };
+                            if icon_button(&mut inner, theme, icon, tip, ButtonStyle::default()).clicked() {
+                                clicked = Some((i, if open { -1 } else { 1 }));
+                            }
+                        } else {
+                            inner.label(RichText::new(icon).size(theme.font(TypeToken::IconLarge)).color(c));
+                        }
                         let more = matches!(item, Item::Source(_) | Item::Epg(_) | Item::List(_) | Item::Orphan(_) | Item::Reminder(_));
                         // the button is laid out first so long names and errors end before it
                         inner.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2767,6 +2811,10 @@ impl SettingsScreen {
         }
         if let Some(i) = hovered.filter(|_| !self.editing) {
             self.row = i;
+        }
+        if crate::ui::widgets::second_click_after(ui, self.page_clicked_at) {
+            text_clicked = None;
+            clicked = None;
         }
         if let Some(i) = text_clicked {
             self.pane = Pane::Content;
@@ -3382,6 +3430,50 @@ mod tests {
         let c = h.state().t.config.clone();
         assert!(c.player.sub_langs.iter().any(|l| l == "de"), "{:?}", c.player.sub_langs);
         assert!(!c.player.user_agent.contains("de"), "{}", c.player.user_agent);
+    }
+
+    /// Compact shows one pane at a time: `‹ Settings` above a page leads back to the page list
+    /// (the mouse twin of Esc there), and a page from the list opens it again.
+    #[test]
+    fn compact_pages_are_reached_by_the_back_button() {
+        let (mut t, one) = rig();
+        t.layout = LayoutClass::Compact;
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(420.0, 900.0));
+        h.state_mut().enter(Route::Settings(SettingsPage::Player));
+        h.run_steps(2);
+        assert!(has_label(&h, "Hardware decoding") && !has_label(&h, "Hidden items"), "the page, alone");
+        // left mid-edit, like Esc: what was typed is kept
+        focus(&mut h, "Subtitle languages");
+        h.state_mut().act(Action::Activate);
+        h.run_steps(2);
+        type_text(&mut h, ", de");
+        h.get_by_label("Back to Settings").click();
+        h.run_steps(2);
+        assert!(has_label(&h, "Hidden items") && !has_label(&h, "Hardware decoding"), "the page list");
+        h.state_mut().apply_config();
+        assert!(h.state().t.config.player.sub_langs.iter().any(|l| l == "de"), "{:?}", h.state().t.config.player.sub_langs);
+        h.get_by_label("Interface").click();
+        h.run_steps(2);
+        assert_eq!(h.state().s.page, SettingsPage::Interface);
+        assert!(has_label(&h, "Back to Settings"));
+    }
+
+    /// A sub-view's `‹ {page}` button closes it like Esc: the source editor goes, the page's
+    /// rows are back.
+    #[test]
+    fn the_source_editor_back_button_closes_it_like_esc() {
+        let (mut t, one) = rig();
+        seed(&mut t, |c| testkit::source(c, "Alpha").map(|_| ()));
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 1000.0));
+        h.state_mut().enter(Route::Settings(SettingsPage::Playlists));
+        until(&mut h, "the source", |h| has_label(h, "Alpha"));
+        focus(&mut h, "Alpha");
+        h.state_mut().act(Action::Activate);
+        h.run_steps(2);
+        assert!(has_label(&h, "EDIT ALPHA"));
+        h.get_by_label("Back to Playlists").click();
+        h.run_steps(2);
+        assert!(!has_label(&h, "EDIT ALPHA") && has_label(&h, "Alpha"), "the editor closed");
     }
 
     /// ←/→ on a guide's offset shows at once but is saved (and the guide re-imported) once the

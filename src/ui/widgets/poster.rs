@@ -240,6 +240,7 @@ pub(crate) fn poster_tile(
     let t = &theme.tokens;
     let width = width.max(40.0);
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, card_height(theme, width)), egui::Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &*item.name));
     if !ui.is_rect_visible(rect) {
         return resp;

@@ -26,6 +26,7 @@ use crate::msg::{AppEvent, DataScope};
 use crate::sources::epg_match::{EpgCandidateIndex, build_index, suggest};
 use crate::theme::{SpaceToken, TypeToken};
 use crate::ui::overlays::{ContextMenuSpec, MenuItem, OverlayResult};
+use crate::ui::widgets::button::{ButtonStyle, back_button, button};
 use crate::ui::widgets::list::{ListOutcome, ListState, virtual_list};
 use crate::ui::widgets::text_field::search_header;
 use crate::ui::widgets::{RowState, empty_state, glyphs, rows, section};
@@ -503,6 +504,15 @@ impl Screen for EpgMappingScreen {
         self.pump_mappings(ctx);
         let theme = ctx.theme;
         let t = &theme.tokens;
+        let full_page = !(ctx.lib.built_at != 0 && ctx.lib.live.channels.is_empty()) && !self.catalog.as_ref().is_some_and(|c| c.entries.is_empty());
+        // the way back shows on the empty states too; the view menu only with channels to view
+        let mut mode_menu = false;
+        let mode = self.mode.label();
+        section::page_header(ui, ctx, "EPG mapping", |ui| {
+            if full_page {
+                mode_menu = button(ui, theme, None, &format!("{mode} ▾"), ButtonStyle::default()).on_hover_text("Show channels (Ctrl+S)").clicked();
+            }
+        });
         if ctx.lib.built_at != 0 && ctx.lib.live.channels.is_empty() {
             empty_state::empty_state(ui, theme, glyphs::GUIDE, "No channels to map", Some("Add a playlist first."), None);
             return;
@@ -523,6 +533,10 @@ impl Screen for EpgMappingScreen {
             return;
         }
         let compact = ctx.layout == LayoutClass::Compact;
+        if mode_menu {
+            self.mode_menu(ctx);
+        }
+        ui.add_space(theme.space(SpaceToken::Sm));
         let full = ui.available_rect_before_wrap();
         let gap = theme.space(SpaceToken::PanelPadding);
         let left_w = if compact { full.width() } else { (full.width() * 0.48).round() };
@@ -580,6 +594,12 @@ impl Screen for EpgMappingScreen {
                         self.refilter_cands();
                     }
                     ListOutcome::Activated(_) => self.pane = Pane::Candidates,
+                    // right-click: the menu key on the list
+                    ListOutcome::ContextMenu(_) => {
+                        self.pane = Pane::Channels;
+                        self.refilter_cands();
+                        self.mode_menu(ctx);
+                    }
                     _ => {}
                 }
             }
@@ -587,8 +607,13 @@ impl Screen for EpgMappingScreen {
                 section::pane_divider(ui.painter(), left.right() + gap / 2.0, full.y_range(), theme);
             }
         }
+        let mut clear_clicked = false;
         if !compact || self.pane == Pane::Candidates {
             let mut ui_r = ui.new_child(egui::UiBuilder::new().id_salt("map-cands").max_rect(right).layout(egui::Layout::top_down(egui::Align::Min)));
+            // one pane at a time: the way back to the channel list (Esc)
+            if compact && back_button(&mut ui_r, theme, "Channels").clicked() {
+                self.pane = Pane::Channels;
+            }
             let current = self.highlighted().and_then(|h| ctx.lib.live.get(h)).map(|c| c.name.to_string()).unwrap_or_default();
             ui_r.label(RichText::new(format!("Guide for {current}")).size(theme.font(TypeToken::Title)).color(t.fg));
             match &self.mappings {
@@ -600,12 +625,27 @@ impl Screen for EpgMappingScreen {
                             .and_then(|cat| cat.entries.iter().find(|e| e.source == best.epg_source_id && e.xmltv_id == best.xmltv_id))
                             .map(|e| format!("{} ({})", e.name, e.source_name))
                             .unwrap_or_else(|| best.xmltv_id.clone());
-                        let extra = if best.method == EpgMatchMethod::Manual { " · Delete clears it" } else { "" };
-                        ui_r.label(
-                            RichText::new(format!("Matched {name} by {}{extra}", method_label(best.method)))
-                                .size(theme.font(TypeToken::BodySmall))
-                                .color(t.text_secondary),
-                        );
+                        let manual = best.method == EpgMatchMethod::Manual;
+                        let extra = if manual { " · Delete clears it" } else { "" };
+                        let mut clear = false;
+                        ui_r.horizontal(|ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!("Matched {name} by {}{extra}", method_label(best.method)))
+                                        .size(theme.font(TypeToken::BodySmall))
+                                        .color(t.text_secondary),
+                                )
+                                .wrap(),
+                            );
+                            if manual {
+                                clear = button(ui, theme, None, "Clear", ButtonStyle { bordered: true, ..Default::default() })
+                                    .on_hover_text("Clear the manual assignment (Delete)")
+                                    .clicked();
+                            }
+                        });
+                        if clear {
+                            clear_clicked = true;
+                        }
                     }
                     None => {
                         ui_r.label(
@@ -618,6 +658,9 @@ impl Screen for EpgMappingScreen {
                 _ => {
                     ui_r.label(RichText::new(" ").size(theme.font(TypeToken::BodySmall)));
                 }
+            }
+            if std::mem::take(&mut clear_clicked) {
+                self.clear(ctx);
             }
             let few = self.few_note(ctx);
             if let Some(note) = &few {

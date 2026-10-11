@@ -199,6 +199,34 @@ pub enum NavRequest {
     TogglePopOut,
 }
 
+/// What the app's Back leads to from the current route: the route below it, or the parent of a
+/// lone sub-page (named for the back button: "‹ Settings").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackTarget {
+    pub label: &'static str,
+}
+
+impl BackTarget {
+    /// The back button's label for going back to `screen`.
+    pub fn to(screen: ScreenId) -> Self {
+        let label = match screen {
+            ScreenId::Home => "Home",
+            ScreenId::Live => "Live TV",
+            ScreenId::Guide => "Guide",
+            ScreenId::Movies => "Movies",
+            ScreenId::Series => "Series",
+            ScreenId::MovieDetail => "Movie",
+            ScreenId::SeriesDetail => "Series",
+            ScreenId::Player => "Player",
+            ScreenId::Settings => "Settings",
+            ScreenId::Onboarding => "Setup",
+            ScreenId::EpgMapping => "EPG mapping",
+            ScreenId::Logs => "Logs",
+        };
+        Self { label }
+    }
+}
+
 /// A queued Settings change (applied by the app after the frame).
 pub type ConfigEdit = Box<dyn FnOnce(&mut Config)>;
 
@@ -238,6 +266,9 @@ pub struct UiCtx<'a> {
     pub mini_rect: Option<egui::Rect>,
     /// The window is popped out: the player draws its video-only layout (DESIGN §12.3).
     pub video_only: bool,
+    /// Where the app's Back (Esc) goes from the current route, for the on-screen back button
+    /// ([`widgets::section::page_header`]); `None` on a tab root. Set by the app each frame.
+    pub back: Option<BackTarget>,
     pub now: Timestamp,
     nav: &'a mut Vec<NavRequest>,
     toasts: &'a mut Vec<Toast>,
@@ -290,6 +321,7 @@ impl<'a> UiCtx<'a> {
             layout: p.layout,
             mini_rect: p.mini_rect,
             video_only: p.video_only,
+            back: None,
             now: p.now,
             nav: p.nav,
             toasts: p.toasts,

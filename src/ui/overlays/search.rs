@@ -18,10 +18,12 @@
 //! * Item shortcuts (`SEARCH_ITEM_ACTIONS`, listed in Help for `[Search]`) act on the highlighted
 //!   hit: Ctrl+F favourite, Ctrl+Shift+F lists, Ctrl+G guide, Ctrl+I details / edit
 //!   information, Ctrl+E assign EPG, Ctrl+W watched, F2 rename, Ctrl+H hide, Ctrl+L lock.
-//!   Overlays opened from here (rename, lists, edit information) write by themselves; menus
-//!   and PIN prompts would answer the screen BELOW the search, so the overlay never opens
-//!   them (a locked hit — only reachable when the session relocks while the card is open —
-//!   toasts instead).
+//!   The menu key (and a right-click on a hit) opens them as a menu, "Play" first; the menu
+//!   answers this overlay (the app routes a menu's result to the overlay that opened it).
+//!   Overlays opened from here (rename, lists, edit information) write by themselves; PIN
+//!   prompts would answer the screen BELOW the search, so the overlay never opens them (a
+//!   locked hit — only reachable when the session relocks while the card is open — toasts
+//!   instead).
 //! * Rows are rebuilt only when the query, section, lock state or library change, or when
 //!   the fuzzy matcher / the guide search report new results — not every frame.
 
@@ -31,8 +33,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui::{self, Align2, Rect, RichText};
 
-use super::dialogs::{card_area, scrim};
-use super::{Overlay, OverlayOutcome};
+use super::dialogs::{card_area, scrim, with_close};
+use super::{ContextMenuSpec, MenuItem, Overlay, OverlayOutcome, OverlayResult};
 use crate::keymap::{Action, KeyContext};
 use crate::model::{ItemKind, ItemRef, MediaRef, PlayOrigin, ProgrammeHit, ProgrammeSlim, VodKind};
 use crate::search::{EpgSearch, SearchHit, SearchIndex, SearchSection, SearchTarget};
@@ -238,7 +240,9 @@ impl SearchOverlay {
             return OverlayOutcome::Keep;
         }
         if action == Action::ContextMenu {
-            ctx.toast(crate::msg::Toast::info("Ctrl+F favourite · Ctrl+G guide · Ctrl+I details · F2 rename · Ctrl+H hide"));
+            if let Some(row) = row {
+                Self::menu(ctx, &row);
+            }
             return OverlayOutcome::Keep;
         }
         let Some(Row::Hit(h)) = row else {
@@ -278,6 +282,66 @@ impl SearchOverlay {
             _ => kit::not_here(ctx),
         }
         OverlayOutcome::Keep
+    }
+
+    /// The highlighted hit's actions as a menu (its result comes back to this overlay).
+    fn menu(ctx: &mut UiCtx<'_>, row: &Row) {
+        let mi = |icon: &'static str, label: &str, action: Action, shortcut: &str| MenuItem {
+            icon,
+            label: label.into(),
+            action,
+            enabled: true,
+            shortcut: Some(shortcut.into()),
+        };
+        let (title, items) = match row {
+            Row::Header(_) => return,
+            Row::Guide(g) => {
+                let (play, play_label) = match guide_channel(ctx, g) {
+                    Some((_, p)) if p.contains(ctx.now) => (glyphs::PLAY, "Watch"),
+                    Some((_, p)) if p.stop <= ctx.now => (glyphs::CATCHUP, "Catch up"),
+                    _ => (glyphs::REMINDER, "Remind me"),
+                };
+                (
+                    g.programme.title.to_string(),
+                    vec![mi(play, play_label, Action::Activate, "Enter"), mi(glyphs::GUIDE, "Show in TV guide", Action::OpenInGuide, "Ctrl+G")],
+                )
+            }
+            Row::Hit(h) => {
+                let fav = Self::hit_item(ctx, h).is_some_and(|(item, ..)| ctx.favs.is_fav(&item));
+                let fav = mi(glyphs::FAVOURITE, if fav { "Remove from Favourites" } else { "Add to Favourites" }, Action::ToggleFavourite, "Ctrl+F");
+                let lists = mi(glyphs::FAV_LIST, "Favourites lists…", Action::AddToList, "Ctrl+Shift+F");
+                let mut items = match h.item.target {
+                    SearchTarget::Channel(_) => vec![
+                        mi(glyphs::PLAY, "Play now", Action::Activate, "Enter"),
+                        fav,
+                        lists,
+                        mi(glyphs::GUIDE, "Show in TV guide", Action::OpenInGuide, "Ctrl+G"),
+                        mi(glyphs::INFO, "Edit information…", Action::ShowDetails, "Ctrl+I"),
+                        mi(glyphs::GUIDE, "Assign EPG channel…", Action::AssignEpg, "Ctrl+E"),
+                    ],
+                    SearchTarget::Movie(_) => vec![
+                        mi(glyphs::PLAY, "Play now", Action::ActivateAlt, "Shift+Enter"),
+                        mi(glyphs::INFO, "Open the movie's page", Action::Activate, "Enter"),
+                        fav,
+                        lists,
+                        mi(glyphs::CHECK, "Mark watched", Action::MarkWatched, "Ctrl+W"),
+                    ],
+                    SearchTarget::Series(_) => vec![
+                        mi(glyphs::PLAY, "Play now", Action::ActivateAlt, "Shift+Enter"),
+                        mi(glyphs::INFO, "Open the series' page", Action::Activate, "Enter"),
+                        fav,
+                        lists,
+                    ],
+                };
+                items.extend([
+                    mi(glyphs::TAG, "Rename…", Action::Rename, "F2"),
+                    mi(glyphs::LOCK, "Lock / unlock", Action::ToggleLock, "Ctrl+L"),
+                    mi(glyphs::HIDDEN, "Hide", Action::ToggleHidden, "Ctrl+H"),
+                ]);
+                (h.item.name.to_string(), items)
+            }
+        };
+        ctx.open(crate::ui::OverlayRequest::ContextMenu(ContextMenuSpec { title, items }));
     }
 
     /// Build or refresh the shared index (lazily, also after a lock change).
@@ -449,6 +513,14 @@ impl Overlay for SearchOverlay {
         }
     }
 
+    /// A choice from the hit's menu: what its shortcut does.
+    fn on_overlay_result(&mut self, ctx: &mut UiCtx<'_>, result: OverlayResult) -> OverlayOutcome {
+        match result {
+            OverlayResult::Chosen(a) if a != Action::ContextMenu => self.on_action(ctx, a),
+            _ => OverlayOutcome::Keep,
+        }
+    }
+
     fn ui(&mut self, egui_ctx: &egui::Context, ctx: &mut UiCtx<'_>) -> OverlayOutcome {
         self.ensure_index(egui_ctx, ctx);
         let mut matched = false;
@@ -473,12 +545,16 @@ impl Overlay for SearchOverlay {
         let selectable = self.selectable();
         let cursor_row = selectable.get(self.cursor).copied();
         let mut clicked: Option<usize> = None;
+        let mut menu: Option<usize> = None;
+        let mut close = false;
         let mut hovered: Option<usize> = None;
         let mut section_clicked = None;
         let scroll = std::mem::take(&mut self.scroll_to_cursor);
         let rows = std::mem::take(&mut self.rows);
         let r = card_area(egui_ctx, theme, "search", CardKind::Menu, CARD_W * theme.rem(), self.top, |ui| {
-            search_header(ui, theme, &self.query, "Search channels, movies, series and the guide", Some(glyphs::SEARCH));
+            close = with_close(ui, theme, |ui| {
+                search_header(ui, theme, &self.query, "Search channels, movies, series and the guide", Some(glyphs::SEARCH));
+            });
             ui.add_space(theme.space(SpaceToken::Md));
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = theme.space(SpaceToken::Xxs);
@@ -526,8 +602,11 @@ impl Overlay for SearchOverlay {
                     if is_cursor && scroll {
                         ui.scroll_to_rect(rect, None);
                     }
+                    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
                     if resp.clicked() {
                         clicked = Some(i);
+                    } else if resp.secondary_clicked() {
+                        menu = Some(i);
                     } else if pointer_moved && resp.hovered() && !is_cursor {
                         hovered = Some(i);
                     }
@@ -559,11 +638,18 @@ impl Overlay for SearchOverlay {
         if let Some(i) = hovered.and_then(|i| sel.iter().position(|x| *x == i)) {
             self.cursor = i;
         }
+        if close {
+            return OverlayOutcome::Close;
+        }
         if let Some(i) = clicked.and_then(|i| sel.iter().position(|x| *x == i)) {
             self.cursor = i;
             if let Some(row) = self.current() {
                 return self.activate(ctx, row, false);
             }
+        }
+        if let Some(i) = menu.and_then(|i| sel.iter().position(|x| *x == i)) {
+            self.cursor = i;
+            return self.item_action(ctx, Action::ContextMenu);
         }
         if ctx.now_next.pending() {
             egui_ctx.request_repaint();
@@ -840,14 +926,25 @@ mod tests {
         // Ctrl+G: the channel in the guide
         assert_eq!(h.state_mut().act(Action::OpenInGuide), "Close");
         assert!(matches!(h.state_mut().nav().as_slice(), [NavRequest::Push(Route::Guide { focus: Some(_), .. })]));
+        // the menu key: the hit's actions as a menu, "Play now" first (the app routes its answer
+        // back to this overlay); a right-click on the hit opens the same menu
+        assert_eq!(h.state_mut().act(Action::ContextMenu), "Keep");
+        let keyed = h.state_mut().nav();
+        let [NavRequest::Open(crate::ui::OverlayRequest::ContextMenu(spec))] = keyed.as_slice() else { panic!("{keyed:?}") };
+        assert_eq!(spec.items[0].label, "Play now");
+        egui_kittest::kittest::Queryable::get_by_role_and_label(&h, egui::accesskit::Role::Button, "Channel 2").click_secondary();
+        h.run_steps(2);
+        assert_eq!(h.state_mut().nav(), keyed, "right-click = the menu key");
+        // its answer is the item's shortcut
+        let app = h.state_mut();
+        let (t, o) = (&mut app.t, &mut app.o);
+        assert_eq!(testkit::outcome(&t.with_ctx(|ctx| o.on_overlay_result(ctx, OverlayResult::Chosen(Action::OpenInGuide)))), "Close");
+        assert!(matches!(h.state_mut().nav().as_slice(), [NavRequest::Push(Route::Guide { focus: Some(_), .. })]));
         // the session relocks with the card open: Enter toasts, no PIN prompt
         h.state_mut().t.parental.lock();
         assert_eq!(h.state_mut().act(Action::Activate), "Keep");
         assert!(h.state_mut().nav().is_empty(), "no PIN overlay from inside the search");
         assert!(h.state().t.toasts.iter().any(|t| t.text.contains("locked")), "{:?}", h.state().t.toasts);
-        // the context menu would answer the screen below: it explains the shortcuts instead
-        assert_eq!(h.state_mut().act(Action::ContextMenu), "Keep");
-        assert!(h.state_mut().nav().is_empty());
         // movies: Ctrl+I opens the page; Ctrl+Shift+F the lists picker; Ctrl+W marks it watched
         let app = h.state_mut();
         app.act(Action::FilterClear);

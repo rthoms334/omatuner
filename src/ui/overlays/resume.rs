@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, RichText};
 
-use super::dialogs::{card_area, scrim};
+use super::dialogs::{card_area, scrim, with_close};
 use super::{Overlay, OverlayOutcome, ResumeSpec};
 use crate::keymap::{Action, KeyContext};
 use crate::model::PlayOrigin;
@@ -107,8 +107,11 @@ impl Overlay for ResumeOverlay {
                 "Start over".to_owned(),
             )
         };
+        let mut close = false;
         let (a, b) = card_area(egui_ctx, theme, "resume", CardKind::Popup, 420.0 * theme.rem(), None, |ui| {
-            ui.label(RichText::new(&title).size(theme.font(TypeToken::Heading)).color(t.fg));
+            close = with_close(ui, theme, |ui| {
+                ui.add(egui::Label::new(RichText::new(&title).size(theme.font(TypeToken::Heading)).color(t.fg)).wrap());
+            });
             ui.add_space(theme.space(SpaceToken::Xs));
             ui.add(egui::Label::new(RichText::new(&detail).size(theme.font(TypeToken::Body)).color(t.text_secondary)).wrap());
             if up_next {
@@ -138,6 +141,9 @@ impl Overlay for ResumeOverlay {
         .inner;
         if up_next {
             egui_ctx.request_repaint_after(Duration::from_millis(200));
+        }
+        if close {
+            return OverlayOutcome::Close;
         }
         match (a, b, up_next) {
             (true, _, true) => self.start(ctx, false),

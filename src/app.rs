@@ -6,7 +6,8 @@
 //!   egui widgets never handle them a second time (Enter would also click the focused button,
 //!   Tab would move egui focus). egui-winit reports Alt chords as `Key{alt}` followed by the
 //!   `Text` of the bare key; when the Key resolves, that Text is dropped too (Alt+1 must not
-//!   also type "1" into a filter). Also maps the mouse back button to `Back`.
+//!   also type "1" into a filter). Also maps the mouse back button to Esc (resolved through the
+//!   same stack) and swallows the forward button.
 //! * `logic()`: drain `AppEvent`s, refresh the player snapshot, render mpv into the FBO (GL
 //!   current), idle inhibitor. NOTE: frames are paced by compositor frame callbacks (vsync
 //!   off; `ui` calls `pre_present_notify`, DESIGN §11.1), so `logic` runs only when the
@@ -62,10 +63,10 @@ use crate::theme::{SpaceToken, Theme, ThemeEvent};
 use crate::ui::data::{FrameBudget, NowNextCache};
 use crate::ui::overlays::{self, Overlay, OverlayOutcome};
 use crate::ui::popout::{PopOut, Toggle};
-use crate::ui::video_host::{Placement, VideoHost};
+use crate::ui::video_host::{MiniAction, Placement, VideoHost};
 use crate::ui::widgets::status_bar::{StatusClick, StatusInfo};
 use crate::ui::widgets::toast::Toasts;
-use crate::ui::{LayoutClass, NavRequest, OnboardingStart, OverlayRequest, ParentalSession, Route, Screen, ScreenId, UiCtx, UiParts};
+use crate::ui::{BackTarget, LayoutClass, NavRequest, OnboardingStart, OverlayRequest, ParentalSession, Route, Screen, ScreenId, UiCtx, UiParts};
 
 /// An open overlay, the screen that opened it (receives its result) and which request built
 /// it (Help / Jobs toggle closed when requested again).
@@ -73,7 +74,14 @@ struct OpenOverlay {
     overlay: Box<dyn Overlay>,
     opener: ScreenId,
     kind: std::mem::Discriminant<OverlayRequest>,
+    /// A menu an overlay opened (search's item menu): the index of that overlay, which gets
+    /// the result instead of the screen.
+    owner: Option<usize>,
 }
+
+/// The key the mouse back button stands for.
+const ESCAPE: egui::Event =
+    egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
 
 /// After a network failure toast, further network failures stay quiet this long.
 const NETWORK_TOAST_QUIET: std::time::Duration = std::time::Duration::from_secs(10);
@@ -102,6 +110,8 @@ pub struct TunerApp {
     /// Quality badges measured this session (fed from `snapshot` every frame).
     measured: crate::ui::data::MeasuredQuality,
     nav: Vec<NavRequest>,
+    /// (index in `nav`, overlay) of the `Open` requests an overlay made (see `as_overlay`).
+    nav_owner: Vec<(usize, usize)>,
     pending_toasts: Vec<Toast>,
     config_edits: Vec<crate::ui::ConfigEdit>,
     /// Actions resolved in `raw_input_hook`, dispatched at the start of `ui`, with the context
@@ -212,6 +222,7 @@ impl TunerApp {
             snapshot,
             measured: Default::default(),
             nav: Vec::new(),
+            nav_owner: Vec::new(),
             pending_toasts: Vec::new(),
             config_edits: Vec::new(),
             pending_actions: Vec::new(),
@@ -308,6 +319,7 @@ impl TunerApp {
         let services = self.services.as_ref().expect("services alive");
         let cfg = services.config();
         let mini_rect = self.video.mini_rect();
+        let back = self.back_target();
         let mut ctx = UiCtx::new(UiParts {
             theme: &self.theme,
             services,
@@ -331,7 +343,21 @@ impl TunerApp {
             toasts: &mut self.pending_toasts,
             config_edits: &mut self.config_edits,
         });
+        ctx.back = back;
         f(&mut ctx, &mut self.screens, &mut self.overlays)
+    }
+
+    /// Where `NavRequest::Back` leads from the route on screen (the back button's label): the
+    /// route below it, else a lone sub-page's parent. The video-only player has none.
+    fn back_target(&self) -> Option<BackTarget> {
+        if self.video_only {
+            return None;
+        }
+        let below = match self.routes.len() {
+            0 | 1 => parent_route(self.current_route()),
+            n => Some(self.routes[n - 2].clone()),
+        };
+        below.map(|r| BackTarget::to(r.screen()))
     }
 
     fn handle_event(&mut self, ev: AppEvent, egui_ctx: &egui::Context) {
@@ -788,10 +814,12 @@ impl TunerApp {
             return;
         }
         let opener = self.view_screen();
-        self.overlays.push(OpenOverlay { overlay: Box::new(overlays::help::HelpOverlay::with_contexts(contexts)), opener, kind });
+        self.overlays.push(OpenOverlay { overlay: Box::new(overlays::help::HelpOverlay::with_contexts(contexts)), opener, kind, owner: None });
     }
 
-    fn open_overlay(&mut self, req: OverlayRequest) {
+    /// `owner`: the overlay that asked (its menus answer it); `at`: where a right-click
+    /// that opened it happened (menus open there).
+    fn open_overlay(&mut self, req: OverlayRequest, owner: Option<usize>, at: Option<egui::Pos2>) {
         match req {
             OverlayRequest::Help => self.open_help(self.key_stack()),
             OverlayRequest::Jobs if self.overlays.last().is_some_and(|o| o.kind == std::mem::discriminant(&req)) => {
@@ -800,17 +828,34 @@ impl TunerApp {
             req => {
                 let kind = std::mem::discriminant(&req);
                 let opener = self.view_screen();
-                let overlay = self.with_ctx(|ctx, _, _| overlays::build(req, ctx));
-                self.overlays.push(OpenOverlay { overlay, opener, kind });
+                let menu = matches!(req, OverlayRequest::ContextMenu(_));
+                let mut overlay = self.with_ctx(|ctx, _, _| overlays::build(req, ctx));
+                if let Some(pos) = at {
+                    overlay.anchor_at(pos);
+                }
+                let owner = owner.filter(|_| menu);
+                self.overlays.push(OpenOverlay { overlay, opener, kind, owner });
             }
         }
+    }
+
+    /// Run overlay code (`f`) and remember which overlay asked for what it opens.
+    fn as_overlay<R>(&mut self, index: usize, f: impl FnOnce(&mut Self) -> R) -> R {
+        let n = self.nav.len();
+        let r = f(self);
+        for i in n..self.nav.len() {
+            if matches!(self.nav[i], NavRequest::Open(_)) {
+                self.nav_owner.push((i, index));
+            }
+        }
+        r
     }
 
     /// Dispatch the actions resolved in `raw_input_hook`: topmost overlay → screen → globals.
     fn dispatch_actions(&mut self, egui_ctx: &egui::Context) {
         for (action, stack) in std::mem::take(&mut self.pending_actions) {
             let handled = if let Some(top) = self.overlays.len().checked_sub(1) {
-                let outcome = self.with_ctx(|ctx, _, ovs| ovs[top].overlay.on_action(ctx, action));
+                let outcome = self.as_overlay(top, |app| app.with_ctx(|ctx, _, ovs| ovs[top].overlay.on_action(ctx, action)));
                 let ignored = matches!(outcome, OverlayOutcome::Ignored);
                 self.apply_overlay_outcome(outcome);
                 !ignored
@@ -839,8 +884,18 @@ impl TunerApp {
                     return;
                 }
                 if let Some(o) = self.overlays.pop() {
-                    let idx = self.screen_index(o.opener);
-                    self.with_ctx(|ctx, screens, _| screens[idx].on_overlay_result(ctx, result));
+                    match o.owner {
+                        // a menu of the overlay now on top: its answer applies to that overlay
+                        Some(owner) if owner + 1 == self.overlays.len() => {
+                            let outcome = self.as_overlay(owner, |app| app.with_ctx(|ctx, _, ovs| ovs[owner].overlay.on_overlay_result(ctx, result)));
+                            self.apply_overlay_outcome(outcome);
+                        }
+                        Some(_) => {}
+                        None => {
+                            let idx = self.screen_index(o.opener);
+                            self.with_ctx(|ctx, screens, _| screens[idx].on_overlay_result(ctx, result));
+                        }
+                    }
                 }
             }
             OverlayOutcome::Keep | OverlayOutcome::Ignored => {}
@@ -849,7 +904,10 @@ impl TunerApp {
 
     fn apply_nav(&mut self, egui_ctx: &egui::Context) {
         let reqs: Vec<NavRequest> = std::mem::take(&mut self.nav);
-        for r in reqs {
+        let owners = std::mem::take(&mut self.nav_owner);
+        // a menu opened by a right-click this frame opens at the pointer
+        let at = egui_ctx.input(|i| if i.pointer.secondary_clicked() { i.pointer.interact_pos() } else { None });
+        for (n, r) in reqs.into_iter().enumerate() {
             match r {
                 // the video-only player isn't a route of its own: Back from it (`p`, `q`, a
                 // finished movie) leaves only a Player route under it, never the screens below
@@ -880,7 +938,10 @@ impl TunerApp {
                         self.routes[0] = parent;
                     }
                 }
-                NavRequest::Open(req) => self.open_overlay(req),
+                NavRequest::Open(req) => {
+                    let owner = owners.iter().find(|(i, _)| *i == n).map(|(_, o)| *o);
+                    self.open_overlay(req, owner, at);
+                }
                 NavRequest::CloseOverlay => {
                     self.overlays.pop();
                 }
@@ -1042,7 +1103,13 @@ impl TunerApp {
                 .inner
         };
         if let Some(id) = clicked {
-            self.nav.push(NavRequest::Switch(route_for_screen(id)));
+            // the lit tab of a sub-page (a movie's page, Logs under Settings): back down to that
+            // tab where it is on the stack, like Esc, instead of a fresh tab
+            let lit = crate::ui::widgets::sidebar::is_current(id, current);
+            match self.routes.iter().rev().skip(1).position(|r| r.screen() == id) {
+                Some(above) if lit => self.nav.extend(std::iter::repeat_n(NavRequest::Back, above + 1)),
+                _ => self.nav.push(NavRequest::Switch(route_for_screen(id))),
+            }
         }
         if search_clicked {
             self.nav.push(NavRequest::Open(OverlayRequest::Search { initial: String::new() }));
@@ -1060,10 +1127,13 @@ impl eframe::App for TunerApp {
             if std::mem::take(&mut drop_text) && matches!(ev, egui::Event::Text(_)) {
                 return false;
             }
-            // mouse back button = Back (DESIGN §15.1)
-            if let egui::Event::PointerButton { button: egui::PointerButton::Extra1, pressed, .. } = ev {
-                if *pressed {
-                    resolved.push((Action::Back, stack.clone()));
+            // mouse back button = Esc, resolved against the same stack so it walks the whole Esc
+            // ladder (clear a filter, leave the OSD controls or a text field, pop the window
+            // back in…); the forward button has no forward stack to walk and does nothing
+            // (DESIGN §15.1)
+            if let egui::Event::PointerButton { button: button @ (egui::PointerButton::Extra1 | egui::PointerButton::Extra2), pressed, .. } = ev {
+                if *pressed && *button == egui::PointerButton::Extra1 {
+                    resolved.push((keymap::resolve(&stack, &ESCAPE).unwrap_or(Action::Back), stack.clone()));
                 }
                 return false;
             }
@@ -1198,14 +1268,15 @@ impl eframe::App for TunerApp {
         {
             let snap = self.snapshot.clone();
             match self.video.mini_player(&egui_ctx, &theme, &snap) {
-                Some(true) => self.nav.push(NavRequest::Push(Route::Player)),
-                Some(false) => self.send_player(PlayerCommand::Stop),
+                Some(MiniAction::Open) => self.nav.push(NavRequest::Push(Route::Player)),
+                Some(MiniAction::PopOut) => self.nav.push(NavRequest::TogglePopOut),
+                Some(MiniAction::Stop) => self.send_player(PlayerCommand::Stop),
                 None => {}
             }
         }
 
         if let Some(i) = self.overlays.len().checked_sub(1) {
-            let outcome = self.with_ctx(|ctx, _, ovs| ovs[i].overlay.ui(&egui_ctx, ctx));
+            let outcome = self.as_overlay(i, |app| app.with_ctx(|ctx, _, ovs| ovs[i].overlay.ui(&egui_ctx, ctx)));
             self.apply_overlay_outcome(outcome);
         }
         for t in std::mem::take(&mut self.pending_toasts) {
@@ -1500,6 +1571,23 @@ mod tests {
             self.frame_with(key_events(key, modifiers))
         }
 
+        /// Press and release of a mouse button at the top-left corner.
+        fn button_events(button: egui::PointerButton) -> Vec<Event> {
+            let ev = |pressed| Event::PointerButton { pos: egui::pos2(5.0, 5.0), button, pressed, modifiers: NONE };
+            vec![ev(true), ev(false)]
+        }
+
+        fn mouse_button(&mut self, button: egui::PointerButton) -> egui::FullOutput {
+            self.frame_with(Self::button_events(button))
+        }
+
+        /// Move the pointer to `pos`, then click `button` there.
+        fn click(&mut self, pos: egui::Pos2, button: egui::PointerButton) -> egui::FullOutput {
+            self.frame_with(vec![Event::PointerMoved(pos)]);
+            let ev = |pressed| Event::PointerButton { pos, button, pressed, modifiers: NONE };
+            self.frame_with(vec![ev(true), ev(false)])
+        }
+
         /// Run frames until `done` or 10 s (background work finishing).
         fn until(&mut self, what: &str, done: impl FnMut(&mut Self) -> bool) {
             self.until_within(what, Duration::from_secs(10), done)
@@ -1702,6 +1790,10 @@ mod tests {
         texts.iter().find(|(t, _, _)| t == text).map(|(_, r, _)| r)
     }
 
+    fn centre(r: &egui::accesskit::Rect) -> egui::Pos2 {
+        egui::pos2(((r.x0 + r.x1) / 2.0) as f32, ((r.y0 + r.y1) / 2.0) as f32)
+    }
+
     /// A button by its label (the sidebar entries; screens may show the same words as text).
     fn button<'a>(texts: &'a [Node], text: &str) -> Option<&'a egui::accesskit::Rect> {
         texts.iter().find(|(t, _, role)| t == text && *role == egui::accesskit::Role::Button).map(|(_, r, _)| r)
@@ -1791,9 +1883,144 @@ mod tests {
     fn mouse_back_button_is_back() {
         let mut rig = Rig::new();
         rig.app.routes.push(Route::Logs);
-        let click = |pressed| Event::PointerButton { pos: egui::pos2(5.0, 5.0), button: egui::PointerButton::Extra1, pressed, modifiers: NONE };
-        rig.frame_with(vec![click(true), click(false)]);
+        rig.mouse_button(egui::PointerButton::Extra1);
         assert_eq!(rig.route(), &Route::Live { group: None, channel: None });
+    }
+
+    /// The mouse back button is Esc, resolved against the same context stack: it clears a
+    /// filter, leaves the OSD controls or a text field, closes an overlay — never a shortcut
+    /// past those rungs to the route stack. The forward button does nothing.
+    #[test]
+    fn mouse_back_walks_the_esc_ladder_and_forward_does_nothing() {
+        let mut rig = Rig::new();
+        let cases = [
+            (vec![KeyContext::ListFiltering], Action::FilterClear),
+            (vec![KeyContext::PosterGridFiltering], Action::FilterClear),
+            (vec![KeyContext::PlayerOsd, KeyContext::PlayerLive], Action::LeaveOsdControls),
+            (vec![KeyContext::TextInput, KeyContext::Panel], Action::Back),
+            (vec![KeyContext::List], Action::Back),
+        ];
+        for (contexts, rung) in cases {
+            let probe = rig.probe(ScreenId::Live, contexts.clone());
+            probe.borrow_mut().handle_back = true;
+            rig.frame_with(vec![]);
+            rig.press(Key::Escape, NONE);
+            rig.mouse_button(egui::PointerButton::Extra1);
+            assert_eq!(probe.borrow().actions, [rung, rung], "{contexts:?}: Esc, then the mouse back button");
+        }
+        // an overlay takes it first, like Esc
+        rig.probe(ScreenId::Live, vec![KeyContext::List]);
+        rig.press(Key::J, CTRL);
+        rig.mouse_button(egui::PointerButton::Extra1);
+        assert!(rig.app.overlays.is_empty());
+        assert_eq!(rig.route(), &Route::Live { group: None, channel: None });
+        // forward: consumed, nothing happens
+        let probe = rig.probe(ScreenId::Logs, vec![KeyContext::List]);
+        rig.app.routes.push(Route::Logs);
+        rig.frame_with(vec![]);
+        let mut raw = egui::RawInput { events: Rig::button_events(egui::PointerButton::Extra2), ..Default::default() };
+        rig.app.raw_input_hook(&rig.ctx.clone(), &mut raw);
+        assert!(raw.events.is_empty() && rig.app.pending_actions.is_empty(), "the forward button never reaches egui or the keymap");
+        rig.mouse_button(egui::PointerButton::Extra2);
+        assert_eq!(rig.app.routes, [Route::Live { group: None, channel: None }, Route::Logs]);
+        assert_eq!(probe.borrow().actions, []);
+    }
+
+    /// `‹ {label}` goes where Esc goes: the route below, or a lone sub-page's parent; a tab root
+    /// has none. The lit sidebar tab of a sub-page goes back down to it.
+    #[test]
+    fn the_back_button_and_the_lit_tab_go_back() {
+        let mut rig = Rig::new();
+        let back_buttons = |out: &egui::FullOutput| texts(out).into_iter().filter(|(t, _, _)| t.starts_with("Back to ")).count();
+        assert_eq!(back_buttons(&rig.frame_with(vec![])), 0, "a tab root has no back button");
+        rig.app.routes.push(Route::MovieDetail(crate::model::MovieId(1)));
+        rig.frame_with(vec![]);
+        let out = rig.frame_with(vec![]);
+        let back = *button(&texts(&out), "Back to Live TV").expect("the detail page's back button");
+        rig.click(centre(&back), egui::PointerButton::Primary);
+        assert_eq!(rig.app.routes, [Route::Live { group: None, channel: None }]);
+        rig.app.routes = vec![Route::Logs];
+        rig.frame_with(vec![]);
+        let out = rig.frame_with(vec![]);
+        let back = *button(&texts(&out), "Back to Settings").expect("a lone Logs page goes to Settings");
+        rig.click(centre(&back), egui::PointerButton::Primary);
+        assert_eq!(rig.app.routes, [Route::Settings(Default::default())]);
+        // Settings ▸ Hidden items ▸ Logs: the lit Settings tab pops back to that page (a switch
+        // would open Settings afresh)
+        rig.app.routes = vec![Route::Settings(crate::ui::SettingsPage::Hidden), Route::Logs];
+        rig.frame_with(vec![]);
+        let out = rig.frame_with(vec![]);
+        let tab = *button(&texts(&out), "Settings").expect("the sidebar's Settings");
+        rig.click(centre(&tab), egui::PointerButton::Primary);
+        assert_eq!(rig.app.routes, [Route::Settings(crate::ui::SettingsPage::Hidden)]);
+    }
+
+    /// A click (or right-click) on the scrim closes an overlay, except one holding an unsaved
+    /// edit: the stray click is ignored and Cancel still closes it.
+    #[test]
+    fn a_click_outside_closes_an_overlay_unless_it_holds_an_edit() {
+        let mut rig = Rig::new();
+        let outside = egui::pos2(4.0, 790.0);
+        rig.press(Key::F1, NONE);
+        rig.click(outside, egui::PointerButton::Primary);
+        assert!(rig.app.overlays.is_empty(), "Help closes");
+        let item = crate::ui::overlays::MenuItem { icon: "", label: "Rename".into(), action: Action::Rename, enabled: true, shortcut: None };
+        let menu = crate::ui::overlays::ContextMenuSpec { title: "News".into(), items: vec![item] };
+        rig.app.nav.push(NavRequest::Open(OverlayRequest::ContextMenu(menu)));
+        rig.frame_with(vec![]);
+        rig.click(outside, egui::PointerButton::Secondary);
+        assert!(rig.app.overlays.is_empty(), "a right-click outside a menu closes it");
+        let spec = crate::ui::overlays::RenameSpec {
+            title: "Rename list".into(),
+            initial: "News".into(),
+            target: crate::ui::overlays::RenameTarget::FavList(crate::model::FavListId(1)),
+        };
+        rig.app.nav.push(NavRequest::Open(OverlayRequest::Rename(spec.clone())));
+        rig.frame_with(vec![]);
+        rig.click(outside, egui::PointerButton::Primary);
+        assert!(rig.app.overlays.is_empty(), "nothing typed yet: closes");
+        rig.app.nav.push(NavRequest::Open(OverlayRequest::Rename(spec)));
+        rig.frame_with(vec![]);
+        rig.frame_with(vec![Event::Text("!".into())]);
+        rig.click(outside, egui::PointerButton::Primary);
+        assert_eq!(rig.overlay_kinds().len(), 1, "an edited name survives a stray click");
+        let out = rig.frame_with(vec![]);
+        let cancel = *button(&texts(&out), "Cancel").expect("Cancel");
+        rig.click(centre(&cancel), egui::PointerButton::Primary);
+        assert!(rig.app.overlays.is_empty());
+    }
+
+    /// A menu an overlay opens (search's item menu, by the menu key or a right-click at the
+    /// pointer) answers that overlay, never the screen below it.
+    #[test]
+    fn a_menu_opened_by_an_overlay_answers_that_overlay() {
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_channels(c, 3, None));
+        rig.settle();
+        let probe = rig.probe(ScreenId::Live, vec![KeyContext::List]);
+        rig.app.nav.push(NavRequest::Open(OverlayRequest::Search { initial: "Channel 1".into() }));
+        let mut hit = None;
+        rig.until("the search hit", |r| {
+            hit = button(&texts(&r.frame_with(vec![])), "Channel 1").copied();
+            hit.is_some()
+        });
+        let search = kind(OverlayRequest::Search { initial: String::new() });
+        let menu = kind(OverlayRequest::ContextMenu(crate::ui::overlays::ContextMenuSpec { title: String::new(), items: vec![] }));
+        // right-click: the same menu, at the pointer
+        let at = centre(&hit.expect("hit"));
+        rig.click(at, egui::PointerButton::Secondary);
+        assert_eq!(rig.overlay_kinds(), [search, menu]);
+        let out = rig.frame_with(vec![]);
+        let play = *button(&texts(&out), "Play now").expect("the menu's first item");
+        assert!(play.y0 as f32 >= at.y - 1.0 && play.x0 as f32 >= at.x - 1.0, "opens at the pointer: {play:?} vs {at:?}");
+        rig.press(Key::Escape, NONE);
+        assert_eq!(rig.overlay_kinds(), [search], "Esc closes the menu only");
+        // the menu key; Enter on "Play now": the search plays the hit (fullscreen) and closes
+        rig.press(Key::F10, Modifiers::SHIFT);
+        assert_eq!(rig.overlay_kinds(), [search, menu]);
+        rig.press(Key::Enter, NONE);
+        assert!(rig.app.overlays.is_empty());
+        assert_eq!(rig.route(), &Route::Player);
+        assert_eq!(probe.borrow().results, [], "the screen below never got the menu's answer");
     }
 
     // ---- dispatch layers -------------------------------------------------------------------
@@ -2876,6 +3103,21 @@ mod tests {
         rig.frame_with(vec![]);
         assert!(rig.app.window_fullscreen);
         assert_eq!(rig.app.services().config().player.popout_last, None, "unmoved: follow the corner again");
+    }
+
+    /// Popped out, the mouse back button is Esc there too: it puts the window back in.
+    #[test]
+    fn the_mouse_back_button_pops_the_player_back_in() {
+        let mut rig = Rig::new();
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        rig.app.popout_backend = Some(Box::new(PopRecorder(sent.clone())));
+        rig.press(Key::O, Modifiers { shift: true, ..CTRL });
+        rig.size = egui::vec2(480.0, 270.0);
+        rig.frame_with(vec![]);
+        rig.event(pop_event(PopOutEvent::PoppedOut));
+        assert!(rig.app.video_only);
+        rig.mouse_button(egui::PointerButton::Extra1);
+        assert_eq!(sent.borrow().last(), Some(&PopRequest::In { ours: true }));
     }
 
     /// A movie finishing while popped out doesn't pull the window back in: its page lands
