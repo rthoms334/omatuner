@@ -11,8 +11,9 @@
 //!
 //! Every optional integration may fail to start (no session bus, socket in use…): the failure
 //! is logged and the app runs without it. Settings edits re-apply live
-//! ([`Services::apply_config`]): toggling the theme follower, MPRIS or reminders starts/stops
-//! them, a reminder lead change restarts the scheduler, a font change reloads fonts on a worker,
+//! ([`Services::apply_config`]): toggling the theme follower or MPRIS starts/stops them, a
+//! reminder setting restarts the reminder scheduler (it always runs: automatic switches, DESIGN
+//! §30.8, don't depend on notification reminders), a font change reloads fonts on a worker,
 //! a User-Agent / network timeout change rebuilds the shared HTTP client (jobs and image
 //! fetches), and debug logging switches the log filter.
 
@@ -147,9 +148,8 @@ impl Services {
         if cfg.integration.mpris {
             self.start_mpris();
         }
-        if cfg.reminders.enabled {
-            self.start_reminders(&cfg);
-        }
+        // always: automatic switches (DESIGN §30.8) run with notification reminders off too
+        self.start_reminders(&cfg);
         self.integrations.scheduler = Some(crate::jobs::scheduler::spawn(self.jobs.clone()));
         match self.store.reader().and_then(|c| connection_limits(&c)) {
             Ok(cmds) => cmds.into_iter().for_each(|c| self.player.handle().send(c)),
@@ -178,9 +178,11 @@ impl Services {
                 self.store.clone(),
                 self.bus.clone(),
                 lead_s,
+                cfg.reminders.enabled,
                 self.jobs.context().explicit.clone(),
             ),
         );
+        self.agent.set_reminder_waker(self.integrations.reminders.as_ref().map(|r| r.waker()));
     }
 
     /// Re-apply a Settings edit to the integrations (the app calls it after swapping the shared
@@ -209,9 +211,7 @@ impl Services {
         }
         if old.reminders != new.reminders {
             self.integrations.reminders = None; // dropping the scheduler aborts its task
-            if new.reminders.enabled {
-                self.start_reminders(new);
-            }
+            self.start_reminders(new);
         }
         if old.general.debug_log != new.general.debug_log {
             crate::logging::set_debug(new.general.debug_log);

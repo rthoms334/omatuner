@@ -152,6 +152,12 @@ pub struct TunerApp {
     /// played when the PIN overlay answers `Unlocked(OpenPlayer)` (DESIGN §13.12 "PIN prompt on
     /// play"). No screen opens `Pin { then: OpenPlayer }`, so it can't take over a screen's PIN.
     pending_locked: Option<(ChannelId, PlayOrigin)>,
+    /// An MCP client's `play` of a locked item waiting for the PIN (DESIGN §30.4): played
+    /// when the PIN overlay answers `Unlocked(OpenPlayer)`, like `pending_locked`.
+    pending_agent: Option<crate::agent::AgentPlay>,
+    /// Automatic switches called off by their toast's Cancel: a `SwitchNow` already on its way
+    /// is ignored (DESIGN §30.8).
+    cancelled_switches: std::collections::HashSet<crate::model::ReminderId>,
     /// Route whose `on_enter` ran last (a new route — even of the same screen — re-enters).
     entered: Option<Route>,
     layout: LayoutClass,
@@ -249,6 +255,8 @@ impl TunerApp {
             pending_zap: None,
             explicit_visible: false,
             pending_locked: None,
+            pending_agent: None,
+            cancelled_switches: Default::default(),
             entered: None,
             layout: LayoutClass::Wide,
             epg_updated: None,
@@ -412,8 +420,8 @@ impl TunerApp {
             AppEvent::Toast(t) => self.toast(t.clone()),
             // The IPC server already raised the window (`hypr::focus_self`).
             AppEvent::Ipc(req) => self.handle_ipc(req),
-            // SKELETON: the MCP-app track plays the validated target (DESIGN §30.4)
-            AppEvent::Agent(_) => {}
+            // the handler raised the window (`hypr::focus_self`) and validated the target
+            AppEvent::Agent(crate::agent::AgentCommand::Play(p)) => self.on_agent_play(p.clone()),
             AppEvent::Platform(p) => match p {
                 PlatformEvent::Quit => egui_ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 PlatformEvent::Raise => crate::platform::hypr::focus_self(),
@@ -425,8 +433,9 @@ impl TunerApp {
                 PlatformEvent::FilePicked { purpose: PickPurpose::ExportLog, path: Some(path) } => self.export_log(path.clone()),
                 // Other pickers belong to the screen that opened them (`on_event` below).
                 PlatformEvent::FilePicked { .. } | PlatformEvent::ReminderFired(_) => {}
-                // SKELETON: the MCP-app track toasts / switches (DESIGN §30.8)
-                PlatformEvent::SwitchSoon { .. } | PlatformEvent::SwitchNow { .. } => {}
+                PlatformEvent::SwitchSoon { reminder, channel, start } => self.on_switch_soon(*reminder, channel, *start),
+                // the scheduler raised the window
+                PlatformEvent::SwitchNow { reminder, channel } => self.on_switch_now(*reminder, channel),
                 PlatformEvent::PopOut(ev) => self.on_popout_event(ev, egui_ctx),
             },
             // the first copy of a title failed before its first frame (DESIGN §29.15)
@@ -754,6 +763,7 @@ impl TunerApp {
             self.toasts.clear();
             self.pending_toasts.clear();
             self.pending_locked = None;
+            self.pending_agent = None;
             let hidden = Arc::new(self.lib.hiding_explicit());
             let old = std::mem::replace(&mut self.lib, hidden);
             // a playlist left with only explicit movies isn't eligible any more (its toast names
@@ -842,6 +852,156 @@ impl TunerApp {
         self.nav.push(NavRequest::Push(Route::Player));
     }
 
+    /// What the agent handler reads (DESIGN §30.4): the snapshot on screen and when the PIN was
+    /// entered. Every frame (two cheap stores); a replaced snapshot is dropped on the memory
+    /// maintenance thread.
+    fn publish_for_agent(&self) {
+        let Some(s) = &self.services else { return };
+        s.agent.set_unlocked_at(self.parental.unlocked_at());
+        if let Some(old) = s.agent.publish_library(&self.lib) {
+            s.memory.release(old, "agent snapshot");
+        }
+    }
+
+    /// An MCP client's `play` (DESIGN §30.4). The handler checked that the target exists and is
+    /// visible; this plays it like a key press would: the PIN prompt for a locked item (played
+    /// once it is typed), a channel's zap list, a title's copies and resume rules.
+    fn on_agent_play(&mut self, p: crate::agent::AgentPlay) {
+        use crate::agent::PlayTarget;
+        use crate::model::VodKind;
+        let cfg = self.services().config();
+        let unlocked = self.parental.is_unlocked(&cfg.parental);
+        let now = crate::model::now();
+        let gone = |app: &mut Self| app.toast(Toast::info("That is no longer in your playlists"));
+        let plan = |app: &Self, movies: bool, idx: u32| {
+            crate::store::copies::plan(&app.db, &app.lib.vod, movies, idx, unlocked, cfg.interface.copy_order, now).map_err(|e| {
+                tracing::warn!("agent play: {e}");
+            })
+        };
+        let resume = !p.from_start;
+        let cmd = match &p.target {
+            PlayTarget::Media(MediaRef::Channel(id)) => {
+                self.pending_agent = None;
+                return self.play_channel(*id, PlayOrigin::Cli);
+            }
+            PlayTarget::Media(media @ MediaRef::Catchup { channel, .. }) => {
+                let Some(locked) = self.lib.live.get(*channel).map(|c| c.locked) else { return gone(self) };
+                if locked && !unlocked {
+                    return self.ask_pin_for(p, "This channel is locked");
+                }
+                PlayerCommand::Play(PlayRequest { media: media.clone(), zap: None, origin: PlayOrigin::Cli, resume: false, immediate: true })
+            }
+            PlayTarget::Media(MediaRef::Movie(id)) => {
+                let Some(idx) = self.lib.vod.index_of(VodKind::Movie(*id)) else { return gone(self) };
+                let Ok(plan) = plan(self, true, idx) else { return gone(self) };
+                if plan.first().is_none() {
+                    return self.ask_pin_for(p, "This title is locked");
+                }
+                match crate::ui::copies::movie_command(&self.lib.vod, &plan, None, resume, PlayOrigin::Fullscreen) {
+                    Some(cmd) => cmd,
+                    None => return gone(self),
+                }
+            }
+            PlayTarget::Media(MediaRef::Episode(id)) => {
+                let Ok(ep) = crate::store::vod::episode(&self.db, *id) else { return gone(self) };
+                let Some(idx) = self.lib.vod.index_of(VodKind::Series(ep.series_id)) else { return gone(self) };
+                let Ok(plan) = plan(self, false, idx) else { return gone(self) };
+                if plan.first().is_none() {
+                    return self.ask_pin_for(p, "This series is locked");
+                }
+                crate::ui::copies::episode_command(&self.db, &self.lib.vod, &plan, ep.series_id, &ep, resume, PlayOrigin::Fullscreen)
+            }
+            PlayTarget::Series(sid) => {
+                let Some(idx) = self.lib.vod.index_of(VodKind::Series(*sid)) else { return gone(self) };
+                let Ok(plan) = plan(self, false, idx) else { return gone(self) };
+                if plan.first().is_none() {
+                    return self.ask_pin_for(p, "This series is locked");
+                }
+                // the episode the copy with the newest progress is at (Enter on its card)
+                let ids: Vec<crate::model::SeriesId> = plan
+                    .order
+                    .iter()
+                    .filter_map(|c| match self.lib.vod.series.get(*c as usize)?.kind {
+                        VodKind::Series(id) => Some(id),
+                        VodKind::Movie(_) => None,
+                    })
+                    .collect();
+                match crate::store::copies::next_episode(&self.db, &ids) {
+                    Ok(Some((series, ep))) => {
+                        crate::ui::copies::episode_command(&self.db, &self.lib.vod, &plan, series, &ep, resume, PlayOrigin::Fullscreen)
+                    }
+                    Ok(None) => {
+                        self.nav.push(NavRequest::Push(Route::SeriesDetail(*sid)));
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!("agent play: {e}");
+                        return gone(self);
+                    }
+                }
+            }
+            PlayTarget::Media(MediaRef::Url(_)) => return,
+        };
+        self.pending_agent = None;
+        self.pending_zap = None;
+        self.send_player(cmd);
+        self.nav.push(NavRequest::Push(Route::Player));
+    }
+
+    /// The PIN prompt for an agent's `play` of a locked item; it plays once the PIN is typed.
+    fn ask_pin_for(&mut self, p: crate::agent::AgentPlay, reason: &str) {
+        self.pending_agent = Some(p);
+        self.nav.push(NavRequest::Open(OverlayRequest::Pin { then: Box::new(Action::OpenPlayer), reason: reason.into() }));
+    }
+
+    /// An automatic switch is due shortly: "Switching to ‹channel› in 10 s · ‹programme›" with
+    /// Cancel (DESIGN §30.8). Nothing for a channel parental control hides.
+    fn on_switch_soon(&mut self, id: crate::model::ReminderId, channel: &ItemRef, start: Timestamp) {
+        if self.lib.conceals(channel) {
+            return;
+        }
+        let row = crate::store::user::reminder(&self.db, id).ok().flatten();
+        let name = match self.lib.live.by_ref(channel).and_then(|c| self.lib.live.get(c)) {
+            Some(c) => c.name.to_string(),
+            None => row.as_ref().map(|r| r.channel_name.clone()).unwrap_or_else(|| "the channel".to_owned()),
+        };
+        let secs = (start - crate::model::now()).max(1);
+        let mut text = format!("Switching to {name} in {secs} s");
+        if let Some(t) = row.map(|r| r.programme_title).filter(|t| !t.trim().is_empty()) {
+            text.push_str(" · ");
+            text.push_str(t.trim());
+        }
+        let ttl_ms = u32::try_from((secs + 3) * 1000).unwrap_or(u32::MAX);
+        self.toast(Toast { kind: ToastKind::Info, text, action: Some(("Cancel".into(), Action::CancelSwitch(id))), ttl_ms });
+    }
+
+    /// An automatic switch's start: play the channel unless it was cancelled or already plays.
+    fn on_switch_now(&mut self, id: crate::model::ReminderId, channel: &ItemRef) {
+        if self.cancelled_switches.remove(&id) {
+            return;
+        }
+        match self.channel_for(channel) {
+            Some(cid) => {
+                let playing =
+                    self.snapshot.state != PlayerState::Idle && self.snapshot.playable.as_ref().is_some_and(|p| p.media == MediaRef::Channel(cid));
+                if !playing {
+                    self.play_channel(cid, PlayOrigin::Reminder);
+                }
+            }
+            None => self.toast(Toast::info("That channel is no longer in your playlists")),
+        }
+    }
+
+    /// The Cancel of a switch's toast: the row goes, a `SwitchNow` on its way is ignored.
+    fn cancel_switch(&mut self, id: crate::model::ReminderId) {
+        self.cancelled_switches.insert(id);
+        let _ = self.services().store.writer().submit_notify(DataScope::Reminders, move |c| match crate::store::user::reminder(c, id)? {
+            Some(r) if r.switches() => crate::store::user::remove_reminder(c, id),
+            _ => Ok(()),
+        });
+        self.toast(Toast::info("Switch cancelled"));
+    }
+
     /// The visible channels of a group in the Live sort order; `None` when the library has none.
     fn zap_list(&self, group: GroupId, cfg: &Config) -> Option<ZapList> {
         let collection = Collection::Group(group);
@@ -891,6 +1051,8 @@ impl TunerApp {
                 self.toggle_popout(egui_ctx);
             }
             Action::Back => self.back(egui_ctx),
+            // an automatic switch's toast (DESIGN §30.8)
+            Action::CancelSwitch(id) => self.cancel_switch(id),
             // a combined action's Undo (`ui::copies`)
             Action::Undo(n) => {
                 let undone = crate::ui::copies::undo(self.services(), n);
@@ -1067,6 +1229,14 @@ impl TunerApp {
                 {
                     self.overlays.pop();
                     self.play_channel(id, origin);
+                    return;
+                }
+                // ... or by an MCP client's `play` of a locked title / catch-up
+                if matches!(result, overlays::OverlayResult::Unlocked(Action::OpenPlayer))
+                    && let Some(p) = self.pending_agent.take()
+                {
+                    self.overlays.pop();
+                    self.on_agent_play(p);
                     return;
                 }
                 if let Some(o) = self.overlays.pop() {
@@ -1425,6 +1595,7 @@ impl eframe::App for TunerApp {
         }
         self.snapshot = self.services().player.handle().snapshot();
         self.sync_explicit(ctx);
+        self.publish_for_agent();
         self.measured.observe(&self.snapshot);
         let busy = matches!(self.snapshot.state, PlayerState::Loading { .. } | PlayerState::Zapping { .. });
         self.services().jobs.context().player_busy.store(busy, Ordering::Relaxed);
@@ -1567,6 +1738,7 @@ impl eframe::App for TunerApp {
         self.apply_config_edits(&egui_ctx);
         // "Lock now", a PIN typed or set this frame: not one more frame of the old state
         self.sync_explicit(&egui_ctx);
+        self.publish_for_agent();
         self.free_closed_search();
         if self.budget.deferred() || self.now_next.pending() || !self.pending_actions.is_empty() {
             egui_ctx.request_repaint();
@@ -3288,6 +3460,193 @@ mod tests {
         assert_eq!(rig.log().toasts.len(), 1);
     }
 
+    // ---------------------------------------------------------------- agent control (§30)
+
+    fn pin_config() -> Config {
+        let mut cfg = test_config();
+        let salt = "00".repeat(16);
+        cfg.parental.enabled = true;
+        cfg.parental.pin_hash = Some(crate::ui::parental::hash_pin("1234", &salt));
+        cfg.parental.pin_salt = Some(salt);
+        cfg
+    }
+
+    fn pin_prompt() -> std::mem::Discriminant<OverlayRequest> {
+        std::mem::discriminant(&OverlayRequest::Pin { then: Box::new(Action::OpenPlayer), reason: String::new() })
+    }
+
+    fn type_pin(rig: &mut Rig) {
+        rig.frame_with(vec![Event::Text("1234".into())]);
+        rig.press(Key::Enter, NONE);
+        rig.frame_with(vec![]);
+    }
+
+    /// `seed_channels(3)` with Channel 0 locked and a guide: "Touring Cars" on Channel 1 and
+    /// "Rally Stage" on Channel 2, starting `soon` and `soon + 2` seconds from now.
+    fn seed_agent(c: &mut rusqlite::Connection, soon: i64) -> crate::error::Result<()> {
+        use rusqlite::params;
+        seed_channels(c, 3, None)?;
+        c.execute("INSERT INTO item_override(source_id, kind, item_key, locked, fp) VALUES (1, 'channel', 'm3u:ch0', 1, '')", [])?;
+        let now = crate::model::now();
+        c.execute("INSERT INTO epg_source(id, name, kind, url, active_gen) VALUES (1, 'Guide', 'url', 'http://127.0.0.1/epg.xml', 1)", [])?;
+        for (ec, key, start, title) in [(1, "m3u:ch1", now + soon, "Touring Cars"), (2, "m3u:ch2", now + soon + 2, "Rally Stage")] {
+            c.execute("INSERT INTO epg_channel(id, epg_source_id, xmltv_id, seen_gen) VALUES (?1, 1, ?2, 1)", params![ec, key])?;
+            c.execute("INSERT INTO channel_epg(channel_id, epg_channel_id) SELECT id, ?1 FROM channel WHERE key = ?2", params![ec, key])?;
+            c.execute(
+                "INSERT INTO programme(epg_source_id, epg_channel_id, gen, start, stop, title) VALUES (1, ?1, 1, ?2, ?3, ?4)",
+                params![ec, start, start + 3600, title],
+            )?;
+            c.execute("INSERT INTO programme_fts(rowid, title, sub_title) VALUES (?1, ?2, NULL)", params![c.last_insert_rowid(), title])?;
+        }
+        Ok(())
+    }
+
+    /// A request to the agent handler the rig's IPC server runs (same services, the snapshot
+    /// the app publishes every frame).
+    fn ask(rig: &Rig, call: crate::agent::proto::Call) -> serde_json::Value {
+        use crate::agent::server::AgentService;
+        let s = rig.app.services();
+        let handler = crate::agent::server::AgentHandler::new(
+            s.agent.clone(),
+            s.store.clone(),
+            s.config.clone(),
+            s.player.handle(),
+            s.bus.clone(),
+            s.jobs.clone(),
+        );
+        let reply = s.rt.block_on(handler.handle(crate::agent::proto::Request::new(1, call)));
+        assert!(reply.ok, "{reply:?}");
+        reply.result.unwrap()
+    }
+
+    /// DESIGN §30.4 end to end: `play` from an MCP client plays like `--play` (fullscreen, the
+    /// zap list); a locked channel opens the PIN prompt and plays nothing until the PIN.
+    #[test]
+    fn agent_play_reaches_the_player_and_a_locked_channel_the_pin_prompt() {
+        use crate::agent::proto::{Call, Play};
+        let mut rig = Rig::with(pin_config(), live(), 1.0, |c| seed_agent(c, 3600));
+        rig.settle();
+        let ch1 = rig.app.lib.live.by_ref(&channel_ref(1)).unwrap();
+        let out = ask(&rig, Call::Play(Play { item: "channel:1:m3u:ch1".into(), from_start: None }));
+        assert_eq!(out["outcome"], "playing");
+        rig.until("the play", |r| !played(&r.log()).is_empty());
+        assert_eq!(played(&rig.log()), [(MediaRef::Channel(ch1), PlayOrigin::Cli)]);
+        assert_eq!(rig.route(), &Route::Player);
+        assert!(rig.log().commands.iter().any(|c| matches!(c, PlayerCommand::Play(r) if r.zap.is_some())), "zaps through its group");
+
+        let out = ask(&rig, Call::Play(Play { item: "channel:1:m3u:ch0".into(), from_start: None }));
+        assert_eq!(out["outcome"], "pin_required");
+        rig.until("the PIN prompt", |r| r.overlay_kinds() == [pin_prompt()]);
+        assert_eq!(played(&rig.log()).len(), 1, "nothing plays before the PIN");
+        type_pin(&mut rig);
+        let ch0 = rig.app.lib.live.by_ref(&channel_ref(0)).unwrap();
+        assert_eq!(played(&rig.log()).last(), Some(&(MediaRef::Channel(ch0), PlayOrigin::Cli)));
+    }
+
+    /// A locked title from an agent: the PIN prompt, then the title's copy command (resuming).
+    #[test]
+    fn agent_play_of_a_locked_movie_waits_for_the_pin() {
+        let mut rig = Rig::with(pin_config(), live(), 1.0, |c| {
+            seed_channels(c, 1, None)?;
+            c.execute("INSERT INTO grp(source_id, kind, key, name, provider_order, item_count, seen_gen) VALUES (1, 'movie', 'movie:films', 'Films', 0, 1, 1)", [])?;
+            let g = c.last_insert_rowid();
+            c.execute(
+                "INSERT INTO movie(source_id, key, name, clean_name, norm_name, stream, provider_order, seen_gen)
+                 VALUES (1, 'm3u:film', 'Film', 'Film', 'film', '{\"t\":\"url\",\"url\":\"http://127.0.0.1/film.mp4\"}', 0, 1)",
+                [],
+            )?;
+            c.execute("INSERT INTO movie_group(group_id, movie_id, position) VALUES (?1, ?2, 0)", [g, c.last_insert_rowid()])?;
+            c.execute("INSERT INTO item_override(source_id, kind, item_key, locked, fp) VALUES (1, 'movie', 'm3u:film', 1, '')", [])?;
+            Ok(())
+        });
+        rig.settle();
+        let id = crate::model::MovieId(1);
+        let play = crate::agent::AgentPlay { target: crate::agent::PlayTarget::Media(MediaRef::Movie(id)), from_start: false };
+        rig.event(AppEvent::Agent(crate::agent::AgentCommand::Play(play)));
+        rig.frame_with(vec![]);
+        assert_eq!(rig.overlay_kinds(), [pin_prompt()]);
+        let copies = |rig: &Rig| {
+            rig.log().commands.iter().filter_map(|c| if let PlayerCommand::PlayCopy(c) = c { Some(c.req.clone()) } else { None }).collect::<Vec<_>>()
+        };
+        assert!(copies(&rig).is_empty());
+        type_pin(&mut rig);
+        let reqs = copies(&rig);
+        assert_eq!(reqs.len(), 1);
+        assert_eq!((&reqs[0].media, reqs[0].resume), (&MediaRef::Movie(id), true));
+        assert_eq!(rig.route(), &Route::Player);
+    }
+
+    /// DESIGN §30.8 end to end: `schedule_switch` → the scheduler (running although reminders
+    /// are off) → "Switching to … · Cancel" toasts → the switch plays the channel at the start;
+    /// the switch whose Cancel was pressed never plays.
+    #[test]
+    fn agent_switches_toast_then_switch_and_cancel_stops_one() {
+        use crate::agent::proto::{Call, GuideSearch, ScheduleSwitch};
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_agent(c, 14));
+        rig.settle();
+        let rally_start = {
+            let conn = &rig.app.db;
+            conn.query_row("SELECT start FROM programme WHERE title = 'Rally Stage'", [], |r| r.get::<_, i64>(0)).unwrap()
+        };
+        let mut ids = Vec::new();
+        for q in ["touring", "rally"] {
+            let found = ask(&rig, Call::GuideSearch(GuideSearch { query: q.into(), ..Default::default() }));
+            let item = found["programmes"][0]["ref"].as_str().unwrap().to_owned();
+            let s = ask(&rig, Call::ScheduleSwitch(ScheduleSwitch { item, at: None }));
+            ids.push(crate::model::ReminderId(s["id"].as_i64().unwrap()));
+        }
+        let (touring, rally) = (ids[0], ids[1]);
+        let cancels = |r: &Rig| r.log().toasts.iter().filter_map(|t| t.action.clone()).filter(|a| matches!(a.1, Action::CancelSwitch(_))).count();
+        rig.until_within("the switch toasts", Duration::from_secs(20), |r| cancels(r) == 2);
+        let toast = rig.log().toasts.iter().find(|t| t.action == Some(("Cancel".into(), Action::CancelSwitch(touring)))).cloned().unwrap();
+        assert!(toast.text.starts_with("Switching to Channel 1 in ") && toast.text.ends_with(" s · Touring Cars"), "{}", toast.text);
+        // the rally's Cancel
+        rig.app.pending_actions.push((Action::CancelSwitch(rally), Vec::new()));
+        rig.frame_with(vec![]);
+        assert_eq!(rig.log().toasts.last().map(|t| t.text.as_str()), Some("Switch cancelled"));
+        let ch1 = rig.app.lib.live.by_ref(&channel_ref(1)).unwrap();
+        rig.until_within("the switch", Duration::from_secs(25), |r| played(&r.log()).contains(&(MediaRef::Channel(ch1), PlayOrigin::Reminder)));
+        assert_eq!(rig.route(), &Route::Player);
+        // past the rally's start: nothing else switched
+        rig.until_within("the rally's start", Duration::from_secs(10), |_| crate::model::now() > rally_start + 1);
+        rig.frame_with(vec![]);
+        assert_eq!(played(&rig.log()).len(), 1, "{:?}", played(&rig.log()));
+        let states: Vec<(i64, String)> = {
+            let mut st = rig.app.db.prepare("SELECT id, state FROM reminder ORDER BY id").unwrap();
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().collect::<Result<_, _>>().unwrap()
+        };
+        assert_eq!(states, [(touring.0, "fired".to_owned())], "the cancelled row is gone");
+    }
+
+    /// A `SwitchNow` for a channel that already plays changes nothing; one for a channel that
+    /// is gone says so.
+    #[test]
+    fn a_switch_to_what_already_plays_does_nothing() {
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_channels(c, 2, None));
+        rig.settle();
+        let id = rig.app.lib.live.by_ref(&channel_ref(1)).unwrap();
+        let playable = crate::model::Playable {
+            media: MediaRef::Channel(id),
+            kind: crate::model::PlayableKind::Live,
+            item: Some(channel_ref(1)),
+            source_id: Some(SourceId(1)),
+            title: "Channel 1".into(),
+            subtitle: None,
+            logo: None,
+            number: Some(2),
+            url: crate::redact::Secret::new(String::new()),
+            headers: Default::default(),
+            start_at: None,
+            duration_hint: None,
+        };
+        rig.app.snapshot =
+            Arc::new(PlayerSnapshot { state: PlayerState::Playing, playable: Some(Arc::new(playable)), ..(*rig.app.snapshot).clone() });
+        rig.event(AppEvent::Platform(PlatformEvent::SwitchNow { reminder: crate::model::ReminderId(1), channel: channel_ref(1) }));
+        assert!(played(&rig.log()).is_empty());
+        rig.event(AppEvent::Platform(PlatformEvent::SwitchNow { reminder: crate::model::ReminderId(2), channel: channel_ref(7) }));
+        assert_eq!(rig.log().toasts.last().map(|t| t.text.as_str()), Some("That channel is no longer in your playlists"));
+    }
+
     #[test]
     fn image_user_agents_by_playlist_host() {
         use crate::model::{Source, SourceKind, SourceSettings, XtreamCredentials};
@@ -3420,13 +3779,16 @@ mod tests {
     #[test]
     fn integration_settings_apply_live() {
         let mut rig = Rig::new();
-        assert!(rig.app.services().integrations.reminders.is_none());
+        // the scheduler always runs (automatic switches, DESIGN §30.8); the setting turns the
+        // notification reminders on and off
+        let notifies = |rig: &Rig| rig.app.services().integrations.reminders.as_ref().map(|r| r.notifies());
+        assert_eq!(notifies(&rig), Some(false));
         rig.app.config_edits.push(Box::new(|c: &mut Config| c.reminders.enabled = true));
         rig.frame_with(vec![]);
-        assert!(rig.app.services().integrations.reminders.is_some());
+        assert_eq!(notifies(&rig), Some(true));
         rig.app.config_edits.push(Box::new(|c: &mut Config| c.reminders.enabled = false));
         rig.frame_with(vec![]);
-        assert!(rig.app.services().integrations.reminders.is_none());
+        assert_eq!(notifies(&rig), Some(false));
         // follow the Omarchy theme (fake home: nothing there → fallback palette, loaded on a
         // worker), then stop following
         rig.app.config_edits.push(Box::new(|c: &mut Config| c.integration.follow_omarchy_theme = true));

@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use crate::config::ParentalConfig;
+use crate::platform::notify::ReminderWaker;
 use crate::store::library::Library;
 use crate::ui::ParentalSession;
 
@@ -22,6 +23,9 @@ use crate::ui::ParentalSession;
 pub struct AgentShared {
     lib: RwLock<Arc<Library>>,
     unlocked_at: Mutex<Option<Instant>>,
+    /// The reminder scheduler's waker (`Services::start_reminders`): a switch the handler
+    /// wrote is picked up at once, UI frame or not.
+    reminders: Mutex<Option<ReminderWaker>>,
 }
 
 /// The parental state at one moment.
@@ -55,6 +59,18 @@ impl AgentShared {
     /// The app's parental session changed (`ParentalSession::unlocked_at`).
     pub fn set_unlocked_at(&self, at: Option<Instant>) {
         *self.unlocked_at.lock().unwrap_or_else(|e| e.into_inner()) = at;
+    }
+
+    /// The reminder scheduler (re)started (`None`: it isn't running).
+    pub fn set_reminder_waker(&self, waker: Option<ReminderWaker>) {
+        *self.reminders.lock().unwrap_or_else(|e| e.into_inner()) = waker;
+    }
+
+    /// Ask the reminder scheduler to re-read its reminders (a switch was added or removed).
+    pub fn wake_reminders(&self) {
+        if let Some(w) = self.reminders.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            w.wake();
+        }
     }
 
     /// The parental state now, under `cfg` (the live config).
