@@ -352,7 +352,7 @@ async fn refresh_playlist(
         Ok((_, account)) => account,
         Err(Error::Cancelled) => return Err(Error::Cancelled),
         Err(e) => {
-            upgrade_failed(ctx, src, &creds, &e).await?;
+            upgrade_failed(ctx, src, &creds, &e, false).await?;
             return keep_playlist(ctx, src, playlist, refetch, cfg, progress, cancel).await;
         }
     };
@@ -360,10 +360,10 @@ async fn refresh_playlist(
     // 3. switch: the Xtream import commits it at its first finish
     let login = creds.clone();
     let moves = read(ctx, move |c| import::m3u_to_xtream_moves(c, id, &login)).await?;
-    let mut upgrade = Upgrade { creds, account, moves, committed: false };
+    let mut upgrade = Upgrade { creds, account, moves, committed: false, transient: false };
     match refresh_xtream(ctx, src, cfg, progress, cancel, Some(&mut upgrade)).await {
         Err(e) if !upgrade.committed && !matches!(e, Error::Cancelled) => {
-            upgrade_failed(ctx, src, &upgrade.creds, &e).await?;
+            upgrade_failed(ctx, src, &upgrade.creds, &e, upgrade.transient).await?;
             keep_playlist(ctx, src, playlist, refetch, cfg, progress, cancel).await
         }
         r => r,
@@ -372,9 +372,10 @@ async fn refresh_playlist(
 
 /// An upgrade check found no usable Xtream login: record it (retried in a week, or on a forced
 /// refresh; in an hour when the server couldn't answer — offline, a timeout, a 5xx or 429 —
-/// as that says nothing about the login) and say why in the log.
-async fn upgrade_failed(ctx: &JobContext, src: &Source, creds: &XtreamCredentials, e: &Error) -> Result<()> {
-    let transient = matches!(e, Error::Network(_) | Error::Http { status: 429 | 500..=599, .. });
+/// as that says nothing about the login; also `transient` when every list failed that way)
+/// and say why in the log.
+async fn upgrade_failed(ctx: &JobContext, src: &Source, creds: &XtreamCredentials, e: &Error, transient: bool) -> Result<()> {
+    let transient = transient || is_transient(e);
     let (id, attempt) = (src.id, UpgradeAttempt { at: crate::model::now(), login_failed: true, transient });
     write(ctx, move |c| crate::store::sources::record_upgrade_attempt(c, id, &attempt)).await?;
     tracing::info!(
@@ -561,19 +562,41 @@ struct M3uParsed {
 
 /// Distinct Xtream logins an M3U import keeps for redaction (a merged playlist may carry many).
 const MAX_PLAYLIST_LOGINS: usize = 16;
+/// Pairs seen on one entry only, held while waiting for a second (a plain playlist has many).
+const MAX_LOGIN_CANDIDATES: usize = 64;
 
-/// Collect (and register at once) the login of an entry's Xtream stream URL: the playlist's
-/// short-form entries with a path prefix carry it too, and no URL pattern can mask those.
-fn note_login(logins: &mut Vec<(String, String)>, url: &str) {
-    if logins.len() >= MAX_PLAYLIST_LOGINS {
-        return;
-    }
-    if let Some(s) = parse_stream_url(url) {
+/// The logins of an M3U import's Xtream stream URLs: the playlist's short-form entries with a
+/// path prefix carry them too, and no URL pattern can mask those. A pair counts once two
+/// entries with different stream ids carry it — every entry of an account does, while a CDN
+/// path that merely looks like `/live/<a>/<b>/<n>` must not make "channel" a secret.
+#[derive(Default)]
+struct PlaylistLogins {
+    /// Registered with the redactor as they were confirmed.
+    found: Vec<(String, String)>,
+    /// Seen on one entry so far, with its stream id.
+    once: Vec<((String, String), i64)>,
+}
+
+impl PlaylistLogins {
+    fn note(&mut self, url: &str) {
+        if self.found.len() >= MAX_PLAYLIST_LOGINS {
+            return;
+        }
+        let Some(s) = parse_stream_url(url) else { return };
         let login = (s.creds.username, s.creds.password.into_inner());
-        if !logins.contains(&login) {
-            crate::redact::register_secret(&login.0);
-            crate::redact::register_secret(&login.1);
-            logins.push(login);
+        if self.found.contains(&login) {
+            return;
+        }
+        match self.once.iter().position(|(l, _)| *l == login) {
+            Some(i) if self.once[i].1 != s.stream_id => {
+                self.once.swap_remove(i);
+                crate::redact::register_secret(&login.0);
+                crate::redact::register_secret(&login.1);
+                self.found.push(login);
+            }
+            Some(_) => {}
+            None if self.once.len() < MAX_LOGIN_CANDIDATES => self.once.push((login, s.stream_id)),
+            None => {}
         }
     }
 }
@@ -595,13 +618,13 @@ fn parse_m3u_file(
     let mut batch = M3uBatch::default();
     let mut episodes = EpisodeCollector::default();
     let (mut entries, mut skipped) = (0u64, 0u64);
-    let mut logins = Vec::new();
+    let mut logins = PlaylistLogins::default();
     let send = |b: M3uBatch| tx.blocking_send(b).map_err(|_| Error::Cancelled);
     for item in parser.by_ref() {
         match item {
             Ok(e) => {
                 let order = i32::try_from(entries).unwrap_or(i32::MAX);
-                note_login(&mut logins, &e.url);
+                logins.note(&e.url);
                 match m3u_vod::classify(&e) {
                     EntryClass::Live => batch.channels.push(m3u_entry_to_channel(&e, order, smart, &mut keys, &mut new_groups)),
                     EntryClass::Movie { stream_id } => batch.movies.push(m3u_entry_to_movie(&e, stream_id, order, smart, &mut keys, &mut new_groups)),
@@ -638,7 +661,7 @@ fn parse_m3u_file(
         }
         send(M3uBatch { series, ..Default::default() })?;
     }
-    Ok(M3uParsed { tvg_urls: parser.header().tvg_urls.clone(), entries, skipped, logins })
+    Ok(M3uParsed { tvg_urls: parser.header().tvg_urls.clone(), entries, skipped, logins: logins.found })
 }
 
 pub(super) fn m3u_error(e: M3uError) -> Error {
@@ -923,6 +946,11 @@ fn is_fatal(e: &Error) -> bool {
     matches!(e, Error::Cancelled | Error::AuthRejected | Error::AccountUnavailable { .. } | Error::Db(_) | Error::Io { .. })
 }
 
+/// The server couldn't answer (offline, a timeout, a 5xx or 429): says nothing about the login.
+fn is_transient(e: &Error) -> bool {
+    matches!(e, Error::Network(_) | Error::Http { status: 429 | 500..=599, .. })
+}
+
 /// A list action's error in refresh terms: 401 = the login no longer works; 403 = the panel
 /// refuses this request (blocked account, too many devices, User-Agent filter).
 fn list_error(e: Error) -> Error {
@@ -970,6 +998,9 @@ struct Upgrade {
     moves: Vec<KeyMove>,
     /// The source is Xtream now (its first finish switched it).
     committed: bool,
+    /// Not committed because every list failed only as [`is_transient`] (their combined
+    /// error no longer says so).
+    transient: bool,
 }
 
 impl Upgrade {
@@ -1038,7 +1069,7 @@ async fn refresh_xtream(
             let login = creds.clone();
             let moves = read(ctx, move |c| import::m3u_to_xtream_moves(c, id, &login)).await?;
             if !moves.is_empty() {
-                leftover = Some(Upgrade { creds: creds.clone(), account: AccountInfo::default(), moves, committed: true });
+                leftover = Some(Upgrade { creds: creds.clone(), account: AccountInfo::default(), moves, committed: true, transient: false });
             }
         }
     }
@@ -1088,7 +1119,12 @@ async fn refresh_xtream(
     }
 
     let summary = match (live, vod_done.is_empty()) {
-        (None, true) => return Err(combine(failures)),
+        (None, true) => {
+            if let Some(u) = upgrade {
+                u.transient = failures.iter().all(|(_, e)| is_transient(e));
+            }
+            return Err(combine(failures));
+        }
         (Some(s), true) => s,
         (live, false) => {
             progress.set(JobPhase::Finishing);
@@ -1443,6 +1479,21 @@ mod tests {
             url: url.into(),
             ..Default::default()
         }
+    }
+
+    /// A CDN path shaped like a stream URL must not turn its segments into secrets (they would
+    /// be masked in every log line); an account's login is on many entries.
+    #[test]
+    fn a_playlist_login_counts_once_two_streams_carry_it() {
+        let mut logins = PlaylistLogins::default();
+        logins.note("https://cdn.example/live/channel-9d2/hd1-9d2/1080.m3u8");
+        logins.note("https://cdn.example/live/channel-9d2/hd1-9d2/1080.m3u8");
+        logins.note("http://panel.example/live/pl-user-71c/pl-pass-71c/11.ts");
+        assert!(logins.found.is_empty(), "one stream each");
+        logins.note("http://panel.example/pre/movie/pl-user-71c/pl-pass-71c/12.mkv");
+        assert_eq!(logins.found, [("pl-user-71c".to_owned(), "pl-pass-71c".to_owned())]);
+        assert_eq!(crate::redact::redact("http://cdn.example/pre/pl-user-71c/pl-pass-71c/11.ts"), "http://cdn.example/pre/***/***/11.ts");
+        assert_eq!(crate::redact::redact("channel-9d2 hd1-9d2"), "channel-9d2 hd1-9d2");
     }
 
     #[test]

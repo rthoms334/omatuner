@@ -208,20 +208,28 @@ pub fn record_upgrade_attempt(conn: &Connection, id: SourceId, attempt: &Upgrade
     Ok(())
 }
 
-/// `meta` key marking a source upgraded by `tuner --refresh`, while no window could say so.
+/// `meta` key marking a source upgraded while no window has said so yet.
 fn unseen_upgrade_key(id: SourceId) -> String {
     format!("xtream-upgraded-unseen:{}", id.0)
 }
 
-/// `tuner --refresh` switched this M3U source to its Xtream login: the next window says so
-/// ([`take_unseen_upgrades`], DESIGN §27.3).
+/// This M3U source switched to its Xtream login (written with the switch): until a window
+/// toasts it ([`forget_unseen_upgrade`]) — the refresh was headless, or Tuner quit or the job
+/// was cancelled before its end was shown — the next window says so ([`take_unseen_upgrades`],
+/// DESIGN §27.3).
 pub fn note_unseen_upgrade(conn: &Connection, id: SourceId) -> Result<()> {
     conn.execute("INSERT INTO meta(key, value) VALUES (?1, '1') ON CONFLICT(key) DO NOTHING", [unseen_upgrade_key(id)])?;
     Ok(())
 }
 
-/// The names of the sources upgraded since the last window (still there and still Xtream),
-/// forgetting them: the window that asks shows them.
+/// A window has said this source was upgraded.
+pub fn forget_unseen_upgrade(conn: &Connection, id: SourceId) -> Result<()> {
+    conn.execute("DELETE FROM meta WHERE key = ?1", [unseen_upgrade_key(id)])?;
+    Ok(())
+}
+
+/// The names of the sources whose upgrade no window has said yet (still there and still
+/// Xtream), forgetting them: the window that asks shows them.
 pub fn take_unseen_upgrades(conn: &Connection) -> Result<Vec<String>> {
     atomic(conn, |c| {
         let mut stmt = c.prepare(

@@ -821,6 +821,10 @@ pub fn finish_catalogue_with(
     let tx = conn.transaction()?;
     if let Some((kind, login)) = &opts.switch_kind {
         crate::store::sources::set_source_kind(&tx, imp.source, *kind, login.as_ref())?;
+        if *kind == SourceKind::Xtream {
+            // said by the window that sees the refresh end, else by the next one to start
+            crate::store::sources::note_unseen_upgrade(&tx, imp.source)?;
+        }
     }
     if let Some(a) = &opts.account {
         crate::store::sources::set_account(&tx, imp.source, a)?;

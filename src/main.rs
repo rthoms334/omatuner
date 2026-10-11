@@ -11,8 +11,8 @@
 //! windowed instance runs it does nothing — that instance owns the database writer and its
 //! scheduler refreshes on its own. It holds the instance lock for the whole refresh, so a
 //! window started meanwhile waits like for a starting instance and then says a background
-//! refresh is running; playlists it upgraded to their Xtream login are toasted by the next
-//! window (`store::sources::note_unseen_upgrade`).
+//! refresh is running (and a desktop notification says so); playlists it upgraded to their
+//! Xtream login are toasted by the next window (`store::sources::note_unseen_upgrade`).
 
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -26,7 +26,7 @@ use tuner::cli::Cli;
 use tuner::config::Config;
 use tuner::fonts::{FontSet, LoadedFonts};
 use tuner::ipc::{Handoff, IpcRequest};
-use tuner::jobs::{JobContext, JobEvent, JobKind, JobManager, JobOutcome};
+use tuner::jobs::{JobContext, JobEvent, JobKind, JobManager};
 use tuner::model::JobId;
 use tuner::msg::{AppEvent, EventBus};
 use tuner::paths::AppPaths;
@@ -78,7 +78,14 @@ fn main() -> anyhow::Result<()> {
     let request =
         IpcRequest { view: cli.view, play: cli.play.as_deref().map(absolute_input), inputs: cli.inputs.iter().map(|i| absolute_input(i)).collect() };
     // held until the process exits: the database has one owner
-    let Some(_instance) = become_primary(&paths, &request, HANDOFF_WAIT)? else {
+    let primary = become_primary(&paths, &request, HANDOFF_WAIT);
+    if let Err(e) = &primary
+        && e.is::<RefreshRunning>()
+    {
+        // launched from the desktop, nobody reads stderr
+        tuner::platform::notify::notify(tuner::APP_NAME, &e.to_string(), false);
+    }
+    let Some(_instance) = primary? else {
         return Ok(());
     };
 
@@ -204,16 +211,26 @@ fn become_primary(paths: &AppPaths, request: &IpcRequest, wait: Duration) -> any
         }
         if Instant::now() >= deadline {
             let holder = std::fs::read_to_string(lock_path(paths)).unwrap_or_default();
-            anyhow::ensure!(
-                holder != REFRESH_MARK,
-                "a background refresh (tuner --refresh) is running; start {} again once it has finished",
-                tuner::APP_NAME
-            );
+            if holder == REFRESH_MARK {
+                return Err(RefreshRunning.into());
+            }
             anyhow::bail!("{} is already running but doesn't answer (try again in a moment)", tuner::APP_NAME);
         }
         std::thread::sleep(Duration::from_millis(100));
     }
 }
+
+/// A launch gave up because `tuner --refresh` holds the instance lock (see [`REFRESH_MARK`]).
+#[derive(Debug)]
+struct RefreshRunning;
+
+impl std::fmt::Display for RefreshRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "a background refresh (tuner --refresh) is running; start {} again once it has finished", tuner::APP_NAME)
+    }
+}
+
+impl std::error::Error for RefreshRunning {}
 
 /// Held by the primary instance until it exits (`None` inside: locking failed, unguarded).
 #[derive(Debug)]
@@ -284,13 +301,7 @@ fn wait_for_jobs(jobs: &JobManager, events: &Receiver<AppEvent>, root: JobId, ti
             Ok(AppEvent::Job(JobEvent::Finished { id, kind, outcome, .. })) => {
                 root_done |= id == root;
                 match outcome {
-                    Ok(o) => {
-                        tracing::info!("refresh: {kind:?} done");
-                        // no window to say so: the next one does (written before the store closes)
-                        if let JobOutcome::SourceRefreshed { source, upgraded: true, .. } = o {
-                            let _ = jobs.context().store.writer().submit(move |c| tuner::store::sources::note_unseen_upgrade(c, source));
-                        }
-                    }
+                    Ok(_) => tracing::info!("refresh: {kind:?} done"),
                     Err(e) => {
                         tracing::warn!("refresh: {kind:?} failed: {e}");
                         failed += 1;
@@ -391,15 +402,16 @@ mod tests {
         let refresh = refresh_lock(&paths).expect("nothing running");
         assert!(refresh_lock(&paths).is_none(), "one refresh at a time");
         let req = IpcRequest::default();
-        let err = become_primary(&paths, &req, Duration::from_millis(200)).unwrap_err().to_string();
-        assert!(err.contains("background refresh"), "{err}");
+        // the type picks the desktop notification
+        let err = become_primary(&paths, &req, Duration::from_millis(200)).unwrap_err();
+        assert!(err.is::<RefreshRunning>() && err.to_string().contains("background refresh"), "{err}");
         drop(refresh);
         let window = become_primary(&paths, &req, Duration::ZERO).unwrap().expect("primary once the refresh is done");
         drop(window);
         // a lock held by a window that is still starting is not mistaken for a refresh
         let _starting = become_primary(&paths, &req, Duration::ZERO).unwrap().expect("primary");
-        let err = become_primary(&paths, &req, Duration::from_millis(200)).unwrap_err().to_string();
-        assert!(err.contains("doesn't answer"), "{err}");
+        let err = become_primary(&paths, &req, Duration::from_millis(200)).unwrap_err();
+        assert!(!err.is::<RefreshRunning>() && err.to_string().contains("doesn't answer"), "{err}");
     }
 
     /// Audit fix: two quick launches both missed the socket (bound only once the window is up)
@@ -469,57 +481,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let failed = refresh_headless(AppPaths::rooted(dir.path()), Config::default(), Duration::from_secs(60)).unwrap();
         assert_eq!(failed, 0);
-    }
-
-    /// Audit fix: a playlist `--refresh` switched to its Xtream login was never toasted. The
-    /// headless run notes it before the store closes; the next window takes it, once, by name
-    /// (a playlist switched back to M3U since is not announced).
-    #[test]
-    fn an_upgrade_by_the_background_refresh_is_kept_for_the_next_window() {
-        use tuner::model::{SourceColor, SourceDraft, SourceKind, XtreamCredentials};
-        use tuner::store::sources;
-        let dir = tempfile::tempdir().unwrap();
-        let paths = AppPaths::rooted(dir.path());
-        paths.ensure().unwrap();
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let (bus, events) = EventBus::new(None);
-        let store = Store::open(&paths.db_file(), None).unwrap();
-        let ids = store
-            .writer()
-            .blocking(|c| {
-                let draft = |name: &str| SourceDraft {
-                    name: name.into(),
-                    kind: SourceKind::M3uUrl,
-                    icon: String::new(),
-                    color: SourceColor::Accent,
-                    url: Some(format!("http://example.invalid/{name}.m3u")),
-                    path: None,
-                    xtream: None,
-                    settings: Default::default(),
-                };
-                let (a, b) = (sources::insert_source(c, &draft("Upgraded"), 0)?, sources::insert_source(c, &draft("Back"), 0)?);
-                let login = XtreamCredentials { server: "http://example.invalid".into(), username: "u".into(), password: "p".to_owned().into() };
-                sources::set_source_kind(c, a, SourceKind::Xtream, Some(&login))?;
-                Ok([a, b])
-            })
-            .unwrap();
-        let http =
-            HttpClient::new(&tuner::sources::http::HttpOptions { default_user_agent: "t".into(), connect_timeout_s: 1, read_timeout_s: 1 }).unwrap();
-        let jobs = JobManager::new(JobContext::new(store.clone(), http, bus.clone(), paths.clone(), Arc::default()), rt.handle().clone());
-        for (n, source) in ids.into_iter().enumerate() {
-            bus.send(AppEvent::Job(JobEvent::Finished {
-                id: JobId(n as u64 + 1),
-                kind: JobKind::RefreshSource { source, force: false },
-                outcome: Ok(JobOutcome::SourceRefreshed { source, summary: Default::default(), not_modified: false, account: None, upgraded: true }),
-                failure: None,
-            }));
-        }
-        assert_eq!(wait_for_jobs(&jobs, &events, JobId(1), Duration::from_secs(10)), 0);
-        assert!(store.close(Duration::from_secs(3)));
-
-        let store = Store::open(&paths.db_file(), None).unwrap();
-        assert_eq!(store.writer().blocking(|c| sources::take_unseen_upgrades(c)).unwrap(), ["Upgraded"]);
-        assert!(store.writer().blocking(|c| sources::take_unseen_upgrades(c)).unwrap().is_empty(), "said once");
     }
 
     #[test]

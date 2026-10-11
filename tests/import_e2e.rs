@@ -902,6 +902,8 @@ async fn an_xtream_playlist_upgrades_silently_keeping_user_data_and_can_switch_b
                          + (SELECT count(*) FROM movie WHERE source_id = ?1 AND key LIKE 'm3u:%')
                          + (SELECT count(*) FROM series WHERE source_id = ?1 AND key LIKE 'm3u:%')";
     assert_eq!(h.scalar(m3u_rows, source).await, 0);
+    // noted with the switch: no window saw this refresh end, so the next one says so
+    assert_eq!(h.scalar("SELECT count(*) FROM meta WHERE key = 'xtream-upgraded-unseen:' || ?1", source).await, 1);
 
     // saving the stale copy (no login) keeps the new login
     h.update(stale).await;
@@ -917,6 +919,8 @@ async fn an_xtream_playlist_upgrades_silently_keeping_user_data_and_can_switch_b
     assert!(src.xtream.is_some(), "the login is kept for switching again");
     assert_eq!(user_data().await, on_playlist_keys);
     assert_eq!(h.scalar("SELECT count(*) FROM movie WHERE source_id = ?1 AND key LIKE 'xt:%'", source).await, 0);
+    let unseen = h.store.writer().run(|c| tuner::store::sources::take_unseen_upgrades(c)).await.unwrap();
+    assert!(unseen.is_empty(), "back on its playlist: not announced");
     for line in job_warnings() {
         assert_clean(&line);
     }
@@ -1005,6 +1009,19 @@ async fn a_provider_file_and_a_prefixed_get_php_url_switch_to_the_api_behind_the
     }
     assert!(file.exists(), "a playlist file is never removed");
     assert_eq!(mock.count("/get.php"), 0, "a get.php login is tried before any download");
+
+    // added as M3U ("Add anyway"), upgraded by its first import: onboarding says what was
+    // added, so the next window has no upgrade to announce
+    let mut d = draft("Added", SourceKind::M3uUrl);
+    d.url = Some(format!("{}/get.php?username=demo&password={PASSWORD}", mock.server()));
+    d.settings.use_provider_epg = Some(false);
+    h.jobs.submit(JobKind::AddSource(d));
+    let source = match h.finished(|k| matches!(k, JobKind::AddSource(_))).await.1 {
+        Ok(JobOutcome::SourceAdded(id)) => id,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(h.source(source).await.kind, SourceKind::Xtream);
+    assert_eq!(h.scalar("SELECT count(*) FROM meta WHERE key = 'xtream-upgraded-unseen:' || ?1", source).await, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
@@ -1046,26 +1063,29 @@ async fn a_playlist_whose_login_fails_stays_m3u_and_checks_again_weekly() {
         assert_eq!(h.source(source).await.kind, SourceKind::M3uUrl, "{name}");
     }
 
-    // the server couldn't answer (503): that says nothing about the login, checked in an hour
-    let mut d = draft("Unavailable", SourceKind::M3uUrl);
-    d.url = Some(format!("{}/get.php?username=http503&password={PASSWORD}", mock.base));
-    d.settings.use_provider_epg = Some(false);
-    let source = h.insert(d).await;
-    let logins = || mock.recorded().iter().filter(|r| r.starts_with("/player_api.php") && r.contains("http503")).count();
-    assert!(matches!(h.refresh(source).await, Ok(JobOutcome::SourceRefreshed { upgraded: false, .. })));
-    assert_eq!((logins(), h.source(source).await.kind), (1, SourceKind::M3uUrl));
-    assert!(matches!(h.refresh(source).await, Ok(JobOutcome::SourceRefreshed { upgraded: false, .. })));
-    assert_eq!(logins(), 1, "not again within the hour");
-    h.store
-        .writer()
-        .run(move |c| {
-            let sql = "UPDATE meta SET value = json_set(value, '$.at', json_extract(value, '$.at') - 3601) WHERE key = 'xtream-upgrade:' || ?1";
-            Ok(c.execute(sql, [source])?)
-        })
-        .await
-        .unwrap();
-    assert!(matches!(h.refresh(source).await, Ok(JobOutcome::SourceRefreshed { upgraded: false, .. })));
-    assert_eq!(logins(), 2, "an hour later a plain refresh checks again");
+    // the server couldn't answer (503) — to the login, or to every list after it: that says
+    // nothing about the login, checked in an hour
+    for (name, user) in [("Unavailable", "http503"), ("Busy lists", "list503")] {
+        let mut d = draft(name, SourceKind::M3uUrl);
+        d.url = Some(format!("{}/get.php?username={user}&password={PASSWORD}", mock.base));
+        d.settings.use_provider_epg = Some(false);
+        let source = h.insert(d).await;
+        let logins = || mock.recorded().iter().filter(|r| r.starts_with("/player_api.php") && !r.contains("action=") && r.contains(user)).count();
+        assert!(matches!(h.refresh(source).await, Ok(JobOutcome::SourceRefreshed { upgraded: false, .. })), "{name}");
+        assert_eq!((logins(), h.source(source).await.kind), (1, SourceKind::M3uUrl), "{name}");
+        assert!(matches!(h.refresh(source).await, Ok(JobOutcome::SourceRefreshed { upgraded: false, .. })), "{name}");
+        assert_eq!(logins(), 1, "{name}: not again within the hour");
+        h.store
+            .writer()
+            .run(move |c| {
+                let sql = "UPDATE meta SET value = json_set(value, '$.at', json_extract(value, '$.at') - 3601) WHERE key = 'xtream-upgrade:' || ?1";
+                Ok(c.execute(sql, [source])?)
+            })
+            .await
+            .unwrap();
+        assert!(matches!(h.refresh(source).await, Ok(JobOutcome::SourceRefreshed { upgraded: false, .. })), "{name}");
+        assert_eq!(logins(), 2, "{name}: an hour later a plain refresh checks again");
+    }
 
     let lines = logs().snapshot(tracing::Level::INFO);
     assert!(lines.iter().any(|l| l.message.contains("Couldn't use the Xtream login of Refused")), "the reason is logged");

@@ -646,7 +646,8 @@ pub struct SettingsScreen {
     error: Option<(Local, String)>,
     backup: BackupOptions,
     restore_replace: bool,
-    /// Apply the backup's settings on restore; follows the mode until the user sets it.
+    /// Apply the backup's settings on restore; reset to the mode's default (on for Replace,
+    /// off for Merge) whenever the mode changes.
     restore_settings: bool,
     backup_job: Option<JobId>,
     backup_status: Option<(bool, String)>,

@@ -279,6 +279,9 @@ pub async fn add_source(ctx: &JobContext, draft: &SourceDraft, progress: &Progre
         }
         return Err(e);
     }
+    // an "Add anyway" playlist that upgraded: onboarding's Done step says what was added, so no
+    // window toasts it later
+    write(ctx, move |c| crate::store::sources::forget_unseen_upgrade(c, id)).await?;
     Ok(id)
 }
 

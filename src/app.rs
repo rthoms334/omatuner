@@ -355,6 +355,8 @@ impl TunerApp {
                 if *upgraded {
                     let name = (self.lib.sources.len() > 1).then(|| self.source_name(*source));
                     self.toast(Toast::upgraded(name.as_deref()));
+                    let source = *source;
+                    let _ = self.services().store.writer().submit(move |c| crate::store::sources::forget_unseen_upgrade(c, source));
                 }
             }
             // AddSource ran the first import inline (no `SourceRefreshed`): its stored account
@@ -2059,9 +2061,15 @@ mod tests {
         assert_eq!(toasts(&rig), n + 1, "network failures right after one are not toasted");
         rig.event(failed(source(), crate::error::Error::Http { status: 503, url: "http://h/p.m3u".into() }));
         assert_eq!(toasts(&rig), n + 2, "a different error reports");
-        // a success forgets it; the upgrade says what changed (DESIGN §27.3)
+        // a success forgets it; the upgrade says what changed (DESIGN §27.3), and the next
+        // window does not say it again
+        rig.writer().blocking(|c| crate::store::sources::note_unseen_upgrade(c, SourceId(1))).unwrap();
         rig.event(refreshed(true));
         assert_eq!(rig.log().toasts.last().unwrap().text, "Upgraded to Xtream login — movies & series now available");
+        let unseen = |r: &mut Rig| {
+            r.app.db.query_row("SELECT count(*) FROM meta WHERE key LIKE 'xtream-upgraded-unseen:%'", [], |row| row.get::<_, i64>(0)).unwrap()
+        };
+        rig.until("the upgrade is marked as seen", |r| unseen(r) == 0);
         rig.event(failed(source(), crate::error::Error::Http { status: 503, url: "http://h/p.m3u".into() }));
         assert_eq!(toasts(&rig), n + 4, "the same error after a success reports again");
     }

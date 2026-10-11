@@ -29,6 +29,7 @@
 //! | `listnull`  | `null`                                                          |
 //! | `listerror` | `{"error":"rate limited"}`                                      |
 //! | `listnone`  | `[]` (a genuinely empty catalogue)                              |
+//! | `list503`   | 503 (an overloaded panel behind a proxy)                        |
 //! | `loginreply`| `auth_ok.json` — for every action, details included (forks that |
 //! |             | answer unsupported actions with the login object)               |
 //!
@@ -236,6 +237,9 @@ fn player_api<'a>(st: &State, user: &str, param: &impl Fn(&str) -> Option<&'a st
     };
     if let Some(body) = list_quirk.filter(|_| is_list) {
         return json(body.to_vec());
+    }
+    if user == "list503" && is_list {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Try again later").into_response();
     }
     let vod_list = matches!(action, "get_vod_categories" | "get_series_categories" | "get_vod_streams" | "get_series");
     if vod_list && st.opts.vod_401.load(std::sync::atomic::Ordering::SeqCst) {

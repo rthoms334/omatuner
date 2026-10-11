@@ -73,11 +73,13 @@ impl Services {
         if let Err(e) = store.reader().and_then(|c| crate::store::sources::register_secrets(&c)) {
             tracing::error!("registering stored secrets: {e}");
         }
-        // playlists `tuner --refresh` switched to their Xtream login while no window was open
+        // playlists switched to their Xtream login while no window could say so (`tuner
+        // --refresh`, or Tuner quit first); named when it could be any of several playlists
         let toasts = bus.clone();
         let _ = store.writer().submit(move |c| {
+            let several = crate::store::sources::list_sources(c).map_or(true, |s| s.len() > 1);
             match crate::store::sources::take_unseen_upgrades(c) {
-                Ok(names) => names.iter().for_each(|n| toasts.toast(crate::msg::Toast::upgraded(Some(n)))),
+                Ok(names) => names.iter().for_each(|n| toasts.toast(crate::msg::Toast::upgraded(several.then_some(n.as_str())))),
                 Err(e) => tracing::warn!("upgrades of the last background refresh: {e}"),
             }
             Ok(())
