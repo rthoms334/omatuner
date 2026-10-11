@@ -23,6 +23,7 @@ preview playing](docs/screenshots/live.png)
 - [TV guide and guide coverage](#tv-guide-and-guide-coverage)
 - [Keyboard](#keyboard)
 - [Command line](#command-line)
+- [Use Tuner from Claude](#use-tuner-from-claude)
 - [Files and profiles](#files-and-profiles)
 - [Theming](#theming)
 - [Omarchy integration](#omarchy-integration)
@@ -897,6 +898,7 @@ Settings ▸ Parental sets a 4–8 digit PIN. It is a speed bump for children, n
 ```text
 tuner [--view home|live|guide|movies|series|search|settings] [--play <ref>]
       [--debug] [--profile-dir <dir>] [--refresh] [PLAYLIST_OR_URL...]
+tuner mcp [--profile-dir <dir>] [--debug]
 ```
 
 | Flag | Meaning |
@@ -907,6 +909,7 @@ tuner [--view home|live|guide|movies|series|search|settings] [--play <ref>]
 | `--profile-dir <dir>` | Keep config, data, cache, logs and the socket under `<dir>`. Use it for testing, or for a second profile. |
 | `--refresh` | Refresh stale playlists and guides without a window, then exit (status 1 if a refresh failed). Does nothing while Tuner is running, because the open window refreshes on its own. While it runs, starting Tuner waits a few seconds and then says (also as a desktop notification) that a background refresh is running. A playlist it upgraded to its Xtream login is announced the next time Tuner opens. |
 | `PLAYLIST_OR_URL…` | An `.m3u`/`.m3u8` file opens the add-playlist card. A stream URL or media file plays straight away. `file://` URIs are treated as paths. |
+| `mcp` | Run the MCP server on stdin/stdout for Claude Code and other MCP clients (see [Use Tuner from Claude](#use-tuner-from-claude)). |
 | `--help`, `--version` | Usage and version. |
 
 No screen shows a channel's `--play` reference yet. With the `sqlite3` tool you can look it up:
@@ -919,6 +922,37 @@ sqlite3 -readonly ~/.local/share/tuner/tuner.db \
 Only one Tuner runs per profile. A second `tuner …` hands its request to the running window over
 `$XDG_RUNTIME_DIR/tuner/tuner.sock` (`<dir>/run/tuner.sock` with `--profile-dir`) and exits.
 `omarchy-launch-or-focus` and the menu entries rely on this.
+
+## Use Tuner from Claude
+
+Tuner includes an [MCP](https://modelcontextprotocol.io) server, so you can ask Claude Code (or
+another MCP client) in a terminal to find something and play it, instead of browsing. Add it
+once:
+
+```sh
+claude mcp add tuner -- tuner mcp
+```
+
+Then ask, for example:
+
+- "Touring cars is on" — Claude searches the guide. If the race is live, Tuner switches to it.
+  If it starts later, Claude tells you when and can schedule a switch: Tuner then changes
+  channel by itself at the start, with a *Switching in 10 s · Cancel* toast first.
+- "Something light under 2 hours" — Claude looks through your movie categories, picks an
+  unwatched film and starts it.
+- "What's on BBC One at 9?", "Carry on with my series", "Pause", "Volume to 40".
+
+How it works and what it can't do:
+
+- `tuner mcp` talks to the running Tuner over its local socket. Only programs running as your
+  user can reach it. If Tuner isn't open, the first request starts it.
+- Claude only sees what Tuner shows you: hidden channels and categories, categories your country
+  filter hides, and explicit content hidden by parental control stay out of every answer.
+- Locked items are listed as locked. Playing one makes Tuner ask for your PIN **on its own
+  screen**. The PIN never goes through Claude, and Claude will not ask you for it.
+- Claude gets names, times and programme details, never stream addresses or your logins.
+- Use `tuner mcp --profile-dir <dir>` (and `claude mcp add tuner -- tuner mcp --profile-dir
+  <dir>`) to reach a Tuner started with that profile.
 
 ## Files and profiles
 

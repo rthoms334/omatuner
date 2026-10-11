@@ -217,6 +217,9 @@ pub enum Action {
     /// A toast's Undo button (never bound to a key): the app puts back what a combined action
     /// on a title's copies wrote (`ui::copies`; the number names the action).
     Undo(u16),
+    /// A toast's Cancel button (never bound to a key): call off an automatic switch that is
+    /// about to happen (DESIGN §30.8).
+    CancelSwitch(crate::model::ReminderId),
     // ---- guide
     GuidePrevDay,
     GuideNextDay,

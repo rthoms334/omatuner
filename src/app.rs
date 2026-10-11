@@ -412,6 +412,8 @@ impl TunerApp {
             AppEvent::Toast(t) => self.toast(t.clone()),
             // The IPC server already raised the window (`hypr::focus_self`).
             AppEvent::Ipc(req) => self.handle_ipc(req),
+            // SKELETON: the MCP-app track plays the validated target (DESIGN §30.4)
+            AppEvent::Agent(_) => {}
             AppEvent::Platform(p) => match p {
                 PlatformEvent::Quit => egui_ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 PlatformEvent::Raise => crate::platform::hypr::focus_self(),
@@ -423,6 +425,8 @@ impl TunerApp {
                 PlatformEvent::FilePicked { purpose: PickPurpose::ExportLog, path: Some(path) } => self.export_log(path.clone()),
                 // Other pickers belong to the screen that opened them (`on_event` below).
                 PlatformEvent::FilePicked { .. } | PlatformEvent::ReminderFired(_) => {}
+                // SKELETON: the MCP-app track toasts / switches (DESIGN §30.8)
+                PlatformEvent::SwitchSoon { .. } | PlatformEvent::SwitchNow { .. } => {}
                 PlatformEvent::PopOut(ev) => self.on_popout_event(ev, egui_ctx),
             },
             // the first copy of a title failed before its first frame (DESIGN §29.15)

@@ -1074,3 +1074,36 @@ PIN set, English audio first. Every check in *All playlists* unless it says othe
     TV"); Show each copy makes every copy a card again at once (no rebuild); Home's rails and
     Search show one tile / row per stack with both playlists; Shift+Enter there plays the copy
     that plays first.
+
+## 19. Use Tuner from Claude (MCP)
+
+Default profile, Claude Code installed, `claude mcp add tuner -- tuner mcp` done once (`claude
+mcp list` shows `tuner` connected).
+
+- [ ] **Not running → starts:** quit Tuner. Ask Claude "what's on now?".
+  **Expect:** Tuner opens on the current workspace within a few seconds; Claude lists programmes
+  with channels and times in your local time.
+- [ ] **"Touring cars is on" (or any live sport / show in your guide):**
+  **Expect:** Claude finds the live programme and Tuner plays the channel fullscreen and comes to
+  the front. Backspace returns to the previous channel.
+- [ ] **Upcoming → automatic switch:** ask for something starting in 2–3 minutes and accept the
+  switch. **Expect:** Claude reports the start time; 10 s before, Tuner toasts "Switching to …
+  in 10 s" with Cancel; at the start it switches by itself. Repeat and press Cancel: no switch.
+  Settings ▸ Reminders lists the pending switch with its own label until then.
+- [ ] **Mood pick:** "something light under 2 hours, I haven't seen". **Expect:** Claude names a
+  film from a fitting category with its runtime; on "play it" Tuner starts it (resuming saved
+  progress for a started film).
+- [ ] **Catch-up:** ask for a programme that ended today on a channel with catch-up.
+  **Expect:** it plays from the archive; on a channel without catch-up Claude says it can't.
+- [ ] **Parental lock:** set a PIN, lock a channel, lock the session. Ask Claude to play that
+  channel. **Expect:** Tuner shows its PIN prompt; Claude tells you to type the PIN in Tuner
+  and does not ask for it. With explicit content present and hidden: ask Claude to search for an
+  explicit channel or category by name — nothing found, no counts that give it away. Unlock in
+  Tuner → it is found.
+- [ ] **No addresses:** ask Claude for the stream URL of a channel. **Expect:** it can't give
+  one (no tool result contains a URL).
+- [ ] **Control:** "pause", "resume", "volume to 30", "stop". **Expect:** each happens, also
+  while Tuner sits on another workspace.
+- [ ] **Window hidden:** move Tuner to another workspace, ask "what's on BBC One at 9?".
+  **Expect:** an answer without Tuner coming forward; "play it" brings it forward.
+

@@ -1,5 +1,5 @@
 //! `tuner` binary: CLI → paths/config/logging → single-instance handoff → services → window.
-//! Owner: WP-10b.
+//! Owner: WP-10b. `tuner mcp` branches off right after the paths (`agent::mcp`, DESIGN §30).
 //!
 //! Startup budget (first frame < 300 ms): font resolution (`fc-match`/`fc-list`, ~145 ms) +
 //! font file reads and theme loading (`hyprctl`) run on helper threads in parallel with
@@ -52,6 +52,11 @@ fn main() -> anyhow::Result<()> {
         Some(dir) => AppPaths::rooted(dir),
         None => AppPaths::from_env()?,
     };
+    // the MCP bridge (DESIGN §30): stdout is its protocol channel, it logs to stderr only, never
+    // takes the instance lock and never opens the database
+    if cli.command == Some(tuner::cli::Command::Mcp) {
+        return tuner::agent::mcp::main(&paths, cli.profile_dir.as_deref(), cli.debug);
+    }
     let (config, config_err) = match Config::load(&paths.config_file()) {
         Ok(c) => (c, None),
         Err(e) => (Config::default(), Some(e)),

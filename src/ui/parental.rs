@@ -16,6 +16,17 @@ pub struct ParentalSession {
 }
 
 impl ParentalSession {
+    /// A session unlocked at `at` (`None` = locked): the agent handler's copy of the app's
+    /// session (DESIGN §30.4, `agent::shared`).
+    pub fn with_unlocked_at(at: Option<Instant>) -> Self {
+        Self { unlocked_at: at }
+    }
+
+    /// When the PIN was last entered (`None` = locked), for [`Self::with_unlocked_at`].
+    pub fn unlocked_at(&self) -> Option<Instant> {
+        self.unlocked_at
+    }
+
     /// True when no PIN is configured / parental disabled, or unlocked and not expired.
     pub fn is_unlocked(&self, cfg: &ParentalConfig) -> bool {
         if !cfg.enabled || cfg.pin_hash.is_none() {

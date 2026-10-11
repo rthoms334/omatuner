@@ -62,6 +62,9 @@ pub struct Services {
     /// Drops big snapshots off the UI thread and gives freed heap back to the OS
     /// (`platform::memory`); follows the player's snapshots.
     pub memory: crate::platform::memory::Maintenance,
+    /// What the app publishes for the agent handler (library snapshot, parental unlock;
+    /// DESIGN §30.4). The handler itself lives in the IPC server.
+    pub agent: Arc<crate::agent::shared::AgentShared>,
     /// Set when [`Services::shutdown`] begins (the signal watcher leaves the exit to it; a
     /// signal after that means it is stuck).
     closing: Arc<AtomicBool>,
@@ -117,6 +120,7 @@ impl Services {
             integrations: Integrations::default(),
             undo: Default::default(),
             memory,
+            agent: Arc::default(),
             closing: Arc::default(),
             socket: Arc::default(),
         })
@@ -129,7 +133,16 @@ impl Services {
         if cfg.integration.follow_omarchy_theme {
             self.start_theme_watch(&cfg);
         }
-        self.integrations.ipc = ok("IPC server", crate::ipc::IpcServer::start(self.rt.handle(), &self.paths.ipc_socket(), self.bus.clone()));
+        let agent: Arc<dyn crate::agent::server::AgentService> = Arc::new(crate::agent::server::AgentHandler::new(
+            self.agent.clone(),
+            self.store.clone(),
+            self.config.clone(),
+            self.player.handle(),
+            self.bus.clone(),
+            self.jobs.clone(),
+        ));
+        self.integrations.ipc =
+            ok("IPC server", crate::ipc::IpcServer::start_with_agent(self.rt.handle(), &self.paths.ipc_socket(), self.bus.clone(), Some(agent)));
         *self.socket.lock().unwrap_or_else(|e| e.into_inner()) = self.integrations.ipc.as_ref().map(|s| s.socket());
         if cfg.integration.mpris {
             self.start_mpris();
