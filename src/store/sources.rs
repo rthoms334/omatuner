@@ -125,7 +125,7 @@ pub fn insert_source(conn: &Connection, draft: &SourceDraft, now: Timestamp) -> 
 /// Never clears the Xtream login of a row whose stored kind is `xtream` (DESIGN §27.3): a copy
 /// read before a silent upgrade has `xtream: None` and would otherwise wipe the new login.
 ///
-/// Keeps the stored category filter (`set_category_filter` is its only writer; DESIGN §28.3): a
+/// Keeps the stored category rule (`set_category_rule` is its only writer; DESIGN §28.3): a
 /// source editor opened before the picker saved must not wipe the rule.
 pub fn update_source(conn: &Connection, src: &Source) -> Result<()> {
     let x = src.xtream.as_ref();
@@ -320,7 +320,7 @@ pub fn reorder_sources(conn: &mut Connection, order: &[SourceId]) -> Result<()> 
     Ok(())
 }
 
-/// Replace a source's settings, except the category filter (kept as stored, see
+/// Replace a source's settings, except the category rule (kept as stored, see
 /// [`update_source`]).
 pub fn set_source_settings(conn: &Connection, id: SourceId, settings: &SourceSettings) -> Result<()> {
     let settings = with_stored_category_filter(conn, id, settings)?;
@@ -331,23 +331,130 @@ pub fn set_source_settings(conn: &Connection, id: SourceId, settings: &SourceSet
     Ok(())
 }
 
-/// `settings` with the category filter currently stored for `id` (none for an unknown id: the
-/// caller's update then reports it).
+/// `settings` with the category rule currently stored for `id` (`category_filter` and
+/// `own_category_filter`; none for an unknown id: the caller's update then reports it).
 fn with_stored_category_filter(conn: &Connection, id: SourceId, settings: &SourceSettings) -> Result<SourceSettings> {
     let stored: Option<String> = conn.prepare_cached("SELECT settings FROM source WHERE id = ?1")?.query_row([id], |r| r.get(0)).optional()?;
-    let category_filter = from_json_opt::<SourceSettings>(stored).and_then(|s| s.category_filter);
-    Ok(SourceSettings { category_filter, ..settings.clone() })
+    let stored = from_json_opt::<SourceSettings>(stored).unwrap_or_default();
+    Ok(SourceSettings { category_filter: stored.category_filter, own_category_filter: stored.own_category_filter, ..settings.clone() })
 }
 
-/// Set or clear a source's category filter (DESIGN §28.3): read-modify-write of the settings
-/// JSON inside the writer, so the other settings are untouched. Callers notify
-/// `DataScope::Sources` (the library is rebuilt with the new rule).
-pub fn set_category_filter(conn: &Connection, id: SourceId, filter: Option<&CategoryFilter>) -> Result<()> {
+/// `meta` key of the category rule every playlist shares (DESIGN §28.3; JSON, absent = none).
+const SHARED_FILTER_KEY: &str = "category-filter";
+
+/// Which category rule a playlist follows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CategoryRule {
+    /// The rule every playlist shares ([`shared_category_filter`]).
+    Shared,
+    /// "Use a different rule for this playlist" (`None` = show everything of it).
+    Own(Option<CategoryFilter>),
+}
+
+/// The category rule shared by every playlist without its own (DESIGN §28.3); `None` = none.
+pub fn shared_category_filter(conn: &Connection) -> Result<Option<CategoryFilter>> {
+    let v: Option<String> = conn.query_row("SELECT value FROM meta WHERE key = ?1", [SHARED_FILTER_KEY], |r| r.get(0)).optional()?;
+    Ok(from_json_opt::<Option<CategoryFilter>>(v).flatten())
+}
+
+/// Set or clear the shared category rule. Callers notify `DataScope::Sources`.
+pub fn set_shared_category_filter(conn: &Connection, filter: Option<&CategoryFilter>) -> Result<()> {
+    match filter {
+        Some(f) => conn.execute(
+            "INSERT INTO meta(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![SHARED_FILTER_KEY, sql::to_json(f)?],
+        )?,
+        None => conn.execute("DELETE FROM meta WHERE key = ?1", [SHARED_FILTER_KEY])?,
+    };
+    Ok(())
+}
+
+/// Which rule a playlist follows (DESIGN §28.3): read-modify-write of the settings JSON inside
+/// the writer, so the other settings are untouched. Callers notify `DataScope::Sources` (the
+/// library is rebuilt with the new rule).
+pub fn set_category_rule(conn: &Connection, id: SourceId, rule: &CategoryRule) -> Result<()> {
     let settings: String = or_not_found(conn.query_row("SELECT settings FROM source WHERE id = ?1", [id], |r| r.get(0)), "source", id)?;
     let mut settings: SourceSettings = from_json_opt(Some(settings)).unwrap_or_default();
-    settings.category_filter = filter.cloned();
+    (settings.own_category_filter, settings.category_filter) = match rule {
+        CategoryRule::Shared => (Some(false), None),
+        CategoryRule::Own(f) => (Some(true), f.clone()),
+    };
     conn.execute("UPDATE source SET settings = ?2 WHERE id = ?1", params![id, sql::to_json(&settings)?])?;
     Ok(())
+}
+
+/// Give a playlist its own category rule (`None` = show everything of it):
+/// [`set_category_rule`] with [`CategoryRule::Own`].
+pub fn set_category_filter(conn: &Connection, id: SourceId, filter: Option<&CategoryFilter>) -> Result<()> {
+    set_category_rule(conn, id, &CategoryRule::Own(filter.cloned()))
+}
+
+/// The rule that applies to a playlist now (its own, else the shared one).
+pub fn effective_category_filter(conn: &Connection, id: SourceId) -> Result<Option<CategoryFilter>> {
+    let settings = get_source(conn, id)?.settings;
+    if settings.has_own_category_filter() { Ok(settings.category_filter) } else { shared_category_filter(conn) }
+}
+
+/// Settings ▸ Hidden ▸ Enter on a hidden tag: add it to the rule that hides it for `id` — the
+/// playlist's own, else the shared one (so every playlist shows it). Untagged (`None`) turns
+/// `keep_untagged` on. Returns `true` when the shared rule changed. Nothing to do without a rule.
+pub fn keep_tag(conn: &Connection, id: SourceId, tag: Option<crate::model::CategoryTag>) -> Result<bool> {
+    let settings = get_source(conn, id)?.settings;
+    let own = settings.has_own_category_filter();
+    let Some(mut rule) = (if own { settings.category_filter } else { shared_category_filter(conn)? }) else { return Ok(false) };
+    match tag {
+        Some(t) => {
+            rule.keep.insert(t);
+        }
+        None => rule.keep_untagged = true,
+    }
+    if own {
+        set_category_rule(conn, id, &CategoryRule::Own(Some(rule)))?;
+    } else {
+        set_shared_category_filter(conn, Some(&rule))?;
+    }
+    Ok(!own)
+}
+
+/// Rules saved before the rule was shared (DESIGN §28.3): playlists whose settings carry a
+/// `category_filter` but no `own_category_filter`. Without a shared rule, the first such rule
+/// (playlist order) becomes it (`known` = what the playlists with that same choice knew) — so a
+/// rule saved on one playlist now covers the others (field report: English chosen on "TV",
+/// nothing on "TV 2"). Each such playlist then follows the shared rule when its choice is the
+/// same, else keeps its rule as its own. Their `category_filter` stays stored (ignored while
+/// they follow the shared rule), so an older build still filters. Run when the database opens
+/// and after a restore; `true` = something changed. Idempotent.
+pub fn adopt_legacy_category_filters(conn: &Connection) -> Result<bool> {
+    let legacy: Vec<(SourceId, SourceSettings)> = list_sources(conn)?
+        .into_iter()
+        .filter(|s| s.settings.own_category_filter.is_none() && s.settings.category_filter.is_some())
+        .map(|s| (s.id, s.settings))
+        .collect();
+    if legacy.is_empty() {
+        return Ok(false);
+    }
+    atomic(conn, |c| {
+        let shared = match shared_category_filter(c)? {
+            Some(s) => s,
+            None => {
+                let mut first = legacy[0].1.category_filter.clone().unwrap_or_default();
+                for (_, st) in &legacy[1..] {
+                    if let Some(r) = st.category_filter.as_ref().filter(|r| r.same_choice(&first)) {
+                        first.known.extend(r.known.iter().cloned());
+                    }
+                }
+                tracing::info!("category filter: the rule of playlist {} now applies to every playlist", legacy[0].0.0);
+                set_shared_category_filter(c, Some(&first))?;
+                first
+            }
+        };
+        for (id, st) in &legacy {
+            let own = !st.category_filter.as_ref().is_some_and(|r| r.same_choice(&shared));
+            let settings = SourceSettings { own_category_filter: Some(own), ..st.clone() };
+            c.execute("UPDATE source SET settings = ?2 WHERE id = ?1", params![id, sql::to_json(&settings)?])?;
+        }
+        Ok(true)
+    })
 }
 
 /// Record the start of a refresh attempt (`last_attempt`).

@@ -88,6 +88,10 @@ pub struct Backup {
     /// backups from before P2).
     #[serde(default)]
     pub title_links: Vec<BackupTitleLink>,
+    /// The category rule every playlist shares (DESIGN §28.3; absent in backups from before it
+    /// was shared — their playlists' own rules are adopted on restore).
+    #[serde(default)]
+    pub shared_category_filter: Option<crate::model::CategoryFilter>,
     /// Raw `config.toml` text.
     pub config: Option<String>,
 }
@@ -215,6 +219,7 @@ pub fn export(conn: &Connection, opts: BackupOptions, config_toml: Option<String
             .into_iter()
             .map(|l| BackupTitleLink { item: l.item, action: l.action.as_str().to_owned(), at: l.at })
             .collect(),
+        shared_category_filter: crate::store::sources::shared_category_filter(conn)?,
         config: config_toml,
     })
 }
@@ -517,6 +522,16 @@ pub fn restore(conn: &mut Connection, b: &Backup, mode: RestoreMode) -> Result<R
         )?;
     }
     crate::store::epg::resolve_mappings(&tx)?;
+    // the shared category rule: Replace takes the backup's; Merge only when there is none here
+    if let Some(rule) = &b.shared_category_filter
+        && (mode == RestoreMode::Replace || crate::store::sources::shared_category_filter(&tx)?.is_none())
+    {
+        crate::store::sources::set_shared_category_filter(&tx, Some(rule))?;
+    } else if mode == RestoreMode::Replace {
+        crate::store::sources::set_shared_category_filter(&tx, None)?;
+    }
+    // rules of playlists from a backup made before the rule was shared
+    crate::store::sources::adopt_legacy_category_filters(&tx)?;
     tx.commit()?;
     crate::store::sources::register_secrets(conn)?;
     report.user_rows = rows as u32;

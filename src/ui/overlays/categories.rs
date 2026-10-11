@@ -1,23 +1,31 @@
-//! "Choose what to show" — the per-playlist category filter picker (DESIGN §28.6). Owner: P6-ui.
+//! "Choose what to show" — the category filter picker (DESIGN §28.6). Owner: P6-ui.
 //!
 //! One implementation: [`CategoryPicker`] (state, keys and view) is embedded by the onboarding
 //! step and wrapped by [`CategoriesOverlay`] (Settings ▸ Playlists ▸ playlist ▸ Categories…,
 //! Settings ▸ Hidden ▸ Choose countries…).
 //!
-//! * Rows: the playlist's tags by item count, then "No country tag"; each with a tick box, the
-//!   short code, the name, what it covers and a "new" badge for tags the saved rule didn't know.
-//! * Ticks start from the saved rule; without one from the defaults (the user's country and
-//!   its language, every English-language tag, untagged — `category_tags::default_keep`).
-//! * Saving stores the ticked tags — also ticked tags the playlist doesn't have (yet), so the
-//!   English defaults keep working when such a category appears — and `known` = the tags
-//!   present. Everything ticked stores no rule at all.
-//! * Keys (`[Checklist, Modal]`): ↑/↓ move, Space / Insert tick, Ctrl+A all / none of the rows
-//!   shown, Ctrl+E just my country + English, typing filters, Enter saves, Esc clears the
+//! * It edits the rule **every playlist shares** (DESIGN §28.3), opened from one playlist. Its
+//!   first rows are options: "Only for <playlist>" (with two or more playlists, or when the
+//!   playlist already has its own rule) gives that playlist its own rule instead, and "Also
+//!   hide titles in other languages" (DESIGN §28.12). Space ticks them like any row; they are
+//!   listed while the filter is empty.
+//! * Rows: the tags of the playlists the rule covers (the shared rule: every playlist that
+//!   follows it; "Only for": that playlist) by item count, then "No country tag"; each with a
+//!   tick box, the short code, the name, what it covers and a "new" badge for tags the saved
+//!   rule didn't know.
+//! * Ticks start from the rule edited; without one from the defaults (the user's country and
+//!   its language, every English-language tag, untagged — `category_tags::default_keep`); a
+//!   playlist's own "show everything" ticks every row.
+//! * Saving stores the ticked tags — also ticked tags no playlist has (yet), so the English
+//!   defaults keep working when such a category appears — and `known` = the tags present.
+//!   Everything ticked (and titles in other languages not hidden) stores no rule at all.
+//! * Keys (`[Checklist, Modal]`): ↑/↓ move, Space / Insert tick, Ctrl+A all / none of the tag
+//!   rows shown, Ctrl+E just my country + English, typing filters, Enter saves, Esc clears the
 //!   filter, then cancels. F5 / Ctrl+R on a playlist imported before tags were recognised
 //!   (`needs_refresh`) runs a forced refresh of it (an unforced one may get "304 Not Modified"
 //!   and never write the raw names).
 //! * A line above the buttons says what the ticks show ("6 of 42 ticked · 3 210 of 48 900
-//!   channels"). Ticks that show nothing of the playlist warn, and Enter then asks once more.
+//!   channels"). Ticks that show nothing of the playlists warn, and Enter then asks once more.
 //! * Data is read off the UI thread and re-read whenever the library changes while the picker
 //!   is open (Xtream movie / series categories import after the channels); the ticks survive.
 
@@ -50,19 +58,35 @@ pub(crate) const UNTAGGED: &str = "No country tag";
 
 /// What the picker reads for a playlist (off the UI thread).
 pub(crate) struct PickerData {
+    /// The categories the shared rule covers: every playlist that follows it, and this one.
     pub summary: CategorySummary,
-    /// The rule stored now (`None` = no filtering).
+    /// This playlist's own categories ("Only for <playlist>").
+    pub own_summary: CategorySummary,
+    /// The shared rule (`None` = no filtering).
     pub rule: Option<CategoryFilter>,
+    /// The playlist's own rule when it has one (`Some(None)`: it shows everything).
+    pub own: Option<Option<CategoryFilter>>,
     pub name: String,
+    /// Playlists in all (two or more offer "Only for <playlist>").
+    pub playlists: usize,
     /// The user's country (`presets::detect_country`, which may read a file).
     pub country: Option<String>,
 }
 
-/// Read a playlist's category summary and rule (a `Loader` body).
+/// Read a playlist's category summaries and rules (a `Loader` body).
 pub(crate) fn load(c: &rusqlite::Connection, id: SourceId, hide_explicit: bool) -> crate::error::Result<PickerData> {
-    let summary = crate::store::library::category_summary(c, id, hide_explicit)?;
+    let all = crate::store::sources::list_sources(c)?;
     let src = crate::store::sources::get_source(c, id)?;
-    Ok(PickerData { summary, rule: src.settings.category_filter, name: src.name, country: crate::sources::presets::detect_country() })
+    let followers: Vec<SourceId> = all.iter().filter(|s| s.id == id || !s.settings.has_own_category_filter()).map(|s| s.id).collect();
+    Ok(PickerData {
+        summary: crate::store::library::category_summary_of(c, &followers, hide_explicit)?,
+        own_summary: crate::store::library::category_summary(c, id, hide_explicit)?,
+        rule: crate::store::sources::shared_category_filter(c)?,
+        own: src.settings.has_own_category_filter().then_some(src.settings.category_filter),
+        name: src.name,
+        playlists: all.len(),
+        country: crate::sources::presets::detect_country(),
+    })
 }
 
 /// "United Kingdom", "Arabic", or "No country tag".
@@ -125,21 +149,14 @@ pub(crate) fn showing_text(lib: &Library, source: SourceId, rule: Option<&Catego
     }
 }
 
-/// Settings ▸ Hidden ▸ Enter on a tag: add it to the playlist's rule (read in the write, so a
-/// picker save in between isn't lost). Untagged (`None`) turns `keep_untagged` on.
+/// Settings ▸ Hidden ▸ Enter on a tag: add it to the rule that hides it — the playlist's own,
+/// else the shared one (read in the write, so a picker save in between isn't lost). Untagged
+/// (`None`) turns `keep_untagged` on.
 pub(crate) fn show_tag(ctx: &mut UiCtx<'_>, source: SourceId, tag: Option<CategoryTag>) {
     let name = tag_name(tag.as_ref());
-    let _ = ctx.services.store.writer().submit_notify(DataScope::Sources, move |c| {
-        let Some(mut rule) = crate::store::sources::get_source(c, source)?.settings.category_filter else { return Ok(()) };
-        match tag {
-            Some(t) => {
-                rule.keep.insert(t);
-            }
-            None => rule.keep_untagged = true,
-        }
-        crate::store::sources::set_category_filter(c, source, Some(&rule))
-    });
-    ctx.toast(Toast::info(format!("{name} shown")));
+    let shared = ctx.lib.source(source).is_some_and(|s| !s.own_category_filter) && ctx.lib.sources.len() > 1;
+    let _ = ctx.services.store.writer().submit_notify(DataScope::Sources, move |c| crate::store::sources::keep_tag(c, source, tag).map(|_| ()));
+    ctx.toast(Toast::info(if shared { format!("{name} shown in every playlist") } else { format!("{name} shown") }));
 }
 
 /// What a key or click did to the picker.
@@ -155,12 +172,50 @@ pub enum PickerOutcome {
     Cancelled,
 }
 
+/// A row of the picker's list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Row {
+    /// "Only for <playlist>".
+    OnlyThis,
+    /// "Also hide titles in other languages".
+    OtherLanguages,
+    /// Index into the summary's tags.
+    Tag(usize),
+}
+
+/// What Enter stores.
+#[derive(Debug, Clone, PartialEq)]
+enum Save {
+    /// The shared rule (and the playlist follows it).
+    Shared(Option<CategoryFilter>),
+    /// The playlist's own rule.
+    Own(Option<CategoryFilter>),
+}
+
+impl Save {
+    fn rule(&self) -> Option<&CategoryFilter> {
+        match self {
+            Save::Shared(f) | Save::Own(f) => f.as_ref(),
+        }
+    }
+}
+
 /// The picker's state and view (see the module docs).
 pub struct CategoryPicker {
     source: SourceId,
     name: String,
     country: Option<String>,
+    /// The categories the rule edited covers (shared or "Only for"), and the other ones.
     summary: Option<CategorySummary>,
+    other: Option<CategorySummary>,
+    /// Two or more playlists, or this one has its own rule: "Only for <playlist>" is offered.
+    can_split: bool,
+    /// "Only for <playlist>" is ticked.
+    only_this: bool,
+    /// The playlist had its own rule when the picker opened.
+    was_own: bool,
+    /// "Also hide titles in other languages": `None` = automatic (English-only ticks).
+    title_langs: Option<bool>,
     /// Re-read the data whenever the library generation changes.
     follow: bool,
     /// Library generation the data was (or is being) read for.
@@ -168,23 +223,22 @@ pub struct CategoryPicker {
     loader: Option<Loader<PickerData>>,
     /// The ticks were set up (from the stored rule or the defaults); later reads keep them.
     started: bool,
-    /// The rule stored when the picker opened.
+    /// The rule edited when the picker opened.
     stored: Option<CategoryFilter>,
     keep: BTreeSet<CategoryTag>,
     keep_untagged: bool,
     list: ListState,
-    /// Indices into `summary.tags` that the filter shows.
-    rows: Vec<usize>,
+    rows: Vec<Row>,
     /// The write in flight and what it stores.
-    saving: Option<(Ticket<()>, Option<CategoryFilter>)>,
+    saving: Option<(Ticket<()>, Save)>,
     error: Option<String>,
     /// The button Esc mirrors ("Cancel"; onboarding: "Show everything").
     cancel: &'static str,
-    /// Enter was pressed on ticks that show nothing of the playlist: the next Enter on these
+    /// Enter was pressed on ticks that show nothing of the playlists: the next Enter on these
     /// same ticks saves them.
     armed_empty: Option<(BTreeSet<CategoryTag>, bool)>,
-    /// The ticks as they were set up (unsaved changes = the ticks differ).
-    initial: Option<(BTreeSet<CategoryTag>, bool)>,
+    /// The choice as it was set up (unsaved changes = it differs).
+    initial: Option<(BTreeSet<CategoryTag>, bool, bool, Option<bool>)>,
 }
 
 impl CategoryPicker {
@@ -195,6 +249,11 @@ impl CategoryPicker {
             name: String::new(),
             country: None,
             summary: None,
+            other: None,
+            can_split: false,
+            only_this: false,
+            was_own: false,
+            title_langs: None,
             follow: true,
             loaded_for: None,
             loader: None,
@@ -212,9 +271,13 @@ impl CategoryPicker {
         }
     }
 
+    fn choice(&self) -> (BTreeSet<CategoryTag>, bool, bool, Option<bool>) {
+        (self.keep.clone(), self.keep_untagged, self.only_this, self.title_langs)
+    }
+
     /// Ticks changed and not saved.
     pub fn is_edited(&self) -> bool {
-        self.initial.as_ref().is_some_and(|(keep, untagged)| *keep != self.keep || *untagged != self.keep_untagged)
+        self.initial.as_ref().is_some_and(|i| *i != self.choice())
     }
 
     /// Name the button that Esc mirrors.
@@ -237,38 +300,84 @@ impl CategoryPicker {
         self.source
     }
 
-    /// The summary once read.
+    /// The summary once read (of the playlists the edited rule covers).
     pub fn summary(&self) -> Option<&CategorySummary> {
         self.summary.as_ref()
+    }
+
+    /// The rule edits only this playlist ("Only for <playlist>").
+    pub fn only_this(&self) -> bool {
+        self.only_this
+    }
+
+    /// The playlist's name.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     fn set_data(&mut self, d: PickerData) {
         if !self.started {
             self.started = true;
-            match &d.rule {
-                Some(r) => {
+            self.was_own = d.own.is_some();
+            self.only_this = self.was_own;
+            let rule = match &d.own {
+                Some(own) => own.clone(),
+                None => d.rule.clone(),
+            };
+            match (&rule, &d.own) {
+                (Some(r), _) => {
                     self.keep = r.keep.clone();
                     self.keep_untagged = r.keep_untagged;
+                    self.title_langs = r.hide_other_languages;
                 }
-                None => {
+                // the playlist's own "show everything"
+                (None, Some(None)) => {
+                    self.keep = d.own_summary.present();
+                    self.keep_untagged = true;
+                    self.title_langs = Some(false);
+                }
+                (None, _) => {
                     self.keep = category_tags::default_keep(d.country.as_deref());
                     self.keep_untagged = true;
                 }
             }
-            self.stored = d.rule;
-            self.initial = Some((self.keep.clone(), self.keep_untagged));
+            self.stored = rule;
+            self.initial = Some(self.choice());
         }
+        self.can_split = d.playlists > 1 || d.own.is_some();
         // the cursor stays on its entry when a re-read reorders the rows
-        let at = self.cursor_entry().map(|t| t.tag.clone());
+        let at = self.cursor_row();
         self.name = d.name;
         self.country = d.country;
-        self.summary = Some(d.summary);
+        let (active, other) = if self.only_this { (d.own_summary, d.summary) } else { (d.summary, d.own_summary) };
+        self.summary = Some(active);
+        self.other = Some(other);
         self.refilter();
-        if let Some(tag) = at
-            && let Some(i) = self.rows.iter().position(|&i| self.summary.as_ref().is_some_and(|s| s.tags[i].tag == tag))
-        {
+        self.reselect(at);
+    }
+
+    /// The row under the cursor, as a stable key (the option, or the tag).
+    fn cursor_row(&self) -> Option<Result<Row, Option<CategoryTag>>> {
+        match *self.rows.get(self.list.cursor)? {
+            Row::Tag(i) => Some(Err(self.summary.as_ref()?.tags.get(i)?.tag.clone())),
+            r => Some(Ok(r)),
+        }
+    }
+
+    fn reselect(&mut self, at: Option<Result<Row, Option<CategoryTag>>>) {
+        let Some(at) = at else { return };
+        let s = self.summary.as_ref();
+        if let Some(i) = self.rows.iter().position(|r| match (r, &at) {
+            (Row::Tag(i), Err(tag)) => s.is_some_and(|s| s.tags[*i].tag == *tag),
+            (r, Ok(o)) => r == o,
+            _ => false,
+        }) {
             self.list.select(i);
         }
+    }
+
+    fn has_vod(&self) -> bool {
+        [&self.summary, &self.other].iter().any(|s| s.as_ref().is_some_and(|s| s.tags.iter().any(|t| t.movies + t.series > 0)))
     }
 
     fn refilter(&mut self) {
@@ -281,13 +390,25 @@ impl CategoryPicker {
                 None => UNTAGGED.to_owned(),
             })
             .collect();
-        self.rows = self.list.filter.apply(hay.iter().map(String::as_str)).into_iter().map(|i| i as usize).collect();
+        let mut rows = Vec::new();
+        if !self.list.filter.is_active() {
+            if self.can_split {
+                rows.push(Row::OnlyThis);
+            }
+            if self.has_vod() {
+                rows.push(Row::OtherLanguages);
+            }
+        }
+        rows.extend(self.list.filter.apply(hay.iter().map(String::as_str)).into_iter().map(|i| Row::Tag(i as usize)));
+        self.rows = rows;
         self.list.set_len(self.rows.len());
     }
 
-    fn cursor_entry(&self) -> Option<&TagSummary> {
-        let i = *self.rows.get(self.list.cursor)?;
-        self.summary.as_ref()?.tags.get(i)
+    fn tag_rows(&self) -> impl Iterator<Item = usize> + '_ {
+        self.rows.iter().filter_map(|r| match r {
+            Row::Tag(i) => Some(*i),
+            _ => None,
+        })
     }
 
     fn ticked(&self, tag: Option<&CategoryTag>) -> bool {
@@ -309,16 +430,39 @@ impl CategoryPicker {
         }
     }
 
-    fn toggle_row(&mut self, row: usize) {
-        let Some(tag) = self.rows.get(row).and_then(|&i| self.summary.as_ref()?.tags.get(i)).map(|t| t.tag.clone()) else { return };
-        let on = !self.ticked(tag.as_ref());
-        self.set_tick(tag.as_ref(), on);
+    /// "Also hide titles in other languages" as it stands (automatic: English-only ticks).
+    fn hides_other_languages(&self) -> bool {
+        self.title_langs.unwrap_or_else(|| category_tags::keeps_only_english(&self.keep))
     }
 
-    /// Tick every row the filter shows, or none when they all are.
+    /// "Only for <playlist>" on / off: the rows become that playlist's (or the shared) tags.
+    fn set_only_this(&mut self, on: bool) {
+        if on == self.only_this || !self.can_split {
+            return;
+        }
+        self.only_this = on;
+        std::mem::swap(&mut self.summary, &mut self.other);
+        self.refilter();
+        self.reselect(Some(Ok(Row::OnlyThis)));
+    }
+
+    fn toggle_row(&mut self, row: usize) {
+        match self.rows.get(row).copied() {
+            Some(Row::OnlyThis) => self.set_only_this(!self.only_this),
+            Some(Row::OtherLanguages) => self.title_langs = Some(!self.hides_other_languages()),
+            Some(Row::Tag(i)) => {
+                let Some(tag) = self.summary.as_ref().and_then(|s| s.tags.get(i)).map(|t| t.tag.clone()) else { return };
+                let on = !self.ticked(tag.as_ref());
+                self.set_tick(tag.as_ref(), on);
+            }
+            None => {}
+        }
+    }
+
+    /// Tick every tag row the filter shows, or none when they all are.
     fn set_shown(&mut self, on: Option<bool>) {
         let Some(s) = &self.summary else { return };
-        let tags: Vec<Option<CategoryTag>> = self.rows.iter().map(|&i| s.tags[i].tag.clone()).collect();
+        let tags: Vec<Option<CategoryTag>> = self.tag_rows().map(|i| s.tags[i].tag.clone()).collect();
         let on = on.unwrap_or_else(|| !tags.iter().all(|t| self.ticked(t.as_ref())));
         for t in &tags {
             self.set_tick(t.as_ref(), on);
@@ -328,18 +472,29 @@ impl CategoryPicker {
     fn defaults(&mut self) {
         self.keep = category_tags::default_keep(self.country.as_deref());
         self.keep_untagged = true;
+        self.title_langs = None;
     }
 
-    /// The rule Enter stores: `None` when every entry is ticked (no filtering).
+    /// The rule Enter stores: `None` when every entry is ticked and titles in other languages
+    /// aren't hidden (no filtering).
     fn to_save(&self) -> Option<CategoryFilter> {
         let s = self.summary.as_ref()?;
         let present = s.present();
         let untagged_present = s.tags.iter().any(|t| t.tag.is_none());
         let everything = present.iter().all(|t| self.keep.contains(t)) && (self.keep_untagged || !untagged_present);
-        (!everything).then(|| CategoryFilter { keep: self.keep.clone(), keep_untagged: self.keep_untagged, known: present })
+        (!everything || self.hides_other_languages()).then(|| CategoryFilter {
+            keep: self.keep.clone(),
+            keep_untagged: self.keep_untagged,
+            known: present,
+            hide_other_languages: self.title_langs,
+        })
     }
 
-    /// The ticks show nothing of the playlist (no present tag ticked, untagged off or absent).
+    fn to_store(&self) -> Save {
+        if self.only_this { Save::Own(self.to_save()) } else { Save::Shared(self.to_save()) }
+    }
+
+    /// The ticks show nothing of the playlists (no present tag ticked, untagged off or absent).
     fn shows_nothing(&self) -> bool {
         let Some(s) = &self.summary else { return false };
         !s.tags.is_empty() && s.tags.iter().all(|t| !self.ticked(t.tag.as_ref()))
@@ -352,20 +507,33 @@ impl CategoryPicker {
         let sum = |v: &mut dyn Iterator<Item = &TagSummary>| v.map(|t| t.items() as usize).sum::<usize>();
         let vod = s.tags.iter().any(|t| t.movies + t.series > 0);
         Some(format!(
-            "{} of {} ticked · {} of {} {}",
+            "{} of {} ticked · {} of {} {}{}",
             kept.len(),
             s.tags.len(),
             grouped(sum(&mut kept.iter().copied())),
             grouped(sum(&mut s.tags.iter())),
-            if vod { "channels and titles" } else { "channels" }
+            if vod { "channels and titles" } else { "channels" },
+            if vod && self.hides_other_languages() { " (fewer titles: other languages hidden)" } else { "" }
         ))
+    }
+
+    /// Who the choice applies to: "Applies to every playlist" / "Only TV 2".
+    fn scope_text(&self) -> Option<String> {
+        if !self.can_split {
+            return None;
+        }
+        Some(if self.only_this {
+            format!("Only {} — your other playlists keep the shared choice.", self.name)
+        } else {
+            "Applies to every playlist, also ones you add later (unless one has its own).".to_owned()
+        })
     }
 
     fn save(&mut self, ctx: &mut UiCtx<'_>) {
         if self.saving.is_some() || self.summary.is_none() {
             return;
         }
-        // nothing of the playlist would show: say so, and save on a second Enter
+        // nothing of the playlists would show: say so, and save on a second Enter
         if self.shows_nothing() {
             let ticks = (self.keep.clone(), self.keep_untagged);
             if self.armed_empty.as_ref() != Some(&ticks) {
@@ -374,11 +542,19 @@ impl CategoryPicker {
             }
         }
         self.armed_empty = None;
-        let filter = self.to_save();
-        let (id, f) = (self.source, filter.clone());
-        let ticket =
-            ctx.services.store.writer().submit_notify(DataScope::Sources, move |c| crate::store::sources::set_category_filter(c, id, f.as_ref()));
-        self.saving = Some((ticket, filter));
+        let save = self.to_store();
+        let (id, write, was_own) = (self.source, save.clone(), self.was_own);
+        let ticket = ctx.services.store.writer().submit_notify(DataScope::Sources, move |c| {
+            use crate::store::sources::{CategoryRule, set_category_rule, set_shared_category_filter};
+            match write {
+                Save::Own(f) => set_category_rule(c, id, &CategoryRule::Own(f)),
+                Save::Shared(f) => {
+                    set_shared_category_filter(c, f.as_ref())?;
+                    if was_own { set_category_rule(c, id, &CategoryRule::Shared) } else { Ok(()) }
+                }
+            }
+        });
+        self.saving = Some((ticket, save));
         self.error = None;
     }
 
@@ -438,19 +614,24 @@ impl CategoryPicker {
             Some(Err(e)) => self.error = Some(format!("Couldn't read the categories: {}", crate::redact::redact(&e.to_string()))),
             None => {}
         }
-        if let Some((ticket, filter)) = &mut self.saving {
+        if let Some((ticket, save)) = &mut self.saving {
             match ticket.try_take() {
                 Some(Ok(())) => {
-                    let text = match (filter, &self.summary) {
+                    let whom = match (&*save, self.can_split) {
+                        (Save::Own(_), _) => format!(" in {}", self.name),
+                        (Save::Shared(_), true) => " in every playlist".to_owned(),
+                        (Save::Shared(_), false) => String::new(),
+                    };
+                    let text = match (save.rule(), &self.summary) {
                         (Some(f), Some(s)) => {
                             let present = s.present();
                             format!(
-                                "Showing {} of {} countries and languages · Settings ▸ Hidden items shows the rest",
+                                "Showing {} of {} countries and languages{whom} · Settings ▸ Hidden items shows the rest",
                                 present.iter().filter(|t| f.keep.contains(*t)).count(),
                                 present.len()
                             )
                         }
-                        _ => "Showing every country and language".to_owned(),
+                        _ => format!("Showing every country and language{whom}"),
                     };
                     self.saving = None;
                     ctx.toast(Toast::info(text));
@@ -495,28 +676,48 @@ impl CategoryPicker {
                     });
                     ui.add_space(theme.space(SpaceToken::Sm));
                 }
-                if self.rows.is_empty() {
-                    let q = self.list.filter.query();
-                    small(
-                        ui,
-                        &if q.is_empty() { "This playlist has no categories yet".to_owned() } else { format!("No matches for “{q}”") },
-                        t.text_secondary,
-                    );
+                if !self.rows.iter().any(|r| matches!(r, Row::Tag(_))) && self.list.filter.is_active() {
+                    small(ui, &format!("No matches for “{}”", self.list.filter.query()), t.text_secondary);
                 } else {
+                    if s.tags.is_empty() {
+                        small(ui, "This playlist has no categories yet", t.text_secondary);
+                    }
                     let row_h = row_height(theme, crate::config::Density::Comfortable, true);
                     let max_h = (egui_ctx.content_rect().height() * 0.45).max(row_h * 3.0);
                     let h = (self.rows.len() as f32 * row_h).min(max_h);
                     let (rows, keep, untagged) = (&self.rows, &self.keep, self.keep_untagged);
                     let known = self.stored.as_ref().map(|r| &r.known).filter(|k| !k.is_empty());
+                    let only_label = format!("Only for {}", self.name);
+                    let only_detail = if self.only_this {
+                        "This playlist has its own choice — untick to use the one every playlist shares"
+                    } else {
+                        "Tick to give this playlist its own choice; the others keep the shared one"
+                    };
+                    let (only_this, hides) = (self.only_this, self.hides_other_languages());
                     let list = &mut self.list;
                     ui.allocate_ui(egui::vec2(ui.available_width(), h), |ui| {
                         virtual_list(ui, theme, ("category-picker", self.source), list, row_h, |ui, rc| {
-                            let e = &s.tags[rows[rc.index]];
-                            let ticked = e.tag.as_ref().map_or(untagged, |tag| keep.contains(tag));
-                            let code = e.tag.as_ref().map(category_tags::tag_short);
-                            let new = e.tag.as_ref().is_some_and(|tag| known.is_some_and(|k| !k.contains(tag)));
-                            let label = tag_name(e.tag.as_ref());
-                            let resp = check_row(ui, theme, ticked, code.as_deref(), &label, Some(&counts_text(e)), new, rc.state);
+                            let resp = match rows[rc.index] {
+                                Row::OnlyThis => check_row(ui, theme, only_this, None, &only_label, Some(only_detail), false, rc.state),
+                                Row::OtherLanguages => check_row(
+                                    ui,
+                                    theme,
+                                    hides,
+                                    None,
+                                    "Also hide titles in other languages",
+                                    Some("Movies and series whose name marks another language (“DE - …”, “AR-SUBS - …”), also in the countries ticked. Favourites and titles you started stay."),
+                                    false,
+                                    rc.state,
+                                ),
+                                Row::Tag(i) => {
+                                    let e = &s.tags[i];
+                                    let ticked = e.tag.as_ref().map_or(untagged, |tag| keep.contains(tag));
+                                    let code = e.tag.as_ref().map(category_tags::tag_short);
+                                    let new = e.tag.as_ref().is_some_and(|tag| known.is_some_and(|k| !k.contains(tag)));
+                                    let label = tag_name(e.tag.as_ref());
+                                    check_row(ui, theme, ticked, code.as_deref(), &label, Some(&counts_text(e)), new, rc.state)
+                                }
+                            };
                             if resp.clicked() {
                                 toggled = Some(rc.index);
                             }
@@ -534,6 +735,9 @@ impl CategoryPicker {
             self.refresh(ctx);
         }
         ui.add_space(theme.space(SpaceToken::Sm));
+        if let Some(text) = self.scope_text() {
+            small(ui, &text, t.text_secondary);
+        }
         if let Some(text) = self.effect_text() {
             small(ui, &text, t.text_secondary);
         }
@@ -629,10 +833,11 @@ impl Overlay for CategoriesOverlay {
             ui.label(RichText::new("Choose what to show").size(theme.font(TypeToken::Heading)).color(t.fg));
             ui.add_space(theme.space(SpaceToken::Xs));
             let sub = match picker.summary() {
-                Some(s) => {
-                    format!("{}: categories in {} countries and languages. Untick what you don't want to see.", picker.name, s.tag_count())
+                Some(s) if picker.only_this() => {
+                    format!("{}: categories in {} countries and languages. Untick what you don't want to see.", picker.name(), s.tag_count())
                 }
-                None => picker.name.clone(),
+                Some(s) => format!("Your playlists: categories in {} countries and languages. Untick what you don't want to see.", s.tag_count()),
+                None => picker.name().to_owned(),
             };
             ui.add(egui::Label::new(RichText::new(sub).size(theme.font(TypeToken::Body)).color(t.text_secondary)).wrap());
             ui.add_space(theme.space(SpaceToken::Lg));
@@ -668,7 +873,7 @@ mod tests {
             ],
             needs_refresh: false,
         };
-        PickerData { summary, rule, name: "My IPTV".into(), country: Some("GB".into()) }
+        PickerData { own_summary: summary.clone(), summary, rule, own: None, name: "My IPTV".into(), playlists: 1, country: Some("GB".into()) }
     }
 
     fn ticks(p: &CategoryPicker) -> Vec<String> {
@@ -729,7 +934,7 @@ mod tests {
         assert!(rule.keep_untagged);
         assert_eq!(rule.known, ["lang:ar", "FR", "GB", "US", "lang:en"].into_iter().map(tag).collect::<BTreeSet<_>>());
         // a saved rule is where the ticks start (not the defaults); tags it didn't know are "new"
-        let saved = CategoryFilter { keep: [tag("FR")].into(), keep_untagged: false, known: [tag("FR"), tag("GB")].into() };
+        let saved = CategoryFilter { keep: [tag("FR")].into(), keep_untagged: false, known: [tag("FR"), tag("GB")].into(), ..Default::default() };
         let mut p2 = CategoryPicker::from_data(SourceId(1), data(Some(saved)), None);
         assert_eq!(ticks(&p2), ["FR"]);
         // F5 on a playlist imported before tags were recognised: a forced refresh of it (an
@@ -749,9 +954,79 @@ mod tests {
         drop((t, one));
     }
 
+    /// DESIGN §28.3 / §28.12: the picker edits the rule every playlist shares; "Only for
+    /// <playlist>" (a row, ticked with Space) edits that playlist's own instead, over its own
+    /// categories; "Also hide titles in other languages" is on by itself for English-only ticks;
+    /// Ctrl+A ticks tags only; a playlist's own "show everything" ticks every row.
+    #[test]
+    fn shared_rule_only_for_this_playlist_and_other_languages() {
+        let (mut t, one) = rig();
+        let (tv, tv2) = seed(&mut t, |c| Ok((testkit::source(c, "TV")?, testkit::source(c, "TV 2")?)));
+        let movies = |t: &str, n: u32| TagSummary { tag: Some(tag(t)), movie_groups: 1, movies: n, ..Default::default() };
+        let shared = CategorySummary { tags: vec![movies("DE", 900), movies("GB", 500), movies("FR", 100)], needs_refresh: false };
+        let own = CategorySummary { tags: vec![movies("GB", 500), movies("FR", 100)], needs_refresh: false };
+        let data = |own_rule: Option<Option<CategoryFilter>>| PickerData {
+            summary: shared.clone(),
+            own_summary: own.clone(),
+            rule: None,
+            own: own_rule,
+            name: "TV 2".into(),
+            playlists: 2,
+            country: Some("GB".into()),
+        };
+        let mut p = CategoryPicker::from_data(tv2, data(None), None);
+        assert_eq!(p.rows[..2], [Row::OnlyThis, Row::OtherLanguages]);
+        assert_eq!(ticks(&p), ["GB"], "the shared rule's rows: every playlist's tags");
+        assert!(p.hides_other_languages(), "automatic: English-only ticks");
+        assert!(matches!(p.to_store(), Save::Shared(Some(ref f)) if f.hide_other_languages.is_none() && f.known.len() == 3));
+        t.with_ctx(|ctx| {
+            // Space on "Also hide titles in other languages" turns it off for good
+            p.list.select(1);
+            p.on_action(ctx, Action::ToggleMark);
+            assert!(!p.hides_other_languages());
+            // Ctrl+A ticks the tags only
+            p.on_action(ctx, Action::MarkAll);
+            assert_eq!(ticks(&p), ["DE", "GB", "FR"]);
+            assert!(!p.only_this && !p.hides_other_languages());
+            assert_eq!(p.to_store(), Save::Shared(None), "everything shown: no rule");
+            p.on_action(ctx, Action::MarkDefaults);
+            // Space on "Only for TV 2": TV 2's own categories
+            p.list.select(0);
+            p.on_action(ctx, Action::ToggleMark);
+            assert!(p.only_this);
+            assert_eq!(p.summary().unwrap().tags.len(), 2);
+            assert_eq!(p.list.cursor, 0, "the cursor stays on the option");
+            p.on_action(ctx, Action::Activate);
+        });
+        let (ticket, save) = p.saving.take().expect("saving");
+        assert!(matches!(save, Save::Own(Some(_))));
+        ticket.wait().unwrap();
+        let r = t.services().store.reader().unwrap();
+        let st = crate::store::sources::get_source(&r, tv2).unwrap().settings;
+        assert_eq!(st.own_category_filter, Some(true));
+        assert!(st.category_filter.unwrap().keep.contains(&tag("GB")));
+        assert_eq!(crate::store::sources::shared_category_filter(&r).unwrap(), None, "the shared rule untouched");
+        assert!(!crate::store::sources::get_source(&r, tv).unwrap().settings.has_own_category_filter());
+        // a playlist that shows everything of its own: every row ticked, "Only for" on; unticking
+        // it and saving makes the playlist follow the shared rule again
+        let mut p = CategoryPicker::from_data(tv2, data(Some(None)), None);
+        assert!(p.only_this && !p.hides_other_languages());
+        assert_eq!(ticks(&p), ["GB", "FR"]);
+        t.with_ctx(|ctx| {
+            p.list.select(0);
+            p.on_action(ctx, Action::ToggleMark);
+            p.on_action(ctx, Action::Activate);
+        });
+        let (ticket, save) = p.saving.take().expect("saving");
+        assert!(matches!(save, Save::Shared(_)));
+        ticket.wait().unwrap();
+        assert_eq!(crate::store::sources::get_source(&r, tv2).unwrap().settings.own_category_filter, Some(false));
+        drop((t, one));
+    }
+
     /// The dialog (Settings ▸ Playlists ▸ Categories…): it reads the playlist's categories off
-    /// the UI thread, Space ticks the row the filter shows, Enter stores the rule through
-    /// `set_category_filter` (the library rebuild applies it) and closes.
+    /// the UI thread, Space ticks the row the filter shows, Enter stores the shared rule (the
+    /// library rebuild applies it) and closes.
     #[test]
     fn the_dialog_reads_the_playlist_and_enter_stores_the_rule() {
         let (mut t, one) = rig();
@@ -778,8 +1053,9 @@ mod tests {
         h.state_mut().act(Action::ToggleMark);
         assert_eq!(h.state_mut().act(Action::Activate), "Keep", "the write runs");
         testkit::until_ov(&mut h, "the dialog to close", |h| h.state().last == "Close");
-        let rule = crate::store::sources::get_source(&h.state().t.services().store.reader().unwrap(), src).unwrap().settings.category_filter;
-        let rule = rule.expect("a rule");
+        let r = h.state().t.services().store.reader().unwrap();
+        let rule = crate::store::sources::shared_category_filter(&r).unwrap().expect("a shared rule");
+        assert!(!crate::store::sources::get_source(&r, src).unwrap().settings.has_own_category_filter(), "the playlist follows it");
         assert!(!rule.keep.contains(&tag("region:exyu")) && !rule.keep.contains(&tag("GB")) && rule.keep_untagged);
         assert_eq!(rule.known, [tag("GB"), tag("region:exyu")].into());
         assert!(h.state().t.toasts.iter().any(|x| x.text.starts_with("Showing 0 of 2 countries and languages")), "{:?}", h.state().t.toasts);

@@ -102,6 +102,8 @@ fn library() -> Library {
         has_live: true,
         in_all: true,
         category_filter: None,
+        own_category_filter: false,
+        language_hidden: 0,
     };
     Library {
         sources: vec![source(1, "My IPTV"), source(2, "Backup")],

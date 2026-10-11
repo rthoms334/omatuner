@@ -746,6 +746,22 @@ pub fn audio_lang(code: &str, dub: Dub) -> Option<&'static str> {
     }
 }
 
+/// The language a copy's tag is FOR (ISO 639-1): its audio language, or for a subtitled market
+/// (`AR-SUBS`, `KU-S`, `NL+SUB`) the market's language — its subtitles and its shelf. `None`
+/// for multi-audio copies and regions without one language (`SC`); Ex-Yugoslav (`EX`) is
+/// `sh` ([`category_tags::SERBO_CROATIAN`]). What "Also hide titles
+/// in other languages" reads (DESIGN §28.12).
+pub fn market_lang(code: &str, dub: Dub) -> Option<&'static str> {
+    if dub == Dub::Multi {
+        return None;
+    }
+    let base: Vec<&str> = code.split('-').filter(|p| !matches!(*p, "SUBS" | "SUB" | "S")).collect();
+    match base.first() {
+        Some(&"EX") => Some(category_tags::SERBO_CROATIAN),
+        _ => audio_lang(&base.join("-"), Dub::None),
+    }
+}
+
 /// Language codes [`audio_lang`] can return from a language tag.
 const LANGS: &[&str] = &[
     "en", "ar", "fr", "de", "it", "es", "pt", "tr", "ru", "pl", "nl", "el", "hi", "ur", "ta", "or", "te", "pa", "bn", "ml", "kn", "mr", "gu", "ku",
@@ -1084,6 +1100,17 @@ mod tests {
         assert_eq!(audio_lang("AR-SUBS", Dub::None), None);
         assert_eq!(audio_lang("FR", Dub::Subbed), None, "VOSTFR is original audio");
         assert_eq!(audio_lang("AR", Dub::Dubbed), Some("ar"));
+        // the market a copy is for (subtitled shelves count as their market's language)
+        assert_eq!(market_lang("AR-SUBS", Dub::None), Some("ar"));
+        assert_eq!(market_lang("KU-S", Dub::None), Some("ku"));
+        assert_eq!(market_lang("NL", Dub::Subbed), Some("nl"));
+        assert_eq!(market_lang("EN", Dub::Subbed), Some("en"));
+        assert_eq!(market_lang("QC", Dub::None), Some("fr"));
+        assert_eq!(market_lang("IN-EN", Dub::None), Some("hi"));
+        assert_eq!(market_lang("DE", Dub::Multi), None, "multi-audio may carry the user's language");
+        assert_eq!(market_lang("SC", Dub::None), None);
+        assert_eq!(market_lang("EX", Dub::None), Some("sh"));
+        assert_eq!(market_lang("IS", Dub::None), Some("is"));
         assert_eq!(norm_lang("eng"), "en");
         assert_eq!(norm_lang("ger"), "de");
         let prefs = vec!["en".to_owned(), "de".to_owned()];

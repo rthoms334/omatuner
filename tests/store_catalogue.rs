@@ -1883,7 +1883,7 @@ fn category_filter_hides_tagged_groups_everywhere_and_follows_refreshes() {
     assert_eq!(tags, [Some("lang:ar"), Some("GB"), None], "AR has 2 channels + 1 movie, GB 2 channels, untagged last");
     assert_eq!((summary.tags[0].live_groups, summary.tags[0].movie_groups, summary.needs_refresh), (1, 1, false));
 
-    let rule = CategoryFilter { keep: [CategoryTag::country("GB")].into(), keep_untagged: true, known: summary.present() };
+    let rule = CategoryFilter { keep: [CategoryTag::country("GB")].into(), keep_untagged: true, known: summary.present(), ..Default::default() };
     let saved = rule.clone();
     w(&s, move |c| sources::set_category_filter(c, src, Some(&saved)));
 
@@ -2115,4 +2115,236 @@ fn store_sources_never_use_insert_or_replace() {
             assert!(!re.is_match(code), "{}:{}: {line}", f.display(), n + 1);
         }
     }
+}
+
+/// Movies of one playlist with their provider category names as imported (`raw_name`, what tag
+/// detection reads): `(key, name, category)`.
+fn import_movies_raw(s: &Store, src: SourceId, movies: &[(&str, &str, &str)], now: Timestamp) {
+    let mut groups: Vec<ImportGroup> = Vec::new();
+    for (_, _, raw) in movies {
+        if !groups.iter().any(|g| g.key == group_key(ItemKind::Movie, raw)) {
+            groups.push(ImportGroup {
+                adult: false,
+                kind: ItemKind::Movie,
+                key: group_key(ItemKind::Movie, raw),
+                name: (*raw).to_owned(),
+                raw_name: Some((*raw).to_owned()),
+                provider_id: None,
+                provider_order: groups.len() as i32,
+            });
+        }
+    }
+    let films: Vec<ImportMovie> = movies.iter().enumerate().map(|(i, (key, name, raw))| listed(key, name, raw, i as i32, None)).collect();
+    w(s, move |c| {
+        let imp = import::begin_catalogue(c, src, now)?;
+        import::upsert_groups(c, &imp, &groups)?;
+        import::write_movies(c, &imp, &films)?;
+        import::finish_catalogue(c, &imp, &[ItemKind::Movie], now)
+    });
+}
+
+/// The English set v0.1.0's picker saved ("show my country (English)", field report).
+fn english_rule() -> CategoryFilter {
+    CategoryFilter {
+        keep: ["AU", "CA", "GB", "IE", "NZ", "US"].into_iter().map(CategoryTag::country).chain([CategoryTag::language("en")]).collect(),
+        keep_untagged: true,
+        ..Default::default()
+    }
+}
+
+/// The movies a snapshot shows, by key.
+fn shown_movies(lib: &library::Library) -> HashSet<String> {
+    lib.vod.movies.iter().map(|m| m.key.0.clone()).collect()
+}
+
+/// Field report: "When I view Movies I see stacked cards from other languages when my settings
+/// clearly have show my country (English)". v0.1.0 kept the rule per playlist and only "TV" had
+/// one; "TV 2" showed every country, and its foreign copies stacked with TV's English ones. The
+/// rule is now shared (DESIGN §28.3): the first start adopts TV's rule for every playlist, a
+/// playlist added later follows it, one playlist can still have its own, and Settings ▸ Hidden's
+/// "show this country" changes the rule that hid it. Hidden copies never join a stack.
+#[test]
+fn one_category_rule_covers_every_playlist_and_a_new_one() {
+    let dir = std::env::temp_dir().join(format!("tuner-st-shared-rule-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("tuner.db");
+    let (tv, tv2) = {
+        let s = Store::open(&path, None).unwrap();
+        let (tv, tv2) = w(&s, |c| Ok((seed::seed_source(c, "TV")?, seed::seed_source(c, "TV 2")?)));
+        import_movies_raw(
+            &s,
+            tv,
+            &[
+                ("a1", "EN ✪ Dracula - 2025", "EN ✪ DRAMA"),
+                ("a2", "DE ✪ Dracula - 2025", "DE ✪ FILME"),
+                ("a3", "NL ✪ Heat - 1995", "NL ✪ FILMS [SUB]"),
+            ],
+            NOW,
+        );
+        import_movies_raw(
+            &s,
+            tv2,
+            &[
+                ("b1", "EN - Dracula (2025)", "EN | Movies"),
+                ("b2", "DE - Dracula (2025)", "DE | Filme"),
+                ("b3", "IT - Dracula (2025)", "IT ✪ FILM"),
+                ("b4", "GR - Dracula (2025)", "GR ✪ ταινίες με υπότιτλους"),
+                ("b5", "EN - Heat (1995)", "EN | Movies"),
+            ],
+            NOW,
+        );
+        // what v0.1.0 stored: the English rule on TV only (no "own" flag yet), nothing on TV 2
+        let legacy = serde_json::json!({ "category_filter": english_rule() }).to_string();
+        w(&s, move |c| Ok(c.execute("UPDATE source SET settings = ?2 WHERE id = ?1", rusqlite::params![tv, legacy])?));
+        let before = library::load(&s.reader().unwrap()).unwrap();
+        assert!(shown_movies(&before).contains("b2"), "v0.1.0's shape, read as it was: TV 2 unfiltered");
+        assert!(before.source(tv).unwrap().own_category_filter && !before.source(tv2).unwrap().own_category_filter);
+        assert!(s.close(std::time::Duration::from_secs(5)));
+        (tv, tv2)
+    };
+    // the first start of this build adopts TV's rule as the shared one
+    let s = Store::open(&path, None).unwrap();
+    let r = s.reader().unwrap();
+    let shared = sources::shared_category_filter(&r).unwrap().expect("TV's rule is shared");
+    assert!(shared.same_choice(&english_rule()));
+    let st = |id| sources::get_source(&r, id).unwrap().settings;
+    assert_eq!((st(tv).own_category_filter, st(tv2).own_category_filter), (Some(false), None));
+    assert!(!w(&s, |c| sources::adopt_legacy_category_filters(c)), "done once");
+
+    let lib = library::load(&r).unwrap();
+    assert_eq!(shown_movies(&lib), ["a1", "b1", "b5"].map(String::from).into(), "TV 2's German, Italian and Greek categories hide too");
+    for src in [tv, tv2] {
+        assert!(lib.source(src).unwrap().category_filter.as_ref().is_some_and(|f| f.same_choice(&shared)));
+    }
+    let de2 = lib.vod.movie_groups.iter().find(|g| g.source_id == tv2 && g.tag == Some(CategoryTag::country("DE"))).unwrap();
+    assert_eq!((de2.filter, de2.hidden), (GroupFilter::Hidden, true));
+    // Dracula stacks TV's and TV 2's English copies only: no hidden copy is in any stack
+    let stacks = lib.vod.stacks(true);
+    let dracula = stacks.ids().find(|id| stacks.members(*id).iter().any(|i| lib.vod.movies[*i as usize].key.0 == "a1")).unwrap();
+    let members: Vec<&str> = stacks.members(dracula).iter().map(|i| lib.vod.movies[*i as usize].key.0.as_str()).collect();
+    assert_eq!(members, ["a1", "b1"]);
+    for id in stacks.ids() {
+        for i in stacks.members(id) {
+            assert_eq!(stacks.lang(*i), Some("EN"), "every stacked copy is an English one");
+        }
+    }
+
+    // a playlist added later follows the shared rule without being asked
+    let tv3 = w(&s, |c| sources::insert_source(c, &m3u_draft("TV 3", "http://h.tv/3.m3u"), NOW));
+    import_movies_raw(&s, tv3, &[("c1", "FR - Dracula (2025)", "FR | Films"), ("c2", "UK - Heat (1995)", "UK | Movies")], NOW);
+    let lib = library::load(&r).unwrap();
+    assert_eq!(shown_movies(&lib), ["a1", "b1", "b5", "c2"].map(String::from).into());
+
+    // "Use a different rule for this playlist": TV 3 shows everything, the others keep the rule
+    w(&s, move |c| sources::set_category_rule(c, tv3, &sources::CategoryRule::Own(None)));
+    let lib = library::load(&r).unwrap();
+    assert!(lib.source(tv3).unwrap().own_category_filter && lib.source(tv3).unwrap().category_filter.is_none());
+    assert_eq!(shown_movies(&lib), ["a1", "b1", "b5", "c1", "c2"].map(String::from).into());
+    // ... and back to the shared one
+    w(&s, move |c| sources::set_category_rule(c, tv3, &sources::CategoryRule::Shared));
+    assert!(!shown_movies(&library::load(&r).unwrap()).contains("c1"));
+
+    // Settings ▸ Hidden ▸ "show Germany" on TV 2: the shared rule keeps DE, for TV too
+    assert!(w(&s, move |c| sources::keep_tag(c, tv2, Some(CategoryTag::country("DE")))), "the shared rule changed");
+    let lib = library::load(&r).unwrap();
+    assert!(shown_movies(&lib).is_superset(&["a2", "b2"].map(String::from).into()));
+    // a stale source editor keeps the rule choice
+    let stale = w(&s, move |c| sources::get_source(c, tv3));
+    w(&s, move |c| sources::set_category_rule(c, tv3, &sources::CategoryRule::Own(None)));
+    w(&s, move |c| sources::update_source(c, &Source { name: "TV three".into(), ..stale.clone() }));
+    assert_eq!(st(tv3).own_category_filter, Some(true));
+    drop(r);
+    assert!(s.close(std::time::Duration::from_secs(5)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Several playlists with different rules before the rule was shared: the first becomes the
+/// shared rule, the others keep theirs as their own; playlists without a rule follow the shared
+/// one (DESIGN §28.3).
+#[test]
+fn differing_old_rules_stay_per_playlist() {
+    let s = store("tuner-st-adopt-differ");
+    let (a, b, c3) = w(&s, |c| Ok((seed::seed_source(c, "A")?, seed::seed_source(c, "B")?, seed::seed_source(c, "C")?)));
+    let fr = CategoryFilter { keep: [CategoryTag::country("FR")].into(), ..Default::default() };
+    let (en, fr2) = (english_rule(), fr.clone());
+    w(&s, move |c| {
+        for (id, rule) in [(a, &en), (b, &fr2)] {
+            let legacy = serde_json::json!({ "category_filter": rule }).to_string();
+            c.execute("UPDATE source SET settings = ?2 WHERE id = ?1", rusqlite::params![id, legacy])?;
+        }
+        Ok(())
+    });
+    assert!(w(&s, |c| sources::adopt_legacy_category_filters(c)));
+    let r = s.reader().unwrap();
+    assert!(sources::shared_category_filter(&r).unwrap().unwrap().same_choice(&english_rule()), "seeded from the first playlist");
+    let lib = library::load(&r).unwrap();
+    let rule = |id| lib.source(id).unwrap();
+    assert!(!rule(a).own_category_filter && rule(b).own_category_filter && !rule(c3).own_category_filter);
+    assert_eq!(rule(b).category_filter.as_ref(), Some(&fr));
+    assert!(rule(c3).category_filter.as_ref().unwrap().same_choice(&english_rule()));
+}
+
+/// "Also hide titles in other languages" (DESIGN §28.12), on by itself for an English-only rule:
+/// titles whose own name marks another market are hidden also in kept and untagged categories —
+/// a Dutch title among English ones, Québec films in "CA ✪", Arabic-subtitled films in an
+/// untagged Arabic-named category (and its untagged titles, by the category's market), an Arabic
+/// match in "VIP ✪" — while untagged and multi-audio titles stay, and so do a favourite and a
+/// title the user started. The user's audio languages count as kept. Off, they all return.
+#[test]
+fn titles_in_other_languages_hide_but_never_favourites_or_started_ones() {
+    let s = store("tuner-st-title-langs");
+    let tv = w(&s, |c| seed::seed_source(c, "TV"));
+    let mut movies: Vec<(String, String, String)> = vec![
+        ("en1".into(), "EN ✪ Dracula - 2025".into(), "EN ✪ MULTI-SUB [2025/2026]".into()),
+        ("nl1".into(), "NL ✪ Zwartboek - 2006".into(), "EN ✪ MULTI-SUB [2025/2026]".into()),
+        ("qc1".into(), "QC ✪ Starbuck - 2011".into(), "CA ✪ QUEBEC FILMS".into()),
+        ("vip1".into(), "AR ✪ Final - 2026".into(), "VIP ✪ كأس العالم 2026".into()),
+        ("multi".into(), "Babel [Multi-Audio] - 2006".into(), "VIP ✪ كأس العالم 2026".into()),
+        ("plain".into(), "Heat - 1995".into(), "EN ✪ DRAMA".into()),
+        ("fav".into(), "DE ✪ Lola rennt - 1998".into(), "EN ✪ DRAMA".into()),
+        ("seen".into(), "FR ✪ Amélie - 2001".into(), "EN ✪ DRAMA".into()),
+        ("old".into(), "Casablanca - 1942".into(), "أفلام أجنبية قديمه".into()),
+        ("sv1".into(), "SE ✪ Jägarna - 1996".into(), "SVENSKA 2020 & GAMMAL".into()),
+    ];
+    movies.extend((0..12).map(|i| (format!("sub{i}"), format!("AR-SUBS - Film {i} ({})", 1990 + i), "أفلام أجنبية قديمه".to_owned())));
+    let rows: Vec<(&str, &str, &str)> = movies.iter().map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str())).collect();
+    import_movies_raw(&s, tv, &rows, NOW);
+    let r = s.reader().unwrap();
+    let lang = |key: &str| r.query_row("SELECT match_lang FROM movie WHERE key = ?1", [key], |x| x.get::<_, Option<String>>(0)).unwrap();
+    assert_eq!((lang("nl1").as_deref(), lang("qc1").as_deref(), lang("sub0").as_deref()), (Some("NL"), Some("QC"), Some("AR-SUBS")));
+    w(&s, move |c| {
+        let list = user::default_fav_list(c)?;
+        user::set_favourite(c, list, &mref(tv, "fav"), true, NOW)?;
+        user::save_progress(
+            c,
+            &WatchProgress {
+                item: mref(tv, "seen"),
+                position_s: 600.0,
+                duration_s: Some(5400.0),
+                updated_at: NOW,
+                finished: false,
+                title: "Amélie".into(),
+                fingerprint: Default::default(),
+            },
+        )?;
+        sources::set_shared_category_filter(c, Some(&english_rule()))
+    });
+    let lib = library::load(&r).unwrap();
+    let kept: HashSet<String> = ["en1", "multi", "plain", "fav", "seen"].map(String::from).into();
+    assert_eq!(shown_movies(&lib), kept, "SVENSKA is Sweden now; the rest hide by title");
+    assert_eq!(lib.source(tv).unwrap().language_hidden, 16, "nl1 qc1 vip1 old + 12 AR-SUBS");
+    let arabic = lib.vod.movie_groups.iter().find(|g| g.name == "أفلام أجنبية قديمه").unwrap();
+    assert_eq!((arabic.hidden, arabic.item_count), (false, 0), "the untagged category stays, without the titles it lost");
+    assert_eq!(lib.vod.group_items(arabic.id, SortMode::Provider), Vec::<u32>::new());
+    // Dutch is one of the user's audio languages: Dutch titles stay
+    let dutch = library::load_with(&r, &library::LoadOptions { audio_langs: vec!["nld".into()], ..Default::default() }).unwrap();
+    assert!(shown_movies(&dutch).contains("nl1") && !shown_movies(&dutch).contains("qc1"));
+    // turned off: only the categories filter
+    let off = CategoryFilter { hide_other_languages: Some(false), ..english_rule() };
+    w(&s, move |c| sources::set_shared_category_filter(c, Some(&off)));
+    let lib = library::load(&r).unwrap();
+    assert_eq!(lib.source(tv).unwrap().language_hidden, 0);
+    let all: HashSet<String> = movies.iter().map(|m| m.0.clone()).filter(|k| k != "sv1").collect();
+    assert_eq!(shown_movies(&lib), all);
 }

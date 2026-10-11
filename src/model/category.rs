@@ -50,8 +50,10 @@ impl CategoryTag {
     }
 }
 
-/// The per-source rule (`SourceSettings::category_filter`): which tags' categories are shown.
-/// Applied on every library build, so categories a provider adds later follow it (DESIGN §28.3).
+/// A category filter rule (DESIGN §28.3): which tags' categories are shown. One rule is shared
+/// by every playlist (`store::sources::shared_category_filter`); a playlist may have its own
+/// instead (`SourceSettings::category_filter` with `own_category_filter`). Applied on every
+/// library build, so categories a provider adds later follow it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CategoryFilter {
@@ -60,13 +62,18 @@ pub struct CategoryFilter {
     pub keep: BTreeSet<CategoryTag>,
     /// Show categories without a tag ("No country tag").
     pub keep_untagged: bool,
-    /// The tags the playlist had when the rule was last saved: the picker marks the others "new".
+    /// The tags the playlists had when the rule was last saved: the picker marks the others "new".
     pub known: BTreeSet<CategoryTag>,
+    /// "Also hide titles in other languages" (DESIGN §28.12): movies and series whose own name
+    /// marks a language the rule doesn't keep (`DE - …`, `AR-SUBS - …`) are hidden too, also in
+    /// kept and untagged categories. `None` = automatic: on when the rule keeps only
+    /// English-language tags (`sources::category_tags::hides_other_languages`).
+    pub hide_other_languages: Option<bool>,
 }
 
 impl Default for CategoryFilter {
     fn default() -> Self {
-        Self { keep: BTreeSet::new(), keep_untagged: true, known: BTreeSet::new() }
+        Self { keep: BTreeSet::new(), keep_untagged: true, known: BTreeSet::new(), hide_other_languages: None }
     }
 }
 
@@ -77,6 +84,11 @@ impl CategoryFilter {
             Some(t) => self.keep.contains(t),
             None => self.keep_untagged,
         }
+    }
+
+    /// Same tags kept (`known` is bookkeeping and the language option follows separately).
+    pub fn same_choice(&self, other: &CategoryFilter) -> bool {
+        self.keep == other.keep && self.keep_untagged == other.keep_untagged && self.hide_other_languages == other.hide_other_languages
     }
 }
 

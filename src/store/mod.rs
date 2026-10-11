@@ -70,6 +70,8 @@ impl Store {
         let mut conn = Connection::open(path)?;
         configure(&conn, false)?;
         migrations::migrate(&mut conn)?;
+        // rules saved per playlist before the category rule was shared (DESIGN §28.3)
+        sources::adopt_legacy_category_filters(&conn)?;
         let writer = Writer::spawn(conn, bus)?;
         Ok(Self { path: path.to_path_buf(), writer, _temp: None })
     }

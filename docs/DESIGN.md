@@ -3768,11 +3768,14 @@ countries ("AR | News", "FR | Sport", "|DE| Filme"…) and the only tool was Ctr
 at a time — which also misses every category the provider adds later.
 
 ### 28.1 Decisions
-1. **A rule, not hide flags.** Each source stores a *category filter*: a keep-list of
-   country / language / region tags plus "keep untagged" (`SourceSettings::category_filter`).
-   It is applied on every library build, so categories a provider adds later for unticked tags
-   stay hidden without the user doing anything. `None` (the default; every source before P6) =
-   no filtering.
+1. **A rule, not hide flags — one rule for every playlist** (field fix, §28.3). A *category
+   filter* is a keep-list of country / language / region tags plus "keep untagged". **One rule
+   is shared by every playlist** (`meta` row `category-filter`), new playlists included; a
+   playlist may have **its own** instead ("Only for <playlist>":
+   `SourceSettings::{category_filter, own_category_filter}`). It is applied on every library
+   build, so categories a provider adds later for unticked tags stay hidden without the user
+   doing anything. No rule (the default) = no filtering. (P6 shipped the rule per playlist; the
+   field report below is why it is shared now.)
 2. **Same rule for live, movie and series categories** of a source (one keep-list per source).
 3. **Defaults** (user decision): the user's country (`presets::detect_country`: timezone, then
    locale — GB here) and its main language, plus every English-language tag (GB, US, CA, AU,
@@ -3867,16 +3870,46 @@ the defaults add the main language of the user's country (`country_language`, a 
 FR→fr, DE/AT→de, ES/MX/AR…→es, IT→it, PT/BR→pt, NL→nl, TR→tr, PL→pl, RU→ru, IN→hi, PK→ur…).
 
 ### 28.3 Rule storage and semantics
-* `SourceSettings::category_filter: Option<CategoryFilter>` (settings JSON, serde default
-  `None`). `CategoryFilter { keep: BTreeSet<CategoryTag>, keep_untagged: bool (default true),
-  known: BTreeSet<CategoryTag> }`. `known` = the tags present when the rule was last saved;
-  the picker marks other tags "new" (no toast).
+* **Field report (v0.1.0):** "When I view Movies I see stacked cards from other languages when
+  my settings clearly have show my country (English)." The rule was per playlist and offered
+  once, in the add-playlist flow (dismissable with "Show everything"); the user had saved the
+  English set on "TV" only, so "TV 2" (no rule) showed every country — about 147 k visible
+  non-English copies, 99 % of the foreign stack members and every all-foreign stack of All
+  playlists (43 % of All's cards were another language). Tag detection on `✪` names and the
+  stacks were right: no hidden copy was in any stack. Hence one shared rule, and §28.12 for the
+  foreign titles inside kept / untagged categories (about 27.7 k copies even with TV's rule on
+  TV 2). Measured on a copy of that profile after this fix: All has 39.6 k cards, 6 of them
+  not English; no all-foreign stack.
+* **The shared rule:** `meta` row `category-filter` = JSON `CategoryFilter` (absent = no
+  rule); `store::sources::{shared_category_filter, set_shared_category_filter}`.
+* **A playlist's own rule:** `SourceSettings::own_category_filter: Option<bool>` +
+  `category_filter: Option<CategoryFilter>` (settings JSON). `Some(true)` = `category_filter`
+  is its rule (`None` there = show everything of it); `Some(false)` = the shared rule; `None`
+  = written before the rule was shared: a stored `category_filter` is its own, none = shared
+  (`SourceSettings::{has_own_category_filter, effective_category_filter}`). Written only by
+  `store::sources::set_category_rule(id, CategoryRule::{Shared, Own(rule)})`
+  (`set_category_filter(id, f)` = `Own(f)`).
+* **Adopting old rules** (`sources::adopt_legacy_category_filters`, run by `Store::open` after
+  the migrations and by backup restore; no schema migration, so no `user_version` number is
+  taken): playlists with a stored `category_filter` and no `own_category_filter`. Without a
+  shared rule, the first one (playlist order) becomes it (`known` = what the playlists with the
+  same choice knew); each such playlist then follows the shared rule when its choice is the
+  same (`CategoryFilter::same_choice`: `keep`, `keep_untagged`, `hide_other_languages`), else
+  keeps its rule as its own. So "one playlist has a rule, the others none" (the field report)
+  → that rule covers every playlist on the first start; several different rules stay per
+  playlist, the first seeding the shared one. Their `category_filter` stays stored (ignored
+  while they follow the shared rule) so an older build still filters. Idempotent.
+* `CategoryFilter { keep: BTreeSet<CategoryTag>, keep_untagged: bool (default true),
+  known: BTreeSet<CategoryTag>, hide_other_languages: Option<bool> (§28.12) }`. `known` = the
+  tags present (in the playlists the rule covers) when the rule was last saved; the picker
+  marks other tags "new" (no toast).
 * `CategoryFilter::keeps(tag)`: tagged → `keep` contains it; untagged → `keep_untagged`.
   **Tags that first appear later are hidden** (keep-list semantics) unless they are in `keep`
   — the defaults store the whole English set, so e.g. a later `NZ |` category is shown.
-* Written only by `store::sources::set_category_filter` (read-modify-write in the writer).
-  `update_source` and `set_source_settings` **preserve** the stored `category_filter` (a source
-  editor opened before a picker save must not wipe it — same race as §27.3).
+* Written only by `store::sources::set_category_rule` (read-modify-write in the writer).
+  `update_source` and `set_source_settings` **preserve** the stored `category_filter` and
+  `own_category_filter` (a source editor opened before a picker save must not wipe it — same
+  race as §27.3).
 * Per-group precedence (`library::apply_category_filter`): the user's hide
   (`GroupOverride::hidden`) > the user's show (`GroupOverride::shown`) > the rule > shown.
   `Group::hidden` is the effective flag; `Group::user_hidden` is the user's own hide (kept
@@ -3887,8 +3920,10 @@ FR→fr, DE/AT→de, ES/MX/AR…→es, IT→it, PT/BR→pt, NL→nl, TR→tr, PL
   keeps does not become a permanent exception.
 * Items: unchanged rules (§5.4) — hidden when hidden themselves or when **all** their groups are
   hidden; a channel in a kept and a filtered group (M3U `;` lists) stays visible.
-* Backup: settings JSON and `group_override.shown` round-trip (`GroupOverride` has
-  `#[serde(default)]`, older backups restore with `shown = false`).
+* Backup: settings JSON, `group_override.shown` and the shared rule
+  (`Backup::shared_category_filter`, serde default) round-trip (`GroupOverride` has
+  `#[serde(default)]`, older backups restore with `shown = false`). Replace takes the backup's
+  shared rule; Merge only when there is none here; then old rules are adopted (above).
 
 ### 28.4 Where the rule is applied
 * **Import**: `ImportGroup::raw_name` → `grp.raw_name` (migration `0002_category_filter`:
@@ -3898,8 +3933,9 @@ FR→fr, DE/AT→de, ES/MX/AR…→es, IT→it, PT/BR→pt, NL→nl, TR→tr, PL
   countries" (`CategorySummary::needs_refresh`). A refresh that reaches such a group only
   through an item (the provider no longer lists the category) stores `name` as its raw name,
   since the real one cannot be learned; groups of a kind the refresh did not import stay NULL.
-* **Library build** (`store::library::load`, off the UI thread): `load_sources` parses
-  `settings` → `SourceMeta::category_filter`; `GROUP_COLS` gains `g.raw_name` and `o.shown`;
+* **Library build** (`store::library::load`, off the UI thread): `load_sources` reads the
+  shared rule and parses `settings` → `SourceMeta::category_filter` (the rule that applies:
+  own, else shared) and `own_category_filter`; `GROUP_COLS` gains `g.raw_name` and `o.shown`;
   `group_from_row` sets `tag = detect_tag(raw_name ?? name)` and `filter = Exempt` when
   `shown`, else `Kept`; `load_groups` calls `apply_category_filter` with the group's source
   rule **before** `group_flags`, so `members`, `collection`, `visible_groups`, `by_number`, the
@@ -3916,7 +3952,11 @@ FR→fr, DE/AT→de, ES/MX/AR…→es, IT→it, PT/BR→pt, NL→nl, TR→tr, PL
   reloads the source editor); bulk hide / show → `DataScope::Overrides`.
 
 ### 28.5 Settings ▸ Hidden
-* **Hidden by the category filter** — one section per filtered source: a row per hidden tag
+* **Hidden by the category filter** — one section for the playlists sharing the rule ("Your
+  playlists", keyed by the first of them) and one per playlist with its own rule; Enter on a
+  tag adds it to the rule that hid it (`sources::keep_tag`: own, else shared — toast "Arabic
+  shown in every playlist"); an "N titles in other languages" row (§28.12,
+  `SourceMeta::language_hidden`) opens the picker. Per section: a row per hidden tag
   ("Arabic · 112 categories · 4 380 channels"), Enter = **show this country** (adds the tag
   to `keep`; toast "Arabic shown"), → expands the tag's categories in place (← collapses);
   Enter on a category row shows just that one (`show_group(…, exempt: true)`). Expanded tags
@@ -3930,13 +3970,26 @@ FR→fr, DE/AT→de, ES/MX/AR…→es, IT→it, PT/BR→pt, NL→nl, TR→tr, PL
   otherwise list thousands).
 
 ### 28.6 "Choose what to show" (the picker)
-* Data: `store::library::category_summary(conn, source)` (loader, off the UI thread; reloaded on
+* **Edits the shared rule**, opened from one playlist. Its first rows (listed while the filter
+  is empty; Space ticks them like any row; Ctrl+A ignores them): **Only for <playlist>** (two
+  or more playlists, or the playlist already has its own rule) — ticked, the rows become that
+  playlist's tags and Enter stores its own rule (`CategoryRule::Own`); unticked, Enter stores
+  the shared rule and the playlist follows it (`CategoryRule::Shared` when it had its own) —
+  and **Also hide titles in other languages** (§28.12; when any playlist has movies or series).
+  A line under the list says who it applies to ("Applies to every playlist, also ones you add
+  later…" / "Only TV 2 — …"); the save toast ends "in every playlist" / "in TV 2". No keymap
+  change (the options are rows).
+* Data (`overlays::categories::load`): the shared rule's summary =
+  `library::category_summary_of(conn, [playlists following it + this one])` (counts and
+  `known` aggregate across playlists), this playlist's own `category_summary(conn, source)`,
+  the shared rule and its own rule. (loader, off the UI thread; reloaded on
   `DataScope::Live | Vod | Sources` while open, so Xtream VOD categories that import after the
   channels join the list) → `CategorySummary { tags: Vec<TagSummary>, needs_refresh }`; tagged
   entries by item count descending, then "No country tag". Each row: short-code badge, label,
   counts ("38 live groups · 2 140 channels · 12 movie / 9 series categories"), a "new" badge for
   tags not in `known`, a tick box.
-* Initial ticks: the saved rule; with no rule, `default_keep(detect_country())` (only the
+* Initial ticks: the rule edited (its own when it has one, else the shared one); a playlist's
+  own "show everything" ticks every row; with no rule, `default_keep(detect_country())` (only the
   present tags are displayed; the stored `keep` is the full default set, see §28.3) and
   untagged ticked.
 * Keys (context stack `[Checklist, Modal]`, see the keymap note in §28.7): Space / Insert tick, Ctrl+A
@@ -3961,7 +4014,10 @@ FR→fr, DE/AT→de, ES/MX/AR…→es, IT→it, PT/BR→pt, NL→nl, TR→tr, PL
   in Settings ▸ Playlists." Same for Settings ▸ Add (same card). The step appears on its own
   just as "Open Live TV" turns on, so Enter is ignored for its first 400 ms (an Enter meant for
   that button must not save the defaults unseen); leaving and re-entering the card keeps the
-  step. Not offered when the playlist already has a rule (a restored one).
+  step. Not offered when a rule already applies to the playlist: with a shared rule the new
+  playlist follows it and a toast says so ("TV 2 shows the countries and languages you chose
+  for your playlists · Settings ▸ Playlists changes it"); a restored playlist may have its own.
+  The step stores the shared rule (one playlist: it is that playlist's choice anyway).
 * **Settings ▸ Playlists ▸ <playlist>**: a "Categories…" row (detail: "All countries and
   languages" / "4 of 41 countries and languages") opens the same picker as an overlay
   (`OverlayRequest::Categories(SourceId)`); with `needs_refresh` the picker shows a note ("…
@@ -4114,6 +4170,40 @@ integrator runs the one full gate.
 * **Space binding in `List`**: every list now maps Space to ToggleMark; screens that don't mark
   must ignore it (they do: unhandled actions are no-ops) — keymap test pins it.
 
+### 28.12 Titles in other languages (title-level, field fix)
+The category filter works on categories; providers also put foreign titles in categories the
+rule keeps or that have no tag (field report: Arabic-script, "SVENSKA", "DANSKE",
+"VIAPLAY ÍSLANDS", "EX - MOVIES", "QC - FILMS" categories, "CA ✪ QUEBEC …" under Canada,
+"VIP ✪ …" Arabic matches — about 27.7 k copies once TV 2 had TV's rule). Each such title's own
+name carries a market prefix (`vod_match`, §29.10), so:
+* **Option** `CategoryFilter::hide_other_languages: Option<bool>`: `None` = automatic — on
+  when the rule keeps only English-language tags (`category_tags::{hides_other_languages,
+  keeps_only_english}`: GB US CA AU IE NZ `lang:en`); the picker's row stores the user's
+  choice. A non-English rule is off by default: a country tag does not say one language (BE,
+  CH, CA/Québec), so we don't guess for those users.
+* **Kept languages** (`category_tags::rule_languages`): the language tags kept, each kept
+  country's main language (`country_language`, `IS` → `is` added), Ex-Yugoslav (`sh`) for
+  `region:exyu` / RS HR BA ME; plus the user's audio languages (`player.audio_langs`,
+  `LoadOptions::lang_prefs`; sr / hr / bs add `sh`).
+* **A title's language** (`vod_match::market_lang`): the market its name marks — its audio
+  language, or for a subtitled market (`AR-SUBS`, `KU-S`, `NL [SUB]`) the market's language
+  (its subtitles and its shelf; such copies are hidden too); `EX` → `sh`; multi-audio and
+  regions without one language (`SC`) → none. An **untagged** title in a category whose tagged
+  titles are ≥ 80 % one market (≥ 10; `stacks::dominant_market`, same rule as the stacks'
+  inference) takes that market ("Casablanca" in an Arabic-subtitled shelf).
+* **Hidden:** a movie / series of a playlist whose rule hides other languages, with a
+  language not kept. **Never hidden:** untagged and multi-audio titles, favourites, and titles
+  with watch progress (a series with an episode's) — `library::LanguageRule::protected`.
+* **Where:** `library::load_with`, right after `load_vod` (before the VOD index, the explicit
+  filter and the stacks): the titles are absent from the snapshot like hidden ones — lists,
+  counts (`Group::item_count` lowered; an emptied untagged category stays, empty), search,
+  Home, zap lists and **stacks** (hidden copies never stack). `SourceMeta::language_hidden`
+  counts them for Settings ▸ Hidden. Live channels are not affected (no per-channel market).
+  Cost: one pass over the movies / series (a hash lookup per distinct `match_lang`).
+* Tag detection gained the playlists' own-language names seen in the report (`SVENSKA`,
+  `DANSKE`, `NORSKE`, `ÍSLANDS` → SE / DK / NO / IS); Arabic-script category names stay
+  untagged (the script is shared by Arabic, Persian, Urdu, Kurdish) and are covered here.
+
 ## 29. Several playlists (P1: what am I browsing; P2: stacks in All)
 
 With two providers ("TV" and "TV 2", often both Xtream) nothing said which playlist a list,
@@ -4133,7 +4223,8 @@ answers *what am I browsing*; combining duplicate titles in "All" (P2) and the o
    known; different ids never stack. Language and dub rules order and label the copies inside.
 6. (P2) The **top card** is the copy in the user's audio language (`en` by default), unlocked
    first; with none, the playlist order decides.
-7. (P2) **Hidden copies never stack** (category filter, hidden categories or items,
+7. (P2) **Hidden copies never stack** (category filter, titles in other languages §28.12,
+   hidden categories or items,
    playlists out of All, and explicit content behind parental control); **locked copies do**,
    drawn disabled with the lock (PIN on pick); an all-locked stack shows locked; the copy that
    plays skips locked copies unless the session is unlocked.

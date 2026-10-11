@@ -28,6 +28,8 @@ fn source(id: i64, name: &str) -> SourceMeta {
         has_live: true,
         in_all: true,
         category_filter: None,
+        own_category_filter: false,
+        language_hidden: 0,
     }
 }
 

@@ -63,8 +63,13 @@ pub struct SourceMeta {
     pub has_live: bool,
     /// "Show in All playlists" (`SourceSettings::in_all`, DESIGN §29).
     pub in_all: bool,
-    /// The source's category filter (`SourceSettings::category_filter`, DESIGN §28).
+    /// The category rule that applies to the source (DESIGN §28.3): its own, else the shared one.
     pub category_filter: Option<CategoryFilter>,
+    /// The source has its own rule ("Use a different rule for this playlist"), not the shared one.
+    pub own_category_filter: bool,
+    /// Movies and series of the source that "Also hide titles in other languages" left out of
+    /// this snapshot (DESIGN §28.12).
+    pub language_hidden: u32,
 }
 
 impl SourceMeta {
@@ -731,6 +736,7 @@ fn next_generation() -> u64 {
 const RECENT_CHANNELS: usize = 50;
 
 fn load_sources(conn: &Connection) -> Result<Vec<SourceMeta>> {
+    let shared = crate::store::sources::shared_category_filter(conn)?;
     let mut stmt = conn.prepare_cached(
         "SELECT s.id, s.name, s.icon, s.color, s.kind, s.enabled, s.last_refresh,
                 EXISTS (SELECT 1 FROM movie m WHERE m.source_id = s.id), EXISTS (SELECT 1 FROM series x WHERE x.source_id = s.id),
@@ -752,7 +758,12 @@ fn load_sources(conn: &Connection) -> Result<Vec<SourceMeta>> {
             has_series: r.get(8)?,
             has_live: r.get(10)?,
             in_all: settings.as_ref().and_then(|st| st.in_all).unwrap_or(true),
-            category_filter: settings.and_then(|st| st.category_filter),
+            own_category_filter: settings.as_ref().is_some_and(|st| st.has_own_category_filter()),
+            language_hidden: 0,
+            category_filter: match &settings {
+                Some(st) => st.effective_category_filter(shared.as_ref()).cloned(),
+                None => shared.clone(),
+            },
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -797,16 +808,25 @@ pub fn apply_category_filter(g: &mut Group, filter: Option<&CategoryFilter>) {
 /// it off the UI thread (a `Loader`), never per frame. `hide_explicit`: leave explicit
 /// categories out of the totals (DESIGN §20.3).
 pub fn category_summary(conn: &Connection, source: SourceId, hide_explicit: bool) -> Result<CategorySummary> {
+    category_summary_of(conn, &[source], hide_explicit)
+}
+
+/// [`category_summary`] of several sources together (the shared rule's playlists, DESIGN §28.3).
+pub fn category_summary_of(conn: &Connection, sources: &[SourceId], hide_explicit: bool) -> Result<CategorySummary> {
     let mut stmt = conn.prepare_cached(
         "SELECT g.kind, COALESCE(g.raw_name, g.name), g.item_count, g.raw_name IS NULL FROM grp g
          LEFT JOIN group_override o ON o.source_id = g.source_id AND o.kind = g.kind AND o.group_key = g.key
          WHERE g.source_id = ?1 AND NOT (?2 AND COALESCE(o.explicit, g.explicit > 0) = 1)",
     )?;
-    let rows: Vec<(ItemKind, String, u32, bool)> = stmt
-        .query_map(rusqlite::params![source, hide_explicit], |r| {
+    let mut rows: Vec<(ItemKind, String, u32, bool)> = Vec::new();
+    for source in sources {
+        let part = stmt.query_map(rusqlite::params![source, hide_explicit], |r| {
             Ok((kind_from_sql(&r.get::<_, String>(0)?)?, r.get(1)?, u32_of(r.get(2)?), r.get(3)?))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
+        })?;
+        for r in part {
+            rows.push(r?);
+        }
+    }
     Ok(CategorySummary {
         tags: category_tags::summarize(rows.iter().map(|(kind, name, n, _)| (*kind, name.as_str(), *n))),
         needs_refresh: rows.iter().any(|r| r.3),
@@ -1138,6 +1158,121 @@ fn load_vod(conn: &Connection, movies: bool, groups: &[Group], x: &mut ExplicitI
     Ok((items, members, raws))
 }
 
+/// "Also hide titles in other languages" (DESIGN §28.12) for one build: per playlist whose rule
+/// asks for it, the languages it keeps; and the titles never hidden this way.
+struct LanguageRule {
+    /// Source → kept languages (ISO 639-1: the rule's and the user's audio languages).
+    keep: HashMap<SourceId, Vec<String>>,
+    /// (source, kind, key) of favourites and titles with watch progress (an episode's counts
+    /// for its series).
+    protected: HashSet<(SourceId, ItemKind, String)>,
+}
+
+impl LanguageRule {
+    fn of(conn: &Connection, sources: &[SourceMeta], prefs: &[String]) -> Result<LanguageRule> {
+        let keep: HashMap<SourceId, Vec<String>> = sources
+            .iter()
+            .filter_map(|s| {
+                let rule = s.category_filter.as_ref().filter(|r| category_tags::hides_other_languages(r))?;
+                let mut langs: Vec<String> = category_tags::rule_languages(rule).into_iter().map(str::to_owned).collect();
+                langs.extend(prefs.iter().filter(|p| !langs.contains(p)).cloned().collect::<Vec<_>>());
+                // Ex-Yugoslav titles for a Serbian, Croatian or Bosnian speaker
+                if prefs.iter().any(|p| matches!(p.as_str(), "sr" | "hr" | "bs" | "bos")) {
+                    langs.push(category_tags::SERBO_CROATIAN.to_owned());
+                }
+                Some((s.id, langs))
+            })
+            .collect();
+        let mut protected = HashSet::new();
+        if !keep.is_empty() {
+            let mut stmt = conn.prepare_cached(
+                "SELECT source_id, kind, item_key FROM fav_item WHERE kind IN ('movie', 'series')
+                 UNION SELECT source_id, kind, item_key FROM watch_progress WHERE kind IN ('movie', 'series')
+                 UNION SELECT e.source_id, 'series', x.key FROM watch_progress w
+                       JOIN episode e ON e.source_id = w.source_id AND e.key = w.item_key JOIN series x ON x.id = e.series_id
+                       WHERE w.kind = 'episode'",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, SourceId>(0)?, kind_from_sql(&r.get::<_, String>(1)?)?, r.get::<_, String>(2)?)))?;
+            for r in rows {
+                protected.insert(r?);
+            }
+        }
+        Ok(LanguageRule { keep, protected })
+    }
+
+    /// The items (with their members and match data) without the titles in languages their
+    /// playlist's rule doesn't keep: a title's language is the market its own name marks
+    /// (`vod_match::market_lang`); an untagged title in a category whose tagged titles are
+    /// mostly one market (`stacks::dominant_market`) takes that market. Untagged and
+    /// multi-audio titles, favourites and titles with progress stay. The categories' counts
+    /// and `SourceMeta::language_hidden` leave the dropped titles out.
+    fn apply(
+        &self,
+        kind: ItemKind,
+        items: Vec<VodSummary>,
+        members: VodMembers,
+        raw: Vec<CopyRaw>,
+        groups: &mut [Group],
+        sources: &mut [SourceMeta],
+    ) -> (Vec<VodSummary>, VodMembers, Vec<CopyRaw>) {
+        if self.keep.is_empty() {
+            return (items, members, raw);
+        }
+        // the market of each distinct `match_lang` text (few)
+        let mut markets: HashMap<Arc<str>, Option<&'static str>> = HashMap::new();
+        let market: Vec<Option<&'static str>> = raw
+            .iter()
+            .map(|r| {
+                let t = r.lang.as_ref()?;
+                *markets.entry(t.clone()).or_insert_with(|| {
+                    let (code, dub) = vod_match::split_lang_text(t);
+                    code.and_then(|c| vod_match::market_lang(c, dub))
+                })
+            })
+            .collect();
+        let tagged: Vec<bool> = raw.iter().map(|r| r.lang.is_some()).collect();
+        let dominant = crate::store::stacks::dominant_market(&items, &market, &tagged);
+        let mut map: Vec<Option<u32>> = Vec::with_capacity(items.len());
+        let (mut out, mut out_raw) = (Vec::with_capacity(items.len()), Vec::with_capacity(raw.len()));
+        let mut dropped_per_source: HashMap<SourceId, u32> = HashMap::new();
+        for (i, (v, r)) in items.into_iter().zip(raw).enumerate() {
+            let lang = market[i].or_else(|| if tagged[i] { None } else { v.group_ids.iter().find_map(|g| dominant.get(g).copied()) });
+            let hide = match (self.keep.get(&v.source_id), lang) {
+                (Some(keep), Some(l)) => !keep.iter().any(|k| k == l) && !self.protected.contains(&(v.source_id, kind, v.key.0.clone())),
+                _ => false,
+            };
+            if hide {
+                *dropped_per_source.entry(v.source_id).or_default() += 1;
+                map.push(None);
+            } else {
+                map.push(Some(out.len() as u32));
+                out.push(v);
+                out_raw.push(r);
+            }
+        }
+        if dropped_per_source.is_empty() {
+            return (out, members, out_raw);
+        }
+        let mut dropped: HashMap<GroupId, u32> = HashMap::new();
+        let members = members
+            .into_iter()
+            .map(|(g, v)| {
+                let before = v.len();
+                let v: Vec<u32> = v.into_iter().filter_map(|i| map.get(i as usize).copied().flatten()).collect();
+                dropped.insert(g, (before - v.len()) as u32);
+                (g, v)
+            })
+            .collect();
+        for g in groups.iter_mut() {
+            g.item_count = g.item_count.saturating_sub(dropped.get(&g.id).copied().unwrap_or(0));
+        }
+        for s in sources.iter_mut() {
+            s.language_hidden += dropped_per_source.get(&s.id).copied().unwrap_or(0);
+        }
+        (out, members, out_raw)
+    }
+}
+
 /// Build a full snapshot from a reader connection (uses the `from_parts` constructors) with
 /// the default [`LoadOptions`]: English, everything shown, explicit content included (the
 /// app's builds pass [`LoadOptions::from_config`] with its [`ExplicitGate`]). Never call on the
@@ -1165,8 +1300,15 @@ pub fn load_with(conn: &Connection, opts: &LoadOptions) -> Result<Library> {
         ..Default::default()
     };
     let live = load_live(conn, ch_groups, &mut explicit)?;
-    let (movies, mut members, movie_raw) = load_vod(conn, true, &movie_groups, &mut explicit)?;
+    let (movies, members, movie_raw) = load_vod(conn, true, &movie_groups, &mut explicit)?;
     let (series, series_members, series_raw) = load_vod(conn, false, &series_groups, &mut explicit)?;
+    // "Also hide titles in other languages" (DESIGN §28.12)
+    let mut sources = sources;
+    let langs = LanguageRule::of(conn, &sources, &opts.lang_prefs())?;
+    let mut movie_groups = movie_groups;
+    let mut series_groups = series_groups;
+    let (movies, mut members, movie_raw) = langs.apply(ItemKind::Movie, movies, members, movie_raw, &mut movie_groups, &mut sources);
+    let (series, series_members, series_raw) = langs.apply(ItemKind::Series, series, series_members, series_raw, &mut series_groups, &mut sources);
     members.extend(series_members);
     disabled_explicit_refs(conn, &mut explicit)?;
     // the match data of what the snapshot will show (`with_visibility` keeps the order)

@@ -7,7 +7,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::OnceLock;
 
-use crate::model::{CategoryTag, ItemKind, TagKind};
+use crate::model::{CategoryFilter, CategoryTag, ItemKind, TagKind};
 use crate::sources::name_tokens::{Kind, Token, closing, deco_ascii, flag_code, is_format_word, is_service_word, quality_word, tokens};
 
 /// Countries whose categories count as English-language by default (with `lang:en`).
@@ -51,11 +51,11 @@ const SYNONYMS: &[(&str, &[&str])] = &[
     ("NL", &["NLD", "NED", "HOLLAND", "NETHERLANDS", "NEDERLAND"]),
     ("BE", &["BEL", "BELGIUM", "BELGIQUE"]),
     // `SW` is Sweden on IPTV panels (`SW ★ …`)
-    ("SE", &["SWE", "SW", "SWEDEN", "SVERIGE"]),
-    ("NO", &["NOR", "NORWAY", "NORGE"]),
-    ("DK", &["DNK", "DEN", "DENMARK", "DANMARK"]),
-    ("FI", &["FIN", "FINLAND", "SUOMI"]),
-    ("IS", &["ISL", "ICELAND"]),
+    ("SE", &["SWE", "SW", "SWEDEN", "SVERIGE", "SVENSKA", "SVENSK", "SVENSKE"]),
+    ("NO", &["NOR", "NORWAY", "NORGE", "NORSK", "NORSKE"]),
+    ("DK", &["DNK", "DEN", "DENMARK", "DANMARK", "DANSK", "DANSKE"]),
+    ("FI", &["FIN", "FINLAND", "SUOMI", "SUOMALAISET"]),
+    ("IS", &["ISL", "ICELAND", "ÍSLANDS", "ÍSLENSK", "ÍSLENSKAR"]),
     ("CH", &["CHE", "SUI", "SWITZERLAND", "SCHWEIZ", "SUISSE"]),
     ("AT", &["AUT", "AUSTRIA"]),
     ("GR", &["GRE", "GRC", "GREECE"]),
@@ -546,6 +546,40 @@ pub fn is_english(tag: &CategoryTag) -> bool {
     }
 }
 
+/// Does `rule` hide titles in other languages (DESIGN §28.12)? Its own choice, else
+/// automatically when every tag it keeps is an English-language one.
+pub fn hides_other_languages(rule: &CategoryFilter) -> bool {
+    rule.hide_other_languages.unwrap_or_else(|| keeps_only_english(&rule.keep))
+}
+
+/// The automatic "Also hide titles in other languages": only English-language tags kept.
+pub fn keeps_only_english(keep: &BTreeSet<CategoryTag>) -> bool {
+    !keep.is_empty() && keep.iter().all(is_english)
+}
+
+/// The languages (ISO 639-1) whose titles `rule` keeps when it hides titles in other languages:
+/// the language tags it keeps and the main language of each country it keeps.
+/// Ex-Yugoslav titles (`EX - …`, `vod_match::market_lang`) and the countries / region that
+/// keep them count as one language, Serbo-Croatian (`sh`).
+pub fn rule_languages(rule: &CategoryFilter) -> BTreeSet<&'static str> {
+    let mut out = BTreeSet::new();
+    for t in &rule.keep {
+        let lang = match t.kind() {
+            TagKind::Language => LANGUAGE_NAMES.iter().find(|(c, _)| *c == t.code()).map(|(c, _)| *c),
+            TagKind::Country => country_language(t.code()),
+            TagKind::Region => None,
+        };
+        out.extend(lang);
+        if t.code() == "exyu" || matches!(t.code(), "RS" | "HR" | "BA" | "ME") && t.kind() == TagKind::Country {
+            out.insert(SERBO_CROATIAN);
+        }
+    }
+    out
+}
+
+/// The language of Ex-Yugoslav markets (see [`rule_languages`]).
+pub const SERBO_CROATIAN: &str = "sh";
+
 /// Default keep-list (DESIGN §28.6): the user's country (ISO code from
 /// `presets::detect_country`) and its main language, plus every English-language tag — whether
 /// or not the playlist has them yet, so English categories added later are shown.
@@ -588,6 +622,7 @@ pub fn country_language(iso: &str) -> Option<&'static str> {
         "NO" => "no",
         "DK" => "da",
         "FI" => "fi",
+        "IS" => "is",
         "RO" | "MD" => "ro",
         "HU" => "hu",
         "CZ" => "cs",
@@ -650,6 +685,7 @@ const LANGUAGE_NAMES: &[(&str, &str)] = &[
     ("no", "Norwegian"),
     ("da", "Danish"),
     ("fi", "Finnish"),
+    ("is", "Icelandic"),
     ("ro", "Romanian"),
     ("hu", "Hungarian"),
     ("cs", "Czech"),
@@ -861,6 +897,20 @@ mod tests {
             ("TÜRKIYE: Diziler", Some("TR")),
             ("FARSI | Film", Some("lang:fa")),
             ("IT: Sport", Some("IT")),
+            // the playlists' own-language names (field report: "SVENSKA 2020 & GAMMAL")
+            ("SVENSKA 2020 & GAMMAL", Some("SE")),
+            ("ÍSLANDS MOVIES", Some("IS")),
+            ("SVENSKA NYA UTGÅVAN", Some("SE")),
+            ("DANSKE FILM", Some("DK")),
+            ("NORSKE FILMER", Some("NO")),
+            ("Svenska filmer", Some("SE")),
+            // the ✪ separator (field report)
+            ("NL ✪ FILMS [SUB]", Some("NL")),
+            ("GR ✪ ταινίες με υπότιτλους", Some("GR")),
+            ("AR ✪ اجنبي دراما", Some("lang:ar")),
+            ("EN ✪ MULTI-SUB [2025/2026]", Some("lang:en")),
+            ("CA ✪ QUEBEC FILMS", Some("CA")),
+            ("VIP ✪ كأس العالم 2026", None),
             // negatives: non-tags, unknown words, ordinary English words, hyphenated words
             ("4K | Sports", None),
             ("24/7 Movies", None),

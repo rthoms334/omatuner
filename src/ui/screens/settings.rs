@@ -951,8 +951,11 @@ impl SettingsScreen {
                     let running = jobs.iter().find(|j| matches!(j.kind, JobKind::RefreshSource { source, .. } if source == s.id));
                     let mut detail =
                         source_detail(s, ctx.now, running.map(|j| super::onboarding::phase_text(&j.phase)), self.guide_counts.1.get(&s.id).copied());
-                    if let Some(rule) = &s.settings.category_filter {
+                    if let Some(rule) = ctx.lib.source(s.id).and_then(|m| m.category_filter.as_ref()) {
                         detail.push_str(&format!(" · Showing {}", categories::showing_text(ctx.lib, s.id, Some(rule))));
+                    }
+                    if s.settings.has_own_category_filter() && self.sources.len() > 1 {
+                        detail.push_str(" · own choice");
                     }
                     v.push(Row::Item {
                         item: Item::Source(s.id),
@@ -1249,22 +1252,34 @@ impl SettingsScreen {
         v
     }
 
-    /// Hidden ▸ "Hidden by the category filter" (DESIGN §28.5): per filtered playlist, a row
-    /// per hidden tag (biggest first; → lists its categories), then "Choose countries…"; a
-    /// playlist with several tags and nothing filtered gets just "Choose countries…".
+    /// Hidden ▸ "Hidden by the category filter" (DESIGN §28.5): one section for the playlists
+    /// that share the rule (keyed by the first of them) and one per playlist with its own rule —
+    /// a row per hidden tag (biggest first; → lists its categories), the titles "Also hide
+    /// titles in other languages" leaves out, then "Choose countries…"; a rule that hides
+    /// nothing of playlists with several tags gets just "Choose countries…".
     fn filtered_rows(&self, ctx: &UiCtx<'_>, v: &mut Vec<Row>) {
+        // section of each playlist: the first one sharing the rule, or itself
+        let shared: Vec<&crate::store::library::SourceMeta> = ctx.lib.sources.iter().filter(|s| !s.own_category_filter).collect();
+        let section_of = |id: SourceId| match ctx.lib.source(id) {
+            Some(s) if !s.own_category_filter => shared.first().map_or(id, |f| f.id),
+            _ => id,
+        };
         let mut by_tag: HashMap<(SourceId, Option<CategoryTag>), Vec<&Group>> = HashMap::new();
         for g in all_groups(ctx).filter(|g| g.filter == GroupFilter::Hidden) {
-            by_tag.entry((g.source_id, g.tag.clone())).or_default().push(g);
+            by_tag.entry((section_of(g.source_id), g.tag.clone())).or_default().push(g);
         }
         let multi = categories::multi_tag_sources(ctx.lib);
-        for src in &ctx.lib.sources {
+        let sections = ctx.lib.sources.iter().filter(|s| section_of(s.id) == s.id);
+        for src in sections {
+            let members: Vec<&crate::store::library::SourceMeta> = ctx.lib.sources.iter().filter(|s| section_of(s.id) == src.id).collect();
+            let title = if !src.own_category_filter && members.len() > 1 { "Your playlists".to_owned() } else { src.name.clone() };
+            let language_hidden: u32 = members.iter().map(|s| s.language_hidden).sum();
             let mut tags: Vec<(&Option<CategoryTag>, &Vec<&Group>)> =
                 by_tag.iter().filter(|((s, _), _)| *s == src.id).map(|((_, t), groups)| (t, groups)).collect();
-            if tags.is_empty() {
-                // a playlist in several countries / languages that shows them all: the way in
-                if multi.contains(&src.id) {
-                    v.push(Row::Section(format!("{}: countries and languages", src.name)));
+            if tags.is_empty() && language_hidden == 0 {
+                // playlists in several countries / languages that show them all: the way in
+                if members.iter().any(|s| multi.contains(&s.id)) {
+                    v.push(Row::Section(format!("{title}: countries and languages")));
                     v.push(Row::Item {
                         item: Item::Categories(src.id),
                         icon: glyphs::EARTH.to_owned(),
@@ -1278,7 +1293,7 @@ impl SettingsScreen {
             }
             let items = |gs: &[&Group]| gs.iter().map(|g| g.item_count as u64).sum::<u64>();
             tags.sort_by(|a, b| items(b.1).cmp(&items(a.1)).then_with(|| tag_name(a.0.as_ref()).cmp(&tag_name(b.0.as_ref()))));
-            v.push(Row::Section(format!("{}: hidden by the category filter", src.name)));
+            v.push(Row::Section(format!("{title}: hidden by the category filter")));
             for (tag, groups) in tags {
                 let open = self.expanded.contains(&(src.id, tag.clone()));
                 v.push(Row::Item {
@@ -1303,6 +1318,17 @@ impl SettingsScreen {
                         });
                     }
                 }
+            }
+            if language_hidden > 0 {
+                let n = language_hidden as usize;
+                v.push(Row::Item {
+                    item: Item::Categories(src.id),
+                    icon: glyphs::HIDDEN.to_owned(),
+                    color: None,
+                    label: format!("{} {} in other languages", grouped(n), if n == 1 { "title" } else { "titles" }),
+                    detail: Some("“Also hide titles in other languages” is on · Enter changes it".into()),
+                    reorder: false,
+                });
             }
             v.push(Row::Item {
                 item: Item::Categories(src.id),
@@ -1352,14 +1378,20 @@ impl SettingsScreen {
                 .into(),
             false,
         ));
-        // the stored rule (the picker writes it; the editor's Save keeps it)
-        let rule = self.sources.iter().find(|s| s.id == e.original.id).and_then(|s| s.settings.category_filter.as_ref());
+        // the rule that applies (the picker writes it; the editor's Save keeps it)
+        let rule = ctx.lib.source(e.original.id).and_then(|s| s.category_filter.as_ref());
+        let own = self.sources.iter().find(|s| s.id == e.original.id).is_some_and(|s| s.settings.has_own_category_filter());
+        let whose = match (own, self.sources.len() > 1) {
+            (true, true) => " · only for this playlist",
+            (false, true) => " · the choice every playlist shares",
+            _ => "",
+        };
         v.push(Row::Item {
             item: Item::Categories(e.original.id),
             icon: glyphs::EARTH.to_owned(),
             color: None,
             label: "Categories…".into(),
-            detail: Some(categories::showing_text(ctx.lib, e.original.id, rule)),
+            detail: Some(format!("{}{whose}", categories::showing_text(ctx.lib, e.original.id, rule))),
             reorder: false,
         });
         if let Some(a) = &e.original.status.account {
