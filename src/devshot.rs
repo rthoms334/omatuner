@@ -9,7 +9,8 @@
 //! ```
 //! The script starts once the first library snapshot is in and the window has the requested
 //! size; steps run [`STEP_GAP`] apart. Steps: `wait:<secs>`, `key:<Ctrl+Shift+Name>` (egui key
-//! names: `Down`, `Enter`, `Space`, `Escape`, `F1`, `A`…), `text:<chars>`, `view:<home|live|
+//! names: `Down`, `Enter`, `Space`, `Escape`, `F1`, `A`…; a plain printable key also types its
+//! character, as a keyboard does), `text:<chars>`, `view:<home|live|
 //! guide|movies|series|settings|search>`, `play:<source>:<item-key>` (both as the CLI does),
 //! `move:<x>,<y>` / `click:<x>,<y>` (logical px), `size:<w>x<h>` and `categories:<source id>`
 //! ("Choose what to show" of that playlist, which only a context menu opens). A `;` inside
@@ -112,6 +113,23 @@ fn parse_key(s: &str) -> Result<(egui::Key, egui::Modifiers), String> {
     let title: String = name.chars().take(1).flat_map(char::to_uppercase).chain(name.chars().skip(1).flat_map(char::to_lowercase)).collect();
     let key = egui::Key::from_name(name).or_else(|| egui::Key::from_name(&title)).ok_or_else(|| format!("unknown key '{name}'"))?;
     Ok((key, mods))
+}
+
+/// The character a plain (or Shift+) printable key types along with its `Key` event, as
+/// egui-winit reports it (`Text`): the app binds Space and letters to either event.
+fn typed(key: egui::Key, mods: egui::Modifiers) -> Option<char> {
+    if mods.ctrl || mods.alt || mods.command {
+        return None;
+    }
+    let name = key.name();
+    let mut chars = name.chars();
+    match (key, chars.next(), chars.next()) {
+        (egui::Key::Space, ..) => Some(' '),
+        (_, Some(c), None) if c.is_ascii_alphabetic() || (c.is_ascii_digit() && !mods.shift) => {
+            Some(if mods.shift { c.to_ascii_uppercase() } else { c.to_ascii_lowercase() })
+        }
+        _ => None,
+    }
 }
 
 /// `step;step;…` (see the module docs).
@@ -252,11 +270,13 @@ impl Driver {
                     match step {
                         Step::Wait(d) => wait = *d,
                         Step::Key(key, modifiers) => {
-                            for pressed in [true, false] {
-                                raw.events.push(egui::Event::Key { key: *key, physical_key: None, pressed, repeat: false, modifiers: *modifiers });
-                            }
+                            let ev = |pressed| egui::Event::Key { key: *key, physical_key: None, pressed, repeat: false, modifiers: *modifiers };
+                            raw.events.push(ev(true));
+                            // like a keyboard: a printable key also types its character
+                            raw.events.extend(typed(*key, *modifiers).map(|c| egui::Event::Text(c.to_string())));
+                            raw.events.push(ev(false));
                         }
-                        Step::Text(t) => raw.events.push(egui::Event::Text(t.clone())),
+                        Step::Text(t) => raw.events.extend(t.chars().map(|c| egui::Event::Text(c.to_string()))),
                         Step::View(v) => out.push(Command::View(v.clone())),
                         Step::Play(p) => out.push(Command::Play(p.clone())),
                         Step::Move(p) => raw.events.push(egui::Event::PointerMoved(*p)),
@@ -316,8 +336,13 @@ fn save_png(image: &egui::ColorImage, ppp: f32, path: &std::path::Path) -> Resul
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
-    img.save_with_format(path, image::ImageFormat::Png).map_err(|e| e.to_string())?;
-    Ok(img.dimensions())
+    // opaque RGB at the best compression: these go into git
+    let rgb = image::DynamicImage::ImageRgba8(img).into_rgb8();
+    let file = std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| e.to_string())?);
+    let png =
+        image::codecs::png::PngEncoder::new_with_quality(file, image::codecs::png::CompressionType::Best, image::codecs::png::FilterType::Adaptive);
+    rgb.write_with_encoder(png).map_err(|e| e.to_string())?;
+    Ok(rgb.dimensions())
 }
 
 #[cfg(test)]
@@ -368,5 +393,17 @@ mod tests {
         assert!(parse_script("key:NoSuchKey").is_err());
         assert!(parse_script("move:1").is_err());
         assert_eq!(parse_script(""), Ok(vec![]));
+    }
+
+    #[test]
+    fn printable_keys_also_type_their_character() {
+        use egui::{Key, Modifiers};
+        assert_eq!(typed(Key::Space, Modifiers::NONE), Some(' '));
+        assert_eq!(typed(Key::O, Modifiers::NONE), Some('o'));
+        assert_eq!(typed(Key::G, Modifiers::SHIFT), Some('G'));
+        assert_eq!(typed(Key::Num3, Modifiers::NONE), Some('3'));
+        for (k, m) in [(Key::K, Modifiers::CTRL), (Key::Enter, Modifiers::NONE), (Key::F1, Modifiers::NONE), (Key::Num1, Modifiers::SHIFT)] {
+            assert_eq!(typed(k, m), None, "{k:?} {m:?}");
+        }
     }
 }

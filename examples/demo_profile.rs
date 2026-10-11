@@ -988,12 +988,22 @@ fn user_data(c: &mut Connection, now: Timestamp, progs: &[Prog]) -> tuner::error
         need(channel(c, north, "Lumen Docs")?, "Lumen Docs")?,
         need(channel(c, aurora, "Northstar Cinema")?, "Northstar Cinema")?,
         need(channel(c, north, "Pinecone Kids")?, "Pinecone Kids")?,
-        need(movie(c, north, "Lighthouse Keeper")?, "The Lighthouse Keeper")?,
-        need(movie(c, aurora, "Quiet Frequencies")?, "Quiet Frequencies")?,
-        need(series(c, north, "Harbour Lights")?, "Harbour Lights")?,
     ];
     for (i, f) in favs.iter().enumerate() {
         user::set_favourite(c, list, f, true, now - 86_400 + i as i64 * 60)?;
+    }
+    // titles go in a list of their own: a rail mixing channel tiles and posters leaves a gap
+    // under the tiles on Home
+    let night = user::create_fav_list(c, "Movie night", tuner::ui::widgets::glyphs::FAV_LIST)?;
+    let titles = [
+        need(movie(c, north, "Lighthouse Keeper")?, "The Lighthouse Keeper")?,
+        need(movie(c, aurora, "Quiet Frequencies")?, "Quiet Frequencies")?,
+        need(series(c, north, "Harbour Lights")?, "Harbour Lights")?,
+        need(movie(c, aurora, "Blue Hour Express")?, "Blue Hour Express")?,
+        need(movie(c, north, "Copper Sky")?, "Copper Sky")?,
+    ];
+    for (i, f) in titles.iter().enumerate() {
+        user::set_favourite(c, night, f, true, now - 80_000 + i as i64 * 60)?;
     }
 
     // recently watched channels (oldest first)

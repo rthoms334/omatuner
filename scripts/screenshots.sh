@@ -12,7 +12,7 @@
 #
 # Video: the "Sintel" trailer, © copyright Blender Foundation | durian.blender.org,
 # Creative Commons Attribution 3.0 (https://durian.blender.org/sharing/). It is downloaded to
-# target/screenshots/media/ (never committed); 8 s of it loop in the demo channels. Without
+# target/screenshots/media/ (never committed); 9.5 s of it loop in the demo channels. Without
 # a download the channels play an ffmpeg test pattern instead.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -34,27 +34,32 @@ done
 
 cargo build --release --bin tuner --example demo_profile
 
-# --- video: 8 s of the Sintel trailer (letterbox cropped to 16:9), or a test pattern
+# --- video: 9.5 s of the Sintel trailer (letterbox cropped to 16:9), or a test pattern
 mkdir -p "$media"
-if [[ ! -s $media/demo.mp4 ]]; then
+clip=$media/demo-v2.mp4   # bump the name when the cut changes
+if [[ ! -s $clip ]]; then
   src=$media/sintel_trailer-720p.mp4
   if [[ ! -s $src ]] && command -v curl >/dev/null; then
     curl -fsSL --max-time 300 -o "$src.part" "$clip_url" && mv "$src.part" "$src" || rm -f "$src.part"
   fi
   if [[ -s $src ]] && echo "$clip_sha256  $src" | sha256sum -c --quiet -; then
-    ffmpeg -nostdin -v error -y -ss 27 -i "$src" -t 8 -vf "crop=968:544:156:88,scale=1280:720,setsar=1" \
-      -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 96k "$media/demo.mp4"
+    # 0:22.1–0:32 (sunset flight, no title card) minus the cut to black at 0:28
+    keep='between(t,22.1,27.95)+between(t,28.42,32.05)'
+    ffmpeg -nostdin -v error -y -i "$src" \
+      -vf "select='$keep',setpts=N/FRAME_RATE/TB,crop=968:544:156:88,scale=1280:720,setsar=1" \
+      -af "aselect='$keep',asetpts=N/SR/TB" \
+      -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 96k "$clip"
   else
     echo "screenshots.sh: no Sintel trailer ($clip_url); using a test pattern" >&2
     ffmpeg -nostdin -v error -y -f lavfi -i testsrc2=size=1280x720:rate=25 -f lavfi -i sine=frequency=440 \
-      -t 8 -c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac -shortest "$media/demo.mp4"
+      -t 8 -c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac -shortest "$clip"
   fi
 fi
 
 # --- the demo profile (pristine; every shot runs on a copy)
 profile=$work/profile
 rm -rf "$profile" "$work/run"
-target/release/examples/demo_profile "$profile" --media "$media/demo.mp4" --silent
+target/release/examples/demo_profile "$profile" --media "$clip" --silent
 # NORTHWIND_ID, AURORA_ID, HARBOR_ID, PLAY_DOCS, PLAY_SPORTS, PLAY_NEWS
 # shellcheck disable=SC1091
 source "$profile/demo/refs.env"
@@ -85,12 +90,12 @@ shot() {
 # Scripts: steps run 0.35 s apart once the library is loaded (src/devshot.rs).
 shot home        "$big"  "$dark"  home     ""
 shot live        "$big"  "$dark"  live     "key:Down;key:Down;key:Enter;key:Down;key:Down;wait:3" 3
-shot guide       "$big"  "$dark"  guide    "key:Down;key:Down;key:Right" 2
-shot movies      "$big"  "$dark"  movies   "key:Tab"
-shot stack       "$big"  "$dark"  movies   "key:Tab;key:Space;wait:1"
-shot detail      "$big"  "$dark"  movies   "key:Tab;key:Enter;wait:1.5"
+shot guide       "$big"  "$dark"  guide    "key:F;key:Down;key:Down;key:Down;key:Enter;wait:0.5;key:Down;key:Down;key:Right" 2
+shot movies      "$big"  "$dark"  movies   "key:Right;key:Left"
+shot stack       "$big"  "$dark"  movies   "key:Space;wait:1"
+shot detail      "$big"  "$dark"  movies   "key:Enter;wait:1.5"
 shot player      "$big"  "$dark"  live     "play:$PLAY_DOCS;wait:3;key:Enter;move:1400,940;wait:0.5" 1
-shot popout      "$big"  "$dark"  live     "play:$PLAY_SPORTS;wait:3;key:O;wait:2" 2
+shot popout      "$big"  "$dark"  live     "play:$PLAY_SPORTS;wait:5;text:o;wait:2;move:240,200" 1
 shot live-half   "$half" "$dark"  live     "key:Down;key:Enter;key:Down;wait:3" 3
 shot categories  "$big"  "$dark"  live     "categories:$NORTHWIND_ID;wait:1"
 shot help        "$big"  "$dark"  home     "key:F1;text:guide;wait:0.5"

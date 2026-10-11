@@ -2954,17 +2954,18 @@ public, so every image shows made-up content only:
   `TUNER_SCREENSHOT=<png>` captures the window with `ViewportCommand::Screenshot` and exits;
   `TUNER_SCREENSHOT_SIZE=WxH` first floats, sizes and centres the window over Hyprland IPC
   (`platform::popout::Hypr::float_centred`, found by pid); `TUNER_SCREENSHOT_SCRIPT` runs
-  steps (`view:`, `play:`, `key:`, `text:`, `move:`, `click:`, `size:`, `categories:`,
-  `wait:`) 0.35 s apart once the first library is in and the window has its size;
+  steps (`view:`, `play:`, `key:` — a plain printable key also sends its `Text`, as a
+  keyboard does —, `text:`, `move:`, `click:`, `size:`, `categories:`, `wait:`) 0.35 s apart once the first library is in and the window has its size;
   `TUNER_SCREENSHOT_AFTER` (default 2 s) waits after the last step. The PNG is scaled to the
   window's logical size, so the monitor scale doesn't change the result.
 * **Fixed theme** — `TUNER_THEME_DIR=<dir>` loads that Omarchy theme directory instead of the
   live one (no `~/.config/omarchy/shell.toml`, rounding 0, no theme watcher). The script uses
   the bundled fixtures `tests/fixtures/theme/tokyo-night` (dark) and `catppuccin-latte`
   (light). Fonts still come from fontconfig (Omarchy: JetBrainsMono Nerd Font).
-* **Video** — 8 s of the *Sintel* trailer (© copyright Blender Foundation |
-  durian.blender.org, CC BY 3.0), downloaded by the script into `target/screenshots/media/`
-  (sha256-checked, never committed), letterbox cropped and looped by mpv (`loop-file=inf`,
+* **Video** — 9.5 s of the *Sintel* trailer (© copyright Blender Foundation |
+  durian.blender.org, CC BY 3.0): 0:22–0:32 without the cut to black at 0:28, so no frame is
+  black and no title card shows. The script downloads it into `target/screenshots/media/`
+  (sha256-checked, never committed); it is letterbox cropped and looped by mpv (`loop-file=inf`,
   `ao=null` with `--silent`). Without the download an ffmpeg test pattern plays instead.
 
 ---
