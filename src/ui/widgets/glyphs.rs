@@ -45,10 +45,15 @@ pub const INFO: &str = "\u{f02fd}";
 pub const CHEVRON_LEFT: &str = "\u{f0141}";
 pub const CHEVRON_RIGHT: &str = "\u{f0142}";
 pub const CHECK: &str = "\u{f012c}";
+/// Tick-list boxes (nf-md-checkbox_marked / nf-md-checkbox_blank_outline).
+pub const CHECKBOX_ON: &str = "\u{f0132}";
+pub const CHECKBOX_OFF: &str = "\u{f0131}";
 pub const CLOSE: &str = "\u{f0156}";
 pub const ADD: &str = "\u{f0415}";
 pub const FOLDER: &str = "\u{f024b}";
 pub const SOURCE_URL: &str = "\u{f01e7}";
+/// Countries and languages (the category filter): nf-md-earth, as `SOURCE_URL`.
+pub const EARTH: &str = "\u{f01e7}";
 pub const SOURCE_XTREAM: &str = "\u{f048b}";
 pub const SOURCE_FILE: &str = "\u{f0214}";
 pub const KEYBOARD: &str = "\u{f030c}";

@@ -1072,6 +1072,99 @@ fn live_reminders_rows_and_group_reorder() {
     let _ = ids;
 }
 
+/// DESIGN §28.7 bulk hide in the groups pane: Space marks provider groups (never the virtual
+/// rows) and moves down; Esc clears the marks before it leaves the pane; Ctrl+H hides every
+/// marked group; while filtering, Ctrl+Shift+H hides exactly the groups shown, once confirmed.
+#[test]
+fn live_bulk_hide_of_marked_and_filtered_groups() {
+    let _one = one();
+    let (mut t, _ids) = seeded(10, 0, None);
+    // groups: All, News (seeded), then Sport 1, Sport 2, Kids
+    t.services()
+        .store
+        .writer()
+        .blocking(|c| {
+            for (i, name) in ["Sport 1", "Sport 2", "Kids"].iter().enumerate() {
+                c.execute(
+                    "INSERT INTO grp(source_id, kind, key, name, provider_order, item_count, seen_gen) VALUES (1,'channel',?1,?2,?3,1,1)",
+                    rusqlite::params![format!("channel:x{i}"), name, 2 + i as i64],
+                )?;
+                let g = c.last_insert_rowid();
+                c.execute(
+                    "INSERT INTO channel_group(group_id, channel_id, position, is_primary) SELECT ?1, id, 0, 0 FROM channel WHERE key = ?2",
+                    rusqlite::params![g, format!("m3u:seed{:011}", i + 1)],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    reload(&mut t);
+    let hidden = |t: &TestUi| {
+        let mut v: Vec<String> = tuner::store::user::group_overrides(&t.db).unwrap().into_iter().filter(|r| r.ov.hidden).map(|r| r.key.0).collect();
+        v.sort();
+        v
+    };
+    let wait_hidden = |h: &Harness<'static, ScreenApp<LiveScreen>>, want: &[&str]| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while hidden(&h.state().t) != want && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(hidden(&h.state().t), want);
+    };
+    let mut s = LiveScreen::default();
+    t.with_ctx(|ctx| s.on_enter(ctx, &Route::Live { group: None, channel: None }));
+    let mut h = screen_harness(t, s, 1600.0);
+    h.run_steps(2);
+    // the groups pane, on "All channels" (virtual: can't be marked)
+    hact(&mut h, Action::FocusNext);
+    assert!(hact(&mut h, Action::ToggleMark));
+    assert!(h.state().t.toasts.iter().any(|t| t.text == "Only playlist groups can be marked"));
+    // All and News marked (Space moves down)
+    hact(&mut h, Action::Down);
+    hact(&mut h, Action::ToggleMark);
+    hact(&mut h, Action::ToggleMark);
+    h.run_steps(2);
+    assert!(has(&h, "2 marked · Ctrl+H hides · Esc clears"));
+    // Esc clears the marks; the next Esc leaves the pane (the app's Back)
+    assert!(hact(&mut h, Action::Back));
+    h.run_steps(2);
+    assert!(!has(&h, "2 marked · Ctrl+H hides · Esc clears"));
+    assert!(!hact(&mut h, Action::Back));
+    // News and Kids marked (the cursor is on Sport 1): Ctrl+H hides both
+    hact(&mut h, Action::Up);
+    hact(&mut h, Action::ToggleMark);
+    hact(&mut h, Action::Down);
+    hact(&mut h, Action::Down);
+    hact(&mut h, Action::ToggleMark);
+    hact(&mut h, Action::ToggleHidden);
+    wait_hidden(&h, &["channel:news", "channel:x2"]);
+    assert!(h.state().t.toasts.iter().any(|t| t.text.starts_with("Hid 2 groups")), "{:?}", h.state().t.toasts);
+    // the rebuilt library: filter "sport", then Ctrl+Shift+H → confirm → exactly those two
+    reload(&mut h.state_mut().t);
+    h.run_steps(2);
+    for c in "sport".chars() {
+        hact(&mut h, Action::FilterInput(c));
+    }
+    h.run_steps(2);
+    assert!(has(&h, "2 groups · Ctrl+Shift+H hides them"));
+    h.state_mut().t.nav.clear();
+    assert!(hact(&mut h, Action::HideShown));
+    let token = match opened(&h.state().t).as_slice() {
+        [OverlayRequest::Confirm(c)] => {
+            assert_eq!(c.title, "Hide 2 groups?");
+            assert!(!c.destructive);
+            c.token
+        }
+        other => panic!("{other:?}"),
+    };
+    {
+        let ScreenApp { t, s } = h.state_mut();
+        t.with_ctx(|ctx| s.on_overlay_result(ctx, overlays::OverlayResult::Confirmed(token)));
+    }
+    wait_hidden(&h, &["channel:news", "channel:x0", "channel:x1", "channel:x2"]);
+    assert_eq!(h.state().s.key_contexts(), [KeyContext::List], "the filter is cleared");
+}
+
 #[test]
 fn live_preview_autoplay_is_off_by_default_and_keyboard_rest_only() {
     let _one = one();

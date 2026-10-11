@@ -21,8 +21,13 @@
 //! login", which saves `keep_m3u` and runs a forced refresh that performs the switch. The open
 //! editor follows `DataScope::Sources` (a silent upgrade must not be undone by its Save), and
 //! an unchanged server is saved as stored (an upgraded server may carry a path prefix).
+//!
+//! Category filter (DESIGN §28.5): a playlist's editor has "Categories…" (the "Choose what to
+//! show" picker); Hidden lists what the filter hides per playlist and tag (Enter shows the
+//! tag, → lists its categories, Enter on one shows just it), then only what the user hid
+//! themselves (a filtered playlist would otherwise flood those lists).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use eframe::egui::{self, RichText};
@@ -32,14 +37,15 @@ use crate::config::{Config, Density, IdleInhibitMode, SidebarMode, StartScreen, 
 use crate::jobs::{JobEvent, JobKind, JobOutcome, Submitted};
 use crate::keymap::{Action, KeyContext};
 use crate::model::{
-    AccountStatus, ChannelId, EpgSource, EpgSourceId, EpgSourceKind, FavListId, GroupId, ItemKind, ItemRef, JobId, LiveFormat, Reminder, ReminderId,
-    SortMode, Source, SourceColor, SourceId, SourceKind,
+    AccountStatus, CategoryTag, ChannelId, EpgSource, EpgSourceId, EpgSourceKind, FavListId, Group, GroupFilter, GroupId, GroupRef, ItemKind,
+    ItemRef, JobId, LiveFormat, Reminder, ReminderId, SortMode, Source, SourceColor, SourceId, SourceKind,
 };
 use crate::msg::{AppEvent, DataScope, Toast};
 use crate::platform::{PickPurpose, PlatformEvent};
 use crate::store::backup::{BackupOptions, RestoreMode};
 use crate::store::user::Orphan;
 use crate::theme::{SpaceToken, Theme, TypeToken};
+use crate::ui::overlays::categories::{self, tag_name};
 use crate::ui::overlays::{ConfirmSpec, ContextMenuSpec, MenuItem, OverlayResult, RenameSpec, RenameTarget};
 use crate::ui::parental::{hash_pin, new_salt};
 use crate::ui::widgets::button::{ButtonStyle, icon_button};
@@ -303,6 +309,10 @@ enum Item {
     List(FavListId),
     Reminder(ReminderId),
     HiddenGroup(GroupId),
+    /// What a playlist's category filter hides of one tag (`None` = untagged categories).
+    HiddenTag(SourceId, Option<CategoryTag>),
+    /// "Categories…" / "Choose countries…": the playlist's picker.
+    Categories(SourceId),
     HiddenChannel(ChannelId),
     HiddenVod(ItemRef),
     Orphan(ItemRef),
@@ -663,6 +673,8 @@ pub struct SettingsScreen {
     offset_pending: Option<(EpgSourceId, std::time::Instant)>,
     /// Hidden channels of the library generation `hidden_built` (Settings ▸ Hidden items).
     hidden_channels: Vec<(ChannelId, String)>,
+    /// Hidden ▸ filtered tags whose categories are listed (→ / ←).
+    expanded: HashSet<(SourceId, Option<CategoryTag>)>,
     hidden_built: u64,
     /// A playlist kept as M3U that the user asked to sign in with its Xtream login: the
     /// refresh submitted once that choice was saved says whether that worked.
@@ -741,7 +753,7 @@ impl SettingsScreen {
             return self.attach_rows(a);
         }
         if let Some(e) = &self.editor {
-            return self.editor_rows(e);
+            return self.editor_rows(ctx, e);
         }
         let mut v = Vec::new();
         let item = |item: Item, icon: &str, label: String, detail: Option<String>| Row::Item {
@@ -761,17 +773,17 @@ impl SettingsScreen {
                 let jobs = ctx.services.jobs.active();
                 for s in &self.sources {
                     let running = jobs.iter().find(|j| matches!(j.kind, JobKind::RefreshSource { source, .. } if source == s.id));
+                    let mut detail =
+                        source_detail(s, ctx.now, running.map(|j| super::onboarding::phase_text(&j.phase)), self.guide_counts.1.get(&s.id).copied());
+                    if let Some(rule) = &s.settings.category_filter {
+                        detail.push_str(&format!(" · Showing {}", categories::showing_text(ctx.lib, s.id, Some(rule))));
+                    }
                     v.push(Row::Item {
                         item: Item::Source(s.id),
                         icon: if s.icon.is_empty() { glyphs::PLAYLIST.to_owned() } else { s.icon.clone() },
                         color: Some(s.color),
                         label: s.name.clone(),
-                        detail: Some(source_detail(
-                            s,
-                            ctx.now,
-                            running.map(|j| super::onboarding::phase_text(&j.phase)),
-                            self.guide_counts.1.get(&s.id).copied(),
-                        )),
+                        detail: Some(detail),
                         reorder: true,
                     });
                 }
@@ -946,19 +958,20 @@ impl SettingsScreen {
                 }
             }
             SettingsPage::Hidden => {
+                self.filtered_rows(ctx, &mut v);
                 v.push(Row::Section("Hidden groups".into()));
-                let groups: Vec<&crate::model::Group> =
-                    ctx.lib.live.groups.iter().chain(&ctx.lib.vod.movie_groups).chain(&ctx.lib.vod.series_groups).filter(|g| g.hidden).collect();
+                // only what the user hid: the category filter's are listed above
+                let groups: Vec<&Group> = all_groups(ctx).filter(|g| g.hidden && g.filter != GroupFilter::Hidden).collect();
                 if groups.is_empty() {
                     v.push(Row::Note("Nothing hidden.".into(), false));
                 }
                 for g in groups {
-                    let kind = match g.kind {
-                        ItemKind::Channel => "Live TV",
-                        ItemKind::Movie => "Movies",
-                        _ => "Series",
-                    };
-                    v.push(item(Item::HiddenGroup(g.id), glyphs::HIDDEN, g.display_name().to_owned(), Some(format!("{kind} · Enter unhides"))));
+                    v.push(item(
+                        Item::HiddenGroup(g.id),
+                        glyphs::HIDDEN,
+                        g.display_name().to_owned(),
+                        Some(format!("{} · Enter unhides", kind_name(g.kind))),
+                    ));
                 }
                 v.push(Row::Section("Hidden channels".into()));
                 if self.hidden_channels.is_empty() {
@@ -1003,7 +1016,57 @@ impl SettingsScreen {
         v
     }
 
-    fn editor_rows(&self, e: &SourceEditor) -> Vec<Row> {
+    /// Hidden ▸ "Hidden by the category filter" (DESIGN §28.5): per filtered playlist, a row
+    /// per hidden tag (biggest first; → lists its categories), then "Choose countries…".
+    fn filtered_rows(&self, ctx: &UiCtx<'_>, v: &mut Vec<Row>) {
+        let mut by_tag: HashMap<(SourceId, Option<CategoryTag>), Vec<&Group>> = HashMap::new();
+        for g in all_groups(ctx).filter(|g| g.filter == GroupFilter::Hidden) {
+            by_tag.entry((g.source_id, g.tag.clone())).or_default().push(g);
+        }
+        for src in &ctx.lib.sources {
+            let mut tags: Vec<(&Option<CategoryTag>, &Vec<&Group>)> =
+                by_tag.iter().filter(|((s, _), _)| *s == src.id).map(|((_, t), groups)| (t, groups)).collect();
+            if tags.is_empty() {
+                continue;
+            }
+            let items = |gs: &[&Group]| gs.iter().map(|g| g.item_count as u64).sum::<u64>();
+            tags.sort_by(|a, b| items(b.1).cmp(&items(a.1)).then_with(|| tag_name(a.0.as_ref()).cmp(&tag_name(b.0.as_ref()))));
+            v.push(Row::Section(format!("{}: hidden by the category filter", src.name)));
+            for (tag, groups) in tags {
+                let open = self.expanded.contains(&(src.id, tag.clone()));
+                v.push(Row::Item {
+                    item: Item::HiddenTag(src.id, tag.clone()),
+                    icon: if open { glyphs::CHEVRON_LEFT } else { glyphs::CHEVRON_RIGHT }.to_owned(),
+                    color: None,
+                    label: tag_name(tag.as_ref()),
+                    detail: Some(format!("{} · Enter shows · {}", hidden_tag_detail(groups), if open { "← hides the list" } else { "→ lists them" })),
+                    reorder: false,
+                });
+                if open {
+                    for g in groups {
+                        v.push(Row::Item {
+                            item: Item::HiddenGroup(g.id),
+                            icon: glyphs::HIDDEN.to_owned(),
+                            color: None,
+                            label: g.display_name().to_owned(),
+                            detail: Some(format!("{} · Enter shows just this one", kind_name(g.kind))),
+                            reorder: false,
+                        });
+                    }
+                }
+            }
+            v.push(Row::Item {
+                item: Item::Categories(src.id),
+                icon: glyphs::EARTH.to_owned(),
+                color: None,
+                label: "Choose countries…".into(),
+                detail: None,
+                reorder: false,
+            });
+        }
+    }
+
+    fn editor_rows(&self, ctx: &UiCtx<'_>, e: &SourceEditor) -> Vec<Row> {
         let mut v = vec![Row::Section(format!("Edit {}", e.original.name))];
         let l = |field, label| Row::Local { field, label };
         v.extend([l(Local::SrcName, "Name"), l(Local::SrcIcon, "Icon"), l(Local::SrcColor, "Colour")]);
@@ -1033,6 +1096,16 @@ impl SettingsScreen {
         v.push(l(Local::SrcRefresh, "Refresh every (h, 0 = default)"));
         v.push(l(Local::SrcProviderEpg, "Use the provider's guide"));
         v.push(l(Local::SrcSmartNames, "Smart names"));
+        // the stored rule (the picker writes it; the editor's Save keeps it)
+        let rule = self.sources.iter().find(|s| s.id == e.original.id).and_then(|s| s.settings.category_filter.as_ref());
+        v.push(Row::Item {
+            item: Item::Categories(e.original.id),
+            icon: glyphs::EARTH.to_owned(),
+            color: None,
+            label: "Categories…".into(),
+            detail: Some(format!("Countries and languages shown: {}", categories::showing_text(ctx.lib, e.original.id, rule))),
+            reorder: false,
+        });
         if let Some(a) = &e.original.status.account {
             v.push(Row::Section("Account".into()));
             for (line, bad) in super::onboarding::account_lines(a) {
@@ -1218,6 +1291,14 @@ impl SettingsScreen {
             Row::Local { field: Local::SrcUseXtream, .. } => self.set_use_xtream(ctx, dir > 0),
             Row::Local { field, .. } => self.adjust_local(*field, dir),
             Row::Item { item: Item::Epg(id), .. } => self.epg_offset(ctx, *id, dir * 15),
+            Row::Item { item: Item::HiddenTag(src, tag), .. } => {
+                let key = (*src, tag.clone());
+                if dir > 0 {
+                    self.expanded.insert(key);
+                } else {
+                    self.expanded.remove(&key);
+                }
+            }
             _ => {}
         }
     }
@@ -1490,10 +1571,10 @@ impl SettingsScreen {
     /// The open editor follows its stored row. Across a kind change (a silent upgrade, the
     /// switch) the fields differ: an edit in progress ends and the cursor stays on its field,
     /// else goes to the name.
-    fn rebase_editor(&mut self, s: &Source) {
+    fn rebase_editor(&mut self, ctx: &UiCtx<'_>, s: &Source) {
         let Some(e) = &self.editor else { return };
         let kind_changed = s.kind != e.original.kind;
-        let field = match self.editor_rows(e).get(self.row) {
+        let field = match self.editor_rows(ctx, e).get(self.row) {
             Some(Row::Local { field, .. }) => Some(*field),
             _ => None,
         };
@@ -1502,7 +1583,7 @@ impl SettingsScreen {
         }
         if kind_changed && self.attach.is_none() {
             self.editing = false;
-            let rows = self.editor.as_ref().map(|e| self.editor_rows(e)).unwrap_or_default();
+            let rows = self.editor.as_ref().map(|e| self.editor_rows(ctx, e)).unwrap_or_default();
             let at = |f: Local| rows.iter().position(|r| matches!(r, Row::Local { field, .. } if *field == f));
             self.row = field.and_then(at).or_else(|| at(Local::SrcName)).unwrap_or(0);
         }
@@ -1561,6 +1642,11 @@ impl SettingsScreen {
             Item::Epg(id) => self.toggle_epg(ctx, id),
             Item::List(id) => self.rename_list(ctx, id),
             Item::HiddenGroup(g) => self.unhide_group(ctx, g),
+            Item::HiddenTag(src, tag) => {
+                self.expanded.remove(&(src, tag.clone()));
+                categories::show_tag(ctx, src, tag);
+            }
+            Item::Categories(src) => ctx.open(OverlayRequest::Categories(src)),
             Item::HiddenChannel(c) => {
                 self.unhide_item(ctx, ctx.lib.live.get(c).map(|c| ItemRef { source: c.source_id, kind: ItemKind::Channel, key: c.key.clone() }))
             }
@@ -1589,20 +1675,12 @@ impl SettingsScreen {
         ctx.open(OverlayRequest::Rename(RenameSpec { title: "Rename list".into(), initial: name, target: RenameTarget::FavList(id) }));
     }
 
+    /// Show a group again; one the category filter hides becomes an exception to it
+    /// (`GroupOverride::shown`, DESIGN §28.3).
     fn unhide_group(&mut self, ctx: &mut UiCtx<'_>, g: GroupId) {
-        let Some(group) = ctx.lib.live.groups.iter().chain(&ctx.lib.vod.movie_groups).chain(&ctx.lib.vod.series_groups).find(|x| x.id == g).cloned()
-        else {
-            return;
-        };
-        let _ = ctx.services.store.writer().submit_notify(DataScope::Overrides, move |c| {
-            let mut ov = crate::store::user::group_overrides(c)?
-                .into_iter()
-                .find(|r| r.source == group.source_id && r.kind == group.kind && r.key == group.key)
-                .map(|r| r.ov)
-                .unwrap_or_default();
-            ov.hidden = false;
-            crate::store::user::set_group_override(c, group.source_id, group.kind, &group.key, &ov)
-        });
+        let Some(group) = all_groups(ctx).find(|x| x.id == g) else { return };
+        let (r, exempt) = (GroupRef::from(group), group.filter != GroupFilter::Kept);
+        let _ = ctx.services.store.writer().submit_notify(DataScope::Overrides, move |c| crate::store::user::show_group(c, &r, exempt));
         ctx.toast(Toast::info("Shown again"));
     }
 
@@ -1717,8 +1795,10 @@ impl SettingsScreen {
             Item::Orphan(_) => {
                 ("Orphan".into(), vec![mi(glyphs::CHEVRON_RIGHT, "Attach to…", MENU_ATTACH), mi(glyphs::CLOSE, "Forget…", MENU_DELETE)])
             }
-            Item::HiddenGroup(_) | Item::HiddenChannel(_) | Item::HiddenVod(_) => ("Hidden".into(), vec![mi(glyphs::CHECK, "Unhide", MENU_TOGGLE)]),
-            Item::AttachTarget(_) => return,
+            Item::HiddenGroup(_) | Item::HiddenChannel(_) | Item::HiddenVod(_) | Item::HiddenTag(..) => {
+                ("Hidden".into(), vec![mi(glyphs::CHECK, "Unhide", MENU_TOGGLE)])
+            }
+            Item::AttachTarget(_) | Item::Categories(_) => return,
         };
         self.pending = Some(Pending::Menu(item));
         ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title, items }));
@@ -1788,7 +1868,9 @@ impl SettingsScreen {
                     token,
                 }));
             }
-            (item @ (Item::HiddenGroup(_) | Item::HiddenChannel(_) | Item::HiddenVod(_)), MENU_TOGGLE) => self.item_default(ctx, item),
+            (item @ (Item::HiddenGroup(_) | Item::HiddenChannel(_) | Item::HiddenVod(_) | Item::HiddenTag(..)), MENU_TOGGLE) => {
+                self.item_default(ctx, item)
+            }
             _ => {}
         }
     }
@@ -1853,6 +1935,34 @@ impl SettingsScreen {
 }
 
 static PARENTAL_ENABLED: CfgToggle = toggle_row!("Parental lock", parental.enabled);
+
+/// Every group of the library (live, movie and series categories).
+fn all_groups<'l>(ctx: &'l UiCtx<'_>) -> impl Iterator<Item = &'l Group> {
+    ctx.lib.live.groups.iter().chain(&ctx.lib.vod.movie_groups).chain(&ctx.lib.vod.series_groups)
+}
+
+fn kind_name(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::Channel => "Live TV",
+        ItemKind::Movie => "Movies",
+        _ => "Series",
+    }
+}
+
+/// "112 categories · 4 380 channels · 12 movies" of the groups a filtered tag hides.
+fn hidden_tag_detail(groups: &[&Group]) -> String {
+    let count = |k: ItemKind| groups.iter().filter(|g| g.kind == k).map(|g| g.item_count as usize).sum::<usize>();
+    let n = groups.len();
+    let mut parts = vec![format!("{} {}", grouped(n), if n == 1 { "category" } else { "categories" })];
+    for (k, one, many) in [(ItemKind::Channel, "channel", "channels"), (ItemKind::Movie, "movie", "movies"), (ItemKind::Series, "series", "series")] {
+        match count(k) {
+            0 => {}
+            1 => parts.push(format!("1 {one}")),
+            c => parts.push(format!("{} {many}", grouped(c))),
+        }
+    }
+    parts.join(" · ")
+}
 
 /// A restored Xtream source without its password.
 fn needs_credentials(s: &Source) -> bool {
@@ -2293,8 +2403,16 @@ impl SettingsScreen {
             // one pass per library build, not one per `rows()` call
             self.hidden_built = ctx.lib.generation;
             let live = &ctx.lib.live;
-            self.hidden_channels =
-                live.channels.iter().filter(|c| live.hidden.contains(&c.id)).take(500).map(|c| (c.id, c.name.to_string())).collect();
+            // hidden by their own override: a channel whose groups are all hidden (by the user or
+            // the category filter) shows with its group instead (DESIGN §28.5)
+            let hidden_groups: HashSet<GroupId> = live.groups.iter().filter(|g| g.hidden).map(|g| g.id).collect();
+            self.hidden_channels = live
+                .channels
+                .iter()
+                .filter(|c| live.hidden.contains(&c.id) && (c.group_ids.is_empty() || c.group_ids.iter().any(|g| !hidden_groups.contains(g))))
+                .take(500)
+                .map(|c| (c.id, c.name.to_string()))
+                .collect();
         }
         if self.offset_pending.is_some_and(|(_, at)| at.elapsed() >= OFFSET_SETTLE) {
             self.flush_epg_offset(ctx);
@@ -2306,7 +2424,7 @@ impl SettingsScreen {
                 Ok(v) => {
                     let changed = self.editor.as_ref().and_then(|e| v.iter().find(|s| s.id == e.original.id && **s != e.original).cloned());
                     if let Some(s) = changed {
-                        self.rebase_editor(&s);
+                        self.rebase_editor(ctx, &s);
                     }
                     self.sources = v;
                 }
@@ -2733,6 +2851,14 @@ mod tests {
         h.run_steps(1);
     }
 
+    fn group_ov(h: &H, key: &str) -> Option<crate::model::GroupOverride> {
+        crate::store::user::group_overrides(&h.state().t.services().store.reader().unwrap())
+            .unwrap()
+            .into_iter()
+            .find(|r| r.key.0 == key)
+            .map(|r| r.ov)
+    }
+
     fn sources(h: &H) -> Vec<Source> {
         crate::store::sources::list_sources(&h.state().t.services().store.reader().unwrap()).unwrap()
     }
@@ -2935,8 +3061,19 @@ mod tests {
                 "INSERT INTO fav_item(list_id, source_id, kind, item_key, position, added_at, fp, orphaned_since) VALUES (?1, ?2, 'channel', 'm3u:gone', 0, 1, '{\"norm_name\":\"channel 1\"}', 5)",
                 rusqlite::params![list, s],
             )?;
+            // a category filter that keeps the UK only
+            let rule = crate::model::CategoryFilter { keep: [CategoryTag("GB".into())].into(), ..Default::default() };
+            crate::store::sources::set_category_filter(c, s, Some(&rule))?;
             Ok(())
         });
+        // ... and "News" is an Arabic category the filter hides (as the library build marks it)
+        let arabic = CategoryTag("lang:ar".into());
+        let mut lib = crate::store::library::load(&t.services().store.reader().unwrap()).unwrap();
+        for g in std::sync::Arc::get_mut(&mut lib.live).unwrap().groups.iter_mut().filter(|g| g.key.0 == "channel:news") {
+            (g.tag, g.filter, g.hidden) = (Some(arabic.clone()), GroupFilter::Hidden, true);
+        }
+        lib.sources[0].category_filter = Some(crate::model::CategoryFilter { keep: [CategoryTag("GB".into())].into(), ..Default::default() });
+        t.set_library(lib);
         let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 1000.0));
         // favourites: create a list by typing its name
         h.state_mut().enter(Route::Settings(SettingsPage::Favourites));
@@ -2958,9 +3095,28 @@ mod tests {
         h.state_mut().nav();
         h.state_mut().result(OverlayResult::Chosen(Action::Digit(MENU_DELETE)));
         until(&mut h, "the cancellation", |h| crate::store::user::all_reminders(&h.state().t.services().store.reader().unwrap()).unwrap().is_empty());
-        // hidden items: Enter unhides
+        // hidden items: what the category filter hides, per tag (not among the user's groups)
         h.state_mut().enter(Route::Settings(SettingsPage::Hidden));
         h.run_steps(1);
+        let tag_row = tag_name(Some(&arabic));
+        assert!(has_label(&h, &tag_row) && has_label(&h, "Choose countries…"));
+        assert!(!has_label(&h, "News"), "filtered groups aren't in Hidden groups");
+        // → lists the tag's categories; Enter on one shows just it (an exception to the rule)
+        focus(&mut h, &tag_row);
+        h.state_mut().act(Action::Right);
+        h.run_steps(1);
+        focus(&mut h, "News");
+        h.state_mut().act(Action::Activate);
+        h.run_steps(1);
+        until(&mut h, "News shown", |h| group_ov(h, "channel:news").is_some_and(|o| o.shown && !o.hidden));
+        // Enter on the tag row shows the whole tag: the rule keeps it
+        focus(&mut h, &tag_row);
+        h.state_mut().act(Action::Activate);
+        h.run_steps(1);
+        let rule =
+            |h: &H| crate::store::sources::get_source(&h.state().t.services().store.reader().unwrap(), SourceId(1)).unwrap().settings.category_filter;
+        until(&mut h, "the tag kept", |h| rule(h).is_some_and(|r| r.keep.contains(&arabic) && r.keep.contains(&CategoryTag("GB".into()))));
+        // the user's own hidden channel: Enter unhides
         assert!(has_label(&h, "Channel 2"));
         focus(&mut h, "Channel 2");
         h.state_mut().act(Action::Activate);

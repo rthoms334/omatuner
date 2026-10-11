@@ -1756,9 +1756,10 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Esc` | Back |
 | `/` | Search everything |
 | `?` | Keyboard help |
+| `Space` / `Insert` | Mark group (Ctrl+H then hides all marked) |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
-| `Ctrl+H` | Hide / unhide |
+| `Ctrl+H` | Hide / unhide (groups: every marked one) |
 | `F2` | Rename |
 | `Ctrl+L` | Lock with PIN / unlock |
 | `Alt+↑` | Move up (reorder) |
@@ -1784,9 +1785,11 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Ctrl+Backspace` | Delete word |
 | `Ctrl+U` / `Esc` | Clear filter |
 | `Tab` / `Shift+Tab` | Next / previous pane |
+| `Insert` | Mark group (Ctrl+H then hides all marked) |
+| `Ctrl+Shift+H` | Hide all groups shown |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
-| `Ctrl+H` | Hide / unhide |
+| `Ctrl+H` | Hide / unhide (groups: every marked one) |
 | `F2` | Rename |
 | `Ctrl+L` | Lock with PIN / unlock |
 | `Alt+↑` | Move up (reorder) |
@@ -1798,6 +1801,23 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Ctrl+W` | Mark watched / unwatched |
 | `Delete` | Remove (from list / cancel task / forget) |
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
+| `a–z, 0–9 …` | Type to filter |
+
+#### Tick lists (`Checklist`)
+
+| Keys | Action |
+|---|---|
+| `↑` / `↓` | Move |
+| `PgUp` / `PgDn` | Page up / down |
+| `Home` / `End` | First / last |
+| `Space` / `Insert` | Tick / untick |
+| `Ctrl+A` | Tick all / none (of the rows shown) |
+| `Ctrl+E` | Just my country + English |
+| `Enter` | Save |
+| `Backspace` | Delete character |
+| `Ctrl+Backspace` | Delete word |
+| `Ctrl+U` | Clear filter |
+| `Esc` | Clear the filter, then cancel |
 | `a–z, 0–9 …` | Type to filter |
 
 #### Movies & series grid (`PosterGrid`)
@@ -1816,7 +1836,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `?` | Keyboard help |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
-| `Ctrl+H` | Hide / unhide |
+| `Ctrl+H` | Hide / unhide (groups: every marked one) |
 | `F2` | Rename |
 | `Ctrl+L` | Lock with PIN / unlock |
 | `Alt+↑` | Move up (reorder) |
@@ -1844,7 +1864,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Tab` / `Shift+Tab` | Next / previous pane |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
-| `Ctrl+H` | Hide / unhide |
+| `Ctrl+H` | Hide / unhide (groups: every marked one) |
 | `F2` | Rename |
 | `Ctrl+L` | Lock with PIN / unlock |
 | `Alt+↑` | Move up (reorder) |
@@ -1873,7 +1893,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `?` | Keyboard help |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
-| `Ctrl+H` | Hide / unhide |
+| `Ctrl+H` | Hide / unhide (groups: every marked one) |
 | `F2` | Rename |
 | `Ctrl+L` | Lock with PIN / unlock |
 | `Alt+↑` | Move up (reorder) |
@@ -3184,7 +3204,7 @@ FR→fr, DE/AT→de, ES/MX/AR…→es, IT→it, PT/BR→pt, NL→nl, TR→tr, PL
 * Initial ticks: the saved rule; with no rule, `default_keep(detect_country())` (only the
   present tags are displayed; the stored `keep` is the full default set, see §28.3) and
   untagged ticked.
-* Keys (context stack `[Checklist, List | ListFiltering, Modal]`): Space / Insert tick, Ctrl+A
+* Keys (context stack `[Checklist, Modal]`, see the keymap note in §28.7): Space / Insert tick, Ctrl+A
   all / none (of the rows shown by the filter), Ctrl+E "just my country + English" (the
   defaults), type to filter (label + short code; Space is not typable here — tag names are one
   word), Enter **save** (`keep` = ticked tags ∪ (stored `keep` − present tags), so ticks of
@@ -3208,7 +3228,9 @@ FR→fr, DE/AT→de, ES/MX/AR…→es, IT→it, PT/BR→pt, NL→nl, TR→tr, PL
   anyway) or Insert (List and ListFiltering) toggles the mark of the focused provider group and
   moves down; marked rows show a check glyph (`glyphs::CHECK`) and the accent tint. Virtual rows
   (favourites lists, History, All channels…) cannot be marked. Marks are per pane, cleared on
-  hide, on Esc (first rung of the Esc ladder) and when the library generation changes.
+  hide and on Esc (first rung of the Esc ladder); a library rebuild keeps the marks of groups the
+  pane still lists (group ids are stable) and drops the others. The tag code also filters
+  ("uk" finds the UK groups smart names renamed).
 * **Ctrl+H** with marks hides all marked groups in one write (`hide_groups`), toast "Hid 5
   groups · Settings ▸ Hidden shows them again"; without marks it is unchanged (the focused
   group).
@@ -3222,9 +3244,14 @@ FR→fr, DE/AT→de, ES/MX/AR…→es, IT→it, PT/BR→pt, NL→nl, TR→tr, PL
 
 **Keymap changes** (`src/keymap.rs`; §15.2 regenerated with `cargo run --example keymap_md`):
 new actions `ToggleMark`, `MarkAll`, `MarkDefaults`, `HideShown`; new context
-`KeyContext::Checklist` (title "Tick lists"), innermost, table: `Char(' ')` / Insert →
-ToggleMark "Tick / untick", Ctrl+A → MarkAll "Tick all / none", Ctrl+E → MarkDefaults "Just my
-country + English", Enter → Activate "Save"; hints `tick · all/none · my country · save`.
+`KeyContext::Checklist` (title "Tick lists"), stacked `[Checklist, Modal]` and filterable
+(letters type). It binds its own navigation and filter keys (↑/↓/PgUp/PgDn/Home/End,
+Backspace, Ctrl+Backspace, Ctrl+U, Esc → Back "Clear the filter, then cancel") instead of
+stacking on `List`, where → would be Activate (save) and Backspace Parent. `Key::Space` / Insert →
+ToggleMark "Tick / untick" (the KEY, because `Modal` below binds `Key::Space` to Confirm; the
+`Text(" ")` twin arrives as `FilterInput(' ')`, which the picker ignores), Ctrl+A → MarkAll
+"Tick all / none", Ctrl+E → MarkDefaults "Just my country + English", Enter → Activate "Save";
+hints `tick · all/none · my country · save`.
 LIST: `Char(' ')` and Insert → ToggleMark "Mark group (Ctrl+H then hides all marked)";
 LIST_FILTERING: Insert → ToggleMark, Ctrl+Shift+H → HideShown "Hide all groups shown". Space is
 bound as `Char(' ')` (the Text event), never `Key::Space`, so it never also types into the

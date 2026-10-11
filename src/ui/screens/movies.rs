@@ -28,6 +28,7 @@ use std::collections::HashMap;
 
 use eframe::egui;
 
+use super::group_marks::{self, GroupMarks};
 use super::home::kit::{self, Loader};
 use crate::keymap::{Action, KeyContext};
 use crate::model::{GroupId, ItemKey, ItemKind, SortMode, SourceId, VodKind, VodSummary};
@@ -191,6 +192,10 @@ pub(super) struct VodBrowser {
     /// Titles moved with Alt+↑/↓ that the library has not caught up with yet.
     moved: Option<Moved>,
     playing: kit::PlayingVod,
+    /// Categories marked for a bulk hide (DESIGN §28.7).
+    marks: GroupMarks,
+    /// Short tag codes of the categories of playlists with several tags, per library build.
+    tags: (u64, HashMap<GroupId, String>),
 }
 
 /// One playlist's titles in the custom order the user arranged with Alt+↑/↓ (the whole
@@ -346,13 +351,40 @@ impl VodBrowser {
     }
 
     fn refilter_cats(&mut self, ctx: &UiCtx<'_>) {
+        if self.tags.0 != lib_id(ctx) {
+            let tagged = crate::ui::overlays::categories::multi_tag_sources(ctx.lib);
+            let codes = self
+                .all_groups(ctx)
+                .iter()
+                .filter(|g| tagged.contains(&g.source_id))
+                .filter_map(|g| g.tag.as_ref().map(|t| (g.id, crate::sources::category_tags::tag_short(t))))
+                .collect();
+            self.tags = (lib_id(ctx), codes);
+        }
         let groups = self.groups(ctx);
         let mut all = vec![Cat::All, Cat::Continue, Cat::Favourites];
         all.extend(groups.iter().map(|g| Cat::Group(g.id)));
         let mut names: Vec<String> = all[..3].iter().map(|c| self.virtual_name(*c).to_owned()).collect();
-        names.extend(groups.iter().map(|g| g.display_name().to_owned()));
+        // the tag code filters too ("uk" finds the UK categories smart names renamed)
+        names.extend(groups.iter().map(|g| match self.tags.1.get(&g.id) {
+            Some(code) => format!("{} {code}", g.display_name()),
+            None => g.display_name().to_owned(),
+        }));
         self.cat_rows = self.cats.filter.apply(names.iter().map(String::as_str)).into_iter().map(|i| all[i as usize]).collect();
         self.cats.set_len(self.cat_rows.len());
+        self.marks.retain(|id| groups.iter().any(|g| g.id == id));
+    }
+
+    /// Provider categories the categories filter shows ("Hide these N groups").
+    fn shown_groups<'l>(&self, ctx: &'l UiCtx<'_>) -> Vec<&'l crate::model::Group> {
+        let all = self.all_groups(ctx);
+        self.cat_rows
+            .iter()
+            .filter_map(|c| match c {
+                Cat::Group(g) => all.iter().find(|x| x.id == *g),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Progress by list index (posters look it up per visible card, without cloning keys).
@@ -631,10 +663,29 @@ impl VodBrowser {
 
     /// Category shortcuts (lock, rename, hide, reorder, context menu) in the categories pane.
     fn category_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
-        if !matches!(action, Action::ToggleLock | Action::Rename | Action::ToggleHidden | Action::MoveUp | Action::MoveDown | Action::ContextMenu) {
+        if !matches!(
+            action,
+            Action::ToggleLock
+                | Action::Rename
+                | Action::ToggleHidden
+                | Action::MoveUp
+                | Action::MoveDown
+                | Action::ContextMenu
+                | Action::ToggleMark
+                | Action::HideShown
+        ) {
             return false;
         }
         self.pending_cat = None;
+        // bulk hide: the marked categories, the ones the filter shows (DESIGN §28.7)
+        if action == Action::ToggleHidden && self.marks.hide_marked(ctx) {
+            return true;
+        }
+        if action == Action::HideShown {
+            let shown: Vec<crate::model::Group> = self.shown_groups(ctx).into_iter().cloned().collect();
+            self.marks.hide_shown(ctx, &shown);
+            return true;
+        }
         let Some(g) = self.current_group(ctx).cloned() else {
             ctx.toast(crate::msg::Toast::info("Built-in categories can't be changed"));
             return true;
@@ -642,7 +693,11 @@ impl VodBrowser {
         match action {
             Action::ToggleLock => kit::toggle_group_lock(ctx, &g),
             Action::Rename => kit::rename_group(ctx, &g),
-            Action::ToggleHidden => kit::hide_group(ctx, &g),
+            Action::ToggleHidden => group_marks::hide(ctx, vec![crate::model::GroupRef::from(&g)], Some(g.display_name())),
+            Action::ToggleMark => {
+                self.marks.toggle(&g);
+                self.action(ctx, Action::Down);
+            }
             Action::MoveUp | Action::MoveDown => {
                 let delta = if action == Action::MoveUp { -1 } else { 1 };
                 let visible = self.groups(ctx);
@@ -660,7 +715,7 @@ impl VodBrowser {
                     enabled: true,
                     shortcut: Some(shortcut.into()),
                 };
-                let items = vec![
+                let mut items = vec![
                     mi(glyphs::CHEVRON_RIGHT, "Open", Action::Digit(MENU_OPEN_CAT), "Enter"),
                     mi(glyphs::TAG, "Rename…", Action::Rename, "F2"),
                     mi(
@@ -669,10 +724,14 @@ impl VodBrowser {
                         Action::ToggleLock,
                         "Ctrl+L",
                     ),
-                    mi(glyphs::HIDDEN, "Hide", Action::ToggleHidden, "Ctrl+H"),
-                    mi(glyphs::REORDER, "Move up", Action::MoveUp, "Alt+↑"),
-                    mi(glyphs::REORDER, "Move down", Action::MoveDown, "Alt+↓"),
+                    mi(glyphs::HIDDEN, if self.marks.is_empty() { "Hide" } else { "Hide the marked categories" }, Action::ToggleHidden, "Ctrl+H"),
+                    mi(glyphs::CHECK, if self.marks.is_marked(g.id) { "Unmark" } else { "Mark for hiding" }, Action::ToggleMark, "Space"),
                 ];
+                if self.cats.filter.is_active() {
+                    let n = self.shown_groups(ctx).len();
+                    items.push(mi(glyphs::HIDDEN, &format!("Hide these {n} categories"), Action::HideShown, "Ctrl+Shift+H"));
+                }
+                items.extend([mi(glyphs::REORDER, "Move up", Action::MoveUp, "Alt+↑"), mi(glyphs::REORDER, "Move down", Action::MoveDown, "Alt+↓")]);
                 ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: g.display_name().to_owned(), items }));
             }
         }
@@ -704,7 +763,8 @@ impl VodBrowser {
             return true;
         }
         if action == Action::Back {
-            return self.back(ctx);
+            // Esc ladder: the marks go first
+            return self.marks.clear() || self.back(ctx);
         }
         match self.pane {
             Pane::Categories => match self.cats.handle(action) {
@@ -807,6 +867,13 @@ impl VodBrowser {
                 }
             }
             OverlayResult::Chosen(Action::SortMenu) => self.sort_menu(ctx),
+            OverlayResult::Confirmed(token) => {
+                if self.marks.confirmed(ctx, token) {
+                    self.cats.filter.clear();
+                    self.refilter_cats(ctx);
+                }
+            }
+            OverlayResult::Cancelled(token) => self.marks.cancelled(token),
             OverlayResult::Chosen(a) => {
                 if self.pane == Pane::Categories {
                     self.category_action(ctx, a);
@@ -835,7 +902,6 @@ impl VodBrowser {
                     }
                 }
             }
-            _ => {}
         }
     }
 
@@ -937,43 +1003,53 @@ impl VodBrowser {
         let groups: HashMap<GroupId, &crate::model::Group> = self.groups(ctx).into_iter().map(|g| (g.id, g)).collect();
         let virtual_names = [self.virtual_name(Cat::All), self.virtual_name(Cat::Continue), self.virtual_name(Cat::Favourites)];
         let total = self.all(ctx).len();
-        let outcome = virtual_list(ui, theme, ("vod-cats", self.movies), &mut self.cats, row_h, |ui, rc| {
-            let cat = rows_snapshot[rc.index];
-            let state = RowState::from_flags(focused && rc.state.is_cursor(), cat == open);
-            let group = match cat {
-                Cat::Group(g) => groups.get(&g).copied(),
-                _ => None,
-            };
-            match group {
-                Some(g) => rows::group_row(ui, theme, g, state),
-                None => {
-                    let name = match cat {
-                        Cat::All => virtual_names[0],
-                        Cat::Continue => virtual_names[1],
-                        _ => virtual_names[2],
-                    };
-                    let (icon, detail) = match cat {
-                        Cat::All => (glyphs::FILMSTRIP, Some(total.to_string())),
-                        Cat::Continue => (glyphs::HISTORY, None),
-                        _ => (glyphs::FAVOURITE, None),
-                    };
-                    let r = rows::menu_row(ui, theme, Some(icon), name, None, false, state);
-                    if let Some(d) = detail {
-                        ui.painter().text(
-                            egui::pos2(r.rect.right() - theme.space(SpaceToken::Lg), r.rect.center().y),
-                            egui::Align2::RIGHT_CENTER,
-                            d,
-                            egui::FontId::proportional(theme.font(TypeToken::Body)),
-                            theme.tokens.text_secondary,
-                        );
+        let footer = self.marks.footer(self.cats.filter.is_active(), rows_snapshot.iter().filter(|c| matches!(c, Cat::Group(_))).count());
+        let (marks, tags, movies, cats) = (&self.marks, &self.tags.1, self.movies, &mut self.cats);
+        let outcome = group_marks::with_footer(ui, theme, footer.as_deref(), |ui| {
+            virtual_list(ui, theme, ("vod-cats", movies), cats, row_h, |ui, rc| {
+                let cat = rows_snapshot[rc.index];
+                let state = RowState::from_flags(focused && rc.state.is_cursor(), cat == open);
+                let group = match cat {
+                    Cat::Group(g) => groups.get(&g).copied(),
+                    _ => None,
+                };
+                match group {
+                    Some(g) => rows::group_row_decor(
+                        ui,
+                        theme,
+                        g,
+                        state,
+                        rows::GroupDecor { marked: marks.is_marked(g.id), tag: tags.get(&g.id).map(String::as_str) },
+                    ),
+                    None => {
+                        let name = match cat {
+                            Cat::All => virtual_names[0],
+                            Cat::Continue => virtual_names[1],
+                            _ => virtual_names[2],
+                        };
+                        let (icon, detail) = match cat {
+                            Cat::All => (glyphs::FILMSTRIP, Some(total.to_string())),
+                            Cat::Continue => (glyphs::HISTORY, None),
+                            _ => (glyphs::FAVOURITE, None),
+                        };
+                        let r = rows::menu_row(ui, theme, Some(icon), name, None, false, state);
+                        if let Some(d) = detail {
+                            ui.painter().text(
+                                egui::pos2(r.rect.right() - theme.space(SpaceToken::Lg), r.rect.center().y),
+                                egui::Align2::RIGHT_CENTER,
+                                d,
+                                egui::FontId::proportional(theme.font(TypeToken::Body)),
+                                theme.tokens.text_secondary,
+                            );
+                        }
+                        if cat == Cat::Favourites {
+                            // provider categories follow (DESIGN §13.5 separator)
+                            ui.painter().hline(r.rect.x_range(), r.rect.bottom() - 0.5, egui::Stroke::new(1.0, theme.tokens.group_divider));
+                        }
+                        r
                     }
-                    if cat == Cat::Favourites {
-                        // provider categories follow (DESIGN §13.5 separator)
-                        ui.painter().hline(r.rect.x_range(), r.rect.bottom() - 0.5, egui::Stroke::new(1.0, theme.tokens.group_divider));
-                    }
-                    r
                 }
-            }
+            })
         });
         match outcome {
             ListOutcome::Moved => {
@@ -1403,6 +1479,34 @@ mod tests {
                 .iter()
                 .any(|r| r.item.kind == ItemKind::Movie && r.ov.hidden)
         });
+    }
+
+    /// DESIGN §28.7 in the categories pane: Space marks (and moves down), Ctrl+H hides every
+    /// marked category; Esc clears the marks first.
+    #[test]
+    fn categories_bulk_hide() {
+        let (mut t, one) = rig();
+        two_categories(&mut t);
+        let mut h = harness(t, one, MoviesScreen::default(), egui::vec2(1400.0, 900.0));
+        h.state_mut().enter(Route::Movies { group: None });
+        h.run_steps(2);
+        h.state_mut().act(Action::FocusNext);
+        for _ in 0..3 {
+            h.state_mut().act(Action::Down);
+        }
+        // Movies, then Drama
+        h.state_mut().act(Action::ToggleMark);
+        h.state_mut().act(Action::ToggleMark);
+        h.run_steps(1);
+        assert!(has_label(&h, "2 marked · Ctrl+H hides · Esc clears"));
+        assert!(h.state_mut().act(Action::Back), "Esc clears the marks");
+        h.run_steps(1);
+        assert!(!has_label(&h, "2 marked · Ctrl+H hides · Esc clears"));
+        h.state_mut().act(Action::Up);
+        h.state_mut().act(Action::ToggleMark);
+        h.state_mut().act(Action::ToggleMark);
+        h.state_mut().act(Action::ToggleHidden);
+        until(&mut h, "both hidden", |h| ["movie:movies", "movie:drama"].iter().all(|k| group_ov(&h.state().t, k).is_some_and(|o| o.hidden)));
     }
 
     /// DESIGN §12.1 density: 4–5 columns at a tiled half (the categories in a drawer), 7+ at

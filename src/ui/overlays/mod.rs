@@ -6,6 +6,7 @@
 //! (2 px border; popups use the accent border); opens centred, grows downward only once
 //! typing starts (launcher idiom).
 
+pub mod categories;
 pub mod dialogs;
 pub mod edit_item;
 pub mod help;
@@ -131,5 +132,6 @@ pub fn build(req: OverlayRequest, _ctx: &mut UiCtx<'_>) -> Box<dyn Overlay> {
         OverlayRequest::Resume(spec) => Box::new(resume::ResumeOverlay::new(spec)),
         OverlayRequest::Tracks { audio } => Box::new(tracks::TracksOverlay::new(audio)),
         OverlayRequest::EditItem(item) => Box::new(edit_item::EditItemOverlay::new(item)),
+        OverlayRequest::Categories(source) => Box::new(categories::CategoriesOverlay::new(source)),
     }
 }

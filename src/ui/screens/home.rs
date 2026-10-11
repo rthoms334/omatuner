@@ -214,12 +214,6 @@ pub(crate) mod kit {
         ctx.toast(Toast::info(if on { format!("Locked {}", g.display_name()) } else { format!("Unlocked {}", g.display_name()) }));
     }
 
-    /// Ctrl+H on a category (Settings ▸ Hidden items shows it again).
-    pub(crate) fn hide_group(ctx: &mut UiCtx<'_>, g: &Group) {
-        edit_group_override(ctx, g, |ov| ov.hidden = true);
-        ctx.toast(Toast::info(format!("Hid {} — Settings ▸ Hidden items shows it again", g.display_name())));
-    }
-
     /// Ctrl+H on an item (Settings ▸ Hidden items shows it again).
     pub(crate) fn hide_item(ctx: &mut UiCtx<'_>, item: &ItemRef, name: &str) {
         let write_item = item.clone();
