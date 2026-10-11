@@ -2256,6 +2256,8 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Esc` | Back |
 | `/` | Search everything |
 | `?` | Keyboard help |
+| `Space` | Fan out / fold the copies of a stack |
+| `Ctrl+O` | Play from another copy… |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
 | `Ctrl+H` | Hide / unhide |
@@ -2284,6 +2286,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Ctrl+Backspace` | Delete word |
 | `Ctrl+U` / `Esc` | Clear filter |
 | `Tab` / `Shift+Tab` | Next / previous pane |
+| `Ctrl+O` | Play from another copy… |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
 | `Ctrl+H` | Hide / unhide |
@@ -2313,6 +2316,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Backspace` / `Esc` | Back |
 | `/` | Search everything |
 | `?` | Keyboard help |
+| `Ctrl+O` | Play from another copy… |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
 | `Ctrl+H` | Hide / unhide |
@@ -4024,8 +4028,9 @@ adds "Alt+P playlist" (before "help") only on those screens with two or more eli
 ### 29.8 Changes to the "playlist on cards" work it folds in
 Kept: `PlaylistOnCards`, `SourceMarks` (now `for_view(mode, sources, kind, all)`), the coloured
 name on the meta line, `TileDecor.source`, `paint_source_chip`, the detail badge (now on
-Xtream pages too). Deferred to P2 (they need matched copies): `SourceSet` / several chips per
-card, the stack edge and `+1` counts, `DetailHeader` copies and "also in TV".
+Xtream pages too). Done in P2 (§29.14), differently: the stack card names its playlists on the
+meta line (`TileDecor.stack`, no `SourceSet`), the stack edges and copy count, `+1` inside one
+playlist, and the detail pages' Copies section instead of `DetailHeader` copies.
 
 ### 29.9 Tests
 `ui::scope` (eligibility, stored choice, `in_all` incl. the user's own lists, cycling,
@@ -4166,3 +4171,94 @@ fallback, stack marks), `store_catalogue` (import keys and TMDB ids, hidden vs l
 All vs the visibility hook, split surviving a refresh and its Undo, one pin per stack, a
 renamed copy re-keyed), the 0005 migration (backfill, re-run), Xtream list / info TMDB parsing.
 
+### 29.14 P2 UI: stack cards, Copies, Play from (`ui::stacks`, `screens::copies`)
+
+**Where copies combine.** Only views of everything combine, and only with Settings ▸ Interface
+▸ "Same title in several playlists" on **Combine** (`interface.same_title`, default; "Show each
+copy" turns every copy back into its own card everywhere, no rebuild):
+
+| View | One card per stack | Notes |
+|---|---|---|
+| Movies / Series, scope All | All, every category, Continue watching, Favourites | `ui::stacks::collapse`: the stack's place is where its first copy comes in the list (the sort holds); the card is the stack's **top** when the list has it, else the list's own copy (unlocked first) — a playlist's category shows its own copy, Favourites the favourite one |
+| Movies / Series, one playlist | never | a title also in other playlists gets one card edge and `+1` on the meta line (tooltip "Also in TV"); playlists out of All have no stacks, so no `+1` |
+| Home | Recently added, Recently updated series (renamed: it sorts on the provider's date), favourites rails, Continue watching | top copy; the copy played last; the first favourite copy |
+| Search | Movies and Series hits | the best-matching copy, a chip per playlist of the stack (`[● TV] [● TV 2]`; none with one playlist) |
+
+**Stack card** (`widgets::poster`, `TileDecor.stack`): two card edges offset down-right behind the
+poster (the card keeps its footprint), a copy-count badge bottom-right above the progress bar,
+and the meta line `TV + TV 2 · 2021` (each name in its colour; `TV +1` when it doesn't fit,
+`TV +2` with three playlists). "Playlist on cards: Never" drops the names, not the edges or the
+count. ★ / ✓ / progress / lock follow `stacks::stack_marks`: progress of the copy played last,
+the lock (and the disabled look: dimmed poster, muted title) only when every copy is locked and
+the session is locked. Accessible label: `Dune · TV + TV 2 · 3 copies[ · locked]`.
+
+**Keys and mouse in the grid** (`[PosterGrid]`):
+
+| Input | Stack card | A copy shown fanned out |
+|---|---|---|
+| Enter / double-click | the page of the card's copy (Copies section); every copy locked → PIN | its own page |
+| Shift+Enter | plays the copy that plays first (`ui::stacks::play_order`) | plays that copy |
+| **Space** / click the count badge | fans the copies out right after the card, in copy order, each with its language and version (`TV 2 · EN · 4K`; locked ones dimmed) | folds its stack |
+| Esc | folds every open stack first (after the category marks, before the drawer) | same |
+| Ctrl+O | "Play from…": every copy (`TV · EN · 4K`), "plays first" on the one that would; a locked one asks for the PIN | same |
+| Ctrl+F | no favourite copy: adds the copy that would play; else every favourite copy leaves Favourites (toast with **Undo**) | that copy |
+| Ctrl+W | marks the copy that would play | that copy |
+| Delete (Continue watching / Favourites) | forgets every copy's progress / takes every copy out, with Undo (the forgotten rows are read in the same write and saved back) | that copy |
+| menu | Play from…, Show each copy / Fold, … | adds "Not the same title" |
+
+Space was free in `[PosterGrid]` (the group lists' Space marks categories in `[List]`, a
+different pane), so the decision of §29.1 #4 holds; it is bound as the `Text(" ")` event like the
+marks, so while the grid is filtered it types a space instead (fold with Esc, or clear the
+filter). Ctrl+O is bound in `[PosterGrid]`, `[PosterGridFiltering]` and `[Detail]`; Ctrl+Shift+O
+stays the pop-out. `Action::Undo` is never bound: it is the action of a toast's "Undo", handled
+by the screen that showed the toast.
+
+**Detail pages** (`screens::copies::Copies`, shared by the movie and series pages): with two or
+more copies, a **Copies · N** section of mini-cards (`widgets::copy_card`) after the buttons,
+one per copy in copy order — playlist glyph + name, language and version (`EN · 4K HDR`,
+`AR-SUBS?` for a market inferred from its category), progress bar, status at the right:
+*plays first* / *always plays first* (pinned) / *locked* (dimmed while the session is locked) /
+*failed 2 h ago* (the playback hook below). Under them: "Matched by TMDB id" or "Matched by
+title and year (2021) · Not the same title? Shift+F10 on a copy".
+* **Which copy Play uses**: the one picked on the page (click, or Enter on a focused
+  mini-card; a locked one after the PIN), else on the page of the stack's top the copy that
+  plays first, else the page's own copy. The Play button names its playlist ("Resume 41:20 ·
+  TV"); a series' other copy plays its own next episode.
+* "Play from ▾" button and Ctrl+O: the copies menu as in the grid.
+* A mini-card's menu (right-click, the menu key): Play from TV 2 · Always play from TV 2 /
+  Don't always play from it (`titles::set_pin`, one pin per stack) · Not the same title
+  (`titles::set_split`, toast with Undo) · Open its page (series). The page's ⋯ menu has Play
+  from… and "Not the same title" for the page's own copy.
+* Focus: the movie page's ←/→ walk the buttons then the mini-cards; the series page has a
+  Copies section between the buttons and the season tabs (↑/↓, Tab).
+* A page whose copy left its stack because its details brought a different TMDB id says
+  "Shown on its own now: its details name another title than its other copy".
+
+**Settings.** Interface ▸ *Several playlists*: "Same title in several playlists" (Combine /
+Show each copy) and "Which copy plays first" (Playlist order / Best quality —
+`interface.copy_order`; language, pin, progress and trouble still come first). Hidden ▸ "Titles
+you split or combined" lists `titles::links` (split: "TV 2 · shown on its own · Enter combines
+it again"; pin: "TV · always plays first · Enter undoes"); Enter or the row's menu undoes.
+
+**Playback hooks (CROSS-TRACK).** The UI computes the order (`ui::stacks::play_order`: pin,
+the latest progress from Continue watching / the page's per-copy reads, `ui::stacks::trouble`,
+the movie's container from its stream) and plays the first copy with the ordinary
+`PlayerCommand::Play`. `ui::stacks::trouble` answers `None` until the player records failures
+(failed recently, account at its limit or expired); the fallback to the next copy before the
+first frame and the player's own Ctrl+O belong to the player.
+
+**Cost.** Collapsing runs when a list is rebuilt (category, sort, scope, library, setting or
+open stacks change): O(list + its stacks' copies), with a set instead of a flag per title for
+short lists (Favourites is recomputed every frame). Per frame only visible cards look at their
+stack.
+
+**Tests.** `ui::stacks` (card choice in All / a category / Favourites, fan-out order, card
+facts, labels, play order with progress, locks and the setting), Movies (stack card label and
+place, Space / badge / Esc, Ctrl+O and its pick, Show each copy, one playlist with `+1`; locked
+copies kept and drawn disabled, all-locked card asks for the PIN, a hidden copy and a copy the
+visibility hook rejects leave the stack; Favourites / Continue watching across copies with
+Undo), the movie page (mini-cards, pick, Ctrl+O, pin, split stored with Undo, a locked copy
+picked after the PIN), the series page (Copies section, the other copy's next episode, its
+page), Home (one tile per stack in every rail, Ctrl+F on a stack, Show each copy), Search (one
+row with both playlists), Settings (split / pin list with Undo, the two choices), keymap
+(Space and Ctrl+O per context), `copies` (containers).

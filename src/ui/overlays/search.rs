@@ -26,6 +26,10 @@
 //!   instead).
 //! * Rows are rebuilt only when the query, section, lock state or library change, or when
 //!   the fuzzy matcher / the guide search report new results — not every frame.
+//! * Copies of one movie or series (DESIGN §29.14, while Settings ▸ Interface ▸ "Same title in
+//!   several playlists" is Combine) are one row — the best-matching copy — with a chip per
+//!   playlist of its stack (`[● TV] [● TV 2]`; no chips with one playlist). Enter opens that
+//!   copy's page (Copies section there); Shift+Enter plays the copy that plays first.
 
 use std::cell::Cell;
 use std::sync::Arc;
@@ -36,10 +40,12 @@ use eframe::egui::{self, Align2, Rect, RichText};
 use super::dialogs::{card_area, scrim, with_close};
 use super::{ContextMenuSpec, MenuItem, Overlay, OverlayOutcome, OverlayResult};
 use crate::keymap::{Action, KeyContext};
+use crate::model::SourceId;
 use crate::model::{ItemKind, ItemRef, MediaRef, PlayOrigin, ProgrammeHit, ProgrammeSlim, VodKind};
 use crate::search::{EpgSearch, SearchHit, SearchIndex, SearchSection, SearchTarget};
 use crate::theme::{SpaceToken, TypeToken};
 use crate::ui::screens::home::{kit, vod_ref};
+use crate::ui::stacks as st;
 use crate::ui::widgets::badge::{InlineBadge, job_with_quality};
 use crate::ui::widgets::button::{ButtonStyle, button};
 use crate::ui::widgets::card::CardKind;
@@ -86,6 +92,8 @@ pub struct SearchOverlay {
     epg_query: String,
     /// Rows the user sees (actions resolve against them).
     rows: Vec<Row>,
+    /// The playlists of a row that stands for a stack of copies (by row index).
+    chips: std::collections::HashMap<usize, Vec<SourceId>>,
     /// (query, section, session unlocked, library build) the rows were built for.
     rows_key: Option<(String, SearchSection, bool, crate::model::Timestamp)>,
     /// Set by the guide search when new results landed (rows must be rebuilt).
@@ -105,6 +113,7 @@ impl SearchOverlay {
             epg: None,
             epg_query: String::new(),
             rows: Vec::new(),
+            chips: Default::default(),
             rows_key: None,
             epg_dirty: Arc::default(),
             top: None,
@@ -158,6 +167,18 @@ impl SearchOverlay {
                     if !kit::play_channel(ctx, id, None, PlayOrigin::Search) {
                         locked_toast(ctx);
                         return OverlayOutcome::Keep;
+                    }
+                    OverlayOutcome::Close
+                }
+                // a stack: the copy that plays first (DESIGN §29.12)
+                SearchTarget::Movie(_) | SearchTarget::Series(_) if alt && first_copy(ctx, h.item.target).is_some() => {
+                    match first_copy(ctx, h.item.target) {
+                        Some(VodKind::Movie(id)) => crate::ui::screens::movie_detail::play_movie(ctx, id),
+                        Some(VodKind::Series(id)) => {
+                            let name = ctx.lib.vod.find(VodKind::Series(id)).map(|v| v.name.to_string()).unwrap_or_default();
+                            crate::ui::screens::movies::play_series(ctx, id, &name)
+                        }
+                        None => {}
                     }
                     OverlayOutcome::Close
                 }
@@ -401,10 +422,13 @@ impl SearchOverlay {
 
     fn build_rows(&mut self, ctx: &UiCtx<'_>) {
         let mut rows = Vec::new();
+        self.chips.clear();
         if self.query.trim().is_empty() {
             self.rows = rows;
             return;
         }
+        // one row per stack: its best-matching copy (DESIGN §29.14)
+        let mut seen = std::collections::HashSet::new();
         let hits = ctx
             .search_index
             .as_ref()
@@ -417,9 +441,24 @@ impl SearchOverlay {
                 SearchTarget::Movie(_) => "Movies",
                 SearchTarget::Series(_) => "Series",
             };
+            let vod = match h.item.target {
+                SearchTarget::Movie(id) => Some(VodKind::Movie(id)),
+                SearchTarget::Series(id) => Some(VodKind::Series(id)),
+                SearchTarget::Channel(_) => None,
+            };
+            let stack = vod.and_then(|k| st::stack_of_kind(ctx.lib, ctx.config, k).map(|s| (st::is_movie(k), s)));
+            if let Some(key) = stack
+                && !seen.insert(key)
+            {
+                continue;
+            }
             if self.section == SearchSection::All && last != Some(header) {
                 rows.push(Row::Header(header));
                 last = Some(header);
+            }
+            if let Some((movies, s)) = stack {
+                let stacks = ctx.lib.vod.stacks(movies);
+                self.chips.insert(rows.len(), st::playlists_of(stacks, stacks.members(s), st::all(ctx.lib, movies)));
             }
             rows.push(Row::Hit(h));
         }
@@ -616,12 +655,12 @@ impl Overlay for SearchOverlay {
                     paint_row_state(ui.painter(), rect, theme, if is_cursor { RowState::Cursor } else { RowState::Idle });
                     match row {
                         Row::Hit(h) => {
-                            let label = crate::ui::widgets::badge::label_with_source(
-                                &h.item.name,
-                                ctx.source_of(h.item.target.item_kind(), h.item.source_id),
-                            );
+                            let playlists = self.chips.get(&i).cloned().unwrap_or_else(|| vec![h.item.source_id]);
+                            let kind = h.item.target.item_kind();
+                            let names: Vec<&str> = playlists.iter().filter_map(|p| ctx.source_of(kind, *p)).map(|s| s.name.as_str()).collect();
+                            let label = if names.is_empty() { h.item.name.to_string() } else { format!("{} · {}", h.item.name, names.join(" · ")) };
                             resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
-                            paint_hit(ui, ctx, rect, h, is_cursor);
+                            paint_hit(ui, ctx, rect, h, &playlists, is_cursor);
                         }
                         Row::Guide(g) => {
                             resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &*g.programme.title));
@@ -662,8 +701,9 @@ impl Overlay for SearchOverlay {
     }
 }
 
-/// `[logo] BBC One HD  [󰐹 My IPTV]   News at Eight · 20:00   ▕██░▏` (name highlighted).
-fn paint_hit(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, h: &SearchHit, cursor: bool) {
+/// `[logo] BBC One HD  [󰐹 My IPTV]   News at Eight · 20:00   ▕██░▏` (name highlighted);
+/// a stack of copies gets a chip per playlist (`playlists`, in playlist order).
+fn paint_hit(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, h: &SearchHit, playlists: &[SourceId], cursor: bool) {
     let theme = ctx.theme;
     let t = &theme.tokens;
     let pad = theme.space(SpaceToken::Lg);
@@ -706,8 +746,9 @@ fn paint_hit(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, h: &SearchHit, 
             }
         }
     }
-    // the playlist, with several (Settings ▸ Interface ▸ Playlist on cards, DESIGN §13.0)
-    if let Some(src) = ctx.source_of(h.item.target.item_kind(), h.item.source_id) {
+    // the playlist, with several (Settings ▸ Interface ▸ Playlist on cards, DESIGN §13.0); one
+    // chip per playlist of a stack, the first leftmost
+    for src in playlists.iter().rev().filter_map(|p| ctx.source_of(h.item.target.item_kind(), *p)) {
         let glyph = crate::ui::widgets::badge::source_glyph(src);
         let text = format!("{glyph} {}", src.name);
         let color = theme.source_color(src.color);
@@ -782,6 +823,20 @@ fn paint_guide(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, g: &Programme
     };
     let g = elided(p, &title, egui::FontId::proportional(theme.font(TypeToken::Title)), c, (right - left).max(0.0));
     p.galley(egui::pos2(left, y - g.size().y / 2.0), g, c);
+}
+
+/// The copy of a stacked hit that plays first (`None`: no stack, or every copy is locked).
+fn first_copy(ctx: &UiCtx<'_>, target: SearchTarget) -> Option<VodKind> {
+    let kind = match target {
+        SearchTarget::Movie(id) => VodKind::Movie(id),
+        SearchTarget::Series(id) => VodKind::Series(id),
+        SearchTarget::Channel(_) => return None,
+    };
+    let movies = st::is_movie(kind);
+    let s = st::stack_of_kind(ctx.lib, ctx.config, kind)?;
+    let copies = ctx.lib.vod.stacks(movies).members(s).to_vec();
+    let order = st::play_order(ctx.lib, ctx.config, movies, &copies, kit::unlocked(ctx), |_| None, |_| None);
+    order.first().and_then(|c| st::all(ctx.lib, movies).get(*c as usize)).map(|v| v.kind)
 }
 
 /// A locked hit (the session relocked while the card was open): a PIN prompt from here would
@@ -902,6 +957,32 @@ mod tests {
         let cfg = app.t.config.clone();
         assert!(app.t.parental.unlock("1234", &cfg.parental));
         until_ov(&mut h, "the unlocked channel", |h| has_label(h, "Channel 2"));
+    }
+
+    /// Copies of one movie in two playlists (DESIGN §29.14) are one row naming both playlists;
+    /// Enter opens the matched copy's page; with "Show each copy" every copy is its own row.
+    #[test]
+    fn copies_are_one_row_with_a_chip_per_playlist() {
+        let (mut t, one) = rig();
+        let ids = seed(&mut t, |c| {
+            let a = testkit::source(c, "Alpha")?;
+            let b = testkit::source(c, "Bravo")?;
+            let ids = testkit::named_movies(c, a, &[("EN ★ Dune - 2021", "Dune"), ("EN ★ Heat - 1995", "Heat")])?;
+            testkit::named_movies(c, b, &[("EN - Dune (2021)", "Dune")])?;
+            Ok(ids)
+        });
+        let mut h = overlay_harness(t, one, SearchOverlay::new("dune".into()), egui::vec2(1000.0, 900.0));
+        until_ov(&mut h, "results", |h| has_label(h, "Dune · Alpha · Bravo"));
+        let hits = h.state().o.rows.iter().filter(|r| matches!(r, Row::Hit(_))).count();
+        assert_eq!(hits, 1, "one row for both copies");
+        assert_eq!(h.state_mut().act(Action::Activate), "Close");
+        assert_eq!(h.state_mut().nav(), vec![NavRequest::Push(Route::MovieDetail(ids[0]))]);
+        // every copy its own row
+        let mut c = (*h.state().t.config).clone();
+        c.interface.same_title = crate::config::SameTitle::ShowEach;
+        h.state_mut().t.config = Arc::new(c);
+        h.state_mut().o = SearchOverlay::new("dune".into());
+        until_ov(&mut h, "each copy", |h| has_label(h, "Dune · Alpha") && has_label(h, "Dune · Bravo"));
     }
 
     /// The item shortcuts Help lists for `[Search]` act on the highlighted hit; a hit that is

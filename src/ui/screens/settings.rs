@@ -26,6 +26,11 @@
 //! show" picker); Hidden lists what the filter hides per playlist and tag (Enter shows the
 //! tag, → lists its categories, Enter on one shows just it), then only what the user hid
 //! themselves (a filtered playlist would otherwise flood those lists).
+//!
+//! Several playlists (DESIGN §29.14): Interface ▸ "Same title in several playlists"
+//! (Combine / Show each copy) and "Which copy plays first" (Playlist order / Best quality);
+//! Hidden ▸ "Titles you split or combined" lists the copies taken out of their stack ("Not the
+//! same title") and the "Always play from" pins — Enter undoes one.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -33,7 +38,9 @@ use std::path::PathBuf;
 use eframe::egui::{self, RichText};
 
 use super::home::kit::{self, Loader};
-use crate::config::{Config, Density, IdleInhibitMode, PlaylistOnCards, PopoutCorner, PopoutSize, SidebarMode, StartScreen, SubtitleAuto};
+use crate::config::{
+    Config, CopyOrder, Density, IdleInhibitMode, PlaylistOnCards, PopoutCorner, PopoutSize, SameTitle, SidebarMode, StartScreen, SubtitleAuto,
+};
 use crate::jobs::{JobEvent, JobKind, JobOutcome, Submitted};
 use crate::keymap::{Action, KeyContext};
 use crate::model::{
@@ -43,6 +50,7 @@ use crate::model::{
 use crate::msg::{AppEvent, DataScope, Toast};
 use crate::platform::{PickPurpose, PlatformEvent};
 use crate::store::backup::{BackupOptions, RestoreMode};
+use crate::store::titles::{LinkAction, TitleLink};
 use crate::store::user::Orphan;
 use crate::theme::{SpaceToken, Theme, TypeToken};
 use crate::ui::overlays::categories::{self, tag_name};
@@ -277,6 +285,23 @@ static IFACE_C: [CfgChoice; 9] = [
     },
 ];
 const PLAYLIST_ON_CARDS: [PlaylistOnCards; 3] = [PlaylistOnCards::Auto, PlaylistOnCards::Always, PlaylistOnCards::Never];
+const SAME_TITLE: [SameTitle; 2] = [SameTitle::Combine, SameTitle::ShowEach];
+const COPY_ORDER: [CopyOrder; 2] = [CopyOrder::PlaylistOrder, CopyOrder::BestQuality];
+/// Copies of one title in several playlists (DESIGN §29.14).
+static STACK_C: [CfgChoice; 2] = [
+    CfgChoice {
+        label: "Same title in several playlists",
+        options: &["Combine", "Show each copy"],
+        get: |c| pos(&SAME_TITLE, &c.interface.same_title),
+        set: |c, i| c.interface.same_title = SAME_TITLE[i],
+    },
+    CfgChoice {
+        label: "Which copy plays first",
+        options: &["Playlist order", "Best quality"],
+        get: |c| pos(&COPY_ORDER, &c.interface.copy_order),
+        set: |c, i| c.interface.copy_order = COPY_ORDER[i],
+    },
+];
 static IFACE_T: [CfgToggle; 13] = [
     toggle_row!("Channel numbers", interface.show_channel_numbers),
     toggle_row!("Channel logos", interface.show_logos),
@@ -352,6 +377,8 @@ enum Item {
     Categories(SourceId),
     HiddenChannel(ChannelId),
     HiddenVod(ItemRef),
+    /// A copy split off its stack, or pinned in it (DESIGN §29.14).
+    TitleLink(ItemRef, LinkAction),
     Orphan(ItemRef),
     /// Index into the attach view's candidates (rebuilt only by its own filter).
     AttachTarget(usize),
@@ -699,6 +726,9 @@ pub struct SettingsScreen {
     orphans_loader: Option<Loader<Vec<Orphan>>>,
     hidden_items: Vec<(ItemRef, String)>,
     hidden_loader: Option<Loader<Vec<(ItemRef, String)>>>,
+    /// Hidden ▸ "Titles you split or combined".
+    title_links: Vec<TitleLink>,
+    links_loader: Option<Loader<Vec<TitleLink>>>,
     editor: Option<SourceEditor>,
     attach: Option<Attach>,
     new_epg_url: String,
@@ -772,7 +802,10 @@ impl SettingsScreen {
             SettingsPage::Epg => self.epg_loader = Some(Loader::start(ctx, load_guides)),
             SettingsPage::Reminders => self.reminders_loader = Some(Loader::start(ctx, crate::store::user::all_reminders)),
             SettingsPage::Orphans => self.orphans_loader = Some(Loader::start(ctx, crate::store::user::orphans)),
-            SettingsPage::Hidden => self.hidden_loader = Some(Loader::start(ctx, load_hidden_vod)),
+            SettingsPage::Hidden => {
+                self.hidden_loader = Some(Loader::start(ctx, load_hidden_vod));
+                self.links_loader = Some(Loader::start(ctx, crate::store::titles::links));
+            }
             _ => {}
         }
     }
@@ -951,6 +984,13 @@ impl SettingsScreen {
                 v.push(Row::Section("Sorting".into()));
                 v.extend(IFACE_C[3..6].iter().map(Row::Choice));
                 v.push(Row::Toggle(&IFACE_T[10]));
+                v.push(Row::Section("Several playlists".into()));
+                v.extend(STACK_C.iter().map(Row::Choice));
+                v.push(Row::Note(
+                    "In All playlists, copies of one movie or series are one card; your audio language plays first. Space on a card shows each copy."
+                        .into(),
+                    false,
+                ));
                 v.push(Row::Section("Look".into()));
                 v.push(Row::Toggle(&IFACE_T[6]));
                 v.push(Row::Text(&IFACE_TEXT[0]));
@@ -1060,6 +1100,20 @@ impl SettingsScreen {
                 }
                 for (r, name) in &self.hidden_items {
                     v.push(item(Item::HiddenVod(r.clone()), glyphs::HIDDEN, name.clone(), Some("Enter unhides".into())));
+                }
+                // DESIGN §29.14: "Not the same title" and "Always play from"
+                v.push(Row::Section("Titles you split or combined".into()));
+                if self.title_links.is_empty() && self.links_loader.is_none() {
+                    v.push(Row::Note("Nothing changed — “Not the same title” on a copy of a movie or series shows it on its own.".into(), false));
+                }
+                for l in &self.title_links {
+                    let playlist = ctx.lib.source(l.item.source).map(|s| s.name.clone()).unwrap_or_else(|| "a removed playlist".into());
+                    let name = l.name.clone().unwrap_or_else(|| l.item.key.to_string());
+                    let (icon, detail) = match l.action {
+                        LinkAction::Split => (glyphs::CLOSE, format!("{playlist} · shown on its own · Enter combines it again")),
+                        LinkAction::Pin => (glyphs::FAVOURITE, format!("{playlist} · always plays first · Enter undoes")),
+                    };
+                    v.push(item(Item::TitleLink(l.item.clone(), l.action), icon, name, Some(detail)));
                 }
             }
             SettingsPage::Orphans => {
@@ -1781,6 +1835,19 @@ impl SettingsScreen {
                 self.hidden_items.retain(|(x, _)| *x != r);
                 self.unhide_item(ctx, Some(r));
             }
+            Item::TitleLink(r, action) => {
+                self.title_links.retain(|l| !(l.item == r && l.action == action));
+                let now = ctx.now;
+                let write = r.clone();
+                let _ = ctx.services.store.writer().submit_notify(DataScope::Overrides, move |c| match action {
+                    LinkAction::Split => crate::store::titles::set_split(c, &write, false, now),
+                    LinkAction::Pin => crate::store::titles::set_pin(c, &write, &[], false, now),
+                });
+                ctx.toast(Toast::info(match action {
+                    LinkAction::Split => "Combined again",
+                    LinkAction::Pin => "Plays from the best copy again",
+                }));
+            }
             Item::Orphan(r) => self.start_attach(ctx, &r),
             Item::AttachTarget(i) => self.attach_to(ctx, i),
             Item::Reminder(_) => self.item_menu(ctx, item),
@@ -1926,6 +1993,7 @@ impl SettingsScreen {
             Item::HiddenGroup(_) | Item::HiddenChannel(_) | Item::HiddenVod(_) | Item::HiddenTag(..) => {
                 ("Hidden".into(), vec![mi(glyphs::CHECK, "Unhide", MENU_TOGGLE)])
             }
+            Item::TitleLink(..) => ("Title".into(), vec![mi(glyphs::CHECK, "Undo", MENU_TOGGLE)]),
             Item::AttachTarget(_) | Item::Categories(_) => return,
         };
         self.pending = Some(Pending::Menu(item));
@@ -1997,9 +2065,10 @@ impl SettingsScreen {
                     token,
                 }));
             }
-            (item @ (Item::HiddenGroup(_) | Item::HiddenChannel(_) | Item::HiddenVod(_) | Item::HiddenTag(..)), MENU_TOGGLE) => {
-                self.item_default(ctx, item)
-            }
+            (
+                item @ (Item::HiddenGroup(_) | Item::HiddenChannel(_) | Item::HiddenVod(_) | Item::HiddenTag(..) | Item::TitleLink(..)),
+                MENU_TOGGLE,
+            ) => self.item_default(ctx, item),
             _ => {}
         }
     }
@@ -2604,6 +2673,12 @@ impl SettingsScreen {
             match r {
                 Ok(v) => self.hidden_items = v,
                 Err(e) => kit::error_toast(ctx, "Couldn't read hidden items", &e),
+            }
+        }
+        if let Some(r) = kit::poll(&mut self.links_loader) {
+            match r {
+                Ok(v) => self.title_links = v,
+                Err(e) => kit::error_toast(ctx, "Couldn't read the titles you split", &e),
             }
         }
     }
@@ -3621,6 +3696,45 @@ mod tests {
         h.run_steps(1);
         assert_eq!(stored(&h), 0, "not written per press");
         until(&mut h, "saved after the presses settle", |h| stored(h) == 45);
+    }
+
+    /// DESIGN §29.14: Hidden ▸ "Titles you split or combined" lists the copies taken out of
+    /// their stack and the pinned ones; Enter undoes one (stored at once). Interface ▸ "Same
+    /// title in several playlists" switches between Combine and Show each copy.
+    #[test]
+    fn split_and_pinned_titles_are_listed_with_undo_and_the_combine_setting() {
+        use crate::store::titles::{LinkAction, links, set_pin, set_split};
+        let (mut t, one) = rig();
+        seed(&mut t, |c| {
+            let a = testkit::source(c, "Alpha")?;
+            let b = testkit::source(c, "Bravo")?;
+            testkit::named_movies(c, a, &[("EN ★ Dune - 2021", "Dune"), ("EN ★ Heat - 1995", "Heat")])?;
+            testkit::named_movies(c, b, &[("EN - Dune (2021)", "Dune (Bravo)"), ("EN - Heat (1995)", "Heat (Bravo)")])?;
+            let r = |s: SourceId, i: usize| ItemRef { source: s, kind: ItemKind::Movie, key: ItemKey(format!("m3u:named{i:04}")) };
+            set_split(c, &r(b, 0), true, 5)?;
+            set_pin(c, &r(a, 1), &[r(b, 1)], true, 6)
+        });
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 900.0));
+        h.state_mut().enter(Route::Settings(SettingsPage::Hidden));
+        until(&mut h, "the titles", |h| has_label(h, "Dune (Bravo)") && has_label(h, "Heat"));
+        assert!(has_label(&h, "TITLES YOU SPLIT OR COMBINED"));
+        assert!(testkit::has_label_containing(&h, "Bravo · shown on its own") && testkit::has_label_containing(&h, "Alpha · always plays first"));
+        focus(&mut h, "Dune (Bravo)");
+        h.state_mut().act(Action::Activate);
+        let stored = |h: &H| links(&h.state().t.services().store.reader().unwrap()).unwrap();
+        until(&mut h, "combined again", |h| stored(h).iter().all(|l| l.action != LinkAction::Split));
+        assert_eq!(stored(&h).len(), 1, "the pin stays");
+        // Interface: Combine → Show each copy
+        h.state_mut().enter(Route::Settings(SettingsPage::Interface));
+        h.run_steps(1);
+        focus(&mut h, "Same title in several playlists");
+        h.state_mut().act(Action::Right);
+        h.state_mut().apply_config();
+        assert_eq!(h.state().t.config.interface.same_title, crate::config::SameTitle::ShowEach);
+        focus(&mut h, "Which copy plays first");
+        h.state_mut().act(Action::Right);
+        h.state_mut().apply_config();
+        assert_eq!(h.state().t.config.interface.copy_order, crate::config::CopyOrder::BestQuality);
     }
 
     #[test]
