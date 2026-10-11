@@ -1,14 +1,18 @@
 # Maintainer: Robert Thomson
-# Arch / Omarchy package for Tuner, built from this checkout (no download of the app itself):
+# Arch / Omarchy package for Tuner (repository and package "omatuner"; the app, its command
+# `tuner`, desktop entry, icon and app id stay "tuner"), built from this checkout (no download of
+# the app itself):
 #   cd packaging && makepkg -si
+# The release workflow (.github/workflows/release.yml) builds this same PKGBUILD for x86_64 and
+# aarch64 and attaches the packages to the GitHub Release.
 # Cargo's build output goes to packaging/src/target, so makepkg's RUSTFLAGS don't invalidate the
 # developer's own target/ directory.
-pkgname=tuner
+pkgname=omatuner
 pkgver=0.1.0
 pkgrel=1
 pkgdesc="Keyboard-first IPTV player for Omarchy (M3U, Xtream, XMLTV, catch-up)"
 arch=('x86_64' 'aarch64')
-url="https://example.invalid/tuner"
+url="https://github.com/rthoms334/omatuner"
 license=('GPL-3.0-or-later')
 # Linked: libmpv (client API >= 2.5, mpv >= 0.38) and liblzma (xz). Loaded at runtime:
 # libwayland-client, libxkbcommon, libEGL/libGL (mesa). fontconfig for fc-match/fc-list; the
@@ -44,7 +48,9 @@ prepare() {
   fi
   local _version
   _version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
-  if [[ $_version != "$pkgver" ]]; then
+  # A pre-release build (release.yml) appends its tag's suffix, e.g. 0.1.0rc4 for v0.1.0-rc4,
+  # which pacman orders before 0.1.0.
+  if [[ $pkgver != "$_version" && $pkgver != "$_version"[a-z]* ]]; then
     error "pkgver ($pkgver) does not match Cargo.toml ($_version)"
     return 1
   fi
@@ -56,6 +62,9 @@ build() {
   cd "$_srcdir"
   _cflags
   export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR="$srcdir/target"
+  # Generated sources (e.g. glutin_egl_sys's bindings) live under $srcdir/target; keep the build
+  # directory out of the binary's panic locations and line tables.
+  export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=$srcdir=/usr/src/debug/$pkgname"
   cargo build --frozen --release
 }
 
@@ -75,5 +84,5 @@ package() {
   install -Dm644 packaging/hypr/tuner.lua "$pkgdir/usr/share/tuner/hypr/tuner.lua"
   install -Dm644 packaging/omarchy/omarchy-menu.jsonc "$pkgdir/usr/share/tuner/omarchy/omarchy-menu.jsonc"
   install -Dm644 -t "$pkgdir/usr/share/doc/tuner" README.md docs/DESIGN.md docs/MANUAL_CHECKLIST.md
-  # GPL-3.0-or-later is a common SPDX licence on Arch: no licence file to install.
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
