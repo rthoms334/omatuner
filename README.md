@@ -86,6 +86,8 @@ on-screen controls, and a light theme (catppuccin-latte).
   - Aspect and zoom, stream info, and configurable skip steps.
   - Smart reconnects with clear error messages.
   - A corner mini-player, and window fullscreen.
+  - A pop-out player on Hyprland: a small video-only window that stays on screen on every
+    workspace (`o` in the player, Ctrl+Shift+O anywhere; see [Pop-out player](#pop-out-player)).
 - **Desktop:** MPRIS (media keys and the Omarchy bar's media widget), desktop notifications for
   reminders, and an idle inhibitor while video plays. It runs as a single instance and opens
   M3U files and links from the desktop.
@@ -359,8 +361,9 @@ Tuner is built for the keyboard, and everything is also clickable. The basics:
 
 - **In lists and grids, letters type into a filter** (launcher style). Vim keys work only in the
   guide, the player and Settings.
-- **`?` or F1** shows every key for the screen you're on. The status bar shows a short hint line
-  for the same screen.
+- **`?` or F1** shows every key, the screen you're on first. Type to filter it, like Omarchy's
+  keybindings menu: "ctrl+h", "f5" or "mute" narrow the list as you type, Esc clears the filter
+  and then closes. The status bar shows a short hint line for the same screen.
 - **Esc** steps out one level: filter → panel → fullscreen → player → previous screen.
 - **Alt+1…5** switch screens, and **Alt+0** or **Ctrl+,** opens Settings. **Ctrl+K** or **/**
   searches. **Ctrl+Q** quits.
@@ -386,6 +389,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Ctrl+P` | Open the player (from the mini player) |
 | `Ctrl+Shift+P` | Play / pause |
 | `Ctrl+Shift+S` | Stop playback |
+| `Ctrl+Shift+O` | Pop the player out (small, on every workspace) / back in |
 | `Ctrl+R` / `F5` | Refresh playlists & guide |
 | `Ctrl+J` | Show background tasks |
 | `F1` | Keyboard help |
@@ -609,6 +613,7 @@ The full reference is generated from `src/keymap.rs`:
 | `V` | Zoom |
 | `f` | Toggle window fullscreen |
 | `p` | Keep playing in the mini player |
+| `o` | Pop out: small window on every workspace (Hyprland) |
 | `q` | Stop and close |
 | `r` | Retry (after an error) |
 | `Ctrl+F` | Add to / remove from Favourites |
@@ -640,6 +645,7 @@ The full reference is generated from `src/keymap.rs`:
 | `V` | Zoom |
 | `f` | Toggle window fullscreen |
 | `p` | Keep playing in the mini player |
+| `o` | Pop out: small window on every workspace (Hyprland) |
 | `q` | Stop and close |
 | `r` | Retry (after an error) |
 | `Ctrl+F` | Add to / remove from Favourites |
@@ -656,6 +662,13 @@ The full reference is generated from `src/keymap.rs`:
 | `Enter` | Activate control |
 | `Tab` / `Shift+Tab` | Next / previous control |
 | `Esc` | Leave the controls |
+
+### Pop-out player (`PopOut`)
+
+| Keys | Action |
+|---|---|
+| `Esc` / `o` | Back to the full window (also double-click) |
+| `f` | Back to the full window, fullscreen |
 
 ### Channel number entry (`NumericEntry`)
 
@@ -727,6 +740,22 @@ The full reference is generated from `src/keymap.rs`:
 | `x` / `Delete` | Delete / more actions |
 | `Esc` | Back |
 | `?` | Keyboard help |
+
+### Keyboard help (`Help`)
+
+| Keys | Action |
+|---|---|
+| `↑` / `↓` | Scroll |
+| `PgUp` / `PgDn` | Page up / down |
+| `Home` / `End` | Top / bottom |
+| `Backspace` | Delete character |
+| `Ctrl+Backspace` | Delete word |
+| `Ctrl+U` | Clear filter |
+| `Esc` / `F1` | Clear the filter, then close |
+| `?` | Close (types ? while filtering) |
+| `Enter` | Close |
+| `a–z, 0–9 …` | Type to filter |
+
 <!-- keymap:end -->
 
 ## Command line
@@ -824,6 +853,33 @@ Search, Playlists & settings). Open it with `omarchy menu summon tv`.
 **Media keys:** Tuner registers `org.mpris.MediaPlayer2.tuner`, so `playerctl -p tuner
 play-pause` and Omarchy's media keys and bar widget work, also while the window is hidden.
 
+### Pop-out player
+
+Press `o` in the player, or Ctrl+Shift+O anywhere, to pop the player out: Tuner floats its
+window, makes it small (16:9), puts it in a corner and **pins** it, so it stays on screen on
+every workspace you switch to. The window then shows only the video. Moving the mouse over it,
+or pressing a key, shows a short strip with the channel, what's on and the volume. All player
+keys keep working: ↑/↓ zap, Space pauses, `m` mutes, `+`/`-` set the volume, `c` lists the
+channels. Press Esc or `o`, or double-click the video, to put the window back where it was
+(tiled, on the workspace you are on now); `f` puts it back and goes fullscreen, `p` puts it
+back with the mini player and `q` stops and puts it back. A movie that ends while popped out
+leaves the pop-out where it is ("Nothing playing"); its page is waiting when you come back.
+
+- Move it with Super+drag, resize it with Super+right-drag.
+- Settings ▸ Player ▸ *Pop-out (Hyprland)* picks the size (Small 480 × 270 or Medium
+  640 × 360) and the corner (bottom right by default). If you move or resize the pop-out, it
+  comes back there next time; changing either setting resets that. An unmoved pop-out always
+  goes to the corner (on whichever monitor the window is on).
+- **Super+O** (Omarchy's *Pop window out*) works too: while something plays, a pinned Tuner
+  window at Omarchy's pop size (1300 × 900) or smaller switches to the video-only player by
+  itself, and Esc or `o` puts it back. A bigger pinned window, or nothing playing, keeps the
+  full interface.
+- The pop-out is tagged `pop` like Omarchy's own, so it gets the same look.
+- It needs Hyprland. Elsewhere the key only says so.
+- Install the packaged window rules (`hypr/tuner.lua`, above) for the pop-out too: without them
+  Omarchy draws unfocused windows at 96 % opacity, so the page behind shows through the video.
+  They also keep video rendering while a tiled Tuner sits on another workspace.
+
 ## Troubleshooting
 
 - **Logs:** open them with Settings ▸ About & logs ▸ *Open the log viewer*.
@@ -840,7 +896,12 @@ play-pause` and Omarchy's media keys and bar widget work, also while the window 
 - **"No guide data" everywhere:** see [guide coverage](#tv-guide-and-guide-coverage). Check
   Settings ▸ EPG for "Matches N of M channels".
 - **Playback stops or stutters on another workspace:** install the Hyprland snippet
-  (`render_unfocused`).
+  (`render_unfocused`). Without it the audio keeps playing and video decoding pauses until you
+  come back.
+- **"Application not responding" for Tuner after switching workspaces:** fixed in this version.
+  Older builds blocked waiting for the hidden window's next frame and missed Hyprland's pings,
+  although playback continued. Tuner now never waits for a frame, with or without the
+  snippet.
 - **"The provider refused the stream":** the account has expired, or it is already using all
   its connections. Tuner plays one stream at a time and waits for the old one to close before
   starting the next. The account row in Settings ▸ Playlists shows the connection count.

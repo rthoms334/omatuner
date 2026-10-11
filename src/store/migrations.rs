@@ -213,6 +213,18 @@ mod tests {
         let c = fresh();
         let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v, latest_version());
+        let names: Vec<&str> = MIGRATIONS.iter().map(|m| m.0).collect();
+        assert_eq!(names, ["0001_init", "0002_category_filter", "0003_quality", "0004_name_rules"]);
+        for (t, col) in [
+            ("grp", "raw_name"),
+            ("group_override", "shown"),
+            ("channel", "quality"),
+            ("channel", "family"),
+            ("channel_video", "width"),
+            ("quality_check", "claimed"),
+        ] {
+            assert!(has_column(&c, t, col).unwrap(), "{t}.{col}");
+        }
     }
 
     /// The FTS contract of DESIGN §6.3: contentless FTS keyed by programme.id, inserted with the

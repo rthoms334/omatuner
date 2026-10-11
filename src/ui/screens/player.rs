@@ -14,6 +14,10 @@
 //!   finished movie (marked watched by the player) returns to its detail page; that part is
 //!   driven by the always-alive movie detail screen, so it is done once.
 //! * Mouse: double-click toggles window fullscreen; wheel = volume (only here).
+//! * Video-only (`ctx.video_only`, the popped-out window, DESIGN §12.3): the passive banner
+//!   is a one-strip OSD (title · volume, now playing or position); the full OSD comes back only
+//!   in controls focus mode or with a side panel; double-click pops the window back in;
+//!   nothing playing shows a compact card with the way back.
 //! * Controls row: transport controls (previous / play / next, skips, fullscreen) are glyphs,
 //!   the rest glyph + label; when that doesn't fit every control is a glyph, and controls
 //!   focus mode only walks the controls actually drawn.
@@ -764,6 +768,55 @@ impl PlayerScreen {
         }
     }
 
+    /// The video-only window's banner: one bottom strip — title and volume, then what's on
+    /// (live) or the position (VOD), and the way back when there is room.
+    fn draw_compact_osd(&mut self, ui: &egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, snap: &PlayerSnapshot) {
+        let theme = ctx.theme;
+        let t = &theme.tokens;
+        let pad = theme.space(SpaceToken::Sm);
+        let title_font = FontId::proportional(theme.font(TypeToken::Body));
+        let small_font = FontId::proportional(theme.font(TypeToken::Caption));
+        let line = title_font.size * 1.35;
+        let strip = Rect::from_min_max(egui::pos2(rect.left(), rect.bottom() - 2.0 * pad - line - small_font.size * 1.35), rect.max);
+        let p = ui.painter_at(rect);
+        p.rect_filled(strip, 0.0, t.osd_scrim);
+        self.bottom_bar = Some(strip.height());
+        let inner = strip.shrink(pad);
+        let vol = if snap.muted { format!("{} muted", glyphs::MUTED) } else { format!("{} {:.0} %", glyphs::VOLUME, snap.volume) };
+        let vr = osd_text(&p, inner.right_top(), Align2::RIGHT_TOP, &vol, small_font.clone(), t.osd_text, f32::INFINITY);
+        let playable = snap.playable.as_ref();
+        let mut title = playable.map(|p| p.title.clone()).unwrap_or_default();
+        if snap.paused {
+            title = format!("{} {title}", glyphs::PAUSE);
+        }
+        osd_text(&p, inner.left_top(), Align2::LEFT_TOP, &title, title_font, t.osd_text, (vr.left() - pad - inner.left()).max(0.0));
+        let second = if is_live(snap) {
+            let ch = playable.and_then(|p| match p.media {
+                MediaRef::Channel(id) | MediaRef::Catchup { channel: id, .. } => ctx.lib.live.get(id).cloned(),
+                _ => None,
+            });
+            ch.and_then(|c| live::now_next_of(ctx, &c)).and_then(|n| n.now).map(|now| now.title.to_string()).unwrap_or_default()
+        } else {
+            let dur = snap.duration.or_else(|| playable.and_then(|p| p.duration_hint)).unwrap_or(0.0);
+            format!("{} / {}", clock(snap.position.unwrap_or(0.0)), clock(dur))
+        };
+        let second_pos = egui::pos2(inner.left(), inner.top() + line);
+        let mut second_w = inner.width();
+        if strip.width() >= 360.0 {
+            let hint = osd_text(
+                &p,
+                egui::pos2(inner.right(), second_pos.y),
+                Align2::RIGHT_TOP,
+                "o · Esc  back",
+                small_font.clone(),
+                with_alpha(t.osd_text, 0.5),
+                f32::INFINITY,
+            );
+            second_w = (hint.left() - pad - inner.left()).max(0.0);
+        }
+        osd_text(&p, second_pos, Align2::LEFT_TOP, &second, small_font, with_alpha(t.osd_text, 0.8), second_w);
+    }
+
     /// `[HD] [5.1] [CC] [⟲]` right-aligned at `right_center`; returns their extent.
     fn badges(&self, p: &egui::Painter, theme: &Theme, snap: &PlayerSnapshot, catchup: bool, right_center: egui::Pos2, font: FontId, s: f32) -> Rect {
         let t = &theme.tokens;
@@ -1215,7 +1268,13 @@ impl Screen for PlayerScreen {
         // keys that manage the window / app never show the banner
         if !matches!(
             action,
-            Action::Back | Action::ToggleWindowFullscreen | Action::ToggleHelp | Action::OpenSearch | Action::Quit | Action::ShowJobs
+            Action::Back
+                | Action::ToggleWindowFullscreen
+                | Action::TogglePopOut
+                | Action::ToggleHelp
+                | Action::OpenSearch
+                | Action::Quit
+                | Action::ShowJobs
         ) {
             self.show_banner(ctx);
         }
@@ -1270,10 +1329,19 @@ impl Screen for PlayerScreen {
                 ctx.play(PlayerCommand::SetZoom(ZOOMS[self.zoom]));
                 self.flash = Some((Flash::Zoom, Instant::now()));
             }
-            Action::Minimize => ctx.navigate(NavRequest::Back),
+            // popped out: leave the player AND put the window back (`p` ends in the mini player)
+            Action::Minimize => {
+                ctx.navigate(NavRequest::Back);
+                if ctx.video_only {
+                    ctx.navigate(NavRequest::TogglePopOut);
+                }
+            }
             Action::StopAndClose => {
                 ctx.play(PlayerCommand::Stop);
                 ctx.navigate(NavRequest::Back);
+                if ctx.video_only {
+                    ctx.navigate(NavRequest::TogglePopOut);
+                }
             }
             Action::Retry => {
                 if matches!(ctx.player.state, PlayerState::Error(_) | PlayerState::Reconnecting { .. }) {
@@ -1348,24 +1416,24 @@ impl Screen for PlayerScreen {
             let p = ui.painter_at(rect);
             p.rect_filled(rect, 0.0, Color32::BLACK);
             let t = &theme.tokens;
-            osd_text(
-                &p,
-                rect.center(),
-                Align2::CENTER_BOTTOM,
-                "Nothing is playing",
-                FontId::proportional(theme.font(TypeToken::Title)),
-                t.osd_text,
-                rect.width(),
-            );
+            let (title, hint, title_font, hint_font) = if ctx.video_only {
+                ("Nothing playing", "o or Esc: back to the full window", TypeToken::Subtitle, TypeToken::BodySmall)
+            } else {
+                ("Nothing is playing", "Esc goes back", TypeToken::Title, TypeToken::Body)
+            };
+            osd_text(&p, rect.center(), Align2::CENTER_BOTTOM, title, FontId::proportional(theme.font(title_font)), t.osd_text, rect.width());
             osd_text(
                 &p,
                 rect.center() + egui::vec2(0.0, 8.0),
                 Align2::CENTER_TOP,
-                "Esc goes back",
-                FontId::proportional(theme.font(TypeToken::Body)),
+                hint,
+                FontId::proportional(theme.font(hint_font)),
                 with_alpha(t.osd_text, 0.7),
                 rect.width(),
             );
+            if ctx.video_only && ui.interact(rect, ui.id().with("popout-idle"), egui::Sense::click()).double_clicked() {
+                ctx.navigate(NavRequest::TogglePopOut);
+            }
             return;
         }
         let resp = ctx.video.paint(ui, rect, Placement::Fullscreen, theme, ctx.images, &snap);
@@ -1373,7 +1441,9 @@ impl Screen for PlayerScreen {
         if ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO) && resp.hovered() {
             self.show_banner(ctx);
         }
-        if resp.double_clicked() {
+        if resp.double_clicked() && ctx.video_only {
+            ctx.navigate(NavRequest::TogglePopOut);
+        } else if resp.double_clicked() {
             let fs = ui.input(|i| i.viewport().fullscreen).unwrap_or(false);
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fs));
         } else if resp.clicked() && self.osd_focus {
@@ -1415,7 +1485,11 @@ impl Screen for PlayerScreen {
             self.draw_info(ui, ctx, rect, &snap);
         }
         if self.banner_visible(&snap) {
-            self.draw_osd(ui, ctx, rect, &snap);
+            if ctx.video_only && !self.osd_focus && self.panel.is_none() {
+                self.draw_compact_osd(ui, ctx, rect, &snap);
+            } else {
+                self.draw_osd(ui, ctx, rect, &snap);
+            }
             if let Some(t) = self.banner_until {
                 let left = t.saturating_duration_since(Instant::now());
                 if !left.is_zero() {

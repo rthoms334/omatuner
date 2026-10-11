@@ -10,9 +10,9 @@
 //! Rules:
 //! * For each event the first matching binding wins, innermost context first.
 //! * Filterable contexts (`List`, `ListFiltering`, `PosterGrid`, `PosterGridFiltering`, `Checklist`,
-//!   `Search`): an unbound printable character (no Ctrl/Alt) becomes [`Action::FilterInput`] —
-//!   the launcher idiom: in filterable lists letters type, so there is NO j/k there; vim keys
-//!   live in the guide grid, the player and settings panels.
+//!   `Search`, `Help`): an unbound printable character (no Ctrl/Alt) becomes
+//!   [`Action::FilterInput`] — the launcher idiom: in filterable lists letters type, so there is
+//!   NO j/k there; vim keys live in the guide grid, the player and settings panels.
 //! * `TextInput` owns the keyboard: after its own table, only Ctrl/Alt chords and F-keys may
 //!   reach `Global`; every other event (Space, ←/→, Delete, Backspace…) returns `None` so the
 //!   focused egui text widget edits text. Contexts below `TextInput` are never consulted.
@@ -68,15 +68,20 @@ pub enum KeyContext {
     TextInput,
     /// Settings panes (panel idiom: h/j/k/l allowed because there is no filter).
     Panel,
+    /// The video-only player of a popped-out window, stacked right above `PlayerLive` /
+    /// `PlayerVod` (Esc pops back in instead of leaving the player).
+    PopOut,
     /// A tick list with type-to-filter ("Choose what to show"), innermost above `Modal`: it
     /// binds its own navigation and filter keys, so → never activates and Backspace never
     /// leaves (as `List` would).
     Checklist,
+    /// The keyboard help overlay: typing filters the shortcuts (Omarchy's keybindings menu).
+    Help,
 }
 
 impl KeyContext {
     /// Every context, in help-overlay / documentation order.
-    pub const ALL: [KeyContext; 17] = [
+    pub const ALL: [KeyContext; 19] = [
         KeyContext::Global,
         KeyContext::List,
         KeyContext::ListFiltering,
@@ -88,12 +93,14 @@ impl KeyContext {
         KeyContext::PlayerLive,
         KeyContext::PlayerVod,
         KeyContext::PlayerOsd,
+        KeyContext::PopOut,
         KeyContext::NumericEntry,
         KeyContext::EpgMapping,
         KeyContext::Search,
         KeyContext::Modal,
         KeyContext::TextInput,
         KeyContext::Panel,
+        KeyContext::Help,
     ];
 
     pub fn title(self) -> &'static str {
@@ -108,6 +115,7 @@ impl KeyContext {
             KeyContext::PlayerLive => "Player — live TV",
             KeyContext::PlayerVod => "Player — movies, episodes, catch-up",
             KeyContext::PlayerOsd => "Player — on-screen controls",
+            KeyContext::PopOut => "Pop-out player",
             KeyContext::NumericEntry => "Channel number entry",
             KeyContext::EpgMapping => "EPG mapping",
             KeyContext::Search => "Search",
@@ -115,6 +123,7 @@ impl KeyContext {
             KeyContext::TextInput => "Text fields",
             KeyContext::Panel => "Settings",
             KeyContext::Checklist => "Tick lists",
+            KeyContext::Help => "Keyboard help",
         }
     }
 }
@@ -238,6 +247,9 @@ pub enum Action {
     CycleAspect,
     CycleZoom,
     Minimize,
+    /// `o` / Ctrl+Shift+O: pop the player out into a small pinned window on every workspace
+    /// (Hyprland), or back in (DESIGN §21.6).
+    TogglePopOut,
     StopAndClose,
     Retry,
     Digit(u8),
@@ -353,6 +365,7 @@ pub static GLOBAL: &[Binding] = &[
     // not Ctrl+Space: that is fcitx5's input-method toggle on Omarchy
     b(C::ctrl_shift(Key::P), A::GlobalPlayPause, "Play / pause"),
     b(C::ctrl_shift(Key::S), A::StopPlayback, "Stop playback"),
+    b(C::ctrl_shift(Key::O), A::TogglePopOut, "Pop the player out (small, on every workspace) / back in"),
     b(C::ctrl(Key::R), A::RefreshSource, "Refresh playlists & guide"),
     b(C::key(Key::F5), A::RefreshSource, "Refresh playlists & guide"),
     b(C::ctrl(Key::J), A::ShowJobs, "Show background tasks"),
@@ -554,6 +567,7 @@ pub static PLAYER_COMMON: &[Binding] = &[
     b(C::ch('V'), A::CycleZoom, "Zoom"),
     b(C::ch('f'), A::ToggleWindowFullscreen, "Toggle window fullscreen"),
     b(C::ch('p'), A::Minimize, "Keep playing in the mini player"),
+    b(C::ch('o'), A::TogglePopOut, "Pop out: small window on every workspace (Hyprland)"),
     b(C::ch('q'), A::StopAndClose, "Stop and close"),
     b(C::ch('r'), A::Retry, "Retry (after an error)"),
     b(C::ctrl(Key::F), A::ToggleFavourite, "Add to / remove from Favourites"),
@@ -610,6 +624,15 @@ pub static PLAYER_OSD: &[Binding] = &[
     b(C::key(Key::Tab), A::FocusNext, "Next / previous control"),
     b(C::shift(Key::Tab), A::FocusPrev, "Next / previous control"),
     b(C::key(Key::Escape), A::LeaveOsdControls, "Leave the controls"),
+];
+
+/// The popped-out (video-only) player, above `PlayerLive` / `PlayerVod`: every player key
+/// works; Esc and `o` (also a double-click) put the window back, `f` puts it back fullscreen;
+/// `p` and `q` leave the player as usual and put the window back too.
+pub static POP_OUT: &[Binding] = &[
+    b(C::key(Key::Escape), A::TogglePopOut, "Back to the full window (also double-click)"),
+    b(C::ch('o'), A::TogglePopOut, "Back to the full window (also double-click)"),
+    b(C::ch('f'), A::ToggleWindowFullscreen, "Back to the full window, fullscreen"),
 ];
 
 pub static NUMERIC_ENTRY: &[Binding] = &[
@@ -727,6 +750,24 @@ pub static PANEL: &[Binding] = &[
     b(C::ch('?'), A::ToggleHelp, "Keyboard help"),
 ];
 
+/// The help overlay. Every printable key types into its filter (`?` too: it closes the overlay
+/// only while the filter is empty), so no letter shortcut can fire while help is open.
+pub static HELP: &[Binding] = &[
+    b(C::key(Key::ArrowUp), A::Up, "Scroll"),
+    b(C::key(Key::ArrowDown), A::Down, "Scroll"),
+    b(C::key(Key::PageUp), A::PageUp, "Page up / down"),
+    b(C::key(Key::PageDown), A::PageDown, "Page up / down"),
+    b(C::key(Key::Home), A::Home, "Top / bottom"),
+    b(C::key(Key::End), A::End, "Top / bottom"),
+    b(C::key(Key::Backspace), A::FilterBackspace, "Delete character"),
+    b(C::ctrl(Key::Backspace), A::FilterDeleteWord, "Delete word"),
+    b(C::ctrl(Key::U), A::FilterClear, "Clear filter"),
+    b(C::key(Key::Escape), A::Back, "Clear the filter, then close"),
+    b(C::key(Key::F1), A::ToggleHelp, "Clear the filter, then close"),
+    b(C::ch('?'), A::FilterInput('?'), "Close (types ? while filtering)"),
+    b(C::key(Key::Enter), A::Activate, "Close"),
+];
+
 /// The bindings of one context, in priority order (context-specific first).
 pub fn tables(ctx: KeyContext) -> Vec<&'static [Binding]> {
     match ctx {
@@ -740,6 +781,7 @@ pub fn tables(ctx: KeyContext) -> Vec<&'static [Binding]> {
         KeyContext::PlayerLive => vec![PLAYER_LIVE, PLAYER_COMMON],
         KeyContext::PlayerVod => vec![PLAYER_VOD, PLAYER_COMMON],
         KeyContext::PlayerOsd => vec![PLAYER_OSD],
+        KeyContext::PopOut => vec![POP_OUT],
         KeyContext::NumericEntry => vec![NUMERIC_ENTRY],
         KeyContext::EpgMapping => vec![EPG_MAPPING],
         KeyContext::Search => vec![SEARCH, SEARCH_ITEM_ACTIONS],
@@ -747,6 +789,7 @@ pub fn tables(ctx: KeyContext) -> Vec<&'static [Binding]> {
         KeyContext::TextInput => vec![TEXT_INPUT],
         KeyContext::Panel => vec![PANEL],
         KeyContext::Checklist => vec![CHECKLIST],
+        KeyContext::Help => vec![HELP],
     }
 }
 
@@ -760,6 +803,7 @@ pub fn is_filtering(ctx: KeyContext) -> bool {
             | KeyContext::PosterGridFiltering
             | KeyContext::Search
             | KeyContext::Checklist
+            | KeyContext::Help
     )
 }
 
@@ -873,6 +917,7 @@ const HINTS: &[(KeyContext, &[(Action, &str)])] = &[
     (KeyContext::TextInput, &[(A::Activate, "confirm"), (A::FocusNext, "next field"), (A::Back, "leave")]),
     (KeyContext::Modal, &[(A::Activate, "confirm"), (A::Back, "cancel")]),
     (KeyContext::Checklist, &[(A::ToggleMark, "tick"), (A::MarkAll, "all/none"), (A::MarkDefaults, "my country"), (A::Activate, "save")]),
+    (KeyContext::Help, &[(A::Back, "clear / close"), (A::FilterClear, "clear filter")]),
 ];
 
 /// Hints of a filtering list inside a dialog or menu (Esc clears the filter there).
@@ -1051,6 +1096,22 @@ mod tests {
                 assert_eq!(resolve(stack, &event_of(chord)), Some(action), "{stack:?}: “{} {verb}”", chord.label());
             }
         }
+    }
+
+    /// Help filters as you type: every printable key (`?`, `/`, j/k, digits) goes to the filter,
+    /// so no letter shortcut of the screen below or of a list can fire while help is open.
+    #[test]
+    fn help_types_every_printable_key() {
+        for c in ' '..='~' {
+            assert_eq!(resolve(&[K::Help], &egui::Event::Text(c.to_string())), Some(Action::FilterInput(c)), "{c:?}");
+        }
+        assert_eq!(resolve(&[K::Help], &egui::Event::Text("é".into())), Some(Action::FilterInput('é')));
+        assert_eq!(resolve(&[K::Help], &key(Key::Backspace, false)), Some(Action::FilterBackspace));
+        assert_eq!(resolve(&[K::Help], &key(Key::Backspace, true)), Some(Action::FilterDeleteWord));
+        assert_eq!(resolve(&[K::Help], &key(Key::U, true)), Some(Action::FilterClear));
+        assert_eq!(resolve(&[K::Help], &key(Key::Escape, false)), Some(Action::Back));
+        assert_eq!(resolve(&[K::Help], &key(Key::F1, false)), Some(Action::ToggleHelp));
+        assert_eq!(resolve(&[K::Help], &key(Key::Q, true)), Some(Action::Quit), "globals keep working");
     }
 
     #[test]

@@ -117,7 +117,7 @@ rate, background refresh while closed (`tuner --refresh` flag reserved for a sys
 | Keymap collisions | Per-context tables (§15): `f` = fullscreen in player, favourite = Ctrl+F everywhere; `←` = last channel (live) / seek (VOD); `h` = history (live) / left (guide); digits = channel entry in the live player and the guide. |
 | Adaptive frame rate claim | No VRR here → judder of 25/50 fps on 60 Hz is a known v1 limitation; measured in WP-07; `mpv_options` lets users try `video-sync=display-resample` (§11.8). |
 | Spike "verified" too narrow | WP-07/WP-13 acceptance adds hidden-workspace, fullscreen, 1-hour soak, audio, frame-pacing measurements (§25). |
-| Event draining in `ui()` | Moved to dedicated threads (D2). **Correction (review round 2):** eframe's `logic` does NOT run while the window is on a hidden Hyprland workspace — winit-wayland reports no visibility and `RedrawRequested` needs a compositor frame callback, which Hyprland withholds from hidden workspaces. Mitigations: the `render_unfocused` window rule (frame callbacks at `misc:render_unfocused_fps`, default 15) and the controller's video watchdog (`vid=no` after 2 s without a rendered frame, resumed when the UI renders again) — §11.1. |
+| Event draining in `ui()` | Moved to dedicated threads (D2). **Correction (review round 2):** eframe's `logic` does NOT run while the window is on a hidden Hyprland workspace — winit-wayland reports no visibility and `RedrawRequested` needs a compositor frame callback, which Hyprland withholds from hidden workspaces. Mitigations: the `render_unfocused` window rule (frame callbacks at `misc:render_unfocused_fps`, default 15) and the controller's video watchdog (`vid=no` after 2 s without a rendered frame, resumed when the UI renders again) — §11.1. **Correction (hidden-workspace ANR):** with eframe's default vsync the UI thread did not merely idle there — it **blocked** in Mesa's `eglSwapBuffers` (swap interval 1 waits for the previous frame's callback), stopped answering `xdg_wm_base` pings, and after `misc:anr_missed_pings` Hyprland showed "application not responding" while mpv played on. Now vsync is off and frames are paced by winit frame callbacks (`pre_present_notify` in `App::ui`): hidden, the UI thread sits in its event loop and answers pings, with or without the window rule (§11.1). |
 | `report_swap` omitted | Kept omitted (measured win); consequence documented in §11.8. |
 | XMLTV "0.61 s" is parse-only | Import budget is end-to-end (< 8 s for 415k programmes) with batched writes + progress (§9.3); bench `benches/import.rs`, gate run by WP-13. |
 | FTS schema broken (contentless + WITHOUT ROWID) | `programme` is an AUTOINCREMENT rowid table with `UNIQUE(epg_channel_id, gen, start)`; `programme_fts` is **contentless FTS5 with `contentless_delete=1`**, written in the same transaction as each programme batch and deleted by rowid before programmes are deleted; no cascades from `epg_channel` to `programme` (§6.3). Verified by `store::migrations` tests. |
@@ -847,13 +847,11 @@ CREATE TABLE IF NOT EXISTS channel_video (        -- what mpv decoded when the c
   ≥ 1900, ≥ 1260) say, so cropped 1920×800 and anamorphic 1440×1080 read FHD. **1440p is
   FHD**: four classes keep the badge narrow, and QHD is closer to FHD than to the 4K it would
   otherwise claim.
-* **Migration numbering**: `user_version` is positional, so two branches that each add a
-  `0002` must not both reach one database; whichever merges second is renumbered (`0003_*`,
-  and its `backfill` name match). This one was written as `0002_quality` and renumbered
-  `0003_quality` after `0002_category_filter`; it is safe to re-run for that reason. A
-  database from a pre-merge build of the quality branch (v2 with no `grp.raw_name`) is fixed
-  up by `migrations::reconcile_renumbered` before the pending migrations run: it adds the
-  `0002_category_filter` columns, then `0003_quality` re-runs as a no-op.
+* **Migration numbering**: `user_version` is positional. This migration was written as
+  `0002_quality` alongside `0002_category_filter` (§28) and renumbered to `0003` when both
+  merged (with its `backfill` name match). It is safe to re-run, and a database from a
+  pre-merge build of this branch (v2 with the quality columns but no `grp.raw_name`) gets the
+  category-filter columns from `migrations::reconcile_renumbered` before `0003` re-runs.
 
 ### 6.2.2 `0004_name_rules.sql` (quality-label trust §13.0.1, re-cleaned names §9.6)
 
@@ -1226,12 +1224,31 @@ CLI `--play`, MPRIS and Compact without a mini-player would otherwise stall the 
 load the FBO is cleared to black. Teardown order: render ctx → FBO → mpv (explicit
 `MpvGl::destroy` with GL current; a plain drop leaks, see §5.1).
 
-**Hidden windows (corrected in review round 2).** eframe calls `logic` only after a compositor
-frame callback (winit-wayland reports no visibility, so `update_logic_only` never runs).
-Hyprland sends no frame callbacks to windows on hidden workspaces unless the window has the
-`render_unfocused` rule — shipped in `packaging/hypr/tuner.lua` (callbacks at
-`misc:render_unfocused_fps`, default 15). Without it nothing renders, mpv's VO waits ~200 ms
-per frame and drops it, and decoding burns CPU for nothing. Safety net: every render stamps the
+**Frame pacing and hidden windows (corrected twice).** The window's frames are paced by
+Wayland frame callbacks, never by a blocking swap:
+* `main` sets `glow_options.vsync = false` (swap interval 0). With eframe's default (1), Mesa's
+  `eglSwapBuffers` waits for the frame callback of the *previous* frame
+  (`dri2_wl_swap_buffers_with_damage` dispatches its queue until the throttle callback fires).
+  Hyprland withholds frame callbacks from windows on hidden workspaces, so the first swap after
+  the workspace was left blocked the UI thread indefinitely: winit no longer dispatched the
+  Wayland socket, `xdg_wm_base` pings went unanswered, and after `misc:anr_missed_pings`
+  Hyprland put up its "application not responding" dialog — while mpv kept playing on its
+  own threads.
+* `App::ui` calls `winit::Window::pre_present_notify()` (eframe 0.36 never does —
+  `native/glow_integration.rs` only swaps). winit-wayland then requests a `wl_surface.frame`
+  with the commit of eframe's swap and withholds the next `RedrawRequested` until that callback
+  arrives (`platform_impl/linux/wayland/event_loop/mod.rs`: `FrameCallbackState::Requested`
+  → no redraw). Repaint requests (mpv's update callback, timers) therefore coalesce to one
+  frame per compositor frame — the same cadence vsync gave, without blocking, and no spin:
+  with nothing to repaint the loop sleeps in `epoll`. eframe runs `ui` only for frames it
+  presents (an invisible root viewport gets `logic` alone), so a requested callback always
+  rides on a commit.
+* Hidden: no frame callback → no `RedrawRequested` → neither `logic` nor `ui` runs, and the UI
+  thread waits in `epoll` on the Wayland fd and answers pings. Hyprland sends no frame
+  callbacks there unless the window has the `render_unfocused` rule — shipped in
+  `packaging/hypr/tuner.lua` (callbacks at `misc:render_unfocused_fps`, default 15). Without
+  the rule nothing renders, mpv's VO waits ~200 ms per frame and drops it, and decoding burns
+  CPU for nothing. Safety net: every render stamps the
 player's `RenderClock`; the controller tick sets `vid=no` after 2 s without a rendered frame
 while Playing (audio continues, `snapshot.video_suspended = true`), and the app sends
 `PlayerCommand::ResumeVideo` (`vid=auto`) as soon as `logic` runs again. Nothing else that must
@@ -1342,6 +1359,9 @@ force-media-title=%n%…,user-agent=…,referrer=…,http-header-fields=…,star
 quoted). The title never comes from the URL (credentials).
 
 ### 11.8 Frame pacing (known limitation)
+UI frames follow the compositor's frame callbacks (§11.1: vsync off, `pre_present_notify`), so
+mpv's update callback is served once per display refresh at most, aligned to the compositor's
+repaint like the old blocking vsync swap but without blocking the UI thread.
 Without a post-swap hook `report_swap` is omitted (it halved throughput in the spike) and the
 panel is fixed 60 Hz, so 25/50 fps content shows cadence judder; `video-sync=audio` (default)
 keeps A/V sync. WP-07 records drops/s and `vo-delayed-frame-count` for 25/30/50/60 fps samples;
@@ -1390,6 +1410,27 @@ Toasts stack bottom-right ABOVE the mini-player rect (`VideoHost::mini_rect`), w
 also receive as `UiCtx::mini_rect` (the guide keeps the focused cell clear of it). The
 mini-player never shows over Onboarding or the Player (`allows_mini_player() == false`).
 Overlays centre with a bg @ 0.5 scrim.
+
+### 12.3 Video-only layout (pop-out, `ui/popout.rs`)
+The window shows only the player — no sidebar, status bar or mini player — while
+* our pop-out is requested or active (`o` / Ctrl+Shift+O, §21.6), whatever its size, or
+* something is playing or paused and Hyprland reports the window **floating and pinned** and
+  it is at most Omarchy's Super+O pop size, 1300 × 900 logical px
+  (`omarchy-hyprland-window-pop`'s default). A bigger pinned window, or Super+O with nothing
+  playing (pinning the browsing UI), keeps the full UI; floating alone never switches.
+
+It never shows while a pop-in is in flight, nor between the pop-in's result and Hyprland's
+unpin event (no flash). The app draws the Player screen and gives it the keys whatever the
+route stack says (`TunerApp::view_route`); the stack itself stays, so popping back in returns
+to the screen the user left (it is entered again). The video-only player is not a route of its
+own: a route step back in video-only mode only removes a `Player` route on top of the stack,
+never the screens below. Only user keys pop the window back in: `p` (keep playing) and `q`
+(stop and close) leave the player and pop in; `f` pops in and then goes fullscreen (a pinned
+window can't); a finished movie returning to its page stays popped out ("Nothing playing")
+with the page waiting underneath. Key stack: the player's contexts with `PopOut` right above
+`PlayerLive`/`PlayerVod` — Esc pops back in once a side panel, number entry or controls focus
+has had it. The compact OSD strip (title · volume, what's on or the position, "o · Esc back"
+when at least 360 px wide) shows for the usual OSD time after popping out.
 
 ---
 
@@ -1725,6 +1766,14 @@ Live preview opens the player. End of playback per §13.6. Esc leaves to the pre
 playback continues in the mini player (bottom-right 16:9, 320 Wide / 240 Medium × rem, hidden
 in Compact → status-bar chip; click = back to player, ✕ = stop).
 
+**Video-only (popped-out window, §12.3).** Same screen, same keys (zap ↑/↓, volume, pause,
+mute, tracks, `c`/`g`/`h` panels) plus `PopOut` (Esc / `o` = back to the full window). The
+passive banner is one bottom strip — title (⏸ when paused) and volume, then the programme on
+now (live) or position / duration (VOD), Body/Caption type, no scale factor; the full OSD
+returns only in controls focus mode or with a side panel open. Double-click pops back in
+(instead of window fullscreen). Nothing playing: "Nothing playing · o or Esc: back to the full
+window" on black.
+
 
 ### 13.9 Settings
 ```
@@ -1772,6 +1821,7 @@ favourites lists) show a 󰇙 drag grip and move with Alt+↑/↓ or K/J. Every 
 | | Resume threshold · watched % | `player.resume_min_s`, `watched_pct` | 60 · 92 |
 | | Default User-Agent | `player.user_agent` | VLC/3.0.21 |
 | | Advanced mpv options | `player.mpv_options` | {} |
+| | Pop-out size · corner (Hyprland, §21.6) | `player.popout_size`, `popout_corner` (+ `popout_last`, remembered at pop-in) | small 480 × 270 · bottom right |
 | Interface | Start screen | `general.start_screen` | Auto (Live until favourites/history exist, then Home) |
 | | Sidebar · density · channel numbers · logos · quality badges · 24 h clock | `interface.*` (`quality_badges`) | auto · comfortable · on · on · on · on |
 | | Live preview autoplay · preview delay · guide preview · mini player · OSD timeout | `interface.*` | **off** · 1200 ms · off · on · 3500 ms |
@@ -1822,7 +1872,20 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 
 ### 13.11 Help, jobs, dialogs, EPG mapping, logs
 * Help (`?`, F1): generated from `keymap::help_rows`; current contexts first; two columns ≥
-  760 px.
+  760 px. *Added after rc3:* **type to filter**, like Omarchy's keybindings menu — the
+  overlay's `Help` context is filterable, so every printable key (j/k, `/`, digits) types into
+  a launcher header ("Type to filter keyboard shortcuts…") and no shortcut fires while help is
+  open. A row matches when every whitespace-separated term is a case-insensitive substring of
+  its keys ("ctrl+h", "f5", "alt"; arrows also answer to up/down/left/right, Esc to "escape"),
+  its description or its section title ("guide" keeps the whole TV guide section). Results
+  stay grouped by section in the same order (current contexts first) — the same key means
+  different things per context, so a flat ranked list would lose that; empty sections are
+  hidden, matches are marked with the text-selection fill, a count reads "12 of 269
+  shortcuts", and no match shows "No matching shortcuts". The card's top edge freezes once
+  typing starts (it shrinks downward only) and re-centres when the filter is empty again;
+  typed whitespace (NBSP from AltGr+Space too) is stored as a plain space. Keys: Backspace / Ctrl+Backspace (word) / Ctrl+U edit; Esc and F1
+  clear the filter, then close; `?` closes only while the filter is empty (otherwise it is
+  typed); Enter closes; ↑/↓, PgUp/PgDn, Home/End scroll.
 * Jobs (Ctrl+J, `[List, Modal]`): running jobs with phase + progress; Delete cancels the
   highlighted job; last 20 finished (Enter expands errors).
 * Context menu (Shift+F10 / Ctrl+Enter / right-click): launcher-style, filterable, shortcuts
@@ -1895,12 +1958,13 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 
 ### 15.1 Model & layers
 * **Contexts** (`keymap::KeyContext`): Global, List, ListFiltering, PosterGrid,
-  PosterGridFiltering, Detail, Guide, PlayerLive, PlayerVod, PlayerOsd, NumericEntry,
-  EpgMapping, Search, Modal, TextInput, Panel.
+  PosterGridFiltering, Detail, Guide, PlayerLive, PlayerVod, PlayerOsd, PopOut, NumericEntry,
+  EpgMapping, Search, Modal, TextInput, Panel, Checklist, Help.
 * **Stack per frame**: topmost overlay's contexts, else the current screen's focused-element
   contexts (e.g. `[ListFiltering]`, `[PlayerOsd, PlayerLive]`, `[NumericEntry, Guide]`,
   `[List, PlayerLive]` for a player side panel, `[TextInput, Modal]` for a focused field), then
-  `Global`.
+  `Global`. The video-only player (§12.3) adds `PopOut` right above the player's base context
+  (`[PopOut, PlayerLive]`, `[List, PopOut, PlayerLive]`).
 * **Resolution happens in `App::raw_input_hook`**, before egui processes input, and every event
   that resolves to an action is **removed** from the input — egui never handles it a second time
   (Enter would also click the focused button; Tab would move egui focus). Unresolved events
@@ -1910,15 +1974,15 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 * **Rules** (`keymap::resolve`): first matching binding wins, innermost context first;
   printable symbols match `Event::Text` (layout-independent, shift applied), named keys and
   Ctrl/Alt chords match `Event::Key`.
-  * Filterable contexts (List, ListFiltering, PosterGrid, PosterGridFiltering, Search): an
-    unbound printable char becomes `FilterInput(c)` — **launcher idiom: letters type in lists
+  * Filterable contexts (List, ListFiltering, PosterGrid, PosterGridFiltering, Search, Help):
+    an unbound printable char becomes `FilterInput(c)` — **launcher idiom: letters type in lists
     and grids, so no j/k there**; vim keys exist only in the guide, the player and settings
     panels.
   * **TextInput owns the keyboard**: after its own table only Ctrl/Alt chords and F-keys may
     reach `Global`; Space, ←/→, Delete, Backspace… return `None` and go to the text widget;
     contexts below it are never consulted (typing a space in Rename can't confirm the dialog).
-  * Modal swallows printable text it doesn't bind; PlayerOsd, NumericEntry and EpgMapping fall
-    through to the context below.
+  * Modal swallows printable text it doesn't bind; PlayerOsd, PopOut, NumericEntry and
+    EpgMapping fall through to the context below.
   * Key auto-repeat never produces `Parent`/`Back` (holding Backspace to clear a filter stops at
     the empty filter).
   * `Global` contains only Ctrl/Alt/F-key chords so it never steals typing.
@@ -1933,7 +1997,8 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
   non-Idle player state); with nothing playing it does nothing rather than open an empty player.
 * **Mouse parity**: everything is clickable; hover moves list cursors only after real pointer
   motion (Omarchy `pointerGate`); right-click = context menu; wheel = volume only in the
-  fullscreen player; double-click on video = window fullscreen.
+  fullscreen player; double-click on video = window fullscreen (in the video-only player: pop
+  back in).
 * **Discoverability**: `?`/F1 help overlay (current contexts first) and the status-bar hint line
   (`keymap::hint_line`: curated verbs, keys looked up in the tables).
 * No Super bindings inside the app (Omarchy owns Super). `Ctrl+Space` is avoided (fcitx5 IME
@@ -1958,6 +2023,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Ctrl+P` | Open the player (from the mini player) |
 | `Ctrl+Shift+P` | Play / pause |
 | `Ctrl+Shift+S` | Stop playback |
+| `Ctrl+Shift+O` | Pop the player out (small, on every workspace) / back in |
 | `Ctrl+R` / `F5` | Refresh playlists & guide |
 | `Ctrl+J` | Show background tasks |
 | `F1` | Keyboard help |
@@ -2181,6 +2247,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `V` | Zoom |
 | `f` | Toggle window fullscreen |
 | `p` | Keep playing in the mini player |
+| `o` | Pop out: small window on every workspace (Hyprland) |
 | `q` | Stop and close |
 | `r` | Retry (after an error) |
 | `Ctrl+F` | Add to / remove from Favourites |
@@ -2212,6 +2279,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `V` | Zoom |
 | `f` | Toggle window fullscreen |
 | `p` | Keep playing in the mini player |
+| `o` | Pop out: small window on every workspace (Hyprland) |
 | `q` | Stop and close |
 | `r` | Retry (after an error) |
 | `Ctrl+F` | Add to / remove from Favourites |
@@ -2228,6 +2296,13 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Enter` | Activate control |
 | `Tab` / `Shift+Tab` | Next / previous control |
 | `Esc` | Leave the controls |
+
+#### Pop-out player (`PopOut`)
+
+| Keys | Action |
+|---|---|
+| `Esc` / `o` | Back to the full window (also double-click) |
+| `f` | Back to the full window, fullscreen |
 
 #### Channel number entry (`NumericEntry`)
 
@@ -2299,6 +2374,21 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `x` / `Delete` | Delete / more actions |
 | `Esc` | Back |
 | `?` | Keyboard help |
+
+#### Keyboard help (`Help`)
+
+| Keys | Action |
+|---|---|
+| `↑` / `↓` | Scroll |
+| `PgUp` / `PgDn` | Page up / down |
+| `Home` / `End` | Top / bottom |
+| `Backspace` | Delete character |
+| `Ctrl+Backspace` | Delete word |
+| `Ctrl+U` | Clear filter |
+| `Esc` / `F1` | Clear the filter, then close |
+| `?` | Close (types ? while filtering) |
+| `Enter` | Close |
+| `a–z, 0–9 …` | Type to filter |
 
 ---
 
@@ -2505,6 +2595,55 @@ File pickers through the XDG portal (`rfd` xdg-portal → portal-gtk, auto-float
 prefer-dark/light). `hypr::focus_self` uses Hyprland 0.56's Lua dispatcher
 (`hl.dsp.focus({ window = "class:^(tuner)$" })`) with the legacy `focuswindow` fallback, like
 `omarchy-launch-or-focus`.
+
+### 21.6 Pop-out player (`platform/popout.rs`, `ui/popout.rs`)
+A floating **pinned** Hyprland window is shown on every workspace — Omarchy's Super+O
+(`omarchy-hyprland-window-pop`: float, 1300 × 900, centre, pin, raise, tag `pop`) does that
+for any window. Tuner does it for itself with `o` in the player or Ctrl+Shift+O anywhere:
+* **IPC**: requests on `$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket.sock` (what
+  `hyprctl` writes: `j/clients`, `j/monitors`, `/dispatch …`), from the `hypr-popout` worker
+  thread; the UI only sends `PopRequest`s and gets `PlatformEvent::PopOut` back. Our window is
+  the mapped client with **our pid** (never matched by class); its address must be `0x`+hex
+  before it is put into a dispatcher.
+* **Syntax**: Lua first (`hl.dsp.window.float({ window = "address:0x…", action = "enable" })`,
+  `pin`, `resize { x, y }`, `move { x, y }`, `alter_zorder { mode = "top" }`, `tag { tag =
+  "+pop" }` — Hyprland 0.56 parses `action = enable|disable|toggle`), classic on a non-`ok`
+  reply (`setfloating`/`settiled`, `pin` (toggle — sent only when the state differs),
+  `resizewindowpixel exact W H,address:…`, `movewindowpixel exact X Y,address:…`,
+  `alterzorder top,…`, `tagwindow ±pop …`), exactly like `omarchy-hyprland-window-pop`. The
+  syntax that worked first is kept for the session.
+* **Pop-out**: (unless already) float → size → move → (unless already) pin → raise → tag `pop`
+  (Omarchy rounds `tag:pop` windows). Size: Settings ▸ Player ▸ Pop-out size, Small 480 × 270
+  (default) or Medium 640 × 360; place: the chosen corner (default bottom-right) of the
+  window's monitor, inside its reserved area (bar), 10 px margin (Omarchy's `gaps_out`, so it
+  lines up with tiled windows). A refused step undoes the steps before it (no half popped-out
+  window, no record). A maximized window (Hyprland's fullscreen mode 1) is un-maximized first
+  (`hl.dsp.window.fullscreen({ window, mode = "maximized", action = "unset" })`; classic
+  syntax has no per-window form, so there the toast asks to un-maximize). The app leaves
+  window fullscreen first, before a pop-out or a pop-in (a fullscreen window can be neither
+  pinned nor unpinned); the worker retries for 1 s until Hyprland sees it.
+* **Pop-in** undoes only what pop-out changed: unpin (unless it was pinned), untag (unless it
+  was tagged), then back to its floating geometry if it was floating, else tiled — on the
+  workspace the user is on now (a pinned window travels). If the user moved or resized the
+  pop-out (more than 2 px off its default place), its place and size are remembered
+  (`player.popout_last`, relative to the monitor, clamped on reuse); an unmoved pop-out
+  clears it, so the next one follows the corner on whichever monitor (resolution) it is.
+  Changing size or corner in Settings forgets it too. A refused pop-in keeps the record and
+  the window popped out. Toggling while popped out by Super+O (no record) does what Super+O's
+  second press does: unpin, untag, tile.
+* **State**: the `hypr-events` thread reads `.socket2.sock` and reports our window's
+  floating / pinned flags (`changefloatingmode>>ADDR,0|1`, `pin>>ADDR,0|1`; `openwindow`
+  re-looks our window up, `closewindow` forgets it). They drive the video-only layout
+  (§12.3) and end our pop-out when someone else unpins or tiles it (Super+O pressed again,
+  Super+V).
+* **Outside Hyprland** (no `HYPRLAND_INSTANCE_SIGNATURE`) the key only toasts that the
+  pop-out needs Hyprland. Failures are toasted ("Couldn't pop the player out" / "Couldn't put
+  the player back"; the refused dispatcher goes to the log) and leave the layout docked. The
+  worker and the event watcher start with the first frame of a real window, so unit tests,
+  integration tests and benches never talk to a compositor: `HyprIpc` has a fake that answers
+  like Hyprland in either syntax, and the app takes a recording `PopOutBackend`.
+* A popped-out window is always visible, so its playback never meets the hidden-workspace
+  limits of §11.1.
 
 ---
 
@@ -2798,7 +2937,7 @@ keys, idle, other-workspace 60 s, 1-hour soak with RSS ± 10 %, real providers);
 
 | Risk | Mitigation / owner |
 |---|---|
-| Hidden-workspace playback (no frame callbacks → no `logic`) | `render_unfocused` window rule shipped; controller video watchdog (`vid=no` after 2 s, resumed on the next render); everything correctness-critical off the UI thread. WP-07 + WP-13 measure 60 s on another workspace with and without the rule (audio, `frame-drop-count`, CPU). |
+| Hidden-workspace playback (no frame callbacks → no `logic`) | `render_unfocused` window rule shipped; controller video watchdog (`vid=no` after 2 s, resumed on the next render); everything correctness-critical off the UI thread; vsync off + `pre_present_notify` pacing so the UI thread never blocks in a swap and keeps answering pings (no ANR dialog, §11.1). WP-07 + WP-13 measure 60 s on another workspace with and without the rule (audio, `frame-drop-count`, CPU). |
 | Render-thread rule (UI calling mpv) | `Player::mpv()` removed; UI gets only `render_core()` for context creation; controller-only `Arc<Mpv>`; D2. |
 | Text shaping (RTL, Indic) in egui | Fallback fonts + reshaper/bidi for labels (WP-01); accept Indic limitation; revisit if egui adds shaping. |
 | Provider connection limits | One stream, stop-before-start waiting for END_FILE, zap delay, budget fed from stored account info, preview autoplay and guide preview off by default (§11.5). |

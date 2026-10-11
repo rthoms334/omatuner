@@ -33,7 +33,7 @@ use std::path::PathBuf;
 use eframe::egui::{self, RichText};
 
 use super::home::kit::{self, Loader};
-use crate::config::{Config, Density, IdleInhibitMode, SidebarMode, StartScreen, SubtitleAuto};
+use crate::config::{Config, Density, IdleInhibitMode, PopoutCorner, PopoutSize, SidebarMode, StartScreen, SubtitleAuto};
 use crate::jobs::{JobEvent, JobKind, JobOutcome, Submitted};
 use crate::keymap::{Action, KeyContext};
 use crate::model::{
@@ -164,6 +164,34 @@ static PLAYER_SUB: CfgChoice = CfgChoice {
     get: |c| pos(&[SubtitleAuto::Off, SubtitleAuto::Forced, SubtitleAuto::Always], &c.player.sub_auto),
     set: |c, i| c.player.sub_auto = [SubtitleAuto::Off, SubtitleAuto::Forced, SubtitleAuto::Always][i],
 };
+const POPOUT_SIZES: [PopoutSize; 2] = [PopoutSize::Small, PopoutSize::Medium];
+const POPOUT_CORNERS: [PopoutCorner; 4] = [PopoutCorner::BottomRight, PopoutCorner::BottomLeft, PopoutCorner::TopRight, PopoutCorner::TopLeft];
+/// Pop-out player (Hyprland, DESIGN §21.6). Changing either forgets where the last pop-out
+/// was, so the choice applies to the next one.
+static PLAYER_POPOUT: [CfgChoice; 2] = [
+    CfgChoice {
+        label: "Pop-out size",
+        options: &["Small (480 × 270)", "Medium (640 × 360)"],
+        get: |c| pos(&POPOUT_SIZES, &c.player.popout_size),
+        set: |c, i| {
+            if c.player.popout_size != POPOUT_SIZES[i] {
+                c.player.popout_size = POPOUT_SIZES[i];
+                c.player.popout_last = None;
+            }
+        },
+    },
+    CfgChoice {
+        label: "Pop-out corner",
+        options: &["Bottom right", "Bottom left", "Top right", "Top left"],
+        get: |c| pos(&POPOUT_CORNERS, &c.player.popout_corner),
+        set: |c, i| {
+            if c.player.popout_corner != POPOUT_CORNERS[i] {
+                c.player.popout_corner = POPOUT_CORNERS[i];
+                c.player.popout_last = None;
+            }
+        },
+    },
+];
 static PLAYER_TEXT: [CfgText; 4] = [
     CfgText {
         label: "Audio languages",
@@ -863,6 +891,12 @@ impl SettingsScreen {
                 v.push(Row::Section("Network".into()));
                 v.push(Row::Text(&PLAYER_TEXT[2]));
                 v.push(Row::Text(&PLAYER_TEXT[3]));
+                v.push(Row::Section("Pop-out (Hyprland)".into()));
+                v.extend(PLAYER_POPOUT.iter().map(Row::Choice));
+                v.push(Row::Note(
+                    "o in the player (Ctrl+Shift+O anywhere) pops it out into a small window on every workspace. Omarchy's Super+O works too.".into(),
+                    false,
+                ));
             }
             SettingsPage::Interface => {
                 v.push(Row::Section("Layout".into()));

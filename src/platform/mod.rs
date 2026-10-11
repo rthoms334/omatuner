@@ -1,12 +1,14 @@
 //! Desktop integration: MPRIS, idle inhibit, notifications/reminders, file picker, Hyprland
-//! helpers. Owner: WP-08. Every service degrades gracefully (logs a warning and becomes a
-//! no-op) when its D-Bus name / Wayland protocol / binary is unavailable.
+//! helpers, the pop-out player's window control. Owner: WP-08. Every service degrades
+//! gracefully (logs a warning and becomes a no-op) when its D-Bus name / Wayland protocol /
+//! binary is unavailable.
 
 pub mod filepicker;
 pub mod hypr;
 pub mod idle;
 pub mod mpris;
 pub mod notify;
+pub mod popout;
 pub mod signals;
 
 use crate::model::{ItemRef, ReminderId};
@@ -25,6 +27,8 @@ pub enum PlatformEvent {
     ReminderWatch { reminder: ReminderId, channel: ItemRef },
     /// File picker result (None = cancelled). `purpose` echoes the request.
     FilePicked { purpose: PickPurpose, path: Option<std::path::PathBuf> },
+    /// Pop-out player: Hyprland window state and request results (`platform::popout`).
+    PopOut(popout::PopOutEvent),
 }
 
 /// glibc malloc arenas the process may create (default: 8 per core).

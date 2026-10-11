@@ -584,7 +584,7 @@ fn help_and_jobs_overlays() {
     assert_eq!(h.state_mut().act(Action::Down), "Keep");
     assert_eq!(h.state_mut().act(Action::Quit), "Ignored", "globals keep working");
     assert_eq!(h.state_mut().act(Action::ToggleHelp), "Close");
-    assert_eq!(h.state().ov.key_contexts(), vec![KeyContext::Panel]);
+    assert_eq!(h.state().ov.key_contexts(), vec![KeyContext::Help]);
 
     // jobs: nothing running, the logged failure listed, Enter expands it, Ctrl+J closes
     let t = h.into_state().t;
