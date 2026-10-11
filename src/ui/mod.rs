@@ -33,7 +33,7 @@ use eframe::egui;
 
 use crate::config::Config;
 use crate::keymap::{Action, KeyContext};
-use crate::model::{ChannelId, ChannelSummary, Collection, GroupId, ItemRef, MovieId, ProgrammeId, Quality, SeriesId, SourceId, Timestamp};
+use crate::model::{ChannelId, ChannelSummary, Collection, GroupId, ItemRef, MovieId, ProgrammeId, SeriesId, SourceId, Timestamp};
 use crate::msg::{AppEvent, Toast};
 use crate::player::PlayerSnapshot;
 use crate::services::Services;
@@ -353,7 +353,7 @@ impl<'a> UiCtx<'a> {
     /// The quality badge of a channel (measured this session, else the library's: measured
     /// earlier, else from the name), or `None` while Settings ▸ Interface ▸ Quality badges
     /// is off.
-    pub fn quality(&self, ch: &ChannelSummary) -> Option<Quality> {
+    pub fn quality(&self, ch: &ChannelSummary) -> Option<crate::model::QualityBadge> {
         self.quality_badges().of(ch)
     }
     /// [`UiCtx::quality`] as a `Copy` value (for painters that can't borrow the context).

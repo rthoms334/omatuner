@@ -15,7 +15,7 @@ use super::progress::paint_progress;
 use super::{RowState, glyphs, paint};
 use crate::config::Density;
 use crate::images::ImageCache;
-use crate::model::{ChannelSummary, Episode, Group, NowNext, ProgrammeSlim, Quality, Timestamp};
+use crate::model::{ChannelSummary, Episode, Group, NowNext, ProgrammeSlim, QualityBadge, Timestamp};
 use crate::store::library::SourceMeta;
 use crate::theme::{SpaceToken, Theme, TypeToken, with_alpha};
 
@@ -136,7 +136,7 @@ pub struct ChannelRowOpts<'a> {
     /// guide import runs (DESIGN §13.12).
     pub no_guide_label: Option<&'a str>,
     /// The quality badge after the name (`UiCtx::quality`; `None` = unknown or badges off).
-    pub quality: Option<Quality>,
+    pub quality: Option<QualityBadge>,
 }
 
 /// The detail line of a channel row for a row `width`: "title · 20:00–21:00 · next: X",
@@ -630,6 +630,7 @@ mod tests {
             source_id: crate::model::SourceId(1),
             key: crate::model::ItemKey("k".into()),
             name: "BBC One".into(),
+            provider_name: None,
             number: Some(101),
             logo: None,
             group_ids: vec![],

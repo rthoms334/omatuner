@@ -8,6 +8,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::OnceLock;
 
 use crate::model::{CategoryTag, ItemKind, TagKind};
+use crate::sources::name_tokens::{Kind, Token, closing, deco_ascii, flag_code, is_format_word, is_service_word, quality_word, tokens};
 
 /// Countries whose categories count as English-language by default (with `lang:en`).
 pub const ENGLISH_COUNTRIES: &[&str] = &["GB", "US", "CA", "AU", "IE", "NZ"];
@@ -49,7 +50,8 @@ const SYNONYMS: &[(&str, &[&str])] = &[
     ("PL", &["POL", "POLAND", "POLSKA"]),
     ("NL", &["NLD", "NED", "HOLLAND", "NETHERLANDS", "NEDERLAND"]),
     ("BE", &["BEL", "BELGIUM", "BELGIQUE"]),
-    ("SE", &["SWE", "SWEDEN", "SVERIGE"]),
+    // `SW` is Sweden on IPTV panels (`SW ★ …`)
+    ("SE", &["SWE", "SW", "SWEDEN", "SVERIGE"]),
     ("NO", &["NOR", "NORWAY", "NORGE"]),
     ("DK", &["DNK", "DEN", "DENMARK", "DANMARK"]),
     ("FI", &["FIN", "FINLAND", "SUOMI"]),
@@ -118,10 +120,35 @@ const SYNONYMS: &[(&str, &[&str])] = &[
     ("GH", &["GHA", "GHANA"]),
     ("CM", &["CMR", "CAMEROON"]),
     ("SN", &["SEN", "SENEGAL"]),
-    ("CI", &["CIV"]),
+    ("CI", &["CIV", "COTEDIVOIRE"]),
     ("CY", &["CYPRUS"]),
     ("MT", &["MALTA"]),
     ("JM", &["JAMAICA"]),
+    // full names seen as channel / category prefixes (`URUGUAY ★ …`, `SENEGAL: …`)
+    ("UY", &["URUGUAY"]),
+    ("DO", &["DOMINICAN", "DOMINICANA"]),
+    ("EC", &["ECUADOR"]),
+    ("HN", &["HONDURAS"]),
+    ("GT", &["GUATEMALA"]),
+    ("PA", &["PANAMA"]),
+    ("CU", &["CUBA"]),
+    ("UG", &["UGANDA"]),
+    ("TZ", &["TANZANIA"]),
+    ("ML", &["MALI"]),
+    ("GN", &["GUINEE", "GUINEA"]),
+    ("BF", &["BURKINAFASO"]),
+    ("TG", &["TOGO"]),
+    ("BJ", &["BENIN"]),
+    ("GA", &["GABON"]),
+    ("TD", &["TCHAD", "CHAD"]),
+    ("GM", &["GAMBIA"]),
+    ("SL", &["SIERRALEONE"]),
+    ("CV", &["CAPEVERDE"]),
+    ("AO", &["ANGOLA"]),
+    ("MZ", &["MOZAMBIQUE"]),
+    ("NA", &["NAMIBIA"]),
+    ("ER", &["ERITREA"]),
+    ("DJ", &["DJIBOUTI"]),
     ("lang:en", &["EN", "ENG", "ENGLISH"]),
     ("lang:ar", &["AR", "ARA", "ARAB", "ARABIC"]),
     ("lang:fr", &["FRE", "FRENCH", "FRANCAIS", "FRANÇAIS"]),
@@ -137,10 +164,11 @@ const SYNONYMS: &[(&str, &[&str])] = &[
     ("lang:hi", &["HIN", "HINDI"]),
     ("lang:ur", &["URD", "URDU"]),
     ("lang:ta", &["TAM", "TAMIL"]),
-    ("lang:te", &["TEL", "TELUGU"]),
+    ("lang:te", &["TEL", "TELUGU", "TELEGU"]),
+    ("lang:or", &["ODIA", "ORIYA"]),
     ("lang:pa", &["PUNJABI"]),
     ("lang:bn", &["BANGLA", "BENGALI"]),
-    ("lang:ml", &["MALAYALAM"]),
+    ("lang:ml", &["MAL", "MALAYALAM"]),
     ("lang:kn", &["KANNADA"]),
     ("lang:mr", &["MARATHI"]),
     ("lang:gu", &["GUJARATI"]),
@@ -157,34 +185,25 @@ const SYNONYMS: &[(&str, &[&str])] = &[
     ("region:latam", &["LAT", "LATIN", "LATINO", "LATINA", "LATAM"]),
     ("region:exyu", &["EX-YU", "EXYU", "YU", "BALKAN", "BALKANS"]),
     ("region:africa", &["AF", "AFR", "AFRICA", "AFRIKA", "AFRICAN"]),
-    ("region:asia", &["ASI", "ASIA", "ASIAN"]),
-    ("region:caribbean", &["CARIB", "CARIBBEAN"]),
+    // `AS ❖ Singapore`: Asia in IPTV line-ups, not American Samoa
+    ("region:asia", &["AS", "ASI", "ASIA", "ASIAN"]),
+    ("region:caribbean", &["CAR", "CARIB", "CARIBBEAN"]),
     ("region:nordic", &["NORDIC", "NORDICS", "SCANDINAVIA", "SCANDI"]),
     ("region:europe", &["EU", "EUROPE"]),
 ];
 
-/// Leading / trailing words that are not countries (quality, access, format…): skipped when
-/// bracketed or separated, never a tag (`TV` and `SD` are also ISO codes, `FM` too). Numbers are
-/// skipped the same way.
+/// Leading / trailing words that are not countries (access, format…): skipped when bracketed
+/// or separated, never a tag (`TV` and `SD` are also ISO codes, `FM` too). The quality, format
+/// and service words of `name_tokens` (`4K`, `HEVC`, `VIP`, `24/7`…) and numbers are skipped
+/// the same way.
 const NON_TAGS: &[&str] = &[
-    "4K",
-    "8K",
-    "HD",
-    "FHD",
-    "UHD",
+    // Sudan's code, but a quality word in names
     "SD",
-    "HDR",
-    "HEVC",
-    "H265",
-    "VIP",
-    "PPV",
     "VOD",
     "NEW",
     "XXX",
     "ADULT",
     "18+",
-    "24/7",
-    "24-7",
     "TV",
     "FM",
     "LIVE",
@@ -214,7 +233,7 @@ const SPACED_CODES: &[&str] = &[
 /// Three-letter codes that are also English words: not tags with a space only or `.` / `-`
 /// joined (`"CAN SPORTS"`), still tags with a separator (`"CAN | Sports"`).
 const AMBIGUOUS: &[&str] =
-    &["ARM", "BRA", "CAN", "CHI", "COL", "DEN", "EST", "FIN", "GEO", "KEN", "MAR", "PER", "ROM", "RUM", "SEN", "SPA", "TAM", "TEL", "TUN"];
+    &["ARM", "BRA", "CAN", "CAR", "CHI", "COL", "DEN", "EST", "FIN", "GEO", "KEN", "MAR", "PER", "ROM", "RUM", "SEN", "SPA", "TAM", "TEL", "TUN"];
 
 /// Full names that are adjectives: with a space only, a tag only in capitals (`"INDIAN
 /// MOVIES"`), not in a title (`"Indian Premier League"`, `"African Cup"`). Language names are
@@ -243,210 +262,139 @@ fn table() -> &'static HashMap<String, Option<&'static str>> {
     })
 }
 
-/// What one word of a category name is.
-enum Token {
+/// What one word of a name is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WordTag {
     Tag(CategoryTag),
+    /// A known word that is no tag: quality, format, access (`4K`, `HEVC`, `VIP`), numbers.
     NonTag,
     Unknown,
 }
 
-impl Token {
+impl WordTag {
     fn tag(self) -> Option<CategoryTag> {
         match self {
-            Token::Tag(t) => Some(t),
-            Token::NonTag | Token::Unknown => None,
+            WordTag::Tag(t) => Some(t),
+            WordTag::NonTag | WordTag::Unknown => None,
         }
     }
 }
 
-fn classify(word: &str) -> Token {
+/// A word → tag (ISO codes, [`SYNONYMS`]), non-tag ([`NON_TAGS`], the shared quality /
+/// format / service words of `name_tokens`, numbers) or unknown. Shared with smart names'
+/// prefix stripping.
+pub(crate) fn classify(word: &str) -> WordTag {
     if word.bytes().all(|b| b.is_ascii_digit()) {
-        return Token::NonTag;
+        return WordTag::NonTag;
     }
     match table().get(&word.to_uppercase()) {
-        Some(Some(tag)) => Token::Tag(CategoryTag((*tag).to_owned())),
-        Some(None) => Token::NonTag,
-        None => Token::Unknown,
+        Some(Some(tag)) => WordTag::Tag(CategoryTag((*tag).to_owned())),
+        Some(None) => WordTag::NonTag,
+        None if quality_word(word).is_some() || is_format_word(word) || is_service_word(word) => WordTag::NonTag,
+        None => WordTag::Unknown,
     }
 }
-
-/// Separates a tag from the rest of the name: anything but a letter, digit or space and the
-/// characters that continue a name (`( & ' + .`).
-fn is_separator(c: char) -> bool {
-    !c.is_alphanumeric() && !c.is_whitespace() && !matches!(c, '(' | '&' | '\'' | '’' | '+' | '.')
-}
-
-fn closer(open: char) -> Option<char> {
-    match open {
-        '[' => Some(']'),
-        '(' => Some(')'),
-        '{' => Some('}'),
-        '|' => Some('|'),
-        _ => None,
-    }
-}
-
-fn opener(close: char) -> Option<char> {
-    match close {
-        ']' => Some('['),
-        ')' => Some('('),
-        '}' => Some('{'),
-        '|' => Some('|'),
-        _ => None,
-    }
-}
-
-/// Regional-indicator symbol → its letter (`🇬` → `G`).
-fn regional(c: char) -> Option<char> {
-    let n = u32::from(c).checked_sub(0x1F1E6).filter(|n| *n < 26)?;
-    char::from_u32(u32::from('A') + n)
-}
-
-const BLACK_FLAG: char = '\u{1F3F4}';
 
 /// A flag's letters are an ISO code first (`🇦🇷` is Argentina, not Arabic), else a synonym
-/// (`🇪🇺` → Europe).
-fn flag_tag(code: &str) -> Option<CategoryTag> {
-    if ISO2.split_ascii_whitespace().any(|cc| cc == code) {
-        return Some(CategoryTag::country(code));
+/// (`🇪🇺` → Europe); England's, Scotland's and Wales' flags are GB.
+pub(crate) fn flag_tag(flag: &str) -> Option<CategoryTag> {
+    let code = flag_code(flag);
+    if matches!(code.as_str(), "gbeng" | "gbsct" | "gbwls") {
+        return Some(CategoryTag::country("GB"));
     }
-    classify(code).tag()
-}
-
-fn is_flag_start(c: char) -> bool {
-    regional(c).is_some() || c == BLACK_FLAG
-}
-
-/// Byte length of the leading run of letters / digits.
-fn alnum_len(s: &str) -> usize {
-    s.char_indices().find(|(_, c)| !c.is_alphanumeric()).map_or(s.len(), |(i, _)| i)
-}
-
-/// `[X] rest` / `(X) rest` / `{X} rest` / `|X| rest` → (`X`, `rest`).
-fn bracketed(s: &str) -> Option<(&str, &str)> {
-    let open = s.chars().next()?;
-    let close = closer(open)?;
-    let body = &s[open.len_utf8()..];
-    let end = body.find(close)?;
-    let inner = &body[..end];
-    (!inner.trim().is_empty() && inner.len() <= MAX_BRACKET).then(|| (inner, &body[end + close.len_utf8()..]))
-}
-
-/// `rest [X]` (and the other brackets) → (`rest`, `X`).
-fn bracketed_end(s: &str) -> Option<(&str, &str)> {
-    let close = s.chars().next_back()?;
-    let open = opener(close)?;
-    let body = &s[..s.len() - close.len_utf8()];
-    let start = body.rfind(open)?;
-    let inner = &body[start + open.len_utf8()..];
-    (!inner.trim().is_empty() && inner.len() <= MAX_BRACKET).then(|| (&body[..start], inner))
-}
-
-/// The word at the start of `s` (which starts with a letter or digit) and what follows it.
-/// A listed compound (`EX-YU`, `24/7`, `18+`) is one word.
-fn first_word(s: &str) -> Option<(&str, &str)> {
-    let end = alnum_len(s);
-    if end == 0 {
+    if code.len() != 2 {
         return None;
     }
-    let rest = &s[end..];
-    let compound = match rest.chars().next() {
-        Some('-' | '/') => Some(end + 1 + alnum_len(&rest[1..])).filter(|e| *e > end + 1),
-        Some('+') => Some(end + 1),
-        _ => None,
-    };
-    if let Some(e) = compound
-        && !matches!(classify(&s[..e]), Token::Unknown)
-    {
-        return Some((&s[..e], &s[e..]));
+    if ISO2.split_ascii_whitespace().any(|cc| cc == code) {
+        return Some(CategoryTag::country(&code));
     }
-    Some((&s[..end], rest))
+    classify(&code).tag()
 }
 
-/// The word at the end of `s` and what precedes it (compounds as in [`first_word`]).
-fn last_word(s: &str) -> Option<(&str, &str)> {
-    let start = s.char_indices().rev().take_while(|(_, c)| c.is_alphanumeric()).last()?.0;
-    let before = &s[..start];
-    if let Some(head) = before.strip_suffix(['-', '/'])
-        && let Some((h, _)) = head.char_indices().rev().take_while(|(_, c)| c.is_alphanumeric()).last()
-        && !matches!(classify(&s[h..]), Token::Unknown)
-    {
-        return Some((&s[..h], &s[h..]));
+/// The tokens of a name for detection: a word with joiners that is not itself a known
+/// compound (`EX-YU`, `24/7`) is split at them (`UK-DOCS`, `UK.Sports`, `UK/US`, `Sci-Fi`), the
+/// joiner becoming an unspaced separator.
+fn tag_tokens(name: &str) -> Vec<Token<'_>> {
+    let mut out = Vec::new();
+    for t in tokens(name) {
+        if !t.is(Kind::Word) || !matches!(classify(t.text), WordTag::Unknown) {
+            out.push(t);
+            continue;
+        }
+        let mut spaced = t.spaced;
+        let mut start = 0;
+        for (i, c) in t.text.char_indices() {
+            if matches!(c, '-' | '–' | '.' | '/' | '_' | ':' | ',') && i > start {
+                out.push(Token { kind: Kind::Word, text: &t.text[start..i], spaced });
+                out.push(Token { kind: Kind::Sep, text: &t.text[i..i + c.len_utf8()], spaced: false });
+                spaced = false;
+                start = i + c.len_utf8();
+            }
+        }
+        out.push(Token { kind: Kind::Word, text: &t.text[start..], spaced });
     }
-    Some((before, &s[start..]))
+    out
+}
+
+/// Byte length of tokens as written.
+fn span_len(toks: &[Token<'_>]) -> usize {
+    toks.iter().enumerate().map(|(i, t)| t.text.len() + usize::from(i > 0 && t.spaced)).sum()
+}
+
+/// A bracket starting at `i` (`[X]`, `(X)`, `{X}`, `|X|`…): its inner tokens and the index after
+/// it. Not for empty or long contents.
+fn bracket<'t, 'a>(t: &'t [Token<'a>], i: usize) -> Option<(&'t [Token<'a>], usize)> {
+    let close = match t.get(i)? {
+        o if o.is(Kind::Open) => closing(t, i)?,
+        p if p.is(Kind::Sep) && p.text == "|" => t[i + 1..].iter().position(|x| x.is(Kind::Sep) && x.text.starts_with('|'))? + i + 1,
+        _ => return None,
+    };
+    let inner = &t[i + 1..close];
+    (inner.iter().any(|x| !x.is(Kind::Sep)) && span_len(inner) <= MAX_BRACKET).then_some((inner, close + 1))
+}
+
+/// A bracket ending at `end - 1`: the index of its opener and its inner tokens.
+fn bracket_end<'t, 'a>(t: &'t [Token<'a>], end: usize) -> Option<(usize, &'t [Token<'a>])> {
+    let last = t.get(end.checked_sub(1)?)?;
+    let open = if last.is(Kind::Close) {
+        let want = match last.text {
+            ")" => "(",
+            "]" => "[",
+            "}" => "{",
+            "⁾" => "⁽",
+            "】" => "【",
+            "」" => "「",
+            _ => return None,
+        };
+        t[..end - 1].iter().rposition(|x| x.is(Kind::Open) && x.text == want)?
+    } else if last.is(Kind::Sep) && last.text == "|" {
+        t[..end - 1].iter().rposition(|x| x.is(Kind::Sep) && x.text.ends_with('|'))?
+    } else {
+        return None;
+    };
+    let inner = &t[open + 1..end - 1];
+    (inner.iter().any(|x| !x.is(Kind::Sep)) && span_len(inner) <= MAX_BRACKET).then_some((open, inner))
 }
 
 /// The words of a bracket: a tag when every word is a tag, a flag or a non-tag (`[UK]`,
 /// `[VIP UK]`, `[🇬🇧]`, first tag wins), a non-tag when all are non-tags (`[4K]`), unknown
 /// otherwise (`[In Cinemas]`).
-fn classify_inner(inner: &str) -> Token {
-    let mut found = Token::NonTag;
-    let mut rest = inner;
-    loop {
-        rest = rest.trim_start_matches(|c: char| !c.is_alphanumeric() && !is_flag_start(c));
-        if let Some((tag, after)) = flag(rest) {
-            if let Some(t) = tag
-                && !matches!(found, Token::Tag(_))
-            {
-                found = Token::Tag(t);
-            }
-            rest = after;
-            continue;
+fn classify_inner(inner: &[Token<'_>]) -> WordTag {
+    let mut found = WordTag::NonTag;
+    for t in inner {
+        let class = match t.kind {
+            Kind::Word => classify(t.text),
+            Kind::Deco => classify(&deco_ascii(t.text)),
+            Kind::Flag => flag_tag(t.text).map_or(WordTag::NonTag, WordTag::Tag),
+            Kind::Sep | Kind::Open | Kind::Close => continue,
+        };
+        match class {
+            WordTag::Unknown => return WordTag::Unknown,
+            WordTag::Tag(tag) if !matches!(found, WordTag::Tag(_)) => found = WordTag::Tag(tag),
+            WordTag::Tag(_) | WordTag::NonTag => {}
         }
-        let Some((word, after)) = first_word(rest) else { break };
-        match classify(word) {
-            Token::Unknown => return Token::Unknown,
-            Token::Tag(t) if !matches!(found, Token::Tag(_)) => found = Token::Tag(t),
-            Token::Tag(_) | Token::NonTag => {}
-        }
-        rest = after;
     }
     found
-}
-
-/// A flag emoji at the start: `Some((tag, rest))` (the tag `None` for a flag that is not a
-/// listed country, which is then skipped like decoration).
-fn flag(s: &str) -> Option<(Option<CategoryTag>, &str)> {
-    let mut chars = s.chars();
-    let first = chars.next()?;
-    if let Some(a) = regional(first) {
-        let rest = &s[first.len_utf8()..];
-        return Some(match chars.next().and_then(regional) {
-            Some(b) => (flag_tag(&format!("{a}{b}")), &rest[4..]),
-            None => (None, rest),
-        });
-    }
-    if first != BLACK_FLAG {
-        return None;
-    }
-    // subdivision flags: 🏴 + tag letters (`gbeng`, `gbsct`, `gbwls`) + cancel tag
-    let mut end = first.len_utf8();
-    let mut code = String::new();
-    for c in s[end..].chars() {
-        match c {
-            '\u{E0061}'..='\u{E007A}' => code.extend(char::from_u32(u32::from(c) - 0xE0000)),
-            '\u{E007F}' => {
-                end += c.len_utf8();
-                break;
-            }
-            _ => break,
-        }
-        end += c.len_utf8();
-    }
-    let gb = matches!(code.as_str(), "gbeng" | "gbsct" | "gbwls").then(|| CategoryTag::country("GB"));
-    Some((gb, &s[end..]))
-}
-
-/// Skip leading decoration (`★ ✦ ◉ • ▎ # »`, spaces…) up to a letter, digit, flag or bracket.
-fn skip_decoration(s: &str) -> &str {
-    let mut rest = s;
-    while let Some(c) = rest.chars().next() {
-        if c.is_alphanumeric() || is_flag_start(c) || (closer(c).is_some() && bracketed(rest).is_some()) {
-            break;
-        }
-        rest = &rest[c.len_utf8()..];
-    }
-    rest
 }
 
 /// A code joined to the rest by `.` or an unspaced `-` (`"UK.Sports"`, `"UK-DOCS"`) or followed
@@ -472,100 +420,121 @@ fn space_separated_ok(word: &str, tag: &CategoryTag) -> bool {
     !word.chars().any(char::is_lowercase) || (tag.kind() != TagKind::Language && !DEMONYMS.contains(&word.to_uppercase().as_str()))
 }
 
-/// A `-` between two letters is a hyphenated word (`Sci-Fi`, `Re-Runs`, `Al-Jazeera`), not a
-/// separator.
-fn hyphenated(before: &str, after: &str) -> bool {
-    before.chars().next_back().is_some_and(char::is_alphanumeric) && after.chars().next().is_some_and(char::is_alphanumeric)
-}
-
 /// Grammar steps 1–7 of DESIGN §28.2: the tag at the start of the name.
-fn leading(name: &str) -> Option<CategoryTag> {
-    let mut rest = name;
+fn leading(t: &[Token<'_>]) -> Option<CategoryTag> {
+    let mut i = 0;
     for _ in 0..MAX_TOKENS {
-        rest = skip_decoration(rest);
-        if let Some((tag, after)) = flag(rest) {
-            if tag.is_some() {
-                return tag;
+        // decoration (`★ ✦ ◉ • ▎ # »`, `ᴴᴰ`, a stray bracket) up to a word, flag or bracket
+        while let Some(tok) = t.get(i) {
+            let deco = match tok.kind {
+                Kind::Sep | Kind::Open => bracket(t, i).is_none(),
+                Kind::Deco | Kind::Close => true,
+                Kind::Word | Kind::Flag => false,
+            };
+            if !deco {
+                break;
             }
-            rest = after;
-            continue;
+            i += 1;
         }
-        if let Some((inner, after)) = bracketed(rest) {
-            match classify_inner(inner) {
-                Token::Tag(t) => return Some(t),
-                Token::NonTag => {
-                    rest = after;
-                    continue;
-                }
-                Token::Unknown => return None,
-            }
-        }
-        let (word, after) = first_word(rest)?;
-        let next = after.trim_start();
-        let spaced = next.len() < after.len();
-        match next.chars().next() {
-            // the whole (remaining) name: `ENGLISH`, `VIP | UK`
-            None => return classify(word).tag(),
-            Some(c) if is_separator(c) || (c == '.' && !spaced) => {
-                // `UK-DOCS`, `UK.Sports`: only a short code joins the next word (`Sci-Fi`,
-                // `Al-Jazeera`, `No. 1` are words)
-                let joined = !spaced && (c == '.' || (c == '-' && hyphenated(word, &next[1..])));
-                match classify(word) {
-                    Token::Tag(t) if !joined || short_code_ok(word) => return Some(t),
-                    Token::NonTag if !joined => rest = next,
-                    Token::Tag(_) | Token::NonTag | Token::Unknown => return None,
-                }
-            }
-            Some(_) if spaced => match classify(word) {
-                Token::Tag(t) => return space_separated_ok(word, &t).then_some(t),
-                // `VIP UK | Sports`, `4K UHD | UK`, `NEW ZEALAND`
-                Token::NonTag => rest = next,
-                Token::Unknown => return None,
+        let tok = t.get(i)?;
+        match tok.kind {
+            Kind::Flag => match flag_tag(tok.text) {
+                Some(tag) => return Some(tag),
+                None => i += 1,
             },
-            Some(_) => return None,
+            Kind::Open | Kind::Sep => {
+                let (inner, after) = bracket(t, i)?;
+                match classify_inner(inner) {
+                    WordTag::Tag(tag) => return Some(tag),
+                    WordTag::NonTag => i = after,
+                    WordTag::Unknown => return None,
+                }
+            }
+            Kind::Word => {
+                let word = tok.text;
+                match t.get(i + 1) {
+                    // the whole (remaining) name: `ENGLISH`, `VIP | UK`
+                    None => return classify(word).tag(),
+                    Some(n) if n.is(Kind::Sep) => {
+                        // `UK-DOCS`, `UK.Sports`: only a short code joins the next word
+                        // (`Sci-Fi`, `Al-Jazeera`, `No. 1` are words)
+                        let glued_word = t.get(i + 2).is_some_and(|w| w.is(Kind::Word) && !w.spaced);
+                        let joined = !n.spaced && (n.text == "." || (matches!(n.text, "-" | "–") && glued_word));
+                        match classify(word) {
+                            WordTag::Tag(tag) if !joined || short_code_ok(word) => return Some(tag),
+                            WordTag::NonTag if !joined => i += 1,
+                            WordTag::Tag(_) | WordTag::NonTag | WordTag::Unknown => return None,
+                        }
+                    }
+                    Some(n) if n.spaced => match classify(word) {
+                        WordTag::Tag(tag) => return space_separated_ok(word, &tag).then_some(tag),
+                        // `VIP UK | Sports`, `4K UHD | UK`, `NEW ZEALAND`
+                        WordTag::NonTag => i += 1,
+                        WordTag::Unknown => return None,
+                    },
+                    Some(_) => return None,
+                }
+            }
+            Kind::Deco | Kind::Close => unreachable!("skipped as decoration"),
         }
     }
     None
 }
 
 /// Grammar step 8: `Sports (UK)`, `Movies [EN]`, `NETFLIX - EN`, `Sports | UK` (trailing
-/// non-tags skipped: `Sports | UK | HD`).
-fn trailing(name: &str) -> Option<CategoryTag> {
-    let mut rest = name.trim_end();
+/// non-tags and decoration skipped: `Sports | UK | HD`, `Sports | UK ◉`).
+fn trailing(t: &[Token<'_>]) -> Option<CategoryTag> {
+    let mut end = t.len();
     for _ in 0..MAX_TOKENS {
-        if let Some((before, inner)) = bracketed_end(rest) {
+        while let Some(last) = end.checked_sub(1).and_then(|e| t.get(e)) {
+            let deco = match last.kind {
+                Kind::Sep | Kind::Close => bracket_end(t, end).is_none(),
+                Kind::Deco | Kind::Open => true,
+                Kind::Word | Kind::Flag => false,
+            };
+            if !deco {
+                break;
+            }
+            end -= 1;
+        }
+        let last = t.get(end.checked_sub(1)?)?;
+        if let Some((open, inner)) = bracket_end(t, end) {
             match classify_inner(inner) {
-                Token::Tag(t) => return Some(t),
-                Token::NonTag => {
-                    rest = before.trim_end();
+                WordTag::Tag(tag) => return Some(tag),
+                WordTag::NonTag => {
+                    end = open;
                     continue;
                 }
-                Token::Unknown => return None,
+                WordTag::Unknown => return None,
             }
         }
-        let (before, word) = last_word(rest)?;
-        let lead = before.trim_end();
-        // nothing before the word: the whole name, handled by `leading`
-        let sep = lead.chars().next_back()?;
-        let head = &lead[..lead.len() - sep.len_utf8()];
-        if !is_separator(sep) || (sep == '-' && lead.len() == before.len() && hyphenated(head, word)) {
+        if last.is(Kind::Flag) {
+            return flag_tag(last.text);
+        }
+        // nothing before the word: the whole name, handled by `leading`; a word before it
+        // (`Sports UK`) or a hyphen (`Movies-UK`): no separator
+        let sep = t.get(end.checked_sub(2)?)?;
+        let hyphen = sep.text.starts_with('-') && !sep.spaced && !last.spaced && end >= 3 && t[end - 3].is(Kind::Word);
+        if !sep.is(Kind::Sep) || hyphen {
             return None;
         }
-        match classify(word) {
-            Token::Tag(t) => return (!NOT_TRAILING.contains(&word.to_uppercase().as_str())).then_some(t),
-            Token::NonTag => rest = head.trim_end(),
-            Token::Unknown => return None,
+        match classify(last.text) {
+            WordTag::Tag(tag) => return (!NOT_TRAILING.contains(&last.text.to_uppercase().as_str())).then_some(tag),
+            WordTag::NonTag => end -= 2,
+            WordTag::Unknown => return None,
         }
     }
     None
 }
 
 /// The tag of a raw category name, if it has one (grammar, synonyms and non-tags: DESIGN
-/// §28.2). `"UK | Sports"`, `"|UK| Movies"`, `"[UK] Kids"`, `"UK: News"`, `"🇬🇧 Sports"` →
-/// `GB`; `"EN ▎Movies"`, `"ENGLISH"` → `lang:en`; `"4K | Sports"`, `"VIP"`, `"CNN: Live"` → none.
+/// §28.2), read through the shared name tokenizer (`name_tokens`). `"UK | Sports"`, `"|UK|
+/// Movies"`, `"[UK] Kids"`, `"UK: News"`, `"UK ★ News"`, `"UK ❖ News"`, `"🇬🇧 Sports"` →
+/// `GB`; `"EN ▎Movies"`, `"ENGLISH"` → `lang:en`; `"4K | Sports"`, `"VIP"`, `"CNN: Live"` →
+/// none.
 pub fn detect_tag(raw: &str) -> Option<CategoryTag> {
-    let name = raw.trim();
-    leading(name).or_else(|| trailing(name))
+    let t = tag_tokens(raw.trim());
+    leading(&t).or_else(|| trailing(&t))
 }
 
 /// Is this one of the English-language tags (pre-ticked by default)?
@@ -658,6 +627,7 @@ const LANGUAGE_NAMES: &[(&str, &str)] = &[
     ("hi", "Hindi"),
     ("ur", "Urdu"),
     ("ta", "Tamil"),
+    ("or", "Odia"),
     ("te", "Telugu"),
     ("pa", "Punjabi"),
     ("bn", "Bengali"),
@@ -819,6 +789,20 @@ mod tests {
             ("# DE: Sport", Some("DE")),
             ("UK/US Sports", Some("GB")),
             ("NL| Kinderen", Some("NL")),
+            // any symbol run separates (the shared tokenizer), decoration at either end
+            ("UK ★ Sports", Some("GB")),
+            ("UK ❖ General", Some("GB")),
+            ("UK ⓧ Movies", Some("GB")),
+            ("|UK|", Some("GB")),
+            ("UK:", Some("GB")),
+            ("UK\u{a0}❖\u{a0}Kids", Some("GB")),
+            ("Sports | UK ◉", Some("GB")),
+            ("Sports | UK ᴴᴰ", Some("GB")),
+            ("ALB ★ Filma", Some("AL")),
+            ("LATAM ❖ Futbol", Some("region:latam")),
+            ("SW ❖ Musik", Some("SE")),
+            ("URUGUAY ★ Futbol", Some("UY")),
+            ("CAR ★ Music", Some("region:caribbean")),
             // flags (regional indicators, England's subdivision flag)
             ("🇬🇧 Sports", Some("GB")),
             ("🇺🇸 News", Some("US")),
@@ -864,6 +848,7 @@ mod tests {
             ("ENGLAND | Football", Some("GB")),
             ("ENG | Movies", Some("lang:en")),
             ("AR | News", Some("lang:ar")),
+            ("AS ❖ Other Asia", Some("region:asia")),
             ("ARG | Futbol", Some("AR")),
             ("ARGENTINA", Some("AR")),
             ("YU: Filmovi", Some("region:exyu")),
@@ -916,6 +901,12 @@ mod tests {
             ("Sports", None),
             ("", None),
             ("🏴 Pirates", None),
+            ("GENERAL ᴴᴰ/", None),
+            ("VIP ❖ Premier League+", None),
+            ("SAT: Movies", None),
+            ("UHD | Sports", None),
+            ("1080p ★ Movies", None),
+            ("CAR SHOWS", None),
         ];
         for (raw, want) in cases {
             assert_eq!(detect_tag(raw).as_ref().map(|t| t.0.as_str()), *want, "{raw:?}");

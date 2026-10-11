@@ -480,15 +480,12 @@ impl Overlay for SearchOverlay {
                 if self.query.is_empty() && c.is_whitespace() {
                     return OverlayOutcome::Keep;
                 }
-                self.edit(|q| q.push(c))
+                self.edit(|q| crate::search::push_typed(q, c))
             }
             Action::FilterBackspace => self.edit(|q| {
                 q.pop();
             }),
-            Action::FilterDeleteWord => self.edit(|q| {
-                let cut = q.trim_end().rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
-                q.truncate(cut);
-            }),
+            Action::FilterDeleteWord => self.edit(crate::search::delete_last_word),
             Action::FilterClear => self.edit(String::clear),
             Action::Back if !self.query.is_empty() => self.edit(String::clear),
             Action::Back => OverlayOutcome::Close,

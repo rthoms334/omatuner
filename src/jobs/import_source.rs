@@ -69,7 +69,7 @@ use crate::sources::http::{DownloadOutcome, DownloadRequest, open_decompressed};
 use crate::sources::identity::{self, KeyAllocator, group_key, normalize_group, normalize_name};
 use crate::sources::m3u::{self, M3uEntry, M3uError};
 use crate::sources::m3u_vod::{self, EntryClass, EpisodeMarker};
-use crate::sources::smart_names::{clean_channel_name, clean_group_name, clean_vod_name};
+use crate::sources::smart_names::{clean_channel_name, clean_vod_name, group_display};
 use crate::sources::xtream::XtreamClient;
 use crate::sources::xtream::detect::{PlaylistScan, parse_stream_url};
 use crate::sources::xtream::types::{XtCategory, XtLiveStream, XtSeries, XtVodStream};
@@ -686,12 +686,6 @@ fn payload_name(kind: PayloadKind) -> &'static str {
 
 fn non_empty(s: Option<&str>) -> Option<String> {
     s.map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned)
-}
-
-/// Display name of a group (smart cleanup or trimmed raw), never empty.
-fn group_display(raw: &str, smart: bool) -> String {
-    let name = if smart { clean_group_name(raw) } else { raw.trim().to_owned() };
-    if name.trim().is_empty() { "Uncategorized".to_owned() } else { name }
 }
 
 /// Convert one M3U entry. `smart` = smart-name cleanup on. Group keys are returned in
