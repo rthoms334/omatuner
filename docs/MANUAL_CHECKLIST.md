@@ -341,6 +341,49 @@ These items use the **default** profile: start Tuner from the launcher, not with
   - **Expect:**
     - The audio continues. Video decoding is suspended after about 2 s (CPU drops).
     - The video resumes within a moment of coming back.
+- [ ] **No "application not responding" on a hidden workspace, without the snippet:**
+  - **Do:** with the `render_unfocused` rule still commented out, play a live channel, switch
+    to another workspace, open a browser there and use it for 2 minutes. Then check the main
+    thread: `eu-stack -p $(pgrep -x tuner) | sed -n '/^TID/,/^$/p' | head -20`.
+  - **Expect:**
+    - Hyprland never shows its "… is not responding" dialog for Tuner.
+    - The main thread waits in `epoll_wait`/`poll` (winit's event loop), not in
+      `eglSwapBuffers` or `wl_display_dispatch_queue`.
+    - Back on Tuner's workspace the UI answers at once.
+- [ ] **CPU while visible:** **Do:** watch `top -p $(pgrep -x tuner)` with Tuner idle on
+  Live TV (nothing playing), then playing a live channel fullscreen. **Expect:** idle ≈ 0 %
+  (no busy loop); while playing the same level as before this version, and video motion as
+  smooth.
+- [ ] **Pop-out across workspaces:**
+  - **Do:** play a live channel and press `o` in the player. Switch through workspaces 1–4,
+    open a browser on one of them. Zap with ↑/↓, change the volume with `+`/`-`, pause with
+    Space, hover the video.
+  - **Expect:**
+    - The window floats at 480 × 270 in the bottom-right corner (inside the bar and the
+      gaps), with Omarchy's rounded `pop` look, and stays on top on every workspace.
+    - Only the video shows; hovering or a key shows the strip (channel, programme, volume).
+    - All the keys work; Esc first closes a side panel (`c`), then puts the window back.
+- [ ] **Back to tiled, remembered place:**
+  - **Do:** pop out, drag the pop-out to the top-left and make it bigger (Super+drag), then
+    press Esc. Pop out again. Then change Settings ▸ Player ▸ Pop-out corner and pop out again.
+  - **Expect:**
+    - Esc (also `o`, or a double-click) tiles the window again on the current workspace and
+      shows the screen you popped out from (the player, or Live TV with the mini player
+      after Ctrl+Shift+O there).
+    - The second pop-out comes back at the dragged place and size; after changing the corner
+      it goes to that corner at the preset size.
+- [ ] **Super+O switches to video-only by itself:**
+  - **Do:** with Tuner focused on Live TV, press Super+O. Then press Super+O again. Then press
+    Super+O once more and resize the window bigger than 1300 × 900.
+  - **Expect:**
+    - The 1300 × 900 pinned window shows the video-only player (or "Nothing playing" with the
+      way back), on every workspace.
+    - The second Super+O brings the full interface back.
+    - A pinned window bigger than 1300 × 900 shows the full interface; Esc/`o` in the player
+      then unpins and tiles it.
+- [ ] **Pop-out outside Hyprland:** **Do:** run `env -u HYPRLAND_INSTANCE_SIGNATURE tuner
+  --profile-dir /tmp/tuner-nohypr` and press Ctrl+Shift+O. **Expect:** a toast says the
+  pop-out needs Hyprland; nothing else changes.
 - [ ] **Omarchy menu:**
   - **Do:** merge `packaging/omarchy/omarchy-menu.jsonc` into
     `~/.config/omarchy/extensions/omarchy-menu.jsonc`, then run `omarchy menu summon tv`.

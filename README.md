@@ -60,6 +60,8 @@ on-screen controls, and a light theme (catppuccin-latte).
   - Aspect and zoom, stream info, and configurable skip steps.
   - Smart reconnects with clear error messages.
   - A corner mini-player, and window fullscreen.
+  - A pop-out player on Hyprland: a small video-only window that stays on screen on every
+    workspace (`o` in the player, Ctrl+Shift+O anywhere; see [Pop-out player](#pop-out-player)).
 - **Desktop:** MPRIS (media keys and the Omarchy bar's media widget), desktop notifications for
   reminders, and an idle inhibitor while video plays. It runs as a single instance and opens
   M3U files and links from the desktop.
@@ -286,6 +288,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Ctrl+P` | Open the player (from the mini player) |
 | `Ctrl+Shift+P` | Play / pause |
 | `Ctrl+Shift+S` | Stop playback |
+| `Ctrl+Shift+O` | Pop the player out (small, on every workspace) / back in |
 | `Ctrl+R` / `F5` | Refresh playlists & guide |
 | `Ctrl+J` | Show background tasks |
 | `F1` | Keyboard help |
@@ -489,6 +492,7 @@ The full reference is generated from `src/keymap.rs`:
 | `V` | Zoom |
 | `f` | Toggle window fullscreen |
 | `p` | Keep playing in the mini player |
+| `o` | Pop out: small window on every workspace (Hyprland) |
 | `q` | Stop and close |
 | `r` | Retry (after an error) |
 | `Ctrl+F` | Add to / remove from Favourites |
@@ -520,6 +524,7 @@ The full reference is generated from `src/keymap.rs`:
 | `V` | Zoom |
 | `f` | Toggle window fullscreen |
 | `p` | Keep playing in the mini player |
+| `o` | Pop out: small window on every workspace (Hyprland) |
 | `q` | Stop and close |
 | `r` | Retry (after an error) |
 | `Ctrl+F` | Add to / remove from Favourites |
@@ -536,6 +541,12 @@ The full reference is generated from `src/keymap.rs`:
 | `Enter` | Activate control |
 | `Tab` / `Shift+Tab` | Next / previous control |
 | `Esc` | Leave the controls |
+
+### Pop-out player (`PopOut`)
+
+| Keys | Action |
+|---|---|
+| `Esc` / `o` | Back to the full window |
 
 ### Channel number entry (`NumericEntry`)
 
@@ -703,6 +714,28 @@ Search, Playlists & settings). Open it with `omarchy menu summon tv`.
 
 **Media keys:** Tuner registers `org.mpris.MediaPlayer2.tuner`, so `playerctl -p tuner
 play-pause` and Omarchy's media keys and bar widget work, also while the window is hidden.
+
+### Pop-out player
+
+Press `o` in the player, or Ctrl+Shift+O anywhere, to pop the player out: Tuner floats its
+window, makes it small (16:9), puts it in a corner and **pins** it, so it stays on screen on
+every workspace you switch to. The window then shows only the video. Moving the mouse over it,
+or pressing a key, shows a short strip with the channel, what's on and the volume. All player
+keys keep working: ↑/↓ zap, Space pauses, `m` mutes, `+`/`-` set the volume, `c` lists the
+channels. Press Esc or `o`, or double-click the video, to put the window back where it was
+(tiled, on the workspace you are on now). Nothing playing? The pop-out says so and tells you
+how to get back.
+
+- Settings ▸ Player ▸ *Pop-out (Hyprland)* picks the size (Small 480 × 270 or Medium
+  640 × 360) and the corner (bottom right by default). If you move or resize the pop-out, it
+  comes back there next time; changing either setting resets that.
+- **Super+O** (Omarchy's *Pop window out*) works too: a pinned Tuner window at Omarchy's pop
+  size (1300 × 900) or smaller switches to the video-only player by itself, and Esc or `o` puts
+  it back. A bigger pinned window keeps the full interface.
+- The pop-out is tagged `pop` like Omarchy's own, so it gets the same look.
+- It needs Hyprland. Elsewhere the key only says so.
+- The packaged window rules (`hypr/tuner.lua`, above) are not needed for the pop-out, but they
+  keep video rendering while a *tiled* Tuner sits on another workspace.
 
 ## Troubleshooting
 

@@ -1238,6 +1238,22 @@ also receive as `UiCtx::mini_rect` (the guide keeps the focused cell clear of it
 mini-player never shows over Onboarding or the Player (`allows_mini_player() == false`).
 Overlays centre with a bg @ 0.5 scrim.
 
+### 12.3 Video-only layout (pop-out, `ui/popout.rs`)
+The window shows only the player — no sidebar, status bar or mini player — while
+* our pop-out is requested or active (`o` / Ctrl+Shift+O, §21.6), whatever its size, or
+* Hyprland reports the window **floating and pinned** and it is at most Omarchy's Super+O pop
+  size, 1300 × 900 logical px (`omarchy-hyprland-window-pop`'s default). A bigger pinned
+  window keeps the full UI; floating alone never switches.
+
+It never shows while a pop-in is in flight, nor between the pop-in's result and Hyprland's
+unpin event (no flash). The app draws the Player screen and gives it the keys whatever the
+route stack says (`TunerApp::view_route`); the stack itself stays, so popping back in returns
+to the screen the user left (it is entered again). In video-only mode a route step back
+(`p` keep playing, `q` stop and close, a finished movie returning to its page) pops the window
+back in instead of leaving the player. Key stack: the player's contexts with `PopOut` right
+above `PlayerLive`/`PlayerVod` — Esc pops back in once a side panel, number entry or controls
+focus has had it.
+
 ---
 
 ## 13. Screens & components
@@ -1527,6 +1543,14 @@ Live preview opens the player. End of playback per §13.6. Esc leaves to the pre
 playback continues in the mini player (bottom-right 16:9, 320 Wide / 240 Medium × rem, hidden
 in Compact → status-bar chip; click = back to player, ✕ = stop).
 
+**Video-only (popped-out window, §12.3).** Same screen, same keys (zap ↑/↓, volume, pause,
+mute, tracks, `c`/`g`/`h` panels) plus `PopOut` (Esc / `o` = back to the full window). The
+passive banner is one bottom strip — title (⏸ when paused) and volume, then the programme on
+now (live) or position / duration (VOD), Body/Caption type, no scale factor; the full OSD
+returns only in controls focus mode or with a side panel open. Double-click pops back in
+(instead of window fullscreen). Nothing playing: "Nothing playing · o or Esc: back to the full
+window" on black.
+
 
 ### 13.9 Settings
 ```
@@ -1574,6 +1598,7 @@ favourites lists) show a 󰇙 drag grip and move with Alt+↑/↓ or K/J. Every 
 | | Resume threshold · watched % | `player.resume_min_s`, `watched_pct` | 60 · 92 |
 | | Default User-Agent | `player.user_agent` | VLC/3.0.21 |
 | | Advanced mpv options | `player.mpv_options` | {} |
+| | Pop-out size · corner (Hyprland, §21.6) | `player.popout_size`, `popout_corner` (+ `popout_last`, remembered at pop-in) | small 480 × 270 · bottom right |
 | Interface | Start screen | `general.start_screen` | Auto (Live until favourites/history exist, then Home) |
 | | Sidebar · density · channel numbers · logos · 24 h clock | `interface.*` | auto · comfortable · on · on · on |
 | | Live preview autoplay · preview delay · guide preview · mini player · OSD timeout | `interface.*` | **off** · 1200 ms · off · on · 3500 ms |
@@ -1697,12 +1722,13 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 
 ### 15.1 Model & layers
 * **Contexts** (`keymap::KeyContext`): Global, List, ListFiltering, PosterGrid,
-  PosterGridFiltering, Detail, Guide, PlayerLive, PlayerVod, PlayerOsd, NumericEntry,
+  PosterGridFiltering, Detail, Guide, PlayerLive, PlayerVod, PlayerOsd, PopOut, NumericEntry,
   EpgMapping, Search, Modal, TextInput, Panel.
 * **Stack per frame**: topmost overlay's contexts, else the current screen's focused-element
   contexts (e.g. `[ListFiltering]`, `[PlayerOsd, PlayerLive]`, `[NumericEntry, Guide]`,
   `[List, PlayerLive]` for a player side panel, `[TextInput, Modal]` for a focused field), then
-  `Global`.
+  `Global`. The video-only player (§12.3) adds `PopOut` right above the player's base context
+  (`[PopOut, PlayerLive]`, `[List, PopOut, PlayerLive]`).
 * **Resolution happens in `App::raw_input_hook`**, before egui processes input, and every event
   that resolves to an action is **removed** from the input — egui never handles it a second time
   (Enter would also click the focused button; Tab would move egui focus). Unresolved events
@@ -1719,8 +1745,8 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
   * **TextInput owns the keyboard**: after its own table only Ctrl/Alt chords and F-keys may
     reach `Global`; Space, ←/→, Delete, Backspace… return `None` and go to the text widget;
     contexts below it are never consulted (typing a space in Rename can't confirm the dialog).
-  * Modal swallows printable text it doesn't bind; PlayerOsd, NumericEntry and EpgMapping fall
-    through to the context below.
+  * Modal swallows printable text it doesn't bind; PlayerOsd, PopOut, NumericEntry and
+    EpgMapping fall through to the context below.
   * Key auto-repeat never produces `Parent`/`Back` (holding Backspace to clear a filter stops at
     the empty filter).
   * `Global` contains only Ctrl/Alt/F-key chords so it never steals typing.
@@ -1735,7 +1761,8 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
   non-Idle player state); with nothing playing it does nothing rather than open an empty player.
 * **Mouse parity**: everything is clickable; hover moves list cursors only after real pointer
   motion (Omarchy `pointerGate`); right-click = context menu; wheel = volume only in the
-  fullscreen player; double-click on video = window fullscreen.
+  fullscreen player; double-click on video = window fullscreen (in the video-only player: pop
+  back in).
 * **Discoverability**: `?`/F1 help overlay (current contexts first) and the status-bar hint line
   (`keymap::hint_line`: curated verbs, keys looked up in the tables).
 * No Super bindings inside the app (Omarchy owns Super). `Ctrl+Space` is avoided (fcitx5 IME
@@ -1760,6 +1787,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Ctrl+P` | Open the player (from the mini player) |
 | `Ctrl+Shift+P` | Play / pause |
 | `Ctrl+Shift+S` | Stop playback |
+| `Ctrl+Shift+O` | Pop the player out (small, on every workspace) / back in |
 | `Ctrl+R` / `F5` | Refresh playlists & guide |
 | `Ctrl+J` | Show background tasks |
 | `F1` | Keyboard help |
@@ -1963,6 +1991,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `V` | Zoom |
 | `f` | Toggle window fullscreen |
 | `p` | Keep playing in the mini player |
+| `o` | Pop out: small window on every workspace (Hyprland) |
 | `q` | Stop and close |
 | `r` | Retry (after an error) |
 | `Ctrl+F` | Add to / remove from Favourites |
@@ -1994,6 +2023,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `V` | Zoom |
 | `f` | Toggle window fullscreen |
 | `p` | Keep playing in the mini player |
+| `o` | Pop out: small window on every workspace (Hyprland) |
 | `q` | Stop and close |
 | `r` | Retry (after an error) |
 | `Ctrl+F` | Add to / remove from Favourites |
@@ -2010,6 +2040,12 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Enter` | Activate control |
 | `Tab` / `Shift+Tab` | Next / previous control |
 | `Esc` | Leave the controls |
+
+#### Pop-out player (`PopOut`)
+
+| Keys | Action |
+|---|---|
+| `Esc` / `o` | Back to the full window |
 
 #### Channel number entry (`NumericEntry`)
 
@@ -2287,6 +2323,44 @@ File pickers through the XDG portal (`rfd` xdg-portal → portal-gtk, auto-float
 prefer-dark/light). `hypr::focus_self` uses Hyprland 0.56's Lua dispatcher
 (`hl.dsp.focus({ window = "class:^(tuner)$" })`) with the legacy `focuswindow` fallback, like
 `omarchy-launch-or-focus`.
+
+### 21.6 Pop-out player (`platform/popout.rs`, `ui/popout.rs`)
+A floating **pinned** Hyprland window is shown on every workspace — Omarchy's Super+O
+(`omarchy-hyprland-window-pop`: float, 1300 × 900, centre, pin, raise, tag `pop`) does that
+for any window. Tuner does it for itself with `o` in the player or Ctrl+Shift+O anywhere:
+* **IPC**: requests on `$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket.sock` (what
+  `hyprctl` writes: `j/clients`, `j/monitors`, `/dispatch …`), from the `hypr-popout` worker
+  thread; the UI only sends `PopRequest`s and gets `PlatformEvent::PopOut` back. Our window is
+  the mapped client with **our pid** (never matched by class); its address must be `0x`+hex
+  before it is put into a dispatcher.
+* **Syntax**: Lua first (`hl.dsp.window.float({ window = "address:0x…", action = "enable" })`,
+  `pin`, `resize { x, y }`, `move { x, y }`, `alter_zorder { mode = "top" }`, `tag { tag =
+  "+pop" }` — Hyprland 0.56 parses `action = enable|disable|toggle`), classic on a non-`ok`
+  reply (`setfloating`/`settiled`, `pin` (toggle — sent only when the state differs),
+  `resizewindowpixel exact W H,address:…`, `movewindowpixel exact X Y,address:…`,
+  `alterzorder top,…`, `tagwindow ±pop …`), exactly like `omarchy-hyprland-window-pop`. The
+  syntax that worked first is kept for the session.
+* **Pop-out**: (unless already) float → size → move → (unless already) pin → raise → tag `pop`
+  (Omarchy rounds `tag:pop` windows). Size: Settings ▸ Player ▸ Pop-out size, Small 480 × 270
+  (default) or Medium 640 × 360; place: the chosen corner (default bottom-right) of the
+  window's monitor, inside its reserved area (bar), 16 px margin. A fullscreen window is taken
+  out of fullscreen first (the worker retries for 1 s until Hyprland sees it).
+* **Pop-in** undoes only what pop-out changed: unpin (unless it was pinned), untag (unless it
+  was tagged), then back to its floating geometry if it was floating, else tiled — on the
+  workspace the user is on now (a pinned window travels). The pop-out's place and size at
+  that moment are remembered (`player.popout_last`, relative to the monitor, clamped on
+  reuse); changing size or corner in Settings forgets it. Toggling while popped out by
+  Super+O (no record) does what Super+O's second press does: unpin, untag, tile.
+* **State**: the `hypr-events` thread reads `.socket2.sock` and reports our window's
+  floating / pinned flags (`changefloatingmode>>ADDR,0|1`, `pin>>ADDR,0|1`; `openwindow`
+  re-looks our window up, `closewindow` forgets it). They drive the video-only layout
+  (§12.3) and end our pop-out when someone else unpins it (Super+O pressed again).
+* **Outside Hyprland** (no `HYPRLAND_INSTANCE_SIGNATURE`) the key only toasts that the
+  pop-out needs Hyprland. Failures (refused dispatch, window not listed) are toasted and leave
+  the layout docked. Unit tests never talk to a compositor: `HyprIpc` has a fake that
+  answers like Hyprland in either syntax, and the app takes a recording `PopOutBackend`.
+* A popped-out window is always visible, so its playback never meets the hidden-workspace
+  limits of §11.1.
 
 ---
 
