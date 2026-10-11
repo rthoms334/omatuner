@@ -61,6 +61,15 @@ impl Toast {
     pub fn error(text: impl Into<String>) -> Self {
         Self { kind: ToastKind::Error, text: text.into(), action: None, ttl_ms: 6000 }
     }
+    /// An M3U playlist now signs in with its Xtream login (DESIGN §27.3); `name` when it could
+    /// be any of several playlists.
+    pub fn upgraded(name: Option<&str>) -> Self {
+        const TEXT: &str = "upgraded to Xtream login — movies & series now available";
+        match name {
+            Some(n) => Self::info(format!("{n}: {TEXT}")),
+            None => Self::info("Upgraded to Xtream login — movies & series now available"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

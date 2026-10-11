@@ -353,12 +353,8 @@ impl TunerApp {
                 // DESIGN §27.3: also after a silent (scheduled) refresh; named when it could be
                 // any of several playlists
                 if *upgraded {
-                    let text = if self.lib.sources.len() > 1 {
-                        format!("{}: upgraded to Xtream login — movies & series now available", self.source_name(*source))
-                    } else {
-                        "Upgraded to Xtream login — movies & series now available".to_owned()
-                    };
-                    self.toast(Toast::info(text));
+                    let name = (self.lib.sources.len() > 1).then(|| self.source_name(*source));
+                    self.toast(Toast::upgraded(name.as_deref()));
                 }
             }
             // AddSource ran the first import inline (no `SourceRefreshed`): its stored account

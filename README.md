@@ -620,7 +620,7 @@ tuner [--view home|live|guide|movies|series|search|settings] [--play <ref>]
 | `--play <ref>` | Play a channel by its stable reference `<source-id>:<item-key>` (e.g. `2:xt:live:1234`), a stream URL or a media file. |
 | `--debug` | Debug logging for this session, whatever the setting says. |
 | `--profile-dir <dir>` | Keep config, data, cache, logs and the socket under `<dir>`. Use it for testing, or for a second profile. |
-| `--refresh` | Refresh stale playlists and guides without a window, then exit (status 1 if a refresh failed). Does nothing while Tuner is running, because the open window refreshes on its own. |
+| `--refresh` | Refresh stale playlists and guides without a window, then exit (status 1 if a refresh failed). Does nothing while Tuner is running, because the open window refreshes on its own. While it runs, starting Tuner waits a few seconds and then says a background refresh is running. A playlist it upgraded to its Xtream login is announced the next time Tuner opens. |
 | `PLAYLIST_OR_URL…` | An `.m3u`/`.m3u8` file opens the add-playlist card. A stream URL or media file plays straight away. `file://` URIs are treated as paths. |
 | `--help`, `--version` | Usage and version. |
 

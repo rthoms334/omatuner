@@ -73,6 +73,15 @@ impl Services {
         if let Err(e) = store.reader().and_then(|c| crate::store::sources::register_secrets(&c)) {
             tracing::error!("registering stored secrets: {e}");
         }
+        // playlists `tuner --refresh` switched to their Xtream login while no window was open
+        let toasts = bus.clone();
+        let _ = store.writer().submit(move |c| {
+            match crate::store::sources::take_unseen_upgrades(c) {
+                Ok(names) => names.iter().for_each(|n| toasts.toast(crate::msg::Toast::upgraded(Some(n)))),
+                Err(e) => tracing::warn!("upgrades of the last background refresh: {e}"),
+            }
+            Ok(())
+        });
         let http = HttpClient::new(&http_options(&config))?;
         let config: SharedConfig = Arc::new(RwLock::new(Arc::new(config)));
         let jobs = JobManager::new(JobContext::new(store.clone(), http.clone(), bus.clone(), paths.clone(), config.clone()), rt.handle().clone());

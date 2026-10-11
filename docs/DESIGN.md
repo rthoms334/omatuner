@@ -1001,7 +1001,11 @@ there for the focused channel).
 * Closed app: no background refresh in v1. `tuner --refresh` (for a future user timer) refreshes
   stale sources headlessly and exits (status 1 if a job failed). *Decided in phase 2:* while a
   windowed instance is running it does nothing and exits 0 — that instance owns the database
-  writer and its scheduler refreshes on its own.
+  writer and its scheduler refreshes on its own. *Phase 5 audit:* it holds the single-instance
+  lock (§21.4) for the whole refresh, marked `refresh` in the lock file, so the database keeps one
+  owner: a window launched meanwhile waits as for a starting instance (10 s) and then exits
+  with "a background refresh (tuner --refresh) is running; start Tuner again once it has
+  finished". Upgrades it performs are toasted by the next window (§27.3).
 
 ---
 
@@ -2252,7 +2256,7 @@ onboarding card at Details (`Route::Onboarding(PlaylistFile)`).
 running instance has another working directory); a local `file://` URI (desktop `%U`, file
 managers, `gio open`) is decoded to its path and treated like any other path, while
 `file://host/…` stays a URL. `tuner --refresh` never hands off: with an instance running it
-does nothing (§9.5).
+does nothing (§9.5); while it runs it holds the instance lock itself.
 
 ### 21.5 Files & windows
 File pickers through the XDG portal (`rfd` xdg-portal → portal-gtk, auto-floated, follows
@@ -2765,7 +2769,9 @@ Attempt:
 The outcome is `JobOutcome::SourceRefreshed { upgraded, account, … }`; the app shows
 `Toast::info("Upgraded to Xtream login — movies & series now available")` whenever `upgraded`
 (silent refreshes from the scheduler included) and forwards `account` to the connection budget
-as before. `AddSource` runs the same refresh inline (an "Add anyway" M3U may upgrade during its
+as before. `tuner --refresh` has no window to toast in: it notes each upgraded source in `meta`
+(`xtream-upgraded-unseen:<id>`, `note_unseen_upgrade`) and the next window's start takes them
+(`take_unseen_upgrades`: sources still Xtream, by name, once). `AddSource` runs the same refresh inline (an "Add anyway" M3U may upgrade during its
 first import; onboarding's Done step shows the counts, no toast).
 
 **Switching in Settings ▸ Playlists ▸ source** (UI): a toggle row "Use the Xtream login"

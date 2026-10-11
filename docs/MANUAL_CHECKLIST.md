@@ -92,6 +92,15 @@ in `~/.config/omarchy/shell.toml`; Tuner applies it live).
   - **Expect:**
     - The first command switches the running window to the guide and exits 0.
     - `--refresh` logs that Tuner is running and exits 0 without touching anything.
+- [ ] **Background refresh holds the profile:**
+  - **Do:** quit Tuner; make a playlist stale and start
+    `tuner --profile-dir /tmp/tuner-check --refresh`; while it runs, launch
+    `tuner --profile-dir /tmp/tuner-check`.
+  - **Expect:**
+    - The launch waits about 10 s, then exits saying a background refresh is running (unless
+      the refresh finished first, in which case the window opens).
+    - If the refresh upgraded a playlist to its Xtream login, the next window shows
+      "<name>: upgraded to Xtream login — movies & series now available" once.
 
 ## 2. Theme, fonts, look
 

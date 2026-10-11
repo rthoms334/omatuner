@@ -208,6 +208,31 @@ pub fn record_upgrade_attempt(conn: &Connection, id: SourceId, attempt: &Upgrade
     Ok(())
 }
 
+/// `meta` key marking a source upgraded by `tuner --refresh`, while no window could say so.
+fn unseen_upgrade_key(id: SourceId) -> String {
+    format!("xtream-upgraded-unseen:{}", id.0)
+}
+
+/// `tuner --refresh` switched this M3U source to its Xtream login: the next window says so
+/// ([`take_unseen_upgrades`], DESIGN §27.3).
+pub fn note_unseen_upgrade(conn: &Connection, id: SourceId) -> Result<()> {
+    conn.execute("INSERT INTO meta(key, value) VALUES (?1, '1') ON CONFLICT(key) DO NOTHING", [unseen_upgrade_key(id)])?;
+    Ok(())
+}
+
+/// The names of the sources upgraded since the last window (still there and still Xtream),
+/// forgetting them: the window that asks shows them.
+pub fn take_unseen_upgrades(conn: &Connection) -> Result<Vec<String>> {
+    atomic(conn, |c| {
+        let mut stmt = c.prepare(
+            "SELECT s.name FROM meta m JOIN source s ON m.key = 'xtream-upgraded-unseen:' || s.id WHERE s.kind = 'xtream' ORDER BY s.sort_index, s.id",
+        )?;
+        let names = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+        c.execute("DELETE FROM meta WHERE key LIKE 'xtream-upgraded-unseen:%'", [])?;
+        Ok(names)
+    })
+}
+
 /// `meta` key of the Xtream logins found in an M3U source's entries (redaction only).
 fn playlist_logins_key(id: SourceId) -> String {
     format!("playlist-logins:{}", id.0)
@@ -254,8 +279,8 @@ pub(crate) fn purge_source(conn: &Connection, id: SourceId) -> Result<()> {
     }
     atomic(conn, |c| {
         c.execute(
-            "DELETE FROM meta WHERE key LIKE ?1 OR key IN (?2, ?3)",
-            params![format!("import:{}:%", id.0), upgrade_key(id), playlist_logins_key(id)],
+            "DELETE FROM meta WHERE key LIKE ?1 OR key IN (?2, ?3, ?4)",
+            params![format!("import:{}:%", id.0), upgrade_key(id), playlist_logins_key(id), unseen_upgrade_key(id)],
         )?;
         c.execute("DELETE FROM source WHERE id = ?1", [id])?;
         Ok(())

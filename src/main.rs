@@ -9,7 +9,10 @@
 //! `tuner --refresh` refreshes stale playlists and guides without a window and exits (for a
 //! future systemd user timer): no player, no UI, exit status 1 if a refresh failed. While a
 //! windowed instance runs it does nothing — that instance owns the database writer and its
-//! scheduler refreshes on its own.
+//! scheduler refreshes on its own. It holds the instance lock for the whole refresh, so a
+//! window started meanwhile waits like for a starting instance and then says a background
+//! refresh is running; playlists it upgraded to their Xtream login are toasted by the next
+//! window (`store::sources::note_unseen_upgrade`).
 
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -23,7 +26,7 @@ use tuner::cli::Cli;
 use tuner::config::Config;
 use tuner::fonts::{FontSet, LoadedFonts};
 use tuner::ipc::{Handoff, IpcRequest};
-use tuner::jobs::{JobContext, JobEvent, JobKind, JobManager};
+use tuner::jobs::{JobContext, JobEvent, JobKind, JobManager, JobOutcome};
 use tuner::model::JobId;
 use tuner::msg::{AppEvent, EventBus};
 use tuner::paths::AppPaths;
@@ -60,10 +63,11 @@ fn main() -> anyhow::Result<()> {
         if let Some(e) = config_err {
             tracing::error!("{e}; using defaults (your file was not modified)");
         }
-        if instance_running(&paths) {
-            tracing::info!("Tuner is running; it refreshes stale sources itself");
+        // held until the refresh is done: a window started meanwhile must not open the database
+        let Some(_instance) = refresh_lock(&paths) else {
+            tracing::info!("Tuner (or another refresh) is running; it refreshes stale sources itself");
             return Ok(());
-        }
+        };
         let failed = refresh_headless(paths, config, REFRESH_TIMEOUT)?;
         anyhow::ensure!(failed == 0, "{failed} refresh job(s) failed (see the log)");
         return Ok(());
@@ -145,11 +149,24 @@ fn absolute_input(input: &str) -> String {
     }
 }
 
-/// Something listens on the instance socket (a stale file refuses the connection), or an
-/// instance is starting (it holds the instance lock). Only connects — sending a request would
-/// raise that instance's window.
-fn instance_running(paths: &AppPaths) -> bool {
-    std::os::unix::net::UnixStream::connect(paths.ipc_socket()).is_ok() || matches!(instance_lock(paths), Ok(None))
+/// `--refresh`: take the instance lock for the whole refresh, marked [`REFRESH_MARK`]. `None`:
+/// an instance holds it (running, starting, or another refresh) or something listens on the
+/// instance socket (a stale file refuses the connection). Only connects — sending a request
+/// would raise that instance's window.
+fn refresh_lock(paths: &AppPaths) -> Option<InstanceLock> {
+    let lock = match instance_lock(paths) {
+        Ok(Some(file)) => {
+            mark_lock(&file, REFRESH_MARK);
+            InstanceLock { _file: Some(file) }
+        }
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!("single-instance lock {}: {e}", paths.runtime_dir.display());
+            InstanceLock { _file: None }
+        }
+    };
+    // an instance from before the lock existed
+    std::os::unix::net::UnixStream::connect(paths.ipc_socket()).is_err().then_some(lock)
 }
 
 /// Hand `request` to the running instance, or become it: `Some(lock)` = this process is the
@@ -160,12 +177,16 @@ fn instance_running(paths: &AppPaths) -> bool {
 /// opens the store; a launch that finds it held keeps retrying the handoff while the other
 /// instance starts — without removing a socket that refuses (it may be one that instance is
 /// binding right now) — and gives up after `wait` (that instance never served its socket). A
-/// request the running instance refuses fails right away.
+/// request the running instance refuses fails right away. A background refresh (`--refresh`)
+/// holds the lock too, serving no socket: the launch waits the same way, then says so.
 fn become_primary(paths: &AppPaths, request: &IpcRequest, wait: Duration) -> anyhow::Result<Option<InstanceLock>> {
     let deadline = Instant::now() + wait;
     loop {
         let lock = match instance_lock(paths) {
-            Ok(Some(lock)) => Some(InstanceLock { _file: Some(lock) }),
+            Ok(Some(lock)) => {
+                mark_lock(&lock, "");
+                Some(InstanceLock { _file: Some(lock) })
+            }
             Ok(None) => None,
             Err(e) => {
                 // e.g. a filesystem without locks: run as before, unguarded
@@ -181,7 +202,15 @@ fn become_primary(paths: &AppPaths, request: &IpcRequest, wait: Duration) -> any
             Handoff::NoServer if lock.is_some() => return Ok(lock),
             Handoff::NoServer => {}
         }
-        anyhow::ensure!(Instant::now() < deadline, "{} is already running but doesn't answer (try again in a moment)", tuner::APP_NAME);
+        if Instant::now() >= deadline {
+            let holder = std::fs::read_to_string(lock_path(paths)).unwrap_or_default();
+            anyhow::ensure!(
+                holder != REFRESH_MARK,
+                "a background refresh (tuner --refresh) is running; start {} again once it has finished",
+                tuner::APP_NAME
+            );
+            anyhow::bail!("{} is already running but doesn't answer (try again in a moment)", tuner::APP_NAME);
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
 }
@@ -192,12 +221,28 @@ struct InstanceLock {
     _file: Option<std::fs::File>,
 }
 
+/// The holder of the instance lock writes what it is into the file: this for `--refresh`,
+/// nothing for a window.
+const REFRESH_MARK: &str = "refresh";
+
+fn lock_path(paths: &AppPaths) -> PathBuf {
+    paths.runtime_dir.join("tuner.lock")
+}
+
+/// Say what holds the lock (see [`REFRESH_MARK`]); best effort, it only picks a message.
+fn mark_lock(file: &std::fs::File, holder: &str) {
+    use std::io::Write;
+    if let Err(e) = file.set_len(0).and_then(|()| (&*file).write_all(holder.as_bytes())) {
+        tracing::debug!("instance lock: {e}");
+    }
+}
+
 /// Take the exclusive instance lock (`<runtime dir>/tuner.lock`, released when the returned file
 /// closes, i.e. at the latest when the process exits). `Ok(None)` = another process holds it.
 fn instance_lock(paths: &AppPaths) -> std::io::Result<Option<std::fs::File>> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&paths.runtime_dir)?;
-    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(paths.runtime_dir.join("tuner.lock"))?;
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(lock_path(paths))?;
     match file.try_lock() {
         Ok(()) => Ok(Some(file)),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
@@ -239,7 +284,13 @@ fn wait_for_jobs(jobs: &JobManager, events: &Receiver<AppEvent>, root: JobId, ti
             Ok(AppEvent::Job(JobEvent::Finished { id, kind, outcome, .. })) => {
                 root_done |= id == root;
                 match outcome {
-                    Ok(_) => tracing::info!("refresh: {kind:?} done"),
+                    Ok(o) => {
+                        tracing::info!("refresh: {kind:?} done");
+                        // no window to say so: the next one does (written before the store closes)
+                        if let JobOutcome::SourceRefreshed { source, upgraded: true, .. } = o {
+                            let _ = jobs.context().store.writer().submit(move |c| tuner::store::sources::note_unseen_upgrade(c, source));
+                        }
+                    }
                     Err(e) => {
                         tracing::warn!("refresh: {kind:?} failed: {e}");
                         failed += 1;
@@ -315,17 +366,40 @@ mod tests {
         let paths = AppPaths::rooted(dir.path());
         std::fs::create_dir_all(&paths.runtime_dir).unwrap();
         let sock = paths.ipc_socket();
-        assert!(!instance_running(&paths));
+        assert!(refresh_lock(&paths).is_some());
         // a bound-then-closed socket file refuses connections
         drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
-        assert!(!instance_running(&paths));
+        assert!(refresh_lock(&paths).is_some());
         std::fs::remove_file(&sock).unwrap();
         let live = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-        assert!(instance_running(&paths));
+        assert!(refresh_lock(&paths).is_none());
         // an instance still starting holds the lock but serves no socket yet
         drop(live);
-        let _starting = instance_lock(&paths).unwrap().expect("lock");
-        assert!(instance_running(&paths));
+        let starting = instance_lock(&paths).unwrap().expect("lock");
+        assert!(refresh_lock(&paths).is_none());
+        drop(starting);
+    }
+
+    /// Audit fix: `--refresh` took the instance lock only to look, so a window started during
+    /// the refresh opened the same database and imported alongside it. It now holds the lock
+    /// until it is done: a launch waits as for a starting instance, then says why it can't
+    /// open; once the refresh is over the next launch is primary.
+    #[test]
+    fn a_launch_during_a_background_refresh_waits_then_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::rooted(dir.path());
+        let refresh = refresh_lock(&paths).expect("nothing running");
+        assert!(refresh_lock(&paths).is_none(), "one refresh at a time");
+        let req = IpcRequest::default();
+        let err = become_primary(&paths, &req, Duration::from_millis(200)).unwrap_err().to_string();
+        assert!(err.contains("background refresh"), "{err}");
+        drop(refresh);
+        let window = become_primary(&paths, &req, Duration::ZERO).unwrap().expect("primary once the refresh is done");
+        drop(window);
+        // a lock held by a window that is still starting is not mistaken for a refresh
+        let _starting = become_primary(&paths, &req, Duration::ZERO).unwrap().expect("primary");
+        let err = become_primary(&paths, &req, Duration::from_millis(200)).unwrap_err().to_string();
+        assert!(err.contains("doesn't answer"), "{err}");
     }
 
     /// Audit fix: two quick launches both missed the socket (bound only once the window is up)
@@ -395,6 +469,57 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let failed = refresh_headless(AppPaths::rooted(dir.path()), Config::default(), Duration::from_secs(60)).unwrap();
         assert_eq!(failed, 0);
+    }
+
+    /// Audit fix: a playlist `--refresh` switched to its Xtream login was never toasted. The
+    /// headless run notes it before the store closes; the next window takes it, once, by name
+    /// (a playlist switched back to M3U since is not announced).
+    #[test]
+    fn an_upgrade_by_the_background_refresh_is_kept_for_the_next_window() {
+        use tuner::model::{SourceColor, SourceDraft, SourceKind, XtreamCredentials};
+        use tuner::store::sources;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::rooted(dir.path());
+        paths.ensure().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (bus, events) = EventBus::new(None);
+        let store = Store::open(&paths.db_file(), None).unwrap();
+        let ids = store
+            .writer()
+            .blocking(|c| {
+                let draft = |name: &str| SourceDraft {
+                    name: name.into(),
+                    kind: SourceKind::M3uUrl,
+                    icon: String::new(),
+                    color: SourceColor::Accent,
+                    url: Some(format!("http://example.invalid/{name}.m3u")),
+                    path: None,
+                    xtream: None,
+                    settings: Default::default(),
+                };
+                let (a, b) = (sources::insert_source(c, &draft("Upgraded"), 0)?, sources::insert_source(c, &draft("Back"), 0)?);
+                let login = XtreamCredentials { server: "http://example.invalid".into(), username: "u".into(), password: "p".to_owned().into() };
+                sources::set_source_kind(c, a, SourceKind::Xtream, Some(&login))?;
+                Ok([a, b])
+            })
+            .unwrap();
+        let http =
+            HttpClient::new(&tuner::sources::http::HttpOptions { default_user_agent: "t".into(), connect_timeout_s: 1, read_timeout_s: 1 }).unwrap();
+        let jobs = JobManager::new(JobContext::new(store.clone(), http, bus.clone(), paths.clone(), Arc::default()), rt.handle().clone());
+        for (n, source) in ids.into_iter().enumerate() {
+            bus.send(AppEvent::Job(JobEvent::Finished {
+                id: JobId(n as u64 + 1),
+                kind: JobKind::RefreshSource { source, force: false },
+                outcome: Ok(JobOutcome::SourceRefreshed { source, summary: Default::default(), not_modified: false, account: None, upgraded: true }),
+                failure: None,
+            }));
+        }
+        assert_eq!(wait_for_jobs(&jobs, &events, JobId(1), Duration::from_secs(10)), 0);
+        assert!(store.close(Duration::from_secs(3)));
+
+        let store = Store::open(&paths.db_file(), None).unwrap();
+        assert_eq!(store.writer().blocking(|c| sources::take_unseen_upgrades(c)).unwrap(), ["Upgraded"]);
+        assert!(store.writer().blocking(|c| sources::take_unseen_upgrades(c)).unwrap().is_empty(), "said once");
     }
 
     #[test]
