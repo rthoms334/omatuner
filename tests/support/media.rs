@@ -2,13 +2,17 @@
 //! Tests that need media call `ensure_media()` and SKIP (return early with a note) when ffmpeg
 //! is unavailable, so `cargo test` stays green on minimal machines.
 //!
-//! [`TestServer`] is a tiny HTTP/1.1 file server (one request per connection, `Connection:
-//! close`) bound to 127.0.0.1 on an ephemeral port, running on its own thread and runtime so
-//! blocking tests can use it. It records every request (path, headers, open/close time),
-//! supports `Range`, and injects faults: forced statuses per path, connections cut after N
-//! bytes, 404 for every Nth HLS segment, throttling, and "kill"/"revive" of the whole server
-//! (listener closed, open connections reset). `/live/index.m3u8` is a sliding-window live
-//! playlist over the `long/` segments (one new 1 s segment per second, no `ENDLIST`).
+//! [`TestServer`] is a tiny HTTP/1.1 file server (by default one request per connection,
+//! `Connection: close`) bound to 127.0.0.1 on an ephemeral port, running on its own thread and
+//! runtime so blocking tests can use it. It records every request (path, headers, open/close
+//! time, connection and its n-th request), supports `Range`, and injects faults: forced
+//! statuses per path (or `prefix*`), connections cut after N bytes, 404 for every Nth HLS
+//! segment, throttling, "kill"/"revive" of the whole server (listener closed, open connections
+//! reset), and the provider behaviours of the 2026-10-11 field report: keep-alive connections
+//! the server closes when idle or abandons (a reused request is never answered), a text body
+//! where a playlist should be ("Cannot read …"), and a connection limit whose sessions linger
+//! after their connections closed. `/live/index.m3u8` is a sliding-window live playlist over
+//! the `long/` segments (one new 1 s segment per second, no `ENDLIST`).
 
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
@@ -101,6 +105,29 @@ pub struct Faults {
     pub segment_404_every: Option<u32>,
 }
 
+/// Keep-alive behaviour (see [`TestServer::set_keep_alive`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeepAlive {
+    /// `Connection: close` after every response.
+    #[default]
+    Off,
+    /// Persistent connections, closed silently (FIN) after this long without a request — a
+    /// provider closing idle connections between segment fetches.
+    IdleClose(Duration),
+    /// Persistent connections whose second request is read but never answered — a half-dead
+    /// connection (the client waits for its network timeout).
+    Abandon,
+}
+
+/// A provider's connection limit (see [`TestServer::set_session_limit`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionLimit {
+    /// Streams that may be open at once.
+    pub max: usize,
+    /// How long a stream still counts after its last connection closed.
+    pub linger: Duration,
+}
+
 /// One HTTP request as seen by the server.
 #[derive(Debug, Clone)]
 pub struct Request {
@@ -108,6 +135,9 @@ pub struct Request {
     /// Lower-cased names, values as sent.
     pub headers: Vec<(String, String)>,
     pub status: u16,
+    /// The connection it came on (numbered from 1) and its position there (1 = first).
+    pub conn: usize,
+    pub nth: usize,
     pub opened: Instant,
     /// When the connection ended (response done, cut, or reset by the client/kill).
     pub closed: Option<Instant>,
@@ -131,6 +161,74 @@ struct Shared {
     throttle_bps: Mutex<Option<u64>>,
     /// Requests are not recorded (long soaks: the log would grow with every stream load).
     unlogged: AtomicBool,
+    connections: AtomicUsize,
+    keep_alive: Mutex<KeepAlive>,
+    /// Paths answered 200 with this text.
+    bodies: Mutex<HashMap<String, String>>,
+    limit: Mutex<Option<SessionLimit>>,
+    /// Stream key → (open connections, last close).
+    sessions: Mutex<HashMap<String, (usize, Option<Instant>)>>,
+}
+
+impl Shared {
+    /// The forced status of `path`: its own, else the longest matching `prefix*`.
+    fn forced_status(&self, path: &str) -> Option<u16> {
+        let m = self.status.lock().unwrap();
+        m.get(path).copied().or_else(|| {
+            m.iter()
+                .filter_map(|(k, v)| Some((k.strip_suffix('*')?, *v)))
+                .filter(|(prefix, _)| path.starts_with(prefix))
+                .max_by_key(|(prefix, _)| prefix.len())
+                .map(|(_, v)| v)
+        })
+    }
+
+    /// Open a session of `key` unless the limit is reached by OTHER streams (the same stream
+    /// shares its session, like a provider recognising its client). `false` = refused.
+    fn open_session(&self, key: &str) -> bool {
+        let limit = *self.limit.lock().unwrap();
+        let mut sessions = self.sessions.lock().unwrap();
+        if let Some(l) = limit {
+            let now = Instant::now();
+            let alive = sessions
+                .iter()
+                .filter(|(k, (open, closed))| *k != key && (*open > 0 || closed.is_some_and(|c| now.duration_since(c) < l.linger)))
+                .count();
+            if alive >= l.max {
+                return false;
+            }
+        }
+        sessions.entry(key.to_owned()).or_default().0 += 1;
+        true
+    }
+
+    fn close_session(&self, key: &str) {
+        if let Some(s) = self.sessions.lock().unwrap().get_mut(key) {
+            s.0 = s.0.saturating_sub(1);
+            s.1 = Some(Instant::now());
+        }
+    }
+}
+
+/// The stream a request belongs to: its directory (`/live/seg001.ts` → `/live`), or the file
+/// itself at the top level (`/bars.ts`).
+fn stream_key(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(0) | None => path,
+        Some(i) => &path[..i],
+    }
+}
+
+/// Closes a session when its response ends (however the task ends).
+struct SessionGuard {
+    shared: Arc<Shared>,
+    key: String,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        self.shared.close_session(&self.key);
+    }
 }
 
 enum Ctl {
@@ -171,7 +269,8 @@ impl TestServer {
         format!("{}/{}", self.base, path.trim_start_matches('/'))
     }
 
-    /// Answer every request for `path` (e.g. `/a.ts`) with `status` (0 = back to normal).
+    /// Answer every request for `path` (e.g. `/a.ts`, or `/live/seg*` for every path with that
+    /// prefix) with `status` (0 = back to normal).
     pub fn set_status(&self, path: &str, status: u16) {
         let mut m = self.shared.status.lock().unwrap();
         if status == 0 {
@@ -179,6 +278,27 @@ impl TestServer {
         } else {
             m.insert(path.to_owned(), status);
         }
+    }
+
+    /// Keep connections open between requests ([`KeepAlive`]); applies to new requests.
+    pub fn set_keep_alive(&self, k: KeepAlive) {
+        *self.shared.keep_alive.lock().unwrap() = k;
+    }
+
+    /// Answer `path` with 200 and `text` (`None` = back to normal): the restreamer's "Cannot
+    /// read …" where a playlist should be.
+    pub fn set_body(&self, path: &str, text: Option<&str>) {
+        let mut m = self.shared.bodies.lock().unwrap();
+        match text {
+            Some(t) => m.insert(path.to_owned(), t.to_owned()),
+            None => m.remove(path),
+        };
+    }
+
+    /// Refuse (403) a stream while `max` OTHER streams are open or closed less than `linger`
+    /// ago (`None` = no limit). A stream is a directory (`/live`) or a top-level file.
+    pub fn set_session_limit(&self, limit: Option<SessionLimit>) {
+        *self.shared.limit.lock().unwrap() = limit;
     }
 
     /// Limit every response body to `bps` bytes per second (`None` = unlimited).
@@ -281,13 +401,27 @@ struct ConnGuard {
     index: Option<usize>,
 }
 
-impl Drop for ConnGuard {
-    fn drop(&mut self) {
-        self.shared.active.fetch_sub(1, Ordering::SeqCst);
-        if let Some(i) = self.index {
+impl ConnGuard {
+    fn stamp_closed(&mut self) {
+        if let Some(i) = self.index.take() {
             self.shared.requests.lock().unwrap()[i].closed = Some(Instant::now());
         }
     }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.shared.active.fetch_sub(1, Ordering::SeqCst);
+        self.stamp_closed();
+    }
+}
+
+/// What a served request leaves of its connection.
+enum After {
+    /// Nothing: closed, cut or broken.
+    Closed,
+    /// Response complete on a persistent connection: read the next request.
+    Next,
 }
 
 async fn connection(mut stream: TcpStream, ctx: Arc<Ctx>) {
@@ -295,37 +429,86 @@ async fn connection(mut stream: TcpStream, ctx: Arc<Ctx>) {
     let n = shared.active.fetch_add(1, Ordering::SeqCst) + 1;
     shared.max_active.fetch_max(n, Ordering::SeqCst);
     let mut guard = ConnGuard { shared: shared.clone(), index: None };
+    let conn = shared.connections.fetch_add(1, Ordering::SeqCst) + 1;
+    for nth in 1.. {
+        let keep = *shared.keep_alive.lock().unwrap();
+        let head = match keep {
+            KeepAlive::IdleClose(idle) if nth > 1 => match tokio::time::timeout(idle, read_head(&mut stream)).await {
+                Ok(h) => h,
+                Err(_) => return, // idle: close without a word
+            },
+            _ => read_head(&mut stream).await,
+        };
+        let Some((method, path, headers)) = head else { return };
+        let index = (!shared.unlogged.load(Ordering::SeqCst)).then(|| {
+            let mut reqs = shared.requests.lock().unwrap();
+            reqs.push(Request { path: path.clone(), headers: headers.clone(), status: 0, conn, nth, opened: Instant::now(), closed: None });
+            reqs.len() - 1
+        });
+        guard.index = index;
+        if keep == KeepAlive::Abandon && nth > 1 {
+            // half-dead: never answered; hold the socket until the client gives up
+            let mut probe = [0u8; 512];
+            let _ = tokio::time::timeout(Duration::from_secs(120), async {
+                while let Ok(n) = stream.read(&mut probe).await
+                    && n > 0
+                {}
+            })
+            .await;
+            return;
+        }
+        let persist = keep != KeepAlive::Off && method == "GET";
+        match respond(&mut stream, &ctx, &method, &path, &headers, index, persist).await {
+            After::Next => guard.stamp_closed(),
+            After::Closed => return,
+        }
+    }
+}
 
-    let Some((method, path, headers)) = read_head(&mut stream).await else { return };
-    let index = (!shared.unlogged.load(Ordering::SeqCst)).then(|| {
-        let mut reqs = shared.requests.lock().unwrap();
-        reqs.push(Request { path: path.clone(), headers: headers.clone(), status: 0, opened: Instant::now(), closed: None });
-        reqs.len() - 1
-    });
-    guard.index = index;
+/// Answer one request. `persist`: keep the connection open afterwards (`Connection:
+/// keep-alive`) unless the response is an error or was cut.
+async fn respond(
+    stream: &mut TcpStream,
+    ctx: &Ctx,
+    method: &str,
+    path: &str,
+    headers: &[(String, String)],
+    index: Option<usize>,
+    persist: bool,
+) -> After {
+    let shared = &ctx.shared;
     let set_status = |s: u16| {
         if let Some(i) = index {
             shared.requests.lock().unwrap()[i].status = s;
         }
     };
 
-    let forced = shared.status.lock().unwrap().get(&path).copied();
-    if let Some(code) = forced {
+    if let Some(code) = shared.forced_status(path) {
         set_status(code);
-        let _ = respond_error(&mut stream, code).await;
-        return;
+        let _ = respond_error(stream, code).await;
+        return After::Closed;
     }
     let is_segment = path.rsplit('/').next().is_some_and(|f| f.starts_with("seg") && f.ends_with(".ts"));
     if is_segment && let Some(every) = ctx.faults.segment_404_every {
         let k = shared.segment_count.fetch_add(1, Ordering::SeqCst) + 1;
         if every > 0 && k.is_multiple_of(every as usize) {
             set_status(404);
-            let _ = respond_error(&mut stream, 404).await;
-            return;
+            let _ = respond_error(stream, 404).await;
+            return After::Closed;
         }
     }
+    let key = stream_key(path).to_owned();
+    if !shared.open_session(&key) {
+        set_status(403);
+        let _ = respond_error(stream, 403).await;
+        return After::Closed;
+    }
+    let _session = SessionGuard { shared: shared.clone(), key };
 
-    let body = if path == "/live/index.m3u8" {
+    let text = shared.bodies.lock().unwrap().get(path).cloned();
+    let body = if let Some(t) = text {
+        Some(t.into_bytes())
+    } else if path == "/live/index.m3u8" {
         Some(live_playlist(ctx.epoch.elapsed()).into_bytes())
     } else {
         let rel = path.strip_prefix("/live/").map(|f| format!("long/{f}")).unwrap_or_else(|| path.trim_start_matches('/').to_owned());
@@ -333,8 +516,8 @@ async fn connection(mut stream: TcpStream, ctx: Arc<Ctx>) {
     };
     let Some(body) = body else {
         set_status(404);
-        let _ = respond_error(&mut stream, 404).await;
-        return;
+        let _ = respond_error(stream, 404).await;
+        return After::Closed;
     };
 
     let total = body.len() as u64;
@@ -344,21 +527,25 @@ async fn connection(mut stream: TcpStream, ctx: Arc<Ctx>) {
     set_status(status);
     let len = if total == 0 { 0 } else { end - start + 1 };
     let mut head = format!(
-        "HTTP/1.1 {status} {}\r\nContent-Type: {}\r\nContent-Length: {len}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n",
+        "HTTP/1.1 {status} {}\r\nContent-Type: {}\r\nContent-Length: {len}\r\nAccept-Ranges: bytes\r\nConnection: {}\r\n",
         reason(status),
-        content_type(&path)
+        content_type(path),
+        if persist { "keep-alive" } else { "close" }
     );
     if range.is_some() {
         head.push_str(&format!("Content-Range: bytes {start}-{end}/{total}\r\n"));
     }
     head.push_str("\r\n");
-    if stream.write_all(head.as_bytes()).await.is_err() || method == "HEAD" {
-        return;
+    if stream.write_all(head.as_bytes()).await.is_err() {
+        return After::Closed;
+    }
+    if method == "HEAD" {
+        return if persist { After::Next } else { After::Closed };
     }
 
-    let first = shared.first_seen.lock().unwrap().insert(path.clone());
+    let first = shared.first_seen.lock().unwrap().insert(path.to_owned());
     let cut = ctx.faults.drop_after_bytes.filter(|_| first);
-    let (mut rd, mut wr) = stream.into_split();
+    let (mut rd, mut wr) = stream.split();
     let mut probe = [0u8; 512];
     let mut sent = 0u64;
     let data = &body[start as usize..(start + len) as usize];
@@ -369,10 +556,10 @@ async fn connection(mut stream: TcpStream, ctx: Arc<Ctx>) {
             let _ = wr.write_all(&chunk[..(limit - sent) as usize]).await;
             // reset instead of a clean FIN so the client sees a broken transfer
             let _ = wr.as_ref().set_zero_linger();
-            return;
+            return After::Closed;
         }
         if wr.write_all(chunk).await.is_err() {
-            return;
+            return After::Closed;
         }
         sent += chunk.len() as u64;
         let bps = *shared.throttle_bps.lock().unwrap();
@@ -381,11 +568,14 @@ async fn connection(mut stream: TcpStream, ctx: Arc<Ctx>) {
             // compare these close times)
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs_f64(chunk.len() as f64 / bps as f64)) => {}
-                r = rd.read(&mut probe) => if matches!(r, Ok(0) | Err(_)) { return },
+                r = rd.read(&mut probe) => if matches!(r, Ok(0) | Err(_)) { return After::Closed },
             }
         }
     }
     let _ = wr.flush().await;
+    if persist {
+        return After::Next;
+    }
     let _ = wr.shutdown().await;
     // wait for the client to close (or 2 s) so `closed` reflects when the client let go
     let _ = tokio::time::timeout(Duration::from_secs(2), async {
@@ -394,6 +584,7 @@ async fn connection(mut stream: TcpStream, ctx: Arc<Ctx>) {
         {}
     })
     .await;
+    After::Closed
 }
 
 async fn read_head(stream: &mut TcpStream) -> Option<(String, String, Vec<(String, String)>)> {

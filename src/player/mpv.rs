@@ -11,6 +11,9 @@ use crate::config::{Config, SubtitleAuto};
 use crate::error::Result;
 use crate::model::Playable;
 
+/// Default `demuxer-lavf-o` (see [`create`]). Demuxers without the option ignore it.
+const DEMUXER_LAVF_O: &str = "http_persistent=0";
+
 /// User `mpv_options` that can never be changed at runtime: the render API owns the VO.
 const RUNTIME_DENY: &[&str] = &["vo", "gpu-context", "gpu-api", "wid", "config", "idle", "keep-open"];
 
@@ -33,6 +36,11 @@ pub fn create(cfg: &Config) -> Result<Mpv> {
         init.set_option("cache", "yes")?;
         init.set_option("demuxer-max-back-bytes", "32MiB")?;
         init.set_option("stream-lavf-o", "reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=5")?;
+        // HLS playlists and segments on fresh connections (field report 2026-10-11): providers
+        // close idle keep-alive connections between 10 s segment fetches ("Error reading HTTP
+        // response: End of file" every 10 s) or leave them half-dead (a 15 s "Connection timed
+        // out" stall per fetch, segments skipped). A user `demuxer-lavf-o` replaces this.
+        init.set_option("demuxer-lavf-o", DEMUXER_LAVF_O)?;
         for (name, value) in runtime_settings(cfg) {
             init.set_option(name, value.as_str())?;
         }
@@ -283,6 +291,19 @@ mod tests {
         cfg.player.mpv_options.insert("vo".into(), "null".into());
         cfg.player.mpv_options.insert("ao".into(), "null".into());
         create(&cfg).expect("mpv")
+    }
+
+    /// Field fix: HLS without keep-alive connections by default; the user's `mpv_options`
+    /// still win.
+    #[test]
+    fn hls_keepalive_is_off_unless_the_user_says_otherwise() {
+        let lavf_o = |mpv: &Mpv| mpv.get_property::<String>("demuxer-lavf-o").unwrap();
+        assert_eq!(lavf_o(&headless()), "http_persistent=0");
+        let mut cfg = Config::default();
+        cfg.player.mpv_options.insert("vo".into(), "null".into());
+        cfg.player.mpv_options.insert("ao".into(), "null".into());
+        cfg.player.mpv_options.insert("demuxer-lavf-o".into(), "http_persistent=1,live_start_index=-3".into());
+        assert_eq!(lavf_o(&create(&cfg).unwrap()), "http_persistent=1,live_start_index=-3");
     }
 
     #[test]

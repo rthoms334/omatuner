@@ -6,6 +6,7 @@
 pub mod filepicker;
 pub mod hypr;
 pub mod idle;
+pub mod memstats;
 pub mod mpris;
 pub mod notify;
 pub mod popout;
