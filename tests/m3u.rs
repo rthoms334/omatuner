@@ -620,8 +620,9 @@ fn smart_names_table() {
             assert_eq!(got.tags, want, "row {}: {raw:?}", i + 1);
         }
         // display cleanup and identity agree on what the channel is (identity keeps trailing
-        // `[…]` tags such as `[Geo-blocked]`; the display drops them)
-        if !raw.trim_end().ends_with(']') {
+        // `[…]` tags such as `[Geo-blocked]`, and — frozen — knows none of the later display
+        // rules: `display-only` rows)
+        if !raw.trim_end().ends_with(']') && cols.get(5) != Some(&"display-only") {
             assert_eq!(normalize_name(&got.name), normalize_name(raw), "row {}: {raw:?}", i + 1);
         }
         rows += 1;

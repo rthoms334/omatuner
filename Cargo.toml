@@ -95,6 +95,7 @@ nucleo = "0.5.0"            # MPL-2.0; threaded incremental matcher for global s
 nucleo-matcher = "0.3.1"    # MPL-2.0; single-list type-to-filter
 unicode-bidi = "0.3.18"     # visual reordering for RTL labels (egui has no bidi)
 ar-reshaper = "1.5.0"       # Arabic presentation forms (egui has no shaping)
+unicode-general-category = "1.1.0"  # S*/P* separators of provider names (name_tokens; already in the tree via epaint)
 
 # time
 jiff = "0.2.38"             # tz-aware (server-local catch-up times)

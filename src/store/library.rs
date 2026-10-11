@@ -29,7 +29,7 @@ use rusqlite::Connection;
 use crate::error::Result;
 use crate::model::{
     CategoryFilter, ChannelId, ChannelSummary, Collection, FavListId, FavouriteEntry, FavouriteList, Group, GroupFilter, GroupId, ItemKey, ItemKind,
-    ItemRef, MovieId, Quality, SeriesId, SortMode, SourceColor, SourceId, SourceKind, SourceSettings, Timestamp, VodKind, VodSummary,
+    ItemRef, MovieId, Quality, QualityBadge, SeriesId, SortMode, SourceColor, SourceId, SourceKind, SourceSettings, Timestamp, VodKind, VodSummary,
 };
 use crate::sources::category_tags::{self, CategorySummary};
 use crate::store::live::{GROUP_COLS, GROUP_FROM, GROUP_ORDER, group_from_row};
@@ -145,7 +145,8 @@ impl LiveIndex {
         }
         for slots in families.values().filter(|s| s.len() > 1) {
             let mut members: Vec<ChannelId> = slots.iter().map(|&i| ids[i]).collect();
-            members.sort_by_key(|id| std::cmp::Reverse(self.get(*id).and_then(|c| c.quality)));
+            // a doubtful claim (`4K?`) after a verified one of the same class
+            members.sort_by_key(|id| std::cmp::Reverse(self.get(*id).and_then(|c| c.quality).map(|q| (q.class, !q.doubtful))));
             for (&slot, id) in slots.iter().zip(members) {
                 ids[slot] = id;
             }
@@ -484,6 +485,7 @@ fn effective_groups(links: Option<&Vec<(GroupId, bool)>>, flags: &HashMap<GroupI
 
 fn load_live(conn: &Connection, groups: Vec<Group>) -> Result<LiveIndex> {
     let flags = group_flags(&groups);
+    let trust = crate::store::live::label_trust(conn)?;
     let links = load_memberships(conn, "SELECT cg.channel_id, cg.group_id, cg.is_primary FROM channel_group cg", &flags)?;
     let mut stmt = conn.prepare_cached(
         "SELECT c.id, c.source_id, c.key, COALESCE(o.rename, c.clean_name), c.number, c.logo, ce.epg_channel_id, c.tvg_shift_min,
@@ -521,13 +523,19 @@ fn load_live(conn: &Connection, groups: Vec<Group>) -> Result<LiveIndex> {
                 provider_order: r.get(12)?,
                 user_order: r.get(13)?,
                 added_at: r.get(14)?,
-                // measured beats the name; radio has none (a cover picture is no video)
-                quality: match (r.get::<_, Option<i64>>(18)?, r.get::<_, Option<i64>>(19)?) {
-                    (Some(w), Some(h)) => Quality::of_video(w, h),
-                    _ => None,
-                }
-                .or(r.get::<_, Option<i64>>(17)?.and_then(Quality::from_code))
-                .filter(|_| !radio),
+                // measured beats the name, whose claim is doubtful when the source's claims of
+                // that class measured lower too often; radio has none (a cover picture is no video)
+                quality: {
+                    let claimed = r.get::<_, Option<i64>>(17)?.and_then(Quality::from_code);
+                    let source: SourceId = r.get(1)?;
+                    match (r.get::<_, Option<i64>>(18)?, r.get::<_, Option<i64>>(19)?) {
+                        (Some(w), Some(h)) => Quality::of_video(w, h),
+                        _ => None,
+                    }
+                    .map(|m| QualityBadge::measured(m, claimed))
+                    .or_else(|| claimed.map(|c| QualityBadge::named(c, trust.get(&source).is_some_and(|t| t.doubts(c)))))
+                    .filter(|_| !radio)
+                },
                 family: text_hash(r.get_ref(20)?),
             },
             r.get::<_, bool>(15)?,
@@ -707,7 +715,11 @@ mod tests {
     /// sorts and favourites keep their order.
     #[test]
     fn duplicates_sort_best_quality_first() {
-        let dup = |id: i64, q: Option<Quality>| ChannelSummary { quality: q, family: 7, ..ch(id, id as u32, "BBC One") };
+        let dup = |id: i64, q: Option<Quality>| ChannelSummary {
+            quality: q.map(|q| QualityBadge::named(q, false)),
+            family: 7,
+            ..ch(id, id as u32, "BBC One")
+        };
         let chans = vec![
             dup(1, Some(Quality::Sd)),
             ch(2, 2, "ITV"),

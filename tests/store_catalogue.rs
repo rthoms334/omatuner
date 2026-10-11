@@ -599,8 +599,9 @@ fn measured_quality_beats_the_name_and_follows_the_channel() {
     ];
     run_import(&s, src, v1.clone(), vec![], vec![], vec![ItemKind::Channel], NOW);
     let r = s.reader().unwrap();
-    let quality =
-        || -> HashMap<String, Option<Quality>> { library::load(&r).unwrap().live.channels.iter().map(|c| (c.key.0.clone(), c.quality)).collect() };
+    let quality = || -> HashMap<String, Option<Quality>> {
+        library::load(&r).unwrap().live.channels.iter().map(|c| (c.key.0.clone(), c.quality.map(|b| b.class))).collect()
+    };
     assert_eq!(quality(), HashMap::from([("m3u:a".into(), Some(Quality::Uhd)), ("m3u:b".into(), Some(Quality::Hd)), ("m3u:c".into(), None)]));
 
     // the "4K" one plays at 1080p, the untagged one turns out SD
@@ -619,6 +620,56 @@ fn measured_quality_beats_the_name_and_follows_the_channel() {
     assert_eq!(quality(), HashMap::from([("m3u:a2".into(), Some(Quality::Fhd)), ("m3u:b".into(), Some(Quality::Hd))]));
     assert_eq!(count(&r, "SELECT count(*) FROM channel_video"), 1);
     assert!(user::orphans(&r).unwrap().is_empty());
+}
+
+/// Quality-label trust (DESIGN §13.0.1): once enough of a source's channels were measured and
+/// at least half of its measured 4K claims played lower, its unmeasured 4K claims are
+/// doubtful (`4K?`); a channel measured again replaces its evidence, so the doubt goes when
+/// the claims turn out right.
+#[test]
+fn contradicted_4k_claims_make_the_unmeasured_ones_doubtful() {
+    let (s, src, _) = reattach_setup("tuner-st-quality-trust");
+    let named = |key: &str, name: &str, order| ImportChannel {
+        quality: NameQuality::of(&clean_channel_name(name)),
+        ..chan(key, name, None, "UK", &format!("http://cdn/{key}.ts"), order)
+    };
+    let chans = vec![
+        named("m3u:a", "UK ★ Alpha 4K ◉", 0),
+        named("m3u:b", "UK ★ Bravo 4K", 1),
+        named("m3u:c", "UK ★ Charlie 4K", 2),
+        named("m3u:d", "UK ★ Delta", 3),
+        named("m3u:e", "UK ★ Echo FHD", 4),
+    ];
+    run_import(&s, src, chans, vec![], vec![], vec![ItemKind::Channel], NOW);
+    let r = s.reader().unwrap();
+    let badges = || -> HashMap<String, String> {
+        library::load(&r).unwrap().live.channels.iter().filter_map(|c| Some((c.key.0.clone(), c.quality?.label().to_owned()))).collect()
+    };
+    let measure = |key: &'static str, width: i64, height: i64| w(&s, move |c| live::record_video(c, &ch_ref(src, key), width, height, NOW));
+
+    // two 4K channels play at HD, but only two channels were measured: no doubt yet
+    measure("m3u:a", 1280, 720);
+    measure("m3u:a", 1280, 720);
+    measure("m3u:b", 1280, 720);
+    assert_eq!(badges()["m3u:c"], "4K");
+    // a third measured channel: the remaining 4K claim is doubted; FHD claims are not
+    measure("m3u:d", 720, 576);
+    assert_eq!(
+        badges(),
+        HashMap::from([
+            ("m3u:a".into(), "HD".into()),
+            ("m3u:b".into(), "HD".into()),
+            ("m3u:c".into(), "4K?".into()),
+            ("m3u:d".into(), "SD".into()),
+            ("m3u:e".into(), "FHD".into())
+        ])
+    );
+    assert_eq!(count(&r, "SELECT count(*) FROM quality_check"), 3, "one row per channel");
+    // re-measured at 4K: one of two claims wrong is still half; both right clears the doubt
+    measure("m3u:a", 3840, 2160);
+    assert_eq!(badges()["m3u:c"], "4K?");
+    measure("m3u:b", 3840, 2160);
+    assert_eq!(badges()["m3u:c"], "4K");
 }
 
 /// The quality copies of an M3U channel share a base key and are numbered by playlist position
@@ -649,7 +700,7 @@ fn measured_quality_follows_the_copy_not_its_slot() {
     // raw name → quality, and the names in the default (best-first) order
     let state = || {
         let lib = library::load(&r).unwrap();
-        let by_name: HashMap<String, Option<Quality>> = lib.live.channels.iter().map(|c| (c.name.to_string(), c.quality)).collect();
+        let by_name: HashMap<String, Option<Quality>> = lib.live.channels.iter().map(|c| (c.name.to_string(), c.quality.map(|b| b.class))).collect();
         let order = lib.live.collection(&Collection::AllChannels, &lib.favs, &[], SortMode::Provider);
         let order: Vec<String> = order.iter().map(|id| lib.live.get(*id).unwrap().name.to_string()).collect();
         (by_name, order)

@@ -1,4 +1,4 @@
-raw	clean	country	quality	tags
+raw	clean	country	quality	tags	identity
 UK | BBC One FHD	BBC One	UK	Fhd	
 |EN| CNN HD (backup)	CNN	EN	Hd	backup
 [VIP] US: ESPN 2 4K	ESPN 2	US	Uhd	VIP
@@ -19,3 +19,14 @@ ES: La 1 HD 720p	La 1	ES	Hd
 HD	HD			
 Canal + HD	Canal +		Hd	
 Disney +	Disney +			
+UK: ITV 4 4K ◉	ITV 4	UK	Uhd		
+US ★ HGTV HD ◉	HGTV	US	Hd		display-only
+CA ★ CTV FHD	CTV	CA	Fhd		display-only
+ALB ★ TOP CHANNEL	TOP CHANNEL	ALB			display-only
+VIP: RMC SPORT 1 ᴴᴰ	RMC SPORT 1		Hd	VIP	display-only
+SAT: PRO TV ᴿᴬᵂ	PRO TV			SAT,RAW	display-only
+IN-PREM: FAMILY CINEMA HD	FAMILY CINEMA	IN	Hd	PREM	display-only
+DE: VOX ⁽ᴴᴰ⁾	VOX	DE	Hd		
+FR: CANAL+ LIVE 2 ʰᵉᵛᶜ	CANAL+ LIVE 2	FR		HEVC	
+UK ❖ E! HD	E!	UK	Hd		display-only
+AT&T: A&E ᴿᴬᵂ	AT&T: A&E			RAW	display-only

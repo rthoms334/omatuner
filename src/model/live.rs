@@ -177,6 +177,92 @@ impl Quality {
     }
 }
 
+/// A channel's quality badge as shown (DESIGN §13.0): the class, and where it comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct QualityBadge {
+    pub class: Quality,
+    /// The quality word of the provider name (`channel.quality`), measured or not.
+    pub claimed: Option<Quality>,
+    /// `class` is what mpv decoded when the channel last played (else it is the claim).
+    pub measured: bool,
+    /// An unmeasured claim from a source whose claims of this class measured lower too often
+    /// ([`LabelTrust::doubts`]): the badge reads `4K?`.
+    pub doubtful: bool,
+}
+
+impl QualityBadge {
+    /// The provider name's claim, not measured.
+    pub fn named(class: Quality, doubtful: bool) -> Self {
+        Self { class, claimed: Some(class), measured: false, doubtful }
+    }
+
+    /// What mpv decoded (`claimed`: the name's word, if any).
+    pub fn measured(class: Quality, claimed: Option<Quality>) -> Self {
+        Self { class, claimed, measured: true, doubtful: false }
+    }
+
+    /// The badge text: `4K`, or `4K?` for a doubtful claim.
+    pub fn label(self) -> &'static str {
+        match (self.class, self.doubtful) {
+            (q, false) => q.label(),
+            (Quality::Sd, true) => "SD?",
+            (Quality::Hd, true) => "HD?",
+            (Quality::Fhd, true) => "FHD?",
+            (Quality::Uhd, true) => "4K?",
+        }
+    }
+
+    /// The tooltip / stream-info line: where the badge comes from.
+    pub fn explain(self) -> String {
+        let q = self.class.label();
+        match (self.measured, self.claimed) {
+            (false, _) if self.doubtful => {
+                format!("The provider says {q}; not verified. Channels of this playlist labelled {q} often play at a lower quality.")
+            }
+            (false, _) => format!("The provider says {q}; not verified until it plays."),
+            (true, Some(c)) if c != self.class => format!("Played at {q} (the provider says {}).", c.label()),
+            (true, _) => format!("Played at {q}."),
+        }
+    }
+}
+
+/// How far a source's quality words can be trusted (DESIGN §13.0.1), from the channels of it
+/// that were measured (`quality_check`: one row per channel name, however often it
+/// played). Measured quality always wins; this only marks the *unmeasured* claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LabelTrust {
+    /// Channels of the source measured (with or without a quality word).
+    pub measured: u32,
+    /// Per claimed class (`Quality as usize`): channels measured with that word…
+    pub claimed: [u32; 4],
+    /// …and those of them that played at a lower class.
+    pub wrong: [u32; 4],
+}
+
+impl LabelTrust {
+    /// Too little evidence before this many channels of the source were measured.
+    pub const MIN_MEASURED: u32 = 3;
+    /// …and this many claims of the class: one bad stream is no pattern.
+    pub const MIN_CLAIMS: u32 = 2;
+
+    /// Record one measured channel.
+    pub fn add(&mut self, claimed: Option<Quality>, measured: Quality) {
+        self.measured += 1;
+        if let Some(c) = claimed {
+            self.claimed[c as usize] += 1;
+            self.wrong[c as usize] += u32::from(measured < c);
+        }
+    }
+
+    /// Are unmeasured `class` claims doubtful? Only the high classes (4K, FHD: the ones that
+    /// get inflated), once [`Self::MIN_MEASURED`] channels and [`Self::MIN_CLAIMS`] claims of the
+    /// class were measured and at least half of those claims played lower.
+    pub fn doubts(&self, class: Quality) -> bool {
+        let (claimed, wrong) = (self.claimed[class as usize], self.wrong[class as usize]);
+        class >= Quality::Fhd && self.measured >= Self::MIN_MEASURED && claimed >= Self::MIN_CLAIMS && 2 * wrong >= claimed
+    }
+}
+
 /// A live channel, fully loaded (detail views, playback). Lists use [`ChannelSummary`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Channel {
@@ -245,8 +331,9 @@ pub struct ChannelSummary {
     pub user_order: Option<i32>,
     pub added_at: Option<Timestamp>,
     /// The quality badge: measured when the channel has played (`channel_video`), else from
-    /// its provider name (`channel.quality`); `None` = unknown.
-    pub quality: Option<Quality>,
+    /// its provider name (`channel.quality`, doubtful when the source's measured claims of that
+    /// class were often wrong); `None` = unknown.
+    pub quality: Option<QualityBadge>,
     /// Hash of the normalised cleaned name (`channel.family`, else `channel.norm_name`; quality
     /// words dropped): the SD / HD / 4K duplicates of one channel share it (best-first
     /// ordering, DESIGN §13.2).
@@ -299,5 +386,38 @@ mod tests {
         assert_eq!(q(2560, 1440), Some("FHD"));
         assert_eq!(q(3840, 2160), Some("4K"));
         assert_eq!(q(0, 0), None);
+    }
+
+    /// The trust thresholds: enough channels measured, enough claims of the class, at least
+    /// half of them lower; only 4K / FHD claims are doubted.
+    #[test]
+    fn label_trust_thresholds() {
+        use Quality::*;
+        let trust = |rows: &[(Option<Quality>, Quality)]| {
+            let mut t = LabelTrust::default();
+            for (c, m) in rows {
+                t.add(*c, *m);
+            }
+            t
+        };
+        // two 4K claims, both HD, but only two channels measured: not yet
+        assert!(!trust(&[(Some(Uhd), Hd), (Some(Uhd), Hd)]).doubts(Uhd));
+        // a third channel (no claim) makes the evidence enough
+        let t = trust(&[(Some(Uhd), Hd), (Some(Uhd), Hd), (None, Sd)]);
+        assert!(t.doubts(Uhd));
+        assert!(!t.doubts(Fhd), "per class");
+        // one wrong claim is no pattern
+        assert!(!trust(&[(Some(Uhd), Hd), (None, Hd), (None, Hd), (None, Hd)]).doubts(Uhd));
+        // exactly half wrong doubts, less than half does not
+        assert!(trust(&[(Some(Uhd), Fhd), (Some(Uhd), Uhd), (None, Hd)]).doubts(Uhd));
+        assert!(!trust(&[(Some(Uhd), Fhd), (Some(Uhd), Uhd), (Some(Uhd), Uhd), (None, Hd)]).doubts(Uhd));
+        // a claim that played better is not wrong; HD / SD claims are never doubted
+        assert!(!trust(&[(Some(Fhd), Uhd), (Some(Fhd), Uhd), (None, Hd)]).doubts(Fhd));
+        assert!(!trust(&[(Some(Hd), Sd), (Some(Hd), Sd), (Some(Hd), Sd)]).doubts(Hd));
+        // the badge
+        let b = QualityBadge::named(Uhd, true);
+        assert_eq!((b.label(), QualityBadge::named(Uhd, false).label()), ("4K?", "4K"));
+        assert!(b.explain().starts_with("The provider says 4K; not verified"));
+        assert_eq!(QualityBadge::measured(Hd, Some(Uhd)).explain(), "Played at HD (the provider says 4K).");
     }
 }
