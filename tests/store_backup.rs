@@ -112,7 +112,15 @@ fn populate(s: &Store, creds: &Creds) -> Fixture {
                     username: "viewer".into(),
                     password: Secret::new(xt_pass),
                 }),
-                settings: SourceSettings { refresh_h: Some(6), ..Default::default() },
+                settings: SourceSettings {
+                    refresh_h: Some(6),
+                    category_filter: Some(CategoryFilter {
+                        keep: [CategoryTag::country("GB"), CategoryTag::language("en")].into(),
+                        keep_untagged: false,
+                        known: [CategoryTag::country("GB"), CategoryTag::country("FR")].into(),
+                    }),
+                    ..Default::default()
+                },
             },
             NOW,
         )?;
@@ -144,6 +152,7 @@ fn populate(s: &Store, creds: &Creds) -> Fixture {
                     kind: ItemKind::Channel,
                     key: group_key(ItemKind::Channel, "News"),
                     name: "News".into(),
+                    raw_name: None,
                     provider_id: None,
                     provider_order: 0,
                 },
@@ -151,6 +160,7 @@ fn populate(s: &Store, creds: &Creds) -> Fixture {
                     kind: ItemKind::Movie,
                     key: group_key(ItemKind::Movie, "Films"),
                     name: "Films".into(),
+                    raw_name: None,
                     provider_id: None,
                     provider_order: 0,
                 },
@@ -179,7 +189,7 @@ fn populate(s: &Store, creds: &Creds) -> Fixture {
             m3u,
             ItemKind::Channel,
             &group_key(ItemKind::Channel, "News"),
-            &GroupOverride { rename: Some("Nachrichten".into()), hidden: false, locked: false, user_order: Some(1), pinned_home: true },
+            &GroupOverride { rename: Some("Nachrichten".into()), hidden: false, locked: false, user_order: Some(1), pinned_home: true, shown: true },
         )?;
         user::save_progress(
             c,

@@ -16,7 +16,7 @@ use crate::config::Density;
 use crate::images::ImageCache;
 use crate::model::{ChannelSummary, Episode, Group, NowNext, ProgrammeSlim, Timestamp};
 use crate::store::library::SourceMeta;
-use crate::theme::{SpaceToken, Theme, TypeToken};
+use crate::theme::{SpaceToken, Theme, TypeToken, with_alpha};
 
 /// Row width from which the channel detail line shows everything (title · time · next).
 const DETAIL_FULL_W: f32 = 520.0;
@@ -280,8 +280,24 @@ pub fn channel_row(
     resp
 }
 
+/// Extra marks of a group row (DESIGN §28.7).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GroupDecor<'a> {
+    /// Marked for a bulk hide: a check glyph and the accent tint.
+    pub marked: bool,
+    /// Short code of the provider name's country / language tag ("UK"), shown when the
+    /// playlist has several (smart names drop the "UK |" prefix, so "UK | Sports" and
+    /// "US | Sports" would both read "Sports").
+    pub tag: Option<&'a str>,
+}
+
 /// Group/category row: name, count, lock glyph.
 pub fn group_row(ui: &mut egui::Ui, theme: &Theme, g: &Group, state: RowState) -> egui::Response {
+    group_row_decor(ui, theme, g, state, GroupDecor::default())
+}
+
+/// [`group_row`] with the bulk-hide mark and the tag badge.
+pub fn group_row_decor(ui: &mut egui::Ui, theme: &Theme, g: &Group, state: RowState, decor: GroupDecor<'_>) -> egui::Response {
     let t = &theme.tokens;
     let name = g.display_name();
     let (rect, resp) = allocate_row(ui, theme, row_height(theme, Density::Comfortable, false), state, name);
@@ -289,6 +305,9 @@ pub fn group_row(ui: &mut egui::Ui, theme: &Theme, g: &Group, state: RowState) -
         return resp;
     }
     let p = ui.painter();
+    if decor.marked {
+        p.rect_filled(rect, t.rounding, with_alpha(t.accent, 0.14));
+    }
     let color = if g.hidden { t.text_disabled } else { paint::row_text(theme, state) };
     let inset = theme.space(SpaceToken::Lg);
     let left = rect.left() + inset + theme.space(SpaceToken::Sm);
@@ -328,6 +347,15 @@ pub fn group_row(ui: &mut egui::Ui, theme: &Theme, g: &Group, state: RowState) -
         );
         right = r.left() - theme.space(SpaceToken::Md);
     }
+    if let Some(code) = decor.tag {
+        let r = code_badge(p, theme, egui::pos2(right, y), Align2::RIGHT_CENTER, code, t.text_secondary);
+        right = r.left() - theme.space(SpaceToken::Md);
+    }
+    if decor.marked {
+        let r =
+            paint::text(p, egui::pos2(right, y), Align2::RIGHT_CENTER, glyphs::CHECK, paint::font(theme, TypeToken::Icon), t.accent, f32::INFINITY);
+        right = r.left() - theme.space(SpaceToken::Md);
+    }
     paint::text(
         p,
         egui::pos2(left, y),
@@ -337,6 +365,73 @@ pub fn group_row(ui: &mut egui::Ui, theme: &Theme, g: &Group, state: RowState) -
         color,
         (right - left).max(0.0),
     );
+    resp
+}
+
+/// A short code in a 1 px outlined badge ("UK", "EX-YU"), anchored at `pos`; returns its rect.
+fn code_badge(p: &egui::Painter, theme: &Theme, pos: egui::Pos2, anchor: Align2, code: &str, color: Color32) -> Rect {
+    let g = paint::galley(p, code, paint::font(theme, TypeToken::Caption), color, f32::INFINITY);
+    let pad = egui::vec2(theme.space(SpaceToken::Sm), theme.space(SpaceToken::Xxs));
+    let rect = anchor.anchor_size(pos, g.size() + 2.0 * pad);
+    p.rect_stroke(rect, theme.tokens.rounding, egui::Stroke::new(1.0, with_alpha(color, 0.6)), egui::StrokeKind::Inside);
+    p.galley(rect.center() - g.size() / 2.0, g, color);
+    rect
+}
+
+/// A tick-list row ("Choose what to show", DESIGN §28.6): tick box, short-code badge, label,
+/// detail line and a "new" badge. Reports a `Checkbox` widget labelled with `label`.
+#[allow(clippy::too_many_arguments)]
+pub fn check_row(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    ticked: bool,
+    code: Option<&str>,
+    label: &str,
+    detail: Option<&str>,
+    new: bool,
+    state: RowState,
+) -> egui::Response {
+    let t = &theme.tokens;
+    let h = paint::fit_height(ui, row_height(theme, Density::Comfortable, detail.is_some()));
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, ticked, label));
+    if !ui.is_rect_visible(rect) {
+        return resp;
+    }
+    let p = ui.painter();
+    paint_row_state(p, rect, theme, state);
+    let color = paint::row_text(theme, state);
+    let inset = theme.space(SpaceToken::Lg);
+    let y = rect.center().y;
+    let col = (36.0 * theme.rem()).round();
+    let (tick, tick_color) = if ticked { (glyphs::CHECKBOX_ON, t.accent) } else { (glyphs::CHECKBOX_OFF, t.text_secondary) };
+    p.text(egui::pos2(rect.left() + inset + col / 2.0, y), Align2::CENTER_CENTER, tick, paint::font(theme, TypeToken::IconLarge), tick_color);
+    let mut left = rect.left() + inset + col + theme.space(SpaceToken::Sm);
+    if let Some(code) = code {
+        code_badge(p, theme, egui::pos2(left, y), Align2::LEFT_CENTER, code, if ticked { t.fg } else { t.text_secondary });
+    }
+    // a fixed code column keeps the labels aligned
+    left += (64.0 * theme.rem()).round();
+    let mut right = rect.right() - inset;
+    if new {
+        let r = code_badge(p, theme, egui::pos2(right, y), Align2::RIGHT_CENTER, "new", t.accent);
+        right = r.left() - theme.space(SpaceToken::Lg);
+    }
+    let max_w = (right - left).max(0.0);
+    let label_g = paint::galley(p, label, paint::medium(ui.ctx(), theme, TypeToken::Heading), color, max_w);
+    match detail {
+        Some(d) => {
+            let detail_g = paint::galley(p, d, paint::font(theme, TypeToken::BodySmall), t.text_secondary, max_w);
+            let gap = theme.space(SpaceToken::Xxs);
+            let top = y - (label_g.size().y + gap + detail_g.size().y) / 2.0;
+            let detail_y = top + label_g.size().y + gap;
+            p.galley(egui::pos2(left, top), label_g, color);
+            p.galley(egui::pos2(left, detail_y), detail_g, t.text_secondary);
+        }
+        None => {
+            p.galley(egui::pos2(left, y - label_g.size().y / 2.0), label_g, color);
+        }
+    }
     resp
 }
 

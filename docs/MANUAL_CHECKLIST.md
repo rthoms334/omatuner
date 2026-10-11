@@ -577,3 +577,50 @@ These items use the **default** profile: start Tuner from the launcher, not with
 - [ ] **Login refused:** use a playlist whose panel rejects the API login. **Expect:** it stays
   M3U with movies and series sorted out of the playlist, and the next automatic check is a week
   later (*Refresh now* in its editor retries at once).
+
+## 14. Countries and languages (category filter) and bulk hide (real provider)
+
+Use a real Xtream account whose categories cover many countries (≈ 60 tags: "UK | …", "|DE| …",
+"AR: …", "EX-YU …", "4K | …", "VIP | UK | …"), with the time zone set to Europe/London.
+
+- [ ] **Onboarding defaults:**
+  - **Do:** fresh profile; add the Xtream account. When **Open Live TV** turns on, press Enter
+    at once, then look at the **Choose what to show** step.
+  - **Expect:**
+    - The immediate Enter does not save (the step ignores Enter for its first moment).
+    - Ticked: UK, English and the other English-speaking countries present (US, CA, AU, IE, NZ),
+      and **No country tag**; everything else unticked. "N of M ticked · X of Y channels" is
+      right. Rows read "UK · United Kingdom", not "GB".
+    - Movie and series categories join the counts while they import, without the list jumping.
+    - "4K | Sports", "BT Sport", "FA Cup", "Premier League"-style categories are under **No
+      country tag**; `UK-…`, `UK.…`, `[🇬🇧] …`, `EX YU …` sit under the right tag.
+    - Enter saves; Live TV, the guide, Movies, Series, Home rails, search (Ctrl+K) and zapping
+      (↑/↓ in the player) show nothing from unticked countries; group and channel counts match.
+- [ ] **Picker keys:** in Settings ▸ Playlists ▸ (playlist) ▸ *Countries & languages…*: type
+  "fr" to filter, Space ticks, Ctrl+A all / none of the rows shown, Ctrl+E back to the defaults,
+  Esc clears the filter then cancels. Untick everything + Enter: the warning line, and only a
+  second Enter saves. Tick everything + Enter: the rule is removed (everything shows).
+- [ ] **New categories after a refresh stay hidden:**
+  - **Do:** keep the defaults. Wait for the provider to add categories (or use a panel where
+    you can add "DE | New Test" and "NZ | New Test"), then Ctrl+R.
+  - **Expect:** "DE | New Test" never appears; "NZ | New Test" does (NZ is in the defaults even
+    when the playlist didn't have it). The picker marks newly seen tags *new*.
+- [ ] **Exceptions and Settings ▸ Hidden:**
+  - **Expect:** Settings ▸ Hidden lists each hidden tag with its counts. Enter on "Arabic" shows
+    all Arabic categories again (toast "Arabic shown"). → expands a tag (down chevron); Enter on
+    one category shows just that one, and it stays shown after a refresh. Ctrl+H on a kept
+    group hides it and it is listed under *Hidden groups*.
+- [ ] **Playlist added before this version:** with a profile from v0.1.0-rc3, open the picker.
+  **Expect:** the note "… refresh to find them all (Ctrl+R)"; Ctrl+R refreshes and the note
+  goes away, and most categories now have tags.
+- [ ] **Bulk hide (Live groups):**
+  - **Do:** Space on three groups (check marks, footer "3 marked · Ctrl+H hides · Esc clears"),
+    Ctrl+H. Then type "ar" and press Ctrl+Shift+H.
+  - **Expect:** the three groups go in one step with "Hid 3 groups · Settings ▸ Hidden items shows
+    them again". The footer reads "N groups with “ar” · Ctrl+Shift+H hides them"; the confirm
+    names the first five; "AR | …" and "Arabic …" groups go, "Cartoons" and "Documentary" stay.
+    Choosing a menu item with Space never marks the group behind the menu.
+- [ ] **Bulk hide (Movies / Series):** the same with categories. **Expect:** the toast, confirm
+  and footer say "categories".
+- [ ] **Badges:** with smart names on, "UK | Sports" and "US | Sports" read "Sports" with a
+  muted UK / US badge; with smart names off, "|UK| Sports" has no extra badge.

@@ -938,7 +938,10 @@ impl eframe::App for TunerApp {
             }
             match keymap::resolve(&stack, ev) {
                 Some(a) => {
-                    drop_text = matches!(ev, egui::Event::Key { modifiers, .. } if modifiers.alt);
+                    // ... and of a resolved plain Space: a menu's Space (Activate) closes it, and
+                    // its " " would then reach the pane below (List: mark the group)
+                    drop_text = matches!(ev, egui::Event::Key { modifiers, .. } if modifiers.alt)
+                        || matches!(ev, egui::Event::Key { key: egui::Key::Space, pressed: true, modifiers, .. } if !modifiers.ctrl && !modifiers.alt);
                     resolved.push((a, stack.clone()));
                     false // consumed: egui never sees it
                 }
@@ -1610,6 +1613,28 @@ mod tests {
         evs.insert(1, Event::Text("z".into()));
         rig.frame_with(evs);
         assert_eq!(probe.borrow().actions.last(), Some(&Action::FilterInput('z')));
+    }
+
+    /// A menu chosen with Space closes in that frame: the `Text(" ")` twin must not reach the
+    /// group pane below (where it marks the group for Ctrl+H, DESIGN §28.7).
+    #[test]
+    fn space_in_a_menu_never_also_marks_the_group_below() {
+        let mut rig = Rig::new();
+        let probe = rig.probe(ScreenId::Live, vec![KeyContext::List]);
+        let item = crate::ui::overlays::MenuItem { icon: "", label: "Rename".into(), action: Action::Rename, enabled: true, shortcut: None };
+        rig.app
+            .nav
+            .push(NavRequest::Open(OverlayRequest::ContextMenu(crate::ui::overlays::ContextMenuSpec { title: "News".into(), items: vec![item] })));
+        rig.frame_with(vec![]);
+        let mut evs = key_events(Key::Space, NONE);
+        evs.insert(1, Event::Text(" ".into()));
+        rig.frame_with(evs);
+        assert!(rig.app.overlays.is_empty());
+        assert_eq!(probe.borrow().results, [OverlayResult::Chosen(Action::Rename)]);
+        assert_eq!(probe.borrow().actions, [], "no ToggleMark");
+        // control: in the pane itself the space marks
+        rig.frame_with(vec![Event::Text(" ".into())]);
+        assert_eq!(probe.borrow().actions, [Action::ToggleMark]);
     }
 
     #[test]

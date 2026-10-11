@@ -765,7 +765,14 @@ fn entry_groups(e: &M3uEntry, kind: ItemKind, smart: bool, groups_out: &mut Vec<
         // playlists are grouped: the newest group is the likeliest hit
         if !groups_out.iter().rev().any(|g| g.key == k) {
             let provider_order = i32::try_from(groups_out.len()).unwrap_or(i32::MAX);
-            groups_out.push(ImportGroup { kind, key: k.clone(), name: group_display(raw, smart), provider_id: None, provider_order });
+            groups_out.push(ImportGroup {
+                kind,
+                key: k.clone(),
+                name: group_display(raw, smart),
+                raw_name: non_empty(Some(raw)),
+                provider_id: None,
+                provider_order,
+            });
         }
         groups.push(k);
     }
@@ -1305,7 +1312,7 @@ where
     let uncategorized = group_key(kind, "");
     if !groups.iter().any(|g| g.key == uncategorized) && rows.iter().any(|r| r.group_keys().contains(&uncategorized)) {
         let provider_order = i32::try_from(groups.len()).unwrap_or(i32::MAX);
-        groups.push(ImportGroup { kind, key: uncategorized, name: "Uncategorized".into(), provider_id: None, provider_order });
+        groups.push(ImportGroup { kind, key: uncategorized, name: "Uncategorized".into(), raw_name: None, provider_id: None, provider_order });
     }
     (groups, rows)
 }
@@ -1461,7 +1468,7 @@ pub fn xt_categories_to_groups(kind: crate::model::ItemKind, cats: &[XtCategory]
             continue;
         }
         let provider_order = i32::try_from(out.len()).unwrap_or(i32::MAX);
-        out.push(ImportGroup { kind, key, name: group_display(raw, smart), provider_id: Some(id), provider_order });
+        out.push(ImportGroup { kind, key, name: group_display(raw, smart), raw_name: non_empty(Some(raw)), provider_id: Some(id), provider_order });
     }
     out
 }

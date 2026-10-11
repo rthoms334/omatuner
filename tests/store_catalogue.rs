@@ -120,7 +120,7 @@ fn run_import(
             for k in keys {
                 if !groups.iter().any(|g| g.kind == kind && &g.key == k) {
                     let name = k.0.split_once(':').unwrap().1.to_owned();
-                    groups.push(ImportGroup { kind, key: k.clone(), name, provider_id: None, provider_order: groups.len() as i32 });
+                    groups.push(ImportGroup { kind, key: k.clone(), name, raw_name: None, provider_id: None, provider_order: groups.len() as i32 });
                 }
             }
         };
@@ -1078,6 +1078,156 @@ fn library_load_merges_overrides_and_skips_disabled_sources() {
     assert!(lib.live.hidden.contains(&chans[1]) && lib.live.hidden.contains(&chans[5]));
     assert!(!lib.live.hidden.contains(&chans[0]), "still visible through News");
     assert!(lib.vod.movies.is_empty());
+}
+
+// ------------------------------------------------------------------ category filter
+
+/// One import of channels (and movies) whose groups carry provider raw names (`"UK | News"`),
+/// displayed smart-cleaned like the importer does.
+fn import_tagged(s: &Store, src: SourceId, channels: Vec<(&str, &str, Vec<&str>)>, movies: Vec<(&str, &str)>, now: Timestamp) {
+    let grp = |kind: ItemKind, raw: &str, order: usize| ImportGroup {
+        kind,
+        key: group_key(kind, raw),
+        name: raw.rsplit(['|', ':']).next().unwrap().trim().to_owned(),
+        raw_name: Some(raw.to_owned()),
+        provider_id: None,
+        provider_order: order as i32,
+    };
+    let mut groups: Vec<ImportGroup> = Vec::new();
+    for raw in channels.iter().flat_map(|c| c.2.iter()) {
+        if !groups.iter().any(|g| g.key == group_key(ItemKind::Channel, raw)) {
+            groups.push(grp(ItemKind::Channel, raw, groups.len()));
+        }
+    }
+    groups.extend(movies.iter().enumerate().map(|(i, m)| grp(ItemKind::Movie, m.1, i)));
+    let chans: Vec<ImportChannel> = channels
+        .iter()
+        .enumerate()
+        .map(|(i, (key, name, raws))| ImportChannel {
+            groups: raws.iter().map(|r| group_key(ItemKind::Channel, r)).collect(),
+            ..chan(key, name, None, raws[0], &format!("http://h.tv/{key}"), i as i32)
+        })
+        .collect();
+    let films: Vec<ImportMovie> = movies.iter().enumerate().map(|(i, (key, raw))| movie(key, &format!("Film {key}"), raw, i as i32)).collect();
+    w(s, move |c| {
+        let imp = import::begin_catalogue(c, src, now)?;
+        import::upsert_groups(c, &imp, &groups)?;
+        import::write_channels(c, &imp, &chans)?;
+        import::write_movies(c, &imp, &films)?;
+        import::finish_catalogue(c, &imp, &ALL, now)
+    });
+}
+
+#[test]
+fn category_filter_hides_tagged_groups_everywhere_and_follows_refreshes() {
+    let s = store("tuner-st-catfilter");
+    let src = w(&s, |c| sources::insert_source(c, &m3u_draft("Tagged", "http://h.tv/list.m3u"), NOW));
+    let channels = || {
+        vec![
+            ("m3u:uk1", "BBC News", vec!["UK | News"]),
+            ("m3u:ar1", "Arabiya News", vec!["AR | News"]),
+            ("m3u:both", "Shared News", vec!["AR | News", "UK | News"]),
+            ("m3u:sp1", "Sky Sports News", vec!["Sports"]),
+        ]
+    };
+    import_tagged(&s, src, channels(), vec![("m3u:film1", "|AR| Films")], NOW);
+    // a source editor opened before the picker saves
+    let stale = w(&s, move |c| sources::get_source(c, src));
+
+    let r = s.reader().unwrap();
+    let summary = library::category_summary(&r, src).unwrap();
+    let tags: Vec<Option<&str>> = summary.tags.iter().map(|t| t.tag.as_ref().map(|t| t.0.as_str())).collect();
+    assert_eq!(tags, [Some("lang:ar"), Some("GB"), None], "AR has 2 channels + 1 movie, GB 2 channels, untagged last");
+    assert_eq!((summary.tags[0].live_groups, summary.tags[0].movie_groups, summary.needs_refresh), (1, 1, false));
+
+    let rule = CategoryFilter { keep: [CategoryTag::country("GB")].into(), keep_untagged: true, known: summary.present() };
+    let saved = rule.clone();
+    w(&s, move |c| sources::set_category_filter(c, src, Some(&saved)));
+
+    let id = |lib: &library::Library, key: &str| lib.live.by_ref(&ch_ref(src, key)).unwrap();
+    let group = |lib: &library::Library, raw: &str| lib.live.groups.iter().find(|g| g.key == group_key(ItemKind::Channel, raw)).unwrap().clone();
+    let visible = |lib: &library::Library| -> HashSet<ChannelId> {
+        lib.live.collection(&Collection::AllChannels, &lib.favs, &[], SortMode::Provider).into_iter().collect()
+    };
+
+    let lib = library::load(&r).unwrap();
+    assert_eq!(lib.source(src).unwrap().category_filter.as_ref(), Some(&rule));
+    let (ar, uk, sports) = (group(&lib, "AR | News"), group(&lib, "UK | News"), group(&lib, "Sports"));
+    assert_eq!((ar.tag.clone(), ar.filter, ar.hidden), (Some(CategoryTag::language("ar")), GroupFilter::Hidden, true));
+    assert_eq!((uk.tag.clone(), uk.filter, uk.hidden), (Some(CategoryTag::country("GB")), GroupFilter::Kept, false));
+    assert_eq!((sports.tag.clone(), sports.filter, sports.hidden), (None, GroupFilter::Kept, false), "untagged kept");
+    let shown = visible(&lib);
+    assert_eq!(shown, [id(&lib, "m3u:uk1"), id(&lib, "m3u:both"), id(&lib, "m3u:sp1")].into(), "the AR-only channel is filtered");
+    assert!(lib.live.hidden.contains(&id(&lib, "m3u:ar1")));
+    assert!(lib.vod.movies.is_empty(), "the |AR| movie category is filtered too");
+
+    // search never indexes filtered items
+    let mut idx = tuner::search::SearchIndex::new(std::sync::Arc::new(|| {}));
+    idx.rebuild(&lib, false);
+    idx.set_query("news");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let hits = loop {
+        idx.tick(10);
+        let hits = idx.results(tuner::search::SearchSection::All, 50);
+        if hits.len() >= 3 || std::time::Instant::now() > deadline {
+            break hits;
+        }
+    };
+    let found: HashSet<ChannelId> = hits
+        .iter()
+        .filter_map(|h| match h.item.target {
+            tuner::search::SearchTarget::Channel(c) => Some(c),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(found, shown);
+
+    // a refresh adds a category for a tag the rule does not keep: hidden, the rule untouched
+    let mut more = channels();
+    more.push(("m3u:fr1", "France Info", vec!["|FR| Info"]));
+    import_tagged(&s, src, more, vec![("m3u:film1", "|AR| Films")], NOW + 10);
+    let lib = library::load(&r).unwrap();
+    let fr = group(&lib, "|FR| Info");
+    assert_eq!((fr.tag.clone(), fr.filter, fr.hidden), (Some(CategoryTag::country("FR")), GroupFilter::Hidden, true));
+    assert!(!visible(&lib).contains(&id(&lib, "m3u:fr1")));
+    assert_eq!(lib.source(src).unwrap().category_filter.as_ref(), Some(&rule));
+
+    // the user shows one filtered group: an exemption from the rule
+    let ar_ref = GroupRef::from(&ar);
+    w(&s, move |c| user::show_group(c, &ar_ref, true));
+    let lib = library::load(&r).unwrap();
+    let ar = group(&lib, "AR | News");
+    assert_eq!((ar.filter, ar.hidden), (GroupFilter::Exempt, false));
+    assert!(visible(&lib).contains(&id(&lib, "m3u:ar1")));
+
+    // hiding beats everything and clears the exemption; an item hides once all its groups do
+    let refs = vec![GroupRef::from(&ar), GroupRef::from(&uk)];
+    w(&s, move |c| user::hide_groups(c, &refs));
+    let lib = library::load(&r).unwrap();
+    let (ar, uk) = (group(&lib, "AR | News"), group(&lib, "UK | News"));
+    assert_eq!((ar.filter, ar.hidden, uk.filter, uk.hidden), (GroupFilter::Hidden, true, GroupFilter::Kept, true));
+    assert!(ar.user_hidden && uk.user_hidden, "the user's hide stays visible under the rule's");
+    let ov = w(&s, |c| user::group_overrides(c));
+    assert!(ov.iter().all(|o| o.ov.hidden && !o.ov.shown), "{ov:?}");
+    assert_eq!(visible(&lib), [id(&lib, "m3u:sp1")].into());
+
+    // stale editor copies (update_source / set_source_settings) keep the rule
+    w(&s, move |c| {
+        sources::update_source(c, &Source { name: "Renamed".into(), ..stale.clone() })?;
+        sources::set_source_settings(c, src, &SourceSettings { refresh_h: Some(3), ..stale.settings })
+    });
+    let src_now = w(&s, move |c| sources::get_source(c, src));
+    assert_eq!((src_now.name.as_str(), src_now.settings.refresh_h), ("Renamed", Some(3)));
+    assert_eq!(src_now.settings.category_filter, Some(rule));
+    let lib = library::load(&r).unwrap();
+    assert!(group(&lib, "|FR| Info").hidden, "still filtered after the editor saves");
+
+    // a group imported before raw names were stored: "needs refresh", and detection reads the
+    // (smart-cleaned, untagged) display name, so the rule keeps it as untagged
+    w(&s, move |c| Ok(c.execute("UPDATE grp SET raw_name = NULL WHERE source_id = ?1 AND name = 'Info'", [src])?));
+    assert!(library::category_summary(&r, src).unwrap().needs_refresh);
+    let fr = group(&library::load(&r).unwrap(), "|FR| Info");
+    assert_eq!((fr.tag, fr.filter, fr.hidden), (None, GroupFilter::Kept, false));
 }
 
 // ------------------------------------------------------------------ deletion

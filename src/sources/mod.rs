@@ -8,6 +8,7 @@
 //! | `m3u.rs`          | WP-03 | streaming extended-M3U parser |
 //! | `m3u_vod.rs`      | P5 sources | M3U movies/series fallback classifier (DESIGN §27.5) |
 //! | `presets.rs`      | P5 sources | free-channel playlists + country detection (§27.8) |
+//! | `category_tags.rs`| P6 core | country / language tags of category names (§28.2) |
 //! | `smart_names.rs`  | WP-03 | name cleanup ("UK | BBC One FHD" → "BBC One") |
 //! | `identity.rs`     | skeleton (frozen) | ItemKey / normalization / fingerprints (WP-03 owns its tests) |
 //! | `xmltv.rs`        | WP-05a | streaming XMLTV parser |
@@ -16,6 +17,7 @@
 //! | `resolve.rs`      | WP-05b | MediaRef → Playable (URLs, headers, titles) |
 
 pub mod catchup;
+pub mod category_tags;
 pub mod epg_match;
 pub mod http;
 pub mod identity;

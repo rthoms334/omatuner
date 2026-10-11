@@ -9,7 +9,7 @@
 //!
 //! Rules:
 //! * For each event the first matching binding wins, innermost context first.
-//! * Filterable contexts (`List`, `ListFiltering`, `PosterGrid`, `PosterGridFiltering`,
+//! * Filterable contexts (`List`, `ListFiltering`, `PosterGrid`, `PosterGridFiltering`, `Checklist`,
 //!   `Search`, `Help`): an unbound printable character (no Ctrl/Alt) becomes
 //!   [`Action::FilterInput`] — the launcher idiom: in filterable lists letters type, so there is
 //!   NO j/k there; vim keys live in the guide grid, the player and settings panels.
@@ -68,16 +68,21 @@ pub enum KeyContext {
     TextInput,
     /// Settings panes (panel idiom: h/j/k/l allowed because there is no filter).
     Panel,
+    /// A tick list with type-to-filter ("Choose what to show"), innermost above `Modal`: it
+    /// binds its own navigation and filter keys, so → never activates and Backspace never
+    /// leaves (as `List` would).
+    Checklist,
     /// The keyboard help overlay: typing filters the shortcuts (Omarchy's keybindings menu).
     Help,
 }
 
 impl KeyContext {
     /// Every context, in help-overlay / documentation order.
-    pub const ALL: [KeyContext; 17] = [
+    pub const ALL: [KeyContext; 18] = [
         KeyContext::Global,
         KeyContext::List,
         KeyContext::ListFiltering,
+        KeyContext::Checklist,
         KeyContext::PosterGrid,
         KeyContext::PosterGridFiltering,
         KeyContext::Detail,
@@ -112,6 +117,7 @@ impl KeyContext {
             KeyContext::Modal => "Dialogs & menus",
             KeyContext::TextInput => "Text fields",
             KeyContext::Panel => "Settings",
+            KeyContext::Checklist => "Tick lists",
             KeyContext::Help => "Keyboard help",
         }
     }
@@ -180,6 +186,15 @@ pub enum Action {
     /// Delete in the EPG mapping screen: clear the manual assignment.
     ClearEpg,
     MarkWatched,
+    /// Space / Insert: mark the focused group for a bulk hide; tick a row of a tick list.
+    ToggleMark,
+    /// Ctrl+A in a tick list: tick all shown rows, or none when all are ticked.
+    MarkAll,
+    /// Ctrl+E in the category picker: just the user's country + English.
+    MarkDefaults,
+    /// Ctrl+Shift+H while a group pane is filtered: hide the provider groups it shows whose
+    /// names have a word starting with each word typed (not every fuzzy match).
+    HideShown,
     /// Delete: remove from a favourites list / cancel a job / forget an orphan / cancel a
     /// reminder (whatever "remove" means for the focused row).
     Remove,
@@ -385,6 +400,10 @@ pub static LIST: &[Binding] = &[
     b(C::key(Key::Escape), A::Back, "Back"),
     b(C::ch('/'), A::OpenSearch, "Search everything"),
     b(C::ch('?'), A::ToggleHelp, "Keyboard help"),
+    // the Text event, never Key::Space: the space is then never also typed into the filter
+    // (and a leading space doesn't filter anyway)
+    b(C::ch(' '), A::ToggleMark, "Mark group (Ctrl+H then hides all marked)"),
+    b(C::key(Key::Insert), A::ToggleMark, "Mark group (Ctrl+H then hides all marked)"),
     // any other printable key starts filtering (FilterInput)
 ];
 
@@ -401,6 +420,9 @@ pub static LIST_FILTERING: &[Binding] = &[
     b(C::key(Key::Escape), A::FilterClear, "Clear filter"),
     b(C::key(Key::Tab), A::FocusNext, "Next / previous pane"),
     b(C::shift(Key::Tab), A::FocusPrev, "Next / previous pane"),
+    // Space types here (filters have spaces); Insert still marks
+    b(C::key(Key::Insert), A::ToggleMark, "Mark group (Ctrl+H then hides all marked)"),
+    b(C::ctrl_shift(Key::H), A::HideShown, "Hide the groups with the words typed"),
     // printable keys → FilterInput
 ];
 
@@ -657,6 +679,28 @@ pub static MODAL: &[Binding] = &[
     b(C::key(Key::Escape), A::Back, "Cancel"),
 ];
 
+/// Tick lists ("Choose what to show"), stacked above `Modal`. Space is bound as the KEY (the
+/// `Modal` below would take it as Confirm); its `Text` twin arrives as `FilterInput(' ')`,
+/// which tick lists ignore (their entries are one word).
+pub static CHECKLIST: &[Binding] = &[
+    b(C::key(Key::ArrowUp), A::Up, "Move"),
+    b(C::key(Key::ArrowDown), A::Down, "Move"),
+    b(C::key(Key::PageUp), A::PageUp, "Page up / down"),
+    b(C::key(Key::PageDown), A::PageDown, "Page up / down"),
+    b(C::key(Key::Home), A::Home, "First / last"),
+    b(C::key(Key::End), A::End, "First / last"),
+    b(C::key(Key::Space), A::ToggleMark, "Tick / untick"),
+    b(C::key(Key::Insert), A::ToggleMark, "Tick / untick"),
+    b(C::ctrl(Key::A), A::MarkAll, "Tick all / none (of the rows shown)"),
+    b(C::ctrl(Key::E), A::MarkDefaults, "Just my country + English"),
+    b(C::key(Key::Enter), A::Activate, "Save"),
+    b(C::key(Key::Backspace), A::FilterBackspace, "Delete character"),
+    b(C::ctrl(Key::Backspace), A::FilterDeleteWord, "Delete word"),
+    b(C::ctrl(Key::U), A::FilterClear, "Clear filter"),
+    b(C::key(Key::Escape), A::Back, "Clear the filter, then cancel"),
+    // any other printable key filters (FilterInput)
+];
+
 pub static TEXT_INPUT: &[Binding] = &[
     b(C::key(Key::Tab), A::FocusNext, "Next / previous field"),
     b(C::shift(Key::Tab), A::FocusPrev, "Next / previous field"),
@@ -724,6 +768,7 @@ pub fn tables(ctx: KeyContext) -> Vec<&'static [Binding]> {
         KeyContext::Modal => vec![MODAL],
         KeyContext::TextInput => vec![TEXT_INPUT],
         KeyContext::Panel => vec![PANEL],
+        KeyContext::Checklist => vec![CHECKLIST],
         KeyContext::Help => vec![HELP],
     }
 }
@@ -737,6 +782,7 @@ pub fn is_filtering(ctx: KeyContext) -> bool {
             | KeyContext::PosterGrid
             | KeyContext::PosterGridFiltering
             | KeyContext::Search
+            | KeyContext::Checklist
             | KeyContext::Help
     )
 }
@@ -850,6 +896,7 @@ const HINTS: &[(KeyContext, &[(Action, &str)])] = &[
     (KeyContext::Search, &[(A::Activate, "open"), (A::ActivateAlt, "details"), (A::FocusNext, "section"), (A::Back, "close")]),
     (KeyContext::TextInput, &[(A::Activate, "confirm"), (A::FocusNext, "next field"), (A::Back, "leave")]),
     (KeyContext::Modal, &[(A::Activate, "confirm"), (A::Back, "cancel")]),
+    (KeyContext::Checklist, &[(A::ToggleMark, "tick"), (A::MarkAll, "all/none"), (A::MarkDefaults, "my country"), (A::Activate, "save")]),
     (KeyContext::Help, &[(A::Back, "clear / close"), (A::FilterClear, "clear filter")]),
 ];
 

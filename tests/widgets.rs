@@ -891,9 +891,12 @@ fn data_rows_render_with_real_services() {
         provider_order: 0,
         user_order: None,
         hidden: false,
+        user_hidden: false,
         locked: true,
         item_count: 9812,
         provider_id: None,
+        tag: None,
+        filter: Default::default(),
     };
     let ep = Episode {
         id: EpisodeId(1),
