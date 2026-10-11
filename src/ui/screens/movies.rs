@@ -462,7 +462,7 @@ impl VodBrowser {
             })
             .collect();
         names.extend(groups.iter().zip(&words).map(|(g, w)| match sources.of(g.source_id) {
-            Some(src) => format!("{w} {}", src.name),
+            Some(src) => format!("{w} {} {}", src.name, src.code),
             None => w.clone(),
         }));
         let shown = self.cats.filter.apply(names.iter().map(String::as_str));
@@ -1685,7 +1685,7 @@ impl VodBrowser {
                         count: members.len(),
                         open: open.contains(&s),
                         fan: true,
-                        second: others.first().and_then(|p| sources.of(*p)),
+                        next: [0, 1].map(|k| others.get(k).and_then(|p| sources.of(*p))),
                         others: others.len(),
                     });
                     // the progress of the copy played last
@@ -1998,11 +1998,10 @@ mod tests {
         assert!(!has_label_containing(&h, "copies"));
     }
 
-    /// A narrow window (790 pt) with long playlist names: the stack card's meta line falls back
-    /// to "Alphaville Premium +1" when both names don't fit, and its count badge is still there
-    /// to click.
+    /// A narrow window (790 pt) with long playlist names: the stack card chips the playlists'
+    /// codes ("AP", "BSE"), never their names, and its count badge is still there to click.
     #[test]
-    fn a_narrow_stack_card_shortens_its_playlists_and_keeps_its_badge() {
+    fn a_narrow_stack_card_chips_its_playlists_and_keeps_its_badge() {
         let (mut t, one) = rig();
         seed(&mut t, |c| {
             let a = testkit::source(c, "Alphaville Premium")?;
@@ -2014,7 +2013,10 @@ mod tests {
         h.state_mut().enter(Route::Movies { group: None });
         h.run_steps(2);
         let painted = testkit::painted(&h);
-        assert!(painted.iter().any(|p| p == " +1"), "{painted:?}");
+        assert!(painted.iter().any(|p| p == "AP") && painted.iter().any(|p| p == "BSE"), "{painted:?}");
+        // the names stay on the playlist tabs only, the card's meta line is the year
+        assert_eq!(painted.iter().filter(|p| p.contains("Alphaville") || p.contains("Bravo Sports")).count(), 2, "{painted:?}");
+        assert!(painted.iter().any(|p| p == "2021"), "{painted:?}");
         assert!(has_label(&h, "3 copies — show each"), "the badge");
     }
 

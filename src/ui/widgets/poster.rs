@@ -4,16 +4,18 @@
 //! Card: 2:3 poster (Poster image kind), title below (2 lines max, body), year + rating
 //! (body-small @0.52), progress bar along the bottom edge (accent) when partially watched,
 //! lock glyph when locked. Cursor = 2 px accent outline (posters have no row background).
-//! With several playlists the card says which one it comes from: the source glyph in a
-//! top-left corner chip (lock / watched chips are top-right) and the source name in its colour
-//! at the start of the meta line (Settings ▸ Interface ▸ Playlist on cards, DESIGN §13.0).
+//! With several playlists the card says which one it comes from: the playlist's short code
+//! ("NW") in its colour in a top-left corner chip (lock / watched chips are top-right; Settings
+//! ▸ Interface ▸ Playlist on cards, DESIGN §13.0 "Playlist codes"). The full name is the chip's
+//! tooltip, part of the accessible label and, while the card has the cursor or the pointer, in
+//! the status bar ("Northwind · 2019 · ★ 7.9"); the meta line stays "year · ★ rating".
 //! The item that is playing carries the accent 󰐊 now-playing marker left of its title
 //! (DESIGN §13.0, §13.1 "Now playing marker").
 //! A **stack card** (copies of one title in "All playlists", DESIGN §29.14) has two offset card
 //! edges behind its poster and a copy-count badge in the poster's bottom-right corner (a click
-//! on it fans the stack out in the grid, or folds it); its meta line names the playlists
-//! ("TV + TV 2 · 1999", "TV +1" when narrow). A copy shown fanned out names its language and
-//! version instead of year and rating ("TV 2 · EN · 4K"). Inside one playlist a title that is
+//! on it fans the stack out in the grid, or folds it); its corner shows the code chips of up to
+//! three of its playlists, then "+n" ([TV][TV2][NW] +1). A copy shown fanned out names its
+//! language and version instead of year and rating ("EN · 4K"). Inside one playlist a title that is
 //! also elsewhere gets one edge and "+1" (tooltip "Also in TV"). Locked copies and all-locked
 //! stacks are drawn disabled (dimmed, with the lock) while the session is locked.
 //!
@@ -25,7 +27,7 @@
 
 use eframe::egui::{self, Align2, Rect};
 
-use super::badge::{label_with_source, legible, paint_source_chip};
+use super::badge::CodeChip;
 use super::list::ListOutcome;
 use super::{glyphs, paint};
 use crate::images::{ImageCache, ImageKind, ImageState};
@@ -44,9 +46,8 @@ const WIDE_GRID_FROM: f32 = 900.0;
 const RAIL_CARD: f32 = 132.0;
 /// PageUp/PageDown step (rows) before the first frame measured the viewport.
 const DEFAULT_PAGE_ROWS: usize = 3;
-/// Share of the card width the playlist name may take on the meta line before it elides
-/// (the year and rating keep the rest).
-const SOURCE_NAME_SHARE: f32 = 0.6;
+/// Code chips a stack card shows before "+n" (its own playlist's first).
+const STACK_CHIPS: usize = 3;
 
 #[derive(Default)]
 pub struct GridState {
@@ -180,10 +181,10 @@ pub(crate) struct StackDecor<'a> {
     pub open: bool,
     /// A click on the badge fans the stack out (grids; Home's rails only show the count).
     pub fan: bool,
-    /// The playlist named after the card's own on the meta line ("TV + TV 2"), when cards
-    /// name playlists.
-    pub second: Option<&'a SourceMeta>,
-    /// Playlists of the stack besides the card's own ("TV +2").
+    /// The stack's next playlists after the card's own, chipped beside its chip, when cards
+    /// show playlists.
+    pub next: [Option<&'a SourceMeta>; STACK_CHIPS - 1],
+    /// Playlists of the stack besides the card's own (those past the chips are "+n").
     pub others: usize,
 }
 
@@ -221,16 +222,29 @@ pub(crate) struct TileDecor<'a> {
     pub dimmed: bool,
 }
 
+/// The playlists a card names in full (accessible label, status bar): "Northwind", "TV + TV 2",
+/// "TV + TV 2 + Aurora +1"; `None` while cards don't show playlists.
+fn playlist_names(decor: &TileDecor<'_>) -> Option<String> {
+    let mut out = decor.source?.name.clone();
+    if let Some(st) = decor.stack.filter(|s| !s.open) {
+        let next: Vec<&SourceMeta> = st.next.iter().flatten().copied().collect();
+        for s in &next {
+            out = format!("{out} + {}", s.name);
+        }
+        if st.others > next.len() {
+            out = format!("{out} +{}", st.others - next.len());
+        }
+    }
+    Some(out)
+}
+
 /// The accessible label of a card: "Dune · TV + TV 2 · 3 copies", "Dune · TV 2 · EN · 4K".
 pub(crate) fn tile_label(item: &VodSummary, decor: &TileDecor<'_>) -> String {
-    let mut label = label_with_source(&item.name, decor.source);
+    let mut label = match playlist_names(decor) {
+        Some(names) => format!("{} · {names}", item.name),
+        None => item.name.to_string(),
+    };
     if let Some(s) = decor.stack {
-        if decor.source.is_some()
-            && !s.open
-            && let Some(second) = s.second
-        {
-            label = if s.others > 1 { format!("{label} +{}", s.others) } else { format!("{label} + {}", second.name) };
-        }
         label = format!("{label} · {} copies", s.count);
     }
     if let Some(c) = decor.copy {
@@ -364,10 +378,9 @@ pub(crate) fn poster_tile_ex(
     let chip = theme.font(TypeToken::Icon) + 2.0 * theme.space(SpaceToken::Xs);
     if let Some(src) = decor.source {
         // top-left: the lock / watched chips grow from the top-right corner
-        let r = Rect::from_min_size(poster.min, egui::vec2(chip, chip));
-        paint_source_chip(ui.painter(), theme, r, src);
-        ui.interact(r, resp.id.with("source-chip"), egui::Sense::hover())
-            .on_hover_text(egui::RichText::new(&src.name).size(theme.font(TypeToken::BodySmall)));
+        let right_chips = f32::from(u8::from(item.locked) + u8::from(decor.watched));
+        let limit = poster.right() - right_chips * (chip + theme.space(SpaceToken::Xs));
+        paint_playlist_chips(ui, theme, &resp, poster.left_top(), limit, chip, src, decor.stack.filter(|s| !s.open));
     }
     let p = ui.painter();
     let corner = |p: &egui::Painter, glyph: &str, color: egui::Color32, slot: f32| {
@@ -454,36 +467,15 @@ pub(crate) fn poster_tile_ex(
     if let Some(e) = decor.elsewhere {
         meta = if meta.is_empty() { format!("+{}", e.count) } else { format!("{meta} · +{}", e.count) };
     }
-    let font = paint::font(theme, TypeToken::BodySmall);
-    let mut left = rect.left();
-    if let Some(src) = decor.source {
-        // "Provider A · 1999 · ★ 8.7": the name in its colour (fg where that wouldn't read)
-        let max_w = if meta.is_empty() { rect.width() } else { (rect.width() * SOURCE_NAME_SHARE).round() };
-        let color = legible(theme, theme.source_color(src.color));
-        left = paint::text(p, egui::pos2(left, y), Align2::LEFT_TOP, src.name.as_str(), font.clone(), color, max_w).right();
-        // a stack: "TV + TV 2" (each in its colour) when it fits, else "TV +1"; fanned out,
-        // the head card names its own copy instead (the badge still marks the stack)
-        if let Some(st) = decor.stack.filter(|s| s.others > 0 && !s.open) {
-            let room = (rect.left() + max_w - left).max(0.0);
-            let second = st
-                .second
-                .filter(|b| st.others == 1 && paint::galley(p, format!(" + {}", b.name), font.clone(), t.fg, f32::INFINITY).size().x <= room);
-            left = match second {
-                Some(b) => {
-                    let plus = paint::text(p, egui::pos2(left, y), Align2::LEFT_TOP, " + ", font.clone(), t.text_secondary, f32::INFINITY).right();
-                    let color = legible(theme, theme.source_color(b.color));
-                    paint::text(p, egui::pos2(plus, y), Align2::LEFT_TOP, b.name.as_str(), font.clone(), color, room).right()
-                }
-                None => {
-                    paint::text(p, egui::pos2(left, y), Align2::LEFT_TOP, format!(" +{}", st.others), font.clone(), t.text_secondary, f32::INFINITY)
-                        .right()
-                }
-            };
-        }
-        if !meta.is_empty() {
-            meta = format!(" · {meta}");
-        }
+    // the full playlist names go to the status bar while the card has the cursor or the pointer
+    if (cursor || resp.hovered())
+        && let Some(names) = playlist_names(&decor)
+    {
+        let line = if meta.is_empty() { names } else { format!("{names} · {meta}") };
+        super::status_bar::note_focus(ui.ctx(), line, resp.hovered());
     }
+    let font = paint::font(theme, TypeToken::BodySmall);
+    let left = rect.left();
     if !meta.is_empty() {
         let r = paint::text(p, egui::pos2(left, y), Align2::LEFT_TOP, meta, font, t.text_secondary, (rect.right() - left).max(0.0));
         if let Some(e) = decor.elsewhere {
@@ -498,6 +490,52 @@ pub(crate) fn poster_tile_ex(
         }
     }
     (resp, badge_clicked)
+}
+
+/// The code chips of a card's playlists from `at` (the poster's top-left corner) rightwards, no
+/// further than `limit`: the card's own, then (a folded stack) the next ones up to
+/// [`STACK_CHIPS`], then "+n" for the rest. Each chip's tooltip is the full name.
+#[allow(clippy::too_many_arguments)]
+fn paint_playlist_chips(
+    ui: &egui::Ui,
+    theme: &Theme,
+    card: &egui::Response,
+    at: egui::Pos2,
+    limit: f32,
+    chip: f32,
+    own: &SourceMeta,
+    stack: Option<StackDecor<'_>>,
+) {
+    let t = &theme.tokens;
+    let p = ui.painter();
+    let (font, fill, gap) = (paint::font(theme, TypeToken::Caption), with_alpha(t.bg, 0.85), theme.space(SpaceToken::Xs));
+    let mut list = vec![own];
+    list.extend(stack.iter().flat_map(|s| s.next.iter().flatten().copied()));
+    let total = 1 + stack.map_or(0, |s| s.others);
+    let more_chip = |n: usize| CodeChip::text(p, theme, &format!("+{n}"), t.fg, font.clone(), t.bg, t.fg, chip);
+    let mut x = at.x;
+    let mut shown = 0;
+    for (i, src) in list.iter().enumerate() {
+        let c = CodeChip::new(p, theme, src, font.clone(), t.bg, t.fg, chip);
+        let rest = total.saturating_sub(i + 1);
+        let need = c.size().x + if rest > 0 { gap + more_chip(rest).size().x } else { 0.0 };
+        // the card's own chip always shows
+        if i > 0 && x + need > limit {
+            break;
+        }
+        let r = c.paint(p, theme, egui::pos2(x, at.y), Align2::LEFT_TOP, Some(fill));
+        ui.interact(r, card.id.with(("source-chip", i)), egui::Sense::hover())
+            .on_hover_text(egui::RichText::new(&src.name).size(theme.font(TypeToken::BodySmall)));
+        x = r.right() + gap;
+        shown += 1;
+    }
+    if total > shown {
+        let n = total - shown;
+        let r = more_chip(n).paint(p, theme, egui::pos2(x, at.y), Align2::LEFT_TOP, Some(fill));
+        let tip = if n == 1 { "Also in 1 more playlist".to_owned() } else { format!("Also in {n} more playlists") };
+        ui.interact(r, card.id.with("source-more"), egui::Sense::hover())
+            .on_hover_text(egui::RichText::new(tip).size(theme.font(TypeToken::BodySmall)));
+    }
 }
 
 pub fn poster_card(
@@ -736,6 +774,97 @@ mod tests {
         assert!(wide_w >= MIN_CARD_WIDE && (7..=9).contains(&wide_cols), "{wide_cols} × {wide_w}");
         assert_eq!(grid_metrics(&th, 50.0).0, 1);
         assert!(card_height(&th, 150.0) > 225.0);
+    }
+
+    fn movie() -> VodSummary {
+        VodSummary {
+            kind: crate::model::VodKind::Movie(crate::model::MovieId(1)),
+            source_id: crate::model::SourceId(1),
+            key: crate::model::ItemKey("k".into()),
+            name: "The Matrix".into(),
+            year: Some(1999),
+            poster: None,
+            rating: Some(8.7),
+            group_ids: vec![],
+            added_at: None,
+            provider_order: 0,
+            locked: false,
+        }
+    }
+
+    fn playlist(id: i64, name: &str, code: &str) -> SourceMeta {
+        SourceMeta {
+            id: crate::model::SourceId(id),
+            name: name.into(),
+            icon: String::new(),
+            color: Default::default(),
+            kind: crate::model::SourceKind::M3uUrl,
+            enabled: true,
+            last_refresh: None,
+            has_vod: true,
+            has_series: false,
+            has_live: false,
+            in_all: true,
+            category_filter: None,
+            own_category_filter: false,
+            language_hidden: 0,
+            code: code.into(),
+        }
+    }
+
+    /// (painted texts, status bar line) of one card `width` wide with the cursor on it.
+    fn draw(t: &mut crate::ui::testing::TestUi, width: f32, decor: TileDecor<'_>) -> (Vec<String>, Option<String>) {
+        let theme = Theme::fallback();
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            poster_tile(ui, &theme, &mut t.images, &movie(), width, true, decor);
+        });
+        out.textures_delta.clear();
+        let texts = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                _ => None,
+            })
+            .collect();
+        (texts, crate::ui::widgets::status_bar::take_focus(&ctx))
+    }
+
+    /// DESIGN §13.0 "Playlist codes": the corner shows codes — a stack's first three, then
+    /// "+n", fewer on a narrow card — the meta line stays "year · ★ rating", and the full names
+    /// go to the accessible label and the status bar.
+    #[test]
+    fn cards_chip_playlist_codes_and_keep_the_meta_line() {
+        let mut t = crate::ui::testing::TestUi::new().unwrap();
+        let (a, b, c) = (playlist(1, "Alpha", "AL"), playlist(2, "Bravo", "BR"), playlist(3, "Charlie", "CH"));
+        let single = TileDecor { source: Some(&a), ..Default::default() };
+        let (texts, status) = draw(&mut t, 150.0, single);
+        assert!(texts.iter().any(|t| t == "AL") && texts.iter().any(|t| t == "1999 · ★ 8.7"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("Alpha")), "no name on the card: {texts:?}");
+        assert_eq!(status.as_deref(), Some("Alpha · 1999 · ★ 8.7"));
+        assert_eq!(tile_label(&movie(), &single), "The Matrix · Alpha");
+
+        // four playlists: three chips, then "+1"
+        let stack = StackDecor { count: 5, open: false, fan: true, next: [Some(&b), Some(&c)], others: 3 };
+        let decor = TileDecor { source: Some(&a), stack: Some(stack), ..Default::default() };
+        let (texts, status) = draw(&mut t, 150.0, decor);
+        for code in ["AL", "BR", "CH", "+1"] {
+            assert!(texts.iter().any(|t| t == code), "{code}: {texts:?}");
+        }
+        assert!(texts.iter().any(|t| t == "1999 · ★ 8.7"), "{texts:?}");
+        assert_eq!(status.as_deref(), Some("Alpha + Bravo + Charlie +1 · 1999 · ★ 8.7"));
+        assert_eq!(tile_label(&movie(), &decor), "The Matrix · Alpha + Bravo + Charlie +1 · 5 copies");
+        // a narrow card: its own chip, the rest counted
+        let (texts, _) = draw(&mut t, 60.0, decor);
+        assert!(texts.iter().any(|t| t == "AL") && texts.iter().any(|t| t == "+3") && !texts.iter().any(|t| t == "BR"), "{texts:?}");
+        // fanned out: the head card is one copy, its own chip only
+        let open = TileDecor { stack: Some(StackDecor { open: true, ..stack }), ..decor };
+        let (texts, _) = draw(&mut t, 150.0, open);
+        assert!(texts.iter().any(|t| t == "AL") && !texts.iter().any(|t| t == "BR" || t.starts_with('+')), "{texts:?}");
+        // cards without playlists: nothing in the corner, nothing in the status bar
+        let (texts, status) = draw(&mut t, 150.0, TileDecor::default());
+        assert!(!texts.iter().any(|t| t == "AL") && status.is_none());
     }
 
     #[test]

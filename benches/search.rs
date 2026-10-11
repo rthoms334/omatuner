@@ -104,6 +104,7 @@ fn library() -> Library {
         category_filter: None,
         own_category_filter: false,
         language_hidden: 0,
+        code: String::new(),
     };
     Library {
         sources: vec![source(1, "My IPTV"), source(2, "Backup")],

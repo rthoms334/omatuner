@@ -1006,9 +1006,9 @@ impl LiveScreen {
                 let mut group = g.clone();
                 group.item_count = live.group_members(g.id).len() as u32;
                 let mut name = g.display_name().to_owned();
-                // in All, the playlist's name filters too ("tv 2" finds TV 2's groups)
+                // in All, the playlist's name and code filter too ("tv 2" finds TV 2's groups)
                 if let Some(s) = marks.of(g.source_id) {
-                    name = format!("{name} {}", s.name);
+                    name = format!("{name} {} {}", s.name, s.code);
                 }
                 let code = g.tag.as_ref().filter(|_| tagged.contains(&g.source_id)).map(crate::sources::category_tags::tag_short);
                 // the code filters too ("uk" finds the UK groups smart names renamed to "Sports")
@@ -2406,9 +2406,11 @@ mod tests {
         assert_eq!(zap_len(&mut h), 5, "the zap list too");
         assert!(has_label(&h, "All · Alpha") && has_label(&h, "All · Bravo"), "groups name their playlist");
         assert!(!has_label(&h, "All · Free"), "Free's groups are out of All");
-        // channel rows paint the name, not just a glyph: Bravo's tab, its 2 groups, its 2 channels
+        // rows chip the playlist's code, its name goes to the label: Bravo's 2 groups and 2
+        // channels; only the tab and the preview's "Also on" chip (P3) name it
         let painted = testkit::painted(&h);
-        assert!(painted.iter().filter(|p| *p == "Bravo").count() >= 5, "{painted:?}");
+        assert!(painted.iter().filter(|p| *p == "BR").count() >= 4, "{painted:?}");
+        assert_eq!(painted.iter().filter(|p| p.contains("Bravo")).count(), 2, "only the tab and Also on name it: {painted:?}");
         let news = h.state().s.groups.iter().rev().find(|g| g.group.display_name() == "News").map(|g| g.entry.clone()).unwrap();
         open(&mut h, news);
         assert!(has_label_containing(&h, "All playlists › News · Bravo"), "the breadcrumb names the group's playlist");

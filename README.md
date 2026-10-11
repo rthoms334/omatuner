@@ -73,16 +73,17 @@ takes the pictures. The theme is Omarchy's Tokyo Night unless noted. The video i
 - **Sources:** M3U by URL or local file, and Xtream Codes (live, movies, series and the
   provider's guide). You can add several playlists, each with its own colour and glyph badge.
   A new playlist gets a colour no other playlist uses, and Settings ▸ Playlists offers to fix
-  two playlists that look the same.
+  two playlists that share a colour.
 - **Several playlists:** when two or more playlists have movies, series or channels, Movies,
   Series and Live TV get a bar on top: *All playlists* or one playlist, each with its count.
   Pick one with a click, `Alt+P` (a picker; digits jump) or `Ctrl+PgDn` / `Ctrl+PgUp`. Each
   screen remembers its own choice and the guide follows Live TV. One playlist shows only its
   categories, groups and channels (zapping too), with a stripe in its colour, a breadcrumb
   (`TV 2 › Action`) and the window title `Tuner — Movies · TV 2`. In *All playlists*, cards,
-  channel rows, group rows and search results say which playlist each item comes from (the
-  glyph in a corner of the poster and the playlist's name under the title); detail pages and
-  the player always do. A playlist's *Show in All playlists* switch keeps, say, free channels
+  channel rows, group rows and search results say which playlist each item comes from with a
+  short code chip in its colour (`NW` for Northwind, `TV2` for TV 2 — derived from the name and
+  unique, or your own in the playlist's editor); hover or focus an item to read the full name
+  in the tooltip and the status bar. Detail pages and the player always name the playlist. A playlist's *Show in All playlists* switch keeps, say, free channels
   out of the All view (your favourites and history still list them). Settings ▸ Interface ▸ Playlist on cards switches the marks to Always or
   Never.
   A provider's M3U (a `get.php?username=…` link or a downloaded file) switches to its Xtream
@@ -130,8 +131,8 @@ takes the pictures. The theme is Omarchy's Tokyo Night unless noted. The video i
   Continue watching, and watched markers.
   - **One card per title across playlists.** In *All playlists*, the copies of a movie or
     series (another playlist, another language, a 4K copy) are one **stack** card: card edges
-    behind the poster, the number of copies, and the playlists under the title (`TV + TV 2 ·
-    2021`). Copies match on title and year, across languages; TMDB ids decide when the
+    behind the poster, the number of copies, and code chips for up to three of its playlists
+    (`TV` `TV2` `NW` `+1`). Copies match on title and year, across languages; TMDB ids decide when the
     provider sends them, and two different ids never combine. The card shows the copy in your
     audio language (Settings ▸ Player ▸ audio languages, English by default). Hidden copies
     and explicit content behind parental control never join a stack; locked copies stay in it,

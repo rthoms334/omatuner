@@ -150,18 +150,31 @@ in `~/.config/omarchy/shell.toml`; Tuner applies it live).
     Search (`/`) results; Live ▸ Favourites, History, Reminders and All channels; the Live
     preview; the player's channel (c), mini guide (g) and history (h) panels.
   - **Expect:**
-    - Each poster has a small chip in its top-left corner with its own playlist's glyph (the
-      lock and watched chips stay top-right); hovering the chip shows the playlist's name.
-    - The line under each card's title starts with the playlist's name ("Provider A · 2019 ·
-      ★ 7.1"); a long name ends in "…" and leaves room for the year.
-    - Rows, channel tiles and the player panels show the glyph at the right; detail pages (an
-      Xtream movie too) and the preview show glyph + name; the player's top bar shows "● name"
-      left of the clock.
-    - Group rows in Live and the Movies / Series categories show the playlist's name in its
-      colour, so the two playlists' "Action" (or "Sports") rows can be told apart.
-    - On the light theme the yellow playlist's glyph and name are drawn in the text colour,
-      with a yellow edge on the chip and a yellow underline under row glyphs; nothing is
-      unreadable.
+    - Each poster has a small chip in its top-left corner with its own playlist's short code
+      in the playlist's colour ("NW" for Northwind; the lock and watched chips stay
+      top-right); hovering the chip shows the playlist's name.
+    - The line under each card's title is only "2019 · ★ 7.1" — no playlist name, even a long
+      one. With the cursor or the pointer on a card the status bar starts with "Provider A ·
+      2019 · ★ 7.1".
+    - Rows (channels, favourites, history, reminders, search results), channel tiles and the
+      player panels show the code chip at the right and the channel's name gets the room;
+      detail pages (an Xtream movie too) and the preview show glyph + name; the player's top
+      bar shows "● name" left of the clock.
+    - Group rows in Live and the Movies / Series categories show the code chip, so the two
+      playlists' "Action" (or "Sports") rows can be told apart; typing a code in the category
+      filter finds that playlist's categories.
+    - On the light theme the yellow playlist's code is drawn in the text colour inside a
+      thicker yellow outline; nothing is unreadable.
+- [ ] **Playlist codes (Settings ▸ Playlists ▸ edit):**
+  - **Do:** name two playlists "TV" and "TV 2", a third "Northwind"; open each editor.
+  - **Expect:** the Short code field shows the derived code as its placeholder ("TV", "TV2",
+    "NW"); every card and row uses those codes; no two playlists share one.
+  - **Do:** type "nw" into TV's Short code and press Save; then type "tv!" and "abcd".
+  - **Expect:** "Northwind already uses NW" next to the field; the field takes only letters
+    and digits, upper-cased, at most 3. A free code (e.g. "MAX") saves without a refresh and
+    the cards show it at once; emptying the field goes back to the derived code. The
+    notice ("… share a colour") still appears for two playlists with the same glyph and
+    colour.
     - Disable one playlist (Settings ▸ Playlists): the marks disappear at once (Auto). Settings
       ▸ Interface ▸ Playlist on cards ▸ Always brings them back; Never hides them, with no
       restart.
@@ -192,9 +205,9 @@ in `~/.config/omarchy/shell.toml`; Tuner applies it live).
     one playlist left the bar and "Alt+P playlist" in the status bar disappear.
 - [ ] **Telling playlists apart and "Show in All playlists":**
   - **Do:** add two Xtream logins (or two URL playlists) without changing their colour.
-  - **Expect:** the second gets a different colour from the first. If two playlists still look
-    the same (same glyph and colour), Settings ▸ Playlists says "A and B look the same on
-    cards and in lists" and offers "Give each its own colour"; nothing changes until it is
+  - **Expect:** the second gets a different colour from the first. If two playlists still share
+    a colour (same glyph and colour), Settings ▸ Playlists says "A and B share a colour" and
+    offers "Give each its own colour"; nothing changes until it is
     pressed, then the second gets a new colour.
   - **Do:** add free channels (Settings ▸ Playlists ▸ Add free channels…), edit that playlist,
     turn off "Show in All playlists", Save.
@@ -1034,7 +1047,8 @@ PIN set, English audio first. Every check in *All playlists* unless it says othe
   - **Do:** open Movies ▸ All movies, then a big category (EN Box Office), then Series. Sort by
     name, by recently added. Watch the scope bar's counts.
   - **Expect:** one card per title — card edges behind the poster, the copy count bottom-right,
-    `TV + TV 2 · 2021` (or `TV +1` when narrow) under the title; the poster and title of the
+    the playlists' code chips top-left (`TV` `TV2`, at most three then `+n`; fewer when
+    narrow) and `2021 · ★ 7.1` under the title; the poster and title of the
     English copy where there is one; the list's sort holds (a stack sits where its first copy
     sorts). *All playlists* counts cards (fewer than the two playlists added up). Scrolling is
     as smooth as before; opening All movies takes no longer than before. No obviously different

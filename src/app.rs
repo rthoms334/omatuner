@@ -1703,6 +1703,7 @@ impl eframe::App for TunerApp {
         let side_w = crate::ui::layout::sidebar_width(width, theme.rem(), cfg.interface.sidebar);
 
         let mut status_top = egui_ctx.content_rect().bottom();
+        let focus = crate::ui::widgets::status_bar::take_focus(&egui_ctx);
         if chrome {
             let jobs = self.services().jobs.active();
             let hint = self.hint_now();
@@ -1716,6 +1717,7 @@ impl eframe::App for TunerApp {
                 now: crate::model::now(),
                 hint: &hint,
                 now_playing: now_playing.as_deref(),
+                focus: focus.as_deref(),
             };
             let bar = egui::Panel::bottom("status-bar")
                 .exact_size((26.0 * theme.rem()).round())
@@ -1776,6 +1778,7 @@ impl eframe::App for TunerApp {
         self.sync_explicit(&egui_ctx);
         self.publish_for_agent();
         self.free_closed_search();
+        crate::ui::widgets::status_bar::settle_focus(&egui_ctx);
         if self.budget.deferred() || self.now_next.pending() || !self.pending_actions.is_empty() {
             egui_ctx.request_repaint();
         }

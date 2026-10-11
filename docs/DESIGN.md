@@ -1497,8 +1497,10 @@ clamp(width/1280, 1, 1.6).
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 Content padding = panel-padding (18). Panes separated by 1 px `pane_divider` (fg @ 0.28).
-Status bar: left = running jobs ("󰑐 Refreshing My IPTV · 45 %", click = Ctrl+J) or, when idle,
-the per-context hint line generated from the keymap (`keymap::hint_line`); right = guide
+Status bar: left = the focused / hovered item with its playlist's full name when cards or rows
+show playlist codes ("Northwind · 2019 · ★ 7.9", §13.0), then running jobs ("󰑐 Refreshing My
+IPTV · 45 %", click = Ctrl+J) or, when idle, the per-context hint line generated from the keymap
+(`keymap::hint_line`); right = guide
 freshness, offline marker, and — when the mini-player is hidden (Compact or disabled) — a
 now-playing chip (click = player, ✕ = stop). **No clock** (the Omarchy bar already shows one).
 Toasts stack bottom-right ABOVE the mini-player rect (`VideoHost::mini_rect`), which screens
@@ -1574,22 +1576,35 @@ when at least 360 px wide) shows for the usual OSD time after popping out.
   them**: a scoped screen (§29) shows marks only in "All playlists"; views without a scope
   (Home, Search, detail pages, the Live preview, the player) count as All
   (`UiCtx::source_of(kind, source)`; scoped screens use `Scope::marks`).
+  * **Playlist codes**: cards and rows show a playlist as a **short code chip** — 1–3 letters
+    or digits in the playlist's colour inside a 1 px outline of that colour
+    (`badge::CodeChip`) — never its name, so a long name can't push the year or a channel's
+    name out. The code is the user's (Settings ▸ Playlists ▸ edit ▸ **Short code**,
+    `SourceSettings::code`) or derived from the name (`sources::codes::auto`): the whole name
+    when it has ≤ 3 letters and digits (`TV`, `TV 2` → `TV2`), else its words' initials
+    (`Harbor Free` → `HF`, digits whole: `Channel 44` → `C44`), one word → the initials of its
+    halves (`Northwind` → `NW`) or its first two letters (`Aurora` → `AU`). Codes are
+    **unique** among all playlists (`sources::codes::assign`: the user's first, a duplicate
+    gets the first free variant `TV2`, `TV3`, …, then letters), resolved once per library
+    build into `SourceMeta::code`. The editor's field shows the derived code as placeholder,
+    accepts letters and digits only (upper-cased, ≤ 3) and refuses another playlist's code
+    ("Northwind already uses NW"). The full name stays one step away: the chip's tooltip, the
+    item's accessible label, and the **status bar** while the item has the cursor or the
+    pointer ("Northwind · 2019 · ★ 7.9"; `status_bar::note_focus`). Typing a playlist's code
+    in a category / group filter finds its categories, like its name.
   * *Poster cards* (Movies / Series grids, every Home poster rail — Continue watching,
-    favourites, Recently added): a **top-left corner chip** (the lock / watched chips grow from
-    the top-right, so they never collide), same size and bg @ 0.85 as those chips, the source
-    glyph in the source colour; tooltip = the playlist's name. The **meta line starts with the
-    playlist's name** in its colour then " · " ("Provider A · 1999 · ★ 8.7"), so it reads
-    without hovering and never by colour alone. *Short-name rule*: the name elides with "…" at
-    60 % of the card width when a year / rating follows (they keep the rest), at the full width
-    otherwise.
+    favourites, Recently added): a **top-left code chip** (the lock / watched chips grow from
+    the top-right, so they never collide), the height of those chips on bg @ 0.85; tooltip =
+    the playlist's name. A folded stack card chips **up to three** of its playlists (its own
+    first), then `+n` for the rest; fewer when the card is narrow (its own always shows;
+    tooltip "Also in n more playlists"). The **meta line is "year · ★ rating" only**.
   * *Rows and tiles* (Live channel rows incl. the virtual Favourites / History / All groups,
     Live ▸ Reminders, Home channel tiles incl. Recently watched, the player's channel /
-    history / mini-guide panels): the **compact glyph** at the right edge (left of the lock on
-    tiles), name as tooltip — rows have no room for a name, and the list header / preview
-    already says the rest. Search results keep their glyph + name pill (wide rows).
-  * *Group rows* (Live groups, Movies / Series categories) in All: the playlist's name, short
-    (elided at 30 % of the row), in its colour (fg where it doesn't read), right of the group
-    name — the two "Sports" are told apart (replaces the old " · TV 2" suffix).
+    history / mini-guide panels, search results — a chip per playlist of a stack): the code
+    chip at the right edge (left of the lock on tiles), name as tooltip, the same in every
+    density — the item's name gets the width.
+  * *Group rows* (Live groups, Movies / Series categories) in All: the code chip right of the
+    group name — the two "Sports" are told apart (replaces the old " · TV 2" suffix).
   * *Detail pages* (movie, series — Xtream pages too, not only playlist ones) and the Live
     preview: a source badge (glyph + name) leads the meta line. (Sparse playlist pages no
     longer append the name to the meta.)
@@ -1599,9 +1614,9 @@ when at least 360 px wide) shows for the usual OSD time after popping out.
     A") on cards, tiles, rows and search hits.
   * *Contrast*: a source colour is used for text or a glyph only where it reaches 3:1 on its
     background (`badge::legible_on`; window bg for cards / rows, the OSD scrim in the player).
-    Otherwise the glyph / name is fg and the colour moves to a non-text mark: a 1.5 px edge
-    on the corner chip, a 2 px underline under a row glyph, the border of a badge — e.g. a
-    yellow playlist on a light theme.
+    Otherwise the code / name is fg and the colour moves to a non-text mark: the code chip's
+    outline thickens to 1.5 px, the border of a badge — e.g. a yellow playlist on a light
+    theme.
 * **Reorder vs sort**: Alt+↑/↓ while the list is sorted by anything other than *Custom order*
   (`SortMode::Provider` = provider order with user reordering) switches it to Custom order with
   a toast "Switched to custom order". Ctrl+S opens a small sort & view menu (launcher card),
@@ -1646,10 +1661,10 @@ adds a `Quality` line on live channels with a quality word: "Quality  named 4K �
 | Progress | `progress::*` | programme progress fg; watch progress accent; busy bar for unknown totals |
 | Badge | `badge::*` | caption, 1 px border colour @ 0.6; LIVE = urgent; source = source colour (palette role) + glyph, text fg where the colour is < 3:1 on bg |
 | Scope bar | `scope_bar::scope_bar` (tabs), `scope_bar::scope_button` (`● TV 2 ▾`), `scope_bar::paint_stripe` | control-height row; tab = dot (palette colour, non-text) · name (fg selected / hovered, `text_secondary` otherwise) · count (body-small @ 0.52); selected tab underlined 2 px in its colour (accent for All); hover fill fg @ 0.08; button = bordered button with the dot; stripe 2 px in the picked playlist's colour (§29) |
-| Source mark | `badge::paint_source_chip` (poster corner chip), `badge::paint_source_mark` (rows, tiles, OSD lists), `badge::source_badge` (detail pages, preview) | glyph icon 14 in the source colour; chip = bg @ 0.85, top-left, size of the lock chip; colour < 3:1 → fg glyph + 1.5 px colour edge (chip) / 2 px colour underline (glyph); tooltip = playlist name (§13.0 "Playlist on cards") |
+| Source mark | `badge::CodeChip` (poster corner chips, OSD lists), `badge::paint_code_chip` (rows, tiles, search hits, copy cards), `badge::source_badge` (detail pages, preview) | the playlist's code (caption) in its colour, 1 px outline in the colour, never narrower than tall; poster chips = bg @ 0.85, top-left, height of the lock chip; colour < 3:1 → fg code + 1.5 px colour outline; tooltip = playlist name (§13.0 "Playlist codes") |
 | Quality badge | `badge::InlineBadge::quality` + `name_with_quality` (rows, grid, search, OSD lists), `badge::quality_badge` (preview, guide side panel) | monospace caption, text @ 0.52 (`text_secondary`; `text_disabled` on dimmed rows; OSD text in the player), 1 px border at 0.6 × the text's opacity, Md gap after the name |
 | Logo / monogram | `logo::logo` | square, aspect kept; monogram on fg @ 0.04, text @ 0.52 |
-| Poster card | `poster::poster_card` | 2:3; title body; meta body-small @ 0.52 (led by the playlist's name in its colour, §13.0); progress accent; cursor 2 px accent outline; corner chips: playlist top-left, lock / watched top-right |
+| Poster card | `poster::poster_card` | 2:3; title body; meta body-small @ 0.52 (year · ★ rating; the playlist is a code chip, §13.0); progress accent; cursor 2 px accent outline; corner chips: playlist top-left, lock / watched top-right |
 | Empty / error state | `empty_state::empty_state` | glyph display-large 28 accent @ 0.8; title 14 fg @ 0.7; detail @ 0.52 |
 | Sidebar | `sidebar::sidebar` | bg dark_background; row control-height + md; selected fg @ 0.18 + accent |
 | Status bar | `status_bar::status_bar` | height 26 (Omarchy bar), body-small, fg @ 0.52 |
@@ -1998,6 +2013,7 @@ favourites lists) show a 󰇙 drag grip and move with Alt+↑/↓ or K/J. Every 
 | | Server timezone override | `SourceSettings.server_tz` | from account |
 | | Use provider EPG · smart names · import VOD | `SourceSettings.*` | on |
 | | Show in All playlists (§29; a view setting — saving it doesn't refresh) | `SourceSettings.in_all` | on |
+| | Short code (1–3 letters / digits, unique; placeholder = the derived code; a view setting) (§13.0) | `SourceSettings.code` | from the name |
 | | look-alike notice + "Give each its own colour" (§29) | `source.color` | — |
 | | Account info (read-only) | `AccountInfo` | — |
 | EPG | sources (add URL/file, enable, **priority order** — grip / Alt+↑/↓, offset minutes, refresh) | `epg_source` | — |
@@ -4355,19 +4371,19 @@ adds "Alt+P playlist" (before "help") only on those screens with two or more eli
   compared as the theme draws them — Accent is often the theme's blue
   (`scope::first_free_color`).
 * Settings ▸ Playlists lists playlists that **look the same** (same glyph and same drawn
-  colour, `scope::look_alikes`): "TV and TV 2 look the same on cards and in lists", with a
+  colour, `scope::look_alikes`): "TV and TV 2 share a colour" (their codes always differ), with a
   **Give each its own colour** action that keeps the first of each group and gives the others
   the first free colours (`scope::distinct_colors`; toast). Nothing changes until it is
   pressed.
-* Marks always carry the name (accessible label, meta line, group and channel rows, the
-  player's channel panel, tooltips); only the poster corner chip and Compact channel rows are
-  glyph-only (name as tooltip).
+* Marks are code chips, unique per playlist (§13.0 "Playlist codes"); the name is always in the
+  accessible label, the tooltip and the status bar line of the focused item.
 
 ### 29.8 Changes to the "playlist on cards" work it folds in
-Kept: `PlaylistOnCards`, `SourceMarks` (now `for_view(mode, sources, kind, all)`), the coloured
-name on the meta line, `TileDecor.source`, `paint_source_chip`, the detail badge (now on
-Xtream pages too). Done in P2 (§29.14), differently: the stack card names its playlists on the
-meta line (`TileDecor.stack`, no `SourceSet`), the stack edges and copy count, `+1` inside one
+Kept: `PlaylistOnCards`, `SourceMarks` (now `for_view(mode, sources, kind, all)`),
+`TileDecor.source`, the detail badge (now on
+Xtream pages too). The coloured name on the meta line and the glyph corner chip became code
+chips (§13.0 "Playlist codes"). Done in P2 (§29.14), differently: the stack card chips its
+playlists (`TileDecor.stack`, no `SourceSet`), the stack edges and copy count, `+1` inside one
 playlist, and the detail pages' Copies section instead of `DetailHeader` copies.
 
 ### 29.9 Tests
@@ -4546,16 +4562,16 @@ copy" turns every copy back into its own card everywhere, no rebuild):
 | Movies / Series, scope All | All, every category, Continue watching, Favourites | `ui::stacks::collapse`: the stack's place is where its first copy comes in the list (the sort holds); the card is the stack's **top** when the list has it, else the list's own copy (unlocked first) — a playlist's category shows its own copy, Favourites the favourite one |
 | Movies / Series, one playlist | never | a title also in other playlists gets one card edge and `+1` on the meta line (tooltip "Also in TV"); playlists out of All have no stacks, so no `+1` |
 | Home | Recently added, Recently updated series (renamed: it sorts on the provider's date), favourites rails, Continue watching | top copy; the copy played last; the first favourite copy |
-| Search | Movies and Series hits | the best-matching copy, a chip per playlist of the stack (`[● TV] [● TV 2]`; none with one playlist); Enter opens the stack's top card's page |
+| Search | Movies and Series hits | the best-matching copy, a code chip per playlist of the stack (`[TV] [TV2]`; none with one playlist); Enter opens the stack's top card's page |
 
 **Stack card** (`widgets::poster`, `TileDecor.stack`): two card edges offset down-right behind the
 poster (the card keeps its footprint), a copy-count badge bottom-right above the progress bar,
-and the meta line `TV + TV 2 · 2021` (each name in its colour; `TV +1` when it doesn't fit,
-`TV +2` with three playlists). "Playlist on cards: Never" drops the names, not the edges or the
-count. ★ / ✓ / progress / lock follow `stacks::stack_marks`: progress of the copy played last,
+and its playlists' code chips top-left (`[TV] [TV2] [NW] +1`: up to three, fewer on a narrow
+card, the meta line stays `2021 · ★ 7.1`). "Playlist on cards: Never" drops the chips, not the
+edges or the count. ★ / ✓ / progress / lock follow `stacks::stack_marks`: progress of the copy played last,
 the lock (and the disabled look: dimmed poster and card edges, muted title) only when every
 copy is locked and the session is locked. Fanned out, the head card names its own copy (`TV ·
-EN · 4K`) instead of the playlists; the accent badge still marks the stack. Accessible label:
+EN · 4K` on the meta line, its own chip only); the accent badge still marks the stack. Accessible label:
 `Dune · TV + TV 2 · 3 copies[ · locked]`. With a stack card focused the hint line adds "Space
 copies · Ctrl+O play from" (`Screen::hint_extras`, keys from the context's tables).
 
