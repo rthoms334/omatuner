@@ -761,7 +761,6 @@ impl PlayerScreen {
         }
     }
 
-    /// `[HD] [5.1] [CC] [⟲]` right-aligned at `right_center`; returns their extent.
     /// The video-only window's banner: one bottom strip — title and volume, then what's on
     /// (live) or the position (VOD).
     fn draw_compact_osd(&mut self, ui: &egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, snap: &PlayerSnapshot) {
@@ -797,6 +796,7 @@ impl PlayerScreen {
         osd_text(&p, egui::pos2(inner.left(), inner.top() + line), Align2::LEFT_TOP, &second, small_font, with_alpha(t.osd_text, 0.8), inner.width());
     }
 
+    /// `[HD] [5.1] [CC] [⟲]` right-aligned at `right_center`; returns their extent.
     fn badges(&self, p: &egui::Painter, theme: &Theme, snap: &PlayerSnapshot, catchup: bool, right_center: egui::Pos2, font: FontId, s: f32) -> Rect {
         let t = &theme.tokens;
         let mut labels: Vec<String> = Vec::new();
