@@ -381,6 +381,8 @@ user data (by ItemRef = source_id, kind, item_key):
   fav_list 1─* fav_item · item_override · group_override (by group key) · watch_progress
   · history · reminder (by channel key) · stream_failure
   (every item-keyed user table carries fp + orphaned_since)
+per-stream caches (by channel key, not user data, not in backups): stream_failure ·
+  channel_video (measured picture size, + fp so it follows a re-keyed channel)
 meta (k/v: backup id, last library build, etc.)
 ```
 
@@ -798,6 +800,38 @@ CREATE TABLE stream_failure (
 ) WITHOUT ROWID;
 ```
 
+### 6.2.1 `0002_quality.sql` (quality badges, §13.0)
+
+```sql
+ALTER TABLE channel ADD COLUMN quality INTEGER;   -- name's quality word: 1 SD 2 HD 3 FHD 4 4K
+CREATE TABLE channel_video (                      -- what mpv decoded when the channel last played
+  source_id INTEGER NOT NULL REFERENCES source(id) ON DELETE CASCADE,
+  item_key  TEXT    NOT NULL,
+  width     INTEGER NOT NULL,
+  height    INTEGER NOT NULL,
+  at        INTEGER NOT NULL,
+  fp        TEXT    NOT NULL DEFAULT '{}',        -- channel Fingerprint at measurement time
+  PRIMARY KEY (source_id, item_key)
+) WITHOUT ROWID;
+```
+* `channel.quality` is written by every import (`ImportChannel.quality` = the `smart_names`
+  parse of the provider name, whether or not smart names are on). Databases from before 0002
+  get it from the stored names by the migration's Rust backfill (same transaction, once).
+* `channel_video` is written by the player controller through the writer
+  (`PlayerStore::record_video` → `store::live::record_video`) once per channel and size, only
+  while a **live** channel is `Playing` (a zap or a reconnect can still show the previous
+  picture; catch-up archives may be encoded differently). No `DataScope` is sent: the UI keeps
+  this session's measurements itself (`ui::data::MeasuredQuality`) until the next library build.
+* Keyed by identity like `stream_failure`, so refreshes keep it. A row whose key is gone after
+  a completed channel import is re-keyed with the §8.3 steps from its `fp` (a channel that has
+  its own measurement keeps it), else dropped — never an orphan.
+* `library::load` reads both (`LEFT JOIN channel_video`); `ChannelSummary.quality` = the
+  measured class if any, else the name's. Class of a decoded `w×h` (`Quality::of_video`): the
+  better of what the height (≥ 2000 4K, ≥ 1000 FHD, ≥ 700 HD, else SD) and the width (≥ 3800,
+  ≥ 1900, ≥ 1260) say, so cropped 1920×800 and anamorphic 1440×1080 read FHD. **1440p is
+  FHD**: four classes keep the badge narrow, and QHD is closer to FHD than to the 4K it would
+  otherwise claim.
+
 ### 6.3 FTS approach and write rules (fixes the critique and review B2)
 
 * `programme` is an `INTEGER PRIMARY KEY AUTOINCREMENT` rowid table: ids are never reused, so
@@ -846,7 +880,9 @@ CREATE TABLE stream_failure (
 transaction; a DB newer than the binary is refused (never downgraded silently). `0001_init.sql`
 is frozen at tag `skeleton-v1` (nothing has shipped before it, which is why review round 2
 edited it in place); later changes are new `000N_*.sql` entries appended by WP-02 with
-architect sign-off.
+architect sign-off. A migration whose new columns need data SQL can't compute gets a Rust
+`backfill` step that runs in the same transaction right after its script (0002: channel
+quality from the stored provider names, ~0.1 s per 100k channels, once).
 
 ### 7.2 Mark-and-sweep imports (catalogue)
 `source.generation` = last completed import. An import uses `generation + 1`, **upserts** rows
@@ -1236,6 +1272,17 @@ Overlays centre with a bg @ 0.5 scrim.
 * **Hover** moves list cursors only after real pointer motion (Omarchy `Menu.qml`
   `pointerGate.moved()`), never because rows scroll under a still pointer, and never triggers
   playback.
+* **Quality badges** (Settings ▸ Interface ▸ Show quality badges, default on, applied live):
+  `SD` / `HD` / `FHD` / `4K` after the channel name — Live rows, the guide's channel column and
+  side panel, Search results, the player's channel list / mini guide / zap banner, Home channel
+  tiles (favourites rails included). Source: what mpv decoded the last time the channel played
+  (`channel_video`; this session's plays at once via `ui::data::MeasuredQuality`), else the
+  quality word of the provider name (`channel.quality`) — so "BBC One 4K" that plays at 1080p
+  shows FHD, and an untagged channel gets a badge once it played (§6.2.1). No marker tells a
+  measured value from a name one: two looks for one word is noise, and the player's OSD and
+  the Live preview show the decoded value anyway (those show it whatever the setting). The
+  badge follows the name and gives way first: it shows only while the whole name fits beside
+  it, then the name elides (`widgets::badge::name_with_quality`).
 * **Reorder vs sort**: Alt+↑/↓ while the list is sorted by anything other than *Custom order*
   (`SortMode::Provider` = provider order with user reordering) switches it to Custom order with
   a toast "Switched to custom order". Ctrl+S opens a small sort & view menu (launcher card),
@@ -1246,7 +1293,7 @@ Overlays centre with a bg @ 0.5 scrim.
 | Component | Widget | Tokens |
 |---|---|---|
 | Menu/list row | `widgets::rows::menu_row`, `list::virtual_list` | height max(50, body + 2·row-padding-x), 58 with detail; label heading 16 Medium; detail body-small 11 @ 0.52; icon column 36 @ icon-large 18; chevron @ 0.36; cursor = fg @ 0.08 fill + **accent** text (+ optional 1 px fg @ 0.25); selected = fg @ 0.18 |
-| Channel row | `rows::channel_row` | as menu row; number body @ 0.52; progress bar 3 px (track fg @ 0.18, fill fg); next programme body-small @ 0.52 |
+| Channel row | `rows::channel_row` | as menu row; number body @ 0.52; progress bar 3 px (track fg @ 0.18, fill fg); next programme body-small @ 0.52; quality badge after the name (§13.0) |
 | Section header | `section::section_header` | caption 10, bold, darker(fg, 1.4), top pad ceil(0.15·size) |
 | Separator / pane divider / group divider | `section::*` | 1 px fg @ 0.12 / 0.28 / 0.20 |
 | Card (menu / launcher) | `card::card(Menu)` | bg `menu.background`, 2 px `menu.border` (fg), padding 18 |
@@ -1259,6 +1306,7 @@ Overlays centre with a bg @ 0.5 scrim.
 | Slider / seek bar | `slider::*` | track max(4, 0.11·control-height) fg @ 0.18, fill fg, knob max(14, 0.38·ch) ×1.15 hover; seek bar over video uses OSD colours |
 | Progress | `progress::*` | programme progress fg; watch progress accent; busy bar for unknown totals |
 | Badge | `badge::*` | caption, 1 px border colour @ 0.6; LIVE = urgent; source = source colour (palette role) + glyph |
+| Quality badge | `badge::InlineBadge::quality` + `name_with_quality` (rows, grid, OSD lists), `badge::badge` (panels) | monospace caption, text @ 0.52 (`text_secondary`; `text_disabled` on dimmed rows; OSD text in the player), 1 px border @ 0.6, Md gap after the name |
 | Logo / monogram | `logo::logo` | square, aspect kept; monogram on fg @ 0.04, text @ 0.52 |
 | Poster card | `poster::poster_card` | 2:3; title body; meta body-small @ 0.52; progress accent; cursor 2 px accent outline |
 | Empty / error state | `empty_state::empty_state` | glyph display-large 28 accent @ 0.8; title 14 fg @ 0.7; detail @ 0.52 |
@@ -1313,6 +1361,12 @@ provider groups (renamed/reordered/hidden per overrides; locked show 󰌾 and re
   cancels (also Settings ▸ Reminders).
 * Reorder (Alt+↑/↓) inside a provider group writes `item_override.user_order` (§8 limitation
   for `;` multi-group channels).
+* **Duplicates best first**: with the default sort (custom order), the SD / HD / FHD / 4K
+  duplicates of one channel (same `norm_name`, same primary group) trade places so the best
+  known quality comes first; they keep the slots they had between them, and every other
+  channel — a duplicate of unknown quality, or one the user placed (`user_order`) — keeps its
+  own (`LiveIndex::collection`, All channels and provider groups; favourites, history and
+  search keep their order). The zap order is the list order, as everywhere.
 
 Medium (≈ 790): the preview stays on the RIGHT; groups become a drawer (← / Backspace on the
 channel list, or click the breadcrumb):
@@ -1553,7 +1607,7 @@ favourites lists) show a 󰇙 drag grip and move with Alt+↑/↓ or K/J. Every 
 | | Default User-Agent | `player.user_agent` | VLC/3.0.21 |
 | | Advanced mpv options | `player.mpv_options` | {} |
 | Interface | Start screen | `general.start_screen` | Auto (Live until favourites/history exist, then Home) |
-| | Sidebar · density · channel numbers · logos · 24 h clock | `interface.*` | auto · comfortable · on · on · on |
+| | Sidebar · density · channel numbers · logos · quality badges · 24 h clock | `interface.*` (`quality_badges`) | auto · comfortable · on · on · on · on |
 | | Live preview autoplay · preview delay · guide preview · mini player · OSD timeout | `interface.*` | **off** · 1200 ms · off · on · 3500 ms |
 | | UI scale (on top of Omarchy base size) · hide empty groups | `interface.ui_scale`, `hide_empty_groups` | 1.0 · on |
 | | Default sort live / movies / series | `interface.*_sort` | provider / recent / recent |

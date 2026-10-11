@@ -556,3 +556,34 @@ These items use the **default** profile: start Tuner from the launcher, not with
 - [ ] **Login refused:** use a playlist whose panel rejects the API login. **Expect:** it stays
   M3U with movies and series sorted out of the playlist, and the next automatic check is a week
   later (*Refresh now* in its editor retries at once).
+
+## 14. Quality badges (real provider)
+
+Use a provider that lists the same channel several times in different qualities (e.g.
+"UK: BBC One SD / HD / FHD / 4K", often also "ᴴᴰ" or "1080p" names), at **Wide** and **Tiled**,
+**text 12** and **text 16**.
+
+- [ ] **Duplicates show distinct badges:**
+  - **Do:** after this build's first start (the migration fills the badges of the existing
+    library without a refresh), open the group with the duplicates in Live TV, the guide, Search
+    (`/` + the channel name), the player's channel list (`c`) and mini guide (`g`), and a Home
+    favourites rail holding two of them.
+  - **Expect:**
+    - Each copy shows its badge (SD, HD, FHD, 4K) right after the same name, in the muted badge
+      look (monospace, thin border), never clipped. A channel with no quality word has none.
+    - The copies are listed best first (4K, FHD, HD, SD) in their group; other channels keep
+      the provider's order. ↑/↓ in the player zaps in that order, and the zap banner shows the
+      badge of the copy it tunes to.
+    - In a narrow list a long name keeps its full text while it fits; the badge disappears
+      before the name gets an ellipsis.
+- [ ] **The measured value replaces a wrong name tag after playback:**
+  - **Do:** play a copy whose name claims more than it delivers (a "4K" that plays at 1080p;
+    stream info, `I`, shows the real size), and a channel without a quality word.
+    Leave the player and look at their rows; then restart Tuner and refresh the playlist.
+  - **Expect:** as soon as each plays, its badge shows the real class (FHD for the 1080p "4K";
+    SD/HD/FHD for the untagged one) in every list, and it stays so after the restart and the
+    refresh. A 1440p stream reads FHD.
+- [ ] **Setting:**
+  - **Do:** Settings ▸ Interface ▸ Show quality badges off, then on.
+  - **Expect:** the badges disappear from every list at once and come back; the Live preview
+    and the player OSD still show the stream's quality.
