@@ -48,7 +48,9 @@ prepare() {
   fi
   local _version
   _version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
-  if [[ $_version != "$pkgver" ]]; then
+  # A pre-release build (release.yml) appends its tag's suffix, e.g. 0.1.0rc4 for v0.1.0-rc4,
+  # which pacman orders before 0.1.0.
+  if [[ $pkgver != "$_version" && $pkgver != "$_version"[a-z]* ]]; then
     error "pkgver ($pkgver) does not match Cargo.toml ($_version)"
     return 1
   fi

@@ -2288,11 +2288,14 @@ prefer-dark/light). `hypr::focus_self` uses Hyprland 0.56's Lua dispatcher
   `provides`/`conflicts`: no package of this app was ever published under another name.
 * **Releases** (`.github/workflows/release.yml`): a pushed tag `v<version>` or
   `v<version>-<suffix>` (`<version>` must equal `Cargo.toml`'s; the PKGBUILD's `prepare()` checks
-  `pkgver` against it too) builds the PKGBUILD with makepkg as an unprivileged user in
+  `pkgver` against it too; the suffix is lowercase letters, digits and dots starting with a letter,
+  and a pre-release builds `pkgver=<version><suffix>`, e.g. `0.1.0rc4`, which pacman orders
+  before `0.1.0`) builds the PKGBUILD with makepkg as an unprivileged user in
   `archlinux:base-devel` (x86_64, on `ubuntu-24.04`) and `menci/archlinuxarm:base-devel`
-  (aarch64, natively on `ubuntu-24.04-arm`), and publishes a GitHub Release (`--generate-notes`;
-  a tag with a suffix is a pre-release) with `omatuner-<ver>-<rel>-<arch>.pkg.tar.zst`,
-  `omatuner-<ver>-<arch>.tar.gz` (binary, desktop entry, icon, snippets, README, LICENSE) and
+  (aarch64, natively on `ubuntu-24.04-arm`; pinned by digest in the release workflow, floating in
+  CI), and publishes a GitHub Release (`--generate-notes`; a tag with a suffix is a pre-release;
+  re-running a failed publish re-uploads into the existing release) with
+  `omatuner-<pkgver>-<rel>-<arch>.pkg.tar.zst`, `omatuner-<pkgver>-<arch>.tar.gz` (binary, desktop entry, icon, snippets, README, LICENSE) and
   `SHA256SUMS`. A manual run with `publish=false`, and every pull request that touches
   `packaging/`, `Cargo.*` or the workflow, is a dry run (workflow artifacts only).
 * **CI** (`.github/workflows/ci.yml`): pull requests and pushes to `main`, same two containers:

@@ -2,7 +2,10 @@ name: Release
 
 # A pushed tag `v<version>` (or `v<version>-<suffix>` for a pre-release) builds the Arch packages
 # and tarballs for x86_64 and aarch64 and publishes a GitHub Release. `<version>` must equal
-# Cargo.toml's version (the PKGBUILD checks its pkgver against it too).
+# Cargo.toml's version (the PKGBUILD checks its pkgver against it too). A pre-release's suffix
+# (lowercase letters, digits and dots, starting with a letter) is appended to the package version:
+# tag v0.1.0-rc4 builds omatuner 0.1.0rc4, which pacman orders before 0.1.0, so the final release
+# upgrades it.
 # Run by hand with `publish` off for a dry run on any branch: the files are only uploaded as
 # workflow artifacts. Pull requests that change the packaging or this workflow get the same dry
 # run (build only; the publish job never runs for them).
@@ -49,7 +52,10 @@ jobs:
             keyring: archlinux-keyring
           - arch: aarch64
             runner: ubuntu-24.04-arm
-            image: menci/archlinuxarm:base-devel
+            # Arch Linux ARM (unofficial image, rebuilt daily), pinned by digest for the packages
+            # people install: bump it deliberately (`docker buildx imagetools inspect
+            # menci/archlinuxarm:base-devel`). `pacman -Syu` below keeps its packages current.
+            image: menci/archlinuxarm:base-devel@sha256:57ed42430d3d3f22beb2983de1aa23396b27fcf33ebf5dd781947cdc1038a640
             keyring: archlinuxarm-keyring
     runs-on: ${{ matrix.runner }}
     container:
@@ -63,11 +69,13 @@ jobs:
           # pacman's download sandbox (Landlock + the alpm user) is refused inside the runner's
           # container ("restricting filesystem access failed ... Operation not permitted").
           grep -qx DisableSandbox /etc/pacman.conf || sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf
-          pacman -Sy --noconfirm --needed "$KEYRING"
-          pacman -Su --noconfirm
+          # Mirrors (Arch Linux ARM's especially) fail now and then: three tries per step.
+          retry() { local i; for i in 1 2 3; do "$@" && return; [[ $i == 3 ]] || sleep 20; done; return 1; }
+          retry pacman -Sy --noconfirm --needed "$KEYRING"
+          retry pacman -Su --noconfirm
           # makedepends (cargo via rustup) + depends from packaging/PKGBUILD, so makepkg can
           # check them without installing anything itself.
-          pacman -S --noconfirm --needed \
+          retry pacman -S --noconfirm --needed \
             git rustup mpv xz fontconfig ttf-jetbrains-mono-nerd wayland libxkbcommon mesa dbus \
             gcc-libs glibc
 
@@ -80,7 +88,13 @@ jobs:
         env:
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
+          PUBLISH: ${{ inputs.publish }}
         run: |
+          # Refuse a publish request that can't succeed before spending the build on it.
+          if [[ $PUBLISH == true && $REF_TYPE != tag ]]; then
+            echo "::error::publish=true needs a tag: run the workflow on the tag (Use workflow from: Tags)"
+            exit 1
+          fi
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
           pkgver="$(sed -n 's/^pkgver=//p' packaging/PKGBUILD)"
           pkgrel="$(sed -n 's/^pkgrel=//p' packaging/PKGBUILD)"
@@ -89,19 +103,33 @@ jobs:
             echo "::error::PKGBUILD pkgver ($pkgver) does not match Cargo.toml ($version)"
             exit 1
           fi
-          if [[ $REF_TYPE == tag && $REF_NAME != "v$version" && $REF_NAME != "v$version-"* ]]; then
-            echo "::error::tag $REF_NAME does not match Cargo.toml version $version (expected v$version or v$version-<suffix>)"
-            exit 1
+          # The package version: Cargo's, plus a pre-release tag's suffix without its dash.
+          pkgversion="$version"
+          if [[ $REF_TYPE == tag ]]; then
+            if [[ $REF_NAME =~ ^v${version//./\\.}(-([a-z][a-z0-9.]*))?$ ]]; then
+              pkgversion="$version${BASH_REMATCH[2]}"
+            else
+              echo "::error::tag $REF_NAME does not match Cargo.toml version $version (expected v$version or v$version-<suffix>, the suffix lowercase letters, digits and dots starting with a letter, e.g. v$version-rc1)"
+              exit 1
+            fi
           fi
+          echo "Package version $pkgversion-$pkgrel"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "pkgversion=$pkgversion" >> "$GITHUB_OUTPUT"
           echo "pkgrel=$pkgrel" >> "$GITHUB_OUTPUT"
 
       - name: Build the package (makepkg as an unprivileged user)
+        env:
+          PKGVERSION: ${{ steps.version.outputs.pkgversion }}
         run: |
           useradd --create-home builder
           runuser -u builder -- rustup toolchain install stable --profile minimal
           runuser -u builder -- rustup default stable
           cp -a "$GITHUB_WORKSPACE" /home/builder/omatuner
+          # A pre-release builds e.g. pkgver=0.1.0rc4 (the PKGBUILD accepts Cargo's version plus a
+          # suffix that starts with a letter).
+          sed -i "s/^pkgver=.*/pkgver=$PKGVERSION/" /home/builder/omatuner/packaging/PKGBUILD
+          grep -x "pkgver=$PKGVERSION" /home/builder/omatuner/packaging/PKGBUILD
           chown -R builder:builder /home/builder/omatuner
           # Arch Linux ARM's makepkg.conf defaults to .pkg.tar.xz; release zstd on both arches.
           runuser -u builder -- env PKGEXT=.pkg.tar.zst \
@@ -111,17 +139,18 @@ jobs:
         env:
           ARCH: ${{ matrix.arch }}
           VERSION: ${{ steps.version.outputs.version }}
+          PKGVERSION: ${{ steps.version.outputs.pkgversion }}
           PKGREL: ${{ steps.version.outputs.pkgrel }}
         run: |
           set -x
           src=/home/builder/omatuner/packaging
-          pkg="omatuner-$VERSION-$PKGREL-$ARCH.pkg.tar.zst"
+          pkg="omatuner-$PKGVERSION-$PKGREL-$ARCH.pkg.tar.zst"
           ls -l "$src"
           mkdir -p dist
           cp "$src/$pkg" dist/
           # The tarball holds the packaged binary and files (same build as the package).
           root="$src/pkg/omatuner"
-          stage="omatuner-$VERSION-$ARCH"
+          stage="omatuner-$PKGVERSION-$ARCH"
           mkdir -p "$stage/hypr" "$stage/omarchy"
           install -m755 "$root/usr/bin/tuner" "$stage/tuner"
           install -m644 "$root/usr/share/applications/tuner.desktop" "$stage/"
@@ -130,7 +159,7 @@ jobs:
           install -m644 "$root/usr/share/tuner/omarchy/omarchy-menu.jsonc" "$stage/omarchy/"
           install -m644 README.md LICENSE "$stage/"
           tar --owner=0 --group=0 --sort=name -czf "dist/$stage.tar.gz" "$stage"
-          # Sanity checks: the binary runs and reports this version; list what ships.
+          # Sanity checks: the binary runs and reports Cargo's version; list what ships.
           out="$("$stage/tuner" --version)"
           [[ $out == "tuner $VERSION" ]]
           pacman -Qip "dist/$pkg"
@@ -150,6 +179,7 @@ jobs:
     needs: build
     if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish)
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
@@ -174,6 +204,13 @@ jobs:
           cat ./*.sha256 > SHA256SUMS
           rm ./*.sha256
           sha256sum -c SHA256SUMS
-          flags=()
-          if [[ $TAG == *-* ]]; then flags+=(--prerelease); fi
-          gh release create "$TAG" --verify-tag --generate-notes --title "Tuner $TAG" "${flags[@]}" ./*
+          ls -l
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # A re-run after a partial upload: replace the files, keep the release and its notes.
+            echo "Release $TAG exists; uploading the files again"
+            gh release upload "$TAG" --clobber ./*
+          else
+            flags=()
+            if [[ $TAG == *-* ]]; then flags+=(--prerelease); fi
+            gh release create "$TAG" --verify-tag --generate-notes --title "Tuner $TAG" "${flags[@]}" ./*
+          fi

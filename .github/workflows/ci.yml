@@ -11,7 +11,8 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # A newer push to a pull request supersedes its run; runs on main always finish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -53,16 +54,18 @@ jobs:
           # pacman's download sandbox (Landlock + the alpm user) is refused inside the runner's
           # container ("restricting filesystem access failed ... Operation not permitted").
           grep -qx DisableSandbox /etc/pacman.conf || sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf
-          pacman -Sy --noconfirm --needed "$KEYRING"
-          pacman -Su --noconfirm
+          # Mirrors (Arch Linux ARM's especially) fail now and then: three tries per step.
+          retry() { local i; for i in 1 2 3; do "$@" && return; [[ $i == 3 ]] || sleep 20; done; return 1; }
+          retry pacman -Sy --noconfirm --needed "$KEYRING"
+          retry pacman -Su --noconfirm
           # Build: rustup (rust >= 1.95, clippy, rustfmt), mpv (libmpv), xz (liblzma).
           # Tests: ffmpeg (test media), dbus (session bus for MPRIS/notifications), systemd
           # (busctl), fontconfig + JetBrains Mono Nerd Font (font resolution), lua (Hyprland
           # snippet), desktop-file-utils (desktop entry). Runtime libs: wayland, libxkbcommon, mesa.
-          pacman -S --noconfirm --needed \
+          retry pacman -S --noconfirm --needed \
             git rustup mpv ffmpeg xz dbus systemd fontconfig ttf-jetbrains-mono-nerd lua \
             desktop-file-utils wayland libxkbcommon mesa
-          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          retry rustup toolchain install stable --profile minimal --component clippy,rustfmt
           rustup default stable
           rustc -vV
           mpv --version | sed -n 1p

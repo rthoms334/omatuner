@@ -793,7 +793,9 @@ scripts/gen-big-fixtures.py                   # 100k-channel M3U + 415k-programm
 - **Releases** (`.github/workflows/release.yml`): pushing a tag `vX.Y.Z` (matching `Cargo.toml`
   and the PKGBUILD's `pkgver`) builds the PKGBUILD with makepkg on both architectures and
   publishes a GitHub Release with the packages, tarballs and `SHA256SUMS`. A tag with a suffix
-  (`v0.1.1-rc1` for version 0.1.1) becomes a pre-release. *Run workflow* with `publish` off is a dry run that only
+  (`v0.1.1-rc1` for version 0.1.1; lowercase letters, digits and dots, starting with a letter)
+  becomes a pre-release whose package version is `0.1.1rc1`, which pacman orders before `0.1.1`,
+  so the final release upgrades it. *Run workflow* with `publish` off is a dry run that only
   uploads the files as workflow artifacts; pull requests that change `packaging/`, `Cargo.*` or
   the workflow get the same dry run.
 

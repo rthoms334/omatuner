@@ -80,9 +80,11 @@ in `~/.config/omarchy/shell.toml`; Tuner applies it live).
   - **Do:** download the package for this machine and `SHA256SUMS` from
     <https://github.com/rthoms334/omatuner/releases>, run
     `sha256sum -c --ignore-missing SHA256SUMS`, then
-    `sudo pacman -U omatuner-<version>-1-$(uname -m).pkg.tar.zst`.
-  - **Expect:** the checksum is OK, pacman installs it with its dependencies, and
-    `tuner --version` prints the tag's version.
+    `sudo pacman -U omatuner-<pkgver>-1-$(uname -m).pkg.tar.zst` (`<pkgver>` is the tag without
+    its `v` and the suffix's dash: `0.1.0` for `v0.1.0`, `0.1.0rc4` for `v0.1.0-rc4`).
+  - **Expect:** the checksum is OK, pacman installs it with its dependencies (a final release
+    over its pre-release is an upgrade, not a reinstall), and `tuner --version` prints the
+    tag's version without any pre-release suffix.
 - [ ] **Desktop file:**
   - **Do:** `desktop-file-validate packaging/tuner.desktop`.
   - **Expect:** no output and exit status 0.
