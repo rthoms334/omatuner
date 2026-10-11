@@ -265,12 +265,12 @@ fn stack_fan_out_and_play_from() {
     assert_eq!(resolve(&[K::PosterGrid], &key(Key::Space)), None, "the key twin reaches nothing");
     assert_eq!(resolve(&[K::PosterGridFiltering], &text(" ")), Some(Action::FilterInput(' ')), "filters have spaces");
     assert_eq!(resolve(&[K::List], &text(" ")), Some(Action::ToggleMark), "group lists keep marking");
-    for stack in [vec![K::PosterGrid], vec![K::PosterGridFiltering], vec![K::Detail]] {
+    for stack in [vec![K::PosterGrid], vec![K::PosterGridFiltering], vec![K::Detail], vec![K::PlayerVod]] {
         assert_eq!(resolve(&stack, &ctrl(Key::O)), Some(Action::PlayFrom), "{stack:?}");
         assert_eq!(resolve(&stack, &ctrl_shift(Key::O)), Some(Action::TogglePopOut), "{stack:?}");
     }
     assert_eq!(resolve(&[K::List], &ctrl(Key::O)), None, "channels have no copies");
-    assert!(help_rows(K::PosterGrid).iter().any(|r| r.0 == "Space" && r.1.starts_with("Fan out")));
+    assert!(help_rows(K::PosterGrid).iter().any(|r| r.0 == "Space" && r.1.starts_with("Show each copy")));
 }
 
 // ------------------------------------------------------------------ tables, help, hints

@@ -945,3 +945,86 @@ side buttons, at
     position keep readable room (previous / next drop out below 420 pt). A slider change flashes
     the level. The drag moves the window; a click on a strip button acts without moving the window. The
     mini player's button pops the player out.
+
+## 18. Several playlists: stacks in All (real catalogue)
+
+Two Xtream playlists with overlapping movies and series (the real catalogue: ~300k movies), a
+PIN set, English audio first. Every check in *All playlists* unless it says otherwise.
+
+- [ ] **Stacks:**
+  - **Do:** open Movies ▸ All movies, then a big category (EN Box Office), then Series. Sort by
+    name, by recently added. Watch the scope bar's counts.
+  - **Expect:** one card per title — card edges behind the poster, the copy count bottom-right,
+    `TV + TV 2 · 2021` (or `TV +1` when narrow) under the title; the poster and title of the
+    English copy where there is one; the list's sort holds (a stack sits where its first copy
+    sorts). *All playlists* counts cards (fewer than the two playlists added up). Scrolling is
+    as smooth as before; opening All movies takes no longer than before. No obviously different
+    films share a card (spot-check 20 stacks; namesakes like *Leo* 2023 are the known case).
+- [ ] **Fan-out:**
+  - **Do:** on a stack card press Space, move onto a copy, press Space again; fan out two stacks
+    and press Esc; click a count badge twice; type a filter and press Space.
+  - **Expect:** the copies follow the card, each with `TV 2 · EN · 4K`, the head card names its
+    own copy; Space on a copy folds its stack, the cursor stays on the stack; Esc folds
+    everything first (then goes back); the badge does the same; while filtering Space types a
+    space. The hint line shows `Space copies · Ctrl+O play from` on a stack card.
+- [ ] **Copies on the page, Play from:**
+  - **Do:** Enter on a stack card; look at the Copies row. Click a non-first copy; press Play.
+    Ctrl+O and pick another copy. Open the same title from Search, from a category of TV 2 and
+    from Favourites; press Play each time. Fan a stack out, Enter on TV 2's copy, Play.
+  - **Expect:** one mini-card per copy with playlist chip, language, quality, progress and a
+    status (*plays first*, *locked*, *failed 2 h ago* once a copy failed); "Matched by title and
+    year (2021)" under them. The clicked copy plays and the Play button names its playlist.
+    From Search / a category / Favourites, Play plays the same copy as Shift+Enter on the stack
+    card (the pinned one if any). A copy opened from the fan plays itself.
+- [ ] **Which copy plays, resume:**
+  - **Do:** Shift+Enter on a stack with no progress; stop after a minute; Shift+Enter again;
+    *Always play from* a copy in its menu, Shift+Enter; switch Settings ▸ Interface ▸ *Which
+    copy plays first* to Best quality.
+  - **Expect:** the English copy of the first playlist plays (never a CAM copy when a clean one
+    exists, never an `IN-EN` Hindi dub before English); then "Resume 1:00" resumes that copy;
+    the pinned copy plays first and its mini-card says *always plays first*; Best quality picks
+    4K within the language.
+- [ ] **Fallback:**
+  - **Do:** pick a stack where one copy is dead (or block the first playlist's host in
+    `/etc/hosts`) and Shift+Enter; then let a copy fail mid-film (pull the network after a
+    minute); press Ctrl+O while a stacked movie plays normally.
+  - **Expect:** before the first frame Tuner plays the next copy once and toasts "TV couldn't
+    play Dune — playing from TV 2"; a second failure shows the error (no loop). Mid-film nothing
+    switches by itself: after the reconnects the error card offers "Play from TV 2 at 41:20"
+    (Ctrl+O too). During playback Ctrl+O lists the other copies and the one picked starts at
+    the current position. A copy that failed shows "failed … ago" and plays last next time,
+    also after a playlist refresh.
+- [ ] **Not the same title, Undo:**
+  - **Do:** on a page, a copy's menu ▸ Not the same title; click the toast's Undo. Do it again,
+    open another page, then go to Settings ▸ Hidden ▸ Titles you separated or pinned and press
+    Enter on it. Remove a stack from Favourites (Ctrl+F) and click Undo after opening a page.
+  - **Expect:** the copy leaves the stack (the card count drops), Undo puts it back; the Hidden
+    list shows the split and Enter combines it again; a refresh keeps a split. Each toast's Undo
+    reverts its own action, from any screen.
+- [ ] **Locked copies:**
+  - **Do:** lock one copy of a stack (fan out, Ctrl+L on the copy), lock the session, look at
+    the card and the page; lock every copy; Ctrl+L on the stack card; Shift+Enter.
+  - **Expect:** a locked copy stays in the stack, dimmed with the lock, and asks for the PIN
+    when picked; the card shows an unlocked copy. Every copy locked: the card is dimmed (edges
+    too) with the lock and asks for the PIN. Ctrl+L on the stack locks / unlocks every copy;
+    Shift+Enter never plays a locked copy while the session is locked.
+- [ ] **Hide, rename, favourites on a stack:**
+  - **Do:** Ctrl+H on a stack card; Undo. F2 on a stack whose one copy you renamed before;
+    Enter, Enter. Ctrl+F on a stack, then Ctrl+F again; Ctrl+W; Delete in Continue watching.
+  - **Expect:** Hide hides every copy ("Hid Dune in TV and TV 2"), Undo brings them back. Rename
+    warns about the copy with its own name and renames all on the second Enter. Ctrl+F adds the
+    copy that would play, the second Ctrl+F removes every copy; Delete forgets every copy's
+    progress. Each with Undo.
+- [ ] **Filters, hidden and explicit content:**
+  - **Do:** with the category filter (UK + English) on one playlist, open All movies; hide a
+    category holding one copy of a stack; mark a category explicit; lock the session; unlock.
+  - **Expect:** filtered-out, hidden and explicit copies never join a stack (counts drop by
+    them); explicit copies leave stacks the moment the session locks and come back after the
+    PIN.
+- [ ] **One playlist, Show each copy, Home and Search:**
+  - **Do:** pick TV 2 in the scope bar; set *Same title in several playlists* to Show each copy;
+    back to Combine; look at Home's rails and search a stacked title.
+  - **Expect:** one playlist combines nothing (a title also in TV says `+1`, tooltip "Also in
+    TV"); Show each copy makes every copy a card again at once (no rebuild); Home's rails and
+    Search show one tile / row per stack with both playlists; Shift+Enter there plays the copy
+    that plays first.

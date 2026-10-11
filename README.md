@@ -92,6 +92,31 @@ on-screen controls, and a light theme (catppuccin-latte).
   `shift`, `flussonic`, `xc`, `vod`). You can set a catch-up offset per channel.
 - **Movies and series:** posters, details, seasons and episodes, resume / start over,
   Continue watching, and watched markers.
+  - **One card per title across playlists.** In *All playlists*, the copies of a movie or
+    series (another playlist, another language, a 4K copy) are one **stack** card: card edges
+    behind the poster, the number of copies, and the playlists under the title (`TV + TV 2 ·
+    2021`). Copies match on title and year, across languages; TMDB ids decide when the
+    provider sends them, and two different ids never combine. The card shows the copy in your
+    audio language (Settings ▸ Player ▸ audio languages, English by default). Hidden copies
+    and explicit content behind parental control never join a stack; locked copies stay in it,
+    dimmed, and ask for the PIN.
+  - `Space` (or a click on the count) shows each copy in the grid with its language and
+    version (`TV 2 · EN · 4K`); `Space` or `Esc` folds them. `Shift+Enter` plays the copy that
+    plays first; `Enter` opens the page, whose **Copies** row lists every copy with its
+    playlist, language, quality, progress and status (*plays first*, *failed 2 h ago*,
+    *locked*). Click one to play it, or use **Play from ▾** / `Ctrl+O`.
+  - Which copy plays: the one you chose with *Always play from…*, else the one you watched
+    last, then copies that failed lately, whose playlist refused a stream or whose account
+    expired go last, then your audio language, CAM copies after clean ones, then the playlist
+    order (Settings ▸ Playlists) — or the best quality, with Settings ▸ Interface ▸ *Which copy
+    plays first* — and mkv / mp4 before other files. If it fails before the first frame, Tuner
+    plays the next copy once and says so; if it fails later, the error offers *Play from TV 2
+    at 41:20*. `Ctrl+O` in the player switches copy where you are.
+  - ★, watched, lock, hide and rename on a stack act on the title (the toast has **Undo**).
+    *Not the same title* (a copy's menu) takes a wrongly combined copy out for good;
+    Settings ▸ Hidden ▸ *Titles you separated or pinned* undoes it. Settings ▸ Interface ▸
+    *Same title in several playlists: Show each copy* turns stacks off. Inside one playlist
+    nothing is combined; a title that is also in another playlist says `+1`.
 - **Search:** global fuzzy search over channels, movies, series and programmes (`/` or Ctrl+K),
   plus type-to-filter in every list.
 - **Player:**
@@ -502,6 +527,8 @@ The full reference is generated from `src/keymap.rs`:
 | `Esc` | Back |
 | `/` | Search everything |
 | `?` | Keyboard help |
+| `Space` | Show each copy / fold them (stack card) |
+| `Ctrl+O` | Play from another copy… |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
 | `Ctrl+H` | Hide / unhide |
@@ -530,6 +557,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Ctrl+Backspace` | Delete word |
 | `Ctrl+U` / `Esc` | Clear filter |
 | `Tab` / `Shift+Tab` | Next / previous pane |
+| `Ctrl+O` | Play from another copy… |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
 | `Ctrl+H` | Hide / unhide |
@@ -559,6 +587,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Backspace` / `Esc` | Back |
 | `/` | Search everything |
 | `?` | Keyboard help |
+| `Ctrl+O` | Play from another copy… |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
 | `Ctrl+H` | Hide / unhide |
@@ -645,7 +674,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Shift+←` / `Shift+→` / `↑` / `↓` | Skip back / forward (big step) |
 | `L` | Jump to live (from catch-up) |
 | `Home` | Go to start |
-| `Ctrl+O` | Play from another playlist's copy (after an error) |
+| `Ctrl+O` | Play from another copy… |
 | `Space` | Play / pause |
 | `m` | Mute |
 | `+` / `=` / `-` | Volume up / down |
@@ -800,7 +829,9 @@ Everything the keys do can be done with the mouse too:
   window and stop; drag the video to move it; double-click to put it back. The corner mini
   player has a pop-out button next to its ✕.
 - **Movies and series:** below full width, the "{category} ▾" button opens the categories and
-  one click on a category opens it.
+  one click on a category opens it. A click on a stack's copy count shows each copy, or folds
+  them; on a page, a click on a copy plays from it and right-click opens its menu (*Always
+  play from*, *Not the same title*).
 
 ## Parental control
 

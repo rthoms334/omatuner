@@ -71,7 +71,7 @@ pub struct PlayRequest {
     pub immediate: bool,
 }
 
-/// Play one copy of a title that several playlists have (DESIGN §29.14).
+/// Play one copy of a title that several playlists have (DESIGN §29.15).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CopyPlay {
     pub req: PlayRequest,

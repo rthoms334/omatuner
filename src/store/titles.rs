@@ -114,7 +114,7 @@ impl LinkAction {
     }
 }
 
-/// One stored correction, for Settings ▸ Hidden ▸ "Titles you split or combined".
+/// One stored correction, for Settings ▸ Hidden ▸ "Titles you separated or pinned".
 #[derive(Debug, Clone, PartialEq)]
 pub struct TitleLink {
     pub item: ItemRef,

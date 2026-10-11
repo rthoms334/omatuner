@@ -398,7 +398,7 @@ impl TunerApp {
                 PlatformEvent::FilePicked { .. } | PlatformEvent::ReminderFired(_) => {}
                 PlatformEvent::PopOut(ev) => self.on_popout_event(ev, egui_ctx),
             },
-            // the first copy of a title failed before its first frame (DESIGN §29.14)
+            // the first copy of a title failed before its first frame (DESIGN §29.15)
             AppEvent::Player(crate::player::PlayerEvent::FellBack { title, from, to, .. }) => {
                 self.toast(crate::ui::copies::fell_back_toast(&self.lib, title, *from, *to));
             }

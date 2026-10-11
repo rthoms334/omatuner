@@ -351,9 +351,9 @@ summaries, groups, ordered members, by-id/by-ref maps, hidden set) + `VodIndex` 
 (build-time copy) + `recent_channels`. Built off-thread (`RebuildLibrary`), swapped as
 `Arc<Library>`. Budget: 100k channels + 50k movies + 20k series → < 400 ms, < 60 MB. The index
 types and accessors are implemented in the skeleton and built with `from_parts`.
-`load_with(conn, &LoadOptions)` (the job passes `LoadOptions::from_config`: audio languages, the
-`vod_visible` hook) also builds `VodIndex::stacks` — the copies of one title in "All playlists"
-(§29.11).
+`load_with(conn, &LoadOptions)` (the job passes `LoadOptions::from_config`: audio languages and
+the explicit-content `Visibility`, §20.3) also builds `VodIndex::stacks` — the copies of one
+title in "All playlists" (§29.11).
 
 Favourites live OUTSIDE the immutable snapshot: the app owns `favs: FavIndex` (copied from each
 new `Library`), exposed as `UiCtx::favs`; a toggle submits `store::user::set_favourite` and
@@ -2276,7 +2276,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Esc` | Back |
 | `/` | Search everything |
 | `?` | Keyboard help |
-| `Space` | Fan out / fold the copies of a stack |
+| `Space` | Show each copy / fold them (stack card) |
 | `Ctrl+O` | Play from another copy… |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
@@ -2423,7 +2423,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Shift+←` / `Shift+→` / `↑` / `↓` | Skip back / forward (big step) |
 | `L` | Jump to live (from catch-up) |
 | `Home` | Go to start |
-| `Ctrl+O` | Play from another playlist's copy (after an error) |
+| `Ctrl+O` | Play from another copy… |
 | `Space` | Play / pause |
 | `m` | Mute |
 | `+` / `=` / `-` | Volume up / down |
@@ -4147,6 +4147,10 @@ names and renames never change it), by `vod_match::parse(name, year, &PrefixCode
 | markers | a dotted acronym (`S.W.A.T.`) marks the key (never meets `Swat`); a `3D` prefix part too | `swat|acr`, `avatar|3d` |
 | fold | lower-case letters and digits; Latin diacritics folded (`Opération` = `Operation`), other scripts kept | |
 
+Audio language of a tag (`vod_match::audio_lang`): the market's language; `IN-xx` are Indian
+languages (`IN-TL` Tamil…), and `IN-EN` is the **Hindi-dubbed** shelf ("EN Hindi", "India EN
+Dubbed") — never English; subtitled markets (`AR-SUBS`) say nothing about the audio.
+
 **Stacking** (`vod_match::cluster_flat`, per kind; inputs: the stored hash, TMDB id, origin):
 * Same key + same **known** year → one stack, **across languages and markets** (§29.1 #5).
   A missing year never stacks by key; years are never fuzzy (`Worth` 2020 / 2021 stay apart —
@@ -4157,7 +4161,9 @@ names and renames never change it), by `vod_match::parse(name, year, &PrefixCode
   (`Incendies` / `Die Frau die singt`); a same-key run with two ids splits by id, its id-less
   copies form their own stack; two different explicit origins split the same way
   (*The Office* (US) / (GB)).
-* A copy the user split off stands alone (§29.11).
+* A copy the user split off leaves its stack for good; copies split off the same title stack
+  together, as the other title (namesakes are separated in two steps, not one per copy;
+  §29.11).
 * The ratings check (report rule F) is dropped: provider ratings are too noisy.
 
 Hash: `match_hash` = blake3 over (kind, key, year) with separators, cut to 64 bits (the
@@ -4168,12 +4174,17 @@ On the snapshot (every copy, before hiding): movies 301 965 → **163 481 cards 
 series 77 665 → **41 140 (−47.0 %)**, 11 786 stacks; 109 same-key series kept apart by two
 origins; 42 834 movies and 3 052 series have no year (they stack only by TMDB id, which this
 snapshot doesn't have yet). The app stacks only visible copies, so with the UK + English
-filter the stacks are mostly English copies.
+filter the stacks are mostly English copies. Judged by eye at integration: 160 random stacks
+(40 movie and 40 series stacks across playlists, 40 + 40 inside one) — no definite false stack,
+one doubtful (a 2026 title in a Nordic and a Philippine category): ≈ 0–0.6 % of stacks. The
+known false class is short namesakes of one year across industries (*Leo* 2023, *Gold* 2022):
+only TMDB ids or "Not the same title" separate them.
 
 ### 29.11 P2: stacks in the library (`store::stacks`, `store::titles`)
 
-**Data** (migration `0005_title_stacks`, idempotent — columns added by its Rust step only when
-missing, so it survives a renumber):
+**Data** (migration `0006_title_stacks`, idempotent — columns added by its Rust step only when
+missing; it was 0005 before explicit content took that number, and a development database at
+v5 with it gets `0005_explicit` applied on open, `migrations::reconcile_renumbered`):
 * `movie` / `series`: `match_key` (folded key, diagnostics and P3 "Same title as…"),
   `match_hash` (NULL = can't stack by key), `match_lang` (`EN`, `AR-SUBS`, `FR+SUB`,
   `+MULTI`), `match_tags` (`VersionTags`; NULL = not computed), `match_origin`;
@@ -4187,36 +4198,42 @@ missing, so it survives a renumber):
   with `match_tags IS NULL` are parsed — the upsert clears it when the provider name or year
   changes — unless `meta` `vod_match:<id>` (rules version + prefix fingerprint) changed; only
   changed rows are written.
-* `title_link(source_id, kind, item_key, action ∈ {split, pin}, at)`: the user's corrections,
-  keyed like user data (a refresh keeps them; a vanished copy leaves an inert row).
-  `titles::set_split` ("Not the same title", Undo = `false`), `titles::set_pin` (one pin per
-  stack: pinning clears the other copies'), `titles::links` (Settings ▸ Hidden ▸ "Titles you
-  split or combined"). Write them with `DataScope::Overrides` (the library rebuilds).
+* `title_link(source_id, kind, item_key, action ∈ {split, pin}, at, fp, orphaned_since)`: the
+  user's corrections, **user data** like a favourite (`store::user` HOLDERS): a refresh that
+  re-keys the copy re-attaches them by fingerprint (else they are listed in Settings ▸
+  Orphans), so a split never quietly comes undone. `titles::set_split` ("Not the same title",
+  Undo = `false`), `titles::set_pin` (one pin per stack: pinning clears the other copies'),
+  `titles::links` (Settings ▸ Hidden ▸ "Titles you separated or pinned"). Write them with
+  `DataScope::Overrides` (the library rebuilds); backups carry them.
 
-**Build** (`stacks::build`, inside `library::load_with`, per kind): only copies in the snapshot
-— hidden items (own flag, every category hidden, the category filter) are not, nor items the
-**`LoadOptions::vod_visible` hook** rejects (the one place explicit content plugs in: an item
-it rejects is never listed, counted, searched or stacked) — and only from playlists in All
+**Build** (`stacks::build`, the last step of `library::load_with`, per kind): only copies in the
+snapshot — hidden items (own flag, every category hidden, the category filter) are not, nor
+**explicit content while parental control hides it**: `LoadOptions::visibility` is §20.3's
+`Visibility`, the one predicate; the build leaves explicit copies out before stacking, so they
+are never listed, counted, searched or stacked — and only from playlists in All
 (`library::out_of_all`, shared with `ui::scope`). Locked copies stay (`VodSummary.locked`).
+When the session relocks, `Library::hiding_explicit` re-filters the snapshot on the UI thread:
+`VodIndex::without` re-points the stacks with `Stacks::retain` (members keep their order, a
+stack left with one copy dissolves, the top is re-chosen) until the rebuild lands.
 * Language of a copy: its tag; an untagged copy in a category whose tagged copies are ≥ 80 %
   one market (≥ 10) takes that market (`CopyMeta::inferred`, label `AR-SUBS?`) — it never
   passes as the user's language because the provider left the prefix off.
 * Language rank (`vod_match::lang_rank`, user's `player.audio_langs` normalised `eng` → `en`):
   the user's languages in order, then untagged / multi-audio copies, then subtitled markets
   whose audio the tag doesn't say (`AR-SUBS`, `+SUB`), then other languages.
-* Copy order inside a stack: language rank, playlist order, CAM / TS after the other copies
-  of their playlist, the playlist's own order. **Top** = the first unlocked copy; all locked →
-  the first.
+* Copy order inside a stack: language rank, CAM / TS after the clean copies of that language
+  (whichever playlist has them), playlist order, the playlist's own order. **Top** = the first
+  unlocked copy; all locked → the first.
 
 **API** (`lib.vod.stacks(movies) -> &Stacks`; item = index into `vod.movies` / `vod.series`):
 `stack_of(item) -> Option<StackId>`, `members(s)`, `top(s)`, `copies(item)`, `len()`,
-`saved()` (All's card count = copies − saved), `collapse(&items)` (each stack once, as its
-top, where its first member comes: the list's sort holds), `fan_out(&collapsed, &[open])`,
-`elsewhere(item, &items)` ("+1 also in TV" inside one playlist), `meta(item) -> CopyMeta`
+`saved()` (All's card count = copies − saved; the scope bar's All counts cards), `retain(map,
+&items)`, `elsewhere(item, &items)` ("+1 also in TV" inside one playlist), `meta(item) -> CopyMeta`
 (dub, version tags, origin, TMDB id, rank, pin, split), `lang(item)`, `lang_label(item)`
 (`EN`, `FR · sub`, `AR?`), `playlist_rank(source)`, `facts(item, &items) -> CopyFacts`.
-All views call `collapse` when `interface.same_title = combine` (default; `show-each` = every
-copy is a card); one playlist never collapses. `VodIndex` also caches name sort ranks per
+Views of everything collapse lists with `ui::stacks::collapse` (§29.14) when
+`interface.same_title = combine` (default; `show-each` = every copy is a card); one playlist
+never collapses. `VodIndex` also caches name sort ranks per
 snapshot (a name sort is an integer sort).
 
 ### 29.12 P2: which copy plays, marks (`stacks::play_order`, `stack_marks`)
@@ -4224,9 +4241,10 @@ snapshot (a name sort is an integer sort).
 `play_order(&[CopyFacts], session_unlocked, interface.copy_order)` → copy indices, first plays:
 1. the pinned copy ("Always play from TV 2"); 2. the latest progress; 3. copies that failed
 recently, whose account is at its connection limit or expired go last (`trouble`, the caller
-knows); 4. language rank; 5. playlist order (`copy-order = playlist-order`, default) — or best
-quality first (`best-quality`) — copies of one playlist tie here; 6. mkv / mp4 before other
-containers (`container_ok`, unknown between); 7. CAM / TS last. Locked copies are left out
+knows); 4. language rank; 5. CAM / TS after the clean copies of that language — a CAM copy
+in the first playlist never plays before a clean one in the second; 6. playlist order
+(`copy-order = playlist-order`, default) — or best quality first (`best-quality`) — copies of
+one playlist tie here; 7. mkv / mp4 before other containers (`container_ok`, unknown between). Locked copies are left out
 unless the session is unlocked. `fallback(&order, failed)`: the next copy, tried **once** when
 the first fails before its first frame (the player decides "once" and the toast).
 
@@ -4242,15 +4260,22 @@ Measured (release): clustering the real 301 965 movies 10–16 ms, the whole sta
 60 ms; synthetic 300k (`benches/store.rs` `stacks/*`) in the same range. Parsing a name ≈ 1.6 µs
 (import / migration only: 0.5 s for 302k). No per-frame work: stacks are built with the
 snapshot; `collapse` runs when a list is rebuilt. `benches/startup.rs` and `benches/store.rs`
-seed paired copies keyed like an import, so the library-load gate includes stacking.
+seed paired copies keyed like an import, so the library-load gate includes stacking. At
+integration (after explicit content): library load 100k channels + 50k movies + 20k series
+**309 ms** (origin/main, whose bench seeds no copies: 277 ms, same machine back to back) —
+budget 400 ms; `stacks/build_300k_movies` 42 ms, `stacks/cluster_300k_movies` 12 ms; on the
+real snapshot 29 ms / 10 ms (series 7 / 3 ms).
 
 Tests: `vod_match` (the report's provider spellings per rule, false-merge cases as tables —
 namesakes across industries, remakes by origin, TMDB override, missing / near years, generic
 titles; dub / sub / version tags; frequent prefixes; language ranks), `stacks` (top card with
 locked / CAM / foreign copies, in-All and split, category-inferred markets, play order and
-fallback, stack marks), `store_catalogue` (import keys and TMDB ids, hidden vs locked vs out of
-All vs the visibility hook, split surviving a refresh and its Undo, one pin per stack, a
-renamed copy re-keyed), the 0005 migration (backfill, re-run), Xtream list / info TMDB parsing.
+fallback, CAM across playlists, `retain` after a removal, split copies of one title together,
+stack marks), `store_catalogue` (import keys and TMDB ids, hidden vs locked vs out of All vs
+explicit content at build and on relock, split surviving a refresh and its Undo, a split
+re-attached after the provider re-keys the copy, one pin per stack, a renamed copy re-keyed),
+the 0006 migration (backfill, re-run, a database that ran it as 0005), Xtream list / info TMDB
+parsing.
 
 ### 29.14 P2 UI: stack cards, Copies, Play from (`ui::stacks`, `screens::copies`)
 
@@ -4263,36 +4288,44 @@ copy" turns every copy back into its own card everywhere, no rebuild):
 | Movies / Series, scope All | All, every category, Continue watching, Favourites | `ui::stacks::collapse`: the stack's place is where its first copy comes in the list (the sort holds); the card is the stack's **top** when the list has it, else the list's own copy (unlocked first) — a playlist's category shows its own copy, Favourites the favourite one |
 | Movies / Series, one playlist | never | a title also in other playlists gets one card edge and `+1` on the meta line (tooltip "Also in TV"); playlists out of All have no stacks, so no `+1` |
 | Home | Recently added, Recently updated series (renamed: it sorts on the provider's date), favourites rails, Continue watching | top copy; the copy played last; the first favourite copy |
-| Search | Movies and Series hits | the best-matching copy, a chip per playlist of the stack (`[● TV] [● TV 2]`; none with one playlist) |
+| Search | Movies and Series hits | the best-matching copy, a chip per playlist of the stack (`[● TV] [● TV 2]`; none with one playlist); Enter opens the stack's top card's page |
 
 **Stack card** (`widgets::poster`, `TileDecor.stack`): two card edges offset down-right behind the
 poster (the card keeps its footprint), a copy-count badge bottom-right above the progress bar,
 and the meta line `TV + TV 2 · 2021` (each name in its colour; `TV +1` when it doesn't fit,
 `TV +2` with three playlists). "Playlist on cards: Never" drops the names, not the edges or the
 count. ★ / ✓ / progress / lock follow `stacks::stack_marks`: progress of the copy played last,
-the lock (and the disabled look: dimmed poster, muted title) only when every copy is locked and
-the session is locked. Accessible label: `Dune · TV + TV 2 · 3 copies[ · locked]`.
+the lock (and the disabled look: dimmed poster and card edges, muted title) only when every
+copy is locked and the session is locked. Fanned out, the head card names its own copy (`TV ·
+EN · 4K`) instead of the playlists; the accent badge still marks the stack. Accessible label:
+`Dune · TV + TV 2 · 3 copies[ · locked]`. With a stack card focused the hint line adds "Space
+copies · Ctrl+O play from" (`Screen::hint_extras`, keys from the context's tables).
 
 **Keys and mouse in the grid** (`[PosterGrid]`):
 
 | Input | Stack card | A copy shown fanned out |
 |---|---|---|
-| Enter / double-click | the page of the card's copy (Copies section); every copy locked → PIN | its own page |
-| Shift+Enter | plays the copy that plays first (`ui::stacks::play_order`) | plays that copy |
+| Enter / double-click | the page of the card's copy (Copies section); that copy locked → PIN | its own page, which then plays that copy (`ui::stacks::open_copy`) |
+| Shift+Enter | plays the copy that plays first with its fallback (`ui::copies::play_title`; the resume prompt first when any copy has progress); every copy locked → PIN | plays that copy |
 | **Space** / click the count badge | fans the copies out right after the card, in copy order, each with its language and version (`TV 2 · EN · 4K`; locked ones dimmed) | folds its stack |
 | Esc | folds every open stack first (after the category marks, before the drawer) | same |
 | Ctrl+O | "Play from…": every copy (`TV · EN · 4K`), "plays first" on the one that would; a locked one asks for the PIN | same |
-| Ctrl+F | no favourite copy: adds the copy that would play; else every favourite copy leaves Favourites (toast with **Undo**) | that copy |
+| Ctrl+F | no favourite copy: adds the copy that would play; else every copy leaves Favourites (toast with **Undo**) | that copy |
 | Ctrl+W | marks the copy that would play | that copy |
-| Delete (Continue watching / Favourites) | forgets every copy's progress / takes every copy out, with Undo (the forgotten rows are read in the same write and saved back) | that copy |
+| Ctrl+L / Ctrl+H | locks or unlocks every copy (the PIN first) / hides every copy, the toast naming their playlists — both with Undo | that copy |
+| F2 | "Rename every copy": copies with a name of their own keep it unless Enter is pressed again after the dialog says so; Undo | that copy |
+| Delete (Continue watching / Favourites) | forgets every copy's progress / takes every copy out, with Undo (the rows as they were) | that copy |
 | menu | Play from…, Show each copy / Fold, … | adds "Not the same title" |
 
 Space was free in `[PosterGrid]` (the group lists' Space marks categories in `[List]`, a
 different pane), so the decision of §29.1 #4 holds; it is bound as the `Text(" ")` event like the
 marks, so while the grid is filtered it types a space instead (fold with Esc, or clear the
-filter). Ctrl+O is bound in `[PosterGrid]`, `[PosterGridFiltering]` and `[Detail]`; Ctrl+Shift+O
-stays the pop-out. `Action::Undo` is never bound: it is the action of a toast's "Undo", handled
-by the screen that showed the toast.
+filter). Ctrl+O is bound in `[PosterGrid]`, `[PosterGridFiltering]`, `[Detail]` and
+`[PlayerVod]` (§29.15), one text everywhere ("Play from another copy…"); Ctrl+Shift+O stays the
+pop-out. `Action::Undo(n)` is never bound: it is a toast's "Undo" button, handled by the app
+(§29.15), so it reverts its own action whatever screen shows. Home tiles and Search rows of a
+stack take the same combined ★ / lock / hide / rename (Search changes locks only in an
+unlocked session).
 
 **Detail pages** (`screens::copies::Copies`, shared by the movie and series pages): with two or
 more copies, a **Copies · N** section of mini-cards (`widgets::copy_card`) after the buttons,
@@ -4301,10 +4334,18 @@ one per copy in copy order — playlist glyph + name, language and version (`EN 
 *plays first* / *always plays first* (pinned) / *locked* (dimmed while the session is locked) /
 *failed 2 h ago* (the playback hook below). Under them: "Matched by TMDB id" or "Matched by
 title and year (2021) · Not the same title? Shift+F10 on a copy".
-* **Which copy Play uses**: the one picked on the page (click, or Enter on a focused
-  mini-card; a locked one after the PIN), else on the page of the stack's top the copy that
-  plays first, else the page's own copy. The Play button names its playlist ("Resume 41:20 ·
-  TV"); a series' other copy plays its own next episode.
+* The copies and their state are `store::copies::plan` (§29.15), read off the frame budget
+  when the library, progress, overrides, the session's lock or the copy-order setting change;
+  the mini-card status is `plan.status` ("failed 2 h ago", "playlist at its connection limit",
+  "account expired", "locked"), progress from each copy's own row.
+* **Which copy Play uses**: the one picked on the page (click, Enter on a focused mini-card,
+  "Play from…"; a locked one after the PIN), or the copy opened on purpose (a fanned-out copy,
+  one playlist's list), else **the title's first copy in play order** — whichever card led to
+  the page (a category, Favourites, Home, Search), so Play and Shift+Enter on the card agree
+  and a pin is honoured. Play resumes the **latest progress of any copy** ("Resume 41:20 ·
+  TV", `movie_command`'s `start_at`), with the next copy as its fallback; a series page plays
+  its episodes with the same episode of the next copy as the fallback, and a series' other
+  copy plays its own next episode.
 * "Play from ▾" button and Ctrl+O: the copies menu as in the grid.
 * A mini-card's menu (right-click, the menu key): Play from TV 2 · Always play from TV 2 /
   Don't always play from it (`titles::set_pin`, one pin per stack) · Not the same title
@@ -4315,18 +4356,13 @@ title and year (2021) · Not the same title? Shift+F10 on a copy".
 * A page whose copy left its stack because its details brought a different TMDB id says
   "Shown on its own now: its details name another title than its other copy".
 
-**Settings.** Interface ▸ *Several playlists*: "Same title in several playlists" (Combine /
-Show each copy) and "Which copy plays first" (Playlist order / Best quality —
-`interface.copy_order`; language, pin, progress and trouble still come first). Hidden ▸ "Titles
-you split or combined" lists `titles::links` (split: "TV 2 · shown on its own · Enter combines
-it again"; pin: "TV · always plays first · Enter undoes"); Enter or the row's menu undoes.
-
-**Playback hooks (CROSS-TRACK).** The UI computes the order (`ui::stacks::play_order`: pin,
-the latest progress from Continue watching / the page's per-copy reads, `ui::stacks::trouble`,
-the movie's container from its stream) and plays the first copy with the ordinary
-`PlayerCommand::Play`. `ui::stacks::trouble` answers `None` until the player records failures
-(failed recently, account at its limit or expired); the fallback to the next copy before the
-first frame and the player's own Ctrl+O belong to the player.
+**Settings** (only with two or more playlists of movies or series). Interface ▸ *Several
+playlists*: "Same title in several playlists" (Combine / Show each copy) and "Which copy plays
+first" (Playlist order / Best quality — `interface.copy_order`; language, CAM, pin, progress
+and trouble still come first). Hidden ▸ "Titles you separated or pinned" lists `titles::links`
+(split: "TV 2 · shown on its own · Enter combines it again"; pin, with the pin glyph: "TV ·
+always plays first · Enter undoes"); Enter or the row's menu undoes. It shows for one
+playlist too while it has rows.
 
 **Cost.** Collapsing runs when a list is rebuilt (category, sort, scope, library, setting or
 open stacks change): O(list + its stacks' copies), with a set instead of a flag per title for
@@ -4334,15 +4370,17 @@ short lists (Favourites is recomputed every frame). Per frame only visible cards
 stack.
 
 **Tests.** `ui::stacks` (card choice in All / a category / Favourites, fan-out order, card
-facts, labels, play order with progress, locks and the setting), Movies (stack card label and
-place, Space / badge / Esc, Ctrl+O and its pick, Show each copy, one playlist with `+1`; locked
-copies kept and drawn disabled, all-locked card asks for the PIN, a hidden copy and a copy the
-visibility hook rejects leave the stack; Favourites / Continue watching across copies with
-Undo), the movie page (mini-cards, pick, Ctrl+O, pin, split stored with Undo, a locked copy
-picked after the PIN), the series page (Copies section, the other copy's next episode, its
-page), Home (one tile per stack in every rail, Ctrl+F on a stack, Show each copy), Search (one
-row with both playlists), Settings (split / pin list with Undo, the two choices), keymap
-(Space and Ctrl+O per context), `copies` (containers).
+facts, labels, Show each copy), Movies (stack card label and place, the hint line, Space /
+badge / Esc, the fanned head card's copy, Ctrl+O and its pick, Show each copy, All's card
+count, one playlist with `+1`; locked copies kept and drawn disabled, all-locked card asks for
+the PIN, a hidden copy and an explicit copy leave the stack; Favourites / Continue watching
+across copies with the app's Undo; hide / lock / rename covering every copy; a narrow card's
+"+1" and badge), the movie page (mini-cards, pick, another copy's page playing the first copy,
+a copy opened on purpose playing itself, Ctrl+O, pin, split with Undo, a locked copy picked
+after the PIN), the series page (Copies section, the other copy's next episode, its page),
+Home (one tile per stack in every rail, Ctrl+F on a stack, Show each copy), Search (one row
+with both playlists), Settings (split / pin list with Undo, the two choices), the rename
+dialog (asks before overwriting a copy's own name), keymap (Space and Ctrl+O per context).
 
 ### 29.15 P2: playing a title's copies, and actions on them (`store::copies`, `ui::copies`)
 
@@ -4368,12 +4406,18 @@ retryable failures after one quick retry; the 403 retry stays) and emits `Effect
 instead of Error: the failure is recorded, the controller resolves the other copy, starts it at
 the position the first was asked to start at and sends `PlayerEvent::FellBack` → the toast
 "TV couldn't play Dune — playing from TV 2". A first copy that can't even be resolved goes to
-the fallback directly. The machine is disarmed after one fallback; if the fallback can't be
-resolved, `Input::GiveUp` puts the first failure on screen. After the first frame nothing
+the fallback directly. When the next copy is in the first copy's playlist,
+`CopyPlay::elsewhere` names the first copy of another playlist, tried instead when the failure
+was the playlist's (HTTP 401 / 403, our connection budget for it). The machine is disarmed after
+one fallback; if the fallback can't be resolved, `Input::GiveUp` puts the first failure on
+screen. The resume prompt carries the copy play (`ResumeSpec::copy`), so "Resume 41:20" from a
+card keeps the fallback and the latest progress of any copy. After the first frame nothing
 switches by itself: the normal reconnects run, then the error card offers the other copy
-("Play from TV 2 at 41:20", button or `Ctrl+O` = `Action::PlayFrom`; `ui::copies::other_copy`
-looks it up once per failure within the frame budget; locked copies only for an unlocked
-session) from `PlayerSnapshot::last_position` (kept across reconnect reloads). `start_at`
+("Play from TV 2 at 41:20" — "Play from TV · 4K at 41:20" for another copy of the same
+playlist; button or `Ctrl+O` = `Action::PlayFrom`; `ui::copies::other_copy` looks it up once
+per failure within the frame budget; locked copies only for an unlocked session) from
+`PlayerSnapshot::last_position` (kept across reconnect reloads). During playback Ctrl+O lists
+every other copy (`ui::copies::other_copies`) and plays the one picked from where playback is. `start_at`
 overrides the copy's own progress; "Resume 41:20" on a combined card continues the latest
 progress whichever copy plays (a pin or a pick).
 
@@ -4390,6 +4434,8 @@ progress whichever copy plays (a pin or a pick).
 Every action returns an `Undo`: the rows of its table (`fav_item` of the list, `watch_progress`,
 `item_override`, `title_link`) for those copies as they were; `copies::undo` deletes the
 copies' rows and inserts these back (positions, times, fingerprints included). `ui::copies`
-runs the write on the store writer and, once it succeeded, toasts "… · Undo" with
-`Action::Undo(n)` (the last 8 are kept); the app writes the rows back with the right
-`DataScope`. Inside one playlist the screens keep `kit`'s one-copy actions.
+runs the write on the store writer and, once it succeeded, stashes the rows in the app's
+`Services::undo` (`copies::UndoStash`, the last 8) and toasts "… · Undo" with
+`Action::Undo(n)`; the app writes action `n`'s rows back with the right `DataScope` — whatever
+screen shows and whatever was done since. Inside one playlist the screens keep `kit`'s one-copy
+actions.
