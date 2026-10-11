@@ -832,13 +832,20 @@ Use a real Xtream account whose categories cover many countries (≈ 60 tags: "U
   - **Do:** open its *Countries & languages…*, tick **Only for <playlist>**, tick everything,
     Enter. Then reopen, untick **Only for**, Enter.
   - **Expect:** only that playlist shows everything ("· own choice" on its row); the others
-    are unchanged; unticking makes it follow the shared choice again.
+    are unchanged; unticking "Only for" shows the shared ticks again (not the playlist's), and
+    Enter makes it follow the shared choice without changing it for the other playlists.
+  - **Do (upgrade):** start this build on a v0.1.0 profile where only one playlist had a
+    country choice.
+  - **Expect:** one toast "Your choice of countries from <playlist> now applies to all your
+    playlists · titles in other languages hidden · Settings ▸ Hidden items"; not on the next
+    start.
 - [ ] **Titles in other languages:**
-  - **Do:** with the English choice, look at "EN ✪ MULTI-SUB", "CA ✪ QUEBEC …", "VIP ✪ …" and
-    an untagged Arabic- or Icelandic-named category; favourite a "DE - …" title and start an
+  - **Do:** with the English choice, look at "EN ✪ MULTI-SUB", "CA ✪ QUEBEC …", an untagged
+    Icelandic-named category, and Series ▸ All for Arabic-named categories ("مسلسلات …"); favourite a "DE - …" title and start an
     "FR - …" one first (with the option off), then turn **Also hide titles in other
     languages** back on.
-  - **Expect:** Dutch, Québec, Arabic, Icelandic and "EX - …" titles are gone from those
+  - **Expect:** Arabic-named categories (and "VIP ✪ كأس العالم …") are hidden as Arabic;
+    Dutch, Québec, Icelandic, "EX - …" and bare "SUBS - …" titles are gone from those
     categories (an emptied untagged category shows no titles); the favourite and the started
     title stay; multi-audio and untagged titles stay. Add `nld` to Settings ▸ Player ▸ audio
     languages: Dutch titles come back.

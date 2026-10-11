@@ -443,6 +443,17 @@ pub fn adopt_legacy_category_filters(conn: &Connection) -> Result<bool> {
                         first.known.extend(r.known.iter().cloned());
                     }
                 }
+                // playlists without a rule until now: the rule covers them from here on, and
+                // their tags present now are known (not badged "new" in the picker)
+                let newly: Vec<SourceId> = list_sources(c)?.iter().map(|s| s.id).filter(|id| legacy.iter().all(|(l, _)| l != id)).collect();
+                if !newly.is_empty() {
+                    first.known.extend(crate::store::library::category_summary_of(c, &newly, false)?.present());
+                    // the next window says so once (`take_adopted_category_rule`)
+                    c.execute(
+                        "INSERT INTO meta(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        params![ADOPTED_KEY, get_source(c, legacy[0].0)?.name],
+                    )?;
+                }
                 tracing::info!("category filter: the rule of playlist {} now applies to every playlist", legacy[0].0.0);
                 set_shared_category_filter(c, Some(&first))?;
                 first
@@ -455,6 +466,22 @@ pub fn adopt_legacy_category_filters(conn: &Connection) -> Result<bool> {
         }
         Ok(true)
     })
+}
+
+/// `meta` key of a rule [`adopt_legacy_category_filters`] made shared that no window has said
+/// yet (value: the name of the playlist it came from).
+const ADOPTED_KEY: &str = "category-filter-adopted-unseen";
+
+/// The toast for a playlist's old rule that now covers every playlist (once): "Your choice of
+/// countries from TV now applies to all your playlists…". `None` when there is nothing to say.
+pub fn take_adopted_category_rule(conn: &Connection) -> Result<Option<String>> {
+    let name: Option<String> = conn.query_row("SELECT value FROM meta WHERE key = ?1", [ADOPTED_KEY], |r| r.get(0)).optional()?;
+    let Some(name) = name else { return Ok(None) };
+    conn.execute("DELETE FROM meta WHERE key = ?1", [ADOPTED_KEY])?;
+    let Some(rule) = shared_category_filter(conn)? else { return Ok(None) };
+    let from = if name.is_empty() { String::new() } else { format!(" from {name}") };
+    let titles = if crate::sources::category_tags::hides_other_languages(&rule) { " · titles in other languages hidden" } else { "" };
+    Ok(Some(format!("Your choice of countries{from} now applies to all your playlists{titles} · Settings ▸ Hidden items")))
 }
 
 /// Record the start of a refresh attempt (`last_attempt`).

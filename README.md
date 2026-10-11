@@ -384,7 +384,8 @@ follow it too.
   flag, full names (`ENGLISH`, `FRANCE`, `ARABIC`, `LATINO`,
   `EX-YU`, `AFRICA`) and trailing `… (UK)` / `… | UK`. UK, GB, ENGLAND, SCOTLAND and WALES are
   all the UK; EN, ENG and ENGLISH are the English *language*; AR is Arabic (Argentina is ARG or
-  🇦🇷). Prefixes such as 4K, HD, FHD, ᴴᴰ, VIP, SAT, RAW, PPV, VOD, NEW, 24/7, XXX and ADULT are skipped, and
+  🇦🇷). A name with no code written mostly in Arabic, Greek, Hebrew, Thai, Korean or Japanese
+  kana script counts as that language ("مسلسلات شاهد" is Arabic). Prefixes such as 4K, HD, FHD, ᴴᴰ, VIP, SAT, RAW, PPV, VOD, NEW, 24/7, XXX and ADULT are skipped, and
   unknown words never count: "4K | Sports", "BT Sport", "FA Cup" and "IT Crowd" are untagged
   and stay shown.
 - **Exceptions:** Ctrl+H on a group always hides it. **Settings ▸ Hidden** lists the hidden

@@ -3865,6 +3865,16 @@ case-insensitive unless noted):
 | AF, AFR, AFRICA, AFRIKA, AFRICAN (`AF| NIGERIA`; Afghanistan is AFG) · ASIA, ASIAN · CAR (separated or bracketed only: `AMBIGUOUS`), CARIB, CARIBBEAN · NORDIC, SCANDINAVIA, SCANDI · EU, EUROPE | `region:africa` · `asia` · `caribbean` · `nordic` · `europe` |
 | SW (Sweden on IPTV panels: `SW ★ …`), MAL (Malayalam), TELEGU (sic), ODIA; full names seen as prefixes in real playlists: URUGUAY, DOMINICAN(A), ECUADOR, HONDURAS, GUATEMALA, PANAMA, CUBA, UGANDA, TANZANIA, MALI, GUINEE/GUINEA, BURKINAFASO, TOGO, BENIN, GABON, TCHAD/CHAD, GAMBIA, SIERRALEONE, CAPEVERDE, ANGOLA, MOZAMBIQUE, NAMIBIA, ERITREA, DJIBOUTI, COTEDIVOIRE | `SE` · `lang:ml` · `lang:te` · `lang:or` · those countries |
 
+**Script fallback** (`category_tags::script_tag`, only when the grammar finds no tag): a name
+whose letters are mostly (more than half, at least two) in a script one language uses gets
+that language — Arabic script → `lang:ar` (Persian, Urdu and Kurdish names count as Arabic),
+Greek → `lang:el`, Hebrew → `lang:he`, Thai → `lang:th`, Hangul → `lang:ko`, Kana →
+`lang:ja`. Latin, Cyrillic, Han and Devanagari say too little and are never read this way.
+Field report: about 500 series and 86 films in untagged Arabic-named categories ("مسلسلات
+شاهد الأصلية", "الجزيرة الوثائقية") showed through an English rule with untagged kept;
+"VIP ✪ كأس العالم 2026" is `lang:ar` too. Tags are read when the library loads, so this
+needs no refresh.
+
 Language names are not merged into countries (`FRENCH` ≠ `FR`): the picker lists both, and
 the defaults add the main language of the user's country (`country_language`, a small table:
 FR→fr, DE/AT→de, ES/MX/AR…→es, IT→it, PT/BR→pt, NL→nl, TR→tr, PL→pl, RU→ru, IN→hi, PK→ur…).
@@ -3897,7 +3907,12 @@ FR→fr, DE/AT→de, ES/MX/AR…→es, IT→it, PT/BR→pt, NL→nl, TR→tr, PL
   same (`CategoryFilter::same_choice`: `keep`, `keep_untagged`, `hide_other_languages`), else
   keeps its rule as its own. So "one playlist has a rule, the others none" (the field report)
   → that rule covers every playlist on the first start; several different rules stay per
-  playlist, the first seeding the shared one. Their `category_filter` stays stored (ignored
+  playlist, the first seeding the shared one. When the shared rule is made and some playlist
+  had no rule, the tags those playlists have now join its `known` (not badged "new"), and the
+  next window toasts once (`meta` `category-filter-adopted-unseen`,
+  `sources::take_adopted_category_rule`, taken by `Services::start`): "Your choice of
+  countries from TV now applies to all your playlists · titles in other languages hidden ·
+  Settings ▸ Hidden items". Their `category_filter` stays stored (ignored
   while they follow the shared rule) so an older build still filters. Idempotent.
 * `CategoryFilter { keep: BTreeSet<CategoryTag>, keep_untagged: bool (default true),
   known: BTreeSet<CategoryTag>, hide_other_languages: Option<bool> (§28.12) }`. `known` = the
@@ -3975,7 +3990,13 @@ FR→fr, DE/AT→de, ES/MX/AR…→es, IT→it, PT/BR→pt, NL→nl, TR→tr, PL
   or more playlists, or the playlist already has its own rule) — ticked, the rows become that
   playlist's tags and Enter stores its own rule (`CategoryRule::Own`); unticked, Enter stores
   the shared rule and the playlist follows it (`CategoryRule::Shared` when it had its own) —
-  and **Also hide titles in other languages** (§28.12; when any playlist has movies or series).
+  and **Also hide titles in other languages** (§28.12; when any playlist has movies or
+  series). The shared rule's ticks and the playlist's own are two sets (`Ticks`: keep,
+  untagged, title option): "Only for" first ticked starts the own ticks from the shared ones; unticked, the shared ticks are back as they were. A playlist that
+  had its own rule and only has "Only for" unticked **follows** the shared rule on Enter, which
+  is not rewritten (`Save::Follow`); the shared rule is written only when its ticks changed.
+  Without a shared rule such a playlist sees "everything" ticked as the shared choice (what
+  following shows). "Only for" is offered with two or more **enabled** playlists.
   A line under the list says who it applies to ("Applies to every playlist, also ones you add
   later…" / "Only TV 2 — …"); the save toast ends "in every playlist" / "in TV 2". No keymap
   change (the options are rows).
@@ -4190,7 +4211,9 @@ name carries a market prefix (`vod_match`, §29.10), so:
   (its subtitles and its shelf; such copies are hidden too); `EX` → `sh`; multi-audio and
   regions without one language (`SC`) → none. An **untagged** title in a category whose tagged
   titles are ≥ 80 % one market (≥ 10; `stacks::dominant_market`, same rule as the stacks'
-  inference) takes that market ("Casablanca" in an Arabic-subtitled shelf).
+  inference) takes that market ("Casablanca" in an Arabic-subtitled shelf); so does a bare
+  subtitle mark with no market (`SUBS - Four Brothers`, `+SUB`: `vod_match::is_bare_subtitles`),
+  which also doesn't count as tagged for the category's share.
 * **Hidden:** a movie / series of a playlist whose rule hides other languages, with a
   language not kept. **Never hidden:** untagged and multi-audio titles, favourites, and titles
   with watch progress (a series with an episode's) — `library::LanguageRule::protected`.
@@ -4201,8 +4224,11 @@ name carries a market prefix (`vod_match`, §29.10), so:
   counts them for Settings ▸ Hidden. Live channels are not affected (no per-channel market).
   Cost: one pass over the movies / series (a hash lookup per distinct `match_lang`).
 * Tag detection gained the playlists' own-language names seen in the report (`SVENSKA`,
-  `DANSKE`, `NORSKE`, `ÍSLANDS` → SE / DK / NO / IS); Arabic-script category names stay
-  untagged (the script is shared by Arabic, Persian, Urdu, Kurdish) and are covered here.
+  `DANSKE`, `NORSKE`, `ÍSLANDS` → SE / DK / NO / IS) and the script fallback (§28.2):
+  Arabic-named categories are `lang:ar` and hide as categories.
+* Settings ▸ Hidden shows only the count ("N titles in other languages"); single titles can't
+  be brought back one by one — the row says to untick the option (favourites and started
+  titles always show).
 
 ## 29. Several playlists (P1: what am I browsing; P2: stacks in All)
 

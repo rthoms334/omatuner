@@ -762,6 +762,12 @@ pub fn market_lang(code: &str, dub: Dub) -> Option<&'static str> {
     }
 }
 
+/// A subtitle mark with no market (`SUBS`, `SUB`): the copy is for its category's language
+/// ("Also hide titles in other languages", DESIGN §28.12).
+pub fn is_bare_subtitles(code: &str) -> bool {
+    !code.is_empty() && code.split('-').all(|p| matches!(p, "SUBS" | "SUB" | "S"))
+}
+
 /// Language codes [`audio_lang`] can return from a language tag.
 const LANGS: &[&str] = &[
     "en", "ar", "fr", "de", "it", "es", "pt", "tr", "ru", "pl", "nl", "el", "hi", "ur", "ta", "or", "te", "pa", "bn", "ml", "kn", "mr", "gu", "ku",
@@ -1111,6 +1117,9 @@ mod tests {
         assert_eq!(market_lang("SC", Dub::None), None);
         assert_eq!(market_lang("EX", Dub::None), Some("sh"));
         assert_eq!(market_lang("IS", Dub::None), Some("is"));
+        assert_eq!(market_lang("SUBS", Dub::None), None);
+        assert!(is_bare_subtitles("SUBS") && is_bare_subtitles("SUB"));
+        assert!(!is_bare_subtitles("AR-SUBS") && !is_bare_subtitles("") && !is_bare_subtitles("EN"));
         assert_eq!(norm_lang("eng"), "en");
         assert_eq!(norm_lang("ger"), "de");
         let prefs = vec!["en".to_owned(), "de".to_owned()];

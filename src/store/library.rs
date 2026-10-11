@@ -1218,19 +1218,21 @@ impl LanguageRule {
         if self.keep.is_empty() {
             return (items, members, raw);
         }
-        // the market of each distinct `match_lang` text (few)
-        let mut markets: HashMap<Arc<str>, Option<&'static str>> = HashMap::new();
-        let market: Vec<Option<&'static str>> = raw
+        // the market of each distinct `match_lang` text (few), and whether it is a bare
+        // subtitle mark (`SUBS - …`, `+SUB`), which counts as untagged: the copy is for its
+        // category's language
+        let mut markets: HashMap<Arc<str>, (Option<&'static str>, bool)> = HashMap::new();
+        let (market, tagged): (Vec<Option<&'static str>>, Vec<bool>) = raw
             .iter()
             .map(|r| {
-                let t = r.lang.as_ref()?;
-                *markets.entry(t.clone()).or_insert_with(|| {
+                let Some(t) = r.lang.as_ref() else { return (None, false) };
+                let (m, bare) = *markets.entry(t.clone()).or_insert_with(|| {
                     let (code, dub) = vod_match::split_lang_text(t);
-                    code.and_then(|c| vod_match::market_lang(c, dub))
-                })
+                    (code.and_then(|c| vod_match::market_lang(c, dub)), dub != vod_match::Dub::Multi && code.is_none_or(vod_match::is_bare_subtitles))
+                });
+                (m, !bare)
             })
-            .collect();
-        let tagged: Vec<bool> = raw.iter().map(|r| r.lang.is_some()).collect();
+            .unzip();
         let dominant = crate::store::stacks::dominant_market(&items, &market, &tagged);
         let mut map: Vec<Option<u32>> = Vec::with_capacity(items.len());
         let (mut out, mut out_raw) = (Vec::with_capacity(items.len()), Vec::with_capacity(raw.len()));

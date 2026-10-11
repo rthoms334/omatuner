@@ -2120,26 +2120,34 @@ fn store_sources_never_use_insert_or_replace() {
 /// Movies of one playlist with their provider category names as imported (`raw_name`, what tag
 /// detection reads): `(key, name, category)`.
 fn import_movies_raw(s: &Store, src: SourceId, movies: &[(&str, &str, &str)], now: Timestamp) {
+    import_raw(s, src, movies, &[], now);
+}
+
+/// [`import_movies_raw`] with series too: `(key, name, raw category name)` each.
+fn import_raw(s: &Store, src: SourceId, movies: &[(&str, &str, &str)], shows: &[(&str, &str, &str)], now: Timestamp) {
     let mut groups: Vec<ImportGroup> = Vec::new();
-    for (_, _, raw) in movies {
-        if !groups.iter().any(|g| g.key == group_key(ItemKind::Movie, raw)) {
+    for (kind, raw) in movies.iter().map(|m| (ItemKind::Movie, m.2)).chain(shows.iter().map(|x| (ItemKind::Series, x.2))) {
+        if !groups.iter().any(|g| g.kind == kind && g.key == group_key(kind, raw)) {
             groups.push(ImportGroup {
                 adult: false,
-                kind: ItemKind::Movie,
-                key: group_key(ItemKind::Movie, raw),
-                name: (*raw).to_owned(),
-                raw_name: Some((*raw).to_owned()),
+                kind,
+                key: group_key(kind, raw),
+                name: raw.to_owned(),
+                raw_name: Some(raw.to_owned()),
                 provider_id: None,
                 provider_order: groups.len() as i32,
             });
         }
     }
     let films: Vec<ImportMovie> = movies.iter().enumerate().map(|(i, (key, name, raw))| listed(key, name, raw, i as i32, None)).collect();
+    let shows: Vec<ImportSeries> = shows.iter().enumerate().map(|(i, (key, name, raw))| series(key, name, raw, i as i32)).collect();
+    let kinds: Vec<ItemKind> = if shows.is_empty() { vec![ItemKind::Movie] } else { vec![ItemKind::Movie, ItemKind::Series] };
     w(s, move |c| {
         let imp = import::begin_catalogue(c, src, now)?;
         import::upsert_groups(c, &imp, &groups)?;
         import::write_movies(c, &imp, &films)?;
-        import::finish_catalogue(c, &imp, &[ItemKind::Movie], now)
+        import::write_series(c, &imp, &shows)?;
+        import::finish_catalogue(c, &imp, &kinds, now)
     });
 }
 
@@ -2211,6 +2219,11 @@ fn one_category_rule_covers_every_playlist_and_a_new_one() {
     let st = |id| sources::get_source(&r, id).unwrap().settings;
     assert_eq!((st(tv).own_category_filter, st(tv2).own_category_filter), (Some(false), None));
     assert!(!w(&s, |c| sources::adopt_legacy_category_filters(c)), "done once");
+    // TV 2's tags are known (not "new" in the picker), and the first window says what changed, once
+    assert!([CategoryTag::country("IT"), CategoryTag::country("GR")].iter().all(|t| shared.known.contains(t)), "{:?}", shared.known);
+    let said = w(&s, |c| sources::take_adopted_category_rule(c)).expect("a notice");
+    assert!(said.contains("from TV") && said.contains("all your playlists") && said.contains("other languages hidden"), "{said}");
+    assert_eq!(w(&s, |c| sources::take_adopted_category_rule(c)), None);
 
     let lib = library::load(&r).unwrap();
     assert_eq!(shown_movies(&lib), ["a1", "b1", "b5"].map(String::from).into(), "TV 2's German, Italian and Greek categories hide too");
@@ -2288,9 +2301,10 @@ fn differing_old_rules_stay_per_playlist() {
 /// "Also hide titles in other languages" (DESIGN §28.12), on by itself for an English-only rule:
 /// titles whose own name marks another market are hidden also in kept and untagged categories —
 /// a Dutch title among English ones, Québec films in "CA ✪", Arabic-subtitled films in an
-/// untagged Arabic-named category (and its untagged titles, by the category's market), an Arabic
-/// match in "VIP ✪" — while untagged and multi-audio titles stay, and so do a favourite and a
-/// title the user started. The user's audio languages count as kept. Off, they all return.
+/// untagged category (and its untagged and bare "SUBS" titles, by the category's market) — while
+/// untagged and multi-audio titles stay, and so do a favourite and a title the user started.
+/// Arabic-named categories ("VIP ✪ كأس العالم 2026", Shahid series) are Arabic and hide as
+/// categories. The user's audio languages count as kept. Off, the titles all return.
 #[test]
 fn titles_in_other_languages_hide_but_never_favourites_or_started_ones() {
     let s = store("tuner-st-title-langs");
@@ -2299,20 +2313,33 @@ fn titles_in_other_languages_hide_but_never_favourites_or_started_ones() {
         ("en1".into(), "EN ✪ Dracula - 2025".into(), "EN ✪ MULTI-SUB [2025/2026]".into()),
         ("nl1".into(), "NL ✪ Zwartboek - 2006".into(), "EN ✪ MULTI-SUB [2025/2026]".into()),
         ("qc1".into(), "QC ✪ Starbuck - 2011".into(), "CA ✪ QUEBEC FILMS".into()),
+        // Arabic-named categories are Arabic (field report: about 580 series and films)
         ("vip1".into(), "AR ✪ Final - 2026".into(), "VIP ✪ كأس العالم 2026".into()),
-        ("multi".into(), "Babel [Multi-Audio] - 2006".into(), "VIP ✪ كأس العالم 2026".into()),
+        ("doc".into(), "Planet - 2020".into(), "الجزيرة الوثائقية".into()),
+        ("multi".into(), "Babel [Multi-Audio] - 2006".into(), "OLD MOVIES".into()),
         ("plain".into(), "Heat - 1995".into(), "EN ✪ DRAMA".into()),
         ("fav".into(), "DE ✪ Lola rennt - 1998".into(), "EN ✪ DRAMA".into()),
         ("seen".into(), "FR ✪ Amélie - 2001".into(), "EN ✪ DRAMA".into()),
-        ("old".into(), "Casablanca - 1942".into(), "أفلام أجنبية قديمه".into()),
+        ("old".into(), "Casablanca - 1942".into(), "OLD MOVIES".into()),
+        // a bare subtitle mark is for its category's language
+        ("subs".into(), "SUBS - Four Brothers - 2005".into(), "OLD MOVIES".into()),
         ("sv1".into(), "SE ✪ Jägarna - 1996".into(), "SVENSKA 2020 & GAMMAL".into()),
     ];
-    movies.extend((0..12).map(|i| (format!("sub{i}"), format!("AR-SUBS - Film {i} ({})", 1990 + i), "أفلام أجنبية قديمه".to_owned())));
+    movies.extend((0..12).map(|i| (format!("sub{i}"), format!("AR-SUBS - Film {i} ({})", 1990 + i), "OLD MOVIES".to_owned())));
     let rows: Vec<(&str, &str, &str)> = movies.iter().map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str())).collect();
-    import_movies_raw(&s, tv, &rows, NOW);
+    let shows = [
+        ("wire", "The Wire", "EN ✪ SERIES"),
+        ("sh1", "4K-SH - طالع نازل", "مسلسلات شاهد الأصلية"),
+        ("jinn", "Jinn - جن", "مسلسلات شاهد الأصلية"),
+        ("kids", "Lamput", "مسلسلات شاهد كيدز"),
+    ];
+    import_raw(&s, tv, &rows, &shows, NOW);
     let r = s.reader().unwrap();
     let lang = |key: &str| r.query_row("SELECT match_lang FROM movie WHERE key = ?1", [key], |x| x.get::<_, Option<String>>(0)).unwrap();
-    assert_eq!((lang("nl1").as_deref(), lang("qc1").as_deref(), lang("sub0").as_deref()), (Some("NL"), Some("QC"), Some("AR-SUBS")));
+    assert_eq!(
+        (lang("nl1").as_deref(), lang("qc1").as_deref(), lang("sub0").as_deref(), lang("subs").as_deref()),
+        (Some("NL"), Some("QC"), Some("AR-SUBS"), Some("SUBS"))
+    );
     w(&s, move |c| {
         let list = user::default_fav_list(c)?;
         user::set_favourite(c, list, &mref(tv, "fav"), true, NOW)?;
@@ -2332,11 +2359,18 @@ fn titles_in_other_languages_hide_but_never_favourites_or_started_ones() {
     });
     let lib = library::load(&r).unwrap();
     let kept: HashSet<String> = ["en1", "multi", "plain", "fav", "seen"].map(String::from).into();
-    assert_eq!(shown_movies(&lib), kept, "SVENSKA is Sweden now; the rest hide by title");
-    assert_eq!(lib.source(tv).unwrap().language_hidden, 16, "nl1 qc1 vip1 old + 12 AR-SUBS");
-    let arabic = lib.vod.movie_groups.iter().find(|g| g.name == "أفلام أجنبية قديمه").unwrap();
-    assert_eq!((arabic.hidden, arabic.item_count), (false, 0), "the untagged category stays, without the titles it lost");
-    assert_eq!(lib.vod.group_items(arabic.id, SortMode::Provider), Vec::<u32>::new());
+    assert_eq!(shown_movies(&lib), kept, "SVENSKA is Sweden, Arabic-named categories Arabic; the rest hide by title");
+    assert_eq!(lib.source(tv).unwrap().language_hidden, 16, "nl1 qc1 old subs + 12 AR-SUBS");
+    for name in ["VIP ✪ كأس العالم 2026", "الجزيرة الوثائقية"] {
+        let g = lib.vod.movie_groups.iter().find(|g| g.name == name).unwrap();
+        assert!(g.hidden && g.tag == Some(CategoryTag::language("ar")), "{name}");
+    }
+    let old = lib.vod.movie_groups.iter().find(|g| g.name == "OLD MOVIES").unwrap();
+    assert_eq!((old.hidden, old.item_count), (false, 1), "the untagged category stays, without the titles it lost");
+    // series: Arabic-named categories hide, the English one stays
+    let shown_series: HashSet<String> = lib.vod.series.iter().map(|x| x.key.0.clone()).collect();
+    assert_eq!(shown_series, HashSet::from(["wire".to_owned()]));
+    assert!(lib.vod.series_groups.iter().filter(|g| g.name.starts_with("مسلسلات")).all(|g| g.hidden));
     // Dutch is one of the user's audio languages: Dutch titles stay
     let dutch = library::load_with(&r, &library::LoadOptions { audio_langs: vec!["nld".into()], ..Default::default() }).unwrap();
     assert!(shown_movies(&dutch).contains("nl1") && !shown_movies(&dutch).contains("qc1"));
@@ -2345,6 +2379,6 @@ fn titles_in_other_languages_hide_but_never_favourites_or_started_ones() {
     w(&s, move |c| sources::set_shared_category_filter(c, Some(&off)));
     let lib = library::load(&r).unwrap();
     assert_eq!(lib.source(tv).unwrap().language_hidden, 0);
-    let all: HashSet<String> = movies.iter().map(|m| m.0.clone()).filter(|k| k != "sv1").collect();
+    let all: HashSet<String> = movies.iter().map(|m| m.0.clone()).filter(|k| !["sv1", "vip1", "doc"].contains(&k.as_str())).collect();
     assert_eq!(shown_movies(&lib), all);
 }

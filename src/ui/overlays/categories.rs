@@ -16,6 +16,11 @@
 //! * Ticks start from the rule edited; without one from the defaults (the user's country and
 //!   its language, every English-language tag, untagged — `category_tags::default_keep`); a
 //!   playlist's own "show everything" ticks every row.
+//! * The shared rule's ticks and the playlist's own are kept apart: "Only for" first ticked
+//!   starts the own ticks from the shared ones; unticked, the shared ticks are back as they
+//!   were. A playlist that had its own rule and only has "Only for" unticked follows the shared
+//!   rule on Enter, which is not rewritten (a playlist with its own rule and no shared one shows
+//!   the shared ticks as "everything", what following it shows).
 //! * Saving stores the ticked tags — also ticked tags no playlist has (yet), so the English
 //!   defaults keep working when such a category appears — and `known` = the tags present.
 //!   Everything ticked (and titles in other languages not hidden) stores no rule at all.
@@ -67,7 +72,7 @@ pub(crate) struct PickerData {
     /// The playlist's own rule when it has one (`Some(None)`: it shows everything).
     pub own: Option<Option<CategoryFilter>>,
     pub name: String,
-    /// Playlists in all (two or more offer "Only for <playlist>").
+    /// Enabled playlists (two or more offer "Only for <playlist>").
     pub playlists: usize,
     /// The user's country (`presets::detect_country`, which may read a file).
     pub country: Option<String>,
@@ -84,7 +89,7 @@ pub(crate) fn load(c: &rusqlite::Connection, id: SourceId, hide_explicit: bool) 
         rule: crate::store::sources::shared_category_filter(c)?,
         own: src.settings.has_own_category_filter().then_some(src.settings.category_filter),
         name: src.name,
-        playlists: all.len(),
+        playlists: all.iter().filter(|s| s.enabled).count(),
         country: crate::sources::presets::detect_country(),
     })
 }
@@ -190,13 +195,37 @@ enum Save {
     Shared(Option<CategoryFilter>),
     /// The playlist's own rule.
     Own(Option<CategoryFilter>),
+    /// The playlist had its own rule and follows the shared one again, which stays as it is
+    /// (its ticks weren't changed).
+    Follow(Option<CategoryFilter>),
 }
 
 impl Save {
     fn rule(&self) -> Option<&CategoryFilter> {
         match self {
-            Save::Shared(f) | Save::Own(f) => f.as_ref(),
+            Save::Shared(f) | Save::Own(f) | Save::Follow(f) => f.as_ref(),
         }
+    }
+}
+
+/// One rule's ticks in the picker: the shared rule's and the playlist's own are kept apart, so
+/// "Only for <playlist>" on and off again never carries one into the other.
+#[derive(Debug, Clone, PartialEq, Default)]
+struct Ticks {
+    keep: BTreeSet<CategoryTag>,
+    keep_untagged: bool,
+    /// "Also hide titles in other languages": `None` = automatic (English-only ticks).
+    title_langs: Option<bool>,
+}
+
+impl Ticks {
+    fn of(rule: &CategoryFilter) -> Self {
+        Ticks { keep: rule.keep.clone(), keep_untagged: rule.keep_untagged, title_langs: rule.hide_other_languages }
+    }
+
+    /// Every row ticked, titles in other languages shown: what no rule shows.
+    fn everything(summary: &CategorySummary) -> Self {
+        Ticks { keep: summary.present(), keep_untagged: true, title_langs: Some(false) }
     }
 }
 
@@ -214,8 +243,13 @@ pub struct CategoryPicker {
     only_this: bool,
     /// The playlist had its own rule when the picker opened.
     was_own: bool,
-    /// "Also hide titles in other languages": `None` = automatic (English-only ticks).
-    title_langs: Option<bool>,
+    /// The rule shown: the playlist's own with "Only for" ticked, else the shared one.
+    ticks: Ticks,
+    /// The other rule's ticks (`None`: the own rule before "Only for" was first ticked).
+    parked: Option<Ticks>,
+    /// The shared rule's ticks as they were set up (unchanged: unticking "Only for" only makes
+    /// the playlist follow the shared rule, which isn't rewritten).
+    shared_initial: Option<Ticks>,
     /// Re-read the data whenever the library generation changes.
     follow: bool,
     /// Library generation the data was (or is being) read for.
@@ -223,10 +257,10 @@ pub struct CategoryPicker {
     loader: Option<Loader<PickerData>>,
     /// The ticks were set up (from the stored rule or the defaults); later reads keep them.
     started: bool,
-    /// The rule edited when the picker opened.
-    stored: Option<CategoryFilter>,
-    keep: BTreeSet<CategoryTag>,
-    keep_untagged: bool,
+    /// The shared rule and the playlist's own (when it has one) as stored: their `known` tags
+    /// badge the others "new".
+    stored_shared: Option<CategoryFilter>,
+    stored_own: Option<CategoryFilter>,
     list: ListState,
     rows: Vec<Row>,
     /// The write in flight and what it stores.
@@ -238,8 +272,11 @@ pub struct CategoryPicker {
     /// same ticks saves them.
     armed_empty: Option<(BTreeSet<CategoryTag>, bool)>,
     /// The choice as it was set up (unsaved changes = it differs).
-    initial: Option<(BTreeSet<CategoryTag>, bool, bool, Option<bool>)>,
+    initial: Option<Choice>,
 }
+
+/// What [`CategoryPicker::is_edited`] compares: "Only for", then the shared and own ticks.
+type Choice = (bool, Option<Ticks>, Option<Ticks>);
 
 impl CategoryPicker {
     /// A picker that reads the playlist's data itself (and follows library changes).
@@ -253,14 +290,15 @@ impl CategoryPicker {
             can_split: false,
             only_this: false,
             was_own: false,
-            title_langs: None,
+            ticks: Ticks { keep_untagged: true, ..Default::default() },
+            parked: None,
+            shared_initial: None,
             follow: true,
             loaded_for: None,
             loader: None,
             started: false,
-            stored: None,
-            keep: BTreeSet::new(),
-            keep_untagged: true,
+            stored_shared: None,
+            stored_own: None,
             list: ListState::default(),
             rows: Vec::new(),
             saving: None,
@@ -271,8 +309,15 @@ impl CategoryPicker {
         }
     }
 
-    fn choice(&self) -> (BTreeSet<CategoryTag>, bool, bool, Option<bool>) {
-        (self.keep.clone(), self.keep_untagged, self.only_this, self.title_langs)
+    /// The shared rule's ticks and the playlist's own (`None` when it has none).
+    fn sets(&self) -> (Option<&Ticks>, Option<&Ticks>) {
+        if self.only_this { (self.parked.as_ref(), Some(&self.ticks)) } else { (Some(&self.ticks), self.parked.as_ref()) }
+    }
+
+    fn choice(&self) -> Choice {
+        let (shared, own) = self.sets();
+        // the own ticks only count while they're used
+        (self.only_this, shared.cloned(), own.filter(|_| self.only_this).cloned())
     }
 
     /// Ticks changed and not saved.
@@ -320,28 +365,24 @@ impl CategoryPicker {
             self.started = true;
             self.was_own = d.own.is_some();
             self.only_this = self.was_own;
-            let rule = match &d.own {
-                Some(own) => own.clone(),
-                None => d.rule.clone(),
+            // the shared rule; without one the defaults, or — for a playlist with its own rule,
+            // which may go back to following the shared one — everything, as that is what it
+            // would show
+            let shared = match &d.rule {
+                Some(r) => Ticks::of(r),
+                None if self.was_own => Ticks::everything(&d.summary),
+                None => Ticks { keep: category_tags::default_keep(d.country.as_deref()), keep_untagged: true, title_langs: None },
             };
-            match (&rule, &d.own) {
-                (Some(r), _) => {
-                    self.keep = r.keep.clone();
-                    self.keep_untagged = r.keep_untagged;
-                    self.title_langs = r.hide_other_languages;
+            self.shared_initial = Some(shared.clone());
+            self.stored_shared = d.rule.clone();
+            match &d.own {
+                Some(own) => {
+                    self.ticks = own.as_ref().map_or_else(|| Ticks::everything(&d.own_summary), Ticks::of);
+                    self.parked = Some(shared);
+                    self.stored_own = own.clone();
                 }
-                // the playlist's own "show everything"
-                (None, Some(None)) => {
-                    self.keep = d.own_summary.present();
-                    self.keep_untagged = true;
-                    self.title_langs = Some(false);
-                }
-                (None, _) => {
-                    self.keep = category_tags::default_keep(d.country.as_deref());
-                    self.keep_untagged = true;
-                }
+                None => self.ticks = shared,
             }
-            self.stored = rule;
             self.initial = Some(self.choice());
         }
         self.can_split = d.playlists > 1 || d.own.is_some();
@@ -413,34 +454,39 @@ impl CategoryPicker {
 
     fn ticked(&self, tag: Option<&CategoryTag>) -> bool {
         match tag {
-            Some(t) => self.keep.contains(t),
-            None => self.keep_untagged,
+            Some(t) => self.ticks.keep.contains(t),
+            None => self.ticks.keep_untagged,
         }
     }
 
     fn set_tick(&mut self, tag: Option<&CategoryTag>, on: bool) {
         match tag {
             Some(t) if on => {
-                self.keep.insert(t.clone());
+                self.ticks.keep.insert(t.clone());
             }
             Some(t) => {
-                self.keep.remove(t);
+                self.ticks.keep.remove(t);
             }
-            None => self.keep_untagged = on,
+            None => self.ticks.keep_untagged = on,
         }
     }
 
     /// "Also hide titles in other languages" as it stands (automatic: English-only ticks).
     fn hides_other_languages(&self) -> bool {
-        self.title_langs.unwrap_or_else(|| category_tags::keeps_only_english(&self.keep))
+        self.ticks.title_langs.unwrap_or_else(|| category_tags::keeps_only_english(&self.ticks.keep))
     }
 
-    /// "Only for <playlist>" on / off: the rows become that playlist's (or the shared) tags.
+    /// "Only for <playlist>" on / off: the rows become that playlist's (or the shared) tags,
+    /// and the ticks that rule's. The first time on, the own ticks start from the shared ones;
+    /// off again, the shared ticks are back as they were left.
     fn set_only_this(&mut self, on: bool) {
         if on == self.only_this || !self.can_split {
             return;
         }
         self.only_this = on;
+        let parked = self.parked.take().unwrap_or_else(|| self.ticks.clone());
+        self.parked = Some(std::mem::replace(&mut self.ticks, parked));
+        self.armed_empty = None;
         std::mem::swap(&mut self.summary, &mut self.other);
         self.refilter();
         self.reselect(Some(Ok(Row::OnlyThis)));
@@ -449,7 +495,7 @@ impl CategoryPicker {
     fn toggle_row(&mut self, row: usize) {
         match self.rows.get(row).copied() {
             Some(Row::OnlyThis) => self.set_only_this(!self.only_this),
-            Some(Row::OtherLanguages) => self.title_langs = Some(!self.hides_other_languages()),
+            Some(Row::OtherLanguages) => self.ticks.title_langs = Some(!self.hides_other_languages()),
             Some(Row::Tag(i)) => {
                 let Some(tag) = self.summary.as_ref().and_then(|s| s.tags.get(i)).map(|t| t.tag.clone()) else { return };
                 let on = !self.ticked(tag.as_ref());
@@ -470,9 +516,7 @@ impl CategoryPicker {
     }
 
     fn defaults(&mut self) {
-        self.keep = category_tags::default_keep(self.country.as_deref());
-        self.keep_untagged = true;
-        self.title_langs = None;
+        self.ticks = Ticks { keep: category_tags::default_keep(self.country.as_deref()), keep_untagged: true, title_langs: None };
     }
 
     /// The rule Enter stores: `None` when every entry is ticked and titles in other languages
@@ -481,17 +525,24 @@ impl CategoryPicker {
         let s = self.summary.as_ref()?;
         let present = s.present();
         let untagged_present = s.tags.iter().any(|t| t.tag.is_none());
-        let everything = present.iter().all(|t| self.keep.contains(t)) && (self.keep_untagged || !untagged_present);
+        let everything = present.iter().all(|t| self.ticks.keep.contains(t)) && (self.ticks.keep_untagged || !untagged_present);
         (!everything || self.hides_other_languages()).then(|| CategoryFilter {
-            keep: self.keep.clone(),
-            keep_untagged: self.keep_untagged,
+            keep: self.ticks.keep.clone(),
+            keep_untagged: self.ticks.keep_untagged,
             known: present,
-            hide_other_languages: self.title_langs,
+            hide_other_languages: self.ticks.title_langs,
         })
     }
 
     fn to_store(&self) -> Save {
-        if self.only_this { Save::Own(self.to_save()) } else { Save::Shared(self.to_save()) }
+        if self.only_this {
+            Save::Own(self.to_save())
+        } else if self.was_own && self.shared_initial.as_ref() == Some(&self.ticks) {
+            // "Only for" unticked, the shared ticks untouched: follow the shared rule as it is
+            Save::Follow(self.stored_shared.clone())
+        } else {
+            Save::Shared(self.to_save())
+        }
     }
 
     /// The ticks show nothing of the playlists (no present tag ticked, untagged off or absent).
@@ -535,7 +586,7 @@ impl CategoryPicker {
         }
         // nothing of the playlists would show: say so, and save on a second Enter
         if self.shows_nothing() {
-            let ticks = (self.keep.clone(), self.keep_untagged);
+            let ticks = (self.ticks.keep.clone(), self.ticks.keep_untagged);
             if self.armed_empty.as_ref() != Some(&ticks) {
                 self.armed_empty = Some(ticks);
                 return;
@@ -548,6 +599,7 @@ impl CategoryPicker {
             use crate::store::sources::{CategoryRule, set_category_rule, set_shared_category_filter};
             match write {
                 Save::Own(f) => set_category_rule(c, id, &CategoryRule::Own(f)),
+                Save::Follow(_) => set_category_rule(c, id, &CategoryRule::Shared),
                 Save::Shared(f) => {
                     set_shared_category_filter(c, f.as_ref())?;
                     if was_own { set_category_rule(c, id, &CategoryRule::Shared) } else { Ok(()) }
@@ -619,6 +671,7 @@ impl CategoryPicker {
                 Some(Ok(())) => {
                     let whom = match (&*save, self.can_split) {
                         (Save::Own(_), _) => format!(" in {}", self.name),
+                        (Save::Follow(_), _) => format!(" in {} (the choice every playlist shares)", self.name),
                         (Save::Shared(_), true) => " in every playlist".to_owned(),
                         (Save::Shared(_), false) => String::new(),
                     };
@@ -685,8 +738,10 @@ impl CategoryPicker {
                     let row_h = row_height(theme, crate::config::Density::Comfortable, true);
                     let max_h = (egui_ctx.content_rect().height() * 0.45).max(row_h * 3.0);
                     let h = (self.rows.len() as f32 * row_h).min(max_h);
-                    let (rows, keep, untagged) = (&self.rows, &self.keep, self.keep_untagged);
-                    let known = self.stored.as_ref().map(|r| &r.known).filter(|k| !k.is_empty());
+                    let (rows, keep, untagged) = (&self.rows, &self.ticks.keep, self.ticks.keep_untagged);
+                    // the stored rule of the ticks shown (field borrows: the list is borrowed below)
+                    let stored = if self.only_this { self.stored_own.as_ref() } else { self.stored_shared.as_ref() };
+                    let known = stored.map(|r| &r.known).filter(|k| !k.is_empty());
                     let only_label = format!("Only for {}", self.name);
                     let only_detail = if self.only_this {
                         "This playlist has its own choice — untick to use the one every playlist shares"
@@ -742,7 +797,7 @@ impl CategoryPicker {
             small(ui, &text, t.text_secondary);
         }
         if self.shows_nothing() {
-            let armed = self.armed_empty.as_ref() == Some(&(self.keep.clone(), self.keep_untagged));
+            let armed = self.armed_empty.as_ref() == Some(&(self.ticks.keep.clone(), self.ticks.keep_untagged));
             let text =
                 if armed { "Nothing from this playlist will show — save again to save anyway." } else { "Nothing from this playlist will show." };
             small(ui, text, t.warning);
@@ -1018,9 +1073,50 @@ mod tests {
             p.on_action(ctx, Action::Activate);
         });
         let (ticket, save) = p.saving.take().expect("saving");
-        assert!(matches!(save, Save::Shared(_)));
+        assert_eq!(save, Save::Follow(None), "only \"Only for\" unticked: follow, the shared rule untouched");
         ticket.wait().unwrap();
         assert_eq!(crate::store::sources::get_source(&r, tv2).unwrap().settings.own_category_filter, Some(false));
+        assert_eq!(crate::store::sources::shared_category_filter(&r).unwrap(), None, "None stays None");
+        // an own French-only rule: unticking "Only for" shows the shared ticks, never the own
+        // ones, and saves nothing over the shared rule; ticking it again brings the own ticks back
+        let fr = CategoryFilter {
+            keep: [tag("FR")].into(),
+            keep_untagged: false,
+            known: [tag("GB"), tag("FR")].into(),
+            hide_other_languages: Some(false),
+        };
+        let gb = CategoryFilter {
+            keep: [tag("GB")].into(),
+            keep_untagged: true,
+            known: [tag("DE"), tag("GB"), tag("FR")].into(),
+            hide_other_languages: None,
+        };
+        let mut d = data(Some(Some(fr.clone())));
+        d.rule = Some(gb.clone());
+        let mut p = CategoryPicker::from_data(tv2, d, None);
+        assert_eq!(ticks(&p), ["FR"]);
+        assert!(!p.is_edited());
+        p.set_only_this(false);
+        assert_eq!(ticks(&p), ["GB"], "the shared rule's ticks");
+        assert!(p.hides_other_languages(), "the shared rule's option (automatic)");
+        assert!(p.is_edited());
+        assert_eq!(p.to_store(), Save::Follow(Some(gb.clone())));
+        p.set_only_this(true);
+        assert_eq!(ticks(&p), ["FR"], "the own ticks as they were");
+        assert!(!p.is_edited());
+        // the shared ticks changed after unticking: the shared rule is written, from them
+        p.set_only_this(false);
+        p.set_tick(Some(&tag("DE")), true);
+        match p.to_store() {
+            Save::Shared(Some(f)) => assert!(f.keep == [tag("DE"), tag("GB")].into() && f.keep_untagged && f.hide_other_languages.is_none()),
+            other => panic!("{other:?}"),
+        }
+        // with no shared rule, a playlist with its own one sees "everything" as the shared ticks
+        let mut p = CategoryPicker::from_data(tv2, data(Some(Some(fr))), None);
+        p.set_only_this(false);
+        assert_eq!(ticks(&p), ["DE", "GB", "FR"]);
+        assert!(!p.hides_other_languages());
+        assert_eq!(p.to_store(), Save::Follow(None));
         drop((t, one));
     }
 

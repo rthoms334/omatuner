@@ -1326,7 +1326,7 @@ impl SettingsScreen {
                     icon: glyphs::HIDDEN.to_owned(),
                     color: None,
                     label: format!("{} {} in other languages", grouped(n), if n == 1 { "title" } else { "titles" }),
-                    detail: Some("“Also hide titles in other languages” is on · Enter changes it".into()),
+                    detail: Some("“Also hide titles in other languages” is on · Enter, then untick it to show them all (favourites and titles you started always show)".into()),
                     reorder: false,
                 });
             }
