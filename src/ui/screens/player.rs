@@ -243,6 +243,9 @@ pub struct PlayerScreen {
     /// When a volume change last unmuted (`ToggleMute` is sent once, not on every drag step
     /// before mpv reports the mute gone).
     unmuting: Option<Instant>,
+    /// The other copy the error card offers for the failed load generation (looked up once per
+    /// failure, within the frame budget; DESIGN §29.15).
+    other_copy: Option<(u64, Option<crate::ui::copies::OtherCopy>)>,
 }
 
 /// The OSD scale of the current window.
@@ -1429,6 +1432,37 @@ impl PlayerScreen {
         }
     }
 
+    /// The other copy offered for the current failure, if any.
+    fn offered(&self, snap: &PlayerSnapshot) -> Option<&crate::ui::copies::OtherCopy> {
+        let (generation, other) = self.other_copy.as_ref()?;
+        if *generation != snap.load_generation || !matches!(snap.state, PlayerState::Error(_)) {
+            return None;
+        }
+        other.as_ref()
+    }
+
+    /// Look the failed title's other copy up once per failure (a few indexed reads, within the
+    /// frame budget) and hand its label to the error card.
+    fn update_other_copy(&mut self, ctx: &mut UiCtx<'_>, snap: &PlayerSnapshot) {
+        let vod = snap.playable.as_ref().is_some_and(|p| matches!(p.media, MediaRef::Movie(_) | MediaRef::Episode(_)));
+        if !(vod && matches!(snap.state, PlayerState::Error(_))) {
+            ctx.video.set_other_copy(None);
+            return;
+        }
+        if self.other_copy.as_ref().is_none_or(|(g, _)| *g != snap.load_generation) {
+            let unlocked = ctx.parental.is_unlocked(&ctx.config.parental);
+            let (db, lib, order, now) = (ctx.db, ctx.lib, ctx.config.interface.copy_order, ctx.now);
+            let found = ctx.budget.run(|| {
+                let plan_of = |movies: bool, item: u32| crate::store::copies::plan(db, &lib.vod, movies, item, unlocked, order, now).ok();
+                crate::ui::copies::other_copy(db, lib, plan_of, snap)
+            });
+            if let Some(other) = found {
+                self.other_copy = Some((snap.load_generation, other));
+            }
+        }
+        ctx.video.set_other_copy(self.offered(snap).map(|o| o.label.clone()));
+    }
+
     /// Nothing playing: what to do about it and a button for it. In the full window a click
     /// anywhere goes back; popped out, the button (or a double-click) pops the window back in.
     fn idle_ui(&mut self, ui: &egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect) {
@@ -1799,6 +1833,12 @@ impl Screen for PlayerScreen {
                     ctx.play(PlayerCommand::Reconnect);
                 }
             }
+            // after an error: the title's other copy, where playback stopped (never by itself)
+            Action::PlayFrom => match self.offered(ctx.player) {
+                Some(other) => ctx.play(PlayerCommand::PlayCopy(other.play.clone())),
+                None if matches!(ctx.player.state, PlayerState::Error(_)) => ctx.toast(crate::msg::Toast::info("No other playlist has this title")),
+                None => ctx.toast(crate::msg::Toast::info("Another copy can be picked once playback fails")),
+            },
             Action::ToggleFavourite => {
                 if let Some(ch) = playing_channel(ctx.player).and_then(|id| ctx.lib.live.get(id).cloned()) {
                     live::toggle_favourite(ctx, live::channel_ref(&ch), &ch.name);
@@ -1868,6 +1908,7 @@ impl Screen for PlayerScreen {
             self.idle_ui(ui, ctx, rect);
             return;
         }
+        self.update_other_copy(ctx, &snap);
         let resp = ctx.video.paint(ui, rect, Placement::Fullscreen, theme, ctx.images, &snap);
         // popped out, a drag on the video moves the window (only there: a drag-sensing video
         // counts as hovered under every button drawn over it, see the wheel and cursor below)
@@ -1876,12 +1917,13 @@ impl Screen for PlayerScreen {
         let p = ui.painter_at(rect);
         for (i, b) in ctx.video.state_buttons().to_vec().into_iter().enumerate() {
             p.rect_stroke(b.rect, theme.tokens.rounding, egui::Stroke::new(1.0, with_alpha(theme.tokens.osd_text, 0.6)), egui::StrokeKind::Inside);
-            let (label, tip) = match b.action {
-                StateAction::Retry => ("Retry", "Retry (r)"),
-                StateAction::LastChannel => ("Last channel", "Last channel (Backspace)"),
+            let (label, tip, action) = match b.action {
+                StateAction::Retry => ("Retry", "Retry (r)", Action::Retry),
+                StateAction::LastChannel => ("Last channel", "Last channel (Backspace)", Action::LastChannel),
+                StateAction::OtherCopy => ("Play from another playlist", "Play from another playlist (Ctrl+O)", Action::PlayFrom),
             };
             if osd_button(ui, &p, theme, b.rect, ui.id().with(("state-button", i)), &b.text, b.font, label, Some(tip), false).clicked() {
-                self.on_action(ctx, if b.action == StateAction::Retry { Action::Retry } else { Action::LastChannel });
+                self.on_action(ctx, action);
             }
         }
         // mouse: motion shows the banner, double-click toggles window fullscreen (pops the
@@ -2253,5 +2295,33 @@ mod tests {
         press(&h, c, egui::PointerButton::Primary);
         h.run_steps(2);
         assert!(h.state().s.panel.is_none(), "click on the video");
+    }
+
+    /// A movie that failed mid-film and is also in another playlist: the error card offers
+    /// "Play from TV 2 at 41:20" (DESIGN §29.15), and Ctrl+O plays that copy from there.
+    #[test]
+    fn the_error_card_offers_the_titles_other_copy() {
+        use crate::ui::screens::home::testkit::{movies, painted, seed, source};
+        let (mut t, one) = rig();
+        let (first, other) = seed(&mut t, |c| {
+            let (a, b) = (source(c, "TV")?, source(c, "TV 2")?);
+            let (ma, mb) = (movies(c, a, 2)?, movies(c, b, 2)?);
+            crate::store::titles::refresh_all(c)?;
+            Ok((ma[0], mb[0]))
+        });
+        let mut h = harness(t, one, PlayerScreen::default(), WIDE);
+        let mut s = (*real(&h)).clone();
+        s.state = PlayerState::Error(crate::player::PlayerError { kind: crate::player::PlayerErrorKind::Network, message: "lost".into() });
+        s.playable =
+            Some(Arc::new(Playable { media: MediaRef::Movie(first), kind: PlayableKind::Movie, title: "Movie 0".into(), ..(*playable()).clone() }));
+        s.last_position = Some(2480.0);
+        h.state_mut().t.snapshot = Arc::new(s);
+        h.state_mut().enter(Route::Player);
+        h.run_steps(3);
+        assert!(painted(&h).iter().any(|t| t.ends_with("Play from TV 2 at 41:20")), "{:?}", painted(&h));
+        assert!(has_label(&h, "Play from another playlist"));
+        h.state_mut().act(Action::PlayFrom);
+        until(&mut h, "the other copy", |h| real(h).playable.as_ref().is_some_and(|p| p.media == MediaRef::Movie(other)));
+        assert_eq!(real(&h).playable.as_ref().and_then(|p| p.start_at), Some(2480.0), "from where it stopped");
     }
 }

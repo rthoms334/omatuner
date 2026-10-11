@@ -71,9 +71,24 @@ pub struct PlayRequest {
     pub immediate: bool,
 }
 
+/// Play one copy of a title that several playlists have (DESIGN §29.14).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CopyPlay {
+    pub req: PlayRequest,
+    /// The next copy in the play order (`store::copies::CopyPlan::fallback`): tried ONCE, at
+    /// the same position, when `req` can't be resolved or fails before its first frame
+    /// ([`PlayerEvent::FellBack`]). A failure after the first frame never switches copies.
+    pub fallback: Option<MediaRef>,
+    /// Start here (seconds) instead of the copy's own saved progress: "Play from TV 2 at
+    /// 41:20" after the first copy failed mid-film. Overrides `req.resume`.
+    pub start_at: Option<f64>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlayerCommand {
     Play(PlayRequest),
+    /// [`PlayerCommand::Play`] of a title's copy, with the copy to fall back on.
+    PlayCopy(CopyPlay),
     Stop,
     TogglePause,
     SetPause(bool),
@@ -250,6 +265,9 @@ pub struct PlayerSnapshot {
     /// Video decoding is paused because nothing rendered for 2 s (hidden window, see module
     /// docs). The app sends `ResumeVideo` when it renders again.
     pub video_suspended: bool,
+    /// Last position of the current target, kept across reconnects (`position` is cleared by
+    /// every load): where "Play from TV 2 at 41:20" starts after a failure mid-film.
+    pub last_position: Option<f64>,
 }
 
 impl Default for PlayerSnapshot {
@@ -278,6 +296,7 @@ impl Default for PlayerSnapshot {
             load_generation: 0,
             origin: None,
             video_suspended: false,
+            last_position: None,
         }
     }
 }
@@ -295,6 +314,15 @@ pub enum PlayerEvent {
     },
     Failed(PlayerError),
     TracksChanged,
+    /// The first copy of a title failed before its first frame (`error`) and the player went
+    /// on with the next one ([`CopyPlay::fallback`]): the app toasts "TV couldn't play Dune —
+    /// playing from TV 2".
+    FellBack {
+        title: String,
+        from: Option<crate::model::SourceId>,
+        to: Option<crate::model::SourceId>,
+        error: PlayerErrorKind,
+    },
 }
 
 /// Resolves `MediaRef`s on the controller thread (owns its own DB reader). Built by
@@ -607,6 +635,88 @@ mod tests {
         assert_eq!(h.snapshot().playable.as_ref().map(|p| p.media.clone()), Some(MediaRef::Channel(ChannelId(3))));
         h.send(PlayerCommand::LastChannel { unlocked: true });
         assert!(playing(2));
+    }
+
+    /// Copies of one movie for the fallback tests: `Movie(1)` is a file that doesn't exist (in
+    /// playlist 1), `Movie(2)` plays lavfi's test source (playlist 2), `Movie(3)` can't be
+    /// resolved.
+    struct Copies;
+
+    impl MediaResolver for Copies {
+        fn resolve(&mut self, media: &MediaRef, _resume: bool) -> std::result::Result<Playable, PlayerError> {
+            use crate::model::{ItemKey, ItemKind, MovieId, SourceId};
+            let (id, url) = match media {
+                MediaRef::Movie(MovieId(1)) => (1, "/nonexistent/tuner-test/dune.mkv"),
+                MediaRef::Movie(MovieId(2)) => (2, "av://lavfi:testsrc2=size=160x90:rate=25"),
+                _ => return Err(PlayerError { kind: PlayerErrorKind::Resolve, message: "no such copy".into() }),
+            };
+            Ok(Playable {
+                media: media.clone(),
+                kind: PlayableKind::Movie,
+                item: Some(ItemRef { source: SourceId(id), kind: ItemKind::Movie, key: ItemKey(format!("m{id}")) }),
+                source_id: Some(SourceId(id)),
+                title: "Dune".into(),
+                subtitle: None,
+                logo: None,
+                number: None,
+                url: Secret::new(url.into()),
+                headers: Default::default(),
+                start_at: Some(12.0),
+                duration_hint: None,
+            })
+        }
+        fn skip_on_zap(&mut self, _ch: ChannelId) -> bool {
+            false
+        }
+        fn is_locked(&mut self, _ch: ChannelId) -> bool {
+            false
+        }
+    }
+
+    /// The first copy fails before its first frame: the player plays the next copy once, at the
+    /// position the first was asked to start at, and says so (`FellBack`, the app's toast). A
+    /// first copy that can't even be resolved goes to the next one directly. A copy asked to
+    /// start elsewhere ("Play from TV 2 at 41:20") starts there, not at its own progress.
+    #[test]
+    fn a_copy_that_fails_before_its_first_frame_falls_back_to_the_next_once() {
+        use crate::model::{MovieId, SourceId};
+        let (bus, events) = EventBus::new(None);
+        let deps = PlayerDeps { bus, store: Box::new(NullPlayerStore), resolver: Box::new(Copies) };
+        let p = Player::start(&headless_config(), deps).expect("headless mpv");
+        let h = p.handle();
+        let copy = |media: i64, fallback: Option<i64>, start_at: Option<f64>| {
+            PlayerCommand::PlayCopy(CopyPlay {
+                req: PlayRequest { media: MediaRef::Movie(MovieId(media)), zap: None, origin: PlayOrigin::Fullscreen, resume: true, immediate: true },
+                fallback: fallback.map(|f| MediaRef::Movie(MovieId(f))),
+                start_at,
+            })
+        };
+        let fell_back = || {
+            events.try_iter().find_map(|e| match e {
+                crate::msg::AppEvent::Player(PlayerEvent::FellBack { from, to, .. }) => Some((from, to)),
+                _ => None,
+            })
+        };
+        let on = |id: i64| {
+            let s = h.snapshot();
+            s.playable.as_ref().is_some_and(|p| p.media == MediaRef::Movie(MovieId(id)))
+        };
+
+        h.send(copy(1, Some(2), None));
+        assert!(wait_until(Duration::from_secs(20), || on(2)), "fell back: {:?}", h.snapshot().state);
+        assert_eq!(h.snapshot().playable.as_ref().and_then(|p| p.start_at), Some(12.0), "at the first copy's position");
+        assert!(!matches!(h.snapshot().state, PlayerState::Error(_)));
+        assert_eq!(fell_back(), Some((Some(SourceId(1)), Some(SourceId(2)))));
+
+        h.send(PlayerCommand::Stop);
+        h.send(copy(3, Some(2), Some(2480.0)));
+        assert!(wait_until(Duration::from_secs(5), || on(2) && h.snapshot().playable.as_ref().and_then(|p| p.start_at) == Some(2480.0)));
+        assert_eq!(fell_back(), Some((None, Some(SourceId(2)))), "unresolvable: the next copy at once");
+
+        // without a fallback the failure is the usual error (after the VOD retries)
+        h.send(copy(3, None, None));
+        assert!(wait_until(Duration::from_secs(5), || matches!(h.snapshot().last_error, Some(PlayerError { kind: PlayerErrorKind::Resolve, .. }))));
+        assert_eq!(fell_back(), None);
     }
 
     #[test]

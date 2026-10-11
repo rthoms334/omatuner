@@ -298,7 +298,7 @@ pub(crate) enum Undo {
 }
 
 fn undo_toast(text: String) -> Toast {
-    Toast { kind: ToastKind::Info, text, action: Some(("Undo".into(), Action::Undo)), ttl_ms: 8000 }
+    Toast { kind: ToastKind::Info, text, action: Some(("Undo".into(), Action::Undo(0))), ttl_ms: 8000 }
 }
 
 /// "Not the same title" (DESIGN §29.14): the copy leaves its stack for good (a refresh keeps

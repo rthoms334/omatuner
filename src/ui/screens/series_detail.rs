@@ -395,7 +395,7 @@ impl Screen for SeriesDetailScreen {
                 self.copies.click(ctx, click);
             }
             Action::PlayFrom => self.copies.play_from_menu(ctx),
-            Action::Undo => self.copies.undo(ctx),
+            Action::Undo(0) => self.copies.undo(ctx),
             Action::PageUp | Action::Home if self.section == Section::Episodes => {
                 self.ep = 0;
                 self.scroll_to_cursor = true;

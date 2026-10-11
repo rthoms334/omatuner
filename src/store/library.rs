@@ -345,6 +345,14 @@ impl VodIndex {
         v
     }
 
+    /// The index of a movie / series in `movies` / `series` (what [`Stacks`] speaks in).
+    pub fn index_of(&self, kind: VodKind) -> Option<u32> {
+        match kind {
+            VodKind::Movie(id) => self.movie_idx.get(&id).copied(),
+            VodKind::Series(id) => self.series_idx.get(&id).copied(),
+        }
+    }
+
     pub fn find(&self, kind: VodKind) -> Option<&VodSummary> {
         match kind {
             VodKind::Movie(id) => self.movie_idx.get(&id).map(|i| &self.movies[*i as usize]),

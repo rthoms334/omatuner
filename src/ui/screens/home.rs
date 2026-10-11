@@ -1046,7 +1046,7 @@ impl Screen for HomeScreen {
             }
             // letters never filter on Home (DESIGN §13.3)
             Action::FilterInput(_) | Action::Parent => true,
-            Action::Undo => {
+            Action::Undo(0) => {
                 if let Some(u) = self.undo.take() {
                     st::undo(ctx, u);
                 }

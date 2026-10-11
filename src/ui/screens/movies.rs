@@ -1045,7 +1045,7 @@ impl VodBrowser {
             // Esc ladder: the marks go first, then fanned-out stacks
             return self.marks.clear() || (self.pane == Pane::Grid && self.fold_all(ctx)) || self.back(ctx);
         }
-        if action == Action::Undo {
+        if action == Action::Undo(0) {
             if let Some(u) = self.undo.take() {
                 st::undo(ctx, u);
             }
@@ -1926,8 +1926,8 @@ mod tests {
         let fav = |h: &egui_kittest::Harness<'_, testkit::App<MoviesScreen>>, r: crate::model::ItemRef| h.state().t.favs.is_fav(&r);
         assert!(!fav(&h, named(a, 1)) && !fav(&h, named(b, 0)), "every copy left Favourites");
         let toast = h.state().t.toasts.last().cloned().unwrap();
-        assert_eq!((toast.text.as_str(), toast.action.map(|a| a.1)), ("Removed 2 copies from Favourites", Some(Action::Undo)));
-        h.state_mut().act(Action::Undo);
+        assert_eq!((toast.text.as_str(), toast.action.map(|a| a.1)), ("Removed 2 copies from Favourites", Some(Action::Undo(0))));
+        h.state_mut().act(Action::Undo(0));
         assert!(fav(&h, named(a, 1)) && fav(&h, named(b, 0)), "Undo puts them back");
         // Ctrl+F again: out again (no Undo taken); then on the stack in All, with no favourite
         // copy, Ctrl+F adds the copy that plays first — Bravo's, the one watched last
@@ -1952,7 +1952,7 @@ mod tests {
             crate::store::user::progress(&h.state().t.services().store.reader().unwrap(), &r).unwrap()
         };
         until(&mut h, "both copies forgotten", |h| progress(h, named(a, 0)).is_none() && progress(h, named(b, 0)).is_none());
-        h.state_mut().act(Action::Undo);
+        h.state_mut().act(Action::Undo(0));
         until(&mut h, "the rows restored", |h| {
             progress(h, named(a, 0)).is_some_and(|p| p.position_s == 600.0) && progress(h, named(b, 0)).is_some_and(|p| p.updated_at == 11)
         });

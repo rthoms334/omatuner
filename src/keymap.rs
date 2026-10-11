@@ -211,12 +211,12 @@ pub enum Action {
     /// Space on a stack card in Movies / Series: fan the copies out in the grid, or fold them
     /// back (DESIGN §29.14).
     FanOut,
-    /// Ctrl+O on a title with several copies (grid card, detail page): "Play from…" a chosen
-    /// copy.
+    /// Ctrl+O on a title with several copies (grid card, detail page, the player): "Play
+    /// from…" a chosen copy (DESIGN §29.14, §29.15).
     PlayFrom,
-    /// A toast's "Undo" (never bound to a key): the screen that showed the toast reverts its
-    /// last change ("Not the same title", removing every copy from Favourites…).
-    Undo,
+    /// A toast's Undo button (never bound to a key): the app puts back what a combined action
+    /// on a title's copies wrote (`ui::copies`; the number names the action).
+    Undo(u16),
     // ---- guide
     GuidePrevDay,
     GuideNextDay,
@@ -472,7 +472,7 @@ pub static POSTER_GRID: &[Binding] = &[
     b(C::ch('?'), A::ToggleHelp, "Keyboard help"),
     // the Text event, like the group lists' marks (a leading space never filters anyway);
     // only a stack card reacts (DESIGN §29.14)
-    b(C::ch(' '), A::FanOut, "Fan out / fold the copies of a stack"),
+    b(C::ch(' '), A::FanOut, "Show each copy / fold them (stack card)"),
     b(C::ctrl(Key::O), A::PlayFrom, "Play from another copy…"),
     // any other printable key starts filtering (FilterInput)
 ];
@@ -637,6 +637,7 @@ pub static PLAYER_VOD: &[Binding] = &[
     b(C::key(Key::ArrowDown), A::SeekBackBig, "Skip back / forward (big step)"),
     b(C::ch('L'), A::JumpToLive, "Jump to live (from catch-up)"),
     b(C::key(Key::Home), A::Home, "Go to start"),
+    b(C::ctrl(Key::O), A::PlayFrom, "Play from another copy…"),
 ];
 
 /// Controls focus mode only (never pushed by the passive banner).

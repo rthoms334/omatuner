@@ -381,7 +381,7 @@ impl Screen for MovieDetailScreen {
                 self.copies.play_from_menu(ctx);
                 true
             }
-            Action::Undo => {
+            Action::Undo(0) => {
                 self.copies.undo(ctx);
                 true
             }
@@ -910,13 +910,13 @@ pub(crate) mod tests {
         h.state_mut().nav();
         h.state_mut().result(OverlayResult::Chosen(Action::Digit(super::super::copies::CARD_SPLIT)));
         let toast = h.state().t.toasts.last().cloned().unwrap();
-        assert_eq!(toast.action.map(|a| a.1), Some(Action::Undo), "{}", toast.text);
+        assert_eq!(toast.action.map(|a| a.1), Some(Action::Undo(0)), "{}", toast.text);
         until(&mut h, "the split", |h| stored(h).iter().any(|l| l.item == named(b, 0) && l.action == LinkAction::Split));
         testkit::reload_library(&mut h.state_mut().t);
         h.run_steps(1);
         assert!(has_label(&h, "COPIES · 2") && has_label(&h, "Alpha · FR · always plays first"), "the pinned copy plays first now");
         assert!(has_label(&h, "Play · Alpha"));
-        h.state_mut().act(Action::Undo);
+        h.state_mut().act(Action::Undo(0));
         until(&mut h, "the split undone", |h| !stored(h).iter().any(|l| l.action == LinkAction::Split));
         testkit::reload_library(&mut h.state_mut().t);
         h.run_steps(1);
