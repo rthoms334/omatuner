@@ -97,8 +97,16 @@ pub struct ReminderScheduler {
 impl ReminderScheduler {
     /// Start the scheduler task on `rt` (store reads run on the blocking pool). Never fails
     /// today; storage errors are logged and retried on the next refresh / minute tick.
-    pub fn start(rt: &tokio::runtime::Handle, store: Store, bus: EventBus, lead_default_s: i64) -> Result<Self> {
-        let backend = Arc::new(StoreBackend { store, reader: Mutex::new(None) });
+    /// `explicit`: while it hides explicit content, reminders on explicit channels stay
+    /// silent (they are announced once it shows again, if still airing; DESIGN §20.3).
+    pub fn start(
+        rt: &tokio::runtime::Handle,
+        store: Store,
+        bus: EventBus,
+        lead_default_s: i64,
+        explicit: crate::store::library::ExplicitGate,
+    ) -> Result<Self> {
+        let backend = Arc::new(StoreBackend { store, reader: Mutex::new(None), explicit });
         Ok(Self::spawn(rt, backend, Arc::new(DesktopNotifier { bus: None }), bus, lead_default_s))
     }
 
@@ -139,6 +147,7 @@ trait ReminderBackend: Send + Sync + 'static {
 struct StoreBackend {
     store: Store,
     reader: Mutex<Option<rusqlite::Connection>>,
+    explicit: crate::store::library::ExplicitGate,
 }
 
 impl ReminderBackend for StoreBackend {
@@ -149,8 +158,15 @@ impl ReminderBackend for StoreBackend {
         }
         let conn = guard.as_ref().ok_or_else(|| Error::other("no database reader"))?;
         // A panic in the repository (e.g. not implemented yet) must not kill the scheduler.
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::store::user::pending_reminders(conn, Timestamp::MIN)))
-            .unwrap_or_else(|_| Err(Error::other("reminder storage is not available")))
+        let mut pending = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::store::user::pending_reminders(conn, Timestamp::MIN)))
+            .unwrap_or_else(|_| Err(Error::other("reminder storage is not available")))?;
+        // explicit channels' reminders wait, untouched, while parental control hides them: a
+        // notification would name the programme and the channel (a channel that can't be
+        // read counts as explicit)
+        if !self.explicit.visibility().explicit {
+            pending.retain(|r| !crate::store::live::item_explicit(conn, &r.channel).unwrap_or(true));
+        }
+        Ok(pending)
     }
 
     fn set_state(&self, id: ReminderId, state: ReminderState) {
@@ -522,8 +538,47 @@ mod tests {
         // Until WP-02 lands the repository panics; afterwards it returns rows. Either way the
         // scheduler must get a Result, never a panic.
         let store = Store::open_temp("tuner-reminders-test", None).unwrap();
-        let backend = StoreBackend { store, reader: Mutex::new(None) };
+        let backend = StoreBackend { store, reader: Mutex::new(None), explicit: Default::default() };
         let _ = backend.pending();
+    }
+
+    /// DESIGN §20.3: while parental control hides explicit content, a reminder on an explicit
+    /// channel is not announced (its notification would name the programme and the channel);
+    /// it stays pending and is announced once explicit content shows again.
+    #[test]
+    fn reminders_on_explicit_channels_wait_while_hidden() {
+        let store = Store::open_temp("tuner-reminders-explicit", None).unwrap();
+        let now = crate::model::now();
+        store
+            .writer()
+            .blocking(move |c| {
+                c.execute("INSERT INTO source(id, name, kind, url, created_at, generation) VALUES (1, 'S', 'm3u-url', 'http://127.0.0.1/p.m3u', 0, 1)", [])?;
+                for (id, key, group, explicit) in [(1, "m3u:news", "channel:news", 0), (2, "m3u:late", "channel:xxx", 1)] {
+                    c.execute(
+                        "INSERT INTO channel(id, source_id, key, name, clean_name, norm_name, stream, provider_order, seen_gen)
+                         VALUES (?1, 1, ?2, 'C', 'C', 'c', '{\"t\":\"url\",\"url\":\"http://127.0.0.1/1.ts\"}', 0, 1)",
+                        rusqlite::params![id, key],
+                    )?;
+                    c.execute(
+                        "INSERT INTO grp(id, source_id, kind, key, name, provider_order, item_count, seen_gen, explicit) VALUES (?1, 1, 'channel', ?2, ?2, 0, 1, 1, ?3)",
+                        rusqlite::params![id, group, explicit],
+                    )?;
+                    c.execute("INSERT INTO channel_group(group_id, channel_id, position, is_primary) VALUES (?1, ?1, 0, 1)", [id])?;
+                    c.execute(
+                        "INSERT INTO reminder(source_id, channel_key, channel_name, title, start, stop, lead_s, state)
+                         VALUES (1, ?1, 'C', 'T', ?2, ?3, 120, 'pending')",
+                        rusqlite::params![key, now + 60, now + 1800],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let gate = crate::store::library::ExplicitGate::default();
+        let backend = StoreBackend { store, reader: Mutex::new(None), explicit: gate.clone() };
+        let keys = |b: &StoreBackend| b.pending().unwrap().into_iter().map(|r| r.channel.key.0).collect::<Vec<_>>();
+        assert_eq!(keys(&backend), ["m3u:news"], "hidden by default");
+        gate.set(crate::store::library::Visibility::ALL);
+        assert_eq!(keys(&backend).len(), 2);
     }
 
     /// DESIGN §24.2 WP-08 "[e2e after WP-02] reminder fires and Watch resolves by ItemRef":
@@ -559,7 +614,7 @@ mod tests {
                 Ok((crate::model::ChannelId(channel), SourceId(source)))
             })
             .unwrap();
-        let backend = Arc::new(StoreBackend { store: store.clone(), reader: Mutex::new(None) });
+        let backend = Arc::new(StoreBackend { store: store.clone(), reader: Mutex::new(None), explicit: Default::default() });
         let notifier = Arc::new(FakeNotifier { shown: Mutex::new(Vec::new()), click: true, available: true });
         let (bus, rx) = EventBus::new(None);
         let _sched = ReminderScheduler::spawn(rt.handle(), backend, notifier.clone(), bus, 120);

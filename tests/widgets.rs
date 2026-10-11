@@ -707,6 +707,7 @@ fn confirm_context_menu_and_rename_dialogs() {
 fn pin_prompt_and_list_picker() {
     let salt = tuner::ui::parental::new_salt();
     let parental = tuner::config::ParentalConfig {
+        show_explicit: false,
         enabled: true,
         pin_hash: Some(tuner::ui::parental::hash_pin("1234", &salt)),
         pin_salt: Some(salt),
@@ -900,6 +901,7 @@ fn data_rows_render_with_real_services() {
         provider_id: None,
         tag: None,
         filter: Default::default(),
+        explicit: Default::default(),
     };
     let ep = Episode {
         id: EpisodeId(1),

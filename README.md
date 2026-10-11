@@ -104,8 +104,9 @@ on-screen controls, and a light theme (catppuccin-latte).
 - **Desktop:** MPRIS (media keys and the Omarchy bar's media widget), desktop notifications for
   reminders, and an idle inhibitor while video plays. It runs as a single instance and opens
   M3U files and links from the desktop.
-- **Other:** parental PIN, backup export/import, an in-app log viewer with export, and a `?` help
-  overlay generated from the real key bindings.
+- **Other:** parental control (PIN locks, and adult content hidden until the PIN is entered —
+  see [Parental control](#parental-control)), backup export/import, an in-app log viewer with
+  export, and a `?` help overlay generated from the real key bindings.
 
 ## Requirements
 
@@ -799,6 +800,29 @@ Everything the keys do can be done with the mouse too:
   player has a pop-out button next to its ✕.
 - **Movies and series:** below full width, the "{category} ▾" button opens the categories and
   one click on a category opens it.
+
+## Parental control
+
+Settings ▸ Parental sets a 4–8 digit PIN. It is a speed bump for children, not security.
+
+- **Locks.** Ctrl+L locks a group, channel or title. A locked item stays in its list (dimmed,
+  with a lock) and asks for the PIN when you open or play it. Locked items are left out of
+  search while the session is locked. After the PIN, the session stays open until Tuner
+  restarts, or for *Lock again after* minutes. *Lock now* closes it.
+- **Explicit content is hidden, not locked.** Adult categories don't show at all: not in Live
+  TV, the guide, Movies, Series, Home, search or any count, and zapping skips them. A category
+  is adult when the playlist flags it (Xtream `is_adult`) or its name has a word like *XXX*,
+  *18+*, *Adult(s)*, *Porn* or *Erotic*. *Adult Swim*, *Young Adult* and *Adult Animation*
+  don't count. The PIN shows them until the session locks again. Without a PIN they stay
+  hidden unless you turn on **Show explicit content**. Tuner then suggests setting a PIN
+  first.
+- **Your word wins.** Right-click a group or category for *Mark as explicit* or *Not
+  explicit*. While adult content shows, Settings ▸ Parental lists every category treated as
+  explicit, and Enter changes it. These choices survive playlist refreshes.
+- `tuner --play` of a hidden channel asks for the PIN, or says the channel is hidden, without
+  naming it. Reminders for hidden channels wait. Notifications, the jobs list, the log, MPRIS
+  and the pop-out never show an adult title while it is hidden. If one is playing when the
+  session locks, playback stops.
 
 ## Command line
 

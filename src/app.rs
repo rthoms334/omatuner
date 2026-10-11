@@ -58,7 +58,7 @@ use crate::platform::{PickPurpose, PlatformEvent};
 use crate::player::{PlayRequest, PlayerCommand, PlayerSnapshot, PlayerState};
 use crate::search::SearchIndex;
 use crate::services::Services;
-use crate::store::library::{FavIndex, Library};
+use crate::store::library::{FavIndex, Library, Visibility};
 use crate::theme::{SpaceToken, Theme, ThemeEvent};
 use crate::ui::data::{FrameBudget, NowNextCache};
 use crate::ui::overlays::{self, Overlay, OverlayOutcome};
@@ -142,6 +142,9 @@ pub struct TunerApp {
     /// A channel played before the library knew it (`--play` at startup) and its primary
     /// group: the zap list follows once the library lands.
     pending_zap: Option<(ChannelId, GroupId)>,
+    /// Explicit content is visible (DESIGN §20.3): what the app last applied from the parental
+    /// state ([`TunerApp::sync_explicit`]); library builds follow it through the job gate.
+    explicit_visible: bool,
     /// A locked channel waiting for the parental PIN (CLI/IPC `--play`, a reminder's Watch):
     /// played when the PIN overlay answers `Unlocked(OpenPlayer)` (DESIGN §13.12 "PIN prompt on
     /// play"). No screen opens `Pin { then: OpenPlayer }`, so it can't take over a screen's PIN.
@@ -239,6 +242,7 @@ impl TunerApp {
             video_only: false,
             window_size: egui::vec2(1280.0, 800.0),
             pending_zap: None,
+            explicit_visible: false,
             pending_locked: None,
             entered: None,
             layout: LayoutClass::Wide,
@@ -253,6 +257,9 @@ impl TunerApp {
         };
         app.refresh_epg_updated();
         app.refresh_image_agents();
+        // the first build already leaves out what parental control hides (DESIGN §20.3)
+        app.explicit_visible = !app.parental.hides_explicit(&app.services().config().parental);
+        app.services().jobs.context().explicit.set(Visibility { explicit: app.explicit_visible });
         app.submit_job(JobKind::RebuildLibrary);
         app.handle_ipc(&initial);
         app
@@ -408,6 +415,7 @@ impl TunerApp {
         }
         match outcome {
             Ok(JobOutcome::Library(lib)) => {
+                let lib = self.fit_visibility(lib.clone());
                 let old = std::mem::replace(&mut self.lib, lib.clone());
                 self.check_scopes(&old);
                 // the playing channel is noted again next frame
@@ -626,6 +634,90 @@ impl TunerApp {
         }
     }
 
+    /// A new snapshot as parental control wants it now (DESIGN §20.3): one built before the
+    /// session relocked loses its explicit content before it is shown; one built while it was
+    /// hidden is followed by a build that shows it.
+    fn fit_visibility(&self, lib: Arc<Library>) -> Arc<Library> {
+        if !self.explicit_visible && lib.shows_explicit() {
+            return Arc::new(lib.hiding_explicit());
+        }
+        if self.explicit_visible && !lib.visibility.explicit && !lib.explicit.is_empty() {
+            self.submit_job(JobKind::RebuildLibrary);
+        }
+        lib
+    }
+
+    /// Keep everything in step with the parental state (DESIGN §20.3), every frame: the job gate
+    /// says what library builds show; relocking (the timer, "Lock now", the switch turned off,
+    /// a PIN set) hides explicit content at once ([`TunerApp::hide_explicit_now`]); unlocking
+    /// asks for a build that shows it. The reminder scheduler re-reads what it may announce.
+    fn sync_explicit(&mut self, egui_ctx: &egui::Context) {
+        let cfg = self.services().config();
+        let visible = !self.parental.hides_explicit(&cfg.parental);
+        self.services().jobs.context().explicit.set(Visibility { explicit: visible });
+        if visible && let Some(d) = self.parental.relocks_in(&cfg.parental) {
+            // nothing else may repaint when the timer runs out
+            egui_ctx.request_repaint_after(d);
+        }
+        if visible == self.explicit_visible {
+            return;
+        }
+        self.explicit_visible = visible;
+        if !visible {
+            self.hide_explicit_now();
+        } else if !self.lib.visibility.explicit && !self.lib.explicit.is_empty() {
+            self.submit_job(JobKind::RebuildLibrary);
+        }
+        if let Some(r) = &self.services().integrations.reminders {
+            r.refresh();
+        }
+    }
+
+    /// Parental control hides explicit content again: the snapshot on screen is re-filtered
+    /// here (no rebuild to wait for), explicit playback stops, pages of explicit titles close,
+    /// and dialogs, menus and toasts that may name one go too (DESIGN §20.3).
+    fn hide_explicit_now(&mut self) {
+        if self.lib.shows_explicit() {
+            self.overlays.clear();
+            self.toasts.clear();
+            self.pending_toasts.clear();
+            self.pending_locked = None;
+            let hidden = Arc::new(self.lib.hiding_explicit());
+            let old = std::mem::replace(&mut self.lib, hidden);
+            // a playlist left with only explicit movies isn't eligible any more (its toast names
+            // the playlist, not a title)
+            self.check_scopes(&old);
+            self.search_index = None;
+        }
+        let x = self.lib.explicit.clone();
+        let playing = self.snapshot.playable.as_ref().filter(|_| self.snapshot.state != PlayerState::Idle).and_then(|p| p.item.clone());
+        if playing.is_some_and(|item| x.contains(&item) || crate::store::live::item_explicit(&self.db, &item).unwrap_or(true)) {
+            self.send_player(PlayerCommand::Stop);
+            self.routes.retain(|r| *r != Route::Player);
+            self.toast(Toast::info("Playback stopped — parental control is on"));
+        }
+        // pages and groups of explicit titles
+        self.routes.retain(|r| match r {
+            Route::MovieDetail(id) => !x.vod.contains(&crate::model::VodKind::Movie(*id)),
+            Route::SeriesDetail(id) => !x.vod.contains(&crate::model::VodKind::Series(*id)),
+            _ => true,
+        });
+        for r in &mut self.routes {
+            match r {
+                Route::Live { group: Some(g), .. } if x.groups.contains(g) => *r = Route::Live { group: None, channel: None },
+                Route::Movies { group: Some(g) } if x.groups.contains(g) => *r = Route::Movies { group: None },
+                Route::Series { group: Some(g) } if x.groups.contains(g) => *r = Route::Series { group: None },
+                Route::Guide { collection: Some(Collection::Group(g)), .. } if x.groups.contains(g) => {
+                    *r = Route::Guide { collection: None, focus: None }
+                }
+                _ => {}
+            }
+        }
+        if self.routes.is_empty() {
+            self.routes.push(Route::Home);
+        }
+    }
+
     /// A channel by stable reference: the library snapshot, else one indexed DB lookup (the
     /// library may still be loading at startup).
     fn channel_for(&self, item: &ItemRef) -> Option<ChannelId> {
@@ -646,6 +738,18 @@ impl TunerApp {
     fn play_channel(&mut self, id: ChannelId, origin: PlayOrigin) {
         let cfg = self.services().config();
         let in_lib = self.lib.live.get(id).map(|c| (c.locked, c.group_ids.first().copied()));
+        // explicit content hidden by parental control (DESIGN §20.3) isn't in the library: ask
+        // for the PIN, or say it's hidden, without naming it (a channel that can't be read
+        // counts as explicit)
+        if in_lib.is_none() && self.parental.hides_explicit(&cfg.parental) && crate::store::live::channel_explicit(&self.db, id).unwrap_or(true) {
+            if cfg.parental.pin_active() {
+                self.pending_locked = Some((id, origin));
+                self.nav.push(NavRequest::Open(OverlayRequest::Pin { then: Box::new(Action::OpenPlayer), reason: "This channel is locked".into() }));
+            } else {
+                self.toast(Toast::info("This channel is hidden by parental control (Settings ▸ Parental)"));
+            }
+            return;
+        }
         let (locked, group) = in_lib.unwrap_or_else(|| match crate::store::live::channel(&self.db, id) {
             Ok(c) => (c.locked, c.group_ids.first().copied()),
             Err(e) => {
@@ -1232,6 +1336,7 @@ impl eframe::App for TunerApp {
             self.handle_event(ev, ctx);
         }
         self.snapshot = self.services().player.handle().snapshot();
+        self.sync_explicit(ctx);
         self.measured.observe(&self.snapshot);
         let busy = matches!(self.snapshot.state, PlayerState::Loading { .. } | PlayerState::Zapping { .. });
         self.services().jobs.context().player_busy.store(busy, Ordering::Relaxed);
@@ -1366,6 +1471,8 @@ impl eframe::App for TunerApp {
         }
         self.apply_nav(&egui_ctx);
         self.apply_config_edits(&egui_ctx);
+        // "Lock now", a PIN typed or set this frame: not one more frame of the old state
+        self.sync_explicit(&egui_ctx);
         if self.budget.deferred() || self.now_next.pending() || !self.pending_actions.is_empty() {
             egui_ctx.request_repaint();
         }
@@ -2777,6 +2884,124 @@ mod tests {
         assert!(rig.app.overlays.is_empty());
         assert!(matches!(played(&rig.log()).as_slice(), [(MediaRef::Channel(_), PlayOrigin::Cli)]), "{:?}", played(&rig.log()));
         assert_eq!(rig.route(), &Route::Player);
+    }
+
+    /// `seed_channels(2)` plus "Late Night" (`m3u:x0`, number 99) in the "XXX" category, which
+    /// the import found explicit by its name (DESIGN §20.3).
+    fn seed_explicit(c: &mut rusqlite::Connection) -> crate::error::Result<()> {
+        seed_channels(c, 2, None)?;
+        c.execute(
+            "INSERT INTO grp(source_id, kind, key, name, raw_name, provider_order, item_count, seen_gen, explicit)
+             VALUES (1, 'channel', 'channel:xxx', 'XXX', 'XXX', 1, 1, 1, 1)",
+            [],
+        )?;
+        let g = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO channel(source_id, key, name, clean_name, norm_name, number, stream, provider_order, seen_gen)
+             VALUES (1, 'm3u:x0', 'Late Night', 'Late Night', 'late night', 99, '{\"t\":\"url\",\"url\":\"http://127.0.0.1/live/x0.ts\"}', 9, 1)",
+            [],
+        )?;
+        c.execute("INSERT INTO channel_group(group_id, channel_id, position, is_primary) VALUES (?1, ?2, 0, 1)", [g, c.last_insert_rowid()])?;
+        Ok(())
+    }
+
+    fn explicit_ref() -> ItemRef {
+        ItemRef { source: SourceId(1), kind: ItemKind::Channel, key: ItemKey("m3u:x0".into()) }
+    }
+
+    fn no_late_night(log: &Log) -> bool {
+        log.toasts.iter().all(|t| !t.text.contains("Late Night"))
+    }
+
+    /// DESIGN §20.3 with a PIN: explicit content is absent while locked (lists, counts,
+    /// numbers); `--play` of it asks for the PIN without naming it; the PIN plays it and a
+    /// build that shows it follows; relocking hides it on the spot (no rebuild to wait for),
+    /// stops it playing and closes the player.
+    #[test]
+    fn explicit_content_stays_behind_the_pin_and_hides_again_on_relock() {
+        let mut cfg = test_config();
+        let salt = "00".repeat(16);
+        cfg.parental.enabled = true;
+        cfg.parental.pin_hash = Some(crate::ui::parental::hash_pin("1234", &salt));
+        cfg.parental.pin_salt = Some(salt);
+        let mut rig = Rig::with(cfg, live(), 1.0, seed_explicit);
+        rig.settle();
+        assert_eq!(rig.app.lib.live.by_ref(&explicit_ref()), None);
+        assert!(rig.app.lib.live.groups.iter().all(|g| g.name != "XXX"));
+        assert_eq!(rig.app.lib.count(ItemKind::Channel, SourceId(1)), 2);
+        assert_eq!(rig.app.lib.live.by_number(99), None);
+
+        rig.app.handle_ipc(&IpcRequest { play: Some("1:m3u:x0".into()), ..live() });
+        rig.frame_with(vec![]);
+        let pin = std::mem::discriminant(&OverlayRequest::Pin { then: Box::new(Action::OpenPlayer), reason: String::new() });
+        assert_eq!(rig.overlay_kinds(), [pin], "the PIN prompt, not the channel");
+        assert_eq!(played(&rig.log()), []);
+        rig.frame_with(vec![Event::Text("1234".into())]);
+        rig.press(Key::Enter, NONE);
+        rig.frame_with(vec![]);
+        assert!(matches!(played(&rig.log()).as_slice(), [(MediaRef::Channel(_), PlayOrigin::Cli)]), "{:?}", played(&rig.log()));
+        rig.until("explicit content shown", |r| r.app.lib.live.by_ref(&explicit_ref()).is_some());
+        assert!(rig.app.lib.live.groups.iter().any(|g| g.name == "XXX"));
+
+        // relock while it plays
+        let id = rig.app.lib.live.by_ref(&explicit_ref()).unwrap();
+        rig.app.log.borrow_mut().jobs.clear();
+        rig.app.log.borrow_mut().commands.clear();
+        rig.app.parental.lock();
+        let playable = crate::model::Playable {
+            media: MediaRef::Channel(id),
+            kind: crate::model::PlayableKind::Live,
+            item: Some(explicit_ref()),
+            source_id: Some(SourceId(1)),
+            title: "Late Night".into(),
+            subtitle: None,
+            logo: None,
+            number: Some(99),
+            url: crate::redact::Secret::new("http://127.0.0.1/live/x0.ts".into()),
+            headers: Default::default(),
+            start_at: None,
+            duration_hint: None,
+        };
+        rig.app.snapshot =
+            Arc::new(PlayerSnapshot { state: PlayerState::Playing, playable: Some(Arc::new(playable)), ..(*rig.app.snapshot).clone() });
+        let before = rig.app.lib.generation;
+        let ctx = rig.ctx.clone();
+        rig.app.sync_explicit(&ctx);
+        assert_ne!(rig.app.lib.generation, before);
+        assert_eq!(rig.app.lib.live.by_ref(&explicit_ref()), None, "hidden at once");
+        assert!(rig.log().jobs.is_empty(), "no rebuild to wait for");
+        assert!(rig.log().commands.contains(&PlayerCommand::Stop));
+        assert!(!rig.app.routes.contains(&Route::Player));
+        assert_eq!(rig.log().toasts.last().map(|t| t.text.as_str()), Some("Playback stopped — parental control is on"));
+        assert!(no_late_night(&rig.log()));
+        assert!(!rig.app.services().jobs.context().explicit.visibility().explicit, "the next builds leave it out too");
+    }
+
+    /// DESIGN §20.3 without a PIN: hidden by default (`--play` says so without naming it);
+    /// "Show explicit content" shows it, turning it off hides it again at once.
+    #[test]
+    fn explicit_content_without_a_pin_is_hidden_unless_shown() {
+        let mut rig = Rig::with(test_config(), live(), 1.0, seed_explicit);
+        rig.settle();
+        assert_eq!(rig.app.lib.live.by_ref(&explicit_ref()), None);
+        rig.app.handle_ipc(&IpcRequest { play: Some("1:m3u:x0".into()), ..live() });
+        rig.frame_with(vec![]);
+        assert_eq!(played(&rig.log()), []);
+        assert!(rig.app.overlays.is_empty(), "no PIN to ask for");
+        assert_eq!(rig.log().toasts.last().map(|t| t.text.as_str()), Some("This channel is hidden by parental control (Settings ▸ Parental)"));
+        assert!(no_late_night(&rig.log()));
+
+        rig.app.config_edits.push(Box::new(|c: &mut Config| c.parental.show_explicit = true));
+        rig.frame_with(vec![]);
+        rig.until("explicit content shown", |r| r.app.lib.live.by_ref(&explicit_ref()).is_some());
+        let xxx = rig.app.lib.live.groups.iter().find(|g| g.name == "XXX").map(|g| g.id).unwrap();
+        let cfg = rig.app.services().config();
+        assert_eq!(rig.app.zap_list(xxx, &cfg).map(|z| z.channels.len()), Some(1));
+
+        rig.app.config_edits.push(Box::new(|c: &mut Config| c.parental.show_explicit = false));
+        rig.frame_with(vec![]);
+        assert_eq!(rig.app.lib.live.by_ref(&explicit_ref()), None, "hidden in the same frame");
+        assert!(rig.app.zap_list(xxx, &cfg).is_none());
     }
 
     #[test]

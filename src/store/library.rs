@@ -18,18 +18,27 @@
 //! Budget: 100k channels + 50k movies + 20k series → < 400 ms build, < 60 MB RAM.
 //! Hidden items are excluded from `members`/`collection` but kept in `channels` (Settings ▸
 //! Hidden lists them); locked items are flagged, not removed (the UI asks for the PIN).
+//!
+//! Explicit content (DESIGN §20.3) is different again: while parental control hides it, its
+//! groups and items are ABSENT from the snapshot — not in `channels`, `groups`, the VOD vectors,
+//! `members`, counts, `recent_channels` or the eligible playlists — so every list, count, zap
+//! list, search index and lookup leaves it out without asking. [`Visibility`] is the one
+//! predicate ([`load_visible`] builds with it, [`Library::hiding_explicit`] re-filters a snapshot
+//! on the UI thread when the session relocks); [`ExplicitIndex`] remembers what is explicit
+//! either way.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use rusqlite::Connection;
 
 use crate::error::Result;
 use crate::model::{
-    CategoryFilter, ChannelId, ChannelSummary, Collection, FavListId, FavouriteEntry, FavouriteList, Group, GroupFilter, GroupId, ItemKey, ItemKind,
-    ItemRef, MovieId, Quality, QualityBadge, SeriesId, SortMode, SourceColor, SourceId, SourceKind, SourceSettings, Timestamp, VodKind, VodSummary,
+    CategoryFilter, ChannelId, ChannelSummary, Collection, Explicit, FavListId, FavouriteEntry, FavouriteList, Group, GroupFilter, GroupId, ItemKey,
+    ItemKind, ItemRef, MovieId, Quality, QualityBadge, SeriesId, SortMode, SourceColor, SourceId, SourceKind, SourceSettings, Timestamp, VodKind,
+    VodSummary,
 };
 use crate::sources::category_tags::{self, CategorySummary};
 use crate::store::live::{GROUP_COLS, GROUP_FROM, GROUP_ORDER, group_from_row};
@@ -66,7 +75,79 @@ impl SourceMeta {
     }
 }
 
-#[derive(Debug, Default)]
+/// What a snapshot shows of the catalogue (DESIGN §20.3) — THE visibility predicate of the
+/// library build. Everything built from a snapshot (lists, counts, zap lists, search, Home,
+/// P2's merged stacks) reads vectors it already filtered; code that combines copies of an item
+/// itself asks [`Visibility::admits`] with [`ExplicitIndex`]'s answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Visibility {
+    /// Explicit (adult) groups and items are in the snapshot.
+    pub explicit: bool,
+}
+
+impl Visibility {
+    /// The whole catalogue (an unlocked session, or "Show explicit content" without a PIN).
+    pub const ALL: Visibility = Visibility { explicit: true };
+    /// Explicit content left out (parental control hides it).
+    pub const NO_EXPLICIT: Visibility = Visibility { explicit: false };
+
+    /// Does a snapshot with this visibility show an item / group that is (`explicit`) or isn't
+    /// explicit content?
+    pub fn admits(self, explicit: bool) -> bool {
+        self.explicit || !explicit
+    }
+}
+
+/// `Library::default()` (no build yet, tests) shows everything; the app's builds always go
+/// through [`ExplicitGate`].
+impl Default for Visibility {
+    fn default() -> Self {
+        Visibility::ALL
+    }
+}
+
+/// The app's current [`Visibility`], shared with the jobs that build snapshots (and the
+/// reminder scheduler): written by the app from the parental state on every frame and before
+/// it asks for a build. Starts hidden.
+#[derive(Debug, Clone, Default)]
+pub struct ExplicitGate(Arc<AtomicBool>);
+
+impl ExplicitGate {
+    pub fn visibility(&self) -> Visibility {
+        Visibility { explicit: self.0.load(Ordering::Acquire) }
+    }
+    pub fn set(&self, v: Visibility) {
+        self.0.store(v.explicit, Ordering::Release);
+    }
+}
+
+/// The catalogue's explicit content (DESIGN §20.3): the same whether or not the snapshot that
+/// holds it shows it. An item is explicit when the provider flags it (unless one of its
+/// categories is marked "Not explicit") or when one of its categories is explicit.
+#[derive(Debug, Default, Clone)]
+pub struct ExplicitIndex {
+    /// Explicit groups of every kind.
+    pub groups: HashSet<GroupId>,
+    pub channels: HashSet<ChannelId>,
+    pub vod: HashSet<VodKind>,
+    /// The same channels, movies and series by stable reference (lookups of rows read from the
+    /// database: continue watching, reminders, Settings lists, `--play`).
+    pub refs: HashSet<ItemRef>,
+    /// (source, kind) with at least one item that is NOT explicit (hidden ones count): the
+    /// playlist keeps `SourceMeta::has` for that kind while explicit content is hidden.
+    clean: HashSet<(SourceId, ItemKind)>,
+}
+
+impl ExplicitIndex {
+    pub fn is_empty(&self) -> bool {
+        self.groups.is_empty() && self.channels.is_empty() && self.vod.is_empty()
+    }
+    pub fn contains(&self, item: &ItemRef) -> bool {
+        self.refs.contains(item)
+    }
+}
+
+#[derive(Debug, Default, Clone)]
 pub struct LiveIndex {
     /// All channels of enabled sources (hidden ones included, flagged via `hidden`), in
     /// display order (source sort_index, then user order, then provider order).
@@ -204,9 +285,24 @@ impl LiveIndex {
     pub fn by_number(&self, n: u32) -> Option<ChannelId> {
         self.channels.iter().find(|c| c.number == Some(n) && !self.hidden.contains(&c.id)).map(|c| c.id)
     }
+
+    /// This index without the channels and groups of `x` (explicit content hidden).
+    fn without(self, x: &ExplicitIndex) -> LiveIndex {
+        let Self { channels, hidden, groups, mut members, .. } = self;
+        members.retain(|g, _| !x.groups.contains(g));
+        for v in members.values_mut() {
+            v.retain(|c| !x.channels.contains(c));
+        }
+        LiveIndex::from_parts(
+            channels.into_iter().filter(|c| !x.channels.contains(&c.id)).collect(),
+            groups.into_iter().filter(|g| !x.groups.contains(&g.id)).collect(),
+            members,
+            hidden.into_iter().filter(|c| !x.channels.contains(c)).collect(),
+        )
+    }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct VodIndex {
     /// Visible (non-hidden) movies in display order (source sort_index, then the user's custom
     /// order `item_override.user_order`, then provider order — `SortMode::Provider` is this
@@ -293,6 +389,39 @@ impl VodIndex {
             VodKind::Series(id) => self.series_idx.get(&id).map(|i| &self.series[*i as usize]),
         }
     }
+
+    /// This index without the titles and categories of `x` (explicit content hidden); group
+    /// members are re-pointed at the shorter vectors.
+    fn without(self, x: &ExplicitIndex) -> VodIndex {
+        let Self { movies, series, movie_groups, series_groups, members, .. } = self;
+        // old index → new index, per vector
+        let keep = |v: Vec<VodSummary>| -> (Vec<VodSummary>, Vec<Option<u32>>) {
+            let mut map = Vec::with_capacity(v.len());
+            let mut out = Vec::with_capacity(v.len());
+            for item in v {
+                if x.vod.contains(&item.kind) {
+                    map.push(None);
+                } else {
+                    map.push(Some(out.len() as u32));
+                    out.push(item);
+                }
+            }
+            (out, map)
+        };
+        let (movies, movie_map) = keep(movies);
+        let (series, series_map) = keep(series);
+        let movie_group_ids: HashSet<GroupId> = movie_groups.iter().map(|g| g.id).collect();
+        let members = members
+            .into_iter()
+            .filter(|(g, _)| !x.groups.contains(g))
+            .map(|(g, v)| {
+                let map = if movie_group_ids.contains(&g) { &movie_map } else { &series_map };
+                (g, v.into_iter().filter_map(|i| map.get(i as usize).copied().flatten()).collect())
+            })
+            .collect();
+        let drop_groups = |v: Vec<Group>| v.into_iter().filter(|g| !x.groups.contains(&g.id)).collect();
+        VodIndex::from_parts(movies, series, drop_groups(movie_groups), drop_groups(series_groups), members)
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -372,6 +501,10 @@ pub struct Library {
     /// default): what screens compare to notice a swap. Never the `Arc` address — a dropped
     /// snapshot's allocation is often reused by the next one.
     pub generation: u64,
+    /// What this snapshot shows (DESIGN §20.3).
+    pub visibility: Visibility,
+    /// The catalogue's explicit content, shown or not (shared between copies of a build).
+    pub explicit: Arc<ExplicitIndex>,
 }
 
 impl Library {
@@ -415,7 +548,60 @@ impl Library {
             recent_channels,
             built_at: self.built_at,
             generation: next_generation(),
+            visibility: self.visibility,
+            explicit: self.explicit.clone(),
         }
+    }
+
+    /// The snapshot holds explicit content right now (shows it, and there is some).
+    pub fn shows_explicit(&self) -> bool {
+        self.visibility.explicit && !self.explicit.is_empty()
+    }
+
+    /// `item` (a channel, movie or series) is explicit content this snapshot leaves out: rows
+    /// read from the database (continue watching, reminders, Settings lists, `--play`) check
+    /// it before they show or play anything.
+    pub fn conceals(&self, item: &ItemRef) -> bool {
+        !self.visibility.explicit && self.explicit.contains(item)
+    }
+
+    /// This snapshot without its explicit content: the UI thread's re-filter when the parental
+    /// session relocks, so nothing explicit stays on screen until a rebuild lands (a copy of
+    /// the indexes, tens of ms at the size budget). A new `generation` and `built_at`, so every
+    /// screen rebuilds from it.
+    pub fn hiding_explicit(&self) -> Library {
+        let copy = Library {
+            sources: self.sources.clone(),
+            live: self.live.clone(),
+            vod: self.vod.clone(),
+            favs: self.favs.clone(),
+            recent_channels: self.recent_channels.clone(),
+            built_at: crate::model::now().max(self.built_at + 1),
+            generation: next_generation(),
+            visibility: self.visibility,
+            explicit: self.explicit.clone(),
+        };
+        copy.with_visibility(Visibility::NO_EXPLICIT)
+    }
+
+    /// Apply `v` to a snapshot that shows everything (the build's last step).
+    fn with_visibility(mut self, v: Visibility) -> Library {
+        self.visibility = v;
+        if v.explicit || self.explicit.is_empty() {
+            return self;
+        }
+        let x = self.explicit.clone();
+        let live = Arc::try_unwrap(std::mem::take(&mut self.live)).unwrap_or_else(|a| (*a).clone());
+        let vod = Arc::try_unwrap(std::mem::take(&mut self.vod)).unwrap_or_else(|a| (*a).clone());
+        self.live = Arc::new(live.without(&x));
+        self.vod = Arc::new(vod.without(&x));
+        self.recent_channels.retain(|c| !x.channels.contains(c));
+        for s in &mut self.sources {
+            s.has_live &= x.clean.contains(&(s.id, ItemKind::Channel));
+            s.has_vod &= x.clean.contains(&(s.id, ItemKind::Movie));
+            s.has_series &= x.clean.contains(&(s.id, ItemKind::Series));
+        }
+        self
     }
 }
 
@@ -503,14 +689,23 @@ pub fn category_summary(conn: &Connection, source: SourceId) -> Result<CategoryS
     })
 }
 
-/// Per group: (display position, hidden, locked).
-fn group_flags(groups: &[Group]) -> HashMap<GroupId, (usize, bool, bool)> {
-    groups.iter().enumerate().map(|(i, g)| (g.id, (i, g.hidden, g.locked))).collect()
+/// Per group: what its items inherit.
+#[derive(Debug, Clone, Copy)]
+struct GroupFlags {
+    /// Display position.
+    pos: usize,
+    hidden: bool,
+    locked: bool,
+    explicit: Explicit,
+}
+
+fn group_flags(groups: &[Group]) -> HashMap<GroupId, GroupFlags> {
+    groups.iter().enumerate().map(|(i, g)| (g.id, GroupFlags { pos: i, hidden: g.hidden, locked: g.locked, explicit: g.explicit })).collect()
 }
 
 /// Group memberships `item id → [(group, primary)]` from a link table, restricted to groups
 /// in `flags` (enabled sources).
-fn load_memberships(conn: &Connection, sql: &str, flags: &HashMap<GroupId, (usize, bool, bool)>) -> Result<HashMap<i64, Vec<(GroupId, bool)>>> {
+fn load_memberships(conn: &Connection, sql: &str, flags: &HashMap<GroupId, GroupFlags>) -> Result<HashMap<i64, Vec<(GroupId, bool)>>> {
     let mut stmt = conn.prepare_cached(sql)?;
     let mut out: HashMap<i64, Vec<(GroupId, bool)>> = HashMap::new();
     for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, GroupId>(1)?, r.get::<_, bool>(2)?)))? {
@@ -522,17 +717,44 @@ fn load_memberships(conn: &Connection, sql: &str, flags: &HashMap<GroupId, (usiz
     Ok(out)
 }
 
-/// Ordered group ids (primary first, then display order) + (all groups hidden, any locked).
-fn effective_groups(links: Option<&Vec<(GroupId, bool)>>, flags: &HashMap<GroupId, (usize, bool, bool)>) -> (Vec<GroupId>, bool, bool) {
-    let Some(links) = links else { return (Vec::new(), false, false) };
-    let mut v: Vec<&(GroupId, bool)> = links.iter().collect();
-    v.sort_by_key(|(g, primary)| (!*primary, flags.get(g).map_or(usize::MAX, |f| f.0)));
-    let all_hidden = !v.is_empty() && v.iter().all(|(g, _)| flags.get(g).is_some_and(|f| f.1));
-    let any_locked = v.iter().any(|(g, _)| flags.get(g).is_some_and(|f| f.2));
-    (v.into_iter().map(|(g, _)| *g).collect(), all_hidden, any_locked)
+/// What an item inherits from its groups.
+struct Inherited {
+    /// Primary first, then display order.
+    groups: Vec<GroupId>,
+    /// Every group is hidden.
+    all_hidden: bool,
+    any_locked: bool,
+    /// One of its groups is explicit content.
+    any_explicit: bool,
+    /// One of its groups is marked "Not explicit" (overrides the provider's flag on the item).
+    any_cleared: bool,
 }
 
-fn load_live(conn: &Connection, groups: Vec<Group>) -> Result<LiveIndex> {
+impl Inherited {
+    /// The item is explicit content (DESIGN §20.3): one of its groups is, or the provider flags
+    /// the item (`own`) and the user didn't say "Not explicit" about one of its groups.
+    fn explicit(&self, own: bool) -> bool {
+        self.any_explicit || (own && !self.any_cleared)
+    }
+}
+
+fn effective_groups(links: Option<&Vec<(GroupId, bool)>>, flags: &HashMap<GroupId, GroupFlags>) -> Inherited {
+    let Some(links) = links else {
+        return Inherited { groups: Vec::new(), all_hidden: false, any_locked: false, any_explicit: false, any_cleared: false };
+    };
+    let mut v: Vec<&(GroupId, bool)> = links.iter().collect();
+    v.sort_by_key(|(g, primary)| (!*primary, flags.get(g).map_or(usize::MAX, |f| f.pos)));
+    let flag = |g: &GroupId| flags.get(g).copied();
+    Inherited {
+        all_hidden: !v.is_empty() && v.iter().all(|(g, _)| flag(g).is_some_and(|f| f.hidden)),
+        any_locked: v.iter().any(|(g, _)| flag(g).is_some_and(|f| f.locked)),
+        any_explicit: v.iter().any(|(g, _)| flag(g).is_some_and(|f| f.explicit.is_explicit())),
+        any_cleared: v.iter().any(|(g, _)| flag(g).is_some_and(|f| f.explicit == Explicit::Cleared)),
+        groups: v.into_iter().map(|(g, _)| *g).collect(),
+    }
+}
+
+fn load_live(conn: &Connection, groups: Vec<Group>, x: &mut ExplicitIndex) -> Result<LiveIndex> {
     let flags = group_flags(&groups);
     let trust = crate::store::live::label_trust(conn)?;
     let links = load_memberships(conn, "SELECT cg.channel_id, cg.group_id, cg.is_primary FROM channel_group cg", &flags)?;
@@ -540,7 +762,7 @@ fn load_live(conn: &Connection, groups: Vec<Group>) -> Result<LiveIndex> {
         "SELECT c.id, c.source_id, c.key, COALESCE(o.rename, c.clean_name), c.number, c.logo, ce.epg_channel_id, c.tvg_shift_min,
                 c.catchup IS NOT NULL, COALESCE(json_extract(c.catchup, '$.days'), 0), c.radio, c.unsupported IS NOT NULL,
                 c.provider_order, o.user_order, c.added_at, COALESCE(o.hidden, 0), COALESCE(o.locked, 0),
-                c.quality, v.width, v.height, COALESCE(c.family, c.norm_name), c.name, o.rename IS NOT NULL
+                c.quality, v.width, v.height, COALESCE(c.family, c.norm_name), c.name, o.rename IS NOT NULL, c.explicit
          FROM channel c JOIN source s ON s.id = c.source_id AND s.enabled = 1
          LEFT JOIN item_override o ON o.source_id = c.source_id AND o.kind = 'channel' AND o.item_key = c.key
          LEFT JOIN channel_epg ce ON ce.channel_id = c.id
@@ -596,20 +818,27 @@ fn load_live(conn: &Connection, groups: Vec<Group>) -> Result<LiveIndex> {
             },
             r.get::<_, bool>(15)?,
             r.get::<_, bool>(22)?,
+            r.get::<_, bool>(23)?,
         ))
     })?;
     for row in rows {
-        let (mut c, item_hidden, is_renamed) = row?;
+        let (mut c, item_hidden, is_renamed, own_explicit) = row?;
         renamed.push(is_renamed);
-        let (gids, all_hidden, any_locked) = effective_groups(links.get(&c.id.0), &flags);
-        c.locked |= any_locked;
-        if item_hidden || all_hidden {
+        let inherited = effective_groups(links.get(&c.id.0), &flags);
+        c.locked |= inherited.any_locked;
+        if item_hidden || inherited.all_hidden {
             hidden.insert(c.id);
         }
-        for g in &gids {
+        if inherited.explicit(own_explicit) {
+            x.channels.insert(c.id);
+            x.refs.insert(ItemRef { source: c.source_id, kind: ItemKind::Channel, key: c.key.clone() });
+        } else {
+            x.clean.insert((c.source_id, ItemKind::Channel));
+        }
+        for g in &inherited.groups {
             members.entry(*g).or_default().push(c.id);
         }
-        c.group_ids = gids;
+        c.group_ids = inherited.groups;
         channels.push(c);
     }
     distinguish_channels(&mut channels, &renamed);
@@ -650,14 +879,14 @@ fn text_hash(v: rusqlite::types::ValueRef<'_>) -> u64 {
 type VodMembers = HashMap<GroupId, Vec<u32>>;
 
 /// Visible movies or series + group members (indices into the returned vector).
-fn load_vod(conn: &Connection, movies: bool, groups: &[Group]) -> Result<(Vec<VodSummary>, VodMembers)> {
+fn load_vod(conn: &Connection, movies: bool, groups: &[Group], x: &mut ExplicitIndex) -> Result<(Vec<VodSummary>, VodMembers)> {
     let flags = group_flags(groups);
     let (table, link, col, kind, poster) =
         if movies { ("movie", "movie_group", "movie_id", "movie", "poster") } else { ("series", "series_group", "series_id", "series", "cover") };
     let links = load_memberships(conn, &format!("SELECT l.{col}, l.group_id, 0 FROM {link} l"), &flags)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT x.id, x.source_id, x.key, COALESCE(o.rename, x.clean_name), x.year, x.{poster}, x.rating, x.added_at,
-                x.provider_order, COALESCE(o.locked, 0), COALESCE(o.hidden, 0)
+                x.provider_order, COALESCE(o.locked, 0), COALESCE(o.hidden, 0), x.explicit
          FROM {table} x JOIN source s ON s.id = x.source_id AND s.enabled = 1
          LEFT JOIN item_override o ON o.source_id = x.source_id AND o.kind = '{kind}' AND o.item_key = x.key
          ORDER BY s.sort_index, s.id, (o.user_order IS NULL), o.user_order, x.provider_order, x.id"
@@ -682,42 +911,61 @@ fn load_vod(conn: &Connection, movies: bool, groups: &[Group]) -> Result<(Vec<Vo
             },
             id,
             r.get::<_, bool>(10)?,
+            r.get::<_, bool>(11)?,
         ))
     })?;
+    let item_kind = if movies { ItemKind::Movie } else { ItemKind::Series };
     for row in rows {
-        let (mut v, id, item_hidden) = row?;
-        let (gids, all_hidden, any_locked) = effective_groups(links.get(&id), &flags);
-        if item_hidden || all_hidden {
+        let (mut v, id, item_hidden, own_explicit) = row?;
+        let inherited = effective_groups(links.get(&id), &flags);
+        if inherited.explicit(own_explicit) {
+            x.vod.insert(v.kind);
+            x.refs.insert(ItemRef { source: v.source_id, kind: item_kind, key: v.key.clone() });
+        } else {
+            x.clean.insert((v.source_id, item_kind));
+        }
+        if item_hidden || inherited.all_hidden {
             continue;
         }
-        v.locked |= any_locked;
+        v.locked |= inherited.any_locked;
         let idx = items.len() as u32;
-        for g in &gids {
+        for g in &inherited.groups {
             members.entry(*g).or_default().push(idx);
         }
-        v.group_ids = gids;
+        v.group_ids = inherited.groups;
         items.push(v);
     }
     Ok((items, members))
 }
 
 /// Build a full snapshot from a reader connection (uses the `from_parts` constructors). Never
-/// call on the UI thread.
+/// call on the UI thread. Shows everything, explicit content included: the app's builds go
+/// through [`load_visible`] with its [`ExplicitGate`].
 ///
 /// Only enabled sources contribute channels/VOD/groups (`sources` lists every source).
 /// Effective flags: an item is hidden when it is hidden itself or every one of its groups is
-/// hidden; it is locked when it or any of its groups is locked.
+/// hidden; it is locked when it or any of its groups is locked; it is explicit as
+/// [`ExplicitIndex`] says.
 pub fn load(conn: &Connection) -> Result<Library> {
+    load_visible(conn, Visibility::ALL)
+}
+
+/// [`load`], then leave out what `visibility` hides (DESIGN §20.3).
+pub fn load_visible(conn: &Connection, visibility: Visibility) -> Result<Library> {
     let sources = load_sources(conn)?;
     let (ch_groups, movie_groups, series_groups) = load_groups(conn, &sources)?;
-    let live = load_live(conn, ch_groups)?;
-    let (movies, mut members) = load_vod(conn, true, &movie_groups)?;
-    let (series, series_members) = load_vod(conn, false, &series_groups)?;
+    let mut explicit = ExplicitIndex {
+        groups: ch_groups.iter().chain(&movie_groups).chain(&series_groups).filter(|g| g.explicit.is_explicit()).map(|g| g.id).collect(),
+        ..Default::default()
+    };
+    let live = load_live(conn, ch_groups, &mut explicit)?;
+    let (movies, mut members) = load_vod(conn, true, &movie_groups, &mut explicit)?;
+    let (series, series_members) = load_vod(conn, false, &series_groups, &mut explicit)?;
     members.extend(series_members);
     let vod = VodIndex::from_parts(movies, series, movie_groups, series_groups, members);
     let favs = load_favs(conn)?;
     let recent_channels = load_recent_channels(conn, &live)?;
-    Ok(Library {
+    let lib = Library {
         sources,
         live: Arc::new(live),
         vod: Arc::new(vod),
@@ -725,7 +973,10 @@ pub fn load(conn: &Connection) -> Result<Library> {
         recent_channels,
         built_at: crate::model::now(),
         generation: next_generation(),
-    })
+        visibility: Visibility::ALL,
+        explicit: Arc::new(explicit),
+    };
+    Ok(lib.with_visibility(visibility))
 }
 
 /// Distinct recently watched channels of `live`, most recent first (one aggregate over the

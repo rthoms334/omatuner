@@ -9,6 +9,7 @@
 //! | `m3u_vod.rs`      | P5 sources | M3U movies/series fallback classifier (DESIGN §27.5) |
 //! | `presets.rs`      | P5 sources | free-channel playlists + country detection (§27.8) |
 //! | `category_tags.rs`| P6 core | country / language tags of category names (§28.2) |
+//! | `explicit.rs`     | P14 | adult-content detection of category names (§20.3) |
 //! | `smart_names.rs`  | WP-03 | name cleanup ("UK | BBC One FHD" → "BBC One") |
 //! | `name_tokens.rs`  | P6 names | the name tokenizer shared by smart names and category tags (§13.1) |
 //! | `identity.rs`     | skeleton (frozen) | ItemKey / normalization / fingerprints (WP-03 owns its tests) |
@@ -20,6 +21,7 @@
 pub mod catchup;
 pub mod category_tags;
 pub mod epg_match;
+pub mod explicit;
 pub mod http;
 pub mod identity;
 pub mod m3u;

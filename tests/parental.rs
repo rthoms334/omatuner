@@ -84,7 +84,8 @@ fn type_text<T>(h: &mut Harness<'static, T>, text: &str) {
 
 fn with_pin(t: &mut TestUi, pin: &str) {
     let mut c = (*t.config).clone();
-    c.parental = ParentalConfig { enabled: true, pin_hash: Some(hash_pin(pin, "salt")), pin_salt: Some("salt".into()), relock_min: 0 };
+    c.parental =
+        ParentalConfig { show_explicit: false, enabled: true, pin_hash: Some(hash_pin(pin, "salt")), pin_salt: Some("salt".into()), relock_min: 0 };
     t.config = Arc::new(c);
 }
 

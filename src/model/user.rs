@@ -61,6 +61,9 @@ pub struct GroupOverride {
     /// Shown although the source's category filter hides its tag (DESIGN §28.3). Cleared by
     /// hiding the group.
     pub shown: bool,
+    /// The user's word on explicit content (DESIGN §20.3): `Some(true)` "Mark as explicit",
+    /// `Some(false)` "Not explicit", `None` = as detected.
+    pub explicit: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

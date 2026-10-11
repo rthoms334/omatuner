@@ -531,13 +531,20 @@ impl HomeScreen {
             self.vod_refs = ctx.lib.vod.movies.iter().chain(&ctx.lib.vod.series).map(|v| (vod_ref(v), v.kind)).collect();
         }
         let mut rails = Vec::new();
-        if !self.continue_items.is_empty() {
-            rails.push(Rail {
-                kind: RailKind::Continue,
-                title: "Continue watching".into(),
-                list: None,
-                tiles: (0..self.continue_items.len()).map(Tile::Continue).collect(),
-            });
+        // read from the database, not the library: explicit titles parental control hides are
+        // left out here (DESIGN §20.3)
+        let continue_tiles: Vec<Tile> = self
+            .continue_items
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                let kind = if matches!(c.card.kind, VodKind::Movie(_)) { ItemKind::Movie } else { ItemKind::Series };
+                !ctx.lib.conceals(&ItemRef { source: c.card.source_id, kind, key: c.card.key.clone() })
+            })
+            .map(|(i, _)| Tile::Continue(i))
+            .collect();
+        if !continue_tiles.is_empty() {
+            rails.push(Rail { kind: RailKind::Continue, title: "Continue watching".into(), list: None, tiles: continue_tiles });
         }
         for list in ctx.favs.non_empty_lists() {
             let tiles: Vec<Tile> = ctx
@@ -1862,6 +1869,7 @@ mod tests {
         });
         let mut cfg = (*t.config).clone();
         cfg.parental = crate::config::ParentalConfig {
+            show_explicit: false,
             enabled: true,
             pin_salt: Some("s".into()),
             pin_hash: Some(crate::ui::parental::hash_pin("1234", "s")),
@@ -1885,6 +1893,48 @@ mod tests {
     /// Review fixes: a locked title on Continue watching asks for the PIN before Shift+Enter
     /// resumes it; favourited titles get a rail; Delete removes a tile from its favourites
     /// list; Ctrl+H hides; the item shortcuts and the context menu work on tiles.
+    /// DESIGN §20.3: Continue watching is read from the database, so it leaves out what the
+    /// library conceals itself — an explicit movie is in no rail (nor its title on screen)
+    /// while parental control hides it, and back once it shows.
+    #[test]
+    fn rails_leave_out_explicit_titles_while_hidden() {
+        let (mut t, one) = rig();
+        seed(&mut t, |c| {
+            let s = testkit::source(c, "My IPTV")?;
+            testkit::movies(c, s, 3)?;
+            c.execute("UPDATE movie SET explicit = 1 WHERE key = 'm3u:movie0000000000'", [])?;
+            let list = crate::store::user::default_fav_list(c)?;
+            for i in 0..2 {
+                let item = ItemRef { source: s, kind: ItemKind::Movie, key: ItemKey(format!("m3u:movie{i:010}")) };
+                let p = WatchProgress {
+                    item: item.clone(),
+                    position_s: 600.0,
+                    duration_s: Some(1200.0),
+                    updated_at: 5 + i as i64,
+                    finished: false,
+                    title: format!("Movie {i}"),
+                    fingerprint: Default::default(),
+                };
+                crate::store::user::save_progress(c, &p)?;
+                crate::store::user::set_favourite(c, list, &item, true, 1)?;
+            }
+            Ok(())
+        });
+        let shown = crate::store::library::load(&t.services().store.reader().unwrap()).unwrap();
+        t.set_library(shown.hiding_explicit());
+        let mut h = harness(t, one, HomeScreen::default(), egui::vec2(1400.0, 900.0));
+        h.state_mut().enter(Route::Home);
+        until(&mut h, "continue watching", |h| has_label(h, "CONTINUE WATCHING"));
+        let tiles = |h: &egui_kittest::Harness<'static, testkit::App<HomeScreen>>, kind: RailKind| {
+            h.state().s.rails.iter().find(|r| r.kind == kind).map_or(0, |r| r.tiles.len())
+        };
+        assert_eq!((tiles(&h, RailKind::Continue), tiles(&h, RailKind::Favourites), tiles(&h, RailKind::Movies)), (1, 1, 2));
+        assert!(!testkit::painted(&h).iter().any(|p| p.contains("Movie 0")), "the title isn't on screen");
+        h.state_mut().t.set_library(shown);
+        h.run_steps(2);
+        assert_eq!((tiles(&h, RailKind::Continue), tiles(&h, RailKind::Favourites), tiles(&h, RailKind::Movies)), (2, 2, 3));
+    }
+
     #[test]
     fn continue_watching_respects_locks_and_tiles_take_the_item_shortcuts() {
         let (mut t, one) = rig();
@@ -1913,6 +1963,7 @@ mod tests {
         });
         let mut cfg = (*t.config).clone();
         cfg.parental = crate::config::ParentalConfig {
+            show_explicit: false,
             enabled: true,
             pin_salt: Some("s".into()),
             pin_hash: Some(crate::ui::parental::hash_pin("1234", "s")),

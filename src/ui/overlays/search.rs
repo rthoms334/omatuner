@@ -889,6 +889,7 @@ mod tests {
         });
         let mut cfg = (*t.config).clone();
         cfg.parental = crate::config::ParentalConfig {
+            show_explicit: false,
             enabled: true,
             pin_salt: Some("s".into()),
             pin_hash: Some(crate::ui::parental::hash_pin("1234", "s")),
@@ -919,6 +920,7 @@ mod tests {
         });
         let mut cfg = (*t.config).clone();
         cfg.parental = crate::config::ParentalConfig {
+            show_explicit: false,
             enabled: true,
             pin_salt: Some("s".into()),
             pin_hash: Some(crate::ui::parental::hash_pin("1234", "s")),

@@ -306,11 +306,12 @@ pub fn set_group_override(conn: &Connection, source: SourceId, kind: ItemKind, k
         return Ok(());
     }
     conn.execute(
-        "INSERT INTO group_override(source_id, kind, group_key, rename, hidden, locked, user_order, pinned_home, shown)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "INSERT INTO group_override(source_id, kind, group_key, rename, hidden, locked, user_order, pinned_home, shown, explicit)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(source_id, kind, group_key) DO UPDATE SET rename = excluded.rename, hidden = excluded.hidden,
-           locked = excluded.locked, user_order = excluded.user_order, pinned_home = excluded.pinned_home, shown = excluded.shown",
-        params![source, kind.as_str(), key.0, ov.rename, ov.hidden, ov.locked, ov.user_order, ov.pinned_home, ov.shown],
+           locked = excluded.locked, user_order = excluded.user_order, pinned_home = excluded.pinned_home, shown = excluded.shown,
+           explicit = excluded.explicit",
+        params![source, kind.as_str(), key.0, ov.rename, ov.hidden, ov.locked, ov.user_order, ov.pinned_home, ov.shown, ov.explicit],
     )?;
     Ok(())
 }
@@ -319,7 +320,7 @@ pub fn set_group_override(conn: &Connection, source: SourceId, kind: ItemKind, k
 fn group_override_of(conn: &Connection, g: &GroupRef) -> Result<GroupOverride> {
     Ok(conn
         .prepare_cached(
-            "SELECT rename, hidden, locked, user_order, pinned_home, shown FROM group_override
+            "SELECT rename, hidden, locked, user_order, pinned_home, shown, explicit FROM group_override
              WHERE source_id = ?1 AND kind = ?2 AND group_key = ?3",
         )?
         .query_row(params![g.source, g.kind.as_str(), g.key.0], |r| {
@@ -330,10 +331,19 @@ fn group_override_of(conn: &Connection, g: &GroupRef) -> Result<GroupOverride> {
                 user_order: r.get(3)?,
                 pinned_home: r.get(4)?,
                 shown: r.get(5)?,
+                explicit: r.get(6)?,
             })
         })
         .optional()?
         .unwrap_or_default())
+}
+
+/// The user's word on one category's explicit content (DESIGN §20.3): `Some(true)` "Mark as
+/// explicit", `Some(false)` "Not explicit", `None` = back to what the import detected. Keeps
+/// the rest of the override.
+pub fn set_group_explicit(conn: &Connection, g: &GroupRef, explicit: Option<bool>) -> Result<()> {
+    let ov = GroupOverride { explicit, ..group_override_of(conn, g)? };
+    set_group_override(conn, g.source, g.kind, &g.key, &ov)
 }
 
 /// Hide groups in one transaction (Ctrl+H on one or several marked groups, "Hide these N
@@ -358,7 +368,7 @@ pub fn show_group(conn: &Connection, g: &GroupRef, exempt: bool) -> Result<()> {
 
 pub fn group_overrides(conn: &Connection) -> Result<Vec<GroupOverrideRow>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT source_id, kind, group_key, rename, hidden, locked, user_order, pinned_home, shown FROM group_override
+        "SELECT source_id, kind, group_key, rename, hidden, locked, user_order, pinned_home, shown, explicit FROM group_override
          ORDER BY source_id, kind, group_key",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -373,6 +383,7 @@ pub fn group_overrides(conn: &Connection) -> Result<Vec<GroupOverrideRow>> {
                 user_order: r.get(6)?,
                 pinned_home: r.get(7)?,
                 shown: r.get(8)?,
+                explicit: r.get(9)?,
             },
         })
     })?;

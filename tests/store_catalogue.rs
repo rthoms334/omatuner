@@ -40,6 +40,7 @@ fn m3u_draft(name: &str, url: &str) -> SourceDraft {
 
 fn chan(key: &str, name: &str, tvg: Option<&str>, grp: &str, url: &str, order: i32) -> ImportChannel {
     ImportChannel {
+        adult: false,
         key: ItemKey(key.into()),
         provider_id: key.strip_prefix("xt:live:").map(str::to_owned),
         name: name.into(),
@@ -66,6 +67,7 @@ fn chan(key: &str, name: &str, tvg: Option<&str>, grp: &str, url: &str, order: i
 fn movie(key: &str, name: &str, grp: &str, order: i32) -> ImportMovie {
     let url = format!("http://h.tv/movie/{key}.mp4");
     ImportMovie {
+        adult: false,
         key: ItemKey(key.into()),
         provider_id: key.strip_prefix("xt:vod:").map(str::to_owned),
         name: name.into(),
@@ -84,6 +86,7 @@ fn movie(key: &str, name: &str, grp: &str, order: i32) -> ImportMovie {
 
 fn series(key: &str, name: &str, grp: &str, order: i32) -> ImportSeries {
     ImportSeries {
+        adult: false,
         key: ItemKey(key.into()),
         provider_id: key.strip_prefix("xt:series:").map(str::to_owned),
         name: name.into(),
@@ -122,7 +125,15 @@ fn run_import(
             for k in keys {
                 if !groups.iter().any(|g| g.kind == kind && &g.key == k) {
                     let name = k.0.split_once(':').unwrap().1.to_owned();
-                    groups.push(ImportGroup { kind, key: k.clone(), name, raw_name: None, provider_id: None, provider_order: groups.len() as i32 });
+                    groups.push(ImportGroup {
+                        adult: false,
+                        kind,
+                        key: k.clone(),
+                        name,
+                        raw_name: None,
+                        provider_id: None,
+                        provider_order: groups.len() as i32,
+                    });
                 }
             }
         };
@@ -1243,6 +1254,7 @@ fn library_load_merges_overrides_and_skips_disabled_sources() {
 /// displayed smart-cleaned like the importer does.
 fn import_tagged(s: &Store, src: SourceId, channels: Vec<(&str, &str, Vec<&str>)>, movies: Vec<(&str, &str)>, now: Timestamp) {
     let grp = |kind: ItemKind, raw: &str, order: usize| ImportGroup {
+        adult: false,
         kind,
         key: group_key(kind, raw),
         name: raw.rsplit(['|', ':']).next().unwrap().trim().to_owned(),

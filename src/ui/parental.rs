@@ -44,6 +44,21 @@ impl ParentalSession {
     pub fn lock(&mut self) {
         self.unlocked_at = None;
     }
+
+    /// How long until an unlocked session relocks by itself (`None`: locked, no PIN, or
+    /// unlocked until restart) — the app repaints then, so explicit content disappears on time.
+    pub fn relocks_in(&self, cfg: &ParentalConfig) -> Option<std::time::Duration> {
+        if !cfg.pin_active() || cfg.relock_min == 0 {
+            return None;
+        }
+        let t = self.unlocked_at?;
+        Some(std::time::Duration::from_secs(u64::from(cfg.relock_min) * 60).saturating_sub(t.elapsed()))
+    }
+
+    /// Explicit content is hidden right now (DESIGN §20.3; [`ParentalConfig::hides_explicit`]).
+    pub fn hides_explicit(&self, cfg: &ParentalConfig) -> bool {
+        cfg.hides_explicit(self.is_unlocked(cfg))
+    }
 }
 
 /// hex(blake3(salt_hex_bytes || pin)).
@@ -76,7 +91,8 @@ mod tests {
     fn pin_unlock_and_relock() {
         let salt = new_salt();
         assert_eq!(salt.len(), 32);
-        let cfg = ParentalConfig { enabled: true, pin_hash: Some(hash_pin("1234", &salt)), pin_salt: Some(salt), relock_min: 0 };
+        let cfg =
+            ParentalConfig { show_explicit: false, enabled: true, pin_hash: Some(hash_pin("1234", &salt)), pin_salt: Some(salt), relock_min: 0 };
         let mut s = ParentalSession::default();
         assert!(!s.is_unlocked(&cfg));
         assert!(!s.unlock("0000", &cfg));
@@ -85,5 +101,28 @@ mod tests {
         s.lock();
         assert!(!s.is_unlocked(&cfg));
         assert!(ParentalSession::default().is_unlocked(&ParentalConfig::default()));
+    }
+
+    /// Explicit content: behind the PIN when there is one; without one hidden unless "Show
+    /// explicit content" is on (DESIGN §20.3).
+    #[test]
+    fn explicit_content_follows_the_pin_or_the_switch() {
+        let salt = new_salt();
+        let mut cfg = ParentalConfig { enabled: true, pin_hash: Some(hash_pin("1234", &salt)), pin_salt: Some(salt), ..Default::default() };
+        let mut s = ParentalSession::default();
+        assert!(s.hides_explicit(&cfg), "locked session");
+        cfg.show_explicit = true;
+        assert!(s.hides_explicit(&cfg), "the switch doesn't open a PIN-locked session");
+        assert!(s.unlock("1234", &cfg));
+        assert!(!s.hides_explicit(&cfg), "unlocked");
+        s.lock();
+        assert!(s.hides_explicit(&cfg), "relocked");
+        let mut none = ParentalConfig::default();
+        assert!(ParentalSession::default().hides_explicit(&none), "no PIN: hidden by default");
+        none.show_explicit = true;
+        assert!(!ParentalSession::default().hides_explicit(&none));
+        cfg.enabled = false;
+        cfg.show_explicit = false;
+        assert!(s.hides_explicit(&cfg), "parental lock off: the switch decides");
     }
 }

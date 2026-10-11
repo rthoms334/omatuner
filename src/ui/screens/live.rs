@@ -543,6 +543,49 @@ enum Menu {
 /// The groups menu's "Countries & languages…" (echoed back as `Action::Digit`; channel numbers
 /// never come from a menu).
 const MENU_COUNTRIES: u8 = 200;
+/// The groups menu's "Mark as explicit" / "Not explicit".
+const MENU_EXPLICIT: u8 = 201;
+
+/// The menu entry of a provider category's explicit-content mark (DESIGN §20.3), echoed back
+/// as `Action::Digit(code)`.
+pub(crate) fn explicit_menu_item(g: &Group, code: u8) -> MenuItem {
+    MenuItem {
+        icon: glyphs::EXPLICIT,
+        label: if g.explicit.is_explicit() { "Not explicit".into() } else { "Mark as explicit".into() },
+        action: Action::Digit(code),
+        enabled: true,
+        shortcut: None,
+    }
+}
+
+/// "Mark as explicit" / "Not explicit" on a provider category (DESIGN §20.3): the user's word
+/// beats the playlist's flag and the name rules, and survives refreshes (`group_override`).
+/// Going back to what was detected stores no override. "Not explicit" is only offered while
+/// explicit content shows (unlocked, or shown without a PIN).
+pub(crate) fn toggle_group_explicit(ctx: &mut UiCtx<'_>, g: &Group) {
+    use crate::model::Explicit;
+    let mark = !g.explicit.is_explicit();
+    if !mark && ctx.parental.hides_explicit(&ctx.config.parental) {
+        return;
+    }
+    let value = match (mark, g.explicit) {
+        (true, Explicit::Cleared) | (false, Explicit::Marked) => None,
+        (true, _) => Some(true),
+        (false, _) => Some(false),
+    };
+    let target = crate::model::GroupRef::from(g);
+    let _ = ctx.services.store.writer().submit_notify(DataScope::Overrides, move |c| crate::store::user::set_group_explicit(c, &target, value));
+    let name = g.display_name();
+    ctx.toast(Toast::info(if !mark {
+        format!("“{name}” is no longer treated as explicit")
+    } else if ctx.parental.hides_explicit(&ctx.config.parental) {
+        format!("“{name}” is explicit — hidden by parental control")
+    } else if ctx.config.parental.pin_active() {
+        format!("“{name}” is explicit — hidden once parental control locks again")
+    } else {
+        format!("“{name}” is explicit — hidden unless Settings ▸ Parental shows explicit content")
+    }));
+}
 
 /// Detail line of the "No playlists yet" empty state (Live and the guide).
 pub(crate) const EMPTY_LIBRARY_DETAIL: &str = "Add an M3U playlist or an Xtream login to start watching — press Enter.";
@@ -676,6 +719,7 @@ fn synthetic_group(name: String, count: usize) -> Group {
         provider_id: None,
         tag: None,
         filter: Default::default(),
+        explicit: Default::default(),
     }
 }
 
@@ -781,7 +825,8 @@ impl LiveScreen {
         if !ctx.lib.is_empty() || !live.channels.is_empty() {
             for l in &ctx.favs.lists {
                 let name = format!("{} {}", glyphs::FAVOURITE, l.name);
-                let n = ctx.favs.items(l.id).iter().filter(|r| in_scope(r)).count();
+                // explicit content parental control hides doesn't count (DESIGN §20.3)
+                let n = ctx.favs.items(l.id).iter().filter(|r| in_scope(r) && !ctx.lib.conceals(r)).count();
                 v.push(GroupItem {
                     entry: Entry::FavList(l.id),
                     group: synthetic_group(name.clone(), n),
@@ -794,9 +839,9 @@ impl LiveScreen {
             let name = format!("{} History", glyphs::HISTORY);
             let n = ctx.lib.recent_channels.iter().filter(|id| live.get(**id).is_some_and(|c| mine.admits(c.source_id))).count();
             v.push(GroupItem { entry: Entry::History, group: synthetic_group(name.clone(), n), name, tag: None, words: String::new(), source: None });
-            if !self.reminders.is_empty() {
+            if self.reminders.iter().any(|r| !ctx.lib.conceals(&r.channel)) {
                 let name = format!("{} Reminders", glyphs::REMINDER);
-                let n = self.reminders.iter().filter(|r| mine.admits(r.channel.source)).count();
+                let n = self.reminders.iter().filter(|r| mine.admits(r.channel.source) && !ctx.lib.conceals(&r.channel)).count();
                 v.push(GroupItem {
                     entry: Entry::Reminders,
                     group: synthetic_group(name.clone(), n),
@@ -1167,6 +1212,7 @@ impl LiveScreen {
                 }
                 v.extend([
                     menu_item(glyphs::LOCK, if g.group.locked { "Unlock group" } else { "Lock group" }, Action::ToggleLock, true, k),
+                    explicit_menu_item(&g.group, MENU_EXPLICIT),
                     menu_item(glyphs::REORDER, "Move up", Action::MoveUp, true, k),
                     menu_item(glyphs::REORDER, "Move down", Action::MoveDown, true, k),
                 ]);
@@ -2088,6 +2134,11 @@ impl Screen for LiveScreen {
                         ctx.open(OverlayRequest::Categories(g.source_id));
                     }
                 }
+                Some(Menu::Context) if action == Action::Digit(MENU_EXPLICIT) => {
+                    if let Some(g) = self.cursor_provider_group(ctx) {
+                        toggle_group_explicit(ctx, &g);
+                    }
+                }
                 _ => {
                     self.on_action(ctx, action);
                 }
@@ -2191,6 +2242,47 @@ mod tests {
         assert!(!s.channels.is_empty() && s.open_index().is_some(), "{:?}", s.open);
         pick(&mut h, free);
         assert_eq!(h.state().s.channels.len(), 4, "out of All, but its own tab shows it");
+    }
+
+    /// DESIGN §20.3: a group's menu offers "Mark as explicit"; choosing it stores the user's
+    /// word, and the next hidden build leaves the group and its channels out.
+    #[test]
+    fn mark_a_group_as_explicit_from_its_menu() {
+        let (mut t, one) = rig();
+        seed(&mut t, |c| {
+            let a = testkit::source(c, "Alpha")?;
+            testkit::channels(c, a, 20)
+        });
+        let mut h = harness(t, one, LiveScreen::default(), egui::vec2(1600.0, 900.0));
+        h.state_mut().enter(Route::Live { group: None, channel: None });
+        h.run_steps(2);
+        let app = h.state_mut();
+        let i = app.s.groups.iter().position(|g| matches!(g.entry, Entry::Group(_)) && g.group.display_name() == "News").unwrap();
+        let row = app.s.group_rows.iter().position(|r| *r as usize == i).unwrap();
+        app.s.group_list.select(row);
+        let s = &mut app.s;
+        app.t.with_ctx(|ctx| s.group_menu(ctx));
+        let nav = app.nav();
+        let [crate::ui::NavRequest::Open(OverlayRequest::ContextMenu(menu))] = nav.as_slice() else { panic!("{nav:?}") };
+        let item = menu.items.iter().find(|m| m.label == "Mark as explicit").expect("offered");
+        let action = item.action;
+        app.result(OverlayResult::Chosen(action));
+        assert_eq!(
+            app.t.toasts.last().map(|t| t.text.as_str()),
+            Some("“News” is explicit — hidden by parental control"),
+            "no PIN and not shown: hidden by default"
+        );
+        let reader = app.t.services().store.reader().unwrap();
+        testkit::until(&mut h, "the override", |_| {
+            reader
+                .query_row("SELECT explicit FROM group_override WHERE group_key = 'channel:news'", [], |r| r.get::<_, Option<i64>>(0))
+                .ok()
+                .flatten()
+                == Some(1)
+        });
+        let lib = crate::store::library::load_visible(&reader, crate::store::library::Visibility::NO_EXPLICIT).unwrap();
+        assert!(lib.live.groups.iter().all(|g| g.name != "News"));
+        assert_eq!(lib.live.channels.len(), 18, "every 10th channel was in News");
     }
 
     #[test]

@@ -75,6 +75,7 @@ fn chan(key: &str, name: &str, stream: StreamLocator) -> ImportChannel {
         StreamLocator::Xtream { .. } => None,
     };
     ImportChannel {
+        adult: false,
         key: ItemKey(key.into()),
         provider_id: key.strip_prefix("xt:live:").map(str::to_owned),
         name: name.into(),
@@ -116,6 +117,7 @@ fn import_channels(s: &Store, source: SourceId, channels: Vec<ImportChannel>) ->
     w(s, move |c| {
         let imp = import::begin_catalogue(c, source, T20)?;
         let g = ImportGroup {
+            adult: false,
             kind: ItemKind::Channel,
             key: group_key(ItemKind::Channel, "News"),
             name: "News".into(),
@@ -139,6 +141,7 @@ fn import_channels(s: &Store, source: SourceId, channels: Vec<ImportChannel>) ->
 
 fn movie(key: &str, name: &str, stream: StreamLocator) -> ImportMovie {
     ImportMovie {
+        adult: false,
         key: ItemKey(key.into()),
         provider_id: None,
         name: name.into(),
@@ -160,6 +163,7 @@ fn import_movies(s: &Store, source: SourceId, movies: Vec<ImportMovie>) -> Vec<M
     w(s, move |c| {
         let imp = import::begin_catalogue(c, source, T20)?;
         let g = ImportGroup {
+            adult: false,
             kind: ItemKind::Movie,
             key: group_key(ItemKind::Movie, "Films"),
             name: "Films".into(),
@@ -181,6 +185,7 @@ fn import_movies(s: &Store, source: SourceId, movies: Vec<ImportMovie>) -> Vec<M
 /// One Xtream series with `episodes` (S1) stored through the lazy details path.
 fn import_series(s: &Store, source: SourceId, name: &str, episodes: Vec<ImportEpisode>) -> (SeriesId, Vec<EpisodeId>) {
     let series = ImportSeries {
+        adult: false,
         key: ItemKey("xt:series:77".into()),
         provider_id: Some("77".into()),
         name: name.into(),
@@ -203,6 +208,7 @@ fn import_series(s: &Store, source: SourceId, name: &str, episodes: Vec<ImportEp
     let id = w(s, move |c| {
         let imp = import::begin_catalogue(c, source, T20)?;
         let g = ImportGroup {
+            adult: false,
             kind: ItemKind::Series,
             key: group_key(ItemKind::Series, "Shows"),
             name: "Shows".into(),

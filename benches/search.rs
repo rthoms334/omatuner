@@ -28,6 +28,7 @@ const BRANDS: [&str; 12] = ["BBC", "ITV", "Sky", "CNN", "ESPN", "HBO", "Canal+",
 
 fn group(id: i64, kind: ItemKind, name: &str) -> Group {
     Group {
+        explicit: Default::default(),
         id: GroupId(id),
         source_id: SourceId(1),
         kind,
