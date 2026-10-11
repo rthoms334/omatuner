@@ -14,10 +14,11 @@
 //! §15.1), → (l) / Shift+→ (L) increase or pick the next option, Shift+← (H) decrease,
 //! Enter/Space toggle or open, x/Delete the row's menu, Alt+↑/↓ (K/J) reorder, Tab switches
 //! between the page list and the page (→ / Enter back into it), Esc leaves a text field, then
-//! the page. A source editor with unsaved changes keeps its page: ↑/↓ or a click in the page
-//! list say so instead of dropping the changes. Config rows apply through `ctx.edit_config`
-//! (saved, applied live); store rows go through the writer and its `DataScope` notification. Changing parental
-//! settings needs the open PIN session once a PIN exists.
+//! the page. A source editor with unsaved changes keeps its page: ↑/↓, Esc or a click in the
+//! page list say so and return to the editor instead of dropping the changes. Config rows
+//! apply through `ctx.edit_config` (saved, applied live); store rows go through the writer and
+//! its `DataScope` notification. Changing parental settings needs the open PIN session once a
+//! PIN exists.
 //!
 //! Xtream upgrade (DESIGN §27.3): a playlist that signed in with its Xtream login reads
 //! "Xtream (from M3U)"; its editor (and that of a playlist kept as M3U) has "Use the Xtream
@@ -502,7 +503,8 @@ impl Row {
     }
 }
 
-/// The source editor's working copy.
+/// The source editor's working copy. Every field is user-editable: `is_changed` compares the
+/// whole struct, so transient UI state (a status, a validation message) must live outside it.
 #[derive(Debug, Clone, PartialEq)]
 struct SourceEditor {
     original: Source,
@@ -834,7 +836,7 @@ impl SettingsScreen {
     /// (switching the page drops the editor), which a toast explains instead.
     fn may_leave_editor(&self, ctx: &mut UiCtx<'_>) -> bool {
         if self.editor.as_ref().is_some_and(SourceEditor::is_changed) {
-            ctx.toast(Toast::info("Save the playlist's changes, or Esc to discard them"));
+            ctx.toast(Toast::info("Unsaved playlist changes: Enter on Save, or Esc to discard"));
             return false;
         }
         true
@@ -2577,12 +2579,16 @@ impl Screen for SettingsScreen {
             match action {
                 Action::Up | Action::Down => {
                     let j = if action == Action::Up { i.saturating_sub(1) } else { (i + 1).min(PAGES.len() - 1) };
+                    // blocked: back to the editor, where Esc (as the toast says) discards
                     if j != i && !self.may_leave_editor(ctx) {
+                        self.pane = Pane::Content;
                         return true;
                     }
                     self.set_page(ctx, PAGES[j].0);
                 }
                 Action::Activate | Action::Right | Action::FocusNext | Action::FocusPrev => self.pane = Pane::Content,
+                // leaving Settings would keep unsaved editor changes hidden behind a later visit
+                Action::Back if !self.may_leave_editor(ctx) => self.pane = Pane::Content,
                 Action::Back | Action::Left => return false,
                 Action::ToggleHelp => return false,
                 _ => {}
@@ -3809,9 +3815,18 @@ mod tests {
         h.state_mut().act(Action::Down);
         assert_eq!(h.state().s.page, SettingsPage::Playlists, "unsaved changes keep the page");
         assert_eq!(h.state().s.editor.as_ref().map(|e| e.icon), icon, "and the changes");
-        assert_eq!(h.state().t.toasts.last().map(|t| t.text.as_str()), Some("Save the playlist's changes, or Esc to discard them"));
-        // Esc discards them; then ↓ switches the page
-        h.state_mut().act(Action::Right);
+        assert_eq!(h.state().t.toasts.last().map(|t| t.text.as_str()), Some(UNSAVED));
+        assert_eq!(h.state().s.pane, Pane::Content, "back in the editor, where Esc discards");
+        // so a second (or held) ↓ moves through the editor instead of piling up toasts
+        let toasts = h.state().t.toasts.len();
+        h.state_mut().act(Action::Down);
+        assert_eq!((h.state().t.toasts.len(), h.state().s.pane), (toasts, Pane::Content));
+        // Esc in the page list doesn't leave Settings with the changes either
+        h.state_mut().act(Action::Left);
+        assert!(h.state_mut().act(Action::Back), "Settings stays");
+        assert_eq!(h.state().s.pane, Pane::Content);
+        assert_eq!(h.state().s.editor.as_ref().map(|e| e.icon), icon);
+        // one Esc in the editor discards them; then ← ↓ switches the page
         h.state_mut().act(Action::Back);
         assert!(h.state().s.editor.is_none());
         h.state_mut().act(Action::Left);
@@ -3819,9 +3834,65 @@ mod tests {
         assert_eq!(h.state().s.page, SettingsPage::Epg);
     }
 
+    const UNSAVED: &str = "Unsaved playlist changes: Enter on Save, or Esc to discard";
+
+    /// The page-list guard holds only real changes: an untouched editor lets ↓ switch the page.
+    /// With a change, a click on another page keeps the page, the change and the editor's
+    /// highlight.
+    #[test]
+    fn the_page_list_guard_holds_only_unsaved_changes_and_covers_clicks() {
+        let (mut t, one) = rig();
+        seed(&mut t, |c| testkit::source(c, "My IPTV").map(|_| ()));
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 1000.0));
+        let open = |h: &mut H| {
+            h.state_mut().enter(Route::Settings(SettingsPage::Playlists));
+            until(h, "the playlist", |h| has_label(h, "My IPTV"));
+            focus(h, "My IPTV");
+            h.state_mut().act(Action::Activate);
+            h.run_steps(2);
+            assert!(has_label(h, "EDIT MY IPTV"));
+        };
+        open(&mut h);
+        let toasts = h.state().t.toasts.len();
+        h.state_mut().act(Action::Left);
+        h.state_mut().act(Action::Down);
+        assert_eq!(h.state().s.page, SettingsPage::Epg, "nothing to lose");
+        assert_eq!(h.state().t.toasts.len(), toasts, "no toast");
+        open(&mut h);
+        focus(&mut h, "Icon");
+        h.state_mut().act(Action::Increase);
+        let icon = h.state().s.editor.as_ref().map(|e| e.icon);
+        h.state_mut().act(Action::Left);
+        h.run_steps(1);
+        h.get_by_label("Interface").click();
+        h.run_steps(2);
+        assert_eq!((h.state().s.page, h.state().s.pane), (SettingsPage::Playlists, Pane::Content));
+        assert_eq!(h.state().s.editor.as_ref().map(|e| e.icon), icon, "the change is kept");
+        assert_eq!(h.state().t.toasts.last().map(|t| t.text.as_str()), Some(UNSAVED));
+    }
+
+    /// Compact (one pane at a time): ← from a row shows the page list alone, → brings back the
+    /// page on the same row.
+    #[test]
+    fn compact_left_shows_the_page_list_and_right_returns_to_the_row() {
+        let (mut t, one) = rig();
+        t.layout = LayoutClass::Compact;
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(420.0, 900.0));
+        h.state_mut().enter(Route::Settings(SettingsPage::Interface));
+        h.run_steps(2);
+        focus(&mut h, "Density");
+        let row = h.state().s.row;
+        h.state_mut().act(Action::Left);
+        h.run_steps(2);
+        assert!(has_label(&h, "Hidden items") && !has_label(&h, "Density"), "the page list alone");
+        h.state_mut().act(Action::Right);
+        h.run_steps(2);
+        assert!(has_label(&h, "Density") && !has_label(&h, "Hidden items"), "the page again");
+        assert_eq!((h.state().s.page, h.state().s.row), (SettingsPage::Interface, row));
+    }
+
     /// Shift+← on a parental row that needed the PIN is retried as the same Shift+← (not as
-    /// Enter), the
-    /// relock time is editable from its row, and "Lock now" locks the session.
+    /// Enter), the relock time is editable from its row, and "Lock now" locks the session.
     #[test]
     fn parental_rows_retry_the_same_adjustment_after_the_pin_and_lock_now_locks() {
         let (mut t, one) = rig();

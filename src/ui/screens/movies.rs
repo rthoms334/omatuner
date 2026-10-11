@@ -12,11 +12,12 @@
 //!   idiom), Enter opens details, Shift+Enter plays/resumes fullscreen, Ctrl+S opens the sort
 //!   menu (the choice is saved as `interface.movie_sort` / `series_sort`), ← on the first
 //!   column (also while filtering — the filter is kept — or on an empty grid) / Backspace
-//!   returns to the categories (DESIGN §15.1 spatial panes), Tab switches panes. Item shortcuts: Ctrl+F
-//!   / Ctrl+Shift+F favourites, Ctrl+W watched, Ctrl+L lock, Ctrl+H hide, F2 rename, Ctrl+I
-//!   details, Delete removes from Favourites / Continue watching, Alt+↑/↓ moves the title in
-//!   Custom order (`item_override.user_order`, per title — DESIGN §8.3), switching a sorted
-//!   grid to Custom order first (DESIGN §13.0); the cursor follows the title.
+//!   returns to the categories (DESIGN §15.1 spatial panes), Tab switches panes. Item
+//!   shortcuts: Ctrl+F / Ctrl+Shift+F favourites, Ctrl+W watched, Ctrl+L lock, Ctrl+H hide, F2
+//!   rename, Ctrl+I details, Delete removes from Favourites / Continue watching, Alt+↑/↓ moves
+//!   the title in Custom order (`item_override.user_order`, per title — DESIGN §8.3),
+//!   switching a sorted grid to Custom order first (DESIGN §13.0); the cursor follows the
+//!   title.
 //! * Only the focused pane shows the cursor; the other shows its current row "selected".
 //! * Wide: categories | grid. Medium (a tiled half): the categories are a drawer (← on the
 //!   first column, Backspace, or the "{category} ▾" header button) so the grid keeps 4–5

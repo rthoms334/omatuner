@@ -1087,12 +1087,15 @@ layout. Use only the keyboard.
   - **Expect:** ← always lights the page list and never changes a value; ↓/↑ switch the page;
     → returns to the same page. → and Shift+→ raise a value / pick the next option, Shift+←
     lowers it; a toggle turns on with → and off with Shift+←, Enter flips it. Holding ← stays
-    in the page list. The hint line reads "Shift+→ change"; `?` lists "Back to the page list".
+    in the page list. The hint line reads "→ change"; `?` lists "Back to the page list".
 - [ ] **Settings source editor:**
   - **Do:** open a playlist's editor, change its colour with Shift+→, press ← and then ↓ in the
-    page list. Press → and Esc, then ← and ↓. Also click another page while the change is unsaved.
-  - **Expect:** ← keeps the editor open; with the change unsaved, ↓ (or the click) stays on
-    Playlists with "Save the playlist's changes, or Esc to discard them"; after Esc, ↓ moves on.
+    page list (hold ↓ too). Press Esc, then ← and ↓. Also click another page, and press ← then
+    Esc, while the change is unsaved.
+  - **Expect:** ← keeps the editor open; with the change unsaved, ↓ (the click, or Esc in the
+    page list) stays on Playlists with one "Unsaved playlist changes: Enter on Save, or Esc to
+    discard" and lights the editor again (holding ↓ then moves through its rows); the next Esc
+    discards the change, and after ← ↓ moves on.
 - [ ] **Live TV (Wide, Tiled, Compact):**
   - **Do:** in the channel list type a few letters, then press ←. Press → (or Enter) on a group.
   - **Expect:** ← moves the highlight to the groups (Tiled: the drawer opens; Compact: the

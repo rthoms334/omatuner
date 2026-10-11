@@ -96,7 +96,7 @@ impl Overlay for PlaylistPickerOverlay {
                 Action::Up | Action::Down | Action::PageUp | Action::PageDown | Action::Home | Action::End | Action::FilterInput(_) => {
                     OverlayOutcome::Keep
                 }
-                Action::Activate | Action::ActivateAlt | Action::Left | Action::Right => OverlayOutcome::Keep,
+                Action::Activate | Action::ActivateAlt | Action::Right => OverlayOutcome::Keep,
                 _ => OverlayOutcome::Ignored,
             },
         }

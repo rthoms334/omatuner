@@ -1980,8 +1980,9 @@ Panel idiom (h/j/k/l allowed, Enter toggles; ← / h steps back to the page list
 (§15.1 spatial panes; the source editor and the attach view stay open), → / l / Shift+→ / L
 increase or pick the next option, Shift+← / H decrease or pick the previous one; → / Enter / Tab
 in the page list return to the page; focused text fields push `TextInput`, which owns
-←/→/Delete/Space). A source editor with unsaved changes keeps its page: ↑/↓ or a click in the
-page list show "Save the playlist's changes, or Esc to discard them" instead of dropping them.
+←/→/Delete/Space). A source editor with unsaved changes keeps its page: ↑/↓, Esc or a click in
+the page list show "Unsaved playlist changes: Enter on Save, or Esc to discard" and return the
+highlight to the editor instead of dropping them (Esc there then discards).
 Reorderable rows (playlists, **EPG source priority**,
 favourites lists) show a 󰇙 drag grip and move with Alt+↑/↓ or K/J. Every edit goes through
 `ctx.edit_config` / the store and applies live (`PlayerCommand::ApplyConfig`). Settings list:
@@ -2178,8 +2179,9 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
     contexts below it are never consulted (typing a space in Rename can't confirm the dialog).
   * Modal swallows printable text it doesn't bind; PlayerOsd, PopOut, NumericEntry and
     EpgMapping fall through to the context below.
-  * Key auto-repeat never produces `Parent`/`Back` (holding Backspace to clear a filter stops at
-    the empty filter).
+  * Key auto-repeat never produces `Parent`/`Back`, a filtered list's `Left` or `LastChannel`
+    (holding Backspace to clear a filter stops at the empty filter; holding ← steps out of a
+    filtered list once, and the ← that closed a player side panel never zaps).
 * **Spatial panes** (Omarchy style: arrows move the highlight between side-by-side panes): ← at
   the left edge of the focused pane steps to the pane on its left wherever one exists; → (or
   Enter) opens / moves right; Tab, Shift+Tab and Esc are unchanged; the mouse is unaffected.

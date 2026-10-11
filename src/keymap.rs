@@ -22,8 +22,9 @@
 //!   the first column); → / Enter go right. Where ←/→ mean something inside the pane (a grid,
 //!   the guide, the player, a text field) they keep it; Settings values change with → and
 //!   Shift+←/→.
-//! * Key auto-repeat never triggers `Parent`/`Back` (holding Backspace to clear a filter must
-//!   not continue into "leave the pane").
+//! * Key auto-repeat never triggers `Parent`/`Back`, a filtered list's ← or `LastChannel`
+//!   (holding Backspace to clear a filter must not continue into "leave the pane"; holding the
+//!   ← that closed a player side panel must not zap).
 //! * `Global` contains only Ctrl/Alt/F-key chords so it never steals typing.
 //! * No screen reads raw keys: every key a screen reacts to is in a table (so help is complete).
 //!
@@ -874,8 +875,12 @@ fn is_chord_or_fkey(ev: &egui::Event) -> bool {
 /// automatically). Returns `None` for unbound events (they flow to egui widgets).
 pub fn resolve(stack: &[KeyContext], ev: &egui::Event) -> Option<Action> {
     let action = resolve_inner(stack, ev)?;
-    // Auto-repeat never steps out of a pane/layer (holding Backspace to clear a filter).
-    if matches!(action, Action::Parent | Action::Back) && matches!(ev, egui::Event::Key { repeat: true, .. }) {
+    // Auto-repeat never steps out of a pane/layer (holding Backspace to clear a filter; a
+    // filtered list's ← has no movement to repeat) and never flips between the last two
+    // channels (the ← that closed a player side panel, held on).
+    let steps_out = matches!(action, Action::Parent | Action::Back | Action::LastChannel)
+        || (action == Action::Left && stack.first() == Some(&KeyContext::ListFiltering));
+    if steps_out && matches!(ev, egui::Event::Key { repeat: true, .. }) {
         return None;
     }
     Some(action)
@@ -956,10 +961,7 @@ const HINTS: &[(KeyContext, &[(Action, &str)])] = &[
         KeyContext::Guide,
         &[(A::Activate, "details"), (A::GuideWatch, "watch"), (A::GuideRemind, "remind"), (A::GuideNow, "now"), (A::ToggleHelp, "help")],
     ),
-    (
-        KeyContext::Panel,
-        &[(A::Activate, "toggle"), (A::Increase, "change"), (A::MoveUp, "reorder"), (A::ContextMenu, "more"), (A::ToggleHelp, "help")],
-    ),
+    (KeyContext::Panel, &[(A::Activate, "toggle"), (A::Right, "change"), (A::MoveUp, "reorder"), (A::ContextMenu, "more"), (A::ToggleHelp, "help")]),
     (KeyContext::EpgMapping, &[(A::Activate, "assign"), (A::ClearEpg, "clear")]),
     (KeyContext::NumericEntry, &[(A::Activate, "go"), (A::FilterBackspace, "delete"), (A::Back, "cancel")]),
     (KeyContext::Search, &[(A::Activate, "open"), (A::ActivateAlt, "details"), (A::FocusNext, "section"), (A::Back, "close")]),
@@ -1094,6 +1096,15 @@ mod tests {
         assert_eq!(resolve(&[K::List], &key_ev(Key::Backspace, false, false, false, true)), None);
         assert_eq!(resolve(&[K::List], &key_ev(Key::Backspace, false, false, false, false)), Some(Action::Parent));
         assert_eq!(resolve(&[K::ListFiltering], &key_ev(Key::Backspace, false, false, false, true)), Some(Action::FilterBackspace));
+        // a held ←: a filtered list steps out once, the player behind it never zaps on repeat;
+        // held arrows still move in a grid and still change a Settings value
+        let held = |k, shift| key_ev(k, false, false, shift, true);
+        assert_eq!(resolve(&[K::ListFiltering], &held(Key::ArrowLeft, false)), None);
+        assert_eq!(resolve(&[K::ListFiltering, K::PlayerLive], &held(Key::ArrowLeft, false)), None);
+        assert_eq!(resolve(&[K::PlayerLive], &held(Key::ArrowLeft, false)), None, "no LastChannel flip-flop");
+        assert_eq!(resolve(&[K::PlayerLive], &key(Key::ArrowLeft, false)), Some(Action::LastChannel));
+        assert_eq!(resolve(&[K::PosterGrid], &held(Key::ArrowLeft, false)), Some(Action::Left));
+        assert_eq!(resolve(&[K::Panel], &held(Key::ArrowLeft, true)), Some(Action::Decrease));
     }
 
     #[test]
@@ -1132,7 +1143,7 @@ mod tests {
         assert!(rows.iter().any(|(k, h)| *h == "Back to the page list" && k == "← / h"), "{rows:?}");
         assert!(rows.iter().any(|(k, h)| *h == "Increase / next option" && k == "→ / l / Shift+→ / L"), "{rows:?}");
         assert!(rows.iter().any(|(k, h)| *h == "Decrease / previous option" && k == "Shift+← / H"), "{rows:?}");
-        assert!(hint_line(&[K::Panel]).contains("Shift+→ change"), "{}", hint_line(&[K::Panel]));
+        assert!(hint_line(&[K::Panel]).contains("→ change") && !hint_line(&[K::Panel]).contains("Shift+"), "{}", hint_line(&[K::Panel]));
     }
 
     #[test]
