@@ -2380,8 +2380,30 @@ prefer-dark/light). `hypr::focus_self` uses Hyprland 0.56's Lua dispatcher
   rendering on other workspaces (§11.1), optional idle fallback and Super+Shift+T binding),
   `packaging/omarchy/omarchy-menu.jsonc` (TV submenu), `packaging/PKGBUILD` (x86_64 + aarch64,
   depends mpv/xz/fontconfig/JetBrains Mono Nerd/wayland/mesa; builds the local checkout into
-  `packaging/src/target`, installs the snippets under `/usr/share/tuner/` and the docs under
-  `/usr/share/doc/tuner/`; the licence is the common SPDX text, so no licence file is installed).
+  `packaging/src/target`, installs the snippets under `/usr/share/tuner/`, the docs under
+  `/usr/share/doc/tuner/` and `LICENSE` under `/usr/share/licenses/omatuner/`).
+* **Names**: the repository (<https://github.com/rthoms334/omatuner>) and the Arch package
+  (`pkgname=omatuner`) are *omatuner*; everything the user sees or configures keeps *tuner*: the
+  app name "Tuner", the command `/usr/bin/tuner`, the desktop entry/icon/app id `tuner`, the
+  config/data/state/cache folders, the MPRIS name and `/usr/share/{tuner,doc/tuner}`. No
+  `provides`/`conflicts`: no package of this app was ever published under another name.
+* **Releases** (`.github/workflows/release.yml`): a pushed tag `v<version>` or
+  `v<version>-<suffix>` (`<version>` must equal `Cargo.toml`'s; the PKGBUILD's `prepare()` checks
+  `pkgver` against it too; the suffix is lowercase letters, digits and dots starting with a letter,
+  and a pre-release builds `pkgver=<version><suffix>`, e.g. `0.1.0rc4`, which pacman orders
+  before `0.1.0`) builds the PKGBUILD with makepkg as an unprivileged user in
+  `archlinux:base-devel` (x86_64, on `ubuntu-24.04`) and `menci/archlinuxarm:base-devel`
+  (aarch64, natively on `ubuntu-24.04-arm`; pinned by digest in the release workflow, floating in
+  CI), and publishes a GitHub Release (`--generate-notes`; a tag with a suffix is a pre-release;
+  re-running a failed publish re-uploads into the existing release) with
+  `omatuner-<pkgver>-<rel>-<arch>.pkg.tar.zst`, `omatuner-<pkgver>-<arch>.tar.gz` (binary, desktop entry, icon, snippets, README, LICENSE) and
+  `SHA256SUMS`. A manual run with `publish=false`, and every pull request that touches
+  `packaging/`, `Cargo.*` or the workflow, is a dry run (workflow artifacts only).
+* **CI** (`.github/workflows/ci.yml`): pull requests and pushes to `main`, same two containers:
+  `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo build
+  --all-targets --locked`, `scripts/gen-test-media.sh`, then `dbus-run-session -- cargo test
+  --locked` (MPRIS and notification tests need a session bus; mpv runs with `vo=null`/`ao=null`;
+  kittest UI tests are headless). The soak test stays `#[ignore]`d.
 * User install without a package: `cargo install --path .`, copy the desktop file to
   `~/.local/share/applications/`, icon to `~/.local/share/icons/hicolor/scalable/apps/`, merge the
   Hyprland and menu snippets. The Hyprland snippet is a module: `~/.config/hypr/tuner.lua` +
