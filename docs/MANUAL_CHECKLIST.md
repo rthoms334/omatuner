@@ -603,3 +603,38 @@ Use a real Xtream account whose categories cover many countries (≈ 60 tags: "U
   and footer say "categories".
 - [ ] **Badges:** with smart names on, "UK | Sports" and "US | Sports" read "Sports" with a
   muted UK / US badge; with smart names off, "|UK| Sports" has no extra badge.
+
+## 15. Quality badges (real provider)
+
+Use a provider that lists the same channel several times in different qualities (e.g.
+"UK: BBC One SD / HD / FHD / 4K", often also "ᴴᴰ" or "1080p" names), at **Wide** and **Tiled**,
+**text 12** and **text 16**.
+
+- [ ] **Duplicates show distinct badges:**
+  - **Do:** after this build's first start (the migration fills the badges of the existing
+    library without a refresh), open the group with the duplicates in Live TV, the guide, Search
+    (`/` + the channel name), the player's channel list (`c`) and mini guide (`g`), and a Home
+    favourites rail holding two of them.
+  - **Expect:**
+    - Each copy shows its badge (SD, HD, FHD, 4K) right after the same name, in the muted badge
+      look (monospace, thin border), never clipped. A channel with no quality word has none.
+    - The copies are listed best first (4K, FHD, HD, SD) in their group; other channels keep
+      the provider's order (also "2160p" / "576p" names). ↑/↓ in the player zaps in that order,
+      and the zap banner shows the badge of the copy it tunes to until the picture comes up
+      (then only the decoded badge on the right, no second "FHD").
+    - In a narrow list (Home tiles, the guide column at Tiled, the player's list) a long name
+      gets the ellipsis and the badge stays; only in a very narrow cell does the name keep the
+      room. Radio channels have no badge.
+- [ ] **The measured value replaces a wrong name tag after playback:**
+  - **Do:** play a copy whose name claims more than it delivers (a "4K" that plays at 1080p;
+    stream info, `I`, shows the real size), and a channel without a quality word.
+    Leave the player and look at their rows; then restart Tuner and refresh the playlist.
+  - **Expect:** as soon as each plays, its badge shows the real class (FHD for the 1080p "4K";
+    SD/HD/FHD for the untagged one) in every list, and it stays so after the restart and the
+    refresh. A 1440p stream reads FHD. If the provider reorders its copies (or adds one), each
+    copy keeps its own measured badge after the next refresh; a copy the provider renames
+    ("HD" → "FHD") shows its new name's badge until it plays again.
+- [ ] **Setting:**
+  - **Do:** Settings ▸ Interface ▸ Quality badges off, then on.
+  - **Expect:** the badges disappear from every list at once and come back; the Live preview
+    and the player OSD still show the stream's quality.

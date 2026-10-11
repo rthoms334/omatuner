@@ -3,14 +3,15 @@
 
 mod support;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::Connection;
 use support::seed;
 use tuner::model::*;
 use tuner::redact::Secret;
 use tuner::sources::identity::{group_key, normalize_name, url_key};
-use tuner::store::import::{self, ImportChannel, ImportGroup, ImportMovie, ImportSeries, ImportSummary};
+use tuner::sources::smart_names::clean_channel_name;
+use tuner::store::import::{self, ImportChannel, ImportGroup, ImportMovie, ImportSeries, ImportSummary, NameQuality};
 use tuner::store::{Store, epg, library, live, sources, user, vod};
 
 const NOW: Timestamp = 1_791_576_000;
@@ -58,6 +59,7 @@ fn chan(key: &str, name: &str, tvg: Option<&str>, grp: &str, url: &str, order: i
         provider_order: order,
         added_at: None,
         groups: vec![group_key(ItemKind::Channel, grp)],
+        quality: None,
     }
 }
 
@@ -577,6 +579,115 @@ fn reattach_steps_renamed_group_url_and_ambiguous_names() {
     let (from, to) = (ch_ref(src, "m3u:b"), ch_ref(src, "m3u:b3"));
     w(&s, move |c| user::reassign(c, &from, &to));
     assert_eq!(holders(&r, &ch_ref(src, "m3u:b3")).len(), 5);
+    assert!(user::orphans(&r).unwrap().is_empty());
+}
+
+/// Quality badges (DESIGN §6): the name's quality word is stored at import; a measured size
+/// beats it in the library, survives a refresh, follows the channel to a new key (reattach
+/// steps) and is dropped with a channel that is gone — never listed as an orphan.
+#[test]
+fn measured_quality_beats_the_name_and_follows_the_channel() {
+    let (s, src, _) = reattach_setup("tuner-st-quality");
+    let named = |key: &str, name: &str, url: &str, order| ImportChannel {
+        quality: NameQuality::of(&clean_channel_name(name)),
+        ..chan(key, name, None, "UK", url, order)
+    };
+    let v1 = vec![
+        named("m3u:a", "BBC One 4K", "http://cdn/bbc4k.ts", 0),
+        named("m3u:b", "BBC One HD", "http://cdn/bbchd.ts", 1),
+        named("m3u:c", "ITV", "http://cdn/itv.ts", 2),
+    ];
+    run_import(&s, src, v1.clone(), vec![], vec![], vec![ItemKind::Channel], NOW);
+    let r = s.reader().unwrap();
+    let quality =
+        || -> HashMap<String, Option<Quality>> { library::load(&r).unwrap().live.channels.iter().map(|c| (c.key.0.clone(), c.quality)).collect() };
+    assert_eq!(quality(), HashMap::from([("m3u:a".into(), Some(Quality::Uhd)), ("m3u:b".into(), Some(Quality::Hd)), ("m3u:c".into(), None)]));
+
+    // the "4K" one plays at 1080p, the untagged one turns out SD
+    w(&s, move |c| {
+        live::record_video(c, &ch_ref(src, "m3u:a"), 1920, 1080, NOW)?;
+        live::record_video(c, &ch_ref(src, "m3u:c"), 720, 576, NOW)
+    });
+    let measured = HashMap::from([("m3u:a".into(), Some(Quality::Fhd)), ("m3u:b".into(), Some(Quality::Hd)), ("m3u:c".into(), Some(Quality::Sd))]);
+    assert_eq!(quality(), measured);
+    run_import(&s, src, v1, vec![], vec![], vec![ItemKind::Channel], NOW + 10);
+    assert_eq!(quality(), measured, "a refresh keeps both");
+
+    // re-keyed (same stream path, rotated token): the measurement follows; ITV is gone
+    let v2 = vec![named("m3u:a2", "BBC One 4K", "http://cdn/bbc4k.ts?token=2", 0), named("m3u:b", "BBC One HD", "http://cdn/bbchd.ts", 1)];
+    run_import(&s, src, v2, vec![], vec![], vec![ItemKind::Channel], NOW + 20);
+    assert_eq!(quality(), HashMap::from([("m3u:a2".into(), Some(Quality::Fhd)), ("m3u:b".into(), Some(Quality::Hd))]));
+    assert_eq!(count(&r, "SELECT count(*) FROM channel_video"), 1);
+    assert!(user::orphans(&r).unwrap().is_empty());
+}
+
+/// The quality copies of an M3U channel share a base key and are numbered by playlist position
+/// (`KeyAllocator`), so a reordered or grown playlist moves keys between them: a measurement
+/// follows its copy (provider name), not the slot; a renamed copy drops it. Copies the identity
+/// key tells apart ("2160p") are still one family for best-first ordering.
+#[test]
+fn measured_quality_follows_the_copy_not_its_slot() {
+    use tuner::jobs::import_source::m3u_entry_to_channel;
+    use tuner::sources::identity::KeyAllocator;
+    use tuner::sources::m3u::M3uEntry;
+    let (s, src, _) = reattach_setup("tuner-st-quality-slots");
+    let playlist = |entries: &[(&str, &str)]| {
+        let mut keys = KeyAllocator::default();
+        let entries = entries.iter().enumerate().map(|(i, (name, url))| {
+            let e = M3uEntry {
+                title: (*name).into(),
+                tvg_id: Some("bbc1.uk".into()),
+                groups: vec!["UK".into()],
+                url: (*url).into(),
+                ..Default::default()
+            };
+            m3u_entry_to_channel(&e, i as i32, false, &mut keys, &mut Vec::new())
+        });
+        entries.collect::<Vec<_>>()
+    };
+    let r = s.reader().unwrap();
+    // raw name → quality, and the names in the default (best-first) order
+    let state = || {
+        let lib = library::load(&r).unwrap();
+        let by_name: HashMap<String, Option<Quality>> = lib.live.channels.iter().map(|c| (c.name.to_string(), c.quality)).collect();
+        let order = lib.live.collection(&Collection::AllChannels, &lib.favs, &[], SortMode::Provider);
+        let order: Vec<String> = order.iter().map(|id| lib.live.get(*id).unwrap().name.to_string()).collect();
+        (by_name, order)
+    };
+
+    let v1 = playlist(&[("BBC One HD", "http://cdn/hd.ts"), ("BBC One 4K", "http://cdn/4k.ts")]);
+    assert_eq!(v1[1].key.0, format!("{}#2", v1[0].key.0), "the copies share a base key");
+    let (hd, uhd) = (ch_ref(src, &v1[0].key.0), ch_ref(src, &v1[1].key.0));
+    run_import(&s, src, v1, vec![], vec![], vec![ItemKind::Channel], NOW);
+    // both deliver less than their names say
+    w(&s, move |c| {
+        live::record_video(c, &hd, 720, 576, NOW)?;
+        live::record_video(c, &uhd, 1920, 1080, NOW)
+    });
+
+    // the provider puts a new FHD copy first: every key moves to another copy
+    let v2 = playlist(&[("BBC One FHD", "http://cdn/fhd.ts"), ("BBC One 4K", "http://cdn/4k.ts"), ("BBC One HD", "http://cdn/hd.ts")]);
+    run_import(&s, src, v2, vec![], vec![], vec![ItemKind::Channel], NOW + 10);
+    let st = state();
+    assert_eq!(st.0["BBC One FHD"], Some(Quality::Fhd), "its name: not the HD copy's measurement");
+    assert_eq!(st.0["BBC One 4K"], Some(Quality::Fhd), "measured");
+    assert_eq!(st.0["BBC One HD"], Some(Quality::Sd), "measured");
+    assert_eq!(st.1, ["BBC One FHD", "BBC One 4K", "BBC One HD"], "best first, equal ones keep their order");
+
+    // the HD copy is renamed: its old measurement goes; a 2160p copy is one of the family
+    let v3 = playlist(&[
+        ("BBC One FHD", "http://cdn/fhd.ts"),
+        ("BBC One 4K", "http://cdn/4k.ts"),
+        ("BBC One 1080p", "http://cdn/hd.ts"),
+        ("BBC One 2160p", "http://cdn/uhd.ts"),
+    ]);
+    assert_ne!(v3[3].norm_name, v3[0].norm_name, "identity keeps 2160p in the name");
+    run_import(&s, src, v3, vec![], vec![], vec![ItemKind::Channel], NOW + 20);
+    let st = state();
+    assert_eq!(st.0["BBC One 1080p"], Some(Quality::Fhd), "the new name's word, not the old measurement");
+    assert_eq!(st.0["BBC One 4K"], Some(Quality::Fhd), "still measured");
+    assert_eq!(st.1[0], "BBC One 2160p");
+    assert_eq!(count(&r, "SELECT count(*) FROM channel_video"), 1);
     assert!(user::orphans(&r).unwrap().is_empty());
 }
 

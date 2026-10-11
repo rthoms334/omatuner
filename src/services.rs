@@ -309,6 +309,10 @@ impl PlayerStore for WriterPlayerStore {
             None => crate::store::live::clear_failure(c, &item),
         });
     }
+    fn record_video(&mut self, item: ItemRef, width: i64, height: i64) {
+        // no DataScope: the UI shows this session's measurements itself (`ui::data::MeasuredQuality`)
+        let _ = self.0.submit(move |c| crate::store::live::record_video(c, &item, width, height, crate::model::now()));
+    }
 }
 
 /// `stream_failure.reason`: the kind in kebab case (`HttpForbidden` → `http-forbidden`,

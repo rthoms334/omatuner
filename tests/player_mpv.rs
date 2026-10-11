@@ -35,6 +35,7 @@ struct Recorded {
     progress: Arc<Mutex<Vec<WatchProgress>>>,
     history: Arc<Mutex<Vec<HistoryEntry>>>,
     failures: FailureLog,
+    video: Arc<Mutex<Vec<(ItemRef, i64, i64)>>>,
 }
 
 struct RecordingStore(Recorded);
@@ -48,6 +49,9 @@ impl PlayerStore for RecordingStore {
     }
     fn record_failure(&mut self, item: ItemRef, kind: Option<PlayerErrorKind>) {
         self.0.failures.lock().unwrap().push((item, kind));
+    }
+    fn record_video(&mut self, item: ItemRef, width: i64, height: i64) {
+        self.0.video.lock().unwrap().push((item, width, height));
     }
 }
 
@@ -545,6 +549,16 @@ fn fast_zaps_coalesce_into_one_connection() {
     h.wait_snapshot(LONG, |s| s.playable.as_ref().is_some_and(|p| p.media == chans[0].media));
     h.wait_state_from(mark, LONG, is_playing);
     assert_eq!(h.snapshot().previous_live.as_ref().map(|p| p.media.clone()), Some(chans[2].media.clone()));
+    // the measured size (quality badge) goes to the channels that played, never to the one
+    // zapped over or to the next channel while the old picture is still up
+    h.wait_snapshot(LONG, |s| s.video_size.is_some());
+    std::thread::sleep(Duration::from_millis(300));
+    let video = h.rec.video.lock().unwrap().clone();
+    let sizes = |c: &Playable| video.iter().filter(|(i, ..)| Some(i) == c.item.as_ref()).map(|(_, w, h)| (*w, *h)).collect::<Vec<_>>();
+    let first = sizes(&chans[0]);
+    assert!(!first.is_empty() && first.iter().all(|s| *s == (320, 180)), "{video:?}");
+    assert!(sizes(&chans[1]).is_empty(), "{video:?}");
+    assert_eq!(sizes(&chans[2]), [(640, 360)], "{video:?}");
 }
 
 #[test]

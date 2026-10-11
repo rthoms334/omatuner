@@ -46,6 +46,11 @@ on-screen controls, and a light theme (catppuccin-latte).
   - Keep only the countries and languages you want from a provider's categories
     ("UK | Sports", "[FR] Films", "AR: News"…), including categories the provider adds later.
   - Type a channel number to jump to it.
+  - Quality badges (SD, HD, FHD, 4K) next to channel names, so the SD/HD/4K copies of a channel
+    are told apart without playing each one; the best copy is listed first. A badge comes from
+    the provider's name until the channel plays, then from the resolution it really plays at
+    (a "4K" channel that plays at 1080p shows FHD). Settings ▸ Interface ▸ Quality badges
+    turns them off.
 - **TV guide:** an EPG grid with programme details, reminders and catch-up.
   - XMLTV guides can come from a URL or a file (gz/xz).
   - Several guides can be ranked by priority, each with its own time offset.

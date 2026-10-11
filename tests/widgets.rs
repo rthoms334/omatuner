@@ -871,6 +871,8 @@ fn data_rows_render_with_real_services() {
         provider_order: 0,
         user_order: None,
         added_at: None,
+        quality: None,
+        family: 0,
     };
     let prog = |id, title: &str, start, stop| ProgrammeSlim {
         id: ProgrammeId(id),

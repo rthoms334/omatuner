@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align2, Color32, FontId, Rect};
 
 use crate::keymap::{Action, KeyContext};
-use crate::model::{ChannelId, Collection, EpisodeId, ItemRef, MediaRef, PlayOrigin, PlayableKind};
+use crate::model::{ChannelId, Collection, EpisodeId, ItemRef, MediaRef, PlayOrigin, PlayableKind, Quality};
 use crate::msg::{AppEvent, Toast};
 use crate::player::{PlayRequest, PlayerCommand, PlayerEvent, PlayerSnapshot, PlayerState};
 use crate::store::library::LiveIndex;
@@ -46,6 +46,7 @@ use crate::ui::layout::osd_scale;
 use crate::ui::overlays::OverlayResult;
 use crate::ui::screens::live::{self, GuideStatus, playing_channel};
 use crate::ui::video_host::{Placement, osd_text};
+use crate::ui::widgets::badge::{InlineBadge, name_with_quality};
 use crate::ui::widgets::list::{ListOutcome, ListState};
 use crate::ui::widgets::{glyphs, logo, slider};
 use crate::ui::{NavRequest, OverlayRequest, Route, Screen, ScreenId, UiCtx};
@@ -576,14 +577,20 @@ impl PlayerScreen {
             t.osd_text,
             f32::INFINITY,
         );
-        let title = playable.as_ref().map(|p| p.title.as_str()).unwrap_or("");
-        osd_text(&p, egui::pos2(x, top.center().y), Align2::LEFT_CENTER, title, title_font.clone(), t.osd_text, (cr.left() - pad - x).max(0.0));
-
-        // ---- bottom bar
         let ch = playable.as_ref().and_then(|p| match p.media {
             MediaRef::Channel(id) | MediaRef::Catchup { channel: id, .. } => ctx.lib.live.get(id).cloned(),
             _ => None,
         });
+        let title = playable.as_ref().map(|p| p.title.as_str()).unwrap_or("");
+        // a zap shows which of the SD / HD / 4K duplicates this is before the picture does;
+        // once it plays, the decoded badge on the right says it
+        let decoded = snap.state == PlayerState::Playing && snap.video_size.is_some();
+        let quality = ch.as_ref().filter(|_| live && !decoded).and_then(|c| ctx.quality(c));
+        let badge = quality.map(|q| InlineBadge::quality(&p, theme, q, t.osd_text, s));
+        let max_w = (cr.left() - pad - x).max(0.0);
+        name_with_quality(&p, theme, egui::pos2(x, top.center().y), title, title_font.clone(), t.osd_text, badge, max_w);
+
+        // ---- bottom bar
         let nn = ch.as_ref().filter(|_| live).and_then(|c| live::now_next_of(ctx, c));
         let controls = Self::controls(snap, narrow);
         let ctrl_h = (theme.space(SpaceToken::ControlHeight) * s * 1.2).round();
@@ -761,12 +768,8 @@ impl PlayerScreen {
     fn badges(&self, p: &egui::Painter, theme: &Theme, snap: &PlayerSnapshot, catchup: bool, right_center: egui::Pos2, font: FontId, s: f32) -> Rect {
         let t = &theme.tokens;
         let mut labels: Vec<String> = Vec::new();
-        if let Some((_, h)) = snap.video_size {
-            labels.push(match h {
-                h if h >= 2000 => "4K".into(),
-                h if h >= 700 => "HD".into(),
-                _ => "SD".into(),
-            });
+        if let Some(q) = snap.video_size.and_then(|(w, h)| Quality::of_video(w, h)) {
+            labels.push(q.label().into());
         }
         if snap.stream_info.as_ref().is_some_and(|i| i.is_hdr()) {
             labels.push("HDR".into());
@@ -900,7 +903,8 @@ impl PlayerScreen {
                 let g = osd_text(&p, egui::pos2(x, line_y), Align2::LEFT_CENTER, glyphs::PLAY, small.clone(), t.osd_accent, f32::INFINITY);
                 x = g.right() + pad / 3.0;
             }
-            osd_text(&p, egui::pos2(x, line_y), Align2::LEFT_CENTER, &ch.name, font.clone(), color, r.right() - pad / 2.0 - x);
+            let badge = ctx.quality(&ch).map(|q| InlineBadge::quality(&p, theme, q, with_alpha(t.osd_text, 0.7), s));
+            name_with_quality(&p, theme, egui::pos2(x, line_y), &ch.name, font.clone(), color, badge, r.right() - pad / 2.0 - x);
             if mini {
                 let nn = live::now_next_of(ctx, &ch);
                 let h24 = ctx.config.interface.clock_24h;
