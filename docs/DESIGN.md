@@ -1715,7 +1715,7 @@ provider groups (renamed/reordered/hidden per overrides; locked show 󰌾 and re
   its playlist: `All playlists › Sports · TV 2`.
 
 Medium (≈ 790): the preview stays on the RIGHT; groups become a drawer (← / Backspace on the
-channel list, or click the breadcrumb):
+channel list — ← also while it filters, keeping the filter — or click the breadcrumb):
 ```
 ┌──┬────────────────────────────────┬─────────────────────────────┐
 │󰋜 │ UK News ▾  (filter…)           │ ┌─────────────────────────┐ │
@@ -1928,7 +1928,8 @@ The OSD has two layers (UX review B1):
 
 Side panels: channel list `c` (current collection with now), mini guide `g` (now/next for the
 group), history `h`/→ — each with key contexts `[List|ListFiltering, PlayerLive]`: ↑/↓ move the
-panel cursor (no zap), Enter tunes, ←/Esc close, letters filter. Mouse: a ✕ in the header, the
+panel cursor (no zap), Enter tunes, ←/Esc close (← also while the panel filters; Esc clears the
+filter first), letters filter. Mouse: a ✕ in the header, the
 wheel scrolls, hovering moves the cursor only with real pointer motion, one click tunes and
 keeps the panel open for the next channel. Stream info `I` (codec,
 resolution, fps, pixel format, HDR badge from gamma pq/hlg, audio codec/layout/rate, bitrates,
@@ -1975,8 +1976,14 @@ button.
 │        │   About & logs       │                                                             │
 └────────┴──────────────────────┴─────────────────────────────────────────────────────────────┘
 ```
-Panel idiom (h/j/k/l allowed, Enter toggles, ←/→ adjust; focused text fields push
-`TextInput`, which owns ←/→/Delete/Space). Reorderable rows (playlists, **EPG source priority**,
+Panel idiom (h/j/k/l allowed, Enter toggles; ← / h steps back to the page list from every row
+(§15.1 spatial panes; the source editor and the attach view stay open), → / l / Shift+→ / L
+increase or pick the next option, Shift+← / H decrease or pick the previous one; → / Enter / Tab
+in the page list return to the page; focused text fields push `TextInput`, which owns
+←/→/Delete/Space). A source editor with unsaved changes keeps its page: ↑/↓, Esc or a click in
+the page list show "Unsaved playlist changes: Enter on Save, or Esc to discard" and return the
+highlight to the editor instead of dropping them (Esc there then discards).
+Reorderable rows (playlists, **EPG source priority**,
 favourites lists) show a 󰇙 drag grip and move with Alt+↑/↓ or K/J. Every edit goes through
 `ctx.edit_config` / the store and applies live (`PlayerCommand::ApplyConfig`). Settings list:
 
@@ -2172,8 +2179,27 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
     contexts below it are never consulted (typing a space in Rename can't confirm the dialog).
   * Modal swallows printable text it doesn't bind; PlayerOsd, PopOut, NumericEntry and
     EpgMapping fall through to the context below.
-  * Key auto-repeat never produces `Parent`/`Back` (holding Backspace to clear a filter stops at
-    the empty filter).
+  * Key auto-repeat never produces `Parent`/`Back`, a filtered list's `Left` or `LastChannel`
+    (holding Backspace to clear a filter stops at the empty filter; holding ← steps out of a
+    filtered list once, and the ← that closed a player side panel never zaps).
+* **Spatial panes** (Omarchy style: arrows move the highlight between side-by-side panes): ← at
+  the left edge of the focused pane steps to the pane on its left wherever one exists; → (or
+  Enter) opens / moves right; Tab, Shift+Tab and Esc are unchanged; the mouse is unaffected.
+  * Lists: ← is `Parent` in `List`; in `ListFiltering` it is `Left`, which `ListState` turns
+    into `Parent` whatever the filter (the filter is kept for when the pane is focused again).
+    Backspace stays `Parent` only on an empty filter (one frame can carry "a" + Backspace).
+    Live: channels → groups (the drawer at Medium, the groups pane at Compact); EPG mapping:
+    candidates → channels; menus and pickers close; a player side panel closes.
+  * Grids: ←/→ move between posters; ← on the first column is `Parent` → the categories
+    (drawer at Medium) — also while filtering (the filter is kept) and on an empty grid.
+  * Settings: ← / h is the page list from every content row; values change with → / l and
+    Shift+←/→ / H / L (Interface is almost all value rows, so "← changes a value where there
+    is one" would almost never reach the page list). The page list has nothing on its left.
+  * ←/→ keep their own meaning where there is no pane to the left or they move within the
+    pane: the guide (← is the previous programme, into the past for catch-up; the channel
+    column never takes focus), Home rails, detail pages, the player (seek / zap / OSD), text
+    fields (cursor), onboarding and Edit information (values), Search (no cursor; sections
+    are Tab filters). The app sidebar is never reached with ← (Alt+digits switch screens).
   * `Global` contains only Ctrl/Alt/F-key chords so it never steals typing.
   * **No screen reads raw keys**: every key is in a table, so help and hints are complete.
 * **Esc ladder**: clear filter → close overlay/side panel → leave OSD controls focus → hide the
@@ -2294,6 +2320,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `PgUp` / `PgDn` | Page up / down |
 | `Enter` | Play here / open (playing → fullscreen) |
 | `Shift+Enter` | Play fullscreen |
+| `←` | Back to the previous pane |
 | `Backspace` | Delete character |
 | `Ctrl+Backspace` | Delete word |
 | `Ctrl+U` / `Esc` | Clear filter |
@@ -2599,8 +2626,9 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | Keys | Action |
 |---|---|
 | `↑` / `k` / `↓` / `j` | Move |
-| `←` / `h` | Decrease / previous option |
-| `→` / `l` | Increase / next option |
+| `←` / `h` | Back to the page list |
+| `→` / `l` / `Shift+→` / `L` | Increase / next option |
+| `Shift+←` / `H` | Decrease / previous option |
 | `Alt+↑` / `K` / `Alt+↓` / `J` | Move up / down (reorder: EPG priority, playlists, lists) |
 | `Tab` / `Shift+Tab` | Next / previous section |
 | `Enter` / `Space` | Toggle / open |
@@ -3920,7 +3948,8 @@ FR→fr, DE/AT→de, ES/MX/AR…→es, IT→it, PT/BR→pt, NL→nl, TR→tr, PL
 ### 28.5 Settings ▸ Hidden
 * **Hidden by the category filter** — one section per filtered source: a row per hidden tag
   ("Arabic · 112 categories · 4 380 channels"), Enter = **show this country** (adds the tag
-  to `keep`; toast "Arabic shown"), → expands the tag's categories in place (← collapses);
+  to `keep`; toast "Arabic shown"), → expands the tag's categories in place (Shift+← collapses;
+  ← is the page list);
   Enter on a category row shows just that one (`show_group(…, exempt: true)`). Expanded tags
   show a down chevron and their category rows' detail starts with the tag ("Arabic · Live TV ·
   Enter shows just this one"). A last row "Choose countries…" opens the picker. A playlist

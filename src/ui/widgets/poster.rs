@@ -75,8 +75,9 @@ impl GridState {
     }
 
     /// Apply a `PosterGrid(Filtering)` action. Moves past an edge are `None` (no wrap), except
-    /// ← on the first column which reports `Parent` (back to the categories pane) like
-    /// Backspace on an empty filter.
+    /// ← on the first column which reports `Parent` (the categories pane on the left, DESIGN
+    /// §15.1 "Spatial panes") — also while filtering (the filter is kept) and on an empty grid —
+    /// like Backspace on an empty filter.
     pub fn handle(&mut self, action: Action) -> ListOutcome {
         let cols = self.columns.max(1);
         let last = self.len.saturating_sub(1);
@@ -94,13 +95,7 @@ impl GridState {
                     self.move_to((self.cursor + cols).min(last))
                 }
             }
-            Action::Left if self.len > 0 && self.cursor.is_multiple_of(cols) => {
-                if self.filter.is_active() {
-                    ListOutcome::None
-                } else {
-                    ListOutcome::Parent
-                }
-            }
+            Action::Left if self.cursor.is_multiple_of(cols) => ListOutcome::Parent,
             Action::Left => self.move_to(self.cursor.saturating_sub(1)),
             Action::Right if self.cursor + 1 < self.len && !(self.cursor + 1).is_multiple_of(cols) => self.move_to(self.cursor + 1),
             Action::Right => ListOutcome::None,
@@ -705,6 +700,7 @@ mod tests {
         for a in [Action::Down, Action::Right, Action::End, Action::Activate, Action::ContextMenu] {
             assert_eq!(empty.handle(a), ListOutcome::None, "{a:?}");
         }
+        assert_eq!(empty.handle(Action::Left), ListOutcome::Parent, "an empty grid still leads back to the categories");
     }
 
     #[test]
@@ -717,7 +713,12 @@ mod tests {
         assert_eq!(g.cursor, 0);
         assert_eq!(g.key_context(), KeyContext::PosterGridFiltering);
         assert_eq!(g.handle(Action::Parent), ListOutcome::None);
-        assert_eq!(g.handle(Action::Left), ListOutcome::None, "← at the edge keeps the filter");
+        assert_eq!(g.handle(Action::Left), ListOutcome::Parent, "← on the first column steps out while filtering too");
+        assert_eq!(g.filter.query(), "m", "and keeps the filter");
+        g.set_len(5);
+        g.select(1);
+        assert_eq!(g.handle(Action::Left), ListOutcome::Moved, "inside the row ← moves between posters");
+        assert_eq!(g.cursor, 0);
         assert_eq!(g.handle(Action::FilterBackspace), ListOutcome::FilterChanged);
         assert_eq!(g.handle(Action::Parent), ListOutcome::Parent);
         g.set_len(2);

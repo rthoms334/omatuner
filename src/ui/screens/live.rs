@@ -10,7 +10,8 @@
 //!   started by autoplay (`snapshot.origin == LivePreview`); never from hover.
 //! * Hover moves the cursor only after real pointer motion (Omarchy `pointerGate`).
 //! * Layouts: Wide 3 panes; Medium = channels + preview on the right, groups in a drawer
-//!   (← / Backspace or the breadcrumb); Compact = stack, Enter plays fullscreen.
+//!   (← / Backspace or the breadcrumb; ← also while the channels filter, keeping the filter);
+//!   Compact = stack, Enter plays fullscreen. → / Enter on a group open it in the channels.
 //! * Key contexts: `[List|ListFiltering]` of the focused pane. Owner: WP-11.
 //! * "Also on ● TV 2 (FHD)" (DESIGN §29.16, P3): the preview lists the same channel in other
 //!   playlists — the same normalised name (quality words dropped, `ChannelSummary::family`),
@@ -2424,6 +2425,41 @@ mod tests {
         assert!(!s.channels.is_empty() && s.open_index().is_some(), "{:?}", s.open);
         pick(&mut h, free);
         assert_eq!(h.state().s.channels.len(), 4, "out of All, but its own tab shows it");
+    }
+
+    /// Spatial panes (DESIGN §15.1): ← in a filtered channel list (`Left`, from
+    /// `[ListFiltering]`) focuses the groups — the drawer at Medium — and keeps the filter;
+    /// Esc closes the drawer back to the same filtered channels.
+    #[test]
+    fn left_in_a_filtered_channel_list_opens_the_groups_and_keeps_the_filter() {
+        let (mut t, one) = rig();
+        seed(&mut t, |c| {
+            let a = testkit::source(c, "Alpha")?;
+            testkit::channels(c, a, 12).map(|_| ())
+        });
+        t.layout = LayoutClass::Medium;
+        let mut h = harness(t, one, LiveScreen::default(), egui::vec2(790.0, 800.0));
+        h.state_mut().enter(Route::Live { group: None, channel: None });
+        h.run_steps(2);
+        let app = h.state_mut();
+        let s = &mut app.s;
+        app.t.with_ctx(|ctx| s.open_entry(ctx, Entry::All));
+        h.run_steps(2);
+        assert_eq!(h.state().s.focus, Pane::Channels);
+        h.state_mut().act(Action::FilterInput('1'));
+        h.run_steps(1);
+        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::ListFiltering]);
+        let shown = h.state().s.channel_rows.len();
+        assert!(h.state_mut().act(Action::Left));
+        h.run_steps(1);
+        let s = &h.state().s;
+        assert_eq!((s.focus, s.drawer), (Pane::Groups, true), "← opens the groups drawer");
+        assert_eq!((s.chan_list.filter.query(), s.channel_rows.len()), ("1", shown), "the channel filter is kept");
+        assert_eq!(s.key_contexts(), vec![KeyContext::List]);
+        assert!(h.state_mut().act(Action::Back));
+        let s = &h.state().s;
+        assert_eq!((s.focus, s.drawer), (Pane::Channels, false));
+        assert_eq!(s.key_contexts(), vec![KeyContext::ListFiltering]);
     }
 
     /// DESIGN §20.3: a group's menu offers "Mark as explicit"; choosing it stores the user's
