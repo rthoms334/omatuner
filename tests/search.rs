@@ -57,6 +57,7 @@ fn channel(id: i64, source: i64, name: &str, groups: &[i64], locked: bool) -> Ch
         source_id: SourceId(source),
         key: ItemKey(format!("c{id}")),
         name: Arc::from(name),
+        provider_name: None,
         number: Some(id as u32),
         logo: Some(Arc::from(format!("http://logos.example/{id}.png"))),
         group_ids: groups.iter().map(|g| GroupId(*g)).collect(),

@@ -235,6 +235,7 @@ fn summary(i: i64) -> ChannelSummary {
         source_id: SourceId(1),
         key: ItemKey(format!("k{i}")),
         name: format!("Channel {i}").into(),
+        provider_name: None,
         number: Some(i as u32),
         logo: None,
         group_ids: vec![GroupId(1)],

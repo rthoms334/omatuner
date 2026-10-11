@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 
 use crate::config::PlaylistOnCards;
 use crate::error::Result;
-use crate::model::{ChannelId, ChannelSummary, EpgChannelId, ItemKey, ItemKind, MediaRef, NowNext, ProgrammeSlim, Quality, SourceId, Timestamp};
+use crate::model::{
+    ChannelId, ChannelSummary, EpgChannelId, ItemKey, ItemKind, MediaRef, NowNext, ProgrammeSlim, Quality, QualityBadge, SourceId, Timestamp,
+};
 use crate::player::{PlayerSnapshot, PlayerState};
 use crate::store::library::SourceMeta;
 
@@ -200,9 +202,10 @@ impl MeasuredQuality {
 pub struct QualityBadges<'a>(pub Option<&'a MeasuredQuality>);
 
 impl QualityBadges<'_> {
-    /// Measured this session, else the library's (measured earlier, else from the name).
-    pub fn of(&self, ch: &ChannelSummary) -> Option<Quality> {
-        self.0.and_then(|m| m.get(ch).or(ch.quality))
+    /// Measured this session, else the library's (measured earlier, else from the name —
+    /// `4K?` when the source's claims of that class were often wrong).
+    pub fn of(&self, ch: &ChannelSummary) -> Option<QualityBadge> {
+        self.0.and_then(|m| m.get(ch).map(|q| QualityBadge::measured(q, ch.quality.and_then(|b| b.claimed))).or(ch.quality))
     }
 }
 
@@ -286,6 +289,7 @@ mod tests {
             source_id: SourceId(1),
             key: ItemKey(key.into()),
             name: Arc::from("BBC One"),
+            provider_name: None,
             number: None,
             logo: None,
             group_ids: vec![],
@@ -299,7 +303,7 @@ mod tests {
             provider_order: 0,
             user_order: None,
             added_at: None,
-            quality: Some(Quality::Uhd),
+            quality: Some(QualityBadge::named(Quality::Uhd, false)),
             family: 0,
         };
         let mut snap = PlayerSnapshot { state: PlayerState::Zapping { until: Instant::now() }, video_size: Some((1920, 1080)), ..Default::default() };
@@ -323,8 +327,8 @@ mod tests {
         snap.state = PlayerState::Playing;
         m.observe(&snap);
         let on = QualityBadges(Some(&m));
-        assert_eq!(on.of(&ch("a")), Some(Quality::Fhd), "measured beats the name");
-        assert_eq!(on.of(&ch("b")), Some(Quality::Uhd), "same id, another channel");
+        assert_eq!(on.of(&ch("a")), Some(QualityBadge::measured(Quality::Fhd, Some(Quality::Uhd))), "measured beats the name");
+        assert_eq!(on.of(&ch("b")).map(|b| b.label()), Some("4K"), "same id, another channel");
         assert_eq!(QualityBadges(None).of(&ch("a")), None, "badges off");
     }
 

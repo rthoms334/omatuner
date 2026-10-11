@@ -494,6 +494,24 @@ impl Drop for EpgSearch {
     }
 }
 
+/// A typed character into a filter / search query: leading whitespace is ignored and any
+/// whitespace (AltGr+Space types a no-break space) becomes a plain space.
+pub fn push_typed(query: &mut String, c: char) {
+    if query.is_empty() && c.is_whitespace() {
+        return;
+    }
+    query.push(if c.is_whitespace() { ' ' } else { c });
+}
+
+/// Ctrl+Backspace in a filter / search query: drop trailing whitespace and the word before
+/// it. Cuts after the whitespace *character* (a pasted no-break or ideographic space is
+/// several bytes: a byte offset + 1 would split it and panic).
+pub fn delete_last_word(query: &mut String) {
+    let trimmed = query.trim_end();
+    let cut = trimmed.char_indices().rev().find(|(_, c)| c.is_whitespace()).map_or(0, |(i, c)| i + c.len_utf8());
+    query.truncate(cut);
+}
+
 /// Type-to-filter for one list (channels of a group, groups, episodes, settings rows).
 pub struct ListFilter {
     matcher: nucleo_matcher::Matcher,
@@ -514,18 +532,14 @@ impl ListFilter {
         !self.query.is_empty()
     }
     pub fn push(&mut self, c: char) {
-        if !(self.query.is_empty() && c.is_whitespace()) {
-            self.query.push(c);
-        }
+        push_typed(&mut self.query, c);
     }
     pub fn backspace(&mut self) {
         self.query.pop();
     }
     /// Delete the last word (Ctrl+Backspace).
     pub fn delete_word(&mut self) {
-        let trimmed = self.query.trim_end();
-        let cut = trimmed.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
-        self.query.truncate(cut);
+        delete_last_word(&mut self.query);
     }
     pub fn clear(&mut self) {
         self.query.clear();
@@ -572,6 +586,7 @@ mod tests {
             source_id: SourceId(1),
             key: ItemKey(format!("k{id}")),
             name: Arc::from(name),
+            provider_name: None,
             number: Some(id as u32),
             logo: None,
             group_ids: vec![],
@@ -850,5 +865,24 @@ mod tests {
             f.push(c);
         }
         assert_eq!(f.apply(items.iter().copied()), vec![0, 1]);
+    }
+
+    /// Ctrl+Backspace after a multi-byte whitespace character used to cut inside it and panic
+    /// (a no-break space typed with AltGr+Space, an ideographic space pasted in).
+    #[test]
+    fn delete_word_after_multibyte_whitespace() {
+        let mut f = ListFilter::default();
+        for c in "bbc\u{a0}one\u{a0}".chars() {
+            f.push(c);
+        }
+        assert_eq!(f.query(), "bbc one ", "typed whitespace becomes a plain space");
+        f.delete_word();
+        assert_eq!(f.query(), "bbc ");
+        for (raw, want) in [("bbc\u{a0}one", "bbc\u{a0}"), ("ニュース\u{3000}東京\u{3000}", "ニュース\u{3000}"), ("one", ""), ("\u{2003}", "")]
+        {
+            let mut q = raw.to_owned();
+            delete_last_word(&mut q);
+            assert_eq!(q, want, "{raw:?}");
+        }
     }
 }

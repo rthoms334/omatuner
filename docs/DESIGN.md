@@ -854,6 +854,31 @@ CREATE TABLE IF NOT EXISTS channel_video (        -- what mpv decoded when the c
   pre-merge build of this branch (v2 with the quality columns but no `grp.raw_name`) gets the
   category-filter columns from `migrations::reconcile_renumbered` before `0003` re-runs.
 
+### 6.2.2 `0004_name_rules.sql` (quality-label trust §13.0.1, re-cleaned names §9.6)
+
+```sql
+CREATE TABLE IF NOT EXISTS quality_check (       -- trust evidence: one row per measured channel name
+  source_id INTEGER NOT NULL REFERENCES source(id) ON DELETE CASCADE,
+  name      TEXT    NOT NULL,                     -- channel.name (raw provider name) when measured
+  claimed   INTEGER,                              -- channel.quality then (NULL = no quality word)
+  measured  INTEGER NOT NULL,                     -- Quality::of_video of the decoded size
+  at        INTEGER NOT NULL,
+  PRIMARY KEY (source_id, name)
+) WITHOUT ROWID;
+```
+* Written next to `channel_video` by `store::live::record_video` (same trigger: a live,
+  non-radio channel `Playing` at a known size), as an upsert: a channel measured again
+  replaces its row, so zapping one channel fifty times is one channel of evidence and a
+  claim that later plays right stops counting as wrong. Keyed by **name**, not item key: the
+  evidence is about the provider's label, and it outlives refreshes that move keys between
+  quality duplicates. It is never swept by imports (a removed channel's evidence still says
+  how the provider labels); it goes with its source. Not user data (no fingerprint, not in
+  backups).
+* `store::live::label_trust` aggregates it per source (`GROUP BY source_id, claimed,
+  measured`) into `model::LabelTrust` at every `library::load`.
+* The migration's Rust step seeds it from `channel_video` (claim = the quality word of the
+  name each size was measured under) and runs `migrations::reclean_names` (§9.6).
+
 ### 6.3 FTS approach and write rules (fixes the critique and review B2)
 
 * `programme` is an `INTEGER PRIMARY KEY AUTOINCREMENT` rowid table: ids are never reused, so
@@ -904,7 +929,10 @@ is frozen at tag `skeleton-v1` (nothing has shipped before it, which is why revi
 edited it in place); later changes are new `000N_*.sql` entries appended by WP-02 with
 architect sign-off. A migration whose new columns need data SQL can't compute gets a Rust
 `backfill` step that runs in the same transaction right after its script (0003: channel
-quality and family from the stored provider names, ~0.1 s per 100k channels, once).
+quality and family from the stored provider names, ~0.1 s per 100k channels, once; 0004:
+trust evidence from `channel_video` and every display name re-cleaned from the stored provider
+names — 0.75 s once for 79k channels + 302k movies + 78k series, measured on the names of a
+real playlist in memory; only changed rows are written).
 
 ### 7.2 Mark-and-sweep imports (catalogue)
 `source.generation` = last completed import. An import uses `generation + 1`, **upserts** rows
@@ -1067,6 +1095,94 @@ there for the focused channel).
   performs are toasted by the next window (§27.3).
 
 ---
+
+### 9.6 Smart names (`sources::smart_names` on `sources::name_tokens`)
+Display-only cleanup of provider names (UHF "Smart Playlists"; per source
+`SourceSettings.smart_names`, default `general.smart_names`, on). The raw name stays in
+`name` / `grp.raw_name`; identity (`identity::normalize_name` / `normalize_group`, frozen) is
+unaffected, so toggling or changing the rules never changes keys. The quality word is taken
+from the name whether or not cleanup is on (`channel.quality`, §6.2.1).
+
+**One tokenizer** (`name_tokens::tokens`) is shared by channel, VOD and category display
+names and by category tag detection (§28.2), so `"UK ★ BBC One"`, `"UK ❖ BBC One"`, `"|UK|
+BBC One"` and `"UK: BBC One"` mean the same everywhere. Tokens: **words** (letters, digits,
+marks of any script; `+ & ' ’` anywhere and `! %` after a word character — `E! News`, `Sky
+Sports+`, `AT&T`, `+1`, `100%`; joiners between word characters: `- – . / _`, and `: ,`
+between digits — `Sci-Fi`, `Canela.TV`, `24/7`, `15:55`), **separators** (a run of any other
+punctuation or symbol, Unicode P* / S* via `unicode-general-category`, private-use icon
+glyphs: `| : - ★ ✦ ❖ ◉ ● • ▎ ┃ ⓧ # » ⚽`), **decoration** (superscript / modifier /
+small-capital letters and digits, split off a glued word: `TF1ᴴᴰ`, `⁴ᵏ`, `ᴿᴬᵂ`, `³⁸⁴⁰ᴾ`,
+`ᶜᶦᵗʸ`), **flags** and **brackets** (`( [ { ⁽ 【 「`). Any whitespace (NBSP included) only
+separates; each token remembers whether a space preceded it, so kept text is put back as
+written.
+
+**Rules** (`clean_channel_name`, `clean_vod_name`, `clean_group_name`):
+1. *Leading prefixes*, repeatedly, after decoration and flags: `[…]` (any tag), `(XX)` /
+   `|XX|`, and one to three *prefix words* followed by any separator run (`UK:`, `UK |`,
+   `US ★`, `UK ❖`, `PL VIP:`). A dash separates only spaced after upper-case codes (`DE -
+   Das Erste`, never `Al - Jazeera`); `. , / ' _` never do (`No. 1`). Prefix words: a
+   country / language / region of the category tag tables (§28.2: `UK`, `ALB`, `EXYU`,
+   `LATAM`, `HINDI`, `URUGUAY`), a known three-letter code (`COUNTRY3`), a service tag (`VIP
+   SAT RAW PPV 24/7`), a quality word; and, as the only word, any two letters (`RK:`, `ZG:`:
+   provider line-up codes, as before), code lists (`BE/FR:`) and a code with a short
+   line-up label (`IN-PREM:`, `BE-VIP:`, `AR-SUBS -`). Unknown words stop it: `CNN: Live`,
+   `AT&T: …`, `MY TV: …`, `PRIME: …` stay. Something that names the channel must follow (not
+   only quality words): `"UK: HD"` → `UK`. Movie / series titles take upper-case codes only
+   (`America: The Motion Picture`, `It: Chapter Two` are titles). A quality word of the
+   prefix counts only when the name has none after it (`4K: beIN SPORTS 6 ᴴᴰ` is HD).
+2. *Quality words anywhere* → `Quality`, best wins: `SD 480p 576p HD 720p FHD 1080p 1080i
+   1440p QHD UHD 4K 2160p 3840p` (1440p / QHD are FHD like a measured 2560×1440). `8K` /
+   `4320p` are format words, no claim: providers put them on event slates and placeholders
+   (`- NO EVENT STREAMING - | 8K EXCLUSIVE | …`, 8.4k names of the real playlist), never on an
+   8K picture.
+   glued to symbols (`4K◉`), in `(…)` / `[…]` / `⁽…⁾`, or as decoration (`ᴴᴰ`, `ꜰʜᴅ`, `ᶠ ᴴᴰ`
+   — a run of decoration is read joined first).
+3. *Tags* (stripped into `CleanName.tags`): codec / format words (`HEVC H.265 x265 HDR 50fps`,
+   `⁵⁰ FPS`, `8K`), the upper-case `RAW` feed tag of channels (not after `WWE` / `NIGHT`;
+   titles keep `Raw Deal`), any `[…]`, superscript groups (`⁽ᴮᴷ⁾`), `(…)` groups
+   that are tags (`backup`, `multi-sub`, `geo-blocked`…; `(FHD@60FPS)` is quality + format),
+   superscript text (a superscript country code, `ELEVEN ᴾᴸ`, is also the country). Other
+   `(…)` groups are part of the name (`BBC One (Scotland)`, `(EAST)`); stylised small
+   capitals that are no known word stay (`ꜱᴘᴏʀᴛꜱ 1`).
+4. *Ends*: separators, flags and stray brackets at either end are dropped (`◉`, `★`, `|`,
+   `:`, `##`; a `#` glued to a word stays: `#0`, `#12 Texas A&M vs …`); the full stop of an
+   abbreviation stays (`T.I.M.`). Inside the name everything stays as written (`Parijs-Tours:
+   Mannen`, `NEXT | Lyon vs Nice | 15:55`, `Sp⚽rts`), except that two separators left next
+   to each other become the stronger one (`STREAMING - | 8K EXCLUSIVE |` → `STREAMING |
+   EXCLUSIVE |`).
+5. VOD: a trailing `(YYYY)` / `[YYYY]` / `- YYYY` (1900–2100) is the year. Groups: a quality
+   word written as plain text is what the category is about and stays (`UK ❖ SPORTS 4K` →
+   `Sports 4K`, `UK ❖ 4K` → `4K`, `4K| Relax` → `4K Relax`; superscript ones are decoration);
+   a full country name before text in another script stays (`Lebanon ▶ لبنان`); all-caps
+   names are title-cased (acronyms kept). Never empty: nothing left → the trimmed raw name.
+6. *Collisions*: names cleanup made identical although the provider names differ get what
+   it dropped and not all of them share, after ` · `
+   (`smart_names::distinguishing_suffixes`). Categories of one playlist and kind at import
+   (`store::import::distinguish_group_names`, also in migration 0004: `GENERAL ᴴᴰ/`,
+   `GENERAL ʰᵉᵛᶜ`, `General` → `General · HD`, `General · HEVC`, `General`); channels of one
+   category with the same badge at `library::load` (display only: `FI: TV5` / `FI: TV5 ᴿᴬᵂ`
+   → `TV5` / `TV5 · RAW`; `PL:` / `AF: CANAL+ SPORT 5` → `… · PL` / `… · AF`; renamed
+   channels keep the user's name). Stream info (`I`) shows the provider's name of a live
+   channel (`Provider …`) whenever it differs from the displayed one.
+
+Measured on a real 79k-channel Xtream playlist (names only, never committed): the decorations
+listed in the user report (`★` prefixes 20k names, `VIP:` 2k, `◉` 1.5k, superscripts, glued
+`4K`) are gone; what stays are unknown line-up labels (`PRIME:`, `GOLD:`, `DSTV ★`, `Jawy ★`)
+and `|` between the fields of event names. 79k names clean in ~80 ms (release). Channels of
+one category with the same cleaned name and badge although the provider names differ: 602
+sets after cleaning, 183 after the collision suffixes (rule 6; the rest are the provider's
+own duplicates: `4K` / `UHD`, `HD` / `HD (720P)`).
+
+**Existing data.** Names are cleaned at import, and every refresh upserts `clean_name` /
+`grp.name` (with `grp.raw_name`), so a refresh applies new rules. Databases from before these
+rules get them at once from migration 0004's `reclean_names` (no refresh needed): per source,
+smart names = its own setting, else inferred from its rows (the app-wide default lives in the
+config file, not the database) — on when any stored display name differs from the provider's;
+it rewrites changed `clean_name`s (channels, movies, series) and `grp.name`s (where
+`raw_name` is stored), and every channel's `quality` / `family`. A later rule change appends a
+migration whose backfill calls `reclean_names` again. Display names are not recomputed at
+library load: that would cost every start (~80 ms per 79k channels) for something that changes
+only with a new build.
 
 ## 10. Catch-up URL building (`sources::catchup`, `sources::resolve`)
 
@@ -1343,10 +1459,13 @@ when at least 360 px wide) shows for the usual OSD time after popping out.
   tiles (favourites rails included). Source: what mpv decoded the last time the channel played
   (`channel_video`; this session's plays at once via `ui::data::MeasuredQuality`), else the
   quality word of the provider name (`channel.quality`) — so "BBC One 4K" that plays at 1080p
-  shows FHD, and an untagged channel gets a badge once it played (§6.2.1). No marker tells a
-  measured value from a name one: two looks for one word is noise, and the player's OSD and
-  the Live preview show the decoded value anyway (those show it whatever the setting). Radio
-  channels have none. The badge follows the name and **stays when space runs out — the name
+  shows FHD, and an untagged channel gets a badge once it played (§6.2.1). A measured value and
+  a name one look the same — two looks for one word is noise, and the player's OSD and the Live
+  preview show the decoded value anyway (those show it whatever the setting) — **except a
+  doubtful claim, `4K?` / `FHD?`** (§13.0.1). The badge's tooltip (Live preview, guide side
+  panel) says where it comes from: "Played at HD (the provider says 4K)", "The provider says
+  4K; not verified until it plays", and for `4K?` "…; not verified. Channels of this playlist
+  labelled 4K often play at a lower quality." Radio channels have none. The badge follows the name and **stays when space runs out — the name
   elides beside it** (duplicates share a name, so the badge is what tells them apart); only
   when that would leave the name less than max(2 × badge, 6 em) does the name get the room
   (`widgets::badge::name_with_quality` / `job_with_quality`, also search hits). The zap
@@ -1393,6 +1512,26 @@ when at least 360 px wide) shows for the usual OSD time after popping out.
   (`SortMode::Provider` = provider order with user reordering) switches it to Custom order with
   a toast "Switched to custom order". Ctrl+S opens a small sort & view menu (launcher card),
   never a blind cycle.
+
+#### 13.0.1 Quality-label trust
+Providers label channels 4K that play HD (a real playlist
+labels about 5.7k of 79k channels 4K / UHD; its 8K labels are event slates and claim
+nothing, §9.6).
+Measured quality always wins. Per source,
+`model::LabelTrust` counts the measured channels (`quality_check`, §6.2.2) and, per claimed
+class, how many claims played lower. Once **≥ 3 channels of the source were measured
+(`MIN_MEASURED`), ≥ 2 of them claimed the class (`MIN_CLAIMS`: one bad stream is no pattern)
+and at least half of those played lower**, the source's *unmeasured* claims of that class
+show `4K?` (`QualityBadge::doubtful`). Only 4K and FHD are judged (the classes that get
+inflated; an HD claim that plays SD is rare and harmless). A claim that played *better* is
+not wrong. A channel measured again replaces its evidence, so the doubt clears when the
+claims turn out right. Computed at `library::load` (the doubt follows a measurement at the
+next library build — a refresh or the next start — while the played channel itself shows
+its measured class at once). Best-first ordering of duplicates puts a doubtful claim after
+the class beneath it (`4K?` after any `FHD`, before `HD`). Evidence of channel
+names the provider no longer lists is dropped at each refresh. The stream info panel (`I`)
+adds a `Quality` line on live channels with a quality word: "Quality  named 4K · plays HD" /
+"named 4K · as labelled" / "named 4K · not verified" before the size is known.
 
 ### 13.1 Component catalogue (Omarchy tokens → widgets)
 
@@ -3396,17 +3535,21 @@ country = ISO 3166-1 alpha-2 upper case (`GB`, never `UK`); language = `lang:` +
 `presets::country_name`, built-in names for languages / regions). No flag emoji in the UI:
 egui's bundled emoji font has no flag sequences — the short code is shown as a badge.
 
-**Grammar** (applied to the trimmed raw name; ASCII case-insensitive unless noted):
-1. Leading decoration is skipped: any run of characters that are neither letters/digits nor
-   an opening bracket / pipe (`★ ✦ ◉ • ▎ # »` …).
+**Grammar** (applied to the tokens of the trimmed raw name — the shared name tokenizer of
+§9.6, so smart names and detection agree on what a separator is; a word with joiners that is
+not itself listed is split at them for detection: `UK-DOCS`, `UK.Sports`, `UK/US`; ASCII
+case-insensitive unless noted):
+1. Leading decoration is skipped: separator runs that open no bracket, superscript decoration
+   and stray closing brackets (`★ ✦ ◉ • ▎ ┃ ⓧ ❖ # »`, `ᴴᴰ` …). Trailing decoration likewise
+   before the trailing forms (`"Sports | UK ◉"` → GB).
 2. *Flag*: a leading pair of regional-indicator symbols → that country, read as an ISO code
    first (`🇬🇧` → GB, `🇦🇷` → Argentina, not Arabic; `🇪🇺` → Europe via the synonyms); the
    England / Scotland / Wales tag sequences (`🏴 + tags`) → GB.
 3. *Bracketed token* at the start: `[X]`, `(X)`, `{X}`, `|X|` (also `| X |`), where X is a
    token or a flag (`[🇬🇧] Sports`).
 4. *Separated token* at the start: a token followed by optional spaces and a **separator** —
-   any character that is not a letter, digit, space or one of `( & ' + .` (so `|`, `:`, `-`,
-   `–`, `—`, `/`, `▎`, `✦`, `•`, `·`, `»`, `>`, `*`, `~`…). `"UK | Sports"`, `"UK: News"`,
+   any punctuation or symbol run of the tokenizer (so `|`, `:`, `-`, `–`, `—`, `/`, `▎`, `✦`,
+   `❖`, `★`, `ⓧ`, `•`, `·`, `»`, `>`, `*`, `~`…; not `( & ' +`, which belong to names). `"UK | Sports"`, `"UK: News"`,
    `"UK - Docs"`, `"EN ▎Movies"`, `"UK ✦ Kids"`, `"UK/US Sports"` (first tag wins). A `.` or a
    `-` with no space before it and a letter after it joins words (`"Sci-Fi"`, `"No. 1"`) and
    only separates after a short code accepted by rule 6 (`"UK-DOCS"`, `"UK.Sports"` → GB;
@@ -3423,9 +3566,10 @@ egui's bundled emoji font has no flag sequences — the short code is shown as a
    FIN RUM…). `"IT Crowd"`, `"Us Weekly"`, `"In Cinemas"`, `"AL JAZEERA"`, `"BT Sport"`,
    `"FA Cup"`, `"CL Matches"`, `"CH 5"` stay untagged; `"IT: Sport"` is Italy.
 7. *Non-tags* (and plain numbers) are skipped — bracketed, separated or followed by a space —
-   and detection continues with the next token (at most 3 leading tokens): `4K 8K HD FHD UHD
-   SD HDR HEVC H265 VIP PPV VOD NEW XXX ADULT 18+ 24/7 TV FM LIVE RADIO MULTI INT INTL
-   INTERNATIONAL WORLD TOP PREMIUM EX`. So `"VIP | UK | Sports"`, `"VIP UK | Sports"` and
+   and detection continues with the next token (at most 3 leading tokens): the quality,
+   format and service words shared with smart names (`4K HD FHD UHD 1080p… 8K HDR HEVC H265
+   50fps VIP SAT RAW PPV 24/7`, also as decoration `ᴴᴰ`) and `SD VOD NEW XXX ADULT 18+ TV FM
+   LIVE RADIO MULTI INT INTL INTERNATIONAL WORLD TOP PREMIUM EX`. So `"VIP | UK | Sports"`, `"VIP UK | Sports"` and
    `"[4K] UK: Movies"` → GB; `"4K | Sports"` → untagged; `"NEW ZEALAND"` → NZ (`ZEALAND` is
    listed); `"EX YU"` → Ex-Yugoslavia.
 8. *Trailing* forms, only when nothing leads: a bracketed last token (`"Sports (UK)"`,
@@ -3450,7 +3594,8 @@ egui's bundled emoji font has no flag sequences — the short code is shown as a
 | FRENCH, GERMAN/DEUTSCH, ITALIAN, SPANISH/ESPANOL, PORTUGUESE, TURKISH, RUSSIAN, POLISH, HINDI/HIN, URDU/URD, TAMIL/TAM, TELUGU/TEL, PUNJABI, BANGLA/BENGALI, KURD/KURDISH/KU, PERSIAN/FARSI/PER/FA | `lang:…` |
 | LAT, LATIN, LATINO, LATINA, LATAM | `region:latam` |
 | EX-YU, EXYU, YU, BALKAN(S) | `region:exyu` |
-| AF, AFR, AFRICA, AFRIKA, AFRICAN (`AF| NIGERIA`; Afghanistan is AFG) · ASIA, ASIAN · CARIB, CARIBBEAN · NORDIC, SCANDINAVIA, SCANDI · EU, EUROPE | `region:africa` · `asia` · `caribbean` · `nordic` · `europe` |
+| AF, AFR, AFRICA, AFRIKA, AFRICAN (`AF| NIGERIA`; Afghanistan is AFG) · ASIA, ASIAN · CAR (separated or bracketed only: `AMBIGUOUS`), CARIB, CARIBBEAN · NORDIC, SCANDINAVIA, SCANDI · EU, EUROPE | `region:africa` · `asia` · `caribbean` · `nordic` · `europe` |
+| SW (Sweden on IPTV panels: `SW ★ …`), MAL (Malayalam), TELEGU (sic), ODIA; full names seen as prefixes in real playlists: URUGUAY, DOMINICAN(A), ECUADOR, HONDURAS, GUATEMALA, PANAMA, CUBA, UGANDA, TANZANIA, MALI, GUINEE/GUINEA, BURKINAFASO, TOGO, BENIN, GABON, TCHAD/CHAD, GAMBIA, SIERRALEONE, CAPEVERDE, ANGOLA, MOZAMBIQUE, NAMIBIA, ERITREA, DJIBOUTI, COTEDIVOIRE | `SE` · `lang:ml` · `lang:te` · `lang:or` · those countries |
 
 Language names are not merged into countries (`FRENCH` ≠ `FR`): the picker lists both, and
 the defaults add the main language of the user's country (`country_language`, a small table:

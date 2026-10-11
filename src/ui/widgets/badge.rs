@@ -7,7 +7,7 @@ use std::sync::Arc;
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect};
 
 use super::{glyphs, paint};
-use crate::model::{Quality, SourceKind};
+use crate::model::{QualityBadge, SourceKind};
 use crate::store::library::SourceMeta;
 use crate::theme::{SpaceToken, Theme, TypeToken, with_alpha};
 
@@ -126,15 +126,16 @@ pub fn live_badge(ui: &mut egui::Ui, theme: &Theme) -> egui::Response {
 }
 
 /// A channel's quality badge in a `Ui` flow (preview, guide side panel): the [`InlineBadge`]
-/// the lists paint, so "FHD" looks the same everywhere.
-pub fn quality_badge(ui: &mut egui::Ui, theme: &Theme, q: Quality, color: Color32) -> egui::Response {
+/// the lists paint, so "FHD" looks the same everywhere; the tooltip says where it comes from
+/// (measured, or the provider's word — "not verified").
+pub fn quality_badge(ui: &mut egui::Ui, theme: &Theme, q: QualityBadge, color: Color32) -> egui::Response {
     let b = InlineBadge::quality(ui.painter(), theme, q, color, 1.0);
     let (rect, resp) = ui.allocate_exact_size(b.size(), egui::Sense::hover());
     if ui.is_rect_visible(rect) {
         b.paint(ui.painter(), theme, rect.min, Align2::LEFT_TOP);
     }
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, q.label()));
-    resp
+    resp.on_hover_text(egui::RichText::new(q.explain()).size(theme.font(TypeToken::BodySmall)))
 }
 
 /// The painter-level [`badge`] (rows, grid headers, OSD lists): `text` in `font`, 1 px border
@@ -153,8 +154,9 @@ impl InlineBadge {
         Self { galley: paint::galley(p, text, font, color, f32::INFINITY), pad, color }
     }
 
-    /// A channel's quality badge: monospace caption (`scale`d for the OSD).
-    pub fn quality(p: &egui::Painter, theme: &Theme, q: Quality, color: Color32, scale: f32) -> Self {
+    /// A channel's quality badge: monospace caption (`scale`d for the OSD); `4K?` for a
+    /// doubtful claim.
+    pub fn quality(p: &egui::Painter, theme: &Theme, q: QualityBadge, color: Color32, scale: f32) -> Self {
         Self::new(p, theme, q.label(), FontId::monospace((theme.font(TypeToken::Caption) * scale).round()), color)
     }
 
@@ -236,7 +238,7 @@ mod tests {
             let mut w = 0.0;
             let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
                 let p = ui.painter();
-                let badge = InlineBadge::quality(p, &theme, Quality::Hd, Color32::GRAY, 1.0);
+                let badge = InlineBadge::quality(p, &theme, crate::model::QualityBadge::named(crate::model::Quality::Hd, false), Color32::GRAY, 1.0);
                 w = name_with_quality(p, &theme, Pos2::new(0.0, 50.0), name, font.clone(), Color32::WHITE, Some(badge), max_w).width();
             });
             out.textures_delta.clear();

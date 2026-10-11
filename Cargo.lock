@@ -5011,6 +5011,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-bidi",
+ "unicode-general-category",
  "url",
  "wayland-backend",
  "wayland-client",

@@ -65,8 +65,24 @@ on-screen controls, and a light theme (catppuccin-latte).
   - Quality badges (SD, HD, FHD, 4K) next to channel names, so the SD/HD/4K copies of a channel
     are told apart without playing each one; the best copy is listed first. A badge comes from
     the provider's name until the channel plays, then from the resolution it really plays at
-    (a "4K" channel that plays at 1080p shows FHD). Settings ▸ Interface ▸ Quality badges
-    turns them off.
+    (a "4K" channel that plays at 1080p shows FHD). When the channels a playlist labels 4K keep
+    playing at a lower quality (half of those you played, once you played at least three
+    channels of it and two of them claimed 4K), its other "4K" channels show **4K?** (after
+    the next restart or refresh) until they play: the provider says 4K, but it isn't
+    verified. The same goes for FHD. Hover a
+    badge in the preview for where it comes from; stream info (`I`) shows what the provider
+    claims next to what plays. Settings ▸ Interface ▸ Quality badges turns them off.
+  - Smart names: "UK: ITV 4 4K ◉", "US ★ HGTV HD", "VIP: Sky Sports F1 ᴿᴬᵂ" and
+    "DE ┃ Das Erste ●" read "ITV 4", "HGTV", "Sky Sports F1" and "Das Erste". Country,
+    language and region prefixes, service tags (VIP, SAT, RAW, PPV, 24/7), quality and codec
+    words (also in superscript or glued to a symbol) and decorations at either end are dropped;
+    symbols that belong to a name stay ("E! News", "AT&T", "Sky Sports+", "Channel 4 +1").
+    Categories are cleaned the same way ("UK ❖ General" → "General", "UK ❖ SPORTS 4K" →
+    "Sports 4K"). Channels or categories that would end up with the same name keep what tells
+    them apart ("TV5" / "TV5 · RAW"), and stream info (`I`) shows the provider's own name.
+    "8K" in a name claims nothing (providers use it for event slates). Each playlist can turn it
+    off (Edit ▸ smart name cleanup). Libraries from earlier versions get the new names on the
+    first start, without a refresh.
 - **TV guide:** an EPG grid with programme details, reminders and catch-up.
   - XMLTV guides can come from a URL or a file (gz/xz).
   - Several guides can be ranked by priority, each with its own time offset.
@@ -288,10 +304,11 @@ hidden. One rule covers live groups, movie and series categories.
   Ticking nothing that the playlist has asks for a second Enter. Ticking everything removes the
   rule.
 - **Recognised forms:** `UK | …`, `UK: …`, `UK - …`, `UK-…`, `|UK| …`, `[UK] …`, `(UK) …`,
-  `EN ▎…`, `UK ✦ …`, a leading flag, full names (`ENGLISH`, `FRANCE`, `ARABIC`, `LATINO`,
+  `EN ▎…`, `UK ✦ …`, `UK ★ …`, `UK ❖ …` (any symbol between the code and the name), a leading
+  flag, full names (`ENGLISH`, `FRANCE`, `ARABIC`, `LATINO`,
   `EX-YU`, `AFRICA`) and trailing `… (UK)` / `… | UK`. UK, GB, ENGLAND, SCOTLAND and WALES are
   all the UK; EN, ENG and ENGLISH are the English *language*; AR is Arabic (Argentina is ARG or
-  🇦🇷). Prefixes such as 4K, HD, FHD, VIP, PPV, VOD, NEW, 24/7, XXX and ADULT are skipped, and
+  🇦🇷). Prefixes such as 4K, HD, FHD, ᴴᴰ, VIP, SAT, RAW, PPV, VOD, NEW, 24/7, XXX and ADULT are skipped, and
   unknown words never count: "4K | Sports", "BT Sport", "FA Cup" and "IT Crowd" are untagged
   and stay shown.
 - **Exceptions:** Ctrl+H on a group always hides it. **Settings ▸ Hidden** lists the hidden

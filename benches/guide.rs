@@ -66,6 +66,7 @@ fn live() -> LiveIndex {
             source_id: SourceId(1),
             key: ItemKey(format!("c{i}")),
             name: Arc::from(format!("Channel {i} HD")),
+            provider_name: None,
             number: Some(i as u32),
             logo: None,
             group_ids: vec![GroupId(1)],
