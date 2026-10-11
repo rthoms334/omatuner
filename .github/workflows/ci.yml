@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Line tables keep test backtraces readable at a fraction of the full debuginfo's size.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  RUST_BACKTRACE: "1"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: test (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            image: archlinux:base-devel
+            keyring: archlinux-keyring
+          - arch: aarch64
+            # Native Arm runner (free for public repositories) running Arch Linux ARM.
+            runner: ubuntu-24.04-arm
+            image: menci/archlinuxarm:base-devel
+            keyring: archlinuxarm-keyring
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ${{ matrix.image }}
+    timeout-minutes: 120
+    steps:
+      # Before the checkout: actions/checkout needs git in the container.
+      - name: Install packages
+        env:
+          KEYRING: ${{ matrix.keyring }}
+        run: |
+          pacman -Sy --noconfirm --needed "$KEYRING"
+          pacman -Su --noconfirm
+          # Build: rustup (rust >= 1.95, clippy, rustfmt), mpv (libmpv), xz (liblzma).
+          # Tests: ffmpeg (test media), dbus (session bus for MPRIS/notifications), systemd
+          # (busctl), fontconfig + JetBrains Mono Nerd Font (font resolution), lua (Hyprland
+          # snippet), desktop-file-utils (desktop entry). Runtime libs: wayland, libxkbcommon, mesa.
+          pacman -S --noconfirm --needed \
+            git rustup mpv ffmpeg xz dbus systemd fontconfig ttf-jetbrains-mono-nerd lua \
+            desktop-file-utils wayland libxkbcommon mesa
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+          rustc -vV
+          mpv --version | sed -n 1p
+
+      - uses: actions/checkout@v7
+
+      - name: Trust the checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}
+
+      - name: cargo fmt --check
+        if: matrix.arch == 'x86_64'
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: cargo build
+        run: cargo build --all-targets --locked
+
+      - name: Generate test media
+        # tests/support/media.rs reuses target/test-media once its stamp matches MEDIA_VERSION.
+        # Generating it here makes a missing or broken ffmpeg fail the job instead of
+        # silently skipping the player tests.
+        run: |
+          version="$(sed -n 's/^const MEDIA_VERSION: &str = "\(.*\)";/\1/p' tests/support/media.rs)"
+          test -n "$version"
+          rm -rf target/test-media
+          scripts/gen-test-media.sh target/test-media
+          printf '%s' "$version" > target/test-media/.complete
+          ls -l target/test-media
+
+      - name: cargo test
+        # MPRIS and notification tests need a session bus. mpv runs with vo=null/ao=null and the
+        # egui_kittest UI tests are headless. The soak test stays #[ignore]d.
+        run: dbus-run-session -- cargo test --locked --no-fail-fast

@@ -1,0 +1,164 @@
+name: Release
+
+# A pushed tag `v<version>` (or `v<version>-<suffix>` for a pre-release) builds the Arch packages
+# and tarballs for x86_64 and aarch64 and publishes a GitHub Release. `<version>` must equal
+# Cargo.toml's version (the PKGBUILD checks its pkgver against it too).
+# Run by hand with `publish` off for a dry run on any branch: the files are only uploaded as
+# workflow artifacts.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish a GitHub Release (run on a tag); off = dry run, artifacts only"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            image: archlinux:base-devel
+            keyring: archlinux-keyring
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            image: menci/archlinuxarm:base-devel
+            keyring: archlinuxarm-keyring
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ${{ matrix.image }}
+    timeout-minutes: 120
+    steps:
+      - name: Install packages
+        env:
+          KEYRING: ${{ matrix.keyring }}
+        run: |
+          pacman -Sy --noconfirm --needed "$KEYRING"
+          pacman -Su --noconfirm
+          # makedepends (cargo via rustup) + depends from packaging/PKGBUILD, so makepkg can
+          # check them without installing anything itself.
+          pacman -S --noconfirm --needed \
+            git rustup mpv xz fontconfig ttf-jetbrains-mono-nerd wayland libxkbcommon mesa dbus \
+            gcc-libs glibc
+
+      - uses: actions/checkout@v7
+
+      - name: Check versions
+        id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          pkgver="$(sed -n 's/^pkgver=//p' packaging/PKGBUILD)"
+          pkgrel="$(sed -n 's/^pkgrel=//p' packaging/PKGBUILD)"
+          echo "Cargo.toml $version, PKGBUILD $pkgver-$pkgrel, ref $REF_TYPE $REF_NAME"
+          if [[ $version != "$pkgver" ]]; then
+            echo "::error::PKGBUILD pkgver ($pkgver) does not match Cargo.toml ($version)"
+            exit 1
+          fi
+          if [[ $REF_TYPE == tag && $REF_NAME != "v$version" && $REF_NAME != "v$version-"* ]]; then
+            echo "::error::tag $REF_NAME does not match Cargo.toml version $version (expected v$version or v$version-<suffix>)"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "pkgrel=$pkgrel" >> "$GITHUB_OUTPUT"
+
+      - name: Build the package (makepkg as an unprivileged user)
+        run: |
+          useradd --create-home builder
+          runuser -u builder -- rustup toolchain install stable --profile minimal
+          runuser -u builder -- rustup default stable
+          cp -a "$GITHUB_WORKSPACE" /home/builder/omatuner
+          chown -R builder:builder /home/builder/omatuner
+          runuser -u builder -- bash -c 'cd ~/omatuner/packaging && makepkg --force --noconfirm'
+
+      - name: Assemble release files
+        env:
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ steps.version.outputs.version }}
+          PKGREL: ${{ steps.version.outputs.pkgrel }}
+        run: |
+          set -x
+          src=/home/builder/omatuner/packaging
+          pkg="omatuner-$VERSION-$PKGREL-$ARCH.pkg.tar.zst"
+          mkdir -p dist
+          cp "$src/$pkg" dist/
+          # The tarball holds the packaged binary and files (same build as the package).
+          root="$src/pkg/omatuner"
+          stage="omatuner-$VERSION-$ARCH"
+          mkdir -p "$stage/hypr" "$stage/omarchy"
+          install -m755 "$root/usr/bin/tuner" "$stage/tuner"
+          install -m644 "$root/usr/share/applications/tuner.desktop" "$stage/"
+          install -m644 "$root/usr/share/icons/hicolor/scalable/apps/tuner.svg" "$stage/"
+          install -m644 "$root/usr/share/tuner/hypr/tuner.lua" "$stage/hypr/"
+          install -m644 "$root/usr/share/tuner/omarchy/omarchy-menu.jsonc" "$stage/omarchy/"
+          install -m644 README.md LICENSE "$stage/"
+          tar --owner=0 --group=0 --sort=name -czf "dist/$stage.tar.gz" "$stage"
+          # Sanity checks: the binary runs and reports this version; list what ships.
+          out="$("$stage/tuner" --version)"
+          [[ $out == "tuner $VERSION" ]]
+          pacman -Qip "dist/$pkg"
+          pacman -Qlp "dist/$pkg"
+          tar -tzvf "dist/$stage.tar.gz"
+          cd dist
+          for f in *; do sha256sum "$f" > "$f.sha256"; done
+          cat ./*.sha256
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: omatuner-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.event_name == 'push' || inputs.publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: omatuner-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          if [[ $REF_TYPE != tag ]]; then
+            echo "::error::publishing needs a tag: run the workflow on the tag (Use workflow from: Tags)"
+            exit 1
+          fi
+          cd dist
+          cat ./*.sha256 > SHA256SUMS
+          rm ./*.sha256
+          sha256sum -c SHA256SUMS
+          flags=()
+          if [[ $TAG == *-* ]]; then flags+=(--prerelease); fi
+          gh release create "$TAG" --verify-tag --generate-notes --title "Tuner $TAG" "${flags[@]}" ./*
