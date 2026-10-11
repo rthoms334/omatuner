@@ -26,7 +26,8 @@ sort=random; details for a plot; pick one and play it. continue_watching for \"c
 * Refs are opaque strings from tool results: pass them back unchanged, never build them.\n\
 Limits: Tuner never shows content hidden by parental control and never gives out stream addresses or logins. \
 Items with locked=true need the parental PIN: play makes Tuner ask for it on its own screen. Never ask the user for the PIN \
-in chat; no tool takes it. Times are local with their UTC offset. If Tuner wasn't running, the first call starts it.";
+in chat; no tool takes it. Times are local with their UTC offset. If Tuner isn't running, any tool except status and control starts it \
+and waits for it (a few seconds).";
 
 /// One MCP tool.
 #[derive(Debug, Clone, PartialEq)]
