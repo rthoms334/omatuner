@@ -1167,14 +1167,6 @@ fn vod_reads_details_and_next_episode() {
         vec![(1, Some("One".into()), 2), (2, None, 1)]
     );
     assert_eq!(count(&r, "SELECT count(*) FROM episode"), 3, "old episodes deleted");
-
-    // recently added: newest first, hidden left out
-    let hid = ItemRef { source: src, kind: ItemKind::Movie, key: ItemKey("xt:vod:8".into()) };
-    assert_eq!(vod::recently_added(&r, true, 10).unwrap().len(), 2);
-    w(&s, move |c| user::set_item_override(c, &hid, &ItemOverride { hidden: true, ..Default::default() }));
-    let ra = vod::recently_added(&r, true, 10).unwrap();
-    assert_eq!(ra.iter().map(|v| v.key.0.as_str()).collect::<Vec<_>>(), vec!["xt:vod:7"]);
-    assert_eq!(vod::recently_added(&r, false, 10).unwrap().len(), 1);
 }
 
 #[test]

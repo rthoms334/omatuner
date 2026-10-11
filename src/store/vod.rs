@@ -1,13 +1,9 @@
 //! Movie / series / episode reads. Owner: WP-02.
 
-use std::sync::Arc;
-
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::error::Result;
-use crate::model::{
-    Episode, EpisodeId, GroupId, ItemKey, ItemKind, ItemRef, Movie, MovieId, Season, Series, SeriesId, Timestamp, VodKind, VodSummary,
-};
+use crate::model::{Episode, EpisodeId, GroupId, ItemKey, ItemKind, ItemRef, Movie, MovieId, Season, Series, SeriesId, Timestamp};
 use crate::store::sql::{Json, or_not_found, u32_of};
 
 /// Group ids of a movie/series (`link` = `movie_group`/`series_group`, `col` its item column)
@@ -211,56 +207,6 @@ pub fn next_episode(conn: &Connection, id: SeriesId) -> Result<Option<Episode>> 
     }
     // S1E1: specials (season 0) only when there is nothing else
     Ok(eps.iter().find(|e| e.season >= 1).or(eps.first()).cloned())
-}
-
-/// Most recently added (Home "Recently added").
-///
-/// Visible items of enabled sources only (hidden items and items whose groups are all hidden
-/// are left out); `locked` is effective (item or any group).
-pub fn recently_added(conn: &Connection, movies: bool, limit: usize) -> Result<Vec<VodSummary>> {
-    let (table, link, col, kind, poster) =
-        if movies { ("movie", "movie_group", "movie_id", "movie", "poster") } else { ("series", "series_group", "series_id", "series", "cover") };
-    let mut stmt = conn.prepare_cached(&format!(
-        "SELECT x.id, x.source_id, x.key, COALESCE(o.rename, x.clean_name), x.year, x.{poster}, x.rating, x.added_at,
-                x.provider_order, COALESCE(o.locked, 0)
-         FROM {table} x JOIN source s ON s.id = x.source_id AND s.enabled = 1
-         LEFT JOIN item_override o ON o.source_id = x.source_id AND o.kind = '{kind}' AND o.item_key = x.key
-         WHERE COALESCE(o.hidden, 0) = 0
-           AND NOT (EXISTS (SELECT 1 FROM {link} l WHERE l.{col} = x.id)
-                    AND NOT EXISTS (SELECT 1 FROM {link} l JOIN grp g ON g.id = l.group_id
-                                    LEFT JOIN group_override go ON go.source_id = g.source_id AND go.kind = g.kind AND go.group_key = g.key
-                                    WHERE l.{col} = x.id AND COALESCE(go.hidden, 0) = 0))
-         ORDER BY x.added_at IS NULL, x.added_at DESC, x.id DESC LIMIT ?1"
-    ))?;
-    let rows: Vec<(i64, VodSummary)> = stmt
-        .query_map([limit as i64], |r| {
-            let id: i64 = r.get(0)?;
-            Ok((
-                id,
-                VodSummary {
-                    kind: if movies { VodKind::Movie(MovieId(id)) } else { VodKind::Series(SeriesId(id)) },
-                    source_id: r.get(1)?,
-                    key: ItemKey(r.get(2)?),
-                    name: Arc::from(r.get::<_, String>(3)?),
-                    year: r.get(4)?,
-                    poster: r.get::<_, Option<String>>(5)?.map(Arc::from),
-                    rating: r.get::<_, Option<f64>>(6)?.map(|v| v as f32),
-                    group_ids: Vec::new(),
-                    added_at: r.get(7)?,
-                    provider_order: r.get(8)?,
-                    locked: r.get(9)?,
-                },
-            ))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    let mut out = Vec::with_capacity(rows.len());
-    for (id, mut v) in rows {
-        let (groups, locked) = item_groups(conn, link, col, id)?;
-        v.group_ids = groups;
-        v.locked |= locked;
-        out.push(v);
-    }
-    Ok(out)
 }
 
 fn resolve_id(conn: &Connection, table: &str, item: &ItemRef) -> Result<Option<i64>> {
