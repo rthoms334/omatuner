@@ -24,4 +24,4 @@ pub use model::{
 pub use service::{EngineDeps, PlayerPort, QueueHandle};
 
 /// Q-ui flips this in its last commit (the engine runs, the UI shows Up next).
-pub const ENABLED: bool = false;
+pub const ENABLED: bool = true;

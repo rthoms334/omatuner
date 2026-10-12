@@ -1,8 +1,16 @@
 //! Cards over the video: end of playback (next episode), the error card's other copy, the
 //! idle card. OWNER (batch): Q-ui — the Up next card replaces the next-episode card here
 //! (DESIGN §32).
+//!
+//! With Up next on, the engine runs the card between items and the empty-queue next-episode
+//! countdown (so it also runs in the mini player, the pop-out and a hidden window); this file
+//! draws [`crate::queue::ui::card::Card`] from its snapshot and sends the keys and buttons as
+//! commands. Esc ladder: the side panel / number entry first (above), then the card's Esc
+//! cancels, then the OSD steps; popped out, the card's Esc comes before the pop-in.
 
 use super::*;
+use crate::queue::ui::card::{Button as CardButton, Card, Step};
+use crate::queue::{QueueCommand, ui as qui};
 
 pub(super) struct NextEpisode {
     pub(super) id: EpisodeId,
@@ -15,14 +23,165 @@ pub(super) const NEXT_EPISODE_DELAY: Duration = Duration::from_secs(10);
 impl PlayerScreen {
     /// Up next's player keys (`u` panel, `n` / `N`; DESIGN §32): `None` when not one of them
     /// or Up next is off. Q-ui.
-    pub(super) fn queue_action(&mut self, _ctx: &mut UiCtx<'_>, action: Action) -> Option<bool> {
+    pub(super) fn queue_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> Option<bool> {
         if !crate::queue::ENABLED {
             return None;
         }
-        matches!(action, Action::QueuePanel | Action::QueueNext | Action::QueuePrev).then_some(false)
+        match action {
+            Action::Undo(n) if qui::is_undo(n) => return Some(qui::undo(ctx, n)),
+            // the PIN card's PIN was typed: publish the unlock (the engine re-reads it), proceed
+            Action::Digit(qui::PIN_CODE) => {
+                if ctx.parental.is_unlocked(&ctx.config.parental) {
+                    ctx.services.agent.set_unlocked_at(ctx.parental.unlocked_at());
+                    qui::send(ctx, QueueCommand::Proceed { unlocked: true });
+                }
+                return Some(true);
+            }
+            _ => {}
+        }
+        let s = qui::snapshot(ctx);
+        if let Some(card) = Card::of(&s, ctx.now) {
+            // popped out, Esc is the pop-in key: the card has it first
+            let key = if ctx.video_only && action == Action::TogglePopOut { Action::Back } else { action };
+            if let Some(step) = card.key(key) {
+                self.card_step(ctx, step);
+                return Some(true);
+            }
+        }
+        match action {
+            Action::QueuePanel => self.open_panel(ctx, PanelKind::Queue),
+            Action::QueueNext | Action::QueuePrev => {
+                let text = if ctx.services.agent.tiles().on {
+                    Some("Up next waits while multi-view is on")
+                } else if action == Action::QueueNext && s.next.is_none() {
+                    Some("Up next is empty")
+                } else if action == Action::QueuePrev && !s.rows.iter().any(|r| r.entry.state.is_done()) {
+                    Some("Nothing before this in Up next")
+                } else {
+                    None
+                };
+                match text {
+                    Some(t) => self.flash_text = Some((t.into(), Instant::now())),
+                    None => {
+                        qui::send(ctx, if action == Action::QueueNext { QueueCommand::Next } else { QueueCommand::Prev });
+                    }
+                }
+            }
+            _ => return None,
+        }
+        Some(true)
+    }
+
+    /// A card key or button.
+    fn card_step(&mut self, ctx: &mut UiCtx<'_>, step: Step) {
+        match step {
+            Step::Send(c) => {
+                qui::send(ctx, c);
+            }
+            Step::Pin(reason) => ctx.open(OverlayRequest::Pin { then: Box::new(Action::Digit(qui::PIN_CODE)), reason }),
+            Step::List => {
+                if self.panel.as_ref().is_none_or(|p| p.kind != PanelKind::Queue) {
+                    self.open_panel(ctx, PanelKind::Queue);
+                }
+            }
+            Step::PlayEpisode(id) => {
+                ctx.play(PlayerCommand::Play(PlayRequest {
+                    media: MediaRef::Episode(id),
+                    zap: None,
+                    origin: PlayOrigin::Fullscreen,
+                    resume: true,
+                    immediate: true,
+                }));
+                qui::send(ctx, QueueCommand::Cancel);
+                self.show_banner(ctx);
+            }
+        }
+    }
+
+    /// The Up next card over the video (above the bottom bar while it shows); popped out, a
+    /// strip along the bottom edge with glyph buttons.
+    pub(super) fn draw_queue_card(&mut self, ui: &egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect) {
+        if !crate::queue::ENABLED {
+            return;
+        }
+        let s = qui::snapshot(ctx);
+        let Some(card) = Card::of(&s, ctx.now) else { return };
+        let theme = ctx.theme;
+        let t = &theme.tokens;
+        let sc = scale_of(ui);
+        let p = ui.painter_at(rect);
+        let pad = (theme.space(SpaceToken::PopupPadding) * sc).round();
+        let (head, line) = card.lines(ctx.now, ctx.config.interface.clock_24h);
+        let buttons = card.buttons();
+        let small = FontId::proportional((theme.font(TypeToken::Body) * sc).round());
+        let mut pressed = None;
+        if ctx.video_only {
+            let h = (small.size * 2.2).round();
+            let r = Rect::from_min_size(egui::pos2(rect.left() + pad, rect.bottom() - pad - h), egui::vec2(rect.width() - 2.0 * pad, h));
+            p.rect_filled(r, t.rounding, t.osd_scrim);
+            let mut right = r.right();
+            for (i, b) in buttons.iter().enumerate().rev() {
+                let (glyph, label, key) = b.parts();
+                let br = Rect::from_min_size(egui::pos2(right - h, r.top()), egui::vec2(h, h));
+                right = br.left();
+                let tip = format!("{label} ({key})");
+                if osd_button(ui, &p, theme, br, ui.id().with(("queue-strip", i)), glyph, small.clone(), label, Some(&tip), false).clicked() {
+                    pressed = Some(*b);
+                }
+            }
+            osd_text(&p, egui::pos2(r.left() + pad, r.center().y), Align2::LEFT_CENTER, &head, small, t.osd_text, right - r.left() - 2.0 * pad);
+        } else {
+            let font = FontId::proportional((theme.font(TypeToken::Title) * sc).round());
+            let w = (460.0 * sc).min(rect.width() - 2.0 * pad);
+            let button_h = (small.size * 2.0).round();
+            let lines_h = if line.is_some() { font.size * 2.6 } else { font.size * 1.4 };
+            let h = lines_h + button_h + 2.5 * pad;
+            // above the bottom OSD bar while it shows, else near the bottom edge
+            let bottom = rect.bottom() - self.bottom_bar.unwrap_or(0.0) - 2.0 * pad;
+            let r = Rect::from_min_size(egui::pos2(rect.right() - w - pad, (bottom - h).max(rect.top() + pad)), egui::vec2(w, h));
+            // the card takes the clicks that miss a button (they would reach the video)
+            let _ = ui.interact(r, ui.id().with("queue-card"), egui::Sense::click());
+            p.rect_filled(r, t.rounding, t.osd_scrim);
+            p.rect_stroke(r, t.rounding, egui::Stroke::new(1.0, t.osd_accent), egui::StrokeKind::Inside);
+            osd_text(&p, egui::pos2(r.left() + pad, r.top() + pad), Align2::LEFT_TOP, &head, font.clone(), t.osd_accent, w - 2.0 * pad);
+            if let Some(l) = &line {
+                osd_text(&p, egui::pos2(r.left() + pad, r.top() + pad + font.size * 1.3), Align2::LEFT_TOP, l, font, t.osd_text, w - 2.0 * pad);
+            }
+            let mut x = r.left() + pad / 2.0;
+            for (i, b) in buttons.iter().enumerate() {
+                let (glyph, label, key) = b.parts();
+                let label = match (b, &card) {
+                    (CardButton::PlayOffer, Card::Finished { offer: Some((_, l)), .. }) => l.split(" · ").next().unwrap_or(label).to_owned(),
+                    _ => label.to_owned(),
+                };
+                let text = format!("{glyph}  {label} · {key}");
+                let bw = p.layout_no_wrap(text.clone(), small.clone(), t.osd_text).size().x + pad;
+                if x + bw > r.right() {
+                    break;
+                }
+                let br = Rect::from_min_size(egui::pos2(x, r.bottom() - pad / 2.0 - button_h), egui::vec2(bw, button_h));
+                x = br.right() + pad / 2.0;
+                let tip = format!("{label} ({key})");
+                if osd_button(ui, &p, theme, br, ui.id().with(("queue-card-button", i)), &text, small.clone(), &label, Some(&tip), false).clicked() {
+                    pressed = Some(*b);
+                }
+            }
+        }
+        if card.counts_down() {
+            ui.ctx().request_repaint_after(Duration::from_millis(250));
+        }
+        if let Some(b) = pressed {
+            let step = card.press(b);
+            self.card_step(ctx, step);
+        }
     }
 
     pub(super) fn end_of_playback(&mut self, ctx: &mut UiCtx<'_>) {
+        // Up next's engine runs the next-episode countdown (any placement, a hidden window);
+        // without it (it never started) the screen's own card is the fallback
+        if crate::queue::ENABLED && ctx.services.agent.queue_handle().is_some() {
+            return;
+        }
         // a finished movie goes back to its page from `movie_detail` (one owner for that
         // navigation); an episode gets the up-next card here, over the video
         if let Some(MediaRef::Episode(id)) = ctx.player.playable.as_ref().map(|p| &p.media) {
@@ -222,5 +381,120 @@ impl PlayerScreen {
                 self.play_next_episode(ctx);
             }
         }
+        self.draw_queue_card(ui, ctx, rect);
+    }
+}
+
+/// Up next over the video (kittest over `TestUi` with the real engine; the card comes from a
+/// published snapshot, so it shows without anything playing to its end).
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use eframe::egui;
+
+    use super::*;
+    use crate::model::{Playable, QueueId};
+    use crate::queue::{Countdown, CountdownWhy, QueueRow, QueueSnapshot, RowState};
+    use crate::ui::screens::home::testkit::{App, harness, has_label, painted, rig, until};
+
+    type H = egui_kittest::Harness<'static, App<PlayerScreen>>;
+
+    /// A film playing, the player entered, the engine running.
+    fn player(video_only: bool, size: egui::Vec2) -> H {
+        let (mut t, one) = rig();
+        t.video_only = video_only;
+        crate::ui::screens::queue::tests::start_engine(&t);
+        let mut s = (*t.services().tiles.focused().snapshot()).clone();
+        s.state = PlayerState::Playing;
+        s.playable = Some(Arc::new(Playable {
+            media: MediaRef::Movie(crate::model::MovieId(1)),
+            kind: PlayableKind::Movie,
+            item: None,
+            source_id: None,
+            title: "Goldfinger".into(),
+            subtitle: None,
+            logo: None,
+            number: None,
+            url: crate::redact::Secret::new("http://127.0.0.1/m.mkv".into()),
+            headers: Default::default(),
+            start_at: None,
+            duration_hint: None,
+        }));
+        t.snapshot = Arc::new(s);
+        let mut h = harness(t, one, PlayerScreen::default(), size);
+        h.state_mut().enter(Route::Player);
+        // the engine's first (empty) snapshot is out before ours goes in
+        std::thread::sleep(Duration::from_millis(150));
+        h.run_steps(2);
+        h
+    }
+
+    /// Moonraker was played; Thunderball plays in 9 s.
+    fn countdown(h: &mut H) {
+        let rows: Vec<QueueRow> = [(1, RowState::Played, "Moonraker"), (2, RowState::Pending, "Thunderball"), (3, RowState::Pending, "Dr. No")]
+            .map(|(id, st, title)| {
+                let mut e = crate::queue::ui::tests::entry(id, st);
+                e.title = title.into();
+                QueueRow { entry: e, locked: false, eta: None, note: None }
+            })
+            .to_vec();
+        let s = QueueSnapshot {
+            rows: rows.into(),
+            next: Some(QueueId(2)),
+            countdown: Some(Countdown { id: Some(QueueId(2)), at: Some(crate::model::now() + 9), why: CountdownWhy::Ended }),
+            ..Default::default()
+        };
+        h.state().t.services().agent.publish_queue(Arc::new(s));
+        h.run_steps(2);
+    }
+
+    fn card_shown(h: &H) -> bool {
+        painted(h).iter().any(|t| t.starts_with("Up next in"))
+    }
+
+    /// Esc ladder: in controls focus mode the card's Esc cancels it (the engine answers with its
+    /// own snapshot) before Esc leaves the controls.
+    #[test]
+    fn esc_cancels_the_card_before_it_leaves_the_controls() {
+        let mut h = player(false, egui::vec2(1600.0, 900.0));
+        assert!(h.state_mut().act(Action::FocusOsdControls));
+        countdown(&mut h);
+        assert!(card_shown(&h), "{:?}", painted(&h));
+        assert!(has_label(&h, "Play now") && has_label(&h, "List") && has_label(&h, "Cancel"));
+        assert!(h.state_mut().act(Action::LeaveOsdControls));
+        until(&mut h, "the card cancelled", |h| !card_shown(h));
+        assert!(h.state().s.key_contexts().contains(&KeyContext::PlayerOsd), "the controls keep the focus");
+        assert!(h.state_mut().act(Action::LeaveOsdControls));
+        assert!(!h.state().s.key_contexts().contains(&KeyContext::PlayerOsd));
+    }
+
+    /// Popped out: a strip with glyph buttons; Esc (the pop-in key) cancels it first. `u` opens
+    /// the Up next panel with what is still to play; it filters like the other panels and `u`
+    /// closes it.
+    #[test]
+    fn popped_out_the_strip_takes_esc_first_and_u_opens_the_panel() {
+        let mut h = player(true, egui::vec2(640.0, 360.0));
+        countdown(&mut h);
+        assert!(card_shown(&h), "{:?}", painted(&h));
+        assert!(has_label(&h, "Cancel"));
+        h.state_mut().nav();
+        assert!(h.state_mut().act(Action::TogglePopOut), "Esc goes to the card");
+        until(&mut h, "the strip cancelled", |h| !card_shown(h));
+        assert!(!h.state_mut().nav().contains(&NavRequest::TogglePopOut), "and doesn't pop in");
+        countdown(&mut h);
+        assert!(h.state_mut().act(Action::QueuePanel));
+        h.run_steps(2);
+        assert_eq!(h.state().s.key_contexts()[0], KeyContext::List);
+        let text = painted(&h);
+        assert!(text.iter().any(|t| t == "Thunderball") && !text.iter().any(|t| t == "Moonraker"), "{text:?}");
+        assert!(h.state_mut().act(Action::FilterInput('o')));
+        assert_eq!(h.state().s.key_contexts()[0], KeyContext::ListFiltering, "the panel's filter drives the keys");
+        h.run_steps(2);
+        let text = painted(&h);
+        assert!(text.iter().any(|t| t == "Dr. No") && !text.iter().any(|t| t == "Moonraker" || t == "Thunderball"), "{text:?}");
+        assert!(h.state_mut().act(Action::FilterClear));
+        assert!(h.state_mut().act(Action::QueuePanel));
+        assert!(h.state().s.panel.is_none());
     }
 }
