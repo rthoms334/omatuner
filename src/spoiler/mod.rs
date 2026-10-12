@@ -18,6 +18,7 @@
 
 pub mod snapshot;
 pub mod tracker;
+pub mod ui;
 pub mod verdict;
 
 /// S-ui flips this in its last commit.

@@ -263,6 +263,8 @@ pub struct EpgGridState {
     /// Programme under the pointer (the screen loads its description into `hover_detail`).
     pub(crate) hovered: Option<ProgrammeId>,
     pub(crate) hover_detail: Option<(ProgrammeId, String)>,
+    /// The spoiler guard's view for this frame's text (the screen sets it; identity by default).
+    pub(crate) spoilers: crate::ui::widgets::spoiler::Spoilers,
     /// Set by the guide screen each frame: why rows without a mapping have no programmes
     /// ("Loading guide… 45 %", "Not in your guide — Ctrl+E maps it"…), shown instead of "No
     /// guide data" (DESIGN §13.12).
@@ -289,6 +291,7 @@ impl EpgGridState {
             show_numbers: true,
             hovered: None,
             hover_detail: None,
+            spoilers: Default::default(),
             no_guide_label: None,
         }
     }
@@ -749,9 +752,17 @@ pub fn epg_grid(
                 when.push_str(glyphs::CATCHUP);
             }
             ui.label(egui::RichText::new(when).size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
-            let extra = detail.or_else(|| p.sub_title.as_ref().map(|s| s.to_string()));
+            let guarded_sub = || {
+                let sub = p.sub_title.as_deref()?;
+                state.spoilers.text(&crate::ui::widgets::spoiler::slim_subject(&p), crate::guard::Field::SubTitle, sub).map(|s| s.into_owned())
+            };
+            let extra = detail.or_else(guarded_sub);
             if let Some(d) = extra.filter(|d| !d.is_empty()) {
                 ui.add(egui::Label::new(egui::RichText::new(excerpt(&d, 220)).size(theme.font(TypeToken::BodySmall)).color(t.text_secondary)).wrap());
+            }
+            // "From Following: Arsenal" (F-C)
+            if let Some(line) = crate::follow::ui::tooltip_line(&p) {
+                ui.label(egui::RichText::new(line).size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
             }
         });
     }

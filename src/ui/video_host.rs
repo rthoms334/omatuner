@@ -403,7 +403,14 @@ impl VideoHost {
     /// the layout isn't Compact and `interface.mini_player` is on). Returns what was clicked:
     /// the video opens the fullscreen player, the strip pops the player out or stops it.
     /// Records [`VideoHost::mini_rect`].
-    pub fn mini_player(&mut self, ctx: &egui::Context, theme: &Theme, snap: &PlayerSnapshot) -> Option<MiniAction> {
+    /// `queue`: Up next's snapshot, for its chip over the video (`queue::ui::mini_chip`).
+    pub fn mini_player(
+        &mut self,
+        ctx: &egui::Context,
+        theme: &Theme,
+        snap: &PlayerSnapshot,
+        queue: &crate::queue::QueueSnapshot,
+    ) -> Option<MiniAction> {
         self.mini = None;
         if snap.state == PlayerState::Idle {
             return None;
@@ -420,6 +427,7 @@ impl VideoHost {
             if resp.on_hover_text("Open the player").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                 result = Some(MiniAction::Open);
             }
+            crate::queue::ui::mini_chip(ui, theme, queue, video);
             let strip = Rect::from_min_max(egui::pos2(total.left(), video.bottom()), total.max);
             let p = ui.painter();
             p.rect_filled(strip, 0.0, t.card_bg);

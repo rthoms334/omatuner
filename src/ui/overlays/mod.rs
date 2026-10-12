@@ -11,6 +11,7 @@ pub mod categories;
 pub mod delete_playlist;
 pub mod dialogs;
 pub mod edit_item;
+pub mod follow_sheet;
 pub mod help;
 pub mod jobs;
 pub mod playlists;
@@ -18,6 +19,8 @@ pub mod programme;
 pub mod resume;
 pub mod same_title;
 pub mod search;
+pub mod spoiler_menu;
+pub mod spoiler_rule;
 pub mod tracks;
 
 use eframe::egui;
@@ -161,5 +164,12 @@ pub fn build(req: OverlayRequest, ctx: &mut UiCtx<'_>) -> Box<dyn Overlay> {
         OverlayRequest::PlaylistMenu(source, kind) => Box::new(playlists::PlaylistMenuOverlay::new(source, kind, ctx)),
         OverlayRequest::SameTitle(spec) => Box::new(same_title::SameTitleOverlay::new(spec)),
         OverlayRequest::DeletePlaylist { source, token } => Box::new(delete_playlist::DeletePlaylistOverlay::new(source, token)),
+        // the batch features (base-B; each overlay is its track's)
+        OverlayRequest::FollowSheet(spec) => Box::new(follow_sheet::FollowSheet::new(spec)),
+        OverlayRequest::SpoilerMenu => Box::<spoiler_menu::SpoilerMenu>::default(),
+        OverlayRequest::SpoilerRule(spec) => Box::new(spoiler_rule::SpoilerRuleEditor::new(spec)),
+        OverlayRequest::QueueSeries { series, play_next } => Box::new(crate::queue::ui::SeriesPicker::new(series, play_next)),
+        OverlayRequest::SleepTimer => Box::new(crate::reminders::ui::SleepTimerMenu),
+        OverlayRequest::WatchAlongside => Box::new(crate::ui::multiview::AlongsidePicker),
     }
 }

@@ -25,6 +25,7 @@
 pub mod arming;
 pub mod closed;
 pub mod sleep;
+pub mod ui;
 
 use crate::follow::flash::FlashSkip;
 use crate::guard::Guard;

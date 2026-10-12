@@ -409,9 +409,9 @@ fn sidebar_rail_and_compact_glyph_strip() {
         |ui, s: &mut S| {
             let mut search = false;
             let clicked = if s.strip {
-                ui.horizontal(|ui| sidebar(ui, &s.theme, ScreenId::MovieDetail, false, true, &mut search)).inner
+                ui.horizontal(|ui| sidebar(ui, &s.theme, ScreenId::MovieDetail, false, true, None, &mut search)).inner
             } else {
-                sidebar(ui, &s.theme, ScreenId::Live, false, false, &mut search)
+                sidebar(ui, &s.theme, ScreenId::Live, false, false, None, &mut search)
             };
             s.clicked = s.clicked.or(clicked);
             s.search |= search;
@@ -575,7 +575,8 @@ fn help_and_jobs_overlays() {
 
     // help: every context, generated from the keymap (tall window: nothing scrolled away)
     let mut h = overlay_harness(OvApp::new(t, OverlayRequest::Help), egui::vec2(1600.0, 5000.0));
-    for ctx in KeyContext::ALL {
+    // (a context of a feature that is off, multi-view, has no keys to list yet)
+    for ctx in KeyContext::ALL.into_iter().filter(|c| !tuner::keymap::help_rows(*c).is_empty()) {
         assert!(h.query_by_label(&ctx.title().to_uppercase()).is_some(), "help misses {ctx:?}");
     }
     for (_, help) in tuner::keymap::help_rows(KeyContext::PlayerLive) {

@@ -1846,7 +1846,7 @@ fn mini_player_sits_bottom_right_and_toasts_avoid_it() {
         |ui, a: &mut App| {
             a.host.begin_frame();
             if a.mini {
-                let r = a.host.mini_player(ui.ctx(), &a.theme, &a.snap);
+                let r = a.host.mini_player(ui.ctx(), &a.theme, &a.snap, &Default::default());
                 a.result.push(r);
             }
             let bottom = 900.0 - 26.0;
@@ -1926,7 +1926,7 @@ fn state_overlay_shows_the_channel_logo() {
                 images.pump();
                 host.begin_frame();
                 if mini {
-                    host.mini_player(ui.ctx(), &theme, &snap);
+                    host.mini_player(ui.ctx(), &theme, &snap, &Default::default());
                 } else {
                     host.paint(
                         ui,

@@ -14,6 +14,7 @@
 pub mod catalog;
 pub mod issues;
 pub mod preview;
+pub mod ui;
 
 pub use crate::store::guide_fix::GuideOpts;
 

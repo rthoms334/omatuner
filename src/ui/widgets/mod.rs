@@ -28,6 +28,7 @@ pub mod scope_bar;
 pub mod section;
 pub mod sidebar;
 pub mod slider;
+pub mod spoiler;
 pub mod status_bar;
 pub mod text_field;
 pub mod time;

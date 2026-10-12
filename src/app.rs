@@ -1088,6 +1088,13 @@ impl TunerApp {
             Action::GoMovies => self.nav.push(NavRequest::Switch(Route::Movies { group: None })),
             Action::GoSeries => self.nav.push(NavRequest::Switch(Route::Series { group: None })),
             Action::GoSettings => self.nav.push(NavRequest::Switch(Route::Settings(Default::default()))),
+            // the batch features' global keys (each a no-op while its feature is off)
+            Action::GoQueue if crate::queue::ENABLED => self.nav.push(NavRequest::Switch(Route::Queue)),
+            Action::SpoilerMenu if crate::spoiler::ENABLED => self.nav.push(NavRequest::Open(OverlayRequest::SpoilerMenu)),
+            Action::SleepTimer if crate::reminders::ENABLED => self.nav.push(NavRequest::Open(OverlayRequest::SleepTimer)),
+            Action::EndNewsFlash => {
+                crate::reminders::ui::end_news_flash(self.services());
+            }
             Action::Quit => egui_ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             // the popped-out player: back to the full window, fullscreen
             Action::ToggleWindowFullscreen if self.video_only => {
@@ -1562,6 +1569,8 @@ impl TunerApp {
     fn sidebar_panel(&mut self, ui: &mut egui::Ui, theme: &Theme, current: ScreenId, side_w: f32) {
         let mut search_clicked = false;
         let has_vod = self.lib.has_vod() || self.lib.has_series() || self.lib.built_at == 0;
+        // Up next's entry shows only while it has pending items (DESIGN §32)
+        let up_next = crate::queue::ENABLED.then(|| self.services().agent.queue().pending()).filter(|n| *n > 0);
         let frame = egui::Frame::NONE.fill(theme.palette.dark_background);
         let clicked = if side_w > 0.0 {
             egui::Panel::left("sidebar")
@@ -1569,7 +1578,7 @@ impl TunerApp {
                 .resizable(false)
                 .show_separator_line(false)
                 .frame(frame)
-                .show(ui, |ui| crate::ui::widgets::sidebar::sidebar(ui, theme, current, side_w > 100.0, has_vod, &mut search_clicked))
+                .show(ui, |ui| crate::ui::widgets::sidebar::sidebar(ui, theme, current, side_w > 100.0, has_vod, up_next, &mut search_clicked))
                 .inner
         } else {
             let strip = theme.space(SpaceToken::ControlHeight) + theme.space(SpaceToken::Md);
@@ -1579,7 +1588,7 @@ impl TunerApp {
                 .show_separator_line(false)
                 .frame(frame.inner_margin(egui::Margin::symmetric(theme.space(SpaceToken::Md) as i8, 0)))
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| crate::ui::widgets::sidebar::sidebar(ui, theme, current, false, has_vod, &mut search_clicked)).inner
+                    ui.horizontal(|ui| crate::ui::widgets::sidebar::sidebar(ui, theme, current, false, has_vod, up_next, &mut search_clicked)).inner
                 })
                 .inner
         };
@@ -1728,6 +1737,7 @@ impl eframe::App for TunerApp {
             let mini_hidden = self.layout == LayoutClass::Compact || !cfg.interface.mini_player;
             let now_playing =
                 (mini_hidden && self.snapshot.state != PlayerState::Idle).then(|| self.snapshot.playable.as_ref().map(|p| p.title.clone())).flatten();
+            let chips: Vec<_> = crate::spoiler::ui::status_chip(&self.services().agent, crate::model::now()).into_iter().collect();
             let info = StatusInfo {
                 jobs: &jobs,
                 epg_updated: self.epg_updated,
@@ -1736,6 +1746,7 @@ impl eframe::App for TunerApp {
                 hint: &hint,
                 now_playing: now_playing.as_deref(),
                 focus: focus.as_deref(),
+                chips: &chips,
             };
             let bar = egui::Panel::bottom("status-bar")
                 .exact_size((26.0 * theme.rem()).round())
@@ -1748,6 +1759,7 @@ impl eframe::App for TunerApp {
                 StatusClick::Jobs => self.nav.push(NavRequest::Open(OverlayRequest::Jobs)),
                 StatusClick::OpenPlayer => self.nav.push(NavRequest::Push(Route::Player)),
                 StatusClick::StopPlayback => self.send_player(PlayerCommand::Stop),
+                StatusClick::Chip(action) => self.global_action(action, &[], &egui_ctx),
                 StatusClick::None => {}
             }
             self.sidebar_panel(ui, &theme, current, side_w);
@@ -1771,7 +1783,8 @@ impl eframe::App for TunerApp {
             && self.video.placement() == Placement::None
         {
             let snap = self.snapshot.clone();
-            match self.video.mini_player(&egui_ctx, &theme, &snap) {
+            let queue = self.services().agent.queue();
+            match self.video.mini_player(&egui_ctx, &theme, &snap, &queue) {
                 Some(MiniAction::Open) => self.nav.push(NavRequest::Push(Route::Player)),
                 Some(MiniAction::PopOut) => self.nav.push(NavRequest::TogglePopOut),
                 Some(MiniAction::Stop) => self.send_player(PlayerCommand::Stop),
@@ -1881,6 +1894,7 @@ fn route_for_screen(id: ScreenId) -> Route {
         ScreenId::Onboarding => Route::Onboarding(OnboardingStart::Welcome),
         ScreenId::Logs => Route::Logs,
         ScreenId::EpgMapping => Route::EpgMapping { channel: None },
+        ScreenId::Queue => Route::Queue,
         ScreenId::MovieDetail | ScreenId::SeriesDetail => Route::Home,
     }
 }
@@ -1923,7 +1937,7 @@ fn view_name(screen: ScreenId) -> Option<&'static str> {
         ScreenId::Movies | ScreenId::MovieDetail => "movies",
         ScreenId::Series | ScreenId::SeriesDetail => "series",
         ScreenId::Settings | ScreenId::Logs | ScreenId::EpgMapping => "settings",
-        ScreenId::Player | ScreenId::Onboarding => return None,
+        ScreenId::Player | ScreenId::Onboarding | ScreenId::Queue => return None,
     })
 }
 
@@ -4080,6 +4094,7 @@ mod tests {
             Route::Onboarding(OnboardingStart::AddSource),
             Route::EpgMapping { channel: None },
             Route::Logs,
+            Route::Queue,
         ];
         for r in routes {
             rig.app.nav.push(NavRequest::Push(r.clone()));

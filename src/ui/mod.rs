@@ -17,6 +17,7 @@
 pub mod copies;
 pub mod data;
 pub mod epg_grid;
+pub mod item_menu;
 pub mod layout;
 pub mod multiview;
 pub mod overlays;
@@ -60,6 +61,8 @@ pub enum ScreenId {
     Onboarding,
     EpgMapping,
     Logs,
+    /// Up next (Alt+6, DESIGN §32).
+    Queue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -80,6 +83,10 @@ pub enum SettingsPage {
     /// User data whose items vanished (reattach / forget).
     Orphans,
     About,
+    /// Following rules and what they matched (DESIGN §33; listed once `follow::ENABLED`).
+    Following,
+    /// The spoiler guard (DESIGN §34; listed once `spoiler::ENABLED`).
+    SpoilerGuard,
 }
 
 /// Where the onboarding card starts (the same card is reused by Settings ▸ Playlists ▸ Add,
@@ -130,6 +137,8 @@ pub enum Route {
         channel: Option<ChannelId>,
     },
     Logs,
+    /// Up next (Alt+6, DESIGN §32).
+    Queue,
 }
 
 impl Route {
@@ -147,6 +156,7 @@ impl Route {
             Route::Onboarding(_) => ScreenId::Onboarding,
             Route::EpgMapping { .. } => ScreenId::EpgMapping,
             Route::Logs => ScreenId::Logs,
+            Route::Queue => ScreenId::Queue,
         }
     }
 }
@@ -203,6 +213,21 @@ pub enum OverlayRequest {
         source: SourceId,
         token: u64,
     },
+    /// Following's sheet (`R`, "Follow…"; DESIGN §33, F-C).
+    FollowSheet(overlays::follow_sheet::FollowSheetSpec),
+    /// The spoiler guard menu (Ctrl+Shift+B; DESIGN §34, S-ui).
+    SpoilerMenu,
+    /// Add / edit a spoiler topic or blackout (DESIGN §34, S-ui).
+    SpoilerRule(overlays::spoiler_rule::SpoilerRuleSpec),
+    /// How many episodes of a series to add to Up next (DESIGN §32, Q-ui).
+    QueueSeries {
+        series: SeriesId,
+        play_next: bool,
+    },
+    /// The sleep timer menu (Ctrl+Shift+T; B6, rui).
+    SleepTimer,
+    /// Choose the channel for the other picture (Ctrl+M in the player; DESIGN §35, MV-2).
+    WatchAlongside,
 }
 
 /// Requests a screen makes during a frame; the app applies them after the frame.
@@ -242,6 +267,7 @@ impl BackTarget {
             ScreenId::Onboarding => "Setup",
             ScreenId::EpgMapping => "EPG mapping",
             ScreenId::Logs => "Logs",
+            ScreenId::Queue => "Up next",
         };
         Self { label }
     }

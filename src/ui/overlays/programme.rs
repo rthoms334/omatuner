@@ -8,11 +8,16 @@
 //! through the channel's primary group. A locked channel opens the PIN prompt with `GuideWatch` / `GuideCatchup`
 //! as the action to retry, which the guide (the opener) re-runs on its focused programme.
 //! The programme row is read once (one indexed read inside the frame budget).
+//!
+//! The batch features (base-B, plan §2.2): at most 4 primary buttons — Watch / Catch up ·
+//! Remind me · Up next · Follow… (`ui::item_menu::popover_buttons`) — and everything else under
+//! "More…" (Ctrl+Enter; `ui::item_menu::extend`): Watch alongside, Mark seen, Guard spoilers
+//! about…. Their choices go to `ui::item_menu::dispatch` on the programme.
 
 use eframe::egui::{self, RichText};
 
 use super::dialogs::{card_area, scrim};
-use super::{Overlay, OverlayOutcome};
+use super::{ContextMenuSpec, MenuItem, Overlay, OverlayOutcome, OverlayResult};
 use crate::keymap::{Action, KeyContext};
 use crate::model::{ChannelId, ChannelSummary, PlayOrigin, Programme, ProgrammeFlags, ProgrammeId, ProgrammeSlim, ReminderId, ZapList};
 use crate::theme::{SpaceToken, TypeToken};
@@ -29,6 +34,10 @@ enum Act {
     Catchup,
     Remind,
     AssignEpg,
+    /// A feature's primary button (`ProgrammeOverlay::slots`).
+    Slot(usize),
+    /// The features' other entries.
+    More,
     Close,
 }
 
@@ -48,12 +57,15 @@ pub struct ProgrammeOverlay {
     cursor: usize,
     loaded: Option<Loaded>,
     zap: Option<Option<ZapList>>,
+    /// The features' primary buttons and "More…" entries (read with the programme).
+    slots: Vec<MenuItem>,
+    more: Vec<MenuItem>,
 }
 
 impl ProgrammeOverlay {
     /// `zap`: the opener's zap list for Watch (`None` = the channel's primary group).
     pub fn new(programme: ProgrammeId, channel: ChannelId, zap: Option<ZapList>) -> Self {
-        Self { programme, channel, cursor: 0, loaded: None, zap: zap.map(Some) }
+        Self { programme, channel, cursor: 0, loaded: None, zap: zap.map(Some), slots: Vec::new(), more: Vec::new() }
     }
 
     fn load(&mut self, ctx: &mut UiCtx<'_>) {
@@ -87,6 +99,15 @@ impl ProgrammeOverlay {
             _ => None,
         };
         self.loaded = Some(Loaded { programme, slim, channel, reminder });
+        let target = self.target();
+        self.slots = crate::ui::item_menu::popover_buttons(&target, ctx);
+        let mut more = Vec::new();
+        crate::ui::item_menu::extend(&mut more, &target, ctx, KeyContext::Guide);
+        self.more = more;
+    }
+
+    fn target(&self) -> crate::ui::item_menu::Target {
+        crate::ui::item_menu::Target::Programme { programme: self.programme, channel: self.channel }
     }
 
     /// Available actions, in display order.
@@ -114,6 +135,10 @@ impl ProgrammeOverlay {
             }
             None => v.push(Act::Watch),
         }
+        v.extend((0..self.slots.len()).map(Act::Slot));
+        if !self.more.is_empty() {
+            v.push(Act::More);
+        }
         v.push(Act::AssignEpg);
         v.push(Act::Close);
         v
@@ -131,6 +156,8 @@ impl ProgrammeOverlay {
                 (glyphs::REMINDER, if set { "Cancel reminder".into() } else { "Remind me".into() })
             }
             Act::AssignEpg => (glyphs::GUIDE, "Assign EPG…".into()),
+            Act::Slot(i) => self.slots.get(i).map_or(("", String::new()), |m| (m.icon, m.label.clone())),
+            Act::More => (glyphs::MORE, "More…".into()),
             Act::Close => ("", "Close".into()),
         }
     }
@@ -153,9 +180,23 @@ impl ProgrammeOverlay {
                 }
             }
             Act::AssignEpg => ctx.push(Route::EpgMapping { channel: Some(self.channel) }),
+            Act::Slot(i) => {
+                if let Some(a) = self.slots.get(i).map(|m| m.action) {
+                    crate::ui::item_menu::dispatch(ctx, a, &self.target());
+                }
+            }
+            Act::More => {
+                self.open_more(ctx);
+                return OverlayOutcome::Keep;
+            }
             Act::Close => {}
         }
         OverlayOutcome::Close
+    }
+
+    fn open_more(&self, ctx: &mut UiCtx<'_>) {
+        let title = self.loaded.as_ref().and_then(|l| l.programme.as_ref()).map_or_else(String::new, |p| p.title.clone());
+        ctx.open(crate::ui::OverlayRequest::ContextMenu(ContextMenuSpec { title, items: self.more.clone() }));
     }
 }
 
@@ -182,7 +223,19 @@ impl Overlay for ProgrammeOverlay {
                 None => OverlayOutcome::Close,
             },
             Action::Back => OverlayOutcome::Close,
+            Action::ContextMenu if !self.more.is_empty() => {
+                self.open_more(ctx);
+                OverlayOutcome::Keep
+            }
             _ => OverlayOutcome::Ignored,
+        }
+    }
+
+    /// A "More…" choice: the feature acts on the programme.
+    fn on_overlay_result(&mut self, ctx: &mut UiCtx<'_>, result: OverlayResult) -> OverlayOutcome {
+        match result {
+            OverlayResult::Chosen(a) if crate::ui::item_menu::dispatch(ctx, a, &self.target()) => OverlayOutcome::Close,
+            _ => OverlayOutcome::Keep,
         }
     }
 
@@ -197,6 +250,7 @@ impl Overlay for ProgrammeOverlay {
         let h24 = ctx.config.interface.clock_24h;
         let acts = self.actions(now);
         self.cursor = self.cursor.min(acts.len().saturating_sub(1));
+        let spoilers = crate::ui::widgets::spoiler::Spoilers::of(ctx);
         let mut clicked = None;
         card_area(egui_ctx, theme, "programme", CardKind::Popup, 520.0 * theme.rem(), None, |ui| {
             let Some(l) = &self.loaded else {
@@ -205,9 +259,13 @@ impl Overlay for ProgrammeOverlay {
             };
             match (&l.programme, &l.slim) {
                 (Some(p), Some(s)) => {
-                    ui.add(egui::Label::new(RichText::new(&p.title).size(theme.font(TypeToken::Heading)).color(t.fg)).wrap());
-                    if let Some(sub) = p.sub_title.as_deref().filter(|x| !x.is_empty()) {
-                        ui.label(RichText::new(sub).size(theme.font(TypeToken::Title)).color(t.text_secondary));
+                    // the spoiler guard's view of the text (S-ui draws what replaces hidden text)
+                    let subj = crate::ui::widgets::spoiler::programme_subject(p);
+                    let title = spoilers.text(&subj, crate::guard::Field::Title, &p.title).unwrap_or_default();
+                    ui.add(egui::Label::new(RichText::new(title.as_ref()).size(theme.font(TypeToken::Heading)).color(t.fg)).wrap());
+                    let sub = p.sub_title.as_deref().filter(|x| !x.is_empty()).and_then(|x| spoilers.text(&subj, crate::guard::Field::SubTitle, x));
+                    if let Some(sub) = sub {
+                        ui.label(RichText::new(sub.as_ref()).size(theme.font(TypeToken::Title)).color(t.text_secondary));
                     }
                     let mut when = format!("{} · {}", day_label(s.start), time_range(s.start, s.stop, h24));
                     if let Some(ch) = &l.channel {
@@ -247,10 +305,12 @@ impl Overlay for ProgrammeOverlay {
                             ui.label(RichText::new(time_left(s.stop - now)).size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
                         });
                     }
-                    if let Some(d) = p.description.as_deref().filter(|d| !d.is_empty()) {
+                    let descr =
+                        p.description.as_deref().filter(|d| !d.is_empty()).and_then(|d| spoilers.text(&subj, crate::guard::Field::Description, d));
+                    if let Some(d) = descr {
                         ui.add_space(theme.space(SpaceToken::Md));
                         egui::ScrollArea::vertical().max_height(egui_ctx.content_rect().height() * 0.35).show(ui, |ui| {
-                            ui.add(egui::Label::new(RichText::new(d).size(theme.font(TypeToken::Body)).color(t.fg)).wrap());
+                            ui.add(egui::Label::new(RichText::new(d.as_ref()).size(theme.font(TypeToken::Body)).color(t.fg)).wrap());
                         });
                     }
                 }

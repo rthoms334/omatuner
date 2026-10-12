@@ -858,12 +858,19 @@ impl VodBrowser {
             mi(glyphs::HIDDEN, "Hide", Action::ToggleHidden, "Ctrl+H"),
             mi(glyphs::SORT, "Sort & view options…", Action::SortMenu, "Ctrl+S"),
         ]);
+        crate::ui::item_menu::extend(&mut items, &crate::ui::item_menu::Target::vod(v.kind), ctx, KeyContext::List);
         ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: v.name.to_string(), items }));
     }
 
     /// Item actions shared by the grid keys and the context menu.
     fn item_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
         self.pending_cat = None;
+        // the batch features' keys and menu choices on the card (Ctrl+N…)
+        if let Some(v) = self.current(ctx)
+            && crate::ui::item_menu::dispatch(ctx, action, &crate::ui::item_menu::Target::vod(v.kind))
+        {
+            return true;
+        }
         let item_actions = [
             Action::ToggleFavourite,
             Action::AddToList,

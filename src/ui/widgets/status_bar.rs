@@ -35,6 +35,19 @@ pub struct StatusInfo<'a> {
     pub now_playing: Option<&'a str>,
     /// The focused / hovered item with its playlist's full name ([`take_focus`]).
     pub focus: Option<&'a str>,
+    /// The batch features' chips, right of the now-playing chip (the spoiler guard's
+    /// "Spoilers shown · 14 min ✕"; base-B slot).
+    pub chips: &'a [StatusChip],
+}
+
+/// A feature's status chip: clicking it runs `action` as a global key.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatusChip {
+    pub text: String,
+    /// The accessible name.
+    pub label: String,
+    pub action: Action,
+    pub warning: bool,
 }
 
 /// The focus line noted this frame: (text, from the pointer). A hovered item beats the
@@ -86,6 +99,8 @@ pub enum StatusClick {
     OpenPlayer,
     /// ✕ on the chip.
     StopPlayback,
+    /// A feature's chip (its action).
+    Chip(Action),
 }
 
 /// "Refreshing My IPTV · 45 % (+1)" for the first job of `jobs`.
@@ -137,6 +152,11 @@ pub fn status_bar(ui: &mut egui::Ui, theme: &Theme, info: &StatusInfo<'_>) -> St
                 }
             });
             ui.spacing_mut().item_spacing.x = gap;
+        }
+        for c in info.chips {
+            if chip(ui, c.text.clone(), if c.warning { t.warning } else { t.text_secondary }, size, &c.label).clicked() {
+                click = StatusClick::Chip(c.action);
+            }
         }
         if info.offline {
             ui.label(egui::RichText::new(format!("{} Offline — showing saved data", glyphs::OFFLINE)).size(size).color(t.warning));

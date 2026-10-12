@@ -6,7 +6,7 @@
 //! two must come from different playlists. Sound stays where it is until `M`; moving a playing
 //! picture to its other playlist always asks (Enter = Move).
 
-use eframe::egui::Rect;
+use eframe::egui::{self, Rect};
 
 use crate::config::{MultiViewLayout, PopoutCorner};
 use crate::model::{ChannelId, SourceId, TileId};
@@ -127,3 +127,36 @@ pub fn plan(req: &PlaceRequest, limits: &LimitsView) -> Result<PlacementPlan, Un
 
 /// MV-2 flips this in its last commit (Ctrl+M opens multi-view, MCP lists `multiview`).
 pub const ENABLED: bool = false;
+
+// ------------------------------------------------------------------ base-B hooks (MV-2's)
+
+/// Its entries in an item menu ("Watch alongside", Ctrl+M; `ui::item_menu::extend`); none
+/// while multi-view is off.
+pub fn menu_items(
+    _target: &crate::ui::item_menu::Target,
+    _ctx: &crate::ui::UiCtx<'_>,
+    _keys: crate::keymap::KeyContext,
+) -> Vec<crate::ui::overlays::MenuItem> {
+    Vec::new()
+}
+
+/// Ctrl+M on an item (`ui::item_menu::dispatch`); false while multi-view is off.
+pub fn on_action(_ctx: &mut crate::ui::UiCtx<'_>, _action: crate::keymap::Action, _target: &crate::ui::item_menu::Target) -> bool {
+    false
+}
+
+/// "Watch alongside…" (`OverlayRequest::WatchAlongside`): choose the channel for the other
+/// picture.
+pub struct AlongsidePicker;
+
+impl crate::ui::overlays::Overlay for AlongsidePicker {
+    fn key_contexts(&self) -> Vec<crate::keymap::KeyContext> {
+        vec![crate::keymap::KeyContext::Modal]
+    }
+    fn on_action(&mut self, _ctx: &mut crate::ui::UiCtx<'_>, _action: crate::keymap::Action) -> crate::ui::overlays::OverlayOutcome {
+        crate::ui::overlays::OverlayOutcome::Close
+    }
+    fn ui(&mut self, _egui_ctx: &egui::Context, _ctx: &mut crate::ui::UiCtx<'_>) -> crate::ui::overlays::OverlayOutcome {
+        crate::ui::overlays::OverlayOutcome::Close
+    }
+}

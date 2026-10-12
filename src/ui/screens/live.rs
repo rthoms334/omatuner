@@ -279,16 +279,17 @@ impl GuideStatus {
         }
     }
 
-    /// (channels with a guide, all channels) of the library (cached per snapshot).
+    /// (shown channels with a guide, shown channels) of the library (cached per snapshot;
+    /// `guide_fix::coverage`, the one coverage function).
     pub(crate) fn coverage(&mut self, ctx: &UiCtx<'_>) -> (usize, usize) {
         let key = ctx.lib.generation;
         match self.coverage {
             Some((k, covered, total)) if k == key => (covered, total),
             _ => {
-                let all = &ctx.lib.live.channels;
-                let covered = all.iter().filter(|c| c.epg_channel_id.is_some()).count();
-                self.coverage = Some((key, covered, all.len()));
-                (covered, all.len())
+                let cov = crate::guide_fix::coverage(ctx.lib);
+                let (covered, total) = (cov.iter().map(|c| c.with_guide).sum(), cov.iter().map(|c| c.shown).sum());
+                self.coverage = Some((key, covered, total));
+                (covered, total)
             }
         }
     }
@@ -439,8 +440,16 @@ impl ProgrammeDetails {
         if !self.loaded_desc {
             match now_prog {
                 Some(p) => {
+                    let spoilers = crate::ui::widgets::spoiler::Spoilers::of(ctx);
                     if let Some(r) = ctx.budget.run(|| crate::store::epg::programme(db, p.id)) {
-                        self.description = r.ok().and_then(|full: Programme| full.description);
+                        // what the spoiler guard lets the details pane say
+                        self.description = r.ok().and_then(|full: Programme| {
+                            let subj = crate::ui::widgets::spoiler::programme_subject(&full);
+                            full.description
+                                .as_deref()
+                                .and_then(|d| spoilers.text(&subj, crate::guard::Field::Description, d))
+                                .map(|d| d.into_owned())
+                        });
                         self.loaded_desc = true;
                     }
                 }
@@ -1466,6 +1475,12 @@ impl LiveScreen {
 
     fn channel_command(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
         let cur = self.cursor_channel().and_then(|id| ctx.lib.live.get(id).cloned());
+        // the batch features' keys and menu choices on the channel (Ctrl+N, Ctrl+M…)
+        if let Some(ch) = &cur
+            && crate::ui::item_menu::dispatch(ctx, action, &crate::ui::item_menu::Target::Channel(ch.id))
+        {
+            return true;
+        }
         match action {
             Action::FocusNext | Action::FocusPrev => {
                 self.focus_groups(ctx.layout);
@@ -1560,6 +1575,7 @@ impl LiveScreen {
         if matches!(self.open, Some(Entry::Reminders)) {
             items.push(menu_item(glyphs::CLOSE, "Cancel reminder", Action::Remove, true, k));
         }
+        crate::ui::item_menu::extend(&mut items, &crate::ui::item_menu::Target::Channel(ch.id), ctx, k);
         self.menu = Some(Menu::Context);
         ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: ch.name.to_string(), items }));
     }

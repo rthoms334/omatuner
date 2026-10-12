@@ -69,19 +69,53 @@ use crate::ui::widgets::toggle::toggle;
 use crate::ui::widgets::{RowState, empty_state, glyphs, rows, section};
 use crate::ui::{LayoutClass, OnboardingStart, OverlayRequest, Route, Screen, ScreenId, SettingsPage, UiCtx};
 
-const PAGES: [(SettingsPage, &str, &str); 11] = [
+// The batch features' parts of Settings (base-B): each file is its track's, with the same
+// hooks — `rows` (its rows on the pages it adds to), `act` (its `Act::Feature` buttons), `item`
+// (Enter on its `Item::Feature` rows) and, for a page of its own, `enter` (load on entering).
+mod following; // F-C: the Following page (DESIGN §33)
+mod guide_fix; // G-ui: EPG ▸ "Fix guide data… (N to fix)" (DESIGN §31)
+mod multiview; // MV-2: Player ▸ Multi-view (DESIGN §35)
+mod queue; // Q-ui: Interface ▸ Playback ▸ "Play the next item after" (DESIGN §32)
+mod reminders; // rui: Reminders ▸ open in, while closed, sleep timer (B6)
+mod spoiler; // S-ui: the Spoiler guard page (DESIGN §34)
+
+/// Which feature file a `Act::Feature` / `Item::Feature` row belongs to.
+#[allow(dead_code)] // base-B: each feature file constructs its own once its track fills it
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Feature {
+    Following,
+    GuideFix,
+    MultiView,
+    Queue,
+    Reminders,
+    Spoiler,
+}
+
+/// Every page in list order (`pages` leaves out the features that are off).
+const PAGES_ALL: [(SettingsPage, &str, &str); 13] = [
     (SettingsPage::Playlists, glyphs::PLAYLIST, "Playlists"),
     (SettingsPage::Epg, glyphs::GUIDE, "EPG"),
     (SettingsPage::Player, glyphs::PLAY, "Player"),
     (SettingsPage::Interface, glyphs::DISPLAY, "Interface"),
     (SettingsPage::Favourites, glyphs::FAVOURITE, "Favourites"),
     (SettingsPage::Reminders, glyphs::REMINDER, "Reminders"),
+    (SettingsPage::Following, glyphs::FOLLOW, "Following"),
+    (SettingsPage::SpoilerGuard, glyphs::SPOILER, "Spoiler guard"),
     (SettingsPage::Parental, glyphs::LOCK, "Parental"),
     (SettingsPage::Backup, glyphs::BACKUP, "Backup"),
     (SettingsPage::Hidden, glyphs::HIDDEN, "Hidden items"),
     (SettingsPage::Orphans, glyphs::WARNING, "Orphans"),
     (SettingsPage::About, glyphs::INFO, "About & logs"),
 ];
+
+/// The pages listed (a feature's page only once the feature is on).
+fn pages() -> impl Iterator<Item = (SettingsPage, &'static str, &'static str)> {
+    PAGES_ALL.into_iter().filter(|(p, ..)| match p {
+        SettingsPage::Following => crate::follow::ENABLED,
+        SettingsPage::SpoilerGuard => crate::spoiler::ENABLED,
+        _ => true,
+    })
+}
 
 // ------------------------------------------------------------------ config row tables
 
@@ -389,6 +423,9 @@ enum Item {
     Orphan(ItemRef),
     /// Index into the attach view's candidates (rebuilt only by its own filter).
     AttachTarget(usize),
+    /// A feature file's row (a Following rule, a spoiler topic…), keyed by its own id.
+    #[allow(dead_code)] // base-B: made by the feature files
+    Feature(Feature, i64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -413,6 +450,9 @@ enum Act {
     CloseAttach,
     /// "Give each its own colour": playlists that look the same get the first free colours.
     DistinctColours,
+    /// A feature file's button (its own numbering).
+    #[allow(dead_code)] // base-B: made by the feature files
+    Feature(Feature, u16),
 }
 
 /// Local (non-config) fields: forms and the source editor.
@@ -748,6 +788,11 @@ enum Pane {
 
 #[derive(Default)]
 pub struct SettingsScreen {
+    /// The feature files' own state (base-B: one field per file, so they never collide).
+    #[allow(dead_code)] // base-B: F-C's
+    following: following::State,
+    #[allow(dead_code)] // base-B: S-ui's
+    spoiler: spoiler::State,
     page: SettingsPage,
     pane: Pane,
     /// When a click on the page list last opened a page (egui time): at Compact the page
@@ -768,6 +813,8 @@ pub struct SettingsScreen {
     epg_loader: Option<Loader<GuideList>>,
     /// Channels with a guide per playlist, for the library build in `.0` (Playlists rows).
     guide_counts: (u64, HashMap<SourceId, usize>),
+    /// Shown channels of every playlist, with `guide_counts`.
+    guide_shown: usize,
     reminders: Vec<Reminder>,
     reminders_loader: Option<Loader<Vec<Reminder>>>,
     orphans: Vec<Orphan>,
@@ -855,7 +902,33 @@ impl SettingsScreen {
                 self.hidden_loader = Some(Loader::start(ctx, load_hidden_vod));
                 self.links_loader = Some(Loader::start(ctx, crate::store::titles::links));
             }
+            SettingsPage::Following => following::enter(self, ctx),
+            SettingsPage::SpoilerGuard => spoiler::enter(self, ctx),
             _ => {}
+        }
+    }
+
+    /// A feature file's button.
+    fn feature_act(&mut self, ctx: &mut UiCtx<'_>, f: Feature, n: u16) {
+        match f {
+            Feature::Following => following::act(self, ctx, n),
+            Feature::GuideFix => guide_fix::act(self, ctx, n),
+            Feature::MultiView => multiview::act(self, ctx, n),
+            Feature::Queue => queue::act(self, ctx, n),
+            Feature::Reminders => reminders::act(self, ctx, n),
+            Feature::Spoiler => spoiler::act(self, ctx, n),
+        }
+    }
+
+    /// Enter on a feature file's row.
+    fn feature_item(&mut self, ctx: &mut UiCtx<'_>, f: Feature, id: i64) {
+        match f {
+            Feature::Following => following::item(self, ctx, id),
+            Feature::GuideFix => guide_fix::item(self, ctx, id),
+            Feature::MultiView => multiview::item(self, ctx, id),
+            Feature::Queue => queue::item(self, ctx, id),
+            Feature::Reminders => reminders::item(self, ctx, id),
+            Feature::Spoiler => spoiler::item(self, ctx, id),
         }
     }
 
@@ -1077,13 +1150,14 @@ impl SettingsScreen {
                         reorder: true,
                     });
                 }
-                if let Some(note) = coverage_note(&self.epg_sources, self.guide_counts.1.values().sum(), ctx.lib.live.channels.len()) {
+                if let Some(note) = coverage_note(&self.epg_sources, self.guide_counts.1.values().sum(), self.guide_shown) {
                     v.push(Row::Note(note, true));
                 }
                 v.push(Row::Local { field: Local::NewEpgUrl, label: "Add an XMLTV URL" });
                 v.push(Row::Act { act: Act::AddEpgUrl, icon: glyphs::ADD, label: "Add URL".into(), danger: false });
                 v.push(Row::Act { act: Act::AddEpgFile, icon: glyphs::FOLDER, label: "Add a guide file…".into(), danger: false });
                 v.push(Row::Act { act: Act::EpgMapping, icon: glyphs::GUIDE, label: "EPG mapping…".into(), danger: false });
+                guide_fix::rows(self, ctx, &mut v);
                 v.push(Row::Section("Options".into()));
                 v.extend(EPG_N.iter().map(Row::Number));
                 v.push(Row::Toggle(&EPG_T));
@@ -1110,6 +1184,7 @@ impl SettingsScreen {
                     "o in the player (Ctrl+Shift+O anywhere) pops it out into a small window on every workspace. Omarchy's Super+O works too.".into(),
                     false,
                 ));
+                multiview::rows(self, ctx, &mut v);
             }
             SettingsPage::Interface => {
                 v.push(Row::Section("Layout".into()));
@@ -1125,6 +1200,7 @@ impl SettingsScreen {
                 v.push(Row::Number(&IFACE_N[0]));
                 v.extend(IFACE_T[3..5].iter().map(Row::Toggle));
                 v.push(Row::Number(&IFACE_N[1]));
+                queue::rows(self, ctx, &mut v);
                 v.push(Row::Section("Sorting".into()));
                 v.extend(IFACE_C[3..6].iter().map(Row::Choice));
                 v.push(Row::Toggle(&IFACE_T[10]));
@@ -1189,7 +1265,10 @@ impl SettingsScreen {
                         )),
                     ));
                 }
+                reminders::rows(self, ctx, &mut v);
             }
+            SettingsPage::Following => following::rows(self, ctx, &mut v),
+            SettingsPage::SpoilerGuard => spoiler::rows(self, ctx, &mut v),
             SettingsPage::Parental => {
                 let has_pin = ctx.config.parental.pin_hash.is_some();
                 v.push(Row::Section("Parental lock".into()));
@@ -1753,6 +1832,7 @@ impl SettingsScreen {
 
     fn act(&mut self, ctx: &mut UiCtx<'_>, act: Act) {
         match act {
+            Act::Feature(f, n) => self.feature_act(ctx, f, n),
             Act::DistinctColours => {
                 let theme = ctx.theme;
                 let fixes = crate::ui::scope::distinct_colors(&self.looks(), |c| theme.source_color(c));
@@ -2089,6 +2169,7 @@ impl SettingsScreen {
             Item::AttachTarget(i) => self.attach_to(ctx, i),
             Item::Reminder(_) => self.item_menu(ctx, item),
             Item::Explicit(id) => self.toggle_explicit_item(ctx, id),
+            Item::Feature(f, id) => self.feature_item(ctx, f, id),
         }
     }
 
@@ -2236,7 +2317,8 @@ impl SettingsScreen {
                 let Some(g) = all_groups(ctx).find(|g| g.id == id) else { return };
                 (g.display_name().to_owned(), vec![super::live::explicit_menu_item(g, MENU_TOGGLE)])
             }
-            Item::AttachTarget(_) | Item::Categories(_) => return,
+            // a feature file opens its own menu from `item`
+            Item::AttachTarget(_) | Item::Categories(_) | Item::Feature(..) => return,
         };
         self.pending = Some(Pending::Menu(item));
         ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title, items }));
@@ -2582,6 +2664,8 @@ impl Screen for SettingsScreen {
                     DataScope::Epg => self.page == SettingsPage::Epg,
                     DataScope::Reminders => self.page == SettingsPage::Reminders,
                     DataScope::Overrides => matches!(self.page, SettingsPage::Hidden | SettingsPage::Orphans),
+                    DataScope::Follow => self.page == SettingsPage::Following,
+                    DataScope::Spoiler => self.page == SettingsPage::SpoilerGuard,
                     DataScope::All => true,
                     _ => false,
                 };
@@ -2677,16 +2761,17 @@ impl Screen for SettingsScreen {
 
     fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
         if self.pane == Pane::Pages {
-            let i = PAGES.iter().position(|p| p.0 == self.page).unwrap_or(0);
+            let pages: Vec<_> = pages().collect();
+            let i = pages.iter().position(|p| p.0 == self.page).unwrap_or(0);
             match action {
                 Action::Up | Action::Down => {
-                    let j = if action == Action::Up { i.saturating_sub(1) } else { (i + 1).min(PAGES.len() - 1) };
+                    let j = if action == Action::Up { i.saturating_sub(1) } else { (i + 1).min(pages.len() - 1) };
                     // blocked: back to the editor, where Esc (as the toast says) discards
                     if j != i && !self.may_leave_editor(ctx) {
                         self.pane = Pane::Content;
                         return true;
                     }
-                    self.set_page(ctx, PAGES[j].0);
+                    self.set_page(ctx, pages[j].0);
                 }
                 Action::Activate | Action::Right | Action::FocusNext | Action::FocusPrev => self.pane = Pane::Content,
                 // leaving Settings would keep unsaved editor changes hidden behind a later visit
@@ -2920,14 +3005,13 @@ impl SettingsScreen {
                 Err(e) => kit::error_toast(ctx, "Couldn't read the guides", &e),
             }
         }
-        // channels with a guide per playlist (one pass per library build)
+        // shown channels with a guide per playlist (one pass per library build;
+        // `guide_fix::coverage`, the one coverage function)
         let built = ctx.lib.generation;
         if matches!(self.page, SettingsPage::Playlists | SettingsPage::Epg) && self.guide_counts.0 != built {
-            let mut m: HashMap<SourceId, usize> = HashMap::new();
-            for c in ctx.lib.live.channels.iter().filter(|c| c.epg_channel_id.is_some()) {
-                *m.entry(c.source_id).or_default() += 1;
-            }
-            self.guide_counts = (built, m);
+            let cov = crate::guide_fix::coverage(ctx.lib);
+            self.guide_shown = cov.iter().map(|c| c.shown).sum();
+            self.guide_counts = (built, cov.iter().map(|c| (c.source, c.with_guide)).collect());
         }
         if let Some(r) = kit::poll(&mut self.reminders_loader) {
             match r {
@@ -2966,7 +3050,7 @@ impl SettingsScreen {
         ui.add_space(theme.space(SpaceToken::Md));
         let mut clicked = None;
         egui::ScrollArea::vertical().id_salt("settings-pages-scroll").auto_shrink([false, false]).show(ui, |ui| {
-            for (page, icon, label) in PAGES {
+            for (page, icon, label) in pages() {
                 let selected = page == self.page;
                 // hover lights a page only while the keyboard cursor is in the content (one
                 // cursor at a time; moving it here would switch the page under the pointer)
@@ -3007,7 +3091,7 @@ impl SettingsScreen {
         let mut item_rects: Vec<(usize, egui::Rect)> = Vec::new();
         // the way out of a sub-view (Esc): the source editor or attach view to their page, and
         // in Compact (one pane at a time) the page to the page list
-        let page_label = PAGES.iter().find(|p| p.0 == self.page).map_or("Settings", |p| p.2);
+        let page_label = PAGES_ALL.iter().find(|p| p.0 == self.page).map_or("Settings", |p| p.2);
         let back_to = if self.attach.is_some() || self.editor.is_some() {
             Some(page_label)
         } else if ctx.layout == LayoutClass::Compact {

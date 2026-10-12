@@ -341,7 +341,11 @@ fn multi_view_keys() {
         assert_eq!(resolve(&stack, &ctrl(Key::M)), Some(Action::WatchAlongside), "{stack:?}");
     }
     assert_eq!(resolve(&[K::TextInput, K::Modal], &ctrl(Key::M)), None);
-    assert_eq!(hint_line(&mv), "w next picture · M sound here · W swap · t layout · q close picture");
+    if tuner::ui::multiview::ENABLED {
+        assert_eq!(hint_line(&mv), "w next picture · M sound here · W swap · t layout · q close picture");
+    } else {
+        assert_eq!(hint_line(&mv), hint_line(&[K::PlayerLive]), "multi-view's hints wait for the feature");
+    }
 }
 
 /// Guide fixes (DESIGN §31) on the mapping screen only; Delete ends a news flash in the
@@ -386,10 +390,13 @@ fn help_is_complete_for_every_context() {
         assert!(!ctx.title().is_empty());
         titles.push(ctx.title());
         let rows = help_rows(ctx);
-        assert!(!rows.is_empty(), "{ctx:?} has no help rows");
-        // every binding of the context appears with its key in the row for its help text
+        // a context of a feature that is off (multi-view) lists nothing yet
+        let on = tables(ctx).iter().any(|t| t.iter().any(|b| tuner::keymap::feature_on(b.action)));
+        assert_eq!(rows.is_empty(), !on, "{ctx:?}");
+        // every binding of the context appears with its key in the row for its help text,
+        // once its feature is on
         for t in tables(ctx) {
-            for b in t.iter() {
+            for b in t.iter().filter(|b| tuner::keymap::feature_on(b.action)) {
                 let row = rows.iter().find(|(_, h)| *h == b.help).unwrap_or_else(|| panic!("{ctx:?}: '{}' missing", b.help));
                 assert!(row.0.split(" / ").any(|k| k == b.chord.label()), "{ctx:?}: {} missing in '{}'", b.chord.label(), row.0);
             }
@@ -435,7 +442,8 @@ fn labels_are_human() {
 #[test]
 fn hint_line_comes_from_the_tables() {
     assert_eq!(hint_line(&[K::List]), "Enter play · Shift+Enter fullscreen · Ctrl+F fav · Shift+F10 more · ? help");
-    assert_eq!(hint_line(&[K::Guide]), "Enter details · w watch · r remind · R follow · ? help");
+    let follow = if tuner::follow::ENABLED { " · R follow" } else { "" };
+    assert_eq!(hint_line(&[K::Guide]), format!("Enter details · w watch · r remind{follow} · ? help"));
     // the innermost context with hints wins; contexts without hints are skipped
     assert_eq!(hint_line(&[K::PlayerOsd, K::List]), hint_line(&[K::List]));
     assert!(hint_line(&[K::Modal]).starts_with("Enter confirm"));

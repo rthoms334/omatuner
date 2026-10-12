@@ -27,6 +27,8 @@ pub const ITEMS: &[SidebarItem] = &[
     SidebarItem { id: ScreenId::Guide, glyph: glyphs::GUIDE, label: "Guide" },
     SidebarItem { id: ScreenId::Movies, glyph: glyphs::MOVIES, label: "Movies" },
     SidebarItem { id: ScreenId::Series, glyph: glyphs::SERIES, label: "Series" },
+    // only while Up next has pending items (DESIGN §32; Q-ui draws the count)
+    SidebarItem { id: ScreenId::Queue, glyph: glyphs::UP_NEXT, label: "Up next" },
     SidebarItem { id: ScreenId::Settings, glyph: glyphs::SETTINGS, label: "Settings" },
 ];
 
@@ -42,11 +44,13 @@ pub fn is_current(id: ScreenId, current: ScreenId) -> bool {
         || (id == ScreenId::Settings && matches!(current, ScreenId::Logs | ScreenId::EpgMapping))
 }
 
-/// The visible entries in order; `None` marks the search button.
-fn entries(has_vod: bool) -> impl Iterator<Item = Option<&'static SidebarItem>> {
+/// The visible entries in order; `None` marks the search button. `up_next`: Up next's pending
+/// items (`None`: the entry is hidden).
+fn entries(has_vod: bool, up_next: Option<usize>) -> impl Iterator<Item = Option<&'static SidebarItem>> {
     ITEMS
         .iter()
         .filter(move |it| has_vod || !matches!(it.id, ScreenId::Movies | ScreenId::Series))
+        .filter(move |it| up_next.is_some() || it.id != ScreenId::Queue)
         .flat_map(|it| (it.id == ScreenId::Settings).then_some(None).into_iter().chain([Some(it)]))
 }
 
@@ -82,14 +86,22 @@ fn entry(ui: &mut egui::Ui, theme: &Theme, it: &SidebarItem, size: egui::Vec2, e
 }
 
 /// Draw; returns the clicked item. `search_clicked` is set when the search entry is clicked.
-pub fn sidebar(ui: &mut egui::Ui, theme: &Theme, current: ScreenId, expanded: bool, has_vod: bool, search_clicked: &mut bool) -> Option<ScreenId> {
+pub fn sidebar(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    current: ScreenId,
+    expanded: bool,
+    has_vod: bool,
+    up_next: Option<usize>,
+    search_clicked: &mut bool,
+) -> Option<ScreenId> {
     let side = theme.space(SpaceToken::ControlHeight) + theme.space(SpaceToken::Md);
     let strip = ui.layout().main_dir().is_horizontal();
     let mut clicked = None;
     if !strip {
         ui.add_space(theme.space(SpaceToken::PanelPadding));
     }
-    for e in entries(has_vod) {
+    for e in entries(has_vod, up_next) {
         let it = e.unwrap_or(&SEARCH);
         if strip {
             if e.is_none() {
@@ -116,9 +128,10 @@ mod tests {
 
     #[test]
     fn vod_entries_hide_without_vod_and_search_precedes_settings() {
-        let labels = |vod| entries(vod).map(|e| e.map_or("Search", |it| it.label)).collect::<Vec<_>>();
-        assert_eq!(labels(true), ["Home", "Live TV", "Guide", "Movies", "Series", "Search", "Settings"]);
-        assert_eq!(labels(false), ["Home", "Live TV", "Guide", "Search", "Settings"]);
+        let labels = |vod, up_next| entries(vod, up_next).map(|e| e.map_or("Search", |it| it.label)).collect::<Vec<_>>();
+        assert_eq!(labels(true, None), ["Home", "Live TV", "Guide", "Movies", "Series", "Search", "Settings"]);
+        assert_eq!(labels(false, None), ["Home", "Live TV", "Guide", "Search", "Settings"]);
+        assert_eq!(labels(false, Some(2)), ["Home", "Live TV", "Guide", "Up next", "Search", "Settings"]);
         assert!(is_current(ScreenId::Movies, ScreenId::MovieDetail));
         assert!(!is_current(ScreenId::Live, ScreenId::Guide));
     }

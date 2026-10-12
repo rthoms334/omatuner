@@ -1031,10 +1031,34 @@ fn resolve_inner(stack: &[KeyContext], ev: &egui::Event) -> Option<Action> {
 }
 
 /// Rows for the help overlay of one context: (merged key labels, description).
+/// Whether `a` belongs to a feature that is on: the batch features' keys stay bound (so the
+/// no-duplicate tests cover them) but are left out of the help overlay and the hint line until
+/// their feature's `ENABLED` flips (base-B; each track flips only its flag).
+pub fn feature_on(a: Action) -> bool {
+    match a {
+        A::QueueAdd | A::QueuePlayNext | A::GoQueue | A::QueuePanel | A::QueueNext | A::QueuePrev => crate::queue::ENABLED,
+        A::FollowProgramme => crate::follow::ENABLED,
+        A::RevealSpoilers | A::SpoilerMenu => crate::spoiler::ENABLED,
+        A::AcceptFix | A::ShiftLater | A::ShiftEarlier | A::UndoGuideFix(_) => crate::guide_fix::ENABLED,
+        A::NextPicture
+        | A::FocusPictureLeft
+        | A::FocusPictureRight
+        | A::FocusPictureUp
+        | A::FocusPictureDown
+        | A::SoundHere
+        | A::SwapPictures
+        | A::CycleLayout
+        | A::ClosePicture
+        | A::WatchAlongside => crate::ui::multiview::ENABLED,
+        A::SleepTimer | A::EndNewsFlash => crate::reminders::ENABLED,
+        _ => true,
+    }
+}
+
 pub fn help_rows(ctx: KeyContext) -> Vec<(String, &'static str)> {
     let mut rows: Vec<(String, &'static str)> = Vec::new();
     for table in tables(ctx) {
-        for bd in table.iter() {
+        for bd in table.iter().filter(|bd| feature_on(bd.action)) {
             let label = bd.chord.label();
             if let Some(r) = rows.iter_mut().find(|r| r.1 == bd.help) {
                 if !r.0.split(" / ").any(|l| l == label) {
@@ -1110,12 +1134,17 @@ pub fn hints(stack: &[KeyContext]) -> Vec<(Action, KeyChord, &'static str)> {
             },
         };
         let t = tables(*ctx);
-        return items
+        let v: Vec<_> = items
             .iter()
+            .filter(|(a, _)| feature_on(*a))
             .filter_map(|(a, verb)| {
                 t.iter().chain(std::iter::once(&GLOBAL)).find_map(|tb| tb.iter().find(|bd| bd.action == *a)).map(|bd| (*a, bd.chord, *verb))
             })
             .collect();
+        // a context whose hints are all of a feature that is off (multi-view) gives way
+        if !v.is_empty() {
+            return v;
+        }
     }
     Vec::new()
 }
@@ -1289,7 +1318,9 @@ mod tests {
     fn every_hint_verb_finds_its_key() {
         for (ctx, items) in HINTS {
             let line = hint_line(&[*ctx]);
-            assert_eq!(line.split(" · ").count(), items.len(), "{ctx:?}: {line}");
+            // a feature that is off leaves its verbs out (a context of only those gives way)
+            let on = items.iter().filter(|(a, _)| feature_on(*a)).count();
+            assert_eq!(if line.is_empty() { 0 } else { line.split(" · ").count() }, on, "{ctx:?}: {line}");
         }
         assert_eq!(hint_line(&[K::TextInput, K::Modal]), "Enter confirm · Tab next field · Esc leave");
         assert_eq!(hint_line(&[K::PlayerLive]), "", "no hint line in the player (no status bar)");
@@ -1368,7 +1399,9 @@ mod tests {
     fn every_context_has_a_title_and_rows() {
         for c in KeyContext::ALL {
             assert!(!c.title().is_empty());
-            assert!(!help_rows(c).is_empty(), "{c:?}");
+            // a context of a feature that is off (multi-view) lists nothing yet
+            let on = tables(c).iter().any(|t| t.iter().any(|b| feature_on(b.action)));
+            assert_eq!(help_rows(c).is_empty(), !on, "{c:?}");
         }
     }
 }

@@ -747,6 +747,17 @@ impl HomeScreen {
         }
     }
 
+    /// What the batch features act on for a tile.
+    fn tile_target(&self, tile: &Tile) -> Option<crate::ui::item_menu::Target> {
+        use crate::ui::item_menu::Target;
+        Some(match tile {
+            Tile::Channel { id, .. } => Target::Channel(*id),
+            Tile::Vod(kind) => Target::vod(*kind),
+            Tile::Continue(i) => Target::vod(self.continue_items.get(*i)?.card.kind),
+            Tile::Start(_) => return None,
+        })
+    }
+
     /// Display name of a tile (rename / hide / menu titles).
     fn tile_name(&self, ctx: &UiCtx<'_>, tile: &Tile) -> String {
         match tile {
@@ -772,6 +783,12 @@ impl HomeScreen {
 
     /// Item shortcuts (Help lists them for `[PosterGrid]`) and the context menu.
     fn item_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) {
+        // a feature's choice from the menu
+        if let Some(t) = self.current_tile().and_then(|(_, t)| self.tile_target(t))
+            && crate::ui::item_menu::dispatch(ctx, action, &t)
+        {
+            return;
+        }
         if action == Action::SortMenu {
             ctx.toast(crate::msg::Toast::info("Home follows your lists — sort in Live TV, Movies or Series"));
             return;
@@ -908,6 +925,9 @@ impl HomeScreen {
         items.push(mi(glyphs::TAG, "Rename…", Action::Rename, "F2"));
         items.push(mi(glyphs::LOCK, "Lock / unlock", Action::ToggleLock, "Ctrl+L"));
         items.push(mi(glyphs::HIDDEN, "Hide", Action::ToggleHidden, "Ctrl+H"));
+        if let Some(t) = self.tile_target(tile) {
+            crate::ui::item_menu::extend(&mut items, &t, ctx, KeyContext::List);
+        }
         ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: name.to_owned(), items }));
     }
 }
@@ -1034,6 +1054,12 @@ impl Screen for HomeScreen {
                 return true;
             }
             return matches!(action, Action::Up | Action::Down | Action::Left | Action::Right | Action::FilterInput(_));
+        }
+        // the batch features' keys on the tile (Ctrl+N, Ctrl+M…)
+        if let Some(t) = self.current_tile().and_then(|(_, t)| self.tile_target(t))
+            && crate::ui::item_menu::dispatch(ctx, action, &t)
+        {
+            return true;
         }
         match action {
             Action::Up | Action::Down => {

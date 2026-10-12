@@ -16,6 +16,7 @@ pub mod plan;
 pub mod preview;
 pub mod spec;
 pub mod suggest;
+pub mod ui;
 
 pub use spec::{Airings, ChannelScope, FollowKind, FollowMode, FollowSpec, Prefer, Shape};
 

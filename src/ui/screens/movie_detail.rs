@@ -222,6 +222,12 @@ impl MovieDetailScreen {
 
     /// Item shortcuts of the page (and its context menu).
     fn item_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) {
+        // a feature's choice from the menu
+        if let Some(id) = self.id
+            && crate::ui::item_menu::dispatch(ctx, action, &crate::ui::item_menu::Target::Movie(id))
+        {
+            return;
+        }
         let Some(item) = self.item(ctx) else { return };
         let title = self.title(ctx);
         // a combined title (DESIGN §29.15, P3): lock, hide and rename cover every copy, with Undo
@@ -275,6 +281,9 @@ impl MovieDetailScreen {
                     mi(glyphs::LOCK, if every { "Lock / unlock every copy" } else { "Lock / unlock" }, Action::ToggleLock, "Ctrl+L"),
                     mi(glyphs::HIDDEN, if every { "Hide every copy" } else { "Hide" }, Action::ToggleHidden, "Ctrl+H"),
                 ]);
+                if let Some(id) = self.id {
+                    crate::ui::item_menu::extend(&mut items, &crate::ui::item_menu::Target::Movie(id), ctx, KeyContext::Detail);
+                }
                 ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title, items }));
             }
             _ => kit::not_here(ctx),
@@ -394,6 +403,12 @@ impl Screen for MovieDetailScreen {
     }
 
     fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
+        // the batch features' keys on the movie (Ctrl+N, Ctrl+M…)
+        if let Some(id) = self.id
+            && crate::ui::item_menu::dispatch(ctx, action, &crate::ui::item_menu::Target::Movie(id))
+        {
+            return true;
+        }
         let n = self.focus_len(ctx);
         let buttons = self.buttons(ctx).len();
         let handled = match action {
@@ -548,8 +563,10 @@ impl Screen for MovieDetailScreen {
         }
         let mut text = Vec::new();
         if let Some(m) = &m {
-            if let Some(p) = m.plot.as_deref().filter(|p| !p.trim().is_empty()) {
-                text.push((p.to_owned(), false));
+            let spoilers = crate::ui::widgets::spoiler::Spoilers::of(ctx);
+            let subj = crate::guard::Subject::Vod { title: &m.name, series_norm: None };
+            if let Some(p) = m.plot.as_deref().filter(|p| !p.trim().is_empty()).and_then(|p| spoilers.text(&subj, crate::guard::Field::Plot, p)) {
+                text.push((p.into_owned(), false));
             }
             if let Some(c) = m.cast.as_deref().filter(|c| !c.trim().is_empty()) {
                 text.push((format!("Cast: {c}"), true));

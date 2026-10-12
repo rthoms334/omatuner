@@ -11,6 +11,7 @@ pub mod movie_detail;
 pub mod movies;
 pub mod onboarding;
 pub mod player;
+pub mod queue;
 pub mod series;
 pub mod series_detail;
 pub mod settings;
@@ -32,5 +33,6 @@ pub fn all() -> Vec<Box<dyn Screen>> {
         Box::new(onboarding::OnboardingScreen::default()),
         Box::new(epg_mapping::EpgMappingScreen::default()),
         Box::new(logs::LogsScreen::default()),
+        Box::new(queue::QueueScreen::default()),
     ]
 }

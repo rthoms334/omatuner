@@ -342,7 +342,8 @@ mod tests {
     #[test]
     fn filter_matches_keys_descriptions_and_sections() {
         let (all, total) = HelpOverlay::new().sections();
-        assert_eq!(all.len(), KeyContext::ALL.len());
+        // every context with keys (a feature that is off, multi-view, lists none yet)
+        assert_eq!(all.len(), KeyContext::ALL.into_iter().filter(|c| !keymap::help_rows(*c).is_empty()).count());
         assert_eq!(all.iter().map(|(_, r)| r.len()).sum::<usize>(), total);
 
         // key combo

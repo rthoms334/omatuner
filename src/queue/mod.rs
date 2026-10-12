@@ -15,6 +15,7 @@
 pub mod machine;
 pub mod model;
 pub mod service;
+pub mod ui;
 
 pub use model::{
     AddTarget, AddedBy, Blocked, Countdown, CountdownWhy, FinishedWhy, Insert, NextEpisode, PlayReply, QueueCommand, QueueEntry, QueueReply,
