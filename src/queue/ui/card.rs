@@ -128,7 +128,6 @@ impl Card {
                 Some(t) => format!("Stopped after {t}, as asked"),
                 None => "Stopped, as asked".to_owned(),
             },
-            FinishedWhy::Sleep => "Up next stopped for the sleep timer".to_owned(),
         };
         Some(Card::Finished { text, offer: s.next_episode.as_ref().map(|e| (e.id, e.label.clone())) })
     }
@@ -276,7 +275,8 @@ mod tests {
         assert_eq!(Card::of(&s, 100).unwrap().short(100).as_deref(), Some("Next in 8 s"));
 
         s.countdown = Some(Countdown { id: None, at: Some(110), why: CountdownWhy::NextEpisode });
-        s.next_episode = Some(NextEpisode { id: EpisodeId(9), label: "S02E06 · Bad Dates".into() });
+        s.next_episode =
+            Some(NextEpisode { id: EpisodeId(9), label: "S02E06 · Bad Dates".into(), series: "Slow Horses".into(), season: 2, episode: 6 });
         let c = Card::of(&s, 100).unwrap();
         assert_eq!(c.lines(100, true), ("Next episode in 10 s".into(), Some("S02E06 · Bad Dates".into())));
         assert_eq!(c.buttons(), vec![Button::PlayNow, Button::Cancel]);

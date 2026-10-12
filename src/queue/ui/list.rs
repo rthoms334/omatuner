@@ -34,6 +34,17 @@ pub enum Line {
     Sleep(String),
 }
 
+/// The sleep timer as the list marks it (`reminders::sleep`'s status, read by the screen).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SleepMark {
+    /// At a time (or the end of what plays now): before the first row expected to start after.
+    At(Timestamp),
+    /// After this many more items: Up next's rows while it plays them, the one on now first.
+    Items(u32),
+    /// When Up next runs out: after its last row.
+    End,
+}
+
 /// Where the list is drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -71,8 +82,8 @@ pub struct QueueList {
     pub marks: Vec<QueueId>,
     /// The row being dragged by its handle.
     drag: Option<QueueId>,
-    /// What the lines were built from: (snapshot, filter, mode, sleep time).
-    built: Option<(Arc<QueueSnapshot>, String, Mode, Option<Timestamp>)>,
+    /// What the lines were built from: (snapshot, filter, mode, sleep timer).
+    built: Option<(Arc<QueueSnapshot>, String, Mode, Option<SleepMark>)>,
     /// The first late row (after the sleep marker).
     late_from: Option<usize>,
     /// The list's rect and the pointer's place last frame (drag auto-scroll).
@@ -80,17 +91,17 @@ pub struct QueueList {
 }
 
 impl QueueList {
-    /// Follow a new snapshot (cheap when nothing changed). `sleep_at`: a sleep timer at a fixed
-    /// time, drawn before the first row expected to start after it.
-    pub fn sync(&mut self, snap: Arc<QueueSnapshot>, mode: Mode, sleep_at: Option<Timestamp>) {
+    /// Follow a new snapshot (cheap when nothing changed). `sleep`: the sleep timer, if set
+    /// (its marker line).
+    pub fn sync(&mut self, snap: Arc<QueueSnapshot>, mode: Mode, sleep: Option<SleepMark>) {
         let q = self.list.filter.query().to_owned();
-        if self.built.as_ref().is_some_and(|(s, f, m, z)| (Arc::ptr_eq(s, &snap) || **s == *snap) && *f == q && *m == mode && *z == sleep_at) {
+        if self.built.as_ref().is_some_and(|(s, f, m, z)| (Arc::ptr_eq(s, &snap) || **s == *snap) && *f == q && *m == mode && *z == sleep) {
             return;
         }
         let keep = self.cursor_id();
         self.snap = snap.clone();
-        self.built = Some((snap, q, mode, sleep_at));
-        self.rebuild(mode, sleep_at);
+        self.built = Some((snap, q, mode, sleep));
+        self.rebuild(mode, sleep);
         self.marks.retain(|id| self.snap.row(*id).is_some_and(|r| r.entry.state == RowState::Pending));
         if self.drag.is_some_and(|d| self.snap.row(d).is_none()) {
             self.drag = None;
@@ -100,7 +111,7 @@ impl QueueList {
         self.list.set_len(self.lines.len());
     }
 
-    fn rebuild(&mut self, mode: Mode, sleep_at: Option<Timestamp>) {
+    fn rebuild(&mut self, mode: Mode, sleep: Option<SleepMark>) {
         let s = &self.snap;
         let mut lines = Vec::new();
         self.late_from = None;
@@ -137,9 +148,13 @@ impl QueueList {
         if !pending.is_empty() && !panel {
             lines.push(Line::Header("Next".into()));
         }
-        // the sleep marker: after the row Up next resolves it to (after what plays now: right
-        // under it), else before the first row expected to start after a fixed-time timer
-        let after = s.sleep.and_then(|z| z.after);
+        // the sleep marker: after the row it falls after (what plays now: right under it), else
+        // before the first row expected to start after a fixed-time timer
+        let after = sleep.and_then(|z| sleep_after(s, z));
+        let sleep_at = match sleep {
+            Some(SleepMark::At(t)) => Some(t),
+            _ => None,
+        };
         let marker = || Line::Sleep(format!("{} Sleep timer", glyphs::SLEEP));
         let mut marked = false;
         if let Some(a) = after.filter(|a| s.current == Some(*a)) {
@@ -247,7 +262,7 @@ impl QueueList {
             }
             ListOutcome::FilterChanged => {
                 // build again for the new filter, in the mode and with the timer of the last build
-                let (snap, mode, z) = (self.snap.clone(), self.mode(), self.sleep_at());
+                let (snap, mode, z) = (self.snap.clone(), self.mode(), self.sleep_mark());
                 self.built = None;
                 self.sync(snap, mode, z);
                 self.list.select(self.first_row_from(0, true).unwrap_or(0));
@@ -301,7 +316,7 @@ impl QueueList {
         self.built.as_ref().map_or(Mode::Screen { compact: false }, |b| b.2)
     }
 
-    fn sleep_at(&self) -> Option<Timestamp> {
+    fn sleep_mark(&self) -> Option<SleepMark> {
         self.built.as_ref().and_then(|b| b.3)
     }
 
@@ -579,6 +594,20 @@ impl QueueList {
     }
 }
 
+/// The row the sleep timer falls after: the n-th still to play (the row on now first) while Up
+/// next plays or is between its items, or the last one for "end of Up next".
+fn sleep_after(s: &QueueSnapshot, z: SleepMark) -> Option<QueueId> {
+    let mut pending = s.rows.iter().filter(|r| r.eta.is_some()).map(|r| r.entry.id);
+    match z {
+        SleepMark::Items(n) if s.driving || s.between_items() => {
+            let on = s.current.filter(|_| s.driving);
+            on.into_iter().chain(pending).nth((n as usize).checked_sub(1)?)
+        }
+        SleepMark::End => pending.next_back(),
+        SleepMark::Items(_) | SleepMark::At(_) => None,
+    }
+}
+
 /// Position and duration of what plays, when it is Up next's current row.
 fn playing_position(ctx: &UiCtx<'_>, s: &QueueSnapshot) -> Option<(f64, Option<f64>)> {
     if !s.driving {
@@ -634,8 +663,8 @@ impl Look {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::queue::Insert;
     use crate::queue::ui::tests::entry;
-    use crate::queue::{Insert, SleepMark};
 
     fn snap(rows: &[(i64, RowState)]) -> Arc<QueueSnapshot> {
         let rows: Vec<QueueRow> = rows.iter().map(|(id, s)| QueueRow { entry: entry(*id, *s), locked: false, eta: None, note: None }).collect();
@@ -646,27 +675,40 @@ mod tests {
         l.lines().iter().map(|x| if let Line::Row(i) = x { Some(l.snapshot().rows[*i].entry.id.0) } else { None }).collect()
     }
 
-    /// Played / Now / Next sections with the sleep marker after its row; the cursor never rests
-    /// on a section line; the panel keeps what is still to play.
+    /// Played / Now / Next sections with the sleep marker after its row (after 2 items: the one
+    /// on now and the next; between items, the next two); the cursor never rests on a section
+    /// line; the panel keeps what is still to play.
     #[test]
     fn sections_keep_the_play_order_and_the_cursor_skips_their_rules() {
         let mut s = (*snap(&[(1, RowState::Played), (2, RowState::Current), (3, RowState::Pending), (4, RowState::Pending)])).clone();
-        s.sleep = Some(SleepMark { action: crate::reminders::sleep::SleepAction::Stop, items_left: Some(2), after: Some(QueueId(3)) });
-        let s = Arc::new(s);
+        let mut rows = s.rows.to_vec();
+        rows[2].eta = Some(100);
+        rows[3].eta = Some(200);
+        s.rows = rows.into();
+        let z = Some(SleepMark::Items(2));
         let mut l = QueueList::default();
-        l.sync(s.clone(), Mode::Screen { compact: false }, None);
+        l.sync(Arc::new(s.clone()), Mode::Screen { compact: false }, z);
+        assert!(!l.lines().iter().any(|x| matches!(x, Line::Sleep(_))), "not while Up next is stopped");
+        (s.current, s.driving) = (Some(QueueId(2)), true);
+        let s = Arc::new(s);
+        l.sync(s.clone(), Mode::Screen { compact: false }, z);
         assert_eq!(row_ids(&l), vec![None, Some(1), None, Some(2), None, Some(3), None, Some(4)]);
         assert!(matches!(&l.lines()[6], Line::Sleep(_)));
+        let mut between = (*s).clone();
+        (between.driving, between.countdown) =
+            (false, Some(crate::queue::Countdown { id: Some(QueueId(3)), at: Some(100), why: crate::queue::CountdownWhy::Ended }));
+        assert_eq!(sleep_after(&between, SleepMark::Items(2)), Some(QueueId(4)), "row 2 has ended: the next two");
+        assert_eq!(sleep_after(&between, SleepMark::End), Some(QueueId(4)));
         l.list.select(1);
         assert_eq!(l.handle(Action::Down), Out::Handled);
         assert_eq!(l.cursor_id(), Some(QueueId(2)), "the Now rule is stepped over");
         assert_eq!(l.handle(Action::Down), Out::Handled);
         assert_eq!(l.handle(Action::Down), Out::Handled);
         assert_eq!(l.cursor_id(), Some(QueueId(4)), "and the sleep marker too");
-        l.sync(s.clone(), Mode::Screen { compact: true }, None);
+        l.sync(s.clone(), Mode::Screen { compact: true }, z);
         assert_eq!(l.lines()[0], Line::Header("✓ 1 played".into()), "compact: played on one line");
         assert_eq!(l.cursor_id(), Some(QueueId(4)), "the cursor stays on its row");
-        l.sync(s, Mode::Panel, None);
+        l.sync(s, Mode::Panel, z);
         assert_eq!(row_ids(&l).into_iter().flatten().collect::<Vec<_>>(), vec![2, 3, 4]);
     }
 

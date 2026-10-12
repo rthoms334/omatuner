@@ -6,7 +6,7 @@ This file covers what the engine does and the contract the UI (Q-ui), MPRIS (MV-
 
 | File | Contents |
 |---|---|
-| `src/queue/model.rs` | `QueueSnapshot`, `QueueRow`, `QueueEntry`, `QueueCommand`, `QueueReply`, `Refusal`, `SleepRequest` |
+| `src/queue/model.rs` | `QueueSnapshot`, `QueueRow`, `QueueEntry`, `QueueCommand`, `QueueReply`, `Refusal` |
 | `src/queue/machine.rs` | `QueueMachine`, the pure state machine, with its unit tests |
 | `src/queue/service.rs` | The tokio engine: `spawn`, `QueueHandle`, `EngineDeps`, `PlayerPort`, and play-time resolution |
 | `src/store/queue.rs` | `queue_item`: load, add, move, remove, clear, set_state, from-start, pin copy, retime, prune, export and import |
@@ -85,16 +85,7 @@ Resolution runs on the blocking pool with a reader. It never holds the `Library`
 
 ## Sleep timer (B6 hook 6)
 
-`QueueCommand::Sleep(Some(SleepRequest { items, action }))` takes one of two forms:
-- `items: Some(n)` counts items that end. It counts Up next items while Up next drives playback, and otherwise episodes.
-- `items: None` fires when Up next runs out.
-
-When the timer fires, the engine does three things:
-- it sends `Stop` (or `SetPause(true)`) to the main picture;
-- it sets `finished = Sleep`;
-- it drops the request.
-
-`QueueSnapshot::sleep` gives the items left and the row the marker falls after.
+The engine has no sleep timer of its own **(deviation)**: `reminders::sleep::SleepService` reads this snapshot and stops the pictures itself. Between two items (`QueueSnapshot::between_items`: a countdown to the next row, a PIN wait, a future slot, the failure pause) Up next hasn't run out, so "end of Up next" must not fire there. The list's sleep marker comes from the timer's status (`queue::ui::sleep_mark`).
 
 ## Measurements
 

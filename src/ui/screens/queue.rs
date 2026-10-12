@@ -383,7 +383,7 @@ impl QueueScreen {
     }
 }
 
-/// "Shuffle the rest": every pending row to the end, in a random order.
+/// "Shuffle the rest": the pending rows in a random order, in their places (one write).
 fn shuffled(s: &QueueSnapshot) -> Vec<QueueCommand> {
     let mut ids: Vec<QueueId> = s.rows.iter().filter(|r| r.entry.state == RowState::Pending).map(|r| r.entry.id).collect();
     let mut seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64) | 1;
@@ -394,7 +394,7 @@ fn shuffled(s: &QueueSnapshot) -> Vec<QueueCommand> {
         seed ^= seed << 17;
         ids.swap(i, (seed % (i as u64 + 1)) as usize);
     }
-    ids.into_iter().map(|id| QueueCommand::Move { ids: vec![id], to: Insert::End }).collect()
+    vec![QueueCommand::Reorder(ids)]
 }
 
 impl Screen for QueueScreen {
@@ -417,7 +417,7 @@ impl Screen for QueueScreen {
 
     fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
         let s = crate::queue::ui::snapshot(ctx);
-        self.list.sync(s, self.mode(ctx), sleep_at(ctx));
+        self.list.sync(s, self.mode(ctx), crate::queue::ui::sleep_mark(ctx));
         match action {
             Action::Back if self.list.cancel_drag() => return true,
             Action::Undo(n) if crate::queue::ui::is_undo(n) => return crate::queue::ui::undo(ctx, n),
@@ -467,7 +467,7 @@ impl Screen for QueueScreen {
         let theme = ctx.theme;
         let s = crate::queue::ui::snapshot(ctx);
         let mode = self.mode(ctx);
-        self.list.sync(s.clone(), mode, sleep_at(ctx));
+        self.list.sync(s.clone(), mode, crate::queue::ui::sleep_mark(ctx));
         let h24 = ctx.config.interface.clock_24h;
         let summary = crate::queue::ui::summary(&s, ctx.now, h24);
         section::page_header(ui, ctx, "Up next", |ui| {
@@ -516,13 +516,6 @@ impl QueueScreen {
     fn mode(&self, ctx: &UiCtx<'_>) -> Mode {
         Mode::Screen { compact: ctx.layout == LayoutClass::Compact }
     }
-}
-
-/// A sleep timer at a fixed time (the list's marker before the first row starting after it).
-fn sleep_at(ctx: &UiCtx<'_>) -> Option<crate::model::Timestamp> {
-    use crate::reminders::sleep::SleepWhen;
-    let st = ctx.services.agent.sleep()?.status()?;
-    matches!(st.when, SleepWhen::At(_)).then_some(st.fires_at).flatten()
 }
 
 #[cfg(test)]

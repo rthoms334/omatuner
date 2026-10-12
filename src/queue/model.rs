@@ -7,7 +7,6 @@
 use std::sync::Arc;
 
 use crate::model::{EpisodeId, ItemRef, QueueId, Timestamp};
-use crate::reminders::sleep::SleepAction;
 
 /// A row's state (`queue_item.state`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -125,8 +124,6 @@ pub enum FinishedWhy {
     EndOfQueue,
     /// "Stopped after Goldfinger, as asked".
     StopAfter(QueueId),
-    /// The sleep timer's "after N items" / "end of Up next" ran out.
-    Sleep,
 }
 
 /// The episode after the one that ended (the next-episode countdown, or the offer on the
@@ -134,18 +131,12 @@ pub enum FinishedWhy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NextEpisode {
     pub id: EpisodeId,
-    /// "S02E06 · Episode title".
+    /// "S02E06 · Episode title" (unguarded: the UI passes it through the spoiler guard).
     pub label: String,
-}
-
-/// The sleep timer as Up next resolves it (`after_items`, `end_of_queue`; B6 hook 6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SleepMark {
-    pub action: SleepAction,
-    /// Items still to end before it fires (`after_items`); `None` = at the end of Up next.
-    pub items_left: Option<u32>,
-    /// The row after which it falls (the list's sleep marker), when Up next drives playback.
-    pub after: Option<QueueId>,
+    /// The series' name as the library shows it (the guard's subject).
+    pub series: String,
+    pub season: u32,
+    pub episode: u32,
 }
 
 /// What every consumer reads (≤ 200 small rows).
@@ -171,7 +162,6 @@ pub struct QueueSnapshot {
     pub finished: Option<FinishedWhy>,
     /// The next-episode countdown's episode, or the one offered on the finished card.
     pub next_episode: Option<NextEpisode>,
-    pub sleep: Option<SleepMark>,
 }
 
 impl QueueSnapshot {
@@ -182,6 +172,13 @@ impl QueueSnapshot {
 
     pub fn row(&self, id: QueueId) -> Option<&QueueRow> {
         self.rows.iter().find(|r| r.entry.id == id)
+    }
+
+    /// Up next is between two of its items: the card after one (a countdown to its next row, a
+    /// wait for the PIN, a future slot, the failure pause). It hasn't run out or stepped aside;
+    /// the sleep timer's "end of Up next" must not fire here.
+    pub fn between_items(&self) -> bool {
+        self.countdown.as_ref().is_some_and(|c| c.why != CountdownWhy::NextEpisode) || self.blocked.is_some()
     }
 
     /// "3 of 7": the place of `id` among the visible rows that aren't skipped or failed.
@@ -274,15 +271,6 @@ pub enum QueueReply {
     Error(String),
 }
 
-/// The sleep timer handed to Up next (B6 hook 6): `after_items` counts queue items while Up
-/// next drives playback, else episodes; `end_of_queue` fires when Up next runs out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SleepRequest {
-    /// `Some(n)` = after n items; `None` = at the end of Up next.
-    pub items: Option<u32>,
-    pub action: SleepAction,
-}
-
 /// Commands to the engine (UI, MPRIS, MCP).
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueueCommand {
@@ -295,7 +283,11 @@ pub enum QueueCommand {
         ids: Vec<QueueId>,
         to: Insert,
     },
+    /// These rows, in this order, take the places they hold now among the list (the others
+    /// stay where they are): "Shuffle the rest" in one transaction.
+    Reorder(Vec<QueueId>),
     Remove(Vec<QueueId>),
+    /// "Remove played" / "Clear Up next…": the rows the user can see (concealed rows stay).
     Clear {
         played_only: bool,
     },
@@ -318,6 +310,4 @@ pub enum QueueCommand {
     },
     /// Carry on after an interruption ("Resume Up next").
     Resume,
-    /// The sleep timer's queue part (`None` clears it).
-    Sleep(Option<SleepRequest>),
 }

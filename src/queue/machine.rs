@@ -8,7 +8,8 @@
 //!   current row keeps its state, "Up next paused · Alt+6 to carry on". Stop (`Idle`) never
 //!   advances.
 //! * **Advancing.** `Ended` of the current row → played, then the countdown (or the stop:
-//!   stop-after, the sleep timer, the end of Up next). The next row is the first visible,
+//!   stop-after, the end of Up next). The sleep timer is `reminders::sleep`'s: it reads this
+//!   snapshot ([`QueueSnapshot::between_items`]) and stops the pictures itself. The next row is the first visible,
 //!   available, pending row in list order; locked ones wait for the PIN (never skipped
 //!   silently), concealed ones are invisible and passed over, and stay pending.
 //! * **Live slots.** Airing → live (from the start through catch-up when the row asks and the
@@ -28,9 +29,8 @@ use crate::model::{EpisodeId, ItemRef, MediaRef, PlayOrigin, PlayableKind, Queue
 use crate::player::{PlayerSnapshot, PlayerState};
 use crate::queue::model::{
     AddTarget, AddedBy, Blocked, Countdown, CountdownWhy, FinishedWhy, Insert, NextEpisode, QueueCommand, QueueEntry, QueueRow, QueueSnapshot,
-    RowState, SleepMark, SleepRequest,
+    RowState,
 };
-use crate::reminders::sleep::SleepAction;
 
 /// The "Keep watching" card at the end of a live slot.
 pub const SLOT_END_CARD_S: i64 = 30;
@@ -109,9 +109,14 @@ pub enum Input {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Write {
     State(QueueId, RowState),
-    Move { ids: Vec<QueueId>, to: Insert },
+    Move {
+        ids: Vec<QueueId>,
+        to: Insert,
+    },
+    /// [`QueueCommand::Reorder`].
+    Order(Vec<QueueId>),
+    /// Rows to delete (a removal, "Remove played", "Clear Up next…": never a concealed row).
     Remove(Vec<QueueId>),
-    Clear { played_only: bool },
     FromStart(QueueId, bool),
     PinCopy(QueueId, ItemRef),
 }
@@ -140,8 +145,6 @@ pub enum Effect {
         by: AddedBy,
     },
     Write(Write),
-    /// The sleep timer's queue part ran out.
-    Sleep(SleepAction),
     Toast(&'static str),
     /// "Up next is waiting for your PIN" (a notification while the window is hidden).
     NotifyPin(QueueId),
@@ -211,7 +214,6 @@ pub struct QueueMachine {
     finished: Option<FinishedWhy>,
     next_episode: Option<NextEpisode>,
     lookup: Option<Lookup>,
-    sleep: Option<SleepRequest>,
     last: Option<Seen>,
     /// Origin of the last foreign playback (the next-episode card keeps it).
     origin: Option<PlayOrigin>,
@@ -402,10 +404,8 @@ impl QueueMachine {
                 if let Some(MediaRef::Episode(id)) = s.playable.as_ref().filter(|p| matches!(p.kind, PlayableKind::Episode { .. })).map(|p| &p.media)
                 {
                     self.origin = s.origin.filter(|o| *o != PlayOrigin::Queue);
-                    if !self.count_sleep(fx) {
-                        self.lookup = Some(Lookup::Countdown);
-                        fx.push(Effect::LookupNextEpisode(*id));
-                    }
+                    self.lookup = Some(Lookup::Countdown);
+                    fx.push(Effect::LookupNextEpisode(*id));
                 }
             }
             PlayerState::Error(_) if ours && self.owned => {
@@ -451,9 +451,6 @@ impl QueueMachine {
         self.live_until = None;
         self.position = None;
         self.set_state(id, RowState::Played, fx);
-        if self.count_sleep(fx) {
-            return;
-        }
         if self.stop_after == Some(id) {
             self.stop_after = None;
             self.finished = Some(FinishedWhy::StopAfter(id));
@@ -467,10 +464,6 @@ impl QueueMachine {
 
     /// Nothing left: "That was Up next." — an episode's successor is offered, no countdown.
     fn run_out(&mut self, s: &PlayerSnapshot, fx: &mut Vec<Effect>) {
-        if self.sleep.is_some_and(|z| z.items.is_none()) {
-            self.fire_sleep(fx);
-            return;
-        }
         self.finished = Some(FinishedWhy::EndOfQueue);
         if let Some(MediaRef::Episode(ep)) = s.playable.as_ref().map(|p| &p.media) {
             self.lookup = Some(Lookup::Offer);
@@ -492,25 +485,6 @@ impl QueueMachine {
         match self.next_row() {
             Some(next) => self.start_countdown(CountdownWhy::Failed, Some(next), now, fx),
             None => self.finished = Some(FinishedWhy::EndOfQueue),
-        }
-    }
-
-    /// One more item ended for the sleep timer's "after N items"; true when it fired.
-    fn count_sleep(&mut self, fx: &mut Vec<Effect>) -> bool {
-        let Some(SleepRequest { items: Some(left), .. }) = &mut self.sleep else { return false };
-        *left = left.saturating_sub(1);
-        if *left == 0 {
-            self.fire_sleep(fx);
-            return true;
-        }
-        false
-    }
-
-    fn fire_sleep(&mut self, fx: &mut Vec<Effect>) {
-        if let Some(z) = self.sleep.take() {
-            self.countdown = None;
-            self.finished = Some(FinishedWhy::Sleep);
-            fx.push(Effect::Sleep(z.action));
         }
     }
 
@@ -698,8 +672,13 @@ impl QueueMachine {
         match c {
             QueueCommand::Add { targets, at, by } => fx.push(Effect::Add { targets, at, by }),
             QueueCommand::Move { ids, to } => fx.push(Effect::Write(Write::Move { ids, to })),
+            QueueCommand::Reorder(ids) => fx.push(Effect::Write(Write::Order(ids))),
             QueueCommand::Remove(ids) => fx.push(Effect::Write(Write::Remove(ids))),
-            QueueCommand::Clear { played_only } => fx.push(Effect::Write(Write::Clear { played_only })),
+            QueueCommand::Clear { played_only } => {
+                // only what the user can see: concealed rows stay pending in their places
+                let ids = self.rows.iter().filter(|r| self.visible(r.id) && (!played_only || r.state.is_done())).map(|r| r.id).collect();
+                fx.push(Effect::Write(Write::Remove(ids)));
+            }
             QueueCommand::FromStart(id, on) => fx.push(Effect::Write(Write::FromStart(id, on))),
             QueueCommand::PinCopy(id, item) => fx.push(Effect::Write(Write::PinCopy(id, item))),
             QueueCommand::PlayAt(id) => {
@@ -763,7 +742,6 @@ impl QueueMachine {
                     None => self.advance(self.next_row(), false, now, fx),
                 }
             }
-            QueueCommand::Sleep(req) => self.sleep = req.filter(|r| r.items != Some(0)),
         }
     }
 
@@ -792,7 +770,10 @@ impl QueueMachine {
             fx.push(Effect::Toast("Up next is empty"));
             return;
         };
-        if let Some(cur) = self.current() {
+        // a row Up next plays is skipped; an interrupted one keeps its place (Resume)
+        if self.owned
+            && let Some(cur) = self.current()
+        {
             self.owned = false;
             self.set_state(cur, RowState::Skipped, fx);
         }
@@ -841,7 +822,6 @@ impl QueueMachine {
             let note = self.notes.get(&r.id).copied().or((r.orphaned || f.unavailable).then_some("Unavailable"));
             rows.push(QueueRow { entry: r.clone(), locked: f.needs_pin, eta, note: note.map(str::to_owned) });
         }
-        let sleep = self.sleep.map(|z| SleepMark { action: z.action, items_left: z.items, after: self.sleep_after(z, driving, &rows) });
         self.snapshot = QueueSnapshot {
             rows: rows.into(),
             current: current.filter(|c| self.visible(*c)),
@@ -856,19 +836,7 @@ impl QueueMachine {
             driving,
             finished: self.finished,
             next_episode: self.next_episode.clone(),
-            sleep,
         };
-    }
-
-    /// The row after which the sleep timer falls (the list's marker).
-    fn sleep_after(&self, z: SleepRequest, driving: bool, rows: &[QueueRow]) -> Option<QueueId> {
-        let order = rows.iter().filter(|r| r.eta.is_some()).map(|r| r.entry.id);
-        let mut order: Vec<QueueId> = if driving { self.current().into_iter().chain(order).collect() } else { order.collect() };
-        match z.items {
-            Some(n) if driving => order.get(n as usize - 1).copied(),
-            Some(_) => None,
-            None => order.pop(),
-        }
     }
 }
 
@@ -1012,6 +980,16 @@ mod tests {
         let fx = m.step(Input::Command(QueueCommand::Resume), T0 + 120);
         assert_eq!(fx, vec![Effect::Play { id: QueueId(1), how: How::Vod, resume: true }]);
 
+        // `n` after the interruption plays the next row; the interrupted one isn't skipped
+        let mut m = machine(vec![movie(1), movie(2)]);
+        start(&mut m, 1, 1, T0);
+        m.step(Input::Player(snap(PlayerState::Playing, 2, PlayOrigin::Guide, &news, PlayableKind::Live, MediaRef::Url("n".into()))), T0 + 60);
+        let fx = m.step(Input::Command(QueueCommand::Next), T0 + 90);
+        assert_eq!(plays(&fx), vec![QueueId(2)]);
+        assert!(!fx.iter().any(|e| matches!(e, Effect::Write(Write::State(_, RowState::Skipped)))), "{fx:?}");
+        m.step(Input::Resolved { id: QueueId(2), outcome: Resolved::Sent { items: vec![m.row(QueueId(2)).unwrap().item.clone()] } }, T0 + 90);
+        assert_eq!(m.snapshot().row(QueueId(1)).unwrap().entry.state, RowState::Pending, "still to play, in its place");
+
         // a zap that keeps the Queue origin onto another channel is foreign too
         let mut m = machine(vec![movie(1)]);
         start(&mut m, 1, 1, T0);
@@ -1067,6 +1045,8 @@ mod tests {
         assert_eq!(s.pending(), 2);
         assert_eq!(s.place(QueueId(3)), Some((2, 2)), "\"2 of 2\"");
         assert_eq!(s.eta_end, Some((T0 + 7200, true)), "two hours, not three");
+        let clear = m.step(Input::Command(QueueCommand::Clear { played_only: false }), T0);
+        assert_eq!(clear, vec![Effect::Write(Write::Remove(vec![QueueId(1), QueueId(3)]))], "\"Clear Up next…\" leaves what it can't show");
         start(&mut m, 1, 1, T0);
         end(&mut m, 1, 1, T0);
         assert_eq!(plays(&m.step(Input::Command(QueueCommand::Now), T0)), vec![QueueId(3)]);
@@ -1077,8 +1057,8 @@ mod tests {
         assert_eq!(m.snapshot().rows.iter().position(|r| r.entry.id == QueueId(2)), Some(1), "in its place");
     }
 
-    /// Stop-after, the last row and the sleep timer's end of Up next stop without the
-    /// next-episode countdown; an episode ending outside Up next gets it, run by the engine.
+    /// Stop-after and the last row stop without the next-episode countdown; an episode ending
+    /// outside Up next gets it, run by the engine.
     #[test]
     fn the_end_of_up_next_stops_and_an_episode_outside_it_counts_down() {
         let mut m = machine(vec![movie(1), movie(2)]);
@@ -1094,17 +1074,10 @@ mod tests {
         let ep = PlayableKind::Episode { season: 1, episode: 1 };
         let fx = m.step(Input::Player(snap(PlayerState::Ended, 1, PlayOrigin::Queue, &it, ep.clone(), MediaRef::Episode(EpisodeId(7)))), T0);
         assert!(fx.contains(&Effect::LookupNextEpisode(EpisodeId(7))));
-        let card = NextEpisode { id: EpisodeId(8), label: "S01E02 · Two".into() };
+        let card = NextEpisode { id: EpisodeId(8), label: "S01E02 · Two".into(), series: "Show".into(), season: 1, episode: 2 };
         m.step(Input::NextEpisode(Some(card.clone())), T0);
         assert_eq!((m.snapshot().finished, &m.snapshot().countdown), (Some(FinishedWhy::EndOfQueue), &None));
         assert_eq!(m.snapshot().next_episode.as_ref(), Some(&card));
-
-        // the sleep timer's "end of Up next"
-        let mut m = machine(vec![movie(1)]);
-        m.step(Input::Command(QueueCommand::Sleep(Some(SleepRequest { items: None, action: SleepAction::Stop }))), T0);
-        start(&mut m, 1, 1, T0);
-        assert!(end(&mut m, 1, 1, T0).contains(&Effect::Sleep(SleepAction::Stop)));
-        assert_eq!(m.snapshot().finished, Some(FinishedWhy::Sleep));
 
         // an episode played outside Up next: today's next-episode card, then the episode
         let mut m = machine(vec![]);
@@ -1113,28 +1086,9 @@ mod tests {
         assert!(fx.is_empty());
         let fx = m.step(Input::Player(snap(PlayerState::Ended, 1, PlayOrigin::Home, &own, ep, MediaRef::Episode(EpisodeId(3)))), T0);
         assert_eq!(fx, vec![Effect::LookupNextEpisode(EpisodeId(3))]);
-        m.step(Input::NextEpisode(Some(NextEpisode { id: EpisodeId(4), label: "S01E04".into() })), T0);
+        m.step(Input::NextEpisode(Some(NextEpisode { id: EpisodeId(4), label: "S01E04".into(), series: "Show".into(), season: 1, episode: 4 })), T0);
         assert_eq!(m.snapshot().countdown.as_ref().map(|c| c.why), Some(CountdownWhy::NextEpisode));
         assert_eq!(m.step(Input::Tick, T0 + 10), vec![Effect::PlayEpisode { id: EpisodeId(4), origin: PlayOrigin::Home }]);
-    }
-
-    /// "After 2 items": counted in Up next items; the second end stops instead of advancing.
-    #[test]
-    fn the_sleep_timer_counts_items() {
-        let mut m = machine(vec![movie(1), movie(2), movie(3)]);
-        m.step(Input::Command(QueueCommand::Sleep(Some(SleepRequest { items: Some(2), action: SleepAction::Stop }))), T0);
-        start(&mut m, 1, 1, T0);
-        assert_eq!(m.snapshot().sleep.and_then(|z| z.after), Some(QueueId(2)), "the marker after the 2nd row");
-        end(&mut m, 1, 1, T0);
-        let fx = m.step(Input::Command(QueueCommand::Now), T0);
-        let it = m.row(QueueId(2)).unwrap().item.clone();
-        assert_eq!(plays(&fx), vec![QueueId(2)]);
-        m.step(Input::Resolved { id: QueueId(2), outcome: Resolved::Sent { items: vec![it.clone()] } }, T0);
-        m.step(Input::Player(snap(PlayerState::Playing, 2, PlayOrigin::Queue, &it, PlayableKind::Movie, MediaRef::Movie(MovieId(2)))), T0);
-        let fx = end(&mut m, 2, 2, T0 + 10);
-        assert!(fx.contains(&Effect::Sleep(SleepAction::Stop)));
-        assert_eq!(m.snapshot().countdown, None);
-        assert!(plays(&m.step(Input::Tick, T0 + 100)).is_empty());
     }
 
     /// Live slots: airing plays live and advances at its stop with a 30 s card; ended plays

@@ -68,6 +68,12 @@ fn order_stays_dense_and_play_next_goes_before_the_first_pending_row() {
     w(&s, move |c| q::remove(c, &[b]));
     assert!(dense(&s));
     assert_eq!(order(&s).len(), 4);
+    // "Shuffle the rest": the rows given swap places; the others stay put
+    let before = order(&s);
+    let (x, y) = (before[1], before[3]);
+    w(&s, move |c| q::reorder(c, &[y, x, y]));
+    assert_eq!(order(&s), vec![before[0], y, before[2], x]);
+    assert!(dense(&s));
 
     w(&s, move |c| q::set_state(c, n, RowState::Current, NOW));
     let three = ids[2];
@@ -205,6 +211,7 @@ struct Rig {
     player: Arc<Recorder>,
     snaps: watch::Sender<Arc<PlayerSnapshot>>,
     queue: QueueHandle,
+    events: crossbeam_channel::Receiver<tuner::msg::AppEvent>,
 }
 
 impl Rig {
@@ -216,16 +223,20 @@ impl Rig {
         shared.set_main_player(snaps.subscribe());
         let player = Arc::new(Recorder::default());
         let config: SharedConfig = Arc::new(RwLock::new(Arc::new(cfg)));
-        let (bus, _events) = tuner::msg::EventBus::new(None);
+        let (bus, events) = tuner::msg::EventBus::new(None);
         let deps = EngineDeps { store, config, player: player.clone(), bus };
-        Self { queue: tuner::queue::service::spawn(rt.handle(), shared, deps), player, snaps }
+        Self { queue: tuner::queue::service::spawn(rt.handle(), shared, deps), player, snaps, events }
     }
 
-    /// The main picture plays `item` (origin, state, load generation).
+    /// The main picture plays the film `item` (origin, state, load generation).
     fn player(&self, item: &ItemRef, media: MediaRef, origin: PlayOrigin, state: PlayerState, generation: u64) {
+        self.player_kind(item, media, PlayableKind::Movie, origin, state, generation);
+    }
+
+    fn player_kind(&self, item: &ItemRef, media: MediaRef, kind: PlayableKind, origin: PlayOrigin, state: PlayerState, generation: u64) {
         let playable = Playable {
             media,
-            kind: PlayableKind::Movie,
+            kind,
             item: Some(item.clone()),
             source_id: Some(item.source),
             title: "t".into(),
@@ -344,4 +355,66 @@ fn the_engine_adds_plays_advances_and_never_plays_after_a_restart() {
     assert!(!snap.driving);
     std::thread::sleep(Duration::from_millis(200));
     assert!(again.player.plays().is_empty(), "never auto-plays");
+}
+
+/// An episode that ends outside Up next gets the engine's next-episode countdown (any
+/// placement, a hidden window): the next episode plays. When the PIN window closed during the
+/// episode and its series is locked, it doesn't play: "Next episode is locked".
+#[test]
+fn an_episode_ending_outside_up_next_plays_the_next_unless_it_is_locked_now() {
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    let s = store();
+    let src = w(&s, |c| seed::seed_source(c, "TV"));
+    w(&s, move |c| seed::seed_series_with_episodes(c, src, 1, 1, 3));
+    let eps: Vec<tuner::model::EpisodeId> = w(&s, |c| {
+        let mut st = c.prepare("SELECT id FROM episode ORDER BY season, episode")?;
+        let v = st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(v)
+    });
+    let ep_ref = |e: u32| ItemRef { source: src, kind: ItemKind::Episode, key: ItemKey(format!("m3u:ep0-1-{e}")) };
+    let ep_kind = |e: u32| PlayableKind::Episode { season: 1, episode: e };
+    let mut cfg = Config::default();
+    cfg.queue.countdown_s = 0;
+    let episode_plays = |rig: &Rig| -> Vec<MediaRef> {
+        rig.player
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|c| match c {
+                PlayerCommand::Play(r) => Some(r.media.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // the engine has started (its first look at the player never plays anything)
+    let started = |rig: &Rig| assert_eq!(rt.block_on(rig.queue.request(QueueCommand::Cancel)), QueueReply::Done);
+    let rig = Rig::new(&rt, s.clone(), cfg.clone());
+    started(&rig);
+    rig.player_kind(&ep_ref(1), MediaRef::Episode(eps[0]), ep_kind(1), PlayOrigin::Home, PlayerState::Playing, 1);
+    rig.player_kind(&ep_ref(1), MediaRef::Episode(eps[0]), ep_kind(1), PlayOrigin::Home, PlayerState::Ended, 1);
+    until("the next episode", || episode_plays(&rig) == vec![MediaRef::Episode(eps[1])]);
+    drop(rig);
+
+    // the series is locked and the session is (no PIN entered)
+    let series = ItemRef { source: src, kind: ItemKind::Series, key: ItemKey("m3u:series000000000".into()) };
+    w(&s, move |c| tuner::store::copies::lock(c, &[series], true).map(|_| ()));
+    let salt = tuner::ui::parental::new_salt();
+    cfg.parental.enabled = true;
+    cfg.parental.pin_hash = Some(tuner::ui::parental::hash_pin("1234", &salt));
+    cfg.parental.pin_salt = Some(salt);
+    let rig = Rig::new(&rt, s, cfg);
+    started(&rig);
+    rig.player_kind(&ep_ref(2), MediaRef::Episode(eps[1]), ep_kind(2), PlayOrigin::Home, PlayerState::Playing, 1);
+    rig.player_kind(&ep_ref(2), MediaRef::Episode(eps[1]), ep_kind(2), PlayOrigin::Home, PlayerState::Ended, 1);
+    let t = Instant::now();
+    let toast = loop {
+        match rig.events.recv_timeout(Duration::from_millis(100)) {
+            Ok(tuner::msg::AppEvent::Toast(t)) => break t.text,
+            _ => assert!(t.elapsed() < Duration::from_secs(5), "no toast"),
+        }
+    };
+    assert_eq!(toast, "Next episode is locked");
+    assert!(episode_plays(&rig).is_empty());
 }

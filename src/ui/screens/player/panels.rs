@@ -45,7 +45,7 @@ impl PlayerScreen {
         if kind == PanelKind::Queue {
             let s = crate::queue::ui::snapshot(ctx);
             let mut q = Box::new(QueueList::default());
-            q.sync(s.clone(), Mode::Panel, None);
+            q.sync(s.clone(), Mode::Panel, crate::queue::ui::sleep_mark(ctx));
             if let Some(id) = s.current.or(s.next) {
                 q.select(id);
             }
@@ -91,7 +91,7 @@ impl PlayerScreen {
         let p = self.panel.as_mut()?;
         let q = p.queue.as_mut()?;
         std::mem::swap(&mut p.list, &mut q.list);
-        q.sync(crate::queue::ui::snapshot(ctx), Mode::Panel, None);
+        q.sync(crate::queue::ui::snapshot(ctx), Mode::Panel, crate::queue::ui::sleep_mark(ctx));
         let r = f(q);
         std::mem::swap(&mut p.list, &mut q.list);
         Some(r)
@@ -397,7 +397,7 @@ impl PlayerScreen {
             egui::pos2(area.right() - pad / 2.0, area.bottom() - pad / 2.0 - if footer.is_some() { foot_h } else { 0.0 }),
         );
         std::mem::swap(&mut panel.list, &mut q.list);
-        q.sync(snap.clone(), Mode::Panel, None);
+        q.sync(snap.clone(), Mode::Panel, crate::queue::ui::sleep_mark(ctx));
         let row_h = (font.size * 2.0).round();
         let empty = q.lines().is_empty();
         let out = if empty {
