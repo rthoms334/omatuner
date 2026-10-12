@@ -138,7 +138,9 @@ fn guide_fix_columns(conn: &Connection) -> Result<()> {
 
 /// 0011 (owner: F-AB): the Following rule that made a reminder.
 fn follow_columns(conn: &Connection) -> Result<()> {
-    add_column_if_missing(conn, "reminder", "rule_id", "INTEGER REFERENCES follow_rule(id) ON DELETE SET NULL")
+    add_column_if_missing(conn, "reminder", "rule_id", "INTEGER REFERENCES follow_rule(id) ON DELETE SET NULL")?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS reminder_rule ON reminder(rule_id) WHERE rule_id IS NOT NULL")?;
+    Ok(())
 }
 
 /// 0007: `title_link` rebuilt to accept `join` rows with a `join_group` (a CHECK constraint

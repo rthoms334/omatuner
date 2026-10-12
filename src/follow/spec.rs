@@ -116,6 +116,74 @@ pub struct FollowSpec {
     pub flash: Option<crate::follow::flash::FlashSpec>,
 }
 
+/// Weekday mask of Monday–Friday (`FollowSpec::days`).
+pub const WEEKDAYS: u8 = 0b001_1111;
+
+/// What a team rule leaves out by default (the design's template: the senior men's side, no
+/// highlights).
+pub const TEAM_WITHOUT: [&str; 11] = ["Women", "Ladies", "U18", "U19", "U21", "U23", "Legends", "Fan TV", "Highlights", "Academy", "Reserves"];
+
+impl FollowSpec {
+    /// The template of `kind` (DESIGN §33 §4): team — fixtures in title, episode title and
+    /// description, live only, the senior men's side; show — the title is the show, new
+    /// episodes only; event — anywhere in title or episode title, live only; news flash — the
+    /// title is the bulletin, every airing, headlines only (`headlines_min`); custom —
+    /// anywhere in title or episode title, every airing.
+    pub fn template(kind: FollowKind, terms: Vec<String>, headlines_min: u16) -> Self {
+        let base = FollowSpec { terms, ..FollowSpec::default() };
+        let title_only = Fields { title: true, sub_title: false, description: false, categories: false };
+        match kind {
+            FollowKind::Team => FollowSpec {
+                without: TEAM_WITHOUT.iter().map(|s| (*s).to_owned()).collect(),
+                fields: Fields { title: true, sub_title: true, description: true, categories: false },
+                shape: Shape::Fixture,
+                airings: Airings::LiveOnly,
+                ..base
+            },
+            FollowKind::Show => FollowSpec { fields: title_only, shape: Shape::TitleIs { spin_offs: false }, airings: Airings::NewOnly, ..base },
+            FollowKind::Event => FollowSpec { shape: Shape::Anywhere, airings: Airings::LiveOnly, ..base },
+            FollowKind::News => FollowSpec {
+                fields: title_only,
+                shape: Shape::TitleIs { spin_offs: false },
+                airings: Airings::Any,
+                flash: Some(crate::follow::flash::FlashSpec {
+                    length: crate::follow::flash::FlashLength::Headlines(headlines_min.max(1)),
+                    volume: crate::follow::flash::FlashVolume::Normal,
+                }),
+                ..base
+            },
+            FollowKind::Custom => FollowSpec { airings: Airings::Any, ..base },
+        }
+    }
+
+    /// Why this spec can't be saved (no name to look for, no field to look in).
+    pub fn problem(&self) -> Option<&'static str> {
+        let mut buf = String::new();
+        let has_term = self.terms.iter().any(|t| {
+            crate::textmatch::fold::fold(t, &mut buf);
+            !buf.is_empty()
+        });
+        if !has_term {
+            return Some("a rule needs at least one name to look for");
+        }
+        if !(self.fields.title || self.fields.sub_title || self.fields.description || self.fields.categories) {
+            return Some("a rule must look in at least one field");
+        }
+        None
+    }
+
+    /// Runs on local weekday `wd` (0 = Monday) at local minute `minute` (`days`, `between`).
+    pub fn admits_time(&self, wd: u8, minute: u16) -> bool {
+        let day_ok = self.days == 0 || self.days & (1 << (wd % 7)) != 0;
+        let time_ok = match self.between {
+            None => true,
+            Some((from, to)) if from <= to => (from..to).contains(&minute),
+            Some((from, to)) => minute >= from || minute < to,
+        };
+        day_ok && time_ok
+    }
+}
+
 impl Default for FollowSpec {
     fn default() -> Self {
         Self {
