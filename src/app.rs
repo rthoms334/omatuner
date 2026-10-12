@@ -427,8 +427,14 @@ impl TunerApp {
             AppEvent::Agent(crate::agent::AgentCommand::Play(p)) => self.on_agent_play(p.clone()),
             // the reminder engine (B6): countdowns, switches, the sleep timer, news flashes
             AppEvent::Reminder(e) => self.on_reminder_event(e, egui_ctx),
-            // the batch features' events (owners: F-C, MV-2) — nothing to do until they land
-            AppEvent::Follow(_) | AppEvent::Tile(_) => {}
+            // Following's summary when no notification server answered (F-C)
+            AppEvent::Follow(f) => {
+                if let Some(t) = crate::follow::ui::on_event(f) {
+                    self.toast(t);
+                }
+            }
+            // multi-view's events (owner: MV-2) — nothing to do until it lands
+            AppEvent::Tile(_) => {}
             AppEvent::Platform(p) => match p {
                 PlatformEvent::Quit => egui_ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 PlatformEvent::Raise => crate::platform::hypr::focus_self(),

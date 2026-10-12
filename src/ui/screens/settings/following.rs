@@ -1,20 +1,347 @@
-//! Settings ▸ Following (DESIGN §33). OWNER: F-C. Listed once `follow::ENABLED`: the rules,
-//! the rule editor and Upcoming (Skipped included).
+//! Settings ▸ Following (DESIGN §33 §3.2, the news-flash preset). OWNER: F-C. Listed once
+//! `follow::ENABLED`.
+//!
+//! * "+ Follow…" opens the Follow sheet on the templates (Team, Show, Event, News flash, Custom).
+//! * Rules, in list order (higher wins a clash): "Arsenal — Team · live · remind 2 min ·
+//!   spoiler-safe · 4 coming". Enter or a click opens the rule in the sheet's editor (pause,
+//!   Delete…, Duplicate, Move up / down live there).
+//! * Upcoming (next 14 days, the ledger): "Arsenal — Sat 12:30 · Sky Sports Main Event · remind".
+//!   Spoiler-safe rules show only the rule's name. Enter or a click opens the programme popover
+//!   (Watch, Cancel reminder = skip this one, Follow…).
+//! * The switches of `[follow]` and the news flash's quiet hours, "not over another app's
+//!   fullscreen" and headlines length.
+
+use std::cell::RefCell;
 
 use super::*;
+use crate::follow::FollowRule;
+use crate::follow::plan::{MatchState, Upcoming};
+use crate::follow::ui as fui;
 
-/// The page's state (loaded rows, the editor…), kept in `SettingsScreen`.
+/// "+ Follow…".
+const ACT_NEW: u16 = 1;
+/// Upcoming rows are listed at most this many.
+const UPCOMING_MAX: usize = 300;
+
+/// What the page shows, read in the background.
+struct Data {
+    rules: Vec<FollowRule>,
+    upcoming: Vec<Upcoming>,
+    /// When the guide was last checked (`meta follow:last_run`).
+    checked: Option<crate::model::Timestamp>,
+}
+
+fn load(c: &rusqlite::Connection) -> crate::error::Result<Data> {
+    let now = crate::model::now();
+    let checked = crate::store::follow::meta_get(c, "follow:last_run")?.and_then(|v| v.parse().ok());
+    Ok(Data { rules: crate::store::follow::rules(c)?, upcoming: crate::store::follow::upcoming(c, now, UPCOMING_MAX)?, checked })
+}
+
+/// The page's state (loaded rows), kept in `SettingsScreen`. Interior mutability: the rows are
+/// built from `&SettingsScreen`, and that is where the read is polled.
 #[derive(Default)]
-pub(super) struct State {}
+pub(super) struct State {
+    loader: RefCell<Option<Loader<Data>>>,
+    data: RefCell<Option<Data>>,
+}
+
+impl State {
+    fn poll(&self) {
+        let mut slot = self.loader.borrow_mut();
+        match kit::poll(&mut slot) {
+            Some(Ok(d)) => *self.data.borrow_mut() = Some(d),
+            Some(Err(e)) => tracing::warn!(target: "tuner::follow", "reading Following: {e}"),
+            None => {}
+        }
+    }
+}
+
+static FOLLOW_T: [CfgToggle; 4] = [
+    CfgToggle { label: "Check the guide for what I follow", get: |c| c.follow.enabled, set: |c, v| c.follow.enabled = v },
+    CfgToggle { label: "Summary of new matches (at most twice a day)", get: |c| c.follow.summary, set: |c, v| c.follow.summary = v },
+    CfgToggle {
+        label: "New team and event rules are spoiler-safe",
+        get: |c| c.follow.spoiler_safe_default,
+        set: |c, v| c.follow.spoiler_safe_default = v,
+    },
+    CfgToggle { label: "A rule's switch may interrupt a film or episode", get: |c| c.follow.interrupt_vod, set: |c, v| c.follow.interrupt_vod = v },
+];
+static FLASH_T: CfgToggle = CfgToggle {
+    label: "Not while another app is fullscreen",
+    get: |c| c.follow.news_flash.skip_when_fullscreen,
+    set: |c, v| c.follow.news_flash.skip_when_fullscreen = v,
+};
+static FLASH_N: CfgNumber = CfgNumber {
+    label: "Headlines only: the first",
+    unit: "min",
+    min: 1.0,
+    max: 30.0,
+    step: 1.0,
+    get: |c| f64::from(c.follow.news_flash.headlines_min),
+    set: |c, v| c.follow.news_flash.headlines_min = v.round().clamp(1.0, 30.0) as u16,
+};
+static FLASH_QUIET: CfgText = CfgText {
+    label: "Quiet hours (no news flash)",
+    placeholder: "22:00–07:00 (empty = none)",
+    get: |c| quiet_text(c.follow.news_flash.quiet_from_min, c.follow.news_flash.quiet_to_min),
+    set: |c, v| {
+        if let Some((from, to)) = parse_quiet(&v) {
+            c.follow.news_flash.quiet_from_min = from;
+            c.follow.news_flash.quiet_to_min = to;
+        }
+    },
+};
+
+/// "22:00–07:00", or "" for none.
+fn quiet_text(from: Option<u16>, to: Option<u16>) -> String {
+    match (from, to) {
+        (Some(f), Some(t)) => format!("{:02}:{:02}–{:02}:{:02}", f / 60, f % 60, t / 60, t % 60),
+        _ => String::new(),
+    }
+}
+
+/// "22:00-07:00", "22–7", "2200 0700" → local minutes; "" → none; anything else → `None`
+/// (the field keeps what was stored).
+fn parse_quiet(s: &str) -> Option<(Option<u16>, Option<u16>)> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Some((None, None));
+    }
+    let parts: Vec<&str> = s.split(['–', '-', ' ', '—']).filter(|p| !p.trim().is_empty()).collect();
+    let [a, b] = parts.as_slice() else { return None };
+    let minute = |p: &str| -> Option<u16> {
+        let p = p.trim();
+        let (h, m) = match p.split_once([':', '.']) {
+            Some((h, m)) => (h.parse::<u16>().ok()?, m.parse::<u16>().ok()?),
+            None if p.len() > 2 => (p[..p.len() - 2].parse().ok()?, p[p.len() - 2..].parse().ok()?),
+            None => (p.parse().ok()?, 0),
+        };
+        (h < 24 && m < 60).then_some(h * 60 + m)
+    };
+    let (from, to) = (minute(a)?, minute(b)?);
+    (from != to).then_some((Some(from), Some(to)))
+}
 
 /// The Following page's rows.
-pub(super) fn rows(_s: &SettingsScreen, _ctx: &UiCtx<'_>, _v: &mut Vec<Row>) {}
+pub(super) fn rows(s: &SettingsScreen, ctx: &UiCtx<'_>, v: &mut Vec<Row>) {
+    s.following.poll();
+    let data = s.following.data.borrow();
+    let h24 = ctx.config.interface.clock_24h;
+    v.push(Row::Section("Following".into()));
+    let mut intro = "Tuner reads the guide after every refresh and sets these reminders for you.".to_owned();
+    if let Some(d) = data.as_ref() {
+        let fresh = d.upcoming.iter().filter(|u| counts(u)).count();
+        intro.push_str(&format!(" {fresh} coming"));
+        if let Some(at) = d.checked {
+            intro.push_str(&format!(" · checked {}", crate::ui::widgets::time::day_time(at, h24)));
+        }
+        intro.push('.');
+    }
+    if !ctx.config.follow.enabled {
+        intro.push_str(" Switched off: nothing is checked until it's on again.");
+    }
+    v.push(Row::Note(intro, false));
+    v.push(Row::Act { act: Act::Feature(Feature::Following, ACT_NEW), icon: glyphs::ADD, label: "Follow…".into(), danger: false });
+    let Some(d) = data.as_ref() else {
+        v.push(Row::Note("Loading…".into(), false));
+        return;
+    };
+    v.push(Row::Section("Rules · higher wins a clash".into()));
+    if d.rules.is_empty() {
+        v.push(Row::Note(
+            "Nothing yet. Press R on a programme in the guide, or Follow… above. A news flash pops up a bulletin every day.".into(),
+            false,
+        ));
+    }
+    for r in &d.rules {
+        let coming = d.upcoming.iter().filter(|u| u.rule == r.id && counts(u)).count();
+        let mut detail = fui::rule_summary(r);
+        detail.push_str(&match coming {
+            0 => " · nothing coming".to_owned(),
+            n => format!(" · {n} coming"),
+        });
+        let icon = if !r.enabled {
+            glyphs::PAUSE
+        } else if r.kind == crate::follow::FollowKind::News {
+            glyphs::POP_OUT
+        } else {
+            glyphs::FOLLOW
+        };
+        v.push(Row::Item {
+            item: Item::Feature(Feature::Following, r.id.0),
+            icon: icon.into(),
+            color: None,
+            label: r.name.clone(),
+            detail: Some(detail),
+            reorder: false,
+        });
+    }
+    v.push(Row::Section(format!("Upcoming · next {} days", 14)));
+    let horizon = ctx.now + 14 * 86_400;
+    let mut any = false;
+    for (i, u) in d.upcoming.iter().enumerate().filter(|(_, u)| u.start < horizon) {
+        any = true;
+        let mut detail = crate::ui::widgets::time::local(u.start, if h24 { "%a %-d %b %H:%M" } else { "%a %-d %b %-I:%M %p" }, "");
+        if !u.channel_name.is_empty() {
+            detail.push_str(" · ");
+            detail.push_str(&u.channel_name);
+        }
+        detail.push_str(" · ");
+        detail.push_str(&fui::state_text(u));
+        let title = match u.sub_title.as_deref().filter(|s| !s.is_empty()) {
+            Some(s) => format!("{} · {s}", u.title),
+            None => u.title.clone(),
+        };
+        v.push(Row::Item {
+            item: Item::Feature(Feature::Following, upcoming_id(i)),
+            icon: fui::state_glyph(u).into(),
+            color: None,
+            label: title,
+            detail: Some(detail),
+            reorder: false,
+        });
+    }
+    if !any {
+        v.push(Row::Note("Nothing coming up in the guide yet.".into(), false));
+    }
+    v.push(Row::Section("Settings".into()));
+    for t in &FOLLOW_T {
+        v.push(Row::Toggle(t));
+    }
+    v.push(Row::Section("News flash".into()));
+    v.push(Row::Note(
+        "A news flash pops a bulletin up in the small player at its time, then closes it and puts back what you were watching. It never interrupts a film or episode: you get a notification instead.".into(),
+        false,
+    ));
+    v.push(Row::Text(&FLASH_QUIET));
+    v.push(Row::Toggle(&FLASH_T));
+    v.push(Row::Number(&FLASH_N));
+}
+
+/// Counts as coming (not over the limit, skipped or listed only).
+fn counts(u: &Upcoming) -> bool {
+    matches!(u.state, MatchState::Scheduled | MatchState::Adopted)
+}
+
+/// Upcoming rows are `Item::Feature` with negative ids (rules have positive ones).
+fn upcoming_id(i: usize) -> i64 {
+    -(i as i64) - 1
+}
 
 /// Its `Act::Feature(Feature::Following, n)` buttons.
-pub(super) fn act(_s: &mut SettingsScreen, _ctx: &mut UiCtx<'_>, _n: u16) {}
+pub(super) fn act(_s: &mut SettingsScreen, ctx: &mut UiCtx<'_>, n: u16) {
+    if n == ACT_NEW {
+        ctx.open(OverlayRequest::FollowSheet(crate::ui::overlays::follow_sheet::FollowSheetSpec { programme: None, rule: None }));
+    }
+}
 
-/// Enter on its `Item::Feature(Feature::Following, id)` rows.
-pub(super) fn item(_s: &mut SettingsScreen, _ctx: &mut UiCtx<'_>, _id: i64) {}
+/// Enter on its `Item::Feature(Feature::Following, id)` rows: a rule opens in the editor, an
+/// Upcoming row opens its programme's popover.
+pub(super) fn item(s: &mut SettingsScreen, ctx: &mut UiCtx<'_>, id: i64) {
+    if id > 0 {
+        let rule = Some(crate::model::FollowRuleId(id));
+        ctx.open(OverlayRequest::FollowSheet(crate::ui::overlays::follow_sheet::FollowSheetSpec { programme: None, rule }));
+        return;
+    }
+    let i = (-id - 1) as usize;
+    let Some(u) = s.following.data.borrow().as_ref().and_then(|d| d.upcoming.get(i).cloned()) else { return };
+    match programme_of(ctx, &u) {
+        Some((programme, channel)) => ctx.open(OverlayRequest::Programme { programme, channel, zap: None }),
+        None => ctx.toast(Toast::info("That airing is no longer in the guide")),
+    }
+}
+
+/// The guide programme of an Upcoming row: its channel's programme starting at the row's
+/// (displayed) start.
+fn programme_of(ctx: &UiCtx<'_>, u: &Upcoming) -> Option<(crate::model::ProgrammeId, ChannelId)> {
+    let id = ctx.lib.live.by_ref(u.channel.as_ref()?)?;
+    let ch = ctx.lib.live.get(id)?;
+    let epg = ch.epg_channel_id?;
+    let start = u.start - i64::from(ch.tvg_shift_min) * 60;
+    let p = crate::store::epg::window(ctx.db, epg, start, start + 1).ok()?.into_iter().find(|p| p.start == start)?;
+    Some((p.id, id))
+}
 
 /// The page became current (or its data changed): start loading.
-pub(super) fn enter(_s: &mut SettingsScreen, _ctx: &UiCtx<'_>) {}
+pub(super) fn enter(s: &mut SettingsScreen, ctx: &UiCtx<'_>) {
+    *s.following.loader.borrow_mut() = Some(Loader::start(ctx, load));
+}
+
+#[cfg(test)]
+mod tests {
+    use eframe::egui;
+
+    use super::*;
+    use crate::follow::{FollowKind, FollowReason};
+    use crate::ui::NavRequest;
+    use crate::ui::screens::home::testkit::{self, harness, has_label, has_label_containing, rig, seed, until};
+
+    /// After an evaluation, Settings ▸ Following lists the rule ("1 coming") and its match
+    /// under Upcoming by the rule's name only (spoiler-safe); Enter on the rule opens it in the
+    /// sheet's editor, Enter on the match opens that programme's popover; and the guide's
+    /// tooltip says which rule set it.
+    #[test]
+    fn the_page_lists_rules_and_matches_and_opens_them() {
+        let (mut t, one) = rig();
+        let (pid, ch, start) = crate::ui::overlays::follow_sheet::tests::fixture(&mut t);
+        let id = seed(&mut t, |c| {
+            let r = FollowRule::draft("Arsenal", FollowKind::Team, vec!["Arsenal".into()], &crate::config::FollowConfig::default(), 0);
+            crate::store::follow::save_rule(c, &r, 100, 0)
+        });
+        let opts = crate::jobs::follow::Opts {
+            now: crate::model::now(),
+            reason: FollowReason::Rules,
+            cfg: crate::config::FollowConfig::default(),
+            pin_active: false,
+            tz: jiff::tz::TimeZone::system(),
+        };
+        let reader = t.services().store.reader().unwrap();
+        let ev = crate::jobs::follow::prepare(&reader, &t.lib, &opts, &|| false).unwrap().expect("evaluated");
+        t.services().store.writer().blocking(move |c| crate::jobs::follow::commit(c, &ev, &opts)).unwrap();
+
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1600.0, 1000.0));
+        h.state_mut().enter(Route::Settings(SettingsPage::Following));
+        until(&mut h, "the rule", |h| has_label_containing(h, "1 coming"));
+        assert!(has_label(&h, "Team · live · remind 2 min · spoiler-safe · 1 coming"));
+        assert!(!has_label_containing(&h, "Chelsea"), "spoiler-safe: the rule's name, not the fixture");
+        let open = |h: &mut egui_kittest::Harness<'static, testkit::App<SettingsScreen>>, item: Item| {
+            let app = h.state_mut();
+            let rows = app.t.with_ctx(|ctx| app.s.rows(ctx));
+            app.s.pane = Pane::Content;
+            app.s.row = rows.iter().position(|r| matches!(r, Row::Item { item: x, .. } if *x == item)).expect("row");
+            app.act(Action::Activate);
+            h.run_steps(2);
+            h.state_mut().nav()
+        };
+        let sheet = crate::ui::overlays::follow_sheet::FollowSheetSpec { programme: None, rule: Some(id) };
+        assert!(open(&mut h, Item::Feature(Feature::Following, id.0)).contains(&NavRequest::Open(OverlayRequest::FollowSheet(sheet))));
+        let popover = OverlayRequest::Programme { programme: pid, channel: ch, zap: None };
+        assert!(open(&mut h, Item::Feature(Feature::Following, upcoming_id(0))).contains(&NavRequest::Open(popover)));
+
+        // the guide's tooltip (read in the background once a Following hook saw the store)
+        let app = h.state_mut();
+        let target = crate::ui::item_menu::Target::Programme { programme: pid, channel: ch };
+        app.t.with_ctx(|ctx| crate::follow::ui::menu_items(&target, ctx, crate::keymap::KeyContext::Guide));
+        let epg = app.t.lib.live.get(ch).and_then(|c| c.epg_channel_id).unwrap();
+        let slim = crate::store::epg::window(&app.t.db, epg, start, start + 1).unwrap().into_iter().find(|p| p.id == pid).unwrap();
+        let begun = std::time::Instant::now();
+        while crate::follow::ui::tooltip_line(&slim).is_none() {
+            assert!(begun.elapsed() < std::time::Duration::from_secs(10), "no tooltip line");
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        assert_eq!(crate::follow::ui::tooltip_line(&slim).as_deref(), Some("From Following: Arsenal"));
+    }
+
+    /// Quiet hours as typed: both spellings of the dash, hours alone, four digits; empty
+    /// clears them, nonsense keeps what was stored.
+    #[test]
+    fn quiet_hours_as_typed() {
+        assert_eq!(parse_quiet("22:00–07:00"), Some((Some(22 * 60), Some(7 * 60))));
+        assert_eq!(parse_quiet("22-7"), Some((Some(22 * 60), Some(7 * 60))));
+        assert_eq!(parse_quiet("2230 0615"), Some((Some(22 * 60 + 30), Some(6 * 60 + 15))));
+        assert_eq!(parse_quiet(""), Some((None, None)));
+        assert_eq!(parse_quiet("late"), None);
+        assert_eq!(parse_quiet("25:00-07:00"), None);
+        assert_eq!(quiet_text(Some(22 * 60), Some(7 * 60)), "22:00–07:00");
+    }
+}
