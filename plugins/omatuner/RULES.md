@@ -91,8 +91,9 @@ before offering two pictures.
 
 propose → show the summary and up to 5 before/after now-next rows → the user's explicit yes →
 `guide_fix apply` with `confirm: true` → state the undo ("say 'undo', or Ctrl+Z in Guide fixes").
-At most 200 channels per proposal; more than 50 aren't applied from chat (`pending_review`): tell
-the user to review them in Tuner's Guide fixes, or propose a narrower batch. Never on locked
+At most 200 channels per proposal; more than 50 aren't applied from chat (`pending_review`):
+Tuner now shows them in a confirm card, so tell the user to press Enter there (Esc cancels).
+Don't apply that proposal again; if they cancel, propose again or a narrower batch. Never on locked
 channels (a playlist's rules are refused while it has locked channels and the session is locked). Name rules as rules: they change every future
 refresh. Don't guess catch-up offsets: suggest Tuner's Check, or use what the user says ("starts
 5 minutes late").

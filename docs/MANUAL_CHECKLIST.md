@@ -1288,9 +1288,10 @@ once (`claude mcp list` shows `tuner` connected).
 - [ ] **Backup:** export a backup after a shift and an "It's right", restore it on a fresh
   profile. **Expect:** the shift and the dismissal are back.
 - [ ] **Claude:** ask Claude "why is the guide empty on half my channels?" and to fix them.
-  **Expect:** a proposal; more than 50 channels is not applied from chat (Claude says to review
-  them in Guide fixes); a smaller batch applies and its toast/Undo works; a locked channel is
-  refused while locked.
+  **Expect:** a proposal; more than 50 channels is not applied from chat: Tuner comes forward
+  on Guide fixes with "Accept Claude's N fixes?" and Enter applies them (toast with Undo), Esc
+  applies nothing; a smaller batch applies from chat and its toast/Undo works; a locked
+  channel is refused while locked.
 
 ## 23. Up next
 

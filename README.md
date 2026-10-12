@@ -1109,7 +1109,7 @@ How it works and what it can't do:
   screen**. The PIN never goes through Claude, and Claude will not ask you for it. Claude can
   lock but never unlock, never shows explicit content and never loosens a setting: it can't
   turn a rule's spoiler-safe off, remove your own spoiler rules, or apply a guide fix to more
-  than 50 channels from chat. Rules Claude adds are marked and toast with **Undo**.
+  than 50 channels from chat (Tuner shows those in a confirm card for you to press Enter). Rules Claude adds are marked and toast with **Undo**.
 - Claude gets names, times and programme details, never stream addresses or your logins.
   Playlist names are shared too, and a playlist you didn't rename is named after its server:
   rename it (Settings ▸ Playlists) if you'd rather Claude didn't see that. Web links inside

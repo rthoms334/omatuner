@@ -54,8 +54,9 @@ Notes for the wave-4 DESIGN pass (§30, plus the feature sections §31–§35). 
   `missing` everywhere.
 - Follow rules made by Claude are marked and capped at 10 an hour and 20 in all.
 - Guide fixes: proposals live 10 minutes, are bound to the guide-check stamp (`stale`), at most
-  200 channels; more than 50 returns `pending_review` (the app's confirm card; not applied from
-  chat). Locked channels are rejected while locked. Claude undoes only its own batches.
+  200 channels; more than 50 returns `pending_review` and is not applied from chat: the
+  proposal goes to the app (`AgentCommand::GuideFixReview`), which opens Guide fixes with its
+  confirm card prefilled; the user's Enter applies it as Claude's batch. Locked channels are rejected while locked. Claude undoes only its own batches.
 - Multi-view: the handler checks the playlists' stream limits (`AccountInfo::max_connections`)
   with each live picture's copies; `needs_rearrange` when only moving the playing picture works.
 - No tool returns a log line: `diagnose` gives Tuner's own error kinds, failure counts and the

@@ -130,8 +130,8 @@ guarded event. Writes need the user's confirmation; pausing stays in the app.",
             title: "Guide fixes",
             description: "Fix the TV guide's channel mappings: issues (coverage per playlist, channels without or with wrong guide data, \
 one channel's candidates), propose (changes, accept by kind and confidence, per-playlist rules; returns before/after now-next and a \
-proposal_id valid 10 min), apply (proposal_id + confirm=true, only after the user said yes; more than 50 channels → pending_review: the user \
-reviews them in Tuner's Guide fixes), undo (undo_id). At most 200 channels per proposal; locked channels are refused while the session is locked.",
+proposal_id valid 10 min), apply (proposal_id + confirm=true, only after the user said yes; more than 50 channels → pending_review: Tuner shows \
+them in a confirm card and the user presses Enter there; don't apply it again), undo (undo_id). At most 200 channels per proposal; locked channels are refused while the session is locked.",
             input_schema: object(
                 json!({
                     "action": action_schema::<GuideFixAction>("What to do."),

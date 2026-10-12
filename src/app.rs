@@ -498,6 +498,18 @@ impl TunerApp {
                 }
             }
             AppEvent::Agent(crate::agent::AgentCommand::MultiView(r)) => self.on_agent_multiview(r),
+            // Claude's batch over 50 channels: Guide fixes with its confirm card prefilled (the
+            // handler raised the window); Enter applies it, Esc drops it
+            AppEvent::Agent(crate::agent::AgentCommand::GuideFixReview(r)) => {
+                crate::guide_fix::ui::offer_review(r.clone());
+                if self.popout.is_out() || self.video_only {
+                    self.toggle_popout(egui_ctx);
+                }
+                if self.current_route().screen() != ScreenId::EpgMapping {
+                    self.nav.push(NavRequest::Push(Route::EpgMapping { channel: None }));
+                }
+                egui_ctx.request_repaint();
+            }
             // the reminder engine (B6): countdowns, switches, the sleep timer, news flashes
             AppEvent::Reminder(e) => self.on_reminder_event(e, egui_ctx),
             // Following's summary when no notification server answered (F-C)
@@ -4273,6 +4285,97 @@ mod tests {
         assert_eq!(reqs.len(), 1);
         assert_eq!((&reqs[0].media, reqs[0].resume), (&MediaRef::Movie(id), true));
         assert_eq!(rig.route(), &Route::Player);
+    }
+
+    /// DESIGN §31.5 end to end: Claude's `guide_fix apply` of more than 50 channels writes
+    /// nothing from chat; Tuner opens Guide fixes with the confirm card prefilled, the user's
+    /// Enter applies it as Claude's batch (its toast offers Undo), and Esc on a second one
+    /// leaves everything as it was.
+    #[test]
+    fn claude_guide_fixes_over_50_channels_wait_for_enter_in_the_confirm_card() {
+        use crate::agent::proto::{Call, Request};
+        use crate::agent::server::{AgentHandler, AgentService};
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_channels(c, 60, None));
+        rig.settle();
+        // one handler: it keeps the proposals between calls
+        let s = rig.app.services();
+        let handler = AgentHandler::new(s.agent.clone(), s.store.clone(), s.config.clone(), s.tiles.focused(), s.bus.clone(), s.jobs.clone());
+        let tool = |rig: &Rig, args: serde_json::Value| {
+            let reply = rig.app.services().rt.block_on(handler.handle(Request::new(1, Call::from_tool("guide_fix", args).unwrap())));
+            assert!(reply.ok, "{reply:?}");
+            reply.result.unwrap()
+        };
+        let send_for_review = |rig: &Rig, shift: i64| {
+            let changes: Vec<serde_json::Value> =
+                (0..55).map(|i| serde_json::json!({ "ref": format!("channel:1:m3u:ch{i}"), "shift_min": shift })).collect();
+            let p = tool(rig, serde_json::json!({ "action": "propose", "changes": changes }));
+            assert_eq!((p["summary"]["channels"].as_u64(), p["applies_in_chat"].as_bool()), (Some(55), Some(false)), "{p}");
+            tool(rig, serde_json::json!({ "action": "apply", "proposal_id": p["proposal_id"], "confirm": true }))
+        };
+        let batches = |rig: &Rig| crate::store::guide_fix::recent(&rig.app.services().store.reader().unwrap(), 10).unwrap();
+        let confirm = std::mem::discriminant(&OverlayRequest::Confirm(crate::ui::overlays::ConfirmSpec {
+            title: String::new(),
+            body: String::new(),
+            confirm_label: String::new(),
+            destructive: false,
+            token: 0,
+        }));
+
+        let out = send_for_review(&rig, 30);
+        assert_eq!((out["pending_review"].as_bool(), out["channels"].as_u64()), (Some(true), Some(55)), "{out}");
+        assert!(out.get("applied").is_none() && batches(&rig).is_empty(), "nothing is applied from chat");
+        rig.until("Guide fixes with the confirm card", |r| r.route().screen() == ScreenId::EpgMapping && r.overlay_kinds() == [confirm]);
+        let shown = texts(&rig.frame_with(vec![]));
+        assert!(shown.iter().any(|(t, _, _)| t == "Accept Claude's 55 fixes?"), "the card's title: {shown:?}");
+        assert!(shown.iter().any(|(t, _, _)| t.contains("Claude proposed these in chat") && t.contains("55 time shifts")), "{shown:?}");
+        assert!(button(&shown, "Accept 55").is_some(), "the card's button: {shown:?}");
+
+        rig.press(Key::Enter, NONE);
+        assert!(rig.app.overlays.is_empty(), "Enter confirms");
+        rig.until("Claude's batch", |r| !batches(r).is_empty());
+        let b = batches(&rig);
+        assert_eq!((b.len(), b[0].actor, b[0].label.as_str(), b[0].n), (1, crate::model::FixActor::Claude, "Claude: 55 channels", 55));
+        rig.until("its toast", |r| {
+            r.log()
+                .toasts
+                .iter()
+                .any(|t| t.text == "Claude fixed the guide for 55 channels" && t.action == Some(("Undo".into(), Action::UndoGuideFix(Some(b[0].id)))))
+        });
+        let shifts = crate::store::guide_fix::facts(
+            &rig.app.services().store.reader().unwrap(),
+            &crate::store::guide_fix::GuideOpts::default(),
+            crate::model::now(),
+        )
+        .unwrap()
+        .extras;
+        let shifted = |i: usize| rig.app.lib.live.by_ref(&channel_ref(i)).and_then(|id| shifts.get(&id)).and_then(|e| e.shift_min);
+        assert_eq!((shifted(0), shifted(54), shifted(55)), (Some(30), Some(30), None), "the 55 channels and no other");
+
+        // a second batch: Esc drops it, nothing changes
+        let out = send_for_review(&rig, 60);
+        assert_eq!(out["pending_review"].as_bool(), Some(true));
+        rig.until("the second card", |r| r.overlay_kinds() == [confirm]);
+        rig.press(Key::Escape, NONE);
+        assert!(rig.app.overlays.is_empty());
+        for _ in 0..10 {
+            rig.frame_with(vec![]);
+        }
+        assert_eq!(batches(&rig).len(), 1, "Esc applies nothing");
+        assert_eq!(rig.route().screen(), ScreenId::EpgMapping, "Esc closes the card, not the screen");
+
+        // the playlist changed while a card waited: Enter applies nothing and says so
+        assert_eq!(send_for_review(&rig, 90)["pending_review"].as_bool(), Some(true));
+        rig.until("the third card", |r| r.overlay_kinds() == [confirm]);
+        rig.writer()
+            .blocking(|c| {
+                c.execute("UPDATE source SET generation = generation + 1", [])?;
+                Ok(())
+            })
+            .unwrap();
+        rig.press(Key::Enter, NONE);
+        rig.until("the stale toast", |r| r.log().toasts.iter().any(|t| t.text.starts_with("The guide data changed since these fixes were proposed")));
+        assert!(rig.log().toasts.iter().any(|t| t.text.ends_with("ask Claude to propose them again")));
+        assert_eq!(batches(&rig).len(), 1, "a stale batch applies nothing");
     }
 
     /// DESIGN §30.8 / B6 end to end: `schedule_switch` → the scheduler (running although

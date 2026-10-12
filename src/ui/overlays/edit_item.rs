@@ -210,6 +210,7 @@ impl EditItemOverlay {
             let toast = format!("{}: time shift {shift}", if name.is_empty() { l.provider_name.as_str() } else { name });
             let _ = crate::guide_fix::ui::submit_apply(
                 ctx.services,
+                crate::model::FixActor::You,
                 format!("Time shift {shift}"),
                 toast,
                 crate::model::Proposal { changes: vec![change], ..Default::default() },
