@@ -15,6 +15,7 @@ use super::act::error_kind;
 use super::proto::{AgentRef, CopyOut, Diagnose, PlayerStateOut, TileName, fmt_time, item_ref};
 use super::query::{Fail, Out, Q, channel_copies_out, clean, parse_ref, when};
 use super::server::{Inner, to_value};
+use crate::cast::firewall::{FirewallState, UnknownWhy};
 use crate::model::{ItemKind, ItemRef, SourceId};
 use crate::player::{PlayerSnapshot, PlayerState};
 
@@ -34,6 +35,68 @@ pub struct DiagnoseOut {
     /// Tuner's reading of it (`provider_outage`, `connection_limit`, `account`, `dead_channel`,
     /// `local_decode`, `network`): a hint, the skill explains it.
     pub likely: Vec<String>,
+    /// Casting, once a TV is paired or a cast ran (DESIGN §40 §12).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cast: Option<CastSection>,
+}
+
+/// `diagnose`'s cast section: what the TV is and how casting stands, with no address.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CastSection {
+    /// The TV last cast to (or being cast to): "AppleTV14,1".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Its OS version ("26.6 (23L773)").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub os_version: Option<String>,
+    /// The AirPlay version it reports.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_version: Option<String>,
+    /// The pairing variant that worked (`hkp3`, `hkp5`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pairing: Option<String>,
+    /// How the TV is told to keep time: always `ptp-declared` in Phase 1.
+    pub timing: String,
+    /// `no_firewall`, `allowed`, `allowed_by_tuner`, `blocked`, `blocked_shadowed` or
+    /// `unknown_<why>`. For the blocked ones the user presses **Allow on firewall** in Tuner
+    /// (Settings ▸ Cast ▸ Network); agents never change the firewall.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub firewall: Option<String>,
+    /// The typed reason of the last cast failure (`cast-firewall`, …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+/// The firewall state as `diagnose` words it.
+fn firewall_name(s: FirewallState) -> &'static str {
+    match s {
+        FirewallState::NoFirewall => "no_firewall",
+        FirewallState::Allowed { ours: false } => "allowed",
+        FirewallState::Allowed { ours: true } => "allowed_by_tuner",
+        FirewallState::Blocked { shadowed: false } => "blocked",
+        FirewallState::Blocked { shadowed: true } => "blocked_shadowed",
+        FirewallState::Unknown { why: UnknownWhy::Firewalld } => "unknown_firewalld",
+        FirewallState::Unknown { why: UnknownWhy::Nftables } => "unknown_nftables",
+        FirewallState::Unknown { why: UnknownWhy::Unreadable } => "unknown_unreadable",
+    }
+}
+
+/// The cast section from the service's own report (`CastApi::diagnose`, the firewall detection
+/// it last made). `None` while casting has nothing to say: no TV known and no cast ever failed.
+pub fn cast_section(d: &crate::cast::CastDiagnose, known: bool) -> Option<CastSection> {
+    if !known && d.device.is_none() && d.last_error.is_none() {
+        return None;
+    }
+    let text = |s: &Option<String>| s.as_deref().map(clean).filter(|s| !s.is_empty());
+    Some(CastSection {
+        model: text(&d.model),
+        os_version: text(&d.os_version),
+        source_version: text(&d.source_version),
+        pairing: d.pairing.map(|p| p.as_str().to_owned()),
+        timing: d.timing.to_owned(),
+        firewall: d.firewall.map(|f| firewall_name(f).to_owned()),
+        last_error: d.last_error.map(|e| e.reason().to_owned()),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -254,7 +317,7 @@ fn plan_diagnose(q: &Q, p: &Diagnose, snaps: &[(crate::model::TileId, Arc<Player
     {
         hint(&mut likely, "dead_channel");
     }
-    Ok(DiagnoseOut { playing, item, playlists, since: fmt_time(since), likely })
+    Ok(DiagnoseOut { playing, item, playlists, since: fmt_time(since), likely, cast: None })
 }
 
 pub(super) async fn diagnose(h: &Arc<Inner>, p: Diagnose) -> Out<Value> {
@@ -262,7 +325,9 @@ pub(super) async fn diagnose(h: &Arc<Inner>, p: Diagnose) -> Out<Value> {
     if let Some(b) = h.shared.tile_player(crate::model::TileId::B) {
         snaps.push((crate::model::TileId::B, b.borrow().clone()));
     }
-    let out = h.run(true, move |q| plan_diagnose(q, &p, &snaps)).await?;
+    let mut out = h.run(true, move |q| plan_diagnose(q, &p, &snaps)).await?;
+    let cast = h.shared.cast();
+    out.cast = cast_section(&cast.diagnose(), !cast.devices().is_empty());
     to_value(&out)
 }
 

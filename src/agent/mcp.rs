@@ -242,7 +242,16 @@ fn tools_call(params: &Value, client: &Client, session: &Session) -> Result<Valu
     let setting = || session.config.as_deref().and_then(|p| crate::config::Config::load(p).ok()).map(|c| c.agents.play_in).unwrap_or_default();
     let launch = launch_for(&tool, &call, hyprland, setting);
     let plain = without_open_in(&call);
+    let casts = matches!(&call, Call::Play(p) if p.device.is_some());
     let mut reply = client.send_as(call, launch, session.agent.clone());
+    // a Tuner from before casting refuses `device`: never play it here instead (DESIGN §40 §12)
+    if casts
+        && let Ok(sent) = &reply
+        && cannot_cast(&sent.reply)
+    {
+        tracing::info!("mcp: {}: the running Tuner doesn't know device; not playing it here", tool.name);
+        return Ok(tool_error("unsupported", CANNOT_CAST));
+    }
     // a Tuner from before `open_in` (0.2.4, still running after an upgrade) refuses the field:
     // ask again without it, as that Tuner's own play
     let mut older = false;
@@ -302,6 +311,16 @@ fn tools_call(params: &Value, client: &Client, session: &Session) -> Result<Valu
 const OLDER_TUNER: &str = "The running Tuner is older than this bridge: it played this its own way (in its window), without open_in. \
 Restart Tuner to update it.";
 
+/// What an agent is told when the running Tuner is older than casting.
+const CANNOT_CAST: &str = "The running Tuner can't cast; update Tuner";
+
+/// A Tuner from before casting refuses `play`'s `device` as an unknown field (it never reaches a
+/// handler that could answer): unlike `open_in`, the call is not asked again without it, because
+/// playing on this computer instead of the TV would be wrong.
+fn cannot_cast(reply: &super::proto::Reply) -> bool {
+    reply.error.as_ref().is_some_and(|e| e.code == ErrorCode::BadRequest && e.message.contains("unknown field `device`"))
+}
+
 /// `call` without its `open_in`, when it has one (`play`, `queue`): what a Tuner from before
 /// the field accepts.
 fn without_open_in(call: &Call) -> Option<Call> {
@@ -316,13 +335,17 @@ fn without_open_in(call: &Call) -> Option<Call> {
 /// §30.13) starts it there, pinned and without the keyboard (like a switch reminder), the rest
 /// in its window. Unasked, a play starts the window too: Hyprland opens it on the workspace
 /// the agent's terminal shows, i.e. on screen, where the play fills it; only `open_in:
-/// popout` starts the pop-out. `setting`: "Agents play in", read only for plays.
+/// popout` starts the pop-out; a play with a `device` always starts the window (the picture is on
+/// the TV, and the pop-out would be an empty player pinned on every workspace).
+/// `setting`: "Agents play in", read only for plays.
 fn launch_for(tool: &tools::ToolDef, call: &Call, hyprland: bool, setting: impl FnOnce() -> crate::model::OpenIn) -> Launch {
     use super::params::QueueAction;
     if !tool.launches {
         return Launch::No;
     }
     let asked = match call {
+        // a cast is the window, never the pop-out: the picture is on the TV (DESIGN §40 §12)
+        Call::Play(p) if p.device.is_some() => return Launch::Window,
         Call::Play(p) => p.open_in.as_deref(),
         Call::Queue(q) if matches!(q.action, QueueAction::Play | QueueAction::Skip) => q.open_in.as_deref(),
         _ => return Launch::Window,
@@ -407,6 +430,32 @@ mod tests {
         assert_eq!(launch("queue", json!({ "action": "add", "refs": ["movie:2:xt:vod:1"] }), true, OpenIn::PopOut), Launch::Window);
         assert_eq!(launch("search", json!({ "query": "dune" }), true, OpenIn::PopOut), Launch::Window);
         assert_eq!(launch("status", json!({}), true, OpenIn::PopOut), Launch::No);
+        // a cast never starts the pop-out, whatever is asked or set
+        let tv = "device:00112233445566778899aabbccddeeff";
+        assert_eq!(launch("play", json!({ "ref": "movie:2:xt:vod:1", "device": tv }), true, OpenIn::PopOut), Launch::Window);
+        assert_eq!(launch("play", json!({ "ref": "movie:2:xt:vod:1", "device": tv, "open_in": "popout" }), true, OpenIn::PopOut), Launch::Window);
+        assert_eq!(launch("cast_devices", json!({}), true, OpenIn::PopOut), Launch::Window);
+    }
+
+    /// A Tuner from before casting says `unknown field `device``: the bridge tells the agent to
+    /// update it, and does not play the item here. Any other refusal is passed on as it is.
+    #[test]
+    fn an_older_tuner_is_not_asked_to_play_a_cast_here() {
+        use crate::agent::proto::Reply;
+        // what serde says in Tuner 0.2.5, whose `Play` knows `ref`, `from_start` and `open_in`
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct OlderPlay {
+            r#ref: String,
+            from_start: Option<bool>,
+            open_in: Option<String>,
+        }
+        let says = serde_json::from_value::<OlderPlay>(json!({ "ref": "movie:2:xt:vod:1", "device": "x" })).unwrap_err().to_string();
+        assert!(cannot_cast(&Reply::err(1, ErrorCode::BadRequest, crate::redact::redact(&says))), "{says}");
+        assert!(!cannot_cast(&Reply::err(1, ErrorCode::BadRequest, "not a device ref: pass back a `ref` cast_devices returned")));
+        assert!(!cannot_cast(&Reply::err(1, ErrorCode::NotFound, "unknown field `device`")));
+        assert!(!cannot_cast(&Reply::ok(1, json!({}))));
     }
 
     /// Lines are read whole up to the cap; a longer one is skipped to its newline without

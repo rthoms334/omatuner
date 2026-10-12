@@ -4545,14 +4545,14 @@ mod tests {
         let mut rig = Rig::with(pin_config(), live(), 1.0, |c| seed_agent(c, 3600));
         rig.settle();
         let ch1 = rig.app.lib.live.by_ref(&channel_ref(1)).unwrap();
-        let out = ask(&rig, Call::Play(Play { item: "channel:1:m3u:ch1".into(), from_start: None, open_in: None }));
+        let out = ask(&rig, Call::Play(Play { item: "channel:1:m3u:ch1".into(), from_start: None, open_in: None, device: None }));
         assert_eq!(out["outcome"], "playing");
         rig.until("the play", |r| !played(&r.log()).is_empty());
         assert_eq!(played(&rig.log()), [(MediaRef::Channel(ch1), PlayOrigin::Cli)]);
         assert_eq!(rig.route(), &Route::Player);
         assert!(rig.log().commands.iter().any(|c| matches!(c, PlayerCommand::Play(r) if r.zap.is_some())), "zaps through its group");
 
-        let out = ask(&rig, Call::Play(Play { item: "channel:1:m3u:ch0".into(), from_start: None, open_in: None }));
+        let out = ask(&rig, Call::Play(Play { item: "channel:1:m3u:ch0".into(), from_start: None, open_in: None, device: None }));
         assert_eq!(out["outcome"], "pin_required");
         rig.until("the PIN prompt", |r| r.overlay_kinds() == [pin_prompt()]);
         assert_eq!(played(&rig.log()).len(), 1, "nothing plays before the PIN");

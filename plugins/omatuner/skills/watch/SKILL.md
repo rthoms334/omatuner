@@ -2,7 +2,7 @@
 name: watch
 description: Play, find or catch up on live TV in Tuner, the user's IPTV player. "Is X on", "put X on", "I missed X, play it from the start", "no spoilers", the news, background TV, what's on now, what's this and how long is left, switch me over at kick-off, put both semis on side by side.
 when_to_use: Use when the user wants something on the TV now or soon in Tuner, asks what is on, wants to catch up on a programme that aired, or wants two live things at once. Hand standing "every time X is on" requests to the plan skill.
-allowed-tools: Read mcp__plugin_omatuner_tuner__status mcp__plugin_omatuner_tuner__guide_search mcp__plugin_omatuner_tuner__whats_on mcp__plugin_omatuner_tuner__details mcp__plugin_omatuner_tuner__search mcp__plugin_omatuner_tuner__categories mcp__plugin_omatuner_tuner__play mcp__plugin_omatuner_tuner__control mcp__plugin_omatuner_tuner__reminders mcp__plugin_omatuner_tuner__schedule_switch mcp__plugin_omatuner_tuner__cancel_switch mcp__plugin_omatuner_tuner__queue mcp__plugin_omatuner_tuner__multiview mcp__plugin_omatuner_tuner__spoiler_guard
+allowed-tools: Read mcp__plugin_omatuner_tuner__status mcp__plugin_omatuner_tuner__guide_search mcp__plugin_omatuner_tuner__whats_on mcp__plugin_omatuner_tuner__details mcp__plugin_omatuner_tuner__search mcp__plugin_omatuner_tuner__categories mcp__plugin_omatuner_tuner__play mcp__plugin_omatuner_tuner__cast_devices mcp__plugin_omatuner_tuner__control mcp__plugin_omatuner_tuner__reminders mcp__plugin_omatuner_tuner__schedule_switch mcp__plugin_omatuner_tuner__cancel_switch mcp__plugin_omatuner_tuner__queue mcp__plugin_omatuner_tuner__multiview mcp__plugin_omatuner_tuner__spoiler_guard
 ---
 
 # Watch: find it, play it now, or catch up
@@ -56,6 +56,10 @@ First read `${CLAUDE_SKILL_DIR}/../../RULES.md` (this plugin's shared rules) and
   that programme (confirm), and `mark_seen` once they say they've watched it.
 - **On the TV / full screen / the big screen**: `play` with `open_in: "full_window"`; for what
   already plays, `control` `window` (it carries on, full screen in Tuner's window).
+- **"Put it on the TV" (a TV Tuner casts to, such as the Apple TV)**: `cast_devices`, then `play`
+  with `device`; follow rule 12 (the user's yes unless they named the TV, Tuner's window stays
+  where it is, `status.casting` to confirm). Say "on the TV" in the confirmation. "Bring it back
+  here" is `control` `play_here`.
 - **"Pop it out" / mini player**: `control` `popout`.
 - **"Go back to the last channel"**: `control` `previous_channel`.
 

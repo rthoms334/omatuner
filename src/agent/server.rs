@@ -13,6 +13,11 @@
 //!   `AppEvent::Agent(AgentCommand::Play)`, with `hypr::focus_self()` only when it shows in
 //!   the window: the app applies the PIN rules (prompt on screen), zap lists and
 //!   resume rules exactly as for a key press, and moves the window;
+//! * `play {device}` casts instead (DESIGN §40 §12): the TV is resolved and checked
+//!   (`agent::act::cast_gate`: paired, seen, no firewall block, no multi-view), the window
+//!   stays where it is (no placement, no raise except for the PIN prompt), and the reply is
+//!   immediate (`casting_started`; connecting can take longer than a request may): `status`
+//!   says how it went;
 //! * `control` / `status` go straight to the `PlayerHandle` (work while the window is hidden);
 //! * `schedule_switch` / `cancel_switch` write reminder rows (`Reminder::SWITCH_LEAD`) through
 //!   the store writer and wake the reminder scheduler, which fires them (`PlatformEvent::Switch*`).
@@ -34,7 +39,7 @@ use super::proto::{Call, CancelOut, Control, ControlAction, ErrorCode, Reply, Re
 use super::query::{self, Fail, Out, Q};
 use crate::config::SharedConfig;
 use crate::jobs::JobManager;
-use crate::model::OpenIn;
+use crate::model::{CastErrorKind, OpenIn};
 use crate::msg::{AppEvent, DataScope, EventBus};
 use crate::player::tiles::TileRegistry;
 use crate::player::{PlayerCommand, PlayerHandle};
@@ -59,6 +64,11 @@ const DETAILS_WAIT: Duration = Duration::from_secs(3);
 const READERS: usize = 3;
 /// How long `control` waits for the player to show the change.
 const CONTROL_WAIT: Duration = Duration::from_millis(500);
+/// How long `control stop_casting` / `play_here` wait: the TV is told to stop first (the
+/// controller waits up to 1.5 s for the relay to close).
+const CAST_STOP_WAIT: Duration = Duration::from_secs(2);
+/// How long `play {device}` lets discovery look for a remembered TV Tuner hasn't seen yet.
+const DISCOVER_WAIT: Duration = Duration::from_secs(2);
 
 /// The production [`AgentService`].
 #[derive(Clone)]
@@ -210,6 +220,7 @@ impl Inner {
             Call::Favourites(p) => self.query(move |q| query::favourites(q, &p)).await,
             Call::Details(p) => self.details(p).await,
             Call::Status(_) => self.status().await,
+            Call::CastDevices(_) => self.cast_devices(),
             Call::Play(p) => self.play(p).await.inspect_err(|_| self.undo_empty_pop_out()),
             Call::ScheduleSwitch(p) => self.schedule_switch(p).await,
             Call::CancelSwitch(p) => {
@@ -313,12 +324,56 @@ impl Inner {
     pub(super) fn status_more(&self) -> act::StatusMore {
         let tiles = self.shared.tiles();
         let b = self.shared.tile_player(crate::model::TileId::B).map(|rx| rx.borrow().clone());
-        act::StatusMore { queue: self.shared.queue(), tiles, tile_b: b, sleep: self.shared.sleep().and_then(|h| h.status()) }
+        act::StatusMore { queue: self.shared.queue(), tiles, tile_b: b, sleep: self.shared.sleep().and_then(|h| h.status()), casting: None }
+    }
+
+    /// What the cast service remembers of the last cast, for `status.casting` (DESIGN §40 §12).
+    pub(super) fn cast_last(&self) -> act::CastLast {
+        let cast = self.shared.cast();
+        let Some(error) = cast.last_error() else { return act::CastLast::default() };
+        let device = cast.diagnose().device.and_then(|id| cast.devices().into_iter().find(|d| d.id == id)).map(|d| (d.id, d.name, d.kind));
+        act::CastLast { error: Some(error), device }
+    }
+
+    /// `cast_devices`: the registry as it is (it never starts a scan).
+    fn cast_devices(&self) -> Out<serde_json::Value> {
+        let casting = self.player.snapshot().cast.as_ref().map(|v| v.device);
+        to_value(&act::cast_devices(&self.shared.cast().devices(), casting))
+    }
+
+    /// The TV `play {device}` asks for, once a cast to it can start, and whether it still has to
+    /// be paired (an outcome, not an error: agents never pair). A remembered TV Tuner hasn't
+    /// seen since it started gets one look by discovery (bounded) before it counts as
+    /// unreachable.
+    async fn cast_target(&self, asked: &str) -> Out<(crate::cast::Device, bool)> {
+        let cast = self.shared.cast();
+        let mut device = act::resolve_device(&cast.devices(), asked)?;
+        let multiview = self.shared.tiles().on;
+        let blocked = || cast.firewall().filter(|d| d.net.is_some()).map(|d| d.state);
+        let mut gate = act::cast_gate(&device, multiview, blocked());
+        if gate == act::CastGate::Refused(CastErrorKind::Unreachable.reason()) {
+            cast.browse();
+            let deadline = Instant::now() + DISCOVER_WAIT;
+            while Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if let Some(seen) = cast.devices().into_iter().find(|d| d.id == device.id && d.available) {
+                    gate = act::cast_gate(&seen, multiview, blocked());
+                    device = seen;
+                    break;
+                }
+            }
+        }
+        match gate {
+            act::CastGate::Go => Ok((device, false)),
+            act::CastGate::PairingRequired => Ok((device, true)),
+            act::CastGate::Refused(reason) => Err(act::refusal(reason)),
+        }
     }
 
     async fn status(self: &Arc<Self>) -> Out<serde_json::Value> {
         let snap = self.player.snapshot();
-        let more = self.status_more();
+        let mut more = self.status_more();
+        more.casting = act::casting_out(&snap, &self.cast_last());
         let v = self.run(false, move |q| act::status_with(q, &snap, &more)).await?;
         to_value(&v)
     }
@@ -409,6 +464,11 @@ impl Inner {
 
     async fn play(self: &Arc<Self>, p: super::proto::Play) -> Out<serde_json::Value> {
         let asked = act::parse_open_in(p.open_in.as_deref())?;
+        // a cast: the TV first (a TV that can't take it needs no look at the item)
+        let target = match p.device.as_deref() {
+            Some(d) => Some(self.cast_target(d).await?),
+            None => None,
+        };
         let again = p.clone();
         let mut step = self.run(true, move |q| act::plan_play(q, &p)).await?;
         if let PlayStep::NeedsDetails(job) = step {
@@ -431,13 +491,29 @@ impl Inner {
         };
         // the PIN is typed in Tuner's window: the prompt brings it forward
         let pin = out.outcome == super::proto::PlayOutcome::PinRequired;
-        let (show, w) = self.show(asked, pin).await;
+        if let Some((device, unpaired)) = &target {
+            if *unpaired {
+                tracing::info!("agent: play {log_ref} → pairing_required (cast device {})", device.id.short());
+                return to_value(&act::pairing_required(&out, device));
+            }
+            act::for_device(&mut command, &mut out, device);
+        }
+        // a cast never places the window (DESIGN §40 §3.8): only the PIN prompt raises it
+        let (show, w) = match (&target, pin) {
+            (Some(_), false) => (act::AgentShow::IN_PLACE, self.window()),
+            (Some(_), true) => (act::AgentShow::window(true), self.window()),
+            (None, _) => self.show(asked, pin).await,
+        };
         if let super::AgentCommand::Play(play) = &mut command {
             play.show = show;
         }
         self.bus.send(AppEvent::Agent(command));
         let opened = Self::raise_for(show, w);
-        out.opened_in = Some(opened);
+        out.opened_in.get_or_insert(opened);
+        if let Some((device, _)) = &target {
+            tracing::info!("agent: play {log_ref} → {:?} on cast device {}", out.outcome, device.id.short());
+            return to_value(&out);
+        }
         if !pin {
             match show.place {
                 Placement::PopOut => out.message.push_str(" It's in the pop-out."),
@@ -506,6 +582,8 @@ impl Inner {
             ControlAction::PreviousChannel | ControlAction::Popout | ControlAction::Window => {
                 get(tiles.focus).or_else(|| get(crate::model::TileId::A)).into_iter().collect()
             }
+            // casting is picture A's (multi-view can't be on while it casts)
+            ControlAction::StopCasting | ControlAction::PlayHere => get(crate::model::TileId::A).into_iter().collect(),
             _ => match &self.tiles {
                 Some(reg) => reg.all(),
                 None => vec![self.player.clone()],
@@ -522,6 +600,9 @@ impl Inner {
         let snap = first.snapshot();
         let idle = |s: &crate::player::PlayerSnapshot| matches!(s.state, crate::player::PlayerState::Idle | crate::player::PlayerState::Ended);
         let view = self.view().0;
+        if let Some(refused) = act::cast_control_guard(c.action, snap.cast.as_ref()) {
+            return Err(refused);
+        }
         let cmd = match c.action {
             ControlAction::Pause | ControlAction::Resume | ControlAction::TogglePause | ControlAction::Popout | ControlAction::Window
                 if idle(&snap) =>
@@ -548,6 +629,8 @@ impl Inner {
                 }
                 Some(PlayerCommand::LastChannel { unlocked: view.unlocked })
             }
+            ControlAction::StopCasting => Some(PlayerCommand::StopCasting { play_here: false }),
+            ControlAction::PlayHere => Some(PlayerCommand::StopCasting { play_here: true }),
             ControlAction::Popout => {
                 self.bus.send(AppEvent::Agent(super::AgentCommand::PopOut));
                 tracing::info!("agent: control Popout");
@@ -576,7 +659,9 @@ impl Inner {
                 ControlAction::Unmute => !s.muted,
                 ControlAction::PreviousChannel => s.load_generation != was_gen,
                 ControlAction::Popout | ControlAction::Window => true,
+                ControlAction::StopCasting | ControlAction::PlayHere => s.cast.is_none(),
             };
+            let wait = if matches!(c.action, ControlAction::StopCasting | ControlAction::PlayHere) { CAST_STOP_WAIT } else { CONTROL_WAIT };
             let mut rx = first.subscribe();
             rx.borrow_and_update();
             for t in &targets {
@@ -587,7 +672,7 @@ impl Inner {
                 };
                 t.send(cmd);
             }
-            let _ = tokio::time::timeout(CONTROL_WAIT, async {
+            let _ = tokio::time::timeout(wait, async {
                 while !done(&rx.borrow_and_update()) {
                     if rx.changed().await.is_err() {
                         break;
