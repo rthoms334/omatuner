@@ -1337,7 +1337,15 @@ fn agent_plays_open_in_the_window_on_screen_and_say_where() {
     let out = w.ok("queue", json!({ "action": "play" }));
     assert_eq!((out["opened_in"].as_str(), shown(&w)), (Some("window"), AgentShow::window(false)), "{out}");
     shared.set_window(WindowNow { popped_out: true, ..away });
-    // (the test player never plays, so Up next isn't driving it: the skip places it again)
+    // a stop ends Up next's drive (it keeps its place): the skip places it again. (Not "the
+    // test player never plays": under a loaded run Up next can drive its failing loads for long.)
+    w.ok("control", json!({ "action": "stop" }));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while shared.queue_handle().unwrap().snapshot().driving {
+        assert!(Instant::now() < deadline, "a stop never ended Up next's drive");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    w.commands();
     let out = w.ok("queue", json!({ "action": "skip" }));
     assert_eq!((out["opened_in"].as_str(), shown(&w)), (Some("popout"), AgentShow::POP_OUT), "the pop-out stays: {out}");
     let out = w.ok("queue", json!({ "action": "skip", "open_in": "full_window" }));
