@@ -198,21 +198,36 @@ fn hover_moves_the_cursor_only_on_real_pointer_motion() {
     assert_ne!(h.state().list.cursor, cursor);
 }
 
+/// One click does what Enter does; a double-click activates once (the list ignores a
+/// multi-click's later clicks, also when a busy frame batches both); right-click = the menu.
 #[test]
-fn list_clicks_move_activate_and_open_the_menu() {
+fn list_clicks_activate_once_and_open_the_menu() {
     let mut h = list_harness(50);
     h.get_by_label("Row 2").click();
     h.run();
     assert_eq!(h.state().list.cursor, 2);
+    assert_eq!(h.state().outcomes.iter().filter(|o| matches!(o, ListOutcome::Activated(_))).collect::<Vec<_>>(), [&ListOutcome::Activated(2)]);
     // let the first click age out of egui's double/triple-click window
     h.run_steps(40);
     let r = h.get_by_label("Row 4").rect();
     h.hover_at(r.center());
+    h.run_steps(1);
+    h.state_mut().outcomes.clear();
+    let press =
+        |pressed| egui::Event::PointerButton { pos: r.center(), button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+    for _ in 0..2 {
+        h.event(press(true));
+        h.event(press(false));
+        h.run_steps(2);
+    }
+    assert_eq!(h.state().outcomes, [ListOutcome::Activated(4)], "a double-click: once");
+    h.run_steps(40);
+    h.state_mut().outcomes.clear();
     for pressed in [true, false, true, false] {
-        h.event(egui::Event::PointerButton { pos: r.center(), button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+        h.event(press(pressed));
     }
     h.run();
-    assert!(h.state().outcomes.contains(&ListOutcome::Activated(4)), "{:?}", h.state().outcomes);
+    assert_eq!(h.state().outcomes, [ListOutcome::Activated(4)], "both clicks in one frame: once");
     h.get_by_label("Row 6").click_secondary();
     h.run();
     assert_eq!(h.state().outcomes.last(), Some(&ListOutcome::ContextMenu(6)));

@@ -271,8 +271,8 @@ impl PlayerScreen {
                 let Some(ch) = ctx.lib.live.get(id).cloned() else { return resp };
                 let source = sources.of(ch.source_id);
                 resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, badge::label_with_source(&ch.name, source)));
-                // the second click of a double-click would tune it again
-                if resp.clicked() && !resp.double_clicked() {
+                // a click tunes it, as Enter does (not again on a double-click's second click)
+                if crate::ui::widgets::fresh_click(&resp) {
                     tune = Some(id);
                 }
                 let p = ui.painter();
@@ -428,7 +428,7 @@ impl PlayerScreen {
                 area.width() - 2.0 * pad,
             );
         }
-        // a click puts the cursor on a row, a double-click plays it
+        // a click plays a row, as Enter does
         let out = match out {
             Out::Handled => Out::None,
             o => o,

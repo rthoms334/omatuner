@@ -64,7 +64,7 @@ The hint line adds `accept · mark · undo · view` on the issues, and `±1 h ·
 
 **Mouse.**
 - Clicking the mark box marks a row. Ctrl+click toggles a mark; Shift+click marks a range from the last mark.
-- A double-click accepts. Right-click opens the channel menu.
+- One click on a row does what Enter does (on to its guide channels); Shift+Enter or the Accept button accepts. Right-click opens the channel menu.
 - The stepper buttons act like the keys. Compact has `‹ Issues`.
 
 ## Elsewhere

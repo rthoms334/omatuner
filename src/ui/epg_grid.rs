@@ -29,7 +29,8 @@
 //! one. The view auto-scrolls horizontally to keep the focused cell fully visible (or its start
 //! when longer than the view) and vertically with a 2-row margin. PgUp/PgDn move by visible
 //! rows; `[`/`]` ±24 h; Shift+←/→ ±3 h; `n`/Home → now. Mouse: wheel = rows, Shift+wheel /
-//! horizontal trackpad = time, click = focus, double-click = open programme, hover tooltip.
+//! horizontal trackpad = time, a click on a programme = Enter (focus + open it; a gap watches),
+//! a click on the channel column = watch, hover tooltip.
 //!
 //! The guide screen feeds a few per-frame extras through crate-visible fields of
 //! [`EpgGridState`] (the reminder set, the mini-player rect to keep the focus clear of, the
@@ -208,7 +209,7 @@ impl ProgrammeCache {
 pub enum GridOutcome {
     None,
     FocusChanged,
-    /// Enter / double-click on a programme.
+    /// Enter / a click on a programme.
     Open {
         programme: ProgrammeId,
         channel: ChannelId,
@@ -714,10 +715,12 @@ pub fn epg_grid(
         painter.rect_filled(marker, 0.0, t.accent);
     }
 
-    // ---- clicks: the channel column watches, cells focus / open; a right-click on either
-    //      focuses it and asks for the menu
+    // ---- clicks: the channel column watches, a cell does what Enter does there (focus +
+    //      open; a gap watches); a right-click on either focuses it and asks for the menu. The
+    //      2nd/3rd click of a multi-click does nothing more (DESIGN §15.1 "Double-click safety")
+    let click = crate::ui::widgets::fresh_click(&resp);
     if let Some(i) = header_hit
-        && (resp.clicked() || resp.secondary_clicked())
+        && (click || resp.secondary_clicked())
     {
         // focus the row first: a locked channel's PIN retry (`GuideWatch`) watches the focus
         state.focus_at(i, state.focus_time, None);
@@ -726,7 +729,7 @@ pub fn epg_grid(
     }
     if let Some((row, tp, prog)) = hovered.clone() {
         state.hovered = prog.as_ref().map(|p| p.id);
-        if resp.double_clicked() {
+        if click {
             state.focus_at(row, tp, prog.clone());
             outcome = match prog {
                 Some(p) => GridOutcome::Open { programme: p.id, channel: state.rows[row].channel },
@@ -735,11 +738,6 @@ pub fn epg_grid(
         } else if resp.secondary_clicked() {
             state.focus_at(row, tp, prog);
             outcome = GridOutcome::Menu;
-        } else if resp.clicked() {
-            state.focus_at(row, tp, prog);
-            if outcome == GridOutcome::None {
-                outcome = GridOutcome::FocusChanged;
-            }
         }
     } else {
         state.hovered = None;

@@ -1752,7 +1752,6 @@ impl LiveScreen {
         let sources = Self::scope(ctx).marks(ctx);
         let hide_n = self.marks.hide_count(self.matching.len());
         let (groups, rows, marks) = (&self.groups, &self.group_rows, &self.marks);
-        let mut clicked = None;
         let list = &mut self.group_list;
         let (out, footer_click) = group_marks::with_footer(ui, theme, footer.as_deref(), Some(hide_n), |ui| {
             virtual_list(ui, theme, "live-groups", list, row_h, |ui, rc| {
@@ -1766,11 +1765,6 @@ impl LiveScreen {
                     let r = resp.rect;
                     ui.painter().hline(r.x_range(), r.bottom() - 0.5, egui::Stroke::new(1.0, theme.tokens.group_divider));
                 }
-                // the list reports `Moved` only when the cursor wasn't there yet, and a hover
-                // with real pointer motion has already put it there before the click
-                if resp.clicked() {
-                    clicked = Some(rc.index);
-                }
                 resp
             })
         });
@@ -1781,17 +1775,16 @@ impl LiveScreen {
             self.on_action(ctx, a);
             return;
         }
-        if let Some(i) = clicked.filter(|_| !matches!(out, ListOutcome::ContextMenu(_))) {
-            // a click (not a hover) focuses the pane and opens the group
-            self.group_list.select(i);
-            self.focus = Pane::Groups;
-            self.groups_action(ctx, Action::Activate);
-            return;
-        }
         match out {
             ListOutcome::Activated(_) => {
+                // Enter or a click: focus the pane, open the group
                 self.focus = Pane::Groups;
                 self.groups_action(ctx, Action::Activate);
+                if ctx.layout != LayoutClass::Wide {
+                    // the drawer / the one pane now shows the channels: a double-click's
+                    // second click must not play one
+                    crate::ui::widgets::swapped_under_pointer(ui.ctx());
+                }
             }
             ListOutcome::ContextMenu(_) => {
                 self.focus = Pane::Groups;
@@ -1905,10 +1898,11 @@ impl LiveScreen {
         }
         match out {
             ListOutcome::Moved => {
-                // pointer (hover/click): never autoplay
+                // hover: never autoplay
                 self.rest = None;
             }
             ListOutcome::Activated(_) => {
+                // Enter or a click: plays in the preview (Wide) or opens the player
                 self.focus = Pane::Channels;
                 self.activate(ctx, !Self::preview_visible(ctx.layout));
             }
@@ -1926,7 +1920,7 @@ impl LiveScreen {
         let (channels, rows, reminders, reminder_rows) = (&self.channels, &self.channel_rows, &self.reminders, &self.reminder_rows);
         let lib = ctx.lib.clone();
         let sources = Self::scope(ctx).marks(ctx);
-        virtual_list(ui, theme, "live-reminders", &mut self.chan_list, row_h, |ui, rc| {
+        let out = virtual_list(ui, theme, "live-reminders", &mut self.chan_list, row_h, |ui, rc| {
             let row = rows[rc.index] as usize;
             let ch = lib.live.get(channels[row]);
             let r = reminder_rows.get(row).and_then(|i| reminders.get(*i));
@@ -1946,6 +1940,19 @@ impl LiveScreen {
             let source = ch.and_then(|c| sources.of(c.source_id));
             menu_row_source(ui, theme, Some(glyphs::REMINDER), &label, detail.as_deref(), source, state)
         });
+        // what Enter and the menu key do on a reminder row (`channels_action`)
+        match out {
+            ListOutcome::Moved => self.rest = None,
+            ListOutcome::Activated(_) => {
+                self.focus = Pane::Channels;
+                self.activate(ctx, !Self::preview_visible(ctx.layout));
+            }
+            ListOutcome::ContextMenu(_) => {
+                self.focus = Pane::Channels;
+                self.channel_menu(ctx);
+            }
+            _ => {}
+        }
     }
 
     fn draw_empty_channels(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) {
@@ -2002,7 +2009,7 @@ impl LiveScreen {
         } else {
             let r = ui.allocate_rect(video_rect, egui::Sense::hover()).rect;
             ui.painter().rect_filled(r, t.rounding, t.fill_field);
-            let hint = if cursor.is_some() { "Enter or double-click plays here · Shift+Enter fullscreen" } else { "" };
+            let hint = if cursor.is_some() { "Enter or a click plays here · Shift+Enter fullscreen" } else { "" };
             ui.painter().text(
                 r.center(),
                 egui::Align2::CENTER_CENTER,

@@ -300,8 +300,9 @@ impl Screen for LogsScreen {
                 _ => {}
             }
         });
+        // a click does what Enter does: open or close the line's detail
         if let Some(i) = activated {
-            self.expanded = self.line_at(i).map(LineId::of);
+            self.toggle_expanded(i);
         }
         if menu {
             self.view_menu(ctx);

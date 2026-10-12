@@ -37,14 +37,31 @@ pub mod toggle;
 
 pub use paint::{session_locked, set_session_locked};
 
-/// The second click of a double-click whose first click (at `first`, egui time) swapped what is
-/// under the pointer — a category opening its grid, the page list opening a page. It must not
-/// act on what appeared there (it would open a title or flip a setting). Screens record the
-/// time of such a click and drop clicks for which this is true.
-pub fn second_click_after(ui: &egui::Ui, first: Option<f64>) -> bool {
-    let Some(first) = first else { return false };
-    let max = ui.ctx().options(|o| o.input_options.max_double_click_delay);
-    ui.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary) && i.time - first <= max + 0.05)
+/// A primary click that is not the 2nd/3rd click of a double/triple-click (egui reports
+/// `clicked()` on every release of a multi-click). One click does what Enter does, so a widget
+/// acting on `clicked()` acts on this instead: a double-click acts once — a tick isn't flipped
+/// back, a row isn't played twice (DESIGN §15.1 "Double-click safety"). Keyboard/accesskit
+/// clicks are always fresh, and so is a whole double-click that arrives in one frame (a busy
+/// frame batches input): it still acts once.
+pub fn fresh_click(resp: &egui::Response) -> bool {
+    let releases = || {
+        resp.ctx.input(|i| {
+            i.raw
+                .events
+                .iter()
+                .filter(|e| matches!(e, egui::Event::PointerButton { button: egui::PointerButton::Primary, pressed: false, .. }))
+                .count()
+        })
+    };
+    resp.clicked() && ((!resp.double_clicked() && !resp.triple_clicked()) || releases() > 1)
+}
+
+/// This frame's click swapped what is under the pointer without changing the route or overlay
+/// stack (a category opening its grid in the same pane, the Compact page list opening a page):
+/// the app drops the second click of the double-click so it can't act on what appeared there
+/// ([`crate::ui::click_guard`]). Route and overlay changes are noticed without this.
+pub fn swapped_under_pointer(ctx: &egui::Context) {
+    crate::ui::click_guard::mark_swapped(ctx);
 }
 
 /// Visual state of a row/control (Omarchy paint priority: pressed > focus > hover/cursor >

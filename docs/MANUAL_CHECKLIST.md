@@ -992,14 +992,35 @@ side buttons, at
     window at the right edge). A search hit's menu starts with "Play now", and choosing an item
     acts on that hit. The player menu lists Channels…, Now / next…, History… (live) through Stop
     and close.
-- [ ] **Hover, pointer, double-click:**
+- [ ] **Hover, pointer:**
   - **Do:** hover buttons, rows, posters, toggles, the sidebar; hover the Settings page list while
     a page has the keyboard cursor; move the mouse over onboarding's choices (Settings ▸
-    Playlists ▸ Add). At Tiled and Compact, double-click a Movies category; at Compact,
-    double-click a Settings page name.
+    Playlists ▸ Add).
   - **Expect:** a pointing hand over everything clickable, never over plain text or the scrim.
-    Never two rows lit as the cursor at once. The double-click opens the category / page and
-    nothing else (no movie page, no toggled setting).
+    Never two rows lit as the cursor at once.
+- [ ] **One click = Enter:**
+  - **Do:** click once on: a Live channel (Wide, then Tiled), a group, a poster, a Home tile, an
+    episode, a guide programme and a guide gap, an Up next row, a Logs line (twice), an EPG
+    mapping channel and a candidate, a Settings toggle row.
+  - **Expect:** each does what Enter does there: the channel plays in the preview (Wide) or opens
+    the player, the group opens, the title's page opens, the episode plays, the programme's card
+    opens / the gap's channel plays, the row plays, the line opens then closes, the candidates
+    take the cursor / the guide channel is assigned, the setting flips. Hover alone never acts.
+- [ ] **Double-click = one click:**
+  - **Do:** double-click a Live channel at Tiled (the player opens under the pointer), a Movies
+    category at Tiled and Compact, a Settings page name at Compact, a poster, a guide programme,
+    a context-menu item over a list, a category tick and a Settings toggle. Then double-click the
+    player's video, and the video-only pop-out.
+  - **Expect:** each acts once: no fullscreen toggled by the player that just opened, no movie page
+    from the grid that replaced the categories, no setting flipped back, no row activated under
+    the menu. On video a double-click still toggles fullscreen / pops the window back in.
+- [ ] **Focusing click:** with Hyprland's `input:follow_mouse = 2` (click to focus), focus
+  another window, then click a channel in Tuner. **Expect:** the window takes focus and nothing
+  plays; the next click plays. With the default `follow_mouse = 1` (flick the pointer onto the
+  sidebar from the window to its left and click at once), and with `3` (the keyboard stays where
+  it is), a click acts at once; with `3`, dragging a scrollbar or the volume slider works too.
+- [ ] **Slow double-click:** double-click a Movies category at Tiled a little slower than usual
+  (about 0.4 s between clicks). **Expect:** the category opens and no title opens.
 - [ ] **Jobs, toasts, bulk hide, tracks:**
   - **Do:** start a playlist refresh, open Jobs, click a running task's ✕. Hover a toast and click
     its ✕. Mark two groups (right-click → Mark for hiding) and use the footer's `[Hide 2]` and

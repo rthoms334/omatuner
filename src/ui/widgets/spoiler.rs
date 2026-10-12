@@ -310,7 +310,7 @@ pub fn field(
                 .on_hover_text(format!("Shown on purpose — click or {} to hide", crate::spoiler::ui::reveal_key_label()))
                 .on_hover_cursor(egui::CursorIcon::PointingHand);
             eye.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Hide spoilers again"));
-            if eye.clicked() {
+            if super::fresh_click(&eye) {
                 crate::spoiler::ui::hide_all();
                 click = FieldClick::Hidden;
             }
@@ -343,7 +343,7 @@ pub fn field(
             };
             let resp = resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand);
             resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, accessible_name(reason.as_ref())));
-            if resp.clicked()
+            if super::fresh_click(&resp)
                 && let Some(k) = RevealKey::of(subject)
             {
                 crate::spoiler::ui::reveal_key(k);

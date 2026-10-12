@@ -773,7 +773,8 @@ impl CategoryPicker {
                                     check_row(ui, theme, ticked, code.as_deref(), &label, Some(&counts_text(e)), new, rc.state)
                                 }
                             };
-                            if resp.clicked() {
+                            // a click ticks, as Space does; a double-click doesn't tick it back
+                            if crate::ui::widgets::fresh_click(&resp) {
                                 toggled = Some(rc.index);
                             }
                             resp

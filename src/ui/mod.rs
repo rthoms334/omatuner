@@ -14,6 +14,7 @@
 //! * UI code never calls mpv: player control is `ctx.play(PlayerCommand)` (non-blocking),
 //!   state is `ctx.player` (snapshot).
 
+pub mod click_guard;
 pub mod copies;
 pub mod data;
 pub mod epg_grid;

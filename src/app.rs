@@ -126,6 +126,10 @@ pub struct TunerApp {
     /// The last input event was an Alt chord that resolved: drop its `Text` twin if it comes
     /// next (possibly in the next batch of input).
     drop_alt_text: bool,
+    /// Double-click safety and the focusing click (DESIGN §15.1).
+    click_guard: crate::ui::click_guard::ClickGuard,
+    /// The route and overlay stacks at the end of the last frame (`click_guard`).
+    last_stacks: (Vec<Route>, Vec<std::mem::Discriminant<OverlayRequest>>),
     /// The window title last sent ("Tuner — Movies · TV 2", DESIGN §29).
     window_title: String,
     /// The status bar's spoiler entry ("Ctrl+B show spoilers"), worked out before the bar.
@@ -213,6 +217,7 @@ impl TunerApp {
     ) -> Self {
         fonts.install(&cc.egui_ctx);
         crate::theme::egui_style::apply(&cc.egui_ctx, &theme);
+        crate::ui::click_guard::install(&cc.egui_ctx);
         let surface = match services.tiles.a().render_core().map(|core| crate::player::VideoSurface::new(core, cc)) {
             Some(Ok(s)) => Some(s),
             Some(Err(e)) => {
@@ -251,6 +256,8 @@ impl TunerApp {
             screens: crate::ui::screens::all(),
             routes: vec![start],
             overlays: Vec::new(),
+            click_guard: Default::default(),
+            last_stacks: Default::default(),
             toasts: Toasts::default(),
             images,
             parental: ParentalSession::default(),
@@ -2334,6 +2341,8 @@ impl TunerApp {
 
 impl eframe::App for TunerApp {
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        // before the screenshot script injects its clicks: those are never dropped
+        self.click_guard.filter(ctx, raw);
         if let Some(mut d) = self.devshot.take() {
             let cmds = d.hook(ctx, raw, self.lib.generation != 0, self.window_size);
             self.devshot = Some(d);
@@ -2560,6 +2569,13 @@ impl eframe::App for TunerApp {
         self.publish_for_agent(&egui_ctx);
         self.free_closed_search();
         crate::ui::widgets::status_bar::settle_focus(&egui_ctx);
+        // a click that opened a page or overlay (or closed one) arms the drop of its double-click's
+        // second click
+        let changed = self.routes != self.last_stacks.0 || !self.overlays.iter().map(|o| o.kind).eq(self.last_stacks.1.iter().copied());
+        if changed {
+            self.last_stacks = (self.routes.clone(), self.overlays.iter().map(|o| o.kind).collect());
+        }
+        self.click_guard.end_frame(&egui_ctx, changed);
         if self.budget.deferred() || self.now_next.pending() || !self.pending_actions.is_empty() {
             egui_ctx.request_repaint();
         }
@@ -2886,7 +2902,13 @@ mod tests {
         }
 
         fn frame_raw(&mut self, events: Vec<Event>, hook: bool) -> egui::FullOutput {
-            let mut raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.size)), events, ..Default::default() };
+            self.frame_dt(events, hook, 1.0 / 60.0)
+        }
+
+        /// A frame `dt` seconds after the last one.
+        fn frame_dt(&mut self, events: Vec<Event>, hook: bool, dt: f32) -> egui::FullOutput {
+            let screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.size));
+            let mut raw = egui::RawInput { screen_rect, events, predicted_dt: dt, ..Default::default() };
             raw.viewports.entry(egui::ViewportId::ROOT).or_default().fullscreen = self.fullscreen;
             let Rig { app, ctx, frame, .. } = self;
             if hook {
@@ -2914,9 +2936,10 @@ mod tests {
             self.frame_with(Self::button_events(button))
         }
 
-        /// Move the pointer to `pos`, then click `button` there.
+        /// Move the pointer to `pos` (taking a second: never the second click of a double-click),
+        /// then click `button` there.
         fn click(&mut self, pos: egui::Pos2, button: egui::PointerButton) -> egui::FullOutput {
-            self.frame_with(vec![Event::PointerMoved(pos)]);
+            self.frame_dt(vec![Event::PointerMoved(pos)], true, 1.0);
             let ev = |pressed| Event::PointerButton { pos, button, pressed, modifiers: NONE };
             self.frame_with(vec![ev(true), ev(false)])
         }
@@ -3323,6 +3346,40 @@ mod tests {
         let cancel = *button(&texts(&out), "Cancel").expect("Cancel");
         rig.click(centre(&cancel), egui::PointerButton::Primary);
         assert!(rig.app.overlays.is_empty());
+    }
+
+    /// One click does what Enter does; a double-click does it once. Below Wide a click on a
+    /// channel opens the player under the pointer, and the double-click's second click is
+    /// dropped (`click_guard`): it would toggle fullscreen on the video — or, once the headless
+    /// player has given up on the seeded stream ("Nothing is playing"), go straight back.
+    #[test]
+    fn a_double_click_on_a_channel_opens_the_player_once() {
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_channels(c, 3, None));
+        rig.size = egui::vec2(600.0, 800.0); // Compact: no preview pane
+        rig.settle();
+        let mut row = None;
+        rig.until("the channel rows", |r| {
+            row = texts(&r.frame_with(vec![])).into_iter().find(|(t, _, _)| t.contains("Channel 1")).map(|(_, r, _)| r);
+            row.is_some()
+        });
+        let at = centre(&row.expect("row"));
+        rig.frame_dt(vec![Event::PointerMoved(at)], true, 1.0);
+        let ev = |pressed| Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: NONE };
+        // the player is drawn for a few frames before the second click (well within the
+        // double-click time)
+        let mut outs = Vec::new();
+        for events in [vec![ev(true)], vec![ev(false)], vec![], vec![], vec![ev(true)], vec![ev(false)], vec![]] {
+            outs.push(rig.frame_with(events));
+        }
+        assert_eq!(rig.app.routes, [Route::Live { group: None, channel: None }, Route::Player], "opened once, and still open");
+        let fullscreen =
+            |o: &egui::FullOutput| o.viewport_output.values().any(|v| v.commands.iter().any(|c| matches!(c, egui::ViewportCommand::Fullscreen(_))));
+        assert!(!outs.iter().any(fullscreen) && !rig.app.window_fullscreen);
+        // a click after the double-click time is the player's again (what it does there depends
+        // on how far the headless player got with the seeded stream, so only its arrival is
+        // checked)
+        rig.click(at, egui::PointerButton::Primary);
+        assert!(rig.ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Primary)), "a later click is delivered");
     }
 
     /// A menu an overlay opens (search's item menu, by the menu key or a right-click at the

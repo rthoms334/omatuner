@@ -193,7 +193,7 @@ Settings ▸ Spoiler guard
 - **Esc ladder:** unchanged. Esc never reveals or hides.
 - **Arrow-key pane navigation:** no new focus stops. Bars are not focusable; reveal acts on the row's cursor.
 - **Mouse:**
-  - A click on a redaction bar or description block reveals that item. The bar has its own interact rect that consumes the click, so the row doesn't activate (the same idea as the `second_click_after` double-click rules).
+  - A click on a redaction bar or description block reveals that item. The bar has its own interact rect that consumes the click, so the row doesn't activate (the same idea as the reorder grips on top of their rows).
   - A click on 󰈈 hides it again.
   - Hover shows the reason tooltip.
   - The status chip: click opens the menu, ✕ guards again.

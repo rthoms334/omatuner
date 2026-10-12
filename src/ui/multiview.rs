@@ -983,12 +983,9 @@ impl PickerState {
                                 rect.width() - 2.0 * theme.space(SpaceToken::Md),
                             );
                             resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
-                            // one click plays, like the player's side panels
-                            if resp.clicked() {
-                                picked = Some(rc.index);
-                            }
                             resp
                         });
+                        // Enter or one click plays, like the player's side panels
                         if let ListOutcome::Activated(r) = out {
                             picked = Some(r);
                         }

@@ -180,8 +180,8 @@ Auto-repeat never steps out, as today.
 - A dashboard card click scopes the list to that playlist.
 - A chip click picks the issue kind; the lit chip shows the active filter.
 - Rules card toggles open the rule preview card (below).
-- A row click moves the cursor (pointerGate). A click on the ☐ box marks. Ctrl+click toggles a mark; Shift+click marks a range.
-- Double-clicking a row accepts its fix. The second click is dropped if the row changed under the pointer (`widgets::second_click_after`).
+- Hover moves the cursor (pointerGate). A click on the ☐ box marks. Ctrl+click toggles a mark; Shift+click marks a range.
+- A click on a row does what Enter does: on to its guide channels (Shift+Enter or the Accept button accepts its fix). A double-click is one click; its second click is dropped when the click changed what is under the pointer (`ui::click_guard`, DESIGN §15.1 "Double-click safety").
 - Right-click opens the channel menu.
 - The stepper buttons [−1 h] [−15] [+15] [+1 h] and [−1] [+1] behave like the keys.
 - Footer button: `[Accept N]`. Toasts carry `[Undo]`.

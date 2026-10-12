@@ -993,7 +993,13 @@ The full reference is generated from `src/keymap.rs`:
 
 ## Mouse
 
-Everything the keys do can be done with the mouse too:
+Everything the keys do can be done with the mouse too. The rule: **point** by hovering (outside the
+guide, moving the pointer moves the cursor, as the arrow keys do); **one click does what Enter
+does** there — a channel plays, a poster or Home tile opens, an episode plays, a guide programme
+opens its card, a Settings row toggles or opens; **right-click** opens the menu. A double-click
+counts as one click: it never opens something and then clicks what appeared under the pointer.
+Double-click has a meaning of its own only on video (fullscreen, and back from the pop-out).
+In a click-to-focus setup, the click that focuses Tuner's window only focuses it.
 
 - **Back:** the mouse's back (side) button is Esc — it clears a filter, closes a panel or
   dialog, leaves the player's controls, and only then goes back a screen. The forward button

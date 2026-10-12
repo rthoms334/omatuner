@@ -191,7 +191,7 @@ There are no new Global chords, and nothing is bound in the player: following fr
 
 ### 3.8 Mouse model
 
-- **Guide:** right-click a cell → the channel menu gains "Follow this programme…". Double-clicking a cell opens the popover, which has the Follow… button.
+- **Guide:** right-click a cell → the channel menu gains "Follow this programme…". A click on a cell does what Enter does: it opens the popover, which has the Follow… button.
 - **Rule rows:**
   - a click on a rule row opens the editor;
   - the ● dot toggles pause;

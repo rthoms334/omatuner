@@ -1215,11 +1215,13 @@ impl Screen for HomeScreen {
                                 if is_cursor && scroll {
                                     ui.scroll_to_rect(resp.rect, None);
                                 }
-                                if resp.double_clicked() {
+                                // a click does what Enter does (the 2nd/3rd click of a
+                                // multi-click: nothing more); hover with motion points
+                                if crate::ui::widgets::fresh_click(&resp) {
                                     clicked = Some((ri, ci, true));
                                 } else if resp.secondary_clicked() {
                                     menu = Some((ri, ci));
-                                } else if resp.clicked() || (pointer_moved && resp.hovered() && !is_cursor) {
+                                } else if !resp.clicked() && pointer_moved && resp.hovered() && !is_cursor {
                                     clicked = Some((ri, ci, false));
                                 }
                             }
@@ -2075,6 +2077,10 @@ mod tests {
         h.state_mut().act(Action::End);
         h.state_mut().act(Action::Activate);
         assert_eq!(h.state_mut().nav(), vec![NavRequest::Push(Route::MovieDetail(movies[0]))]);
+        // one click on a tile does what Enter does there
+        h.get_by_label("Movie 3").click();
+        h.run_steps(2);
+        assert_eq!(h.state_mut().nav(), vec![NavRequest::Push(Route::MovieDetail(movies[3]))], "a click: the title's page");
     }
 
     /// While Up next has items to go and nothing plays, "Resume Up next" leads Home (after a

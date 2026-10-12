@@ -33,7 +33,8 @@ pub fn toggle(ui: &mut egui::Ui, theme: &Theme, on: &mut bool, label: &str, focu
     let height = theme.space(SpaceToken::ControlHeight).max(track.y);
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
     let mut resp = if ui.is_enabled() { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp };
-    if resp.clicked() {
+    // a double-click flips it once (DESIGN §15.1 "Double-click safety")
+    if super::fresh_click(&resp) {
         *on = !*on;
         resp.mark_changed();
     }

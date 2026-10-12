@@ -569,7 +569,7 @@ impl Overlay for SleepTimerMenu {
                 if pointer_moved && resp.hovered() && !cursor {
                     self.cursor = i;
                 }
-                if resp.clicked() {
+                if crate::ui::widgets::fresh_click(&resp) {
                     clicked = Some(i);
                 }
                 let p = ui.painter();
