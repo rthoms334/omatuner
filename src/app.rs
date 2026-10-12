@@ -1402,6 +1402,7 @@ impl TunerApp {
             label: "Sleep timer".into(),
             action: Action::SleepTimer,
             warning: self.reminder_ui.sleep_warn.is_some(),
+            close: None,
         })
     }
 
