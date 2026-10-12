@@ -193,6 +193,9 @@ pub struct TunerApp {
     /// Multi-view (DESIGN §35): the pictures' focus, sound and layout places, picture B's start
     /// and what waits for it (`app/multiview.rs`).
     mv: multiview::MvApp,
+    /// The first-run card's offer (DESIGN §39), waiting until nothing else is going on
+    /// ([`agent_card_may_show`]); shown once, then `None`.
+    agent_offer: Option<crate::agent::connect::Offer>,
     #[cfg(test)]
     log: std::cell::RefCell<tests::Log>,
 }
@@ -287,6 +290,7 @@ impl TunerApp {
             dropped: Vec::new(),
             devshot: None,
             mv: Default::default(),
+            agent_offer: None,
             #[cfg(test)]
             log: Default::default(),
         };
@@ -297,7 +301,59 @@ impl TunerApp {
         app.services().jobs.context().explicit.set(Visibility { explicit: app.explicit_visible });
         app.submit_job(JobKind::RebuildLibrary);
         app.handle_ipc(&initial);
+        app.start_agent_pass();
         app
+    }
+
+    /// The start-of-version pass (DESIGN §39): once per Tuner version, look for AI agents to
+    /// offer the first-run card for (and bring Claude Code's plugin up to date). The service
+    /// waits a few seconds itself; the outcome arrives in [`TunerApp::agent_card_frame`].
+    fn start_agent_pass(&self) {
+        let cfg = self.services().config();
+        if crate::agent::connect::should_check(&cfg.agents, TUNER_VERSION) {
+            self.services().agent_connect.start_pass(&cfg.agents);
+        }
+    }
+
+    /// The pass's outcome (polled until it comes), then the card once the gate opens. Nothing
+    /// is recorded until the card is answered (or there was nothing to offer): a run that never
+    /// showed it asks again at the next start.
+    fn agent_card_frame(&mut self, egui_ctx: &egui::Context) {
+        use crate::agent::connect::{AgentId, Offer, PassOutcome, Status};
+        match self.services().agent_connect.take_pass_outcome() {
+            Some(PassOutcome::Offer(o)) => self.agent_offer = Some(o),
+            Some(PassOutcome::Settled) => self.config_edits.push(Box::new(|c| c.agents.checked_version = Some(TUNER_VERSION.to_owned()))),
+            Some(PassOutcome::Retry) | None => {}
+        }
+        if self.agent_offer.is_none() {
+            return;
+        }
+        let gate = CardGate {
+            onboarded: !self.lib.sources.is_empty() && !matches!(self.current_route(), Route::Onboarding(_)),
+            busy: !self.overlays.is_empty() || !self.nav.is_empty(),
+            player: self.view_screen() == ScreenId::Player,
+            fullscreen: self.window_fullscreen,
+            popped_out: self.popout.is_out() || self.video_only,
+            multiview: self.mv.view.on,
+            typing: egui_ctx.egui_wants_keyboard_input() || self.key_stack().contains(&KeyContext::TextInput),
+            agents_page: matches!(self.current_route(), Route::Settings(crate::ui::SettingsPage::Agents)),
+        };
+        if agent_card_may_show(gate)
+            && let Some(offer) = self.agent_offer.take()
+        {
+            // the offer may have waited a while: the switch turned off, or an agent connected
+            // from Settings meanwhile
+            let rows = self.services().agent_connect.rows();
+            let still = |id: &AgentId| {
+                rows.iter().find(|r| r.id == *id).is_none_or(|r| r.busy.is_none() && matches!(r.status, Status::NotConnected | Status::Checking))
+            };
+            let agents: Vec<AgentId> = offer.agents.into_iter().filter(still).collect();
+            if self.services().config().agents.offer_connect && !agents.is_empty() {
+                self.nav.push(NavRequest::Open(OverlayRequest::AgentConnect(Offer { agents })));
+            } else {
+                self.config_edits.push(Box::new(|c| c.agents.checked_version = Some(TUNER_VERSION.to_owned())));
+            }
+        }
     }
 
     fn services(&self) -> &Services {
@@ -2302,6 +2358,7 @@ impl eframe::App for TunerApp {
         self.images.pump();
         self.dispatch_actions(&egui_ctx);
         self.handle_dropped_files();
+        self.agent_card_frame(&egui_ctx);
         self.apply_nav(&egui_ctx);
 
         let title = self.title_now();
@@ -2569,6 +2626,34 @@ fn parse_channel_ref(s: &str) -> Option<ItemRef> {
     let source = source.parse::<i64>().ok()?;
     let is_channel_key = key.strip_prefix("xt:live:").is_some_and(|id| !id.is_empty()) || key.strip_prefix("m3u:").is_some_and(|h| !h.is_empty());
     is_channel_key.then(|| ItemRef { source: SourceId(source), kind: ItemKind::Channel, key: ItemKey(key.to_owned()) })
+}
+
+/// This Tuner's version: the start-of-version pass runs once per version (DESIGN §39).
+const TUNER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// What the first-run card waits for (DESIGN §39): it never covers playback or something the
+/// user is in the middle of.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CardGate {
+    /// A playlist was added and onboarding is over.
+    onboarded: bool,
+    /// Another dialog or menu is open, or about to open this frame.
+    busy: bool,
+    /// The fullscreen player is on screen.
+    player: bool,
+    fullscreen: bool,
+    popped_out: bool,
+    multiview: bool,
+    /// A text field has the keyboard.
+    typing: bool,
+    /// Settings ▸ AI agents is open: the card would only repeat it.
+    agents_page: bool,
+}
+
+/// Whether the first-run card may open now. A preview playing in a browse screen's pane
+/// doesn't block it: the card takes the keys, playback is untouched.
+fn agent_card_may_show(g: CardGate) -> bool {
+    g.onboarded && !g.busy && !g.player && !g.fullscreen && !g.popped_out && !g.multiview && !g.typing && !g.agents_page
 }
 
 /// First route: CLI view → no sources ⇒ onboarding → configured start screen. `Auto` = Live
@@ -5628,5 +5713,39 @@ mod tests {
                 assert!(r.x0 >= 0.0 && r.x1 as f32 <= w && r.y1 < 800.0, "{label} on screen at {w} pt @ {scale}: {r:?}");
             }
         }
+    }
+
+    /// An offer that arrives while the player is on screen waits; leaving the player opens it.
+    #[test]
+    fn the_agent_card_opens_only_after_leaving_the_player() {
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_channels(c, 3, None));
+        rig.settle();
+        rig.app.nav.push(NavRequest::Push(Route::Player));
+        rig.frame_with(vec![]);
+        let offer = crate::agent::connect::Offer { agents: vec![crate::agent::connect::AgentId::Claude] };
+        rig.app.agent_offer = Some(offer.clone());
+        for _ in 0..3 {
+            rig.frame_with(vec![]);
+        }
+        assert!(rig.app.overlays.is_empty(), "not over the player");
+        rig.press(Key::Escape, NONE);
+        assert_eq!(rig.route(), &Route::Live { group: None, channel: None });
+        rig.frame_with(vec![]);
+        assert_eq!(rig.overlay_kinds(), [kind(OverlayRequest::AgentConnect(offer.clone()))]);
+        assert!(rig.app.agent_offer.is_none(), "once");
+        // an offer that waited while the switch was turned off isn't shown; the version is
+        // recorded instead
+        rig.press(Key::Escape, NONE);
+        rig.app.config_edits.push(Box::new(|c: &mut Config| {
+            c.agents.offer_connect = false;
+            c.agents.checked_version = None;
+        }));
+        rig.frame_with(vec![]);
+        rig.app.agent_offer = Some(offer);
+        for _ in 0..3 {
+            rig.frame_with(vec![]);
+        }
+        assert!(rig.app.overlays.is_empty() && rig.app.agent_offer.is_none());
+        assert_eq!(rig.app.services().config().agents.checked_version.as_deref(), Some(TUNER_VERSION));
     }
 }

@@ -44,6 +44,8 @@ pub struct Config {
     pub follow: FollowConfig,
     /// Spoiler guard (DESIGN §34).
     pub spoiler: SpoilerConfig,
+    /// Connecting AI agents to Tuner (DESIGN §39).
+    pub agents: AgentsConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -506,6 +508,29 @@ impl Default for SpoilerConfig {
     }
 }
 
+/// `[agents]`: connecting AI agents to Tuner (DESIGN §39). Machine-local: a restored backup
+/// keeps this machine's values (`Config::restored`), since the connections are this computer's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentsConfig {
+    /// Offer to connect the agents found on this computer, once per Tuner version (the card).
+    /// "Don't ask again" turns it off; Settings ▸ AI agents turns it back on.
+    pub offer_connect: bool,
+    /// After a Tuner upgrade, bring Claude Code's record of Tuner's plugin up to date (a toast
+    /// says so). The user opted in by connecting it.
+    pub keep_in_sync: bool,
+    /// The Tuner version whose start check finished (the card was answered, or there was
+    /// nothing to offer). `None` (a new install, or upgraded from 0.2.2 or older): check at the
+    /// next start.
+    pub checked_version: Option<String>,
+}
+
+impl Default for AgentsConfig {
+    fn default() -> Self {
+        Self { offer_connect: true, keep_in_sync: true, checked_version: None }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ParentalConfig {
@@ -601,6 +626,7 @@ impl Config {
         c.interface.ui_scale = local.interface.ui_scale;
         c.interface.last_screen.clone_from(&local.interface.last_screen);
         c.general.debug_log = local.general.debug_log;
+        c.agents = local.agents.clone();
         if local.parental.pin_hash.is_some() {
             c.parental = local.parental.clone();
         }
@@ -715,8 +741,10 @@ mod tests {
         local.player.hwdec = "no".into();
         local.player.mpv_options.insert("vo".into(), "gpu-next".into());
         local.interface.ui_scale = 1.1;
+        local.agents.offer_connect = false;
 
         let c = Config::restored(&raw, &local).unwrap();
+        assert_eq!(c.agents, local.agents, "agent connections are this machine's");
         assert_eq!(c.player.zap_delay_ms, 120);
         assert_eq!(c.parental, backup.parental, "no PIN here: the backup's applies");
         assert_eq!((c.player.hwdec.as_str(), c.interface.ui_scale), ("no", 1.1));

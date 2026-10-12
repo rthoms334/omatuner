@@ -14,6 +14,8 @@ pub const SHARE_DIR: &str = "/usr/share/tuner/claude";
 pub const GITHUB_MARKETPLACE: &str = "rthoms334/omatuner";
 /// `<plugin>@<marketplace>`.
 pub const PLUGIN: &str = "omatuner@omatuner";
+/// The marketplace's name in Claude Code.
+pub const MARKETPLACE: &str = "omatuner";
 
 /// One step: what it does and the command (program + arguments, run without a shell).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +49,32 @@ pub fn steps(local: Option<&Path>) -> Vec<Step> {
     ]
 }
 
+/// Bring the plugin up to date after a Tuner upgrade. `github`: refresh the marketplace first
+/// (a GitHub marketplace is a clone; the packaged folder loads in place, so it needs only the
+/// plugin's record updated — the refresh is harmless there).
+pub fn update_steps(github: bool) -> Vec<Step> {
+    let mut v = Vec::new();
+    if github {
+        v.push(Step::new("Refresh Tuner's plugin marketplace", &["claude", "plugin", "marketplace", "update", MARKETPLACE]));
+    }
+    v.push(Step::new("Update the omatuner plugin", &["claude", "plugin", "update", PLUGIN]));
+    v
+}
+
+/// Take Tuner's plugin and its marketplace out of Claude Code (Settings ▸ AI agents' Disconnect).
+pub fn remove_steps() -> Vec<Step> {
+    vec![
+        Step::new("Uninstall the omatuner plugin", &["claude", "plugin", "uninstall", PLUGIN, "--scope", "user"]),
+        Step::new("Remove Tuner's plugin marketplace", &["claude", "plugin", "marketplace", "remove", MARKETPLACE]),
+    ]
+}
+
+/// The packaged marketplace ([`SHARE_DIR`]) when the package installed it.
+pub fn local_marketplace() -> Option<&'static Path> {
+    let share = Path::new(SHARE_DIR);
+    share.join(".claude-plugin/marketplace.json").is_file().then_some(share)
+}
+
 /// The setup without plugins: the MCP server only. The skills need the plugin: they read its
 /// shared `RULES.md`, which a copied skill folder leaves behind.
 pub fn manual_steps() -> Vec<Step> {
@@ -72,8 +100,10 @@ pub fn instructions(local: Option<&Path>, claude_found: bool) -> String {
     for st in manual_steps() {
         s.push_str(&format!("  # {}\n  {}\n", st.what, st.shell()));
     }
-    s.push_str("\nUpdate later with: claude plugin marketplace update omatuner && claude plugin update omatuner@omatuner\n");
+    let update: Vec<String> = update_steps(local.is_none()).iter().map(Step::shell).collect();
+    s.push_str(&format!("\nUpdate later with: {}\n", update.join(" && ")));
     s.push_str("Run `tuner claude-setup --apply` to run the plugin steps now (it asks first).\n");
+    s.push_str("Or open Tuner ▸ Settings ▸ AI agents (Tuner also offers this on its first start).\n");
     s
 }
 
@@ -84,8 +114,7 @@ fn on_path(program: &str) -> Option<PathBuf> {
 
 /// `tuner claude-setup [--apply]`.
 pub fn main(apply: bool) -> anyhow::Result<()> {
-    let share = Path::new(SHARE_DIR);
-    let local = share.join(".claude-plugin/marketplace.json").is_file().then_some(share);
+    let local = local_marketplace();
     let claude = on_path("claude");
     let mut out = std::io::stdout().lock();
     write!(out, "{}", instructions(local, claude.is_some()))?;
@@ -134,5 +163,12 @@ mod tests {
         assert_eq!(spaced[0].argv.len(), 5);
         assert!(spaced[0].shell().ends_with("'/opt/my apps/claude'"));
         assert!(instructions(None, false).contains("isn't on your PATH"));
+        // the GitHub marketplace is a clone: refreshed before the plugin's update
+        assert_eq!(
+            update_steps(true).iter().map(Step::shell).collect::<Vec<_>>(),
+            ["claude plugin marketplace update omatuner", "claude plugin update omatuner@omatuner"]
+        );
+        assert_eq!(update_steps(false).len(), 1);
+        assert!(instructions(None, true).contains("Update later with: claude plugin marketplace update omatuner && claude plugin update"));
     }
 }

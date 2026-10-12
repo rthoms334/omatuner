@@ -74,6 +74,8 @@ pub(super) struct Inner {
     pub(super) tiles: Option<TileRegistry>,
     /// `guide_fix propose`'s proposals until applied or expired.
     pub(super) proposals: super::guide::Proposals,
+    /// When each named agent last asked (Settings ▸ AI agents' "last used"; DESIGN §39).
+    usage: super::connect::usage::Usage,
     limits: Limits,
     readers: Mutex<Vec<Connection>>,
     /// The published snapshot without its explicit content (generation → copy), for a
@@ -106,6 +108,7 @@ impl AgentHandler {
                 jobs,
                 tiles: None,
                 proposals: super::guide::Proposals::default(),
+                usage: Default::default(),
                 limits,
                 readers: Mutex::new(Vec::new()),
                 concealed: Mutex::new(None),
@@ -141,6 +144,9 @@ impl AgentService for AgentHandler {
             let (policy, reveal) = req.call.guard_opts();
             // who asked, for "added by Codex" (display only: never a permission)
             let who = req.agent_name();
+            if let Some(name) = who.stored() {
+                inner.usage.note(&inner.store, name, crate::model::now());
+            }
             let reply = match tokio::time::timeout(HANDLER_BUDGET, inner.clone().dispatch(req.call, who)).await {
                 // every result passes the spoiler guard's one choke point (B4)
                 Ok(Ok(mut v)) => {
