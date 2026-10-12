@@ -70,7 +70,8 @@ pub fn fire(store: &Store, cfg: &Config, guard: impl FnOnce(&rusqlite::Connectio
     let id = ReminderId(id);
     let conn = store.reader()?;
     let Some(r) = crate::store::user::reminder(&conn, id)? else { return Ok(ClosedOutcome::Exit) };
-    if r.state != ReminderState::Pending {
+    // Following off: its reminders wait, untouched (they fire again once it is back on)
+    if r.state != ReminderState::Pending || (r.rule_id.is_some() && !cfg.follow.enabled) {
         return Ok(ClosedOutcome::Exit);
     }
     // the session is locked while Tuner is closed (no PIN: unlocked)

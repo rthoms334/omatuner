@@ -104,16 +104,6 @@ impl PopOut {
     }
 }
 
-/// The popped-out window's strip above the video (DESIGN §35, additions: scheduled playback
-/// opens in the pop-out): rui's countdown and news-flash strip ("Switching to BBC News in 8 s ·
-/// Cancel · Open full") is drawn here, at the top of `rect`, by `reminders::ui` (wired at
-/// integration). Returns the height it took; the player lays the pictures out below it.
-/// Multi-view shows picture in picture in the pop-out (`ui::multiview::Layout::effective`);
-/// the layout the user chose comes back on pop-in, since only the popped-out window forces it.
-pub fn strip(_ui: &mut egui::Ui, _ctx: &mut crate::ui::UiCtx<'_>, _rect: egui::Rect) -> f32 {
-    0.0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

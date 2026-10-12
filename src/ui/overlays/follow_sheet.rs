@@ -507,7 +507,8 @@ impl FollowSheet {
                 }
             }
             F::Volume => {
-                const V: [FlashVolume; 3] = [FlashVolume::Normal, FlashVolume::Duck, FlashVolume::Mute];
+                // `Duck` isn't offered until it does something different from Normal
+                const V: [FlashVolume; 2] = [FlashVolume::Normal, FlashVolume::Mute];
                 let mut fl = r.spec.flash.unwrap_or_default();
                 let i = V.iter().position(|v| *v == fl.volume).unwrap_or(0);
                 fl.volume = V[cycle(V.len(), i)];
@@ -878,8 +879,13 @@ impl Overlay for FollowSheet {
         if let Some(r) = self.pending.as_mut().and_then(Ticket::try_take) {
             self.pending = None;
             match r {
-                Ok(_) => {
-                    ctx.toast(self.saved_toast());
+                Ok(id) => {
+                    let mut toast = self.saved_toast();
+                    // a new rule can be taken back at once (its reminders go with it)
+                    if self.stored().is_none() {
+                        toast.action = Some(("Undo".into(), Action::UndoFollow(id)));
+                    }
+                    ctx.toast(toast);
                     return OverlayOutcome::Close;
                 }
                 Err(e) => self.error = Some(format!("Couldn't save: {}", crate::redact::redact(&e.to_string()))),

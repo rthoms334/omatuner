@@ -161,6 +161,12 @@ impl JobKind {
             (JobKind::RefreshEpg { epg_source, force: a }, JobKind::RefreshEpg { force: b, .. }) => {
                 JobKind::RefreshEpg { epg_source: *epg_source, force: *a || *b }
             }
+            // a guide import or the daily tick may skip unchanged inputs: it never replaces a
+            // reason that must look again
+            (JobKind::EvaluateFollows { reason: a }, JobKind::EvaluateFollows { reason: b }) => {
+                use crate::follow::FollowReason::{Daily, Guide};
+                JobKind::EvaluateFollows { reason: if matches!(b, Guide | Daily) { *a } else { *b } }
+            }
             _ => newer.clone(),
         }
     }
@@ -1016,6 +1022,11 @@ mod tests {
         assert_eq!(a.merged_with(&b), a);
         assert_eq!(b.merged_with(&a), a);
         assert_eq!(JobKind::RebuildLibrary.merged_with(&JobKind::RebuildLibrary), JobKind::RebuildLibrary);
+        // a queued evaluation that must look again keeps its reason
+        use crate::follow::FollowReason::{Guide, Mapping};
+        let (mapping, guide) = (JobKind::EvaluateFollows { reason: Mapping }, JobKind::EvaluateFollows { reason: Guide });
+        assert_eq!(mapping.merged_with(&guide), mapping);
+        assert_eq!(guide.merged_with(&mapping), mapping);
     }
 
     fn status(id: u64) -> JobStatus {

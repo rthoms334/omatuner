@@ -302,9 +302,17 @@ impl Services {
                 self.start_mpris();
             }
         }
-        if old.reminders != new.reminders {
-            self.integrations.reminders = None; // dropping the scheduler aborts its task
-            self.start_reminders();
+        if old.reminders != new.reminders || old.follow != new.follow {
+            // the scheduler reads its settings live: a restart would forget the countdowns it
+            // already gave (a second countdown, or a second fire)
+            match &self.integrations.reminders {
+                Some(r) => r.refresh(),
+                None => self.start_reminders(),
+            }
+        }
+        // the threshold is part of the suggestion cache's stamp
+        if old.epg.fuzzy_threshold != new.epg.fuzzy_threshold {
+            crate::jobs::guide_check::request_from(&self.jobs);
         }
         if old.spoiler != new.spoiler || old.follow != new.follow {
             self.agent.guard().configure(self.config());

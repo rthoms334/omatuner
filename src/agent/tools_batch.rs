@@ -81,7 +81,7 @@ add. Never create a rule from an inferred interest. Spoiler-safe results show on
                         "max_per_week": { "type": "integer", "minimum": 1, "maximum": 50 },
                         "days": strings("News flash: mon…sun (default every day)."),
                         "headlines_min": { "type": "integer", "minimum": 1, "maximum": 60 },
-                        "volume": { "type": "string", "enum": ["normal", "duck", "mute"] },
+                        "volume": { "type": "string", "enum": ["normal", "mute"] },
                     }, "required": ["name", "kind"], "additionalProperties": false },
                     "id": { "type": "integer", "description": "preview / remove: a rule id." },
                     "replace_id": { "type": "integer" },

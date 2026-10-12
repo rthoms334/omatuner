@@ -383,7 +383,8 @@ fn make_reminder(c: &Connection, rule: &FollowRule, to: &Upcoming) -> Result<(Op
         if switches { Reminder::SWITCH_LEAD } else { rule.lead_s.max(0) },
     );
     r.mode = if switches { ReminderMode::Switch } else { ReminderMode::Notify };
-    r.offset_s = rule.offset_s;
+    // the rule's offset ("skip the build-up") only where it lands inside this airing
+    r.offset_s = if to.start + rule.offset_s < to.stop { rule.offset_s } else { 0 };
     r.open_in = (to.mode == FollowMode::Flash).then_some(OpenIn::PopOut);
     r.rule_id = Some(rule.id);
     Ok((Some(crate::store::user::add_reminder(c, &r)?), false))
@@ -674,8 +675,8 @@ pub fn prune(conn: &Connection, now: Timestamp) -> Result<usize> {
 }
 
 /// A news flash reminder at fire time (the scheduler asks before it switches): its rule's
-/// flash settings and the other channels showing the bulletin, best first (on a one-connection
-/// account the flash takes another playlist's copy, `follow::flash::pick`).
+/// flash settings and the other channels showing the bulletin, best first (a copy already
+/// playing counts as watching it).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FlashFire {
     pub rule: FollowRuleId,

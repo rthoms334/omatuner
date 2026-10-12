@@ -236,7 +236,8 @@ impl Commands for TileRouter {
     }
     fn queue_step(&self, snap: &PlayerSnapshot, forward: bool) -> Option<bool> {
         let queue = self.queue.as_ref()?;
-        if snap.origin != Some(PlayOrigin::Queue) {
+        // zapped away from a queued channel: the origin stays Queue, but Up next no longer drives
+        if snap.origin != Some(PlayOrigin::Queue) || !queue.snapshot().driving {
             return None;
         }
         let intent = PlayIntent { source: PlaySource::Queue, kind: kind_of(snap), live_channel: None };
@@ -250,7 +251,11 @@ impl Commands for TileRouter {
         }
     }
     fn queue_has_next(&self, snap: &PlayerSnapshot) -> bool {
-        snap.origin == Some(PlayOrigin::Queue) && self.queue.as_ref().is_some_and(|q| q.snapshot().next.is_some())
+        snap.origin == Some(PlayOrigin::Queue)
+            && self.queue.as_ref().is_some_and(|q| {
+                let s = q.snapshot();
+                s.driving && s.next.is_some()
+            })
     }
     fn guard(&self) -> Guard {
         self.shared.guard()

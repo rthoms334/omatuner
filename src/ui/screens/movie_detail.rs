@@ -393,8 +393,9 @@ impl Screen for MovieDetailScreen {
                     self.reload(ctx);
                 }
                 // DESIGN §13.6: a finished movie returns from the fullscreen player to its page,
-                // wherever it was started (grid, Home, search, this page)
-                if *finished && ctx.video.placement() == Placement::Fullscreen {
+                // wherever it was started (grid, Home, search, this page) — but not one Up next
+                // plays: its card and the next film follow in the player
+                if *finished && ctx.video.placement() == Placement::Fullscreen && ctx.player.origin != Some(PlayOrigin::Queue) {
                     return_to_page(ctx, item);
                 }
             }
@@ -900,9 +901,14 @@ pub(crate) mod tests {
         h.run_steps(1);
         assert_eq!(h.state_mut().nav(), vec![crate::ui::NavRequest::Back, crate::ui::NavRequest::Push(Route::MovieDetail(ids[1]))]);
         // stopped before the end, or in the mini player: nothing moves
-        h.state().t.services().bus.send(AppEvent::Player(PlayerEvent::Ended { item: Some(other), finished: false }));
+        h.state().t.services().bus.send(AppEvent::Player(PlayerEvent::Ended { item: Some(other.clone()), finished: false }));
         h.run_steps(1);
         assert!(h.state_mut().nav().is_empty());
+        // a film Up next plays: the player stays for the next one
+        std::sync::Arc::make_mut(&mut h.state_mut().t.snapshot).origin = Some(PlayOrigin::Queue);
+        h.state().t.services().bus.send(AppEvent::Player(PlayerEvent::Ended { item: Some(other), finished: true }));
+        h.run_steps(1);
+        assert!(h.state_mut().nav().is_empty(), "Up next keeps the player");
         // DESIGN §27.7: the playlist movie's page has nothing to load: year · category, and a
         // muted "no description" where the plot (or a loading skeleton) would be
         h.state_mut().enter(Route::MovieDetail(ids[1]));

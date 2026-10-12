@@ -237,6 +237,8 @@ pub enum Action {
     /// A toast's Cancel button (never bound to a key): call off an automatic switch that is
     /// about to happen (DESIGN §30.8).
     CancelSwitch(crate::model::ReminderId),
+    /// A toast's Undo for a Following rule just added (never bound to a key): delete it again.
+    UndoFollow(crate::model::FollowRuleId),
     // ---- guide
     GuidePrevDay,
     GuideNextDay,
@@ -1042,7 +1044,7 @@ fn resolve_inner(stack: &[KeyContext], ev: &egui::Event) -> Option<Action> {
 pub fn feature_on(a: Action) -> bool {
     match a {
         A::QueueAdd | A::QueuePlayNext | A::GoQueue | A::QueuePanel | A::QueueNext | A::QueuePrev => crate::queue::ENABLED,
-        A::FollowProgramme => crate::follow::ENABLED,
+        A::FollowProgramme | A::UndoFollow(_) => crate::follow::ENABLED,
         A::RevealSpoilers | A::SpoilerMenu => crate::spoiler::ENABLED,
         A::AcceptFix | A::ShiftLater | A::ShiftEarlier | A::UndoGuideFix(_) => crate::guide_fix::ENABLED,
         A::NextPicture

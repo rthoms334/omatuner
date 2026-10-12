@@ -575,6 +575,7 @@ impl TunerApp {
                 let lib = self.fit_visibility(lib.clone());
                 let old = std::mem::replace(&mut self.lib, lib.clone());
                 self.check_scopes(&old);
+                let first = old.built_at == 0;
                 self.release(old, "library swap");
                 // the playing channel is noted again next frame
                 self.measured.clear();
@@ -589,6 +590,11 @@ impl TunerApp {
                 self.drop_search_index("library swap");
                 self.refresh_epg_updated();
                 self.send_pending_zap();
+                // hidden, locked or explicit channels changed what Following may pick (not at
+                // start: the first library is the one the last evaluation saw)
+                if crate::follow::ENABLED && !first && self.services().config().follow.enabled {
+                    self.services().jobs.submit(JobKind::EvaluateFollows { reason: crate::follow::FollowReason::Library });
+                }
             }
             Ok(JobOutcome::SourceRefreshed { source, account, upgraded, .. }) => {
                 self.offline = false;
@@ -1603,6 +1609,10 @@ impl TunerApp {
                     self.toast(Toast::info(e));
                 }
             }
+            Action::UndoFollow(id) if crate::follow::ENABLED => {
+                crate::follow::ui::undo_follow(self.services(), id);
+                self.toast(Toast::info("Rule removed"));
+            }
             Action::UndoGuideFix(log @ Some(_)) if crate::guide_fix::ENABLED => {
                 let opts = crate::store::guide_fix::GuideOpts::from_config(&self.services().config());
                 let _ = crate::guide_fix::ui::submit_undo(self.services(), log, opts, crate::model::now());
@@ -1756,6 +1766,16 @@ impl TunerApp {
     /// Dispatch the actions resolved in `raw_input_hook`: topmost overlay → screen → globals.
     fn dispatch_actions(&mut self, egui_ctx: &egui::Context) {
         for (action, stack) in std::mem::take(&mut self.pending_actions) {
+            // Esc in the player or the pop-out while an automatic switch counts down (its strip
+            // shows over the picture): calls the switch off rather than leaving
+            if action == Action::Back
+                && self.overlays.is_empty()
+                && (self.view_screen() == ScreenId::Player || self.popout.is_out() || self.video_only)
+                && let Some(id) = self.reminder_ui.countdowns.first().map(|c| c.reminder)
+            {
+                self.cancel_switch(id);
+                continue;
+            }
             let handled = if let Some(top) = self.overlays.len().checked_sub(1) {
                 let outcome = self.as_overlay(top, |app| app.with_ctx(|ctx, _, ovs| ovs[top].overlay.on_action(ctx, action)));
                 let ignored = matches!(outcome, OverlayOutcome::Ignored);

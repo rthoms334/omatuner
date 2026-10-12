@@ -103,6 +103,8 @@ impl ProgrammeOverlay {
         self.slots = crate::ui::item_menu::popover_buttons(&target, ctx);
         let mut more = Vec::new();
         crate::ui::item_menu::extend(&mut more, &target, ctx, KeyContext::Guide);
+        // what already has its own button isn't repeated under More…
+        more.retain(|m| !self.slots.iter().any(|s| s.action == m.action));
         self.more = more;
     }
 

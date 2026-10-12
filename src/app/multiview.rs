@@ -83,12 +83,6 @@ impl MvApp {
         self.pin.clear();
         self.consent = None;
     }
-
-    /// The picture an outside play just went to (it took the sound, or will once picture B is
-    /// up).
-    pub(super) fn outside_tile(&self) -> TileId {
-        self.waiting.as_ref().filter(|s| s.take_sound).map_or(self.view.audible, |s| s.target)
-    }
 }
 
 fn slot(t: TileId) -> usize {

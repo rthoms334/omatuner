@@ -144,7 +144,8 @@ async fn show(n: &Notification, bus: Option<&str>) -> Result<notify_rust::Notifi
 pub struct ReminderScheduler {
     task: Option<tokio::task::JoinHandle<()>>,
     wake: tokio::sync::mpsc::UnboundedSender<()>,
-    notify: bool,
+    /// Its settings (read live by the pass-2 scheduler).
+    backend: Arc<dyn ReminderBackend>,
 }
 
 /// Asks a running scheduler to reload its reminders (the agent handler's switches, which
@@ -215,9 +216,8 @@ impl ReminderScheduler {
         arm: Option<Arc<Mutex<ArmSync>>>,
     ) -> Self {
         let (wake, rx) = tokio::sync::mpsc::unbounded_channel();
-        let notify = backend.settings().notify;
-        let task = rt.spawn(run(backend, notifier, bus, arm, rx));
-        Self { task: Some(task), wake, notify }
+        let task = rt.spawn(run(backend.clone(), notifier, bus, arm, rx));
+        Self { task: Some(task), wake, backend }
     }
 
     /// Reload pending reminders (after add/remove).
@@ -232,7 +232,7 @@ impl ReminderScheduler {
 
     /// Notification reminders are on (automatic switches run either way).
     pub fn notifies(&self) -> bool {
-        self.notify
+        self.backend.settings().notify
     }
 }
 
@@ -341,6 +341,10 @@ impl ReminderBackend for StoreBackend {
             // read counts as explicit)
             if !self.explicit.visibility().explicit {
                 pending.retain(|r| !crate::store::live::item_explicit(conn, &r.channel).unwrap_or(true));
+            }
+            // Following off: its reminders wait, untouched
+            if self.live.as_ref().is_some_and(|l| !crate::config::current(&l.config).follow.enabled) {
+                pending.retain(|r| r.rule_id.is_none());
             }
             Ok(pending)
         })

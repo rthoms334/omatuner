@@ -103,7 +103,7 @@ pub struct FollowRuleInput {
     /// News flash: minutes of headlines (absent = the whole programme).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headlines_min: Option<u32>,
-    /// News flash: `normal`, `duck`, `mute`.
+    /// News flash: `normal`, `mute`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume: Option<String>,
 }

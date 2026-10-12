@@ -117,7 +117,10 @@ fn rule_out(r: &FollowRule) -> RuleOut {
 
 /// One match as the tools show it; `safe`: only the rule's name, the time and the channel.
 fn match_out(q: &Q, u: &Upcoming, rule: &FollowRule, safe: bool, preview: bool) -> MatchOut {
-    let channel = u.channel.as_ref().filter(|c| !q.conceals(c)).and_then(|c| q.channel_by_ref(c));
+    let concealed = u.channel.as_ref().is_some_and(|c| q.conceals(c));
+    let channel = u.channel.as_ref().filter(|_| !concealed).and_then(|c| q.channel_by_ref(c));
+    // a hidden or locked-away channel's programme isn't named either
+    let safe = safe || concealed;
     let state = match (u.state, preview) {
         (MatchState::Scheduled, true) => match u.mode {
             FollowMode::Switch => "would_switch",
@@ -202,9 +205,8 @@ pub fn rule_from_input(q: &Q, i: &FollowRuleInput) -> Out<FollowRule> {
         if let Some(v) = i.volume.as_deref() {
             flash.volume = match v {
                 "normal" => FlashVolume::Normal,
-                "duck" => FlashVolume::Duck,
                 "mute" => FlashVolume::Mute,
-                _ => return Err(Fail::bad("rule.volume is normal, duck or mute")),
+                _ => return Err(Fail::bad("rule.volume is normal or mute")),
             };
         }
     } else if i.headlines_min.is_some() || i.volume.is_some() {
@@ -341,6 +343,11 @@ pub(super) async fn handle(h: &Arc<Inner>, p: Follow) -> Out<Value> {
                     let mut rule = rule_from_input(q, &input)?;
                     if let Some(id) = replace {
                         let old = saved_rule(q, id)?;
+                        // Claude never loosens the user's guard
+                        if old.spoiler_safe && !rule.spoiler_safe {
+                            return Err(Fail::bad("that rule is spoiler-safe; only the user can turn that off in Tuner ▸ Settings ▸ Following"));
+                        }
+                        rule.by_agent = old.by_agent;
                         rule.id = old.id;
                         rule.priority = old.priority;
                         rule.created_at = old.created_at;
@@ -374,6 +381,14 @@ pub(super) async fn handle(h: &Arc<Inner>, p: Follow) -> Out<Value> {
                 .map_err(|m| Fail::new(ErrorCode::Unavailable, m))?;
             h.jobs.submit(crate::jobs::JobKind::EvaluateFollows { reason: crate::follow::FollowReason::Rules });
             tracing::info!("agent: follow add → rule {}", id.0);
+            // a new rule: the user sees it and can take it back at once
+            if rule.id.0 == 0 {
+                let name = clean(&rule.name);
+                let reminders = if would == 1 { "1 reminder".to_owned() } else { format!("{would} reminders") };
+                let mut toast = crate::msg::Toast::info(format!("Claude added {name} · {reminders}"));
+                toast.action = Some(("Undo".into(), crate::keymap::Action::UndoFollow(id)));
+                h.bus.toast(toast);
+            }
             let mut out = rule_out(&FollowRule { id, ..rule });
             out.by_claude = true;
             to_value(&json!({ "rule": out, "reminders_to_set": would, "message": "Tuner checks the guide for this after every refresh." }))

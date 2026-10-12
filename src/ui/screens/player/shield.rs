@@ -123,7 +123,7 @@ impl PlayerScreen {
             Self::drop_shield(ctx, true);
         } else {
             Self::drop_shield(ctx, false);
-            ctx.play(PlayerCommand::ZapTo(next));
+            ctx.play(PlayerCommand::ZapTo { id: next, unlocked });
         }
         true
     }

@@ -53,7 +53,7 @@ offer reminders for what it finds.
 
 `follow` `preview` then `add` a rule with `kind: "news_flash"`, `name` / `terms` the bulletin's
 title, `days` (for example `["mon","tue","wed","thu","fri"]`), `headlines_min` (default 5) and
-`volume` (`normal`, `duck`, `mute`). It pops up in the pop-out without taking the keyboard,
+`volume` (`normal`, `mute`). It pops up in the pop-out without taking the keyboard,
 never interrupts a film or episode (a notification with Watch instead), and closes after the
 headlines.
 

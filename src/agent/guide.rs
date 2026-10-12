@@ -507,6 +507,10 @@ pub(super) async fn handle(h: &Arc<Inner>, p: GuideFix) -> Out<Value> {
             if report.mappings_changed {
                 h.jobs.submit(crate::jobs::JobKind::EvaluateFollows { reason: crate::follow::FollowReason::Mapping });
             }
+            // new rules are a new stamp; an unmapped channel needs suggestions
+            if report.rules_changed || report.mappings_changed {
+                crate::jobs::guide_check::request_from(&h.jobs);
+            }
             if report.reminders_moved > 0 {
                 h.shared.wake_reminders();
             }
@@ -541,6 +545,9 @@ pub(super) async fn handle(h: &Arc<Inner>, p: GuideFix) -> Out<Value> {
             let now = crate::model::now();
             let report = h.write(DataScope::Epg, move |c| crate::store::guide_fix::undo(c, id, &opts, now)).await?;
             h.jobs.submit(crate::jobs::JobKind::EvaluateFollows { reason: crate::follow::FollowReason::Mapping });
+            if report.rules_changed || report.reverted > 0 {
+                crate::jobs::guide_check::request_from(&h.jobs);
+            }
             if report.reminders_moved > 0 {
                 h.shared.wake_reminders();
             }

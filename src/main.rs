@@ -326,12 +326,18 @@ fn refresh_headless(paths: AppPaths, config: Config, timeout: Duration) -> anyho
         tracing::error!("registering stored secrets: {e}");
     }
     let http = HttpClient::new(&tuner::services::http_options(&config))?;
+    let (arm_cfg, arm_paths) = (config.clone(), paths.clone());
     let shared = Arc::new(RwLock::new(Arc::new(config)));
     let jobs = JobManager::new(JobContext::new(store.clone(), http, bus, paths, shared).headless(), rt.handle().clone());
     let root = jobs.submit(JobKind::RefreshStale);
     let failed = wait_for_jobs(&jobs, &events, root, timeout);
     jobs.cancel_all();
     rt.shutdown_timeout(Duration::from_secs(2));
+    // Following may have made or moved reminders: their units, as a running Tuner would arm them
+    match store.reader() {
+        Ok(conn) => tuner::reminders::arming::rearm(&conn, &arm_cfg, &arm_paths),
+        Err(e) => tracing::warn!("reminders: re-arming after the refresh: {e}"),
+    }
     if !store.close(Duration::from_secs(3)) {
         tracing::warn!("database writer did not finish within 3 s");
     }

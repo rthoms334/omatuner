@@ -60,6 +60,25 @@ pub fn unit_at(r: &Reminder, lead_default_s: i64) -> Timestamp {
     fire_at(r, lead_default_s) - if r.switches() { LAUNCH_EARLY_S } else { 0 }
 }
 
+/// After a headless `tuner --refresh` (no scheduler runs): put the units in step with the
+/// pending reminders, so the ones Following just made or moved fire while Tuner stays closed.
+/// Blocking (`systemctl`); errors are logged.
+pub fn rearm(conn: &rusqlite::Connection, cfg: &crate::config::Config, paths: &crate::paths::AppPaths) {
+    if !super::ENABLED || !cfg.reminders.when_closed {
+        return;
+    }
+    let Some(armer) = crate::platform::systemd::SystemdArmer::for_profile(paths) else { return };
+    let mut pending = match crate::store::user::pending_reminders(conn, Timestamp::MIN) {
+        Ok(p) => p,
+        Err(e) => return tracing::warn!("reminders: re-arming after the refresh: {e}"),
+    };
+    if !cfg.follow.enabled {
+        pending.retain(|r| r.rule_id.is_none());
+    }
+    let want = plan(&pending, crate::model::now(), i64::from(cfg.reminders.lead_min) * 60);
+    crate::platform::systemd::ArmSync::new(std::sync::Arc::new(armer)).sync(&want);
+}
+
 /// The reminders to arm now and when their units elapse: pending, elapsing in `(now, now +
 /// ARM_WINDOW_S]`, soonest first, at most [`MAX_UNITS`]. Re-planned whenever the scheduler
 /// reloads (every change, every Following evaluation, at least once a minute).

@@ -25,7 +25,8 @@ pub enum FlashLength {
 pub enum FlashVolume {
     #[default]
     Normal,
-    /// Lower what plays under it.
+    /// Lower what plays under it. Not offered yet: the flash replaces what plays (single
+    /// view), or plays in the picture without the sound (multi-view), so it would act as Normal.
     Duck,
     /// "Silent flash" (subtitles when available).
     Mute,
@@ -78,7 +79,7 @@ pub fn ends_at(spec: &FlashSpec, start: Timestamp) -> Option<Timestamp> {
 pub struct FlashCtx {
     /// Local minute of the day now (quiet hours).
     pub minute_of_day: u16,
-    /// Another app is fullscreen ([`other_app_fullscreen`]; only asked when
+    /// Another app is fullscreen ([`crate::reminders::other_app_fullscreen`]; only asked when
     /// `news_flash.skip_when_fullscreen`).
     pub other_fullscreen: bool,
     /// What the main picture plays (`None`: nothing).
@@ -125,69 +126,6 @@ pub fn decide(
         return FlashDecision::Notify(FlashSkip::WouldInterrupt);
     }
     FlashDecision::Pop { ends_at: ends_at(spec, start), volume: spec.volume }
-}
-
-/// The news-flash check at fire time (the scheduler's `FireCtx::flash_skip`, and the closed
-/// `--reminder` path with nothing playing): `None` for any other reminder, or a flash that
-/// pops up; else why not — quiet hours, another app fullscreen (asked only when that setting
-/// is on), the bulletin already on, or a film or episode playing (a notification instead,
-/// whatever `follow.interrupt_vod` says). Blocking (the store, `hyprctl`): call it from the
-/// scheduler's worker, never the UI thread. A flash whose rule can't be read becomes a
-/// notification.
-pub fn flash_skip(
-    conn: &rusqlite::Connection,
-    cfg: &crate::config::Config,
-    r: &crate::model::Reminder,
-    main_kind: Option<crate::playback::Kind>,
-    multiview: bool,
-    playing: Vec<crate::model::ItemRef>,
-    now: Timestamp,
-) -> Option<FlashSkip> {
-    r.rule_id?;
-    let f = match crate::store::follow::flash_of(conn, r.id) {
-        Ok(f) => f?,
-        Err(e) => {
-            tracing::warn!(target: "tuner::follow", "reading a news flash: {e}");
-            return (r.open_in == Some(crate::model::OpenIn::PopOut)).then_some(FlashSkip::WouldInterrupt);
-        }
-    };
-    let cfg = &cfg.follow.news_flash;
-    let minute_of_day = jiff::Timestamp::from_second(now)
-        .map(|t| {
-            let z = t.to_zoned(jiff::tz::TimeZone::system());
-            z.hour() as u16 * 60 + z.minute() as u16
-        })
-        .unwrap_or(0);
-    let ctx = FlashCtx { minute_of_day, other_fullscreen: cfg.skip_when_fullscreen && other_app_fullscreen(), main_kind, multiview, playing };
-    match decide(&f.spec, cfg, &ctx, &r.channel, &f.alternates, r.start) {
-        FlashDecision::Pop { .. } => None,
-        FlashDecision::Notify(s) | FlashDecision::Skip(s) => Some(s),
-    }
-}
-
-/// Where the flash plays on accounts allowing one stream each (both of the user's): a copy on a
-/// playlist that isn't streaming now, so whatever plays keeps playing; else `channel` itself —
-/// it briefly takes over that playlist's stream and the previous playback is restored after.
-/// Returns (the channel, takes over).
-pub fn pick<'a>(
-    channel: &'a crate::model::ItemRef,
-    copies: &'a [crate::model::ItemRef],
-    busy: &[crate::model::SourceId],
-) -> (&'a crate::model::ItemRef, bool) {
-    std::iter::once(channel).chain(copies).find(|c| !busy.contains(&c.source)).map_or((channel, true), |c| (c, false))
-}
-
-/// Another app's window is fullscreen (Hyprland's active window; not ours). Blocking: one
-/// `hyprctl` run — call it from the scheduler's worker, never the UI thread. Outside Hyprland:
-/// false.
-pub fn other_app_fullscreen() -> bool {
-    if !crate::platform::hypr::is_hyprland() {
-        return false;
-    }
-    match std::process::Command::new("hyprctl").args(["-j", "activewindow"]).output() {
-        Ok(out) if out.status.success() => fullscreen_in(&out.stdout, std::process::id()),
-        _ => false,
-    }
 }
 
 /// `hyprctl -j activewindow` says a window other than process `own_pid`'s is fullscreen
@@ -242,11 +180,6 @@ mod tests {
         assert_eq!(decide(&spec, &cfg, &watching, &bbc, std::slice::from_ref(&bbc2), 1000), FlashDecision::Skip(FlashSkip::AlreadyWatching));
         let whole = FlashSpec { length: FlashLength::Whole, volume: FlashVolume::Mute };
         assert_eq!(decide(&whole, &cfg, &at(13 * 60, None), &bbc, &[], 1000), FlashDecision::Pop { ends_at: None, volume: FlashVolume::Mute });
-
-        // one connection per account: the other playlist's copy, else take over and restore
-        assert_eq!(pick(&bbc, std::slice::from_ref(&bbc2), &[SourceId(1)]), (&bbc2, false));
-        assert_eq!(pick(&bbc, std::slice::from_ref(&bbc2), &[]), (&bbc, false));
-        assert_eq!(pick(&bbc, std::slice::from_ref(&bbc2), &[SourceId(1), SourceId(2)]), (&bbc, true));
     }
 
     #[test]

@@ -109,6 +109,9 @@ pub struct Watch {
     pub ended: bool,
     /// Up next drives the main picture: its current row.
     pub queue_current: Option<QueueId>,
+    /// Up next is between two of its items (the card after one, a PIN wait, a future slot):
+    /// it hasn't run out, and the item that ended is already counted.
+    pub queue_between: bool,
     /// Up next's rows after the current one.
     pub queue_left: usize,
     /// Up next's estimated end.
@@ -134,6 +137,7 @@ impl Watch {
             left_s,
             ended: p.state == PlayerState::Ended,
             queue_current: q.current.filter(|_| driving),
+            queue_between: q.between_items(),
             queue_left: if driving { q.pending().saturating_sub(1) } else { 0 },
             queue_eta: q.eta_end.map(|(t, _)| t).filter(|_| driving),
         }
@@ -144,6 +148,8 @@ impl Watch {
     fn item(&self) -> Option<Item> {
         match (&self.queue_current, &self.media) {
             (Some(q), _) => Some(Item::Queue(*q)),
+            // the row that ended still shows under the card: not a new item
+            (None, _) if self.queue_between => None,
             (None, Some(m)) if !self.live => Some(Item::Media(m.clone())),
             _ => None,
         }
@@ -215,7 +221,7 @@ impl SleepRun {
             SleepWhen::AfterItems(n) if n == 0 || n > MAX_ITEMS => return Err(SleepError::NoItems),
             SleepWhen::AfterItems(_) if w.item().is_none() => return Err(SleepError::NothingPlaying),
             SleepWhen::AfterItems(n) => Deadline::Items { left: n },
-            SleepWhen::EndOfQueue if w.queue_current.is_none() => return Err(SleepError::NoQueue),
+            SleepWhen::EndOfQueue if w.queue_current.is_none() && !w.queue_between => return Err(SleepError::NoQueue),
             SleepWhen::EndOfQueue => Deadline::QueueEnd,
         };
         let counting = match timer.when {
@@ -224,7 +230,7 @@ impl SleepRun {
             _ => w.item(),
         }
         .map(|i| (i, w.left_s));
-        Ok(Self { timer, deadline, counting, spent: None, queue_seen: w.queue_current.is_some(), warned: false })
+        Ok(Self { timer, deadline, counting, spent: None, queue_seen: w.queue_current.is_some() || w.queue_between, warned: false })
     }
 
     pub fn timer(&self) -> &SleepTimer {
@@ -275,9 +281,10 @@ impl SleepRun {
                 }
             }
             Deadline::QueueEnd => {
-                self.queue_seen |= w.queue_current.is_some();
+                self.queue_seen |= w.queue_current.is_some() || w.queue_between;
                 let last_ended = w.queue_left == 0 && w.queue_current.is_some() && w.ended;
-                if self.queue_seen && (w.queue_current.is_none() || last_ended) {
+                // between two items (the card after one) it hasn't run out
+                if self.queue_seen && ((w.queue_current.is_none() && !w.queue_between) || last_ended) {
                     return Some(SleepStep::Fire(self.timer.action));
                 }
             }
@@ -543,23 +550,34 @@ mod tests {
         Watch { queue_current: row.map(QueueId), queue_left: left_rows, ..ep(media, left, now) }
     }
 
-    /// While Up next drives playback items are its rows (a live slot too); end of queue fires
-    /// when the last row ends or the queue stops.
+    /// While Up next drives playback items are its rows, and the card between
+    /// two rows (the engine no longer drives; the ended row still shows) neither counts again nor
+    /// ends Up next; end of queue fires when the last row ends or the queue stops.
     #[test]
     fn queue_rows_and_end_of_queue() {
-        let mut run = SleepRun::arm(timer(SleepWhen::AfterItems(1)), &queue(Some(1), 2, 10, 50.0, T0), None).unwrap();
-        // the next row starts (a live slot: still a row)
-        let slot =
-            Watch { media: Some(MediaRef::Channel(crate::model::ChannelId(4))), live: true, left_s: None, ..queue(Some(2), 1, 0, 0.0, T0 + 60) };
-        assert_eq!(run.step(&slot), Some(SleepStep::Fire(SleepAction::Stop)));
+        let between = |media: i64, now| Watch { ended: true, queue_between: true, ..ep(media, 0.0, now) };
+        let mut run = SleepRun::arm(timer(SleepWhen::AfterItems(2)), &queue(Some(1), 2, 10, 50.0, T0), None).unwrap();
+        assert_eq!(run.step(&queue(Some(1), 2, 10, 0.0, T0 + 50)), None);
+        for t in 0..3 {
+            assert_eq!(run.step(&between(10, T0 + 51 + t)), None, "the card, tick {t}");
+        }
+        assert_eq!(run.status(&between(10, T0 + 54)).items_left, Some(1));
+        // the next row starts, and ends
+        assert_eq!(run.step(&queue(Some(2), 1, 11, 600.0, T0 + 60)), None);
+        assert_eq!(run.step(&Watch { ended: true, ..queue(Some(2), 1, 11, 0.0, T0 + 660) }), Some(SleepStep::Fire(SleepAction::Stop)));
 
         assert_eq!(SleepRun::arm(timer(SleepWhen::EndOfQueue), &ep(1, 10.0, T0), None), Err(SleepError::NoQueue));
         let mut run = SleepRun::arm(timer(SleepWhen::EndOfQueue), &queue(Some(1), 1, 10, 900.0, T0), None).unwrap();
-        assert_eq!(run.step(&queue(Some(2), 0, 11, 1000.0, T0 + 900)), None);
-        assert_eq!(run.status(&queue(Some(2), 0, 11, 1000.0, T0 + 900)).fires_at, Some(T0 + 1900));
-        assert_eq!(run.step(&queue(Some(2), 0, 11, 100.0, T0 + 1800)), Some(SleepStep::Warn { at: T0 + 1900 }));
-        let done = Watch { ended: true, ..queue(Some(2), 0, 11, 0.0, T0 + 1900) };
+        for t in 0..3 {
+            assert_eq!(run.step(&between(10, T0 + 900 + t)), None, "the card, tick {t}");
+        }
+        assert_eq!(run.step(&queue(Some(2), 0, 11, 1000.0, T0 + 910)), None);
+        assert_eq!(run.status(&queue(Some(2), 0, 11, 1000.0, T0 + 910)).fires_at, Some(T0 + 1910));
+        assert_eq!(run.step(&queue(Some(2), 0, 11, 100.0, T0 + 1810)), Some(SleepStep::Warn { at: T0 + 1910 }));
+        let done = Watch { ended: true, ..queue(Some(2), 0, 11, 0.0, T0 + 1910) };
         assert_eq!(run.step(&done), Some(SleepStep::Fire(SleepAction::Stop)));
+        // armed on the card between two rows
+        assert!(SleepRun::arm(timer(SleepWhen::EndOfQueue), &between(10, T0), None).is_ok());
         // the user clears Up next: it has run out
         let mut run = SleepRun::arm(timer(SleepWhen::EndOfQueue), &queue(Some(1), 3, 10, 900.0, T0), None).unwrap();
         assert_eq!(run.step(&ep(10, 800.0, T0 + 100)), Some(SleepStep::Fire(SleepAction::Stop)));

@@ -590,13 +590,9 @@ impl Screen for PlayerScreen {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) {
-        let mut rect = ui.available_rect_before_wrap();
-        // popped out: the scheduled-playback strip (rui's) takes the top of the window
-        if ctx.video_only {
-            let top = crate::ui::popout::strip(ui, ctx, rect);
-            rect.min.y = (rect.min.y + top).min(rect.max.y);
-        }
-        let rect = rect;
+        // popped out, the scheduled-playback strip (`reminders::ui`) draws over the top of the
+        // picture as a foreground area
+        let rect = ui.available_rect_before_wrap();
         let theme = ctx.theme;
         let snap = ctx.player.clone();
         self.live_ctx = is_live(&snap);

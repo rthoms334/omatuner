@@ -184,14 +184,14 @@ fn a_news_flash_follows_the_bulletin_on_weekdays() {
     assert_eq!(flash.spec.length, tuner::follow::flash::FlashLength::Headlines(5));
 
     // at fire time: it pops up, but never in quiet hours or over a film (a notification)
-    use tuner::follow::flash::{FlashSkip, flash_skip};
+    use tuner::follow::flash::{FlashCtx, FlashSkip};
     let mut cfg = tuner::config::Config::default();
-    cfg.follow.news_flash.skip_when_fullscreen = false;
-    let reader = s.reader().unwrap();
-    let at = |cfg: &tuner::config::Config, main| flash_skip(&reader, cfg, &r[0], main, false, Vec::new(), r[0].start);
+    let minute = tuner::reminders::local_minute_of_day(r[0].start);
+    let at = |cfg: &tuner::config::Config, main_kind| {
+        tuner::reminders::flash_skip(&flash, &cfg.follow.news_flash, &FlashCtx { minute_of_day: minute, main_kind, ..Default::default() }, &r[0])
+    };
     assert_eq!(at(&cfg, Some(tuner::playback::Kind::Live)), None);
-    cfg.follow.interrupt_vod = true;
-    assert_eq!(at(&cfg, Some(tuner::playback::Kind::Vod)), Some(FlashSkip::WouldInterrupt), "whatever interrupt_vod says");
+    assert_eq!(at(&cfg, Some(tuner::playback::Kind::Vod)), Some(FlashSkip::WouldInterrupt), "never over a film");
     (cfg.follow.news_flash.quiet_from_min, cfg.follow.news_flash.quiet_to_min) = (Some(0), Some(24 * 60));
     assert_eq!(at(&cfg, None), Some(FlashSkip::QuietHours));
 }

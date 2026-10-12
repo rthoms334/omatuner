@@ -741,7 +741,7 @@ pub fn edit_reminder(conn: &Connection, id: ReminderId, e: &ReminderEdit) -> Res
     }
     let (lead_s, mode) = stored_mode(lead_s, mode);
     let open_in = e.open_in.unwrap_or(old.open_in);
-    if old.rule_id.is_some() && (lead_s != old_lead || mode != old_mode) {
+    if old.rule_id.is_some() && (lead_s != old_lead || mode != old_mode || offset_s != old.offset_s) {
         crate::store::follow::on_reminder_edited(conn, id)?;
     }
     conn.execute(
@@ -823,8 +823,9 @@ const HOLDERS: &[(&str, &str, &str, &str, &str)] = &[
     ("epg", "channel_epg_map", "'channel'", "channel_key", " AND method = 'manual'"),
     // "Not the same title" / "Always play from" (DESIGN §29.11)
     ("split, pin or join", "title_link", "kind", "item_key", ""),
-    // Up next rows (DESIGN §32): re-keyed items reattach, vanished ones list under Orphans
-    ("queue", "queue_item", "kind", "item_key", ""),
+    // Up next rows still to play (DESIGN §32): re-keyed items reattach, vanished ones list
+    // under Orphans (played, skipped and failed rows are pruned by age instead)
+    ("queue", "queue_item", "kind", "item_key", " AND state IN ('pending', 'current')"),
 ];
 
 fn holder_name(s: &str) -> &'static str {
