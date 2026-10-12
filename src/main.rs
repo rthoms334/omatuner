@@ -46,6 +46,10 @@ const REFRESH_SETTLE: Duration = Duration::from_millis(500);
 fn main() -> anyhow::Result<()> {
     tuner::platform::limit_malloc_arenas();
     let cli = Cli::parse();
+    // prints (or, with --apply and a "y", runs) the Claude Code setup; touches no profile
+    if let Some(tuner::cli::Command::ClaudeSetup { apply }) = cli.command {
+        return tuner::agent::setup::main(apply);
+    }
     // developer-only screenshot capture (DESIGN §23.1); a typo fails here, not after a minute
     let devshot = tuner::devshot::ShotConfig::from_env().map_err(|e| anyhow::anyhow!("TUNER_SCREENSHOT*: {e}"))?;
     let paths = match &cli.profile_dir {
@@ -82,8 +86,13 @@ fn main() -> anyhow::Result<()> {
 
     // Paths are made absolute HERE: a running instance receiving them over IPC has another
     // working directory.
-    let request =
-        IpcRequest { view: cli.view, play: cli.play.as_deref().map(absolute_input), inputs: cli.inputs.iter().map(|i| absolute_input(i)).collect() };
+    let mut request = IpcRequest {
+        view: cli.view,
+        play: cli.play.as_deref().map(absolute_input),
+        inputs: cli.inputs.iter().map(|i| absolute_input(i)).collect(),
+        popout: cli.popout,
+        reminder: cli.reminder,
+    };
     // held until the process exits: the database has one owner
     let primary = become_primary(&paths, &request, HANDOFF_WAIT);
     if let Err(e) = &primary
@@ -92,9 +101,29 @@ fn main() -> anyhow::Result<()> {
         // launched from the desktop, nobody reads stderr
         tuner::platform::notify::notify(tuner::APP_NAME, &e.to_string(), false);
     }
-    let Some(_instance) = primary? else {
+    let Some(instance) = primary? else {
         return Ok(());
     };
+    // a reminder's systemd timer fired while Tuner was closed (B6): show its note from here,
+    // start Tuner for a switch, or do nothing
+    if let Some(id) = cli.reminder {
+        let store = tuner::store::Store::open(&paths.db_file(), None)?;
+        let now = tuner::model::now();
+        // the spoiler guard is built (from the store) only when a note goes out
+        let outcome = tuner::reminders::closed::fire(&store, &config, |c| tuner::reminders::closed::store_guard(c, &config, now), id, now);
+        store.close(Duration::from_secs(3));
+        match outcome? {
+            tuner::reminders::closed::ClosedOutcome::Exit => return Ok(()),
+            tuner::reminders::closed::ClosedOutcome::StartApp { popout } => request.popout = popout,
+            tuner::reminders::closed::ClosedOutcome::Notify(note) => {
+                // Watch launches a fresh `tuner --play`, which must be able to become primary
+                drop(instance);
+                tuner::reminders::closed::notify_and_wait(&note);
+                return Ok(());
+            }
+        }
+    }
+    let _instance = instance;
 
     let (bus, events) = EventBus::new(None);
     // only the primary instance: the first Settings change saves over config.toml
@@ -297,12 +326,18 @@ fn refresh_headless(paths: AppPaths, config: Config, timeout: Duration) -> anyho
         tracing::error!("registering stored secrets: {e}");
     }
     let http = HttpClient::new(&tuner::services::http_options(&config))?;
+    let (arm_cfg, arm_paths) = (config.clone(), paths.clone());
     let shared = Arc::new(RwLock::new(Arc::new(config)));
-    let jobs = JobManager::new(JobContext::new(store.clone(), http, bus, paths, shared), rt.handle().clone());
+    let jobs = JobManager::new(JobContext::new(store.clone(), http, bus, paths, shared).headless(), rt.handle().clone());
     let root = jobs.submit(JobKind::RefreshStale);
     let failed = wait_for_jobs(&jobs, &events, root, timeout);
     jobs.cancel_all();
     rt.shutdown_timeout(Duration::from_secs(2));
+    // Following may have made or moved reminders: their units, as a running Tuner would arm them
+    match store.reader() {
+        Ok(conn) => tuner::reminders::arming::rearm(&conn, &arm_cfg, &arm_paths),
+        Err(e) => tracing::warn!("reminders: re-arming after the refresh: {e}"),
+    }
     if !store.close(Duration::from_secs(3)) {
         tracing::warn!("database writer did not finish within 3 s");
     }

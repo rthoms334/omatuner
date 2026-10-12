@@ -1,8 +1,8 @@
 //! Command line. Implemented in the skeleton (clap derive).
 //!
 //! ```text
-//! tuner [--view home|live|guide|movies|series|search|settings] [--play <source>:<item-key>]
-//!       [--debug] [--profile-dir <dir>] [--refresh] [PLAYLIST_OR_URL...]
+//! tuner [--view home|live|guide|movies|series|search|settings] [--play <source>:<item-key> [--popout]]
+//!       [--reminder <id>] [--debug] [--profile-dir <dir>] [--refresh] [PLAYLIST_OR_URL...]
 //! tuner mcp [--debug] [--profile-dir <dir>]     # MCP server on stdio (DESIGN §30)
 //! ```
 //! A second invocation hands its request to the running instance over the IPC socket and exits
@@ -39,6 +39,16 @@ pub struct Cli {
     #[arg(long)]
     pub play: Option<String>,
 
+    /// With --play: open it in the pinned pop-out without taking keyboard focus (scheduled
+    /// playback, big-features additions); the in-app mini player outside Hyprland.
+    #[arg(long, requires = "play")]
+    pub popout: bool,
+
+    /// Fire reminder <id> now (what the transient systemd timers run while Tuner is closed,
+    /// B6): Tuner looks the reminder up, and guards it, itself.
+    #[arg(long, value_name = "ID")]
+    pub reminder: Option<i64>,
+
     /// Verbose logging (also `RUST_LOG`).
     #[arg(long, global = true)]
     pub debug: bool,
@@ -62,7 +72,12 @@ impl Cli {
     /// with no player flag is the bridge too. `tuner ./mcp` opens a file of that name.
     pub fn is_mcp(&self) -> bool {
         self.command == Some(Command::Mcp)
-            || (self.command.is_none() && self.inputs == ["mcp"] && self.view.is_none() && self.play.is_none() && !self.refresh)
+            || (self.command.is_none()
+                && self.inputs == ["mcp"]
+                && self.view.is_none()
+                && self.play.is_none()
+                && self.reminder.is_none()
+                && !self.refresh)
     }
 }
 
@@ -72,6 +87,13 @@ pub enum Command {
     /// `claude mcp add tuner -- tuner mcp`) can search the guide and your library and play
     /// things in the running Tuner — starting it when needed (DESIGN §30).
     Mcp,
+    /// Show how to connect Claude Code to Tuner (the omatuner plugin: the MCP server and its
+    /// skills). `--apply` runs the plugin steps after asking on the terminal.
+    ClaudeSetup {
+        /// Run the steps (asks first; never without a "y").
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[cfg(test)]
@@ -100,5 +122,16 @@ mod tests {
         for not in [&["tuner", "./mcp"][..], &["tuner", "--refresh", "mcp"], &["tuner", "--play", "1:a", "mcp"]] {
             assert!(!Cli::try_parse_from(not).unwrap().is_mcp(), "{not:?}");
         }
+    }
+
+    /// What the reminder timers run (B6) and the pop-out launch: `--popout` only goes with
+    /// `--play`.
+    #[test]
+    fn reminder_and_popout_flags() {
+        let cli = Cli::try_parse_from(["tuner", "--reminder", "42"]).unwrap();
+        assert_eq!((cli.reminder, cli.popout), (Some(42), false));
+        let cli = Cli::try_parse_from(["tuner", "--play", "2:xt:live:1", "--popout"]).unwrap();
+        assert!(cli.popout && cli.play.is_some());
+        assert!(Cli::try_parse_from(["tuner", "--popout"]).is_err(), "nothing to pop out");
     }
 }

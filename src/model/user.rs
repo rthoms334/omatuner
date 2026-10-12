@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{FavListId, Fingerprint, GroupKey, ItemKind, ItemRef, ReminderId, SourceId, Timestamp};
+use super::{FavListId, Fingerprint, FollowRuleId, GroupKey, ItemKind, ItemRef, ReminderId, SourceId, Timestamp};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FavouriteList {
@@ -126,6 +126,62 @@ pub struct Reminder {
     /// Seconds before `start` to notify.
     pub lead_s: i64,
     pub state: ReminderState,
+    /// Notify, or switch to the channel by itself (migration 0008; older rows: `lead_s ==
+    /// SWITCH_LEAD` means switch). Serde defaults: backups from before the batch.
+    #[serde(default)]
+    pub mode: ReminderMode,
+    /// Seconds after `start` the switch happens / playback starts ("skip the build-up").
+    #[serde(default)]
+    pub offset_s: i64,
+    /// Where scheduled playback opens; `None` = `reminders.open_in` (big-features additions).
+    #[serde(default)]
+    pub open_in: Option<OpenIn>,
+    /// The Following rule that made it (migration 0011); `None` = the user's or Claude's own.
+    /// Editing its lead or mode detaches it (`follow::on_reminder_edited`).
+    #[serde(default)]
+    pub rule_id: Option<FollowRuleId>,
+}
+
+/// What a reminder does at its time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReminderMode {
+    /// A notification "starts in 2 min" with Watch (the default).
+    #[default]
+    Notify,
+    /// An automatic switch with the 10 s Cancel toast (DESIGN §30.8); routed by
+    /// `reminders::fire_policy` (B1/B6).
+    Switch,
+}
+
+/// Where scheduled playback (an automatic switch, a Following switch, a news flash, `tuner
+/// --play <ref> --popout`) opens (Settings ▸ Reminders "Open scheduled playback in").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum OpenIn {
+    /// The pinned pop-out on every workspace, never taking keyboard focus (Hyprland; the
+    /// in-app mini player elsewhere).
+    #[default]
+    PopOut,
+    /// The full window, raised.
+    FullWindow,
+    /// Wherever Tuner is now (fullscreen stays fullscreen, the mini player stays mini).
+    WhereIAm,
+}
+
+/// Why a reminder is removed (`store::user::remove_reminder`, the only delete path, B6): a
+/// Following ledger row turns `skipped` when the user removed its reminder, never when its
+/// rule did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RemoveWhy {
+    /// Settings ▸ Reminders, the guide's `r` toggle, a Cancel toast, the Live reminders list.
+    User,
+    /// MCP `cancel_switch` / `reminders cancel`.
+    Agent,
+    /// The Following engine (rule deleted, match gone).
+    Rule,
+    /// Pruning (`jobs::maintenance`).
+    Maintenance,
 }
 
 impl Reminder {
@@ -139,7 +195,26 @@ impl Reminder {
 
     /// An automatic switch rather than a notification.
     pub fn switches(&self) -> bool {
-        self.lead_s == Self::SWITCH_LEAD
+        self.mode == ReminderMode::Switch || self.lead_s == Self::SWITCH_LEAD
+    }
+
+    /// A notification reminder with the defaults of the new columns (mode notify, no offset,
+    /// the configured place, no rule).
+    pub fn notify(channel: ItemRef, channel_name: String, programme_title: String, start: Timestamp, stop: Timestamp, lead_s: i64) -> Self {
+        Self {
+            id: ReminderId(0),
+            channel,
+            channel_name,
+            programme_title,
+            start,
+            stop,
+            lead_s,
+            state: ReminderState::Pending,
+            mode: ReminderMode::Notify,
+            offset_s: 0,
+            open_in: None,
+            rule_id: None,
+        }
     }
 }
 

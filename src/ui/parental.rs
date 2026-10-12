@@ -17,7 +17,7 @@ pub struct ParentalSession {
 
 impl ParentalSession {
     /// A session unlocked at `at` (`None` = locked): the agent handler's copy of the app's
-    /// session (DESIGN §30.4, `agent::shared`).
+    /// session (DESIGN §30.4, `crate::shared`).
     pub fn with_unlocked_at(at: Option<Instant>) -> Self {
         Self { unlocked_at: at }
     }

@@ -17,7 +17,9 @@
 pub mod copies;
 pub mod data;
 pub mod epg_grid;
+pub mod item_menu;
 pub mod layout;
+pub mod multiview;
 pub mod overlays;
 pub mod parental;
 pub mod popout;
@@ -59,6 +61,8 @@ pub enum ScreenId {
     Onboarding,
     EpgMapping,
     Logs,
+    /// Up next (Alt+6, DESIGN §32).
+    Queue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -79,6 +83,10 @@ pub enum SettingsPage {
     /// User data whose items vanished (reattach / forget).
     Orphans,
     About,
+    /// Following rules and what they matched (DESIGN §33; listed once `follow::ENABLED`).
+    Following,
+    /// The spoiler guard (DESIGN §34; listed once `spoiler::ENABLED`).
+    SpoilerGuard,
 }
 
 /// Where the onboarding card starts (the same card is reused by Settings ▸ Playlists ▸ Add,
@@ -129,6 +137,8 @@ pub enum Route {
         channel: Option<ChannelId>,
     },
     Logs,
+    /// Up next (Alt+6, DESIGN §32).
+    Queue,
 }
 
 impl Route {
@@ -146,6 +156,7 @@ impl Route {
             Route::Onboarding(_) => ScreenId::Onboarding,
             Route::EpgMapping { .. } => ScreenId::EpgMapping,
             Route::Logs => ScreenId::Logs,
+            Route::Queue => ScreenId::Queue,
         }
     }
 }
@@ -202,6 +213,24 @@ pub enum OverlayRequest {
         source: SourceId,
         token: u64,
     },
+    /// Following's sheet (`R`, "Follow…"; DESIGN §33, F-C).
+    FollowSheet(overlays::follow_sheet::FollowSheetSpec),
+    /// The spoiler guard menu (Ctrl+Shift+B; DESIGN §34, S-ui).
+    SpoilerMenu,
+    /// Add / edit a spoiler topic or blackout (DESIGN §34, S-ui).
+    SpoilerRule(overlays::spoiler_rule::SpoilerRuleSpec),
+    /// How many episodes of a series to add to Up next (DESIGN §32, Q-ui).
+    QueueSeries {
+        series: SeriesId,
+        play_next: bool,
+    },
+    /// The sleep timer menu (Ctrl+Shift+T; B6, rui).
+    SleepTimer,
+    /// A programme's reminder sheet: notify or switch, lead, start offset, where it opens
+    /// (B6, rui).
+    ReminderSheet(overlays::reminders::ReminderSheetSpec),
+    /// Choose the channel for the other picture (Ctrl+M in the player; DESIGN §35, MV-2).
+    WatchAlongside,
 }
 
 /// Requests a screen makes during a frame; the app applies them after the frame.
@@ -216,6 +245,8 @@ pub enum NavRequest {
     /// Pop the window out to the video-only player on every workspace, or back in (the
     /// player's double-click; DESIGN §21.6).
     TogglePopOut,
+    /// Multi-view (DESIGN §35): applied by the app after the frame (`app/multiview.rs`).
+    MultiView(multiview::MvRequest),
 }
 
 /// What the app's Back leads to from the current route: the route below it, or the parent of a
@@ -239,8 +270,9 @@ impl BackTarget {
             ScreenId::Player => "Player",
             ScreenId::Settings => "Settings",
             ScreenId::Onboarding => "Setup",
-            ScreenId::EpgMapping => "EPG mapping",
+            ScreenId::EpgMapping => "Guide fixes",
             ScreenId::Logs => "Logs",
+            ScreenId::Queue => "Up next",
         };
         Self { label }
     }
@@ -288,8 +320,13 @@ pub struct UiCtx<'a> {
     /// Where the app's Back (Esc) goes from the current route, for the on-screen back button
     /// ([`widgets::section::page_header`]); `None` on a tab root. Set by the app each frame.
     pub back: Option<BackTarget>,
+    /// Multi-view this frame (both pictures, focus, sound); set by the app each frame, off
+    /// otherwise (screen tests). `player` is the focused picture's snapshot.
+    pub multiview: multiview::MvFrame,
     pub now: Timestamp,
     nav: &'a mut Vec<NavRequest>,
+    /// Multi-view requests made through `&self` (`play`); the app moves them to `nav`.
+    mv_out: std::cell::RefCell<Vec<multiview::MvRequest>>,
     toasts: &'a mut Vec<Toast>,
     config_edits: &'a mut Vec<ConfigEdit>,
 }
@@ -341,8 +378,10 @@ impl<'a> UiCtx<'a> {
             mini_rect: p.mini_rect,
             video_only: p.video_only,
             back: None,
+            multiview: Default::default(),
             now: p.now,
             nav: p.nav,
+            mv_out: Default::default(),
             toasts: p.toasts,
             config_edits: p.config_edits,
         }
@@ -365,9 +404,39 @@ impl<'a> UiCtx<'a> {
     pub fn edit_config(&mut self, f: impl FnOnce(&mut Config) + 'static) {
         self.config_edits.push(Box::new(f));
     }
-    /// Send a player command (non-blocking; never call mpv from the UI thread).
+    /// Send a player command (non-blocking; never call mpv from the UI thread). Single view: to
+    /// the picture on screen. Multi-view (DESIGN §35): volume and mute to the picture with the
+    /// sound, a channel or catch-up through the copy planner for the focused picture, a film or
+    /// episode ends multi-view ([`multiview::route_command`]); the rest to the focused picture.
     pub fn play(&self, cmd: crate::player::PlayerCommand) {
-        self.services.player.handle().send(cmd);
+        match multiview::route_command(&self.multiview.view, cmd) {
+            multiview::Routed::Focused(cmd) => self.services.tiles.focused().send(cmd),
+            multiview::Routed::Audible(cmd) => self.services.tiles.audible_handle().send(cmd),
+            multiview::Routed::Request(r) => self.mv_out.borrow_mut().push(r),
+        }
+    }
+    /// Send a command to one picture, whatever has the focus (multi-view chrome).
+    pub fn play_in(&self, tile: crate::model::TileId, cmd: crate::player::PlayerCommand) {
+        if let Some(p) = self.services.tiles.player(tile) {
+            p.handle().send(cmd);
+        }
+    }
+    /// Ask multi-view for something (focus, sound, layout, a picture's channel…); the app
+    /// applies it after the frame.
+    pub fn mv_request(&self, r: multiview::MvRequest) {
+        self.mv_out.borrow_mut().push(r);
+    }
+    /// The requests made this frame (the app turns them into `NavRequest::MultiView`).
+    pub fn take_mv_requests(&mut self) -> Vec<multiview::MvRequest> {
+        std::mem::take(self.mv_out.get_mut())
+    }
+    /// The snapshot of the picture with the sound (the volume control's).
+    pub fn audible_player(&self) -> Arc<PlayerSnapshot> {
+        let mv = &self.multiview;
+        match mv.snap(mv.view.audible) {
+            Some(s) if mv.on() => s.clone(),
+            _ => self.player.clone(),
+        }
     }
     /// The quality badge of a channel (measured this session, else the library's: measured
     /// earlier, else from the name), or `None` while Settings ▸ Interface ▸ Quality badges

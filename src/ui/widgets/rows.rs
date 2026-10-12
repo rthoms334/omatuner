@@ -48,28 +48,19 @@ fn allocate_row(ui: &mut egui::Ui, theme: &Theme, natural_h: f32, state: RowStat
     (rect, resp)
 }
 
-/// A row's playlist mark, right-aligned at `right_center` (DESIGN §29 "marks always include
-/// the name"): the playlist's name in its colour (`legible`), elided to `name_w`; with
-/// `name_w = None` (compact rows) its glyph (the source colour, fg with an underline where it
-/// wouldn't read). The name is also the tooltip.
-fn source_mark(ui: &egui::Ui, theme: &Theme, right_center: egui::Pos2, src: &SourceMeta, row: egui::Id, name_w: Option<f32>) -> Rect {
+/// A row's playlist mark, right-aligned at `right_center` (DESIGN §13.0 "Playlist codes"): the
+/// playlist's code chip in its colour, so the item's name keeps the row's width. The full name
+/// is the chip's tooltip, part of the row's accessible label, and — while the row has the
+/// cursor — in the status bar ("BBC One · Northwind").
+fn source_mark(ui: &egui::Ui, theme: &Theme, right_center: egui::Pos2, src: &SourceMeta, row: &egui::Response, item: &str, state: RowState) -> Rect {
     let t = &theme.tokens;
-    let r = match name_w {
-        Some(w) => {
-            let color = super::badge::legible(theme, theme.source_color(src.color));
-            paint::text(ui.painter(), right_center, Align2::RIGHT_CENTER, src.name.as_str(), paint::font(theme, TypeToken::BodySmall), color, w)
-        }
-        None => {
-            let font = paint::font(theme, TypeToken::Icon);
-            super::badge::paint_source_mark(ui.painter(), theme, right_center, Align2::RIGHT_CENTER, src, font, t.bg, t.fg)
-        }
-    };
-    ui.interact(r, row.with("source"), egui::Sense::hover()).on_hover_text(egui::RichText::new(&src.name).size(theme.font(TypeToken::BodySmall)));
+    let r = super::badge::paint_code_chip(ui.painter(), theme, right_center, Align2::RIGHT_CENTER, src, t.bg, t.fg);
+    ui.interact(r, row.id.with("source"), egui::Sense::hover()).on_hover_text(egui::RichText::new(&src.name).size(theme.font(TypeToken::BodySmall)));
+    if state.is_cursor() || row.hovered() {
+        super::status_bar::note_focus(ui.ctx(), label_with_source(item, Some(src)), row.hovered());
+    }
     r
 }
-
-/// The share of a row's width a playlist's name may take (channel, reminder rows).
-const ROW_SOURCE_SHARE: f32 = 0.2;
 
 /// `state` with the hover of the [`menu_row`] about to be drawn next in `ui` (top-down): hover
 /// lights a row like the cursor. For rows outside a [`virtual_list`](super::list::virtual_list)
@@ -152,8 +143,7 @@ fn menu_row_with(
         right = r.left() - theme.space(SpaceToken::Lg);
     }
     if let Some(src) = source {
-        let w = (rect.width() * ROW_SOURCE_SHARE).round();
-        right = source_mark(ui, theme, egui::pos2(right, rect.center().y), src, resp.id, Some(w)).left() - theme.space(SpaceToken::Lg);
+        right = source_mark(ui, theme, egui::pos2(right, rect.center().y), src, &resp, label, state).left() - theme.space(SpaceToken::Lg);
     }
     let p = ui.painter();
     let max_w = (right - left).max(0.0);
@@ -194,6 +184,8 @@ pub struct ChannelRowOpts<'a> {
     pub no_guide_label: Option<&'a str>,
     /// The quality badge after the name (`UiCtx::quality`; `None` = unknown or badges off).
     pub quality: Option<QualityBadge>,
+    /// The spoiler guard's view: programme titles as it shows them (`None`: as is).
+    pub spoilers: Option<&'a super::spoiler::Spoilers>,
 }
 
 /// The detail line of a channel row for a row `width`: "title · 20:00–21:00 · next: X",
@@ -206,10 +198,11 @@ fn channel_detail(ch: &ChannelSummary, now_next: Option<&NowNext>, width: f32, r
         return no_data();
     }
     let nn = now_next?;
-    let next = nn.next.as_ref().map(|n| format!("next: {}", n.title));
+    let title = |p: &ProgrammeSlim| opts.spoilers.map_or_else(|| p.title.to_string(), |s| s.programme_title(p).into_owned());
+    let next = nn.next.as_ref().map(|n| format!("next: {}", title(n)));
     let line = match &nn.now {
         Some(p) => {
-            let mut parts = vec![p.title.to_string()];
+            let mut parts = vec![title(p)];
             if width >= DETAIL_FULL_W * rem {
                 parts.push(super::time::span(p.start, p.stop, h24));
             }
@@ -221,7 +214,7 @@ fn channel_detail(ch: &ChannelSummary, now_next: Option<&NowNext>, width: f32, r
             parts.join(" · ")
         }
         None => match nn.next.as_ref() {
-            Some(n) => format!("{} {}", super::time::hhmm(n.start, h24), n.title),
+            Some(n) => format!("{} {}", super::time::hhmm(n.start, h24), title(n)),
             None => return no_data(),
         },
     };
@@ -285,8 +278,7 @@ pub fn channel_row(
         glyph(glyphs::LOCK, t.text_secondary);
     }
     if let Some(src) = opts.source {
-        let w = (opts.density != Density::Compact).then(|| (rect.width() * ROW_SOURCE_SHARE).round());
-        right = source_mark(ui, theme, egui::pos2(right, line_y), src, resp.id, w).left() - theme.space(SpaceToken::Md);
+        right = source_mark(ui, theme, egui::pos2(right, line_y), src, &resp, &ch.name, state).left() - theme.space(SpaceToken::Md);
     }
 
     if opts.show_number {
@@ -357,14 +349,10 @@ pub struct GroupDecor<'a> {
     /// playlist has several (smart names drop the "UK |" prefix, so "UK | Sports" and
     /// "US | Sports" would both read "Sports").
     pub tag: Option<&'a str>,
-    /// The group's playlist, in All with several playlists (DESIGN §29): its name, short, in
-    /// its colour (fg where the colour doesn't read), right of the group's name — so two
-    /// "Sports" groups can be told apart.
+    /// The group's playlist, in All with several playlists (DESIGN §29): its code chip right
+    /// of the group's name — so two "Sports" groups can be told apart.
     pub source: Option<&'a SourceMeta>,
 }
-
-/// Share of a group row the playlist's name may take before it elides.
-const GROUP_SOURCE_SHARE: f32 = 0.3;
 
 /// Group/category row: name, count, lock glyph.
 pub fn group_row(ui: &mut egui::Ui, theme: &Theme, g: &Group, state: RowState) -> egui::Response {
@@ -428,10 +416,7 @@ pub fn group_row_decor(ui: &mut egui::Ui, theme: &Theme, g: &Group, state: RowSt
         right = r.left() - theme.space(SpaceToken::Md);
     }
     if let Some(src) = decor.source {
-        let color = if g.hidden { t.text_disabled } else { super::badge::legible(theme, theme.source_color(src.color)) };
-        let max_w = (rect.width() * GROUP_SOURCE_SHARE).round();
-        let r = paint::text(p, egui::pos2(right, y), Align2::RIGHT_CENTER, src.name.as_str(), paint::font(theme, TypeToken::BodySmall), color, max_w);
-        right = r.left() - theme.space(SpaceToken::Md);
+        right = source_mark(ui, theme, egui::pos2(right, y), src, &resp, name, state).left() - theme.space(SpaceToken::Md);
     }
     if decor.marked {
         let r =

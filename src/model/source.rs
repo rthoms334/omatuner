@@ -99,6 +99,38 @@ pub struct SourceSettings {
     /// the "All playlists" scope of Movies, Series, Live TV and the guide (they still show when
     /// it is the playlist picked). `None` = shown.
     pub in_all: Option<bool>,
+    /// The playlist's short code on cards and rows (DESIGN §13.0, 1–3 letters or digits,
+    /// upper-case); `None` = derived from the name (`sources::codes`).
+    pub code: Option<String>,
+    /// Guide fixes rules and the catch-up offset of this playlist (DESIGN §31). Written only by
+    /// `store::sources::set_guide_rules` (other settings writes keep it).
+    pub guide: GuideRules,
+}
+
+/// Per-playlist Guide fixes rules (DESIGN §31, `SourceSettings::guide`). `None` = the config
+/// default (`config.epg.rules_default`; the catch-up offset: 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct GuideRules {
+    /// "+1/+2 follow their base": derive `sibling` mappings with a time shift.
+    pub timeshift_siblings: Option<bool>,
+    /// "Copies share a guide": derive `copy` mappings from the same channel in another
+    /// playlist.
+    pub share_copies: Option<bool>,
+    /// Catch-up offset of every channel of the playlist (a channel's own offset wins).
+    pub catchup_offset_s: Option<i64>,
+}
+
+impl GuideRules {
+    /// Rule "+1/+2 follow their base" with `default` = `config.epg.rules_default`.
+    pub fn siblings_on(&self, default: bool) -> bool {
+        self.timeshift_siblings.unwrap_or(default)
+    }
+
+    /// Rule "Copies share a guide" with `default` = `config.epg.rules_default`.
+    pub fn copies_on(&self, default: bool) -> bool {
+        self.share_copies.unwrap_or(default)
+    }
 }
 
 impl SourceSettings {

@@ -33,6 +33,13 @@ pub enum DataScope {
     Reminders,
     /// Everything (backup restore).
     All,
+    /// Following rules or their ledger changed (DESIGN §33).
+    Follow,
+    /// Spoiler-guard rules or seen events changed (DESIGN §34): rebuild the guard snapshot.
+    Spoiler,
+    /// The guide check's results (suggestions, probes) changed (DESIGN §31): light, no library
+    /// rebuild.
+    GuideIssues,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +91,12 @@ pub enum AppEvent {
     /// An MCP client asked for something only the UI can do (DESIGN §30.4).
     Agent(crate::agent::AgentCommand),
     Toast(Toast),
+    /// Following's preview service answered (DESIGN §33; F-C draws it).
+    Follow(crate::follow::FollowEvent),
+    /// The reminder engine: sleep timer, scheduled playback, news flash (B6; remind / rui).
+    Reminder(crate::reminders::ReminderEvent),
+    /// Multi-view's second picture (DESIGN §35; MV-1 / MV-2).
+    Tile(crate::player::tiles::TileEvent),
 }
 
 /// Cloneable sender half. `Send + Sync`. The egui context is shared by all clones and may be

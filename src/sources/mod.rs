@@ -8,6 +8,7 @@
 //! | `m3u.rs`          | WP-03 | streaming extended-M3U parser |
 //! | `m3u_vod.rs`      | P5 sources | M3U movies/series fallback classifier (DESIGN §27.5) |
 //! | `presets.rs`      | P5 sources | free-channel playlists + country detection (§27.8) |
+//! | `codes.rs`       | playlist codes | short playlist codes shown on cards and rows (§13.0) |
 //! | `category_tags.rs`| P6 core | country / language tags of category names (§28.2) |
 //! | `explicit.rs`     | P14 | adult-content detection of category names (§20.3) |
 //! | `smart_names.rs`  | WP-03 | name cleanup ("UK | BBC One FHD" → "BBC One") |
@@ -21,6 +22,7 @@
 
 pub mod catchup;
 pub mod category_tags;
+pub mod codes;
 pub mod epg_match;
 pub mod explicit;
 pub mod http;

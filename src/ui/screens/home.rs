@@ -323,6 +323,10 @@ pub(crate) mod kit {
             stop,
             lead_s: i64::from(ctx.config.reminders.lead_min) * 60,
             state: crate::model::ReminderState::Pending,
+            mode: Default::default(),
+            offset_s: 0,
+            open_in: None,
+            rule_id: None,
         };
         let _ = ctx.services.store.writer().submit_notify(DataScope::Reminders, move |c| crate::store::user::add_reminder(c, &r).map(|_| ()));
         ctx.toast(Toast::info(format!("Reminder set: {title} at {}", hhmm(start, ctx.config.interface.clock_24h))));
@@ -440,10 +444,13 @@ enum Tile {
     Vod(VodKind),
     Continue(usize),
     Start(StartAction),
+    /// Up next: carry on where it stopped, or start it (DESIGN §32).
+    UpNext,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RailKind {
+    UpNext,
     Continue,
     Favourites,
     Recent,
@@ -476,6 +483,8 @@ struct RailsKey {
     continue_gen: u64,
     /// Copies of one title are one tile (`interface.same_title`).
     combine: bool,
+    /// Up next's tile: (items to go, the row it resumes) while nothing plays.
+    up_next: Option<(usize, Option<crate::model::QueueId>)>,
 }
 
 #[derive(Default)]
@@ -522,7 +531,13 @@ impl HomeScreen {
     /// Rebuild the rails when the library, the favourites or Continue watching changed.
     fn build_rails(&mut self, ctx: &mut UiCtx<'_>) {
         let combine = st::combine(ctx.config);
-        let key = RailsKey { generation: ctx.lib.generation, favs: favs_signature(ctx.favs), continue_gen: self.continue_gen, combine };
+        let key = RailsKey {
+            generation: ctx.lib.generation,
+            favs: favs_signature(ctx.favs),
+            continue_gen: self.continue_gen,
+            combine,
+            up_next: up_next_key(ctx),
+        };
         if self.rails_key == Some(key) {
             return;
         }
@@ -554,6 +569,10 @@ impl HomeScreen {
             self.vod_refs = favourite_vod(ctx.lib, ctx.favs);
         }
         let mut rails = Vec::new();
+        // Up next first while it has items to go and nothing plays (DESIGN §32)
+        if key.up_next.is_some() {
+            rails.push(Rail { kind: RailKind::UpNext, title: "Up next".into(), list: None, tiles: vec![Tile::UpNext] });
+        }
         // a title's copies are one tile: the first (newest) of them in Continue watching, the
         // first in a favourites list
         let stack_key = |kind: VodKind| -> Option<(bool, crate::store::stacks::StackId)> {
@@ -720,6 +739,7 @@ impl HomeScreen {
                 ctx.toast(crate::msg::Toast::info("Press Ctrl+F on any channel to add it to your favourites"));
                 ctx.navigate(crate::ui::NavRequest::Switch(Route::Live { group: None, channel: None }));
             }
+            Tile::UpNext => resume_up_next(ctx),
         }
     }
 
@@ -739,8 +759,19 @@ impl HomeScreen {
             Tile::Channel { id, .. } => ctx.lib.live.get(*id).map(|c| ItemRef { source: c.source_id, kind: ItemKind::Channel, key: c.key.clone() }),
             Tile::Vod(kind) => ctx.lib.vod.find(*kind).map(vod_ref),
             Tile::Continue(i) => self.continue_items.get(*i).map(|c| c.item.clone()),
-            Tile::Start(_) => None,
+            Tile::Start(_) | Tile::UpNext => None,
         }
+    }
+
+    /// What the batch features act on for a tile.
+    fn tile_target(&self, tile: &Tile) -> Option<crate::ui::item_menu::Target> {
+        use crate::ui::item_menu::Target;
+        Some(match tile {
+            Tile::Channel { id, .. } => Target::Channel(*id),
+            Tile::Vod(kind) => Target::vod(*kind),
+            Tile::Continue(i) => Target::vod(self.continue_items.get(*i)?.card.kind),
+            Tile::Start(_) | Tile::UpNext => return None,
+        })
     }
 
     /// Display name of a tile (rename / hide / menu titles).
@@ -749,6 +780,7 @@ impl HomeScreen {
             Tile::Channel { id, .. } => ctx.lib.live.get(*id).map(|c| c.name.to_string()),
             Tile::Vod(kind) => ctx.lib.vod.find(*kind).map(|v| v.name.to_string()),
             Tile::Continue(i) => self.continue_items.get(*i).map(|c| c.card.name.to_string()),
+            Tile::UpNext => Some("Up next".to_owned()),
             Tile::Start(_) => None,
         }
         .unwrap_or_default()
@@ -762,12 +794,18 @@ impl HomeScreen {
             }
             Tile::Vod(kind) => ctx.lib.vod.find(*kind).map_or((false, false), |v| (v.locked, vod_group_locked(ctx, v))),
             Tile::Continue(i) => self.continue_items.get(*i).map_or((false, false), |c| (c.card.locked, vod_group_locked(ctx, &c.card))),
-            Tile::Start(_) => (false, false),
+            Tile::Start(_) | Tile::UpNext => (false, false),
         }
     }
 
     /// Item shortcuts (Help lists them for `[PosterGrid]`) and the context menu.
     fn item_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) {
+        // a feature's choice from the menu
+        if let Some(t) = self.current_tile().and_then(|(_, t)| self.tile_target(t))
+            && crate::ui::item_menu::dispatch(ctx, action, &t)
+        {
+            return;
+        }
         if action == Action::SortMenu {
             ctx.toast(crate::msg::Toast::info("Home follows your lists — sort in Live TV, Movies or Series"));
             return;
@@ -877,7 +915,7 @@ impl HomeScreen {
                 items.push(mi(glyphs::PLAY, "Play", Action::Activate, "Enter"));
                 items.push(mi(glyphs::GUIDE, "Show in TV guide", Action::OpenInGuide, "Ctrl+G"));
                 items.push(mi(glyphs::INFO, "Edit information…", Action::ShowDetails, "Ctrl+I"));
-                items.push(mi(glyphs::GUIDE, "Assign EPG channel…", Action::AssignEpg, "Ctrl+E"));
+                items.push(mi(glyphs::GUIDE, "Assign guide channel…", Action::AssignEpg, "Ctrl+E"));
             }
             Tile::Vod(_) | Tile::Continue(_) => {
                 items.push(mi(glyphs::INFO, "Details", Action::Activate, "Enter"));
@@ -885,6 +923,14 @@ impl HomeScreen {
                 if !matches!(tile, Tile::Vod(VodKind::Series(_))) {
                     items.push(mi(glyphs::CHECK, "Mark watched", Action::MarkWatched, "Ctrl+W"));
                 }
+            }
+            Tile::UpNext => {
+                let items = vec![
+                    mi(glyphs::PLAY, "Carry on with Up next", Action::Activate, "Enter"),
+                    mi(glyphs::UP_NEXT, "Open Up next", Action::GoQueue, "Alt+6"),
+                ];
+                ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: name.to_owned(), items }));
+                return;
             }
             Tile::Start(_) => return,
         }
@@ -904,6 +950,9 @@ impl HomeScreen {
         items.push(mi(glyphs::TAG, "Rename…", Action::Rename, "F2"));
         items.push(mi(glyphs::LOCK, "Lock / unlock", Action::ToggleLock, "Ctrl+L"));
         items.push(mi(glyphs::HIDDEN, "Hide", Action::ToggleHidden, "Ctrl+H"));
+        if let Some(t) = self.tile_target(tile) {
+            crate::ui::item_menu::extend(&mut items, &t, ctx, KeyContext::List);
+        }
         ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: name.to_owned(), items }));
     }
 }
@@ -1031,6 +1080,12 @@ impl Screen for HomeScreen {
             }
             return matches!(action, Action::Up | Action::Down | Action::Left | Action::Right | Action::FilterInput(_));
         }
+        // the batch features' keys on the tile (Ctrl+N, Ctrl+M…)
+        if let Some(t) = self.current_tile().and_then(|(_, t)| self.tile_target(t))
+            && crate::ui::item_menu::dispatch(ctx, action, &t)
+        {
+            return true;
+        }
         match action {
             Action::Up | Action::Down => {
                 let n = self.rails.len();
@@ -1091,6 +1146,8 @@ impl Screen for HomeScreen {
             OverlayResult::Unlocked(a @ (Action::Activate | Action::ActivateAlt))
             | OverlayResult::Chosen(a @ (Action::Activate | Action::ActivateAlt)) => self.activate(ctx, a == Action::ActivateAlt),
             OverlayResult::Unlocked(Action::ToggleLock) => self.item_action(ctx, Action::ToggleLock),
+            // Up next's tile menu
+            OverlayResult::Chosen(Action::GoQueue) => ctx.navigate(crate::ui::NavRequest::Switch(Route::Queue)),
             // the context menu (its entries are the shortcuts themselves)
             OverlayResult::Chosen(a) if a != Action::ContextMenu => self.item_action(ctx, a),
             _ => {}
@@ -1242,7 +1299,7 @@ fn draw_tile(
                         count: c.count,
                         open: false,
                         fan: false,
-                        second: others.first().and_then(|p| ctx.source_of(item_kind, **p)),
+                        next: [0, 1].map(|k| others.get(k).and_then(|p| ctx.source_of(item_kind, **p))),
                         others: others.len(),
                     });
                     decor.dimmed = c.all_locked && !kit::unlocked(ctx);
@@ -1267,6 +1324,7 @@ fn draw_tile(
             let is_playing = playing == Some(MediaRef::Channel(*id));
             channel_tile(ui, ctx, *id, cursor, is_playing)
         }
+        Tile::UpNext => up_next_tile(ui, ctx, cursor),
         Tile::Start(a) => {
             let (glyph, label) = match a {
                 StartAction::BrowseLive => (glyphs::LIVE_TV, "Browse Live TV"),
@@ -1320,14 +1378,13 @@ fn channel_tile(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, id: ChannelId, cursor: b
     let right = rect.right() - pad;
     let p = ui.painter();
     let top_y = rect.top() + rect.height() * 0.32;
-    // top line, from the right edge: lock, then the playlist's glyph (DESIGN §13.0)
+    // top line, from the right edge: lock, then the playlist's code chip (DESIGN §13.0)
     let mut name_right = right;
     if ch.locked {
         name_right -= theme.font(TypeToken::Icon) + theme.space(SpaceToken::Md);
     }
     if let Some(src) = source {
-        let icon = egui::FontId::proportional(theme.font(TypeToken::Icon));
-        let r = badge::paint_source_mark(p, theme, egui::pos2(name_right, top_y), Align2::RIGHT_CENTER, src, icon, t.bg, t.fg);
+        let r = badge::paint_code_chip(p, theme, egui::pos2(name_right, top_y), Align2::RIGHT_CENTER, src, t.bg, t.fg);
         name_right = r.left() - theme.space(SpaceToken::Md);
         ui.interact(r, resp.id.with("source"), egui::Sense::hover())
             .on_hover_text(egui::RichText::new(&src.name).size(theme.font(TypeToken::BodySmall)));
@@ -1362,7 +1419,7 @@ fn channel_tile(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, id: ChannelId, cursor: b
             elided(
                 p,
                 egui::pos2(left, detail_y),
-                &now.title,
+                &crate::ui::widgets::spoiler::Spoilers::of(ctx).programme_title(now),
                 egui::FontId::proportional(theme.font(TypeToken::BodySmall)),
                 t.text_secondary,
                 right - left - bar_w - pad,
@@ -1381,6 +1438,72 @@ fn channel_tile(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, id: ChannelId, cursor: b
                 right - left,
             );
         }
+    }
+    resp
+}
+
+/// Up next's tile key: (items to go, the row it resumes) while it has some and nothing plays.
+fn up_next_key(ctx: &UiCtx<'_>) -> Option<(usize, Option<crate::model::QueueId>)> {
+    if !crate::queue::ENABLED || ctx.player.state != crate::player::PlayerState::Idle {
+        return None;
+    }
+    let s = crate::queue::ui::snapshot(ctx);
+    let n = s.pending();
+    (n > 0).then(|| (n, s.current.or(s.next)))
+}
+
+/// Enter on Up next's tile: carry on where it stopped (else start it), in the player.
+fn resume_up_next(ctx: &mut UiCtx<'_>) {
+    use crate::queue::QueueCommand;
+    let s = crate::queue::ui::snapshot(ctx);
+    let cmd = match (s.current, s.next) {
+        (Some(_), _) => QueueCommand::Resume,
+        (None, Some(n)) => QueueCommand::PlayAt(n),
+        (None, None) => return,
+    };
+    if crate::queue::ui::send(ctx, cmd) {
+        ctx.push(Route::Player);
+    }
+}
+
+/// "Resume Up next / Goldfinger · 5 more" (the row it resumes, what follows).
+fn up_next_tile(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, cursor: bool) -> egui::Response {
+    let theme = ctx.theme;
+    let t = &theme.tokens;
+    let rem = theme.rem();
+    let s = crate::queue::ui::snapshot(ctx);
+    let resumes = s.current.or(s.next).and_then(|id| s.row(id));
+    let head = if s.current.is_some() { "Resume Up next" } else { "Start Up next" };
+    let more = s.pending().saturating_sub(1);
+    let detail = match (resumes, more) {
+        (Some(r), 0) => crate::queue::ui::row_title(&r.entry),
+        (Some(r), n) => format!("{} · {n} more", crate::queue::ui::row_title(&r.entry)),
+        (None, _) => String::new(),
+    };
+    let size = egui::vec2((CHANNEL_TILE_W * 1.5 * rem).round(), (64.0 * rem).round());
+    let (rect, resp) = tile_frame(ui, theme, size, &format!("{head} · {detail}"), cursor);
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        let pad = theme.space(SpaceToken::Lg);
+        let g = p.text(
+            egui::pos2(rect.left() + pad, rect.center().y),
+            Align2::LEFT_CENTER,
+            glyphs::UP_NEXT,
+            egui::FontId::proportional(theme.font(TypeToken::IconLarge)),
+            t.accent,
+        );
+        let x = g.right() + pad;
+        let w = rect.right() - x - pad;
+        let color = if cursor { t.list_cursor_text } else { t.fg };
+        elided(p, egui::pos2(x, rect.top() + rect.height() * 0.32), head, egui::FontId::proportional(theme.font(TypeToken::Body)), color, w);
+        elided(
+            p,
+            egui::pos2(x, rect.top() + rect.height() * 0.66),
+            &detail,
+            egui::FontId::proportional(theme.font(TypeToken::BodySmall)),
+            t.text_secondary,
+            w,
+        );
     }
     resp
 }
@@ -1951,6 +2074,39 @@ mod tests {
         assert_eq!(h.state_mut().nav(), vec![NavRequest::Push(Route::MovieDetail(movies[0]))]);
     }
 
+    /// While Up next has items to go and nothing plays, "Resume Up next" leads Home (after a
+    /// restart nothing plays by itself: Enter carries on, in the player); once something plays
+    /// the tile goes.
+    #[test]
+    fn up_next_leads_home_while_nothing_plays() {
+        use crate::queue::{QueueRow, QueueSnapshot, RowState};
+        let (mut t, one) = rig();
+        testkit::seed(&mut t, |c| {
+            let s = testkit::source(c, "TV")?;
+            testkit::channels(c, s, 3).map(|_| ())
+        });
+        crate::ui::screens::queue::tests::start_engine(&t);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let rows: Vec<QueueRow> = [(1, RowState::Current), (2, RowState::Pending)]
+            .map(|(id, s)| QueueRow { entry: crate::queue::ui::tests::entry(id, s), locked: false, eta: None, note: None })
+            .to_vec();
+        let snap = QueueSnapshot { rows: rows.into(), current: Some(crate::model::QueueId(1)), interrupted: true, ..Default::default() };
+        t.services().agent.publish_queue(Arc::new(snap));
+        let mut h = harness(t, one, HomeScreen::default(), egui::vec2(1000.0, 800.0));
+        h.state_mut().enter(Route::Home);
+        h.run_steps(2);
+        assert!(has_label(&h, "Resume Up next · Movie 1 · 1 more"));
+        assert_eq!(h.state().s.rails.first().map(|r| r.kind), Some(RailKind::UpNext), "first");
+        h.state_mut().nav();
+        assert!(h.state_mut().act(Action::Activate));
+        assert_eq!(h.state_mut().nav(), vec![NavRequest::Push(Route::Player)]);
+        let mut playing = (*h.state().t.snapshot).clone();
+        playing.state = crate::player::PlayerState::Playing;
+        h.state_mut().t.snapshot = Arc::new(playing);
+        h.run_steps(2);
+        assert!(h.state().s.rails.iter().all(|r| r.kind != RailKind::UpNext), "gone while something plays");
+    }
+
     #[test]
     fn get_started_rail_continue_watching_and_the_empty_library() {
         let (mut t, one) = rig();
@@ -1996,7 +2152,7 @@ mod tests {
 
         // a library without favourites, history or VOD gets the get-started rail
         let app = h.state_mut();
-        app.t.services().player.handle().send(crate::player::PlayerCommand::Stop);
+        app.t.services().tiles.focused().send(crate::player::PlayerCommand::Stop);
         std::thread::sleep(std::time::Duration::from_millis(300));
         app.t.services().store.writer().blocking(|c| Ok(c.execute("DELETE FROM watch_progress", [])?)).unwrap();
         let mut lib = crate::store::library::load(&app.t.services().store.reader().unwrap()).unwrap();
@@ -2286,7 +2442,8 @@ mod tests {
     }
 
     /// With two playlists every card and tile says which one its item comes from — its own,
-    /// in the accessible label and readable on the meta line — and Settings ▸ Interface ▸
+    /// by name in the accessible label and by code in the corner chip, the meta line keeping
+    /// year and rating (DESIGN §13.0 "Playlist codes") — and Settings ▸ Interface ▸
     /// Playlist on cards applies at once; Auto counts eligible playlists only: enabled, and
     /// with that kind of item (DESIGN §13.0, §29).
     #[test]
@@ -2308,7 +2465,9 @@ mod tests {
         assert!(has_label(&h, "Movie 0 · Alpha") && has_label(&h, "Movie 0 · Bravo"), "same title, each card its own playlist");
         // only Bravo has channels: one playlist of channels, so channel tiles carry no mark
         assert!(has_label(&h, "Channel 1") && !has_label_containing(&h, "Channel 1 ·"), "per kind: {:?}", testkit::painted(&h));
-        assert!(testkit::painted(&h).iter().any(|s| s == "Bravo"), "the meta line names it without hovering");
+        let painted = testkit::painted(&h);
+        assert!(painted.iter().any(|s| s == "BR"), "the code chip shows it without hovering: {painted:?}");
+        assert!(!painted.iter().any(|s| s.contains("Bravo")), "no names on the cards: {painted:?}");
         let set = |h: &mut egui_kittest::Harness<'static, testkit::App<HomeScreen>>, mode: PlaylistOnCards| {
             let app = h.state_mut();
             let mut c = (*app.t.config).clone();
@@ -2318,7 +2477,7 @@ mod tests {
         };
         set(&mut h, PlaylistOnCards::Never);
         assert!(has_label(&h, "Movie 0") && !has_label_containing(&h, "· Alpha"), "Never: no playlist anywhere");
-        assert!(!testkit::painted(&h).iter().any(|s| s == "Bravo"));
+        assert!(!testkit::painted(&h).iter().any(|s| s == "BR"));
         // Auto with one of the two playlists disabled: a single playlist is noise
         set(&mut h, PlaylistOnCards::Auto);
         testkit::seed(&mut h.state_mut().t, move |c| Ok(c.execute("UPDATE source SET enabled = 0 WHERE id = ?1", [bravo])?));

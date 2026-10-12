@@ -95,7 +95,9 @@ pub fn copy_card(ui: &mut egui::Ui, theme: &Theme, width: f32, c: CopyCard<'_>) 
     let mut left = inner.left();
     if let Some(src) = c.source {
         let bg = if c.chosen { t.bg } else { t.card_bg };
-        let mark = badge::paint_source_mark(p, theme, egui::pos2(left, inner.top()), Align2::LEFT_TOP, src, font.clone(), bg, ink);
+        // the code chip, then the name (the card is about which copy: the full name stays)
+        let y = inner.top() + theme.font(TypeToken::Body) * 0.65;
+        let mark = badge::paint_code_chip(p, theme, egui::pos2(left, y), Align2::LEFT_CENTER, src, bg, ink);
         left = mark.right() + theme.space(SpaceToken::Sm);
         paint::text(p, egui::pos2(left, inner.top()), Align2::LEFT_TOP, src.name.as_str(), font, ink, (right - left).max(0.0));
     }

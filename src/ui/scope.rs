@@ -327,6 +327,7 @@ mod tests {
             category_filter: None,
             own_category_filter: false,
             language_hidden: 0,
+            code: String::new(),
         }
     }
 

@@ -83,11 +83,15 @@ pub enum KeyContext {
     Checklist,
     /// The keyboard help overlay: typing filters the shortcuts (Omarchy's keybindings menu).
     Help,
+    /// Multi-view (DESIGN §35), stacked right above `PlayerLive` / `PlayerVod` of the FOCUSED
+    /// picture (`[MultiView, PlayerLive]`, `[PlayerOsd, MultiView, PlayerLive]`, `[List,
+    /// MultiView, PlayerLive]`, `[PopOut, MultiView, PlayerLive]`); unbound keys fall through.
+    MultiView,
 }
 
 impl KeyContext {
     /// Every context, in help-overlay / documentation order.
-    pub const ALL: [KeyContext; 19] = [
+    pub const ALL: [KeyContext; 20] = [
         KeyContext::Global,
         KeyContext::List,
         KeyContext::ListFiltering,
@@ -99,6 +103,7 @@ impl KeyContext {
         KeyContext::PlayerLive,
         KeyContext::PlayerVod,
         KeyContext::PlayerOsd,
+        KeyContext::MultiView,
         KeyContext::PopOut,
         KeyContext::NumericEntry,
         KeyContext::EpgMapping,
@@ -123,13 +128,14 @@ impl KeyContext {
             KeyContext::PlayerOsd => "Player — on-screen controls",
             KeyContext::PopOut => "Pop-out player",
             KeyContext::NumericEntry => "Channel number entry",
-            KeyContext::EpgMapping => "EPG mapping",
+            KeyContext::EpgMapping => "Guide fixes",
             KeyContext::Search => "Search",
             KeyContext::Modal => "Dialogs & menus",
             KeyContext::TextInput => "Text fields",
             KeyContext::Panel => "Settings",
             KeyContext::Checklist => "Tick lists",
             KeyContext::Help => "Keyboard help",
+            KeyContext::MultiView => "Player — multi-view",
         }
     }
 }
@@ -231,6 +237,8 @@ pub enum Action {
     /// A toast's Cancel button (never bound to a key): call off an automatic switch that is
     /// about to happen (DESIGN §30.8).
     CancelSwitch(crate::model::ReminderId),
+    /// A toast's Undo for a Following rule just added (never bound to a key): delete it again.
+    UndoFollow(crate::model::FollowRuleId),
     // ---- guide
     GuidePrevDay,
     GuideNextDay,
@@ -281,6 +289,64 @@ pub enum Action {
     StopAndClose,
     Retry,
     Digit(u8),
+    // ---- Up next (DESIGN §32)
+    /// Ctrl+N: add the focused item (or programme) to the end of Up next.
+    QueueAdd,
+    /// Ctrl+Shift+N: play it next (after the current item).
+    QueuePlayNext,
+    /// Alt+6: the Up next screen.
+    GoQueue,
+    /// `u` in the player: the Up next panel.
+    QueuePanel,
+    /// `n` / `N` in the player: next / previous Up next item (multi-view: "Up next waits").
+    QueueNext,
+    QueuePrev,
+    // ---- Following (DESIGN §33)
+    /// `R` in the guide: Follow… (every time it's on).
+    FollowProgramme,
+    // ---- spoiler guard (DESIGN §34)
+    /// Ctrl+B: show / hide the guarded text of the focused item.
+    RevealSpoilers,
+    /// Ctrl+Shift+B: the spoiler-guard menu (pause, blackout, guard a topic, settings).
+    SpoilerMenu,
+    // ---- Guide fixes (DESIGN §31)
+    /// Shift+Enter: accept the proposed fix (every marked channel when some are marked).
+    AcceptFix,
+    /// Ctrl+Shift+→ / ←: time shift +1 h / −1 h.
+    ShiftLater,
+    ShiftEarlier,
+    /// Ctrl+Z (`None` = the last batch) or a toast's Undo (`Some(batch)`).
+    UndoGuideFix(Option<crate::model::GuideFixLogId>),
+    // ---- multi-view (DESIGN §35)
+    /// `w`: focus the next picture.
+    NextPicture,
+    /// Ctrl+←/→/↑/↓: focus the picture in that direction.
+    FocusPictureLeft,
+    FocusPictureRight,
+    FocusPictureUp,
+    FocusPictureDown,
+    /// `M`: the sound comes from the focused picture.
+    SoundHere,
+    /// `W`: swap the pictures' places.
+    SwapPictures,
+    /// `t`: side by side → big + small → picture in picture.
+    CycleLayout,
+    /// `q` in multi-view: close the focused picture (the other carries on).
+    ClosePicture,
+    /// Ctrl+M: watch in the other picture (opens multi-view from a list, the guide, search;
+    /// in the player, choose the channel for the other picture).
+    WatchAlongside,
+    // ---- reminders, sleep timer, news flash (B6, big-features additions)
+    /// Ctrl+Shift+T: the sleep timer menu (in N min, end of programme, after N items, end of
+    /// Up next, off).
+    SleepTimer,
+    /// Delete in the pop-out during a news flash: end it now and put back what was playing
+    /// (or, while a switch's countdown shows, call that switch off).
+    EndNewsFlash,
+    /// A menu entry, never bound to a key: "Switch to this when it starts…" / "Edit
+    /// reminder…" on a programme — the reminder sheet (notify or switch, lead, start offset,
+    /// where it opens; `reminders::ui`).
+    ReminderOptions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,6 +451,7 @@ pub static GLOBAL: &[Binding] = &[
     b(C::alt(Key::Num3), A::GoGuide, "TV guide"),
     b(C::alt(Key::Num4), A::GoMovies, "Movies"),
     b(C::alt(Key::Num5), A::GoSeries, "Series"),
+    b(C::alt(Key::Num6), A::GoQueue, "Up next"),
     b(C::ctrl(Key::Comma), A::GoSettings, "Settings"),
     b(C::alt(Key::Num0), A::GoSettings, "Settings"),
     b(C::alt(Key::ArrowLeft), A::Back, "Back"),
@@ -398,6 +465,10 @@ pub static GLOBAL: &[Binding] = &[
     b(C::key(Key::F5), A::RefreshSource, "Refresh playlists & guide"),
     b(C::ctrl(Key::J), A::ShowJobs, "Show background tasks"),
     b(C::key(Key::F1), A::ToggleHelp, "Keyboard help"),
+    // Ctrl chords, so they work in filtered lists and text fields too
+    b(C::ctrl(Key::B), A::RevealSpoilers, "Show / hide spoilers of the focused item"),
+    b(C::ctrl_shift(Key::B), A::SpoilerMenu, "Spoiler guard… (pause, I'll watch it later, guard a topic)"),
+    b(C::ctrl_shift(Key::T), A::SleepTimer, "Sleep timer…"),
     // not Ctrl+0 (egui's zoom reset) nor Alt+[ / Alt+] (AltGr chords on German / French keyboards)
     b(C::alt(Key::P), A::PlaylistPicker, "Choose the playlist shown (Movies, Series, Live TV, guide)"),
     b(C::ctrl(Key::PageDown), A::NextPlaylist, "Next / previous playlist (Movies, Series, Live TV, guide)"),
@@ -417,9 +488,13 @@ pub static ITEM_ACTIONS: &[Binding] = &[
     b(C::ctrl(Key::S), A::SortMenu, "Sort & view options…"),
     b(C::ctrl(Key::G), A::OpenInGuide, "Show in TV guide"),
     b(C::ctrl(Key::I), A::ShowDetails, "Details / edit information"),
-    b(C::ctrl(Key::E), A::AssignEpg, "Assign EPG channel"),
+    b(C::ctrl(Key::E), A::AssignEpg, "Assign guide channel"),
     b(C::ctrl(Key::W), A::MarkWatched, "Mark watched / unwatched"),
     b(C::key(Key::Delete), A::Remove, "Remove (from list / cancel task / forget)"),
+    // not Global: a text field must not pass them on (Ctrl chords reach Global from there)
+    b(C::ctrl(Key::N), A::QueueAdd, "Add to Up next"),
+    b(C::ctrl_shift(Key::N), A::QueuePlayNext, "Play next (Up next)"),
+    b(C::ctrl(Key::M), A::WatchAlongside, "Watch alongside"),
     b(C::shift(Key::F10), A::ContextMenu, "Context menu"),
     b(C::ctrl(Key::Enter), A::ContextMenu, "Context menu"),
 ];
@@ -443,8 +518,8 @@ pub static LIST: &[Binding] = &[
     b(C::ch('?'), A::ToggleHelp, "Keyboard help"),
     // the Text event, never Key::Space: the space is then never also typed into the filter
     // (and a leading space doesn't filter anyway)
-    b(C::ch(' '), A::ToggleMark, "Mark group (Ctrl+H then hides all marked)"),
-    b(C::key(Key::Insert), A::ToggleMark, "Mark group (Ctrl+H then hides all marked)"),
+    b(C::ch(' '), A::ToggleMark, "Mark (groups: Ctrl+H then hides all marked)"),
+    b(C::key(Key::Insert), A::ToggleMark, "Mark (groups: Ctrl+H then hides all marked)"),
     // Live TV: the same channel in another playlist ("Also on", DESIGN §29.16)
     b(C::ctrl(Key::O), A::PlayFrom, "Play from another playlist (Also on)…"),
     // any other printable key starts filtering (FilterInput)
@@ -467,7 +542,7 @@ pub static LIST_FILTERING: &[Binding] = &[
     b(C::key(Key::Tab), A::FocusNext, "Next / previous pane"),
     b(C::shift(Key::Tab), A::FocusPrev, "Next / previous pane"),
     // Space types here (filters have spaces); Insert still marks
-    b(C::key(Key::Insert), A::ToggleMark, "Mark group (Ctrl+H then hides all marked)"),
+    b(C::key(Key::Insert), A::ToggleMark, "Mark (groups: Ctrl+H then hides all marked)"),
     b(C::ctrl_shift(Key::H), A::HideShown, "Hide the groups with the words typed"),
     b(C::ctrl(Key::O), A::PlayFrom, "Play from another playlist (Also on)…"),
     // printable keys → FilterInput
@@ -562,6 +637,11 @@ pub static GUIDE: &[Binding] = &[
     b(C::shift(Key::Enter), A::GuideWatch, "Watch channel"),
     b(C::ch('c'), A::GuideCatchup, "Catch up (past programme)"),
     b(C::ch('r'), A::GuideRemind, "Remind me / cancel reminder"),
+    b(C::ch('R'), A::FollowProgramme, "Follow… (remind me every time it's on)"),
+    b(C::ctrl(Key::W), A::MarkWatched, "Mark seen (lifts the spoiler guard)"),
+    b(C::ctrl(Key::N), A::QueueAdd, "Add to Up next"),
+    b(C::ctrl_shift(Key::N), A::QueuePlayNext, "Play next (Up next)"),
+    b(C::ctrl(Key::M), A::WatchAlongside, "Watch alongside"),
     b(C::ch('f'), A::GuideCategory, "Collection: favourites lists, groups, all"),
     b(C::ch('0'), A::Digit(0), "Jump to channel number"),
     b(C::ch('1'), A::Digit(1), "Jump to channel number"),
@@ -575,7 +655,7 @@ pub static GUIDE: &[Binding] = &[
     b(C::ch('9'), A::Digit(9), "Jump to channel number"),
     b(C::ctrl(Key::F), A::ToggleFavourite, "Add channel to Favourites"),
     b(C::ctrl_shift(Key::F), A::AddToList, "Favourites lists… (add, new list)"),
-    b(C::ctrl(Key::E), A::AssignEpg, "Assign EPG channel"),
+    b(C::ctrl(Key::E), A::AssignEpg, "Assign guide channel"),
     b(C::ctrl(Key::I), A::ShowDetails, "Edit channel information"),
     b(C::key(Key::F2), A::Rename, "Rename channel"),
     b(C::ctrl(Key::H), A::ToggleHidden, "Hide channel"),
@@ -615,6 +695,10 @@ pub static PLAYER_COMMON: &[Binding] = &[
     b(C::ch('o'), A::TogglePopOut, "Pop out: small window on every workspace (Hyprland)"),
     b(C::ch('q'), A::StopAndClose, "Stop and close"),
     b(C::ch('r'), A::Retry, "Retry (after an error)"),
+    b(C::ch('u'), A::QueuePanel, "Up next"),
+    b(C::ch('n'), A::QueueNext, "Next / previous in Up next"),
+    b(C::ch('N'), A::QueuePrev, "Next / previous in Up next"),
+    b(C::ctrl(Key::M), A::WatchAlongside, "Watch alongside… (choose the channel)"),
     b(C::ctrl(Key::F), A::ToggleFavourite, "Add to / remove from Favourites"),
     b(C::key(Key::Escape), A::Back, "Back (hide banner, then leave; keeps playing in the mini player)"),
     b(C::ch('/'), A::OpenSearch, "Search everything"),
@@ -679,6 +763,22 @@ pub static POP_OUT: &[Binding] = &[
     b(C::key(Key::Escape), A::TogglePopOut, "Back to the full window (also double-click)"),
     b(C::ch('o'), A::TogglePopOut, "Back to the full window (also double-click)"),
     b(C::ch('f'), A::ToggleWindowFullscreen, "Back to the full window, fullscreen"),
+    b(C::key(Key::Delete), A::EndNewsFlash, "Cancel the coming switch / end the news flash (back to what you were watching)"),
+];
+
+/// Multi-view (DESIGN §35), above the focused picture's player context. `q` shadows "Stop and
+/// close" only here; Esc keeps its ladder (it never closes a picture).
+pub static MULTI_VIEW: &[Binding] = &[
+    b(C::ch('w'), A::NextPicture, "Next picture"),
+    b(C::ctrl(Key::ArrowLeft), A::FocusPictureLeft, "Picture in that direction"),
+    b(C::ctrl(Key::ArrowRight), A::FocusPictureRight, "Picture in that direction"),
+    b(C::ctrl(Key::ArrowUp), A::FocusPictureUp, "Picture in that direction"),
+    b(C::ctrl(Key::ArrowDown), A::FocusPictureDown, "Picture in that direction"),
+    b(C::ch('M'), A::SoundHere, "Sound from this picture"),
+    b(C::ch('W'), A::SwapPictures, "Swap the pictures' places"),
+    b(C::ch('t'), A::CycleLayout, "Layout: side by side, big + small, picture in picture"),
+    b(C::ch('q'), A::ClosePicture, "Close this picture (the other carries on)"),
+    b(C::ctrl(Key::M), A::WatchAlongside, "Watch alongside… (choose the channel)"),
 ];
 
 pub static NUMERIC_ENTRY: &[Binding] = &[
@@ -698,8 +798,16 @@ pub static NUMERIC_ENTRY: &[Binding] = &[
 ];
 
 /// Stacked above `List`/`ListFiltering` on the EPG mapping screen.
-pub static EPG_MAPPING: &[Binding] =
-    &[b(C::key(Key::Enter), A::Activate, "Assign the highlighted EPG channel"), b(C::key(Key::Delete), A::ClearEpg, "Clear the manual assignment")];
+pub static EPG_MAPPING: &[Binding] = &[
+    b(C::key(Key::Enter), A::Activate, "Issues: show its guide channels · Guide channels: assign"),
+    b(C::key(Key::Delete), A::ClearEpg, "Reset to automatic (guide channel and time shift)"),
+    // Guide fixes (DESIGN §31); Shift+Enter shadows the list's "Play fullscreen" here only
+    b(C::shift(Key::Enter), A::AcceptFix, "Accept the proposed fix (every marked channel)"),
+    b(C::ctrl(Key::A), A::MarkAll, "Mark all shown / none"),
+    b(C::ctrl(Key::Z), A::UndoGuideFix(None), "Undo the last guide fix"),
+    b(C::ctrl_shift(Key::ArrowRight), A::ShiftLater, "Time shift +1 h / −1 h"),
+    b(C::ctrl_shift(Key::ArrowLeft), A::ShiftEarlier, "Time shift +1 h / −1 h"),
+];
 
 pub static SEARCH: &[Binding] = &[
     b(C::key(Key::ArrowUp), A::Up, "Move"),
@@ -726,8 +834,11 @@ pub static SEARCH_ITEM_ACTIONS: &[Binding] = &[
     b(C::ctrl(Key::L), A::ToggleLock, "Lock with PIN / unlock"),
     b(C::ctrl(Key::G), A::OpenInGuide, "Show in TV guide"),
     b(C::ctrl(Key::I), A::ShowDetails, "Details / edit information"),
-    b(C::ctrl(Key::E), A::AssignEpg, "Assign EPG channel"),
+    b(C::ctrl(Key::E), A::AssignEpg, "Assign guide channel"),
     b(C::ctrl(Key::W), A::MarkWatched, "Mark watched / unwatched"),
+    b(C::ctrl(Key::N), A::QueueAdd, "Add to Up next"),
+    b(C::ctrl_shift(Key::N), A::QueuePlayNext, "Play next (Up next)"),
+    b(C::ctrl(Key::M), A::WatchAlongside, "Watch alongside"),
     b(C::shift(Key::F10), A::ContextMenu, "List these shortcuts"),
     b(C::ctrl(Key::Enter), A::ContextMenu, "List these shortcuts"),
 ];
@@ -789,10 +900,10 @@ pub static PANEL: &[Binding] = &[
     b(C::ch('L'), A::Increase, "Increase / next option"),
     b(C::shift(Key::ArrowLeft), A::Decrease, "Decrease / previous option"),
     b(C::ch('H'), A::Decrease, "Decrease / previous option"),
-    b(C::alt(Key::ArrowUp), A::MoveUp, "Move up / down (reorder: EPG priority, playlists, lists)"),
-    b(C::ch('K'), A::MoveUp, "Move up / down (reorder: EPG priority, playlists, lists)"),
-    b(C::alt(Key::ArrowDown), A::MoveDown, "Move up / down (reorder: EPG priority, playlists, lists)"),
-    b(C::ch('J'), A::MoveDown, "Move up / down (reorder: EPG priority, playlists, lists)"),
+    b(C::alt(Key::ArrowUp), A::MoveUp, "Move up / down (reorder: guide priority, playlists, lists)"),
+    b(C::ch('K'), A::MoveUp, "Move up / down (reorder: guide priority, playlists, lists)"),
+    b(C::alt(Key::ArrowDown), A::MoveDown, "Move up / down (reorder: guide priority, playlists, lists)"),
+    b(C::ch('J'), A::MoveDown, "Move up / down (reorder: guide priority, playlists, lists)"),
     b(C::key(Key::Tab), A::FocusNext, "Next / previous section"),
     b(C::shift(Key::Tab), A::FocusPrev, "Next / previous section"),
     b(C::key(Key::Enter), A::Activate, "Toggle / open"),
@@ -843,6 +954,7 @@ pub fn tables(ctx: KeyContext) -> Vec<&'static [Binding]> {
         KeyContext::Panel => vec![PANEL],
         KeyContext::Checklist => vec![CHECKLIST],
         KeyContext::Help => vec![HELP],
+        KeyContext::MultiView => vec![MULTI_VIEW],
     }
 }
 
@@ -926,10 +1038,34 @@ fn resolve_inner(stack: &[KeyContext], ev: &egui::Event) -> Option<Action> {
 }
 
 /// Rows for the help overlay of one context: (merged key labels, description).
+/// Whether `a` belongs to a feature that is on: the batch features' keys stay bound (so the
+/// no-duplicate tests cover them) but are left out of the help overlay and the hint line until
+/// their feature's `ENABLED` flips (base-B; each track flips only its flag).
+pub fn feature_on(a: Action) -> bool {
+    match a {
+        A::QueueAdd | A::QueuePlayNext | A::GoQueue | A::QueuePanel | A::QueueNext | A::QueuePrev => crate::queue::ENABLED,
+        A::FollowProgramme | A::UndoFollow(_) => crate::follow::ENABLED,
+        A::RevealSpoilers | A::SpoilerMenu => crate::spoiler::ENABLED,
+        A::AcceptFix | A::ShiftLater | A::ShiftEarlier | A::UndoGuideFix(_) => crate::guide_fix::ENABLED,
+        A::NextPicture
+        | A::FocusPictureLeft
+        | A::FocusPictureRight
+        | A::FocusPictureUp
+        | A::FocusPictureDown
+        | A::SoundHere
+        | A::SwapPictures
+        | A::CycleLayout
+        | A::ClosePicture
+        | A::WatchAlongside => crate::ui::multiview::ENABLED,
+        A::SleepTimer | A::EndNewsFlash | A::ReminderOptions => crate::reminders::ENABLED,
+        _ => true,
+    }
+}
+
 pub fn help_rows(ctx: KeyContext) -> Vec<(String, &'static str)> {
     let mut rows: Vec<(String, &'static str)> = Vec::new();
     for table in tables(ctx) {
-        for bd in table.iter() {
+        for bd in table.iter().filter(|bd| feature_on(bd.action)) {
             let label = bd.chord.label();
             if let Some(r) = rows.iter_mut().find(|r| r.1 == bd.help) {
                 if !r.0.split(" / ").any(|l| l == label) {
@@ -965,16 +1101,26 @@ const HINTS: &[(KeyContext, &[(Action, &str)])] = &[
     (KeyContext::Detail, &[(A::Activate, "play"), (A::TabNext, "season"), (A::MarkWatched, "watched"), (A::Back, "back")]),
     (
         KeyContext::Guide,
-        &[(A::Activate, "details"), (A::GuideWatch, "watch"), (A::GuideRemind, "remind"), (A::GuideNow, "now"), (A::ToggleHelp, "help")],
+        &[(A::Activate, "details"), (A::GuideWatch, "watch"), (A::GuideRemind, "remind"), (A::FollowProgramme, "follow"), (A::ToggleHelp, "help")],
     ),
     (KeyContext::Panel, &[(A::Activate, "toggle"), (A::Right, "change"), (A::MoveUp, "reorder"), (A::ContextMenu, "more"), (A::ToggleHelp, "help")]),
-    (KeyContext::EpgMapping, &[(A::Activate, "assign"), (A::ClearEpg, "clear")]),
+    (KeyContext::EpgMapping, &[(A::Activate, "pick"), (A::ClearEpg, "reset")]),
     (KeyContext::NumericEntry, &[(A::Activate, "go"), (A::FilterBackspace, "delete"), (A::Back, "cancel")]),
     (KeyContext::Search, &[(A::Activate, "open"), (A::ActivateAlt, "details"), (A::FocusNext, "section"), (A::Back, "close")]),
     (KeyContext::TextInput, &[(A::Activate, "confirm"), (A::FocusNext, "next field"), (A::Back, "leave")]),
     (KeyContext::Modal, &[(A::Activate, "confirm"), (A::Back, "cancel")]),
     (KeyContext::Checklist, &[(A::ToggleMark, "tick"), (A::MarkAll, "all/none"), (A::MarkDefaults, "my country"), (A::Activate, "save")]),
     (KeyContext::Help, &[(A::Back, "clear / close"), (A::FilterClear, "clear filter")]),
+    (
+        KeyContext::MultiView,
+        &[
+            (A::NextPicture, "next picture"),
+            (A::SoundHere, "sound here"),
+            (A::SwapPictures, "swap"),
+            (A::CycleLayout, "layout"),
+            (A::ClosePicture, "close picture"),
+        ],
+    ),
 ];
 
 /// Hints of a filtering list inside a dialog or menu (Esc clears the filter there).
@@ -995,12 +1141,17 @@ pub fn hints(stack: &[KeyContext]) -> Vec<(Action, KeyChord, &'static str)> {
             },
         };
         let t = tables(*ctx);
-        return items
+        let v: Vec<_> = items
             .iter()
+            .filter(|(a, _)| feature_on(*a))
             .filter_map(|(a, verb)| {
                 t.iter().chain(std::iter::once(&GLOBAL)).find_map(|tb| tb.iter().find(|bd| bd.action == *a)).map(|bd| (*a, bd.chord, *verb))
             })
             .collect();
+        // a context whose hints are all of a feature that is off (multi-view) gives way
+        if !v.is_empty() {
+            return v;
+        }
     }
     Vec::new()
 }
@@ -1174,7 +1325,9 @@ mod tests {
     fn every_hint_verb_finds_its_key() {
         for (ctx, items) in HINTS {
             let line = hint_line(&[*ctx]);
-            assert_eq!(line.split(" · ").count(), items.len(), "{ctx:?}: {line}");
+            // a feature that is off leaves its verbs out (a context of only those gives way)
+            let on = items.iter().filter(|(a, _)| feature_on(*a)).count();
+            assert_eq!(if line.is_empty() { 0 } else { line.split(" · ").count() }, on, "{ctx:?}: {line}");
         }
         assert_eq!(hint_line(&[K::TextInput, K::Modal]), "Enter confirm · Tab next field · Esc leave");
         assert_eq!(hint_line(&[K::PlayerLive]), "", "no hint line in the player (no status bar)");
@@ -1253,7 +1406,9 @@ mod tests {
     fn every_context_has_a_title_and_rows() {
         for c in KeyContext::ALL {
             assert!(!c.title().is_empty());
-            assert!(!help_rows(c).is_empty(), "{c:?}");
+            // a context of a feature that is off (multi-view) lists nothing yet
+            let on = tables(c).iter().any(|t| t.iter().any(|b| feature_on(b.action)));
+            assert_eq!(help_rows(c).is_empty(), !on, "{c:?}");
         }
     }
 }

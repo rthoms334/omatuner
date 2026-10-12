@@ -88,4 +88,9 @@ pub enum PlayOrigin {
     Mpris,
     Reminder,
     Cli,
+    /// Up next advanced to (or was asked to play) a queue item (DESIGN §32): the queue owns
+    /// this playback while `PlayerSnapshot::origin` says so.
+    Queue,
+    /// A picture of multi-view (DESIGN §35); live preview autoplay never replaces it.
+    MultiView,
 }

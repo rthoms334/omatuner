@@ -623,7 +623,24 @@ fn xtream_catchup_applies_shift_offset_and_caps_running_programmes() {
     let p = resolve(&reader(&s), &cfg, &catchup(ch, T20 + HOUR, T20 + 2 * HOUR), false, now).expect("shifted");
     assert!(url_of(&p).ends_with("/60/2026-10-09:21-00/1234.m3u8"), "tvg-shift converts back to EPG time: {}", p.url.redacted());
 
-    // per-channel user offset (Ctrl+I) +2 min
+    // the playlist's catch-up offset (Guide fixes) applies to a channel without its own
+    w(&s, move |c| sources::set_guide_rules(c, src, &GuideRules { catchup_offset_s: Some(300), ..Default::default() }));
+    let p = resolve(&reader(&s), &cfg, &catchup(ch, T20 + HOUR, T20 + 2 * HOUR), false, now).expect("playlist offset");
+    assert!(url_of(&p).ends_with("/60/2026-10-09:21-05/1234.m3u8"), "{}", p.url.redacted());
+
+    // a user time shift means the stream airs later: its archive is at the shown time, only
+    // the provider's tvg-shift converts back (DESIGN §31 §4.6)
+    let shift = FixChange {
+        channel: Some(ItemRef { source: src, kind: ItemKind::Channel, key: ItemKey("xt:live:1234".into()) }),
+        shift_min: Some(Some(120)),
+        ..Default::default()
+    };
+    let opts = tuner::store::guide_fix::GuideOpts::default();
+    w(&s, move |c| tuner::store::guide_fix::apply(c, FixActor::You, "t", &Proposal { changes: vec![shift], ..Default::default() }, &opts, now));
+    let p = resolve(&reader(&s), &cfg, &catchup(ch, T20 + HOUR, T20 + 2 * HOUR), false, now).expect("user shift");
+    assert!(url_of(&p).ends_with("/60/2026-10-09:21-05/1234.m3u8"), "{}", p.url.redacted());
+
+    // per-channel user offset (Ctrl+I) +2 min, over the playlist's
     set_override(
         &s,
         ItemRef { source: src, kind: ItemKind::Channel, key: ItemKey("xt:live:1234".into()) },
@@ -631,13 +648,21 @@ fn xtream_catchup_applies_shift_offset_and_caps_running_programmes() {
     );
     let p = resolve(&reader(&s), &cfg, &catchup(ch, T20 + HOUR, T20 + 2 * HOUR), false, now).expect("offset");
     assert!(url_of(&p).ends_with("/60/2026-10-09:21-02/1234.m3u8"), "{}", p.url.redacted());
-
     assert_eq!(p.duration_hint, Some(3600.0));
+
+    // an own offset of 0 (calibrated with Check ▶) wins over the playlist's +5 min
+    set_override(
+        &s,
+        ItemRef { source: src, kind: ItemKind::Channel, key: ItemKey("xt:live:1234".into()) },
+        ItemOverride { catchup_offset_s: Some(0), ..Default::default() },
+    );
+    let p = resolve(&reader(&s), &cfg, &catchup(ch, T20 + HOUR, T20 + 2 * HOUR), false, now).expect("own 0");
+    assert!(url_of(&p).ends_with("/60/2026-10-09:21-00/1234.m3u8"), "{}", p.url.redacted());
 
     // on air on the "+1" channel right now, but complete in the original channel's archive
     let now = T20 + HOUR + 30 * 60;
     let p = resolve(&reader(&s), &cfg, &catchup(ch, T20 + HOUR, T20 + 2 * HOUR), false, now).expect("+1 running");
-    assert!(url_of(&p).contains("/60/2026-10-09:21-02/"), "{}", p.url.redacted());
+    assert!(url_of(&p).contains("/60/2026-10-09:21-00/"), "{}", p.url.redacted());
     assert_eq!(p.duration_hint, Some(3600.0));
 }
 

@@ -15,7 +15,13 @@
 //! [`FavIndex::apply_toggle`] right after submitting a write, and replaces it with
 //! [`load_favs`] on `DataScope::Favourites` (event-driven, ≤ 5 ms, never per frame).
 //!
-//! Budget: 100k channels + 50k movies + 20k series → < 400 ms build, < 60 MB RAM.
+//! Budget: 100k channels + 50k movies + 20k series → < 400 ms build, < 60 MB RAM; a two-playlist
+//! catalogue of 80k channels, 300k movies and 40k series with a category rule → < 550 ms
+//! (`benches/startup.rs`). The item tables are read in id order, without joins or sorts in SQL
+//! (an `ORDER BY` carried every column of every row through SQLite's sorter, hidden rows too),
+//! merged with their group links (`Links`) and the user's overrides by lookup, and put in
+//! display order in memory; a hidden title is dropped before the rest of its row is read.
+//! [`load_profiled`] times the steps; a build over a second logs them.
 //! Hidden items are excluded from `members`/`collection` but kept in `channels` (Settings ▸
 //! Hidden lists them); locked items are flagged, not removed (the UI asks for the PIN).
 //!
@@ -70,6 +76,10 @@ pub struct SourceMeta {
     /// Movies and series of the source that "Also hide titles in other languages" left out of
     /// this snapshot (DESIGN §28.12).
     pub language_hidden: u32,
+    /// Its short code on cards and rows ("NW", DESIGN §13.0): the user's
+    /// (`SourceSettings::code`) or derived from the name, unique among the playlists; resolved
+    /// once per build (`sources::codes::assign`).
+    pub code: String,
 }
 
 impl SourceMeta {
@@ -746,27 +756,34 @@ fn load_sources(conn: &Connection) -> Result<Vec<SourceMeta>> {
     let rows = stmt.query_map([], |r| {
         let kind: String = r.get(4)?;
         let settings = from_json_opt::<SourceSettings>(r.get(9)?);
-        Ok(SourceMeta {
-            id: r.get(0)?,
-            name: r.get(1)?,
-            icon: r.get(2)?,
-            color: enum_parse(&r.get::<_, String>(3)?).unwrap_or_default(),
-            kind: enum_parse(&kind).unwrap_or(SourceKind::M3uUrl),
-            enabled: r.get(5)?,
-            last_refresh: r.get(6)?,
-            has_vod: r.get(7)?,
-            has_series: r.get(8)?,
-            has_live: r.get(10)?,
-            in_all: settings.as_ref().and_then(|st| st.in_all).unwrap_or(true),
-            own_category_filter: settings.as_ref().is_some_and(|st| st.has_own_category_filter()),
-            language_hidden: 0,
-            category_filter: match &settings {
-                Some(st) => st.effective_category_filter(shared.as_ref()).cloned(),
-                None => shared.clone(),
+        let user_code = settings.as_ref().and_then(|st| st.code.clone());
+        Ok((
+            user_code,
+            SourceMeta {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                icon: r.get(2)?,
+                color: enum_parse(&r.get::<_, String>(3)?).unwrap_or_default(),
+                kind: enum_parse(&kind).unwrap_or(SourceKind::M3uUrl),
+                enabled: r.get(5)?,
+                last_refresh: r.get(6)?,
+                has_vod: r.get(7)?,
+                has_series: r.get(8)?,
+                has_live: r.get(10)?,
+                in_all: settings.as_ref().and_then(|st| st.in_all).unwrap_or(true),
+                own_category_filter: settings.as_ref().is_some_and(|st| st.has_own_category_filter()),
+                language_hidden: 0,
+                category_filter: match &settings {
+                    Some(st) => st.effective_category_filter(shared.as_ref()).cloned(),
+                    None => shared.clone(),
+                },
+                code: String::new(),
             },
-        })
+        ))
     })?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+    let rows: Vec<(Option<String>, SourceMeta)> = rows.collect::<rusqlite::Result<_>>()?;
+    let codes = crate::sources::codes::assign(rows.iter().map(|(c, s)| (s.id, s.name.as_str(), c.as_deref())));
+    Ok(rows.into_iter().zip(codes).map(|((_, s), code)| SourceMeta { code, ..s }).collect())
 }
 
 /// Groups of every kind of enabled sources, in display order per kind, with each source's
@@ -847,18 +864,133 @@ fn group_flags(groups: &[Group]) -> HashMap<GroupId, GroupFlags> {
     groups.iter().enumerate().map(|(i, g)| (g.id, GroupFlags { pos: i, hidden: g.hidden, locked: g.locked, explicit: g.explicit })).collect()
 }
 
-/// Group memberships `item id → [(group, primary)]` from a link table, restricted to groups
-/// in `flags` (enabled sources).
-fn load_memberships(conn: &Connection, sql: &str, flags: &HashMap<GroupId, GroupFlags>) -> Result<HashMap<i64, Vec<(GroupId, bool)>>> {
-    let mut stmt = conn.prepare_cached(sql)?;
-    let mut out: HashMap<i64, Vec<(GroupId, bool)>> = HashMap::new();
-    for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, GroupId>(1)?, r.get::<_, bool>(2)?)))? {
-        let (item, g, primary) = row?;
-        if flags.contains_key(&g) {
-            out.entry(item).or_default().push((g, primary));
+/// One group membership row, with what the item inherits from the group.
+#[derive(Debug, Clone, Copy)]
+struct Link {
+    item: i64,
+    group: GroupId,
+    primary: bool,
+    flags: GroupFlags,
+}
+
+/// The group memberships of a link table (groups of enabled sources only), sorted by item id
+/// and handed out in that order ([`Links::of`]): the item tables are read in id order too, so
+/// the two merge without a map from item to groups (300k small vectors and a hash per item at
+/// the catalogue sizes of DESIGN §28.12).
+struct Links {
+    rows: Vec<Link>,
+    at: usize,
+}
+
+impl Links {
+    /// `sql` selects (item id, group id, primary).
+    fn load(conn: &Connection, sql: &str, flags: &HashMap<GroupId, GroupFlags>) -> Result<Links> {
+        let mut stmt = conn.prepare_cached(sql)?;
+        let mut rows = Vec::new();
+        let mut q = stmt.query([])?;
+        while let Some(r) = q.next()? {
+            let group: GroupId = r.get(1)?;
+            if let Some(f) = flags.get(&group) {
+                rows.push(Link { item: r.get(0)?, group, primary: r.get(2)?, flags: *f });
+            }
         }
+        rows.sort_unstable_by_key(|l| l.item);
+        Ok(Links { rows, at: 0 })
     }
-    Ok(out)
+
+    /// The memberships of `item`; items must be asked for in ascending id order (the ones
+    /// between are skipped).
+    fn of(&mut self, item: i64) -> &[Link] {
+        while self.rows.get(self.at).is_some_and(|l| l.item < item) {
+            self.at += 1;
+        }
+        let start = self.at;
+        while self.rows.get(self.at).is_some_and(|l| l.item == item) {
+            self.at += 1;
+        }
+        &self.rows[start..self.at]
+    }
+}
+
+/// The user's overrides of one kind of movies or series (`item_override`; few rows) by
+/// playlist and key, looked up per item instead of a join per row.
+#[derive(Default)]
+struct Overrides(HashMap<SourceId, HashMap<String, ItemOverride>>);
+
+struct ItemOverride {
+    rename: Option<String>,
+    user_order: Option<i64>,
+    hidden: bool,
+    locked: bool,
+}
+
+impl Overrides {
+    fn load(conn: &Connection, kind: &str) -> Result<Overrides> {
+        let mut stmt = conn.prepare_cached("SELECT source_id, item_key, rename, user_order, hidden, locked FROM item_override WHERE kind = ?1")?;
+        let mut out = Overrides::default();
+        let mut q = stmt.query([kind])?;
+        while let Some(r) = q.next()? {
+            let o = ItemOverride { rename: r.get(2)?, user_order: r.get(3)?, hidden: r.get(4)?, locked: r.get(5)? };
+            out.0.entry(r.get(0)?).or_default().insert(r.get(1)?, o);
+        }
+        Ok(out)
+    }
+
+    fn get(&self, source: SourceId, key: &str) -> Option<&ItemOverride> {
+        self.0.get(&source)?.get(key)
+    }
+}
+
+/// Display position of each enabled playlist (`load_sources` order: `sort_index`, id); the
+/// item tables are read in id order and sorted in memory ([`display_order`]).
+struct SourceOrder(Vec<SourceId>);
+
+impl SourceOrder {
+    fn of(sources: &[SourceMeta]) -> SourceOrder {
+        SourceOrder(sources.iter().filter(|s| s.enabled).map(|s| s.id).collect())
+    }
+    /// `None`: the playlist is disabled (its items are left out).
+    fn pos(&self, source: SourceId) -> Option<u32> {
+        self.0.iter().position(|s| *s == source).map(|p| p as u32)
+    }
+}
+
+/// Display order of an item: playlist, the user's order (placed items first), provider order,
+/// id — what the `ORDER BY` of the item queries said before they were read in id order.
+type OrderKey = (u32, bool, i64, i64, i64);
+
+fn order_key(source_pos: u32, user_order: Option<i64>, provider_order: i64, id: i64) -> OrderKey {
+    (source_pos, user_order.is_none(), user_order.unwrap_or(0), provider_order, id)
+}
+
+/// The permutation that puts `keys` in order; `None` when they already are (an import writes
+/// rows in provider order, so a catalogue without user ordering usually is).
+fn display_order(keys: &[OrderKey]) -> Option<Vec<u32>> {
+    if keys.is_sorted() {
+        return None;
+    }
+    let mut order: Vec<u32> = (0..keys.len() as u32).collect();
+    order.sort_unstable_by_key(|i| keys[*i as usize]);
+    Some(order)
+}
+
+/// `v` in `order` (a permutation of its indices).
+fn permute<T>(v: Vec<T>, order: &[u32]) -> Vec<T> {
+    let mut slots: Vec<Option<T>> = v.into_iter().map(Some).collect();
+    order.iter().filter_map(|i| slots[*i as usize].take()).collect()
+}
+
+/// A TEXT column borrowed from the row (no allocation).
+fn text<'r>(r: &'r rusqlite::Row<'_>, i: usize) -> rusqlite::Result<&'r str> {
+    r.get_ref(i)?.as_str().map_err(|e| rusqlite::Error::FromSqlConversionFailure(i, rusqlite::types::Type::Text, Box::new(e)))
+}
+
+/// An optional TEXT column as a shared string (one allocation).
+fn arc_text(r: &rusqlite::Row<'_>, i: usize) -> rusqlite::Result<Option<Arc<str>>> {
+    Ok(match r.get_ref(i)? {
+        rusqlite::types::ValueRef::Text(t) => Some(Arc::from(String::from_utf8_lossy(t).as_ref())),
+        _ => None,
+    })
 }
 
 /// What an item inherits from its groups.
@@ -882,93 +1014,97 @@ impl Inherited {
     }
 }
 
-fn effective_groups(links: Option<&Vec<(GroupId, bool)>>, flags: &HashMap<GroupId, GroupFlags>) -> Inherited {
-    let Some(links) = links else {
-        return Inherited { groups: Vec::new(), all_hidden: false, any_locked: false, any_explicit: false, any_cleared: false };
+fn effective_groups(links: &[Link]) -> Inherited {
+    let groups = match links {
+        [] => Vec::new(),
+        [one] => vec![one.group],
+        _ => {
+            let mut v: Vec<&Link> = links.iter().collect();
+            v.sort_by_key(|l| (!l.primary, l.flags.pos));
+            v.into_iter().map(|l| l.group).collect()
+        }
     };
-    let mut v: Vec<&(GroupId, bool)> = links.iter().collect();
-    v.sort_by_key(|(g, primary)| (!*primary, flags.get(g).map_or(usize::MAX, |f| f.pos)));
-    let flag = |g: &GroupId| flags.get(g).copied();
     Inherited {
-        all_hidden: !v.is_empty() && v.iter().all(|(g, _)| flag(g).is_some_and(|f| f.hidden)),
-        any_locked: v.iter().any(|(g, _)| flag(g).is_some_and(|f| f.locked)),
-        any_explicit: v.iter().any(|(g, _)| flag(g).is_some_and(|f| f.explicit.is_explicit())),
-        any_cleared: v.iter().any(|(g, _)| flag(g).is_some_and(|f| f.explicit == Explicit::Cleared)),
-        groups: v.into_iter().map(|(g, _)| *g).collect(),
+        all_hidden: !links.is_empty() && links.iter().all(|l| l.flags.hidden),
+        any_locked: links.iter().any(|l| l.flags.locked),
+        any_explicit: links.iter().any(|l| l.flags.explicit.is_explicit()),
+        any_cleared: links.iter().any(|l| l.flags.explicit == Explicit::Cleared),
+        groups,
     }
 }
 
-fn load_live(conn: &Connection, groups: Vec<Group>, x: &mut ExplicitIndex) -> Result<LiveIndex> {
+fn load_live(conn: &Connection, groups: Vec<Group>, order: &SourceOrder, x: &mut ExplicitIndex) -> Result<LiveIndex> {
     let flags = group_flags(&groups);
+    // `tvg_shift_min` is the EFFECTIVE shift (B8, DESIGN §31): the user's override, else the
+    // Guide fixes rule row's, else the provider's tvg-shift — every reader of
+    // `ChannelSummary::tvg_shift_min` / `ProgrammeSlim::shifted` gets it; only the catch-up
+    // request uses the provider's alone (`sources::resolve`).
     let trust = crate::store::live::label_trust(conn)?;
-    let links = load_memberships(conn, "SELECT cg.channel_id, cg.group_id, cg.is_primary FROM channel_group cg", &flags)?;
+    let mut links = Links::load(conn, "SELECT cg.channel_id, cg.group_id, cg.is_primary FROM channel_group cg", &flags)?;
+    // read in id order (no sort in SQL: it carried every column of every row), put in display
+    // order below; channels of disabled playlists are skipped
     let mut stmt = conn.prepare_cached(
-        "SELECT c.id, c.source_id, c.key, COALESCE(o.rename, c.clean_name), c.number, c.logo, ce.epg_channel_id, c.tvg_shift_min,
+        "SELECT c.id, c.source_id, c.key, COALESCE(o.rename, c.clean_name), c.number, c.logo, ce.epg_channel_id, COALESCE(o.shift_min, ce.shift_min, c.tvg_shift_min),
                 c.catchup IS NOT NULL, COALESCE(json_extract(c.catchup, '$.days'), 0), c.radio, c.unsupported IS NOT NULL,
                 c.provider_order, o.user_order, c.added_at, COALESCE(o.hidden, 0), COALESCE(o.locked, 0),
                 c.quality, v.width, v.height, COALESCE(c.family, c.norm_name), c.name, o.rename IS NOT NULL, c.explicit
-         FROM channel c JOIN source s ON s.id = c.source_id AND s.enabled = 1
+         FROM channel c
          LEFT JOIN item_override o ON o.source_id = c.source_id AND o.kind = 'channel' AND o.item_key = c.key
          LEFT JOIN channel_epg ce ON ce.channel_id = c.id
          LEFT JOIN channel_video v ON v.source_id = c.source_id AND v.item_key = c.key AND v.name = c.name
                    AND (v.url_key IS NULL OR c.url_key IS NULL OR v.url_key = c.url_key)
-         ORDER BY s.sort_index, s.id, (o.user_order IS NULL), o.user_order, c.provider_order, c.id",
+         ORDER BY c.id",
     )?;
     let mut channels = Vec::new();
+    let mut keys: Vec<OrderKey> = Vec::new();
     let mut hidden = HashSet::new();
-    let mut members: HashMap<GroupId, Vec<ChannelId>> = HashMap::new();
     let mut renamed = Vec::new();
-    let rows = stmt.query_map([], |r| {
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let id: i64 = r.get(0)?;
+        let source_id: SourceId = r.get(1)?;
+        let Some(pos) = order.pos(source_id) else { continue };
         let radio: bool = r.get(10)?;
-        let name: String = r.get(3)?;
+        let name = text(r, 3)?;
         let provider_name = match r.get_ref(21)? {
             rusqlite::types::ValueRef::Text(raw) if raw != name.as_bytes() => Some(Arc::from(String::from_utf8_lossy(raw))),
             _ => None,
         };
-        Ok((
-            ChannelSummary {
-                id: r.get(0)?,
-                source_id: r.get(1)?,
-                key: ItemKey(r.get(2)?),
-                name: Arc::from(name),
-                provider_name,
-                number: r.get(4)?,
-                logo: r.get::<_, Option<String>>(5)?.map(Arc::from),
-                group_ids: Vec::new(),
-                epg_channel_id: r.get(6)?,
-                tvg_shift_min: r.get(7)?,
-                has_catchup: r.get(8)?,
-                catchup_days: u32_of(r.get(9)?),
-                radio,
-                locked: r.get(16)?,
-                unsupported: r.get(11)?,
-                provider_order: r.get(12)?,
-                user_order: r.get(13)?,
-                added_at: r.get(14)?,
-                // measured beats the name, whose claim is doubtful when the source's claims of
-                // that class measured lower too often; radio has none (a cover picture is no video)
-                quality: {
-                    let claimed = r.get::<_, Option<i64>>(17)?.and_then(Quality::from_code);
-                    let source: SourceId = r.get(1)?;
-                    match (r.get::<_, Option<i64>>(18)?, r.get::<_, Option<i64>>(19)?) {
-                        (Some(w), Some(h)) => Quality::of_video(w, h),
-                        _ => None,
-                    }
-                    .map(|m| QualityBadge::measured(m, claimed))
-                    .or_else(|| claimed.map(|c| QualityBadge::named(c, trust.get(&source).is_some_and(|t| t.doubts(c)))))
-                    .filter(|_| !radio)
-                },
-                family: text_hash(r.get_ref(20)?),
+        let mut c = ChannelSummary {
+            id: ChannelId(id),
+            source_id,
+            key: ItemKey(text(r, 2)?.to_owned()),
+            name: Arc::from(name),
+            provider_name,
+            number: r.get(4)?,
+            logo: arc_text(r, 5)?,
+            group_ids: Vec::new(),
+            epg_channel_id: r.get(6)?,
+            tvg_shift_min: r.get(7)?,
+            has_catchup: r.get(8)?,
+            catchup_days: u32_of(r.get(9)?),
+            radio,
+            locked: r.get(16)?,
+            unsupported: r.get(11)?,
+            provider_order: r.get(12)?,
+            user_order: r.get(13)?,
+            added_at: r.get(14)?,
+            // measured beats the name, whose claim is doubtful when the source's claims of
+            // that class measured lower too often; radio has none (a cover picture is no video)
+            quality: {
+                let claimed = r.get::<_, Option<i64>>(17)?.and_then(Quality::from_code);
+                match (r.get::<_, Option<i64>>(18)?, r.get::<_, Option<i64>>(19)?) {
+                    (Some(w), Some(h)) => Quality::of_video(w, h),
+                    _ => None,
+                }
+                .map(|m| QualityBadge::measured(m, claimed))
+                .or_else(|| claimed.map(|c| QualityBadge::named(c, trust.get(&source_id).is_some_and(|t| t.doubts(c)))))
+                .filter(|_| !radio)
             },
-            r.get::<_, bool>(15)?,
-            r.get::<_, bool>(22)?,
-            r.get::<_, bool>(23)?,
-        ))
-    })?;
-    for row in rows {
-        let (mut c, item_hidden, is_renamed, own_explicit) = row?;
-        renamed.push(is_renamed);
-        let inherited = effective_groups(links.get(&c.id.0), &flags);
+            family: text_hash(r.get_ref(20)?),
+        };
+        let (item_hidden, is_renamed, own_explicit): (bool, bool, bool) = (r.get(15)?, r.get(22)?, r.get(23)?);
+        let inherited = effective_groups(links.of(id));
         c.locked |= inherited.any_locked;
         if item_hidden || inherited.all_hidden {
             hidden.insert(c.id);
@@ -979,11 +1115,20 @@ fn load_live(conn: &Connection, groups: Vec<Group>, x: &mut ExplicitIndex) -> Re
         } else {
             x.clean.insert((c.source_id, ItemKind::Channel));
         }
-        for g in &inherited.groups {
+        c.group_ids = inherited.groups;
+        keys.push(order_key(pos, c.user_order.map(i64::from), i64::from(c.provider_order), id));
+        renamed.push(is_renamed);
+        channels.push(c);
+    }
+    if let Some(order) = display_order(&keys) {
+        channels = permute(channels, &order);
+        renamed = permute(renamed, &order);
+    }
+    let mut members: HashMap<GroupId, Vec<ChannelId>> = HashMap::new();
+    for c in &channels {
+        for g in &c.group_ids {
             members.entry(*g).or_default().push(c.id);
         }
-        c.group_ids = inherited.groups;
-        channels.push(c);
     }
     distinguish_channels(&mut channels, &renamed);
     Ok(LiveIndex::from_parts(channels, groups, members, hidden))
@@ -1072,90 +1217,110 @@ pub fn out_of_all_of(eligible: &[&SourceMeta]) -> Vec<SourceId> {
 
 /// Visible movies or series + group members (indices into the returned vector) + their match
 /// data (same order).
-fn load_vod(conn: &Connection, movies: bool, groups: &[Group], x: &mut ExplicitIndex) -> Result<(Vec<VodSummary>, VodMembers, Vec<CopyRaw>)> {
+fn load_vod(
+    conn: &Connection,
+    movies: bool,
+    groups: &[Group],
+    order: &SourceOrder,
+    x: &mut ExplicitIndex,
+) -> Result<(Vec<VodSummary>, VodMembers, Vec<CopyRaw>)> {
     let flags = group_flags(groups);
     let (table, link, col, kind, poster) =
         if movies { ("movie", "movie_group", "movie_id", "movie", "poster") } else { ("series", "series_group", "series_id", "series", "cover") };
     let item_kind = if movies { ItemKind::Movie } else { ItemKind::Series };
-    let links = load_memberships(conn, &format!("SELECT l.{col}, l.group_id, 0 FROM {link} l"), &flags)?;
+    let mut links = Links::load(conn, &format!("SELECT l.{col}, l.group_id, 0 FROM {link} l"), &flags)?;
+    let overrides = Overrides::load(conn, kind)?;
     let split = crate::store::titles::linked_ids(conn, item_kind, LinkAction::Split)?;
     let pinned = crate::store::titles::linked_ids(conn, item_kind, LinkAction::Pin)?;
     let joins = crate::store::titles::join_groups(conn, item_kind)?;
+    // read in id order (no join, no sort in SQL: the sort carried every column of every row,
+    // hidden ones too), put in display order below
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT x.id, x.source_id, x.key, COALESCE(o.rename, x.clean_name), x.year, x.{poster}, x.rating, x.added_at,
-                x.provider_order, COALESCE(o.locked, 0), COALESCE(o.hidden, 0),
-                x.match_hash, x.match_lang, x.match_tags, x.match_origin, x.tmdb_id, x.explicit
-         FROM {table} x JOIN source s ON s.id = x.source_id AND s.enabled = 1
-         LEFT JOIN item_override o ON o.source_id = x.source_id AND o.kind = '{kind}' AND o.item_key = x.key
-         ORDER BY s.sort_index, s.id, (o.user_order IS NULL), o.user_order, x.provider_order, x.id"
+        "SELECT x.id, x.source_id, x.key, x.explicit, x.clean_name, x.year, x.{poster}, x.rating, x.added_at,
+                x.provider_order, x.match_hash, x.match_lang, x.match_tags, x.match_origin, x.tmdb_id
+         FROM {table} x ORDER BY x.id"
     ))?;
     let mut items = Vec::new();
     let mut raws = Vec::new();
-    let mut members = VodMembers::new();
+    let mut keys: Vec<OrderKey> = Vec::new();
     // `match_lang` values are few: one allocation each
     let mut langs: HashMap<Vec<u8>, Arc<str>> = HashMap::new();
+    let mut clean_seen: Option<SourceId> = None;
     let mut rows = stmt.query([])?;
     while let Some(r) = rows.next()? {
         let id: i64 = r.get(0)?;
-        let item_hidden: bool = r.get(10)?;
-        let own_explicit: bool = r.get(16)?;
-        let inherited = effective_groups(links.get(&id), &flags);
-        let kind = if movies { VodKind::Movie(MovieId(id)) } else { VodKind::Series(SeriesId(id)) };
         let source_id: SourceId = r.get(1)?;
-        let key = ItemKey(r.get(2)?);
-        if inherited.explicit(own_explicit) {
+        let Some(pos) = order.pos(source_id) else { continue };
+        let inherited = effective_groups(links.of(id));
+        let key = text(r, 2)?;
+        let o = overrides.get(source_id, key);
+        let kind = if movies { VodKind::Movie(MovieId(id)) } else { VodKind::Series(SeriesId(id)) };
+        if inherited.explicit(r.get(3)?) {
             x.vod.insert(kind);
-            x.refs.insert(ItemRef { source: source_id, kind: item_kind, key: key.clone() });
-        } else {
+            x.refs.insert(ItemRef { source: source_id, kind: item_kind, key: ItemKey(key.to_owned()) });
+        } else if clean_seen != Some(source_id) {
             x.clean.insert((source_id, item_kind));
+            clean_seen = Some(source_id);
         }
-        if item_hidden || inherited.all_hidden {
+        // hidden titles are left out before anything else of the row is read
+        if o.is_some_and(|o| o.hidden) || inherited.all_hidden {
             continue;
         }
-        let mut v = VodSummary {
+        let name: Arc<str> = match o.and_then(|o| o.rename.as_deref()) {
+            Some(rename) => Arc::from(rename),
+            None => Arc::from(text(r, 4)?),
+        };
+        let provider_order: i32 = r.get(9)?;
+        keys.push(order_key(pos, o.and_then(|o| o.user_order), i64::from(provider_order), id));
+        items.push(VodSummary {
             kind,
             source_id,
-            key,
-            name: Arc::from(r.get::<_, String>(3)?),
-            year: r.get(4)?,
-            poster: r.get::<_, Option<String>>(5)?.map(Arc::from),
-            rating: r.get::<_, Option<f64>>(6)?.map(|v| v as f32),
+            key: ItemKey(key.to_owned()),
+            name,
+            year: r.get(5)?,
+            poster: arc_text(r, 6)?,
+            rating: r.get::<_, Option<f64>>(7)?.map(|v| v as f32),
             group_ids: inherited.groups,
-            added_at: r.get(7)?,
-            provider_order: r.get(8)?,
-            locked: r.get::<_, bool>(9)? || inherited.any_locked,
-        };
-        let lang = match r.get_ref(12)? {
-            rusqlite::types::ValueRef::Text(t) if !t.is_empty() => {
-                Some(langs.entry(t.to_vec()).or_insert_with(|| Arc::from(String::from_utf8_lossy(t).as_ref())).clone())
-            }
+            added_at: r.get(8)?,
+            provider_order,
+            locked: o.is_some_and(|o| o.locked) || inherited.any_locked,
+        });
+        let lang = match r.get_ref(11)? {
+            rusqlite::types::ValueRef::Text(t) if !t.is_empty() => Some(match langs.get(t) {
+                Some(l) => l.clone(),
+                None => langs.entry(t.to_vec()).or_insert_with(|| Arc::from(String::from_utf8_lossy(t).as_ref())).clone(),
+            }),
             _ => None,
         };
-        let tmdb = match r.get_ref(15)? {
+        let tmdb = match r.get_ref(14)? {
             rusqlite::types::ValueRef::Integer(n) => u32::try_from(n).ok().filter(|n| *n > 0),
             rusqlite::types::ValueRef::Text(t) => std::str::from_utf8(t).ok().and_then(vod_match::tmdb_id),
             _ => None,
         };
-        let origin = match r.get_ref(14)? {
+        let origin = match r.get_ref(13)? {
             rusqlite::types::ValueRef::Text([a, b]) => Some([*a, *b]),
             _ => None,
         };
         raws.push(CopyRaw {
-            hash: r.get(11)?,
+            hash: r.get(10)?,
             lang,
-            tags: VersionTags(r.get::<_, Option<i64>>(13)?.and_then(|t| u16::try_from(t).ok()).unwrap_or(0)),
+            tags: VersionTags(r.get::<_, Option<i64>>(12)?.and_then(|t| u16::try_from(t).ok()).unwrap_or(0)),
             origin,
             tmdb,
-            split: split.contains(&id),
-            pinned: pinned.contains(&id),
-            join: joins.get(&id).copied(),
+            split: !split.is_empty() && split.contains(&id),
+            pinned: !pinned.is_empty() && pinned.contains(&id),
+            join: if joins.is_empty() { None } else { joins.get(&id).copied() },
         });
-        let idx = items.len() as u32;
+    }
+    if let Some(order) = display_order(&keys) {
+        items = permute(items, &order);
+        raws = permute(raws, &order);
+    }
+    let mut members = VodMembers::new();
+    for (i, v) in items.iter().enumerate() {
         for g in &v.group_ids {
-            members.entry(*g).or_default().push(idx);
+            members.entry(*g).or_default().push(i as u32);
         }
-        v.group_ids.shrink_to_fit();
-        items.push(v);
     }
     Ok((items, members, raws))
 }
@@ -1165,9 +1330,9 @@ fn load_vod(conn: &Connection, movies: bool, groups: &[Group], x: &mut ExplicitI
 struct LanguageRule {
     /// Source → kept languages (ISO 639-1: the rule's and the user's audio languages).
     keep: HashMap<SourceId, Vec<String>>,
-    /// (source, kind, key) of favourites and titles with watch progress (an episode's counts
-    /// for its series).
-    protected: HashSet<(SourceId, ItemKind, String)>,
+    /// Keys of favourites and titles with watch progress (an episode's counts for its series)
+    /// per (source, kind): looked up by the title's key without copying it.
+    protected: HashMap<(SourceId, ItemKind), HashSet<String>>,
 }
 
 impl LanguageRule {
@@ -1185,7 +1350,7 @@ impl LanguageRule {
                 Some((s.id, langs))
             })
             .collect();
-        let mut protected = HashSet::new();
+        let mut protected: HashMap<(SourceId, ItemKind), HashSet<String>> = HashMap::new();
         if !keep.is_empty() {
             let mut stmt = conn.prepare_cached(
                 "SELECT source_id, kind, item_key FROM fav_item WHERE kind IN ('movie', 'series')
@@ -1196,7 +1361,8 @@ impl LanguageRule {
             )?;
             let rows = stmt.query_map([], |r| Ok((r.get::<_, SourceId>(0)?, kind_from_sql(&r.get::<_, String>(1)?)?, r.get::<_, String>(2)?)))?;
             for r in rows {
-                protected.insert(r?);
+                let (source, kind, key) = r?;
+                protected.entry((source, kind)).or_default().insert(key);
             }
         }
         Ok(LanguageRule { keep, protected })
@@ -1223,12 +1389,14 @@ impl LanguageRule {
         // the market of each distinct `match_lang` text (few), and whether it is a bare
         // subtitle mark (`SUBS - …`, `+SUB`), which counts as untagged: the copy is for its
         // category's language
-        let mut markets: HashMap<Arc<str>, (Option<&'static str>, bool)> = HashMap::new();
+        // keyed by the text's address: `load_vod` shares one allocation per distinct text, so
+        // a title costs a pointer hash, not a string hash
+        let mut markets: HashMap<*const u8, (Option<&'static str>, bool)> = HashMap::new();
         let (market, tagged): (Vec<Option<&'static str>>, Vec<bool>) = raw
             .iter()
             .map(|r| {
                 let Some(t) = r.lang.as_ref() else { return (None, false) };
-                let (m, bare) = *markets.entry(t.clone()).or_insert_with(|| {
+                let (m, bare) = *markets.entry(t.as_ptr()).or_insert_with(|| {
                     let (code, dub) = vod_match::split_lang_text(t);
                     (code.and_then(|c| vod_match::market_lang(c, dub)), dub != vod_match::Dub::Multi && code.is_none_or(vod_match::is_bare_subtitles))
                 });
@@ -1242,7 +1410,9 @@ impl LanguageRule {
         for (i, (v, r)) in items.into_iter().zip(raw).enumerate() {
             let lang = market[i].or_else(|| if tagged[i] { None } else { v.group_ids.iter().find_map(|g| dominant.get(g).copied()) });
             let hide = match (self.keep.get(&v.source_id), lang) {
-                (Some(keep), Some(l)) => !keep.iter().any(|k| k == l) && !self.protected.contains(&(v.source_id, kind, v.key.0.clone())),
+                (Some(keep), Some(l)) => {
+                    !keep.iter().any(|k| k == l) && !self.protected.get(&(v.source_id, kind)).is_some_and(|p| p.contains(v.key.as_str()))
+                }
                 _ => false,
             };
             if hide {
@@ -1297,23 +1467,75 @@ pub fn load_visible(conn: &Connection, visibility: Visibility) -> Result<Library
 
 /// [`load`] with options.
 pub fn load_with(conn: &Connection, opts: &LoadOptions) -> Result<Library> {
+    let (lib, profile) = load_profiled(conn, opts)?;
+    // a slow build says which step was slow (field reports come without the catalogue)
+    if profile.total() >= SLOW_BUILD {
+        tracing::info!("library build: {profile}");
+    } else {
+        tracing::debug!("library build: {profile}");
+    }
+    Ok(lib)
+}
+
+/// A build this slow is logged with its steps at `info`.
+const SLOW_BUILD: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long each step of one build took (the perf benches print it; a handful of clock
+/// reads, nothing else).
+#[derive(Debug, Default, Clone)]
+pub struct LoadProfile(pub Vec<(&'static str, std::time::Duration)>);
+
+impl std::fmt::Display for LoadProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ms (", self.total().as_millis())?;
+        for (i, (step, d)) in self.0.iter().enumerate() {
+            write!(f, "{}{step} {} ms", if i > 0 { ", " } else { "" }, d.as_millis())?;
+        }
+        write!(f, ")")
+    }
+}
+
+impl LoadProfile {
+    pub fn total(&self) -> std::time::Duration {
+        self.0.iter().map(|(_, d)| *d).sum()
+    }
+
+    fn lap(&mut self, step: &'static str, since: &mut std::time::Instant) {
+        let now = std::time::Instant::now();
+        self.0.push((step, now - *since));
+        *since = now;
+    }
+}
+
+/// [`load_with`], with the time of each step.
+pub fn load_profiled(conn: &Connection, opts: &LoadOptions) -> Result<(Library, LoadProfile)> {
+    let mut profile = LoadProfile::default();
+    let mut t = std::time::Instant::now();
     let sources = load_sources(conn)?;
+    profile.lap("sources", &mut t);
     let (ch_groups, movie_groups, series_groups) = load_groups(conn, &sources)?;
+    profile.lap("groups", &mut t);
     let mut explicit = ExplicitIndex {
         groups: ch_groups.iter().chain(&movie_groups).chain(&series_groups).filter(|g| g.explicit.is_explicit()).map(|g| g.id).collect(),
         ..Default::default()
     };
-    let live = load_live(conn, ch_groups, &mut explicit)?;
-    let (movies, members, movie_raw) = load_vod(conn, true, &movie_groups, &mut explicit)?;
-    let (series, series_members, series_raw) = load_vod(conn, false, &series_groups, &mut explicit)?;
+    let order = SourceOrder::of(&sources);
+    let live = load_live(conn, ch_groups, &order, &mut explicit)?;
+    profile.lap("channels", &mut t);
+    let (movies, members, movie_raw) = load_vod(conn, true, &movie_groups, &order, &mut explicit)?;
+    profile.lap("movies", &mut t);
+    let (series, series_members, series_raw) = load_vod(conn, false, &series_groups, &order, &mut explicit)?;
+    profile.lap("series", &mut t);
     // "Also hide titles in other languages" (DESIGN §28.12)
     let mut sources = sources;
-    let langs = LanguageRule::of(conn, &sources, &opts.lang_prefs())?;
+    let prefs = opts.lang_prefs();
+    let langs = LanguageRule::of(conn, &sources, &prefs)?;
     let mut movie_groups = movie_groups;
     let mut series_groups = series_groups;
     let (movies, mut members, movie_raw) = langs.apply(ItemKind::Movie, movies, members, movie_raw, &mut movie_groups, &mut sources);
     let (series, series_members, series_raw) = langs.apply(ItemKind::Series, series, series_members, series_raw, &mut series_groups, &mut sources);
     members.extend(series_members);
+    profile.lap("title languages", &mut t);
     disabled_explicit_refs(conn, &mut explicit)?;
     // the match data of what the snapshot will show (`with_visibility` keeps the order)
     let shown = |items: &[VodSummary], raw: Vec<CopyRaw>| -> Vec<CopyRaw> {
@@ -1326,6 +1548,7 @@ pub fn load_with(conn: &Connection, opts: &LoadOptions) -> Result<Library> {
     let vod = VodIndex::from_parts(movies, series, movie_groups, series_groups, members);
     let favs = load_favs(conn)?;
     let recent_channels = load_recent_channels(conn, &live)?;
+    profile.lap("vod index, favourites", &mut t);
     let lib = Library {
         sources,
         live: Arc::new(live),
@@ -1337,7 +1560,11 @@ pub fn load_with(conn: &Connection, opts: &LoadOptions) -> Result<Library> {
         visibility: Visibility::ALL,
         explicit: Arc::new(explicit),
     };
-    Ok(lib.with_visibility(opts.visibility).stacked(movie_raw, series_raw, &opts.lang_prefs()))
+    let lib = lib.with_visibility(opts.visibility);
+    profile.lap("visibility", &mut t);
+    let lib = lib.stacked(movie_raw, series_raw, &prefs);
+    profile.lap("stacks", &mut t);
+    Ok((lib, profile))
 }
 
 /// Explicit channels, movies and series of DISABLED playlists into `x.refs` (the enabled ones
@@ -1480,5 +1707,50 @@ mod tests {
         assert!(f.is_fav(&item));
         f.apply_toggle(FavListId(1), &item, false);
         assert!(!f.is_fav(&item));
+    }
+
+    /// The item tables are read in id order and put in display order in memory: playlists by
+    /// their order, the user's order first, then provider order; the user's overrides of
+    /// movies by lookup; disabled playlists left out.
+    #[test]
+    fn load_puts_items_in_display_order_with_overrides() {
+        let store = crate::store::Store::open_temp("tuner-lib-order", None).unwrap();
+        store
+            .writer()
+            .blocking(|c| {
+                c.execute_batch(
+                    "INSERT INTO source(id, name, kind, url, created_at, generation, sort_index, enabled) VALUES
+                       (1, 'A', 'm3u-url', 'http://a', 0, 1, 1, 1), (2, 'B', 'm3u-url', 'http://b', 0, 1, 0, 1),
+                       (3, 'Off', 'm3u-url', 'http://c', 0, 1, 2, 0);
+                     INSERT INTO grp(id, source_id, kind, key, name, provider_order, item_count, seen_gen) VALUES
+                       (1, 1, 'movie', 'movie:m', 'M', 0, 3, 1), (2, 2, 'movie', 'movie:m', 'M', 0, 1, 1),
+                       (3, 3, 'movie', 'movie:m', 'M', 0, 1, 1), (4, 1, 'channel', 'channel:c', 'C', 0, 2, 1),
+                       (5, 2, 'channel', 'channel:c', 'C', 0, 1, 1);
+                     -- ids out of provider order
+                     INSERT INTO movie(id, source_id, key, name, clean_name, norm_name, stream, provider_order, seen_gen) VALUES
+                       (1, 1, 'm1', 'One', 'One', 'one', '{}', 2, 1), (2, 1, 'm2', 'Two', 'Two', 'two', '{}', 0, 1),
+                       (3, 1, 'm3', 'Three', 'Three', 'three', '{}', 1, 1), (4, 1, 'm6', 'Six', 'Six', 'six', '{}', 3, 1),
+                       (5, 2, 'm4', 'Four', 'Four', 'four', '{}', 0, 1), (6, 3, 'm5', 'Five', 'Five', 'five', '{}', 0, 1);
+                     INSERT INTO movie_group(group_id, movie_id, position) VALUES (1, 1, 0), (1, 2, 1), (1, 3, 2), (1, 4, 3), (2, 5, 0), (3, 6, 0);
+                     INSERT INTO channel(id, source_id, key, name, clean_name, norm_name, stream, provider_order, seen_gen) VALUES
+                       (1, 1, 'c1', 'C1', 'C1', 'c1', '{}', 1, 1), (2, 1, 'c2', 'C2', 'C2', 'c2', '{}', 0, 1),
+                       (3, 2, 'c3', 'C3', 'C3', 'c3', '{}', 0, 1);
+                     INSERT INTO channel_group(group_id, channel_id, position) VALUES (4, 1, 0), (4, 2, 1), (5, 3, 0);
+                     INSERT INTO item_override(source_id, kind, item_key, rename, hidden, locked, user_order, fp) VALUES
+                       (1, 'movie', 'm3', NULL, 0, 0, 0, '{}'), (1, 'movie', 'm1', 'Renamed', 0, 1, NULL, '{}'),
+                       (1, 'movie', 'm2', NULL, 1, 0, NULL, '{}'), (1, 'channel', 'c1', NULL, 0, 0, 0, '{}');",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let lib = load(&store.reader().unwrap()).unwrap();
+        let keys = |v: &[VodSummary]| v.iter().map(|m| m.key.as_str().to_owned()).collect::<Vec<_>>();
+        assert_eq!(keys(&lib.vod.movies), ["m4", "m3", "m1", "m6"], "B first; A: user order, then provider order; hidden and disabled out");
+        assert_eq!((&*lib.vod.movies[2].name, lib.vod.movies[2].locked), ("Renamed", true));
+        assert_eq!(lib.vod.group_items(GroupId(1), SortMode::Provider), [1, 2, 3]);
+        assert_eq!(lib.vod.group_items(GroupId(2), SortMode::Provider), [0]);
+        let channels: Vec<&str> = lib.live.channels.iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(channels, ["c3", "c1", "c2"]);
+        assert_eq!(lib.live.group_members(GroupId(4)), [ChannelId(1), ChannelId(2)]);
     }
 }

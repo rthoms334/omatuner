@@ -352,6 +352,7 @@ mod tests {
             category_filter: None,
             own_category_filter: false,
             language_hidden: 0,
+            code: String::new(),
         };
         let one_on = [src(1, true, true), src(2, false, true)];
         let two_on = [src(1, true, true), src(2, true, true)];

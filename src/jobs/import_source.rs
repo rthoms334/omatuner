@@ -520,6 +520,8 @@ async fn import_m3u(
     mark_refreshed(ctx, src, counts_of(&summary), etag, last_modified, now).await?;
     provider_epg(ctx, src, parsed.tvg_urls.clone(), cfg).await?;
     (ctx.submit)(JobKind::RebuildLibrary);
+    // new or changed channels: Guide fixes' suggestions (debounced, the app only)
+    crate::jobs::guide_check::request(ctx);
     Ok(RefreshResult { summary, not_modified: false, epg_urls: parsed.tvg_urls, upgraded: false })
 }
 
@@ -1163,6 +1165,7 @@ async fn refresh_xtream(
     let epg_urls = vec![urls::xmltv_url(&creds)];
     provider_epg(ctx, src, epg_urls.clone(), cfg).await?;
     (ctx.submit)(JobKind::RebuildLibrary);
+    crate::jobs::guide_check::request(ctx);
     let upgraded = committed_here(&upgrade);
     if upgraded {
         tracing::info!("{} now uses its Xtream login ({})", src.name, crate::redact::redact_url(&creds.server));

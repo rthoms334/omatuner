@@ -73,16 +73,17 @@ takes the pictures. The theme is Omarchy's Tokyo Night unless noted. The video i
 - **Sources:** M3U by URL or local file, and Xtream Codes (live, movies, series and the
   provider's guide). You can add several playlists, each with its own colour and glyph badge.
   A new playlist gets a colour no other playlist uses, and Settings ▸ Playlists offers to fix
-  two playlists that look the same.
+  two playlists that share a colour.
 - **Several playlists:** when two or more playlists have movies, series or channels, Movies,
   Series and Live TV get a bar on top: *All playlists* or one playlist, each with its count.
   Pick one with a click, `Alt+P` (a picker; digits jump) or `Ctrl+PgDn` / `Ctrl+PgUp`. Each
   screen remembers its own choice and the guide follows Live TV. One playlist shows only its
   categories, groups and channels (zapping too), with a stripe in its colour, a breadcrumb
   (`TV 2 › Action`) and the window title `Tuner — Movies · TV 2`. In *All playlists*, cards,
-  channel rows, group rows and search results say which playlist each item comes from (the
-  glyph in a corner of the poster and the playlist's name under the title); detail pages and
-  the player always do. A playlist's *Show in All playlists* switch keeps, say, free channels
+  channel rows, group rows and search results say which playlist each item comes from with a
+  short code chip in its colour (`NW` for Northwind, `TV2` for TV 2 — derived from the name and
+  unique, or your own in the playlist's editor); hover or focus an item to read the full name
+  in the tooltip and the status bar. Detail pages and the player always name the playlist. A playlist's *Show in All playlists* switch keeps, say, free channels
   out of the All view (your favourites and history still list them). Settings ▸ Interface ▸ Playlist on cards switches the marks to Always or
   Never.
   A provider's M3U (a `get.php?username=…` link or a downloaded file) switches to its Xtream
@@ -122,16 +123,21 @@ takes the pictures. The theme is Omarchy's Tokyo Night unless noted. The video i
 - **TV guide:** an EPG grid with programme details, reminders and catch-up.
   - XMLTV guides can come from a URL or a file (gz/xz).
   - Several guides can be ranked by priority, each with its own time offset.
-  - Channels are matched to the guide automatically. The EPG mapping screen fixes the rest by
-    hand.
+  - Channels are matched to the guide automatically. **Guide fixes** (`Ctrl+E`, or Settings ▸
+    EPG ▸ *Fix guide data…*) lists what is still wrong — no guide, a "+1" channel without its
+    shift, a guide that ended or looks wrong, a copy in another playlist that has a guide — with
+    a proposed fix and a before/after preview. Accept one or many at once (`Shift+Enter`), shift
+    a channel's times (`Ctrl+Shift+←/→`), set its catch-up offset and check it with ▶, or turn
+    on per-playlist rules (*+1/+2 follow their base*, *Copies share a guide*). Every change is a
+    batch you can undo (`Ctrl+Z`), and reminders move with a time shift.
 - **Catch-up:** works with Xtream and with the M3U `catchup` types (`default`, `append`,
   `shift`, `flussonic`, `xc`, `vod`). You can set a catch-up offset per channel.
 - **Movies and series:** posters, details, seasons and episodes, resume / start over,
   Continue watching, and watched markers.
   - **One card per title across playlists.** In *All playlists*, the copies of a movie or
     series (another playlist, another language, a 4K copy) are one **stack** card: card edges
-    behind the poster, the number of copies, and the playlists under the title (`TV + TV 2 ·
-    2021`). Copies match on title and year, across languages; TMDB ids decide when the
+    behind the poster, the number of copies, and code chips for up to three of its playlists
+    (`TV` `TV2` `NW` `+1`). Copies match on title and year, across languages; TMDB ids decide when the
     provider sends them, and two different ids never combine. The card shows the copy in your
     audio language (Settings ▸ Player ▸ audio languages, English by default). Hidden copies
     and explicit content behind parental control never join a stack; locked copies stay in it,
@@ -174,6 +180,34 @@ takes the pictures. The theme is Omarchy's Tokyo Night unless noted. The video i
   - A corner mini-player, and window fullscreen.
   - A pop-out player on Hyprland: a small video-only window that stays on screen on every
     workspace (`o` in the player, Ctrl+Shift+O anywhere; see [Pop-out player](#pop-out-player)).
+- **Up next:** a play queue for films, episodes and live programmes (`Ctrl+N` adds,
+  `Ctrl+Shift+N` plays next, `Alt+6` opens it, `u` in the player). It plays the next item after a
+  short countdown (Settings ▸ Interface ▸ Playback), steps aside when you pick something else
+  ("Up next paused · Alt+6 to carry on"), waits for the PIN on locked items and never plays
+  after a restart. With Up next empty, the next episode of a series follows on its own.
+- **Following:** rules that watch the guide for a team, a show, an event or a news bulletin and
+  set reminders or switches for you (`R` on a programme, *Follow…* in its menu, or Settings ▸
+  Following). Repeats, +1 channels and the same match on two channels count once; your other
+  playlist's copy is used when it's the better channel. A rule's switch never interrupts a film
+  or episode you're watching — you get a notification with **Watch** instead.
+- **News flash:** "pop up the 1 o'clock news every weekday, headlines only". At broadcast time
+  the bulletin opens in the pop-out without taking the keyboard (Cancel / Open full), plays the
+  whole programme or the first few minutes, then puts back what you were watching. Never in
+  quiet hours, while another app is fullscreen, over a film, or when you're already watching it.
+- **Spoiler guard:** on by default, but narrow: series you're part-way through and sport you
+  follow. Scores in guide titles are rewritten ("Arsenal v Chelsea 󰈉"), later episodes' titles
+  and plots are hidden, and zapping onto a channel showing the match you're saving stops at a
+  card first. `Ctrl+B` shows an item, `Ctrl+Shift+B` pauses the guard or adds a topic ("I'll
+  watch it later"), and watching the match lifts it. Notifications, MPRIS and Claude's answers
+  are guarded too.
+- **Multi-view:** two live channels at once — side by side, big + small, or picture in picture
+  (`Ctrl+M` on a channel, *Watch alongside*). `w` moves the focus, `M` the sound, `t` the layout,
+  `q` closes a picture. Built for one-connection accounts: the second picture takes a copy on
+  your other playlist, and moving the playing picture to its other playlist always asks first.
+- **Reminders and sleep timer:** notify or switch at a programme's start (or "10 min in"),
+  opened in the pop-out, the full window or where you are; reminders fire even while Tuner is
+  closed (systemd user timers). The sleep timer (`Ctrl+Shift+T`) stops or pauses after a time,
+  at the end of the programme, after N episodes or at the end of Up next.
 - **Desktop:** MPRIS (media keys and the Omarchy bar's media widget), desktop notifications for
   reminders, and an idle inhibitor while video plays. It runs as a single instance and opens
   M3U files and links from the desktop.
@@ -493,6 +527,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Alt+3` | TV guide |
 | `Alt+4` | Movies |
 | `Alt+5` | Series |
+| `Alt+6` | Up next |
 | `Ctrl+Comma` / `Alt+0` | Settings |
 | `Alt+←` | Back |
 | `F11` | Toggle window fullscreen |
@@ -503,6 +538,9 @@ The full reference is generated from `src/keymap.rs`:
 | `Ctrl+R` / `F5` | Refresh playlists & guide |
 | `Ctrl+J` | Show background tasks |
 | `F1` | Keyboard help |
+| `Ctrl+B` | Show / hide spoilers of the focused item |
+| `Ctrl+Shift+B` | Spoiler guard… (pause, I'll watch it later, guard a topic) |
+| `Ctrl+Shift+T` | Sleep timer… |
 | `Alt+P` | Choose the playlist shown (Movies, Series, Live TV, guide) |
 | `Ctrl+PgDn` / `Ctrl+PgUp` | Next / previous playlist (Movies, Series, Live TV, guide) |
 
@@ -520,7 +558,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Esc` | Back |
 | `/` | Search everything |
 | `?` | Keyboard help |
-| `Space` / `Insert` | Mark group (Ctrl+H then hides all marked) |
+| `Space` / `Insert` | Mark (groups: Ctrl+H then hides all marked) |
 | `Ctrl+O` | Play from another playlist (Also on)… |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
@@ -532,9 +570,12 @@ The full reference is generated from `src/keymap.rs`:
 | `Ctrl+S` | Sort & view options… |
 | `Ctrl+G` | Show in TV guide |
 | `Ctrl+I` | Details / edit information |
-| `Ctrl+E` | Assign EPG channel |
+| `Ctrl+E` | Assign guide channel |
 | `Ctrl+W` | Mark watched / unwatched |
 | `Delete` | Remove (from list / cancel task / forget) |
+| `Ctrl+N` | Add to Up next |
+| `Ctrl+Shift+N` | Play next (Up next) |
+| `Ctrl+M` | Watch alongside |
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
 | `a–z, 0–9 …` | Type to filter |
 
@@ -551,7 +592,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Ctrl+Backspace` | Delete word |
 | `Ctrl+U` / `Esc` | Clear filter |
 | `Tab` / `Shift+Tab` | Next / previous pane |
-| `Insert` | Mark group (Ctrl+H then hides all marked) |
+| `Insert` | Mark (groups: Ctrl+H then hides all marked) |
 | `Ctrl+Shift+H` | Hide the groups with the words typed |
 | `Ctrl+O` | Play from another playlist (Also on)… |
 | `Ctrl+F` | Add to / remove from Favourites |
@@ -564,9 +605,12 @@ The full reference is generated from `src/keymap.rs`:
 | `Ctrl+S` | Sort & view options… |
 | `Ctrl+G` | Show in TV guide |
 | `Ctrl+I` | Details / edit information |
-| `Ctrl+E` | Assign EPG channel |
+| `Ctrl+E` | Assign guide channel |
 | `Ctrl+W` | Mark watched / unwatched |
 | `Delete` | Remove (from list / cancel task / forget) |
+| `Ctrl+N` | Add to Up next |
+| `Ctrl+Shift+N` | Play next (Up next) |
+| `Ctrl+M` | Watch alongside |
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
 | `a–z, 0–9 …` | Type to filter |
 
@@ -613,9 +657,12 @@ The full reference is generated from `src/keymap.rs`:
 | `Ctrl+S` | Sort & view options… |
 | `Ctrl+G` | Show in TV guide |
 | `Ctrl+I` | Details / edit information |
-| `Ctrl+E` | Assign EPG channel |
+| `Ctrl+E` | Assign guide channel |
 | `Ctrl+W` | Mark watched / unwatched |
 | `Delete` | Remove (from list / cancel task / forget) |
+| `Ctrl+N` | Add to Up next |
+| `Ctrl+Shift+N` | Play next (Up next) |
+| `Ctrl+M` | Watch alongside |
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
 | `a–z, 0–9 …` | Type to filter |
 
@@ -642,9 +689,12 @@ The full reference is generated from `src/keymap.rs`:
 | `Ctrl+S` | Sort & view options… |
 | `Ctrl+G` | Show in TV guide |
 | `Ctrl+I` | Details / edit information |
-| `Ctrl+E` | Assign EPG channel |
+| `Ctrl+E` | Assign guide channel |
 | `Ctrl+W` | Mark watched / unwatched |
 | `Delete` | Remove (from list / cancel task / forget) |
+| `Ctrl+N` | Add to Up next |
+| `Ctrl+Shift+N` | Play next (Up next) |
+| `Ctrl+M` | Watch alongside |
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
 | `a–z, 0–9 …` | Type to filter |
 
@@ -672,9 +722,12 @@ The full reference is generated from `src/keymap.rs`:
 | `Ctrl+S` | Sort & view options… |
 | `Ctrl+G` | Show in TV guide |
 | `Ctrl+I` | Details / edit information |
-| `Ctrl+E` | Assign EPG channel |
+| `Ctrl+E` | Assign guide channel |
 | `Ctrl+W` | Mark watched / unwatched |
 | `Delete` | Remove (from list / cancel task / forget) |
+| `Ctrl+N` | Add to Up next |
+| `Ctrl+Shift+N` | Play next (Up next) |
+| `Ctrl+M` | Watch alongside |
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
 
 ### TV guide (`Guide`)
@@ -692,11 +745,16 @@ The full reference is generated from `src/keymap.rs`:
 | `w` / `Shift+Enter` | Watch channel |
 | `c` | Catch up (past programme) |
 | `r` | Remind me / cancel reminder |
+| `R` | Follow… (remind me every time it's on) |
+| `Ctrl+W` | Mark seen (lifts the spoiler guard) |
+| `Ctrl+N` | Add to Up next |
+| `Ctrl+Shift+N` | Play next (Up next) |
+| `Ctrl+M` | Watch alongside |
 | `f` | Collection: favourites lists, groups, all |
 | `0` / `1` / `2` / `3` / `4` / `5` / `6` / `7` / `8` / `9` | Jump to channel number |
 | `Ctrl+F` | Add channel to Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
-| `Ctrl+E` | Assign EPG channel |
+| `Ctrl+E` | Assign guide channel |
 | `Ctrl+I` | Edit channel information |
 | `F2` | Rename channel |
 | `Ctrl+H` | Hide channel |
@@ -735,6 +793,9 @@ The full reference is generated from `src/keymap.rs`:
 | `o` | Pop out: small window on every workspace (Hyprland) |
 | `q` | Stop and close |
 | `r` | Retry (after an error) |
+| `u` | Up next |
+| `n` / `N` | Next / previous in Up next |
+| `Ctrl+M` | Watch alongside… (choose the channel) |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Esc` | Back (hide banner, then leave; keeps playing in the mini player) |
 | `/` | Search everything |
@@ -768,6 +829,9 @@ The full reference is generated from `src/keymap.rs`:
 | `o` | Pop out: small window on every workspace (Hyprland) |
 | `q` | Stop and close |
 | `r` | Retry (after an error) |
+| `u` | Up next |
+| `n` / `N` | Next / previous in Up next |
+| `Ctrl+M` | Watch alongside… (choose the channel) |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Esc` | Back (hide banner, then leave; keeps playing in the mini player) |
 | `/` | Search everything |
@@ -783,12 +847,25 @@ The full reference is generated from `src/keymap.rs`:
 | `Tab` / `Shift+Tab` | Next / previous control |
 | `Esc` | Leave the controls |
 
+### Player — multi-view (`MultiView`)
+
+| Keys | Action |
+|---|---|
+| `w` | Next picture |
+| `Ctrl+←` / `Ctrl+→` / `Ctrl+↑` / `Ctrl+↓` | Picture in that direction |
+| `M` | Sound from this picture |
+| `W` | Swap the pictures' places |
+| `t` | Layout: side by side, big + small, picture in picture |
+| `q` | Close this picture (the other carries on) |
+| `Ctrl+M` | Watch alongside… (choose the channel) |
+
 ### Pop-out player (`PopOut`)
 
 | Keys | Action |
 |---|---|
 | `Esc` / `o` | Back to the full window (also double-click) |
 | `f` | Back to the full window, fullscreen |
+| `Delete` | Cancel the coming switch / end the news flash (back to what you were watching) |
 
 ### Channel number entry (`NumericEntry`)
 
@@ -799,12 +876,16 @@ The full reference is generated from `src/keymap.rs`:
 | `Backspace` | Delete digit |
 | `Esc` | Cancel |
 
-### EPG mapping (`EpgMapping`)
+### Guide fixes (`EpgMapping`)
 
 | Keys | Action |
 |---|---|
-| `Enter` | Assign the highlighted EPG channel |
-| `Delete` | Clear the manual assignment |
+| `Enter` | Issues: show its guide channels · Guide channels: assign |
+| `Delete` | Reset to automatic (guide channel and time shift) |
+| `Shift+Enter` | Accept the proposed fix (every marked channel) |
+| `Ctrl+A` | Mark all shown / none |
+| `Ctrl+Z` | Undo the last guide fix |
+| `Ctrl+Shift+→` / `Ctrl+Shift+←` | Time shift +1 h / −1 h |
 
 ### Search (`Search`)
 
@@ -826,8 +907,11 @@ The full reference is generated from `src/keymap.rs`:
 | `Ctrl+L` | Lock with PIN / unlock |
 | `Ctrl+G` | Show in TV guide |
 | `Ctrl+I` | Details / edit information |
-| `Ctrl+E` | Assign EPG channel |
+| `Ctrl+E` | Assign guide channel |
 | `Ctrl+W` | Mark watched / unwatched |
+| `Ctrl+N` | Add to Up next |
+| `Ctrl+Shift+N` | Play next (Up next) |
+| `Ctrl+M` | Watch alongside |
 | `Shift+F10` / `Ctrl+Enter` | List these shortcuts |
 
 ### Dialogs & menus (`Modal`)
@@ -855,7 +939,7 @@ The full reference is generated from `src/keymap.rs`:
 | `←` / `h` | Back to the page list |
 | `→` / `l` / `Shift+→` / `L` | Increase / next option |
 | `Shift+←` / `H` | Decrease / previous option |
-| `Alt+↑` / `K` / `Alt+↓` / `J` | Move up / down (reorder: EPG priority, playlists, lists) |
+| `Alt+↑` / `K` / `Alt+↓` / `J` | Move up / down (reorder: guide priority, playlists, lists) |
 | `Tab` / `Shift+Tab` | Next / previous section |
 | `Enter` / `Space` | Toggle / open |
 | `x` / `Delete` | Delete / more actions |
@@ -876,7 +960,6 @@ The full reference is generated from `src/keymap.rs`:
 | `?` | Close (types ? while filtering) |
 | `Enter` | Close |
 | `a–z, 0–9 …` | Type to filter |
-
 <!-- keymap:end -->
 
 ## Mouse
@@ -936,20 +1019,24 @@ Settings ▸ Parental sets a 4–8 digit PIN. It is a speed bump for children, n
 ## Command line
 
 ```text
-tuner [--view home|live|guide|movies|series|search|settings] [--play <ref>]
-      [--debug] [--profile-dir <dir>] [--refresh] [PLAYLIST_OR_URL...]
+tuner [--view home|live|guide|movies|series|search|settings] [--play <ref> [--popout]]
+      [--reminder <id>] [--debug] [--profile-dir <dir>] [--refresh] [PLAYLIST_OR_URL...]
 tuner mcp [--profile-dir <dir>] [--debug]
+tuner claude-setup [--apply]
 ```
 
 | Flag | Meaning |
 |---|---|
 | `--view <screen>` | Open that screen. If Tuner is already running, it switches the running window. |
 | `--play <ref>` | Play a channel by its stable reference `<source-id>:<item-key>` (e.g. `2:xt:live:1234`), a stream URL or a media file. |
+| `--popout` | With `--play`: play it in the pop-out player (Hyprland), without taking focus. |
+| `--reminder <id>` | Fire reminder `<id>` now. This is what the reminder timers run while Tuner is closed; you don't need it yourself. |
 | `--debug` | Debug logging for this session, whatever the setting says. |
 | `--profile-dir <dir>` | Keep config, data, cache, logs and the socket under `<dir>`. Use it for testing, or for a second profile. |
 | `--refresh` | Refresh stale playlists and guides without a window, then exit (status 1 if a refresh failed). Does nothing while Tuner is running, because the open window refreshes on its own. While it runs, starting Tuner waits a few seconds and then says (also as a desktop notification) that a background refresh is running. A playlist it upgraded to its Xtream login is announced the next time Tuner opens. |
 | `PLAYLIST_OR_URL…` | An `.m3u`/`.m3u8` file opens the add-playlist card. A stream URL or media file plays straight away. `file://` URIs are treated as paths. |
 | `mcp` | Run the MCP server on stdin/stdout for Claude Code and other MCP clients (see [Use Tuner from Claude](#use-tuner-from-claude)). |
+| `claude-setup` | Show how to connect Claude Code to Tuner (the omatuner plugin). `--apply` runs the plugin steps after asking on the terminal. |
 | `--help`, `--version` | Usage and version. |
 
 No screen shows a channel's `--play` reference yet. With the `sqlite3` tool you can look it up:
@@ -966,8 +1053,24 @@ Only one Tuner runs per profile. A second `tuner …` hands its request to the r
 ## Use Tuner from Claude
 
 Tuner includes an [MCP](https://modelcontextprotocol.io) server, so you can ask Claude Code (or
-another MCP client) in a terminal to find something and play it, instead of browsing. Add it
-once:
+another MCP client) in a terminal to find something and play it, instead of browsing.
+
+**The omatuner plugin (recommended)** adds the server and seven skills that know how to use it:
+*watch* (live TV and "what's on"), *pick* (a film or series for tonight), *series* (carry on,
+catch up), *plan* (reminders, switches, Following rules, news flashes, Up next, the sleep
+timer), *kids* (a safe line-up and parental locks), *fix* (guide fixes and playback trouble)
+and *discover* (what's trending that your playlists have). Install it once:
+
+```sh
+claude plugin marketplace add rthoms334/omatuner
+claude plugin install omatuner@omatuner
+```
+
+The Arch package also ships the marketplace under `/usr/share/tuner/claude/`, and `tuner
+claude-setup` prints the steps for your install (`tuner claude-setup --apply` runs them after
+asking).
+
+**Just the tools**, without the skills:
 
 ```sh
 claude mcp add --scope user tuner -- tuner mcp
@@ -984,6 +1087,9 @@ Then ask, for example:
 - "Something light under 2 hours" — Claude looks through your movie categories, picks an
   unwatched film and starts it.
 - "What's on BBC One at 9?", "Carry on with my series", "Pause", "Volume to 40".
+- "Follow Arsenal, spoiler-safe", "Pop up the 1 o'clock news every weekday, headlines only",
+  "Put both semis on side by side", "Queue the next three episodes and stop after them",
+  "Why is the guide empty on half my channels?".
 
 How it works and what it can't do:
 
@@ -997,7 +1103,10 @@ How it works and what it can't do:
 - Claude only sees what Tuner shows you: hidden channels and categories, categories your country
   filter hides, and explicit content hidden by parental control stay out of every answer.
 - Locked items are listed as locked. Playing one makes Tuner ask for your PIN **on its own
-  screen**. The PIN never goes through Claude, and Claude will not ask you for it.
+  screen**. The PIN never goes through Claude, and Claude will not ask you for it. Claude can
+  lock but never unlock, never shows explicit content and never loosens a setting: it can't
+  turn a rule's spoiler-safe off, remove your own spoiler rules, or apply a guide fix to more
+  than 50 channels from chat. Rules Claude adds are marked and toast with **Undo**.
 - Claude gets names, times and programme details, never stream addresses or your logins.
   Playlist names are shared too, and a playlist you didn't rename is named after its server:
   rename it (Settings ▸ Playlists) if you'd rather Claude didn't see that. Web links inside

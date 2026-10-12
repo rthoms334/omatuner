@@ -3,8 +3,8 @@
 //! `ipc.rs` hands every v2 request line to an [`AgentService`]; production uses
 //! [`AgentHandler`]. The handler runs on the tokio runtime (blocking store reads on the blocking
 //! pool, a small pool of lazily opened readers), never on the UI thread:
-//! * queries read the snapshot the app published (`AgentShared::library`), a store reader (EPG,
-//!   progress, favourites, details) and the parental state computed now (`AgentShared::parental`)
+//! * queries read the snapshot the app published (`AppShared::library`), a store reader (EPG,
+//!   progress, favourites, details) and the parental state computed now (`AppShared::parental`)
 //!   — `agent::query`. A snapshot built while unlocked loses its explicit content here when the
 //!   session relocked since (`Library::hiding_explicit`, cached per snapshot);
 //! * `play` validates the target (`agent::act::plan_play`: exists, visible, catch-up window…),
@@ -29,11 +29,12 @@ use super::act::{self, PlayStep};
 use super::guard::{self, Limits};
 use super::proto::{Call, CancelOut, Control, ControlAction, ErrorCode, Reply, Request};
 use super::query::{self, Fail, Out, Q};
-use super::shared::{AgentShared, ParentalView};
 use crate::config::SharedConfig;
 use crate::jobs::JobManager;
 use crate::msg::{AppEvent, DataScope, EventBus};
+use crate::player::tiles::TileRegistry;
 use crate::player::{PlayerCommand, PlayerHandle};
+use crate::shared::{AppShared, ParentalView};
 use crate::store::Store;
 use crate::store::library::Library;
 
@@ -60,13 +61,19 @@ pub struct AgentHandler {
     inner: Arc<Inner>,
 }
 
-struct Inner {
-    shared: Arc<AgentShared>,
-    store: Store,
-    config: SharedConfig,
-    player: PlayerHandle,
-    bus: EventBus,
-    jobs: JobManager,
+/// The handler's state, shared by the tool modules (`agent::{queue, follow, …}`).
+pub(super) struct Inner {
+    pub(super) shared: Arc<AppShared>,
+    pub(super) store: Store,
+    pub(super) config: SharedConfig,
+    /// Picture A (single view: the only one).
+    pub(super) player: PlayerHandle,
+    pub(super) bus: EventBus,
+    pub(super) jobs: JobManager,
+    /// Every picture's handle (multi-view `control tile`); `None`: picture A only.
+    pub(super) tiles: Option<TileRegistry>,
+    /// `guide_fix propose`'s proposals until applied or expired.
+    pub(super) proposals: super::guide::Proposals,
     limits: Limits,
     readers: Mutex<Vec<Connection>>,
     /// The published snapshot without its explicit content (generation → copy), for a
@@ -75,13 +82,13 @@ struct Inner {
 }
 
 impl AgentHandler {
-    pub fn new(shared: Arc<AgentShared>, store: Store, config: SharedConfig, player: PlayerHandle, bus: EventBus, jobs: JobManager) -> Self {
+    pub fn new(shared: Arc<AppShared>, store: Store, config: SharedConfig, player: PlayerHandle, bus: EventBus, jobs: JobManager) -> Self {
         Self::with_limits(shared, store, config, player, bus, jobs, Limits::default())
     }
 
     /// [`AgentHandler::new`] with other request limits (tests).
     pub fn with_limits(
-        shared: Arc<AgentShared>,
+        shared: Arc<AppShared>,
         store: Store,
         config: SharedConfig,
         player: PlayerHandle,
@@ -90,8 +97,31 @@ impl AgentHandler {
         limits: Limits,
     ) -> Self {
         Self {
-            inner: Arc::new(Inner { shared, store, config, player, bus, jobs, limits, readers: Mutex::new(Vec::new()), concealed: Mutex::new(None) }),
+            inner: Arc::new(Inner {
+                shared,
+                store,
+                config,
+                player,
+                bus,
+                jobs,
+                tiles: None,
+                proposals: super::guide::Proposals::default(),
+                limits,
+                readers: Mutex::new(Vec::new()),
+                concealed: Mutex::new(None),
+            }),
         }
+    }
+
+    fn configure(mut self, f: impl FnOnce(&mut Inner)) -> Self {
+        f(Arc::get_mut(&mut self.inner).expect("configure the handler before cloning it"));
+        self
+    }
+
+    /// Every picture (multi-view: `control tile`, `status.multiview`); without it the handler
+    /// reaches picture A only.
+    pub fn with_tiles(self, tiles: TileRegistry) -> Self {
+        self.configure(|i| i.tiles = Some(tiles))
     }
 }
 
@@ -108,8 +138,13 @@ impl AgentService for AgentHandler {
                 }
             };
             let started = Instant::now();
+            let (policy, reveal) = req.call.guard_opts();
             let reply = match tokio::time::timeout(HANDLER_BUDGET, inner.clone().dispatch(req.call)).await {
-                Ok(Ok(v)) => Reply::ok(id, v),
+                // every result passes the spoiler guard's one choke point (B4)
+                Ok(Ok(mut v)) => {
+                    guard::guard_reply(&mut v, &inner.shared.guard(), policy, &reveal);
+                    Reply::ok(id, v)
+                }
                 Ok(Err(f)) => Reply::err(id, f.code, f.message),
                 Err(_) => {
                     tracing::warn!("agent: {method} took longer than {} s", HANDLER_BUDGET.as_secs());
@@ -138,7 +173,15 @@ fn code_name(c: ErrorCode) -> &'static str {
     }
 }
 
-fn to_value<T: Serialize>(v: &T) -> Out<serde_json::Value> {
+/// A failed write, for the model (the store's message is logged, not sent: it may name rows).
+fn write_fail(e: crate::error::Error) -> Fail {
+    match e {
+        crate::error::Error::Other(m) if m.len() < 160 && !m.contains("://") => Fail::new(ErrorCode::Unavailable, m),
+        e => Fail::from(e),
+    }
+}
+
+pub(super) fn to_value<T: Serialize>(v: &T) -> Out<serde_json::Value> {
     serde_json::to_value(v).map_err(|e| Fail::new(ErrorCode::Internal, format!("encoding the answer: {e}")))
 }
 
@@ -153,18 +196,14 @@ impl Inner {
             Call::ContinueWatching(p) => self.query(move |q| query::continue_watching(q, &p)).await,
             Call::Favourites(p) => self.query(move |q| query::favourites(q, &p)).await,
             Call::Details(p) => self.details(p).await,
-            Call::Status(_) => {
-                let snap = self.player.snapshot();
-                let v = self.run(false, move |q| act::status(q, &snap)).await?;
-                to_value(&v)
-            }
+            Call::Status(_) => self.status().await,
             Call::Play(p) => self.play(p).await,
             Call::ScheduleSwitch(p) => self.schedule_switch(p).await,
             Call::CancelSwitch(p) => {
                 let id = self.run(true, move |q| act::check_cancel(q, &p)).await?;
                 self.store
                     .writer()
-                    .submit_notify(DataScope::Reminders, move |c| crate::store::user::remove_reminder(c, id))
+                    .submit_notify(DataScope::Reminders, move |c| crate::store::user::remove_reminder(c, id, crate::model::RemoveWhy::Agent))
                     .recv()
                     .await
                     .map_err(Fail::from)?;
@@ -173,11 +212,55 @@ impl Inner {
                 to_value(&CancelOut { cancelled: true })
             }
             Call::Control(c) => self.control(c).await,
+            // the batch's tools (`handle` refused them already when their feature is off)
+            Call::Queue(p) => super::queue::handle(&self, p).await,
+            Call::Follow(p) => super::follow::handle(&self, p).await,
+            Call::SpoilerGuard(p) => super::spoiler::handle(&self, p).await,
+            Call::GuideFix(p) => super::guide::handle(&self, p).await,
+            Call::Multiview(p) => super::multiview::handle(&self, p).await,
+            Call::Reminders(p) => super::reminders::handle(&self, p).await,
+            Call::SleepTimer(p) => super::reminders::sleep_timer(&self, p).await,
+            Call::MatchTitles(p) => self.query(move |q| super::library::match_titles(q, &p)).await,
+            Call::History(p) => self.query(move |q| super::library::history(q, &p)).await,
+            Call::Episodes(p) => super::library::episodes(&self, p).await,
+            Call::FavouritesEdit(p) => super::library::favourites_edit(&self, p).await,
+            Call::ParentalStatus(_) => self.query(super::library::parental_status).await,
+            Call::Lock(p) => super::library::lock(&self, p).await,
+            Call::Diagnose(p) => super::health::diagnose(&self, p).await,
+            Call::Sources(_) => self.query(super::health::sources).await,
         }
     }
 
+    /// The live config.
+    pub(super) fn cfg(&self) -> Arc<crate::config::Config> {
+        crate::config::current(&self.config)
+    }
+
+    /// One write through the store writer (notifying `scope`).
+    pub(super) async fn write<T: Send + 'static>(
+        &self,
+        scope: DataScope,
+        f: impl FnOnce(&mut Connection) -> crate::error::Result<T> + Send + 'static,
+    ) -> Out<T> {
+        self.store.writer().submit_notify(scope, f).recv().await.map_err(write_fail)
+    }
+
+    /// What the pictures, Up next and the sleep timer say now (`status`).
+    pub(super) fn status_more(&self) -> act::StatusMore {
+        let tiles = self.shared.tiles();
+        let b = self.shared.tile_player(crate::model::TileId::B).map(|rx| rx.borrow().clone());
+        act::StatusMore { queue: self.shared.queue(), tiles, tile_b: b, sleep: self.shared.sleep().and_then(|h| h.status()) }
+    }
+
+    async fn status(self: &Arc<Self>) -> Out<serde_json::Value> {
+        let snap = self.player.snapshot();
+        let more = self.status_more();
+        let v = self.run(false, move |q| act::status_with(q, &snap, &more)).await?;
+        to_value(&v)
+    }
+
     /// The parental state and the snapshot as it may be shown now.
-    fn view(&self) -> (ParentalView, Arc<crate::config::Config>) {
+    pub(super) fn view(&self) -> (ParentalView, Arc<crate::config::Config>) {
         let cfg = crate::config::current(&self.config);
         (self.shared.parental(&cfg.parental), cfg)
     }
@@ -221,7 +304,7 @@ impl Inner {
 
     /// `f` over a [`Q`] on the blocking pool. `needs_library`: `loading` until the app published
     /// its first snapshot.
-    async fn run<T: Send + 'static>(self: &Arc<Self>, needs_library: bool, f: impl FnOnce(&Q) -> Out<T> + Send + 'static) -> Out<T> {
+    pub(super) async fn run<T: Send + 'static>(self: &Arc<Self>, needs_library: bool, f: impl FnOnce(&Q) -> Out<T> + Send + 'static) -> Out<T> {
         let me = self.clone();
         let task = tokio::task::spawn_blocking(move || {
             let (view, cfg) = me.view();
@@ -237,7 +320,10 @@ impl Inner {
         })
     }
 
-    async fn query<T: Serialize + Send + 'static>(self: &Arc<Self>, f: impl FnOnce(&Q) -> Out<T> + Send + 'static) -> Out<serde_json::Value> {
+    pub(super) async fn query<T: Serialize + Send + 'static>(
+        self: &Arc<Self>,
+        f: impl FnOnce(&Q) -> Out<T> + Send + 'static,
+    ) -> Out<serde_json::Value> {
         let v = self.run(true, f).await?;
         to_value(&v)
     }
@@ -318,11 +404,41 @@ impl Inner {
         to_value(&out)
     }
 
+    /// The pictures a `control` reaches: the one named, else every picture for pause / resume /
+    /// stop and the one with the sound for volume and mute.
+    fn control_targets(&self, c: &Control) -> Out<Vec<PlayerHandle>> {
+        let tiles = self.shared.tiles();
+        let get = |t: crate::model::TileId| match &self.tiles {
+            Some(reg) => reg.get(t),
+            None => (t == crate::model::TileId::A).then(|| self.player.clone()),
+        };
+        if let Some(t) = c.tile {
+            return get(t.id()).map(|h| vec![h]).ok_or_else(|| Fail::new(ErrorCode::Unavailable, "That picture isn't open (multi-view is off)"));
+        }
+        Ok(match c.action {
+            ControlAction::Volume | ControlAction::Mute | ControlAction::Unmute => {
+                get(tiles.audible).or_else(|| get(crate::model::TileId::A)).into_iter().collect()
+            }
+            // the focused picture (A while multi-view is off)
+            ControlAction::PreviousChannel | ControlAction::Popout => get(tiles.focus).or_else(|| get(crate::model::TileId::A)).into_iter().collect(),
+            _ => match &self.tiles {
+                Some(reg) => reg.all(),
+                None => vec![self.player.clone()],
+            },
+        })
+    }
+
     async fn control(self: &Arc<Self>, c: Control) -> Out<serde_json::Value> {
-        let snap = self.player.snapshot();
-        let idle = matches!(snap.state, crate::player::PlayerState::Idle | crate::player::PlayerState::Ended);
+        if c.value.is_some() && c.action != ControlAction::Volume {
+            return Err(Fail::bad("value is only for volume"));
+        }
+        let targets = self.control_targets(&c)?;
+        let Some(first) = targets.first().cloned() else { return Err(Fail::new(ErrorCode::Unavailable, "Nothing is playing")) };
+        let snap = first.snapshot();
+        let idle = |s: &crate::player::PlayerSnapshot| matches!(s.state, crate::player::PlayerState::Idle | crate::player::PlayerState::Ended);
+        let view = self.view().0;
         let cmd = match c.action {
-            ControlAction::Pause | ControlAction::Resume | ControlAction::TogglePause if idle => {
+            ControlAction::Pause | ControlAction::Resume | ControlAction::TogglePause | ControlAction::Popout if idle(&snap) => {
                 return Err(Fail::new(ErrorCode::Unavailable, "Nothing is playing"));
             }
             ControlAction::Pause => Some(PlayerCommand::SetPause(true)),
@@ -338,25 +454,44 @@ impl Inner {
             }
             ControlAction::Mute => (!snap.muted).then_some(PlayerCommand::ToggleMute),
             ControlAction::Unmute => snap.muted.then_some(PlayerCommand::ToggleMute),
+            // the player keeps the PIN rule: a locked channel isn't recalled while locked
+            ControlAction::PreviousChannel => {
+                if snap.previous_live.is_none() {
+                    return Err(Fail::new(ErrorCode::Unavailable, "There is no previous channel to go back to"));
+                }
+                Some(PlayerCommand::LastChannel { unlocked: view.unlocked })
+            }
+            ControlAction::Popout => {
+                self.bus.send(AppEvent::Agent(super::AgentCommand::PopOut));
+                tracing::info!("agent: control Popout");
+                None
+            }
         };
-        if c.value.is_some() && c.action != ControlAction::Volume {
-            return Err(Fail::bad("value is only for volume"));
-        }
         if let Some(cmd) = cmd {
             let was_paused = snap.paused;
-            // the change this asked for, as the player shows it
+            let was_gen = snap.load_generation;
+            // the change this asked for, as the (first) player shows it
             let done = |s: &crate::player::PlayerSnapshot| match c.action {
                 ControlAction::Pause => s.paused,
                 ControlAction::Resume => !s.paused,
                 ControlAction::TogglePause => s.paused != was_paused,
-                ControlAction::Stop => matches!(s.state, crate::player::PlayerState::Idle | crate::player::PlayerState::Ended),
+                ControlAction::Stop => idle(s),
                 ControlAction::Volume => c.value.is_some_and(|v| (s.volume - v).abs() < 0.5),
                 ControlAction::Mute => s.muted,
                 ControlAction::Unmute => !s.muted,
+                ControlAction::PreviousChannel => s.load_generation != was_gen,
+                ControlAction::Popout => true,
             };
-            let mut rx = self.player.subscribe();
+            let mut rx = first.subscribe();
             rx.borrow_and_update();
-            self.player.send(cmd);
+            for t in &targets {
+                // a toggle per picture would flip them apart: pause / resume them all alike
+                let cmd = match (&cmd, targets.len() > 1) {
+                    (PlayerCommand::TogglePause, true) => PlayerCommand::SetPause(!was_paused),
+                    (cmd, _) => cmd.clone(),
+                };
+                t.send(cmd);
+            }
             let _ = tokio::time::timeout(CONTROL_WAIT, async {
                 while !done(&rx.borrow_and_update()) {
                     if rx.changed().await.is_err() {
@@ -367,8 +502,6 @@ impl Inner {
             .await;
             tracing::info!("agent: control {:?}", c.action);
         }
-        let snap = self.player.snapshot();
-        let v = self.run(false, move |q| act::status(q, &snap)).await?;
-        to_value(&v)
+        self.status().await
     }
 }

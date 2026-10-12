@@ -29,6 +29,9 @@
 //!   starting after `now + 14 d` are skipped while parsing.
 //! * Matching: `provider_guide` (Xtream `epg_channel_id` tagging) applies to the guide's own
 //!   playlist source; name matching follows `config.epg.auto_name_match`.
+//! * Guide fixes (DESIGN §31, B7): after the flip (and after `rematch_all`'s resolve) the rule
+//!   rows are re-derived (`store::guide_fix::derive_rule_rows`) before `DataScope::Epg`, so the
+//!   library rebuild and Following's evaluation see the final mappings.
 
 use std::ops::ControlFlow;
 use std::path::PathBuf;
@@ -152,7 +155,9 @@ async fn run(ctx: &JobContext, src: &EpgSource, force: bool, progress: &Progress
             {
                 tracing::warn!("storing the guide's download validators: {e}");
             }
+            derive_rules(ctx, &cfg).await;
             notify(ctx, DataScope::Epg);
+            super::after_guide(ctx, crate::follow::FollowReason::Guide);
             Ok(EpgRefreshResult { summary, not_modified: false })
         }
         Err(e) => {
@@ -376,8 +381,28 @@ pub async fn rematch_all(ctx: &JobContext, progress: &Progress, cancel: &Cancell
     }
     progress.set(JobPhase::Finishing);
     write(ctx, |c| store_epg::resolve_mappings(c)).await?;
+    derive_rules(ctx, &cfg).await;
     notify(ctx, DataScope::Epg);
+    super::after_guide(ctx, crate::follow::FollowReason::Guide);
     Ok(total)
+}
+
+/// B7: the Guide fixes rule rows ("+1/+2 follow their base", "Copies share a guide") are
+/// re-derived from the mappings as matched now, so channels added since are covered and a rule
+/// turned off loses its rows. Best effort: a failure keeps the matcher's mappings (resolved).
+async fn derive_rules(ctx: &JobContext, cfg: &Config) {
+    if !crate::guide_fix::ENABLED {
+        return;
+    }
+    let opts = crate::store::guide_fix::GuideOpts::from_config(cfg);
+    // planned on a reader: the writer is held only for the rows and the resolve
+    let derived = async {
+        let plan = read(ctx, move |c| crate::store::guide_fix::plan_rule_rows(c, &opts)).await?;
+        write(ctx, move |c| crate::store::guide_fix::write_rule_rows(c, &plan)).await
+    };
+    if let Err(e) = derived.await {
+        tracing::warn!(target: "tuner::jobs", "applying the guide rules failed ({e}); the guide's own matches stay");
+    }
 }
 
 #[cfg(test)]

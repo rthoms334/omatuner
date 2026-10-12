@@ -11,7 +11,7 @@ use crate::store::sql::{Json, enum_parse, from_json_opt, kind_from_sql, or_not_f
 
 const CHANNEL_COLS: &str = "c.id, c.source_id, c.key, c.provider_id, c.name, c.clean_name, c.number, c.logo, c.tvg_id, c.tvg_name, \
      c.tvg_shift_min, c.stream, c.headers, c.catchup, c.radio, c.unsupported, c.provider_order, c.added_at, o.rename, \
-     COALESCE(o.hidden, 0), COALESCE(o.locked, 0), o.user_order, COALESCE(o.catchup_offset_s, 0), ce.epg_channel_id";
+     COALESCE(o.hidden, 0), COALESCE(o.locked, 0), o.user_order, o.catchup_offset_s, ce.epg_channel_id";
 
 const CHANNEL_FROM: &str = "FROM channel c
      LEFT JOIN item_override o ON o.source_id = c.source_id AND o.kind = 'channel' AND o.item_key = c.key

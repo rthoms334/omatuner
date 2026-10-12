@@ -6,7 +6,9 @@
 //! * a library swap (the old snapshot is ~2 M allocations, 240 MiB here),
 //! * the global search index (~110 MiB) when the search card closes,
 //! * mpv's decoder memory (hundreds of MiB at 4K 10-bit) when playback stops, video decoding is
-//!   switched off (`vid=no`, hidden window), or a stream ends or is reloaded.
+//!   switched off (`vid=no`, hidden window), or a stream ends or is reloaded — per picture:
+//!   with multi-view there are two decoders, and one picture closing while the other plays
+//!   ("picture closed") frees one of them.
 //!
 //! [`Maintenance`] owns one thread ("tuner-mem"). [`Maintenance::release`] drops a value there
 //! (dropping a library snapshot took 20–395 ms on the UI thread: a frame hitch at every swap)
@@ -19,11 +21,13 @@
 //!
 //! The memory figures of the periodic health line come from [`super::memstats`].
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
+use crate::model::TileId;
 use crate::player::{PlayerSnapshot, PlayerState};
 
 /// Wait after the first trigger before trimming (let mpv's threads free what they hold).
@@ -73,6 +77,18 @@ pub fn player_trigger(prev: &PlayerSnapshot, next: &PlayerSnapshot) -> Option<&'
     }
 }
 
+/// [`player_trigger`] for one picture of several: a picture that stops while another one
+/// plays is "picture closed" (multi-view's `q`; same trim, its own reason in the log).
+pub fn tile_trigger(prev: &PlayerSnapshot, next: &PlayerSnapshot, other_active: bool) -> Option<&'static str> {
+    match player_trigger(prev, next) {
+        Some("playback stopped") if other_active => Some("picture closed"),
+        t => t,
+    }
+}
+
+/// The latest snapshot of every watched picture (what "picture closed" looks at).
+type Watched = Arc<Mutex<HashMap<TileId, tokio::sync::watch::Receiver<Arc<PlayerSnapshot>>>>>;
+
 enum Msg {
     /// Drop this here, then trim.
     Release(Box<dyn Send>, &'static str),
@@ -96,7 +112,8 @@ type TrimHook = Box<dyn Fn(&'static str) + Send>;
 pub struct Maintenance {
     tx: Sender<Msg>,
     thread: Option<std::thread::JoinHandle<()>>,
-    watcher: Option<tokio::task::AbortHandle>,
+    watchers: HashMap<TileId, tokio::task::AbortHandle>,
+    watched: Watched,
 }
 
 impl Maintenance {
@@ -111,7 +128,7 @@ impl Maintenance {
             .spawn(move || run(rx, timing, hook))
             .map_err(|e| tracing::warn!("memory maintenance thread: {e}"))
             .ok();
-        Self { tx, thread, watcher: None }
+        Self { tx, thread, watchers: HashMap::new(), watched: Watched::default() }
     }
 
     /// Drop `what` on the maintenance thread, then trim (the module docs say why). Without the
@@ -127,16 +144,22 @@ impl Maintenance {
         let _ = self.tx.send(Msg::Trim(why));
     }
 
-    /// Trim after the player stops, switches video off or (re)loads a stream
-    /// ([`player_trigger`]). Runs on `rt` until this is dropped.
-    pub fn watch_player(&mut self, rt: &tokio::runtime::Handle, mut snapshots: tokio::sync::watch::Receiver<Arc<PlayerSnapshot>>) {
+    /// Trim after picture `tile`'s player stops, switches video off or (re)loads a stream
+    /// ([`tile_trigger`]). Runs on `rt` until this is dropped (or `tile` is watched again).
+    pub fn watch_player(&mut self, rt: &tokio::runtime::Handle, tile: TileId, mut snapshots: tokio::sync::watch::Receiver<Arc<PlayerSnapshot>>) {
         let tx = self.tx.clone();
+        let watched = self.watched.clone();
+        watched.lock().unwrap_or_else(|e| e.into_inner()).insert(tile, snapshots.clone());
         // the state at subscription is the baseline (not whatever the task first sees)
         let mut prev = snapshots.borrow_and_update().clone();
         let task = rt.spawn(async move {
             while snapshots.changed().await.is_ok() {
                 let next = snapshots.borrow_and_update().clone();
-                if let Some(why) = player_trigger(&prev, &next)
+                let other_active = || {
+                    let w = watched.lock().unwrap_or_else(|e| e.into_inner());
+                    w.iter().any(|(t, rx)| *t != tile && rx.borrow().state.is_active())
+                };
+                if let Some(why) = tile_trigger(&prev, &next, player_trigger(&prev, &next).is_some() && other_active())
                     && tx.send(Msg::Trim(why)).is_err()
                 {
                     break;
@@ -144,7 +167,7 @@ impl Maintenance {
                 prev = next;
             }
         });
-        if let Some(old) = self.watcher.replace(task.abort_handle()) {
+        if let Some(old) = self.watchers.insert(tile, task.abort_handle()) {
             old.abort();
         }
     }
@@ -152,7 +175,7 @@ impl Maintenance {
 
 impl Drop for Maintenance {
     fn drop(&mut self) {
-        if let Some(w) = self.watcher.take() {
+        for (_, w) in self.watchers.drain() {
             w.abort();
         }
         let _ = self.tx.send(Msg::Shutdown);
@@ -287,6 +310,11 @@ mod tests {
         assert_eq!(player_trigger(&playing, &snap(PlayerState::Paused, false, 1)), None);
         assert_eq!(player_trigger(&snap(PlayerState::Playing, true, 1), &playing), None);
         assert_eq!(player_trigger(&snap(PlayerState::Idle, false, 1), &snap(err, false, 1)), None);
+        // multi-view: a picture that stops while the other plays
+        let idle = snap(PlayerState::Idle, false, 1);
+        assert_eq!(tile_trigger(&playing, &idle, true), Some("picture closed"));
+        assert_eq!(tile_trigger(&playing, &idle, false), Some("playback stopped"));
+        assert_eq!(tile_trigger(&playing, &snap(PlayerState::Playing, true, 1), true), Some("video off"));
     }
 
     /// The player's snapshot channel drives trims: video switched off (hidden window) and stop.
@@ -295,7 +323,7 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let (mut m, trims) = quick(10, 0, 60_000);
         let (tx, rx) = tokio::sync::watch::channel(Arc::new(snap(PlayerState::Playing, false, 1)));
-        m.watch_player(rt.handle(), rx);
+        m.watch_player(rt.handle(), TileId::A, rx);
         let spin = |want: &str| {
             rt.block_on(async {
                 tokio::time::timeout(Duration::from_secs(5), async {
@@ -314,6 +342,15 @@ mod tests {
         assert_eq!(spin("video off"), "video off");
         tx.send(Arc::new(snap(PlayerState::Idle, true, 1))).unwrap();
         assert_eq!(spin("stop"), "playback stopped");
+        // a second picture: its stop while A plays is "picture closed"; A's watch keeps going
+        tx.send(Arc::new(snap(PlayerState::Playing, false, 2))).unwrap();
+        assert_eq!(spin("reload"), "stream reload");
+        let (tx_b, rx_b) = tokio::sync::watch::channel(Arc::new(snap(PlayerState::Playing, false, 1)));
+        m.watch_player(rt.handle(), TileId::B, rx_b);
+        tx_b.send(Arc::new(snap(PlayerState::Idle, false, 1))).unwrap();
+        assert_eq!(spin("picture closed"), "picture closed");
+        tx.send(Arc::new(snap(PlayerState::Playing, true, 2))).unwrap();
+        assert_eq!(spin("A's video off"), "video off");
         drop(m);
     }
 

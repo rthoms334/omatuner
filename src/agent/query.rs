@@ -18,17 +18,17 @@ use std::collections::{HashMap, HashSet};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::proto::{
-    self, AgentRef, Airing, Browse, BrowseOut, BrowseSort, Categories, CategoriesOut, CategoryOut, ChannelItemOut, ChannelOut, ContinueItem,
-    ContinueOut, Details, DetailsOut, EpisodeOut, ErrorCode, FavListOut, Favourites, FavouritesOut, GuideSearch, GuideSearchOut, ItemOut, Kind,
-    Limit, ProgrammeOut, ProgressOut, Search, SearchOut, SeasonOut, TitleOut, WhatsOn, WhatsOnOut, fmt_time, item_ref,
+    self, AgentRef, Airing, Browse, BrowseOut, BrowseSort, Categories, CategoriesOut, CategoryKind, CategoryOut, ChannelItemOut, ChannelOut,
+    ContinueItem, ContinueOut, CopyOut, Details, DetailsOut, EpisodeOut, ErrorCode, FavListOut, Favourites, FavouritesOut, FilteredOut, GuideSearch,
+    GuideSearchOut, ItemOut, Kind, ProgrammeOut, ProgressOut, Search, SearchOut, SeasonOut, TitleOut, WhatsOn, WhatsOnOut, fmt_time, item_ref,
 };
-use super::shared::ParentalView;
 use crate::config::Config;
 use crate::jobs::JobKind;
 use crate::model::{
     ChannelId, ChannelSummary, Episode, GroupId, ItemKind, ItemRef, MovieId, ProgrammeSlim, SeriesId, SourceId, SourceKind, Timestamp, VodKind,
     VodSummary, WatchProgress,
 };
+use crate::shared::ParentalView;
 use crate::store::library::{FavIndex, Library, SourceMeta};
 
 /// A request that can't be answered: the error code and a sentence for the model.
@@ -352,17 +352,62 @@ impl<'a> Q<'a> {
     }
 
     pub fn programme_out(&self, c: &ChannelSummary, p: &ProgrammeSlim, also_on: Vec<ChannelOut>) -> ProgrammeOut {
+        self.programme_out_x(c, p, also_on, None)
+    }
+
+    /// [`Q::programme_out`] with the guide's extra fields (categories, numbers, flags, rating).
+    pub fn programme_out_x(&self, c: &ChannelSummary, p: &ProgrammeSlim, also_on: Vec<ChannelOut>, x: Option<&Extra>) -> ProgrammeOut {
+        let catchup = self.catchup(c, p);
+        let airing = self.airing(p);
         ProgrammeOut {
             item: AgentRef::programme(channel_ref(c), p.start).to_string(),
             title: clean(&p.title),
             subtitle: clean_opt(p.sub_title.as_deref()),
             start: fmt_time(p.start),
             end: fmt_time(p.stop),
-            airing: self.airing(p),
-            catchup: self.catchup(c, p),
+            airing,
+            catchup,
             channel: self.channel_out(c),
             also_on,
+            categories: x.map(|x| x.categories.iter().map(|c| clean(c)).collect()).unwrap_or_default(),
+            season: x.and_then(|x| x.season),
+            episode: x.and_then(|x| x.episode),
+            is_live: p.flags.is_live,
+            is_new: p.flags.is_new,
+            repeat: x.is_some_and(|x| x.repeat),
+            content_rating: x.and_then(|x| clean_opt(x.rating.as_deref())),
+            catchup_until: catchup.then(|| fmt_time(p.start + i64::from(catchup_days(c)) * 86_400)),
+            remaining_min: (airing == Airing::Live).then(|| ((p.stop - self.now).max(0) as u32).div_ceil(60)),
         }
+    }
+
+    /// The guide's extra fields of programmes (one query per 500 ids).
+    pub fn extras(&self, ids: &[crate::model::ProgrammeId]) -> Out<HashMap<crate::model::ProgrammeId, Extra>> {
+        let mut out = HashMap::with_capacity(ids.len());
+        for chunk in ids.chunks(500) {
+            let marks = vec!["?"; chunk.len()].join(",");
+            let mut stmt =
+                self.conn.prepare(&format!("SELECT id, categories, season, episode, rating, flags FROM programme WHERE id IN ({marks})"))?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                let cats: Option<String> = r.get(1)?;
+                let flags: i64 = r.get(5)?;
+                Ok((
+                    r.get::<_, crate::model::ProgrammeId>(0)?,
+                    Extra {
+                        categories: cats.map(|c| c.split('\x1f').filter(|s| !s.is_empty()).map(str::to_owned).collect()).unwrap_or_default(),
+                        season: r.get(2)?,
+                        episode: r.get(3)?,
+                        rating: r.get(4)?,
+                        repeat: flags & 4 != 0,
+                    },
+                ))
+            })?;
+            for row in rows {
+                let (id, x) = row?;
+                out.insert(id, x);
+            }
+        }
+        Ok(out)
     }
 
     /// `c` is in a playlist the user keeps out of All.
@@ -490,6 +535,38 @@ impl<'a> Q<'a> {
     }
 }
 
+/// What the guide says of a programme beyond its slim row.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Extra {
+    pub categories: Vec<String>,
+    pub season: Option<u32>,
+    pub episode: Option<u32>,
+    /// Age rating.
+    pub rating: Option<String>,
+    /// Shown before.
+    pub repeat: bool,
+}
+
+impl Extra {
+    /// One of its categories holds one of `words` (lower-case).
+    pub fn in_categories(&self, words: &[String]) -> bool {
+        words.is_empty()
+            || self.categories.iter().any(|c| {
+                let c = c.to_lowercase();
+                words.iter().any(|w| c.contains(w.as_str()))
+            })
+    }
+}
+
+/// Category words of a param (lower-case, ≤ 10).
+pub fn category_words(cats: Option<&[String]>) -> Out<Vec<String>> {
+    let cats = cats.unwrap_or_default();
+    if cats.len() > 10 {
+        return Err(Fail::bad("at most 10 categories"));
+    }
+    cats.iter().map(|c| text("categories", c).map(str::to_lowercase)).collect()
+}
+
 pub fn channel_ref(c: &ChannelSummary) -> ItemRef {
     ItemRef { source: c.source_id, kind: ItemKind::Channel, key: c.key.clone() }
 }
@@ -508,22 +585,161 @@ pub fn parse_ref(s: &str) -> Out<AgentRef> {
 /// FTS hits read before visibility / time filtering and merging (`truncated` when reached: hidden
 /// channels' matches may have taken the room).
 const GUIDE_FETCH: usize = 500;
+/// Programmes a search without words reads at most (a window over categories or a channel).
+const WINDOW_FETCH: usize = 2000;
+/// The longest window a search without words may cover.
+const MAX_WINDOW_S: i64 = 3 * 86_400;
 /// Other channels listed with a programme.
 const MAX_ALSO_ON: usize = 10;
 
+/// The channels a `channel` / `playlist` / `favourites_only` filter leaves (`None`: no filter).
+fn channel_set(q: &Q, channel: Option<&str>, playlist: Option<&str>, favourites_only: bool) -> Out<Option<HashSet<ChannelId>>> {
+    if channel.is_none() && playlist.is_none() && !favourites_only {
+        return Ok(None);
+    }
+    let sources: Option<HashSet<SourceId>> =
+        playlist.map(|p| q.scope(ItemKind::Channel, Some(p)).map(|(s, _)| s.iter().map(|s| s.id).collect())).transpose()?;
+    let name = channel.map(|s| text("channel", s)).transpose()?;
+    let number = name.and_then(|n| n.parse::<u32>().ok());
+    let name_words = name.map(words).unwrap_or_default();
+    let favs = q.favs();
+    let set: HashSet<ChannelId> = q
+        .lib
+        .live
+        .channels
+        .iter()
+        .filter(|c| !q.lib.live.hidden.contains(&c.id))
+        .filter(|c| sources.as_ref().is_none_or(|s| s.contains(&c.source_id)))
+        .filter(|c| name.is_none() || number.is_some_and(|n| c.number == Some(n)) || matches_words(&c.name, &name_words))
+        .filter(|c| !favourites_only || favs.is_fav(&channel_ref(c)))
+        .map(|c| c.id)
+        .collect();
+    if set.is_empty() {
+        return Err(Fail::not_found("channel"));
+    }
+    Ok(Some(set))
+}
+
+/// Guide rows (guide time) with the channels showing each, as `epg::search` gives them.
+type Hits = Vec<(ProgrammeSlim, Vec<ChannelId>)>;
+
+/// Programmes overlapping [`from`, `to`) (as shown) on the guide channels of `channels`, in
+/// guide time, with the categories asked for. `(hits, capped)`.
+fn window_hits(q: &Q, from: Timestamp, to: Timestamp, cats: &[String], channels: &[&ChannelSummary]) -> Out<(Hits, bool)> {
+    // guide channel → its channels; the widest shift range decides the guide-time window
+    let mut by_epg: HashMap<crate::model::EpgChannelId, Vec<ChannelId>> = HashMap::new();
+    let (mut lo, mut hi) = (0i64, 0i64);
+    for c in channels {
+        if let Some(e) = c.epg_channel_id {
+            by_epg.entry(e).or_default().push(c.id);
+            lo = lo.min(i64::from(c.tvg_shift_min) * 60);
+            hi = hi.max(i64::from(c.tvg_shift_min) * 60);
+        }
+    }
+    let (from_g, to_g) = (from - hi, to - lo);
+    let cat_sql: String =
+        cats.iter().enumerate().map(|(i, _)| format!("instr(lower(p.categories), ?{})", i + 5)).collect::<Vec<_>>().join(" > 0 OR ");
+    let cat_sql = if cats.is_empty() { String::new() } else { format!("AND ({cat_sql} > 0)") };
+    let mut stmt = q.conn.prepare(&format!(
+        "SELECT p.id, p.start, p.stop, p.title, p.sub_title, p.flags, p.catchup_id IS NOT NULL FROM programme p
+         WHERE p.epg_channel_id = ?1
+           AND p.gen = (SELECT es.active_gen FROM epg_channel ec JOIN epg_source es ON es.id = ec.epg_source_id WHERE ec.id = ?1 AND es.enabled = 1)
+           AND p.start >= ?2 - 43200 AND p.start < ?3 AND p.stop > ?2 {cat_sql}
+         ORDER BY p.start LIMIT ?4"
+    ))?;
+    let mut epgs: Vec<_> = by_epg.keys().copied().collect();
+    epgs.sort_unstable();
+    let mut out = Vec::new();
+    for e in epgs {
+        let room = (WINDOW_FETCH + 1).saturating_sub(out.len());
+        if room == 0 {
+            break;
+        }
+        let mut args: Vec<rusqlite::types::Value> = vec![e.0.into(), from_g.into(), to_g.into(), (room as i64).into()];
+        args.extend(cats.iter().map(|c| rusqlite::types::Value::from(c.clone())));
+        let rows = stmt.query_map(rusqlite::params_from_iter(args), |r| {
+            let flags: i64 = r.get(5)?;
+            Ok(ProgrammeSlim {
+                id: r.get(0)?,
+                start: r.get(1)?,
+                stop: r.get(2)?,
+                title: std::sync::Arc::from(r.get::<_, String>(3)?),
+                sub_title: r.get::<_, Option<String>>(4)?.map(std::sync::Arc::from),
+                flags: crate::model::ProgrammeFlags { is_new: flags & 1 != 0, is_live: flags & 2 != 0, has_catchup_id: r.get(6)? },
+            })
+        })?;
+        for row in rows {
+            out.push((row?, by_epg[&e].clone()));
+        }
+    }
+    let capped = out.len() > WINDOW_FETCH;
+    out.truncate(WINDOW_FETCH);
+    Ok((out, capped))
+}
+
 pub fn guide_search(q: &Q, p: &GuideSearch) -> Out<GuideSearchOut> {
-    let query = text("query", &p.query)?;
     let limit = clamp(p.limit, 20, 50);
     let from = p.from.as_deref().map(|s| when("from", s, q.now)).transpose()?;
     let to = p.to.as_deref().map(|s| when("to", s, q.now)).transpose()?;
     let include_past = p.include_past.unwrap_or(true);
-    let hits = crate::store::epg::search(q.conn, query, q.now, GUIDE_FETCH)?;
+    let cats = category_words(p.categories.as_deref())?;
+    let only = channel_set(q, p.channel.as_deref(), p.playlist.as_deref(), p.favourites_only == Some(true))?;
+    let query = p.query.as_deref().map(|s| text("query", s)).transpose()?;
+    let (hits, capped) = match query {
+        Some(query) => {
+            let hits = crate::store::epg::search(q.conn, query, q.now, GUIDE_FETCH)?;
+            let capped = hits.len() >= GUIDE_FETCH;
+            (hits.into_iter().map(|h| (h.programme, h.channel_ids)).collect::<Vec<_>>(), capped)
+        }
+        None => {
+            let (Some(f), Some(t)) = (from, to) else {
+                return Err(Fail::bad("without query, give a window: from and to"));
+            };
+            if t <= f || t - f > MAX_WINDOW_S {
+                return Err(Fail::bad("the window (from → to) must be positive and at most 3 days"));
+            }
+            if cats.is_empty() && p.channel.is_none() {
+                return Err(Fail::bad("without query, name categories or a channel"));
+            }
+            // like the guide's All playlists, unless a playlist or channel is named
+            let all: Option<HashSet<SourceId>> = (p.playlist.is_none() && p.channel.is_none())
+                .then(|| q.scope(ItemKind::Channel, None))
+                .transpose()?
+                .map(|(s, _)| s.iter().map(|s| s.id).collect());
+            let chans: Vec<&ChannelSummary> = q
+                .lib
+                .live
+                .channels
+                .iter()
+                .filter(|c| !q.lib.live.hidden.contains(&c.id))
+                .filter(|c| only.as_ref().is_none_or(|o| o.contains(&c.id)))
+                .filter(|c| all.as_ref().is_none_or(|a| a.contains(&c.source_id)))
+                .collect();
+            window_hits(q, f, t, &cats, &chans)?
+        }
+    };
+    let extras = q.extras(&hits.iter().map(|(p, _)| p.id).collect::<Vec<_>>())?;
+    let none = Extra::default();
     // one row per programme as shown (title + shifted start): its channels best first
     let mut rows: Vec<(ProgrammeSlim, Vec<&ChannelSummary>)> = Vec::new();
     let mut index: HashMap<(String, Timestamp), usize> = HashMap::new();
-    for hit in &hits {
-        for c in hit.channel_ids.iter().filter_map(|id| q.channel(*id)) {
-            let shown = hit.programme.shifted(c.tvg_shift_min);
+    for (prog, ids) in &hits {
+        let x = extras.get(&prog.id).unwrap_or(&none);
+        if !x.in_categories(&cats)
+            || (p.live_only == Some(true) && !prog.flags.is_live)
+            || (p.new_only == Some(true) && !prog.flags.is_new)
+            || (p.exclude_repeats == Some(true) && x.repeat)
+        {
+            continue;
+        }
+        for c in ids.iter().filter_map(|id| q.channel(*id)) {
+            if only.as_ref().is_some_and(|o| !o.contains(&c.id)) {
+                continue;
+            }
+            let shown = prog.shifted(c.tvg_shift_min);
+            if p.catchup_only == Some(true) && !q.catchup(c, &shown) {
+                continue;
+            }
             let key = (shown.title.to_lowercase(), shown.start);
             match index.get(&key) {
                 Some(&i) => {
@@ -548,14 +764,14 @@ pub fn guide_search(q: &Q, p: &GuideSearch) -> Out<GuideSearchOut> {
         Airing::Upcoming => (1, prog.start),
         Airing::Past => (2, -prog.start),
     });
-    let truncated = rows.len() > limit || hits.len() >= GUIDE_FETCH;
+    let truncated = rows.len() > limit || capped;
     let programmes = rows
         .into_iter()
         .take(limit)
         .map(|(prog, mut chans)| {
             chans.sort_by_key(|c| q.channel_rank(c));
             let also_on = chans[1..].iter().take(MAX_ALSO_ON).map(|c| q.channel_out(c)).collect();
-            q.programme_out(chans[0], &prog, also_on)
+            q.programme_out_x(chans[0], &prog, also_on, extras.get(&prog.id))
         })
         .collect();
     Ok(GuideSearchOut { programmes, truncated })
@@ -569,6 +785,7 @@ const WHATS_ON_SCAN: usize = 1500;
 pub fn whats_on(q: &Q, p: &WhatsOn) -> Out<WhatsOnOut> {
     let at = p.at.as_deref().map(|s| when("at", s, q.now)).transpose()?.unwrap_or(q.now);
     let limit = clamp(p.limit, 30, 100);
+    let cats = category_words(p.categories.as_deref())?;
     let name = p.channel.as_deref().map(|s| text("channel", s)).transpose()?;
     let number = name.and_then(|n| n.parse::<u32>().ok());
     let name_words = name.map(words).unwrap_or_default();
@@ -615,13 +832,18 @@ pub fn whats_on(q: &Q, p: &WhatsOn) -> Out<WhatsOnOut> {
         }
         looked += 1;
         let Some(c) = q.channel(*id) else { continue };
-        if let Some(prog) = q.now_on(c, at)? {
-            programmes.push(q.programme_out(c, &prog, Vec::new()));
+        let Some(prog) = q.now_on(c, at)? else { continue };
+        if p.live_only == Some(true) && !prog.flags.is_live {
+            continue;
         }
+        let x = q.extras(&[prog.id])?.remove(&prog.id);
+        if !x.as_ref().is_some_and(|x| x.in_categories(&cats)) && !cats.is_empty() {
+            continue;
+        }
+        programmes.push(q.programme_out_x(c, &prog, Vec::new(), x.as_ref()));
     }
     Ok(WhatsOnOut { at: fmt_time(at), programmes, truncated: looked < order.len() })
 }
-
 // ------------------------------------------------------------------ search
 
 pub fn search(q: &Q, p: &Search) -> Out<SearchOut> {
@@ -669,7 +891,131 @@ pub fn search(q: &Q, p: &Search) -> Out<SearchOut> {
             Cand::Title(movies, i) => Some(ItemOut::Title(q.title_out(movies, i))),
         })
         .collect();
-    Ok(SearchOut { results })
+    let filtered = if p.explain_filtered == Some(true) { explain_filtered(q, query, &kinds)? } else { Vec::new() };
+    Ok(SearchOut { results, filtered })
+}
+
+/// Rows `explain_filtered` reads per kind, and the notes it returns at most.
+const EXPLAIN_FETCH: usize = 200;
+const EXPLAIN_MAX: usize = 10;
+
+/// Titles with every word of `query` in their name that one of the user's OWN settings keeps
+/// out of view: a category they hid, the category filter, an item they hid, the title-language
+/// rule; or (shown, but not in All playlists) a playlist kept out of All. Explicit content never
+/// comes up, whatever the parental state (no "1 hidden" hint), and neither does a title whose
+/// category the snapshot doesn't hold.
+fn explain_filtered(q: &Q, query: &str, kinds: &[Kind]) -> Out<Vec<FilteredOut>> {
+    let w = words(query);
+    let Some(first) = w.iter().max_by_key(|x| x.len()) else { return Ok(Vec::new()) };
+    let like = format!("%{}%", first.replace(['%', '_'], ""));
+    let mut out: Vec<FilteredOut> = Vec::new();
+    let mut seen: HashSet<(SourceId, String)> = HashSet::new();
+    for &kind in kinds {
+        let (table, link, col, groups) = match kind {
+            Kind::Channel => ("channel", "channel_group", "channel_id", &q.lib.live.groups),
+            Kind::Movie => ("movie", "movie_group", "movie_id", &q.lib.vod.movie_groups),
+            Kind::Series => ("series", "series_group", "series_id", &q.lib.vod.series_groups),
+        };
+        let mut stmt = q.conn.prepare_cached(&format!("SELECT id, source_id, key, name FROM {table} WHERE lower(name) LIKE ?1 LIMIT ?2"))?;
+        let rows: Vec<(i64, SourceId, String, String)> = stmt
+            .query_map(params![like, EXPLAIN_FETCH as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut link_stmt = q.conn.prepare_cached(&format!("SELECT group_id FROM {link} WHERE {col} = ?1"))?;
+        for (id, source, key, name) in rows {
+            if out.len() == EXPLAIN_MAX {
+                return Ok(out);
+            }
+            if !matches_words(&name, &w) || !seen.insert((source, name.to_lowercase())) {
+                continue;
+            }
+            let item = ItemRef { source, kind: item_kind(kind), key: crate::model::ItemKey(key) };
+            if crate::store::live::item_explicit(q.conn, &item).unwrap_or(true) || q.conceals(&item) {
+                continue;
+            }
+            let Some(meta) = q.lib.source(source) else { continue };
+            let gids: Vec<GroupId> = link_stmt.query_map([id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+            let its: Vec<&crate::model::Group> = gids.iter().filter_map(|g| groups.iter().find(|x| x.id == *g)).collect();
+            if its.len() < gids.len() {
+                continue; // a category this snapshot doesn't hold: say nothing
+            }
+            let visible = match kind {
+                Kind::Channel => q.channel_by_ref(&item).is_some(),
+                Kind::Movie | Kind::Series => q.vod_index(&item)?.is_some(),
+            };
+            let note = |why: &str, category: Option<&crate::model::Group>| FilteredOut {
+                name: clean(&name),
+                kind,
+                playlist: clean(&meta.name),
+                why: why.to_owned(),
+                category: category.map(|g| clean(g.display_name())),
+            };
+            if visible {
+                if !meta.in_all {
+                    out.push(note("not_in_all", None));
+                }
+                continue;
+            }
+            if crate::store::user::item_override(q.conn, &item)?.is_some_and(|o| o.hidden) {
+                out.push(note("hidden_by_you", None));
+            } else if let Some(g) = its.iter().find(|g| g.user_hidden) {
+                out.push(note("hidden_category", Some(g)));
+            } else if let Some(g) = its.iter().find(|g| g.hidden) {
+                out.push(note("category_filter", Some(g)));
+            } else if kind != Kind::Channel && meta.language_hidden > 0 {
+                out.push(note("title_language", None));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// What a category is about, from words of its name.
+pub fn category_kinds(name: &str) -> Vec<CategoryKind> {
+    let n = format!(" {} ", name.to_lowercase().replace(|c: char| !c.is_alphanumeric(), " "));
+    let has = |ws: &[&str]| ws.iter().any(|w| n.contains(w));
+    let mut out = Vec::new();
+    if has(&[" kid", "child", "cartoon", "cbbc", "cbeebies", "junior", "toon", "nickelodeon", " nick ", "disney jr", "baby"]) {
+        out.push(CategoryKind::Kids);
+    }
+    if has(&["family"]) {
+        out.push(CategoryKind::Family);
+    }
+    if has(&[" news"]) {
+        out.push(CategoryKind::News);
+    }
+    if has(&[
+        "sport",
+        "football",
+        "soccer",
+        " f1 ",
+        "formula",
+        "cricket",
+        "rugby",
+        "tennis",
+        " golf",
+        " nba",
+        " nfl",
+        " nhl",
+        "boxing",
+        " ufc",
+        "racing",
+        "motorsport",
+        " darts",
+        "snooker",
+        " dazn",
+        "premier league",
+        "laliga",
+        "bundesliga",
+    ]) {
+        out.push(CategoryKind::Sport);
+    }
+    if has(&["music", " mtv", "concert", " hits "]) {
+        out.push(CategoryKind::Music);
+    }
+    if has(&["documentar", " docu", "nature", "history", "discovery", "nat geo", "science", "wildlife"]) {
+        out.push(CategoryKind::Doc);
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -700,6 +1046,10 @@ pub fn categories(q: &Q, p: &Categories) -> Out<CategoriesOut> {
         .iter()
         .filter(|g| !g.hidden && ids.contains(&g.source_id))
         .filter_map(|g| {
+            let tags = category_kinds(g.display_name());
+            if p.tag.is_some_and(|t| !tags.contains(&t)) {
+                return None;
+            }
             let count = match p.kind {
                 Kind::Channel => q.lib.live.group_members(g.id).len(),
                 _ => q.lib.vod.group_items(g.id, crate::model::SortMode::Provider).len(),
@@ -709,6 +1059,8 @@ pub fn categories(q: &Q, p: &Categories) -> Out<CategoriesOut> {
                 playlist: q.source_name(g.source_id),
                 count: count as u32,
                 locked: q.needs_pin(g.locked),
+                tags,
+                lang: g.tag.as_ref().map(|t| t.0.clone()),
             })
         })
         .collect();
@@ -793,10 +1145,28 @@ pub fn browse(q: &Q, p: &Browse) -> Out<BrowseOut> {
     }
     let progress = q.progress();
     let st = q.lib.vod.stacks(movies);
+    let added_since = p.added_since.as_deref().map(|s| when("added_since", s, q.now)).transpose()?;
+    let table = if movies { "movie" } else { "series" };
+    let person =
+        p.person.as_deref().map(|s| text_ids(q, table, "coalesce(cast_, '') || ' ' || coalesce(director, '')", text("person", s)?)).transpose()?;
+    let genre = p.genre.as_deref().map(|s| text_ids(q, table, "coalesce(genre, '')", text("genre", s)?)).transpose()?;
+    let id_of = |v: &VodSummary| match v.kind {
+        VodKind::Movie(id) => id.0,
+        VodKind::Series(id) => id.0,
+    };
     picked.retain(|&i| {
         let v = &all_items[i as usize];
         if p.unwatched == Some(true) && st.copies(i).iter().any(|c| progress.of(&all_items[*c as usize]).is_some()) {
             return false;
+        }
+        let copies = || st.copies(i).into_iter().map(|c| &all_items[c as usize]);
+        if added_since.is_some_and(|t| !copies().any(|c| c.added_at.is_some_and(|a| a >= t))) {
+            return false;
+        }
+        for set in [&person, &genre].into_iter().flatten() {
+            if !copies().any(|c| set.contains(&id_of(c))) {
+                return false;
+            }
         }
         if let Some(r) = p.min_rating
             && v.rating.is_none_or(|x| x < r)
@@ -832,12 +1202,34 @@ pub fn browse(q: &Q, p: &Browse) -> Out<BrowseOut> {
     Ok(BrowseOut { items, total })
 }
 
+/// Ids of `table` rows whose `expr` (a text column expression) holds every word of `query`.
+fn text_ids(q: &Q, table: &str, expr: &str, query: &str) -> Out<HashSet<i64>> {
+    let w = words(query);
+    let Some(longest) = w.iter().max_by_key(|x| x.len()) else { return Ok(HashSet::new()) };
+    let like = format!("%{}%", longest.replace(['%', '_'], ""));
+    let mut stmt = q.conn.prepare_cached(&format!("SELECT id, lower({expr}) AS t FROM {table} WHERE t LIKE ?1"))?;
+    let rows = stmt.query_map([like], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    let mut out = HashSet::new();
+    for row in rows {
+        let (id, t) = row?;
+        if w.iter().all(|x| t.contains(x.as_str())) {
+            out.insert(id);
+        }
+    }
+    Ok(out)
+}
+
 // ------------------------------------------------------------------ continue / favourites
 
 /// Progress rows read for `continue_watching` (episodes of one series collapse).
 const CONTINUE_FETCH: usize = 200;
 
-pub fn continue_watching(q: &Q, p: &Limit) -> Out<ContinueOut> {
+/// Minutes left of a progress row, when its length is known.
+fn remaining(w: &WatchProgress) -> Option<u32> {
+    w.duration_s.filter(|d| *d > 0.0).map(|d| ((d - w.position_s).max(0.0) / 60.0).round() as u32)
+}
+
+pub fn continue_watching(q: &Q, p: &proto::ContinueWatching) -> Out<ContinueOut> {
     let limit = clamp(p.limit, 10, 30);
     let rows = crate::store::user::continue_watching(q.conn, CONTINUE_FETCH)?;
     let mut seen: HashSet<(bool, u32)> = HashSet::new();
@@ -854,7 +1246,7 @@ pub fn continue_watching(q: &Q, p: &Limit) -> Out<ContinueOut> {
                 let Some(idx) = q.vod_index(&row.item)? else { continue };
                 let key = q.stack_key(true, idx);
                 if seen.insert((true, key)) {
-                    items.push(ContinueItem { title: q.title_out(true, key), next_episode: None });
+                    items.push(ContinueItem { title: q.title_out(true, key), next_episode: None, remaining_min: remaining(&row) });
                 }
             }
             ItemKind::Episode => {
@@ -864,7 +1256,9 @@ pub fn continue_watching(q: &Q, p: &Limit) -> Out<ContinueOut> {
                     continue;
                 }
                 let next = crate::store::copies::next_episode(q.conn, &q.series_copies(key))?.map(|(_, e)| q.episode_out(&e));
-                items.push(ContinueItem { title: q.title_out(false, key), next_episode: next });
+                // minutes left of the episode in progress, when that is the one play starts
+                let left = next.as_ref().filter(|n| n.item == item_ref(&row.item)).and_then(|_| remaining(&row));
+                items.push(ContinueItem { title: q.title_out(false, key), next_episode: next, remaining_min: left });
             }
             _ => {}
         }
@@ -940,8 +1334,13 @@ pub fn details(q: &Q, p: &Details) -> Out<(DetailsOut, Option<JobKind>)> {
             out.description = clean_opt(full.description.as_deref());
             out.categories = full.categories.iter().map(|c| clean(c)).collect();
             out.rating = full.star_rating.as_deref().and_then(star_rating);
+            out.season = full.episode.and_then(|e| e.season);
+            out.episode = full.episode.and_then(|e| e.episode);
+            out.content_rating = clean_opt(full.rating.as_deref());
             out.channel = Some(q.channel_out(c));
-            out.schedule = vec![q.programme_out(c, &prog, Vec::new())];
+            let x = q.extras(&[prog.id])?.remove(&prog.id);
+            out.schedule = vec![q.programme_out_x(c, &prog, Vec::new(), x.as_ref())];
+            out.copies = channel_copies_out(q, c)?;
             Ok((out, None))
         }
         AgentRef::Item(r) => match r.kind {
@@ -967,6 +1366,7 @@ pub fn details(q: &Q, p: &Details) -> Out<(DetailsOut, Option<JobKind>)> {
                     }
                     out.schedule = sched.iter().take(CHANNEL_UPCOMING + 1).map(|p| q.programme_out(c, p, Vec::new())).collect();
                 }
+                out.copies = channel_copies_out(q, c)?;
                 Ok((out, None))
             }
             ItemKind::Movie => {
@@ -990,6 +1390,7 @@ pub fn details(q: &Q, p: &Details) -> Out<(DetailsOut, Option<JobKind>)> {
                 out.runtime_min = m.duration_s.filter(|d| *d > 0).map(|d| (f64::from(d) / 60.0).round() as u32).or(title.runtime_min);
                 out.release_date = clean_opt(m.release_date.as_deref());
                 out.progress = title.progress;
+                out.copies = title_copies_out(q, true, idx);
                 out.details_pending = lazy;
                 Ok((out, lazy.then_some(JobKind::LoadMovieDetails(id))))
             }
@@ -1016,6 +1417,7 @@ pub fn details(q: &Q, p: &Details) -> Out<(DetailsOut, Option<JobKind>)> {
                     crate::store::vod::seasons(q.conn, id)?.into_iter().map(|s| SeasonOut { number: s.number, episodes: s.episode_count }).collect();
                 out.next_episode = crate::store::copies::next_episode(q.conn, &q.series_copies(idx))?.map(|(_, e)| q.episode_out(&e));
                 out.progress = title.progress;
+                out.copies = title_copies_out(q, false, idx);
                 out.details_pending = lazy;
                 Ok((out, lazy.then_some(JobKind::LoadSeriesDetails(id))))
             }
@@ -1037,6 +1439,52 @@ pub fn details(q: &Q, p: &Details) -> Out<(DetailsOut, Option<JobKind>)> {
             }
         },
     }
+}
+
+/// A channel and its copies in other playlists (B5 `channel_copies`: same family, no tvg-id
+/// veto), visible ones only, with their failures of the last 7 days.
+pub fn channel_copies_out(q: &Q, c: &ChannelSummary) -> Out<Vec<CopyOut>> {
+    let failures = crate::store::live::failures(q.conn, q.now - 7 * 86_400)?;
+    let copies = crate::store::copies::channel_copies(q.lib, q.conn, c.id)?;
+    let ids = std::iter::once(c.id).chain(copies.iter().filter(|x| !(x.explicit && q.view.hides_explicit)).map(|x| x.id));
+    Ok(ids
+        .filter_map(|id| q.channel(id))
+        .map(|ch| {
+            let r = channel_ref(ch);
+            CopyOut {
+                item: item_ref(&r),
+                playlist: q.source_name(ch.source_id),
+                quality: ch.quality.map(|x| x.label().to_owned()),
+                failures_7d: failures.get(&r).map_or(0, |f| f.count),
+                has_guide: Some(ch.epg_channel_id.is_some()),
+                catchup_days: Some(catchup_days(ch)),
+                locked: q.needs_pin(ch.locked),
+            }
+        })
+        .collect())
+}
+
+/// The copies of a movie or series (its stack), the one that plays first first.
+pub fn title_copies_out(q: &Q, movies: bool, idx: u32) -> Vec<CopyOut> {
+    let items = q.items(movies);
+    let mut copies = q.lib.vod.stacks(movies).copies(idx);
+    copies.sort_by_key(|c| *c != idx);
+    if copies.len() < 2 {
+        return Vec::new();
+    }
+    copies
+        .into_iter()
+        .filter_map(|c| items.get(c as usize))
+        .map(|v| CopyOut {
+            item: item_ref(&crate::store::copies::vod_ref(v)),
+            playlist: q.source_name(v.source_id),
+            quality: None,
+            failures_7d: 0,
+            has_guide: None,
+            catchup_days: None,
+            locked: q.needs_pin(v.locked),
+        })
+        .collect()
 }
 
 /// XMLTV star rating `7/10` / `3.5/5` → 0–10.

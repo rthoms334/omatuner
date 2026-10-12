@@ -93,6 +93,10 @@ pub enum ImageKind {
     Backdrop,
     /// Episode stills: fit in 400×225.
     Still,
+    /// A still or icon under the spoiler guard (DESIGN §34 §2.2): fit in 12×12, then shown
+    /// stretched with linear filtering (a blur without a shader) under a scrim. Its own cache
+    /// key, so the sharp image is never what a guarded painter gets.
+    Obscured,
 }
 
 impl ImageKind {
@@ -102,6 +106,7 @@ impl ImageKind {
             ImageKind::Poster => (342, 513),
             ImageKind::Backdrop => (1280, 720),
             ImageKind::Still => (400, 225),
+            ImageKind::Obscured => (12, 12),
         }
     }
 
@@ -111,6 +116,7 @@ impl ImageKind {
             ImageKind::Poster => 1,
             ImageKind::Backdrop => 2,
             ImageKind::Still => 3,
+            ImageKind::Obscured => 4,
         }
     }
 }
@@ -1368,5 +1374,9 @@ mod tests {
         assert_ne!(a, key_of("http://a", ImageKind::Poster));
         assert_ne!(a, key_of("http://b", ImageKind::Logo));
         assert_eq!(a, key_of("http://a", ImageKind::Logo));
+        // the spoiler guard's obscured still is its own entry, never the sharp one, and tiny
+        assert_ne!(key_of("http://a", ImageKind::Still), key_of("http://a", ImageKind::Obscured));
+        let img = decode(&png(400, 225), ImageKind::Obscured).unwrap();
+        assert_eq!(img.size, [12, 7]);
     }
 }

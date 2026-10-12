@@ -30,11 +30,16 @@
 pub mod backup;
 pub mod copies;
 pub mod epg;
+pub mod follow;
+pub mod guide_fix;
 pub mod import;
 pub mod library;
 pub mod live;
 pub mod migrations;
+pub mod queue;
+pub mod retime;
 pub mod sources;
+pub mod spoiler;
 pub mod sql;
 pub mod stacks;
 pub mod titles;

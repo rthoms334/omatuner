@@ -66,6 +66,12 @@ pub struct BackupManualMapping {
     /// Matched by name on import (EPG source ids differ between installs).
     pub epg_source_name: String,
     pub xmltv_id: String,
+    /// The guide channel's name when it was chosen (Guide fixes finds a renamed id by it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epg_name: Option<String>,
+    /// Who chose it (`FixActor`, as stored); absent: "you".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -92,8 +98,37 @@ pub struct Backup {
     /// was shared — their playlists' own rules are adopted on restore).
     #[serde(default)]
     pub shared_category_filter: Option<crate::model::CategoryFilter>,
+    /// The batch features' user data (DESIGN §31–§34): Up next rows, Following rules (not their
+    /// ledger), spoiler-guard rules and seen events — each owner's `export` / `import`.
+    #[serde(default, skip_serializing_if = "FeatureBackup::is_empty")]
+    pub features: FeatureBackup,
     /// Raw `config.toml` text.
     pub config: Option<String>,
+}
+
+/// The batch features' user data, as each owner store module writes it (opaque JSON here, so a
+/// feature's format is its own; `None` = nothing to restore).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FeatureBackup {
+    /// `store::queue::export` (Q-core).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue: Option<serde_json::Value>,
+    /// `store::follow::export` (F-AB).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub follow: Option<serde_json::Value>,
+    /// `store::spoiler::export` (S1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spoiler: Option<serde_json::Value>,
+    /// `store::guide_fix::export` (G-core): time shifts and dismissals.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guide_fix: Option<serde_json::Value>,
+}
+
+impl FeatureBackup {
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_none() && self.follow.is_none() && self.spoiler.is_none() && self.guide_fix.is_none()
+    }
 }
 
 /// One `title_link` row.
@@ -195,11 +230,18 @@ pub fn export(conn: &Connection, opts: BackupOptions, config_toml: Option<String
     };
     let manual_mappings = {
         let mut stmt = conn.prepare_cached(
-            "SELECT m.source_id, m.channel_key, es.name, m.xmltv_id FROM channel_epg_map m JOIN epg_source es ON es.id = m.epg_source_id
+            "SELECT m.source_id, m.channel_key, es.name, m.xmltv_id, m.epg_name, m.actor FROM channel_epg_map m JOIN epg_source es ON es.id = m.epg_source_id
              WHERE m.method = 'manual' ORDER BY m.source_id, m.channel_key",
         )?;
         stmt.query_map([], |r| {
-            Ok(BackupManualMapping { source_id: r.get(0)?, channel_key: r.get(1)?, epg_source_name: r.get(2)?, xmltv_id: r.get(3)? })
+            Ok(BackupManualMapping {
+                source_id: r.get(0)?,
+                channel_key: r.get(1)?,
+                epg_source_name: r.get(2)?,
+                xmltv_id: r.get(3)?,
+                epg_name: r.get(4)?,
+                actor: r.get(5)?,
+            })
         })?
         .collect::<rusqlite::Result<_>>()?
     };
@@ -223,6 +265,12 @@ pub fn export(conn: &Connection, opts: BackupOptions, config_toml: Option<String
             .map(|l| BackupTitleLink { item: l.item, action: l.action.as_str().to_owned(), at: l.at, group: l.group })
             .collect(),
         shared_category_filter: crate::store::sources::shared_category_filter(conn)?,
+        features: FeatureBackup {
+            queue: crate::store::queue::export(conn)?,
+            follow: crate::store::follow::export(conn)?,
+            spoiler: crate::store::spoiler::export(conn)?,
+            guide_fix: crate::store::guide_fix::export(conn)?,
+        },
         config: config_toml,
     })
 }
@@ -515,22 +563,47 @@ pub fn restore(conn: &mut Connection, b: &Backup, mode: RestoreMode) -> Result<R
     for r in &b.reminders {
         let Some(item) = remap(&r.channel) else { continue };
         rows += tx.execute(
-            "INSERT INTO reminder(source_id, channel_key, channel_name, title, start, stop, lead_s, state)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(source_id, channel_key, start) DO NOTHING",
-            params![item.source, item.key.as_str(), r.channel_name, r.programme_title, r.start, r.stop, r.lead_s, enum_str(&r.state)],
+            "INSERT INTO reminder(source_id, channel_key, channel_name, title, start, stop, lead_s, state, mode, offset_s, open_in)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT(source_id, channel_key, start) DO NOTHING",
+            params![
+                item.source,
+                item.key.as_str(),
+                r.channel_name,
+                r.programme_title,
+                r.start,
+                r.stop,
+                r.lead_s,
+                enum_str(&r.state),
+                enum_str(&r.mode),
+                r.offset_s,
+                r.open_in.as_ref().map(enum_str)
+            ],
         )?;
+    }
+    // ---- the batch features (each owner remaps its own refs; rule ids never carry over)
+    if let Some(v) = &b.features.queue {
+        rows += crate::store::queue::import(&tx, v, &remap)?;
+    }
+    if let Some(v) = &b.features.follow {
+        rows += crate::store::follow::import(&tx, v, &remap)?;
+    }
+    if let Some(v) = &b.features.spoiler {
+        rows += crate::store::spoiler::import(&tx, v, &remap)?;
+    }
+    if let Some(v) = &b.features.guide_fix {
+        rows += crate::store::guide_fix::import(&tx, v, &remap)?;
     }
 
     // ---- manual EPG mappings (by guide name)
     for m in &b.manual_mappings {
         let (Some(source), Some(epg)) = (source_map.get(&m.source_id), epg_by_name.get(&m.epg_source_name)) else { continue };
         rows += tx.execute(
-            "INSERT INTO channel_epg_map(source_id, channel_key, epg_source_id, xmltv_id, method, confidence)
-             VALUES (?1, ?2, ?3, ?4, 'manual', 1.0)
+            "INSERT INTO channel_epg_map(source_id, channel_key, epg_source_id, xmltv_id, method, confidence, epg_name, actor)
+             VALUES (?1, ?2, ?3, ?4, 'manual', 1.0, ?5, COALESCE(?6, 'you'))
              ON CONFLICT(source_id, channel_key, epg_source_id) DO UPDATE SET xmltv_id = excluded.xmltv_id, method = 'manual',
-               confidence = 1.0
+               confidence = 1.0, shift_min = NULL, epg_name = excluded.epg_name, actor = excluded.actor
              WHERE channel_epg_map.method != 'manual'",
-            params![source, m.channel_key, epg, m.xmltv_id],
+            params![source, m.channel_key, epg, m.xmltv_id, m.epg_name, m.actor.as_deref().filter(|a| matches!(*a, "you" | "claude"))],
         )?;
     }
     crate::store::epg::resolve_mappings(&tx)?;

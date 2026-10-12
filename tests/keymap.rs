@@ -273,6 +273,96 @@ fn stack_fan_out_and_play_from() {
     assert!(help_rows(K::PosterGrid).iter().any(|r| r.0 == "Space" && r.1.starts_with("Show each copy")));
 }
 
+// ------------------------------------------------------------------ the big-features batch
+
+fn ctrl_shift(k: Key) -> egui::Event {
+    key_mods(k, Modifiers::CTRL | Modifiers::COMMAND | Modifiers::SHIFT, false)
+}
+
+/// Up next (DESIGN §32): Ctrl+N / Ctrl+Shift+N on every item, search hit and guide programme —
+/// never Global (a text field would pass it on) — Alt+6 everywhere, u / n / N in both players.
+#[test]
+fn up_next_keys() {
+    for stack in
+        [vec![K::List], vec![K::ListFiltering], vec![K::PosterGrid], vec![K::PosterGridFiltering], vec![K::Detail], vec![K::Search], vec![K::Guide]]
+    {
+        assert_eq!(resolve(&stack, &ctrl(Key::N)), Some(Action::QueueAdd), "{stack:?}");
+        assert_eq!(resolve(&stack, &ctrl_shift(Key::N)), Some(Action::QueuePlayNext), "{stack:?}");
+    }
+    assert!(!keymap::GLOBAL.iter().any(|b| matches!(b.action, Action::QueueAdd | Action::QueuePlayNext)));
+    assert_eq!(resolve(&[K::TextInput, K::List], &ctrl(Key::N)), None, "a text field never adds");
+    for stack in [vec![K::List], vec![K::PlayerLive], vec![K::TextInput, K::Panel]] {
+        assert_eq!(resolve(&stack, &alt(Key::Num6)), Some(Action::GoQueue), "{stack:?}");
+    }
+    for player in [K::PlayerLive, K::PlayerVod] {
+        assert_eq!(resolve(&[player], &text("u")), Some(Action::QueuePanel));
+        assert_eq!(resolve(&[player], &text("n")), Some(Action::QueueNext));
+        assert_eq!(resolve(&[player], &text("N")), Some(Action::QueuePrev));
+        // a side panel's filter still types them
+        assert_eq!(resolve(&[K::List, player], &text("n")), Some(Action::FilterInput('n')));
+    }
+}
+
+/// Following, the spoiler guard and the sleep timer: R next to r in the guide; Ctrl+B /
+/// Ctrl+Shift+B / Ctrl+Shift+T anywhere, text fields and filters included; Ctrl+W marks a
+/// programme seen.
+#[test]
+fn follow_spoiler_and_sleep_keys() {
+    assert_eq!(resolve(&[K::Guide], &text("R")), Some(Action::FollowProgramme));
+    assert_eq!(resolve(&[K::Guide], &text("r")), Some(Action::GuideRemind));
+    assert_eq!(resolve(&[K::Guide], &ctrl(Key::W)), Some(Action::MarkWatched));
+    for stack in [vec![K::ListFiltering], vec![K::TextInput, K::Modal], vec![K::Guide], vec![K::PlayerLive], vec![K::Search]] {
+        assert_eq!(resolve(&stack, &ctrl(Key::B)), Some(Action::RevealSpoilers), "{stack:?}");
+        assert_eq!(resolve(&stack, &ctrl_shift(Key::B)), Some(Action::SpoilerMenu), "{stack:?}");
+        assert_eq!(resolve(&stack, &ctrl_shift(Key::T)), Some(Action::SleepTimer), "{stack:?}");
+    }
+}
+
+/// Multi-view (DESIGN §35): its keys above the focused picture's context; unbound keys fall
+/// through; `q` closes a picture only here; Esc keeps its ladder; side panels still filter.
+#[test]
+fn multi_view_keys() {
+    let mv = [K::MultiView, K::PlayerLive];
+    assert_eq!(resolve(&mv, &text("w")), Some(Action::NextPicture));
+    assert_eq!(resolve(&mv, &text("M")), Some(Action::SoundHere));
+    assert_eq!(resolve(&mv, &text("m")), Some(Action::Mute), "m stays mute");
+    assert_eq!(resolve(&mv, &text("W")), Some(Action::SwapPictures));
+    assert_eq!(resolve(&mv, &text("t")), Some(Action::CycleLayout));
+    assert_eq!(resolve(&mv, &text("q")), Some(Action::ClosePicture));
+    assert_eq!(resolve(&[K::PlayerLive], &text("q")), Some(Action::StopAndClose), "single view unchanged");
+    assert_eq!(resolve(&mv, &ctrl(Key::ArrowRight)), Some(Action::FocusPictureRight));
+    assert_eq!(resolve(&mv, &key(Key::ArrowDown)), Some(Action::ZapNext), "zaps the focused picture");
+    assert_eq!(resolve(&mv, &key(Key::Escape)), Some(Action::Back), "Esc never closes a picture");
+    assert_eq!(resolve(&[K::List, K::MultiView, K::PlayerLive], &text("w")), Some(Action::FilterInput('w')));
+    assert_eq!(resolve(&[K::PopOut, K::MultiView, K::PlayerVod], &text("W")), Some(Action::SwapPictures));
+    assert_eq!(resolve(&[K::PlayerOsd, K::MultiView, K::PlayerLive], &text("t")), Some(Action::CycleLayout));
+    // Ctrl+M: from lists, the guide, search and the player (never Global)
+    for stack in [vec![K::List], vec![K::Guide], vec![K::Search], vec![K::PlayerLive], vec![K::PlayerVod], mv.to_vec()] {
+        assert_eq!(resolve(&stack, &ctrl(Key::M)), Some(Action::WatchAlongside), "{stack:?}");
+    }
+    assert_eq!(resolve(&[K::TextInput, K::Modal], &ctrl(Key::M)), None);
+    if tuner::ui::multiview::ENABLED {
+        assert_eq!(hint_line(&mv), "w next picture · M sound here · W swap · t layout · q close picture");
+    } else {
+        assert_eq!(hint_line(&mv), hint_line(&[K::PlayerLive]), "multi-view's hints wait for the feature");
+    }
+}
+
+/// Guide fixes (DESIGN §31) on the mapping screen only; Delete ends a news flash in the
+/// pop-out.
+#[test]
+fn guide_fix_and_news_flash_keys() {
+    let map = [K::EpgMapping, K::List];
+    assert_eq!(resolve(&map, &shift(Key::Enter)), Some(Action::AcceptFix));
+    assert_eq!(resolve(&[K::List], &shift(Key::Enter)), Some(Action::ActivateAlt), "other lists keep fullscreen");
+    assert_eq!(resolve(&map, &ctrl(Key::A)), Some(Action::MarkAll));
+    assert_eq!(resolve(&map, &ctrl(Key::Z)), Some(Action::UndoGuideFix(None)));
+    assert_eq!(resolve(&map, &ctrl_shift(Key::ArrowRight)), Some(Action::ShiftLater));
+    assert_eq!(resolve(&[K::EpgMapping, K::ListFiltering], &ctrl_shift(Key::ArrowLeft)), Some(Action::ShiftEarlier));
+    assert_eq!(resolve(&[K::EpgMapping, K::ListFiltering], &text(" ")), Some(Action::FilterInput(' ')), "filters keep their spaces");
+    assert_eq!(resolve(&[K::PopOut, K::PlayerLive], &key(Key::Delete)), Some(Action::EndNewsFlash));
+}
+
 // ------------------------------------------------------------------ tables, help, hints
 
 #[test]
@@ -300,10 +390,13 @@ fn help_is_complete_for_every_context() {
         assert!(!ctx.title().is_empty());
         titles.push(ctx.title());
         let rows = help_rows(ctx);
-        assert!(!rows.is_empty(), "{ctx:?} has no help rows");
-        // every binding of the context appears with its key in the row for its help text
+        // a context of a feature that is off (multi-view) lists nothing yet
+        let on = tables(ctx).iter().any(|t| t.iter().any(|b| tuner::keymap::feature_on(b.action)));
+        assert_eq!(rows.is_empty(), !on, "{ctx:?}");
+        // every binding of the context appears with its key in the row for its help text,
+        // once its feature is on
         for t in tables(ctx) {
-            for b in t.iter() {
+            for b in t.iter().filter(|b| tuner::keymap::feature_on(b.action)) {
                 let row = rows.iter().find(|(_, h)| *h == b.help).unwrap_or_else(|| panic!("{ctx:?}: '{}' missing", b.help));
                 assert!(row.0.split(" / ").any(|k| k == b.chord.label()), "{ctx:?}: {} missing in '{}'", b.chord.label(), row.0);
             }
@@ -349,7 +442,8 @@ fn labels_are_human() {
 #[test]
 fn hint_line_comes_from_the_tables() {
     assert_eq!(hint_line(&[K::List]), "Enter play · Shift+Enter fullscreen · Ctrl+F fav · Shift+F10 more · ? help");
-    assert_eq!(hint_line(&[K::Guide]), "Enter details · w watch · r remind · n now · ? help");
+    let follow = if tuner::follow::ENABLED { " · R follow" } else { "" };
+    assert_eq!(hint_line(&[K::Guide]), format!("Enter details · w watch · r remind{follow} · ? help"));
     // the innermost context with hints wins; contexts without hints are skipped
     assert_eq!(hint_line(&[K::PlayerOsd, K::List]), hint_line(&[K::List]));
     assert!(hint_line(&[K::Modal]).starts_with("Enter confirm"));

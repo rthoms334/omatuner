@@ -64,11 +64,16 @@ fn handoff_delivers_the_request_to_the_running_instance() {
     let (bus, rx) = EventBus::new(None);
     let _server = IpcServer::start(rt.handle(), &sock, bus).unwrap();
 
-    let req = IpcRequest { view: Some(ViewArg::Guide), play: None, inputs: vec![] };
+    let req = IpcRequest { view: Some(ViewArg::Guide), ..Default::default() };
     assert!(delivered(&sock, &req));
     assert_eq!(next_ipc(&rx), req);
 
-    let req = IpcRequest { view: None, play: Some("2:xt:live:1234".into()), inputs: vec!["/tmp/a b.m3u".into(), "http://h.tv/x.m3u8".into()] };
+    let req = IpcRequest {
+        view: None,
+        play: Some("2:xt:live:1234".into()),
+        inputs: vec!["/tmp/a b.m3u".into(), "http://h.tv/x.m3u8".into()],
+        ..Default::default()
+    };
     assert!(delivered(&sock, &req));
     assert_eq!(next_ipc(&rx), req);
 }
@@ -199,5 +204,8 @@ fn second_instance_binary_hands_over_and_exits_zero() {
         std::thread::sleep(Duration::from_millis(20));
     };
     assert!(status.success(), "exit status {status}");
-    assert_eq!(next_ipc(&rx), IpcRequest { view: Some(ViewArg::Guide), play: Some("1:xt:live:42".into()), inputs: vec!["/tmp/list.m3u".into()] });
+    assert_eq!(
+        next_ipc(&rx),
+        IpcRequest { view: Some(ViewArg::Guide), play: Some("1:xt:live:42".into()), inputs: vec!["/tmp/list.m3u".into()], ..Default::default() }
+    );
 }

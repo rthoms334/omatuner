@@ -90,6 +90,16 @@ impl Limits {
     }
 }
 
+/// The spoiler guard's one choke point over EVERY result (B4, DESIGN §34 §6): guarded titles
+/// neutralised, guarded `sub_title` / `description` / `plot` / episode `title` removed, each
+/// item annotated `spoiler: {hidden, rule, reason, until}`; `Policy::SpoilerSafe` strips for
+/// everything; `reveal_spoilers` refs get `Policy::Reveal` (the body is
+/// `crate::guard::reply::guard_json`, which covers new tools by field name).
+pub fn guard_reply(result: &mut serde_json::Value, guard: &crate::guard::Guard, policy: crate::guard::Policy, reveal: &[String]) {
+    let reveal = |r: &str| reveal.iter().any(|x| x == r);
+    crate::guard::reply::guard_json(result, guard, policy, &reveal, crate::model::now());
+}
+
 /// Redact every string of a reply; a URL anywhere (`"://"`) → `internal` (DESIGN §30.6).
 pub fn sanitize(mut reply: Reply, method: &str) -> Reply {
     let mut url = false;

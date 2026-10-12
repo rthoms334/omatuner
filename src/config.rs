@@ -38,6 +38,12 @@ pub struct Config {
     pub parental: ParentalConfig,
     pub integration: IntegrationConfig,
     pub fonts: FontConfig,
+    /// Up next (DESIGN §32).
+    pub queue: QueueConfig,
+    /// Following and news flash (DESIGN §33).
+    pub follow: FollowConfig,
+    /// Spoiler guard (DESIGN §34).
+    pub spoiler: SpoilerConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -281,7 +287,38 @@ pub struct PlayerConfig {
     /// comes back there. Cleared by an unmoved pop-out and when the size or corner is changed in
     /// Settings.
     pub popout_last: Option<[i32; 4]>,
+    /// Multi-view (`[player.multiview]`, DESIGN §35).
+    pub multiview: MultiViewConfig,
 }
+
+/// `[player.multiview]` (DESIGN §35).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct MultiViewConfig {
+    pub layout: MultiViewLayout,
+    pub pip_corner: PopoutCorner,
+    /// Lighter decoding for the small picture (`vd-lavc-skiploopfilter=all` when it loads).
+    /// Off by default: the MV-1 measurement saved 10–13 % of a 4K decode, under the 15 % bar
+    /// (docs/design/multiview-spike.md).
+    pub light_decode_small: LightDecode,
+}
+
+/// Multi-view layout; `auto` = side by side at full width, big + small at half screen, picture
+/// in picture in the pop-out and the mini player.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum MultiViewLayout {
+    #[default]
+    Auto,
+    SideBySide,
+    BigSmall,
+    Pip,
+}
+
+/// `light_decode_small` (off by default; see [`MultiViewConfig::light_decode_small`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(transparent)]
+pub struct LightDecode(pub bool);
 
 /// 16:9 pop-out sizes (logical px).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -338,6 +375,7 @@ impl Default for PlayerConfig {
             popout_size: PopoutSize::Small,
             popout_corner: PopoutCorner::BottomRight,
             popout_last: None,
+            multiview: MultiViewConfig::default(),
         }
     }
 }
@@ -349,11 +387,14 @@ pub struct EpgConfig {
     pub fuzzy_threshold: f64,
     /// Accept normalized-name matches automatically (step 4 of the matcher).
     pub auto_name_match: bool,
+    /// Guide fixes rules ("+1/+2 follow their base", "Copies share a guide") for playlists
+    /// that don't set their own (`SourceSettings::guide`, DESIGN §31).
+    pub rules_default: bool,
 }
 
 impl Default for EpgConfig {
     fn default() -> Self {
-        Self { fuzzy_threshold: 0.92, auto_name_match: true }
+        Self { fuzzy_threshold: 0.92, auto_name_match: true, rules_default: true }
     }
 }
 
@@ -363,11 +404,105 @@ pub struct ReminderConfig {
     pub enabled: bool,
     /// Notify this many minutes before the programme starts.
     pub lead_min: u32,
+    /// Where scheduled playback opens ("Open scheduled playback in", big-features additions);
+    /// a reminder's or rule's own choice wins.
+    pub open_in: crate::model::OpenIn,
+    /// Fire while Tuner is closed: transient `systemd-run --user` timers that run `tuner
+    /// --reminder <id>` (B6: ≤ 48 h ahead, ≤ 30 units, no titles in unit names or commands).
+    pub when_closed: bool,
+    /// The sleep timer's warning before it stops or pauses (seconds; a toast with Cancel).
+    pub sleep_warn_s: u32,
 }
 
 impl Default for ReminderConfig {
     fn default() -> Self {
-        Self { enabled: true, lead_min: 2 }
+        Self { enabled: true, lead_min: 2, open_in: crate::model::OpenIn::PopOut, when_closed: true, sleep_warn_s: 120 }
+    }
+}
+
+/// `[queue]` (Up next, DESIGN §32).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QueueConfig {
+    /// "Play the next item after" (s); 0 = at once. `ask` = no countdown, the card waits.
+    pub countdown_s: u32,
+    pub ask: bool,
+}
+
+impl Default for QueueConfig {
+    fn default() -> Self {
+        Self { countdown_s: 10, ask: false }
+    }
+}
+
+/// `[follow]` (Following, DESIGN §33).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FollowConfig {
+    pub enabled: bool,
+    /// At most one summary notification per 12 h, only with additions.
+    pub summary: bool,
+    /// A rule's switch may interrupt a film, episode or catch-up (default: never; it becomes a
+    /// notification with Watch — the user's decision, 2026-10-11).
+    pub interrupt_vod: bool,
+    pub max_rules: u32,
+    pub max_pending: u32,
+    /// New Team / Event rules are spoiler-safe — also the spoiler guard's "Sport I follow" row
+    /// (one key, B4).
+    pub spoiler_safe_default: bool,
+    /// News flash (big-features additions): when it never pops up.
+    pub news_flash: NewsFlashConfig,
+}
+
+impl Default for FollowConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            summary: true,
+            interrupt_vod: false,
+            max_rules: 100,
+            max_pending: 300,
+            spoiler_safe_default: true,
+            news_flash: NewsFlashConfig::default(),
+        }
+    }
+}
+
+/// `[follow.news_flash]`: quiet hours and the defaults of new news-flash rules.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NewsFlashConfig {
+    /// Quiet hours, local minutes after midnight (`None` = none); `from > to` wraps midnight.
+    pub quiet_from_min: Option<u16>,
+    pub quiet_to_min: Option<u16>,
+    /// Never while another app is fullscreen (Hyprland's fullscreen state).
+    pub skip_when_fullscreen: bool,
+    /// "Headlines only" length of a new rule (minutes).
+    pub headlines_min: u16,
+}
+
+impl Default for NewsFlashConfig {
+    fn default() -> Self {
+        Self { quiet_from_min: None, quiet_to_min: None, skip_when_fullscreen: true, headlines_min: 5 }
+    }
+}
+
+/// `[spoiler]` (spoiler guard, DESIGN §34). "Sport I follow" is `follow.spoiler_safe_default`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SpoilerConfig {
+    pub enabled: bool,
+    /// Guard series you're part-way through (after the next-up episode).
+    pub series_auto: bool,
+    pub hide_scores_everywhere: bool,
+    /// Don't tune guarded channels when zapping (the zap shield, `UserZap` only).
+    pub shield_zap: bool,
+    pub default_window_h: u32,
+}
+
+impl Default for SpoilerConfig {
+    fn default() -> Self {
+        Self { enabled: true, series_auto: true, hide_scores_everywhere: false, shield_zap: true, default_window_h: 48 }
     }
 }
 

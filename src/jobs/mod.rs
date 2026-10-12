@@ -44,6 +44,8 @@
 //!   id, no rerun).
 
 pub mod details;
+pub mod follow;
+pub mod guide_check;
 pub mod import_epg;
 pub mod import_source;
 pub mod maintenance;
@@ -118,6 +120,14 @@ pub enum JobKind {
         mode: RestoreMode,
         settings: bool,
     },
+    /// Evaluate the Following rules against the guide and write their reminders (DESIGN §33,
+    /// B7; `jobs::follow`). One dedupe key ("follows") whatever the reason.
+    EvaluateFollows {
+        reason: crate::follow::FollowReason,
+    },
+    /// Guide fixes' background check: probes, suggestions, classification cache (DESIGN §31,
+    /// B7; `jobs::guide_check`).
+    GuideCheck,
 }
 
 impl JobKind {
@@ -137,6 +147,8 @@ impl JobKind {
             JobKind::Maintenance => "maintenance".into(),
             JobKind::ExportBackup { path, .. } => format!("export-backup:{}", path.display()),
             JobKind::ImportBackup { path, .. } => format!("import-backup:{}", path.display()),
+            JobKind::EvaluateFollows { .. } => "follows".into(),
+            JobKind::GuideCheck => "guide-check".into(),
         }
     }
 
@@ -148,6 +160,12 @@ impl JobKind {
             }
             (JobKind::RefreshEpg { epg_source, force: a }, JobKind::RefreshEpg { force: b, .. }) => {
                 JobKind::RefreshEpg { epg_source: *epg_source, force: *a || *b }
+            }
+            // a guide import or the daily tick may skip unchanged inputs: it never replaces a
+            // reason that must look again
+            (JobKind::EvaluateFollows { reason: a }, JobKind::EvaluateFollows { reason: b }) => {
+                use crate::follow::FollowReason::{Daily, Guide};
+                JobKind::EvaluateFollows { reason: if matches!(b, Guide | Daily) { *a } else { *b } }
             }
             _ => newer.clone(),
         }
@@ -351,12 +369,50 @@ pub struct JobContext {
     pub player_busy: Arc<AtomicBool>,
     /// Whether library builds show explicit content (DESIGN §20.3), kept by the app.
     pub explicit: crate::store::library::ExplicitGate,
+    /// What the app publishes (B2): jobs use its library snapshot instead of building their
+    /// own. `None` headless (`tuner --refresh`, tests).
+    pub shared: Option<Arc<crate::shared::AppShared>>,
+    /// `tuner --refresh` ([`Self::headless`]): nothing reads the GUI-only caches, so the guide
+    /// check isn't submitted (the app checks the stamp once it has published its library).
+    pub headless: bool,
+    /// The guide check's debounce and whether it is running (`guide_check::request`).
+    pub guide_check: Arc<guide_check::CheckState>,
 }
 
 impl JobContext {
     /// `submit` is a no-op placeholder until [`JobManager::new`] installs the real one.
     pub fn new(store: Store, http: HttpClient, bus: EventBus, paths: AppPaths, config: SharedConfig) -> Self {
-        Self { store, http, bus, paths, config, submit: Arc::new(|_| JobId(0)), player_busy: Arc::default(), explicit: Default::default() }
+        Self {
+            store,
+            http,
+            bus,
+            paths,
+            config,
+            submit: Arc::new(|_| JobId(0)),
+            player_busy: Arc::default(),
+            explicit: Default::default(),
+            shared: None,
+            headless: false,
+            guide_check: Arc::default(),
+        }
+    }
+
+    /// A context for headless `tuner --refresh` (no GUI-only follow-ups).
+    pub fn headless(mut self) -> Self {
+        self.headless = true;
+        self
+    }
+
+    /// Jobs read what the app publishes; the explicit gate becomes the app's.
+    pub fn with_shared(mut self, shared: Arc<crate::shared::AppShared>) -> Self {
+        self.explicit = shared.explicit().clone();
+        self.shared = Some(shared);
+        self
+    }
+
+    /// The library snapshot the app last published (`None` headless or before the first).
+    pub fn published_library(&self) -> Option<Arc<crate::store::library::Library>> {
+        self.shared.as_ref().map(|s| s.library()).filter(|l| l.built_at != 0)
     }
 }
 
@@ -519,6 +575,8 @@ fn label_for(kind: &JobKind, subject: Option<&str>) -> String {
         JobKind::Maintenance => "Tidying up the database".into(),
         JobKind::ExportBackup { .. } => "Exporting backup".into(),
         JobKind::ImportBackup { .. } => "Restoring backup".into(),
+        JobKind::EvaluateFollows { .. } => "Checking what you follow".into(),
+        JobKind::GuideCheck => "Checking guide data".into(),
     }
 }
 
@@ -538,6 +596,8 @@ fn failure_for(kind: &JobKind, subject: Option<&str>) -> String {
         JobKind::Maintenance => "Database maintenance failed".into(),
         JobKind::ExportBackup { .. } => "Couldn't export the backup".into(),
         JobKind::ImportBackup { .. } => "Couldn't restore the backup".into(),
+        JobKind::EvaluateFollows { .. } => "Couldn't check what you follow".into(),
+        JobKind::GuideCheck => "Couldn't check the guide data".into(),
     }
 }
 
@@ -600,6 +660,9 @@ struct Limits {
     epg: Arc<Semaphore>,
     details: Arc<Semaphore>,
     other: Arc<Semaphore>,
+    /// Following's evaluation and the guide check: one at a time (B7), after the import that
+    /// submitted them.
+    features: Arc<Semaphore>,
 }
 
 impl Limits {
@@ -609,6 +672,7 @@ impl Limits {
             epg: Arc::new(Semaphore::new(1)),
             details: Arc::new(Semaphore::new(4)),
             other: Arc::new(Semaphore::new(2)),
+            features: Arc::new(Semaphore::new(1)),
         }
     }
 
@@ -617,6 +681,7 @@ impl Limits {
             JobKind::RefreshSource { .. } | JobKind::AddSource(_) | JobKind::ProbeSource(_) => self.playlists.clone(),
             JobKind::RefreshEpg { .. } | JobKind::RematchEpg => self.epg.clone(),
             JobKind::LoadMovieDetails(_) | JobKind::LoadSeriesDetails(_) => self.details.clone(),
+            JobKind::EvaluateFollows { .. } | JobKind::GuideCheck => self.features.clone(),
             _ => self.other.clone(),
         }
     }
@@ -634,6 +699,9 @@ impl JobManager {
             });
             ManagerInner { ctx, rt, jobs: Mutex::default(), next_id: AtomicU64::new(1), limits: Limits::new(), closing: AtomicBool::new(false) }
         });
+        if crate::guide_fix::ENABLED && !inner.ctx.headless && inner.ctx.shared.is_some() {
+            inner.rt.spawn(guide_check::after_first_publish(Arc::downgrade(&inner)));
+        }
         Self { inner }
     }
 
@@ -875,12 +943,37 @@ async fn execute(ctx: &JobContext, kind: &JobKind, progress: &Progress, cancel: 
             progress.set(JobPhase::Writing { done: 0, total: None });
             Ok(JobOutcome::Restored(maintenance::import_backup(ctx, path, *mode, *settings).await?))
         }
+        JobKind::EvaluateFollows { reason } => {
+            follow::evaluate(ctx, *reason, progress, cancel).await?;
+            Ok(JobOutcome::Nothing)
+        }
+        JobKind::GuideCheck => {
+            guide_check::run(ctx, progress, cancel).await?;
+            Ok(JobOutcome::Nothing)
+        }
     }
 }
 
 /// `DataScope` notification helper for job bodies.
 fn notify(ctx: &JobContext, scope: DataScope) {
     ctx.bus.data_changed(scope)
+}
+
+/// The daily maintenance tick (B6/B7): Following marks aired rows and re-arms reminders.
+pub(crate) fn after_guide_daily(ctx: &JobContext) {
+    if crate::follow::ENABLED {
+        (ctx.submit)(JobKind::EvaluateFollows { reason: crate::follow::FollowReason::Daily });
+    }
+}
+
+/// The pipeline after a guide import, a rematch or a Guide fixes mapping change (B7): Following
+/// re-evaluates, the guide check refreshes its cache (debounced, GUI only) — each only once its
+/// feature is on; the "features" lane runs them one at a time.
+pub(crate) fn after_guide(ctx: &JobContext, reason: crate::follow::FollowReason) {
+    if crate::follow::ENABLED {
+        (ctx.submit)(JobKind::EvaluateFollows { reason });
+    }
+    guide_check::request(ctx);
 }
 
 #[cfg(test)]
@@ -929,6 +1022,11 @@ mod tests {
         assert_eq!(a.merged_with(&b), a);
         assert_eq!(b.merged_with(&a), a);
         assert_eq!(JobKind::RebuildLibrary.merged_with(&JobKind::RebuildLibrary), JobKind::RebuildLibrary);
+        // a queued evaluation that must look again keeps its reason
+        use crate::follow::FollowReason::{Guide, Mapping};
+        let (mapping, guide) = (JobKind::EvaluateFollows { reason: Mapping }, JobKind::EvaluateFollows { reason: Guide });
+        assert_eq!(mapping.merged_with(&guide), mapping);
+        assert_eq!(guide.merged_with(&mapping), mapping);
     }
 
     fn status(id: u64) -> JobStatus {

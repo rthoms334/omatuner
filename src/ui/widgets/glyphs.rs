@@ -87,4 +87,14 @@ pub const DOT: &str = "\u{25cf}";
 pub const MORE: &str = "\u{f01d8}";
 
 /// Icons offered when creating a playlist source (UHF "choose an icon").
+// The batch features' glyphs (base-B placeholders on existing glyphs; each owning UI track may
+// point its own at a better one: queue = Q-ui, follow = F-C, spoiler = S-ui, multi-view = MV-2,
+// sleep = rui, guide fixes = G-ui).
+pub const UP_NEXT: &str = PLAYLIST;
+pub const FOLLOW: &str = REMINDER;
+pub const SPOILER: &str = HIDDEN;
+pub const MULTI_VIEW: &str = MINI_PLAYER;
+pub const SLEEP: &str = REMINDER;
+pub const GUIDE_FIX: &str = GUIDE;
+
 pub const SOURCE_ICONS: &[&str] = &[PLAYLIST, LIVE_TV, SOURCE_XTREAM, SOURCE_URL, MOVIES, SERIES, RADIO, MUSIC, FAVOURITE, HEART, FOLDER, TAG];

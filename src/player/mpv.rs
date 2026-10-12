@@ -9,16 +9,27 @@ use libmpv2_sys as sys;
 
 use crate::config::{Config, SubtitleAuto};
 use crate::error::Result;
-use crate::model::Playable;
+use crate::model::{Playable, TileId};
 
 /// Default `demuxer-lavf-o` (see [`create`]). Demuxers without the option ignore it.
 const DEMUXER_LAVF_O: &str = "http_persistent=0";
 
+/// Demuxer cache caps of a second picture (multi-view, DESIGN §35 §4.6): a 4K picture's cache
+/// is hundreds of MiB, and the second picture is usually the small one.
+const SECOND_PICTURE_MAX_MIB: u32 = 64;
+const SECOND_PICTURE_BACK: &str = "8MiB";
+
+/// Per-load option of [`add_light_decode`]: skip HEVC/H.264 in-loop filtering (deblocking,
+/// SAO). Saves decode time at a small, mostly invisible cost in a small picture.
+pub const LIGHT_DECODE: &str = "vd-lavc-skiploopfilter=all";
+
 /// User `mpv_options` that can never be changed at runtime: the render API owns the VO.
 const RUNTIME_DENY: &[&str] = &["vo", "gpu-context", "gpu-api", "wid", "config", "idle", "keep-open"];
 
-/// Create the single mpv instance (`vo=libmpv`; video goes through the render API).
-pub fn create(cfg: &Config) -> Result<Mpv> {
+/// Create the mpv instance of picture `tile` (`vo=libmpv`; video goes through the render API).
+/// Picture A is the single-view player. Any other picture starts muted (the app gives it the
+/// sound) with smaller demuxer caches.
+pub fn create(cfg: &Config, tile: TileId) -> Result<Mpv> {
     let p = &cfg.player;
     let mpv = Mpv::with_initializer(|init| {
         init.set_option("vo", "libmpv")?;
@@ -34,18 +45,18 @@ pub fn create(cfg: &Config) -> Result<Mpv> {
         init.set_option("video-timing-offset", "0")?; // don't make render() wait for display time
         init.set_option("audio-client-name", crate::APP_ID)?;
         init.set_option("cache", "yes")?;
-        init.set_option("demuxer-max-back-bytes", "32MiB")?;
+        init.set_option("demuxer-max-back-bytes", if tile == TileId::A { "32MiB" } else { SECOND_PICTURE_BACK })?;
         init.set_option("stream-lavf-o", "reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=5")?;
         // HLS playlists and segments on fresh connections (field report 2026-10-11): providers
         // close idle keep-alive connections between 10 s segment fetches ("Error reading HTTP
         // response: End of file" every 10 s) or leave them half-dead (a 15 s "Connection timed
         // out" stall per fetch, segments skipped). A user `demuxer-lavf-o` replaces this.
         init.set_option("demuxer-lavf-o", DEMUXER_LAVF_O)?;
-        for (name, value) in runtime_settings(cfg) {
+        for (name, value) in runtime_settings(cfg, tile) {
             init.set_option(name, value.as_str())?;
         }
         init.set_option("volume", p.volume)?;
-        init.set_option("mute", if p.muted { "yes" } else { "no" })?;
+        init.set_option("mute", if p.muted || tile != TileId::A { "yes" } else { "no" })?;
         init.set_option("hr-seek", "yes")?;
         // power-user options go last; a bad one is logged and skipped instead of making the
         // whole player (and the app) unusable
@@ -61,15 +72,17 @@ pub fn create(cfg: &Config) -> Result<Mpv> {
 
 /// Every config-derived setting that can change while running (DESIGN §11.5 "Settings apply
 /// live"), as `(name, value)` in mpv's option syntax. Applied at init and again by
-/// `PlayerCommand::ApplyConfig`, so the two paths cannot drift apart.
-pub(super) fn runtime_settings(cfg: &Config) -> Vec<(&'static str, String)> {
+/// `PlayerCommand::ApplyConfig`, so the two paths cannot drift apart. A second picture's
+/// demuxer cache is capped.
+pub(super) fn runtime_settings(cfg: &Config, tile: TileId) -> Vec<(&'static str, String)> {
     let p = &cfg.player;
     let readahead = if p.instant_load { 1 } else { p.cache_secs.max(1) }.to_string();
+    let max_mib = if tile == TileId::A { p.demuxer_max_mib } else { p.demuxer_max_mib.min(SECOND_PICTURE_MAX_MIB) };
     vec![
         ("hwdec", cfg.effective_hwdec()),
         ("cache-secs", readahead.clone()),
         ("demuxer-readahead-secs", readahead),
-        ("demuxer-max-bytes", format!("{}MiB", p.demuxer_max_mib)),
+        ("demuxer-max-bytes", format!("{max_mib}MiB")),
         ("network-timeout", p.network_timeout_s.to_string()),
         // mpv defaults (no / 1 s) unless "instant load" asks for the shortest start
         ("cache-pause-initial", "no".into()),
@@ -90,9 +103,9 @@ pub(super) fn runtime_settings(cfg: &Config) -> Vec<(&'static str, String)> {
 /// have been adjusted for the current stream. Raw options take effect from the next file for
 /// most mpv options; options in [`RUNTIME_DENY`] (the VO belongs to the render API) and
 /// removed keys need a restart.
-pub(super) fn apply_runtime(mpv: &Mpv, cfg: &Config, previous: &Config) {
-    let before: BTreeMap<_, _> = runtime_settings(previous).into_iter().collect();
-    for (name, value) in runtime_settings(cfg) {
+pub(super) fn apply_runtime(mpv: &Mpv, cfg: &Config, previous: &Config, tile: TileId) {
+    let before: BTreeMap<_, _> = runtime_settings(previous, tile).into_iter().collect();
+    for (name, value) in runtime_settings(cfg, tile) {
         if before.get(name) == Some(&value) {
             continue;
         }
@@ -149,6 +162,16 @@ pub fn loadfile_args(p: &Playable) -> Vec<String> {
         opts.push(format!("start={s:.1}"));
     }
     vec![p.url.expose().clone(), "replace".into(), "-1".into(), opts.join(",")]
+}
+
+/// Add [`LIGHT_DECODE`] to `loadfile` arguments from [`loadfile_args`].
+pub fn add_light_decode(args: &mut [String]) {
+    if let Some(opts) = args.get_mut(3) {
+        if !opts.is_empty() {
+            opts.push(',');
+        }
+        opts.push_str(LIGHT_DECODE);
+    }
 }
 
 /// Run `loadfile` with `args` (from [`loadfile_args`]) and return the new playlist entry id.
@@ -260,7 +283,7 @@ mod tests {
         cfg.player.hwdec = "vaapi".into();
         cfg.player.cache_secs = 7;
         cfg.player.sub_auto = SubtitleAuto::Off;
-        let s: BTreeMap<_, _> = runtime_settings(&cfg).into_iter().collect();
+        let s: BTreeMap<_, _> = runtime_settings(&cfg, TileId::A).into_iter().collect();
         for name in [
             "hwdec",
             "cache-secs",
@@ -281,7 +304,7 @@ mod tests {
         assert_eq!(s["cache-secs"], "7");
         assert_eq!(s["sid"], "no");
         cfg.player.instant_load = true;
-        let s: BTreeMap<_, _> = runtime_settings(&cfg).into_iter().collect();
+        let s: BTreeMap<_, _> = runtime_settings(&cfg, TileId::A).into_iter().collect();
         assert_eq!(s["cache-secs"], "1");
         assert_eq!(s["demuxer-readahead-secs"], "1");
     }
@@ -290,7 +313,30 @@ mod tests {
         let mut cfg = Config::default();
         cfg.player.mpv_options.insert("vo".into(), "null".into());
         cfg.player.mpv_options.insert("ao".into(), "null".into());
-        create(&cfg).expect("mpv")
+        create(&cfg, TileId::A).expect("mpv")
+    }
+
+    /// Picture B never makes a sound before the app gives it the sound, and keeps its cache
+    /// small whatever the settings say (two 4K caches would be a GiB); ApplyConfig keeps the cap.
+    #[test]
+    fn a_second_picture_starts_muted_with_small_caches() {
+        let mut cfg = Config::default();
+        cfg.player.mpv_options.insert("vo".into(), "null".into());
+        cfg.player.mpv_options.insert("ao".into(), "null".into());
+        cfg.player.demuxer_max_mib = 400;
+        let b = create(&cfg, TileId::B).expect("mpv");
+        assert!(b.get_property::<bool>("mute").unwrap());
+        assert_eq!(b.get_property::<i64>("demuxer-max-bytes").unwrap(), 64 << 20);
+        assert_eq!(b.get_property::<i64>("demuxer-max-back-bytes").unwrap(), 8 << 20);
+        let a = create(&cfg, TileId::A).expect("mpv");
+        assert!(!a.get_property::<bool>("mute").unwrap());
+        assert_eq!(a.get_property::<i64>("demuxer-max-bytes").unwrap(), 400 << 20);
+        let mut more = cfg.clone();
+        more.player.demuxer_max_mib = 500;
+        more.player.cache_secs = 9;
+        apply_runtime(&b, &more, &cfg, TileId::B);
+        assert_eq!(b.get_property::<i64>("demuxer-max-bytes").unwrap(), 64 << 20);
+        assert_eq!(b.get_property::<f64>("cache-secs").unwrap(), 9.0);
     }
 
     /// Field fix: HLS without keep-alive connections by default; the user's `mpv_options`
@@ -303,7 +349,7 @@ mod tests {
         cfg.player.mpv_options.insert("vo".into(), "null".into());
         cfg.player.mpv_options.insert("ao".into(), "null".into());
         cfg.player.mpv_options.insert("demuxer-lavf-o".into(), "http_persistent=1,live_start_index=-3".into());
-        assert_eq!(lavf_o(&create(&cfg).unwrap()), "http_persistent=1,live_start_index=-3");
+        assert_eq!(lavf_o(&create(&cfg, TileId::A).unwrap()), "http_persistent=1,live_start_index=-3");
     }
 
     #[test]
@@ -313,7 +359,7 @@ mod tests {
         cfg.player.mpv_options.insert("ao".into(), "null".into());
         cfg.player.mpv_options.insert("no-such-option-xyz".into(), "1".into());
         cfg.player.mpv_options.insert("video-sync".into(), "display-resample".into());
-        let mpv = create(&cfg).expect("mpv starts despite a bad option");
+        let mpv = create(&cfg, TileId::A).expect("mpv starts despite a bad option");
         assert_eq!(mpv.get_property::<String>("video-sync").unwrap(), "display-resample");
     }
 
@@ -343,7 +389,7 @@ mod tests {
         cfg.player.demuxer_max_mib = 64;
         cfg.player.mpv_options.insert("vo".into(), "gpu".into()); // denied at runtime
         cfg.player.mpv_options.insert("video-sync".into(), "display-resample".into());
-        apply_runtime(&mpv, &cfg, &Config::default());
+        apply_runtime(&mpv, &cfg, &Config::default(), TileId::A);
         assert_eq!(mpv.get_property::<f64>("cache-secs").unwrap(), 3.0);
         assert_eq!(mpv.get_property::<f64>("demuxer-readahead-secs").unwrap(), 3.0);
         assert_eq!(mpv.get_property::<f64>("network-timeout").unwrap(), 9.0);
@@ -363,14 +409,14 @@ mod tests {
         mpv.set_property("sub-scale", 1.4).unwrap();
         let mut cfg = before.clone();
         cfg.player.cache_secs = 6;
-        apply_runtime(&mpv, &cfg, &before);
+        apply_runtime(&mpv, &cfg, &before, TileId::A);
         assert_eq!(mpv.get_property::<f64>("cache-secs").unwrap(), 6.0);
         assert_eq!(mpv.get_property::<String>("sid").unwrap(), "3", "track choice kept");
         assert!((mpv.get_property::<f64>("sub-scale").unwrap() - 1.4).abs() < 1e-3, "per-stream sub scale kept");
         // the subtitle mode itself changed: applied
         let mut off = cfg.clone();
         off.player.sub_auto = SubtitleAuto::Off;
-        apply_runtime(&mpv, &off, &cfg);
+        apply_runtime(&mpv, &off, &cfg, TileId::A);
         assert_eq!(mpv.get_property::<String>("sid").unwrap(), "no");
     }
 }

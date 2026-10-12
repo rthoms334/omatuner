@@ -155,6 +155,13 @@ pub enum EpgMatchMethod {
     NormalizedName,
     /// Fuzzy suggestion the user accepted (stored as Manual) or pending (not applied).
     Fuzzy,
+    /// Guide fixes rule "+1/+2 follow their base" (DESIGN §31): a +N channel mapped to its base
+    /// channel's guide channel with a time shift (`channel_epg_map.shift_min`). Re-derived on
+    /// every rematch; ranks after every other automatic method.
+    Sibling,
+    /// Guide fixes rule "Copies share a guide": the same channel (`store::copies` family key) in
+    /// another playlist resolves, so this one takes its guide channel.
+    Copy,
 }
 
 /// A channel → EPG channel assignment, keyed by the channel's stable [`ItemRef`].
@@ -184,4 +191,85 @@ pub struct ProgrammeHit {
     pub programme: ProgrammeSlim,
     pub epg_channel_id: EpgChannelId,
     pub channel_ids: Vec<super::ChannelId>,
+}
+
+// ------------------------------------------------------------------ guide fixes (DESIGN §31)
+
+/// What is wrong with a channel's guide data (Guide fixes, computed by `guide_fix::issues`,
+/// never stored; `item_override.guide_ok` holds one bit per kind the user dismissed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IssueKind {
+    /// Unmapped, and nothing scores above the fuzzy threshold.
+    NoGuide,
+    /// Unmapped, a cached suggestion scores above the threshold.
+    Suggested,
+    /// "+1" in the name, effective shift 0 and the base's guide channel.
+    PlusNoShift,
+    /// Unmapped; the same channel in another playlist (`store::copies` family) has guide data.
+    CopyHasGuide,
+    /// Mapped, but the guide has nothing now or later for it.
+    GuideEnded,
+    /// A manual mapping whose guide channel left the active guide generation.
+    GoneFromGuide,
+    /// An automatic tvg-id mapping whose guide channel shares no trigram with the name.
+    LooksWrong,
+}
+
+impl IssueKind {
+    pub const ALL: [IssueKind; 7] = [
+        IssueKind::NoGuide,
+        IssueKind::Suggested,
+        IssueKind::PlusNoShift,
+        IssueKind::CopyHasGuide,
+        IssueKind::GuideEnded,
+        IssueKind::GoneFromGuide,
+        IssueKind::LooksWrong,
+    ];
+
+    /// The bit of `item_override.guide_ok` that dismisses this kind for a channel.
+    pub fn bit(self) -> i64 {
+        1 << (self as i64)
+    }
+}
+
+/// A guide channel a fix points at (agent refs: `guide:<epg_source_id>:<xmltv_id>`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct GuideTarget {
+    pub epg_source: EpgSourceId,
+    pub xmltv_id: String,
+    /// Display name when chosen (finds a renamed id again: `GoneFromGuide`).
+    pub name: String,
+}
+
+/// One channel's change in a Guide fixes batch. Each `Some` field is changed; `Some(None)`
+/// resets it to automatic.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct FixChange {
+    pub channel: Option<ItemRef>,
+    pub map: Option<Option<GuideTarget>>,
+    /// Minutes the stream airs after the guide (`item_override.shift_min`).
+    pub shift_min: Option<Option<i32>>,
+    pub catchup_offset_s: Option<Option<i64>>,
+    /// "It's right": dismiss this issue kind for the channel.
+    pub dismiss: Option<IssueKind>,
+}
+
+/// A batch to apply (the screen's confirm card, or Claude's `guide_fix propose`), bound to the
+/// guide check it was computed from.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Proposal {
+    pub changes: Vec<FixChange>,
+    pub rules: Vec<(SourceId, super::GuideRules)>,
+    /// `meta guide_check:stamp` when proposed: a different stamp at apply time = stale.
+    pub stamp: [u8; 16],
+}
+
+/// Who made a guide fix (`guide_fix_log.actor`, `channel_epg_map.actor`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum FixActor {
+    #[default]
+    You,
+    Claude,
 }

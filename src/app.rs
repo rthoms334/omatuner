@@ -54,7 +54,7 @@ use crate::images::ImageCache;
 use crate::ipc::IpcRequest;
 use crate::jobs::{FailureKind, JobKind, JobOutcome};
 use crate::keymap::{self, Action, KeyContext};
-use crate::model::{ChannelId, Collection, GroupId, ItemKey, ItemKind, ItemRef, MediaRef, PlayOrigin, SourceId, Timestamp, ZapList};
+use crate::model::{ChannelId, Collection, GroupId, ItemKey, ItemKind, ItemRef, MediaRef, OpenIn, PlayOrigin, SourceId, Timestamp, ZapList};
 use crate::msg::{AppEvent, DataScope, Toast, ToastKind};
 use crate::platform::popout::{Place, PopError, PopOutBackend, PopOutEvent, PopRequest};
 use crate::platform::{PickPurpose, PlatformEvent};
@@ -70,6 +70,9 @@ use crate::ui::video_host::{MiniAction, Placement, VideoHost};
 use crate::ui::widgets::status_bar::{StatusClick, StatusInfo};
 use crate::ui::widgets::toast::Toasts;
 use crate::ui::{BackTarget, LayoutClass, NavRequest, OnboardingStart, OverlayRequest, ParentalSession, Route, Screen, ScreenId, UiCtx, UiParts};
+
+/// Multi-view (DESIGN §35, MV-2): focus, sound, picture B, the planner's plays.
+mod multiview;
 
 /// An open overlay, the screen that opened it (receives its result) and which request built
 /// it (Help / Jobs toggle closed when requested again).
@@ -158,6 +161,8 @@ pub struct TunerApp {
     /// Automatic switches called off by their toast's Cancel: a `SwitchNow` already on its way
     /// is ignored (DESIGN §30.8).
     cancelled_switches: std::collections::HashSet<crate::model::ReminderId>,
+    /// Switch countdowns, the sleep timer's warning, a news flash (`reminders::ui`, rui).
+    reminder_ui: crate::reminders::ui::ReminderUi,
     /// Route whose `on_enter` ran last (a new route — even of the same screen — re-enters).
     entered: Option<Route>,
     layout: LayoutClass,
@@ -179,6 +184,9 @@ pub struct TunerApp {
     dropped: Vec<PathBuf>,
     /// Developer screenshot capture (`TUNER_SCREENSHOT`, DESIGN §23.1); `None` normally.
     devshot: Option<crate::devshot::Driver>,
+    /// Multi-view (DESIGN §35): the pictures' focus, sound and layout places, picture B's start
+    /// and what waits for it (`app/multiview.rs`).
+    mv: multiview::MvApp,
     #[cfg(test)]
     log: std::cell::RefCell<tests::Log>,
 }
@@ -196,7 +204,7 @@ impl TunerApp {
     ) -> Self {
         fonts.install(&cc.egui_ctx);
         crate::theme::egui_style::apply(&cc.egui_ctx, &theme);
-        let surface = match services.player.render_core().map(|core| crate::player::VideoSurface::new(core, cc)) {
+        let surface = match services.tiles.a().render_core().map(|core| crate::player::VideoSurface::new(core, cc)) {
             Some(Ok(s)) => Some(s),
             Some(Err(e)) => {
                 tracing::error!("video surface: {e}");
@@ -217,9 +225,12 @@ impl TunerApp {
             }
         };
         let start = start_route(&services.config(), &initial, &db);
-        let snapshot = services.player.handle().snapshot();
+        let snapshot = services.tiles.focused().snapshot();
+        let mut video = VideoHost::new(surface);
+        // picture B's surface is made later, from the same GL context (multi-view)
+        video.set_factory(crate::player::render::SurfaceFactory::new(cc).ok());
         let mut app = Self {
-            video: VideoHost::new(surface),
+            video,
             services: Some(services),
             events,
             theme,
@@ -257,6 +268,7 @@ impl TunerApp {
             pending_locked: None,
             pending_agent: None,
             cancelled_switches: Default::default(),
+            reminder_ui: Default::default(),
             entered: None,
             layout: LayoutClass::Wide,
             epg_updated: None,
@@ -266,6 +278,7 @@ impl TunerApp {
             last_network_toast: None,
             dropped: Vec::new(),
             devshot: None,
+            mv: Default::default(),
             #[cfg(test)]
             log: Default::default(),
         };
@@ -323,15 +336,22 @@ impl TunerApp {
     }
 
     /// The key context stack right now (topmost overlay, else the screen on view); `Global`
-    /// is appended by `keymap::resolve`. Video-only: `PopOut` sits right above the player's
-    /// base context, so Esc pops back in once side panels / number entry are done with it.
+    /// is appended by `keymap::resolve`. Multi-view: `MultiView` sits right above the
+    /// player's base context (side panels, number entry and controls focus stay above it).
+    /// Video-only: `PopOut` sits above those, so Esc pops back in once side panels / number
+    /// entry are done with it.
     fn key_stack(&self) -> Vec<KeyContext> {
         match self.overlays.last() {
             Some(o) => o.overlay.key_contexts(),
             None => {
                 let mut stack = self.screens[self.screen_index(self.view_screen())].key_contexts();
+                let base = |c: &KeyContext| matches!(c, KeyContext::PlayerLive | KeyContext::PlayerVod);
+                if self.mv.view.on && self.view_screen() == ScreenId::Player {
+                    let at = stack.iter().position(base).unwrap_or(stack.len());
+                    stack.insert(at, KeyContext::MultiView);
+                }
                 if self.video_only {
-                    let at = stack.iter().position(|c| matches!(c, KeyContext::PlayerLive | KeyContext::PlayerVod)).unwrap_or(stack.len());
+                    let at = stack.iter().position(|c| base(c) || *c == KeyContext::MultiView).unwrap_or(stack.len());
                     stack.insert(at, KeyContext::PopOut);
                 }
                 stack
@@ -339,11 +359,24 @@ impl TunerApp {
         }
     }
 
-    /// Every player command of the app goes through here (tests record them).
+    /// Every player command of the app goes through here (tests record them): to the focused
+    /// picture; a film, an episode or a file to picture A, ending multi-view; with two pictures,
+    /// volume and mute to the one with the sound (as the keys, `ui::multiview::route_command`).
     fn send_player(&self, cmd: PlayerCommand) {
         #[cfg(test)]
         self.log.borrow_mut().commands.push(cmd.clone());
-        self.services().player.handle().send(cmd);
+        if self.mv_vod_to_a(&cmd) {
+            return;
+        }
+        let tiles = &self.services().tiles;
+        match cmd {
+            PlayerCommand::SetVolume(_) | PlayerCommand::AdjustVolume(_) | PlayerCommand::ToggleMute | PlayerCommand::SetMute(_)
+                if self.mv.view.on =>
+            {
+                tiles.audible_handle().send(cmd)
+            }
+            cmd => tiles.focused().send(cmd),
+        }
     }
 
     /// Every job the app submits goes through here (tests record them).
@@ -365,6 +398,7 @@ impl TunerApp {
         let cfg = services.config();
         let mini_rect = self.video.mini_rect();
         let back = self.back_target();
+        let multiview = self.mv_frame();
         let mut ctx = UiCtx::new(UiParts {
             theme: &self.theme,
             services,
@@ -389,7 +423,13 @@ impl TunerApp {
             config_edits: &mut self.config_edits,
         });
         ctx.back = back;
-        f(&mut ctx, &mut self.screens, &mut self.overlays)
+        ctx.multiview = multiview;
+        let r = f(&mut ctx, &mut self.screens, &mut self.overlays);
+        // multi-view requests made through `&UiCtx` (`play`) are applied with the navigation
+        for m in ctx.take_mv_requests() {
+            ctx.navigate(NavRequest::MultiView(m));
+        }
+        r
     }
 
     /// Where `NavRequest::Back` leads from the route on screen (the back button's label): the
@@ -406,6 +446,25 @@ impl TunerApp {
     }
 
     fn handle_event(&mut self, ev: AppEvent, egui_ctx: &egui::Context) {
+        // multi-view: the focused picture's player events are "the player's" for the screens
+        // (picture B's arrive as `TileEvent::Player`); the other picture's only toast
+        let ev = match ev {
+            AppEvent::Tile(t) => match self.on_tile_event(t) {
+                Some(pev) => AppEvent::Player(pev),
+                None => return,
+            },
+            AppEvent::Player(pev) if self.mv.view.focus != crate::model::TileId::A => {
+                self.on_picture_event(crate::model::TileId::A, &pev);
+                return;
+            }
+            AppEvent::Player(pev) => {
+                if matches!(pev, crate::player::PlayerEvent::ZapSkipped { .. }) {
+                    self.on_picture_event(crate::model::TileId::A, &pev);
+                }
+                AppEvent::Player(pev)
+            }
+            ev => ev,
+        };
         match &ev {
             // A load started before "follow Omarchy theme" was turned off may still land.
             AppEvent::Theme(ThemeEvent::Changed(_)) if !self.services().config().integration.follow_omarchy_theme => {}
@@ -422,6 +481,25 @@ impl TunerApp {
             AppEvent::Ipc(req) => self.handle_ipc(req),
             // the handler raised the window (`hypr::focus_self`) and validated the target
             AppEvent::Agent(crate::agent::AgentCommand::Play(p)) => self.on_agent_play(p.clone()),
+            // `lock session_now`: Claude can only ever lock (the handler's view locked already)
+            AppEvent::Agent(crate::agent::AgentCommand::LockSession) => self.parental.lock(),
+            // `control popout`: the pop-out never takes the keyboard
+            AppEvent::Agent(crate::agent::AgentCommand::PopOut) => {
+                if !self.popout.is_out() && !self.video_only {
+                    self.toggle_popout(egui_ctx);
+                }
+            }
+            AppEvent::Agent(crate::agent::AgentCommand::MultiView(r)) => self.on_agent_multiview(r),
+            // the reminder engine (B6): countdowns, switches, the sleep timer, news flashes
+            AppEvent::Reminder(e) => self.on_reminder_event(e, egui_ctx),
+            // Following's summary when no notification server answered (F-C)
+            AppEvent::Follow(f) => {
+                if let Some(t) = crate::follow::ui::on_event(f) {
+                    self.toast(t);
+                }
+            }
+            // picture B's events were mapped above (`on_tile_event`)
+            AppEvent::Tile(_) => {}
             AppEvent::Platform(p) => match p {
                 PlatformEvent::Quit => egui_ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 PlatformEvent::Raise => crate::platform::hypr::focus_self(),
@@ -433,9 +511,9 @@ impl TunerApp {
                 PlatformEvent::FilePicked { purpose: PickPurpose::ExportLog, path: Some(path) } => self.export_log(path.clone()),
                 // Other pickers belong to the screen that opened them (`on_event` below).
                 PlatformEvent::FilePicked { .. } | PlatformEvent::ReminderFired(_) => {}
-                PlatformEvent::SwitchSoon { reminder, channel, start } => self.on_switch_soon(*reminder, channel, *start),
-                // the scheduler raised the window
-                PlatformEvent::SwitchNow { reminder, channel } => self.on_switch_now(*reminder, channel),
+                // pass 1 (before `reminders::ENABLED`): the scheduler raised the window
+                PlatformEvent::SwitchSoon { reminder, channel, start } => self.on_switch_soon(*reminder, channel, *start, None, OpenIn::FullWindow),
+                PlatformEvent::SwitchNow { reminder, channel } => self.on_switch_now(*reminder, channel, OpenIn::FullWindow, None, None, egui_ctx),
                 PlatformEvent::PopOut(ev) => self.on_popout_event(ev, egui_ctx),
             },
             // the first copy of a title failed before its first frame (DESIGN §29.15)
@@ -497,6 +575,7 @@ impl TunerApp {
                 let lib = self.fit_visibility(lib.clone());
                 let old = std::mem::replace(&mut self.lib, lib.clone());
                 self.check_scopes(&old);
+                let first = old.built_at == 0;
                 self.release(old, "library swap");
                 // the playing channel is noted again next frame
                 self.measured.clear();
@@ -511,6 +590,11 @@ impl TunerApp {
                 self.drop_search_index("library swap");
                 self.refresh_epg_updated();
                 self.send_pending_zap();
+                // hidden, locked or explicit channels changed what Following may pick (not at
+                // start: the first library is the one the last evaluation saw)
+                if crate::follow::ENABLED && !first && self.services().config().follow.enabled {
+                    self.services().jobs.submit(JobKind::EvaluateFollows { reason: crate::follow::FollowReason::Library });
+                }
             }
             Ok(JobOutcome::SourceRefreshed { source, account, upgraded, .. }) => {
                 self.offline = false;
@@ -617,6 +701,7 @@ impl TunerApp {
                 Err(e) => tracing::warn!("favourites: {e}"),
             },
             DataScope::Epg => {
+                self.services().agent.guard().rebuild();
                 self.now_next.invalidate();
                 self.refresh_epg_updated();
                 self.submit_job(JobKind::RebuildLibrary);
@@ -633,11 +718,30 @@ impl TunerApp {
                 self.submit_job(JobKind::RebuildLibrary);
             }
             DataScope::Live | DataScope::Vod | DataScope::Overrides => {
+                if scope != DataScope::Overrides {
+                    self.services().agent.guard().rebuild();
+                }
                 self.submit_job(JobKind::RebuildLibrary);
             }
             // every zap writes history: patch the recently watched list, never rebuild
             DataScope::History => self.refresh_recent_channels(),
-            DataScope::VodDetails | DataScope::Progress => {}
+            DataScope::VodDetails => {}
+            // a finished episode moves a series' spoiler boundary (debounced in the builder): a
+            // manual mark or the save at stop rebuilds; the player's 10 s saves during a film or
+            // episode don't (the guard's tracker rebuilds once an episode reaches 90 %)
+            DataScope::Progress => {
+                let saving = self.services().tiles.handles().iter().any(|h| {
+                    let s = h.snapshot();
+                    s.state == PlayerState::Playing && s.playable.as_ref().is_some_and(|p| !p.kind.is_live())
+                });
+                if !saving {
+                    self.services().agent.guard().rebuild();
+                }
+            }
+            // the batch features' own data: their screens and services react (Following's job
+            // raises `Reminders` too)
+            DataScope::Spoiler | DataScope::Follow => self.services().agent.guard().rebuild(),
+            DataScope::GuideIssues => {}
         }
     }
 
@@ -683,6 +787,17 @@ impl TunerApp {
     /// card at Details; other files/URLs play fullscreen). `main` made file paths absolute in
     /// the invoking process (its working directory may differ from ours).
     fn handle_ipc(&mut self, req: &IpcRequest) {
+        // a reminder timer fired while Tuner was closed or running (B6): the scheduler re-reads
+        // its reminders and fires the due one (routed by `reminders::fire_policy`; a switch
+        // opens where the reminder says, see `on_switch_now`)
+        if req.reminder.is_some() {
+            self.services().agent.wake_reminders();
+        }
+        // `--play <ref> --popout` (a scheduled launch): the pop-out, never taking focus — on the
+        // first frame the Hyprland worker runs (at startup it doesn't yet)
+        if req.popout && req.play.is_some() {
+            self.reminder_ui.pop_out_pending = true;
+        }
         match req.view {
             Some(crate::cli::ViewArg::Search) => self.nav.push(NavRequest::Open(OverlayRequest::Search { initial: String::new() })),
             Some(v) => self.nav.push(NavRequest::Switch(route_for_view(v))),
@@ -765,6 +880,7 @@ impl TunerApp {
             self.pending_toasts.clear();
             self.pending_locked = None;
             self.pending_agent = None;
+            self.mv.forget_pending();
             let hidden = Arc::new(self.lib.hiding_explicit());
             let old = std::mem::replace(&mut self.lib, hidden);
             // a playlist left with only explicit movies isn't eligible any more (its toast names
@@ -775,10 +891,17 @@ impl TunerApp {
         }
         let x = self.lib.explicit.clone();
         let playing = self.snapshot.playable.as_ref().filter(|_| self.snapshot.state != PlayerState::Idle).and_then(|p| p.item.clone());
-        if playing.is_some_and(|item| x.contains(&item) || crate::store::live::item_explicit(&self.db, &item).unwrap_or(true)) {
+        let explicit = |item: &ItemRef| x.contains(item) || crate::store::live::item_explicit(&self.db, item).unwrap_or(true);
+        // multi-view: the other picture stops too when it shows explicit content
+        let other = self.mv_stop_explicit(|s| s.playable.as_ref().and_then(|p| p.item.as_ref()).is_some_and(explicit));
+        if playing.as_ref().is_some_and(explicit) {
             self.send_player(PlayerCommand::Stop);
-            self.routes.retain(|r| *r != Route::Player);
+            if !self.mv.view.on || other {
+                self.routes.retain(|r| *r != Route::Player);
+            }
             self.toast(Toast::info("Playback stopped — parental control is on"));
+        } else if other {
+            self.toast(Toast::info("A picture stopped — parental control is on"));
         }
         // pages and groups of explicit titles
         self.routes.retain(|r| match r {
@@ -849,6 +972,12 @@ impl TunerApp {
             return;
         }
         let zap = group.and_then(|g| self.zap_list(g, &cfg));
+        // two pictures: a play from outside (reminder, `--play`, MCP, a notification's Watch)
+        // goes to the silent picture and takes the sound (DESIGN §35)
+        if matches!(origin, PlayOrigin::Reminder | PlayOrigin::Cli) && self.mv_outside(MediaRef::Channel(id), zap.clone(), origin) {
+            self.nav.push(NavRequest::Push(Route::Player));
+            return;
+        }
         // not in the library yet: send the zap list once it has loaded (`on_job_finished`)
         self.pending_zap = group.filter(|_| zap.is_none() && in_lib.is_none()).map(|g| (id, g));
         self.send_player(PlayerCommand::Play(PlayRequest { media: MediaRef::Channel(id), zap, origin, resume: false, immediate: true }));
@@ -947,7 +1076,14 @@ impl TunerApp {
         };
         self.pending_agent = None;
         self.pending_zap = None;
-        self.send_player(cmd);
+        // two pictures: catch-up goes to the silent picture (films end multi-view)
+        let catchup = match &cmd {
+            PlayerCommand::Play(r) if matches!(r.media, MediaRef::Catchup { .. }) => Some(r.media.clone()),
+            _ => None,
+        };
+        if !catchup.is_some_and(|m| self.mv_outside(m, None, PlayOrigin::Cli)) {
+            self.send_player(cmd);
+        }
         self.nav.push(NavRequest::Push(Route::Player));
     }
 
@@ -960,42 +1096,418 @@ impl TunerApp {
         self.nav.push(NavRequest::Open(OverlayRequest::Pin { then: Box::new(Action::OpenPlayer), reason: reason.into() }));
     }
 
-    /// An automatic switch is due shortly: "Switching to ‹channel› in 10 s · ‹programme›" with
-    /// Cancel (DESIGN §30.8). Nothing for a channel parental control hides.
-    fn on_switch_soon(&mut self, id: crate::model::ReminderId, channel: &ItemRef, start: Timestamp) {
-        if self.lib.conceals(channel) || self.switch_hidden(channel) {
+    /// An automatic switch is due shortly (DESIGN §30.8, B6): the strip's countdown "Switching
+    /// to ‹channel› in 10 s · ‹programme›" with Cancel (and Open full when it opens in the
+    /// pop-out), drawn in the full window and in the pop-out. Nothing for a channel parental
+    /// control hides. `named`: (channel, guarded title) from the pass-2 event; the pass-1 event
+    /// reads them from the row.
+    fn on_switch_soon(&mut self, id: crate::model::ReminderId, channel: &ItemRef, at: Timestamp, named: Option<(String, String)>, open_in: OpenIn) {
+        if self.lib.conceals(channel) || self.switch_hidden(channel) || self.cancelled_switches.contains(&id) {
             return;
         }
-        let row = crate::store::user::reminder(&self.db, id).ok().flatten();
-        let name = match self.lib.live.by_ref(channel).and_then(|c| self.lib.live.get(c)) {
-            Some(c) => c.name.to_string(),
-            None => row.as_ref().map(|r| r.channel_name.clone()).unwrap_or_else(|| "the channel".to_owned()),
-        };
-        let secs = (start - crate::model::now()).max(1);
-        let mut text = format!("Switching to {name} in {secs} s");
-        if let Some(t) = row.map(|r| r.programme_title).filter(|t| !t.trim().is_empty()) {
-            text.push_str(" · ");
-            text.push_str(t.trim());
-        }
-        let ttl_ms = u32::try_from((secs + 3) * 1000).unwrap_or(u32::MAX);
-        self.toast(Toast { kind: ToastKind::Info, text, action: Some(("Cancel".into(), Action::CancelSwitch(id))), ttl_ms });
+        let (channel_name, title) = named.unwrap_or_else(|| {
+            let row = crate::store::user::reminder(&self.db, id).ok().flatten();
+            let name = match self.lib.live.by_ref(channel).and_then(|c| self.lib.live.get(c)) {
+                Some(c) => c.name.to_string(),
+                None => row.as_ref().map(|r| r.channel_name.clone()).unwrap_or_else(|| "the channel".to_owned()),
+            };
+            let title = row.map(|r| r.programme_title).unwrap_or_default();
+            let title =
+                if title.trim().is_empty() { title } else { self.services().agent.guard().outside_title(&title, crate::model::now()).into_owned() };
+            (name, title)
+        });
+        self.reminder_ui.add_countdown(crate::reminders::ui::Countdown { reminder: id, channel_name, title, at, open_in });
     }
 
-    /// An automatic switch's start: play the channel unless it was cancelled or already plays.
-    fn on_switch_now(&mut self, id: crate::model::ReminderId, channel: &ItemRef) {
+    /// An automatic switch's time: play the channel where "Open in" says
+    /// ([`crate::reminders::ui::placement`]: the pop-out never takes focus) unless it was
+    /// cancelled or already plays. Late with catch-up: from the beginning. A news flash
+    /// remembers what played, to put it back.
+    fn on_switch_now(
+        &mut self,
+        id: crate::model::ReminderId,
+        channel: &ItemRef,
+        open_in: OpenIn,
+        rule: Option<crate::model::FollowRuleId>,
+        late: Option<crate::reminders::Late>,
+        egui_ctx: &egui::Context,
+    ) {
+        use crate::reminders::ui::Placement as Place;
+        self.reminder_ui.drop_countdown(id);
+        let open_full = self.reminder_ui.open_full.remove(&id);
         if self.cancelled_switches.remove(&id) || self.switch_hidden(channel) {
             return;
         }
-        match self.channel_for(channel) {
-            Some(cid) => {
-                let playing =
-                    self.snapshot.state != PlayerState::Idle && self.snapshot.playable.as_ref().is_some_and(|p| p.media == MediaRef::Channel(cid));
-                if !playing {
-                    self.play_channel(cid, PlayOrigin::Reminder);
+        let Some(cid) = self.channel_for(channel) else {
+            self.toast(Toast::info("That channel is no longer in your playlists"));
+            return;
+        };
+        // multi-view: automatic switches go to the silent picture, never the one watched
+        let picture = self.mv.view.on.then(|| crate::reminders::ui::FlashPicture { tile: self.mv.view.silent(), sound_was: self.mv.view.audible });
+        let snap = match picture {
+            Some(p) => self.mv_snap(p.tile).unwrap_or_default(),
+            None => self.snapshot.clone(),
+        };
+        let now_media = snap.playable.as_ref().filter(|_| snap.state != PlayerState::Idle).map(|p| p.media.clone());
+        if picture.is_none() && now_media == Some(MediaRef::Channel(cid)) {
+            return;
+        }
+        let open_in = if open_full { OpenIn::FullWindow } else { open_in };
+        let place = crate::reminders::ui::placement(open_in, self.window_now(egui_ctx));
+        let flash =
+            rule.and_then(|_| crate::store::follow::flash_of(&self.db, id).map_err(|e| tracing::debug!("news flash {id}: {e}")).ok().flatten());
+        // when a flash closes: headlines only after N minutes, else with the programme; played
+        // from the beginning (late, catch-up) it runs that much later
+        let catchup = self.switch_catchup(cid, late);
+        let flash_end = flash.as_ref().map(|f| {
+            let row = crate::store::user::reminder(&self.db, id).ok().flatten();
+            let from = row.as_ref().map_or_else(crate::model::now, crate::reminders::target_at);
+            let stop = row.as_ref().map_or(from + crate::reminders::DEFAULT_DURATION_S, crate::reminders::effective_stop);
+            let shift = catchup.map_or(0, |l| crate::model::now() - l.from);
+            crate::follow::flash::ends_at(&f.spec, from).map_or(stop, |t| t.min(stop)) + shift
+        });
+        if flash_end.is_some_and(|t| t <= crate::model::now()) {
+            tracing::info!("news flash {id}: its headlines were over before it could start");
+            return;
+        }
+        let previous = now_media.map(|media| crate::reminders::ui::Previous {
+            media,
+            origin: snap.origin.unwrap_or(PlayOrigin::Fullscreen),
+            paused: snap.paused,
+        });
+        let was_on_player = self.view_screen() == ScreenId::Player;
+        // a silent flash: its picture without the sound (multi-view), or the main one muted
+        let silent = flash.as_ref().is_some_and(|f| f.spec.volume == crate::follow::flash::FlashVolume::Mute);
+        self.play_switch(cid, late, !silent);
+        if self.pending_locked.as_ref().is_some_and(|(c, _)| *c == cid) {
+            return; // the PIN prompt shows where the window is; nothing moves under it
+        }
+        match place {
+            Place::PopOut => {
+                self.toggle_popout(egui_ctx);
+            }
+            Place::FullWindow => {
+                if self.popout.is_out() || self.video_only {
+                    self.toggle_popout(egui_ctx);
+                }
+                if open_full {
+                    crate::platform::hypr::focus_self();
                 }
             }
-            None => self.toast(Toast::info("That channel is no longer in your playlists")),
+            Place::InPlace => self.drop_player_push(),
         }
+        let (Some(f), Some(ends_at)) = (flash, flash_end) else { return };
+        let muted = silent && picture.is_none() && !self.snapshot.muted;
+        if muted {
+            self.send_player(PlayerCommand::SetMute(true));
+        }
+        self.reminder_ui.flash = Some(crate::reminders::ui::FlashRun {
+            reminder: id,
+            name: f.name,
+            channel: cid,
+            ends_at,
+            previous,
+            popped: place == Place::PopOut,
+            was_on_player,
+            muted,
+            picture,
+        });
+        // it closes by itself even while no frame runs (the window hidden): the event wakes
+        // `logic`
+        let bus = self.services().bus.clone();
+        let wait = std::time::Duration::from_secs((ends_at - crate::model::now()).max(0).unsigned_abs());
+        self.services().rt.spawn(async move {
+            tokio::time::sleep(wait).await;
+            bus.send(AppEvent::Reminder(crate::reminders::ReminderEvent::FlashEnded));
+        });
+    }
+
+    /// A late switch that plays from the beginning: on a channel with catch-up that needs no
+    /// PIN.
+    fn switch_catchup(&self, cid: ChannelId, late: Option<crate::reminders::Late>) -> Option<crate::reminders::Late> {
+        let unlocked = self.parental.is_unlocked(&self.services().config().parental);
+        let open = self.lib.live.get(cid).is_some_and(|c| !c.locked || unlocked);
+        late.filter(|l| l.catchup && open)
+    }
+
+    /// Play a switch's channel (the PIN rules apply): live, or — a switch that comes late on a
+    /// channel with catch-up that needs no PIN — from the beginning. With two pictures it goes
+    /// to the silent one, taking the sound unless `sound` is off (a silent news flash).
+    fn play_switch(&mut self, cid: ChannelId, late: Option<crate::reminders::Late>, sound: bool) {
+        let catchup = self.switch_catchup(cid, late);
+        let media = match catchup {
+            Some(l) => MediaRef::Catchup { channel: cid, start: l.from, stop: l.stop, catchup_id: None },
+            None => MediaRef::Channel(cid),
+        };
+        if self.mv.view.on {
+            let cfg = self.services().config();
+            let zap = match catchup {
+                None => self.lib.live.get(cid).and_then(|c| c.group_ids.first().copied()).and_then(|g| self.zap_list(g, &cfg)),
+                Some(_) => None,
+            };
+            let tile = self.mv.view.silent();
+            let aim = crate::ui::multiview::Aim::Tile(tile);
+            self.mv_place(crate::ui::multiview::PlaceIn { aim, media, zap, origin: PlayOrigin::Reminder, take_sound: sound, rearrange: false });
+            self.nav.push(NavRequest::Push(Route::Player));
+        } else if catchup.is_some() {
+            self.pending_zap = None;
+            self.send_player(PlayerCommand::Play(PlayRequest { media, zap: None, origin: PlayOrigin::Reminder, resume: false, immediate: true }));
+            self.nav.push(NavRequest::Push(Route::Player));
+        } else {
+            self.play_channel(cid, PlayOrigin::Reminder);
+        }
+        match (late, catchup) {
+            (Some(l), Some(_)) => self.toast(Toast::info(format!("Started {} min ago — playing from the beginning", l.by_s / 60))),
+            (Some(l), None) => self.toast(Toast::info(format!("Started {} min ago", l.by_s / 60))),
+            _ => {}
+        }
+    }
+
+    /// Undo the Player push a play just queued (scheduled playback "where I am": the screen
+    /// stays, the mini player shows it).
+    fn drop_player_push(&mut self) {
+        if matches!(self.nav.last(), Some(NavRequest::Push(Route::Player))) {
+            self.nav.pop();
+        }
+    }
+
+    /// The window as a switch finds it.
+    fn window_now(&self, egui_ctx: &egui::Context) -> crate::reminders::ui::WindowNow {
+        crate::reminders::ui::WindowNow {
+            focused: egui_ctx.input(|i| i.viewport().focused).unwrap_or(false),
+            watching: self.view_screen() == ScreenId::Player && self.snapshot.state != PlayerState::Idle,
+            popped_out: self.popout.is_out() || self.video_only,
+            can_pop: self.popout_backend.is_some(),
+        }
+    }
+
+    /// A news flash ends (its time, Delete in the pop-out, the strip's End): put back what
+    /// played (unless the user moved on), the window back in, the screen as it was.
+    fn end_flash(&mut self, restore: bool, egui_ctx: &egui::Context) {
+        use crate::reminders::ui::FlashRestore;
+        let Some(f) = self.reminder_ui.flash.take() else { return };
+        if f.muted {
+            self.send_player(PlayerCommand::SetMute(false));
+        }
+        if !restore {
+            return;
+        }
+        let snap = match f.picture {
+            Some(p) => self.mv_snap(p.tile).unwrap_or_default(),
+            None => self.snapshot.clone(),
+        };
+        let playing = snap.playable.as_ref().filter(|_| snap.state != PlayerState::Idle).map(|p| p.media.clone());
+        // the bulletin and its copies (multi-view may have played one on a free playlist)
+        let copies: Vec<ChannelId> = self
+            .lib
+            .live
+            .get(f.channel)
+            .and_then(|ch| crate::ui::multiview::copies_with_pick(&self.lib, ch, |ids| crate::store::copies::tvg_ids(&self.db, ids).ok()))
+            .map(|v| v.into_iter().map(|c| c.id).collect())
+            .unwrap_or_default();
+        match (f.restore(playing.as_ref(), &copies), f.picture) {
+            // the user moved on to something else during the flash: leave it as it is
+            (FlashRestore::Nothing, _) if playing.is_some() => return,
+            (FlashRestore::Nothing, _) => {}
+            // its picture closes: the other carries on with the sound
+            (FlashRestore::Stop, Some(p)) if self.mv.view.on => self.apply_mv(crate::ui::multiview::MvRequest::Close(Some(p.tile))),
+            (FlashRestore::Stop, Some(p)) => self.send_to(p.tile, PlayerCommand::Stop),
+            (FlashRestore::Stop, None) => self.send_player(PlayerCommand::Stop),
+            // what that picture showed comes back, silent; the sound goes back where it was
+            (FlashRestore::Play(prev), Some(p)) => {
+                let aim = crate::ui::multiview::Aim::Tile(p.tile);
+                self.mv_place(crate::ui::multiview::PlaceIn {
+                    aim,
+                    media: prev.media,
+                    zap: None,
+                    origin: prev.origin,
+                    take_sound: false,
+                    rearrange: false,
+                });
+                if self.mv.view.on && self.mv.view.audible != p.sound_was {
+                    self.apply_mv(crate::ui::multiview::MvRequest::Sound(Some(p.sound_was)));
+                }
+            }
+            (FlashRestore::Play(p), None) => match p.media {
+                MediaRef::Channel(c) => {
+                    self.play_channel(c, p.origin);
+                    self.drop_player_push();
+                }
+                media => {
+                    self.send_player(PlayerCommand::Play(PlayRequest { media, zap: None, origin: p.origin, resume: true, immediate: true }));
+                    if p.paused {
+                        self.send_player(PlayerCommand::SetPause(true));
+                    }
+                }
+            },
+        }
+        if f.popped && (self.popout.is_out() || self.video_only) {
+            self.toggle_popout(egui_ctx);
+        }
+        if !f.was_on_player && self.current_route() == &Route::Player {
+            self.nav.push(NavRequest::Back);
+        }
+        self.toast(Toast::info("News flash ended"));
+    }
+
+    /// Delete in the pop-out: call off the next switch's countdown, else end the news flash.
+    fn on_end_news_flash(&mut self, egui_ctx: &egui::Context) {
+        if let Some(id) = self.reminder_ui.countdowns.first().map(|c| c.reminder) {
+            self.cancel_switch(id);
+        } else if self.reminder_ui.flash.is_some() {
+            self.end_flash(true, egui_ctx);
+        }
+    }
+
+    /// The reminder engine's events (`reminders::ENABLED`).
+    fn on_reminder_event(&mut self, ev: &crate::reminders::ReminderEvent, egui_ctx: &egui::Context) {
+        use crate::reminders::ReminderEvent as E;
+        match ev {
+            E::SwitchSoon { reminder, channel, channel_name, title, at, open_in, .. } => {
+                self.on_switch_soon(*reminder, channel, *at, Some((channel_name.clone(), title.clone())), *open_in);
+            }
+            // `route`: a tile B route is multi-view's (MV-2); single view plays in the main picture
+            E::SwitchNow { reminder, channel, open_in, rule, late, .. } => self.on_switch_now(*reminder, channel, *open_in, *rule, *late, egui_ctx),
+            // the scheduler showed the note (or nothing): the countdown goes
+            E::NotSwitched { reminder, .. } => {
+                self.reminder_ui.drop_countdown(*reminder);
+            }
+            E::SleepWarn { at } => self.reminder_ui.sleep_warn = Some(*at),
+            E::SleepNow { action } => self.on_sleep_now(*action, egui_ctx),
+            // set again, moved or turned off: its warning no longer holds
+            E::SleepChanged(_) => self.reminder_ui.sleep_warn = None,
+            // a flash's own timer (or the engine): only once its time has come
+            E::FlashEnded => {
+                if self.reminder_ui.flash.as_ref().is_some_and(|f| crate::model::now() + 2 >= f.ends_at) {
+                    self.end_flash(true, egui_ctx);
+                }
+            }
+        }
+    }
+
+    /// The sleep timer fired: the engine stopped (or paused) the pictures it started with; every
+    /// picture there is now gets the same (multi-view's second one included).
+    fn on_sleep_now(&mut self, action: crate::reminders::sleep::SleepAction, egui_ctx: &egui::Context) {
+        use crate::reminders::sleep::SleepAction;
+        let cmd = match action {
+            SleepAction::Stop => PlayerCommand::Stop,
+            SleepAction::Pause => PlayerCommand::SetPause(true),
+        };
+        for h in self.services().tiles.handles() {
+            h.send(cmd.clone());
+        }
+        self.reminder_ui.sleep_warn = None;
+        // a news flash on: it ends without putting anything back (unmuted), the window back in
+        if let Some(popped) = self.reminder_ui.flash.as_ref().map(|f| f.popped) {
+            self.end_flash(false, egui_ctx);
+            if popped && (self.popout.is_out() || self.video_only) {
+                self.toggle_popout(egui_ctx);
+            }
+        }
+        self.toast(Toast::info(match action {
+            SleepAction::Stop => "Sleep timer: playback stopped",
+            SleepAction::Pause => "Sleep timer: paused",
+        }));
+    }
+
+    /// Every frame: a pop-out asked for before the Hyprland worker ran, a flash's end, stale
+    /// countdowns, and the strip (countdowns, the sleep warning, the news flash).
+    fn reminder_frame(&mut self, egui_ctx: &egui::Context, theme: &Theme) {
+        if self.reminder_ui.pop_out_pending && (self.popout_started || self.popout_backend.is_some()) {
+            self.reminder_ui.pop_out_pending = false;
+            if self.popout_backend.is_some() {
+                if !self.popout.is_out() {
+                    self.toggle_popout(egui_ctx);
+                }
+            } else if self.current_route() == &Route::Player {
+                // no Hyprland: the mini player in the normal window
+                self.nav.push(NavRequest::Back);
+            }
+        }
+        let now = crate::model::now();
+        if self.reminder_ui.flash.as_ref().is_some_and(|f| now >= f.ends_at) {
+            self.end_flash(true, egui_ctx);
+        }
+        // a countdown whose switch never came (Tuner asleep through it, the row edited)
+        self.reminder_ui.countdowns.retain(|c| now < c.at + 30);
+        if self.reminder_ui.sleep_warn.is_some_and(|at| now > at + 5) {
+            self.reminder_ui.sleep_warn = None;
+        }
+        if self.reminder_ui.is_empty() {
+            return;
+        }
+        let sleep = self.services().agent.sleep().and_then(|h| h.status()).map(|s| s.action);
+        let h24 = self.services().config().interface.clock_24h;
+        if let Some(a) = self.reminder_ui.draw(egui_ctx, theme, now, self.video_only, h24, sleep) {
+            self.strip_action(a, egui_ctx);
+        }
+    }
+
+    /// A button on the strip.
+    fn strip_action(&mut self, a: crate::reminders::ui::StripAction, egui_ctx: &egui::Context) {
+        use crate::reminders::ui::StripAction as S;
+        match a {
+            S::CancelSwitch(id) => self.cancel_switch(id),
+            // in the full window, now and when it switches
+            S::OpenFull(id) => {
+                self.reminder_ui.open_full.insert(id);
+                if self.popout.is_out() || self.video_only {
+                    self.toggle_popout(egui_ctx);
+                }
+                crate::platform::hypr::focus_self();
+            }
+            S::SleepExtend => {
+                let Some(h) = self.services().agent.sleep() else { return };
+                let now = crate::model::now();
+                let Some(st) = h.status() else { return };
+                let base = st.fires_at.or(self.reminder_ui.sleep_warn).unwrap_or(now).max(now);
+                let warn_s = self.services().config().reminders.sleep_warn_s;
+                let h24 = self.services().config().interface.clock_24h;
+                match h.set(crate::reminders::sleep::SleepWhen::At(base + crate::reminders::ui::EXTEND_S), st.action, warn_s, None) {
+                    Ok(st) => {
+                        self.toast(Toast::info(format!("Sleep timer: {}", crate::reminders::ui::sleep_status_text(&st, now, h24).to_lowercase())))
+                    }
+                    Err(e) => self.toast(Toast::error(e.message())),
+                }
+                self.reminder_ui.sleep_warn = None;
+            }
+            S::SleepOff => {
+                if let Some(h) = self.services().agent.sleep() {
+                    h.cancel();
+                }
+                self.reminder_ui.sleep_warn = None;
+                self.toast(Toast::info("Sleep timer off"));
+            }
+            S::EndFlash => self.end_flash(true, egui_ctx),
+            // keep watching: no longer a flash
+            S::FlashOpenFull => {
+                self.end_flash(false, egui_ctx);
+                if self.popout.is_out() || self.video_only {
+                    self.toggle_popout(egui_ctx);
+                }
+                crate::platform::hypr::focus_self();
+            }
+        }
+    }
+
+    /// The status bar's sleep-timer chip ("Sleep 23:10"; a click opens the menu, ✕ turns it off).
+    fn sleep_chip(&self) -> Option<crate::ui::widgets::status_bar::StatusChip> {
+        if !crate::reminders::ENABLED {
+            return None;
+        }
+        let sleep = self.services().agent.sleep()?;
+        let st = sleep.status()?;
+        let text = crate::reminders::ui::sleep_chip(&st, self.services().config().interface.clock_24h);
+        let key = keymap::GLOBAL.iter().find(|b| b.action == Action::SleepTimer).map(|b| b.chord.label()).unwrap_or_default();
+        Some(crate::ui::widgets::status_bar::StatusChip {
+            label: format!("Sleep timer — {text} ({key})"),
+            text,
+            action: Action::SleepTimer,
+            warning: self.reminder_ui.sleep_warn.is_some(),
+            close: Some(crate::ui::widgets::status_bar::ChipClose::new("Turn the sleep timer off", move || {
+                sleep.cancel();
+            })),
+        })
     }
 
     /// A switch to a channel parental control hides right now (checked against the clock and
@@ -1007,29 +1519,26 @@ impl TunerApp {
     }
 
     /// A switch cancelled elsewhere (an MCP client's `cancel_switch`, Settings ▸ Reminders): its
-    /// "Switching to … in N s" toast goes, and a `SwitchNow` already on its way is ignored.
+    /// countdown goes, and a `SwitchNow` already on its way is ignored.
     fn drop_cancelled_switch_toasts(&mut self) {
         let db = &self.db;
-        let mut gone = Vec::new();
-        self.toasts.retain(|t| match &t.action {
-            Some((_, Action::CancelSwitch(id))) => {
-                // removed = cancelled (a fired switch keeps its row, `Fired`, and its toast)
-                let removed = matches!(crate::store::user::reminder(db, *id), Ok(None));
-                if removed {
-                    gone.push(*id);
-                }
-                !removed
-            }
-            _ => true,
-        });
+        // removed = cancelled (a fired switch keeps its row, `Fired`)
+        let removed = |id: crate::model::ReminderId| matches!(crate::store::user::reminder(db, id), Ok(None));
+        let gone: Vec<_> = self.reminder_ui.countdowns.iter().map(|c| c.reminder).filter(|id| removed(*id)).collect();
+        for id in &gone {
+            self.reminder_ui.drop_countdown(*id);
+        }
         self.cancelled_switches.extend(gone);
     }
 
-    /// The Cancel of a switch's toast: the row goes, a `SwitchNow` on its way is ignored.
+    /// The countdown's Cancel (or Delete in the pop-out): the row goes, a `SwitchNow` on its
+    /// way is ignored.
     fn cancel_switch(&mut self, id: crate::model::ReminderId) {
         self.cancelled_switches.insert(id);
+        self.reminder_ui.drop_countdown(id);
+        self.reminder_ui.open_full.remove(&id);
         let _ = self.services().store.writer().submit_notify(DataScope::Reminders, move |c| match crate::store::user::reminder(c, id)? {
-            Some(r) if r.switches() => crate::store::user::remove_reminder(c, id),
+            Some(r) if r.switches() => crate::store::user::remove_reminder(c, id, crate::model::RemoveWhy::User),
             _ => Ok(()),
         });
         self.toast(Toast::info("Switch cancelled"));
@@ -1070,6 +1579,11 @@ impl TunerApp {
             Action::GoMovies => self.nav.push(NavRequest::Switch(Route::Movies { group: None })),
             Action::GoSeries => self.nav.push(NavRequest::Switch(Route::Series { group: None })),
             Action::GoSettings => self.nav.push(NavRequest::Switch(Route::Settings(Default::default()))),
+            // the batch features' global keys (each a no-op while its feature is off)
+            Action::GoQueue if crate::queue::ENABLED => self.nav.push(NavRequest::Switch(Route::Queue)),
+            Action::SpoilerMenu if crate::spoiler::ENABLED => self.nav.push(NavRequest::Open(OverlayRequest::SpoilerMenu)),
+            Action::SleepTimer if crate::reminders::ENABLED => self.nav.push(NavRequest::Open(OverlayRequest::SleepTimer)),
+            Action::EndNewsFlash => self.on_end_news_flash(egui_ctx),
             Action::Quit => egui_ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             // the popped-out player: back to the full window, fullscreen
             Action::ToggleWindowFullscreen if self.video_only => {
@@ -1077,6 +1591,9 @@ impl TunerApp {
             }
             Action::ToggleWindowFullscreen => self.set_window_fullscreen(!self.window_fullscreen, egui_ctx),
             Action::OpenPlayer if self.snapshot.state != PlayerState::Idle => self.nav.push(NavRequest::Push(Route::Player)),
+            // two pictures: both pause / play, both stop (DESIGN §35)
+            Action::GlobalPlayPause if self.mv.view.on => self.mv_pause_all(),
+            Action::StopPlayback if self.mv.view.on => self.mv_stop_all(),
             Action::GlobalPlayPause => self.send_player(PlayerCommand::TogglePause),
             Action::StopPlayback => self.send_player(PlayerCommand::Stop),
             Action::RefreshSource => self.refresh_everything(),
@@ -1086,6 +1603,20 @@ impl TunerApp {
             Action::Back => self.back(egui_ctx),
             // an automatic switch's toast (DESIGN §30.8)
             Action::CancelSwitch(id) => self.cancel_switch(id),
+            // a toast's Undo off the screens that made it: Up next's rows, a guide-fix batch
+            Action::Undo(n) if crate::queue::ui::is_undo(n) => {
+                if let Err(e) = crate::queue::ui::undo_in(self.services(), n) {
+                    self.toast(Toast::info(e));
+                }
+            }
+            Action::UndoFollow(id) if crate::follow::ENABLED => {
+                crate::follow::ui::undo_follow(self.services(), id);
+                self.toast(Toast::info("Rule removed"));
+            }
+            Action::UndoGuideFix(log @ Some(_)) if crate::guide_fix::ENABLED => {
+                let opts = crate::store::guide_fix::GuideOpts::from_config(&self.services().config());
+                let _ = crate::guide_fix::ui::submit_undo(self.services(), log, opts, crate::model::now());
+            }
             // a combined action's Undo (`ui::copies`)
             Action::Undo(n) => {
                 let undone = crate::ui::copies::undo(self.services(), n);
@@ -1235,6 +1766,16 @@ impl TunerApp {
     /// Dispatch the actions resolved in `raw_input_hook`: topmost overlay → screen → globals.
     fn dispatch_actions(&mut self, egui_ctx: &egui::Context) {
         for (action, stack) in std::mem::take(&mut self.pending_actions) {
+            // Esc in the player or the pop-out while an automatic switch counts down (its strip
+            // shows over the picture): calls the switch off rather than leaving
+            if action == Action::Back
+                && self.overlays.is_empty()
+                && (self.view_screen() == ScreenId::Player || self.popout.is_out() || self.video_only)
+                && let Some(id) = self.reminder_ui.countdowns.first().map(|c| c.reminder)
+            {
+                self.cancel_switch(id);
+                continue;
+            }
             let handled = if let Some(top) = self.overlays.len().checked_sub(1) {
                 let outcome = self.as_overlay(top, |app| app.with_ctx(|ctx, _, ovs| ovs[top].overlay.on_action(ctx, action)));
                 let ignored = matches!(outcome, OverlayOutcome::Ignored);
@@ -1256,6 +1797,11 @@ impl TunerApp {
                 self.overlays.pop();
             }
             OverlayOutcome::CloseWith(result) => {
+                // multi-view's "move the playing picture?" card, or its PIN for a picture
+                if self.mv_overlay_result(&result) {
+                    self.overlays.pop();
+                    return;
+                }
                 // the PIN asked for by `play_channel` (not a screen's): play it now
                 if matches!(result, overlays::OverlayResult::Unlocked(Action::OpenPlayer))
                     && let Some((id, origin)) = self.pending_locked.take()
@@ -1334,6 +1880,7 @@ impl TunerApp {
                 NavRequest::CloseOverlay => {
                     self.overlays.pop();
                 }
+                NavRequest::MultiView(r) => self.apply_mv(r),
             }
         }
         let route = self.view_route();
@@ -1544,6 +2091,8 @@ impl TunerApp {
     fn sidebar_panel(&mut self, ui: &mut egui::Ui, theme: &Theme, current: ScreenId, side_w: f32) {
         let mut search_clicked = false;
         let has_vod = self.lib.has_vod() || self.lib.has_series() || self.lib.built_at == 0;
+        // Up next's entry shows only while it has pending items (DESIGN §32)
+        let up_next = crate::queue::ENABLED.then(|| self.services().agent.queue().pending()).filter(|n| *n > 0);
         let frame = egui::Frame::NONE.fill(theme.palette.dark_background);
         let clicked = if side_w > 0.0 {
             egui::Panel::left("sidebar")
@@ -1551,7 +2100,7 @@ impl TunerApp {
                 .resizable(false)
                 .show_separator_line(false)
                 .frame(frame)
-                .show(ui, |ui| crate::ui::widgets::sidebar::sidebar(ui, theme, current, side_w > 100.0, has_vod, &mut search_clicked))
+                .show(ui, |ui| crate::ui::widgets::sidebar::sidebar(ui, theme, current, side_w > 100.0, has_vod, up_next, &mut search_clicked))
                 .inner
         } else {
             let strip = theme.space(SpaceToken::ControlHeight) + theme.space(SpaceToken::Md);
@@ -1561,7 +2110,7 @@ impl TunerApp {
                 .show_separator_line(false)
                 .frame(frame.inner_margin(egui::Margin::symmetric(theme.space(SpaceToken::Md) as i8, 0)))
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| crate::ui::widgets::sidebar::sidebar(ui, theme, current, false, has_vod, &mut search_clicked)).inner
+                    ui.horizontal(|ui| crate::ui::widgets::sidebar::sidebar(ui, theme, current, false, has_vod, up_next, &mut search_clicked)).inner
                 })
                 .inner
         };
@@ -1629,21 +2178,35 @@ impl eframe::App for TunerApp {
         while let Ok(ev) = self.events.try_recv() {
             self.handle_event(ev, ctx);
         }
-        self.snapshot = self.services().player.handle().snapshot();
+        // multi-view: a picture that went away ends it; the routers get focus and sound
+        self.mv_reconcile();
+        self.snapshot = self.services().tiles.focused().snapshot();
         self.sync_explicit(ctx);
         self.publish_for_agent();
-        self.measured.observe(&self.snapshot);
-        let busy = matches!(self.snapshot.state, PlayerState::Loading { .. } | PlayerState::Zapping { .. });
+        let focus = self.mv.view.focus;
+        let snaps = [self.mv_snap(crate::model::TileId::A), self.mv_snap(crate::model::TileId::B)];
+        let live_snaps = || snaps.iter().flatten();
+        for s in live_snaps() {
+            self.measured.observe(s);
+        }
+        // the jobs pause while any picture is tuning
+        let busy = live_snaps().any(|s| matches!(s.state, PlayerState::Loading { .. } | PlayerState::Zapping { .. }));
         self.services().jobs.context().player_busy.store(busy, Ordering::Relaxed);
-        if self.snapshot.video_suspended {
-            self.send_player(PlayerCommand::ResumeVideo);
+        // a suspended picture comes back when it is drawn again (the focused one always renders)
+        let any_painted = [crate::model::TileId::A, crate::model::TileId::B].iter().any(|t| self.video.was_painted(*t));
+        for s in live_snaps().filter(|s| s.video_suspended) {
+            if s.tile == focus && (!any_painted || self.video.was_painted(s.tile)) {
+                self.send_player(PlayerCommand::ResumeVideo);
+            } else if s.tile != focus && self.video.was_painted(s.tile) {
+                self.send_to(s.tile, PlayerCommand::ResumeVideo);
+            }
         }
         if let Some(gl) = frame.gl().cloned() {
-            let snap = self.snapshot.clone();
-            self.video.render(&gl, frame, &snap);
+            self.mv_make_surface();
+            self.video.render(&gl, frame, [snaps[0].as_deref(), snaps[1].as_deref()], focus);
         }
         let mode = self.services().config().integration.idle_inhibit;
-        let active = self.snapshot.state.is_active() && !self.snapshot.paused;
+        let active = live_snaps().any(|s| s.state.is_active() && !s.paused);
         let fs = self.window_fullscreen;
         if let Some(i) = &mut self.idle {
             i.set(mode, active, fs);
@@ -1674,6 +2237,7 @@ impl eframe::App for TunerApp {
         }
         let egui_ctx = ui.ctx().clone();
         let width = egui_ctx.content_rect().width();
+        self.mv.ppp = egui_ctx.pixels_per_point();
         // egui points are logical px (no zoom factor), like Hyprland's sizes
         self.window_size = egui_ctx.content_rect().size();
         self.video_only = self.popout.video_only(self.window_size, self.has_media());
@@ -1703,12 +2267,17 @@ impl eframe::App for TunerApp {
         let side_w = crate::ui::layout::sidebar_width(width, theme.rem(), cfg.interface.sidebar);
 
         let mut status_top = egui_ctx.content_rect().bottom();
+        let focus = crate::ui::widgets::status_bar::take_focus(&egui_ctx);
         if chrome {
             let jobs = self.services().jobs.active();
             let hint = self.hint_now();
             let mini_hidden = self.layout == LayoutClass::Compact || !cfg.interface.mini_player;
             let now_playing =
                 (mini_hidden && self.snapshot.state != PlayerState::Idle).then(|| self.snapshot.playable.as_ref().map(|p| p.title.clone())).flatten();
+            // multi-view: "▶ 2 pictures · Sky Sports Main Event" (the focused one's)
+            let now_playing = now_playing.map(|t| if self.mv.view.on { format!("2 pictures · {t}") } else { t });
+            let chips: Vec<_> =
+                crate::spoiler::ui::status_chip(&self.services().agent, crate::model::now()).into_iter().chain(self.sleep_chip()).collect();
             let info = StatusInfo {
                 jobs: &jobs,
                 epg_updated: self.epg_updated,
@@ -1716,6 +2285,8 @@ impl eframe::App for TunerApp {
                 now: crate::model::now(),
                 hint: &hint,
                 now_playing: now_playing.as_deref(),
+                focus: focus.as_deref(),
+                chips: &chips,
             };
             let bar = egui::Panel::bottom("status-bar")
                 .exact_size((26.0 * theme.rem()).round())
@@ -1727,7 +2298,9 @@ impl eframe::App for TunerApp {
             match bar.inner {
                 StatusClick::Jobs => self.nav.push(NavRequest::Open(OverlayRequest::Jobs)),
                 StatusClick::OpenPlayer => self.nav.push(NavRequest::Push(Route::Player)),
+                StatusClick::StopPlayback if self.mv.view.on => self.mv_stop_all(),
                 StatusClick::StopPlayback => self.send_player(PlayerCommand::Stop),
+                StatusClick::Chip(action) => self.global_action(action, &[], &egui_ctx),
                 StatusClick::None => {}
             }
             self.sidebar_panel(ui, &theme, current, side_w);
@@ -1751,9 +2324,13 @@ impl eframe::App for TunerApp {
             && self.video.placement() == Placement::None
         {
             let snap = self.snapshot.clone();
-            match self.video.mini_player(&egui_ctx, &theme, &snap) {
+            let queue = self.services().agent.queue();
+            // multi-view: picture in picture, the focused picture big
+            let inset = self.mv_snap(self.mv.view.unfocused()).filter(|_| self.mv.view.on);
+            match self.video.mini_player_with(&egui_ctx, &theme, &snap, &queue, inset.as_deref()) {
                 Some(MiniAction::Open) => self.nav.push(NavRequest::Push(Route::Player)),
                 Some(MiniAction::PopOut) => self.nav.push(NavRequest::TogglePopOut),
+                Some(MiniAction::Stop) if self.mv.view.on => self.mv_stop_all(),
                 Some(MiniAction::Stop) => self.send_player(PlayerCommand::Stop),
                 None => {}
             }
@@ -1770,12 +2347,14 @@ impl eframe::App for TunerApp {
             let stack = self.key_stack();
             self.pending_actions.push((action, stack));
         }
+        self.reminder_frame(&egui_ctx, &theme);
         self.apply_nav(&egui_ctx);
         self.apply_config_edits(&egui_ctx);
         // "Lock now", a PIN typed or set this frame: not one more frame of the old state
         self.sync_explicit(&egui_ctx);
         self.publish_for_agent();
         self.free_closed_search();
+        crate::ui::widgets::status_bar::settle_focus(&egui_ctx);
         if self.budget.deferred() || self.now_next.pending() || !self.pending_actions.is_empty() {
             egui_ctx.request_repaint();
         }
@@ -1860,6 +2439,7 @@ fn route_for_screen(id: ScreenId) -> Route {
         ScreenId::Onboarding => Route::Onboarding(OnboardingStart::Welcome),
         ScreenId::Logs => Route::Logs,
         ScreenId::EpgMapping => Route::EpgMapping { channel: None },
+        ScreenId::Queue => Route::Queue,
         ScreenId::MovieDetail | ScreenId::SeriesDetail => Route::Home,
     }
 }
@@ -1902,7 +2482,7 @@ fn view_name(screen: ScreenId) -> Option<&'static str> {
         ScreenId::Movies | ScreenId::MovieDetail => "movies",
         ScreenId::Series | ScreenId::SeriesDetail => "series",
         ScreenId::Settings | ScreenId::Logs | ScreenId::EpgMapping => "settings",
-        ScreenId::Player | ScreenId::Onboarding => return None,
+        ScreenId::Player | ScreenId::Onboarding | ScreenId::Queue => return None,
     })
 }
 
@@ -1995,6 +2575,8 @@ mod tests {
         pub toasts: Vec<Toast>,
         /// What was handed to the memory maintenance thread (`TunerApp::release`).
         pub releases: Vec<&'static str>,
+        /// Commands multi-view sent to one picture (`TunerApp::send_to`).
+        pub tile_commands: Vec<(crate::model::TileId, PlayerCommand)>,
     }
 
     /// One app (mpv + runtime + store) at a time keeps the test binary's memory flat.
@@ -3239,7 +3821,8 @@ mod tests {
     fn cli_and_ipc_requests() {
         let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_channels(c, 3, None));
         let ipc = |rig: &mut Rig, view, play: Option<&str>, inputs: &[&str]| {
-            let req = IpcRequest { view, play: play.map(str::to_owned), inputs: inputs.iter().map(|s| s.to_string()).collect() };
+            let req =
+                IpcRequest { view, play: play.map(str::to_owned), inputs: inputs.iter().map(|s| s.to_string()).collect(), ..Default::default() };
             rig.event(AppEvent::Ipc(req));
             rig.frame_with(vec![]);
         };
@@ -3280,7 +3863,7 @@ mod tests {
 
     #[test]
     fn initial_cli_request_applies_at_startup() {
-        let req = IpcRequest { view: Some(crate::cli::ViewArg::Settings), play: Some("http://127.0.0.1:9/x.ts".into()), inputs: vec![] };
+        let req = IpcRequest { view: Some(crate::cli::ViewArg::Settings), play: Some("http://127.0.0.1:9/x.ts".into()), ..Default::default() };
         let rig = Rig::with(test_config(), req, 1.0, |_| Ok(()));
         assert_eq!(rig.app.routes, [Route::Settings(Default::default()), Route::Player]);
         assert_eq!(played(&rig.log()), [(MediaRef::Url("http://127.0.0.1:9/x.ts".into()), PlayOrigin::Cli)]);
@@ -3377,7 +3960,9 @@ mod tests {
         let id = rig.app.lib.live.by_ref(&explicit_ref()).unwrap();
         rig.app.log.borrow_mut().jobs.clear();
         rig.app.log.borrow_mut().commands.clear();
-        rig.app.parental.lock();
+        // Claude's `lock session_now` (the user's own relock takes the same path from here)
+        rig.event(AppEvent::Agent(crate::agent::AgentCommand::LockSession));
+        assert!(!rig.app.parental.is_unlocked(&rig.app.services().config().parental));
         let playable = crate::model::Playable {
             media: MediaRef::Channel(id),
             kind: crate::model::PlayableKind::Live,
@@ -3546,7 +4131,7 @@ mod tests {
             s.agent.clone(),
             s.store.clone(),
             s.config.clone(),
-            s.player.handle(),
+            s.tiles.focused(),
             s.bus.clone(),
             s.jobs.clone(),
         );
@@ -3612,13 +4197,16 @@ mod tests {
         assert_eq!(rig.route(), &Route::Player);
     }
 
-    /// DESIGN §30.8 end to end: `schedule_switch` → the scheduler (running although reminders
-    /// are off) → "Switching to … · Cancel" toasts → the switch plays the channel at the start;
-    /// the switch whose Cancel was pressed never plays.
+    /// DESIGN §30.8 / B6 end to end: `schedule_switch` → the scheduler (running although
+    /// reminders are off) → the strip's countdowns "Switching to … in N s · ‹title›" → the
+    /// switch plays the channel at its start in the pop-out (the window isn't in front: asked of
+    /// Hyprland, never focused); the switch whose Cancel was clicked never plays.
     #[test]
-    fn agent_switches_toast_then_switch_and_cancel_stops_one() {
+    fn agent_switches_count_down_then_pop_out_and_cancel_stops_one() {
         use crate::agent::proto::{Call, GuideSearch, ScheduleSwitch};
         let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_agent(c, 14));
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        rig.app.popout_backend = Some(Box::new(PopRecorder(sent.clone())));
         rig.settle();
         let rally_start = {
             let conn = &rig.app.db;
@@ -3626,22 +4214,30 @@ mod tests {
         };
         let mut ids = Vec::new();
         for q in ["touring", "rally"] {
-            let found = ask(&rig, Call::GuideSearch(GuideSearch { query: q.into(), ..Default::default() }));
+            let found = ask(&rig, Call::GuideSearch(GuideSearch { query: Some(q.into()), ..Default::default() }));
             let item = found["programmes"][0]["ref"].as_str().unwrap().to_owned();
             let s = ask(&rig, Call::ScheduleSwitch(ScheduleSwitch { item, at: None }));
             ids.push(crate::model::ReminderId(s["id"].as_i64().unwrap()));
         }
-        let (touring, rally) = (ids[0], ids[1]);
-        let cancels = |r: &Rig| r.log().toasts.iter().filter_map(|t| t.action.clone()).filter(|a| matches!(a.1, Action::CancelSwitch(_))).count();
-        rig.until_within("the switch toasts", Duration::from_secs(20), |r| cancels(r) == 2);
-        let toast = rig.log().toasts.iter().find(|t| t.action == Some(("Cancel".into(), Action::CancelSwitch(touring)))).cloned().unwrap();
-        assert!(toast.text.starts_with("Switching to Channel 1 in ") && toast.text.ends_with(" s · Touring Cars"), "{}", toast.text);
-        // the rally's Cancel
-        rig.app.pending_actions.push((Action::CancelSwitch(rally), Vec::new()));
-        rig.frame_with(vec![]);
+        let touring = ids[0];
+        rig.until_within("the countdowns", Duration::from_secs(20), |r| r.app.reminder_ui.countdowns.len() == 2);
+        let first = rig.app.reminder_ui.countdowns[0].clone();
+        let text = first.text(crate::model::now());
+        assert_eq!(first.reminder, touring);
+        assert!(text.starts_with("Switching to Channel 1 in ") && text.ends_with(" s · Touring Cars"), "{text}");
+        // the rally's Cancel: the strip's lower one
+        let out = rig.frame_with(vec![]);
+        let mut cancels: Vec<_> =
+            texts(&out).into_iter().filter(|(t, _, role)| t == "Cancel" && *role == egui::accesskit::Role::Button).map(|(_, r, _)| r).collect();
+        cancels.sort_by(|a, b| a.y0.total_cmp(&b.y0));
+        assert_eq!(cancels.len(), 2);
+        rig.click(centre(&cancels[1]), egui::PointerButton::Primary);
         assert_eq!(rig.log().toasts.last().map(|t| t.text.as_str()), Some("Switch cancelled"));
+        assert_eq!(rig.app.reminder_ui.countdowns.iter().map(|c| c.reminder).collect::<Vec<_>>(), [touring]);
         let ch1 = rig.app.lib.live.by_ref(&channel_ref(1)).unwrap();
         rig.until_within("the switch", Duration::from_secs(25), |r| played(&r.log()).contains(&(MediaRef::Channel(ch1), PlayOrigin::Reminder)));
+        assert!(matches!(sent.borrow().as_slice(), [PopRequest::Out { .. }]), "{:?}", sent.borrow());
+        assert!(rig.app.reminder_ui.countdowns.is_empty());
         assert_eq!(rig.route(), &Route::Player);
         // past the rally's start: nothing else switched
         rig.until_within("the rally's start", Duration::from_secs(10), |_| crate::model::now() > rally_start + 1);
@@ -3654,29 +4250,157 @@ mod tests {
         assert_eq!(states, [(touring.0, "fired".to_owned())], "the cancelled row is gone");
     }
 
-    /// `cancel_switch` from an MCP client while the "Switching to … in N s" toast shows: the
-    /// toast goes (nothing will switch) and a `SwitchNow` already on its way is ignored.
+    /// `cancel_switch` from an MCP client while the countdown shows: the countdown goes
+    /// (nothing will switch) and a `SwitchNow` already on its way is ignored.
     #[test]
-    fn a_switch_cancelled_by_the_agent_drops_its_toast() {
+    fn a_switch_cancelled_by_the_agent_drops_its_countdown() {
         use crate::agent::proto::{Call, CancelSwitch, GuideSearch, ScheduleSwitch};
         let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_agent(c, 12));
         rig.settle();
-        let found = ask(&rig, Call::GuideSearch(GuideSearch { query: "touring".into(), ..Default::default() }));
+        let found = ask(&rig, Call::GuideSearch(GuideSearch { query: Some("touring".into()), ..Default::default() }));
         let item = found["programmes"][0]["ref"].as_str().unwrap().to_owned();
         let id = crate::model::ReminderId(ask(&rig, Call::ScheduleSwitch(ScheduleSwitch { item, at: None }))["id"].as_i64().unwrap());
-        let showing = |r: &mut Rig| {
-            let mut n = 0;
-            r.app.toasts.retain(|t| {
-                n += usize::from(matches!(t.action, Some((_, Action::CancelSwitch(_)))));
-                true
-            });
-            n
-        };
-        rig.until_within("the switch toast", Duration::from_secs(15), |r| showing(r) == 1);
+        rig.until_within("the countdown", Duration::from_secs(15), |r| r.app.reminder_ui.countdowns.len() == 1);
         assert_eq!(ask(&rig, Call::CancelSwitch(CancelSwitch { id: id.0 })), serde_json::json!({"cancelled": true}));
-        rig.until("the toast to go", |r| showing(r) == 0);
-        rig.event(AppEvent::Platform(PlatformEvent::SwitchNow { reminder: id, channel: channel_ref(1) }));
+        rig.until("the countdown to go", |r| r.app.reminder_ui.countdowns.is_empty());
+        rig.event(AppEvent::Reminder(crate::reminders::ReminderEvent::SwitchNow {
+            reminder: id,
+            channel: channel_ref(1),
+            open_in: OpenIn::WhereIAm,
+            route: crate::playback::Route::Tile { tile: crate::model::TileId::A, take_sound: false, interrupts_queue: false },
+            rule: None,
+            late: None,
+        }));
         assert!(played(&rig.log()).is_empty());
+    }
+
+    /// "Switch to this when it starts…" from a programme's menu opens the reminder sheet; the
+    /// sheet names what the new switch clashes with, and ↓ → Enter sets a switch that skips
+    /// 5 minutes of build-up (following the "Open in" setting).
+    #[test]
+    fn the_reminder_sheet_sets_a_switch_and_names_its_clashes() {
+        use crate::ui::item_menu::{Target, dispatch, extend};
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_agent(c, 600));
+        rig.settle();
+        let (programme, rally_start) = {
+            let q = |t: &str| rig.app.db.query_row("SELECT id, start FROM programme WHERE title = ?1", [t], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+            let (touring, _): (i64, i64) = q("Touring Cars");
+            let (_, rally): (i64, i64) = q("Rally Stage");
+            (crate::model::ProgrammeId(touring), rally)
+        };
+        let channel = rig.app.lib.live.by_ref(&channel_ref(1)).unwrap();
+        // the rally, an hour that overlaps the touring cars, has a plain reminder
+        let rally = crate::model::Reminder::notify(channel_ref(2), "Channel 2".into(), "Rally Stage".into(), rally_start, rally_start + 3600, 120);
+        rig.writer().blocking(move |c| crate::store::user::add_reminder(c, &rally)).unwrap();
+        let target = Target::Programme { programme, channel };
+        let entry = rig.app.with_ctx(|ctx, _, _| {
+            let mut items = Vec::new();
+            extend(&mut items, &target, ctx, KeyContext::Guide);
+            items.into_iter().find(|i| i.label == "Switch to this when it starts…")
+        });
+        let entry = entry.expect("the menu entry");
+        assert!(rig.app.with_ctx(|ctx, _, _| dispatch(ctx, entry.action, &target)));
+        rig.frame_with(vec![]);
+        let out = rig.frame_with(vec![]);
+        assert!(texts(&out).iter().any(|(t, _, _)| t.contains("Clashes with Rally Stage on Channel 2 at ")), "{:?}", texts(&out));
+        rig.press(Key::ArrowDown, NONE);
+        rig.press(Key::ArrowRight, NONE);
+        rig.press(Key::Enter, NONE);
+        assert!(rig.overlay_kinds().is_empty());
+        let rows = |r: &Rig| crate::store::user::reminders_for_channel(&r.app.db, &channel_ref(1)).unwrap();
+        rig.until("the switch", |r| !rows(r).is_empty());
+        let r = rows(&rig).remove(0);
+        assert!(r.switches(), "{r:?}");
+        assert_eq!((r.offset_s, r.open_in), (300, None));
+        assert!(rig.log().toasts.last().is_some_and(|t| t.text.starts_with("Switching to Channel 1 at ")), "{:?}", rig.log().toasts.last());
+    }
+
+    /// A news flash (a Following "flash" rule's switch) pops out over the live channel, and
+    /// Delete in the pop-out ends it: the channel that played comes back and the window goes
+    /// back in.
+    #[test]
+    fn a_news_flash_pops_out_and_puts_back_the_channel_it_replaced() {
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| {
+            seed_channels(c, 3, None)?;
+            c.execute(
+                "INSERT INTO follow_rule(id, name, kind, spec, mode, priority, created_at, updated_at) VALUES (1, 'News at One', 'news', '{}', 'flash', 0, 0, 0)",
+                [],
+            )?;
+            Ok(())
+        });
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        rig.app.popout_backend = Some(Box::new(PopRecorder(sent.clone())));
+        rig.settle();
+        let now = crate::model::now();
+        let mut news = crate::model::Reminder::notify(channel_ref(2), "Channel 2".into(), "News at One".into(), now - 5, now + 1800, 0);
+        news.mode = crate::model::ReminderMode::Switch;
+        news.rule_id = Some(crate::model::FollowRuleId(1));
+        let id = rig.writer().blocking(move |c| crate::store::user::add_reminder(c, &news)).unwrap();
+        let (ch1, ch2) = (rig.app.lib.live.by_ref(&channel_ref(1)).unwrap(), rig.app.lib.live.by_ref(&channel_ref(2)).unwrap());
+        let playing = |ch: ChannelId| {
+            let p = crate::model::Playable {
+                media: MediaRef::Channel(ch),
+                kind: crate::model::PlayableKind::Live,
+                item: None,
+                source_id: Some(SourceId(1)),
+                title: String::new(),
+                subtitle: None,
+                logo: None,
+                number: None,
+                url: crate::redact::Secret::new(String::new()),
+                headers: Default::default(),
+                start_at: None,
+                duration_hint: None,
+            };
+            PlayerSnapshot { state: PlayerState::Playing, playable: Some(Arc::new(p)), origin: Some(PlayOrigin::Fullscreen), ..Default::default() }
+        };
+        rig.app.snapshot = Arc::new(playing(ch1));
+        rig.event(AppEvent::Reminder(crate::reminders::ReminderEvent::SwitchNow {
+            reminder: id,
+            channel: channel_ref(2),
+            open_in: OpenIn::PopOut,
+            route: crate::playback::Route::Tile { tile: crate::model::TileId::A, take_sound: false, interrupts_queue: false },
+            rule: Some(crate::model::FollowRuleId(1)),
+            late: None,
+        }));
+        assert_eq!(played(&rig.log()).last(), Some(&(MediaRef::Channel(ch2), PlayOrigin::Reminder)));
+        assert!(matches!(sent.borrow().as_slice(), [PopRequest::Out { .. }]), "{:?}", sent.borrow());
+        let flash = rig.app.reminder_ui.flash.clone().expect("a flash");
+        assert_eq!(flash.ends_at, now - 5 + 300, "headlines only: 5 minutes");
+        // Hyprland popped it out and the news plays; Delete in the pop-out ends it
+        rig.event(pop_event(PopOutEvent::PoppedOut));
+        rig.app.snapshot = Arc::new(playing(ch2));
+        let ctx = rig.ctx.clone();
+        rig.app.global_action(Action::EndNewsFlash, &[KeyContext::PopOut], &ctx);
+        assert_eq!(played(&rig.log()).last(), Some(&(MediaRef::Channel(ch1), PlayOrigin::Fullscreen)));
+        assert_eq!(sent.borrow().last(), Some(&PopRequest::In { ours: true }));
+        assert!(rig.app.reminder_ui.flash.is_none());
+        assert!(rig.log().toasts.iter().any(|t| t.text == "News flash ended"));
+    }
+
+    /// Ctrl+Shift+T → Enter sets the sleep timer 15 minutes ahead (the status-bar chip shows
+    /// it); its warning's "+15 min" moves it 15 minutes later.
+    #[test]
+    fn the_sleep_timer_menu_sets_it_and_the_warning_extends_it() {
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_channels(c, 1, None));
+        rig.settle();
+        rig.press(Key::T, Modifiers::CTRL | Modifiers::SHIFT);
+        assert_eq!(rig.overlay_kinds(), [kind(OverlayRequest::SleepTimer)]);
+        let before = crate::model::now();
+        rig.press(Key::Enter, NONE);
+        assert!(rig.overlay_kinds().is_empty());
+        let status = || rig.app.services().agent.sleep().and_then(|h| h.status());
+        let at = status().and_then(|s| s.fires_at).expect("set");
+        assert!((before + 900..=crate::model::now() + 900).contains(&at), "{at}");
+        assert!(rig.app.sleep_chip().is_some_and(|c| c.action == Action::SleepTimer));
+        rig.frame_with(vec![]); // the timer's own `SleepChanged`
+        rig.event(AppEvent::Reminder(crate::reminders::ReminderEvent::SleepWarn { at }));
+        let out = rig.frame_with(vec![]);
+        let more = button(&texts(&out), "+15 min").copied().expect("the warning's +15 min");
+        rig.click(centre(&more), egui::PointerButton::Primary);
+        let later = rig.app.services().agent.sleep().and_then(|h| h.status()).and_then(|s| s.fires_at);
+        assert_eq!(later, Some(at + 900));
+        assert!(rig.app.reminder_ui.sleep_warn.is_none());
     }
 
     /// The relock timer ran out while no frame ran (Tuner on another workspace): a switch to an
@@ -3874,7 +4598,7 @@ mod tests {
         let cleanup = rig.app.services().exit_cleanup();
         rig.app.services().rt.block_on(cleanup);
         assert!(!sock.exists());
-        assert_eq!(rig.app.services().player.handle().snapshot().state, PlayerState::Idle);
+        assert_eq!(rig.app.services().tiles.focused().snapshot().state, PlayerState::Idle);
     }
 
     #[test]
@@ -4058,6 +4782,7 @@ mod tests {
             Route::Onboarding(OnboardingStart::AddSource),
             Route::EpgMapping { channel: None },
             Route::Logs,
+            Route::Queue,
         ];
         for r in routes {
             rig.app.nav.push(NavRequest::Push(r.clone()));
@@ -4207,5 +4932,414 @@ mod tests {
         rig.frame_with(vec![]);
         assert_eq!(rig.route(), &page);
         assert!(!rig.app.routes.contains(&Route::Player));
+    }
+    // ---------------------------------------------------------------- multi-view (§35)
+
+    /// "TV" (Alpha, Bravo, Charlie) and "TV 2" (Bravo, Charlie, Delta), one stream each: the
+    /// user's two accounts. Channel ids 1–3 on TV, 4–6 on TV 2.
+    fn seed_two_playlists(c: &mut rusqlite::Connection) -> crate::error::Result<()> {
+        seed_two_playlists_with(c, |src, i| format!("http://127.0.0.1/{src}/{i}.ts"))
+    }
+
+    /// `seed_two_playlists` with Alpha (TV) PIN-locked and every channel playing lavfi's test
+    /// source, so both pictures really play.
+    fn seed_two_locked_playlists(c: &mut rusqlite::Connection) -> crate::error::Result<()> {
+        seed_two_playlists_with(c, |_, _| "av://lavfi:testsrc2=size=160x90:rate=25".into())?;
+        c.execute("INSERT INTO item_override(source_id, kind, item_key, locked, fp) VALUES (1, 'channel', 'm3u:Alpha', 1, '')", [])?;
+        Ok(())
+    }
+
+    fn seed_two_playlists_with(c: &mut rusqlite::Connection, url_of: impl Fn(usize, usize) -> String) -> crate::error::Result<()> {
+        use rusqlite::params;
+        let account = serde_json::to_string(&crate::model::AccountInfo { max_connections: Some(1), ..Default::default() }).unwrap();
+        for (src, (name, chans)) in [("TV", ["Alpha", "Bravo", "Charlie"]), ("TV 2", ["Bravo", "Charlie", "Delta"])].into_iter().enumerate() {
+            c.execute(
+                "INSERT INTO source(name, kind, url, created_at, generation, account) VALUES (?1, 'm3u-url', ?2, 0, 1, ?3)",
+                params![name, format!("http://127.0.0.1/{src}.m3u"), account],
+            )?;
+            let sid = c.last_insert_rowid();
+            c.execute(
+                "INSERT INTO grp(source_id, kind, key, name, provider_order, item_count, seen_gen) VALUES (?1,'channel','channel:all','All',0,3,1)",
+                params![sid],
+            )?;
+            let grp = c.last_insert_rowid();
+            for (i, ch) in chans.iter().enumerate() {
+                let url = url_of(src, i);
+                c.execute(
+                    "INSERT INTO channel(source_id, key, name, clean_name, norm_name, number, stream, url_key, provider_order, seen_gen)
+                     VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
+                    params![
+                        sid,
+                        format!("m3u:{ch}"),
+                        ch,
+                        ch.to_lowercase(),
+                        (i + 1) as i64,
+                        format!(r#"{{"t":"url","url":"{url}"}}"#),
+                        url,
+                        i as i64
+                    ],
+                )?;
+                let id = c.last_insert_rowid();
+                c.execute(
+                    "INSERT INTO channel_group(group_id, channel_id, position, is_primary) VALUES (?1, ?2, ?3, 1)",
+                    params![grp, id, i as i64],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    const PIC_A: crate::model::TileId = crate::model::TileId::A;
+    const PIC_B: crate::model::TileId = crate::model::TileId::B;
+
+    /// The plays multi-view sent to `tile`.
+    fn tile_plays(log: &Log, tile: crate::model::TileId) -> Vec<MediaRef> {
+        log.tile_commands
+            .iter()
+            .filter_map(|(t, c)| match c {
+                PlayerCommand::Play(r) if *t == tile => Some(r.media.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Alpha plays in picture A (from TV); Ctrl+M on Bravo in Live opens picture B.
+    fn two_pictures() -> Rig {
+        two_pictures_at(1.0)
+    }
+
+    fn two_pictures_at(ui_scale: f32) -> Rig {
+        let mut rig = Rig::with(test_config(), live(), ui_scale, seed_two_playlists);
+        rig.settle();
+        rig.app.send_player(PlayerCommand::Play(PlayRequest {
+            media: MediaRef::Channel(ChannelId(1)),
+            zap: None,
+            origin: PlayOrigin::Fullscreen,
+            resume: false,
+            immediate: true,
+        }));
+        rig.until("Alpha plays", |r| r.app.snapshot.playable.is_some());
+        rig.app.nav.push(NavRequest::Switch(Route::Live { group: None, channel: Some(ChannelId(2)) }));
+        rig.frame_with(vec![]);
+        rig.press(Key::M, CTRL);
+        rig.until("picture B plays", |r| r.app.services().tiles.b().is_some() && !tile_plays(&r.log(), PIC_B).is_empty());
+        rig
+    }
+
+    /// Ctrl+M in Live: picture B starts and plays the channel's copy on the free playlist (TV
+    /// is held by picture A), focus and sound stay on A, nothing is sent to A; an outside play
+    /// (a reminder's Watch) goes to the silent picture and takes the sound; a film ends
+    /// multi-view and plays in picture A.
+    #[test]
+    fn ctrl_m_opens_picture_b_on_a_free_playlist_and_outside_plays_take_the_silent_one() {
+        let mut rig = two_pictures();
+        assert_eq!(tile_plays(&rig.log(), PIC_B), [MediaRef::Channel(ChannelId(4))], "Bravo's copy on TV 2");
+        assert!(tile_plays(&rig.log(), PIC_A).is_empty(), "picture A untouched");
+        let v = rig.app.mv.view;
+        assert!(v.on && v.focus == PIC_A && v.audible == PIC_A, "{v:?}");
+        assert!(rig.log().toasts.iter().any(|t| t.text == "Picture B plays it from TV 2 — TV is busy with picture A"), "{:?}", rig.log().toasts);
+        assert!(rig.app.services().agent.tiles().on, "the routers see two pictures");
+
+        // a reminder's Watch: the silent picture (B) plays Charlie's TV 2 copy and has the sound
+        let charlie = ItemRef { source: SourceId(1), kind: ItemKind::Channel, key: ItemKey("m3u:Charlie".into()) };
+        rig.event(AppEvent::Platform(PlatformEvent::ReminderWatch { reminder: crate::model::ReminderId(1), channel: charlie }));
+        rig.frame_with(vec![]);
+        assert_eq!(tile_plays(&rig.log(), PIC_B).last(), Some(&MediaRef::Channel(ChannelId(5))));
+        let v = rig.app.mv.view;
+        assert!(v.focus == PIC_A && v.audible == PIC_B, "the sound moved, the focus didn't: {v:?}");
+        assert_eq!(rig.app.services().tiles.audible(), PIC_B);
+
+        // a film: picture B stops, it plays in picture A, single view again
+        rig.app.send_player(PlayerCommand::Play(PlayRequest {
+            media: MediaRef::Url("http://127.0.0.1/film.mkv".into()),
+            zap: None,
+            origin: PlayOrigin::Cli,
+            resume: false,
+            immediate: true,
+        }));
+        assert!(rig.log().tile_commands.iter().any(|(t, c)| *t == PIC_B && *c == PlayerCommand::Stop));
+        rig.until("single view", |r| !r.app.mv.view.on);
+        let v = rig.app.mv.view;
+        assert!(v.focus == PIC_A && v.audible == PIC_A, "{v:?}");
+    }
+
+    /// Two pictures (the user's decision, 2026-10-11): automatic switches go to the silent
+    /// picture and never touch the watched one. A silent news flash plays there (a copy on the
+    /// free playlist) without taking the sound; when it ends, that picture gets back what it
+    /// showed. A late switch played from the beginning on catch-up goes there too.
+    #[test]
+    fn switches_in_multi_view_leave_the_watched_picture_alone() {
+        use crate::reminders::ReminderEvent;
+        let mut rig = two_pictures();
+        let to_a = |r: &Rig| r.log().commands.iter().filter(|c| matches!(c, PlayerCommand::Play(_) | PlayerCommand::SetMute(_))).count();
+        let before = to_a(&rig);
+        let spec = r#"{"flash":{"length":{"t":"headlines","min":5},"volume":"mute"}}"#;
+        rig.writer()
+            .blocking(move |c| {
+                c.execute(
+                    "INSERT INTO follow_rule(id, name, kind, spec, mode, priority, created_at, updated_at) VALUES (1, 'News at One', 'news', ?1, 'flash', 0, 0, 0)",
+                    [spec],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let now = crate::model::now();
+        let charlie = ItemRef { source: SourceId(1), kind: ItemKind::Channel, key: ItemKey("m3u:Charlie".into()) };
+        let mut news = crate::model::Reminder::notify(charlie.clone(), "Charlie".into(), "News at One".into(), now - 5, now + 1800, 0);
+        news.mode = crate::model::ReminderMode::Switch;
+        news.rule_id = Some(crate::model::FollowRuleId(1));
+        let id = rig.writer().blocking(move |c| crate::store::user::add_reminder(c, &news)).unwrap();
+        let to_b = crate::playback::Route::Tile { tile: PIC_B, take_sound: true, interrupts_queue: false };
+        rig.event(AppEvent::Reminder(ReminderEvent::SwitchNow {
+            reminder: id,
+            channel: charlie,
+            open_in: OpenIn::WhereIAm,
+            route: to_b,
+            rule: Some(crate::model::FollowRuleId(1)),
+            late: None,
+        }));
+        assert_eq!(tile_plays(&rig.log(), PIC_B).last(), Some(&MediaRef::Channel(ChannelId(5))), "Charlie's TV 2 copy in picture B");
+        let flash = rig.app.reminder_ui.flash.clone().expect("a flash");
+        assert!(flash.picture.is_some_and(|p| p.tile == PIC_B) && !flash.muted, "{flash:?}");
+        assert_eq!(rig.app.mv.view.audible, PIC_A, "a silent flash leaves the sound where it was");
+        rig.until("picture B plays the news", |r| {
+            r.app.mv_snap(PIC_B).is_some_and(|s| s.playable.as_ref().is_some_and(|p| p.media == MediaRef::Channel(ChannelId(5))))
+        });
+        let ctx = rig.ctx.clone();
+        rig.app.global_action(Action::EndNewsFlash, &[KeyContext::PopOut], &ctx);
+        assert!(rig.app.reminder_ui.flash.is_none());
+        assert_eq!(tile_plays(&rig.log(), PIC_B).last(), Some(&MediaRef::Channel(ChannelId(4))), "Bravo is back in picture B");
+        assert_eq!(rig.app.mv.view.audible, PIC_A);
+
+        // late, with catch-up: from the beginning, in picture B
+        let delta = ItemRef { source: SourceId(2), kind: ItemKind::Channel, key: ItemKey("m3u:Delta".into()) };
+        let late = crate::reminders::Late { by_s: 300, from: now - 300, stop: now + 1500, catchup: true };
+        rig.event(AppEvent::Reminder(ReminderEvent::SwitchNow {
+            reminder: crate::model::ReminderId(77),
+            channel: delta,
+            open_in: OpenIn::WhereIAm,
+            route: to_b,
+            rule: None,
+            late: Some(late),
+        }));
+        let from_start = MediaRef::Catchup { channel: ChannelId(6), start: now - 300, stop: now + 1500, catchup_id: None };
+        assert_eq!(tile_plays(&rig.log(), PIC_B).last(), Some(&from_start));
+        assert!(rig.log().toasts.iter().any(|t| t.text == "Started 5 min ago — playing from the beginning"));
+        assert!(tile_plays(&rig.log(), PIC_A).is_empty() && to_a(&rig) == before, "picture A (the one watched) was never touched");
+    }
+
+    /// In the player: `MultiView` sits above the base context (`w`, `q`… resolve there), `w`
+    /// moves the focus without the sound, `q` closes the focused picture and the other carries
+    /// on with the sound; Esc never closes a picture.
+    #[test]
+    fn player_keys_focus_and_close_a_picture() {
+        let mut rig = two_pictures();
+        rig.app.nav.push(NavRequest::Push(Route::Player));
+        rig.frame_with(vec![]);
+        let stack = rig.app.key_stack();
+        let at = stack.iter().position(|c| *c == KeyContext::MultiView).expect("MultiView in the player's stack");
+        assert!(matches!(stack.get(at + 1), Some(KeyContext::PlayerLive | KeyContext::PlayerVod)), "{stack:?}");
+        rig.frame_with(vec![Event::Text("w".into())]);
+        rig.frame_with(vec![]);
+        assert_eq!((rig.app.mv.view.focus, rig.app.mv.view.audible), (PIC_B, PIC_A));
+        assert_eq!(rig.app.services().tiles.focus(), PIC_B, "keys and commands go to B");
+        rig.press(Key::Escape, NONE);
+        rig.press(Key::Escape, NONE);
+        assert!(rig.app.mv.view.on, "Esc never closes a picture");
+        rig.app.nav.push(NavRequest::Push(Route::Player));
+        rig.frame_with(vec![]);
+        rig.frame_with(vec![Event::Text("q".into())]);
+        rig.frame_with(vec![]);
+        assert!(rig.log().tile_commands.iter().any(|(t, c)| *t == PIC_B && *c == PlayerCommand::Stop), "q stopped picture B");
+        let v = rig.app.mv.view;
+        assert!(!v.on && v.focus == PIC_A && v.audible == PIC_A, "{v:?}");
+        assert!(!rig.app.key_stack().contains(&KeyContext::MultiView));
+        assert!(!rig.log().tile_commands.iter().any(|(t, c)| *t == PIC_A && *c == PlayerCommand::Stop), "A carries on");
+    }
+
+    /// Both pictures only on TV (one stream): Ctrl+M on a channel only TV has, while A could
+    /// move to its TV 2 copy, asks first; Enter moves A and plays the channel in B, Esc moves
+    /// nothing.
+    #[test]
+    fn moving_the_playing_picture_always_asks() {
+        let mut rig = Rig::with(test_config(), live(), 1.0, seed_two_playlists);
+        rig.settle();
+        // Bravo (TV) in A: it has a copy on TV 2; Alpha is only on TV
+        rig.app.send_player(PlayerCommand::Play(PlayRequest {
+            media: MediaRef::Channel(ChannelId(2)),
+            zap: None,
+            origin: PlayOrigin::Fullscreen,
+            resume: false,
+            immediate: true,
+        }));
+        rig.until("Bravo plays", |r| r.app.snapshot.playable.is_some());
+        let alpha = crate::ui::multiview::PlaceIn::new(crate::ui::multiview::Aim::Alongside, MediaRef::Channel(ChannelId(1)), None);
+        rig.app.nav.push(NavRequest::MultiView(crate::ui::multiview::MvRequest::Place(alpha.clone())));
+        rig.frame_with(vec![]);
+        assert_eq!(
+            rig.overlay_kinds(),
+            [kind(OverlayRequest::Confirm(overlays::ConfirmSpec {
+                title: String::new(),
+                body: String::new(),
+                confirm_label: String::new(),
+                destructive: false,
+                token: 0
+            }))]
+        );
+        assert!(rig.log().tile_commands.is_empty(), "nothing moves before the answer");
+        rig.press(Key::Escape, NONE);
+        assert!(rig.log().tile_commands.is_empty() && !rig.app.mv.view.on, "Esc: nothing moved");
+
+        rig.app.nav.push(NavRequest::MultiView(crate::ui::multiview::MvRequest::Place(alpha)));
+        rig.frame_with(vec![]);
+        rig.press(Key::Enter, NONE);
+        rig.until("picture B plays", |r| r.app.services().tiles.b().is_some() && !tile_plays(&r.log(), PIC_B).is_empty());
+        assert_eq!(tile_plays(&rig.log(), PIC_A), [MediaRef::Channel(ChannelId(4))], "A moved to Bravo's TV 2 copy");
+        assert_eq!(tile_plays(&rig.log(), PIC_B), [MediaRef::Channel(ChannelId(1))], "B plays Alpha from TV");
+        assert_eq!(rig.app.services().tiles.budget().claim_of(PIC_A), Some(SourceId(2)), "A's claim moved at once");
+    }
+
+    /// Alpha (TV) is PIN-locked: Ctrl+M on it with nothing playing, and the agent's two
+    /// pictures with Alpha first, ask for the PIN before anything plays; with the PIN both land
+    /// at once, Alpha in A and Bravo's TV 2 copy in B (one plan: B never plans against what A
+    /// replaces). From one picture the agent's two again fill both, on different playlists.
+    #[test]
+    fn locked_pictures_ask_for_the_pin_and_the_agents_two_fill_both_pictures() {
+        use crate::agent::{AgentCommand, AgentMultiView};
+        let mut rig = Rig::with(pin_config(), live(), 1.0, seed_two_locked_playlists);
+        rig.settle();
+        rig.app.nav.push(NavRequest::Switch(Route::Live { group: None, channel: Some(ChannelId(1)) }));
+        rig.frame_with(vec![]);
+        rig.press(Key::M, CTRL);
+        rig.frame_with(vec![]);
+        assert_eq!(rig.overlay_kinds(), [pin_prompt()], "Ctrl+M on a locked channel");
+        assert!(played(&rig.log()).is_empty() && rig.log().tile_commands.is_empty(), "nothing played: {:?}", rig.log().commands);
+        rig.press(Key::Escape, NONE);
+
+        let open = |targets: [i64; 2]| {
+            AppEvent::Agent(AgentCommand::MultiView(AgentMultiView::Open {
+                targets: targets.iter().map(|c| MediaRef::Channel(ChannelId(*c))).collect(),
+                layout: None,
+                sound: None,
+                rearrange: false,
+            }))
+        };
+        rig.event(open([1, 2]));
+        rig.frame_with(vec![]);
+        assert_eq!(rig.overlay_kinds(), [pin_prompt()], "the agent's pair with a locked channel");
+        assert!(played(&rig.log()).is_empty() && rig.log().tile_commands.is_empty(), "nothing played before the PIN");
+        type_pin(&mut rig);
+        rig.until("picture B plays", |r| r.app.services().tiles.b().is_some() && !tile_plays(&r.log(), PIC_B).is_empty());
+        assert_eq!(tile_plays(&rig.log(), PIC_A), [MediaRef::Channel(ChannelId(1))], "Alpha in A");
+        assert_eq!(tile_plays(&rig.log(), PIC_B), [MediaRef::Channel(ChannelId(4))], "Bravo's TV 2 copy in B");
+        assert!(played(&rig.log()).is_empty(), "no play went the single-view way");
+        let v = rig.app.mv.view;
+        assert!(v.on && v.focus == PIC_A && v.audible == PIC_A, "{v:?}");
+
+        // one picture (B closed), the agent opens two others: one plan again
+        rig.app.apply_mv(crate::ui::multiview::MvRequest::Close(Some(PIC_B)));
+        rig.until("single view", |r| !r.app.mv.view.on);
+        rig.app.log.borrow_mut().tile_commands.clear();
+        rig.event(open([3, 6]));
+        rig.until("both sent", |r| !tile_plays(&r.log(), PIC_A).is_empty() && !tile_plays(&r.log(), PIC_B).is_empty());
+        assert_eq!(tile_plays(&rig.log(), PIC_A), [MediaRef::Channel(ChannelId(3))], "Charlie from TV");
+        assert_eq!(tile_plays(&rig.log(), PIC_B), [MediaRef::Channel(ChannelId(6))], "Delta, only on TV 2");
+    }
+
+    /// DESIGN §35 §7.8: relocking stops only the picture that shows a locked channel; the other
+    /// carries on (with the sound).
+    #[test]
+    fn relocking_stops_only_the_locked_picture() {
+        let mut rig = Rig::with(pin_config(), live(), 1.0, seed_two_locked_playlists);
+        rig.settle();
+        let cfg = rig.app.services().config();
+        assert!(rig.app.parental.unlock("1234", &cfg.parental));
+        rig.app.send_player(PlayerCommand::Play(PlayRequest {
+            media: MediaRef::Channel(ChannelId(1)),
+            zap: None,
+            origin: PlayOrigin::Fullscreen,
+            resume: false,
+            immediate: true,
+        }));
+        let playing = |r: &Rig, t, ch: i64| r.app.mv_snap(t).is_some_and(|s| crate::ui::screens::live::playing_channel(&s) == Some(ChannelId(ch)));
+        rig.until("Alpha plays", |r| playing(r, PIC_A, 1));
+        rig.app.nav.push(NavRequest::Switch(Route::Live { group: None, channel: Some(ChannelId(2)) }));
+        rig.frame_with(vec![]);
+        rig.press(Key::M, CTRL);
+        rig.until("both play", |r| playing(r, PIC_A, 1) && playing(r, PIC_B, 4));
+        rig.app.parental.lock();
+        rig.frame_with(vec![]);
+        let stops = |r: &Rig, t| r.log().tile_commands.iter().any(|(x, c)| *x == t && *c == PlayerCommand::Stop);
+        assert!(stops(&rig, PIC_A), "locked Alpha stopped");
+        assert!(!stops(&rig, PIC_B), "picture B carries on");
+        assert!(rig.log().toasts.iter().any(|t| t.text == "Picture A stopped — parental control is on"), "{:?}", rig.log().toasts);
+        rig.until("single view on B", |r| !r.app.mv.view.on);
+        let v = rig.app.mv.view;
+        assert!(v.focus == PIC_B && v.audible == PIC_B, "{v:?}");
+    }
+
+    /// The `multiview` tool with two channels while one picture shows (idle, or a film): A plays
+    /// the first and B the second, although the snapshot doesn't show A's play yet.
+    #[test]
+    fn the_agent_opens_two_pictures_at_once() {
+        for film in [false, true] {
+            let mut rig = Rig::with(test_config(), live(), 1.0, seed_two_playlists);
+            rig.settle();
+            if film {
+                rig.app.send_player(PlayerCommand::Play(PlayRequest {
+                    media: MediaRef::Url("http://127.0.0.1/film.mkv".into()),
+                    zap: None,
+                    origin: PlayOrigin::Cli,
+                    resume: false,
+                    immediate: true,
+                }));
+                rig.until("the film plays", |r| r.app.snapshot.playable.is_some());
+            }
+            let before = rig.log().commands.len();
+            let (alpha, delta) = (MediaRef::Channel(ChannelId(1)), MediaRef::Channel(ChannelId(6)));
+            let open =
+                crate::agent::AgentMultiView::Open { targets: vec![alpha.clone(), delta.clone()], layout: None, sound: None, rearrange: false };
+            rig.event(AppEvent::Agent(crate::agent::AgentCommand::MultiView(open)));
+            rig.until("picture B plays", |r| r.app.services().tiles.b().is_some() && !tile_plays(&r.log(), PIC_B).is_empty());
+            let to_a: Vec<MediaRef> = rig.log().commands[before..]
+                .iter()
+                .chain(rig.log().tile_commands.iter().filter(|(t, _)| *t == PIC_A).map(|(_, c)| c))
+                .filter_map(|c| match c {
+                    PlayerCommand::Play(r) => Some(r.media.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(to_a, [alpha], "film {film}: A plays the first only");
+            assert_eq!(tile_plays(&rig.log(), PIC_B), [delta], "film {film}");
+            assert!(rig.app.mv.view.on, "film {film}");
+        }
+    }
+
+    /// The multi-view player at a tiled half (790 pt) and full screen (1600 pt), text size 12
+    /// and 16: the layout follows the width (side by side, big + small, picture in picture) and
+    /// the multi-view group's buttons are on screen with the banner.
+    #[test]
+    fn the_multi_view_player_fits_at_790_and_1600_pt_with_text_size_12_and_16() {
+        use crate::ui::multiview::Layout;
+        let cases = [
+            (790.0, 1.0, Layout::BigSmall),
+            (790.0, 4.0 / 3.0, Layout::Pip),
+            (1600.0, 1.0, Layout::SideBySide),
+            (1600.0, 4.0 / 3.0, Layout::SideBySide),
+        ];
+        for (w, scale, layout) in cases {
+            let mut rig = two_pictures_at(scale);
+            rig.size = egui::vec2(w, 800.0);
+            rig.app.nav.push(NavRequest::Push(Route::Player));
+            rig.frame_with(vec![]);
+            let out = rig.frame_with(vec![Event::PointerMoved(egui::pos2(w / 2.0, 400.0))]);
+            let cfg = rig.app.services().config();
+            assert_eq!(Layout::effective(cfg.player.multiview.layout, w, rig.app.theme.rem(), false), layout, "{w} pt @ {scale}");
+            let t = texts(&out);
+            for label in ["Layout", "Sound here", "Swap", "Close"] {
+                let r = button(&t, label).unwrap_or_else(|| panic!("{label} at {w} pt @ {scale}: {t:?}"));
+                assert!(r.x0 >= 0.0 && r.x1 as f32 <= w && r.y1 < 800.0, "{label} on screen at {w} pt @ {scale}: {r:?}");
+            }
+        }
     }
 }

@@ -150,18 +150,31 @@ in `~/.config/omarchy/shell.toml`; Tuner applies it live).
     Search (`/`) results; Live ▸ Favourites, History, Reminders and All channels; the Live
     preview; the player's channel (c), mini guide (g) and history (h) panels.
   - **Expect:**
-    - Each poster has a small chip in its top-left corner with its own playlist's glyph (the
-      lock and watched chips stay top-right); hovering the chip shows the playlist's name.
-    - The line under each card's title starts with the playlist's name ("Provider A · 2019 ·
-      ★ 7.1"); a long name ends in "…" and leaves room for the year.
-    - Rows, channel tiles and the player panels show the glyph at the right; detail pages (an
-      Xtream movie too) and the preview show glyph + name; the player's top bar shows "● name"
-      left of the clock.
-    - Group rows in Live and the Movies / Series categories show the playlist's name in its
-      colour, so the two playlists' "Action" (or "Sports") rows can be told apart.
-    - On the light theme the yellow playlist's glyph and name are drawn in the text colour,
-      with a yellow edge on the chip and a yellow underline under row glyphs; nothing is
-      unreadable.
+    - Each poster has a small chip in its top-left corner with its own playlist's short code
+      in the playlist's colour ("NW" for Northwind; the lock and watched chips stay
+      top-right); hovering the chip shows the playlist's name.
+    - The line under each card's title is only "2019 · ★ 7.1" — no playlist name, even a long
+      one. With the cursor or the pointer on a card the status bar starts with "Provider A ·
+      2019 · ★ 7.1".
+    - Rows (channels, favourites, history, reminders, search results), channel tiles and the
+      player panels show the code chip at the right and the channel's name gets the room;
+      detail pages (an Xtream movie too) and the preview show glyph + name; the player's top
+      bar shows "● name" left of the clock.
+    - Group rows in Live and the Movies / Series categories show the code chip, so the two
+      playlists' "Action" (or "Sports") rows can be told apart; typing a code in the category
+      filter finds that playlist's categories.
+    - On the light theme the yellow playlist's code is drawn in the text colour inside a
+      thicker yellow outline; nothing is unreadable.
+- [ ] **Playlist codes (Settings ▸ Playlists ▸ edit):**
+  - **Do:** name two playlists "TV" and "TV 2", a third "Northwind"; open each editor.
+  - **Expect:** the Short code field shows the derived code as its placeholder ("TV", "TV2",
+    "NW"); every card and row uses those codes; no two playlists share one.
+  - **Do:** type "nw" into TV's Short code and press Save; then type "tv!" and "abcd".
+  - **Expect:** "Northwind already uses NW" next to the field; the field takes only letters
+    and digits, upper-cased, at most 3. A free code (e.g. "MAX") saves without a refresh and
+    the cards show it at once; emptying the field goes back to the derived code. The
+    notice ("… share a colour") still appears for two playlists with the same glyph and
+    colour.
     - Disable one playlist (Settings ▸ Playlists): the marks disappear at once (Auto). Settings
       ▸ Interface ▸ Playlist on cards ▸ Always brings them back; Never hides them, with no
       restart.
@@ -192,9 +205,9 @@ in `~/.config/omarchy/shell.toml`; Tuner applies it live).
     one playlist left the bar and "Alt+P playlist" in the status bar disappear.
 - [ ] **Telling playlists apart and "Show in All playlists":**
   - **Do:** add two Xtream logins (or two URL playlists) without changing their colour.
-  - **Expect:** the second gets a different colour from the first. If two playlists still look
-    the same (same glyph and colour), Settings ▸ Playlists says "A and B look the same on
-    cards and in lists" and offers "Give each its own colour"; nothing changes until it is
+  - **Expect:** the second gets a different colour from the first. If two playlists still share
+    a colour (same glyph and colour), Settings ▸ Playlists says "A and B share a colour" and
+    offers "Give each its own colour"; nothing changes until it is
     pressed, then the second gets a new colour.
   - **Do:** add free channels (Settings ▸ Playlists ▸ Add free channels…), edit that playlist,
     turn off "Show in All playlists", Save.
@@ -1034,7 +1047,8 @@ PIN set, English audio first. Every check in *All playlists* unless it says othe
   - **Do:** open Movies ▸ All movies, then a big category (EN Box Office), then Series. Sort by
     name, by recently added. Watch the scope bar's counts.
   - **Expect:** one card per title — card edges behind the poster, the copy count bottom-right,
-    `TV + TV 2 · 2021` (or `TV +1` when narrow) under the title; the poster and title of the
+    the playlists' code chips top-left (`TV` `TV2`, at most three then `+n`; fewer when
+    narrow) and `2021 · ★ 7.1` under the title; the poster and title of the
     English copy where there is one; the list's sort holds (a stack sits where its first copy
     sorts). *All playlists* counts cards (fewer than the two playlists added up). Scrolling is
     as smooth as before; opening All movies takes no longer than before. No obviously different
@@ -1249,3 +1263,146 @@ once (`claude mcp list` shows `tuner` connected).
   build open), ask Claude anything. **Expect:** Claude says to restart Tuner; after a restart it
   works.
 
+
+## 22. Guide fixes (real catalogue)
+
+- [ ] **The list:** open Guide fixes (`Ctrl+E`, or Settings ▸ EPG ▸ *Fix guide data…*) on the
+  real catalogue. **Expect:** the dashboard's coverage per playlist matches what the guide
+  shows; the issue chips have counts; rows draw at once in "All channels" (79k) and scrolling
+  stays smooth. "Checking the guide data for new suggestions…" shows only while a check waits or
+  runs (about 30 s after a guide refresh), never as a job for the whole wait.
+- [ ] **Accept and Undo:** mark three "Suggested" rows, `Shift+Enter`. **Expect:** a card with
+  the before/after now lines; Enter applies; the guide shows the programmes; the toast's Undo
+  (or `Ctrl+Z`) puts all three back.
+- [ ] **+1 channel:** on a "+1" channel without guide, accept "+1 h". **Expect:** the guide
+  shows its base's programmes an hour later; a reminder set on it before moves by an hour.
+  "Canal+ 1" or "Disney+ 1" (if your playlists have them) are not offered as +1 channels.
+- [ ] **Rules:** turn on *+1/+2 follow their base* for one playlist. **Expect:** the confirm
+  names how many channels change; after Enter those channels have guides.
+- [ ] **Time shift keys:** `Ctrl+Shift+→` twice quickly, then once more after a second.
+  **Expect:** +3 h, one undo entry per pause.
+- [ ] **Catch-up offset:** on a channel with archive, set the offset to 0 while the playlist's
+  offset is +2 min, press Check ▶. **Expect:** the last programme starts at its real start (the
+  channel's 0 wins).
+- [ ] **Backup:** export a backup after a shift and an "It's right", restore it on a fresh
+  profile. **Expect:** the shift and the dismissal are back.
+- [ ] **Claude:** ask Claude "why is the guide empty on half my channels?" and to fix them.
+  **Expect:** a proposal; more than 50 channels is not applied from chat (Claude says to review
+  them in Guide fixes); a smaller batch applies and its toast/Undo works; a locked channel is
+  refused while locked.
+
+## 23. Up next
+
+- [ ] **Queue and play:** add three episodes (`Ctrl+N`) and a film, `Alt+6`, Enter on the first.
+  **Expect:** each item plays after the countdown card ("Next in 10 s"); the card works with
+  keys and mouse, in the fullscreen player, the mini player and the pop-out; a queued film ending
+  fullscreen stays in the player for the next item.
+- [ ] **Step aside:** during an item, zap to a channel. **Expect:** "Up next paused · Alt+6 to
+  carry on"; media keys Next/Previous zap (they don't step the queue); Carry on resumes the
+  item.
+- [ ] **Locked item:** queue a locked film with the session locked. **Expect:** the card waits
+  for the PIN; with the window on another workspace a notification says Up next is waiting.
+- [ ] **Explicit hidden:** queue an explicit item while unlocked, relock. **Expect:** it
+  disappears from the list and counts; *Clear Up next* doesn't delete it (unlock: it's still
+  there).
+- [ ] **Next episode, empty queue:** watch an episode to the end with Up next empty. **Expect:**
+  "Next episode in 10 s" with its label through the spoiler guard (a later episode's title
+  hidden for a part-way series); it plays. Lock the series and repeat with the session locked:
+  "Next episode is locked", nothing plays.
+- [ ] **Restart:** quit during an item, start Tuner. **Expect:** nothing plays; Home shows
+  "Resume Up next".
+
+## 24. Following and the news flash
+
+- [ ] **Follow a team:** `R` on a match in the guide, Follow. **Expect:** the toast "Following:
+  … · N in the guide" with Undo (Undo removes the rule and its reminders); reminders for the
+  next games appear in Settings ▸ Reminders "from Following"; a game shown on two channels gets
+  one reminder; two different games at the same time get one each.
+- [ ] **No interrupt:** with a film playing, let a rule's switch come due. **Expect:** a
+  notification with **Watch**, the film keeps playing. Your own one-off switch does interrupt,
+  after the 10 s Cancel.
+- [ ] **Edit a rule:** change a rule from Notify to Switch. **Expect:** its coming reminders
+  become switches after the next evaluation (within seconds).
+- [ ] **Following off:** turn Following off in Settings. **Expect:** its reminders don't fire
+  (on again: they do).
+- [ ] **News flash (the user's addition):** on a news bulletin, *News flash this daily…*,
+  weekdays, headlines 5 min. At the bulletin's time with a live channel playing. **Expect:** the
+  countdown strip in the pop-out (pinned, every workspace, **keyboard focus stays where it
+  was**), the bulletin plays, after 5 min the pop-out closes and the previous channel is back.
+  With a film playing: a notification instead. With the bulletin's channel (or its copy)
+  already on: nothing. In quiet hours (set them to cover now): nothing. With another app
+  fullscreen (and "not while another app is fullscreen" on): nothing.
+- [ ] **Silent flash:** set the rule's sound to Mute. **Expect:** the flash plays muted and the
+  sound comes back after it.
+- [ ] **Tuner closed:** quit Tuner before a flash. **Expect:** it still pops up (systemd timer)
+  in the pop-out; in quiet hours nothing starts.
+
+## 25. Spoiler guard
+
+- [ ] **Part-way series:** with a series half watched, open its page and the guide. **Expect:**
+  later episodes' titles are bars, plots say "hidden — … · Ctrl+B to show"; the next-up episode
+  and earlier ones show. `Ctrl+B` on one reveals it until you move.
+- [ ] **Followed sport:** follow your team spoiler-safe; during and after their match, look at
+  the guide and the news channels. **Expect:** "Arsenal v Chelsea 󰈉" where a score was (also
+  "Arsenal v Chelsea 2-1"); news sub-titles mentioning the team are bars; unrelated sport and
+  "Arsenal Women" / "Fan TV" are untouched. Watching the match (or its repeat the next day)
+  lifts it.
+- [ ] **Zap shield:** while the match's guard is active, zap with ↑/↓ onto a sports news
+  channel talking about it. **Expect:** the card covers the picture **before any sound** (the
+  channel isn't tuned; the previous picture pauses under it); Enter watches anyway, ↓ judges
+  the next channel, Backspace resumes the previous one.
+- [ ] **Notifications:** a reminder for the match's channel fires (Tuner open, then closed).
+  **Expect:** no score in the notification either way.
+- [ ] **Claude:** ask Claude "what was the Arsenal score?" and "what's on Sky Sports News?".
+  **Expect:** no score or guarded text; asking Claude to remove your own spoiler rule is refused.
+
+## 26. Multi-view on the two one-connection accounts
+
+Both test accounts allow one stream each (TV and TV 2).
+
+- [ ] **Second picture from the other playlist:** play a channel from TV, `Ctrl+M` on a channel
+  that exists on both. **Expect:** picture B plays TV 2's copy; A is untouched; the status shows
+  one stream per playlist; focus and sound stay on A until `M`.
+- [ ] **Only on the busy playlist:** `Ctrl+M` on a channel that's only on TV while A plays TV.
+  **Expect:** "Move picture A to its TV 2 copy?"; Esc changes nothing; Enter moves A (one short
+  gap) and B plays — never two streams on one playlist (no provider 403 / "too many
+  connections").
+- [ ] **Zap past the other playlist:** in B, zap with ↑/↓ through channels A's playlist holds.
+  **Expect:** B plays copies on its own playlist or skips with "… skipped — TV is in use by
+  picture A".
+- [ ] **Layouts and keys:** `t` cycles side by side / big + small / picture in picture at Wide,
+  Tiled and in the pop-out; `w`, Ctrl+arrows, `W`, `q`; Esc never closes a picture.
+- [ ] **Automatic switches:** with two pictures, let a reminder switch and a news flash come
+  due. **Expect:** they play in the silent picture; the picture you watch is untouched; after
+  the flash the silent picture gets back what it showed.
+- [ ] **Parental:** with the session locked, `Ctrl+M` on a locked channel. **Expect:** the PIN
+  prompt before anything plays. Relock with a locked channel in A and a free one in B: only A
+  stops.
+- [ ] **Claude:** "put both semis side by side". **Expect:** two pictures on different
+  playlists in one go.
+- [ ] **CPU:** two HD live channels for 10 minutes. **Expect:** smooth video, fans and battery
+  as noted in `docs/design/multiview-spike.md`.
+
+## 27. Reminders, scheduled playback and the sleep timer
+
+- [ ] **Pop-out auto-launch without focus steal (Tuner closed):** set a switch for a programme
+  starting in 3 minutes (Open in: Pop-out), quit Tuner, keep typing in a terminal. **Expect:**
+  Tuner starts about 40 s before, the pop-out appears pinned on the current workspace, the
+  countdown strip shows, and **the terminal keeps the keyboard** the whole time. Known gap: on
+  Omarchy 4 the first window may still take focus — note what happens.
+- [ ] **Pop-out with Tuner open on another workspace:** same, Tuner running. **Expect:** the
+  pop-out appears on the current workspace without taking focus.
+- [ ] **`tuner --play <ref> --popout`:** **Expect:** plays in the pop-out without focus.
+- [ ] **Esc cancels:** while "Switching to … in 8 s" shows over the player, press Esc.
+  **Expect:** "Switch cancelled", the player stays.
+- [ ] **Late switch:** suspend the laptop across a switch's start, resume 5 min later.
+  **Expect:** the 10 s countdown still shows, then it plays from the beginning on catch-up
+  ("Started 5 min ago — playing from the beginning") or live.
+- [ ] **Re-login:** set a switch, log out and back in (lingering on), quit Tuner. **Expect:** the
+  switch still opens the pop-out.
+- [ ] **`tuner --refresh` with a Following rule:** quit Tuner, run `tuner --refresh` after the
+  guide changed. **Expect:** `systemctl --user list-timers` shows a "Tuner reminder" unit for
+  the new match.
+- [ ] **Sleep timer:** `Ctrl+Shift+T`, "after 2 items" on a series. **Expect:** the warning
+  strip near the end of episode 2, then it stops — not earlier while episode 1's end card shows.
+  "End of Up next" with three queued items stops after the third, not after the first.

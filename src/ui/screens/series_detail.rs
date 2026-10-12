@@ -206,6 +206,16 @@ impl SeriesDetailScreen {
         }
     }
 
+    /// What the batch features act on: the focused episode, else the series.
+    fn feature_target(&self) -> Option<crate::ui::item_menu::Target> {
+        use crate::ui::item_menu::Target;
+        let series = self.id?;
+        Some(match self.focused_episode() {
+            Some(e) => Target::Episode { series, episode: e.id },
+            None => Target::Series(series),
+        })
+    }
+
     fn focused_episode(&self) -> Option<Episode> {
         self.current_episodes().get(self.ep).map(|e| (*e).clone())
     }
@@ -484,6 +494,12 @@ impl Screen for SeriesDetailScreen {
     }
 
     fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
+        // the batch features' keys on the focused episode, else the series (Ctrl+N…)
+        if let Some(t) = self.feature_target()
+            && crate::ui::item_menu::dispatch(ctx, action, &t)
+        {
+            return true;
+        }
         match action {
             Action::Up => self.move_vertical(false),
             Action::Down => self.move_vertical(true),
@@ -611,6 +627,9 @@ impl Screen for SeriesDetailScreen {
                 if crate::ui::stacks::combine(ctx.config) && ctx.lib.eligible(ItemKind::Series).len() > 1 {
                     items.push(mi(glyphs::PLAYLIST, "Same title as…", Action::Digit(super::copies::SAME_TITLE), None));
                 }
+                if let Some(t) = self.feature_target() {
+                    crate::ui::item_menu::extend(&mut items, &t, ctx, KeyContext::Detail);
+                }
                 ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: "Series".into(), items }));
             }
             // this is the details page already
@@ -653,6 +672,12 @@ impl Screen for SeriesDetailScreen {
             }
             OverlayResult::Unlocked(a @ (Action::Activate | Action::ActivateAlt | Action::ToggleLock)) => {
                 self.on_action(ctx, a);
+            }
+            // a feature's choice from the menu
+            OverlayResult::Chosen(a) => {
+                if let Some(t) = self.feature_target() {
+                    crate::ui::item_menu::dispatch(ctx, a, &t);
+                }
             }
             _ => {}
         }
@@ -736,8 +761,11 @@ impl Screen for SeriesDetailScreen {
             meta.push(format!("★ {r:.1}"));
         }
         let mut text = Vec::new();
-        if let Some(p) = s.plot.as_deref().filter(|p| !p.trim().is_empty()) {
-            text.push((p.to_owned(), false));
+        let spoilers = crate::ui::widgets::spoiler::Spoilers::of(ctx);
+        let series_norm = crate::spoiler::series_key(&s.name);
+        let subj = crate::guard::Subject::Vod { title: s.display_name(), series_norm: Some(&series_norm) };
+        if let Some(p) = s.plot.as_deref().filter(|p| !p.trim().is_empty()).and_then(|p| spoilers.text(&subj, crate::guard::Field::Plot, p)) {
+            text.push((p.into_owned(), false));
         }
         if let Some(c) = s.cast.as_deref().filter(|c| !c.trim().is_empty()) {
             text.push((format!("Cast: {c}"), true));
@@ -891,6 +919,8 @@ impl Screen for SeriesDetailScreen {
             ui.add_space(theme.space(SpaceToken::Md));
             let season = data.seasons.get(season_idx).copied().unwrap_or(0);
             for (i, e) in data.season_episodes(season).into_iter().enumerate() {
+                // the spoiler guard's view of the episode (title and plot after next-up)
+                let e = &*spoilers.episode(&series_norm, e);
                 let p = shown.get(&e.key);
                 let watched = p.is_some_and(|p| p.finished);
                 let cursor = section == Section::Episodes && i == ep_idx;
@@ -1267,6 +1297,9 @@ mod tests {
             c.execute("UPDATE series SET details_at = NULL WHERE id = ?1", [bravo])?;
             Ok(())
         });
+        // what a refresh announces (the seed itself sends nothing: without this the page only
+        // reloaded on a late Progress event from the marks above)
+        h.state().t.services().bus.send(AppEvent::Data(DataScope::Vod));
         until(&mut h, "Bravo unloaded", |h| h.state().s.data.as_ref().is_some_and(|d| !d.unloaded.is_empty()));
         h.state_mut().result(OverlayResult::Chosen(Action::Digit(MENU_SEASON_WATCHED)));
         assert!(h.state().s.fetch.busy());

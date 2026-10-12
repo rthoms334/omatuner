@@ -46,6 +46,42 @@ row_id!(/// `fav_list.id`
     FavListId);
 row_id!(/// `reminder.id`
     ReminderId);
+row_id!(/// `queue_item.id` (Up next, DESIGN §32; batch base).
+    QueueId);
+row_id!(/// `follow_rule.id` (Following, DESIGN §33; batch base).
+    FollowRuleId);
+row_id!(/// `spoiler_rule.id` (spoiler guard, DESIGN §34; batch base).
+    SpoilerRuleId);
+row_id!(/// `guide_fix_log.id` (Guide fixes, DESIGN §31; one logged batch that Undo reverts).
+    GuideFixLogId);
+
+/// A picture of the player (multi-view, DESIGN §35): A is the player that always exists, B the
+/// second one multi-view starts lazily. The names never change through swaps and layouts
+/// (logs, MCP and the key help use them). Not persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TileId(pub u8);
+
+impl TileId {
+    pub const A: Self = Self(0);
+    pub const B: Self = Self(1);
+
+    /// `'A'`, `'B'`, … (corner letters, log prefixes, MCP `tile`).
+    pub fn letter(self) -> char {
+        (b'A' + self.0.min(25)) as char
+    }
+
+    /// The other picture of a two-picture view.
+    pub fn other(self) -> Self {
+        if self == Self::A { Self::B } else { Self::A }
+    }
+}
+
+impl fmt::Display for TileId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.letter())
+    }
+}
 
 /// In-process job id (not persisted).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

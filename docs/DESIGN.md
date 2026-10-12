@@ -17,7 +17,10 @@ data flow · 4 Module map · 5 Runtime details · 6 Data model · 7 Storage life
 reattach · 9 Import pipelines & EPG matching · 10 Catch-up · 11 Player · 12 Layout ·
 13 Screens & components · 14 Search · 15 Keyboard · 16 Theme engine · 17 Fonts · 18 Images ·
 19 Backup · 20 Security · 21 Desktop integration · 22 Packaging & licence · 23 Testing ·
-24 Implementation plan (work packages) · 25 Risks & verification backlog · 26 Review decisions
+24 Implementation plan (work packages) · 25 Risks & verification backlog · 26 Review decisions ·
+27–29 Xtream upgrade, category filter, several playlists · 30 Agent control (MCP) · v0.2 batch:
+31 Guide fixes · 32 Up next · 33 Following & news flash · 34 Spoiler guard · 35 Multi-view ·
+36 Reminders & sleep timer · 37 Claude plugin & skills · 38 Playlist codes & library load
 
 ---
 
@@ -1497,8 +1500,10 @@ clamp(width/1280, 1, 1.6).
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 Content padding = panel-padding (18). Panes separated by 1 px `pane_divider` (fg @ 0.28).
-Status bar: left = running jobs ("󰑐 Refreshing My IPTV · 45 %", click = Ctrl+J) or, when idle,
-the per-context hint line generated from the keymap (`keymap::hint_line`); right = guide
+Status bar: left = the focused / hovered item with its playlist's full name when cards or rows
+show playlist codes ("Northwind · 2019 · ★ 7.9", §13.0), then running jobs ("󰑐 Refreshing My
+IPTV · 45 %", click = Ctrl+J) or, when idle, the per-context hint line generated from the keymap
+(`keymap::hint_line`); right = guide
 freshness, offline marker, and — when the mini-player is hidden (Compact or disabled) — a
 now-playing chip (click = player, ✕ = stop). **No clock** (the Omarchy bar already shows one).
 Toasts stack bottom-right ABOVE the mini-player rect (`VideoHost::mini_rect`), which screens
@@ -1574,22 +1579,35 @@ when at least 360 px wide) shows for the usual OSD time after popping out.
   them**: a scoped screen (§29) shows marks only in "All playlists"; views without a scope
   (Home, Search, detail pages, the Live preview, the player) count as All
   (`UiCtx::source_of(kind, source)`; scoped screens use `Scope::marks`).
+  * **Playlist codes**: cards and rows show a playlist as a **short code chip** — 1–3 letters
+    or digits in the playlist's colour inside a 1 px outline of that colour
+    (`badge::CodeChip`) — never its name, so a long name can't push the year or a channel's
+    name out. The code is the user's (Settings ▸ Playlists ▸ edit ▸ **Short code**,
+    `SourceSettings::code`) or derived from the name (`sources::codes::auto`): the whole name
+    when it has ≤ 3 letters and digits (`TV`, `TV 2` → `TV2`), else its words' initials
+    (`Harbor Free` → `HF`, digits whole: `Channel 44` → `C44`), one word → the initials of its
+    halves (`Northwind` → `NW`) or its first two letters (`Aurora` → `AU`). Codes are
+    **unique** among all playlists (`sources::codes::assign`: the user's first, a duplicate
+    gets the first free variant `TV2`, `TV3`, …, then letters), resolved once per library
+    build into `SourceMeta::code`. The editor's field shows the derived code as placeholder,
+    accepts letters and digits only (upper-cased, ≤ 3) and refuses another playlist's code
+    ("Northwind already uses NW"). The full name stays one step away: the chip's tooltip, the
+    item's accessible label, and the **status bar** while the item has the cursor or the
+    pointer ("Northwind · 2019 · ★ 7.9"; `status_bar::note_focus`). Typing a playlist's code
+    in a category / group filter finds its categories, like its name.
   * *Poster cards* (Movies / Series grids, every Home poster rail — Continue watching,
-    favourites, Recently added): a **top-left corner chip** (the lock / watched chips grow from
-    the top-right, so they never collide), same size and bg @ 0.85 as those chips, the source
-    glyph in the source colour; tooltip = the playlist's name. The **meta line starts with the
-    playlist's name** in its colour then " · " ("Provider A · 1999 · ★ 8.7"), so it reads
-    without hovering and never by colour alone. *Short-name rule*: the name elides with "…" at
-    60 % of the card width when a year / rating follows (they keep the rest), at the full width
-    otherwise.
+    favourites, Recently added): a **top-left code chip** (the lock / watched chips grow from
+    the top-right, so they never collide), the height of those chips on bg @ 0.85; tooltip =
+    the playlist's name. A folded stack card chips **up to three** of its playlists (its own
+    first), then `+n` for the rest; fewer when the card is narrow (its own always shows;
+    tooltip "Also in n more playlists"). The **meta line is "year · ★ rating" only**.
   * *Rows and tiles* (Live channel rows incl. the virtual Favourites / History / All groups,
     Live ▸ Reminders, Home channel tiles incl. Recently watched, the player's channel /
-    history / mini-guide panels): the **compact glyph** at the right edge (left of the lock on
-    tiles), name as tooltip — rows have no room for a name, and the list header / preview
-    already says the rest. Search results keep their glyph + name pill (wide rows).
-  * *Group rows* (Live groups, Movies / Series categories) in All: the playlist's name, short
-    (elided at 30 % of the row), in its colour (fg where it doesn't read), right of the group
-    name — the two "Sports" are told apart (replaces the old " · TV 2" suffix).
+    history / mini-guide panels, search results — a chip per playlist of a stack): the code
+    chip at the right edge (left of the lock on tiles), name as tooltip, the same in every
+    density — the item's name gets the width.
+  * *Group rows* (Live groups, Movies / Series categories) in All: the code chip right of the
+    group name — the two "Sports" are told apart (replaces the old " · TV 2" suffix).
   * *Detail pages* (movie, series — Xtream pages too, not only playlist ones) and the Live
     preview: a source badge (glyph + name) leads the meta line. (Sparse playlist pages no
     longer append the name to the meta.)
@@ -1599,9 +1617,9 @@ when at least 360 px wide) shows for the usual OSD time after popping out.
     A") on cards, tiles, rows and search hits.
   * *Contrast*: a source colour is used for text or a glyph only where it reaches 3:1 on its
     background (`badge::legible_on`; window bg for cards / rows, the OSD scrim in the player).
-    Otherwise the glyph / name is fg and the colour moves to a non-text mark: a 1.5 px edge
-    on the corner chip, a 2 px underline under a row glyph, the border of a badge — e.g. a
-    yellow playlist on a light theme.
+    Otherwise the code / name is fg and the colour moves to a non-text mark: the code chip's
+    outline thickens to 1.5 px, the border of a badge — e.g. a yellow playlist on a light
+    theme.
 * **Reorder vs sort**: Alt+↑/↓ while the list is sorted by anything other than *Custom order*
   (`SortMode::Provider` = provider order with user reordering) switches it to Custom order with
   a toast "Switched to custom order". Ctrl+S opens a small sort & view menu (launcher card),
@@ -1646,10 +1664,10 @@ adds a `Quality` line on live channels with a quality word: "Quality  named 4K �
 | Progress | `progress::*` | programme progress fg; watch progress accent; busy bar for unknown totals |
 | Badge | `badge::*` | caption, 1 px border colour @ 0.6; LIVE = urgent; source = source colour (palette role) + glyph, text fg where the colour is < 3:1 on bg |
 | Scope bar | `scope_bar::scope_bar` (tabs), `scope_bar::scope_button` (`● TV 2 ▾`), `scope_bar::paint_stripe` | control-height row; tab = dot (palette colour, non-text) · name (fg selected / hovered, `text_secondary` otherwise) · count (body-small @ 0.52); selected tab underlined 2 px in its colour (accent for All); hover fill fg @ 0.08; button = bordered button with the dot; stripe 2 px in the picked playlist's colour (§29) |
-| Source mark | `badge::paint_source_chip` (poster corner chip), `badge::paint_source_mark` (rows, tiles, OSD lists), `badge::source_badge` (detail pages, preview) | glyph icon 14 in the source colour; chip = bg @ 0.85, top-left, size of the lock chip; colour < 3:1 → fg glyph + 1.5 px colour edge (chip) / 2 px colour underline (glyph); tooltip = playlist name (§13.0 "Playlist on cards") |
+| Source mark | `badge::CodeChip` (poster corner chips, OSD lists), `badge::paint_code_chip` (rows, tiles, search hits, copy cards), `badge::source_badge` (detail pages, preview) | the playlist's code (caption) in its colour, 1 px outline in the colour, never narrower than tall; poster chips = bg @ 0.85, top-left, height of the lock chip; colour < 3:1 → fg code + 1.5 px colour outline; tooltip = playlist name (§13.0 "Playlist codes") |
 | Quality badge | `badge::InlineBadge::quality` + `name_with_quality` (rows, grid, search, OSD lists), `badge::quality_badge` (preview, guide side panel) | monospace caption, text @ 0.52 (`text_secondary`; `text_disabled` on dimmed rows; OSD text in the player), 1 px border at 0.6 × the text's opacity, Md gap after the name |
 | Logo / monogram | `logo::logo` | square, aspect kept; monogram on fg @ 0.04, text @ 0.52 |
-| Poster card | `poster::poster_card` | 2:3; title body; meta body-small @ 0.52 (led by the playlist's name in its colour, §13.0); progress accent; cursor 2 px accent outline; corner chips: playlist top-left, lock / watched top-right |
+| Poster card | `poster::poster_card` | 2:3; title body; meta body-small @ 0.52 (year · ★ rating; the playlist is a code chip, §13.0); progress accent; cursor 2 px accent outline; corner chips: playlist top-left, lock / watched top-right |
 | Empty / error state | `empty_state::empty_state` | glyph display-large 28 accent @ 0.8; title 14 fg @ 0.7; detail @ 0.52 |
 | Sidebar | `sidebar::sidebar` | bg dark_background; row control-height + md; selected fg @ 0.18 + accent |
 | Status bar | `status_bar::status_bar` | height 26 (Omarchy bar), body-small, fg @ 0.52 |
@@ -1998,6 +2016,7 @@ favourites lists) show a 󰇙 drag grip and move with Alt+↑/↓ or K/J. Every 
 | | Server timezone override | `SourceSettings.server_tz` | from account |
 | | Use provider EPG · smart names · import VOD | `SourceSettings.*` | on |
 | | Show in All playlists (§29; a view setting — saving it doesn't refresh) | `SourceSettings.in_all` | on |
+| | Short code (1–3 letters / digits, unique; placeholder = the derived code; a view setting) (§13.0) | `SourceSettings.code` | from the name |
 | | look-alike notice + "Give each its own colour" (§29) | `source.color` | — |
 | | Account info (read-only) | `AccountInfo` | — |
 | EPG | sources (add URL/file, enable, **priority order** — grip / Alt+↑/↓, offset minutes, refresh) | `epg_source` | — |
@@ -2268,6 +2287,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Alt+3` | TV guide |
 | `Alt+4` | Movies |
 | `Alt+5` | Series |
+| `Alt+6` | Up next |
 | `Ctrl+Comma` / `Alt+0` | Settings |
 | `Alt+←` | Back |
 | `F11` | Toggle window fullscreen |
@@ -2278,6 +2298,9 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Ctrl+R` / `F5` | Refresh playlists & guide |
 | `Ctrl+J` | Show background tasks |
 | `F1` | Keyboard help |
+| `Ctrl+B` | Show / hide spoilers of the focused item |
+| `Ctrl+Shift+B` | Spoiler guard… (pause, I'll watch it later, guard a topic) |
+| `Ctrl+Shift+T` | Sleep timer… |
 | `Alt+P` | Choose the playlist shown (Movies, Series, Live TV, guide) |
 | `Ctrl+PgDn` / `Ctrl+PgUp` | Next / previous playlist (Movies, Series, Live TV, guide) |
 
@@ -2295,7 +2318,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Esc` | Back |
 | `/` | Search everything |
 | `?` | Keyboard help |
-| `Space` / `Insert` | Mark group (Ctrl+H then hides all marked) |
+| `Space` / `Insert` | Mark (groups: Ctrl+H then hides all marked) |
 | `Ctrl+O` | Play from another playlist (Also on)… |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
@@ -2307,9 +2330,12 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Ctrl+S` | Sort & view options… |
 | `Ctrl+G` | Show in TV guide |
 | `Ctrl+I` | Details / edit information |
-| `Ctrl+E` | Assign EPG channel |
+| `Ctrl+E` | Assign guide channel |
 | `Ctrl+W` | Mark watched / unwatched |
 | `Delete` | Remove (from list / cancel task / forget) |
+| `Ctrl+N` | Add to Up next |
+| `Ctrl+Shift+N` | Play next (Up next) |
+| `Ctrl+M` | Watch alongside |
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
 | `a–z, 0–9 …` | Type to filter |
 
@@ -2326,7 +2352,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Ctrl+Backspace` | Delete word |
 | `Ctrl+U` / `Esc` | Clear filter |
 | `Tab` / `Shift+Tab` | Next / previous pane |
-| `Insert` | Mark group (Ctrl+H then hides all marked) |
+| `Insert` | Mark (groups: Ctrl+H then hides all marked) |
 | `Ctrl+Shift+H` | Hide the groups with the words typed |
 | `Ctrl+O` | Play from another playlist (Also on)… |
 | `Ctrl+F` | Add to / remove from Favourites |
@@ -2339,9 +2365,12 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Ctrl+S` | Sort & view options… |
 | `Ctrl+G` | Show in TV guide |
 | `Ctrl+I` | Details / edit information |
-| `Ctrl+E` | Assign EPG channel |
+| `Ctrl+E` | Assign guide channel |
 | `Ctrl+W` | Mark watched / unwatched |
 | `Delete` | Remove (from list / cancel task / forget) |
+| `Ctrl+N` | Add to Up next |
+| `Ctrl+Shift+N` | Play next (Up next) |
+| `Ctrl+M` | Watch alongside |
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
 | `a–z, 0–9 …` | Type to filter |
 
@@ -2388,9 +2417,12 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Ctrl+S` | Sort & view options… |
 | `Ctrl+G` | Show in TV guide |
 | `Ctrl+I` | Details / edit information |
-| `Ctrl+E` | Assign EPG channel |
+| `Ctrl+E` | Assign guide channel |
 | `Ctrl+W` | Mark watched / unwatched |
 | `Delete` | Remove (from list / cancel task / forget) |
+| `Ctrl+N` | Add to Up next |
+| `Ctrl+Shift+N` | Play next (Up next) |
+| `Ctrl+M` | Watch alongside |
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
 | `a–z, 0–9 …` | Type to filter |
 
@@ -2417,9 +2449,12 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Ctrl+S` | Sort & view options… |
 | `Ctrl+G` | Show in TV guide |
 | `Ctrl+I` | Details / edit information |
-| `Ctrl+E` | Assign EPG channel |
+| `Ctrl+E` | Assign guide channel |
 | `Ctrl+W` | Mark watched / unwatched |
 | `Delete` | Remove (from list / cancel task / forget) |
+| `Ctrl+N` | Add to Up next |
+| `Ctrl+Shift+N` | Play next (Up next) |
+| `Ctrl+M` | Watch alongside |
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
 | `a–z, 0–9 …` | Type to filter |
 
@@ -2447,9 +2482,12 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Ctrl+S` | Sort & view options… |
 | `Ctrl+G` | Show in TV guide |
 | `Ctrl+I` | Details / edit information |
-| `Ctrl+E` | Assign EPG channel |
+| `Ctrl+E` | Assign guide channel |
 | `Ctrl+W` | Mark watched / unwatched |
 | `Delete` | Remove (from list / cancel task / forget) |
+| `Ctrl+N` | Add to Up next |
+| `Ctrl+Shift+N` | Play next (Up next) |
+| `Ctrl+M` | Watch alongside |
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
 
 #### TV guide (`Guide`)
@@ -2467,11 +2505,16 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `w` / `Shift+Enter` | Watch channel |
 | `c` | Catch up (past programme) |
 | `r` | Remind me / cancel reminder |
+| `R` | Follow… (remind me every time it's on) |
+| `Ctrl+W` | Mark seen (lifts the spoiler guard) |
+| `Ctrl+N` | Add to Up next |
+| `Ctrl+Shift+N` | Play next (Up next) |
+| `Ctrl+M` | Watch alongside |
 | `f` | Collection: favourites lists, groups, all |
 | `0` / `1` / `2` / `3` / `4` / `5` / `6` / `7` / `8` / `9` | Jump to channel number |
 | `Ctrl+F` | Add channel to Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
-| `Ctrl+E` | Assign EPG channel |
+| `Ctrl+E` | Assign guide channel |
 | `Ctrl+I` | Edit channel information |
 | `F2` | Rename channel |
 | `Ctrl+H` | Hide channel |
@@ -2510,6 +2553,9 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `o` | Pop out: small window on every workspace (Hyprland) |
 | `q` | Stop and close |
 | `r` | Retry (after an error) |
+| `u` | Up next |
+| `n` / `N` | Next / previous in Up next |
+| `Ctrl+M` | Watch alongside… (choose the channel) |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Esc` | Back (hide banner, then leave; keeps playing in the mini player) |
 | `/` | Search everything |
@@ -2543,6 +2589,9 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `o` | Pop out: small window on every workspace (Hyprland) |
 | `q` | Stop and close |
 | `r` | Retry (after an error) |
+| `u` | Up next |
+| `n` / `N` | Next / previous in Up next |
+| `Ctrl+M` | Watch alongside… (choose the channel) |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Esc` | Back (hide banner, then leave; keeps playing in the mini player) |
 | `/` | Search everything |
@@ -2558,12 +2607,25 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Tab` / `Shift+Tab` | Next / previous control |
 | `Esc` | Leave the controls |
 
+#### Player — multi-view (`MultiView`)
+
+| Keys | Action |
+|---|---|
+| `w` | Next picture |
+| `Ctrl+←` / `Ctrl+→` / `Ctrl+↑` / `Ctrl+↓` | Picture in that direction |
+| `M` | Sound from this picture |
+| `W` | Swap the pictures' places |
+| `t` | Layout: side by side, big + small, picture in picture |
+| `q` | Close this picture (the other carries on) |
+| `Ctrl+M` | Watch alongside… (choose the channel) |
+
 #### Pop-out player (`PopOut`)
 
 | Keys | Action |
 |---|---|
 | `Esc` / `o` | Back to the full window (also double-click) |
 | `f` | Back to the full window, fullscreen |
+| `Delete` | Cancel the coming switch / end the news flash (back to what you were watching) |
 
 #### Channel number entry (`NumericEntry`)
 
@@ -2574,12 +2636,16 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Backspace` | Delete digit |
 | `Esc` | Cancel |
 
-#### EPG mapping (`EpgMapping`)
+#### Guide fixes (`EpgMapping`)
 
 | Keys | Action |
 |---|---|
-| `Enter` | Assign the highlighted EPG channel |
-| `Delete` | Clear the manual assignment |
+| `Enter` | Issues: show its guide channels · Guide channels: assign |
+| `Delete` | Reset to automatic (guide channel and time shift) |
+| `Shift+Enter` | Accept the proposed fix (every marked channel) |
+| `Ctrl+A` | Mark all shown / none |
+| `Ctrl+Z` | Undo the last guide fix |
+| `Ctrl+Shift+→` / `Ctrl+Shift+←` | Time shift +1 h / −1 h |
 
 #### Search (`Search`)
 
@@ -2601,8 +2667,11 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Ctrl+L` | Lock with PIN / unlock |
 | `Ctrl+G` | Show in TV guide |
 | `Ctrl+I` | Details / edit information |
-| `Ctrl+E` | Assign EPG channel |
+| `Ctrl+E` | Assign guide channel |
 | `Ctrl+W` | Mark watched / unwatched |
+| `Ctrl+N` | Add to Up next |
+| `Ctrl+Shift+N` | Play next (Up next) |
+| `Ctrl+M` | Watch alongside |
 | `Shift+F10` / `Ctrl+Enter` | List these shortcuts |
 
 #### Dialogs & menus (`Modal`)
@@ -2630,7 +2699,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `←` / `h` | Back to the page list |
 | `→` / `l` / `Shift+→` / `L` | Increase / next option |
 | `Shift+←` / `H` | Decrease / previous option |
-| `Alt+↑` / `K` / `Alt+↓` / `J` | Move up / down (reorder: EPG priority, playlists, lists) |
+| `Alt+↑` / `K` / `Alt+↓` / `J` | Move up / down (reorder: guide priority, playlists, lists) |
 | `Tab` / `Shift+Tab` | Next / previous section |
 | `Enter` / `Space` | Toggle / open |
 | `x` / `Delete` | Delete / more actions |
@@ -4355,19 +4424,19 @@ adds "Alt+P playlist" (before "help") only on those screens with two or more eli
   compared as the theme draws them — Accent is often the theme's blue
   (`scope::first_free_color`).
 * Settings ▸ Playlists lists playlists that **look the same** (same glyph and same drawn
-  colour, `scope::look_alikes`): "TV and TV 2 look the same on cards and in lists", with a
+  colour, `scope::look_alikes`): "TV and TV 2 share a colour" (their codes always differ), with a
   **Give each its own colour** action that keeps the first of each group and gives the others
   the first free colours (`scope::distinct_colors`; toast). Nothing changes until it is
   pressed.
-* Marks always carry the name (accessible label, meta line, group and channel rows, the
-  player's channel panel, tooltips); only the poster corner chip and Compact channel rows are
-  glyph-only (name as tooltip).
+* Marks are code chips, unique per playlist (§13.0 "Playlist codes"); the name is always in the
+  accessible label, the tooltip and the status bar line of the focused item.
 
 ### 29.8 Changes to the "playlist on cards" work it folds in
-Kept: `PlaylistOnCards`, `SourceMarks` (now `for_view(mode, sources, kind, all)`), the coloured
-name on the meta line, `TileDecor.source`, `paint_source_chip`, the detail badge (now on
-Xtream pages too). Done in P2 (§29.14), differently: the stack card names its playlists on the
-meta line (`TileDecor.stack`, no `SourceSet`), the stack edges and copy count, `+1` inside one
+Kept: `PlaylistOnCards`, `SourceMarks` (now `for_view(mode, sources, kind, all)`),
+`TileDecor.source`, the detail badge (now on
+Xtream pages too). The coloured name on the meta line and the glyph corner chip became code
+chips (§13.0 "Playlist codes"). Done in P2 (§29.14), differently: the stack card chips its
+playlists (`TileDecor.stack`, no `SourceSet`), the stack edges and copy count, `+1` inside one
 playlist, and the detail pages' Copies section instead of `DetailHeader` copies.
 
 ### 29.9 Tests
@@ -4546,16 +4615,16 @@ copy" turns every copy back into its own card everywhere, no rebuild):
 | Movies / Series, scope All | All, every category, Continue watching, Favourites | `ui::stacks::collapse`: the stack's place is where its first copy comes in the list (the sort holds); the card is the stack's **top** when the list has it, else the list's own copy (unlocked first) — a playlist's category shows its own copy, Favourites the favourite one |
 | Movies / Series, one playlist | never | a title also in other playlists gets one card edge and `+1` on the meta line (tooltip "Also in TV"); playlists out of All have no stacks, so no `+1` |
 | Home | Recently added, Recently updated series (renamed: it sorts on the provider's date), favourites rails, Continue watching | top copy; the copy played last; the first favourite copy |
-| Search | Movies and Series hits | the best-matching copy, a chip per playlist of the stack (`[● TV] [● TV 2]`; none with one playlist); Enter opens the stack's top card's page |
+| Search | Movies and Series hits | the best-matching copy, a code chip per playlist of the stack (`[TV] [TV2]`; none with one playlist); Enter opens the stack's top card's page |
 
 **Stack card** (`widgets::poster`, `TileDecor.stack`): two card edges offset down-right behind the
 poster (the card keeps its footprint), a copy-count badge bottom-right above the progress bar,
-and the meta line `TV + TV 2 · 2021` (each name in its colour; `TV +1` when it doesn't fit,
-`TV +2` with three playlists). "Playlist on cards: Never" drops the names, not the edges or the
-count. ★ / ✓ / progress / lock follow `stacks::stack_marks`: progress of the copy played last,
+and its playlists' code chips top-left (`[TV] [TV2] [NW] +1`: up to three, fewer on a narrow
+card, the meta line stays `2021 · ★ 7.1`). "Playlist on cards: Never" drops the chips, not the
+edges or the count. ★ / ✓ / progress / lock follow `stacks::stack_marks`: progress of the copy played last,
 the lock (and the disabled look: dimmed poster and card edges, muted title) only when every
 copy is locked and the session is locked. Fanned out, the head card names its own copy (`TV ·
-EN · 4K`) instead of the playlists; the accent badge still marks the stack. Accessible label:
+EN · 4K` on the meta line, its own chip only); the accent badge still marks the stack. Accessible label:
 `Dune · TV + TV 2 · 3 copies[ · locked]`. With a stack card focused the hint line adds "Space
 copies · Ctrl+O play from" (`Screen::hint_extras`, keys from the context's tables).
 
@@ -5153,3 +5222,420 @@ the real binary against a headless `Services` on a seeded temp profile (search �
 * **Spec drift**: the MCP subset is small and version-negotiated; unknown versions get our
   newest and the client decides.
 * **Launch surprises**: only tools that lead to watching launch Tuner; `status` never does.
+
+---
+
+## Batch v0.2: five features, reminders, Claude skills (§31–§38)
+
+The v0.2 batch adds five features designed together (big-features plan, 2026-10-11), the
+second reminder pass with the sleep timer, the Claude Code plugin, playlist codes and a faster
+library load. Each feature has a kill switch (`ENABLED` in its module: `guide_fix`, `queue`,
+`follow`, `spoiler`/`guard`, `ui::multiview`, `reminders`); all are on. The approved designs are
+kept in `docs/design/*-design.md` (user stories, mockups, numbered rules), and each build
+track's notes in `docs/design/<track>.md`. The sections below are the contract as built.
+
+**User decisions (2026-10-11).**
+1. Order: Guide fixes → Up next → Following (with the news flash) → Spoiler guard → Multi-view.
+2. Automatic things (Following rules, the news flash) never interrupt a film or episode being
+   watched: they become a notification with **Watch**. The user's own one-off auto-switch
+   reminders still interrupt, with the 10 s Cancel. With multi-view on, automatic switches go to
+   the silent picture.
+3. The spoiler guard is on, but narrow: part-way series and followed sport, with a quick reveal.
+4. Multi-view: the sound stays where it is until `M`; moving a picture to its other playlist
+   always asks. Both of the user's accounts allow one connection each, so the two pictures come
+   from different playlists.
+5. Claude never unlocks, reveals explicit content or loosens a setting.
+6. Every design's open questions took the recommended default.
+
+**Shared blocks** (plan §1): B1 one play router (`playback::route`: who may take which picture,
+and what an automatic play becomes); B2 `AppShared` (the published library, pictures, Up next,
+the guard, the parental view) for code off the UI thread; B3/B4 the spoiler guard as one API
+(`guard::Guard`) that every outside text goes through; B5 copies (`store::copies`: a channel's
+or title's copies across playlists, ranked); B6 reminder hooks (rule-owned rows, switch modes,
+systemd arming); B7 `jobs::after_guide` (after a guide import or rematch: Following, then the
+guide check); B8 the effective time shift (`COALESCE(item_override.shift_min,
+channel_epg.shift_min, channel.tvg_shift_min)`, one select for the library, the OSD and
+catch-up).
+
+**Migrations** 0008 (reminder modes), 0009 (guide fixes), 0010 (Up next), 0011 (Following),
+0012 (spoiler guard). All are additive; older builds ignore the new columns and tables.
+
+## 31. Guide fixes
+
+Design: `docs/design/guide-fixes-design.md`. Build notes: `docs/design/gcore.md` (engine) and
+`docs/design/gui.md` (screen).
+
+### 31.1 What it is
+The EPG mapping screen becomes **Guide fixes** (Ctrl+E, "Assign guide channel…", Settings ▸ EPG
+"Fix guide data… (N to fix)"). It lists what is wrong with the guide data, one row per channel,
+proposes a fix, and applies fixes in logged batches that can be undone.
+
+Issue kinds, in the order a channel is classified (each channel gets at most one; a dismissed
+kind is skipped): Gone from guide, +1 without shift, Looks wrong, Guide ended, Copy has guide,
+Suggested, No guide. Each row's "why" is a fixed phrase; no URL ever appears.
+
+### 31.2 Rules derived after every rematch
+* **+1/+2 follow their base.** `textmatch::timeshift::marker` parses a strict `+N` / "plus N"
+  (1–24 h) at the end of the name, after quality words; "Canal+ 1" and "Disney+ 1" are not
+  markers, "E4+1" and "Quest Red + 1" are. A "+N" channel without its own guide takes its base's
+  guide channel with `shift_min = N·60`.
+* **Copies share a guide.** A channel with no guide takes the guide channel of its first
+  resolving copy (B5 family key, another playlist, usable, no tvg-id veto).
+* Rules never touch manual rows. Resolution order: manual, sibling, guide priority, method.
+* Both rules are per playlist (`SourceSettings::guide`), toggled on the Rules card (always with a
+  confirm naming how many channels change).
+
+### 31.3 Batches, Undo, the shift
+* `store::guide_fix::apply` writes one batch (`guide_fix_log` + one change row per field: `map`,
+  `shift`, `catchup`, `dismiss`, `rule`). Undo restores each field only while it still holds the
+  batch's value; a field changed since is skipped and named. A restored manual mapping keeps who
+  chose it (older logs fall back to "you").
+* A time shift moves the channel's reminders, Up next slots and Following rows in the same
+  transaction (`store::retime::channel_shift`).
+* The catch-up offset: the channel's own (`Option`, so a stored 0 wins), else the playlist's,
+  else 0. A user time shift never changes the provider's `tvg_shift_min` sent to catch-up.
+* Shift and offset presses are debounced (400 ms, or on leaving the row/screen); the screen
+  bases a quick second press on what its last flush wrote.
+
+### 31.4 The guide check (`jobs::guide_check`)
+* Fuzzy suggestions for unmapped shown channels are cached per **stamp** (guides' and playlists'
+  generations, the rules, the threshold). Channels without a candidate get a marker row, so each
+  channel is scored once per stamp. The cache floor is the lower of 0.8 and the user's threshold.
+* **Debounced before it is submitted** (30 s; a request in the window pushes the deadline back),
+  so it never holds the "features" lane or shows as a job while it waits. Requested after a
+  guide import or rematch, a playlist import, an applied or undone batch that changed rules or
+  mappings (the screen's and Claude's), and a threshold change. The GUI checks the stamp once
+  after its first library publish. A headless `tuner --refresh` never checks (`JobContext::
+  headless`).
+* "Include hidden" channels aren't scored by the check (tens of thousands); the screen scores
+  the rows it draws.
+
+### 31.5 Guardrails
+* The universe is the library snapshot: explicit, hidden and filtered channels follow its
+  visibility (counts and coverage too).
+* Claude's batches: at most 200 channels; more than 50 is refused from chat
+  (`pending_review`: the user reviews them in Guide fixes, or Claude proposes a narrower batch);
+  proposals live 10 minutes and are bound to the stamp; locked channels and rules for a
+  playlist with a PIN-locked channel are refused while locked; Claude undoes only its own
+  batches.
+* Backup carries time shifts, dismissals and manual mappings with their guide name and who chose
+  them (restore keeps a shift already set on this machine).
+
+## 32. Up next
+
+Design: `docs/design/up-next-design.md`. Build notes: `docs/design/qcore.md`,
+`docs/design/qui.md`.
+
+### 32.1 What it is
+A play queue of films, episodes and live programme slots (`queue_item`, migration 0010).
+Ctrl+N adds, Ctrl+Shift+N plays next; Alt+6 opens the Up next screen; `u` in the player opens
+the panel, `n` / `N` step. Home shows an "Up next" rail while items wait and nothing plays.
+
+### 32.2 The engine (`queue::service`, `queue::machine`)
+* Plays the first row that is pending, visible (not concealed), available and not deferred.
+  Played, skipped and failed rows stay in place, so "Next" is exactly the play order.
+* Drives the main picture only while `origin == Queue` and the playable is one of the row's refs
+  (any copy of the title, any ranked channel of a slot). Any other pick or zap steps aside
+  ("Up next paused · Alt+6 to carry on"); the row stays current. An interrupted row is never
+  marked skipped by `n`.
+* Countdown between items (`[queue] countdown_s`: at once, 5–30 s, or Ask); a live slot gets a
+  30 s card at its end; a future slot waits; after a suspend a slot plays from its archive or
+  is skipped as "Expired".
+* Every play goes through B1 (`PlaySource::Queue`); in multi-view Up next waits.
+* With Up next empty, an episode ending outside it offers the next episode with a countdown
+  (the engine, in any placement, a hidden window included). Before it plays it re-reads the
+  lock and concealment: a series locked again says "Next episode is locked" and plays nothing.
+  When the queue runs out after an episode, the next one is offered with no countdown.
+* A queued film ending in the fullscreen player keeps the player (the next item follows on the
+  card); only films started elsewhere return to their page.
+
+### 32.3 Guardrails
+* Locked rows wait for the PIN (`Blocked::NeedsPin`; the engine never unlocks; a hidden window
+  gets "Up next is waiting for your PIN" through `Guard::outside_title`). Concealed rows are
+  left out of rows, counts, ETA and cards, never played and never deleted: Clear removes the
+  visible rows only (also over MCP).
+* Next-episode labels go through the spoiler guard (`Subject::Episode`); the S/E number always
+  shows.
+* Three failures in a row pause Up next with a toast. Nothing plays after a restart.
+* Media keys (MPRIS Next/Previous) go to Up next only while it drives the picture.
+* Only rows still to play are listed under Settings ▸ Orphans.
+
+### 32.4 Kill switch
+With `queue::ENABLED` off, the player's own next-episode card is the fallback
+(`tests/guide.rs::episode_end_offers_the_next_episode` guards it).
+
+## 33. Following and the news flash
+
+Design: `docs/design/following-design.md` (and the news-flash addition). Build notes:
+`docs/design/fcore.md`, `docs/design/fui.md`.
+
+### 33.1 What it is
+Rules (`follow_rule`, migration 0011) that watch the guide for a team, a show, an event, a
+news bulletin or custom terms, and set reminders, switches or news flashes for what they find.
+Templates: Team, Show, Event, News flash, Custom. Set up from a programme (`R`, the popover's
+"Follow…" / "News flash this daily…", the item menus' "Follow this programme…"), Settings ▸
+Following ("+ Follow…", the rules in priority order, Upcoming for 14 days), or Claude.
+
+### 33.2 Evaluation (`jobs::follow`, `follow::plan`, `store::follow`)
+* Triggers: a guide import or rematch (B7), a mapping change, a rule change, a new library
+  (hidden, locked or explicit channels change what may be picked; not the first library at
+  start) and a daily tick. All coalesce into one job on the "features" lane; a queued
+  evaluation that must look again keeps its reason when a guide/daily request joins it. Inputs
+  are fingerprinted (guides, rules, mappings) so an unchanged guide/daily run exits early.
+* One Aho-Corasick over every rule's folded terms, with an ASCII prefilter (0.8 s for 760k
+  programmes × 100 rules).
+* **Events.** Hits of one rule starting within 10 min are one event only when they are the same
+  programme: a window is split by event key; fixtures that share one side with the other
+  spelled differently ("Man Utd v Arsenal" / "Manchester United v Arsenal") stay one event,
+  show episodes group by their core title.
+* **Channel.** Pool channels (visible, supported, mapped, never explicit in any parental state)
+  ranked by B5; a "+1" copy is never the live match; three alternates.
+* **Ledger** (`follow_match`): states scheduled, listed, adopted, skipped, gone, over-cap.
+  Weekly caps and `max_pending` apply. A reminder at the same channel and start is adopted, not
+  duplicated; when the owning rule drops it, it is handed to another rule that adopted it.
+* **Editing a rule** (mode, lead, offset, spoiler-safe, flash settings, or the name of a
+  spoiler-safe rule) removes its pending reminders, and the evaluation makes them again with the
+  new settings. A rule's offset that lands past a short airing's end isn't used there. Editing
+  one reminder's lead, mode or offset detaches it from its rule.
+* **Following off** holds every rule reminder (the scheduler and the closed path skip them).
+
+### 33.3 Switches and interrupts
+A rule's switch goes through B1 (`PlaySource::Reminder { rule }`): over a film, episode or
+catch-up it becomes a notification with Watch (`follow.interrupt_vod` can allow it; never for a
+news flash). A locked target while locked becomes "… · needs your PIN". Clashes: your own or
+Claude's switches win, then rule priority, then the earlier start; the loser notifies.
+
+### 33.4 News flash
+* A News rule in Flash mode: daily or weekdays, matched from the guide each day (it follows
+  schedule changes). It pops up in the pop-out without taking focus (Cancel / Open full), whole
+  programme or **headlines only** (first N min, default 5).
+* Never in quiet hours (`[follow.news_flash] quiet_from_min..quiet_to_min`, typed "22:00–07:00"),
+  never while another app is fullscreen (`hyprctl -j activewindow`, with a timeout; only asked
+  when that setting is on), never over a film or episode, and nothing when the bulletin (or a
+  copy) already plays on either picture. The check runs at the countdown and again at the switch
+  (`reminders::flash_skip`), in a running Tuner and on the closed path.
+* Sound: Normal, or Mute ("silent flash": single view mutes the main picture; multi-view plays it
+  in the silent picture without taking the sound). Duck is stored but not offered until it does
+  something different.
+* At its end the previous playback comes back (the bulletin or one of its copies must still be
+  playing; if the user moved on, nothing changes), the window pops back in and the Player screen
+  is left if the user wasn't on it. In multi-view the flash's picture gets back what it showed,
+  or closes if it showed nothing, and the sound returns where it was. A late flash on catch-up
+  ends that much later; one whose headlines are already over doesn't start.
+
+### 33.5 Feedback and Claude
+* "Following: Chelsea · 1 in the guide" with **Undo** for a new rule; Claude's rules toast
+  "Claude added X · N reminders" with Undo (`Action::UndoFollow`).
+* A summary notification at most every 12 h, only with additions.
+* Claude's rules are marked, capped (10 an hour, 20 in all); Claude can't turn a rule's
+  spoiler-safe off; a concealed channel's match is named by the rule only.
+* Upcoming rows in Settings go through the spoiler guard and skip concealed channels.
+
+### 33.6 Gaps
+No row menu or drag reorder on the Settings rows (the editor has ↑/↓, Duplicate, Delete…); the
+summary notification has no Open action; Settings' hint line still advertises reorder.
+
+## 34. Spoiler guard
+
+Design: `docs/design/spoiler-guard-design.md`. Build notes: `docs/design/score.md` (engine),
+`docs/design/sui.md` (UI).
+
+### 34.1 What it guards
+On by default but narrow; nothing is guarded before an event starts. Display only: it never
+builds events from explicit content, never lists or counts it, never reveals it.
+* **Series you're part-way through** (automatic): episodes after the next-up one lose title,
+  plot and still; guide airings with S/E after next-up likewise; an airing without S/E loses its
+  sub-title and description.
+* **Sport you follow**: Following's spoiler-safe Team/Event rules become topics. An airing
+  counts as the event only when it parses as a fixture (`parse_fixture`) and has none of the
+  rule's "leave out" words ("Women", "U21", "Fan TV"…); highlights and reaction shows are never
+  the event. Following topics don't hide every sport description.
+* **Topics you add** (rule editor: teams from "A v B", aliases, scope, until watched / N h /
+  always / a blackout from "I'll watch it later").
+* A topic is active from the event's first airing until it is seen or `window_h` after it ends.
+  Fixture keys group repeats on later days (one embargo, lifted by watching any airing within
+  7 days).
+* Scores in titles are rewritten ("Arsenal v Chelsea 󰈉"), including a trailing "2-1" or
+  "(2-1)" after a fixture; a sub-title becomes a fixed-width bar; descriptions say why and how to
+  show them.
+
+### 34.2 Where it applies
+Guide grid cells and tooltips, Live rows, details and upcoming list, search hits (painted text
+and accessibility labels), Home's on-now line, the programme popover, series and movie pages,
+Up next's labels, multi-view strips, notifications (`Guard::outside_title`, also when Tuner is
+closed: built from the store, failing closed), MPRIS titles, Following's Upcoming and every
+MCP reply (`guard::reply::guard_json`). Painters cache per programme, minute and
+`Spoilers::stamp()`, so Ctrl+B and rule changes show at once.
+
+### 34.3 Seen, reveal, shield
+* **Seen**: live at ≥ 50 % watched or present in the last 10 minutes; catch-up/VOD at ≥ 90 %;
+  either picture counts; Ctrl+W marks a guide programme seen (toast "Spoiler guard…" opens the
+  menu with Undo).
+* **Reveal**: Ctrl+B on an item (any move hides it again); Ctrl+Shift+B opens the menu; "show
+  everything for 15 min / 1 h / until restart" with a status chip and ✕.
+* **Zap shield**: before tuning. A zap (↑/↓, digits, the channel panel) onto a channel whose
+  programme mentions an active topic sends no play: the card covers the picture and the picture
+  underneath pauses. Enter = Watch anyway (for as long as the same reason shields it), ↓ judges
+  the next channel, Backspace/← resumes. A channel chosen in Live or the guide is never shielded.
+* The snapshot rebuilds on guard, library, guide, follow and progress changes, but not every
+  progress save while a film, episode or catch-up plays.
+
+### 34.4 Claude
+`spoiler_guard` adds topics and blackouts (a programme blackout guards its two teams) and
+marks seen; `remove` only removes Claude's own rules ("that rule is yours — remove it in Tuner ▸
+Settings ▸ Spoiler guard"). Replies drop guarded fields unless the call names the item in
+`reveal_spoilers`.
+
+### 34.5 Gaps
+Slim guide programmes carry no S/E yet, so every grid airing of a guarded series loses its
+sub-title; Ctrl+B in the player and a "Ctrl+B show spoilers" hint are missing; in multi-view the
+shield card covers the whole player.
+
+## 35. Multi-view
+
+Design: `docs/design/multiview-design.md`. Build notes: `docs/design/mv1.md` (the second player),
+`docs/design/mv2.md` (the UI), `docs/design/multiview-spike.md` (two UHD HEVC decodes on the M2).
+
+### 35.1 What it is
+Two live or catch-up pictures (A and B): side by side, big + small, or picture in picture
+(`auto` picks by width; the pop-out and the mini player are always picture in picture). Ctrl+M
+on a channel or programme ("Watch alongside") opens B; in the player it opens a channel picker
+for the other picture. `w` / Ctrl+arrows / a click move the focus (keys go there), `M` moves the
+sound, `t` cycles the layout, `W` swaps, `q` closes the focused picture (the other carries on
+with the sound). Esc never closes a picture.
+
+### 35.2 Rules
+* **Connections.** One stream per playlist on both accounts, so the planner
+  (`ui::multiview::plan`) never exceeds a known or learned limit: the pick, else a healthy copy
+  on a free playlist, else (asked, never silent) "Move picture A to its TV 2 copy?" — only then
+  `Tiles::rearrange`, which claims both pictures' new playlists before either loads. Locked
+  copies are never picked while locked (`ZapTo` carries the session state), nor copies whose
+  explicit flag differs.
+* **Zapping a picture past the other's playlist** plays the next channel's copy elsewhere, or
+  skips it with "BBC One skipped — TV is in use by picture A".
+* **Films, episodes and files play in picture A only**; picking one ends multi-view.
+* **Plays from outside** (a reminder's switch or Watch, `--play`, MCP `play`, a news flash, a
+  late catch-up switch) go to the silent picture and take the sound; a silent news flash doesn't
+  take it.
+* **Sound and volume** act on the picture with the sound (volume, mute, sleep-timer and flash
+  mutes included). If the picture given the sound fails while the other plays, the sound goes
+  back.
+* **Parental.** The PIN gate runs before a picture is chosen, for Ctrl+M and for Claude's two
+  pictures alike; the stored plays go out once the PIN is typed and are forgotten on relock.
+  Relocking stops only the pictures showing a locked channel or explicit content.
+* Picture B starts lazily on the first request (its own mpv, muted, small caches) and lives
+  until exit.
+
+### 35.3 Claude
+`multiview open` with two refs from single view plans both pictures at once (one plan, so the
+second never plans against what the first replaces); one ref goes alongside the focused
+picture, judged against that picture's stream; `needs_rearrange` when only moving the playing
+picture works; a film playing answers "multi-view is for live TV and catch-up". `control` with
+no `tile` pauses/stops both, sets volume and mute on the picture with the sound, and acts on the
+focused one for previous channel and pop-out.
+
+### 35.4 Gaps
+Two refs while multi-view is already on still go one picture at a time; a PIN prompt cancelled
+with Esc keeps its stored plays until a relock (harmless: only `play_channel`'s or the agent's
+prompts send them).
+
+## 36. Reminders (pass 2) and the sleep timer
+
+Build notes: `docs/design/remind.md` (engine), `docs/design/rui.md` (UI). Extends §30.8.
+
+### 36.1 Reminders
+* A reminder's **target** is `start + offset_s` (−1 h to +12 h; "10 min in" skips the
+  build-up; an offset at or past the programme's end is refused for the user's own rows).
+  Notifications go out `lead` before it; a switch counts down 10 s before it and switches at it.
+  Migration 0008 stores the mode (`mode = 'switch'` with `lead_s = SWITCH_LEAD`).
+* **The reminder sheet** ("Switch to this when it starts…" / "Edit reminder…" in a programme's
+  menus): Notify me / Switch to it, lead, start offset, **Open in** (Pop-out — the default,
+  pinned, every workspace, no focus taken — Full window, or Where I am), and up to 3 clashes.
+* **Late**: a notification still goes out while its programme airs; a switch up to 15 min late
+  still happens and always gets its 10 s countdown (one warned is not dismissed by the late
+  limit); 60 s or more late it plays from the beginning on catch-up when the channel has it and
+  needs no PIN.
+* **The strip** (top centre, never takes focus): "Switching to ‹channel› in 8 s · ‹title›" with
+  Cancel and Open full; Delete in the pop-out, and Esc in the player or pop-out, cancel the first
+  countdown. A decision made at the countdown is made again at the switch.
+* **Multi-view**: every automatic switch goes to the silent picture; a switch to a channel that
+  already plays on either picture does nothing.
+* Settings edits take effect live (the scheduler is refreshed, never restarted, so a countdown
+  already shown isn't shown twice).
+
+### 36.2 While Tuner is closed
+Transient `systemd-run --user` timers (`tuner-reminder-<id>`, described only "Tuner reminder",
+at most 30 within 48 h, a switch's 30 s before its countdown) run `tuner --reminder <id>` (the
+running Tuner's own executable). Units take the user manager's environment (session variables
+are set only when the manager lacks them), so a re-login doesn't leave stale values. A headless
+`tuner --refresh` re-arms the units after Following's evaluation. With Tuner closed:
+* a notification is shown from the short-lived process (Watch runs `tuner --play`), its title
+  through the spoiler guard built from the store (failing closed);
+* a switch starts Tuner (popped out unless the reminder says otherwise); a news flash in quiet
+  hours or over a fullscreen app does nothing;
+* the session counts as locked: explicit channels wait, a Following switch to a locked channel
+  becomes "needs your PIN".
+
+### 36.3 Sleep timer
+Ctrl+Shift+T, the player menu, the status-bar chip ("Sleep timer — 23:10 (Ctrl+Shift+T)" with
+✕) and Settings ▸ Reminders: stop or pause, in 15 min–2 h, at the end of this programme, after N
+items, or at the end of Up next. An item counts once when it ends (an ended item that stays on
+screen is not counted again) or when the next starts within 90 s of its end; live is never an
+item. Between two Up next items (the card, a PIN wait, a future slot) Up next hasn't run out.
+It warns `reminders.sleep_warn_s` before, then stops or pauses every picture; a news flash on
+ends with it and the window pops back in. It runs on tokio, so it fires with the window hidden.
+
+### 36.4 Gap
+The scheduled auto-launch (Tuner closed, a switch due) starts Tuner as a normal window that may
+take focus: Omarchy 4's Lua Hyprland config has no exec-with-rules dispatcher we could verify
+headless. To do on the real desktop: re-exec through Hyprland with initial focus suppressed (a
+dedicated app id plus a `no_initial_focus` window rule, the webcam-overlay pattern).
+
+## 37. Use Tuner from Claude: the plugin, skills and pass-2 tools
+
+Build notes: `docs/design/agent.md`. Extends §30.
+
+### 37.1 Tools
+28 tools: the 13 of §30.5 (extended: `guide_search` without a query over a window and
+categories, `whats_on` filters, `details.copies`, `search.explain_filtered`, `status.queue /
+multiview / streams / sleep_timer`, `control.previous_channel / popout / tile`), plus
+`match_titles`, `history`, `episodes`, `favourites_edit`, `parental_status`, `lock`,
+`diagnose`, `sources`, `reminders`, `sleep_timer`, `queue`, `follow`, `spoiler_guard`,
+`guide_fix`, `multiview`. A tool whose feature's kill switch is off answers `unavailable`.
+Every read reply passes the spoiler guard (`spoiler_safe` strips harder; `reveal_spoilers`
+names what may show).
+
+### 37.2 Guardrails added
+Locks only add (`lock session_now` locks the session in the app); locked items are never added
+to favourites or Up next; explicit items while hidden are `not_found` everywhere, counts
+included; `reminders add` finds the programme's row in any state (a switch asked for after the
+notification fired still switches) and refuses hidden channels; sleep-timer times in the past
+are refused; Following, spoiler and guide-fix limits as in §31.5, §33.5 and §34.4. No tool
+returns a log line or a URL.
+
+### 37.3 The plugin
+* `.claude-plugin/marketplace.json` (repo root) → `plugins/omatuner`: `plugin.json`, `.mcp.json`
+  (`tuner mcp`), `RULES.md` (the shared rules every skill reads first, via
+  `${CLAUDE_SKILL_DIR}/../../RULES.md`) and seven skills: **watch**, **pick**, **series**,
+  **plan** (reminders, switches, news flashes, sleep timer), **kids**, **fix** (guide fixes,
+  playback trouble) and **discover** (`match_titles` against what's trending).
+* Install: `claude plugin marketplace add rthoms334/omatuner` then `claude plugin install
+  omatuner@omatuner`. Without the plugin: `claude mcp add tuner -- tuner mcp` (tools only).
+  The Arch package ships the marketplace under `/usr/share/tuner/claude/`; `tuner claude-setup`
+  prints the steps, `--apply` runs them after a "y" on the terminal.
+* `claude plugin validate ./plugins/omatuner --strict` and `claude plugin validate .` pass; a
+  test checks every `allowed-tools` name is a real tool and that the plugin's version follows
+  the app's.
+
+## 38. Playlist codes and a faster library load
+
+* **Playlist codes** (§13.0): every playlist has a 1–3 letter code (derived, or the user's in
+  the playlist editor) shown as a chip on cards and rows with two or more playlists. Derived
+  codes are assigned in creation order, so reordering playlists never swaps them; a user's code
+  always wins.
+* **Library load** (`store::library`, build notes `docs/design/perf.md`): item tables are read
+  in id order with no SQL sort or override join, display order is rebuilt in memory, group links
+  merge through a cursor, hidden titles are dropped before the rest of the row is read. On the
+  synthetic catalogue (80k channels, 300k movies, 40k series, 2.5k categories) the default rule
+  loads in about 350 ms (was 650 ms); `benches/startup.rs` gates it under 550 ms and the rule's
+  cost at 1.25× the rule with titles kept. Builds of 1 s or more log their steps at info.

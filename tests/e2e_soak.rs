@@ -106,7 +106,7 @@ fn memory_stays_flat_over_2000_zaps_and_guide_scrolls() {
     cfg.general.refresh_on_launch_after_h = 0;
     let (bus, events) = EventBus::new(None);
     let services = Services::start(paths, cfg, tuner::logging::LogBuffer::new(1000), bus).expect("services");
-    let player = services.player.handle();
+    let player = services.tiles.focused();
     let ctx = egui::Context::default();
     let cc = eframe::CreationContext::_new_kittest(ctx.clone());
     let initial = IpcRequest { view: Some(ViewArg::Guide), ..Default::default() };

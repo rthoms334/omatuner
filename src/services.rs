@@ -5,6 +5,13 @@
 //! video surface → integrations (theme watcher, IPC server, MPRIS, reminders, scheduler,
 //! connection limits). The memory maintenance thread (`platform::memory`) starts with the
 //! player and follows its snapshots.
+//!
+//! Multi-view (DESIGN §35, MV-1): `tiles` holds picture A from the start and picture B once
+//! [`Services::start_tile_b`] started it on the blocking pool and the app adopted it
+//! ([`Services::adopt_tile_b`]). Both share one connection budget (stored limits go to it at
+//! startup, `SetConnectionLimit` after a refresh reaches it through any picture), both are
+//! watched by the memory thread, MPRIS routes through the [`TileRouter`], and shutdown stops
+//! B, then A.
 //! Shutdown order: video surface destroy (GL, done by the app) → integrations → jobs.shutdown
 //! (cancel all, refuse new ones) → player shutdown (mpv; final progress save) → wait ≤ 5 s for
 //! the cancelled jobs' wind-down → runtime (shutdown_timeout 2 s) → store writer drains + joins.
@@ -26,7 +33,7 @@ use crate::config::{Config, SharedConfig};
 use crate::error::{Error, Result};
 use crate::jobs::{JobContext, JobManager};
 use crate::logging::LogBuffer;
-use crate::model::{ChannelId, HistoryEntry, ItemRef, MediaRef, Playable, WatchProgress};
+use crate::model::{ChannelId, HistoryEntry, ItemRef, MediaRef, Playable, SourceId, TileId, WatchProgress};
 use crate::msg::{AppEvent, DataScope, EventBus};
 use crate::paths::AppPaths;
 use crate::player::{MediaResolver, Player, PlayerCommand, PlayerDeps, PlayerError, PlayerErrorKind, PlayerStore};
@@ -55,7 +62,11 @@ pub struct Services {
     pub store: Store,
     pub http: HttpClient,
     pub jobs: JobManager,
-    pub player: Player,
+    /// The pictures (tile A always; tile B once multi-view starts it, DESIGN §35). Single view
+    /// is tile A: `tiles.focused()` / `tiles.handle(TileId::A)`.
+    pub tiles: crate::player::tiles::Tiles,
+    /// Up next's engine (DESIGN §32; idle until Q-core).
+    pub queue: Option<crate::queue::QueueHandle>,
     pub logs: LogBuffer,
     pub integrations: Integrations,
     /// Combined actions on a title's copies that a toast can still undo (DESIGN §29.15).
@@ -63,9 +74,10 @@ pub struct Services {
     /// Drops big snapshots off the UI thread and gives freed heap back to the OS
     /// (`platform::memory`); follows the player's snapshots.
     pub memory: crate::platform::memory::Maintenance,
-    /// What the app publishes for the agent handler (library snapshot, parental unlock;
-    /// DESIGN §30.4). The handler itself lives in the IPC server.
-    pub agent: Arc<crate::agent::shared::AgentShared>,
+    /// What the app publishes for code off the UI thread (B2: library snapshot, parental
+    /// unlock, the guard, the pictures, Up next; DESIGN §30.4). The agent handler itself lives in
+    /// the IPC server.
+    pub agent: Arc<crate::shared::AppShared>,
     /// Set when [`Services::shutdown`] begins (the signal watcher leaves the exit to it; a
     /// signal after that means it is stuck).
     closing: Arc<AtomicBool>,
@@ -102,18 +114,17 @@ impl Services {
         });
         let http = HttpClient::new(&http_options(&config))?;
         let config: SharedConfig = Arc::new(RwLock::new(Arc::new(config)));
-        let jobs = JobManager::new(JobContext::new(store.clone(), http.clone(), bus.clone(), paths.clone(), config.clone()), rt.handle().clone());
+        let agent = Arc::new(crate::shared::AppShared::default());
+        let ctx = JobContext::new(store.clone(), http.clone(), bus.clone(), paths.clone(), config.clone()).with_shared(agent.clone());
+        let jobs = JobManager::new(ctx, rt.handle().clone());
         let player = {
             let cfg = crate::config::current(&config);
-            let deps = PlayerDeps {
-                bus: bus.clone(),
-                store: Box::new(WriterPlayerStore(store.writer().clone())),
-                resolver: Box::new(DbResolver::new(store.clone(), config.clone())),
-            };
-            Player::start(&cfg, deps)?
+            Player::start(&cfg, player_deps(&store, &config, &bus, &agent))?
         };
         let mut memory = crate::platform::memory::Maintenance::start();
-        memory.watch_player(rt.handle(), player.handle().subscribe());
+        memory.watch_player(rt.handle(), TileId::A, player.handle().subscribe());
+        let tiles = crate::player::tiles::Tiles::single(player);
+        agent.set_main_player(tiles.main_watch());
         Ok(Self {
             paths,
             config,
@@ -122,12 +133,13 @@ impl Services {
             store,
             http,
             jobs,
-            player,
+            tiles,
+            queue: None,
             logs,
             integrations: Integrations::default(),
             undo: Default::default(),
             memory,
-            agent: Arc::default(),
+            agent,
             closing: Arc::default(),
             socket: Arc::default(),
         })
@@ -140,27 +152,64 @@ impl Services {
         if cfg.integration.follow_omarchy_theme {
             self.start_theme_watch(&cfg);
         }
-        let agent: Arc<dyn crate::agent::server::AgentService> = Arc::new(crate::agent::server::AgentHandler::new(
-            self.agent.clone(),
-            self.store.clone(),
-            self.config.clone(),
-            self.player.handle(),
-            self.bus.clone(),
-            self.jobs.clone(),
-        ));
+        let agent: Arc<dyn crate::agent::server::AgentService> = Arc::new(
+            crate::agent::server::AgentHandler::new(
+                self.agent.clone(),
+                self.store.clone(),
+                self.config.clone(),
+                self.tiles.handle(crate::model::TileId::A),
+                self.bus.clone(),
+                self.jobs.clone(),
+            )
+            .with_tiles(self.tiles.registry()),
+        );
         self.integrations.ipc =
             ok("IPC server", crate::ipc::IpcServer::start_with_agent(self.rt.handle(), &self.paths.ipc_socket(), self.bus.clone(), Some(agent)));
         *self.socket.lock().unwrap_or_else(|e| e.into_inner()) = self.integrations.ipc.as_ref().map(|s| s.socket());
+        // Up next before MPRIS: its Next/Previous go to the queue while it drives
+        if crate::queue::ENABLED {
+            let deps = crate::queue::service::EngineDeps {
+                store: self.store.clone(),
+                config: self.config.clone(),
+                player: Arc::new(self.tiles.handle(TileId::A)),
+                bus: self.bus.clone(),
+            };
+            self.queue = Some(crate::queue::service::spawn(self.rt.handle(), self.agent.clone(), deps));
+            self.agent.set_queue_handle(self.queue.clone());
+        }
         if cfg.integration.mpris {
             self.start_mpris();
         }
         // always: automatic switches (DESIGN §30.8) run with notification reminders off too
-        self.start_reminders(&cfg);
+        self.start_reminders();
+        let sleep = crate::reminders::sleep::SleepService::start(
+            self.rt.handle(),
+            self.tiles.main_watch(),
+            self.agent.subscribe_queue(),
+            // every picture at fire time (multi-view's B starts later, lazily)
+            {
+                let tiles = self.tiles.registry();
+                Arc::new(move |a| crate::reminders::sleep::player_actuator(tiles.all())(a))
+            },
+            self.bus.clone(),
+        );
+        self.agent.set_sleep(Some(sleep));
         self.integrations.scheduler = Some(crate::jobs::scheduler::spawn(self.jobs.clone()));
         match self.store.reader().and_then(|c| connection_limits(&c)) {
-            Ok(cmds) => cmds.into_iter().for_each(|c| self.player.handle().send(c)),
+            Ok(cmds) => cmds.into_iter().for_each(|c| {
+                if let PlayerCommand::SetConnectionLimit { source, max } = &c {
+                    self.tiles.budget().set_limit(*source, *max);
+                }
+                self.tiles.handles().iter().for_each(|h| h.send(c.clone()));
+            }),
             Err(e) => tracing::warn!("connection limits: {e}"),
         }
+        // the batch features' background parts (each a no-op until its track turns it on)
+        if crate::spoiler::ENABLED {
+            crate::spoiler::tracker::start(self.rt.handle(), self.agent.clone(), self.store.clone());
+        }
+        // the guard's builder reads the live settings (identity guard: no-op)
+        self.agent.guard().configure(cfg.clone());
     }
 
     fn start_theme_watch(&mut self, cfg: &Config) {
@@ -172,22 +221,60 @@ impl Services {
     }
 
     fn start_mpris(&mut self) {
-        self.integrations.mpris = ok("MPRIS", crate::platform::mpris::MprisService::start(self.rt.handle(), self.player.handle(), self.bus.clone()));
+        let router = crate::platform::mpris::TileRouter::new(self.tiles.registry(), self.agent.clone(), self.queue.clone());
+        self.integrations.mpris = ok("MPRIS", crate::platform::mpris::MprisService::start(self.rt.handle(), router, self.bus.clone()));
     }
 
-    fn start_reminders(&mut self, cfg: &Config) {
-        let lead_s = cfg.reminders.lead_min as i64 * 60;
-        self.integrations.reminders = ok(
-            "reminders",
-            crate::platform::notify::ReminderScheduler::start(
-                self.rt.handle(),
-                self.store.clone(),
-                self.bus.clone(),
-                lead_s,
-                cfg.reminders.enabled,
-                self.jobs.context().explicit.clone(),
-            ),
-        );
+    /// Start picture B's player on the blocking pool (multi-view's first request; mpv init
+    /// takes 30–80 ms and must not run on the UI thread). The app hears
+    /// `AppEvent::Tile(TileEvent::Ready(B))` — or `Failed(B, why)` — and then calls
+    /// [`Services::adopt_tile_b`]. False when B exists or is already starting.
+    pub fn start_tile_b(&mut self) -> bool {
+        let Some(slot) = self.tiles.begin_b() else { return false };
+        let cfg = self.config();
+        let deps = player_deps(&self.store, &self.config, &self.bus, &self.agent);
+        let (budget, bus) = (self.tiles.budget().clone(), self.bus.clone());
+        self.rt.spawn_blocking(move || {
+            let started = Player::start_tile(&cfg, deps, TileId::B, budget).map_err(|e| e.to_string());
+            let ev = match &started {
+                Ok(_) => crate::player::tiles::TileEvent::Ready(TileId::B),
+                Err(e) => {
+                    tracing::warn!("player B: couldn't start: {e}");
+                    crate::player::tiles::TileEvent::Failed(TileId::B, e.clone())
+                }
+            };
+            slot.fill(started);
+            bus.send(AppEvent::Tile(ev));
+        });
+        true
+    }
+
+    /// Take picture B's player once it started (on `TileEvent::Ready`): it joins the routers
+    /// and the memory thread. `None` while it is still starting; `Some(Err)` when it failed (a
+    /// later [`Services::start_tile_b`] tries again). The app then makes B's video surface.
+    pub fn adopt_tile_b(&mut self) -> Option<std::result::Result<(), String>> {
+        let adopted = self.tiles.adopt_b()?;
+        if adopted.is_ok()
+            && let Some(b) = self.tiles.b()
+        {
+            self.memory.watch_player(self.rt.handle(), TileId::B, b.handle().subscribe());
+            self.agent.set_tile_b(Some(b.handle().subscribe()));
+        }
+        Some(adopted)
+    }
+
+    fn start_reminders(&mut self) {
+        // settings are read live from the shared config; systemd timers only for the default
+        // profile (and only once `reminders::ENABLED` arms anything)
+        let armer = crate::platform::systemd::SystemdArmer::for_profile(&self.paths).map(|a| Arc::new(a) as Arc<dyn crate::platform::systemd::Armer>);
+        let deps = crate::platform::notify::SchedulerDeps {
+            store: self.store.clone(),
+            bus: self.bus.clone(),
+            shared: self.agent.clone(),
+            config: self.config.clone(),
+            armer,
+        };
+        self.integrations.reminders = Some(crate::platform::notify::ReminderScheduler::start_with(self.rt.handle(), deps));
         self.agent.set_reminder_waker(self.integrations.reminders.as_ref().map(|r| r.waker()));
     }
 
@@ -215,12 +302,30 @@ impl Services {
                 self.start_mpris();
             }
         }
-        if old.reminders != new.reminders {
-            self.integrations.reminders = None; // dropping the scheduler aborts its task
-            self.start_reminders(new);
+        if old.reminders != new.reminders || old.follow != new.follow {
+            // the scheduler reads its settings live: a restart would forget the countdowns it
+            // already gave (a second countdown, or a second fire)
+            match &self.integrations.reminders {
+                Some(r) => r.refresh(),
+                None => self.start_reminders(),
+            }
+        }
+        // the threshold is part of the suggestion cache's stamp
+        if old.epg.fuzzy_threshold != new.epg.fuzzy_threshold {
+            crate::jobs::guide_check::request_from(&self.jobs);
+        }
+        if old.spoiler != new.spoiler || old.follow != new.follow {
+            self.agent.guard().configure(self.config());
         }
         if old.general.debug_log != new.general.debug_log {
             crate::logging::set_debug(new.general.debug_log);
+        }
+        // the app sends ApplyConfig to the focused picture; the others get it here
+        let focused = self.tiles.focus();
+        for tile in [TileId::A, TileId::B].into_iter().filter(|t| *t != focused) {
+            if let Some(p) = self.tiles.player(tile) {
+                p.handle().send(PlayerCommand::ApplyConfig(Box::new(new.clone())));
+            }
         }
         // the audio languages pick the top copy of every stack (DESIGN §29.11)
         if old.player.audio_langs != new.player.audio_langs {
@@ -276,11 +381,15 @@ impl Services {
     /// it): stop the player (its final progress save goes to the writer), flush the writer
     /// queue, remove the IPC socket. mpv and the WAL are left to process exit / the next open.
     pub(crate) fn exit_cleanup(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
-        let (player, writer, socket) = (self.player.handle(), self.store.writer().clone(), self.socket.clone());
+        let (players, writer, socket) = (self.tiles.handles(), self.store.writer().clone(), self.socket.clone());
         async move {
-            player.send(PlayerCommand::Shutdown);
-            let mut snap = player.subscribe();
-            let _ = tokio::time::timeout(Duration::from_secs(1), snap.wait_for(|s| s.state == crate::player::PlayerState::Idle)).await;
+            for player in &players {
+                player.send(PlayerCommand::Shutdown);
+            }
+            for player in &players {
+                let mut snap = player.subscribe();
+                let _ = tokio::time::timeout(Duration::from_secs(1), snap.wait_for(|s| s.state == crate::player::PlayerState::Idle)).await;
+            }
             if tokio::time::timeout(Duration::from_secs(2), writer.run(|_| Ok(()))).await.is_err() {
                 tracing::warn!("database writer busy at exit");
             }
@@ -303,7 +412,7 @@ impl Services {
         }
         self.integrations = Integrations::default();
         self.jobs.shutdown();
-        self.player.shutdown(); // final progress save is submitted to the writer here
+        self.tiles.shutdown(); // final progress saves are submitted to the writer here
         // cancelled jobs finish their wind-down (an aborted guide import discards its partial
         // data and restores the channel matches) before the runtime drops their tasks
         if !self.jobs.wait_idle(JOBS_WIND_DOWN) {
@@ -322,6 +431,16 @@ pub fn http_options(cfg: &Config) -> HttpOptions {
         default_user_agent: cfg.player.user_agent.clone(),
         connect_timeout_s: 10,
         read_timeout_s: cfg.player.network_timeout_s.max(30) as u64,
+    }
+}
+
+/// A player's persistence and resolver (picture A at startup, picture B later on the blocking
+/// pool: each gets its own database reader).
+fn player_deps(store: &Store, config: &SharedConfig, bus: &EventBus, shared: &Arc<crate::shared::AppShared>) -> PlayerDeps {
+    PlayerDeps {
+        bus: bus.clone(),
+        store: Box::new(WriterPlayerStore(store.writer().clone())),
+        resolver: Box::new(DbResolver::new(store.clone(), config.clone()).with_copies(shared.clone())),
     }
 }
 
@@ -385,11 +504,19 @@ struct DbResolver {
     conn: Option<rusqlite::Connection>,
     /// Channels that failed to resolve this session (zapping skips them).
     unresolvable: HashSet<ChannelId>,
+    /// The published library, for channel copies (B5: the family rule needs the snapshot).
+    shared: Option<Arc<crate::shared::AppShared>>,
 }
 
 impl DbResolver {
     fn new(store: Store, config: SharedConfig) -> Self {
-        Self { store, config, conn: None, unresolvable: HashSet::new() }
+        Self { store, config, conn: None, unresolvable: HashSet::new(), shared: None }
+    }
+
+    /// Answer `channel_copies` from the library the app publishes.
+    fn with_copies(mut self, shared: Arc<crate::shared::AppShared>) -> Self {
+        self.shared = Some(shared);
+        self
     }
 
     fn conn(&mut self) -> std::result::Result<&rusqlite::Connection, PlayerError> {
@@ -458,6 +585,23 @@ impl MediaResolver for DbResolver {
             .ok()
             .and_then(|r| r.ok())
             .unwrap_or(true)
+    }
+
+    fn channel_source(&mut self, ch: ChannelId) -> Option<SourceId> {
+        let conn = self.conn().ok()?;
+        conn.prepare_cached("SELECT source_id FROM channel WHERE id = ?1").and_then(|mut s| s.query_row([ch], |r| r.get(0))).ok()
+    }
+
+    /// The copies in the published library (nothing before the app published one). Hidden
+    /// copies never come back; locked and explicit ones are flagged for the controller's gate.
+    fn channel_copies(&mut self, ch: ChannelId) -> Vec<crate::store::copies::ChannelCopy> {
+        let Some(shared) = self.shared.clone() else { return Vec::new() };
+        let lib = shared.library();
+        let Ok(conn) = self.conn() else { return Vec::new() };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::store::copies::channel_copies(&lib, conn, ch)))
+            .ok()
+            .and_then(|r| r.map_err(|e| tracing::debug!("channel copies: {e}")).ok())
+            .unwrap_or_default()
     }
 }
 

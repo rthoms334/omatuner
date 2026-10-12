@@ -292,6 +292,16 @@ impl GuideScreen {
         ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: "Show in the guide…".into(), items }));
     }
 
+    /// What the batch features act on in the guide: the focused programme, else its channel.
+    fn focused_target(&self) -> Option<crate::ui::item_menu::Target> {
+        use crate::ui::item_menu::Target;
+        let (channel, prog) = self.grid.as_ref()?.focused()?;
+        Some(match prog {
+            Some(p) => Target::Programme { programme: p.id, channel },
+            None => Target::Channel(channel),
+        })
+    }
+
     fn focused_channel(&self, ctx: &UiCtx<'_>) -> Option<crate::model::ChannelSummary> {
         self.grid.as_ref().and_then(|g| g.focused()).and_then(|(id, _)| ctx.lib.live.get(id).cloned())
     }
@@ -302,7 +312,7 @@ impl GuideScreen {
         let Some(ch) = self.focused_channel(ctx) else { return };
         let k = KeyContext::Guide;
         let fav = ctx.favs.is_fav(&live::channel_ref(&ch));
-        let items = vec![
+        let mut items = vec![
             live::menu_item(glyphs::PLAY, "Watch", Action::GuideWatch, !ch.unsupported, k),
             live::menu_item(
                 if fav { glyphs::FAVOURITE_OFF } else { glyphs::FAVOURITE },
@@ -314,10 +324,13 @@ impl GuideScreen {
             live::menu_item(glyphs::FAV_LIST, "Favourites lists…", Action::AddToList, true, k),
             live::menu_item(glyphs::INFO, "Edit information…", Action::ShowDetails, true, k),
             live::menu_item(glyphs::TAG, "Rename", Action::Rename, true, k),
-            live::menu_item(glyphs::GUIDE, "Assign EPG channel…", Action::AssignEpg, true, k),
+            live::menu_item(glyphs::GUIDE, "Assign guide channel…", Action::AssignEpg, true, k),
             live::menu_item(glyphs::HIDDEN, "Hide", Action::ToggleHidden, true, k),
             live::menu_item(glyphs::LOCK, if ch.locked { "Unlock" } else { "Lock with PIN" }, Action::ToggleLock, true, k),
         ];
+        if let Some(t) = self.focused_target() {
+            crate::ui::item_menu::extend(&mut items, &t, ctx, k);
+        }
         ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: ch.name.to_string(), items }));
     }
 
@@ -643,6 +656,12 @@ impl Screen for GuideScreen {
         if scope::on_action(ctx, ScopeKind::Live, action) {
             return true;
         }
+        // the batch features on the focused programme / channel (R, Ctrl+N, Ctrl+W, Ctrl+M…)
+        if let Some(t) = self.focused_target()
+            && crate::ui::item_menu::dispatch(ctx, action, &t)
+        {
+            return true;
+        }
         match action {
             Action::Digit(d) => {
                 self.numeric = Some((char::from(b'0' + d.min(9)).to_string(), Instant::now()));
@@ -782,11 +801,29 @@ impl Screen for GuideScreen {
             g.no_guide_label = no_guide;
             g.clock_24h = ctx.config.interface.clock_24h;
             g.show_numbers = ctx.config.interface.show_channel_numbers;
+            // what the spoiler guard lets the grid's text say this frame
+            let spoilers = crate::ui::widgets::spoiler::Spoilers::of(ctx);
+            g.spoilers = spoilers.clone();
+            // a new guard snapshot, a pause or a reveal (Ctrl+B): the tooltip's text again
+            if g.hover_stamp != spoilers.stamp() {
+                g.hover_stamp = spoilers.stamp();
+                g.hover_detail = None;
+            }
             // hovered programme: load its description for the tooltip (one indexed read)
             if let Some(id) = g.hovered.filter(|id| g.hover_detail.as_ref().is_none_or(|(h, _)| h != id)) {
                 let db = ctx.db;
                 if let Some(r) = ctx.budget.run(|| crate::store::epg::programme(db, id)) {
-                    let d = r.ok().and_then(|p| p.description.or(p.sub_title)).unwrap_or_default();
+                    // what the spoiler guard lets the tooltip say
+                    let d = r
+                        .ok()
+                        .and_then(|p| {
+                            let subj = crate::ui::widgets::spoiler::programme_subject(&p);
+                            let descr = p.description.as_deref().and_then(|d| spoilers.text(&subj, crate::guard::Field::Description, d));
+                            descr
+                                .or_else(|| p.sub_title.as_deref().and_then(|s| spoilers.text(&subj, crate::guard::Field::SubTitle, s)))
+                                .map(|c| c.into_owned())
+                        })
+                        .unwrap_or_default();
                     g.hover_detail = Some((id, d));
                 }
             }

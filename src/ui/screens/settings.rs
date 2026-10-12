@@ -3,7 +3,7 @@
 //! rows (playlists, EPG priority, favourites lists) with Alt+↑/↓ or K/J or the drag grip.
 //! Playlists page: sources with status, account info (expiry, connections, formats),
 //! refresh/edit/delete/reorder, "+ Add" (→ `Route::Onboarding(AddSource)`); EPG page: ordered
-//! EPG sources with offsets + "EPG mapping…"; Reminders: pending list (Delete cancels);
+//! EPG sources with offsets + "Fix guide data…"; Reminders: pending list (Delete cancels);
 //! About: version, paths, log viewer link. Text fields push `TextInput`. Edits go through
 //! `ctx.edit_config` (applied live to the player). Owner: WP-12.
 //!
@@ -69,19 +69,53 @@ use crate::ui::widgets::toggle::toggle;
 use crate::ui::widgets::{RowState, empty_state, glyphs, rows, section};
 use crate::ui::{LayoutClass, OnboardingStart, OverlayRequest, Route, Screen, ScreenId, SettingsPage, UiCtx};
 
-const PAGES: [(SettingsPage, &str, &str); 11] = [
+// The batch features' parts of Settings (base-B): each file is its track's, with the same
+// hooks — `rows` (its rows on the pages it adds to), `act` (its `Act::Feature` buttons), `item`
+// (Enter on its `Item::Feature` rows) and, for a page of its own, `enter` (load on entering).
+mod following; // F-C: the Following page (DESIGN §33)
+mod guide_fix; // G-ui: EPG ▸ "Fix guide data… (N to fix)" (DESIGN §31)
+mod multiview; // MV-2: Player ▸ Multi-view (DESIGN §35)
+mod queue; // Q-ui: Interface ▸ Playback ▸ "Play the next item after" (DESIGN §32)
+mod reminders; // rui: Reminders ▸ open in, while closed, sleep timer (B6)
+mod spoiler; // S-ui: the Spoiler guard page (DESIGN §34)
+
+/// Which feature file a `Act::Feature` / `Item::Feature` row belongs to.
+#[allow(dead_code)] // base-B: each feature file constructs its own once its track fills it
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Feature {
+    Following,
+    GuideFix,
+    MultiView,
+    Queue,
+    Reminders,
+    Spoiler,
+}
+
+/// Every page in list order (`pages` leaves out the features that are off).
+const PAGES_ALL: [(SettingsPage, &str, &str); 13] = [
     (SettingsPage::Playlists, glyphs::PLAYLIST, "Playlists"),
     (SettingsPage::Epg, glyphs::GUIDE, "EPG"),
     (SettingsPage::Player, glyphs::PLAY, "Player"),
     (SettingsPage::Interface, glyphs::DISPLAY, "Interface"),
     (SettingsPage::Favourites, glyphs::FAVOURITE, "Favourites"),
     (SettingsPage::Reminders, glyphs::REMINDER, "Reminders"),
+    (SettingsPage::Following, glyphs::FOLLOW, "Following"),
+    (SettingsPage::SpoilerGuard, glyphs::SPOILER, "Spoiler guard"),
     (SettingsPage::Parental, glyphs::LOCK, "Parental"),
     (SettingsPage::Backup, glyphs::BACKUP, "Backup"),
     (SettingsPage::Hidden, glyphs::HIDDEN, "Hidden items"),
     (SettingsPage::Orphans, glyphs::WARNING, "Orphans"),
     (SettingsPage::About, glyphs::INFO, "About & logs"),
 ];
+
+/// The pages listed (a feature's page only once the feature is on).
+fn pages() -> impl Iterator<Item = (SettingsPage, &'static str, &'static str)> {
+    PAGES_ALL.into_iter().filter(|(p, ..)| match p {
+        SettingsPage::Following => crate::follow::ENABLED,
+        SettingsPage::SpoilerGuard => crate::spoiler::ENABLED,
+        _ => true,
+    })
+}
 
 // ------------------------------------------------------------------ config row tables
 
@@ -389,6 +423,9 @@ enum Item {
     Orphan(ItemRef),
     /// Index into the attach view's candidates (rebuilt only by its own filter).
     AttachTarget(usize),
+    /// A feature file's row (a Following rule, a spoiler topic…), keyed by its own id.
+    #[allow(dead_code)] // base-B: made by the feature files
+    Feature(Feature, i64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -413,6 +450,9 @@ enum Act {
     CloseAttach,
     /// "Give each its own colour": playlists that look the same get the first free colours.
     DistinctColours,
+    /// A feature file's button (its own numbering).
+    #[allow(dead_code)] // base-B: made by the feature files
+    Feature(Feature, u16),
 }
 
 /// Local (non-config) fields: forms and the source editor.
@@ -430,6 +470,8 @@ enum Local {
     SrcName,
     SrcIcon,
     SrcColor,
+    /// The playlist's short code on cards and rows (empty = derived from the name).
+    SrcCode,
     SrcUrl,
     SrcServer,
     SrcUser,
@@ -457,6 +499,7 @@ impl Local {
                 | Local::PinNew
                 | Local::PinConfirm
                 | Local::SrcName
+                | Local::SrcCode
                 | Local::SrcUrl
                 | Local::SrcServer
                 | Local::SrcUser
@@ -511,6 +554,8 @@ struct SourceEditor {
     name: String,
     icon: usize,
     color: usize,
+    /// The short code as typed (empty = automatic).
+    code: String,
     url: String,
     server: String,
     user: String,
@@ -544,6 +589,7 @@ impl SourceEditor {
             name: s.name.clone(),
             icon: glyphs::SOURCE_ICONS.iter().position(|g| *g == s.icon).unwrap_or(0),
             color: super::onboarding::COLORS.iter().position(|c| c.0 == s.color).unwrap_or(0),
+            code: s.settings.code.clone().unwrap_or_default(),
             url: s.url.as_ref().map(|u| u.expose().clone()).or_else(|| s.path.as_ref().map(|p| p.display().to_string())).unwrap_or_default(),
             server: x.map(|x| x.server.clone()).unwrap_or_default(),
             user: x.map(|x| x.username.clone()).unwrap_or_default(),
@@ -568,6 +614,7 @@ impl SourceEditor {
         rebased(&mut self.name, &old.name, &new.name);
         rebased(&mut self.icon, &old.icon, &new.icon);
         rebased(&mut self.color, &old.color, &new.color);
+        rebased(&mut self.code, &old.code, &new.code);
         rebased(&mut self.url, &old.url, &new.url);
         rebased(&mut self.server, &old.server, &new.server);
         rebased(&mut self.user, &old.user, &new.user);
@@ -598,14 +645,34 @@ impl SourceEditor {
         s.m3u_origin().is_some() || (s.kind != SourceKind::Xtream && s.settings.keep_m3u)
     }
 
-    /// The edited source, or the field that is wrong. Also: whether a refresh is needed.
-    fn apply(&self) -> Result<(Source, bool), (Local, String)> {
+    /// The code this playlist gets from its (edited) name among `sources` (all playlists, as
+    /// stored): the short code field's placeholder.
+    fn auto_code(&self, sources: &[Source]) -> String {
+        let id = self.original.id;
+        let list =
+            sources.iter().map(|s| if s.id == id { (s.id, self.name.trim(), None) } else { (s.id, s.name.as_str(), s.settings.code.as_deref()) });
+        let codes = crate::sources::codes::assign(list);
+        sources.iter().position(|s| s.id == id).and_then(|i| codes.get(i).cloned()).unwrap_or_else(|| crate::sources::codes::auto(&self.name))
+    }
+
+    /// The edited source, or the field that is wrong (`sources`: all playlists as stored, for
+    /// the short code's uniqueness). Also: whether a refresh is needed.
+    fn apply(&self, sources: &[Source]) -> Result<(Source, bool), (Local, String)> {
         let mut s = self.original.clone();
         let name = self.name.trim();
         if name.is_empty() {
             return Err((Local::SrcName, "The name can't be empty".into()));
         }
         s.name = name.to_owned();
+        let code = crate::sources::codes::parse(&self.code).map_err(|e| (Local::SrcCode, e.to_owned()))?;
+        if let Some(c) = &code {
+            // another playlist's code as cards show it now (its own or derived)
+            let now = crate::sources::codes::assign(sources.iter().map(|x| (x.id, x.name.as_str(), x.settings.code.as_deref())));
+            if let Some((other, _)) = sources.iter().zip(&now).find(|(x, n)| x.id != s.id && *n == c) {
+                return Err((Local::SrcCode, format!("{} already uses {c}", other.name)));
+            }
+        }
+        s.settings.code = code;
         s.icon = glyphs::SOURCE_ICONS.get(self.icon).copied().unwrap_or(glyphs::PLAYLIST).to_owned();
         s.color = super::onboarding::COLORS.get(self.color).map(|c| c.0).unwrap_or_default();
         match s.kind {
@@ -657,8 +724,9 @@ impl SourceEditor {
         s.settings.import_vod = tri(s.settings.import_vod, self.import_vod);
         s.settings.in_all = tri(s.settings.in_all, self.in_all);
         let o = &self.original;
-        // "Show in All playlists" is a view setting: the library rebuild applies it, no import
-        let fetched = |st: &SourceSettings| SourceSettings { in_all: None, ..st.clone() };
+        // "Show in All playlists" and the code are view settings: the library rebuild applies
+        // them, no import
+        let fetched = |st: &SourceSettings| SourceSettings { in_all: None, code: None, ..st.clone() };
         let refresh = s.url != o.url
             || s.path != o.path
             || s.xtream.as_ref().map(|x| (&x.server, &x.username, x.password.expose()))
@@ -721,6 +789,11 @@ enum Pane {
 
 #[derive(Default)]
 pub struct SettingsScreen {
+    /// The feature files' own state (base-B: one field per file, so they never collide).
+    #[allow(dead_code)] // base-B: F-C's
+    following: following::State,
+    #[allow(dead_code)] // base-B: S-ui's
+    spoiler: spoiler::State,
     page: SettingsPage,
     pane: Pane,
     /// When a click on the page list last opened a page (egui time): at Compact the page
@@ -741,6 +814,8 @@ pub struct SettingsScreen {
     epg_loader: Option<Loader<GuideList>>,
     /// Channels with a guide per playlist, for the library build in `.0` (Playlists rows).
     guide_counts: (u64, HashMap<SourceId, usize>),
+    /// Shown channels of every playlist, with `guide_counts`.
+    guide_shown: usize,
     reminders: Vec<Reminder>,
     reminders_loader: Option<Loader<Vec<Reminder>>>,
     orphans: Vec<Orphan>,
@@ -828,7 +903,33 @@ impl SettingsScreen {
                 self.hidden_loader = Some(Loader::start(ctx, load_hidden_vod));
                 self.links_loader = Some(Loader::start(ctx, crate::store::titles::links));
             }
+            SettingsPage::Following => following::enter(self, ctx),
+            SettingsPage::SpoilerGuard => spoiler::enter(self, ctx),
             _ => {}
+        }
+    }
+
+    /// A feature file's button.
+    fn feature_act(&mut self, ctx: &mut UiCtx<'_>, f: Feature, n: u16) {
+        match f {
+            Feature::Following => following::act(self, ctx, n),
+            Feature::GuideFix => guide_fix::act(self, ctx, n),
+            Feature::MultiView => multiview::act(self, ctx, n),
+            Feature::Queue => queue::act(self, ctx, n),
+            Feature::Reminders => reminders::act(self, ctx, n),
+            Feature::Spoiler => spoiler::act(self, ctx, n),
+        }
+    }
+
+    /// Enter on a feature file's row.
+    fn feature_item(&mut self, ctx: &mut UiCtx<'_>, f: Feature, id: i64) {
+        match f {
+            Feature::Following => following::item(self, ctx, id),
+            Feature::GuideFix => guide_fix::item(self, ctx, id),
+            Feature::MultiView => multiview::item(self, ctx, id),
+            Feature::Queue => queue::item(self, ctx, id),
+            Feature::Reminders => reminders::item(self, ctx, id),
+            Feature::Spoiler => spoiler::item(self, ctx, id),
         }
     }
 
@@ -996,8 +1097,9 @@ impl SettingsScreen {
                 let alike = crate::ui::scope::look_alikes(&looks, |c| ctx.theme.source_color(c));
                 for g in &alike {
                     let names: Vec<&str> = g.iter().filter_map(|i| self.sources.get(*i)).map(|s| s.name.as_str()).collect();
-                    let verb = if names.len() == 2 { "look the same" } else { "all look the same" };
-                    v.push(Row::Note(format!("{} {verb} on cards and in lists", crate::ui::scope::names_and(&names)), false));
+                    // codes always differ (§13.0), so only the colour is shared
+                    let verb = if names.len() == 2 { "share a colour" } else { "all share a colour" };
+                    v.push(Row::Note(format!("{} {verb}", crate::ui::scope::names_and(&names)), false));
                 }
                 if !alike.is_empty() {
                     v.push(Row::Act { act: Act::DistinctColours, icon: glyphs::THEME, label: "Give each its own colour".into(), danger: false });
@@ -1049,13 +1151,14 @@ impl SettingsScreen {
                         reorder: true,
                     });
                 }
-                if let Some(note) = coverage_note(&self.epg_sources, self.guide_counts.1.values().sum(), ctx.lib.live.channels.len()) {
+                if let Some(note) = coverage_note(&self.epg_sources, self.guide_counts.1.values().sum(), self.guide_shown) {
                     v.push(Row::Note(note, true));
                 }
                 v.push(Row::Local { field: Local::NewEpgUrl, label: "Add an XMLTV URL" });
                 v.push(Row::Act { act: Act::AddEpgUrl, icon: glyphs::ADD, label: "Add URL".into(), danger: false });
                 v.push(Row::Act { act: Act::AddEpgFile, icon: glyphs::FOLDER, label: "Add a guide file…".into(), danger: false });
-                v.push(Row::Act { act: Act::EpgMapping, icon: glyphs::GUIDE, label: "EPG mapping…".into(), danger: false });
+                v.push(Row::Act { act: Act::EpgMapping, icon: glyphs::GUIDE, label: "Fix guide data…".into(), danger: false });
+                guide_fix::rows(self, ctx, &mut v);
                 v.push(Row::Section("Options".into()));
                 v.extend(EPG_N.iter().map(Row::Number));
                 v.push(Row::Toggle(&EPG_T));
@@ -1082,6 +1185,7 @@ impl SettingsScreen {
                     "o in the player (Ctrl+Shift+O anywhere) pops it out into a small window on every workspace. Omarchy's Super+O works too.".into(),
                     false,
                 ));
+                multiview::rows(self, ctx, &mut v);
             }
             SettingsPage::Interface => {
                 v.push(Row::Section("Layout".into()));
@@ -1097,6 +1201,7 @@ impl SettingsScreen {
                 v.push(Row::Number(&IFACE_N[0]));
                 v.extend(IFACE_T[3..5].iter().map(Row::Toggle));
                 v.push(Row::Number(&IFACE_N[1]));
+                queue::rows(self, ctx, &mut v);
                 v.push(Row::Section("Sorting".into()));
                 v.extend(IFACE_C[3..6].iter().map(Row::Choice));
                 v.push(Row::Toggle(&IFACE_T[10]));
@@ -1161,7 +1266,10 @@ impl SettingsScreen {
                         )),
                     ));
                 }
+                reminders::rows(self, ctx, &mut v);
             }
+            SettingsPage::Following => following::rows(self, ctx, &mut v),
+            SettingsPage::SpoilerGuard => spoiler::rows(self, ctx, &mut v),
             SettingsPage::Parental => {
                 let has_pin = ctx.config.parental.pin_hash.is_some();
                 v.push(Row::Section("Parental lock".into()));
@@ -1404,7 +1512,8 @@ impl SettingsScreen {
     fn editor_rows(&self, ctx: &UiCtx<'_>, e: &SourceEditor) -> Vec<Row> {
         let mut v = vec![Row::Section(format!("Edit {}", e.original.name))];
         let l = |field, label| Row::Local { field, label };
-        v.extend([l(Local::SrcName, "Name"), l(Local::SrcIcon, "Icon"), l(Local::SrcColor, "Colour")]);
+        v.extend([l(Local::SrcName, "Name"), l(Local::SrcIcon, "Icon"), l(Local::SrcColor, "Colour"), l(Local::SrcCode, "Short code")]);
+        v.push(Row::Note("Up to 3 letters or digits, shown on cards and in lists in the playlist's colour. Empty: from the name.".into(), false));
         match e.original.kind {
             SourceKind::Xtream => {
                 v.extend([l(Local::SrcServer, "Server"), l(Local::SrcUser, "Username"), l(Local::SrcPassword, "Password (empty = keep)")])
@@ -1529,6 +1638,7 @@ impl SettingsScreen {
                 let e = self.editor.as_mut()?;
                 match f {
                     Local::SrcName => &mut e.name,
+                    Local::SrcCode => &mut e.code,
                     Local::SrcUrl => &mut e.url,
                     Local::SrcServer => &mut e.server,
                     Local::SrcUser => &mut e.user,
@@ -1723,6 +1833,7 @@ impl SettingsScreen {
 
     fn act(&mut self, ctx: &mut UiCtx<'_>, act: Act) {
         match act {
+            Act::Feature(f, n) => self.feature_act(ctx, f, n),
             Act::DistinctColours => {
                 let theme = ctx.theme;
                 let fixes = crate::ui::scope::distinct_colors(&self.looks(), |c| theme.source_color(c));
@@ -1876,7 +1987,7 @@ impl SettingsScreen {
 
     fn save_source(&mut self, ctx: &mut UiCtx<'_>) {
         let Some(e) = &self.editor else { return };
-        match e.apply() {
+        match e.apply(&self.sources) {
             Err((f, msg)) => {
                 self.error = Some((f, msg));
                 let rows = self.rows(ctx);
@@ -2059,6 +2170,7 @@ impl SettingsScreen {
             Item::AttachTarget(i) => self.attach_to(ctx, i),
             Item::Reminder(_) => self.item_menu(ctx, item),
             Item::Explicit(id) => self.toggle_explicit_item(ctx, id),
+            Item::Feature(f, id) => self.feature_item(ctx, f, id),
         }
     }
 
@@ -2206,7 +2318,8 @@ impl SettingsScreen {
                 let Some(g) = all_groups(ctx).find(|g| g.id == id) else { return };
                 (g.display_name().to_owned(), vec![super::live::explicit_menu_item(g, MENU_TOGGLE)])
             }
-            Item::AttachTarget(_) | Item::Categories(_) => return,
+            // a feature file opens its own menu from `item`
+            Item::AttachTarget(_) | Item::Categories(_) | Item::Feature(..) => return,
         };
         self.pending = Some(Pending::Menu(item));
         ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title, items }));
@@ -2288,7 +2401,11 @@ impl SettingsScreen {
 
     fn cancel_reminder(&mut self, ctx: &mut UiCtx<'_>, id: ReminderId) {
         self.reminders.retain(|r| r.id != id);
-        let _ = ctx.services.store.writer().submit_notify(DataScope::Reminders, move |c| crate::store::user::remove_reminder(c, id));
+        let _ = ctx
+            .services
+            .store
+            .writer()
+            .submit_notify(DataScope::Reminders, move |c| crate::store::user::remove_reminder(c, id, crate::model::RemoveWhy::User));
         ctx.toast(Toast::info("Reminder cancelled"));
     }
 
@@ -2433,7 +2550,7 @@ fn coverage_note(guides: &[EpgSource], covered: usize, total: usize) -> Option<S
     }
     (covered * 2 < total).then(|| {
         format!(
-            "Your guides cover {} of {} channels. Add an XMLTV guide that lists your channels, or map them in EPG mapping (below).",
+            "Your guides cover {} of {} channels. Add an XMLTV guide that lists your channels, or fix them in Fix guide data (below).",
             grouped(covered),
             grouped(total)
         )
@@ -2548,6 +2665,8 @@ impl Screen for SettingsScreen {
                     DataScope::Epg => self.page == SettingsPage::Epg,
                     DataScope::Reminders => self.page == SettingsPage::Reminders,
                     DataScope::Overrides => matches!(self.page, SettingsPage::Hidden | SettingsPage::Orphans),
+                    DataScope::Follow => self.page == SettingsPage::Following,
+                    DataScope::Spoiler => self.page == SettingsPage::SpoilerGuard,
                     DataScope::All => true,
                     _ => false,
                 };
@@ -2643,16 +2762,17 @@ impl Screen for SettingsScreen {
 
     fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
         if self.pane == Pane::Pages {
-            let i = PAGES.iter().position(|p| p.0 == self.page).unwrap_or(0);
+            let pages: Vec<_> = pages().collect();
+            let i = pages.iter().position(|p| p.0 == self.page).unwrap_or(0);
             match action {
                 Action::Up | Action::Down => {
-                    let j = if action == Action::Up { i.saturating_sub(1) } else { (i + 1).min(PAGES.len() - 1) };
+                    let j = if action == Action::Up { i.saturating_sub(1) } else { (i + 1).min(pages.len() - 1) };
                     // blocked: back to the editor, where Esc (as the toast says) discards
                     if j != i && !self.may_leave_editor(ctx) {
                         self.pane = Pane::Content;
                         return true;
                     }
-                    self.set_page(ctx, PAGES[j].0);
+                    self.set_page(ctx, pages[j].0);
                 }
                 Action::Activate | Action::Right | Action::FocusNext | Action::FocusPrev => self.pane = Pane::Content,
                 // leaving Settings would keep unsaved editor changes hidden behind a later visit
@@ -2886,14 +3006,13 @@ impl SettingsScreen {
                 Err(e) => kit::error_toast(ctx, "Couldn't read the guides", &e),
             }
         }
-        // channels with a guide per playlist (one pass per library build)
+        // shown channels with a guide per playlist (one pass per library build;
+        // `guide_fix::coverage`, the one coverage function)
         let built = ctx.lib.generation;
         if matches!(self.page, SettingsPage::Playlists | SettingsPage::Epg) && self.guide_counts.0 != built {
-            let mut m: HashMap<SourceId, usize> = HashMap::new();
-            for c in ctx.lib.live.channels.iter().filter(|c| c.epg_channel_id.is_some()) {
-                *m.entry(c.source_id).or_default() += 1;
-            }
-            self.guide_counts = (built, m);
+            let cov = crate::guide_fix::coverage(ctx.lib);
+            self.guide_shown = cov.iter().map(|c| c.shown).sum();
+            self.guide_counts = (built, cov.iter().map(|c| (c.source, c.with_guide)).collect());
         }
         if let Some(r) = kit::poll(&mut self.reminders_loader) {
             match r {
@@ -2932,7 +3051,7 @@ impl SettingsScreen {
         ui.add_space(theme.space(SpaceToken::Md));
         let mut clicked = None;
         egui::ScrollArea::vertical().id_salt("settings-pages-scroll").auto_shrink([false, false]).show(ui, |ui| {
-            for (page, icon, label) in PAGES {
+            for (page, icon, label) in pages() {
                 let selected = page == self.page;
                 // hover lights a page only while the keyboard cursor is in the content (one
                 // cursor at a time; moving it here would switch the page under the pointer)
@@ -2973,7 +3092,7 @@ impl SettingsScreen {
         let mut item_rects: Vec<(usize, egui::Rect)> = Vec::new();
         // the way out of a sub-view (Esc): the source editor or attach view to their page, and
         // in Compact (one pane at a time) the page to the page list
-        let page_label = PAGES.iter().find(|p| p.0 == self.page).map_or("Settings", |p| p.2);
+        let page_label = PAGES_ALL.iter().find(|p| p.0 == self.page).map_or("Settings", |p| p.2);
         let back_to = if self.attach.is_some() || self.editor.is_some() {
             Some(page_label)
         } else if ctx.layout == LayoutClass::Compact {
@@ -3086,11 +3205,16 @@ impl SettingsScreen {
                         if field.is_text() {
                             let editing = focused && self.editing;
                             let password = matches!(field, Local::PinNew | Local::PinConfirm | Local::SrcPassword);
+                            let auto = match (field, &self.editor) {
+                                (Local::SrcCode, Some(e)) => e.auto_code(&self.sources),
+                                _ => String::new(),
+                            };
                             let placeholder = match field {
                                 Local::NewEpgUrl => "http://example.com/guide.xml.gz",
                                 Local::PinNew | Local::PinConfirm => "4–8 digits",
                                 Local::SrcServer => "panel.example.com:8080",
                                 Local::AttachFilter => "type to filter",
+                                Local::SrcCode => auto.as_str(),
                                 _ => "",
                             };
                             let mut buf = self.local_text(field).map(std::mem::take).unwrap_or_default();
@@ -3099,6 +3223,15 @@ impl SettingsScreen {
                             if matches!(field, Local::PinNew | Local::PinConfirm) {
                                 buf.retain(|c| c.is_ascii_digit());
                                 buf.truncate(8);
+                            }
+                            if field == Local::SrcCode {
+                                // letters and digits, upper-case, at most 3
+                                buf = buf
+                                    .chars()
+                                    .filter(|c| c.is_alphanumeric())
+                                    .map(|c| c.to_uppercase().next().unwrap_or(c))
+                                    .take(crate::sources::codes::MAX_LEN)
+                                    .collect();
                             }
                             if let Some(slot) = self.local_text(field) {
                                 *slot = buf;
@@ -3381,7 +3514,7 @@ mod tests {
         let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 1000.0));
         h.state_mut().enter(Route::Settings(SettingsPage::Playlists));
         until(&mut h, "the sources", |h| has_label(h, "Radio"));
-        assert!(has_label(&h, "TV and TV 2 look the same on cards and in lists"));
+        assert!(has_label(&h, "TV and TV 2 share a colour"));
         let colors = |h: &H| sources(h).iter().map(|s| s.color).collect::<Vec<_>>();
         assert_eq!(colors(&h), [SourceColor::Accent, SourceColor::Accent, SourceColor::Red], "never silently");
         focus(&mut h, "Give each its own colour");
@@ -3597,6 +3730,10 @@ mod tests {
                     stop: 4_000_003_600,
                     lead_s: 120,
                     state: crate::model::ReminderState::Pending,
+                    mode: Default::default(),
+                    offset_s: 0,
+                    open_in: None,
+                    rule_id: None,
                 },
             )?;
             // an orphaned favourite of a channel that vanished
@@ -3761,6 +3898,10 @@ mod tests {
                 stop: 4_000_003_600,
                 lead_s: 120,
                 state: crate::model::ReminderState::Pending,
+                mode: Default::default(),
+                offset_s: 0,
+                open_in: None,
+                rule_id: None,
             };
             crate::store::user::add_reminder(c, &r).map(|_| ())
         });
@@ -4325,14 +4466,25 @@ mod tests {
         let mut e = SourceEditor::new(&src);
         assert_eq!(e.color, 6);
         e.name = "Renamed".into();
-        let (s, refresh) = e.apply().unwrap();
+        let (s, refresh) = e.apply(&[]).unwrap();
         assert_eq!(s.name, "Renamed");
         assert_eq!(s.xtream.as_ref().unwrap().password.expose(), "pw", "an empty password field keeps the stored one");
         assert!(!refresh, "a rename needs no refresh");
+        // the short code: the derived one as placeholder, unique, a view setting (no refresh)
+        let other = Source { id: SourceId(2), name: "Northwind".into(), ..src.clone() };
+        let all = [src.clone(), other];
+        assert_eq!(e.auto_code(&all), "RE", "from the edited name");
+        e.code = "NW".into();
+        assert_eq!(e.apply(&all).unwrap_err(), (Local::SrcCode, "Northwind already uses NW".into()));
+        e.code = "tv".into();
+        let (s, refresh) = e.apply(&all).unwrap();
+        assert_eq!((s.settings.code.as_deref(), refresh), (Some("TV"), false));
+        e.code = String::new();
+        assert_eq!(e.apply(&all).unwrap().0.settings.code, None, "empty = automatic");
         e.password = "new".into();
-        assert!(e.apply().unwrap().1, "new credentials refresh");
+        assert!(e.apply(&[]).unwrap().1, "new credentials refresh");
         e.server = "".into();
-        assert_eq!(e.apply().unwrap_err().0, Local::SrcServer);
+        assert_eq!(e.apply(&[]).unwrap_err().0, Local::SrcServer);
         assert!(!needs_credentials(&src));
         let detail = source_detail(&src, 1000, None, Some(0));
         assert!(detail.starts_with("Xtream · 0 ch") && detail.ends_with("Never refreshed"), "{detail}");
@@ -4373,7 +4525,7 @@ mod tests {
         };
         e.rebase(&upgraded);
         assert!(e.offers_xtream_switch() && e.use_xtream);
-        let (s, refresh) = e.apply().unwrap();
+        let (s, refresh) = e.apply(&[]).unwrap();
         assert_eq!(s.name, "Renamed", "the user's edit is kept");
         assert_eq!(s.kind, SourceKind::Xtream);
         assert_eq!(s.xtream.as_ref().map(|x| x.server.as_str()), Some("http://p.example/sub"), "an unchanged server isn't normalized");
@@ -4479,7 +4631,7 @@ mod tests {
         };
         assert_eq!(coverage_text(&e, 3, 11_249), "Matches 3 of 11\u{2009}249 channels · guide lists 2 channels, 312 programmes");
         let note = coverage_note(std::slice::from_ref(&e), 3, 11_249).expect("a note for poor coverage");
-        assert!(note.starts_with("Your guides cover 3 of 11\u{2009}249 channels") && note.contains("EPG mapping"), "{note}");
+        assert!(note.starts_with("Your guides cover 3 of 11\u{2009}249 channels") && note.contains("Fix guide data"), "{note}");
         assert_eq!(coverage_note(std::slice::from_ref(&e), 9_000, 11_249), None, "good coverage needs no note");
         assert_eq!(coverage_note(&[], 0, 11_249), None, "no guide: the page says so already");
     }

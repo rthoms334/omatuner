@@ -11,6 +11,7 @@ pub mod ids;
 pub mod live;
 pub mod playable;
 pub mod source;
+pub mod spoiler;
 pub mod user;
 pub mod vod;
 
@@ -20,6 +21,7 @@ pub use ids::*;
 pub use live::*;
 pub use playable::*;
 pub use source::*;
+pub use spoiler::*;
 pub use user::*;
 pub use vod::*;
 

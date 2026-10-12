@@ -171,7 +171,7 @@ fn initialize_negotiates_the_protocol_version() {
     assert!(instructions.contains("guide_search") && instructions.contains("PIN"), "{instructions}");
 }
 
-/// `tools/list`: the 13 tools with MCP-shaped entries and closed object schemas.
+/// `tools/list`: the tools on in this build, with MCP-shaped entries and closed object schemas.
 #[test]
 fn tools_list_has_every_tool() {
     let dir = tempfile::tempdir().unwrap();
@@ -194,7 +194,24 @@ fn tools_list_has_every_tool() {
             "play",
             "schedule_switch",
             "cancel_switch",
-            "control"
+            "control",
+            // the feature tools (each listed while its feature is on)
+            "queue",
+            "follow",
+            "spoiler_guard",
+            "guide_fix",
+            "multiview",
+            "reminders",
+            "sleep_timer",
+            // the library and health tools
+            "match_titles",
+            "history",
+            "episodes",
+            "favourites_edit",
+            "parental_status",
+            "lock",
+            "diagnose",
+            "sources"
         ]
     );
     for t in tools {
@@ -432,10 +449,41 @@ fn the_real_binary_speaks_only_json_on_stdout() {
     let ids: Vec<_> = replies.iter().map(|r| r["id"].as_u64().unwrap()).collect();
     assert_eq!(ids, [1, 2, 3, 4], "{stdout}");
     assert_eq!(replies[0]["result"]["protocolVersion"], "2025-06-18");
-    assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 13);
+    assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), tuner::agent::tools::tools().len());
     assert_eq!(replies[2]["result"]["structuredContent"], json!({ "running": false }));
     assert!(error_text(&replies[3]["result"]).starts_with("not_running: "));
     assert!(!dir.path().join("data").join("tuner.db").exists(), "the bridge never opens the database");
     assert!(!dir.path().join("state").join("tuner.log").exists(), "the bridge never writes tuner.log");
     assert!(!socket_in(&dir).exists(), "status and control never launch Tuner");
+}
+
+/// The Claude Code plugin (`plugins/omatuner`) talks to this server: its `.mcp.json` names the
+/// server `tuner` (`tuner mcp`), the marketplace entry matches the plugin, and every MCP tool a
+/// skill allows (`mcp__plugin_omatuner_tuner__<tool>`) is a tool this build knows — a renamed
+/// tool would otherwise leave a skill calling nothing. Every skill points at the shared rules.
+#[test]
+fn the_plugin_names_real_tools() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let read = |p: &str| std::fs::read_to_string(root.join(p)).unwrap_or_else(|e| panic!("{p}: {e}"));
+    let mcp: Value = serde_json::from_str(&read("plugins/omatuner/.mcp.json")).unwrap();
+    assert_eq!(mcp["mcpServers"]["tuner"], json!({ "command": "tuner", "args": ["mcp"] }));
+    let plugin: Value = serde_json::from_str(&read("plugins/omatuner/.claude-plugin/plugin.json")).unwrap();
+    let market: Value = serde_json::from_str(&read(".claude-plugin/marketplace.json")).unwrap();
+    assert_eq!(market["plugins"][0]["name"], plugin["name"]);
+    assert_eq!(market["plugins"][0]["source"], "./plugins/omatuner");
+    assert_eq!(plugin["version"], env!("CARGO_PKG_VERSION"), "bump the plugin with the app (installs are cached by version)");
+    let known: Vec<&str> = tuner::agent::tools::tools().iter().map(|t| t.name).collect();
+    for skill in ["watch", "pick", "series", "plan", "kids", "fix", "discover"] {
+        let text = read(&format!("plugins/omatuner/skills/{skill}/SKILL.md"));
+        let front = text.split("---").nth(1).unwrap_or_else(|| panic!("{skill}: no frontmatter"));
+        assert!(front.contains(&format!("name: {skill}\n")), "{skill}");
+        let allowed = front.lines().find_map(|l| l.strip_prefix("allowed-tools: ")).unwrap_or_else(|| panic!("{skill}: allowed-tools"));
+        let tools: Vec<&str> = allowed.split_whitespace().filter_map(|t| t.strip_prefix("mcp__plugin_omatuner_tuner__")).collect();
+        assert!(!tools.is_empty(), "{skill}");
+        for t in tools {
+            assert!(known.contains(&t), "{skill} allows {t}, which isn't a tool");
+        }
+        assert!(text.contains("`${CLAUDE_SKILL_DIR}/../../RULES.md`"), "{skill} points at the shared rules");
+        assert!(text.lines().count() < 500, "{skill}: keep skills short");
+    }
 }

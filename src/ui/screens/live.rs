@@ -18,6 +18,11 @@
 //!   never two different tvg-ids — as alternatives to pick (a click, or Ctrl+O's menu). They
 //!   are never merged and nothing switches to one by itself; hidden channels and hidden
 //!   explicit content aren't offered, a locked one asks for the PIN.
+//! * Multi-view (DESIGN §35): picture chips over the preview (a click chooses the picture
+//!   the preview shows and Enter retunes), the A / B letter on the rows that play, a note under
+//!   the preview for the cursor channel ("↵ plays in A · Ctrl+M plays in B", and what the copy
+//!   planner would do in the other picture); Ctrl+M on a row plays it in the other picture
+//!   (`ui::item_menu`); preview autoplay is off (it never opens a third stream).
 //! * Several playlists with channels (DESIGN §29): the scope bar on top (tabs at Wide, the
 //!   `● TV 2 ▾` button otherwise; Alt+P, Ctrl+PgDn/PgUp) narrows the groups, All channels,
 //!   the favourites lists, History and Reminders — and so the zap lists — to one playlist;
@@ -158,7 +163,7 @@ pub(crate) fn toggle_reminder(ctx: &mut UiCtx<'_>, ch: &ChannelSummary, p: &Prog
     let writer = ctx.services.store.writer();
     match existing {
         Some(id) => {
-            let _ = writer.submit_notify(DataScope::Reminders, move |c| crate::store::user::remove_reminder(c, id));
+            let _ = writer.submit_notify(DataScope::Reminders, move |c| crate::store::user::remove_reminder(c, id, crate::model::RemoveWhy::User));
             ctx.toast(Toast::info(format!("Reminder cancelled: {}", p.title)));
         }
         None => {
@@ -175,6 +180,10 @@ pub(crate) fn toggle_reminder(ctx: &mut UiCtx<'_>, ch: &ChannelSummary, p: &Prog
                 stop: p.stop,
                 lead_s: i64::from(ctx.config.reminders.lead_min) * 60,
                 state: ReminderState::Pending,
+                mode: Default::default(),
+                offset_s: 0,
+                open_in: None,
+                rule_id: None,
             };
             let _ = writer.submit_notify(DataScope::Reminders, move |c| crate::store::user::add_reminder(c, &r).map(|_| ()));
             let when = hhmm(p.start, ctx.config.interface.clock_24h);
@@ -275,16 +284,17 @@ impl GuideStatus {
         }
     }
 
-    /// (channels with a guide, all channels) of the library (cached per snapshot).
+    /// (shown channels with a guide, shown channels) of the library (cached per snapshot;
+    /// `guide_fix::coverage`, the one coverage function).
     pub(crate) fn coverage(&mut self, ctx: &UiCtx<'_>) -> (usize, usize) {
         let key = ctx.lib.generation;
         match self.coverage {
             Some((k, covered, total)) if k == key => (covered, total),
             _ => {
-                let all = &ctx.lib.live.channels;
-                let covered = all.iter().filter(|c| c.epg_channel_id.is_some()).count();
-                self.coverage = Some((key, covered, all.len()));
-                (covered, all.len())
+                let cov = crate::guide_fix::coverage(ctx.lib);
+                let (covered, total) = (cov.iter().map(|c| c.with_guide).sum(), cov.iter().map(|c| c.shown).sum());
+                self.coverage = Some((key, covered, total));
+                (covered, total)
             }
         }
     }
@@ -418,6 +428,8 @@ pub(crate) fn menu_item(icon: &'static str, label: impl Into<String>, action: Ac
 #[derive(Default)]
 pub(crate) struct ProgrammeDetails {
     key: Option<(ChannelId, Option<crate::model::ProgrammeId>)>,
+    /// The spoiler guard's `Spoilers::stamp` the description was loaded under.
+    stamp: (u64, u64),
     pub description: Option<String>,
     pub upcoming: Option<Vec<ProgrammeSlim>>,
     loaded_desc: bool,
@@ -431,12 +443,27 @@ impl ProgrammeDetails {
         if self.key != Some(key) {
             *self = Self { key: Some(key), ..Default::default() };
         }
+        // a new guard snapshot, a pause or a reveal (Ctrl+B): the description again
+        let stamp = crate::ui::widgets::spoiler::Spoilers::of(ctx).stamp();
+        if self.stamp != stamp {
+            self.stamp = stamp;
+            self.loaded_desc = false;
+            self.description = None;
+        }
         let db = ctx.db;
         if !self.loaded_desc {
             match now_prog {
                 Some(p) => {
+                    let spoilers = crate::ui::widgets::spoiler::Spoilers::of(ctx);
                     if let Some(r) = ctx.budget.run(|| crate::store::epg::programme(db, p.id)) {
-                        self.description = r.ok().and_then(|full: Programme| full.description);
+                        // what the spoiler guard lets the details pane say
+                        self.description = r.ok().and_then(|full: Programme| {
+                            let subj = crate::ui::widgets::spoiler::programme_subject(&full);
+                            full.description
+                                .as_deref()
+                                .and_then(|d| spoilers.text(&subj, crate::guard::Field::Description, d))
+                                .map(|d| d.into_owned())
+                        });
                         self.loaded_desc = true;
                     }
                 }
@@ -650,6 +677,10 @@ pub struct LiveScreen {
     layout: Option<LayoutClass>,
     /// Groups marked for a bulk hide (DESIGN §28.7).
     marks: GroupMarks,
+    /// Multi-view (DESIGN §35): two pictures showed last frame (the hint line), and the
+    /// cursor channel's note under the preview (cursor, the focused picture and what it plays).
+    mv_on: bool,
+    mv_note: Option<((ChannelId, crate::model::TileId, u64), Option<String>)>,
     /// Indices into `groups` of the provider groups the filter shows whose names have the
     /// words typed: what "Hide these N groups" hides.
     matching: Vec<u32>,
@@ -665,44 +696,20 @@ pub struct LiveScreen {
 /// words dropped), another playlist, not hidden, not DRM-only; a channel whose tvg-id differs
 /// from `ch`'s (both known) is another channel. Best quality first within a playlist, playlists
 /// in their order. `tvg` reads the tvg-ids of some channels (`None`: the frame budget is spent).
+/// The rule itself is `store::copies::channel_copies_with` (B5); this keeps the UI's frame
+/// budget and the list's length.
 pub(crate) fn also_on(
     lib: &crate::store::library::Library,
     ch: &ChannelSummary,
     tvg: impl FnOnce(&[ChannelId]) -> Option<std::collections::HashMap<ChannelId, String>>,
 ) -> Option<Vec<ChannelId>> {
-    let live = &lib.live;
-    let mut alts: Vec<&ChannelSummary> = live
-        .channels
-        .iter()
-        .filter(|c| c.family == ch.family && c.source_id != ch.source_id && !c.unsupported && !live.hidden.contains(&c.id))
-        .collect();
-    if alts.is_empty() {
-        return Some(Vec::new());
-    }
-    let mut ids: Vec<ChannelId> = alts.iter().map(|c| c.id).collect();
-    ids.push(ch.id);
-    let tvg = tvg(&ids)?;
-    let id_of = |c: ChannelId| tvg.get(&c).map(|t| t.trim()).filter(|t| !t.is_empty());
-    if let Some(own) = id_of(ch.id) {
-        alts.retain(|c| id_of(c.id).is_none_or(|t| t.eq_ignore_ascii_case(own)));
-    }
-    // playlists in their order (the vector's), the best quality first inside one
-    let rank = |s: SourceId| lib.sources.iter().position(|m| m.id == s).unwrap_or(usize::MAX);
-    alts.sort_by_key(|c| (rank(c.source_id), std::cmp::Reverse(c.quality.map(|q| q.class as u8)), c.provider_order));
-    Some(alts.into_iter().take(MAX_ALSO_ON).map(|c| c.id).collect())
+    let copies = crate::store::copies::channel_copies_with(lib, ch, tvg)?;
+    Some(copies.into_iter().take(MAX_ALSO_ON).map(|c| c.id).collect())
 }
 
-/// The tvg-ids of `ids` (one indexed read).
+/// The tvg-ids of `ids` (one indexed read each).
 fn tvg_ids(conn: &rusqlite::Connection, ids: &[ChannelId]) -> crate::error::Result<std::collections::HashMap<ChannelId, String>> {
-    use rusqlite::OptionalExtension;
-    let mut stmt = conn.prepare_cached("SELECT tvg_id FROM channel WHERE id = ?1")?;
-    let mut out = std::collections::HashMap::new();
-    for id in ids {
-        if let Some(t) = stmt.query_row([id.0], |r| r.get::<_, Option<String>>(0)).optional()?.flatten() {
-            out.insert(*id, t);
-        }
-    }
-    Ok(out)
+    crate::store::copies::tvg_ids(conn, ids)
 }
 
 /// Channel management shared by Live and the Guide: favourite, lists, hide, rename, lock (the
@@ -1006,9 +1013,9 @@ impl LiveScreen {
                 let mut group = g.clone();
                 group.item_count = live.group_members(g.id).len() as u32;
                 let mut name = g.display_name().to_owned();
-                // in All, the playlist's name filters too ("tv 2" finds TV 2's groups)
+                // in All, the playlist's name and code filter too ("tv 2" finds TV 2's groups)
                 if let Some(s) = marks.of(g.source_id) {
-                    name = format!("{name} {}", s.name);
+                    name = format!("{name} {} {}", s.name, s.code);
                 }
                 let code = g.tag.as_ref().filter(|_| tagged.contains(&g.source_id)).map(crate::sources::category_tags::tag_short);
                 // the code filters too ("uk" finds the UK groups smart names renamed to "Sports")
@@ -1486,6 +1493,12 @@ impl LiveScreen {
 
     fn channel_command(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
         let cur = self.cursor_channel().and_then(|id| ctx.lib.live.get(id).cloned());
+        // the batch features' keys and menu choices on the channel (Ctrl+N, Ctrl+M…)
+        if let Some(ch) = &cur
+            && crate::ui::item_menu::dispatch(ctx, action, &crate::ui::item_menu::Target::Channel(ch.id))
+        {
+            return true;
+        }
         match action {
             Action::FocusNext | Action::FocusPrev => {
                 self.focus_groups(ctx.layout);
@@ -1569,7 +1582,7 @@ impl LiveScreen {
             menu_item(glyphs::GUIDE, "Show in TV guide", Action::OpenInGuide, true, k),
             menu_item(glyphs::INFO, "Edit information…", Action::ShowDetails, true, k),
             menu_item(glyphs::TAG, "Rename", Action::Rename, true, k),
-            menu_item(glyphs::GUIDE, "Assign EPG channel…", Action::AssignEpg, true, k),
+            menu_item(glyphs::GUIDE, "Assign guide channel…", Action::AssignEpg, true, k),
             menu_item(glyphs::HIDDEN, "Hide", Action::ToggleHidden, true, k),
             menu_item(glyphs::LOCK, if ch.locked { "Unlock" } else { "Lock with PIN" }, Action::ToggleLock, true, k),
             menu_item(glyphs::SORT, "Sort & view…", Action::SortMenu, true, k),
@@ -1580,6 +1593,7 @@ impl LiveScreen {
         if matches!(self.open, Some(Entry::Reminders)) {
             items.push(menu_item(glyphs::CLOSE, "Cancel reminder", Action::Remove, true, k));
         }
+        crate::ui::item_menu::extend(&mut items, &crate::ui::item_menu::Target::Channel(ch.id), ctx, k);
         self.menu = Some(Menu::Context);
         ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: ch.name.to_string(), items }));
     }
@@ -1682,7 +1696,11 @@ impl LiveScreen {
             Some(Entry::Reminders) => {
                 if let Some(r) = self.cursor_reminder().filter(|r| r.channel == channel_ref(ch)) {
                     let id = r.id;
-                    let _ = ctx.services.store.writer().submit_notify(DataScope::Reminders, move |c| crate::store::user::remove_reminder(c, id));
+                    let _ = ctx
+                        .services
+                        .store
+                        .writer()
+                        .submit_notify(DataScope::Reminders, move |c| crate::store::user::remove_reminder(c, id, crate::model::RemoveWhy::User));
                     ctx.toast(Toast::info(format!("Reminder cancelled: {}", r.programme_title)));
                 }
             }
@@ -1815,12 +1833,14 @@ impl LiveScreen {
         let playing = playing_channel(ctx.player);
         // the first guide import says so instead of "No guide data" (DESIGN §13.12)
         let loading = self.guide.loading_label(ctx);
+        let spoilers = crate::ui::widgets::spoiler::Spoilers::of(ctx);
         let opts = ChannelRowOpts {
             density,
             show_number: ctx.config.interface.show_channel_numbers,
             show_logo: ctx.config.interface.show_logos,
             twelve_hour: !ctx.config.interface.clock_24h,
             no_guide_label: loading.as_deref(),
+            spoilers: Some(&spoilers),
             ..Default::default()
         };
         let sources = scope.marks(ctx);
@@ -1836,11 +1856,13 @@ impl LiveScreen {
                 let mut reader = crate::ui::data::DbEpg(ctx.db);
                 ctx.now_next.get((epg, ch.tvg_shift_min), now, &mut reader, ctx.budget).cloned()
             });
+            // two pictures: both channels are "playing", each with its picture's letter
+            let picture = ctx.multiview.tile_playing(id);
             let o = ChannelRowOpts {
                 source: sources.of(ch.source_id),
                 favourite: ctx.favs.is_fav(&item),
                 failed: failed.contains(&item),
-                playing: playing == Some(id),
+                playing: playing == Some(id) || picture.is_some(),
                 quality: ctx.quality(ch),
                 ..opts
             };
@@ -1852,6 +1874,17 @@ impl LiveScreen {
                 RowState::Idle
             };
             let resp = channel_row(ui, theme, ctx.images, ch, nn.as_ref(), now, o, state);
+            if let Some(tile) = picture {
+                let r = resp.rect;
+                let font = egui::FontId::proportional(theme.font(TypeToken::BodySmall));
+                ui.painter().text(
+                    egui::pos2(r.right() - theme.space(SpaceToken::Md), r.top() + theme.space(SpaceToken::Sm)),
+                    egui::Align2::RIGHT_TOP,
+                    tile.to_string(),
+                    font,
+                    theme.tokens.accent,
+                );
+            }
             clicked |= resp.clicked();
             resp
         });
@@ -1930,6 +1963,8 @@ impl LiveScreen {
         let theme = ctx.theme;
         let t = &theme.tokens;
         let rem = theme.rem();
+        // two pictures: which one the preview shows (a click chooses; DESIGN §35)
+        crate::ui::multiview::chips(ui, ctx);
         let width = ui.available_width();
         let video_rect = Rect::from_min_size(ui.cursor().min, egui::vec2(width, (width * 9.0 / 16.0).round()));
         let snap = ctx.player.clone();
@@ -1952,6 +1987,7 @@ impl LiveScreen {
                     .truncate(),
                 );
             }
+            self.draw_mv_note(ui, ctx, cursor);
         } else {
             let r = ui.allocate_rect(video_rect, egui::Sense::hover()).rect;
             ui.painter().rect_filled(r, t.rounding, t.fill_field);
@@ -2055,10 +2091,11 @@ impl LiveScreen {
             }
             (Some(_), Some(p)) => {
                 // time on the right first, the title truncated into what is left
+                let title = crate::ui::widgets::spoiler::Spoilers::of(ctx).programme_title(p);
                 ui.allocate_ui_with_layout(egui::vec2(width, line_h), egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(egui::RichText::new(time_range(p.start, p.stop, h24)).size(theme.font(TypeToken::Body)).color(t.text_secondary));
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        ui.add(egui::Label::new(egui::RichText::new(p.title.as_ref()).size(theme.font(TypeToken::Title)).color(t.fg)).truncate());
+                        ui.add(egui::Label::new(egui::RichText::new(title).size(theme.font(TypeToken::Title)).color(t.fg)).truncate());
                     });
                 });
                 ui.horizontal(|ui| {
@@ -2083,8 +2120,10 @@ impl LiveScreen {
             let item = channel_ref(&ch);
             // a fixed time column ("20:00" / "10:00 pm"), titles truncated to the pane
             let time_w = (theme.font(TypeToken::Body) * 5.0).round();
+            let spoilers = crate::ui::widgets::spoiler::Spoilers::of(ctx);
             for p in up {
                 let remind = self.reminders.iter().any(|r| r.channel == item && r.start == p.start);
+                let title = spoilers.programme_title(&p);
                 ui.allocate_ui_with_layout(egui::vec2(width, line_h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.allocate_ui_with_layout(egui::vec2(time_w, line_h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.set_min_width(time_w);
@@ -2095,7 +2134,7 @@ impl LiveScreen {
                             ui.label(egui::RichText::new(glyphs::REMINDER).size(theme.font(TypeToken::Body)).color(t.accent));
                         }
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            ui.add(egui::Label::new(egui::RichText::new(p.title.as_ref()).size(theme.font(TypeToken::Body)).color(t.fg)).truncate());
+                            ui.add(egui::Label::new(egui::RichText::new(title.as_ref()).size(theme.font(TypeToken::Body)).color(t.fg)).truncate());
                         });
                     });
                 });
@@ -2103,8 +2142,40 @@ impl LiveScreen {
         }
     }
 
+    /// Two pictures: where Enter and Ctrl+M play the cursor channel, and what the copy planner
+    /// would do with it in the other picture (computed once per cursor / picture change).
+    fn draw_mv_note(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, cursor: Option<ChannelId>) {
+        let theme = ctx.theme;
+        let t = &theme.tokens;
+        let view = ctx.multiview.view;
+        let (Some(id), true) = (cursor, view.on) else { return };
+        let loads = ctx.multiview.snap(view.focus).map_or(0, |s| s.load_generation)
+            ^ ctx.multiview.snap(view.unfocused()).map_or(0, |s| s.load_generation << 32);
+        let key = (id, view.focus, loads);
+        if self.mv_note.as_ref().is_none_or(|(k, _)| *k != key) {
+            match crate::ui::multiview::preview_note(ctx, id) {
+                Some(n) => self.mv_note = Some((key, Some(n))),
+                // no frame budget left: asked again next frame (a cached `None` is final)
+                None if ctx.budget.deferred() => {}
+                None => self.mv_note = Some((key, None)),
+            }
+        }
+        let small = |s: String, c| egui::Label::new(egui::RichText::new(s).size(theme.font(TypeToken::BodySmall)).color(c)).wrap();
+        let ctrl_m = shortcut(KeyContext::List, Action::WatchAlongside).unwrap_or_else(|| "Ctrl+M".into());
+        ui.add_space(theme.space(SpaceToken::Xs));
+        ui.add(small(format!("↵ plays in {} · {ctrl_m} plays in {}", view.focus, view.unfocused()), t.text_secondary));
+        if let Some((_, Some(note))) = &self.mv_note {
+            ui.add(small(format!("{} {note}", glyphs::INFO), t.text_secondary));
+        }
+    }
+
     /// Opt-in preview autoplay after the keyboard cursor rested.
     fn autoplay(&mut self, ctx: &mut UiCtx<'_>, ui: &egui::Ui) {
+        // never while two pictures show: the preview never opens a third stream (DESIGN §35)
+        if ctx.multiview.on() {
+            self.rest = None;
+            return;
+        }
         let Some((ch, at)) = self.rest else { return };
         let cfg = &ctx.config.interface;
         if !cfg.live_preview_autoplay || !Self::preview_visible(ctx.layout) || self.cursor_channel() != Some(ch) {
@@ -2150,7 +2221,15 @@ impl Screen for LiveScreen {
 
     fn hint_extras(&self) -> Vec<(Action, &'static str)> {
         let shown = self.also_on.as_ref().is_some_and(|(_, c, alts)| Some(*c) == self.cursor_channel() && !alts.is_empty());
-        if self.focus == Pane::Channels && shown { vec![(Action::PlayFrom, "also on")] } else { Vec::new() }
+        let mut v = Vec::new();
+        if self.focus == Pane::Channels && shown {
+            v.push((Action::PlayFrom, "also on"));
+        }
+        // two pictures: Enter retunes the focused one, Ctrl+M the other (DESIGN §35)
+        if self.focus == Pane::Channels && self.mv_on {
+            v.push((Action::WatchAlongside, "other picture"));
+        }
+        v
     }
 
     fn on_enter(&mut self, ctx: &mut UiCtx<'_>, route: &Route) {
@@ -2211,6 +2290,7 @@ impl Screen for LiveScreen {
 
     fn ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) {
         self.refresh(ctx);
+        self.mv_on = ctx.multiview.on();
         let theme = ctx.theme;
         let layout = ctx.layout;
         if self.layout != Some(layout) {
@@ -2406,9 +2486,11 @@ mod tests {
         assert_eq!(zap_len(&mut h), 5, "the zap list too");
         assert!(has_label(&h, "All · Alpha") && has_label(&h, "All · Bravo"), "groups name their playlist");
         assert!(!has_label(&h, "All · Free"), "Free's groups are out of All");
-        // channel rows paint the name, not just a glyph: Bravo's tab, its 2 groups, its 2 channels
+        // rows chip the playlist's code, its name goes to the label: Bravo's 2 groups and 2
+        // channels; only the tab and the preview's "Also on" chip (P3) name it
         let painted = testkit::painted(&h);
-        assert!(painted.iter().filter(|p| *p == "Bravo").count() >= 5, "{painted:?}");
+        assert!(painted.iter().filter(|p| *p == "BR").count() >= 4, "{painted:?}");
+        assert_eq!(painted.iter().filter(|p| p.contains("Bravo")).count(), 2, "only the tab and Also on name it: {painted:?}");
         let news = h.state().s.groups.iter().rev().find(|g| g.group.display_name() == "News").map(|g| g.entry.clone()).unwrap();
         open(&mut h, news);
         assert!(has_label_containing(&h, "All playlists › News · Bravo"), "the breadcrumb names the group's playlist");
@@ -2515,7 +2597,7 @@ mod tests {
         assert!(has_label(&h, "Also on Bravo"), "Bravo has Channel 0");
         assert!(!has_label_containing(&h, "Also on Charlie"), "a hidden channel isn't offered");
         assert_eq!(h.state().s.hint_extras(), vec![(Action::PlayFrom, "also on")]);
-        let playing = |h: &H| h.state().t.services().player.handle().snapshot().playable.as_ref().map(|p| p.media.clone());
+        let playing = |h: &H| h.state().t.services().tiles.focused().snapshot().playable.as_ref().map(|p| p.media.clone());
         // a click plays Bravo's copy here — the cursor stays on Alpha's
         h.get_by_label("Also on Bravo").click();
         h.run_steps(1);
@@ -2556,7 +2638,7 @@ mod tests {
             resume: false,
             immediate: true,
         };
-        h.state().t.services().player.handle().send(crate::player::PlayerCommand::Play(other));
+        h.state().t.services().tiles.focused().send(crate::player::PlayerCommand::Play(other));
         testkit::until(&mut h, "Alpha's Channel 2 plays", |h| playing(h) == Some(MediaRef::Channel(a_ch[2])));
         h.state_mut().enter(Route::Live { group: None, channel: Some(a_ch[0]) });
         h.run_steps(2);

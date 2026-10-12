@@ -97,7 +97,7 @@ fn act(t: &mut TestUi, screen: &mut dyn Screen, a: Action) -> bool {
 
 /// Wait for the REAL player (commands sent by the UI) to satisfy `f`.
 fn player_until(t: &TestUi, what: &str, f: impl Fn(&PlayerSnapshot) -> bool) -> Arc<PlayerSnapshot> {
-    let h = t.services().player.handle();
+    let h = t.services().tiles.focused();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let s = h.snapshot();
@@ -112,7 +112,7 @@ fn player_until(t: &TestUi, what: &str, f: impl Fn(&PlayerSnapshot) -> bool) -> 
 /// The real player received nothing for `ms`.
 fn player_stays_idle(t: &TestUi, ms: u64) {
     std::thread::sleep(Duration::from_millis(ms));
-    let s = t.services().player.handle().snapshot();
+    let s = t.services().tiles.focused().snapshot();
     assert!(s.playable.is_none(), "nothing may play: {:?}", s.playable.as_ref().map(|p| &p.media));
 }
 
@@ -203,6 +203,8 @@ const T0: Timestamp = 1_791_576_000; // a multiple of 30 minutes
 #[derive(Default)]
 struct FakeEpg {
     calls: u32,
+    /// This slot's programmes are a result ("Arsenal 2-1 Chelsea").
+    result_slot: Option<i64>,
 }
 
 impl EpgReader for FakeEpg {
@@ -216,7 +218,7 @@ impl EpgReader for FakeEpg {
                 id: ProgrammeId(ch.0 * 100_000 + slot + 50_000),
                 start: s,
                 stop: s + 1800,
-                title: format!("Show {slot}").into(),
+                title: if self.result_slot == Some(slot) { "Arsenal 2-1 Chelsea".into() } else { format!("Show {slot}").into() },
                 sub_title: None,
                 flags: ProgrammeFlags::default(),
             });
@@ -420,6 +422,22 @@ fn grid_paints_the_now_line_and_virtualizes_rows() {
     // the focused cell uses the list-cursor colours
     let focus = t.iter().find(|(x, _, r)| x == "Show 0" && r.top() < 120.0).expect("focused title on the first row");
     assert_eq!(focus.1, theme.tokens.list_cursor_text);
+    // the spoiler guard rewrites a result in a cell (scores hidden in every title)
+    let snap = tuner::spoiler::snapshot::GuardSnapshot::from_parts(
+        tuner::spoiler::snapshot::Settings { hide_scores_everywhere: true, ..Default::default() },
+        Vec::new(),
+        HashMap::new(),
+        HashMap::new(),
+    );
+    h.state_mut().state.spoilers = tuner::ui::widgets::spoiler::Spoilers::with_guard(tuner::guard::Guard::with_snapshot(snap), now, true);
+    h.state_mut().reader.result_slot = Some(1);
+    h.state_mut().state.cache = Default::default();
+    h.step();
+    h.step();
+    let t = texts(&shapes(&h));
+    let shown = format!("Arsenal v Chelsea {}", tuner::ui::widgets::spoiler::HIDDEN);
+    assert!(t.iter().any(|(x, _, _)| *x == shown), "rewritten cell title: {:?}", t.iter().map(|x| &x.0).collect::<Vec<_>>());
+    assert!(!t.iter().any(|(x, _, _)| x.contains("2-1")), "the score never painted");
 }
 
 #[test]
@@ -1031,6 +1049,10 @@ fn live_reminders_rows_and_group_reorder() {
                     stop: start + 1800,
                     lead_s: 120,
                     state: tuner::model::ReminderState::Pending,
+                    mode: Default::default(),
+                    offset_s: 0,
+                    open_in: None,
+                    rule_id: None,
                 };
                 tuner::store::user::add_reminder(c, &r)?;
             }
@@ -1842,7 +1864,7 @@ fn mini_player_sits_bottom_right_and_toasts_avoid_it() {
         |ui, a: &mut App| {
             a.host.begin_frame();
             if a.mini {
-                let r = a.host.mini_player(ui.ctx(), &a.theme, &a.snap);
+                let r = a.host.mini_player(ui.ctx(), &a.theme, &a.snap, &Default::default());
                 a.result.push(r);
             }
             let bottom = 900.0 - 26.0;
@@ -1922,7 +1944,7 @@ fn state_overlay_shows_the_channel_logo() {
                 images.pump();
                 host.begin_frame();
                 if mini {
-                    host.mini_player(ui.ctx(), &theme, &snap);
+                    host.mini_player(ui.ctx(), &theme, &snap, &Default::default());
                 } else {
                     host.paint(
                         ui,
@@ -2027,7 +2049,7 @@ fn tracks_overlay_selects_tracks_and_adjusts_subtitles() {
     assert!(matches!(t.with_ctx(|ctx| o.on_action(ctx, Action::Right)), OverlayOutcome::Keep));
     player_until(&t, "sub scale 1.1", |s| (s.sub_scale - 1.1).abs() < 1e-6);
     // drawn over the video in OSD colours; Esc closes
-    let player = t.services().player.handle();
+    let player = t.services().tiles.focused();
     let mut h = Harness::builder().with_size(egui::vec2(1280.0, 720.0)).build_ui(|ui| {
         let egui_ctx = ui.ctx().clone();
         let _ = t.with_ctx(|ctx| o.ui(&egui_ctx, ctx));
@@ -2081,7 +2103,8 @@ fn edit_information_saves_overrides() {
     assert_eq!(o.key_contexts(), [KeyContext::TextInput, KeyContext::Modal]);
     t.with_ctx(|ctx| o.on_action(ctx, Action::Back));
     assert_eq!(o.key_contexts(), [KeyContext::Modal]);
-    // rows: Name, Offset, EPG, Locked, Hidden, Save, Cancel
+    // rows: Name, Time shift, Offset, EPG, Locked, Hidden, Save, Cancel
+    t.with_ctx(|ctx| o.on_action(ctx, Action::Down));
     t.with_ctx(|ctx| o.on_action(ctx, Action::Down));
     for _ in 0..5 {
         t.with_ctx(|ctx| o.on_action(ctx, Action::Right));
@@ -2105,6 +2128,7 @@ fn edit_information_saves_overrides() {
     // the EPG row goes to the mapping screen for this channel
     let mut o = t.with_ctx(|ctx| overlays::build(OverlayRequest::EditItem(item.clone()), ctx));
     frame(&mut t, &mut o);
+    t.with_ctx(|ctx| o.on_action(ctx, Action::Down));
     t.with_ctx(|ctx| o.on_action(ctx, Action::Down));
     t.with_ctx(|ctx| o.on_action(ctx, Action::Down));
     assert!(matches!(t.with_ctx(|ctx| o.on_action(ctx, Action::Activate)), OverlayOutcome::Close));
@@ -2163,7 +2187,7 @@ fn every_wp11_key_is_in_help() {
         "Play fullscreen",
         "Show in TV guide",
         "Details / edit information",
-        "Assign EPG channel",
+        "Assign guide channel",
         "Sort & view options…",
     ] {
         assert!(list.contains(&h), "list help lacks {h}");

@@ -260,6 +260,13 @@ impl SearchOverlay {
     /// An item shortcut on the highlighted row (see the module docs).
     fn item_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> OverlayOutcome {
         let row = self.current();
+        // a feature's own meaning first (Ctrl+W on a guide hit marks it seen, DESIGN §34)
+        if action != Action::ContextMenu
+            && let Some(t) = row.as_ref().and_then(|r| row_target(ctx, r))
+            && crate::ui::item_menu::dispatch(ctx, action, &t)
+        {
+            return OverlayOutcome::Keep;
+        }
         // the guide section: Ctrl+G shows the programme's channel in the guide
         if let (Some(Row::Guide(g)), Action::OpenInGuide) = (&row, action) {
             if let Some((ch, _)) = guide_channel(ctx, g) {
@@ -363,7 +370,7 @@ impl SearchOverlay {
                         lists,
                         mi(glyphs::GUIDE, "Show in TV guide", Action::OpenInGuide, "Ctrl+G"),
                         mi(glyphs::INFO, "Edit information…", Action::ShowDetails, "Ctrl+I"),
-                        mi(glyphs::GUIDE, "Assign EPG channel…", Action::AssignEpg, "Ctrl+E"),
+                        mi(glyphs::GUIDE, "Assign guide channel…", Action::AssignEpg, "Ctrl+E"),
                     ],
                     SearchTarget::Movie(_) => vec![
                         mi(glyphs::PLAY, "Play now", Action::ActivateAlt, "Shift+Enter"),
@@ -387,6 +394,10 @@ impl SearchOverlay {
                 (h.item.name.to_string(), items)
             }
         };
+        let mut items = items;
+        if let Some(t) = row_target(ctx, row) {
+            crate::ui::item_menu::extend(&mut items, &t, ctx, crate::keymap::KeyContext::Search);
+        }
         ctx.open(crate::ui::OverlayRequest::ContextMenu(ContextMenuSpec { title, items }));
     }
 
@@ -517,6 +528,23 @@ pub(crate) fn hit_matches(query: &str, title: &str, sub_title: Option<&str>) -> 
 }
 
 /// The playable channel of a guide hit and the programme as shown on it (tvg-shift applied).
+/// What the batch features act on for a row.
+fn row_target(ctx: &UiCtx<'_>, row: &Row) -> Option<crate::ui::item_menu::Target> {
+    use crate::ui::item_menu::Target;
+    Some(match row {
+        Row::Header(_) => return None,
+        Row::Guide(g) => {
+            let (channel, p) = guide_channel(ctx, g)?;
+            Target::Programme { programme: p.id, channel }
+        }
+        Row::Hit(h) => match h.item.target {
+            SearchTarget::Channel(id) => Target::Channel(id),
+            SearchTarget::Movie(id) => Target::Movie(id),
+            SearchTarget::Series(id) => Target::Series(id),
+        },
+    })
+}
+
 fn guide_channel(ctx: &UiCtx<'_>, g: &ProgrammeHit) -> Option<(crate::model::ChannelId, ProgrammeSlim)> {
     let unlocked = kit::unlocked(ctx);
     let id = g
@@ -573,7 +601,11 @@ impl Overlay for SearchOverlay {
             | Action::AssignEpg
             | Action::MarkWatched
             | Action::ContextMenu => self.item_action(ctx, action),
-            _ => OverlayOutcome::Ignored,
+            // the batch features' keys and menu choices on the row (Ctrl+N, Ctrl+M…)
+            a => match self.current().and_then(|r| row_target(ctx, &r)) {
+                Some(t) if crate::ui::item_menu::dispatch(ctx, a, &t) => OverlayOutcome::Keep,
+                _ => OverlayOutcome::Ignored,
+            },
         }
     }
 
@@ -688,7 +720,8 @@ impl Overlay for SearchOverlay {
                             paint_hit(ui, ctx, rect, h, &playlists, is_cursor);
                         }
                         Row::Guide(g) => {
-                            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &*g.programme.title));
+                            let title = crate::ui::widgets::spoiler::Spoilers::of(ctx).programme_title(&g.programme).into_owned();
+                            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &title));
                             paint_guide(ui, ctx, rect, g, is_cursor);
                         }
                         Row::Header(_) => {}
@@ -763,7 +796,8 @@ fn paint_hit(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, h: &SearchHit, 
                 let bar = Rect::from_center_size(egui::pos2(right - bar_w / 2.0, y), egui::vec2(bar_w, (3.0 * theme.rem()).round().max(2.0)));
                 crate::ui::widgets::progress::paint_progress(&p, bar, theme, cur.progress(now), false);
                 right -= bar_w + pad;
-                let text = format!("{} · {}", cur.title, kit::hhmm(cur.start, ctx.config.interface.clock_24h));
+                let title = crate::ui::widgets::spoiler::Spoilers::of(ctx).programme_title(&cur).into_owned();
+                let text = format!("{title} · {}", kit::hhmm(cur.start, ctx.config.interface.clock_24h));
                 let g = elided(&p, &text, small.clone(), t.text_secondary, (rect.width() * 0.32).max(60.0));
                 let r = Align2::RIGHT_CENTER.anchor_size(egui::pos2(right, y), g.size());
                 p.galley(r.min, g, t.text_secondary);
@@ -771,19 +805,13 @@ fn paint_hit(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, h: &SearchHit, 
             }
         }
     }
-    // the playlist, with several (Settings ▸ Interface ▸ Playlist on cards, DESIGN §13.0); one
-    // chip per playlist of a stack, the first leftmost
-    for src in playlists.iter().rev().filter_map(|p| ctx.source_of(h.item.target.item_kind(), *p)) {
-        let glyph = crate::ui::widgets::badge::source_glyph(src);
-        let text = format!("{glyph} {}", src.name);
-        let color = theme.source_color(src.color);
-        // the border keeps the source colour; the text falls back to fg where it wouldn't read
-        let text_color = kit::legible(theme, color);
-        let g = elided(&p, &text, egui::FontId::proportional(theme.font(TypeToken::Caption)), text_color, 140.0 * theme.rem());
-        let size = g.size() + egui::vec2(2.0 * theme.space(SpaceToken::Sm), 2.0 * theme.space(SpaceToken::Xxs));
-        let r = Align2::RIGHT_CENTER.anchor_size(egui::pos2(right, y), size);
-        p.rect_stroke(r, t.rounding, egui::Stroke::new(1.0, crate::theme::with_alpha(color, 0.6)), egui::StrokeKind::Inside);
-        p.galley(r.center() - g.size() / 2.0, g, text_color);
+    // the playlist, with several (Settings ▸ Interface ▸ Playlist on cards, DESIGN §13.0): its
+    // code chip, one per playlist of a stack, the first leftmost; the full names are the
+    // tooltips and in the row's label
+    for (k, src) in playlists.iter().rev().filter_map(|p| ctx.source_of(h.item.target.item_kind(), *p)).enumerate() {
+        let r = crate::ui::widgets::badge::paint_code_chip(&p, theme, egui::pos2(right, y), Align2::RIGHT_CENTER, src, t.bg, t.fg);
+        ui.interact(r, ui.id().with(("hit-source", h.item.source_id, &h.item.name, k)), egui::Sense::hover())
+            .on_hover_text(egui::RichText::new(&src.name).size(theme.font(TypeToken::BodySmall)));
         right = r.left() - pad;
     }
     // name with the matched characters in accent
@@ -837,7 +865,8 @@ fn paint_guide(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, g: &Programme
     let tw = tg.size().x;
     p.galley(egui::pos2(rect.left() + pad, y - tg.size().y / 2.0), tg, t.text_secondary);
     let left = rect.left() + pad + tw.max(90.0 * theme.rem()) + pad;
-    let title = if channel_name.is_empty() { prog.title.to_string() } else { format!("{} · {channel_name}", prog.title) };
+    let shown = crate::ui::widgets::spoiler::Spoilers::of(ctx).programme_title(&prog).into_owned();
+    let title = if channel_name.is_empty() { shown } else { format!("{shown} · {channel_name}") };
     let past = prog.stop <= now;
     let c = if cursor {
         t.list_cursor_text

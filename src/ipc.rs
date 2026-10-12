@@ -10,7 +10,8 @@
 //! be the starting instance's) instead of opening the database.
 //! Requests arrive in the UI as `AppEvent::Ipc` and also trigger `hypr::focus_self` right
 //! away — the UI may not be running `logic` while the window sits on another workspace, so
-//! raising cannot wait for it.
+//! raising cannot wait for it. A reminder's timer (`--reminder`) and a pop-out play
+//! (`--popout`) never raise it.
 //!
 //! Security: the socket is 0600 inside the 0700 runtime dir, and the server only accepts peers
 //! with the socket owner's uid (`SO_PEERCRED`). Requests are capped at 64 KiB and 5 s.
@@ -42,6 +43,12 @@ pub struct IpcRequest {
     pub view: Option<ViewArg>,
     pub play: Option<String>,
     pub inputs: Vec<String>,
+    /// `--popout` with `--play`: open in the pop-out without taking focus.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub popout: bool,
+    /// `--reminder <id>`: a reminder timer fired (B6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reminder: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -235,8 +242,13 @@ fn v1_reply(line: &str, bus: &EventBus) -> std::io::Result<String> {
     let reply = match serde_json::from_str::<IpcRequest>(line) {
         Ok(req) => {
             tracing::info!("IPC request: view={:?} play={} inputs={}", req.view, req.play.is_some(), req.inputs.len());
+            // a reminder's timer and a pop-out play never take focus (the app raises the
+            // window itself for "Open in: Full window")
+            let raise = req.reminder.is_none() && !req.popout;
             bus.send(AppEvent::Ipc(req));
-            crate::platform::hypr::focus_self();
+            if raise {
+                crate::platform::hypr::focus_self();
+            }
             IpcReply { ok: true, error: None }
         }
         Err(e) => IpcReply { ok: false, error: Some(format!("bad request: {e}")) },
@@ -270,7 +282,7 @@ mod tests {
 
     #[test]
     fn request_and_reply_wire_format() {
-        let req = IpcRequest { view: Some(ViewArg::Guide), play: Some("2:xt:live:1".into()), inputs: vec!["a.m3u".into()] };
+        let req = IpcRequest { view: Some(ViewArg::Guide), play: Some("2:xt:live:1".into()), inputs: vec!["a.m3u".into()], ..Default::default() };
         let s = serde_json::to_string(&req).unwrap();
         assert_eq!(s, r#"{"view":"guide","play":"2:xt:live:1","inputs":["a.m3u"]}"#);
         assert_eq!(serde_json::from_str::<IpcRequest>(&s).unwrap(), req);

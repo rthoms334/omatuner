@@ -331,8 +331,9 @@ pub struct Channel {
     pub stream: StreamLocator,
     pub headers: HttpHeaders,
     pub catchup: Option<CatchupSpec>,
-    /// Per-channel user catch-up offset in seconds (UHF 1.100.1), applied on top of correction.
-    pub catchup_offset_s: i64,
+    /// Per-channel user catch-up offset in seconds (UHF 1.100.1), applied on top of correction;
+    /// `None`: the playlist's (`GuideRules::catchup_offset_s`), so an own 0 overrides it.
+    pub catchup_offset_s: Option<i64>,
     pub radio: bool,
     pub unsupported: Option<Unsupported>,
     pub provider_order: i32,

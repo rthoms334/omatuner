@@ -26,7 +26,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::model::{EpgChannel, EpgChannelId, EpgMapping, EpgMatchMethod, EpgSourceId, EpgSuggestion};
+use crate::model::{ChannelId, EpgChannel, EpgChannelId, EpgMapping, EpgMatchMethod, EpgSourceId, EpgSuggestion, ItemKey, SourceId};
 use crate::sources::identity::normalize_name;
 use crate::store::epg::ChannelMatchRow;
 
@@ -179,6 +179,14 @@ fn prefilter(idx: &EpgCandidateIndex, norm: &str) -> Vec<usize> {
     cands.into_iter().map(|(i, _)| i as usize).collect()
 }
 
+/// Whether two norms share at least one padded trigram (Guide fixes' "Looks wrong": a tvg-id
+/// match whose guide channel shares none with the channel's name).
+pub fn share_trigram(a: &str, b: &str) -> bool {
+    let mut ga: Vec<u32> = trigrams(a).collect();
+    ga.sort_unstable();
+    trigrams(b).any(|g| ga.binary_search(&g).is_ok())
+}
+
 /// Padded byte trigrams of an (ASCII) norm packed into a `u32`: `"abc"` → `^ab abc bc$`.
 fn trigrams(norm: &str) -> impl Iterator<Item = u32> + '_ {
     let b = norm.as_bytes();
@@ -199,6 +207,178 @@ fn trigrams(norm: &str) -> impl Iterator<Item = u32> + '_ {
 /// `CNN.us@SD` → `CNN.us`.
 pub fn strip_feed(id: &str) -> &str {
     id.split_once('@').map(|(a, _)| a).unwrap_or(id)
+}
+
+impl EpgCandidateIndex {
+    /// The guide channel whose id equals `xmltv_id` ignoring case, else ignoring the `@Feed`
+    /// suffix (Guide fixes: a guide that renamed `bbcfour.uk` to `BBCFour.uk`): `(id, xmltv id)`.
+    pub fn find_id(&self, xmltv_id: &str) -> Option<(EpgChannelId, String)> {
+        let id = xmltv_id.trim();
+        if id.is_empty() {
+            return None;
+        }
+        if let Some(hit) = self.by_id.get(id) {
+            return Some(hit.clone());
+        }
+        if let Some(hit) = self.by_id_lower.get(&id.to_lowercase()).and_then(|v| v.first()) {
+            return Some(hit.clone());
+        }
+        let feedless = strip_feed(id).trim().to_lowercase();
+        (!feedless.is_empty()).then(|| self.by_id_feedless.get(&feedless).and_then(|v| v.first()).cloned()).flatten()
+    }
+}
+
+// ------------------------------------------------------------------ Guide fixes rules (DESIGN §31)
+
+/// A playlist channel as the Guide fixes rules see it ("+1/+2 follow their base", "Copies
+/// share a guide"): the derivation after a rematch (`store::guide_fix::derive_rule_rows`) and
+/// the issue list (`guide_fix::issues`) use the same two rules.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuleChannel {
+    pub id: ChannelId,
+    pub source: SourceId,
+    pub key: ItemKey,
+    /// The provider's name (the "+N" marker is read from it, then from `tvg_name`).
+    pub name: String,
+    pub tvg_name: Option<String>,
+    /// `channel.norm_name` (`identity::normalize_name`).
+    pub norm: String,
+    /// The copies key (`channel.family`, else `norm_name`): the `store::copies` family (B5).
+    pub family: String,
+    pub tvg_id: Option<String>,
+    /// May lend its guide to a copy: supported, not hidden by the user, playlist enabled.
+    pub usable: bool,
+    pub resolved: Option<Resolved>,
+}
+
+/// The guide channel a channel resolves to (`channel_epg`) and the row that won.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolved {
+    pub epg_channel: EpgChannelId,
+    pub epg_source: EpgSourceId,
+    pub xmltv_id: String,
+    pub method: EpgMatchMethod,
+    /// The winning row's time shift (a rule's), minutes.
+    pub shift_min: Option<i32>,
+}
+
+/// What "+1/+2 follow their base" says about one channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sibling {
+    /// Not a "+N" name.
+    NotShifted,
+    /// A "+N" name whose base isn't in the playlist or has no guide channel.
+    NoBase { minutes: i32 },
+    /// Its bases resolve to different guide channels: a person picks one.
+    Ambiguous { minutes: i32, bases: usize },
+    /// It has a guide channel of its own (another than the base's), or the base's guide channel
+    /// is itself a "+N" entry: nothing to derive.
+    Own,
+    /// Follows `base` (an index into the rule channels) `minutes` later. `already`: it resolves
+    /// to the base's guide channel already (a provider reusing the base's tvg-id), only the
+    /// shift is missing.
+    Follows { base: usize, minutes: i32, already: bool },
+}
+
+/// Lookups over every playlist channel for the two rules.
+#[derive(Debug)]
+pub struct RuleIndex<'a> {
+    pub chans: &'a [RuleChannel],
+    /// The "+N" channels: index → (base norm, minutes).
+    markers: HashMap<u32, (String, i32)>,
+    /// The channels some "+N" channel's base norm names (only those: the index is per frame
+    /// of a 79k-channel classification).
+    by_norm: HashMap<(SourceId, String), Vec<u32>>,
+    /// Built on the first [`Self::copy_of`].
+    by_family: std::cell::OnceCell<HashMap<&'a str, Vec<u32>>>,
+}
+
+impl<'a> RuleIndex<'a> {
+    /// `chans` in playlist order, then provider order (the copy rule takes the first copy).
+    pub fn new(chans: &'a [RuleChannel]) -> Self {
+        let mut markers = HashMap::new();
+        let mut by_norm: HashMap<(SourceId, String), Vec<u32>> = HashMap::new();
+        for (i, c) in chans.iter().enumerate() {
+            let m = crate::textmatch::timeshift::marker(&c.name).or_else(|| c.tvg_name.as_deref().and_then(crate::textmatch::timeshift::marker));
+            if let Some((base, minutes)) = m {
+                let norm = normalize_name(&base);
+                by_norm.entry((c.source, norm.clone())).or_default();
+                markers.insert(i as u32, (norm, minutes));
+            }
+        }
+        if !by_norm.is_empty() {
+            let mut probe = (SourceId(0), String::new());
+            for (i, c) in chans.iter().enumerate() {
+                probe.0 = c.source;
+                probe.1.clear();
+                probe.1.push_str(&c.norm);
+                if let Some(v) = by_norm.get_mut(&probe) {
+                    v.push(i as u32);
+                }
+            }
+        }
+        Self { chans, markers, by_norm, by_family: std::cell::OnceCell::new() }
+    }
+
+    /// Rule "+1/+2 follow their base" for channel `i`: its bases are the channels of its
+    /// playlist named like it without the marker. `marked(guide channel)` = that guide channel's
+    /// display names carry a "+N" marker.
+    pub fn sibling(&self, i: usize, marked: &mut dyn FnMut(EpgChannelId) -> bool) -> Sibling {
+        let Some((norm, minutes)) = self.markers.get(&(i as u32)) else { return Sibling::NotShifted };
+        let minutes = *minutes;
+        let c = &self.chans[i];
+        let bases = self.by_norm.get(&(c.source, norm.clone())).map(Vec::as_slice).unwrap_or_default();
+        let mut targets: Vec<(EpgChannelId, usize)> = Vec::new();
+        for &b in bases {
+            let b = b as usize;
+            if b == i {
+                continue;
+            }
+            if let Some(r) = &self.chans[b].resolved
+                && !targets.iter().any(|(t, _)| *t == r.epg_channel)
+            {
+                targets.push((r.epg_channel, b));
+            }
+        }
+        match targets.as_slice() {
+            [] => Sibling::NoBase { minutes },
+            [(target, base)] => {
+                if marked(*target) {
+                    return Sibling::Own;
+                }
+                match &c.resolved {
+                    None => Sibling::Follows { base: *base, minutes, already: false },
+                    Some(r) if r.epg_channel == *target => Sibling::Follows { base: *base, minutes, already: true },
+                    Some(_) => Sibling::Own,
+                }
+            }
+            many => Sibling::Ambiguous { minutes, bases: many.len() },
+        }
+    }
+
+    /// Rule "Copies share a guide" for channel `i` (unresolved): the first copy (`store::copies`
+    /// family, another playlist, usable, no tvg-id veto) that resolves.
+    pub fn copy_of(&self, i: usize) -> Option<usize> {
+        let c = &self.chans[i];
+        let own_tvg = c.tvg_id.as_deref().map(str::trim).filter(|t| !t.is_empty());
+        let by_family = self.by_family.get_or_init(|| {
+            let mut m: HashMap<&str, Vec<u32>> = HashMap::new();
+            for (i, c) in self.chans.iter().enumerate().filter(|(_, c)| !c.family.is_empty()) {
+                m.entry(c.family.as_str()).or_default().push(i as u32);
+            }
+            m
+        });
+        by_family.get(c.family.as_str())?.iter().map(|&j| j as usize).find(|&j| {
+            let o = &self.chans[j];
+            o.source != c.source
+                && o.usable
+                && o.resolved.is_some()
+                && match (own_tvg, o.tvg_id.as_deref().map(str::trim).filter(|t| !t.is_empty())) {
+                    (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                    _ => true,
+                }
+        })
+    }
 }
 
 #[cfg(test)]

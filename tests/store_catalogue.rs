@@ -473,6 +473,10 @@ fn attach_all(c: &mut Connection, item: &ItemRef, epg_src: EpgSourceId) -> tuner
                 stop: NOW + 1200,
                 lead_s: 120,
                 state: ReminderState::Pending,
+                mode: Default::default(),
+                offset_s: 0,
+                open_in: None,
+                rule_id: None,
             },
         )?;
         epg::set_manual_mapping(c, item, epg_src, "manual.tv")?;
@@ -990,6 +994,10 @@ fn overrides_progress_history_and_reminders() {
         stop: start + 60,
         lead_s: lead,
         state: ReminderState::Pending,
+        mode: Default::default(),
+        offset_s: 0,
+        open_in: None,
+        rule_id: None,
     };
     let (r1, r2, r3) = (rem(1000, 100), rem(950, 0), rem(1000, 5));
     let (id1, id2, id3) = w(&s, move |c| Ok((user::add_reminder(c, &r1)?, user::add_reminder(c, &r2)?, user::add_reminder(c, &r3)?)));
@@ -1000,7 +1008,7 @@ fn overrides_progress_history_and_reminders() {
     w(&s, move |c| user::set_reminder_state(c, id2, ReminderState::Fired));
     assert_eq!(user::all_reminders(&r).unwrap().len(), 1);
     assert_eq!(user::reminders_for_channel(&r, &ch_ref(src, "m3u:seed00000000001")).unwrap().len(), 2);
-    w(&s, move |c| user::remove_reminder(c, id1));
+    w(&s, move |c| user::remove_reminder(c, id1, tuner::model::RemoveWhy::User));
     assert!(user::all_reminders(&r).unwrap().is_empty());
     let bad = Reminder { channel: ItemRef { kind: ItemKind::Movie, ..ch0.clone() }, ..rem(1, 1) };
     assert!(s.writer().blocking(move |c| user::add_reminder(c, &bad)).is_err());
@@ -1038,7 +1046,7 @@ fn live_reads_groups_and_failure_cache() {
     let r = s.reader().unwrap();
     let ch = live::channel_by_ref(&r, &a).unwrap().unwrap();
     assert_eq!(ch.display_name(), "A!");
-    assert_eq!(ch.catchup_offset_s, 30);
+    assert_eq!(ch.catchup_offset_s, Some(30));
     assert_eq!(ch.headers.user_agent.as_deref(), Some("UA"));
     assert_eq!(ch.catchup.as_ref().unwrap().days, 3);
     assert!(ch.locked, "locked through its Premium group");
