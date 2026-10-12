@@ -883,6 +883,37 @@ fn guide_search_and_search_prefer_playlists_in_all() {
     assert_eq!(refs[..2], ["channel:1:m3u:bbc1", "channel:3:m3u:extra"], "{r}");
 }
 
+/// The same title from the same start on two channels, ended on one and still on on the other,
+/// is two programmes: the live one's ref is the channel it is live on (so `play` plays it), the
+/// ended one's the channel it ended on.
+#[test]
+fn guide_search_keeps_a_title_apart_when_it_ends_at_different_times() {
+    let mut w = World::new(pin_config());
+    let now = w.now;
+    w.ui.services()
+        .store
+        .writer()
+        .blocking(move |c| {
+            for (ec, stop) in [(1, now - 600), (2, now + 1200)] {
+                c.execute(
+                    "INSERT INTO programme(epg_source_id, epg_channel_id, gen, start, stop, title, categories) VALUES (1, ?1, 1, ?2, ?3, 'Goal Rush', 'Sport')",
+                    params![ec, now - 2400, stop],
+                )?;
+                c.execute("INSERT INTO programme_fts(rowid, title, sub_title) VALUES (?1, 'Goal Rush', NULL)", [c.last_insert_rowid()])?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    w.publish(Visibility::NO_EXPLICIT);
+    let r = w.ok("guide_search", json!({"query": "goal rush"}));
+    let rows: Vec<(&str, &str)> =
+        r["programmes"].as_array().unwrap().iter().map(|p| (p["airing"].as_str().unwrap(), p["channel"]["name"].as_str().unwrap())).collect();
+    assert!(rows.contains(&("live", "ITV4")), "{r}");
+    assert!(rows.contains(&("past", "BBC One HD")), "{r}");
+    let live = r["programmes"].as_array().unwrap().iter().find(|p| p["airing"] == "live").unwrap();
+    assert_eq!(w.ok("play", json!({"ref": live["ref"]}))["outcome"], "playing");
+}
+
 /// DESIGN §28.3 / §28.12: the agent sees what the screens show. The shared category rule (TV
 /// Two has no rule of its own) hides its German sports category and its French films category
 /// from every tool and count — their channel is no `also_on` alternative either — and "Also
