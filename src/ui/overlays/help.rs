@@ -348,7 +348,7 @@ mod tests {
 
         // key combo
         let hide = filtered(vec![], "ctrl+h");
-        // (the bulk-hide "Mark group (Ctrl+H then hides all marked)" rows match by description)
+        // (the bulk-hide "Mark (groups: Ctrl+H then hides all marked)" rows match by description)
         assert!(hide.iter().all(|(_, rows)| rows.iter().all(|(k, h)| k.contains("Ctrl+H") || h.contains("Ctrl+H"))));
         assert!(hide.iter().any(|(c, rows)| *c == KeyContext::List && rows.iter().any(|(k, _)| k.contains("Space"))));
         assert!(hide.iter().any(|(c, rows)| *c == KeyContext::List && rows.iter().any(|(_, h)| *h == "Hide / unhide")));

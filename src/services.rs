@@ -159,7 +159,8 @@ impl Services {
             self.tiles.handle(crate::model::TileId::A),
             self.bus.clone(),
             self.jobs.clone(),
-        ));
+        )
+        .with_tiles(self.tiles.registry()));
         self.integrations.ipc =
             ok("IPC server", crate::ipc::IpcServer::start_with_agent(self.rt.handle(), &self.paths.ipc_socket(), self.bus.clone(), Some(agent)));
         *self.socket.lock().unwrap_or_else(|e| e.into_inner()) = self.integrations.ipc.as_ref().map(|s| s.socket());
@@ -183,7 +184,11 @@ impl Services {
             self.rt.handle(),
             self.tiles.main_watch(),
             self.agent.subscribe_queue(),
-            crate::reminders::sleep::player_actuator(self.tiles.handles()),
+            // every picture at fire time (multi-view's B starts later, lazily)
+            {
+                let tiles = self.tiles.registry();
+                Arc::new(move |a| crate::reminders::sleep::player_actuator(tiles.all())(a))
+            },
             self.bus.clone(),
         );
         self.agent.set_sleep(Some(sleep));

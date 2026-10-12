@@ -270,7 +270,7 @@ impl BackTarget {
             ScreenId::Player => "Player",
             ScreenId::Settings => "Settings",
             ScreenId::Onboarding => "Setup",
-            ScreenId::EpgMapping => "EPG mapping",
+            ScreenId::EpgMapping => "Guide fixes",
             ScreenId::Logs => "Logs",
             ScreenId::Queue => "Up next",
         };

@@ -128,7 +128,7 @@ impl KeyContext {
             KeyContext::PlayerOsd => "Player — on-screen controls",
             KeyContext::PopOut => "Pop-out player",
             KeyContext::NumericEntry => "Channel number entry",
-            KeyContext::EpgMapping => "EPG mapping",
+            KeyContext::EpgMapping => "Guide fixes",
             KeyContext::Search => "Search",
             KeyContext::Modal => "Dialogs & menus",
             KeyContext::TextInput => "Text fields",
@@ -516,8 +516,8 @@ pub static LIST: &[Binding] = &[
     b(C::ch('?'), A::ToggleHelp, "Keyboard help"),
     // the Text event, never Key::Space: the space is then never also typed into the filter
     // (and a leading space doesn't filter anyway)
-    b(C::ch(' '), A::ToggleMark, "Mark group (Ctrl+H then hides all marked)"),
-    b(C::key(Key::Insert), A::ToggleMark, "Mark group (Ctrl+H then hides all marked)"),
+    b(C::ch(' '), A::ToggleMark, "Mark (groups: Ctrl+H then hides all marked)"),
+    b(C::key(Key::Insert), A::ToggleMark, "Mark (groups: Ctrl+H then hides all marked)"),
     // Live TV: the same channel in another playlist ("Also on", DESIGN §29.16)
     b(C::ctrl(Key::O), A::PlayFrom, "Play from another playlist (Also on)…"),
     // any other printable key starts filtering (FilterInput)
@@ -540,7 +540,7 @@ pub static LIST_FILTERING: &[Binding] = &[
     b(C::key(Key::Tab), A::FocusNext, "Next / previous pane"),
     b(C::shift(Key::Tab), A::FocusPrev, "Next / previous pane"),
     // Space types here (filters have spaces); Insert still marks
-    b(C::key(Key::Insert), A::ToggleMark, "Mark group (Ctrl+H then hides all marked)"),
+    b(C::key(Key::Insert), A::ToggleMark, "Mark (groups: Ctrl+H then hides all marked)"),
     b(C::ctrl_shift(Key::H), A::HideShown, "Hide the groups with the words typed"),
     b(C::ctrl(Key::O), A::PlayFrom, "Play from another playlist (Also on)…"),
     // printable keys → FilterInput
@@ -797,8 +797,8 @@ pub static NUMERIC_ENTRY: &[Binding] = &[
 
 /// Stacked above `List`/`ListFiltering` on the EPG mapping screen.
 pub static EPG_MAPPING: &[Binding] = &[
-    b(C::key(Key::Enter), A::Activate, "Assign the highlighted EPG channel"),
-    b(C::key(Key::Delete), A::ClearEpg, "Clear the manual assignment"),
+    b(C::key(Key::Enter), A::Activate, "Issues: show its guide channels · Guide channels: assign"),
+    b(C::key(Key::Delete), A::ClearEpg, "Reset to automatic (guide channel and time shift)"),
     // Guide fixes (DESIGN §31); Shift+Enter shadows the list's "Play fullscreen" here only
     b(C::shift(Key::Enter), A::AcceptFix, "Accept the proposed fix (every marked channel)"),
     b(C::ctrl(Key::A), A::MarkAll, "Mark all shown / none"),
@@ -1102,7 +1102,7 @@ const HINTS: &[(KeyContext, &[(Action, &str)])] = &[
         &[(A::Activate, "details"), (A::GuideWatch, "watch"), (A::GuideRemind, "remind"), (A::FollowProgramme, "follow"), (A::ToggleHelp, "help")],
     ),
     (KeyContext::Panel, &[(A::Activate, "toggle"), (A::Right, "change"), (A::MoveUp, "reorder"), (A::ContextMenu, "more"), (A::ToggleHelp, "help")]),
-    (KeyContext::EpgMapping, &[(A::Activate, "assign"), (A::ClearEpg, "clear")]),
+    (KeyContext::EpgMapping, &[(A::Activate, "pick"), (A::ClearEpg, "reset")]),
     (KeyContext::NumericEntry, &[(A::Activate, "go"), (A::FilterBackspace, "delete"), (A::Back, "cancel")]),
     (KeyContext::Search, &[(A::Activate, "open"), (A::ActivateAlt, "details"), (A::FocusNext, "section"), (A::Back, "close")]),
     (KeyContext::TextInput, &[(A::Activate, "confirm"), (A::FocusNext, "next field"), (A::Back, "leave")]),

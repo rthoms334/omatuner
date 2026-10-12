@@ -222,6 +222,46 @@ impl TunerApp {
         }
     }
 
+    /// The `multiview` MCP tool (validated by the handler; the PIN and copy rules apply here
+    /// as for the user's own plays). One target plays alongside what plays; two fill A and B.
+    pub(super) fn on_agent_multiview(&mut self, r: &crate::agent::AgentMultiView) {
+        use crate::agent::{AgentMultiView as M, MultiViewKeep as Keep, MultiViewSwap as Swap};
+        let set_layout = |app: &mut Self, l: crate::config::MultiViewLayout| {
+            app.config_edits.push(Box::new(move |c: &mut crate::config::Config| c.player.multiview.layout = l));
+        };
+        match r {
+            M::Open { targets, layout, sound, rearrange } => {
+                if let Some(l) = layout {
+                    set_layout(self, *l);
+                }
+                let on = self.mv.view.on;
+                let aims: &[Aim] = match targets.len() {
+                    1 => &[Aim::Alongside],
+                    _ if on => &[Aim::Tile(A), Aim::Tile(B)],
+                    _ => &[Aim::Focused, Aim::Alongside],
+                };
+                for (i, (media, aim)) in targets.iter().zip(aims).enumerate() {
+                    let mut p = PlaceIn::new(*aim, media.clone(), None);
+                    p.take_sound = *sound == Some(i);
+                    p.rearrange = *rearrange;
+                    self.mv_place(p);
+                }
+            }
+            M::Swap(Swap::Sound) => self.apply_mv(MvRequest::Sound(Some(self.mv.view.audible.other()))),
+            M::Swap(Swap::Places) => self.apply_mv(MvRequest::Swap),
+            M::Swap(Swap::Focus) => self.apply_mv(MvRequest::FocusNext),
+            M::Swap(Swap::Layout(l)) => set_layout(self, *l),
+            M::Close { keep } => {
+                let keep = match keep {
+                    Keep::A => A,
+                    Keep::B => B,
+                    Keep::Sound => self.mv.view.audible,
+                };
+                self.apply_mv(MvRequest::Close(Some(keep.other())));
+            }
+        }
+    }
+
     /// Ctrl+Shift+P with two pictures: pause both, or play both when both are paused.
     pub(super) fn mv_pause_all(&mut self) {
         let playing = [A, B].into_iter().filter_map(|t| self.mv_snap(t)).any(|s| s.state.is_active() && !s.paused);

@@ -2085,7 +2085,8 @@ fn edit_information_saves_overrides() {
     assert_eq!(o.key_contexts(), [KeyContext::TextInput, KeyContext::Modal]);
     t.with_ctx(|ctx| o.on_action(ctx, Action::Back));
     assert_eq!(o.key_contexts(), [KeyContext::Modal]);
-    // rows: Name, Offset, EPG, Locked, Hidden, Save, Cancel
+    // rows: Name, Time shift, Offset, EPG, Locked, Hidden, Save, Cancel
+    t.with_ctx(|ctx| o.on_action(ctx, Action::Down));
     t.with_ctx(|ctx| o.on_action(ctx, Action::Down));
     for _ in 0..5 {
         t.with_ctx(|ctx| o.on_action(ctx, Action::Right));
@@ -2109,6 +2110,7 @@ fn edit_information_saves_overrides() {
     // the EPG row goes to the mapping screen for this channel
     let mut o = t.with_ctx(|ctx| overlays::build(OverlayRequest::EditItem(item.clone()), ctx));
     frame(&mut t, &mut o);
+    t.with_ctx(|ctx| o.on_action(ctx, Action::Down));
     t.with_ctx(|ctx| o.on_action(ctx, Action::Down));
     t.with_ctx(|ctx| o.on_action(ctx, Action::Down));
     assert!(matches!(t.with_ctx(|ctx| o.on_action(ctx, Action::Activate)), OverlayOutcome::Close));

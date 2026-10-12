@@ -2549,7 +2549,7 @@ fn coverage_note(guides: &[EpgSource], covered: usize, total: usize) -> Option<S
     }
     (covered * 2 < total).then(|| {
         format!(
-            "Your guides cover {} of {} channels. Add an XMLTV guide that lists your channels, or map them in EPG mapping (below).",
+            "Your guides cover {} of {} channels. Add an XMLTV guide that lists your channels, or fix them in Fix guide data (below).",
             grouped(covered),
             grouped(total)
         )
@@ -4630,7 +4630,7 @@ mod tests {
         };
         assert_eq!(coverage_text(&e, 3, 11_249), "Matches 3 of 11\u{2009}249 channels · guide lists 2 channels, 312 programmes");
         let note = coverage_note(std::slice::from_ref(&e), 3, 11_249).expect("a note for poor coverage");
-        assert!(note.starts_with("Your guides cover 3 of 11\u{2009}249 channels") && note.contains("EPG mapping"), "{note}");
+        assert!(note.starts_with("Your guides cover 3 of 11\u{2009}249 channels") && note.contains("Fix guide data"), "{note}");
         assert_eq!(coverage_note(std::slice::from_ref(&e), 9_000, 11_249), None, "good coverage needs no note");
         assert_eq!(coverage_note(&[], 0, 11_249), None, "no guide: the page says so already");
     }

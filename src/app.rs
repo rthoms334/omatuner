@@ -474,8 +474,13 @@ impl TunerApp {
             AppEvent::Agent(crate::agent::AgentCommand::Play(p)) => self.on_agent_play(p.clone()),
             // `lock session_now`: Claude can only ever lock (the handler's view locked already)
             AppEvent::Agent(crate::agent::AgentCommand::LockSession) => self.parental.lock(),
-            // the pop-out and multi-view commands are MV-2's (`AgentCommand::{PopOut, MultiView}`)
-            AppEvent::Agent(_) => {}
+            // `control popout`: the pop-out never takes the keyboard
+            AppEvent::Agent(crate::agent::AgentCommand::PopOut) => {
+                if !self.popout.is_out() && !self.video_only {
+                    self.toggle_popout(egui_ctx);
+                }
+            }
+            AppEvent::Agent(crate::agent::AgentCommand::MultiView(r)) => self.on_agent_multiview(r),
             // the reminder engine (B6): countdowns, switches, the sleep timer, news flashes
             AppEvent::Reminder(e) => self.on_reminder_event(e, egui_ctx),
             // Following's summary when no notification server answered (F-C)
@@ -1499,6 +1504,16 @@ impl TunerApp {
             Action::Back => self.back(egui_ctx),
             // an automatic switch's toast (DESIGN §30.8)
             Action::CancelSwitch(id) => self.cancel_switch(id),
+            // a toast's Undo off the screens that made it: Up next's rows, a guide-fix batch
+            Action::Undo(n) if crate::queue::ui::is_undo(n) => {
+                if let Err(e) = crate::queue::ui::undo_in(self.services(), n) {
+                    self.toast(Toast::info(e));
+                }
+            }
+            Action::UndoGuideFix(log @ Some(_)) if crate::guide_fix::ENABLED => {
+                let opts = crate::store::guide_fix::GuideOpts::from_config(&self.services().config());
+                let _ = crate::guide_fix::ui::submit_undo(self.services(), log, opts, crate::model::now());
+            }
             // a combined action's Undo (`ui::copies`)
             Action::Undo(n) => {
                 let undone = crate::ui::copies::undo(self.services(), n);
