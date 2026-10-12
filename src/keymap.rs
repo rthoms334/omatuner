@@ -239,6 +239,9 @@ pub enum Action {
     CancelSwitch(crate::model::ReminderId),
     /// A toast's Undo for a Following rule just added (never bound to a key): delete it again.
     UndoFollow(crate::model::FollowRuleId),
+    /// The Open button of Following's summary toast (never bound to a key): Settings ▸
+    /// Following.
+    OpenFollowing,
     // ---- guide
     GuidePrevDay,
     GuideNextDay,
@@ -900,10 +903,10 @@ pub static PANEL: &[Binding] = &[
     b(C::ch('L'), A::Increase, "Increase / next option"),
     b(C::shift(Key::ArrowLeft), A::Decrease, "Decrease / previous option"),
     b(C::ch('H'), A::Decrease, "Decrease / previous option"),
-    b(C::alt(Key::ArrowUp), A::MoveUp, "Move up / down (reorder: guide priority, playlists, lists)"),
-    b(C::ch('K'), A::MoveUp, "Move up / down (reorder: guide priority, playlists, lists)"),
-    b(C::alt(Key::ArrowDown), A::MoveDown, "Move up / down (reorder: guide priority, playlists, lists)"),
-    b(C::ch('J'), A::MoveDown, "Move up / down (reorder: guide priority, playlists, lists)"),
+    b(C::alt(Key::ArrowUp), A::MoveUp, "Move up / down (reorder: guide priority, playlists, lists, Following rules)"),
+    b(C::ch('K'), A::MoveUp, "Move up / down (reorder: guide priority, playlists, lists, Following rules)"),
+    b(C::alt(Key::ArrowDown), A::MoveDown, "Move up / down (reorder: guide priority, playlists, lists, Following rules)"),
+    b(C::ch('J'), A::MoveDown, "Move up / down (reorder: guide priority, playlists, lists, Following rules)"),
     b(C::key(Key::Tab), A::FocusNext, "Next / previous section"),
     b(C::shift(Key::Tab), A::FocusPrev, "Next / previous section"),
     b(C::key(Key::Enter), A::Activate, "Toggle / open"),
@@ -1044,7 +1047,7 @@ fn resolve_inner(stack: &[KeyContext], ev: &egui::Event) -> Option<Action> {
 pub fn feature_on(a: Action) -> bool {
     match a {
         A::QueueAdd | A::QueuePlayNext | A::GoQueue | A::QueuePanel | A::QueueNext | A::QueuePrev => crate::queue::ENABLED,
-        A::FollowProgramme | A::UndoFollow(_) => crate::follow::ENABLED,
+        A::FollowProgramme | A::UndoFollow(_) | A::OpenFollowing => crate::follow::ENABLED,
         A::RevealSpoilers | A::SpoilerMenu => crate::spoiler::ENABLED,
         A::AcceptFix | A::ShiftLater | A::ShiftEarlier | A::UndoGuideFix(_) => crate::guide_fix::ENABLED,
         A::NextPicture

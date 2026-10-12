@@ -2700,7 +2700,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `←` / `h` | Back to the page list |
 | `→` / `l` / `Shift+→` / `L` | Increase / next option |
 | `Shift+←` / `H` | Decrease / previous option |
-| `Alt+↑` / `K` / `Alt+↓` / `J` | Move up / down (reorder: guide priority, playlists, lists) |
+| `Alt+↑` / `K` / `Alt+↓` / `J` | Move up / down (reorder: guide priority, playlists, lists, Following rules) |
 | `Tab` / `Shift+Tab` | Next / previous section |
 | `Enter` / `Space` | Toggle / open |
 | `x` / `Delete` | Delete / more actions |
@@ -5446,8 +5446,10 @@ Claude's switches win, then rule priority, then the earlier start; the loser not
   copy) already plays on either picture. The check runs at the countdown and again at the switch
   (`reminders::flash_skip`), in a running Tuner and on the closed path.
 * Sound: Normal, or Mute ("silent flash": single view mutes the main picture; multi-view plays it
-  in the silent picture without taking the sound). Duck is stored but not offered until it does
-  something different.
+  in the silent picture without taking the sound). There is no "duck" (lower what plays under
+  it): nothing plays under a flash with its sound (single view replaces what played, multi-view
+  gives the flash's picture the sound), so it would act as Normal. A `"duck"` stored by an early
+  build reads as Normal.
 * At its end the previous playback comes back (the bulletin or one of its copies must still be
   playing; if the user moved on, nothing changes), the window pops back in and the Player screen
   is left if the user wasn't on it. In multi-view the flash's picture gets back what it showed,
@@ -5457,14 +5459,25 @@ Claude's switches win, then rule priority, then the earlier start; the loser not
 ### 33.5 Feedback and Claude
 * "Following: Chelsea · 1 in the guide" with **Undo** for a new rule; Claude's rules toast
   "Claude added X · N reminders" with Undo (`Action::UndoFollow`).
-* A summary notification at most every 12 h, only with additions.
+* A summary notification at most every 12 h, only with additions, with **Open** (and a click on
+  it): the window is raised and shows Settings ▸ Following (`FollowEvent::Open`). Without a
+  notification server it is an in-app toast with the same Open (`Action::OpenFollowing`).
 * Claude's rules are marked, capped (10 an hour, 20 in all); Claude can't turn a rule's
   spoiler-safe off; a concealed channel's match is named by the rule only.
 * Upcoming rows in Settings go through the spoiler guard and skip concealed channels.
 
-### 33.6 Gaps
-No row menu or drag reorder on the Settings rows (the editor has ↑/↓, Duplicate, Delete…); the
-summary notification has no Open action; Settings' hint line still advertises reorder.
+### 33.6 Settings ▸ Following
+* Rule rows, in priority order (higher wins a clash): Enter or a click opens the rule in the
+  sheet's editor. `x` / Delete / right-click / the gear open the row's menu: **Edit…**,
+  **Pause / Resume** (the evaluation that follows cancels a paused rule's reminders, and makes
+  them again on Resume), **Test against the guide** (a preview over 14 days in the background,
+  toasted as "Arsenal: 4 in the next 14 days · next Sat 12:30 on Sky Sports Main Event · 2 left
+  out (repeat)": the rule's name, times and channels only), **Move up / down**, **Delete…**
+  ("Delete it and cancel its N reminders" / "keep the reminders as my own").
+* Reorder: Alt+↑/↓ (K/J), the drag grip (shown with two rules or more) or the menu's Move; the
+  order is saved at once and the guide checked again. The Panel hint's "reorder" covers them.
+* Upcoming rows: Enter, a click or `x` opens the programme's popover (Watch, Cancel reminder =
+  skip this one, Follow…).
 
 ## 34. Spoiler guard
 

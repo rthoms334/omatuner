@@ -1327,6 +1327,14 @@ once (`claude mcp list` shows `tuner` connected).
   become switches after the next evaluation (within seconds).
 - [ ] **Following off:** turn Following off in Settings. **Expect:** its reminders don't fire
   (on again: they do).
+- [ ] **Rule menu and order:** Settings ▸ Following, `x` on a rule. **Expect:** Edit…, Pause,
+  Test against the guide, Move up / down, Delete…. Test toasts "N in the next 14 days · next …"
+  with the rule's name only; Pause shows "paused" and its reminders leave Settings ▸ Reminders
+  within seconds (Resume brings them back); Delete… asks to cancel or keep them. With two
+  rules, Alt+↑/↓ and the drag grip change the order, and it stays after a restart.
+- [ ] **Summary Open:** let a new rule match (or wait for a guide refresh that adds matches).
+  **Expect:** the "Following: N new" notification has **Open**; picking it raises Tuner on
+  Settings ▸ Following. Without a notification server the toast has the same Open.
 - [ ] **News flash (the user's addition):** on a news bulletin, *News flash this daily…*,
   weekdays, headlines 5 min. At the bulletin's time with a live channel playing. **Expect:** the
   countdown strip in the pop-out (pinned, every workspace, **keyboard focus stays where it

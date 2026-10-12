@@ -36,7 +36,7 @@ use crate::follow::ui as fui;
 use crate::follow::{Airings, ChannelScope, FollowEvent, FollowKind, FollowMode, FollowRule, FollowSpec};
 use crate::keymap::{Action, KeyContext};
 use crate::model::{FollowRuleId, ReminderState};
-use crate::msg::{AppEvent, DataScope, EventBus, Toast};
+use crate::msg::{AppEvent, EventBus, Toast};
 use crate::store::Ticket;
 use crate::theme::{SpaceToken, Theme, TypeToken};
 use crate::ui::UiCtx;
@@ -507,7 +507,6 @@ impl FollowSheet {
                 }
             }
             F::Volume => {
-                // `Duck` isn't offered until it does something different from Normal
                 const V: [FlashVolume; 2] = [FlashVolume::Normal, FlashVolume::Mute];
                 let mut fl = r.spec.flash.unwrap_or_default();
                 let i = V.iter().position(|v| *v == fl.volume).unwrap_or(0);
@@ -589,19 +588,7 @@ impl FollowSheet {
 
     fn delete(&mut self, ctx: &mut UiCtx<'_>, keep: bool) -> OverlayOutcome {
         let Some(r) = self.stored().cloned() else { return OverlayOutcome::Keep };
-        let bus = ctx.services.bus.clone();
-        let _ = ctx.services.store.writer().submit_notify(DataScope::Follow, move |c| {
-            let n = crate::store::follow::delete_rule(c, r.id, keep)?;
-            bus.data_changed(DataScope::Reminders);
-            let what = match n {
-                0 => String::new(),
-                1 => " · 1 reminder cancelled".into(),
-                n => format!(" · {n} reminders cancelled"),
-            };
-            bus.toast(Toast::info(format!("Stopped following {}{what}", r.name)));
-            Ok(())
-        });
-        fui::invalidate();
+        fui::delete_rule(ctx.services, r.id, r.name, keep);
         OverlayOutcome::Close
     }
 
@@ -617,12 +604,7 @@ impl FollowSheet {
         }
         let v = l.order.remove(i);
         l.order.insert(j, v);
-        let (order, now, jobs) = (l.order.clone(), ctx.now, ctx.services.jobs.clone());
-        let _ = ctx.services.store.writer().submit_notify(DataScope::Follow, move |c| {
-            crate::store::follow::reorder_rules(c, &order, now)?;
-            jobs.submit(crate::jobs::JobKind::EvaluateFollows { reason: crate::follow::FollowReason::Rules });
-            Ok(())
-        });
+        fui::reorder_rules(ctx.services, l.order.clone(), ctx.now);
         ctx.toast(Toast::info(format!("Moved to {} of {}", j + 1, l.order.len())));
     }
 

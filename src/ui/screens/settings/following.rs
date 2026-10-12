@@ -3,25 +3,34 @@
 //!
 //! * "+ Follow…" opens the Follow sheet on the templates (Team, Show, Event, News flash, Custom).
 //! * Rules, in list order (higher wins a clash): "Arsenal — Team · live · remind 2 min ·
-//!   spoiler-safe · 4 coming". Enter or a click opens the rule in the sheet's editor (pause,
-//!   Delete…, Duplicate, Move up / down live there).
+//!   spoiler-safe · 4 coming". Enter or a click opens the rule in the sheet's editor. `x` /
+//!   Delete / right-click / the gear: the row's menu — Edit…, Pause / Resume, Test against the
+//!   guide (a toast of what it finds now), Move up / down, Delete… (cancel or keep its
+//!   reminders). Alt+↑/↓ (K/J) or the drag grip reorder them.
 //! * Upcoming (next 14 days, the ledger): "Arsenal — Sat 12:30 · Sky Sports Main Event · remind".
-//!   Spoiler-safe rules show only the rule's name. Enter or a click opens the programme popover
-//!   (Watch, Cancel reminder = skip this one, Follow…).
+//!   Spoiler-safe rules show only the rule's name. Enter, a click or `x` opens the programme
+//!   popover (Watch, Cancel reminder = skip this one, Follow…).
 //! * The switches of `[follow]` and the news flash's quiet hours, "not over another app's
 //!   fullscreen" and headlines length.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 use super::*;
 use crate::follow::FollowRule;
 use crate::follow::plan::{MatchState, Upcoming};
 use crate::follow::ui as fui;
+use crate::model::FollowRuleId;
 
 /// "+ Follow…".
 const ACT_NEW: u16 = 1;
 /// Upcoming rows are listed at most this many.
 const UPCOMING_MAX: usize = 300;
+/// The rule menu's own codes (`Action::Digit`; Edit, Pause / Resume, Move and Delete… use the
+/// page's shared `MENU_*`).
+const MENU_TEST: u8 = 40;
+const MENU_DELETE_CANCEL: u8 = 41;
+const MENU_DELETE_KEEP: u8 = 42;
 
 /// What the page shows, read in the background.
 struct Data {
@@ -29,12 +38,20 @@ struct Data {
     upcoming: Vec<Upcoming>,
     /// When the guide was last checked (`meta follow:last_run`).
     checked: Option<crate::model::Timestamp>,
+    /// Each rule's pending reminders (what Delete… cancels or keeps).
+    owned: HashMap<FollowRuleId, usize>,
 }
 
 fn load(c: &rusqlite::Connection) -> crate::error::Result<Data> {
     let now = crate::model::now();
     let checked = crate::store::follow::meta_get(c, "follow:last_run")?.and_then(|v| v.parse().ok());
-    Ok(Data { rules: crate::store::follow::rules(c)?, upcoming: crate::store::follow::upcoming(c, now, UPCOMING_MAX)?, checked })
+    let mut owned = HashMap::new();
+    for r in crate::store::user::all_reminders(c)? {
+        if let Some(rule) = r.rule_id.filter(|_| r.state == crate::model::ReminderState::Pending) {
+            *owned.entry(rule).or_insert(0) += 1;
+        }
+    }
+    Ok(Data { rules: crate::store::follow::rules(c)?, upcoming: crate::store::follow::upcoming(c, now, UPCOMING_MAX)?, checked, owned })
 }
 
 /// The page's state (loaded rows), kept in `SettingsScreen`. Interior mutability: the rows are
@@ -177,7 +194,8 @@ pub(super) fn rows(s: &SettingsScreen, ctx: &UiCtx<'_>, v: &mut Vec<Row>) {
             color: None,
             label: r.name.clone(),
             detail: Some(detail),
-            reorder: false,
+            // one rule needs no grip
+            reorder: d.rules.len() > 1,
         });
     }
     v.push(Row::Section(format!("Upcoming · next {} days", 14)));
@@ -258,7 +276,7 @@ pub(super) fn act(_s: &mut SettingsScreen, ctx: &mut UiCtx<'_>, n: u16) {
 /// Upcoming row opens its programme's popover.
 pub(super) fn item(s: &mut SettingsScreen, ctx: &mut UiCtx<'_>, id: i64) {
     if id > 0 {
-        let rule = Some(crate::model::FollowRuleId(id));
+        let rule = Some(FollowRuleId(id));
         ctx.open(OverlayRequest::FollowSheet(crate::ui::overlays::follow_sheet::FollowSheetSpec { programme: None, rule }));
         return;
     }
@@ -268,6 +286,137 @@ pub(super) fn item(s: &mut SettingsScreen, ctx: &mut UiCtx<'_>, id: i64) {
         Some((programme, channel)) => ctx.open(OverlayRequest::Programme { programme, channel, zap: None }),
         None => ctx.toast(Toast::info("That airing is no longer in the guide")),
     }
+}
+
+/// `x` / Delete / right-click / the gear on its rows: a rule's menu (title, items); an Upcoming
+/// row opens its programme's popover instead (`None`).
+pub(super) fn menu(s: &mut SettingsScreen, ctx: &mut UiCtx<'_>, id: i64) -> Option<(String, Vec<MenuItem>)> {
+    if id < 0 {
+        item(s, ctx, id);
+        return None;
+    }
+    let data = s.following.data.borrow();
+    let d = data.as_ref()?;
+    let r = d.rules.iter().find(|r| r.id.0 == id)?;
+    let mi = |icon: &'static str, label: &str, code: u8| MenuItem {
+        icon,
+        label: label.into(),
+        action: Action::Digit(code),
+        enabled: true,
+        shortcut: None,
+    };
+    let at = d.rules.iter().position(|x| x.id == r.id).unwrap_or(0);
+    let mut up = mi(glyphs::REORDER, "Move up (wins more clashes)", MENU_UP);
+    up.enabled = at > 0;
+    let mut down = mi(glyphs::REORDER, "Move down", MENU_DOWN);
+    down.enabled = at + 1 < d.rules.len();
+    let items = vec![
+        mi(glyphs::SETTINGS, "Edit…", MENU_EDIT),
+        if r.enabled { mi(glyphs::PAUSE, "Pause", MENU_TOGGLE) } else { mi(glyphs::PLAY, "Resume", MENU_TOGGLE) },
+        mi(glyphs::SEARCH, "Test against the guide", MENU_TEST),
+        up,
+        down,
+        mi(glyphs::CLOSE, "Delete…", MENU_DELETE),
+    ];
+    Some((r.name.clone(), items))
+}
+
+/// A choice in a rule's menu (Move up / down go through the page's `reorder`).
+pub(super) fn menu_choice(s: &mut SettingsScreen, ctx: &mut UiCtx<'_>, id: i64, code: u8) {
+    let rule = s.following.data.borrow().as_ref().and_then(|d| d.rules.iter().find(|r| r.id.0 == id).cloned());
+    let Some(r) = rule else { return };
+    let owned = s.following.data.borrow().as_ref().and_then(|d| d.owned.get(&r.id).copied()).unwrap_or(0);
+    match code {
+        MENU_EDIT => item(s, ctx, id),
+        MENU_TOGGLE => {
+            let on = !r.enabled;
+            fui::set_enabled(ctx.services, r.id, on, ctx.now);
+            if let Some(x) = s.following.data.borrow_mut().as_mut().and_then(|d| d.rules.iter_mut().find(|x| x.id == r.id)) {
+                x.enabled = on;
+            }
+            ctx.toast(Toast::info(if on {
+                format!("Resumed {} — Tuner checks the guide for it again", r.name)
+            } else if owned == 1 {
+                format!("Paused {} — its coming reminder is cancelled", r.name)
+            } else if owned > 1 {
+                format!("Paused {} — its {owned} coming reminders are cancelled", r.name)
+            } else {
+                format!("Paused {}", r.name)
+            }));
+        }
+        MENU_TEST => test(ctx, r),
+        MENU_DELETE => {
+            let mi = |label: String, code| MenuItem { icon: glyphs::CLOSE, label, action: Action::Digit(code), enabled: true, shortcut: None };
+            let mut items = vec![mi(
+                match owned {
+                    0 => "Delete the rule".into(),
+                    1 => "Delete it and cancel its reminder".into(),
+                    n => format!("Delete it and cancel its {n} reminders"),
+                },
+                MENU_DELETE_CANCEL,
+            )];
+            if owned > 0 {
+                items.push(mi(format!("Delete it, keep the reminder{} as my own", if owned == 1 { "" } else { "s" }), MENU_DELETE_KEEP));
+            }
+            s.pending = Some(Pending::Menu(Item::Feature(Feature::Following, id)));
+            ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: format!("Stop following {}?", r.name), items }));
+        }
+        MENU_DELETE_CANCEL | MENU_DELETE_KEEP => {
+            fui::delete_rule(ctx.services, r.id, r.name.clone(), code == MENU_DELETE_KEEP);
+            if let Some(d) = s.following.data.borrow_mut().as_mut() {
+                d.rules.retain(|x| x.id != r.id);
+                d.upcoming.retain(|u| u.rule != r.id);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// "Test against the guide": preview the rule (paused or not) over the next 14 days in the
+/// background and toast what it finds ([`fui::test_text`]).
+fn test(ctx: &mut UiCtx<'_>, rule: FollowRule) {
+    if ctx.lib.built_at == 0 {
+        ctx.toast(Toast::info("Your playlists are still loading — try again in a moment"));
+        return;
+    }
+    ctx.toast(Toast::info(format!("Checking the guide for {}…", rule.name)));
+    let (store, lib, bus) = (ctx.services.store.clone(), ctx.lib.clone(), ctx.services.bus.clone());
+    let opts = crate::follow::preview::PreviewOpts {
+        now: ctx.now,
+        days: 14,
+        limit: 50,
+        pin_active: ctx.config.parental.pin_active(),
+        max_pending: ctx.config.follow.max_pending as usize,
+    };
+    let h24 = ctx.config.interface.clock_24h;
+    ctx.services.rt.spawn_blocking(move || {
+        let tz = jiff::tz::TimeZone::system();
+        let toast = match store.reader().and_then(|c| crate::follow::preview::preview(&c, &lib, &rule, &opts, &tz, &|| false)) {
+            Ok(p) => Toast { ttl_ms: 8000, ..Toast::info(fui::test_text(&rule.name, &p, h24)) },
+            Err(e) => {
+                tracing::debug!(target: "tuner::follow", "test failed: {e}");
+                Toast::error(format!("Couldn't check the guide for {}", rule.name))
+            }
+        };
+        bus.toast(toast);
+    });
+}
+
+/// Alt+↑/↓ (K/J), the drag grip or the menu's Move: move a rule within the list now (higher
+/// wins a clash), then check the guide.
+pub(super) fn reorder(s: &SettingsScreen, ctx: &mut UiCtx<'_>, id: i64, delta: isize) {
+    let mut data = s.following.data.borrow_mut();
+    let Some(d) = data.as_mut() else { return };
+    let mut order: Vec<FollowRuleId> = d.rules.iter().map(|r| r.id).collect();
+    let Some(i) = order.iter().position(|x| x.0 == id) else { return };
+    let j = (i as isize + delta).clamp(0, order.len() as isize - 1) as usize;
+    if i == j {
+        return;
+    }
+    let v = order.remove(i);
+    order.insert(j, v);
+    d.rules.sort_by_key(|r| order.iter().position(|x| *x == r.id));
+    fui::reorder_rules(ctx.services, order, ctx.now);
 }
 
 /// The guide programme of an Upcoming row: its channel's programme starting at the row's
@@ -349,6 +498,169 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(15));
         }
         assert_eq!(crate::follow::ui::tooltip_line(&slim).as_deref(), Some("From Following: Arsenal"));
+    }
+
+    /// A rule row's menu and reorder: Alt+↑ and the drag grip change the order (higher wins a
+    /// clash), the menu tests the rule against the guide, pauses it (its reminder goes at the
+    /// evaluation that follows) and resumes it, and Delete… asks whether to cancel or keep its
+    /// reminders, then stops following. `x` on an Upcoming row opens the programme's popover.
+    #[test]
+    fn rule_rows_have_a_menu_and_reorder() {
+        use egui_kittest::kittest::Queryable;
+        type H = egui_kittest::Harness<'static, testkit::App<SettingsScreen>>;
+
+        let (mut t, one) = rig();
+        let (pid, ch, _start) = crate::ui::overlays::follow_sheet::tests::fixture(&mut t);
+        let cfg = crate::config::FollowConfig::default();
+        let (arsenal, wimbledon) = seed(&mut t, move |c| {
+            let a = crate::store::follow::save_rule(c, &FollowRule::draft("Arsenal", FollowKind::Team, vec!["Arsenal".into()], &cfg, 0), 100, 0)?;
+            let w =
+                crate::store::follow::save_rule(c, &FollowRule::draft("Wimbledon", FollowKind::Event, vec!["Wimbledon".into()], &cfg, 0), 100, 0)?;
+            Ok((a, w))
+        });
+        let opts = crate::jobs::follow::Opts {
+            now: crate::model::now(),
+            reason: FollowReason::Rules,
+            cfg: crate::config::FollowConfig::default(),
+            pin_active: false,
+            tz: jiff::tz::TimeZone::system(),
+        };
+        let reader = t.services().store.reader().unwrap();
+        let ev = crate::jobs::follow::prepare(&reader, &t.lib, &opts, &|| false).unwrap().expect("evaluated");
+        t.services().store.writer().blocking(move |c| crate::jobs::follow::commit(c, &ev, &opts)).unwrap();
+
+        let stored = |h: &H| crate::store::follow::rules(&h.state().t.services().store.reader().unwrap()).unwrap();
+        let order = |h: &H| stored(h).into_iter().map(|r| r.name).collect::<Vec<_>>();
+        let pending = |h: &H| {
+            crate::store::user::all_reminders(&h.state().t.services().store.reader().unwrap())
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.rule_id == Some(arsenal) && r.state == crate::model::ReminderState::Pending)
+                .count()
+        };
+        let focus = |h: &mut H, item: Item| {
+            let app = h.state_mut();
+            let rows = app.t.with_ctx(|ctx| app.s.rows(ctx));
+            app.s.pane = Pane::Content;
+            app.s.row = rows.iter().position(|r| matches!(r, Row::Item { item: x, .. } if *x == item)).expect("row");
+        };
+        let menu = |h: &mut H| match h.state_mut().nav().as_slice() {
+            [NavRequest::Open(OverlayRequest::ContextMenu(m))] => m.clone(),
+            other => panic!("{other:?}"),
+        };
+        let toasted = |h: &mut H, text: &str| {
+            h.state_mut().pump();
+            h.state().t.toasts.iter().any(|t| t.text.contains(text))
+        };
+
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1600.0, 1000.0));
+        h.state_mut().enter(Route::Settings(SettingsPage::Following));
+        until(&mut h, "the rules", |h| has_label_containing(h, "1 coming") && has_label(h, "Wimbledon"));
+        assert_eq!(order(&h), ["Arsenal", "Wimbledon"]);
+        assert_eq!(pending(&h), 1);
+
+        // x on an Upcoming row: its programme's popover (Watch, Cancel = skip this one)
+        focus(&mut h, Item::Feature(Feature::Following, upcoming_id(0)));
+        h.state_mut().act(Action::ContextMenu);
+        assert_eq!(h.state_mut().nav(), [NavRequest::Open(OverlayRequest::Programme { programme: pid, channel: ch, zap: None })]);
+
+        // Alt+↑ on Wimbledon: first now
+        focus(&mut h, Item::Feature(Feature::Following, wimbledon.0));
+        h.state_mut().act(Action::MoveUp);
+        until(&mut h, "keyboard reorder", |h| order(h) == ["Wimbledon", "Arsenal"]);
+
+        // the drag grip: Arsenal back above Wimbledon
+        h.state_mut().enter(Route::Settings(SettingsPage::Following));
+        until(&mut h, "the reloaded order", |h| {
+            h.state().s.following.data.borrow().as_ref().is_some_and(|d| d.rules.first().is_some_and(|r| r.name == "Wimbledon"))
+        });
+        h.run_steps(2);
+        let grip = |h: &H, name: &str| {
+            let row = h.query_all_by_label(name).next().expect("row").rect();
+            let grips: Vec<egui::Rect> = h.query_all_by_label(glyphs::REORDER).map(|n| n.rect()).collect();
+            grips.into_iter().find(|g| g.center().y >= row.top() - 12.0 && g.center().y <= row.bottom() + 24.0).expect("grip of the row")
+        };
+        let from = grip(&h, "Arsenal").center();
+        let to = h.query_all_by_label("Wimbledon").next().expect("the first rule").rect().center();
+        h.drag_at(from);
+        h.run_steps(1);
+        h.hover_at(egui::pos2(from.x, (from.y + to.y) / 2.0));
+        h.run_steps(1);
+        h.hover_at(egui::pos2(from.x, to.y));
+        h.run_steps(1);
+        h.drop_at(egui::pos2(from.x, to.y));
+        h.run_steps(2);
+        until(&mut h, "drag reorder", |h| order(h) == ["Arsenal", "Wimbledon"]);
+
+        // x: the menu (first: no Move up)
+        h.state_mut().enter(Route::Settings(SettingsPage::Following));
+        until(&mut h, "the reloaded order", |h| {
+            h.state().s.following.data.borrow().as_ref().is_some_and(|d| d.rules.first().is_some_and(|r| r.name == "Arsenal"))
+        });
+        focus(&mut h, Item::Feature(Feature::Following, arsenal.0));
+        h.state_mut().act(Action::ContextMenu);
+        let m = menu(&mut h);
+        assert_eq!(m.title, "Arsenal");
+        let labels: Vec<(&str, bool)> = m.items.iter().map(|i| (i.label.as_str(), i.enabled)).collect();
+        assert_eq!(
+            labels,
+            [
+                ("Edit…", true),
+                ("Pause", true),
+                ("Test against the guide", true),
+                ("Move up (wins more clashes)", false),
+                ("Move down", true),
+                ("Delete…", true)
+            ]
+        );
+        // Edit… opens the rule in the sheet
+        h.state_mut().result(OverlayResult::Chosen(Action::Digit(MENU_EDIT)));
+        let sheet = crate::ui::overlays::follow_sheet::FollowSheetSpec { programme: None, rule: Some(arsenal) };
+        assert_eq!(h.state_mut().nav(), [NavRequest::Open(OverlayRequest::FollowSheet(sheet))]);
+
+        // Test against the guide: a toast of what it finds, by the rule's name only
+        h.state_mut().act(Action::ContextMenu);
+        let _ = menu(&mut h);
+        h.state_mut().result(OverlayResult::Chosen(Action::Digit(MENU_TEST)));
+        until(&mut h, "the test toast", |h| toasted(h, "Arsenal: 1 in the next 14 days · next "));
+        assert!(!h.state().t.toasts.iter().any(|t| t.text.contains("Chelsea")), "spoiler-safe");
+
+        // Pause: stored, shown, and its reminder goes at the evaluation that follows
+        h.state_mut().act(Action::ContextMenu);
+        let _ = menu(&mut h);
+        h.state_mut().result(OverlayResult::Chosen(Action::Digit(MENU_TOGGLE)));
+        until(&mut h, "paused", |h| stored(h).iter().any(|r| r.id == arsenal && !r.enabled));
+        assert!(toasted(&mut h, "Paused Arsenal — its coming reminder is cancelled"));
+        until(&mut h, "its reminder cancelled", |h| pending(h) == 0);
+        until(&mut h, "the row says paused", |h| has_label_containing(h, "paused"));
+        h.state_mut().act(Action::ContextMenu);
+        let m = menu(&mut h);
+        assert_eq!(m.items[1].label, "Resume");
+        h.state_mut().result(OverlayResult::Chosen(Action::Digit(MENU_TOGGLE)));
+        until(&mut h, "resumed", |h| stored(h).iter().any(|r| r.id == arsenal && r.enabled));
+        until(&mut h, "its reminder back", |h| pending(h) == 1);
+
+        // Delete…: cancel or keep its reminder; keep → the reminder is the user's own
+        h.state_mut().enter(Route::Settings(SettingsPage::Following));
+        until(&mut h, "the owned count", |h| h.state().s.following.data.borrow().as_ref().is_some_and(|d| d.owned.get(&arsenal) == Some(&1)));
+        focus(&mut h, Item::Feature(Feature::Following, arsenal.0));
+        h.state_mut().act(Action::ContextMenu);
+        let _ = menu(&mut h);
+        h.state_mut().result(OverlayResult::Chosen(Action::Digit(MENU_DELETE)));
+        let m = menu(&mut h);
+        assert_eq!(m.title, "Stop following Arsenal?");
+        let labels: Vec<&str> = m.items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["Delete it and cancel its reminder", "Delete it, keep the reminder as my own"]);
+        h.state_mut().result(OverlayResult::Chosen(Action::Digit(MENU_DELETE_KEEP)));
+        until(&mut h, "deleted", |h| order(h) == ["Wimbledon"]);
+        until(&mut h, "the toast", |h| toasted(h, "Stopped following Arsenal"));
+        let mine = crate::store::user::all_reminders(&h.state().t.services().store.reader().unwrap())
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.state == crate::model::ReminderState::Pending && r.rule_id.is_none())
+            .count();
+        assert_eq!(mine, 1, "kept as the user's own");
+        assert!(!has_label(&h, "Arsenal"));
     }
 
     /// Quiet hours as typed: both spellings of the dash, hours alone, four digits; empty

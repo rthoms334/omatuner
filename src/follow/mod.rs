@@ -105,8 +105,11 @@ pub enum FollowEvent {
     PreviewReady { rev: u64, preview: plan::Preview },
     /// New matches to announce in the app (no notification server answered): "Following: 3
     /// new" with up to two lines ("Arsenal · Sat 12:30 · Sky Sports Main Event") and "+1
-    /// more"; the toast's Open goes to Settings ▸ Following ▸ Upcoming. Spoiler-safe already.
+    /// more"; the toast's Open goes to Settings ▸ Following. Spoiler-safe already.
     Summary { title: String, lines: Vec<String> },
+    /// The user picked Open on the summary's desktop notification (the window was raised
+    /// already): show Settings ▸ Following.
+    Open,
 }
 
 /// The folded terms of spoiler-safe rules, as virtual spoiler-guard topics ("until seen",
