@@ -361,6 +361,16 @@ types and accessors are implemented in the skeleton and built with `from_parts`.
 the explicit-content `Visibility`, §20.3) also builds `VodIndex::stacks` — the copies of one
 title in "All playlists" (§29.11).
 
+A build reads ONE snapshot: it opens a read transaction on its connection (or reads in the
+caller's transaction, when one is open). The channels are read on a thread of their own, on a
+second read-only connection (`store::open_reader`), while the first one reads the movies and
+series. The second connection's read transaction must be on the same snapshot. It reads
+`PRAGMA data_version` before the first connection's transaction starts and again when its own
+starts. The value only changes when another connection committed in between. If it changed,
+the build tries again (3 times), then reads everything on the first connection. Without a path
+(an in-memory database) or inside a caller's transaction, the build also uses one connection.
+This saves about 100 ms on a real-size catalogue (`benches/startup.rs`).
+
 Favourites live OUTSIDE the immutable snapshot: the app owns `favs: FavIndex` (copied from each
 new `Library`), exposed as `UiCtx::favs`; a toggle submits `store::user::set_favourite` and
 patches `favs.apply_toggle` immediately; `DataScope::Favourites` reloads it with

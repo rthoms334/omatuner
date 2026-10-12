@@ -124,11 +124,29 @@ New gates in `benches/startup.rs`:
 - the catalogue load with the rule takes under 550 ms (best of 7);
 - the default rule costs at most 1.25 × the rule with titles kept.
 
+## Follow-up: channels beside the VOD (gaps/perf)
+
+The channels are now read on a second reader, on their own thread, while the first reader
+reads the movies and series (DESIGN §5.4). Both readers read one snapshot. The build opens a
+read transaction on its connection. Before that, the second connection reads
+`PRAGMA data_version`, and it reads it again after it starts its own transaction. If a write
+committed in between, the value differs, and the build tries again (3 times) or reads
+everything on one connection. `store::open_reader(path)` is now `pub(crate)`. Interleaved A/B
+on the same catalogue database, best of 7, same machine:
+
+| Variant | before | after |
+|---|---|---|
+| default English rule | 355 ms | 251 ms |
+| rule, titles kept | 330 ms | 229 ms |
+| no rule | 430 ms | 333 ms |
+| 100k-channel profile (median of 5) | 208 ms | 184 ms |
+
+The `channels` step is now the wait for the thread after the VOD steps (0 ms on the catalogue).
+On the 100k profile, the time until the library reaches the app fell from about 900 ms to
+about 650 ms.
+
 ## Not done (possible follow-ups)
 
-- **Load channels and VOD in parallel on a second reader.** This would save about 100 ms more.
-  It needs `store::configure` or a `store::open_reader(path)` to become `pub(crate)`, which is an
-  integrator-owned file.
 - **`stacks::dominant_market`** (owned by stacks) still hashes a `GroupId` for each title and
   group. It costs a few milliseconds here.
 
