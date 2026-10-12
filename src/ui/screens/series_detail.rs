@@ -1297,6 +1297,9 @@ mod tests {
             c.execute("UPDATE series SET details_at = NULL WHERE id = ?1", [bravo])?;
             Ok(())
         });
+        // what a refresh announces (the seed itself sends nothing: without this the page only
+        // reloaded on a late Progress event from the marks above)
+        h.state().t.services().bus.send(AppEvent::Data(DataScope::Vod));
         until(&mut h, "Bravo unloaded", |h| h.state().s.data.as_ref().is_some_and(|d| !d.unloaded.is_empty()));
         h.state_mut().result(OverlayResult::Chosen(Action::Digit(MENU_SEASON_WATCHED)));
         assert!(h.state().s.fetch.busy());
