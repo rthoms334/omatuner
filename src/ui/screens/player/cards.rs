@@ -20,6 +20,11 @@ pub(super) struct NextEpisode {
 
 pub(super) const NEXT_EPISODE_DELAY: Duration = Duration::from_secs(10);
 
+/// The player menu's "Play here" and "Convert this channel" (codes above typed digits and the
+/// Ctrl+O copies, below multi-view's `CLOSE_OTHER`).
+pub(super) const CAST_PLAY_HERE: u8 = 248;
+pub(super) const CAST_CONVERT: u8 = 249;
+
 impl PlayerScreen {
     /// Up next's player keys (`u` panel, `n` / `N`; DESIGN §32): `None` when not one of them
     /// or Up next is off. Q-ui.
@@ -261,6 +266,79 @@ impl PlayerScreen {
             }
         }
         ctx.video.set_other_copy(self.offered(snap).map(|o| o.label.clone()));
+    }
+
+    // ------------------------------------------------------------------ casting (DESIGN §40)
+
+    /// `C`, the OSD's Cast control and the menu's "Cast to a TV…": the device picker.
+    pub(super) fn cast_menu(&mut self, ctx: &mut UiCtx<'_>) {
+        ctx.open(OverlayRequest::CastPicker);
+    }
+
+    /// The player menu's casting items: "Cast to a TV…" (also to switch TV), and while casting
+    /// Stop casting, Play here and Convert this channel (L3 for this item on this TV).
+    pub(super) fn cast_menu_items(&self, ctx: &UiCtx<'_>, k: KeyContext) -> Vec<crate::ui::overlays::MenuItem> {
+        let Some(view) = ctx.player.cast.as_ref() else {
+            return if crate::cast::ENABLED { vec![menu_item(glyphs::CAST, "Cast to a TV…", Action::CastMenu, true, k)] } else { Vec::new() };
+        };
+        vec![
+            menu_item(glyphs::CAST_CONNECTED, "Cast to a TV…", Action::CastMenu, true, k),
+            menu_item(glyphs::STOP, "Stop casting", Action::StopCasting, true, k),
+            menu_item(glyphs::PLAY, "Play here", Action::Digit(CAST_PLAY_HERE), true, k),
+            menu_item(glyphs::SYNC, "Convert this channel", Action::Digit(CAST_CONVERT), view.level != Some(crate::model::CastLevel::Converted), k),
+        ]
+    }
+
+    /// What the casting card adds to the snapshot: the programme now through the spoiler guard,
+    /// like the OSD's, and whether converting is off (set before each paint, DESIGN §40 §3.3).
+    pub(super) fn update_cast_context(&mut self, ctx: &mut UiCtx<'_>, snap: &PlayerSnapshot) {
+        if snap.cast.is_none() {
+            return;
+        }
+        let now = snap
+            .playable
+            .as_ref()
+            .filter(|p| matches!(p.kind, PlayableKind::Live))
+            .and_then(|p| match p.media {
+                MediaRef::Channel(id) => ctx.lib.live.get(id).cloned(),
+                _ => None,
+            })
+            .and_then(|c| live::now_next_of(ctx, &c))
+            .and_then(|n| n.now)
+            .map(|now| {
+                let spoilers = crate::ui::widgets::spoiler::Spoilers::of(ctx);
+                crate::ui::video_host::CastNow {
+                    line: self.banner_cats.shown(ctx, &now).line(&spoilers),
+                    range: time_range(now.start, now.stop, ctx.config.interface.clock_24h),
+                    progress: now.progress(ctx.now),
+                }
+            });
+        let convert_off = ctx.config.cast.convert == crate::config::CastConvert::Never;
+        ctx.video.set_cast_context(crate::ui::video_host::CastContext { now, convert_off });
+    }
+
+    /// A casting card button (DESIGN §40 §3.3, §3.4).
+    pub(super) fn cast_state_action(&mut self, ctx: &mut UiCtx<'_>, action: StateAction, snap: &PlayerSnapshot) {
+        let Some(view) = snap.cast.as_ref() else { return };
+        let cast = ctx.services.agent.cast();
+        match action {
+            StateAction::StopCasting => ctx.play(PlayerCommand::StopCasting { play_here: false }),
+            StateAction::PlayHere => ctx.play(PlayerCommand::StopCasting { play_here: true }),
+            // nothing is replayed from here: with nothing playing the controller takes the last item
+            StateAction::TryAgain | StateAction::CastAgain => ctx.play(PlayerCommand::CastTo { device: view.device, play: None }),
+            StateAction::ConvertChannel => cast.convert_current(),
+            // pkexec's dialog is Omarchy's; the firewall card shows "Waiting for your password…"
+            StateAction::AllowFirewall => {
+                if cast.firewall().is_some_and(|d| d.can_allow()) {
+                    cast.firewall_allow();
+                }
+                ctx.open(OverlayRequest::CastFirewall);
+            }
+            StateAction::ShowCommand => ctx.open(OverlayRequest::CastFirewall),
+            StateAction::Pair => ctx.open(OverlayRequest::CastPair(view.device)),
+            StateAction::Retry | StateAction::LastChannel | StateAction::OtherCopy | StateAction::Stop => {}
+        }
+        self.show_banner(ctx);
     }
 
     /// Nothing playing: what to do about it and a button for it. In the full window a click

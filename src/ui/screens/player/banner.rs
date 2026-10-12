@@ -14,6 +14,26 @@ pub(super) enum Flash {
     Zoom,
 }
 
+/// The banner when a volume key or the speaker is used on a TV without a volume (AirPlay).
+pub(super) const TV_VOLUME: &str = "Use the TV remote for volume";
+/// The banner for a key that does nothing on a TV: tracks, subtitles, aspect and zoom.
+pub(super) const NOT_WHILE_CASTING: &str = "Not available while casting";
+
+/// The picture is on a TV that takes no volume from here (DESIGN §40 §11.3).
+pub(super) fn tv_volume(snap: &PlayerSnapshot) -> bool {
+    snap.cast.as_ref().is_some_and(|c| !c.volume)
+}
+
+/// What a cast's quality level is called in the info panel (DESIGN §40 §8.3).
+fn level_label(l: crate::model::CastLevel) -> &'static str {
+    use crate::model::CastLevel as L;
+    match l {
+        L::Original => "as the provider sends it",
+        L::Repackaged => "repackaged",
+        L::Converted => "converted on this computer",
+    }
+}
+
 pub(super) fn flash_text(f: Flash, snap: &PlayerSnapshot, zoom: &usize) -> String {
     match f {
         Flash::Audio => format!("{} {}", glyphs::AUDIO_TRACK, snap.tracks.selected_audio().map_or_else(|| "No audio track".into(), |a| a.label())),
@@ -33,6 +53,12 @@ pub(super) fn flash_text(f: Flash, snap: &PlayerSnapshot, zoom: &usize) -> Strin
 }
 
 impl PlayerScreen {
+    /// A banner line (like "No channel 7") that shows with the OSD for a moment.
+    pub(super) fn cast_notice(&mut self, ctx: &UiCtx<'_>, text: &str) {
+        self.flash_text = Some((text.to_owned(), Instant::now()));
+        self.show_banner(ctx);
+    }
+
     pub(super) fn show_banner(&mut self, ctx: &UiCtx<'_>) {
         self.banner_until = Some(Instant::now() + Duration::from_millis(u64::from(ctx.config.interface.osd_timeout_ms)));
         self.banner_dismissed = false;
@@ -95,9 +121,24 @@ impl PlayerScreen {
                 ));
                 let kbps = |b: Option<f64>| b.map_or_else(|| "–".into(), |b| format!("{:.0} kb/s", b / 1000.0));
                 lines.push(format!("Bitrate  video {} · audio {}", kbps(i.video_bitrate), kbps(i.audio_bitrate)));
-                lines.push(format!("Decoder  {}", i.hwdec.clone().filter(|h| !h.is_empty() && h != "no").unwrap_or_else(|| "software".into())));
-                lines.push(format!("Dropped  {}", i.dropped_frames.map_or_else(|| "–".into(), |d| d.to_string())));
-                lines.push(format!("Cache    {}", i.cache_secs.map_or_else(|| "–".into(), |c| format!("{c:.1} s"))));
+                // the probe's view of the stream (DESIGN §40 §8.2): the decoder, dropped frames
+                // and cache are mpv's, which isn't playing it
+                match &snap.cast {
+                    Some(c) => {
+                        lines.push(format!("Casting  {} · {}", c.name, c.level.map_or("starting", level_label)));
+                        if let Some(s) = c.behind_live_s {
+                            lines.push(format!("Behind   about {s} s"));
+                        }
+                    }
+                    None => {
+                        lines.push(format!(
+                            "Decoder  {}",
+                            i.hwdec.clone().filter(|h| !h.is_empty() && h != "no").unwrap_or_else(|| "software".into())
+                        ));
+                        lines.push(format!("Dropped  {}", i.dropped_frames.map_or_else(|| "–".into(), |d| d.to_string())));
+                        lines.push(format!("Cache    {}", i.cache_secs.map_or_else(|| "–".into(), |c| format!("{c:.1} s"))));
+                    }
+                }
                 if let Some(c) = &i.container {
                     lines.push(format!("Stream   {c}"));
                 }

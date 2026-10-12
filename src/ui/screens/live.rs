@@ -2209,7 +2209,8 @@ impl LiveScreen {
         self.rest = None;
         let snap = ctx.player;
         // never replaces something the user started (only idle or its own autoplay)
-        let allowed = snap.state == PlayerState::Idle || snap.origin == Some(PlayOrigin::LivePreview);
+        // never while casting: moving the cursor must not retune the TV (DESIGN §40 §11.4)
+        let allowed = snap.cast.is_none() && (snap.state == PlayerState::Idle || snap.origin == Some(PlayOrigin::LivePreview));
         let Some(c) = ctx.lib.live.get(ch) else { return };
         if !allowed || playing_channel(snap) == Some(ch) || c.unsupported || (c.locked && !ctx.parental.is_unlocked(&ctx.config.parental)) {
             return;
