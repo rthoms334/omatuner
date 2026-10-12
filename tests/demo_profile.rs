@@ -1,6 +1,7 @@
 //! The screenshot demo profile (`examples/demo_profile.rs`) builds through the real import
 //! jobs and gives the app what the README shots need: three playlists, stacks across and
-//! inside playlists, country-tagged categories, a guide, quality badges and user data.
+//! inside playlists, country-tagged categories, a guide, quality badges, user data and the v0.2
+//! features (Up next, Following, reminders, Guide fixes, multi-view's connection limits).
 
 #[path = "../examples/demo_profile.rs"]
 #[allow(dead_code)]
@@ -40,15 +41,37 @@ fn demo_profile_builds_a_library_with_stacks() {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
-    assert!(badged >= 40 && unmapped == 0, "{badged} badged, {unmapped} without guide");
+    assert!(badged >= 40 && unmapped == 2, "{badged} badged, {unmapped} without guide (Guide fixes)");
     let uhd: i64 = c.query_row("SELECT count(*) FROM channel WHERE quality = ?1", [Quality::Uhd as i64], |r| r.get(0)).unwrap();
     assert!(uhd >= 4);
 
-    // the user's side: favourites, recently watched, Continue Watching, a reminder
+    // the user's side: favourites, recently watched, Continue Watching, reminders
     assert!(!lib.favs.is_empty() && lib.recent_channels.len() >= 4);
-    let progress: i64 = c.query_row("SELECT count(*) FROM watch_progress", [], |r| r.get(0)).unwrap();
-    let reminders: i64 = c.query_row("SELECT count(*) FROM reminder", [], |r| r.get(0)).unwrap();
-    assert_eq!((progress, reminders), (3, 1));
+    let n = |sql: &str| -> i64 { c.query_row(sql, [], |r| r.get(0)).unwrap() };
+    assert_eq!(n("SELECT count(*) FROM watch_progress"), 3);
+    assert_eq!(n("SELECT count(*) FROM reminder WHERE rule_id IS NULL"), 3);
+    assert_eq!(n("SELECT count(*) FROM reminder WHERE rule_id IS NULL AND mode = 'switch'"), 1);
+    // nothing fires within the hour (screenshots run on a copy, never interrupted)
+    let soon = tuner::model::now() + 3600;
+    assert_eq!(n(&format!("SELECT count(*) FROM reminder WHERE start - CASE WHEN lead_s > 0 THEN lead_s ELSE 0 END < {soon}")), 0);
+
+    // Up next: the trilogy (three titles, not one stack) and an episode, the first film played
+    let rows = tuner::store::queue::load(&c).unwrap();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows.iter().filter(|r| r.state == tuner::queue::RowState::Played).count(), 1);
+    let trilogy: Vec<u32> = movies.iter().enumerate().filter(|(_, m)| m.name.contains("Starling Bay")).map(|(i, _)| i as u32).collect();
+    let stacks: std::collections::HashSet<_> = trilogy.iter().map(|i| lib.vod.stacks(true).stack_of(*i).map_or(u32::MAX - i, |s| s.0)).collect();
+    assert_eq!(stacks.len(), 3, "the three films are separate titles");
+
+    // Following: a team with two fixtures in the guide, a news flash, a listed show
+    assert_eq!(n("SELECT count(*) FROM follow_rule"), 3);
+    let team = "SELECT count(*) FROM reminder r JOIN follow_rule f ON f.id = r.rule_id WHERE f.kind = 'team'";
+    assert_eq!(n(team), 2, "Northport Albion's two live fixtures");
+    assert!(n("SELECT count(*) FROM follow_match WHERE state = 'listed'") >= 1);
+
+    // multi-view: one connection per paid playlist
+    let limits = tuner::store::sources::account_limits(&c).unwrap();
+    assert_eq!(limits.iter().filter(|(_, m)| *m == Some(1)).count(), 2);
 
     let refs = std::fs::read_to_string(profile.join("demo/refs.env")).unwrap();
     assert!(refs.contains("NORTHWIND_ID=") && refs.contains("PLAY_DOCS='"), "{refs}");

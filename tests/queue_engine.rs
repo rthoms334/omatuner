@@ -357,6 +357,29 @@ fn the_engine_adds_plays_advances_and_never_plays_after_a_restart() {
     assert!(again.player.plays().is_empty(), "never auto-plays");
 }
 
+/// The app starts the engine before its first library: the stored rows show as soon as one
+/// is published (not at the next minute's re-check, nor only after a command).
+#[test]
+fn stored_rows_show_once_the_first_library_is_published() {
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    let s = store();
+    let src = w(&s, |c| seed::seed_source(c, "TV"));
+    w(&s, move |c| seed::seed_movies(c, src, 3));
+    w(&s, move |c| q::add(c, &[row(movie_ref(src, 0)), row(movie_ref(src, 1))], Insert::End, NOW));
+    let shared = Arc::new(AppShared::default());
+    let snaps = watch::Sender::new(Arc::new(PlayerSnapshot::default()));
+    shared.set_main_player(snaps.subscribe());
+    let config: SharedConfig = Arc::new(RwLock::new(Arc::new(Config::default())));
+    let (bus, _events) = tuner::msg::EventBus::new(None);
+    let deps = EngineDeps { store: s.clone(), config, player: Arc::new(Recorder::default()), bus };
+    let queue = tuner::queue::service::spawn(rt.handle(), shared.clone(), deps);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(queue.snapshot().rows.is_empty(), "no library yet: nothing shows");
+    let lib = tuner::store::library::load(&s.reader().unwrap()).unwrap();
+    let _ = shared.publish_library(&Arc::new(lib));
+    until("the rows", || queue.snapshot().rows.len() == 2);
+}
+
 /// An episode that ends outside Up next gets the engine's next-episode countdown (any
 /// placement, a hidden window): the next episode plays. When the PIN window closed during the
 /// episode and its series is locked, it doesn't play: "Next episode is locked".

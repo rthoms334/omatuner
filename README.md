@@ -11,7 +11,7 @@ current theme live, corners are square, and the font is JetBrains Mono Nerd Font
 The video is rendered by an embedded libmpv inside a native Rust window (egui), so there is no
 browser or Electron runtime and no separate player window.
 
-![Live TV: groups from three playlists, channels with now/next and quality badges, and the
+![Live TV: groups from all playlists, channels with now/next and quality badges, and the
 preview playing](docs/screenshots/live.png)
 
 - [Screenshots](#screenshots)
@@ -36,7 +36,7 @@ preview playing](docs/screenshots/live.png)
 
 <table>
 <tr>
-<td width="50%"><img src="docs/screenshots/home.png" alt="Home screen"><br><b>Home</b>: Continue watching, favourites lists and recently added titles.</td>
+<td width="50%"><img src="docs/screenshots/home.png" alt="Home screen"><br><b>Home</b>: Up next, Continue watching, favourites lists and recently added titles.</td>
 <td width="50%"><img src="docs/screenshots/guide.png" alt="TV guide"><br><b>Guide</b>: a day of programmes; the bell marks a reminder.</td>
 </tr>
 <tr>
@@ -57,7 +57,15 @@ preview playing](docs/screenshots/live.png)
 </tr>
 <tr>
 <td width="50%"><img src="docs/screenshots/popout.png" alt="Pop-out player"><br><b>Pop-out</b> (<code>o</code>): a small player pinned on every workspace (Hyprland).</td>
-<td width="50%"></td>
+<td width="50%"><img src="docs/screenshots/multiview.png" alt="Multi-view, two pictures side by side"><br><b>Multi-view</b> (<code>Ctrl+M</code>): two channels side by side, each from its own playlist.</td>
+</tr>
+<tr>
+<td width="50%"><img src="docs/screenshots/upnext.png" alt="Up next"><br><b>Up next</b> (<code>Alt+6</code>): films, episodes and programmes queued to play one after another.</td>
+<td width="50%"><img src="docs/screenshots/following.png" alt="Settings, Following"><br><b>Following</b>: a team, a show and a daily news flash, with what's coming in the guide.</td>
+</tr>
+<tr>
+<td width="50%"><img src="docs/screenshots/reminders.png" alt="Settings, Reminders"><br><b>Reminders</b>: notifications and automatic switches into the pop-out, yours and Following's.</td>
+<td width="50%"><img src="docs/screenshots/guidefix.png" alt="Guide fixes"><br><b>Guide fixes</b>: guide coverage per playlist and the channels to fix.</td>
 </tr>
 </table>
 
@@ -245,7 +253,7 @@ fontconfig, JetBrains Mono Nerd Font, …):
 
 ```sh
 sha256sum -c --ignore-missing SHA256SUMS
-sudo pacman -U omatuner-0.1.0-1-x86_64.pkg.tar.zst     # or …-aarch64.pkg.tar.zst
+sudo pacman -U omatuner-0.2.0-1-x86_64.pkg.tar.zst     # or …-aarch64.pkg.tar.zst
 ```
 
 The package installs:
@@ -271,7 +279,7 @@ makepkg -si          # builds this checkout, smoke-tests the binary, installs th
 
 - `makepkg --nocheck -si` skips the smoke test. The test suite is `cargo test` (see Development).
 - The PKGBUILD builds the checkout it sits in (no download of the app itself), so check out the
-  tag you want first, e.g. `git checkout v0.1.0`.
+  tag you want first, e.g. `git checkout v0.2.0`.
 
 ### With cargo
 

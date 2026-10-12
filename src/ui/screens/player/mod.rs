@@ -859,8 +859,8 @@ mod tests {
             sync(h);
             real(h).muted
         });
-        h.run_steps(1);
-        assert!(has_label(&h, "Unmute"), "the speaker says what a click does");
+        // the label follows the player's state a frame or more later (slow under a loaded test run)
+        until(&mut h, "the speaker says what a click does (Unmute)", |h| has_label(h, "Unmute"));
         h.hover_at(c);
         h.drag_at(c);
         h.drop_at(c);
