@@ -2187,7 +2187,7 @@ fn every_wp11_key_is_in_help() {
         "Play fullscreen",
         "Show in TV guide",
         "Details / edit information",
-        "Assign EPG channel",
+        "Assign guide channel",
         "Sort & view options…",
     ] {
         assert!(list.contains(&h), "list help lacks {h}");

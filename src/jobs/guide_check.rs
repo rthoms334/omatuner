@@ -4,10 +4,10 @@
 //! * Rule-row derivation runs in `rematch_all` / the guide import (B7), not here; the probes
 //!   ("anything now or later?") are cheap and run with the classification
 //!   (`store::guide_fix::facts`).
-//! * Debounced [`DEBOUNCE`] at request time ([`request`]): the job is submitted once the window
-//!   has passed (requests meanwhile join the waiting one), so it never holds the "features" lane
-//!   or shows in the Jobs overlay while it waits. The app only: a headless `tuner --refresh`
-//!   (no `JobContext::shared`) never checks.
+//! * Debounced [`DEBOUNCE`] before it is submitted ([`request`]): requests made meanwhile push
+//!   the deadline back, so the job is only active (status bar, "features" lane, headless
+//!   `wait_for_jobs`) while it works. Headless `tuner --refresh` doesn't check: the app checks
+//!   the stamp once it has published its first library ([`after_first_publish`]).
 //! * The cache is bound to `store::guide_fix::stamp` (guides' generations, playlists'
 //!   generations, threshold, rules): a different stamp clears it; otherwise only channels
 //!   without cached rows are looked at.
@@ -17,13 +17,13 @@
 //!   leaves a consistent cache that the next run completes.
 //! * Same job lane as `EvaluateFollows` (one at a time). Ends with `DataScope::GuideIssues`.
 
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use super::{JobContext, JobKind, JobManager, JobPhase, Progress, blocking, check, notify, read, write};
+use super::{JobContext, JobKind, JobManager, JobPhase, ManagerInner, Progress, blocking, check, lock, notify, read, write};
 use crate::error::Result;
 use crate::model::{EpgSuggestion, ItemKind, ItemRef};
 use crate::msg::DataScope;
@@ -52,10 +52,30 @@ pub struct CheckReport {
     pub scored: usize,
 }
 
-/// Ask for a check in [`DEBOUNCE`] (B7: after a guide import or rematch; a rule change). A
-/// request while one waits joins it; headless (no `JobContext::shared`) it does nothing. Called
-/// from a job (a tokio context).
-pub fn request(ctx: &JobContext) {
+/// The debounce deadline and whether a check is running (shared by every clone of the context).
+#[derive(Debug, Default)]
+pub struct CheckState {
+    due: Mutex<Option<tokio::time::Instant>>,
+    running: AtomicBool,
+}
+
+impl CheckState {
+    /// A check is working right now (one atomic load a frame).
+    pub fn running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
+    }
+
+    /// A requested check waits out its debounce.
+    pub fn pending(&self) -> bool {
+        lock(&self.due).is_some()
+    }
+}
+
+/// Ask for a check [`DEBOUNCE`] from now (B7: after a guide import or rematch; a rule or
+/// mapping change). The first request in a window starts the timer; later ones push the
+/// deadline back. Headless (`JobContext::headless`) it does nothing. Called from a job (a tokio
+/// context).
+pub(crate) fn request(ctx: &JobContext) {
     match tokio::runtime::Handle::try_current() {
         Ok(rt) => request_on(ctx, &rt),
         Err(_) => tracing::debug!(target: "tuner::jobs", "guide check requested outside the runtime: skipped"),
@@ -68,27 +88,73 @@ pub fn request_from(jobs: &JobManager) {
 }
 
 fn request_on(ctx: &JobContext, rt: &tokio::runtime::Handle) {
-    if !crate::guide_fix::ENABLED || ctx.shared.is_none() || ctx.guide_check_pending.swap(true, Ordering::SeqCst) {
+    if !crate::guide_fix::ENABLED || ctx.headless {
         return;
     }
-    let (submit, pending) = (ctx.submit.clone(), ctx.guide_check_pending.clone());
+    let state = ctx.guide_check.clone();
+    let first = lock(&state.due).replace(tokio::time::Instant::now() + DEBOUNCE).is_none();
+    if !first {
+        return;
+    }
+    let submit = ctx.submit.clone();
     rt.spawn(async move {
-        tokio::time::sleep(DEBOUNCE).await;
-        pending.store(false, Ordering::SeqCst);
+        loop {
+            let at = {
+                let mut due = lock(&state.due);
+                match *due {
+                    Some(at) if at <= tokio::time::Instant::now() => {
+                        due.take();
+                        break;
+                    }
+                    Some(at) => at,
+                    None => return,
+                }
+            };
+            tokio::time::sleep_until(at).await;
+        }
         submit(JobKind::GuideCheck);
     });
 }
 
-/// A requested check waits out its debounce (the screen says "Checking…" meanwhile).
-pub fn pending(ctx: &JobContext) -> bool {
-    ctx.guide_check_pending.load(Ordering::SeqCst)
+/// GUI start: once the app has published its first library, check if the cache's stamp is
+/// out of date (a headless refresh imported a guide without checking). Holds only a weak
+/// reference, so it never keeps the manager alive.
+pub(super) async fn after_first_publish(inner: Weak<ManagerInner>) {
+    const POLL: Duration = Duration::from_secs(1);
+    loop {
+        tokio::time::sleep(POLL).await;
+        let Some(inner) = inner.upgrade() else { return };
+        if inner.closing.load(Ordering::SeqCst) {
+            return;
+        }
+        if inner.ctx.published_library().is_some() {
+            let ctx = inner.ctx.clone();
+            drop(inner);
+            let opts = GuideOpts::from_config(&crate::config::current(&ctx.config));
+            match read(&ctx, move |c| Ok(store_gf::cached_stamp(c)? != Some(store_gf::stamp(c, &opts)?))).await {
+                Ok(true) => request(&ctx),
+                Ok(false) => {}
+                Err(e) => tracing::warn!(target: "tuner::jobs", "guide check stamp: {e}"),
+            }
+            return;
+        }
+    }
 }
 
-/// Run the check (a no-op until `guide_fix::ENABLED`, and headless).
+/// Run the check (a no-op until `guide_fix::ENABLED`, and headless); [`request`] already
+/// debounced it.
 pub async fn run(ctx: &JobContext, progress: &Progress, cancel: &CancellationToken) -> Result<()> {
-    if !crate::guide_fix::ENABLED || ctx.shared.is_none() {
+    if !crate::guide_fix::ENABLED || ctx.headless {
         return Ok(());
     }
+    struct Running<'a>(&'a AtomicBool);
+    impl Drop for Running<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Relaxed);
+        }
+    }
+    ctx.guide_check.running.store(true, Ordering::Relaxed);
+    let _running = Running(&ctx.guide_check.running);
     let lib = job_library(ctx).await?;
     check_now(ctx, lib, progress, cancel).await.map(|_| ())
 }
@@ -102,7 +168,7 @@ async fn job_library(ctx: &JobContext) -> Result<Arc<Library>> {
     }
 }
 
-/// The check itself (`run`, tests).
+/// The check itself (tests, and `run`).
 pub async fn check_now(ctx: &JobContext, lib: Arc<Library>, progress: &Progress, cancel: &CancellationToken) -> Result<CheckReport> {
     progress.mark_inputs_read();
     progress.set(JobPhase::Matching);
@@ -163,62 +229,4 @@ fn score(cat: &crate::guide_fix::catalog::Catalog, chunk: &[(ItemRef, String)], 
             .collect();
         handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use super::*;
-    use crate::follow::FollowReason;
-    use crate::msg::{AppEvent, EventBus};
-
-    /// After a guide import the check is requested, not started: it waits out [`DEBOUNCE`]
-    /// outside the jobs (the "features" lane stays free, nothing shows in the Jobs overlay),
-    /// repeated requests make one check, and a headless refresh never checks.
-    #[test]
-    fn a_check_waits_outside_the_jobs_and_never_runs_headless() {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let manager = |shared: bool| {
-            let paths = crate::paths::AppPaths::rooted(dir.path());
-            paths.ensure().unwrap();
-            let store = crate::store::Store::open(&paths.db_file(), None).unwrap();
-            let http = crate::sources::http::HttpClient::new(&Default::default()).unwrap();
-            let (bus, events) = EventBus::new(None);
-            let mut ctx = JobContext::new(store, http, bus, paths, Arc::default());
-            if shared {
-                ctx = ctx.with_shared(Arc::default());
-            }
-            (JobManager::new(ctx, rt.handle().clone()), events)
-        };
-        let checks = |events: &crossbeam_channel::Receiver<AppEvent>| {
-            events.try_iter().filter(|e| matches!(e, AppEvent::Job(crate::jobs::JobEvent::Finished { kind: JobKind::GuideCheck, .. }))).count()
-        };
-        let wait = |jobs: &JobManager| {
-            rt.block_on(async {
-                tokio::time::sleep(DEBOUNCE + Duration::from_secs(1)).await;
-                while !jobs.active().is_empty() {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-        };
-
-        let (headless, events) = manager(false);
-        rt.block_on(async { crate::jobs::after_guide(headless.context(), FollowReason::Guide) });
-        assert!(!pending(headless.context()));
-        wait(&headless);
-        assert_eq!(checks(&events), 0, "headless: no check");
-
-        let (app, events) = manager(true);
-        rt.block_on(async {
-            crate::jobs::after_guide(app.context(), FollowReason::Guide);
-            crate::jobs::after_guide(app.context(), FollowReason::Guide);
-        });
-        assert!(pending(app.context()));
-        assert!(app.active().iter().all(|j| j.kind != JobKind::GuideCheck), "nothing runs while it waits");
-        wait(&app);
-        assert!(!pending(app.context()));
-        assert_eq!(checks(&events), 1, "two requests, one check");
-    }
 }

@@ -394,10 +394,10 @@ impl EpgMappingScreen {
         }
     }
 
-    /// A guide check is running, queued or waiting out its debounce.
+    /// A guide check is running or waiting out its debounce (two cheap reads a frame).
     fn checking(ctx: &UiCtx<'_>) -> bool {
-        let jobs = &ctx.services.jobs;
-        crate::jobs::guide_check::pending(jobs.context()) || jobs.active().iter().any(|j| matches!(j.kind, crate::jobs::JobKind::GuideCheck))
+        let state = &ctx.services.jobs.context().guide_check;
+        state.pending() || state.running()
     }
 
     fn reload_catalog(&mut self, ctx: &UiCtx<'_>) {

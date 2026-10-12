@@ -370,7 +370,7 @@ impl SearchOverlay {
                         lists,
                         mi(glyphs::GUIDE, "Show in TV guide", Action::OpenInGuide, "Ctrl+G"),
                         mi(glyphs::INFO, "Edit information…", Action::ShowDetails, "Ctrl+I"),
-                        mi(glyphs::GUIDE, "Assign EPG channel…", Action::AssignEpg, "Ctrl+E"),
+                        mi(glyphs::GUIDE, "Assign guide channel…", Action::AssignEpg, "Ctrl+E"),
                     ],
                     SearchTarget::Movie(_) => vec![
                         mi(glyphs::PLAY, "Play now", Action::ActivateAlt, "Shift+Enter"),

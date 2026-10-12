@@ -82,7 +82,7 @@ A row's `why` is a fixed phrase and never contains a URL.
 
 ## The guide check job
 
-A check is requested with `jobs::guide_check::request` (B7 `after_guide`, after a guide import or rematch) or `request_from` (the UI, after a rule or mapping change). The request waits 30 s outside the jobs, so the "features" lane stays free and the Jobs overlay shows nothing; requests meanwhile join the waiting one (`JobContext::guide_check_pending`). Headless (`tuner --refresh`, no `JobContext::shared`) nothing is requested and `run` does nothing. The Guide fixes screen submits a check at once when its report finds the cache behind (a playlist refresh, a threshold change).
+A check is requested with `jobs::guide_check::request` (B7 `after_guide`, after a guide import or rematch) or `request_from` (the UI, after a rule or mapping change). The request waits 30 s outside the jobs, so the "features" lane stays free and the Jobs overlay shows nothing; requests meanwhile push the deadline back (`JobContext::guide_check`, which also says whether a check is running). Headless (`tuner --refresh`, `JobContext::headless`) nothing is requested and `run` does nothing; the app checks the stamp once after its first library publish (`guide_check::after_first_publish`). The Guide fixes screen submits a check at once when its report finds the cache behind (a playlist refresh, a threshold change).
 
 `jobs::guide_check::run` works in this order:
 1. It takes a library snapshot.

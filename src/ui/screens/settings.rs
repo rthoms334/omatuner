@@ -3,7 +3,7 @@
 //! rows (playlists, EPG priority, favourites lists) with Alt+↑/↓ or K/J or the drag grip.
 //! Playlists page: sources with status, account info (expiry, connections, formats),
 //! refresh/edit/delete/reorder, "+ Add" (→ `Route::Onboarding(AddSource)`); EPG page: ordered
-//! EPG sources with offsets + "EPG mapping…"; Reminders: pending list (Delete cancels);
+//! EPG sources with offsets + "Fix guide data…"; Reminders: pending list (Delete cancels);
 //! About: version, paths, log viewer link. Text fields push `TextInput`. Edits go through
 //! `ctx.edit_config` (applied live to the player). Owner: WP-12.
 //!
@@ -649,7 +649,8 @@ impl SourceEditor {
     /// stored): the short code field's placeholder.
     fn auto_code(&self, sources: &[Source]) -> String {
         let id = self.original.id;
-        let list = sources.iter().map(|s| if s.id == id { (self.name.trim(), None) } else { (s.name.as_str(), s.settings.code.as_deref()) });
+        let list =
+            sources.iter().map(|s| if s.id == id { (s.id, self.name.trim(), None) } else { (s.id, s.name.as_str(), s.settings.code.as_deref()) });
         let codes = crate::sources::codes::assign(list);
         sources.iter().position(|s| s.id == id).and_then(|i| codes.get(i).cloned()).unwrap_or_else(|| crate::sources::codes::auto(&self.name))
     }
@@ -666,7 +667,7 @@ impl SourceEditor {
         let code = crate::sources::codes::parse(&self.code).map_err(|e| (Local::SrcCode, e.to_owned()))?;
         if let Some(c) = &code {
             // another playlist's code as cards show it now (its own or derived)
-            let now = crate::sources::codes::assign(sources.iter().map(|x| (x.name.as_str(), x.settings.code.as_deref())));
+            let now = crate::sources::codes::assign(sources.iter().map(|x| (x.id, x.name.as_str(), x.settings.code.as_deref())));
             if let Some((other, _)) = sources.iter().zip(&now).find(|(x, n)| x.id != s.id && *n == c) {
                 return Err((Local::SrcCode, format!("{} already uses {c}", other.name)));
             }
@@ -1156,7 +1157,7 @@ impl SettingsScreen {
                 v.push(Row::Local { field: Local::NewEpgUrl, label: "Add an XMLTV URL" });
                 v.push(Row::Act { act: Act::AddEpgUrl, icon: glyphs::ADD, label: "Add URL".into(), danger: false });
                 v.push(Row::Act { act: Act::AddEpgFile, icon: glyphs::FOLDER, label: "Add a guide file…".into(), danger: false });
-                v.push(Row::Act { act: Act::EpgMapping, icon: glyphs::GUIDE, label: "EPG mapping…".into(), danger: false });
+                v.push(Row::Act { act: Act::EpgMapping, icon: glyphs::GUIDE, label: "Fix guide data…".into(), danger: false });
                 guide_fix::rows(self, ctx, &mut v);
                 v.push(Row::Section("Options".into()));
                 v.extend(EPG_N.iter().map(Row::Number));

@@ -1582,7 +1582,7 @@ impl LiveScreen {
             menu_item(glyphs::GUIDE, "Show in TV guide", Action::OpenInGuide, true, k),
             menu_item(glyphs::INFO, "Edit information…", Action::ShowDetails, true, k),
             menu_item(glyphs::TAG, "Rename", Action::Rename, true, k),
-            menu_item(glyphs::GUIDE, "Assign EPG channel…", Action::AssignEpg, true, k),
+            menu_item(glyphs::GUIDE, "Assign guide channel…", Action::AssignEpg, true, k),
             menu_item(glyphs::HIDDEN, "Hide", Action::ToggleHidden, true, k),
             menu_item(glyphs::LOCK, if ch.locked { "Unlock" } else { "Lock with PIN" }, Action::ToggleLock, true, k),
             menu_item(glyphs::SORT, "Sort & view…", Action::SortMenu, true, k),
