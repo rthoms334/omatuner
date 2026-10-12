@@ -71,6 +71,9 @@ use crate::ui::widgets::status_bar::{StatusClick, StatusInfo};
 use crate::ui::widgets::toast::Toasts;
 use crate::ui::{BackTarget, LayoutClass, NavRequest, OnboardingStart, OverlayRequest, ParentalSession, Route, Screen, ScreenId, UiCtx, UiParts};
 
+/// Multi-view (DESIGN §35, MV-2): focus, sound, picture B, the planner's plays.
+mod multiview;
+
 /// An open overlay, the screen that opened it (receives its result) and which request built
 /// it (Help / Jobs toggle closed when requested again).
 struct OpenOverlay {
@@ -179,6 +182,9 @@ pub struct TunerApp {
     dropped: Vec<PathBuf>,
     /// Developer screenshot capture (`TUNER_SCREENSHOT`, DESIGN §23.1); `None` normally.
     devshot: Option<crate::devshot::Driver>,
+    /// Multi-view (DESIGN §35): the pictures' focus, sound and layout places, picture B's start
+    /// and what waits for it (`app/multiview.rs`).
+    mv: multiview::MvApp,
     #[cfg(test)]
     log: std::cell::RefCell<tests::Log>,
 }
@@ -218,8 +224,11 @@ impl TunerApp {
         };
         let start = start_route(&services.config(), &initial, &db);
         let snapshot = services.tiles.focused().snapshot();
+        let mut video = VideoHost::new(surface);
+        // picture B's surface is made later, from the same GL context (multi-view)
+        video.set_factory(crate::player::render::SurfaceFactory::new(cc).ok());
         let mut app = Self {
-            video: VideoHost::new(surface),
+            video,
             services: Some(services),
             events,
             theme,
@@ -266,6 +275,7 @@ impl TunerApp {
             last_network_toast: None,
             dropped: Vec::new(),
             devshot: None,
+            mv: Default::default(),
             #[cfg(test)]
             log: Default::default(),
         };
@@ -323,15 +333,22 @@ impl TunerApp {
     }
 
     /// The key context stack right now (topmost overlay, else the screen on view); `Global`
-    /// is appended by `keymap::resolve`. Video-only: `PopOut` sits right above the player's
-    /// base context, so Esc pops back in once side panels / number entry are done with it.
+    /// is appended by `keymap::resolve`. Multi-view: `MultiView` sits right above the
+    /// player's base context (side panels, number entry and controls focus stay above it).
+    /// Video-only: `PopOut` sits above those, so Esc pops back in once side panels / number
+    /// entry are done with it.
     fn key_stack(&self) -> Vec<KeyContext> {
         match self.overlays.last() {
             Some(o) => o.overlay.key_contexts(),
             None => {
                 let mut stack = self.screens[self.screen_index(self.view_screen())].key_contexts();
+                let base = |c: &KeyContext| matches!(c, KeyContext::PlayerLive | KeyContext::PlayerVod);
+                if self.mv.view.on && self.view_screen() == ScreenId::Player {
+                    let at = stack.iter().position(base).unwrap_or(stack.len());
+                    stack.insert(at, KeyContext::MultiView);
+                }
                 if self.video_only {
-                    let at = stack.iter().position(|c| matches!(c, KeyContext::PlayerLive | KeyContext::PlayerVod)).unwrap_or(stack.len());
+                    let at = stack.iter().position(|c| base(c) || *c == KeyContext::MultiView).unwrap_or(stack.len());
                     stack.insert(at, KeyContext::PopOut);
                 }
                 stack
@@ -339,10 +356,14 @@ impl TunerApp {
         }
     }
 
-    /// Every player command of the app goes through here (tests record them).
+    /// Every player command of the app goes through here (tests record them): to the focused
+    /// picture; a film, an episode or a file to picture A, ending multi-view.
     fn send_player(&self, cmd: PlayerCommand) {
         #[cfg(test)]
         self.log.borrow_mut().commands.push(cmd.clone());
+        if self.mv_vod_to_a(&cmd) {
+            return;
+        }
         self.services().tiles.focused().send(cmd);
     }
 
@@ -365,6 +386,7 @@ impl TunerApp {
         let cfg = services.config();
         let mini_rect = self.video.mini_rect();
         let back = self.back_target();
+        let multiview = self.mv_frame();
         let mut ctx = UiCtx::new(UiParts {
             theme: &self.theme,
             services,
@@ -389,7 +411,13 @@ impl TunerApp {
             config_edits: &mut self.config_edits,
         });
         ctx.back = back;
-        f(&mut ctx, &mut self.screens, &mut self.overlays)
+        ctx.multiview = multiview;
+        let r = f(&mut ctx, &mut self.screens, &mut self.overlays);
+        // multi-view requests made through `&UiCtx` (`play`) are applied with the navigation
+        for m in ctx.take_mv_requests() {
+            ctx.navigate(NavRequest::MultiView(m));
+        }
+        r
     }
 
     /// Where `NavRequest::Back` leads from the route on screen (the back button's label): the
@@ -406,6 +434,25 @@ impl TunerApp {
     }
 
     fn handle_event(&mut self, ev: AppEvent, egui_ctx: &egui::Context) {
+        // multi-view: the focused picture's player events are "the player's" for the screens
+        // (picture B's arrive as `TileEvent::Player`); the other picture's only toast
+        let ev = match ev {
+            AppEvent::Tile(t) => match self.on_tile_event(t) {
+                Some(pev) => AppEvent::Player(pev),
+                None => return,
+            },
+            AppEvent::Player(pev) if self.mv.view.focus != crate::model::TileId::A => {
+                self.on_picture_event(crate::model::TileId::A, &pev);
+                return;
+            }
+            AppEvent::Player(pev) => {
+                if matches!(pev, crate::player::PlayerEvent::ZapSkipped { .. }) {
+                    self.on_picture_event(crate::model::TileId::A, &pev);
+                }
+                AppEvent::Player(pev)
+            }
+            ev => ev,
+        };
         match &ev {
             // A load started before "follow Omarchy theme" was turned off may still land.
             AppEvent::Theme(ThemeEvent::Changed(_)) if !self.services().config().integration.follow_omarchy_theme => {}
@@ -793,10 +840,17 @@ impl TunerApp {
         }
         let x = self.lib.explicit.clone();
         let playing = self.snapshot.playable.as_ref().filter(|_| self.snapshot.state != PlayerState::Idle).and_then(|p| p.item.clone());
-        if playing.is_some_and(|item| x.contains(&item) || crate::store::live::item_explicit(&self.db, &item).unwrap_or(true)) {
+        let explicit = |item: &ItemRef| x.contains(item) || crate::store::live::item_explicit(&self.db, item).unwrap_or(true);
+        // multi-view: the other picture stops too when it shows explicit content
+        let other = self.mv_stop_explicit(|s| s.playable.as_ref().and_then(|p| p.item.as_ref()).is_some_and(explicit));
+        if playing.as_ref().is_some_and(explicit) {
             self.send_player(PlayerCommand::Stop);
-            self.routes.retain(|r| *r != Route::Player);
+            if !self.mv.view.on || other {
+                self.routes.retain(|r| *r != Route::Player);
+            }
             self.toast(Toast::info("Playback stopped — parental control is on"));
+        } else if other {
+            self.toast(Toast::info("A picture stopped — parental control is on"));
         }
         // pages and groups of explicit titles
         self.routes.retain(|r| match r {
@@ -867,6 +921,12 @@ impl TunerApp {
             return;
         }
         let zap = group.and_then(|g| self.zap_list(g, &cfg));
+        // two pictures: a play from outside (reminder, `--play`, MCP, a notification's Watch)
+        // goes to the silent picture and takes the sound (DESIGN §35)
+        if matches!(origin, PlayOrigin::Reminder | PlayOrigin::Cli) && self.mv_outside(MediaRef::Channel(id), zap.clone(), origin) {
+            self.nav.push(NavRequest::Push(Route::Player));
+            return;
+        }
         // not in the library yet: send the zap list once it has loaded (`on_job_finished`)
         self.pending_zap = group.filter(|_| zap.is_none() && in_lib.is_none()).map(|g| (id, g));
         self.send_player(PlayerCommand::Play(PlayRequest { media: MediaRef::Channel(id), zap, origin, resume: false, immediate: true }));
@@ -965,7 +1025,14 @@ impl TunerApp {
         };
         self.pending_agent = None;
         self.pending_zap = None;
-        self.send_player(cmd);
+        // two pictures: catch-up goes to the silent picture (films end multi-view)
+        let catchup = match &cmd {
+            PlayerCommand::Play(r) if matches!(r.media, MediaRef::Catchup { .. }) => Some(r.media.clone()),
+            _ => None,
+        };
+        if !catchup.is_some_and(|m| self.mv_outside(m, None, PlayOrigin::Cli)) {
+            self.send_player(cmd);
+        }
         self.nav.push(NavRequest::Push(Route::Player));
     }
 
@@ -1102,6 +1169,9 @@ impl TunerApp {
             }
             Action::ToggleWindowFullscreen => self.set_window_fullscreen(!self.window_fullscreen, egui_ctx),
             Action::OpenPlayer if self.snapshot.state != PlayerState::Idle => self.nav.push(NavRequest::Push(Route::Player)),
+            // two pictures: both pause / play, both stop (DESIGN §35)
+            Action::GlobalPlayPause if self.mv.view.on => self.mv_pause_all(),
+            Action::StopPlayback if self.mv.view.on => self.mv_stop_all(),
             Action::GlobalPlayPause => self.send_player(PlayerCommand::TogglePause),
             Action::StopPlayback => self.send_player(PlayerCommand::Stop),
             Action::RefreshSource => self.refresh_everything(),
@@ -1281,6 +1351,11 @@ impl TunerApp {
                 self.overlays.pop();
             }
             OverlayOutcome::CloseWith(result) => {
+                // multi-view's "move the playing picture?" card, or its PIN for a picture
+                if self.mv_overlay_result(&result) {
+                    self.overlays.pop();
+                    return;
+                }
                 // the PIN asked for by `play_channel` (not a screen's): play it now
                 if matches!(result, overlays::OverlayResult::Unlocked(Action::OpenPlayer))
                     && let Some((id, origin)) = self.pending_locked.take()
@@ -1359,6 +1434,7 @@ impl TunerApp {
                 NavRequest::CloseOverlay => {
                     self.overlays.pop();
                 }
+                NavRequest::MultiView(r) => self.apply_mv(r),
             }
         }
         let route = self.view_route();
@@ -1656,21 +1732,35 @@ impl eframe::App for TunerApp {
         while let Ok(ev) = self.events.try_recv() {
             self.handle_event(ev, ctx);
         }
+        // multi-view: a picture that went away ends it; the routers get focus and sound
+        self.mv_reconcile();
         self.snapshot = self.services().tiles.focused().snapshot();
         self.sync_explicit(ctx);
         self.publish_for_agent();
-        self.measured.observe(&self.snapshot);
-        let busy = matches!(self.snapshot.state, PlayerState::Loading { .. } | PlayerState::Zapping { .. });
+        let focus = self.mv.view.focus;
+        let snaps = [self.mv_snap(crate::model::TileId::A), self.mv_snap(crate::model::TileId::B)];
+        let live_snaps = || snaps.iter().flatten();
+        for s in live_snaps() {
+            self.measured.observe(s);
+        }
+        // the jobs pause while any picture is tuning
+        let busy = live_snaps().any(|s| matches!(s.state, PlayerState::Loading { .. } | PlayerState::Zapping { .. }));
         self.services().jobs.context().player_busy.store(busy, Ordering::Relaxed);
-        if self.snapshot.video_suspended {
-            self.send_player(PlayerCommand::ResumeVideo);
+        // a suspended picture comes back when it is drawn again (the focused one always renders)
+        let any_painted = [crate::model::TileId::A, crate::model::TileId::B].iter().any(|t| self.video.was_painted(*t));
+        for s in live_snaps().filter(|s| s.video_suspended) {
+            if s.tile == focus && (!any_painted || self.video.was_painted(s.tile)) {
+                self.send_player(PlayerCommand::ResumeVideo);
+            } else if s.tile != focus && self.video.was_painted(s.tile) {
+                self.send_to(s.tile, PlayerCommand::ResumeVideo);
+            }
         }
         if let Some(gl) = frame.gl().cloned() {
-            let snap = self.snapshot.clone();
-            self.video.render(&gl, frame, &snap);
+            self.mv_make_surface();
+            self.video.render(&gl, frame, [snaps[0].as_deref(), snaps[1].as_deref()], focus);
         }
         let mode = self.services().config().integration.idle_inhibit;
-        let active = self.snapshot.state.is_active() && !self.snapshot.paused;
+        let active = live_snaps().any(|s| s.state.is_active() && !s.paused);
         let fs = self.window_fullscreen;
         if let Some(i) = &mut self.idle {
             i.set(mode, active, fs);
@@ -1701,6 +1791,7 @@ impl eframe::App for TunerApp {
         }
         let egui_ctx = ui.ctx().clone();
         let width = egui_ctx.content_rect().width();
+        self.mv.ppp = egui_ctx.pixels_per_point();
         // egui points are logical px (no zoom factor), like Hyprland's sizes
         self.window_size = egui_ctx.content_rect().size();
         self.video_only = self.popout.video_only(self.window_size, self.has_media());
@@ -1737,6 +1828,8 @@ impl eframe::App for TunerApp {
             let mini_hidden = self.layout == LayoutClass::Compact || !cfg.interface.mini_player;
             let now_playing =
                 (mini_hidden && self.snapshot.state != PlayerState::Idle).then(|| self.snapshot.playable.as_ref().map(|p| p.title.clone())).flatten();
+            // multi-view: "▶ 2 pictures · Sky Sports Main Event" (the focused one's)
+            let now_playing = now_playing.map(|t| if self.mv.view.on { format!("2 pictures · {t}") } else { t });
             let chips: Vec<_> = crate::spoiler::ui::status_chip(&self.services().agent, crate::model::now()).into_iter().collect();
             let info = StatusInfo {
                 jobs: &jobs,
@@ -1758,6 +1851,7 @@ impl eframe::App for TunerApp {
             match bar.inner {
                 StatusClick::Jobs => self.nav.push(NavRequest::Open(OverlayRequest::Jobs)),
                 StatusClick::OpenPlayer => self.nav.push(NavRequest::Push(Route::Player)),
+                StatusClick::StopPlayback if self.mv.view.on => self.mv_stop_all(),
                 StatusClick::StopPlayback => self.send_player(PlayerCommand::Stop),
                 StatusClick::Chip(action) => self.global_action(action, &[], &egui_ctx),
                 StatusClick::None => {}
@@ -1784,9 +1878,12 @@ impl eframe::App for TunerApp {
         {
             let snap = self.snapshot.clone();
             let queue = self.services().agent.queue();
-            match self.video.mini_player(&egui_ctx, &theme, &snap, &queue) {
+            // multi-view: picture in picture, the focused picture big
+            let inset = self.mv_snap(self.mv.view.unfocused()).filter(|_| self.mv.view.on);
+            match self.video.mini_player_with(&egui_ctx, &theme, &snap, &queue, inset.as_deref()) {
                 Some(MiniAction::Open) => self.nav.push(NavRequest::Push(Route::Player)),
                 Some(MiniAction::PopOut) => self.nav.push(NavRequest::TogglePopOut),
+                Some(MiniAction::Stop) if self.mv.view.on => self.mv_stop_all(),
                 Some(MiniAction::Stop) => self.send_player(PlayerCommand::Stop),
                 None => {}
             }
@@ -2030,6 +2127,8 @@ mod tests {
         pub toasts: Vec<Toast>,
         /// What was handed to the memory maintenance thread (`TunerApp::release`).
         pub releases: Vec<&'static str>,
+        /// Commands multi-view sent to one picture (`TunerApp::send_to`).
+        pub tile_commands: Vec<(crate::model::TileId, PlayerCommand)>,
     }
 
     /// One app (mpv + runtime + store) at a time keeps the test binary's memory flat.
@@ -4244,5 +4343,221 @@ mod tests {
         rig.frame_with(vec![]);
         assert_eq!(rig.route(), &page);
         assert!(!rig.app.routes.contains(&Route::Player));
+    }
+    // ---------------------------------------------------------------- multi-view (§35)
+
+    /// "TV" (Alpha, Bravo, Charlie) and "TV 2" (Bravo, Charlie, Delta), one stream each: the
+    /// user's two accounts. Channel ids 1–3 on TV, 4–6 on TV 2.
+    fn seed_two_playlists(c: &mut rusqlite::Connection) -> crate::error::Result<()> {
+        use rusqlite::params;
+        let account = serde_json::to_string(&crate::model::AccountInfo { max_connections: Some(1), ..Default::default() }).unwrap();
+        for (src, (name, chans)) in [("TV", ["Alpha", "Bravo", "Charlie"]), ("TV 2", ["Bravo", "Charlie", "Delta"])].into_iter().enumerate() {
+            c.execute(
+                "INSERT INTO source(name, kind, url, created_at, generation, account) VALUES (?1, 'm3u-url', ?2, 0, 1, ?3)",
+                params![name, format!("http://127.0.0.1/{src}.m3u"), account],
+            )?;
+            let sid = c.last_insert_rowid();
+            c.execute(
+                "INSERT INTO grp(source_id, kind, key, name, provider_order, item_count, seen_gen) VALUES (?1,'channel','channel:all','All',0,3,1)",
+                params![sid],
+            )?;
+            let grp = c.last_insert_rowid();
+            for (i, ch) in chans.iter().enumerate() {
+                let url = format!("http://127.0.0.1/{src}/{i}.ts");
+                c.execute(
+                    "INSERT INTO channel(source_id, key, name, clean_name, norm_name, number, stream, url_key, provider_order, seen_gen)
+                     VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
+                    params![
+                        sid,
+                        format!("m3u:{ch}"),
+                        ch,
+                        ch.to_lowercase(),
+                        (i + 1) as i64,
+                        format!(r#"{{"t":"url","url":"{url}"}}"#),
+                        url,
+                        i as i64
+                    ],
+                )?;
+                let id = c.last_insert_rowid();
+                c.execute(
+                    "INSERT INTO channel_group(group_id, channel_id, position, is_primary) VALUES (?1, ?2, ?3, 1)",
+                    params![grp, id, i as i64],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    const PIC_A: crate::model::TileId = crate::model::TileId::A;
+    const PIC_B: crate::model::TileId = crate::model::TileId::B;
+
+    /// The plays multi-view sent to `tile`.
+    fn tile_plays(log: &Log, tile: crate::model::TileId) -> Vec<MediaRef> {
+        log.tile_commands
+            .iter()
+            .filter_map(|(t, c)| match c {
+                PlayerCommand::Play(r) if *t == tile => Some(r.media.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Alpha plays in picture A (from TV); Ctrl+M on Bravo in Live opens picture B.
+    fn two_pictures() -> Rig {
+        two_pictures_at(1.0)
+    }
+
+    fn two_pictures_at(ui_scale: f32) -> Rig {
+        let mut rig = Rig::with(test_config(), live(), ui_scale, seed_two_playlists);
+        rig.settle();
+        rig.app.send_player(PlayerCommand::Play(PlayRequest {
+            media: MediaRef::Channel(ChannelId(1)),
+            zap: None,
+            origin: PlayOrigin::Fullscreen,
+            resume: false,
+            immediate: true,
+        }));
+        rig.until("Alpha plays", |r| r.app.snapshot.playable.is_some());
+        rig.app.nav.push(NavRequest::Switch(Route::Live { group: None, channel: Some(ChannelId(2)) }));
+        rig.frame_with(vec![]);
+        rig.press(Key::M, CTRL);
+        rig.until("picture B plays", |r| r.app.services().tiles.b().is_some() && !tile_plays(&r.log(), PIC_B).is_empty());
+        rig
+    }
+
+    /// Ctrl+M in Live: picture B starts and plays the channel's copy on the free playlist (TV
+    /// is held by picture A), focus and sound stay on A, nothing is sent to A; an outside play
+    /// (a reminder's Watch) goes to the silent picture and takes the sound; a film ends
+    /// multi-view and plays in picture A.
+    #[test]
+    fn ctrl_m_opens_picture_b_on_a_free_playlist_and_outside_plays_take_the_silent_one() {
+        let mut rig = two_pictures();
+        assert_eq!(tile_plays(&rig.log(), PIC_B), [MediaRef::Channel(ChannelId(4))], "Bravo's copy on TV 2");
+        assert!(tile_plays(&rig.log(), PIC_A).is_empty(), "picture A untouched");
+        let v = rig.app.mv.view;
+        assert!(v.on && v.focus == PIC_A && v.audible == PIC_A, "{v:?}");
+        assert!(rig.log().toasts.iter().any(|t| t.text == "Picture B plays it from TV 2 — TV is busy with picture A"), "{:?}", rig.log().toasts);
+        assert!(rig.app.services().agent.tiles().on, "the routers see two pictures");
+
+        // a reminder's Watch: the silent picture (B) plays Charlie's TV 2 copy and has the sound
+        let charlie = ItemRef { source: SourceId(1), kind: ItemKind::Channel, key: ItemKey("m3u:Charlie".into()) };
+        rig.event(AppEvent::Platform(PlatformEvent::ReminderWatch { reminder: crate::model::ReminderId(1), channel: charlie }));
+        rig.frame_with(vec![]);
+        assert_eq!(tile_plays(&rig.log(), PIC_B).last(), Some(&MediaRef::Channel(ChannelId(5))));
+        let v = rig.app.mv.view;
+        assert!(v.focus == PIC_A && v.audible == PIC_B, "the sound moved, the focus didn't: {v:?}");
+        assert_eq!(rig.app.services().tiles.audible(), PIC_B);
+
+        // a film: picture B stops, it plays in picture A, single view again
+        rig.app.send_player(PlayerCommand::Play(PlayRequest {
+            media: MediaRef::Url("http://127.0.0.1/film.mkv".into()),
+            zap: None,
+            origin: PlayOrigin::Cli,
+            resume: false,
+            immediate: true,
+        }));
+        assert!(rig.log().tile_commands.iter().any(|(t, c)| *t == PIC_B && *c == PlayerCommand::Stop));
+        rig.until("single view", |r| !r.app.mv.view.on);
+        let v = rig.app.mv.view;
+        assert!(v.focus == PIC_A && v.audible == PIC_A, "{v:?}");
+    }
+
+    /// In the player: `MultiView` sits above the base context (`w`, `q`… resolve there), `w`
+    /// moves the focus without the sound, `q` closes the focused picture and the other carries
+    /// on with the sound; Esc never closes a picture.
+    #[test]
+    fn player_keys_focus_and_close_a_picture() {
+        let mut rig = two_pictures();
+        rig.app.nav.push(NavRequest::Push(Route::Player));
+        rig.frame_with(vec![]);
+        let stack = rig.app.key_stack();
+        let at = stack.iter().position(|c| *c == KeyContext::MultiView).expect("MultiView in the player's stack");
+        assert!(matches!(stack.get(at + 1), Some(KeyContext::PlayerLive | KeyContext::PlayerVod)), "{stack:?}");
+        rig.frame_with(vec![Event::Text("w".into())]);
+        rig.frame_with(vec![]);
+        assert_eq!((rig.app.mv.view.focus, rig.app.mv.view.audible), (PIC_B, PIC_A));
+        assert_eq!(rig.app.services().tiles.focus(), PIC_B, "keys and commands go to B");
+        rig.press(Key::Escape, NONE);
+        rig.press(Key::Escape, NONE);
+        assert!(rig.app.mv.view.on, "Esc never closes a picture");
+        rig.app.nav.push(NavRequest::Push(Route::Player));
+        rig.frame_with(vec![]);
+        rig.frame_with(vec![Event::Text("q".into())]);
+        rig.frame_with(vec![]);
+        assert!(rig.log().tile_commands.iter().any(|(t, c)| *t == PIC_B && *c == PlayerCommand::Stop), "q stopped picture B");
+        let v = rig.app.mv.view;
+        assert!(!v.on && v.focus == PIC_A && v.audible == PIC_A, "{v:?}");
+        assert!(!rig.app.key_stack().contains(&KeyContext::MultiView));
+        assert!(!rig.log().tile_commands.iter().any(|(t, c)| *t == PIC_A && *c == PlayerCommand::Stop), "A carries on");
+    }
+
+    /// Both pictures only on TV (one stream): Ctrl+M on a channel only TV has, while A could
+    /// move to its TV 2 copy, asks first; Enter moves A and plays the channel in B, Esc moves
+    /// nothing.
+    #[test]
+    fn moving_the_playing_picture_always_asks() {
+        let mut rig = Rig::with(test_config(), live(), 1.0, seed_two_playlists);
+        rig.settle();
+        // Bravo (TV) in A: it has a copy on TV 2; Alpha is only on TV
+        rig.app.send_player(PlayerCommand::Play(PlayRequest {
+            media: MediaRef::Channel(ChannelId(2)),
+            zap: None,
+            origin: PlayOrigin::Fullscreen,
+            resume: false,
+            immediate: true,
+        }));
+        rig.until("Bravo plays", |r| r.app.snapshot.playable.is_some());
+        let alpha = crate::ui::multiview::PlaceIn::new(crate::ui::multiview::Aim::Alongside, MediaRef::Channel(ChannelId(1)), None);
+        rig.app.nav.push(NavRequest::MultiView(crate::ui::multiview::MvRequest::Place(alpha.clone())));
+        rig.frame_with(vec![]);
+        assert_eq!(
+            rig.overlay_kinds(),
+            [kind(OverlayRequest::Confirm(overlays::ConfirmSpec {
+                title: String::new(),
+                body: String::new(),
+                confirm_label: String::new(),
+                destructive: false,
+                token: 0
+            }))]
+        );
+        assert!(rig.log().tile_commands.is_empty(), "nothing moves before the answer");
+        rig.press(Key::Escape, NONE);
+        assert!(rig.log().tile_commands.is_empty() && !rig.app.mv.view.on, "Esc: nothing moved");
+
+        rig.app.nav.push(NavRequest::MultiView(crate::ui::multiview::MvRequest::Place(alpha)));
+        rig.frame_with(vec![]);
+        rig.press(Key::Enter, NONE);
+        rig.until("picture B plays", |r| r.app.services().tiles.b().is_some() && !tile_plays(&r.log(), PIC_B).is_empty());
+        assert_eq!(tile_plays(&rig.log(), PIC_A), [MediaRef::Channel(ChannelId(4))], "A moved to Bravo's TV 2 copy");
+        assert_eq!(tile_plays(&rig.log(), PIC_B), [MediaRef::Channel(ChannelId(1))], "B plays Alpha from TV");
+        assert_eq!(rig.app.services().tiles.budget().claim_of(PIC_A), Some(SourceId(2)), "A's claim moved at once");
+    }
+
+    /// The multi-view player at a tiled half (790 pt) and full screen (1600 pt), text size 12
+    /// and 16: the layout follows the width (side by side, big + small, picture in picture) and
+    /// the multi-view group's buttons are on screen with the banner.
+    #[test]
+    fn the_multi_view_player_fits_at_790_and_1600_pt_with_text_size_12_and_16() {
+        use crate::ui::multiview::Layout;
+        let cases = [
+            (790.0, 1.0, Layout::BigSmall),
+            (790.0, 4.0 / 3.0, Layout::Pip),
+            (1600.0, 1.0, Layout::SideBySide),
+            (1600.0, 4.0 / 3.0, Layout::SideBySide),
+        ];
+        for (w, scale, layout) in cases {
+            let mut rig = two_pictures_at(scale);
+            rig.size = egui::vec2(w, 800.0);
+            rig.app.nav.push(NavRequest::Push(Route::Player));
+            rig.frame_with(vec![]);
+            let out = rig.frame_with(vec![Event::PointerMoved(egui::pos2(w / 2.0, 400.0))]);
+            let cfg = rig.app.services().config();
+            assert_eq!(Layout::effective(cfg.player.multiview.layout, w, rig.app.theme.rem(), false), layout, "{w} pt @ {scale}");
+            let t = texts(&out);
+            for label in ["Layout", "Sound here", "Swap", "Close"] {
+                let r = button(&t, label).unwrap_or_else(|| panic!("{label} at {w} pt @ {scale}: {t:?}"));
+                assert!(r.x0 >= 0.0 && r.x1 as f32 <= w && r.y1 < 800.0, "{label} on screen at {w} pt @ {scale}: {r:?}");
+            }
+        }
     }
 }
