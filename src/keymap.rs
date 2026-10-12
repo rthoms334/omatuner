@@ -705,6 +705,9 @@ pub static PLAYER_COMMON: &[Binding] = &[
     b(C::ch('o'), A::TogglePopOut, "Pop out: small window on every workspace (Hyprland)"),
     b(C::ch('q'), A::StopAndClose, "Stop and close"),
     b(C::ch('r'), A::Retry, "Retry (after an error)"),
+    // casting (DESIGN §40 §3.7): while casting it opens the picker on "This computer", so
+    // stopping is `C` then Enter; no global chord (Ctrl+Shift+C is the terminal's copy)
+    b(C::ch('C'), A::CastMenu, "Cast to a TV…"),
     b(C::ch('u'), A::QueuePanel, "Up next"),
     b(C::ch('n'), A::QueueNext, "Next / previous in Up next"),
     b(C::ch('N'), A::QueuePrev, "Next / previous in Up next"),
@@ -1068,6 +1071,7 @@ pub fn feature_on(a: Action) -> bool {
         | A::ClosePicture
         | A::WatchAlongside => crate::ui::multiview::ENABLED,
         A::SleepTimer | A::EndNewsFlash | A::ReminderOptions => crate::reminders::ENABLED,
+        A::CastMenu | A::StopCasting => crate::cast::ENABLED,
         _ => true,
     }
 }
