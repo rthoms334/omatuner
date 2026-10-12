@@ -80,6 +80,21 @@ pub struct Topic {
 }
 
 impl Topic {
+    /// A topic of any category that shields, with no windows yet ([`Topic::set_windows`]).
+    pub fn new(label: impl Into<String>, source: TopicSource, mode: TopicMode) -> Self {
+        Self {
+            label: label.into(),
+            source,
+            mode,
+            sport_only: false,
+            categories: Vec::new(),
+            sport_descr: false,
+            shield: true,
+            windows: Vec::new(),
+            spans: Vec::new(),
+        }
+    }
+
     /// Active at `now`: `Some(until)` (when it lifts by itself; `None` = when watched / never).
     pub fn active(&self, now: Timestamp) -> Option<Option<Timestamp>> {
         match self.mode {
@@ -248,6 +263,61 @@ pub(crate) fn folded(s: &str) -> String {
     out
 }
 
+/// What keeps a Following topic narrow (a user's own rule has none of it).
+#[derive(Debug, Default)]
+struct Narrow {
+    /// Folded words that make an airing not the event ("women", "fan tv").
+    without: Vec<String>,
+    /// Only fixtures ("A v B") are events.
+    fixtures_only: bool,
+}
+
+impl Narrow {
+    /// A title hit is one of this topic's events: not highlights or a reaction show (those
+    /// spoil it), none of the `without` words, a fixture when the rule wants one.
+    fn is_event(&self, folded_title: &str, p: &db::EventCandidate) -> bool {
+        use crate::textmatch::fold::has_token;
+        if ["highlights", "reaction"].iter().any(|w| has_token(folded_title, w)) {
+            return false;
+        }
+        let sub = p.sub_title.as_deref().map(folded).unwrap_or_default();
+        if self.without.iter().any(|w| has_token(folded_title, w) || has_token(&sub, w)) {
+            return false;
+        }
+        !self.fixtures_only || crate::textmatch::fixture::parse_fixture(&p.title, p.sub_title.as_deref()).is_some()
+    }
+}
+
+/// One airing of an event (the builder's working row).
+struct Airing {
+    base: String,
+    start: Timestamp,
+    stop: Timestamp,
+    key: String,
+    title: String,
+}
+
+/// What events and seen rows group by: a fixture's teams without its date (`arsenal|chelsea`
+/// — a repeat the next day is the same match), any other event key as is.
+fn event_base(key: &str) -> &str {
+    if key.contains('|') { key.rsplit_once('@').map_or(key, |(teams, _)| teams) } else { key }
+}
+
+/// Airings grouped into events: by base key, the earliest airing opens the window, and
+/// airings within [`SEEN_SPAN_S`] of it (repeats, +1 channels, both playlists) are the same
+/// event.
+fn events_of(mut airings: Vec<Airing>) -> Vec<(String, Window)> {
+    airings.sort_by(|a, b| a.base.cmp(&b.base).then(a.start.cmp(&b.start)));
+    let mut out: Vec<(String, Window)> = Vec::new();
+    for a in airings {
+        if out.last().is_some_and(|(base, w)| *base == a.base && a.start - w.open <= SEEN_SPAN_S) {
+            continue;
+        }
+        out.push((a.base, Window { open: a.start, close: a.stop, event_key: a.key, title: a.title }));
+    }
+    out
+}
+
 /// Build a snapshot from the rules, Following's spoiler-safe rules (virtual topics, B4), the
 /// guide and merged series progress. `conn` is a reader; runs off the UI thread.
 pub fn build(conn: &rusqlite::Connection, cfg: &Config, lib: &Library, now: Timestamp) -> Result<GuardSnapshot> {
@@ -260,7 +330,7 @@ pub fn build(conn: &rusqlite::Connection, cfg: &Config, lib: &Library, now: Time
         series_auto: cfg.spoiler.series_auto,
     };
     let rules = db::list_rules(conn)?;
-    let mut topics: Vec<(Topic, Vec<String>, u32)> = Vec::new(); // (topic, terms, window_h)
+    let mut topics: Vec<(Topic, Vec<String>, u32, Narrow)> = Vec::new(); // (topic, terms, window_h, …)
     for r in rules.iter().filter(|r| r.enabled && r.kind != SpoilerRuleKind::Series && !r.terms.is_empty()) {
         let mode = match (r.kind, r.mode) {
             (SpoilerRuleKind::Blackout, _) => match r.until_at {
@@ -284,23 +354,25 @@ pub fn build(conn: &rusqlite::Connection, cfg: &Config, lib: &Library, now: Time
             windows: Vec::new(),
             spans: Vec::new(),
         };
-        topics.push((topic, r.terms.clone(), r.window_h));
+        topics.push((topic, r.terms.clone(), r.window_h, Narrow::default()));
     }
+    // sport you follow, narrowly: its own fixtures (Team rules) without the spec's `without`
+    // words open windows, and other sport programmes keep their text
     for f in db::follow_topics(conn)? {
         let topic = Topic {
-            label: f.label,
+            label: f.term.label,
             source: TopicSource::Follow,
             mode: TopicMode::UntilSeen,
-            sport_only: f.sport_only,
+            sport_only: f.term.sport_only,
             categories: Vec::new(),
-            sport_descr: f.sport_only,
+            sport_descr: false,
             shield: true,
             windows: Vec::new(),
             spans: Vec::new(),
         };
-        topics.push((topic, f.terms, cfg.spoiler.default_window_h));
+        topics.push((topic, f.term.terms, cfg.spoiler.default_window_h, Narrow { without: f.without, fixtures_only: f.fixtures_only }));
     }
-    let terms: Vec<(String, u32)> = topics.iter().enumerate().flat_map(|(i, (_, ts, _))| ts.iter().map(move |t| (t.clone(), i as u32))).collect();
+    let terms: Vec<(String, u32)> = topics.iter().enumerate().flat_map(|(i, (_, ts, _, _))| ts.iter().map(move |t| (t.clone(), i as u32))).collect();
     let matcher = TermSet::new(&terms);
 
     let mut shields: HashMap<ChannelId, Vec<ShieldSpan>> = HashMap::new();
@@ -315,15 +387,16 @@ pub fn build(conn: &rusqlite::Connection, cfg: &Config, lib: &Library, now: Time
                 chans.entry(e).or_default().push((c.id, c.tvg_shift_min));
             }
         }
+        // seen rows by event (a fixture's teams, whatever day it was seen on)
         let seen: HashMap<String, Vec<Timestamp>> =
             db::seen_since(conn, now - MAX_LOOKBACK_S - 2 * SEEN_SPAN_S)?.into_iter().fold(HashMap::new(), |mut m, s| {
-                m.entry(s.event_key).or_default().push(s.first_start);
+                m.entry(event_base(&s.event_key).to_owned()).or_default().push(s.first_start);
                 m
             });
         let max_h = topics.iter().map(|t| if t.2 == 0 { i64::MAX } else { i64::from(t.2) }).max().unwrap_or(48);
         let lookback = max_h.saturating_mul(3600).saturating_add(SEEN_SPAN_S).min(MAX_LOOKBACK_S);
         let shield_from = now - 6 * 3600;
-        for (idx, (topic, terms, window_h)) in topics.iter_mut().enumerate() {
+        for (idx, (topic, terms, window_h, narrow)) in topics.iter_mut().enumerate() {
             let idx = idx as u32;
             let until_seen = topic.mode == TopicMode::UntilSeen;
             let from = if until_seen { now - lookback } else { shield_from };
@@ -333,19 +406,19 @@ pub fn build(conn: &rusqlite::Connection, cfg: &Config, lib: &Library, now: Time
             }
             // one FTS query per topic: titles make events, titles and sub-titles shield spans
             let cands = db::event_candidates(conn, terms, !wants_shield, from, now + LOOKAHEAD_S)?;
-            let mut events: HashMap<String, Window> = HashMap::new();
+            let mut airings: Vec<Airing> = Vec::new();
             let mut event_ids = HashSet::new();
             for p in &cands {
                 let Some(on) = chans.get(&p.epg_channel_id) else { continue };
                 if !topic.in_scope(&p.categories) {
                     continue;
                 }
-                let in_title = matcher.owners_in(&folded(&p.title)).contains(&idx);
-                if until_seen && in_title {
+                let ft = folded(&p.title);
+                let in_title = matcher.owners_in(&ft).contains(&idx);
+                if until_seen && in_title && narrow.is_event(&ft, p) {
                     let se = p.season.zip(p.episode);
                     let key = super::event_key_of(&p.title, p.sub_title.as_deref(), p.description.as_deref(), se, p.start);
-                    // candidates come ordered by start: the first one seen is the first airing
-                    events.entry(key.clone()).or_insert_with(|| Window { open: p.start, close: p.stop, event_key: key, title: p.title.clone() });
+                    airings.push(Airing { base: event_base(&key).to_owned(), start: p.start, stop: p.stop, key, title: p.title.clone() });
                     event_ids.insert(p.id);
                 }
                 if wants_shield && p.stop > now {
@@ -361,10 +434,10 @@ pub fn build(conn: &rusqlite::Connection, cfg: &Config, lib: &Library, now: Time
             }
             if until_seen {
                 let span = if *window_h == 0 { None } else { Some(i64::from(*window_h) * 3600) };
-                let windows: Vec<Window> = events
-                    .into_values()
-                    .filter(|w| !seen.get(&w.event_key).is_some_and(|starts| starts.iter().any(|s| (s - w.open).abs() <= SEEN_SPAN_S)))
-                    .map(|w| Window { close: span.map_or(Timestamp::MAX, |s| w.close.saturating_add(s)), ..w })
+                let windows: Vec<Window> = events_of(airings)
+                    .into_iter()
+                    .filter(|(base, w)| !seen.get(base).is_some_and(|starts| starts.iter().any(|s| (s - w.open).abs() <= SEEN_SPAN_S)))
+                    .map(|(_, w)| Window { close: span.map_or(Timestamp::MAX, |s| w.close.saturating_add(s)), ..w })
                     .filter(|w| w.close > now)
                     .collect();
                 topic.set_windows(windows);

@@ -183,15 +183,27 @@ fn plan(q: &Q, p: &SpoilerGuard) -> Out<Write> {
             Ok(Write::Series { norm: crate::spoiler::series_key(&name), label: name })
         }
         SpoilerAction::Blackout => {
-            // a programme (its title is the topic) or a topic, until a time
-            let (label, until_default) = match (p.item.as_deref(), p.topic.as_deref()) {
+            // a programme (a fixture's two teams, else its core title, like the app's "I'll
+            // watch it later") or a topic, until a time
+            let (label, terms, until_default) = match (p.item.as_deref(), p.topic.as_deref()) {
                 (Some(s), None) => {
                     let AgentRef::Programme { channel, start } = parse_ref(s)? else { return Err(Fail::bad("ref is a programme ref")) };
                     let c = q.channel_by_ref(&channel).ok_or_else(|| Fail::not_found("programme"))?;
                     let prog = q.programme_at(c, start)?.ok_or_else(|| Fail::not_found("programme"))?;
-                    (prog.title.to_string(), Some(prog.stop + i64::from(window_h) * 3600))
+                    let until = Some(prog.stop + i64::from(window_h) * 3600);
+                    match crate::textmatch::fixture::parse_fixture(&prog.title, prog.sub_title.as_deref()) {
+                        Some((a, b)) => (format!("{a} v {b}"), vec![a, b], until),
+                        None => {
+                            let core = crate::textmatch::event::core_title(&prog.title);
+                            let core = if core.is_empty() { prog.title.to_string() } else { core };
+                            (prog.title.to_string(), vec![core], until)
+                        }
+                    }
                 }
-                (None, Some(t)) => (text("topic", t)?.to_owned(), None),
+                (None, Some(t)) => {
+                    let t = text("topic", t)?.to_owned();
+                    (t.clone(), vec![t], None)
+                }
                 _ => return Err(Fail::bad("blackout takes ref or topic")),
             };
             let until = match p.until.as_deref() {
@@ -201,16 +213,15 @@ fn plan(q: &Q, p: &SpoilerGuard) -> Out<Write> {
             if until <= q.now || until > q.now + 14 * 86_400 {
                 return Err(Fail::bad("until is in the next 14 days"));
             }
-            Ok(Write::Add(SpoilerRule {
-                terms: vec![label.clone()],
-                until_at: Some(until),
-                window_h,
-                ..base_rule(SpoilerRuleKind::Blackout, &label, q.now)
-            }))
+            Ok(Write::Add(SpoilerRule { terms, until_at: Some(until), window_h, ..base_rule(SpoilerRuleKind::Blackout, &label, q.now) }))
         }
         SpoilerAction::Remove => {
+            // only Claude's own rules: removing the user's would loosen their guard
             let id = SpoilerRuleId(p.id.ok_or_else(|| Fail::bad("remove needs id (from list)"))?);
-            crate::store::spoiler::rule(q.conn, id).map_err(|_| Fail::not_found("spoiler rule"))?;
+            let r = crate::store::spoiler::rule(q.conn, id).map_err(|_| Fail::not_found("spoiler rule"))?;
+            if !r.by_agent {
+                return Err(Fail::bad("that rule is yours — remove it in Tuner ▸ Settings ▸ Spoiler guard"));
+            }
             Ok(Write::Remove(id))
         }
         SpoilerAction::MarkSeen => {
@@ -219,10 +230,10 @@ fn plan(q: &Q, p: &SpoilerGuard) -> Out<Write> {
                 AgentRef::Programme { channel, start } => {
                     let c = q.channel_by_ref(&channel).ok_or_else(|| Fail::not_found("programme"))?;
                     let prog = q.programme_at(c, start)?.ok_or_else(|| Fail::not_found("programme"))?;
+                    // EPG time, like the tracker and Ctrl+W (a shifted start could change the
+                    // fixture key's date)
                     let full = crate::store::epg::programme(q.conn, prog.id)?;
-                    // the airing as shown on this channel (the guard keys seen rows by it)
-                    let shown = crate::model::Programme { start: prog.start, stop: prog.stop, ..full };
-                    Ok(Write::Seen(crate::spoiler::seen_row_for(&shown, SeenHow::Agent, q.now)))
+                    Ok(Write::Seen(crate::spoiler::seen_row_for(&full, SeenHow::Agent, q.now)))
                 }
                 AgentRef::Item(r) if r.kind == ItemKind::Episode => {
                     let (ep, idx) = q.episode(&r)?.ok_or_else(|| Fail::not_found("episode"))?;
@@ -253,7 +264,7 @@ pub(super) async fn handle(h: &Arc<Inner>, p: SpoilerGuard) -> Out<Value> {
             let following = h.run(false, |q| Ok(crate::store::spoiler::follow_topics(q.conn)?)).await?;
             to_value(&json!({
                 "rules": rules.iter().map(rule_out).collect::<Vec<_>>(),
-                "following": following.iter().map(|t| clean(&t.label)).collect::<Vec<_>>(),
+                "following": following.iter().map(|t| clean(&t.term.label)).collect::<Vec<_>>(),
             }))
         }
         action => {

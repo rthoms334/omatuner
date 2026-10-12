@@ -263,8 +263,12 @@ pub struct EpgGridState {
     /// Programme under the pointer (the screen loads its description into `hover_detail`).
     pub(crate) hovered: Option<ProgrammeId>,
     pub(crate) hover_detail: Option<(ProgrammeId, String)>,
+    /// The `Spoilers::stamp` `hover_detail` was loaded under.
+    pub(crate) hover_stamp: (u64, u64),
     /// The spoiler guard's view for this frame's text (the screen sets it; identity by default).
-    pub(crate) spoilers: crate::ui::widgets::spoiler::Spoilers,
+    pub spoilers: crate::ui::widgets::spoiler::Spoilers,
+    /// Cell titles as the guard shows them (judged once a minute per programme).
+    titles: crate::ui::widgets::spoiler::TitleCache,
     /// Set by the guide screen each frame: why rows without a mapping have no programmes
     /// ("Loading guide… 45 %", "Not in your guide — Ctrl+E maps it"…), shown instead of "No
     /// guide data" (DESIGN §13.12).
@@ -291,7 +295,9 @@ impl EpgGridState {
             show_numbers: true,
             hovered: None,
             hover_detail: None,
+            hover_stamp: (0, 0),
             spoilers: Default::default(),
+            titles: Default::default(),
             no_guide_label: None,
         }
     }
@@ -684,7 +690,8 @@ pub fn epg_grid(
                     _ => false,
                 };
             let reminder = cell.programme.as_ref().is_some_and(|p| state.reminders.get(&row.channel).is_some_and(|s| s.contains(&p.start)));
-            paint_cell(&grid_painter, &f, &row, cell, r, focused, reminder, progs.is_none(), state.clock_24h);
+            let title = cell.programme.as_ref().map(|p| state.titles.title(&state.spoilers, p));
+            paint_cell(&grid_painter, &f, &row, cell, title.as_deref(), r, focused, reminder, progs.is_none(), state.clock_24h);
             if let Some(pos) = pointer
                 && r.contains(pos)
                 && grid.contains(pos)
@@ -745,7 +752,7 @@ pub fn epg_grid(
         let catchup = state.rows.get(row).is_some_and(|r| catchup_available(r, &p, now));
         resp.clone().on_hover_ui_at_pointer(|ui| {
             ui.set_max_width(320.0 * theme.rem());
-            ui.label(egui::RichText::new(p.title.as_ref()).size(theme.font(TypeToken::Body)).color(t.fg));
+            ui.label(egui::RichText::new(state.spoilers.programme_title(&p)).size(theme.font(TypeToken::Body)).color(t.fg));
             let mut when = time_range(p.start, p.stop, h24);
             if catchup {
                 when.push_str("  ");
@@ -880,9 +887,20 @@ fn paint_header(
     );
 }
 
-/// One programme / gap / skeleton cell.
+/// One programme / gap / skeleton cell; `title`: the programme's as the spoiler guard shows it.
 #[allow(clippy::too_many_arguments)]
-fn paint_cell(p: &egui::Painter, f: &Frame<'_>, row: &GuideRow, cell: &Cell, r: Rect, focused: bool, reminder: bool, skeleton: bool, h24: bool) {
+fn paint_cell(
+    p: &egui::Painter,
+    f: &Frame<'_>,
+    row: &GuideRow,
+    cell: &Cell,
+    title: Option<&str>,
+    r: Rect,
+    focused: bool,
+    reminder: bool,
+    skeleton: bool,
+    h24: bool,
+) {
     let theme = f.theme;
     let t = &theme.tokens;
     let inner = Rect::from_min_max(egui::pos2(r.left(), r.top() + 1.0), egui::pos2(r.right() - 1.0, r.bottom() - 1.0));
@@ -966,7 +984,7 @@ fn paint_cell(p: &egui::Painter, f: &Frame<'_>, row: &GuideRow, cell: &Cell, r: 
         p,
         egui::pos2(left, title_y),
         Align2::LEFT_CENTER,
-        prog.title.to_string(),
+        title.unwrap_or(&prog.title).to_owned(),
         FontId::proportional(theme.font(TypeToken::Body)),
         title_color,
         (right - left).max(0.0),

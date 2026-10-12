@@ -107,8 +107,9 @@ add. Never create a rule from an inferred interest. Spoiler-safe results show on
             name: "spoiler_guard",
             title: "Spoiler guard",
             description: "Tuner's spoiler guard, which hides results and later episodes in the app and in these tools until the user \
-has watched them: status, list, add_topic, add_series, blackout (\"I'll watch it later\"), remove, mark_seen. Say \"hidden by your \
-spoiler guard\" rather than guessing; never web-search a guarded event. Writes need the user's confirmation; pausing stays in the app.",
+has watched them: status, list, add_topic, add_series, blackout (\"I'll watch it later\"), remove (rules Claude added only; the \
+user's own rules are removed in the app), mark_seen. Say \"hidden by your spoiler guard\" rather than guessing; never web-search a \
+guarded event. Writes need the user's confirmation; pausing stays in the app.",
             input_schema: object(
                 json!({
                     "action": action_schema::<SpoilerAction>("What to do."),
@@ -121,7 +122,7 @@ spoiler guard\" rather than guessing; never web-search a guarded event. Writes n
                     "ref": text("blackout / mark_seen: a programme or episode ref."),
                     "topic": text("blackout: a topic instead of a programme."),
                     "until": text(&format!("blackout: until. {TIME}")),
-                    "id": { "type": "integer", "description": "remove: a rule id." },
+                    "id": { "type": "integer", "description": "remove: the id of a rule Claude added." },
                 }),
                 &["action"],
             ),

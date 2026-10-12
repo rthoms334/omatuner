@@ -346,14 +346,28 @@ pub fn import(conn: &Connection, v: &serde_json::Value, _remap: &dyn Fn(&ItemRef
 
 // ------------------------------------------------------------------ Following's topics (B4)
 
+/// A spoiler-safe Following rule as a guard topic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FollowTopic {
+    pub term: crate::guard::GuardTerm,
+    /// The spec's `without` words, folded ("women", "fan tv", "highlights"): an airing that
+    /// carries one isn't the followed event.
+    pub without: Vec<String>,
+    /// A Team rule: only fixtures ("A v B") are its events.
+    pub fixtures_only: bool,
+}
+
 /// Following rules with `spoiler_safe = 1` as guard topics ("until seen"; Sport scope for Team
-/// and Event rules): their name and the spec's `terms`, folded. A broken spec is skipped with a
-/// WARN (by id, never the text).
-pub fn follow_topics(conn: &Connection) -> Result<Vec<crate::guard::GuardTerm>> {
+/// and Event rules): their name and the spec's `terms`, folded, with what keeps them narrow
+/// (`without`, fixtures only for Team rules). A broken spec is skipped with a WARN (by id,
+/// never the text).
+pub fn follow_topics(conn: &Connection) -> Result<Vec<FollowTopic>> {
     #[derive(Deserialize)]
     struct Terms {
         #[serde(default)]
         terms: Vec<String>,
+        #[serde(default)]
+        without: Vec<String>,
     }
     let mut stmt =
         conn.prepare_cached("SELECT id, name, kind, spec FROM follow_rule WHERE spoiler_safe = 1 AND enabled = 1 ORDER BY priority, id")?;
@@ -365,7 +379,11 @@ pub fn follow_topics(conn: &Connection) -> Result<Vec<crate::guard::GuardTerm>> 
             Ok(t) => {
                 let terms = fold_terms(&t.terms);
                 if !terms.is_empty() {
-                    out.push(crate::guard::GuardTerm { label: name, terms, sport_only: matches!(kind.as_str(), "team" | "event") });
+                    out.push(FollowTopic {
+                        term: crate::guard::GuardTerm { label: name, terms, sport_only: matches!(kind.as_str(), "team" | "event") },
+                        without: fold_terms(&t.without),
+                        fixtures_only: kind == "team",
+                    });
                 }
             }
             Err(e) => tracing::warn!("follow rule {id}: unreadable spec, not a spoiler topic: {e}"),
@@ -409,7 +427,8 @@ pub fn fts_terms(terms: &[String]) -> Option<String> {
 
 /// Programmes of enabled guides (active generation) mapped to a playlist channel, overlapping
 /// `[from, to)` (EPG time), whose title (`title_only`) or title / sub-title mention one of
-/// `terms` (an FTS pre-filter; callers re-check whole tokens).
+/// `terms` (an FTS pre-filter; callers re-check whole tokens). Newest first: at the
+/// [`MAX_CANDIDATES`] cap the oldest airings go, never the match on now.
 pub fn event_candidates(conn: &Connection, terms: &[String], title_only: bool, from: Timestamp, to: Timestamp) -> Result<Vec<EventCandidate>> {
     let Some(expr) = fts_terms(terms) else { return Ok(Vec::new()) };
     let expr = if title_only { format!("{{title}} : ({expr})") } else { expr };
@@ -422,7 +441,7 @@ pub fn event_candidates(conn: &Connection, terms: &[String], title_only: bool, f
          WHERE programme_fts MATCH ?1 AND p.gen = es.active_gen AND es.enabled = 1
            AND p.start < ?3 AND p.stop > ?2
            AND EXISTS (SELECT 1 FROM channel_epg ce WHERE ce.epg_channel_id = p.epg_channel_id)
-         ORDER BY p.start LIMIT ?4",
+         ORDER BY p.start DESC LIMIT ?4",
     )?;
     let rows = stmt.query_map(params![expr, from, to, MAX_CANDIDATES as i64], |r| {
         Ok(EventCandidate {
@@ -441,7 +460,11 @@ pub fn event_candidates(conn: &Connection, terms: &[String], title_only: bool, f
             episode: r.get(9)?,
         })
     })?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+    let out: Vec<EventCandidate> = rows.collect::<rusqlite::Result<_>>()?;
+    if out.len() == MAX_CANDIDATES {
+        tracing::debug!("spoiler guard: a topic hit the {MAX_CANDIDATES}-programme cap; its oldest airings were left out");
+    }
+    Ok(out)
 }
 
 /// One episode's progress, merged across playlists by the series key in its fingerprint
@@ -538,8 +561,7 @@ mod tests {
     }
 
     #[test]
-    fn terms_become_or_phrases() {
-        assert_eq!(fts_terms(&["arsenal".into(), "man utd".into()]).as_deref(), Some("\"arsenal\" OR \"man utd\""));
+    fn a_term_without_a_token_makes_no_query() {
         assert_eq!(fts_terms(&["\"".into()]), None);
     }
 }

@@ -1284,7 +1284,53 @@ fn the_spoiler_guard_tool() {
     let qual = programme(&mut w, "touring cars qualifying");
     let b = w.ok("spoiler_guard", json!({ "action": "blackout", "ref": qual }));
     assert!(b["id"].as_i64().is_some());
+    // a fixture's blackout guards its two teams (news sub-titles name teams, not the fixture)
+    let now = w.now;
+    w.ui.services()
+        .store
+        .writer()
+        .blocking(move |c| {
+            c.execute(
+                "INSERT INTO programme(epg_source_id, epg_channel_id, gen, start, stop, title, categories) VALUES (1, 2, 1, ?1, ?2, 'PL: Arsenal v Chelsea', 'Sport')",
+                params![now + 10_000, now + 17_000],
+            )?;
+            c.execute("INSERT INTO programme_fts(rowid, title, sub_title) VALUES (?1, 'PL: Arsenal v Chelsea', NULL)", [c.last_insert_rowid()])?;
+            Ok(())
+        })
+        .unwrap();
+    let fixture = programme(&mut w, "arsenal chelsea");
+    let b = w.ok("spoiler_guard", json!({ "action": "blackout", "ref": fixture }))["id"].as_i64().unwrap();
+    let list = w.ok("spoiler_guard", json!({ "action": "list" }));
+    let rule = list["rules"].as_array().unwrap().iter().find(|r| r["id"] == b).unwrap();
+    assert_eq!((rule["label"].as_str(), rule["terms"].clone()), (Some("Arsenal v Chelsea"), json!(["arsenal", "chelsea"])));
     assert_eq!(w.ok("spoiler_guard", json!({ "action": "remove", "id": id }))["removed"], true);
+    // the user's own rule stays theirs: Claude never loosens the guard
+    use tuner::model::{SpoilerMode, SpoilerRule, SpoilerRuleId, SpoilerRuleKind};
+    let mine =
+        w.ui.services()
+            .store
+            .writer()
+            .blocking(move |c| {
+                let r = SpoilerRule {
+                    id: SpoilerRuleId(0),
+                    kind: SpoilerRuleKind::Topic,
+                    label: "Strictly".into(),
+                    terms: vec!["strictly".into()],
+                    series_norm: None,
+                    categories: vec![],
+                    mode: SpoilerMode::Always,
+                    window_h: 0,
+                    until_at: None,
+                    sport_descr: false,
+                    shield: false,
+                    enabled: true,
+                    by_agent: false,
+                    created_at: 0,
+                };
+                tuner::store::spoiler::add_rule(c, &r, now)
+            })
+            .unwrap();
+    assert_eq!(w.err("spoiler_guard", json!({ "action": "remove", "id": mine.0 })), ErrorCode::BadRequest);
     assert!(w.ok("spoiler_guard", json!({ "action": "status" }))["topics"].is_array());
 }
 

@@ -7,11 +7,11 @@
 //! * the **builder**: a new snapshot (blocking pool) on `Guard::rebuild`, a settings change
 //!   (`Guard::configure`), a new library (not a zap's copy), an hourly tick (extends the 36 h
 //!   lookahead) — debounced 1 s;
-//! * the **tracker**: every 30 s, the main picture's snapshot (`AppShared::main_player`; tile B
-//!   once AppShared publishes it) → what's on → [`Tracker::observe`] → a `spoiler_seen` row
-//!   through the store writer (`DataScope::Spoiler`), `Guard::note_seen` for the UI's Undo, a
-//!   rebuild and the toast "… marked seen — spoiler guard lifted". An episode played to 90 %
-//!   rebuilds too (its progress moves the series boundary on).
+//! * the **tracker**: every 30 s, each picture's snapshot (`AppShared::tile_player`, A and B)
+//!   → what's on → [`Tracker::observe`] → a `spoiler_seen` row through the store writer
+//!   (`DataScope::Spoiler`), `Guard::note_seen` for the UI's Undo, a rebuild and the toast
+//!   "… marked seen — spoiler guard lifted · Undo…". An episode played to 90 % rebuilds on the
+//!   next poll (its saved progress moves the series boundary on).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Weak};
@@ -185,51 +185,58 @@ async fn builder(guard: Guard, shared: Arc<AppShared>, store: Store) {
 async fn track(guard: Guard, shared: Arc<AppShared>, store: Store) {
     let mut tracker = Tracker::default();
     let mut episodes_done: HashSet<crate::model::EpisodeId> = HashSet::new();
+    let mut rebuild_next_poll = false;
     let mut tick = tokio::time::interval(POLL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
+        // an episode reached 90 % last poll: its progress row is saved by now (every 10 s), so
+        // the series boundary moves on (whatever plays now; the episode may have ended)
+        if std::mem::take(&mut rebuild_next_poll) {
+            guard.rebuild();
+        }
         let gsnap = guard.snapshot();
         if !gsnap.on || !gsnap.ready {
             continue;
         }
-        let Some(rx) = shared.main_player() else { continue };
-        let snap: Arc<PlayerSnapshot> = rx.borrow().clone();
-        if snap.state != PlayerState::Playing {
-            continue;
-        }
-        let Some(p) = snap.playable.clone() else { continue };
-        let now = crate::model::now();
-        if let (MediaRef::Episode(id), PlayableKind::Episode { .. }) = (&p.media, &p.kind) {
-            // the series boundary moves with the episode's progress (the player saves it)
-            if fraction(&snap, None).is_some_and(|f| f >= 0.9) && episodes_done.insert(*id) {
-                guard.rebuild();
-            }
-            continue;
-        }
-        let lib = shared.library();
-        let (channel, catchup) = match (&p.media, &p.kind) {
-            (MediaRef::Channel(ch), PlayableKind::Live) => (*ch, None),
-            (MediaRef::Catchup { channel, start, stop, .. }, _) => (*channel, Some((*start, *stop))),
-            _ => continue,
-        };
-        let Some((epg, shift)) = lib.live.get(channel).and_then(|c| Some((c.epg_channel_id?, c.tvg_shift_min))) else { continue };
-        drop(lib);
-        let frac = catchup.and_then(|(s, e)| fraction(&snap, Some(e - s)));
-        let reader = store.clone();
-        let watching = tokio::task::spawn_blocking(move || resolve(&reader, epg, shift, catchup, frac, now)).await;
-        let w = match watching {
-            Ok(Ok(Some(w))) => w,
-            Ok(Ok(None)) => continue,
-            Ok(Err(e)) => {
-                tracing::debug!("spoiler guard: what's on: {e}");
+        // every picture shown can mark something seen (two on one airing count it once: the
+        // second observation in a poll adds no time)
+        for tile in [crate::model::TileId::A, crate::model::TileId::B] {
+            let Some(rx) = shared.tile_player(tile) else { continue };
+            let snap: Arc<PlayerSnapshot> = rx.borrow().clone();
+            if snap.state != PlayerState::Playing {
                 continue;
             }
-            Err(_) => continue,
-        };
-        let tracked = super::verdict::tracks(&gsnap, &w.subject(), now);
-        if let Some(row) = tracker.observe(&w, tracked, now) {
-            record(&guard, &store, row, now, channel);
+            let Some(p) = snap.playable.clone() else { continue };
+            let now = crate::model::now();
+            if let (MediaRef::Episode(id), PlayableKind::Episode { .. }) = (&p.media, &p.kind) {
+                rebuild_next_poll |= fraction(&snap, None).is_some_and(|f| f >= 0.9) && episodes_done.insert(*id);
+                continue;
+            }
+            let lib = shared.library();
+            let (channel, catchup) = match (&p.media, &p.kind) {
+                (MediaRef::Channel(ch), PlayableKind::Live) => (*ch, None),
+                (MediaRef::Catchup { channel, start, stop, .. }, _) => (*channel, Some((*start, *stop))),
+                _ => continue,
+            };
+            let Some((epg, shift)) = lib.live.get(channel).and_then(|c| Some((c.epg_channel_id?, c.tvg_shift_min))) else { continue };
+            drop(lib);
+            let frac = catchup.and_then(|(s, e)| fraction(&snap, Some(e - s)));
+            let reader = store.clone();
+            let watching = tokio::task::spawn_blocking(move || resolve(&reader, epg, shift, catchup, frac, now)).await;
+            let w = match watching {
+                Ok(Ok(Some(w))) => w,
+                Ok(Ok(None)) => continue,
+                Ok(Err(e)) => {
+                    tracing::debug!("spoiler guard: what's on: {e}");
+                    continue;
+                }
+                Err(_) => continue,
+            };
+            let tracked = super::verdict::tracks(&gsnap, &w.subject(), now);
+            if let Some(row) = tracker.observe(&w, tracked, now) {
+                record(&guard, &store, row, now, channel);
+            }
         }
     }
 }
@@ -296,7 +303,11 @@ fn record(guard: &Guard, store: &Store, row: SeenRow, now: Timestamp, channel: C
             g.note_seen(r);
             g.rebuild();
             if let Some(b) = bus {
-                b.toast(crate::msg::Toast::info(format!("{shown} marked seen — spoiler guard lifted")));
+                b.toast(crate::msg::Toast {
+                    action: Some(("Undo…".into(), crate::keymap::Action::SpoilerMenu)),
+                    ttl_ms: 6000,
+                    ..crate::msg::Toast::info(format!("“{shown}” marked seen — spoiler guard lifted"))
+                });
             }
         }
         Ok(())

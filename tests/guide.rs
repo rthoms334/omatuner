@@ -203,6 +203,8 @@ const T0: Timestamp = 1_791_576_000; // a multiple of 30 minutes
 #[derive(Default)]
 struct FakeEpg {
     calls: u32,
+    /// This slot's programmes are a result ("Arsenal 2-1 Chelsea").
+    result_slot: Option<i64>,
 }
 
 impl EpgReader for FakeEpg {
@@ -216,7 +218,7 @@ impl EpgReader for FakeEpg {
                 id: ProgrammeId(ch.0 * 100_000 + slot + 50_000),
                 start: s,
                 stop: s + 1800,
-                title: format!("Show {slot}").into(),
+                title: if self.result_slot == Some(slot) { "Arsenal 2-1 Chelsea".into() } else { format!("Show {slot}").into() },
                 sub_title: None,
                 flags: ProgrammeFlags::default(),
             });
@@ -420,6 +422,22 @@ fn grid_paints_the_now_line_and_virtualizes_rows() {
     // the focused cell uses the list-cursor colours
     let focus = t.iter().find(|(x, _, r)| x == "Show 0" && r.top() < 120.0).expect("focused title on the first row");
     assert_eq!(focus.1, theme.tokens.list_cursor_text);
+    // the spoiler guard rewrites a result in a cell (scores hidden in every title)
+    let snap = tuner::spoiler::snapshot::GuardSnapshot::from_parts(
+        tuner::spoiler::snapshot::Settings { hide_scores_everywhere: true, ..Default::default() },
+        Vec::new(),
+        HashMap::new(),
+        HashMap::new(),
+    );
+    h.state_mut().state.spoilers = tuner::ui::widgets::spoiler::Spoilers::with_guard(tuner::guard::Guard::with_snapshot(snap), now, true);
+    h.state_mut().reader.result_slot = Some(1);
+    h.state_mut().state.cache = Default::default();
+    h.step();
+    h.step();
+    let t = texts(&shapes(&h));
+    let shown = format!("Arsenal v Chelsea {}", tuner::ui::widgets::spoiler::HIDDEN);
+    assert!(t.iter().any(|(x, _, _)| *x == shown), "rewritten cell title: {:?}", t.iter().map(|x| &x.0).collect::<Vec<_>>());
+    assert!(!t.iter().any(|(x, _, _)| x.contains("2-1")), "the score never painted");
 }
 
 #[test]

@@ -43,6 +43,12 @@ pub struct Spoilers {
     reveals: RevealSet,
 }
 
+impl std::fmt::Debug for Spoilers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Spoilers").field("guard", &self.guard).field("now", &self.now).finish_non_exhaustive()
+    }
+}
+
 impl Spoilers {
     /// This frame's view.
     pub fn of(ctx: &UiCtx<'_>) -> Self {
@@ -131,6 +137,50 @@ pub fn programme_subject(p: &Programme) -> Subject<'_> {
 /// The subject of a grid programme (no categories or S/E in the slim row).
 pub fn slim_subject(p: &crate::model::ProgrammeSlim) -> Subject<'_> {
     Subject::Programme { title: &p.title, sub_title: p.sub_title.as_deref(), categories: &[], season_episode: None, start: p.start }
+}
+
+impl Spoilers {
+    /// A guide programme's title as a row, cell or search hit shows it ("Arsenal v Chelsea 󰈉").
+    pub fn programme_title<'p>(&self, p: &'p crate::model::ProgrammeSlim) -> Cow<'p, str> {
+        if self.guard.is_none() {
+            return Cow::Borrowed(&p.title);
+        }
+        self.text(&slim_subject(p), Field::Title, &p.title).unwrap_or(Cow::Borrowed(&p.title))
+    }
+}
+
+/// Guide titles as the guard shows them, judged once per programme per minute (activity moves
+/// with time) and per guard change (`Spoilers::stamp`): the grid paints hundreds of cells a
+/// frame.
+#[derive(Default)]
+pub struct TitleCache {
+    key: ((u64, u64), Timestamp),
+    /// `None`: shown as is.
+    titles: std::collections::HashMap<crate::model::ProgrammeId, Option<std::sync::Arc<str>>>,
+}
+
+impl TitleCache {
+    const MAX: usize = 4000;
+
+    /// `p`'s title under `sp`.
+    pub fn title<'p>(&mut self, sp: &Spoilers, p: &'p crate::model::ProgrammeSlim) -> Cow<'p, str> {
+        if sp.guard.is_none() {
+            return Cow::Borrowed(&p.title);
+        }
+        let key = (sp.stamp(), sp.now.div_euclid(60));
+        if key != self.key || self.titles.len() >= Self::MAX {
+            self.titles.clear();
+            self.key = key;
+        }
+        let shown = self.titles.entry(p.id).or_insert_with(|| match sp.programme_title(p) {
+            Cow::Owned(s) => Some(s.into()),
+            Cow::Borrowed(_) => None,
+        });
+        match shown {
+            Some(s) => Cow::Owned(s.to_string()),
+            None => Cow::Borrowed(&p.title),
+        }
+    }
 }
 
 // ------------------------------------------------------------------ text forms

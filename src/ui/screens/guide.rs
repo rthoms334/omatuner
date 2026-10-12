@@ -804,6 +804,11 @@ impl Screen for GuideScreen {
             // what the spoiler guard lets the grid's text say this frame
             let spoilers = crate::ui::widgets::spoiler::Spoilers::of(ctx);
             g.spoilers = spoilers.clone();
+            // a new guard snapshot, a pause or a reveal (Ctrl+B): the tooltip's text again
+            if g.hover_stamp != spoilers.stamp() {
+                g.hover_stamp = spoilers.stamp();
+                g.hover_detail = None;
+            }
             // hovered programme: load its description for the tooltip (one indexed read)
             if let Some(id) = g.hovered.filter(|id| g.hover_detail.as_ref().is_none_or(|(h, _)| h != id)) {
                 let db = ctx.db;

@@ -2,7 +2,8 @@
 //!
 //! Zapping (↑/↓, the channel panel, a number) onto a live channel whose programme may show a
 //! guarded result — it mentions an active topic and isn't the "until seen" event itself, or a
-//! blackout covers it (`Guard::shield`) — covers the picture and asks:
+//! blackout covers it (`Guard::shield`) — doesn't tune it: the picture under the card is paused
+//! (no sound, the account's one connection not spent on the new channel) and the card asks:
 //!
 //! ```text
 //! ┌──────────────────────────────────────────────────────┐
@@ -11,25 +12,29 @@
 //! │ [ Watch anyway ↵ ]  [ Next channel ↓ ]  [ Back ⌫ ]   │
 //! └──────────────────────────────────────────────────────┘
 //! ```
-//! Enter (and a click) watches anyway — for this channel, this session; ↑/↓ zap on (the next
-//! channel is judged again), Backspace goes back to the last channel, Esc leaves the player as
-//! usual. Only zaps inside the player are shielded: a channel chosen in Live or the guide is a
-//! choice, not a zap. Never while the guard is paused, off, or before its first build.
+//! Enter (and a click) tunes it anyway — for this channel while the same rule shields it; ↑/↓
+//! zap on from the shielded channel (the next one is judged again), Backspace / ← drop the card
+//! and resume the channel underneath, Esc leaves the player as usual. Only zaps inside the
+//! player are shielded: a channel chosen in Live or the guide is a choice, not a zap. Never
+//! while the guard is paused, off, or before its first build.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use super::*;
 use crate::guard::Reason;
 
 #[derive(Default)]
 struct Shield {
-    /// The live channel of the last frame (a different one now is a zap).
-    last: Option<ChannelId>,
-    /// The card is up over this channel.
+    /// The card is up over this channel (not tuned).
     card: Option<(ChannelId, Reason)>,
-    /// "Watch anyway" (this session).
-    allowed: HashSet<ChannelId>,
+    /// The live channel under the card (paused), when the card went up.
+    under: Option<ChannelId>,
+    /// The card paused the picture under it (resumed when the card goes without tuning).
+    paused_it: bool,
+    /// "Watch anyway": the channel stays unshielded while the same reason shields it (a later
+    /// event, another rule, shields it again).
+    allowed: HashMap<ChannelId, Reason>,
     /// The egui pass the player last drew in.
     drawn_pass: Option<u64>,
 }
@@ -38,68 +43,167 @@ thread_local! {
     static SHIELD: RefCell<Shield> = RefCell::default();
 }
 
-/// The live channel playing (`None`: catch-up, a film, nothing).
-fn live_channel(snap: &PlayerSnapshot) -> Option<ChannelId> {
-    match (snap.playable.as_ref().map(|p| (&p.media, &p.kind)), &snap.state) {
-        (Some((MediaRef::Channel(id), PlayableKind::Live)), s) if *s != PlayerState::Idle => Some(*id),
-        _ => None,
-    }
-}
-
 impl PlayerScreen {
-    /// Draw the shield card over `rect` when the channel zapped onto is shielded; `true` when
-    /// drawn (the banner then stays hidden).
+    /// The channel the shield card is up over (not tuned).
+    pub(super) fn shield_card(&self) -> Option<ChannelId> {
+        SHIELD.with(|s| s.borrow().card.as_ref().map(|c| c.0))
+    }
+
+    /// Why `target` must not be tuned by a zap now (`None`: tune it).
+    fn shield_reason(ctx: &UiCtx<'_>, target: ChannelId) -> Option<Reason> {
+        if !crate::spoiler::ENABLED {
+            return None;
+        }
+        let reason = ctx.services.agent.guard().shield(target, ctx.now)?;
+        let allowed = SHIELD.with(|s| s.borrow().allowed.get(&target) == Some(&reason));
+        (!allowed).then_some(reason)
+    }
+
+    /// Put the card up over `target` (nothing tuned); the picture under it pauses.
+    fn raise_shield(ctx: &mut UiCtx<'_>, target: ChannelId, reason: Reason) {
+        let pause = SHIELD.with(|s| {
+            let mut s = s.borrow_mut();
+            let first = s.card.is_none();
+            s.card = Some((target, reason));
+            if first {
+                s.under = playing_channel(ctx.player);
+                s.paused_it = !ctx.player.paused && s.under.is_some();
+            }
+            first && s.paused_it
+        });
+        if pause {
+            ctx.play(PlayerCommand::SetPause(true));
+        }
+    }
+
+    /// Take the card down without tuning; `resume`: play the channel under it again.
+    fn drop_shield(ctx: &mut UiCtx<'_>, resume: bool) {
+        let unpause = SHIELD.with(|s| {
+            let mut s = s.borrow_mut();
+            s.card = None;
+            s.under = None;
+            std::mem::take(&mut s.paused_it)
+        });
+        if unpause && resume {
+            ctx.play(PlayerCommand::SetPause(false));
+        }
+    }
+
+    /// A zap (↑/↓) while the shield may act: `true` when it took the zap. With the card up the
+    /// zap goes on from the shielded channel; otherwise a shielded neighbour gets the card
+    /// instead of a tune.
+    pub(super) fn shield_zap(&mut self, ctx: &mut UiCtx<'_>, forward: bool) -> bool {
+        if !crate::spoiler::ENABLED {
+            return false;
+        }
+        let card = self.shield_card();
+        if card.is_none() && !ctx.services.agent.guard().on() {
+            return false;
+        }
+        let from = card.or_else(|| playing_channel(ctx.player));
+        let (Some(from), Some(zap)) = (from, ctx.player.zap.as_ref()) else { return card.is_some() };
+        let unlocked = ctx.parental.is_unlocked(&ctx.config.parental);
+        let hides_explicit = ctx.config.parental.hides_explicit(unlocked);
+        let failing = super::live::failing_set(ctx).unwrap_or_default();
+        let lib = ctx.lib.clone();
+        let skip = |c: ChannelId| {
+            lib.live.get(c).is_none_or(|x| (x.locked && !unlocked) || x.unsupported || failing.contains(&live::channel_ref(x)))
+                || (hides_explicit && lib.explicit.channels.contains(&c))
+        };
+        let Some(next) = LiveIndex::neighbour(&zap.channels, from, forward, &skip) else { return card.is_some() };
+        if let Some(reason) = Self::shield_reason(ctx, next) {
+            Self::raise_shield(ctx, next, reason);
+            return true;
+        }
+        if card.is_none() {
+            return false; // the player's own zap
+        }
+        // from the card onto an unshielded channel
+        if Some(next) == SHIELD.with(|s| s.borrow().under) {
+            Self::drop_shield(ctx, true);
+        } else {
+            Self::drop_shield(ctx, false);
+            ctx.play(PlayerCommand::ZapTo(next));
+        }
+        true
+    }
+
+    /// A channel tuned from a panel or a number: `true` when the shield put its card up instead.
+    pub(super) fn shield_tune(&mut self, ctx: &mut UiCtx<'_>, id: ChannelId) -> bool {
+        match Self::shield_reason(ctx, id) {
+            Some(reason) => {
+                Self::raise_shield(ctx, id, reason);
+                true
+            }
+            None => {
+                // tuned on purpose: whatever card was up goes (the load plays)
+                if self.shield_card().is_some() {
+                    Self::drop_shield(ctx, Some(id) == SHIELD.with(|s| s.borrow().under));
+                }
+                false
+            }
+        }
+    }
+
+    /// Keys while the card is up: Enter watches anyway, Backspace / ← go back to the channel
+    /// under the card. ↑/↓ reach [`Self::shield_zap`] through the player's zap.
+    pub(super) fn shield_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> Option<bool> {
+        self.shield_card()?;
+        match action {
+            Action::FocusOsdControls | Action::Activate => {
+                self.watch_anyway(ctx);
+                Some(true)
+            }
+            Action::LastChannel => {
+                Self::drop_shield(ctx, true);
+                Some(true)
+            }
+            _ => None,
+        }
+    }
+
+    /// "Watch anyway": tune the shielded channel; it stays unshielded while the same reason
+    /// shields it.
+    fn watch_anyway(&mut self, ctx: &mut UiCtx<'_>) {
+        let Some((ch, reason)) = SHIELD.with(|s| s.borrow().card.clone()) else { return };
+        SHIELD.with(|s| s.borrow_mut().allowed.insert(ch, reason));
+        Self::drop_shield(ctx, false);
+        self.tune(ctx, ch, Action::Activate);
+    }
+
+    /// Draw the shield card over `rect` while it is up; `true` when drawn.
     pub(super) fn draw_shield(&mut self, ui: &egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, snap: &PlayerSnapshot) -> bool {
         if !crate::spoiler::ENABLED {
             return false;
         }
-        let guard = ctx.services.agent.guard();
-        let now = ctx.now;
-        let channel = live_channel(snap);
         let pass = ui.ctx().cumulative_pass_nr();
-        let card = SHIELD.with(|s| {
+        let (card, gone) = SHIELD.with(|s| {
             let mut s = s.borrow_mut();
-            // the player wasn't drawn last pass (Live, the guide…): what plays now was chosen,
-            // not zapped onto
-            if s.drawn_pass.is_none_or(|p| p + 1 < pass) {
-                s.last = None;
-                s.card = None;
-            }
+            // the player wasn't drawn last pass (Live, the guide…): the card went with it
+            let left = s.drawn_pass.is_none_or(|p| p + 1 < pass);
             s.drawn_pass = Some(pass);
-            let zapped = channel.is_some() && s.last.is_some() && s.last != channel;
-            s.last = channel;
-            // another channel, or its programme no longer shielded (it ended, the topic lifted)
-            if s.card.as_ref().is_some_and(|(c, _)| Some(*c) != channel || guard.shield(*c, now).is_none()) {
+            // something else plays now (a choice in Live, Claude, a reminder): no card
+            let replaced = s.card.is_some() && playing_channel(snap) != s.under;
+            if left || replaced {
                 s.card = None;
+                s.under = None;
+                s.paused_it = false;
             }
-            if zapped
-                && let Some(ch) = channel
-                && !s.allowed.contains(&ch)
-                && let Some(reason) = guard.shield(ch, now)
-            {
-                s.card = Some((ch, reason));
-            }
-            // Enter (controls focus) on the card: watch anyway
-            if s.card.is_some() && self.osd_focus {
-                self.osd_focus = false;
-                if let Some((ch, _)) = s.card.take() {
-                    s.allowed.insert(ch);
-                }
-            }
-            s.card.clone()
+            // the programme no longer shielded (it ended, the topic lifted): tune what was zapped to
+            let gone = s.card.as_ref().filter(|(c, _)| ctx.services.agent.guard().shield(*c, ctx.now).is_none()).map(|c| c.0);
+            (s.card.clone(), gone)
         });
+        if let Some(ch) = gone {
+            Self::drop_shield(ctx, false);
+            self.tune(ctx, ch, Action::Activate);
+            return false;
+        }
         let Some((ch, reason)) = card else { return false };
-        let choice = self.paint_shield(ui, ctx, rect, ch, &reason);
-        match choice {
-            Some(Action::Activate) => SHIELD.with(|s| {
-                let mut s = s.borrow_mut();
-                s.card = None;
-                s.allowed.insert(ch);
-            }),
-            Some(a) => {
-                self.on_action(ctx, a);
-            }
-            None => {}
+        match self.paint_shield(ui, ctx, rect, ch, &reason) {
+            Some(Action::Activate) => self.watch_anyway(ctx),
+            Some(Action::ZapNext) => self.zap(ctx, true),
+            Some(Action::LastChannel) => Self::drop_shield(ctx, true),
+            _ => {}
         }
         // the card stays until the programme changes or its topic lifts
         ui.ctx().request_repaint_after(Duration::from_secs(30));
