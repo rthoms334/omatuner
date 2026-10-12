@@ -537,11 +537,14 @@ pub struct AgentsConfig {
     /// nothing to offer). `None` (a new install, or upgraded from 0.2.2 or older): check at the
     /// next start.
     pub checked_version: Option<String>,
+    /// Where an agent's play opens (Settings ▸ AI agents "Agents play in"): the pop-out
+    /// (default) or the full window. A play's own `open_in` wins (DESIGN §30.13).
+    pub play_in: crate::model::OpenIn,
 }
 
 impl Default for AgentsConfig {
     fn default() -> Self {
-        Self { offer_connect: true, keep_in_sync: true, checked_version: None }
+        Self { offer_connect: true, keep_in_sync: true, checked_version: None, play_in: crate::model::OpenIn::PopOut }
     }
 }
 
@@ -729,6 +732,19 @@ mod tests {
     fn empty_file_gives_defaults() {
         let c: Config = toml::from_str("").unwrap();
         assert_eq!(c, Config::default());
+    }
+
+    /// Agents play in the pop-out unless the user chose the full window; a config from before
+    /// the setting (0.2.4) loads with the pop-out.
+    #[test]
+    fn agents_play_in_defaults_to_the_pop_out() {
+        use crate::model::OpenIn;
+        assert_eq!(Config::default().agents.play_in, OpenIn::PopOut);
+        let old: Config = toml::from_str("[agents]\noffer_connect = false\nchecked_version = \"0.2.4\"\n").unwrap();
+        assert_eq!((old.agents.play_in, old.agents.offer_connect), (OpenIn::PopOut, false));
+        let window: Config = toml::from_str("[agents]\nplay_in = \"full-window\"\n").unwrap();
+        assert_eq!(window.agents.play_in, OpenIn::FullWindow);
+        assert!(toml::to_string_pretty(&window).unwrap().contains("play_in = \"full-window\""));
     }
 
     #[test]

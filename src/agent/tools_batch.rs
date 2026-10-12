@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use super::actions::{ToolAction, action_schema};
 use super::params::{FollowAction, GuideFixAction, MultiViewAction, QueueAction, RemindersAction, SleepAction, SpoilerAction};
-use super::tools::{TIME, ToolDef, kind_enum, limit, object, reveal, spoiler_safe, text};
+use super::tools::{TIME, ToolDef, kind_enum, limit, object, open_in, reveal, spoiler_safe, text};
 
 fn strings(description: &str) -> Value {
     json!({ "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": crate::agent::proto::MAX_TEXT }, "description": description })
@@ -32,9 +32,10 @@ pub fn tools() -> Vec<ToolDef> {
             name: "queue",
             title: "Up next",
             description: "Tuner's play queue (Up next): list it, add movies, episodes, catch-up or programme refs (end, next or an \
-index; at most 50 per call, 200 in all), move, remove, clear, play (replaces what plays: call status first), skip, stop_after. Locked \
-items are refused (\"locked: needs your PIN in Tuner\"); hidden ones don't exist. Adding more than 3 items, clear and play need the \
-user's confirmation first.",
+index; at most 50 per call, 200 in all), move, remove, clear, play (replaces what plays: call status first), skip, stop_after. play \
+opens where the play tool would (default the pop-out; open_in and opened_in as for play) and the next items follow it there; skip \
+keeps Up next where it plays. Locked items are refused (\"locked: needs your PIN in Tuner\"); hidden ones don't exist. Adding more \
+than 3 items, clear and play need the user's confirmation first.",
             input_schema: object(
                 json!({
                     "action": action_schema::<QueueAction>("What to do."),
@@ -47,6 +48,7 @@ user's confirmation first.",
                     "id": { "type": "integer", "description": "play / stop_after: a row id (default: the next)." },
                     "include_played": { "type": "boolean" },
                     "played_only": { "type": "boolean", "default": true },
+                    "open_in": open_in("play / skip: where it plays, as for play."),
                 }),
                 &["action"],
             ),

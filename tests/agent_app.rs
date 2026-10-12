@@ -1270,6 +1270,73 @@ fn the_queue_tool_drives_up_next() {
     assert!(w.ok("status", json!({})).get("queue").is_none());
 }
 
+/// DESIGN §30.13: an agent's play opens in the pop-out by default — unless the user watches
+/// in Tuner's fullscreen window, or asked for the full window — and says where (`opened_in`);
+/// without Hyprland (no window published, off the desktop) it opens in the window as before.
+/// `queue play` shows what Up next started the same way (the app never heard of it before:
+/// the corner mini player); the next items follow it into the pop-out. A failed play puts an
+/// empty pop-out back in.
+#[test]
+fn agent_plays_open_in_the_pop_out_and_say_where() {
+    use tuner::reminders::ui::{Placement, WindowNow};
+    let mut w = World::new(Config::default());
+    w.publish(Visibility::NO_EXPLICIT);
+    let place = |w: &World| match &w.commands()[..] {
+        [AgentCommand::Play(p)] => p.show.place,
+        [AgentCommand::Show(s)] => s.place,
+        other => panic!("{other:?}"),
+    };
+    let bbc = json!({ "ref": "channel:1:m3u:bbc1" });
+    let out = w.ok("play", bbc.clone());
+    assert_eq!((out["opened_in"].as_str(), place(&w)), (Some("window"), Placement::FullWindow), "no Hyprland: {out}");
+
+    let shared = w.ui.services().agent.clone();
+    let away = WindowNow { can_pop: true, ..Default::default() };
+    shared.set_window(away);
+    let out = w.ok("play", bbc.clone());
+    assert_eq!((out["opened_in"].as_str(), place(&w)), (Some("popout"), Placement::PopOut), "{out}");
+    assert!(out["message"].as_str().unwrap().ends_with("It's in the pop-out."), "{out}");
+    shared.set_window(WindowNow { fullscreen: true, watching: true, ..away });
+    assert_eq!((w.ok("play", bbc.clone())["opened_in"].as_str(), place(&w)), (Some("window"), Placement::FullWindow), "fullscreen stays");
+    shared.set_window(away);
+    let tv = w.ok("play", json!({ "ref": "channel:1:m3u:bbc1", "open_in": "full_window" }));
+    assert_eq!((tv["opened_in"].as_str(), place(&w)), (Some("window"), Placement::FullWindow));
+    assert_eq!(w.err("play", json!({ "ref": "channel:1:m3u:bbc1", "open_in": "tv" })), ErrorCode::BadRequest);
+    assert!(w.commands().is_empty());
+    // a play that fails while the pop-out shows nothing (Tuner started for it): back in
+    shared.set_window(WindowNow { popped_out: true, ..away });
+    assert_eq!(w.err("play", json!({ "ref": "channel:1:m3u:gone" })), ErrorCode::NotFound);
+    assert_eq!(w.commands(), [AgentCommand::PopIn]);
+    shared.set_window(away);
+
+    let s = w.ui.services();
+    let engine = tuner::queue::service::spawn(
+        s.rt.handle(),
+        s.agent.clone(),
+        tuner::queue::service::EngineDeps {
+            store: s.store.clone(),
+            config: s.config.clone(),
+            player: Arc::new(s.tiles.focused()),
+            bus: s.bus.clone(),
+        },
+    );
+    shared.set_queue_handle(Some(engine));
+    let films: Vec<String> = ["airplane", "long comedy", "dune"]
+        .iter()
+        .map(|q| first_ref(&w.ok("search", json!({ "query": q, "kinds": ["movie"] })), "results"))
+        .collect();
+    assert_eq!(w.ok("queue", json!({ "action": "add", "refs": films }))["added"].as_array().unwrap().len(), 3);
+    assert_eq!(w.err("queue", json!({ "action": "list", "open_in": "popout" })), ErrorCode::BadRequest);
+    let out = w.ok("queue", json!({ "action": "play" }));
+    assert_eq!((out["opened_in"].as_str(), place(&w)), (Some("popout"), Placement::PopOut), "{out}");
+    shared.set_window(WindowNow { popped_out: true, ..away });
+    // (the test player never plays, so Up next isn't driving it: the skip places it again)
+    let out = w.ok("queue", json!({ "action": "skip" }));
+    assert_eq!((out["opened_in"].as_str(), place(&w)), (Some("popout"), Placement::PopOut), "the pop-out stays: {out}");
+    let out = w.ok("queue", json!({ "action": "skip", "open_in": "full_window" }));
+    assert_eq!((out["opened_in"].as_str(), place(&w)), (Some("window"), Placement::FullWindow), "{out}");
+}
+
 /// follow: a preview never looks at explicit channels; a spoiler-safe rule shows only its
 /// name; rules an agent adds are marked with its name and capped at 10 an hour.
 #[test]

@@ -440,6 +440,10 @@ pub struct Play {
     /// when the channel has catch-up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_start: Option<bool>,
+    /// Where it plays: `popout`, `full_window` or `where_i_am` (`agent::act::parse_open_in`);
+    /// default: the user's setting (DESIGN §30.13). Older clients don't send it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_in: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -474,6 +478,9 @@ pub enum ControlAction {
     PreviousChannel,
     /// Move what plays to the pop-out (the small pinned window; it never takes the keyboard).
     Popout,
+    /// Move what plays to Tuner's window, fullscreen and raised ("put it on the big screen",
+    /// DESIGN §30.13): out of the pop-out without starting it again.
+    Window,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1052,6 +1059,19 @@ pub struct PlayOut {
     pub resume_at_min: Option<u32>,
     /// One sentence for the user.
     pub message: String,
+    /// Where it plays (DESIGN §30.13; the handler fills it in).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened_in: Option<OpenedIn>,
+}
+
+/// Where an agent's play shows (`PlayOut::opened_in`, `queue play`'s `opened_in`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenedIn {
+    /// The pop-out: the small player pinned on every workspace.
+    Popout,
+    /// Tuner's window.
+    Window,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1223,8 +1243,11 @@ mod tests {
     #[test]
     fn tool_arguments_are_the_params() {
         let call = Call::from_tool("play", serde_json::json!({"ref": "channel:2:xt:live:1", "from_start": true})).unwrap();
-        assert_eq!(call, Call::Play(Play { item: "channel:2:xt:live:1".into(), from_start: Some(true) }));
+        // an older client: no open_in
+        assert_eq!(call, Call::Play(Play { item: "channel:2:xt:live:1".into(), from_start: Some(true), open_in: None }));
         assert!(call.is_action() && call.name() == "play");
+        let tv = Call::from_tool("play", serde_json::json!({"ref": "movie:2:xt:vod:1", "open_in": "full_window"})).unwrap();
+        assert_eq!(tv, Call::Play(Play { item: "movie:2:xt:vod:1".into(), from_start: None, open_in: Some("full_window".into()) }));
         assert!(Call::from_tool("browse", serde_json::json!({"kind": "film"})).is_err());
         assert!(Call::from_tool("nope", serde_json::json!({})).is_err());
     }

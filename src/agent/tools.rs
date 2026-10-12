@@ -21,6 +21,8 @@ Use these tools to find something to watch and start it in Tuner instead of the 
 airing=upcoming → tell the user when it starts and offer a reminder (reminders add with mode switch, or schedule_switch: Tuner \
 then switches to it by itself at the start, showing a toast with Cancel 10 seconds before). airing=past with catchup=true → play replays it from the archive.\n\
 * \"what's on <channel> at 9\" → whats_on with channel and at.\n\
+* play (and queue play) open in the pop-out, pinned on every workspace, unless the user wants full screen, the big screen or the TV: \
+then open_in full_window (control window moves what already plays there). Tell the user where it opened (opened_in).\n\
 * A mood (\"something light under 2 hours\") → categories, then browse with a fitting category, max_minutes, unwatched=true, \
 sort=random; details for a plot; pick one and play it. continue_watching for \"carry on with my show\".\n\
 * Tuner's spoiler guard applies to every answer: guarded text is gone and the item says spoiler: {hidden, rule, reason}. Say \
@@ -95,6 +97,11 @@ pub(super) fn spoiler_safe() -> Value {
 pub(super) fn reveal() -> Value {
     json!({ "type": "array", "maxItems": 10, "items": { "type": "string", "minLength": 1, "maxLength": crate::agent::proto::MAX_TEXT },
             "description": "Refs the user asked to see unguarded in this turn (the spoiler guard hides them otherwise)." })
+}
+
+/// `open_in` of `play` and `queue` (DESIGN §30.13; the reminders' names).
+pub(super) fn open_in(description: &str) -> Value {
+    json!({ "type": "string", "enum": ["popout", "full_window", "where_i_am"], "description": description })
 }
 
 pub(super) fn text(description: &str) -> Value {
@@ -298,15 +305,20 @@ pictures) and the sleep timer. Call it before replacing playback. Doesn't start 
         ToolDef {
             name: "play",
             title: "Play",
-            description: "Play a ref in Tuner, fullscreen, and bring its window forward. Channel → live. Programme → live when on now (with \
-from_start=true restarted from the archive when the channel has catch-up), from the archive when past and catchup=true, an error \
-(not_started) when upcoming — offer reminders add (mode switch) or schedule_switch. Movie / episode → resumes saved progress (from_start=true starts over). Series → \
-its next episode. outcome=pin_required: the item is locked and Tuner is asking for the parental PIN on screen — tell the user to type \
-it there; never ask for it in chat.",
+            description: "Play a ref in Tuner. It opens in the pop-out by default: a small player pinned on every workspace that never \
+takes the keyboard (the user can make Tuner's window the default in Settings ▸ AI agents). open_in: full_window when the user asks for \
+full screen, the big screen or the TV (Tuner's window, full screen and in front); popout to move it to the pop-out; where_i_am to \
+change only what plays. Without open_in, what the user watches in Tuner's window (fullscreen, or on screen) stays there. The result's \
+opened_in (popout or window) says where it plays: tell the user. Channel → live. Programme → live when on now (with from_start=true \
+restarted from the archive when the channel has catch-up), from the archive when past and catchup=true, an error (not_started) when \
+upcoming — offer reminders add (mode switch) or schedule_switch. Movie / episode → resumes saved progress (from_start=true starts \
+over). Series → its next episode. outcome=pin_required: the item is locked and Tuner is asking for the parental PIN in its window — \
+tell the user to type it there; never ask for it in chat.",
             input_schema: object(
                 json!({
                     "ref": text("Channel, programme, movie, series or episode ref."),
                     "from_start": { "type": "boolean", "default": false },
+                    "open_in": open_in("Where it plays (default: the user's setting, the pop-out). full_window: full screen, the big screen, the TV."),
                 }),
                 &["ref"],
             ),
@@ -343,11 +355,12 @@ programme the user had a reminder for replaces that reminder; cancelling removes
             title: "Control playback",
             description: "Pause, resume, toggle_pause or stop playback, set the volume (value 0–130 percent), mute or unmute, \
 previous_channel (back to the channel before; the PIN rules apply), popout (what plays moves to the small pinned pop-out, which never \
-takes the keyboard). Multi-view: tile a or b for one picture (default: pause/stop both, volume and mute the one with the sound). \
-Never loop zapping on your own. Doesn't start Tuner.",
+takes the keyboard), window (what plays moves to Tuner's window, full screen and in front: \"put it on the big screen\"). \
+Multi-view: tile a or b for one picture (default: pause/stop both, volume and mute the one with the sound). Never loop zapping on \
+your own. Doesn't start Tuner.",
             input_schema: object(
                 json!({
-                    "action": { "type": "string", "enum": ["pause", "resume", "toggle_pause", "stop", "volume", "mute", "unmute", "previous_channel", "popout"] },
+                    "action": { "type": "string", "enum": ["pause", "resume", "toggle_pause", "stop", "volume", "mute", "unmute", "previous_channel", "popout", "window"] },
                     "value": { "type": "number", "minimum": 0, "maximum": 130, "description": "Volume percent (action=volume)." },
                     "tile": { "type": "string", "enum": ["a", "b"] },
                 }),

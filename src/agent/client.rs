@@ -8,8 +8,9 @@
 //! through the [`Launcher`] (detached: own process group, stdio to /dev/null, so it outlives
 //! the MCP client and never writes into the MCP stream), then poll the socket every 100 ms for
 //! up to [`LAUNCH_WAIT`]; `ErrorCode::Loading` replies (library not built yet) are retried
-//! every 250 ms within [`LOADING_WAIT`]. `status` / `control` never launch: `status` answers
-//! `{"running":false}`, `control` says Tuner isn't running.
+//! every 250 ms within [`LOADING_WAIT`]. A play that opens in the pop-out starts Tuner as the
+//! pop-out only ([`Launch::PopOut`], DESIGN §30.13). `status` / `control` never launch:
+//! `status` answers `{"running":false}`, `control` says Tuner isn't running.
 //! A running Tuner from before v2 answers with a v1 error line (no `"v"`): "restart Tuner".
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -37,9 +38,33 @@ const LAUNCH_POLL: Duration = Duration::from_millis(100);
 /// Retry interval while Tuner answers `loading`.
 const LOADING_POLL: Duration = Duration::from_millis(250);
 
+/// Whether and how a call may start Tuner when it isn't running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Launch {
+    /// Never (`status`, `control`).
+    No,
+    /// Its window, as from the app menu.
+    Window,
+    /// As the pop-out only, without the keyboard (`--agent-popout`): an agent's play that
+    /// opens there (DESIGN §30.13).
+    PopOut,
+}
+
+impl From<bool> for Launch {
+    fn from(launch: bool) -> Self {
+        if launch { Launch::Window } else { Launch::No }
+    }
+}
+
 /// Starts Tuner (tests inject fakes that start a server on the socket).
 pub trait Launcher: Send + Sync {
     fn launch(&self) -> std::io::Result<()>;
+
+    /// Start Tuner for an agent's play in the pop-out (`--agent-popout`: pinned, without the
+    /// keyboard, like a switch reminder's launch). Fakes: [`Launcher::launch`].
+    fn launch_popout(&self) -> std::io::Result<()> {
+        self.launch()
+    }
 
     /// The launched process already gave up (it exited unsuccessfully before serving the
     /// socket): why, for the model. Polled while waiting for the socket; `None` = keep waiting.
@@ -75,11 +100,14 @@ impl ExeLauncher {
     }
 }
 
-impl Launcher for ExeLauncher {
-    fn launch(&self) -> std::io::Result<()> {
+impl ExeLauncher {
+    fn spawn(&self, popout: bool) -> std::io::Result<()> {
         let mut cmd = Command::new(&self.exe);
         if let Some(dir) = &self.profile_dir {
             cmd.arg("--profile-dir").arg(dir);
+        }
+        if popout {
+            cmd.arg("--agent-popout");
         }
         // own process group: the MCP client ending the bridge (or the terminal hanging up its
         // foreground group) doesn't take Tuner with it; stdio never touches the MCP stream
@@ -88,7 +116,7 @@ impl Launcher for ExeLauncher {
         // directory isn't Tuner's
         cmd.env_remove("RUST_LOG").current_dir("/");
         let mut child = cmd.spawn()?;
-        tracing::info!("mcp: started Tuner (pid {})", child.id());
+        tracing::info!("mcp: started Tuner (pid {}{})", child.id(), if popout { ", pop-out" } else { "" });
         *self.exit.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let exit = self.exit.clone();
         // reap it (no zombie while the bridge lives) and remember how it ended
@@ -98,6 +126,16 @@ impl Launcher for ExeLauncher {
             }
         })?;
         Ok(())
+    }
+}
+
+impl Launcher for ExeLauncher {
+    fn launch(&self) -> std::io::Result<()> {
+        self.spawn(false)
+    }
+
+    fn launch_popout(&self) -> std::io::Result<()> {
+        self.spawn(true)
     }
 
     fn failed(&self) -> Option<String> {
@@ -197,12 +235,12 @@ impl Client {
 
     /// [`Client::call`], also saying whether it started Tuner.
     pub fn send(&self, call: Call, launch: bool) -> Result<Sent, ClientError> {
-        self.send_as(call, launch, None)
+        self.send_as(call, launch.into(), None)
     }
 
     /// [`Client::send`] on behalf of an MCP client (`initialize.clientInfo`), so Tuner can say
-    /// which agent made a change.
-    pub fn send_as(&self, call: Call, launch: bool, agent: Option<ClientInfo>) -> Result<Sent, ClientError> {
+    /// which agent made a change; `launch`: how it starts Tuner when nothing answers.
+    pub fn send_as(&self, call: Call, launch: Launch, agent: Option<ClientInfo>) -> Result<Sent, ClientError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let req = Request::new(id, call).with_agent(agent);
         let mut line = serde_json::to_string(&req).map_err(|e| ClientError::Failed(e.to_string()))?;
@@ -215,11 +253,12 @@ impl Client {
         loop {
             let reply = match self.attempt(id, &line)? {
                 Attempt::Reply(r) => r,
-                Attempt::NotListening if !launch => return Err(ClientError::NotRunning),
+                Attempt::NotListening if launch == Launch::No => return Err(ClientError::NotRunning),
                 Attempt::NotListening => {
                     match started {
                         None => {
-                            self.launcher.launch().map_err(|e| ClientError::DidNotStart(format!("couldn't run it: {e}")))?;
+                            let launched = if launch == Launch::PopOut { self.launcher.launch_popout() } else { self.launcher.launch() };
+                            launched.map_err(|e| ClientError::DidNotStart(format!("couldn't run it: {e}")))?;
                             started = Some(Instant::now());
                         }
                         Some(at) => {

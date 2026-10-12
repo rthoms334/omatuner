@@ -44,6 +44,12 @@ pub struct Cli {
     #[arg(long, requires = "play")]
     pub popout: bool,
 
+    /// Started by `tuner mcp` for an agent's play in the pop-out (DESIGN §30.13): the pop-out's
+    /// window (pinned, without the keyboard; Hyprland) with nothing on yet; the play arrives
+    /// over IPC v2.
+    #[arg(long, hide = true)]
+    pub agent_popout: bool,
+
     /// Fire reminder <id> now (what the transient systemd timers run while Tuner is closed,
     /// B6): Tuner looks the reminder up, and guards it, itself.
     #[arg(long, value_name = "ID")]
@@ -134,5 +140,8 @@ mod tests {
         let cli = Cli::try_parse_from(["tuner", "--play", "2:xt:live:1", "--popout"]).unwrap();
         assert!(cli.popout && cli.play.is_some());
         assert!(Cli::try_parse_from(["tuner", "--popout"]).is_err(), "nothing to pop out");
+        // `tuner mcp`'s launch for an agent's play: the play itself comes over IPC v2
+        let cli = Cli::try_parse_from(["tuner", "--agent-popout"]).unwrap();
+        assert!(cli.agent_popout && !cli.popout && !cli.is_mcp());
     }
 }

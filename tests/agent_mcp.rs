@@ -423,6 +423,33 @@ fn an_old_tuner_is_reported() {
     assert!(t.starts_with("too_old: ") && t.contains("restart Tuner"), "{t}");
 }
 
+/// A Tuner from before `open_in` (0.2.4 still running after an upgrade) refuses the field: the
+/// bridge asks again without it, so "full screen" still plays (in that Tuner's window), and the
+/// result says to restart Tuner (DESIGN §30.13).
+#[test]
+fn a_tuner_before_open_in_still_plays() {
+    let rt = runtime();
+    let dir = tempfile::tempdir().unwrap();
+    let sock = socket_in(&dir);
+    let fake = Fake::new(|req, _| {
+        if serde_json::to_value(req).unwrap()["params"].get("open_in").is_some() {
+            return Reply::err(req.id, ErrorCode::BadRequest, "unknown field `open_in`, expected `ref` or `from_start`");
+        }
+        Reply::ok(req.id, json!({ "outcome": "playing", "message": "Playing BBC One." }))
+    });
+    let _server = start_server(&rt, &sock, &fake);
+    let client = offline(&dir);
+    let r = tool(&client, "play", json!({ "ref": "channel:1:m3u:bbc1", "open_in": "full_window" }));
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(r["structuredContent"]["outcome"], "playing");
+    assert!(r["structuredContent"]["note"].as_str().unwrap().contains("Restart Tuner"), "{r}");
+    let seen: Vec<Value> = fake.seen().iter().map(|q| serde_json::to_value(q).unwrap()["params"].clone()).collect();
+    assert_eq!(seen, [json!({ "ref": "channel:1:m3u:bbc1", "open_in": "full_window" }), json!({ "ref": "channel:1:m3u:bbc1" })]);
+    // without open_in nothing is retried or noted
+    let r = tool(&client, "play", json!({ "ref": "channel:1:m3u:bbc1" }));
+    assert!(r["structuredContent"].get("note").is_none() && fake.seen().len() == 3, "{r}");
+}
+
 /// The real binary: `tuner mcp --profile-dir <tmp>` with no Tuner running answers initialize,
 /// tools/list, status (`running: false`) and control (not running) with nothing but JSON-RPC
 /// on stdout, exits when stdin closes, and touches neither the database nor `tuner.log`.

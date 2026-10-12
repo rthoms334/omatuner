@@ -18,7 +18,7 @@ use super::params::{RemindersAction, SleepAction as SleepVerb};
 use super::proto::{AgentRef, ChannelOut, ErrorCode, Reminders, SleepTimer, fmt_time};
 use super::query::{Fail, Out, Q, channel_ref, clean, parse_ref, when};
 use super::server::{Inner, to_value};
-use crate::model::{OpenIn, Reminder, ReminderId, ReminderMode, ReminderState};
+use crate::model::{Reminder, ReminderId, ReminderMode, ReminderState};
 use crate::msg::DataScope;
 
 /// Pending reminders at most (each `add` is one; the skill caps a request at about 20).
@@ -77,14 +77,6 @@ pub struct ClashOut {
     pub kind: &'static str,
 }
 
-fn open_in_name(o: OpenIn) -> &'static str {
-    match o {
-        OpenIn::PopOut => "popout",
-        OpenIn::FullWindow => "full_window",
-        OpenIn::WhereIAm => "where_i_am",
-    }
-}
-
 /// A reminder as the tools show it (`None`: its channel isn't visible now).
 fn reminder_out(q: &Q, r: &Reminder, rules: &HashMap<crate::model::FollowRuleId, crate::follow::FollowRule>) -> Option<ReminderOut> {
     if q.conceals(&r.channel) {
@@ -105,7 +97,7 @@ fn reminder_out(q: &Q, r: &Reminder, rules: &HashMap<crate::model::FollowRuleId,
         fires_at: fmt_time(if switch { crate::reminders::switch_at(r) } else { crate::reminders::notify_at(r, lead_default) }),
         lead_min: (!switch).then(|| (crate::reminders::lead_of(r, lead_default) / 60) as u32),
         offset_min: r.offset_s / 60,
-        open_in: switch.then(|| open_in_name(crate::reminders::open_in(r, q.cfg.reminders.open_in))),
+        open_in: switch.then(|| super::act::open_in_name(crate::reminders::open_in(r, q.cfg.reminders.open_in))),
         rule: rule.map(|x| clean(&x.name)),
     })
 }
@@ -159,14 +151,10 @@ fn plan_add(q: &Q, p: &Reminders) -> Out<AddPlan> {
         (ReminderMode::Notify, Some(m)) if m > 120 => return Err(Fail::bad("lead_min is 0–120")),
         (ReminderMode::Notify, m) => i64::from(m.unwrap_or(q.cfg.reminders.lead_min)) * 60,
     };
-    let open_in = match p.open_in.as_deref() {
-        None => None,
-        Some(_) if mode == ReminderMode::Notify => return Err(Fail::bad("open_in is for switch")),
-        Some("popout") => Some(OpenIn::PopOut),
-        Some("full_window") => Some(OpenIn::FullWindow),
-        Some("where_i_am") => Some(OpenIn::WhereIAm),
-        Some(_) => return Err(Fail::bad("open_in is popout, full_window or where_i_am")),
-    };
+    if p.open_in.is_some() && mode == ReminderMode::Notify {
+        return Err(Fail::bad("open_in is for switch"));
+    }
+    let open_in = super::act::parse_open_in(p.open_in.as_deref())?;
     Ok(AddPlan {
         reminder: Reminder {
             id: ReminderId(0),

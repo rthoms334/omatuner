@@ -555,8 +555,19 @@ impl TunerApp {
             AppEvent::Toast(t) => self.toast(t.clone()),
             // The IPC server already raised the window (`hypr::focus_self`).
             AppEvent::Ipc(req) => self.handle_ipc(req),
-            // the handler raised the window (`hypr::focus_self`) and validated the target
-            AppEvent::Agent(crate::agent::AgentCommand::Play(p)) => self.on_agent_play(p.clone()),
+            // the handler validated the target, resolved where it shows and raised the window
+            // when it shows there (`hypr::focus_self`; DESIGN §30.13)
+            AppEvent::Agent(crate::agent::AgentCommand::Play(p)) => self.on_agent_play(p.clone(), egui_ctx),
+            // an agent's `queue play` / `skip` (the engine started it on the main picture), or
+            // `control window`
+            AppEvent::Agent(crate::agent::AgentCommand::Show(show)) => self.agent_show(*show, egui_ctx),
+            // an agent's play failed: an empty pop-out (started for it) goes back in
+            AppEvent::Agent(crate::agent::AgentCommand::PopIn) => {
+                self.reminder_ui.pop_out_pending = false;
+                if (self.popout.is_out() || self.video_only) && !self.has_media() {
+                    self.toggle_popout(egui_ctx);
+                }
+            }
             // `lock session_now`: an agent can only ever lock (the handler's view locked already)
             AppEvent::Agent(crate::agent::AgentCommand::LockSession) => self.parental.lock(),
             // `control popout`: the pop-out never takes the keyboard
@@ -565,7 +576,7 @@ impl TunerApp {
                     self.toggle_popout(egui_ctx);
                 }
             }
-            AppEvent::Agent(crate::agent::AgentCommand::MultiView(r)) => self.on_agent_multiview(r),
+            AppEvent::Agent(crate::agent::AgentCommand::MultiView(r)) => self.on_agent_multiview(r, egui_ctx),
             // an agent's batch over 50 channels: Guide fixes with its confirm card prefilled (the
             // handler raised the window); Enter applies it, Esc drops it
             AppEvent::Agent(crate::agent::AgentCommand::GuideFixReview(r)) => {
@@ -1077,27 +1088,92 @@ impl TunerApp {
         self.nav.push(NavRequest::Push(Route::Player));
     }
 
-    /// What the agent handler reads (DESIGN §30.4): the snapshot on screen and when the PIN was
-    /// entered. Every frame (two cheap stores); a replaced snapshot is dropped on the memory
-    /// maintenance thread.
-    fn publish_for_agent(&self) {
+    /// What the agent handler reads (DESIGN §30.4): the snapshot on screen, when the PIN was
+    /// entered and the window (where an agent's play opens, §30.13). Every frame (cheap
+    /// stores); a replaced snapshot is dropped on the memory maintenance thread.
+    fn publish_for_agent(&self, egui_ctx: &egui::Context) {
         let Some(s) = &self.services else { return };
         s.agent.set_unlocked_at(self.parental.unlocked_at());
+        // before the first frame the pop-out worker isn't started yet: Hyprland says whether it
+        // will be (an agent's pop-out asked for then waits for it, `agent_place`)
+        let w = self.window_now(egui_ctx);
+        let will_pop = !self.popout_started && crate::platform::hypr::is_hyprland() && !crate::platform::off_desktop();
+        // a pop-out asked for (a launch for it) counts as out: it is on its way
+        let popped_out = w.popped_out || self.reminder_ui.pop_out_pending;
+        s.agent.set_window(crate::reminders::ui::WindowNow { can_pop: w.can_pop || will_pop, popped_out, ..w });
         if let Some(old) = s.agent.publish_library(&self.lib) {
             s.memory.release(old, "agent snapshot");
         }
     }
 
-    /// An MCP client's `play` (DESIGN §30.4). The handler checked that the target exists and is
-    /// visible; this plays it like a key press would: the PIN prompt for a locked item (played
-    /// once it is typed), a channel's zap list, a title's copies and resume rules.
-    fn on_agent_play(&mut self, p: crate::agent::AgentPlay) {
+    /// An MCP client's `play` (DESIGN §30.4): [`Self::agent_play`], then the window where the
+    /// handler resolved (§30.13). A PIN prompt the handler didn't predict (the session relocked
+    /// since) shows in the window: popped back in and raised.
+    fn on_agent_play(&mut self, p: crate::agent::AgentPlay, egui_ctx: &egui::Context) {
+        use crate::reminders::ui::Placement;
+        let show = p.show;
+        match self.agent_play(p) {
+            AgentPlayed::Sent => self.agent_place(show, egui_ctx),
+            AgentPlayed::Pin => {
+                self.agent_place(crate::agent::act::AgentShow { place: Placement::FullWindow, ..show }, egui_ctx);
+                if show.place != Placement::FullWindow {
+                    crate::platform::hypr::focus_self();
+                }
+            }
+            AgentPlayed::Nothing => {}
+        }
+    }
+
+    /// Where an agent's play shows (DESIGN §30.13; the handler resolved it and raised the
+    /// window when it shows there): the pop-out — never taking the keyboard; asked for on the
+    /// first frame when the Hyprland worker isn't up yet — the full window (popped back in;
+    /// fullscreen when asked for), or as it is (the screen stays; the mini player shows it).
+    /// Anything but the pop-out drops a pop-out still pending from the launch (`--agent-popout`:
+    /// a PIN prompt there could never get the keyboard).
+    fn agent_place(&mut self, show: crate::agent::act::AgentShow, egui_ctx: &egui::Context) {
+        use crate::reminders::ui::Placement;
+        let out = self.popout.is_out() || self.video_only;
+        if show.place != Placement::PopOut {
+            self.reminder_ui.pop_out_pending = false;
+        }
+        match show.place {
+            Placement::PopOut if out => {}
+            Placement::PopOut if !self.popout_started => self.reminder_ui.pop_out_pending = true,
+            Placement::PopOut => {
+                self.toggle_popout(egui_ctx);
+            }
+            Placement::FullWindow if out => {
+                let sent = self.toggle_popout(egui_ctx);
+                self.fullscreen_after_pop_in |= sent && show.fullscreen;
+            }
+            Placement::FullWindow if show.fullscreen && !self.window_fullscreen => self.set_window_fullscreen(true, egui_ctx),
+            Placement::FullWindow => {}
+            Placement::InPlace => self.drop_player_push(),
+        }
+    }
+
+    /// `AgentCommand::Show`: what Up next started for an agent, shown like an agent's play (the
+    /// player screen under a pop-out, so popping in lands on it), or `control window`.
+    fn agent_show(&mut self, show: crate::agent::act::AgentShow, egui_ctx: &egui::Context) {
+        if show.place != crate::reminders::ui::Placement::InPlace && self.current_route() != &Route::Player {
+            self.nav.push(NavRequest::Push(Route::Player));
+        }
+        self.agent_place(show, egui_ctx);
+    }
+
+    /// Play an agent's target like a key press would: the PIN prompt for a locked item (played
+    /// once it is typed), a channel's zap list, a title's copies and resume rules. The handler
+    /// checked that the target exists and is visible.
+    fn agent_play(&mut self, p: crate::agent::AgentPlay) -> AgentPlayed {
         use crate::agent::PlayTarget;
         use crate::model::VodKind;
         let cfg = self.services().config();
         let unlocked = self.parental.is_unlocked(&cfg.parental);
         let now = crate::model::now();
-        let gone = |app: &mut Self| app.toast(Toast::info("That is no longer in your playlists"));
+        let gone = |app: &mut Self| {
+            app.toast(Toast::info("That is no longer in your playlists"));
+            AgentPlayed::Nothing
+        };
         let plan = |app: &Self, movies: bool, idx: u32| {
             crate::store::copies::plan(&app.db, &app.lib.vod, movies, idx, unlocked, cfg.interface.copy_order, now).map_err(|e| {
                 tracing::warn!("agent play: {e}");
@@ -1107,7 +1183,16 @@ impl TunerApp {
         let cmd = match &p.target {
             PlayTarget::Media(MediaRef::Channel(id)) => {
                 self.pending_agent = None;
-                return self.play_channel(*id, PlayOrigin::Cli);
+                self.play_channel(*id, PlayOrigin::Cli);
+                // the prompt this play opened (a stale `pending_locked` from a prompt dismissed
+                // earlier says nothing)
+                return if matches!(self.nav.last(), Some(NavRequest::Open(OverlayRequest::Pin { .. }))) {
+                    AgentPlayed::Pin
+                } else if matches!(self.nav.last(), Some(NavRequest::Push(Route::Player))) {
+                    AgentPlayed::Sent
+                } else {
+                    AgentPlayed::Nothing // hidden by parental control (a toast says so)
+                };
             }
             PlayTarget::Media(media @ MediaRef::Catchup { channel, .. }) => {
                 let Some(locked) = self.lib.live.get(*channel).map(|c| c.locked) else { return gone(self) };
@@ -1157,7 +1242,7 @@ impl TunerApp {
                     }
                     Ok(None) => {
                         self.nav.push(NavRequest::Push(Route::SeriesDetail(*sid)));
-                        return;
+                        return AgentPlayed::Nothing;
                     }
                     Err(e) => {
                         tracing::warn!("agent play: {e}");
@@ -1165,7 +1250,7 @@ impl TunerApp {
                     }
                 }
             }
-            PlayTarget::Media(MediaRef::Url(_)) => return,
+            PlayTarget::Media(MediaRef::Url(_)) => return AgentPlayed::Nothing,
         };
         self.pending_agent = None;
         self.pending_zap = None;
@@ -1178,15 +1263,17 @@ impl TunerApp {
             self.send_player(cmd);
         }
         self.nav.push(NavRequest::Push(Route::Player));
+        AgentPlayed::Sent
     }
 
     /// The PIN prompt for an agent's `play` of a locked item; it plays once the PIN is typed.
     /// Only the newest prompt's target plays (a stale `pending_locked` from a prompt closed
     /// without the PIN never takes its place).
-    fn ask_pin_for(&mut self, p: crate::agent::AgentPlay, reason: &str) {
+    fn ask_pin_for(&mut self, p: crate::agent::AgentPlay, reason: &str) -> AgentPlayed {
         self.pending_locked = None;
         self.pending_agent = Some(p);
         self.nav.push(NavRequest::Open(OverlayRequest::Pin { then: Box::new(Action::OpenPlayer), reason: reason.into() }));
+        AgentPlayed::Pin
     }
 
     /// An automatic switch is due shortly (DESIGN §30.8, B6): the strip's countdown "Switching
@@ -1364,13 +1451,18 @@ impl TunerApp {
         }
     }
 
-    /// The window as a switch finds it.
+    /// The window as a switch (or an agent's play) finds it.
     fn window_now(&self, egui_ctx: &egui::Context) -> crate::reminders::ui::WindowNow {
+        let focused = egui_ctx.input(|i| i.viewport().focused).unwrap_or(false);
         crate::reminders::ui::WindowNow {
-            focused: egui_ctx.input(|i| i.viewport().focused).unwrap_or(false),
+            focused,
             watching: self.view_screen() == ScreenId::Player && self.snapshot.state != PlayerState::Idle,
             popped_out: self.popout.is_out() || self.video_only,
             can_pop: self.popout_backend.is_some(),
+            fullscreen: self.window_fullscreen,
+            multiview: self.mv.view.on,
+            // focused: on screen; the agent handler asks Hyprland otherwise
+            visible: focused,
         }
     }
 
@@ -1917,8 +2009,9 @@ impl TunerApp {
                 if matches!(result, overlays::OverlayResult::Unlocked(Action::OpenPlayer))
                     && let Some(p) = self.pending_agent.take()
                 {
+                    // typed in the window: it plays there
                     self.overlays.pop();
-                    self.on_agent_play(p);
+                    self.agent_play(p);
                     return;
                 }
                 if let Some(o) = self.overlays.pop() {
@@ -2301,7 +2394,7 @@ impl eframe::App for TunerApp {
         self.mv_reconcile();
         self.snapshot = self.services().tiles.focused().snapshot();
         self.sync_explicit(ctx);
-        self.publish_for_agent();
+        self.publish_for_agent(ctx);
         let focus = self.mv.view.focus;
         let snaps = [self.mv_snap(crate::model::TileId::A), self.mv_snap(crate::model::TileId::B)];
         let live_snaps = || snaps.iter().flatten();
@@ -2473,7 +2566,7 @@ impl eframe::App for TunerApp {
         self.apply_config_edits(&egui_ctx);
         // "Lock now", a PIN typed or set this frame: not one more frame of the old state
         self.sync_explicit(&egui_ctx);
-        self.publish_for_agent();
+        self.publish_for_agent(&egui_ctx);
         self.free_closed_search();
         crate::ui::widgets::status_bar::settle_focus(&egui_ctx);
         // a click that opened a page or overlay (or closed one) arms the drop of its double-click's
@@ -2617,6 +2710,17 @@ fn view_name(screen: ScreenId) -> Option<&'static str> {
 fn route_for_view_name(name: &str) -> Option<Route> {
     use clap::ValueEnum;
     crate::cli::ViewArg::from_str(name, true).ok().filter(|v| *v != crate::cli::ViewArg::Search).map(route_for_view)
+}
+
+/// What an agent's play did in the app (`TunerApp::agent_play`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentPlayed {
+    /// The play went out (the player screen is pushed).
+    Sent,
+    /// The PIN prompt shows; it plays once the PIN is typed.
+    Pin,
+    /// Nothing plays (gone, hidden, a series without an episode to play).
+    Nothing,
 }
 
 /// `.m3u` / `.m3u8` local file (a playlist to add, not a stream to play).
@@ -4417,14 +4521,14 @@ mod tests {
         let mut rig = Rig::with(pin_config(), live(), 1.0, |c| seed_agent(c, 3600));
         rig.settle();
         let ch1 = rig.app.lib.live.by_ref(&channel_ref(1)).unwrap();
-        let out = ask(&rig, Call::Play(Play { item: "channel:1:m3u:ch1".into(), from_start: None }));
+        let out = ask(&rig, Call::Play(Play { item: "channel:1:m3u:ch1".into(), from_start: None, open_in: None }));
         assert_eq!(out["outcome"], "playing");
         rig.until("the play", |r| !played(&r.log()).is_empty());
         assert_eq!(played(&rig.log()), [(MediaRef::Channel(ch1), PlayOrigin::Cli)]);
         assert_eq!(rig.route(), &Route::Player);
         assert!(rig.log().commands.iter().any(|c| matches!(c, PlayerCommand::Play(r) if r.zap.is_some())), "zaps through its group");
 
-        let out = ask(&rig, Call::Play(Play { item: "channel:1:m3u:ch0".into(), from_start: None }));
+        let out = ask(&rig, Call::Play(Play { item: "channel:1:m3u:ch0".into(), from_start: None, open_in: None }));
         assert_eq!(out["outcome"], "pin_required");
         rig.until("the PIN prompt", |r| r.overlay_kinds() == [pin_prompt()]);
         assert_eq!(played(&rig.log()).len(), 1, "nothing plays before the PIN");
@@ -4451,7 +4555,11 @@ mod tests {
         });
         rig.settle();
         let id = crate::model::MovieId(1);
-        let play = crate::agent::AgentPlay { target: crate::agent::PlayTarget::Media(MediaRef::Movie(id)), from_start: false };
+        let play = crate::agent::AgentPlay {
+            target: crate::agent::PlayTarget::Media(MediaRef::Movie(id)),
+            from_start: false,
+            show: crate::agent::act::AgentShow::window(true),
+        };
         rig.event(AppEvent::Agent(crate::agent::AgentCommand::Play(play)));
         rig.frame_with(vec![]);
         assert_eq!(rig.overlay_kinds(), [pin_prompt()]);
@@ -4464,6 +4572,80 @@ mod tests {
         assert_eq!(reqs.len(), 1);
         assert_eq!((&reqs[0].media, reqs[0].resume), (&MediaRef::Movie(id), true));
         assert_eq!(rig.route(), &Route::Player);
+    }
+
+    /// DESIGN §30.13: what Up next starts for an agent (`queue play`, which the engine sends
+    /// straight to the player) opens the player like `play` — it used to leave the window on
+    /// Home with the corner mini player. An agent's play in the pop-out pops out over the
+    /// player (asked for on the first frame the Hyprland worker runs, not refused before it);
+    /// Up next's next play stays there; "full screen" pops back in, fullscreen.
+    #[test]
+    fn agent_plays_open_the_player_pop_out_and_up_next_stays_there() {
+        use crate::agent::act::AgentShow;
+        use crate::agent::{AgentCommand, AgentPlay, PlayTarget};
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_channels(c, 2, None));
+        rig.settle();
+        let start = rig.route().clone();
+        rig.event(AppEvent::Agent(AgentCommand::Show(AgentShow::window(true))));
+        rig.frame_with(vec![]);
+        assert_eq!(rig.route(), &Route::Player, "queue play: the player, not the mini player");
+        assert!(!rig.app.window_fullscreen, "the setting's window isn't made fullscreen");
+        rig.press(Key::Escape, NONE);
+        assert_eq!(rig.route(), &start);
+
+        let ch = rig.app.lib.live.by_ref(&channel_ref(1)).unwrap();
+        let play = AgentPlay { target: PlayTarget::Media(MediaRef::Channel(ch)), from_start: false, show: AgentShow::POP_OUT };
+        rig.event(AppEvent::Agent(AgentCommand::Play(play)));
+        assert!(rig.app.reminder_ui.pop_out_pending, "before the worker: asked for");
+        assert!(!rig.log().toasts.iter().any(|t| t.text.contains("needs Hyprland")), "{:?}", rig.log().toasts);
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        rig.app.popout_backend = Some(Box::new(PopRecorder(sent.clone())));
+        rig.frame_with(vec![]);
+        assert!(matches!(sent.borrow().as_slice(), [PopRequest::Out { .. }]), "{:?}", sent.borrow());
+        assert_eq!(rig.route(), &Route::Player, "under the pop-out: popping in lands on the player");
+        assert_eq!(played(&rig.log()).last(), Some(&(MediaRef::Channel(ch), PlayOrigin::Cli)));
+        rig.event(pop_event(PopOutEvent::PoppedOut));
+
+        rig.event(AppEvent::Agent(AgentCommand::Show(AgentShow::POP_OUT)));
+        rig.frame_with(vec![]);
+        assert_eq!(sent.borrow().len(), 1, "Up next carries on in the pop-out: {:?}", sent.borrow());
+        assert!(rig.app.popout.is_out());
+        rig.event(AppEvent::Agent(AgentCommand::Show(AgentShow { fullscreen: true, ..AgentShow::window(true) })));
+        assert_eq!(sent.borrow().last(), Some(&PopRequest::In { ours: true }), "\"on the TV\": back in");
+        rig.event(pop_event(PopOutEvent::PoppedIn { place: Place::Keep }));
+        assert!(rig.app.window_fullscreen, "\"full screen\": the window fullscreen once back in");
+    }
+
+    /// DESIGN §30.13: Tuner started for an agent's play in the pop-out (`--agent-popout` asks for
+    /// the pop-out before the Hyprland worker runs) whose play needs the PIN: the prompt stays in
+    /// the window, where the keyboard can reach it (the pending pop-out is dropped). A play that
+    /// failed puts an empty pop-out back into the window.
+    #[test]
+    fn a_launch_for_the_pop_out_keeps_the_pin_prompt_in_the_window() {
+        use crate::agent::act::AgentShow;
+        use crate::agent::{AgentCommand, AgentPlay, PlayTarget};
+        let mut rig = Rig::with(pin_config(), live(), 1.0, |c| seed_agent(c, 3600));
+        rig.settle();
+        rig.app.reminder_ui.pop_out_pending = true;
+        let ch0 = rig.app.lib.live.by_ref(&channel_ref(0)).unwrap();
+        let play = AgentPlay { target: PlayTarget::Media(MediaRef::Channel(ch0)), from_start: false, show: AgentShow::window(true) };
+        rig.event(AppEvent::Agent(AgentCommand::Play(play)));
+        rig.frame_with(vec![]);
+        assert_eq!(rig.overlay_kinds(), [pin_prompt()]);
+        assert!(!rig.app.reminder_ui.pop_out_pending, "the PIN is typed in the window");
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        rig.app.popout_backend = Some(Box::new(PopRecorder(sent.clone())));
+        rig.frame_with(vec![]);
+        assert!(sent.borrow().is_empty(), "{:?}", sent.borrow());
+        rig.press(Key::Escape, NONE);
+
+        // the launch's pop-out came up, then the play failed: nothing plays in it
+        rig.app.reminder_ui.pop_out_pending = true;
+        rig.frame_with(vec![]);
+        assert!(matches!(sent.borrow().as_slice(), [PopRequest::Out { .. }]), "{:?}", sent.borrow());
+        rig.event(pop_event(PopOutEvent::PoppedOut));
+        rig.event(AppEvent::Agent(AgentCommand::PopIn));
+        assert_eq!(sent.borrow().last(), Some(&PopRequest::In { ours: true }), "{:?}", sent.borrow());
     }
 
     /// DESIGN §31.5 end to end: an agent's `guide_fix apply` of more than 50 channels writes
@@ -4791,7 +4973,11 @@ mod tests {
         rig.frame_with(vec![]);
         assert!(played(&rig.log()).is_empty(), "{:?}", played(&rig.log()));
         assert!(rig.log().toasts[before..].iter().all(|t| !t.text.contains("Channel 1") && !t.text.contains("Switching")));
-        bus.send(AppEvent::Agent(AgentCommand::Play(AgentPlay { target: PlayTarget::Media(MediaRef::Channel(ch1)), from_start: false })));
+        bus.send(AppEvent::Agent(AgentCommand::Play(AgentPlay {
+            target: PlayTarget::Media(MediaRef::Channel(ch1)),
+            from_start: false,
+            show: crate::agent::act::AgentShow::window(true),
+        })));
         rig.frame_with(vec![]);
         assert!(played(&rig.log()).is_empty(), "the PIN first");
         // the direct paths refuse too (store check), whatever the snapshot says
@@ -4825,7 +5011,11 @@ mod tests {
         rig.press(Key::Escape, NONE);
         assert!(rig.overlay_kinds().is_empty() && rig.app.pending_locked.is_some(), "a dismissed prompt leaves its channel");
         let id = crate::model::MovieId(1);
-        let play = crate::agent::AgentPlay { target: crate::agent::PlayTarget::Media(MediaRef::Movie(id)), from_start: false };
+        let play = crate::agent::AgentPlay {
+            target: crate::agent::PlayTarget::Media(MediaRef::Movie(id)),
+            from_start: false,
+            show: crate::agent::act::AgentShow::window(true),
+        };
         rig.event(AppEvent::Agent(crate::agent::AgentCommand::Play(play)));
         rig.frame_with(vec![]);
         assert_eq!(rig.overlay_kinds(), [pin_prompt()]);

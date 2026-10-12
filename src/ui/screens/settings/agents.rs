@@ -6,6 +6,7 @@
 //! Let an AI agent find, play and plan what to watch in Tuner. Last used by Claude, 2 h ago.
 //! Offer to connect agents after updates                              [ On  ]
 //! Keep Claude Code's plugin up to date after Tuner updates           [ On  ]
+//! Agents play in                                            ‹ Pop-out ›
 //! AGENTS ON THIS COMPUTER
 //! ↻ Check again
 //! 󰚩 Claude Code   Connected · plugin 0.2.2 · used 2 h ago
@@ -55,6 +56,16 @@ static TOGGLES: [CfgToggle; 2] = [
         set: |c, v| c.agents.keep_in_sync = v,
     },
 ];
+
+/// Where an agent's play opens (DESIGN §30.13): the pop-out, or Tuner's window. A play's own
+/// `open_in` wins ("put it on the TV"); a hand-written `where-i-am` acts as, and shows as, the
+/// pop-out.
+static PLAY_IN: CfgChoice = CfgChoice {
+    label: "Agents play in",
+    options: &["Pop-out", "Tuner window"],
+    get: |c| usize::from(c.agents.play_in == crate::model::OpenIn::FullWindow),
+    set: |c, i| c.agents.play_in = [crate::model::OpenIn::PopOut, crate::model::OpenIn::FullWindow][i],
+};
 
 /// A row's id is the agent's place in `AgentId::ALL`.
 fn row_id(id: AgentId) -> i64 {
@@ -116,6 +127,10 @@ pub(super) fn rows(_s: &SettingsScreen, ctx: &UiCtx<'_>, v: &mut Vec<Row>) {
     // the plugin switch only matters with Claude Code here
     let toggles = if missing.contains(&AgentId::Claude) { &TOGGLES[..1] } else { &TOGGLES[..] };
     v.extend(toggles.iter().map(Row::Toggle));
+    v.push(Row::Choice(&PLAY_IN));
+    if !crate::platform::hypr::is_hyprland() {
+        v.push(Row::Note("The pop-out needs Hyprland: agents play in Tuner's window here.".into(), false));
+    }
 
     let rows = svc.rows();
     let env = svc.env();

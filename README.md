@@ -190,6 +190,7 @@ and [Artemis I Launch (Press Site)](https://images.nasa.gov/details/Artemis%20I%
   - A corner mini-player, and window fullscreen.
   - A pop-out player on Hyprland: a small video-only window that stays on screen on every
     workspace (`o` in the player, Ctrl+Shift+O anywhere; see [Pop-out player](#pop-out-player)).
+    What an AI agent plays for you opens there by default.
 - **Up next:** a play queue for films, episodes and live programmes (`Ctrl+N` adds,
   `Ctrl+Shift+N` plays next, `Alt+6` opens it, `u` in the player). It plays the next item after a
   short countdown (Settings ▸ Interface ▸ Playback), steps aside when you pick something else
@@ -1121,6 +1122,8 @@ reason. Enter or a click on an agent opens its menu: *Connect* (*Repair*, or *Ad
 plugin* when Claude Code has only the MCP server), *Update to <version>*, *Disconnect…* (asks
 first), *Copy the setup command* and *Copy the README link*. *Check again* reads every status again. The page also says
 which agents it didn't find, and which agent used Tuner last ("Last used by Claude, 2 h ago").
+*Agents play in* picks where what an agent plays opens: the *Pop-out* (default) or the *Tuner
+window* (see [Where it plays](#where-it-plays)).
 
 | Agent | Connect runs | Disconnect runs |
 |---|---|---|
@@ -1245,7 +1248,36 @@ skills (Claude picks the right one from what you say), but the example asks work
 | *discover* | "What's trending this week?", "Netflix top 10", "Best-reviewed films I've got", "Is *Dune* any good?" | Looks the list up on the web, matches it against your library, and plays, queues or saves the ones you have to a "Trending" list. Web data is labelled with its source and date. |
 
 Small requests work too: "Pause", "Volume to 40", "Back to the last channel", "Move it to the
-pop-out", "What am I watching?". *discover* needs an agent that can search the web.
+pop-out", "Put it on the big screen", "What am I watching?". *discover* needs an agent that can
+search the web.
+
+### Where it plays
+
+What your agent plays (a channel, a film, an episode, Up next) opens in the
+[pop-out](#pop-out-player) by default: the small player pinned on every workspace, so it appears
+where you are and your terminal keeps the keyboard. The agent says where it opened.
+
+- Ask for **full screen**, **the big screen** or **the TV** and it plays full screen in Tuner's
+  window instead, brought to the front. "Put it on the big screen" moves what already plays
+  there the same way, without starting it again.
+- If you are already watching in Tuner's window where you can see it (fullscreen, tiled beside
+  your terminal, on another monitor, or two pictures side by side), a new play stays there,
+  even while your terminal has the keyboard. Tuner never moves what you watch into the pop-out
+  unless you ask ("move it to the pop-out"). A window on a workspace you aren't looking at
+  doesn't count: the play comes to you in the pop-out.
+- Once Up next plays in the pop-out, its next items carry on there. If one of them needs the
+  PIN, a notification says so (type it in Tuner's window).
+- Opening two pictures (multi-view) moves the pop-out back into Tuner's window, in front.
+- Settings ▸ AI agents ▸ *Agents play in* makes the Tuner window the default instead.
+- If Tuner isn't running, asking to play something starts it straight into the pop-out on the
+  workspace you are on, without taking the keyboard (like a scheduled switch; install the
+  packaged window rules, see [Pop-out player](#pop-out-player)).
+- A locked item brings Tuner's window forward, because the PIN is typed there.
+- If the play fails (nothing on, not found), a pop-out that shows nothing goes back into Tuner's
+  window.
+- The pop-out needs Hyprland. Elsewhere agents play in Tuner's window, as before.
+- After updating Tuner while it runs, restart it: until then a request for full screen plays the
+  old way (Tuner's window, as before), and the agent says to restart it.
 
 ### What your agent asks first
 
@@ -1416,8 +1448,10 @@ leaves the pop-out where it is ("Nothing playing"); its page is waiting when you
 - Install the packaged window rules (`hypr/tuner.lua`, above) for the pop-out too: without them
   Omarchy draws unfocused windows at 96 % opacity, so the page behind shows through the video.
   They also keep video rendering while a tiled Tuner sits on another workspace.
-- A scheduled switch (Open in: Pop-out) while Tuner is closed, or `tuner --play <ref>
-  --popout`, starts Tuner straight into the pop-out. That window's class is **`tuner-popout`**
+- What an AI agent plays opens in the pop-out by default (see
+  [Where it plays](#where-it-plays)).
+- A scheduled switch (Open in: Pop-out) or an AI agent's play while Tuner is closed, or `tuner
+  --play <ref> --popout`, starts Tuner straight into the pop-out. That window's class is **`tuner-popout`**
   (all session long), and the packaged rules map it floating and pinned **without taking the
   keyboard** from what you are typing in. Esc tiles it like any pop-out. Without the rules it
   may open tiled and focused first. Popping out a running Tuner never takes the keyboard
