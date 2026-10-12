@@ -13,8 +13,10 @@ pub mod allow;
 pub mod ufw;
 
 use std::ffi::OsString;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
+use std::process::Stdio;
+use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
@@ -26,7 +28,7 @@ pub const POLKIT_ACTION: &str = "io.github.rthoms334.omatuner.firewall";
 /// Where the package installs the helper.
 pub const HELPER_PATH: &str = "/usr/lib/tuner/tuner-firewall";
 /// The longest an Allow / Remove may wait for polkit's dialog.
-pub const PKEXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+pub const PKEXEC_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// What detection concluded (Settings ▸ Cast ▸ Network's Firewall row).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,25 +195,140 @@ pub struct CopyText {
 
 /// Read the firewall state toward `toward` (the TV) for `port`, without root. Runs on the
 /// runtime (it spawns `systemctl`).
-pub async fn detect(_env: &FirewallEnv, port: u16, _toward: Ipv4Addr) -> Detection {
-    // CAST-7: files + systemctl + interface/subnet + `ufw::parse` + covering/shadowing.
-    Detection { state: FirewallState::Unknown { why: UnknownWhy::Unreadable }, ufw: false, pkexec: false, net: None, tagged: Vec::new(), port }
+pub async fn detect(env: &FirewallEnv, port: u16, toward: Ipv4Addr) -> Detection {
+    let (ufw_unit, firewalld, nftables) = tokio::join!(unit_active(env, "ufw"), unit_active(env, "firewalld"), unit_active(env, "nftables"));
+    let net = lan_net(toward);
+    let mut det = Detection { state: FirewallState::NoFirewall, ufw: false, pkexec: env.pkexec.exists(), net, tagged: Vec::new(), port };
+    let unreadable = FirewallState::Unknown { why: UnknownWhy::Unreadable };
+    // ufw is in force when its binary is there, its unit is active and ufw.conf says ENABLED=yes.
+    let mut ufw_on = false;
+    if env.ufw.exists() && ufw_unit {
+        match tokio::fs::read_to_string(env.etc_ufw.join("ufw.conf")).await {
+            Ok(conf) => ufw_on = conf_value(&conf, "ENABLED").is_some_and(|v| v.eq_ignore_ascii_case("yes")),
+            Err(_) => {
+                det.state = unreadable;
+                return det;
+            }
+        }
+    }
+    if !ufw_on {
+        det.state = if firewalld {
+            FirewallState::Unknown { why: UnknownWhy::Firewalld }
+        } else if nftables {
+            FirewallState::Unknown { why: UnknownWhy::Nftables }
+        } else {
+            FirewallState::NoFirewall
+        };
+        return det;
+    }
+    det.ufw = true;
+    let (policy, rules) = tokio::join!(tokio::fs::read_to_string(&env.default_ufw), tokio::fs::read_to_string(env.etc_ufw.join("user.rules")));
+    let (Ok(policy), Ok(rules)) = (policy, rules) else {
+        det.state = unreadable;
+        return det;
+    };
+    let policy_blocks = input_policy_blocks(&policy);
+    match det.net.clone() {
+        Some(net) => (det.state, det.tagged) = assess(&rules, policy_blocks, &net, toward, port),
+        // No route toward the TV: the interface (and so any rule's scope) is unknown.
+        None => {
+            det.tagged = ufw::tagged(&ufw::parse(&rules));
+            det.state = unreadable;
+        }
+    }
+    det
+}
+
+/// The state of `rules` (the text of `user.rules`) for the TV at `tv` reaching `net.addr:port`
+/// on `net.iface`, and every rule tagged [`TAG`]. Pure: [`detect`] without the files and
+/// `systemctl`.
+///
+/// ufw is first-match: the first rule matching the traffic decides; with none, the input policy
+/// does (`policy_blocks`: `DEFAULT_INPUT_POLICY` is DROP or REJECT).
+pub fn assess(rules: &str, policy_blocks: bool, net: &LanNet, tv: Ipv4Addr, port: u16) -> (FirewallState, Vec<Rule>) {
+    let tuples = ufw::parse(rules);
+    let flow = ufw::Flow { port, iface: &net.iface, local: net.addr, tv };
+    let state = match ufw::evaluate(&tuples, &flow) {
+        ufw::Verdict::Allowed { ours } => FirewallState::Allowed { ours },
+        ufw::Verdict::Denied => FirewallState::Blocked { shadowed: true },
+        ufw::Verdict::Unmatched if policy_blocks => FirewallState::Blocked { shadowed: false },
+        ufw::Verdict::Unmatched => FirewallState::NoFirewall,
+    };
+    (state, ufw::tagged(&tuples))
+}
+
+/// `DEFAULT_INPUT_POLICY` of `/etc/default/ufw`: DROP and REJECT block, ACCEPT doesn't; a missing
+/// key is ufw's own default, DROP.
+pub fn input_policy_blocks(default_ufw: &str) -> bool {
+    conf_value(default_ufw, "DEFAULT_INPUT_POLICY").is_none_or(|v| !v.eq_ignore_ascii_case("accept"))
+}
+
+/// The last `KEY=value` of a shell-style config file, unquoted.
+fn conf_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    text.lines()
+        .filter_map(|l| l.trim().strip_prefix(key)?.trim_start().strip_prefix('='))
+        .next_back()
+        .map(|v| v.trim().trim_matches(|c| c == '"' || c == '\''))
+}
+
+/// Does `systemctl is-active <unit>` say active? (Works without root; a missing `systemctl` or
+/// one that doesn't answer in 5 s is "no".)
+async fn unit_active(env: &FirewallEnv, unit: &str) -> bool {
+    let mut cmd = tokio::process::Command::new(&env.systemctl);
+    cmd.args(["is-active", "--quiet", unit]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true);
+    matches!(tokio::time::timeout(Duration::from_secs(5), cmd.status()).await, Ok(Ok(st)) if st.success())
+}
+
+/// This computer's side of the LAN toward `toward`: the UDP `connect()` trick names the source
+/// address the kernel would use (no packet is sent), `if-addrs` the interface and prefix that own it.
+pub fn lan_net(toward: Ipv4Addr) -> Option<LanNet> {
+    let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    sock.connect((toward, 9)).ok()?;
+    let SocketAddr::V4(local) = sock.local_addr().ok()? else { return None };
+    if_addrs::get_if_addrs().ok()?.into_iter().find_map(|i| match i.addr {
+        if_addrs::IfAddr::V4(v4) if v4.ip == *local.ip() => Some(LanNet { iface: i.name, addr: v4.ip, prefix: v4.prefixlen }),
+        _ => None,
+    })
 }
 
 /// The shell-free argv for `verb` on `rule`: the packaged helper
 /// (`pkexec --disable-internal-agent <helper> allow <iface> <cidr> <port> [--first]`), or the
 /// checkout form (`pkexec --disable-internal-agent <ufw> …`) when the helper or its policy isn't
-/// installed.
-pub fn argv(_env: &FirewallEnv, _verb: Verb, _rule: &Rule) -> Vec<OsString> {
-    // CAST-7
-    Vec::new()
+/// installed. Element 0 is the `pkexec` program itself.
+pub fn argv(env: &FirewallEnv, verb: Verb, rule: &Rule) -> Vec<OsString> {
+    let mut a: Vec<OsString> = vec![env.pkexec.clone().into(), "--disable-internal-agent".into()];
+    let (iface, cidr, port) = (rule.iface.as_str(), rule.cidr(), rule.port.to_string());
+    if env.helper.exists() && env.policy.exists() {
+        a.push(env.helper.clone().into());
+        a.push(if matches!(verb, Verb::Remove) { "remove" } else { "allow" }.into());
+        a.extend([iface.into(), cidr.into(), port.into()]);
+        if matches!(verb, Verb::Allow { first: true }) {
+            a.push("--first".into());
+        }
+    } else {
+        // `man ufw`: `ufw [prepend] allow|delete allow …`; the comment is one argument, no quotes.
+        a.push(env.ufw.clone().into());
+        match verb {
+            Verb::Allow { first } => {
+                if first {
+                    a.push("prepend".into());
+                }
+                a.push("allow".into());
+            }
+            Verb::Remove => a.extend(["delete".into(), "allow".into()]),
+        }
+        a.extend(["in", "on", iface, "from", &cidr, "to", "any", "port", &port, "proto", "tcp"].map(OsString::from));
+        if !matches!(verb, Verb::Remove) {
+            a.extend(["comment", TAG].map(OsString::from));
+        }
+    }
+    a
 }
 
 /// Run `verb` on `rule` through pkexec (stdin null, stderr captured, [`PKEXEC_TIMEOUT`]);
 /// `cancel` kills pkexec, which closes polkit's dialog.
-pub async fn run(_env: &FirewallEnv, _verb: Verb, _rule: &Rule, _cancel: CancellationToken) -> AllowOutcome {
-    // CAST-7: `allow::run`.
-    AllowOutcome::Failed { message: String::new() }
+pub async fn run(env: &FirewallEnv, verb: Verb, rule: &Rule, cancel: CancellationToken) -> AllowOutcome {
+    allow::run_with(env, verb, rule, cancel, PKEXEC_TIMEOUT).await
 }
 
 /// The commands to copy for `rule` (DESIGN §40 §9.4 "Copyable fallback").

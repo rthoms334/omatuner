@@ -1,0 +1,14 @@
+### RULES ###
+
+### tuple ### allow tcp 47800 0.0.0.0/0 any 192.168.1.0/24 in_wlan0 comment=not-hex-at-all
+### tuple ### allow tcp 47800 0.0.0.0/0 any 192.168.1.0/24 in_wlan0 comment=6f6d6174756e65722063617
+### tuple ### allow tcp 47800 0.0.0.0/0 any 192.168.1.0/24 in_wlan0 comment=6f6d6174756e65722063617374 trailing
+### tuple ### allow tcp 47800
+### tuple ### allow tcp 47800 0.0.0.0/0 any 192.168.1.0/24 in_wlan0 x y z extra fields
+### tuple ### frobnicate tcp 47800 0.0.0.0/0 any 192.168.1.0/24 in_wlan0
+### tuple ### allow tcp 99999 0.0.0.0/0 any 192.168.1.0/24 in_wlan0
+### tuple ### allow tcp 47800 0.0.0.0/0 any 192.168.1.0/33 in_wlan0
+### tuple ### allow_loud tcp 47800 0.0.0.0/0 any 192.168.1.0/24 in_wlan0
+### tuple ### allow tcp 47800 0.0.0.0/0 any 192.168.1.0/24 sideways
+# ### tuple ### allow tcp 47800 0.0.0.0/0 any 192.168.1.0/24 in_wlan0 comment=6f6d6174756e65722063617374
+### END RULES ###

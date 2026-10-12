@@ -1,0 +1,5 @@
+### RULES ###
+
+### tuple ### allow_log any any 0.0.0.0/0 any 192.168.1.5 in_wlan0
+
+### END RULES ###
