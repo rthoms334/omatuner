@@ -12,6 +12,13 @@
 //! startup, `SetConnectionLimit` after a refresh reaches it through any picture), both are
 //! watched by the memory thread, MPRIS routes through the [`TileRouter`], and shutdown stops
 //! B, then A.
+//! Casting (DESIGN §40 §5.6): the cast service starts with the integrations when casting is
+//! built in and `cast.enabled` (a failure means no casting, never a crash) and is published with
+//! `AppShared::set_cast`; picture A reaches it through `AppShared` from the start. Turning
+//! `cast.enabled` off or on in Settings stops or starts it (every other `[cast]` value is read
+//! live, so a change never ends a cast). It stops first at shutdown (the TV's stop, its children,
+//! a waiting `pkexec`, the LAN listener, the sleep lock), and a signal's direct exit takes the
+//! same fast path ([`Services::exit_cleanup`]).
 //! Shutdown order: video surface destroy (GL, done by the app) → integrations → jobs.shutdown
 //! (cancel all, refuse new ones) → player shutdown (mpv; final progress save) → wait ≤ 5 s for
 //! the cancelled jobs' wind-down → runtime (shutdown_timeout 2 s) → store writer drains + joins.
@@ -52,6 +59,8 @@ pub struct Integrations {
     pub mpris: Option<crate::platform::mpris::MprisService>,
     pub reminders: Option<crate::platform::notify::ReminderScheduler>,
     pub scheduler: Option<tokio::task::AbortHandle>,
+    /// Casting to TVs (DESIGN §40).
+    pub cast: Option<crate::cast::service::CastService>,
 }
 
 pub struct Services {
@@ -86,6 +95,8 @@ pub struct Services {
     closing: Arc<AtomicBool>,
     /// The IPC socket we bound, for the signal watcher's direct exit.
     socket: Arc<Mutex<Option<crate::ipc::SocketGuard>>>,
+    /// The running cast service's fast stop, for the signal watcher's direct exit.
+    cast_stop: Arc<Mutex<Option<crate::cast::service::CastStopper>>>,
 }
 
 impl Services {
@@ -123,7 +134,7 @@ impl Services {
         let player = {
             let cfg = crate::config::current(&config);
             // picture A casts (DESIGN §40 §5.5): through `AppShared`, which answers "casting isn't
-            // available" until the cast service publishes its handle (CAST-6)
+            // available" until the cast service publishes its handle
             let cast: Arc<dyn crate::player::remote::CastConnector> = agent.clone();
             Player::start(&cfg, PlayerDeps { cast: Some(cast), ..player_deps(&store, &config, &bus, &agent) })?
         };
@@ -150,6 +161,7 @@ impl Services {
             agent_connect,
             closing: Arc::default(),
             socket: Arc::default(),
+            cast_stop: Arc::default(),
         })
     }
 
@@ -187,6 +199,9 @@ impl Services {
         }
         if cfg.integration.mpris {
             self.start_mpris();
+        }
+        if crate::cast::ENABLED && cfg.cast.enabled {
+            self.start_cast();
         }
         // always: automatic switches (DESIGN §30.8) run with notification reminders off too
         self.start_reminders();
@@ -231,6 +246,25 @@ impl Services {
     fn start_mpris(&mut self) {
         let router = crate::platform::mpris::TileRouter::new(self.tiles.registry(), self.agent.clone(), self.queue.clone());
         self.integrations.mpris = ok("MPRIS", crate::platform::mpris::MprisService::start(self.rt.handle(), router, self.bus.clone()));
+    }
+
+    /// Start the cast service and publish it (the UI, the agent and picture A see it through
+    /// `AppShared::cast`).
+    fn start_cast(&mut self) {
+        let deps = crate::cast::service::CastDeps::new(self.store.clone(), self.config.clone(), self.paths.clone());
+        self.integrations.cast = ok("casting", crate::cast::service::CastService::start(self.rt.handle(), deps));
+        self.agent.set_cast(self.integrations.cast.as_ref().map(|c| c.handle()));
+        *self.cast_stop.lock().unwrap_or_else(|e| e.into_inner()) = self.integrations.cast.as_ref().map(|c| c.stopper());
+    }
+
+    /// Stop the cast service (Settings turned casting off, or shutdown): the inert handle answers
+    /// from then on.
+    fn stop_cast(&mut self) {
+        self.agent.set_cast(None);
+        self.cast_stop.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(mut c) = self.integrations.cast.take() {
+            c.stop();
+        }
     }
 
     /// Start picture B's player on the blocking pool (multi-view's first request; mpv init
@@ -310,6 +344,13 @@ impl Services {
                 self.start_mpris();
             }
         }
+        // the service reads every other `[cast]` value live (a cast picks it up at its next load)
+        if old.cast.enabled != new.cast.enabled {
+            self.stop_cast();
+            if crate::cast::ENABLED && new.cast.enabled {
+                self.start_cast();
+            }
+        }
         if old.reminders != new.reminders || old.follow != new.follow {
             // the scheduler reads its settings live: a restart would forget the countdowns it
             // already gave (a second countdown, or a second fire)
@@ -386,11 +427,18 @@ impl Services {
     }
 
     /// What the direct exit does instead of [`Services::shutdown`] (the UI thread can't run
-    /// it): stop the player (its final progress save goes to the writer), flush the writer
-    /// queue, remove the IPC socket. mpv and the WAL are left to process exit / the next open.
+    /// it): stop casting (the TV's stop within 300 ms, ffmpeg and a waiting pkexec killed, the
+    /// session directories wiped), stop the player (its final progress save goes to the writer),
+    /// flush the writer queue, remove the IPC socket. mpv and the WAL are left to process exit /
+    /// the next open.
     pub(crate) fn exit_cleanup(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
         let (players, writer, socket) = (self.tiles.handles(), self.store.writer().clone(), self.socket.clone());
+        let cast = self.cast_stop.clone();
         async move {
+            let stopper = cast.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(stopper) = stopper {
+                stopper.stop_fast().await;
+            }
             for player in &players {
                 player.send(PlayerCommand::Shutdown);
             }
@@ -414,6 +462,8 @@ impl Services {
         self.closing.store(true, Ordering::SeqCst);
         // agent CLIs still running are killed with what they started
         self.agent_connect.shutdown();
+        // the TV first: a fire-and-forget stop, then the relay's children and a waiting pkexec
+        self.stop_cast();
         if let Some(m) = &mut self.integrations.mpris {
             m.stop();
         }
