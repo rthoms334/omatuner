@@ -39,6 +39,8 @@ const B: TileId = TileId::B;
 
 /// The "move the playing picture?" card's token.
 const MOVE_TOKEN: u64 = 0x4d56_4d4f_5645_0001;
+/// Why multi-view doesn't open while casting (the router's refusal says the same).
+const CASTING_NO_MV: &str = "Stop casting to use multi-view";
 
 /// Multi-view's state in the app.
 #[derive(Default)]
@@ -298,6 +300,11 @@ impl TunerApp {
 
     /// Play a live channel or catch-up in a picture (module docs).
     pub(super) fn mv_place(&mut self, p: PlaceIn) {
+        // casting and multi-view exclude each other (DESIGN §40 §0.6): the router refuses
+        // picture B already; this keeps every other way in (an agent's two pictures) out too
+        if self.snapshot.cast.is_some() && matches!(p.aim, Aim::Tile(TileId::B) | Aim::Alongside) {
+            return self.toast(Toast::info(CASTING_NO_MV));
+        }
         let view = self.mv.view;
         let kind = media_kind(&p.media);
         let channel = match &p.media {
@@ -483,6 +490,9 @@ impl TunerApp {
             MediaRef::Channel(c) | MediaRef::Catchup { channel: c, .. } => Some(*c),
             _ => None,
         };
+        if self.snapshot.cast.is_some() {
+            return self.toast(Toast::info(CASTING_NO_MV));
+        }
         let (Some(first), Some(second)) = (pair.first(), pair.get(1)) else { return };
         let (Some(id0), Some(id1)) = (channel(first), channel(second)) else {
             return self.toast(Toast::info("Films and episodes play on their own"));

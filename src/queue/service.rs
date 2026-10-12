@@ -357,8 +357,10 @@ impl Engine {
             Effect::NotifyPin(id) => {
                 // the card shows it in the window; a hidden window, or the pop-out (it never
                 // takes the keyboard: an agent's Up next plays there, DESIGN §30.13), gets a
-                // notification
-                if (self.last.video_suspended || self.shared.window().is_some_and(|w| w.popped_out))
+                // notification. Casting suspends no local video (there is none): there, a
+                // window without the focus gets it (DESIGN §40 §3.8, §11.4)
+                let casting_unseen = self.last.cast.is_some() && !self.shared.window().is_some_and(|w| w.focused);
+                if (self.last.video_suspended || casting_unseen || self.shared.window().is_some_and(|w| w.popped_out))
                     && let Some(r) = self.machine.rows().iter().find(|r| r.id == id)
                 {
                     let title = self.shared.guard().outside_title(&r.title, now()).into_owned();

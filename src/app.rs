@@ -198,10 +198,62 @@ pub struct TunerApp {
     /// and what waits for it (`app/multiview.rs`).
     mv: multiview::MvApp,
     /// The first-run card's offer (DESIGN §39), waiting until nothing else is going on
-    /// ([`agent_card_may_show`]); shown once, then `None`.
+    /// ([`card_may_show`]); shown once, then `None`.
     agent_offer: Option<crate::agent::connect::Offer>,
+    /// Casting (DESIGN §40): the first-run card's offer, the last TV cast to, the alerts and the
+    /// quit confirmation (`CastApp`).
+    cast: CastApp,
     #[cfg(test)]
     log: std::cell::RefCell<tests::Log>,
+}
+
+/// The app's casting state (DESIGN §40 §3.5, §3.8). The session itself is picture A's
+/// controller's (`PlayerSnapshot::cast`); this is only what the window does about it.
+#[derive(Debug, Default)]
+struct CastApp {
+    /// The first-run card's offer (§3.5), waiting until nothing else is going on
+    /// ([`card_may_show`]; the agent card goes first); shown once, then `None`.
+    offer: Option<crate::cast::SetupOffer>,
+    /// The TV last cast to and its sanitized name: an alert after casting ended still names it.
+    last: Option<(crate::model::DeviceId, String)>,
+    /// A cast was on at the last frame (a cast that starts while popped out pops back in).
+    was_casting: bool,
+    /// What a "casting stopped" alert offers (Cast again), kept for its notification's Show.
+    ended_alert: Option<Toast>,
+    /// "Quit anyway" was confirmed: the next close request closes.
+    quit_confirmed: bool,
+    /// Close the window after this frame (the confirmation answered Quit).
+    close_now: bool,
+    /// An agent's `play {device}` being sent (`send_player` turns its play into `CastTo`).
+    device: Option<crate::model::DeviceId>,
+    /// The TV a locked channel's play waits for, with the PIN (`pending_locked`).
+    pending_device: Option<crate::model::DeviceId>,
+    /// Tests: the cast picture A shows (the controller's remote output is CAST-5's).
+    #[cfg(test)]
+    view: Option<crate::model::CastView>,
+}
+
+/// The token of the quit confirmation while casting.
+const QUIT_TOKEN: u64 = 0x4341_5354_5155_4954;
+
+/// Where a cast alert goes (DESIGN §40 §3.8): the window seen (focused, or on a workspace a
+/// monitor shows) with the player on screen → the casting card, which has the actions (nothing
+/// more to do); seen otherwise → a toast with the action; not seen → a desktop notification
+/// with Show (a toast without a notification server). Casting that ended has no card left: a
+/// toast at least.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AlertTo {
+    Card,
+    Toast,
+    Notify,
+}
+
+fn alert_to(seen: bool, player_on_screen: bool, ended: bool) -> AlertTo {
+    match (seen, player_on_screen && !ended) {
+        (false, _) => AlertTo::Notify,
+        (true, true) => AlertTo::Card,
+        (true, false) => AlertTo::Toast,
+    }
 }
 
 impl TunerApp {
@@ -298,6 +350,7 @@ impl TunerApp {
             devshot: None,
             mv: Default::default(),
             agent_offer: None,
+            cast: CastApp::default(),
             #[cfg(test)]
             log: Default::default(),
         };
@@ -309,6 +362,7 @@ impl TunerApp {
         app.submit_job(JobKind::RebuildLibrary);
         app.handle_ipc(&initial);
         app.start_agent_pass();
+        app.start_cast_pass();
         app
     }
 
@@ -335,17 +389,7 @@ impl TunerApp {
         if self.agent_offer.is_none() {
             return;
         }
-        let gate = CardGate {
-            onboarded: !self.lib.sources.is_empty() && !matches!(self.current_route(), Route::Onboarding(_)),
-            busy: !self.overlays.is_empty() || !self.nav.is_empty(),
-            player: self.view_screen() == ScreenId::Player,
-            fullscreen: self.window_fullscreen,
-            popped_out: self.popout.is_out() || self.video_only,
-            multiview: self.mv.view.on,
-            typing: egui_ctx.egui_wants_keyboard_input() || self.key_stack().contains(&KeyContext::TextInput),
-            agents_page: matches!(self.current_route(), Route::Settings(crate::ui::SettingsPage::Agents)),
-        };
-        if agent_card_may_show(gate)
+        if card_may_show(self.card_gate(egui_ctx, crate::ui::SettingsPage::Agents))
             && let Some(offer) = self.agent_offer.take()
         {
             // the offer may have waited a while: the switch turned off, or an agent connected
@@ -365,6 +409,195 @@ impl TunerApp {
             } else {
                 self.config_edits.push(Box::new(|c| c.agents.checked_version = Some(TUNER_VERSION.to_owned())));
             }
+        }
+    }
+
+    /// What the first-run cards wait for, now; `page`: the card's own Settings page (the card
+    /// would only repeat it).
+    fn card_gate(&self, egui_ctx: &egui::Context, page: crate::ui::SettingsPage) -> CardGate {
+        CardGate {
+            onboarded: !self.lib.sources.is_empty() && !matches!(self.current_route(), Route::Onboarding(_)),
+            busy: !self.overlays.is_empty() || !self.nav.is_empty(),
+            player: self.view_screen() == ScreenId::Player,
+            fullscreen: self.window_fullscreen,
+            popped_out: self.popout.is_out() || self.video_only,
+            multiview: self.mv.view.on,
+            typing: egui_ctx.egui_wants_keyboard_input() || self.key_stack().contains(&KeyContext::TextInput),
+            own_page: self.current_route() == &Route::Settings(page),
+        }
+    }
+
+    /// The casting first-run pass (DESIGN §40 §3.5, modelled on [`Self::start_agent_pass`]):
+    /// one 5 s browse at startup, at most once per Tuner version, only while casting is on,
+    /// "Offer to set up new TVs" is on and Tuner runs on the desktop. The outcome arrives in
+    /// [`Self::cast_card_frame`].
+    fn start_cast_pass(&self) {
+        let cfg = self.services().config();
+        let c = &cfg.cast;
+        if crate::cast::ENABLED
+            && c.enabled
+            && c.offer_setup
+            && c.checked_version.as_deref() != Some(TUNER_VERSION)
+            && !crate::platform::off_desktop()
+        {
+            self.services().agent.cast().start_pass();
+        }
+    }
+
+    /// The cast pass's outcome (polled until it comes), then the card once the gate opens and
+    /// the agent card isn't due (one card at a time: the agent card goes first). Nothing is
+    /// recorded until the card is answered (or there was nothing to offer).
+    fn cast_card_frame(&mut self, egui_ctx: &egui::Context) {
+        let cast = self.services().agent.cast();
+        match cast.take_pass_outcome() {
+            Some(crate::cast::PassOutcome { offer: Some(o) }) => self.cast.offer = Some(o),
+            Some(crate::cast::PassOutcome { offer: None }) => {
+                self.config_edits.push(Box::new(|c| c.cast.checked_version = Some(TUNER_VERSION.to_owned())));
+            }
+            None => {}
+        }
+        if self.cast.offer.is_none() || self.agent_offer.is_some() {
+            return;
+        }
+        if card_may_show(self.card_gate(egui_ctx, crate::ui::SettingsPage::Cast))
+            && let Some(offer) = self.cast.offer.take()
+        {
+            // the offer may have waited a while: the switch turned off, or the TV paired from
+            // Settings meanwhile
+            let cfg = self.services().config();
+            let paired = cast.devices().iter().any(|d| d.id == offer.device && !matches!(d.pairing, crate::cast::Pairing::Required));
+            if cfg.cast.enabled && cfg.cast.offer_setup && !paired {
+                self.nav.push(NavRequest::Open(OverlayRequest::CastOffer(offer)));
+            } else {
+                self.config_edits.push(Box::new(|c| c.cast.checked_version = Some(TUNER_VERSION.to_owned())));
+            }
+        }
+    }
+
+    /// The TV's name for an alert: the one casting, else the last one cast to.
+    fn cast_name(&self) -> String {
+        match (&self.snapshot.cast, &self.cast.last) {
+            (Some(c), _) => c.name.clone(),
+            (None, Some((_, name))) => name.clone(),
+            (None, None) => "Your TV".to_owned(),
+        }
+    }
+
+    /// A cast failure or a cast that ended on the TV (DESIGN §40 §3.4, §3.8): the alert goes
+    /// where the user is ([`alert_to`]). Whether the window is seen is decided as an agent's
+    /// play decides it (§30.13): focused, else Hyprland is asked on the runtime (two blocking
+    /// socket requests, only now); off Hyprland, or when it doesn't answer, an unfocused window
+    /// counts as not seen — the opposite default to §30.13: an alert only tells, and a
+    /// duplicate notification is harmless where a missed firewall error is not. Casting never
+    /// moves the window: only the notification's Show raises it.
+    fn cast_alert(&mut self, kind: crate::cast::CastErrorKind, ended: bool, egui_ctx: &egui::Context) {
+        use crate::cast::CastErrorKind as K;
+        let name = self.cast_name();
+        let convert_off = self.services().config().cast.convert == crate::config::CastConvert::Never;
+        let text = crate::ui::overlays::cast_offer::error_sentence(kind, &name, convert_off);
+        let toast = match kind {
+            _ if ended => Toast { kind: ToastKind::Info, text: text.clone(), action: Some(("Cast again".into(), Action::CastMenu)), ttl_ms: 10_000 },
+            K::NeedsFfmpeg => Toast { ttl_ms: 10_000, ..Toast::error(text.clone()) },
+            // the casting card has the actions (Allow on firewall, Pair, Play here…)
+            _ => Toast { action: self.has_media().then(|| ("Show".into(), Action::OpenPlayer)), ttl_ms: 10_000, ..Toast::error(text.clone()) },
+        };
+        let on_player = self.view_screen() == ScreenId::Player;
+        self.cast.ended_alert = ended.then(|| toast.clone());
+        if egui_ctx.input(|i| i.viewport().focused).unwrap_or(false) {
+            if alert_to(true, on_player, ended) == AlertTo::Toast {
+                self.toast(toast);
+            }
+            return;
+        }
+        #[cfg(test)]
+        self.log.borrow_mut().cast_alerts.push(kind);
+        let bus = self.services().bus.clone();
+        let summary = if ended { format!("Casting to {name} stopped") } else { format!("Casting to {name} failed") };
+        self.services().rt.spawn(async move {
+            let shown = tokio::task::spawn_blocking(crate::platform::popout::self_shown).await.ok().flatten() == Some(true);
+            match alert_to(shown, on_player, ended) {
+                AlertTo::Card => {}
+                AlertTo::Toast => bus.toast(toast),
+                AlertTo::Notify => {
+                    if !crate::platform::notify::notify_cast(&summary, &text, bus.clone()).await {
+                        bus.toast(toast);
+                    }
+                }
+            }
+        });
+    }
+
+    /// **Show** on a cast alert's notification (it raised the window already): back in from
+    /// the pop-out, onto the player, where the casting card has the actions; a cast that ended
+    /// has no card, so its alert shows as the toast instead.
+    fn on_show_player(&mut self, egui_ctx: &egui::Context) {
+        if self.popout.is_out() || self.video_only {
+            self.toggle_popout(egui_ctx);
+        }
+        if self.has_media() {
+            self.nav.push(NavRequest::Push(Route::Player));
+        } else if let Some(t) = self.cast.ended_alert.take() {
+            self.toast(t);
+        }
+    }
+
+    /// Every frame, after the snapshot: remember the TV cast to, put a popped-out window back
+    /// in (unraised) when a cast starts (a pop-out pinned on every workspace would only show
+    /// the casting card; §3.8), and keep a quit confirmation for a cast that ended meanwhile
+    /// from closing anything.
+    fn cast_frame(&mut self, egui_ctx: &egui::Context) {
+        let now = self.snapshot.cast.as_ref().map(|c| (c.device, c.name.clone()));
+        let started = now.is_some() && !self.cast.was_casting;
+        self.cast.was_casting = now.is_some();
+        if now.is_some() {
+            self.cast.last = now;
+        }
+        if started && (self.popout.is_out() || self.video_only) {
+            self.reminder_ui.pop_out_pending = false;
+            self.toggle_popout(egui_ctx);
+        }
+    }
+
+    /// The status bar's chip while casting and no mini player shows (Compact, or the mini
+    /// player off): "Casting · Living Room"; a click opens the player (the casting card), ✕
+    /// stops casting.
+    fn cast_chip(&self, mini_hidden: bool) -> Option<crate::ui::widgets::status_bar::StatusChip> {
+        let c = self.snapshot.cast.as_ref().filter(|_| mini_hidden)?;
+        let player = self.services().tiles.a().handle();
+        Some(crate::ui::widgets::status_bar::StatusChip {
+            text: format!("Casting · {}", c.name),
+            label: format!("Casting to {} — show the player", c.name),
+            action: Action::OpenPlayer,
+            warning: c.phase == crate::model::CastPhase::Lost,
+            close: Some(crate::ui::widgets::status_bar::ChipClose::new("Stop casting", move || {
+                player.send(PlayerCommand::StopCasting { play_here: false });
+            })),
+        })
+    }
+
+    /// A close request (Ctrl+Q, the compositor's close bind, the IPC's quit) while casting:
+    /// Tuner *is* the relay, so the TV can't carry on without it — ask first ("Closing Tuner
+    /// stops playback on Living Room"), raising the window when the request came while it was
+    /// out of sight (a close bind used on another monitor) so the question is seen.
+    fn confirm_quit(&mut self, egui_ctx: &egui::Context) {
+        if !egui_ctx.input(|i| i.viewport().close_requested()) || self.cast.quit_confirmed {
+            return;
+        }
+        let Some(c) = &self.snapshot.cast else { return };
+        egui_ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        if !egui_ctx.input(|i| i.viewport().focused).unwrap_or(false) {
+            crate::platform::hypr::focus_self();
+        }
+        let ask = OverlayRequest::Confirm(crate::ui::overlays::ConfirmSpec {
+            title: "Quit Tuner?".into(),
+            body: format!("Closing Tuner stops playback on {}.", c.name),
+            confirm_label: "Quit".into(),
+            destructive: true,
+            token: QUIT_TOKEN,
+        });
+        // asked already (a second close request while the question is up)
+        if !self.overlays.iter().any(|o| o.kind == std::mem::discriminant(&ask)) {
+            self.nav.push(NavRequest::Open(ask));
         }
     }
 
@@ -439,6 +672,16 @@ impl TunerApp {
     /// picture; a film, an episode or a file to picture A, ending multi-view; with two pictures,
     /// volume and mute to the one with the sound (as the keys, `ui::multiview::route_command`).
     fn send_player(&self, cmd: PlayerCommand) {
+        // an agent's `play {device}` (DESIGN §40 §12): its play goes to that TV — already
+        // casting there, the play simply lands on it (everything played in picture A does)
+        let cmd = match (self.cast.device, cmd) {
+            (Some(device), PlayerCommand::Play(req) | PlayerCommand::PlayCopy(crate::player::CopyPlay { req, .. }))
+                if self.snapshot.cast.as_ref().is_none_or(|c| c.device != device) =>
+            {
+                PlayerCommand::CastTo { device, play: Some(req) }
+            }
+            (_, cmd) => cmd,
+        };
         #[cfg(test)]
         self.log.borrow_mut().commands.push(cmd.clone());
         if self.mv_vod_to_a(&cmd) {
@@ -618,12 +861,22 @@ impl TunerApp {
                 PlatformEvent::SwitchSoon { reminder, channel, start } => self.on_switch_soon(*reminder, channel, *start, None, OpenIn::FullWindow),
                 PlatformEvent::SwitchNow { reminder, channel } => self.on_switch_now(*reminder, channel, OpenIn::FullWindow, None, None, egui_ctx),
                 PlatformEvent::PopOut(ev) => self.on_popout_event(ev, egui_ctx),
-                // CAST-9: a cast alert's Show (DESIGN §40 §3.8); never sent while casting is off
-                PlatformEvent::ShowPlayer => {}
+                // a cast alert's Show (DESIGN §40 §3.8): the notification raised the window
+                PlatformEvent::ShowPlayer => self.on_show_player(egui_ctx),
             },
             // the first copy of a title failed before its first frame (DESIGN §29.15)
             AppEvent::Player(crate::player::PlayerEvent::FellBack { title, from, to, .. }) => {
                 self.toast(crate::ui::copies::fell_back_toast(&self.lib, title, *from, *to));
+            }
+            // casting failed, or ended on the TV (DESIGN §40 §3.4): the alert goes where the
+            // user is (§3.8)
+            AppEvent::Player(crate::player::PlayerEvent::Failed(crate::player::PlayerError {
+                kind: crate::player::PlayerErrorKind::Cast(kind),
+                ..
+            })) => self.cast_alert(*kind, false, egui_ctx),
+            AppEvent::Player(crate::player::PlayerEvent::CastEnded { device, name, kind }) => {
+                self.cast.last = Some((*device, name.clone()));
+                self.cast_alert(*kind, true, egui_ctx);
             }
             AppEvent::Player(_) => {}
         }
@@ -1058,6 +1311,7 @@ impl TunerApp {
             if cfg.parental.pin_active() {
                 self.pending_locked = Some((id, origin));
                 self.pending_agent = None;
+                self.cast.pending_device = None;
                 self.nav.push(NavRequest::Open(OverlayRequest::Pin { then: Box::new(Action::OpenPlayer), reason: "This channel is locked".into() }));
             } else {
                 self.toast(Toast::info("This channel is hidden by parental control (Settings ▸ Parental)"));
@@ -1074,6 +1328,7 @@ impl TunerApp {
         if locked && !self.parental.is_unlocked(&cfg.parental) {
             self.pending_locked = Some((id, origin));
             self.pending_agent = None;
+            self.cast.pending_device = None;
             self.nav.push(NavRequest::Open(OverlayRequest::Pin { then: Box::new(Action::OpenPlayer), reason: "This channel is locked".into() }));
             return;
         }
@@ -1112,10 +1367,17 @@ impl TunerApp {
     /// handler resolved (§30.13). A PIN prompt the handler didn't predict (the session relocked
     /// since) shows in the window: popped back in and raised (also a window on screen the
     /// handler left unraised: the terminal has the keyboard).
+    ///
+    /// `play {device}` (DESIGN §40 §3.8, §12) plays on that TV and never moves the window: no
+    /// pop-out, no raise, no new screen, whatever `show` says (a popped-out window goes back
+    /// in, unraised, when the cast starts: `cast_frame`). Only its PIN prompt raises the
+    /// window, and nothing is cast before the unlock.
     fn on_agent_play(&mut self, p: crate::agent::AgentPlay, egui_ctx: &egui::Context) {
         use crate::reminders::ui::Placement;
         let show = p.show;
+        let device = p.device;
         match self.agent_play(p) {
+            AgentPlayed::Sent if device.is_some() => self.drop_player_push(),
             AgentPlayed::Sent => {
                 if show.place == Placement::FullWindow {
                     self.agent_leave_screen();
@@ -1189,6 +1451,15 @@ impl TunerApp {
     /// once it is typed), a channel's zap list, a title's copies and resume rules. The handler
     /// checked that the target exists and is visible.
     fn agent_play(&mut self, p: crate::agent::AgentPlay) -> AgentPlayed {
+        // `play {device}`: what this sends goes to the TV (`send_player`)
+        self.cast.device = p.device;
+        let played = self.agent_play_here(p);
+        self.cast.device = None;
+        played
+    }
+
+    /// [`Self::agent_play`]'s body.
+    fn agent_play_here(&mut self, p: crate::agent::AgentPlay) -> AgentPlayed {
         use crate::agent::PlayTarget;
         use crate::model::VodKind;
         let cfg = self.services().config();
@@ -1211,6 +1482,7 @@ impl TunerApp {
                 // the prompt this play opened (a stale `pending_locked` from a prompt dismissed
                 // earlier says nothing)
                 return if matches!(self.nav.last(), Some(NavRequest::Open(OverlayRequest::Pin { .. }))) {
+                    self.cast.pending_device = p.device;
                     AgentPlayed::Pin
                 } else if matches!(self.nav.last(), Some(NavRequest::Push(Route::Player))) {
                     AgentPlayed::Sent
@@ -1386,6 +1658,9 @@ impl TunerApp {
         if self.pending_locked.as_ref().is_some_and(|(c, _)| *c == cid) {
             return; // the PIN prompt shows where the window is; nothing moves under it
         }
+        // casting: the switch retunes the TV and skips its "Open in" (DESIGN §40 §3.8: casting
+        // never moves the window)
+        let place = if self.snapshot.cast.is_some() { Place::InPlace } else { place };
         match place {
             Place::PopOut => {
                 self.toggle_popout(egui_ctx);
@@ -1814,6 +2089,17 @@ impl TunerApp {
             Action::StopPlayback if self.mv.view.on => self.mv_stop_all(),
             Action::GlobalPlayPause => self.send_player(PlayerCommand::TogglePause),
             Action::StopPlayback => self.send_player(PlayerCommand::Stop),
+            // casting off the player (DESIGN §40 §3.7; `C` and the player menu are the player
+            // screen's): the status chip, a toast's "Cast again" (the picker over the player:
+            // the TV chosen there replays the last item, `CastTo { play: None }`)
+            Action::StopCasting if self.snapshot.cast.is_some() => self.send_player(PlayerCommand::StopCasting { play_here: false }),
+            Action::CastMenu if crate::cast::ENABLED && !self.mv.view.on => {
+                if self.popout.is_out() || self.video_only {
+                    self.toggle_popout(egui_ctx);
+                }
+                self.nav.push(NavRequest::Push(Route::Player));
+                self.nav.push(NavRequest::Open(OverlayRequest::CastPicker));
+            }
             Action::RefreshSource => self.refresh_everything(),
             Action::TogglePopOut => {
                 self.toggle_popout(egui_ctx);
@@ -2016,6 +2302,15 @@ impl TunerApp {
                 self.overlays.pop();
             }
             OverlayOutcome::CloseWith(result) => {
+                // the quit confirmation while casting
+                if let overlays::OverlayResult::Confirmed(QUIT_TOKEN) | overlays::OverlayResult::Cancelled(QUIT_TOKEN) = result {
+                    self.overlays.pop();
+                    if result == overlays::OverlayResult::Confirmed(QUIT_TOKEN) {
+                        self.cast.quit_confirmed = true;
+                        self.cast.close_now = true;
+                    }
+                    return;
+                }
                 // multi-view's "move the playing picture?" card, or its PIN for a picture
                 if self.mv_overlay_result(&result) {
                     self.overlays.pop();
@@ -2026,7 +2321,10 @@ impl TunerApp {
                     && let Some((id, origin)) = self.pending_locked.take()
                 {
                     self.overlays.pop();
+                    // an agent's `play {device}` of a locked channel: on the TV, now unlocked
+                    self.cast.device = self.cast.pending_device.take();
                     self.play_channel(id, origin);
+                    self.cast.device = None;
                     return;
                 }
                 // ... or by an MCP client's `play` of a locked title / catch-up
@@ -2161,6 +2459,14 @@ impl TunerApp {
     fn toggle_popout(&mut self, egui_ctx: &egui::Context) -> bool {
         if self.popout_backend.is_none() {
             self.toast(Toast::info("Pop-out needs Hyprland (it pins a small player on every workspace)"));
+            return false;
+        }
+        // casting: nothing to show here (DESIGN §40 §3.3); back in is always fine
+        if let Some(c) = &self.snapshot.cast
+            && !self.popout.is_out()
+            && !self.video_only
+        {
+            self.toast(Toast::info(format!("Nothing to show here — playing on {}", c.name)));
             return false;
         }
         let Some(t) = self.popout.toggle(self.window_size, self.has_media()) else { return false };
@@ -2417,6 +2723,11 @@ impl eframe::App for TunerApp {
         // multi-view: a picture that went away ends it; the routers get focus and sound
         self.mv_reconcile();
         self.snapshot = self.services().tiles.focused().snapshot();
+        #[cfg(test)]
+        if let Some(v) = &self.cast.view {
+            Arc::make_mut(&mut self.snapshot).cast = Some(v.clone());
+        }
+        self.cast_frame(ctx);
         self.sync_explicit(ctx);
         self.publish_for_agent(ctx);
         let focus = self.mv.view.focus;
@@ -2442,7 +2753,9 @@ impl eframe::App for TunerApp {
             self.video.render(&gl, frame, [snaps[0].as_deref(), snaps[1].as_deref()], focus);
         }
         let mode = self.services().config().integration.idle_inhibit;
-        let active = live_snaps().any(|s| s.state.is_active() && !s.paused);
+        // casting: the picture is on the TV, so the screen here may lock and blank (DESIGN §40
+        // §11.5; the logind sleep inhibitor keeps the relay up)
+        let active = live_snaps().any(|s| s.state.is_active() && !s.paused && s.cast.is_none());
         let fs = self.window_fullscreen;
         if let Some(i) = &mut self.idle {
             i.set(mode, active, fs);
@@ -2489,7 +2802,9 @@ impl eframe::App for TunerApp {
         self.images.pump();
         self.dispatch_actions(&egui_ctx);
         self.handle_dropped_files();
+        self.confirm_quit(&egui_ctx);
         self.agent_card_frame(&egui_ctx);
+        self.cast_card_frame(&egui_ctx);
         self.apply_nav(&egui_ctx);
 
         let title = self.title_now();
@@ -2514,8 +2829,12 @@ impl eframe::App for TunerApp {
                 (mini_hidden && self.snapshot.state != PlayerState::Idle).then(|| self.snapshot.playable.as_ref().map(|p| p.title.clone())).flatten();
             // multi-view: "▶ 2 pictures · Sky Sports Main Event" (the focused one's)
             let now_playing = now_playing.map(|t| if self.mv.view.on { format!("2 pictures · {t}") } else { t });
-            let chips: Vec<_> =
-                crate::spoiler::ui::status_chip(&self.services().agent, crate::model::now()).into_iter().chain(self.sleep_chip()).collect();
+            let chips: Vec<_> = self
+                .cast_chip(mini_hidden)
+                .into_iter()
+                .chain(crate::spoiler::ui::status_chip(&self.services().agent, crate::model::now()))
+                .chain(self.sleep_chip())
+                .collect();
             let info = StatusInfo {
                 jobs: &jobs,
                 epg_updated: self.epg_updated,
@@ -2588,6 +2907,9 @@ impl eframe::App for TunerApp {
         self.reminder_frame(&egui_ctx, &theme);
         self.apply_nav(&egui_ctx);
         self.apply_config_edits(&egui_ctx);
+        if std::mem::take(&mut self.cast.close_now) {
+            egui_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         // "Lock now", a PIN typed or set this frame: not one more frame of the old state
         self.sync_explicit(&egui_ctx);
         self.publish_for_agent(&egui_ctx);
@@ -2780,8 +3102,8 @@ fn parse_channel_ref(s: &str) -> Option<ItemRef> {
 /// This Tuner's version: the start-of-version pass runs once per version (DESIGN §39).
 const TUNER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// What the first-run card waits for (DESIGN §39): it never covers playback or something the
-/// user is in the middle of.
+/// What the first-run cards wait for (DESIGN §39, §40 §3.5): they never cover playback or
+/// something the user is in the middle of.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct CardGate {
     /// A playlist was added and onboarding is over.
@@ -2795,14 +3117,15 @@ struct CardGate {
     multiview: bool,
     /// A text field has the keyboard.
     typing: bool,
-    /// Settings ▸ AI agents is open: the card would only repeat it.
-    agents_page: bool,
+    /// The card's own Settings page is open (AI agents, Cast): the card would only repeat it.
+    own_page: bool,
 }
 
-/// Whether the first-run card may open now. A preview playing in a browse screen's pane
-/// doesn't block it: the card takes the keys, playback is untouched.
-fn agent_card_may_show(g: CardGate) -> bool {
-    g.onboarded && !g.busy && !g.player && !g.fullscreen && !g.popped_out && !g.multiview && !g.typing && !g.agents_page
+/// Whether a first-run card (the agents' DESIGN §39, casting's §40 §3.5) may open now. A
+/// preview playing in a browse screen's pane doesn't block it: the card takes the keys,
+/// playback is untouched.
+fn card_may_show(g: CardGate) -> bool {
+    g.onboarded && !g.busy && !g.player && !g.fullscreen && !g.popped_out && !g.multiview && !g.typing && !g.own_page
 }
 
 /// First route: CLI view → no sources ⇒ onboarding → configured start screen (Home by
@@ -2854,6 +3177,8 @@ mod tests {
         pub releases: Vec<&'static str>,
         /// Commands multi-view sent to one picture (`TunerApp::send_to`).
         pub tile_commands: Vec<(crate::model::TileId, PlayerCommand)>,
+        /// Cast alerts that went off the UI thread to find the user (`TunerApp::cast_alert`).
+        pub cast_alerts: Vec<crate::cast::CastErrorKind>,
     }
 
     /// One app (mpv + runtime + store) at a time keeps the test binary's memory flat.
@@ -2866,6 +3191,10 @@ mod tests {
         size: egui::Vec2,
         /// What the window backend reports as the window's fullscreen state.
         fullscreen: Option<bool>,
+        /// Whether the window has the keyboard focus (`None`: the backend doesn't say).
+        focused: Option<bool>,
+        /// A close request in the next frame (the compositor's close bind, Ctrl+Q's command).
+        close: bool,
         dir: tempfile::TempDir,
         _one: std::sync::MutexGuard<'static, ()>,
     }
@@ -2915,7 +3244,17 @@ mod tests {
             let cc = eframe::CreationContext::_new_kittest(ctx.clone());
             let theme = Arc::new(scaled(Theme::fallback(), ui_scale));
             let app = TunerApp::new(&cc, services, events, theme, LoadedFonts::default(), initial);
-            let mut rig = Self { app, ctx, frame: eframe::Frame::_new_kittest(), size: egui::vec2(1280.0, 800.0), fullscreen: None, dir, _one: one };
+            let mut rig = Self {
+                app,
+                ctx,
+                frame: eframe::Frame::_new_kittest(),
+                size: egui::vec2(1280.0, 800.0),
+                fullscreen: None,
+                focused: None,
+                close: false,
+                dir,
+                _one: one,
+            };
             rig.frame_with(vec![]);
             rig
         }
@@ -2933,7 +3272,12 @@ mod tests {
         fn frame_dt(&mut self, events: Vec<Event>, hook: bool, dt: f32) -> egui::FullOutput {
             let screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.size));
             let mut raw = egui::RawInput { screen_rect, events, predicted_dt: dt, ..Default::default() };
-            raw.viewports.entry(egui::ViewportId::ROOT).or_default().fullscreen = self.fullscreen;
+            let vp = raw.viewports.entry(egui::ViewportId::ROOT).or_default();
+            vp.fullscreen = self.fullscreen;
+            vp.focused = self.focused;
+            if std::mem::take(&mut self.close) {
+                vp.events.push(egui::ViewportEvent::Close);
+            }
             let Rig { app, ctx, frame, .. } = self;
             if hook {
                 app.raw_input_hook(ctx, &mut raw);
@@ -6034,5 +6378,203 @@ mod tests {
         }
         assert!(rig.app.overlays.is_empty() && rig.app.agent_offer.is_none());
         assert_eq!(rig.app.services().config().agents.checked_version.as_deref(), Some(TUNER_VERSION));
+    }
+
+    // ---------------------------------------------------------------- casting (DESIGN §40)
+
+    fn living_room() -> crate::model::DeviceId {
+        crate::model::DeviceId::derive("airplay", "living-room")
+    }
+
+    /// Casting to Living Room as picture A's snapshot shows it (the controller's remote output
+    /// is CAST-5's), with a scripted cast service.
+    fn casting(rig: &mut Rig) -> Arc<crate::cast::testing::FakeCast> {
+        let fake = Arc::new(crate::cast::testing::FakeCast::default());
+        rig.app.services().agent.set_cast(Some(crate::cast::CastHandle::new(fake.clone())));
+        rig.app.cast.view = Some(crate::model::CastView {
+            device: living_room(),
+            name: "Living Room".into(),
+            kind: crate::model::cast::ReceiverKind::AppleTv,
+            phase: crate::model::CastPhase::Playing,
+            level: None,
+            behind_live_s: Some(15),
+            can_seek: false,
+            volume: false,
+        });
+        rig.frame_with(vec![]);
+        fake
+    }
+
+    fn cast_failed(kind: crate::cast::CastErrorKind) -> AppEvent {
+        let kind = crate::player::PlayerErrorKind::Cast(kind);
+        AppEvent::Player(crate::player::PlayerEvent::Failed(crate::player::PlayerError { kind, message: String::new() }))
+    }
+
+    /// DESIGN §40 §3.8: the window seen with the player on screen leaves the alert to the
+    /// casting card; seen elsewhere, a toast with the sentence; not seen, the notification path
+    /// (off the desktop it falls back to the toast). A cast that ended on the TV has no card:
+    /// its toast offers Cast again.
+    #[test]
+    fn cast_alerts_go_where_the_user_is() {
+        use crate::cast::CastErrorKind as K;
+        assert_eq!(alert_to(true, true, false), AlertTo::Card);
+        assert_eq!(alert_to(true, false, false), AlertTo::Toast);
+        assert_eq!(alert_to(true, true, true), AlertTo::Toast, "nothing left to show it");
+        assert_eq!(alert_to(false, true, false), AlertTo::Notify);
+
+        let mut rig = Rig::new();
+        casting(&mut rig);
+        rig.focused = Some(true);
+        rig.frame_with(vec![]);
+        rig.event(cast_failed(K::Firewall));
+        let last = rig.log().toasts.last().cloned().expect("a toast");
+        assert_eq!(last.text, "Living Room couldn't connect back to Tuner. Your firewall is blocking it.");
+        assert_eq!(last.kind, ToastKind::Error);
+
+        rig.app.nav.push(NavRequest::Push(Route::Player));
+        rig.frame_with(vec![]);
+        let n = rig.log().toasts.len();
+        rig.event(cast_failed(K::Unreachable));
+        assert_eq!(rig.log().toasts.len(), n, "the casting card shows it");
+        rig.event(AppEvent::Player(crate::player::PlayerEvent::CastEnded {
+            device: living_room(),
+            name: "Living Room".into(),
+            kind: K::StoppedOnTv,
+        }));
+        let last = rig.log().toasts.last().cloned().expect("a toast");
+        assert_eq!(last.text, "Living Room stopped playing. Its remote stopped it, or another device took over.");
+        assert_eq!(last.action, Some(("Cast again".into(), Action::CastMenu)));
+
+        // out of sight: a notification (none off the desktop, so the toast comes back through
+        // the bus); the window isn't moved
+        rig.focused = Some(false);
+        rig.frame_with(vec![]);
+        let n = rig.log().toasts.len();
+        rig.event(cast_failed(K::ReceiverFailed));
+        assert_eq!(rig.log().cast_alerts, [K::ReceiverFailed]);
+        rig.until("the fallback toast", |r| r.log().toasts.len() > n);
+        assert_eq!(rig.log().toasts[n].text, "Living Room couldn't play it.");
+        assert_eq!(rig.route(), &Route::Player);
+    }
+
+    /// One first-run card at a time: the agent card goes first, the cast card follows once it
+    /// is answered; an offer for a TV paired meanwhile only records the version.
+    #[test]
+    fn the_cast_card_waits_for_the_agent_card() {
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_channels(c, 3, None));
+        rig.settle();
+        let fake = Arc::new(crate::cast::testing::FakeCast::default());
+        rig.app.services().agent.set_cast(Some(crate::cast::CastHandle::new(fake.clone())));
+        let offer = crate::cast::SetupOffer { device: living_room(), name: "Living Room".into(), kind: crate::model::cast::ReceiverKind::AppleTv };
+        rig.app.agent_offer = Some(crate::agent::connect::Offer { agents: vec![crate::agent::connect::AgentId::Claude], connected: Vec::new() });
+        rig.app.cast.offer = Some(offer.clone());
+        rig.frame_with(vec![]);
+        assert_eq!(rig.overlay_kinds(), [kind(OverlayRequest::AgentConnect(crate::agent::connect::Offer { agents: vec![], connected: vec![] }))]);
+        rig.press(Key::Escape, NONE);
+        rig.frame_with(vec![]);
+        assert_eq!(rig.overlay_kinds(), [kind(OverlayRequest::CastOffer(offer.clone()))]);
+        rig.press(Key::Escape, NONE);
+        rig.frame_with(vec![]);
+        assert!(rig.app.overlays.is_empty());
+        assert_eq!(rig.app.services().config().cast.checked_version.as_deref(), Some(TUNER_VERSION), "Not now answers this version");
+
+        rig.app.config_edits.push(Box::new(|c: &mut Config| c.cast.checked_version = None));
+        let mut paired =
+            crate::cast::Device::new(living_room(), "Living Room", crate::model::cast::ReceiverKind::AppleTv, crate::cast::Protocol::AirPlay);
+        paired.pairing = crate::cast::Pairing::Paired(crate::cast::PairVariant::Hkp3);
+        fake.script(|s| s.devices = vec![paired]);
+        rig.frame_with(vec![]);
+        rig.app.cast.offer = Some(offer);
+        for _ in 0..3 {
+            rig.frame_with(vec![]);
+        }
+        assert!(rig.app.overlays.is_empty() && rig.app.cast.offer.is_none());
+        assert_eq!(rig.app.services().config().cast.checked_version.as_deref(), Some(TUNER_VERSION));
+    }
+
+    /// A cast that starts while the window is popped out puts it back in; while casting the
+    /// pop-out has nothing to show and says so.
+    #[test]
+    fn a_cast_start_pops_back_in_and_the_pop_out_stays_shut() {
+        let mut rig = Rig::new();
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        rig.app.popout_backend = Some(Box::new(PopRecorder(sent.clone())));
+        rig.press(Key::O, Modifiers { shift: true, ..CTRL });
+        rig.event(pop_event(PopOutEvent::PoppedOut));
+        rig.size = egui::vec2(480.0, 270.0);
+        rig.frame_with(vec![]);
+        assert!(matches!(sent.borrow().as_slice(), [PopRequest::Out { .. }]));
+        casting(&mut rig);
+        assert_eq!(sent.borrow().last(), Some(&PopRequest::In { ours: true }));
+        rig.event(pop_event(PopOutEvent::PoppedIn { place: Place::Keep }));
+        rig.size = egui::vec2(1280.0, 800.0);
+        rig.frame_with(vec![]);
+        rig.press(Key::O, Modifiers { shift: true, ..CTRL });
+        assert_eq!(sent.borrow().len(), 2, "no pop-out while casting");
+        assert!(rig.log().toasts.iter().any(|t| t.text == "Nothing to show here — playing on Living Room"), "{:?}", rig.log().toasts);
+    }
+
+    /// An agent's `play {device}`: the play goes to the TV and the window stays where it is,
+    /// whatever "Agents play in" says (no pop-out, no player screen).
+    #[test]
+    fn an_agent_play_on_a_tv_casts_in_place() {
+        use crate::agent::act::AgentShow;
+        use crate::agent::{AgentCommand, AgentPlay, PlayTarget};
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_channels(c, 2, None));
+        rig.settle();
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        rig.app.popout_backend = Some(Box::new(PopRecorder(sent.clone())));
+        let start = rig.route().clone();
+        let ch = rig.app.lib.live.by_ref(&channel_ref(1)).unwrap();
+        let play =
+            AgentPlay { target: PlayTarget::Media(MediaRef::Channel(ch)), from_start: false, show: AgentShow::POP_OUT, device: Some(living_room()) };
+        rig.event(AppEvent::Agent(AgentCommand::Play(play)));
+        rig.frame_with(vec![]);
+        let cmd = rig.log().commands.last().cloned();
+        assert!(
+            matches!(&cmd, Some(PlayerCommand::CastTo { device, play: Some(r) }) if *device == living_room() && r.media == MediaRef::Channel(ch) && r.zap.is_some()),
+            "{cmd:?}"
+        );
+        assert!(sent.borrow().is_empty() && !rig.app.reminder_ui.pop_out_pending, "no pop-out");
+        assert_eq!(rig.route(), &start, "no new screen");
+        // already casting there: the next play simply lands on the TV
+        casting(&mut rig);
+        let play = AgentPlay {
+            target: PlayTarget::Media(MediaRef::Channel(ch)),
+            from_start: false,
+            show: AgentShow::window(true),
+            device: Some(living_room()),
+        };
+        rig.event(AppEvent::Agent(AgentCommand::Play(play)));
+        assert!(matches!(rig.log().commands.last(), Some(PlayerCommand::Play(_))));
+    }
+
+    /// Closing while casting asks first (the TV stops with Tuner) and closes once confirmed;
+    /// not casting, a close request closes as before.
+    #[test]
+    fn quitting_while_casting_asks_first() {
+        let mut rig = Rig::new();
+        let cancelled = |out: &egui::FullOutput| out.viewport_output.values().any(|v| v.commands.contains(&egui::ViewportCommand::CancelClose));
+        rig.close = true;
+        let out = rig.frame_with(vec![]);
+        assert!(!cancelled(&out) && rig.app.overlays.is_empty());
+        casting(&mut rig);
+        rig.close = true;
+        let out = rig.frame_with(vec![]);
+        assert!(cancelled(&out));
+        let ask = OverlayRequest::Confirm(crate::ui::overlays::ConfirmSpec {
+            title: String::new(),
+            body: String::new(),
+            confirm_label: String::new(),
+            destructive: true,
+            token: QUIT_TOKEN,
+        });
+        assert_eq!(rig.overlay_kinds(), [kind(ask)]);
+        rig.app.apply_overlay_outcome(OverlayOutcome::CloseWith(OverlayResult::Confirmed(QUIT_TOKEN)));
+        let out = rig.frame_with(vec![]);
+        assert!(out.viewport_output.values().any(|v| v.commands.contains(&egui::ViewportCommand::Close)));
+        rig.close = true;
+        let out = rig.frame_with(vec![]);
+        assert!(!cancelled(&out), "confirmed: it closes");
     }
 }

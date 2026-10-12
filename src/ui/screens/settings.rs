@@ -75,6 +75,7 @@ use crate::ui::{LayoutClass, OnboardingStart, OverlayRequest, Route, Screen, Scr
 // hooks — `rows` (its rows on the pages it adds to), `act` (its `Act::Feature` buttons), `item`
 // (Enter on its `Item::Feature` rows) and, for a page of its own, `enter` (load on entering).
 mod agents; // the AI agents page (DESIGN §39)
+mod cast; // CAST-9: the Cast page (DESIGN §40 §3.6)
 mod following; // F-C: the Following page (DESIGN §33)
 mod guide_fix; // G-ui: EPG ▸ "Fix guide data… (N to fix)" (DESIGN §31)
 mod multiview; // MV-2: Player ▸ Multi-view (DESIGN §35)
@@ -87,6 +88,7 @@ mod spoiler; // S-ui: the Spoiler guard page (DESIGN §34)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Feature {
     Agents,
+    Cast,
     Following,
     GuideFix,
     MultiView,
@@ -96,7 +98,7 @@ enum Feature {
 }
 
 /// Every page in list order (`pages` leaves out the features that are off).
-const PAGES_ALL: [(SettingsPage, &str, &str); 14] = [
+const PAGES_ALL: [(SettingsPage, &str, &str); 15] = [
     (SettingsPage::Playlists, glyphs::PLAYLIST, "Playlists"),
     (SettingsPage::Epg, glyphs::GUIDE, "EPG"),
     (SettingsPage::Player, glyphs::PLAY, "Player"),
@@ -107,6 +109,7 @@ const PAGES_ALL: [(SettingsPage, &str, &str); 14] = [
     (SettingsPage::SpoilerGuard, glyphs::SPOILER, "Spoiler guard"),
     (SettingsPage::Parental, glyphs::LOCK, "Parental"),
     (SettingsPage::Agents, glyphs::AGENT, "AI agents"),
+    (SettingsPage::Cast, glyphs::CAST, "Cast"),
     (SettingsPage::Backup, glyphs::BACKUP, "Backup"),
     (SettingsPage::Hidden, glyphs::HIDDEN, "Hidden items"),
     (SettingsPage::Orphans, glyphs::WARNING, "Orphans"),
@@ -118,6 +121,7 @@ fn pages() -> impl Iterator<Item = (SettingsPage, &'static str, &'static str)> {
     PAGES_ALL.into_iter().filter(|(p, ..)| match p {
         SettingsPage::Following => crate::follow::ENABLED,
         SettingsPage::SpoilerGuard => crate::spoiler::ENABLED,
+        SettingsPage::Cast => crate::cast::ENABLED,
         _ => true,
     })
 }
@@ -502,6 +506,8 @@ enum Local {
     /// "Use the Xtream login" (= `!keep_m3u`): applied at once, not on Save.
     SrcUseXtream,
     AttachFilter,
+    /// Settings ▸ Cast ▸ "Add by address" (an IPv4 address).
+    CastAddress,
 }
 
 impl Local {
@@ -521,6 +527,7 @@ impl Local {
                 | Local::SrcUa
                 | Local::SrcTz
                 | Local::AttachFilter
+                | Local::CastAddress
         )
     }
     fn is_toggle(self) -> bool {
@@ -811,6 +818,7 @@ pub struct SettingsScreen {
     #[allow(dead_code)] // base-B: S-ui's
     spoiler: spoiler::State,
     agents: agents::State,
+    cast: cast::State,
     page: SettingsPage,
     pane: Pane,
     /// Focused row (index into the page's rows; only focusable rows are chosen).
@@ -920,6 +928,7 @@ impl SettingsScreen {
             SettingsPage::Following => following::enter(self, ctx),
             SettingsPage::SpoilerGuard => spoiler::enter(self, ctx),
             SettingsPage::Agents => agents::enter(self, ctx),
+            SettingsPage::Cast => cast::enter(self, ctx),
             _ => {}
         }
     }
@@ -928,6 +937,7 @@ impl SettingsScreen {
     fn feature_act(&mut self, ctx: &mut UiCtx<'_>, f: Feature, n: u16) {
         match f {
             Feature::Agents => agents::act(self, ctx, n),
+            Feature::Cast => cast::act(self, ctx, n),
             Feature::Following => following::act(self, ctx, n),
             Feature::GuideFix => guide_fix::act(self, ctx, n),
             Feature::MultiView => multiview::act(self, ctx, n),
@@ -941,6 +951,7 @@ impl SettingsScreen {
     fn feature_item(&mut self, ctx: &mut UiCtx<'_>, f: Feature, id: i64) {
         match f {
             Feature::Agents => agents::item(self, ctx, id),
+            Feature::Cast => cast::item(self, ctx, id),
             Feature::Following => following::item(self, ctx, id),
             Feature::GuideFix => guide_fix::item(self, ctx, id),
             Feature::MultiView => multiview::item(self, ctx, id),
@@ -1290,8 +1301,7 @@ impl SettingsScreen {
             SettingsPage::Following => following::rows(self, ctx, &mut v),
             SettingsPage::SpoilerGuard => spoiler::rows(self, ctx, &mut v),
             SettingsPage::Agents => agents::rows(self, ctx, &mut v),
-            // CAST-9: the Cast page (`settings/cast.rs`; listed in `PAGES_ALL` once `cast::ENABLED`)
-            SettingsPage::Cast => {}
+            SettingsPage::Cast => cast::rows(self, ctx, &mut v),
             SettingsPage::Parental => {
                 let has_pin = ctx.config.parental.pin_hash.is_some();
                 v.push(Row::Section("Parental lock".into()));
@@ -1656,6 +1666,7 @@ impl SettingsScreen {
             Local::PinNew => &mut self.pin_new,
             Local::PinConfirm => &mut self.pin_confirm,
             Local::AttachFilter => &mut self.attach.as_mut()?.filter,
+            Local::CastAddress => &mut self.cast.address,
             _ => {
                 let e = self.editor.as_mut()?;
                 match f {
@@ -1844,6 +1855,7 @@ impl SettingsScreen {
             Local::NewListName => self.act(ctx, Act::NewList),
             Local::PinConfirm => self.act(ctx, Act::SetPin),
             Local::AttachFilter => self.refilter_attach(ctx),
+            Local::CastAddress => cast::act(self, ctx, cast::ACT_ADD),
             _ => {}
         }
     }
@@ -2351,6 +2363,11 @@ impl SettingsScreen {
                 Some(menu) => menu,
                 None => return,
             },
+            // a TV: Pair / Pair again, Test on TV, Make default, Forget…
+            Item::Feature(Feature::Cast, id) => match cast::menu(ctx, id) {
+                Some(menu) => menu,
+                None => return,
+            },
             // a feature file opens its own menu from `item`
             Item::AttachTarget(_) | Item::Categories(_) | Item::Feature(..) => return,
         };
@@ -2412,6 +2429,7 @@ impl SettingsScreen {
             }
             (Item::Feature(Feature::Following, id), code) if code != MENU_UP && code != MENU_DOWN => following::menu_choice(self, ctx, id, code),
             (Item::Feature(Feature::Agents, id), code) => agents::menu_choice(self, ctx, id, code),
+            (Item::Feature(Feature::Cast, id), code) => cast::menu_choice(self, ctx, id, code),
             (item, MENU_UP) | (item, MENU_DOWN) => self.reorder(ctx, item, if code == MENU_UP { -1 } else { 1 }),
             (Item::Reminder(id), MENU_DELETE) => self.cancel_reminder(ctx, id),
             (Item::Explicit(id), MENU_TOGGLE) => self.toggle_explicit_item(ctx, id),
@@ -2952,6 +2970,7 @@ impl Screen for SettingsScreen {
                     }
                 }
                 Pending::Feature(Feature::Agents, id) => agents::confirmed(ctx, id),
+                Pending::Feature(Feature::Cast, id) => cast::confirmed(ctx, id),
                 Pending::Menu(_) | Pending::Adjust(_) | Pending::ShowExplicit | Pending::Feature(..) => {}
             },
             // the PIN was entered: retry what needed it (the same value change, else Enter)
@@ -2970,6 +2989,7 @@ impl Screen for SettingsScreen {
     fn ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) {
         self.poll_loaders(ctx);
         agents::frame(self, ui);
+        cast::frame(self, ui, ctx);
         let theme = ctx.theme;
         let compact = ctx.layout == LayoutClass::Compact;
         let full = ui.available_rect_before_wrap();
@@ -3256,6 +3276,7 @@ impl SettingsScreen {
                                 Local::PinNew | Local::PinConfirm => "4–8 digits",
                                 Local::SrcServer => "panel.example.com:8080",
                                 Local::AttachFilter => "type to filter",
+                                Local::CastAddress => "the TV's IPv4 address",
                                 Local::SrcCode => auto.as_str(),
                                 _ => "",
                             };
@@ -3329,7 +3350,7 @@ impl SettingsScreen {
                         }
                         let more = matches!(item, Item::Source(_) | Item::Epg(_) | Item::List(_) | Item::Orphan(_) | Item::Reminder(_))
                             || matches!(item, Item::Feature(Feature::Following, id) if *id > 0)
-                            || matches!(item, Item::Feature(Feature::Agents, _));
+                            || matches!(item, Item::Feature(Feature::Agents | Feature::Cast, _));
                         // the button is laid out first so long names and errors end before it
                         inner.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if more {
