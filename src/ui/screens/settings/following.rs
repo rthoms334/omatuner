@@ -660,7 +660,8 @@ mod tests {
             .filter(|r| r.state == crate::model::ReminderState::Pending && r.rule_id.is_none())
             .count();
         assert_eq!(mine, 1, "kept as the user's own");
-        assert!(!has_label(&h, "Arsenal"));
+        // the page reloads once the store says the rule went (a frame or more later)
+        until(&mut h, "the row gone", |h| !has_label(h, "Arsenal"));
     }
 
     /// Quiet hours as typed: both spellings of the dash, hours alone, four digits; empty

@@ -349,8 +349,8 @@ fn series_hide_episodes_after_next_up_across_playlists() {
 /// Guide airings of a guarded series without S/E in the guide (DESIGN §34.5): the slim rows
 /// the grid paints carry the guide's S/E; a sub-title naming a catalogue episode or carrying an
 /// "S02E04" marker places the airing; a seen repeat shows; the catalogue's air dates and the
-/// guide's "new" flag place what's left; an airing nothing places is guarded only while the
-/// series is part-way.
+/// guide's "new" flag place what's left; an airing nothing places is guarded (also of a series
+/// the user guarded before starting it).
 #[test]
 fn series_airings_without_s_e_are_placed_before_they_are_guarded() {
     let world = World::new("spoiler-airings");
@@ -429,7 +429,8 @@ fn series_airings_without_s_e_are_placed_before_they_are_guarded() {
     let g = world.guard(&cfg, KICK_OFF);
     assert_eq!(hidden_subs(&world, &g), vec!["Cold Harbor"], "the catalogue title still places S2E9");
 
-    // a series guarded before it's started: unplaced airings keep their text, a first showing doesn't
+    // a series guarded before it's started: the user's own guard holds — an airing nothing
+    // places loses its text, a first showing too
     w(&world.store, |c| db::set_series_guard(c, "taskmaster", "Taskmaster", true, false, KICK_OFF).map(|_| ()));
     let g = world.guard(&cfg, KICK_OFF);
     let tm = |sub, is_new| Subject::Programme {
@@ -440,7 +441,8 @@ fn series_airings_without_s_e_are_placed_before_they_are_guarded() {
         start: KICK_OFF,
         is_new,
     };
-    assert!(!g.judge(&tm("Hot Dogs", false), KICK_OFF).guarded());
+    let v = g.judge(&tm("Hot Dogs", false), KICK_OFF);
+    assert!(v.hide_sub && v.hide_descr, "{v:?}");
     assert!(g.judge(&tm("Hot Dogs", true), KICK_OFF).hide_sub);
 }
 

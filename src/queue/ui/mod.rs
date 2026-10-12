@@ -203,7 +203,8 @@ pub fn play_row(ctx: &mut UiCtx<'_>, s: &QueueSnapshot, id: QueueId, fullscreen:
                 ctx.toast(Toast::info("Up next isn't running"));
                 return RowPlay::NotRunning;
             }
-            let e = &row.entry;
+            // the prompt says what the row says: through the guard
+            let e = &guarded(&crate::ui::widgets::spoiler::Spoilers::of(ctx), &row.entry);
             let title = match &e.subtitle {
                 Some(sub) => format!("{} — {sub}", e.title),
                 None => e.title.clone(),
@@ -760,7 +761,7 @@ pub(crate) mod tests {
         let mut series = std::collections::HashMap::new();
         series.insert(
             crate::spoiler::series_key("Queue Guard Show"),
-            SeriesMark { label: "Queue Guard Show".into(), next_up: (2, 4), automatic: true, part_way: true, ..Default::default() },
+            SeriesMark { label: "Queue Guard Show".into(), next_up: (2, 4), automatic: true, ..Default::default() },
         );
         let guard = crate::guard::Guard::with_snapshot(GuardSnapshot::from_parts(Settings::default(), Vec::new(), series, Default::default()));
         let sp = crate::ui::widgets::spoiler::Spoilers::with_guard(guard, 0, true);

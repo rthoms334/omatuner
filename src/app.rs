@@ -501,7 +501,9 @@ impl TunerApp {
             // Claude's batch over 50 channels: Guide fixes with its confirm card prefilled (the
             // handler raised the window); Enter applies it, Esc drops it
             AppEvent::Agent(crate::agent::AgentCommand::GuideFixReview(r)) => {
-                crate::guide_fix::ui::offer_review(r.clone());
+                if crate::guide_fix::ui::offer_review(r.clone()) {
+                    self.toast(Toast::info("Claude's earlier guide fixes were replaced by its newer ones"));
+                }
                 if self.popout.is_out() || self.video_only {
                     self.toggle_popout(egui_ctx);
                 }
@@ -3559,10 +3561,6 @@ mod tests {
         assert_eq!(rig.log().toasts.last().unwrap().text, "That can no longer be undone");
     }
 
-    /// A playlist picked on a screen (DESIGN §29): the window title names it and the hint line
-    /// offers Alt+P (two playlists with channels); once it is disabled, Live TV shows All
-    /// playlists again with a toast saying why, and the title drops it. With one playlist
-    /// left there is nothing to choose: no "Alt+P playlist". A removed playlist says so.
     /// The status bar's "Ctrl+B show spoilers" (DESIGN §34.5): on Live TV's channel whose
     /// programme the guard hides something of, "hide spoilers" once Ctrl+B showed it, nothing on
     /// a channel with nothing hidden.
@@ -3583,7 +3581,7 @@ mod tests {
             Ok(())
         });
         rig.settle();
-        let mark = SeriesMark { label: "Severance".into(), next_up: (2, 4), automatic: true, part_way: true, ..Default::default() };
+        let mark = SeriesMark { label: "Severance".into(), next_up: (2, 4), automatic: true, ..Default::default() };
         let snap = GuardSnapshot::from_parts(Settings::default(), vec![], [("severance".to_owned(), mark)].into(), Default::default());
         rig.app.services().agent.set_guard(crate::guard::Guard::with_snapshot(snap));
         let key = crate::spoiler::ui::reveal_key_label();
@@ -3597,6 +3595,10 @@ mod tests {
         assert!(!rig.app.hint_now().contains("spoilers"), "{}", rig.app.hint_now());
     }
 
+    /// A playlist picked on a screen (DESIGN §29): the window title names it and the hint line
+    /// offers Alt+P (two playlists with channels); once it is disabled, Live TV shows All
+    /// playlists again with a toast saying why, and the title drops it. With one playlist
+    /// left there is nothing to choose: no "Alt+P playlist". A removed playlist says so.
     #[test]
     fn a_disabled_picked_playlist_falls_back_to_all_with_a_toast() {
         let mut cfg = test_config();

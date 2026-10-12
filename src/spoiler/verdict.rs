@@ -11,8 +11,7 @@
 //! * a guarded series hides episodes after the next-up one (EPG airings with S/E likewise; an
 //!   airing without S/E is placed by [`airing_beyond`] — its sub-title naming an episode, a
 //!   seen repeat, its date against the catalogue's air dates, the guide's "new" flag — and
-//!   loses its sub-title and description when it's later, or when nothing places it and the
-//!   series is part-way);
+//!   loses its sub-title and description when it's later or when nothing places it);
 //! * before the first build the guard fails closed: every episode is hidden, sport text hidden,
 //!   scores rewritten.
 
@@ -45,7 +44,8 @@ pub fn judge(snap: &GuardSnapshot, subj: &Subject<'_>, now: Timestamp) -> Verdic
             }
             if let Some(m) = series_mark(snap, title) {
                 let beyond = airing_beyond(m, &Airing { title, sub_title, season_episode, start, is_new });
-                if beyond.unwrap_or(m.part_way) {
+                // nothing places it: guarded (a series the user guarded before starting it too)
+                if beyond != Some(false) {
                     v.hide_sub = true;
                     v.hide_descr = true;
                     v.obscure_image |= beyond.is_some();
@@ -107,7 +107,7 @@ const AIR_DATE_MARGIN_DAYS: i64 = 7;
 
 /// Is this airing of a guarded series after its next-up episode? `Some(true)`: later (guard
 /// it), `Some(false)`: the next-up one or earlier, or a repeat already seen (show it), `None`:
-/// nothing places it (the caller guards it only when the series is part-way). In order:
+/// nothing places it (the caller guards it). In order:
 /// * the guide's S/E, else an episode marker or a catalogue episode title in the sub-title;
 /// * an airing seen before (same title and sub-title) shows;
 /// * an airing a week or more before the first guarded episode first aired can't show one;

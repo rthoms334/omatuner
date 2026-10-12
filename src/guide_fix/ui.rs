@@ -347,9 +347,10 @@ thread_local! {
     static REVIEW: RefCell<Option<crate::agent::GuideFixReview>> = const { RefCell::new(None) };
 }
 
-/// Hand Claude's batch to the Guide fixes screen (the app opens the screen).
-pub(crate) fn offer_review(r: crate::agent::GuideFixReview) {
-    REVIEW.with(|s| *s.borrow_mut() = Some(r));
+/// Hand Claude's batch to the Guide fixes screen (the app opens the screen). True when it
+/// replaced an earlier batch still waiting for its card (the app says so).
+pub(crate) fn offer_review(r: crate::agent::GuideFixReview) -> bool {
+    REVIEW.with(|s| s.borrow_mut().replace(r).is_some())
 }
 
 /// Claude's batch for the confirm card (once).

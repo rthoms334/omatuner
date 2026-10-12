@@ -134,11 +134,10 @@ fn build(summary: &str, body: &str, urgency_critical: bool, actions: &[(&str, &s
 }
 
 async fn show(n: &Notification, bus: Option<&str>) -> Result<notify_rust::NotificationHandle> {
-    // Unit tests run real services (jobs, the scheduler) and must never reach the desktop's
+    // Tests run real services (jobs, the scheduler) and must never reach the desktop's
     // notification server: only the fake test buses answer them (callers fall back to a toast).
-    #[cfg(test)]
-    if bus.is_none() {
-        return Err(Error::other("no desktop notifications from unit tests"));
+    if bus.is_none() && crate::platform::off_desktop() {
+        return Err(Error::other("no desktop notifications off the desktop (tests)"));
     }
     match bus {
         None => n.show_async().await,

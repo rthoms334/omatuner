@@ -15,7 +15,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// (callers include the UI thread), and overlapping requests collapse into one.
 pub fn focus_self() {
     static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-    if !is_hyprland() || IN_FLIGHT.swap(true, Ordering::AcqRel) {
+    // tests (headless) never reach the live compositor
+    if super::off_desktop() || !is_hyprland() || IN_FLIGHT.swap(true, Ordering::AcqRel) {
         return;
     }
     let spawned = std::thread::Builder::new().name("hypr-focus".into()).spawn(|| {

@@ -520,7 +520,7 @@ impl PlayerScreen {
         let mut y = inner.top();
         // the spoiler guard: what the banner may say of the programme, and Ctrl+B's hint
         let spoilers = crate::ui::widgets::spoiler::Spoilers::of(ctx);
-        let shown = banner_programmes(ctx);
+        let shown = self.banner_programmes_with(ctx, nn.as_ref());
         let spoiler_hint = spoiler_hint(&shown, &spoilers);
         if live {
             match nn.as_ref().and_then(|n| n.now.clone()) {
@@ -538,7 +538,7 @@ impl PlayerScreen {
                         &p,
                         egui::pos2(inner.left(), y),
                         Align2::LEFT_TOP,
-                        &Shown::of(&now).line(&spoilers),
+                        &self.banner_cats.shown(ctx, &now).line(&spoilers),
                         body_font.clone(),
                         t.osd_text,
                         (tr.left() - pad - inner.left()).max(0.0),
@@ -575,7 +575,7 @@ impl PlayerScreen {
             let next = nn
                 .as_ref()
                 .and_then(|n| n.next.clone())
-                .map(|n| format!("Next  {}  {}", hhmm(n.start, h24), Shown::of(&n).title(&spoilers)))
+                .map(|n| format!("Next  {}  {}", hhmm(n.start, h24), self.banner_cats.shown(ctx, &n).title(&spoilers)))
                 .unwrap_or_default();
             let br = self.badges(
                 &p,
@@ -766,7 +766,10 @@ impl PlayerScreen {
                 _ => None,
             });
             let spoilers = crate::ui::widgets::spoiler::Spoilers::of(ctx);
-            ch.and_then(|c| live::now_next_of(ctx, &c)).and_then(|n| n.now).map(|now| Shown::of(&now).title(&spoilers)).unwrap_or_default()
+            ch.and_then(|c| live::now_next_of(ctx, &c))
+                .and_then(|n| n.now)
+                .map(|now| self.banner_cats.shown(ctx, &now).title(&spoilers))
+                .unwrap_or_default()
         } else {
             let dur = snap.duration.or_else(|| playable.and_then(|p| p.duration_hint)).unwrap_or(0.0);
             format!("{} / {}", clock(snap.position.unwrap_or(0.0)), clock(dur))

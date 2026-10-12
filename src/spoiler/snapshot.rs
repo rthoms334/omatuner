@@ -161,9 +161,6 @@ pub struct SeriesMark {
     /// Part-way through (the automatic rule) rather than the user's own row.
     pub automatic: bool,
     pub rule: Option<SpoilerRuleId>,
-    /// At least one episode watched or started: a guide airing nothing places is guarded (a
-    /// series guarded before you start it keeps such airings' text).
-    pub part_way: bool,
     /// What places a guide airing that carries no season / episode (shared by the series'
     /// aliases).
     pub airings: Arc<SeriesAirings>,
@@ -608,14 +605,7 @@ fn series_marks(
         let label = rule.map(|r| r.label.clone()).or_else(|| rows.first().map(|r| r.name.clone())).unwrap_or_else(|| norm.clone());
         let mut airings = SeriesAirings { seen: seen_airings.remove(&norm).unwrap_or_default(), ..Default::default() };
         airings.index(&db::series_episodes(conn, &norm)?, next_up);
-        let mark = SeriesMark {
-            label,
-            next_up,
-            automatic: rule.is_none(),
-            rule: rule.map(|r| r.id),
-            part_way: done.is_some() || started.is_some(),
-            airings: Arc::new(airings),
-        };
+        let mark = SeriesMark { label, next_up, automatic: rule.is_none(), rule: rule.map(|r| r.id), airings: Arc::new(airings) };
         for r in &rows {
             out.entry(super::series_key(&r.name)).or_insert_with(|| mark.clone());
         }

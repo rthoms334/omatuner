@@ -538,7 +538,7 @@ mod tests {
             .unwrap()[0];
         let norm = crate::spoiler::series_key("Severance");
         let mut marks = HashMap::new();
-        marks.insert(norm.clone(), SeriesMark { label: "Severance".into(), next_up: (1, 4), automatic: true, part_way: true, ..Default::default() });
+        marks.insert(norm.clone(), SeriesMark { label: "Severance".into(), next_up: (1, 4), automatic: true, ..Default::default() });
         t.services().agent.set_guard(Guard::with_snapshot(GuardSnapshot::from_parts(Settings::default(), Vec::new(), marks, HashMap::new())));
         let eps = crate::store::vod::episodes(&t.db, series, Some(1)).unwrap();
         let target = |n: usize| Target::Episode { series, episode: eps[n - 1].id };

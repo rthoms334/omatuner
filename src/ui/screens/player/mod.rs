@@ -159,6 +159,8 @@ pub struct PlayerScreen {
     switch_copies: Vec<crate::ui::copies::OtherCopy>,
     /// Multi-view's layout of the last frame and its captions (`multiview.rs`).
     mv: multiview::MvScreen,
+    /// The banner's programmes' categories (the spoiler guard's sport rule; `reveal.rs`).
+    banner_cats: reveal::BannerCats,
 }
 
 /// The OSD scale of the current window.
@@ -1043,7 +1045,7 @@ mod tests {
             )?;
             Ok(ids)
         });
-        let mark = SeriesMark { label: "Severance".into(), next_up: (2, 4), automatic: true, part_way: true, ..Default::default() };
+        let mark = SeriesMark { label: "Severance".into(), next_up: (2, 4), automatic: true, ..Default::default() };
         let snap = GuardSnapshot::from_parts(Settings::default(), vec![], HashMap::from([("severance".to_owned(), mark)]), Default::default());
         t.services().agent.set_guard(Guard::with_snapshot(snap));
         let mut h = harness(t, one, PlayerScreen::default(), WIDE);
@@ -1078,6 +1080,48 @@ mod tests {
         assert!(!crate::spoiler::ui::reveals().is_empty());
         assert!(h.state_mut().act(Action::RevealSpoilers));
         assert!(crate::spoiler::ui::reveals().is_empty());
+    }
+
+    /// The banner's "Title · sub-title" of an unrelated sport programme while a topic with
+    /// "sport descriptions" is active: the sub-title is a bar (the guide's categories are read
+    /// for the banner — the slim now row has none).
+    #[test]
+    fn the_banner_hides_an_unrelated_sport_sub_title_under_sport_descriptions() {
+        use std::collections::HashMap;
+
+        use crate::guard::Guard;
+        use crate::spoiler::snapshot::{GuardSnapshot, Settings, Topic, TopicMode, TopicSource};
+        use crate::ui::screens::home::testkit::{channels, epg, painted, seed, source};
+        crate::spoiler::ui::hide_all();
+        let (mut t, one) = rig();
+        let now = t.now;
+        let ids = seed(&mut t, move |c| {
+            let s = source(c, "TV")?;
+            let ids = channels(c, s, 2)?;
+            epg(c, &ids, now - now.rem_euclid(1800) - 1800, 3, true)?;
+            // channel 0 airs another match (a sport category; nothing names the topic)
+            c.execute(
+                "UPDATE programme SET title = 'Premier League', sub_title = 'Spurs 3-1 Leeds', categories = 'Sport\u{1f}Football'
+                 WHERE epg_channel_id = (SELECT epg_channel_id FROM channel_epg WHERE channel_id = ?1) AND start <= ?2 AND stop > ?2",
+                rusqlite::params![ids[0].0, now],
+            )?;
+            Ok(ids)
+        });
+        let mut topic = Topic::new("Arsenal", TopicSource::Follow, TopicMode::Always);
+        topic.sport_descr = true;
+        let snap = GuardSnapshot::from_parts(Settings::default(), vec![(topic, vec!["arsenal".into()])], HashMap::new(), Default::default());
+        t.services().agent.set_guard(Guard::with_snapshot(snap));
+        let mut h = harness(t, one, PlayerScreen::default(), WIDE);
+        let mut s = (*real(&h)).clone();
+        s.state = PlayerState::Playing;
+        s.playable = Some(Arc::new(Playable { media: MediaRef::Channel(ids[0]), ..(*playable()).clone() }));
+        h.state_mut().t.snapshot = Arc::new(s);
+        h.state_mut().enter(Route::Player);
+        until(&mut h, "the banner's now line", |h| painted(h).iter().any(|t| t.starts_with("Premier League · ")));
+        let texts = painted(&h);
+        assert!(texts.iter().any(|t| t.starts_with("Premier League · ▆")), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("Spurs 3-1 Leeds")), "{texts:?}");
+        assert!(texts.contains(&format!("{} show spoilers", crate::spoiler::ui::reveal_key_label())), "{texts:?}");
     }
 
     /// Popped out: the strip under the pointer has the way back to the full window, and so does

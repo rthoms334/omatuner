@@ -8,10 +8,11 @@
 //! channel's programme.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use super::*;
 use crate::guard::{Field, Subject};
-use crate::model::{ProgrammeSlim, Timestamp};
+use crate::model::{NowNext, ProgrammeId, ProgrammeSlim, Timestamp};
 use crate::spoiler::ui::RevealKey;
 use crate::ui::item_menu::Target;
 use crate::ui::widgets::spoiler::Spoilers;
@@ -24,29 +25,34 @@ pub(super) struct Shown {
     season_episode: Option<(i32, i32)>,
     start: Timestamp,
     is_new: bool,
+    /// The guide's categories (the slim row has none: "sport descriptions" needs them);
+    /// `None` until the full programme is read.
+    categories: Option<Arc<[String]>>,
 }
 
 impl Shown {
-    pub(super) fn of(p: &ProgrammeSlim) -> Self {
+    /// A guide programme with its categories as read so far (`BannerCats`).
+    pub(super) fn of(p: &ProgrammeSlim, categories: Option<Arc<[String]>>) -> Self {
         Self {
             title: p.title.to_string(),
             sub_title: p.sub_title.as_deref().map(str::to_owned),
             season_episode: p.episode.and_then(crate::spoiler::episode_se),
             start: p.start,
             is_new: p.flags.is_new,
+            categories,
         }
     }
 
     /// The catch-up airing (its title is the playable's sub-title).
     fn catchup(title: &str, start: Timestamp) -> Self {
-        Self { title: title.to_owned(), sub_title: None, season_episode: None, start, is_new: false }
+        Self { title: title.to_owned(), sub_title: None, season_episode: None, start, is_new: false, categories: Some(Arc::from([])) }
     }
 
     fn subject(&self) -> Subject<'_> {
         Subject::Programme {
             title: &self.title,
             sub_title: self.sub_title.as_deref(),
-            categories: &[],
+            categories: self.categories.as_deref().unwrap_or(&[]),
             season_episode: self.season_episode,
             start: self.start,
             is_new: self.is_new,
@@ -59,9 +65,11 @@ impl Shown {
     }
 
     /// "Title · sub-title" as the guard lets the banner say it (a hidden sub-title is a bar).
+    /// Until its categories are read the sub-title waits: an unrelated sport programme's
+    /// sub-title is hidden while a topic with "sport descriptions" is active.
     pub(super) fn line(&self, sp: &Spoilers) -> String {
         let title = self.title(sp);
-        match self.sub_title.as_deref().filter(|s| !s.trim().is_empty()) {
+        match self.sub_title.as_deref().filter(|s| !s.trim().is_empty() && self.categories.is_some()) {
             Some(s) => format!("{title} · {}", sp.text(&self.subject(), Field::SubTitle, s).unwrap_or_default()),
             None => title,
         }
@@ -82,18 +90,65 @@ pub(super) fn picture_channel(snap: &PlayerSnapshot) -> Option<ChannelId> {
     }
 }
 
-/// The programmes the banner is about: the channel's now and next (live), or the catch-up
-/// airing.
-pub(super) fn banner_programmes(ctx: &mut UiCtx<'_>) -> Vec<Shown> {
-    let snap = ctx.player.clone();
-    let Some(p) = snap.playable.as_ref() else { return Vec::new() };
-    match p.kind {
-        PlayableKind::Catchup { start, .. } => p.subtitle.as_deref().map(|t| vec![Shown::catchup(t, start)]).unwrap_or_default(),
-        PlayableKind::Live => {
-            let Some(ch) = playing_channel(&snap).and_then(|id| ctx.lib.live.get(id).cloned()) else { return Vec::new() };
-            live::now_next_of(ctx, &ch).map(|n| n.now.iter().chain(n.next.iter()).map(Shown::of).collect()).unwrap_or_default()
+/// The categories of the banner's programmes, read once per programme within the frame
+/// budget (the slim now / next rows carry none).
+#[derive(Default)]
+pub(super) struct BannerCats {
+    read: Vec<(ProgrammeId, Arc<[String]>)>,
+}
+
+impl BannerCats {
+    /// Now, next and the one before: enough for a zap back.
+    const KEEP: usize = 4;
+
+    /// `id`'s categories; `None` while the frame's budget defers the read.
+    pub(super) fn get(&mut self, ctx: &mut UiCtx<'_>, id: ProgrammeId) -> Option<Arc<[String]>> {
+        if let Some((_, c)) = self.read.iter().find(|(i, _)| *i == id) {
+            return Some(c.clone());
         }
-        _ => Vec::new(),
+        let db = ctx.db;
+        let r = ctx.budget.run(|| crate::store::epg::programme(db, id))?;
+        // a programme gone from the guide: no categories (the next refresh replaces the row)
+        let c: Arc<[String]> = r.map(|p| p.categories.into()).unwrap_or_else(|_| Arc::from([]));
+        if self.read.len() >= Self::KEEP {
+            self.read.remove(0);
+        }
+        self.read.push((id, c.clone()));
+        Some(c)
+    }
+
+    /// `p` as the banner shows it.
+    pub(super) fn shown(&mut self, ctx: &mut UiCtx<'_>, p: &ProgrammeSlim) -> Shown {
+        let cats = self.get(ctx, p.id);
+        Shown::of(p, cats)
+    }
+}
+
+impl PlayerScreen {
+    /// The programmes the banner is about: the channel's now and next (live), or the catch-up
+    /// airing.
+    pub(super) fn banner_programmes(&mut self, ctx: &mut UiCtx<'_>) -> Vec<Shown> {
+        let nn = match ctx.player.playable.as_ref().map(|p| &p.kind) {
+            Some(PlayableKind::Live) => {
+                let snap = ctx.player.clone();
+                playing_channel(&snap).and_then(|id| ctx.lib.live.get(id).cloned()).and_then(|ch| live::now_next_of(ctx, &ch))
+            }
+            _ => None,
+        };
+        self.banner_programmes_with(ctx, nn.as_ref())
+    }
+
+    /// [`Self::banner_programmes`] with the channel's now / next already read (the OSD's).
+    pub(super) fn banner_programmes_with(&mut self, ctx: &mut UiCtx<'_>, nn: Option<&NowNext>) -> Vec<Shown> {
+        let Some(p) = ctx.player.playable.clone() else { return Vec::new() };
+        match p.kind {
+            PlayableKind::Catchup { start, .. } => p.subtitle.as_deref().map(|t| vec![Shown::catchup(t, start)]).unwrap_or_default(),
+            PlayableKind::Live => {
+                let Some(n) = nn else { return Vec::new() };
+                n.now.iter().chain(n.next.iter()).map(|p| self.banner_cats.shown(ctx, p)).collect()
+            }
+            _ => Vec::new(),
+        }
     }
 }
 
@@ -128,7 +183,8 @@ impl PlayerScreen {
             return Some(crate::spoiler::ui::on_action(ctx, action, &target));
         }
         let sp = Spoilers::of(ctx);
-        let keys: Vec<RevealKey> = banner_programmes(ctx).iter().filter(|s| s.guarded(&sp)).filter_map(|s| RevealKey::of(&s.subject())).collect();
+        let keys: Vec<RevealKey> =
+            self.banner_programmes(ctx).iter().filter(|s| s.guarded(&sp)).filter_map(|s| RevealKey::of(&s.subject())).collect();
         crate::spoiler::ui::toggle_reveal_keys(ctx, target, keys);
         self.show_banner(ctx);
         Some(true)

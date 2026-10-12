@@ -3139,7 +3139,10 @@ for any window. Tuner does it for itself with `o` in the player or Ctrl+Shift+O 
 `cargo test` must stay green without network, ffmpeg or a Wayland session (those tests skip).
 Lint gate: `cargo clippy --all-targets -- -D warnings` (baseline is zero; stub modules carry a
 scoped allow in `lib.rs` that each WP removes for its module). Tests never call
-`redact::clear_secrets`.
+`redact::clear_secrets`. Tests never touch the user's desktop: `platform::off_desktop()` (unit
+tests, any process that built a `TestUi` — it calls `platform::keep_off_desktop()` — or
+`TUNER_NO_DESKTOP` set) makes `hypr::focus_self` a no-op and lets notifications reach only an
+explicit test bus.
 
 ### 23.1 Dev notes: README screenshots
 
@@ -5354,7 +5357,9 @@ Suggested, No guide. Each row's "why" is a fixed phrase; no URL ever appears.
   the window raised, out of the pop-out), which opens Guide fixes with its confirm card
   prefilled ("Accept Claude's N fixes?"). Enter applies it as Claude's batch (toast with Undo;
   `stale` if the guide or a playlist changed meanwhile: nothing applies and the toast says so);
-  Esc drops it, and Claude proposes again or a narrower batch. A batch applied from chat toasts
+  Esc drops it, and Claude proposes again or a narrower batch. A newer batch replaces one still
+  waiting for its card (toast "Claude's earlier guide fixes were replaced by its newer ones"); a
+  card already open is never replaced (the newer one waits for it). A batch applied from chat toasts
   "Claude fixed the guide for N channels" with Undo;
   proposals live 10 minutes and are bound to the stamp; locked channels and rules for a
   playlist with a PIN-locked channel are refused while locked; Claude undoes only its own
@@ -5509,8 +5514,7 @@ builds events from explicit content, never lists or counts it, never reveals it.
 * **Series you're part-way through** (automatic): episodes after the next-up one lose title,
   plot and still; guide airings with S/E after next-up likewise (the grid's slim rows carry the
   guide's S/E too); an airing without S/E is placed first (§34.5) and loses its sub-title and
-  description only when it comes after next-up, or when nothing places it and the series is
-  part-way.
+  description when it comes after next-up or when nothing places it.
 * **Sport you follow**: Following's spoiler-safe Team/Event rules become topics. An airing
   counts as the event only when it parses as a fixture (`parse_fixture`) and has none of the
   rule's "leave out" words ("Women", "U21", "Fan TV"…); highlights and reaction shows are never
@@ -5542,6 +5546,9 @@ MCP reply (`guard::reply::guard_json`). Painters cache per programme, minute and
   spoilers" while it is shown). In the player, the banner's programme line ("Severance ·
   ▆▆▆▆▆▆▆▆ 󰈉") and next title go through the guard, the banner says "Ctrl+B show spoilers", and
   Ctrl+B shows the banner's now and next until the picture changes (a zap hides them again).
+  The slim now / next rows carry no categories, so the banner reads each programme's categories
+  once (frame budget, `player::reveal::BannerCats`) and shows its sub-title only once they are
+  known: "sport descriptions" hides an unrelated match's sub-title there too.
 * **Zap shield**: before tuning. A zap (↑/↓, digits, the channel panel) onto a channel whose
   programme mentions an active topic sends no play: the card covers the picture and the picture
   underneath pauses. Enter = Watch anyway (for as long as the same reason shields it), ↓ judges
@@ -5572,8 +5579,8 @@ airings are judged by number. An airing of a guarded series without one is place
    aired can't be one (the margin covers another country's dates);
 4. the guide's "new" flag: a first showing is later than next-up, unless it airs before the
    next-up episode first aired.
-What nothing places is guarded only while the series is part-way (an episode watched or
-started); a series guarded by the user's own row before starting it keeps such airings' text.
+What nothing places is guarded, also for a series the user guarded before starting it (their
+own rule is never weakened); rules 2 and 3 still let seen and old repeats show.
 Watching an airing a sub-title places records that episode, which moves the series on.
 MCP replies have no airing date (start 0): rule 3 never applies there.
 

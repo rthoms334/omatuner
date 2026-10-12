@@ -1291,7 +1291,8 @@ once (`claude mcp list` shows `tuner` connected).
   **Expect:** a proposal; more than 50 channels is not applied from chat: Tuner comes forward
   on Guide fixes with "Accept Claude's N fixes?" and Enter applies them (toast with Undo), Esc
   applies nothing; a smaller batch applies from chat and its toast/Undo works; a locked
-  channel is refused while locked.
+  channel is refused while locked. Ask for a second big batch before opening the first card:
+  **Expect:** a toast says the earlier fixes were replaced and the card shows the newer batch.
 
 ## 23. Up next
 
@@ -1368,6 +1369,13 @@ once (`claude mcp list` shows `tuner` connected).
 - [ ] **In the player:** play the channel airing a hidden episode. **Expect:** the banner reads
   "Show · ▆▆▆▆▆▆▆▆ 󰈉" with "Ctrl+B show spoilers"; Ctrl+B shows the episode title ("Ctrl+B
   hide spoilers"); a zap hides it again.
+- [ ] **Series guarded before you start it:** guard a series you haven't watched (item menu ▸
+  Spoiler guard), then find a repeat of a late episode whose guide entry has no season/episode.
+  **Expect:** its sub-title is a bar; an old airing from before the series' guarded episodes
+  first aired still shows.
+- [ ] **Sport descriptions in the player:** with a topic that hides sport descriptions active,
+  play a channel showing another match. **Expect:** the banner's line reads "Title ·
+  ▆▆▆▆▆▆▆▆ 󰈉", never the other match's score.
 - [ ] **Followed sport:** follow your team spoiler-safe; during and after their match, look at
   the guide and the news channels. **Expect:** "Arsenal v Chelsea 󰈉" where a score was (also
   "Arsenal v Chelsea 2-1"); news sub-titles mentioning the team are bars; unrelated sport and

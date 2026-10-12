@@ -66,6 +66,8 @@ impl TestUi {
     pub fn with_config(mut config: Config) -> Result<Self> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
+        // a headless UI never focuses a window or notifies on the user's desktop
+        crate::platform::keep_off_desktop();
         let dir = std::env::temp_dir().join(format!("tuner-testui-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
         let paths = crate::paths::AppPaths::rooted(&dir);
         config.player.mpv_options.insert("vo".into(), "null".into());

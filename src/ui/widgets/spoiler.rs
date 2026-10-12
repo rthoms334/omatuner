@@ -426,10 +426,7 @@ mod tests {
     /// Severance, next up S2E4: later episodes are guarded.
     fn severance() -> Guard {
         let mut series = HashMap::new();
-        series.insert(
-            "severance".to_owned(),
-            SeriesMark { label: "Severance".into(), next_up: (2, 4), automatic: true, part_way: true, ..Default::default() },
-        );
+        series.insert("severance".to_owned(), SeriesMark { label: "Severance".into(), next_up: (2, 4), automatic: true, ..Default::default() });
         Guard::with_snapshot(GuardSnapshot::from_parts(Settings::default(), Vec::new(), series, HashMap::new()))
     }
 
