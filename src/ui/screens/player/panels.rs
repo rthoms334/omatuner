@@ -1,21 +1,29 @@
 //! Side panels: channels, mini guide, history (owner WP-11). Q-ui adds Up next's `u` panel
-//! here (DESIGN §32).
+//! here (DESIGN §32): what is still to play, Enter plays from here, Alt+↑/↓ moves, Delete
+//! removes (Undo), letters filter, ←/Esc close; ✕ in the header, a click plays.
 
 use super::*;
+use crate::queue::ui::list::{Look, Mode, Out, QueueList};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PanelKind {
     Channels,
     MiniGuide,
     History,
+    /// Up next (`u`).
+    Queue,
 }
 
 pub(super) struct SidePanel {
     pub(super) kind: PanelKind,
+    /// The cursor and filter (the queue panel's live here between frames too, so the key
+    /// context follows its filter).
     pub(super) list: ListState,
     pub(super) items: Vec<ChannelId>,
     pub(super) haystacks: Vec<String>,
     pub(super) rows: Vec<u32>,
+    /// The Up next panel's list.
+    pub(super) queue: Option<Box<QueueList>>,
 }
 
 impl SidePanel {
@@ -34,9 +42,21 @@ impl PlayerScreen {
             self.panel = None;
             return;
         }
+        if kind == PanelKind::Queue {
+            let s = crate::queue::ui::snapshot(ctx);
+            let mut q = Box::new(QueueList::default());
+            q.sync(s.clone(), Mode::Panel, None);
+            if let Some(id) = s.current.or(s.next) {
+                q.select(id);
+            }
+            let list = std::mem::take(&mut q.list);
+            self.panel = Some(SidePanel { kind, list, items: Vec::new(), haystacks: Vec::new(), rows: Vec::new(), queue: Some(q) });
+            return;
+        }
         let snap = ctx.player;
         let current = playing_channel(snap);
         let items: Vec<ChannelId> = match kind {
+            PanelKind::Queue => Vec::new(),
             PanelKind::History => ctx.lib.recent_channels.clone(),
             PanelKind::Channels | PanelKind::MiniGuide => match &snap.zap {
                 // a zap list sent before parental control relocked may hold explicit channels
@@ -58,7 +78,7 @@ impl PlayerScreen {
                 })
             })
             .collect();
-        let mut p = SidePanel { kind, list: ListState::default(), items, haystacks, rows: Vec::new() };
+        let mut p = SidePanel { kind, list: ListState::default(), items, haystacks, rows: Vec::new(), queue: None };
         p.refilter();
         if let Some(i) = current.and_then(|c| p.rows.iter().position(|&r| p.items[r as usize] == c)) {
             p.list.select(i);
@@ -66,7 +86,70 @@ impl PlayerScreen {
         self.panel = Some(p);
     }
 
+    /// Run `f` on the Up next panel's list with its cursor and filter in place.
+    fn with_queue<R>(&mut self, ctx: &UiCtx<'_>, f: impl FnOnce(&mut QueueList) -> R) -> Option<R> {
+        let p = self.panel.as_mut()?;
+        let q = p.queue.as_mut()?;
+        std::mem::swap(&mut p.list, &mut q.list);
+        q.sync(crate::queue::ui::snapshot(ctx), Mode::Panel, None);
+        let r = f(q);
+        std::mem::swap(&mut p.list, &mut q.list);
+        Some(r)
+    }
+
+    /// The list's answer, in the panel: a play closes it, a toast flashes.
+    fn queue_out(&mut self, ctx: &mut UiCtx<'_>, out: Out) -> Option<bool> {
+        match out {
+            Out::None => return None,
+            Out::Handled | Out::Menu(_) => {}
+            Out::Parent => self.panel = None,
+            Out::Play { id, .. } => {
+                let s = crate::queue::ui::snapshot(ctx);
+                if !(s.driving && s.current == Some(id)) {
+                    crate::queue::ui::send(ctx, crate::queue::QueueCommand::PlayAt(id));
+                }
+                self.panel = None;
+                self.show_banner(ctx);
+            }
+            Out::Send(cmds) => {
+                for c in cmds {
+                    crate::queue::ui::send(ctx, c);
+                }
+            }
+            Out::Remove(ids) => {
+                let s = crate::queue::ui::snapshot(ctx);
+                crate::queue::ui::remove(ctx, &s, ids);
+            }
+            Out::Toast(t) => self.flash_text = Some((t.into(), Instant::now())),
+        }
+        Some(true)
+    }
+
+    fn queue_panel_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> Option<bool> {
+        if action == Action::Back {
+            self.panel = None;
+            return Some(true);
+        }
+        let out = self.with_queue(ctx, |q| q.handle(action))?;
+        if let Some(h) = self.queue_out(ctx, out) {
+            return Some(h);
+        }
+        match action {
+            Action::Up | Action::Down | Action::PageUp | Action::PageDown | Action::Home | Action::End | Action::Activate => Some(true),
+            Action::FilterInput(_) | Action::FilterBackspace | Action::FilterClear | Action::FilterDeleteWord => Some(true),
+            // the panel toggle again (the card's List button, the OSD) closes it; a typed `u` filters
+            Action::QueuePanel => {
+                self.panel = None;
+                Some(true)
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn panel_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> Option<bool> {
+        if self.panel.as_ref()?.kind == PanelKind::Queue {
+            return self.queue_panel_action(ctx, action);
+        }
         let p = self.panel.as_mut()?;
         match p.list.handle(action) {
             ListOutcome::Moved | ListOutcome::ContextMenu(_) => Some(true),
@@ -105,8 +188,10 @@ impl PlayerScreen {
     /// view follows only key moves), a ✕ in the header, one click on a row tunes it (the panel
     /// stays open for the next one).
     pub(super) fn draw_panel(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect) {
-        if self.panel.is_none() {
-            return;
+        match self.panel.as_ref().map(|p| p.kind) {
+            None => return,
+            Some(PanelKind::Queue) => return self.draw_queue_panel(ui, ctx, rect),
+            Some(_) => {}
         }
         let loading = self.guide.loading_label(ctx);
         let theme = ctx.theme;
@@ -134,6 +219,7 @@ impl PlayerScreen {
             PanelKind::Channels => "CHANNELS (c)",
             PanelKind::MiniGuide => "NOW / NEXT (g)",
             PanelKind::History => "HISTORY (h)",
+            PanelKind::Queue => "UP NEXT (u)",
         };
         let head_h = (caption.size * 2.0).round();
         let close = Rect::from_min_size(egui::pos2(area.right() - pad / 2.0 - head_h, area.top() + pad / 2.0), egui::vec2(head_h, head_h));
@@ -259,6 +345,94 @@ impl PlayerScreen {
         {
             self.show_banner(ctx);
         }
+        if closed {
+            self.panel = None;
+        }
+    }
+
+    /// The Up next panel: the same place and look as the other panels, the shared list in OSD
+    /// colours, and "n to go · ends ~03:12" under it.
+    fn draw_queue_panel(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect) {
+        let theme = ctx.theme;
+        let t = &theme.tokens;
+        let s = scale_of(ui);
+        let pad = (theme.space(SpaceToken::PopupPadding) * s).round();
+        let w = (340.0 * theme.rem() * s).min(rect.width() * 0.6);
+        let area = Rect::from_min_max(
+            egui::pos2(rect.right() - w - pad, rect.top() + pad * 6.0),
+            egui::pos2(rect.right() - pad, rect.bottom() - pad * 12.0),
+        );
+        if area.height() < 60.0 {
+            return;
+        }
+        let _ = ui.interact(area, ui.id().with("panel-bg"), egui::Sense::click());
+        let p = ui.painter_at(rect);
+        p.rect_filled(area, t.rounding, t.osd_scrim);
+        let caption = FontId::proportional((theme.font(TypeToken::Caption) * s).round());
+        let font = FontId::proportional((theme.font(TypeToken::Title) * s).round());
+        let small = FontId::proportional((theme.font(TypeToken::Body) * s).round());
+        let snap = crate::queue::ui::snapshot(ctx);
+        let Some(panel) = &mut self.panel else { return };
+        let Some(q) = panel.queue.as_mut() else { return };
+        let head_h = (caption.size * 2.0).round();
+        let close = Rect::from_min_size(egui::pos2(area.right() - pad / 2.0 - head_h, area.top() + pad / 2.0), egui::vec2(head_h, head_h));
+        let query = panel.list.filter.query().to_owned();
+        let head = if query.is_empty() { "UP NEXT (u)".to_owned() } else { format!("UP NEXT (u)  ·  {query}") };
+        osd_text(
+            &p,
+            egui::pos2(area.left() + pad, close.center().y),
+            Align2::LEFT_CENTER,
+            &head,
+            caption.clone(),
+            with_alpha(t.osd_text, 0.7),
+            close.left() - area.left() - 2.0 * pad,
+        );
+        let closed = osd_button(ui, &p, theme, close, ui.id().with("panel-close"), glyphs::CLOSE, small.clone(), "Close", Some("Close (Esc)"), false)
+            .clicked();
+        let foot_h = (small.size * 1.8).round();
+        let footer = crate::queue::ui::summary(&snap, ctx.now, ctx.config.interface.clock_24h);
+        let list_top = close.bottom() + pad / 2.0;
+        let list_rect = Rect::from_min_max(
+            egui::pos2(area.left() + pad / 2.0, list_top),
+            egui::pos2(area.right() - pad / 2.0, area.bottom() - pad / 2.0 - if footer.is_some() { foot_h } else { 0.0 }),
+        );
+        std::mem::swap(&mut panel.list, &mut q.list);
+        q.sync(snap.clone(), Mode::Panel, None);
+        let row_h = (font.size * 2.0).round();
+        let empty = q.lines().is_empty();
+        let out = if empty {
+            let msg = if query.is_empty() { "Nothing to play next · Ctrl+N adds" } else { "No matches" };
+            osd_text(
+                &p,
+                egui::pos2(area.left() + pad, list_top + row_h / 2.0),
+                Align2::LEFT_CENTER,
+                msg,
+                small.clone(),
+                with_alpha(t.osd_text, 0.7),
+                area.width() - 2.0 * pad,
+            );
+            Out::None
+        } else {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(list_rect), |ui| q.ui(ui, ctx, &Look::osd(theme), row_h)).inner
+        };
+        std::mem::swap(&mut panel.list, &mut q.list);
+        if let Some(text) = footer {
+            osd_text(
+                &p,
+                egui::pos2(area.left() + pad, area.bottom() - pad / 2.0 - foot_h / 2.0),
+                Align2::LEFT_CENTER,
+                &text,
+                small,
+                with_alpha(t.osd_text, 0.7),
+                area.width() - 2.0 * pad,
+            );
+        }
+        // a click puts the cursor on a row, a double-click plays it
+        let out = match out {
+            Out::Handled => Out::None,
+            o => o,
+        };
+        self.queue_out(ctx, out);
         if closed {
             self.panel = None;
         }
