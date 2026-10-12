@@ -1,7 +1,7 @@
-//! Agent control: use Tuner from Claude (or any MCP client) — DESIGN §30.
+//! Agent control: use Tuner from an AI agent (any MCP client) — DESIGN §30.
 //!
 //! ```text
-//!  Claude Code ──stdio JSON-RPC (MCP)──▶ `tuner mcp` ──IPC v2 (unix socket)──▶ running Tuner
+//!  MCP client  ──stdio JSON-RPC (MCP)──▶ `tuner mcp` ──IPC v2 (unix socket)──▶ running Tuner
 //!                                         agent::{mcp, tools, client}        ipc.rs → agent::server
 //!                                         (bridge track)                     (app track)
 //! ```
@@ -45,18 +45,18 @@ pub enum AgentCommand {
     /// `control popout`: move what plays to the pop-out without taking the keyboard (MV-2).
     PopOut,
     /// `lock session_now`: lock the parental session now (the app's `ParentalSession::lock`).
-    /// Claude can only ever lock: nothing here unlocks.
+    /// An agent can only ever lock: nothing here unlocks.
     LockSession,
     /// `multiview` (validated: visible live channels or catch-up, the PIN rules re-applied by
     /// the app; MV-2).
     MultiView(AgentMultiView),
     /// `guide_fix apply` of more than `guide::CHAT_APPLY_MAX` channels after the user's yes:
-    /// Tuner opens Guide fixes with its confirm card prefilled; Enter applies the batch as
-    /// Claude's (DESIGN §31.5).
+    /// Tuner opens Guide fixes with its confirm card prefilled; Enter applies the batch as the
+    /// agent's (DESIGN §31.5).
     GuideFixReview(GuideFixReview),
 }
 
-/// A Claude proposal handed to Tuner's confirm card (taken out of the handler's proposals, so
+/// An agent's proposal handed to Tuner's confirm card (taken out of the handler's proposals, so
 /// it is applied there or not at all).
 #[derive(Debug, Clone, PartialEq)]
 pub struct GuideFixReview {
@@ -64,6 +64,8 @@ pub struct GuideFixReview {
     pub proposal: crate::model::Proposal,
     /// The card isn't opened after this (the screen wasn't shown in time).
     pub expires: crate::model::Timestamp,
+    /// Who proposed it ("Accept Codex's 55 fixes?").
+    pub agent: crate::model::AgentName,
 }
 
 /// A multi-view request (`multiview` tool, DESIGN §35 §6).

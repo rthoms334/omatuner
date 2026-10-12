@@ -199,8 +199,9 @@ fn reminder_start(s: &Store, id: ReminderId) -> Timestamp {
     user::reminder(&s.reader().unwrap(), id).unwrap().unwrap().start
 }
 
+/// An agent's batches are Codex's here.
 fn apply(s: &Store, actor: FixActor, p: Proposal) -> tuner::error::Result<gf::ApplyReport> {
-    s.writer().blocking(move |c| gf::apply(c, actor, "test", &p, &opts(), NOW))
+    s.writer().blocking(move |c| gf::apply(c, actor, &AgentName::named("Codex"), "test", &p, &opts(), NOW))
 }
 
 fn change(ch: &ItemRef) -> FixChange {
@@ -363,7 +364,7 @@ fn explicit_channels_count_only_while_shown() {
 
 /// A batch writes manual rows (with the guide channel's name and the actor), overrides and its
 /// log; a shift moves pending reminders. Undo restores what the batch changed and skips (and
-/// names) a field changed since and a channel gone from its playlist. Claude's batches are
+/// names) a field changed since and a channel gone from its playlist. An agent's batches are
 /// capped; a proposal from before a guide import is stale.
 #[test]
 fn batches_apply_log_and_undo() {
@@ -391,16 +392,17 @@ fn batches_apply_log_and_undo() {
     assert_eq!(pv[1].before.now.as_ref().map(|p| &*p.title), Some("BBC One 6"));
     assert_eq!(pv[1].after.now.as_ref().map(|p| (&*p.title, p.start)), Some(("BBC One 5", T0)), "+1 h: the programme of an hour earlier");
 
-    let rep = apply(&s, FixActor::Claude, batch.clone()).unwrap();
+    let rep = apply(&s, FixActor::Agent, batch.clone()).unwrap();
     assert_eq!((rep.applied, rep.reminders_moved, rep.mappings_changed), (2, 1, true));
     let log = rep.log.unwrap();
     let entry = &gf::recent(&conn, 10).unwrap()[0];
-    assert_eq!((entry.id, entry.actor, entry.n, entry.undone_at), (log, FixActor::Claude, 2, None));
+    assert_eq!((entry.id, entry.actor, entry.agent.name(), entry.n, entry.undone_at), (log, FixActor::Agent, "Codex", 2, None));
     let (name, actor): (Option<String>, Option<String>) = conn
         .query_row("SELECT epg_name, actor FROM channel_epg_map WHERE channel_key = 'm3u:sky' AND method = 'manual'", [], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })
         .unwrap();
+    // an agent's key stays 'claude' (0009's CHECK, older backups); the name is the log's
     assert_eq!((name.as_deref(), actor.as_deref()), (Some("Sky Mix HD"), Some("claude")));
     let l = lib(&s);
     assert_eq!(shown(&s, &l, &sky), (Some("skymixhd.uk".into()), 0));
@@ -411,11 +413,13 @@ fn batches_apply_log_and_undo() {
     assert_eq!(facts.extras[&bbc_id].guide_ok, IssueKind::LooksWrong.bit());
 
     // the same proposal again changes nothing and logs nothing; the stamp still matches
-    let again = apply(&s, FixActor::Claude, batch).unwrap();
+    let again = apply(&s, FixActor::Agent, batch).unwrap();
     assert_eq!((again.applied, again.log), (0, None));
 
-    // you shift BBC One again afterwards: Undo of Claude's batch leaves that alone
+    // you shift BBC One again afterwards: Undo of the agent's batch leaves that alone
     apply(&s, FixActor::You, Proposal { changes: vec![FixChange { shift_min: Some(Some(30)), ..change(&bbc) }], ..Default::default() }).unwrap();
+    // the user's own batch is never shown under an agent's name
+    assert_eq!(gf::recent(&conn, 1).unwrap()[0].agent.stored(), None);
     let un = s.writer().blocking(move |c| gf::undo(c, log, &opts(), NOW)).unwrap();
     assert_eq!(un.reverted, 2, "Sky Mix fully, BBC One's dismissal");
     assert_eq!(un.skipped, vec![("m3u:bbc".to_owned(), "changed since".to_owned())]);
@@ -432,21 +436,21 @@ fn batches_apply_log_and_undo() {
     let un = s.writer().blocking(move |c| gf::undo(c, shift_sky.log.unwrap(), &opts(), NOW)).unwrap();
     assert_eq!((un.reverted, un.skipped), (0, vec![("m3u:sky".to_owned(), "no longer in the playlist".to_owned())]));
 
-    // stale after a guide import; Claude's batches are capped
+    // stale after a guide import; an agent's batches are capped
     import_guide(&s, g, &gchans);
     let stale = Proposal { changes: vec![FixChange { shift_min: Some(None), ..change(&bbc) }], rules: vec![], stamp };
-    assert!(apply(&s, FixActor::Claude, stale).unwrap_err().to_string().contains(gf::STALE));
+    assert!(apply(&s, FixActor::Agent, stale).unwrap_err().to_string().contains(gf::STALE));
     let big = Proposal { changes: vec![change(&bbc); gf::MAX_BATCH + 1], ..Default::default() };
-    assert!(apply(&s, FixActor::Claude, big).is_err());
+    assert!(apply(&s, FixActor::Agent, big).is_err());
 
-    // Undo of Claude's remap gives your mapping back as yours
+    // Undo of an agent's remap gives your mapping back as yours
     let map = |actor, id: &str, name: &str| {
         let p = Proposal { changes: vec![FixChange { map: Some(Some(target(g, id, name))), ..change(&bbc) }], ..Default::default() };
         apply(&s, actor, p).unwrap().log.unwrap()
     };
     map(FixActor::You, "bbc1.uk", "BBC One");
-    let claude = map(FixActor::Claude, "skymixhd.uk", "Sky Mix HD");
-    s.writer().blocking(move |c| gf::undo(c, claude, &opts(), NOW)).unwrap();
+    let theirs = map(FixActor::Agent, "skymixhd.uk", "Sky Mix HD");
+    s.writer().blocking(move |c| gf::undo(c, theirs, &opts(), NOW)).unwrap();
     let row: (String, Option<String>) = conn
         .query_row("SELECT xmltv_id, actor FROM channel_epg_map WHERE channel_key = 'm3u:bbc' AND method = 'manual'", [], |r| {
             Ok((r.get(0)?, r.get(1)?))

@@ -15,7 +15,7 @@ use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 use tuner::agent::client::{Client, Launcher};
 use tuner::agent::mcp::{self, MAX_MESSAGE};
-use tuner::agent::proto::{ErrorCode, Reply, Request};
+use tuner::agent::proto::{ClientInfo, ErrorCode, Reply, Request};
 use tuner::agent::server::AgentService;
 use tuner::ipc::IpcServer;
 use tuner::msg::EventBus;
@@ -263,7 +263,8 @@ fn protocol_errors_and_ping() {
 /// A tool call goes to the running Tuner as an IPC v2 request whose params ARE the arguments,
 /// and comes back as `structuredContent` + the same JSON as text; an error reply is a tool
 /// error `"<code>: <message>"`; bad arguments are a tool error without any IPC request;
-/// `status` says `running: true`; a result carrying an address is withheld.
+/// `status` says `running: true`; a result carrying an address is withheld; the client's name
+/// from `initialize` goes with the session's calls.
 #[test]
 fn tool_calls_round_trip_through_the_ipc_socket() {
     let rt = runtime();
@@ -310,6 +311,19 @@ fn tool_calls_round_trip_through_the_ipc_socket() {
 
     let methods: Vec<_> = fake.seen().iter().map(|r| r.call.name()).collect();
     assert_eq!(methods, ["guide_search", "continue_watching", "details", "status", "whats_on"]);
+
+    let hello = json!({ "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": { "name": "codex-mcp-client", "title": "Codex", "version": "1" } });
+    let out = exchange(
+        &client,
+        &[
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": hello }),
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "continue_watching" } }),
+        ],
+    );
+    assert_eq!(out[1]["result"]["isError"], false, "{out:?}");
+    let seen = fake.seen();
+    assert!(seen[..seen.len() - 1].iter().all(|r| r.agent.is_none()), "no initialize, no name");
+    assert_eq!(seen.last().unwrap().agent, Some(ClientInfo { name: "codex-mcp-client".into(), title: Some("Codex".into()) }));
 }
 
 /// Tuner not running: `status` answers `running: false` and `control` a "not running" error,

@@ -7,13 +7,15 @@
 //! request, 5 s per connection):
 //!
 //! ```text
-//! → {"v":2,"id":7,"method":"guide_search","params":{"query":"touring car"}}
+//! → {"v":2,"id":7,"agent":{"name":"codex-mcp-client","title":"Codex"},"method":"guide_search","params":{"query":"touring car"}}
 //! ← {"v":2,"id":7,"ok":true,"result":{"programmes":[…],"truncated":false}}
 //! ← {"v":2,"id":7,"ok":false,"error":{"code":"not_found","message":"…"}}
 //! ```
 //! A line without `"v"` (or `"v":1`) is a v1 [`crate::ipc::IpcRequest`] (`--view`/`--play`
-//! handoff). A Tuner from before v2 answers a v2 line with a v1 error (`{"ok":false,"error":"bad
-//! request: …"}`): the client reports "restart Tuner to update it".
+//! handoff). `agent` (optional) is the MCP client that asked, as its `initialize` reported it;
+//! Tuner from before 0.2.2 ignores it, bridges before 0.2.2 don't send it, and a malformed one is
+//! read as absent (never a refused call). A Tuner from before v2 answers a v2 line with a v1 error
+//! (`{"ok":false,"error":"bad request: …"}`): the client reports "restart Tuner to update it".
 //!
 //! Tool arguments ARE the params: `tuner mcp` forwards a `tools/call`'s `arguments` unchanged as
 //! `params` (`{}` when absent), so the JSON schemas in `agent::tools` and the param structs here
@@ -34,18 +36,48 @@ pub const MAX_REPLY: usize = 1 << 20;
 /// Longest free-text parameter (queries, names, times); longer ones are refused.
 pub const MAX_TEXT: usize = 200;
 
-/// `{"v":2,"id":…,"method":…,"params":…}`.
+/// `{"v":2,"id":…,"agent":…,"method":…,"params":…}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Request {
     pub v: u32,
     pub id: u64,
+    /// The MCP client that asked; `None` from bridges before 0.2.2 (DESIGN §30.12) or when
+    /// malformed: it only names the agent on screen, so it never fails the call.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_agent")]
+    pub agent: Option<ClientInfo>,
     #[serde(flatten)]
     pub call: Call,
 }
 
+/// The MCP client as `initialize.clientInfo` reported it. Client-supplied: Tuner names it with
+/// [`crate::model::AgentName::from_client`] (sanitised, display only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientInfo {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+/// `agent` as a [`ClientInfo`] when it is one, else `None`.
+fn lenient_agent<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<ClientInfo>, D::Error> {
+    Ok(serde_json::from_value(serde_json::Value::deserialize(d)?).ok())
+}
+
 impl Request {
     pub fn new(id: u64, call: Call) -> Self {
-        Self { v: VERSION, id, call }
+        Self { v: VERSION, id, agent: None, call }
+    }
+
+    /// The same request, saying which MCP client asked.
+    pub fn with_agent(mut self, agent: Option<ClientInfo>) -> Self {
+        self.agent = agent;
+        self
+    }
+
+    /// Who asked, as Tuner names it ("your agent" when the bridge didn't say).
+    pub fn agent_name(&self) -> crate::model::AgentName {
+        self.agent.as_ref().map_or_else(Default::default, |c| crate::model::AgentName::from_client(&c.name, c.title.as_deref()))
     }
 
     /// The protocol version of a request line: `Some(v)` for a JSON object with a numeric `v`,
@@ -1166,6 +1198,26 @@ mod tests {
         // unknown params are refused, so a schema typo can't be silently ignored
         assert!(serde_json::from_str::<Request>(r#"{"v":2,"id":1,"method":"search","params":{"query":"x","colour":1}}"#).is_err());
         assert!(serde_json::from_str::<Request>(r#"{"v":2,"id":1,"method":"launch_missiles","params":{}}"#).is_err());
+
+        // the client's name rides at the top level, beside (not in) the params; an unknown
+        // top-level key is ignored, which is what lets a 0.2.1 Tuner read a newer bridge's lines
+        let named = req.clone().with_agent(Some(ClientInfo { name: "codex-mcp-client".into(), title: Some("Codex".into()) }));
+        let line = serde_json::to_string(&named).unwrap();
+        assert!(line.starts_with(r#"{"v":2,"id":7,"agent":{"name":"codex-mcp-client","title":"Codex"},"method""#), "{line}");
+        assert_eq!(serde_json::from_str::<Request>(&line).unwrap(), named);
+        assert_eq!(named.agent_name().name(), "Codex");
+        let newer = serde_json::from_str::<Request>(r#"{"v":2,"id":1,"agent":{"name":"x"},"later":true,"method":"status","params":{}}"#).unwrap();
+        assert_eq!(newer.call, Call::Status(Empty {}));
+        // a malformed `agent` only loses the name, never the call
+        for agent in [r#"{"title":"Codex"}"#, "{}", "null", r#""Codex""#, r#"{"name":5}"#] {
+            let line = format!(r#"{{"v":2,"id":1,"agent":{agent},"method":"status","params":{{}}}}"#);
+            let req = serde_json::from_str::<Request>(&line).unwrap_or_else(|e| panic!("{agent}: {e}"));
+            assert_eq!(req.call, Call::Status(Empty {}), "{agent}");
+        }
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"v":2,"id":1,"agent":{"title":"Codex"},"method":"status","params":{}}"#).unwrap().agent_name().name(),
+            "Codex"
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //!
 //! * **Ownership.** Up next drives the main picture while its snapshot says `origin == Queue`
 //!   on one of the refs the current row was sent with (its copies). Anything else that loads
-//!   there (a pick, a zap to another channel, a reminder, Claude) makes Up next step aside: the
+//!   there (a pick, a zap to another channel, a reminder, an agent) makes Up next step aside: the
 //!   current row keeps its state, "Up next paused · Alt+6 to carry on". Stop (`Idle`) never
 //!   advances.
 //! * **Advancing.** `Ended` of the current row → played, then the countdown (or the stop:

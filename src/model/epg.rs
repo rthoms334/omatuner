@@ -257,7 +257,7 @@ pub struct FixChange {
     pub dismiss: Option<IssueKind>,
 }
 
-/// A batch to apply (the screen's confirm card, or Claude's `guide_fix propose`), bound to the
+/// A batch to apply (the screen's confirm card, or an agent's `guide_fix propose`), bound to the
 /// guide check it was computed from.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Proposal {
@@ -267,11 +267,14 @@ pub struct Proposal {
     pub stamp: [u8; 16],
 }
 
-/// Who made a guide fix (`guide_fix_log.actor`, `channel_epg_map.actor`).
+/// Who made a guide fix (`guide_fix_log.actor`, `channel_epg_map.actor`): the user or an agent
+/// (which one: `guide_fix_log.agent`, display only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum FixActor {
     #[default]
     You,
-    Claude,
+    /// Stored as "claude", the only agent when guide fixes were made (0009's CHECK, backups).
+    #[serde(rename = "claude")]
+    Agent,
 }

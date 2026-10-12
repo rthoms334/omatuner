@@ -136,7 +136,7 @@ pub struct Reminder {
     /// Where scheduled playback opens; `None` = `reminders.open_in` (big-features additions).
     #[serde(default)]
     pub open_in: Option<OpenIn>,
-    /// The Following rule that made it (migration 0011); `None` = the user's or Claude's own.
+    /// The Following rule that made it (migration 0011); `None` = the user's or an agent's own.
     /// Editing its lead or mode detaches it (`follow::on_reminder_edited`).
     #[serde(default)]
     pub rule_id: Option<FollowRuleId>,

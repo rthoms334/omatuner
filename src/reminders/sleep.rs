@@ -1,4 +1,4 @@
-//! The in-app sleep timer (skill plan; B6 hook 6): it outlives the Claude session because it
+//! The in-app sleep timer (skill plan; B6 hook 6): it outlives the agent's session because it
 //! runs in Tuner (on tokio, so it works while the window is hidden). OWNER: remind (engine) /
 //! rui (menu, toast, OSD countdown).
 //!

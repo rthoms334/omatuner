@@ -2,7 +2,7 @@
 //! the skill plan §2). OWNER: agent track.
 //!
 //! Reminders are ordinary rows (`store::user::add_reminder`, the one delete path
-//! `remove_reminder`) fired by Tuner's scheduler, also while Tuner is closed (B6). Claude can't
+//! `remove_reminder`) fired by Tuner's scheduler, also while Tuner is closed (B6). An agent can't
 //! schedule a channel that needs the PIN now, never sees reminders of concealed channels, and a
 //! Following rule's reminder shows the rule's name when the rule is spoiler-safe. The sleep
 //! timer runs in Tuner (`reminders::sleep::SleepHandle`), so it outlives the conversation.

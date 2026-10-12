@@ -64,7 +64,7 @@ tool_actions!(
     }
 );
 
-/// A rule as Claude describes it (`follow preview` / `add`).
+/// A rule as the agent describes it (`follow preview` / `add`).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FollowRuleInput {
@@ -286,7 +286,7 @@ pub struct Reminders {
 }
 
 tool_actions!(
-    /// `sleep_timer` (in the app, so it outlives the Claude session).
+    /// `sleep_timer` (in the app, so it outlives the agent's session).
     pub enum SleepAction {
         Status => ("status", false),
         Set => ("set", true),
@@ -316,7 +316,7 @@ pub struct SleepTimer {
 
 // ------------------------------------------------------------------ library and health tools
 
-/// One title Claude found on the web (`match_titles`).
+/// One title the agent found on the web (`match_titles`).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TitleQuery {

@@ -41,8 +41,10 @@ pub struct FollowRule {
     /// List order; lower wins a clash.
     pub priority: i64,
     pub enabled: bool,
-    /// Made by Claude (`follow add`, marked in Settings).
+    /// Made by an agent (`follow add`, marked in Settings).
     pub by_agent: bool,
+    /// Which agent, when `by_agent` ("added by Codex"; unknown = "your agent").
+    pub agent: crate::model::AgentName,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
 }
@@ -81,6 +83,7 @@ impl FollowRule {
             priority: i64::MAX,
             enabled: true,
             by_agent: false,
+            agent: Default::default(),
             created_at: now,
             updated_at: now,
         }

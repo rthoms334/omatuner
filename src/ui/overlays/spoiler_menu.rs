@@ -250,7 +250,7 @@ impl SpoilerMenu {
             Choice::Series { norm, label, guard: on } => {
                 let l = label.clone();
                 let _ = writer
-                    .submit_notify(DataScope::Spoiler, move |c| crate::store::spoiler::set_series_guard(c, &norm, &l, on, false, now).map(|_| ()));
+                    .submit_notify(DataScope::Spoiler, move |c| crate::store::spoiler::set_series_guard(c, &norm, &l, on, None, now).map(|_| ()));
                 ctx.toast(Toast::info(if on {
                     format!("Guarding {label} after the episode you're on")
                 } else {

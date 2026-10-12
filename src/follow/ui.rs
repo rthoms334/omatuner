@@ -248,7 +248,7 @@ pub fn rule_summary(r: &FollowRule) -> String {
         parts.push("spoiler-safe".into());
     }
     if r.by_agent {
-        parts.push("by Claude".into());
+        parts.push(format!("by {}", r.agent.name()));
     }
     if !r.enabled {
         parts.push("paused".into());

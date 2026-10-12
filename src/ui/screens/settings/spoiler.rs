@@ -119,7 +119,7 @@ fn rule_detail(
         });
     }
     if r.by_agent {
-        parts.push("added by Claude".into());
+        parts.push(format!("added by {}", r.agent.name()));
     }
     if !r.enabled {
         parts.push("off".into());
@@ -134,13 +134,13 @@ fn rule_detail(
     parts.join(" · ")
 }
 
-fn how(h: SeenHow) -> &'static str {
-    match h {
-        SeenHow::Live => "watched live",
-        SeenHow::Catchup => "watched on catch-up",
-        SeenHow::Vod => "watched",
-        SeenHow::Marked => "marked seen",
-        SeenHow::Agent => "marked seen by Claude",
+fn how(r: &SeenRow) -> String {
+    match r.how {
+        SeenHow::Live => "watched live".into(),
+        SeenHow::Catchup => "watched on catch-up".into(),
+        SeenHow::Vod => "watched".into(),
+        SeenHow::Marked => "marked seen".into(),
+        SeenHow::Agent => format!("marked seen by {}", r.agent.name()),
     }
 }
 
@@ -161,7 +161,7 @@ pub(super) fn rows(s: &SettingsScreen, ctx: &UiCtx<'_>, v: &mut Vec<Row>) {
     v.push(Row::Section("Spoiler guard".into()));
     v.push(Row::Note(
         format!(
-            "Hides what could spoil a match or an episode you haven't watched yet — in the guide, search, Home, notifications and Claude. {} shows what's hidden on the item you're on; {} pauses it.",
+            "Hides what could spoil a match or an episode you haven't watched yet — in the guide, search, Home, notifications and your agent's answers. {} shows what's hidden on the item you're on; {} pauses it.",
             crate::spoiler::ui::reveal_key_label(),
             crate::keymap::GLOBAL.iter().find(|b| b.action == crate::keymap::Action::SpoilerMenu).map(|b| b.chord.label()).unwrap_or_default()
         ),
@@ -222,7 +222,7 @@ pub(super) fn rows(s: &SettingsScreen, ctx: &UiCtx<'_>, v: &mut Vec<Row>) {
         v.push(Row::Section("Seen recently".into()));
         for (i, r) in st.seen.iter().enumerate() {
             let title = guard.outside_title(&r.title, now).into_owned();
-            let detail = format!("{} · {} · Enter to undo", how(r.how), crate::ui::widgets::time::day_time(r.seen_at, h24));
+            let detail = format!("{} · {} · Enter to undo", how(r), crate::ui::widgets::time::day_time(r.seen_at, h24));
             v.push(item(SEEN_BASE - i as i64, glyphs::CHECK, title, detail));
         }
     }
@@ -302,6 +302,7 @@ mod tests {
             shield: true,
             enabled: true,
             by_agent: false,
+            agent: Default::default(),
             created_at: 0,
         }
     }
@@ -322,6 +323,7 @@ mod tests {
                 episode: None,
                 seen_at: 1_791_583_000,
                 how: SeenHow::Live,
+                agent: Default::default(),
             };
             crate::store::spoiler::mark_seen(c, &seen)?;
             Ok(id)

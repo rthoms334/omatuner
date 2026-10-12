@@ -548,6 +548,7 @@ impl FollowSheet {
                     r.name = format!("{} (copy)", r.name.trim());
                     r.priority = i64::MAX;
                     r.by_agent = false;
+                    r.agent = Default::default();
                     r.enabled = true;
                 }
                 if let Some(Ok(l)) = self.loaded.as_mut() {
@@ -755,7 +756,7 @@ fn look_in_options() -> [(Fields, &'static str); 4] {
 }
 
 /// The channel scopes the editor offers: any, favourites, each playlist — and the rule's own
-/// when it is something else (a list or channels Claude chose).
+/// when it is something else (a list or channels an agent chose).
 fn channel_options(ctx: &UiCtx<'_>, current: Option<&ChannelScope>) -> Vec<(ChannelScope, String)> {
     let mut v = vec![(ChannelScope::Any, "Any I can watch".to_owned()), (ChannelScope::Favourites, "My favourites".to_owned())];
     v.extend(ctx.lib.sources.iter().filter(|s| s.enabled).map(|s| (ChannelScope::Playlist(s.id), format!("Only {}", s.name))));
@@ -1027,7 +1028,7 @@ impl FollowSheet {
         ui.horizontal(|ui| {
             ui.label(RichText::new(heading).size(theme.font(TypeToken::Heading)).color(t.fg));
             if r.by_agent {
-                ui.label(RichText::new("added by Claude").size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
+                ui.label(RichText::new(format!("added by {}", r.agent.name())).size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
             }
         });
         ui.add_space(theme.space(SpaceToken::Md));

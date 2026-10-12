@@ -63,6 +63,7 @@ pub fn seen_row_for(p: &crate::model::Programme, how: crate::model::SeenHow, now
         episode: se.map(|s| s.1),
         seen_at: now,
         how,
+        agent: Default::default(),
     }
 }
 

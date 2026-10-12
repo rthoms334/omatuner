@@ -1218,51 +1218,62 @@ combined (Settings ▸ Interface). Undo toasts last 8 s.
     the same name but another tvg-id, and explicit channels with the session locked are never
     offered. Nothing ever switches channel by itself.
 
-## 21. Use Tuner from Claude (MCP)
+## 21. Use Tuner from an AI agent (MCP)
 
 Default profile, Claude Code installed, `claude mcp add --scope user tuner -- tuner mcp` done
-once (`claude mcp list` shows `tuner` connected).
+once (`claude mcp list` shows `tuner` connected). The checks below say "the agent": run them
+with Claude Code, and *Second agent* with another one.
 
-- [ ] **Not running → status doesn't start it:** quit Tuner. Ask Claude "what's playing?".
-  **Expect:** Claude says Tuner isn't running; Tuner does not open.
+- [ ] **Not running → status doesn't start it:** quit Tuner. Ask the agent "what's playing?".
+  **Expect:** the agent says Tuner isn't running; Tuner does not open.
 
-- [ ] **Not running → starts:** quit Tuner. Ask Claude "what's on now?".
-  **Expect:** Tuner opens on the current workspace within a few seconds; Claude lists programmes
+- [ ] **Not running → starts:** quit Tuner. Ask the agent "what's on now?".
+  **Expect:** Tuner opens on the current workspace within a few seconds; the agent lists programmes
   with channels and times in your local time.
 - [ ] **"Touring cars is on" (or any live sport / show in your guide):**
-  **Expect:** Claude finds the live programme and Tuner plays the channel fullscreen and comes to
+  **Expect:** the agent finds the live programme and Tuner plays the channel fullscreen and comes to
   the front. Backspace returns to the previous channel.
 - [ ] **Upcoming → automatic switch:** ask for something starting in 2–3 minutes and accept the
-  switch. **Expect:** Claude reports the start time; 10 s before, Tuner toasts "Switching to …
+  switch. **Expect:** the agent reports the start time; 10 s before, Tuner toasts "Switching to …
   in 10 s" with Cancel; at the start it switches by itself. Repeat and press Cancel: no switch.
   Settings ▸ Reminders lists the pending switch with its own label until then.
-- [ ] **Mood pick:** "something light under 2 hours, I haven't seen". **Expect:** Claude names a
-  film from a fitting category with its runtime; on "play it" Tuner starts it (resuming saved
+- [ ] **Mood pick:** "something light under 2 hours, I haven't seen". **Expect:** the agent names
+  a film from a fitting category with its runtime; on "play it" Tuner starts it (resuming saved
   progress for a started film).
 - [ ] **Catch-up:** ask for a programme that ended today on a channel with catch-up.
-  **Expect:** it plays from the archive; on a channel without catch-up Claude says it can't.
-- [ ] **Parental lock:** set a PIN, lock a channel, lock the session. Ask Claude to play that
-  channel. **Expect:** Tuner shows its PIN prompt; Claude tells you to type the PIN in Tuner
-  and does not ask for it. With explicit content present and hidden: ask Claude to search for an
-  explicit channel or category by name — nothing found, no counts that give it away. Unlock in
+  **Expect:** it plays from the archive; on a channel without catch-up the agent says it can't.
+- [ ] **Parental lock:** set a PIN, lock a channel, lock the session. Ask the agent to play
+  that channel. **Expect:** Tuner shows its PIN prompt; the agent tells you to type the PIN in Tuner
+  and does not ask for it. With explicit content present and hidden: ask the agent to search for
+  an explicit channel or category by name — nothing found, no counts that give it away. Unlock in
   Tuner → it is found.
-- [ ] **No addresses:** ask Claude for the stream URL of a channel. **Expect:** it can't give
+- [ ] **No addresses:** ask the agent for the stream URL of a channel. **Expect:** it can't give
   one (no tool result contains a URL).
 - [ ] **Control:** "pause", "resume", "volume to 30", "stop". **Expect:** each happens, also
   while Tuner sits on another workspace.
 - [ ] **Window hidden:** move Tuner to another workspace, ask "what's on BBC One at 9?".
   **Expect:** an answer without Tuner coming forward; "play it" brings it forward.
-- [ ] **Outlives Claude:** with Tuner started by Claude (first check), quit Claude Code (and
+- [ ] **Outlives the agent:** with Tuner started by the agent (first check), quit the agent (and
   close its terminal). **Expect:** Tuner keeps running and playing.
-- [ ] **Relock while away:** set a PIN with a 1-minute relock, unlock, ask Claude to switch to an
-  explicit channel in 3 minutes, then move Tuner to another workspace and wait. **Expect:** no
+- [ ] **Relock while away:** set a PIN with a 1-minute relock, unlock, ask the agent to switch to
+  an explicit channel in 3 minutes, then move Tuner to another workspace and wait. **Expect:** no
   toast or switch for it after the relock; "what's playing?" and the scheduled list don't name
   it.
 - [ ] **Flags first:** `claude mcp add tuner-debug -- tuner --debug mcp`, then ask "what's
   playing?". **Expect:** an answer (not a Tuner window opening); remove it afterwards.
 - [ ] **Old instance:** with a Tuner from before this feature running (or simulate: keep an old
-  build open), ask Claude anything. **Expect:** Claude says to restart Tuner; after a restart it
-  works.
+  build open), ask the agent anything. **Expect:** the agent says to restart Tuner; after a
+  restart it works.
+- [ ] **Second agent:** connect Codex (`codex mcp add tuner -- tuner mcp`) or Gemini CLI
+  (`gemini mcp add -s user tuner tuner mcp`) and ask it to follow a team. **Expect:** it shows
+  the matches and asks first; the toast reads "Codex added … · N reminders" (or "Gemini added
+  …") with Undo; Settings ▸ Following shows the rule "· by Codex" and its follow sheet "added by
+  Codex". A rule Claude Code added still says "by Claude". A play, search and status work the
+  same as with Claude Code.
+- [ ] **Upgrade:** open a profile from Tuner 0.2.1 that has a Following rule, a spoiler rule and
+  a guide-fix batch Claude made. **Expect:** they show "by Claude" / "added by Claude", and
+  Recent changes in Guide fixes names Claude. Restoring a 0.2.1 backup with the two rules on a
+  fresh profile shows them "by Claude" too (backups don't carry Recent changes).
 
 
 ## 22. Guide fixes (real catalogue)
@@ -1287,9 +1298,10 @@ once (`claude mcp list` shows `tuner` connected).
   channel's 0 wins).
 - [ ] **Backup:** export a backup after a shift and an "It's right", restore it on a fresh
   profile. **Expect:** the shift and the dismissal are back.
-- [ ] **Claude:** ask Claude "why is the guide empty on half my channels?" and to fix them.
+- [ ] **Agent:** ask your agent "why is the guide empty on half my channels?" and to fix them.
   **Expect:** a proposal; more than 50 channels is not applied from chat: Tuner comes forward
-  on Guide fixes with "Accept Claude's N fixes?" and Enter applies them (toast with Undo), Esc
+  on Guide fixes with "Accept <agent>'s N fixes?" (the agent's name, e.g. "Accept Codex's N
+  fixes?") and Enter applies them (toast with Undo), Esc
   applies nothing; a smaller batch applies from chat and its toast/Undo works; a locked
   channel is refused while locked. Ask for a second big batch before opening the first card:
   **Expect:** a toast says the earlier fixes were replaced and the card shows the newer batch.
@@ -1332,6 +1344,8 @@ once (`claude mcp list` shows `tuner` connected).
 - [ ] **No interrupt:** with a film playing, let a rule's switch come due. **Expect:** a
   notification with **Watch**, the film keeps playing. Your own one-off switch does interrupt,
   after the 10 s Cancel.
+- [ ] **An agent's rule:** ask your agent to follow a show, then open the rule in Settings ▸
+  Following. **Expect:** the sheet says "added by <agent>"; after an edit it still does.
 - [ ] **Edit a rule:** change a rule from Notify to Switch. **Expect:** its coming reminders
   become switches after the next evaluation (within seconds).
 - [ ] **Following off:** turn Following off in Settings. **Expect:** its reminders don't fire
@@ -1390,8 +1404,10 @@ once (`claude mcp list` shows `tuner` connected).
   other picture and Enter does nothing to the card; back on it, Enter watches anyway.
 - [ ] **Notifications:** a reminder for the match's channel fires (Tuner open, then closed).
   **Expect:** no score in the notification either way.
-- [ ] **Claude:** ask Claude "what was the Arsenal score?" and "what's on Sky Sports News?".
-  **Expect:** no score or guarded text; asking Claude to remove your own spoiler rule is refused.
+- [ ] **Agent:** ask your agent "what was the Arsenal score?" and "what's on Sky Sports News?".
+  **Expect:** no score or guarded text; asking it to remove your own spoiler rule is refused. Ask
+  it to guard a show and to mark an episode seen: Settings ▸ Spoiler guard shows the rule "added
+  by <agent>" and the mark "marked seen by <agent>".
 
 ## 26. Multi-view on the two one-connection accounts
 
@@ -1415,7 +1431,7 @@ Both test accounts allow one stream each (TV and TV 2).
 - [ ] **Parental:** with the session locked, `Ctrl+M` on a locked channel. **Expect:** the PIN
   prompt before anything plays. Relock with a locked channel in A and a free one in B: only A
   stops.
-- [ ] **Claude:** "put both semis side by side". **Expect:** two pictures on different
+- [ ] **Agent:** "put both semis side by side". **Expect:** two pictures on different
   playlists in one go. With two pictures already on, "now X and Y" replaces both in one go
   (no "Move picture …?" for a picture that is replaced); if one of them is already on screen
   it stays and only the other changes.

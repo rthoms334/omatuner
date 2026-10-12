@@ -4,7 +4,7 @@
 //! argument shapes change only together with `params`).
 //!
 //! Every result follows §30's rules: refs, never URLs; explicit content absent while hidden
-//! (counts included); locked items only as "locked: needs your PIN in Tuner"; Claude can never
+//! (counts included); locked items only as "locked: needs your PIN in Tuner"; an agent can never
 //! unlock, reveal explicit content or loosen a setting (no tool takes a PIN or "show explicit").
 
 use serde_json::{Value, json};
@@ -101,8 +101,8 @@ add. Never create a rule from an inferred interest. Spoiler-safe results show on
             name: "spoiler_guard",
             title: "Spoiler guard",
             description: "Tuner's spoiler guard, which hides results and later episodes in the app and in these tools until the user \
-has watched them: status, list, add_topic, add_series, blackout (\"I'll watch it later\"), remove (rules Claude added only; the \
-user's own rules are removed in the app), mark_seen. Say \"hidden by your spoiler guard\" rather than guessing; never web-search a \
+has watched them: status, list, add_topic, add_series, blackout (\"I'll watch it later\"), remove (only rules an agent added, \
+by_agent in list; the user's own rules are removed in the app), mark_seen. Say \"hidden by your spoiler guard\" rather than guessing; never web-search a \
 guarded event. Writes need the user's confirmation; pausing stays in the app.",
             input_schema: object(
                 json!({
@@ -116,7 +116,7 @@ guarded event. Writes need the user's confirmation; pausing stays in the app.",
                     "ref": text("blackout / mark_seen: a programme or episode ref."),
                     "topic": text("blackout: a topic instead of a programme."),
                     "until": text(&format!("blackout: until. {TIME}")),
-                    "id": { "type": "integer", "description": "remove: the id of a rule Claude added." },
+                    "id": { "type": "integer", "description": "remove: the id of a rule an agent added (by_agent)." },
                 }),
                 &["action"],
             ),

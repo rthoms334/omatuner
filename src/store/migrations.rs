@@ -28,6 +28,7 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("0010_play_queue", include_str!("migrations/0010_play_queue.sql")),
     ("0011_follow", include_str!("migrations/0011_follow.sql")),
     ("0012_spoiler_guard", include_str!("migrations/0012_spoiler_guard.sql")),
+    ("0013_agent_names", include_str!("migrations/0013_agent_names.sql")),
 ];
 
 /// Current schema version after all migrations.
@@ -110,6 +111,7 @@ fn backfill(conn: &Connection, name: &str) -> Result<()> {
         "0008_reminder_modes" => reminder_modes(conn),
         "0009_guide_fixes" => guide_fix_columns(conn),
         "0011_follow" => follow_columns(conn),
+        "0013_agent_names" => agent_names(conn),
         _ => Ok(()),
     }
 }
@@ -140,6 +142,23 @@ fn guide_fix_columns(conn: &Connection) -> Result<()> {
 fn follow_columns(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "reminder", "rule_id", "INTEGER REFERENCES follow_rule(id) ON DELETE SET NULL")?;
     conn.execute_batch("CREATE INDEX IF NOT EXISTS reminder_rule ON reminder(rule_id) WHERE rule_id IS NOT NULL")?;
+    Ok(())
+}
+
+/// 0013: the name of the agent that made a rule, a seen mark or a guide-fix batch (DESIGN
+/// §30.12); NULL = unknown ("your agent"). Agent rows from before it were Claude's: only the
+/// Claude Code plugin could make them. Run once (`user_version`); a renumbered re-run would only
+/// name unknown agents' rows Claude, which is harmless.
+fn agent_names(conn: &Connection) -> Result<()> {
+    for t in ["follow_rule", "spoiler_rule", "spoiler_seen", "guide_fix_log"] {
+        add_column_if_missing(conn, t, "agent", "TEXT")?;
+    }
+    conn.execute_batch(
+        "UPDATE follow_rule   SET agent = 'Claude' WHERE origin = 'agent'  AND agent IS NULL;
+         UPDATE spoiler_rule  SET agent = 'Claude' WHERE origin = 'agent'  AND agent IS NULL;
+         UPDATE spoiler_seen  SET agent = 'Claude' WHERE how    = 'agent'  AND agent IS NULL;
+         UPDATE guide_fix_log SET agent = 'Claude' WHERE actor  = 'claude' AND agent IS NULL;",
+    )?;
     Ok(())
 }
 
@@ -351,7 +370,8 @@ mod tests {
                 "0009_guide_fixes",
                 "0010_play_queue",
                 "0011_follow",
-                "0012_spoiler_guard"
+                "0012_spoiler_guard",
+                "0013_agent_names"
             ]
         );
         for (t, col) in [
@@ -378,12 +398,16 @@ mod tests {
             ("follow_match", "event_key"),
             ("spoiler_seen", "event_key"),
             ("guide_fix_log", "actor"),
+            ("follow_rule", "agent"),
+            ("spoiler_rule", "agent"),
+            ("spoiler_seen", "agent"),
+            ("guide_fix_log", "agent"),
         ] {
             assert!(has_column(&c, t, col).unwrap(), "{t}.{col}");
         }
     }
 
-    /// The batch's migrations (0008–0012) are safe to re-run, the way a renumbered branch
+    /// The batch's migrations (0008–0013) are safe to re-run, the way a renumbered branch
     /// database re-runs them: every script and Rust step again on a migrated database changes
     /// nothing and fails nothing; an old switch row (`lead_s = -1`) reads as mode 'switch'.
     #[test]
@@ -501,6 +525,33 @@ mod tests {
         c.pragma_update(None, "user_version", 2).unwrap();
         migrate(&mut c).unwrap();
         assert_eq!(q(&c, "a"), (Some(3), Some("bbcone".into())));
+    }
+
+    /// 0013 on a 0.2.1 profile: agent rows made before names were kept are Claude's (only the
+    /// Claude Code plugin could make them); the user's rows stay unnamed.
+    #[test]
+    fn agent_names_migration_names_old_rows_claude() {
+        let mut c = migrated_to(12);
+        assert_eq!(MIGRATIONS[12].0, "0013_agent_names");
+        c.execute_batch(
+            "INSERT INTO follow_rule(name, kind, spec, priority, origin, created_at, updated_at) VALUES
+               ('Mine', 'team', '{}', 1, 'user', 0, 0), ('Theirs', 'team', '{}', 2, 'agent', 0, 0);
+             INSERT INTO spoiler_rule(kind, label, origin, created_at) VALUES ('topic', 'Mine', 'user', 0), ('topic', 'Theirs', 'agent', 0);
+             INSERT INTO spoiler_seen(event_key, first_start, title, seen_at, how) VALUES ('mine', 0, 'Mine', 0, 'live'), ('theirs', 0, 'Theirs', 0, 'agent');
+             INSERT INTO guide_fix_log(at, actor, label, n) VALUES (0, 'you', 'Mine', 1), (0, 'claude', 'Theirs', 1);",
+        )
+        .unwrap();
+        migrate(&mut c).unwrap();
+        for (t, label) in [("follow_rule", "name"), ("spoiler_rule", "label"), ("spoiler_seen", "title"), ("guide_fix_log", "label")] {
+            let named: Vec<(String, Option<String>)> = c
+                .prepare(&format!("SELECT {label}, agent FROM {t} ORDER BY {label}"))
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(named, [("Mine".to_owned(), None), ("Theirs".to_owned(), Some("Claude".to_owned()))], "{t}");
+        }
     }
 
     /// A database from a pre-merge build of the quality branch: v2 with that branch's

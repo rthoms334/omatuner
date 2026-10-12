@@ -223,6 +223,7 @@ impl SpoilerRuleEditor {
             shield: base.as_ref().is_none_or(|r| r.shield),
             enabled: true,
             by_agent: false,
+            agent: Default::default(),
             created_at: base.as_ref().map_or(ctx.now, |r| r.created_at),
         })
     }

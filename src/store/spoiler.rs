@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use super::sql::{Json, atomic, enum_parse, enum_str, or_not_found, to_json};
 use crate::error::{Error, Result};
 use crate::model::{
-    EpgChannelId, ItemRef, ProgrammeId, SEEN_SPAN_S, SeenHow, SeenRow, SpoilerMode, SpoilerRule, SpoilerRuleId, SpoilerRuleKind, Timestamp,
+    AgentName, EpgChannelId, ItemRef, ProgrammeId, SEEN_SPAN_S, SeenHow, SeenRow, SpoilerMode, SpoilerRule, SpoilerRuleId, SpoilerRuleKind, Timestamp,
 };
 
 /// Seen rows are pruned this long after their window closes.
@@ -31,7 +31,8 @@ pub const MAX_TERMS: usize = 20;
 pub const MAX_TERM_CHARS: usize = 60;
 pub const MAX_LABEL_CHARS: usize = 80;
 
-const RULE_COLS: &str = "id, kind, label, terms, series_norm, categories, mode, window_h, until_at, sport_descr, shield, enabled, origin, created_at";
+const RULE_COLS: &str =
+    "id, kind, label, terms, series_norm, categories, mode, window_h, until_at, sport_descr, shield, enabled, origin, created_at, agent";
 
 fn rule_from_row(r: &Row<'_>) -> rusqlite::Result<SpoilerRule> {
     let bad = |what: &str, v: String| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, format!("bad {what} {v:?}").into());
@@ -53,6 +54,7 @@ fn rule_from_row(r: &Row<'_>) -> rusqlite::Result<SpoilerRule> {
         shield: r.get(10)?,
         enabled: r.get(11)?,
         by_agent: origin == "agent",
+        agent: AgentName::from(r.get::<_, Option<String>>(14)?),
         created_at: r.get(13)?,
     })
 }
@@ -118,8 +120,8 @@ pub fn add_rule(conn: &Connection, r: &SpoilerRule, now: Timestamp) -> Result<Sp
         }
         c.prepare_cached(
             "INSERT INTO spoiler_rule(kind, label, terms, series_norm, categories, mode, window_h, until_at, sport_descr, shield,
-                                      enabled, origin, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                                      enabled, origin, created_at, agent)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         )?
         .execute(params![
             enum_str(&r.kind),
@@ -134,7 +136,9 @@ pub fn add_rule(conn: &Connection, r: &SpoilerRule, now: Timestamp) -> Result<Sp
             r.shield,
             r.enabled,
             if r.by_agent { "agent" } else { "user" },
-            now
+            now,
+            // the agent's name only on its own rules; `update_rule` never changes it
+            r.by_agent.then(|| r.agent.stored()).flatten()
         ])?;
         Ok(SpoilerRuleId(c.last_insert_rowid()))
     })
@@ -183,8 +187,16 @@ pub fn remove_rule(conn: &Connection, id: SpoilerRuleId) -> Result<bool> {
 }
 
 /// The series' own row: `guarded = false` is the user's "don't guard" exception (it wins over
-/// the automatic part-way rule), `true` an explicit addition.
-pub fn set_series_guard(conn: &Connection, series_norm: &str, label: &str, guarded: bool, by_agent: bool, now: Timestamp) -> Result<SpoilerRuleId> {
+/// the automatic part-way rule), `true` an explicit addition. `agent`: made by that agent, `None`
+/// = by the user.
+pub fn set_series_guard(
+    conn: &Connection,
+    series_norm: &str,
+    label: &str,
+    guarded: bool,
+    agent: Option<&AgentName>,
+    now: Timestamp,
+) -> Result<SpoilerRuleId> {
     add_rule(
         conn,
         &SpoilerRule {
@@ -200,7 +212,8 @@ pub fn set_series_guard(conn: &Connection, series_norm: &str, label: &str, guard
             sport_descr: false,
             shield: false,
             enabled: guarded,
-            by_agent,
+            by_agent: agent.is_some(),
+            agent: agent.cloned().unwrap_or_default(),
             created_at: now,
         },
         now,
@@ -209,7 +222,7 @@ pub fn set_series_guard(conn: &Connection, series_norm: &str, label: &str, guard
 
 // ------------------------------------------------------------------ seen events
 
-const SEEN_COLS: &str = "event_key, first_start, title, series_norm, season, episode, seen_at, how";
+const SEEN_COLS: &str = "event_key, first_start, title, series_norm, season, episode, seen_at, how, agent";
 
 fn seen_from_row(r: &Row<'_>) -> rusqlite::Result<SeenRow> {
     let how: String = r.get(7)?;
@@ -222,6 +235,7 @@ fn seen_from_row(r: &Row<'_>) -> rusqlite::Result<SeenRow> {
         episode: r.get(5)?,
         seen_at: r.get(6)?,
         how: enum_parse(&how).unwrap_or(SeenHow::Marked),
+        agent: AgentName::from(r.get::<_, Option<String>>(8)?),
     })
 }
 
@@ -243,7 +257,7 @@ pub fn mark_seen(conn: &Connection, row: &SeenRow) -> Result<bool> {
         if seen_covering(c, &row.event_key, row.first_start)?.is_some() {
             return Ok(false);
         }
-        c.prepare_cached(&format!("INSERT INTO spoiler_seen({SEEN_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"))?.execute(params![
+        c.prepare_cached(&format!("INSERT INTO spoiler_seen({SEEN_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"))?.execute(params![
             row.event_key,
             row.first_start,
             row.title,
@@ -251,7 +265,8 @@ pub fn mark_seen(conn: &Connection, row: &SeenRow) -> Result<bool> {
             row.season,
             row.episode,
             row.seen_at,
-            enum_str(&row.how)
+            enum_str(&row.how),
+            (row.how == SeenHow::Agent).then(|| row.agent.stored()).flatten()
         ])?;
         Ok(true)
     })

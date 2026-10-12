@@ -26,7 +26,7 @@ pub const WARN_EMPTY: &str = "the guide has nothing for it now or later";
 pub const WARN_GONE: &str = "no longer in the playlist";
 
 /// Preview `changes` at `now`: one row per change, in order (the confirm card, the detail
-/// pane, Claude's `guide_fix propose`). Times are shown times (shifts applied).
+/// pane, an agent's `guide_fix propose`). Times are shown times (shifts applied).
 pub fn preview(conn: &Connection, changes: &[FixChange], now: Timestamp) -> Result<Vec<PreviewRow>> {
     let mut states: Vec<Option<(State, State)>> = Vec::with_capacity(changes.len());
     for ch in changes {

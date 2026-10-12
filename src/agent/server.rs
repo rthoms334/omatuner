@@ -139,7 +139,9 @@ impl AgentService for AgentHandler {
             };
             let started = Instant::now();
             let (policy, reveal) = req.call.guard_opts();
-            let reply = match tokio::time::timeout(HANDLER_BUDGET, inner.clone().dispatch(req.call)).await {
+            // who asked, for "added by Codex" (display only: never a permission)
+            let who = req.agent_name();
+            let reply = match tokio::time::timeout(HANDLER_BUDGET, inner.clone().dispatch(req.call, who)).await {
                 // every result passes the spoiler guard's one choke point (B4)
                 Ok(Ok(mut v)) => {
                     guard::guard_reply(&mut v, &inner.shared.guard(), policy, &reveal);
@@ -186,7 +188,7 @@ pub(super) fn to_value<T: Serialize>(v: &T) -> Out<serde_json::Value> {
 }
 
 impl Inner {
-    async fn dispatch(self: Arc<Self>, call: Call) -> Out<serde_json::Value> {
+    async fn dispatch(self: Arc<Self>, call: Call, who: crate::model::AgentName) -> Out<serde_json::Value> {
         match call {
             Call::GuideSearch(p) => self.query(move |q| query::guide_search(q, &p)).await,
             Call::WhatsOn(p) => self.query(move |q| query::whats_on(q, &p)).await,
@@ -214,9 +216,9 @@ impl Inner {
             Call::Control(c) => self.control(c).await,
             // the batch's tools (`handle` refused them already when their feature is off)
             Call::Queue(p) => super::queue::handle(&self, p).await,
-            Call::Follow(p) => super::follow::handle(&self, p).await,
-            Call::SpoilerGuard(p) => super::spoiler::handle(&self, p).await,
-            Call::GuideFix(p) => super::guide::handle(&self, p).await,
+            Call::Follow(p) => super::follow::handle(&self, p, &who).await,
+            Call::SpoilerGuard(p) => super::spoiler::handle(&self, p, &who).await,
+            Call::GuideFix(p) => super::guide::handle(&self, p, &who).await,
             Call::Multiview(p) => super::multiview::handle(&self, p).await,
             Call::Reminders(p) => super::reminders::handle(&self, p).await,
             Call::SleepTimer(p) => super::reminders::sleep_timer(&self, p).await,

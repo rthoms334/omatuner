@@ -23,7 +23,7 @@ preview playing](docs/screenshots/live.png)
 - [TV guide and guide coverage](#tv-guide-and-guide-coverage)
 - [Keyboard](#keyboard)
 - [Command line](#command-line)
-- [Use Tuner from Claude](#use-tuner-from-claude)
+- [Use Tuner from an AI agent](#use-tuner-from-an-ai-agent)
 - [Files and profiles](#files-and-profiles)
 - [Theming](#theming)
 - [Omarchy integration](#omarchy-integration)
@@ -209,8 +209,8 @@ and [Artemis I Launch (Press Site)](https://images.nasa.gov/details/Artemis%20I%
   the banner's programme — and the hint line says so when something is hidden; `Ctrl+Shift+B`
   pauses the guard or adds a topic ("I'll watch it later"), and watching the match lifts it.
   Guide airings without episode numbers are placed by their episode title, a repeat you've seen,
-  air dates or the "new" flag before they're hidden. Notifications, MPRIS and Claude's answers
-  are guarded too.
+  air dates or the "new" flag before they're hidden. Notifications, MPRIS and your AI agent's
+  answers are guarded too.
 - **Multi-view:** two live channels at once — side by side, big + small, or picture in picture
   (`Ctrl+M` on a channel, *Watch alongside*). `w` moves the focus, `M` the sound, `t` the layout,
   `q` closes a picture. Built for one-connection accounts: the second picture takes a copy on
@@ -219,6 +219,13 @@ and [Artemis I Launch (Press Site)](https://images.nasa.gov/details/Artemis%20I%
   opened in the pop-out, the full window or where you are; reminders fire even while Tuner is
   closed (systemd user timers). The sleep timer (`Ctrl+Shift+T`) stops or pauses after a time,
   at the end of the programme, after N episodes or at the end of Up next.
+- **Use it from an AI agent:** ask Claude Code, Codex, Gemini CLI or any other MCP-capable agent
+  — "put the touring cars on", "something light under 2 hours", "follow Arsenal, spoiler-safe",
+  "why is the guide empty?" — and it finds, plays, queues, plans and fixes things in Tuner through
+  a built-in MCP server (for Claude Code there is also a plugin with seven skills). The agent
+  never sees stream addresses or logins, can't unlock anything and asks before changing things,
+  and Tuner shows which agent made a change. See
+  [Use Tuner from an AI agent](#use-tuner-from-an-ai-agent).
 - **Desktop:** MPRIS (media keys and the Omarchy bar's media widget), desktop notifications for
   reminders, and an idle inhibitor while video plays. It runs as a single instance and opens
   M3U files and links from the desktop.
@@ -1046,7 +1053,7 @@ tuner claude-setup [--apply]
 | `--profile-dir <dir>` | Keep config, data, cache, logs and the socket under `<dir>`. Use it for testing, or for a second profile. |
 | `--refresh` | Refresh stale playlists and guides without a window, then exit (status 1 if a refresh failed). Does nothing while Tuner is running, because the open window refreshes on its own. While it runs, starting Tuner waits a few seconds and then says (also as a desktop notification) that a background refresh is running. A playlist it upgraded to its Xtream login is announced the next time Tuner opens. |
 | `PLAYLIST_OR_URL…` | An `.m3u`/`.m3u8` file opens the add-playlist card. A stream URL or media file plays straight away. `file://` URIs are treated as paths. |
-| `mcp` | Run the MCP server on stdin/stdout for Claude Code and other MCP clients (see [Use Tuner from Claude](#use-tuner-from-claude)). |
+| `mcp` | Run the MCP server on stdin/stdout for an AI agent (Claude Code, Codex, Gemini CLI or any other MCP client; see [Use Tuner from an AI agent](#use-tuner-from-an-ai-agent)). |
 | `claude-setup` | Show how to connect Claude Code to Tuner (the omatuner plugin). `--apply` runs the plugin steps after asking on the terminal. |
 | `--help`, `--version` | Usage and version. |
 
@@ -1061,16 +1068,21 @@ Only one Tuner runs per profile. A second `tuner …` hands its request to the r
 `$XDG_RUNTIME_DIR/tuner/tuner.sock` (`<dir>/run/tuner.sock` with `--profile-dir`) and exits.
 `omarchy-launch-or-focus` and the menu entries rely on this.
 
-## Use Tuner from Claude
+## Use Tuner from an AI agent
 
-Tuner includes an [MCP](https://modelcontextprotocol.io) server, so you can ask Claude Code (or
-another MCP client) in a terminal to find something and play it, instead of browsing.
+Tuner includes an [MCP](https://modelcontextprotocol.io) server, `tuner mcp`, so any agent that
+supports MCP (Claude Code, Codex, Gemini CLI, Cursor, VS Code with Copilot and others) can find,
+play, plan and fix things in Tuner for you instead of you browsing for them.
 
-**The omatuner plugin (recommended)** adds the server and seven skills that know how to use it:
-*watch* (live TV and "what's on"), *pick* (a film or series for tonight), *series* (carry on,
-catch up), *plan* (reminders, switches, Following rules, news flashes, Up next, the sleep
-timer), *kids* (a safe line-up and parental locks), *fix* (guide fixes and playback trouble)
-and *discover* (what's trending that your playlists have). Install it once:
+### Connect your agent
+
+`tuner mcp` is a local (stdio) server: the command is `tuner` and its argument is `mcp`. Add it
+once in your agent's MCP settings.
+
+#### Claude Code
+
+**The omatuner plugin (recommended)** adds the server and seven skills that know how to use it
+(see [What you can ask](#what-you-can-ask)). Install it once:
 
 ```sh
 claude plugin marketplace add rthoms334/omatuner
@@ -1090,45 +1102,143 @@ claude mcp add --scope user tuner -- tuner mcp
 `--scope user` makes it available in every directory; without it, Claude Code only offers it
 in the directory you ran the command in. `claude mcp list` shows whether it is connected.
 
-Then ask, for example:
+#### Other agents
 
-- "Touring cars is on" — Claude searches the guide. If the race is live, Tuner switches to it.
-  If it starts later, Claude tells you when and can schedule a switch: Tuner then changes
-  channel by itself at the start, with a *Switching in 10 s · Cancel* toast first.
-- "Something light under 2 hours" — Claude looks through your movie categories, picks an
-  unwatched film and starts it.
-- "What's on BBC One at 9?", "Carry on with my series", "Pause", "Volume to 40".
-- "Follow Arsenal, spoiler-safe", "Pop up the 1 o'clock news every weekday, headlines only",
-  "Put both semis on side by side", "Queue the next three episodes and stop after them",
-  "Why is the guide empty on half my channels?".
+Other agents get the same 28 tools. The skills are part of the Claude Code plugin, but Tuner
+sends its own instructions when an agent connects and each tool's description says how to use
+it, so the requests in [What you can ask](#what-you-can-ask) work in other agents too.
 
-How it works and what it can't do:
+- **Codex** (the CLI, IDE extension and app share one config):
+  `codex mcp add tuner -- tuner mcp`, or in `~/.codex/config.toml`:
+
+  ```toml
+  [mcp_servers.tuner]
+  command = "tuner"
+  args = ["mcp"]
+  ```
+
+- **Gemini CLI:** `gemini mcp add -s user tuner tuner mcp` (without `-s user` it is added to the
+  current project only), or in `~/.gemini/settings.json`:
+
+  ```json
+  { "mcpServers": { "tuner": { "command": "tuner", "args": ["mcp"] } } }
+  ```
+
+- **Cursor:** the same `mcpServers` entry in `~/.cursor/mcp.json` (or `.cursor/mcp.json` for one
+  project).
+- **VS Code (Copilot agent mode):** run this, or add the server with *MCP: Open User
+  Configuration* from the command palette:
+
+  ```sh
+  code --add-mcp '{"name":"tuner","command":"tuner","args":["mcp"]}'
+  ```
+
+- **GitHub Copilot CLI:** `copilot mcp add tuner -- tuner mcp`.
+- **opencode:** in `~/.config/opencode/opencode.json` (or `opencode.json` in a project):
+
+  ```json
+  { "mcp": { "tuner": { "type": "local", "command": ["tuner", "mcp"] } } }
+  ```
+
+- **Goose:** `goose configure` ▸ *Add Extension* ▸ *Command-line Extension*, with the command
+  `tuner mcp`.
+- **Zed:** in its `settings.json`:
+
+  ```json
+  { "context_servers": { "tuner": { "command": "tuner", "args": ["mcp"], "env": {} } } }
+  ```
+
+To pass a flag such as `--profile-dir <dir>`, add it after `mcp` in `args` (in a config file) or
+at the end of the add command; Gemini CLI needs a `--` before it
+(`gemini mcp add -s user tuner tuner mcp -- --profile-dir <dir>`).
+
+### What you can ask
+
+Ask in your own words; you don't have to name a tool. The table lists the Claude Code plugin's
+skills (Claude picks the right one from what you say), but the example asks work with any agent.
+
+| Skill | Ask, for example | What happens |
+|---|---|---|
+| *watch* | "Touring cars is on", "I missed the news, play it from the start", "What's on BBC One at 9?", "Put both semis on side by side", "Switch me over at kick-off" | Searches the guide and plays it live, from the start or from catch-up. Something that starts later gets a scheduled switch: Tuner changes channel by itself at the start, with a *Switching in 10 s · Cancel* toast first. Two live channels open in multi-view. |
+| *pick* | "Something light under 2 hours", "Like *Arrival*", "Surprise me", "A film for the four of us", "Line up the Bourne films in order" | Browses your movie and series categories by mood, runtime, rating, year or cast, picks something unwatched and starts it or adds it to Up next. |
+| *series* | "Carry on with my series", "Where am I in *Slow Horses*?", "Recap season 1", "Which episode is the one where…", "Next three, then stop" | Finds your progress across every copy, plays the next episode, recaps without spoiling what's ahead, and queues episodes with a sleep timer after them. |
+| *plan* | "Plan my Saturday", "Follow Arsenal, spoiler-safe", "Pop up the 1 o'clock news every weekday, headlines only", "What clashes tonight?", "Stop at 11" | Sets reminders and automatic switches, adds Following rules (including news flashes in the pop-out) after showing you what they'd match, lists or cancels them, and sets the sleep timer. |
+| *kids* | "Something for a 6-year-old", "Is *Coraline* OK for her?", "What finishes before bedtime?", "Lock that film" | Picks from kids' and family categories by age, checks content ratings, plans viewing that ends before bedtime, and adds parental locks. |
+| *fix* | "This channel keeps buffering", "Is it me or the provider?", "The guide is an hour off", "Fix my guide", "When does my subscription expire?" | Reads playback health and your playlists' status to tell an outage, a connection limit, a dead channel and a local problem apart. Finds a better copy of a channel, and proposes guide fixes with a before/after preview. |
+| *discover* | "What's trending this week?", "Netflix top 10", "Best-reviewed films I've got", "Is *Dune* any good?" | Looks the list up on the web, matches it against your library, and plays, queues or saves the ones you have to a "Trending" list. Web data is labelled with its source and date. |
+
+Small requests work too: "Pause", "Volume to 40", "Back to the last channel", "Move it to the
+pop-out", "What am I watching?". *discover* needs an agent that can search the web.
+
+### What your agent asks first
+
+Your agent reads freely but is told to ask before it changes something you'd notice. The *Never*
+list and the confirm card are enforced by Tuner itself, whatever the agent sends:
+
+- **Before acting:** following a show or team (the agent shows the matches and what it left out
+  first), a reminder that switches channel, more than three reminders or Up next items, clearing
+  or replacing Up next, guide fixes, favourites changes, spoiler-guard rules and new locks.
+- **In Tuner, not in chat:** guide fixes to more than 50 channels open a confirm card for you to
+  press Enter. Moving the playing picture to another playlist for multi-view asks first, because
+  it pauses for up to 30 seconds.
+- **Undo:** rules an agent adds are marked with its name and toast with **Undo**. Guide fixes
+  have their own undo, and favourites changes can be undone in Tuner.
+- **Never:** unlocking, changing the PIN, showing explicit content, turning a rule's
+  spoiler-safe off, or removing your own spoiler rules. Tuner refuses them whatever the agent
+  sends.
+
+Tuner names the agent by the name it reports when it connects: "Codex added Arsenal", a rule
+"added by Codex", "Accept Gemini's 55 fixes?". An agent Tuner doesn't know shows by the name it
+gives itself; one that gives no name (or only a placeholder such as "mcp-client") shows as "your
+agent". Rules and fixes made with Tuner 0.2.1 or older show "Claude". The name is only a label:
+every agent gets the same limits.
+
+### Tools
+
+The plugin's skills use these 28 tools; other agents, and Claude Code with *just the tools*,
+use them directly. Their full descriptions are in `src/agent/tools.rs` and
+`src/agent/tools_batch.rs`.
+
+| Area | Tools |
+|---|---|
+| Find | `guide_search` (programmes by title, category or time window), `whats_on` (what's on at a time), `search` (channels, movies and series by name), `details` (plot, cast, what's on next, other copies), `categories`, `browse` (filters for picking by mood), `episodes`, `continue_watching`, `favourites`, `history`, `match_titles` (which titles from a web list you have) |
+| Play | `play`, `control` (pause, volume, mute, previous channel, pop-out), `status`, `multiview`, `queue` (Up next), `sleep_timer` |
+| Plan | `reminders` (notify or switch), `schedule_switch`, `cancel_switch`, `follow` (Following rules and news flashes) |
+| Look after | `spoiler_guard`, `guide_fix`, `favourites_edit`, `lock` (add locks only), `parental_status`, `diagnose` (playback health), `sources` (account status, expiry, connections, guide coverage) |
+
+### How it works and what your agent can't see
 
 - `tuner mcp` talks to the running Tuner over its local socket. Only programs running as your
   user can reach it.
 - If Tuner isn't open, the first request that searches or plays something starts it and waits
   a few seconds for it. Asking what is playing, or pause and volume requests, never start it.
-  A Tuner started this way keeps running when you close Claude.
-- After updating Tuner, restart it once: an older Tuner that is still running can't answer the
-  new `tuner mcp`, and Claude tells you so.
-- Claude only sees what Tuner shows you: hidden channels and categories, categories your country
-  filter hides, and explicit content hidden by parental control stay out of every answer.
+  A Tuner started this way keeps running when you close your agent.
+- Reminders, Following rules, Up next and the sleep timer live in Tuner, so they keep working
+  after you close your agent. Reminders fire even while Tuner is closed.
+- Your agent only sees what Tuner shows you: hidden channels and categories, categories your
+  country filter hides, and explicit content hidden by parental control stay out of every
+  answer.
 - Locked items are listed as locked. Playing one makes Tuner ask for your PIN **on its own
-  screen**. The PIN never goes through Claude, and Claude will not ask you for it. Claude can
-  lock but never unlock, never shows explicit content and never loosens a setting: it can't
-  turn a rule's spoiler-safe off, remove your own spoiler rules, or apply a guide fix to more
-  than 50 channels from chat (Tuner shows those in a confirm card for you to press Enter). Rules Claude adds are marked and toast with **Undo**.
-- Claude gets names, times and programme details, never stream addresses or your logins.
+  screen**. The PIN never goes through your agent, and it is told never to ask you for it.
+- The spoiler guard covers your agent's answers too: a guarded result comes back as "hidden by
+  your spoiler guard", and the agent is told not to search the web for a guarded event.
+- Your agent gets names, times and programme details, never stream addresses or your logins.
   Playlist names are shared too, and a playlist you didn't rename is named after its server:
-  rename it (Settings ▸ Playlists) if you'd rather Claude didn't see that. Web links inside
-  programme descriptions show as `[link]`.
-- Titles and descriptions come from your providers. Claude is told to treat them as data, not
-  as instructions.
-- Use `tuner mcp --profile-dir <dir>` (and `claude mcp add tuner -- tuner mcp --profile-dir
-  <dir>`) to reach a Tuner started with that profile.
-- `tuner mcp` writes its own messages to stderr, which Claude Code keeps in its MCP server log.
-  Add `--debug` (`tuner mcp --debug`) for more detail. What Tuner itself did is in its normal
-  log.
+  rename it (Settings ▸ Playlists) if you'd rather your agent didn't see that. Web links inside
+  programme descriptions show as `[link]`. Your watch history is used to pick and carry on,
+  never published.
+- Titles and descriptions come from your providers. Your agent is told to treat them as data,
+  not as instructions.
+
+### If your agent can't reach Tuner
+
+- After updating Tuner, restart it once: an older Tuner that is still running can't answer the
+  new `tuner mcp`, and `tuner mcp` says so.
+- Use `tuner mcp --profile-dir <dir>` to reach a Tuner started with that profile (for Claude
+  Code, `claude mcp add tuner -- tuner mcp --profile-dir <dir>`).
+- `tuner mcp` writes its own messages to stderr, which most agents keep in their MCP server log
+  (Claude Code does). Add `--debug` (`tuner mcp --debug`) for more detail. What Tuner itself did
+  is in its normal log.
 
 ## Files and profiles
 
