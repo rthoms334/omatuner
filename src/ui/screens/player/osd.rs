@@ -16,8 +16,30 @@ pub(super) enum Control {
     Guide,
     History,
     Info,
+    /// Up next's panel (`u`; DESIGN §32): with Up next on.
+    UpNext,
+    /// Up next's next item (`n`): while Up next has one and multi-view is off.
+    QueueNext,
     Fullscreen,
     PopOut,
+}
+
+/// Which of Up next's OSD buttons the controls row has (DESIGN §32, up-next-design §2.5 Mouse).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) struct QueueButtons {
+    pub(super) panel: bool,
+    pub(super) next: bool,
+}
+
+impl QueueButtons {
+    /// `Up next` with Up next on; `Next` while it has a next item and multi-view is off (Up
+    /// next waits in multi-view).
+    pub(super) fn of(ctx: &UiCtx<'_>) -> Self {
+        if !crate::queue::ENABLED {
+            return Self::default();
+        }
+        Self { panel: true, next: !ctx.multiview.on() && ctx.services.agent.queue().next.is_some() }
+    }
 }
 
 impl Control {
@@ -40,6 +62,8 @@ impl Control {
             Control::Guide => glyphs::GUIDE,
             Control::History => glyphs::HISTORY,
             Control::Info => glyphs::INFO,
+            Control::UpNext => glyphs::UP_NEXT,
+            Control::QueueNext => glyphs::QUEUE_NEXT,
             Control::Fullscreen => glyphs::FULLSCREEN,
             Control::PopOut => glyphs::POP_OUT,
         }
@@ -57,6 +81,8 @@ impl Control {
             Control::Guide => "Guide",
             Control::History => "History",
             Control::Info => "Info",
+            Control::UpNext => "Up next",
+            Control::QueueNext => "Next in Up next",
             Control::Fullscreen => "Fullscreen",
             Control::PopOut => "Pop out",
         }
@@ -68,6 +94,14 @@ impl Control {
             self,
             Control::Prev | Control::PlayPause | Control::Next | Control::SkipBack | Control::SkipForward | Control::Fullscreen | Control::PopOut
         )
+    }
+    /// The hover text of a control that always has one (its key), whether labelled or not.
+    pub(super) fn key_tip(self) -> Option<&'static str> {
+        match self {
+            Control::UpNext => Some("Up next (u)"),
+            Control::QueueNext => Some("Play the next item in Up next (n)"),
+            _ => None,
+        }
     }
 }
 
@@ -150,16 +184,26 @@ pub(super) fn control_text(c: Control, snap: &PlayerSnapshot) -> String {
     match c {
         Control::Audio => snap.tracks.selected_audio().map_or_else(|| "Audio".into(), |a| a.label()),
         Control::Subtitles => snap.tracks.selected_sub().map_or_else(|| "Off".into(), |a| a.label()),
+        Control::QueueNext => "Next".into(),
         other => other.label().into(),
     }
 }
 
 impl PlayerScreen {
     /// The controls focus mode walks: those drawn last frame (a prefix of `controls`).
-    pub(super) fn active_controls(&self, snap: &PlayerSnapshot, narrow: bool, video_only: bool) -> Vec<Control> {
-        let all = Self::controls(snap, narrow, video_only);
+    pub(super) fn active_controls(&self, snap: &PlayerSnapshot, narrow: bool, video_only: bool, queue: QueueButtons) -> Vec<Control> {
+        let all = Self::controls(snap, narrow, video_only, queue);
         let drawn: Vec<Control> = all.iter().copied().filter(|c| self.visible.contains(c)).collect();
         if drawn.is_empty() { all } else { drawn }
+    }
+
+    /// `controls`' index of the control focused last frame: a button that came or went since
+    /// (Up next's `Next`) doesn't move the focus onto its neighbour.
+    pub(super) fn focused_index(&self, controls: &[Control]) -> usize {
+        self.visible
+            .get(self.control)
+            .and_then(|c| controls.iter().position(|x| x == c))
+            .unwrap_or_else(|| self.control.min(controls.len().saturating_sub(1)))
     }
 
     /// Below 700 pt (× rem) the controls row collapses (DESIGN §13.8).
@@ -167,21 +211,27 @@ impl PlayerScreen {
         width < 700.0 * theme.rem()
     }
 
-    /// The controls row; narrow keeps zapping (the only mouse path to it) and play / tracks /
-    /// info. "Pop out" isn't offered in the popped-out window (its strip has the way back).
-    pub(super) fn controls(snap: &PlayerSnapshot, narrow: bool, video_only: bool) -> Vec<Control> {
+    /// The controls row; narrow keeps zapping (the only mouse path to it), play / tracks /
+    /// info and Up next's `Next`. "Pop out" isn't offered in the popped-out window (its strip
+    /// has the way back). Up next's buttons sit before Info (up-next-design §2.4).
+    pub(super) fn controls(snap: &PlayerSnapshot, narrow: bool, video_only: bool, queue: QueueButtons) -> Vec<Control> {
         use Control as C;
         let live = is_live(snap);
+        let up_next = [queue.panel.then_some(C::UpNext), queue.next.then_some(C::QueueNext)];
         if narrow {
             let mut v = if live { vec![C::Prev, C::PlayPause, C::Next] } else { vec![C::PlayPause] };
-            v.extend([C::Audio, C::Subtitles, C::Info]);
+            v.extend([C::Audio, C::Subtitles]);
+            v.extend(queue.next.then_some(C::QueueNext));
+            v.push(C::Info);
             return v;
         }
         let mut v = if live {
-            vec![C::Prev, C::PlayPause, C::Next, C::Audio, C::Subtitles, C::Channels, C::Guide, C::History, C::Info, C::Fullscreen]
+            vec![C::Prev, C::PlayPause, C::Next, C::Audio, C::Subtitles, C::Channels, C::Guide, C::History]
         } else {
-            vec![C::SkipBack, C::PlayPause, C::SkipForward, C::Audio, C::Subtitles, C::Info, C::Fullscreen]
+            vec![C::SkipBack, C::PlayPause, C::SkipForward, C::Audio, C::Subtitles]
         };
+        v.extend(up_next.into_iter().flatten());
+        v.extend([C::Info, C::Fullscreen]);
         if !video_only {
             v.push(C::PopOut);
         }
@@ -295,6 +345,13 @@ impl PlayerScreen {
             Control::Guide => self.open_panel(ctx, PanelKind::MiniGuide),
             Control::History => self.open_panel(ctx, PanelKind::History),
             Control::Info => self.toggle_info(ctx),
+            // the keys' own paths: a card showing takes them first, `n` flashes when it can't act
+            Control::UpNext => {
+                self.queue_action(ctx, Action::QueuePanel);
+            }
+            Control::QueueNext => {
+                self.queue_action(ctx, Action::QueueNext);
+            }
             Control::Fullscreen => self.toggle_fullscreen = true,
             Control::PopOut => ctx.navigate(NavRequest::TogglePopOut),
         }
@@ -308,8 +365,11 @@ impl PlayerScreen {
             return None;
         }
         let snap = ctx.player.clone();
-        let controls = self.active_controls(&snap, narrow, ctx.video_only);
+        let controls = self.active_controls(&snap, narrow, ctx.video_only, QueueButtons::of(ctx));
         let n = controls.len();
+        self.control = self.focused_index(&controls);
+        // the index below is into this list from now on
+        self.visible.clone_from(&controls);
         let seekable = !is_live(&snap) && snap.seekable;
         match action {
             Action::LeaveOsdControls | Action::Back => self.osd_focus = false,
@@ -447,7 +507,7 @@ impl PlayerScreen {
 
         // ---- bottom bar
         let nn = ch.as_ref().filter(|_| live).and_then(|c| live::now_next_of(ctx, c));
-        let controls = Self::controls(snap, narrow, ctx.video_only);
+        let controls = Self::controls(snap, narrow, ctx.video_only, QueueButtons::of(ctx));
         let ctrl_h = (theme.space(SpaceToken::ControlHeight) * s * 1.2).round();
         let line = body_font.size * 1.4;
         let lines = 3.0;
@@ -607,6 +667,7 @@ impl PlayerScreen {
             controls.iter().map(|c| p.layout_no_wrap(text_of(*c, glyphs_only), small_font.clone(), t.osd_text).size().x + pad * 1.5).sum()
         };
         let glyphs_only = narrow || row_width(false) > controls_right - inner.left();
+        self.control = self.focused_index(&controls);
         let mut drawn = Vec::with_capacity(controls.len());
         for (i, c) in controls.iter().enumerate() {
             let text = text_of(*c, glyphs_only);
@@ -617,7 +678,10 @@ impl PlayerScreen {
             }
             drawn.push(*c);
             let focused = self.osd_focus && self.row == OsdRow::Buttons && i == self.control.min(controls.len() - 1);
-            let tip = (glyphs_only || c.glyph_only()).then(|| control_text(*c, snap));
+            let tip = match c.key_tip() {
+                Some(k) => Some(k.to_owned()),
+                None => (glyphs_only || c.glyph_only()).then(|| control_text(*c, snap)),
+            };
             let resp = osd_button(ui, &p, theme, r, ui.id().with(("osd-control", i)), &text, small_font.clone(), c.label(), tip.as_deref(), focused);
             if resp.clicked() {
                 clicked = Some((i, *c));

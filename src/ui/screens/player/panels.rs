@@ -106,7 +106,7 @@ impl PlayerScreen {
             Out::Play { id, .. } => {
                 let s = crate::queue::ui::snapshot(ctx);
                 if !(s.driving && s.current == Some(id)) {
-                    crate::queue::ui::send(ctx, crate::queue::QueueCommand::PlayAt(id));
+                    crate::queue::ui::play_row(ctx, &s, id, false);
                 }
                 self.panel = None;
                 self.show_banner(ctx);

@@ -54,7 +54,14 @@ pub(crate) fn resume_or_play(ctx: &mut UiCtx<'_>, media: MediaRef, item: &ItemRe
     let p = ctx.budget.run(|| crate::store::user::progress(db, item)).and_then(|r| r.ok()).flatten();
     match p {
         Some(p) if resumable(&p, ctx.config.player.resume_min_s) => {
-            ctx.open(OverlayRequest::Resume(ResumeSpec { media, title, position_s: p.position_s, duration_s: p.duration_s, copy: None }));
+            ctx.open(OverlayRequest::Resume(ResumeSpec {
+                media,
+                title,
+                position_s: p.position_s,
+                duration_s: p.duration_s,
+                copy: None,
+                queue: None,
+            }));
         }
         _ => kit::play_media(ctx, media, true, origin),
     }

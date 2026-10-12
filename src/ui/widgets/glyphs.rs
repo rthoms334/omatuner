@@ -91,6 +91,8 @@ pub const MORE: &str = "\u{f01d8}";
 // point its own at a better one: queue = Q-ui, follow = F-C, spoiler = S-ui, multi-view = MV-2,
 // sleep = rui, guide fixes = G-ui).
 pub const UP_NEXT: &str = PLAYLIST;
+/// Up next's next item in the player (nf-md-skip_next_circle): not the next channel's `NEXT`.
+pub const QUEUE_NEXT: &str = "\u{f0661}";
 pub const FOLLOW: &str = REMINDER;
 pub const SPOILER: &str = HIDDEN;
 pub const MULTI_VIEW: &str = MINI_PLAYER;

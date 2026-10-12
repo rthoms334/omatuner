@@ -486,7 +486,11 @@ impl Screen for PlayerScreen {
             Action::FocusOsdControls => {
                 self.osd_focus = true;
                 self.row = OsdRow::Buttons;
-                self.control = self.active_controls(ctx.player, narrow, ctx.video_only).iter().position(|c| *c == Control::PlayPause).unwrap_or(0);
+                self.control = self
+                    .active_controls(ctx.player, narrow, ctx.video_only, osd::QueueButtons::of(ctx))
+                    .iter()
+                    .position(|c| *c == Control::PlayPause)
+                    .unwrap_or(0);
             }
             Action::LeaveOsdControls => self.osd_focus = false,
             Action::StreamInfo => self.toggle_info(ctx),

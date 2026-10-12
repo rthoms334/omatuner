@@ -1311,6 +1311,14 @@ once (`claude mcp list` shows `tuner` connected).
   "Next episode is locked", nothing plays.
 - [ ] **Restart:** quit during an item, start Tuner. **Expect:** nothing plays; Home shows
   "Resume Up next".
+- [ ] **OSD buttons:** play a film with two items in Up next and show the OSD. **Expect:**
+  `Up next` and `Next` before Info (tooltips "u" / "n"); a click on `Up next` opens the panel,
+  `Next` plays the next item; with the controls focus (↓) the arrows reach both and Enter acts.
+  With Up next empty there is no `Next`.
+- [ ] **Resume prompt:** watch 5 minutes of a queued film, stop, `Alt+6`, Enter on it.
+  **Expect:** "Resume from 5:00" / "Start over"; Start over plays it from 0 as Up next's item
+  (the list stays; Shift+Enter opens the player); a row set to "Play from the start" doesn't
+  ask.
 
 ## 24. Following and the news flash
 
@@ -1379,7 +1387,9 @@ Both test accounts allow one stream each (TV and TV 2).
   prompt before anything plays. Relock with a locked channel in A and a free one in B: only A
   stops.
 - [ ] **Claude:** "put both semis side by side". **Expect:** two pictures on different
-  playlists in one go.
+  playlists in one go. With two pictures already on, "now X and Y" replaces both in one go
+  (no "Move picture …?" for a picture that is replaced); if one of them is already on screen
+  it stays and only the other changes.
 - [ ] **CPU:** two HD live channels for 10 minutes. **Expect:** smooth video, fans and battery
   as noted in `docs/design/multiview-spike.md`.
 

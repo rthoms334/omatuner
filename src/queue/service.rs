@@ -284,6 +284,7 @@ impl Engine {
         let plays = matches!(
             cmd,
             QueueCommand::PlayAt(_)
+                | QueueCommand::PlayAtFrom { .. }
                 | QueueCommand::Next
                 | QueueCommand::Prev
                 | QueueCommand::Now
@@ -569,6 +570,76 @@ fn vod_index(conn: &Connection, lib: &Library, item: &ItemRef) -> crate::error::
         _ => None,
     };
     Ok(kind.and_then(|k| lib.vod.index_of(k)))
+}
+
+/// Where "Resume" would start a film or episode row: the latest unfinished progress of the
+/// title across its copies, as [`resolve`] resumes it (the plan's newest progress for a film;
+/// for an episode the same episode's newest progress in any copy). `None` for a slot, a row
+/// that won't play now (concealed, gone, locked while the session is locked: the engine says
+/// why) or no progress. The Up next list's Resume prompt (Enter on a row).
+pub fn resume_point(
+    conn: &Connection,
+    lib: &Library,
+    view: ParentalView,
+    cfg: &Config,
+    row: &QueueEntry,
+    now: Timestamp,
+) -> crate::error::Result<Option<ResumePoint>> {
+    if row.programme.is_some() || conceals(conn, lib, view, &row.item) {
+        return Ok(None);
+    }
+    let order = cfg.interface.copy_order;
+    let unfinished = |position_s: f64, finished: bool| !finished && position_s > 0.0;
+    match row.item.kind {
+        ItemKind::Movie => {
+            let Some(idx) = vod_index(conn, lib, &row.item)? else { return Ok(None) };
+            if title_locked(lib, true, idx, row.any_copy) && !view.unlocked {
+                return Ok(None);
+            }
+            let Some(id) = crate::store::vod::resolve_movie(conn, &row.item)? else { return Ok(None) };
+            let plan = crate::store::copies::plan(conn, &lib.vod, true, idx, view.unlocked, order, now)?;
+            Ok(plan.resume().and_then(|c| c.progress.clone()).filter(|p| unfinished(p.position_s, p.finished)).map(|p| ResumePoint {
+                media: MediaRef::Movie(id),
+                position_s: p.position_s,
+                duration_s: p.duration_s,
+            }))
+        }
+        ItemKind::Episode => {
+            let Some((ep, idx)) = episode_of(conn, lib, &row.item)? else { return Ok(None) };
+            if title_locked(lib, false, idx, row.any_copy) && !view.unlocked {
+                return Ok(None);
+            }
+            let plan = crate::store::copies::plan(conn, &lib.vod, false, idx, view.unlocked, order, now)?;
+            let ids: Vec<SeriesId> = plan
+                .copies
+                .iter()
+                .filter_map(|c| match lib.vod.series.get(c.item as usize)?.kind {
+                    VodKind::Series(id) => Some(id),
+                    VodKind::Movie(_) => None,
+                })
+                .collect();
+            let p = if ids.len() > 1 {
+                crate::store::copies::episode_progress(conn, &ids)?.remove(&(ep.season, ep.episode))
+            } else {
+                crate::store::user::progress(conn, &row.item)?
+            };
+            Ok(p.filter(|p| unfinished(p.position_s, p.finished)).map(|p| ResumePoint {
+                media: MediaRef::Episode(ep.id),
+                position_s: p.position_s,
+                duration_s: p.duration_s,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// [`resume_point`]'s answer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResumePoint {
+    /// The row's own film or episode.
+    pub media: MediaRef,
+    pub position_s: f64,
+    pub duration_s: Option<f64>,
 }
 
 /// An episode ref → the episode and its series' index in the snapshot.

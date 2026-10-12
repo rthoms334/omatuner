@@ -250,12 +250,9 @@ impl TunerApp {
                 };
                 match targets.as_slice() {
                     [one] => self.mv_place(place(0, Aim::Alongside, one)),
-                    [a, b, ..] if self.mv.view.on => {
-                        self.mv_place(place(0, Aim::Tile(A), a));
-                        self.mv_place(place(1, Aim::Tile(B), b));
-                    }
-                    // single view: one plan for both (the focused picture and the other), so
-                    // the second never plans against what the first replaces
+                    // one plan for both (A and B; from single view the focused picture and the
+                    // other), so the second never plans against what the first replaces
+                    [a, b, ..] if self.mv.view.on => self.mv_place_pair(vec![place(0, Aim::Tile(A), a), place(1, Aim::Tile(B), b)]),
                     [a, b, ..] => self.mv_place_pair(vec![place(0, Aim::Focused, a), place(1, Aim::Alongside, b)]),
                     [] => {}
                 }
@@ -469,9 +466,12 @@ impl TunerApp {
         Some(ch)
     }
 
-    /// Two live channels or catch-ups from single view (the agent's `multiview open`): the
-    /// focused picture and the other, planned together on the playlists' limits (nothing is
-    /// kept: both pictures play anew). Both pass the parental gate before either plays.
+    /// Two live channels or catch-ups (the agent's `multiview open`): from single view the
+    /// focused picture and the other, with multi-view on A and B (the layout's places stay),
+    /// planned together on the playlists' limits (nothing is kept: both pictures play anew).
+    /// A picture that already shows one of the two keeps it, and the other one goes in the
+    /// other picture, planned against it: a move of the picture that stays is asked first.
+    /// Both pass the parental gate before either plays.
     pub(super) fn mv_place_pair(&mut self, pair: Vec<PlaceIn>) {
         let channel = |p: &PlaceIn| match &p.media {
             MediaRef::Channel(c) | MediaRef::Catchup { channel: c, .. } => Some(*c),
@@ -483,22 +483,42 @@ impl TunerApp {
         };
         let Some(ch0) = self.mv_gate(id0, &pair) else { return };
         let Some(ch1) = self.mv_gate(id1, &pair) else { return };
-        let focus = self.mv.view.focus;
-        // the focused picture already shows the first: only the second needs a picture
-        if matches!(first.media, MediaRef::Channel(_))
-            && self.mv_snap(focus).is_some_and(|s| crate::ui::screens::live::playing_channel(&s) == Some(id0))
-        {
+        let view = self.mv.view;
+        let focus = view.focus;
+        let shows = |app: &Self, t: TileId, id: ChannelId| app.mv_snap(t).is_some_and(|s| crate::ui::screens::live::playing_channel(&s) == Some(id));
+        if view.on {
+            // a picture already shows one of them (a live channel): it stays, the other one
+            // goes in the other picture
+            let shown = |p: &PlaceIn, id: ChannelId| match p.media {
+                MediaRef::Channel(_) => [A, B].into_iter().find(|t| shows(self, *t, id)),
+                _ => None,
+            };
+            match (shown(first, id0), shown(second, id1)) {
+                // both on screen already: at most the sound moves
+                (Some(t0), Some(t1)) if t0 != t1 => {
+                    if let Some(t) = [(first, t0), (second, t1)].into_iter().find_map(|(p, t)| p.take_sound.then_some(t)) {
+                        self.mv_sound(t);
+                    }
+                    return;
+                }
+                (Some(t), _) => return self.mv_keep_one(first, t, second),
+                (None, Some(t)) => return self.mv_keep_one(second, t, first),
+                (None, None) => {}
+            }
+        } else if matches!(first.media, MediaRef::Channel(_)) && shows(self, focus, id0) {
+            // the focused picture already shows the first: only the second needs a picture
             let p = PlaceIn { aim: Aim::Alongside, ..second.clone() };
             return self.mv_place(p);
         }
         let cfg = self.services().config();
         let unlocked = self.parental.is_unlocked(&cfg.parental);
-        let slots = [focus, focus.other()];
+        // the pictures they go to, and the layout's places
+        let (tiles, slots) = if view.on { ([A, B], view.slots) } else { ([focus, focus.other()], [focus, focus.other()]) };
         let layout = Layout::effective(cfg.player.multiview.layout, self.window_size.x, self.theme.rem(), self.video_only);
         let area = egui::Rect::from_min_size(egui::Pos2::ZERO, self.window_size);
         let ppp = if self.mv.ppp > 0.0 { self.mv.ppp } else { 1.0 };
         let mut wanted = Vec::new();
-        for (p, id, ch, tile) in [(first, id0, &ch0, slots[0]), (second, id1, &ch1, slots[1])] {
+        for (p, id, ch, tile) in [(first, id0, &ch0, tiles[0]), (second, id1, &ch1, tiles[1])] {
             let candidates = match p.media {
                 MediaRef::Channel(_) => self.copies_of(id),
                 _ => vec![self.copy_of(ch)],
@@ -527,11 +547,22 @@ impl TunerApp {
             let req = PlayRequest { media, zap: zap_with(p.zap.as_ref(), id, chosen), origin: p.origin, resume: false, immediate: true };
             cmds.push((t, PlayerCommand::Play(req)));
         }
+        // the sound stays where it is unless one of them takes it
         let (target, take_sound) = match pair.iter().position(|p| p.take_sound) {
-            Some(i) => (slots[i.min(1)], true),
-            None => (slots[1], false),
+            Some(i) => (tiles[i.min(1)], true),
+            None => (tiles[1], false),
         };
         self.mv_send(Sending { target, cmds, mover: None, take_sound, slots, note: None });
+    }
+
+    /// [`Self::mv_place_pair`] with picture `at` already showing `kept`: it stays (with the
+    /// sound when `kept` takes it) and `other` goes in the other picture, planned against the
+    /// one that stays (moving it is asked first, `mv_place`).
+    fn mv_keep_one(&mut self, kept: &PlaceIn, at: TileId, other: &PlaceIn) {
+        if kept.take_sound {
+            self.mv_sound(at);
+        }
+        self.mv_place(PlaceIn { aim: Aim::Tile(at.other()), ..other.clone() });
     }
 
     /// Send a plan, starting picture B first when it doesn't exist yet.
@@ -580,6 +611,22 @@ impl TunerApp {
                 }
             }
             None => {
+                // both pictures play anew (the agent's two): both claims move first, as in
+                // `Tiles::rearrange`, so pictures that trade playlists each wait for the other's
+                // old stream to close instead of being refused, whichever loads first
+                let claims: Vec<(TileId, SourceId)> = s
+                    .cmds
+                    .iter()
+                    .filter_map(|(t, c)| match played_media(c)? {
+                        MediaRef::Channel(ch) | MediaRef::Catchup { channel: ch, .. } => Some((*t, self.lib.live.get(*ch)?.source_id)),
+                        _ => None,
+                    })
+                    .collect();
+                if claims.len() > 1 {
+                    for (t, src) in claims {
+                        self.services().tiles.budget().claim(t, Some(src));
+                    }
+                }
                 for (t, c) in s.cmds {
                     self.send_to(t, c);
                 }
