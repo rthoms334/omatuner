@@ -13,7 +13,8 @@ use tuner::model::{ItemKind, Quality};
 fn demo_profile_builds_a_library_with_stacks() {
     let dir = tempfile::tempdir().unwrap();
     let profile = dir.path().join("profile");
-    let s = demo::build(&profile, None, true).expect("demo profile");
+    let (earth, launch) = (dir.path().join("earth.mp4"), dir.path().join("launch.mp4"));
+    let s = demo::build(&profile, Some(&earth), Some(&launch), true).expect("demo profile");
     let lib = &s.library;
     assert_eq!(s.sources.len(), 3);
     assert_eq!(lib.eligible(ItemKind::Channel).len(), 3);
@@ -72,6 +73,11 @@ fn demo_profile_builds_a_library_with_stacks() {
     // multi-view: one connection per paid playlist
     let limits = tuner::store::sources::account_limits(&c).unwrap();
     assert_eq!(limits.iter().filter(|(_, m)| *m == Some(1)).count(), 2);
+
+    // multi-view's two pictures play different clips: Polar Nature the first, Lumen Docs the second
+    let m3u = std::fs::read_to_string(profile.join("demo/northwind.m3u")).unwrap();
+    let url_after = |name: &str| m3u.lines().skip_while(|l| !l.contains(&format!(",{name}"))).nth(1).unwrap().to_string();
+    assert!(url_after("Polar Nature").ends_with("/earth.mp4") && url_after("Lumen Docs").ends_with("/launch.mp4"));
 
     let refs = std::fs::read_to_string(profile.join("demo/refs.env")).unwrap();
     assert!(refs.contains("NORTHWIND_ID=") && refs.contains("PLAY_DOCS='"), "{refs}");

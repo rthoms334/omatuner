@@ -10,18 +10,24 @@
 # fresh copy of the demo profile in target/screenshots/, with a bundled theme
 # (TUNER_THEME_DIR) instead of your Omarchy theme.
 #
-# Video: the "Sintel" trailer, © copyright Blender Foundation | durian.blender.org,
-# Creative Commons Attribution 3.0 (https://durian.blender.org/sharing/). It is downloaded to
-# target/screenshots/media/ (never committed); 9.5 s of it loop in the demo channels. Without
-# a download the channels play an ffmpeg test pattern instead.
+# Video: NASA footage, public domain (NASA Image and Video Library, images.nasa.gov; NASA
+# media is not copyrighted): "Earth Views from the International Space Station" (HDEV camera)
+# and "Artemis I Launch (Press Site)" (NASA/Sam Lott). Downloaded to target/screenshots/media/
+# (sha256-checked, never committed); 8–9.5 s of each loop in the demo channels: Earth on most,
+# the launch on those in SECOND_CLIP (examples/demo_profile.rs; Lumen Docs among them, so
+# multi-view's two pictures differ). The cuts are silent (a null audio track replaces the
+# soundtrack). Without a download a channel plays an ffmpeg test pattern instead.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 out=docs/screenshots
 work=target/screenshots
 media=$work/media
-clip_url=https://download.blender.org/durian/trailer/sintel_trailer-720p.mp4
-clip_sha256=cb0fe73fc0a7d543459996c0cdab730997e6eac1013d3ede18796f777cb7f273
+nasa=https://images-assets.nasa.gov/video
+earth_url="$nasa/Earth%20Views%20from%20the%20International%20Space%20Station/Earth%20Views%20from%20the%20International%20Space%20Station~medium.mp4"
+earth_sha256=caf71b75b1cd19816c55179384ea41e606d6ecd1088432b1e8e85e566917ce98   # 55 MB, 1280×720
+launch_url="$nasa/Artemis%20I%20Launch%202022%20CU%20tracking%20from%20Press%20Site_compressed/Artemis%20I%20Launch%202022%20CU%20tracking%20from%20Press%20Site_compressed~medium.mp4"
+launch_sha256=a02fd793f0b33ce3ec213d9c77eba9426329412f7cd33428422494258af6bb72  # 100 MB, 1280×720
 dark=$PWD/tests/fixtures/theme/tokyo-night       # Omarchy's default theme
 light=$PWD/tests/fixtures/theme/catppuccin-latte
 big=1600x1000
@@ -35,32 +41,35 @@ done
 
 cargo build --release --bin tuner --example demo_profile
 
-# --- video: 9.5 s of the Sintel trailer (letterbox cropped to 16:9), or a test pattern
+# --- video: a segment of each NASA source (16:9, 1280×720, silent), or a test pattern
 mkdir -p "$media"
-clip=$media/demo-v2.mp4   # bump the name when the cut changes
-if [[ ! -s $clip ]]; then
-  src=$media/sintel_trailer-720p.mp4
+# cut <out> <source name> <url> <sha256> <start s> <length s> <test pattern>
+cut() {
+  local out=$1 src=$media/$2 url=$3 sha=$4 start=$5 len=$6 pattern=$7
+  [[ -s $out ]] && return
   if [[ ! -s $src ]] && command -v curl >/dev/null; then
-    curl -fsSL --max-time 300 -o "$src.part" "$clip_url" && mv "$src.part" "$src" || rm -f "$src.part"
+    curl -fsSL --max-time 600 -o "$src.part" "$url" && mv "$src.part" "$src" || rm -f "$src.part"
   fi
-  if [[ -s $src ]] && echo "$clip_sha256  $src" | sha256sum -c --quiet -; then
-    # 0:22.1–0:32 (sunset flight, no title card) minus the cut to black at 0:28
-    keep='between(t,22.1,27.95)+between(t,28.42,32.05)'
-    ffmpeg -nostdin -v error -y -i "$src" \
-      -vf "select='$keep',setpts=N/FRAME_RATE/TB,crop=968:544:156:88,scale=1280:720,setsar=1" \
-      -af "aselect='$keep',asetpts=N/SR/TB" \
-      -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 96k "$clip"
+  if [[ -s $src ]] && echo "$sha  $src" | sha256sum -c --quiet -; then
+    ffmpeg -nostdin -v error -y -ss "$start" -t "$len" -i "$src" -f lavfi -i anullsrc=r=48000:cl=stereo \
+      -map 0:v:0 -map 1:a -vf "scale=1280:720,setsar=1" -shortest \
+      -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 32k "$out"
   else
-    echo "screenshots.sh: no Sintel trailer ($clip_url); using a test pattern" >&2
-    ffmpeg -nostdin -v error -y -f lavfi -i testsrc2=size=1280x720:rate=25 -f lavfi -i sine=frequency=440 \
-      -t 8 -c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac -shortest "$clip"
+    echo "screenshots.sh: no $2 ($url); using a test pattern" >&2
+    ffmpeg -nostdin -v error -y -f lavfi -i "$pattern=size=1280x720:rate=25" -f lavfi -i sine=frequency=440 \
+      -t 8 -c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac -shortest "$out"
   fi
-fi
+}
+# bump a name when its cut changes
+clip=$media/demo-nasa-earth-v1.mp4    # 0:49.3–0:57.3, swirling clouds over the limb, between cross-fades
+clip2=$media/demo-nasa-launch-v1.mp4  # 0:53–1:02.5, SLS clearing the pad's lightning towers
+cut "$clip" earth-views-iss-medium.mp4 "$earth_url" "$earth_sha256" 49.3 8 testsrc2
+cut "$clip2" artemis-1-launch-medium.mp4 "$launch_url" "$launch_sha256" 53 9.5 smptehdbars
 
 # --- the demo profile (pristine; every shot runs on a copy)
 profile=$work/profile
 rm -rf "$profile" "$work/run"
-target/release/examples/demo_profile "$profile" --media "$clip" --silent
+target/release/examples/demo_profile "$profile" --media "$clip" --media2 "$clip2" --silent
 # NORTHWIND_ID, AURORA_ID, HARBOR_ID, PLAY_DOCS, PLAY_SPORTS, PLAY_NEWS
 # shellcheck disable=SC1091
 source "$profile/demo/refs.env"
