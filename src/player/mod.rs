@@ -29,6 +29,14 @@
 //! `vid=no` (audio continues, no decode cost, no VO stalls) and publishes
 //! `video_suspended = true`; the app sends [`PlayerCommand::ResumeVideo`] as soon as it runs
 //! `logic` again.
+//!
+//! Multi-view (DESIGN §35, MV-1): picture B is a second `Player` ([`Player::start_tile`]) — its
+//! own mpv, event pump ("mpv-events-b"), controller ("player-b"), render clock and liveness
+//! flag — sharing the [`budget::SharedBudget`] with picture A. The whole single-player stack
+//! (state machine, reconnects, stop-before-start, the provider-message trap, logging, the
+//! hidden-window suspension above) runs per picture; each surface stamps only its own clock, so
+//! a picture that isn't placed or rendered suspends on its own. B starts muted
+//! ([`PlayerCommand::SetAudible`]) with smaller demuxer caches (`mpv::create`).
 
 pub mod budget;
 pub mod controller;
@@ -55,7 +63,7 @@ pub use tracks::{AspectMode, StreamInfo, Track, TrackKind, Tracks};
 
 use crate::config::Config;
 use crate::error::Result;
-use crate::model::{ChannelId, HistoryEntry, ItemRef, MediaRef, PlayOrigin, Playable, WatchProgress, ZapList};
+use crate::model::{ChannelId, HistoryEntry, ItemRef, MediaRef, PlayOrigin, Playable, SourceId, TileId, WatchProgress, ZapList};
 use crate::msg::EventBus;
 
 /// Request to play something. Resolution (URL building, DB reads) happens on the controller
@@ -134,6 +142,14 @@ pub enum PlayerCommand {
     SetVolume(f64),
     AdjustVolume(f64),
     ToggleMute,
+    /// The user's mute (moving the sound carries it to the other picture).
+    SetMute(bool),
+    /// Multi-view: this picture has the sound (`false`: mpv muted whatever the user's mute;
+    /// the snapshot keeps the user's mute and volume). Picture B starts without it.
+    SetAudible(bool),
+    /// Multi-view: decode the next loads lighter (`vd-lavc-skiploopfilter=all`) — for the
+    /// small picture, set when it loads (swapping places doesn't reload).
+    SetLightDecode(bool),
     /// `None` = off.
     SetAudioTrack(Option<i64>),
     SetSubtitleTrack(Option<i64>),
@@ -291,6 +307,17 @@ pub struct PlayerSnapshot {
     /// Last position of the current target, kept across reconnects (`position` is cleared by
     /// every load): where "Play from TV 2 at 41:20" starts after a failure mid-film.
     pub last_position: Option<f64>,
+    /// The picture this player is (A in single view).
+    pub tile: TileId,
+    /// This picture has the sound (multi-view; always true in single view). `muted` and
+    /// `volume` are the user's, whatever this says.
+    pub audible: bool,
+    /// The playlist this picture holds in the shared connection budget (play through
+    /// Reconnecting; `None` once stopped, ended or failed for good).
+    pub claim: Option<SourceId>,
+    /// A copy plays in place of this zap-list channel (its playlist was held by the other
+    /// picture): the next zap continues from here.
+    pub zap_anchor: Option<ChannelId>,
 }
 
 impl Default for PlayerSnapshot {
@@ -320,6 +347,10 @@ impl Default for PlayerSnapshot {
             origin: None,
             video_suspended: false,
             last_position: None,
+            tile: TileId::A,
+            audible: true,
+            claim: None,
+            zap_anchor: None,
         }
     }
 }
@@ -346,6 +377,14 @@ pub enum PlayerEvent {
         to: Option<crate::model::SourceId>,
         error: PlayerErrorKind,
     },
+    /// Multi-view: a zap skipped `channel` because its playlist is held by another picture
+    /// (`holder`) and it has no copy on a free playlist — the banner's "BBC One skipped — TV
+    /// is in use by picture A". Once per zap.
+    ZapSkipped {
+        channel: ChannelId,
+        source: SourceId,
+        holder: Option<TileId>,
+    },
 }
 
 /// Resolves `MediaRef`s on the controller thread (owns its own DB reader). Built by
@@ -363,6 +402,16 @@ pub trait MediaResolver: Send {
     /// parental control hides explicit content. A channel that can't be read counts as explicit.
     fn is_explicit(&mut self, _ch: ChannelId) -> bool {
         false
+    }
+    /// The playlist a channel belongs to (multi-view zaps check the shared budget before
+    /// resolving; `None` = unknown, just try it).
+    fn channel_source(&mut self, _ch: ChannelId) -> Option<SourceId> {
+        None
+    }
+    /// The channel's copies on other playlists (`store::copies::channel_copies`, B5), in the
+    /// order to try. Default: none.
+    fn channel_copies(&mut self, _ch: ChannelId) -> Vec<crate::store::copies::ChannelCopy> {
+        Vec::new()
     }
 }
 
@@ -418,6 +467,15 @@ pub struct PlayerHandle {
 }
 
 impl PlayerHandle {
+    /// A handle not attached to a player: what it is sent arrives on the receiver, its
+    /// snapshots come from the sender (routers' tests).
+    #[cfg(test)]
+    pub(crate) fn detached(snapshot: PlayerSnapshot) -> (Self, crossbeam_channel::Receiver<PlayerCommand>, watch::Sender<Arc<PlayerSnapshot>>) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (snap_tx, snap_rx) = watch::channel(Arc::new(snapshot));
+        (Self { tx, snapshot: snap_rx }, rx, snap_tx)
+    }
+
     pub fn send(&self, cmd: PlayerCommand) {
         let _ = self.tx.send(cmd);
     }
@@ -435,6 +493,8 @@ impl PlayerHandle {
 /// surface was destroyed (render context must be freed before mpv).
 pub struct Player {
     mpv: Option<Arc<Mpv>>,
+    tile: TileId,
+    budget: budget::SharedBudget,
     handle: PlayerHandle,
     render_alive: Arc<AtomicBool>,
     render_clock: RenderClock,
@@ -444,26 +504,46 @@ pub struct Player {
 }
 
 impl Player {
-    /// Create mpv with options from `cfg`, start the event pump and controller threads.
+    /// Create mpv with options from `cfg`, start the event pump and controller threads: the
+    /// single-view player (picture A with a budget of its own).
     pub fn start(cfg: &Config, deps: PlayerDeps) -> Result<Self> {
-        let mpv = Arc::new(mpv::create(cfg)?);
-        let version = |p: &str| mpv.get_property::<String>(p).unwrap_or_else(|_| "?".into());
-        tracing::info!("Tuner {}, {}, FFmpeg {}", env!("CARGO_PKG_VERSION"), version("mpv-version"), version("ffmpeg-version"));
+        Self::start_tile(cfg, deps, TileId::A, budget::SharedBudget::default())
+    }
+
+    /// Start the player of picture `tile`, sharing `budget` with the other pictures. Picture A
+    /// starts audible; any other starts muted (mpv `mute=yes` from creation, so it is never
+    /// heard before the app gives it the sound) with smaller caches. mpv init takes 30–80 ms:
+    /// call it off the UI thread for a picture started while the app runs.
+    pub fn start_tile(cfg: &Config, deps: PlayerDeps, tile: TileId, budget: budget::SharedBudget) -> Result<Self> {
+        let audible = tile == TileId::A;
+        let mpv = Arc::new(mpv::create(cfg, tile)?);
+        if tile == TileId::A {
+            let version = |p: &str| mpv.get_property::<String>(p).unwrap_or_else(|_| "?".into());
+            tracing::info!("Tuner {}, {}, FFmpeg {}", env!("CARGO_PKG_VERSION"), version("mpv-version"), version("ffmpeg-version"));
+        } else {
+            tracing::info!("player {tile}: started");
+        }
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
         let (evt_tx, evt_rx) = crossbeam_channel::unbounded();
         let (snap_tx, snap_rx) = watch::channel(Arc::new(PlayerSnapshot {
             volume: cfg.player.volume,
             muted: cfg.player.muted,
             sub_scale: cfg.player.sub_scale,
+            tile,
+            audible,
             ..Default::default()
         }));
-        let pump = events::EventPump::start(mpv.clone(), evt_tx).map_err(crate::error::Error::other)?;
+        let pump_name = if tile == TileId::A { "mpv-events".to_owned() } else { format!("mpv-events-{}", tile.letter().to_ascii_lowercase()) };
+        let pump = events::EventPump::start(mpv.clone(), evt_tx, pump_name).map_err(crate::error::Error::other)?;
         let render_clock: RenderClock = Arc::new(AtomicU64::new(0));
         let epoch = Instant::now();
-        let controller =
-            controller::spawn(mpv.clone(), cfg, deps, cmd_rx, evt_rx, snap_tx, render_clock.clone(), epoch).map_err(crate::error::Error::other)?;
+        let setup = controller::TileSetup { tile, budget: budget.clone(), audible };
+        let controller = controller::spawn(mpv.clone(), cfg, deps, cmd_rx, evt_rx, snap_tx, render_clock.clone(), epoch, setup)
+            .map_err(crate::error::Error::other)?;
         Ok(Self {
             mpv: Some(mpv),
+            tile,
+            budget,
             handle: PlayerHandle { tx: cmd_tx, snapshot: snap_rx },
             render_alive: Arc::new(AtomicBool::new(false)),
             render_clock,
@@ -475,6 +555,16 @@ impl Player {
 
     pub fn handle(&self) -> PlayerHandle {
         self.handle.clone()
+    }
+
+    /// The picture this player is.
+    pub fn tile(&self) -> TileId {
+        self.tile
+    }
+
+    /// The connection budget it shares.
+    pub fn budget(&self) -> &budget::SharedBudget {
+        &self.budget
     }
 
     /// Raw core for `VideoSurface::new` ONLY (see module docs: no other mpv access from the UI).
@@ -497,7 +587,7 @@ impl Player {
         if self.render_alive.load(Ordering::Acquire)
             && let Some(m) = self.mpv.take()
         {
-            tracing::error!("player dropped while the video surface is alive; leaking mpv");
+            tracing::error!("player {}: dropped while the video surface is alive; leaking mpv", self.tile);
             std::mem::forget(m);
         }
     }
@@ -515,6 +605,7 @@ impl Drop for Player {
 mod tests {
     use std::time::Duration;
 
+    use super::tiles::Tiles;
     use super::*;
     use crate::model::{ChannelId, PlayableKind};
     use crate::redact::Secret;
@@ -606,37 +697,260 @@ mod tests {
         assert_eq!(mpv.get_property::<String>("user-agent").unwrap(), "ApplyConfig/1");
     }
 
+    /// Also per picture (multi-view): picture B, still rendered, keeps decoding while A — not
+    /// placed or not rendered — is suspended.
     #[test]
     fn video_is_suspended_while_nothing_renders_and_resumed_on_request() {
         let p = start();
         let mpv = p.mpv.clone().expect("mpv");
         let h = p.handle();
+        let deps = PlayerDeps { bus: EventBus::new(None).0, store: Box::new(NullPlayerStore), resolver: Box::new(Lavfi(Vec::new(), Vec::new())) };
+        let b = Player::start_tile(&headless_config(), deps, TileId::B, p.budget().clone()).expect("picture B");
         play(&p);
-        assert!(
-            wait_until(Duration::from_secs(20), || {
-                let s = h.snapshot();
-                s.state == PlayerState::Playing && s.video_size.is_some()
-            }),
-            "lavfi playback: {:?}",
-            h.snapshot().state
-        );
+        play(&b);
+        for (who, h) in [("A", &h), ("B", &b.handle())] {
+            assert!(
+                wait_until(Duration::from_secs(20), || {
+                    let s = h.snapshot();
+                    s.state == PlayerState::Playing && s.video_size.is_some()
+                }),
+                "lavfi playback {who}: {:?}",
+                h.snapshot().state
+            );
+        }
         // no surface yet (clock 0): never suspended
         std::thread::sleep(Duration::from_millis(2300));
         assert!(!h.snapshot().video_suspended);
 
-        // one frame rendered "now", then nothing (hidden window)
+        // one frame rendered "now", then nothing (hidden window); B keeps rendering
         let core = p.render_core().expect("core");
         core.clock.store(core.epoch.elapsed().as_millis().max(1) as u64, Ordering::Relaxed);
+        let b_core = b.render_core().expect("core B");
+        let rendering = Arc::new(AtomicBool::new(true));
+        let stamper = {
+            let rendering = rendering.clone();
+            std::thread::spawn(move || {
+                while rendering.load(Ordering::Relaxed) {
+                    b_core.clock.store(b_core.epoch.elapsed().as_millis().max(1) as u64, Ordering::Relaxed);
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            })
+        };
         // a quick workspace switch (< 10 s) never suspends: decoding would restart mid-GOP
         std::thread::sleep(Duration::from_secs(8));
         assert!(!h.snapshot().video_suspended, "not after 8 s");
         assert!(wait_until(Duration::from_secs(6), || h.snapshot().video_suspended), "suspended after 10 s");
         assert_eq!(mpv.get_property::<String>("vid").unwrap(), "no");
         assert_eq!(h.snapshot().state, PlayerState::Playing, "audio keeps playing");
+        assert!(!b.handle().snapshot().video_suspended, "the picture still rendered keeps its video");
+        assert_ne!(b.mpv.as_ref().expect("mpv B").get_property::<String>("vid").unwrap(), "no");
+        rendering.store(false, Ordering::Relaxed);
+        stamper.join().unwrap();
 
         h.send(PlayerCommand::ResumeVideo);
         assert!(wait_until(Duration::from_secs(5), || !h.snapshot().video_suspended));
         assert_ne!(mpv.get_property::<String>("vid").unwrap(), "no");
+    }
+
+    /// Two playlists of three channels each (1–3 on playlist 1, 4–6 on playlist 2), all
+    /// playing lavfi's test source; channel 4's copy is channel 2, channel 1's is channel 5.
+    /// Like the user's "TV" and "TV 2" with one connection each.
+    struct TwoPlaylists;
+
+    impl TwoPlaylists {
+        fn source(ch: ChannelId) -> SourceId {
+            SourceId(if ch.0 <= 3 { 1 } else { 2 })
+        }
+    }
+
+    impl MediaResolver for TwoPlaylists {
+        fn resolve(&mut self, media: &MediaRef, _resume: bool) -> std::result::Result<Playable, PlayerError> {
+            use crate::model::{ItemKey, ItemKind};
+            let MediaRef::Channel(ch) = media else { return Err(PlayerError { kind: PlayerErrorKind::Resolve, message: "channels only".into() }) };
+            let source = Self::source(*ch);
+            Ok(Playable {
+                media: media.clone(),
+                kind: PlayableKind::Live,
+                item: Some(ItemRef { source, kind: ItemKind::Channel, key: ItemKey(format!("ch{}", ch.0)) }),
+                source_id: Some(source),
+                title: format!("Channel {}", ch.0),
+                subtitle: None,
+                logo: None,
+                number: None,
+                url: Secret::new("av://lavfi:testsrc2=size=160x90:rate=25".into()),
+                headers: Default::default(),
+                start_at: None,
+                duration_hint: None,
+            })
+        }
+        fn skip_on_zap(&mut self, _ch: ChannelId) -> bool {
+            false
+        }
+        fn is_locked(&mut self, _ch: ChannelId) -> bool {
+            false
+        }
+        fn channel_source(&mut self, ch: ChannelId) -> Option<SourceId> {
+            Some(Self::source(ch))
+        }
+        fn channel_copies(&mut self, ch: ChannelId) -> Vec<crate::store::copies::ChannelCopy> {
+            let copy = |id: i64| crate::store::copies::ChannelCopy {
+                id: ChannelId(id),
+                source: Self::source(ChannelId(id)),
+                quality: None,
+                locked: false,
+                explicit: false,
+            };
+            match ch.0 {
+                4 => vec![copy(2)],
+                1 => vec![copy(5)],
+                _ => Vec::new(),
+            }
+        }
+    }
+
+    /// Pictures A and B on one budget with the two one-connection playlists (B's events on
+    /// `events`).
+    fn two_pictures() -> (Tiles, crossbeam_channel::Receiver<crate::msg::AppEvent>) {
+        let (bus, events) = EventBus::new(None);
+        let deps = |bus: EventBus| PlayerDeps { bus, store: Box::new(NullPlayerStore), resolver: Box::new(TwoPlaylists) };
+        let a = Player::start(&headless_config(), deps(EventBus::new(None).0)).expect("picture A");
+        a.budget().set_limit(SourceId(1), Some(1));
+        a.budget().set_limit(SourceId(2), Some(1));
+        let mut tiles = Tiles::single(a);
+        let slot = tiles.begin_b().expect("B starts");
+        assert!(tiles.begin_b().is_none(), "one start at a time");
+        assert_eq!(tiles.adopt_b(), None, "not started yet");
+        slot.fill(Player::start_tile(&headless_config(), deps(bus), TileId::B, tiles.budget().clone()).map_err(|e| e.to_string()));
+        assert_eq!(tiles.adopt_b(), Some(Ok(())));
+        (tiles, events)
+    }
+
+    fn on(h: &PlayerHandle, ch: i64) -> bool {
+        wait_until(Duration::from_secs(20), || {
+            let s = h.snapshot();
+            s.state == PlayerState::Playing && s.playable.as_ref().is_some_and(|p| p.media == MediaRef::Channel(ChannelId(ch)))
+        })
+    }
+
+    fn channel(ch: i64, zap: Option<&[i64]>) -> PlayRequest {
+        PlayRequest {
+            media: MediaRef::Channel(ChannelId(ch)),
+            zap: zap.map(|z| ZapList { collection: crate::model::Collection::AllChannels, channels: z.iter().map(|c| ChannelId(*c)).collect() }),
+            origin: PlayOrigin::MultiView,
+            resume: false,
+            immediate: true,
+        }
+    }
+
+    fn tile_events(events: &crossbeam_channel::Receiver<crate::msg::AppEvent>) -> Vec<PlayerEvent> {
+        events
+            .try_iter()
+            .filter_map(|e| match e {
+                crate::msg::AppEvent::Tile(tiles::TileEvent::Player(TileId::B, ev)) => Some(ev),
+                crate::msg::AppEvent::Player(ev) => panic!("picture B's event reached single view: {ev:?}"),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The user's setup (DESIGN §35 §4.4): picture A plays from TV; picture B asked for a TV
+    /// channel can't open a second TV stream and plays its TV 2 copy instead, saying so. A is
+    /// untouched, and B's events never reach single-view code. A channel only TV has is refused
+    /// — until the user agrees to move A to its TV 2 copy, after which both play.
+    #[test]
+    fn a_second_picture_on_a_busy_playlist_plays_the_copy_elsewhere() {
+        let (tiles, events) = two_pictures();
+        let (a, b) = (tiles.handle(TileId::A), tiles.handle(TileId::B));
+        a.send(PlayerCommand::Play(channel(1, None)));
+        assert!(on(&a, 1));
+        let generation = a.snapshot().load_generation;
+        assert_eq!(a.snapshot().claim, Some(SourceId(1)));
+
+        b.send(PlayerCommand::PlayCopy(CopyPlay {
+            req: channel(3, None),
+            fallback: Some(MediaRef::Channel(ChannelId(5))),
+            elsewhere: None,
+            start_at: None,
+        }));
+        assert!(on(&b, 5), "B on the copy: {:?}", b.snapshot().state);
+        assert_eq!(b.snapshot().claim, Some(SourceId(2)));
+        let fell = tile_events(&events).into_iter().find_map(|e| match e {
+            PlayerEvent::FellBack { from, to, error, .. } => Some((from, to, error)),
+            _ => None,
+        });
+        assert_eq!(fell, Some((Some(SourceId(1)), Some(SourceId(2)), PlayerErrorKind::Budget)));
+        let s = a.snapshot();
+        assert_eq!((s.state.clone(), s.load_generation, s.claim), (PlayerState::Playing, generation, Some(SourceId(1))), "A untouched");
+
+        // without a copy the refusal is B's error, never A's stream
+        b.send(PlayerCommand::Play(channel(2, None)));
+        assert!(wait_until(Duration::from_secs(10), || matches!(&b.snapshot().state, PlayerState::Error(e) if e.kind == PlayerErrorKind::Budget)));
+        assert_eq!(b.snapshot().claim, None, "a final error lets the playlist go");
+        assert_eq!(a.snapshot().load_generation, generation);
+        assert_eq!(tiles.budget().usage().iter().map(|u| u.in_use).sum::<u32>(), 1);
+
+        // "Move picture A to its TV 2 copy so B can use TV?" — Enter
+        tiles.rearrange(TileId::A, SourceId(2), PlayerCommand::ZapTo(ChannelId(5)), TileId::B, PlayerCommand::Play(channel(2, None)));
+        assert!(on(&a, 5) && on(&b, 2), "both play: A {:?}, B {:?}", a.snapshot().state, b.snapshot().state);
+        assert_eq!((a.snapshot().claim, b.snapshot().claim), (Some(SourceId(2)), Some(SourceId(1))));
+        let usage = tiles.budget().usage();
+        assert!(usage.iter().all(|u| u.in_use == 1 && u.limit == Some(1)), "never two streams on one playlist: {usage:?}");
+    }
+
+    /// Zapping picture B onto a channel whose playlist A holds plays its copy on the free
+    /// playlist and keeps the zap-list position; a channel without a copy is skipped, once
+    /// announced ("BBC One skipped — TV is in use by picture A").
+    #[test]
+    fn zapping_a_picture_past_the_other_pictures_playlist() {
+        let (tiles, events) = two_pictures();
+        let (a, b) = (tiles.handle(TileId::A), tiles.handle(TileId::B));
+        a.send(PlayerCommand::Play(channel(5, None)));
+        assert!(on(&a, 5));
+        b.send(PlayerCommand::Play(channel(1, Some(&[1, 4, 6]))));
+        assert!(on(&b, 1));
+
+        b.send(PlayerCommand::Zap { forward: true, unlocked: true });
+        assert!(on(&b, 2), "channel 4's copy: {:?}", b.snapshot().playable);
+        assert_eq!(b.snapshot().zap_anchor, Some(ChannelId(4)));
+
+        b.send(PlayerCommand::Zap { forward: true, unlocked: true });
+        assert!(on(&b, 1), "6 skipped (no copy), wrapped to 1: {:?}", b.snapshot().playable);
+        assert_eq!(b.snapshot().zap_anchor, None);
+        let skipped: Vec<_> = tile_events(&events).into_iter().filter(|e| matches!(e, PlayerEvent::ZapSkipped { .. })).collect();
+        assert_eq!(skipped, [PlayerEvent::ZapSkipped { channel: ChannelId(6), source: SourceId(2), holder: Some(TileId::A) }]);
+        assert_eq!(a.snapshot().playable.as_ref().map(|p| p.media.clone()), Some(MediaRef::Channel(ChannelId(5))), "A untouched");
+    }
+
+    /// One listening volume (DESIGN §35 §4.3): B is silent from its creation; moving the sound
+    /// mutes the old picture and gives the new one the listening volume and the user's mute,
+    /// which survives two moves.
+    #[test]
+    fn the_sound_moves_between_pictures_with_the_listening_volume() {
+        let (mut tiles, _events) = two_pictures();
+        let mpv = |t: TileId| tiles.player(t).and_then(|p| p.mpv.clone()).expect("mpv");
+        let (mpv_a, mpv_b) = (mpv(TileId::A), mpv(TileId::B));
+        let muted = |m: &Mpv| m.get_property::<bool>("mute").unwrap();
+        let (a, b) = (tiles.handle(TileId::A), tiles.handle(TileId::B));
+        assert!(muted(&mpv_b) && !b.snapshot().audible && !b.snapshot().muted, "B silent, the user's mute untouched");
+        assert!(!muted(&mpv_a) && a.snapshot().audible);
+
+        a.send(PlayerCommand::SetVolume(70.0));
+        assert!(wait_until(Duration::from_secs(5), || a.snapshot().volume == 70.0));
+        tiles.move_sound(TileId::B);
+        assert_eq!(tiles.audible(), TileId::B);
+        assert!(wait_until(Duration::from_secs(5), || b.snapshot().audible && b.snapshot().volume == 70.0));
+        assert!(wait_until(Duration::from_secs(5), || muted(&mpv_a) && !muted(&mpv_b)));
+        assert!(!a.snapshot().audible && !a.snapshot().muted);
+
+        // the user mutes, then the sound moves twice: still muted, wherever it is
+        tiles.audible_handle().send(PlayerCommand::ToggleMute);
+        assert!(wait_until(Duration::from_secs(5), || b.snapshot().muted && muted(&mpv_b)));
+        tiles.move_sound(TileId::A);
+        assert!(wait_until(Duration::from_secs(5), || a.snapshot().audible && a.snapshot().muted && muted(&mpv_a) && muted(&mpv_b)));
+        tiles.move_sound(TileId::B);
+        assert!(wait_until(Duration::from_secs(5), || b.snapshot().audible && b.snapshot().muted && muted(&mpv_b)));
+        tiles.audible_handle().send(PlayerCommand::ToggleMute);
+        assert!(wait_until(Duration::from_secs(5), || !b.snapshot().muted && !muted(&mpv_b) && muted(&mpv_a)));
     }
 
     /// Audit fix: MPRIS Next/Previous (which can't ask for the PIN) and a Backspace recall after
@@ -802,6 +1116,140 @@ mod tests {
         h.send(PlayerCommand::ApplyConfig(Box::new(none)));
         h.send(PlayerCommand::Zap { forward: true, unlocked: false });
         assert!(playing(2));
+    }
+
+    /// The MV-1 measurement spike (DESIGN §35 §4.6, `docs/design/multiview-spike.md`): CPU and
+    /// memory of one and two 4K HEVC pictures decoded in software, with and without
+    /// `light_decode_small`, and with both pictures' video suspended (hidden workspace).
+    /// `TUNER_SPIKE_MEDIA=<a 4K HEVC file> cargo test --release --lib spike_ -- --ignored
+    /// --nocapture`. Whole-process CPU from `/proc/self/stat`, so run it on a quiet machine.
+    #[test]
+    #[ignore = "measurement spike: needs TUNER_SPIKE_MEDIA (a 4K HEVC file)"]
+    fn spike_two_uhd_hevc_decodes() {
+        let Some(media) = std::env::var_os("TUNER_SPIKE_MEDIA") else {
+            eprintln!("skipped: set TUNER_SPIKE_MEDIA");
+            return;
+        };
+        let secs: u64 = std::env::var("TUNER_SPIKE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+        struct File(String);
+        impl MediaResolver for File {
+            fn resolve(&mut self, media: &MediaRef, _resume: bool) -> std::result::Result<Playable, PlayerError> {
+                Ok(Playable {
+                    media: media.clone(),
+                    kind: PlayableKind::Movie,
+                    item: None,
+                    source_id: None,
+                    title: "spike".into(),
+                    subtitle: None,
+                    logo: None,
+                    number: None,
+                    url: Secret::new(self.0.clone()),
+                    headers: Default::default(),
+                    start_at: None,
+                    duration_hint: None,
+                })
+            }
+            fn skip_on_zap(&mut self, _ch: ChannelId) -> bool {
+                false
+            }
+            fn is_locked(&mut self, _ch: ChannelId) -> bool {
+                false
+            }
+        }
+        let mut cfg = headless_config();
+        cfg.player.hwdec = "no".into();
+        cfg.player.mpv_options.insert("loop-file".into(), "inf".into());
+        let path = media.to_string_lossy().into_owned();
+        let deps = || PlayerDeps { bus: EventBus::new(None).0, store: Box::new(NullPlayerStore), resolver: Box::new(File(path.clone())) };
+        let cpu_s = || {
+            let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+            let f: Vec<&str> = stat[stat.rfind(')').unwrap() + 2..].split_whitespace().collect();
+            (f[11].parse::<f64>().unwrap() + f[12].parse::<f64>().unwrap()) / 100.0
+        };
+        let status = |field: &str| {
+            let s = std::fs::read_to_string("/proc/self/status").unwrap();
+            s.lines().find_map(|l| l.strip_prefix(field)).and_then(|v| v.split_whitespace().next()).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0)
+                >> 10
+        };
+        let mem = |what: &str| eprintln!("MEM {what}: VmRSS {} MiB, RssAnon {} MiB", status("VmRSS:"), status("RssAnon:"));
+        let drops = |p: &Player| {
+            let m = p.mpv.as_ref().unwrap();
+            (m.get_property::<i64>("decoder-frame-drop-count").unwrap_or(0), m.get_property::<i64>("frame-drop-count").unwrap_or(0))
+        };
+        let measure = |what: &str, players: &[&Player]| {
+            std::thread::sleep(Duration::from_secs(3)); // settle
+            let d0: Vec<_> = players.iter().map(|p| drops(p)).collect();
+            let (c0, t0) = (cpu_s(), Instant::now());
+            std::thread::sleep(Duration::from_secs(secs));
+            let cores = (cpu_s() - c0) / t0.elapsed().as_secs_f64();
+            let d: Vec<_> = players.iter().zip(d0).map(|(p, (a, b))| (drops(p).0 - a, drops(p).1 - b)).collect();
+            let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+            eprintln!("CPU {what}: {cores:.2} cores; drops (decoder, vo) per picture {d:?}; loadavg {}", load.trim());
+            cores
+        };
+        // (re)load the file; returns the load generation to wait past
+        let play_file = |p: &Player| {
+            let generation = p.handle().snapshot().load_generation;
+            p.handle().send(PlayerCommand::Play(PlayRequest {
+                media: MediaRef::Url("spike".into()),
+                zap: None,
+                origin: PlayOrigin::Cli,
+                resume: false,
+                immediate: true,
+            }));
+            generation
+        };
+        let playing = |p: &Player, after: u64| {
+            wait_until(Duration::from_secs(30), || {
+                let s = p.handle().snapshot();
+                s.state == PlayerState::Playing && s.load_generation > after
+            })
+        };
+
+        mem("A idle");
+        let a = Player::start(&cfg, deps()).expect("A");
+        let g = play_file(&a);
+        assert!(playing(&a, g));
+        let one = measure("one picture", &[&a]);
+        mem("A playing");
+        let b = Player::start_tile(&cfg, deps(), TileId::B, a.budget().clone()).expect("B");
+        std::thread::sleep(Duration::from_secs(2));
+        mem("A playing, B started idle");
+        let g = play_file(&b);
+        assert!(playing(&b, g));
+        let two = measure("two pictures", &[&a, &b]);
+        mem("A and B playing");
+        b.handle().send(PlayerCommand::SetLightDecode(true));
+        let g = play_file(&b);
+        assert!(playing(&b, g));
+        let skip = |p: &Player| p.mpv.as_ref().unwrap().get_property::<String>("vd-lavc-skiploopfilter").unwrap_or_default();
+        assert_eq!((skip(&a), skip(&b)), ("default".into(), "all".into()), "the per-file option reached B only");
+        let two_light = measure("two pictures, B light", &[&a, &b]);
+        b.handle().send(PlayerCommand::Stop);
+        std::thread::sleep(Duration::from_secs(3));
+        mem("B stopped");
+        crate::platform::memory::trim();
+        mem("B stopped, trimmed");
+        a.handle().send(PlayerCommand::SetLightDecode(true));
+        let g = play_file(&a);
+        assert!(playing(&a, g));
+        let one_light = measure("one picture, light", &[&a]);
+        a.handle().send(PlayerCommand::SetLightDecode(false));
+        let (ga, gb) = (play_file(&a), play_file(&b));
+        assert!(playing(&a, ga) && playing(&b, gb));
+        // hidden workspace: one frame "rendered", then none; both suspend after 10 s
+        for p in [&a, &b] {
+            let core = p.render_core().unwrap();
+            core.clock.store(core.epoch.elapsed().as_millis().max(1) as u64, Ordering::Relaxed);
+        }
+        assert!(wait_until(Duration::from_secs(20), || a.handle().snapshot().video_suspended && b.handle().snapshot().video_suspended));
+        let hidden = measure("two pictures, video suspended (hidden)", &[&a, &b]);
+        crate::platform::memory::trim();
+        mem("both suspended, trimmed");
+        eprintln!(
+            "SUMMARY one {one:.2} · two {two:.2} · two with B light {two_light:.2} · one light {one_light:.2} · light saves {:.0} % of a decode · hidden {hidden:.2}",
+            (one - one_light) / one * 100.0
+        );
     }
 
     #[test]

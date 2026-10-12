@@ -21,6 +21,12 @@
 //! * Until a screen places the video, frames are rendered into a 640×360 sink so the VO never
 //!   waits (CLI `--play`, MPRIS, Compact without mini-player). `mpv_render_context_update`
 //!   alone does NOT consume frames.
+//! * Multi-view (DESIGN §35): one surface per picture, each with its own render context on
+//!   the ONE GL context (mpv allows one render context per mpv handle). Picture B's surface is
+//!   made after startup, in `App::logic` with GL current, from a [`SurfaceFactory`] saved from
+//!   the `CreationContext`. `render` restores the GL state egui needs after each surface, each
+//!   surface renders only when its own update callback flagged a frame, and each stamps only
+//!   its own picture's `RenderClock` (a picture that isn't rendered suspends on its own).
 
 use std::ffi::{CStr, c_char, c_void};
 use std::sync::Arc;
@@ -237,8 +243,41 @@ impl VideoTarget {
     }
 }
 
-/// The single video "screen": render context + target, drawn wherever the current layout puts
-/// it (Live preview pane, fullscreen player, corner mini-player). One instance per app.
+/// The Wayland display mpv's hwdec interop needs (a raw `wl_display*`, saved from the
+/// `CreationContext`; UI thread only).
+#[derive(Debug, Clone, Copy)]
+pub struct WlDisplay(std::ptr::NonNull<c_void>);
+
+/// What making a video surface needs besides the player's core, saved at startup so picture B's
+/// surface can be made later (GL current, UI thread).
+#[derive(Clone)]
+pub struct SurfaceFactory {
+    gpa: GetProcAddress,
+    wl: Option<WlDisplay>,
+    egui: egui::Context,
+}
+
+impl SurfaceFactory {
+    /// From eframe's creation context (glow backend required).
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Result<Self> {
+        use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
+        let gpa = cc.get_proc_address.clone().ok_or_else(|| Error::Mpv("glow backend required".into()))?;
+        let wl = match cc.display_handle().map(|h| h.as_raw()) {
+            Ok(RawDisplayHandle::Wayland(h)) => Some(WlDisplay(h.display)),
+            _ => None,
+        };
+        Ok(Self { gpa, wl, egui: cc.egui_ctx.clone() })
+    }
+
+    /// A surface for `core` (`Player::render_core`). GL must be current.
+    pub fn make(&self, core: crate::player::RenderCore) -> Result<VideoSurface> {
+        VideoSurface::from_parts(core, self.gpa.clone(), self.wl, self.egui.clone())
+    }
+}
+
+/// A picture's video "screen": render context + target, drawn wherever the current layout puts
+/// it (Live preview pane, fullscreen player, corner mini-player, a multi-view tile). One per
+/// picture.
 pub struct VideoSurface {
     render: Option<MpvGl>,
     core: crate::player::RenderCore,
@@ -259,13 +298,14 @@ impl VideoSurface {
     /// Create the render context. Call from the eframe `CreationContext` callback (GL current)
     /// with `Player::render_core()`.
     pub fn new(core: crate::player::RenderCore, cc: &eframe::CreationContext<'_>) -> Result<Self> {
-        use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
-        let gpa = cc.get_proc_address.clone().ok_or_else(|| Error::Mpv("glow backend required".into()))?;
-        let wl = match cc.display_handle().map(|h| h.as_raw()) {
-            Ok(RawDisplayHandle::Wayland(h)) => Some(h.display.as_ptr()),
-            _ => None,
-        };
-        let render = MpvGl::new(core.handle, gpa, wl, cc.egui_ctx.clone())?;
+        SurfaceFactory::new(cc)?.make(core)
+    }
+
+    /// Create the render context from saved parts (picture B, made after startup in
+    /// `App::logic`). GL must be current; mpv's liveness flag is set so the player never
+    /// destroys mpv before this surface's [`VideoSurface::destroy`].
+    pub fn from_parts(core: crate::player::RenderCore, gpa: GetProcAddress, wl: Option<WlDisplay>, egui_ctx: egui::Context) -> Result<Self> {
+        let render = MpvGl::new(core.handle, gpa, wl.map(|d| d.0.as_ptr()), egui_ctx)?;
         core.alive.store(true, Ordering::Release);
         Ok(Self { render: Some(render), core, target: None, want: (0, 0), has_frame: false, pending_clear: false, renders: 0 })
     }

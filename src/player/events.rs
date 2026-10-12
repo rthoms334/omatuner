@@ -143,8 +143,9 @@ pub struct EventPump {
 }
 
 impl EventPump {
-    /// Observe properties, request warn-level log messages, spawn the thread.
-    pub fn start(mpv: Arc<Mpv>, tx: Sender<MpvEvent>) -> std::io::Result<Self> {
+    /// Observe properties, request warn-level log messages, spawn the thread (`name`:
+    /// "mpv-events", "mpv-events-b" for picture B).
+    pub fn start(mpv: Arc<Mpv>, tx: Sender<MpvEvent>, name: String) -> std::io::Result<Self> {
         let h = mpv.ctx.as_ptr();
         unsafe {
             let lvl = CString::new("warn").unwrap();
@@ -162,7 +163,7 @@ impl EventPump {
         }
         let stop = Arc::new(AtomicBool::new(false));
         let (stop2, mpv2) = (stop.clone(), mpv.clone());
-        let join = std::thread::Builder::new().name("mpv-events".into()).spawn(move || pump(mpv2, tx, stop2))?;
+        let join = std::thread::Builder::new().name(name).spawn(move || pump(mpv2, tx, stop2))?;
         Ok(Self { stop, mpv, join: Some(join) })
     }
 

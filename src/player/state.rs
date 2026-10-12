@@ -338,7 +338,7 @@ impl PlayerMachine {
                 {
                     fx.push(Effect::RecordFailure(t.clone(), err.kind));
                 }
-                if self.fallback_due() {
+                if self.fallback_due(err.kind, now) {
                     self.fallback = false;
                     fx.push(Effect::Fallback(err));
                     return fx;
@@ -539,14 +539,19 @@ impl PlayerMachine {
         fx.push(Effect::Load(t));
     }
 
-    /// An armed VOD target that never showed a frame: its failure plays the other copy.
-    fn fallback_due(&self) -> bool {
-        self.fallback && !self.history_pushed && self.target.as_ref().is_some_and(|t| !t.kind.is_live())
+    /// An armed target that never showed a frame: its failure of `kind` plays the other copy.
+    /// A live channel (multi-view's copy on a free playlist, DESIGN §35) only when its
+    /// playlist refused it — our budget, or a 403 the race window doesn't explain (a close on
+    /// that playlist moments ago: retried as the race instead).
+    fn fallback_due(&self, kind: PlayerErrorKind, now: Instant) -> bool {
+        let refused =
+            kind == PlayerErrorKind::Budget || (kind == PlayerErrorKind::HttpForbidden && !self.race_until.is_some_and(|until| now < until));
+        self.fallback && !self.history_pushed && self.target.as_ref().is_some_and(|t| !t.kind.is_live() || refused)
     }
 
     fn fail(&mut self, kind: PlayerErrorKind, now: Instant, fx: &mut Vec<Effect>) {
         let live = self.target.as_ref().map(|t| t.kind.is_live()).unwrap_or(true);
-        let early = self.fallback_due();
+        let early = self.fallback_due(kind, now);
         // a live channel the user has been watching: keep trying (module docs)
         let sticky = live && self.played && ReconnectPolicy::sticky(kind);
         // a 403 right after a zap on the same source: the provider still counts the old stream
@@ -1683,8 +1688,9 @@ mod tests {
     }
 
     /// After the first frame nothing falls back by itself (the normal reconnect runs, then the
-    /// error card offers the other copy at the last position); live streams never fall back;
-    /// an unarmed VOD keeps its three retries.
+    /// error card offers the other copy at the last position); a live stream falls back only
+    /// when its playlist refused it (multi-view: the copy on a free playlist), and not while
+    /// the race window explains a 403; an unarmed VOD keeps its three retries.
     #[test]
     fn no_fallback_after_the_first_frame_for_live_or_unarmed() {
         let t0 = Instant::now();
@@ -1714,6 +1720,26 @@ mod tests {
         m.handle(Input::Play { target: live(), immediate: true }, t0);
         m.handle(Input::Loaded { entry: Some(1) }, t0);
         assert_eq!(fell_back(&m.handle(Input::Tick, t0 + secs(60))), None);
+
+        // live, refused by the playlist before its first frame: the copy elsewhere
+        let live_armed = || {
+            let mut m = machine();
+            m.arm_fallback(true);
+            m.handle(Input::Play { target: live(), immediate: true }, t0);
+            m
+        };
+        let mut m = live_armed();
+        let fx = m.handle(Input::Fail(PlayerError { kind: PlayerErrorKind::Budget, message: "limit".into() }), t0);
+        assert_eq!(fell_back(&fx), Some(PlayerErrorKind::Budget));
+        // a 403 inside the race window (the other picture left this playlist a moment ago)
+        let mut m = live_armed();
+        m.handle(Input::Loaded { entry: Some(1) }, t0);
+        m.handle(Input::SourceClosed(Some(t0)), t0);
+        m.handle(Input::StartFile { entry: 1 }, t0);
+        m.handle(Input::HttpStatus(403), t0);
+        let fx = m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry: 1 }, t0);
+        assert_eq!(fell_back(&fx), None);
+        assert!(matches!(m.state(), PlayerState::Reconnecting { reason: PlayerErrorKind::HttpForbidden, max: 0, .. }), "{:?}", m.state());
 
         let mut m = machine();
         m.handle(Input::Play { target: vod(), immediate: true }, t0);
