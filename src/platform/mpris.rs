@@ -691,6 +691,8 @@ mod tests {
         let router = TileRouter::new(router.registry.clone(), shared.clone(), Some(queue));
         let mut from_queue = live(None);
         from_queue.origin = Some(PlayOrigin::Queue);
+        assert_eq!(router.queue_step(&from_queue, true), None, "zapped away: Up next doesn't drive");
+        shared.publish_queue(Arc::new(crate::queue::QueueSnapshot { driving: true, ..Default::default() }));
         assert_eq!(router.queue_step(&live(None), true), None, "not the queue's picture");
         assert_eq!(router.queue_step(&from_queue, true), Some(false), "waits while multi-view is on");
         shared.publish_tiles(TilesState::default());

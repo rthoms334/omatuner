@@ -6,11 +6,11 @@ Notes for the wave-4 DESIGN pass (§30, plus the feature sections §31–§35). 
 
 ## Tools
 
-| Tool | Module | Listed when |
+| Tool | Module | Kill switch |
 |---|---|---|
 | 13 pass-1 tools (extended) | `query`, `act`, `server` | always |
-| `match_titles`, `history`, `episodes`, `favourites_edit`, `parental_status`, `lock` | `library` | `LIBRARY_TOOLS` (on) |
-| `diagnose`, `sources` | `health` | `LIBRARY_TOOLS` (on) |
+| `match_titles`, `history`, `episodes`, `favourites_edit`, `parental_status`, `lock` | `library` | always |
+| `diagnose`, `sources` | `health` | always |
 | `reminders`, `sleep_timer` | `reminders` | `reminders::ENABLED` |
 | `queue` | `queue` | `queue::ENABLED` |
 | `follow` (news flash included) | `follow` | `follow::ENABLED` |
@@ -18,8 +18,8 @@ Notes for the wave-4 DESIGN pass (§30, plus the feature sections §31–§35). 
 | `guide_fix` | `guide` | `guide_fix::ENABLED` |
 | `multiview` | `multiview` | `ui::multiview::ENABLED` |
 
-- A tool whose feature is off is not listed and the production handler answers it
-  `unsupported`. `AgentHandler::serve_unlisted()` answers it anyway (tests).
+- Every feature is on, so every tool is listed (28). A tool whose feature's kill switch is
+  turned off answers `unavailable` (RULES.md §11).
 - `AgentHandler::with_tiles(TileRegistry)` lets `control tile` reach picture B; without it the
   handler reaches picture A only.
 

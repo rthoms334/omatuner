@@ -57,7 +57,6 @@ This track builds DESIGN §35 (designs/multiview.md) on MV-1's second player. `u
 | `src/ui/mod.rs` | `UiCtx::multiview`, `play` (routing), `play_in`, `mv_request`, `audible_player`, and `NavRequest::MultiView` |
 | `src/ui/video_host.rs` | Two surfaces, `paint_tile`, per-picture render and painted flags, and the picture-in-picture mini player (`mini_player_with`) |
 | `src/ui/screens/player/{mod,multiview}.rs` | Layout, chrome, strips, keys, mouse and menu |
-| `src/ui/popout.rs` | `strip` hook for rui's countdown strip; the player lays the pictures out below it |
 | `src/ui/screens/live.rs` | Chips, row letters, note, autoplay off, hint |
 | `src/ui/screens/settings/multiview.rs` | The Settings rows |
 
