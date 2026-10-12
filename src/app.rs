@@ -54,7 +54,7 @@ use crate::images::ImageCache;
 use crate::ipc::IpcRequest;
 use crate::jobs::{FailureKind, JobKind, JobOutcome};
 use crate::keymap::{self, Action, KeyContext};
-use crate::model::{ChannelId, Collection, GroupId, ItemKey, ItemKind, ItemRef, MediaRef, PlayOrigin, SourceId, Timestamp, ZapList};
+use crate::model::{ChannelId, Collection, GroupId, ItemKey, ItemKind, ItemRef, MediaRef, OpenIn, PlayOrigin, SourceId, Timestamp, ZapList};
 use crate::msg::{AppEvent, DataScope, Toast, ToastKind};
 use crate::platform::popout::{Place, PopError, PopOutBackend, PopOutEvent, PopRequest};
 use crate::platform::{PickPurpose, PlatformEvent};
@@ -158,6 +158,8 @@ pub struct TunerApp {
     /// Automatic switches called off by their toast's Cancel: a `SwitchNow` already on its way
     /// is ignored (DESIGN §30.8).
     cancelled_switches: std::collections::HashSet<crate::model::ReminderId>,
+    /// Switch countdowns, the sleep timer's warning, a news flash (`reminders::ui`, rui).
+    reminder_ui: crate::reminders::ui::ReminderUi,
     /// Route whose `on_enter` ran last (a new route — even of the same screen — re-enters).
     entered: Option<Route>,
     layout: LayoutClass,
@@ -257,6 +259,7 @@ impl TunerApp {
             pending_locked: None,
             pending_agent: None,
             cancelled_switches: Default::default(),
+            reminder_ui: Default::default(),
             entered: None,
             layout: LayoutClass::Wide,
             epg_updated: None,
@@ -422,8 +425,10 @@ impl TunerApp {
             AppEvent::Ipc(req) => self.handle_ipc(req),
             // the handler raised the window (`hypr::focus_self`) and validated the target
             AppEvent::Agent(crate::agent::AgentCommand::Play(p)) => self.on_agent_play(p.clone()),
-            // the batch features' events (owners: F-C, rui, MV-2) — nothing to do until they land
-            AppEvent::Follow(_) | AppEvent::Reminder(_) | AppEvent::Tile(_) => {}
+            // the reminder engine (B6): countdowns, switches, the sleep timer, news flashes
+            AppEvent::Reminder(e) => self.on_reminder_event(e, egui_ctx),
+            // the batch features' events (owners: F-C, MV-2) — nothing to do until they land
+            AppEvent::Follow(_) | AppEvent::Tile(_) => {}
             AppEvent::Platform(p) => match p {
                 PlatformEvent::Quit => egui_ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 PlatformEvent::Raise => crate::platform::hypr::focus_self(),
@@ -435,9 +440,9 @@ impl TunerApp {
                 PlatformEvent::FilePicked { purpose: PickPurpose::ExportLog, path: Some(path) } => self.export_log(path.clone()),
                 // Other pickers belong to the screen that opened them (`on_event` below).
                 PlatformEvent::FilePicked { .. } | PlatformEvent::ReminderFired(_) => {}
-                PlatformEvent::SwitchSoon { reminder, channel, start } => self.on_switch_soon(*reminder, channel, *start),
-                // the scheduler raised the window
-                PlatformEvent::SwitchNow { reminder, channel } => self.on_switch_now(*reminder, channel),
+                // pass 1 (before `reminders::ENABLED`): the scheduler raised the window
+                PlatformEvent::SwitchSoon { reminder, channel, start } => self.on_switch_soon(*reminder, channel, *start, None, OpenIn::FullWindow),
+                PlatformEvent::SwitchNow { reminder, channel } => self.on_switch_now(*reminder, channel, OpenIn::FullWindow, None, None, egui_ctx),
                 PlatformEvent::PopOut(ev) => self.on_popout_event(ev, egui_ctx),
             },
             // the first copy of a title failed before its first frame (DESIGN §29.15)
@@ -696,10 +701,15 @@ impl TunerApp {
     /// the invoking process (its working directory may differ from ours).
     fn handle_ipc(&mut self, req: &IpcRequest) {
         // a reminder timer fired while Tuner was closed or running (B6): the scheduler re-reads
-        // its reminders and fires the due one (routed by `reminders::fire_policy`); the remind /
-        // rui tracks own this branch and `req.popout` (scheduled playback in the pop-out)
+        // its reminders and fires the due one (routed by `reminders::fire_policy`; a switch
+        // opens where the reminder says, see `on_switch_now`)
         if req.reminder.is_some() {
             self.services().agent.wake_reminders();
+        }
+        // `--play <ref> --popout` (a scheduled launch): the pop-out, never taking focus — on the
+        // first frame the Hyprland worker runs (at startup it doesn't yet)
+        if req.popout && req.play.is_some() {
+            self.reminder_ui.pop_out_pending = true;
         }
         match req.view {
             Some(crate::cli::ViewArg::Search) => self.nav.push(NavRequest::Open(OverlayRequest::Search { initial: String::new() })),
@@ -978,42 +988,344 @@ impl TunerApp {
         self.nav.push(NavRequest::Open(OverlayRequest::Pin { then: Box::new(Action::OpenPlayer), reason: reason.into() }));
     }
 
-    /// An automatic switch is due shortly: "Switching to ‹channel› in 10 s · ‹programme›" with
-    /// Cancel (DESIGN §30.8). Nothing for a channel parental control hides.
-    fn on_switch_soon(&mut self, id: crate::model::ReminderId, channel: &ItemRef, start: Timestamp) {
-        if self.lib.conceals(channel) || self.switch_hidden(channel) {
+    /// An automatic switch is due shortly (DESIGN §30.8, B6): the strip's countdown "Switching
+    /// to ‹channel› in 10 s · ‹programme›" with Cancel (and Open full when it opens in the
+    /// pop-out), drawn in the full window and in the pop-out. Nothing for a channel parental
+    /// control hides. `named`: (channel, guarded title) from the pass-2 event; the pass-1 event
+    /// reads them from the row.
+    fn on_switch_soon(&mut self, id: crate::model::ReminderId, channel: &ItemRef, at: Timestamp, named: Option<(String, String)>, open_in: OpenIn) {
+        if self.lib.conceals(channel) || self.switch_hidden(channel) || self.cancelled_switches.contains(&id) {
             return;
         }
-        let row = crate::store::user::reminder(&self.db, id).ok().flatten();
-        let name = match self.lib.live.by_ref(channel).and_then(|c| self.lib.live.get(c)) {
-            Some(c) => c.name.to_string(),
-            None => row.as_ref().map(|r| r.channel_name.clone()).unwrap_or_else(|| "the channel".to_owned()),
-        };
-        let secs = (start - crate::model::now()).max(1);
-        let mut text = format!("Switching to {name} in {secs} s");
-        if let Some(t) = row.map(|r| r.programme_title).filter(|t| !t.trim().is_empty()) {
-            text.push_str(" · ");
-            text.push_str(t.trim());
-        }
-        let ttl_ms = u32::try_from((secs + 3) * 1000).unwrap_or(u32::MAX);
-        self.toast(Toast { kind: ToastKind::Info, text, action: Some(("Cancel".into(), Action::CancelSwitch(id))), ttl_ms });
+        let (channel_name, title) = named.unwrap_or_else(|| {
+            let row = crate::store::user::reminder(&self.db, id).ok().flatten();
+            let name = match self.lib.live.by_ref(channel).and_then(|c| self.lib.live.get(c)) {
+                Some(c) => c.name.to_string(),
+                None => row.as_ref().map(|r| r.channel_name.clone()).unwrap_or_else(|| "the channel".to_owned()),
+            };
+            let title = row.map(|r| r.programme_title).unwrap_or_default();
+            let title =
+                if title.trim().is_empty() { title } else { self.services().agent.guard().outside_title(&title, crate::model::now()).into_owned() };
+            (name, title)
+        });
+        self.reminder_ui.add_countdown(crate::reminders::ui::Countdown { reminder: id, channel_name, title, at, open_in });
     }
 
-    /// An automatic switch's start: play the channel unless it was cancelled or already plays.
-    fn on_switch_now(&mut self, id: crate::model::ReminderId, channel: &ItemRef) {
+    /// An automatic switch's time: play the channel where "Open in" says
+    /// ([`crate::reminders::ui::placement`]: the pop-out never takes focus) unless it was
+    /// cancelled or already plays. Late with catch-up: from the beginning. A news flash
+    /// remembers what played, to put it back.
+    fn on_switch_now(
+        &mut self,
+        id: crate::model::ReminderId,
+        channel: &ItemRef,
+        open_in: OpenIn,
+        rule: Option<crate::model::FollowRuleId>,
+        late: Option<crate::reminders::Late>,
+        egui_ctx: &egui::Context,
+    ) {
+        use crate::reminders::ui::Placement as Place;
+        self.reminder_ui.drop_countdown(id);
+        let open_full = self.reminder_ui.open_full.remove(&id);
         if self.cancelled_switches.remove(&id) || self.switch_hidden(channel) {
             return;
         }
-        match self.channel_for(channel) {
-            Some(cid) => {
-                let playing =
-                    self.snapshot.state != PlayerState::Idle && self.snapshot.playable.as_ref().is_some_and(|p| p.media == MediaRef::Channel(cid));
-                if !playing {
-                    self.play_channel(cid, PlayOrigin::Reminder);
+        let Some(cid) = self.channel_for(channel) else {
+            self.toast(Toast::info("That channel is no longer in your playlists"));
+            return;
+        };
+        let now_media = self.snapshot.playable.as_ref().filter(|_| self.snapshot.state != PlayerState::Idle).map(|p| p.media.clone());
+        if now_media == Some(MediaRef::Channel(cid)) {
+            return;
+        }
+        let open_in = if open_full { OpenIn::FullWindow } else { open_in };
+        let place = crate::reminders::ui::placement(open_in, self.window_now(egui_ctx));
+        let flash =
+            rule.and_then(|_| crate::store::follow::flash_of(&self.db, id).map_err(|e| tracing::debug!("news flash {id}: {e}")).ok().flatten());
+        let previous = now_media.map(|media| crate::reminders::ui::Previous {
+            media,
+            origin: self.snapshot.origin.unwrap_or(PlayOrigin::Fullscreen),
+            paused: self.snapshot.paused,
+        });
+        let was_on_player = self.view_screen() == ScreenId::Player;
+        self.play_switch(cid, late);
+        if self.pending_locked.as_ref().is_some_and(|(c, _)| *c == cid) {
+            return; // the PIN prompt shows where the window is; nothing moves under it
+        }
+        match place {
+            Place::PopOut => {
+                self.toggle_popout(egui_ctx);
+            }
+            Place::FullWindow => {
+                if self.popout.is_out() || self.video_only {
+                    self.toggle_popout(egui_ctx);
+                }
+                if open_full {
+                    crate::platform::hypr::focus_self();
                 }
             }
-            None => self.toast(Toast::info("That channel is no longer in your playlists")),
+            Place::InPlace => self.drop_player_push(),
         }
+        let Some(f) = flash else { return };
+        let row = crate::store::user::reminder(&self.db, id).ok().flatten();
+        let from = row.as_ref().map_or_else(crate::model::now, crate::reminders::target_at);
+        let stop = row.as_ref().map_or(from + crate::reminders::DEFAULT_DURATION_S, crate::reminders::effective_stop);
+        let ends_at = crate::follow::flash::ends_at(&f.spec, from).map_or(stop, |t| t.min(stop));
+        let muted = f.spec.volume == crate::follow::flash::FlashVolume::Mute && !self.snapshot.muted;
+        if muted {
+            self.send_player(PlayerCommand::SetMute(true));
+        }
+        self.reminder_ui.flash = Some(crate::reminders::ui::FlashRun {
+            reminder: id,
+            name: f.name,
+            channel: cid,
+            ends_at,
+            previous,
+            popped: place == Place::PopOut,
+            was_on_player,
+            muted,
+        });
+        // it closes by itself even while no frame runs (the window hidden): the event wakes
+        // `logic`
+        let bus = self.services().bus.clone();
+        let wait = std::time::Duration::from_secs((ends_at - crate::model::now()).max(0).unsigned_abs());
+        self.services().rt.spawn(async move {
+            tokio::time::sleep(wait).await;
+            bus.send(AppEvent::Reminder(crate::reminders::ReminderEvent::FlashEnded));
+        });
+    }
+
+    /// Play a switch's channel (the PIN rules apply): live, or — a switch that comes late on a
+    /// channel with catch-up that needs no PIN — from the beginning.
+    fn play_switch(&mut self, cid: ChannelId, late: Option<crate::reminders::Late>) {
+        let unlocked = self.parental.is_unlocked(&self.services().config().parental);
+        let open = self.lib.live.get(cid).is_some_and(|c| !c.locked || unlocked);
+        match late {
+            Some(l) if l.catchup && open => {
+                self.pending_zap = None;
+                self.send_player(PlayerCommand::Play(PlayRequest {
+                    media: MediaRef::Catchup { channel: cid, start: l.from, stop: l.stop, catchup_id: None },
+                    zap: None,
+                    origin: PlayOrigin::Reminder,
+                    resume: false,
+                    immediate: true,
+                }));
+                self.nav.push(NavRequest::Push(Route::Player));
+                self.toast(Toast::info(format!("Started {} min ago — playing from the beginning", l.by_s / 60)));
+            }
+            Some(l) => {
+                self.play_channel(cid, PlayOrigin::Reminder);
+                self.toast(Toast::info(format!("Started {} min ago", l.by_s / 60)));
+            }
+            None => self.play_channel(cid, PlayOrigin::Reminder),
+        }
+    }
+
+    /// Undo the Player push a play just queued (scheduled playback "where I am": the screen
+    /// stays, the mini player shows it).
+    fn drop_player_push(&mut self) {
+        if matches!(self.nav.last(), Some(NavRequest::Push(Route::Player))) {
+            self.nav.pop();
+        }
+    }
+
+    /// The window as a switch finds it.
+    fn window_now(&self, egui_ctx: &egui::Context) -> crate::reminders::ui::WindowNow {
+        crate::reminders::ui::WindowNow {
+            focused: egui_ctx.input(|i| i.viewport().focused).unwrap_or(false),
+            watching: self.view_screen() == ScreenId::Player && self.snapshot.state != PlayerState::Idle,
+            popped_out: self.popout.is_out() || self.video_only,
+            can_pop: self.popout_backend.is_some(),
+        }
+    }
+
+    /// A news flash ends (its time, Delete in the pop-out, the strip's End): put back what
+    /// played (unless the user moved on), the window back in, the screen as it was.
+    fn end_flash(&mut self, restore: bool, egui_ctx: &egui::Context) {
+        use crate::reminders::ui::FlashRestore;
+        let Some(f) = self.reminder_ui.flash.take() else { return };
+        if f.muted {
+            self.send_player(PlayerCommand::SetMute(false));
+        }
+        if !restore {
+            return;
+        }
+        let playing = self.snapshot.playable.as_ref().filter(|_| self.snapshot.state != PlayerState::Idle).map(|p| p.media.clone());
+        match f.restore(playing.as_ref()) {
+            FlashRestore::Nothing => return,
+            FlashRestore::Stop => self.send_player(PlayerCommand::Stop),
+            FlashRestore::Play(p) => match p.media {
+                MediaRef::Channel(c) => {
+                    self.play_channel(c, p.origin);
+                    self.drop_player_push();
+                }
+                media => {
+                    self.send_player(PlayerCommand::Play(PlayRequest { media, zap: None, origin: p.origin, resume: true, immediate: true }));
+                    if p.paused {
+                        self.send_player(PlayerCommand::SetPause(true));
+                    }
+                }
+            },
+        }
+        if f.popped && (self.popout.is_out() || self.video_only) {
+            self.toggle_popout(egui_ctx);
+        }
+        if !f.was_on_player && self.current_route() == &Route::Player {
+            self.nav.push(NavRequest::Back);
+        }
+        self.toast(Toast::info("News flash ended"));
+    }
+
+    /// Delete in the pop-out: call off the next switch's countdown, else end the news flash.
+    fn on_end_news_flash(&mut self, egui_ctx: &egui::Context) {
+        if let Some(id) = self.reminder_ui.countdowns.first().map(|c| c.reminder) {
+            self.cancel_switch(id);
+        } else if self.reminder_ui.flash.is_some() {
+            self.end_flash(true, egui_ctx);
+        }
+    }
+
+    /// The reminder engine's events (`reminders::ENABLED`).
+    fn on_reminder_event(&mut self, ev: &crate::reminders::ReminderEvent, egui_ctx: &egui::Context) {
+        use crate::reminders::ReminderEvent as E;
+        match ev {
+            E::SwitchSoon { reminder, channel, channel_name, title, at, open_in, .. } => {
+                self.on_switch_soon(*reminder, channel, *at, Some((channel_name.clone(), title.clone())), *open_in);
+            }
+            // `route`: a tile B route is multi-view's (MV-2); single view plays in the main picture
+            E::SwitchNow { reminder, channel, open_in, rule, late, .. } => self.on_switch_now(*reminder, channel, *open_in, *rule, *late, egui_ctx),
+            // the scheduler showed the note (or nothing): the countdown goes
+            E::NotSwitched { reminder, .. } => {
+                self.reminder_ui.drop_countdown(*reminder);
+            }
+            E::SleepWarn { at } => self.reminder_ui.sleep_warn = Some(*at),
+            E::SleepNow { action } => self.on_sleep_now(*action),
+            // set again, moved or turned off: its warning no longer holds
+            E::SleepChanged(_) => self.reminder_ui.sleep_warn = None,
+            // a flash's own timer (or the engine): only once its time has come
+            E::FlashEnded => {
+                if self.reminder_ui.flash.as_ref().is_some_and(|f| crate::model::now() + 2 >= f.ends_at) {
+                    self.end_flash(true, egui_ctx);
+                }
+            }
+        }
+    }
+
+    /// The sleep timer fired: the engine stopped (or paused) the pictures it started with; every
+    /// picture there is now gets the same (multi-view's second one included).
+    fn on_sleep_now(&mut self, action: crate::reminders::sleep::SleepAction) {
+        use crate::reminders::sleep::SleepAction;
+        let cmd = match action {
+            SleepAction::Stop => PlayerCommand::Stop,
+            SleepAction::Pause => PlayerCommand::SetPause(true),
+        };
+        for h in self.services().tiles.handles() {
+            h.send(cmd.clone());
+        }
+        self.reminder_ui.sleep_warn = None;
+        if let Some(f) = self.reminder_ui.flash.take()
+            && f.muted
+        {
+            self.send_player(PlayerCommand::SetMute(false));
+        }
+        self.toast(Toast::info(match action {
+            SleepAction::Stop => "Sleep timer: playback stopped",
+            SleepAction::Pause => "Sleep timer: paused",
+        }));
+    }
+
+    /// Every frame: a pop-out asked for before the Hyprland worker ran, a flash's end, stale
+    /// countdowns, and the strip (countdowns, the sleep warning, the news flash).
+    fn reminder_frame(&mut self, egui_ctx: &egui::Context, theme: &Theme) {
+        if self.reminder_ui.pop_out_pending && (self.popout_started || self.popout_backend.is_some()) {
+            self.reminder_ui.pop_out_pending = false;
+            if self.popout_backend.is_some() {
+                if !self.popout.is_out() {
+                    self.toggle_popout(egui_ctx);
+                }
+            } else if self.current_route() == &Route::Player {
+                // no Hyprland: the mini player in the normal window
+                self.nav.push(NavRequest::Back);
+            }
+        }
+        let now = crate::model::now();
+        if self.reminder_ui.flash.as_ref().is_some_and(|f| now >= f.ends_at) {
+            self.end_flash(true, egui_ctx);
+        }
+        // a countdown whose switch never came (Tuner asleep through it, the row edited)
+        self.reminder_ui.countdowns.retain(|c| now < c.at + 30);
+        if self.reminder_ui.sleep_warn.is_some_and(|at| now > at + 5) {
+            self.reminder_ui.sleep_warn = None;
+        }
+        if self.reminder_ui.is_empty() {
+            return;
+        }
+        let sleep = self.services().agent.sleep().and_then(|h| h.status()).map(|s| s.action);
+        let h24 = self.services().config().interface.clock_24h;
+        if let Some(a) = self.reminder_ui.draw(egui_ctx, theme, now, self.video_only, h24, sleep) {
+            self.strip_action(a, egui_ctx);
+        }
+    }
+
+    /// A button on the strip.
+    fn strip_action(&mut self, a: crate::reminders::ui::StripAction, egui_ctx: &egui::Context) {
+        use crate::reminders::ui::StripAction as S;
+        match a {
+            S::CancelSwitch(id) => self.cancel_switch(id),
+            // in the full window, now and when it switches
+            S::OpenFull(id) => {
+                self.reminder_ui.open_full.insert(id);
+                if self.popout.is_out() || self.video_only {
+                    self.toggle_popout(egui_ctx);
+                }
+                crate::platform::hypr::focus_self();
+            }
+            S::SleepExtend => {
+                let Some(h) = self.services().agent.sleep() else { return };
+                let now = crate::model::now();
+                let Some(st) = h.status() else { return };
+                let base = st.fires_at.or(self.reminder_ui.sleep_warn).unwrap_or(now).max(now);
+                let warn_s = self.services().config().reminders.sleep_warn_s;
+                let h24 = self.services().config().interface.clock_24h;
+                match h.set(crate::reminders::sleep::SleepWhen::At(base + crate::reminders::ui::EXTEND_S), st.action, warn_s, None) {
+                    Ok(st) => {
+                        self.toast(Toast::info(format!("Sleep timer: {}", crate::reminders::ui::sleep_status_text(&st, now, h24).to_lowercase())))
+                    }
+                    Err(e) => self.toast(Toast::error(e.message())),
+                }
+                self.reminder_ui.sleep_warn = None;
+            }
+            S::SleepOff => {
+                if let Some(h) = self.services().agent.sleep() {
+                    h.cancel();
+                }
+                self.reminder_ui.sleep_warn = None;
+                self.toast(Toast::info("Sleep timer off"));
+            }
+            S::EndFlash => self.end_flash(true, egui_ctx),
+            // keep watching: no longer a flash
+            S::FlashOpenFull => {
+                self.end_flash(false, egui_ctx);
+                if self.popout.is_out() || self.video_only {
+                    self.toggle_popout(egui_ctx);
+                }
+                crate::platform::hypr::focus_self();
+            }
+        }
+    }
+
+    /// The status bar's sleep-timer chip ("Sleep 23:10"; a click opens the menu).
+    fn sleep_chip(&self) -> Option<crate::ui::widgets::status_bar::StatusChip> {
+        if !crate::reminders::ENABLED {
+            return None;
+        }
+        let st = self.services().agent.sleep()?.status()?;
+        Some(crate::ui::widgets::status_bar::StatusChip {
+            text: crate::reminders::ui::sleep_chip(&st, self.services().config().interface.clock_24h),
+            label: "Sleep timer".into(),
+            action: Action::SleepTimer,
+            warning: self.reminder_ui.sleep_warn.is_some(),
+        })
     }
 
     /// A switch to a channel parental control hides right now (checked against the clock and
@@ -1025,27 +1337,24 @@ impl TunerApp {
     }
 
     /// A switch cancelled elsewhere (an MCP client's `cancel_switch`, Settings ▸ Reminders): its
-    /// "Switching to … in N s" toast goes, and a `SwitchNow` already on its way is ignored.
+    /// countdown goes, and a `SwitchNow` already on its way is ignored.
     fn drop_cancelled_switch_toasts(&mut self) {
         let db = &self.db;
-        let mut gone = Vec::new();
-        self.toasts.retain(|t| match &t.action {
-            Some((_, Action::CancelSwitch(id))) => {
-                // removed = cancelled (a fired switch keeps its row, `Fired`, and its toast)
-                let removed = matches!(crate::store::user::reminder(db, *id), Ok(None));
-                if removed {
-                    gone.push(*id);
-                }
-                !removed
-            }
-            _ => true,
-        });
+        // removed = cancelled (a fired switch keeps its row, `Fired`)
+        let removed = |id: crate::model::ReminderId| matches!(crate::store::user::reminder(db, id), Ok(None));
+        let gone: Vec<_> = self.reminder_ui.countdowns.iter().map(|c| c.reminder).filter(|id| removed(*id)).collect();
+        for id in &gone {
+            self.reminder_ui.drop_countdown(*id);
+        }
         self.cancelled_switches.extend(gone);
     }
 
-    /// The Cancel of a switch's toast: the row goes, a `SwitchNow` on its way is ignored.
+    /// The countdown's Cancel (or Delete in the pop-out): the row goes, a `SwitchNow` on its
+    /// way is ignored.
     fn cancel_switch(&mut self, id: crate::model::ReminderId) {
         self.cancelled_switches.insert(id);
+        self.reminder_ui.drop_countdown(id);
+        self.reminder_ui.open_full.remove(&id);
         let _ = self.services().store.writer().submit_notify(DataScope::Reminders, move |c| match crate::store::user::reminder(c, id)? {
             Some(r) if r.switches() => crate::store::user::remove_reminder(c, id, crate::model::RemoveWhy::User),
             _ => Ok(()),
@@ -1092,9 +1401,7 @@ impl TunerApp {
             Action::GoQueue if crate::queue::ENABLED => self.nav.push(NavRequest::Switch(Route::Queue)),
             Action::SpoilerMenu if crate::spoiler::ENABLED => self.nav.push(NavRequest::Open(OverlayRequest::SpoilerMenu)),
             Action::SleepTimer if crate::reminders::ENABLED => self.nav.push(NavRequest::Open(OverlayRequest::SleepTimer)),
-            Action::EndNewsFlash => {
-                crate::reminders::ui::end_news_flash(self.services());
-            }
+            Action::EndNewsFlash => self.on_end_news_flash(egui_ctx),
             Action::Quit => egui_ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             // the popped-out player: back to the full window, fullscreen
             Action::ToggleWindowFullscreen if self.video_only => {
@@ -1737,7 +2044,8 @@ impl eframe::App for TunerApp {
             let mini_hidden = self.layout == LayoutClass::Compact || !cfg.interface.mini_player;
             let now_playing =
                 (mini_hidden && self.snapshot.state != PlayerState::Idle).then(|| self.snapshot.playable.as_ref().map(|p| p.title.clone())).flatten();
-            let chips: Vec<_> = crate::spoiler::ui::status_chip(&self.services().agent, crate::model::now()).into_iter().collect();
+            let chips: Vec<_> =
+                crate::spoiler::ui::status_chip(&self.services().agent, crate::model::now()).into_iter().chain(self.sleep_chip()).collect();
             let info = StatusInfo {
                 jobs: &jobs,
                 epg_updated: self.epg_updated,
@@ -1803,6 +2111,7 @@ impl eframe::App for TunerApp {
             let stack = self.key_stack();
             self.pending_actions.push((action, stack));
         }
+        self.reminder_frame(&egui_ctx, &theme);
         self.apply_nav(&egui_ctx);
         self.apply_config_edits(&egui_ctx);
         // "Lock now", a PIN typed or set this frame: not one more frame of the old state
@@ -3648,13 +3957,16 @@ mod tests {
         assert_eq!(rig.route(), &Route::Player);
     }
 
-    /// DESIGN §30.8 end to end: `schedule_switch` → the scheduler (running although reminders
-    /// are off) → "Switching to … · Cancel" toasts → the switch plays the channel at the start;
-    /// the switch whose Cancel was pressed never plays.
+    /// DESIGN §30.8 / B6 end to end: `schedule_switch` → the scheduler (running although
+    /// reminders are off) → the strip's countdowns "Switching to … in N s · ‹title›" → the
+    /// switch plays the channel at its start in the pop-out (the window isn't in front: asked of
+    /// Hyprland, never focused); the switch whose Cancel was clicked never plays.
     #[test]
-    fn agent_switches_toast_then_switch_and_cancel_stops_one() {
+    fn agent_switches_count_down_then_pop_out_and_cancel_stops_one() {
         use crate::agent::proto::{Call, GuideSearch, ScheduleSwitch};
         let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_agent(c, 14));
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        rig.app.popout_backend = Some(Box::new(PopRecorder(sent.clone())));
         rig.settle();
         let rally_start = {
             let conn = &rig.app.db;
@@ -3667,17 +3979,25 @@ mod tests {
             let s = ask(&rig, Call::ScheduleSwitch(ScheduleSwitch { item, at: None }));
             ids.push(crate::model::ReminderId(s["id"].as_i64().unwrap()));
         }
-        let (touring, rally) = (ids[0], ids[1]);
-        let cancels = |r: &Rig| r.log().toasts.iter().filter_map(|t| t.action.clone()).filter(|a| matches!(a.1, Action::CancelSwitch(_))).count();
-        rig.until_within("the switch toasts", Duration::from_secs(20), |r| cancels(r) == 2);
-        let toast = rig.log().toasts.iter().find(|t| t.action == Some(("Cancel".into(), Action::CancelSwitch(touring)))).cloned().unwrap();
-        assert!(toast.text.starts_with("Switching to Channel 1 in ") && toast.text.ends_with(" s · Touring Cars"), "{}", toast.text);
-        // the rally's Cancel
-        rig.app.pending_actions.push((Action::CancelSwitch(rally), Vec::new()));
-        rig.frame_with(vec![]);
+        let touring = ids[0];
+        rig.until_within("the countdowns", Duration::from_secs(20), |r| r.app.reminder_ui.countdowns.len() == 2);
+        let first = rig.app.reminder_ui.countdowns[0].clone();
+        let text = first.text(crate::model::now());
+        assert_eq!(first.reminder, touring);
+        assert!(text.starts_with("Switching to Channel 1 in ") && text.ends_with(" s · Touring Cars"), "{text}");
+        // the rally's Cancel: the strip's lower one
+        let out = rig.frame_with(vec![]);
+        let mut cancels: Vec<_> =
+            texts(&out).into_iter().filter(|(t, _, role)| t == "Cancel" && *role == egui::accesskit::Role::Button).map(|(_, r, _)| r).collect();
+        cancels.sort_by(|a, b| a.y0.total_cmp(&b.y0));
+        assert_eq!(cancels.len(), 2);
+        rig.click(centre(&cancels[1]), egui::PointerButton::Primary);
         assert_eq!(rig.log().toasts.last().map(|t| t.text.as_str()), Some("Switch cancelled"));
+        assert_eq!(rig.app.reminder_ui.countdowns.iter().map(|c| c.reminder).collect::<Vec<_>>(), [touring]);
         let ch1 = rig.app.lib.live.by_ref(&channel_ref(1)).unwrap();
         rig.until_within("the switch", Duration::from_secs(25), |r| played(&r.log()).contains(&(MediaRef::Channel(ch1), PlayOrigin::Reminder)));
+        assert!(matches!(sent.borrow().as_slice(), [PopRequest::Out { .. }]), "{:?}", sent.borrow());
+        assert!(rig.app.reminder_ui.countdowns.is_empty());
         assert_eq!(rig.route(), &Route::Player);
         // past the rally's start: nothing else switched
         rig.until_within("the rally's start", Duration::from_secs(10), |_| crate::model::now() > rally_start + 1);
@@ -3690,29 +4010,157 @@ mod tests {
         assert_eq!(states, [(touring.0, "fired".to_owned())], "the cancelled row is gone");
     }
 
-    /// `cancel_switch` from an MCP client while the "Switching to … in N s" toast shows: the
-    /// toast goes (nothing will switch) and a `SwitchNow` already on its way is ignored.
+    /// `cancel_switch` from an MCP client while the countdown shows: the countdown goes
+    /// (nothing will switch) and a `SwitchNow` already on its way is ignored.
     #[test]
-    fn a_switch_cancelled_by_the_agent_drops_its_toast() {
+    fn a_switch_cancelled_by_the_agent_drops_its_countdown() {
         use crate::agent::proto::{Call, CancelSwitch, GuideSearch, ScheduleSwitch};
         let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_agent(c, 12));
         rig.settle();
         let found = ask(&rig, Call::GuideSearch(GuideSearch { query: "touring".into(), ..Default::default() }));
         let item = found["programmes"][0]["ref"].as_str().unwrap().to_owned();
         let id = crate::model::ReminderId(ask(&rig, Call::ScheduleSwitch(ScheduleSwitch { item, at: None }))["id"].as_i64().unwrap());
-        let showing = |r: &mut Rig| {
-            let mut n = 0;
-            r.app.toasts.retain(|t| {
-                n += usize::from(matches!(t.action, Some((_, Action::CancelSwitch(_)))));
-                true
-            });
-            n
-        };
-        rig.until_within("the switch toast", Duration::from_secs(15), |r| showing(r) == 1);
+        rig.until_within("the countdown", Duration::from_secs(15), |r| r.app.reminder_ui.countdowns.len() == 1);
         assert_eq!(ask(&rig, Call::CancelSwitch(CancelSwitch { id: id.0 })), serde_json::json!({"cancelled": true}));
-        rig.until("the toast to go", |r| showing(r) == 0);
-        rig.event(AppEvent::Platform(PlatformEvent::SwitchNow { reminder: id, channel: channel_ref(1) }));
+        rig.until("the countdown to go", |r| r.app.reminder_ui.countdowns.is_empty());
+        rig.event(AppEvent::Reminder(crate::reminders::ReminderEvent::SwitchNow {
+            reminder: id,
+            channel: channel_ref(1),
+            open_in: OpenIn::WhereIAm,
+            route: crate::playback::Route::Tile { tile: crate::model::TileId::A, take_sound: false, interrupts_queue: false },
+            rule: None,
+            late: None,
+        }));
         assert!(played(&rig.log()).is_empty());
+    }
+
+    /// "Switch to this when it starts…" from a programme's menu opens the reminder sheet; the
+    /// sheet names what the new switch clashes with, and ↓ → Enter sets a switch that skips
+    /// 5 minutes of build-up (following the "Open in" setting).
+    #[test]
+    fn the_reminder_sheet_sets_a_switch_and_names_its_clashes() {
+        use crate::ui::item_menu::{Target, dispatch, extend};
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_agent(c, 600));
+        rig.settle();
+        let (programme, rally_start) = {
+            let q = |t: &str| rig.app.db.query_row("SELECT id, start FROM programme WHERE title = ?1", [t], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+            let (touring, _): (i64, i64) = q("Touring Cars");
+            let (_, rally): (i64, i64) = q("Rally Stage");
+            (crate::model::ProgrammeId(touring), rally)
+        };
+        let channel = rig.app.lib.live.by_ref(&channel_ref(1)).unwrap();
+        // the rally, an hour that overlaps the touring cars, has a plain reminder
+        let rally = crate::model::Reminder::notify(channel_ref(2), "Channel 2".into(), "Rally Stage".into(), rally_start, rally_start + 3600, 120);
+        rig.writer().blocking(move |c| crate::store::user::add_reminder(c, &rally)).unwrap();
+        let target = Target::Programme { programme, channel };
+        let entry = rig.app.with_ctx(|ctx, _, _| {
+            let mut items = Vec::new();
+            extend(&mut items, &target, ctx, KeyContext::Guide);
+            items.into_iter().find(|i| i.label == "Switch to this when it starts…")
+        });
+        let entry = entry.expect("the menu entry");
+        assert!(rig.app.with_ctx(|ctx, _, _| dispatch(ctx, entry.action, &target)));
+        rig.frame_with(vec![]);
+        let out = rig.frame_with(vec![]);
+        assert!(texts(&out).iter().any(|(t, _, _)| t.contains("Clashes with Rally Stage on Channel 2 at ")), "{:?}", texts(&out));
+        rig.press(Key::ArrowDown, NONE);
+        rig.press(Key::ArrowRight, NONE);
+        rig.press(Key::Enter, NONE);
+        assert!(rig.overlay_kinds().is_empty());
+        let rows = |r: &Rig| crate::store::user::reminders_for_channel(&r.app.db, &channel_ref(1)).unwrap();
+        rig.until("the switch", |r| !rows(r).is_empty());
+        let r = rows(&rig).remove(0);
+        assert!(r.switches(), "{r:?}");
+        assert_eq!((r.offset_s, r.open_in), (300, None));
+        assert!(rig.log().toasts.last().is_some_and(|t| t.text.starts_with("Switching to Channel 1 at ")), "{:?}", rig.log().toasts.last());
+    }
+
+    /// A news flash (a Following "flash" rule's switch) pops out over the live channel, and
+    /// Delete in the pop-out ends it: the channel that played comes back and the window goes
+    /// back in.
+    #[test]
+    fn a_news_flash_pops_out_and_puts_back_the_channel_it_replaced() {
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| {
+            seed_channels(c, 3, None)?;
+            c.execute(
+                "INSERT INTO follow_rule(id, name, kind, spec, mode, priority, created_at, updated_at) VALUES (1, 'News at One', 'news', '{}', 'flash', 0, 0, 0)",
+                [],
+            )?;
+            Ok(())
+        });
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        rig.app.popout_backend = Some(Box::new(PopRecorder(sent.clone())));
+        rig.settle();
+        let now = crate::model::now();
+        let mut news = crate::model::Reminder::notify(channel_ref(2), "Channel 2".into(), "News at One".into(), now - 5, now + 1800, 0);
+        news.mode = crate::model::ReminderMode::Switch;
+        news.rule_id = Some(crate::model::FollowRuleId(1));
+        let id = rig.writer().blocking(move |c| crate::store::user::add_reminder(c, &news)).unwrap();
+        let (ch1, ch2) = (rig.app.lib.live.by_ref(&channel_ref(1)).unwrap(), rig.app.lib.live.by_ref(&channel_ref(2)).unwrap());
+        let playing = |ch: ChannelId| {
+            let p = crate::model::Playable {
+                media: MediaRef::Channel(ch),
+                kind: crate::model::PlayableKind::Live,
+                item: None,
+                source_id: Some(SourceId(1)),
+                title: String::new(),
+                subtitle: None,
+                logo: None,
+                number: None,
+                url: crate::redact::Secret::new(String::new()),
+                headers: Default::default(),
+                start_at: None,
+                duration_hint: None,
+            };
+            PlayerSnapshot { state: PlayerState::Playing, playable: Some(Arc::new(p)), origin: Some(PlayOrigin::Fullscreen), ..Default::default() }
+        };
+        rig.app.snapshot = Arc::new(playing(ch1));
+        rig.event(AppEvent::Reminder(crate::reminders::ReminderEvent::SwitchNow {
+            reminder: id,
+            channel: channel_ref(2),
+            open_in: OpenIn::PopOut,
+            route: crate::playback::Route::Tile { tile: crate::model::TileId::A, take_sound: false, interrupts_queue: false },
+            rule: Some(crate::model::FollowRuleId(1)),
+            late: None,
+        }));
+        assert_eq!(played(&rig.log()).last(), Some(&(MediaRef::Channel(ch2), PlayOrigin::Reminder)));
+        assert!(matches!(sent.borrow().as_slice(), [PopRequest::Out { .. }]), "{:?}", sent.borrow());
+        let flash = rig.app.reminder_ui.flash.clone().expect("a flash");
+        assert_eq!(flash.ends_at, now - 5 + 300, "headlines only: 5 minutes");
+        // Hyprland popped it out and the news plays; Delete in the pop-out ends it
+        rig.event(pop_event(PopOutEvent::PoppedOut));
+        rig.app.snapshot = Arc::new(playing(ch2));
+        let ctx = rig.ctx.clone();
+        rig.app.global_action(Action::EndNewsFlash, &[KeyContext::PopOut], &ctx);
+        assert_eq!(played(&rig.log()).last(), Some(&(MediaRef::Channel(ch1), PlayOrigin::Fullscreen)));
+        assert_eq!(sent.borrow().last(), Some(&PopRequest::In { ours: true }));
+        assert!(rig.app.reminder_ui.flash.is_none());
+        assert!(rig.log().toasts.iter().any(|t| t.text == "News flash ended"));
+    }
+
+    /// Ctrl+Shift+T → Enter sets the sleep timer 15 minutes ahead (the status-bar chip shows
+    /// it); its warning's "+15 min" moves it 15 minutes later.
+    #[test]
+    fn the_sleep_timer_menu_sets_it_and_the_warning_extends_it() {
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_channels(c, 1, None));
+        rig.settle();
+        rig.press(Key::T, Modifiers::CTRL | Modifiers::SHIFT);
+        assert_eq!(rig.overlay_kinds(), [kind(OverlayRequest::SleepTimer)]);
+        let before = crate::model::now();
+        rig.press(Key::Enter, NONE);
+        assert!(rig.overlay_kinds().is_empty());
+        let status = || rig.app.services().agent.sleep().and_then(|h| h.status());
+        let at = status().and_then(|s| s.fires_at).expect("set");
+        assert!((before + 900..=crate::model::now() + 900).contains(&at), "{at}");
+        assert!(rig.app.sleep_chip().is_some_and(|c| c.action == Action::SleepTimer));
+        rig.frame_with(vec![]); // the timer's own `SleepChanged`
+        rig.event(AppEvent::Reminder(crate::reminders::ReminderEvent::SleepWarn { at }));
+        let out = rig.frame_with(vec![]);
+        let more = button(&texts(&out), "+15 min").copied().expect("the warning's +15 min");
+        rig.click(centre(&more), egui::PointerButton::Primary);
+        let later = rig.app.services().agent.sleep().and_then(|h| h.status()).and_then(|s| s.fires_at);
+        assert_eq!(later, Some(at + 900));
+        assert!(rig.app.reminder_ui.sleep_warn.is_none());
     }
 
     /// The relock timer ran out while no frame ran (Tuner on another workspace): a switch to an

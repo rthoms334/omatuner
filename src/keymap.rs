@@ -338,8 +338,13 @@ pub enum Action {
     /// Ctrl+Shift+T: the sleep timer menu (in N min, end of programme, after N items, end of
     /// Up next, off).
     SleepTimer,
-    /// Delete in the pop-out during a news flash: end it now and put back what was playing.
+    /// Delete in the pop-out during a news flash: end it now and put back what was playing
+    /// (or, while a switch's countdown shows, call that switch off).
     EndNewsFlash,
+    /// A menu entry, never bound to a key: "Switch to this when it starts…" / "Edit
+    /// reminder…" on a programme — the reminder sheet (notify or switch, lead, start offset,
+    /// where it opens; `reminders::ui`).
+    ReminderOptions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -756,7 +761,7 @@ pub static POP_OUT: &[Binding] = &[
     b(C::key(Key::Escape), A::TogglePopOut, "Back to the full window (also double-click)"),
     b(C::ch('o'), A::TogglePopOut, "Back to the full window (also double-click)"),
     b(C::ch('f'), A::ToggleWindowFullscreen, "Back to the full window, fullscreen"),
-    b(C::key(Key::Delete), A::EndNewsFlash, "End the news flash (back to what you were watching)"),
+    b(C::key(Key::Delete), A::EndNewsFlash, "Cancel the coming switch / end the news flash (back to what you were watching)"),
 ];
 
 /// Multi-view (DESIGN §35), above the focused picture's player context. `q` shadows "Stop and
@@ -1050,7 +1055,7 @@ pub fn feature_on(a: Action) -> bool {
         | A::CycleLayout
         | A::ClosePicture
         | A::WatchAlongside => crate::ui::multiview::ENABLED,
-        A::SleepTimer | A::EndNewsFlash => crate::reminders::ENABLED,
+        A::SleepTimer | A::EndNewsFlash | A::ReminderOptions => crate::reminders::ENABLED,
         _ => true,
     }
 }

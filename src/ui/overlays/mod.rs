@@ -16,6 +16,7 @@ pub mod help;
 pub mod jobs;
 pub mod playlists;
 pub mod programme;
+pub mod reminders;
 pub mod resume;
 pub mod same_title;
 pub mod search;
@@ -169,7 +170,8 @@ pub fn build(req: OverlayRequest, ctx: &mut UiCtx<'_>) -> Box<dyn Overlay> {
         OverlayRequest::SpoilerMenu => Box::<spoiler_menu::SpoilerMenu>::default(),
         OverlayRequest::SpoilerRule(spec) => Box::new(spoiler_rule::SpoilerRuleEditor::new(spec)),
         OverlayRequest::QueueSeries { series, play_next } => Box::new(crate::queue::ui::SeriesPicker::new(series, play_next)),
-        OverlayRequest::SleepTimer => Box::new(crate::reminders::ui::SleepTimerMenu),
+        OverlayRequest::SleepTimer => Box::<reminders::SleepTimerMenu>::default(),
+        OverlayRequest::ReminderSheet(spec) => Box::new(reminders::ReminderSheet::new(spec)),
         OverlayRequest::WatchAlongside => Box::new(crate::ui::multiview::AlongsidePicker),
     }
 }

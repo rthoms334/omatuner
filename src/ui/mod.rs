@@ -226,6 +226,9 @@ pub enum OverlayRequest {
     },
     /// The sleep timer menu (Ctrl+Shift+T; B6, rui).
     SleepTimer,
+    /// A programme's reminder sheet: notify or switch, lead, start offset, where it opens
+    /// (B6, rui).
+    ReminderSheet(overlays::reminders::ReminderSheetSpec),
     /// Choose the channel for the other picture (Ctrl+M in the player; DESIGN §35, MV-2).
     WatchAlongside,
 }

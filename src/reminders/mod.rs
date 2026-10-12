@@ -33,10 +33,9 @@ use crate::model::{FollowRuleId, ItemRef, OpenIn, Reminder, ReminderId, Timestam
 use crate::playback::{Kind, PlayIntent, PlaySource, Route, RouteState};
 
 /// The remind track's pass-2 switch (richer `AppEvent::Reminder` events instead of the
-/// `PlatformEvent::Switch*` pair, pop-out launch, systemd arming). Flipped once rui's
-/// `AppEvent::Reminder` arm handles [`ReminderEvent::SwitchSoon`] / [`ReminderEvent::SwitchNow`]:
-/// before that the scheduler keeps sending the pass-1 events the app handles today.
-pub const ENABLED: bool = false;
+/// `PlatformEvent::Switch*` pair, pop-out launch, systemd arming), flipped by rui: the app's
+/// `AppEvent::Reminder` arm handles every [`ReminderEvent`] (`app.rs`, [`ui`]).
+pub const ENABLED: bool = true;
 
 /// Programmes without a usable stop time are assumed to last this long.
 pub const DEFAULT_DURATION_S: i64 = 3600;

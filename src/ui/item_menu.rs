@@ -1,7 +1,8 @@
 //! The batch features' share of item menus and item keys (base-B, plan §2.2). OWNER: the
 //! integrator; each feature fills its own `menu_items` / `on_action` in its `ui` module:
 //! Up next (`queue::ui`), Following (`follow::ui`), the spoiler guard (`spoiler::ui`), Guide
-//! fixes (`guide_fix::ui`) and multi-view (`ui::multiview`).
+//! fixes (`guide_fix::ui`), multi-view (`ui::multiview`) and reminders (`reminders::ui`: "Switch to
+//! this when it starts…" on a programme).
 //!
 //! A screen with an item menu calls [`extend`] when it builds the menu for the item under the
 //! cursor, and [`dispatch`] from its item action handler (keys such as Ctrl+N / Ctrl+M / `R`,
@@ -52,6 +53,7 @@ pub fn extend(items: &mut Vec<MenuItem>, target: &Target, ctx: &UiCtx<'_>, keys:
     items.extend(crate::spoiler::ui::menu_items(target, ctx, keys));
     items.extend(crate::ui::multiview::menu_items(target, ctx, keys));
     items.extend(crate::guide_fix::ui::menu_items(target, ctx, keys));
+    items.extend(crate::reminders::ui::menu_items(target, ctx, keys));
 }
 
 /// The programme popover's primary buttons after Watch / Catch up and Remind me: Up next, then
@@ -67,6 +69,7 @@ pub fn dispatch(ctx: &mut UiCtx<'_>, action: Action, target: &Target) -> bool {
         || crate::spoiler::ui::on_action(ctx, action, target)
         || crate::ui::multiview::on_action(ctx, action, target)
         || crate::guide_fix::ui::on_action(ctx, action, target)
+        || crate::reminders::ui::on_action(ctx, action, target)
 }
 
 /// A menu entry with its shortcut from `keys` (the screens' `menu_item`).

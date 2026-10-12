@@ -311,6 +311,7 @@ impl PlayerScreen {
             items.push(menu_item(glyphs::POP_OUT, "Pop out", Action::TogglePopOut, true, k));
         }
         items.push(menu_item(glyphs::MINI_PLAYER, "Keep playing in the mini player", Action::Minimize, true, k));
+        items.extend(crate::reminders::ui::player_menu_items(KeyContext::Global));
         items.push(menu_item(glyphs::STOP, "Stop and close", Action::StopAndClose, true, k));
         let title = snap.playable.as_ref().map(|p| p.title.clone()).unwrap_or_else(|| "Player".into());
         ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title, items }));
@@ -703,6 +704,8 @@ impl Screen for PlayerScreen {
         match result {
             // the app handles the pop-out key itself; from the menu it comes here
             OverlayResult::Chosen(Action::TogglePopOut) => ctx.navigate(NavRequest::TogglePopOut),
+            // a global key's entry (rui): its menu
+            OverlayResult::Chosen(Action::SleepTimer) => ctx.open(OverlayRequest::SleepTimer),
             // a copy of the Ctrl+O menu (never a typed channel number)
             OverlayResult::Chosen(Action::Digit(d)) if d >= SWITCH_COPY && !self.switch_copies.is_empty() => {
                 if let Some(c) = self.switch_copies.get(usize::from(d - SWITCH_COPY)) {
