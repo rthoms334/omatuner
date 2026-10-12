@@ -111,6 +111,10 @@ fn parse_quiet(s: &str) -> Option<(Option<u16>, Option<u16>)> {
     let [a, b] = parts.as_slice() else { return None };
     let minute = |p: &str| -> Option<u16> {
         let p = p.trim();
+        // the four-digit form slices bytes
+        if !p.is_ascii() {
+            return None;
+        }
         let (h, m) = match p.split_once([':', '.']) {
             Some((h, m)) => (h.parse::<u16>().ok()?, m.parse::<u16>().ok()?),
             None if p.len() > 2 => (p[..p.len() - 2].parse().ok()?, p[p.len() - 2..].parse().ok()?),
@@ -179,7 +183,10 @@ pub(super) fn rows(s: &SettingsScreen, ctx: &UiCtx<'_>, v: &mut Vec<Row>) {
     v.push(Row::Section(format!("Upcoming · next {} days", 14)));
     let horizon = ctx.now + 14 * 86_400;
     let mut any = false;
-    for (i, u) in d.upcoming.iter().enumerate().filter(|(_, u)| u.start < horizon) {
+    let spoilers = crate::ui::widgets::spoiler::Spoilers::of(ctx);
+    // a channel that became explicit (or hidden by parental control) since the evaluation
+    let shown = |u: &Upcoming| u.channel.as_ref().is_none_or(|c| !ctx.lib.conceals(c));
+    for (i, u) in d.upcoming.iter().enumerate().filter(|(_, u)| u.start < horizon && shown(u)) {
         any = true;
         let mut detail = crate::ui::widgets::time::local(u.start, if h24 { "%a %-d %b %H:%M" } else { "%a %-d %b %-I:%M %p" }, "");
         if !u.channel_name.is_empty() {
@@ -188,9 +195,20 @@ pub(super) fn rows(s: &SettingsScreen, ctx: &UiCtx<'_>, v: &mut Vec<Row>) {
         }
         detail.push_str(" · ");
         detail.push_str(&fui::state_text(u));
+        // spoiler-safe rules' rows carry the rule name only; the others go through the guard
+        // (a show you're part-way through, a followed sport's score)
+        let subject = crate::guard::Subject::Programme {
+            title: &u.title,
+            sub_title: u.sub_title.as_deref(),
+            categories: &[],
+            season_episode: None,
+            start: u.start,
+        };
+        let guarded = |field, s: &str| spoilers.text(&subject, field, s).map(std::borrow::Cow::into_owned).unwrap_or_default();
+        let title = guarded(crate::guard::Field::Title, &u.title);
         let title = match u.sub_title.as_deref().filter(|s| !s.is_empty()) {
-            Some(s) => format!("{} · {s}", u.title),
-            None => u.title.clone(),
+            Some(s) => format!("{title} · {}", guarded(crate::guard::Field::SubTitle, s)),
+            None => title,
         };
         v.push(Row::Item {
             item: Item::Feature(Feature::Following, upcoming_id(i)),
@@ -342,6 +360,8 @@ mod tests {
         assert_eq!(parse_quiet(""), Some((None, None)));
         assert_eq!(parse_quiet("late"), None);
         assert_eq!(parse_quiet("25:00-07:00"), None);
+        assert_eq!(parse_quiet("２２００ ０７００"), None, "full-width digits: no panic");
+        assert_eq!(parse_quiet("07ä0 2200"), None);
         assert_eq!(quiet_text(Some(22 * 60), Some(7 * 60)), "22:00–07:00");
     }
 }

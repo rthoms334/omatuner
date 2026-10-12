@@ -177,7 +177,8 @@ pub struct Cand {
 pub struct Pool {
     cands: Vec<Cand>,
     by_epg: HashMap<i64, Vec<u32>>,
-    by_ref: HashMap<ItemRef, ChannelId>,
+    /// Index into `cands`.
+    by_ref: HashMap<ItemRef, u32>,
     fav_lists: HashMap<ChannelId, Vec<FavListId>>,
     /// The shared ranking's context (B5) without a rule's pin and quality cap.
     rank: RankCtx,
@@ -200,7 +201,7 @@ impl Pool {
                 continue;
             }
             pool.by_epg.entry(epg.0).or_default().push(pool.cands.len() as u32);
-            pool.by_ref.insert(item.clone(), c.id);
+            pool.by_ref.insert(item.clone(), pool.cands.len() as u32);
             pool.cands.push(Cand {
                 id: c.id,
                 item,
@@ -213,7 +214,7 @@ impl Pool {
         let mut favourites = HashMap::new();
         for (li, list) in lib.favs.lists.iter().enumerate() {
             for (pi, item) in lib.favs.items(list.id).iter().enumerate() {
-                if let Some(&id) = pool.by_ref.get(item) {
+                if let Some(id) = pool.by_ref.get(item).map(|&i| pool.cands[i as usize].id) {
                     favourites.entry(id).or_insert((li, pi));
                     pool.fav_lists.entry(id).or_default().push(list.id);
                 }
@@ -240,8 +241,7 @@ impl Pool {
 
     /// A channel of the pool by reference.
     pub fn channel(&self, item: &ItemRef) -> Option<&Cand> {
-        let id = self.by_ref.get(item)?;
-        self.cands.iter().find(|c| c.id == *id)
+        self.by_ref.get(item).map(|&i| &self.cands[i as usize])
     }
 
     fn in_scope(&self, c: &Cand, scope: &ChannelScope) -> bool {
@@ -267,7 +267,7 @@ impl Pool {
         let Some(min_shift) = cands.iter().map(|c| c.shift_s.abs()).min() else { return Vec::new() };
         cands.retain(|c| c.shift_s.abs() == min_shift);
         let mut ctx = self.rank.clone();
-        ctx.pinned = rule.spec.prefer.pin.as_ref().and_then(|p| self.by_ref.get(p).copied());
+        ctx.pinned = rule.spec.prefer.pin.as_ref().and_then(|p| self.channel(p)).map(|c| c.id);
         ctx.max_quality = rule.spec.prefer.max_quality;
         let ranks: Vec<RankCand> = cands.iter().map(|c| c.rank).collect();
         let order = rank_channels(&ranks, &ctx);
@@ -348,7 +348,9 @@ fn key_rank(k: &str) -> u8 {
     }
 }
 
-/// Group hits into events and choose their channels (left-outs kept apart).
+/// Group hits into events and choose their channels (left-outs kept apart): one rule's hits
+/// within [`SIMULCAST_S`] of each other, split by what they are — two different games at the
+/// same time on two channels are two events, never one with the other as an alternate.
 fn events(hits: &mut [Hit], ctx: &PlanCtx<'_>) -> Vec<Event> {
     hits.sort_by_key(|h| (h.rule, h.start, h.epg_channel));
     let mut out = Vec::new();
@@ -358,19 +360,98 @@ fn events(hits: &mut [Hit], ctx: &PlanCtx<'_>) -> Vec<Event> {
         while j < hits.len() && hits[j].rule == hits[i].rule && hits[j].start - hits[i].start <= SIMULCAST_S {
             j += 1;
         }
-        if let Some(e) = event(&hits[i..j], ctx) {
-            out.push(e);
+        for group in split_window(&hits[i..j], ctx.tz) {
+            if let Some(e) = event(&group, ctx) {
+                out.push(e);
+            }
         }
         i = j;
     }
     out
 }
 
-fn event(group: &[Hit], ctx: &PlanCtx<'_>) -> Option<Event> {
+/// One window's hits by event. A fixture is its teams (two spellings of one match — "Man Utd"
+/// and "Manchester United" against the same side — stay one), a show episode its core title
+/// (one guide may carry S/E and another an episode title). A hit with only a title joins its
+/// show's episode, else the window's one fixture or episode, else its own title.
+fn split_window<'h>(window: &'h [Hit], tz: &jiff::tz::TimeZone) -> Vec<Vec<&'h Hit>> {
+    if window.len() == 1 {
+        return vec![window.iter().collect()];
+    }
+    let date = local(window[0].start, tz).0;
+    let keyed: Vec<(&Hit, String)> = window.iter().map(|h| (h, key_of(h, &date))).collect();
+    // (the first key of a group, its hits)
+    let mut groups: Vec<(String, Vec<&Hit>)> = Vec::new();
+    let mut plain: Vec<(&Hit, &str)> = Vec::new();
+    for (h, k) in &keyed {
+        let found = match key_rank(k) {
+            0 => groups.iter_mut().find(|(g, _)| same_fixture(g, k)),
+            1 => groups.iter_mut().find(|(g, _)| key_rank(g) == 1 && core_of(g) == core_of(k)),
+            _ => {
+                plain.push((h, k));
+                continue;
+            }
+        };
+        match found {
+            Some((_, v)) => v.push(h),
+            None => groups.push((k.clone(), vec![h])),
+        }
+    }
+    let specific = groups.len();
+    for (h, k) in plain {
+        let to = groups[..specific]
+            .iter()
+            .position(|(g, _)| key_rank(g) == 1 && core_of(g) == core_of(k))
+            .or_else(|| (specific == 1).then_some(0))
+            .or_else(|| groups.iter().position(|(g, _)| g == k));
+        match to {
+            Some(i) => groups[i].1.push(h),
+            None => groups.push((k.to_owned(), vec![h])),
+        }
+    }
+    groups.into_iter().map(|(_, v)| v).collect()
+}
+
+/// A key's title part (before its `#` episode or `@` date).
+fn core_of(k: &str) -> &str {
+    k.split(['#', '@']).next().unwrap_or(k)
+}
+
+/// The two sides of a fixture key (`a|b@date`).
+fn sides(k: &str) -> Option<(&str, &str)> {
+    k.rsplit_once('@').map_or(k, |(body, _)| body).split_once('|')
+}
+
+/// Two spellings of one side ("man utd", "manchester united"; "wolves", "wolverhampton"): a
+/// word in common, or first words where one begins the other or that share four letters.
+fn alike(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let words = |s: &'_ str| s.split_whitespace().filter(|w| w.chars().count() >= 3).map(str::to_owned).collect::<Vec<_>>();
+    let wb = words(b);
+    if words(a).iter().any(|w| wb.contains(w)) {
+        return true;
+    }
+    let (Some(x), Some(y)) = (a.split_whitespace().next(), b.split_whitespace().next()) else { return false };
+    let common = x.chars().zip(y.chars()).take_while(|(p, q)| p == q).count();
+    common >= 4 || (common >= 3 && (x.starts_with(y) || y.starts_with(x)))
+}
+
+/// One match under two fixture keys: a side in common and the other side alike (a team never
+/// plays two matches at once).
+fn same_fixture(k1: &str, k2: &str) -> bool {
+    if k1 == k2 {
+        return true;
+    }
+    let (Some((a, b)), Some((c, d))) = (sides(k1), sides(k2)) else { return false };
+    (a == c && alike(b, d)) || (a == d && alike(b, c)) || (b == c && alike(a, d)) || (b == d && alike(a, c))
+}
+
+fn event(group: &[&Hit], ctx: &PlanCtx<'_>) -> Option<Event> {
     let rule = &ctx.rules[group[0].rule];
-    let ok: Vec<&Hit> = group.iter().filter(|h| h.verdict.is_ok()).collect();
-    let (used, left_out): (Vec<&Hit>, Option<LeftOut>) =
-        if ok.is_empty() { (group.iter().collect(), group[0].verdict.clone().err()) } else { (ok, None) };
+    let ok: Vec<&Hit> = group.iter().copied().filter(|h| h.verdict.is_ok()).collect();
+    let (used, left_out): (Vec<&Hit>, Option<LeftOut>) = if ok.is_empty() { (group.to_vec(), group[0].verdict.clone().err()) } else { (ok, None) };
     let mut epgs: Vec<i64> = used.iter().map(|h| h.epg_channel).collect();
     epgs.sort_unstable();
     epgs.dedup();
@@ -532,7 +613,8 @@ pub fn build(hits: &mut [Hit], ctx: &PlanCtx<'_>) -> Plan {
         }
         up.state = match row.map(|r| r.state) {
             Some(MatchState::Skipped) => MatchState::Skipped,
-            Some(MatchState::Adopted) if row.is_some_and(|r| r.start == up.start) => MatchState::Adopted,
+            // adopted while that reminder is still there (another rule's may have gone with it)
+            Some(MatchState::Adopted) if row.is_some_and(|r| r.start == up.start && r.reminder.is_some()) => MatchState::Adopted,
             _ if rule.mode == FollowMode::List => MatchState::Listed,
             _ => MatchState::Scheduled,
         };
@@ -811,6 +893,21 @@ mod tests {
         // only the +1 channel shows it: its start is shifted
         let l = lib(vec![summary(4, 1, 10, "Sky Sports +1", Some(Quality::Uhd), 60)]);
         assert_eq!(run(&Pool::build(&l, HashSet::new(), false)).steps[0].to.start, start + H);
+
+        // two games at the same time on two channels are two events, neither the other's
+        // alternate; one game under two spellings stays one
+        let l = lib(vec![summary(1, 1, 10, "TNT Sports 1", None, 0), summary(2, 2, 11, "TNT Sports 2", None, 0)]);
+        let pool = Pool::build(&l, HashSet::new(), false);
+        let rules = [rule(1, FollowKind::Event, FollowMode::Notify)];
+        let two = |a: &str, b: &str| {
+            let mut hits = vec![hit(0, 10, start, a, None, Ok(AiringKind::Live)), hit(0, 11, start + 300, b, None, Ok(AiringKind::Live))];
+            build(&mut hits, &ctx(&rules, &pool, &[], &[], &tz)).steps
+        };
+        let steps = two("Real Madrid v Bayern Munich", "PSG v Inter");
+        assert_eq!(steps.len(), 2);
+        assert!(steps.iter().all(|s| s.to.alternates.is_empty()), "{steps:?}");
+        let steps = two("Man Utd v Arsenal", "Manchester United v Arsenal");
+        assert_eq!((steps.len(), steps[0].to.alternates.len()), (1, 1));
     }
 
     /// A moved kick-off moves the reminder (no duplicate); a dismissed match stays dismissed;

@@ -98,15 +98,29 @@ pub fn save_rule(conn: &Connection, r: &FollowRule, max_rules: u32, now: Timesta
         )?;
         return Ok(FollowRuleId(conn.last_insert_rowid()));
     }
-    let n = conn.execute(
-        "UPDATE follow_rule SET name = ?2, kind = ?3, spec = ?4, mode = ?5, lead_s = ?6, offset_s = ?7, spoiler_safe = ?8, max_per_week = ?9,
-           enabled = ?10, updated_at = ?11 WHERE id = ?1",
-        params![r.id, name, enum_str(&r.kind), spec, enum_str(&r.mode), r.lead_s, r.offset_s, r.spoiler_safe, r.max_per_week, r.enabled, now],
-    )?;
-    if n == 0 {
-        return Err(crate::store::sql::not_found("follow rule", r.id));
-    }
-    Ok(r.id)
+    atomic(conn, |c| {
+        let Some(was) = rule(c, r.id)? else { return Err(crate::store::sql::not_found("follow rule", r.id)) };
+        c.execute(
+            "UPDATE follow_rule SET name = ?2, kind = ?3, spec = ?4, mode = ?5, lead_s = ?6, offset_s = ?7, spoiler_safe = ?8, max_per_week = ?9,
+               enabled = ?10, updated_at = ?11 WHERE id = ?1",
+            params![r.id, name, enum_str(&r.kind), spec, enum_str(&r.mode), r.lead_s, r.offset_s, r.spoiler_safe, r.max_per_week, r.enabled, now],
+        )?;
+        // what its reminders carry changed: they go, and the evaluation the caller submits makes
+        // them again with the new settings (ledger rows stay `scheduled`, their reminder NULL)
+        let carried = |x: &FollowRule, name: &str| {
+            (x.mode, x.lead_s, x.offset_s, x.spoiler_safe, x.spec.flash, if x.spoiler_safe { Some(name.to_owned()) } else { None })
+        };
+        if carried(&was, was.name.trim()) != carried(r, name) {
+            let owned: Vec<ReminderId> = {
+                let mut stmt = c.prepare_cached("SELECT id FROM reminder WHERE rule_id = ?1 AND state = 'pending'")?;
+                stmt.query_map([r.id], |x| x.get(0))?.collect::<rusqlite::Result<_>>()?
+            };
+            for id in owned {
+                crate::store::user::remove_reminder(c, id, RemoveWhy::Rule)?;
+            }
+        }
+        Ok(r.id)
+    })
 }
 
 /// Delete a rule and its ledger; its pending reminders are cancelled unless `keep_reminders`
@@ -121,9 +135,11 @@ pub fn delete_rule(conn: &Connection, id: FollowRuleId, keep_reminders: bool) ->
                 let mut stmt = c.prepare_cached("SELECT id FROM reminder WHERE rule_id = ?1 AND state = 'pending'")?;
                 stmt.query_map([id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
             };
+            // one another rule adopted passes to that rule
             for r in owned {
-                crate::store::user::remove_reminder(c, r, RemoveWhy::Rule)?;
-                cancelled += 1;
+                if release(c, r)? {
+                    cancelled += 1;
+                }
             }
             c.execute("UPDATE reminder SET rule_id = NULL WHERE rule_id = ?1", [id])?;
         }
@@ -253,6 +269,9 @@ pub fn apply_plan(conn: &Connection, plan: &Plan, rules: &[FollowRule], now: Tim
     let by_id: HashMap<FollowRuleId, &FollowRule> = rules.iter().map(|r| (r.id, r)).collect();
     atomic(conn, |c| {
         let mut done = Applied::default();
+        // cancelled reminders another rule had adopted pass to that rule once every row is
+        // written (a rule paused or over its limit; never a moved or gone airing's)
+        let mut released: Vec<ReminderId> = Vec::new();
         for step in &plan.steps {
             let mut to = step.to.clone();
             // None: leave the row's reminder as it is
@@ -260,7 +279,9 @@ pub fn apply_plan(conn: &Connection, plan: &Plan, rules: &[FollowRule], now: Tim
             match step.reminder {
                 ReminderOp::Keep => {}
                 ReminderOp::Cancel(id) => {
-                    cancel(c, id, &mut done)?;
+                    if owned(c, id)? {
+                        released.push(id);
+                    }
                     reminder = Some(None);
                 }
                 ReminderOp::Replace(id) => {
@@ -292,18 +313,50 @@ pub fn apply_plan(conn: &Connection, plan: &Plan, rules: &[FollowRule], now: Tim
             }
             write_row(c, step.row, &to, reminder, now)?;
         }
+        for id in released {
+            if release(c, id)? {
+                done.cancelled += 1;
+            }
+        }
         Ok(done)
     })
 }
 
+/// A reminder a rule still owns (an edited one detached itself).
+fn owned(c: &Connection, id: ReminderId) -> Result<bool> {
+    Ok(c.query_row("SELECT EXISTS (SELECT 1 FROM reminder WHERE id = ?1 AND rule_id IS NOT NULL)", [id], |r| r.get(0))?)
+}
+
 fn cancel(c: &Connection, id: ReminderId, done: &mut Applied) -> Result<()> {
-    // only a reminder the rule still owns and that hasn't fired: an edited one detached itself
-    let owned: bool = c.query_row("SELECT EXISTS (SELECT 1 FROM reminder WHERE id = ?1 AND rule_id IS NOT NULL)", [id], |r| r.get(0))?;
-    if owned {
+    if owned(c, id)? {
         crate::store::user::remove_reminder(c, id, RemoveWhy::Rule)?;
         done.cancelled += 1;
     }
     Ok(())
+}
+
+/// Its rule lets go of reminder `id`: an enabled rule that adopted it (its row still `adopted`
+/// with that reminder) takes it over, else it is cancelled. Returns whether it was cancelled.
+fn release(c: &Connection, id: ReminderId) -> Result<bool> {
+    let heir: Option<(i64, FollowRuleId)> = c
+        .query_row(
+            "SELECT m.id, m.rule_id FROM follow_match m
+               JOIN follow_rule r ON r.id = m.rule_id AND r.enabled = 1
+               JOIN reminder x ON x.id = m.reminder_id
+             WHERE m.reminder_id = ?1 AND m.state = 'adopted' AND x.state = 'pending' AND m.rule_id IS NOT x.rule_id
+             ORDER BY r.priority, r.id LIMIT 1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((row, rule)) = heir else {
+        crate::store::user::remove_reminder(c, id, RemoveWhy::Rule)?;
+        return Ok(true);
+    };
+    c.execute("UPDATE reminder SET rule_id = ?2 WHERE id = ?1", params![id, rule])?;
+    c.execute("UPDATE follow_match SET state = 'scheduled' WHERE id = ?1", [row])?;
+    c.execute("UPDATE follow_match SET reminder_id = NULL WHERE reminder_id = ?1 AND rule_id <> ?2", params![id, rule])?;
+    Ok(false)
 }
 
 /// Make `to`'s reminder for `rule`, or adopt the one already at that channel and time.
@@ -447,15 +500,17 @@ pub fn manual_switches(conn: &Connection, now: Timestamp) -> Result<Vec<(Timesta
 }
 
 /// What the guide and the rules look like (the evaluation's early exit): the active guide
-/// generations and the rules' last change.
+/// generations, the rules' last change and the channel ↔ guide mappings (a guide fix or a
+/// re-match changes which channels show what).
 pub fn inputs_hash(conn: &Connection) -> Result<String> {
-    let (gens, rules): (String, String) = conn.query_row(
+    let (gens, rules, maps): (String, String, String) = conn.query_row(
         "SELECT (SELECT COALESCE(group_concat(id || ':' || active_gen || ':' || COALESCE(max_stop, 0), ','), '') FROM epg_source WHERE enabled = 1),
-                (SELECT count(*) || ':' || COALESCE(max(updated_at), 0) FROM follow_rule)",
+                (SELECT count(*) || ':' || COALESCE(max(updated_at), 0) FROM follow_rule),
+                (SELECT count(*) || ':' || total(channel_id * 1000003 + epg_channel_id) FROM channel_epg)",
         [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
-    Ok(format!("{gens}|{rules}"))
+    Ok(format!("{gens}|{rules}|{maps}"))
 }
 
 pub fn meta_get(conn: &Connection, key: &str) -> Result<Option<String>> {
