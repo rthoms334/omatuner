@@ -4947,18 +4947,21 @@ read at Delete, a join of one dropped (`store_catalogue`); 0007's re-run keeps `
 
 ---
 
-## 30. Agent control (MCP): use Tuner from Claude
+## 30. Agent control (MCP): use Tuner from an AI agent
 
-"Touring cars is on" → Claude finds the race in the guide and Tuner switches to it; "something
-light under 2 hours" → Claude browses the library, picks a film and starts it. The user prompts
-Claude Code in a terminal; Claude talks to Tuner through an MCP server that the `tuner` binary
-itself provides.
+"Touring cars is on" → the agent finds the race in the guide and Tuner switches to it;
+"something light under 2 hours" → the agent browses the library, picks a film and starts it.
+The user prompts an AI agent (Claude Code, Codex, Gemini CLI, Cursor, VS Code with Copilot, or
+any other MCP client); the agent talks to Tuner through an MCP server that the `tuner` binary
+itself provides. Tuner names the agent on its own screens by the name its client reports
+(§30.12).
 
 ### 30.1 Decisions
-1. **`tuner mcp`** is an MCP server over stdio (`claude mcp add tuner -- tuner mcp`). It is a
-   thin bridge: it never opens the database. Every answer comes from the **running** Tuner over
-   the existing IPC socket, so it uses the app's in-memory library and guide and honours every
-   visibility rule the screens honour.
+1. **`tuner mcp`** is an MCP server over stdio for any MCP client (`claude mcp add tuner --
+   tuner mcp`, `codex mcp add tuner -- tuner mcp`, or a `command: tuner, args: [mcp]` entry in
+   the client's config). It is a thin bridge: it never opens the database. Every answer comes
+   from the **running** Tuner over the existing IPC socket, so it uses the app's in-memory
+   library and guide and honours every visibility rule the screens honour.
 2. **Hand-rolled protocol, no `rmcp`.** Checked on crates.io (2026-10-11): `rmcp` 3.5.1 (the
    official SDK, MSRV 1.88; pinnable at most to 3.4.1 under the two-week rule) is mature but
    would add `schemars` 1, `chrono`, `uuid`, `rmcp-macros`/`pastey`, `indexmap` and the
@@ -4990,14 +4993,17 @@ itself provides.
 * `main` dispatches `Cli::is_mcp()` right after resolving the paths (`tuner mcp`, and a lone
   `mcp` word after global flags — `tuner --debug mcp`, which clap reads as an input file): no
   config load, no instance lock, no `logging::init` (that writes `tuner.log`, which the running
-  app owns). Logging goes to stderr only (WARN; DEBUG with `--debug`) — Claude Code keeps an MCP
-  server's stderr in its log. stdout carries protocol lines only. `--profile-dir` selects the
-  profile's socket (tests, second profiles) and is passed on when launching.
+  app owns). Logging goes to stderr only (WARN; DEBUG with `--debug`) — MCP clients such as
+  Claude Code keep a server's stderr in their log. stdout carries protocol lines only.
+  `--profile-dir` selects the profile's socket (tests, second profiles) and is passed on when
+  launching.
 * JSON-RPC 2.0, one message per line. `initialize`: `protocolVersion` = the client's if it is in
   `tools::PROTOCOL_VERSIONS` (2025-11-25, 2025-06-18, 2025-03-26, 2024-11-05), else the newest;
   `capabilities: {tools: {listChanged: false}}`; `serverInfo: {name: "tuner", title: "Tuner",
   version}`; `instructions` = `tools::INSTRUCTIONS` (the workflow: guide_search → play /
   schedule_switch; categories → browse → details → play; refs are opaque; the PIN rule).
+  `clientInfo` (`name`, optional `title`, each cut to 64 chars) is kept for the session and
+  sent with every request (§30.3, §30.12); a second `initialize` replaces it.
   Notifications are ignored; `ping` → `{}`; unknown method → −32601; unparsable → −32700; a
   line over 1 MiB → −32600 (not buffered whole). Requests are handled in order.
 * `tools/list` → `tools::tools()` (name, title, description, `inputSchema`, `annotations`:
@@ -5010,8 +5016,8 @@ itself provides.
   isError: false}`.
 * `client::Client::call(call, launch)`: one connection per request, 6 s timeout, reply ≤ 1 MiB.
   No socket / refused + `launch` → `Launcher::launch` (production `ExeLauncher`: this executable,
-  `--profile-dir` if given, own process group, stdio `/dev/null`, so it survives Claude and
-  never writes into the protocol stream), then poll the socket every 100 ms for ≤ 15 s;
+  `--profile-dir` if given, own process group, stdio `/dev/null`, so it survives the agent
+  and never writes into the protocol stream), then poll the socket every 100 ms for ≤ 15 s;
   `ErrorCode::Loading` replies are retried every 250 ms for ≤ 20 s. A reply without `"v"` (a
   pre-v2 Tuner answering `bad request`) → "restart Tuner to update it". Status without Tuner →
   `{"running": false}` as a normal result.
@@ -5038,6 +5044,11 @@ itself provides.
   send `AppEvent::Ipc` and never raise the window by themselves.
 * `params` use `deny_unknown_fields`; every numeric limit is clamped by the handler; free text ≤
   200 chars (`proto::MAX_TEXT`).
+* An optional top-level `"agent":{"name":"codex-mcp-client","title":"Codex"}` carries the MCP
+  client's `clientInfo` (§30.12). It sits beside `method`, not in `params` (those are the tool
+  arguments). Additive, so `v` stays 2: an older app ignores the key (`Request` has no
+  `deny_unknown_fields`), an older bridge omits it (the agent is then unknown), and a request
+  without it serialises as before.
 * Error codes: `bad_request`, `not_found` (also for anything concealed — indistinguishable on
   purpose), `unavailable`, `not_started`, `loading`, `rate_limited`, `busy`, `unsupported`,
   `internal`.
@@ -5218,7 +5229,7 @@ File ownership is disjoint; a cross-track edit needs the owner's agreement and g
 merge note. Lean: clippy + the tests you touched; the integrator runs the full gate.
 
 **bridge track** — owns `src/agent/{mcp,client,tools}.rs`, `src/main.rs` (the mcp branch only),
-`tests/agent_mcp.rs` (new), README "Use Tuner from Claude", MANUAL_CHECKLIST §21.
+`tests/agent_mcp.rs` (new), README "Use Tuner from an AI agent", MANUAL_CHECKLIST §21.
 1. `mcp::serve`: the JSON-RPC loop of §30.2 (version negotiation, errors, 1 MiB cap, ordered
    handling); `mcp::main`: stderr logging, `Client` with `ExeLauncher`, stdin/stdout.
 2. `client`: connect / send / read (caps, timeouts), launch-if-needed, loading retries,
@@ -5271,6 +5282,41 @@ the real binary against a headless `Services` on a seeded temp profile (search �
   newest and the client decides.
 * **Launch surprises**: only tools that lead to watching launch Tuner; `status` never does.
 
+### 30.12 Naming the agent (user decision, 2026-10-12)
+`tuner mcp` works with any MCP client, so Tuner's own screens don't say "Claude": they name the
+agent that made a change by the name its client reports, store it with the change, and fall
+back to "your agent".
+* **Source.** `initialize.params.clientInfo` (`name`, optional `title`), forwarded on each IPC
+  request (§30.3). `model::AgentName::from_client` maps it to a friendly name with an ordered
+  table matched on whole words of the name or title (`claude-code` → Claude, `codex-mcp-client`
+  → Codex, `gemini-cli-mcp-client` → Gemini, `cursor-vscode` → Cursor, …; the table in
+  `model::agent` is the reference). No row matches → the title, then the name, unless it is a
+  generic SDK default (`mcp`, `test`, …) or reads as the user or the app (`you`, `user`,
+  `Tuner`, …: "You added Arsenal" only ever means the user); otherwise unknown. A malformed
+  `agent` on the wire reads as absent, never a refused call.
+* **Shown:** "Codex added Arsenal · 3 reminders", "by Codex" / "added by Codex" (Following, the
+  follow sheet, spoiler rules), "marked seen by Codex", "Accept Codex's 55 fixes?", "Codex fixed
+  the guide for 55 channels", "55 changes · Codex" in Recent changes. Unknown: "your agent",
+  "Your agent" at a sentence start, "your agent's"; a real name keeps its own case ("iFlow").
+* **Client-supplied text, display only.** Sanitised wherever it enters (`AgentName::named`):
+  letters, digits, spaces and `-_.+'()` only, so no control or bidi characters, markup, `://`,
+  newlines or blank letters (Hangul fillers); trimmed; at most 32 chars; empty = unknown. Never a permission: any local client can
+  claim any name, so the caps, `spoiler_guard remove` and `guide_fix undo` check agent vs user
+  (`origin 'agent'`, `FixActor::Agent`), never the name. Never in desktop notifications;
+  `initialize` is logged at DEBUG only.
+* **Stored** (migration `0013_agent_names`): a nullable `agent` column on `follow_rule`,
+  `spoiler_rule`, `spoiler_seen` and `guide_fix_log`, written only for agent-made rows and kept
+  through edits. Rows an agent made before 0013 are backfilled to 'Claude' (only the Claude Code
+  plugin could make them), so NULL afterwards only means unknown. Stored keys are unchanged
+  (`origin 'agent'`, `actor 'claude'`; `FixActor::Agent` still serialises as "claude").
+  `channel_epg_map.actor` and `queue_item.added_by` get no name: neither is shown.
+* **Backups** (format version stays 1): the name is always written (`null` = unknown); a backup
+  without the key predates names and reads as Claude, like the backfill; older builds ignore it.
+* **Upgrades.** A new bridge talking to an older running app: the app ignores `agent` and keeps
+  saying Claude. An older bridge talking to a new app: no name, so "your agent".
+* The Claude Code plugin (§37) and `tuner claude-setup` stay Claude Code specific; the tool
+  result field `by_claude` became `by_agent` (RULES.md follows).
+
 ---
 
 ## Batch v0.2: five features, reminders, Claude skills (§31–§38)
@@ -5292,7 +5338,7 @@ track's notes in `docs/design/<track>.md`. The sections below are the contract a
 4. Multi-view: the sound stays where it is until `M`; moving a picture to its other playlist
    always asks. Both of the user's accounts allow one connection each, so the two pictures come
    from different playlists.
-5. Claude never unlocks, reveals explicit content or loosens a setting.
+5. An agent never unlocks, reveals explicit content or loosens a setting.
 6. Every design's open questions took the recommended default.
 
 **Shared blocks** (plan §1): B1 one play router (`playback::route`: who may take which picture,
@@ -5306,7 +5352,8 @@ channel_epg.shift_min, channel.tvg_shift_min)`, one select for the library, the 
 catch-up).
 
 **Migrations** 0008 (reminder modes), 0009 (guide fixes), 0010 (Up next), 0011 (Following),
-0012 (spoiler guard). All are additive; older builds ignore the new columns and tables.
+0012 (spoiler guard), 0013 (agent names, §30.12). All are additive; older builds ignore the
+new columns and tables.
 
 ## 31. Guide fixes
 
@@ -5352,7 +5399,7 @@ Suggested, No guide. Each row's "why" is a fixed phrase; no URL ever appears.
 * **Debounced before it is submitted** (30 s; a request in the window pushes the deadline back),
   so it never holds the "features" lane or shows as a job while it waits. Requested after a
   guide import or rematch, a playlist import, an applied or undone batch that changed rules or
-  mappings (the screen's and Claude's), and a threshold change. The GUI checks the stamp once
+  mappings (the screen's and an agent's), and a threshold change. The GUI checks the stamp once
   after its first library publish. A headless `tuner --refresh` never checks (`JobContext::
   headless`).
 * "Include hidden" channels aren't scored by the check (tens of thousands); the screen scores
@@ -5361,18 +5408,18 @@ Suggested, No guide. Each row's "why" is a fixed phrase; no URL ever appears.
 ### 31.5 Guardrails
 * The universe is the library snapshot: explicit, hidden and filtered channels follow its
   visibility (counts and coverage too).
-* Claude's batches: at most 200 channels; more than 50 isn't applied from chat
+* An agent's batches: at most 200 channels; more than 50 isn't applied from chat
   (`pending_review`): the handler hands the proposal to Tuner (`AgentCommand::GuideFixReview`,
   the window raised, out of the pop-out), which opens Guide fixes with its confirm card
-  prefilled ("Accept Claude's N fixes?"). Enter applies it as Claude's batch (toast with Undo;
-  `stale` if the guide or a playlist changed meanwhile: nothing applies and the toast says so);
-  Esc drops it, and Claude proposes again or a narrower batch. A newer batch replaces one still
-  waiting for its card (toast "Claude's earlier guide fixes were replaced by its newer ones"); a
-  card already open is never replaced (the newer one waits for it). A batch applied from chat toasts
-  "Claude fixed the guide for N channels" with Undo;
+  prefilled ("Accept Codex's N fixes?", named as in §30.12). Enter applies it as the agent's
+  batch (toast with Undo; `stale` if the guide or a playlist changed meanwhile: nothing applies
+  and the toast says so); Esc drops it, and the agent proposes again or a narrower batch. A newer
+  batch replaces one still waiting for its card (toast "Codex's newer guide fixes replaced the
+  earlier ones"); a card already open is never replaced (the newer one waits for it). A batch
+  applied from chat toasts "Codex fixed the guide for N channels" with Undo;
   proposals live 10 minutes and are bound to the stamp; locked channels and rules for a
-  playlist with a PIN-locked channel are refused while locked; Claude undoes only its own
-  batches.
+  playlist with a PIN-locked channel are refused while locked; an agent undoes only batches an
+  agent made (whichever agent), never the user's.
 * Backup carries time shifts, dismissals and manual mappings with their guide name and who chose
   them (restore keeps a shift already set on this machine).
 
@@ -5438,7 +5485,7 @@ Rules (`follow_rule`, migration 0011) that watch the guide for a team, a show, a
 news bulletin or custom terms, and set reminders, switches or news flashes for what they find.
 Templates: Team, Show, Event, News flash, Custom. Set up from a programme (`R`, the popover's
 "Follow…" / "News flash this daily…", the item menus' "Follow this programme…"), Settings ▸
-Following ("+ Follow…", the rules in priority order, Upcoming for 14 days), or Claude.
+Following ("+ Follow…", the rules in priority order, Upcoming for 14 days), or an agent.
 
 ### 33.2 Evaluation (`jobs::follow`, `follow::plan`, `store::follow`)
 * Triggers: a guide import or rematch (B7), a mapping change, a rule change, a new library
@@ -5467,7 +5514,7 @@ Following ("+ Follow…", the rules in priority order, Upcoming for 14 days), or
 A rule's switch goes through B1 (`PlaySource::Reminder { rule }`): over a film, episode or
 catch-up it becomes a notification with Watch (`follow.interrupt_vod` can allow it; never for a
 news flash). A locked target while locked becomes "… · needs your PIN". Clashes: your own or
-Claude's switches win, then rule priority, then the earlier start; the loser notifies.
+an agent's switches win, then rule priority, then the earlier start; the loser notifies.
 
 ### 33.4 News flash
 * A News rule in Flash mode: daily or weekdays, matched from the guide each day (it follows
@@ -5489,14 +5536,15 @@ Claude's switches win, then rule priority, then the earlier start; the loser not
   or closes if it showed nothing, and the sound returns where it was. A late flash on catch-up
   ends that much later; one whose headlines are already over doesn't start.
 
-### 33.5 Feedback and Claude
-* "Following: Chelsea · 1 in the guide" with **Undo** for a new rule; Claude's rules toast
-  "Claude added X · N reminders" with Undo (`Action::UndoFollow`).
+### 33.5 Feedback and agents
+* "Following: Chelsea · 1 in the guide" with **Undo** for a new rule; an agent's rules toast
+  "Codex added X · N reminders" (the agent's name, §30.12) with Undo (`Action::UndoFollow`).
 * A summary notification at most every 12 h, only with additions, with **Open** (and a click on
   it): the window is raised and shows Settings ▸ Following (`FollowEvent::Open`). Without a
   notification server it is an in-app toast with the same Open (`Action::OpenFollowing`).
-* Claude's rules are marked, capped (10 an hour, 20 in all); Claude can't turn a rule's
-  spoiler-safe off; a concealed channel's match is named by the rule only.
+* Agents' rules are marked with the agent's name ("by Codex", "added by Codex") and capped
+  (10 an hour, 20 in all, for all agents together); an agent can't turn a rule's spoiler-safe
+  off; a concealed channel's match is named by the rule only.
 * Upcoming rows in Settings go through the spoiler guard and skip concealed channels.
 
 ### 33.6 Settings ▸ Following
@@ -5568,11 +5616,12 @@ MCP reply (`guard::reply::guard_json`). Painters cache per programme, minute and
 * The snapshot rebuilds on guard, library, guide, follow and progress changes, but not every
   progress save while a film, episode or catch-up plays.
 
-### 34.4 Claude
+### 34.4 Agents
 `spoiler_guard` adds topics and blackouts (a programme blackout guards its two teams) and
-marks seen; `remove` only removes Claude's own rules ("that rule is yours — remove it in Tuner ▸
-Settings ▸ Spoiler guard"). Replies drop guarded fields unless the call names the item in
-`reveal_spoilers`.
+marks seen; Settings shows such rules as "added by <agent>" and the marks as "marked seen by
+<agent>" (§30.12). `remove` only removes rules an agent added, whichever agent ("that rule is
+yours — remove it in Tuner ▸ Settings ▸ Spoiler guard"). Replies drop guarded fields unless the
+call names the item in `reveal_spoilers`.
 
 ### 34.5 Series airings without S/E
 Slim guide rows (grid, now/next, search hits) carry the guide's season and episode, so most
@@ -5622,13 +5671,13 @@ with the sound). Esc never closes a picture.
 * **Sound and volume** act on the picture with the sound (volume, mute, sleep-timer and flash
   mutes included). If the picture given the sound fails while the other plays, the sound goes
   back.
-* **Parental.** The PIN gate runs before a picture is chosen, for Ctrl+M and for Claude's two
-  pictures alike; the stored plays go out once the PIN is typed and are forgotten on relock.
+* **Parental.** The PIN gate runs before a picture is chosen, for Ctrl+M and for an agent's
+  two pictures alike; the stored plays go out once the PIN is typed and are forgotten on relock.
   Relocking stops only the pictures showing a locked channel or explicit content.
 * Picture B starts lazily on the first request (its own mpv, muted, small caches) and lives
   until exit.
 
-### 35.3 Claude
+### 35.3 Agents
 `multiview open` with two refs plans both pictures at once (one plan, so the second never
 plans against what the first replaces): from single view the focused picture and the other,
 with multi-view on A and B (the layout's places and the sound stay; both claims move before
@@ -5734,6 +5783,9 @@ returns a log line or a URL.
 * `claude plugin validate ./plugins/omatuner --strict` and `claude plugin validate .` pass; a
   test checks every `allowed-tools` name is a real tool and that the plugin's version follows
   the app's.
+* The plugin is Claude Code only: the skills read `${CLAUDE_SKILL_DIR}` and list Claude Code's
+  plugin tool names. Other agents use `tuner mcp` directly (README "Use Tuner from an AI
+  agent") and get the tools, their descriptions and `tools::INSTRUCTIONS`, without the skills.
 
 ## 38. Playlist codes and a faster library load
 
