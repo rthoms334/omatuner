@@ -23,6 +23,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS spoiler_rule_series ON spoiler_rule(series_nor
 CREATE TABLE IF NOT EXISTS spoiler_seen (
   event_key   TEXT    NOT NULL,                    -- textmatch::event_key (shared with follow_match)
   first_start INTEGER NOT NULL,                    -- EPG time of the first airing
+  title       TEXT    NOT NULL DEFAULT '',         -- as the guide wrote it (Settings "Seen recently")
+  series_norm TEXT,                                -- normalize_name(series) when S/E known
   season      INTEGER,
   episode     INTEGER,
   seen_at     INTEGER NOT NULL,
