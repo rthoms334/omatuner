@@ -13,6 +13,7 @@ pub mod mpris;
 pub mod notify;
 pub mod popout;
 pub mod signals;
+pub mod systemd;
 
 use crate::model::{ItemRef, ReminderId};
 
