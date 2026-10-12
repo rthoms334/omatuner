@@ -724,9 +724,11 @@ pub fn guide_search(q: &Q, p: &GuideSearch) -> Out<GuideSearchOut> {
     };
     let extras = q.extras(&hits.iter().map(|(p, _)| p.id).collect::<Vec<_>>())?;
     let none = Extra::default();
-    // one row per programme as shown (title + shifted start): its channels best first
+    // one row per programme as shown (title + shifted start and stop): its channels best first.
+    // The stop is part of it: the same title at the same start but ending at different times is
+    // two programmes (the row's airing and its first channel's ref must agree)
     let mut rows: Vec<(ProgrammeSlim, Vec<&ChannelSummary>)> = Vec::new();
-    let mut index: HashMap<(String, Timestamp), usize> = HashMap::new();
+    let mut index: HashMap<(String, Timestamp, Timestamp), usize> = HashMap::new();
     for (prog, ids) in &hits {
         let x = extras.get(&prog.id).unwrap_or(&none);
         if !x.in_categories(&cats)
@@ -744,7 +746,7 @@ pub fn guide_search(q: &Q, p: &GuideSearch) -> Out<GuideSearchOut> {
             if p.catchup_only == Some(true) && !q.catchup(c, &shown) {
                 continue;
             }
-            let key = (shown.title.to_lowercase(), shown.start);
+            let key = (shown.title.to_lowercase(), shown.start, shown.stop);
             match index.get(&key) {
                 Some(&i) => {
                     if !rows[i].1.iter().any(|x| x.id == c.id) {

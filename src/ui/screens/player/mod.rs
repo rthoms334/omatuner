@@ -834,6 +834,10 @@ mod tests {
     #[test]
     fn the_osd_volume_slider_sets_the_volume_and_the_speaker_mutes() {
         let mut h = player(WIDE);
+        // the banner stays up however slow mpv is to answer under a loaded test run
+        let mut cfg = (*h.state().t.config).clone();
+        cfg.interface.osd_timeout_ms = 60_000;
+        h.state_mut().t.config = Arc::new(cfg);
         let c = h.get_by_label("Volume").rect().center();
         h.hover_at(c);
         h.drag_at(c);
