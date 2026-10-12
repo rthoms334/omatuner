@@ -5,8 +5,8 @@
 # usage: scripts/screenshots.sh [shot...]          (default: every shot listed below)
 #
 # Needs a Hyprland session (each window floats itself at an exact size, centred on the
-# current workspace; don't type while it runs), cargo, curl and ffmpeg. pngquant and oxipng
-# shrink the PNGs when installed. Nothing of your own setup reaches the images: every shot runs on a
+# current workspace; don't type while it runs), cargo, curl and ffmpeg. pngquant (else ffmpeg) and oxipng
+# shrink the PNGs. Nothing of your own setup reaches the images: every shot runs on a
 # fresh copy of the demo profile in target/screenshots/, with a bundled theme
 # (TUNER_THEME_DIR) instead of your Omarchy theme.
 #
@@ -94,18 +94,39 @@ shot live        "$hero" "$dark"  live     "key:Enter;wait:3" 3
 shot guide       "$big"  "$dark"  guide    "key:F;key:Down;key:Down;key:Down;key:Enter;wait:0.5;key:Down;key:Down;key:Right" 2
 shot movies      "$big"  "$dark"  movies   "key:Right;key:Left"
 shot stack       "$big"  "$dark"  movies   "key:Space;wait:1"
-shot detail      "$big"  "$dark"  series   "key:Enter;wait:1.5"
+shot detail      "$big"  "$dark"  series   "wait:5;key:Enter;wait:1.5"
 shot player      "$big"  "$dark"  live     "play:$PLAY_DOCS;wait:3;key:Enter;move:1400,940;wait:0.5" 1
 shot popout      "$big"  "$dark"  live     "play:$PLAY_SPORTS;wait:5;text:o;wait:2;move:240,200" 1
 shot live-half   "$half" "$dark"  live     "key:Down;key:Down;key:Down;key:Down;key:Enter;wait:3" 3
 shot categories  "$big"  "$dark"  live     "categories:$NORTHWIND_ID;wait:1"
 shot help        "$big"  "$dark"  home     "key:F1;text:guide;wait:0.5"
 shot settings    "$big"  "$light" settings "wait:0.5"
+# v0.2 features
+shot upnext      "$big"  "$dark"  home     "key:Alt+6;wait:1"
+shot multiview   "$big"  "$dark"  live     "play:$PLAY_DOCS;wait:4;key:Ctrl+M;wait:0.5;text:lumen;wait:0.5;key:Enter;wait:5;move:1400,940;wait:0.5" 1
+shot following   "$big"  "$dark"  settings "key:Left;key:Down;key:Down;key:Down;key:Down;key:Down;key:Down;wait:1"
+shot reminders   "$big"  "$dark"  settings "key:Left;key:Down;key:Down;key:Down;key:Down;key:Down;wait:1"
+# the guide check is debounced 30 s (jobs::guide_check::DEBOUNCE): shoot once it is done
+shot guidefix    "$big"  "$dark"  settings "key:Left;key:Down;key:Right;key:Down;key:Down;key:Down;key:Down;key:Enter;wait:34"
 
 # Every regeneration adds the images to git history again: rerun it only when the UI changes.
 # pngquant (lossy, 256 colours) roughly halves them; oxipng then recompresses losslessly.
+# Without pngquant, ffmpeg (already needed) does a 256-colour pass, kept only if smaller; it
+# skips the video-heavy shots (live, live-half, popout), where its dithering shows.
 if command -v pngquant >/dev/null && ((${#taken[@]})); then
   pngquant --quality 70-90 --skip-if-larger --force --ext .png "${taken[@]}" || true
+elif ((${#taken[@]})); then
+  for png in "${taken[@]}"; do
+    case $(basename "$png" .png) in live | live-half | popout) continue ;; esac
+    tmp=${png%.png}.q.png
+    if ffmpeg -loglevel error -y -i "$png" -lavfi \
+        "split[a][b];[a]palettegen=max_colors=256:stats_mode=full[p];[b][p]paletteuse=dither=sierra2_4a" \
+        "$tmp" && (($(stat -c%s "$tmp") < $(stat -c%s "$png"))); then
+      mv "$tmp" "$png"
+    else
+      rm -f "$tmp"
+    fi
+  done
 fi
 if command -v oxipng >/dev/null && ((${#taken[@]})); then
   oxipng -q -o 4 --strip safe "${taken[@]}"

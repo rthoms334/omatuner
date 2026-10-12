@@ -150,6 +150,8 @@ impl Engine {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Msg>) {
         let mut snaps = self.shared.main_player();
         let mut tiles = Some(self.shared.subscribe_tiles());
+        // the engine usually starts before the first library: its rows show once one is in
+        let mut libs = Some(self.shared.subscribe_library());
         if let Some(s) = &mut snaps {
             self.last = s.borrow_and_update().clone();
         }
@@ -188,6 +190,16 @@ impl Engine {
                     }
                     let on = tiles.as_mut().is_some_and(|t| t.borrow_and_update().on);
                     self.input(Input::MultiView(on)).await;
+                }
+                ok = changed(&mut libs) => {
+                    if !ok {
+                        libs = None;
+                        continue;
+                    }
+                    if let Some(l) = libs.as_mut() {
+                        l.borrow_and_update();
+                    }
+                    self.refresh_facts().await;
                 }
                 _ = tokio::time::sleep(wait) => {
                     if wait == RECHECK {

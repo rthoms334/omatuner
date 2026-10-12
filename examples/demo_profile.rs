@@ -1,6 +1,6 @@
 //! A made-up demo profile for screenshots (README) and manual checks: three fictional playlists,
-//! a day of guide, movies and series with generated posters, and some favourites, history,
-//! progress and a reminder.
+//! a few days of guide, movies and series with generated posters, and some favourites, history,
+//! progress, reminders, Up next, Following rules and channels for Guide fixes.
 //!
 //! `cargo run --example demo_profile -- <dir> [--media <video file>] [--silent]`, then
 //! `tuner --profile-dir <dir>`. `--silent` gives mpv no audio output (screenshots).
@@ -25,16 +25,19 @@ use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::Receiver;
 use rusqlite::{Connection, params};
 use tuner::config::{Config, StartScreen};
+use tuner::follow::{ChannelScope, FollowKind, FollowMode, FollowReason, FollowRule};
 use tuner::jobs::{JobContext, JobEvent, JobKind, JobManager, JobOutcome};
 use tuner::model::{
-    EpgSourceKind, HistoryEntry, ItemKey, ItemKind, ItemRef, MovieId, Reminder, ReminderId, ReminderState, SourceColor, SourceDraft, SourceId,
-    SourceKind, SourceSettings, Timestamp, WatchProgress,
+    AccountInfo, AccountStatus, EpgSourceKind, HistoryEntry, ItemKey, ItemKind, ItemRef, MovieId, OpenIn, Reminder, ReminderId, ReminderMode,
+    ReminderState, SourceColor, SourceDraft, SourceId, SourceKind, SourceSettings, Timestamp, WatchProgress,
 };
 use tuner::msg::{AppEvent, EventBus};
 use tuner::paths::AppPaths;
+use tuner::queue::model::{AddedBy, Insert, RowState};
 use tuner::sources::http::HttpClient;
 use tuner::store::Store;
 use tuner::store::import::MovieDetails;
+use tuner::store::queue::NewRow;
 use tuner::ui::widgets::glyphs;
 
 const SEED: u64 = 0x7475_6e65_7264_656d; // "tunerdem"
@@ -144,6 +147,8 @@ const NORTHWIND_LIVE: Lineup = &[
     ("DE | Kino", "Kino Funke", " FHD"),
     ("UK | Lifestyle", "Ember Food", " HD"),
     ("UK | Lifestyle", "Saffron Kitchen", " HD"),
+    // "+1 without shift" in Guide fixes: the base's guide, an hour early
+    ("UK | Entertainment", "Brightside", " +1"),
 ];
 
 const AURORA_LIVE: Lineup = &[
@@ -184,7 +189,13 @@ const HARBOR_LIVE: Lineup = &[
     ("Kids", "Doodle Lab", " HD"),
     ("Community", "Brightside", ""),
     ("Music", "Cobalt Music", ""),
+    // no guide lists these (Guide fixes: "No guide")
+    ("Community", "Quarry Lane TV", ""),
+    ("Community", "Seabright Local", " HD"),
 ];
+
+/// (name, hue) of the channels no guide lists: a logo, no programmes.
+const UNLISTED: &[(&str, u32)] = &[("Quarry Lane TV", 75), ("Seabright Local", 165)];
 
 /// (title, year, genre line, minutes): the movie catalogue.
 const MOVIES: &[(&str, u16, &str, u32)] = &[
@@ -210,6 +221,10 @@ const MOVIES: &[(&str, u16, &str, u32)] = &[
     ("Echoes in Amber", 2025, "Drama, History", 128),
     ("The Clockmaker's Daughter", 2012, "Fantasy", 112),
     ("Blue Hour Express", 2024, "Action", 106),
+    // a trilogy (Up next)
+    ("Starling Bay", 2016, "Adventure, Drama", 112),
+    ("Starling Bay: Undertow", 2019, "Adventure, Thriller", 118),
+    ("Starling Bay: Landfall", 2023, "Adventure, Drama", 124),
 ];
 
 /// Movies or series of one playlist: (index in MOVIES / SERIES, language prefix, 4K copy,
@@ -235,6 +250,9 @@ const NORTHWIND_MOVIES: VodLineup = &[
     (17, "EN - ", false, "EN | Movies"),
     (19, "EN - ", false, "EN | Movies"),
     (20, "EN - ", false, "EN | Kids"),
+    (22, "EN - ", false, "EN | Movies"),
+    (23, "EN - ", false, "EN | Movies"),
+    (24, "EN - ", false, "EN | Movies"),
 ];
 const AURORA_MOVIES: VodLineup = &[
     (0, "EN - ", true, "EN | 4K Movies"),
@@ -250,6 +268,7 @@ const AURORA_MOVIES: VodLineup = &[
     (18, "EN - ", false, "EN | New Releases"),
     (19, "EN - ", true, "EN | 4K Movies"),
     (21, "EN - ", false, "EN | New Releases"),
+    (24, "EN - ", true, "EN | 4K Movies"),
 ];
 
 /// (title, year, seasons, episodes per season, genre).
@@ -646,6 +665,15 @@ fn m3u(p: &Playlist, media: &str) -> String {
     s
 }
 
+/// Fixtures at fixed local times, for Following's team rule: (channel brand, days after today,
+/// local start in minutes, title, minutes, live). The rest of the guide is generated around them.
+const FIXTURES: &[(&str, i64, i64, &str, i64, bool)] = &[
+    ("Bluefield Sports", 1, 15 * 60, "Northport Albion v Granite Rovers", 120, true),
+    ("Goalpost TV", 1, 20 * 60, "Kestrel United v Harbour City", 120, true),
+    ("Summit Sports 2", 1, 23 * 60, "Northport Albion v Granite Rovers", 120, false),
+    ("Summit Sports", 2, 19 * 60 + 45, "Harbour City v Northport Albion", 120, true),
+];
+
 /// One programme of the demo guide.
 struct Prog {
     channel: String,
@@ -654,7 +682,7 @@ struct Prog {
     title: String,
 }
 
-/// A guide from 06:00 yesterday to 06:00 the day after tomorrow (local), for every brand.
+/// A guide from 06:00 yesterday to 06:00 three days ahead (local), for every brand.
 fn guide(day_start: Timestamp) -> (String, Vec<Prog>) {
     let mut progs = Vec::new();
     let mut s = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<tv generator-info-name=\"tuner demo_profile\">\n");
@@ -665,25 +693,40 @@ fn guide(day_start: Timestamp) -> (String, Vec<Prog>) {
     for (name, genre, _) in BRANDS {
         let mut rng = Rng::new(name);
         let titles = programmes(*genre);
+        let fixtures: Vec<(Timestamp, &str, i64, bool)> = FIXTURES
+            .iter()
+            .filter(|f| f.0 == *name)
+            .map(|&(_, day, minute, title, minutes, live)| (day_start + day * 86_400 + minute * 60, title, minutes * 60, live))
+            .collect();
         let mut prev = String::new();
         let mut t = day_start - 18 * 3600;
-        let end = day_start + 2 * 86_400 + 6 * 3600;
+        let end = day_start + 3 * 86_400 + 6 * 3600;
         while t < end {
-            let len = match genre {
-                Genre::Cinema => 90 + 15 * rng.below(3) as i64,
-                Genre::News | Genre::Weather => 30 * (1 + rng.below(2) as i64),
-                _ => 30 * (1 + rng.below(3) as i64),
-            } * 60;
-            let title = programme_title(&mut rng, *genre, titles, (t - day_start).rem_euclid(86_400) / 3600, &prev);
+            let (title, len, live) = match fixtures.iter().find(|f| f.0 == t) {
+                Some(&(_, title, len, live)) => (title.to_owned(), len, live),
+                None => {
+                    let mut len = match genre {
+                        Genre::Cinema => 90 + 15 * rng.below(3) as i64,
+                        Genre::News | Genre::Weather => 30 * (1 + rng.below(2) as i64),
+                        _ => 30 * (1 + rng.below(3) as i64),
+                    } * 60;
+                    // end where the next fixture starts
+                    if let Some(f) = fixtures.iter().find(|f| f.0 > t && f.0 < t + len) {
+                        len = f.0 - t;
+                    }
+                    (programme_title(&mut rng, *genre, titles, (t - day_start).rem_euclid(86_400) / 3600, &prev), len, false)
+                }
+            };
             prev.clone_from(&title);
             let _ = writeln!(
                 s,
-                "  <programme start=\"{}\" stop=\"{}\" channel=\"{}.demo\"><title>{}</title><desc>{}</desc></programme>",
+                "  <programme start=\"{}\" stop=\"{}\" channel=\"{}.demo\"><title>{}</title><desc>{}</desc>{}</programme>",
                 fmt(t),
                 fmt(t + len),
                 slug(name),
                 xml(&title),
-                xml(&blurb(*genre, &title))
+                xml(&blurb(*genre, &title)),
+                if live { "<live />" } else { "" }
             );
             progs.push(Prog { channel: slug(name), start: t, stop: t + len, title });
             t += len;
@@ -773,6 +816,8 @@ pub fn build(dir: &Path, media: Option<&Path>, silent: bool) -> Result<Summary> 
         cfg.player.mpv_options.insert("ao".into(), "null".into());
     }
     cfg.integration.mpris = false;
+    cfg.follow.news_flash.quiet_from_min = Some(22 * 60);
+    cfg.follow.news_flash.quiet_to_min = Some(7 * 60);
     cfg.save(&paths.config_file())?;
 
     // images
@@ -784,8 +829,8 @@ pub fn build(dir: &Path, media: Option<&Path>, silent: bool) -> Result<Summary> 
         std::fs::write(&p, png)?;
         Ok(())
     };
-    for (name, _, hue) in BRANDS {
-        put(&format!("{IMG}/logo/{}.png", slug(name)), painter.png(&logo_svg(name, *hue))?)?;
+    for (name, hue) in BRANDS.iter().map(|b| (b.0, b.2)).chain(UNLISTED.iter().copied()) {
+        put(&format!("{IMG}/logo/{}.png", slug(name)), painter.png(&logo_svg(name, hue))?)?;
     }
     for (title, year, ..) in MOVIES.iter().map(|m| (m.0, m.1)).chain(SERIES.iter().map(|s| (s.0, s.1))) {
         let mut rng = Rng::new(title);
@@ -836,11 +881,14 @@ pub fn build(dir: &Path, media: Option<&Path>, silent: bool) -> Result<Summary> 
     let now = tuner::model::now();
     let progs = Arc::new(progs);
     let p2 = progs.clone();
+    let follow_cfg = cfg.follow.clone();
     store.writer().blocking(move |c| {
         details(c, now)?;
         user_data(c, now, &p2)?;
+        follow_rules(c, now, &follow_cfg)?;
         Ok(())
     })?;
+    run(&jobs, &events, JobKind::EvaluateFollows { reason: FollowReason::Rules })?;
     if let JobOutcome::Library(lib) = run(&jobs, &events, JobKind::RebuildLibrary)? {
         summary.library = lib;
     }
@@ -958,6 +1006,33 @@ fn details(c: &mut Connection, now: Timestamp) -> tuner::error::Result<()> {
     Ok(())
 }
 
+/// Following: a team with fixtures in the guide, a daily news flash, a show that is only listed.
+/// Nothing they set fires within the next few hours (the fixtures are tomorrow and the day
+/// after; the news flash takes a bulletin that isn't due soon).
+fn follow_rules(c: &mut Connection, now: Timestamp, cfg: &tuner::config::FollowConfig) -> tuner::error::Result<()> {
+    use tuner::store::follow::save_rule;
+    let team = FollowRule::draft("Northport Albion", FollowKind::Team, vec!["Northport Albion".into()], cfg, now);
+    save_rule(c, &team, cfg.max_rules, now)?;
+
+    let (key, source): (String, i64) = c.query_row(
+        "SELECT c.key, c.source_id FROM channel c JOIN source s ON s.id = c.source_id WHERE s.name = 'Northwind' AND c.name LIKE 'Meridian News%'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let meridian = ItemRef { source: SourceId(source), kind: ItemKind::Channel, key: ItemKey(key) };
+    let hour = jiff::Zoned::now().hour();
+    let (title, between) = if (15..21).contains(&hour) { ("Morning Briefing", (7 * 60, 8 * 60)) } else { ("The Evening Report", (18 * 60, 19 * 60)) };
+    let mut news = FollowRule::draft(title, FollowKind::News, vec![title.into()], cfg, now);
+    news.spec.between = Some(between);
+    news.spec.channels = ChannelScope::Channels(vec![meridian]);
+    save_rule(c, &news, cfg.max_rules, now)?;
+
+    let mut show = FollowRule::draft("Wild Frontiers", FollowKind::Show, vec!["Wild Frontiers".into()], cfg, now);
+    show.mode = FollowMode::List;
+    save_rule(c, &show, cfg.max_rules, now)?;
+    Ok(())
+}
+
 fn movie_plot(genre: &str) -> String {
     let lead = match genre.split(',').next().unwrap_or("") {
         "Drama" | "Music" => "A family secret surfaces one winter and changes three lives for good.",
@@ -981,7 +1056,8 @@ fn series_plot(title: &str) -> String {
     format!("Season after season, the people of {title} keep each other's secrets — until they don't.")
 }
 
-/// Favourites, recently watched channels, Continue Watching and one reminder.
+/// Favourites, recently watched channels, Continue Watching, reminders, Up next and the
+/// playlists' connection limits.
 fn user_data(c: &mut Connection, now: Timestamp, progs: &[Prog]) -> tuner::error::Result<()> {
     use tuner::store::user;
     let one = |c: &Connection, sql: &str, source: i64, like: &str| -> tuner::error::Result<Option<ItemRef>> {
@@ -1083,9 +1159,11 @@ fn user_data(c: &mut Connection, now: Timestamp, progs: &[Prog]) -> tuner::error
         )?;
     }
 
-    // a reminder for the next sports programme starting in an hour or more
-    let ch = need(channel(c, north, "Bluefield Sports")?, "Bluefield Sports")?;
-    if let Some(p) = progs.iter().filter(|p| p.channel == "bluefield-sports" && p.start >= now + 3600).min_by_key(|p| p.start) {
+    // reminders: a notification for the next sports programme starting in 90 min or more, an
+    // automatic switch (into the pop-out) and a film night; none fires within the hour
+    let remind = |src: i64, name: &str, brand: &str, after: i64, lead_s: i64, switch: bool| -> tuner::error::Result<()> {
+        let ch = need(channel(c, src, name)?, name)?;
+        let Some(p) = progs.iter().filter(|p| p.channel == slug(brand) && p.start >= now + after).min_by_key(|p| p.start) else { return Ok(()) };
         let channel_name: String =
             c.query_row("SELECT name FROM channel WHERE source_id = ?1 AND key = ?2", params![ch.source, ch.key.0], |r| r.get(0))?;
         user::add_reminder(
@@ -1097,14 +1175,69 @@ fn user_data(c: &mut Connection, now: Timestamp, progs: &[Prog]) -> tuner::error
                 programme_title: p.title.clone(),
                 start: p.start,
                 stop: p.stop,
-                lead_s: 300,
+                lead_s: if switch { Reminder::SWITCH_LEAD } else { lead_s },
                 state: ReminderState::Pending,
-                mode: Default::default(),
+                mode: if switch { ReminderMode::Switch } else { ReminderMode::Notify },
                 offset_s: 0,
-                open_in: None,
+                open_in: switch.then_some(OpenIn::PopOut),
                 rule_id: None,
             },
         )?;
+        Ok(())
+    };
+    remind(north, "Bluefield Sports", "Bluefield Sports", 90 * 60, 300, false)?;
+    remind(north, "Lumen Docs", "Lumen Docs", 2 * 3600, 0, true)?;
+    remind(aurora, "Northstar Cinema", "Northstar Cinema", 3 * 3600, 600, false)?;
+
+    // Up next: the trilogy's first film played, an episode, then the other two films
+    let mut rows = Vec::new();
+    for (title, year, minutes) in MOVIES.iter().filter(|m| m.0.starts_with("Starling Bay")).map(|m| (m.0, m.1, m.3)) {
+        // the plain title would also find its sequels
+        let item = need(
+            one(c, "SELECT source_id, key FROM movie WHERE source_id = ?1 AND name LIKE ?2 ORDER BY id", north, &format!("{title} ("))?
+                .map(|i| ItemRef { kind: ItemKind::Movie, ..i }),
+            title,
+        )?;
+        rows.push(NewRow {
+            item,
+            any_copy: true,
+            programme: None,
+            title: format!("{title} ({year})"),
+            subtitle: None,
+            duration_s: Some(f64::from(minutes * 60)),
+            from_start: false,
+            by: AddedBy::App,
+        });
+    }
+    let ep: (i64, String, String, i64, i64) = c.query_row(
+        "SELECT e.source_id, e.key, e.title, e.season, e.episode FROM episode e JOIN series s ON s.id = e.series_id
+         WHERE s.source_id = ?1 AND s.name LIKE '%Fernwood Station%' AND e.season = 2 AND e.episode = 4",
+        [north],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    )?;
+    rows.insert(
+        2,
+        NewRow {
+            item: ItemRef { source: SourceId(ep.0), kind: ItemKind::Episode, key: ItemKey(ep.1) },
+            any_copy: true,
+            programme: None,
+            title: "Fernwood Station".into(),
+            subtitle: Some(format!("S{:02}E{:02} · {}", ep.3, ep.4, ep.2)),
+            duration_s: Some(1560.0),
+            from_start: false,
+            by: AddedBy::App,
+        },
+    );
+    let added = tuner::store::queue::add(c, &rows, Insert::End, now - 4 * 3600)?;
+    if let Some(&first) = added.ids.first() {
+        tuner::store::queue::set_state(c, first, RowState::Played, now - 2 * 3600)?;
+    }
+
+    // one connection per playlist (multi-view then takes the other picture from the other
+    // playlist), as on the accounts multi-view was designed for
+    for src in [north, aurora] {
+        let account = AccountInfo { status: AccountStatus::Active, max_connections: Some(1), ..Default::default() };
+        tuner::store::sources::set_account(c, SourceId(src), &account)?;
     }
     Ok(())
 }

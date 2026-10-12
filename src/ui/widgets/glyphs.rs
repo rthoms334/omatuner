@@ -76,7 +76,8 @@ pub const MUSIC: &str = "\u{f075a}";
 pub const SORT: &str = "\u{f04ba}";
 pub const TAG: &str = "\u{f04f9}";
 pub const BUSY: &str = "\u{f051f}";
-pub const BACKUP: &str = "\u{f0c4e}";
+/// nf-md-backup_restore.
+pub const BACKUP: &str = "\u{f006f}";
 pub const DISPLAY: &str = "\u{f0379}";
 pub const THEME: &str = "\u{f03d8}";
 pub const REORDER: &str = "\u{f01dd}";

@@ -37,6 +37,8 @@ use crate::ui::ParentalSession;
 #[derive(Debug)]
 pub struct AppShared {
     lib: RwLock<Arc<Library>>,
+    /// The published snapshot's generation, for services that follow the library (Up next).
+    lib_generation: watch::Sender<u64>,
     unlocked_at: Mutex<Option<Instant>>,
     /// The reminder scheduler's waker (`Services::start_reminders`): a switch the handler
     /// wrote is picked up at once, UI frame or not.
@@ -81,6 +83,7 @@ impl AppShared {
     pub fn new(explicit: ExplicitGate) -> Self {
         Self {
             lib: RwLock::default(),
+            lib_generation: watch::Sender::new(0),
             unlocked_at: Mutex::default(),
             reminders: Mutex::default(),
             explicit,
@@ -106,7 +109,15 @@ impl AppShared {
         if Arc::ptr_eq(&cur, lib) {
             return None;
         }
-        Some(std::mem::replace(&mut *cur, lib.clone()))
+        let old = std::mem::replace(&mut *cur, lib.clone());
+        drop(cur);
+        self.lib_generation.send_replace(lib.generation);
+        Some(old)
+    }
+
+    /// Wakes when a new snapshot is published (its generation).
+    pub fn subscribe_library(&self) -> watch::Receiver<u64> {
+        self.lib_generation.subscribe()
     }
 
     /// The last published snapshot (`Library::default()` — `built_at` 0 — before the first).
