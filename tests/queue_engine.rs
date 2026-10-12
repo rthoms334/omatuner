@@ -1,0 +1,347 @@
+//! Up next (DESIGN §32): `queue_item` storage (order, cap, pruning, reattach, backup, retime)
+//! and the engine end to end — real store, real library snapshot, a recording player — from
+//! an add to the advance after `Ended`, the PIN and MCP guardrails, and a restart that plays
+//! nothing. The state machine's own rules are unit-tested in `queue::machine`. Owner: Q-core.
+
+mod support;
+
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
+
+use rusqlite::Connection;
+use support::seed;
+use tokio::sync::watch;
+use tuner::config::{Config, SharedConfig};
+use tuner::model::{ItemKey, ItemKind, ItemRef, MediaRef, PlayOrigin, Playable, PlayableKind, QueueId, SourceId, Timestamp};
+use tuner::player::{PlayerCommand, PlayerSnapshot, PlayerState};
+use tuner::queue::{AddTarget, AddedBy, EngineDeps, Insert, PlayReply, PlayerPort, QueueCommand, QueueHandle, QueueReply, Refusal, RowState, Slot};
+use tuner::shared::AppShared;
+use tuner::store::Store;
+use tuner::store::queue::{self as q, NewRow};
+
+const NOW: Timestamp = 1_800_000_000;
+
+fn store() -> Store {
+    Store::open_temp("tuner-queue-test", None).unwrap()
+}
+
+fn w<R: Send + 'static>(s: &Store, f: impl FnOnce(&mut Connection) -> tuner::error::Result<R> + Send + 'static) -> R {
+    s.writer().blocking(f).unwrap()
+}
+
+fn movie_ref(src: SourceId, i: usize) -> ItemRef {
+    ItemRef { source: src, kind: ItemKind::Movie, key: ItemKey(format!("m3u:movie{i:010}")) }
+}
+
+fn row(item: ItemRef) -> NewRow {
+    NewRow { item, any_copy: true, programme: None, title: "t".into(), subtitle: None, duration_s: Some(60.0), from_start: false, by: AddedBy::App }
+}
+
+/// (id, position, state) in list order.
+fn listing(s: &Store) -> Vec<(QueueId, i64, String)> {
+    let c = s.reader().unwrap();
+    let mut st = c.prepare("SELECT id, position, state FROM queue_item ORDER BY position, id").unwrap();
+    st.query_map([], |r| Ok((QueueId(r.get(0)?), r.get(1)?, r.get(2)?))).unwrap().map(Result::unwrap).collect()
+}
+
+fn dense(s: &Store) -> bool {
+    listing(s).iter().enumerate().all(|(i, (_, p, _))| *p == i as i64)
+}
+
+/// Adds, "play next", moves and removals keep positions dense; a new current row demotes the
+/// old one and the unique index refuses a second.
+#[test]
+fn order_stays_dense_and_play_next_goes_before_the_first_pending_row() {
+    let s = store();
+    let src = w(&s, |c| seed::seed_source(c, "TV"));
+    w(&s, move |c| seed::seed_movies(c, src, 6));
+    let ids = w(&s, move |c| q::add(c, &(0..4).map(|i| row(movie_ref(src, i))).collect::<Vec<_>>(), Insert::End, NOW)).ids;
+    let (a, b) = (ids[0], ids[1]);
+    w(&s, move |c| q::set_state(c, a, RowState::Played, NOW));
+    w(&s, move |c| q::set_state(c, b, RowState::Current, NOW));
+    let n = w(&s, move |c| q::add(c, &[row(movie_ref(src, 4))], Insert::Next, NOW)).ids[0];
+    let order = |s: &Store| listing(s).into_iter().map(|(id, ..)| id).collect::<Vec<_>>();
+    assert_eq!(order(&s), vec![a, b, n, ids[2], ids[3]], "before the first pending row");
+    let last = ids[3];
+    w(&s, move |c| q::move_rows(c, &[last], Insert::Index(0)));
+    assert_eq!(order(&s)[0], last);
+    w(&s, move |c| q::remove(c, &[b]));
+    assert!(dense(&s));
+    assert_eq!(order(&s).len(), 4);
+
+    w(&s, move |c| q::set_state(c, n, RowState::Current, NOW));
+    let three = ids[2];
+    w(&s, move |c| q::set_state(c, three, RowState::Current, NOW));
+    let current: Vec<QueueId> = listing(&s).into_iter().filter(|r| r.2 == "current").map(|r| r.0).collect();
+    assert_eq!(current, vec![three], "the old current row went back to pending");
+    let two = s.writer().blocking(move |c| Ok(c.execute("UPDATE queue_item SET state = 'current' WHERE id = ?1", [n.0])?));
+    assert!(two.is_err(), "at most one current row");
+}
+
+/// Past 200 rows the oldest played rows make room; with only unplayed rows left the rest is
+/// refused. Pruning drops played rows after a week only.
+#[test]
+fn the_cap_evicts_old_played_rows_first_and_pruning_keeps_a_week() {
+    let s = store();
+    let src = w(&s, |c| seed::seed_source(c, "TV"));
+    w(&s, move |c| seed::seed_movies(c, src, 1));
+    let all: Vec<QueueId> = (0..4).flat_map(|_| w(&s, move |c| q::add(c, &vec![row(movie_ref(src, 0)); q::MAX_ADD], Insert::End, NOW)).ids).collect();
+    assert_eq!(all.len(), q::MAX_ROWS);
+    // played at different times: the oldest goes first
+    for (i, id) in all[..3].iter().copied().enumerate() {
+        w(&s, move |c| q::set_state(c, id, RowState::Played, NOW - 10 * 86_400 + i as i64));
+    }
+    let added = w(&s, move |c| q::add(c, &vec![row(movie_ref(src, 0)); 2], Insert::End, NOW));
+    assert_eq!((added.ids.len(), added.full), (2, 0));
+    let left: Vec<QueueId> = listing(&s).into_iter().map(|r| r.0).collect();
+    assert!(!left.contains(&all[0]) && !left.contains(&all[1]) && left.contains(&all[2]), "the two oldest played rows");
+    let added = w(&s, move |c| q::add(c, &vec![row(movie_ref(src, 0)); 3], Insert::End, NOW));
+    assert_eq!((added.ids.len(), added.full), (1, 2), "one played row left to make room");
+    assert_eq!(listing(&s).len(), q::MAX_ROWS);
+    assert!(dense(&s));
+
+    let (old, recent) = (all[3], all[4]);
+    w(&s, move |c| q::set_state(c, old, RowState::Played, NOW - 8 * 86_400));
+    w(&s, move |c| q::set_state(c, recent, RowState::Skipped, NOW - 86_400));
+    assert_eq!(w(&s, |c| q::prune(c, NOW)), 1);
+    let left: Vec<QueueId> = listing(&s).into_iter().map(|r| r.0).collect();
+    assert!(!left.contains(&old) && left.contains(&recent));
+    assert!(dense(&s));
+}
+
+/// A refresh that re-keys a movie moves its row along (`store::user::HOLDERS`); a movie that
+/// vanishes leaves an orphaned row, listed under Orphans and loaded as such.
+#[test]
+fn a_refresh_reattaches_rekeyed_rows_and_orphans_vanished_ones() {
+    let s = store();
+    let src = w(&s, |c| seed::seed_source(c, "TV"));
+    w(&s, move |c| seed::seed_movies(c, src, 3));
+    w(&s, move |c| q::add(c, &[row(movie_ref(src, 0)), row(movie_ref(src, 1))], Insert::End, NOW));
+    w(&s, move |c| {
+        c.execute("UPDATE movie SET key = 'm3u:renamed' WHERE key = 'm3u:movie0000000000'", [])?;
+        c.execute("DELETE FROM movie WHERE key = 'm3u:movie0000000001'", [])?;
+        tuner::store::import::reattach_user_data(c, src, NOW)
+    });
+    let rows = q::load(&s.reader().unwrap()).unwrap();
+    assert_eq!(rows[0].item.key, ItemKey("m3u:renamed".into()));
+    assert!(!rows[0].orphaned);
+    assert!(rows[1].orphaned);
+    let orphans = tuner::store::user::orphans(&s.reader().unwrap()).unwrap();
+    assert!(orphans.iter().any(|o| o.item == movie_ref(src, 1) && o.holders.contains(&"queue")));
+}
+
+/// The unplayed queue survives a backup round trip (merging twice adds nothing); a time-shift
+/// change moves the pending slots of that channel only.
+#[test]
+fn backup_round_trip_and_retime() {
+    let (a, b) = (store(), store());
+    let src = w(&a, |c| seed::seed_source(c, "TV"));
+    w(&a, move |c| seed::seed_movies(c, src, 2));
+    w(&a, move |c| seed::seed_channels(c, src, 2));
+    let ch = move |i: usize| ItemRef { source: src, kind: ItemKind::Channel, key: ItemKey(format!("m3u:seed{i:011}")) };
+    let slot = |s: Timestamp| Some(Slot { start: s, stop: s + 1800, catchup_id: Some("c1".into()) });
+    let ids = w(&a, move |c| {
+        q::add(
+            c,
+            &[
+                row(movie_ref(src, 0)),
+                NewRow { programme: slot(NOW), ..row(ch(0)) },
+                NewRow { programme: slot(NOW + 1800), ..row(ch(1)) },
+                row(movie_ref(src, 1)),
+            ],
+            Insert::End,
+            NOW,
+        )
+    })
+    .ids;
+    let played = ids[3];
+    w(&a, move |c| q::set_state(c, played, RowState::Played, NOW));
+
+    let key = ch(0).key.0.clone();
+    assert_eq!(w(&a, move |c| q::retime(c, src, &key, 3600)), 1);
+    let rows = q::load(&a.reader().unwrap()).unwrap();
+    assert_eq!(rows[1].programme.as_ref().map(|s| (s.start, s.stop)), Some((NOW + 3600, NOW + 5400)));
+    assert_eq!(rows[2].programme.as_ref().map(|s| s.start), Some(NOW + 1800), "another channel");
+
+    let v = q::export(&a.reader().unwrap()).unwrap().expect("something to keep");
+    let src_b = w(&b, |c| seed::seed_source(c, "TV"));
+    assert_eq!(src_b, src);
+    let v2 = v.clone();
+    assert_eq!(w(&b, move |c| q::import(c, &v2, &|r| Some(r.clone()))), 3, "unplayed rows only");
+    assert_eq!(w(&b, move |c| q::import(c, &v, &|r| Some(r.clone()))), 0, "already there");
+    let back = q::load(&b.reader().unwrap()).unwrap();
+    let mine: Vec<_> = q::load(&a.reader().unwrap()).unwrap().into_iter().filter(|r| !r.state.is_done()).collect();
+    let strip = |r: &tuner::queue::QueueEntry| (r.item.clone(), r.programme.clone(), r.title.clone(), r.any_copy, r.state);
+    assert_eq!(back.iter().map(strip).collect::<Vec<_>>(), mine.iter().map(strip).collect::<Vec<_>>());
+}
+
+// ---------------------------------------------------------------------------------------------
+// The engine
+
+#[derive(Default)]
+struct Recorder(Mutex<Vec<PlayerCommand>>);
+
+impl PlayerPort for Recorder {
+    fn send(&self, cmd: PlayerCommand) {
+        self.0.lock().unwrap().push(cmd);
+    }
+}
+
+impl Recorder {
+    fn plays(&self) -> Vec<(MediaRef, PlayOrigin)> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|c| match c {
+                PlayerCommand::PlayCopy(p) => Some((p.req.media.clone(), p.req.origin)),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+struct Rig {
+    player: Arc<Recorder>,
+    snaps: watch::Sender<Arc<PlayerSnapshot>>,
+    queue: QueueHandle,
+}
+
+impl Rig {
+    fn new(rt: &tokio::runtime::Runtime, store: Store, cfg: Config) -> Self {
+        let shared = Arc::new(AppShared::default());
+        let lib = tuner::store::library::load(&store.reader().unwrap()).unwrap();
+        let _ = shared.publish_library(&Arc::new(lib));
+        let snaps = watch::Sender::new(Arc::new(PlayerSnapshot::default()));
+        shared.set_main_player(snaps.subscribe());
+        let player = Arc::new(Recorder::default());
+        let config: SharedConfig = Arc::new(RwLock::new(Arc::new(cfg)));
+        let (bus, _events) = tuner::msg::EventBus::new(None);
+        let deps = EngineDeps { store, config, player: player.clone(), bus };
+        Self { queue: tuner::queue::service::spawn(rt.handle(), shared, deps), player, snaps }
+    }
+
+    /// The main picture plays `item` (origin, state, load generation).
+    fn player(&self, item: &ItemRef, media: MediaRef, origin: PlayOrigin, state: PlayerState, generation: u64) {
+        let playable = Playable {
+            media,
+            kind: PlayableKind::Movie,
+            item: Some(item.clone()),
+            source_id: Some(item.source),
+            title: "t".into(),
+            subtitle: None,
+            logo: None,
+            number: None,
+            url: tuner::redact::Secret::new("http://x".into()),
+            headers: Default::default(),
+            start_at: None,
+            duration_hint: None,
+        };
+        self.snaps.send_replace(Arc::new(PlayerSnapshot {
+            state,
+            playable: Some(Arc::new(playable)),
+            origin: Some(origin),
+            load_generation: generation,
+            ..Default::default()
+        }));
+    }
+}
+
+fn until(what: &str, f: impl Fn() -> bool) {
+    let t = Instant::now();
+    while !f() {
+        assert!(t.elapsed() < Duration::from_secs(5), "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn target(item: ItemRef) -> AddTarget {
+    AddTarget { item, programme: None, from_start: false, any_copy: true }
+}
+
+/// Up next end to end: adds (with the duplicate, no-guide and MCP lock refusals), a play
+/// through the copy plan with origin Queue, the advance after `Ended`, a live slot, the PIN
+/// card for a locked row — and a restart that restores the queue and plays nothing.
+#[test]
+fn the_engine_adds_plays_advances_and_never_plays_after_a_restart() {
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    let s = store();
+    let src = w(&s, |c| seed::seed_source(c, "TV"));
+    w(&s, move |c| seed::seed_movies(c, src, 4));
+    let chans = w(&s, move |c| seed::seed_channels(c, src, 2));
+    let now = tuner::model::now();
+    let half = now - now % 1800;
+    w(&s, move |c| seed::seed_epg(c, &chans, half - 3600, 3).map(|_| ()));
+    // movie 3 is locked behind a PIN
+    let locked = movie_ref(src, 3);
+    let l = locked.clone();
+    w(&s, move |c| tuner::store::copies::lock(c, &[l], true).map(|_| ()));
+    let salt = tuner::ui::parental::new_salt();
+    let mut cfg = Config::default();
+    cfg.queue.countdown_s = 0;
+    cfg.parental.enabled = true;
+    cfg.parental.pin_hash = Some(tuner::ui::parental::hash_pin("1234", &salt));
+    cfg.parental.pin_salt = Some(salt);
+    let rig = Rig::new(&rt, s.clone(), cfg.clone());
+    let req = |cmd: QueueCommand| rt.block_on(rig.queue.request(cmd));
+    let add = |items: Vec<AddTarget>, by: AddedBy| req(QueueCommand::Add { targets: items, at: Insert::End, by });
+
+    let QueueReply::Added { added, refused } =
+        add(vec![target(movie_ref(src, 0)), target(movie_ref(src, 1)), target(movie_ref(src, 0))], AddedBy::App)
+    else {
+        panic!("added")
+    };
+    assert_eq!(added.len(), 2);
+    assert_eq!(refused, vec![(movie_ref(src, 0), Refusal::Duplicate)]);
+    let ch0 = ItemRef { source: src, kind: ItemKind::Channel, key: ItemKey("m3u:seed00000000000".into()) };
+    let QueueReply::Added { refused, .. } = add(vec![target(ch0.clone()), target(locked.clone())], AddedBy::Agent) else { panic!() };
+    assert_eq!(refused, vec![(ch0.clone(), Refusal::NoGuide), (locked.clone(), Refusal::Locked)], "MCP never adds a locked item");
+    let QueueReply::Added { added: lock_row, .. } = add(vec![target(locked.clone())], AddedBy::App) else { panic!() };
+    assert_eq!(lock_row.len(), 1, "the app may queue it: the PIN at play time");
+    let slot = Slot { start: half, stop: half + 1800, catchup_id: None };
+    let QueueReply::Added { added: slot_row, .. } =
+        add(vec![AddTarget { item: ch0.clone(), programme: Some(slot), from_start: false, any_copy: false }], AddedBy::App)
+    else {
+        panic!()
+    };
+    let snap = rig.queue.snapshot();
+    assert_eq!(snap.rows.len(), 4);
+    let slot_entry = &snap.row(slot_row[0].0).unwrap().entry;
+    assert_eq!(slot_entry.title, "Show 2 on 0", "the programme's title");
+    assert!(snap.row(lock_row[0].0).unwrap().locked);
+
+    // play the first row: its copy plan's command, origin Queue
+    let (first, second) = (added[0].0, added[1].0);
+    assert_eq!(req(QueueCommand::PlayAt(first)), QueueReply::Play(PlayReply::Playing(first)));
+    let m0 = match &rig.player.plays()[..] {
+        [(MediaRef::Movie(id), PlayOrigin::Queue)] => *id,
+        other => panic!("{other:?}"),
+    };
+    rig.player(&movie_ref(src, 0), MediaRef::Movie(m0), PlayOrigin::Queue, PlayerState::Playing, 1);
+    until("driving", || rig.queue.snapshot().driving);
+    // EOF: played, and (countdown 0) the next row plays at once
+    rig.player(&movie_ref(src, 0), MediaRef::Movie(m0), PlayOrigin::Queue, PlayerState::Ended, 1);
+    until("the second play", || rig.player.plays().len() == 2);
+    assert!(matches!(rig.player.plays()[1], (MediaRef::Movie(id), PlayOrigin::Queue) if id != m0));
+    until("the row states", || {
+        let s = rig.queue.snapshot();
+        s.row(first).is_some_and(|r| r.entry.state == RowState::Played) && s.row(second).is_some_and(|r| r.entry.state == RowState::Current)
+    });
+
+    // the locked row waits for the PIN and nothing plays
+    assert_eq!(req(QueueCommand::PlayAt(lock_row[0].0)), QueueReply::Play(PlayReply::WaitingForPin(lock_row[0].0)));
+    assert_eq!(rig.player.plays().len(), 2);
+    // the airing slot plays live
+    assert_eq!(req(QueueCommand::PlayAt(slot_row[0].0)), QueueReply::Play(PlayReply::Playing(slot_row[0].0)));
+    assert!(matches!(rig.player.plays().last(), Some((MediaRef::Channel(_), PlayOrigin::Queue))));
+    drop(rig);
+
+    // restart: the queue is back, the slot row still current, and nothing plays
+    let again = Rig::new(&rt, s, cfg);
+    until("the restored queue", || again.queue.snapshot().rows.len() == 4);
+    let snap = again.queue.snapshot();
+    assert_eq!(snap.current, Some(slot_row[0].0));
+    assert!(!snap.driving);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(again.player.plays().is_empty(), "never auto-plays");
+}

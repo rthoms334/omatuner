@@ -16,8 +16,11 @@ pub mod machine;
 pub mod model;
 pub mod service;
 
-pub use model::{Blocked, Countdown, Insert, QueueCommand, QueueEntry, QueueRow, QueueSnapshot, RowState, Slot};
-pub use service::QueueHandle;
+pub use model::{
+    AddTarget, AddedBy, Blocked, Countdown, CountdownWhy, FinishedWhy, Insert, NextEpisode, PlayReply, QueueCommand, QueueEntry, QueueReply,
+    QueueRow, QueueSnapshot, Refusal, RowState, SleepMark, SleepRequest, Slot,
+};
+pub use service::{EngineDeps, PlayerPort, QueueHandle};
 
 /// Q-ui flips this in its last commit (the engine runs, the UI shows Up next).
 pub const ENABLED: bool = false;
