@@ -152,15 +152,17 @@ impl Services {
         if cfg.integration.follow_omarchy_theme {
             self.start_theme_watch(&cfg);
         }
-        let agent: Arc<dyn crate::agent::server::AgentService> = Arc::new(crate::agent::server::AgentHandler::new(
-            self.agent.clone(),
-            self.store.clone(),
-            self.config.clone(),
-            self.tiles.handle(crate::model::TileId::A),
-            self.bus.clone(),
-            self.jobs.clone(),
-        )
-        .with_tiles(self.tiles.registry()));
+        let agent: Arc<dyn crate::agent::server::AgentService> = Arc::new(
+            crate::agent::server::AgentHandler::new(
+                self.agent.clone(),
+                self.store.clone(),
+                self.config.clone(),
+                self.tiles.handle(crate::model::TileId::A),
+                self.bus.clone(),
+                self.jobs.clone(),
+            )
+            .with_tiles(self.tiles.registry()),
+        );
         self.integrations.ipc =
             ok("IPC server", crate::ipc::IpcServer::start_with_agent(self.rt.handle(), &self.paths.ipc_socket(), self.bus.clone(), Some(agent)));
         *self.socket.lock().unwrap_or_else(|e| e.into_inner()) = self.integrations.ipc.as_ref().map(|s| s.socket());

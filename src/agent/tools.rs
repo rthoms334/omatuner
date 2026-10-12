@@ -395,7 +395,7 @@ mod tests {
     /// method, every property of a schema is a field the param struct accepts.
     #[test]
     fn every_tool_is_a_method_and_its_example_parses() {
-        assert_eq!(tools().len(), 21, "the pass-1 and library tools; the feature tools are listed once their feature is on");
+        assert_eq!(tools().len(), 28, "every feature is on: the pass-1, feature, library and health tools are all listed");
         let tools = all_tools();
         assert_eq!(tools.len(), 28);
         for t in &tools {

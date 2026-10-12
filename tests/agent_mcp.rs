@@ -195,7 +195,15 @@ fn tools_list_has_every_tool() {
             "schedule_switch",
             "cancel_switch",
             "control",
-            // the library and health tools (the feature tools join once their feature is on)
+            // the feature tools (each listed while its feature is on)
+            "queue",
+            "follow",
+            "spoiler_guard",
+            "guide_fix",
+            "multiview",
+            "reminders",
+            "sleep_timer",
+            // the library and health tools
             "match_titles",
             "history",
             "episodes",
