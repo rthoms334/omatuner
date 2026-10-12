@@ -197,8 +197,11 @@ takes the pictures. The theme is Omarchy's Tokyo Night unless noted. The video i
 - **Spoiler guard:** on by default, but narrow: series you're part-way through and sport you
   follow. Scores in guide titles are rewritten ("Arsenal v Chelsea 󰈉"), later episodes' titles
   and plots are hidden, and zapping onto a channel showing the match you're saving stops at a
-  card first. `Ctrl+B` shows an item, `Ctrl+Shift+B` pauses the guard or adds a topic ("I'll
-  watch it later"), and watching the match lifts it. Notifications, MPRIS and Claude's answers
+  card first (in multi-view, over that picture only). `Ctrl+B` shows an item — in the player,
+  the banner's programme — and the hint line says so when something is hidden; `Ctrl+Shift+B`
+  pauses the guard or adds a topic ("I'll watch it later"), and watching the match lifts it.
+  Guide airings without episode numbers are placed by their episode title, a repeat you've seen,
+  air dates or the "new" flag before they're hidden. Notifications, MPRIS and Claude's answers
   are guarded too.
 - **Multi-view:** two live channels at once — side by side, big + small, or picture in picture
   (`Ctrl+M` on a channel, *Watch alongside*). `w` moves the focus, `M` the sound, `t` the layout,

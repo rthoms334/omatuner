@@ -360,6 +360,9 @@ impl Screen for MovieDetailScreen {
     fn id(&self) -> ScreenId {
         ScreenId::MovieDetail
     }
+    fn reveal_target(&self, _ctx: &UiCtx<'_>) -> Option<crate::ui::item_menu::Target> {
+        self.id.map(crate::ui::item_menu::Target::Movie)
+    }
     fn hint_extras(&self) -> Vec<(Action, &'static str)> {
         if self.copies.is_stacked() { vec![(Action::PlayFrom, "play from")] } else { Vec::new() }
     }

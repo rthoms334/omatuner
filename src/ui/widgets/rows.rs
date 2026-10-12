@@ -708,7 +708,15 @@ mod tests {
     }
 
     fn prog(title: &str, start: i64, stop: i64) -> ProgrammeSlim {
-        ProgrammeSlim { id: crate::model::ProgrammeId(1), start, stop, title: title.into(), sub_title: None, flags: Default::default() }
+        ProgrammeSlim {
+            id: crate::model::ProgrammeId(1),
+            start,
+            stop,
+            title: title.into(),
+            sub_title: None,
+            flags: Default::default(),
+            episode: None,
+        }
     }
 
     #[test]

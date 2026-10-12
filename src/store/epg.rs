@@ -110,7 +110,7 @@ struct ImportCounters {
     max_stop: Option<Timestamp>,
 }
 
-const PROGRAMME_SLIM_COLS: &str = "p.id, p.start, p.stop, p.title, p.sub_title, p.flags, p.catchup_id IS NOT NULL";
+const PROGRAMME_SLIM_COLS: &str = "p.id, p.start, p.stop, p.title, p.sub_title, p.flags, p.catchup_id IS NOT NULL, p.season, p.episode";
 
 const FLAG_NEW: i64 = 1;
 const FLAG_LIVE: i64 = 2;
@@ -125,7 +125,13 @@ fn slim_from_row(r: &Row<'_>) -> rusqlite::Result<ProgrammeSlim> {
         title: Arc::from(r.get::<_, String>(3)?),
         sub_title: r.get::<_, Option<String>>(4)?.map(Arc::from),
         flags: ProgrammeFlags { is_new: flags & FLAG_NEW != 0, is_live: flags & FLAG_LIVE != 0, has_catchup_id: r.get(6)? },
+        episode: episode_num(r.get(7)?, r.get(8)?),
     })
+}
+
+/// The `season` / `episode` columns as the model's (none when neither is set).
+fn episode_num(season: Option<u32>, episode: Option<u32>) -> Option<EpisodeNum> {
+    (season.is_some() || episode.is_some()).then_some(EpisodeNum { season, episode })
 }
 
 /// Active generation of the EPG source owning `ch`, as a scalar subquery on `?1` (keeps the
@@ -574,7 +580,7 @@ pub fn search(conn: &Connection, query: &str, now: Timestamp, limit: usize) -> R
                       p.id
              LIMIT ?3"
         ))?;
-        let rows = stmt.query_map(params![expr, now, limit as i64], |r| Ok((slim_from_row(r)?, r.get(7)?)))?;
+        let rows = stmt.query_map(params![expr, now, limit as i64], |r| Ok((slim_from_row(r)?, r.get(9)?)))?;
         rows.collect::<rusqlite::Result<_>>()?
     };
     let mut chans = conn.prepare_cached("SELECT channel_id FROM channel_epg WHERE epg_channel_id = ?1 ORDER BY channel_id")?;

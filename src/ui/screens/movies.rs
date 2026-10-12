@@ -96,6 +96,9 @@ impl Screen for MoviesScreen {
     fn hint_extras(&self) -> Vec<(Action, &'static str)> {
         self.browser.hint_extras()
     }
+    fn reveal_target(&self, ctx: &UiCtx<'_>) -> Option<crate::ui::item_menu::Target> {
+        self.browser.reveal_target(ctx)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1309,6 +1312,11 @@ impl VodBrowser {
                 }
             }
         }
+    }
+
+    /// The card Ctrl+B acts on (the status bar's spoiler hint).
+    pub(super) fn reveal_target(&self, ctx: &UiCtx<'_>) -> Option<crate::ui::item_menu::Target> {
+        self.current(ctx).map(|v| crate::ui::item_menu::Target::vod(v.kind))
     }
 
     /// The status bar's extra hints: Space and Ctrl+O on a stack card, Ctrl+O on a copy.

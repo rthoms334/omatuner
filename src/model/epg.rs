@@ -100,6 +100,8 @@ pub struct ProgrammeSlim {
     pub title: Arc<str>,
     pub sub_title: Option<Arc<str>>,
     pub flags: ProgrammeFlags,
+    /// The guide's season / episode (the spoiler guard judges series airings by it).
+    pub episode: Option<EpisodeNum>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

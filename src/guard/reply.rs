@@ -127,7 +127,14 @@ fn guard_fields(o: &mut Map<String, Value>, kind: Option<&str>, series: Option<&
         let subj = if vod {
             Subject::Vod { title: t, series_norm: series }
         } else {
-            Subject::Programme { title: t, sub_title: sub.as_deref(), categories: &categories, season_episode: se, start: 0 }
+            Subject::Programme {
+                title: t,
+                sub_title: sub.as_deref(),
+                categories: &categories,
+                season_episode: se,
+                start: 0,
+                is_new: o.get("is_new").and_then(Value::as_bool).unwrap_or(false),
+            }
         };
         let out = g.text(&subj, Field::Title, t, policy, now);
         set(o, if key == "title" { "title" } else { "name" }, out, true);
@@ -144,7 +151,7 @@ fn guard_fields(o: &mut Map<String, Value>, kind: Option<&str>, series: Option<&
     }
     // a channel's programme on now
     if let Some(t) = string(o, "now") {
-        let subj = Subject::Programme { title: &t, sub_title: None, categories: &[], season_episode: None, start: 0 };
+        let subj = Subject::Programme { title: &t, sub_title: None, categories: &[], season_episode: None, start: 0, is_new: false };
         let out = g.text(&subj, Field::Title, &t, policy, now);
         set(o, "now", out, true);
     }

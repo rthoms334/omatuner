@@ -51,6 +51,9 @@ pub struct TestUi {
     pub nav: Vec<NavRequest>,
     pub toasts: Vec<Toast>,
     pub config_edits: Vec<crate::ui::ConfigEdit>,
+    /// Multi-view as the screens see it (off unless a test sets it; `snapshot` stays the
+    /// focused picture's).
+    pub multiview: crate::ui::multiview::MvFrame,
     dir: PathBuf,
 }
 
@@ -98,6 +101,7 @@ impl TestUi {
             nav: Vec::new(),
             toasts: Vec::new(),
             config_edits: Vec::new(),
+            multiview: Default::default(),
             dir,
         })
     }
@@ -145,6 +149,7 @@ impl TestUi {
             toasts: &mut self.toasts,
             config_edits: &mut self.config_edits,
         });
+        ctx.multiview = self.multiview.clone();
         f(&mut ctx)
     }
 }

@@ -5470,8 +5470,10 @@ Design: `docs/design/spoiler-guard-design.md`. Build notes: `docs/design/score.m
 On by default but narrow; nothing is guarded before an event starts. Display only: it never
 builds events from explicit content, never lists or counts it, never reveals it.
 * **Series you're part-way through** (automatic): episodes after the next-up one lose title,
-  plot and still; guide airings with S/E after next-up likewise; an airing without S/E loses its
-  sub-title and description.
+  plot and still; guide airings with S/E after next-up likewise (the grid's slim rows carry the
+  guide's S/E too); an airing without S/E is placed first (§34.5) and loses its sub-title and
+  description only when it comes after next-up, or when nothing places it and the series is
+  part-way.
 * **Sport you follow**: Following's spoiler-safe Team/Event rules become topics. An airing
   counts as the event only when it parses as a fixture (`parse_fixture`) and has none of the
   rule's "leave out" words ("Women", "U21", "Fan TV"…); highlights and reaction shows are never
@@ -5498,11 +5500,18 @@ MCP reply (`guard::reply::guard_json`). Painters cache per programme, minute and
   either picture counts; Ctrl+W marks a guide programme seen (toast "Spoiler guard…" opens the
   menu with Undo).
 * **Reveal**: Ctrl+B on an item (any move hides it again); Ctrl+Shift+B opens the menu; "show
-  everything for 15 min / 1 h / until restart" with a status chip and ✕.
+  everything for 15 min / 1 h / until restart" with a status chip and ✕. The hint line says
+  "Ctrl+B show spoilers" while the guard hides something of the focused item ("Ctrl+B hide
+  spoilers" while it is shown). In the player, the banner's programme line ("Severance ·
+  ▆▆▆▆▆▆▆▆ 󰈉") and next title go through the guard, the banner says "Ctrl+B show spoilers", and
+  Ctrl+B shows the banner's now and next until the picture changes (a zap hides them again).
 * **Zap shield**: before tuning. A zap (↑/↓, digits, the channel panel) onto a channel whose
   programme mentions an active topic sends no play: the card covers the picture and the picture
   underneath pauses. Enter = Watch anyway (for as long as the same reason shields it), ↓ judges
   the next channel, Backspace/← resumes. A channel chosen in Live or the guide is never shielded.
+  In multi-view the card covers only the picture that zapped (that picture pauses, the other
+  plays on); its keys act while that picture has the focus, and a click on it focuses it first.
+  One card at a time: a shielded zap in the other picture moves it there.
 * The snapshot rebuilds on guard, library, guide, follow and progress changes, but not every
   progress save while a film, episode or catch-up plays.
 
@@ -5512,10 +5521,24 @@ marks seen; `remove` only removes Claude's own rules ("that rule is yours — re
 Settings ▸ Spoiler guard"). Replies drop guarded fields unless the call names the item in
 `reveal_spoilers`.
 
-### 34.5 Gaps
-Slim guide programmes carry no S/E yet, so every grid airing of a guarded series loses its
-sub-title; Ctrl+B in the player and a "Ctrl+B show spoilers" hint are missing; in multi-view the
-shield card covers the whole player.
+### 34.5 Series airings without S/E
+Slim guide rows (grid, now/next, search hits) carry the guide's season and episode, so most
+airings are judged by number. An airing of a guarded series without one is placed by
+(`spoiler::verdict::airing_beyond`, in order):
+1. its sub-title: an "S02E05" / "2x05" / "Season 2 Episode 5" marker, or a catalogue episode
+   title of the series (folded; "Show - S02E05 - Title" names count as "Title"; a title two
+   episodes share, or "Episode 6", places nothing);
+2. a seen repeat: an airing watched (or Ctrl+W'd) before keeps its "title#sub-title" key as the
+   series' seen state (`spoiler_seen.series_norm` set, no episode; never pruned), so its repeats
+   show;
+3. the catalogue's air dates: an airing a week or more before the first guarded episode first
+   aired can't be one (the margin covers another country's dates);
+4. the guide's "new" flag: a first showing is later than next-up, unless it airs before the
+   next-up episode first aired.
+What nothing places is guarded only while the series is part-way (an episode watched or
+started); a series guarded by the user's own row before starting it keeps such airings' text.
+Watching an airing a sub-title places records that episode, which moves the series on.
+MCP replies have no airing date (start 0): rule 3 never applies there.
 
 ## 35. Multi-view
 

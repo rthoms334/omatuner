@@ -1072,6 +1072,7 @@ mod tests {
                         title: format!("P{}", (s - T0) / 1800).into(),
                         sub_title: None,
                         flags: ProgrammeFlags::default(),
+                        episode: None,
                     });
                 }
                 s += 1800;
@@ -1303,6 +1304,7 @@ mod tests {
             title: "x".into(),
             sub_title: None,
             flags: ProgrammeFlags::default(),
+            episode: None,
         };
         let cells = cells_of(Some(&[p(10, 20), p(30, 40)]), 0, 50);
         let spans: Vec<(i64, i64, bool)> = cells.iter().map(|c| (c.start, c.stop, c.programme.is_some())).collect();

@@ -128,6 +128,8 @@ pub struct TunerApp {
     drop_alt_text: bool,
     /// The window title last sent ("Tuner — Movies · TV 2", DESIGN §29).
     window_title: String,
+    /// The status bar's spoiler entry ("Ctrl+B show spoilers"), worked out before the bar.
+    reveal_hint: Option<(Action, &'static str)>,
     idle: Option<crate::platform::idle::IdleInhibitor>,
     /// Window fullscreen as last requested by the app, re-synced every frame from the
     /// compositor's state (`ViewportInfo::fullscreen`) when the backend reports it.
@@ -259,6 +261,7 @@ impl TunerApp {
             pending_actions: Vec::new(),
             drop_alt_text: false,
             window_title: crate::APP_NAME.to_owned(),
+            reveal_hint: None,
             idle,
             window_fullscreen: false,
             popout: PopOut::default(),
@@ -2067,12 +2070,26 @@ impl TunerApp {
         let stack = self.key_stack();
         // the focused element's (a stack card: Space, Ctrl+O), then the playlist picker
         let mut extra = if self.overlays.is_empty() { self.screens[self.screen_index(self.view_screen())].hint_extras() } else { Vec::new() };
+        // the spoiler guard: "Ctrl+B show spoilers" when it hides something of the focused item
+        extra.extend(self.reveal_hint.filter(|_| self.overlays.is_empty()));
         let multi = ScopeKind::of_screen(self.view_screen())
             .is_some_and(|k| Scope::of(&self.lib, &self.services().config().interface.playlist_scope, k).multi());
         if multi {
             extra.push((Action::PlaylistPicker, "playlist"));
         }
         keymap::hint_line_with(&stack, &extra)
+    }
+
+    /// The status bar's spoiler entry for the focused item (`spoiler::ui::hint`).
+    fn spoiler_hint(&mut self) -> Option<(Action, &'static str)> {
+        if !crate::spoiler::ENABLED || !self.overlays.is_empty() {
+            return None;
+        }
+        let idx = self.screen_index(self.view_screen());
+        self.with_ctx(|ctx, screens, _| {
+            let target = screens[idx].reveal_target(ctx);
+            crate::spoiler::ui::hint(ctx, target)
+        })
     }
 
     /// `StartScreen::Last`: store the main screen the user leaves on (written at exit only).
@@ -2276,6 +2293,7 @@ impl eframe::App for TunerApp {
         let focus = crate::ui::widgets::status_bar::take_focus(&egui_ctx);
         if chrome {
             let jobs = self.services().jobs.active();
+            self.reveal_hint = self.spoiler_hint();
             let hint = self.hint_now();
             let mini_hidden = self.layout == LayoutClass::Compact || !cfg.interface.mini_player;
             let now_playing =
@@ -3521,6 +3539,40 @@ mod tests {
     /// offers Alt+P (two playlists with channels); once it is disabled, Live TV shows All
     /// playlists again with a toast saying why, and the title drops it. With one playlist
     /// left there is nothing to choose: no "Alt+P playlist". A removed playlist says so.
+    /// The status bar's "Ctrl+B show spoilers" (DESIGN §34.5): on Live TV's channel whose
+    /// programme the guard hides something of, "hide spoilers" once Ctrl+B showed it, nothing on
+    /// a channel with nothing hidden.
+    #[test]
+    fn the_hint_line_offers_ctrl_b_on_a_guarded_item() {
+        use crate::spoiler::snapshot::{GuardSnapshot, SeriesMark, Settings};
+        let now = crate::model::now();
+        let mut rig = Rig::with(test_config(), live(), 1.0, move |c| {
+            seed_channels(c, 2, None)?;
+            let ids = [ChannelId(1), ChannelId(2)];
+            crate::ui::screens::home::testkit::epg(c, &ids, now - now.rem_euclid(1800) - 1800, 3, true)?;
+            // channel 1 airs a later episode of a series you're part-way through
+            c.execute(
+                "UPDATE programme SET title = 'Severance', sub_title = 'Cold Harbor'
+                 WHERE epg_channel_id = (SELECT epg_channel_id FROM channel_epg WHERE channel_id = 1) AND start <= ?1 AND stop > ?1",
+                [now],
+            )?;
+            Ok(())
+        });
+        rig.settle();
+        let mark = SeriesMark { label: "Severance".into(), next_up: (2, 4), automatic: true, part_way: true, ..Default::default() };
+        let snap = GuardSnapshot::from_parts(Settings::default(), vec![], [("severance".to_owned(), mark)].into(), Default::default());
+        rig.app.services().agent.set_guard(crate::guard::Guard::with_snapshot(snap));
+        let key = crate::spoiler::ui::reveal_key_label();
+        rig.until("the hint on channel 1", |r| r.app.hint_now().contains(&format!("{key} show spoilers")));
+        rig.press(Key::B, CTRL);
+        rig.frame_with(vec![]);
+        assert!(rig.app.hint_now().contains(&format!("{key} hide spoilers")), "{}", rig.app.hint_now());
+        // channel 2: nothing hidden, no hint (and the reveal went with the move)
+        rig.press(Key::ArrowDown, NONE);
+        rig.frame_with(vec![]);
+        assert!(!rig.app.hint_now().contains("spoilers"), "{}", rig.app.hint_now());
+    }
+
     #[test]
     fn a_disabled_picked_playlist_falls_back_to_all_with_a_toast() {
         let mut cfg = test_config();

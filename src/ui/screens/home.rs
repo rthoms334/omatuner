@@ -1052,6 +1052,9 @@ impl Screen for HomeScreen {
     fn id(&self) -> ScreenId {
         ScreenId::Home
     }
+    fn reveal_target(&self, _ctx: &UiCtx<'_>) -> Option<crate::ui::item_menu::Target> {
+        self.current_tile().and_then(|(_, t)| self.tile_target(t))
+    }
     fn key_contexts(&self) -> Vec<KeyContext> {
         vec![KeyContext::PosterGrid]
     }

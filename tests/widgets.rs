@@ -884,6 +884,7 @@ fn data_rows_render_with_real_services() {
         title: Arc::from(title),
         sub_title: None,
         flags: Default::default(),
+        episode: None,
     };
     let nn = NowNext { now: Some(prog(1, "News at Eight", now - 600, now + 3000)), next: Some(prog(2, "Panorama", now + 3000, now + 6600)) };
     let group = Group {
