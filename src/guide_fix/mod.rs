@@ -21,8 +21,8 @@ pub use crate::store::guide_fix::GuideOpts;
 use crate::model::SourceId;
 use crate::store::library::Library;
 
-/// G-ui flips this in its last commit (the job runs, the screen shows Guide fixes).
-pub const ENABLED: bool = false;
+/// On (G-ui): the guide check runs, rule rows are derived, the screen shows Guide fixes.
+pub const ENABLED: bool = true;
 
 /// One playlist's guide coverage over its SHOWN channels (the dashboard card, Settings ▸ EPG,
 /// Settings ▸ Playlists, the Live "not in your guide" note, onboarding, MCP `sources`).

@@ -4,8 +4,10 @@
 //! / `store::epg::set_manual_mapping` (fingerprints computed by the store). Owner: WP-11.
 //! Key contexts: `[Modal]`, `[TextInput, Modal]` while a field is focused.
 //!
-//! Rows: Name (text field; Enter on it or a click starts editing, Tab/Esc leave it) · Catch-up
-//! offset (channels with an archive; ←/→ ±1 min) · EPG channel (opens the EPG mapping screen
+//! Rows: Name (text field; Enter on it or a click starts editing, Tab/Esc leave it) · Time
+//! shift (channels, with Guide fixes on; ←/→ ±15 min, "+1 h"; saved as a logged guide fix that
+//! moves the channel's reminders, `guide_fix::ui::submit_apply`) · Catch-up offset (channels
+//! with an archive; ←/→ ±1 min) · EPG channel (opens the EPG mapping screen
 //! for the channel, which ranks `epg_match::suggest` candidates and writes the manual mapping)
 //! · Locked · Hidden (Enter/Space/←/→ toggle) · Save / Cancel. Changing the lock needs an
 //! unlocked parental session. Everything is read once when the overlay opens (two indexed
@@ -26,12 +28,15 @@ use crate::ui::widgets::card::CardKind;
 use crate::ui::widgets::{text_field::text_field, toggle::toggle};
 use crate::ui::{Route, UiCtx};
 
-/// Catch-up offset limits (minutes).
+/// Catch-up offset and time shift limits (minutes), and the time shift step.
 const OFFSET_LIMIT_MIN: i64 = 24 * 60;
+const SHIFT_LIMIT_MIN: i32 = 24 * 60;
+const SHIFT_STEP_MIN: i32 = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Field {
     Name,
+    Shift,
     Offset,
     Epg,
     Locked,
@@ -48,6 +53,8 @@ struct Loaded {
     has_catchup: bool,
     epg_label: Option<String>,
     ov: ItemOverride,
+    /// The channel's effective time shift (minutes) as loaded.
+    shift_min: i32,
 }
 
 pub struct EditItemOverlay {
@@ -56,6 +63,7 @@ pub struct EditItemOverlay {
     loaded: Option<Result<Loaded, String>>,
     name: String,
     offset_min: i64,
+    shift_min: i32,
     locked: bool,
     hidden: bool,
     editing: bool,
@@ -74,6 +82,7 @@ impl EditItemOverlay {
             loaded: None,
             name: String::new(),
             offset_min: 0,
+            shift_min: 0,
             locked: false,
             hidden: false,
             editing: false,
@@ -90,6 +99,13 @@ impl EditItemOverlay {
         }
         let (db, item) = (ctx.db, self.item.clone());
         let Some(r) = ctx.budget.run(|| load_item(db, &item)) else { return };
+        // the effective shift (own ?? rule ?? provider, B8) is the snapshot's
+        let r = r.map(|l| {
+            l.map(|mut l| {
+                l.shift_min = l.channel.and_then(|c| ctx.lib.live.get(c)).map_or(0, |c| c.tvg_shift_min);
+                l
+            })
+        });
         self.loaded = Some(
             r.map_err(|e| crate::redact::redact(&e.to_string()).into_owned())
                 .and_then(|l| l.ok_or_else(|| "This item is no longer in your playlists".to_owned())),
@@ -97,6 +113,7 @@ impl EditItemOverlay {
         if let Some(Ok(l)) = &self.loaded {
             self.name = l.ov.rename.clone().unwrap_or_else(|| l.provider_name.clone());
             self.offset_min = l.ov.catchup_offset_s.unwrap_or(0) / 60;
+            self.shift_min = l.shift_min;
             self.locked = l.ov.locked;
             self.hidden = l.ov.hidden;
         }
@@ -105,6 +122,9 @@ impl EditItemOverlay {
     fn fields(&self) -> Vec<Field> {
         let mut v = vec![Field::Name];
         if let Some(Ok(l)) = &self.loaded {
+            if l.channel.is_some() && crate::guide_fix::ENABLED {
+                v.push(Field::Shift);
+            }
             if l.channel.is_some() && l.has_catchup {
                 v.push(Field::Offset);
             }
@@ -131,7 +151,7 @@ impl EditItemOverlay {
                 self.editing = true;
                 self.focus_field = true;
             }
-            Field::Offset => {}
+            Field::Shift | Field::Offset => {}
             Field::Epg => {
                 if let Some(Ok(Loaded { channel: Some(ch), .. })) = &self.loaded {
                     ctx.push(Route::EpgMapping { channel: Some(*ch) });
@@ -155,12 +175,17 @@ impl EditItemOverlay {
 
     fn adjust(&mut self, ctx: &mut UiCtx<'_>, f: Field, up: bool) {
         match f {
+            Field::Shift => self.nudge_shift(if up { SHIFT_STEP_MIN } else { -SHIFT_STEP_MIN }),
             Field::Offset => self.offset_min = (self.offset_min + if up { 1 } else { -1 }).clamp(-OFFSET_LIMIT_MIN, OFFSET_LIMIT_MIN),
             Field::Locked | Field::Hidden => {
                 self.activate(ctx, f);
             }
             _ => {}
         }
+    }
+
+    fn nudge_shift(&mut self, by: i32) {
+        self.shift_min = (self.shift_min + by).clamp(-SHIFT_LIMIT_MIN, SHIFT_LIMIT_MIN);
     }
 
     fn save(&mut self, ctx: &mut UiCtx<'_>) -> OverlayOutcome {
@@ -174,6 +199,21 @@ impl EditItemOverlay {
         ov.catchup_offset_s = (self.offset_min != 0).then_some(self.offset_min * 60);
         ov.locked = self.locked;
         ov.hidden = self.hidden;
+        // the time shift is a guide fix: logged (Undo in its toast and Ctrl+Z in Guide fixes) and
+        // it moves the channel's reminders in the same transaction
+        if self.shift_min != l.shift_min {
+            let change = crate::model::FixChange { channel: Some(self.item.clone()), shift_min: Some(Some(self.shift_min)), ..Default::default() };
+            let shift = crate::guide_fix::ui::shift_text(self.shift_min);
+            let toast = format!("{}: time shift {shift}", if name.is_empty() { l.provider_name.as_str() } else { name });
+            let _ = crate::guide_fix::ui::submit_apply(
+                ctx.services,
+                format!("Time shift {shift}"),
+                toast,
+                crate::model::Proposal { changes: vec![change], ..Default::default() },
+                crate::store::guide_fix::GuideOpts::from_config(ctx.config),
+                ctx.now,
+            );
+        }
         if ov == l.ov {
             return OverlayOutcome::Close;
         }
@@ -193,7 +233,14 @@ fn load_item(db: &rusqlite::Connection, item: &ItemRef) -> crate::error::Result<
                 .epg_channel_id
                 .and_then(|id| crate::store::epg::epg_channel(db, id).ok())
                 .map(|e| e.display_names.first().cloned().unwrap_or(e.xmltv_id));
-            Loaded { provider_name: c.clean_name.clone(), channel: Some(c.id), has_catchup: c.catchup.is_some(), epg_label, ov: ov.clone() }
+            Loaded {
+                provider_name: c.clean_name.clone(),
+                channel: Some(c.id),
+                has_catchup: c.catchup.is_some(),
+                epg_label,
+                ov: ov.clone(),
+                shift_min: 0,
+            }
         }),
         ItemKind::Movie => crate::store::vod::resolve_movie(db, item)?.map(|id| crate::store::vod::movie(db, id)).transpose()?.map(|m| Loaded {
             provider_name: m.clean_name,
@@ -201,17 +248,18 @@ fn load_item(db: &rusqlite::Connection, item: &ItemRef) -> crate::error::Result<
             has_catchup: false,
             epg_label: None,
             ov: ov.clone(),
+            shift_min: 0,
         }),
         ItemKind::Series => db
             .query_row("SELECT clean_name FROM series WHERE source_id = ?1 AND key = ?2", rusqlite::params![item.source, item.key.as_str()], |r| {
                 r.get::<_, String>(0)
             })
             .ok()
-            .map(|n| Loaded { provider_name: n, channel: None, has_catchup: false, epg_label: None, ov: ov.clone() }),
+            .map(|n| Loaded { provider_name: n, channel: None, has_catchup: false, epg_label: None, ov: ov.clone(), shift_min: 0 }),
         ItemKind::Episode => crate::store::vod::resolve_episode(db, item)?
             .map(|id| crate::store::vod::episode(db, id))
             .transpose()?
-            .map(|e| Loaded { provider_name: e.title, channel: None, has_catchup: false, epg_label: None, ov: ov.clone() }),
+            .map(|e| Loaded { provider_name: e.title, channel: None, has_catchup: false, epg_label: None, ov: ov.clone(), shift_min: 0 }),
     };
     Ok(loaded)
 }
@@ -225,7 +273,11 @@ impl Overlay for EditItemOverlay {
     fn is_dirty(&self) -> bool {
         let Some(Ok(l)) = &self.loaded else { return false };
         let name = l.ov.rename.as_deref().unwrap_or(&l.provider_name);
-        self.name != name || self.offset_min != l.ov.catchup_offset_s.unwrap_or(0) / 60 || self.locked != l.ov.locked || self.hidden != l.ov.hidden
+        self.name != name
+            || self.offset_min != l.ov.catchup_offset_s.unwrap_or(0) / 60
+            || self.shift_min != l.shift_min
+            || self.locked != l.ov.locked
+            || self.hidden != l.ov.hidden
     }
 
     fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> OverlayOutcome {
@@ -348,6 +400,25 @@ impl Overlay for EditItemOverlay {
                                 .size(theme.font(TypeToken::BodySmall))
                                 .color(t.text_secondary),
                         );
+                    }
+                    Field::Shift => {
+                        ui.add_space(theme.space(SpaceToken::Md));
+                        ui.horizontal(|ui| {
+                            label(ui, "Time shift", focused);
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if button(ui, theme, None, "+1 h", Default::default()).on_hover_text("Airs an hour after the guide").clicked() {
+                                    self.shift_min = (self.shift_min + 60).min(SHIFT_LIMIT_MIN);
+                                }
+                                if button(ui, theme, None, "+", Default::default()).clicked() {
+                                    self.shift_min = (self.shift_min + SHIFT_STEP_MIN).min(SHIFT_LIMIT_MIN);
+                                }
+                                let v = crate::guide_fix::ui::shift_text(self.shift_min);
+                                ui.label(RichText::new(v).size(theme.font(TypeToken::Body)).color(if focused { t.list_cursor_text } else { t.fg }));
+                                if button(ui, theme, None, "−", Default::default()).clicked() {
+                                    self.shift_min = (self.shift_min - SHIFT_STEP_MIN).max(-SHIFT_LIMIT_MIN);
+                                }
+                            });
+                        });
                     }
                     Field::Offset => {
                         ui.add_space(theme.space(SpaceToken::Md));
@@ -476,5 +547,34 @@ mod tests {
         h.run_steps(2);
         assert_ne!(h.state().last, "Close", "an edit survives a stray click");
         assert_eq!(h.state_mut().act(Action::Back), "Close", "Esc still closes");
+    }
+
+    /// The time shift row saves a logged guide fix (Undo in its toast, reminders move with it).
+    #[test]
+    fn the_time_shift_is_saved_as_a_guide_fix() {
+        let (mut t, one) = rig();
+        let ch = seed(&mut t, |c| {
+            let s = testkit::source(c, "My IPTV")?;
+            testkit::channels(c, s, 1)
+        });
+        let item = crate::ui::screens::live::channel_ref(t.lib.live.get(ch[0]).expect("seeded"));
+        let mut h = overlay_harness(t, one, EditItemOverlay::new(item.clone()), egui::vec2(1200.0, 900.0));
+        until_ov(&mut h, "loaded", |h| matches!(h.state().o.loaded, Some(Ok(_))));
+        assert_eq!(h.state().o.fields()[1], Field::Shift);
+        h.state_mut().act(Action::Down);
+        for _ in 0..4 {
+            h.state_mut().act(Action::Right);
+        }
+        assert!(h.state().o.is_dirty());
+        let save = h.state().o.fields().iter().position(|f| *f == Field::Save).expect("Save");
+        h.state_mut().o.cursor = save;
+        h.state_mut().act(Action::Activate);
+        until_ov(&mut h, "closed", |h| h.state().last == "Close");
+        let _ = h.state().t.services().store.writer().blocking(|_| Ok(()));
+        let c = h.state().t.services().store.reader().unwrap();
+        let shift: Option<i32> = c.query_row("SELECT shift_min FROM item_override WHERE item_key = ?1", [item.key.as_str()], |r| r.get(0)).unwrap();
+        assert_eq!(shift, Some(60));
+        let log = crate::store::guide_fix::recent(&c, 5).unwrap();
+        assert_eq!(log.iter().map(|e| e.label.as_str()).collect::<Vec<_>>(), ["Time shift +1 h"]);
     }
 }

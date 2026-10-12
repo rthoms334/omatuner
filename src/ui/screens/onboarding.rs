@@ -1715,8 +1715,10 @@ impl OnboardingScreen {
         let line = |ui: &mut egui::Ui, glyph: &str, text: String, color: egui::Color32| {
             ui.add(egui::Label::new(RichText::new(format!("{glyph}  {text}")).size(theme.font(TypeToken::Body)).color(color)).wrap());
         };
-        let total = ctx.lib.live.channels.len();
-        let covered = ctx.lib.live.channels.iter().filter(|c| c.epg_channel_id.is_some()).count();
+        // shown channels, as Settings ▸ EPG, Live and Guide fixes count them (`guide_fix::coverage`)
+        let cov = crate::guide_fix::coverage(ctx.lib);
+        let total: usize = cov.iter().map(|c| c.shown).sum();
+        let covered: usize = cov.iter().map(|c| c.with_guide).sum();
         let importing = ctx.services.jobs.active().iter().any(|j| matches!(j.kind, JobKind::RefreshEpg { .. }));
         let guides: Vec<&crate::model::EpgSource> = self.guides.as_ref().map(|(g, _)| g.iter().filter(|g| g.enabled).collect()).unwrap_or_default();
         if importing {
@@ -1741,9 +1743,10 @@ impl OnboardingScreen {
                 ui,
                 glyphs::INFO,
                 format!(
-                    "Only {} of {} channels have a guide. Add a guide that lists them, or map them with Ctrl+E in Live TV.",
+                    "Only {} of {} shown channels have a guide. Add a guide that lists them, or {}.",
                     crate::ui::widgets::rows::grouped(covered),
-                    crate::ui::widgets::rows::grouped(total)
+                    crate::ui::widgets::rows::grouped(total),
+                    if crate::guide_fix::ENABLED { "fix them in Guide fixes (Ctrl+E in Live TV)" } else { "map them with Ctrl+E in Live TV" }
                 ),
                 t.text_secondary,
             );
