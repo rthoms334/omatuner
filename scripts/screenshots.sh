@@ -94,13 +94,19 @@ shot live        "$hero" "$dark"  live     "key:Enter;wait:3" 3
 shot guide       "$big"  "$dark"  guide    "key:F;key:Down;key:Down;key:Down;key:Enter;wait:0.5;key:Down;key:Down;key:Right" 2
 shot movies      "$big"  "$dark"  movies   "key:Right;key:Left"
 shot stack       "$big"  "$dark"  movies   "key:Space;wait:1"
-shot detail      "$big"  "$dark"  series   "key:Enter;wait:1.5"
+shot detail      "$big"  "$dark"  series   "wait:5;key:Enter;wait:1.5"
 shot player      "$big"  "$dark"  live     "play:$PLAY_DOCS;wait:3;key:Enter;move:1400,940;wait:0.5" 1
 shot popout      "$big"  "$dark"  live     "play:$PLAY_SPORTS;wait:5;text:o;wait:2;move:240,200" 1
 shot live-half   "$half" "$dark"  live     "key:Down;key:Down;key:Down;key:Down;key:Enter;wait:3" 3
 shot categories  "$big"  "$dark"  live     "categories:$NORTHWIND_ID;wait:1"
 shot help        "$big"  "$dark"  home     "key:F1;text:guide;wait:0.5"
 shot settings    "$big"  "$light" settings "wait:0.5"
+# v0.2 features
+shot upnext      "$big"  "$dark"  home     "key:Alt+6;wait:1"
+shot multiview   "$big"  "$dark"  live     "play:$PLAY_DOCS;wait:4;key:Ctrl+M;wait:0.5;text:lumen;wait:0.5;key:Enter;wait:5;move:1400,940;wait:0.5" 1
+shot following   "$big"  "$dark"  settings "key:Left;key:Down;key:Down;key:Down;key:Down;key:Down;key:Down;wait:1"
+shot reminders   "$big"  "$dark"  settings "key:Left;key:Down;key:Down;key:Down;key:Down;key:Down;wait:1"
+shot guidefix    "$big"  "$dark"  settings "key:Left;key:Down;key:Right;key:Down;key:Down;key:Down;key:Down;key:Enter;wait:1.5"
 
 # Every regeneration adds the images to git history again: rerun it only when the UI changes.
 # pngquant (lossy, 256 colours) roughly halves them; oxipng then recompresses losslessly.

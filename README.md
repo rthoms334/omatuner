@@ -57,7 +57,15 @@ preview playing](docs/screenshots/live.png)
 </tr>
 <tr>
 <td width="50%"><img src="docs/screenshots/popout.png" alt="Pop-out player"><br><b>Pop-out</b> (<code>o</code>): a small player pinned on every workspace (Hyprland).</td>
-<td width="50%"></td>
+<td width="50%"><img src="docs/screenshots/multiview.png" alt="Multi-view, two pictures side by side"><br><b>Multi-view</b> (<code>Ctrl+M</code>): two channels side by side, each from its own playlist.</td>
+</tr>
+<tr>
+<td width="50%"><img src="docs/screenshots/upnext.png" alt="Up next"><br><b>Up next</b> (<code>Alt+6</code>): films, episodes and programmes queued to play one after another.</td>
+<td width="50%"><img src="docs/screenshots/following.png" alt="Settings, Following"><br><b>Following</b>: a team, a show and a daily news flash, with what's coming in the guide.</td>
+</tr>
+<tr>
+<td width="50%"><img src="docs/screenshots/reminders.png" alt="Settings, Reminders"><br><b>Reminders</b>: notifications and automatic switches into the pop-out, yours and Following's.</td>
+<td width="50%"><img src="docs/screenshots/guidefix.png" alt="Guide fixes"><br><b>Guide fixes</b>: guide coverage per playlist and the channels to fix.</td>
 </tr>
 </table>
 
@@ -242,7 +250,7 @@ fontconfig, JetBrains Mono Nerd Font, …):
 
 ```sh
 sha256sum -c --ignore-missing SHA256SUMS
-sudo pacman -U omatuner-0.1.0-1-x86_64.pkg.tar.zst     # or …-aarch64.pkg.tar.zst
+sudo pacman -U omatuner-0.2.0-1-x86_64.pkg.tar.zst     # or …-aarch64.pkg.tar.zst
 ```
 
 The package installs:
@@ -268,7 +276,7 @@ makepkg -si          # builds this checkout, smoke-tests the binary, installs th
 
 - `makepkg --nocheck -si` skips the smoke test. The test suite is `cargo test` (see Development).
 - The PKGBUILD builds the checkout it sits in (no download of the app itself), so check out the
-  tag you want first, e.g. `git checkout v0.1.0`.
+  tag you want first, e.g. `git checkout v0.2.0`.
 
 ### With cargo
 

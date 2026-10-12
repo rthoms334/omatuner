@@ -3114,10 +3114,15 @@ public, so every image shows made-up content only:
   three fictional playlists (Northwind, Aurora, Harbor Free; distinct colours) as local M3U
   files imported by the real `RefreshSource` job, ~60 channels with quality badges in
   country-tagged categories (`UK | News`, `FR | Cinéma`…), a guide from an XMLTV file
-  (`RefreshEpg`) covering yesterday 06:00 to the day after tomorrow, movies and series whose
-  titles repeat across (and inside) playlists so "All playlists" stacks them, details written
-  with `store::import::store_movie_details`, and favourites, history, progress and a reminder
-  through `store::user`. Logos (monograms) and posters/backdrops (gradient landscapes + title)
+  (`RefreshEpg`) covering yesterday 06:00 to three days ahead (with fixed football fixtures
+  tomorrow and the day after), movies and series whose titles repeat across (and inside)
+  playlists so "All playlists" stacks them, details written with
+  `store::import::store_movie_details`, and favourites, history, progress and reminders (one an
+  automatic switch) through `store::user`. For the v0.2 shots: Up next (a film trilogy and an
+  episode, `store::queue`), three Following rules (a team, a daily news flash on a bulletin
+  that isn't due within the next three hours, a listed show; evaluated by `EvaluateFollows`),
+  two channels no guide lists and a "+1" channel (Guide fixes), and a one-connection limit on
+  Northwind and Aurora (multi-view takes the second picture's copy from the other playlist). Logos (monograms) and posters/backdrops (gradient landscapes + title)
   are rendered with resvg using egui's bundled fonts and written into the profile's image
   cache under `https://img.tuner-demo.invalid/…` URLs, which are never fetched. Content is
   seeded; only the guide follows today's date. `demo/refs.env` names playlist ids and `--play`
