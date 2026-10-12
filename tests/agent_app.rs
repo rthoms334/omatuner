@@ -237,10 +237,8 @@ impl World {
         let now = tuner::model::now();
         ui.services().store.writer().blocking(move |c| seed(c, now)).unwrap();
         let s = ui.services();
-        // the batch's tools are answered here even while their feature's flag is off
         let handler =
-            AgentHandler::with_limits(s.agent.clone(), s.store.clone(), s.config.clone(), s.tiles.focused(), s.bus.clone(), s.jobs.clone(), limits)
-                .serve_unlisted();
+            AgentHandler::with_limits(s.agent.clone(), s.store.clone(), s.config.clone(), s.tiles.focused(), s.bus.clone(), s.jobs.clone(), limits);
         Self { ui, handler, now, next: 1 }
     }
 
@@ -1134,6 +1132,7 @@ fn diagnose_and_sources() {
     let s = w.ok("sources", json!({}));
     let one = s["playlists"].as_array().unwrap().iter().find(|p| p["playlist"] == "TV One").unwrap();
     assert_eq!((one["kind"].as_str(), one["failures_24h"].as_u64()), (Some("m3u"), Some(2)));
+    assert_eq!(one["channels"], 4, "what Tuner shows, the explicit channel not counted while locked: {one}");
     assert!(one["guide_coverage"]["with_guide"].as_u64().unwrap() >= 1);
     assert_eq!(s["guides"][0]["guide"], "Guide");
 }
@@ -1163,6 +1162,16 @@ fn reminders_and_the_sleep_timer() {
     assert_eq!(w.ok("reminders", json!({ "action": "cancel", "id": id }))["cancelled"], true);
     assert!(names(&w.ok("reminders", json!({ "action": "list" })), "reminders", "title").is_empty());
     assert_eq!(w.err("reminders", json!({ "action": "cancel", "id": id })), ErrorCode::NotFound);
+    // "switch me over when it starts" after its notification went out: the fired row switches
+    let note = w.ok("reminders", json!({ "action": "add", "programme": qual }));
+    let id = tuner::model::ReminderId(note["reminder"]["id"].as_i64().unwrap());
+    w.ui.services().store.writer().blocking(move |c| tuner::store::user::set_reminder_state(c, id, tuner::model::ReminderState::Fired)).unwrap();
+    let switch = w.ok("reminders", json!({ "action": "add", "programme": qual, "mode": "switch" }));
+    assert_eq!((switch["reminder"]["id"].as_i64(), switch["existed"].as_bool()), (Some(id.0), Some(true)));
+    assert_eq!(switch["reminder"]["mode"], "switch");
+    let list = w.ok("reminders", json!({ "action": "list" }));
+    assert_eq!(list["reminders"][0]["mode"], "switch", "pending again: {list}");
+    w.ok("reminders", json!({ "action": "cancel", "id": id.0 }));
 
     // the sleep timer runs in Tuner
     assert_eq!(w.err("sleep_timer", json!({ "action": "status" })), ErrorCode::Unavailable, "not running yet");
@@ -1180,6 +1189,7 @@ fn reminders_and_the_sleep_timer() {
     assert_eq!((set["set"]["when"].as_str(), set["set"]["then"].as_str()), (Some("at"), Some("pause")));
     assert_eq!(w.ok("status", json!({}))["sleep_timer"]["then"], "pause");
     assert_eq!(w.err("sleep_timer", json!({ "action": "set", "after_min": 30, "end_of_queue": true })), ErrorCode::BadRequest);
+    assert_eq!(w.err("sleep_timer", json!({ "action": "set", "at": "2001-01-01T23:00" })), ErrorCode::BadRequest, "in the past");
     assert_eq!(w.err("sleep_timer", json!({ "action": "set", "end_of_programme": true })), ErrorCode::Unavailable, "nothing plays");
     assert_eq!(w.ok("sleep_timer", json!({ "action": "cancel" }))["cancelled"], true);
     assert!(w.ok("sleep_timer", json!({ "action": "status" }))["set"].is_null());
@@ -1363,6 +1373,9 @@ fn guide_fixes_round_trip() {
     let undo = done["undo_id"].as_i64().unwrap();
     assert_eq!(w.ok("guide_fix", json!({ "action": "undo", "undo_id": undo }))["reverted"], 1);
     assert_eq!(w.err("guide_fix", json!({ "action": "undo", "undo_id": undo })), ErrorCode::Unavailable, "undone already");
+    // a playlist rule re-maps its locked channels too
+    let rule = json!({ "action": "propose", "rules": [{ "playlist": "TV One", "timeshift_siblings": true }] });
+    assert_eq!(w.err("guide_fix", rule), ErrorCode::Unavailable, "TV One has a locked channel and the session is locked");
 }
 
 /// multiview: two live pictures are sent to the app; movies stay single view, a future
@@ -1387,20 +1400,4 @@ fn the_multiview_tool() {
     assert_eq!(w.err("multiview", json!({ "action": "open", "refs": ["channel:1:m3u:late", "channel:1:m3u:itv4"] })), ErrorCode::NotFound);
     assert_eq!(w.err("multiview", json!({ "action": "swap", "what": "sound" })), ErrorCode::Unavailable);
     assert_eq!(w.err("multiview", json!({ "action": "close" })), ErrorCode::Unavailable);
-}
-
-/// A feature tool whose flag is off is refused by the production handler (it isn't listed by
-/// `tools/list` either), whatever a client sends.
-#[test]
-fn unlisted_feature_tools_are_refused_in_production() {
-    let ui = TestUi::with_config(pin_config()).unwrap();
-    let s = ui.services();
-    let handler = AgentHandler::new(s.agent.clone(), s.store.clone(), s.config.clone(), s.tiles.focused(), s.bus.clone(), s.jobs.clone());
-    for (name, args) in [("queue", json!({ "action": "list" })), ("follow", json!({ "action": "list" })), ("multiview", json!({ "action": "close" }))]
-    {
-        let listed = tuner::agent::tools::tools().iter().any(|t| t.name == name);
-        let call = Call::from_tool(name, args).unwrap();
-        let reply = s.rt.block_on(handler.handle(Request::new(1, call)));
-        assert_eq!(reply.ok || reply.error.as_ref().is_some_and(|e| e.code != ErrorCode::Unsupported), listed, "{name}: {reply:?}");
-    }
 }

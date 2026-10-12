@@ -7,7 +7,7 @@ allowed-tools: Read mcp__plugin_omatuner_tuner__status mcp__plugin_omatuner_tune
 
 # Kids: suitable picks, bedtime, parent checks, tighter locks
 
-First read `../../RULES.md` and follow it throughout; rules 5 and 6 matter most here.
+First read `${CLAUDE_SKILL_DIR}/../../RULES.md` and follow it throughout; rules 5 and 6 matter most here.
 
 ## Picks ("something for the kids, 5 and 8, nothing scary")
 

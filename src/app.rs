@@ -3935,7 +3935,9 @@ mod tests {
         let id = rig.app.lib.live.by_ref(&explicit_ref()).unwrap();
         rig.app.log.borrow_mut().jobs.clear();
         rig.app.log.borrow_mut().commands.clear();
-        rig.app.parental.lock();
+        // Claude's `lock session_now` (the user's own relock takes the same path from here)
+        rig.event(AppEvent::Agent(crate::agent::AgentCommand::LockSession));
+        assert!(!rig.app.parental.is_unlocked(&rig.app.services().config().parental));
         let playable = crate::model::Playable {
             media: MediaRef::Channel(id),
             kind: crate::model::PlayableKind::Live,
@@ -5249,6 +5251,43 @@ mod tests {
         rig.until("single view on B", |r| !r.app.mv.view.on);
         let v = rig.app.mv.view;
         assert!(v.focus == PIC_B && v.audible == PIC_B, "{v:?}");
+    }
+
+    /// The `multiview` tool with two channels while one picture shows (idle, or a film): A plays
+    /// the first and B the second, although the snapshot doesn't show A's play yet.
+    #[test]
+    fn the_agent_opens_two_pictures_at_once() {
+        for film in [false, true] {
+            let mut rig = Rig::with(test_config(), live(), 1.0, seed_two_playlists);
+            rig.settle();
+            if film {
+                rig.app.send_player(PlayerCommand::Play(PlayRequest {
+                    media: MediaRef::Url("http://127.0.0.1/film.mkv".into()),
+                    zap: None,
+                    origin: PlayOrigin::Cli,
+                    resume: false,
+                    immediate: true,
+                }));
+                rig.until("the film plays", |r| r.app.snapshot.playable.is_some());
+            }
+            let before = rig.log().commands.len();
+            let (alpha, delta) = (MediaRef::Channel(ChannelId(1)), MediaRef::Channel(ChannelId(6)));
+            let open =
+                crate::agent::AgentMultiView::Open { targets: vec![alpha.clone(), delta.clone()], layout: None, sound: None, rearrange: false };
+            rig.event(AppEvent::Agent(crate::agent::AgentCommand::MultiView(open)));
+            rig.until("picture B plays", |r| r.app.services().tiles.b().is_some() && !tile_plays(&r.log(), PIC_B).is_empty());
+            let to_a: Vec<MediaRef> = rig.log().commands[before..]
+                .iter()
+                .chain(rig.log().tile_commands.iter().filter(|(t, _)| *t == PIC_A).map(|(_, c)| c))
+                .filter_map(|c| match c {
+                    PlayerCommand::Play(r) => Some(r.media.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(to_a, [alpha], "film {film}: A plays the first only");
+            assert_eq!(tile_plays(&rig.log(), PIC_B), [delta], "film {film}");
+            assert!(rig.app.mv.view.on, "film {film}");
+        }
     }
 
     /// The multi-view player at a tiled half (790 pt) and full screen (1600 pt), text size 12

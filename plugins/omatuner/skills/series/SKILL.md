@@ -7,7 +7,7 @@ allowed-tools: Read mcp__plugin_omatuner_tuner__status mcp__plugin_omatuner_tune
 
 # Series: carry on, recap, find an episode
 
-First read `../../RULES.md` and follow it throughout. A series the user is part-way through is
+First read `${CLAUDE_SKILL_DIR}/../../RULES.md` and follow it throughout. A series the user is part-way through is
 spoiler territory: use `spoiler_safe: true` until you know where they are.
 
 ## Carry on

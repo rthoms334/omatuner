@@ -7,7 +7,7 @@ allowed-tools: Read mcp__plugin_omatuner_tuner__status mcp__plugin_omatuner_tune
 
 # Fix: playback trouble, missing things, guide and playlist health
 
-First read `../../RULES.md` and follow it throughout. Settings advice is text only: you don't
+First read `${CLAUDE_SKILL_DIR}/../../RULES.md` and follow it throughout. Settings advice is text only: you don't
 change Tuner's settings yourself (guide fixes go through `guide_fix`, with the user's yes).
 
 ## Playback ("this keeps buffering", "channel's dead", "is it me or the provider?")
@@ -46,7 +46,8 @@ explicit while locked is simply not found: say it isn't in Tuner, nothing more.
 4. Show the summary and up to 5 before/after now-next rows, then ask.
 5. On yes: `guide_fix` `apply` with the `proposal_id` and `confirm: true`. Report `applied`
    and `skipped`, and the undo ("say 'undo', or Ctrl+Z in Guide fixes"; `guide_fix` `undo`
-   with `undo_id`). More than 50 channels: `pending_review`, the user applies it in Tuner.
+   with `undo_id`). More than 50 channels: `pending_review`; tell the user to review them in
+   Tuner's Guide fixes, or propose a narrower batch.
 6. Catch-up offsets: don't guess; suggest Tuner's Check, or use the user's "starts N minutes
    late".
 "Why wasn't I reminded about X?" → `follow` `preview` with the rule's `id` (left-out reasons)

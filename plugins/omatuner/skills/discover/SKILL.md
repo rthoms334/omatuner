@@ -7,7 +7,7 @@ allowed-tools: Read WebSearch WebFetch mcp__plugin_omatuner_tuner__match_titles 
 
 # Discover: trending and well-reviewed titles the user has
 
-First read `../../RULES.md` and follow it throughout.
+First read `${CLAUDE_SKILL_DIR}/../../RULES.md` and follow it throughout.
 
 ## Steps
 
@@ -15,8 +15,9 @@ First read `../../RULES.md` and follow it throughout.
    else a reputable current one. Note the source and its date. Search with titles and chart
    names only, never personal data or viewing history.
 2. `match_titles` with up to 100 `{title, year, kind}` (add `tmdb` or `imdb` ids when the page
-   gives them). Hidden, filtered and parental-locked-away titles come back `missing`; that is
-   expected, don't explain it.
+   gives them). Titles the user hid or filtered out, and explicit ones while the session is
+   locked, come back `missing`; that is expected, don't explain it. A locked title comes back
+   matched with `locked: true` (rule 5).
 3. Answer with what the library has first, in the chart's order: title, year, the copy that
    plays (playlist), and the web data labelled with its source and date ("#3 on Netflix's top 10,
    week of 5 October, per netflix.com"). Then, only if useful, what's missing.

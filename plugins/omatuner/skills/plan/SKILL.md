@@ -7,7 +7,7 @@ allowed-tools: Read mcp__plugin_omatuner_tuner__status mcp__plugin_omatuner_tune
 
 # Plan: tonight, this week, sport, reminders, sleep timer
 
-First read `../../RULES.md` and follow it throughout.
+First read `${CLAUDE_SKILL_DIR}/../../RULES.md` and follow it throughout.
 
 ## An evening or a weekend
 
