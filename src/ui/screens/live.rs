@@ -18,6 +18,11 @@
 //!   never two different tvg-ids — as alternatives to pick (a click, or Ctrl+O's menu). They
 //!   are never merged and nothing switches to one by itself; hidden channels and hidden
 //!   explicit content aren't offered, a locked one asks for the PIN.
+//! * Multi-view (DESIGN §35): picture chips over the preview (a click chooses the picture
+//!   the preview shows and Enter retunes), the A / B letter on the rows that play, a note under
+//!   the preview for the cursor channel ("↵ plays in A · Ctrl+M plays in B", and what the copy
+//!   planner would do in the other picture); Ctrl+M on a row plays it in the other picture
+//!   (`ui::item_menu`); preview autoplay is off (it never opens a third stream).
 //! * Several playlists with channels (DESIGN §29): the scope bar on top (tabs at Wide, the
 //!   `● TV 2 ▾` button otherwise; Alt+P, Ctrl+PgDn/PgUp) narrows the groups, All channels,
 //!   the favourites lists, History and Reminders — and so the zap lists — to one playlist;
@@ -663,6 +668,10 @@ pub struct LiveScreen {
     layout: Option<LayoutClass>,
     /// Groups marked for a bulk hide (DESIGN §28.7).
     marks: GroupMarks,
+    /// Multi-view (DESIGN §35): two pictures showed last frame (the hint line), and the
+    /// cursor channel's note under the preview (cursor, the focused picture and what it plays).
+    mv_on: bool,
+    mv_note: Option<((ChannelId, crate::model::TileId, u64), Option<String>)>,
     /// Indices into `groups` of the provider groups the filter shows whose names have the
     /// words typed: what "Hide these N groups" hides.
     matching: Vec<u32>,
@@ -1836,11 +1845,13 @@ impl LiveScreen {
                 let mut reader = crate::ui::data::DbEpg(ctx.db);
                 ctx.now_next.get((epg, ch.tvg_shift_min), now, &mut reader, ctx.budget).cloned()
             });
+            // two pictures: both channels are "playing", each with its picture's letter
+            let picture = ctx.multiview.tile_playing(id);
             let o = ChannelRowOpts {
                 source: sources.of(ch.source_id),
                 favourite: ctx.favs.is_fav(&item),
                 failed: failed.contains(&item),
-                playing: playing == Some(id),
+                playing: playing == Some(id) || picture.is_some(),
                 quality: ctx.quality(ch),
                 ..opts
             };
@@ -1852,6 +1863,17 @@ impl LiveScreen {
                 RowState::Idle
             };
             let resp = channel_row(ui, theme, ctx.images, ch, nn.as_ref(), now, o, state);
+            if let Some(tile) = picture {
+                let r = resp.rect;
+                let font = egui::FontId::proportional(theme.font(TypeToken::BodySmall));
+                ui.painter().text(
+                    egui::pos2(r.right() - theme.space(SpaceToken::Md), r.top() + theme.space(SpaceToken::Sm)),
+                    egui::Align2::RIGHT_TOP,
+                    tile.to_string(),
+                    font,
+                    theme.tokens.accent,
+                );
+            }
             clicked |= resp.clicked();
             resp
         });
@@ -1930,6 +1952,8 @@ impl LiveScreen {
         let theme = ctx.theme;
         let t = &theme.tokens;
         let rem = theme.rem();
+        // two pictures: which one the preview shows (a click chooses; DESIGN §35)
+        crate::ui::multiview::chips(ui, ctx);
         let width = ui.available_width();
         let video_rect = Rect::from_min_size(ui.cursor().min, egui::vec2(width, (width * 9.0 / 16.0).round()));
         let snap = ctx.player.clone();
@@ -1952,6 +1976,7 @@ impl LiveScreen {
                     .truncate(),
                 );
             }
+            self.draw_mv_note(ui, ctx, cursor);
         } else {
             let r = ui.allocate_rect(video_rect, egui::Sense::hover()).rect;
             ui.painter().rect_filled(r, t.rounding, t.fill_field);
@@ -2103,8 +2128,40 @@ impl LiveScreen {
         }
     }
 
+    /// Two pictures: where Enter and Ctrl+M play the cursor channel, and what the copy planner
+    /// would do with it in the other picture (computed once per cursor / picture change).
+    fn draw_mv_note(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, cursor: Option<ChannelId>) {
+        let theme = ctx.theme;
+        let t = &theme.tokens;
+        let view = ctx.multiview.view;
+        let (Some(id), true) = (cursor, view.on) else { return };
+        let loads = ctx.multiview.snap(view.focus).map_or(0, |s| s.load_generation)
+            ^ ctx.multiview.snap(view.unfocused()).map_or(0, |s| s.load_generation << 32);
+        let key = (id, view.focus, loads);
+        if self.mv_note.as_ref().is_none_or(|(k, _)| *k != key) {
+            match crate::ui::multiview::preview_note(ctx, id) {
+                Some(n) => self.mv_note = Some((key, Some(n))),
+                // no frame budget left: asked again next frame (a cached `None` is final)
+                None if ctx.budget.deferred() => {}
+                None => self.mv_note = Some((key, None)),
+            }
+        }
+        let small = |s: String, c| egui::Label::new(egui::RichText::new(s).size(theme.font(TypeToken::BodySmall)).color(c)).wrap();
+        let ctrl_m = shortcut(KeyContext::List, Action::WatchAlongside).unwrap_or_else(|| "Ctrl+M".into());
+        ui.add_space(theme.space(SpaceToken::Xs));
+        ui.add(small(format!("↵ plays in {} · {ctrl_m} plays in {}", view.focus, view.unfocused()), t.text_secondary));
+        if let Some((_, Some(note))) = &self.mv_note {
+            ui.add(small(format!("{} {note}", glyphs::INFO), t.text_secondary));
+        }
+    }
+
     /// Opt-in preview autoplay after the keyboard cursor rested.
     fn autoplay(&mut self, ctx: &mut UiCtx<'_>, ui: &egui::Ui) {
+        // never while two pictures show: the preview never opens a third stream (DESIGN §35)
+        if ctx.multiview.on() {
+            self.rest = None;
+            return;
+        }
         let Some((ch, at)) = self.rest else { return };
         let cfg = &ctx.config.interface;
         if !cfg.live_preview_autoplay || !Self::preview_visible(ctx.layout) || self.cursor_channel() != Some(ch) {
@@ -2150,7 +2207,15 @@ impl Screen for LiveScreen {
 
     fn hint_extras(&self) -> Vec<(Action, &'static str)> {
         let shown = self.also_on.as_ref().is_some_and(|(_, c, alts)| Some(*c) == self.cursor_channel() && !alts.is_empty());
-        if self.focus == Pane::Channels && shown { vec![(Action::PlayFrom, "also on")] } else { Vec::new() }
+        let mut v = Vec::new();
+        if self.focus == Pane::Channels && shown {
+            v.push((Action::PlayFrom, "also on"));
+        }
+        // two pictures: Enter retunes the focused one, Ctrl+M the other (DESIGN §35)
+        if self.focus == Pane::Channels && self.mv_on {
+            v.push((Action::WatchAlongside, "other picture"));
+        }
+        v
     }
 
     fn on_enter(&mut self, ctx: &mut UiCtx<'_>, route: &Route) {
@@ -2211,6 +2276,7 @@ impl Screen for LiveScreen {
 
     fn ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) {
         self.refresh(ctx);
+        self.mv_on = ctx.multiview.on();
         let theme = ctx.theme;
         let layout = ctx.layout;
         if self.layout != Some(layout) {

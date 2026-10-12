@@ -24,6 +24,16 @@
 //! (theme colours for its title strip, OSD colours inside the video) and is NOT recorded as a
 //! placement: the app shows it only when no screen placed the video in the previous frame, so
 //! recording it would make it blink every other frame.
+//!
+//! Multi-view (DESIGN §35, MV-2): one surface per picture. Picture B's is made after startup
+//! ([`VideoHost::make_surface`], GL current, from the `SurfaceFactory` saved at startup); until
+//! then its place reads "Starting…". [`VideoHost::paint`] paints the surface of the snapshot's
+//! picture (screens pass the focused one), [`VideoHost::paint_tile`] one multi-view picture
+//! (only the focused one lays out recovery buttons; the other's overlay says how to choose
+//! it). [`VideoHost::render`] renders each picture painted in the last frame — when none was,
+//! the focused one into the sink — so a picture nobody shows stops its render clock and its
+//! player suspends its video after 10 s ([`VideoHost::was_painted`] tells the app when to
+//! resume it). The mini player shows picture in picture ([`VideoHost::mini_player_with`]).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -33,6 +43,8 @@ use eframe::glow;
 
 use crate::images::{ImageCache, ImageKind, ImageState};
 use crate::model::PlayableKind;
+use crate::model::TileId;
+use crate::player::render::SurfaceFactory;
 use crate::player::{PlayerErrorKind, PlayerSnapshot, PlayerState, VideoSurface};
 use crate::theme::{SpaceToken, Theme, TypeToken, with_alpha};
 use crate::ui::LayoutClass;
@@ -80,32 +92,79 @@ pub struct StateButton {
     pub font: FontId,
 }
 
+/// One picture's video: its surface and what painting it needs.
+#[derive(Default)]
+struct TileVideo {
+    surface: Option<VideoSurface>,
+    last_generation: u64,
+    /// Logo of what plays (url, texture), resolved through the image cache by `paint`.
+    logo: Option<(String, egui::TextureHandle)>,
+    /// Painted this frame (`painted`) / in the previous one (`painted_before`).
+    painted: bool,
+    painted_before: bool,
+}
+
 #[derive(Default)]
 pub struct VideoHost {
-    surface: Option<VideoSurface>,
+    /// Picture A (made at startup) and picture B (made once multi-view started it).
+    tiles: [TileVideo; 2],
+    /// Makes picture B's surface after startup (GL current; `None` without a GL backend).
+    factory: Option<SurfaceFactory>,
     placed: Placement,
     placed_this_frame: Placement,
-    last_generation: u64,
     mini: Option<egui::Rect>,
     /// `mini_player` ran since the last `begin_frame` (a rect nobody redraws is dropped).
     mini_drawn: bool,
-    /// Logo of what plays (url, texture), resolved through the image cache by `paint`.
-    logo: Option<(String, egui::TextureHandle)>,
-    /// Recovery buttons of the last fullscreen `paint` (empty unless failed / reconnecting).
+    /// Recovery buttons of the last fullscreen `paint` of the focused picture (empty unless
+    /// failed / reconnecting).
     buttons: Vec<StateButton>,
     /// The label of the other copy a failed title can play from ([`VideoHost::set_other_copy`]).
     other_copy: Option<String>,
 }
 
+fn slot(tile: TileId) -> usize {
+    usize::from(tile.0).min(1)
+}
+
 impl VideoHost {
     pub fn new(surface: Option<VideoSurface>) -> Self {
-        Self { surface, ..Default::default() }
+        let mut h = Self::default();
+        h.tiles[0].surface = surface;
+        h
+    }
+
+    /// What makes the other pictures' surfaces later (saved from the creation context).
+    pub fn set_factory(&mut self, factory: Option<SurfaceFactory>) {
+        self.factory = factory;
+    }
+
+    /// Make `tile`'s surface for its player (`Player::render_core`); GL must be current. Without
+    /// a factory (no GL backend: tests) the picture shows "Video unavailable".
+    pub fn make_surface(&mut self, tile: TileId, core: crate::player::RenderCore) -> Result<(), String> {
+        let Some(f) = &self.factory else { return Err("no GL backend".into()) };
+        let s = f.make(core).map_err(|e| e.to_string())?;
+        self.tiles[slot(tile)].surface = Some(s);
+        Ok(())
+    }
+
+    /// `tile`'s surface exists (B: once made).
+    pub fn has_surface(&self, tile: TileId) -> bool {
+        self.tiles[slot(tile)].surface.is_some()
+    }
+
+    /// `tile` was painted in the last frame (the app resumes a suspended picture only then).
+    pub fn was_painted(&self, tile: TileId) -> bool {
+        let t = &self.tiles[slot(tile)];
+        t.painted || t.painted_before
     }
 
     /// Start of frame bookkeeping (app).
     pub fn begin_frame(&mut self) {
         self.placed = self.placed_this_frame;
         self.placed_this_frame = Placement::None;
+        for t in &mut self.tiles {
+            t.painted_before = std::mem::take(&mut t.painted);
+        }
         // the mini-player wasn't drawn last frame (a screen placed the video, playback
         // stopped, Compact…): toasts and the guide must stop avoiding its old rect
         if !self.mini_drawn {
@@ -121,7 +180,7 @@ impl VideoHost {
 
     /// False when libmpv/GL failed at startup (no surface).
     pub fn available(&self) -> bool {
-        self.surface.is_some()
+        self.tiles[0].surface.is_some()
     }
 
     /// The mini-player rect drawn this frame or the previous one (toasts and the guide avoid
@@ -130,14 +189,23 @@ impl VideoHost {
         self.mini
     }
 
-    /// Render mpv into the FBO (from `App::logic`, GL current). Clears to black on new loads.
-    pub fn render(&mut self, gl: &glow::Context, frame: &mut eframe::Frame, snap: &PlayerSnapshot) {
-        let Some(s) = &mut self.surface else { return };
-        if snap.load_generation != self.last_generation {
-            self.last_generation = snap.load_generation;
-            s.reset_for_new_file();
+    /// Render mpv into the FBOs (from `App::logic`, GL current). Clears to black on new loads.
+    /// Each picture painted in the last frame renders; when none was, only the focused picture
+    /// renders, into the sink (frames must be consumed). A picture that isn't rendered stops
+    /// its render clock, and its player suspends its video after 10 s (DESIGN §35 §4.6).
+    pub fn render(&mut self, gl: &glow::Context, frame: &mut eframe::Frame, snaps: [Option<&PlayerSnapshot>; 2], focus: TileId) {
+        let any = self.tiles.iter().any(|t| t.painted);
+        for (i, t) in self.tiles.iter_mut().enumerate() {
+            let (Some(s), Some(snap)) = (&mut t.surface, snaps[i]) else { continue };
+            if !(t.painted || (!any && i == slot(focus))) {
+                continue;
+            }
+            if snap.load_generation != t.last_generation {
+                t.last_generation = snap.load_generation;
+                s.reset_for_new_file();
+            }
+            s.render(gl, frame);
         }
-        s.render(gl, frame);
     }
 
     /// Paint the video into `rect` (mpv draws black bars), plus the state overlay (with the
@@ -154,27 +222,45 @@ impl VideoHost {
         snap: &PlayerSnapshot,
     ) -> egui::Response {
         self.update_logo(images, snap);
-        self.paint_video(ui, rect, placement, theme, snap)
+        self.paint_video(ui, rect, placement, theme, snap, true)
+    }
+
+    /// [`paint`](Self::paint) of one multi-view picture: `focused` = keys act on it (only its
+    /// recovery buttons are laid out; the others' overlays say how to get to them).
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint_tile(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        placement: Placement,
+        theme: &Theme,
+        images: &mut ImageCache,
+        snap: &PlayerSnapshot,
+        focused: bool,
+    ) -> egui::Response {
+        self.update_logo(images, snap);
+        self.paint_video(ui, rect, placement, theme, snap, focused)
     }
 
     /// Resolve the logo of what plays (only requested while a video rect is painted).
     fn update_logo(&mut self, images: &mut ImageCache, snap: &PlayerSnapshot) {
+        let t = &mut self.tiles[slot(snap.tile)];
         let Some(url) = snap.playable.as_ref().and_then(|p| p.logo.as_deref()).map(str::trim).filter(|u| !u.is_empty()) else {
-            self.logo = None;
+            t.logo = None;
             return;
         };
         match images.get(url, ImageKind::Logo) {
-            ImageState::Ready(tex) => self.logo = Some((url.to_owned(), tex)),
+            ImageState::Ready(tex) => t.logo = Some((url.to_owned(), tex)),
             // keep a texture of the same url while it reloads; a new channel starts without
-            ImageState::Loading => self.logo = self.logo.take().filter(|(u, _)| u == url),
-            ImageState::Failed => self.logo = None,
+            ImageState::Loading => t.logo = t.logo.take().filter(|(u, _)| u == url),
+            ImageState::Failed => t.logo = None,
         }
     }
 
     /// The logo texture for what plays now (`None` → monogram).
     fn logo_for(&self, snap: &PlayerSnapshot) -> Option<&egui::TextureHandle> {
         let url = snap.playable.as_ref().and_then(|p| p.logo.as_deref()).map(str::trim)?;
-        self.logo.as_ref().filter(|(u, _)| u == url).map(|(_, t)| t)
+        self.tiles[slot(snap.tile)].logo.as_ref().filter(|(u, _)| u == url).map(|(_, t)| t)
     }
 
     /// Offer another copy of the failed title on the error card ("Play from TV 2 at 41:20");
@@ -188,7 +274,15 @@ impl VideoHost {
         &self.buttons
     }
 
-    fn paint_video(&mut self, ui: &mut egui::Ui, rect: egui::Rect, placement: Placement, theme: &Theme, snap: &PlayerSnapshot) -> egui::Response {
+    fn paint_video(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        placement: Placement,
+        theme: &Theme,
+        snap: &PlayerSnapshot,
+        focused: bool,
+    ) -> egui::Response {
         self.placed_this_frame = placement;
         let resp = ui.allocate_rect(rect, egui::Sense::click());
         let painter = ui.painter_at(rect);
@@ -197,7 +291,19 @@ impl VideoHost {
         // The FBO covers the whole rect: mpv letterboxes itself (keepaspect), so aspect
         // override / panscan / zoom (`v`, `V`) work without app-side geometry.
         let target = rect;
-        if let Some(s) = &mut self.surface {
+        let starting = snap.tile != TileId::A && self.tiles[slot(snap.tile)].surface.is_none() && self.tiles[0].surface.is_some();
+        let tile = &mut self.tiles[slot(snap.tile)];
+        tile.painted = true;
+        if starting {
+            // picture B's player is up; its surface comes with the next GL frame
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Starting…",
+                egui::FontId::proportional(theme.font(crate::theme::TypeToken::Body)),
+                theme.tokens.osd_text,
+            );
+        } else if let Some(s) = &mut tile.surface {
             s.request_size((target.width() * ppp).round() as i32, (target.height() * ppp).round() as i32);
             if let (Some((tex, _)), true) = (s.texture(), s.has_frame()) {
                 painter.image(tex, target, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
@@ -211,7 +317,10 @@ impl VideoHost {
                 theme.tokens.osd_text,
             );
         }
-        self.buttons = self.paint_state_overlay(ui, rect, placement, theme, snap);
+        let buttons = self.paint_state_overlay(ui, rect, placement, theme, snap, focused);
+        if focused {
+            self.buttons = buttons;
+        }
         resp
     }
 
@@ -224,6 +333,7 @@ impl VideoHost {
         placement: Placement,
         theme: &Theme,
         snap: &PlayerSnapshot,
+        focused: bool,
     ) -> Vec<StateButton> {
         let t = &theme.tokens;
         let p = ui.painter_at(rect);
@@ -237,7 +347,9 @@ impl VideoHost {
         let time = ui.input(|i| i.time);
         // recovery buttons centred under the text (the fullscreen player handles them)
         let buttons = |bottom: f32, reconnecting: bool| -> Vec<StateButton> {
-            if placement != Placement::Fullscreen {
+            // keys act on the focused picture; inside one narrower than 360 pt only the hint
+            // says what to press
+            if placement != Placement::Fullscreen || !focused || rect.width() < 360.0 {
                 return Vec::new();
             }
             let font = FontId::proportional((theme.font(TypeToken::Body) * k).round());
@@ -329,7 +441,7 @@ impl VideoHost {
                 } else {
                     format!("{} · retrying now", reason_label(*reason))
                 };
-                let hint = recovery_hint(placement, live, snap.previous_live.is_some(), true);
+                let hint = if focused { recovery_hint(placement, live, snap.previous_live.is_some(), true) } else { UNFOCUSED_HINT };
                 let lines = [
                     (head.as_str(), title_font, t.osd_text),
                     (detail.as_str(), body_font, with_alpha(t.osd_text, 0.7)),
@@ -343,7 +455,7 @@ impl VideoHost {
             PlayerState::Error(e) => {
                 p.rect_filled(rect, 0.0, t.osd_scrim);
                 let (head, detail) = error_copy(e.kind, &e.message);
-                let hint = recovery_hint(placement, live, snap.previous_live.is_some(), false);
+                let hint = if focused { recovery_hint(placement, live, snap.previous_live.is_some(), false) } else { UNFOCUSED_HINT };
                 let glyph_font = FontId::proportional((theme.font(TypeToken::DisplayLarge) * k).round());
                 let lines = [
                     (glyphs::WARNING, glyph_font, t.osd_accent),
@@ -411,6 +523,20 @@ impl VideoHost {
         snap: &PlayerSnapshot,
         queue: &crate::queue::QueueSnapshot,
     ) -> Option<MiniAction> {
+        self.mini_player_with(ctx, theme, snap, queue, None)
+    }
+
+    /// [`mini_player`](Self::mini_player) with multi-view's other picture (DESIGN §35):
+    /// picture in picture, the focused one big and `inset` a third of the width at the top
+    /// right, outlined; ✕ stops both.
+    pub fn mini_player_with(
+        &mut self,
+        ctx: &egui::Context,
+        theme: &Theme,
+        snap: &PlayerSnapshot,
+        queue: &crate::queue::QueueSnapshot,
+        inset: Option<&PlayerSnapshot>,
+    ) -> Option<MiniAction> {
         self.mini = None;
         if snap.state == PlayerState::Idle {
             return None;
@@ -423,9 +549,19 @@ impl VideoHost {
         egui::Area::new(egui::Id::new("mini-player")).movable(false).order(egui::Order::Foreground).fixed_pos(total.min).show(ctx, |ui| {
             ui.set_min_size(total.size());
             let video = Rect::from_min_size(total.min, egui::vec2(total.width(), total.height() - strip_h));
-            let resp = self.paint_video(ui, video, Placement::Mini, theme, snap);
+            let resp = self.paint_video(ui, video, Placement::Mini, theme, snap, true);
             if resp.on_hover_text("Open the player").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                 result = Some(MiniAction::Open);
+            }
+            if let Some(other) = inset {
+                let w = (video.width() / 3.0).round();
+                let m = theme.space(SpaceToken::Sm);
+                let r = Rect::from_min_size(egui::pos2(video.right() - m - w, video.top() + m), egui::vec2(w, (w * 9.0 / 16.0).round()));
+                let resp = self.paint_video(ui, r, Placement::Mini, theme, other, false);
+                ui.painter().rect_stroke(r, 0.0, egui::Stroke::new(1.0, t.osd_text), egui::StrokeKind::Outside);
+                if resp.on_hover_text("Open the player").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    result = Some(MiniAction::Open);
+                }
             }
             crate::queue::ui::mini_chip(ui, theme, queue, video);
             let strip = Rect::from_min_max(egui::pos2(total.left(), video.bottom()), total.max);
@@ -463,7 +599,8 @@ impl VideoHost {
             if strip_button(ui, pop, "mini-pop-out", glyphs::POP_OUT, "Pop out", "Pop out (Ctrl+Shift+O)") {
                 result = Some(MiniAction::PopOut);
             }
-            if strip_button(ui, close, "mini-close", glyphs::CLOSE, "Stop playback", "Stop playback") {
+            let stop = if inset.is_some() { "Stop both pictures" } else { "Stop playback" };
+            if strip_button(ui, close, "mini-close", glyphs::CLOSE, stop, stop) {
                 result = Some(MiniAction::Stop);
             }
             let p = ui.painter();
@@ -476,12 +613,15 @@ impl VideoHost {
         result
     }
 
-    /// Free GL resources (from `App::on_exit`, before the player shuts down).
+    /// Free GL resources (from `App::on_exit`, before the players shut down): picture B's
+    /// surface first, then A's.
     pub fn destroy(&mut self, gl: Option<&glow::Context>) {
-        if let Some(s) = &mut self.surface {
-            s.destroy(gl);
+        for t in self.tiles.iter_mut().rev() {
+            if let Some(s) = &mut t.surface {
+                s.destroy(gl);
+            }
+            t.surface = None;
         }
-        self.surface = None;
     }
 }
 
@@ -567,6 +707,9 @@ fn reason_label(kind: PlayerErrorKind) -> &'static str {
         _ => "Connection lost",
     }
 }
+
+/// The hint on a multi-view picture keys don't go to.
+const UNFOCUSED_HINT: &str = "Click it or press w to choose this picture";
 
 /// The key hint under a failed / reconnecting stream. The player's keys (`r`, Backspace) only
 /// work in the fullscreen player: in the Live list `r` types into the filter and Backspace

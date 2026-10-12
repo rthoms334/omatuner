@@ -39,7 +39,13 @@
 //! * `osd.rs`: the controls and bars. `panels.rs`: side panels — Q-ui adds the `u` panel.
 //! * `banner.rs`: the info banner and flashes. `cards.rs`: end-of-playback and state cards —
 //!   Q-ui (Up next card). `shield.rs`: the zap shield card — S-ui (S4).
-//!   `multiview.rs`: the multi-view chrome — MV-2.
+//!   `multiview.rs`: the multi-view pictures, chrome, keys and mouse — MV-2.
+//! * Multi-view (DESIGN §35, `ctx.multiview.on()`): both pictures in the layout (side by side,
+//!   big + small, picture in picture — always in the popped-out window); `ctx.player` is the
+//!   focused picture's, so the OSD, panels, cards and keys act on it, volume and mute on the
+//!   picture with the sound (`UiCtx::play`). The app puts `MultiView` above the player's base
+//!   context: `w` next picture, Ctrl+arrows, `M` sound here, `W` swap, `t` layout, `q` close
+//!   this picture (Esc never closes one); the right-click menu starts with them.
 //!
 //! Everything over the video uses the fixed OSD colours (`osd_scrim`, `osd_text`,
 //! `osd_accent`), never theme colours, so it is legible on any theme (FIXED DECISION 6). Keys
@@ -149,6 +155,8 @@ pub struct PlayerScreen {
     other_copy: Option<(u64, Option<crate::ui::copies::OtherCopy>)>,
     /// The copies the Ctrl+O menu listed during playback (DESIGN §29.15).
     switch_copies: Vec<crate::ui::copies::OtherCopy>,
+    /// Multi-view's layout of the last frame and its captions (`multiview.rs`).
+    mv: multiview::MvScreen,
 }
 
 /// The OSD scale of the current window.
@@ -285,7 +293,8 @@ impl PlayerScreen {
         let snap = ctx.player;
         let live = is_live(snap);
         let k = if live { KeyContext::PlayerLive } else { KeyContext::PlayerVod };
-        let mut items = Vec::new();
+        // multi-view: what to do with the picture first (DESIGN §35)
+        let mut items = self.multiview_menu(ctx);
         if live {
             items.push(menu_item(glyphs::PLAYLIST, "Channels…", Action::ChannelList, true, k));
             items.push(menu_item(glyphs::GUIDE, "Now / next…", Action::MiniGuide, true, k));
@@ -569,7 +578,13 @@ impl Screen for PlayerScreen {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) {
-        let rect = ui.available_rect_before_wrap();
+        let mut rect = ui.available_rect_before_wrap();
+        // popped out: the scheduled-playback strip (rui's) takes the top of the window
+        if ctx.video_only {
+            let top = crate::ui::popout::strip(ui, ctx, rect);
+            rect.min.y = (rect.min.y + top).min(rect.max.y);
+        }
+        let rect = rect;
         let theme = ctx.theme;
         let snap = ctx.player.clone();
         self.live_ctx = is_live(&snap);
@@ -580,12 +595,16 @@ impl Screen for PlayerScreen {
             let fs = ui.input(|i| i.viewport().fullscreen).unwrap_or(false);
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fs));
         }
-        if snap.state == PlayerState::Idle && snap.playable.is_none() {
+        if snap.state == PlayerState::Idle && snap.playable.is_none() && !ctx.multiview.on() {
             self.idle_ui(ui, ctx, rect);
             return;
         }
         self.update_other_copy(ctx, &snap);
-        let resp = ctx.video.paint(ui, rect, Placement::Fullscreen, theme, ctx.images, &snap);
+        // multi-view: both pictures in their layout (the response covers every picture)
+        let resp = match self.paint_multiview(ui, ctx, rect) {
+            Some(r) => r,
+            None => ctx.video.paint(ui, rect, Placement::Fullscreen, theme, ctx.images, &snap),
+        };
         // popped out, a drag on the video moves the window (only there: a drag-sensing video
         // counts as hovered under every button drawn over it, see the wheel and cursor below)
         let resp = if ctx.video_only { resp.interact(egui::Sense::drag()) } else { resp };
@@ -657,6 +676,7 @@ impl Screen for PlayerScreen {
             } else {
                 self.draw_osd(ui, ctx, rect, &snap);
             }
+            self.draw_multiview_bar(ui, ctx, rect);
             if let Some(t) = self.banner_until {
                 let left = t.saturating_duration_since(Instant::now());
                 if !left.is_zero() {
@@ -706,6 +726,10 @@ impl Screen for PlayerScreen {
             OverlayResult::Chosen(Action::TogglePopOut) => ctx.navigate(NavRequest::TogglePopOut),
             // a global key's entry (rui): its menu
             OverlayResult::Chosen(Action::SleepTimer) => ctx.open(OverlayRequest::SleepTimer),
+            // the menu's "Close picture B" (multi-view; never a typed channel number)
+            OverlayResult::Chosen(Action::Digit(multiview::CLOSE_OTHER)) if ctx.multiview.on() => {
+                ctx.mv_request(crate::ui::multiview::MvRequest::Close(Some(ctx.multiview.view.unfocused())));
+            }
             // a copy of the Ctrl+O menu (never a typed channel number)
             OverlayResult::Chosen(Action::Digit(d)) if d >= SWITCH_COPY && !self.switch_copies.is_empty() => {
                 if let Some(c) = self.switch_copies.get(usize::from(d - SWITCH_COPY)) {
