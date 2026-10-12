@@ -4,6 +4,8 @@
 //! Every playlist's code is unique among the user's playlists: the library build resolves them
 //! all at once ([`assign`]), so they are computed once per library generation.
 
+use crate::model::SourceId;
+
 /// Longest code, in characters.
 pub const MAX_LEN: usize = 3;
 
@@ -131,23 +133,27 @@ fn unique(base: &str, taken: &impl Fn(&str) -> bool) -> String {
     base.to_owned()
 }
 
-/// The code of every playlist, in the order given (`(name, user code)`, playlist order): the
+/// The code of every playlist (`(id, name, user code)`), returned in the order given: the
 /// user's codes first (a later duplicate of one gets a variant), then derived codes for the
-/// rest in order, each the first free variant of [`auto`]. Unique and deterministic.
-pub fn assign<'a>(playlists: impl IntoIterator<Item = (&'a str, Option<&'a str>)>) -> Vec<String> {
-    let list: Vec<(&str, Option<String>)> = playlists.into_iter().map(|(n, c)| (n, c.and_then(|c| parse(c).ok().flatten()))).collect();
+/// rest, each the first free variant of [`auto`]. "Later" is creation order (the id), never the
+/// display order, so reordering playlists doesn't swap their codes. Unique and deterministic.
+pub fn assign<'a>(playlists: impl IntoIterator<Item = (SourceId, &'a str, Option<&'a str>)>) -> Vec<String> {
+    let list: Vec<(SourceId, &str, Option<String>)> =
+        playlists.into_iter().map(|(id, n, c)| (id, n, c.and_then(|c| parse(c).ok().flatten()))).collect();
+    let mut order: Vec<usize> = (0..list.len()).collect();
+    order.sort_by_key(|&i| list[i].0);
     let mut out: Vec<Option<String>> = vec![None; list.len()];
     let mut taken: Vec<String> = Vec::with_capacity(list.len());
-    for (i, (_, user)) in list.iter().enumerate() {
-        if let Some(u) = user {
+    for &i in &order {
+        if let Some(u) = &list[i].2 {
             let code = unique(u, &|c: &str| taken.iter().any(|t| t == c));
             taken.push(code.clone());
             out[i] = Some(code);
         }
     }
-    for (i, (name, _)) in list.iter().enumerate() {
+    for &i in &order {
         if out[i].is_none() {
-            let code = unique(&auto(name), &|c: &str| taken.iter().any(|t| t == c));
+            let code = unique(&auto(list[i].1), &|c: &str| taken.iter().any(|t| t == c));
             taken.push(code.clone());
             out[i] = Some(code);
         }
@@ -181,7 +187,8 @@ mod tests {
 
     #[test]
     fn codes_are_unique_and_users_win() {
-        let names = |v: &[(&'static str, Option<&'static str>)]| assign(v.iter().copied());
+        // ids in the order given, as most callers have them
+        let names = |v: &[(&'static str, Option<&'static str>)]| assign(v.iter().enumerate().map(|(i, &(n, c))| (SourceId(i as i64 + 1), n, c)));
         assert_eq!(names(&[("TV", None), ("TV 2", None), ("TV", None)]), ["TV", "TV2", "TV3"]);
         // a user's code is kept even when an earlier playlist would derive it
         assert_eq!(names(&[("Northwind", None), ("Nightwatch", Some("nw"))]), ["NW2", "NW"]);
@@ -189,14 +196,19 @@ mod tests {
         assert_eq!(names(&[("A", Some("X")), ("B", Some("x"))]), ["X", "X2"]);
         // an invalid stored code falls back to the name's
         assert_eq!(names(&[("Aurora", Some("toolong"))]), ["AU"]);
-        let many: Vec<(&str, Option<&str>)> = (0..60).map(|_| ("Aurora", None)).collect();
-        let codes = assign(many);
+        // reordering playlists keeps their codes: the older one keeps "NW", the user's "X"
+        let (nw, ng) = ((SourceId(1), "Northwind", None), (SourceId(2), "Nightwatch", None));
+        assert_eq!(assign([nw, ng]), ["NW", "NW2"]);
+        assert_eq!(assign([ng, nw]), ["NW2", "NW"]);
+        assert_eq!(assign([(SourceId(5), "B", Some("x")), (SourceId(4), "A", Some("X"))]), ["X2", "X"]);
+        let many: Vec<(SourceId, &str, Option<&str>)> = (0..60).map(|i| (SourceId(i), "Aurora", None)).collect();
+        let codes = assign(many.clone());
         let mut dedup = codes.clone();
         dedup.sort();
         dedup.dedup();
         assert_eq!(dedup.len(), 60, "{codes:?}");
         assert!(codes.iter().all(|c| (1..=MAX_LEN).contains(&c.chars().count())));
-        assert_eq!(assign(vec![("Aurora", None), ("Aurora", None)]), assign(vec![("Aurora", None), ("Aurora", None)]), "deterministic");
+        assert_eq!(assign(many.clone()), codes, "deterministic");
     }
 
     #[test]

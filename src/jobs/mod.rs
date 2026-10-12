@@ -366,6 +366,11 @@ pub struct JobContext {
     /// What the app publishes (B2): jobs use its library snapshot instead of building their
     /// own. `None` headless (`tuner --refresh`, tests).
     pub shared: Option<Arc<crate::shared::AppShared>>,
+    /// `tuner --refresh` ([`Self::headless`]): nothing reads the GUI-only caches, so the guide
+    /// check isn't submitted (the app checks the stamp once it has published its library).
+    pub headless: bool,
+    /// The guide check's debounce and whether it is running (`guide_check::request`).
+    pub guide_check: Arc<guide_check::CheckState>,
 }
 
 impl JobContext {
@@ -381,7 +386,15 @@ impl JobContext {
             player_busy: Arc::default(),
             explicit: Default::default(),
             shared: None,
+            headless: false,
+            guide_check: Arc::default(),
         }
+    }
+
+    /// A context for headless `tuner --refresh` (no GUI-only follow-ups).
+    pub fn headless(mut self) -> Self {
+        self.headless = true;
+        self
     }
 
     /// Jobs read what the app publishes; the explicit gate becomes the app's.
@@ -680,6 +693,9 @@ impl JobManager {
             });
             ManagerInner { ctx, rt, jobs: Mutex::default(), next_id: AtomicU64::new(1), limits: Limits::new(), closing: AtomicBool::new(false) }
         });
+        if crate::guide_fix::ENABLED && !inner.ctx.headless && inner.ctx.shared.is_some() {
+            inner.rt.spawn(guide_check::after_first_publish(Arc::downgrade(&inner)));
+        }
         Self { inner }
     }
 
@@ -945,14 +961,14 @@ pub(crate) fn after_guide_daily(ctx: &JobContext) {
 }
 
 /// The pipeline after a guide import, a rematch or a Guide fixes mapping change (B7): Following
-/// re-evaluates, the guide check refreshes its cache — each only once its feature is on; the
-/// "features" lane runs them one at a time.
+/// re-evaluates, the guide check refreshes its cache (debounced, GUI only) — each only once its
+/// feature is on; the "features" lane runs them one at a time.
 pub(crate) fn after_guide(ctx: &JobContext, reason: crate::follow::FollowReason) {
     if crate::follow::ENABLED {
         (ctx.submit)(JobKind::EvaluateFollows { reason });
     }
-    if crate::guide_fix::ENABLED {
-        (ctx.submit)(JobKind::GuideCheck);
+    if crate::guide_fix::ENABLED && !ctx.headless {
+        guide_check::request(ctx);
     }
 }
 

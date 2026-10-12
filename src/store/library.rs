@@ -782,7 +782,7 @@ fn load_sources(conn: &Connection) -> Result<Vec<SourceMeta>> {
         ))
     })?;
     let rows: Vec<(Option<String>, SourceMeta)> = rows.collect::<rusqlite::Result<_>>()?;
-    let codes = crate::sources::codes::assign(rows.iter().map(|(c, s)| (s.name.as_str(), c.as_deref())));
+    let codes = crate::sources::codes::assign(rows.iter().map(|(c, s)| (s.id, s.name.as_str(), c.as_deref())));
     Ok(rows.into_iter().zip(codes).map(|((_, s), code)| SourceMeta { code, ..s }).collect())
 }
 

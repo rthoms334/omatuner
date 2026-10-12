@@ -6,7 +6,7 @@
 
 use super::*;
 
-/// The "EPG mapping…" row becomes "Fix guide data… (N to fix)" (counted off the UI thread per
+/// The "Fix guide data…" row gains "(N to fix)" (counted off the UI thread per
 /// library build; the count of shown channels, like the coverage above it).
 pub(super) fn rows(_s: &SettingsScreen, ctx: &UiCtx<'_>, v: &mut [Row]) {
     if !crate::guide_fix::ENABLED {

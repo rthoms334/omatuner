@@ -2327,12 +2327,12 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Ctrl+S` | Sort & view options… |
 | `Ctrl+G` | Show in TV guide |
 | `Ctrl+I` | Details / edit information |
-| `Ctrl+E` | Assign EPG channel |
+| `Ctrl+E` | Assign guide channel |
 | `Ctrl+W` | Mark watched / unwatched |
 | `Delete` | Remove (from list / cancel task / forget) |
 | `Ctrl+N` | Add to Up next |
 | `Ctrl+Shift+N` | Play next (Up next) |
-| `Ctrl+M` | Watch in the other picture (multi-view) |
+| `Ctrl+M` | Watch alongside |
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
 | `a–z, 0–9 …` | Type to filter |
 
@@ -2362,12 +2362,12 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Ctrl+S` | Sort & view options… |
 | `Ctrl+G` | Show in TV guide |
 | `Ctrl+I` | Details / edit information |
-| `Ctrl+E` | Assign EPG channel |
+| `Ctrl+E` | Assign guide channel |
 | `Ctrl+W` | Mark watched / unwatched |
 | `Delete` | Remove (from list / cancel task / forget) |
 | `Ctrl+N` | Add to Up next |
 | `Ctrl+Shift+N` | Play next (Up next) |
-| `Ctrl+M` | Watch in the other picture (multi-view) |
+| `Ctrl+M` | Watch alongside |
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
 | `a–z, 0–9 …` | Type to filter |
 
@@ -2414,12 +2414,12 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Ctrl+S` | Sort & view options… |
 | `Ctrl+G` | Show in TV guide |
 | `Ctrl+I` | Details / edit information |
-| `Ctrl+E` | Assign EPG channel |
+| `Ctrl+E` | Assign guide channel |
 | `Ctrl+W` | Mark watched / unwatched |
 | `Delete` | Remove (from list / cancel task / forget) |
 | `Ctrl+N` | Add to Up next |
 | `Ctrl+Shift+N` | Play next (Up next) |
-| `Ctrl+M` | Watch in the other picture (multi-view) |
+| `Ctrl+M` | Watch alongside |
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
 | `a–z, 0–9 …` | Type to filter |
 
@@ -2446,12 +2446,12 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Ctrl+S` | Sort & view options… |
 | `Ctrl+G` | Show in TV guide |
 | `Ctrl+I` | Details / edit information |
-| `Ctrl+E` | Assign EPG channel |
+| `Ctrl+E` | Assign guide channel |
 | `Ctrl+W` | Mark watched / unwatched |
 | `Delete` | Remove (from list / cancel task / forget) |
 | `Ctrl+N` | Add to Up next |
 | `Ctrl+Shift+N` | Play next (Up next) |
-| `Ctrl+M` | Watch in the other picture (multi-view) |
+| `Ctrl+M` | Watch alongside |
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
 | `a–z, 0–9 …` | Type to filter |
 
@@ -2479,12 +2479,12 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Ctrl+S` | Sort & view options… |
 | `Ctrl+G` | Show in TV guide |
 | `Ctrl+I` | Details / edit information |
-| `Ctrl+E` | Assign EPG channel |
+| `Ctrl+E` | Assign guide channel |
 | `Ctrl+W` | Mark watched / unwatched |
 | `Delete` | Remove (from list / cancel task / forget) |
 | `Ctrl+N` | Add to Up next |
 | `Ctrl+Shift+N` | Play next (Up next) |
-| `Ctrl+M` | Watch in the other picture (multi-view) |
+| `Ctrl+M` | Watch alongside |
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
 
 #### TV guide (`Guide`)
@@ -2506,12 +2506,12 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Ctrl+W` | Mark seen (lifts the spoiler guard) |
 | `Ctrl+N` | Add to Up next |
 | `Ctrl+Shift+N` | Play next (Up next) |
-| `Ctrl+M` | Watch in the other picture (multi-view) |
+| `Ctrl+M` | Watch alongside |
 | `f` | Collection: favourites lists, groups, all |
 | `0` / `1` / `2` / `3` / `4` / `5` / `6` / `7` / `8` / `9` | Jump to channel number |
 | `Ctrl+F` | Add channel to Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
-| `Ctrl+E` | Assign EPG channel |
+| `Ctrl+E` | Assign guide channel |
 | `Ctrl+I` | Edit channel information |
 | `F2` | Rename channel |
 | `Ctrl+H` | Hide channel |
@@ -2552,7 +2552,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `r` | Retry (after an error) |
 | `u` | Up next |
 | `n` / `N` | Next / previous in Up next |
-| `Ctrl+M` | Watch something alongside… (multi-view) |
+| `Ctrl+M` | Watch alongside… (choose the channel) |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Esc` | Back (hide banner, then leave; keeps playing in the mini player) |
 | `/` | Search everything |
@@ -2588,7 +2588,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `r` | Retry (after an error) |
 | `u` | Up next |
 | `n` / `N` | Next / previous in Up next |
-| `Ctrl+M` | Watch something alongside… (multi-view) |
+| `Ctrl+M` | Watch alongside… (choose the channel) |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Esc` | Back (hide banner, then leave; keeps playing in the mini player) |
 | `/` | Search everything |
@@ -2614,7 +2614,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `W` | Swap the pictures' places |
 | `t` | Layout: side by side, big + small, picture in picture |
 | `q` | Close this picture (the other carries on) |
-| `Ctrl+M` | Choose the channel for the other picture… |
+| `Ctrl+M` | Watch alongside… (choose the channel) |
 
 #### Pop-out player (`PopOut`)
 
@@ -2664,11 +2664,11 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `Ctrl+L` | Lock with PIN / unlock |
 | `Ctrl+G` | Show in TV guide |
 | `Ctrl+I` | Details / edit information |
-| `Ctrl+E` | Assign EPG channel |
+| `Ctrl+E` | Assign guide channel |
 | `Ctrl+W` | Mark watched / unwatched |
 | `Ctrl+N` | Add to Up next |
 | `Ctrl+Shift+N` | Play next (Up next) |
-| `Ctrl+M` | Watch in the other picture (multi-view) |
+| `Ctrl+M` | Watch alongside |
 | `Shift+F10` / `Ctrl+Enter` | List these shortcuts |
 
 #### Dialogs & menus (`Modal`)
@@ -2696,7 +2696,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `←` / `h` | Back to the page list |
 | `→` / `l` / `Shift+→` / `L` | Increase / next option |
 | `Shift+←` / `H` | Decrease / previous option |
-| `Alt+↑` / `K` / `Alt+↓` / `J` | Move up / down (reorder: EPG priority, playlists, lists) |
+| `Alt+↑` / `K` / `Alt+↓` / `J` | Move up / down (reorder: guide priority, playlists, lists) |
 | `Tab` / `Shift+Tab` | Next / previous section |
 | `Enter` / `Space` | Toggle / open |
 | `x` / `Delete` | Delete / more actions |

@@ -324,7 +324,7 @@ impl GuideScreen {
             live::menu_item(glyphs::FAV_LIST, "Favourites lists…", Action::AddToList, true, k),
             live::menu_item(glyphs::INFO, "Edit information…", Action::ShowDetails, true, k),
             live::menu_item(glyphs::TAG, "Rename", Action::Rename, true, k),
-            live::menu_item(glyphs::GUIDE, "Assign EPG channel…", Action::AssignEpg, true, k),
+            live::menu_item(glyphs::GUIDE, "Assign guide channel…", Action::AssignEpg, true, k),
             live::menu_item(glyphs::HIDDEN, "Hide", Action::ToggleHidden, true, k),
             live::menu_item(glyphs::LOCK, if ch.locked { "Unlock" } else { "Lock with PIN" }, Action::ToggleLock, true, k),
         ];

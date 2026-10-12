@@ -415,7 +415,7 @@ pub fn mark_seen(ctx: &mut UiCtx<'_>, guard: &Guard, p: &Programme) {
     with(|s| s.seen.push(row));
     hide_all();
     ctx.toast(Toast {
-        action: Some(("Undo…".into(), Action::SpoilerMenu)),
+        action: Some(("Spoiler guard…".into(), Action::SpoilerMenu)),
         ttl_ms: 6000,
         ..Toast::info(format!("“{shown}” marked seen — spoiler guard lifted"))
     });

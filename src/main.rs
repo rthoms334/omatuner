@@ -326,7 +326,7 @@ fn refresh_headless(paths: AppPaths, config: Config, timeout: Duration) -> anyho
     }
     let http = HttpClient::new(&tuner::services::http_options(&config))?;
     let shared = Arc::new(RwLock::new(Arc::new(config)));
-    let jobs = JobManager::new(JobContext::new(store.clone(), http, bus, paths, shared), rt.handle().clone());
+    let jobs = JobManager::new(JobContext::new(store.clone(), http, bus, paths, shared).headless(), rt.handle().clone());
     let root = jobs.submit(JobKind::RefreshStale);
     let failed = wait_for_jobs(&jobs, &events, root, timeout);
     jobs.cancel_all();

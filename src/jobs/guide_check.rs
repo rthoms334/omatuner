@@ -4,8 +4,10 @@
 //! * Rule-row derivation runs in `rematch_all` / the guide import (B7), not here; the probes
 //!   ("anything now or later?") are cheap and run with the classification
 //!   (`store::guide_fix::facts`).
-//! * Debounced [`DEBOUNCE`]: the job waits before reading anything, and requests made meanwhile
-//!   coalesce into it (`JobManager::submit` merges into a job that hasn't read its inputs).
+//! * Debounced [`DEBOUNCE`] before it is submitted ([`request`]): requests made meanwhile push
+//!   the deadline back, so the job is only active (status bar, "features" lane, headless
+//!   `wait_for_jobs`) while it works. Headless `tuner --refresh` doesn't check: the app checks
+//!   the stamp once it has published its first library ([`after_first_publish`]).
 //! * The cache is bound to `store::guide_fix::stamp` (guides' generations, playlists'
 //!   generations, threshold, rules): a different stamp clears it; otherwise only channels
 //!   without cached rows are looked at.
@@ -15,13 +17,13 @@
 //!   leaves a consistent cache that the next run completes.
 //! * Same job lane as `EvaluateFollows` (one at a time). Ends with `DataScope::GuideIssues`.
 
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use super::{JobContext, JobPhase, Progress, blocking, check, notify, read, write};
+use super::{JobContext, JobKind, JobPhase, ManagerInner, Progress, blocking, check, lock, notify, read, write};
 use crate::error::Result;
 use crate::model::{EpgSuggestion, ItemKind, ItemRef};
 use crate::msg::DataScope;
@@ -49,15 +51,91 @@ pub struct CheckReport {
     pub scored: usize,
 }
 
-/// Run the check (a no-op until `guide_fix::ENABLED`): wait [`DEBOUNCE`], then [`check_now`].
+/// The debounce deadline and whether a check is running (shared by every clone of the context).
+#[derive(Debug, Default)]
+pub struct CheckState {
+    due: Mutex<Option<tokio::time::Instant>>,
+    running: AtomicBool,
+}
+
+impl CheckState {
+    /// A check is working right now (Guide fixes' "Checking…" line; one atomic load a frame).
+    pub fn running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
+    }
+}
+
+/// Ask for a check [`DEBOUNCE`] from now. The first request in a window starts the timer;
+/// later ones push the deadline back. Outside a runtime the check is submitted at once.
+pub(crate) fn request(ctx: &JobContext) {
+    let state = ctx.guide_check.clone();
+    let first = lock(&state.due).replace(tokio::time::Instant::now() + DEBOUNCE).is_none();
+    if !first {
+        return;
+    }
+    let submit = ctx.submit.clone();
+    let Ok(rt) = tokio::runtime::Handle::try_current() else {
+        lock(&state.due).take();
+        submit(JobKind::GuideCheck);
+        return;
+    };
+    rt.spawn(async move {
+        loop {
+            let at = {
+                let mut due = lock(&state.due);
+                match *due {
+                    Some(at) if at <= tokio::time::Instant::now() => {
+                        due.take();
+                        break;
+                    }
+                    Some(at) => at,
+                    None => return,
+                }
+            };
+            tokio::time::sleep_until(at).await;
+        }
+        submit(JobKind::GuideCheck);
+    });
+}
+
+/// GUI start: once the app has published its first library, check if the cache's stamp is
+/// out of date (a headless refresh imported a guide without checking). Holds only a weak
+/// reference, so it never keeps the manager alive.
+pub(super) async fn after_first_publish(inner: Weak<ManagerInner>) {
+    const POLL: Duration = Duration::from_secs(1);
+    loop {
+        tokio::time::sleep(POLL).await;
+        let Some(inner) = inner.upgrade() else { return };
+        if inner.closing.load(Ordering::SeqCst) {
+            return;
+        }
+        if inner.ctx.published_library().is_some() {
+            let ctx = inner.ctx.clone();
+            drop(inner);
+            let opts = GuideOpts::from_config(&crate::config::current(&ctx.config));
+            match read(&ctx, move |c| Ok(store_gf::cached_stamp(c)? != Some(store_gf::stamp(c, &opts)?))).await {
+                Ok(true) => request(&ctx),
+                Ok(false) => {}
+                Err(e) => tracing::warn!(target: "tuner::jobs", "guide check stamp: {e}"),
+            }
+            return;
+        }
+    }
+}
+
+/// Run the check (a no-op until `guide_fix::ENABLED`); [`request`] already debounced it.
 pub async fn run(ctx: &JobContext, progress: &Progress, cancel: &CancellationToken) -> Result<()> {
     if !crate::guide_fix::ENABLED {
         return Ok(());
     }
-    tokio::select! {
-        _ = cancel.cancelled() => return Err(crate::error::Error::Cancelled),
-        _ = tokio::time::sleep(DEBOUNCE) => {}
+    struct Running<'a>(&'a AtomicBool);
+    impl Drop for Running<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Relaxed);
+        }
     }
+    ctx.guide_check.running.store(true, Ordering::Relaxed);
+    let _running = Running(&ctx.guide_check.running);
     let lib = job_library(ctx).await?;
     check_now(ctx, lib, progress, cancel).await.map(|_| ())
 }
@@ -71,7 +149,7 @@ async fn job_library(ctx: &JobContext) -> Result<Arc<Library>> {
     }
 }
 
-/// The check without the debounce (tests, and `run` after it).
+/// The check itself (tests, and `run`).
 pub async fn check_now(ctx: &JobContext, lib: Arc<Library>, progress: &Progress, cancel: &CancellationToken) -> Result<CheckReport> {
     progress.mark_inputs_read();
     progress.set(JobPhase::Matching);

@@ -155,7 +155,7 @@ impl ProgrammeOverlay {
                 let set = self.loaded.as_ref().is_some_and(|l| l.reminder.is_some());
                 (glyphs::REMINDER, if set { "Cancel reminder".into() } else { "Remind me".into() })
             }
-            Act::AssignEpg => (glyphs::GUIDE, "Assign EPG…".into()),
+            Act::AssignEpg => (glyphs::GUIDE, "Assign guide channel…".into()),
             Act::Slot(i) => self.slots.get(i).map_or(("", String::new()), |m| (m.icon, m.label.clone())),
             Act::More => (glyphs::MORE, "More…".into()),
             Act::Close => ("", "Close".into()),

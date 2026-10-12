@@ -569,3 +569,31 @@ async fn a_cancel_after_the_flip_keeps_the_new_guide() {
     assert!(h.finished(|k| *k == JobKind::Maintenance).await.1.is_ok());
     assert_eq!(scalar("SELECT count(*) FROM programme WHERE epg_source_id = ?1"), total);
 }
+
+/// The guide check is debounced before it is submitted: during the window nothing is active
+/// (status bar, the "features" lane, headless `wait_for_jobs`), and requests made meanwhile
+/// push the deadline back into one check. A headless context never asks for one.
+#[tokio::test(start_paused = true)]
+async fn the_guide_check_is_debounced_before_it_is_submitted_and_never_headless() {
+    let h = harness();
+    let checks = || h.jobs.active().into_iter().filter(|j| j.kind == JobKind::GuideCheck).count();
+    let settle = || async {
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    };
+    let headless = h.jobs.context().clone().headless();
+    after_guide(&headless, crate::follow::FollowReason::Guide);
+
+    after_guide(h.jobs.context(), crate::follow::FollowReason::Guide);
+    tokio::time::advance(guide_check::DEBOUNCE / 2).await;
+    settle().await;
+    assert_eq!(checks(), 0, "waiting out the debounce isn't a job");
+    after_guide(h.jobs.context(), crate::follow::FollowReason::Guide);
+    tokio::time::advance(guide_check::DEBOUNCE / 2 + Duration::from_secs(1)).await;
+    settle().await;
+    assert_eq!(checks(), 0, "a later request pushed the deadline back");
+    tokio::time::advance(guide_check::DEBOUNCE / 2).await;
+    settle().await;
+    assert_eq!(checks(), 1, "one check for both requests; none for the headless one");
+}

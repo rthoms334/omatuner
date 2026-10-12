@@ -915,7 +915,7 @@ impl HomeScreen {
                 items.push(mi(glyphs::PLAY, "Play", Action::Activate, "Enter"));
                 items.push(mi(glyphs::GUIDE, "Show in TV guide", Action::OpenInGuide, "Ctrl+G"));
                 items.push(mi(glyphs::INFO, "Edit information…", Action::ShowDetails, "Ctrl+I"));
-                items.push(mi(glyphs::GUIDE, "Assign EPG channel…", Action::AssignEpg, "Ctrl+E"));
+                items.push(mi(glyphs::GUIDE, "Assign guide channel…", Action::AssignEpg, "Ctrl+E"));
             }
             Tile::Vod(_) | Tile::Continue(_) => {
                 items.push(mi(glyphs::INFO, "Details", Action::Activate, "Enter"));

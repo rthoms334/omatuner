@@ -1396,18 +1396,23 @@ impl TunerApp {
         }
     }
 
-    /// The status bar's sleep-timer chip ("Sleep 23:10"; a click opens the menu).
+    /// The status bar's sleep-timer chip ("Sleep 23:10"; a click opens the menu, ✕ turns it off).
     fn sleep_chip(&self) -> Option<crate::ui::widgets::status_bar::StatusChip> {
         if !crate::reminders::ENABLED {
             return None;
         }
-        let st = self.services().agent.sleep()?.status()?;
+        let sleep = self.services().agent.sleep()?;
+        let st = sleep.status()?;
+        let text = crate::reminders::ui::sleep_chip(&st, self.services().config().interface.clock_24h);
+        let key = keymap::GLOBAL.iter().find(|b| b.action == Action::SleepTimer).map(|b| b.chord.label()).unwrap_or_default();
         Some(crate::ui::widgets::status_bar::StatusChip {
-            text: crate::reminders::ui::sleep_chip(&st, self.services().config().interface.clock_24h),
-            label: "Sleep timer".into(),
+            label: format!("Sleep timer — {text} ({key})"),
+            text,
             action: Action::SleepTimer,
             warning: self.reminder_ui.sleep_warn.is_some(),
-            close: None,
+            close: Some(crate::ui::widgets::status_bar::ChipClose::new("Turn the sleep timer off", move || {
+                sleep.cancel();
+            })),
         })
     }
 

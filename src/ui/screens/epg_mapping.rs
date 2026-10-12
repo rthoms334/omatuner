@@ -1665,7 +1665,7 @@ impl EpgMappingScreen {
         {
             crate::ui::scope::choose(ctx, ScopeKind::Live, choice, false);
         }
-        if !rep.fresh || ctx.services.jobs.active().iter().any(|j| matches!(j.kind, crate::jobs::JobKind::GuideCheck)) {
+        if !rep.fresh || ctx.services.jobs.context().guide_check.running() {
             ui.label(small("Checking the guide data for new suggestions…".into()));
         }
         if ctx.layout != LayoutClass::Compact {
