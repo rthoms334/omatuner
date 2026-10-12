@@ -1116,21 +1116,43 @@ impl TunerApp {
             self.toast(Toast::info("That channel is no longer in your playlists"));
             return;
         };
-        let now_media = self.snapshot.playable.as_ref().filter(|_| self.snapshot.state != PlayerState::Idle).map(|p| p.media.clone());
-        if now_media == Some(MediaRef::Channel(cid)) {
+        // multi-view: automatic switches go to the silent picture, never the one watched
+        let picture = self.mv.view.on.then(|| crate::reminders::ui::FlashPicture { tile: self.mv.view.silent(), sound_was: self.mv.view.audible });
+        let snap = match picture {
+            Some(p) => self.mv_snap(p.tile).unwrap_or_default(),
+            None => self.snapshot.clone(),
+        };
+        let now_media = snap.playable.as_ref().filter(|_| snap.state != PlayerState::Idle).map(|p| p.media.clone());
+        if picture.is_none() && now_media == Some(MediaRef::Channel(cid)) {
             return;
         }
         let open_in = if open_full { OpenIn::FullWindow } else { open_in };
         let place = crate::reminders::ui::placement(open_in, self.window_now(egui_ctx));
         let flash =
             rule.and_then(|_| crate::store::follow::flash_of(&self.db, id).map_err(|e| tracing::debug!("news flash {id}: {e}")).ok().flatten());
+        // when a flash closes: headlines only after N minutes, else with the programme; played
+        // from the beginning (late, catch-up) it runs that much later
+        let catchup = self.switch_catchup(cid, late);
+        let flash_end = flash.as_ref().map(|f| {
+            let row = crate::store::user::reminder(&self.db, id).ok().flatten();
+            let from = row.as_ref().map_or_else(crate::model::now, crate::reminders::target_at);
+            let stop = row.as_ref().map_or(from + crate::reminders::DEFAULT_DURATION_S, crate::reminders::effective_stop);
+            let shift = catchup.map_or(0, |l| crate::model::now() - l.from);
+            crate::follow::flash::ends_at(&f.spec, from).map_or(stop, |t| t.min(stop)) + shift
+        });
+        if flash_end.is_some_and(|t| t <= crate::model::now()) {
+            tracing::info!("news flash {id}: its headlines were over before it could start");
+            return;
+        }
         let previous = now_media.map(|media| crate::reminders::ui::Previous {
             media,
-            origin: self.snapshot.origin.unwrap_or(PlayOrigin::Fullscreen),
-            paused: self.snapshot.paused,
+            origin: snap.origin.unwrap_or(PlayOrigin::Fullscreen),
+            paused: snap.paused,
         });
         let was_on_player = self.view_screen() == ScreenId::Player;
-        self.play_switch(cid, late);
+        // a silent flash: its picture without the sound (multi-view), or the main one muted
+        let silent = flash.as_ref().is_some_and(|f| f.spec.volume == crate::follow::flash::FlashVolume::Mute);
+        self.play_switch(cid, late, !silent);
         if self.pending_locked.as_ref().is_some_and(|(c, _)| *c == cid) {
             return; // the PIN prompt shows where the window is; nothing moves under it
         }
@@ -1148,12 +1170,8 @@ impl TunerApp {
             }
             Place::InPlace => self.drop_player_push(),
         }
-        let Some(f) = flash else { return };
-        let row = crate::store::user::reminder(&self.db, id).ok().flatten();
-        let from = row.as_ref().map_or_else(crate::model::now, crate::reminders::target_at);
-        let stop = row.as_ref().map_or(from + crate::reminders::DEFAULT_DURATION_S, crate::reminders::effective_stop);
-        let ends_at = crate::follow::flash::ends_at(&f.spec, from).map_or(stop, |t| t.min(stop));
-        let muted = f.spec.volume == crate::follow::flash::FlashVolume::Mute && !self.snapshot.muted;
+        let (Some(f), Some(ends_at)) = (flash, flash_end) else { return };
+        let muted = silent && picture.is_none() && !self.snapshot.muted;
         if muted {
             self.send_player(PlayerCommand::SetMute(true));
         }
@@ -1166,6 +1184,7 @@ impl TunerApp {
             popped: place == Place::PopOut,
             was_on_player,
             muted,
+            picture,
         });
         // it closes by itself even while no frame runs (the window hidden): the event wakes
         // `logic`
@@ -1177,29 +1196,44 @@ impl TunerApp {
         });
     }
 
-    /// Play a switch's channel (the PIN rules apply): live, or — a switch that comes late on a
-    /// channel with catch-up that needs no PIN — from the beginning.
-    fn play_switch(&mut self, cid: ChannelId, late: Option<crate::reminders::Late>) {
+    /// A late switch that plays from the beginning: on a channel with catch-up that needs no
+    /// PIN.
+    fn switch_catchup(&self, cid: ChannelId, late: Option<crate::reminders::Late>) -> Option<crate::reminders::Late> {
         let unlocked = self.parental.is_unlocked(&self.services().config().parental);
         let open = self.lib.live.get(cid).is_some_and(|c| !c.locked || unlocked);
-        match late {
-            Some(l) if l.catchup && open => {
-                self.pending_zap = None;
-                self.send_player(PlayerCommand::Play(PlayRequest {
-                    media: MediaRef::Catchup { channel: cid, start: l.from, stop: l.stop, catchup_id: None },
-                    zap: None,
-                    origin: PlayOrigin::Reminder,
-                    resume: false,
-                    immediate: true,
-                }));
-                self.nav.push(NavRequest::Push(Route::Player));
-                self.toast(Toast::info(format!("Started {} min ago — playing from the beginning", l.by_s / 60)));
-            }
-            Some(l) => {
-                self.play_channel(cid, PlayOrigin::Reminder);
-                self.toast(Toast::info(format!("Started {} min ago", l.by_s / 60)));
-            }
-            None => self.play_channel(cid, PlayOrigin::Reminder),
+        late.filter(|l| l.catchup && open)
+    }
+
+    /// Play a switch's channel (the PIN rules apply): live, or — a switch that comes late on a
+    /// channel with catch-up that needs no PIN — from the beginning. With two pictures it goes
+    /// to the silent one, taking the sound unless `sound` is off (a silent news flash).
+    fn play_switch(&mut self, cid: ChannelId, late: Option<crate::reminders::Late>, sound: bool) {
+        let catchup = self.switch_catchup(cid, late);
+        let media = match catchup {
+            Some(l) => MediaRef::Catchup { channel: cid, start: l.from, stop: l.stop, catchup_id: None },
+            None => MediaRef::Channel(cid),
+        };
+        if self.mv.view.on {
+            let cfg = self.services().config();
+            let zap = match catchup {
+                None => self.lib.live.get(cid).and_then(|c| c.group_ids.first().copied()).and_then(|g| self.zap_list(g, &cfg)),
+                Some(_) => None,
+            };
+            let tile = self.mv.view.silent();
+            let aim = crate::ui::multiview::Aim::Tile(tile);
+            self.mv_place(crate::ui::multiview::PlaceIn { aim, media, zap, origin: PlayOrigin::Reminder, take_sound: sound, rearrange: false });
+            self.nav.push(NavRequest::Push(Route::Player));
+        } else if catchup.is_some() {
+            self.pending_zap = None;
+            self.send_player(PlayerCommand::Play(PlayRequest { media, zap: None, origin: PlayOrigin::Reminder, resume: false, immediate: true }));
+            self.nav.push(NavRequest::Push(Route::Player));
+        } else {
+            self.play_channel(cid, PlayOrigin::Reminder);
+        }
+        match (late, catchup) {
+            (Some(l), Some(_)) => self.toast(Toast::info(format!("Started {} min ago — playing from the beginning", l.by_s / 60))),
+            (Some(l), None) => self.toast(Toast::info(format!("Started {} min ago", l.by_s / 60))),
+            _ => {}
         }
     }
 
@@ -1232,11 +1266,43 @@ impl TunerApp {
         if !restore {
             return;
         }
-        let playing = self.snapshot.playable.as_ref().filter(|_| self.snapshot.state != PlayerState::Idle).map(|p| p.media.clone());
-        match f.restore(playing.as_ref()) {
-            FlashRestore::Nothing => return,
-            FlashRestore::Stop => self.send_player(PlayerCommand::Stop),
-            FlashRestore::Play(p) => match p.media {
+        let snap = match f.picture {
+            Some(p) => self.mv_snap(p.tile).unwrap_or_default(),
+            None => self.snapshot.clone(),
+        };
+        let playing = snap.playable.as_ref().filter(|_| snap.state != PlayerState::Idle).map(|p| p.media.clone());
+        // the bulletin and its copies (multi-view may have played one on a free playlist)
+        let copies: Vec<ChannelId> = self
+            .lib
+            .live
+            .get(f.channel)
+            .and_then(|ch| crate::ui::multiview::copies_with_pick(&self.lib, ch, |ids| crate::store::copies::tvg_ids(&self.db, ids).ok()))
+            .map(|v| v.into_iter().map(|c| c.id).collect())
+            .unwrap_or_default();
+        match (f.restore(playing.as_ref(), &copies), f.picture) {
+            // the user moved on to something else during the flash: leave it as it is
+            (FlashRestore::Nothing, _) if playing.is_some() => return,
+            (FlashRestore::Nothing, _) => {}
+            // its picture closes: the other carries on with the sound
+            (FlashRestore::Stop, Some(p)) if self.mv.view.on => self.apply_mv(crate::ui::multiview::MvRequest::Close(Some(p.tile))),
+            (FlashRestore::Stop, Some(p)) => self.send_to(p.tile, PlayerCommand::Stop),
+            (FlashRestore::Stop, None) => self.send_player(PlayerCommand::Stop),
+            // what that picture showed comes back, silent; the sound goes back where it was
+            (FlashRestore::Play(prev), Some(p)) => {
+                let aim = crate::ui::multiview::Aim::Tile(p.tile);
+                self.mv_place(crate::ui::multiview::PlaceIn {
+                    aim,
+                    media: prev.media,
+                    zap: None,
+                    origin: prev.origin,
+                    take_sound: false,
+                    rearrange: false,
+                });
+                if self.mv.view.on && self.mv.view.audible != p.sound_was {
+                    self.apply_mv(crate::ui::multiview::MvRequest::Sound(Some(p.sound_was)));
+                }
+            }
+            (FlashRestore::Play(p), None) => match p.media {
                 MediaRef::Channel(c) => {
                     self.play_channel(c, p.origin);
                     self.drop_player_push();
@@ -1281,7 +1347,7 @@ impl TunerApp {
                 self.reminder_ui.drop_countdown(*reminder);
             }
             E::SleepWarn { at } => self.reminder_ui.sleep_warn = Some(*at),
-            E::SleepNow { action } => self.on_sleep_now(*action),
+            E::SleepNow { action } => self.on_sleep_now(*action, egui_ctx),
             // set again, moved or turned off: its warning no longer holds
             E::SleepChanged(_) => self.reminder_ui.sleep_warn = None,
             // a flash's own timer (or the engine): only once its time has come
@@ -1295,7 +1361,7 @@ impl TunerApp {
 
     /// The sleep timer fired: the engine stopped (or paused) the pictures it started with; every
     /// picture there is now gets the same (multi-view's second one included).
-    fn on_sleep_now(&mut self, action: crate::reminders::sleep::SleepAction) {
+    fn on_sleep_now(&mut self, action: crate::reminders::sleep::SleepAction, egui_ctx: &egui::Context) {
         use crate::reminders::sleep::SleepAction;
         let cmd = match action {
             SleepAction::Stop => PlayerCommand::Stop,
@@ -1305,10 +1371,12 @@ impl TunerApp {
             h.send(cmd.clone());
         }
         self.reminder_ui.sleep_warn = None;
-        if let Some(f) = self.reminder_ui.flash.take()
-            && f.muted
-        {
-            self.send_player(PlayerCommand::SetMute(false));
+        // a news flash on: it ends without putting anything back (unmuted), the window back in
+        if let Some(popped) = self.reminder_ui.flash.as_ref().map(|f| f.popped) {
+            self.end_flash(false, egui_ctx);
+            if popped && (self.popout.is_out() || self.video_only) {
+                self.toggle_popout(egui_ctx);
+            }
         }
         self.toast(Toast::info(match action {
             SleepAction::Stop => "Sleep timer: playback stopped",
@@ -4934,6 +5002,71 @@ mod tests {
         rig.until("single view", |r| !r.app.mv.view.on);
         let v = rig.app.mv.view;
         assert!(v.focus == PIC_A && v.audible == PIC_A, "{v:?}");
+    }
+
+    /// Two pictures (the user's decision, 2026-10-11): automatic switches go to the silent
+    /// picture and never touch the watched one. A silent news flash plays there (a copy on the
+    /// free playlist) without taking the sound; when it ends, that picture gets back what it
+    /// showed. A late switch played from the beginning on catch-up goes there too.
+    #[test]
+    fn switches_in_multi_view_leave_the_watched_picture_alone() {
+        use crate::reminders::ReminderEvent;
+        let mut rig = two_pictures();
+        let to_a = |r: &Rig| r.log().commands.iter().filter(|c| matches!(c, PlayerCommand::Play(_) | PlayerCommand::SetMute(_))).count();
+        let before = to_a(&rig);
+        let spec = r#"{"flash":{"length":{"t":"headlines","min":5},"volume":"mute"}}"#;
+        rig.writer()
+            .blocking(move |c| {
+                c.execute(
+                    "INSERT INTO follow_rule(id, name, kind, spec, mode, priority, created_at, updated_at) VALUES (1, 'News at One', 'news', ?1, 'flash', 0, 0, 0)",
+                    [spec],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let now = crate::model::now();
+        let charlie = ItemRef { source: SourceId(1), kind: ItemKind::Channel, key: ItemKey("m3u:Charlie".into()) };
+        let mut news = crate::model::Reminder::notify(charlie.clone(), "Charlie".into(), "News at One".into(), now - 5, now + 1800, 0);
+        news.mode = crate::model::ReminderMode::Switch;
+        news.rule_id = Some(crate::model::FollowRuleId(1));
+        let id = rig.writer().blocking(move |c| crate::store::user::add_reminder(c, &news)).unwrap();
+        let to_b = crate::playback::Route::Tile { tile: PIC_B, take_sound: true, interrupts_queue: false };
+        rig.event(AppEvent::Reminder(ReminderEvent::SwitchNow {
+            reminder: id,
+            channel: charlie,
+            open_in: OpenIn::WhereIAm,
+            route: to_b,
+            rule: Some(crate::model::FollowRuleId(1)),
+            late: None,
+        }));
+        assert_eq!(tile_plays(&rig.log(), PIC_B).last(), Some(&MediaRef::Channel(ChannelId(5))), "Charlie's TV 2 copy in picture B");
+        let flash = rig.app.reminder_ui.flash.clone().expect("a flash");
+        assert!(flash.picture.is_some_and(|p| p.tile == PIC_B) && !flash.muted, "{flash:?}");
+        assert_eq!(rig.app.mv.view.audible, PIC_A, "a silent flash leaves the sound where it was");
+        rig.until("picture B plays the news", |r| {
+            r.app.mv_snap(PIC_B).is_some_and(|s| s.playable.as_ref().is_some_and(|p| p.media == MediaRef::Channel(ChannelId(5))))
+        });
+        let ctx = rig.ctx.clone();
+        rig.app.global_action(Action::EndNewsFlash, &[KeyContext::PopOut], &ctx);
+        assert!(rig.app.reminder_ui.flash.is_none());
+        assert_eq!(tile_plays(&rig.log(), PIC_B).last(), Some(&MediaRef::Channel(ChannelId(4))), "Bravo is back in picture B");
+        assert_eq!(rig.app.mv.view.audible, PIC_A);
+
+        // late, with catch-up: from the beginning, in picture B
+        let delta = ItemRef { source: SourceId(2), kind: ItemKind::Channel, key: ItemKey("m3u:Delta".into()) };
+        let late = crate::reminders::Late { by_s: 300, from: now - 300, stop: now + 1500, catchup: true };
+        rig.event(AppEvent::Reminder(ReminderEvent::SwitchNow {
+            reminder: crate::model::ReminderId(77),
+            channel: delta,
+            open_in: OpenIn::WhereIAm,
+            route: to_b,
+            rule: None,
+            late: Some(late),
+        }));
+        let from_start = MediaRef::Catchup { channel: ChannelId(6), start: now - 300, stop: now + 1500, catchup_id: None };
+        assert_eq!(tile_plays(&rig.log(), PIC_B).last(), Some(&from_start));
+        assert!(rig.log().toasts.iter().any(|t| t.text == "Started 5 min ago — playing from the beginning"));
+        assert!(tile_plays(&rig.log(), PIC_A).is_empty() && to_a(&rig) == before, "picture A (the one watched) was never touched");
     }
 
     /// In the player: `MultiView` sits above the base context (`w`, `q`… resolve there), `w`

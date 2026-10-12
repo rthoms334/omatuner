@@ -108,8 +108,9 @@ fn main() -> anyhow::Result<()> {
     // start Tuner for a switch, or do nothing
     if let Some(id) = cli.reminder {
         let store = tuner::store::Store::open(&paths.db_file(), None)?;
-        // TODO(score): a guard built from the store once the spoiler guard ships; identity until then
-        let outcome = tuner::reminders::closed::fire(&store, &config, &tuner::guard::Guard::default(), id, tuner::model::now());
+        let now = tuner::model::now();
+        // the spoiler guard is built (from the store) only when a note goes out
+        let outcome = tuner::reminders::closed::fire(&store, &config, |c| tuner::reminders::closed::store_guard(c, &config, now), id, now);
         store.close(Duration::from_secs(3));
         match outcome? {
             tuner::reminders::closed::ClosedOutcome::Exit => return Ok(()),

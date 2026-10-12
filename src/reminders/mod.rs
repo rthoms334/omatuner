@@ -96,7 +96,7 @@ pub struct FireCtx {
     pub route: RouteState,
     /// The target channel is locked and the session is locked.
     pub target_locked: bool,
-    /// The main picture already plays the target channel.
+    /// A picture (either, with multi-view) already plays the target channel.
     pub target_playing: bool,
     /// A news flash's own reasons not to pop up (quiet hours, another app fullscreen), from
     /// Following's flash check; `None` for every other reminder.
@@ -153,7 +153,7 @@ pub fn fire_policy(r: &Reminder, ctx: &FireCtx) -> FireAs {
     if !r.switches() {
         return FireAs::Notify(NotifyWhy::Reminder);
     }
-    if ctx.target_playing && !ctx.route.tiles.on {
+    if ctx.target_playing {
         return FireAs::Skip(SkipWhy::AlreadyPlaying);
     }
     match ctx.flash_skip {
@@ -171,6 +171,37 @@ pub fn fire_policy(r: &Reminder, ctx: &FireCtx) -> FireAs {
         Route::Downgrade(_) | Route::Shield => FireAs::Notify(NotifyWhy::WouldInterrupt),
         Route::Refuse(why) => FireAs::Notify(NotifyWhy::Refused(why)),
     }
+}
+
+/// A news flash's own reason not to pop up now (`None`: it pops up), from Following's check
+/// (`follow::flash::decide`) at the reminder's target time.
+pub fn flash_skip(
+    f: &crate::store::follow::FlashFire,
+    cfg: &crate::config::NewsFlashConfig,
+    ctx: &crate::follow::flash::FlashCtx,
+    r: &Reminder,
+) -> Option<FlashSkip> {
+    use crate::follow::flash::FlashDecision as D;
+    match crate::follow::flash::decide(&f.spec, cfg, ctx, &r.channel, &f.alternates, target_at(r)) {
+        D::Pop { .. } => None,
+        D::Notify(s) | D::Skip(s) => Some(s),
+    }
+}
+
+/// The local minute of the day at `now` (quiet hours); UTC without a zone database.
+pub fn local_minute_of_day(now: Timestamp) -> u16 {
+    jiff::Timestamp::from_second(now).map_or(0, |t| {
+        let z = t.to_zoned(jiff::tz::TimeZone::system());
+        u16::from(z.hour().unsigned_abs()) * 60 + u16::from(z.minute().unsigned_abs())
+    })
+}
+
+/// Another app's window is fullscreen (Hyprland), asked with a timeout (a wedged `hyprctl`
+/// must not stall the scheduler). Blocking: call it from a worker. Outside Hyprland: false.
+pub fn other_app_fullscreen() -> bool {
+    crate::platform::hypr::is_hyprland()
+        && crate::platform::systemd::call("hyprctl", &["-j", "activewindow"])
+            .is_ok_and(|out| crate::follow::flash::fullscreen_in(out.as_bytes(), std::process::id()))
 }
 
 /// Where scheduled playback opens: the reminder's own choice, else the setting.
@@ -258,7 +289,12 @@ fn clash_of(a: &Reminder, b: &Reminder) -> Option<ClashKind> {
 /// Every clash among `rs` (pending reminders), soonest first. Sweep over start times:
 /// O(n log n + clashes).
 pub fn clashes(rs: &[Reminder]) -> Vec<Clash> {
-    let mut by_start: Vec<&Reminder> = rs.iter().filter(|r| r.state == crate::model::ReminderState::Pending).collect();
+    clashes_in(rs)
+}
+
+/// [`clashes`] over borrowed rows.
+pub fn clashes_in<'a>(rs: impl IntoIterator<Item = &'a Reminder>) -> Vec<Clash> {
+    let mut by_start: Vec<&Reminder> = rs.into_iter().filter(|r| r.state == crate::model::ReminderState::Pending).collect();
     by_start.sort_by_key(|r| (window(r).0, r.id));
     let mut out = Vec::new();
     for (i, a) in by_start.iter().enumerate() {
@@ -332,6 +368,9 @@ mod tests {
         let mut on = ctx(Some(Kind::Live), false);
         on.target_playing = true;
         assert_eq!(fire_policy(&reminder(ReminderMode::Switch, None), &on), FireAs::Skip(SkipWhy::AlreadyPlaying));
+        // with two pictures too: a second copy on the silent picture would take another stream
+        on.route.tiles = TilesState { on: true, ..Default::default() };
+        assert_eq!(fire_policy(&reminder(ReminderMode::Switch, Some(3)), &on), FireAs::Skip(SkipWhy::AlreadyPlaying));
         assert_eq!(fire_policy(&reminder(ReminderMode::Notify, None), &on), FireAs::Notify(NotifyWhy::Reminder), "notes still go out");
         let flash = |skip| FireCtx { flash_skip: Some(skip), ..ctx(None, false) };
         let r = reminder(ReminderMode::Switch, Some(9));

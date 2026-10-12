@@ -39,6 +39,26 @@ thread_local! {
     /// Following rules' names by id, read once per set of ids shown (the page's rows are built
     /// every frame; a rename shows on the next reload of the list).
     static RULE_NAMES: RefCell<(Vec<FollowRuleId>, HashMap<FollowRuleId, String>)> = RefCell::default();
+    /// The shown reminders' clashes, worked out again only when their times change.
+    static CLASHES: RefCell<(u64, Vec<crate::reminders::Clash>)> = RefCell::default();
+}
+
+/// The clashes among `shown` (cached on what decides them: ids, times, modes).
+fn clashes(shown: &[&Reminder]) -> Vec<crate::reminders::Clash> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for r in shown {
+        (r.id, r.start, r.stop, r.offset_s, r.switches(), r.state == crate::model::ReminderState::Pending).hash(&mut h);
+        r.channel.hash(&mut h);
+    }
+    let key = h.finish();
+    CLASHES.with_borrow_mut(|(k, v)| {
+        if *k != key {
+            *v = crate::reminders::clashes_in(shown.iter().copied());
+            *k = key;
+        }
+        v.clone()
+    })
 }
 
 fn rule_names(db: &rusqlite::Connection, ids: Vec<FollowRuleId>) -> HashMap<FollowRuleId, String> {
@@ -90,8 +110,7 @@ pub(super) fn rows(s: &SettingsScreen, ctx: &UiCtx<'_>, v: &mut Vec<Row>) {
     ids.dedup();
     let rules = if ids.is_empty() { HashMap::new() } else { rule_names(ctx.db, ids) };
     // clashes among the shown ones (a hidden explicit channel's reminder is never named)
-    let pending: Vec<Reminder> = shown.iter().map(|r| (*r).clone()).collect();
-    let clashes = crate::reminders::clashes(&pending);
+    let clashes = clashes(&shown);
     let guard = ctx.services.agent.guard();
     let mut out = Vec::with_capacity(v.len() + clashes.len());
     for row in v.drain(..) {
@@ -103,7 +122,7 @@ pub(super) fn rows(s: &SettingsScreen, ctx: &UiCtx<'_>, v: &mut Vec<Row>) {
             out.push(row);
             continue;
         };
-        let Some(r) = pending.iter().find(|r| r.id == id) else {
+        let Some(r) = shown.iter().find(|r| r.id == id) else {
             out.push(row);
             continue;
         };
@@ -116,7 +135,7 @@ pub(super) fn rows(s: &SettingsScreen, ctx: &UiCtx<'_>, v: &mut Vec<Row>) {
         out.push(row);
         for c in clashes.iter().filter(|c| c.a == id || c.b == id) {
             let other = if c.a == id { c.b } else { c.a };
-            let Some(o) = pending.iter().find(|r| r.id == other) else { continue };
+            let Some(o) = shown.iter().find(|r| r.id == other) else { continue };
             let title =
                 if o.programme_title.trim().is_empty() { o.channel_name.clone() } else { guard.outside_title(&o.programme_title, now).into_owned() };
             out.push(Row::Note(format!("{} {}", glyphs::WARNING, crate::reminders::ui::clash_text(o, c.kind, &title, h24)), true));

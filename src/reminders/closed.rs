@@ -3,7 +3,7 @@
 //! instance lock and before it starts the window:
 //!
 //! ```text
-//! match closed::fire(&store, &cfg, &guard, id, now)? {
+//! match closed::fire(&store, &cfg, |c| closed::store_guard(c, &cfg, now), id, now)? {
 //!     Exit           → exit 0
 //!     StartApp{..}   → start Tuner as usual (the scheduler fires it; `popout` = in the pop-out,
 //!                      without taking focus)
@@ -15,8 +15,10 @@
 //! process (the fallback when nothing should start), and its Watch launches `tuner --play
 //! <ref>`. A switch starts Tuner (its countdown and the switch happen there). Parental control
 //! counts the session as locked: explicit channels' reminders wait (silently, still pending) and
-//! a Following switch to a locked channel becomes a "needs your PIN" note. Missed ones are
-//! dismissed silently, like in a running Tuner.
+//! a Following switch to a locked channel becomes a "needs your PIN" note. A news flash keeps
+//! its own rules (quiet hours, another app fullscreen): it does nothing then. Missed ones are
+//! dismissed silently, like in a running Tuner. A note's title passes the spoiler guard, built
+//! from the store only when a note goes out (failing closed).
 
 use crate::config::Config;
 use crate::error::Result;
@@ -48,8 +50,23 @@ pub struct ClosedNote {
 /// re-arms it.
 const EARLY_SLACK_S: i64 = 120;
 
-/// Decide, and record (`Fired` / `Dismissed`), what reminder `id` does now.
-pub fn fire(store: &Store, cfg: &Config, guard: &Guard, id: i64, now: Timestamp) -> Result<ClosedOutcome> {
+/// The spoiler guard as a running Tuner would have it: off when the guard is off, else over a
+/// snapshot built from the store; one that can't be built fails closed.
+pub fn store_guard(conn: &rusqlite::Connection, cfg: &Config, now: Timestamp) -> Guard {
+    if !cfg.spoiler.enabled {
+        return Guard::default();
+    }
+    crate::store::library::load(conn).and_then(|lib| crate::spoiler::snapshot::build(conn, cfg, &lib, now)).map(Guard::with_snapshot).unwrap_or_else(
+        |e| {
+            tracing::debug!("reminder: spoiler guard not built ({e}); guarding everything");
+            Guard::live()
+        },
+    )
+}
+
+/// Decide, and record (`Fired` / `Dismissed`), what reminder `id` does now. `guard` builds the
+/// spoiler guard (only when a note goes out: [`store_guard`]).
+pub fn fire(store: &Store, cfg: &Config, guard: impl FnOnce(&rusqlite::Connection) -> Guard, id: i64, now: Timestamp) -> Result<ClosedOutcome> {
     let id = ReminderId(id);
     let conn = store.reader()?;
     let Some(r) = crate::store::user::reminder(&conn, id)? else { return Ok(ClosedOutcome::Exit) };
@@ -72,12 +89,30 @@ pub fn fire(store: &Store, cfg: &Config, guard: &Guard, id: i64, now: Timestamp)
         if at - now > super::arming::LAUNCH_EARLY_S + Reminder::SWITCH_WARN_S + EARLY_SLACK_S {
             return Ok(ClosedOutcome::Exit);
         }
-        let ctx = super::FireCtx { target_locked: !unlocked && crate::store::user::channel_locked(&conn, &r.channel)?, ..super::FireCtx::idle(now) };
+        // a news flash: quiet hours, another app fullscreen (nothing plays: Tuner is closed)
+        let flash = match r.rule_id {
+            Some(_) => crate::store::follow::flash_of(&conn, id)?,
+            None => None,
+        };
+        let flash_skip = flash.and_then(|f| {
+            let nf = &cfg.follow.news_flash;
+            let ctx = crate::follow::flash::FlashCtx {
+                minute_of_day: super::local_minute_of_day(now),
+                other_fullscreen: nf.skip_when_fullscreen && super::other_app_fullscreen(),
+                ..Default::default()
+            };
+            super::flash_skip(&f, nf, &ctx, &r)
+        });
+        let ctx = super::FireCtx {
+            target_locked: !unlocked && crate::store::user::channel_locked(&conn, &r.channel)?,
+            flash_skip,
+            ..super::FireCtx::idle(now)
+        };
         return Ok(match super::fire_policy(&r, &ctx) {
             super::FireAs::Switch(_) => ClosedOutcome::StartApp { popout: super::open_in(&r, cfg.reminders.open_in) == OpenIn::PopOut },
             super::FireAs::Notify(why) => {
                 set(ReminderState::Fired)?;
-                ClosedOutcome::Notify(note(&r, guard, now, Some(why)))
+                ClosedOutcome::Notify(note(&r, &guard(&conn), now, Some(why)))
             }
             super::FireAs::Skip(_) => {
                 set(ReminderState::Fired)?;
@@ -96,7 +131,7 @@ pub fn fire(store: &Store, cfg: &Config, guard: &Guard, id: i64, now: Timestamp)
         return Ok(ClosedOutcome::Exit);
     }
     set(ReminderState::Fired)?;
-    Ok(ClosedOutcome::Notify(note(&r, guard, now, None)))
+    Ok(ClosedOutcome::Notify(note(&r, &guard(&conn), now, None)))
 }
 
 fn note(r: &Reminder, guard: &Guard, now: Timestamp, why: Option<super::NotifyWhy>) -> ClosedNote {
@@ -109,7 +144,7 @@ fn note(r: &Reminder, guard: &Guard, now: Timestamp, why: Option<super::NotifyWh
 /// started meanwhile must not wait for this process.
 pub fn notify_and_wait(note: &ClosedNote) {
     if crate::platform::notify::show_and_wait_watch(&note.summary, &note.body) {
-        let spawned = std::process::Command::new(crate::APP_ID)
+        let spawned = std::process::Command::new(super::arming::exe())
             .args(["--play", &note.play])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())

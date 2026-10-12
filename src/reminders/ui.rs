@@ -98,9 +98,10 @@ impl SheetChoice {
         v
     }
 
-    /// The offset choices: [`OFFSETS_MIN`] and the current one.
-    pub fn offsets(&self) -> Vec<i64> {
-        let mut v = OFFSETS_MIN.to_vec();
+    /// The offset choices: [`OFFSETS_MIN`] that start before a programme of `len_s` seconds
+    /// ends, and the current one.
+    pub fn offsets(&self, len_s: i64) -> Vec<i64> {
+        let mut v: Vec<i64> = OFFSETS_MIN.iter().copied().filter(|m| m * 60 < len_s).collect();
         if !v.contains(&self.offset_min) {
             v.push(self.offset_min);
             v.sort_unstable();
@@ -367,8 +368,18 @@ pub struct FlashRun {
     pub popped: bool,
     /// The Player screen showed before (else Back leaves it after).
     pub was_on_player: bool,
-    /// Muted for it ("silent flash").
+    /// The main picture was muted for it ("silent flash", single view).
     pub muted: bool,
+    /// Multi-view: the picture it plays in (`None`: the main picture, single view).
+    pub picture: Option<FlashPicture>,
+}
+
+/// A news flash in multi-view's silent picture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlashPicture {
+    pub tile: crate::model::TileId,
+    /// The picture that had the sound before (it gets it back).
+    pub sound_was: crate::model::TileId,
 }
 
 /// What to do when a flash ends. Pure.
@@ -383,9 +394,15 @@ pub enum FlashRestore {
 }
 
 impl FlashRun {
-    /// `now_playing`: the main picture's media now.
-    pub fn restore(&self, now_playing: Option<&MediaRef>) -> FlashRestore {
-        if now_playing != Some(&MediaRef::Channel(self.channel)) {
+    /// `now_playing`: its picture's media now; `copies`: the bulletin's channel and its copies
+    /// (multi-view may have picked one on a free playlist).
+    pub fn restore(&self, now_playing: Option<&MediaRef>, copies: &[ChannelId]) -> FlashRestore {
+        let still_on = match now_playing {
+            // live, or from the beginning on catch-up (a late flash)
+            Some(MediaRef::Channel(c) | MediaRef::Catchup { channel: c, .. }) => *c == self.channel || copies.contains(c),
+            _ => false,
+        };
+        if !still_on {
             return FlashRestore::Nothing;
         }
         match &self.previous {
@@ -606,11 +623,16 @@ mod tests {
             popped: true,
             was_on_player: false,
             muted: false,
+            picture: None,
         };
-        assert_eq!(f.restore(Some(&MediaRef::Channel(ChannelId(9)))), FlashRestore::Play(prev));
-        assert_eq!(f.restore(Some(&MediaRef::Channel(ChannelId(5)))), FlashRestore::Nothing);
-        assert_eq!(f.restore(None), FlashRestore::Nothing);
+        assert_eq!(f.restore(Some(&MediaRef::Channel(ChannelId(9))), &[]), FlashRestore::Play(prev.clone()));
+        assert_eq!(f.restore(Some(&MediaRef::Channel(ChannelId(5))), &[]), FlashRestore::Nothing);
+        assert_eq!(f.restore(None, &[]), FlashRestore::Nothing);
+        // a late flash from the beginning on catch-up; the bulletin's copy on another playlist
+        let catchup = MediaRef::Catchup { channel: ChannelId(9), start: 0, stop: 100, catchup_id: None };
+        assert_eq!(f.restore(Some(&catchup), &[]), FlashRestore::Play(prev.clone()));
+        assert_eq!(f.restore(Some(&MediaRef::Channel(ChannelId(19))), &[ChannelId(9), ChannelId(19)]), FlashRestore::Play(prev));
         let none = FlashRun { previous: None, ..f };
-        assert_eq!(none.restore(Some(&MediaRef::Channel(ChannelId(9)))), FlashRestore::Stop);
+        assert_eq!(none.restore(Some(&MediaRef::Channel(ChannelId(9))), &[]), FlashRestore::Stop);
     }
 }

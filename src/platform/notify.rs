@@ -37,7 +37,7 @@
 //! `reminders::arming`): the scheduler keeps them in step with the pending reminders on every
 //! reload when "Fire while Tuner is closed" is on.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -362,18 +362,51 @@ impl ReminderBackend for StoreBackend {
         let lib = shared.library();
         let channel = lib.live.by_ref(&r.channel);
         let main_kind = main.as_deref().and_then(kind_of);
-        let target_playing = main_kind.is_some()
-            && channel.is_some_and(|c| main.as_ref().and_then(|p| p.playable.as_ref()).is_some_and(|p| p.media == MediaRef::Channel(c)));
+        // the live channels on either picture (multi-view's silent one too: playing it twice
+        // would take a second connection)
+        let on_screen: Vec<crate::model::ChannelId> = [crate::model::TileId::A, crate::model::TileId::B]
+            .into_iter()
+            .filter_map(|t| shared.tile_player(t).map(|rx| rx.borrow().clone()))
+            .filter(|p| kind_of(p).is_some())
+            .filter_map(|p| match p.playable.as_ref().map(|pl| &pl.media) {
+                Some(MediaRef::Channel(c)) => Some(*c),
+                _ => None,
+            })
+            .collect();
+        let target_playing = channel.is_some_and(|c| on_screen.contains(&c));
         let queue = shared.queue();
         let queue_running = queue.current.is_some() && !queue.interrupted && main.as_ref().is_some_and(|p| p.origin == Some(PlayOrigin::Queue));
         let unlocked = shared.parental(&cfg.parental).unlocked;
         // a channel that can't be read counts as locked
         let target_locked = !unlocked && self.with_reader(|c| crate::store::user::channel_locked(c, &r.channel)).unwrap_or(true);
+        let tiles = shared.tiles();
+        // a news flash's own checks (quiet hours, another app fullscreen, a copy already on)
+        let flash = r.rule_id.and_then(|_| {
+            self.with_reader(|c| crate::store::follow::flash_of(c, r.id)).unwrap_or_else(|e| {
+                tracing::debug!("news flash {}: {e}", r.id);
+                None
+            })
+        });
+        let flash_skip = flash.and_then(|f| {
+            let playing = on_screen
+                .iter()
+                .filter_map(|c| lib.live.get(*c))
+                .map(|c| crate::model::ItemRef { source: c.source_id, kind: crate::model::ItemKind::Channel, key: c.key.clone() })
+                .collect();
+            let ctx = crate::follow::flash::FlashCtx {
+                minute_of_day: crate::reminders::local_minute_of_day(now),
+                other_fullscreen: cfg.follow.news_flash.skip_when_fullscreen && crate::reminders::other_app_fullscreen(),
+                main_kind,
+                multiview: tiles.on,
+                playing,
+            };
+            crate::reminders::flash_skip(&f, &cfg.follow.news_flash, &ctx, r)
+        });
         let ctx = FireCtx {
-            route: crate::playback::RouteState { tiles: shared.tiles(), main_kind, queue_running, follow_interrupt_vod: cfg.follow.interrupt_vod },
+            route: crate::playback::RouteState { tiles, main_kind, queue_running, follow_interrupt_vod: cfg.follow.interrupt_vod },
             target_locked,
             target_playing,
-            flash_skip: None,
+            flash_skip,
             guard: shared.guard(),
             now,
         };
@@ -443,8 +476,9 @@ enum Decision {
     Dismiss(ReminderId),
     Fire(Reminder),
     /// An automatic switch is `SWITCH_WARN_S` away: the app's Cancel toast (the row stays
-    /// pending).
-    Warn(Reminder),
+    /// pending). With the time it switches at: its target, or — late (Tuner closed or asleep at
+    /// its countdown) — `SWITCH_WARN_S` from now, so even a late switch can be cancelled.
+    Warn(Reminder, Timestamp),
     /// An automatic switch's time: switch; the row becomes `Fired`.
     Switch(Reminder),
 }
@@ -463,23 +497,30 @@ impl Plan {
 }
 
 /// Pure scheduling step: what to do at `now` and when to look again. `warned`: switches whose
-/// Cancel toast already went out.
-fn plan(pending: &[Reminder], now: Timestamp, settings: Settings, handled: &HashSet<ReminderId>, warned: &HashSet<ReminderId>) -> Plan {
+/// countdown went out (or was decided), with the time they switch at.
+fn plan(pending: &[Reminder], now: Timestamp, settings: Settings, handled: &HashSet<ReminderId>, warned: &HashMap<ReminderId, Timestamp>) -> Plan {
     use crate::reminders::{effective_stop, notify_at, switch_at};
     let mut p = Plan::default();
     for r in pending.iter().filter(|r| r.state == ReminderState::Pending && !handled.contains(&r.id)) {
         if r.switches() {
             let at = switch_at(r);
             let warn_at = at - Reminder::SWITCH_WARN_S;
-            if effective_stop(r) <= now || now > at + LATE_SWITCH_S {
+            let due = warned.get(&r.id).copied();
+            if effective_stop(r) <= now || (due.is_none() && now > at + LATE_SWITCH_S) {
                 p.now.push(Decision::Dismiss(r.id));
-            } else if now >= at {
-                p.now.push(Decision::Switch(r.clone()));
-            } else if now >= warn_at && !warned.contains(&r.id) {
-                p.now.push(Decision::Warn(r.clone()));
-                p.wake_at(at);
+            } else if let Some(due) = due {
+                if now >= due {
+                    p.now.push(Decision::Switch(r.clone()));
+                } else {
+                    p.wake_at(due);
+                }
+            } else if now >= warn_at {
+                // the countdown always runs its full time: a late switch is never sprung
+                let due = at.max(now + Reminder::SWITCH_WARN_S);
+                p.now.push(Decision::Warn(r.clone(), due));
+                p.wake_at(due);
             } else {
-                p.wake_at(if now >= warn_at { at } else { warn_at });
+                p.wake_at(warn_at);
             }
             continue;
         }
@@ -511,8 +552,9 @@ struct Engine {
     bus: EventBus,
     /// Fired/dismissed here but maybe not yet written: never act on them twice.
     handled: HashSet<ReminderId>,
-    /// Switches whose Cancel toast went out.
-    warned: HashSet<ReminderId>,
+    /// Switches whose countdown went out (or was decided at its time), with the time they
+    /// switch at.
+    warned: HashMap<ReminderId, Timestamp>,
 }
 
 impl Engine {
@@ -572,12 +614,13 @@ impl Engine {
                 let guard = self.facts(&r, now).await.ctx.guard;
                 self.show_note(&r, now, &guard, None).await;
             }
-            Decision::Warn(r) => {
+            Decision::Warn(r, at) => {
+                // decided again at the switch either way (the user may zap away from the channel,
+                // or start a film, during the countdown): only the countdown depends on this
+                self.warned.insert(r.id, at);
                 let facts = self.facts(&r, now).await;
                 match crate::reminders::fire_policy(&r, &facts.ctx) {
                     FireAs::Switch(route) => {
-                        self.warned.insert(r.id);
-                        let at = crate::reminders::switch_at(&r);
                         tracing::info!("reminder {}: switching in {} s", r.id, (at - now).max(0));
                         let event = if s.rich {
                             let title = r.programme_title.trim();
@@ -595,7 +638,7 @@ impl Engine {
                         };
                         self.bus.send(event);
                     }
-                    how => self.not_switched(&r, now, s, &facts.ctx.guard, how).await,
+                    how => tracing::info!("reminder {}: no countdown ({how:?}); decided at its time", r.id),
                 }
             }
             Decision::Switch(r) => {
@@ -665,7 +708,7 @@ async fn run(
     arm: Option<Arc<Mutex<ArmSync>>>,
     mut wake: tokio::sync::mpsc::UnboundedReceiver<()>,
 ) {
-    let mut engine = Engine { backend, notifier, bus, handled: HashSet::new(), warned: HashSet::new() };
+    let mut engine = Engine { backend, notifier, bus, handled: HashSet::new(), warned: HashMap::new() };
     // Last load error, so a persistent one is logged once rather than every minute.
     let mut last_error: Option<String> = None;
     let mut last_units = None;
@@ -695,7 +738,7 @@ async fn run(
             sync_units(arm, &pending, settings, &mut last_units).await;
         }
         engine.handled.retain(|id| pending.iter().any(|r| r.id == *id));
-        engine.warned.retain(|id| pending.iter().any(|r| r.id == *id));
+        engine.warned.retain(|id, _| pending.iter().any(|r| r.id == *id));
         let now = crate::model::now();
         let p = plan(&pending, now, settings, &engine.handled, &engine.warned);
         for d in p.now {
@@ -758,7 +801,7 @@ mod tests {
             reminder(5, now + 300, now + 900, 0),     // no own lead → default 240 → in 60 s
             reminder(6, now - 7200, now - 7200, 120), // no stop: assumed 1 h → ended
         ];
-        let p = plan(&pending, now, Settings { lead_default_s: 240, ..ON }, &HashSet::new(), &HashSet::new());
+        let p = plan(&pending, now, Settings { lead_default_s: 240, ..ON }, &HashSet::new(), &HashMap::new());
         assert_eq!(
             p.now,
             vec![
@@ -778,34 +821,48 @@ mod tests {
         fired.state = ReminderState::Fired;
         let pending = vec![reminder(1, now, now + 60, 0), fired];
         let handled: HashSet<_> = [ReminderId(1)].into();
-        assert_eq!(plan(&pending, now, ON, &handled, &HashSet::new()), Plan::default());
+        assert_eq!(plan(&pending, now, ON, &handled, &HashMap::new()), Plan::default());
     }
 
     /// DESIGN §30.8: a switch warns `SWITCH_WARN_S` before its start (once), switches at the
-    /// start, still switches up to `LATE_SWITCH_S` late and is dismissed after; it runs with
-    /// notification reminders off, which only skips the notification rows.
+    /// start, still switches up to `LATE_SWITCH_S` late — after a full countdown of its own, so
+    /// it can be cancelled too — and is dismissed after; it runs with notification reminders
+    /// off, which only skips the notification rows.
     #[test]
     fn plan_warns_then_switches_whatever_notifications_say() {
         let now = 1_000_000;
         let sw = |id, start| reminder(id, start, start + 1800, Reminder::SWITCH_LEAD);
         let pending = vec![
             sw(1, now + 60),                       // warns at now + 50
-            sw(2, now + 5),                        // warns now, switches at now + 5
-            sw(3, now - 300),                      // 5 min late: switches
+            sw(2, now + 5),                        // warns late (5 s left): a full countdown
+            sw(3, now - 300),                      // 5 min late: a countdown from now
             sw(4, now - LATE_SWITCH_S - 1),        // too late: dismissed
             reminder(5, now + 60, now + 900, 120), // a notification due now
         ];
         let off = OFF;
-        let p = plan(&pending, now, off, &HashSet::new(), &HashSet::new());
-        assert_eq!(p.now, vec![Decision::Warn(pending[1].clone()), Decision::Switch(pending[2].clone()), Decision::Dismiss(ReminderId(4))]);
-        assert_eq!(p.next_at, Some(now + 5));
-        // warned already: wait for the start, no second toast
-        let warned: HashSet<_> = [ReminderId(2)].into();
-        let p = plan(&pending[1..2], now, off, &HashSet::new(), &warned);
-        assert_eq!((p.now, p.next_at), (vec![], Some(now + 5)));
-        assert_eq!(plan(&pending[..1], now, off, &HashSet::new(), &HashSet::new()).next_at, Some(now + 50));
+        let late_at = now + Reminder::SWITCH_WARN_S;
+        let p = plan(&pending, now, off, &HashSet::new(), &HashMap::new());
+        assert_eq!(
+            p.now,
+            vec![Decision::Warn(pending[1].clone(), late_at), Decision::Warn(pending[2].clone(), late_at), Decision::Dismiss(ReminderId(4))]
+        );
+        assert_eq!(p.next_at, Some(late_at));
+        // on time: the countdown ends at the start
+        assert_eq!(plan(&pending[..1], now + 50, off, &HashSet::new(), &HashMap::new()).now, vec![Decision::Warn(pending[0].clone(), now + 60)]);
+        // warned already: wait for its time, no second toast; then switch (the late one too)
+        let warned: HashMap<_, _> = [(ReminderId(2), late_at), (ReminderId(3), late_at)].into();
+        let p = plan(&pending[1..3], now, off, &HashSet::new(), &warned);
+        assert_eq!((p.now, p.next_at), (vec![], Some(late_at)));
+        let p = plan(&pending[1..3], late_at, off, &HashSet::new(), &warned);
+        assert_eq!(p.now, vec![Decision::Switch(pending[1].clone()), Decision::Switch(pending[2].clone())]);
+        // a countdown that started just inside the late limit still switches after it
+        let edge = sw(6, now - LATE_SWITCH_S + 5);
+        let warned: HashMap<_, _> = [(ReminderId(6), now + Reminder::SWITCH_WARN_S)].into();
+        let p = plan(std::slice::from_ref(&edge), now + Reminder::SWITCH_WARN_S, off, &HashSet::new(), &warned);
+        assert_eq!(p.now, vec![Decision::Switch(edge)]);
+        assert_eq!(plan(&pending[..1], now, off, &HashSet::new(), &HashMap::new()).next_at, Some(now + 50));
         // notifications on: the notification row fires as before
-        let p = plan(&pending[4..], now, ON, &HashSet::new(), &HashSet::new());
+        let p = plan(&pending[4..], now, ON, &HashSet::new(), &HashMap::new());
         assert_eq!(p.now, vec![Decision::Fire(pending[4].clone())]);
     }
 
@@ -944,7 +1001,7 @@ mod tests {
         let notifier = Arc::new(FakeNotifier { shown: Mutex::new(Vec::new()), click: false, available: true });
         let (bus, rx) = EventBus::new(None);
         let _sched = ReminderScheduler::spawn(rt.handle(), backend.clone(), notifier.clone(), bus, None);
-        let events = recv_until(&rx, Duration::from_secs(10), |ev| matches!(ev, AppEvent::Platform(PlatformEvent::SwitchNow { .. })));
+        let events = recv_until(&rx, Duration::from_secs(20), |ev| matches!(ev, AppEvent::Platform(PlatformEvent::SwitchNow { .. })));
         let seen: Vec<&str> = events
             .iter()
             .filter_map(|e| match e {
@@ -1096,10 +1153,10 @@ mod tests {
     fn plan_honours_the_start_offset() {
         let now = 1_000_000;
         let note = Reminder { offset_s: 600, ..reminder(1, now + 60, now + 3600, 120) }; // at now + 540
-        let sw = Reminder { offset_s: 300, ..switch(2, now - 300) }; // at now
-        let p = plan(&[note, sw.clone()], now, ON, &HashSet::new(), &HashSet::new());
-        assert_eq!(p.now, vec![Decision::Switch(sw)]);
-        assert_eq!(p.next_at, Some(now + 540));
+        let sw = Reminder { offset_s: 300, ..switch(2, now - 290) }; // at now + 10
+        let p = plan(&[note, sw.clone()], now, ON, &HashSet::new(), &HashMap::new());
+        assert_eq!(p.now, vec![Decision::Warn(sw, now + 10)]);
+        assert_eq!(p.next_at, Some(now + 10));
     }
 
     /// User decision (2026-10-11): a Following switch while a film plays becomes a note with
@@ -1114,7 +1171,7 @@ mod tests {
         let notifier = Arc::new(FakeNotifier { shown: Mutex::new(Vec::new()), click: false, available: true });
         let (bus, rx) = EventBus::new(None);
         let _sched = ReminderScheduler::spawn(rt.handle(), backend.clone(), notifier.clone(), bus, None);
-        let events = recv_until(&rx, Duration::from_secs(10), |e| matches!(e, AppEvent::Reminder(ReminderEvent::NotSwitched { .. })));
+        let events = recv_until(&rx, Duration::from_secs(20), |e| matches!(e, AppEvent::Reminder(ReminderEvent::NotSwitched { .. })));
         let seen = reminder_events(&events);
         assert_eq!(
             seen,
@@ -1140,7 +1197,8 @@ mod tests {
         let (bus, rx) = EventBus::new(None);
         let _sched = ReminderScheduler::spawn(rt.handle(), backend.clone(), notifier.clone(), bus, None);
         let mut now_count = 0;
-        let events = recv_until(&rx, Duration::from_secs(10), |e| {
+        // the late one counts down from now too: it switches `SWITCH_WARN_S` later
+        let events = recv_until(&rx, Duration::from_secs(20), |e| {
             now_count += usize::from(matches!(e, AppEvent::Reminder(ReminderEvent::SwitchNow { .. })));
             now_count == 2
         });
@@ -1148,6 +1206,7 @@ mod tests {
         let seen = reminder_events(&events);
         let soon = seen.iter().find(|e| matches!(e, ReminderEvent::SwitchSoon { reminder: ReminderId(5), .. })).expect("countdown");
         assert!(matches!(soon, ReminderEvent::SwitchSoon { open_in: OpenIn::PopOut, route, title, .. } if *route == main && title == "Programme 5"));
+        assert!(seen.iter().any(|e| matches!(e, ReminderEvent::SwitchSoon { reminder: ReminderId(6), .. })), "a late switch can be cancelled too");
         let switched: Vec<_> = seen
             .iter()
             .filter_map(|e| {
@@ -1223,17 +1282,103 @@ mod tests {
         let shared = Arc::new(AppShared::default());
         shared.publish_tiles(crate::playback::TilesState { on: true, ..Default::default() });
         let backend = StoreBackend {
-            store,
+            store: store.clone(),
             reader: Mutex::new(None),
             explicit: Default::default(),
-            live: Some(Live { shared: shared.clone(), config }),
+            live: Some(Live { shared: shared.clone(), config: config.clone() }),
             fixed: ON,
         };
         let facts = backend.fire_facts(&reminder(7, 100, 200, 0), 100);
         assert!(facts.ctx.target_locked && facts.ctx.route.follow_interrupt_vod && facts.ctx.route.tiles.on);
+        assert_eq!(facts.ctx.flash_skip, None, "not a news flash");
         assert!(!backend.fire_facts(&reminder(8, 100, 200, 0), 100).ctx.target_locked, "not locked");
         shared.set_unlocked_at(Some(std::time::Instant::now()));
         assert!(!backend.fire_facts(&reminder(7, 100, 200, 0), 100).ctx.target_locked, "unlocked session");
+
+        // a news flash (its copy on the other playlist) and what plays on the two pictures
+        let news = |key: &str| ItemRef { source: SourceId(1), kind: ItemKind::Channel, key: ItemKey(key.into()) };
+        let alternates = serde_json::to_string(&[news("m3u:news2")]).unwrap();
+        store
+            .writer()
+            .blocking(move |c| {
+                for (id, key) in [(10, "m3u:news"), (11, "m3u:news2")] {
+                    c.execute(
+                        "INSERT INTO channel(id, source_id, key, name, clean_name, norm_name, stream, provider_order, seen_gen)
+                         VALUES (?1, 1, ?2, 'News', 'News', 'news', '{\"t\":\"url\",\"url\":\"http://127.0.0.1/1.ts\"}', 0, 1)",
+                        rusqlite::params![id, key],
+                    )?;
+                    c.execute(
+                        "INSERT INTO grp(id, source_id, kind, key, name, provider_order, item_count, seen_gen) VALUES (?1, 1, 'channel', ?2, 'G', 0, 1, 1)",
+                        rusqlite::params![id, format!("channel:{key}")],
+                    )?;
+                    c.execute("INSERT INTO channel_group(group_id, channel_id, position, is_primary) VALUES (?1, ?1, 0, 1)", [id])?;
+                }
+                c.execute(
+                    "INSERT INTO follow_rule(id, name, kind, spec, mode, priority, created_at, updated_at) VALUES (5, 'News at One', 'news', '{}', 'flash', 0, 0, 0)",
+                    [],
+                )?;
+                c.execute(
+                    "INSERT INTO reminder(id, source_id, channel_key, channel_name, title, start, stop, lead_s, state, mode, rule_id)
+                     VALUES (20, 1, 'm3u:news', 'News', 'News at One', 100, 200, ?1, 'pending', 'switch', 5)",
+                    [Reminder::SWITCH_LEAD],
+                )?;
+                c.execute(
+                    "INSERT INTO follow_match(rule_id, event_key, start, stop, title, source_id, channel_key, alternates, state, reminder_id, seen_at)
+                     VALUES (5, 'news', 100, 200, 'News at One', 1, 'm3u:news', ?1, 'scheduled', 20, 0)",
+                    [alternates],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let _ = shared.publish_library(&Arc::new(crate::store::library::load(&store.reader().unwrap()).unwrap()));
+        let flash = Reminder { id: ReminderId(20), rule_id: Some(crate::model::FollowRuleId(5)), ..switch(9, 100) };
+        let flash = Reminder { channel: news("m3u:news"), ..flash };
+        let set_cfg = |f: &dyn Fn(&mut crate::config::Config)| {
+            let mut c = (*crate::config::current(&config)).clone();
+            f(&mut c);
+            *config.write().unwrap() = Arc::new(c);
+        };
+        set_cfg(&|c| {
+            c.follow.news_flash.quiet_from_min = Some(0);
+            c.follow.news_flash.quiet_to_min = Some(24 * 60);
+            c.follow.news_flash.skip_when_fullscreen = false;
+        });
+        let facts = backend.fire_facts(&flash, 100);
+        assert_eq!(facts.ctx.flash_skip, Some(crate::follow::flash::FlashSkip::QuietHours));
+        assert!(matches!(crate::reminders::fire_policy(&flash, &facts.ctx), FireAs::Skip(crate::reminders::SkipWhy::Quiet(_))));
+        set_cfg(&|c| c.follow.news_flash.quiet_from_min = None);
+        assert_eq!(backend.fire_facts(&flash, 100).ctx.flash_skip, None, "pops up");
+        // picture B plays the bulletin's copy, then the bulletin itself
+        let on_b = |id: i64| {
+            let playable = crate::model::Playable {
+                media: MediaRef::Channel(crate::model::ChannelId(id)),
+                kind: crate::model::PlayableKind::Live,
+                item: None,
+                source_id: Some(SourceId(1)),
+                title: "News".into(),
+                subtitle: None,
+                logo: None,
+                number: None,
+                url: crate::redact::Secret::new("http://127.0.0.1/1.ts".into()),
+                headers: Default::default(),
+                start_at: None,
+                duration_hint: None,
+            };
+            let snap = crate::player::PlayerSnapshot {
+                state: crate::player::PlayerState::Playing,
+                playable: Some(Arc::new(playable)),
+                ..Default::default()
+            };
+            let (_tx, rx) = tokio::sync::watch::channel(Arc::new(snap));
+            shared.set_tile_b(Some(rx));
+        };
+        on_b(11);
+        let facts = backend.fire_facts(&flash, 100);
+        assert_eq!((facts.ctx.flash_skip, facts.ctx.target_playing), (Some(crate::follow::flash::FlashSkip::AlreadyWatching), false));
+        on_b(10);
+        let facts = backend.fire_facts(&flash, 100);
+        assert!(facts.ctx.target_playing, "the silent picture counts");
+        assert_eq!(crate::reminders::fire_policy(&flash, &facts.ctx), FireAs::Skip(crate::reminders::SkipWhy::AlreadyPlaying));
     }
 
     // ---------------------------------------------------------------- D-Bus (fake server)
