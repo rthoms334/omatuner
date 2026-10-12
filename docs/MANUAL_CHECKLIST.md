@@ -465,7 +465,8 @@ These items use the **default** profile: start Tuner from the launcher, not with
     `require("hypr.tuner")` below `require("default.hypr.toggles")`. Reload Hyprland.
   - **Expect:**
     - The config loads without errors.
-    - `hyprctl clients` shows class `tuner`.
+    - `hyprctl clients` shows class `tuner` (`tuner-popout` for a Tuner started straight into
+      the pop-out, see §27).
     - Tuner's video is fully opaque (no wallpaper bleeding through, unlike a terminal).
     - The optional Super+Shift+T binding, when uncommented, launches or focuses Tuner.
 - [ ] **Playback on another workspace (60 s), with the Hyprland snippet:**
@@ -1385,14 +1386,33 @@ Both test accounts allow one stream each (TV and TV 2).
 
 ## 27. Reminders, scheduled playback and the sleep timer
 
-- [ ] **Pop-out auto-launch without focus steal (Tuner closed):** set a switch for a programme
-  starting in 3 minutes (Open in: Pop-out), quit Tuner, keep typing in a terminal. **Expect:**
-  Tuner starts about 40 s before, the pop-out appears pinned on the current workspace, the
-  countdown strip shows, and **the terminal keeps the keyboard** the whole time. Known gap: on
-  Omarchy 4 the first window may still take focus — note what happens.
-- [ ] **Pop-out with Tuner open on another workspace:** same, Tuner running. **Expect:** the
-  pop-out appears on the current workspace without taking focus.
-- [ ] **`tuner --play <ref> --popout`:** **Expect:** plays in the pop-out without focus.
+- [ ] **Pop-out auto-launch without focus steal (Tuner closed), with the Hyprland snippet:**
+  - **Do:** install the current `packaging/hypr/tuner.lua` (§ *Applying the Hyprland snippet*)
+    and reload Hyprland. Set a switch for a programme starting in 3 minutes (Open in: Pop-out),
+    quit Tuner, and keep typing in a terminal; keep the mouse still. When it has appeared, run
+    `hyprctl clients -j | jq '.[] | select(.class | startswith("tuner")) | {class, floating,
+    pinned, tags}'`. Then click the pop-out and press Esc.
+  - **Expect:**
+    - Tuner starts about 40 s before as a small window that is pinned on the current workspace
+      from its first frame (never a big centred or tiled window first), then moves to the
+      pop-out corner showing the countdown strip; it plays there when the programme starts.
+    - **The terminal keeps the keyboard** the whole time: no keystroke goes to Tuner, the
+      terminal's border stays the active one.
+    - `hyprctl` lists class `tuner-popout`, floating, pinned, tag `pop`.
+    - The video is fully opaque, like a normal Tuner window.
+    - Esc tiles the window on the current workspace like any pop-in (not left floating or
+      pinned); `o` pops it out again at the corner.
+  - **Without the snippet** (comment out the `tuner-popout` rule, reload, repeat): Tuner may map
+    tiled and take the keyboard, then pops out; nothing else breaks. Restore the rule afterwards.
+- [ ] **Pop-out with Tuner open on another workspace:** same, Tuner running and tiled on another
+  workspace, the mouse resting where the pop-out will land. **Expect:** the pop-out appears on
+  the current workspace without taking focus; `hyprctl clients` still shows class `tuner`.
+- [ ] **`tuner --play <ref> --popout`:** run it from a terminal, with Tuner closed and again with
+  it running. **Expect:** plays in the pop-out without focus both times (the terminal keeps
+  typing); the first run's window is class `tuner-popout`.
+- [ ] **Open Tuner while it runs as `tuner-popout`:** with the auto-launched pop-out on screen,
+  use the Omarchy menu's *Open Tuner* (and the Super+Shift+T binding if enabled). **Expect:**
+  the pop-out gets the focus (it is found by its class), no second Tuner starts.
 - [ ] **Esc cancels:** while "Switching to … in 8 s" shows over the player, press Esc.
   **Expect:** "Switch cancelled", the player stays.
 - [ ] **Late switch:** suspend the laptop across a switch's start, resume 5 min later.

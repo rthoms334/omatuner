@@ -34,7 +34,8 @@ stale guides, configurable skip, subtitle delay, stream info, profiles-friendly 
 text is typed), square corners, JetBrains Mono Nerd Font, colours taken live from the current
 Omarchy theme, foreground-alpha state tints that work in light themes.
 
-* Binary / Wayland `app_id` / Hyprland class / MPRIS suffix / `.desktop`: **`tuner`**.
+* Binary / Wayland `app_id` / Hyprland class / MPRIS suffix / `.desktop`: **`tuner`** (a
+  launch straight into the pop-out maps as `tuner-popout`, §21.6).
 * Stack: Rust 2024 · eframe/egui 0.36.2 (**glow** renderer; glow 0.17 via `eframe::glow` only) ·
   libmpv 0.41 through the render API into an FBO texture (spike-proven) · SQLite (rusqlite,
   bundled, WAL) · tokio · reqwest (rustls).
@@ -2974,7 +2975,8 @@ Reminders fire only while Tuner runs (v1).
 ### 21.4 Single instance & CLI
 `$XDG_RUNTIME_DIR/tuner/tuner.sock`; a second `tuner [--view guide] [--play …] [file/url]`
 hands its request over and exits 0 (stale socket removed). Works with `omarchy-launch-or-focus
-'^tuner$'` (anchored: the pattern also matches window titles) and the omarchy-menu entries. Request handling (`TunerApp::handle_ipc`, also for the
+'^tuner(-popout)?$'` (anchored: the pattern also matches window titles; `-popout`: a window
+started straight into the pop-out, §21.6) and the omarchy-menu entries. Request handling (`TunerApp::handle_ipc`, also for the
 first instance's own CLI): `--view` switches route; `--play X` and positional URLs / media files
 play immediately (`MediaRef::Url`, fullscreen player); positional `.m3u`/`.m3u8` files open the
 onboarding card at Details (`Route::Onboarding(PlaylistFile)`).
@@ -3006,7 +3008,8 @@ for any window. Tuner does it for itself with `o` in the player or Ctrl+Shift+O 
   `resizewindowpixel exact W H,address:…`, `movewindowpixel exact X Y,address:…`,
   `alterzorder top,…`, `tagwindow ±pop …`), exactly like `omarchy-hyprland-window-pop`. The
   syntax that worked first is kept for the session.
-* **Pop-out**: (unless already) float → size → move → (unless already) pin → raise → tag `pop`
+* **Pop-out**: (unless already) float → size → move → (unless already) pin → (only if it was
+  already floating) raise → tag `pop`
   (Omarchy rounds `tag:pop` windows). Size: Settings ▸ Player ▸ Pop-out size, Small 480 × 270
   (default) or Medium 640 × 360; place: the chosen corner (default bottom-right) of the
   window's monitor, inside its reserved area (bar), 10 px margin (Omarchy's `gaps_out`, so it
@@ -3015,7 +3018,28 @@ for any window. Tuner does it for itself with `o` in the player or Ctrl+Shift+O 
   (`hl.dsp.window.fullscreen({ window, mode = "maximized", action = "unset" })`; classic
   syntax has no per-window form, so there the toast asks to un-maximize). The app leaves
   window fullscreen first, before a pop-out or a pop-in (a fullscreen window can be neither
-  pinned nor unpinned); the worker retries for 1 s until Hyprland sees it.
+  pinned nor unpinned); the worker retries for 1 s until Hyprland sees it (and, popping out,
+  for up to 3 s until a just-created window is mapped).
+* **Focus**: no pop-out step takes the keyboard (checked against Hyprland 0.56's
+  `Actions::floatWindow` / `pinWindow` / `resize` / `move` / `tag`), and an IPC `--play …
+  --popout` or `--reminder` never calls `focus_self`. `alter_zorder` is the exception: it
+  simulates a pointer motion after raising, and with `follow_mouse = 1` a pointer that moved
+  in the last 0.5 s over the raised window hands it the keyboard. So the raise is only sent
+  for a window that was floating already: floating a window raises it anyway (0.56
+  `floatWindow`; `changeWindowFloatingMode` in older releases).
+* **Launch into the pop-out** (Tuner closed: a scheduled switch with Open in: Pop-out starts it
+  — `ClosedOutcome::StartApp { popout }` — or `tuner --play <ref> --popout`): under Hyprland the
+  window is created with the app id **`tuner-popout`** (`tuner::window_app_id`, chosen from the
+  command line before the window exists; winit can't change it later) at the pop-out size. The
+  packaged rule `o.window("^(tuner-popout)$", { float = true, pin = true, no_initial_focus =
+  true })` (Hyprland 0.56 Lua rule names; Omarchy's webcam overlay uses the same three) maps it
+  floating and pinned on the current workspace without the keyboard. The app pops it out on
+  its first frame (also for the reminder launch, so the countdown shows in the pop-out and the
+  switch plays in place): size, place, tag — no float, pin or raise. That first pop-out adopts
+  the rule's floating + pinned state (`Hypr::with_launch_rule`), so popping in tiles the window
+  like any other. The class stays `tuner-popout` for the session; every other `tuner` rule in
+  the snippet matches both classes. Without the rule the window maps tiled and focused, then
+  pops out as before. Outside Hyprland the app id stays `tuner`.
 * **Pop-in** undoes only what pop-out changed: unpin (unless it was pinned), untag (unless it
   was tagged), then back to its floating geometry if it was floating, else tiled — on the
   workspace the user is on now (a pinned window travels). If the user moved or resized the
@@ -3049,7 +3073,9 @@ for any window. Tuner does it for itself with `o` in the player or Ctrl+Shift+O 
   `packaging/icons/tuner.svg` (square-cornered; PKGBUILD installs to hicolor/scalable — PNG
   sizes can be rendered with `rsvg-convert` if a theme needs them), `packaging/hypr/tuner.lua`
   (`-default-opacity` tag + `opacity "1 1"`, **`render_unfocused = true`** so playback keeps
-  rendering on other workspaces (§11.1), optional idle fallback and Super+Shift+T binding),
+  rendering on other workspaces (§11.1), for classes `tuner` and `tuner-popout`; `float`, `pin`,
+  `no_initial_focus` for `tuner-popout` (§21.6); optional idle fallback and Super+Shift+T
+  binding),
   `packaging/omarchy/omarchy-menu.jsonc` (TV submenu), `packaging/PKGBUILD` (x86_64 + aarch64,
   depends mpv/xz/fontconfig/JetBrains Mono Nerd/wayland/mesa; builds the local checkout into
   `packaging/src/target`, installs the snippets under `/usr/share/tuner/`, the docs under
@@ -5585,11 +5611,13 @@ item. Between two Up next items (the card, a PIN wait, a future slot) Up next ha
 It warns `reminders.sleep_warn_s` before, then stops or pauses every picture; a news flash on
 ends with it and the window pops back in. It runs on tokio, so it fires with the window hidden.
 
-### 36.4 Gap
-The scheduled auto-launch (Tuner closed, a switch due) starts Tuner as a normal window that may
-take focus: Omarchy 4's Lua Hyprland config has no exec-with-rules dispatcher we could verify
-headless. To do on the real desktop: re-exec through Hyprland with initial focus suppressed (a
-dedicated app id plus a `no_initial_focus` window rule, the webcam-overlay pattern).
+### 36.4 Focus on the scheduled auto-launch
+Closed in v0.2: the scheduled auto-launch (Tuner closed, a switch due, Open in: Pop-out) starts
+Tuner with the app id `tuner-popout`; the packaged Hyprland rule maps that window floating,
+pinned and with `no_initial_focus` (the webcam-overlay pattern), and it pops out at once
+(§21.6). It needs the snippet installed: without it the window maps tiled and may take focus.
+Verified against Hyprland's source and docs only; the real-desktop check is in
+`docs/MANUAL_CHECKLIST.md` §27.
 
 ## 37. Use Tuner from Claude: the plugin, skills and pass-2 tools
 
