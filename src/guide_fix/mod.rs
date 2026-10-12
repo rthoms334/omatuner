@@ -15,6 +15,8 @@ pub mod catalog;
 pub mod issues;
 pub mod preview;
 
+pub use crate::store::guide_fix::GuideOpts;
+
 use crate::model::SourceId;
 use crate::store::library::Library;
 

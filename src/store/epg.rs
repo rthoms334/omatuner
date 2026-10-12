@@ -36,8 +36,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::model::{
-    ChannelId, EpgChannel, EpgChannelId, EpgMapping, EpgMatchMethod, EpgSourceId, EpisodeNum, ItemKey, ItemKind, ItemRef, NowNext, Programme,
-    ProgrammeFlags, ProgrammeHit, ProgrammeId, ProgrammeSlim, SourceId, Timestamp,
+    ChannelId, EpgChannel, EpgChannelId, EpgMapping, EpgMatchMethod, EpgSourceId, EpisodeNum, FixActor, ItemKey, ItemKind, ItemRef, NowNext,
+    Programme, ProgrammeFlags, ProgrammeHit, ProgrammeId, ProgrammeSlim, SourceId, Timestamp,
 };
 use crate::store::sql::{self, atomic, enum_parse, enum_str, from_json_opt, or_not_found, u32_of};
 
@@ -664,18 +664,42 @@ pub fn channels_for_matching(conn: &Connection, source: SourceId) -> Result<Vec<
 }
 
 /// Replace automatic mappings for (source, epg_source); manual rows are preserved.
+///
+/// Guide fixes (DESIGN §31): the rule rows ('sibling', 'copy') stay until the next
+/// `store::guide_fix::derive_rule_rows` re-derives them (so the flip's resolve keeps the shown
+/// times), except where the matcher now finds the channel itself (its row replaces the rule
+/// row); a rule's time shift on an automatic row stays while the row is unchanged.
 pub fn replace_auto_mappings(conn: &mut Connection, source: SourceId, epg_source: EpgSourceId, maps: &[EpgMapping]) -> Result<()> {
     let tx = conn.transaction()?;
-    tx.execute("DELETE FROM channel_epg_map WHERE source_id = ?1 AND epg_source_id = ?2 AND method != 'manual'", params![source, epg_source])?;
+    let shifted: Vec<(String, String, i32)> = {
+        let mut stmt = tx.prepare_cached(
+            "SELECT channel_key, xmltv_id, shift_min FROM channel_epg_map
+             WHERE source_id = ?1 AND epg_source_id = ?2 AND method NOT IN ('manual', 'sibling', 'copy') AND shift_min IS NOT NULL",
+        )?;
+        stmt.query_map(params![source, epg_source], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?
+    };
+    tx.execute(
+        "DELETE FROM channel_epg_map WHERE source_id = ?1 AND epg_source_id = ?2 AND method NOT IN ('manual', 'sibling', 'copy')",
+        params![source, epg_source],
+    )?;
     {
-        // a manual row for the same (channel, epg source) wins: DO NOTHING
+        // a manual row for the same (channel, epg source) wins; a rule row gives way
         let mut ins = tx.prepare_cached(
             "INSERT INTO channel_epg_map(source_id, channel_key, epg_source_id, xmltv_id, method, confidence)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(source_id, channel_key, epg_source_id) DO NOTHING",
+             ON CONFLICT(source_id, channel_key, epg_source_id) DO UPDATE SET
+               xmltv_id = excluded.xmltv_id, method = excluded.method, confidence = excluded.confidence, shift_min = NULL
+             WHERE channel_epg_map.method IN ('sibling', 'copy')",
         )?;
         for m in maps.iter().filter(|m| m.method != EpgMatchMethod::Manual && m.channel.source == source && m.epg_source_id == epg_source) {
             ins.execute(params![source, m.channel.key.as_str(), epg_source, m.xmltv_id, enum_str(&m.method), f64::from(m.confidence)])?;
+        }
+        let mut keep = tx.prepare_cached(
+            "UPDATE channel_epg_map SET shift_min = ?5
+             WHERE source_id = ?1 AND channel_key = ?2 AND epg_source_id = ?3 AND xmltv_id = ?4 AND method NOT IN ('manual', 'sibling', 'copy')",
+        )?;
+        for (key, xmltv_id, shift) in &shifted {
+            keep.execute(params![source, key, epg_source, xmltv_id, shift])?;
         }
     }
     tx.commit()?;
@@ -687,8 +711,33 @@ pub fn replace_auto_mappings(conn: &mut Connection, source: SourceId, epg_source
 /// like other user data.
 ///
 /// A channel has at most one manual mapping; `channel_epg` is updated for that channel
-/// immediately (no full [`resolve_mappings`] run).
+/// immediately (no full [`resolve_mappings`] run). The guide channel's first display name is
+/// kept with the row (`epg_name`: Guide fixes finds a renamed id again by it), actor "you".
 pub fn set_manual_mapping(conn: &Connection, channel: &ItemRef, epg_source: EpgSourceId, xmltv_id: &str) -> Result<()> {
+    let name = guide_channel_name(conn, epg_source, xmltv_id)?;
+    set_manual_mapping_as(conn, channel, epg_source, xmltv_id, name.as_deref(), FixActor::You)
+}
+
+/// The first display name of a guide channel (any generation still stored).
+pub(crate) fn guide_channel_name(conn: &Connection, epg_source: EpgSourceId, xmltv_id: &str) -> Result<Option<String>> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT dn.name FROM epg_channel ec JOIN epg_display_name dn ON dn.epg_channel_id = ec.id
+             WHERE ec.epg_source_id = ?1 AND ec.xmltv_id = ?2 ORDER BY dn.epg_channel_id, dn.name LIMIT 1",
+        )?
+        .query_row(params![epg_source, xmltv_id], |r| r.get(0))
+        .optional()?)
+}
+
+/// [`set_manual_mapping`] with the guide channel's name and who chose it (Guide fixes).
+pub fn set_manual_mapping_as(
+    conn: &Connection,
+    channel: &ItemRef,
+    epg_source: EpgSourceId,
+    xmltv_id: &str,
+    epg_name: Option<&str>,
+    actor: FixActor,
+) -> Result<()> {
     atomic(conn, |c| {
         let fp = crate::store::user::fingerprint_of(c, channel)?;
         c.execute(
@@ -696,12 +745,14 @@ pub fn set_manual_mapping(conn: &Connection, channel: &ItemRef, epg_source: EpgS
             params![channel.source, channel.key.as_str(), epg_source],
         )?;
         c.execute(
-            "INSERT INTO channel_epg_map(source_id, channel_key, epg_source_id, xmltv_id, method, confidence, fp, orphaned_since)
-             VALUES (?1, ?2, ?3, ?4, 'manual', 1.0, COALESCE(?5, '{}'), NULL)
+            "INSERT INTO channel_epg_map(source_id, channel_key, epg_source_id, xmltv_id, method, confidence, fp, orphaned_since,
+                                         shift_min, epg_name, actor)
+             VALUES (?1, ?2, ?3, ?4, 'manual', 1.0, COALESCE(?5, '{}'), NULL, NULL, ?6, ?7)
              ON CONFLICT(source_id, channel_key, epg_source_id) DO UPDATE SET
                xmltv_id = excluded.xmltv_id, method = 'manual', confidence = 1.0,
-               fp = COALESCE(?5, channel_epg_map.fp), orphaned_since = NULL",
-            params![channel.source, channel.key.as_str(), epg_source, xmltv_id, sql::fp_opt(&fp)],
+               fp = COALESCE(?5, channel_epg_map.fp), orphaned_since = NULL, shift_min = NULL,
+               epg_name = excluded.epg_name, actor = excluded.actor",
+            params![channel.source, channel.key.as_str(), epg_source, xmltv_id, sql::fp_opt(&fp), epg_name, enum_str(&actor)],
         )?;
         resolve_channel(c, channel)
     })
@@ -718,13 +769,14 @@ pub fn clear_manual_mapping(conn: &Connection, channel: &ItemRef) -> Result<()> 
     })
 }
 
-/// Every mapping row of a channel, best first (manual, then guide priority, then method).
+/// Every mapping row of a channel, best first (manual, then a sibling rule row, then guide
+/// priority, then method).
 pub fn mappings_for_channel(conn: &Connection, channel: &ItemRef) -> Result<Vec<EpgMapping>> {
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT m.epg_source_id, m.xmltv_id, m.method, m.confidence FROM channel_epg_map m
          JOIN epg_source es ON es.id = m.epg_source_id
          WHERE m.source_id = ?1 AND m.channel_key = ?2
-         ORDER BY m.method = 'manual' DESC, es.priority, es.id, {METHOD_RANK}"
+         ORDER BY m.method = 'manual' DESC, m.method = 'sibling' DESC, es.priority, es.id, {METHOD_RANK}"
     ))?;
     let rows = stmt.query_map(params![channel.source, channel.key.as_str()], |r| {
         let method: String = r.get(2)?;
@@ -739,17 +791,27 @@ pub fn mappings_for_channel(conn: &Connection, channel: &ItemRef) -> Result<Vec<
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// `EpgMatchMethod` priority (enum order) as SQL.
+/// `EpgMatchMethod` priority (enum order) as SQL: the Guide fixes rule rows ('sibling',
+/// 'copy') rank after every matcher method.
 const METHOD_RANK: &str = "CASE m.method WHEN 'manual' THEN 0 WHEN 'tvg-id-exact' THEN 1 WHEN 'tvg-id-caseless' THEN 2 \
-     WHEN 'xtream-epg-id' THEN 3 WHEN 'feed-stripped' THEN 4 WHEN 'normalized-name' THEN 5 ELSE 6 END";
+     WHEN 'xtream-epg-id' THEN 3 WHEN 'feed-stripped' THEN 4 WHEN 'normalized-name' THEN 5 WHEN 'fuzzy' THEN 6 \
+     WHEN 'sibling' THEN 7 WHEN 'copy' THEN 8 ELSE 9 END";
 
-/// The winning mapping per channel. `{filter}` narrows the channel set (`AND c.…`).
-fn resolve_select(filter: &str) -> String {
+/// The winning mapping per channel: `(channel_id, epg_channel_id, shift_min)`. `{filter}`
+/// narrows the rows (`AND c.…` / `AND m.…`).
+///
+/// Order (DESIGN §31): the user's manual row, then a "+1/+2 follow their base" row (derived
+/// only for a channel that is unresolved or resolves to its base's guide channel, so it wins
+/// over that row), then guide priority, then method. The winner's `shift_min` (a rule row's
+/// time shift) goes to `channel_epg.shift_min`, the middle term of the effective shift
+/// `COALESCE(item_override.shift_min, channel_epg.shift_min, channel.tvg_shift_min)` (B8).
+pub(crate) fn resolve_select(filter: &str) -> String {
     format!(
-        "SELECT channel_id, epg_channel_id FROM (
-           SELECT c.id AS channel_id, ec.id AS epg_channel_id,
+        "SELECT channel_id, epg_channel_id, shift_min FROM (
+           SELECT c.id AS channel_id, ec.id AS epg_channel_id, m.shift_min AS shift_min,
                   row_number() OVER (PARTITION BY c.id
-                                     ORDER BY m.method = 'manual' DESC, es.priority, es.id, {METHOD_RANK}, m.confidence DESC)
+                                     ORDER BY m.method = 'manual' DESC, m.method = 'sibling' DESC, es.priority, es.id,
+                                              {METHOD_RANK}, m.confidence DESC)
                     AS rn
            FROM channel_epg_map m
            JOIN channel c ON c.source_id = m.source_id AND c.key = m.channel_key
@@ -761,6 +823,16 @@ fn resolve_select(filter: &str) -> String {
     )
 }
 
+/// What one channel resolves to with the mapping rows `filter` keeps (`AND m.…`; Guide fixes'
+/// preview of a reset: `AND m.method != 'manual'`): `(guide channel, rule row's shift)`.
+pub(crate) fn resolve_one(conn: &Connection, channel: &ItemRef, filter: &str) -> Result<Option<(EpgChannelId, Option<i32>)>> {
+    let inner = resolve_select(&format!("AND c.source_id = ?1 AND c.key = ?2 {filter}"));
+    Ok(conn
+        .prepare_cached(&format!("SELECT epg_channel_id, shift_min FROM ({inner})"))?
+        .query_row(params![channel.source, channel.key.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?)
+}
+
 /// Re-resolve one channel (manual mapping edits).
 pub(crate) fn resolve_channel(conn: &Connection, channel: &ItemRef) -> Result<()> {
     conn.execute(
@@ -768,15 +840,15 @@ pub(crate) fn resolve_channel(conn: &Connection, channel: &ItemRef) -> Result<()
         params![channel.source, channel.key.as_str()],
     )?;
     conn.execute(
-        &format!("INSERT INTO channel_epg(channel_id, epg_channel_id) {}", resolve_select("AND c.source_id = ?1 AND c.key = ?2")),
+        &format!("INSERT INTO channel_epg(channel_id, epg_channel_id, shift_min) {}", resolve_select("AND c.source_id = ?1 AND c.key = ?2")),
         params![channel.source, channel.key.as_str()],
     )?;
     Ok(())
 }
 
-/// Rebuild `channel_epg`: for each channel, the mapping with (Manual first, then lowest
-/// epg_source.priority, then best method) whose epg channel exists in an enabled source with
-/// `epg_channel.seen_gen = epg_source.active_gen`.
+/// Rebuild `channel_epg`: for each channel, the mapping with (Manual first, then a sibling rule
+/// row, then lowest epg_source.priority, then best method) whose epg channel exists in an
+/// enabled source with `epg_channel.seen_gen = epg_source.active_gen`.
 /// Pure SQL; < 200 ms for 100k channels.
 ///
 /// `seen_gen >= active_gen` in practice: channels refreshed by an import that is still running
@@ -784,7 +856,7 @@ pub(crate) fn resolve_channel(conn: &Connection, channel: &ItemRef) -> Result<()
 pub fn resolve_mappings(conn: &Connection) -> Result<()> {
     atomic(conn, |c| {
         c.execute("DELETE FROM channel_epg", [])?;
-        c.execute(&format!("INSERT INTO channel_epg(channel_id, epg_channel_id) {}", resolve_select("")), [])?;
+        c.execute(&format!("INSERT INTO channel_epg(channel_id, epg_channel_id, shift_min) {}", resolve_select("")), [])?;
         Ok(())
     })
 }
