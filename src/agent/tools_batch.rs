@@ -1,5 +1,5 @@
 //! The batch's MCP tools (DESIGN §31–§35, the skill plan): one action-shaped tool per feature
-//! plus the library and health tools. Listed only once their feature is on (`available`).
+//! plus the library and health tools.
 //! Batch base wrote the shapes; OWNER: agent track (descriptions may be tuned; names and
 //! argument shapes change only together with `params`).
 //!
@@ -12,10 +12,6 @@ use serde_json::{Value, json};
 use super::actions::{ToolAction, action_schema};
 use super::params::{FollowAction, GuideFixAction, MultiViewAction, QueueAction, RemindersAction, SleepAction, SpoilerAction};
 use super::tools::{TIME, ToolDef, kind_enum, limit, object, reveal, spoiler_safe, text};
-
-/// The library and health tools (match_titles, history, episodes, favourites_edit,
-/// parental_status, lock, diagnose, sources): the agent track flips this.
-pub const LIBRARY_TOOLS: bool = true;
 
 fn strings(description: &str) -> Value {
     json!({ "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": crate::agent::proto::MAX_TEXT }, "description": description })
@@ -57,7 +53,6 @@ user's confirmation first.",
             read_only: read_only::<QueueAction>(),
             launches: true,
             example: json!({ "action": "add", "refs": ["movie:3:xt:vod:812"], "at": "end" }),
-            available: crate::queue::ENABLED,
             mixed: true,
         },
         ToolDef {
@@ -100,7 +95,6 @@ add. Never create a rule from an inferred interest. Spoiler-safe results show on
             read_only: read_only::<FollowAction>(),
             launches: true,
             example: json!({ "action": "preview", "rule": { "name": "Arsenal", "kind": "team", "terms": ["Arsenal"] } }),
-            available: crate::follow::ENABLED,
             mixed: true,
         },
         ToolDef {
@@ -128,7 +122,6 @@ spoiler guard\" rather than guessing; never web-search a guarded event. Writes n
             read_only: read_only::<SpoilerAction>(),
             launches: true,
             example: json!({ "action": "status" }),
-            available: crate::spoiler::ENABLED,
             mixed: true,
         },
         ToolDef {
@@ -136,8 +129,8 @@ spoiler guard\" rather than guessing; never web-search a guarded event. Writes n
             title: "Guide fixes",
             description: "Fix the TV guide's channel mappings: issues (coverage per playlist, channels without or with wrong guide data, \
 one channel's candidates), propose (changes, accept by kind and confidence, per-playlist rules; returns before/after now-next and a \
-proposal_id valid 10 min), apply (proposal_id + confirm=true, only after the user said yes; more than 50 channels opens a confirm card \
-in Tuner), undo (undo_id). At most 200 channels per proposal; locked channels are refused while the session is locked.",
+proposal_id valid 10 min), apply (proposal_id + confirm=true, only after the user said yes; more than 50 channels → pending_review: the user \
+reviews them in Tuner's Guide fixes), undo (undo_id). At most 200 channels per proposal; locked channels are refused while the session is locked.",
             input_schema: object(
                 json!({
                     "action": action_schema::<GuideFixAction>("What to do."),
@@ -160,7 +153,6 @@ in Tuner), undo (undo_id). At most 200 channels per proposal; locked channels ar
             read_only: read_only::<GuideFixAction>(),
             launches: true,
             example: json!({ "action": "issues", "limit": 20 }),
-            available: crate::guide_fix::ENABLED,
             mixed: true,
         },
         ToolDef {
@@ -186,7 +178,6 @@ episodes stay single-view.",
             read_only: false,
             launches: true,
             example: json!({ "action": "open", "refs": ["channel:2:xt:live:406"] }),
-            available: crate::ui::multiview::ENABLED,
             mixed: true,
         },
         ToolDef {
@@ -210,7 +201,6 @@ closed. At most about 20 per request; more than 3, and any switch, need the user
             read_only: read_only::<RemindersAction>(),
             launches: true,
             example: json!({ "action": "add", "programme": "programme:2:xt:live:1234@1791748800", "mode": "notify" }),
-            available: crate::reminders::ENABLED,
             mixed: true,
         },
         ToolDef {
@@ -234,7 +224,6 @@ then stop (every picture) or pause. A toast warns first and has Cancel. status /
             read_only: read_only::<SleepAction>(),
             launches: true,
             example: json!({ "action": "set", "after_min": 45 }),
-            available: crate::reminders::ENABLED,
             mixed: true,
         },
         ToolDef {
@@ -256,7 +245,6 @@ its source and date; never present it as Tuner's.",
             read_only: true,
             launches: true,
             example: json!({ "titles": [{ "title": "Dune", "year": 2021 }] }),
-            available: LIBRARY_TOOLS,
             mixed: false,
         },
         ToolDef {
@@ -268,7 +256,6 @@ pick and to carry on, never publish it.",
             read_only: true,
             launches: true,
             example: json!({ "limit": 10 }),
-            available: LIBRARY_TOOLS,
             mixed: false,
         },
         ToolDef {
@@ -289,7 +276,6 @@ copies; narrow with season or query. spoiler_safe=true drops plots; the spoiler 
             read_only: true,
             launches: true,
             example: json!({ "series_ref": "series:2:xt:series:9", "season": 2 }),
-            available: LIBRARY_TOOLS,
             mixed: false,
         },
         ToolDef {
@@ -309,7 +295,6 @@ locked items are never added. The user can undo it in Tuner.",
             read_only: false,
             launches: true,
             example: json!({ "create": "Trending", "add": ["movie:3:xt:vod:812"] }),
-            available: LIBRARY_TOOLS,
             mixed: false,
         },
         ToolDef {
@@ -321,7 +306,6 @@ content is shown. For advice only: no tool unlocks, changes the PIN or shows exp
             read_only: true,
             launches: true,
             example: json!({}),
-            available: LIBRARY_TOOLS,
             mixed: false,
         },
         ToolDef {
@@ -333,7 +317,6 @@ removing one needs the PIN in Tuner. Confirm with the user first.",
             read_only: false,
             launches: true,
             example: json!({ "refs": ["channel:2:xt:live:406"] }),
-            available: LIBRARY_TOOLS,
             mixed: false,
         },
         ToolDef {
@@ -346,7 +329,6 @@ local problem apart. Never contains addresses or logins.",
             read_only: true,
             launches: true,
             example: json!({}),
-            available: LIBRARY_TOOLS,
             mixed: false,
         },
         ToolDef {
@@ -358,7 +340,6 @@ coverage, failures in 24 h. No hosts or logins.",
             read_only: true,
             launches: true,
             example: json!({}),
-            available: LIBRARY_TOOLS,
             mixed: false,
         },
     ]

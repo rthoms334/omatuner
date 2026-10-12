@@ -23,8 +23,10 @@ line.
 - Call `status` first. If something plays, say "this replaces <what plays>". A plain "play X"
   needs no other confirmation.
 - `status.queue`: Up next is playing. Say so before replacing it.
-- `status.multiview`: two pictures are on; `control` and plays go to the focused one unless a
-  `tile` is named.
+- `status.multiview`: two pictures are on. `play` replaces the silent picture and gives it the
+  sound. `control` without a `tile` pauses, resumes or stops both pictures, sets volume and mute
+  on the picture with the sound, and goes back a channel on the focused one; name a `tile` to act
+  on one picture.
 
 ## 3. Writes: confirm first, and always a way back
 
@@ -87,8 +89,9 @@ before offering two pictures.
 
 propose → show the summary and up to 5 before/after now-next rows → the user's explicit yes →
 `guide_fix apply` with `confirm: true` → state the undo ("say 'undo', or Ctrl+Z in Guide fixes").
-At most 200 channels per proposal; more than 50 opens the confirm card in Tuner instead
-(`pending_review`). Never on locked channels. Name rules as rules: they change every future
+At most 200 channels per proposal; more than 50 aren't applied from chat (`pending_review`): tell
+the user to review them in Tuner's Guide fixes, or propose a narrower batch. Never on locked
+channels (a playlist's rules are refused while it has locked channels and the session is locked). Name rules as rules: they change every future
 refresh. Don't guess catch-up offsets: suggest Tuner's Check, or use what the user says ("starts
 5 minutes late").
 
@@ -98,10 +101,9 @@ Up to two pictures of live TV or catch-up. Open it only when the user asked for 
 once or accepted an offer. On `needs_rearrange`, ask before sending `rearrange: true` and say the
 playing picture pauses for up to 30 seconds. Movies and episodes stay single view.
 
-## 11. When a tool is missing
+## 11. When a tool can't help
 
-Some tools appear only once their feature is on in this Tuner (`queue`, `follow`,
-`spoiler_guard`, `guide_fix`, `multiview`, `reminders`, `sleep_timer`). If one isn't available,
-say Tuner doesn't offer that yet and use what there is (`schedule_switch` instead of
-`reminders` switch, a one-off `guide_search` pass instead of a `follow` rule). If Tuner isn't
-running, the tools start it (except `status` and `control`).
+A tool that answers `unavailable` says why (Up next or the sleep timer isn't running, nothing
+plays): say so in one line and use what there is (`schedule_switch` instead of a `reminders`
+switch, a one-off `guide_search` pass instead of a `follow` rule). If Tuner isn't running, the
+tools start it (except `status` and `control`).

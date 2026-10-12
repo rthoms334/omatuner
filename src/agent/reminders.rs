@@ -136,7 +136,7 @@ fn plan_add(q: &Q, p: &Reminders) -> Out<AddPlan> {
     let AgentRef::Programme { channel, start } = parse_ref(item)? else {
         return Err(Fail::bad("programme is a programme ref (from guide_search, whats_on or details)"));
     };
-    let c = q.channel_by_ref(&channel).ok_or_else(|| Fail::not_found("programme"))?;
+    let c = q.channel_by_ref(&channel).filter(|_| !q.conceals(&channel)).ok_or_else(|| Fail::not_found("programme"))?;
     let prog = q.programme_at(c, start)?.ok_or_else(|| Fail::not_found("programme"))?;
     if q.needs_pin(c.locked) {
         return Err(Fail::new(ErrorCode::Unavailable, "locked: needs your PIN in Tuner (locked channels can't be scheduled)"));
@@ -218,19 +218,22 @@ pub(super) async fn handle(h: &Arc<Inner>, p: Reminders) -> Out<Value> {
             let written = h
                 .write(DataScope::Reminders, move |c| {
                     let pending = crate::store::user::all_reminders(c)?;
-                    let same = pending.iter().find(|x| x.channel == r.channel && x.start == r.start).cloned();
-                    if same.is_none() {
-                        if pending.len() >= MAX_PENDING {
-                            return Ok(Err("Too many reminders are pending; cancel some first"));
-                        }
-                        if r.switches() && pending.iter().filter(|x| x.switches() && x.start >= late).count() >= super::act::MAX_SWITCHES {
-                            return Ok(Err("Too many switches are scheduled; cancel one first"));
-                        }
+                    // the row of the same programme in any state: one whose notification has
+                    // already fired still holds the (channel, start) slot
+                    let same = crate::store::user::reminders_for_channel(c, &r.channel)?.into_iter().find(|x| x.start == r.start);
+                    let was_pending = same.as_ref().is_some_and(|x| x.state == ReminderState::Pending);
+                    if !was_pending && pending.len() >= MAX_PENDING {
+                        return Ok(Err("Too many reminders are pending; cancel some first"));
+                    }
+                    let was_switch = was_pending && same.as_ref().is_some_and(Reminder::switches);
+                    if r.switches() && !was_switch && pending.iter().filter(|x| x.switches() && x.start >= late).count() >= super::act::MAX_SWITCHES {
+                        return Ok(Err("Too many switches are scheduled; cancel one first"));
                     }
                     let id = crate::store::user::add_reminder(c, &r)?;
                     // an existing row of the same programme takes this one's mode and times
+                    // (pending again when its new time is still ahead)
                     if let Some(old) = &same {
-                        crate::store::user::edit_reminder(
+                        let row = crate::store::user::edit_reminder(
                             c,
                             id,
                             &crate::store::user::ReminderEdit {
@@ -240,6 +243,9 @@ pub(super) async fn handle(h: &Arc<Inner>, p: Reminders) -> Out<Value> {
                                 open_in: Some(r.open_in.or(old.open_in)),
                             },
                         )?;
+                        if row.state == ReminderState::Dismissed && crate::reminders::arming::fire_at(&row, 0) > crate::model::now() {
+                            crate::store::user::set_reminder_state(c, id, ReminderState::Pending)?;
+                        }
                     }
                     let clashes: Vec<(Reminder, crate::reminders::ClashKind)> = {
                         let now_row = crate::store::user::reminder(c, id)?.unwrap_or(r.clone());
@@ -293,6 +299,8 @@ fn sleep_when(q: &Q, p: &SleepTimer) -> Out<(crate::reminders::sleep::SleepWhen,
         let mut t = when("at", at, q.now)?;
         if t <= q.now && super::act::is_clock_time(at) {
             t += 86_400;
+        } else if t < q.now {
+            return Err(Fail::bad("at is in the past"));
         }
         return Ok((SleepWhen::At(t), None));
     }

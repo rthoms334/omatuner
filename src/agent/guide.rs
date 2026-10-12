@@ -3,8 +3,8 @@
 //!
 //! Guardrails: at most 200 channels per proposal (`store::guide_fix::MAX_BATCH`); a proposal
 //! lives 10 minutes and is bound to the guide check it was made from (applied after a guide
-//! import it is `stale`); more than 50 channels go to Tuner's own screen instead of being
-//! applied from chat; channels needing the PIN now are refused; explicit and hidden channels
+//! import it is `stale`); more than 50 channels aren't applied from chat (`pending_review`: the
+//! user reviews them in Tuner's Guide fixes); channels needing the PIN now are refused; explicit and hidden channels
 //! don't exist here. Claude undoes only its own batches. Guide channels are named by
 //! `guide:<guide id>:<xmltv id>` refs, never by an address.
 
@@ -22,7 +22,8 @@ use super::server::{Inner, to_value};
 use crate::guide_fix::catalog::Catalog;
 use crate::guide_fix::issues::{ClassifyOpts, IssueRow};
 use crate::model::{
-    ChannelId, ChannelSummary, EpgSourceId, FixActor, FixChange, GuideFixLogId, GuideTarget, IssueKind, NowNext, Proposal, SourceId, Timestamp,
+    ChannelId, ChannelSummary, EpgSourceId, FixActor, FixChange, GuideFixLogId, GuideTarget, IssueKind, ItemKey, ItemKind, ItemRef, NowNext,
+    Proposal, SourceId, Timestamp,
 };
 use crate::msg::DataScope;
 use crate::store::guide_fix::GuideOpts;
@@ -258,11 +259,13 @@ fn issues(q: &Q, p: &GuideFix) -> Out<Value> {
     }
     let limit = clamp(p.limit, 50, 200);
     let offset: usize = p.cursor.as_deref().map(|c| c.parse().map_err(|_| Fail::bad("cursor is from a previous answer"))).transpose()?.unwrap_or(0);
+    // the user's hidden channels on request (`q.channel` leaves them out); explicit ones never
+    let seen = |id: ChannelId| if p.include_hidden == Some(true) { q.lib.live.get(id) } else { q.channel(id) };
     let rows: Vec<(&ChannelSummary, &IssueRow)> = report
         .rows
         .iter()
         .filter(|r| kinds.as_ref().is_none_or(|k| k.contains(&r.kind)))
-        .filter_map(|r| q.channel(r.channel).filter(|c| !q.conceals(&channel_ref(c))).map(|c| (c, r)))
+        .filter_map(|r| seen(r.channel).filter(|c| !q.conceals(&channel_ref(c))).map(|c| (c, r)))
         .filter(|(c, _)| source.is_none_or(|s| s == c.source_id))
         .collect();
     let total = rows.len();
@@ -372,10 +375,13 @@ fn propose(q: &Q, p: &GuideFix) -> Out<Proposed> {
     if proposal.changes.len() > crate::store::guide_fix::MAX_BATCH {
         return Err(Fail::bad(format!("more than {} channels: narrow it (playlist, kinds, min_confidence)", crate::store::guide_fix::MAX_BATCH)));
     }
-    // per-playlist rules
+    // per-playlist rules: they re-map the playlist's locked channels too
     if let Some(rules) = &p.rules {
         for r in rules.as_array().ok_or_else(|| Fail::bad("rules is a list"))? {
             let source = playlist_filter(q, r.get("playlist").and_then(Value::as_str))?.ok_or_else(|| Fail::bad("a rule needs playlist"))?;
+            if q.lib.live.channels.iter().any(|c| c.source_id == source && q.needs_pin(c.locked)) {
+                return Err(Fail::new(ErrorCode::Unavailable, "locked: this playlist has locked channels, so its rules need your PIN in Tuner"));
+            }
             let mut now = cx.facts.rules.get(&source).cloned().unwrap_or_default();
             if let Some(b) = r.get("timeshift_siblings").and_then(Value::as_bool) {
                 now.timeshift_siblings = Some(b);
@@ -394,6 +400,27 @@ fn propose(q: &Q, p: &GuideFix) -> Out<Proposed> {
     }
     proposal.stamp = crate::store::guide_fix::stamp(q.conn, &cx.opts)?;
     Ok(Proposed { proposal, channels, rejected })
+}
+
+/// What `apply` / `undo` skipped, as Claude can name it: the proposal's ref of that channel and
+/// its name when it still shows (the store reports bare channel keys). Concealed ones are left
+/// out.
+fn skipped_out(q: &Q, skipped: &[(String, String)], known: &[ItemRef]) -> Vec<Value> {
+    skipped
+        .iter()
+        .filter_map(|(key, why)| {
+            let refs: Vec<ItemRef> = match known.iter().filter(|r| r.key.0 == *key).cloned().collect::<Vec<_>>() {
+                v if !v.is_empty() || key.is_empty() => v,
+                _ => q.lib.sources.iter().map(|s| ItemRef { source: s.id, kind: ItemKind::Channel, key: ItemKey(key.clone()) }).collect(),
+            };
+            if refs.iter().any(|r| q.lib.live.by_ref(r).is_some() && q.conceals(r)) {
+                return None;
+            }
+            let name = refs.iter().find_map(|r| q.channel_by_ref(r)).map(|c| clean(&c.name));
+            let r = known.iter().find(|r| r.key.0 == *key).map(item_ref);
+            Some(json!({ "ref": r, "channel": name, "reason": clean(why) }))
+        })
+        .collect()
 }
 
 fn slim(nn: &NowNext) -> Value {
@@ -462,11 +489,12 @@ pub(super) async fn handle(h: &Arc<Inner>, p: GuideFix) -> Out<Value> {
             if channels > CHAT_APPLY_MAX {
                 return to_value(&json!({
                     "pending_review": true,
-                    "message": format!("{channels} channels is more than Claude applies from chat: open Guide fixes in Tuner to review and apply them there."),
+                    "message": format!("{channels} channels is more than Claude applies from chat: review Tuner's own suggestions in Guide fixes and apply them there, or propose a narrower batch (a playlist, fewer kinds, a higher min_confidence)."),
                 }));
             }
             let opts = GuideOpts::from_config(&h.cfg());
             let label = format!("Claude: {channels} channel{}", if channels == 1 { "" } else { "s" });
+            let known: Vec<ItemRef> = proposal.changes.iter().filter_map(|c| c.channel.clone()).collect();
             let report = h
                 .write(DataScope::Epg, move |c| match crate::store::guide_fix::apply(c, FixActor::Claude, &label, &proposal, &opts, now) {
                     Ok(r) => Ok(Ok(r)),
@@ -483,9 +511,11 @@ pub(super) async fn handle(h: &Arc<Inner>, p: GuideFix) -> Out<Value> {
                 h.shared.wake_reminders();
             }
             tracing::info!("agent: guide_fix apply → {} channels", report.applied);
+            let skipped = report.skipped.clone();
+            let skipped = h.run(true, move |q| Ok(skipped_out(q, &skipped, &known))).await?;
             to_value(&json!({
                 "applied": report.applied,
-                "skipped": report.skipped.iter().map(|(k, why)| json!({ "channel": k, "reason": clean(why) })).collect::<Vec<_>>(),
+                "skipped": skipped,
                 "undo_id": report.log.map(|l| l.0),
                 "reminders_moved": report.reminders_moved,
             }))
@@ -515,9 +545,11 @@ pub(super) async fn handle(h: &Arc<Inner>, p: GuideFix) -> Out<Value> {
                 h.shared.wake_reminders();
             }
             tracing::info!("agent: guide_fix undo {} → {} reverted", id.0, report.reverted);
+            let skipped = report.skipped.clone();
+            let skipped = h.run(true, move |q| Ok(skipped_out(q, &skipped, &[]))).await?;
             to_value(&json!({
                 "reverted": report.reverted,
-                "skipped": report.skipped.iter().map(|(k, why)| json!({ "channel": k, "reason": clean(why) })).collect::<Vec<_>>(),
+                "skipped": skipped,
                 "reminders_moved": report.reminders_moved,
             }))
         }

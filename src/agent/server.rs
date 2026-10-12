@@ -72,8 +72,6 @@ pub(super) struct Inner {
     pub(super) jobs: JobManager,
     /// Every picture's handle (multi-view `control tile`); `None`: picture A only.
     pub(super) tiles: Option<TileRegistry>,
-    /// Answer the batch's tools whose feature is still off (tests; `tools/list` hides them).
-    serve_unlisted: bool,
     /// `guide_fix propose`'s proposals until applied or expired.
     pub(super) proposals: super::guide::Proposals,
     limits: Limits,
@@ -107,7 +105,6 @@ impl AgentHandler {
                 bus,
                 jobs,
                 tiles: None,
-                serve_unlisted: false,
                 proposals: super::guide::Proposals::default(),
                 limits,
                 readers: Mutex::new(Vec::new()),
@@ -126,18 +123,6 @@ impl AgentHandler {
     pub fn with_tiles(self, tiles: TileRegistry) -> Self {
         self.configure(|i| i.tiles = Some(tiles))
     }
-
-    /// Also answer the batch's tools whose feature is still off (tests). `tools/list` never
-    /// lists them, and the production handler refuses them as `unsupported`.
-    pub fn serve_unlisted(self) -> Self {
-        self.configure(|i| i.serve_unlisted = true)
-    }
-}
-
-/// The batch's tools whose feature is off in this build (`ToolDef::available`).
-fn unlisted(name: &str) -> bool {
-    static OFF: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
-    OFF.get_or_init(|| super::tools::all_tools().into_iter().filter(|t| !t.available).map(|t| t.name).collect()).contains(&name)
 }
 
 impl AgentService for AgentHandler {
@@ -145,9 +130,6 @@ impl AgentService for AgentHandler {
         let inner = self.inner.clone();
         Box::pin(async move {
             let (id, method, action) = (req.id, req.call.name(), req.call.is_action());
-            if unlisted(method) && !inner.serve_unlisted {
-                return Reply::err(id, ErrorCode::Unsupported, format!("{method} isn't available in this Tuner yet"));
-            }
             let _slot = match inner.limits.admit(action) {
                 Ok(s) => s,
                 Err(e) => {
@@ -425,7 +407,7 @@ impl Inner {
     /// The pictures a `control` reaches: the one named, else every picture for pause / resume /
     /// stop and the one with the sound for volume and mute.
     fn control_targets(&self, c: &Control) -> Out<Vec<PlayerHandle>> {
-        let audible = self.shared.tiles().audible;
+        let tiles = self.shared.tiles();
         let get = |t: crate::model::TileId| match &self.tiles {
             Some(reg) => reg.get(t),
             None => (t == crate::model::TileId::A).then(|| self.player.clone()),
@@ -435,9 +417,10 @@ impl Inner {
         }
         Ok(match c.action {
             ControlAction::Volume | ControlAction::Mute | ControlAction::Unmute => {
-                get(audible).or_else(|| get(crate::model::TileId::A)).into_iter().collect()
+                get(tiles.audible).or_else(|| get(crate::model::TileId::A)).into_iter().collect()
             }
-            ControlAction::PreviousChannel | ControlAction::Popout => vec![self.player.clone()],
+            // the focused picture (A while multi-view is off)
+            ControlAction::PreviousChannel | ControlAction::Popout => get(tiles.focus).or_else(|| get(crate::model::TileId::A)).into_iter().collect(),
             _ => match &self.tiles {
                 Some(reg) => reg.all(),
                 None => vec![self.player.clone()],

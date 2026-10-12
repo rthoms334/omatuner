@@ -472,7 +472,7 @@ fn the_plugin_names_real_tools() {
     assert_eq!(market["plugins"][0]["name"], plugin["name"]);
     assert_eq!(market["plugins"][0]["source"], "./plugins/omatuner");
     assert_eq!(plugin["version"], env!("CARGO_PKG_VERSION"), "bump the plugin with the app (installs are cached by version)");
-    let known: Vec<&str> = tuner::agent::tools::all_tools().iter().map(|t| t.name).collect();
+    let known: Vec<&str> = tuner::agent::tools::tools().iter().map(|t| t.name).collect();
     for skill in ["watch", "pick", "series", "plan", "kids", "fix", "discover"] {
         let text = read(&format!("plugins/omatuner/skills/{skill}/SKILL.md"));
         let front = text.split("---").nth(1).unwrap_or_else(|| panic!("{skill}: no frontmatter"));
@@ -483,7 +483,7 @@ fn the_plugin_names_real_tools() {
         for t in tools {
             assert!(known.contains(&t), "{skill} allows {t}, which isn't a tool");
         }
-        assert!(text.contains("../../RULES.md"), "{skill} points at the shared rules");
+        assert!(text.contains("`${CLAUDE_SKILL_DIR}/../../RULES.md`"), "{skill} points at the shared rules");
         assert!(text.lines().count() < 500, "{skill}: keep skills short");
     }
 }

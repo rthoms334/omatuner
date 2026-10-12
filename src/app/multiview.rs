@@ -234,13 +234,15 @@ impl TunerApp {
                 if let Some(l) = layout {
                     set_layout(self, *l);
                 }
-                let on = self.mv.view.on;
-                let aims: &[Aim] = match targets.len() {
-                    1 => &[Aim::Alongside],
-                    _ if on => &[Aim::Tile(A), Aim::Tile(B)],
-                    _ => &[Aim::Focused, Aim::Alongside],
+                let view = self.mv.view;
+                // one picture: the first target replaces what plays, the second opens the other
+                // picture (not `Alongside`: the snapshot doesn't show the first play yet)
+                let aims = match targets.len() {
+                    1 => [Aim::Alongside, Aim::Alongside],
+                    _ if view.on => [Aim::Tile(A), Aim::Tile(B)],
+                    _ => [Aim::Focused, Aim::Tile(view.focus.other())],
                 };
-                for (i, (media, aim)) in targets.iter().zip(aims).enumerate() {
+                for (i, (media, aim)) in targets.iter().zip(&aims).enumerate() {
                     let mut p = PlaceIn::new(*aim, media.clone(), None);
                     p.take_sound = *sound == Some(i);
                     p.rearrange = *rearrange;

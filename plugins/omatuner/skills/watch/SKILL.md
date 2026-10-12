@@ -7,7 +7,7 @@ allowed-tools: Read mcp__plugin_omatuner_tuner__status mcp__plugin_omatuner_tune
 
 # Watch: find it, play it now, or catch up
 
-First read `../../RULES.md` (this plugin's shared rules) and follow it throughout.
+First read `${CLAUDE_SKILL_DIR}/../../RULES.md` (this plugin's shared rules) and follow it throughout.
 
 ## Steps
 

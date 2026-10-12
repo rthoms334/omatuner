@@ -289,6 +289,8 @@ pub struct PlaylistOut {
     /// The last refresh failed: its (redacted) reason.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh_error: Option<String>,
+    /// What Tuner shows of it (the user's hidden items and, while locked, explicit ones aren't
+    /// counted).
     pub channels: u32,
     pub movies: u32,
     pub series: u32,
@@ -331,7 +333,7 @@ pub fn sources(q: &Q) -> Out<SourcesOut> {
         .map(|m| {
             let s = stored.get(&m.id);
             let cov = coverage.iter().find(|c| c.source == m.id);
-            let counts = s.map(|s| s.status.counts).unwrap_or_default();
+            let count = |k: crate::model::ItemKind| q.lib.count(k, m.id) as u32;
             PlaylistOut {
                 playlist: clean(&m.name),
                 kind: if m.kind == crate::model::SourceKind::Xtream { "xtream" } else { "m3u" }.into(),
@@ -340,9 +342,9 @@ pub fn sources(q: &Q) -> Out<SourcesOut> {
                 account: s.and_then(|s| s.status.account.as_ref()).map(account_out),
                 last_refresh: m.last_refresh.map(fmt_time),
                 refresh_error: s.and_then(|s| s.status.last_error.as_deref()).map(clean),
-                channels: counts.channels,
-                movies: counts.movies,
-                series: counts.series,
+                channels: count(crate::model::ItemKind::Channel),
+                movies: count(crate::model::ItemKind::Movie),
+                series: count(crate::model::ItemKind::Series),
                 guide_coverage: CoverageOut { shown: cov.map_or(0, |c| c.shown as u32), with_guide: cov.map_or(0, |c| c.with_guide as u32) },
                 failures_24h: failures.iter().filter(|(r, _)| r.source == m.id && q.channel_by_ref(r).is_some()).map(|(_, f)| f.count.max(1)).sum(),
             }

@@ -47,7 +47,8 @@ pub fn steps(local: Option<&Path>) -> Vec<Step> {
     ]
 }
 
-/// The setup without plugins: the MCP server only (skills can be copied from the plugin).
+/// The setup without plugins: the MCP server only. The skills need the plugin: they read its
+/// shared `RULES.md`, which a copied skill folder leaves behind.
 pub fn manual_steps() -> Vec<Step> {
     vec![Step::new(
         "Register Tuner's MCP server",
@@ -65,7 +66,9 @@ pub fn instructions(local: Option<&Path>, claude_found: bool) -> String {
     for st in steps(local) {
         s.push_str(&format!("  # {}\n  {}\n", st.what, st.shell()));
     }
-    s.push_str("\nOr only the MCP server, without the skills:\n");
+    s.push_str(
+        "\nOr only the MCP server, without the skills (they need the plugin: a copied skill folder leaves out\nthe shared rules they follow):\n",
+    );
     for st in manual_steps() {
         s.push_str(&format!("  # {}\n  {}\n", st.what, st.shell()));
     }

@@ -116,7 +116,29 @@ fn fits(wants: &[Want], held: Option<(SourceId, Vec<SourceId>)>, limits: &HashMa
     }
 }
 
-fn plan_open(q: &Q, p: &MultiView, playing: Option<(ChannelId, SourceId)>, multiview_on: bool) -> Out<(Option<AgentMultiView>, Value)> {
+/// What the picture that stays (the focused one) plays when one ref goes alongside it.
+enum Staying {
+    Nothing,
+    /// A live channel on a playlist: it may move to one of its copies.
+    Live(ChannelId, SourceId),
+    /// Catch-up holds its playlist's stream and stays on it.
+    Catchup(SourceId),
+    /// A film, an episode or a file: multi-view doesn't open next to it.
+    Film,
+}
+
+fn staying(snap: &crate::player::PlayerSnapshot, q: &Q) -> Staying {
+    use crate::model::PlayableKind as K;
+    let Some(pl) = snap.playable.as_deref().filter(|_| snap.state != crate::player::PlayerState::Idle) else { return Staying::Nothing };
+    match (&pl.kind, snap.claim) {
+        (K::Live, Some(src)) => pl.item.as_ref().and_then(|i| q.lib.live.by_ref(i)).map_or(Staying::Nothing, |id| Staying::Live(id, src)),
+        (K::Catchup { .. }, Some(src)) => Staying::Catchup(src),
+        (K::Live | K::Catchup { .. }, None) => Staying::Nothing,
+        (K::Movie | K::Episode { .. } | K::Url, _) => Staying::Film,
+    }
+}
+
+fn plan_open(q: &Q, p: &MultiView, playing: Staying, multiview_on: bool) -> Out<(Option<AgentMultiView>, Value)> {
     let refs = p.refs.as_deref().filter(|r| (1..=2).contains(&r.len())).ok_or_else(|| Fail::bad("open takes 1–2 refs"))?;
     let from_start = p.from_start == Some(true);
     let wants: Vec<Want> = refs.iter().map(|s| want(q, s, from_start)).collect::<Out<_>>()?;
@@ -130,11 +152,21 @@ fn plan_open(q: &Q, p: &MultiView, playing: Option<(ChannelId, SourceId)>, multi
         .collect();
     // one ref goes alongside what plays (which keeps its playlist, or moves to a copy)
     let held = match (wants.len(), playing) {
-        (1, Some((ch, src))) => {
-            let alts: Vec<SourceId> = crate::store::copies::channel_copies(q.lib, q.conn, ch)?.iter().map(|c| c.source).collect();
+        (1, Staying::Live(ch, src)) => {
+            let alts: Vec<SourceId> = crate::store::copies::channel_copies(q.lib, q.conn, ch)?
+                .iter()
+                .filter(|c| !(c.explicit && q.view.hides_explicit) && q.channel(c.id).is_some())
+                .map(|c| c.source)
+                .collect();
             Some((src, alts))
         }
-        (1, None) if !multiview_on => return Err(Fail::new(ErrorCode::Unavailable, "Nothing is playing: give two refs, or play one first")),
+        (1, Staying::Catchup(src)) => Some((src, vec![])),
+        (1, Staying::Film) if !multiview_on => {
+            return Err(Fail::new(ErrorCode::Unavailable, "A film or episode is playing: multi-view is for live TV and catch-up"));
+        }
+        (1, Staying::Nothing) if !multiview_on => {
+            return Err(Fail::new(ErrorCode::Unavailable, "Nothing is playing: give two refs, or play one first"));
+        }
         _ => None,
     };
     let names: Vec<String> = wants.iter().map(|w| clean(&w.name)).collect();
@@ -172,19 +204,13 @@ pub(super) async fn handle(h: &Arc<Inner>, p: MultiView) -> Out<Value> {
     let send = |m: AgentMultiView| h.bus.send(AppEvent::Agent(AgentCommand::MultiView(m)));
     match p.action {
         MultiViewAction::Open => {
-            let snap = h.player.snapshot();
-            let playing_item = snap.playable.as_ref().filter(|p| p.kind.is_live()).and_then(|p| p.item.clone());
-            let claim = snap.claim;
+            // one ref replaces the picture that isn't focused: the focused one stays
+            let snap = match h.shared.tile_player(tiles.focus) {
+                Some(rx) => rx.borrow().clone(),
+                None => h.player.snapshot(),
+            };
             let on = tiles.on;
-            let (cmd, out) = h
-                .run(true, move |q| {
-                    let playing = match (playing_item, claim) {
-                        (Some(i), Some(src)) => q.lib.live.by_ref(&i).map(|id| (id, src)),
-                        _ => None,
-                    };
-                    plan_open(q, &p, playing, on)
-                })
-                .await?;
+            let (cmd, out) = h.run(true, move |q| plan_open(q, &p, staying(&snap, q), on)).await?;
             if let Some(cmd) = cmd {
                 send(cmd);
                 tracing::info!("agent: multiview open");
