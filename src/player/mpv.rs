@@ -200,6 +200,24 @@ pub(super) fn loadfile(mpv: &Mpv, args: &[String]) -> std::result::Result<Option
     }
 }
 
+/// What mpv knows about the streams it plays, for the relay's plan when that item moves to a TV
+/// (DESIGN §40 §5.5 step 2, §8.2 hint 4: the probe is skipped when these are enough). Read
+/// before mpv stops. The codecs are FFmpeg's names (`h264`, `hevc`, `mp2`…, as `ffprobe`
+/// gives them); the channel count is the demuxer's (the source, not mpv's downmix);
+/// interlacing is known only for the frame on screen (`video-frame-info`), and mpv has no
+/// H.264 level, which the Apple TV doesn't need (≤ High@5.2 covers broadcast).
+pub fn cast_hints(mpv: &Mpv) -> crate::model::CastHints {
+    let s = |n: &str| mpv.get_property::<String>(n).ok().filter(|v| !v.is_empty());
+    let u = |n: &str| mpv.get_property::<i64>(n).ok().and_then(|v| u32::try_from(v).ok()).filter(|v| *v > 0);
+    crate::model::CastHints {
+        vcodec: s("current-tracks/video/codec"),
+        acodec: s("current-tracks/audio/codec"),
+        channels: u("current-tracks/audio/demux-channel-count"),
+        interlaced: mpv.get_property::<bool>("video-frame-info/interlaced").ok(),
+        height: u("video-params/h"),
+    }
+}
+
 /// `node[key]` as an integer when `node` is a map.
 ///
 /// # Safety

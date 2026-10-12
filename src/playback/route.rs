@@ -12,6 +12,10 @@
 //! | Following / news flash switch | main, Cancel | a notification with Watch (unless `follow.interrupt_vod`) | silent picture, takes the sound |
 //! | MCP play, IPC `--play`, notification Watch | main | main; the queue steps aside | silent picture, takes the sound |
 //!
+//! Casting (DESIGN §40 §5.5): picture A plays on a TV, and multi-view and casting exclude each
+//! other. Ctrl+M and any play aimed at picture B are refused ("Stop casting to use
+//! multi-view"); plays aimed at A go through as above and land on the TV.
+//!
 //! The parental gate is NOT here: the PIN and the explicit gate stay in the play path, and the
 //! router never unlocks anything. The shield applies to `UserZap` only.
 
@@ -85,8 +89,7 @@ pub struct RouteState {
     pub follow_interrupt_vod: bool,
     /// The main picture plays on a TV (`PlayerSnapshot::cast`; DESIGN §40 §5.5): plays aimed
     /// at picture B and "Alongside" are refused ("Stop casting to use multi-view"), plays
-    /// aimed at A go through (and land on the TV). Set by the skeleton at every caller; the
-    /// refusal in [`route`] is CAST-5's.
+    /// aimed at A go through (and land on the TV).
     pub casting: bool,
 }
 
@@ -122,9 +125,25 @@ pub enum Route {
 /// Refusal texts (also MCP messages).
 pub const MULTIVIEW_LIVE_ONLY: &str = "Multi-view is for live TV and catch-up";
 pub const QUEUE_WAITS: &str = "Up next waits while multi-view is on";
+pub const STOP_CASTING_FOR_MULTIVIEW: &str = "Stop casting to use multi-view";
 
 /// Route one play intent. Pure; `guard` and `now` only for the zap shield.
 pub fn route(intent: &PlayIntent, st: &RouteState, guard: &Guard, now: Timestamp) -> Route {
+    if !st.casting {
+        return route_tiles(intent, st, guard, now);
+    }
+    // casting: multi-view can't start, and (defensively, it can't be on) nothing goes to B
+    match intent.source {
+        PlaySource::Alongside => Route::Refuse(STOP_CASTING_FOR_MULTIVIEW),
+        _ => match route_tiles(intent, st, guard, now) {
+            Route::Tile { tile, .. } if tile != TileId::A => Route::Refuse(STOP_CASTING_FOR_MULTIVIEW),
+            r => r,
+        },
+    }
+}
+
+/// [`route`] over the pictures (single view or multi-view).
+fn route_tiles(intent: &PlayIntent, st: &RouteState, guard: &Guard, now: Timestamp) -> Route {
     let multi = st.tiles.on;
     let main = |interrupts_queue: bool| Route::Tile { tile: TileId::A, take_sound: false, interrupts_queue };
     let main_busy_vod = matches!(st.main_kind, Some(Kind::Vod | Kind::Catchup));
@@ -262,6 +281,26 @@ mod tests {
             assert_eq!(r(s, Kind::Vod, &single(Some(Kind::Vod), true)), MAIN_STEPS_ASIDE, "{s:?}");
             assert_eq!(r(s, Kind::Live, &multi()), SILENT_TAKES_SOUND, "{s:?}");
         }
+    }
+
+    /// Casting: Ctrl+M is refused whatever plays, plays aimed at A land on the TV as in single
+    /// view (a Following rule still never interrupts a film there), and nothing reaches B.
+    #[test]
+    fn casting_refuses_multi_view_and_keeps_picture_a() {
+        let g = Guard::default();
+        let casting = |main: Option<Kind>| RouteState { casting: true, ..single(main, false) };
+        let r = |i: PlaySource, k: Kind, st: &RouteState| route(&intent(i, k), st, &g, NOW);
+        for main in [None, Some(Kind::Live), Some(Kind::Catchup)] {
+            assert_eq!(r(PlaySource::Alongside, Kind::Live, &casting(main)), Route::Refuse(STOP_CASTING_FOR_MULTIVIEW), "{main:?}");
+        }
+        for s in [PlaySource::User, PlaySource::UserZap, PlaySource::Queue, PlaySource::Agent, PlaySource::Ipc, PlaySource::Notification] {
+            assert_eq!(r(s, Kind::Live, &casting(Some(Kind::Live))), MAIN, "{s:?}");
+        }
+        let rule = PlaySource::Reminder { id: ReminderId(2), rule: Some(FollowRuleId(3)) };
+        assert_eq!(r(rule, Kind::Live, &casting(Some(Kind::Vod))), Route::Downgrade(Downgrade::Notify { reason: NotifyReason::WouldInterrupt }));
+        let both = RouteState { casting: true, ..multi() };
+        assert_eq!(r(PlaySource::User, Kind::Live, &both), Route::Refuse(STOP_CASTING_FOR_MULTIVIEW), "the focused picture is B");
+        assert_eq!(r(PlaySource::Agent, Kind::Live, &both), Route::Refuse(STOP_CASTING_FOR_MULTIVIEW), "the silent picture is B");
     }
 
     /// The silent picture is the one without sound, wherever the focus is.
