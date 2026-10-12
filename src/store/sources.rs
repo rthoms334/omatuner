@@ -385,6 +385,17 @@ pub fn set_category_rule(conn: &Connection, id: SourceId, rule: &CategoryRule) -
     Ok(())
 }
 
+/// A playlist's Guide fixes rules and catch-up offset (DESIGN §31): the only writer of
+/// `SourceSettings::guide`. Callers re-derive the rule rows afterwards
+/// (`store::guide_fix::derive_rule_rows`; `store::guide_fix::apply` does it).
+pub fn set_guide_rules(conn: &Connection, id: SourceId, rules: &crate::model::GuideRules) -> Result<()> {
+    let settings: String = or_not_found(conn.query_row("SELECT settings FROM source WHERE id = ?1", [id], |r| r.get(0)), "source", id)?;
+    let mut settings: SourceSettings = from_json_opt(Some(settings)).unwrap_or_default();
+    settings.guide = *rules;
+    conn.execute("UPDATE source SET settings = ?2 WHERE id = ?1", params![id, sql::to_json(&settings)?])?;
+    Ok(())
+}
+
 /// Give a playlist its own category rule (`None` = show everything of it):
 /// [`set_category_rule`] with [`CategoryRule::Own`].
 pub fn set_category_filter(conn: &Connection, id: SourceId, filter: Option<&CategoryFilter>) -> Result<()> {

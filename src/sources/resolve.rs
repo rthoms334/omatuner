@@ -74,7 +74,7 @@ fn resolve_live(conn: &Connection, cfg: &Config, media: &MediaRef, id: ChannelId
     check_supported(&ch)?;
     let src = load_source(conn, ch.source_id)?;
     let url = stream_url(&ch.stream, &src, cfg)?;
-    let subtitle = ch.epg_channel_id.and_then(|e| current_programme(conn, e, ch.tvg_shift_min, now));
+    let subtitle = ch.epg_channel_id.and_then(|e| current_programme(conn, e, shown_shift(conn, &ch), now));
     Ok(Playable {
         media: media.clone(),
         kind: PlayableKind::Live,
@@ -112,8 +112,10 @@ fn resolve_catchup(
         start,
         stop,
         now,
+        // §4.6: only the provider's tvg-shift converts back; a user or rule shift means the
+        // stream airs later, so its archive is at the shown time
         tvg_shift_min: ch.tvg_shift_min,
-        user_offset_s: ch.catchup_offset_s,
+        user_offset_s: catchup_offset(&ch, &src),
         catchup_id: catchup_id.filter(|c| !c.trim().is_empty()),
         tz: server_tz(&src),
     };
@@ -121,7 +123,7 @@ fn resolve_catchup(
         StreamLocator::Xtream { stream_id, .. } => xtream_timeshift(&req, xtream_creds(&src)?, *stream_id, live_ext(&src, cfg))?,
         StreamLocator::Url { .. } => catchup::build_url(&req)?,
     };
-    let epg_start = start.saturating_sub(i64::from(ch.tvg_shift_min) * 60);
+    let epg_start = start.saturating_sub(i64::from(shown_shift(conn, &ch)) * 60);
     let subtitle = ch.epg_channel_id.and_then(|e| programme_at(conn, e, epg_start));
     Ok(Playable {
         media: media.clone(),
@@ -244,6 +246,27 @@ fn load_source(conn: &Connection, id: SourceId) -> Result<Source> {
         return Err(Error::NotFound("source is disabled".into()));
     }
     Ok(src)
+}
+
+/// The shift the guide shows the channel with (B8, DESIGN §31): the user's, else a Guide fixes
+/// rule row's, else the provider's tvg-shift — the same `COALESCE` as the library's.
+fn shown_shift(conn: &Connection, ch: &Channel) -> i32 {
+    let q = conn
+        .prepare_cached(
+            "SELECT COALESCE(o.shift_min, ce.shift_min, c.tvg_shift_min) FROM channel c
+             LEFT JOIN item_override o ON o.source_id = c.source_id AND o.kind = 'channel' AND o.item_key = c.key
+             LEFT JOIN channel_epg ce ON ce.channel_id = c.id
+             WHERE c.id = ?1",
+        )
+        .and_then(|mut s| s.query_row([ch.id], |r| r.get::<_, i32>(0)));
+    q.unwrap_or(ch.tvg_shift_min)
+}
+
+/// The catch-up offset: the channel's own, else its playlist's (`SourceSettings::guide`,
+/// DESIGN §31), else none. A channel offset of exactly 0 counts as unset (the channel load
+/// folds a missing override into 0).
+fn catchup_offset(ch: &Channel, src: &Source) -> i64 {
+    if ch.catchup_offset_s != 0 { ch.catchup_offset_s } else { src.settings.guide.catchup_offset_s.unwrap_or(0) }
 }
 
 fn xtream_creds(src: &Source) -> Result<&XtreamCredentials> {

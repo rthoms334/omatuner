@@ -7,6 +7,10 @@
 //! allocates 30-minute programmes per 6-hour bucket like `store::epg::window` would return
 //! them, so cache misses cost what they cost in the app minus SQLite. Prints the median and
 //! the 95th percentile and exits non-zero when the median misses the gate.
+//!
+//! Guide fixes (DESIGN §31 §4.4, G-core): `guide_fix::issues::classify` over a synthetic
+//! 79k-channel snapshot (two playlists, a third unmapped, a "+1" every 50 channels, cached
+//! suggestions for half the unmapped ones), median of 7 runs < 100 ms (release).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -28,6 +32,9 @@ const FRAMES: usize = 200;
 const WARMUP: usize = 20;
 const GATE: Duration = Duration::from_millis(8);
 const T0: Timestamp = 1_791_576_000;
+const FIX_CHANNELS: i64 = 79_000;
+const FIX_RUNS: usize = 7;
+const FIX_GATE: Duration = Duration::from_millis(100);
 
 const TITLES: [&str; 8] =
     ["News at Eight", "Gardeners' World", "Film: The Matrix", "Live Football", "The Simpsons", "Panorama", "Weather", "Big Bang Theory"];
@@ -88,7 +95,104 @@ fn live() -> LiveIndex {
     LiveIndex::from_parts(chans, vec![], members, HashSet::new())
 }
 
+/// `classify` over [`FIX_CHANNELS`] synthetic channels: (median, rows).
+fn classify_bench() -> (Duration, usize) {
+    use tuner::guide_fix::issues::{ClassifyOpts, classify};
+    use tuner::model::{EpgMatchMethod, EpgSourceId, EpgSuggestion};
+    use tuner::sources::epg_match::{Resolved, RuleChannel};
+    use tuner::store::guide_fix::{GuideFacts, GuideOpts};
+
+    let name = |i: i64| if i % 50 == 1 { format!("Channel {} +1", i - 1) } else { format!("Channel {i}") };
+    let mapped = |i: i64| i % 3 != 0 && i % 50 != 1;
+    let chans: Vec<ChannelSummary> = (1..=FIX_CHANNELS)
+        .map(|i| ChannelSummary {
+            id: ChannelId(i),
+            source_id: SourceId(1 + i % 2),
+            key: ItemKey(format!("c{i}")),
+            name: Arc::from(name(i)),
+            provider_name: None,
+            number: Some(i as u32),
+            logo: None,
+            group_ids: vec![GroupId(1)],
+            epg_channel_id: mapped(i).then_some(EpgChannelId(i)),
+            tvg_shift_min: 0,
+            has_catchup: false,
+            catchup_days: 0,
+            radio: false,
+            locked: false,
+            unsupported: false,
+            provider_order: i as i32,
+            user_order: None,
+            added_at: None,
+            quality: None,
+            family: (i / 2) as u64,
+        })
+        .collect();
+    let rule: Vec<RuleChannel> = chans
+        .iter()
+        .map(|c| RuleChannel {
+            id: c.id,
+            source: c.source_id,
+            key: c.key.clone(),
+            name: c.name.to_string(),
+            tvg_name: None,
+            norm: tuner::sources::identity::normalize_name(&c.name),
+            family: (c.id.0 / 2).to_string(),
+            tvg_id: None,
+            usable: true,
+            resolved: c.epg_channel_id.map(|e| Resolved {
+                epg_channel: e,
+                epg_source: EpgSourceId(1),
+                xmltv_id: format!("c{}.tv", e.0),
+                method: EpgMatchMethod::TvgIdExact,
+                shift_min: None,
+            }),
+        })
+        .collect();
+    let mut facts = GuideFacts { opts: GuideOpts::default(), ..Default::default() };
+    facts.index = rule.iter().enumerate().map(|(i, c)| (c.id, i as u32)).collect();
+    for c in &rule {
+        match &c.resolved {
+            Some(r) => {
+                if r.epg_channel.0 % 100 != 7 {
+                    facts.airing.insert(r.epg_channel);
+                }
+                facts.guide_names.insert(r.epg_channel, vec![(c.name.clone(), c.norm.clone())]);
+            }
+            None if c.id.0 % 2 == 0 => {
+                let s = EpgSuggestion {
+                    epg_channel_id: EpgChannelId(c.id.0 + 1),
+                    epg_source_id: EpgSourceId(1),
+                    xmltv_id: "x".into(),
+                    display_name: c.name.clone(),
+                    score: 0.96,
+                };
+                facts.suggestions.insert(c.id, vec![s]);
+            }
+            None => {}
+        }
+    }
+    facts.chans = rule;
+    let lib =
+        tuner::store::library::Library { live: Arc::new(LiveIndex::from_parts(chans, vec![], HashMap::new(), HashSet::new())), ..Default::default() };
+    let mut times = Vec::with_capacity(FIX_RUNS);
+    let mut rows = 0;
+    for _ in 0..FIX_RUNS {
+        let t = Instant::now();
+        let rep = classify(&lib, &facts, None, ClassifyOpts::default());
+        times.push(t.elapsed());
+        rows = rep.rows.len();
+    }
+    times.sort();
+    (times[times.len() / 2], rows)
+}
+
 fn main() {
+    let (fix_median, fix_rows) = classify_bench();
+    println!("guide fixes: classify {FIX_CHANNELS} channels → {fix_rows} issues: median {fix_median:?}");
+    let fix_verdict = if fix_median < FIX_GATE { "PASS" } else { "FAIL" };
+    println!("gate {:<24} {:>8.2} ms   (< {} ms)   {fix_verdict}", "guide fixes classify", fix_median.as_secs_f64() * 1e3, FIX_GATE.as_millis());
+
     let dir = std::env::temp_dir().join(format!("tuner-bench-guide-{}", std::process::id()));
     let paths = tuner::paths::AppPaths::rooted(&dir);
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
@@ -134,7 +238,7 @@ fn main() {
     let verdict = if median < GATE { "PASS" } else { "FAIL" };
     println!("gate {:<24} {:>8.2} ms   (< {} ms)   {verdict}", "guide frame (median)", median.as_secs_f64() * 1e3, GATE.as_millis());
     let _ = std::fs::remove_dir_all(&dir);
-    if median >= GATE {
+    if median >= GATE || fix_median >= FIX_GATE {
         eprintln!("guide bench FAILED the gate");
         std::process::exit(1);
     }
