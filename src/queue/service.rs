@@ -231,21 +231,31 @@ impl Engine {
 
     /// Re-read the rows and their facts.
     async fn reload(&mut self) {
-        match self.deps.store.writer().run(|c| crate::store::queue::load(c)).await {
-            Ok(rows) => self.input(Input::Rows(rows)).await,
-            Err(e) => tracing::warn!("queue: reading Up next: {e}"),
-        }
+        self.load_rows().await;
         self.seen = None;
         self.refresh_facts().await;
     }
 
-    /// New facts when the library or the parental state changed (or were never computed).
+    /// Re-read the rows (a reader: an idle engine never waits on the writer's queue).
+    async fn load_rows(&mut self) {
+        match self.read(|c, _, _, _| crate::store::queue::load(c)).await {
+            Ok(rows) => self.input(Input::Rows(rows)).await,
+            Err(e) => tracing::warn!("queue: reading Up next: {e}"),
+        }
+    }
+
+    /// New facts when the library or the parental state changed (or were never computed). A
+    /// new library also re-reads the rows: a refresh may have re-keyed or orphaned some, and
+    /// removing a playlist deletes its rows.
     async fn refresh_facts(&mut self) {
         let lib = self.shared.library();
         let key = (lib.generation, self.shared.parental(&self.config().parental));
         drop(lib);
         if self.seen == Some(key) {
             return;
+        }
+        if self.seen.is_some_and(|(generation, _)| generation != key.0) {
+            self.load_rows().await;
         }
         let rows = self.machine.rows().to_vec();
         match self.read(move |c, lib, view, _| Ok(facts(c, lib, view, &rows))).await {
@@ -300,14 +310,25 @@ impl Engine {
         match e {
             Effect::Play { id, how, resume } => vec![self.play(id, how, resume).await],
             Effect::PlayEpisode { id, origin } => {
-                let req = PlayRequest { media: MediaRef::Episode(id), zap: None, origin, resume: true, immediate: true };
-                if self.routes(Kind::Vod, None) {
-                    self.deps.player.send(PlayerCommand::Play(req));
+                // the PIN window may have closed during the episode before: re-read it now
+                let may = self.read(move |c, lib, view, _| episode_may_play(c, lib, view, id)).await.unwrap_or_else(|e| {
+                    tracing::debug!("queue: next episode: {e}");
+                    EpisodeCheck::Gone
+                });
+                match may {
+                    EpisodeCheck::Plays => {
+                        let req = PlayRequest { media: MediaRef::Episode(id), zap: None, origin, resume: true, immediate: true };
+                        if self.routes(Kind::Vod, None) {
+                            self.deps.player.send(PlayerCommand::Play(req));
+                        }
+                    }
+                    EpisodeCheck::Locked => self.deps.bus.toast(Toast::info("Next episode is locked")),
+                    EpisodeCheck::Gone => {}
                 }
                 Vec::new()
             }
             Effect::LookupNextEpisode(ep) => {
-                let next = self.read(move |c, _, _, _| next_episode(c, ep)).await.unwrap_or_else(|e| {
+                let next = self.read(move |c, lib, _, _| next_episode(c, lib, ep)).await.unwrap_or_else(|e| {
                     tracing::debug!("queue: next episode: {e}");
                     None
                 });
@@ -315,14 +336,6 @@ impl Engine {
             }
             Effect::Add { targets, at, by } => self.add(targets, at, by).await,
             Effect::Write(w) => self.write(w).await,
-            Effect::Sleep(action) => {
-                // "Stop" stops the main picture (the sleep runner stops any other one)
-                match action {
-                    crate::reminders::sleep::SleepAction::Stop => self.deps.player.send(PlayerCommand::Stop),
-                    crate::reminders::sleep::SleepAction::Pause => self.deps.player.send(PlayerCommand::SetPause(true)),
-                }
-                Vec::new()
-            }
             Effect::Toast(text) => {
                 let action = (text == PAUSED_TOAST).then(|| ("Up next".to_owned(), crate::keymap::Action::GoQueue));
                 self.deps.bus.toast(Toast { kind: ToastKind::Info, text: text.into(), action, ttl_ms: 5000 });
@@ -381,10 +394,13 @@ impl Engine {
     }
 
     /// Run a write, then re-read the list (a state change needs no re-read: the machine made it).
+    /// Facts are per row and only a pinned copy changes a row's item; a move or a removal keeps
+    /// every other row's facts.
     async fn write(&mut self, w: Write) -> Vec<Input> {
         let at = now();
         let reload = !matches!(w, Write::State(..));
-        let counts = matches!(w, Write::Remove(_) | Write::Clear { .. });
+        let counts = matches!(w, Write::Remove(_));
+        let new_facts = matches!(w, Write::PinCopy(..));
         let r = self
             .deps
             .store
@@ -393,8 +409,8 @@ impl Engine {
                 let n = match &w {
                     Write::State(id, s) => crate::store::queue::set_state(c, *id, *s, at).map(|_| 0)?,
                     Write::Move { ids, to } => crate::store::queue::move_rows(c, ids, *to).map(|_| 0)?,
+                    Write::Order(ids) => crate::store::queue::reorder(c, ids).map(|_| 0)?,
                     Write::Remove(ids) => crate::store::queue::remove(c, ids)?,
-                    Write::Clear { played_only } => crate::store::queue::clear(c, *played_only)?,
                     Write::FromStart(id, on) => crate::store::queue::set_from_start(c, *id, *on).map(|_| 0)?,
                     Write::PinCopy(id, item) => crate::store::queue::pin_copy(c, *id, item).map(|_| 0)?,
                 };
@@ -407,7 +423,7 @@ impl Engine {
                     self.reply = Some(QueueReply::Removed(n));
                 }
                 let mut out: Vec<Input> = rows.map(Input::Rows).into_iter().collect();
-                if let Some(Input::Rows(rows)) = out.first() {
+                if new_facts && let Some(Input::Rows(rows)) = out.first() {
                     let rows = rows.clone();
                     if let Ok(f) = self.read(move |c, lib, view, _| Ok(facts(c, lib, view, &rows))).await {
                         out.push(Input::Facts(f));
@@ -458,7 +474,7 @@ impl Engine {
         let added: Vec<(crate::model::QueueId, ItemRef)> = added.ids.iter().copied().zip(rows.iter().map(|r| r.item.clone())).collect();
         tracing::info!("queue: added {} ({} refused, by {})", added.len(), refused.len(), if by == AddedBy::Agent { "agent" } else { "app" });
         if by == AddedBy::App
-            && let Some(text) = add_toast(&added, &refused, at, &list)
+            && let Some(text) = add_toast(&added, &refused, at, &self.machine.snapshot().rows)
         {
             self.deps.bus.toast(Toast::info(text));
         }
@@ -484,15 +500,21 @@ fn main_kind(s: &PlayerSnapshot) -> Option<Kind> {
     })
 }
 
-/// The app's toast after an add from the UI.
-fn add_toast(added: &[(crate::model::QueueId, ItemRef)], refused: &[(ItemRef, Refusal)], at: Insert, list: &[QueueEntry]) -> Option<String> {
+/// The app's toast after an add from the UI. `visible`: the snapshot's rows (a duplicate's place
+/// never counts rows it conceals).
+fn add_toast(
+    added: &[(crate::model::QueueId, ItemRef)],
+    refused: &[(ItemRef, Refusal)],
+    at: Insert,
+    visible: &[crate::queue::QueueRow],
+) -> Option<String> {
     if let [(item, why)] = refused
         && added.is_empty()
     {
         return Some(match why {
             Refusal::Duplicate => {
-                let pending = list.iter().filter(|r| !r.state.is_done());
-                match pending.clone().position(|r| &r.item == item) {
+                let mut pending = visible.iter().filter(|r| !r.entry.state.is_done());
+                match pending.position(|r| &r.entry.item == item) {
                     Some(i) => format!("Already in Up next ({})", ordinal(i + 1)),
                     None => "Already in Up next".into(),
                 }
@@ -592,15 +614,40 @@ fn row_facts(conn: &Connection, lib: &Library, view: ParentalView, r: &QueueEntr
     Ok(RowFacts { concealed: false, needs_pin: locked.unwrap_or(false) && !view.unlocked, unavailable: locked.is_none() || r.orphaned, catchup_days })
 }
 
-/// The episode after `ep` in its series, with its "S02E06 · Title" label.
-fn next_episode(conn: &Connection, ep: crate::model::EpisodeId) -> crate::error::Result<Option<NextEpisode>> {
+/// The episode after `ep` in its series, with its "S02E06 · Title" label and its series' name
+/// (the spoiler guard's subject); none when the series isn't in the library now.
+fn next_episode(conn: &Connection, lib: &Library, ep: crate::model::EpisodeId) -> crate::error::Result<Option<NextEpisode>> {
     let e = crate::store::vod::episode(conn, ep)?;
+    let Some(idx) = lib.vod.index_of(VodKind::Series(e.series_id)) else { return Ok(None) };
+    let series = lib.vod.series[idx as usize].name.to_string();
     let eps = crate::store::vod::episodes(conn, e.series_id, None)?;
-    Ok(eps
-        .iter()
-        .position(|x| x.id == ep)
-        .and_then(|i| eps.get(i + 1))
-        .map(|n| NextEpisode { id: n.id, label: format!("S{:02}E{:02} · {}", n.season, n.episode, crate::ui::widgets::rows::episode_title(n)) }))
+    Ok(eps.iter().position(|x| x.id == ep).and_then(|i| eps.get(i + 1)).map(|n| NextEpisode {
+        id: n.id,
+        label: format!("S{:02}E{:02} · {}", n.season, n.episode, crate::ui::widgets::rows::episode_title(n)),
+        series,
+        season: n.season,
+        episode: n.episode,
+    }))
+}
+
+/// Whether the next-episode countdown may play `id` now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EpisodeCheck {
+    Plays,
+    /// Its series is locked and the session is locked (the PIN window closed meanwhile).
+    Locked,
+    /// Gone, or explicit while hidden: nothing plays, nothing is said.
+    Gone,
+}
+
+fn episode_may_play(conn: &Connection, lib: &Library, view: ParentalView, id: crate::model::EpisodeId) -> crate::error::Result<EpisodeCheck> {
+    let e = crate::store::vod::episode(conn, id)?;
+    let item = ItemRef { source: e.source_id, kind: ItemKind::Episode, key: e.key.clone() };
+    if conceals(conn, lib, view, &item) {
+        return Ok(EpisodeCheck::Gone);
+    }
+    let Some(idx) = lib.vod.index_of(VodKind::Series(e.series_id)) else { return Ok(EpisodeCheck::Gone) };
+    Ok(if title_locked(lib, false, idx, false) && !view.unlocked { EpisodeCheck::Locked } else { EpisodeCheck::Plays })
 }
 
 /// What a row resolves to at play time.

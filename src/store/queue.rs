@@ -161,6 +161,25 @@ pub fn move_rows(conn: &Connection, ids: &[QueueId], to: Insert) -> Result<()> {
     })
 }
 
+/// Put `ids` in this order into the places they hold now (every other row keeps its place;
+/// unknown ids are ignored): "Shuffle the rest" in one transaction.
+pub fn reorder(conn: &Connection, ids: &[QueueId]) -> Result<()> {
+    atomic(conn, |c| {
+        let mut all: Vec<QueueId> = order(c)?.into_iter().map(|(id, _)| id).collect();
+        let mut seen = std::collections::HashSet::new();
+        let new: Vec<QueueId> = ids.iter().copied().filter(|id| all.contains(id) && seen.insert(*id)).collect();
+        let mut new = new.into_iter();
+        for slot in all.iter_mut() {
+            if ids.contains(slot)
+                && let Some(id) = new.next()
+            {
+                *slot = id;
+            }
+        }
+        write_order(c, &all)
+    })
+}
+
 /// Remove rows; positions stay dense.
 pub fn remove(conn: &Connection, ids: &[QueueId]) -> Result<usize> {
     atomic(conn, |c| {

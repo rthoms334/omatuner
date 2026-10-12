@@ -40,7 +40,8 @@ impl PlayerScreen {
             _ => {}
         }
         let s = qui::snapshot(ctx);
-        if let Some(card) = Card::of(&s, ctx.now) {
+        // the card shows (and takes its keys) in single view only
+        if let Some(card) = Card::of(&s, ctx.now).filter(|_| !ctx.multiview.on()) {
             // popped out, Esc is the pop-in key: the card has it first
             let key = if ctx.video_only && action == Action::TogglePopOut { Action::Back } else { action };
             if let Some(step) = card.key(key) {
@@ -99,9 +100,10 @@ impl PlayerScreen {
     }
 
     /// The Up next card over the video (above the bottom bar while it shows); popped out, a
-    /// strip along the bottom edge with glyph buttons.
+    /// strip along the bottom edge with glyph buttons. Single view only: in multi-view Up next
+    /// waits, and `n` says so.
     pub(super) fn draw_queue_card(&mut self, ui: &egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect) {
-        if !crate::queue::ENABLED {
+        if !crate::queue::ENABLED || ctx.multiview.on() {
             return;
         }
         let s = qui::snapshot(ctx);

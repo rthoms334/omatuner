@@ -19,7 +19,7 @@ pub mod ui;
 
 pub use model::{
     AddTarget, AddedBy, Blocked, Countdown, CountdownWhy, FinishedWhy, Insert, NextEpisode, PlayReply, QueueCommand, QueueEntry, QueueReply,
-    QueueRow, QueueSnapshot, Refusal, RowState, SleepMark, SleepRequest, Slot,
+    QueueRow, QueueSnapshot, Refusal, RowState, Slot,
 };
 pub use service::{EngineDeps, PlayerPort, QueueHandle};
 

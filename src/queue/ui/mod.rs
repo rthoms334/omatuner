@@ -41,38 +41,60 @@ use crate::ui::{OverlayRequest, UiCtx};
 pub const PIN_CODE: u8 = 250;
 
 /// The latest snapshot, as the spoiler guard lets it show (B4, Normal: a guarded programme's
-/// title, an episode's title). Every Up next UI piece reads it through here, which also starts
-/// (once per app) a watcher that repaints the window whenever the engine publishes: a countdown
-/// that starts while nothing else moves must still be drawn.
+/// title, an episode's title, the next-episode card's title). Every Up next UI piece reads it
+/// through here, which also starts (once per app) a watcher that repaints the window whenever
+/// the engine publishes: a countdown that starts while nothing else moves must still be drawn.
 pub fn snapshot(ctx: &UiCtx<'_>) -> Arc<QueueSnapshot> {
     remember(ctx);
     let raw = ctx.services.agent.queue();
-    if !crate::spoiler::ENABLED || raw.rows.is_empty() {
+    if !crate::spoiler::ENABLED || (raw.rows.is_empty() && raw.next_episode.is_none()) {
         return raw;
     }
-    // once per published snapshot and minute (the guard's windows move with the clock)
+    // once per published snapshot, minute (the guard's windows move with the clock) and guard
+    // stamp (a new guard snapshot, a reveal or a hide)
     thread_local! {
         static GUARDED: std::cell::RefCell<Option<Guarded>> = const { std::cell::RefCell::new(None) };
     }
-    let minute = ctx.now / 60;
+    let sp = crate::ui::widgets::spoiler::Spoilers::of(ctx);
+    let key = (ctx.now / 60, sp.stamp());
     GUARDED.with_borrow_mut(|g| {
-        if let Some((w, m, s)) = g.as_ref()
-            && *m == minute
+        if let Some((w, k, s)) = g.as_ref()
+            && *k == key
             && std::ptr::eq(w.as_ptr(), Arc::as_ptr(&raw))
         {
             return s.clone();
         }
-        let sp = crate::ui::widgets::spoiler::Spoilers::of(ctx);
-        let mut s = (*raw).clone();
-        s.rows = s.rows.iter().map(|r| crate::queue::QueueRow { entry: guarded(&sp, &r.entry), ..r.clone() }).collect();
-        let s = Arc::new(s);
-        *g = Some((Arc::downgrade(&raw), minute, s.clone()));
+        let s = Arc::new(guard_snapshot(&sp, &raw));
+        *g = Some((Arc::downgrade(&raw), key, s.clone()));
         s
     })
 }
 
-/// The guarded snapshot of (the raw one, the minute it was made for).
-type Guarded = (Weak<QueueSnapshot>, i64, Arc<QueueSnapshot>);
+/// The guarded snapshot of (the raw one, the minute and guard stamp it was made for).
+type Guarded = (Weak<QueueSnapshot>, (i64, (u64, u64)), Arc<QueueSnapshot>);
+
+/// `raw` with its rows' and next episode's text through the guard.
+fn guard_snapshot(sp: &crate::ui::widgets::spoiler::Spoilers, raw: &QueueSnapshot) -> QueueSnapshot {
+    let mut s = raw.clone();
+    s.rows = s.rows.iter().map(|r| crate::queue::QueueRow { entry: guarded(sp, &r.entry), ..r.clone() }).collect();
+    s.next_episode = s.next_episode.map(|n| guarded_next(sp, n));
+    s
+}
+
+/// The next-episode card's "S02E06 · Title": the title as the guard lets it show (the number
+/// always shows).
+fn guarded_next(sp: &crate::ui::widgets::spoiler::Spoilers, mut n: crate::queue::NextEpisode) -> crate::queue::NextEpisode {
+    use crate::guard::{Field, Subject};
+    let Some((num, title)) = n.label.split_once(" · ") else { return n };
+    let norm = crate::spoiler::series_key(&n.series);
+    let subj = Subject::Episode { series_norm: &norm, season: n.season as i32, episode: n.episode as i32 };
+    let label = match sp.text(&subj, Field::EpisodeTitle, title) {
+        Some(t) => format!("{num} · {t}"),
+        None => num.to_owned(),
+    };
+    n.label = label;
+    n
+}
 
 /// A row's title and subtitle through the guard: a programme slot's title, an episode's own
 /// title ("S02E05 · …" keeps its number).
@@ -295,6 +317,9 @@ type Removed = (u16, Vec<QueueEntry>, Option<QueueId>);
 /// Up next's Undo numbers (`Action::Undo(n)`, far above the copies' own numbers).
 const UNDO_BASE: u16 = 0xF000;
 static UNDO: Mutex<VecDeque<Removed>> = Mutex::new(VecDeque::new());
+/// Counts Undo numbers: a number comes back only after 4096 more removals, never while a toast
+/// that carries it may still show.
+static UNDO_NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
 
 /// Whether `n` is one of Up next's Undo numbers.
 pub fn is_undo(n: u16) -> bool {
@@ -319,7 +344,7 @@ pub fn remove(ctx: &mut UiCtx<'_>, s: &QueueSnapshot, ids: Vec<QueueId>) {
         return;
     }
     let mut q = UNDO.lock().unwrap_or_else(|e| e.into_inner());
-    let n = q.back().map_or(UNDO_BASE, |(k, ..)| k.checked_add(1).unwrap_or(UNDO_BASE));
+    let n = UNDO_BASE + UNDO_NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % (u16::MAX - UNDO_BASE + 1);
     q.push_back((n, undoable, before));
     while q.len() > 8 {
         q.pop_front();
@@ -597,6 +622,19 @@ pub fn mini_chip(ui: &egui::Ui, theme: &crate::theme::Theme, queue: &QueueSnapsh
     }
 }
 
+/// The sleep timer as the list marks it, when one is set.
+pub fn sleep_mark(ctx: &UiCtx<'_>) -> Option<list::SleepMark> {
+    use crate::reminders::sleep::SleepWhen;
+    let st = ctx.services.agent.sleep()?.status()?;
+    match st.when {
+        SleepWhen::At(t) => Some(list::SleepMark::At(t)),
+        // a film's end (when known) or a live programme's: the rows starting after it are late
+        SleepWhen::EndOfProgramme => st.fires_at.map(list::SleepMark::At),
+        SleepWhen::AfterItems(n) => Some(list::SleepMark::Items(st.items_left.unwrap_or(n))),
+        SleepWhen::EndOfQueue => Some(list::SleepMark::End),
+    }
+}
+
 /// Rows that are still to play (current first), for the panel's footer and Home's tile.
 pub fn to_go(s: &QueueSnapshot) -> impl Iterator<Item = &crate::queue::QueueRow> {
     s.rows.iter().filter(|r| matches!(r.entry.state, RowState::Current | RowState::Pending))
@@ -658,6 +696,32 @@ pub(crate) mod tests {
             assert_eq!(visible(&all), want, "move {moving} before {before:?}");
             assert_eq!(all.len(), 5, "nothing lost");
         }
+    }
+
+    /// The next-episode card of a series watched part-way: a later episode's title is guarded
+    /// (the number shows), the next-up one shows as is.
+    #[test]
+    fn the_next_episode_card_is_spoiler_guarded() {
+        use crate::spoiler::snapshot::{GuardSnapshot, SeriesMark, Settings};
+        let mut series = std::collections::HashMap::new();
+        series.insert(
+            crate::spoiler::series_key("Queue Guard Show"),
+            SeriesMark { label: "Queue Guard Show".into(), next_up: (2, 4), automatic: true, rule: None },
+        );
+        let guard = crate::guard::Guard::with_snapshot(GuardSnapshot::from_parts(Settings::default(), Vec::new(), series, Default::default()));
+        let sp = crate::ui::widgets::spoiler::Spoilers::with_guard(guard, 0, true);
+        let next = |episode: u32, title: &str| crate::queue::NextEpisode {
+            id: crate::model::EpisodeId(i64::from(episode)),
+            label: format!("S02E{episode:02} · {title}"),
+            series: "Queue Guard Show".into(),
+            season: 2,
+            episode,
+        };
+        let raw = QueueSnapshot { next_episode: Some(next(6, "Who Dies")), ..Default::default() };
+        let label = guard_snapshot(&sp, &raw).next_episode.unwrap().label;
+        assert!(label.starts_with("S02E06 · ") && !label.contains("Who Dies"), "{label}");
+        let raw = QueueSnapshot { next_episode: Some(next(4, "Fine")), ..Default::default() };
+        assert_eq!(guard_snapshot(&sp, &raw).next_episode.unwrap().label, "S02E04 · Fine");
     }
 
     #[test]
