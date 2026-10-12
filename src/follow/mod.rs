@@ -24,7 +24,7 @@ use crate::model::{FollowRuleId, Timestamp};
 
 /// The owning track flips this in its last commit; until then nothing evaluates, previews or
 /// shows (jobs exit at once, the UI hides its entries, MCP answers `unsupported`).
-pub const ENABLED: bool = false;
+pub const ENABLED: bool = true;
 
 /// One rule (`follow_rule` row).
 #[derive(Debug, Clone, PartialEq)]

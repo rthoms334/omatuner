@@ -422,8 +422,14 @@ impl TunerApp {
             AppEvent::Ipc(req) => self.handle_ipc(req),
             // the handler raised the window (`hypr::focus_self`) and validated the target
             AppEvent::Agent(crate::agent::AgentCommand::Play(p)) => self.on_agent_play(p.clone()),
-            // the batch features' events (owners: F-C, rui, MV-2) — nothing to do until they land
-            AppEvent::Follow(_) | AppEvent::Reminder(_) | AppEvent::Tile(_) => {}
+            // Following's summary when no notification server answered (F-C)
+            AppEvent::Follow(f) => {
+                if let Some(t) = crate::follow::ui::on_event(f) {
+                    self.toast(t);
+                }
+            }
+            // the batch features' events (owners: rui, MV-2) — nothing to do until they land
+            AppEvent::Reminder(_) | AppEvent::Tile(_) => {}
             AppEvent::Platform(p) => match p {
                 PlatformEvent::Quit => egui_ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 PlatformEvent::Raise => crate::platform::hypr::focus_self(),
