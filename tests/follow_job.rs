@@ -128,9 +128,28 @@ fn a_rule_keeps_its_reminders_in_step_with_the_guide() {
     let r = reminders(&s);
     assert_eq!(r.iter().map(|r| (r.start, r.switches())).collect::<Vec<_>>(), [(SAT + 24 * H, true)]);
 
-    // deleting a rule cancels the reminders it made
+    // editing the rule's mode and lead remakes its reminder with them
     let women_id = r[0].rule_id.unwrap();
-    assert_eq!(w(&s, move |c| store_follow::delete_rule(c, women_id, false)), 1);
+    let mut edited = store_follow::rule(&s.reader().unwrap(), women_id).unwrap().unwrap();
+    (edited.mode, edited.lead_s) = (FollowMode::Notify, 600);
+    w(&s, move |c| store_follow::save_rule(c, &edited, 100, NOW + 360));
+    evaluate(&s, FollowReason::Rules, NOW + 360).expect("evaluated");
+    let r = reminders(&s);
+    assert_eq!(r.iter().map(|r| (r.start, r.switches(), r.lead_s)).collect::<Vec<_>>(), [(SAT + 24 * H, false, 600)]);
+
+    // a second rule on the same match adopts that reminder; pausing the first hands it over
+    let mut gunners = FollowRule::draft("Gunners", FollowKind::Team, vec!["Arsenal Women".into()], &Default::default(), NOW);
+    gunners.spec.without.retain(|w| w != "Women");
+    let gunners_id = w(&s, move |c| store_follow::save_rule(c, &gunners, 100, NOW + 420));
+    evaluate(&s, FollowReason::Rules, NOW + 420).expect("evaluated");
+    assert_eq!(reminders(&s).len(), 1, "adopted, not doubled");
+    w(&s, move |c| store_follow::set_rule_enabled(c, women_id, false, NOW + 480));
+    evaluate(&s, FollowReason::Rules, NOW + 480).expect("evaluated");
+    let r = reminders(&s);
+    assert_eq!(r.iter().map(|r| (r.start, r.rule_id)).collect::<Vec<_>>(), [(SAT + 24 * H, Some(gunners_id))]);
+
+    // deleting a rule cancels the reminders it made
+    assert_eq!(w(&s, move |c| store_follow::delete_rule(c, gunners_id, false)), 1);
     assert!(reminders(&s).is_empty());
 }
 
@@ -163,4 +182,16 @@ fn a_news_flash_follows_the_bulletin_on_weekdays() {
     assert!(r.iter().all(|r| r.switches() && r.open_in == Some(OpenIn::PopOut)));
     let flash = store_follow::flash_of(&s.reader().unwrap(), r[0].id).unwrap().expect("a flash");
     assert_eq!(flash.spec.length, tuner::follow::flash::FlashLength::Headlines(5));
+
+    // at fire time: it pops up, but never in quiet hours or over a film (a notification)
+    use tuner::follow::flash::{FlashSkip, flash_skip};
+    let mut cfg = tuner::config::Config::default();
+    cfg.follow.news_flash.skip_when_fullscreen = false;
+    let reader = s.reader().unwrap();
+    let at = |cfg: &tuner::config::Config, main| flash_skip(&reader, cfg, &r[0], main, false, Vec::new(), r[0].start);
+    assert_eq!(at(&cfg, Some(tuner::playback::Kind::Live)), None);
+    cfg.follow.interrupt_vod = true;
+    assert_eq!(at(&cfg, Some(tuner::playback::Kind::Vod)), Some(FlashSkip::WouldInterrupt), "whatever interrupt_vod says");
+    (cfg.follow.news_flash.quiet_from_min, cfg.follow.news_flash.quiet_to_min) = (Some(0), Some(24 * 60));
+    assert_eq!(at(&cfg, None), Some(FlashSkip::QuietHours));
 }
