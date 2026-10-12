@@ -244,7 +244,17 @@ fn populate(s: &Store, creds: &Creds) -> Fixture {
                 rule_id: None,
             },
         )?;
-        epg::set_manual_mapping(c, &ch(m3u, "m3u:aa"), guide, "arte.de")?;
+        // Guide fixes: a mapping Claude picked (with the guide channel's name), your time shift
+        // and an "It's right"
+        epg::set_manual_mapping_as(c, &ch(m3u, "m3u:aa"), guide, "arte.de", Some("Arte HD"), FixActor::Claude)?;
+        let fixes = Proposal {
+            changes: vec![
+                FixChange { channel: Some(ch(xt, "xt:live:1")), shift_min: Some(Some(60)), ..Default::default() },
+                FixChange { channel: Some(ch(xt, "xt:live:2")), dismiss: Some(IssueKind::LooksWrong), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        tuner::store::guide_fix::apply(c, FixActor::You, "t", &fixes, &Default::default(), NOW)?;
         // "Not the same title" (DESIGN §29.11): the split survives a restore
         tuner::store::titles::set_split(c, &mv(xt, "xt:vod:7"), true, NOW + 4)?;
         // "Same title as…" (DESIGN §29.16): the join (both copies, one group) survives too
@@ -276,6 +286,9 @@ fn normalized(mut b: Backup) -> Backup {
     });
     b.manual_mappings.iter_mut().for_each(|m| m.source_id = sources[&m.source_id]);
     b.title_links.iter_mut().for_each(|t| t.item.source = src(t.item.source));
+    for c in b.features.guide_fix.iter_mut().flat_map(|v| v["channels"].as_array_mut().unwrap()) {
+        c["item"]["source"] = sources[&c["item"]["source"].as_i64().unwrap()].into();
+    }
     b
 }
 
@@ -292,9 +305,12 @@ fn export_wipe_restore_round_trip_is_lossless() {
     assert_eq!(b1.sources[0].xt_password.as_deref(), Some(creds.xt_pass.as_str()));
     assert_eq!(b1.epg_sources.len(), 2);
     assert_eq!((b1.fav_lists.len(), b1.fav_items.len()), (2, 4));
-    assert_eq!((b1.item_overrides.len(), b1.group_overrides.len(), b1.progress.len()), (2, 1, 1));
+    assert_eq!((b1.item_overrides.len(), b1.group_overrides.len(), b1.progress.len()), (3, 1, 1));
     assert_eq!((b1.history.len(), b1.reminders.len(), b1.manual_mappings.len()), (3, 1, 1));
-    assert_eq!(b1.manual_mappings[0].epg_source_name, "My guide");
+    let m = &b1.manual_mappings[0];
+    assert_eq!((m.epg_source_name.as_str(), m.epg_name.as_deref(), m.actor.as_deref()), ("My guide", Some("Arte HD"), Some("claude")));
+    let fixes = b1.features.guide_fix.as_ref().expect("the time shift and the dismissal");
+    assert_eq!(fixes["channels"].as_array().map(Vec::len), Some(2));
     let actions: Vec<(&str, Option<i64>)> = b1.title_links.iter().map(|t| (t.action.as_str(), t.group)).collect();
     assert_eq!(actions, [("join", Some(1)), ("join", Some(1)), ("split", None)]);
     assert!(b1.fav_items.iter().all(|e| !e.fingerprint.norm_name.is_empty()), "fingerprints travel with the data");

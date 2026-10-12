@@ -14,7 +14,7 @@ const MAX_HOURS: u32 = 24;
 
 /// `(base name, minutes)` for a time-shifted channel name: "Channel 4 +1" → ("channel 4", 60),
 /// "E4+1 HD" → ("e4", 60), "BBC One +24", "Quest Red + 1"; none for "Sky Sports+", "ITV4+",
-/// "5USA", "Dave ja vu". The base is lower-cased with its quality words dropped; compare it to
+/// "Canal+ 1", "5USA", "Dave ja vu". The base is lower-cased with its quality words dropped; compare it to
 /// a channel through `identity::normalize_name`.
 pub fn marker(name: &str) -> Option<(String, i32)> {
     // fast path: an ASCII name without '+' or "plus" (nearly all of them; called per channel)
@@ -44,8 +44,14 @@ pub fn marker(name: &str) -> Option<(String, i32)> {
     if hours == 0 || hours > MAX_HOURS {
         return None;
     }
-    let rest = s[..s.len() - digits].trim_end();
+    let raw = &s[..s.len() - digits];
+    let rest = raw.trim_end();
     let base = if let Some(b) = rest.strip_suffix('+') {
+        // a '+' glued to its word is the name's ("Canal+ 1", "Disney+ 1") unless the hours are
+        // glued to it too ("E4+1"); "Quest Red + 1" stands apart
+        if rest.len() != raw.len() && !b.is_empty() && !b.ends_with(char::is_whitespace) {
+            return None;
+        }
         b
     } else {
         // "plus 1" needs a space on both sides
@@ -75,9 +81,21 @@ mod tests {
         assert_eq!(marker("UK: Film4 +1 (UK)"), Some(("uk: film4".into(), 60)));
         assert_eq!(marker("Dave plus 1"), Some(("dave".into(), 60)));
         assert_eq!(marker("ITV2 +2h"), Some(("itv2".into(), 120)));
-        for none in
-            ["Sky Sports+", "ITV4+", "5USA", "Dave ja vu", "BBC1", "Channel 4", "+1", "Sky Sports+ HD", "Channel +0", "News +100", "Daveplus 1"]
-        {
+        for none in [
+            "Sky Sports+",
+            "ITV4+",
+            "5USA",
+            "Dave ja vu",
+            "BBC1",
+            "Channel 4",
+            "+1",
+            "Sky Sports+ HD",
+            "Channel +0",
+            "News +100",
+            "Daveplus 1",
+            "Canal+ 1",
+            "Disney+ 1",
+        ] {
             assert_eq!(marker(none), None, "{none}");
         }
     }

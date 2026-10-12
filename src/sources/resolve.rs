@@ -262,11 +262,10 @@ fn shown_shift(conn: &Connection, ch: &Channel) -> i32 {
     q.unwrap_or(ch.tvg_shift_min)
 }
 
-/// The catch-up offset: the channel's own, else its playlist's (`SourceSettings::guide`,
-/// DESIGN §31), else none. A channel offset of exactly 0 counts as unset (the channel load
-/// folds a missing override into 0).
+/// The catch-up offset: the channel's own (0 included), else its playlist's
+/// (`SourceSettings::guide`, DESIGN §31), else none.
 fn catchup_offset(ch: &Channel, src: &Source) -> i64 {
-    if ch.catchup_offset_s != 0 { ch.catchup_offset_s } else { src.settings.guide.catchup_offset_s.unwrap_or(0) }
+    ch.catchup_offset_s.or(src.settings.guide.catchup_offset_s).unwrap_or(0)
 }
 
 fn xtream_creds(src: &Source) -> Result<&XtreamCredentials> {

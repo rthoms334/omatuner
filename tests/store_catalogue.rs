@@ -1046,7 +1046,7 @@ fn live_reads_groups_and_failure_cache() {
     let r = s.reader().unwrap();
     let ch = live::channel_by_ref(&r, &a).unwrap().unwrap();
     assert_eq!(ch.display_name(), "A!");
-    assert_eq!(ch.catchup_offset_s, 30);
+    assert_eq!(ch.catchup_offset_s, Some(30));
     assert_eq!(ch.headers.user_agent.as_deref(), Some("UA"));
     assert_eq!(ch.catchup.as_ref().unwrap().days, 3);
     assert!(ch.locked, "locked through its Premium group");

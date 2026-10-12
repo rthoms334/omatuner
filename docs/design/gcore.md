@@ -82,14 +82,15 @@ A row's `why` is a fixed phrase and never contains a URL.
 
 ## The guide check job
 
-`jobs::guide_check::run` works in this order:
-1. It debounces for 30 s. Requests coalesce, because the job hasn't read its inputs yet.
-2. It takes a library snapshot.
-3. It runs `check_now`:
-   - It clears the cache together with the new stamp when the stamp changed.
-   - It scores unmapped shown channels without cached rows, in chunks of 256 on 2 threads.
-   - It pauses while `player_busy` and can be cancelled between chunks.
-   - It writes each chunk in its own transaction.
-4. It ends with `DataScope::GuideIssues`.
+A check is requested with `jobs::guide_check::request` (B7 `after_guide`, after a guide import or rematch) or `request_from` (the UI, after a rule or mapping change). The request waits 30 s outside the jobs, so the "features" lane stays free and the Jobs overlay shows nothing; requests meanwhile join the waiting one (`JobContext::guide_check_pending`). Headless (`tuner --refresh`, no `JobContext::shared`) nothing is requested and `run` does nothing. The Guide fixes screen submits a check at once when its report finds the cache behind (a playlist refresh, a threshold change).
 
-Suggestions are cached from a score of 0.8 up. The issue list applies the user's threshold.
+`jobs::guide_check::run` works in this order:
+1. It takes a library snapshot.
+2. It runs `check_now`:
+   - It clears the cache together with the new stamp when the stamp changed.
+   - It scores unmapped shown channels without cached rows, in chunks of 256 on 2 threads. Hidden channels are not scored; with "Include hidden" the screen scores the rows it draws.
+   - It pauses while `player_busy` and can be cancelled between chunks.
+   - It writes each chunk in its own transaction. A channel without any candidate gets a marker row (`rank = -1`), so each channel is scored once per stamp.
+3. It ends with `DataScope::GuideIssues`.
+
+Suggestions are cached from a score of 0.8 up, or from the user's threshold when it is lower. The issue list applies the threshold.
