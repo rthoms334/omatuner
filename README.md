@@ -219,6 +219,11 @@ and [Artemis I Launch (Press Site)](https://images.nasa.gov/details/Artemis%20I%
   opened in the pop-out, the full window or where you are; reminders fire even while Tuner is
   closed (systemd user timers). The sleep timer (`Ctrl+Shift+T`) stops or pauses after a time,
   at the end of the programme, after N episodes or at the end of Up next.
+- **Use it from Claude:** ask Claude Code in a terminal — "put the touring cars on",
+  "something light under 2 hours", "follow Arsenal, spoiler-safe", "why is the guide empty?" —
+  and it finds, plays, queues, plans and fixes things in Tuner through a built-in MCP server and
+  the omatuner plugin's seven skills. Claude never sees stream addresses or logins, can't unlock
+  anything and asks before changing things. See [Use Tuner from Claude](#use-tuner-from-claude).
 - **Desktop:** MPRIS (media keys and the Omarchy bar's media widget), desktop notifications for
   reminders, and an idle inhibitor while video plays. It runs as a single instance and opens
   M3U files and links from the desktop.
@@ -1064,13 +1069,13 @@ Only one Tuner runs per profile. A second `tuner …` hands its request to the r
 ## Use Tuner from Claude
 
 Tuner includes an [MCP](https://modelcontextprotocol.io) server, so you can ask Claude Code (or
-another MCP client) in a terminal to find something and play it, instead of browsing.
+another MCP client) in a terminal to find, play, plan and fix things in Tuner instead of
+browsing for them.
 
-**The omatuner plugin (recommended)** adds the server and seven skills that know how to use it:
-*watch* (live TV and "what's on"), *pick* (a film or series for tonight), *series* (carry on,
-catch up), *plan* (reminders, switches, Following rules, news flashes, Up next, the sleep
-timer), *kids* (a safe line-up and parental locks), *fix* (guide fixes and playback trouble)
-and *discover* (what's trending that your playlists have). Install it once:
+### Set it up
+
+**The omatuner plugin (recommended)** adds the server and seven skills that know how to use it
+(see [What you can ask](#what-you-can-ask)). Install it once:
 
 ```sh
 claude plugin marketplace add rthoms334/omatuner
@@ -1090,40 +1095,78 @@ claude mcp add --scope user tuner -- tuner mcp
 `--scope user` makes it available in every directory; without it, Claude Code only offers it
 in the directory you ran the command in. `claude mcp list` shows whether it is connected.
 
-Then ask, for example:
+### What you can ask
 
-- "Touring cars is on" — Claude searches the guide. If the race is live, Tuner switches to it.
-  If it starts later, Claude tells you when and can schedule a switch: Tuner then changes
-  channel by itself at the start, with a *Switching in 10 s · Cancel* toast first.
-- "Something light under 2 hours" — Claude looks through your movie categories, picks an
-  unwatched film and starts it.
-- "What's on BBC One at 9?", "Carry on with my series", "Pause", "Volume to 40".
-- "Follow Arsenal, spoiler-safe", "Pop up the 1 o'clock news every weekday, headlines only",
-  "Put both semis on side by side", "Queue the next three episodes and stop after them",
-  "Why is the guide empty on half my channels?".
+Claude picks the right skill from what you say; you don't have to name it.
 
-How it works and what it can't do:
+| Skill | Ask, for example | What Claude does |
+|---|---|---|
+| *watch* | "Touring cars is on", "I missed the news, play it from the start", "What's on BBC One at 9?", "Put both semis on side by side", "Switch me over at kick-off" | Searches the guide and plays it live, from the start or from catch-up. Something that starts later gets a scheduled switch: Tuner changes channel by itself at the start, with a *Switching in 10 s · Cancel* toast first. Two live channels open in multi-view. |
+| *pick* | "Something light under 2 hours", "Like *Arrival*", "Surprise me", "A film for the four of us", "Line up the Bourne films in order" | Browses your movie and series categories by mood, runtime, rating, year or cast, picks something unwatched and starts it or adds it to Up next. |
+| *series* | "Carry on with my series", "Where am I in *Slow Horses*?", "Recap season 1", "Which episode is the one where…", "Next three, then stop" | Finds your progress across every copy, plays the next episode, recaps without spoiling what's ahead, and queues episodes with a sleep timer after them. |
+| *plan* | "Plan my Saturday", "Follow Arsenal, spoiler-safe", "Pop up the 1 o'clock news every weekday, headlines only", "What clashes tonight?", "Stop at 11" | Sets reminders and automatic switches, adds Following rules (including news flashes in the pop-out) after showing you what they'd match, lists or cancels them, and sets the sleep timer. |
+| *kids* | "Something for a 6-year-old", "Is *Coraline* OK for her?", "What finishes before bedtime?", "Lock that film" | Picks from kids' and family categories by age, checks content ratings, plans viewing that ends before bedtime, and adds parental locks. |
+| *fix* | "This channel keeps buffering", "Is it me or the provider?", "The guide is an hour off", "Fix my guide", "When does my subscription expire?" | Reads playback health and your playlists' status to tell an outage, a connection limit, a dead channel and a local problem apart. Finds a better copy of a channel, and proposes guide fixes with a before/after preview. |
+| *discover* | "What's trending this week?", "Netflix top 10", "Best-reviewed films I've got", "Is *Dune* any good?" | Looks the list up on the web, matches it against your library, and plays, queues or saves the ones you have to a "Trending" list. Web data is labelled with its source and date. |
+
+Small requests work without a skill too: "Pause", "Volume to 40", "Back to the last channel",
+"Move it to the pop-out", "What am I watching?".
+
+### What Claude asks first
+
+Claude reads freely but asks before it changes something you'd notice. The *Never* list and the
+confirm card are enforced by Tuner itself, whatever Claude is told:
+
+- **Before acting:** following a show or team (Claude shows the matches and what it left out
+  first), a reminder that switches channel, more than three reminders or Up next items, clearing
+  or replacing Up next, guide fixes, favourites changes, spoiler-guard rules and new locks.
+- **In Tuner, not in chat:** guide fixes to more than 50 channels open a confirm card for you to
+  press Enter. Moving the playing picture to another playlist for multi-view asks first, because
+  it pauses for up to 30 seconds.
+- **Undo:** rules Claude adds are marked as Claude's and toast with **Undo**. Guide fixes have
+  their own undo, and favourites changes can be undone in Tuner.
+- **Never:** unlocking, changing the PIN, showing explicit content, turning a rule's
+  spoiler-safe off, or removing your own spoiler rules. Tuner refuses them whatever Claude sends.
+
+### Tools
+
+The plugin's skills use these 28 tools; with *just the tools* Claude uses them directly. Their
+full descriptions are in `src/agent/tools.rs` and `src/agent/tools_batch.rs`.
+
+| Area | Tools |
+|---|---|
+| Find | `guide_search` (programmes by title, category or time window), `whats_on` (what's on at a time), `search` (channels, movies and series by name), `details` (plot, cast, what's on next, other copies), `categories`, `browse` (filters for picking by mood), `episodes`, `continue_watching`, `favourites`, `history`, `match_titles` (which titles from a web list you have) |
+| Play | `play`, `control` (pause, volume, mute, previous channel, pop-out), `status`, `multiview`, `queue` (Up next), `sleep_timer` |
+| Plan | `reminders` (notify or switch), `schedule_switch`, `cancel_switch`, `follow` (Following rules and news flashes) |
+| Look after | `spoiler_guard`, `guide_fix`, `favourites_edit`, `lock` (add locks only), `parental_status`, `diagnose` (playback health), `sources` (account status, expiry, connections, guide coverage) |
+
+### How it works and what Claude can't see
 
 - `tuner mcp` talks to the running Tuner over its local socket. Only programs running as your
   user can reach it.
 - If Tuner isn't open, the first request that searches or plays something starts it and waits
   a few seconds for it. Asking what is playing, or pause and volume requests, never start it.
   A Tuner started this way keeps running when you close Claude.
-- After updating Tuner, restart it once: an older Tuner that is still running can't answer the
-  new `tuner mcp`, and Claude tells you so.
+- Reminders, Following rules, Up next and the sleep timer live in Tuner, so they keep working
+  after you close Claude. Reminders fire even while Tuner is closed.
 - Claude only sees what Tuner shows you: hidden channels and categories, categories your country
   filter hides, and explicit content hidden by parental control stay out of every answer.
 - Locked items are listed as locked. Playing one makes Tuner ask for your PIN **on its own
-  screen**. The PIN never goes through Claude, and Claude will not ask you for it. Claude can
-  lock but never unlock, never shows explicit content and never loosens a setting: it can't
-  turn a rule's spoiler-safe off, remove your own spoiler rules, or apply a guide fix to more
-  than 50 channels from chat (Tuner shows those in a confirm card for you to press Enter). Rules Claude adds are marked and toast with **Undo**.
+  screen**. The PIN never goes through Claude, and Claude will not ask you for it.
+- The spoiler guard covers Claude's answers too: a guarded result comes back as "hidden by your
+  spoiler guard", and Claude won't search the web for a guarded event.
 - Claude gets names, times and programme details, never stream addresses or your logins.
   Playlist names are shared too, and a playlist you didn't rename is named after its server:
   rename it (Settings ▸ Playlists) if you'd rather Claude didn't see that. Web links inside
-  programme descriptions show as `[link]`.
+  programme descriptions show as `[link]`. Your watch history is used to pick and carry on,
+  never published.
 - Titles and descriptions come from your providers. Claude is told to treat them as data, not
   as instructions.
+
+### If Claude can't reach Tuner
+
+- After updating Tuner, restart it once: an older Tuner that is still running can't answer the
+  new `tuner mcp`, and Claude tells you so.
 - Use `tuner mcp --profile-dir <dir>` (and `claude mcp add tuner -- tuner mcp --profile-dir
   <dir>`) to reach a Tuner started with that profile.
 - `tuner mcp` writes its own messages to stderr, which Claude Code keeps in its MCP server log.
