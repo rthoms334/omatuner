@@ -224,7 +224,8 @@ and [Artemis I Launch (Press Site)](https://images.nasa.gov/details/Artemis%20I%
   "why is the guide empty?" — and it finds, plays, queues, plans and fixes things in Tuner through
   a built-in MCP server (for Claude Code there is also a plugin with seven skills). The agent
   never sees stream addresses or logins, can't unlock anything and asks before changing things,
-  and Tuner shows which agent made a change. See
+  and Tuner shows which agent made a change. Tuner offers to connect the agents it finds on your
+  computer, and Settings ▸ AI agents connects, updates and disconnects them. See
   [Use Tuner from an AI agent](#use-tuner-from-an-ai-agent).
 - **Desktop:** MPRIS (media keys and the Omarchy bar's media widget), desktop notifications for
   reminders, and an idle inhibitor while video plays. It runs as a single instance and opens
@@ -329,6 +330,10 @@ With no playlists, Tuner opens a single onboarding card with these steps:
 7. **Done:** counts per kind, and how much of the playlist the guide covers (see below).
 
 Esc steps back. Everything works from the keyboard.
+
+Once onboarding is done, and once per Tuner version, Tuner may also offer to connect the AI
+agents it finds on your computer (Claude Code, Codex, Gemini CLI, Copilot CLI, opencode). Esc
+says *Not now*; see [From Tuner](#from-tuner-settings--ai-agents).
 
 ## Adding sources
 
@@ -1054,7 +1059,7 @@ tuner claude-setup [--apply]
 | `--refresh` | Refresh stale playlists and guides without a window, then exit (status 1 if a refresh failed). Does nothing while Tuner is running, because the open window refreshes on its own. While it runs, starting Tuner waits a few seconds and then says (also as a desktop notification) that a background refresh is running. A playlist it upgraded to its Xtream login is announced the next time Tuner opens. |
 | `PLAYLIST_OR_URL…` | An `.m3u`/`.m3u8` file opens the add-playlist card. A stream URL or media file plays straight away. `file://` URIs are treated as paths. |
 | `mcp` | Run the MCP server on stdin/stdout for an AI agent (Claude Code, Codex, Gemini CLI or any other MCP client; see [Use Tuner from an AI agent](#use-tuner-from-an-ai-agent)). |
-| `claude-setup` | Show how to connect Claude Code to Tuner (the omatuner plugin). `--apply` runs the plugin steps after asking on the terminal. |
+| `claude-setup` | Show how to connect Claude Code to Tuner (the omatuner plugin). `--apply` runs the plugin steps after asking on the terminal. Settings ▸ AI agents does the same from inside Tuner, for other agents too. |
 | `--help`, `--version` | Usage and version. |
 
 No screen shows a channel's `--play` reference yet. With the `sqlite3` tool you can look it up:
@@ -1076,8 +1081,67 @@ play, plan and fix things in Tuner for you instead of you browsing for them.
 
 ### Connect your agent
 
-`tuner mcp` is a local (stdio) server: the command is `tuner` and its argument is `mcp`. Add it
-once in your agent's MCP settings.
+`tuner mcp` is a local (stdio) server: the command is `tuner` and its argument is `mcp`. Tuner can
+add it to the agents it finds for you, or you add it once in your agent's MCP settings.
+
+#### From Tuner (Settings ▸ AI agents)
+
+**The offer.** The first time Tuner starts after an install or an update, it looks for agent
+command-line tools on your computer. If it finds one that isn't connected to Tuner yet, it asks
+once, for example *Connect Claude Code to Tuner?* It waits until onboarding is done and never
+covers the player, full screen, the pop-out or another dialog.
+
+- **Enter** (*Connect*) connects it in the background. A toast says when it's done, or what the
+  agent's tool answered when it failed. Restart Claude Code, or start a new session of the other
+  agents, to use it.
+- **Esc** (*Not now*) asks again only after the next Tuner update.
+- Tick **Don't ask again** and it never asks again. *Offer to connect agents after updates* in
+  Settings ▸ AI agents turns the offer back on.
+- When it finds several agents, the card lists them and ticks only the first (Claude Code, when
+  it's there). Tab moves, Space ticks or unticks. Everything works with the mouse too.
+
+**Settings ▸ AI agents** lists the agents found on this computer, each with its status:
+*Connected · plugin 0.2.2*, *Connected · MCP server only (no skills)*, *Update available*,
+*Turned off in Claude Code*, *Needs repair* (the plugin's folder is gone; Repair connects it
+again), *Connected*, *Not connected* (Cursor: *add it by hand*) or *Couldn't check* with the
+reason. Enter or a click on an agent opens its menu: *Connect* (*Repair*, or *Add Tuner's
+plugin* when Claude Code has only the MCP server), *Update to <version>*, *Disconnect…* (asks
+first), *Copy the setup command* and *Copy the README link*. *Check again* reads every status again. The page also says
+which agents it didn't find, and which agent used Tuner last ("Last used by Claude, 2 h ago").
+
+| Agent | Connect runs | Disconnect runs |
+|---|---|---|
+| Claude Code | `claude plugin marketplace add /usr/share/tuner/claude` (`rthoms334/omatuner` when Tuner wasn't installed from the package), then `claude plugin install omatuner@omatuner --scope user` | `claude plugin uninstall omatuner@omatuner --scope user`, then `claude plugin marketplace remove omatuner` |
+| Codex | `codex mcp add tuner -- tuner mcp` | `codex mcp remove tuner` |
+| Gemini CLI | `gemini mcp add -s user tuner tuner mcp` | `gemini mcp remove -s user tuner` |
+| Copilot CLI | `copilot mcp add tuner -- tuner mcp` | `copilot mcp remove tuner` |
+| opencode | `opencode mcp add tuner -- tuner mcp` | By hand: opencode has no remove command. The menu copies where the `tuner` entry is. |
+| Cursor | By hand: *Copy the setup (JSON)*, add it to `~/.cursor/mcp.json`, then approve Tuner in Cursor | By hand |
+
+(Tuner adds `--json` to the `claude plugin` commands so it can read their answers.)
+
+- Claude Code gets the omatuner plugin: the tools and the seven skills. The other agents get the
+  MCP server and its 28 tools (the skills are written for Claude Code).
+- **Keeping the plugin up to date:** Claude Code records which plugin version it installed.
+  After a Tuner update, with *Keep Claude Code's plugin up to date after Tuner updates* on (the
+  default), Tuner runs `claude plugin marketplace update omatuner` and `claude plugin update
+  omatuner@omatuner` once and toasts the result. Restart Claude Code to apply it.
+- Gemini CLI only uses MCP servers in folders you trust.
+- Tuner runs each tool from your home folder with no input, so a tool that waits for a login or
+  a question is stopped after two minutes (a status check after 15 seconds) and the error is
+  shown. Besides your `PATH`, it looks in `~/.local/bin`, mise's shims, `~/.bun/bin`,
+  `~/.npm-global/bin` and `~/.volta/bin`, so a Tuner started from the launcher finds the same
+  tools as your terminal. It reads only the `tuner` entry of an agent's settings and never writes
+  them itself.
+- VS Code, Zed and other agents aren't listed: the page's *Other agents* note copies `tuner mcp`,
+  the VS Code command or a link to this section.
+- The package doesn't connect anything when you install it: pacman runs as root, and an agent's
+  settings live in your home folder. It only prints where to do it.
+- Connections belong to this computer, so restoring a backup keeps this computer's AI agents
+  settings.
+
+The rest of this section does the same by hand, for agents Tuner doesn't list or if you prefer
+the terminal.
 
 #### Claude Code
 
@@ -1091,7 +1155,7 @@ claude plugin install omatuner@omatuner
 
 The Arch package also ships the marketplace under `/usr/share/tuner/claude/`, and `tuner
 claude-setup` prints the steps for your install (`tuner claude-setup --apply` runs them after
-asking).
+asking). Settings ▸ AI agents runs the same steps from inside Tuner.
 
 **Just the tools**, without the skills:
 
@@ -1232,6 +1296,8 @@ use them directly. Their full descriptions are in `src/agent/tools.rs` and
 
 ### If your agent can't reach Tuner
 
+- Settings ▸ AI agents shows whether each agent it found is connected. *Repair* or *Connect*
+  there sets it up again; *Couldn't check* shows what the agent's tool said.
 - After updating Tuner, restart it once: an older Tuner that is still running can't answer the
   new `tuner mcp`, and `tuner mcp` says so.
 - Use `tuner mcp --profile-dir <dir>` to reach a Tuner started with that profile (for Claude
@@ -1414,6 +1480,10 @@ leaves the pop-out where it is ("Nothing playing"); its page is waiting when you
   Passwords, usernames, tokens, URL credentials and Xtream path segments become `***`. The log
   still names your playlists and channels, so read an exported log before sharing it.
 - **MPRIS** exposes the title, channel and logo URL of what is playing, and nothing else.
+- **AI agents:** Tuner runs an agent's own tool only when you connect, update or disconnect it,
+  or to check its status (and, when you connected Claude Code, to keep its plugin up to date).
+  It reads only the `tuner` entry of the agent's settings, and the log keeps the commands and
+  their redacted results, never the settings themselves.
 - **Backups** leave passwords out unless you tick *Include passwords*.
 - **The parental PIN** is a speed bump for children, not security.
 

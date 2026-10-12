@@ -2063,6 +2063,7 @@ favourites lists) show a 󰇙 drag grip and move with Alt+↑/↓ or K/J. Every 
 | Backup | export (include passwords? history?) · import (merge/replace, restore settings?) | §19 | — |
 | Hidden items | unhide groups/channels/VOD | overrides | — |
 | Orphans | Enter = attach to…, Delete/x → menu with Forget | §8.3 | — |
+| AI agents (§39, after Parental) | offer to connect agents after updates · keep Claude Code's plugin up to date · per agent: Connect / Update / Disconnect… / Copy | `agents.offer_connect`, `agents.keep_in_sync` (+ `agents.checked_version`) | on · on |
 | About & logs | version, paths, debug logging, log viewer, export log | `general.debug_log` | off |
 Per channel (Ctrl+I "Edit information", `OverlayRequest::EditItem`, WP-11): rename, catch-up
 offset (minutes), EPG assignment, lock, hide.
@@ -3090,6 +3091,8 @@ for any window. Tuner does it for itself with `o` in the player or Ctrl+Shift+O 
   depends mpv/xz/fontconfig/JetBrains Mono Nerd/wayland/mesa; builds the local checkout into
   `packaging/src/target`, installs the snippets under `/usr/share/tuner/`, the docs under
   `/usr/share/doc/tuner/` and `LICENSE` under `/usr/share/licenses/omatuner/`).
+  `packaging/omatuner.install` (`install=`, next to the PKGBUILD so makepkg finds it in CI's copy
+  of the checkout too) only echoes where to connect an AI agent (§39.8); it runs nothing.
 * **Names**: the repository (<https://github.com/rthoms334/omatuner>) and the Arch package
   (`pkgname=omatuner`) are *omatuner*; everything the user sees or configures keeps *tuner*: the
   app name "Tuner", the command `/usr/bin/tuner`, the desktop entry/icon/app id `tuner`, the
@@ -4954,7 +4957,8 @@ read at Delete, a join of one dropped (`store_catalogue`); 0007's re-run keeps `
 The user prompts an AI agent (Claude Code, Codex, Gemini CLI, Cursor, VS Code with Copilot, or
 any other MCP client); the agent talks to Tuner through an MCP server that the `tuner` binary
 itself provides. Tuner names the agent on its own screens by the name its client reports
-(§30.12).
+(§30.12), and connects the agents it finds from its own first-start card or Settings ▸ AI agents
+(§39).
 
 ### 30.1 Decisions
 1. **`tuner mcp`** is an MCP server over stdio for any MCP client (`claude mcp add tuner --
@@ -5779,7 +5783,9 @@ returns a log line or a URL.
 * Install: `claude plugin marketplace add rthoms334/omatuner` then `claude plugin install
   omatuner@omatuner`. Without the plugin: `claude mcp add tuner -- tuner mcp` (tools only).
   The Arch package ships the marketplace under `/usr/share/tuner/claude/`; `tuner claude-setup`
-  prints the steps, `--apply` runs them after a "y" on the terminal.
+  prints the steps, `--apply` runs them after a "y" on the terminal. Since §39 Tuner runs the
+  same steps itself (the first-start card, Settings ▸ AI agents) and keeps the installed plugin's
+  version in step with Tuner's.
 * `claude plugin validate ./plugins/omatuner --strict` and `claude plugin validate .` pass; a
   test checks every `allowed-tools` name is a real tool and that the plugin's version follows
   the app's.
@@ -5799,3 +5805,159 @@ returns a log line or a URL.
   synthetic catalogue (80k channels, 300k movies, 40k series, 2.5k categories) the default rule
   loads in about 350 ms (was 650 ms); `benches/startup.rs` gates it under 550 ms and the rule's
   cost at 1.25× the rule with titles kept. Builds of 1 s or more log their steps at info.
+
+## 39. Connecting AI agents (the card and Settings ▸ AI agents)
+
+CLI behaviour verified 2026-10-12 against claude 2.1.296, codex-cli 0.162.1, gemini 0.63.0,
+Copilot CLI 1.0.95, cursor-agent 2026.10.01 and opencode 1.18.35, every mutating command in a
+throwaway `HOME`. Extends §30 and §37.
+
+**Problem (user report, 0.2.2).** After installing the package, Claude Code knew nothing about
+Tuner: the plugin under `/usr/share/tuner/claude` is opt-in and nothing said so. **User decision
+(2026-10-12):** "build the first-run card and connect it now" and "We should also have a way to
+do it in settings also".
+
+### 39.1 Decisions
+1. **The package never connects anything.** pacman runs scriptlets as root, an agent's settings
+   live in the user's home (Arch packages must not write to `/home`), and they belong to another
+   app. The package only ships the plugin and echoes a hint (§39.8); Tuner, running as the user,
+   does it when the user says so.
+2. **Six agents known, five automated.** Claude Code gets the **plugin** (tools + 7 skills);
+   Codex, Gemini CLI, Copilot CLI and opencode get **plain MCP** (`tuner mcp`): the skills use
+   Claude Code's plugin tool names and `${CLAUDE_SKILL_DIR}`, and their plugin routes are
+   untested in real sessions. opencode has no remove command, so its Disconnect is by hand.
+   Cursor is copy-and-paste only (no `mcp add`; the user approves servers per workspace in
+   Cursor anyway). VS Code, Zed and others get an *Other agents* note with Copy actions.
+3. **Only the agents' own CLIs write their settings.** Tuner reads status (the `tuner` entry
+   only) but never writes another app's config file: comments and formats are the CLI's
+   business, and a CLI that changes its format keeps working.
+4. **Status reads never start MCP servers.** `claude mcp list/get`, `gemini mcp list`,
+   `cursor-agent mcp list` and `opencode mcp list` health-check by spawning every configured
+   server (including `tuner mcp` and the user's others), so they are never called; Tuner uses
+   `claude plugin list --json`, `codex|copilot mcp get --json tuner` or the config files.
+5. **One card per Tuner version, no nagging.** It shows only when a found, automatable agent is
+   not connected; *Not now* waits for the next upgrade; *Don't ask again* is the same switch
+   as the Settings toggle (`offer_connect = false`), so the user can see why it stopped.
+6. **Keeping the plugin in sync is automatic** (`keep_in_sync`, on): the user opted in by
+   connecting, Claude Code caches the plugin by version, and the update is cosmetic for the
+   packaged folder (it loads in place) but needed for a GitHub-sourced install. A toast says it.
+7. **No new key bindings.** The card is a `Modal`, the page a `Panel` with the row menu, so the
+   README key tables and `?` help are unchanged.
+
+### 39.2 Config (`[agents]`, `config::AgentsConfig`)
+`offer_connect` (true), `keep_in_sync` (true), `checked_version: Option<String>` (the Tuner
+version whose start check finished: the card was answered, or there was nothing to offer;
+`None` on a new install or an upgrade from 0.2.2 or older). `connect::should_check` = (either
+switch on) and `checked_version` ≠ this version. Machine-local: `Config::restored` keeps this
+machine's `[agents]` from a restored backup (connections are per computer).
+
+### 39.3 The service (`agent::connect`, `Services::agent_connect`)
+`AgentConnect` owns detection, status, operations, the start-of-version pass and "last used".
+The UI reads `rows()` snapshots (`AgentRow { id, status, busy, last, last_used }`) each frame;
+`refresh`, `refresh_if_stale` (30 s; the page's `enter`) and `run(ids, op)` work in the
+background and request a repaint on every change. `run` has **one queue**, so two CLI changes
+never overlap; each result is toasted and that agent's status read again. `start_pass` (≥ 3 s
+after start) refreshes, runs Claude's Update when `keep_in_sync` and the plugin is
+behind, then `decide`s: `Offer` (found, automatable, not connected; `AgentId` order, the first
+ticked), `Settled` (agents found but nothing to offer, or `offer_connect` off: record
+`checked_version` now) or `Retry` (nothing found: record nothing, the next start looks again).
+`shutdown` kills running children before the runtime stops. A refresh's `refreshing` flag is
+cleared by a drop guard (a task dropped at shutdown or a panic can't wedge it), and the pass
+waits at most 60 s for a refresh it didn't start.
+
+**Only on the user's own desktop.** `for_services(paths, …)` uses the `NullRunner` (and never
+starts the pass) off the desktop (`platform::off_desktop`: unit tests, `keep_off_desktop`,
+`TUNER_NO_DESKTOP`) or when `AppPaths::home` isn't `$HOME` (a test profile with a fake home).
+The integration harnesses (`agent_e2e`, `e2e_flows`, `e2e_soak`) call `keep_off_desktop` too.
+
+Statuses: Checking, Not found, Not connected, Connected (plugin + version, MCP only, or MCP),
+Update available (Claude: `version` older than `folderVersion`, or a GitHub install older than
+Tuner — until Claude's own update calls that version up to date, which the service remembers
+for the session), Turned off (`enabled: false`), Needs repair (plugin entry with `errors`, e.g. the package's
+folder is gone; Repair = Connect), Couldn't check (redacted first line, ≤ 120 chars).
+
+### 39.4 Running agent CLIs (`connect::runner`)
+`CommandRunner` (`which`, `run`) behind a trait: `SystemRunner` in production, `NullRunner`
+off the desktop (tests, `TUNER_NO_DESKTOP`: spawns nothing), `FakeRunner` (cfg(test), scripted
+answers, records every argv). `SystemRunner` rules:
+* argv, no shell; stdin closed; cwd `$HOME` (no project scopes or folder-trust prompts);
+  inherited env plus `GIT_TERMINAL_PROMPT=0`, `NO_COLOR=1`, Copilot `COPILOT_AUTO_UPDATE=false`;
+  `PATH` plus `~/.local/bin`, mise's shims, `~/.bun/bin`, `~/.npm-global/bin`, `~/.volta/bin`
+  (a launcher-started Tuner may lack the shell's PATH).
+* Timeouts 15 s (status) and 120 s (changes; Claude's own clone timeout); stdout and stderr
+  drained on threads (capped at 1 MiB each, no pipe deadlock); its own process group, killed
+  whole (node and git grandchildren too) on timeout or shutdown, and after a normal exit when
+  something it left running still holds the output open 2 s later (so no reader thread stays).
+* Logged at info for changes: the command line and `ok` / `exit N` with the redacted first line
+  of the result; status reads only their outcome at debug. Never the raw output of a list or get
+  command, nor any config file (other servers' secrets, `~/.claude.json` account data).
+* Never `gemini extensions install` (hangs on a trust prompt even with stdin closed) or
+  `--trust` on `gemini mcp add` (it skips tool confirmations).
+
+### 39.5 Per agent
+| Agent | Status | Connect | Update | Disconnect |
+|---|---|---|---|---|
+| Claude Code | `claude plugin list --json` → `omatuner@omatuner` in the user scope (no `scope`: an older CLI, user); none → `~/.claude.json` (`$CLAUDE_CONFIG_DIR`) `mcpServers.tuner` or a project's `projects.*.mcpServers.tuner` = MCP only | `plugin marketplace add --json <share dir, else rthoms334/omatuner>`, `plugin install --json omatuner@omatuner --scope user` | `plugin marketplace update --json omatuner`, `plugin update --json omatuner@omatuner` | `plugin uninstall --json omatuner@omatuner --scope user` (`not_installed` = ok), `plugin marketplace remove --json omatuner` (`not_configured` = ok) |
+| Codex | `codex mcp get --json tuner` | `codex mcp add tuner -- tuner mcp` | — | `codex mcp remove tuner` |
+| Gemini CLI | `~/.gemini/settings.json` (JSONC) `mcpServers.tuner` | `gemini mcp add -s user tuner tuner mcp` | — | `gemini mcp remove -s user tuner` |
+| Copilot CLI | `copilot mcp get --json tuner` (`Server "tuner" not found` = not connected) | `copilot mcp add tuner -- tuner mcp` (`already exists` = ok) | — | `copilot mcp remove tuner` (`Server "tuner" not found` = ok) |
+| opencode | `$XDG_CONFIG_HOME/opencode/opencode.json[c]` (JSONC) `mcp.tuner` | `opencode mcp add tuner -- tuner mcp` | — | by hand (copy where) |
+| Cursor | `~/.cursor/mcp.json` `mcpServers.tuner` (found: `cursor-agent` or `~/.cursor/`) | by hand (Copy JSON) | — | by hand |
+
+Claude's steps stop at the first failure; re-running Connect migrates a GitHub marketplace to
+the packaged folder. A Claude MCP-only setup is never removed automatically (the menu copies
+`claude mcp remove --scope user tuner`). File-status agents run `<cli> --version` once per
+refresh as the liveness check. Config files are read with a 32 MiB cap through a small JSONC
+reader (comments, trailing commas).
+
+### 39.6 The first-run card (`ui::overlays::agent_connect`)
+App start: `should_check` → `start_pass`; each frame `take_pass_outcome`. The card opens only
+when `agent_card_may_show` holds: onboarding done, no other overlay, not on the Player, not full
+screen, not popped out or video-only, not multi-view, no text field focused. A preview playing
+in a browse screen doesn't block it, nor does Settings ▸ AI agents (the card would repeat it).
+When the gate opens, the offer is checked again: with `offer_connect` turned off meanwhile, or
+no offered agent still *Not connected* and idle, nothing opens and `checked_version` is
+recorded. If the gate never opens, nothing is recorded and the next
+start checks again. One agent: "Connect Claude Code to Tuner?" with what it adds; several: a
+tick list (only the first ticked) and "Connect N agents". Enter Connect, Esc Not now, Tab/arrows
+move, Space ticks; mouse buttons, a scrim click = Not now. The card opens by itself, so for its
+first 0.6 s Enter, Space and clicks do nothing (a key meant for the list behind can't connect an
+agent); Esc works at once. Connect runs `run(ticked, Connect)`
+and keeps the card with a progress line per agent until every one is idle (Esc hides it early;
+the work continues, toasts carry the results). Both answers set `checked_version`; *Don't ask
+again* also sets `offer_connect = false`.
+
+### 39.7 Settings ▸ AI agents (`ui::screens::settings::agents`)
+After Parental. The two toggles, *Check again*, one row per agent found (status, "used 2 h ago"),
+"Not found on this computer: …", and *Other agents* (Copy `tuner mcp`, the VS Code command, the
+README link). Enter or a click opens the row's menu: Connect / Repair, Update to <version>,
+Disconnect… (destructive confirm naming what the agent loses), Copy the setup command, the
+by-hand copies (Cursor JSON and path, opencode's removal, Claude's MCP-only removal) and the
+README link. A busy row has no menu. A failed op shows under its row until that agent's next
+op (a refresh keeps it); a *Couldn't check* status is repeated in full under its row. With no
+agent found, one note names them all; the plugin switch hides while Claude Code isn't found.
+Copy goes through egui's `copy_text` and toasts "Copied"; there is no URL opener.
+
+**Last used by.** `AgentHandler::handle` notes each named agent (`AgentName::stored()`; unknown
+names are not recorded) in the database's `meta` table, key `agent.used.<Name>` = unix seconds,
+throttled in memory to once a minute per name, written fire-and-forget through the store's
+writer; only the newest 20 names are kept (the name comes from the client). The page's intro says "Last used by Claude, 2 h ago" (newest of all names, Zed
+included); a row whose friendly name matches shows "used …".
+
+### 39.8 The pacman message (`packaging/omatuner.install`)
+`post_install` echoes two lines (Tuner offers it when it next starts, or Settings ▸ AI agents;
+Claude Code: `tuner claude-setup`). `post_upgrade` echoes them only when coming from a version
+older than 0.2.3, the release that brought the card, so later upgrades stay quiet. Nothing else
+runs as root.
+
+### 39.9 Tests
+No test spawns an agent CLI. Unit: Claude list parsing (current, GitHub source, downgrade,
+disabled, errors and `errors: null`, scopes, MCP only incl. a project's, `$CLAUDE_CONFIG_DIR`,
+leading warnings, missing fields, garbage); Copilot's own "not found" vs a wrapper's; step results
+and the "already done" rules; JSONC and file status; exact argv, env and timeouts per agent and
+op; `should_check`, `decide`, `version_lt`; the service with `FakeRunner` (order, stop at the
+first failure, sync on start, the queue); `SystemRunner` with real shell utilities only
+(timeout kills the group, 2 MiB output, stdin closed, missing program); usage throttling; the
+config restore. kittest with the fake: the page (rows, Connect, Disconnect confirm and cancel,
+Copy), the card (Enter, Esc, Don't ask again, several agents, a key or click as it appears),
+and the gate (waits for the player to close; a stale offer isn't shown).

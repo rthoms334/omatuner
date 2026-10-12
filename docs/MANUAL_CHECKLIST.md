@@ -1480,3 +1480,122 @@ Both test accounts allow one stream each (TV and TV 2).
 - [ ] **Sleep timer:** `Ctrl+Shift+T`, "after 2 items" on a series. **Expect:** the warning
   strip near the end of episode 2, then it stops — not earlier while episode 1's end card shows.
   "End of Up next" with three queued items stops after the third, not after the first.
+
+## 28. Connect an AI agent (the card and Settings ▸ AI agents)
+
+These checks change agents' settings. Unless an item says otherwise, run Tuner and the agent
+CLIs in a **throwaway home**, so your real Claude Code, Codex and Gemini settings stay as they
+are:
+
+```sh
+S=$(mktemp -d)
+env HOME=$S XDG_CONFIG_HOME=$S/.config XDG_DATA_HOME=$S/.local/share XDG_CACHE_HOME=$S/.cache XDG_STATE_HOME=$S/.local/state CODEX_HOME=$S/.codex \
+  target/release/tuner --profile-dir /tmp/tuner-check
+```
+
+Run every agent command of an item with the same `env HOME=$S …` prefix. The Omarchy theme
+falls back to the default there; that's expected. Don't set `TUNER_NO_DESKTOP` (with it Tuner
+never runs an agent's tool). To make Tuner treat the next start as the first after an upgrade,
+quit it and remove the `checked_version` line under `[agents]` in
+`/tmp/tuner-check/config/config.toml` (or set it to `"0.2.2"`).
+
+- [ ] **pacman message:**
+  - **Do:** `sudo pacman -U` the new package on a machine without omatuner; then remove it,
+    install 0.2.2 and upgrade to the new package; then upgrade again to a rebuilt package with a
+    higher `pkgrel`.
+  - **Expect:** the two "To connect an AI agent … Tuner offers it when it next starts, or open
+    Settings ▸ AI agents (Claude Code: tuner claude-setup)" lines print after the fresh install
+    and after the upgrade from 0.2.2, not after the later upgrade. Nothing else runs
+    (`cat /var/lib/pacman/local/omatuner-*/install` contains only `echo` lines).
+- [ ] **The card offers only what isn't connected:**
+  - **Do:** with Claude Code and Codex on `PATH`, connect Claude Code by hand
+    (`claude plugin marketplace add /usr/share/tuner/claude`, `claude plugin install
+    omatuner@omatuner --scope user`), finish onboarding (Try free channels), quit and start
+    Tuner after clearing `checked_version`.
+  - **Expect:** about 3 s after start, one card: *Connect Codex to Tuner?* (Claude Code is not
+    offered). The hint line reads Enter Connect · Esc Not now. Holding Enter or clicking
+    outside as it appears does nothing; Esc closes it; restarting shows no card. Clearing
+    `checked_version` again shows it again. It doesn't open while Settings ▸ AI agents is on
+    screen.
+- [ ] **Never over the player:** clear `checked_version`, start Tuner with
+  `--play <ref>` (full screen), then pop it out (`o`), then open multi-view. **Expect:** no card
+  while any of them is on screen, nor during onboarding or with a dialog or a text field open;
+  it appears as soon as you are back on a browse screen (a preview playing in a pane is fine).
+- [ ] **Connect from the card (Claude Code):**
+  - **Do:** remove the plugin (`claude plugin uninstall omatuner@omatuner --scope user`), clear
+    `checked_version`, start Tuner and press Enter on the card.
+  - **Expect:** the card shows "Claude Code — connecting…" with a busy bar, then closes; a toast
+    says Claude Code is connected and to restart it. `claude plugin list --json` lists
+    `omatuner@omatuner` with Tuner's version. (Optional, needs a Claude login in the throwaway
+    home: a new `claude` session's `/mcp` lists `plugin:omatuner:tuner` and `/omatuner:watch`
+    exists.)
+- [ ] **Several agents:** with Codex, Gemini CLI and Claude Code all on `PATH` and none
+  connected, clear `checked_version` and start. **Expect:** *Connect your AI agents to Tuner?*
+  with Claude Code ticked and the others not; the button reads *Connect Claude Code*. Space on
+  Codex makes it *Connect 2 agents*; unticking both disables it. Connect runs them one after the
+  other with a toast each. Mouse: clicking the rows ticks them; the buttons work; a click outside
+  the card is *Not now*.
+- [ ] **Keyboard and help on the card:** **Expect:** `?` shows the dialog keys; ↑/↓/Tab move,
+  Enter on a tick toggles it; during Connect, Enter or Esc hides the card and the toast still
+  arrives.
+- [ ] **Nothing found:** start with `PATH=/usr/bin` added to the `env` line and no agents in
+  `~/.local/bin`, mise's shims, `~/.bun/bin`, `~/.npm-global/bin` or `~/.volta/bin` of the
+  throwaway home. **Expect:** no card; the page shows one "Tuner didn't find …" note and no
+  *Keep Claude Code's plugin up to date* switch.
+- [ ] **Don't ask again:** clear `checked_version`, start, tick *Don't ask again*, press Esc.
+  **Expect:** Settings ▸ AI agents shows *Offer to connect agents after updates* Off; clearing
+  `checked_version` again shows no card. Turning the toggle back on and clearing
+  `checked_version` brings the card back.
+- [ ] **Settings ▸ AI agents, statuses:**
+  - **Do:** open the page with Claude Code connected, Codex not connected, Copilot CLI not
+    installed, opencode installed.
+  - **Expect:** Claude Code "Connected · plugin <version>", Codex "Not connected", opencode
+    "Not connected", "Not found on this computer: Copilot CLI." (and any other missing agent).
+    The statuses match `claude plugin list --json`, `codex mcp get --json tuner`,
+    `~/.gemini/settings.json` and `~/.config/opencode/opencode.json` in the throwaway home.
+    *Check again* shows "Checking…" briefly and picks up a change made in a terminal. Wide,
+    tiled, text 12/16: rows and the menu fit.
+- [ ] **Connect and Disconnect from Settings:**
+  - **Do:** on Codex, Enter ▸ *Connect*; then Enter ▸ *Disconnect…*, Esc on the confirm; then
+    *Disconnect…* ▸ *Disconnect*. Repeat with Gemini CLI, Copilot CLI and Claude Code.
+  - **Expect:** "Connecting…" on the row, a success toast, the row turns "Connected"
+    (`codex mcp get --json tuner` finds it; Gemini: "tuner" under `mcpServers` in
+    `~/.gemini/settings.json`; Copilot: `copilot mcp get --json tuner`). Esc on the confirm
+    changes nothing. Disconnect removes it and toasts "Disconnected …"; Claude Code's plugin and
+    its `omatuner` marketplace are both gone from `claude plugin list --json` and `claude plugin
+    marketplace list --json`. Doing it all with the mouse works the same.
+- [ ] **By hand: opencode and Cursor:** Connect opencode, then open its menu. **Expect:**
+  "Connected"; no *Disconnect…*, but *Copy how to remove it* pastes the instruction with the
+  file's path. With `~/.cursor/` present (or `cursor-agent` on `PATH`), Cursor's row is "Not
+  connected · add it by hand"; *Copy the setup (JSON)* pastes
+  `{"mcpServers":{"tuner":{"command":"tuner","args":["mcp"]}}}`. *Other agents* copies
+  `tuner mcp`, the VS Code command and the README link; each pastes correctly.
+- [ ] **Update after an upgrade:**
+  - **Do:** in the throwaway home connect from GitHub (`claude plugin marketplace add
+    rthoms334/omatuner`, `claude plugin install omatuner@omatuner --scope user`) while running a
+    build whose version is newer than GitHub's, or upgrade the package from 0.2.2 with the
+    plugin connected.
+  - **Expect:** the row shows "Update available · plugin <old> → <new>" and *Update to <new>*
+    works. With *Keep Claude Code's plugin up to date* on, the first start after the upgrade
+    updates it by itself and toasts it (no card for it); with it off, the row just says
+    *Update available*. When GitHub has nothing newer, *Update* toasts that the plugin is up to
+    date and the row turns *Connected · plugin <old>*.
+- [ ] **Started from the launcher:** with an agent CLI installed only through mise (or in
+  `~/.local/bin`), start Tuner from the Omarchy launcher (default profile; only open the page,
+  don't press Connect or Disconnect). **Expect:** the agent is found and its status is right.
+- [ ] **A tool that hangs:** make a fake `codex` (`mkdir -p $S/bin; printf '#!/bin/sh\nsleep
+  600\n' > $S/bin/codex; chmod +x $S/bin/codex`), start Tuner with `PATH=$S/bin:$PATH` added to
+  the `env` line and connect Codex. **Expect:** the UI keeps working; after 2 minutes an error toast says it didn't answer;
+  `pgrep -f 'sleep 600'` finds nothing. Quit Tuner during a second attempt: Tuner exits promptly
+  and no `sleep` is left behind.
+- [ ] **Last used by:** default profile (the agent's `tuner mcp` reaches it; this check changes
+  no agent settings). Ask a connected agent "what's playing?", then open Settings ▸ AI agents
+  within a minute. **Expect:** "Last used by Claude, just now" (or the agent's name) in the
+  intro, and "used just now" on that agent's row.
+- [ ] **Logs:** Settings ▸ About & logs ▸ open the log viewer after the checks above.
+  **Expect:** each Connect / Update / Disconnect is logged with its command line and `ok` or
+  `exit N` and a redacted first line. No raw `claude plugin list` output, no
+  `~/.claude.json` content, no other MCP server's settings.
+- [ ] **Backup restore:** with *Offer to connect* Off, restore a backup made with it On
+  (*Restore settings* ticked). **Expect:** it stays Off: the AI agents settings belong to this
+  computer.
