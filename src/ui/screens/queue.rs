@@ -460,7 +460,7 @@ impl Screen for QueueScreen {
     }
 
     fn hint_extras(&self) -> Vec<(Action, &'static str)> {
-        vec![(Action::MoveUp, "move"), (Action::Remove, "remove"), (Action::PlayFrom, "copy"), (Action::ContextMenu, "more")]
+        vec![(Action::MoveUp, "move"), (Action::Remove, "remove"), (Action::PlayFrom, "copy")]
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) {

@@ -106,15 +106,18 @@ shot upnext      "$big"  "$dark"  home     "key:Alt+6;wait:1"
 shot multiview   "$big"  "$dark"  live     "play:$PLAY_DOCS;wait:4;key:Ctrl+M;wait:0.5;text:lumen;wait:0.5;key:Enter;wait:5;move:1400,940;wait:0.5" 1
 shot following   "$big"  "$dark"  settings "key:Left;key:Down;key:Down;key:Down;key:Down;key:Down;key:Down;wait:1"
 shot reminders   "$big"  "$dark"  settings "key:Left;key:Down;key:Down;key:Down;key:Down;key:Down;wait:1"
-shot guidefix    "$big"  "$dark"  settings "key:Left;key:Down;key:Right;key:Down;key:Down;key:Down;key:Down;key:Enter;wait:1.5"
+# the guide check is debounced 30 s (jobs::guide_check::DEBOUNCE): shoot once it is done
+shot guidefix    "$big"  "$dark"  settings "key:Left;key:Down;key:Right;key:Down;key:Down;key:Down;key:Down;key:Enter;wait:34"
 
 # Every regeneration adds the images to git history again: rerun it only when the UI changes.
 # pngquant (lossy, 256 colours) roughly halves them; oxipng then recompresses losslessly.
-# Without pngquant, ffmpeg (already needed) does the same 256-colour pass, kept only if smaller.
+# Without pngquant, ffmpeg (already needed) does a 256-colour pass, kept only if smaller; it
+# skips the video-heavy shots (live, live-half, popout), where its dithering shows.
 if command -v pngquant >/dev/null && ((${#taken[@]})); then
   pngquant --quality 70-90 --skip-if-larger --force --ext .png "${taken[@]}" || true
 elif ((${#taken[@]})); then
   for png in "${taken[@]}"; do
+    case $(basename "$png" .png) in live | live-half | popout) continue ;; esac
     tmp=${png%.png}.q.png
     if ffmpeg -loglevel error -y -i "$png" -lavfi \
         "split[a][b];[a]palettegen=max_colors=256:stats_mode=full[p];[b][p]paletteuse=dither=sierra2_4a" \

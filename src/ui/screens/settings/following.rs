@@ -158,11 +158,14 @@ pub(super) fn rows(s: &SettingsScreen, ctx: &UiCtx<'_>, v: &mut Vec<Row>) {
         ));
     }
     for r in &d.rules {
-        let coming = d.upcoming.iter().filter(|u| u.rule == r.id && counts(u)).count();
         let mut detail = fui::rule_summary(r);
-        detail.push_str(&match coming {
-            0 => " · nothing coming".to_owned(),
-            n => format!(" · {n} coming"),
+        // a "just list" rule sets no reminders: count what it lists instead
+        let listed = r.mode == crate::follow::FollowMode::List;
+        let coming = d.upcoming.iter().filter(|u| u.rule == r.id && if listed { u.state == MatchState::Listed } else { counts(u) }).count();
+        detail.push_str(&match (coming, listed) {
+            (0, _) => " · nothing coming".to_owned(),
+            (n, true) => format!(" · {n} listed"),
+            (n, false) => format!(" · {n} coming"),
         });
         let icon = if !r.enabled {
             glyphs::PAUSE

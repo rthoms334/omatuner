@@ -11,7 +11,7 @@ current theme live, corners are square, and the font is JetBrains Mono Nerd Font
 The video is rendered by an embedded libmpv inside a native Rust window (egui), so there is no
 browser or Electron runtime and no separate player window.
 
-![Live TV: groups from three playlists, channels with now/next and quality badges, and the
+![Live TV: groups from all playlists, channels with now/next and quality badges, and the
 preview playing](docs/screenshots/live.png)
 
 - [Screenshots](#screenshots)
@@ -36,7 +36,7 @@ preview playing](docs/screenshots/live.png)
 
 <table>
 <tr>
-<td width="50%"><img src="docs/screenshots/home.png" alt="Home screen"><br><b>Home</b>: Continue watching, favourites lists and recently added titles.</td>
+<td width="50%"><img src="docs/screenshots/home.png" alt="Home screen"><br><b>Home</b>: Up next, Continue watching, favourites lists and recently added titles.</td>
 <td width="50%"><img src="docs/screenshots/guide.png" alt="TV guide"><br><b>Guide</b>: a day of programmes; the bell marks a reminder.</td>
 </tr>
 <tr>
