@@ -3136,10 +3136,14 @@ for any window. Tuner does it for itself with `o` in the player or Ctrl+Shift+O 
   rendering on other workspaces (§11.1), for classes `tuner` and `tuner-popout`; `float`, `pin`,
   `no_initial_focus` for `tuner-popout` (§21.6); optional idle fallback and Super+Shift+T
   binding),
-  `packaging/omarchy/omarchy-menu.jsonc` (TV submenu), `packaging/PKGBUILD` (x86_64 + aarch64,
+  `packaging/omarchy/omarchy-menu.jsonc` (TV submenu), `packaging/systemd/tuner-rearm.service`
+  (the login re-arm of the reminder timers, §36.2), `packaging/PKGBUILD` (x86_64 + aarch64,
   depends mpv/xz/fontconfig/JetBrains Mono Nerd/wayland/mesa; builds the local checkout into
-  `packaging/src/target`, installs the snippets under `/usr/share/tuner/`, the docs under
-  `/usr/share/doc/tuner/` and `LICENSE` under `/usr/share/licenses/omatuner/`).
+  `packaging/src/target`, installs the snippets under `/usr/share/tuner/`, the user unit under
+  `/usr/lib/systemd/user/` with its `graphical-session.target.wants/` link (enabled for every
+  account, owned by the package; pacman's `daemon-reload-user` hook reloads running user
+  managers), the docs under `/usr/share/doc/tuner/` and `LICENSE` under
+  `/usr/share/licenses/omatuner/`).
   `packaging/omatuner.install` (`install=`, next to the PKGBUILD so makepkg finds it in CI's copy
   of the checkout too) only echoes where to connect an AI agent (§39.8); it runs nothing.
 * **Names**: the repository (<https://github.com/rthoms334/omatuner>) and the Arch package
@@ -3156,7 +3160,7 @@ for any window. Tuner does it for itself with `o` in the player or Ctrl+Shift+O 
   (aarch64, natively on `ubuntu-24.04-arm`; pinned by digest in the release workflow, floating in
   CI), and publishes a GitHub Release (`--generate-notes`; a tag with a suffix is a pre-release;
   re-running a failed publish re-uploads into the existing release) with
-  `omatuner-<pkgver>-<rel>-<arch>.pkg.tar.zst`, `omatuner-<pkgver>-<arch>.tar.gz` (binary, desktop entry, icon, snippets, README, LICENSE) and
+  `omatuner-<pkgver>-<rel>-<arch>.pkg.tar.zst`, `omatuner-<pkgver>-<arch>.tar.gz` (binary, desktop entry, icon, snippets, `systemd/tuner-rearm.service`, README, LICENSE) and
   `SHA256SUMS`. A manual run with `publish=false`, and every pull request that touches
   `packaging/`, `Cargo.*` or the workflow, is a dry run (workflow artifacts only).
 * **CI** (`.github/workflows/ci.yml`): pull requests and pushes to `main`, same two containers:
@@ -5889,6 +5893,47 @@ are set only when the manager lacks them), so a re-login doesn't leave stale val
   hours or over a fullscreen app does nothing;
 * the session counts as locked: explicit channels wait, a Following switch to a locked channel
   becomes "needs your PIN".
+
+**Re-armed at login.** Transient units die with the user manager (reboot, or logout without
+lingering), so a reminder set before a reboot used to be missed unless Tuner was opened first.
+The package ships `tuner-rearm.service` (`/usr/lib/systemd/user/`, a oneshot running `tuner
+--rearm`) with its own `graphical-session.target.wants/` link: enabled for every account
+without a scriptlet touching home directories, removed with the package, `static` in
+`systemctl --user is-enabled`, `systemctl --user mask tuner-rearm` turns it off. `tuner
+--rearm` (`reminders::arming::rearm_at_login`) arms what a Tuner started then would arm
+(`arming::closed_plan`: the scheduler's pending reminders, Following's waiting while it is off,
+explicit channels' while parental control hides them — the session counts as locked) through
+the same `ArmSync`, and exits: no network, no refresh, no window, player or notification.
+* **When**: `After=graphical-session.target`, wanted by it. uwsm (Omarchy's session manager)
+  reaches that target at every login, after `wayland-session-waitenv.service` saw
+  `WAYLAND_DISPLAY` and `HYPRLAND_INSTANCE_SIGNATURE` in the manager's environment, and stops it
+  at logout, so a re-login with the manager still up (lingering, another session) runs it again
+  (the pattern of Omarchy's own `omarchy-migrate-notify.service`). `default.target` would not:
+  with a lingering manager it stays up across logins. Sessions started without uwsm never reach
+  the target; there the next Tuner start (or `tuner --refresh`) arms, as before.
+* **Environment**: the service's environment is the manager's, so every session variable it
+  has is one the manager has: nothing is passed with `--setenv` and the units read the
+  manager's values when they fire (a run before the variables arrived would have none to pass
+  either). A unit armed at login therefore fires into the session that is current at its time.
+* **Safe to run any time**: no database yet (an account that never started Tuner) → exit 0
+  having made nothing, not even the log; Tuner or a refresh holding the instance lock → exit 0
+  (they arm themselves); the lock is held while arming, so a window started meanwhile waits a
+  moment; setting off, a `--profile-dir` profile or no `systemd-run` → exit 0; systemd refusing
+  → exit 1 (the unit shows failed). Twice in a row is the same as once: a fresh `ArmSync`
+  learns the armed units and re-arms them for the times planned now. A store migration after
+  an upgrade happens here, under the lock, as for `--reminder`.
+* **Due while nothing ran**: a reminder whose unit time passed during the reboot or logout
+  (or a switch whose unit fired with no display) is what a starting Tuner fires late — a note
+  while its programme airs (notes on), a switch up to `LATE_SWITCH_S` after its time.
+  `closed_plan` gives each such one a unit `LATE_UNIT_S` (5 s) from now, ahead of the others
+  within the 30, so `tuner --reminder` fires it late by the same rules; past those it is
+  dismissed by the next start, as before. Its `--reminder` waits for the lock if the re-arm
+  still holds it (a few seconds; it waits up to 10).
+* **A time that passes while arming**: `SystemdArmer::arm` arms no earlier than 2 s from the
+  call — an `OnCalendar=` time already past never elapses — so a unit due during a slow run
+  (a re-login re-arms every unit, five `systemctl` calls each) fires a moment late instead of
+  never.
+* Suspend and resume need nothing: the user manager, and its timers, stay up.
 
 ### 36.3 Sleep timer
 Ctrl+Shift+T, the player menu, the status-bar chip ("Sleep timer — 23:10 (Ctrl+Shift+T)" with

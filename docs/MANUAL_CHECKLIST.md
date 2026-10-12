@@ -63,6 +63,8 @@ in `~/.config/omarchy/shell.toml`; Tuner applies it live).
     - The package contains `/usr/bin/tuner`, `/usr/share/applications/tuner.desktop`,
       `/usr/share/icons/hicolor/scalable/apps/tuner.svg`,
       `/usr/share/tuner/{hypr/tuner.lua,omarchy/omarchy-menu.jsonc}`,
+      `/usr/lib/systemd/user/tuner-rearm.service` and its link
+      `/usr/lib/systemd/user/graphical-session.target.wants/tuner-rearm.service`,
       `/usr/share/doc/tuner/{README.md,DESIGN.md,MANUAL_CHECKLIST.md}` and
       `/usr/share/licenses/omatuner/LICENSE` (`pacman -Qlp omatuner-*.pkg.tar.zst`).
     - `pkgver` matches `Cargo.toml`.
@@ -74,8 +76,8 @@ in `~/.config/omarchy/shell.toml`; Tuner applies it live).
   - **Expect:**
     - Both architectures produce `omatuner-<version>-1-<arch>.pkg.tar.zst`,
       `omatuner-<version>-<arch>.tar.gz` and their `.sha256` files.
-    - The tarball holds `tuner`, `tuner.desktop`, `tuner.svg`, the snippets, `README.md` and
-      `LICENSE`.
+    - The tarball holds `tuner`, `tuner.desktop`, `tuner.svg`, the snippets,
+      `systemd/tuner-rearm.service`, `README.md` and `LICENSE`.
 - [ ] **Release package install** (after `git tag vX.Y.Z && git push origin vX.Y.Z`):
   - **Do:** download the package for this machine and `SHA256SUMS` from
     <https://github.com/rthoms334/omatuner/releases>, run
@@ -1544,6 +1546,32 @@ Both test accounts allow one stream each (TV and TV 2).
   ("Started 5 min ago — playing from the beginning") or live.
 - [ ] **Re-login:** set a switch, log out and back in (lingering on), quit Tuner. **Expect:** the
   switch still opens the pop-out.
+- [ ] **Reboot, Tuner never opened:**
+  - **Do:** with the package installed, set a notification reminder for a programme starting in
+    about 15 minutes and a switch for one in about 20 (Open in: Pop-out); quit Tuner and reboot.
+    Log in and do **not** open Tuner.
+  - **Expect:**
+    - `systemctl --user list-timers 'tuner-reminder-*'` lists both "Tuner reminder" timers
+      within a few seconds of the desktop appearing.
+    - `systemctl --user status tuner-rearm` is `inactive (dead)` with a `status=0/SUCCESS` run
+      at this login and a `reminders: 2 timer(s) armed` line; `systemctl --user is-enabled
+      tuner-rearm` says `static`; `systemctl --user --failed` doesn't list it.
+    - The notification shows at its time (Watch plays), and the switch opens the pop-out without
+      taking the keyboard — so the timers fired with the new session's display.
+- [ ] **Due during the reboot:** set a notification reminder for a programme starting in about
+  3 minutes (lead 2 min); quit Tuner, reboot so that you log in after its time but while it
+  airs; don't open Tuner. **Expect:** the note ("Started … ago") shows within seconds of
+  logging in, once.
+- [ ] **Log out and back in (no reboot):** same with a reminder 15 minutes ahead; log out, log in,
+  don't open Tuner. **Expect:** `journalctl --user -u tuner-rearm -b` shows a run for each
+  login; the timer is listed once and the reminder fires once.
+- [ ] **Re-arm while Tuner runs, and with no profile:** with Tuner open, run
+  `systemctl --user start tuner-rearm`. **Expect:** it succeeds, its log says Tuner is running,
+  the timers are unchanged. Log in as an account that never started Tuner. **Expect:**
+  `tuner-rearm` succeeded and `~/.local/share/tuner` and `~/.local/state/tuner` don't exist.
+- [ ] **Masked:** `systemctl --user mask tuner-rearm`, reboot with a reminder pending, don't open
+  Tuner. **Expect:** no timers until Tuner starts. `systemctl --user unmask tuner-rearm`
+  afterwards.
 - [ ] **`tuner --refresh` with a Following rule:** quit Tuner, run `tuner --refresh` after the
   guide changed. **Expect:** `systemctl --user list-timers` shows a "Tuner reminder" unit for
   the new match.

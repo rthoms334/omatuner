@@ -13,6 +13,11 @@
 //! window started meanwhile waits like for a starting instance and then says a background
 //! refresh is running (and a desktop notification says so); playlists it upgraded to their
 //! Xtream login are toasted by the next window (`store::sources::note_unseen_upgrade`).
+//!
+//! `tuner --rearm` (the packaged `tuner-rearm.service`, at every login) arms the reminder timers
+//! a reboot or logout removed and exits (`reminders::arming::rearm_at_login`, DESIGN §36.2):
+//! offline, no window, no player. It takes the instance lock like `--refresh` (a running Tuner,
+//! or a refresh, arms them itself: exit 0) and exits 1 only when systemd refused.
 
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -61,6 +66,11 @@ fn main() -> anyhow::Result<()> {
     if cli.is_mcp() {
         return tuner::agent::mcp::main(&paths, cli.profile_dir.as_deref(), cli.debug);
     }
+    // `--rearm` runs at every login of every user (the packaged tuner-rearm.service): one who
+    // never started Tuner has no profile, so nothing to arm and nothing is made, not even the log
+    if cli.rearm && !paths.db_file().exists() {
+        return Ok(());
+    }
     let (config, config_err) = match Config::load(&paths.config_file()) {
         Ok(c) => (c, None),
         Err(e) => (Config::default(), Some(e)),
@@ -82,6 +92,24 @@ fn main() -> anyhow::Result<()> {
         let failed = refresh_headless(paths, config, REFRESH_TIMEOUT)?;
         anyhow::ensure!(failed == 0, "{failed} refresh job(s) failed (see the log)");
         return Ok(());
+    }
+    if cli.rearm {
+        if let Some(e) = config_err {
+            tracing::error!("{e}; using defaults (your file was not modified)");
+        }
+        // held while arming: a window started meanwhile waits for it (a second or two)
+        let Some(_instance) = refresh_lock(&paths) else {
+            tracing::info!("Tuner (or a background refresh) is running; it arms the reminder timers itself");
+            return Ok(());
+        };
+        return match tuner::reminders::arming::rearm_at_login(&paths, &config)? {
+            tuner::platform::systemd::ArmStatus::Unavailable(e) => Err(anyhow::anyhow!("reminders won't fire while Tuner is closed: {e}")),
+            tuner::platform::systemd::ArmStatus::Armed(n) => {
+                tracing::info!("reminders: {n} timer(s) armed");
+                Ok(())
+            }
+            tuner::platform::systemd::ArmStatus::Off => Ok(()),
+        };
     }
 
     // Paths are made absolute HERE: a running instance receiving them over IPC has another
@@ -216,10 +244,10 @@ fn absolute_input(input: &str) -> String {
     }
 }
 
-/// `--refresh`: take the instance lock for the whole refresh, marked [`REFRESH_MARK`]. `None`:
-/// an instance holds it (running, starting, or another refresh) or something listens on the
-/// instance socket (a stale file refuses the connection). Only connects — sending a request
-/// would raise that instance's window.
+/// `--refresh` (and `--rearm`): take the instance lock for the whole run, marked
+/// [`REFRESH_MARK`]. `None`: an instance holds it (running, starting, or another refresh) or
+/// something listens on the instance socket (a stale file refuses the connection). Only
+/// connects — sending a request would raise that instance's window.
 fn refresh_lock(paths: &AppPaths) -> Option<InstanceLock> {
     let lock = match instance_lock(paths) {
         Ok(Some(file)) => {

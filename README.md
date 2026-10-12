@@ -220,7 +220,8 @@ and [Artemis I Launch (Press Site)](https://images.nasa.gov/details/Artemis%20I%
   your other playlist, and moving the playing picture to its other playlist always asks first.
 - **Reminders and sleep timer:** notify or switch at a programme's start (or "10 min in"),
   opened in the pop-out, the full window or where you are; reminders fire even while Tuner is
-  closed (systemd user timers). The sleep timer (`Ctrl+Shift+T`) stops or pauses after a time,
+  closed, after a reboot too (systemd user timers, see
+  [Reminders while Tuner is closed](#reminders-while-tuner-is-closed)). The sleep timer (`Ctrl+Shift+T`) stops or pauses after a time,
   at the end of the programme, after N episodes or at the end of Up next.
 - **Use it from an AI agent:** ask Claude Code, Codex, Gemini CLI or any other MCP-capable agent
   — "put the touring cars on", "something light under 2 hours", "follow Arsenal, spoiler-safe",
@@ -272,13 +273,16 @@ The package installs:
 - `/usr/bin/tuner`
 - the desktop entry and icon
 - the opt-in snippets under `/usr/share/tuner/`
+- `tuner-rearm.service`, a systemd user unit that re-arms the reminder timers at every login
+  (see [Reminders while Tuner is closed](#reminders-while-tuner-is-closed))
 - this README and the design notes under `/usr/share/doc/tuner/`, the licence under
   `/usr/share/licenses/omatuner/`
 
-`omatuner-<version>-<arch>.tar.gz` holds the same binary, desktop entry, icon, snippets, README
-and LICENSE for other setups. The binary links against the system libmpv, so install `mpv`
-first. Copy `tuner` to a directory on your session PATH (e.g. `~/.local/bin`), then install the
-desktop entry and icon as described under [With cargo](#with-cargo).
+`omatuner-<version>-<arch>.tar.gz` holds the same binary, desktop entry, icon, snippets, login
+unit (`systemd/tuner-rearm.service`), README and LICENSE for other setups. The binary links
+against the system libmpv, so install `mpv` first. Copy `tuner` to a directory on your session
+PATH (e.g. `~/.local/bin`), then install the desktop entry, icon and login unit as described
+under [With cargo](#with-cargo).
 
 ### Build the Arch package from source
 
@@ -305,7 +309,12 @@ sure `~/.cargo/bin` is on your session PATH, or edit `Exec=` to the full path:
 - `packaging/tuner.desktop` to `~/.local/share/applications/`
 - `packaging/icons/tuner.svg` to `~/.local/share/icons/hicolor/scalable/apps/`
 
-Then follow [Omarchy integration](#omarchy-integration).
+Then follow [Omarchy integration](#omarchy-integration). Without the package nothing re-arms
+the reminder timers at login; to have that too, copy `packaging/systemd/tuner-rearm.service`
+(the tarball's `systemd/tuner-rearm.service`) to `~/.config/systemd/user/`, set its
+`ExecStart=` to your `tuner` by its full path (systemd doesn't expand `~`; `%h` is your home,
+e.g. `ExecStart=%h/.cargo/bin/tuner --rearm`), and run
+`systemctl --user add-wants graphical-session.target tuner-rearm.service`.
 
 ## First run
 
@@ -1056,6 +1065,7 @@ Settings ▸ Parental sets a 4–8 digit PIN. It is a speed bump for children, n
 ```text
 tuner [--view home|live|guide|movies|series|search|settings] [--play <ref> [--popout]]
       [--reminder <id>] [--debug] [--profile-dir <dir>] [--refresh] [PLAYLIST_OR_URL...]
+tuner --rearm [--debug]
 tuner mcp [--profile-dir <dir>] [--debug]
 tuner claude-setup [--apply]
 ```
@@ -1069,6 +1079,7 @@ tuner claude-setup [--apply]
 | `--debug` | Debug logging for this session, whatever the setting says. |
 | `--profile-dir <dir>` | Keep config, data, cache, logs and the socket under `<dir>`. Use it for testing, or for a second profile. |
 | `--refresh` | Refresh stale playlists and guides without a window, then exit (status 1 if a refresh failed). Does nothing while Tuner is running, because the open window refreshes on its own. While it runs, starting Tuner waits a few seconds and then says (also as a desktop notification) that a background refresh is running. A playlist it upgraded to its Xtream login is announced the next time Tuner opens. |
+| `--rearm` | Re-arm the reminder timers and exit: offline, without a window, in a second or two (exit status 1 only if systemd refused). This is what `tuner-rearm.service` runs at every login; you don't need it yourself. Does nothing while Tuner is running. See [Reminders while Tuner is closed](#reminders-while-tuner-is-closed). |
 | `PLAYLIST_OR_URL…` | An `.m3u`/`.m3u8` file opens the add-playlist card. A stream URL or media file plays straight away. `file://` URIs are treated as paths. |
 | `mcp` | Run the MCP server on stdin/stdout for an AI agent (Claude Code, Codex, Gemini CLI or any other MCP client; see [Use Tuner from an AI agent](#use-tuner-from-an-ai-agent)). |
 | `claude-setup` | Show how to connect Claude Code to Tuner (the omatuner plugin). `--apply` runs the plugin steps after asking on the terminal. Settings ▸ AI agents does the same from inside Tuner, for other agents too. |
@@ -1467,6 +1478,25 @@ leaves the pop-out where it is ("Nothing playing"); its page is waiting when you
   keyboard** from what you are typing in. Esc tiles it like any pop-out. Without the rules it
   may open tiled and focused first. Popping out a running Tuner never takes the keyboard
   either. If you have your own rules for class `tuner`, add `tuner-popout` to them.
+
+### Reminders while Tuner is closed
+
+With Settings ▸ Reminders *Fire while Tuner is closed* on (the default), every reminder and
+automatic switch due in the next 48 hours (at most 30) gets a systemd user timer, "Tuner
+reminder", that runs `tuner --reminder <id>` at its time: a notification shows by itself, a
+switch starts Tuner. `systemctl --user list-timers 'tuner-reminder-*'` lists them; they carry
+the reminder's number only, never a title.
+
+These timers don't survive a reboot or a logout. The package's `tuner-rearm.service` puts them
+back at every login (it runs `tuner --rearm` once the Hyprland session is up: offline, no
+window, done in a second), so a reminder set before a reboot fires without you opening Tuner.
+One whose time passed while the computer was off fires as soon as you log in, as it would if
+you opened Tuner then: a notification while the programme is still on, a switch up to 15
+minutes late.
+It does nothing while Tuner runs (Tuner keeps its timers itself) or for an account that never
+started Tuner. `systemctl --user status tuner-rearm` shows its last run; `systemctl --user mask
+tuner-rearm` turns it off for your account. It needs a session started by uwsm, as Omarchy's
+is; otherwise the timers come back the next time Tuner starts.
 
 ## Troubleshooting
 

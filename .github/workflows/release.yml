@@ -151,12 +151,13 @@ jobs:
           # The tarball holds the packaged binary and files (same build as the package).
           root="$src/pkg/omatuner"
           stage="omatuner-$PKGVERSION-$ARCH"
-          mkdir -p "$stage/hypr" "$stage/omarchy"
+          mkdir -p "$stage/hypr" "$stage/omarchy" "$stage/systemd"
           install -m755 "$root/usr/bin/tuner" "$stage/tuner"
           install -m644 "$root/usr/share/applications/tuner.desktop" "$stage/"
           install -m644 "$root/usr/share/icons/hicolor/scalable/apps/tuner.svg" "$stage/"
           install -m644 "$root/usr/share/tuner/hypr/tuner.lua" "$stage/hypr/"
           install -m644 "$root/usr/share/tuner/omarchy/omarchy-menu.jsonc" "$stage/omarchy/"
+          install -m644 "$root/usr/lib/systemd/user/tuner-rearm.service" "$stage/systemd/"
           install -m644 README.md LICENSE "$stage/"
           tar --owner=0 --group=0 --sort=name -czf "dist/$stage.tar.gz" "$stage"
           # Sanity checks: the binary runs and reports Cargo's version; list what ships.
