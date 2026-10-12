@@ -38,18 +38,39 @@ pub fn neutralise_scores(title: &str) -> Cow<'_, str> {
         let after = toks.get(j).is_some_and(|n| n.chars().next().is_some_and(char::is_alphabetic));
         if before && after {
             changed = true;
-            if !matches!(toks[j].to_ascii_lowercase().as_str(), "v" | "vs" | "vs." | "v.") {
+            if !is_versus(toks[j]) {
                 out.push("v");
             }
+        } else if before && j == toks.len() && out.iter().any(|t| is_versus(t)) {
+            // after the fixture: "Arsenal v Chelsea 2-1"
+            changed = true;
         } else {
             out.extend_from_slice(&toks[i..j]);
         }
         i = j;
     }
+    // "Arsenal v Chelsea (2-1)": the bracket goes with the other score leftovers
+    if !changed && out.iter().any(|t| is_versus(t)) && ends_in_score_bracket(&out) {
+        changed = true;
+    }
     if !changed {
         return Cow::Borrowed(title);
     }
     Cow::Owned(drop_score_brackets(&out).join(" "))
+}
+
+fn is_versus(t: &str) -> bool {
+    matches!(t.to_ascii_lowercase().as_str(), "v" | "vs" | "vs." | "v.")
+}
+
+/// The last bracketed group holds a score (and its modifiers) only.
+fn ends_in_score_bracket(toks: &[&str]) -> bool {
+    if !toks.last().is_some_and(|t| t.ends_with(')')) {
+        return false;
+    }
+    let Some(k) = toks.iter().rposition(|t| t.starts_with('(')) else { return false };
+    let bare: Vec<&str> = toks[k..].iter().map(|t| t.trim_matches(|c: char| matches!(c, '(' | ')'))).collect();
+    bare.iter().all(|t| is_score(t) || is_modifier(t)) && bare.iter().any(|t| is_score(t))
 }
 
 /// Whitespace tokens of `s`, a spaced score ("2 - 1") kept as one token (a slice of `s`).
@@ -190,6 +211,9 @@ mod tests {
             ("Bayern 2:1 Dortmund", "Bayern v Dortmund"),
             ("Arsenal 2 - 1 Chelsea", "Arsenal v Chelsea"),
             ("Highlights: Arsenal 3-0 Spurs", "Highlights: Arsenal v Spurs"),
+            ("Arsenal v Chelsea 2-1", "Arsenal v Chelsea"),
+            ("Arsenal v Chelsea (2-1)", "Arsenal v Chelsea"),
+            ("Spain vs Italy 1-1 (4-3 pens)", "Spain vs Italy"),
         ] {
             assert_eq!(neutralise_scores(from), to, "{from}");
         }

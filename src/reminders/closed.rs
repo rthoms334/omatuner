@@ -53,7 +53,7 @@ const EARLY_SLACK_S: i64 = 120;
 /// The spoiler guard as a running Tuner would have it: off when the guard is off, else over a
 /// snapshot built from the store; one that can't be built fails closed.
 pub fn store_guard(conn: &rusqlite::Connection, cfg: &Config, now: Timestamp) -> Guard {
-    if !cfg.spoiler.enabled {
+    if !cfg.spoiler.enabled || !crate::spoiler::ENABLED {
         return Guard::default();
     }
     crate::store::library::load(conn).and_then(|lib| crate::spoiler::snapshot::build(conn, cfg, &lib, now)).map(Guard::with_snapshot).unwrap_or_else(

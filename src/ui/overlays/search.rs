@@ -720,7 +720,8 @@ impl Overlay for SearchOverlay {
                             paint_hit(ui, ctx, rect, h, &playlists, is_cursor);
                         }
                         Row::Guide(g) => {
-                            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &*g.programme.title));
+                            let title = crate::ui::widgets::spoiler::Spoilers::of(ctx).programme_title(&g.programme).into_owned();
+                            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &title));
                             paint_guide(ui, ctx, rect, g, is_cursor);
                         }
                         Row::Header(_) => {}
@@ -795,7 +796,8 @@ fn paint_hit(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, h: &SearchHit, 
                 let bar = Rect::from_center_size(egui::pos2(right - bar_w / 2.0, y), egui::vec2(bar_w, (3.0 * theme.rem()).round().max(2.0)));
                 crate::ui::widgets::progress::paint_progress(&p, bar, theme, cur.progress(now), false);
                 right -= bar_w + pad;
-                let text = format!("{} · {}", cur.title, kit::hhmm(cur.start, ctx.config.interface.clock_24h));
+                let title = crate::ui::widgets::spoiler::Spoilers::of(ctx).programme_title(&cur).into_owned();
+                let text = format!("{title} · {}", kit::hhmm(cur.start, ctx.config.interface.clock_24h));
                 let g = elided(&p, &text, small.clone(), t.text_secondary, (rect.width() * 0.32).max(60.0));
                 let r = Align2::RIGHT_CENTER.anchor_size(egui::pos2(right, y), g.size());
                 p.galley(r.min, g, t.text_secondary);
@@ -863,7 +865,8 @@ fn paint_guide(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, g: &Programme
     let tw = tg.size().x;
     p.galley(egui::pos2(rect.left() + pad, y - tg.size().y / 2.0), tg, t.text_secondary);
     let left = rect.left() + pad + tw.max(90.0 * theme.rem()) + pad;
-    let title = if channel_name.is_empty() { prog.title.to_string() } else { format!("{} · {channel_name}", prog.title) };
+    let shown = crate::ui::widgets::spoiler::Spoilers::of(ctx).programme_title(&prog).into_owned();
+    let title = if channel_name.is_empty() { shown } else { format!("{shown} · {channel_name}") };
     let past = prog.stop <= now;
     let c = if cursor {
         t.list_cursor_text

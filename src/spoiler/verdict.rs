@@ -68,20 +68,18 @@ pub fn judge(snap: &GuardSnapshot, subj: &Subject<'_>, now: Timestamp) -> Verdic
     v
 }
 
-/// Should the tracker record this programme when it's watched? Guarded now, or an airing of a
-/// guarded series at or after its next-up episode (watching the next-up on TV moves the
-/// boundary on).
+/// Should the tracker record this programme when it's watched? Its title or sub-title names a
+/// guarded topic, or it's an airing of a guarded series from its next-up episode on (watching
+/// the next-up on TV moves the boundary on). Unrelated sport whose text an active topic hides
+/// is never recorded.
 pub fn tracks(snap: &GuardSnapshot, subj: &Subject<'_>, now: Timestamp) -> bool {
     if !snap.on || !snap.ready {
         return false;
     }
-    if judge(snap, subj, now).guarded() {
-        return true;
-    }
-    match *subj {
-        Subject::Programme { title, season_episode: Some(se), .. } => series_mark(snap, title).is_some_and(|m| se >= m.next_up),
-        _ => false,
-    }
+    let Subject::Programme { title, sub_title, categories, season_episode, .. } = *subj else { return false };
+    let mut v = Verdict::default();
+    topic_hits(snap, &folded(title), sub_title.map(folded).as_deref(), categories, now, &mut v);
+    v.guarded() || series_mark(snap, title).is_some_and(|m| season_episode.is_none_or(|se| se >= m.next_up))
 }
 
 /// Topics mentioned in the title or sub-title that are active and in scope.

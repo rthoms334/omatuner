@@ -711,8 +711,18 @@ impl TunerApp {
             // every zap writes history: patch the recently watched list, never rebuild
             DataScope::History => self.refresh_recent_channels(),
             DataScope::VodDetails => {}
-            // a finished episode moves a series' spoiler boundary (debounced in the builder)
-            DataScope::Progress => self.services().agent.guard().rebuild(),
+            // a finished episode moves a series' spoiler boundary (debounced in the builder): a
+            // manual mark or the save at stop rebuilds; the player's 10 s saves during a film or
+            // episode don't (the guard's tracker rebuilds once an episode reaches 90 %)
+            DataScope::Progress => {
+                let saving = self.services().tiles.handles().iter().any(|h| {
+                    let s = h.snapshot();
+                    s.state == PlayerState::Playing && s.playable.as_ref().is_some_and(|p| !p.kind.is_live())
+                });
+                if !saving {
+                    self.services().agent.guard().rebuild();
+                }
+            }
             // the batch features' own data: their screens and services react (Following's job
             // raises `Reminders` too)
             DataScope::Spoiler | DataScope::Follow => self.services().agent.guard().rebuild(),

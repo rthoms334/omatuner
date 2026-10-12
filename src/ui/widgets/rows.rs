@@ -184,6 +184,8 @@ pub struct ChannelRowOpts<'a> {
     pub no_guide_label: Option<&'a str>,
     /// The quality badge after the name (`UiCtx::quality`; `None` = unknown or badges off).
     pub quality: Option<QualityBadge>,
+    /// The spoiler guard's view: programme titles as it shows them (`None`: as is).
+    pub spoilers: Option<&'a super::spoiler::Spoilers>,
 }
 
 /// The detail line of a channel row for a row `width`: "title · 20:00–21:00 · next: X",
@@ -196,10 +198,11 @@ fn channel_detail(ch: &ChannelSummary, now_next: Option<&NowNext>, width: f32, r
         return no_data();
     }
     let nn = now_next?;
-    let next = nn.next.as_ref().map(|n| format!("next: {}", n.title));
+    let title = |p: &ProgrammeSlim| opts.spoilers.map_or_else(|| p.title.to_string(), |s| s.programme_title(p).into_owned());
+    let next = nn.next.as_ref().map(|n| format!("next: {}", title(n)));
     let line = match &nn.now {
         Some(p) => {
-            let mut parts = vec![p.title.to_string()];
+            let mut parts = vec![title(p)];
             if width >= DETAIL_FULL_W * rem {
                 parts.push(super::time::span(p.start, p.stop, h24));
             }
@@ -211,7 +214,7 @@ fn channel_detail(ch: &ChannelSummary, now_next: Option<&NowNext>, width: f32, r
             parts.join(" · ")
         }
         None => match nn.next.as_ref() {
-            Some(n) => format!("{} {}", super::time::hhmm(n.start, h24), n.title),
+            Some(n) => format!("{} {}", super::time::hhmm(n.start, h24), title(n)),
             None => return no_data(),
         },
     };

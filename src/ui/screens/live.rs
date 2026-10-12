@@ -428,6 +428,8 @@ pub(crate) fn menu_item(icon: &'static str, label: impl Into<String>, action: Ac
 #[derive(Default)]
 pub(crate) struct ProgrammeDetails {
     key: Option<(ChannelId, Option<crate::model::ProgrammeId>)>,
+    /// The spoiler guard's `Spoilers::stamp` the description was loaded under.
+    stamp: (u64, u64),
     pub description: Option<String>,
     pub upcoming: Option<Vec<ProgrammeSlim>>,
     loaded_desc: bool,
@@ -440,6 +442,13 @@ impl ProgrammeDetails {
         let key = (ch.id, now_prog.map(|p| p.id));
         if self.key != Some(key) {
             *self = Self { key: Some(key), ..Default::default() };
+        }
+        // a new guard snapshot, a pause or a reveal (Ctrl+B): the description again
+        let stamp = crate::ui::widgets::spoiler::Spoilers::of(ctx).stamp();
+        if self.stamp != stamp {
+            self.stamp = stamp;
+            self.loaded_desc = false;
+            self.description = None;
         }
         let db = ctx.db;
         if !self.loaded_desc {
@@ -1824,12 +1833,14 @@ impl LiveScreen {
         let playing = playing_channel(ctx.player);
         // the first guide import says so instead of "No guide data" (DESIGN §13.12)
         let loading = self.guide.loading_label(ctx);
+        let spoilers = crate::ui::widgets::spoiler::Spoilers::of(ctx);
         let opts = ChannelRowOpts {
             density,
             show_number: ctx.config.interface.show_channel_numbers,
             show_logo: ctx.config.interface.show_logos,
             twelve_hour: !ctx.config.interface.clock_24h,
             no_guide_label: loading.as_deref(),
+            spoilers: Some(&spoilers),
             ..Default::default()
         };
         let sources = scope.marks(ctx);
@@ -2080,10 +2091,11 @@ impl LiveScreen {
             }
             (Some(_), Some(p)) => {
                 // time on the right first, the title truncated into what is left
+                let title = crate::ui::widgets::spoiler::Spoilers::of(ctx).programme_title(p);
                 ui.allocate_ui_with_layout(egui::vec2(width, line_h), egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(egui::RichText::new(time_range(p.start, p.stop, h24)).size(theme.font(TypeToken::Body)).color(t.text_secondary));
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        ui.add(egui::Label::new(egui::RichText::new(p.title.as_ref()).size(theme.font(TypeToken::Title)).color(t.fg)).truncate());
+                        ui.add(egui::Label::new(egui::RichText::new(title).size(theme.font(TypeToken::Title)).color(t.fg)).truncate());
                     });
                 });
                 ui.horizontal(|ui| {
@@ -2108,8 +2120,10 @@ impl LiveScreen {
             let item = channel_ref(&ch);
             // a fixed time column ("20:00" / "10:00 pm"), titles truncated to the pane
             let time_w = (theme.font(TypeToken::Body) * 5.0).round();
+            let spoilers = crate::ui::widgets::spoiler::Spoilers::of(ctx);
             for p in up {
                 let remind = self.reminders.iter().any(|r| r.channel == item && r.start == p.start);
+                let title = spoilers.programme_title(&p);
                 ui.allocate_ui_with_layout(egui::vec2(width, line_h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.allocate_ui_with_layout(egui::vec2(time_w, line_h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.set_min_width(time_w);
@@ -2120,7 +2134,7 @@ impl LiveScreen {
                             ui.label(egui::RichText::new(glyphs::REMINDER).size(theme.font(TypeToken::Body)).color(t.accent));
                         }
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            ui.add(egui::Label::new(egui::RichText::new(p.title.as_ref()).size(theme.font(TypeToken::Body)).color(t.fg)).truncate());
+                            ui.add(egui::Label::new(egui::RichText::new(title.as_ref()).size(theme.font(TypeToken::Body)).color(t.fg)).truncate());
                         });
                     });
                 });

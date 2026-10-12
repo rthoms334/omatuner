@@ -187,6 +187,10 @@ impl PlayerScreen {
         if snap.zap.as_ref().is_none_or(|z| z.channels.is_empty()) {
             return;
         }
+        // the spoiler guard's zap shield: a shielded neighbour gets its card, never a tune
+        if self.shield_zap(ctx, forward) {
+            return;
+        }
         if ctx.parental.is_unlocked(&ctx.config.parental) {
             ctx.play(PlayerCommand::Zap { forward, unlocked: true });
             return;
@@ -199,6 +203,9 @@ impl PlayerScreen {
 
     /// Tune a channel from a panel / numeric entry (keeps the zap list); locked → PIN.
     fn tune(&mut self, ctx: &mut UiCtx<'_>, id: ChannelId, retry: Action) -> bool {
+        if self.shield_tune(ctx, id) {
+            return true;
+        }
         if playing_channel(ctx.player) == Some(id) {
             return true;
         }
@@ -420,6 +427,9 @@ impl Screen for PlayerScreen {
             return h;
         }
         if let Some(h) = self.panel_action(ctx, action) {
+            return h;
+        }
+        if let Some(h) = self.shield_action(ctx, action) {
             return h;
         }
         if let Some(h) = self.multiview_action(ctx, action) {
@@ -896,6 +906,48 @@ mod tests {
         assert!(h.state_mut().act(Action::ZapNext));
         frames(&mut h);
         assert!(!banner(&h), "a parked pointer doesn't hold the banner");
+    }
+
+    /// The spoiler guard's zap shield acts before tuning: ↓ onto a shielded channel puts the
+    /// card up and tunes nothing, ↓ on the card judges the next channel, Enter tunes it anyway.
+    #[test]
+    fn a_shielded_zap_tunes_nothing_until_watch_anyway() {
+        use crate::guard::Guard;
+        use crate::spoiler::snapshot::{GuardSnapshot, Settings, ShieldSpan, Topic, TopicMode, TopicSource};
+        use crate::ui::screens::home::testkit::{channels, seed, source};
+        let (mut t, one) = rig();
+        let ids = seed(&mut t, |c| {
+            let s = source(c, "TV")?;
+            channels(c, s, 4)
+        });
+        // a Sky Sports News on channels 2 and 3 while "Arsenal" is guarded
+        let span = ShieldSpan { start: t.now - 60, stop: t.now + 3600, topic: 0, is_event: false };
+        let shields = [(ids[1], vec![span.clone()]), (ids[2], vec![span])].into_iter().collect();
+        let topic = Topic::new("Arsenal", TopicSource::Follow, TopicMode::Always);
+        let settings = Settings { shield_zap: true, ..Default::default() };
+        let snap = GuardSnapshot::from_parts(settings, vec![(topic, vec!["arsenal".into()])], Default::default(), shields);
+        t.services().agent.set_guard(Guard::with_snapshot(snap));
+        let mut h = harness(t, one, PlayerScreen::default(), WIDE);
+        let mut s = (*real(&h)).clone();
+        s.state = PlayerState::Playing;
+        s.playable = Some(Arc::new(Playable { media: MediaRef::Channel(ids[0]), ..(*playable()).clone() }));
+        s.zap = Some(crate::model::ZapList { collection: crate::model::Collection::AllChannels, channels: ids.clone().into() });
+        h.state_mut().t.snapshot = Arc::new(s);
+        h.state_mut().enter(Route::Player);
+        h.run_steps(3);
+        let tuned = |h: &H| real(h).playable.as_ref().map(|p| p.media.clone());
+        assert!(h.state_mut().act(Action::ZapNext));
+        h.run_steps(3);
+        assert_eq!(h.state().s.shield_card(), Some(ids[1]), "the card, not channel 2");
+        assert!(h.state_mut().act(Action::ZapNext));
+        h.run_steps(3);
+        assert_eq!(h.state().s.shield_card(), Some(ids[2]), "↓ on the card judges channel 3: shielded too");
+        std::thread::sleep(Duration::from_millis(300));
+        h.run_steps(2);
+        assert_eq!(tuned(&h), None, "nothing was tuned");
+        assert!(h.state_mut().act(Action::FocusOsdControls), "Enter: watch anyway");
+        until(&mut h, "channel 3 tuned", |h| tuned(h) == Some(MediaRef::Channel(ids[2])));
+        assert_eq!(h.state().s.shield_card(), None);
     }
 
     /// Popped out: the strip under the pointer has the way back to the full window, and so does

@@ -181,6 +181,9 @@ fn match_day(name: &str) -> World {
 #[test]
 fn an_embargo_opens_at_kick_off_and_lifts_when_seen_or_after_its_window() {
     let world = match_day("spoiler-embargo");
+    // the repeat the next day on another channel is the same match
+    let repeat = KICK_OFF + 24 * H;
+    world.prog("BBC Two", repeat, repeat + 2 * H, "Arsenal v Chelsea (R)", None, None, "Sport", None);
     let cfg = Config::default();
     let g = world.guard(&cfg, KICK_OFF - 6 * H);
     let sport: Vec<String> = vec!["Sport".into()];
@@ -213,24 +216,35 @@ fn an_embargo_opens_at_kick_off_and_lifts_when_seen_or_after_its_window() {
     assert!(!g.judge(&news, KICK_OFF + 2 * H + 48 * H).guarded());
 
     // one "seen" (the repeat on TV 2's copy has the same event) lifts it everywhere
-    let key = tuner::spoiler::event_key_of("PL: Arsenal v Chelsea", None, Some("Live coverage"), None, KICK_OFF);
-    let row = SeenRow {
-        event_key: key.clone(),
-        first_start: KICK_OFF,
-        title: "PL: Arsenal v Chelsea".into(),
-        series_norm: None,
-        season: None,
-        episode: None,
-        seen_at: t,
-        how: SeenHow::Marked,
+    let seen = |title: &str, start: Timestamp| {
+        let key = tuner::spoiler::event_key_of(title, None, None, None, start);
+        let row = SeenRow {
+            event_key: key.clone(),
+            first_start: start,
+            title: title.into(),
+            series_norm: None,
+            season: None,
+            episode: None,
+            seen_at: t,
+            how: SeenHow::Marked,
+        };
+        assert!(w(&world.store, move |c| db::mark_seen(c, &row)));
+        key
     };
-    assert!(w(&world.store, move |c| db::mark_seen(c, &row)));
+    let key = seen("PL: Arsenal v Chelsea", KICK_OFF);
     let g = world.guard(&cfg, t);
     assert!(!g.judge(&news, t).guarded(), "seen: lifted");
     assert!(!g.topics(t)[0].active);
+    let at_repeat = repeat + H;
+    assert!(!world.guard(&cfg, at_repeat).judge(&news, at_repeat).guarded(), "the next day's repeat opens no new window");
     // Undo guards again
     assert!(w(&world.store, move |c| db::unmark_seen(c, &key, KICK_OFF)));
     assert!(world.guard(&cfg, t).judge(&news, t).guarded());
+    // watching only the repeat lifts the match's window too
+    let key = seen("Arsenal v Chelsea (R)", repeat);
+    let after = repeat + 3 * H;
+    assert!(!world.guard(&cfg, after).judge(&news, after).guarded(), "seen on the repeat");
+    assert!(w(&world.store, move |c| db::unmark_seen(c, &key, repeat)));
 
     // the guard off: nothing
     let off = Config { spoiler: tuner::config::SpoilerConfig { enabled: false, ..Default::default() }, ..Default::default() };
@@ -399,10 +413,13 @@ fn mcp_replies_lose_guarded_text_unless_revealed() {
 fn following_spoiler_safe_rules_are_guard_topics() {
     let world = World::new("spoiler-follow");
     world.prog("Sky Sports Main Event", KICK_OFF, KICK_OFF + 2 * H, "Spurs v Arsenal", None, None, "Sport", None);
+    // not the followed team's match: the women's side (`without`), a fan channel (no fixture)
+    world.prog("BBC Two", KICK_OFF - 6 * H, KICK_OFF - 4 * H, "Spurs Women v Arsenal Women", None, None, "Sport", None);
+    world.prog("Sky Sports News", KICK_OFF - 4 * H, KICK_OFF - 3 * H, "Spurs Fan TV", None, None, "Sport", None);
     w(&world.store, |c| {
         c.execute_batch(
             "INSERT INTO follow_rule(name, kind, spec, spoiler_safe, priority, created_at, updated_at)
-               VALUES ('Spurs', 'team', '{\"v\":1,\"terms\":[\"Spurs\",\"Tottenham\"]}', 1, 0, 0, 0);
+               VALUES ('Spurs', 'team', '{\"v\":1,\"terms\":[\"Spurs\",\"Tottenham\"],\"without\":[\"Women\",\"Fan TV\"]}', 1, 0, 0, 0);
              INSERT INTO follow_rule(name, kind, spec, spoiler_safe, priority, created_at, updated_at)
                VALUES ('Taskmaster', 'show', '{\"v\":1,\"terms\":[\"Taskmaster\"]}', 0, 1, 0, 0);
              INSERT INTO follow_rule(name, kind, spec, spoiler_safe, priority, created_at, updated_at)
@@ -414,6 +431,11 @@ fn following_spoiler_safe_rules_are_guard_topics() {
     let topics = g.topics(KICK_OFF + H);
     assert_eq!(topics.iter().map(|t| (t.label.as_str(), t.rule, t.active)).collect::<Vec<_>>(), [("Spurs", None, true)]);
     assert_eq!(g.outside_title("Tottenham 3-0 Arsenal", KICK_OFF + H), "Tottenham v Arsenal");
+    // narrow: only the fixture opened a window, and other sport keeps its text meanwhile
+    assert!(!g.topics(KICK_OFF - H)[0].active, "the women's match and the fan channel are not the event");
+    let sport: Vec<String> = vec!["Sport".into()];
+    let golf = prog("Golf", Some("Round three"), &sport);
+    assert!(!g.judge(&golf, KICK_OFF + H).guarded(), "unrelated sport stays readable");
 }
 
 #[test]

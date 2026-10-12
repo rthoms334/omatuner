@@ -1419,7 +1419,7 @@ fn channel_tile(ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, id: ChannelId, cursor: b
             elided(
                 p,
                 egui::pos2(left, detail_y),
-                &now.title,
+                &crate::ui::widgets::spoiler::Spoilers::of(ctx).programme_title(now),
                 egui::FontId::proportional(theme.font(TypeToken::BodySmall)),
                 t.text_secondary,
                 right - left - bar_w - pad,
