@@ -8,9 +8,10 @@
 //!   — `agent::query`. A snapshot built while unlocked loses its explicit content here when the
 //!   session relocked since (`Library::hiding_explicit`, cached per snapshot);
 //! * `play` validates the target (`agent::act::plan_play`: exists, visible, catch-up window…),
-//!   resolves where it shows (`agent::act::agent_show`: the pop-out by default, DESIGN §30.13)
-//!   and sends `AppEvent::Agent(AgentCommand::Play)`, with `hypr::focus_self()` only when it
-//!   shows in the window: the app applies the PIN rules (prompt on screen), zap lists and
+//!   resolves where it shows (`agent::act::agent_show`: by default the full window when it's
+//!   on screen, else the pop-out, DESIGN §30.13) and sends
+//!   `AppEvent::Agent(AgentCommand::Play)`, with `hypr::focus_self()` only when it shows in
+//!   the window: the app applies the PIN rules (prompt on screen), zap lists and
 //!   resume rules exactly as for a key press, and moves the window;
 //! * `control` / `status` go straight to the `PlayerHandle` (work while the window is hidden);
 //! * `schedule_switch` / `cancel_switch` write reminder rows (`Reminder::SWITCH_LEAD`) through
@@ -265,13 +266,14 @@ impl Inner {
 
     /// Where an agent's play shows ([`act::agent_show`] with the user's "Agents play in"), and
     /// the window it was decided on. When the answer depends on whether the user sees Tuner's
-    /// window (they watch in it or have two pictures on, without it having the keyboard: the
-    /// agent's terminal has it), Hyprland is asked ([`crate::platform::popout::self_shown`]);
-    /// when it can't tell, the window counts as seen (nothing moves uninvited).
+    /// window (unasked, not popped out, without the keyboard: the agent's terminal has it),
+    /// Hyprland is asked ([`crate::platform::popout::self_shown`]); when it can't tell — also
+    /// for a Tuner just started for this play, not mapped yet: it opens on the terminal's
+    /// workspace — the window counts as seen (nothing moves uninvited).
     pub(super) async fn show(&self, asked: Option<OpenIn>, pin: bool) -> (act::AgentShow, WindowNow) {
         let (mut w, setting) = (self.window(), self.cfg().agents.play_in);
         let unasked = asked.is_none() && !pin && setting != OpenIn::FullWindow;
-        if unasked && w.can_pop && !w.popped_out && !w.visible && (w.watching || w.fullscreen || w.multiview) {
+        if unasked && w.can_pop && !w.popped_out && !w.visible {
             let shown = tokio::task::spawn_blocking(crate::platform::popout::self_shown).await.ok().flatten();
             w.visible = shown.unwrap_or(true);
         }

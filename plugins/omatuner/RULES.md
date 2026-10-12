@@ -23,9 +23,10 @@ line.
 - Call `status` first. If something plays, say "this replaces <what plays>". A plain "play X"
   needs no other confirmation.
 - `status.queue`: Up next is playing. Say so before replacing it.
-- Where it plays: `play` and `queue play` open in the pop-out (a small player pinned on every
-  workspace that never takes the keyboard) unless the user asks for full screen, the big screen
-  or the TV: then pass `open_in: "full_window"` (Tuner's window, full screen). To move what
+- Where it plays: `play` and `queue play` open in Tuner's window when the user can see it, else
+  in the pop-out (a small player pinned on every workspace that never takes the keyboard);
+  Tuner decides. If the user asks for full screen, the big screen or the TV, pass `open_in:
+  "full_window"` (Tuner's window, full screen); for the pop-out, `open_in: "popout"`. To move what
   already plays there, use `control` `window` instead of playing it again. Never pass
   `open_in: "popout"` to move what the user watches in Tuner's window unless they ask (Tuner
   keeps a window the user can see by itself). Say where it opened (`opened_in`: "in the

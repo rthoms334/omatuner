@@ -51,11 +51,13 @@ impl AgentShow {
 /// Where an agent's play opens (DESIGN §30.13). An explicit `open_in` wins, else the setting
 /// (Settings ▸ AI agents "Agents play in"; a hand-written `where-i-am` counts as the pop-out,
 /// the screen's two choices). The PIN is typed in Tuner's window; without Hyprland there is no
-/// pop-out; `full_window` also makes the window fullscreen. Unasked, the pop-out never takes
-/// what the user watches in the window: a fullscreen window or the player on screen
-/// (`WindowNow::visible`: focused, or on a workspace a monitor shows) stay in the window, not
-/// raised (it is where the user looks); two pictures stay in the window, raised when it's out
-/// of sight; a pop-out stays the pop-out. Pure.
+/// pop-out; `full_window` also makes the window fullscreen. Unasked, the pop-out is for a
+/// window the user can't see: a window on screen (`WindowNow::visible`: focused, or on a
+/// workspace a monitor shows — beside the agent's terminal, on the other monitor) plays in the
+/// full window whatever screen it shows, not raised (it is where the user looks; the terminal
+/// keeps the keyboard), a fullscreen one staying fullscreen; a window out of sight pops out;
+/// two pictures stay in the window, raised when it's out of sight; a pop-out stays the
+/// pop-out. Pure.
 pub fn agent_show(asked: Option<OpenIn>, setting: OpenIn, w: WindowNow, pin: bool) -> AgentShow {
     let full = AgentShow { fullscreen: true, ..AgentShow::window(true) };
     match asked {
@@ -70,7 +72,7 @@ pub fn agent_show(asked: Option<OpenIn>, setting: OpenIn, w: WindowNow, pin: boo
             OpenIn::FullWindow => AgentShow::window(true),
             OpenIn::PopOut | OpenIn::WhereIAm if w.popped_out => AgentShow::POP_OUT,
             OpenIn::PopOut | OpenIn::WhereIAm if w.multiview => AgentShow::window(!w.visible),
-            OpenIn::PopOut | OpenIn::WhereIAm if w.visible && (w.fullscreen || w.watching) => AgentShow::window(false),
+            OpenIn::PopOut | OpenIn::WhereIAm if w.visible => AgentShow::window(false),
             OpenIn::PopOut | OpenIn::WhereIAm => AgentShow::POP_OUT,
         },
     }
@@ -565,8 +567,8 @@ mod tests {
     use super::*;
 
     /// DESIGN §30.13's order: an explicit `full_window` (fullscreen), the PIN, the rest of
-    /// `open_in`, then no Hyprland, then the setting — which, unasked, keeps what the user
-    /// watches in a window on screen (focused or not: the agent's terminal has the keyboard) and
+    /// `open_in`, then no Hyprland, then the setting — which, unasked, plays in a window on
+    /// screen (focused or not, watching or browsing: the agent's terminal has the keyboard) and
     /// a pop-out, and pops out of a window nobody sees.
     #[test]
     fn agent_show_resolves_explicit_then_setting_then_the_window() {
@@ -582,9 +584,11 @@ mod tests {
         let cases = [
             // (asked, setting, window, pin) → show
             (None, PopOut, away, false, pop),
-            (None, PopOut, WindowNow { focused: true, visible: true, ..away }, false, pop),
             (None, PopOut, WindowNow { watching: true, ..away }, false, pop),
-            // tiled beside the terminal, or on the other monitor: the terminal has the keyboard
+            // tiled beside the terminal, or on the other monitor: the terminal has the keyboard;
+            // browsing (Live TV's preview, Home) too — the player screen fills the window
+            (None, PopOut, shown, false, kept),
+            (None, PopOut, WindowNow { focused: true, visible: true, ..away }, false, kept),
             (None, PopOut, WindowNow { watching: true, ..shown }, false, kept),
             (None, PopOut, WindowNow { focused: true, watching: true, ..shown }, false, kept),
             (None, PopOut, fullscreen, false, kept),
@@ -593,6 +597,7 @@ mod tests {
             (None, PopOut, WindowNow { multiview: true, ..away }, false, raised),
             (None, PopOut, WindowNow { popped_out: true, ..away }, false, pop),
             (None, WhereIAm, away, false, pop),
+            (None, WhereIAm, shown, false, kept),
             (None, FullWindow, WindowNow { popped_out: true, ..away }, false, raised),
             (None, FullWindow, away, true, raised),
             (Some(FullWindow), PopOut, WindowNow { popped_out: true, ..away }, false, full),

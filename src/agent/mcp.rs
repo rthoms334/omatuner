@@ -314,7 +314,9 @@ fn without_open_in(call: &Call) -> Option<Call> {
 
 /// How a call starts Tuner when it isn't running: a play that opens in the pop-out (DESIGN
 /// §30.13) starts it there, pinned and without the keyboard (like a switch reminder), the rest
-/// in its window. `setting`: "Agents play in", read only for plays.
+/// in its window. Unasked, a play starts the window too: Hyprland opens it on the workspace
+/// the agent's terminal shows, i.e. on screen, where the play fills it; only `open_in:
+/// popout` starts the pop-out. `setting`: "Agents play in", read only for plays.
 fn launch_for(tool: &tools::ToolDef, call: &Call, hyprland: bool, setting: impl FnOnce() -> crate::model::OpenIn) -> Launch {
     use super::params::QueueAction;
     if !tool.launches {
@@ -327,8 +329,8 @@ fn launch_for(tool: &tools::ToolDef, call: &Call, hyprland: bool, setting: impl 
     };
     // a bad open_in is refused by Tuner anyway
     let Ok(asked) = super::act::parse_open_in(asked) else { return Launch::Window };
-    // a Tuner that isn't running has no window to keep: what the pop-out would be used for
-    let w = crate::reminders::ui::WindowNow { can_pop: hyprland, ..Default::default() };
+    // a Tuner that isn't running opens its window on the current workspace: on screen
+    let w = crate::reminders::ui::WindowNow { can_pop: hyprland, visible: true, ..Default::default() };
     match super::act::agent_show(asked, setting(), w, false).place {
         crate::reminders::ui::Placement::PopOut => Launch::PopOut,
         _ => Launch::Window,
@@ -383,7 +385,8 @@ mod tests {
         }
     }
 
-    /// A play that would open in the pop-out starts Tuner there (DESIGN §30.13); a play for
+    /// A play asked for in the pop-out starts Tuner there (DESIGN §30.13); an unasked play
+    /// (its window opens on the terminal's workspace, on screen: the play fills it), a play for
     /// the window, the setting "Full window", no Hyprland or any other tool start its window;
     /// `status` never starts it.
     #[test]
@@ -394,12 +397,13 @@ mod tests {
             launch_for(&tool, &Call::from_tool(name, args).unwrap(), hyprland, || setting)
         };
         let film = || json!({ "ref": "movie:2:xt:vod:1" });
-        assert_eq!(launch("play", film(), true, OpenIn::PopOut), Launch::PopOut);
+        assert_eq!(launch("play", film(), true, OpenIn::PopOut), Launch::Window, "unasked: the window, on screen");
         assert_eq!(launch("play", json!({ "ref": "movie:2:xt:vod:1", "open_in": "full_window" }), true, OpenIn::PopOut), Launch::Window);
         assert_eq!(launch("play", json!({ "ref": "movie:2:xt:vod:1", "open_in": "popout" }), true, OpenIn::FullWindow), Launch::PopOut);
         assert_eq!(launch("play", film(), true, OpenIn::FullWindow), Launch::Window);
         assert_eq!(launch("play", film(), false, OpenIn::PopOut), Launch::Window, "no Hyprland: no pop-out");
-        assert_eq!(launch("queue", json!({ "action": "play" }), true, OpenIn::PopOut), Launch::PopOut);
+        assert_eq!(launch("queue", json!({ "action": "play" }), true, OpenIn::PopOut), Launch::Window);
+        assert_eq!(launch("queue", json!({ "action": "play", "open_in": "popout" }), true, OpenIn::PopOut), Launch::PopOut);
         assert_eq!(launch("queue", json!({ "action": "add", "refs": ["movie:2:xt:vod:1"] }), true, OpenIn::PopOut), Launch::Window);
         assert_eq!(launch("search", json!({ "query": "dune" }), true, OpenIn::PopOut), Launch::Window);
         assert_eq!(launch("status", json!({}), true, OpenIn::PopOut), Launch::No);

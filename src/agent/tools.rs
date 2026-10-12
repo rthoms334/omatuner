@@ -21,8 +21,9 @@ Use these tools to find something to watch and start it in Tuner instead of the 
 airing=upcoming → tell the user when it starts and offer a reminder (reminders add with mode switch, or schedule_switch: Tuner \
 then switches to it by itself at the start, showing a toast with Cancel 10 seconds before). airing=past with catchup=true → play replays it from the archive.\n\
 * \"what's on <channel> at 9\" → whats_on with channel and at.\n\
-* play (and queue play) open in the pop-out, pinned on every workspace, unless the user wants full screen, the big screen or the TV: \
-then open_in full_window (control window moves what already plays there). Tell the user where it opened (opened_in).\n\
+* play (and queue play) open in Tuner's window when it is on screen, else in the pop-out, pinned on every workspace; when the user wants \
+full screen, the big screen or the TV: open_in full_window (control window moves what already plays there). Tell the user where it \
+opened (opened_in).\n\
 * A mood (\"something light under 2 hours\") → categories, then browse with a fitting category, max_minutes, unwatched=true, \
 sort=random; details for a plot; pick one and play it. continue_watching for \"carry on with my show\".\n\
 * Tuner's spoiler guard applies to every answer: guarded text is gone and the item says spoiler: {hidden, rule, reason}. Say \
@@ -305,10 +306,10 @@ pictures) and the sleep timer. Call it before replacing playback. Doesn't start 
         ToolDef {
             name: "play",
             title: "Play",
-            description: "Play a ref in Tuner. It opens in the pop-out by default: a small player pinned on every workspace that never \
-takes the keyboard (the user can make Tuner's window the default in Settings ▸ AI agents). open_in: full_window when the user asks for \
-full screen, the big screen or the TV (Tuner's window, full screen and in front); popout to move it to the pop-out; where_i_am to \
-change only what plays. Without open_in, what the user watches in Tuner's window (fullscreen, or on screen) stays there. The result's \
+            description: "Play a ref in Tuner. By default it plays in Tuner's window when that is on screen (not brought to the front), \
+else in the pop-out: a small player pinned on every workspace that never takes the keyboard (the user can make Tuner's window the \
+default in Settings ▸ AI agents). open_in: full_window when the user asks for full screen, the big screen or the TV (Tuner's window, \
+full screen and in front); popout to move it to the pop-out; where_i_am to change only what plays. The result's \
 opened_in (popout or window) says where it plays: tell the user. Channel → live. Programme → live when on now (with from_start=true \
 restarted from the archive when the channel has catch-up), from the archive when past and catchup=true, an error (not_started) when \
 upcoming — offer reminders add (mode switch) or schedule_switch. Movie / episode → resumes saved progress (from_start=true starts \
@@ -318,7 +319,7 @@ tell the user to type it there; never ask for it in chat.",
                 json!({
                     "ref": text("Channel, programme, movie, series or episode ref."),
                     "from_start": { "type": "boolean", "default": false },
-                    "open_in": open_in("Where it plays (default: the user's setting, the pop-out). full_window: full screen, the big screen, the TV."),
+                    "open_in": open_in("Where it plays (default: the user's setting: Tuner's window when on screen, else the pop-out). full_window: full screen, the big screen, the TV."),
                 }),
                 &["ref"],
             ),

@@ -1108,15 +1108,23 @@ impl TunerApp {
 
     /// An MCP client's `play` (DESIGN §30.4): [`Self::agent_play`], then the window where the
     /// handler resolved (§30.13). A PIN prompt the handler didn't predict (the session relocked
-    /// since) shows in the window: popped back in and raised.
+    /// since) shows in the window: popped back in and raised (also a window on screen the
+    /// handler left unraised: the terminal has the keyboard).
     fn on_agent_play(&mut self, p: crate::agent::AgentPlay, egui_ctx: &egui::Context) {
         use crate::reminders::ui::Placement;
         let show = p.show;
         match self.agent_play(p) {
-            AgentPlayed::Sent => self.agent_place(show, egui_ctx),
+            AgentPlayed::Sent => {
+                if show.place == Placement::FullWindow {
+                    self.agent_leave_screen();
+                }
+                self.agent_place(show, egui_ctx);
+            }
             AgentPlayed::Pin => {
                 self.agent_place(crate::agent::act::AgentShow { place: Placement::FullWindow, ..show }, egui_ctx);
-                if show.place != Placement::FullWindow {
+                // the handler raised only a window it put the play in (`AgentShow::raise`);
+                // the prompt wants the keyboard wherever the play was headed
+                if !show.raise {
                     crate::platform::hypr::focus_self();
                 }
             }
@@ -1155,10 +1163,24 @@ impl TunerApp {
     /// `AgentCommand::Show`: what Up next started for an agent, shown like an agent's play (the
     /// player screen under a pop-out, so popping in lands on it), or `control window`.
     fn agent_show(&mut self, show: crate::agent::act::AgentShow, egui_ctx: &egui::Context) {
-        if show.place != crate::reminders::ui::Placement::InPlace && self.current_route() != &Route::Player {
+        use crate::reminders::ui::Placement;
+        if show.place == Placement::FullWindow {
+            self.agent_leave_screen();
+        }
+        if show.place != Placement::InPlace && self.current_route() != &Route::Player {
             self.nav.push(NavRequest::Push(Route::Player));
         }
         self.agent_place(show, egui_ctx);
+    }
+
+    /// An agent's play taking the full window from another screen (Live TV, Home, the Guide):
+    /// what that screen had open (Search, a programme popover, a menu) closes, as on a tab
+    /// switch, so the player screen fills the window (DESIGN §30.13). A PIN prompt queued by
+    /// this play opens after.
+    fn agent_leave_screen(&mut self) {
+        if self.current_route() != &Route::Player {
+            self.overlays.clear();
+        }
     }
 
     /// Play an agent's target like a key press would: the PIN prompt for a locked item (played
@@ -4593,7 +4615,22 @@ mod tests {
         rig.press(Key::Escape, NONE);
         assert_eq!(rig.route(), &start);
 
+        // the window on screen while browsing (Live TV, a menu left open): the player fills it,
+        // nothing pops out
+        rig.app.nav.push(NavRequest::Switch(Route::Live { group: None, channel: None }));
+        let menu = crate::ui::overlays::ContextMenuSpec { title: "News".into(), items: vec![] };
+        rig.app.nav.push(NavRequest::Open(OverlayRequest::ContextMenu(menu)));
+        rig.frame_with(vec![]);
+        assert_eq!(rig.app.overlays.len(), 1);
         let ch = rig.app.lib.live.by_ref(&channel_ref(1)).unwrap();
+        let play = AgentPlay { target: PlayTarget::Media(MediaRef::Channel(ch)), from_start: false, show: AgentShow::window(false) };
+        rig.event(AppEvent::Agent(AgentCommand::Play(play)));
+        rig.frame_with(vec![]);
+        assert_eq!(rig.route(), &Route::Player, "from Live TV: the player screen");
+        assert!(!rig.app.reminder_ui.pop_out_pending && !rig.app.window_fullscreen);
+        assert!(rig.app.overlays.is_empty(), "the menu closed with Live TV");
+        rig.press(Key::Escape, NONE);
+
         let play = AgentPlay { target: PlayTarget::Media(MediaRef::Channel(ch)), from_start: false, show: AgentShow::POP_OUT };
         rig.event(AppEvent::Agent(AgentCommand::Play(play)));
         assert!(rig.app.reminder_ui.pop_out_pending, "before the worker: asked for");

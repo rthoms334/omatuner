@@ -3088,7 +3088,7 @@ for any window. Tuner does it for itself with `o` in the player or Ctrl+Shift+O 
   `floatWindow`; `changeWindowFloatingMode` in older releases).
 * **Launch into the pop-out** (Tuner closed: a scheduled switch with Open in: Pop-out starts it
   — `ClosedOutcome::StartApp { popout }` — `tuner --play <ref> --popout`, or `tuner mcp` for an
-  agent's play that opens in the pop-out, `--agent-popout`, §30.13): under Hyprland the
+  agent's play asked for in the pop-out, `--agent-popout`, §30.13): under Hyprland the
   window is created with the app id **`tuner-popout`** (`tuner::window_app_id`, chosen from the
   command line before the window exists; winit can't change it later) at the pop-out size. The
   packaged rule `o.window("^(tuner-popout)$", { float = true, pin = true, no_initial_focus =
@@ -5188,8 +5188,8 @@ Example flows: "touring cars is on" → `guide_search{query:"touring car"}` → 
 * No instance: `ExeLauncher` → wait for the socket (≤ 15 s; a background `--refresh` holding the
   lock shows up as "didn't start" with its reason) → `loading` until the first library build
   (≤ 20 s). A started-by-MCP Tuner opens its normal start screen on the current workspace —
-  except for a play that opens in the pop-out (§30.13): `tuner --agent-popout`, the pop-out
-  only (pinned, without the keyboard) on the current workspace.
+  except for a play asked for in the pop-out (`open_in: popout`, §30.13): `tuner
+  --agent-popout`, the pop-out only (pinned, without the keyboard) on the current workspace.
 * An instance from before v2 → `TooOld` ("restart Tuner to update it").
 
 ### 30.8 Auto-switch reminders (`platform::notify`, `store::user`, `app.rs`)
@@ -5379,7 +5379,8 @@ back to "your agent".
 ### 30.13 Where an agent's playback opens (decision record, 2026-10-12)
 User report: "I tested out the play from claude and it started the mini player in the app.
 What I meant for this feature would be to start it detached as the multi workspace visible
-player" — the pop-out (§21.6). Decision: what an agent plays opens in the pop-out by default,
+player" — the pop-out (§21.6). Decision: what an agent plays opens in the pop-out by default
+(amended the same day: unless Tuner's window is on screen, step 6 and its follow-up),
 the way scheduled playback does (§30.8, reminders "Open in"), and the agent says where.
 * **Where.** `play` and `queue` (`play`, `skip`) take `open_in`: the reminders' names,
   `popout` / `full_window` / `where_i_am`. Settings ▸ AI agents "Agents play in" (`[agents]
@@ -5396,16 +5397,29 @@ the way scheduled playback does (§30.8, reminders "Open in"), and the agent say
   5. `popout` → the pop-out, also out of a fullscreen window (asked for);
   6. the setting: Tuner window → the window, raised. Pop-out: a pop-out stays the pop-out (one
      still pending from a launch counts); two pictures on (§35) stay in the window, raised when
-     it is out of sight; a fullscreen window or the player **on screen** stay in the window,
-     **not raised** (it is where the user looks); anything else (Tuner on a workspace no
-     monitor shows, browsing, a fullscreen window out of sight) → the pop-out.
+     it is out of sight; Tuner's window **on screen** → its full window, **not raised** (it is
+     where the user looks; the terminal keeps the keyboard), whatever screen it shows — the
+     player is pushed over Live TV's preview, Home, Movies… — and a fullscreen window stays
+     fullscreen (the window is not made fullscreen otherwise); the window **out of sight**
+     (on a workspace no monitor shows, fullscreen or not) → the pop-out.
+  Follow-up (user report, 2026-10-12: "When I minimised after that to in app preview every
+  launch after that just stayed in preview. It was intended to have it launch in the popout
+  player IF the running app is not in the same workspace as the agent terminal … If its in the
+  same workspace it would be full window width (not necessarily fill screen)"). That report
+  came from an 0.2.4 build from before this section's first change (no `--agent-popout`, no
+  `opened_in`): there `queue play` only fed the corner mini player (the Live TV preview), as
+  "Up next" below describes. The rule it states still stands and changes step 6: it used to
+  keep the window only when the player or a fullscreen window was on screen, so a window on
+  screen showing Live TV, Home or a film page popped out; now being on screen alone decides.
+  A window under another one fullscreen (or maximized) on its workspace — the terminal after
+  Super+F — is out of sight (`j/clients`): the play pops out.
   "On screen" (`WindowNow::visible`) is not keyboard focus: an agent's user types in a terminal,
   so Tuner is almost never focused when a play arrives (tiled beside it, on a second monitor).
-  The app publishes `visible = focused`; when the answer depends on it, the handler asks
-  Hyprland at play time (`platform::popout::self_shown`, `spawn_blocking`: `j/clients` +
-  `j/monitors` — our window pinned, or on a monitor's active or open special workspace, and not
-  a hidden group tab). When Hyprland can't tell, the window counts as seen (nothing moves
-  uninvited).
+  The app publishes `visible = focused`; when the answer depends on it (unasked, setting
+  Pop-out, not popped out, not focused), the handler asks Hyprland at play time (`platform::popout::self_shown`, `spawn_blocking`: `j/clients` +
+  `j/monitors` — our window pinned, or on a monitor's active or open special workspace, not
+  a hidden group tab, and not under another window fullscreen on its workspace). When Hyprland can't tell (also a window not mapped yet: Tuner just
+  started for this play, below), the window counts as seen (nothing moves uninvited).
 * **Focus.** The handler calls `hypr::focus_self()` only when the window is raised (before, it
   raised on every play: the main window jumped in front). The pop-out never takes the
   keyboard (§21.6).
@@ -5439,11 +5453,14 @@ the way scheduled playback does (§30.8, reminders "Open in"), and the agent say
   play) while the published window is popped out (or about to be) and the main picture idle
   sends `AgentCommand::PopIn`: the empty pop-out goes back into the window, unraised, instead of
   staying pinned on every workspace saying "Nothing playing".
-* **Tuner not running.** The bridge decides with the same function (no window to keep):
-  a play that would open in the pop-out under Hyprland starts `tuner --agent-popout`
-  (`client::Launch::PopOut`) — the switch reminders' launch (`tuner-popout` app id, the
-  packaged no-focus rule, popped out on the first frame), showing "Nothing playing" for the
-  second until the play arrives. Everything else starts Tuner's window as before.
+* **Tuner not running.** The bridge decides with the same function, the window counted on
+  screen (Hyprland opens a new window on the current workspace: the one the agent's terminal
+  is on). So an unasked play starts Tuner's window as a plain `tuner` would (tiled, normal app
+  id, focused like any app launch), and the play fills it (step 6: before the first frame nothing is published, the window
+  isn't mapped or is on screen, so the handler decides the window too; no pop-out is pending).
+  Only `open_in: popout` under Hyprland starts `tuner --agent-popout` (`client::Launch::PopOut`)
+  — the switch reminders' launch (`tuner-popout` app id, the packaged no-focus rule, popped out
+  on the first frame), showing "Nothing playing" for the second until the play arrives.
 * **Multi-view** stays in the main window: an agent's `multiview open` while popped out pops
   back in and raises the window first (§35.3).
 * **Unchanged.** `control previous_channel`, zaps and `control popout` act wherever playback
@@ -5581,7 +5598,8 @@ the panel, `n` / `N` step. Home shows an "Up next" rail while items wait and not
   is skipped as "Expired".
 * Every play goes through B1 (`PlaySource::Queue`); in multi-view Up next waits.
 * An agent's `queue play` (and `skip` when Up next wasn't playing) shows where `play` would —
-  the pop-out by default, `open_in` — and the following items stay there; a `skip` inside a
+  Tuner's window when it's on screen, else the pop-out, `open_in` — and the following items
+  stay there; a `skip` inside a
   running Up next keeps it where it plays (§30.13).
 * With Up next empty, an episode ending outside it offers the next episode with a countdown
   (the engine, in any placement, a hidden window included). Before it plays it re-reads the

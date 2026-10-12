@@ -258,8 +258,8 @@ pub struct WindowNow {
     /// Two pictures are on (multi-view). An agent's play keeps them in the window.
     pub multiview: bool,
     /// Tuner's window is on screen: focused, or (the agent handler asks Hyprland at play time,
-    /// `platform::popout::self_shown`) on a workspace a monitor shows. An agent's play keeps
-    /// what the user watches there (DESIGN §30.13).
+    /// `platform::popout::self_shown`) on a workspace a monitor shows. An agent's play then
+    /// fills it; out of sight, it pops out (DESIGN §30.13).
     pub visible: bool,
 }
 
