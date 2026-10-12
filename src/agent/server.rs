@@ -8,8 +8,10 @@
 //!   — `agent::query`. A snapshot built while unlocked loses its explicit content here when the
 //!   session relocked since (`Library::hiding_explicit`, cached per snapshot);
 //! * `play` validates the target (`agent::act::plan_play`: exists, visible, catch-up window…),
-//!   sends `AppEvent::Agent(AgentCommand::Play)` + `hypr::focus_self()`: the app applies the PIN
-//!   rules (prompt on screen), zap lists and resume rules exactly as for a key press;
+//!   resolves where it shows (`agent::act::agent_show`: the pop-out by default, DESIGN §30.13)
+//!   and sends `AppEvent::Agent(AgentCommand::Play)`, with `hypr::focus_self()` only when it
+//!   shows in the window: the app applies the PIN rules (prompt on screen), zap lists and
+//!   resume rules exactly as for a key press, and moves the window;
 //! * `control` / `status` go straight to the `PlayerHandle` (work while the window is hidden);
 //! * `schedule_switch` / `cancel_switch` write reminder rows (`Reminder::SWITCH_LEAD`) through
 //!   the store writer and wake the reminder scheduler, which fires them (`PlatformEvent::Switch*`).
@@ -31,9 +33,11 @@ use super::proto::{Call, CancelOut, Control, ControlAction, ErrorCode, Reply, Re
 use super::query::{self, Fail, Out, Q};
 use crate::config::SharedConfig;
 use crate::jobs::JobManager;
+use crate::model::OpenIn;
 use crate::msg::{AppEvent, DataScope, EventBus};
 use crate::player::tiles::TileRegistry;
 use crate::player::{PlayerCommand, PlayerHandle};
+use crate::reminders::ui::{Placement, WindowNow};
 use crate::shared::{AppShared, ParentalView};
 use crate::store::Store;
 use crate::store::library::Library;
@@ -205,7 +209,7 @@ impl Inner {
             Call::Favourites(p) => self.query(move |q| query::favourites(q, &p)).await,
             Call::Details(p) => self.details(p).await,
             Call::Status(_) => self.status().await,
-            Call::Play(p) => self.play(p).await,
+            Call::Play(p) => self.play(p).await.inspect_err(|_| self.undo_empty_pop_out()),
             Call::ScheduleSwitch(p) => self.schedule_switch(p).await,
             Call::CancelSwitch(p) => {
                 let id = self.run(true, move |q| act::check_cancel(q, &p)).await?;
@@ -221,7 +225,14 @@ impl Inner {
             }
             Call::Control(c) => self.control(c).await,
             // the batch's tools (`handle` refused them already when their feature is off)
-            Call::Queue(p) => super::queue::handle(&self, p).await,
+            Call::Queue(p) => {
+                let starts = matches!(p.action, super::params::QueueAction::Play | super::params::QueueAction::Skip);
+                super::queue::handle(&self, p).await.inspect_err(|_| {
+                    if starts {
+                        self.undo_empty_pop_out();
+                    }
+                })
+            }
             Call::Follow(p) => super::follow::handle(&self, p, &who).await,
             Call::SpoilerGuard(p) => super::spoiler::handle(&self, p, &who).await,
             Call::GuideFix(p) => super::guide::handle(&self, p, &who).await,
@@ -242,6 +253,49 @@ impl Inner {
     /// The live config.
     pub(super) fn cfg(&self) -> Arc<crate::config::Config> {
         crate::config::current(&self.config)
+    }
+
+    /// Tuner's window as the app last published it; before its first frame, only whether a
+    /// pop-out is possible (Hyprland).
+    pub(super) fn window(&self) -> WindowNow {
+        self.shared
+            .window()
+            .unwrap_or_else(|| WindowNow { can_pop: crate::platform::hypr::is_hyprland() && !crate::platform::off_desktop(), ..Default::default() })
+    }
+
+    /// Where an agent's play shows ([`act::agent_show`] with the user's "Agents play in"), and
+    /// the window it was decided on. When the answer depends on whether the user sees Tuner's
+    /// window (they watch in it or have two pictures on, without it having the keyboard: the
+    /// agent's terminal has it), Hyprland is asked ([`crate::platform::popout::self_shown`]);
+    /// when it can't tell, the window counts as seen (nothing moves uninvited).
+    pub(super) async fn show(&self, asked: Option<OpenIn>, pin: bool) -> (act::AgentShow, WindowNow) {
+        let (mut w, setting) = (self.window(), self.cfg().agents.play_in);
+        let unasked = asked.is_none() && !pin && setting != OpenIn::FullWindow;
+        if unasked && w.can_pop && !w.popped_out && !w.visible && (w.watching || w.fullscreen || w.multiview) {
+            let shown = tokio::task::spawn_blocking(crate::platform::popout::self_shown).await.ok().flatten();
+            w.visible = shown.unwrap_or(true);
+        }
+        (act::agent_show(asked, setting, w, pin), w)
+    }
+
+    /// An agent's play failed: a pop-out with nothing in it (Tuner started for that play,
+    /// `--agent-popout`; popping out counts) goes back into the window, unraised, so no empty
+    /// player stays pinned on every workspace (DESIGN §30.13).
+    pub(super) fn undo_empty_pop_out(&self) {
+        let idle = matches!(self.player.snapshot().state, crate::player::PlayerState::Idle | crate::player::PlayerState::Ended);
+        if idle && self.shared.window().is_some_and(|w| w.popped_out) {
+            tracing::debug!("agent: the play failed; an empty pop-out goes back in");
+            self.bus.send(AppEvent::Agent(super::AgentCommand::PopIn));
+        }
+    }
+
+    /// Show a play where `show` says: raise the window when it shows there. `opened_in` for the
+    /// result.
+    pub(super) fn raise_for(show: act::AgentShow, w: WindowNow) -> super::proto::OpenedIn {
+        if show.raise {
+            crate::platform::hypr::focus_self();
+        }
+        act::opened_in(show, w)
     }
 
     /// One write through the store writer (notifying `scope`).
@@ -352,6 +406,7 @@ impl Inner {
     }
 
     async fn play(self: &Arc<Self>, p: super::proto::Play) -> Out<serde_json::Value> {
+        let asked = act::parse_open_in(p.open_in.as_deref())?;
         let again = p.clone();
         let mut step = self.run(true, move |q| act::plan_play(q, &p)).await?;
         if let PlayStep::NeedsDetails(job) = step {
@@ -369,12 +424,30 @@ impl Inner {
                 }
             }
         }
-        let PlayStep::Ready { command, out, log_ref } = step else {
+        let PlayStep::Ready { mut command, mut out, log_ref } = step else {
             return Err(Fail::new(ErrorCode::Internal, "Tuner couldn't decide what to play"));
         };
+        // the PIN is typed in Tuner's window: the prompt brings it forward
+        let pin = out.outcome == super::proto::PlayOutcome::PinRequired;
+        let (show, w) = self.show(asked, pin).await;
+        if let super::AgentCommand::Play(play) = &mut command {
+            play.show = show;
+        }
         self.bus.send(AppEvent::Agent(command));
-        crate::platform::hypr::focus_self();
-        tracing::info!("agent: play {log_ref} → {:?}", out.outcome);
+        let opened = Self::raise_for(show, w);
+        out.opened_in = Some(opened);
+        if !pin {
+            match show.place {
+                Placement::PopOut => out.message.push_str(" It's in the pop-out."),
+                Placement::FullWindow if asked == Some(OpenIn::PopOut) => {
+                    out.message.push_str(" It's in Tuner's window (the pop-out needs Hyprland).")
+                }
+                Placement::FullWindow if show.fullscreen => out.message.push_str(" It's full screen in Tuner's window."),
+                Placement::FullWindow => out.message.push_str(" It's in Tuner's window."),
+                Placement::InPlace => {}
+            }
+        }
+        tracing::info!("agent: play {log_ref} → {:?} in {opened:?}", out.outcome);
         to_value(&out)
     }
 
@@ -428,7 +501,9 @@ impl Inner {
                 get(tiles.audible).or_else(|| get(crate::model::TileId::A)).into_iter().collect()
             }
             // the focused picture (A while multi-view is off)
-            ControlAction::PreviousChannel | ControlAction::Popout => get(tiles.focus).or_else(|| get(crate::model::TileId::A)).into_iter().collect(),
+            ControlAction::PreviousChannel | ControlAction::Popout | ControlAction::Window => {
+                get(tiles.focus).or_else(|| get(crate::model::TileId::A)).into_iter().collect()
+            }
             _ => match &self.tiles {
                 Some(reg) => reg.all(),
                 None => vec![self.player.clone()],
@@ -446,7 +521,9 @@ impl Inner {
         let idle = |s: &crate::player::PlayerSnapshot| matches!(s.state, crate::player::PlayerState::Idle | crate::player::PlayerState::Ended);
         let view = self.view().0;
         let cmd = match c.action {
-            ControlAction::Pause | ControlAction::Resume | ControlAction::TogglePause | ControlAction::Popout if idle(&snap) => {
+            ControlAction::Pause | ControlAction::Resume | ControlAction::TogglePause | ControlAction::Popout | ControlAction::Window
+                if idle(&snap) =>
+            {
                 return Err(Fail::new(ErrorCode::Unavailable, "Nothing is playing"));
             }
             ControlAction::Pause => Some(PlayerCommand::SetPause(true)),
@@ -474,6 +551,14 @@ impl Inner {
                 tracing::info!("agent: control Popout");
                 None
             }
+            // like `play` with `open_in: full_window`, without playing it again
+            ControlAction::Window => {
+                let show = act::AgentShow { fullscreen: true, ..act::AgentShow::window(true) };
+                self.bus.send(AppEvent::Agent(super::AgentCommand::Show(show)));
+                crate::platform::hypr::focus_self();
+                tracing::info!("agent: control Window");
+                None
+            }
         };
         if let Some(cmd) = cmd {
             let was_paused = snap.paused;
@@ -488,7 +573,7 @@ impl Inner {
                 ControlAction::Mute => s.muted,
                 ControlAction::Unmute => !s.muted,
                 ControlAction::PreviousChannel => s.load_generation != was_gen,
-                ControlAction::Popout => true,
+                ControlAction::Popout | ControlAction::Window => true,
             };
             let mut rx = first.subscribe();
             rx.borrow_and_update();

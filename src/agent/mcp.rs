@@ -25,7 +25,7 @@ use std::io::{BufRead, Write};
 
 use serde_json::{Value, json};
 
-use super::client::{Client, ClientError, ExeLauncher};
+use super::client::{Client, ClientError, ExeLauncher, Launch};
 use super::proto::{Call, ClientInfo, ErrorCode};
 use super::tools::{self, PROTOCOL_VERSIONS};
 
@@ -45,6 +45,9 @@ const MAX_CLIENT_TEXT: usize = 64;
 struct Session {
     /// `initialize.clientInfo`; `None` before it, or when it was malformed.
     agent: Option<ClientInfo>,
+    /// Tuner's `config.toml`, read for "Agents play in" when a play has to start Tuner
+    /// (`None`: the default, the pop-out).
+    config: Option<std::path::PathBuf>,
 }
 
 /// `tuner mcp [--profile-dir DIR] [--debug]`: serve stdin/stdout until stdin closes.
@@ -61,7 +64,7 @@ pub fn main(paths: &crate::paths::AppPaths, profile_dir: Option<&std::path::Path
     };
     let client = Client::new(&paths.ipc_socket(), launcher);
     tracing::debug!("mcp: serving on stdio, socket {}", paths.ipc_socket().display());
-    serve(std::io::stdin().lock(), std::io::stdout().lock(), &client)?;
+    serve_with(std::io::stdin().lock(), std::io::stdout().lock(), &client, Some(paths.config_file()))?;
     tracing::debug!("mcp: stdin closed");
     Ok(())
 }
@@ -83,9 +86,14 @@ fn init_stderr_logging(debug: bool) {
 }
 
 /// The protocol loop over any reader/writer (tests drive it with in-memory pipes).
-pub fn serve(mut input: impl BufRead, mut output: impl Write, client: &Client) -> std::io::Result<()> {
+pub fn serve(input: impl BufRead, output: impl Write, client: &Client) -> std::io::Result<()> {
+    serve_with(input, output, client, None)
+}
+
+/// [`serve`], reading "Agents play in" from `config` when a play starts Tuner.
+pub fn serve_with(mut input: impl BufRead, mut output: impl Write, client: &Client, config: Option<std::path::PathBuf>) -> std::io::Result<()> {
     let mut buf = Vec::new();
-    let mut session = Session::default();
+    let mut session = Session { config, ..Default::default() };
     loop {
         let line = match read_message(&mut input, &mut buf)? {
             None => return Ok(()),
@@ -230,11 +238,33 @@ fn tools_call(params: &Value, client: &Client, session: &Session) -> Result<Valu
         Err(e) => return Ok(tool_error("bad_request", &crate::redact::redact(&e))),
     };
     tracing::debug!("mcp: tools/call {}", tool.name);
-    Ok(match client.send_as(call, tool.launches, session.agent.clone()) {
+    let hyprland = crate::platform::hypr::is_hyprland() && !crate::platform::off_desktop();
+    let setting = || session.config.as_deref().and_then(|p| crate::config::Config::load(p).ok()).map(|c| c.agents.play_in).unwrap_or_default();
+    let launch = launch_for(&tool, &call, hyprland, setting);
+    let plain = without_open_in(&call);
+    let mut reply = client.send_as(call, launch, session.agent.clone());
+    // a Tuner from before `open_in` (0.2.4, still running after an upgrade) refuses the field:
+    // ask again without it, as that Tuner's own play
+    let mut older = false;
+    if let (Ok(first), Some(plain)) = (&reply, plain)
+        && first.reply.error.as_ref().is_some_and(|e| e.code == ErrorCode::BadRequest && e.message.contains("open_in"))
+    {
+        tracing::info!("mcp: {}: the running Tuner doesn't know open_in; asking again without it", tool.name);
+        let started = first.started;
+        reply = client.send_as(plain, Launch::No, session.agent.clone()).map(|mut s| {
+            s.started |= started;
+            s
+        });
+        older = true;
+    }
+    Ok(match reply {
         Ok(sent) if sent.reply.ok => {
             let mut result = sent.reply.result.unwrap_or_else(|| json!({}));
             if !result.is_object() {
                 result = json!({ "result": result });
+            }
+            if older && let Some(obj) = result.as_object_mut() {
+                obj.insert("note".into(), Value::String(OLDER_TUNER.into()));
             }
             if tool.name == "status"
                 && let Some(obj) = result.as_object_mut()
@@ -266,6 +296,43 @@ fn tools_call(params: &Value, client: &Client, session: &Session) -> Result<Valu
             tool_error(e.code(), &message)
         }
     })
+}
+
+/// The note on a play a Tuner from before `open_in` made (`tools_call`).
+const OLDER_TUNER: &str = "The running Tuner is older than this bridge: it played this its own way (in its window), without open_in. \
+Restart Tuner to update it.";
+
+/// `call` without its `open_in`, when it has one (`play`, `queue`): what a Tuner from before
+/// the field accepts.
+fn without_open_in(call: &Call) -> Option<Call> {
+    match call {
+        Call::Play(p) if p.open_in.is_some() => Some(Call::Play(super::proto::Play { open_in: None, ..p.clone() })),
+        Call::Queue(q) if q.open_in.is_some() => Some(Call::Queue(super::params::Queue { open_in: None, ..q.clone() })),
+        _ => None,
+    }
+}
+
+/// How a call starts Tuner when it isn't running: a play that opens in the pop-out (DESIGN
+/// §30.13) starts it there, pinned and without the keyboard (like a switch reminder), the rest
+/// in its window. `setting`: "Agents play in", read only for plays.
+fn launch_for(tool: &tools::ToolDef, call: &Call, hyprland: bool, setting: impl FnOnce() -> crate::model::OpenIn) -> Launch {
+    use super::params::QueueAction;
+    if !tool.launches {
+        return Launch::No;
+    }
+    let asked = match call {
+        Call::Play(p) => p.open_in.as_deref(),
+        Call::Queue(q) if matches!(q.action, QueueAction::Play | QueueAction::Skip) => q.open_in.as_deref(),
+        _ => return Launch::Window,
+    };
+    // a bad open_in is refused by Tuner anyway
+    let Ok(asked) = super::act::parse_open_in(asked) else { return Launch::Window };
+    // a Tuner that isn't running has no window to keep: what the pop-out would be used for
+    let w = crate::reminders::ui::WindowNow { can_pop: hyprland, ..Default::default() };
+    match super::act::agent_show(asked, setting(), w, false).place {
+        crate::reminders::ui::Placement::PopOut => Launch::PopOut,
+        _ => Launch::Window,
+    }
 }
 
 /// The `ErrorCode` as its wire name (`not_found`, …).
@@ -314,6 +381,28 @@ mod tests {
         ] {
             assert_eq!(serde_json::to_value(code).unwrap(), error_code(code));
         }
+    }
+
+    /// A play that would open in the pop-out starts Tuner there (DESIGN §30.13); a play for
+    /// the window, the setting "Full window", no Hyprland or any other tool start its window;
+    /// `status` never starts it.
+    #[test]
+    fn plays_for_the_pop_out_start_tuner_there() {
+        use crate::model::OpenIn;
+        let launch = |name: &str, args: Value, hyprland: bool, setting: OpenIn| {
+            let tool = tools::tool(name).unwrap();
+            launch_for(&tool, &Call::from_tool(name, args).unwrap(), hyprland, || setting)
+        };
+        let film = || json!({ "ref": "movie:2:xt:vod:1" });
+        assert_eq!(launch("play", film(), true, OpenIn::PopOut), Launch::PopOut);
+        assert_eq!(launch("play", json!({ "ref": "movie:2:xt:vod:1", "open_in": "full_window" }), true, OpenIn::PopOut), Launch::Window);
+        assert_eq!(launch("play", json!({ "ref": "movie:2:xt:vod:1", "open_in": "popout" }), true, OpenIn::FullWindow), Launch::PopOut);
+        assert_eq!(launch("play", film(), true, OpenIn::FullWindow), Launch::Window);
+        assert_eq!(launch("play", film(), false, OpenIn::PopOut), Launch::Window, "no Hyprland: no pop-out");
+        assert_eq!(launch("queue", json!({ "action": "play" }), true, OpenIn::PopOut), Launch::PopOut);
+        assert_eq!(launch("queue", json!({ "action": "add", "refs": ["movie:2:xt:vod:1"] }), true, OpenIn::PopOut), Launch::Window);
+        assert_eq!(launch("search", json!({ "query": "dune" }), true, OpenIn::PopOut), Launch::Window);
+        assert_eq!(launch("status", json!({}), true, OpenIn::PopOut), Launch::No);
     }
 
     /// Lines are read whole up to the cap; a longer one is skipped to its newline without

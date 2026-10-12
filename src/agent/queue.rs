@@ -4,7 +4,8 @@
 //! The engine does the guarding: an agent add of a locked item is refused ("locked: needs your
 //! PIN in Tuner"), an explicit one while hidden is `not_found` (indistinguishable from a
 //! missing one), and concealed rows are never in the snapshot this lists. `play` replaces what
-//! plays (the skill calls `status` first); a locked next item waits for the PIN on screen.
+//! plays (the skill calls `status` first) and shows where the `play` tool would (the pop-out by
+//! default, `open_in`; DESIGN §30.13); a locked next item waits for the PIN on screen.
 
 use std::sync::Arc;
 
@@ -199,6 +200,51 @@ fn engine_fail(m: String) -> Fail {
     Fail::new(ErrorCode::Unavailable, m)
 }
 
+/// What an agent's `queue play` / `skip` does with the window (DESIGN §30.13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shows {
+    /// Show it where `play` would; `pin`: Up next waits for the PIN, typed in the window.
+    Place { pin: bool },
+    /// A skip inside a running Up next: it stays where it plays (like a zap).
+    Stays,
+    /// Up next waits (multi-view, a future slot): the window stays as it is.
+    Waits,
+    /// Nothing plays.
+    Nothing,
+}
+
+/// `moves`: whether a play may move the window (not a skip inside a running Up next).
+fn shows(reply: &QueueReply, moves: bool) -> Shows {
+    match reply {
+        QueueReply::Play(PlayReply::WaitingForPin(_)) => Shows::Place { pin: true },
+        QueueReply::Play(PlayReply::Playing(_)) if moves => Shows::Place { pin: false },
+        QueueReply::Play(PlayReply::Playing(_)) => Shows::Stays,
+        QueueReply::Play(PlayReply::Waiting(..)) => Shows::Waits,
+        _ => Shows::Nothing,
+    }
+}
+
+/// What Up next started for an agent shows where `play` would (DESIGN §30.13): the engine sent
+/// it to the main picture, which the app never hears about; `AgentCommand::Show` opens the
+/// player there (without it the window stayed on Home with the corner mini player). A wait
+/// for the PIN brings the window forward (the PIN is typed there); nothing played puts an
+/// empty pop-out back in. `opened_in` for the result; `None` when nothing started.
+async fn show(h: &Inner, reply: &QueueReply, asked: Option<crate::model::OpenIn>, moves: bool) -> Option<super::proto::OpenedIn> {
+    match shows(reply, moves) {
+        Shows::Place { pin } => {
+            let (show, w) = h.show(asked, pin).await;
+            h.bus.send(crate::msg::AppEvent::Agent(super::AgentCommand::Show(show)));
+            Some(Inner::raise_for(show, w))
+        }
+        Shows::Stays => Some(super::act::opened_in(super::act::AgentShow::IN_PLACE, h.window())),
+        Shows::Waits => None,
+        Shows::Nothing => {
+            h.undo_empty_pop_out();
+            None
+        }
+    }
+}
+
 pub(super) async fn handle(h: &Arc<Inner>, p: Queue) -> Out<Value> {
     let Some(engine) = h.shared.queue_handle() else {
         return Err(Fail::new(ErrorCode::Unavailable, "Up next isn't running in this Tuner"));
@@ -213,6 +259,10 @@ pub(super) async fn handle(h: &Arc<Inner>, p: Queue) -> Out<Value> {
         }
     };
     let action = p.action;
+    let asked = super::act::parse_open_in(p.open_in.as_deref())?;
+    if asked.is_some() && !matches!(action, QueueAction::Play | QueueAction::Skip) {
+        return Err(Fail::bad("open_in is for play and skip"));
+    }
     match action {
         QueueAction::List => to_value(&list_out(&engine.snapshot(), p.include_played == Some(true))),
         QueueAction::Add => {
@@ -266,21 +316,33 @@ pub(super) async fn handle(h: &Arc<Inner>, p: Queue) -> Out<Value> {
             if snap.row(id).is_none() {
                 return Err(Fail::not_found("Up next item"));
             }
-            let out = match ask(QueueCommand::PlayAt(id)).await? {
+            let reply = ask(QueueCommand::PlayAt(id)).await?;
+            let opened = show(h, &reply, asked, true).await;
+            let mut out = match reply {
                 QueueReply::Play(PlayReply::Playing(i)) => json!({ "playing": i.0 }),
                 QueueReply::Play(PlayReply::WaitingForPin(i)) => json!({ "waiting_for_pin": true, "id": i.0,
                     "message": "Tuner is asking for the parental PIN on its screen; it plays once it is typed there." }),
                 QueueReply::Play(PlayReply::Waiting(i, why)) => json!({ "waiting": blocked_name(why), "id": i.0 }),
                 _ => json!({ "playing": Value::Null }),
             };
-            tracing::info!("agent: queue play #{}", id.0);
+            if let Some(o) = opened {
+                out["opened_in"] = serde_json::to_value(o).unwrap_or_default();
+            }
+            tracing::info!("agent: queue play #{} in {opened:?}", id.0);
             to_value(&out)
         }
         QueueAction::Skip => {
-            ask(QueueCommand::Next).await?;
-            tracing::info!("agent: queue skip");
+            // a skip inside a running Up next keeps it where it plays (like a zap)
+            let was_driving = engine.snapshot().driving;
+            let reply = ask(QueueCommand::Next).await?;
+            let opened = show(h, &reply, asked, !was_driving || asked.is_some()).await;
+            tracing::info!("agent: queue skip in {opened:?}");
             let s = engine.snapshot();
-            to_value(&json!({ "current_id": s.current.map(|i| i.0), "next_id": s.next.map(|i| i.0) }))
+            let mut out = json!({ "current_id": s.current.map(|i| i.0), "next_id": s.next.map(|i| i.0) });
+            if let Some(o) = opened {
+                out["opened_in"] = serde_json::to_value(o).unwrap_or_default();
+            }
+            to_value(&out)
         }
         QueueAction::StopAfter => {
             let snap = engine.snapshot();
@@ -292,5 +354,25 @@ pub(super) async fn handle(h: &Arc<Inner>, p: Queue) -> Out<Value> {
             tracing::info!("agent: queue stop_after #{}", id.0);
             to_value(&json!({ "stop_after_id": id.0 }))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// DESIGN §30.13: `queue play` (and a skip that starts Up next) shows where `play` would;
+    /// a skip inside a running Up next stays where it plays; the PIN shows the window even
+    /// then; a wait leaves the window; nothing played is a failure (an empty pop-out goes in).
+    #[test]
+    fn up_next_shows_where_play_would_and_a_running_one_stays() {
+        let id = QueueId(3);
+        let playing = QueueReply::Play(PlayReply::Playing(id));
+        let pin = QueueReply::Play(PlayReply::WaitingForPin(id));
+        assert_eq!(shows(&playing, true), Shows::Place { pin: false });
+        assert_eq!(shows(&playing, false), Shows::Stays, "a skip while Up next drives the picture");
+        assert_eq!(shows(&pin, false), Shows::Place { pin: true });
+        assert_eq!(shows(&QueueReply::Play(PlayReply::Waiting(id, Blocked::NotStarted)), true), Shows::Waits);
+        assert_eq!(shows(&QueueReply::Play(PlayReply::Nothing), true), Shows::Nothing);
     }
 }

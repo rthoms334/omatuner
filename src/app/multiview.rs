@@ -233,13 +233,19 @@ impl TunerApp {
 
     /// The `multiview` MCP tool (validated by the handler; the PIN and copy rules apply here
     /// as for the user's own plays). One target plays alongside what plays; two fill A and B.
-    pub(super) fn on_agent_multiview(&mut self, r: &crate::agent::AgentMultiView) {
+    pub(super) fn on_agent_multiview(&mut self, r: &crate::agent::AgentMultiView, egui_ctx: &egui::Context) {
         use crate::agent::{AgentMultiView as M, MultiViewKeep as Keep, MultiViewSwap as Swap};
         let set_layout = |app: &mut Self, l: crate::config::MultiViewLayout| {
             app.config_edits.push(Box::new(move |c: &mut crate::config::Config| c.player.multiview.layout = l));
         };
         match r {
             M::Open { targets, layout, sound, rearrange } => {
+                // two pictures belong in the window (DESIGN §30.13): out of the pop-out an
+                // agent's play went to, in front
+                if self.popout.is_out() || self.video_only {
+                    self.toggle_popout(egui_ctx);
+                    crate::platform::hypr::focus_self();
+                }
                 if let Some(l) = layout {
                     set_layout(self, *l);
                 }

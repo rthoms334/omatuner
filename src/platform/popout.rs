@@ -110,6 +110,18 @@ pub struct Client {
     /// `*` marks a tag set by a window rule.
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub workspace: WorkspaceRef,
+    /// A group member behind another tab.
+    #[serde(default)]
+    pub hidden: bool,
+}
+
+/// A workspace as `j/clients` and `j/monitors` name it (the id is enough).
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct WorkspaceRef {
+    #[serde(default)]
+    pub id: i64,
 }
 
 fn mapped_default() -> bool {
@@ -136,6 +148,38 @@ pub struct Monitor {
     /// left, top, right, bottom (logical px; the bar).
     #[serde(default)]
     pub reserved: [i32; 4],
+    /// The workspace it shows.
+    #[serde(default, rename = "activeWorkspace")]
+    pub active_workspace: WorkspaceRef,
+    /// The special (scratchpad) workspace open over it (id 0: none).
+    #[serde(default, rename = "specialWorkspace")]
+    pub special_workspace: WorkspaceRef,
+}
+
+/// `c` is on screen: pinned (every workspace), or on a workspace one of `monitors` shows — and
+/// not a group member behind another tab.
+fn shown_on(c: &Client, monitors: &[Monitor]) -> bool {
+    let ws = c.workspace.id;
+    !c.hidden && (c.pinned || monitors.iter().any(|m| m.active_workspace.id == ws || (m.special_workspace.id != 0 && m.special_workspace.id == ws)))
+}
+
+/// Whether Tuner's window is on screen now (an agent's play keeps what the user watches there,
+/// DESIGN §30.13). Blocking: two requests on Hyprland's socket. `None` off Hyprland, off the
+/// desktop (tests), without a window, or when Hyprland doesn't answer.
+pub fn self_shown() -> Option<bool> {
+    if super::off_desktop() {
+        return None;
+    }
+    let mut hypr = Hypr::new(SocketIpc::from_env()?);
+    let shown = (|| -> Result<Option<bool>, String> {
+        let Some(c) = hypr.our_client(std::process::id())? else { return Ok(None) };
+        let monitors: Vec<Monitor> = hypr.json("monitors")?;
+        Ok(Some(shown_on(&c, &monitors)))
+    })();
+    shown.unwrap_or_else(|e| {
+        tracing::debug!("pop-out: is our window on screen? {e}");
+        None
+    })
 }
 
 /// A rectangle in Hyprland's logical layout coordinates.
@@ -1003,6 +1047,31 @@ mod tests {
             Err(PopError::Ipc("refused".into()))
         });
         assert_eq!(calls, 1, "{r:?}");
+    }
+
+    /// Our window is on screen when a monitor shows its workspace (the second monitor too, a
+    /// scratchpad open over one), or it's pinned; not on a workspace nobody shows, nor behind
+    /// another tab of its group (DESIGN §30.13: an agent's play keeps what the user watches).
+    #[test]
+    fn our_window_is_shown_on_a_workspace_a_monitor_shows() {
+        let monitors: Vec<Monitor> = serde_json::from_str(
+            r#"[{"id": 0, "x": 0, "y": 0, "width": 1920, "height": 1080, "scale": 1, "activeWorkspace": {"id": 1, "name": "1"},
+                 "specialWorkspace": {"id": 0, "name": ""}},
+                {"id": 1, "x": 1920, "y": 0, "width": 1920, "height": 1080, "scale": 1, "activeWorkspace": {"id": 4, "name": "4"},
+                 "specialWorkspace": {"id": -98, "name": "special:scratch"}}]"#,
+        )
+        .unwrap();
+        let on = |ws: i64, extra: serde_json::Value| {
+            let mut c = tiled(PID);
+            c["workspace"] = serde_json::json!({ "id": ws, "name": ws.to_string() });
+            c.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            shown_on(&serde_json::from_value(c).unwrap(), &monitors)
+        };
+        let none = serde_json::json!({});
+        assert!(on(1, none.clone()) && on(4, none.clone()) && on(-98, none.clone()));
+        assert!(!on(2, none), "a workspace nobody shows");
+        assert!(on(2, serde_json::json!({ "pinned": true })), "pinned: every workspace");
+        assert!(!on(1, serde_json::json!({ "hidden": true })), "behind another tab of its group");
     }
 
     /// The event stream drives the floating/pinned flags of OUR window only.

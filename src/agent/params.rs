@@ -52,6 +52,9 @@ pub struct Queue {
     /// clear: default true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub played_only: Option<bool>,
+    /// play / skip: where it plays, as `play`'s `open_in` (DESIGN §30.13).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_in: Option<String>,
 }
 
 tool_actions!(

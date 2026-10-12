@@ -29,7 +29,8 @@ First read `${CLAUDE_SKILL_DIR}/../../RULES.md` (this plugin's shared rules) and
    - `upcoming` → say when and where, then offer a reminder: `reminders` `add` with
      `mode: "notify"`, or `mode: "switch"` when the user wants Tuner to switch by itself (that
      interrupts playback: confirm). Without the `reminders` tool, use `schedule_switch`.
-4. Confirm in one line what plays, on which channel, and how to stop or undo it.
+4. Confirm in one line what plays, on which channel, where (the pop-out or Tuner's window:
+   `opened_in`), and how to stop or undo it.
 
 ## Cases
 
@@ -53,6 +54,8 @@ First read `${CLAUDE_SKILL_DIR}/../../RULES.md` (this plugin's shared rules) and
   catch-up later (spoiler-safe)".
 - **"I'll watch it later" / "don't tell me the score"**: offer `spoiler_guard` `blackout` for
   that programme (confirm), and `mark_seen` once they say they've watched it.
+- **On the TV / full screen / the big screen**: `play` with `open_in: "full_window"`; for what
+  already plays, `control` `window` (it carries on, full screen in Tuner's window).
 - **"Pop it out" / mini player**: `control` `popout`.
 - **"Go back to the last channel"**: `control` `previous_channel`.
 

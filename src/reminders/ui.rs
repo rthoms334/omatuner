@@ -242,7 +242,7 @@ pub fn player_menu_items(keys: KeyContext) -> Vec<MenuItem> {
 
 // ------------------------------------------------------------------ where it opens
 
-/// The window as a switch finds it.
+/// The window as a switch (or an agent's play, `agent::act::agent_show`) finds it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WindowNow {
     /// Tuner's window has the keyboard focus.
@@ -253,6 +253,14 @@ pub struct WindowNow {
     pub popped_out: bool,
     /// The pop-out is possible (Hyprland).
     pub can_pop: bool,
+    /// Tuner's window is fullscreen (Super+F, `f`). An agent's play keeps it (DESIGN §30.13).
+    pub fullscreen: bool,
+    /// Two pictures are on (multi-view). An agent's play keeps them in the window.
+    pub multiview: bool,
+    /// Tuner's window is on screen: focused, or (the agent handler asks Hyprland at play time,
+    /// `platform::popout::self_shown`) on a workspace a monitor shows. An agent's play keeps
+    /// what the user watches there (DESIGN §30.13).
+    pub visible: bool,
 }
 
 /// What a switch does with the window.

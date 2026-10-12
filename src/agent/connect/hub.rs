@@ -772,7 +772,7 @@ mod tests {
         assert_eq!(r.toasts(), [(ToastKind::Success, "Updated Tuner's plugin in Claude Code to 0.2.3 — restart Claude Code to apply".into())]);
 
         // keep-in-sync off: no update; "Don't ask again": nothing offered, but recorded
-        let (r, out) = pass(fake(), AgentsConfig { keep_in_sync: false, offer_connect: false, checked_version: None });
+        let (r, out) = pass(fake(), AgentsConfig { keep_in_sync: false, offer_connect: false, ..Default::default() });
         assert_eq!(out, Some(PassOutcome::Settled));
         assert!(!r.fake.lines().iter().any(|l| l.contains("update")));
 
