@@ -11,11 +11,11 @@ use serde_json::{Value, json};
 
 use super::actions::{ToolAction, action_schema};
 use super::params::{FollowAction, GuideFixAction, MultiViewAction, QueueAction, RemindersAction, SleepAction, SpoilerAction};
-use super::tools::{TIME, ToolDef, kind_enum, limit, object, text};
+use super::tools::{TIME, ToolDef, kind_enum, limit, object, reveal, spoiler_safe, text};
 
 /// The library and health tools (match_titles, history, episodes, favourites_edit,
 /// parental_status, lock, diagnose, sources): the agent track flips this.
-pub const LIBRARY_TOOLS: bool = false;
+pub const LIBRARY_TOOLS: bool = true;
 
 fn strings(description: &str) -> Value {
     json!({ "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": crate::agent::proto::MAX_TEXT }, "description": description })
@@ -281,7 +281,8 @@ copies; narrow with season or query. spoiler_safe=true drops plots; the spoiler 
                     "series_ref": text("A series ref."),
                     "season": { "type": "integer", "minimum": 0 },
                     "query": text("Words of an episode title or plot."),
-                    "spoiler_safe": { "type": "boolean" },
+                    "spoiler_safe": spoiler_safe(),
+                    "reveal_spoilers": reveal(),
                 }),
                 &["series_ref"],
             ),

@@ -1,0 +1,18 @@
+{
+  "name": "omatuner",
+  "owner": {
+    "name": "Robert Thomson"
+  },
+  "metadata": {
+    "description": "Tuner, the keyboard-first IPTV player for Omarchy, driven from Claude Code.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "omatuner",
+      "source": "./plugins/omatuner",
+      "description": "Watch, pick, plan and fix TV in Tuner from Claude Code: the tuner MCP server and seven skills.",
+      "version": "0.1.0"
+    }
+  ]
+}

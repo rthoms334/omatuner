@@ -107,7 +107,7 @@ fn seed(c: &mut Connection, now: Timestamp) -> tuner::error::Result<()> {
         tx.execute("INSERT INTO channel_epg(channel_id, epg_channel_id) VALUES (?1, ?2)", params![id, ec])?;
     }
     tx.execute("INSERT INTO item_override(source_id, kind, item_key, locked, fp) VALUES (1, 'channel', 'm3u:locked', 1, '{}')", [])?;
-    let progs: [(i64, i64, i64, &str, &str); 8] = [
+    let progs: [(i64, i64, i64, &str, &str); 9] = [
         (1, now - 3 * 3600, now - 2 * 3600, "Old News", "Yesterday's headlines at http://news.example/"),
         (1, now - 1800, now + 1800, "News at Six", "The day's news"),
         (2, now - 7200, now - 3600, "Touring Car Highlights", "Last weekend's races"),
@@ -116,6 +116,7 @@ fn seed(c: &mut Connection, now: Timestamp) -> tuner::error::Result<()> {
         (3, now - 600, now + 3000, "Locked Match", "A locked match"),
         (4, now - 600, now + 3000, "Touring Cars After Dark", "Explicit"),
         (2, now - 3 * 86400, now - 3 * 86400 + 1800, "Touring Car Classics", "From the archive"),
+        (3, now + 7200, now + 9000, "Locked Final", "A locked final"),
     ];
     for (ec, start, stop, title, descr) in progs {
         tx.execute(
@@ -195,6 +196,23 @@ fn seed(c: &mut Connection, now: Timestamp) -> tuner::error::Result<()> {
         )?;
     }
     tx.commit()?;
+    // the match keys `match_titles` compares (an import computes them)
+    for src in 1..=3 {
+        tuner::store::titles::refresh_source(c, SourceId(src))?;
+    }
+    // watched on this machine: a channel, a movie, an episode and an explicit film
+    for (i, (kind, key, title)) in [
+        (ItemKind::Channel, "m3u:itv4", "ITV4"),
+        (ItemKind::Movie, "m3u:airplane", "Airplane!"),
+        (ItemKind::Episode, "m3u:show-1-2", "Episode 2"),
+        (ItemKind::Movie, "m3u:adult", "Adult Film"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let item = ItemRef { source: SourceId(1), kind, key: ItemKey(key.into()) };
+        tuner::store::user::push_history(c, &tuner::model::HistoryEntry { item, at: now - 3600 + i as i64, title: title.into() })?;
+    }
     let list = tuner::store::user::default_fav_list(c)?;
     for (kind, key) in [(ItemKind::Channel, "m3u:itv4"), (ItemKind::Movie, "m3u:airplane"), (ItemKind::Channel, "m3u:late")] {
         tuner::store::user::set_favourite(c, list, &ItemRef { source: SourceId(1), kind, key: ItemKey(key.into()) }, true, now)?;
@@ -219,8 +237,10 @@ impl World {
         let now = tuner::model::now();
         ui.services().store.writer().blocking(move |c| seed(c, now)).unwrap();
         let s = ui.services();
+        // the batch's tools are answered here even while their feature's flag is off
         let handler =
-            AgentHandler::with_limits(s.agent.clone(), s.store.clone(), s.config.clone(), s.tiles.focused(), s.bus.clone(), s.jobs.clone(), limits);
+            AgentHandler::with_limits(s.agent.clone(), s.store.clone(), s.config.clone(), s.tiles.focused(), s.bus.clone(), s.jobs.clone(), limits)
+                .serve_unlisted();
         Self { ui, handler, now, next: 1 }
     }
 
@@ -544,7 +564,7 @@ fn play_resolves_programmes_movies_and_series() {
     let p = w.ok("play", json!({"ref": live, "from_start": true}));
     assert_eq!(p["outcome"], "catch_up");
     let sent = w.commands();
-    let AgentCommand::Play(play) = &sent[0];
+    let AgentCommand::Play(play) = &sent[0] else { panic!("{sent:?}") };
     let PlayTarget::Media(MediaRef::Catchup { start, stop, .. }) = &play.target else { panic!("{sent:?}") };
     assert_eq!((*start, *stop), (w.now - 1800, w.now + 3600));
     let past = find(&mut w, "highlights", "past", "ITV4");
@@ -939,4 +959,402 @@ fn the_shared_category_rule_and_title_languages_apply_to_every_tool() {
     assert_eq!(r["total"], 4, "{r}");
     let r = w.ok("guide_search", json!({"query": "british touring"}));
     assert!(mentions(&r, "sky sport"), "{r}");
+}
+
+// ------------------------------------------------------------------ MCP pass 2 (the skill plan)
+
+/// A ref from a tool answer (`list[i].ref`).
+fn first_ref(v: &Value, list: &str) -> String {
+    v[list][0]["ref"].as_str().unwrap_or_else(|| panic!("no {list}[0].ref in {v}")).to_owned()
+}
+
+/// The ref of a programme found by title words.
+fn programme(w: &mut World, q: &str) -> String {
+    first_ref(&w.ok("guide_search", json!({ "query": q })), "programmes")
+}
+
+/// "What football's on this weekend": the guide by category over a window (no title words),
+/// with its categories on every row; explicit and hidden channels never show; a window is
+/// required and bounded. Details name a channel's copies; spoiler_safe strips descriptions
+/// (the guard's choke point), and reveal_spoilers gives them back for that ref only.
+#[test]
+fn the_guide_by_category_and_spoiler_safe_answers() {
+    let mut w = World::new(pin_config());
+    w.publish(Visibility::NO_EXPLICIT);
+    let win = json!({ "categories": ["motoring"], "from": (w.now - 3600).to_string(), "to": (w.now + 3 * 3600).to_string() });
+    let r = w.ok("guide_search", win.clone());
+    let titles = names(&r, "programmes", "title");
+    assert!(titles.contains(&"British Touring Car Championship".to_owned()) && titles.contains(&"Touring Cars Qualifying".to_owned()), "{titles:?}");
+    assert!(titles.contains(&"Locked Final".to_owned()), "locked channels are listed, flagged: {titles:?}");
+    for hidden in ["After Dark", "Secret Channel", "Canal Sport", "Late Night"] {
+        assert!(!mentions(&r, hidden), "{hidden} in {r}");
+    }
+    assert_eq!(r["programmes"][0]["categories"], json!(["Sport", "Motoring"]));
+    assert!(r["programmes"][0]["remaining_min"].as_u64().is_some(), "live rows say how long is left");
+    let none = w.ok("guide_search", json!({ "categories": ["cookery"], "from": "now", "to": (w.now + 3600).to_string() }));
+    assert!(names(&none, "programmes", "title").is_empty());
+    let r = w.ok("guide_search", json!({ "categories": ["motoring"], "channel": "itv4 +1", "from": "now", "to": (w.now + 6 * 3600).to_string() }));
+    assert!(r["programmes"].as_array().unwrap().iter().all(|p| p["channel"]["name"] == "ITV4 +1"), "{r}");
+    assert_eq!(w.err("guide_search", json!({ "categories": ["motoring"] })), ErrorCode::BadRequest, "a window is needed");
+    assert_eq!(
+        w.err("guide_search", json!({ "categories": ["motoring"], "from": "now", "to": (w.now + 4 * 86_400).to_string() })),
+        ErrorCode::BadRequest,
+        "at most 3 days"
+    );
+    let r = w.ok("guide_search", json!({ "query": "touring", "catchup_only": true }));
+    assert!(r["programmes"].as_array().unwrap().iter().all(|p| p["catchup"] == true && p["catchup_until"].is_string()), "{r}");
+
+    // details: the channel and its copies; spoiler-safe answers
+    let d = w.ok("details", json!({ "ref": "channel:1:m3u:itv4" }));
+    assert_eq!(d["copies"][0]["ref"], "channel:1:m3u:itv4");
+    assert_eq!((d["copies"][0]["has_guide"].as_bool(), d["copies"][0]["catchup_days"].as_u64()), (Some(true), Some(7)));
+    let live = programme(&mut w, "british touring");
+    let safe = w.ok("details", json!({ "ref": live, "spoiler_safe": true }));
+    assert!(safe.get("description").is_none(), "{safe}");
+    assert_eq!(safe["spoiler"]["reason"], "spoiler_safe");
+    let shown = w.ok("details", json!({ "ref": live, "spoiler_safe": true, "reveal_spoilers": [live] }));
+    assert_eq!(shown["description"], "Live from Brands Hatch");
+}
+
+/// The library tools keep parental control's rules: an explicit title is "missing" to
+/// match_titles and absent from history; a locked title is never added to a list; a lock can
+/// only be added (episodes aren't lockable), and "lock the session now" locks it.
+#[test]
+fn library_tools_keep_the_parental_rules() {
+    let mut w = World::new(pin_config());
+    w.publish(Visibility::NO_EXPLICIT);
+    let r = w.ok(
+        "match_titles",
+        json!({ "titles": [{ "title": "Dune", "year": 2021 }, { "title": "Adult Film" }, { "title": "Not In The Library" }, { "title": "AIRPLANE!" }] }),
+    );
+    let res = r["results"].as_array().unwrap();
+    assert_eq!(res[0]["matched"].as_array().unwrap().len(), 1, "one Dune (its two copies are one title): {r}");
+    assert_eq!(res[0]["matched"][0]["other_copies"], 1);
+    assert_eq!((res[1]["missing"].as_bool(), res[2]["missing"].as_bool()), (Some(true), Some(true)), "explicit = missing: {r}");
+    assert_eq!(res[3]["matched"][0]["name"], "Airplane!");
+    assert!(!mentions(&r, "explicit."));
+
+    let h = w.ok("history", json!({}));
+    let kinds: Vec<(String, String)> =
+        h["items"].as_array().unwrap().iter().map(|i| (i["kind"].as_str().unwrap().to_owned(), i["title"].as_str().unwrap().to_owned())).collect();
+    assert_eq!(kinds.len(), 3, "{h}");
+    assert!(!mentions(&h, "adult"), "{h}");
+    let ep = h["items"].as_array().unwrap().iter().find(|i| i["kind"] == "episode").unwrap();
+    assert_eq!((ep["series"].as_str(), ep["season"].as_u64()), (Some("The Show"), Some(1)));
+    assert_eq!(names(&w.ok("history", json!({ "kind": "movie" })), "items", "title"), ["Airplane!"]);
+
+    let show = first_ref(&w.ok("search", json!({ "query": "the show", "kinds": ["series"] })), "results");
+    let eps = w.ok("episodes", json!({ "series_ref": show }));
+    assert_eq!(eps["episodes"].as_array().unwrap().len(), 3);
+    assert_eq!(eps["episodes"][1]["progress"]["position_min"], 15, "progress of the copy in progress: {eps}");
+    assert_eq!(eps["next_episode"], eps["episodes"][1]["ref"]);
+    assert_eq!(names(&w.ok("episodes", json!({ "series_ref": show, "query": "episode 3" })), "episodes", "title"), ["Episode 3"]);
+
+    // favourites_edit: a new list; the locked film and the explicit one are refused
+    let dune = first_ref(&w.ok("search", json!({ "query": "dune" })), "results");
+    let locked = first_ref(&w.ok("search", json!({ "query": "locked film" })), "results");
+    let out = w.ok("favourites_edit", json!({ "create": "Trending", "add": [dune, locked, "movie:1:m3u:adult"] }));
+    assert_eq!((out["created"].as_bool(), out["added"].as_u64()), (Some(true), Some(1)), "{out}");
+    let errors: Vec<&str> = out["refused"].as_array().unwrap().iter().map(|r| r["error"].as_str().unwrap()).collect();
+    assert_eq!(errors, ["locked: needs your PIN in Tuner", "not_found"]);
+    let favs = w.ok("favourites", json!({ "list": "trending" }));
+    assert_eq!(names(&favs["lists"][0], "items", "name"), ["Dune"]);
+    let out = w.ok("favourites_edit", json!({ "list": "trending", "remove": [dune] }));
+    assert_eq!(out["removed"], 1);
+
+    // lock: adds only; an episode isn't lockable
+    let airplane = first_ref(&w.ok("search", json!({ "query": "airplane", "kinds": ["movie"] })), "results");
+    let ep_ref = eps["episodes"][0]["ref"].as_str().unwrap().to_owned();
+    let out = w.ok("lock", json!({ "refs": [airplane, ep_ref, locked] }));
+    assert_eq!((out["locked"].as_u64(), out["already_locked"].as_u64()), (Some(1), Some(1)), "{out}");
+    assert!(out["refused"][0]["error"].as_str().unwrap().starts_with("not_lockable"));
+    w.publish(Visibility::NO_EXPLICIT);
+    assert_eq!(w.ok("play", json!({ "ref": airplane }))["outcome"], "pin_required", "locked by Claude: the PIN on screen");
+    w.commands();
+
+    // the session: unlocked by the user, locked by Claude on request
+    w.unlock(Some(Instant::now()));
+    let st = w.ok("parental_status", json!({}));
+    assert_eq!((st["pin_set"].as_bool(), st["session_unlocked"].as_bool(), st["relock_min"].as_u64()), (Some(true), Some(true), Some(1)));
+    let out = w.ok("lock", json!({ "session_now": true }));
+    assert_eq!(out["session_locked"], true);
+    assert_eq!(w.commands(), [AgentCommand::LockSession]);
+    let st = w.ok("parental_status", json!({}));
+    assert_eq!((st["session_unlocked"].as_bool(), st["explicit_shown"].as_bool()), (Some(false), Some(false)));
+}
+
+/// "Why can't she find it?": search names the user's own settings that hide a title (a hidden
+/// category, the category filter, a playlist out of All) — never parental control.
+#[test]
+fn search_explains_the_users_own_filters_only() {
+    let mut w = World::new(pin_config());
+    w.publish(Visibility::NO_EXPLICIT);
+    let why = |w: &mut World, q: &str| -> Vec<(String, Option<String>)> {
+        let r = w.ok("search", json!({ "query": q, "explain_filtered": true }));
+        r["filtered"]
+            .as_array()
+            .map(|a| a.iter().map(|f| (f["why"].as_str().unwrap().to_owned(), f["category"].as_str().map(str::to_owned))).collect())
+            .unwrap_or_default()
+    };
+    assert_eq!(why(&mut w, "secret channel"), [("hidden_category".to_owned(), Some("Hidden Group".to_owned()))]);
+    assert_eq!(why(&mut w, "canal sport"), [("category_filter".to_owned(), Some("FR: Sport".to_owned()))]);
+    assert_eq!(why(&mut w, "extra movie"), [("not_in_all".to_owned(), None)]);
+    for q in ["late night", "adult film"] {
+        assert!(why(&mut w, q).is_empty(), "explicit content is never explained: {q}");
+    }
+    w.unlock(Some(Instant::now()));
+    w.publish(Visibility::default());
+    assert!(why(&mut w, "adult film").is_empty(), "not even while unlocked");
+}
+
+/// diagnose reads the failures and the pictures; sources the playlists and guides — with no
+/// address, login or provider message in either (`World::reply` checks every answer).
+#[test]
+fn diagnose_and_sources() {
+    let mut w = World::new(pin_config());
+    w.ui.services()
+        .store
+        .writer()
+        .blocking(move |c| {
+            let itv = ItemRef { source: SourceId(1), kind: ItemKind::Channel, key: ItemKey("m3u:itv4".into()) };
+            for _ in 0..2 {
+                tuner::store::live::record_failure(c, &itv, "http-forbidden", tuner::model::now())?;
+            }
+            let late = ItemRef { source: SourceId(1), kind: ItemKind::Channel, key: ItemKey("m3u:late".into()) };
+            tuner::store::live::record_failure(c, &late, "stalled", tuner::model::now())
+        })
+        .unwrap();
+    w.publish(Visibility::NO_EXPLICIT);
+    let d = w.ok("diagnose", json!({ "ref": "channel:1:m3u:itv4" }));
+    assert_eq!((d["item"]["failures"].as_u64(), d["item"]["last_failure"]["reason"].as_str()), (Some(2), Some("http-forbidden")));
+    assert_eq!(d["likely"], json!(["dead_channel"]));
+    let tv_one = d["playlists"].as_array().unwrap().iter().find(|p| p["playlist"] == "TV One").unwrap();
+    assert_eq!(tv_one["failed_channels"], 1, "the explicit channel's failure isn't counted while locked: {d}");
+    assert_eq!(w.err("diagnose", json!({ "ref": "channel:1:m3u:late" })), ErrorCode::NotFound);
+    let s = w.ok("sources", json!({}));
+    let one = s["playlists"].as_array().unwrap().iter().find(|p| p["playlist"] == "TV One").unwrap();
+    assert_eq!((one["kind"].as_str(), one["failures_24h"].as_u64()), (Some("m3u"), Some(2)));
+    assert!(one["guide_coverage"]["with_guide"].as_u64().unwrap() >= 1);
+    assert_eq!(s["guides"][0]["guide"], "Guide");
+}
+
+/// reminders: notify, then the same programme as a switch (one row), listed, cancelled; a
+/// started programme and a locked channel are refused. The sleep timer is Tuner's own.
+#[test]
+fn reminders_and_the_sleep_timer() {
+    let mut w = World::new(pin_config());
+    w.publish(Visibility::NO_EXPLICIT);
+    let qual = programme(&mut w, "touring cars qualifying");
+    let add = w.ok("reminders", json!({ "action": "add", "programme": qual, "lead_min": 5 }));
+    let r = &add["reminder"];
+    assert_eq!((r["mode"].as_str(), r["lead_min"].as_u64(), add["existed"].as_bool()), (Some("notify"), Some(5), Some(false)));
+    let id = r["id"].as_i64().unwrap();
+    let again = w.ok("reminders", json!({ "action": "add", "programme": qual, "mode": "switch", "open_in": "popout" }));
+    assert_eq!((again["reminder"]["id"].as_i64(), again["existed"].as_bool()), (Some(id), Some(true)));
+    assert_eq!((again["reminder"]["mode"].as_str(), again["reminder"]["open_in"].as_str()), (Some("switch"), Some("popout")));
+    let list = w.ok("reminders", json!({ "action": "list" }));
+    assert_eq!(names(&list, "reminders", "title"), ["Touring Cars Qualifying"]);
+    let live = programme(&mut w, "british touring");
+    assert_eq!(w.err("reminders", json!({ "action": "add", "programme": live })), ErrorCode::Unavailable);
+    let locked = programme(&mut w, "locked final");
+    let e = w.reply("reminders", json!({ "action": "add", "programme": locked }));
+    assert!(e.error.unwrap().message.starts_with("locked: needs your PIN"), "locked channels can't be scheduled");
+    assert_eq!(w.err("reminders", json!({ "action": "add", "programme": qual, "mode": "switch", "lead_min": 3 })), ErrorCode::BadRequest);
+    assert_eq!(w.ok("reminders", json!({ "action": "cancel", "id": id }))["cancelled"], true);
+    assert!(names(&w.ok("reminders", json!({ "action": "list" })), "reminders", "title").is_empty());
+    assert_eq!(w.err("reminders", json!({ "action": "cancel", "id": id })), ErrorCode::NotFound);
+
+    // the sleep timer runs in Tuner
+    assert_eq!(w.err("sleep_timer", json!({ "action": "status" })), ErrorCode::Unavailable, "not running yet");
+    let s = w.ui.services();
+    let player = s.tiles.focused();
+    let timer = tuner::reminders::sleep::SleepService::start(
+        s.rt.handle(),
+        player.subscribe(),
+        s.agent.subscribe_queue(),
+        tuner::reminders::sleep::player_actuator(vec![player.clone()]),
+        s.bus.clone(),
+    );
+    s.agent.set_sleep(Some(timer));
+    let set = w.ok("sleep_timer", json!({ "action": "set", "after_min": 30, "then": "pause" }));
+    assert_eq!((set["set"]["when"].as_str(), set["set"]["then"].as_str()), (Some("at"), Some("pause")));
+    assert_eq!(w.ok("status", json!({}))["sleep_timer"]["then"], "pause");
+    assert_eq!(w.err("sleep_timer", json!({ "action": "set", "after_min": 30, "end_of_queue": true })), ErrorCode::BadRequest);
+    assert_eq!(w.err("sleep_timer", json!({ "action": "set", "end_of_programme": true })), ErrorCode::Unavailable, "nothing plays");
+    assert_eq!(w.ok("sleep_timer", json!({ "action": "cancel" }))["cancelled"], true);
+    assert!(w.ok("sleep_timer", json!({ "action": "status" }))["set"].is_null());
+}
+
+/// queue: Claude's adds go through the Up next engine, which refuses a locked title ("locked:
+/// needs your PIN in Tuner") and an explicit one (not_found); a bare channel has no slot.
+#[test]
+fn the_queue_tool_drives_up_next() {
+    let mut w = World::new(pin_config());
+    w.publish(Visibility::NO_EXPLICIT);
+    assert_eq!(w.err("queue", json!({ "action": "list" })), ErrorCode::Unavailable, "no engine yet");
+    let s = w.ui.services();
+    let engine = tuner::queue::service::spawn(
+        s.rt.handle(),
+        s.agent.clone(),
+        tuner::queue::service::EngineDeps {
+            store: s.store.clone(),
+            config: s.config.clone(),
+            player: Arc::new(s.tiles.focused()),
+            bus: s.bus.clone(),
+        },
+    );
+    s.agent.set_queue_handle(Some(engine));
+    let airplane = first_ref(&w.ok("search", json!({ "query": "airplane", "kinds": ["movie"] })), "results");
+    let locked = first_ref(&w.ok("search", json!({ "query": "locked film" })), "results");
+    let qual = programme(&mut w, "touring cars qualifying");
+    let out = w.ok("queue", json!({ "action": "add", "refs": [airplane, locked, qual, "channel:1:m3u:itv4", "movie:1:m3u:adult"] }));
+    let added: Vec<&str> = out["added"].as_array().unwrap().iter().map(|a| a["ref"].as_str().unwrap()).collect();
+    assert_eq!(added, [airplane.as_str(), qual.as_str()], "{out}");
+    let refused: Vec<(&str, &str)> =
+        out["refused"].as_array().unwrap().iter().map(|r| (r["ref"].as_str().unwrap(), r["error"].as_str().unwrap())).collect();
+    assert!(refused.contains(&(locked.as_str(), "locked: needs your PIN in Tuner")), "{refused:?}");
+    assert!(refused.contains(&("channel:1:m3u:itv4", "no_guide")), "{refused:?}");
+    assert!(refused.contains(&("movie:1:m3u:adult", "not_found")), "{refused:?}");
+    let list = w.ok("queue", json!({ "action": "list" }));
+    assert_eq!(names(&list, "items", "title"), ["Airplane! (1980)", "Touring Cars Qualifying"]);
+    assert_eq!(list["items"][1]["kind"], "programme");
+    let second = list["items"][1]["id"].as_i64().unwrap();
+    w.ok("queue", json!({ "action": "move", "ids": [second], "to": "top" }));
+    assert_eq!(names(&w.ok("queue", json!({ "action": "list" })), "items", "title"), ["Touring Cars Qualifying", "Airplane! (1980)"]);
+    assert_eq!(w.ok("queue", json!({ "action": "remove", "ids": [second] }))["removed"], 1);
+    assert_eq!(w.ok("status", json!({}))["queue"]["left"], 1);
+    assert_eq!(w.ok("queue", json!({ "action": "clear", "played_only": false }))["removed"], 1);
+    assert!(w.ok("status", json!({})).get("queue").is_none());
+}
+
+/// follow: a preview never looks at explicit channels; a spoiler-safe rule shows only its
+/// name; rules Claude adds are marked and capped at 10 an hour.
+#[test]
+fn follow_rules_preview_add_and_cap() {
+    let mut w = World::new(pin_config());
+    w.publish(Visibility::NO_EXPLICIT);
+    let rule = json!({ "name": "Touring", "kind": "custom", "terms": ["touring"] });
+    let p = w.ok("follow", json!({ "action": "preview", "rule": rule }));
+    let titles = names(&p, "matches", "title");
+    assert!(titles.contains(&"Touring Cars Qualifying".to_owned()), "{p}");
+    assert!(!mentions(&p, "after dark") && !mentions(&p, "late night"), "{p}");
+    let safe = w.ok(
+        "follow",
+        json!({ "action": "preview", "rule": { "name": "Cars", "kind": "event", "terms": ["touring"], "airings": "any" }, "spoiler_safe": true }),
+    );
+    assert!(safe["matches"].as_array().unwrap().iter().all(|m| m["title"] == "Cars" && m.get("sub_title").is_none()), "{safe}");
+    assert_eq!(w.err("follow", json!({ "action": "add", "rule": { "name": "x", "kind": "derby" } })), ErrorCode::BadRequest);
+    let news = w.ok(
+        "follow",
+        json!({ "action": "preview", "rule": { "name": "News at Six", "kind": "news_flash", "days": ["mon", "fri"], "headlines_min": 3 } }),
+    );
+    assert_eq!(news["rule"]["mode"], "flash");
+
+    let added = w.ok("follow", json!({ "action": "add", "rule": rule }));
+    let id = added["rule"]["id"].as_i64().unwrap();
+    assert_eq!(added["rule"]["by_claude"], true);
+    let list = w.ok("follow", json!({ "action": "list" }));
+    assert_eq!(names(&list, "rules", "name"), ["Touring"]);
+    for i in 1..10 {
+        w.ok("follow", json!({ "action": "add", "rule": { "name": format!("Rule {i}"), "kind": "custom", "terms": [format!("word{i}")] } }));
+    }
+    let e = w.reply("follow", json!({ "action": "add", "rule": { "name": "One too many", "kind": "custom" } }));
+    assert_eq!(e.error.as_ref().unwrap().code, ErrorCode::Unavailable, "10 an hour: {e:?}");
+    let out = w.ok("follow", json!({ "action": "remove", "id": id }));
+    assert_eq!(out["removed"], true);
+    assert_eq!(w.err("follow", json!({ "action": "remove", "id": id })), ErrorCode::NotFound);
+}
+
+/// spoiler_guard: Claude adds a topic and marks a programme seen (once), removes its rule; a
+/// topic blackout needs an end.
+#[test]
+fn the_spoiler_guard_tool() {
+    let mut w = World::new(pin_config());
+    w.publish(Visibility::NO_EXPLICIT);
+    let id =
+        w.ok("spoiler_guard", json!({ "action": "add_topic", "label": "Touring cars", "terms": ["touring car", "btcc"] }))["id"].as_i64().unwrap();
+    let list = w.ok("spoiler_guard", json!({ "action": "list" }));
+    assert_eq!((list["rules"][0]["kind"].as_str(), list["rules"][0]["by_claude"].as_bool()), (Some("topic"), Some(true)));
+    let live = programme(&mut w, "british touring");
+    assert_eq!(w.ok("spoiler_guard", json!({ "action": "mark_seen", "ref": live }))["marked"], true);
+    assert_eq!(w.ok("spoiler_guard", json!({ "action": "mark_seen", "ref": live }))["marked"], false, "seen once");
+    let show = first_ref(&w.ok("search", json!({ "query": "the show", "kinds": ["series"] })), "results");
+    assert!(w.ok("spoiler_guard", json!({ "action": "add_series", "series_ref": show }))["id"].as_i64().is_some());
+    assert_eq!(w.err("spoiler_guard", json!({ "action": "blackout", "topic": "Final" })), ErrorCode::BadRequest);
+    let qual = programme(&mut w, "touring cars qualifying");
+    let b = w.ok("spoiler_guard", json!({ "action": "blackout", "ref": qual }));
+    assert!(b["id"].as_i64().is_some());
+    assert_eq!(w.ok("spoiler_guard", json!({ "action": "remove", "id": id }))["removed"], true);
+    assert!(w.ok("spoiler_guard", json!({ "action": "status" }))["topics"].is_array());
+}
+
+/// guide_fix: propose → apply (only with confirm) → undo; a locked channel is refused while
+/// the session is locked, an explicit one doesn't exist; Claude undoes only its own batches.
+#[test]
+fn guide_fixes_round_trip() {
+    let mut w = World::new(pin_config());
+    w.publish(Visibility::NO_EXPLICIT);
+    let issues = w.ok("guide_fix", json!({ "action": "issues" }));
+    assert!(issues["coverage"].as_array().unwrap().iter().any(|c| c["playlist"] == "TV One"), "{issues}");
+    assert!(!mentions(&issues, "late night") && !mentions(&issues, "secret"), "{issues}");
+    let p = w.ok(
+        "guide_fix",
+        json!({ "action": "propose", "changes": [
+            { "ref": "channel:1:m3u:bbc1", "shift_min": 5 },
+            { "ref": "channel:1:m3u:locked", "shift_min": 5 },
+            { "ref": "channel:1:m3u:late", "shift_min": 5 },
+        ] }),
+    );
+    assert_eq!(p["summary"]["channels"], 1, "{p}");
+    let rejected: Vec<&str> = p["rejected"].as_array().unwrap().iter().map(|r| r["reason"].as_str().unwrap()).collect();
+    assert_eq!(rejected, ["locked: needs your PIN in Tuner", "not_found"]);
+    assert_eq!(p["changes"][0]["before"]["now"]["title"], "News at Six");
+    let id = p["proposal_id"].as_str().unwrap().to_owned();
+    assert_eq!(w.err("guide_fix", json!({ "action": "apply", "proposal_id": id })), ErrorCode::BadRequest, "confirm=true only after a yes");
+    let done = w.ok("guide_fix", json!({ "action": "apply", "proposal_id": id, "confirm": true }));
+    assert_eq!(done["applied"], 1);
+    assert_eq!(w.err("guide_fix", json!({ "action": "apply", "proposal_id": id, "confirm": true })), ErrorCode::NotFound, "applied once");
+    let undo = done["undo_id"].as_i64().unwrap();
+    assert_eq!(w.ok("guide_fix", json!({ "action": "undo", "undo_id": undo }))["reverted"], 1);
+    assert_eq!(w.err("guide_fix", json!({ "action": "undo", "undo_id": undo })), ErrorCode::Unavailable, "undone already");
+}
+
+/// multiview: two live pictures are sent to the app; movies stay single view, a future
+/// programme hasn't started, and swap / close need multi-view on.
+#[test]
+fn the_multiview_tool() {
+    let mut w = World::new(pin_config());
+    w.publish(Visibility::NO_EXPLICIT);
+    w.commands();
+    let out = w.ok("multiview", json!({ "action": "open", "refs": ["channel:1:m3u:itv4", "channel:1:m3u:bbc1"], "sound": 1 }));
+    assert_eq!(out["outcome"], "opening");
+    match w.commands().as_slice() {
+        [AgentCommand::MultiView(tuner::agent::AgentMultiView::Open { targets, sound: Some(1), rearrange: false, .. })] => {
+            assert_eq!(targets.len(), 2)
+        }
+        other => panic!("{other:?}"),
+    }
+    let airplane = first_ref(&w.ok("search", json!({ "query": "airplane", "kinds": ["movie"] })), "results");
+    assert_eq!(w.err("multiview", json!({ "action": "open", "refs": ["channel:1:m3u:itv4", airplane] })), ErrorCode::Unsupported);
+    let later = programme(&mut w, "touring cars qualifying");
+    assert_eq!(w.err("multiview", json!({ "action": "open", "refs": ["channel:1:m3u:itv4", later] })), ErrorCode::NotStarted);
+    assert_eq!(w.err("multiview", json!({ "action": "open", "refs": ["channel:1:m3u:late", "channel:1:m3u:itv4"] })), ErrorCode::NotFound);
+    assert_eq!(w.err("multiview", json!({ "action": "swap", "what": "sound" })), ErrorCode::Unavailable);
+    assert_eq!(w.err("multiview", json!({ "action": "close" })), ErrorCode::Unavailable);
+}
+
+/// A feature tool whose flag is off is refused by the production handler (it isn't listed by
+/// `tools/list` either), whatever a client sends.
+#[test]
+fn unlisted_feature_tools_are_refused_in_production() {
+    let ui = TestUi::with_config(pin_config()).unwrap();
+    let s = ui.services();
+    let handler = AgentHandler::new(s.agent.clone(), s.store.clone(), s.config.clone(), s.tiles.focused(), s.bus.clone(), s.jobs.clone());
+    for (name, args) in [("queue", json!({ "action": "list" })), ("follow", json!({ "action": "list" })), ("multiview", json!({ "action": "close" }))]
+    {
+        let listed = tuner::agent::tools::tools().iter().any(|t| t.name == name);
+        let call = Call::from_tool(name, args).unwrap();
+        let reply = s.rt.block_on(handler.handle(Request::new(1, call)));
+        assert_eq!(reply.ok || reply.error.as_ref().is_some_and(|e| e.code != ErrorCode::Unsupported), listed, "{name}: {reply:?}");
+    }
 }

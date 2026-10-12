@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "tuner": {
+      "command": "tuner",
+      "args": ["mcp"]
+    }
+  }
+}

@@ -70,7 +70,7 @@ pub enum Call {
     Details(Details),
     Categories(Categories),
     Browse(Browse),
-    ContinueWatching(Limit),
+    ContinueWatching(ContinueWatching),
     Favourites(Favourites),
     Status(Empty),
     Play(Play),
@@ -149,6 +149,25 @@ impl Call {
         }
     }
 
+    /// How the spoiler guard treats this call's result (B4): `spoiler_safe=true` strips
+    /// sub-titles, descriptions and plots of everything; the refs in `reveal_spoilers` (the skill
+    /// passes them only when the user asked to see them in that turn) come back unguarded.
+    pub fn guard_opts(&self) -> (crate::guard::Policy, Vec<String>) {
+        let (safe, reveal) = match self {
+            Call::GuideSearch(p) => (p.spoiler_safe, p.reveal_spoilers.clone()),
+            Call::WhatsOn(p) => (p.spoiler_safe, p.reveal_spoilers.clone()),
+            Call::Details(p) => (p.spoiler_safe, p.reveal_spoilers.clone()),
+            Call::Search(p) => (p.spoiler_safe, None),
+            Call::Browse(p) => (p.spoiler_safe, None),
+            Call::ContinueWatching(p) => (p.spoiler_safe, None),
+            Call::Episodes(p) => (p.spoiler_safe, p.reveal_spoilers.clone()),
+            Call::Follow(p) => (p.spoiler_safe, None),
+            _ => (None, None),
+        };
+        let policy = if safe == Some(true) { crate::guard::Policy::SpoilerSafe } else { crate::guard::Policy::Normal };
+        (policy, reveal.unwrap_or_default().into_iter().map(|r| r.trim().to_owned()).collect())
+    }
+
     /// Build a call from a tool name and its arguments (`tools/call`). `Err`: unknown tool, or
     /// arguments that don't match its schema (the serde message, for the model to correct).
     pub fn from_tool(name: &str, arguments: serde_json::Value) -> Result<Call, String> {
@@ -171,8 +190,10 @@ pub enum Kind {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GuideSearch {
-    /// Words of a programme title / episode title (FTS, last word a prefix).
-    pub query: String,
+    /// Words of a programme title / episode title (FTS, last word a prefix). Without it the
+    /// search needs a window (`from` + `to`, at most 3 days) and `categories` or `channel`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
     /// Only programmes overlapping [`from`, `to`) ([`parse_when`] formats).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
@@ -181,6 +202,34 @@ pub struct GuideSearch {
     /// Include programmes that already ended (catch-up). Default true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_past: Option<bool>,
+    /// Guide categories, any of (words, case-insensitive: "football", "news").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub categories: Option<Vec<String>>,
+    /// Only on this channel (name words or number).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    /// Only channels of this playlist (name words).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub playlist: Option<String>,
+    /// Only favourite channels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub favourites_only: Option<bool>,
+    /// Only programmes the guide marks live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_only: Option<bool>,
+    /// Only programmes the guide marks new.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_only: Option<bool>,
+    /// Leave out programmes the guide marks as shown before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude_repeats: Option<bool>,
+    /// Only programmes the archive can play now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catchup_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spoiler_safe: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reveal_spoilers: Option<Vec<String>>,
     /// 1–50, default 20.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
@@ -200,6 +249,15 @@ pub struct WhatsOn {
     pub group: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub favourites_only: Option<bool>,
+    /// The programme's guide categories, any of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub categories: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spoiler_safe: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reveal_spoilers: Option<Vec<String>>,
     /// 1–100, default 30.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
@@ -212,6 +270,12 @@ pub struct Search {
     /// Default all three.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kinds: Option<Vec<Kind>>,
+    /// Also say which of the user's own settings hide matching titles (a hidden category, the
+    /// category filter, a playlist kept out of All, title languages). Never parental control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explain_filtered: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spoiler_safe: Option<bool>,
     /// 1–50, default 20.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
@@ -223,6 +287,10 @@ pub struct Details {
     /// An [`AgentRef`] string.
     #[serde(rename = "ref")]
     pub item: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spoiler_safe: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reveal_spoilers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -232,6 +300,21 @@ pub struct Categories {
     /// Playlist name (words); default every playlist in "All playlists".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub playlist: Option<String>,
+    /// Only categories about this (read from their names).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<CategoryKind>,
+}
+
+/// What a category is about, read from its name (`categories tag`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CategoryKind {
+    Kids,
+    Family,
+    News,
+    Sport,
+    Music,
+    Doc,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,6 +353,17 @@ pub struct Browse {
     pub year_to: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort: Option<BrowseSort>,
+    /// Only titles added since ([`parse_when`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_since: Option<String>,
+    /// Movies / series: a cast member or director (name words).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person: Option<String>,
+    /// Movies / series: genre words ("thriller").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub genre: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spoiler_safe: Option<bool>,
     /// 1–50, default 20.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
@@ -280,9 +374,11 @@ pub struct Browse {
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Limit {
+pub struct ContinueWatching {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spoiler_safe: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -342,6 +438,10 @@ pub enum ControlAction {
     Volume,
     Mute,
     Unmute,
+    /// Back to the channel watched before (the PIN rules apply).
+    PreviousChannel,
+    /// Move what plays to the pop-out (the small pinned window; it never takes the keyboard).
+    Popout,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -350,6 +450,31 @@ pub struct Control {
     pub action: ControlAction,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<f64>,
+    /// Multi-view: one picture (`a` or `b`). Default: pause / resume / stop both, volume and
+    /// mute the one with the sound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tile: Option<TileName>,
+}
+
+/// A picture of multi-view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TileName {
+    A,
+    B,
+}
+
+impl TileName {
+    pub fn id(self) -> crate::model::TileId {
+        match self {
+            TileName::A => crate::model::TileId::A,
+            TileName::B => crate::model::TileId::B,
+        }
+    }
+
+    pub fn of(t: crate::model::TileId) -> Self {
+        if t == crate::model::TileId::A { TileName::A } else { TileName::B }
+    }
 }
 
 // ------------------------------------------------------------------ reply
@@ -463,6 +588,29 @@ pub struct ProgrammeOut {
     /// Other channels with the same programme (each `ref` is that channel's).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub also_on: Vec<ChannelOut>,
+    /// Guide categories.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub categories: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub season: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode: Option<u32>,
+    /// The guide marks it live / new / shown before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_live: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_new: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub repeat: bool,
+    /// The guide's age rating ("15", "PG").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_rating: Option<String>,
+    /// Catch-up: when the archive drops it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catchup_until: Option<String>,
+    /// Live: minutes left.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_min: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -543,6 +691,23 @@ pub struct WhatsOnOut {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SearchOut {
     pub results: Vec<ItemOut>,
+    /// `explain_filtered`: matching titles one of the user's own settings hides.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filtered: Vec<FilteredOut>,
+}
+
+/// A title the user's own settings hide (`search explain_filtered`); never one parental
+/// control hides.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FilteredOut {
+    pub name: String,
+    pub kind: Kind,
+    pub playlist: String,
+    /// `hidden_category` (with `category`), `category_filter` (with `category`),
+    /// `hidden_by_you`, `not_in_all`, `title_language`.
+    pub why: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -604,9 +769,42 @@ pub struct DetailsOut {
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub categories: Vec<String>,
+    /// Programme numbers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub season: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode: Option<u32>,
+    /// Programme: the guide's age rating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_rating: Option<String>,
+    /// Channel / programme: the channel and the same channel in other playlists; movie /
+    /// series: its copies. The best first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub copies: Vec<CopyOut>,
     /// Details are still being fetched from the provider: ask again in a moment.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub details_pending: bool,
+}
+
+/// One copy of a channel or title (`details copies`): its `ref` plays that copy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CopyOut {
+    #[serde(rename = "ref")]
+    pub item: String,
+    pub playlist: String,
+    /// Measured or labelled quality (`SD` … `4K`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality: Option<String>,
+    /// Stream failures in the last 7 days.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub failures_7d: u32,
+    /// Channels: has guide data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_guide: Option<bool>,
+    /// Channels: catch-up days (0 = none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catchup_days: Option<u32>,
+    pub locked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -616,6 +814,12 @@ pub struct CategoryOut {
     /// Visible items.
     pub count: u32,
     pub locked: bool,
+    /// What it is about, from its name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<CategoryKind>,
+    /// Its country or language tag ("GB", "lang:fr").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -642,6 +846,9 @@ pub struct ContinueItem {
     pub title: TitleOut,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_episode: Option<EpisodeOut>,
+    /// Minutes left of the movie, or of the episode in progress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_min: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -712,6 +919,82 @@ pub struct StatusOut {
     /// Pending automatic switches.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scheduled: Vec<SwitchOut>,
+    /// Up next, while it has items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue: Option<QueueStatusOut>,
+    /// Multi-view, while two pictures are on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multiview: Option<MultiviewStatusOut>,
+    /// Streams per playlist: the account's limit and the pictures using it now.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub streams: Vec<StreamsOut>,
+    /// The sleep timer, when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sleep_timer: Option<SleepOut>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QueueStatusOut {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_id: Option<i64>,
+    /// What plays next.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<QueueNextOut>,
+    /// Items still to play.
+    pub left: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eta_end: Option<String>,
+    /// Up next drives the picture now.
+    pub playing: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QueueNextOut {
+    #[serde(rename = "ref")]
+    pub item: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TileOut {
+    pub tile: TileName,
+    #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub playlist: Option<String>,
+    pub state: PlayerStateOut,
+    pub sound: bool,
+    pub focused: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MultiviewStatusOut {
+    pub on: bool,
+    pub tiles: Vec<TileOut>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StreamsOut {
+    pub playlist: String,
+    /// The account's connection limit, when the provider says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Tuner's pictures using it now.
+    pub in_use: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SleepOut {
+    /// `at`, `end_of_programme`, `after_items` or `end_of_queue`.
+    pub when: String,
+    /// `stop` or `pause`.
+    pub then: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub items_left: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -870,7 +1153,7 @@ mod tests {
 
     #[test]
     fn requests_round_trip_on_the_wire() {
-        let req = Request::new(7, Call::GuideSearch(GuideSearch { query: "touring car".into(), limit: Some(5), ..Default::default() }));
+        let req = Request::new(7, Call::GuideSearch(GuideSearch { query: Some("touring car".into()), limit: Some(5), ..Default::default() }));
         let line = serde_json::to_string(&req).unwrap();
         assert_eq!(line, r#"{"v":2,"id":7,"method":"guide_search","params":{"query":"touring car","limit":5}}"#);
         assert_eq!(serde_json::from_str::<Request>(&line).unwrap(), req);

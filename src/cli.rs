@@ -87,6 +87,13 @@ pub enum Command {
     /// `claude mcp add tuner -- tuner mcp`) can search the guide and your library and play
     /// things in the running Tuner — starting it when needed (DESIGN §30).
     Mcp,
+    /// Show how to connect Claude Code to Tuner (the omatuner plugin: the MCP server and its
+    /// skills). `--apply` runs the plugin steps after asking on the terminal.
+    ClaudeSetup {
+        /// Run the steps (asks first; never without a "y").
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[cfg(test)]
