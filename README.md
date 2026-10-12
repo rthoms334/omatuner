@@ -71,10 +71,10 @@ preview playing](docs/screenshots/live.png)
 
 Everything in these screenshots is made up: the playlists, channels, programmes, logos and
 posters come from a demo profile (`examples/demo_profile.rs`), and `scripts/screenshots.sh`
-takes the pictures. The theme is Omarchy's Tokyo Night unless noted. The video is from the
-*Sintel* trailer, © copyright Blender Foundation |
-[durian.blender.org](https://durian.blender.org/sharing/), licensed under
-[CC BY 3.0](https://creativecommons.org/licenses/by/3.0/).
+takes the pictures. The theme is Omarchy's Tokyo Night unless noted. Video: NASA, public
+domain ([NASA media usage guidelines](https://www.nasa.gov/nasa-brand-center/images-and-media/)):
+[Earth Views from the International Space Station](https://images.nasa.gov/details/Earth%20Views%20from%20the%20International%20Space%20Station)
+and [Artemis I Launch (Press Site)](https://images.nasa.gov/details/Artemis%20I%20Launch%202022%20CU%20tracking%20from%20Press%20Site_compressed).
 
 ## Features
 

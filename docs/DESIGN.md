@@ -3149,7 +3149,7 @@ explicit test bus.
 `scripts/screenshots.sh [shot…]` regenerates `docs/screenshots/*.png`. The repository is
 public, so every image shows made-up content only:
 
-* **Demo profile** — `cargo run --example demo_profile -- <dir> [--media <file>] [--silent]`:
+* **Demo profile** — `cargo run --example demo_profile -- <dir> [--media <file>] [--media2 <file>] [--silent]`:
   three fictional playlists (Northwind, Aurora, Harbor Free; distinct colours) as local M3U
   files imported by the real `RefreshSource` job, ~60 channels with quality badges in
   country-tagged categories (`UK | News`, `FR | Cinéma`…), a guide from an XMLTV file
@@ -3178,11 +3178,15 @@ public, so every image shows made-up content only:
   live one (no `~/.config/omarchy/shell.toml`, rounding 0, no theme watcher). The script uses
   the bundled fixtures `tests/fixtures/theme/tokyo-night` (dark) and `catppuccin-latte`
   (light). Fonts still come from fontconfig (Omarchy: JetBrainsMono Nerd Font).
-* **Video** — 9.5 s of the *Sintel* trailer (© copyright Blender Foundation |
-  durian.blender.org, CC BY 3.0): 0:22–0:32 without the cut to black at 0:28, so no frame is
-  black and no title card shows. The script downloads it into `target/screenshots/media/`
-  (sha256-checked, never committed); it is letterbox cropped and looped by mpv (`loop-file=inf`,
-  `ao=null` with `--silent`). Without the download an ffmpeg test pattern plays instead.
+* **Video** — public-domain NASA footage (NASA Image and Video Library), no people, captions
+  or overlays: 8 s of *Earth Views from the International Space Station* (0:49.3–0:57.3,
+  clouds over the limb between two cross-fades) on most channels, and 9.5 s of *Artemis I
+  Launch (Press Site)* (0:53–1:02.5, SLS clearing the towers) on the channels in the demo
+  profile's `SECOND_CLIP` (`--media2`; Lumen Docs, so multi-view's two pictures differ). The
+  script downloads both 1280×720 sources into `target/screenshots/media/` (sha256-checked,
+  never committed), cuts them with a silent audio track (the Earth Views soundtrack isn't
+  used), and mpv loops them (`loop-file=inf`, `ao=null` with `--silent`). Without a download
+  that channel's clip is an ffmpeg test pattern.
 
 ---
 

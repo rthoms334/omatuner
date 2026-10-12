@@ -2,14 +2,16 @@
 //! a few days of guide, movies and series with generated posters, and some favourites, history,
 //! progress, reminders, Up next, Following rules and channels for Guide fixes.
 //!
-//! `cargo run --example demo_profile -- <dir> [--media <video file>] [--silent]`, then
+//! `cargo run --example demo_profile -- <dir> [--media <video file>] [--media2 <video file>]
+//! [--silent]`, then
 //! `tuner --profile-dir <dir>`. `--silent` gives mpv no audio output (screenshots).
 //!
 //! Everything is invented and generated here — names, programmes, logos (monograms), posters
 //! (gradients + title) — so screenshots never show a real provider, channel or artwork. The
 //! content is fixed (seeded); only the guide's times follow today's date. Live channels play
-//! `--media` (looped; `scripts/screenshots.sh` passes a Creative Commons clip), movies and
-//! episodes point at `*.tuner-demo.invalid` and never play.
+//! `--media` (looped; `scripts/screenshots.sh` passes public-domain NASA footage), the channels
+//! in `SECOND_CLIP` play `--media2` instead when given (so multi-view's two pictures differ),
+//! movies and episodes point at `*.tuner-demo.invalid` and never play.
 //!
 //! It goes through the app's own import path: M3U files are imported by the `RefreshSource`
 //! job (smart names, quality badges, country tags, stacks), the XMLTV file by `RefreshEpg`;
@@ -43,26 +45,30 @@ use tuner::ui::widgets::glyphs;
 const SEED: u64 = 0x7475_6e65_7264_656d; // "tunerdem"
 const IMG: &str = "https://img.tuner-demo.invalid";
 
+const USAGE: &str = "usage: demo_profile <dir> [--media <video file>] [--media2 <video file>] [--silent]";
+
 #[allow(dead_code)] // the test includes this file and uses `build` only
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let mut dir = None;
     let mut media = None;
+    let mut media2 = None;
     let mut silent = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--media" => media = Some(PathBuf::from(args.next().context("--media needs a file")?)),
+            "--media2" => media2 = Some(PathBuf::from(args.next().context("--media2 needs a file")?)),
             "--silent" => silent = true,
             "-h" | "--help" => {
-                println!("usage: demo_profile <dir> [--media <video file>] [--silent]");
+                println!("{USAGE}");
                 return Ok(());
             }
             _ if dir.is_none() => dir = Some(PathBuf::from(a)),
             other => bail!("unexpected argument {other}"),
         }
     }
-    let dir = dir.context("usage: demo_profile <dir> [--media <video file>] [--silent]")?;
-    let summary = build(&dir, media.as_deref(), silent)?;
+    let dir = dir.context(USAGE)?;
+    let summary = build(&dir, media.as_deref(), media2.as_deref(), silent)?;
     println!("{summary}");
     println!("run: tuner --profile-dir {}", dir.display());
     Ok(())
@@ -116,6 +122,10 @@ const BRANDS: &[(&str, Genre, u32)] = &[
     ("Lakeside One", Genre::Entertainment, 190),
     ("Paperlight Drama", Genre::Entertainment, 300),
 ];
+
+/// The brands whose channels play the second clip (`--media2`): multi-view pairs Polar Nature
+/// (first clip) with Lumen Docs, and the pop-out's Summit Sports differs from the player's shot.
+const SECOND_CLIP: &[&str] = &["Lumen Docs", "Orbit Science", "Summit Sports"];
 
 /// One playlist's channels: (category, brand, name suffix).
 type Lineup = &'static [(&'static str, &'static str, &'static str)];
@@ -626,7 +636,8 @@ fn playlists() -> [Playlist; 3] {
     ]
 }
 
-fn m3u(p: &Playlist, media: &str) -> String {
+/// `media`: (the first clip's URL, the second's) for live channels.
+fn m3u(p: &Playlist, media: (&str, &str)) -> String {
     let mut s = String::from("#EXTM3U\n");
     for (i, (group, name, suffix)) in p.live.iter().enumerate() {
         let id = slug(name);
@@ -635,7 +646,7 @@ fn m3u(p: &Playlist, media: &str) -> String {
             r#"#EXTINF:-1 tvg-id="{id}.demo" tvg-chno="{}" tvg-logo="{IMG}/logo/{id}.png" group-title="{group}",{name}{suffix}"#,
             101 + i
         );
-        s.push_str(media);
+        s.push_str(if SECOND_CLIP.contains(name) { media.1 } else { media.0 });
         s.push('\n');
     }
     let uhd = |on: bool| if on { " [4K]" } else { "" };
@@ -788,10 +799,10 @@ impl std::fmt::Display for Summary {
     }
 }
 
-/// Build the demo profile in `dir` (must be empty or missing). Live channels play `media`;
-/// `silent`: mpv gets no audio output. Also writes `demo/refs.env` (shell variables naming
+/// Build the demo profile in `dir` (must be empty or missing). Live channels play `media`, those
+/// in `SECOND_CLIP` play `media2` (`media` without it); `silent`: mpv gets no audio output. Also writes `demo/refs.env` (shell variables naming
 /// demo items for `scripts/screenshots.sh`).
-pub fn build(dir: &Path, media: Option<&Path>, silent: bool) -> Result<Summary> {
+pub fn build(dir: &Path, media: Option<&Path>, media2: Option<&Path>, silent: bool) -> Result<Summary> {
     if dir.exists() && std::fs::read_dir(dir)?.next().is_some() {
         bail!("{} is not empty", dir.display());
     }
@@ -801,11 +812,15 @@ pub fn build(dir: &Path, media: Option<&Path>, silent: bool) -> Result<Summary> 
     paths.ensure()?;
     let fixtures = dir.join("demo");
     std::fs::create_dir_all(&fixtures)?;
-    let media = match media {
-        Some(m) => std::fs::canonicalize(m).unwrap_or_else(|_| m.to_path_buf()),
-        None => fixtures.join("missing-demo-video.mp4"),
+    let file_url = |m: Option<&Path>| -> Result<String> {
+        let m = match m {
+            Some(m) => std::fs::canonicalize(m).unwrap_or_else(|_| m.to_path_buf()),
+            None => fixtures.join("missing-demo-video.mp4"),
+        };
+        Ok(url::Url::from_file_path(&m).map_err(|()| anyhow!("media path must be absolute"))?.to_string())
     };
-    let media_url = url::Url::from_file_path(&media).map_err(|()| anyhow!("media path must be absolute"))?.to_string();
+    let media_url = file_url(media)?;
+    let media2_url = if media2.is_some() { file_url(media2)? } else { media_url.clone() };
 
     // config: Home first, live previews loop the clip, nothing refreshes on its own
     let mut cfg = Config::default();
@@ -842,7 +857,7 @@ pub fn build(dir: &Path, media: Option<&Path>, silent: bool) -> Result<Summary> 
     // playlists + guide files
     let lists = playlists();
     for p in &lists {
-        std::fs::write(fixtures.join(p.file), m3u(p, &media_url))?;
+        std::fs::write(fixtures.join(p.file), m3u(p, (&media_url, &media2_url)))?;
     }
     let day_start = jiff::Zoned::now().start_of_day().map(|z| z.timestamp().as_second()).unwrap_or_else(|_| tuner::model::now() / 86_400 * 86_400);
     let (xmltv, progs) = guide(day_start);

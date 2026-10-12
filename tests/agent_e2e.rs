@@ -185,7 +185,7 @@ fn claude_finds_the_live_sport_plays_it_and_schedules_the_next() {
     // the live channels' "stream": a still image, which mpv plays (looped) like a video
     let media = dir.path().join("live.png");
     image::RgbImage::from_pixel(64, 36, image::Rgb([40, 90, 160])).save(&media).unwrap();
-    demo::build(&profile, Some(&media), true).expect("demo profile");
+    demo::build(&profile, Some(&media), None, true).expect("demo profile");
     let profile = std::fs::canonicalize(&profile).unwrap();
     let mut app = Headless::start(&profile);
     // the app serves its socket (bound by the services at start)
