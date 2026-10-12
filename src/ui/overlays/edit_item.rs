@@ -196,7 +196,10 @@ impl EditItemOverlay {
         let name = self.name.trim();
         let mut ov = l.ov.clone();
         ov.rename = (!name.is_empty() && name != l.provider_name).then(|| name.to_owned());
-        ov.catchup_offset_s = (self.offset_min != 0).then_some(self.offset_min * 60);
+        // an unchanged offset keeps what is stored (an own 0 overrides the playlist's offset)
+        if self.offset_min != l.ov.catchup_offset_s.unwrap_or(0) / 60 {
+            ov.catchup_offset_s = (self.offset_min != 0).then_some(self.offset_min * 60);
+        }
         ov.locked = self.locked;
         ov.hidden = self.hidden;
         // the time shift is a guide fix: logged (Undo in its toast and Ctrl+Z in Guide fixes) and

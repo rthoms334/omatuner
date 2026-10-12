@@ -5,7 +5,8 @@
 //!   snapshot, so explicit channels are absent while hidden).
 //! * [`submit_apply`] / [`submit_undo`]: every write is one logged batch on the store writer;
 //!   it emits `DataScope::Epg`, toasts what it did (with Undo), and submits
-//!   `EvaluateFollows { reason: Mapping }` when a mapping changed (B7). The app's global
+//!   `EvaluateFollows { reason: Mapping }` when a mapping changed (B7), and a guide check
+//!   (`jobs::guide_check::request_from`) when rules or mappings changed. The app's global
 //!   `Action::UndoGuideFix` arm can call [`submit_undo`] too (a toast's Undo off the screen).
 //! * [`to_fix`]: "Fix guide data… (N to fix)" for Settings ▸ EPG, cached per library build.
 //! * Item menus: "Time shift…" on a channel opens Guide fixes on it with Adjust focused.
@@ -117,10 +118,19 @@ impl Report {
     }
 }
 
-/// Read and classify (blocking pool; about 0.3 s + < 0.1 s at 79k channels).
-pub fn load_report(conn: &rusqlite::Connection, lib: &Library, opts: GuideOpts, include_hidden: bool, now: Timestamp) -> Result<Report> {
+/// Read and classify (blocking pool; about 0.3 s + < 0.1 s at 79k channels). `with_catalog`:
+/// also find proposals for "Gone from guide" and "Guide ended" (the catalogue takes 0.2–1 s to
+/// build; a count doesn't need them).
+pub fn load_report(
+    conn: &rusqlite::Connection,
+    lib: &Library,
+    opts: GuideOpts,
+    include_hidden: bool,
+    with_catalog: bool,
+    now: Timestamp,
+) -> Result<Report> {
     let facts = crate::store::guide_fix::facts(conn, &opts, now)?;
-    let catalog = super::catalog::shared(conn).ok();
+    let catalog = if with_catalog { super::catalog::shared(conn).ok() } else { None };
     let issues = classify(lib, &facts, catalog.as_deref(), ClassifyOpts { include_hidden });
     let by_channel = issues.rows.iter().enumerate().map(|(i, r)| (r.channel, i as u32)).collect();
     let mut methods = HashMap::new();
@@ -189,6 +199,10 @@ pub fn submit_apply(services: &Services, label: String, toast: String, p: Propos
         if r.mappings_changed && crate::follow::ENABLED {
             jobs.submit(JobKind::EvaluateFollows { reason: crate::follow::FollowReason::Mapping });
         }
+        // new rules are a new stamp; an unmapped channel needs suggestions
+        if r.rules_changed || r.mappings_changed {
+            crate::jobs::guide_check::request_from(&jobs);
+        }
         Ok(r)
     })
 }
@@ -225,6 +239,9 @@ pub fn submit_undo(services: &Services, log: Option<GuideFixLogId>, opts: GuideO
         if r.reverted > 0 && crate::follow::ENABLED {
             jobs.submit(JobKind::EvaluateFollows { reason: crate::follow::FollowReason::Mapping });
         }
+        if r.rules_changed || r.reverted > 0 {
+            crate::jobs::guide_check::request_from(&jobs);
+        }
         Ok(Some(r))
     })
 }
@@ -257,7 +274,7 @@ pub fn to_fix(ctx: &UiCtx<'_>) -> Option<usize> {
     let (store, bus, lib) = (ctx.services.store.clone(), ctx.services.bus.clone(), Arc::clone(ctx.lib));
     let (opts, now) = (GuideOpts::from_config(ctx.config), ctx.now);
     ctx.services.rt.spawn_blocking(move || {
-        let n = store.reader().and_then(|c| load_report(&c, &lib, opts, false, now)).map(|r| r.to_fix());
+        let n = store.reader().and_then(|c| load_report(&c, &lib, opts, false, false, now)).map(|r| r.to_fix());
         match n {
             Ok(n) => {
                 let mut slot = to_fix_slot();

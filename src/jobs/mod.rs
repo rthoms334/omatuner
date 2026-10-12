@@ -366,6 +366,8 @@ pub struct JobContext {
     /// What the app publishes (B2): jobs use its library snapshot instead of building their
     /// own. `None` headless (`tuner --refresh`, tests).
     pub shared: Option<Arc<crate::shared::AppShared>>,
+    /// A guide check waits out its debounce (`guide_check::request`): requests meanwhile join it.
+    pub guide_check_pending: Arc<AtomicBool>,
 }
 
 impl JobContext {
@@ -381,6 +383,7 @@ impl JobContext {
             player_busy: Arc::default(),
             explicit: Default::default(),
             shared: None,
+            guide_check_pending: Arc::default(),
         }
     }
 
@@ -951,9 +954,7 @@ pub(crate) fn after_guide(ctx: &JobContext, reason: crate::follow::FollowReason)
     if crate::follow::ENABLED {
         (ctx.submit)(JobKind::EvaluateFollows { reason });
     }
-    if crate::guide_fix::ENABLED {
-        (ctx.submit)(JobKind::GuideCheck);
-    }
+    guide_check::request(ctx);
 }
 
 #[cfg(test)]

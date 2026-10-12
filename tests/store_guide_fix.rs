@@ -14,7 +14,7 @@ use tuner::sources::identity::{group_key, normalize_name};
 use tuner::store::epg::{self, ImportEpgChannel, ImportProgramme};
 use tuner::store::guide_fix::{self as gf, GuideOpts};
 use tuner::store::import::{self, ImportChannel, ImportGroup};
-use tuner::store::library::{self, Library};
+use tuner::store::library::{self, Library, Visibility};
 use tuner::store::{Store, sources, user};
 
 /// On the hour.
@@ -90,9 +90,10 @@ fn derive(s: &Store) -> gf::DeriveReport {
     w(s, |c| gf::derive_rule_rows(c, &opts()))
 }
 
+/// A channel; one named "XXX …" is flagged adult by the provider (explicit).
 fn chan(i: usize, key: &str, name: &str, tvg: Option<&str>, shift: i32) -> ImportChannel {
     ImportChannel {
-        adult: false,
+        adult: name.starts_with("XXX "),
         key: ItemKey(key.into()),
         provider_id: None,
         name: name.into(),
@@ -338,6 +339,26 @@ fn copies_share_a_guide_across_playlists() {
     assert_eq!(issue(&rep, &l, &vetoed).unwrap().kind, IssueKind::NoGuide);
 }
 
+/// While explicit content is hidden, explicit channels are absent from the issue list and the
+/// coverage; shown, they count like any other (DESIGN §31, parental).
+#[test]
+fn explicit_channels_count_only_while_shown() {
+    let s = store("tuner-gf-explicit");
+    playlist(&s, "P", &[("m3u:news", "News 24", Some("news24.uk"), 0), ("m3u:hot", "XXX Hot", Some("hot.uk"), 0), ("m3u:late", "XXX Late", None, 0)]);
+    let g = guide(&s, "G");
+    import_guide(&s, g, &[("news24.uk", "News 24"), ("hot.uk", "Hot")]);
+    let c = s.reader().unwrap();
+    let (hidden, shown) = (library::load_visible(&c, Visibility::NO_EXPLICIT).unwrap(), library::load_visible(&c, Visibility::ALL).unwrap());
+    let seen = |l: &Library| {
+        let rep = report(&s, l, true);
+        let rows: Vec<String> = rep.rows.iter().map(|r| l.live.get(r.channel).unwrap().name.to_string()).collect();
+        let cov = rep.coverage.iter().map(|c| (c.shown, c.with_guide, c.hidden_with_guide)).collect::<Vec<_>>();
+        (rows, cov)
+    };
+    assert_eq!(seen(&hidden), (vec![], vec![(1, 1, 0)]));
+    assert_eq!(seen(&shown), (vec!["XXX Late".to_owned()], vec![(3, 2, 0)]));
+}
+
 // ------------------------------------------------------------------ batches
 
 /// A batch writes manual rows (with the guide channel's name and the actor), overrides and its
@@ -417,6 +438,21 @@ fn batches_apply_log_and_undo() {
     assert!(apply(&s, FixActor::Claude, stale).unwrap_err().to_string().contains(gf::STALE));
     let big = Proposal { changes: vec![change(&bbc); gf::MAX_BATCH + 1], ..Default::default() };
     assert!(apply(&s, FixActor::Claude, big).is_err());
+
+    // Undo of Claude's remap gives your mapping back as yours
+    let map = |actor, id: &str, name: &str| {
+        let p = Proposal { changes: vec![FixChange { map: Some(Some(target(g, id, name))), ..change(&bbc) }], ..Default::default() };
+        apply(&s, actor, p).unwrap().log.unwrap()
+    };
+    map(FixActor::You, "bbc1.uk", "BBC One");
+    let claude = map(FixActor::Claude, "skymixhd.uk", "Sky Mix HD");
+    s.writer().blocking(move |c| gf::undo(c, claude, &opts(), NOW)).unwrap();
+    let row: (String, Option<String>) = conn
+        .query_row("SELECT xmltv_id, actor FROM channel_epg_map WHERE channel_key = 'm3u:bbc' AND method = 'manual'", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(row, ("bbc1.uk".to_owned(), Some("you".to_owned())));
 }
 
 /// A manual mapping, a time shift and a dismissal follow the channel through a refresh that
@@ -481,9 +517,9 @@ fn gone_from_guide_is_found_again() {
 // ------------------------------------------------------------------ the guide check job
 
 /// The guide check caches suggestions for unmapped shown channels (the issue list proposes
-/// the top one), waits while a picture is Loading or Zapping, scores only channels without
-/// cached rows on the next run and rebuilds when its stamp changes; cancelled, it leaves the
-/// cache as it was.
+/// the top one), waits while a picture is Loading or Zapping, scores each channel once per
+/// stamp (one without any candidate too) and rebuilds when its stamp changes; cancelled, it
+/// leaves the cache as it was.
 #[test]
 fn guide_check_caches_suggestions_and_waits_for_playback() {
     use std::sync::atomic::Ordering;
@@ -494,7 +530,7 @@ fn guide_check_caches_suggestions_and_waits_for_playback() {
     use tuner::jobs::{JobContext, Progress};
 
     let s = store("tuner-gf-check");
-    let p = playlist(&s, "P", &[("m3u:sky", "Sky Mix", None, 0), ("m3u:bbc", "BBC One", Some("bbc1.uk"), 0)]);
+    let p = playlist(&s, "P", &[("m3u:sky", "Sky Mix", None, 0), ("m3u:bbc", "BBC One", Some("bbc1.uk"), 0), ("m3u:none", "Qzx Vw Telly", None, 0)]);
     let g = guide(&s, "G");
     import_guide(&s, g, &[("skymixhd.uk", "Sky Mix HD"), ("bbc1.uk", "BBC One")]);
     let dir = tempfile::tempdir().unwrap();
@@ -518,7 +554,7 @@ fn guide_check_caches_suggestions_and_waits_for_playback() {
     assert_eq!(rows(&s), 0);
     ctx.player_busy.store(false, Ordering::Relaxed);
     let first = rt.block_on(task).unwrap().unwrap();
-    assert_eq!((first.rebuilt, first.scored), (true, 1), "only the unmapped channel");
+    assert_eq!((first.rebuilt, first.scored), (true, 2), "only the unmapped channels");
     let l = lib(&s);
     let rep = report(&s, &l, false);
     let row = issue(&rep, &l, &r(p, "m3u:sky")).unwrap();
@@ -526,19 +562,21 @@ fn guide_check_caches_suggestions_and_waits_for_playback() {
     assert_eq!(row.proposal.as_ref().unwrap().map.clone().unwrap().unwrap().xmltv_id, "skymixhd.uk");
 
     let again = run(&ctx, CancellationToken::new()).unwrap();
-    assert_eq!((again.rebuilt, again.scored), (false, 0), "cached");
+    assert_eq!((again.rebuilt, again.scored), (false, 0), "cached, the channel without a candidate too");
+    let none = issue(&report(&s, &l, false), &l, &r(p, "m3u:none")).unwrap().kind;
+    assert_eq!(none, IssueKind::NoGuide);
 
     // a new threshold is a new stamp: rebuilt
     let mut cfg = tuner::config::Config::default();
     cfg.epg.fuzzy_threshold = 0.9;
     *config.write().unwrap() = Arc::new(cfg);
     let rebuilt = run(&ctx, CancellationToken::new()).unwrap();
-    assert_eq!((rebuilt.rebuilt, rebuilt.scored), (true, 1));
+    assert_eq!((rebuilt.rebuilt, rebuilt.scored), (true, 2));
 
     // cancelled while waiting for playback: nothing half-written
     ctx.player_busy.store(true, Ordering::Relaxed);
     let cancel = CancellationToken::new();
     cancel.cancel();
     assert!(matches!(run(&ctx, cancel), Err(tuner::error::Error::Cancelled)));
-    assert_eq!(rows(&s), 1);
+    assert_eq!(rows(&s), 2, "a suggestion and the no-candidate marker");
 }

@@ -74,6 +74,9 @@ pub struct ClassifyOpts {
 
 /// The phrase for a guide that has nothing now or later and no other guide lists the channel.
 pub const WHY_ENDED: &str = "the guide has nothing now or later · refresh the guide";
+/// "Guide ended" rows that look for another guide per classification (a whole guide that
+/// expired makes thousands; refreshing it is the fix, so the rest carry [`WHY_ENDED`]).
+pub const ENDED_LOOKUPS: usize = 500;
 
 /// Classify every shown channel of `lib` (see the module table). `catalog` finds proposals for
 /// "Gone from guide" and "Guide ended"; without it those rows carry none.
@@ -102,6 +105,7 @@ pub fn classify(lib: &Library, facts: &GuideFacts, catalog: Option<&Catalog>, op
     };
 
     let mut rows = Vec::new();
+    let mut ended_lookups = 0usize;
     for c in lib.live.channels.iter() {
         if c.unsupported || (!opts.include_hidden && lib.live.hidden.contains(&c.id)) {
             continue;
@@ -179,7 +183,8 @@ pub fn classify(lib: &Library, facts: &GuideFacts, catalog: Option<&Catalog>, op
             // Guide ended
             if found.is_none() && !facts.airing.contains(&epg) && !dismissed(IssueKind::GuideEnded) {
                 let own = fc.resolved.as_ref().map(|r| r.epg_source);
-                let other = catalog.and_then(|cat| {
+                ended_lookups += 1;
+                let other = catalog.filter(|_| ended_lookups <= ENDED_LOOKUPS).and_then(|cat| {
                     let s = cat.suggest(&c.name, 1, threshold, own).into_iter().next()?;
                     Some((cat.target(s.epg_channel_id)?, s.score, cat.guide_name(s.epg_source_id).unwrap_or("another guide").to_owned()))
                 });

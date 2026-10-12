@@ -78,6 +78,8 @@ pub struct ApplyReport {
     pub reminders_moved: usize,
     /// A mapping changed: the caller submits `EvaluateFollows { reason: Mapping }` (B7).
     pub mappings_changed: bool,
+    /// A playlist's rules changed (a new stamp): the caller requests a guide check.
+    pub rules_changed: bool,
 }
 
 /// What [`undo`] did: changes made since are skipped and named.
@@ -86,6 +88,8 @@ pub struct UndoReport {
     pub reverted: usize,
     pub skipped: Vec<(String, String)>,
     pub reminders_moved: usize,
+    /// A playlist's rules went back (a new stamp): the caller requests a guide check.
+    pub rules_changed: bool,
 }
 
 /// What [`derive_rule_rows`] did.
@@ -417,22 +421,32 @@ pub fn clear_suggestions(conn: &Connection) -> Result<usize> {
     Ok(conn.execute("DELETE FROM epg_suggestion", [])?)
 }
 
-/// The channels with cached suggestions: `(source, channel key)`.
+/// The channels the cache has looked at (with suggestions or without): `(source, channel key)`.
 pub fn suggested_keys(conn: &Connection) -> Result<HashSet<(SourceId, String)>> {
     let mut stmt = conn.prepare_cached("SELECT DISTINCT source_id, channel_key FROM epg_suggestion")?;
     let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// Replace the cached suggestions of these channels (≤ [`SUGGESTIONS`] each, best first).
+/// Replace the cached suggestions of these channels (≤ [`SUGGESTIONS`] each, best first). A
+/// channel with none gets a marker row (`rank = -1`, no guide channel) so the next check skips
+/// it until the stamp changes.
 pub fn write_suggestions(conn: &Connection, rows: &[(ItemRef, Vec<EpgSuggestion>)]) -> Result<()> {
     atomic(conn, |c| {
         let mut del = c.prepare_cached("DELETE FROM epg_suggestion WHERE source_id = ?1 AND channel_key = ?2")?;
         let mut ins = c.prepare_cached(
             "INSERT INTO epg_suggestion(source_id, channel_key, rank, epg_source_id, xmltv_id, display_name, score) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
+        // the marker needs a guide for its foreign key (none: nothing to suggest from anyway)
+        let mut none = c.prepare_cached(
+            "INSERT INTO epg_suggestion(source_id, channel_key, rank, epg_source_id, xmltv_id, display_name, score)
+             SELECT ?1, ?2, -1, id, '', '', 0 FROM epg_source ORDER BY id LIMIT 1",
+        )?;
         for (ch, sugg) in rows {
             del.execute(params![ch.source, ch.key.as_str()])?;
+            if sugg.is_empty() {
+                none.execute(params![ch.source, ch.key.as_str()])?;
+            }
             for (rank, s) in sugg.iter().take(SUGGESTIONS).enumerate() {
                 ins.execute(params![ch.source, ch.key.as_str(), rank as i64, s.epg_source_id, s.xmltv_id, s.display_name, f64::from(s.score)])?;
             }
@@ -449,6 +463,7 @@ pub fn suggestions(conn: &Connection) -> Result<HashMap<(SourceId, String), Vec<
          FROM epg_suggestion s
          JOIN epg_source es ON es.id = s.epg_source_id AND es.enabled = 1
          JOIN epg_channel ec ON ec.epg_source_id = s.epg_source_id AND ec.xmltv_id = s.xmltv_id AND ec.seen_gen >= es.active_gen
+         WHERE s.rank >= 0
          ORDER BY s.source_id, s.channel_key, s.rank",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -749,6 +764,26 @@ fn set_map(conn: &Connection, ch: &ItemRef, to: Option<&GuideTarget>, actor: Fix
     }
 }
 
+/// A manual mapping as a batch logs it before changing it: the target and who had chosen it
+/// (undo restores both; logs from before the actor was kept restore it as "you").
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct LoggedTarget {
+    #[serde(flatten)]
+    target: GuideTarget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    actor: Option<FixActor>,
+}
+
+/// The channel's manual mapping with who chose it.
+fn logged_target(conn: &Connection, ch: &ItemRef) -> Result<Option<LoggedTarget>> {
+    let actor: Option<Option<String>> = conn
+        .prepare_cached("SELECT actor FROM channel_epg_map WHERE source_id = ?1 AND channel_key = ?2 AND method = 'manual'")?
+        .query_row(params![ch.source, ch.key.as_str()], |r| r.get(0))
+        .optional()?;
+    let actor = actor.flatten().and_then(|a| enum_parse(&a));
+    Ok(manual_target(conn, ch)?.map(|target| LoggedTarget { target, actor }))
+}
+
 fn same_target(a: &Option<GuideTarget>, b: &Option<GuideTarget>) -> bool {
     match (a, b) {
         (Some(a), Some(b)) => a.epg_source == b.epg_source && a.xmltv_id == b.xmltv_id,
@@ -801,8 +836,8 @@ pub fn apply(conn: &Connection, actor: FixActor, label: &str, p: &Proposal, opts
             let shift0 = effective_shift(c, r)?;
             let mut changed = false;
             if let Some(to) = &ch.map {
-                let before = manual_target(c, r)?;
-                if !same_target(&before, to) {
+                let before = logged_target(c, r)?;
+                if !same_target(&before.as_ref().map(|b| b.target.clone()), to) {
                     set_map(c, r, to.as_ref(), actor)?;
                     log_change(c, log, r.source, key, F_MAP, json(&before)?, json(to)?)?;
                     changed = true;
@@ -857,6 +892,7 @@ pub fn apply(conn: &Connection, actor: FixActor, label: &str, p: &Proposal, opts
         if rules_changed {
             report.reminders_moved += derive_rule_rows(c, opts)?.reminders_moved;
             report.mappings_changed = true;
+            report.rules_changed = true;
         }
         if report.applied == 0 {
             c.execute("DELETE FROM guide_fix_log WHERE id = ?1", [log])?;
@@ -880,8 +916,6 @@ pub fn undo(conn: &Connection, log: GuideFixLogId, opts: &GuideOpts, now: Timest
             Some(Some(_)) => return Err(Error::Other("that guide fix was already undone".into())),
             Some(None) => {}
         }
-        let actor: FixActor =
-            enum_parse(&c.query_row("SELECT actor FROM guide_fix_log WHERE id = ?1", [log], |r| r.get::<_, String>(0))?).unwrap_or_default();
         let changes = changes_of(c, log)?;
         let mut report = UndoReport::default();
         let mut by_channel: Vec<(SourceId, String, Vec<&LoggedChange>)> = Vec::new();
@@ -918,9 +952,11 @@ pub fn undo(conn: &Connection, log: GuideFixLogId, opts: &GuideOpts, now: Timest
                 let ok = match f.field.as_str() {
                     F_MAP => {
                         let cur = manual_target(c, &r)?;
-                        let (before, after): (Option<GuideTarget>, Option<GuideTarget>) = (unjson(&f.before), unjson(&f.after));
+                        let (before, after): (Option<LoggedTarget>, Option<GuideTarget>) = (unjson(&f.before), unjson(&f.after));
                         same_target(&cur, &after) && {
-                            set_map(c, &r, before.as_ref(), actor)?;
+                            // the mapping comes back as whoever had chosen it, not the batch's actor
+                            let by = before.as_ref().and_then(|b| b.actor).unwrap_or(FixActor::You);
+                            set_map(c, &r, before.as_ref().map(|b| &b.target), by)?;
                             true
                         }
                     }
@@ -963,11 +999,67 @@ pub fn undo(conn: &Connection, log: GuideFixLogId, opts: &GuideOpts, now: Timest
         }
         if rules_changed {
             report.reminders_moved += derive_rule_rows(c, opts)?.reminders_moved;
+            report.rules_changed = true;
         }
         c.execute("UPDATE guide_fix_log SET undone_at = ?2 WHERE id = ?1", params![log, now])?;
         tracing::info!(target: "tuner::guide", "guide fix #{} undone: {} reverted, {} skipped", log.0, report.reverted, report.skipped.len());
         Ok(report)
     })
+}
+
+// ------------------------------------------------------------------ backup
+
+/// A channel's own Guide fixes data in a backup (`Backup::features.guide_fix`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct BackupChannel {
+    item: ItemRef,
+    #[serde(default)]
+    shift_min: Option<i32>,
+    #[serde(default)]
+    guide_ok: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct BackupData {
+    channels: Vec<BackupChannel>,
+}
+
+/// The user's time shifts and "It's right" dismissals (the playlists' rules travel in
+/// `SourceSettings`, manual mappings with the backup's own rows). `None`: nothing to keep.
+pub fn export(conn: &Connection) -> Result<Option<serde_json::Value>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT source_id, item_key, shift_min, guide_ok FROM item_override
+         WHERE kind = 'channel' AND (shift_min IS NOT NULL OR guide_ok != 0) ORDER BY source_id, item_key",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(BackupChannel {
+            item: ItemRef { source: r.get(0)?, kind: ItemKind::Channel, key: ItemKey(r.get(1)?) },
+            shift_min: r.get(2)?,
+            guide_ok: r.get(3)?,
+        })
+    })?;
+    let channels: Vec<BackupChannel> = rows.collect::<rusqlite::Result<_>>()?;
+    if channels.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::to_value(BackupData { channels }).map_err(Error::other)?))
+}
+
+/// Restore them onto the override rows the backup's `item_overrides` restored (run after
+/// them): a shift set here is kept, dismissals add up. Returns the rows changed.
+pub fn import(conn: &Connection, v: &serde_json::Value, remap: &dyn Fn(&ItemRef) -> Option<ItemRef>) -> Result<usize> {
+    let b: BackupData = serde_json::from_value(v.clone()).map_err(|e| Error::BadPayload(format!("guide fixes backup: {e}")))?;
+    let mut upd = conn.prepare_cached(
+        "UPDATE item_override SET shift_min = COALESCE(shift_min, ?3), guide_ok = guide_ok | ?4
+         WHERE source_id = ?1 AND kind = 'channel' AND item_key = ?2",
+    )?;
+    let mut n = 0;
+    for ch in &b.channels {
+        let Some(item) = remap(&ch.item) else { continue };
+        n += upd.execute(params![item.source, item.key.as_str(), ch.shift_min, ch.guide_ok])?;
+    }
+    Ok(n)
 }
 
 /// Prune logs older than [`LOG_KEEP_S`] or beyond the newest [`LOG_KEEP_N`], and suggestions

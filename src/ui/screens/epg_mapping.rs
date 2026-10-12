@@ -207,6 +207,9 @@ pub struct EpgMappingScreen {
     preview: Option<(PreviewKey, PreviewRow)>,
     preview_loader: Option<(PreviewKey, Loader<Vec<PreviewRow>>)>,
     adjust: Option<PendingAdjust>,
+    /// Shifts written by the last flush, for the library build they were written on (the next
+    /// presses start from them until the rebuild shows them).
+    written: (u64, HashMap<ChannelId, i32>),
     /// The last write; Check ▶ waits for it (the archive must use the offset just set).
     writing: Option<Ticket<ApplyReport>>,
     check_after: Option<ChannelId>,
@@ -363,6 +366,10 @@ impl EpgMappingScreen {
                     if !r.include_hidden {
                         gf::note_to_fix(r.generation, r.to_fix());
                     }
+                    // the cache is behind (a playlist refresh, a new threshold…): check now
+                    if !r.fresh && crate::guide_fix::ENABLED && !Self::checking(ctx) {
+                        ctx.services.jobs.submit(crate::jobs::JobKind::GuideCheck);
+                    }
                     self.report = Some(Arc::new(r));
                     self.report_key = Some(key);
                     self.rows_dirty = true;
@@ -383,8 +390,14 @@ impl EpgMappingScreen {
         if self.report_key != Some(want) && !loading && ctx.lib.built_at != 0 {
             let lib = Arc::clone(ctx.lib);
             let (opts, hidden, now) = (Self::opts(ctx), self.include_hidden, ctx.now);
-            self.report_loader = Some((want, Loader::start(ctx, move |c| gf::load_report(c, &lib, opts, hidden, now))));
+            self.report_loader = Some((want, Loader::start(ctx, move |c| gf::load_report(c, &lib, opts, hidden, true, now))));
         }
+    }
+
+    /// A guide check is running, queued or waiting out its debounce.
+    fn checking(ctx: &UiCtx<'_>) -> bool {
+        let jobs = &ctx.services.jobs;
+        crate::jobs::guide_check::pending(jobs.context()) || jobs.active().iter().any(|j| matches!(j.kind, crate::jobs::JobKind::GuideCheck))
     }
 
     fn reload_catalog(&mut self, ctx: &UiCtx<'_>) {
@@ -652,6 +665,8 @@ impl EpgMappingScreen {
 
     fn apply(&mut self, ctx: &mut UiCtx<'_>, proposal: Proposal, label: String, toast: String) {
         self.flush_adjust(ctx);
+        // this write may change the shifts the last flush wrote
+        self.written.1.clear();
         self.writing = Some(gf::submit_apply(ctx.services, label, toast, proposal, Self::opts(ctx), ctx.now));
     }
 
@@ -769,9 +784,18 @@ impl EpgMappingScreen {
 
     // ------------------------------------------------------------------ adjust
 
+    /// A channel's effective shift: what the last flush wrote while the library doesn't show it
+    /// yet, else the snapshot's.
+    fn shift_base(&self, ctx: &UiCtx<'_>, ch: ChannelId) -> i32 {
+        match self.written.1.get(&ch) {
+            Some(v) if self.written.0 == ctx.lib.generation => *v,
+            _ => ctx.lib.live.get(ch).map_or(0, |c| c.tvg_shift_min),
+        }
+    }
+
     /// The highlighted channel's shift / offset as shown (pending presses included).
     fn shift_shown(&self, ctx: &UiCtx<'_>, ch: ChannelId) -> i32 {
-        let base = ctx.lib.live.get(ch).map_or(0, |c| c.tvg_shift_min);
+        let base = self.shift_base(ctx, ch);
         match &self.adjust {
             Some(a) => a.targets.iter().find(|(c, _)| *c == ch).map_or(base, |(_, b)| b + a.delta),
             None => base,
@@ -820,12 +844,8 @@ impl EpgMappingScreen {
         if self.adjust.as_ref().is_some_and(|a| a.targets.iter().map(|(c, _)| *c).ne(targets.iter().copied())) {
             self.flush_adjust(ctx);
         }
-        let a = self.adjust.get_or_insert_with(|| PendingAdjust {
-            targets: targets.iter().map(|c| (*c, ctx.lib.live.get(*c).map_or(0, |x| x.tvg_shift_min))).collect(),
-            delta: 0,
-            catchup: None,
-            due: Instant::now(),
-        });
+        let bases: Vec<(ChannelId, i32)> = targets.iter().map(|c| (*c, self.shift_base(ctx, *c))).collect();
+        let a = self.adjust.get_or_insert_with(|| PendingAdjust { targets: bases, delta: 0, catchup: None, due: Instant::now() });
         let lo = a.targets.iter().map(|(_, b)| -SHIFT_LIMIT - b).max().unwrap_or(-SHIFT_LIMIT);
         let hi = a.targets.iter().map(|(_, b)| SHIFT_LIMIT - b).min().unwrap_or(SHIFT_LIMIT);
         a.delta = (a.delta + delta).clamp(lo, hi);
@@ -839,7 +859,7 @@ impl EpgMappingScreen {
             self.flush_adjust(ctx);
         }
         let now_off = self.offset_now(ctx, ch);
-        let base = ctx.lib.live.get(ch).map_or(0, |x| x.tvg_shift_min);
+        let base = self.shift_base(ctx, ch);
         let a = self.adjust.get_or_insert_with(|| PendingAdjust { targets: vec![(ch, base)], delta: 0, catchup: None, due: Instant::now() });
         a.catchup = Some((a.catchup.unwrap_or(now_off) + delta).clamp(-OFFSET_LIMIT, OFFSET_LIMIT));
         a.due = Instant::now() + DEBOUNCE;
@@ -879,6 +899,9 @@ impl EpgMappingScreen {
                 (format!("Time shift {} ({n} channels)", shift_text(d)), format!("Time shift {} for {} channels", shift_text(d), rows::grouped(n)))
             }
         };
+        if a.delta != 0 {
+            self.written = (ctx.lib.generation, a.targets.iter().map(|(c, b)| (*c, b + a.delta)).collect());
+        }
         self.writing = Some(gf::submit_apply(ctx.services, label, toast, Proposal { changes, ..Default::default() }, Self::opts(ctx), ctx.now));
     }
 
@@ -1194,6 +1217,7 @@ impl EpgMappingScreen {
             }
             Action::UndoGuideFix(log) => {
                 self.flush_adjust(ctx);
+                self.written.1.clear();
                 let _ = gf::submit_undo(ctx.services, log, Self::opts(ctx), ctx.now);
                 self.preview = None;
                 return true;
@@ -1204,6 +1228,7 @@ impl EpgMappingScreen {
             return match self.list.handle(action) {
                 ListOutcome::Activated(i) | ListOutcome::ActivatedAlt(i) => {
                     if let Some(e) = self.recent.get(i).filter(|e| e.undone_at.is_none()) {
+                        self.written.1.clear();
                         let _ = gf::submit_undo(ctx.services, Some(e.id), Self::opts(ctx), ctx.now);
                     }
                     true
@@ -1423,6 +1448,11 @@ impl Screen for EpgMappingScreen {
     }
 
     fn on_event(&mut self, ctx: &mut UiCtx<'_>, ev: &AppEvent) {
+        // presses whose debounce passed are written even when the screen isn't drawn (left by
+        // a click elsewhere)
+        if self.adjust.as_ref().is_some_and(|a| Instant::now() >= a.due) {
+            self.flush_adjust(ctx);
+        }
         // the screen isn't shown: let go of the big things (they're rebuilt on the way back)
         if self.last_frame.is_some_and(|t| t.elapsed() > IDLE_RELEASE) {
             self.flush_adjust(ctx);
@@ -1665,7 +1695,7 @@ impl EpgMappingScreen {
         {
             crate::ui::scope::choose(ctx, ScopeKind::Live, choice, false);
         }
-        if !rep.fresh || ctx.services.jobs.active().iter().any(|j| matches!(j.kind, crate::jobs::JobKind::GuideCheck)) {
+        if !rep.fresh || Self::checking(ctx) {
             ui.label(small("Checking the guide data for new suggestions…".into()));
         }
         if ctx.layout != LayoutClass::Compact {
@@ -2284,6 +2314,7 @@ impl EpgMappingScreen {
             });
         }
         if undo {
+            self.written.1.clear();
             let _ = gf::submit_undo(ctx.services, Some(e.id), Self::opts(ctx), ctx.now);
         }
     }
@@ -2413,16 +2444,18 @@ mod tests {
         settle(&mut h);
         assert_eq!(manual(&h, 5).len(), 1);
         assert!(h.state().s.confirm.is_none() && h.state().s.confirm_loader.is_none());
-        // the new library: that guide channel lists nothing now or later (its own issue)
+        // the new library: that guide channel lists nothing now or later (its own issue); the
+        // suggestion cache was behind, so the screen checked the guide data and the channels
+        // without a guide are suggestions now
         testkit::reload_library(&mut h.state_mut().t);
-        until(&mut h, "the report after the fix", |h| {
-            h.state().s.report.as_ref().and_then(|r| r.row(chans[5])).is_some_and(|r| r.kind == IssueKind::GuideEnded)
+        until(&mut h, "the checked report after the fix", |h| {
+            h.state().s.report.as_ref().is_some_and(|r| r.fresh && r.row(chans[5]).is_some_and(|r| r.kind == IssueKind::GuideEnded))
         });
         // a chip click filters by its kind; clicking the lit chip shows every issue again
-        h.get_by_label("No guide 2").click();
+        h.get_by_label("Suggested 2").click();
         h.run_steps(2);
-        assert_eq!((h.state().s.view, h.state().s.rows.clone()), (View::Issues(Some(IssueKind::NoGuide)), chans[3..5].to_vec()));
-        h.get_by_label("No guide 2").click();
+        assert_eq!((h.state().s.view, h.state().s.rows.clone()), (View::Issues(Some(IssueKind::Suggested)), chans[3..5].to_vec()));
+        h.get_by_label("Suggested 2").click();
         h.run_steps(2);
         assert_eq!((h.state().s.view, h.state().s.rows.len()), (View::Issues(None), 3));
         // Esc: the filter, then the guide channels pane, then the marks, then the screen
