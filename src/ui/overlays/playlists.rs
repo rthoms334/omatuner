@@ -138,7 +138,7 @@ impl Overlay for PlaylistPickerOverlay {
                 if pointer_moved && resp.hovered() && !cursor {
                     self.list.select(row);
                 }
-                if resp.clicked() {
+                if crate::ui::widgets::fresh_click(&resp) {
                     chosen = Some(i);
                 }
                 let p = ui.painter();

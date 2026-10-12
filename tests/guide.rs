@@ -460,8 +460,10 @@ fn grid_defers_loads_over_the_budget_and_fills_in_later() {
     assert!(texts(&shapes(&h)).iter().any(|(x, _, _)| x == "Show 0"));
 }
 
+/// A click on a programme does what Enter does there (focus it and open its popover); a click
+/// on the channel column watches.
 #[test]
-fn grid_mouse_click_focuses_and_header_click_watches() {
+fn grid_mouse_click_opens_and_header_click_watches() {
     let now = T0 + 900;
     let mut h = grid_harness(10, now, Duration::from_secs(10));
     h.step();
@@ -490,7 +492,9 @@ fn grid_mouse_click_focuses_and_header_click_watches() {
     h.step();
     let (ch, p) = h.state().state.focused().map(|(c, p)| (c, p.cloned())).unwrap();
     assert_eq!(ch, ChannelId(3));
-    assert_eq!(p.unwrap().start, T0 + 3600);
+    let p = p.unwrap();
+    assert_eq!(p.start, T0 + 3600);
+    assert_eq!(h.state().outcomes, [GridOutcome::Open { programme: p.id, channel: ch }], "one click: Enter");
     // click on the channel column = watch
     let hy = m.ruler_height + 1.5 * m.row_height;
     h.input_mut().events.push(egui::Event::PointerMoved(egui::pos2(20.0, hy)));

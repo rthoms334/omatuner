@@ -813,9 +813,6 @@ pub struct SettingsScreen {
     agents: agents::State,
     page: SettingsPage,
     pane: Pane,
-    /// When a click on the page list last opened a page (egui time): at Compact the page
-    /// replaces the list, and the second click of a double-click mustn't act on its rows.
-    page_clicked_at: Option<f64>,
     /// Focused row (index into the page's rows; only focusable rows are chosen).
     row: usize,
     editing: bool,
@@ -3097,7 +3094,7 @@ impl SettingsScreen {
                 // cursor at a time; moving it here would switch the page under the pointer)
                 let state = RowState::from_flags(selected && self.pane == Pane::Pages, selected);
                 let state = if self.pane == Pane::Pages { state } else { rows::with_hover(ui, theme, false, state) };
-                if rows::menu_row(ui, theme, Some(icon), label, None, false, state).clicked() {
+                if crate::ui::widgets::fresh_click(&rows::menu_row(ui, theme, Some(icon), label, None, false, state)) {
                     clicked = Some(page);
                 }
             }
@@ -3109,7 +3106,9 @@ impl SettingsScreen {
             }
             self.set_page(ctx, p);
             self.pane = Pane::Content;
-            self.page_clicked_at = Some(ui.input(|i| i.time));
+            // at Compact the page replaces the list: a double-click's second click mustn't act
+            // on its rows
+            crate::ui::widgets::swapped_under_pointer(ui.ctx());
         }
     }
 
@@ -3195,7 +3194,8 @@ impl SettingsScreen {
                 if focused {
                     ui.painter().rect_stroke(rect, t.rounding, egui::Stroke::new(1.0, t.border_hover), egui::StrokeKind::Inside);
                 }
-                if resp.clicked() {
+                // a click does what Enter does (once on a double-click: a toggle stays flipped)
+                if crate::ui::widgets::fresh_click(&resp) {
                     clicked = Some((i, 0));
                 } else if resp.secondary_clicked() {
                     clicked = Some((i, 2));
@@ -3384,10 +3384,6 @@ impl SettingsScreen {
         }
         if let Some(i) = hovered.filter(|_| !self.editing) {
             self.row = i;
-        }
-        if crate::ui::widgets::second_click_after(ui, self.page_clicked_at) {
-            text_clicked = None;
-            clicked = None;
         }
         if let Some(i) = text_clicked {
             self.pane = Pane::Content;
@@ -3742,6 +3738,7 @@ mod tests {
         };
         let from = grip(&h, "Second guide").center();
         let to = h.query_all_by_label("Seed EPG").next().expect("first guide").rect().center();
+        h.state_mut().nav();
         h.drag_at(from);
         h.run_steps(1);
         h.hover_at(egui::pos2(from.x, (from.y + to.y) / 2.0));
@@ -3751,6 +3748,7 @@ mod tests {
         h.drop_at(egui::pos2(from.x, to.y));
         h.run_steps(2);
         until(&mut h, "drag reorder", |h| names(h).first().map(String::as_str) == Some("Second guide"));
+        assert!(h.state_mut().nav().is_empty(), "a drag ends without a click: the row opens nothing");
     }
 
     #[test]

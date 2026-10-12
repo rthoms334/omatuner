@@ -351,7 +351,7 @@ impl Overlay for ContextMenuOverlay {
                     if pointer_moved && resp.hovered() && !cursor {
                         self.list.select(row);
                     }
-                    if resp.clicked() {
+                    if crate::ui::widgets::fresh_click(&resp) {
                         self.list.select(row);
                         chosen = Some(row);
                     }
@@ -953,7 +953,8 @@ impl Overlay for ListPickerOverlay {
                 if pointer_moved && resp.hovered() {
                     self.cursor = row;
                 }
-                if resp.clicked() {
+                // a tick: a double-click doesn't untick it
+                if crate::ui::widgets::fresh_click(&resp) {
                     self.cursor = row;
                     clicked = Some(*id);
                 }
@@ -979,7 +980,7 @@ impl Overlay for ListPickerOverlay {
                     if pointer_moved && resp.hovered() {
                         self.cursor = new_row;
                     }
-                    if resp.clicked() {
+                    if crate::ui::widgets::fresh_click(&resp) {
                         self.cursor = new_row;
                         self.naming = Some(String::new());
                     }

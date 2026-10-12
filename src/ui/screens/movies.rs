@@ -270,9 +270,6 @@ pub(super) struct VodBrowser {
     /// The categories the filter shows whose names have the words typed: what "Hide these N
     /// categories" hides.
     matching: Vec<GroupId>,
-    /// When a click on a category last opened it below Wide (egui time): the grid then takes
-    /// its place under the pointer.
-    cat_clicked_at: Option<f64>,
 }
 
 /// One playlist's titles in the custom order the user arranged with Alt+↑/↓ (the whole
@@ -1471,17 +1468,15 @@ impl VodBrowser {
         let footer = self.marks.footer(self.cats.filter.query(), self.matching.len());
         let hide_n = self.marks.hide_count(self.matching.len());
         let (marks, tags, movies, cats) = (&self.marks, &self.tags.1, self.movies, &mut self.cats);
-        let mut clicked = None;
         let (outcome, footer_click) = group_marks::with_footer(ui, theme, footer.as_deref(), Some(hide_n), |ui| {
             virtual_list(ui, theme, ("vod-cats", movies), cats, row_h, |ui, rc| {
-                let index = rc.index;
                 let cat = rows_snapshot[rc.index];
                 let state = RowState::from_flags(focused && rc.state.is_cursor(), cat == open);
                 let group = match cat {
                     Cat::Group(g) => groups.get(&g).copied(),
                     _ => None,
                 };
-                let r = match group {
+                match group {
                     Some(g) => rows::group_row_decor(
                         ui,
                         theme,
@@ -1521,11 +1516,7 @@ impl VodBrowser {
                         }
                         r
                     }
-                };
-                if r.clicked() {
-                    clicked = Some(index);
                 }
-                r
             })
         });
         // the footer's Hide N / Clear: its keys, on this pane
@@ -1533,15 +1524,6 @@ impl VodBrowser {
             self.pane = Pane::Categories;
             let a = self.marks.footer_action(hide);
             self.action(ctx, a);
-            return;
-        }
-        // a tiled half or narrower: a click on a category opens it and shows its titles (the
-        // drawer closes, Compact turns to the grid); in Wide both panes show anyway
-        if ctx.layout != LayoutClass::Wide
-            && let Some(c) = clicked.and_then(|i| self.cat_rows.get(i).copied())
-        {
-            self.cat_clicked_at = Some(ui.input(|i| i.time));
-            self.open_cat(ctx, c, true);
             return;
         }
         match outcome {
@@ -1554,8 +1536,14 @@ impl VodBrowser {
                 }
             }
             ListOutcome::Activated(i) => {
+                // Enter or a click: open it and focus its titles. A tiled half or narrower shows
+                // them where the categories were (the drawer closes, Compact turns to the grid):
+                // a double-click's second click must not open the poster that appears there
                 if let Some(c) = self.cat_rows.get(i).copied() {
                     self.open_cat(ctx, c, true);
+                    if ctx.layout != LayoutClass::Wide {
+                        crate::ui::widgets::swapped_under_pointer(ui.ctx());
+                    }
                 }
             }
             ListOutcome::ContextMenu(_) => {
@@ -1730,15 +1718,10 @@ impl VodBrowser {
             self.toggle_fan(ctx, at);
             return;
         }
-        // the second click of the double-click that opened the category lands on a poster
-        // that just appeared under the pointer: it doesn't open that title
-        let outcome = match outcome {
-            ListOutcome::Moved | ListOutcome::Activated(_) if crate::ui::widgets::second_click_after(ui, self.cat_clicked_at) => ListOutcome::None,
-            o => o,
-        };
         match outcome {
             ListOutcome::Moved => self.pane = Pane::Grid,
             ListOutcome::Activated(_) => {
+                // Enter or a click: the title's page (a stack: its copies / PIN)
                 self.pane = Pane::Grid;
                 if let Some(v) = self.current(ctx) {
                     self.open_item(ctx, &v, false);
@@ -1927,6 +1910,8 @@ mod tests {
         h.get_by_label("3 copies — show each").click();
         h.run_steps(2);
         assert_eq!(shown_names(&h).len(), 5);
+        // a later click folds (a double-click on the badge is one click)
+        h.run_steps(40);
         h.get_by_label("3 copies — fold them").click();
         h.run_steps(2);
         assert_eq!(shown_names(&h).len(), 3);
@@ -2727,8 +2712,9 @@ mod tests {
         h.run_steps(2);
         assert_eq!(h.state().s.key_contexts(), vec![KeyContext::PosterGrid], "one click: the grid");
         assert!(has_label(&h, "Movie 1") && !has_label(&h, "Movie 4"), "of Drama");
-        // a double-click (the old way to open one): its second click lands on a poster that
-        // just appeared under the pointer, and opens nothing
+        // a double-click opens it once: its second click lands on a poster that just appeared
+        // under the pointer, and opens nothing (the grid ignores a multi-click's later clicks;
+        // the app also drops that press, `click_guard`)
         h.get_by_label("Drama ▾").click();
         // (long enough for that click not to make the next two a triple-click)
         h.run_steps(40);
@@ -2746,6 +2732,11 @@ mod tests {
         }
         assert_eq!(h.state().s.key_contexts(), vec![KeyContext::PosterGrid], "the grid");
         assert!(h.state_mut().nav().is_empty(), "no title opened");
+        // one click on a poster does what Enter does: its page
+        h.run_steps(40);
+        h.get_by_label("Movie 1").click();
+        h.run_steps(2);
+        assert!(matches!(h.state_mut().nav().as_slice(), [NavRequest::Push(Route::MovieDetail(_))]), "a click opens the title");
         h.state_mut().t.layout = LayoutClass::Medium;
         h.run_steps(2);
         h.get_by_label("Drama ▾").click();

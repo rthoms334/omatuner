@@ -1834,8 +1834,9 @@ Medium: rails narrower, same structure.
   Shift+←/→ ± 3 h; `n`/Home = now; `g`/`G` first/last channel; **digits** open numeric entry
   (`[NumericEntry, Guide]`) and jump to that channel number. Focus/scroll targets keep clear of
   the mini-player rect.
-* **Mouse**: wheel = rows, Shift+wheel / horizontal trackpad = time, click = focus,
-  double-click = details, click on the channel column = watch, right-click on a cell or a
+* **Mouse**: wheel = rows, Shift+wheel / horizontal trackpad = time, a click on a cell =
+  Enter there (focus it and open the programme popover; a gap watches), a click on the
+  channel column = watch, right-click on a cell or a
   channel = focus it and open the channel menu (the menu key), hover tooltip (title, time,
   description excerpt).
 * **Actions**: Enter → programme popover (Watch if airing · Catch up if past & archive ·
@@ -2257,9 +2258,17 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 * *Decided in phase 3:* Ctrl+P (open the player) acts only while something is playing (any
   non-Idle player state); with nothing playing it does nothing rather than open an empty player.
 * **Mouse parity**: everything is clickable; hover moves list cursors only after real pointer
-  motion (Omarchy `pointerGate`); right-click = context menu; wheel = volume only in the
-  fullscreen player; double-click on video = window fullscreen (in the video-only player: pop
-  back in). *Decided in the mouse pass:*
+  motion (Omarchy `pointerGate`) and never acts; **one click = exactly what Enter does in that
+  context** on every selectable item (list rows of every kind, poster cards, Home tiles,
+  episode rows, copies, guide cells, Up next rows, Logs lines, EPG mapping rows); right-click =
+  context menu; wheel = volume only in the fullscreen player; double-click has a meaning of
+  its own only on video: window fullscreen (in the video-only player: pop back in). Widgets with
+  their own single click keep it (buttons, scope tabs, the "{category} ▾" button, a stack's
+  copy-count badge). *Decided in the single-click pass:* a click on an EPG mapping channel
+  moves on to its guide channels as Enter does (accepting the proposal is Shift+Enter or the
+  Accept button, no longer a double-click); a click on a Recent changes row undoes it as Enter
+  does (the detail's "Undo this" button stays); a guide cell click opens the popover (a click no
+  longer only focuses; the preview-rest timer starts from keys). *Decided in the mouse pass:*
   * **Back affordance**: a page or pane that Esc leaves shows a borderless `‹ {where}` button
     (`widgets::button::back_button`, accessible name "Back to {where}"): detail pages, Logs,
     EPG mapping and Settings when something is below them (`UiCtx::back`: the route below, or
@@ -2280,10 +2289,38 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
     edited first, keeping its text). A pushed TV guide (Ctrl+G from Home / Search) has one
     too. Long labels are cut to 24 characters on screen ("‹ |UK| SKY CINEMA PREMIE…"); the
     accessible name keeps the whole label.
-  * **Double-click safety**: where one click swaps what is under the pointer (a category
-    opening its grid, the Compact page list opening a page), the second click of a
-    double-click is dropped (`widgets::second_click_after`) — it would open a title or flip a
-    setting.
+  * **Double-click safety**: a double-click is one activation, in two layers.
+    (1) Widgets act on `widgets::fresh_click` — a click that isn't the 2nd/3rd of a multi-click
+    (egui reports `clicked()` on every release) — so a row isn't played twice and a tick or
+    toggle isn't flipped back. (2) When a click changes what is under the pointer, the app
+    (`ui::click_guard`, in `raw_input_hook`) drops the next primary press and its release that
+    come within the double-click delay (+50 ms, extended by each dropped press) and 6 px of that
+    click. The app sets egui's double-click delay to 0.5 s (`click_guard::DOUBLE_CLICK_DELAY`;
+    egui's 0.3 s is shorter than desktops count, GTK 0.4 s), and both layers read it, so a
+    normal-speed double-click is one click. The drop happens automatically when the route or
+    overlay stack changed in that frame or the next (a title's page, the player, a popover or menu opening; a menu or overlay closing), and when a
+    screen calls `widgets::swapped_under_pointer` for a swap inside one route (a Movies / Series
+    category or a Live group opening below Wide, the Compact Settings page list, EPG mapping's
+    one-pane Compact and a candidate assigned, onboarding's choices). So a double-click on a
+    channel never also toggles fullscreen on the player it opened, a double-click on a menu item
+    never activates the row under the menu, and a category's second click never opens a title.
+    Drag ends never click: egui reports no click past 6 px or 0.8 s, and the reorder grips
+    (Settings, Up next) are drag-only widgets on top of their rows.
+  * **The focusing click**: egui doesn't say whether a click also focused the window. With
+    Hyprland's default `follow_mouse = 1` the pointer focuses the window before any click, so
+    the click hits the item hover already lit — what was meant. For click-to-focus setups the
+    first click is ambiguous, so `click_guard` drops the primary press (and its release) that
+    the focus comes with: a press into the unfocused window is held back until its release
+    and dropped if `WindowFocused(true)` arrives meanwhile, as is a press within 100 ms after
+    it with no pointer motion in between (hover focus always comes with motion, so a quick
+    click right after the pointer crosses into the window under `follow_mouse = 1` acts). A
+    held press that brought no focus (`follow_mouse = 3`, a window that never takes the
+    keyboard) is delivered at its release as the click it was. A held press that turns into a
+    drag (moves > 6 px) is delivered at once, so scrollbars, sliders, the reorder grips,
+    multi-view swaps and the pop-out's window move work in an unfocused window too; one held
+    still for > 0.8 s does nothing (it isn't a click). Pointer motion always passes, so hover
+    keeps pointing. The developer screenshot
+    driver's injected clicks come after the guard and are never dropped.
   * Clickable widgets show the pointing hand; Settings pages light on hover while the keyboard
     cursor is in the page's content (never a second cursor); the onboarding choices move the
     focus with real pointer motion, like menus; below Wide one click on a Movies / Series
@@ -4693,7 +4730,7 @@ copies · Ctrl+O play from" (`Screen::hint_extras`, keys from the context's tabl
 
 | Input | Stack card | A copy shown fanned out |
 |---|---|---|
-| Enter / double-click | the page of the card's copy (Copies section); that copy locked → PIN | its own page, which then plays that copy (`ui::stacks::open_copy`) |
+| Enter / click | the page of the card's copy (Copies section); that copy locked → PIN | its own page, which then plays that copy (`ui::stacks::open_copy`) |
 | Shift+Enter | plays the copy that plays first with its fallback (`ui::copies::play_title`; the resume prompt first when any copy has progress); every copy locked → PIN | plays that copy |
 | **Space** / click the count badge | fans the copies out right after the card, in copy order, each with its language and version (`TV 2 · EN · 4K`; locked ones dimmed) | folds its stack |
 | Esc | folds every open stack first (after the category marks, before the drawer) | same |
@@ -5467,7 +5504,7 @@ the panel, `n` / `N` step. Home shows an "Up next" rail while items wait and not
 * The player's OSD row has `Up next` (the panel, `u`) and, while Up next has a next item and
   multi-view is off, `Next` (`n`), before Info; narrow keeps `Next` only. Both are in the
   controls focus walk, and a button that comes or goes keeps the focus on its control.
-* Enter (a double-click, "Play now") on a film or episode row with progress past
+* Enter (a click, "Play now") on a film or episode row with progress past
   `resume_min_s` opens the usual Resume prompt (the latest progress of any copy, as the
   resolver resumes it); its answer goes to the engine as `PlayAtFrom { id, resume }`, which
   overrides the row's "from the start" for that row only. A row that asks for the start, a

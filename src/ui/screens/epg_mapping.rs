@@ -7,7 +7,8 @@
 //! * **Issues** (left pane): the channels of the chosen view (an issue kind, every issue, every
 //!   channel, or Recent changes) in the Live TV playlist scope (Alt+P, Ctrl+PgDn / Ctrl+PgUp),
 //!   each with its proposed fix and confidence; Space / Insert / a click on the box marks,
-//!   Ctrl+A marks all shown, Shift+Enter (or a double-click) accepts — one channel at once,
+//!   Ctrl+A marks all shown, Enter or a click picks a guide channel for it, Shift+Enter (or
+//!   the Accept button) accepts — one channel at once,
 //!   more after a confirm card with the before/after now; Delete resets to automatic; Ctrl+Z
 //!   undoes the last batch (every write is a logged batch, `guide_fix::ui::submit_apply`).
 //! * **Detail** (right pane): the channel's state and proposal with a before/after now/next
@@ -725,7 +726,15 @@ impl EpgMappingScreen {
         self.confirm_loader = Some((pending, Loader::start(ctx, move |c| crate::guide_fix::preview::preview(c, &changes, now))));
     }
 
-    /// Shift+Enter / double-click / "Accept": one channel at once, more after the card.
+    /// Enter (or a click) on a Recent changes row: undo that change, unless it is undone.
+    fn undo_recent(&mut self, ctx: &mut UiCtx<'_>, i: usize) {
+        if let Some(e) = self.recent.get(i).filter(|e| e.undone_at.is_none()) {
+            self.written.1.clear();
+            let _ = gf::submit_undo(ctx.services, Some(e.id), Self::opts(ctx), ctx.now);
+        }
+    }
+
+    /// Shift+Enter / "Accept": one channel at once, more after the card.
     fn accept(&mut self, ctx: &mut UiCtx<'_>) {
         let fixes: Vec<(ChannelId, Fix)> = self.targets().into_iter().filter_map(|ch| self.fix_of(ctx, ch).map(|f| (ch, f))).collect();
         match fixes.as_slice() {
@@ -1299,10 +1308,7 @@ impl EpgMappingScreen {
         if self.view == View::Recent {
             return match self.list.handle(action) {
                 ListOutcome::Activated(i) | ListOutcome::ActivatedAlt(i) => {
-                    if let Some(e) = self.recent.get(i).filter(|e| e.undone_at.is_none()) {
-                        self.written.1.clear();
-                        let _ = gf::submit_undo(ctx.services, Some(e.id), Self::opts(ctx), ctx.now);
-                    }
+                    self.undo_recent(ctx, i);
                     true
                 }
                 ListOutcome::Parent => false,
@@ -1900,8 +1906,14 @@ impl EpgMappingScreen {
                     state,
                 )
             });
-            if matches!(out, ListOutcome::Moved) {
-                self.pane = Pane::Issues;
+            match out {
+                ListOutcome::Moved => self.pane = Pane::Issues,
+                // a click does what Enter does: undo that change
+                ListOutcome::Activated(i) => {
+                    self.pane = Pane::Issues;
+                    self.undo_recent(ctx, i);
+                }
+                _ => {}
             }
             return;
         }
@@ -1923,6 +1935,7 @@ impl EpgMappingScreen {
             let mut visible = Vec::new();
             let mut box_click: Option<(usize, egui::Modifiers)> = None;
             let multi = ctx.lib.eligible(ItemKind::Channel).len() > 1;
+            let before = self.list.cursor;
             let painted = self.paint_rows(&mut ui_list, ctx, row_h, focused, multi, &mut visible, &mut box_click);
             self.visible = visible;
             if let Some((i, m)) = box_click {
@@ -1938,10 +1951,25 @@ impl EpgMappingScreen {
                     self.flush_adjust(ctx);
                     self.refilter_cands();
                 }
-                // a double-click accepts the row's fix
-                ListOutcome::Activated(_) => {
+                // a click on the box (or with Ctrl / Shift) only marks (and points)
+                ListOutcome::Activated(_) if box_click.is_some() => {
                     self.pane = Pane::Issues;
-                    self.accept(ctx);
+                    if self.list.cursor != before {
+                        self.flush_adjust(ctx);
+                        self.refilter_cands();
+                    }
+                }
+                // a click does what Enter does: on to the row's guide channels (Shift+Enter or
+                // Accept accepts the proposal)
+                ListOutcome::Activated(_) => {
+                    self.flush_adjust(ctx);
+                    self.refilter_cands();
+                    self.pane = Pane::Guide;
+                    self.cands.select(0);
+                    if ctx.layout == LayoutClass::Compact {
+                        // one pane at a time: the candidates now sit under the pointer
+                        crate::ui::widgets::swapped_under_pointer(ui.ctx());
+                    }
                 }
                 ListOutcome::ContextMenu(_) => {
                     self.pane = Pane::Issues;
@@ -2072,7 +2100,7 @@ impl EpgMappingScreen {
                 w - name_w - theme.space(SpaceToken::Sm),
             );
             p.galley(egui::pos2(left + name_w + theme.space(SpaceToken::Sm), y - tg.size().y / 2.0), tg, t.text_secondary);
-            if resp.clicked() {
+            if crate::ui::widgets::fresh_click(&resp) {
                 let m = ui.input(|i| i.modifiers);
                 let on_box = resp.interact_pointer_pos().is_some_and(|pos| box_rect.contains(pos));
                 if on_box || m.command || m.shift {
@@ -2271,9 +2299,11 @@ impl EpgMappingScreen {
         });
         match out {
             ListOutcome::Moved => self.pane = Pane::Guide,
+            // Enter or a click assigns it; the lists rebuild under the pointer
             ListOutcome::Activated(_) => {
                 self.pane = Pane::Guide;
                 self.assign(ctx);
+                crate::ui::widgets::swapped_under_pointer(ui.ctx());
             }
             _ => {}
         }

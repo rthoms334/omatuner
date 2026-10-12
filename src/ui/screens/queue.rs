@@ -10,7 +10,7 @@
 //! player), Shift+Enter fullscreen, Alt+↑/↓ move (not while filtering), Ctrl+Shift+N play next,
 //! Space / Insert mark, Delete removes (Undo in the toast), Ctrl+O pins a copy, Ctrl+I opens
 //! the title, Ctrl+Enter / right-click the row menu, letters filter. Mouse: drag a row by its
-//! handle, ✕ on hover removes, double-click plays.
+//! handle, ✕ on hover removes, a click plays (as Enter).
 
 use std::sync::Arc;
 

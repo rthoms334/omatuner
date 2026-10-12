@@ -179,7 +179,7 @@ pub enum RowPlay {
     NotRunning,
 }
 
-/// Enter (a double-click, "Play now") on a row of the Up next screen or the player's panel
+/// Enter (a click, "Play now") on a row of the Up next screen or the player's panel
 /// (up-next-design §3 "Resume": "Enter on a row uses the normal Resume prompt"): the Resume
 /// prompt when the row's film or episode has progress past `resume_min_s` and the row doesn't
 /// ask for the start; else play from here as before. Locked, concealed and gone rows go

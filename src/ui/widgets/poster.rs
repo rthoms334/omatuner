@@ -22,8 +22,8 @@
 //! Keyboard: [`GridState::handle`] turns `PosterGrid` actions into cursor moves (↑/↓ by a row,
 //! ←/→ by one card, ← on the first column = back to the categories pane) and filter edits —
 //! the launcher idiom of `list::ListState`, in two dimensions. Mouse: hover moves the cursor
-//! only on real pointer motion (Omarchy pointer gate), click selects, double-click activates,
-//! right-click opens the context menu.
+//! only on real pointer motion (Omarchy pointer gate), a click does what Enter does (a
+//! double-click activates once), right-click opens the context menu.
 
 use eframe::egui::{self, Align2, Rect};
 
@@ -426,7 +426,7 @@ pub(crate) fn poster_tile_ex(
                 .map(|b| format!(" ({})", b.chord.label()))
                 .unwrap_or_default();
             let tip = egui::RichText::new(format!("{} copies — click to {what}{key}", st.count)).size(theme.font(TypeToken::BodySmall));
-            badge_clicked = b.on_hover_text(tip).clicked();
+            badge_clicked = super::fresh_click(&b.on_hover_text(tip));
         }
     }
     let p = ui.painter();
@@ -615,13 +615,15 @@ pub(crate) fn poster_grid_with<'s>(
                         if badge {
                             state.cursor = i;
                             state.badge_clicked = Some(i);
-                        } else if resp.double_clicked() {
+                        } else if super::fresh_click(&resp) {
                             state.cursor = i;
                             outcome = ListOutcome::Activated(i);
                         } else if resp.secondary_clicked() {
                             state.cursor = i;
                             outcome = ListOutcome::ContextMenu(i);
-                        } else if (resp.clicked() || (pointer_moved && resp.hovered())) && i != state.cursor {
+                        } else if resp.clicked() {
+                            // the 2nd/3rd click of a multi-click: already activated
+                        } else if pointer_moved && resp.hovered() && i != state.cursor {
                             state.cursor = i;
                             outcome = ListOutcome::Moved;
                         }

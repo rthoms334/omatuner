@@ -1,6 +1,6 @@
 //! Virtualized, keyboard-first list with launcher-style type-to-filter (DESIGN §13.1).
 //! Rows are drawn by the caller; this owns cursor, paging, scroll-to-cursor, hover-moves-cursor
-//! (Omarchy menus), click/double-click, and the filter text (drawn by `text_field::search_header`).
+//! (Omarchy menus), clicks, and the filter text (drawn by `text_field::search_header`).
 //! Uses `ScrollArea::show_rows` so 100k rows cost only the visible ones.
 //!
 //! Usage (the screen owns the filtered rows; the list only knows their count):
@@ -15,7 +15,9 @@
 //! ```
 //! Mouse rules (Omarchy `Menu.qml` pointer gate): hover moves the cursor only on frames with
 //! real pointer motion — never because rows scroll under a still pointer — and never activates;
-//! click = move the cursor, double-click = activate, right-click = context menu.
+//! a click does what Enter does (cursor there + `Activated`), right-click = context menu. The
+//! later clicks of a double/triple-click are ignored ([`super::fresh_click`]): a double-click
+//! activates once (DESIGN §15.1 "Double-click safety").
 
 use eframe::egui;
 
@@ -44,7 +46,7 @@ pub struct ListState {
 pub enum ListOutcome {
     None,
     Moved,
-    /// Enter / Right / double-click on row `usize` (index into the *displayed* rows).
+    /// Enter / Right / click on row `usize` (index into the *displayed* rows).
     Activated(usize),
     /// Shift+Enter.
     ActivatedAlt(usize),
@@ -190,13 +192,15 @@ pub fn virtual_list(
                     let mut child =
                         ui.new_child(egui::UiBuilder::new().id_salt(index).max_rect(rect).layout(egui::Layout::top_down(egui::Align::Min)));
                     let resp = row(&mut child, RowCtx { index, state: row_state }).on_hover_cursor(egui::CursorIcon::PointingHand);
-                    if resp.double_clicked() {
+                    if super::fresh_click(&resp) {
                         state.cursor = index;
                         outcome = ListOutcome::Activated(index);
                     } else if resp.secondary_clicked() {
                         state.cursor = index;
                         outcome = ListOutcome::ContextMenu(index);
-                    } else if (resp.clicked() || (pointer_moved && resp.hovered())) && index != state.cursor {
+                    } else if resp.clicked() {
+                        // the 2nd/3rd click of a multi-click: already activated
+                    } else if pointer_moved && resp.hovered() && index != state.cursor {
                         state.cursor = index;
                         outcome = ListOutcome::Moved;
                     }

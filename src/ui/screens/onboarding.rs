@@ -1275,8 +1275,11 @@ fn choice_rows(ui: &mut egui::Ui, theme: &Theme, focus: &mut usize, items: &[(&s
         if moved && resp.hovered() {
             *focus = i;
         }
-        if resp.clicked() {
+        // a click picks it, as Enter does; the next step then replaces these rows, so the
+        // second click of a double-click is dropped
+        if crate::ui::widgets::fresh_click(&resp) {
             clicked = Some(i);
+            crate::ui::widgets::swapped_under_pointer(ui.ctx());
         }
     }
     clicked
@@ -1521,8 +1524,9 @@ impl OnboardingScreen {
             let state = if i == self.focus { RowState::Cursor } else { RowState::Idle };
             let (icon, detail) = if p.added { (glyphs::CHECK, "Added — already one of your playlists") } else { (glyphs::LIVE_TV, p.description) };
             let r = ui.add_enabled_ui(!p.added, |ui| rows::menu_row(ui, theme, Some(icon), &p.name, Some(detail), !p.added, state)).inner;
-            if r.clicked() {
+            if crate::ui::widgets::fresh_click(&r) {
                 clicked = Some(i);
+                crate::ui::widgets::swapped_under_pointer(ui.ctx());
             }
         }
         clicked

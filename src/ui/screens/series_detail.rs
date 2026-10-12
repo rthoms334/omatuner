@@ -933,12 +933,11 @@ impl Screen for SeriesDetailScreen {
                 if (cursor || selected) && scroll {
                     ui.scroll_to_rect(resp.rect, None);
                 }
-                if resp.double_clicked() {
+                // a click plays it, as Enter does (a double-click plays once)
+                if crate::ui::widgets::fresh_click(&resp) {
                     clicked_ep = Some((i, true));
                 } else if resp.secondary_clicked() {
                     ep_menu = Some(i);
-                } else if resp.clicked() {
-                    clicked_ep = Some((i, false));
                 }
             }
         });

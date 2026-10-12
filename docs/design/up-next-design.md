@@ -171,7 +171,7 @@ Mini player:  ┌ video ─────────┐   Pop-out strip:  Goldfin
   - Rows show the ⠿ handle on hover. Dragging the **handle** reorders the row:
     - an accent insertion line shows where it will land, and the list auto-scrolls within 24 px of an edge;
     - Esc or a drop outside the list cancels the drag.
-  - A click selects and a double-click plays. Under the existing double-click safety rule, a reorder never comes from a body click.
+  - One click does what Enter does: it plays the row. A double-click is one click (DESIGN §15.1 "Double-click safety"), and a reorder never comes from a body click.
   - A ✕ on hover removes the row. Right-click opens the row menu.
   - The OSD row gets `󰐑 Up next` and, when the queue has a next item, `󰒭 Next` (tooltips show the keys).
   - Detail pages get a `[󰐑 Up next]` button after Resume / Start over. The guide programme card gets `Up next`.

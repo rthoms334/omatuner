@@ -60,7 +60,7 @@ pub enum Out {
     None,
     /// Handled here (cursor, filter, marks).
     Handled,
-    /// Enter / double-click (`fullscreen`: Shift+Enter).
+    /// Enter / a click (`fullscreen`: Shift+Enter).
     Play {
         id: QueueId,
         fullscreen: bool,
@@ -483,7 +483,8 @@ impl QueueList {
                         let xb = ui.interact(xr, resp.id.with("remove"), egui::Sense::click()).on_hover_text("Remove (Delete)");
                         xb.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("Remove {label}")));
                         p.text(xr.center(), Align2::CENTER_CENTER, glyphs::CLOSE, icon.clone(), if xb.hovered() { look.danger } else { look.dim });
-                        if xb.clicked() {
+                        // the next row's ✕ moves up under the pointer: a double-click removes one
+                        if crate::ui::widgets::fresh_click(&xb) {
                             remove = Some(e.id);
                         }
                         right = xr.left() - pad / 2.0;
@@ -555,6 +556,11 @@ impl QueueList {
         });
         self.lines = lines;
         let mut out = match outcome {
+            // a click on a section or sleep line: the cursor steps on to a row, as keys would
+            ListOutcome::Activated(_) | ListOutcome::ContextMenu(_) if self.cursor_id().is_none() => {
+                self.skip_lines(true);
+                Out::Handled
+            }
             ListOutcome::Activated(_) => self.cursor_id().map_or(Out::Handled, |id| Out::Play { id, fullscreen: false }),
             ListOutcome::ContextMenu(_) => self.cursor_id().map_or(Out::Handled, Out::Menu),
             ListOutcome::Moved => {

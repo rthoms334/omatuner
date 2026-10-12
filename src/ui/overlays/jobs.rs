@@ -188,7 +188,7 @@ impl Overlay for JobsOverlay {
                     let (resp, cancelled) = running_row(ui, theme, job, now, i == self.cursor);
                     if cancelled {
                         cancel = Some(i);
-                    } else if resp.clicked() {
+                    } else if crate::ui::widgets::fresh_click(&resp) {
                         clicked = Some(i);
                     } else if pointer_moved && resp.hovered() {
                         hovered = Some(i);
@@ -203,7 +203,8 @@ impl Overlay for JobsOverlay {
                     let row = self.running.len() + p;
                     let expanded = self.expanded.iter().any(|(at, msg)| *at == line.at && *msg == line.message);
                     let resp = problem_row(ui, theme, line, p, expanded, row == self.cursor, h24);
-                    if resp.clicked() {
+                    // a double-click doesn't fold the problem it opened
+                    if crate::ui::widgets::fresh_click(&resp) {
                         clicked = Some(row);
                     } else if pointer_moved && resp.hovered() {
                         hovered = Some(row);
@@ -277,7 +278,7 @@ fn running_row(ui: &mut egui::Ui, theme: &Theme, job: &JobStatus, now: Timestamp
     // registered after the labels, so it gets the clicks; the labels carry the accesskit text
     let row = ui.interact(inner.inner, ui.id().with(("job", job.id)), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
     let mut over = ui.new_child(egui::UiBuilder::new().id_salt(("cancel", job.id)).max_rect(cancel_rect));
-    let cancel = icon_button(&mut over, theme, glyphs::CLOSE, "Cancel task (Delete)", ButtonStyle::default()).clicked();
+    let cancel = crate::ui::widgets::fresh_click(&icon_button(&mut over, theme, glyphs::CLOSE, "Cancel task (Delete)", ButtonStyle::default()));
     (row, cancel)
 }
 
