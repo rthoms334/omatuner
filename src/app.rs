@@ -348,8 +348,13 @@ impl TunerApp {
                 rows.iter().find(|r| r.id == *id).is_none_or(|r| r.busy.is_none() && matches!(r.status, Status::NotConnected | Status::Checking))
             };
             let agents: Vec<AgentId> = offer.agents.into_iter().filter(still).collect();
+            // and the "already connected" lines as they are now, keeping any still being checked
+            let mut connected = crate::agent::connect::connected_agents(&rows);
+            connected.extend(offer.connected.into_iter().filter(|id| rows.iter().find(|r| r.id == *id).is_none_or(|r| r.status == Status::Checking)));
+            connected.sort();
+            connected.dedup();
             if self.services().config().agents.offer_connect && !agents.is_empty() {
-                self.nav.push(NavRequest::Open(OverlayRequest::AgentConnect(Offer { agents })));
+                self.nav.push(NavRequest::Open(OverlayRequest::AgentConnect(Offer { agents, connected })));
             } else {
                 self.config_edits.push(Box::new(|c| c.agents.checked_version = Some(TUNER_VERSION.to_owned())));
             }
@@ -5722,7 +5727,7 @@ mod tests {
         rig.settle();
         rig.app.nav.push(NavRequest::Push(Route::Player));
         rig.frame_with(vec![]);
-        let offer = crate::agent::connect::Offer { agents: vec![crate::agent::connect::AgentId::Claude] };
+        let offer = crate::agent::connect::Offer { agents: vec![crate::agent::connect::AgentId::Claude], connected: Vec::new() };
         rig.app.agent_offer = Some(offer.clone());
         for _ in 0..3 {
             rig.frame_with(vec![]);

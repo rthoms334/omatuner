@@ -228,6 +228,9 @@ impl AgentRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Offer {
     pub agents: Vec<AgentId>,
+    /// Agents found that are already connected ([`connected_agents`]), in [`AgentId`] order: the
+    /// card says so, so an agent it doesn't offer doesn't look missing.
+    pub connected: Vec<AgentId>,
 }
 
 /// How the start-of-version pass ended (the app polls it once).
@@ -265,6 +268,16 @@ pub fn should_check(cfg: &AgentsConfig, version: &str) -> bool {
     (cfg.offer_connect || cfg.keep_in_sync) && cfg.checked_version.as_deref() != Some(version)
 }
 
+/// The agents the card shows as "already connected", in [`AgentId`] order: connected, or
+/// connected with an older plugin (not turned off, broken or unreadable).
+pub fn connected_agents(rows: &[AgentRow]) -> Vec<AgentId> {
+    let mut ids: Vec<AgentId> =
+        rows.iter().filter(|r| matches!(r.status, Status::Connected { .. } | Status::UpdateAvailable { .. })).map(|r| r.id).collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 /// What the pass offers, from fresh rows.
 pub fn decide(rows: &[AgentRow], offer_connect: bool) -> PassOutcome {
     if !rows.iter().any(|r| !matches!(r.status, Status::NotFound | Status::Checking)) {
@@ -273,7 +286,7 @@ pub fn decide(rows: &[AgentRow], offer_connect: bool) -> PassOutcome {
     let mut agents: Vec<AgentId> = rows.iter().filter(|r| r.status == Status::NotConnected && r.id.can(Op::Connect)).map(|r| r.id).collect();
     agents.sort();
     agents.dedup();
-    if !offer_connect || agents.is_empty() { PassOutcome::Settled } else { PassOutcome::Offer(Offer { agents }) }
+    if !offer_connect || agents.is_empty() { PassOutcome::Settled } else { PassOutcome::Offer(Offer { agents, connected: connected_agents(rows) }) }
 }
 
 /// The setup an agent needs, to copy ("Copy the setup command"; Cursor's JSON).
@@ -392,7 +405,15 @@ mod tests {
             row(AgentId::Cursor, NotConnected),
             row(AgentId::OpenCode, Unreadable("x".into())),
         ];
-        assert_eq!(decide(&rows, true), PassOutcome::Offer(Offer { agents: vec![AgentId::Codex, AgentId::Gemini] }));
+        let offer = |agents: Vec<AgentId>, connected: Vec<AgentId>| PassOutcome::Offer(Offer { agents, connected });
+        assert_eq!(decide(&rows, true), offer(vec![AgentId::Codex, AgentId::Gemini], vec![AgentId::Claude]));
+        // the card says which are already connected: an older plugin counts, turned off doesn't
+        let mut older = rows.clone();
+        older[1].status = UpdateAvailable { installed: "0.2.2".into(), available: "0.2.3".into() };
+        older[5].status = Connected { via: Via::Mcp, version: None };
+        assert_eq!(decide(&older, true), offer(vec![AgentId::Codex, AgentId::Gemini], vec![AgentId::Claude, AgentId::OpenCode]));
+        older[1].status = TurnedOff;
+        assert_eq!(decide(&older, true), offer(vec![AgentId::Codex, AgentId::Gemini], vec![AgentId::OpenCode]));
         assert_eq!(decide(&rows, false), PassOutcome::Settled, "Don't ask again");
         // all connected, or only by-hand / unreadable agents: nothing to ask, recorded
         assert_eq!(decide(&rows[1..2], true), PassOutcome::Settled);

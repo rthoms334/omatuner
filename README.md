@@ -1099,6 +1099,8 @@ covers the player, full screen, the pop-out or another dialog.
   Settings ▸ AI agents turns the offer back on.
 - When it finds several agents, the card lists them and ticks only the first (Claude Code, when
   it's there). Tab moves, Space ticks or unticks. Everything works with the mouse too.
+- Agents that are already connected aren't offered again; the card lists them above the others
+  as *✓ Claude Code already connected*.
 
 **Settings ▸ AI agents** lists the agents found on this computer, each with its status:
 *Connected · plugin 0.2.2*, *Connected · MCP server only (no skills)*, *Update available*,

@@ -8,18 +8,22 @@
 //!  Connect your AI agents to Tuner?
 //!  Tuner can add its MCP server to these agents …
 //!
-//!  󰄲 Claude Code      plugin: tools + 7 skills
-//!  󰄱 Codex            MCP server
+//!  󰄬 Claude Code      already connected
+//!  󰄲 Codex            MCP server
+//!  󰄱 Gemini CLI       MCP server
 //!  󰄱 Don't ask again
-//!                                         [ Not now ]  [ Connect Claude Code ]
+//!                                              [ Not now ]  [ Connect Codex ]
 //!  Enter Connect · Esc Not now · Tab moves
 //! ```
-//! Only the first agent (the primary, in `AgentId` order) starts ticked. Keys are the dialog
-//! keys (`Modal`; no new bindings): ↑/↓/←/→ and Tab/Shift+Tab move along tick rows → "Don't
-//! ask again" → Not now → Connect (stopping at the ends), Enter/Space toggles a tick or presses
-//! the focused button, Esc is Not now. Mouse: a row or its box toggles, the buttons click, a
-//! click outside is Not now. The card opens by itself, so for its first [`ARMING`] Enter, Space
-//! and clicks do nothing (a key meant for the list behind can't connect an agent); Esc works.
+//! Agents already connected get a plain line above the offer (one agent offered: above "Don't
+//! ask again"), so one the card doesn't offer doesn't look missing; the lines take no focus or
+//! clicks. Only the first offered agent (the primary, in `AgentId` order) starts ticked. Keys
+//! are the dialog keys (`Modal`; no new bindings): ↑/↓/←/→ and Tab/Shift+Tab move along tick
+//! rows → "Don't ask again" → Not now → Connect (stopping at the ends), Enter/Space toggles a
+//! tick or presses the focused button, Esc is Not now. Mouse: a row or its box toggles, the
+//! buttons click, a click outside is Not now. The card opens by itself, so for its first
+//! [`ARMING`] Enter, Space and clicks do nothing (a key meant for the list behind can't connect
+//! an agent); Esc works.
 //!
 //! Answers (config through `ctx.edit_config`): Connect runs the setup in the background
 //! (`AgentConnect::run`, one queue) and records `checked_version`; the card stays with a busy
@@ -246,6 +250,29 @@ fn key(action: Action) -> String {
     crate::keymap::MODAL.iter().find(|b| b.action == action).map(|b| b.chord.label()).unwrap_or_default()
 }
 
+/// A row's glyph, label and (optional) secondary text, laid out like every other row.
+fn paint_row_text(
+    p: &egui::Painter,
+    rect: egui::Rect,
+    theme: &Theme,
+    glyph: (&str, egui::Color32),
+    label: (&str, egui::Color32),
+    detail: Option<&str>,
+) {
+    let t = &theme.tokens;
+    let inset = theme.space(SpaceToken::Md);
+    let y = rect.center().y;
+    let glyph_r =
+        p.text(egui::pos2(rect.left() + inset, y), Align2::LEFT_CENTER, glyph.0, egui::FontId::proportional(theme.font(TypeToken::Icon)), glyph.1);
+    let left = glyph_r.right() + theme.space(SpaceToken::Md);
+    let label_r = p.text(egui::pos2(left, y), Align2::LEFT_CENTER, label.0, egui::FontId::proportional(theme.font(TypeToken::Body)), label.1);
+    if let Some(d) = detail {
+        // a fixed column keeps the agents' details aligned
+        let col = left.max(label_r.right() + theme.space(SpaceToken::Lg)).max(left + (150.0 * theme.rem()).round());
+        p.text(egui::pos2(col, y), Align2::LEFT_CENTER, d, egui::FontId::proportional(theme.font(TypeToken::BodySmall)), t.text_secondary);
+    }
+}
+
 /// A tick row: box, label and (optional) secondary text; the focus ring when focused.
 fn tick_row(ui: &mut egui::Ui, theme: &Theme, ticked: bool, label: &str, detail: Option<&str>, focused: bool) -> egui::Response {
     let t = &theme.tokens;
@@ -261,20 +288,21 @@ fn tick_row(ui: &mut egui::Ui, theme: &Theme, ticked: bool, label: &str, detail:
     if focused {
         p.rect_stroke(rect, t.rounding, egui::Stroke::new(1.0, t.border_hover), egui::StrokeKind::Inside);
     }
-    let inset = theme.space(SpaceToken::Md);
-    let y = rect.center().y;
-    let (tick, tick_color) = if ticked { (glyphs::CHECKBOX_ON, t.accent) } else { (glyphs::CHECKBOX_OFF, t.text_secondary) };
-    let tick_r =
-        p.text(egui::pos2(rect.left() + inset, y), Align2::LEFT_CENTER, tick, egui::FontId::proportional(theme.font(TypeToken::Icon)), tick_color);
-    let left = tick_r.right() + theme.space(SpaceToken::Md);
-    let color = if focused { t.list_cursor_text } else { t.fg };
-    let label_r = p.text(egui::pos2(left, y), Align2::LEFT_CENTER, label, egui::FontId::proportional(theme.font(TypeToken::Body)), color);
-    if let Some(d) = detail {
-        // a fixed column keeps the agents' details aligned
-        let col = left.max(label_r.right() + theme.space(SpaceToken::Lg)).max(left + (150.0 * theme.rem()).round());
-        p.text(egui::pos2(col, y), Align2::LEFT_CENTER, d, egui::FontId::proportional(theme.font(TypeToken::BodySmall)), t.text_secondary);
-    }
+    let tick = if ticked { (glyphs::CHECKBOX_ON, t.accent) } else { (glyphs::CHECKBOX_OFF, t.text_secondary) };
+    paint_row_text(p, rect, theme, tick, (label, if focused { t.list_cursor_text } else { t.fg }), detail);
     resp
+}
+
+/// "✓ Claude Code   already connected": a plain line, no focus, no clicks (the words say it,
+/// not the colour).
+fn connected_row(ui: &mut egui::Ui, theme: &Theme, id: AgentId) {
+    let t = &theme.tokens;
+    let h = theme.space(SpaceToken::ControlHeight);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::hover());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, format!("{} already connected", id.label())));
+    if ui.is_rect_visible(rect) {
+        paint_row_text(ui.painter(), rect, theme, (glyphs::CHECK, t.text_secondary), (id.label(), t.fg), Some("already connected"));
+    }
 }
 
 impl Overlay for AgentConnectCard {
@@ -356,6 +384,9 @@ impl Overlay for AgentConnectCard {
                 let hint = format!("{} or {} hide · it goes on in the background", key(Action::Activate), key(Action::Back));
                 ui.label(RichText::new(hint).size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
                 return;
+            }
+            for id in &self.offer.connected {
+                connected_row(ui, theme, *id);
             }
             if several {
                 for (i, id) in self.offer.agents.iter().enumerate() {
@@ -445,7 +476,8 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let fake = fake();
         t.services().agent_connect.with_fake(fake.clone(), ConnectEnv::rooted(home.path()));
-        let mut h = overlay_harness(t, one, AgentConnectCard::new(Offer { agents: agents.to_vec() }), egui::vec2(1200.0, 800.0));
+        let mut h =
+            overlay_harness(t, one, AgentConnectCard::new(Offer { agents: agents.to_vec(), connected: Vec::new() }), egui::vec2(1200.0, 800.0));
         h.state_mut().o.opened = Some(Instant::now() - ARMING); // the user has seen it
         (h, fake, home)
     }
@@ -506,16 +538,27 @@ mod tests {
     }
 
     /// Esc is Not now: this version is answered, nothing runs. With "Don't ask again" ticked
-    /// (keyboard to the box, or a click on it), the offer is switched off for good.
+    /// (keyboard to the box, or a click on it), the offer is switched off for good. Claude
+    /// Code, already connected, gets a plain line: no focus, no clicks.
     #[test]
     fn not_now_runs_nothing_and_dont_ask_again_switches_the_offer_off() {
         let (mut h, fake, _home) = card(&[AgentId::Codex]);
+        h.state_mut().o.offer.connected = vec![AgentId::Claude];
+        h.run_steps(1);
+        let line = h.get_by_label("Claude Code already connected");
+        let does = |a| line.accesskit_node().data().supports_action(a);
+        assert!(!does(egui::accesskit::Action::Focus) && !does(egui::accesskit::Action::Click));
+        assert!(h.get_by_label("Don't ask again").accesskit_node().data().supports_action(egui::accesskit::Action::Click));
+        line.click();
+        h.run_steps(2);
+        assert_ne!(h.state().last, "Close");
+        assert!(h.state().o.focus == Focus::Connect && !h.state().o.dont_ask);
         assert_eq!(h.state_mut().act(Action::Back), "Close");
         let c = answered(&mut h);
         assert_eq!(c.agents.checked_version.as_deref(), Some(VERSION));
         assert!(c.agents.offer_connect);
-        // ↑↑ from Connect: Not now, then the box; Enter ticks it; Esc
-        for a in [Action::Up, Action::Up, Action::Activate] {
+        // ↑↑↑ from Connect: Not now, then the box, where it stops; Enter ticks it; Esc
+        for a in [Action::Up, Action::Up, Action::Up, Action::Activate] {
             assert_eq!(h.state_mut().act(a), "Keep");
         }
         assert!(h.state().o.dont_ask);

@@ -5859,11 +5859,12 @@ background and request a repaint on every change. `run` has **one queue**, so tw
 never overlap; each result is toasted and that agent's status read again. `start_pass` (≥ 3 s
 after start) refreshes, runs Claude's Update when `keep_in_sync` and the plugin is
 behind, then `decide`s: `Offer` (found, automatable, not connected; `AgentId` order, the first
-ticked), `Settled` (agents found but nothing to offer, or `offer_connect` off: record
-`checked_version` now) or `Retry` (nothing found: record nothing, the next start looks again).
-`shutdown` kills running children before the runtime stops. A refresh's `refreshing` flag is
-cleared by a drop guard (a task dropped at shutdown or a panic can't wedge it), and the pass
-waits at most 60 s for a refresh it didn't start.
+ticked; plus `connected`, the agents found already connected or with an older plugin, for the
+card's "already connected" lines), `Settled` (agents found but nothing to offer, or
+`offer_connect` off: record `checked_version` now) or `Retry` (nothing found: record nothing,
+the next start looks again). `shutdown` kills running children before the runtime stops. A
+refresh's `refreshing` flag is cleared by a drop guard (a task dropped at shutdown or a panic
+can't wedge it), and the pass waits at most 60 s for a refresh it didn't start.
 
 **Only on the user's own desktop.** `for_services(paths, …)` uses the `NullRunner` (and never
 starts the pass) off the desktop (`platform::off_desktop`: unit tests, `keep_off_desktop`,
@@ -5917,15 +5918,18 @@ screen, not popped out or video-only, not multi-view, no text field focused. A p
 in a browse screen doesn't block it, nor does Settings ▸ AI agents (the card would repeat it).
 When the gate opens, the offer is checked again: with `offer_connect` turned off meanwhile, or
 no offered agent still *Not connected* and idle, nothing opens and `checked_version` is
-recorded. If the gate never opens, nothing is recorded and the next
-start checks again. One agent: "Connect Claude Code to Tuner?" with what it adds; several: a
-tick list (only the first ticked) and "Connect N agents". Enter Connect, Esc Not now, Tab/arrows
-move, Space ticks; mouse buttons, a scrim click = Not now. The card opens by itself, so for its
-first 0.6 s Enter, Space and clicks do nothing (a key meant for the list behind can't connect an
-agent); Esc works at once. Connect runs `run(ticked, Connect)`
-and keeps the card with a progress line per agent until every one is idle (Esc hides it early;
-the work continues, toasts carry the results). Both answers set `checked_version`; *Don't ask
-again* also sets `offer_connect = false`.
+recorded (agents connected meanwhile join the "already connected" lines). If the gate never
+opens, nothing is recorded and the next start checks again. One agent: "Connect Claude Code to
+Tuner?" with what it adds; several: a tick list (only the first ticked) and "Connect N agents".
+Above the offer, each agent already connected (`Offer::connected`) gets a plain line,
+"✓ Claude Code  already connected" (the words carry it; the muted colour doesn't have to), so
+an agent the card doesn't offer doesn't look missing; the lines take no focus, ticks or clicks.
+Enter Connect, Esc Not now, Tab/arrows move, Space ticks; mouse buttons, a scrim click = Not
+now. The card opens by itself, so for its first 0.6 s Enter, Space and clicks do nothing (a key
+meant for the list behind can't connect an agent); Esc works at once. Connect runs
+`run(ticked, Connect)` and keeps the card with a progress line per agent until every one is
+idle (Esc hides it early; the work continues, toasts carry the results). Both answers set
+`checked_version`; *Don't ask again* also sets `offer_connect = false`.
 
 ### 39.7 Settings ▸ AI agents (`ui::screens::settings::agents`)
 After Parental. The two toggles, *Check again*, one row per agent found (status, "used 2 h ago"),
