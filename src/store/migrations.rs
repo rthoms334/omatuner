@@ -115,7 +115,9 @@ fn backfill(conn: &Connection, name: &str) -> Result<()> {
 }
 
 /// 0008 (owner: remind track): the reminder's mode, start offset and where it opens; rows made
-/// with the old switch marker (`lead_s = Reminder::SWITCH_LEAD`) become `mode = 'switch'`.
+/// with the old switch marker (`lead_s = Reminder::SWITCH_LEAD`) become `mode = 'switch'`. From
+/// here on both say the same (`store::user` keeps `lead_s = SWITCH_LEAD` ⟺ `mode = 'switch'`),
+/// so readers of either agree.
 fn reminder_modes(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "reminder", "mode", "TEXT NOT NULL DEFAULT 'notify'")?;
     add_column_if_missing(conn, "reminder", "offset_s", "INTEGER NOT NULL DEFAULT 0")?;

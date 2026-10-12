@@ -16,7 +16,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use crate::error::{Error, Result};
 use crate::model::{
     FavListId, FavouriteEntry, FavouriteList, Fingerprint, GroupKey, GroupOverride, GroupOverrideRow, GroupRef, HistoryEntry, ItemKey, ItemKind,
-    ItemOverride, ItemOverrideRow, ItemRef, Reminder, ReminderId, ReminderState, SourceId, Timestamp, WatchProgress,
+    ItemOverride, ItemOverrideRow, ItemRef, Reminder, ReminderId, ReminderMode, ReminderState, SourceId, Timestamp, WatchProgress,
 };
 use crate::store::sql::{self, atomic, enum_parse, enum_str, fp_from_json, fp_opt, group_norm, kind_from_sql, or_not_found};
 
@@ -579,12 +579,41 @@ fn reminders_where(conn: &Connection, cond: &str, args: impl rusqlite::Params) -
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// Longest lead of a notification (a day).
+pub const MAX_LEAD_S: i64 = 86_400;
+/// A start offset goes at most this far before the start…
+pub const MIN_OFFSET_S: i64 = -3600;
+/// …and this far after it.
+pub const MAX_OFFSET_S: i64 = 12 * 3600;
+
+fn check_reminder_times(lead_s: i64, offset_s: i64) -> Result<()> {
+    if lead_s != Reminder::SWITCH_LEAD && !(0..=MAX_LEAD_S).contains(&lead_s) {
+        return Err(Error::Other("a reminder's lead is 0 to 24 hours".into()));
+    }
+    if !(MIN_OFFSET_S..=MAX_OFFSET_S).contains(&offset_s) {
+        return Err(Error::Other("a reminder's start offset is −1 to +12 hours".into()));
+    }
+    Ok(())
+}
+
+/// A row's `(lead_s, mode)` as stored: a switch always carries both markers (`mode = 'switch'`
+/// and `lead_s = Reminder::SWITCH_LEAD`), a notification neither (a switch made a note again
+/// gets the default lead), so every reader — `Reminder::switches`, SQL on either column — agrees.
+fn stored_mode(lead_s: i64, mode: ReminderMode) -> (i64, ReminderMode) {
+    match (mode, lead_s) {
+        (ReminderMode::Switch, _) | (_, Reminder::SWITCH_LEAD) => (Reminder::SWITCH_LEAD, ReminderMode::Switch),
+        (ReminderMode::Notify, l) => (l, ReminderMode::Notify),
+    }
+}
+
 /// Insert (unique per channel+start; returns existing id if present; fingerprint computed
-/// inside).
+/// inside). A switch is stored with both markers ([`stored_mode`]).
 pub fn add_reminder(conn: &Connection, r: &Reminder) -> Result<ReminderId> {
     if r.channel.kind != ItemKind::Channel {
         return Err(Error::Other("reminders are for channels only".into()));
     }
+    check_reminder_times(r.lead_s, r.offset_s)?;
+    let (lead_s, mode) = stored_mode(r.lead_s, r.mode);
     let fp = fingerprint_of(conn, &r.channel)?;
     conn.execute(
         "INSERT INTO reminder(source_id, channel_key, channel_name, title, start, stop, lead_s, state, fp, mode, offset_s, open_in, rule_id)
@@ -597,10 +626,10 @@ pub fn add_reminder(conn: &Connection, r: &Reminder) -> Result<ReminderId> {
             r.programme_title,
             r.start,
             r.stop,
-            r.lead_s,
+            lead_s,
             enum_str(&r.state),
             fp_opt(&fp),
-            enum_str(&r.mode),
+            enum_str(&mode),
             r.offset_s,
             r.open_in.as_ref().map(enum_str),
             r.rule_id
@@ -653,19 +682,81 @@ pub fn all_reminders(conn: &Connection) -> Result<Vec<Reminder>> {
     reminders_where(conn, "state = 'pending' ORDER BY start, id", [])
 }
 
-/// Make reminder `id` an automatic switch (DESIGN §30.8): `lead_s` = `Reminder::SWITCH_LEAD`,
-/// pending again. An agent's `schedule_switch` on a programme that already had a notification
-/// reminder (rows are unique per channel + start).
+/// Make reminder `id` an automatic switch (DESIGN §30.8): `mode = 'switch'`, pending again. An
+/// agent's `schedule_switch` on a programme that already had a notification reminder (rows are
+/// unique per channel + start). A rule's reminder detaches from its rule (B6 point 5).
 pub fn set_reminder_switch(conn: &Connection, id: ReminderId) -> Result<()> {
-    if conn.execute("UPDATE reminder SET lead_s = ?2, mode = 'switch', state = 'pending' WHERE id = ?1", params![id, Reminder::SWITCH_LEAD])? == 0 {
-        return Err(sql::not_found("reminder", id));
+    edit_reminder(conn, id, &ReminderEdit { mode: Some(ReminderMode::Switch), ..Default::default() })?;
+    set_reminder_state(conn, id, ReminderState::Pending)
+}
+
+/// A change to one reminder (`None` = unchanged).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReminderEdit {
+    pub lead_s: Option<i64>,
+    pub mode: Option<ReminderMode>,
+    pub offset_s: Option<i64>,
+    /// `Some(None)` = back to the setting.
+    pub open_in: Option<Option<crate::model::OpenIn>>,
+}
+
+/// Edit reminder `id` (Settings ▸ Reminders, MCP `reminders`); returns the row as it is now.
+/// Changing a rule reminder's lead or mode makes it the user's: it detaches from its rule first
+/// (`store::follow::on_reminder_edited`, B6 point 5), so the next evaluation leaves it alone.
+/// A fired reminder whose new time is still ahead is pending again.
+pub fn edit_reminder(conn: &Connection, id: ReminderId, e: &ReminderEdit) -> Result<Reminder> {
+    let Some(old) = reminder(conn, id)? else { return Err(sql::not_found("reminder", id)) };
+    let (old_lead, old_mode) = stored_mode(old.lead_s, old.mode);
+    let mode = e.mode.unwrap_or(old_mode);
+    // a switch made a note again starts from the default lead
+    let lead_s = e.lead_s.unwrap_or(if old_lead == Reminder::SWITCH_LEAD { 0 } else { old_lead });
+    let offset_s = e.offset_s.unwrap_or(old.offset_s);
+    check_reminder_times(lead_s, offset_s)?;
+    let (lead_s, mode) = stored_mode(lead_s, mode);
+    let open_in = e.open_in.unwrap_or(old.open_in);
+    if old.rule_id.is_some() && (lead_s != old_lead || mode != old_mode) {
+        crate::store::follow::on_reminder_edited(conn, id)?;
     }
-    Ok(())
+    conn.execute(
+        "UPDATE reminder SET lead_s = ?2, mode = ?3, offset_s = ?4, open_in = ?5 WHERE id = ?1",
+        params![id, lead_s, enum_str(&mode), offset_s, open_in.as_ref().map(enum_str)],
+    )?;
+    let Some(now_row) = reminder(conn, id)? else { return Err(sql::not_found("reminder", id)) };
+    if now_row.state == ReminderState::Fired && crate::reminders::arming::fire_at(&now_row, 0) > crate::model::now() {
+        set_reminder_state(conn, id, ReminderState::Pending)?;
+        return Ok(Reminder { state: ReminderState::Pending, ..now_row });
+    }
+    Ok(now_row)
 }
 
 /// Pending automatic switches (`Reminder::switches`), soonest first.
 pub fn pending_switches(conn: &Connection) -> Result<Vec<Reminder>> {
-    reminders_where(conn, "state = 'pending' AND (lead_s = ?1 OR mode = 'switch') ORDER BY start, id", [Reminder::SWITCH_LEAD])
+    reminders_where(conn, "state = 'pending' AND (mode = 'switch' OR lead_s = ?1) ORDER BY start, id", [Reminder::SWITCH_LEAD])
+}
+
+/// Pending reminders whose programme overlaps `[from, to)` (clash checks before adding one:
+/// `reminders::clashes_with`).
+pub fn reminders_overlapping(conn: &Connection, from: Timestamp, to: Timestamp) -> Result<Vec<Reminder>> {
+    reminders_where(
+        conn,
+        "state = 'pending' AND start + offset_s < ?2 AND (CASE WHEN stop > start THEN stop ELSE start + ?3 END) > ?1 ORDER BY start, id",
+        params![from, to, crate::reminders::DEFAULT_DURATION_S],
+    )
+}
+
+/// The channel is PIN-locked, by itself or through one of its groups (a Following switch to it
+/// becomes a "needs your PIN" note while the session is locked).
+pub fn channel_locked(conn: &Connection, channel: &ItemRef) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM item_override WHERE source_id = ?1 AND kind = 'channel' AND item_key = ?2 AND locked = 1)
+                 OR EXISTS(SELECT 1 FROM channel c
+                           JOIN channel_group cg ON cg.channel_id = c.id
+                           JOIN grp g ON g.id = cg.group_id
+                           JOIN group_override go ON go.source_id = g.source_id AND go.kind = g.kind AND go.group_key = g.key AND go.locked = 1
+                           WHERE c.source_id = ?1 AND c.key = ?2)",
+        )?
+        .query_row(params![channel.source, channel.key.as_str()], |r| r.get(0))?)
 }
 
 /// One reminder by id (any state), if it exists.
