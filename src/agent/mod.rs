@@ -50,6 +50,20 @@ pub enum AgentCommand {
     /// `multiview` (validated: visible live channels or catch-up, the PIN rules re-applied by
     /// the app; MV-2).
     MultiView(AgentMultiView),
+    /// `guide_fix apply` of more than `guide::CHAT_APPLY_MAX` channels after the user's yes:
+    /// Tuner opens Guide fixes with its confirm card prefilled; Enter applies the batch as
+    /// Claude's (DESIGN §31.5).
+    GuideFixReview(GuideFixReview),
+}
+
+/// A Claude proposal handed to Tuner's confirm card (taken out of the handler's proposals, so
+/// it is applied there or not at all).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GuideFixReview {
+    /// Bound to the guide check it was made from (`store::guide_fix::STALE` otherwise).
+    pub proposal: crate::model::Proposal,
+    /// The card isn't opened after this (the screen wasn't shown in time).
+    pub expires: crate::model::Timestamp,
 }
 
 /// A multi-view request (`multiview` tool, DESIGN §35 §6).

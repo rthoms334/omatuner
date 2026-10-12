@@ -1378,6 +1378,85 @@ fn guide_fixes_round_trip() {
     assert_eq!(w.err("guide_fix", rule), ErrorCode::Unavailable, "TV One has a locked channel and the session is locked");
 }
 
+/// guide_fix: a "yes" to more than 50 channels applies nothing from chat; the whole proposal
+/// goes to Tuner (`AgentCommand::GuideFixReview`, whose confirm card the user confirms with
+/// Enter, tested with the app rig in `src/app.rs`) and is Tuner's from then on. A batch of 50
+/// applies from chat and toasts with its Undo.
+#[test]
+fn guide_fix_batches_over_50_go_to_tuners_confirm_card() {
+    let mut w = World::new(pin_config());
+    w.ui.services()
+        .store
+        .writer()
+        .blocking(|c| {
+            let news: i64 = c.query_row("SELECT id FROM grp WHERE source_id = 1 AND key = 'channel:news'", [], |r| r.get(0))?;
+            for i in 0..55 {
+                let url = format!("http://127.0.0.1/live/more{i}.ts");
+                c.execute(
+                    "INSERT INTO channel(source_id, key, name, clean_name, norm_name, number, stream, url_key, provider_order, added_at, seen_gen)
+                     VALUES (1, ?1, ?2, ?2, lower(?2), ?3, ?4, ?5, ?3, ?3, 1)",
+                    params![format!("m3u:more{i}"), format!("More News {i}"), 100 + i, format!(r#"{{"t":"url","url":"{url}"}}"#), url],
+                )?;
+                c.execute(
+                    "INSERT INTO channel_group(group_id, channel_id, position, is_primary) VALUES (?1, ?2, ?3, 1)",
+                    params![news, c.last_insert_rowid(), 10 + i],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    w.publish(Visibility::NO_EXPLICIT);
+    let propose = |w: &mut World, n: usize| {
+        let changes: Vec<Value> = (0..n).map(|i| json!({ "ref": format!("channel:1:m3u:more{i}"), "shift_min": 15 })).collect();
+        let p = w.ok("guide_fix", json!({ "action": "propose", "changes": changes }));
+        assert_eq!(p["summary"]["channels"].as_u64(), Some(n as u64), "{p}");
+        assert_eq!(p["applies_in_chat"].as_bool(), Some(n <= 50));
+        p["proposal_id"].as_str().unwrap().to_owned()
+    };
+    let drain = |w: &World| w.ui.events.try_iter().collect::<Vec<AppEvent>>();
+    drain(&w);
+
+    let id = propose(&mut w, 55);
+    let out = w.ok("guide_fix", json!({ "action": "apply", "proposal_id": id, "confirm": true }));
+    assert_eq!((out["pending_review"].as_bool(), out["channels"].as_u64()), (Some(true), Some(55)), "{out}");
+    assert!(out["message"].as_str().unwrap().contains("Enter"), "{out}");
+    let events = drain(&w);
+    let reviews: Vec<&tuner::agent::GuideFixReview> = events
+        .iter()
+        .filter_map(|e| match e {
+            AppEvent::Agent(AgentCommand::GuideFixReview(r)) => Some(r),
+            _ => None,
+        })
+        .collect();
+    let [review] = reviews.as_slice() else { panic!("one review: {events:?}") };
+    assert_eq!(review.proposal.changes.len(), 55);
+    assert!(review.proposal.changes.iter().all(|c| c.shift_min == Some(Some(15))));
+    assert_ne!(review.proposal.stamp, [0; 16], "still bound to the guide check it was made from");
+    assert!(review.expires > w.now);
+    assert!(!events.iter().any(|e| matches!(e, AppEvent::Toast(_))), "nothing applied, nothing toasted");
+    let written = |w: &World| tuner::store::guide_fix::recent(&w.ui.services().store.reader().unwrap(), 10).unwrap().len();
+    assert_eq!(written(&w), 0);
+    assert_eq!(w.err("guide_fix", json!({ "action": "apply", "proposal_id": id, "confirm": true })), ErrorCode::NotFound, "Tuner's now");
+
+    let id = propose(&mut w, 50);
+    let done = w.ok("guide_fix", json!({ "action": "apply", "proposal_id": id, "confirm": true }));
+    assert_eq!(done["applied"], 50);
+    assert_eq!(written(&w), 1);
+    let undo = tuner::model::GuideFixLogId(done["undo_id"].as_i64().unwrap());
+    let toasts: Vec<tuner::msg::Toast> = drain(&w)
+        .into_iter()
+        .filter_map(|e| match e {
+            AppEvent::Toast(t) => Some(t),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        toasts.iter().any(|t| t.text == "Claude fixed the guide for 50 channels"
+            && t.action == Some(("Undo".into(), tuner::keymap::Action::UndoGuideFix(Some(undo))))),
+        "{toasts:?}"
+    );
+}
+
 /// multiview: two live pictures are sent to the app; movies stay single view, a future
 /// programme hasn't started, and swap / close need multi-view on.
 #[test]

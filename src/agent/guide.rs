@@ -4,9 +4,11 @@
 //! Guardrails: at most 200 channels per proposal (`store::guide_fix::MAX_BATCH`); a proposal
 //! lives 10 minutes and is bound to the guide check it was made from (applied after a guide
 //! import it is `stale`); more than 50 channels aren't applied from chat (`pending_review`: the
-//! user reviews them in Tuner's Guide fixes); channels needing the PIN now are refused; explicit and hidden channels
-//! don't exist here. Claude undoes only its own batches. Guide channels are named by
-//! `guide:<guide id>:<xmltv id>` refs, never by an address.
+//! proposal goes to Tuner, `AgentCommand::GuideFixReview`, which opens Guide fixes with its
+//! confirm card prefilled, and the user's Enter there applies it as Claude's batch); channels
+//! needing the PIN now are refused; explicit and hidden channels don't exist here. Claude undoes
+//! only its own batches. Guide channels are named by `guide:<guide id>:<xmltv id>` refs, never
+//! by an address.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,20 +21,21 @@ use super::params::{GuideFix, GuideFixAction};
 use super::proto::{AgentRef, ErrorCode, MAX_TEXT, fmt_time, item_ref};
 use super::query::{Fail, Out, Q, channel_ref, clamp, clean, parse_ref, text};
 use super::server::{Inner, to_value};
+use crate::agent::{AgentCommand, GuideFixReview};
 use crate::guide_fix::catalog::Catalog;
 use crate::guide_fix::issues::{ClassifyOpts, IssueRow};
 use crate::model::{
     ChannelId, ChannelSummary, EpgSourceId, FixActor, FixChange, GuideFixLogId, GuideTarget, IssueKind, ItemKey, ItemKind, ItemRef, NowNext,
     Proposal, SourceId, Timestamp,
 };
-use crate::msg::DataScope;
+use crate::msg::{AppEvent, DataScope};
 use crate::store::guide_fix::GuideOpts;
 
 /// How long a proposal can be applied.
 pub const PROPOSAL_TTL_S: i64 = 600;
 /// Proposals kept at once (the oldest goes).
 const LIVE_PROPOSALS: usize = 5;
-/// Channels Claude applies on a "yes"; more go to Tuner's confirm card.
+/// Channels Claude applies on a "yes"; more go to Tuner's confirm card (the user's Enter).
 pub const CHAT_APPLY_MAX: usize = 50;
 
 /// `propose`'s proposals until applied or expired (in the handler).
@@ -487,13 +490,19 @@ pub(super) async fn handle(h: &Arc<Inner>, p: GuideFix) -> Out<Value> {
             let now = crate::model::now();
             let (proposal, channels) = h.proposals.get(&id, now)?;
             if channels > CHAT_APPLY_MAX {
+                // Tuner's confirm card takes it from here (applied there or not at all)
+                h.proposals.take(&id);
+                h.bus.send(AppEvent::Agent(AgentCommand::GuideFixReview(GuideFixReview { proposal, expires: now + PROPOSAL_TTL_S })));
+                crate::platform::hypr::focus_self();
+                tracing::info!("agent: guide_fix apply → {channels} channels to Tuner's confirm card");
                 return to_value(&json!({
                     "pending_review": true,
-                    "message": format!("{channels} channels is more than Claude applies from chat: review Tuner's own suggestions in Guide fixes and apply them there, or propose a narrower batch (a playlist, fewer kinds, a higher min_confidence)."),
+                    "channels": channels,
+                    "message": format!("{channels} channels is more than Claude applies from chat, so Tuner now shows them in a confirm card in Guide fixes: the user presses Enter there to apply them, Esc cancels, Ctrl+Z in Guide fixes undoes. Don't apply this proposal again; if they cancel, propose again or a narrower batch."),
                 }));
             }
             let opts = GuideOpts::from_config(&h.cfg());
-            let label = format!("Claude: {channels} channel{}", if channels == 1 { "" } else { "s" });
+            let label = crate::guide_fix::ui::claude_label(channels);
             let known: Vec<ItemRef> = proposal.changes.iter().filter_map(|c| c.channel.clone()).collect();
             let report = h
                 .write(DataScope::Epg, move |c| match crate::store::guide_fix::apply(c, FixActor::Claude, &label, &proposal, &opts, now) {
@@ -515,6 +524,10 @@ pub(super) async fn handle(h: &Arc<Inner>, p: GuideFix) -> Out<Value> {
                 h.shared.wake_reminders();
             }
             tracing::info!("agent: guide_fix apply → {} channels", report.applied);
+            // the user sees it and can take it back at once (as the confirm card's batch does)
+            if let Some(t) = crate::guide_fix::ui::claude_toast(&report) {
+                h.bus.toast(t);
+            }
             let skipped = report.skipped.clone();
             let skipped = h.run(true, move |q| Ok(skipped_out(q, &skipped, &known))).await?;
             to_value(&json!({

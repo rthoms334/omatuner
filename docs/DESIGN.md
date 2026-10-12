@@ -5313,8 +5313,13 @@ Suggested, No guide. Each row's "why" is a fixed phrase; no URL ever appears.
 ### 31.5 Guardrails
 * The universe is the library snapshot: explicit, hidden and filtered channels follow its
   visibility (counts and coverage too).
-* Claude's batches: at most 200 channels; more than 50 is refused from chat
-  (`pending_review`: the user reviews them in Guide fixes, or Claude proposes a narrower batch);
+* Claude's batches: at most 200 channels; more than 50 isn't applied from chat
+  (`pending_review`): the handler hands the proposal to Tuner (`AgentCommand::GuideFixReview`,
+  the window raised, out of the pop-out), which opens Guide fixes with its confirm card
+  prefilled ("Accept Claude's N fixes?"). Enter applies it as Claude's batch (toast with Undo;
+  `stale` if the guide or a playlist changed meanwhile: nothing applies and the toast says so);
+  Esc drops it, and Claude proposes again or a narrower batch. A batch applied from chat toasts
+  "Claude fixed the guide for N channels" with Undo;
   proposals live 10 minutes and are bound to the stamp; locked channels and rules for a
   playlist with a PIN-locked channel are refused while locked; Claude undoes only its own
   batches.

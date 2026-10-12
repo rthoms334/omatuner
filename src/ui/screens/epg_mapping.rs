@@ -36,7 +36,9 @@ use crate::guide_fix::catalog::Catalog;
 use crate::guide_fix::preview::PreviewRow;
 use crate::guide_fix::ui::{self as gf, Report, kind_label, method_label, offset_text, shift_text};
 use crate::keymap::{Action, KeyContext};
-use crate::model::{ChannelId, EpgSuggestion, FixChange, GuideRules, GuideTarget, IssueKind, ItemKind, ItemRef, NowNext, Proposal, SourceId};
+use crate::model::{
+    ChannelId, EpgSuggestion, FixActor, FixChange, GuideRules, GuideTarget, IssueKind, ItemKind, ItemRef, NowNext, Proposal, SourceId,
+};
 use crate::msg::{AppEvent, DataScope, Toast};
 use crate::store::Ticket;
 use crate::store::guide_fix::{ApplyReport, GuideOpts, LogEntry, LoggedChange};
@@ -75,6 +77,7 @@ const T_ACCEPT: u64 = 0x6766_0001;
 const T_RESET: u64 = 0x6766_0002;
 const T_RULE: u64 = 0x6766_0003;
 const T_USE_ALL: u64 = 0x6766_0004;
+const T_CLAUDE: u64 = 0x6766_0005;
 
 /// Menu choices (`live::choice_action` indexes). `C_KIND + kind` picks an issue kind;
 /// `C_RULE + 2·i (+1)` toggles playlist `i`'s +1 (copies) rule.
@@ -171,6 +174,8 @@ struct Pending {
     proposal: Proposal,
     label: String,
     toast: String,
+    /// Claude's batch over 50 channels (`AgentCommand::GuideFixReview`), else the user's.
+    actor: FixActor,
 }
 
 type PreviewKey = (ChannelId, FixChange);
@@ -540,8 +545,20 @@ impl EpgMappingScreen {
             .filter_map(|c| c.channel.as_ref())
             .filter(|r| ctx.lib.live.by_ref(r).and_then(|id| ctx.lib.live.get(id)).is_some_and(|c| c.locked))
             .count();
-        let mut body =
-            format!("{} · {} · {} locked", plural(maps, "guide channel", "guide channels"), plural(shifts, "time shift", "time shifts"), locked);
+        let claude = pending.actor == FixActor::Claude;
+        let mut body = String::new();
+        if claude {
+            body.push_str("Claude proposed these in chat.\n");
+        }
+        body.push_str(&format!(
+            "{} · {} · {} locked",
+            plural(maps, "guide channel", "guide channels"),
+            plural(shifts, "time shift", "time shifts"),
+            locked
+        ));
+        if !pending.proposal.rules.is_empty() {
+            body.push_str(&format!(" · {}", plural(pending.proposal.rules.len(), "playlist rule", "playlist rules")));
+        }
         body.push_str("\n\n");
         for (c, p) in changes.iter().zip(previews.iter()).take(CONFIRM_LINES) {
             let name = c.channel.as_ref().and_then(|r| ctx.lib.live.by_ref(r)).and_then(|id| ctx.lib.live.get(id)).map(|c| c.name.to_string());
@@ -554,7 +571,7 @@ impl EpgMappingScreen {
         body.push_str("\nUndo: Ctrl+Z in Guide fixes");
         let n = changes.len();
         ctx.open(OverlayRequest::Confirm(ConfirmSpec {
-            title: format!("Accept {} fixes?", rows::grouped(n)),
+            title: if claude { format!("Accept Claude's {} fixes?", rows::grouped(n)) } else { format!("Accept {} fixes?", rows::grouped(n)) },
             body,
             confirm_label: format!("Accept {}", rows::grouped(n)),
             destructive: false,
@@ -664,10 +681,33 @@ impl EpgMappingScreen {
     // ------------------------------------------------------------------ writes
 
     fn apply(&mut self, ctx: &mut UiCtx<'_>, proposal: Proposal, label: String, toast: String) {
+        self.apply_as(ctx, FixActor::You, proposal, label, toast);
+    }
+
+    fn apply_as(&mut self, ctx: &mut UiCtx<'_>, actor: FixActor, proposal: Proposal, label: String, toast: String) {
         self.flush_adjust(ctx);
         // this write may change the shifts the last flush wrote
         self.written.1.clear();
-        self.writing = Some(gf::submit_apply(ctx.services, label, toast, proposal, Self::opts(ctx), ctx.now));
+        self.writing = Some(gf::submit_apply(ctx.services, actor, label, toast, proposal, Self::opts(ctx), ctx.now));
+    }
+
+    /// Claude's batch over 50 channels (`AgentCommand::GuideFixReview`): the confirm card,
+    /// prefilled like Shift+Enter's (DESIGN §31.5). It waits while another card is open.
+    fn pump_review(&mut self, ctx: &mut UiCtx<'_>) {
+        if self.confirm.is_some() || self.confirm_loader.is_some() {
+            return;
+        }
+        let Some(r) = gf::take_review() else { return };
+        if r.expires <= ctx.now {
+            ctx.toast(Toast::info("Claude's guide fixes waited too long — ask Claude to propose them again"));
+            return;
+        }
+        let n = r.proposal.changes.len();
+        let changes = r.proposal.changes.clone();
+        let pending =
+            Pending { token: T_CLAUDE, proposal: r.proposal, label: gf::claude_label(n), toast: gf::claude_fixed_text(n), actor: FixActor::Claude };
+        let now = ctx.now;
+        self.confirm_loader = Some((pending, Loader::start(ctx, move |c| crate::guide_fix::preview::preview(c, &changes, now))));
     }
 
     /// Shift+Enter / double-click / "Accept": one channel at once, more after the card.
@@ -688,6 +728,7 @@ impl EpgMappingScreen {
                     proposal: Proposal { changes: changes.clone(), ..Default::default() },
                     label: format!("Accepted {n} fixes"),
                     toast: format!("Fixed the guide of {} channels", rows::grouped(n)),
+                    actor: FixActor::You,
                 };
                 let now = ctx.now;
                 self.confirm_loader = Some((pending, Loader::start(ctx, move |c| crate::guide_fix::preview::preview(c, &changes, now))));
@@ -742,6 +783,7 @@ impl EpgMappingScreen {
                     proposal: Proposal { changes, ..Default::default() },
                     label: format!("Reset {n} channels"),
                     toast: format!("{} channels back to automatic", rows::grouped(n)),
+                    actor: FixActor::You,
                 });
             }
         }
@@ -902,7 +944,8 @@ impl EpgMappingScreen {
         if a.delta != 0 {
             self.written = (ctx.lib.generation, a.targets.iter().map(|(c, b)| (*c, b + a.delta)).collect());
         }
-        self.writing = Some(gf::submit_apply(ctx.services, label, toast, Proposal { changes, ..Default::default() }, Self::opts(ctx), ctx.now));
+        self.writing =
+            Some(gf::submit_apply(ctx.services, FixActor::You, label, toast, Proposal { changes, ..Default::default() }, Self::opts(ctx), ctx.now));
     }
 
     fn adj_rows(&self, ctx: &UiCtx<'_>) -> Vec<Adj> {
@@ -964,6 +1007,7 @@ impl EpgMappingScreen {
             proposal: Proposal { rules: vec![(src, rules)], ..Default::default() },
             label: "Playlist catch-up offset".into(),
             toast: format!("{name}: catch-up offset {}", offset_text(off)),
+            actor: FixActor::You,
         });
     }
 
@@ -1012,6 +1056,7 @@ impl EpgMappingScreen {
             proposal: Proposal { rules: vec![(src, new)], ..Default::default() },
             label: format!("Rule “{rule}” {}", if on { "off" } else { "on" }),
             toast: format!("{name}: “{rule}” {}", if on { "off" } else { "on" }),
+            actor: FixActor::You,
         });
     }
 
@@ -1493,9 +1538,12 @@ impl Screen for EpgMappingScreen {
             },
             OverlayResult::Confirmed(token) => {
                 if let Some(p) = self.confirm.take().filter(|p| p.token == token) {
-                    self.apply(ctx, p.proposal, p.label, p.toast);
+                    self.apply_as(ctx, p.actor, p.proposal, p.label, p.toast);
                     if token == T_ACCEPT || token == T_RESET {
                         self.after_write();
+                    } else if token == T_CLAUDE {
+                        self.marks.clear();
+                        self.preview = None;
                     }
                 }
             }
@@ -1516,6 +1564,7 @@ impl Screen for EpgMappingScreen {
         self.pump_report(ctx);
         self.pump_recent(ctx);
         self.pump_writing(ctx);
+        self.pump_review(ctx);
         self.pump_confirm(ctx);
         let scope = Scope::current(ctx, ScopeKind::Live).filter();
         if scope != self.scope {
