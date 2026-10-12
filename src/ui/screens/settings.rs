@@ -44,7 +44,8 @@ use eframe::egui::{self, RichText};
 
 use super::home::kit::{self, Loader};
 use crate::config::{
-    Config, CopyOrder, Density, IdleInhibitMode, PlaylistOnCards, PopoutCorner, PopoutSize, SameTitle, SidebarMode, StartScreen, SubtitleAuto,
+    Config, CopyOrder, Density, IdleInhibitMode, LiveOpensOn, PlaylistOnCards, PopoutCorner, PopoutSize, SameTitle, SidebarMode, StartScreen,
+    SubtitleAuto,
 };
 use crate::jobs::{JobEvent, JobKind, JobOutcome, Submitted};
 use crate::keymap::{Action, KeyContext};
@@ -270,12 +271,12 @@ static PLAYER_TEXT: [CfgText; 4] = [
     },
 ];
 
-static IFACE_C: [CfgChoice; 9] = [
+static IFACE_C: [CfgChoice; 10] = [
     CfgChoice {
         label: "Start screen",
-        options: &["Auto", "Home", "Live TV", "Guide", "Last used"],
-        get: |c| pos(&[StartScreen::Auto, StartScreen::Home, StartScreen::Live, StartScreen::Guide, StartScreen::Last], &c.general.start_screen),
-        set: |c, i| c.general.start_screen = [StartScreen::Auto, StartScreen::Home, StartScreen::Live, StartScreen::Guide, StartScreen::Last][i],
+        options: &["Home", "Live TV", "Guide", "Last used"],
+        get: |c| pos(&START_SCREEN, &c.general.start_screen),
+        set: |c, i| c.general.start_screen = START_SCREEN[i],
     },
     CfgChoice {
         label: "Sidebar",
@@ -325,7 +326,16 @@ static IFACE_C: [CfgChoice; 9] = [
         get: |c| pos(&PLAYLIST_ON_CARDS, &c.interface.playlist_on_cards),
         set: |c, i| c.interface.playlist_on_cards = PLAYLIST_ON_CARDS[i],
     },
+    // the first time in a session, without a group asked for (DESIGN §13.2)
+    CfgChoice {
+        label: "Live TV opens on",
+        options: &["All channels", "Favourites"],
+        get: |c| pos(&LIVE_OPENS_ON, &c.interface.live_opens_on),
+        set: |c, i| c.interface.live_opens_on = LIVE_OPENS_ON[i],
+    },
 ];
+const START_SCREEN: [StartScreen; 4] = [StartScreen::Home, StartScreen::Live, StartScreen::Guide, StartScreen::Last];
+const LIVE_OPENS_ON: [LiveOpensOn; 2] = [LiveOpensOn::AllChannels, LiveOpensOn::Favourites];
 const PLAYLIST_ON_CARDS: [PlaylistOnCards; 3] = [PlaylistOnCards::Auto, PlaylistOnCards::Always, PlaylistOnCards::Never];
 const SAME_TITLE: [SameTitle; 2] = [SameTitle::Combine, SameTitle::ShowEach];
 const COPY_ORDER: [CopyOrder; 2] = [CopyOrder::PlaylistOrder, CopyOrder::BestQuality];
@@ -1199,7 +1209,9 @@ impl SettingsScreen {
             }
             SettingsPage::Interface => {
                 v.push(Row::Section("Layout".into()));
-                v.extend(IFACE_C[..3].iter().map(Row::Choice));
+                v.push(Row::Choice(&IFACE_C[0]));
+                v.push(Row::Choice(&IFACE_C[9]));
+                v.extend(IFACE_C[1..3].iter().map(Row::Choice));
                 v.push(Row::Number(&IFACE_N[2]));
                 v.extend(IFACE_T[..2].iter().map(Row::Toggle));
                 v.push(Row::Toggle(&IFACE_T[12]));
@@ -4437,9 +4449,9 @@ mod tests {
         assert_eq!((PLAYER_N[0].get)(&c), 25.0);
         (IFACE_N[2].set)(&mut c, 1.25);
         assert_eq!(c.interface.ui_scale, 1.25);
-        (IFACE_C[0].set)(&mut c, 4);
+        (IFACE_C[0].set)(&mut c, 3);
         assert_eq!(c.general.start_screen, StartScreen::Last);
-        assert_eq!((IFACE_C[0].get)(&c), 4);
+        assert_eq!((IFACE_C[0].get)(&c), 3);
         (PLAYER_TEXT[3].set)(&mut c, "profile=fast; cache = yes; junk".into());
         assert_eq!(c.player.mpv_options.get("cache").map(String::as_str), Some("yes"));
         assert_eq!(c.player.mpv_options.len(), 2);

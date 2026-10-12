@@ -2656,8 +2656,8 @@ fn agent_card_may_show(g: CardGate) -> bool {
     g.onboarded && !g.busy && !g.player && !g.fullscreen && !g.popped_out && !g.multiview && !g.typing && !g.agents_page
 }
 
-/// First route: CLI view → no sources ⇒ onboarding → configured start screen. `Auto` = Live
-/// until the user has favourites or history, then Home. Two tiny indexed queries (< 1 ms).
+/// First route: CLI view → no sources ⇒ onboarding → configured start screen (Home by
+/// default). One tiny indexed query (< 1 ms).
 fn start_route(cfg: &Config, initial: &IpcRequest, db: &rusqlite::Connection) -> Route {
     if let Some(v) = initial.view {
         return route_for_view(v);
@@ -2672,13 +2672,6 @@ fn start_route(cfg: &Config, initial: &IpcRequest, db: &rusqlite::Connection) ->
         S::Live => Route::Live { group: None, channel: None },
         S::Guide => Route::Guide { collection: None, focus: None },
         S::Last => cfg.interface.last_screen.as_deref().and_then(route_for_view_name).unwrap_or(Route::Home),
-        S::Auto => {
-            if exists("SELECT EXISTS(SELECT 1 FROM fav_item) OR EXISTS(SELECT 1 FROM history)") {
-                Route::Home
-            } else {
-                Route::Live { group: None, channel: None }
-            }
-        }
     }
 }
 
@@ -4993,12 +4986,10 @@ mod tests {
         assert_eq!(start_route(&cfg, &none, &db), Route::Onboarding(OnboardingStart::Welcome));
         assert_eq!(start_route(&cfg, &live(), &db), Route::Live { group: None, channel: None }, "--view wins");
         store.writer().blocking(|c| seed_channels(c, 1, None)).unwrap();
-        assert_eq!(start_route(&cfg, &none, &db), Route::Live { group: None, channel: None }, "Auto without history");
-        store
-            .writer()
-            .blocking(|c| Ok(c.execute("INSERT INTO history(source_id, kind, item_key, title, at) VALUES (1, 'channel', 'm3u:ch0', 'C', 1)", [])?))
-            .unwrap();
-        assert_eq!(start_route(&cfg, &none, &db), Route::Home, "Auto with history");
+        assert_eq!(start_route(&cfg, &none, &db), Route::Home, "Home by default, even with no favourites or history");
+        // the old "auto" (Live TV until favourites or history) in a config or backup → Home
+        let old: Config = toml::from_str("[general]\nstart_screen = \"auto\"\n").unwrap();
+        assert_eq!(start_route(&old, &none, &db), Route::Home);
         let mut c = cfg.clone();
         c.general.start_screen = crate::config::StartScreen::Guide;
         assert_eq!(start_route(&c, &none, &db), Route::Guide { collection: None, focus: None });

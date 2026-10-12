@@ -1,14 +1,14 @@
 //! TV Guide (DESIGN §13.4): header (clickable collection picker "Favourites ▾", ‹ day ›, Now) +
 //! `epg_grid` + optional preview strip (Wide, config `guide_preview`). Default collection: the
-//! first non-empty favourites list, else the last-used group. Enter → programme popover; `r`
+//! last-used one, else like Live TV's (Settings ▸ Interface ▸ Live TV opens on) All channels,
+//! or the first favourites list with channels (All channels without one). Enter → programme popover; `r`
 //! toggles a reminder; digits jump to a channel number (`[NumericEntry, Guide]`); click on the
 //! channel column = watch; returning from the player focuses the channel just watched
 //! (UHF 1.96). Keeps the focused cell clear of `ctx.mini_rect`. The focused channel is
 //! managed as in Live (Ctrl+F / Ctrl+Shift+F / Ctrl+I / F2 / Ctrl+H / Ctrl+L, Shift+F10 menu).
 //! Owner: WP-11.
 //!
-//! "Last-used group": the collection picked in the guide this session; without one, the group
-//! of the channel playing (or All channels).
+//! "Last-used": the collection picked in the guide this session.
 //!
 //! Several playlists with channels (DESIGN §29): the guide shows Live TV's playlist scope — a
 //! `● TV 2 ▾` button before the collection picker (Alt+P, Ctrl+PgDn/PgUp) — and its collections,
@@ -26,8 +26,9 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Rect, RichText};
 
+use crate::config::LiveOpensOn;
 use crate::keymap::{Action, KeyContext};
-use crate::model::{ChannelId, Collection, MediaRef, PlayOrigin, Reminder, SortMode, Timestamp};
+use crate::model::{ChannelId, Collection, ItemKind, ItemRef, MediaRef, PlayOrigin, Reminder, SortMode, Timestamp};
 use crate::msg::{AppEvent, DataScope, Toast};
 use crate::player::{PlayRequest, PlayerCommand, PlayerSnapshot, PlayerState};
 use crate::theme::{SpaceToken, TypeToken};
@@ -98,16 +99,14 @@ impl GuideScreen {
         if let Some(c) = self.collection.clone().filter(|c| self.valid(ctx, c)) {
             return c;
         }
-        if let Some(l) = ctx.favs.non_empty_lists().next() {
-            return Collection::Favourites(l.id);
+        if ctx.config.interface.live_opens_on == LiveOpensOn::AllChannels {
+            return Collection::AllChannels;
         }
-        // the group of what plays (in scope), else everything
-        let scope = Self::scope(ctx).filter();
-        playing_channel(ctx.player)
-            .and_then(|id| ctx.lib.live.get(id))
-            .filter(|c| scope.admits(c.source_id))
-            .and_then(|c| c.group_ids.first().copied())
-            .map_or(Collection::AllChannels, Collection::Group)
+        // as Live's Favourites rows count: channels in scope parental control doesn't hide
+        // (lists may hold movies and other playlists'), else All channels
+        let mine = Self::scope(ctx).filter().for_user_list();
+        let shown = |r: &ItemRef| r.kind == ItemKind::Channel && mine.admits(r.source) && !ctx.lib.conceals(r);
+        ctx.favs.lists.iter().find(|l| ctx.favs.items(l.id).iter().any(shown)).map_or(Collection::AllChannels, |l| Collection::Favourites(l.id))
     }
 
     fn valid(&self, ctx: &UiCtx<'_>, c: &Collection) -> bool {
