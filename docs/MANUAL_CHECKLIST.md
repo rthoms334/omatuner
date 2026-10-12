@@ -1535,6 +1535,11 @@ quit it and remove the `checked_version` line under `[agents]` in
   Codex makes it *Connect 2 agents*; unticking both disables it. Connect runs them one after the
   other with a toast each. Mouse: clicking the rows ticks them; the buttons work; a click outside
   the card is *Not now*.
+- [ ] **Already connected:** with Claude Code connected and Codex found but not connected, clear
+  `checked_version` and start. **Expect:** *Connect Codex to Tuner?* with a line "✓ Claude Code
+  already connected" above *Don't ask again*; only Codex is offered. Tab, the arrows and clicks
+  never land on that line. Same with Gemini CLI also found: the line sits above the Codex and
+  Gemini CLI ticks.
 - [ ] **Keyboard and help on the card:** **Expect:** `?` shows the dialog keys; ↑/↓/Tab move,
   Enter on a tick toggles it; during Connect, Enter or Esc hides the card and the toast still
   arrives.

@@ -767,7 +767,7 @@ mod tests {
                 .on_fail(&["codex", "mcp", "get"], 1, "", "Error: No MCP server named 'tuner' found.")
         };
         let (r, out) = pass(fake(), AgentsConfig::default());
-        assert_eq!(out, Some(PassOutcome::Offer(super::super::Offer { agents: vec![AgentId::Codex] })));
+        assert_eq!(out, Some(PassOutcome::Offer(super::super::Offer { agents: vec![AgentId::Codex], connected: vec![AgentId::Claude] })));
         assert!(r.fake.lines().contains(&"claude plugin update --json omatuner@omatuner".to_owned()));
         assert_eq!(r.toasts(), [(ToastKind::Success, "Updated Tuner's plugin in Claude Code to 0.2.3 — restart Claude Code to apply".into())]);
 
