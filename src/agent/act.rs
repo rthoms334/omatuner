@@ -5,13 +5,18 @@
 //! MCP-app track.
 
 use super::proto::{
-    AgentRef, Airing, CancelSwitch, ErrorCode, MultiviewStatusOut, NowPlayingOut, OpenedIn, Play, PlayOut, PlayOutcome, PlayerStateOut, QueueNextOut,
-    QueueStatusOut, ScheduleSwitch, SleepOut, StatusOut, StreamsOut, SwitchOut, TileName, TileOut, fmt_time, item_ref,
+    AgentRef, Airing, CancelSwitch, CastDeviceOut, CastDevicesOut, CastingOut, ErrorCode, MultiviewStatusOut, NowPlayingOut, OpenedIn, Play, PlayOut,
+    PlayOutcome, PlayerStateOut, QueueNextOut, QueueStatusOut, ScheduleSwitch, SleepOut, StatusOut, StreamsOut, SwitchOut, TileName, TileOut,
+    fmt_time, item_ref,
 };
 use super::query::{Fail, Out, Q, channel_ref, clean, parse_ref, when};
 use super::{AgentCommand, AgentPlay, PlayTarget};
+use crate::cast::firewall::FirewallState;
+use crate::cast::{Device, Pairing, Protocol};
 use crate::jobs::JobKind;
-use crate::model::{ItemKind, MediaRef, OpenIn, PlayableKind, Reminder, ReminderId, ReminderState, VodKind};
+use crate::model::{
+    CastErrorKind, CastPhase, DeviceId, ItemKind, MediaRef, OpenIn, PlayableKind, ReceiverKind, Reminder, ReminderId, ReminderState, VodKind,
+};
 use crate::player::{PlayerErrorKind, PlayerSnapshot, PlayerState};
 use crate::reminders::ui::{Placement, WindowNow};
 
@@ -109,6 +114,199 @@ pub fn open_in_name(o: OpenIn) -> &'static str {
     }
 }
 
+// ------------------------------------------------------------------ casting (DESIGN §40 §12)
+
+/// The ref `cast_devices` hands out for a TV: `device:<32 hex>` (opaque; no address in it).
+pub fn device_ref(id: DeviceId) -> String {
+    format!("device:{id}")
+}
+
+/// `play {device}`'s TV among `devices`: its `device:<hex>` ref, or its exact name (case
+/// ignored; a name two TVs share is refused, the ref tells them apart). `not_found` never says
+/// which of the two was wrong.
+pub fn resolve_device(devices: &[Device], asked: &str) -> Out<Device> {
+    let asked = asked.trim();
+    let no_tv = || Fail::new(ErrorCode::NotFound, "No such TV in Tuner (pass back a ref cast_devices returned, or its exact name)");
+    if let Some(hex) = asked.strip_prefix("device:") {
+        let id = hex.parse::<DeviceId>().map_err(|_| Fail::bad("not a device ref: pass back a `ref` cast_devices returned"))?;
+        return devices.iter().find(|d| d.id == id).cloned().ok_or_else(no_tv);
+    }
+    let mut named = devices.iter().filter(|d| d.name.eq_ignore_ascii_case(asked));
+    match (named.next(), named.next()) {
+        (Some(d), None) => Ok(d.clone()),
+        (Some(_), Some(_)) => Err(Fail::bad("more than one TV has that name: pass its ref from cast_devices")),
+        _ => Err(no_tv()),
+    }
+}
+
+/// A receiver kind as the tools name it (the design's names; the model's own serde names differ
+/// for `AirPlayTv`).
+pub fn kind_name(k: ReceiverKind) -> &'static str {
+    match k {
+        ReceiverKind::AppleTv => "apple_tv",
+        ReceiverKind::AirPlayTv => "airplay_tv",
+        ReceiverKind::Chromecast => "chromecast",
+        ReceiverKind::Dlna => "dlna",
+    }
+}
+
+/// `cast_devices`: the registry as an agent sees it; no address. `casting`: the TV the picture
+/// plays on now.
+pub fn cast_devices(devices: &[Device], casting: Option<DeviceId>) -> CastDevicesOut {
+    CastDevicesOut {
+        devices: devices
+            .iter()
+            .map(|d| CastDeviceOut {
+                device_ref: device_ref(d.id),
+                name: clean(&d.name),
+                kind: kind_name(d.kind).into(),
+                paired: !matches!(d.pairing, Pairing::Required),
+                available: d.available,
+                experimental: d.experimental,
+                casting: casting == Some(d.id),
+            })
+            .collect(),
+    }
+}
+
+/// What lets a cast to a TV start (`cast_gate`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CastGate {
+    Go,
+    /// The TV isn't paired: say so (an outcome, not an error). Agents never pair.
+    PairingRequired,
+    /// `unavailable` with this typed reason.
+    Refused(&'static str),
+}
+
+/// `multiview-on`: two pictures are on, and casting needs one (DESIGN §40 §5.5).
+pub const REASON_MULTIVIEW: &str = "multiview-on";
+
+/// Whether a cast to `d` can start now, before the item is looked at (DESIGN §40 §12): multi-view
+/// is off, the TV is one Phase 1 casts to (an Apple-made or third-party AirPlay TV that isn't a
+/// Mac, nor "Same Home only"), it is paired, Tuner has seen it, and the firewall isn't known to
+/// block the port. `firewall`: the latest detection's state, only when it was made toward a
+/// network (an unknown one blocks nothing here: the session's own check still reports it).
+pub fn cast_gate(d: &Device, multiview: bool, firewall: Option<FirewallState>) -> CastGate {
+    let phase_one = d.protocol == Protocol::AirPlay && matches!(d.kind, ReceiverKind::AppleTv | ReceiverKind::AirPlayTv);
+    if multiview {
+        CastGate::Refused(REASON_MULTIVIEW)
+    } else if !phase_one || !d.selectable() {
+        CastGate::Refused(CastErrorKind::Unsupported.reason())
+    } else if d.pairing == Pairing::Required {
+        CastGate::PairingRequired
+    } else if !d.available {
+        CastGate::Refused(CastErrorKind::Unreachable.reason())
+    } else if matches!(firewall, Some(FirewallState::Blocked { .. })) {
+        CastGate::Refused(CastErrorKind::Firewall.reason())
+    } else {
+        CastGate::Go
+    }
+}
+
+/// The one fixed sentence of a refusal (no device or provider text, DESIGN §30.6); the typed
+/// reason leads, as `unavailable: casting` does for `control`.
+pub fn refusal(reason: &str) -> Fail {
+    let why = match reason {
+        REASON_MULTIVIEW => "multi-view is on; casting needs a single picture (close multi-view first)",
+        "cast-unsupported" => "Tuner can't cast to that TV",
+        "cast-unreachable" => "the TV isn't answering; check that it is on and on the same network",
+        "cast-firewall" => {
+            "the firewall blocks the TV from reaching Tuner; the user can press Allow on firewall in Tuner (Settings ▸ Cast ▸ Network)"
+        }
+        _ => "casting isn't possible now",
+    };
+    Fail::new(ErrorCode::Unavailable, format!("{reason}: {why}"))
+}
+
+/// A `play` that was decided to go to a TV: casting instead of playing here (DESIGN §40 §12).
+/// The window stays where it is: nothing pops out or is raised (`AgentShow::IN_PLACE`), except
+/// for the PIN, which is typed in Tuner's window, so that prompt raises it as for any play, and
+/// nothing is cast before the unlock. The result says `opened_in: device` and names the TV.
+pub fn for_device(command: &mut AgentCommand, out: &mut PlayOut, d: &Device) {
+    let AgentCommand::Play(play) = command else { return };
+    play.device = Some(d.id);
+    out.device = Some(clean(&d.name));
+    if out.outcome == PlayOutcome::PinRequired {
+        out.message = clean(&format!("{} It will play on {}.", out.message, d.name));
+        return;
+    }
+    play.show = AgentShow::IN_PLACE;
+    let resume = out.resume_at_min.map(|m| format!(" It resumes from {m} min.")).unwrap_or_default();
+    out.message = clean(&format!("Casting {} to {}.{resume}", out.title, d.name));
+    out.outcome = PlayOutcome::CastingStarted;
+    out.opened_in = Some(OpenedIn::Device);
+}
+
+/// The reply to a `play {device}` for an unpaired TV: nothing was sent.
+pub fn pairing_required(out: &PlayOut, d: &Device) -> PlayOut {
+    PlayOut {
+        outcome: PlayOutcome::PairingRequired,
+        message: clean(&format!("Pair {} in Tuner first (Settings ▸ Cast).", d.name)),
+        opened_in: None,
+        device: Some(clean(&d.name)),
+        ..out.clone()
+    }
+}
+
+/// What the cast service remembers of the last cast: `status.casting` once the cast ended
+/// (`CastApi::last_error`, `CastApi::diagnose().device`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CastLast {
+    pub error: Option<CastErrorKind>,
+    /// The TV last cast to: its id, name and kind.
+    pub device: Option<(DeviceId, String, ReceiverKind)>,
+}
+
+/// `status.casting` (DESIGN §40 §12): the TV the picture plays on, and the typed reason of the
+/// failure, so that an agent can explain it while Tuner is out of sight (§3.8). `error`: the
+/// player's own cast error when it shows one, else the service's last one once the session was
+/// lost. A cast that ended without the user asking (stopped from the TV's remote) leaves no
+/// casting picture; while nothing plays here, the TV last cast to and the reason stay.
+pub fn casting_out(snap: &PlayerSnapshot, last: &CastLast) -> Option<CastingOut> {
+    let cast_kind = |k: PlayerErrorKind| if let PlayerErrorKind::Cast(c) = k { Some(c) } else { None };
+    let shown = match &snap.state {
+        PlayerState::Error(e) => cast_kind(e.kind),
+        PlayerState::Reconnecting { reason, .. } => cast_kind(*reason),
+        _ => None,
+    };
+    let idle = matches!(snap.state, PlayerState::Idle | PlayerState::Ended);
+    let out = |id: DeviceId, name: &str, kind, phase, behind_live_s, error: Option<CastErrorKind>| CastingOut {
+        device_ref: device_ref(id),
+        device: clean(name),
+        kind: kind_name(kind).into(),
+        phase,
+        behind_live_s,
+        error: error.map(|e| e.reason().into()),
+    };
+    match (&snap.cast, &last.device) {
+        (Some(v), _) => Some(out(v.device, &v.name, v.kind, v.phase, v.behind_live_s, shown.or(last.error.filter(|_| v.phase == CastPhase::Lost)))),
+        (None, Some((id, name, kind))) if idle || shown.is_some() => {
+            let error = shown.or(last.error)?;
+            Some(out(*id, name, *kind, CastPhase::Lost, None, Some(error)))
+        }
+        _ => None,
+    }
+}
+
+/// What `control` refuses because of the TV (DESIGN §40 §12): the picture is on it, so there is no
+/// window to move (`popout`, `window`: `unavailable: casting`), the volume is the TV's own
+/// (`volume`, `mute`, `unmute`: `unsupported` on a receiver without one, AirPlay), and
+/// `stop_casting` / `play_here` need a cast.
+pub fn cast_control_guard(action: super::proto::ControlAction, cast: Option<&crate::model::CastView>) -> Option<Fail> {
+    use super::proto::ControlAction as A;
+    match (action, cast) {
+        (A::Popout | A::Window, Some(_)) => {
+            Some(Fail::new(ErrorCode::Unavailable, "casting: the picture is on the TV; stop casting or play here first"))
+        }
+        (A::Volume | A::Mute | A::Unmute, Some(v)) if !v.volume => {
+            Some(Fail::new(ErrorCode::Unsupported, "Volume is the TV's: use its remote while casting to it"))
+        }
+        (A::StopCasting | A::PlayHere, None) => Some(Fail::new(ErrorCode::Unavailable, "Nothing is being cast")),
+        _ => None,
+    }
+}
+
 /// What `play` decided.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlayStep {
@@ -148,6 +346,7 @@ pub fn plan_play(q: &Q, p: &Play) -> Out<PlayStep> {
                         resume_at_min: None,
                         message,
                         opened_in: None,
+                        device: None,
                     },
                 ))
             };
@@ -172,6 +371,7 @@ pub fn plan_play(q: &Q, p: &Play) -> Out<PlayStep> {
                             resume_at_min: None,
                             message: if locked { pin(&c.name) } else { format!("Switched to {} for {}.{live_only}", c.name, prog.title) },
                             opened_in: None,
+                            device: None,
                         },
                     ))
                 }
@@ -190,6 +390,7 @@ pub fn plan_play(q: &Q, p: &Play) -> Out<PlayStep> {
                         resume_at_min: None,
                         message: if locked { pin(&c.name) } else { format!("Playing {}.", c.name) },
                         opened_in: None,
+                        device: None,
                     },
                 ))
             }
@@ -217,6 +418,7 @@ pub fn plan_play(q: &Q, p: &Play) -> Out<PlayStep> {
                         resume_at_min: resume.filter(|_| !locked),
                         message,
                         opened_in: None,
+                        device: None,
                     },
                 ))
             }
@@ -235,6 +437,7 @@ pub fn plan_play(q: &Q, p: &Play) -> Out<PlayStep> {
                             resume_at_min: None,
                             message: pin(&v.name),
                             opened_in: None,
+                            device: None,
                         },
                     ));
                 }
@@ -262,6 +465,7 @@ pub fn plan_play(q: &Q, p: &Play) -> Out<PlayStep> {
                             title,
                             resume_at_min: None,
                             opened_in: None,
+                            device: None,
                         },
                     ));
                 }
@@ -281,7 +485,15 @@ fn episode_step(q: &Q, ep: &crate::model::Episode, series: &str, from_start: boo
     };
     Ok(PlayStep::Ready {
         command: AgentCommand::Play(AgentPlay { target, from_start, show: AgentShow::window(true), device: None }),
-        out: clean_play(PlayOut { outcome: PlayOutcome::Playing, item: out.item, title, resume_at_min: resume, message, opened_in: None }),
+        out: clean_play(PlayOut {
+            outcome: PlayOutcome::Playing,
+            item: out.item,
+            title,
+            resume_at_min: resume,
+            message,
+            opened_in: None,
+            device: None,
+        }),
         log_ref: log_ref.to_owned(),
     })
 }
@@ -396,6 +608,8 @@ pub struct StatusMore {
     /// Picture B's snapshot, while it exists.
     pub tile_b: Option<std::sync::Arc<PlayerSnapshot>>,
     pub sleep: Option<crate::reminders::sleep::SleepStatus>,
+    /// `status.casting` ([`casting_out`]).
+    pub casting: Option<CastingOut>,
 }
 
 /// [`status`] with Up next, multi-view, the playlists' streams and the sleep timer.
@@ -449,6 +663,7 @@ pub fn status_with(q: &Q, snap: &PlayerSnapshot, more: &StatusMore) -> Out<Statu
         })
         .collect();
     out.sleep_timer = more.sleep.map(|s| sleep_out(&s));
+    out.casting = more.casting.clone();
     Ok(out)
 }
 
@@ -540,6 +755,7 @@ pub fn status(q: &Q, snap: &PlayerSnapshot) -> Out<StatusOut> {
         multiview: None,
         streams: Vec::new(),
         sleep_timer: None,
+        casting: None,
     })
 }
 
@@ -616,5 +832,184 @@ mod tests {
         assert_eq!(opened_in(in_place, WindowNow { popped_out: true, ..away }), OpenedIn::Popout);
         assert_eq!(opened_in(in_place, away), OpenedIn::Window);
         assert_eq!(opened_in(kept, fullscreen), OpenedIn::Window);
+    }
+
+    fn tv(name: &str, pairing: Pairing) -> Device {
+        Device { pairing, ..Device::new(DeviceId::derive("airplay", name), name, ReceiverKind::AppleTv, Protocol::AirPlay) }
+    }
+
+    /// DESIGN §40 §12: what stops a cast before the item is looked at, in the order an agent
+    /// can act on it: multi-view, a TV Phase 1 can't cast to, pairing, a TV not seen, a blocked
+    /// firewall. An unknown firewall blocks nothing here.
+    #[test]
+    fn a_cast_is_gated_in_the_order_an_agent_can_act_on() {
+        use crate::cast::Usability;
+        use crate::cast::firewall::UnknownWhy;
+        let paired = tv("Living Room", Pairing::Paired(crate::cast::PairVariant::Hkp3));
+        let blocked = Some(FirewallState::Blocked { shadowed: false });
+        let mac = Device { usability: Usability::Mac, ..paired.clone() };
+        let home_only = Device { usability: Usability::HomeOnly, ..paired.clone() };
+        let chromecast = Device { kind: ReceiverKind::Chromecast, protocol: Protocol::GoogleCast, ..paired.clone() };
+        let unseen = Device { available: false, ..paired.clone() };
+        let unpaired = Device { pairing: Pairing::Required, ..unseen.clone() };
+        let cases = [
+            (&paired, false, None, CastGate::Go),
+            (&paired, false, Some(FirewallState::Allowed { ours: true }), CastGate::Go),
+            (&paired, false, Some(FirewallState::Unknown { why: UnknownWhy::Nftables }), CastGate::Go),
+            (&tv("No pairing", Pairing::NotNeeded), false, None, CastGate::Go),
+            (&paired, true, blocked, CastGate::Refused("multiview-on")),
+            (&mac, false, None, CastGate::Refused("cast-unsupported")),
+            (&home_only, false, None, CastGate::Refused("cast-unsupported")),
+            (&chromecast, false, None, CastGate::Refused("cast-unsupported")),
+            (&unpaired, false, blocked, CastGate::PairingRequired),
+            (&unseen, false, blocked, CastGate::Refused("cast-unreachable")),
+            (&paired, false, blocked, CastGate::Refused("cast-firewall")),
+            (&paired, false, Some(FirewallState::Blocked { shadowed: true }), CastGate::Refused("cast-firewall")),
+        ];
+        for (d, multiview, firewall, want) in cases {
+            assert_eq!(cast_gate(d, multiview, firewall), want, "{d:?} multiview {multiview} {firewall:?}");
+        }
+        // the sentence of a refusal leads with the typed reason and carries no device text
+        let f = refusal("cast-firewall");
+        assert_eq!(f.code, ErrorCode::Unavailable);
+        assert!(f.message.starts_with("cast-firewall: ") && f.message.contains("Allow on firewall"), "{}", f.message);
+    }
+
+    /// `device` is a `device:<hex>` ref or an exact name; a name two TVs share is not guessed.
+    #[test]
+    fn a_tv_is_found_by_ref_or_exact_name() {
+        let (a, b) = (tv("Living Room", Pairing::Required), tv("Bedroom", Pairing::Required));
+        let twin = Device { id: DeviceId::derive("airplay", "twin"), ..tv("bedroom", Pairing::Required) };
+        let all = [a.clone(), b.clone(), twin];
+        assert_eq!(resolve_device(&all, &device_ref(a.id)).unwrap().id, a.id);
+        assert_eq!(resolve_device(&all, " living ROOM ").unwrap().id, a.id);
+        assert_eq!(resolve_device(&all, "Bedroom").unwrap_err().code, ErrorCode::BadRequest, "two TVs share it");
+        assert_eq!(resolve_device(&all, &device_ref(b.id)).unwrap().id, b.id);
+        for missing in ["Kitchen", "Living", &device_ref(DeviceId::derive("airplay", "nowhere"))] {
+            assert_eq!(resolve_device(&all, missing).unwrap_err().code, ErrorCode::NotFound, "{missing}");
+        }
+        assert_eq!(resolve_device(&all, "device:xyz").unwrap_err().code, ErrorCode::BadRequest);
+    }
+
+    /// A cast plays in place; only the PIN prompt raises the window, and nothing says "casting"
+    /// until the PIN is typed.
+    #[test]
+    fn a_play_for_a_tv_keeps_the_window_where_it_is() {
+        let d = tv("Living Room", Pairing::Paired(crate::cast::PairVariant::Hkp3));
+        let play = |outcome| {
+            let out = PlayOut {
+                outcome,
+                item: "movie:1:m3u:x".into(),
+                title: "Dune".into(),
+                resume_at_min: Some(12),
+                message: "Playing Dune from 12 min.".into(),
+                opened_in: None,
+                device: None,
+            };
+            let command = AgentCommand::Play(AgentPlay {
+                target: PlayTarget::Media(MediaRef::Movie(crate::model::MovieId(1))),
+                from_start: false,
+                show: AgentShow::window(true),
+                device: None,
+            });
+            (command, out)
+        };
+        let (mut command, mut out) = play(PlayOutcome::Playing);
+        for_device(&mut command, &mut out, &d);
+        let AgentCommand::Play(p) = &command else { panic!() };
+        assert_eq!((p.device, p.show), (Some(d.id), AgentShow::IN_PLACE));
+        assert_eq!((out.outcome, out.opened_in, out.device.as_deref()), (PlayOutcome::CastingStarted, Some(OpenedIn::Device), Some("Living Room")));
+        assert_eq!(out.message, "Casting Dune to Living Room. It resumes from 12 min.");
+
+        let (mut command, mut out) = play(PlayOutcome::PinRequired);
+        for_device(&mut command, &mut out, &d);
+        let AgentCommand::Play(p) = &command else { panic!() };
+        assert_eq!((p.device, p.show), (Some(d.id), AgentShow::window(true)), "the PIN prompt raises the window");
+        assert_eq!((out.outcome, out.opened_in), (PlayOutcome::PinRequired, None));
+        assert!(out.message.ends_with("It will play on Living Room."), "{}", out.message);
+
+        let asked = pairing_required(&out, &d);
+        assert_eq!((asked.outcome, asked.opened_in), (PlayOutcome::PairingRequired, None));
+        assert_eq!(asked.message, "Pair Living Room in Tuner first (Settings ▸ Cast).");
+    }
+
+    /// `status.casting` names the TV and the typed reason of a failure, also after a cast that
+    /// ended without the user asking (stopped from the TV's remote) left nothing casting.
+    #[test]
+    fn status_casting_names_the_tv_and_the_typed_reason() {
+        use crate::model::CastView;
+        use crate::player::PlayerError;
+        let id = DeviceId::derive("airplay", "Living Room");
+        let view = |phase| CastView {
+            device: id,
+            name: "Living Room".into(),
+            kind: ReceiverKind::AppleTv,
+            phase,
+            level: None,
+            behind_live_s: Some(18),
+            can_seek: false,
+            volume: false,
+        };
+        let casting = |phase, state| PlayerSnapshot { cast: Some(view(phase)), state, ..Default::default() };
+        let none = CastLast::default();
+        let last = CastLast { error: Some(CastErrorKind::StoppedOnTv), device: Some((id, "Living Room".into(), ReceiverKind::AppleTv)) };
+
+        let out = casting_out(&casting(CastPhase::Playing, PlayerState::Playing), &none).unwrap();
+        assert_eq!(
+            (out.device_ref.as_str(), out.device.as_str(), out.phase, out.behind_live_s, out.error),
+            (&*device_ref(id), "Living Room", CastPhase::Playing, Some(18), None)
+        );
+        // an old failure doesn't stick to a cast that works again
+        assert_eq!(casting_out(&casting(CastPhase::Starting, PlayerState::Playing), &last).unwrap().error, None);
+        // the player's own cast error, and the service's once the session was lost
+        let failed = PlayerState::Error(PlayerError { kind: PlayerErrorKind::Cast(CastErrorKind::Firewall), message: String::new() });
+        let out = casting_out(&casting(CastPhase::Lost, failed), &none).unwrap();
+        assert_eq!(out.error.as_deref(), Some("cast-firewall"));
+        let out = casting_out(&casting(CastPhase::Lost, PlayerState::Idle), &last).unwrap();
+        assert_eq!(out.error.as_deref(), Some("cast-stopped-on-tv"));
+        // nothing casts and nothing plays here: the TV last cast to and why it stopped
+        let out = casting_out(&PlayerSnapshot::default(), &last).unwrap();
+        assert_eq!((out.phase, out.error.as_deref(), out.device.as_str()), (CastPhase::Lost, Some("cast-stopped-on-tv"), "Living Room"));
+        // …but not once something plays here again, and not without a failure
+        assert_eq!(casting_out(&PlayerSnapshot { state: PlayerState::Playing, ..Default::default() }, &last), None);
+        assert_eq!(casting_out(&PlayerSnapshot::default(), &none), None);
+    }
+
+    /// `control` while casting (DESIGN §40 §12): no window to move, and AirPlay has no volume.
+    #[test]
+    fn control_while_casting_leaves_the_window_and_the_volume_alone() {
+        use super::super::proto::ControlAction as A;
+        use crate::model::{CastPhase, CastView};
+        let view = |volume| CastView {
+            device: DeviceId::derive("airplay", "tv"),
+            name: "TV".into(),
+            kind: ReceiverKind::AppleTv,
+            phase: CastPhase::Playing,
+            level: None,
+            behind_live_s: None,
+            can_seek: false,
+            volume,
+        };
+        let airplay = view(false);
+        let code = |a, v: Option<&CastView>| cast_control_guard(a, v).map(|f| f.code);
+        for window in [A::Popout, A::Window] {
+            assert_eq!(code(window, Some(&airplay)), Some(ErrorCode::Unavailable));
+            assert_eq!(code(window, None), None, "locally they are allowed");
+        }
+        for volume in [A::Volume, A::Mute, A::Unmute] {
+            assert_eq!(code(volume, Some(&airplay)), Some(ErrorCode::Unsupported));
+            assert_eq!(code(volume, Some(&view(true))), None, "a receiver with a volume takes it");
+            assert_eq!(code(volume, None), None);
+        }
+        for stop in [A::StopCasting, A::PlayHere] {
+            assert_eq!(code(stop, None), Some(ErrorCode::Unavailable), "nothing is being cast");
+            assert_eq!(code(stop, Some(&airplay)), None);
+        }
+        // the transport reaches the TV as it is
+        for transport in [A::Pause, A::Resume, A::TogglePause, A::Stop, A::PreviousChannel] {
+            assert_eq!(code(transport, Some(&airplay)), None);
+        }
+        let f = cast_control_guard(A::Window, Some(&airplay)).unwrap();
+        assert!(f.message.starts_with("casting: "), "unavailable: casting");
     }
 }

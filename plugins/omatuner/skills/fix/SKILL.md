@@ -2,7 +2,7 @@
 name: fix
 description: Troubleshoot Tuner. Buffering, a dead or SD channel, no sound, is it me or the provider, find a better copy, why can't I find X, no guide, the guide is an hour off, a +1 channel shows the wrong programme, catch-up starts late, fix my guide, how are my playlists doing, when does my subscription expire.
 when_to_use: Use when playback misbehaves, a channel, title or guide entry is missing or wrong, or the user asks about their playlists' or guides' health in Tuner.
-allowed-tools: Read mcp__plugin_omatuner_tuner__status mcp__plugin_omatuner_tuner__diagnose mcp__plugin_omatuner_tuner__sources mcp__plugin_omatuner_tuner__details mcp__plugin_omatuner_tuner__search mcp__plugin_omatuner_tuner__play mcp__plugin_omatuner_tuner__control mcp__plugin_omatuner_tuner__guide_search mcp__plugin_omatuner_tuner__guide_fix mcp__plugin_omatuner_tuner__follow
+allowed-tools: Read mcp__plugin_omatuner_tuner__status mcp__plugin_omatuner_tuner__diagnose mcp__plugin_omatuner_tuner__cast_devices mcp__plugin_omatuner_tuner__sources mcp__plugin_omatuner_tuner__details mcp__plugin_omatuner_tuner__search mcp__plugin_omatuner_tuner__play mcp__plugin_omatuner_tuner__control mcp__plugin_omatuner_tuner__guide_search mcp__plugin_omatuner_tuner__guide_fix mcp__plugin_omatuner_tuner__follow
 ---
 
 # Fix: playback trouble, missing things, guide and playlist health
@@ -26,6 +26,27 @@ change Tuner's settings yourself (guide fixes go through `guide_fix`, with the u
 4. If every copy fails, say so and suggest the same programme on another channel or on
    catch-up later.
 "No sound": `status` (muted? volume?) then `control` `unmute` / `volume`.
+
+## Casting ("it won't play on the TV", "the TV went blank")
+
+1. `status`: `casting` has the TV, its `phase` and, after a failure, `error`, a typed reason
+   (Tuner may be on another workspace, so it can't be seen). `diagnose` has a `cast` section
+   (the TV's model and tvOS version, the pairing variant, the firewall state, the last error).
+   `cast_devices` says whether the TV is `paired` and `available`.
+2. Say what the `error` means and what the user does:
+   - `cast-firewall`: the firewall blocks the TV from reaching Tuner. Tell the user to press
+     **Allow on firewall** in Tuner (Settings ▸ Cast ▸ Network). No tool changes the firewall;
+     never run `sudo`, `pkexec` or `ufw`.
+   - `cast-unreachable`: the TV is off, asleep or on another network: turn it on, then try again.
+   - `cast-pairing-required` / `cast-pairing-lost` / `cast-pairing-refused`: pair the TV again in
+     Tuner (Settings ▸ Cast). For `cast-pairing-refused` (and often after a tvOS update) the
+     Apple TV needs Settings ▸ AirPlay and HomeKit ▸ Allow Access ▸ Anyone on the Same Network.
+   - `cast-stopped-on-tv`: the TV's remote stopped it, or another device took over. Not a fault;
+     offer `play` with `device` again, or `control` `play_here`.
+   - `cast-unsupported` / `cast-needs-ffmpeg` / `cast-cpu-too-slow` / `cast-receiver-failed`: that
+     channel's format doesn't play on the TV (Tuner converts it when it can); offer another copy
+     (`details` `copies`) or `control` `play_here`.
+3. Offer to try again with `play` and `device` only after the user says the cause is fixed.
 
 ## "Why can't I find X?"
 
