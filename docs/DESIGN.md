@@ -34,7 +34,8 @@ stale guides, configurable skip, subtitle delay, stream info, profiles-friendly 
 text is typed), square corners, JetBrains Mono Nerd Font, colours taken live from the current
 Omarchy theme, foreground-alpha state tints that work in light themes.
 
-* Binary / Wayland `app_id` / Hyprland class / MPRIS suffix / `.desktop`: **`tuner`**.
+* Binary / Wayland `app_id` / Hyprland class / MPRIS suffix / `.desktop`: **`tuner`** (a
+  launch straight into the pop-out maps as `tuner-popout`, §21.6).
 * Stack: Rust 2024 · eframe/egui 0.36.2 (**glow** renderer; glow 0.17 via `eframe::glow` only) ·
   libmpv 0.41 through the render API into an FBO texture (spike-proven) · SQLite (rusqlite,
   bundled, WAL) · tokio · reqwest (rustls).
@@ -360,6 +361,16 @@ types and accessors are implemented in the skeleton and built with `from_parts`.
 `load_with(conn, &LoadOptions)` (the job passes `LoadOptions::from_config`: audio languages and
 the explicit-content `Visibility`, §20.3) also builds `VodIndex::stacks` — the copies of one
 title in "All playlists" (§29.11).
+
+A build reads ONE snapshot: it opens a read transaction on its connection (or reads in the
+caller's transaction, when one is open). The channels are read on a thread of their own, on a
+second read-only connection (`store::open_reader`), while the first one reads the movies and
+series. The second connection's read transaction must be on the same snapshot. It reads
+`PRAGMA data_version` before the first connection's transaction starts and again when its own
+starts. The value only changes when another connection committed in between. If it changed,
+the build tries again (3 times), then reads everything on the first connection. Without a path
+(an in-memory database) or inside a caller's transaction, the build also uses one connection.
+This saves about 100 ms on a real-size catalogue (`benches/startup.rs`).
 
 Favourites live OUTSIDE the immutable snapshot: the app owns `favs: FavIndex` (copied from each
 new `Library`), exposed as `UiCtx::favs`; a toggle submits `store::user::set_favourite` and
@@ -2699,7 +2710,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | `←` / `h` | Back to the page list |
 | `→` / `l` / `Shift+→` / `L` | Increase / next option |
 | `Shift+←` / `H` | Decrease / previous option |
-| `Alt+↑` / `K` / `Alt+↓` / `J` | Move up / down (reorder: guide priority, playlists, lists) |
+| `Alt+↑` / `K` / `Alt+↓` / `J` | Move up / down (reorder: guide priority, playlists, lists, Following rules) |
 | `Tab` / `Shift+Tab` | Next / previous section |
 | `Enter` / `Space` | Toggle / open |
 | `x` / `Delete` | Delete / more actions |
@@ -2974,7 +2985,8 @@ Reminders fire only while Tuner runs (v1).
 ### 21.4 Single instance & CLI
 `$XDG_RUNTIME_DIR/tuner/tuner.sock`; a second `tuner [--view guide] [--play …] [file/url]`
 hands its request over and exits 0 (stale socket removed). Works with `omarchy-launch-or-focus
-'^tuner$'` (anchored: the pattern also matches window titles) and the omarchy-menu entries. Request handling (`TunerApp::handle_ipc`, also for the
+'^tuner(-popout)?$'` (anchored: the pattern also matches window titles; `-popout`: a window
+started straight into the pop-out, §21.6) and the omarchy-menu entries. Request handling (`TunerApp::handle_ipc`, also for the
 first instance's own CLI): `--view` switches route; `--play X` and positional URLs / media files
 play immediately (`MediaRef::Url`, fullscreen player); positional `.m3u`/`.m3u8` files open the
 onboarding card at Details (`Route::Onboarding(PlaylistFile)`).
@@ -3006,7 +3018,8 @@ for any window. Tuner does it for itself with `o` in the player or Ctrl+Shift+O 
   `resizewindowpixel exact W H,address:…`, `movewindowpixel exact X Y,address:…`,
   `alterzorder top,…`, `tagwindow ±pop …`), exactly like `omarchy-hyprland-window-pop`. The
   syntax that worked first is kept for the session.
-* **Pop-out**: (unless already) float → size → move → (unless already) pin → raise → tag `pop`
+* **Pop-out**: (unless already) float → size → move → (unless already) pin → (only if it was
+  already floating) raise → tag `pop`
   (Omarchy rounds `tag:pop` windows). Size: Settings ▸ Player ▸ Pop-out size, Small 480 × 270
   (default) or Medium 640 × 360; place: the chosen corner (default bottom-right) of the
   window's monitor, inside its reserved area (bar), 10 px margin (Omarchy's `gaps_out`, so it
@@ -3015,7 +3028,28 @@ for any window. Tuner does it for itself with `o` in the player or Ctrl+Shift+O 
   (`hl.dsp.window.fullscreen({ window, mode = "maximized", action = "unset" })`; classic
   syntax has no per-window form, so there the toast asks to un-maximize). The app leaves
   window fullscreen first, before a pop-out or a pop-in (a fullscreen window can be neither
-  pinned nor unpinned); the worker retries for 1 s until Hyprland sees it.
+  pinned nor unpinned); the worker retries for 1 s until Hyprland sees it (and, popping out,
+  for up to 3 s until a just-created window is mapped).
+* **Focus**: no pop-out step takes the keyboard (checked against Hyprland 0.56's
+  `Actions::floatWindow` / `pinWindow` / `resize` / `move` / `tag`), and an IPC `--play …
+  --popout` or `--reminder` never calls `focus_self`. `alter_zorder` is the exception: it
+  simulates a pointer motion after raising, and with `follow_mouse = 1` a pointer that moved
+  in the last 0.5 s over the raised window hands it the keyboard. So the raise is only sent
+  for a window that was floating already: floating a window raises it anyway (0.56
+  `floatWindow`; `changeWindowFloatingMode` in older releases).
+* **Launch into the pop-out** (Tuner closed: a scheduled switch with Open in: Pop-out starts it
+  — `ClosedOutcome::StartApp { popout }` — or `tuner --play <ref> --popout`): under Hyprland the
+  window is created with the app id **`tuner-popout`** (`tuner::window_app_id`, chosen from the
+  command line before the window exists; winit can't change it later) at the pop-out size. The
+  packaged rule `o.window("^(tuner-popout)$", { float = true, pin = true, no_initial_focus =
+  true })` (Hyprland 0.56 Lua rule names; Omarchy's webcam overlay uses the same three) maps it
+  floating and pinned on the current workspace without the keyboard. The app pops it out on
+  its first frame (also for the reminder launch, so the countdown shows in the pop-out and the
+  switch plays in place): size, place, tag — no float, pin or raise. That first pop-out adopts
+  the rule's floating + pinned state (`Hypr::with_launch_rule`), so popping in tiles the window
+  like any other. The class stays `tuner-popout` for the session; every other `tuner` rule in
+  the snippet matches both classes. Without the rule the window maps tiled and focused, then
+  pops out as before. Outside Hyprland the app id stays `tuner`.
 * **Pop-in** undoes only what pop-out changed: unpin (unless it was pinned), untag (unless it
   was tagged), then back to its floating geometry if it was floating, else tiled — on the
   workspace the user is on now (a pinned window travels). If the user moved or resized the
@@ -3049,7 +3083,9 @@ for any window. Tuner does it for itself with `o` in the player or Ctrl+Shift+O 
   `packaging/icons/tuner.svg` (square-cornered; PKGBUILD installs to hicolor/scalable — PNG
   sizes can be rendered with `rsvg-convert` if a theme needs them), `packaging/hypr/tuner.lua`
   (`-default-opacity` tag + `opacity "1 1"`, **`render_unfocused = true`** so playback keeps
-  rendering on other workspaces (§11.1), optional idle fallback and Super+Shift+T binding),
+  rendering on other workspaces (§11.1), for classes `tuner` and `tuner-popout`; `float`, `pin`,
+  `no_initial_focus` for `tuner-popout` (§21.6); optional idle fallback and Super+Shift+T
+  binding),
   `packaging/omarchy/omarchy-menu.jsonc` (TV submenu), `packaging/PKGBUILD` (x86_64 + aarch64,
   depends mpv/xz/fontconfig/JetBrains Mono Nerd/wayland/mesa; builds the local checkout into
   `packaging/src/target`, installs the snippets under `/usr/share/tuner/`, the docs under
@@ -3103,7 +3139,10 @@ for any window. Tuner does it for itself with `o` in the player or Ctrl+Shift+O 
 `cargo test` must stay green without network, ffmpeg or a Wayland session (those tests skip).
 Lint gate: `cargo clippy --all-targets -- -D warnings` (baseline is zero; stub modules carry a
 scoped allow in `lib.rs` that each WP removes for its module). Tests never call
-`redact::clear_secrets`.
+`redact::clear_secrets`. Tests never touch the user's desktop: `platform::off_desktop()` (unit
+tests, any process that built a `TestUi` — it calls `platform::keep_off_desktop()` — or
+`TUNER_NO_DESKTOP` set) makes `hypr::focus_self` a no-op and lets notifications reach only an
+explicit test bus.
 
 ### 23.1 Dev notes: README screenshots
 
@@ -5318,8 +5357,15 @@ Suggested, No guide. Each row's "why" is a fixed phrase; no URL ever appears.
 ### 31.5 Guardrails
 * The universe is the library snapshot: explicit, hidden and filtered channels follow its
   visibility (counts and coverage too).
-* Claude's batches: at most 200 channels; more than 50 is refused from chat
-  (`pending_review`: the user reviews them in Guide fixes, or Claude proposes a narrower batch);
+* Claude's batches: at most 200 channels; more than 50 isn't applied from chat
+  (`pending_review`): the handler hands the proposal to Tuner (`AgentCommand::GuideFixReview`,
+  the window raised, out of the pop-out), which opens Guide fixes with its confirm card
+  prefilled ("Accept Claude's N fixes?"). Enter applies it as Claude's batch (toast with Undo;
+  `stale` if the guide or a playlist changed meanwhile: nothing applies and the toast says so);
+  Esc drops it, and Claude proposes again or a narrower batch. A newer batch replaces one still
+  waiting for its card (toast "Claude's earlier guide fixes were replaced by its newer ones"); a
+  card already open is never replaced (the newer one waits for it). A batch applied from chat toasts
+  "Claude fixed the guide for N channels" with Undo;
   proposals live 10 minutes and are bound to the stamp; locked channels and rules for a
   playlist with a PIN-locked channel are refused while locked; Claude undoes only its own
   batches.
@@ -5353,6 +5399,15 @@ the panel, `n` / `N` step. Home shows an "Up next" rail while items wait and not
   When the queue runs out after an episode, the next one is offered with no countdown.
 * A queued film ending in the fullscreen player keeps the player (the next item follows on the
   card); only films started elsewhere return to their page.
+* The player's OSD row has `Up next` (the panel, `u`) and, while Up next has a next item and
+  multi-view is off, `Next` (`n`), before Info; narrow keeps `Next` only. Both are in the
+  controls focus walk, and a button that comes or goes keeps the focus on its control.
+* Enter (a double-click, "Play now") on a film or episode row with progress past
+  `resume_min_s` opens the usual Resume prompt (the latest progress of any copy, as the
+  resolver resumes it); its answer goes to the engine as `PlayAtFrom { id, resume }`, which
+  overrides the row's "from the start" for that row only. A row that asks for the start, a
+  programme slot, and locked, concealed or gone rows play at once as before (the engine says
+  why). Advancing never asks.
 
 ### 32.3 Guardrails
 * Locked rows wait for the PIN (`Blocked::NeedsPin`; the engine never unlocks; a hidden window
@@ -5420,8 +5475,10 @@ Claude's switches win, then rule priority, then the earlier start; the loser not
   copy) already plays on either picture. The check runs at the countdown and again at the switch
   (`reminders::flash_skip`), in a running Tuner and on the closed path.
 * Sound: Normal, or Mute ("silent flash": single view mutes the main picture; multi-view plays it
-  in the silent picture without taking the sound). Duck is stored but not offered until it does
-  something different.
+  in the silent picture without taking the sound). There is no "duck" (lower what plays under
+  it): nothing plays under a flash with its sound (single view replaces what played, multi-view
+  gives the flash's picture the sound), so it would act as Normal. A `"duck"` stored by an early
+  build reads as Normal.
 * At its end the previous playback comes back (the bulletin or one of its copies must still be
   playing; if the user moved on, nothing changes), the window pops back in and the Player screen
   is left if the user wasn't on it. In multi-view the flash's picture gets back what it showed,
@@ -5431,14 +5488,25 @@ Claude's switches win, then rule priority, then the earlier start; the loser not
 ### 33.5 Feedback and Claude
 * "Following: Chelsea · 1 in the guide" with **Undo** for a new rule; Claude's rules toast
   "Claude added X · N reminders" with Undo (`Action::UndoFollow`).
-* A summary notification at most every 12 h, only with additions.
+* A summary notification at most every 12 h, only with additions, with **Open** (and a click on
+  it): the window is raised and shows Settings ▸ Following (`FollowEvent::Open`). Without a
+  notification server it is an in-app toast with the same Open (`Action::OpenFollowing`).
 * Claude's rules are marked, capped (10 an hour, 20 in all); Claude can't turn a rule's
   spoiler-safe off; a concealed channel's match is named by the rule only.
 * Upcoming rows in Settings go through the spoiler guard and skip concealed channels.
 
-### 33.6 Gaps
-No row menu or drag reorder on the Settings rows (the editor has ↑/↓, Duplicate, Delete…); the
-summary notification has no Open action; Settings' hint line still advertises reorder.
+### 33.6 Settings ▸ Following
+* Rule rows, in priority order (higher wins a clash): Enter or a click opens the rule in the
+  sheet's editor. `x` / Delete / right-click / the gear open the row's menu: **Edit…**,
+  **Pause / Resume** (the evaluation that follows cancels a paused rule's reminders, and makes
+  them again on Resume), **Test against the guide** (a preview over 14 days in the background,
+  toasted as "Arsenal: 4 in the next 14 days · next Sat 12:30 on Sky Sports Main Event · 2 left
+  out (repeat)": the rule's name, times and channels only), **Move up / down**, **Delete…**
+  ("Delete it and cancel its N reminders" / "keep the reminders as my own").
+* Reorder: Alt+↑/↓ (K/J), the drag grip (shown with two rules or more) or the menu's Move; the
+  order is saved at once and the guide checked again. The Panel hint's "reorder" covers them.
+* Upcoming rows: Enter, a click or `x` opens the programme's popover (Watch, Cancel reminder =
+  skip this one, Follow…).
 
 ## 34. Spoiler guard
 
@@ -5449,8 +5517,9 @@ Design: `docs/design/spoiler-guard-design.md`. Build notes: `docs/design/score.m
 On by default but narrow; nothing is guarded before an event starts. Display only: it never
 builds events from explicit content, never lists or counts it, never reveals it.
 * **Series you're part-way through** (automatic): episodes after the next-up one lose title,
-  plot and still; guide airings with S/E after next-up likewise; an airing without S/E loses its
-  sub-title and description.
+  plot and still; guide airings with S/E after next-up likewise (the grid's slim rows carry the
+  guide's S/E too); an airing without S/E is placed first (§34.5) and loses its sub-title and
+  description when it comes after next-up or when nothing places it.
 * **Sport you follow**: Following's spoiler-safe Team/Event rules become topics. An airing
   counts as the event only when it parses as a fixture (`parse_fixture`) and has none of the
   rule's "leave out" words ("Women", "U21", "Fan TV"…); highlights and reaction shows are never
@@ -5477,11 +5546,21 @@ MCP reply (`guard::reply::guard_json`). Painters cache per programme, minute and
   either picture counts; Ctrl+W marks a guide programme seen (toast "Spoiler guard…" opens the
   menu with Undo).
 * **Reveal**: Ctrl+B on an item (any move hides it again); Ctrl+Shift+B opens the menu; "show
-  everything for 15 min / 1 h / until restart" with a status chip and ✕.
+  everything for 15 min / 1 h / until restart" with a status chip and ✕. The hint line says
+  "Ctrl+B show spoilers" while the guard hides something of the focused item ("Ctrl+B hide
+  spoilers" while it is shown). In the player, the banner's programme line ("Severance ·
+  ▆▆▆▆▆▆▆▆ 󰈉") and next title go through the guard, the banner says "Ctrl+B show spoilers", and
+  Ctrl+B shows the banner's now and next until the picture changes (a zap hides them again).
+  The slim now / next rows carry no categories, so the banner reads each programme's categories
+  once (frame budget, `player::reveal::BannerCats`) and shows its sub-title only once they are
+  known: "sport descriptions" hides an unrelated match's sub-title there too.
 * **Zap shield**: before tuning. A zap (↑/↓, digits, the channel panel) onto a channel whose
   programme mentions an active topic sends no play: the card covers the picture and the picture
   underneath pauses. Enter = Watch anyway (for as long as the same reason shields it), ↓ judges
   the next channel, Backspace/← resumes. A channel chosen in Live or the guide is never shielded.
+  In multi-view the card covers only the picture that zapped (that picture pauses, the other
+  plays on); its keys act while that picture has the focus, and a click on it focuses it first.
+  One card at a time: a shielded zap in the other picture moves it there.
 * The snapshot rebuilds on guard, library, guide, follow and progress changes, but not every
   progress save while a film, episode or catch-up plays.
 
@@ -5491,10 +5570,24 @@ marks seen; `remove` only removes Claude's own rules ("that rule is yours — re
 Settings ▸ Spoiler guard"). Replies drop guarded fields unless the call names the item in
 `reveal_spoilers`.
 
-### 34.5 Gaps
-Slim guide programmes carry no S/E yet, so every grid airing of a guarded series loses its
-sub-title; Ctrl+B in the player and a "Ctrl+B show spoilers" hint are missing; in multi-view the
-shield card covers the whole player.
+### 34.5 Series airings without S/E
+Slim guide rows (grid, now/next, search hits) carry the guide's season and episode, so most
+airings are judged by number. An airing of a guarded series without one is placed by
+(`spoiler::verdict::airing_beyond`, in order):
+1. its sub-title: an "S02E05" / "2x05" / "Season 2 Episode 5" marker, or a catalogue episode
+   title of the series (folded; "Show - S02E05 - Title" names count as "Title"; a title two
+   episodes share, or "Episode 6", places nothing);
+2. a seen repeat: an airing watched (or Ctrl+W'd) before keeps its "title#sub-title" key as the
+   series' seen state (`spoiler_seen.series_norm` set, no episode; never pruned), so its repeats
+   show;
+3. the catalogue's air dates: an airing a week or more before the first guarded episode first
+   aired can't be one (the margin covers another country's dates);
+4. the guide's "new" flag: a first showing is later than next-up, unless it airs before the
+   next-up episode first aired.
+What nothing places is guarded, also for a series the user guarded before starting it (their
+own rule is never weakened); rules 2 and 3 still let seen and old repeats show.
+Watching an airing a sub-title places records that episode, which moves the series on.
+MCP replies have no airing date (start 0): rule 3 never applies there.
 
 ## 35. Multi-view
 
@@ -5532,16 +5625,20 @@ with the sound). Esc never closes a picture.
   until exit.
 
 ### 35.3 Claude
-`multiview open` with two refs from single view plans both pictures at once (one plan, so the
-second never plans against what the first replaces); one ref goes alongside the focused
+`multiview open` with two refs plans both pictures at once (one plan, so the second never
+plans against what the first replaces): from single view the focused picture and the other,
+with multi-view on A and B (the layout's places and the sound stay; both claims move before
+either loads, so pictures that trade playlists aren't refused). A picture that already shows
+one of the two keeps it, and the other goes in the other picture alongside it — moving the
+picture that stays is asked first (the app's card, or `needs_rearrange` over MCP). One ref
+goes alongside the focused
 picture, judged against that picture's stream; `needs_rearrange` when only moving the playing
 picture works; a film playing answers "multi-view is for live TV and catch-up". `control` with
 no `tile` pauses/stops both, sets volume and mute on the picture with the sound, and acts on the
 focused one for previous channel and pop-out.
 
 ### 35.4 Gaps
-Two refs while multi-view is already on still go one picture at a time; a PIN prompt cancelled
-with Esc keeps its stored plays until a relock (harmless: only `play_channel`'s or the agent's
+A PIN prompt cancelled with Esc keeps its stored plays until a relock (harmless: only `play_channel`'s or the agent's
 prompts send them).
 
 ## 36. Reminders (pass 2) and the sleep timer
@@ -5590,11 +5687,13 @@ item. Between two Up next items (the card, a PIN wait, a future slot) Up next ha
 It warns `reminders.sleep_warn_s` before, then stops or pauses every picture; a news flash on
 ends with it and the window pops back in. It runs on tokio, so it fires with the window hidden.
 
-### 36.4 Gap
-The scheduled auto-launch (Tuner closed, a switch due) starts Tuner as a normal window that may
-take focus: Omarchy 4's Lua Hyprland config has no exec-with-rules dispatcher we could verify
-headless. To do on the real desktop: re-exec through Hyprland with initial focus suppressed (a
-dedicated app id plus a `no_initial_focus` window rule, the webcam-overlay pattern).
+### 36.4 Focus on the scheduled auto-launch
+Closed in v0.2: the scheduled auto-launch (Tuner closed, a switch due, Open in: Pop-out) starts
+Tuner with the app id `tuner-popout`; the packaged Hyprland rule maps that window floating,
+pinned and with `no_initial_focus` (the webcam-overlay pattern), and it pops out at once
+(§21.6). It needs the snippet installed: without it the window maps tiled and may take focus.
+Verified against Hyprland's source and docs only; the real-desktop check is in
+`docs/MANUAL_CHECKLIST.md` §27.
 
 ## 37. Use Tuner from Claude: the plugin, skills and pass-2 tools
 

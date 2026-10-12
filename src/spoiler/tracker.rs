@@ -44,6 +44,8 @@ pub struct Watching {
     pub sub_title: Option<String>,
     pub categories: Vec<String>,
     pub season_episode: Option<(i32, i32)>,
+    /// The guide marks it a first showing.
+    pub is_new: bool,
     /// Live: `None`; catch-up: how far through (0–1).
     pub fraction: Option<f64>,
     /// The channel's shift (s): live airings compare displayed time with `now`.
@@ -58,6 +60,7 @@ impl Watching {
             categories: &self.categories,
             season_episode: self.season_episode,
             start: self.start + self.shift_s,
+            is_new: self.is_new,
         }
     }
 }
@@ -234,7 +237,8 @@ async fn track(guard: Guard, shared: Arc<AppShared>, store: Store) {
                 Err(_) => continue,
             };
             let tracked = super::verdict::tracks(&gsnap, &w.subject(), now);
-            if let Some(row) = tracker.observe(&w, tracked, now) {
+            if let Some(mut row) = tracker.observe(&w, tracked, now) {
+                super::place_seen_row(&gsnap, &mut row, w.sub_title.as_deref());
                 record(&guard, &store, row, now, channel);
             }
         }
@@ -285,6 +289,7 @@ fn resolve(
         sub_title: p.sub_title,
         categories: p.categories,
         season_episode: se,
+        is_new: p.is_new,
         fraction: catchup.map(|_| frac.unwrap_or(0.0)),
         shift_s,
     }))
@@ -327,6 +332,7 @@ mod tests {
             sub_title: None,
             categories: vec!["Sport".into()],
             season_episode: None,
+            is_new: false,
             fraction: None,
             shift_s: 0,
         }

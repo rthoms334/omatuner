@@ -15,7 +15,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// (callers include the UI thread), and overlapping requests collapse into one.
 pub fn focus_self() {
     static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-    if !is_hyprland() || IN_FLIGHT.swap(true, Ordering::AcqRel) {
+    // tests (headless) never reach the live compositor
+    if super::off_desktop() || !is_hyprland() || IN_FLIGHT.swap(true, Ordering::AcqRel) {
         return;
     }
     let spawned = std::thread::Builder::new().name("hypr-focus".into()).spawn(|| {
@@ -94,9 +95,12 @@ mod tests {
     }
 
     /// `packaging/hypr/tuner.lua` evaluated with stand-ins for Hyprland's `hl` table (and
-    /// Omarchy's real `o.window` helper when installed): it must give Tuner opacity 1 (opting out
-    /// of `default-opacity`) and `render_unfocused`, and must not force idle inhibition.
-    /// Skipped without a `lua` interpreter.
+    /// Omarchy's real `o.window` helper when installed): it must give both of Tuner's classes
+    /// opacity 1 (opting out of `default-opacity`) and `render_unfocused`, must not force idle
+    /// inhibition, and must map the pop-out launch's window (`crate::window_app_id`) floating,
+    /// pinned and without initial focus — never the normal window. Rule names as Hyprland
+    /// 0.56's Lua window rules spell them (`WINDOW_RULE_EFFECT_DESCS`: `float`, `pin`,
+    /// `no_initial_focus`, like Omarchy's webcam overlay). Skipped without a `lua` interpreter.
     #[test]
     fn hyprland_snippet_rules() {
         let snippet = concat!(env!("CARGO_MANIFEST_DIR"), "/packaging/hypr/tuner.lua");
@@ -113,7 +117,8 @@ mod tests {
             end
             dofile("{snippet}")
             for _, r in ipairs(RULES) do
-              print(r.match.class, r.tag or "-", r.opacity or "-", tostring(r.render_unfocused), r.idle_inhibit or "-")
+              print(r.match.class, r.tag or "-", r.opacity or "-", tostring(r.render_unfocused), r.idle_inhibit or "-",
+                    tostring(r.float), tostring(r.pin), tostring(r.no_initial_focus))
             end
             "#
         );
@@ -126,9 +131,27 @@ mod tests {
         };
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         let rules = String::from_utf8_lossy(&out.stdout);
-        let lines: Vec<&str> = rules.lines().collect();
-        assert_eq!(lines, ["^(tuner)$\t-default-opacity\t-\tnil\t-", "^(tuner)$\t-\t1 1\tnil\t-", "^(tuner)$\t-\t-\ttrue\t-",], "{rules}");
-        assert!(regex::Regex::new("^(tuner)$").unwrap().is_match(crate::APP_ID));
+        let lines: Vec<Vec<&str>> = rules.lines().map(|l| l.split('\t').collect()).collect();
+        let both = "^(tuner|tuner-popout)$";
+        let nil = "nil";
+        assert_eq!(
+            lines,
+            [
+                [both, "-default-opacity", "-", nil, "-", nil, nil, nil],
+                [both, "-", "1 1", nil, "-", nil, nil, nil],
+                [both, "-", "-", "true", "-", nil, nil, nil],
+                ["^(tuner-popout)$", "-", "-", nil, "-", "true", "true", "true"],
+            ],
+            "{rules}"
+        );
+        let popout = crate::window_app_id(true, true);
+        assert_eq!(crate::window_app_id(true, false), crate::APP_ID, "no pop-out (nor its rule) outside Hyprland");
+        assert_eq!(crate::window_app_id(false, true), crate::APP_ID);
+        for line in &lines {
+            let class = regex::Regex::new(line[0]).unwrap();
+            assert!(class.is_match(popout), "{line:?}");
+            assert_eq!(class.is_match(crate::APP_ID), line[7] != "true", "the normal window keeps its focus: {line:?}");
+        }
     }
 
     /// The shipped desktop entry passes `desktop-file-validate` (skipped when not installed).

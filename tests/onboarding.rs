@@ -156,6 +156,9 @@ fn xtream_login_probes_imports_once_and_opens_live_tv() {
     h.run_steps(1);
     h.state_mut().act(Action::Activate);
     until(&mut h, "the import to finish", |h| has(h, "All set"));
+    // the third press may land after the import finished, where Enter is "Watch now": that is one Live switch
+    let early = std::mem::take(&mut h.state_mut().t.nav);
+    assert!(early.is_empty() || early == vec![NavRequest::Switch(Route::Live { group: None, channel: None })], "{early:?}");
     let sources = h.state().sources();
     assert_eq!(sources.len(), 1, "one source, whatever was pressed");
     let x = sources[0].xtream.as_ref().unwrap();

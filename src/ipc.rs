@@ -43,7 +43,8 @@ pub struct IpcRequest {
     pub view: Option<ViewArg>,
     pub play: Option<String>,
     pub inputs: Vec<String>,
-    /// `--popout` with `--play`: open in the pop-out without taking focus.
+    /// `--popout` with `--play`: open in the pop-out without taking focus. Also set by `main`
+    /// for its own window when a scheduled switch starts Tuner for the pop-out.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub popout: bool,
     /// `--reminder <id>`: a reminder timer fired (B6).

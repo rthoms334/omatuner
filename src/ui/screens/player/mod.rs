@@ -82,12 +82,14 @@ mod cards;
 mod multiview;
 mod osd;
 mod panels;
+mod reveal;
 mod shield;
 
 use banner::*;
 use cards::*;
 use osd::*;
 use panels::*;
+use reveal::*;
 
 const NUMERIC_COMMIT: Duration = Duration::from_millis(1500);
 
@@ -157,6 +159,8 @@ pub struct PlayerScreen {
     switch_copies: Vec<crate::ui::copies::OtherCopy>,
     /// Multi-view's layout of the last frame and its captions (`multiview.rs`).
     mv: multiview::MvScreen,
+    /// The banner's programmes' categories (the spoiler guard's sport rule; `reveal.rs`).
+    banner_cats: reveal::BannerCats,
 }
 
 /// The OSD scale of the current window.
@@ -434,6 +438,9 @@ impl Screen for PlayerScreen {
         if let Some(h) = self.shield_action(ctx, action) {
             return h;
         }
+        if let Some(h) = self.spoiler_action(ctx, action) {
+            return h;
+        }
         if let Some(h) = self.multiview_action(ctx, action) {
             return h;
         }
@@ -486,7 +493,11 @@ impl Screen for PlayerScreen {
             Action::FocusOsdControls => {
                 self.osd_focus = true;
                 self.row = OsdRow::Buttons;
-                self.control = self.active_controls(ctx.player, narrow, ctx.video_only).iter().position(|c| *c == Control::PlayPause).unwrap_or(0);
+                self.control = self
+                    .active_controls(ctx.player, narrow, ctx.video_only, osd::QueueButtons::of(ctx))
+                    .iter()
+                    .position(|c| *c == Control::PlayPause)
+                    .unwrap_or(0);
             }
             Action::LeaveOsdControls => self.osd_focus = false,
             Action::StreamInfo => self.toggle_info(ctx),
@@ -599,6 +610,7 @@ impl Screen for PlayerScreen {
         self.bottom_bar = None;
         self.bars.clear();
         self.find_next_episode(ctx);
+        self.settle_reveal(ctx);
         if std::mem::take(&mut self.toggle_fullscreen) {
             let fs = ui.input(|i| i.viewport().fullscreen).unwrap_or(false);
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fs));
@@ -946,6 +958,170 @@ mod tests {
         assert!(h.state_mut().act(Action::FocusOsdControls), "Enter: watch anyway");
         until(&mut h, "channel 3 tuned", |h| tuned(h) == Some(MediaRef::Channel(ids[2])));
         assert_eq!(h.state().s.shield_card(), None);
+    }
+
+    /// Multi-view: a shielded zap in picture B puts the card over picture B alone — picture A
+    /// is neither covered nor paused — and its keys wait until B has the focus again.
+    #[test]
+    fn a_shield_card_in_multi_view_covers_only_the_picture_that_zapped() {
+        use crate::guard::Guard;
+        use crate::model::TileId;
+        use crate::spoiler::snapshot::{GuardSnapshot, Settings, ShieldSpan, Topic, TopicMode, TopicSource};
+        use crate::ui::multiview::{MultiView, MvFrame};
+        use crate::ui::screens::home::testkit::{channels, seed, source};
+        let (mut t, one) = rig();
+        let ids = seed(&mut t, |c| {
+            let s = source(c, "TV")?;
+            channels(c, s, 5)
+        });
+        let span = ShieldSpan { start: t.now - 60, stop: t.now + 3600, topic: 0, is_event: false };
+        let topic = Topic::new("Arsenal", TopicSource::Follow, TopicMode::Always);
+        let settings = Settings { shield_zap: true, ..Default::default() };
+        let snap = GuardSnapshot::from_parts(settings, vec![(topic, vec!["arsenal".into()])], Default::default(), [(ids[1], vec![span])].into());
+        t.services().agent.set_guard(Guard::with_snapshot(snap));
+        let picture = |ch: ChannelId| {
+            let mut s = PlayerSnapshot { state: PlayerState::Playing, ..Default::default() };
+            s.playable = Some(Arc::new(Playable { media: MediaRef::Channel(ch), ..(*playable()).clone() }));
+            s.zap = Some(crate::model::ZapList { collection: crate::model::Collection::AllChannels, channels: ids.clone().into() });
+            Arc::new(s)
+        };
+        let (a, b) = (picture(ids[4]), picture(ids[0]));
+        let view = MultiView { on: true, focus: TileId::B, ..Default::default() };
+        t.multiview = MvFrame { view, snaps: [Some(a.clone()), Some(b.clone())], starting: false };
+        t.snapshot = b;
+        let mut h = harness(t, one, PlayerScreen::default(), WIDE);
+        h.state_mut().enter(Route::Player);
+        h.run_steps(3);
+        assert!(h.state_mut().act(Action::ZapNext));
+        h.run_steps(3);
+        assert_eq!((h.state().s.shield_card(), h.state().s.shield_tile()), (Some(ids[1]), Some(TileId::B)));
+        // the card's heading sits in picture B, not over A
+        let rect_of = |h: &H, tile| h.state().s.mv_placed().iter().find(|p| p.tile == tile).map(|p| p.video).expect("placed");
+        let heading = h
+            .output()
+            .shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.job.text.starts_with(crate::ui::widgets::spoiler::HIDDEN) => Some(t.pos),
+                _ => None,
+            })
+            .expect("the card's heading");
+        assert!(rect_of(&h, TileId::B).contains(heading) && !rect_of(&h, TileId::A).contains(heading), "{heading:?}");
+        // picture A plays on: no pause reached the app's player (picture A in this rig)
+        std::thread::sleep(Duration::from_millis(300));
+        h.run_steps(2);
+        assert!(!real(&h).paused, "the other picture isn't paused");
+        // focus on picture A: Enter is A's, the card stays over B
+        h.state_mut().t.multiview.view.focus = TileId::A;
+        h.state_mut().t.snapshot = a;
+        h.run_steps(2);
+        h.state_mut().act(Action::FocusOsdControls);
+        h.run_steps(2);
+        assert_eq!(h.state().s.shield_card(), Some(ids[1]), "nothing tuned on B from A's keys");
+    }
+
+    /// Ctrl+B in the player: the banner shows the guarded sub-title of what's on as a bar and
+    /// says "Ctrl+B show spoilers"; Ctrl+B shows it ("… hide spoilers"); another picture (a zap)
+    /// hides it again.
+    #[test]
+    fn ctrl_b_in_the_player_shows_the_banners_spoilers_until_the_picture_changes() {
+        use std::collections::HashMap;
+
+        use crate::guard::Guard;
+        use crate::spoiler::snapshot::{GuardSnapshot, SeriesMark, Settings};
+        use crate::ui::screens::home::testkit::{channels, epg, painted, seed, source};
+        crate::spoiler::ui::hide_all();
+        let (mut t, one) = rig();
+        let now = t.now;
+        let ids = seed(&mut t, move |c| {
+            let s = source(c, "TV")?;
+            let ids = channels(c, s, 3)?;
+            epg(c, &ids, now - now.rem_euclid(1800) - 1800, 3, true)?;
+            // channel 0 airs a later episode of a series you're part-way through
+            c.execute(
+                "UPDATE programme SET title = 'Severance', sub_title = 'Cold Harbor'
+                 WHERE epg_channel_id = (SELECT epg_channel_id FROM channel_epg WHERE channel_id = ?1) AND start <= ?2 AND stop > ?2",
+                rusqlite::params![ids[0].0, now],
+            )?;
+            Ok(ids)
+        });
+        let mark = SeriesMark { label: "Severance".into(), next_up: (2, 4), automatic: true, ..Default::default() };
+        let snap = GuardSnapshot::from_parts(Settings::default(), vec![], HashMap::from([("severance".to_owned(), mark)]), Default::default());
+        t.services().agent.set_guard(Guard::with_snapshot(snap));
+        let mut h = harness(t, one, PlayerScreen::default(), WIDE);
+        let watch = |h: &mut H, ch: ChannelId| {
+            let mut s = (*real(h)).clone();
+            s.state = PlayerState::Playing;
+            s.playable = Some(Arc::new(Playable { media: MediaRef::Channel(ch), ..(*playable()).clone() }));
+            h.state_mut().t.snapshot = Arc::new(s);
+        };
+        watch(&mut h, ids[0]);
+        h.state_mut().enter(Route::Player);
+        h.run_steps(3);
+        let key = crate::spoiler::ui::reveal_key_label();
+        let texts = painted(&h);
+        assert!(texts.iter().any(|t| t.starts_with("Severance · ▆")), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("Cold Harbor")), "{texts:?}");
+        assert!(texts.contains(&format!("{key} show spoilers")), "{texts:?}");
+        assert!(h.state_mut().act(Action::RevealSpoilers));
+        h.run_steps(2);
+        let texts = painted(&h);
+        assert!(texts.iter().any(|t| t == "Severance · Cold Harbor"), "{texts:?}");
+        assert!(texts.contains(&format!("{key} hide spoilers")), "{texts:?}");
+        // another picture: the reveal goes, and stays gone back on channel 0
+        watch(&mut h, ids[1]);
+        h.run_steps(2);
+        assert!(crate::spoiler::ui::reveals().is_empty());
+        watch(&mut h, ids[0]);
+        h.run_steps(2);
+        assert!(!painted(&h).iter().any(|t| t.contains("Cold Harbor")));
+        // Ctrl+B again shows it; Ctrl+B once more hides it
+        assert!(h.state_mut().act(Action::RevealSpoilers));
+        assert!(!crate::spoiler::ui::reveals().is_empty());
+        assert!(h.state_mut().act(Action::RevealSpoilers));
+        assert!(crate::spoiler::ui::reveals().is_empty());
+    }
+
+    /// The banner's "Title · sub-title" of an unrelated sport programme while a topic with
+    /// "sport descriptions" is active: the sub-title is a bar (the guide's categories are read
+    /// for the banner — the slim now row has none).
+    #[test]
+    fn the_banner_hides_an_unrelated_sport_sub_title_under_sport_descriptions() {
+        use std::collections::HashMap;
+
+        use crate::guard::Guard;
+        use crate::spoiler::snapshot::{GuardSnapshot, Settings, Topic, TopicMode, TopicSource};
+        use crate::ui::screens::home::testkit::{channels, epg, painted, seed, source};
+        crate::spoiler::ui::hide_all();
+        let (mut t, one) = rig();
+        let now = t.now;
+        let ids = seed(&mut t, move |c| {
+            let s = source(c, "TV")?;
+            let ids = channels(c, s, 2)?;
+            epg(c, &ids, now - now.rem_euclid(1800) - 1800, 3, true)?;
+            // channel 0 airs another match (a sport category; nothing names the topic)
+            c.execute(
+                "UPDATE programme SET title = 'Premier League', sub_title = 'Spurs 3-1 Leeds', categories = 'Sport\u{1f}Football'
+                 WHERE epg_channel_id = (SELECT epg_channel_id FROM channel_epg WHERE channel_id = ?1) AND start <= ?2 AND stop > ?2",
+                rusqlite::params![ids[0].0, now],
+            )?;
+            Ok(ids)
+        });
+        let mut topic = Topic::new("Arsenal", TopicSource::Follow, TopicMode::Always);
+        topic.sport_descr = true;
+        let snap = GuardSnapshot::from_parts(Settings::default(), vec![(topic, vec!["arsenal".into()])], HashMap::new(), Default::default());
+        t.services().agent.set_guard(Guard::with_snapshot(snap));
+        let mut h = harness(t, one, PlayerScreen::default(), WIDE);
+        let mut s = (*real(&h)).clone();
+        s.state = PlayerState::Playing;
+        s.playable = Some(Arc::new(Playable { media: MediaRef::Channel(ids[0]), ..(*playable()).clone() }));
+        h.state_mut().t.snapshot = Arc::new(s);
+        h.state_mut().enter(Route::Player);
+        until(&mut h, "the banner's now line", |h| painted(h).iter().any(|t| t.starts_with("Premier League · ")));
+        let texts = painted(&h);
+        assert!(texts.iter().any(|t| t.starts_with("Premier League · ▆")), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("Spurs 3-1 Leeds")), "{texts:?}");
+        assert!(texts.contains(&format!("{} show spoilers", crate::spoiler::ui::reveal_key_label())), "{texts:?}");
     }
 
     /// Popped out: the strip under the pointer has the way back to the full window, and so does

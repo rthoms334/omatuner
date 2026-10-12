@@ -46,8 +46,9 @@ explicit while locked is simply not found: say it isn't in Tuner, nothing more.
 4. Show the summary and up to 5 before/after now-next rows, then ask.
 5. On yes: `guide_fix` `apply` with the `proposal_id` and `confirm: true`. Report `applied`
    and `skipped`, and the undo ("say 'undo', or Ctrl+Z in Guide fixes"; `guide_fix` `undo`
-   with `undo_id`). More than 50 channels: `pending_review`; tell the user to review them in
-   Tuner's Guide fixes, or propose a narrower batch.
+   with `undo_id`). More than 50 channels: `pending_review`; Tuner shows them in a confirm
+   card, so tell the user to press Enter there (Esc cancels). Don't apply it again; if they
+   cancel, propose again or a narrower batch.
 6. Catch-up offsets: don't guess; suggest Tuner's Check, or use the user's "starts N minutes
    late".
 "Why wasn't I reminded about X?" → `follow` `preview` with the rule's `id` (left-out reasons)

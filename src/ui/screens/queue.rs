@@ -64,14 +64,15 @@ impl QueueScreen {
         self.list.snapshot().clone()
     }
 
-    /// Play a row: what plays now opens the player; another row plays from here.
+    /// Play a row: what plays now opens the player; another row plays from here, behind the
+    /// Resume prompt when it has progress (`queue::ui::play_row`).
     fn play(&mut self, ctx: &mut UiCtx<'_>, id: QueueId, fullscreen: bool) {
         let s = self.snap();
         if s.driving && s.current == Some(id) {
             ctx.push(Route::Player);
             return;
         }
-        if crate::queue::ui::send(ctx, QueueCommand::PlayAt(id)) && fullscreen {
+        if crate::queue::ui::play_row(ctx, &s, id, fullscreen) == crate::queue::ui::RowPlay::Sent && fullscreen {
             ctx.push(Route::Player);
         }
     }
@@ -568,7 +569,7 @@ pub(crate) mod tests {
 
     /// The main picture's commands (nothing plays in these tests).
     #[derive(Default)]
-    pub(crate) struct Rec(std::sync::Mutex<Vec<crate::player::PlayerCommand>>);
+    pub(crate) struct Rec(pub(crate) std::sync::Mutex<Vec<crate::player::PlayerCommand>>);
     impl crate::queue::PlayerPort for Rec {
         fn send(&self, c: crate::player::PlayerCommand) {
             self.0.lock().unwrap().push(c);
@@ -663,5 +664,95 @@ pub(crate) mod tests {
         let s = &mut app.s;
         assert!(app.t.with_ctx(|ctx| s.on_action(ctx, Action::Undo(n))));
         until(&mut h, "Movie 0 back in its place", |h| order(h) == ["Movie 2", "Movie 0", "Movie 1"]);
+    }
+
+    /// The film commands the engine sent to the main picture: (film, resume, start at).
+    fn film_plays(rec: &Rec) -> Vec<(crate::model::MediaRef, bool)> {
+        rec.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|c| match c {
+                crate::player::PlayerCommand::PlayCopy(c) => Some((c.req.media.clone(), c.req.resume)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Enter on a row with progress asks Resume / Start over like everywhere else (the engine
+    /// then plays it as Up next's: "Start over" from 0, "Resume" from where it was; Shift+Enter
+    /// opens the player once answered); a row with nothing to resume plays straight away.
+    #[test]
+    fn enter_on_a_row_with_progress_asks_resume_or_start_over() {
+        use crate::model::{ItemKey, MediaRef, WatchProgress};
+        use crate::ui::NavRequest;
+        use crate::ui::item_menu::Target;
+        use crate::ui::overlays::{Overlay, QueueResume};
+        use crate::ui::screens::home::testkit::{movies, seed, source, until};
+        let (mut t, one) = rig();
+        let ms = seed(&mut t, |c| {
+            let a = source(c, "TV")?;
+            let ms = movies(c, a, 2)?;
+            let item = ItemRef { source: a, kind: ItemKind::Movie, key: ItemKey("m3u:movie0000000000".into()) };
+            crate::store::user::save_progress(
+                c,
+                &WatchProgress {
+                    item,
+                    position_s: 600.0,
+                    duration_s: Some(3600.0),
+                    updated_at: 5,
+                    finished: false,
+                    title: "Movie 0".into(),
+                    fingerprint: Default::default(),
+                },
+            )?;
+            Ok(ms)
+        });
+        let rec = start_engine(&t);
+        let mut h = harness(t, one, QueueScreen::default(), egui::vec2(1600.0, 800.0));
+        for m in &ms {
+            assert!(h.state_mut().t.with_ctx(|ctx| crate::queue::ui::on_action(ctx, Action::QueueAdd, &Target::Movie(*m))));
+        }
+        until(&mut h, "both rows", |h| order(h) == ["Movie 0", "Movie 1"]);
+        h.state_mut().enter(Route::Queue);
+        h.run_steps(3);
+        let ids: Vec<QueueId> = h.state().t.services().agent.queue().rows.iter().map(|r| r.entry.id).collect();
+        h.state_mut().nav();
+
+        // Enter on Movie 0: the prompt, nothing played yet
+        h.state_mut().s.list.select(ids[0]);
+        assert!(h.state_mut().act(Action::Activate));
+        let nav = h.state_mut().nav();
+        let [NavRequest::Open(OverlayRequest::Resume(spec))] = nav.as_slice() else { panic!("{nav:?}") };
+        assert_eq!((spec.position_s, spec.duration_s), (600.0, Some(3600.0)));
+        assert_eq!(spec.queue, Some(QueueResume { id: ids[0], fullscreen: false }));
+        assert!(spec.title.starts_with("Movie 0"), "{}", spec.title);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(film_plays(&rec).is_empty(), "the prompt comes first");
+
+        // "Start over" (Shift+Enter in the prompt): the engine plays it from 0; the list stays
+        let mut prompt = crate::ui::overlays::resume::ResumeOverlay::new(spec.clone());
+        h.state_mut().t.with_ctx(|ctx| prompt.on_action(ctx, Action::ActivateAlt));
+        until(&mut h, "Movie 0 from the start", |_| film_plays(&rec) == [(MediaRef::Movie(ms[0]), false)]);
+        assert!(!h.state_mut().nav().contains(&NavRequest::Push(Route::Player)));
+        until(&mut h, "Movie 0 is Up next's", |h| h.state().t.services().agent.queue().current == Some(ids[0]));
+
+        // Shift+Enter on it again (it isn't what plays: nothing is loaded in these tests), then
+        // "Resume": from where it was, and the player opens
+        h.state_mut().s.list.select(ids[0]);
+        assert!(h.state_mut().act(Action::ActivateAlt));
+        let nav = h.state_mut().nav();
+        let [NavRequest::Open(OverlayRequest::Resume(spec))] = nav.as_slice() else { panic!("{nav:?}") };
+        assert_eq!(spec.queue, Some(QueueResume { id: ids[0], fullscreen: true }));
+        let mut prompt = crate::ui::overlays::resume::ResumeOverlay::new(spec.clone());
+        h.state_mut().t.with_ctx(|ctx| prompt.on_action(ctx, Action::Activate));
+        assert_eq!(h.state_mut().nav(), vec![NavRequest::Push(Route::Player)]);
+        until(&mut h, "Movie 0 resumed", |_| film_plays(&rec).get(1) == Some(&(MediaRef::Movie(ms[0]), true)));
+
+        // Movie 1 has nothing to resume: Enter plays it at once
+        h.state_mut().s.list.select(ids[1]);
+        assert!(h.state_mut().act(Action::Activate));
+        assert!(h.state_mut().nav().is_empty(), "no prompt");
+        until(&mut h, "Movie 1 playing", |_| film_plays(&rec).get(2) == Some(&(MediaRef::Movie(ms[1]), true)));
     }
 }

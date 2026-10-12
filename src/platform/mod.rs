@@ -15,7 +15,25 @@ pub mod popout;
 pub mod signals;
 pub mod systemd;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::model::{ItemRef, ReminderId};
+
+static OFF_DESKTOP: AtomicBool = AtomicBool::new(false);
+
+/// Keep this process off the user's desktop from now on: no window focus requests
+/// (`hypr::focus_self`) and no notifications to the desktop's server (`notify`: only an
+/// explicit bus answers). The headless test UI (`ui::testing::TestUi`) sets it, so integration
+/// tests never touch a live session.
+pub fn keep_off_desktop() {
+    OFF_DESKTOP.store(true, Ordering::Relaxed);
+}
+
+/// Off the desktop: unit tests, a process that called [`keep_off_desktop`], or
+/// `TUNER_NO_DESKTOP` set.
+pub fn off_desktop() -> bool {
+    cfg!(test) || OFF_DESKTOP.load(Ordering::Relaxed) || std::env::var_os("TUNER_NO_DESKTOP").is_some()
+}
 
 /// Events from platform services to the UI thread.
 #[derive(Debug, Clone, PartialEq)]

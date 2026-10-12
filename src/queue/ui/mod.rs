@@ -102,7 +102,7 @@ fn guarded(sp: &crate::ui::widgets::spoiler::Spoilers, e: &QueueEntry) -> QueueE
     use crate::guard::{Field, Subject};
     let mut out = e.clone();
     if let Some(slot) = &e.programme {
-        let subj = Subject::Programme { title: &e.title, sub_title: None, categories: &[], season_episode: None, start: slot.start };
+        let subj = Subject::Programme { title: &e.title, sub_title: None, categories: &[], season_episode: None, start: slot.start, is_new: false };
         out.title = sp.text(&subj, Field::Title, &e.title).map_or_else(|| "Programme (spoiler guard)".to_owned(), |t| t.into_owned());
         return out;
     }
@@ -166,6 +166,61 @@ pub fn send(ctx: &mut UiCtx<'_>, cmd: QueueCommand) -> bool {
             false
         }
     }
+}
+
+/// What Enter on a row did ([`play_row`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowPlay {
+    /// Sent to the engine: it plays from here.
+    Sent,
+    /// The Resume prompt is open; its answer goes to the engine.
+    Prompt,
+    /// Up next isn't running (a toast says so).
+    NotRunning,
+}
+
+/// Enter (a double-click, "Play now") on a row of the Up next screen or the player's panel
+/// (up-next-design §3 "Resume": "Enter on a row uses the normal Resume prompt"): the Resume
+/// prompt when the row's film or episode has progress past `resume_min_s` and the row doesn't
+/// ask for the start; else play from here as before. Locked, concealed and gone rows go
+/// straight to the engine, which says why. One read on the key press; when the frame's budget
+/// is spent, it plays (and resumes silently, as advancing does).
+pub fn play_row(ctx: &mut UiCtx<'_>, s: &QueueSnapshot, id: QueueId, fullscreen: bool) -> RowPlay {
+    if let Some(row) = s.row(id).filter(|r| !r.entry.from_start && r.entry.programme.is_none()) {
+        let cfg = ctx.config;
+        let view = crate::shared::ParentalView {
+            unlocked: ctx.parental.is_unlocked(&cfg.parental),
+            hides_explicit: ctx.parental.hides_explicit(&cfg.parental),
+            pin_active: cfg.parental.pin_active(),
+        };
+        let (db, lib, now) = (ctx.db, ctx.lib.clone(), ctx.now);
+        let at = ctx
+            .budget
+            .run(|| crate::queue::service::resume_point(db, &lib, view, cfg, &row.entry, now))
+            .and_then(|r| r.map_err(|e| tracing::debug!("queue: resume point of #{id}: {e}")).ok().flatten());
+        if let Some(at) = at.filter(|a| a.position_s > f64::from(cfg.player.resume_min_s)) {
+            if ctx.services.agent.queue_handle().is_none() {
+                ctx.toast(Toast::info("Up next isn't running"));
+                return RowPlay::NotRunning;
+            }
+            // the prompt says what the row says: through the guard
+            let e = &guarded(&crate::ui::widgets::spoiler::Spoilers::of(ctx), &row.entry);
+            let title = match &e.subtitle {
+                Some(sub) => format!("{} — {sub}", e.title),
+                None => e.title.clone(),
+            };
+            ctx.open(crate::ui::OverlayRequest::Resume(crate::ui::overlays::ResumeSpec {
+                media: at.media,
+                title,
+                position_s: at.position_s,
+                duration_s: at.duration_s,
+                copy: None,
+                queue: Some(crate::ui::overlays::QueueResume { id, fullscreen }),
+            }));
+            return RowPlay::Prompt;
+        }
+    }
+    if send(ctx, QueueCommand::PlayAt(id)) { RowPlay::Sent } else { RowPlay::NotRunning }
 }
 
 // ------------------------------------------------------------------ text
@@ -706,7 +761,7 @@ pub(crate) mod tests {
         let mut series = std::collections::HashMap::new();
         series.insert(
             crate::spoiler::series_key("Queue Guard Show"),
-            SeriesMark { label: "Queue Guard Show".into(), next_up: (2, 4), automatic: true, rule: None },
+            SeriesMark { label: "Queue Guard Show".into(), next_up: (2, 4), automatic: true, ..Default::default() },
         );
         let guard = crate::guard::Guard::with_snapshot(GuardSnapshot::from_parts(Settings::default(), Vec::new(), series, Default::default()));
         let sp = crate::ui::widgets::spoiler::Spoilers::with_guard(guard, 0, true);

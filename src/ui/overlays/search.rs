@@ -1126,6 +1126,7 @@ mod tests {
                     title: "X".into(),
                     sub_title: None,
                     flags: Default::default(),
+                    episode: None,
                 },
                 epg_channel_id: crate::model::EpgChannelId(1),
                 channel_ids: vec![],

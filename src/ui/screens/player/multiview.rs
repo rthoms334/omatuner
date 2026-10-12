@@ -106,6 +106,11 @@ impl PlayerScreen {
         Some(resp)
     }
 
+    /// Where each picture went last frame (empty in single view).
+    pub(super) fn mv_placed(&self) -> &[Placed] {
+        &self.mv.placed
+    }
+
     /// A picture dragged and dropped at `at`: onto the other picture swaps places; the inset
     /// dropped elsewhere snaps to the nearest corner (saved).
     fn drop_picture(&mut self, ctx: &mut UiCtx<'_>, placed: &[Placed], p: &Placed, layout: Layout, area: Rect, at: egui::Pos2) {
@@ -398,7 +403,8 @@ fn strip_text(ctx: &mut UiCtx<'_>, snap: &PlayerSnapshot) -> StripText {
             let title = p.subtitle.as_deref().map_or_else(
                 || "Catch-up".to_owned(),
                 |t| {
-                    let subject = crate::guard::Subject::Programme { title: t, sub_title: None, categories: &[], season_episode: None, start };
+                    let subject =
+                        crate::guard::Subject::Programme { title: t, sub_title: None, categories: &[], season_episode: None, start, is_new: false };
                     spoilers.text(&subject, crate::guard::Field::Title, t).map(|c| c.into_owned()).unwrap_or_default()
                 },
             );

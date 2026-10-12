@@ -255,6 +255,7 @@ mod tests {
                 title: Arc::from("News"),
                 sub_title: None,
                 flags: ProgrammeFlags::default(),
+                episode: None,
             };
             Ok(keys.iter().map(|k| (*k, NowNext { now: Some(p.shifted(k.1)), next: None })).collect())
         }

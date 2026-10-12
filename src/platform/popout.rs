@@ -44,9 +44,14 @@ const MOVED_SLACK: i32 = 2;
 /// Smallest pop-out a remembered geometry is clamped to.
 const MIN_SIZE: (i32, i32) = (192, 108);
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
-/// A pop-out right after leaving fullscreen waits this long for Hyprland to see it.
-const FULLSCREEN_WAIT: Duration = Duration::from_millis(100);
+/// A pop-out right after leaving fullscreen, or right after the window was created, waits in
+/// steps of this long for Hyprland to see it (fullscreen gone, the window mapped)…
+const READY_WAIT: Duration = Duration::from_millis(100);
+/// …this many times while it's fullscreen…
 const FULLSCREEN_TRIES: u32 = 10;
+/// …and this many times while Hyprland doesn't list the window (a launch straight into the
+/// pop-out asks on the first frame, before the window is mapped).
+const MAP_TRIES: u32 = 30;
 
 /// One request on Hyprland's request socket. `SocketIpc` in the app, a fake in tests.
 pub trait HyprIpc: Send {
@@ -288,11 +293,23 @@ impl From<String> for PopError {
 pub struct Hypr<I: HyprIpc> {
     ipc: I,
     syntax: Syntax,
+    /// Until the first pop-out: the window was started for the pop-out (`POPOUT_APP_ID`), so a
+    /// floating, pinned window is the launch rule's doing, not the user's.
+    launch_rule: bool,
 }
 
 impl<I: HyprIpc> Hypr<I> {
     pub fn new(ipc: I) -> Self {
-        Self { ipc, syntax: Syntax::Unknown }
+        Self { ipc, syntax: Syntax::Unknown, launch_rule: false }
+    }
+
+    /// The window was started for the pop-out under [`crate::POPOUT_APP_ID`]: the packaged
+    /// rule (`packaging/hypr/tuner.lua`) maps it floating and pinned, without the keyboard. The
+    /// first pop-out takes that state as its own, so popping in tiles the window (instead of
+    /// keeping it floating and pinned as if the user had done that).
+    pub fn with_launch_rule(mut self) -> Self {
+        self.launch_rule = true;
+        self
     }
 
     fn json<T: serde::de::DeserializeOwned>(&mut self, what: &str) -> Result<T, String> {
@@ -349,17 +366,19 @@ impl<I: HyprIpc> Hypr<I> {
             }
             _ => return Err(PopError::Fullscreen),
         }
+        // floating + pinned by the launch rule (never tagged by it): popped in, it tiles
+        let launched = std::mem::take(&mut self.launch_rule) && c.floating && c.pinned && !c.has_tag("pop");
         let m = self.monitor(c.monitor)?;
         let r = place(&m, size, corner, last);
         let restore = Restore {
-            was_floating: c.floating,
-            was_pinned: c.pinned,
+            was_floating: c.floating && !launched,
+            was_pinned: c.pinned && !launched,
             had_tag: c.has_tag("pop"),
             before: Rect { x: c.at[0], y: c.at[1], w: c.size[0], h: c.size[1] },
             size,
             corner,
         };
-        if let Err(e) = self.float_place_pin(&c, r) {
+        if let Err(e) = self.float_place_pin(&c, r, !launched) {
             if let Err(undo) = self.pop_in(pid, Some(&restore)) {
                 tracing::warn!("pop-out: undoing a refused pop-out: {undo}");
             }
@@ -368,7 +387,14 @@ impl<I: HyprIpc> Hypr<I> {
         Ok(restore)
     }
 
-    fn float_place_pin(&mut self, c: &Client, r: Rect) -> Result<(), String> {
+    /// None of these steps moves the keyboard focus (Hyprland 0.56's `Actions::floatWindow`,
+    /// `pinWindow`, `resize`, `move`, `tag`). `alter_zorder` alone may: after raising it
+    /// simulates a pointer motion, and with `follow_mouse = 1` (Omarchy's) a pointer that just
+    /// moved over the raised window gives it the keyboard. So it is sent only when needed: a
+    /// window Hyprland floats is raised by that already (0.56 `floatWindow`, and
+    /// `changeWindowFloatingMode` before it), and a freshly mapped window (`raise` = false: the
+    /// launch rule floated it) is on top anyway.
+    fn float_place_pin(&mut self, c: &Client, r: Rect, raise: bool) -> Result<(), String> {
         let a = c.address.as_str();
         if !c.floating {
             self.dispatch(Cmd::Float(true), a)?;
@@ -378,7 +404,9 @@ impl<I: HyprIpc> Hypr<I> {
         if !c.pinned {
             self.dispatch(Cmd::Pin(true), a)?;
         }
-        self.dispatch(Cmd::Raise, a)?;
+        if c.floating && raise {
+            self.dispatch(Cmd::Raise, a)?;
+        }
         if !c.has_tag("pop") {
             self.dispatch(Cmd::Tag(true), a)?;
         }
@@ -491,13 +519,17 @@ pub struct PopOutWorker {
 
 impl PopOutWorker {
     /// Under Hyprland: start both threads for our own window. `None` outside Hyprland.
-    pub fn start(bus: EventBus) -> Option<Self> {
+    /// `launched`: the window was started for the pop-out ([`Hypr::with_launch_rule`]).
+    pub fn start(bus: EventBus, launched: bool) -> Option<Self> {
         let ipc = SocketIpc::from_env()?;
         let pid = std::process::id();
         let (tx, rx) = crossbeam_channel::unbounded::<PopRequest>();
         let worker_bus = bus.clone();
         let worker_ipc = ipc.clone();
-        let spawned = std::thread::Builder::new().name("hypr-popout".into()).spawn(move || serve(Hypr::new(worker_ipc), &rx, &worker_bus, pid));
+        let spawned = std::thread::Builder::new().name("hypr-popout".into()).spawn(move || {
+            let hypr = Hypr::new(worker_ipc);
+            serve(if launched { hypr.with_launch_rule() } else { hypr }, &rx, &worker_bus, pid)
+        });
         if let Err(e) = spawned {
             tracing::warn!("pop-out worker: {e}");
             return None;
@@ -519,7 +551,7 @@ fn serve<I: HyprIpc>(mut hypr: Hypr<I>, rx: &crossbeam_channel::Receiver<PopRequ
     let mut restore: Option<Restore> = None;
     for req in rx.iter() {
         let ev = match req {
-            PopRequest::Out { size, corner, last } => match after_fullscreen(|| hypr.pop_out(pid, size, corner, last)) {
+            PopRequest::Out { size, corner, last } => match when_ready(true, || hypr.pop_out(pid, size, corner, last)) {
                 Ok(r) => {
                     restore = Some(r);
                     PopOutEvent::PoppedOut
@@ -528,7 +560,7 @@ fn serve<I: HyprIpc>(mut hypr: Hypr<I>, rx: &crossbeam_channel::Receiver<PopRequ
             },
             PopRequest::In { ours } => {
                 let record = restore.take().filter(|_| ours);
-                match after_fullscreen(|| hypr.pop_in(pid, record.as_ref())) {
+                match when_ready(false, || hypr.pop_in(pid, record.as_ref())) {
                     Ok(place) => PopOutEvent::PoppedIn { place },
                     Err(error) => {
                         // still popped out: the next pop-in undoes the same record
@@ -543,18 +575,24 @@ fn serve<I: HyprIpc>(mut hypr: Hypr<I>, rx: &crossbeam_channel::Receiver<PopRequ
     }
 }
 
-/// Run `step`, retrying while the window is fullscreen: the app left window fullscreen just
-/// before the request and Hyprland may not have seen it yet.
-fn after_fullscreen<T>(mut step: impl FnMut() -> Result<T, PopError>) -> Result<T, PopError> {
-    let mut result = step();
-    for _ in 0..FULLSCREEN_TRIES {
-        if !matches!(result, Err(PopError::Fullscreen)) {
-            break;
+/// Run `step`, retrying while the window is fullscreen (the app left window fullscreen just
+/// before the request and Hyprland may not have seen it yet) and, with `mapping`, while
+/// Hyprland doesn't list it yet (a pop-out asked for on the first frame of a new window).
+fn when_ready<T>(mapping: bool, mut step: impl FnMut() -> Result<T, PopError>) -> Result<T, PopError> {
+    let (mut fullscreen, mut unmapped) = (0, 0);
+    loop {
+        let result = step();
+        let tries = match &result {
+            Err(PopError::Fullscreen) => Some((&mut fullscreen, FULLSCREEN_TRIES)),
+            Err(PopError::NoWindow) if mapping => Some((&mut unmapped, MAP_TRIES)),
+            _ => None,
+        };
+        match tries {
+            Some((n, max)) if *n < max => *n += 1,
+            _ => return result,
         }
-        std::thread::sleep(FULLSCREEN_WAIT);
-        result = step();
+        std::thread::sleep(READY_WAIT);
     }
-    result
 }
 
 /// Follows our window through Hyprland's event stream.
@@ -749,8 +787,10 @@ mod tests {
     const W: &str = "address:0xaaab07400000";
 
     /// Lua config (Omarchy 4): float, 480×270 at the bottom-right of the 1920×1200 logical
-    /// monitor (bar 26 px, margin 10), pin, raise, tag; pop-in undoes exactly that. An unmoved
-    /// pop-out's place isn't remembered (it follows the corner); a moved one's is.
+    /// monitor (bar 26 px, margin 10), pin, tag — no `alter_zorder`: floating raised it, and
+    /// that dispatcher's simulated pointer motion could hand it the keyboard; pop-in undoes
+    /// exactly that. An unmoved pop-out's place isn't remembered (it follows the corner); a
+    /// moved one's is.
     #[test]
     fn lua_pop_out_and_back_restores_the_tiled_window() {
         let fake = FakeHypr::new(true, tiled(PID));
@@ -763,7 +803,6 @@ mod tests {
                 format!("hl.dsp.window.resize({{ window = \"{W}\", x = 480, y = 270 }})"),
                 format!("hl.dsp.window.move({{ window = \"{W}\", x = 1430, y = 920 }})"),
                 format!("hl.dsp.window.pin({{ window = \"{W}\", action = \"enable\" }})"),
-                format!("hl.dsp.window.alter_zorder({{ window = \"{W}\", mode = \"top\" }})"),
                 format!("hl.dsp.window.tag({{ window = \"{W}\", tag = \"+pop\" }})"),
             ]
         );
@@ -772,7 +811,7 @@ mod tests {
 
         assert_eq!(h.pop_in(PID, Some(&restore)), Ok(Place::Forget), "unmoved: follow the corner");
         assert_eq!(
-            fake.dispatched()[6..],
+            fake.dispatched()[5..],
             [
                 format!("hl.dsp.window.pin({{ window = \"{W}\", action = \"disable\" }})"),
                 format!("hl.dsp.window.tag({{ window = \"{W}\", tag = \"-pop\" }})"),
@@ -802,7 +841,6 @@ mod tests {
                 format!("resizewindowpixel exact 640 360,{W}"),
                 format!("movewindowpixel exact 0 26,{W}"),
                 format!("pin {W}"),
-                format!("alterzorder top,{W}"),
                 format!("tagwindow +pop {W}"),
             ]
         );
@@ -820,6 +858,7 @@ mod tests {
         let mut h = Hypr::new(fake.clone());
         let restore = h.pop_out(PID, PopoutSize::Small, PopoutCorner::BottomLeft, None).unwrap();
         assert!(!fake.dispatched()[0].contains("window.float"), "already floating: {:?}", fake.dispatched());
+        assert!(fake.dispatched().iter().any(|d| d.contains("alter_zorder")), "nothing raised it: raise it");
         h.pop_in(PID, Some(&restore)).unwrap();
         let back = fake.dispatched();
         assert_eq!(
@@ -889,6 +928,81 @@ mod tests {
         let fake = FakeHypr::new(false, max);
         assert_eq!(Hypr::new(fake.clone()).pop_out(PID, PopoutSize::Small, PopoutCorner::BottomRight, None), Err(PopError::Maximized));
         assert!(fake.dispatched().is_empty());
+    }
+
+    /// A window started for the pop-out (`tuner-popout`) is mapped floating and pinned by the
+    /// packaged rule. Its first pop-out only sizes, places and tags it (no float, no pin, no
+    /// raise: nothing that could move the keyboard) and takes the floating + pinned state as its
+    /// own, so popping in tiles it. The flag survives a pop-out asked before the window was
+    /// mapped and is used once: the next pop-out of the now tiled window is the usual one.
+    /// Without the flag the same window is the user's floating + pinned window, kept as it is.
+    #[test]
+    fn launch_rule_window_is_adopted_by_its_first_pop_out() {
+        let mut ruled = tiled(PID);
+        ruled["floating"] = true.into();
+        ruled["pinned"] = true.into();
+        ruled["at"] = serde_json::json!([720, 465]);
+        ruled["size"] = serde_json::json!([480, 270]);
+        let fake = FakeHypr::new(true, ruled.clone());
+        let mut h = Hypr::new(fake.clone()).with_launch_rule();
+        assert_eq!(h.pop_out(7, PopoutSize::Small, PopoutCorner::BottomRight, None), Err(PopError::NoWindow), "not mapped yet");
+        let restore = h.pop_out(PID, PopoutSize::Small, PopoutCorner::BottomRight, None).unwrap();
+        assert_eq!(
+            fake.dispatched(),
+            [
+                format!("hl.dsp.window.resize({{ window = \"{W}\", x = 480, y = 270 }})"),
+                format!("hl.dsp.window.move({{ window = \"{W}\", x = 1430, y = 920 }})"),
+                format!("hl.dsp.window.tag({{ window = \"{W}\", tag = \"+pop\" }})"),
+            ]
+        );
+        assert_eq!(h.pop_in(PID, Some(&restore)), Ok(Place::Forget));
+        assert_eq!(
+            fake.dispatched()[3..],
+            [
+                format!("hl.dsp.window.pin({{ window = \"{W}\", action = \"disable\" }})"),
+                format!("hl.dsp.window.tag({{ window = \"{W}\", tag = \"-pop\" }})"),
+                format!("hl.dsp.window.float({{ window = \"{W}\", action = \"disable\" }})"),
+            ]
+        );
+        let w = fake.ours();
+        assert_eq!((w["floating"].as_bool(), w["pinned"].as_bool()), (Some(false), Some(false)), "tiled like any window");
+        h.pop_out(PID, PopoutSize::Small, PopoutCorner::BottomRight, None).unwrap();
+        let sent = fake.dispatched();
+        assert!(sent[6].contains("window.float") && sent[9].contains("window.pin"), "the usual pop-out: {sent:?}");
+
+        // no launch flag: the user's own floating + pinned window stays so when popped in
+        let fake = FakeHypr::new(true, ruled);
+        let mut h = Hypr::new(fake.clone());
+        let restore = h.pop_out(PID, PopoutSize::Small, PopoutCorner::BottomRight, None).unwrap();
+        h.pop_in(PID, Some(&restore)).unwrap();
+        let w = fake.ours();
+        assert_eq!((w["floating"].as_bool(), w["pinned"].as_bool()), (Some(true), Some(true)));
+        let sent = fake.dispatched();
+        assert!(!sent.iter().any(|d| d.contains("window.pin") || d.contains("action = \"disable\"")), "{sent:?}");
+    }
+
+    /// The worker waits for a window that isn't mapped yet only when popping out (a pop-in
+    /// without a window has nothing to do), and stops waiting once the step answers.
+    #[test]
+    fn pop_out_waits_for_the_window_to_map() {
+        let mut calls = 0;
+        let r = when_ready(true, || {
+            calls += 1;
+            if calls < 3 { Err(PopError::NoWindow) } else { Ok(calls) }
+        });
+        assert_eq!(r, Ok(3));
+        let mut calls = 0;
+        let r: Result<(), _> = when_ready(false, || {
+            calls += 1;
+            Err(PopError::NoWindow)
+        });
+        assert_eq!((r, calls), (Err(PopError::NoWindow), 1));
+        let mut calls = 0;
+        let r: Result<(), _> = when_ready(true, || {
+            calls += 1;
+            Err(PopError::Ipc("refused".into()))
+        });
+        assert_eq!(calls, 1, "{r:?}");
     }
 
     /// The event stream drives the floating/pinned flags of OUR window only.

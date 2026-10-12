@@ -51,6 +51,9 @@ pub struct TestUi {
     pub nav: Vec<NavRequest>,
     pub toasts: Vec<Toast>,
     pub config_edits: Vec<crate::ui::ConfigEdit>,
+    /// Multi-view as the screens see it (off unless a test sets it; `snapshot` stays the
+    /// focused picture's).
+    pub multiview: crate::ui::multiview::MvFrame,
     dir: PathBuf,
 }
 
@@ -63,6 +66,8 @@ impl TestUi {
     pub fn with_config(mut config: Config) -> Result<Self> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
+        // a headless UI never focuses a window or notifies on the user's desktop
+        crate::platform::keep_off_desktop();
         let dir = std::env::temp_dir().join(format!("tuner-testui-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
         let paths = crate::paths::AppPaths::rooted(&dir);
         config.player.mpv_options.insert("vo".into(), "null".into());
@@ -98,6 +103,7 @@ impl TestUi {
             nav: Vec::new(),
             toasts: Vec::new(),
             config_edits: Vec::new(),
+            multiview: Default::default(),
             dir,
         })
     }
@@ -145,6 +151,7 @@ impl TestUi {
             toasts: &mut self.toasts,
             config_edits: &mut self.config_edits,
         });
+        ctx.multiview = self.multiview.clone();
         f(&mut ctx)
     }
 }

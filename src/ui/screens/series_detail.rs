@@ -450,6 +450,9 @@ impl Screen for SeriesDetailScreen {
     fn hint_extras(&self) -> Vec<(Action, &'static str)> {
         if self.copies.is_stacked() { vec![(Action::PlayFrom, "play from")] } else { Vec::new() }
     }
+    fn reveal_target(&self, _ctx: &UiCtx<'_>) -> Option<crate::ui::item_menu::Target> {
+        self.feature_target()
+    }
     fn key_contexts(&self) -> Vec<KeyContext> {
         vec![KeyContext::Detail]
     }

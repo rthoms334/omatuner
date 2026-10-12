@@ -81,6 +81,12 @@ impl Spoilers {
         self.guarded_with(subject, field, text, policy)
     }
 
+    /// The guard hides or rewrites `field` of `subject` (whether or not it is shown on
+    /// purpose now).
+    pub fn would_guard(&self, subject: &Subject<'_>, field: Field, text: &str) -> bool {
+        !text.is_empty() && !matches!(self.guarded_with(subject, field, text, Policy::Normal), Guarded::Shown(_))
+    }
+
     fn guarded_with<'a>(&self, subject: &Subject<'_>, field: Field, text: &'a str, policy: Policy) -> Guarded<'a> {
         match &self.guard {
             Some(g) => g.text(subject, field, text, policy, self.now),
@@ -131,12 +137,21 @@ pub fn programme_subject(p: &Programme) -> Subject<'_> {
         categories: &p.categories,
         season_episode: crate::spoiler::programme_se(p),
         start: p.start,
+        is_new: p.is_new,
     }
 }
 
-/// The subject of a grid programme (no categories or S/E in the slim row).
+/// The subject of a grid programme (no categories in the slim row; its S/E and "new" flag
+/// are there).
 pub fn slim_subject(p: &crate::model::ProgrammeSlim) -> Subject<'_> {
-    Subject::Programme { title: &p.title, sub_title: p.sub_title.as_deref(), categories: &[], season_episode: None, start: p.start }
+    Subject::Programme {
+        title: &p.title,
+        sub_title: p.sub_title.as_deref(),
+        categories: &[],
+        season_episode: p.episode.and_then(crate::spoiler::episode_se),
+        start: p.start,
+        is_new: p.flags.is_new,
+    }
 }
 
 impl Spoilers {
@@ -411,7 +426,7 @@ mod tests {
     /// Severance, next up S2E4: later episodes are guarded.
     fn severance() -> Guard {
         let mut series = HashMap::new();
-        series.insert("severance".to_owned(), SeriesMark { label: "Severance".into(), next_up: (2, 4), automatic: true, rule: None });
+        series.insert("severance".to_owned(), SeriesMark { label: "Severance".into(), next_up: (2, 4), automatic: true, ..Default::default() });
         Guard::with_snapshot(GuardSnapshot::from_parts(Settings::default(), Vec::new(), series, HashMap::new()))
     }
 

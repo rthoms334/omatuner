@@ -101,9 +101,7 @@ impl Store {
 
     /// Open a new read-only connection (`query_only=ON`). Each thread keeps its own.
     pub fn reader(&self) -> Result<Connection> {
-        let conn = Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
-        configure(&conn, true)?;
-        Ok(conn)
+        open_reader(&self.path)
     }
 
     /// Drain the writer and join it (see [`Writer::shutdown`]).
@@ -142,6 +140,14 @@ fn create_private_file(path: &Path) -> Result<()> {
     std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(path).map_err(|e| Error::io(path, e))?;
     // tighten pre-existing files too
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| Error::io(path, e))
+}
+
+/// A read-only connection to the database at `path`, configured like [`Store::reader`]'s (the
+/// library build opens a second one beside its caller's: `library::load_profiled`).
+pub(crate) fn open_reader(path: &Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    configure(&conn, true)?;
+    Ok(conn)
 }
 
 fn configure(conn: &Connection, read_only: bool) -> Result<()> {

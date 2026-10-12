@@ -163,6 +163,15 @@ impl ExplicitIndex {
     pub fn contains(&self, item: &ItemRef) -> bool {
         self.refs.contains(item)
     }
+
+    /// Add what another part of the same build found (the channels, read on their own thread).
+    fn merge(&mut self, other: ExplicitIndex) {
+        self.groups.extend(other.groups);
+        self.channels.extend(other.channels);
+        self.vod.extend(other.vod);
+        self.refs.extend(other.refs);
+        self.clean.extend(other.clean);
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1508,9 +1517,20 @@ impl LoadProfile {
 }
 
 /// [`load_with`], with the time of each step.
+///
+/// The build reads ONE snapshot of the database: it opens a read transaction on `conn` (or
+/// reads in the caller's, when one is open). The channels are read on their own thread, on a
+/// second connection whose read transaction is on the same snapshot ([`Snapshot::take`]),
+/// while `conn` reads the movies and series; when no such connection can be had (an in-memory
+/// database, a caller's transaction, writes landing while the snapshots are taken), `conn`
+/// reads everything, the channels first. With the thread, the `channels` step is the wait for
+/// it after the VOD steps, so the steps still add up to the build's wall time.
 pub fn load_profiled(conn: &Connection, opts: &LoadOptions) -> Result<(Library, LoadProfile)> {
     let mut profile = LoadProfile::default();
     let mut t = std::time::Instant::now();
+    // `_txn` (not `_`): the read transaction lasts the whole build
+    let Snapshot { txn: _txn, twin } = Snapshot::take(conn)?;
+    profile.lap("snapshot", &mut t);
     let sources = load_sources(conn)?;
     profile.lap("sources", &mut t);
     let (ch_groups, movie_groups, series_groups) = load_groups(conn, &sources)?;
@@ -1520,23 +1540,49 @@ pub fn load_profiled(conn: &Connection, opts: &LoadOptions) -> Result<(Library, 
         ..Default::default()
     };
     let order = SourceOrder::of(&sources);
-    let live = load_live(conn, ch_groups, &order, &mut explicit)?;
-    profile.lap("channels", &mut t);
-    let (movies, members, movie_raw) = load_vod(conn, true, &movie_groups, &order, &mut explicit)?;
-    profile.lap("movies", &mut t);
-    let (series, series_members, series_raw) = load_vod(conn, false, &series_groups, &order, &mut explicit)?;
-    profile.lap("series", &mut t);
-    // "Also hide titles in other languages" (DESIGN §28.12)
     let mut sources = sources;
     let prefs = opts.lang_prefs();
-    let langs = LanguageRule::of(conn, &sources, &prefs)?;
-    let mut movie_groups = movie_groups;
-    let mut series_groups = series_groups;
-    let (movies, mut members, movie_raw) = langs.apply(ItemKind::Movie, movies, members, movie_raw, &mut movie_groups, &mut sources);
-    let (series, series_members, series_raw) = langs.apply(ItemKind::Series, series, series_members, series_raw, &mut series_groups, &mut sources);
-    members.extend(series_members);
-    profile.lap("title languages", &mut t);
-    disabled_explicit_refs(conn, &mut explicit)?;
+    // the movies and series, on `conn`
+    let read_vod =
+        |explicit: &mut ExplicitIndex, sources: &mut [SourceMeta], profile: &mut LoadProfile, t: &mut std::time::Instant| -> Result<VodRead> {
+            let (movies, members, movie_raw) = load_vod(conn, true, &movie_groups, &order, explicit)?;
+            profile.lap("movies", t);
+            let (series, series_members, series_raw) = load_vod(conn, false, &series_groups, &order, explicit)?;
+            profile.lap("series", t);
+            // "Also hide titles in other languages" (DESIGN §28.12)
+            let langs = LanguageRule::of(conn, sources, &prefs)?;
+            let (mut movie_groups, mut series_groups) = (movie_groups, series_groups);
+            let (movies, mut members, movie_raw) = langs.apply(ItemKind::Movie, movies, members, movie_raw, &mut movie_groups, sources);
+            let (series, series_members, series_raw) = langs.apply(ItemKind::Series, series, series_members, series_raw, &mut series_groups, sources);
+            members.extend(series_members);
+            profile.lap("title languages", t);
+            disabled_explicit_refs(conn, explicit)?;
+            Ok(VodRead { movies, series, members, movie_raw, series_raw, movie_groups, series_groups })
+        };
+    let (live, vod) = match twin {
+        Some(twin) => std::thread::scope(|s| -> Result<_> {
+            let order = &order;
+            let channels = std::thread::Builder::new()
+                .name("library-channels".into())
+                .spawn_scoped(s, move || {
+                    let mut x = ExplicitIndex::default();
+                    load_live(&twin, ch_groups, order, &mut x).map(|live| (live, x))
+                })
+                .map_err(crate::error::Error::other)?;
+            let vod = read_vod(&mut explicit, &mut sources, &mut profile, &mut t);
+            let channels = channels.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            let (vod, (live, x)) = (vod?, channels?);
+            explicit.merge(x);
+            profile.lap("channels", &mut t);
+            Ok((live, vod))
+        })?,
+        None => {
+            let live = load_live(conn, ch_groups, &order, &mut explicit)?;
+            profile.lap("channels", &mut t);
+            (live, read_vod(&mut explicit, &mut sources, &mut profile, &mut t)?)
+        }
+    };
+    let VodRead { movies, series, members, movie_raw, series_raw, movie_groups, series_groups } = vod;
     // the match data of what the snapshot will show (`with_visibility` keeps the order)
     let shown = |items: &[VodSummary], raw: Vec<CopyRaw>| -> Vec<CopyRaw> {
         if opts.visibility.explicit || explicit.vod.is_empty() {
@@ -1565,6 +1611,96 @@ pub fn load_profiled(conn: &Connection, opts: &LoadOptions) -> Result<(Library, 
     let lib = lib.stacked(movie_raw, series_raw, &prefs);
     profile.lap("stacks", &mut t);
     Ok((lib, profile))
+}
+
+/// The movies and series of a build (title languages applied), with their groups.
+struct VodRead {
+    movies: Vec<VodSummary>,
+    series: Vec<VodSummary>,
+    members: VodMembers,
+    movie_raw: Vec<CopyRaw>,
+    series_raw: Vec<CopyRaw>,
+    movie_groups: Vec<Group>,
+    series_groups: Vec<Group>,
+}
+
+/// The read transactions one build reads its snapshot in.
+struct Snapshot<'c> {
+    /// The read transaction the build opened on its caller's connection (`None`: the caller
+    /// has one open, and the build reads in it).
+    txn: Option<ReadTxn<'c>>,
+    /// A second read-only connection, in a read transaction on the same snapshot.
+    twin: Option<Connection>,
+}
+
+impl<'c> Snapshot<'c> {
+    /// Times a write may land while the two snapshots are taken before the build gives the
+    /// second connection up.
+    const TRIES: usize = 3;
+
+    /// Open a read transaction on `conn` and, beside it, a second connection on the same
+    /// snapshot. WAL gives every read transaction the last commit at its start, so the two
+    /// agree when no write commits between their starts: the second connection reads
+    /// `PRAGMA data_version` (which changes when ANOTHER connection committed since its last
+    /// read) before `conn`'s transaction starts and again at its own transaction's start; the
+    /// same value, and `conn`'s snapshot (taken in between) is the second one's. A changed
+    /// value may also be a checkpoint: the build tries again, then reads on `conn` alone.
+    /// With the caller's transaction open there is nothing to share: `conn` may have
+    /// uncommitted writes, or a snapshot older than any new connection's.
+    fn take(conn: &'c Connection) -> Result<Snapshot<'c>> {
+        Self::take_with(conn, || {})
+    }
+
+    /// [`Snapshot::take`]; `between` runs after `conn`'s snapshot is taken, before the second
+    /// connection's (tests land a write there).
+    fn take_with(conn: &'c Connection, mut between: impl FnMut()) -> Result<Snapshot<'c>> {
+        if !conn.is_autocommit() {
+            return Ok(Snapshot { txn: None, twin: None });
+        }
+        // an in-memory or temporary database has no path (another connection can't open it)
+        let twin = conn.path().filter(|p| !p.is_empty()).and_then(|p| crate::store::open_reader(std::path::Path::new(p)).ok());
+        if let Some(twin) = twin {
+            for _ in 0..Self::TRIES {
+                let Ok(before) = data_version(&twin) else { break };
+                let txn = ReadTxn::begin(conn)?;
+                between();
+                if twin.execute_batch("BEGIN").is_ok() && data_version(&twin).is_ok_and(|after| after == before) {
+                    return Ok(Snapshot { txn: Some(txn), twin: Some(twin) });
+                }
+                if !twin.is_autocommit() {
+                    let _ = twin.execute_batch("ROLLBACK");
+                }
+            }
+        }
+        Ok(Snapshot { txn: Some(ReadTxn::begin(conn)?), twin: None })
+    }
+}
+
+/// `PRAGMA data_version` (in a transaction: of its snapshot, which a read starts).
+fn data_version(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row("PRAGMA data_version", [], |r| r.get(0))
+}
+
+/// A read transaction the build opened on its caller's connection, ended on drop.
+struct ReadTxn<'c>(&'c Connection);
+
+impl<'c> ReadTxn<'c> {
+    /// `BEGIN`, and a read so that the snapshot is taken now, not at the build's first query.
+    fn begin(conn: &'c Connection) -> Result<ReadTxn<'c>> {
+        conn.execute_batch("BEGIN")?;
+        let txn = ReadTxn(conn);
+        data_version(conn)?;
+        Ok(txn)
+    }
+}
+
+impl Drop for ReadTxn<'_> {
+    fn drop(&mut self) {
+        // nothing was written: either ends it
+        if self.0.execute_batch("COMMIT").is_err() && !self.0.is_autocommit() {
+            let _ = self.0.execute_batch("ROLLBACK");
+        }
+    }
 }
 
 /// Explicit channels, movies and series of DISABLED playlists into `x.refs` (the enabled ones
@@ -1752,5 +1888,180 @@ mod tests {
         let channels: Vec<&str> = lib.live.channels.iter().map(|c| c.key.as_str()).collect();
         assert_eq!(channels, ["c3", "c1", "c2"]);
         assert_eq!(lib.live.group_members(GroupId(4)), [ChannelId(1), ChannelId(2)]);
+    }
+
+    /// The build read the channels on their own thread (the `channels` step comes last: the
+    /// wait for that thread) rather than first on the caller's connection.
+    fn channels_beside_vod(profile: &LoadProfile) -> bool {
+        let at = |step: &str| profile.0.iter().position(|(s, _)| *s == step).unwrap();
+        at("channels") > at("movies")
+    }
+
+    /// One playlist with an explicit category, a provider-flagged channel and movie, a
+    /// disabled playlist with an explicit channel; `extra` more channels and movies.
+    fn seed_two_playlists(store: &crate::store::Store) {
+        store
+            .writer()
+            .blocking(|c| {
+                c.execute_batch(
+                    "INSERT INTO source(id, name, kind, url, created_at, generation, sort_index, enabled) VALUES
+                       (1, 'A', 'm3u-url', 'http://a', 0, 1, 0, 1), (2, 'Off', 'm3u-url', 'http://b', 0, 1, 1, 0);
+                     INSERT INTO grp(id, source_id, kind, key, name, provider_order, item_count, seen_gen, explicit) VALUES
+                       (1, 1, 'channel', 'channel:news', 'News', 0, 2, 1, 0), (2, 1, 'channel', 'channel:xxx', 'XXX', 1, 1, 1, 1),
+                       (3, 1, 'movie', 'movie:m', 'Films', 0, 3, 1, 0), (4, 2, 'channel', 'channel:xxx', 'XXX', 0, 1, 1, 1);
+                     INSERT INTO channel(id, source_id, key, name, clean_name, norm_name, stream, provider_order, seen_gen, explicit) VALUES
+                       (1, 1, 'c1', 'One', 'One', 'one', '{}', 0, 1, 0), (2, 1, 'c2', 'Two', 'Two', 'two', '{}', 1, 1, 1),
+                       (3, 1, 'c3', 'Late', 'Late', 'late', '{}', 2, 1, 0), (4, 2, 'c4', 'Off', 'Off', 'off', '{}', 0, 1, 0);
+                     INSERT INTO channel_group(group_id, channel_id, position) VALUES (1, 1, 0), (1, 2, 1), (2, 3, 0), (4, 4, 0);
+                     INSERT INTO movie(id, source_id, key, name, clean_name, norm_name, stream, provider_order, seen_gen, explicit) VALUES
+                       (1, 1, 'm1', 'Film', 'Film', 'film', '{}', 0, 1, 0), (2, 1, 'm2', 'Adult', 'Adult', 'adult', '{}', 1, 1, 1);
+                     INSERT INTO movie_group(group_id, movie_id, position) VALUES (3, 1, 0), (3, 2, 1);",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn channels_read_on_their_own_thread_build_the_same_library() {
+        let store = crate::store::Store::open_temp("tuner-lib-twin", None).unwrap();
+        seed_two_playlists(&store);
+        let reader = store.reader().unwrap();
+        let (beside, profile) = load_profiled(&reader, &LoadOptions::default()).unwrap();
+        assert!(channels_beside_vod(&profile), "a quiet database on disk: the channels are read beside the VOD ({profile})");
+        assert!(reader.is_autocommit(), "the build ends the read transaction it opened");
+        // in the caller's transaction the build reads everything on the caller's connection
+        reader.execute_batch("BEGIN").unwrap();
+        let (serial, profile) = load_profiled(&reader, &LoadOptions::default()).unwrap();
+        assert!(!channels_beside_vod(&profile), "a caller's transaction: one connection ({profile})");
+        assert!(!reader.is_autocommit(), "the caller's transaction is left open");
+        reader.execute_batch("COMMIT").unwrap();
+
+        let keys = |lib: &Library| lib.live.channels.iter().map(|c| c.key.as_str().to_owned()).collect::<Vec<_>>();
+        assert_eq!(keys(&beside), ["c1", "c2", "c3"]);
+        assert_eq!(keys(&beside), keys(&serial));
+        assert_eq!(beside.live.group_members(GroupId(1)), serial.live.group_members(GroupId(1)));
+        let movies = |lib: &Library| lib.vod.movies.iter().map(|m| m.key.as_str().to_owned()).collect::<Vec<_>>();
+        assert_eq!(movies(&beside), ["m1", "m2"]);
+        assert_eq!(movies(&beside), movies(&serial));
+        // the explicit index merges the channel thread's part with the VOD's and the
+        // disabled playlist's
+        let (x, y) = (&beside.explicit, &serial.explicit);
+        assert_eq!(x.channels, HashSet::from([ChannelId(2), ChannelId(3)]));
+        assert_eq!(x.vod, HashSet::from([VodKind::Movie(MovieId(2))]));
+        let r = |source: i64, kind: ItemKind, key: &str| ItemRef { source: SourceId(source), kind, key: ItemKey(key.to_owned()) };
+        assert_eq!(
+            x.refs,
+            HashSet::from([r(1, ItemKind::Channel, "c2"), r(1, ItemKind::Channel, "c3"), r(1, ItemKind::Movie, "m2"), r(2, ItemKind::Channel, "c4")])
+        );
+        assert_eq!(x.clean, HashSet::from([(SourceId(1), ItemKind::Channel), (SourceId(1), ItemKind::Movie)]));
+        assert_eq!((&x.groups, &x.channels, &x.vod, &x.refs, &x.clean), (&y.groups, &y.channels, &y.vod, &y.refs, &y.clean));
+    }
+
+    #[test]
+    fn a_write_between_the_two_snapshots_is_caught() {
+        let store = crate::store::Store::open_temp("tuner-lib-between", None).unwrap();
+        seed_two_playlists(&store);
+        let add_channel = |n: u32| {
+            store
+                .writer()
+                .blocking(move |c| {
+                    c.execute(
+                        "INSERT INTO channel(source_id, key, name, clean_name, norm_name, stream, provider_order, seen_gen)
+                         VALUES (1, ?1, 'New', 'New', 'new', '{}', 100, 1)",
+                        [format!("between{n}")],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        };
+        let count = |c: &Connection| c.query_row("SELECT COUNT(*) FROM channel", [], |r| r.get::<_, i64>(0)).unwrap();
+        let reader = store.reader().unwrap();
+
+        // a commit lands after the caller's snapshot, before the second connection's, once:
+        // the build takes both again, and they agree
+        let mut landed = 0;
+        let snap = Snapshot::take_with(&reader, || {
+            if landed == 0 {
+                add_channel(landed);
+            }
+            landed += 1;
+        })
+        .unwrap();
+        assert_eq!(landed, 2, "the first pair was given up");
+        let twin = snap.twin.as_ref().expect("the second try agrees");
+        assert_eq!((count(&reader), count(twin)), (5, 5));
+        drop(snap);
+        assert!(reader.is_autocommit());
+
+        // writes land every time: the caller's connection reads alone, in one transaction
+        let mut tries = 0;
+        let snap = Snapshot::take_with(&reader, || {
+            tries += 1;
+            add_channel(tries);
+        })
+        .unwrap();
+        assert_eq!(tries, Snapshot::TRIES as u32);
+        assert!(snap.twin.is_none());
+        let seen = count(&reader);
+        add_channel(100);
+        assert_eq!(count(&reader), seen, "the build's transaction holds its snapshot");
+        drop(snap);
+        assert_eq!(count(&reader), seen + 1);
+    }
+
+    #[test]
+    fn channels_and_movies_come_from_one_snapshot_while_imports_write() {
+        let store = crate::store::Store::open_temp("tuner-lib-snapshot", None).unwrap();
+        seed_two_playlists(&store);
+        // an import's batches: a channel and a movie in each transaction, back to back
+        let stop = Arc::new(AtomicBool::new(false));
+        let writes = {
+            let (store, stop) = (store.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut n = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    n += 1;
+                    store
+                        .writer()
+                        .blocking(move |c| {
+                            let tx = c.transaction()?;
+                            tx.execute(
+                                "INSERT INTO channel(source_id, key, name, clean_name, norm_name, stream, provider_order, seen_gen)
+                                 VALUES (1, ?1, 'New', 'New', 'new', '{}', 100, 1)",
+                                [format!("new{n}")],
+                            )?;
+                            tx.execute(
+                                "INSERT INTO movie(source_id, key, name, clean_name, norm_name, stream, provider_order, seen_gen)
+                                 VALUES (1, ?1, 'New', 'New', 'new', '{}', 100, 1)",
+                                [format!("new{n}")],
+                            )?;
+                            tx.commit()?;
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+                n
+            })
+        };
+        let (mut builds, mut beside) = (0, 0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while builds < 60 && std::time::Instant::now() < deadline {
+            let (lib, profile) = load_profiled(&store.reader().unwrap(), &LoadOptions::default()).unwrap();
+            // 3 seeded channels (+ 1 of the disabled playlist, left out), 2 seeded movies
+            let (channels, movies) = (lib.live.channels.len() - 3, lib.vod.movies.len() - 2);
+            assert_eq!(channels, movies, "channels and movies of one snapshot ({profile})");
+            builds += 1;
+            beside += usize::from(channels_beside_vod(&profile));
+        }
+        stop.store(true, Ordering::Relaxed);
+        let written = writes.join().unwrap();
+        assert!(written > 0 && builds > 0);
+        println!("{builds} builds during {written} writes, {beside} with the channels on their own thread");
+        // quiet again: the build reads the channels beside the VOD, on the same snapshot
+        let (lib, profile) = load_profiled(&store.reader().unwrap(), &LoadOptions::default()).unwrap();
+        assert!(channels_beside_vod(&profile), "{profile}");
+        assert_eq!(lib.live.channels.len() - 3, written as usize);
+        assert_eq!(lib.vod.movies.len() - 2, written as usize);
     }
 }

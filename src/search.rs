@@ -815,6 +815,7 @@ mod tests {
                 title: Arc::from(title),
                 sub_title: None,
                 flags: ProgrammeFlags::default(),
+                episode: None,
             },
             epg_channel_id: EpgChannelId(1),
             channel_ids: vec![],

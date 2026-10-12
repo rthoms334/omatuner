@@ -2212,6 +2212,10 @@ impl Screen for LiveScreen {
         ScreenId::Live
     }
 
+    fn reveal_target(&self, _ctx: &UiCtx<'_>) -> Option<crate::ui::item_menu::Target> {
+        self.cursor_channel().filter(|_| self.focus == Pane::Channels).map(crate::ui::item_menu::Target::Channel)
+    }
+
     fn key_contexts(&self) -> Vec<KeyContext> {
         match self.focus {
             Pane::Groups => vec![self.group_list.key_context()],

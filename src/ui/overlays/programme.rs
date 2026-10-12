@@ -87,6 +87,7 @@ impl ProgrammeOverlay {
                 title: p.title.as_str().into(),
                 sub_title: p.sub_title.as_deref().map(Into::into),
                 flags: ProgrammeFlags { is_new: p.is_new, is_live: p.is_live, has_catchup_id: p.catchup_id.is_some() },
+                episode: p.episode,
             };
             s.shifted(channel.as_ref().map_or(0, |c| c.tvg_shift_min))
         });

@@ -404,9 +404,19 @@ mod tests {
 
     /// A film playing, the player entered, the engine running.
     fn player(video_only: bool, size: egui::Vec2) -> H {
-        let (mut t, one) = rig();
+        let (t, one) = rig();
+        player_on(t, one, video_only, size).0
+    }
+
+    /// [`player`] on a rig the test seeded; also the main picture's commands.
+    fn player_on(
+        mut t: crate::ui::testing::TestUi,
+        one: std::sync::MutexGuard<'static, ()>,
+        video_only: bool,
+        size: egui::Vec2,
+    ) -> (H, Arc<crate::ui::screens::queue::tests::Rec>) {
         t.video_only = video_only;
-        crate::ui::screens::queue::tests::start_engine(&t);
+        let rec = crate::ui::screens::queue::tests::start_engine(&t);
         let mut s = (*t.services().tiles.focused().snapshot()).clone();
         s.state = PlayerState::Playing;
         s.playable = Some(Arc::new(Playable {
@@ -429,7 +439,7 @@ mod tests {
         // the engine's first (empty) snapshot is out before ours goes in
         std::thread::sleep(Duration::from_millis(150));
         h.run_steps(2);
-        h
+        (h, rec)
     }
 
     /// Moonraker was played; Thunderball plays in 9 s.
@@ -498,5 +508,52 @@ mod tests {
         assert!(h.state_mut().act(Action::FilterClear));
         assert!(h.state_mut().act(Action::QueuePanel));
         assert!(h.state().s.panel.is_none());
+    }
+
+    /// The focused OSD control.
+    fn focused(h: &H) -> Option<Control> {
+        let s = &h.state().s;
+        s.osd_focus.then(|| s.visible.get(s.control).copied()).flatten()
+    }
+
+    /// The OSD row has `Up next` (the panel) and, once Up next has a next item, `Next`, for
+    /// the mouse and the controls focus alike: the button appearing doesn't move the focus,
+    /// Enter on `Next` plays the next item and a click on `Up next` opens the panel.
+    #[test]
+    fn the_osd_has_up_next_and_next_buttons() {
+        use crate::ui::item_menu::Target;
+        use crate::ui::screens::home::testkit::{movies, seed, source, until};
+        use egui_kittest::kittest::Queryable;
+        let (mut t, one) = rig();
+        let ms = seed(&mut t, |c| {
+            let a = source(c, "TV")?;
+            movies(c, a, 2)
+        });
+        let (mut h, rec) = player_on(t, one, false, egui::vec2(1600.0, 900.0));
+        assert!(h.state_mut().act(Action::FocusOsdControls));
+        h.run_steps(2);
+        assert!(has_label(&h, "Up next") && !has_label(&h, "Next in Up next"), "Up next is empty: no Next");
+        // the focus on Info, then Up next gets two films: Next comes in before Info
+        while focused(&h) != Some(Control::Info) {
+            assert!(h.state_mut().act(Action::Right));
+            h.run_steps(1);
+        }
+        for m in &ms {
+            assert!(h.state_mut().t.with_ctx(|ctx| crate::queue::ui::on_action(ctx, Action::QueueAdd, &Target::Movie(*m))));
+        }
+        until(&mut h, "the Next button", |h| has_label(h, "Next in Up next"));
+        h.run_steps(1);
+        assert_eq!(focused(&h), Some(Control::Info), "the focus stays on Info");
+        assert!(h.state_mut().act(Action::Left));
+        h.run_steps(1);
+        assert_eq!(focused(&h), Some(Control::QueueNext));
+        assert!(h.state_mut().act(Action::Activate));
+        until(&mut h, "Up next plays its first film", |_| {
+            rec.0.lock().unwrap().iter().any(|c| matches!(c, PlayerCommand::PlayCopy(c) if c.req.media == MediaRef::Movie(ms[0])))
+        });
+        assert!(h.state().s.panel.is_none());
+        h.get_by_label("Up next").click();
+        h.run_steps(2);
+        assert_eq!(h.state().s.panel.as_ref().map(|p| p.kind), Some(PanelKind::Queue), "the button opens the panel");
     }
 }

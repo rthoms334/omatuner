@@ -370,8 +370,8 @@ impl<'a> Q<'a> {
             channel: self.channel_out(c),
             also_on,
             categories: x.map(|x| x.categories.iter().map(|c| clean(c)).collect()).unwrap_or_default(),
-            season: x.and_then(|x| x.season),
-            episode: x.and_then(|x| x.episode),
+            season: x.and_then(|x| x.season).or(p.episode.and_then(|e| e.season)),
+            episode: x.and_then(|x| x.episode).or(p.episode.and_then(|e| e.episode)),
             is_live: p.flags.is_live,
             is_new: p.flags.is_new,
             repeat: x.is_some_and(|x| x.repeat),
@@ -641,7 +641,7 @@ fn window_hits(q: &Q, from: Timestamp, to: Timestamp, cats: &[String], channels:
         cats.iter().enumerate().map(|(i, _)| format!("instr(lower(p.categories), ?{})", i + 5)).collect::<Vec<_>>().join(" > 0 OR ");
     let cat_sql = if cats.is_empty() { String::new() } else { format!("AND ({cat_sql} > 0)") };
     let mut stmt = q.conn.prepare(&format!(
-        "SELECT p.id, p.start, p.stop, p.title, p.sub_title, p.flags, p.catchup_id IS NOT NULL FROM programme p
+        "SELECT p.id, p.start, p.stop, p.title, p.sub_title, p.flags, p.catchup_id IS NOT NULL, p.season, p.episode FROM programme p
          WHERE p.epg_channel_id = ?1
            AND p.gen = (SELECT es.active_gen FROM epg_channel ec JOIN epg_source es ON es.id = ec.epg_source_id WHERE ec.id = ?1 AND es.enabled = 1)
            AND p.start >= ?2 - 43200 AND p.start < ?3 AND p.stop > ?2 {cat_sql}
@@ -666,6 +666,10 @@ fn window_hits(q: &Q, from: Timestamp, to: Timestamp, cats: &[String], channels:
                 title: std::sync::Arc::from(r.get::<_, String>(3)?),
                 sub_title: r.get::<_, Option<String>>(4)?.map(std::sync::Arc::from),
                 flags: crate::model::ProgrammeFlags { is_new: flags & 1 != 0, is_live: flags & 2 != 0, has_catchup_id: r.get(6)? },
+                episode: {
+                    let (season, episode): (Option<u32>, Option<u32>) = (r.get(7)?, r.get(8)?);
+                    (season.is_some() || episode.is_some()).then_some(crate::model::EpisodeNum { season, episode })
+                },
             })
         })?;
         for row in rows {

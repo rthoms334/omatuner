@@ -465,7 +465,8 @@ These items use the **default** profile: start Tuner from the launcher, not with
     `require("hypr.tuner")` below `require("default.hypr.toggles")`. Reload Hyprland.
   - **Expect:**
     - The config loads without errors.
-    - `hyprctl clients` shows class `tuner`.
+    - `hyprctl clients` shows class `tuner` (`tuner-popout` for a Tuner started straight into
+      the pop-out, see §27).
     - Tuner's video is fully opaque (no wallpaper bleeding through, unlike a terminal).
     - The optional Super+Shift+T binding, when uncommented, launches or focuses Tuner.
 - [ ] **Playback on another workspace (60 s), with the Hyprland snippet:**
@@ -1287,9 +1288,11 @@ once (`claude mcp list` shows `tuner` connected).
 - [ ] **Backup:** export a backup after a shift and an "It's right", restore it on a fresh
   profile. **Expect:** the shift and the dismissal are back.
 - [ ] **Claude:** ask Claude "why is the guide empty on half my channels?" and to fix them.
-  **Expect:** a proposal; more than 50 channels is not applied from chat (Claude says to review
-  them in Guide fixes); a smaller batch applies and its toast/Undo works; a locked channel is
-  refused while locked.
+  **Expect:** a proposal; more than 50 channels is not applied from chat: Tuner comes forward
+  on Guide fixes with "Accept Claude's N fixes?" and Enter applies them (toast with Undo), Esc
+  applies nothing; a smaller batch applies from chat and its toast/Undo works; a locked
+  channel is refused while locked. Ask for a second big batch before opening the first card:
+  **Expect:** a toast says the earlier fixes were replaced and the card shows the newer batch.
 
 ## 23. Up next
 
@@ -1311,6 +1314,14 @@ once (`claude mcp list` shows `tuner` connected).
   "Next episode is locked", nothing plays.
 - [ ] **Restart:** quit during an item, start Tuner. **Expect:** nothing plays; Home shows
   "Resume Up next".
+- [ ] **OSD buttons:** play a film with two items in Up next and show the OSD. **Expect:**
+  `Up next` and `Next` before Info (tooltips "u" / "n"); a click on `Up next` opens the panel,
+  `Next` plays the next item; with the controls focus (↓) the arrows reach both and Enter acts.
+  With Up next empty there is no `Next`.
+- [ ] **Resume prompt:** watch 5 minutes of a queued film, stop, `Alt+6`, Enter on it.
+  **Expect:** "Resume from 5:00" / "Start over"; Start over plays it from 0 as Up next's item
+  (the list stays; Shift+Enter opens the player); a row set to "Play from the start" doesn't
+  ask.
 
 ## 24. Following and the news flash
 
@@ -1325,6 +1336,14 @@ once (`claude mcp list` shows `tuner` connected).
   become switches after the next evaluation (within seconds).
 - [ ] **Following off:** turn Following off in Settings. **Expect:** its reminders don't fire
   (on again: they do).
+- [ ] **Rule menu and order:** Settings ▸ Following, `x` on a rule. **Expect:** Edit…, Pause,
+  Test against the guide, Move up / down, Delete…. Test toasts "N in the next 14 days · next …"
+  with the rule's name only; Pause shows "paused" and its reminders leave Settings ▸ Reminders
+  within seconds (Resume brings them back); Delete… asks to cancel or keep them. With two
+  rules, Alt+↑/↓ and the drag grip change the order, and it stays after a restart.
+- [ ] **Summary Open:** let a new rule match (or wait for a guide refresh that adds matches).
+  **Expect:** the "Following: N new" notification has **Open**; picking it raises Tuner on
+  Settings ▸ Following. Without a notification server the toast has the same Open.
 - [ ] **News flash (the user's addition):** on a news bulletin, *News flash this daily…*,
   weekdays, headlines 5 min. At the bulletin's time with a live channel playing. **Expect:** the
   countdown strip in the pop-out (pinned, every workspace, **keyboard focus stays where it
@@ -1342,6 +1361,21 @@ once (`claude mcp list` shows `tuner` connected).
 - [ ] **Part-way series:** with a series half watched, open its page and the guide. **Expect:**
   later episodes' titles are bars, plots say "hidden — … · Ctrl+B to show"; the next-up episode
   and earlier ones show. `Ctrl+B` on one reveals it until you move.
+- [ ] **Guide airings of that series:** find its airings in the guide (some guides give no
+  season/episode). **Expect:** an airing whose sub-title is an episode you've seen (or the
+  next-up one) shows it; later episodes and first showings ("new") are bars; the status bar
+  says "Ctrl+B show spoilers" on a hidden one. Watch one to the end (or Ctrl+W it): its repeats
+  show their sub-title afterwards.
+- [ ] **In the player:** play the channel airing a hidden episode. **Expect:** the banner reads
+  "Show · ▆▆▆▆▆▆▆▆ 󰈉" with "Ctrl+B show spoilers"; Ctrl+B shows the episode title ("Ctrl+B
+  hide spoilers"); a zap hides it again.
+- [ ] **Series guarded before you start it:** guard a series you haven't watched (item menu ▸
+  Spoiler guard), then find a repeat of a late episode whose guide entry has no season/episode.
+  **Expect:** its sub-title is a bar; an old airing from before the series' guarded episodes
+  first aired still shows.
+- [ ] **Sport descriptions in the player:** with a topic that hides sport descriptions active,
+  play a channel showing another match. **Expect:** the banner's line reads "Title ·
+  ▆▆▆▆▆▆▆▆ 󰈉", never the other match's score.
 - [ ] **Followed sport:** follow your team spoiler-safe; during and after their match, look at
   the guide and the news channels. **Expect:** "Arsenal v Chelsea 󰈉" where a score was (also
   "Arsenal v Chelsea 2-1"); news sub-titles mentioning the team are bars; unrelated sport and
@@ -1351,6 +1385,9 @@ once (`claude mcp list` shows `tuner` connected).
   channel talking about it. **Expect:** the card covers the picture **before any sound** (the
   channel isn't tuned; the previous picture pauses under it); Enter watches anyway, ↓ judges
   the next channel, Backspace resumes the previous one.
+- [ ] **Zap shield in multi-view:** with two pictures, zap the focused one onto that channel.
+  **Expect:** the card covers that picture only; the other keeps playing with sound; `w` to the
+  other picture and Enter does nothing to the card; back on it, Enter watches anyway.
 - [ ] **Notifications:** a reminder for the match's channel fires (Tuner open, then closed).
   **Expect:** no score in the notification either way.
 - [ ] **Claude:** ask Claude "what was the Arsenal score?" and "what's on Sky Sports News?".
@@ -1379,20 +1416,41 @@ Both test accounts allow one stream each (TV and TV 2).
   prompt before anything plays. Relock with a locked channel in A and a free one in B: only A
   stops.
 - [ ] **Claude:** "put both semis side by side". **Expect:** two pictures on different
-  playlists in one go.
+  playlists in one go. With two pictures already on, "now X and Y" replaces both in one go
+  (no "Move picture …?" for a picture that is replaced); if one of them is already on screen
+  it stays and only the other changes.
 - [ ] **CPU:** two HD live channels for 10 minutes. **Expect:** smooth video, fans and battery
   as noted in `docs/design/multiview-spike.md`.
 
 ## 27. Reminders, scheduled playback and the sleep timer
 
-- [ ] **Pop-out auto-launch without focus steal (Tuner closed):** set a switch for a programme
-  starting in 3 minutes (Open in: Pop-out), quit Tuner, keep typing in a terminal. **Expect:**
-  Tuner starts about 40 s before, the pop-out appears pinned on the current workspace, the
-  countdown strip shows, and **the terminal keeps the keyboard** the whole time. Known gap: on
-  Omarchy 4 the first window may still take focus — note what happens.
-- [ ] **Pop-out with Tuner open on another workspace:** same, Tuner running. **Expect:** the
-  pop-out appears on the current workspace without taking focus.
-- [ ] **`tuner --play <ref> --popout`:** **Expect:** plays in the pop-out without focus.
+- [ ] **Pop-out auto-launch without focus steal (Tuner closed), with the Hyprland snippet:**
+  - **Do:** install the current `packaging/hypr/tuner.lua` (§ *Applying the Hyprland snippet*)
+    and reload Hyprland. Set a switch for a programme starting in 3 minutes (Open in: Pop-out),
+    quit Tuner, and keep typing in a terminal; keep the mouse still. When it has appeared, run
+    `hyprctl clients -j | jq '.[] | select(.class | startswith("tuner")) | {class, floating,
+    pinned, tags}'`. Then click the pop-out and press Esc.
+  - **Expect:**
+    - Tuner starts about 40 s before as a small window that is pinned on the current workspace
+      from its first frame (never a big centred or tiled window first), then moves to the
+      pop-out corner showing the countdown strip; it plays there when the programme starts.
+    - **The terminal keeps the keyboard** the whole time: no keystroke goes to Tuner, the
+      terminal's border stays the active one.
+    - `hyprctl` lists class `tuner-popout`, floating, pinned, tag `pop`.
+    - The video is fully opaque, like a normal Tuner window.
+    - Esc tiles the window on the current workspace like any pop-in (not left floating or
+      pinned); `o` pops it out again at the corner.
+  - **Without the snippet** (comment out the `tuner-popout` rule, reload, repeat): Tuner may map
+    tiled and take the keyboard, then pops out; nothing else breaks. Restore the rule afterwards.
+- [ ] **Pop-out with Tuner open on another workspace:** same, Tuner running and tiled on another
+  workspace, the mouse resting where the pop-out will land. **Expect:** the pop-out appears on
+  the current workspace without taking focus; `hyprctl clients` still shows class `tuner`.
+- [ ] **`tuner --play <ref> --popout`:** run it from a terminal, with Tuner closed and again with
+  it running. **Expect:** plays in the pop-out without focus both times (the terminal keeps
+  typing); the first run's window is class `tuner-popout`.
+- [ ] **Open Tuner while it runs as `tuner-popout`:** with the auto-launched pop-out on screen,
+  use the Omarchy menu's *Open Tuner* (and the Super+Shift+T binding if enabled). **Expect:**
+  the pop-out gets the focus (it is found by its class), no second Tuner starts.
 - [ ] **Esc cancels:** while "Switching to … in 8 s" shows over the player, press Esc.
   **Expect:** "Switch cancelled", the player stays.
 - [ ] **Late switch:** suspend the laptop across a switch's start, resume 5 min later.

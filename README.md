@@ -205,8 +205,11 @@ takes the pictures. The theme is Omarchy's Tokyo Night unless noted. The video i
 - **Spoiler guard:** on by default, but narrow: series you're part-way through and sport you
   follow. Scores in guide titles are rewritten ("Arsenal v Chelsea 󰈉"), later episodes' titles
   and plots are hidden, and zapping onto a channel showing the match you're saving stops at a
-  card first. `Ctrl+B` shows an item, `Ctrl+Shift+B` pauses the guard or adds a topic ("I'll
-  watch it later"), and watching the match lifts it. Notifications, MPRIS and Claude's answers
+  card first (in multi-view, over that picture only). `Ctrl+B` shows an item — in the player,
+  the banner's programme — and the hint line says so when something is hidden; `Ctrl+Shift+B`
+  pauses the guard or adds a topic ("I'll watch it later"), and watching the match lifts it.
+  Guide airings without episode numbers are placed by their episode title, a repeat you've seen,
+  air dates or the "new" flag before they're hidden. Notifications, MPRIS and Claude's answers
   are guarded too.
 - **Multi-view:** two live channels at once — side by side, big + small, or picture in picture
   (`Ctrl+M` on a channel, *Watch alongside*). `w` moves the focus, `M` the sound, `t` the layout,
@@ -947,7 +950,7 @@ The full reference is generated from `src/keymap.rs`:
 | `←` / `h` | Back to the page list |
 | `→` / `l` / `Shift+→` / `L` | Increase / next option |
 | `Shift+←` / `H` | Decrease / previous option |
-| `Alt+↑` / `K` / `Alt+↓` / `J` | Move up / down (reorder: guide priority, playlists, lists) |
+| `Alt+↑` / `K` / `Alt+↓` / `J` | Move up / down (reorder: guide priority, playlists, lists, Following rules) |
 | `Tab` / `Shift+Tab` | Next / previous section |
 | `Enter` / `Space` | Toggle / open |
 | `x` / `Delete` | Delete / more actions |
@@ -1037,7 +1040,7 @@ tuner claude-setup [--apply]
 |---|---|
 | `--view <screen>` | Open that screen. If Tuner is already running, it switches the running window. |
 | `--play <ref>` | Play a channel by its stable reference `<source-id>:<item-key>` (e.g. `2:xt:live:1234`), a stream URL or a media file. |
-| `--popout` | With `--play`: play it in the pop-out player (Hyprland), without taking focus. |
+| `--popout` | With `--play`: play it in the pop-out player (Hyprland), without taking focus. Started this way, the window's class is `tuner-popout` (see [Pop-out player](#pop-out-player)). |
 | `--reminder <id>` | Fire reminder `<id>` now. This is what the reminder timers run while Tuner is closed; you don't need it yourself. |
 | `--debug` | Debug logging for this session, whatever the setting says. |
 | `--profile-dir <dir>` | Keep config, data, cache, logs and the socket under `<dir>`. Use it for testing, or for a second profile. |
@@ -1114,7 +1117,7 @@ How it works and what it can't do:
   screen**. The PIN never goes through Claude, and Claude will not ask you for it. Claude can
   lock but never unlock, never shows explicit content and never loosens a setting: it can't
   turn a rule's spoiler-safe off, remove your own spoiler rules, or apply a guide fix to more
-  than 50 channels from chat. Rules Claude adds are marked and toast with **Undo**.
+  than 50 channels from chat (Tuner shows those in a confirm card for you to press Enter). Rules Claude adds are marked and toast with **Undo**.
 - Claude gets names, times and programme details, never stream addresses or your logins.
   Playlist names are shared too, and a playlist you didn't rename is named after its server:
   rename it (Settings ▸ Playlists) if you'd rather Claude didn't see that. Web links inside
@@ -1172,7 +1175,9 @@ in the source tree and in `/usr/share/tuner/` when installed as a package.
 **Hyprland window rules (recommended):** `hypr/tuner.lua` makes the video fully opaque, opting
 out of Omarchy's default window transparency. It also sets **`render_unfocused`**, so playback
 keeps rendering while Tuner is on another workspace. Without that rule, Hyprland stops drawing
-the window; Tuner then pauses video decoding to save CPU, and the audio keeps playing.
+the window; Tuner then pauses video decoding to save CPU, and the audio keeps playing. And it
+keeps a Tuner that starts by itself for a scheduled switch from taking the keyboard: that
+window (class `tuner-popout`) appears floating and pinned, without focus.
 
 ```sh
 cp /usr/share/tuner/hypr/tuner.lua ~/.config/hypr/tuner.lua   # or packaging/hypr/tuner.lua
@@ -1222,6 +1227,12 @@ leaves the pop-out where it is ("Nothing playing"); its page is waiting when you
 - Install the packaged window rules (`hypr/tuner.lua`, above) for the pop-out too: without them
   Omarchy draws unfocused windows at 96 % opacity, so the page behind shows through the video.
   They also keep video rendering while a tiled Tuner sits on another workspace.
+- A scheduled switch (Open in: Pop-out) while Tuner is closed, or `tuner --play <ref>
+  --popout`, starts Tuner straight into the pop-out. That window's class is **`tuner-popout`**
+  (all session long), and the packaged rules map it floating and pinned **without taking the
+  keyboard** from what you are typing in. Esc tiles it like any pop-out. Without the rules it
+  may open tiled and focused first. Popping out a running Tuner never takes the keyboard
+  either. If you have your own rules for class `tuner`, add `tuner-popout` to them.
 
 ## Troubleshooting
 

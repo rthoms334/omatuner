@@ -155,7 +155,7 @@ enum Write {
     Seen(SeenRow),
 }
 
-fn plan(q: &Q, p: &SpoilerGuard) -> Out<Write> {
+fn plan(q: &Q, p: &SpoilerGuard, snap: &crate::spoiler::snapshot::GuardSnapshot) -> Out<Write> {
     let window_h = p.window_h.unwrap_or(q.cfg.spoiler.default_window_h).min(336);
     match p.action {
         SpoilerAction::AddTopic => {
@@ -233,7 +233,7 @@ fn plan(q: &Q, p: &SpoilerGuard) -> Out<Write> {
                     // EPG time, like the tracker and Ctrl+W (a shifted start could change the
                     // fixture key's date)
                     let full = crate::store::epg::programme(q.conn, prog.id)?;
-                    Ok(Write::Seen(crate::spoiler::seen_row_for(&full, SeenHow::Agent, q.now)))
+                    Ok(Write::Seen(crate::spoiler::placed_seen_row(snap, &full, SeenHow::Agent, q.now)))
                 }
                 AgentRef::Item(r) if r.kind == ItemKind::Episode => {
                     let (ep, idx) = q.episode(&r)?.ok_or_else(|| Fail::not_found("episode"))?;
@@ -268,7 +268,8 @@ pub(super) async fn handle(h: &Arc<Inner>, p: SpoilerGuard) -> Out<Value> {
             }))
         }
         action => {
-            let write = h.run(true, move |q| plan(q, &p)).await?;
+            let snap = h.shared.guard().snapshot();
+            let write = h.run(true, move |q| plan(q, &p, &snap)).await?;
             let now = crate::model::now();
             let out = h
                 .write(DataScope::Spoiler, move |c| {

@@ -11,6 +11,7 @@
 //! lock state); explicit series never get a series mark. A broken rule is skipped (store layer).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::Config;
@@ -152,7 +153,7 @@ impl Topic {
 }
 
 /// A guarded series: episodes after `next_up` are hidden.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SeriesMark {
     pub label: String,
     /// The episode you're about to play (shown); later ones are guarded.
@@ -160,6 +161,74 @@ pub struct SeriesMark {
     /// Part-way through (the automatic rule) rather than the user's own row.
     pub automatic: bool,
     pub rule: Option<SpoilerRuleId>,
+    /// What places a guide airing that carries no season / episode (shared by the series'
+    /// aliases).
+    pub airings: Arc<SeriesAirings>,
+}
+
+/// What places a guide airing of a guarded series without S/E before or after the next-up
+/// episode (DESIGN §34.5): the catalogue's episode titles and air dates, and the airings
+/// already seen.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SeriesAirings {
+    /// Folded episode title → (season, episode); a title two episodes share is left out.
+    pub titles: HashMap<String, (i32, i32)>,
+    /// Event keys (`textmatch::event::event_key`: "core title#folded sub-title") of airings
+    /// without S/E that were seen.
+    pub seen: HashSet<String>,
+    /// When the next-up episode first aired.
+    pub next_up_air: Option<jiff::civil::Date>,
+    /// The earliest first airing of an episode after the next-up one: an airing a week or more
+    /// before it can't show one.
+    pub first_guarded_air: Option<jiff::civil::Date>,
+}
+
+impl SeriesAirings {
+    /// The episode a guide sub-title names: an "S02E05" / "2x05" / "Season 2 Episode 5"
+    /// marker in it, else a catalogue episode title.
+    pub fn episode_of(&self, sub_title: &str) -> Option<(i32, i32)> {
+        if let Some(m) = crate::sources::m3u_vod::parse_episode_title(sub_title) {
+            return Some((i32::try_from(m.season).ok()?, i32::try_from(m.episode).ok()?));
+        }
+        if self.titles.is_empty() {
+            return None;
+        }
+        self.titles.get(&folded(sub_title)).copied()
+    }
+
+    /// Index the catalogue's episodes `(season, episode, title, air date)` of a series whose
+    /// next-up episode is `next_up`.
+    pub fn index(&mut self, episodes: &[db::CatalogueEpisode], next_up: (i32, i32)) {
+        let mut titles: HashMap<String, Option<(i32, i32)>> = HashMap::new();
+        for (season, episode, title, air) in episodes {
+            let se = (*season, *episode);
+            // "Severance - S02E05 - Trojan's Horse" is "Trojan's Horse"
+            let own = crate::sources::m3u_vod::parse_episode_title(title).and_then(|m| m.title).unwrap_or_else(|| title.clone());
+            let key = folded(&own);
+            if !generic_title(&key) {
+                titles.entry(key).and_modify(|v| *v = v.filter(|x| *x == se)).or_insert(Some(se));
+            }
+            let Some(date) = air.as_deref().and_then(air_date) else { continue };
+            if se == next_up {
+                self.next_up_air = Some(self.next_up_air.map_or(date, |d| d.min(date)));
+            } else if se > next_up {
+                self.first_guarded_air = Some(self.first_guarded_air.map_or(date, |d| d.min(date)));
+            }
+        }
+        self.titles = titles.into_iter().filter_map(|(k, v)| Some((k, v?))).collect();
+    }
+}
+
+/// "Episode 5", "Ep 5", "Part 2", "5", "": a title that names no particular episode.
+fn generic_title(folded: &str) -> bool {
+    let t = folded.trim();
+    let rest = ["episode", "ep", "part", "chapter"].iter().find_map(|w| t.strip_prefix(w)).unwrap_or(t);
+    rest.chars().all(|c| c.is_ascii_digit() || c.is_whitespace() || c == '.')
+}
+
+/// A catalogue air date ("2022-02-18", "2022-02-18 21:00:00").
+pub(crate) fn air_date(s: &str) -> Option<jiff::civil::Date> {
+    s.trim().get(..10)?.parse().ok()
 }
 
 /// A programme on a live channel that mentions a shielding topic (displayed time: the
@@ -497,6 +566,11 @@ fn series_marks(
             a.last_at = a.last_at.max(s.seen_at);
         }
     }
+    // seen airings the guide gave no S/E: they place nothing, but a repeat of one shows
+    let mut seen_airings: HashMap<String, HashSet<String>> = HashMap::new();
+    for (norm, key) in db::seen_series_airings(conn)? {
+        seen_airings.entry(norm).or_default().insert(key);
+    }
     let series_rules: HashMap<&str, &crate::model::SpoilerRule> =
         rules.iter().filter(|r| r.kind == SpoilerRuleKind::Series).filter_map(|r| Some((r.series_norm.as_deref()?, r))).collect();
     let mut wanted: Vec<(String, Option<&crate::model::SpoilerRule>)> = Vec::new();
@@ -529,11 +603,46 @@ fn series_marks(
         };
         let Some(next_up) = next_up else { continue };
         let label = rule.map(|r| r.label.clone()).or_else(|| rows.first().map(|r| r.name.clone())).unwrap_or_else(|| norm.clone());
-        let mark = SeriesMark { label, next_up, automatic: rule.is_none(), rule: rule.map(|r| r.id) };
+        let mut airings = SeriesAirings { seen: seen_airings.remove(&norm).unwrap_or_default(), ..Default::default() };
+        airings.index(&db::series_episodes(conn, &norm)?, next_up);
+        let mark = SeriesMark { label, next_up, automatic: rule.is_none(), rule: rule.map(|r| r.id), airings: Arc::new(airings) };
         for r in &rows {
             out.entry(super::series_key(&r.name)).or_insert_with(|| mark.clone());
         }
         out.insert(norm, mark);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The catalogue index: an episode's own title (a "Show - S02E05 - Title" name gives
+    /// "Title"), never a title two episodes share or one that names no episode; the next-up
+    /// episode's air date and the first one after it.
+    #[test]
+    fn the_catalogue_places_episodes_by_title_and_date() {
+        let ep = |s, e, t: &str, d: Option<&str>| (s, e, t.to_owned(), d.map(str::to_owned));
+        let mut a = SeriesAirings::default();
+        a.index(
+            &[
+                ep(2, 2, "Severance - S02E02 - Goodbye, Mrs. Selvig", Some("2025-01-24")),
+                ep(2, 3, "Who Is Alive?", Some("2025-01-31")),
+                ep(2, 4, "Woe's Hollow", Some("2025-02-07 21:00:00")),
+                ep(2, 5, "Trojan's Horse", Some("2025-02-14")),
+                ep(2, 6, "Episode 6", Some("not a date")),
+                ep(2, 7, "Chikhai Bardo", None),
+                ep(1, 7, "Chikhai Bardo", None),
+            ],
+            (2, 4),
+        );
+        assert_eq!(a.episode_of("Goodbye, Mrs. Selvig"), Some((2, 2)));
+        assert_eq!(a.episode_of("TROJAN'S HORSE"), Some((2, 5)), "folded");
+        assert_eq!(a.episode_of("Chikhai Bardo"), None, "two episodes share it");
+        assert_eq!(a.episode_of("Episode 6"), None, "names no episode");
+        assert_eq!(a.episode_of("Series 2: S02E06"), Some((2, 6)), "a marker in the sub-title");
+        assert_eq!(a.next_up_air, Some(jiff::civil::date(2025, 2, 7)));
+        assert_eq!(a.first_guarded_air, Some(jiff::civil::date(2025, 2, 14)));
+    }
 }

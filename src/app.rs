@@ -128,6 +128,8 @@ pub struct TunerApp {
     drop_alt_text: bool,
     /// The window title last sent ("Tuner — Movies · TV 2", DESIGN §29).
     window_title: String,
+    /// The status bar's spoiler entry ("Ctrl+B show spoilers"), worked out before the bar.
+    reveal_hint: Option<(Action, &'static str)>,
     idle: Option<crate::platform::idle::IdleInhibitor>,
     /// Window fullscreen as last requested by the app, re-synced every frame from the
     /// compositor's state (`ViewportInfo::fullscreen`) when the backend reports it.
@@ -138,6 +140,10 @@ pub struct TunerApp {
     popout: PopOut,
     popout_backend: Option<Box<dyn PopOutBackend>>,
     popout_started: bool,
+    /// Started straight into the pop-out (`--play … --popout`, a scheduled switch): under
+    /// Hyprland the window is `crate::POPOUT_APP_ID`, mapped floating and pinned by the
+    /// packaged rule (`PopOutWorker::start`'s `launched`).
+    launched_popped_out: bool,
     /// `f` on the popped-out player: pop in, then go fullscreen.
     fullscreen_after_pop_in: bool,
     /// This frame shows the video-only player (`PopOut::video_only` at the window's size):
@@ -255,11 +261,13 @@ impl TunerApp {
             pending_actions: Vec::new(),
             drop_alt_text: false,
             window_title: crate::APP_NAME.to_owned(),
+            reveal_hint: None,
             idle,
             window_fullscreen: false,
             popout: PopOut::default(),
             popout_backend: None,
             popout_started: false,
+            launched_popped_out: initial.popout,
             fullscreen_after_pop_in: false,
             video_only: false,
             window_size: egui::vec2(1280.0, 800.0),
@@ -490,8 +498,24 @@ impl TunerApp {
                 }
             }
             AppEvent::Agent(crate::agent::AgentCommand::MultiView(r)) => self.on_agent_multiview(r),
+            // Claude's batch over 50 channels: Guide fixes with its confirm card prefilled (the
+            // handler raised the window); Enter applies it, Esc drops it
+            AppEvent::Agent(crate::agent::AgentCommand::GuideFixReview(r)) => {
+                if crate::guide_fix::ui::offer_review(r.clone()) {
+                    self.toast(Toast::info("Claude's earlier guide fixes were replaced by its newer ones"));
+                }
+                if self.popout.is_out() || self.video_only {
+                    self.toggle_popout(egui_ctx);
+                }
+                if self.current_route().screen() != ScreenId::EpgMapping {
+                    self.nav.push(NavRequest::Push(Route::EpgMapping { channel: None }));
+                }
+                egui_ctx.request_repaint();
+            }
             // the reminder engine (B6): countdowns, switches, the sleep timer, news flashes
             AppEvent::Reminder(e) => self.on_reminder_event(e, egui_ctx),
+            // Open on Following's summary notification
+            AppEvent::Follow(crate::follow::FollowEvent::Open) if crate::follow::ENABLED => self.open_following(egui_ctx),
             // Following's summary when no notification server answered (F-C)
             AppEvent::Follow(f) => {
                 if let Some(t) = crate::follow::ui::on_event(f) {
@@ -793,9 +817,10 @@ impl TunerApp {
         if req.reminder.is_some() {
             self.services().agent.wake_reminders();
         }
-        // `--play <ref> --popout` (a scheduled launch): the pop-out, never taking focus — on the
-        // first frame the Hyprland worker runs (at startup it doesn't yet)
-        if req.popout && req.play.is_some() {
+        // `--play <ref> --popout`, or a scheduled switch that started Tuner for the pop-out (its
+        // countdown then shows in the pop-out, where it plays): the pop-out, never taking focus
+        // — on the first frame the Hyprland worker runs (at startup it doesn't yet)
+        if req.popout {
             self.reminder_ui.pop_out_pending = true;
         }
         match req.view {
@@ -1531,6 +1556,15 @@ impl TunerApp {
         self.cancelled_switches.extend(gone);
     }
 
+    /// Open on Following's summary (its toast, or its desktop notification, which raised the
+    /// window already): Settings ▸ Following in the full window.
+    fn open_following(&mut self, egui_ctx: &egui::Context) {
+        if self.popout.is_out() || self.video_only {
+            self.toggle_popout(egui_ctx);
+        }
+        self.nav.push(NavRequest::Switch(Route::Settings(crate::ui::SettingsPage::Following)));
+    }
+
     /// The countdown's Cancel (or Delete in the pop-out): the row goes, a `SwitchNow` on its
     /// way is ignored.
     fn cancel_switch(&mut self, id: crate::model::ReminderId) {
@@ -1613,6 +1647,7 @@ impl TunerApp {
                 crate::follow::ui::undo_follow(self.services(), id);
                 self.toast(Toast::info("Rule removed"));
             }
+            Action::OpenFollowing if crate::follow::ENABLED => self.open_following(egui_ctx),
             Action::UndoGuideFix(log @ Some(_)) if crate::guide_fix::ENABLED => {
                 let opts = crate::store::guide_fix::GuideOpts::from_config(&self.services().config());
                 let _ = crate::guide_fix::ui::submit_undo(self.services(), log, opts, crate::model::now());
@@ -2061,12 +2096,26 @@ impl TunerApp {
         let stack = self.key_stack();
         // the focused element's (a stack card: Space, Ctrl+O), then the playlist picker
         let mut extra = if self.overlays.is_empty() { self.screens[self.screen_index(self.view_screen())].hint_extras() } else { Vec::new() };
+        // the spoiler guard: "Ctrl+B show spoilers" when it hides something of the focused item
+        extra.extend(self.reveal_hint.filter(|_| self.overlays.is_empty()));
         let multi = ScopeKind::of_screen(self.view_screen())
             .is_some_and(|k| Scope::of(&self.lib, &self.services().config().interface.playlist_scope, k).multi());
         if multi {
             extra.push((Action::PlaylistPicker, "playlist"));
         }
         keymap::hint_line_with(&stack, &extra)
+    }
+
+    /// The status bar's spoiler entry for the focused item (`spoiler::ui::hint`).
+    fn spoiler_hint(&mut self) -> Option<(Action, &'static str)> {
+        if !crate::spoiler::ENABLED || !self.overlays.is_empty() {
+            return None;
+        }
+        let idx = self.screen_index(self.view_screen());
+        self.with_ctx(|ctx, screens, _| {
+            let target = screens[idx].reveal_target(ctx);
+            crate::spoiler::ui::hint(ctx, target)
+        })
     }
 
     /// `StartScreen::Last`: store the main screen the user leaves on (written at exit only).
@@ -2225,8 +2274,8 @@ impl eframe::App for TunerApp {
             w.pre_present_notify();
             if !self.popout_started {
                 self.popout_started = true;
-                self.popout_backend =
-                    crate::platform::popout::PopOutWorker::start(self.services().bus.clone()).map(|w| Box::new(w) as Box<dyn PopOutBackend>);
+                self.popout_backend = crate::platform::popout::PopOutWorker::start(self.services().bus.clone(), self.launched_popped_out)
+                    .map(|w| Box::new(w) as Box<dyn PopOutBackend>);
             }
             if let Some((w, h)) = self.devshot.as_mut().and_then(|d| d.initial_size()) {
                 float_window_at(w, h);
@@ -2270,6 +2319,7 @@ impl eframe::App for TunerApp {
         let focus = crate::ui::widgets::status_bar::take_focus(&egui_ctx);
         if chrome {
             let jobs = self.services().jobs.active();
+            self.reveal_hint = self.spoiler_hint();
             let hint = self.hint_now();
             let mini_hidden = self.layout == LayoutClass::Compact || !cfg.interface.mini_player;
             let now_playing =
@@ -3511,6 +3561,40 @@ mod tests {
         assert_eq!(rig.log().toasts.last().unwrap().text, "That can no longer be undone");
     }
 
+    /// The status bar's "Ctrl+B show spoilers" (DESIGN §34.5): on Live TV's channel whose
+    /// programme the guard hides something of, "hide spoilers" once Ctrl+B showed it, nothing on
+    /// a channel with nothing hidden.
+    #[test]
+    fn the_hint_line_offers_ctrl_b_on_a_guarded_item() {
+        use crate::spoiler::snapshot::{GuardSnapshot, SeriesMark, Settings};
+        let now = crate::model::now();
+        let mut rig = Rig::with(test_config(), live(), 1.0, move |c| {
+            seed_channels(c, 2, None)?;
+            let ids = [ChannelId(1), ChannelId(2)];
+            crate::ui::screens::home::testkit::epg(c, &ids, now - now.rem_euclid(1800) - 1800, 3, true)?;
+            // channel 1 airs a later episode of a series you're part-way through
+            c.execute(
+                "UPDATE programme SET title = 'Severance', sub_title = 'Cold Harbor'
+                 WHERE epg_channel_id = (SELECT epg_channel_id FROM channel_epg WHERE channel_id = 1) AND start <= ?1 AND stop > ?1",
+                [now],
+            )?;
+            Ok(())
+        });
+        rig.settle();
+        let mark = SeriesMark { label: "Severance".into(), next_up: (2, 4), automatic: true, ..Default::default() };
+        let snap = GuardSnapshot::from_parts(Settings::default(), vec![], [("severance".to_owned(), mark)].into(), Default::default());
+        rig.app.services().agent.set_guard(crate::guard::Guard::with_snapshot(snap));
+        let key = crate::spoiler::ui::reveal_key_label();
+        rig.until("the hint on channel 1", |r| r.app.hint_now().contains(&format!("{key} show spoilers")));
+        rig.press(Key::B, CTRL);
+        rig.frame_with(vec![]);
+        assert!(rig.app.hint_now().contains(&format!("{key} hide spoilers")), "{}", rig.app.hint_now());
+        // channel 2: nothing hidden, no hint (and the reveal went with the move)
+        rig.press(Key::ArrowDown, NONE);
+        rig.frame_with(vec![]);
+        assert!(!rig.app.hint_now().contains("spoilers"), "{}", rig.app.hint_now());
+    }
+
     /// A playlist picked on a screen (DESIGN §29): the window title names it and the hint line
     /// offers Alt+P (two playlists with channels); once it is disabled, Live TV shows All
     /// playlists again with a toast saying why, and the title drops it. With one playlist
@@ -3870,6 +3954,26 @@ mod tests {
         assert_eq!(rig.log().jobs.first(), Some(&JobKind::RebuildLibrary), "the library loads asynchronously at startup");
     }
 
+    /// A scheduled switch that started Tuner for the pop-out (`main`: `StartApp { popout }` →
+    /// `IpcRequest { reminder, popout }`, no `--play`): the window pops out on the first frame
+    /// the Hyprland worker runs, so the countdown shows in the pop-out and the switch plays
+    /// there; the worker is told the window was launched for it. A running Tuner's reminder
+    /// wake-up (no `popout`) doesn't pop anything out.
+    #[test]
+    fn scheduled_launch_for_the_pop_out_pops_out_at_once() {
+        let req = IpcRequest { reminder: Some(42), popout: true, ..Default::default() };
+        let mut rig = Rig::with(test_config(), req, 1.0, |_| Ok(()));
+        assert!(rig.app.launched_popped_out);
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        rig.app.popout_backend = Some(Box::new(PopRecorder(sent.clone())));
+        rig.frame_with(vec![]);
+        assert!(matches!(sent.borrow().as_slice(), [PopRequest::Out { .. }]), "{:?}", sent.borrow());
+        rig.app.handle_ipc(&IpcRequest { reminder: Some(42), ..Default::default() });
+        rig.frame_with(vec![]);
+        assert_eq!(sent.borrow().len(), 1, "{:?}", sent.borrow());
+        assert!(rig.app.video_only, "the pop-out's video-only layout from the request on");
+    }
+
     #[test]
     fn startup_play_of_a_locked_channel_asks_for_the_pin() {
         let mut cfg = test_config();
@@ -4067,6 +4171,29 @@ mod tests {
         assert!(rig.app.favs.is_fav(&channel_ref(0)), "the older library's favourites don't win");
     }
 
+    /// Following's summary: the in-app toast carries Open, and Open — on the toast, or on the
+    /// desktop notification (`FollowEvent::Open`) — shows Settings ▸ Following.
+    #[test]
+    fn the_following_summary_opens_settings_following() {
+        let mut rig = Rig::new();
+        let ctx = rig.ctx.clone();
+        rig.event(AppEvent::Follow(crate::follow::FollowEvent::Summary {
+            title: "Following: 2 new".into(),
+            lines: vec!["Arsenal · Sat 12:30".into()],
+        }));
+        let toast = rig.log().toasts.last().cloned().expect("the summary toast");
+        assert_eq!(toast.text, "Following: 2 new — Arsenal · Sat 12:30");
+        assert_eq!(toast.action, Some(("Open".into(), Action::OpenFollowing)));
+        rig.app.global_action(Action::OpenFollowing, &[], &ctx);
+        rig.frame_with(vec![]);
+        assert_eq!(rig.route(), &Route::Settings(crate::ui::SettingsPage::Following));
+        rig.app.routes = vec![Route::Home];
+        rig.frame_with(vec![]);
+        rig.event(AppEvent::Follow(crate::follow::FollowEvent::Open));
+        rig.frame_with(vec![]);
+        assert_eq!(rig.route(), &Route::Settings(crate::ui::SettingsPage::Following));
+    }
+
     #[test]
     fn reminder_watch_plays_the_channel() {
         let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_channels(c, 2, None));
@@ -4195,6 +4322,97 @@ mod tests {
         assert_eq!(reqs.len(), 1);
         assert_eq!((&reqs[0].media, reqs[0].resume), (&MediaRef::Movie(id), true));
         assert_eq!(rig.route(), &Route::Player);
+    }
+
+    /// DESIGN §31.5 end to end: Claude's `guide_fix apply` of more than 50 channels writes
+    /// nothing from chat; Tuner opens Guide fixes with the confirm card prefilled, the user's
+    /// Enter applies it as Claude's batch (its toast offers Undo), and Esc on a second one
+    /// leaves everything as it was.
+    #[test]
+    fn claude_guide_fixes_over_50_channels_wait_for_enter_in_the_confirm_card() {
+        use crate::agent::proto::{Call, Request};
+        use crate::agent::server::{AgentHandler, AgentService};
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_channels(c, 60, None));
+        rig.settle();
+        // one handler: it keeps the proposals between calls
+        let s = rig.app.services();
+        let handler = AgentHandler::new(s.agent.clone(), s.store.clone(), s.config.clone(), s.tiles.focused(), s.bus.clone(), s.jobs.clone());
+        let tool = |rig: &Rig, args: serde_json::Value| {
+            let reply = rig.app.services().rt.block_on(handler.handle(Request::new(1, Call::from_tool("guide_fix", args).unwrap())));
+            assert!(reply.ok, "{reply:?}");
+            reply.result.unwrap()
+        };
+        let send_for_review = |rig: &Rig, shift: i64| {
+            let changes: Vec<serde_json::Value> =
+                (0..55).map(|i| serde_json::json!({ "ref": format!("channel:1:m3u:ch{i}"), "shift_min": shift })).collect();
+            let p = tool(rig, serde_json::json!({ "action": "propose", "changes": changes }));
+            assert_eq!((p["summary"]["channels"].as_u64(), p["applies_in_chat"].as_bool()), (Some(55), Some(false)), "{p}");
+            tool(rig, serde_json::json!({ "action": "apply", "proposal_id": p["proposal_id"], "confirm": true }))
+        };
+        let batches = |rig: &Rig| crate::store::guide_fix::recent(&rig.app.services().store.reader().unwrap(), 10).unwrap();
+        let confirm = std::mem::discriminant(&OverlayRequest::Confirm(crate::ui::overlays::ConfirmSpec {
+            title: String::new(),
+            body: String::new(),
+            confirm_label: String::new(),
+            destructive: false,
+            token: 0,
+        }));
+
+        let out = send_for_review(&rig, 30);
+        assert_eq!((out["pending_review"].as_bool(), out["channels"].as_u64()), (Some(true), Some(55)), "{out}");
+        assert!(out.get("applied").is_none() && batches(&rig).is_empty(), "nothing is applied from chat");
+        rig.until("Guide fixes with the confirm card", |r| r.route().screen() == ScreenId::EpgMapping && r.overlay_kinds() == [confirm]);
+        let shown = texts(&rig.frame_with(vec![]));
+        assert!(shown.iter().any(|(t, _, _)| t == "Accept Claude's 55 fixes?"), "the card's title: {shown:?}");
+        assert!(shown.iter().any(|(t, _, _)| t.contains("Claude proposed these in chat") && t.contains("55 time shifts")), "{shown:?}");
+        assert!(button(&shown, "Accept 55").is_some(), "the card's button: {shown:?}");
+
+        rig.press(Key::Enter, NONE);
+        assert!(rig.app.overlays.is_empty(), "Enter confirms");
+        rig.until("Claude's batch", |r| !batches(r).is_empty());
+        let b = batches(&rig);
+        assert_eq!((b.len(), b[0].actor, b[0].label.as_str(), b[0].n), (1, crate::model::FixActor::Claude, "Claude: 55 channels", 55));
+        rig.until("its toast", |r| {
+            r.log()
+                .toasts
+                .iter()
+                .any(|t| t.text == "Claude fixed the guide for 55 channels" && t.action == Some(("Undo".into(), Action::UndoGuideFix(Some(b[0].id)))))
+        });
+        let shifts = crate::store::guide_fix::facts(
+            &rig.app.services().store.reader().unwrap(),
+            &crate::store::guide_fix::GuideOpts::default(),
+            crate::model::now(),
+        )
+        .unwrap()
+        .extras;
+        let shifted = |i: usize| rig.app.lib.live.by_ref(&channel_ref(i)).and_then(|id| shifts.get(&id)).and_then(|e| e.shift_min);
+        assert_eq!((shifted(0), shifted(54), shifted(55)), (Some(30), Some(30), None), "the 55 channels and no other");
+
+        // a second batch: Esc drops it, nothing changes
+        let out = send_for_review(&rig, 60);
+        assert_eq!(out["pending_review"].as_bool(), Some(true));
+        rig.until("the second card", |r| r.overlay_kinds() == [confirm]);
+        rig.press(Key::Escape, NONE);
+        assert!(rig.app.overlays.is_empty());
+        for _ in 0..10 {
+            rig.frame_with(vec![]);
+        }
+        assert_eq!(batches(&rig).len(), 1, "Esc applies nothing");
+        assert_eq!(rig.route().screen(), ScreenId::EpgMapping, "Esc closes the card, not the screen");
+
+        // the playlist changed while a card waited: Enter applies nothing and says so
+        assert_eq!(send_for_review(&rig, 90)["pending_review"].as_bool(), Some(true));
+        rig.until("the third card", |r| r.overlay_kinds() == [confirm]);
+        rig.writer()
+            .blocking(|c| {
+                c.execute("UPDATE source SET generation = generation + 1", [])?;
+                Ok(())
+            })
+            .unwrap();
+        rig.press(Key::Enter, NONE);
+        rig.until("the stale toast", |r| r.log().toasts.iter().any(|t| t.text.starts_with("The guide data changed since these fixes were proposed")));
+        assert!(rig.log().toasts.iter().any(|t| t.text.ends_with("ask Claude to propose them again")));
+        assert_eq!(batches(&rig).len(), 1, "a stale batch applies nothing");
     }
 
     /// DESIGN §30.8 / B6 end to end: `schedule_switch` → the scheduler (running although
@@ -4802,6 +5020,7 @@ mod tests {
                 position_s: 10.0,
                 duration_s: None,
                 copy: None,
+                queue: None,
             }),
         ];
         for o in overlays {
@@ -5313,6 +5532,71 @@ mod tests {
             assert_eq!(tile_plays(&rig.log(), PIC_B), [delta], "film {film}");
             assert!(rig.app.mv.view.on, "film {film}");
         }
+    }
+
+    /// The `multiview` tool with two channels while two pictures show (both really playing,
+    /// one stream per playlist): one plan for both, so neither plans against what the other
+    /// replaces — the pictures trade playlists with no "Move picture B?" for a picture that is
+    /// replaced anyway, and neither load is refused. A picture that already shows one of the two
+    /// keeps it; the other goes in the other picture, and moving the one that stays is asked
+    /// first.
+    #[test]
+    fn the_agents_two_replace_both_pictures_in_one_step() {
+        use crate::agent::{AgentCommand, AgentMultiView};
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_two_playlists_with(c, |_, _| "av://lavfi:testsrc2=size=160x90:rate=25".into()));
+        rig.settle();
+        let open = |targets: &[i64]| {
+            AppEvent::Agent(AgentCommand::MultiView(AgentMultiView::Open {
+                targets: targets.iter().map(|c| MediaRef::Channel(ChannelId(*c))).collect(),
+                layout: None,
+                sound: None,
+                rearrange: false,
+            }))
+        };
+        let shows = |r: &Rig, t, ch: i64| {
+            r.app.mv_snap(t).is_some_and(|s| s.state == PlayerState::Playing && crate::ui::screens::live::playing_channel(&s) == Some(ChannelId(ch)))
+        };
+        // Alpha (TV) in A, then Bravo alongside: its TV 2 copy in B
+        rig.app.send_player(PlayerCommand::Play(PlayRequest {
+            media: MediaRef::Channel(ChannelId(1)),
+            zap: None,
+            origin: PlayOrigin::Fullscreen,
+            resume: false,
+            immediate: true,
+        }));
+        rig.until("Alpha plays", |r| shows(r, PIC_A, 1));
+        rig.event(open(&[2]));
+        rig.until("both play", |r| shows(r, PIC_A, 1) && shows(r, PIC_B, 4));
+
+        // Delta (only on TV 2) and Charlie: A takes TV 2, B takes TV, in one step
+        rig.app.log.borrow_mut().tile_commands.clear();
+        rig.event(open(&[6, 3]));
+        rig.frame_with(vec![]);
+        assert!(rig.overlay_kinds().is_empty(), "no move card for a picture that is replaced anyway");
+        assert_eq!(tile_plays(&rig.log(), PIC_A), [MediaRef::Channel(ChannelId(6))], "Delta in A");
+        assert_eq!(tile_plays(&rig.log(), PIC_B), [MediaRef::Channel(ChannelId(3))], "Charlie from TV in B");
+        rig.until("both trade playlists", |r| shows(r, PIC_A, 6) && shows(r, PIC_B, 3));
+        let v = rig.app.mv.view;
+        assert!(v.on && v.audible == PIC_A, "the sound stays where it was: {v:?}");
+
+        // Alpha (only on TV) and Charlie (B shows it, from TV): B keeps Charlie, Alpha goes in
+        // A — only if B moves to Charlie's TV 2 copy, which is asked first
+        rig.app.log.borrow_mut().tile_commands.clear();
+        rig.event(open(&[1, 3]));
+        rig.frame_with(vec![]);
+        assert_eq!(
+            rig.overlay_kinds(),
+            [kind(OverlayRequest::Confirm(overlays::ConfirmSpec {
+                title: String::new(),
+                body: String::new(),
+                confirm_label: String::new(),
+                destructive: false,
+                token: 0
+            }))]
+        );
+        assert!(tile_plays(&rig.log(), PIC_A).is_empty() && tile_plays(&rig.log(), PIC_B).is_empty(), "nothing moves before the answer");
+        rig.press(Key::Enter, NONE);
+        rig.until("A plays Alpha, B moved", |r| shows(r, PIC_A, 1) && shows(r, PIC_B, 5));
     }
 
     /// The multi-view player at a tiled half (790 pt) and full screen (1600 pt), text size 12

@@ -135,6 +135,9 @@ struct UiState {
     menu: Option<MenuFor>,
     /// Seen events of this session (the tracker's and Ctrl+W's), newest last, for Undo.
     seen: Vec<SeenRow>,
+    /// The hint line's last answer: (focused item, guard generation, minute) → something of
+    /// it is hidden.
+    hint: Option<((Target, u64, Timestamp), bool)>,
 }
 
 thread_local! {
@@ -269,10 +272,15 @@ pub fn focus(ctx: &UiCtx<'_>, guard: &Guard, target: &Target) -> Option<Focus> {
             if let Some(epg) = c.epg_channel_id {
                 let key = (epg, c.tvg_shift_min);
                 let nn = crate::store::epg::now_next(db, &[key], now).ok()?;
-                if let Some(p) = nn.get(&key).and_then(|n| n.now.as_ref()).and_then(|s| crate::store::epg::programme(db, s.id).ok()) {
+                let nn = nn.get(&key);
+                if let Some(p) = nn.and_then(|n| n.now.as_ref()).and_then(|s| crate::store::epg::programme(db, s.id).ok()) {
                     judge(&crate::ui::widgets::spoiler::programme_subject(&p), &mut f);
                     f.series = crate::spoiler::programme_se(&p).map(|_| (crate::spoiler::series_key(&p.title), p.title.clone()));
                     f.programme = Some(p);
+                }
+                // a channel row (and the player's banner) shows what's next too
+                if let Some(next) = nn.and_then(|n| n.next.as_ref()) {
+                    judge(&crate::ui::widgets::spoiler::slim_subject(next), &mut f);
                 }
             }
         }
@@ -400,6 +408,57 @@ fn toggle_reveal(ctx: &mut UiCtx<'_>, guard: &Guard, target: &Target) {
     }
 }
 
+/// Ctrl+B on something that isn't a list item (the player's banner about `target`): show
+/// `keys` — what of it the guard hides now — or hide them again.
+pub fn toggle_reveal_keys(ctx: &mut UiCtx<'_>, target: Target, keys: Vec<RevealKey>) {
+    if with(|s| s.reveal.target == Some(target) && !s.reveal.is_empty()) {
+        hide_all();
+        return;
+    }
+    let Some(guard) = guard_of(ctx) else { return };
+    if !guard.on() {
+        ctx.toast(Toast::info("The spoiler guard is off"));
+    } else if guard.paused_until(ctx.now).is_some() {
+        ctx.toast(Toast::info("Spoilers are shown everywhere for now"));
+    } else if keys.is_empty() {
+        ctx.toast(Toast::info("Nothing hidden here"));
+    } else {
+        set_reveal(RevealSet { target: Some(target), keys });
+    }
+}
+
+/// Focus left `target` (the player's picture changed): its reveal goes, as when focus moves on
+/// in a list.
+pub fn hide_reveal_of(target: Target) {
+    if with(|s| s.reveal.target == Some(target)) {
+        hide_all();
+    }
+}
+
+/// The hint line's spoiler entry for the focused item: "show spoilers" when the guard hides
+/// something of it, "hide spoilers" while that is shown (DESIGN §34.5); `None` otherwise. The
+/// answer is kept per item, guard generation and minute (one or two indexed reads each).
+pub fn hint(ctx: &UiCtx<'_>, target: Option<Target>) -> Option<(Action, &'static str)> {
+    let target = target?;
+    let guard = guard_of(ctx)?;
+    if !guard.on() || guard.paused_until(ctx.now).is_some() {
+        return None;
+    }
+    if with(|s| s.reveal.target == Some(target) && !s.reveal.is_empty()) {
+        return Some((Action::RevealSpoilers, "hide spoilers"));
+    }
+    let key = (target, guard.generation(), ctx.now.div_euclid(60));
+    let hidden = match with(|s| s.hint.filter(|(k, _)| *k == key)) {
+        Some((_, hidden)) => hidden,
+        None => {
+            let hidden = focus(ctx, &guard, &target).is_some_and(|f| f.hidden && !f.keys.is_empty());
+            with(|s| s.hint = Some((key, hidden)));
+            hidden
+        }
+    };
+    hidden.then_some((Action::RevealSpoilers, "show spoilers"))
+}
+
 /// Ctrl+W on a guide programme: record it seen when the guard tracks it (only guarded subjects
 /// are ever recorded).
 pub fn mark_seen(ctx: &mut UiCtx<'_>, guard: &Guard, p: &Programme) {
@@ -408,7 +467,7 @@ pub fn mark_seen(ctx: &mut UiCtx<'_>, guard: &Guard, p: &Programme) {
         ctx.toast(Toast::info("The spoiler guard isn't hiding anything about this"));
         return;
     }
-    let row = crate::spoiler::seen_row_for(p, SeenHow::Marked, now);
+    let row = crate::spoiler::placed_seen_row(&guard.snapshot(), p, SeenHow::Marked, now);
     let shown = guard.outside_title(&row.title, now).into_owned();
     let write = row.clone();
     let _ = ctx.services.store.writer().submit_notify(DataScope::Spoiler, move |c| crate::store::spoiler::mark_seen(c, &write).map(|_| ()));
@@ -479,7 +538,7 @@ mod tests {
             .unwrap()[0];
         let norm = crate::spoiler::series_key("Severance");
         let mut marks = HashMap::new();
-        marks.insert(norm.clone(), SeriesMark { label: "Severance".into(), next_up: (1, 4), automatic: true, rule: None });
+        marks.insert(norm.clone(), SeriesMark { label: "Severance".into(), next_up: (1, 4), automatic: true, ..Default::default() });
         t.services().agent.set_guard(Guard::with_snapshot(GuardSnapshot::from_parts(Settings::default(), Vec::new(), marks, HashMap::new())));
         let eps = crate::store::vod::episodes(&t.db, series, Some(1)).unwrap();
         let target = |n: usize| Target::Episode { series, episode: eps[n - 1].id };
@@ -519,7 +578,8 @@ mod tests {
     #[test]
     fn reveal_keys_cover_the_same_item_wherever_it_is_painted() {
         let cats = vec!["Sport".to_owned()];
-        let airing = Subject::Programme { title: "Arsenal v Chelsea", sub_title: None, categories: &cats, season_episode: None, start: 1000 };
+        let airing =
+            Subject::Programme { title: "Arsenal v Chelsea", sub_title: None, categories: &cats, season_episode: None, start: 1000, is_new: false };
         let key = RevealKey::of(&airing).unwrap();
         // the slim grid row of the same airing (no categories), and a +1 channel's repeat
         assert!(key.covers(&Subject::Programme {
@@ -527,10 +587,25 @@ mod tests {
             sub_title: Some("x"),
             categories: &[],
             season_episode: None,
-            start: 1000
+            start: 1000,
+            is_new: false,
         }));
-        assert!(key.covers(&Subject::Programme { title: "Arsenal v Chelsea", sub_title: None, categories: &[], season_episode: None, start: 4600 }));
-        assert!(!key.covers(&Subject::Programme { title: "Spurs v Chelsea", sub_title: None, categories: &[], season_episode: None, start: 1000 }));
+        assert!(key.covers(&Subject::Programme {
+            title: "Arsenal v Chelsea",
+            sub_title: None,
+            categories: &[],
+            season_episode: None,
+            start: 4600,
+            is_new: false
+        }));
+        assert!(!key.covers(&Subject::Programme {
+            title: "Spurs v Chelsea",
+            sub_title: None,
+            categories: &[],
+            season_episode: None,
+            start: 1000,
+            is_new: false
+        }));
         // a series page reveal covers its episodes, an episode's only itself
         let series = RevealKey::of(&Subject::Vod { title: "Severance", series_norm: Some("severance") }).unwrap();
         assert!(series.covers(&Subject::Episode { series_norm: "severance", season: 2, episode: 7 }));

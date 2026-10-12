@@ -56,6 +56,7 @@ impl EpgReader for Fake {
                 title: Arc::from(TITLES[i]),
                 sub_title: None,
                 flags: ProgrammeFlags::default(),
+                episode: None,
             });
             s += len;
         }

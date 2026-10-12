@@ -56,5 +56,19 @@ pub mod textmatch;
 /// Application id: binary name, Wayland `app_id` (= Hyprland `class`), MPRIS bus suffix,
 /// `.desktop` basename, XDG directory name.
 pub const APP_ID: &str = "tuner";
+/// Wayland `app_id` (Hyprland `class`) of a window started for the pop-out — a scheduled
+/// switch that starts Tuner, `tuner --play <ref> --popout` — so Hyprland's window rules
+/// (`packaging/hypr/tuner.lua`: float, pin, `no_initial_focus`) apply as it maps and the
+/// keyboard stays where it was (DESIGN §21.6). It stays for the whole session (winit sets
+/// the app id once, when it creates the window).
+pub const POPOUT_APP_ID: &str = "tuner-popout";
+
+/// The Wayland `app_id` for this launch: [`POPOUT_APP_ID`] when it starts straight into the
+/// pop-out under Hyprland (elsewhere there is no pop-out, and no rule to apply), else
+/// [`APP_ID`].
+pub fn window_app_id(popout_launch: bool, hyprland: bool) -> &'static str {
+    if popout_launch && hyprland { POPOUT_APP_ID } else { APP_ID }
+}
+
 /// Human-readable name (window title, MPRIS `Identity`, notifications).
 pub const APP_NAME: &str = "Tuner";

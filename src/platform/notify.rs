@@ -134,6 +134,11 @@ fn build(summary: &str, body: &str, urgency_critical: bool, actions: &[(&str, &s
 }
 
 async fn show(n: &Notification, bus: Option<&str>) -> Result<notify_rust::NotificationHandle> {
+    // Tests run real services (jobs, the scheduler) and must never reach the desktop's
+    // notification server: only the fake test buses answer them (callers fall back to a toast).
+    if bus.is_none() && crate::platform::off_desktop() {
+        return Err(Error::other("no desktop notifications off the desktop (tests)"));
+    }
     match bus {
         None => n.show_async().await,
         Some(b) => n.show_async_at_bus(b).await,
@@ -446,32 +451,47 @@ struct DesktopNotifier {
 impl Notifier for DesktopNotifier {
     fn show_reminder(&self, note: Note, on_watch: Box<dyn FnOnce() + Send>) -> BoxFuture<'static, bool> {
         let bus = self.bus.clone();
-        Box::pin(async move {
-            let n = build(&note.summary, &note.body, false, &[("default", "Watch"), ("watch", "Watch")]);
-            // zbus calls have no timeout of their own: a wedged notification server must not
-            // stall the scheduler (the caller falls back to a toast).
-            let handle = match tokio::time::timeout(NOTIFY_TIMEOUT, show(&n, bus.as_deref())).await {
-                Ok(Ok(h)) => h,
-                Ok(Err(e)) => {
-                    tracing::info!("reminder notification not shown: {e}");
-                    return false;
-                }
-                Err(_) => {
-                    tracing::info!("reminder notification timed out");
-                    return false;
-                }
-            };
-            tokio::spawn(async move {
-                let wait = handle.wait_for_action_async(|response| match response {
-                    NotificationResponse::Default => on_watch(),
-                    NotificationResponse::Action(a) if a == "watch" || a == "default" => on_watch(),
-                    _ => {}
-                });
-                let _ = tokio::time::timeout(ACTION_WAIT, wait).await;
-            });
-            true
-        })
+        Box::pin(async move { show_with_action(bus, &note.summary, &note.body, ("watch", "Watch"), on_watch).await })
     }
+}
+
+/// A notification with one action (`(id, label)`, also on a click on its body): `on_action`
+/// runs at most once when the user picks it, within [`ACTION_WAIT`]. Resolves to false when no
+/// notification server answered (in [`NOTIFY_TIMEOUT`]): the caller falls back to a toast.
+/// Must run inside a tokio runtime (the wait for the action is spawned on it).
+async fn show_with_action(bus: Option<String>, summary: &str, body: &str, action: (&str, &str), on_action: Box<dyn FnOnce() + Send>) -> bool {
+    let (id, label) = action;
+    let n = build(summary, body, false, &[("default", label), (id, label)]);
+    // zbus calls have no timeout of their own: a wedged notification server must not stall
+    // the caller (it falls back to a toast).
+    let handle = match tokio::time::timeout(NOTIFY_TIMEOUT, show(&n, bus.as_deref())).await {
+        Ok(Ok(h)) => h,
+        Ok(Err(e)) => {
+            tracing::info!("notification not shown: {e}");
+            return false;
+        }
+        Err(_) => {
+            tracing::info!("notification timed out");
+            return false;
+        }
+    };
+    let id = id.to_owned();
+    tokio::spawn(async move {
+        let wait = handle.wait_for_action_async(|response| match response {
+            NotificationResponse::Default => on_action(),
+            NotificationResponse::Action(a) if *a == id || a == "default" => on_action(),
+            _ => {}
+        });
+        let _ = tokio::time::timeout(ACTION_WAIT, wait).await;
+    });
+    true
+}
+
+/// Following's summary of new matches with **Open** (and a click on its body): `on_open` runs
+/// when the user picks it. False when no notification server answered (the caller toasts
+/// instead). Must run inside a tokio runtime.
+pub async fn notify_with_open(summary: &str, body: &str, on_open: Box<dyn FnOnce() + Send>) -> bool {
+    show_with_action(None, summary, body, ("open", "Open"), on_open).await
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1473,6 +1493,41 @@ mod tests {
         let calls = calls.lock().unwrap().clone();
         assert_eq!(calls[0].0, "News");
         assert_eq!(calls[0].2, vec!["default", "Watch", "watch", "Watch"]);
+    }
+
+    /// Following's summary carries Open (and a click on its body): picking it runs the callback
+    /// (the job sends `FollowEvent::Open`); a Watch-style action of another note doesn't.
+    #[test]
+    fn the_summary_notification_delivers_open() {
+        if !session_bus_available() {
+            eprintln!("skipped: no session bus");
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let suffix = format!("tuner_summary_{}", std::process::id());
+        let (_conn, calls) = rt.block_on(fake_server(&suffix, Some("open")));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let shown = rt.block_on(show_with_action(
+            Some(suffix.clone()),
+            "Following: 2 new",
+            "Arsenal · Sat 12:30",
+            ("open", "Open"),
+            Box::new(move || tx.send(()).unwrap()),
+        ));
+        assert!(shown);
+        rx.recv_timeout(Duration::from_secs(10)).expect("open action delivered");
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(calls[0].0, "Following: 2 new");
+        assert_eq!(calls[0].2, vec!["default", "Open", "open", "Open"]);
+    }
+
+    /// Unit tests never reach the desktop's notification server (they run real jobs): the
+    /// session target answers "not shown" at once, so callers toast instead.
+    #[test]
+    fn unit_tests_never_notify_the_desktop() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        assert!(!notify("Following: 1 new", "", false));
+        assert!(!rt.block_on(notify_with_open("Following: 1 new", "", Box::new(|| {}))));
     }
 
     #[test]
