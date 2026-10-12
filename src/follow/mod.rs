@@ -61,11 +61,51 @@ pub enum FollowReason {
     Daily,
 }
 
+impl FollowRule {
+    /// A new, unsaved rule from `kind`'s template (`id` 0, last in the list): spoiler-safe for
+    /// Team and Event rules when `follow.spoiler_safe_default` (one key with the spoiler
+    /// guard's "Sport I follow", B4); a news flash pops up (mode Flash) with the configured
+    /// headlines length; a show reminds, an event or team reminds 2 min before.
+    pub fn draft(name: impl Into<String>, kind: FollowKind, terms: Vec<String>, cfg: &crate::config::FollowConfig, now: Timestamp) -> Self {
+        Self {
+            id: FollowRuleId(0),
+            name: name.into(),
+            kind,
+            spec: FollowSpec::template(kind, terms, cfg.news_flash.headlines_min),
+            mode: if kind == FollowKind::News { FollowMode::Flash } else { FollowMode::Notify },
+            lead_s: if kind == FollowKind::News { 0 } else { 120 },
+            offset_s: 0,
+            spoiler_safe: cfg.spoiler_safe_default && matches!(kind, FollowKind::Team | FollowKind::Event),
+            max_per_week: if kind == FollowKind::News { 14 } else { 10 },
+            priority: i64::MAX,
+            enabled: true,
+            by_agent: false,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// A switch (or a news flash, which plays by itself): routed at fire time (B1/B6).
+    pub fn switches(&self) -> bool {
+        matches!(self.mode, FollowMode::Switch | FollowMode::Flash)
+    }
+
+    /// What passive surfaces (notifications, the summary, Upcoming, toasts, MCP) may say about
+    /// one of its matches: the rule name for a spoiler-safe rule, else the programme title.
+    pub fn safe_title<'a>(&'a self, title: &'a str) -> &'a str {
+        if self.spoiler_safe { &self.name } else { title }
+    }
+}
+
 /// What the app hears from Following's services.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FollowEvent {
     /// The editor's / sheet's "In the guide now" preview (newest `rev` wins).
     PreviewReady { rev: u64, preview: plan::Preview },
+    /// New matches to announce in the app (no notification server answered): "Following: 3
+    /// new" with up to two lines ("Arsenal · Sat 12:30 · Sky Sports Main Event") and "+1
+    /// more"; the toast's Open goes to Settings ▸ Following ▸ Upcoming. Spoiler-safe already.
+    Summary { title: String, lines: Vec<String> },
 }
 
 /// The folded terms of spoiler-safe rules, as virtual spoiler-guard topics ("until seen",
@@ -76,7 +116,7 @@ pub fn spoiler_terms(rules: &[FollowRule]) -> Vec<crate::guard::GuardTerm> {
         .filter(|r| r.enabled && r.spoiler_safe)
         .map(|r| crate::guard::GuardTerm {
             label: r.name.clone(),
-            terms: r.spec.terms.clone(),
+            terms: r.spec.terms.iter().map(|t| crate::textmatch::fold::folded(t)).filter(|t| !t.is_empty()).collect(),
             sport_only: matches!(r.kind, FollowKind::Team | FollowKind::Event),
         })
         .collect()
