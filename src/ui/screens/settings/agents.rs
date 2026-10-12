@@ -57,7 +57,8 @@ static TOGGLES: [CfgToggle; 2] = [
     },
 ];
 
-/// Where an agent's play opens (DESIGN §30.13): the pop-out, or Tuner's window. A play's own
+/// Where an agent's play opens (DESIGN §30.13): "Pop-out" — Tuner's window when it's on
+/// screen, the pop-out when it's out of sight — or always Tuner's window. A play's own
 /// `open_in` wins ("put it on the TV"); a hand-written `where-i-am` acts as, and shows as, the
 /// pop-out.
 static PLAY_IN: CfgChoice = CfgChoice {

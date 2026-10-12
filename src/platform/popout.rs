@@ -129,6 +129,11 @@ fn mapped_default() -> bool {
 }
 
 impl Client {
+    /// Our mapped window (by pid), with a well-formed address.
+    fn is_ours(&self, pid: u32) -> bool {
+        self.pid == i64::from(pid) && self.mapped && valid_address(&self.address)
+    }
+
     fn has_tag(&self, tag: &str) -> bool {
         self.tags.iter().any(|t| t.trim_end_matches('*') == tag)
     }
@@ -157,24 +162,30 @@ pub struct Monitor {
 }
 
 /// `c` is on screen: pinned (every workspace), or on a workspace one of `monitors` shows — and
-/// not a group member behind another tab.
-fn shown_on(c: &Client, monitors: &[Monitor]) -> bool {
+/// not a group member behind another tab, nor under another of `clients` fullscreen (or
+/// maximized) on its workspace (the agent's terminal after Super+F).
+fn shown_on(c: &Client, clients: &[Client], monitors: &[Monitor]) -> bool {
     let ws = c.workspace.id;
-    !c.hidden && (c.pinned || monitors.iter().any(|m| m.active_workspace.id == ws || (m.special_workspace.id != 0 && m.special_workspace.id == ws)))
+    let covered =
+        c.fullscreen == 0 && clients.iter().any(|o| o.address != c.address && o.mapped && !o.hidden && o.fullscreen != 0 && o.workspace.id == ws);
+    !c.hidden
+        && !covered
+        && (c.pinned || monitors.iter().any(|m| m.active_workspace.id == ws || (m.special_workspace.id != 0 && m.special_workspace.id == ws)))
 }
 
-/// Whether Tuner's window is on screen now (an agent's play keeps what the user watches there,
-/// DESIGN §30.13). Blocking: two requests on Hyprland's socket. `None` off Hyprland, off the
-/// desktop (tests), without a window, or when Hyprland doesn't answer.
+/// Whether Tuner's window is on screen now (an agent's play then fills it; out of sight, it
+/// pops out, DESIGN §30.13). Blocking: two requests on Hyprland's socket. `None` off Hyprland,
+/// off the desktop (tests), without a window, or when Hyprland doesn't answer.
 pub fn self_shown() -> Option<bool> {
     if super::off_desktop() {
         return None;
     }
     let mut hypr = Hypr::new(SocketIpc::from_env()?);
     let shown = (|| -> Result<Option<bool>, String> {
-        let Some(c) = hypr.our_client(std::process::id())? else { return Ok(None) };
+        let clients: Vec<Client> = hypr.json("clients")?;
+        let Some(c) = clients.iter().find(|c| c.is_ours(std::process::id())) else { return Ok(None) };
         let monitors: Vec<Monitor> = hypr.json("monitors")?;
-        Ok(Some(shown_on(&c, &monitors)))
+        Ok(Some(shown_on(c, &clients, &monitors)))
     })();
     shown.unwrap_or_else(|e| {
         tracing::debug!("pop-out: is our window on screen? {e}");
@@ -364,7 +375,7 @@ impl<I: HyprIpc> Hypr<I> {
     /// Our mapped window (by pid), with a well-formed address.
     pub fn our_client(&mut self, pid: u32) -> Result<Option<Client>, String> {
         let clients: Vec<Client> = self.json("clients")?;
-        Ok(clients.into_iter().find(|c| c.pid == i64::from(pid) && c.mapped && valid_address(&c.address)))
+        Ok(clients.into_iter().find(|c| c.is_ours(pid)))
     }
 
     fn monitor(&mut self, id: i64) -> Result<Monitor, String> {
@@ -1051,7 +1062,8 @@ mod tests {
 
     /// Our window is on screen when a monitor shows its workspace (the second monitor too, a
     /// scratchpad open over one), or it's pinned; not on a workspace nobody shows, nor behind
-    /// another tab of its group (DESIGN §30.13: an agent's play keeps what the user watches).
+    /// another tab of its group, nor under another window fullscreen on its workspace (DESIGN
+    /// §30.13: an agent's play fills a window on screen, pops out of one out of sight).
     #[test]
     fn our_window_is_shown_on_a_workspace_a_monitor_shows() {
         let monitors: Vec<Monitor> = serde_json::from_str(
@@ -1065,13 +1077,22 @@ mod tests {
             let mut c = tiled(PID);
             c["workspace"] = serde_json::json!({ "id": ws, "name": ws.to_string() });
             c.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-            shown_on(&serde_json::from_value(c).unwrap(), &monitors)
+            shown_on(&serde_json::from_value(c).unwrap(), &[], &monitors)
         };
         let none = serde_json::json!({});
         assert!(on(1, none.clone()) && on(4, none.clone()) && on(-98, none.clone()));
         assert!(!on(2, none), "a workspace nobody shows");
         assert!(on(2, serde_json::json!({ "pinned": true })), "pinned: every workspace");
         assert!(!on(1, serde_json::json!({ "hidden": true })), "behind another tab of its group");
+        // the agent's terminal fullscreen (or maximized) over it on workspace 1
+        let ours: Client = serde_json::from_value(tiled(PID)).unwrap();
+        let ours = Client { workspace: WorkspaceRef { id: 1 }, ..ours };
+        let term =
+            |ws: i64, fullscreen: i64| Client { address: "0xbbb".into(), pid: 1, workspace: WorkspaceRef { id: ws }, fullscreen, ..ours.clone() };
+        assert!(!shown_on(&ours, &[ours.clone(), term(1, 2)], &monitors), "under a fullscreen terminal");
+        assert!(!shown_on(&ours, &[term(1, 1)], &monitors), "under a maximized one");
+        assert!(shown_on(&ours, &[term(1, 0), term(4, 2)], &monitors), "beside it; fullscreen on the other monitor");
+        assert!(shown_on(&Client { fullscreen: 2, ..ours.clone() }, &[ours.clone(), term(1, 0)], &monitors), "ours is the fullscreen one");
     }
 
     /// The event stream drives the floating/pinned flags of OUR window only.

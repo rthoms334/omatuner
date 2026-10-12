@@ -8,8 +8,9 @@
 //! through the [`Launcher`] (detached: own process group, stdio to /dev/null, so it outlives
 //! the MCP client and never writes into the MCP stream), then poll the socket every 100 ms for
 //! up to [`LAUNCH_WAIT`]; `ErrorCode::Loading` replies (library not built yet) are retried
-//! every 250 ms within [`LOADING_WAIT`]. A play that opens in the pop-out starts Tuner as the
-//! pop-out only ([`Launch::PopOut`], DESIGN §30.13). `status` / `control` never launch:
+//! every 250 ms within [`LOADING_WAIT`]. A play asked for in the pop-out (`open_in: popout`)
+//! starts Tuner as the pop-out only ([`Launch::PopOut`], DESIGN §30.13); an unasked one starts
+//! its window, on the terminal's workspace. `status` / `control` never launch:
 //! `status` answers `{"running":false}`, `control` says Tuner isn't running.
 //! A running Tuner from before v2 answers with a v1 error line (no `"v"`): "restart Tuner".
 
@@ -45,8 +46,8 @@ pub enum Launch {
     No,
     /// Its window, as from the app menu.
     Window,
-    /// As the pop-out only, without the keyboard (`--agent-popout`): an agent's play that
-    /// opens there (DESIGN §30.13).
+    /// As the pop-out only, without the keyboard (`--agent-popout`): an agent's play asked
+    /// for there (DESIGN §30.13).
     PopOut,
 }
 

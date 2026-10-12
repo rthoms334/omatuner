@@ -1252,7 +1252,7 @@ with Claude Code, and *Second agent* with another one.
   **Expect:** Tuner opens on the current workspace within a few seconds; the agent lists programmes
   with channels and times in your local time.
 - [ ] **"Touring cars is on" (or any live sport / show in your guide):** with Tuner's window on
-  another workspace (or tiled behind the terminal). **Expect:** the agent finds the live programme
+  another workspace (or tiled behind the terminal made fullscreen with Super+F). **Expect:** the agent finds the live programme
   and it plays in the pop-out: pinned, bottom right, on the workspace you are on; the terminal keeps
   the keyboard (keep typing) and Tuner's window doesn't come forward. The agent says it's in the
   pop-out. Hover the pop-out → ↑ zaps; Backspace in it returns to the previous channel.
@@ -1266,23 +1266,33 @@ with Claude Code, and *Second agent* with another one.
   another channel. **Expect:** it stays fullscreen in the window (no pop-out). Same with Tuner's
   player tiled beside the terminal while you type in the terminal (or on a second monitor), and
   with two pictures on (multi-view). "Move it to the pop-out" then pops it out.
+- [ ] **Browsing in the window on screen:** Tuner tiled beside the terminal on Live TV with its
+  preview pane playing (Esc out of the player), then on Home, ask the agent to play something
+  each time. **Expect:** the player fills Tuner's window (not fullscreen, no pop-out, the preview
+  pane doesn't just change channel); the terminal keeps the keyboard; the agent says it's in
+  Tuner's window. Repeat a few times: same every time.
 - [ ] **Watching on another workspace:** Tuner playing in its window on workspace 2, you on
   workspace 1 in the terminal: ask for another channel. **Expect:** it comes to you in the
   pop-out on workspace 1.
 - [ ] **Setting:** Settings ▸ AI agents ▸ *Agents play in* = Tuner window, Tuner on another
   workspace, ask the agent to play something. **Expect:** Tuner's window comes forward and plays
   it. Set it back to Pop-out.
-- [ ] **Tuner not running → the pop-out:** quit Tuner, keep typing in the terminal, ask "play
-  BBC One". **Expect:** Tuner starts as the pop-out only, on this workspace, without the keyboard
+- [ ] **Tuner not running → the window:** quit Tuner, ask "play BBC One". **Expect:** Tuner
+  starts like a plain `tuner` on this workspace (tiled, not pinned, not fullscreen, focused like
+  any app launch) and BBC One plays in its full window's player; no pop-out appears.
+- [ ] **Tuner not running → the pop-out, asked:** quit Tuner, ask "play BBC One in the pop-out".
+  **Expect:** Tuner starts as the pop-out only, on this workspace, without the keyboard
   ("Nothing playing" for a second, then the channel); no full window jumps in front. Esc tiles it.
 - [ ] **Not running, then it fails:** quit Tuner, ask for a programme that hasn't started (or Up
-  next while it is empty). **Expect:** the agent says why; Tuner doesn't stay as an empty pinned
+  next while it is empty) in the pop-out. **Expect:** the agent says why; Tuner doesn't stay as an empty pinned
   pop-out (it goes back into a normal window).
 - [ ] **Not running, locked:** quit Tuner with a PIN set and a locked channel, ask the agent to
   play it. **Expect:** Tuner's window (not the pop-out) with the PIN prompt; typing the PIN works.
-- [ ] **Up next follows the pop-out:** queue two short films (or two episodes) from the agent and
-  say "play Up next". **Expect:** the first plays in the pop-out (not the corner mini player in
-  Tuner's window); when it ends, the second plays in the pop-out too. "Skip" keeps it there.
+- [ ] **Up next follows the pop-out:** with Tuner on another workspace, queue two short films (or
+  two episodes) from the agent and say "play Up next". **Expect:** the first plays in the pop-out
+  (not the corner mini player in Tuner's window); when it ends, the second plays in the pop-out
+  too. "Skip" keeps it there. With Tuner's window on screen (on Home), "play Up next" opens its
+  player in the window instead.
   Lock the second film first: when it comes up, a notification asks for the PIN.
   With *Agents play in* = Tuner window, "play Up next" opens Tuner's player (not the mini player).
 - [ ] **Multi-view from the pop-out:** with a channel in the pop-out, ask for "BBC One and BBC

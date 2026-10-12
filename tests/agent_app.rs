@@ -1270,37 +1270,44 @@ fn the_queue_tool_drives_up_next() {
     assert!(w.ok("status", json!({})).get("queue").is_none());
 }
 
-/// DESIGN §30.13: an agent's play opens in the pop-out by default — unless the user watches
-/// in Tuner's fullscreen window, or asked for the full window — and says where (`opened_in`);
-/// without Hyprland (no window published, off the desktop) it opens in the window as before.
+/// DESIGN §30.13: an agent's play opens in Tuner's full window when the window is on screen —
+/// whatever it shows, unraised (the agent's terminal keeps the keyboard) — and in the pop-out
+/// when it's out of sight or asked for, and says where (`opened_in`). Off the desktop Hyprland
+/// can't tell whether the window is seen: it counts as on screen (nothing moves uninvited);
+/// without Hyprland (no window published) it opens in the window, raised, as before.
 /// `queue play` shows what Up next started the same way (the app never heard of it before:
-/// the corner mini player); the next items follow it into the pop-out. A failed play puts an
+/// the corner mini player); the next items follow it into a pop-out. A failed play puts an
 /// empty pop-out back in.
 #[test]
-fn agent_plays_open_in_the_pop_out_and_say_where() {
-    use tuner::reminders::ui::{Placement, WindowNow};
+fn agent_plays_open_in_the_window_on_screen_and_say_where() {
+    use tuner::agent::act::AgentShow;
+    use tuner::reminders::ui::WindowNow;
     let mut w = World::new(Config::default());
     w.publish(Visibility::NO_EXPLICIT);
-    let place = |w: &World| match &w.commands()[..] {
-        [AgentCommand::Play(p)] => p.show.place,
-        [AgentCommand::Show(s)] => s.place,
+    let shown = |w: &World| match &w.commands()[..] {
+        [AgentCommand::Play(p)] => p.show,
+        [AgentCommand::Show(s)] => *s,
         other => panic!("{other:?}"),
     };
+    let full = AgentShow { fullscreen: true, ..AgentShow::window(true) };
     let bbc = json!({ "ref": "channel:1:m3u:bbc1" });
     let out = w.ok("play", bbc.clone());
-    assert_eq!((out["opened_in"].as_str(), place(&w)), (Some("window"), Placement::FullWindow), "no Hyprland: {out}");
+    assert_eq!((out["opened_in"].as_str(), shown(&w)), (Some("window"), AgentShow::window(true)), "no Hyprland: {out}");
 
     let shared = w.ui.services().agent.clone();
     let away = WindowNow { can_pop: true, ..Default::default() };
     shared.set_window(away);
     let out = w.ok("play", bbc.clone());
-    assert_eq!((out["opened_in"].as_str(), place(&w)), (Some("popout"), Placement::PopOut), "{out}");
+    assert_eq!((out["opened_in"].as_str(), shown(&w)), (Some("window"), AgentShow::window(false)), "browsing, seen: {out}");
+    assert!(out["message"].as_str().unwrap().ends_with("It's in Tuner's window."), "{out}");
+    let out = w.ok("play", json!({ "ref": "channel:1:m3u:bbc1", "open_in": "popout" }));
+    assert_eq!((out["opened_in"].as_str(), shown(&w)), (Some("popout"), AgentShow::POP_OUT), "{out}");
     assert!(out["message"].as_str().unwrap().ends_with("It's in the pop-out."), "{out}");
     shared.set_window(WindowNow { fullscreen: true, watching: true, ..away });
-    assert_eq!((w.ok("play", bbc.clone())["opened_in"].as_str(), place(&w)), (Some("window"), Placement::FullWindow), "fullscreen stays");
+    assert_eq!((w.ok("play", bbc.clone())["opened_in"].as_str(), shown(&w)), (Some("window"), AgentShow::window(false)), "fullscreen stays");
     shared.set_window(away);
     let tv = w.ok("play", json!({ "ref": "channel:1:m3u:bbc1", "open_in": "full_window" }));
-    assert_eq!((tv["opened_in"].as_str(), place(&w)), (Some("window"), Placement::FullWindow));
+    assert_eq!((tv["opened_in"].as_str(), shown(&w)), (Some("window"), full));
     assert_eq!(w.err("play", json!({ "ref": "channel:1:m3u:bbc1", "open_in": "tv" })), ErrorCode::BadRequest);
     assert!(w.commands().is_empty());
     // a play that fails while the pop-out shows nothing (Tuner started for it): back in
@@ -1328,13 +1335,13 @@ fn agent_plays_open_in_the_pop_out_and_say_where() {
     assert_eq!(w.ok("queue", json!({ "action": "add", "refs": films }))["added"].as_array().unwrap().len(), 3);
     assert_eq!(w.err("queue", json!({ "action": "list", "open_in": "popout" })), ErrorCode::BadRequest);
     let out = w.ok("queue", json!({ "action": "play" }));
-    assert_eq!((out["opened_in"].as_str(), place(&w)), (Some("popout"), Placement::PopOut), "{out}");
+    assert_eq!((out["opened_in"].as_str(), shown(&w)), (Some("window"), AgentShow::window(false)), "{out}");
     shared.set_window(WindowNow { popped_out: true, ..away });
     // (the test player never plays, so Up next isn't driving it: the skip places it again)
     let out = w.ok("queue", json!({ "action": "skip" }));
-    assert_eq!((out["opened_in"].as_str(), place(&w)), (Some("popout"), Placement::PopOut), "the pop-out stays: {out}");
+    assert_eq!((out["opened_in"].as_str(), shown(&w)), (Some("popout"), AgentShow::POP_OUT), "the pop-out stays: {out}");
     let out = w.ok("queue", json!({ "action": "skip", "open_in": "full_window" }));
-    assert_eq!((out["opened_in"].as_str(), place(&w)), (Some("window"), Placement::FullWindow), "{out}");
+    assert_eq!((out["opened_in"].as_str(), shown(&w)), (Some("window"), full), "{out}");
 }
 
 /// follow: a preview never looks at explicit channels; a spoiler-safe rule shows only its

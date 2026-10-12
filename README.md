@@ -1122,8 +1122,9 @@ reason. Enter or a click on an agent opens its menu: *Connect* (*Repair*, or *Ad
 plugin* when Claude Code has only the MCP server), *Update to <version>*, *Disconnect…* (asks
 first), *Copy the setup command* and *Copy the README link*. *Check again* reads every status again. The page also says
 which agents it didn't find, and which agent used Tuner last ("Last used by Claude, 2 h ago").
-*Agents play in* picks where what an agent plays opens: the *Pop-out* (default) or the *Tuner
-window* (see [Where it plays](#where-it-plays)).
+*Agents play in* picks where what an agent plays opens: the *Pop-out* (default: Tuner's window
+when you can see it, the pop-out when it's on another workspace) or always the *Tuner window*
+(see [Where it plays](#where-it-plays)).
 
 | Agent | Connect runs | Disconnect runs |
 |---|---|---|
@@ -1253,25 +1254,35 @@ search the web.
 
 ### Where it plays
 
-What your agent plays (a channel, a film, an episode, Up next) opens in the
-[pop-out](#pop-out-player) by default: the small player pinned on every workspace, so it appears
-where you are and your terminal keeps the keyboard. The agent says where it opened.
+What your agent plays (a channel, a film, an episode, Up next) opens where you can see it. When
+Tuner is already running, your terminal keeps the keyboard. The agent says where it opened.
+
+- If Tuner's window is on screen (on the workspace you are on, tiled beside your terminal, or on
+  another monitor), it plays there: the player fills Tuner's window, whatever screen it was on
+  (Live TV, Home, Movies…), without bringing it to the front. A fullscreen window stays
+  fullscreen; Tuner doesn't go full screen by itself.
+- If Tuner's window is on a workspace you aren't looking at, it plays in the
+  [pop-out](#pop-out-player): the small player pinned on every workspace, so it appears where
+  you are.
 
 - Ask for **full screen**, **the big screen** or **the TV** and it plays full screen in Tuner's
   window instead, brought to the front. "Put it on the big screen" moves what already plays
   there the same way, without starting it again.
-- If you are already watching in Tuner's window where you can see it (fullscreen, tiled beside
-  your terminal, on another monitor, or two pictures side by side), a new play stays there,
-  even while your terminal has the keyboard. Tuner never moves what you watch into the pop-out
-  unless you ask ("move it to the pop-out"). A window on a workspace you aren't looking at
-  doesn't count: the play comes to you in the pop-out.
+- Ask for the **pop-out** ("move it to the pop-out") and it plays there wherever Tuner's window
+  is. Once something plays in the pop-out, an agent's next play stays there.
+- A Tuner window hidden behind a fullscreen (or maximized) window, your terminal after Super+F
+  say, counts as out of sight: the play comes to you in the pop-out.
+- With two pictures side by side (multi-view) a new play stays in Tuner's window, brought to the
+  front when it's out of sight.
 - Once Up next plays in the pop-out, its next items carry on there. If one of them needs the
   PIN, a notification says so (type it in Tuner's window).
 - Opening two pictures (multi-view) moves the pop-out back into Tuner's window, in front.
 - Settings ▸ AI agents ▸ *Agents play in* makes the Tuner window the default instead.
-- If Tuner isn't running, asking to play something starts it straight into the pop-out on the
-  workspace you are on, without taking the keyboard (like a scheduled switch; install the
-  packaged window rules, see [Pop-out player](#pop-out-player)).
+- If Tuner isn't running, asking to play something starts it as usual on the workspace you are
+  on, as a normal window that takes the keyboard like any app you open, playing in its window.
+  Asking for the pop-out instead starts it straight into the pop-out,
+  without taking the keyboard (like a scheduled switch; install the packaged window rules, see
+  [Pop-out player](#pop-out-player)).
 - A locked item brings Tuner's window forward, because the PIN is typed there.
 - If the play fails (nothing on, not found), a pop-out that shows nothing goes back into Tuner's
   window.
@@ -1448,10 +1459,10 @@ leaves the pop-out where it is ("Nothing playing"); its page is waiting when you
 - Install the packaged window rules (`hypr/tuner.lua`, above) for the pop-out too: without them
   Omarchy draws unfocused windows at 96 % opacity, so the page behind shows through the video.
   They also keep video rendering while a tiled Tuner sits on another workspace.
-- What an AI agent plays opens in the pop-out by default (see
+- What an AI agent plays opens in Tuner's window when it's on screen, else in the pop-out (see
   [Where it plays](#where-it-plays)).
-- A scheduled switch (Open in: Pop-out) or an AI agent's play while Tuner is closed, or `tuner
-  --play <ref> --popout`, starts Tuner straight into the pop-out. That window's class is **`tuner-popout`**
+- A scheduled switch (Open in: Pop-out) or an AI agent's play asked for in the pop-out while
+  Tuner is closed, or `tuner --play <ref> --popout`, starts Tuner straight into the pop-out. That window's class is **`tuner-popout`**
   (all session long), and the packaged rules map it floating and pinned **without taking the
   keyboard** from what you are typing in. Esc tiles it like any pop-out. Without the rules it
   may open tiled and focused first. Popping out a running Tuner never takes the keyboard
