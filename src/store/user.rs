@@ -605,6 +605,16 @@ fn check_reminder_times(lead_s: i64, offset_s: i64) -> Result<()> {
     Ok(())
 }
 
+/// A reminder's target (start + offset) must fall before the programme ends: one after it would
+/// be dismissed unseen ("30 min in" on a 15-minute bulletin).
+fn check_reminder_target(r: &Reminder, offset_s: i64) -> Result<()> {
+    let r = Reminder { offset_s, ..r.clone() };
+    if crate::reminders::target_at(&r) >= crate::reminders::effective_stop(&r) {
+        return Err(Error::Other("a reminder's start offset must fall before the programme ends".into()));
+    }
+    Ok(())
+}
+
 /// A row's `(lead_s, mode)` as stored: a switch always carries both markers (`mode = 'switch'`
 /// and `lead_s = Reminder::SWITCH_LEAD`), a notification neither (a switch made a note again
 /// gets the default lead), so every reader — `Reminder::switches`, SQL on either column — agrees.
@@ -622,6 +632,11 @@ pub fn add_reminder(conn: &Connection, r: &Reminder) -> Result<ReminderId> {
         return Err(Error::Other("reminders are for channels only".into()));
     }
     check_reminder_times(r.lead_s, r.offset_s)?;
+    // Following's offset is the rule's ("skip the build-up"): its rows are never refused here,
+    // or one short airing would fail the whole evaluation
+    if r.rule_id.is_none() {
+        check_reminder_target(r, r.offset_s)?;
+    }
     let (lead_s, mode) = stored_mode(r.lead_s, r.mode);
     let fp = fingerprint_of(conn, &r.channel)?;
     conn.execute(
@@ -721,6 +736,9 @@ pub fn edit_reminder(conn: &Connection, id: ReminderId, e: &ReminderEdit) -> Res
     let lead_s = e.lead_s.unwrap_or(if old_lead == Reminder::SWITCH_LEAD { 0 } else { old_lead });
     let offset_s = e.offset_s.unwrap_or(old.offset_s);
     check_reminder_times(lead_s, offset_s)?;
+    if e.offset_s.is_some_and(|o| o != old.offset_s) {
+        check_reminder_target(&old, offset_s)?;
+    }
     let (lead_s, mode) = stored_mode(lead_s, mode);
     let open_in = e.open_in.unwrap_or(old.open_in);
     if old.rule_id.is_some() && (lead_s != old_lead || mode != old_mode) {

@@ -88,6 +88,10 @@ struct Loaded {
     around: Vec<Reminder>,
 }
 
+fn programme_len(p: &ProgrammeOn) -> i64 {
+    if p.stop > p.start { p.stop - p.start } else { crate::reminders::DEFAULT_DURATION_S }
+}
+
 pub struct ReminderSheet {
     spec: ReminderSheetSpec,
     loaded: Option<Loaded>,
@@ -144,8 +148,14 @@ impl ReminderSheet {
         v
     }
 
+    /// The programme's length (offsets past its end are not offered).
+    fn programme_len(&self) -> i64 {
+        self.loaded.as_ref().and_then(|l| l.on.as_ref()).map_or(i64::MAX, programme_len)
+    }
+
     /// Move the value of `f` by `d` (or to option `to`).
     fn change(&mut self, f: Field, d: i32, to: Option<usize>) {
+        let len_s = self.programme_len();
         let Some(c) = &mut self.choice else { return };
         match f {
             Field::Mode => c.switch = to.map_or(!c.switch, |i| i == 1),
@@ -155,7 +165,7 @@ impl ReminderSheet {
                 c.lead_min = leads[to.unwrap_or_else(|| step(i, d, leads.len()))];
             }
             Field::Offset => {
-                let offs = c.offsets();
+                let offs = c.offsets(len_s);
                 let i = offs.iter().position(|o| *o == c.offset_min).unwrap_or(0);
                 c.offset_min = offs[to.unwrap_or_else(|| step(i, d, offs.len()))];
             }
@@ -283,6 +293,7 @@ impl Overlay for ReminderSheet {
             let shown = guard.outside_title(&p.title, now);
             title(ui, theme, &shown, Some(&format!("{} · {} · {}", day_label(p.start), time_range(p.start, p.stop, h24), p.channel.name)));
             let Some(c) = self.choice else { return };
+            let len_s = programme_len(p);
             for (i, f) in fields.iter().enumerate() {
                 let focused = i == self.field;
                 let hit = match f {
@@ -296,7 +307,7 @@ impl Overlay for ReminderSheet {
                         choice_row(ui, theme, "Notify me before", &opts, sel, focused)
                     }
                     Field::Offset => {
-                        let offs = c.offsets();
+                        let offs = c.offsets(len_s);
                         let opts: Vec<String> = offs.iter().map(|m| offset_label(*m)).collect();
                         let sel = offs.iter().position(|m| *m == c.offset_min).unwrap_or(0);
                         let label = if c.switch { "Switch (skip the build-up)" } else { "From" };

@@ -35,9 +35,18 @@ pub fn unit_id(unit: &str) -> Option<ReminderId> {
     digits.parse().ok().filter(|n: &i64| *n > 0).map(ReminderId)
 }
 
-/// The command a unit runs.
+/// The command a unit runs: this Tuner (an install outside the user manager's `PATH` too).
 pub fn command(id: ReminderId) -> [String; 3] {
-    [crate::APP_ID.to_owned(), "--reminder".to_owned(), id.0.to_string()]
+    [exe(), "--reminder".to_owned(), id.0.to_string()]
+}
+
+/// The running Tuner's executable, else (replaced by an upgrade, unreadable) Tuner by name.
+pub fn exe() -> String {
+    std::env::current_exe()
+        .ok()
+        .filter(|p| p.is_file())
+        .and_then(|p| p.into_os_string().into_string().ok())
+        .unwrap_or_else(|| crate::APP_ID.to_owned())
 }
 
 /// When `r` fires in a running Tuner (`lead_default_s` for rows without their own lead;
@@ -95,8 +104,9 @@ mod tests {
         assert_eq!(armed.len(), MAX_UNITS);
         assert_eq!(armed[0], (ReminderId(1), now + 600 + 3600 - 120));
         assert!(!armed.iter().any(|(id, _)| [ReminderId(100), ReminderId(101)].contains(id)));
-        let cmd = command(ReminderId(7)).join(" ");
-        assert_eq!(cmd, "tuner --reminder 7");
+        let cmd = command(ReminderId(7));
+        assert_eq!(cmd[1..], ["--reminder", "7"]);
+        assert!(std::path::Path::new(&cmd[0]).is_file(), "this executable: {cmd:?}");
         assert!(!unit_name(ReminderId(7)).contains("Secret") && !UNIT_DESCRIPTION.contains("Secret"));
     }
 

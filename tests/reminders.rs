@@ -90,6 +90,9 @@ fn modes_offsets_and_edits() {
     assert!(s.writer().blocking(move |c| user::edit_reminder(c, id, &ReminderEdit { lead_s: Some(2 * 86_400), ..Default::default() })).is_err());
     assert!(s.writer().blocking(move |c| user::edit_reminder(c, id, &ReminderEdit { offset_s: Some(-7200), ..Default::default() })).is_err());
     assert!(s.writer().blocking(move |c| user::add_reminder(c, &Reminder { offset_s: 13 * 3600, ..rem("xt:live:3", 1, 2, 0) })).is_err());
+    // an offset past the programme's end would be dismissed unseen: refused
+    assert!(s.writer().blocking(move |c| user::add_reminder(c, &Reminder { offset_s: 3600, ..rem("xt:live:3", now, now + 3600, 0) })).is_err());
+    assert!(s.writer().blocking(move |c| user::edit_reminder(c, id, &ReminderEdit { offset_s: Some(3600), ..Default::default() })).is_err());
 
     w(&s, move |c| user::set_reminder_state(c, id, ReminderState::Fired));
     let back = w(&s, move |c| user::edit_reminder(c, id, &ReminderEdit { offset_s: Some(900), ..Default::default() }));
@@ -145,6 +148,11 @@ fn clash_checks_against_the_store() {
     assert_eq!(clashes.iter().map(|(r, k)| (r.id, *k)).collect::<Vec<_>>(), [(semi1, tuner::reminders::ClashKind::Overlap)]);
 }
 
+/// No spoiler guard.
+fn ident(_: &Connection) -> Guard {
+    Guard::default()
+}
+
 fn cfg(f: impl FnOnce(&mut Config)) -> Config {
     let mut c = Config::default();
     f(&mut c);
@@ -163,34 +171,84 @@ fn state(s: &Store, id: ReminderId) -> ReminderState {
 fn closed_tuner_fires_by_mode() {
     let s = store("tuner-rem-closed");
     let now = now();
-    let g = Guard::default();
     let on = Config::default();
 
     let due = add(&s, rem("xt:live:1", now + 100, now + 1800, 120));
-    let out = closed::fire(&s, &on, &g, due.0, now).unwrap();
+    let out = closed::fire(&s, &on, ident, due.0, now).unwrap();
     let ClosedOutcome::Notify(note) = out else { panic!("{out:?}") };
     assert_eq!((note.summary.as_str(), note.body.as_str(), note.play.as_str()), ("The Final", "Starts in 2 min on BBC One", "1:xt:live:1"));
     assert_eq!(state(&s, due), ReminderState::Fired);
-    assert_eq!(closed::fire(&s, &on, &g, due.0, now).unwrap(), ClosedOutcome::Exit, "fires once");
+    assert_eq!(closed::fire(&s, &on, ident, due.0, now).unwrap(), ClosedOutcome::Exit, "fires once");
 
     let early = add(&s, rem("xt:live:2", now + 3600, now + 7200, 120));
-    assert_eq!(closed::fire(&s, &on, &g, early.0, now).unwrap(), ClosedOutcome::Exit);
+    assert_eq!(closed::fire(&s, &on, ident, early.0, now).unwrap(), ClosedOutcome::Exit);
     assert_eq!(state(&s, early), ReminderState::Pending, "the next start re-arms it");
-    assert_eq!(closed::fire(&s, &cfg(|c| c.reminders.enabled = false), &g, early.0, now + 3500).unwrap(), ClosedOutcome::Exit);
+    assert_eq!(closed::fire(&s, &cfg(|c| c.reminders.enabled = false), ident, early.0, now + 3500).unwrap(), ClosedOutcome::Exit);
 
     let ended = add(&s, rem("xt:live:3", now - 7200, now - 3600, 120));
-    assert_eq!(closed::fire(&s, &on, &g, ended.0, now).unwrap(), ClosedOutcome::Exit);
+    assert_eq!(closed::fire(&s, &on, ident, ended.0, now).unwrap(), ClosedOutcome::Exit);
     assert_eq!(state(&s, ended), ReminderState::Dismissed);
 
     let sw = add(&s, Reminder { mode: ReminderMode::Switch, ..rem("xt:live:4", now + 30, now + 1800, 0) });
-    assert_eq!(closed::fire(&s, &on, &g, sw.0, now).unwrap(), ClosedOutcome::StartApp { popout: true });
+    assert_eq!(closed::fire(&s, &on, ident, sw.0, now).unwrap(), ClosedOutcome::StartApp { popout: true });
     assert_eq!(state(&s, sw), ReminderState::Pending, "the started Tuner switches");
     let full = add(&s, Reminder { mode: ReminderMode::Switch, open_in: Some(OpenIn::FullWindow), ..rem("xt:live:5", now + 30, now + 1800, 0) });
-    assert_eq!(closed::fire(&s, &on, &g, full.0, now).unwrap(), ClosedOutcome::StartApp { popout: false });
+    assert_eq!(closed::fire(&s, &on, ident, full.0, now).unwrap(), ClosedOutcome::StartApp { popout: false });
     let gone = add(&s, Reminder { mode: ReminderMode::Switch, ..rem("xt:live:6", now - 1000, now + 1800, 0) });
-    assert_eq!(closed::fire(&s, &on, &g, gone.0, now).unwrap(), ClosedOutcome::Exit);
+    assert_eq!(closed::fire(&s, &on, ident, gone.0, now).unwrap(), ClosedOutcome::Exit);
     assert_eq!(state(&s, gone), ReminderState::Dismissed, "more than 15 min late");
-    assert_eq!(closed::fire(&s, &on, &g, 9999, now).unwrap(), ClosedOutcome::Exit, "no such reminder");
+    assert_eq!(closed::fire(&s, &on, ident, 9999, now).unwrap(), ClosedOutcome::Exit, "no such reminder");
+
+    // the note's title passes the spoiler guard built from the store (a blackout on the topic)
+    let guarded = cfg(|c| c.spoiler.enabled = true);
+    w(&s, move |c| {
+        let rule = SpoilerRule {
+            id: SpoilerRuleId(0),
+            kind: SpoilerRuleKind::Blackout,
+            label: "Arsenal".into(),
+            terms: vec!["Arsenal".into()],
+            series_norm: None,
+            categories: Vec::new(),
+            mode: SpoilerMode::Always,
+            window_h: 48,
+            until_at: Some(now + 86_400),
+            sport_descr: true,
+            shield: true,
+            enabled: true,
+            by_agent: false,
+            created_at: 0,
+        };
+        tuner::store::spoiler::add_rule(c, &rule, now).map(drop)
+    });
+    let result = add(&s, Reminder { programme_title: "Arsenal 2-1 Chelsea".into(), ..rem("xt:live:7", now + 100, now + 1800, 120) });
+    let store_guard = |c: &Connection| closed::store_guard(c, &guarded, now);
+    let out = closed::fire(&s, &guarded, store_guard, result.0, now).unwrap();
+    assert!(matches!(&out, ClosedOutcome::Notify(n) if n.summary == "Arsenal v Chelsea"), "{out:?}");
+
+    // a news flash in quiet hours does nothing (and is done); outside them it starts Tuner
+    w(&s, |c| {
+        c.execute("INSERT INTO follow_rule(id, name, kind, spec, mode, priority, created_at, updated_at) VALUES (6, 'News at One', 'news', '{}', 'flash', 0, 0, 0)", [])?;
+        Ok(())
+    });
+    let flash = |key: &str| {
+        let id = add(&s, Reminder { mode: ReminderMode::Switch, open_in: Some(OpenIn::PopOut), ..rem(key, now + 30, now + 1800, 0) });
+        w(&s, move |c| {
+            c.execute("UPDATE reminder SET rule_id = 6 WHERE id = ?1", [id.0])?;
+            Ok(())
+        });
+        id
+    };
+    let quiet = cfg(|c| {
+        c.follow.news_flash.quiet_from_min = Some(0);
+        c.follow.news_flash.quiet_to_min = Some(24 * 60);
+        c.follow.news_flash.skip_when_fullscreen = false;
+    });
+    let hushed = flash("xt:live:8");
+    assert_eq!(closed::fire(&s, &quiet, ident, hushed.0, now).unwrap(), ClosedOutcome::Exit);
+    assert_eq!(state(&s, hushed), ReminderState::Fired);
+    let loud = flash("xt:live:9");
+    let awake = cfg(|c| c.follow.news_flash.skip_when_fullscreen = false);
+    assert_eq!(closed::fire(&s, &awake, ident, loud.0, now).unwrap(), ClosedOutcome::StartApp { popout: true });
 }
 
 /// Parental control while closed: the session counts as locked. A Following switch to a locked
@@ -218,18 +276,17 @@ fn closed_tuner_respects_parental_control() {
         c.parental.enabled = true;
         c.parental.pin_hash = Some("x".into());
     });
-    let g = Guard::default();
     let rule = add(&s, Reminder { mode: ReminderMode::Switch, ..rem("xt:live:1", now + 30, now + 1800, 0) });
     w(&s, move |c| {
         c.execute("UPDATE reminder SET rule_id = 4 WHERE id = ?1", [rule.0])?;
         Ok(())
     });
-    let out = closed::fire(&s, &pin, &g, rule.0, now).unwrap();
+    let out = closed::fire(&s, &pin, ident, rule.0, now).unwrap();
     assert!(matches!(&out, ClosedOutcome::Notify(n) if n.body.ends_with("needs your PIN")), "{out:?}");
     // the user's own switch to the same channel starts Tuner, which asks for the PIN
     let own = add(&s, Reminder { mode: ReminderMode::Switch, ..rem("xt:live:1", now + 40, now + 1800, 0) });
-    assert_eq!(closed::fire(&s, &pin, &g, own.0, now).unwrap(), ClosedOutcome::StartApp { popout: true });
+    assert_eq!(closed::fire(&s, &pin, ident, own.0, now).unwrap(), ClosedOutcome::StartApp { popout: true });
     let explicit = add(&s, rem("m3u:late", now + 100, now + 1800, 120));
-    assert_eq!(closed::fire(&s, &pin, &g, explicit.0, now).unwrap(), ClosedOutcome::Exit);
+    assert_eq!(closed::fire(&s, &pin, ident, explicit.0, now).unwrap(), ClosedOutcome::Exit);
     assert_eq!(state(&s, explicit), ReminderState::Pending, "announced once it may be");
 }

@@ -13,9 +13,9 @@
 //!   earlier run are re-armed, their times unknown), then only arms and disarms the
 //!   differences. A failing `systemd-run` turns arming off for the session (logged once).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
@@ -116,8 +116,12 @@ impl ArmSync {
 /// The real units.
 #[derive(Debug, Clone)]
 pub struct SystemdArmer {
-    /// `--setenv` pairs (see [`SESSION_VARS`]).
+    /// This session's [`SESSION_VARS`], for `--setenv`…
     env: Vec<(String, String)>,
+    /// …except those the user manager has already (read once, on the first arm): a unit
+    /// inherits them as they are when it fires — current again after a re-login (Omarchy
+    /// imports the session's environment at login) — instead of frozen at arm time.
+    managed: OnceLock<HashSet<String>>,
 }
 
 impl SystemdArmer {
@@ -129,7 +133,15 @@ impl SystemdArmer {
             return None;
         }
         let env = SESSION_VARS.iter().filter_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()).map(|v| ((*k).to_owned(), v))).collect();
-        Some(Self { env })
+        Some(Self { env, managed: OnceLock::new() })
+    }
+
+    fn managed(&self) -> &HashSet<String> {
+        self.managed.get_or_init(|| {
+            call("systemctl", &["--user", "show-environment"])
+                .map(|out| out.lines().filter_map(|l| l.split_once('=').map(|(k, _)| k.to_owned())).collect())
+                .unwrap_or_default()
+        })
     }
 
     /// `systemd-run`'s arguments for reminder `id` at `at`.
@@ -143,7 +155,8 @@ impl SystemdArmer {
             format!("--on-calendar=@{at}"),
             "--timer-property=AccuracySec=1s".to_owned(),
         ];
-        args.extend(self.env.iter().map(|(k, v)| format!("--setenv={k}={v}")));
+        let managed = self.managed();
+        args.extend(self.env.iter().filter(|(k, _)| !managed.contains(k)).map(|(k, v)| format!("--setenv={k}={v}")));
         args.push("--".to_owned());
         args.extend(arming::command(id));
         args
@@ -179,7 +192,7 @@ fn on_path(prog: &str) -> bool {
 }
 
 /// Run `prog args…` with a timeout; its stdout, or an error with its stderr's first line.
-fn call(prog: &str, args: &[&str]) -> Result<String> {
+pub(crate) fn call(prog: &str, args: &[&str]) -> Result<String> {
     let mut child = Command::new(prog)
         .args(args)
         .stdin(Stdio::null())
@@ -279,11 +292,16 @@ pub(crate) mod tests {
     }
 
     /// The unit names nothing but the id: no title, channel or ref in its name, description
-    /// or command line; it runs `tuner --reminder <id>` once at the given second.
+    /// or command line; it runs `tuner --reminder <id>` once at the given second. Session
+    /// variables the user manager keeps are left to it (fresh after a re-login).
     #[test]
     fn units_carry_only_the_id() {
-        let armer = SystemdArmer { env: vec![("WAYLAND_DISPLAY".into(), "wayland-1".into())] };
+        let armer = SystemdArmer {
+            env: vec![("WAYLAND_DISPLAY".into(), "wayland-1".into()), ("HYPRLAND_INSTANCE_SIGNATURE".into(), "abc_1".into())],
+            managed: OnceLock::from(HashSet::from(["HYPRLAND_INSTANCE_SIGNATURE".to_owned()])),
+        };
         let args = armer.run_args(ReminderId(7), 1_791_900_000);
+        let exe = arming::command(ReminderId(7))[0].clone();
         assert_eq!(
             args,
             [
@@ -296,7 +314,7 @@ pub(crate) mod tests {
                 "--timer-property=AccuracySec=1s",
                 "--setenv=WAYLAND_DISPLAY=wayland-1",
                 "--",
-                "tuner",
+                exe.as_str(),
                 "--reminder",
                 "7"
             ]

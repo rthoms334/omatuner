@@ -188,6 +188,8 @@ pub struct SleepRun {
     deadline: Deadline,
     /// The item being counted and the last seconds-left seen of it.
     counting: Option<(Item, Option<f64>)>,
+    /// An item counted as finished that still shows ended: not counted again.
+    spent: Option<Item>,
     /// Up next was seen driving (end of queue).
     queue_seen: bool,
     warned: bool,
@@ -222,7 +224,7 @@ impl SleepRun {
             _ => w.item(),
         }
         .map(|i| (i, w.left_s));
-        Ok(Self { timer, deadline, counting, queue_seen: w.queue_current.is_some(), warned: false })
+        Ok(Self { timer, deadline, counting, spent: None, queue_seen: w.queue_current.is_some(), warned: false })
     }
 
     pub fn timer(&self) -> &SleepTimer {
@@ -255,10 +257,19 @@ impl SleepRun {
                         return Some(SleepStep::Fire(self.timer.action));
                     }
                     // an ended item stays on screen: start counting the next one when it starts
-                    self.counting = if changed { now_item.map(|i| (i, w.left_s)) } else { None };
+                    if changed {
+                        self.counting = now_item.map(|i| (i, w.left_s));
+                    } else {
+                        self.spent = now_item;
+                        self.counting = None;
+                    }
                 } else if changed {
-                    // picked something else mid-way, or the next started: count that one
-                    self.counting = now_item.map(|i| (i, w.left_s));
+                    // picked something else mid-way, or the next started: count that one (not the
+                    // finished one still showing ended; played again, it counts afresh)
+                    if now_item != self.spent || !w.ended {
+                        self.spent = None;
+                        self.counting = now_item.map(|i| (i, w.left_s));
+                    }
                 } else if let Some((_, last)) = &mut self.counting {
                     *last = w.left_s;
                 }
@@ -514,6 +525,15 @@ mod tests {
         assert_eq!(run.step(&ep(4, 110.0, T0 + 2950)), Some(SleepStep::Warn { at: T0 + 3060 }));
         let ended = Watch { ended: true, ..ep(4, 0.0, T0 + 3060) };
         assert_eq!(run.step(&ended), Some(SleepStep::Fire(SleepAction::Stop)));
+        // an ended episode that stays on screen (no auto-next) counts once, however long it shows
+        let mut run = SleepRun::arm(timer(SleepWhen::AfterItems(2)), &ep(1, 1200.0, T0), None).unwrap();
+        for t in 0..3 {
+            assert_eq!(run.step(&Watch { ended: true, ..ep(1, 0.0, T0 + 1200 + t) }), None, "tick {t}");
+        }
+        assert_eq!(run.step(&ep(2, 1300.0, T0 + 1300)), None);
+        assert_eq!(run.status(&ep(2, 1300.0, T0 + 1300)).items_left, Some(1));
+        assert_eq!(run.step(&ep(2, 110.0, T0 + 2490)), Some(SleepStep::Warn { at: T0 + 2600 }));
+        assert_eq!(run.step(&Watch { ended: true, ..ep(2, 0.0, T0 + 2600) }), Some(SleepStep::Fire(SleepAction::Stop)));
         // live is never an item
         assert_eq!(SleepRun::arm(timer(SleepWhen::AfterItems(1)), &live(T0), None), Err(SleepError::NothingPlaying));
         assert_eq!(SleepRun::arm(timer(SleepWhen::AfterItems(0)), &ep(1, 10.0, T0), None), Err(SleepError::NoItems));
