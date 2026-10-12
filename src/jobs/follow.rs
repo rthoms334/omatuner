@@ -213,9 +213,10 @@ pub fn summary_text(rows: &[store_follow::Unannounced], tz: &jiff::tz::TimeZone)
     (title, lines)
 }
 
-/// At most one summary every 12 h, only with additions: a desktop notification, or an in-app
-/// toast (`FollowEvent::Summary`) when no notification server answers. Rows are marked
-/// announced either way (with the summary off too, so they never pile up).
+/// At most one summary every 12 h, only with additions: a desktop notification with Open
+/// (`FollowEvent::Open`: Settings ▸ Following), or an in-app toast with Open
+/// (`FollowEvent::Summary`) when no notification server answers. Rows are marked announced
+/// either way (with the summary off too, so they never pile up).
 async fn announce(ctx: &JobContext, opts: &Opts) -> Result<()> {
     let (now, summary_on) = (opts.now, opts.cfg.summary);
     let rows = super::read(ctx, move |c| {
@@ -233,9 +234,14 @@ async fn announce(ctx: &JobContext, opts: &Opts) -> Result<()> {
     if summary_on {
         let (title, lines) = summary_text(&rows, &opts.tz);
         let body = lines.join("\n");
-        let (t, b) = (title.clone(), body.clone());
-        let shown = super::blocking(move || Ok(crate::platform::notify::notify(&t, &b, false))).await.unwrap_or(false);
-        if !shown {
+        // Open: Settings ▸ Following. Raise right away as well (as a reminder's Watch does): the
+        // window may sit on another workspace where no frame runs to act on the event.
+        let bus = ctx.bus.clone();
+        let on_open: Box<dyn FnOnce() + Send> = Box::new(move || {
+            bus.send(crate::msg::AppEvent::Follow(crate::follow::FollowEvent::Open));
+            crate::platform::hypr::focus_self();
+        });
+        if !crate::platform::notify::notify_with_open(&title, &body, on_open).await {
             ctx.bus.send(crate::msg::AppEvent::Follow(crate::follow::FollowEvent::Summary { title, lines }));
         }
     }

@@ -492,6 +492,8 @@ impl TunerApp {
             AppEvent::Agent(crate::agent::AgentCommand::MultiView(r)) => self.on_agent_multiview(r),
             // the reminder engine (B6): countdowns, switches, the sleep timer, news flashes
             AppEvent::Reminder(e) => self.on_reminder_event(e, egui_ctx),
+            // Open on Following's summary notification
+            AppEvent::Follow(crate::follow::FollowEvent::Open) if crate::follow::ENABLED => self.open_following(egui_ctx),
             // Following's summary when no notification server answered (F-C)
             AppEvent::Follow(f) => {
                 if let Some(t) = crate::follow::ui::on_event(f) {
@@ -1531,6 +1533,15 @@ impl TunerApp {
         self.cancelled_switches.extend(gone);
     }
 
+    /// Open on Following's summary (its toast, or its desktop notification, which raised the
+    /// window already): Settings ▸ Following in the full window.
+    fn open_following(&mut self, egui_ctx: &egui::Context) {
+        if self.popout.is_out() || self.video_only {
+            self.toggle_popout(egui_ctx);
+        }
+        self.nav.push(NavRequest::Switch(Route::Settings(crate::ui::SettingsPage::Following)));
+    }
+
     /// The countdown's Cancel (or Delete in the pop-out): the row goes, a `SwitchNow` on its
     /// way is ignored.
     fn cancel_switch(&mut self, id: crate::model::ReminderId) {
@@ -1613,6 +1624,7 @@ impl TunerApp {
                 crate::follow::ui::undo_follow(self.services(), id);
                 self.toast(Toast::info("Rule removed"));
             }
+            Action::OpenFollowing if crate::follow::ENABLED => self.open_following(egui_ctx),
             Action::UndoGuideFix(log @ Some(_)) if crate::guide_fix::ENABLED => {
                 let opts = crate::store::guide_fix::GuideOpts::from_config(&self.services().config());
                 let _ = crate::guide_fix::ui::submit_undo(self.services(), log, opts, crate::model::now());
@@ -4065,6 +4077,29 @@ mod tests {
             failure: None,
         }));
         assert!(rig.app.favs.is_fav(&channel_ref(0)), "the older library's favourites don't win");
+    }
+
+    /// Following's summary: the in-app toast carries Open, and Open — on the toast, or on the
+    /// desktop notification (`FollowEvent::Open`) — shows Settings ▸ Following.
+    #[test]
+    fn the_following_summary_opens_settings_following() {
+        let mut rig = Rig::new();
+        let ctx = rig.ctx.clone();
+        rig.event(AppEvent::Follow(crate::follow::FollowEvent::Summary {
+            title: "Following: 2 new".into(),
+            lines: vec!["Arsenal · Sat 12:30".into()],
+        }));
+        let toast = rig.log().toasts.last().cloned().expect("the summary toast");
+        assert_eq!(toast.text, "Following: 2 new — Arsenal · Sat 12:30");
+        assert_eq!(toast.action, Some(("Open".into(), Action::OpenFollowing)));
+        rig.app.global_action(Action::OpenFollowing, &[], &ctx);
+        rig.frame_with(vec![]);
+        assert_eq!(rig.route(), &Route::Settings(crate::ui::SettingsPage::Following));
+        rig.app.routes = vec![Route::Home];
+        rig.frame_with(vec![]);
+        rig.event(AppEvent::Follow(crate::follow::FollowEvent::Open));
+        rig.frame_with(vec![]);
+        assert_eq!(rig.route(), &Route::Settings(crate::ui::SettingsPage::Following));
     }
 
     #[test]

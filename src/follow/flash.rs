@@ -23,11 +23,12 @@ pub enum FlashLength {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum FlashVolume {
+    /// The flash plays with its sound. Nothing is left to lower under it (single view: it
+    /// replaces what played; multi-view: its picture takes the sound), so there is no "duck"
+    /// setting; one stored by an early build reads as Normal.
     #[default]
+    #[serde(alias = "duck")]
     Normal,
-    /// Lower what plays under it. Not offered yet: the flash replaces what plays (single
-    /// view), or plays in the picture without the sound (multi-view), so it would act as Normal.
-    Duck,
     /// "Silent flash" (subtitles when available).
     Mute,
 }
@@ -180,6 +181,16 @@ mod tests {
         assert_eq!(decide(&spec, &cfg, &watching, &bbc, std::slice::from_ref(&bbc2), 1000), FlashDecision::Skip(FlashSkip::AlreadyWatching));
         let whole = FlashSpec { length: FlashLength::Whole, volume: FlashVolume::Mute };
         assert_eq!(decide(&whole, &cfg, &at(13 * 60, None), &bbc, &[], 1000), FlashDecision::Pop { ends_at: None, volume: FlashVolume::Mute });
+    }
+
+    /// Two sounds only (Normal, Mute): a "duck" an early build stored reads as Normal, so a rule
+    /// that has one still loads.
+    #[test]
+    fn a_stored_duck_reads_as_normal() {
+        let spec: FlashSpec = serde_json::from_str(r#"{"length":{"t":"headlines","min":5},"volume":"duck"}"#).unwrap();
+        assert_eq!(spec, FlashSpec { length: FlashLength::Headlines(5), volume: FlashVolume::Normal });
+        assert_eq!(serde_json::to_string(&FlashVolume::Normal).unwrap(), r#""normal""#);
+        assert_eq!(serde_json::to_string(&FlashVolume::Mute).unwrap(), r#""mute""#);
     }
 
     #[test]

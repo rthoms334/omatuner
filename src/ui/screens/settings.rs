@@ -1,6 +1,7 @@
 //! Settings (DESIGN §13.9): page list (Playlists, EPG, Player, Interface, Favourites,
 //! Reminders, Parental, Backup, Hidden, Orphans, About) | page content. Panel idiom; reorder
-//! rows (playlists, EPG priority, favourites lists) with Alt+↑/↓ or K/J or the drag grip.
+//! rows (playlists, EPG priority, favourites lists, Following rules) with Alt+↑/↓ or K/J or the
+//! drag grip.
 //! Playlists page: sources with status, account info (expiry, connections, formats),
 //! refresh/edit/delete/reorder, "+ Add" (→ `Route::Onboarding(AddSource)`); EPG page: ordered
 //! EPG sources with offsets + "Fix guide data…"; Reminders: pending list (Delete cancels);
@@ -2318,6 +2319,12 @@ impl SettingsScreen {
                 let Some(g) = all_groups(ctx).find(|g| g.id == id) else { return };
                 (g.display_name().to_owned(), vec![super::live::explicit_menu_item(g, MENU_TOGGLE)])
             }
+            // Following's rules: Edit…, Pause / Resume, Test against the guide, Move, Delete…;
+            // its Upcoming rows open their programme's popover (Watch, Cancel = skip this one)
+            Item::Feature(Feature::Following, id) => match following::menu(self, ctx, id) {
+                Some(menu) => menu,
+                None => return,
+            },
             // a feature file opens its own menu from `item`
             Item::AttachTarget(_) | Item::Categories(_) | Item::Feature(..) => return,
         };
@@ -2377,6 +2384,7 @@ impl SettingsScreen {
                     token,
                 }));
             }
+            (Item::Feature(Feature::Following, id), code) if code != MENU_UP && code != MENU_DOWN => following::menu_choice(self, ctx, id, code),
             (item, MENU_UP) | (item, MENU_DOWN) => self.reorder(ctx, item, if code == MENU_UP { -1 } else { 1 }),
             (Item::Reminder(id), MENU_DELETE) => self.cancel_reminder(ctx, id),
             (Item::Explicit(id), MENU_TOGGLE) => self.toggle_explicit_item(ctx, id),
@@ -2439,6 +2447,8 @@ impl SettingsScreen {
                     });
                 }
             }
+            // Following's rules (higher wins a clash)
+            Item::Feature(Feature::Following, id) => following::reorder(self, ctx, id, delta),
             Item::List(id) => {
                 let mut order: Vec<FavListId> = ctx.favs.lists.iter().map(|l| l.id).collect();
                 if moved(&mut order, id, delta) {
@@ -3285,7 +3295,8 @@ impl SettingsScreen {
                         } else {
                             inner.label(RichText::new(icon).size(theme.font(TypeToken::IconLarge)).color(c));
                         }
-                        let more = matches!(item, Item::Source(_) | Item::Epg(_) | Item::List(_) | Item::Orphan(_) | Item::Reminder(_));
+                        let more = matches!(item, Item::Source(_) | Item::Epg(_) | Item::List(_) | Item::Orphan(_) | Item::Reminder(_))
+                            || matches!(item, Item::Feature(Feature::Following, id) if *id > 0);
                         // the button is laid out first so long names and errors end before it
                         inner.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if more {

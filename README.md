@@ -939,7 +939,7 @@ The full reference is generated from `src/keymap.rs`:
 | `←` / `h` | Back to the page list |
 | `→` / `l` / `Shift+→` / `L` | Increase / next option |
 | `Shift+←` / `H` | Decrease / previous option |
-| `Alt+↑` / `K` / `Alt+↓` / `J` | Move up / down (reorder: guide priority, playlists, lists) |
+| `Alt+↑` / `K` / `Alt+↓` / `J` | Move up / down (reorder: guide priority, playlists, lists, Following rules) |
 | `Tab` / `Shift+Tab` | Next / previous section |
 | `Enter` / `Space` | Toggle / open |
 | `x` / `Delete` | Delete / more actions |
