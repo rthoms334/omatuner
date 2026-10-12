@@ -15,8 +15,15 @@
 //! reasons; HTTP statuses (rate-limited); provider messages; and every 10 minutes a health line
 //! (cache, drops, FFmpeg's own reconnects, memory). Stream addresses never appear: items are
 //! named by their key, mpv's lines are redacted by the event pump.
+//!
+//! Multi-view (DESIGN §35, MV-1): every picture runs its own controller. Picture B's lines read
+//! `player B:` / `health B:`, its events reach the app as `AppEvent::Tile(TileEvent::Player(B,
+//! …))` (single-view code only ever sees picture A's), and its claims and leases go to the
+//! [`SharedBudget`] both controllers share. Sound: `mute = user mute || !audible`; the snapshot
+//! keeps the user's own mute and volume (one listening volume, moved with the sound). Zapping a
+//! picture onto a channel whose playlist the other picture holds plays the channel's copy on a
+//! free playlist (`zap_anchor` keeps the zap-list position), or skips it.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -25,20 +32,24 @@ use crossbeam_channel::{Receiver, select};
 use libmpv2::Mpv;
 use tokio::sync::watch;
 
-use super::budget::{ConnectionBudget, Lease};
+use super::budget::{Lease, Released, SharedBudget};
 use super::events::{EndReason, MpvEvent, PropId, PropValue};
 use super::mpv_log::{self, MpvLog};
 use super::state::{Effect, Input, MachineConfig, PlayerMachine};
 use super::tracks::{AspectMode, parse_track_list, query_stream_info};
 use super::{CopyPlay, PlayRequest, PlayerCommand, PlayerDeps, PlayerError, PlayerErrorKind, PlayerEvent, PlayerSnapshot, PlayerState, RenderClock};
 use crate::config::Config;
-use crate::model::{ChannelId, HistoryEntry, ItemRef, MediaRef, PlayOrigin, Playable, PlayableKind, SourceId, WatchProgress};
+use crate::model::{ChannelId, HistoryEntry, ItemRef, MediaRef, PlayOrigin, Playable, PlayableKind, SourceId, TileId, WatchProgress};
 use crate::msg::AppEvent;
 
 const PROGRESS_EVERY: Duration = Duration::from_secs(10);
 const PUBLISH_EVERY: Duration = Duration::from_millis(100);
 /// Max wait for the old stream's END_FILE before loading anyway (stop-before-start).
 const PENDING_LOAD_MAX: Duration = Duration::from_millis(1500);
+/// Max wait for ANOTHER picture's stream that is closing (its claim already moved on, its
+/// END_FILE not seen yet) before the budget's refusal stands: multi-view's "move picture A to
+/// its TV 2 copy so B can use TV" (`Tiles::rearrange`).
+const OTHER_CLOSE_MAX: Duration = Duration::from_secs(3);
 /// No rendered frame for this long while Playing → `vid=no` (hidden window safety net). Long
 /// enough that a quick workspace switch never suspends: decoding restarts mid-GOP on resume,
 /// and HEVC shows seconds of broken picture until the next keyframe (13 of 14 suspends in the
@@ -51,6 +62,15 @@ const HEALTH_EVERY: Duration = Duration::from_secs(10 * 60);
 /// (logged before the file ended) is delivered just AFTER the END_FILE.
 const END_FILE_LOG_GRACE: Duration = Duration::from_millis(200);
 
+/// Which picture a controller drives and the budget it shares (multi-view, DESIGN §35).
+#[derive(Debug, Clone)]
+pub struct TileSetup {
+    pub tile: TileId,
+    pub budget: SharedBudget,
+    /// Starts audible (picture A) or muted until the app moves the sound (picture B).
+    pub audible: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     mpv: Arc<Mpv>,
@@ -61,19 +81,28 @@ pub fn spawn(
     snap_tx: watch::Sender<Arc<PlayerSnapshot>>,
     render_clock: RenderClock,
     epoch: Instant,
+    setup: TileSetup,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     let snap = (**snap_tx.borrow()).clone();
+    let TileSetup { tile, budget, audible } = setup;
     let mut c = Controller {
         machine: PlayerMachine::new(MachineConfig::from_config(cfg)),
         mpv,
         deps,
         snap,
         snap_tx,
-        budget: ConnectionBudget::default(),
+        tile,
+        log: if tile == TileId::A { "player" } else { "player B" },
+        budget,
+        claimed: None,
+        audible,
+        light_decode: false,
+        race_armed: false,
         lease: None,
         lease_entry: None,
         lease_redirected: false,
         pending: None,
+        waiting: None,
         deferred_end: None,
         on_air: None,
         last_progress: Instant::now(),
@@ -91,13 +120,13 @@ pub fn spawn(
         elsewhere: None,
         lease_media: None,
         lease_played: false,
-        released: HashMap::new(),
         http_log: MpvLog::default(),
         logged: LoggedState { label: state_label(&PlayerState::Idle), who: "nothing".into(), since: Instant::now(), outage: None, provider: None },
         last_health: Instant::now(),
         ffmpeg_reconnects: 0,
     };
-    std::thread::Builder::new().name("player".into()).spawn(move || c.run(cmd_rx, evt_rx))
+    let name = if tile == TileId::A { "player".to_owned() } else { format!("player-{}", tile.letter().to_ascii_lowercase()) };
+    std::thread::Builder::new().name(name).spawn(move || c.run(cmd_rx, evt_rx))
 }
 
 /// A load waiting for the previous stream of the same source to close.
@@ -112,7 +141,21 @@ struct Controller {
     deps: PlayerDeps,
     snap: PlayerSnapshot,
     snap_tx: watch::Sender<Arc<PlayerSnapshot>>,
-    budget: ConnectionBudget,
+    /// The picture this controller drives.
+    tile: TileId,
+    /// Log line prefix: `player` (A), `player B`.
+    log: &'static str,
+    /// Shared by every picture (claims, leases, race window, observed limits).
+    budget: SharedBudget,
+    /// The claim last written to the budget (kept in step with the machine, `sync_claim`).
+    claimed: Option<SourceId>,
+    /// This picture has the sound (`mute = user mute || !audible`).
+    audible: bool,
+    /// Lighter decoding from the next load (`PlayerCommand::SetLightDecode`).
+    light_decode: bool,
+    /// The current load started inside another stream's race window: its 403 is the race,
+    /// not a refusal (`SharedBudget::observe_refusal`).
+    race_armed: bool,
     lease: Option<Lease>,
     /// Playlist entry the current lease belongs to (released on its END_FILE).
     lease_entry: Option<i64>,
@@ -120,6 +163,8 @@ struct Controller {
     /// the next entry that starts.
     lease_redirected: bool,
     pending: Option<PendingLoad>,
+    /// A load waiting for another picture's stream on its playlist to close.
+    waiting: Option<PendingLoad>,
     /// END_FILE(error) (reason, error, entry) held for [`END_FILE_LOG_GRACE`], until the instant.
     deferred_end: Option<(EndReason, i32, i64, Instant)>,
     /// Last live channel that actually started playing (Backspace recall target).
@@ -147,9 +192,6 @@ struct Controller {
     lease_media: Option<MediaRef>,
     /// The current lease's stream reached Playing (a stream the provider counted for sure).
     lease_played: bool,
-    /// When each source's last leased stream closed, and what it was (connection-limit race
-    /// window, `state` module docs).
-    released: HashMap<SourceId, Released>,
     /// Rate limiter of the HTTP status lines.
     http_log: MpvLog,
     /// The state last written to the log.
@@ -187,10 +229,17 @@ impl Controller {
                         // the final progress save reaches the store before its writer closes
                         self.feed(Input::Stop, Instant::now());
                         self.publish(true);
+                        self.budget.forget(self.tile);
                         return;
                     }
                     Ok(cmd) => {
+                        let retargets = retargets(&cmd);
                         state_changed |= self.command(cmd);
+                        if retargets {
+                            // whatever was claimed for this picture meanwhile (`Tiles::rearrange`),
+                            // the play's outcome decides
+                            self.sync_claim(true);
+                        }
                         self.force_publish = true;
                     }
                 },
@@ -209,6 +258,7 @@ impl Controller {
                         self.log_health();
                     }
                     self.pending_tick(now);
+                    self.waiting_tick();
                     self.video_watchdog(now);
                     if now.duration_since(self.last_progress) >= PROGRESS_EVERY
                         && matches!(self.machine.state(), PlayerState::Playing)
@@ -232,8 +282,35 @@ impl Controller {
         if self.lease.is_some() && matches!(self.machine.state(), PlayerState::Playing) {
             self.lease_played = true;
         }
+        self.sync_claim(false);
         self.log_transition(now);
         *self.machine.state() != before
+    }
+
+    /// Keep this picture's claim in the shared budget in step with the machine: the target's
+    /// playlist from the play (Zapping) through Reconnecting; nothing once stopped, ended or
+    /// failed for good. Written when it changes (a claim moved ahead by `Tiles::rearrange`
+    /// isn't undone by the old stream's events), or always (`force`) after a play command.
+    fn sync_claim(&mut self, force: bool) {
+        let want = match self.machine.state() {
+            PlayerState::Idle | PlayerState::Ended | PlayerState::Error(_) => None,
+            _ => self.machine.target().and_then(|t| t.source_id),
+        };
+        if force || want != self.claimed {
+            self.budget.claim(self.tile, want);
+            self.claimed = want;
+            self.snap.claim = want;
+        }
+    }
+
+    /// Send a player event: picture A's as `AppEvent::Player` (what single view always got),
+    /// another picture's tagged with its tile.
+    fn emit(&self, ev: PlayerEvent) {
+        if self.tile == TileId::A {
+            self.deps.bus.send(AppEvent::Player(ev));
+        } else {
+            self.deps.bus.send(AppEvent::Tile(super::tiles::TileEvent::Player(self.tile, ev)));
+        }
     }
 
     /// `source 2 xt:live:717661`: the current target, without its address or title.
@@ -258,11 +335,11 @@ impl Controller {
         if let Some(p) = self.machine.target() {
             let who = playable_label(p);
             if who != self.logged.who {
-                tracing::debug!("player: {who} is {:?}", p.title);
+                tracing::debug!("{}: {who} is {:?}", self.log, p.title);
                 self.logged.who = who;
             }
         }
-        let line = format!("player: {} {from} → {} after {took}", self.logged.who, self.logged.label);
+        let line = format!("{}: {} {from} → {} after {took}", self.log, self.logged.who, self.logged.label);
         match &state {
             PlayerState::Loading { .. } if from.starts_with("Reconnecting") => tracing::debug!("{line}"),
             PlayerState::Reconnecting { at, .. } => {
@@ -276,7 +353,7 @@ impl Controller {
                 tracing::info!("{line}");
                 if let Some((started, attempts)) = self.logged.outage.take() {
                     let s = if attempts == 1 { "" } else { "s" };
-                    tracing::info!("player: recovered after {attempts} attempt{s} in {}", fmt_duration(now.saturating_duration_since(started)));
+                    tracing::info!("{}: recovered after {attempts} attempt{s} in {}", self.log, fmt_duration(now.saturating_duration_since(started)));
                 }
             }
             PlayerState::Error(_) | PlayerState::Idle | PlayerState::Ended | PlayerState::Zapping { .. } => {
@@ -284,7 +361,7 @@ impl Controller {
                 if let Some((started, attempts)) = self.logged.outage.take()
                     && matches!(state, PlayerState::Error(_))
                 {
-                    tracing::info!("player: gave up after {attempts} attempts in {}", fmt_duration(now.saturating_duration_since(started)));
+                    tracing::info!("{}: gave up after {attempts} attempts in {}", self.log, fmt_duration(now.saturating_duration_since(started)));
                 }
             }
             _ => tracing::info!("{line}"),
@@ -296,19 +373,20 @@ impl Controller {
         let mem = crate::platform::memstats::MemStats::sample().line();
         let state = self.machine.state();
         let reconnects = std::mem::take(&mut self.ffmpeg_reconnects);
+        let health = if self.tile == TileId::A { "health".to_owned() } else { format!("health {}", self.tile) };
         if matches!(state, PlayerState::Playing | PlayerState::Buffering { .. } | PlayerState::Paused) {
             let int = |name: &str| self.mpv.get_property::<i64>(name).ok();
             let speed = int("cache-speed").map_or("-".into(), |b| format!("{} KiB/s", b / 1024));
             let (vo, dec) = (int("frame-drop-count").unwrap_or(0), int("decoder-frame-drop-count").unwrap_or(0));
             tracing::info!(
-                "health: {} {}; cache {} at {speed}; {vo} frames dropped ({dec} by the decoder); {reconnects} FFmpeg reconnects; hwdec {}; {mem}",
+                "{health}: {} {}; cache {} at {speed}; {vo} frames dropped ({dec} by the decoder); {reconnects} FFmpeg reconnects; hwdec {}; {mem}",
                 self.target_label(),
                 state_label(state),
                 self.snap.cache_secs.map_or("-".into(), |c| format!("{c:.1} s")),
                 self.snap.hwdec.as_deref().unwrap_or("no"),
             );
         } else {
-            tracing::info!("health: {}; {mem}", state_label(state));
+            tracing::info!("{health}: {}; {mem}", state_label(state));
         }
     }
 
@@ -320,6 +398,7 @@ impl Controller {
                 Effect::Load(p) => self.load(p),
                 Effect::StopMpv => {
                     self.pending = None;
+                    self.waiting = None;
                     let _ = self.mpv.command("stop", &[]);
                     // the lease is released when the stopped entry's END_FILE arrives
                     if self.lease_entry.is_none() {
@@ -339,7 +418,7 @@ impl Controller {
                         }
                         self.snap.playable = Some(p.clone());
                     }
-                    self.deps.bus.send(AppEvent::Player(ev));
+                    self.emit(ev);
                 }
                 Effect::SaveProgress { .. } => self.save_progress(pos.or(self.machine.last_position())),
                 Effect::PushHistory(p) => {
@@ -358,10 +437,9 @@ impl Controller {
 
     fn release_lease(&mut self) {
         if let Some(l) = self.lease.take() {
-            if let Some(media) = self.lease_media.take() {
-                self.released.insert(l.source, Released { at: Instant::now(), media, played: std::mem::take(&mut self.lease_played) });
-            }
-            self.budget.release(l);
+            let played = std::mem::take(&mut self.lease_played);
+            let closed = self.lease_media.take().map(|m| (m, played));
+            self.budget.release(self.tile, l, closed);
         }
         self.lease_entry = None;
         self.lease_redirected = false;
@@ -370,6 +448,7 @@ impl Controller {
     /// Stop-before-start (see [`must_stop_first`]): `stop`, wait for the old entry's END_FILE
     /// (or 1.5 s), then load.
     fn load(&mut self, p: Arc<Playable>) {
+        self.waiting = None;
         if let Some(old) = must_stop_first(self.lease.as_ref(), self.lease_entry, p.source_id, &self.budget) {
             tracing::debug!("stop-before-start: stopping entry {old} and waiting for its END_FILE");
             let _ = self.mpv.command("stop", &[]);
@@ -390,14 +469,32 @@ impl Controller {
         }
     }
 
+    /// A load waiting for another picture's closing stream ([`OTHER_CLOSE_MAX`]): try again.
+    fn waiting_tick(&mut self) {
+        if let Some(w) = self.waiting.take() {
+            self.load_now_by(w.playable, w.deadline);
+        }
+    }
+
     fn load_now(&mut self, p: Arc<Playable>) {
+        self.load_now_by(p, Instant::now() + OTHER_CLOSE_MAX);
+    }
+
+    /// Load `p` now. Refused by the budget only because another picture's stream is still
+    /// closing (its claim moved on): wait for it until `deadline`, then the refusal stands.
+    fn load_now_by(&mut self, p: Arc<Playable>, deadline: Instant) {
         self.release_lease();
         if let Some(src) = p.source_id {
-            match self.budget.try_acquire(src) {
+            match self.budget.acquire(self.tile, src) {
                 Ok(l) => {
                     self.lease = Some(l);
                     self.lease_media = Some(p.media.clone());
                     self.lease_played = false;
+                }
+                Err(e) if e.closing && Instant::now() < deadline => {
+                    tracing::debug!("{}: source {} is still closing in picture {:?}; waiting", self.log, src.0, e.holder);
+                    self.waiting = Some(PendingLoad { playable: p, deadline });
+                    return;
                 }
                 Err(e) => {
                     self.feed(Input::Fail(PlayerError { kind: PlayerErrorKind::Budget, message: e.to_string() }), Instant::now());
@@ -421,7 +518,11 @@ impl Controller {
         self.snap.stream_info = None;
         self.snap.tracks = Default::default();
         self.snap.last_error = None;
-        let entry = match super::mpv::loadfile(&self.mpv, &super::mpv::loadfile_args(&p)) {
+        let mut args = super::mpv::loadfile_args(&p);
+        if self.light_decode {
+            super::mpv::add_light_decode(&mut args);
+        }
+        let entry = match super::mpv::loadfile(&self.mpv, &args) {
             Ok(entry) => entry,
             Err(e) => {
                 tracing::warn!("loadfile failed: {e}");
@@ -435,6 +536,7 @@ impl Controller {
         self.lease_entry = entry;
         self.feed(Input::Loaded { entry }, Instant::now());
         let closed = p.source_id.and_then(|s| self.other_stream_closed(s, &p.media));
+        self.race_armed = closed.is_some();
         if let Some(at) = closed {
             tracing::debug!("another stream of this source closed {:?} ago: a 403 is the connection-limit race", at.elapsed());
         }
@@ -445,7 +547,7 @@ impl Controller {
     /// connection or unknown (the provider may still count it): see [`race_close`].
     fn other_stream_closed(&self, source: SourceId, media: &MediaRef) -> Option<Instant> {
         let one = self.budget.limit(source).is_none_or(|m| m <= 1);
-        race_close(self.released.get(&source).filter(|_| one), media, Instant::now(), self.machine.policy().race_window)
+        race_close(self.budget.released(source).as_ref().filter(|_| one), media, Instant::now(), self.machine.policy().race_window)
     }
 
     /// The provider's message behind a playlist redirect, if the "playlist" was prose: mpv's
@@ -501,7 +603,7 @@ impl Controller {
                     self.elsewhere = None;
                     self.machine.arm_fallback(false);
                     let changed = self.feed(Input::Play { target: Arc::new(p), immediate: req.immediate }, Instant::now());
-                    self.deps.bus.send(AppEvent::Player(ev));
+                    self.emit(ev);
                     changed
                 }
                 Err(_) => {
@@ -528,7 +630,8 @@ impl Controller {
                 let failed = failed.as_deref();
                 p.start_at = failed.and_then(|f| f.start_at);
                 tracing::info!(
-                    "player: {} failed before its first frame ({:?}); playing the next copy",
+                    "{}: {} failed before its first frame ({:?}); playing the next copy",
+                    self.log,
                     failed.map_or_else(|| "nothing".into(), playable_label),
                     err.kind
                 );
@@ -540,7 +643,7 @@ impl Controller {
                 };
                 self.machine.arm_fallback(false);
                 self.feed(Input::Play { target: Arc::new(p), immediate: true }, Instant::now());
-                self.deps.bus.send(AppEvent::Player(ev));
+                self.emit(ev);
             }
             Some((Err(e), m)) => {
                 tracing::warn!("the next copy {m:?} can't be resolved either: {}", e.message);
@@ -559,8 +662,14 @@ impl Controller {
     fn command(&mut self, cmd: PlayerCommand) -> bool {
         let m = self.mpv.clone();
         match cmd {
-            PlayerCommand::Play(req) => return self.resolve_and_play(req),
-            PlayerCommand::PlayCopy(c) => return self.play_copy(c),
+            PlayerCommand::Play(req) => {
+                self.snap.zap_anchor = None;
+                return self.resolve_and_play(req);
+            }
+            PlayerCommand::PlayCopy(c) => {
+                self.snap.zap_anchor = None;
+                return self.play_copy(c);
+            }
             PlayerCommand::Stop => return self.feed(Input::Stop, Instant::now()),
             PlayerCommand::TogglePause => {
                 let _ = m.command("cycle", &["pause"]);
@@ -579,16 +688,21 @@ impl Controller {
                 }
             }
             PlayerCommand::Zap { forward, unlocked } => {
-                if let Some(next) = self.zap_neighbour(forward, unlocked) {
-                    let req = self.zap_request(MediaRef::Channel(next), false);
-                    return self.resolve_and_play(req);
+                if let Some((next, copy)) = self.zap_neighbour(forward, unlocked) {
+                    return self.zap_onto(next, copy);
                 }
             }
             PlayerCommand::ZapTo(id) => {
-                let req = self.zap_request(MediaRef::Channel(id), false);
-                return self.resolve_and_play(req);
+                // numeric entry / history: the copy when the other picture holds the playlist
+                // (none: the budget refuses it and the error card says why)
+                let copy = match self.placement(id, true) {
+                    Placement::Copy(c) => Some(c),
+                    _ => None,
+                };
+                return self.zap_onto(id, copy);
             }
             PlayerCommand::LastChannel { unlocked } => {
+                self.snap.zap_anchor = None;
                 if let Some(prev) = self.snap.previous_live.clone() {
                     if let Some(ch) = channel_of(&prev.media)
                         && self.locked_out(ch, unlocked)
@@ -601,6 +715,7 @@ impl Controller {
                 }
             }
             PlayerCommand::JumpToLive => {
+                self.snap.zap_anchor = None;
                 if let Some(MediaRef::Catchup { channel, .. }) = self.snap.playable.as_ref().map(|p| p.media.clone()) {
                     let req = self.zap_request(MediaRef::Channel(channel), true);
                     return self.resolve_and_play(req);
@@ -614,8 +729,19 @@ impl Controller {
                 let _ = m.set_property("volume", v);
             }
             PlayerCommand::ToggleMute => {
-                let _ = m.command("cycle", &["mute"]);
+                self.snap.muted = !self.snap.muted;
+                self.apply_mute();
             }
+            PlayerCommand::SetMute(on) => {
+                self.snap.muted = on;
+                self.apply_mute();
+            }
+            PlayerCommand::SetAudible(on) => {
+                self.audible = on;
+                self.snap.audible = on;
+                self.apply_mute();
+            }
+            PlayerCommand::SetLightDecode(on) => self.light_decode = on,
             PlayerCommand::SetAudioTrack(id) => {
                 let _ = m.set_property("aid", id.map(|i| i.to_string()).unwrap_or_else(|| "no".into()).as_str());
             }
@@ -661,6 +787,46 @@ impl Controller {
         false
     }
 
+    /// mpv's mute: the user's mute, or this picture doesn't have the sound.
+    fn apply_mute(&self) {
+        let _ = self.mpv.set_property("mute", self.snap.muted || !self.audible);
+    }
+
+    /// Tune `ch` (or its `copy`, keeping `ch` as the zap-list position) as a zap.
+    fn zap_onto(&mut self, ch: ChannelId, copy: Option<ChannelId>) -> bool {
+        let req = self.zap_request(MediaRef::Channel(copy.unwrap_or(ch)), false);
+        let changed = self.resolve_and_play(req);
+        self.snap.zap_anchor = copy.map(|_| ch);
+        if let Some(c) = copy {
+            tracing::info!("{}: channel {} is on a playlist another picture holds; playing its copy {}", self.log, ch.0, c.0);
+        }
+        changed
+    }
+
+    /// Where `ch` can play for this picture (multi-view, DESIGN §35 §4.4): on its own playlist
+    /// when the budget admits it, else on the first copy (same explicit flag as `ch`, not
+    /// locked out, not failing) on a playlist that admits it. Single view never asks the
+    /// database: nobody else holds anything.
+    fn placement(&mut self, ch: ChannelId, unlocked: bool) -> Placement {
+        if !self.budget.others_active(self.tile) {
+            return Placement::Here;
+        }
+        let Some(source) = self.deps.resolver.channel_source(ch) else { return Placement::Here };
+        if self.budget.admits(self.tile, source) {
+            return Placement::Here;
+        }
+        let explicit = self.deps.resolver.is_explicit(ch);
+        for c in self.deps.resolver.channel_copies(ch) {
+            if c.explicit != explicit || self.deps.resolver.skip_on_zap(c.id) || self.locked_out(c.id, unlocked) {
+                continue;
+            }
+            if self.budget.admits(self.tile, c.source) {
+                return Placement::Copy(c.id);
+            }
+        }
+        Placement::Blocked { source, holder: self.budget.holder(self.tile, source) }
+    }
+
     /// Settings changed (DESIGN §13.9): everything applies at runtime — the changed entries of
     /// the setting list shared with init (`mpv::runtime_settings`) plus changed raw
     /// `mpv_options`. Unchanged settings are left alone, so a subtitle track or sub scale the
@@ -668,7 +834,7 @@ impl Controller {
     fn apply_config(&mut self, cfg: &Config) {
         self.machine.set_config(MachineConfig::from_config(cfg));
         self.watched_pct = cfg.player.watched_pct;
-        super::mpv::apply_runtime(&self.mpv, cfg, &self.applied);
+        super::mpv::apply_runtime(&self.mpv, cfg, &self.applied, self.tile);
         *self.applied = cfg.clone();
     }
 
@@ -689,16 +855,45 @@ impl Controller {
         (pin_locks && self.deps.resolver.is_locked(ch)) || (hides_explicit && self.deps.resolver.is_explicit(ch))
     }
 
-    /// Next/previous channel of the ZapList, skipping what the resolver says to skip and, while
-    /// the parental session is locked, locked channels.
-    fn zap_neighbour(&mut self, forward: bool, unlocked: bool) -> Option<ChannelId> {
+    /// Next/previous channel of the ZapList, skipping what the resolver says to skip, locked
+    /// channels while the parental session is locked, and (multi-view) channels whose playlist
+    /// another picture holds and that have no copy on a free one. Returns the channel and the
+    /// copy to play in its place. The position counts from `zap_anchor` when a copy plays.
+    /// The first channel skipped for the budget is announced ([`PlayerEvent::ZapSkipped`]).
+    fn zap_neighbour(&mut self, forward: bool, unlocked: bool) -> Option<(ChannelId, Option<ChannelId>)> {
         let ids = self.snap.zap.as_ref()?.channels.clone();
-        let cur = self.snap.playable.as_ref().and_then(|p| channel_of(&p.media)).unwrap_or(ChannelId(i64::MIN));
-        let this = std::cell::RefCell::new(self);
-        crate::store::library::LiveIndex::neighbour(&ids, cur, forward, &|c| {
+        let playing = self.snap.playable.as_ref().and_then(|p| channel_of(&p.media));
+        let cur = self.snap.zap_anchor.or(playing).unwrap_or(ChannelId(i64::MIN));
+        let copy = std::cell::Cell::new(None);
+        let skipped = std::cell::Cell::new(None);
+        let this = std::cell::RefCell::new(&mut *self);
+        let next = crate::store::library::LiveIndex::neighbour(&ids, cur, forward, &|c| {
             let mut this = this.borrow_mut();
-            this.deps.resolver.skip_on_zap(c) || this.locked_out(c, unlocked)
-        })
+            if this.deps.resolver.skip_on_zap(c) || this.locked_out(c, unlocked) {
+                return true;
+            }
+            match this.placement(c, unlocked) {
+                Placement::Here => {
+                    copy.set(None);
+                    false
+                }
+                Placement::Copy(id) => {
+                    copy.set(Some(id));
+                    false
+                }
+                Placement::Blocked { source, holder } => {
+                    if skipped.get().is_none() {
+                        skipped.set(Some((c, source, holder)));
+                    }
+                    true
+                }
+            }
+        });
+        if let Some((channel, source, holder)) = skipped.get() {
+            tracing::info!("{}: channel {} skipped: source {} is in use by another picture", self.log, channel.0, source.0);
+            self.emit(PlayerEvent::ZapSkipped { channel, source, holder });
+        }
+        next.map(|n| (n, copy.get()))
     }
 
     /// Hidden-window safety net (module docs of `player`).
@@ -714,7 +909,7 @@ impl Controller {
             // advancing stops repainting too
             let advancing = self.machine.position_changed_at().is_some_and(|t| now.saturating_duration_since(t) < Duration::from_secs(3));
             let why = if advancing { "the window is hidden; playback continues" } else { "playback isn't advancing either" };
-            tracing::info!("no frames rendered for {idle:?} ({why}); suspending video decoding");
+            tracing::info!("{}: no frames rendered for {idle:?} ({why}); suspending video decoding", self.log);
             let _ = self.mpv.set_property("vid", "no");
             self.snap.video_suspended = true;
             self.force_publish = true;
@@ -794,9 +989,9 @@ impl Controller {
                 {
                     let about = (self.target_label(), text.clone());
                     if self.logged.provider.as_ref() == Some(&about) {
-                        tracing::debug!("player: the provider answered with the same message again");
+                        tracing::debug!("{}: the provider answered with the same message again", self.log);
                     } else {
-                        tracing::warn!("player: the provider answered with a message instead of a stream: {text:?}");
+                        tracing::warn!("{}: the provider answered with a message instead of a stream: {text:?}", self.log);
                         self.logged.provider = Some(about);
                     }
                     let changed = self.end_file(reason, error, entry_id, inserted) || changed;
@@ -814,6 +1009,7 @@ impl Controller {
                         tracing::info!("HTTP {code} in {}", state_label(self.machine.state()));
                     }
                     self.feed(Input::HttpStatus(code), now);
+                    self.observe_refusal(code);
                 }
                 if mpv_log::is_internal_reconnect(&text) {
                     self.ffmpeg_reconnects += 1;
@@ -834,6 +1030,20 @@ impl Controller {
                 false
             }
             MpvEvent::Shutdown => false,
+        }
+    }
+
+    /// A 403 while loading, outside the race window, on a playlist with an unknown limit that
+    /// another picture holds: the playlist allows one stream at a time (learned for the
+    /// session, so the planner and zaps stop offering it twice).
+    fn observe_refusal(&mut self, code: u16) {
+        if code != 403 || self.race_armed || !matches!(self.machine.state(), PlayerState::Loading { .. }) {
+            return;
+        }
+        if let Some(src) = self.machine.target().and_then(|t| t.source_id)
+            && self.budget.observe_refusal(self.tile, src)
+        {
+            tracing::info!("{}: source {} refused a second stream; one stream at a time from now on", self.log, src.0);
         }
     }
 
@@ -874,10 +1084,9 @@ impl Controller {
                 self.snap.volume = f(&v).unwrap_or(self.snap.volume);
                 self.force_publish = true;
             }
-            PropId::Mute => {
-                self.snap.muted = b(&v);
-                self.force_publish = true;
-            }
+            // the controller is mute's only writer (`apply_mute`): the snapshot keeps the user's
+            // own mute, mpv's also follows the sound
+            PropId::Mute => self.force_publish = true,
             PropId::TrackList => {
                 if let PropValue::Str(s) = &v {
                     // track-list re-fires on sub-property changes (demux-bitrate…): only
@@ -885,7 +1094,7 @@ impl Controller {
                     let t = parse_track_list(s);
                     if t != self.snap.tracks {
                         self.snap.tracks = t;
-                        self.deps.bus.send(AppEvent::Player(PlayerEvent::TracksChanged));
+                        self.emit(PlayerEvent::TracksChanged);
                     }
                 }
             }
@@ -994,16 +1203,6 @@ impl Controller {
     }
 }
 
-/// A state for the log: without instants and buffering percentages, so only real changes differ.
-/// A leased stream that closed (see [`race_close`]).
-#[derive(Debug, Clone)]
-struct Released {
-    at: Instant,
-    media: MediaRef,
-    /// It reached Playing: the provider counted it.
-    played: bool,
-}
-
 /// The close that opens the connection-limit race window for a load of `media`: a stream that
 /// closed less than `window` ago and was either another stream (a zap) or this one after it
 /// played (stop, then restart the same channel). Our own failed attempts never played, so a
@@ -1064,6 +1263,32 @@ fn provider_text(entry: &str) -> Option<String> {
     (!text.is_empty()).then(|| text.chars().take(200).collect())
 }
 
+/// Commands that (may) change what the picture plays: its claim is re-written after them.
+fn retargets(cmd: &PlayerCommand) -> bool {
+    matches!(
+        cmd,
+        PlayerCommand::Play(_)
+            | PlayerCommand::PlayCopy(_)
+            | PlayerCommand::Zap { .. }
+            | PlayerCommand::ZapTo(_)
+            | PlayerCommand::LastChannel { .. }
+            | PlayerCommand::JumpToLive
+            | PlayerCommand::Stop
+    )
+}
+
+/// Where a channel can play for a picture ([`Controller::placement`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    Here,
+    Copy(ChannelId),
+    /// Its playlist is held by another picture and no copy is free.
+    Blocked {
+        source: SourceId,
+        holder: Option<TileId>,
+    },
+}
+
 /// What an END_FILE does to the connection lease.
 #[derive(Debug, PartialEq)]
 enum LeaseOnEnd {
@@ -1096,7 +1321,7 @@ fn lease_on_end(lease_entry: Option<i64>, entry_id: i64, reason: EndReason, inse
 /// the open leased entry, and that source allows one connection or its limit is unknown —
 /// `loadfile replace` would open the new connection before the old one is closed. Returns the
 /// entry to stop and wait for.
-fn must_stop_first(lease: Option<&Lease>, lease_entry: Option<i64>, next: Option<SourceId>, budget: &ConnectionBudget) -> Option<i64> {
+fn must_stop_first(lease: Option<&Lease>, lease_entry: Option<i64>, next: Option<SourceId>, budget: &SharedBudget) -> Option<i64> {
     let (lease, entry, next) = (lease?, lease_entry?, next?);
     (lease.source == next && budget.limit(next).is_none_or(|m| m <= 1)).then_some(entry)
 }
@@ -1128,7 +1353,7 @@ mod tests {
     fn stop_first_only_for_the_same_source_with_a_limit_of_one_or_unknown() {
         let (a, b) = (SourceId(1), SourceId(2));
         let lease = Lease { source: a };
-        let mut budget = ConnectionBudget::default();
+        let budget = SharedBudget::default();
         // unknown limit: assume the usual Xtream limit of 1
         assert_eq!(must_stop_first(Some(&lease), Some(7), Some(a), &budget), Some(7));
         budget.set_limit(a, Some(1));
@@ -1150,7 +1375,8 @@ mod tests {
         let w = Duration::from_secs(45);
         let a = MediaRef::Url("a".into());
         let b = MediaRef::Url("b".into());
-        let closed = |media: &MediaRef, played: bool, ago: u64| Released { at: now - Duration::from_secs(ago), media: media.clone(), played };
+        let closed =
+            |media: &MediaRef, played: bool, ago: u64| Released { at: now - Duration::from_secs(ago), media: media.clone(), played, tile: TileId::A };
         assert_eq!(race_close(Some(&closed(&a, false, 5)), &b, now, w), Some(now - Duration::from_secs(5)), "zap");
         assert_eq!(race_close(Some(&closed(&a, true, 5)), &a, now, w), Some(now - Duration::from_secs(5)), "stop + restart");
         assert_eq!(race_close(Some(&closed(&a, false, 5)), &a, now, w), None, "our own failed attempt");
