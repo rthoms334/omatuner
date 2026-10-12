@@ -1604,3 +1604,25 @@ quit it and remove the `checked_version` line under `[agents]` in
 - [ ] **Backup restore:** with *Offer to connect* Off, restore a backup made with it On
   (*Restore settings* ticked). **Expect:** it stays Off: the AI agents settings belong to this
   computer.
+
+## 29. Sidebar order, start screen and where Live TV opens
+
+Use a profile with a playlist and at least one favourite channel.
+
+- [ ] **Sidebar order:** Wide, tiled and the Compact glyph strip (a window under 480 pt).
+  **Expect:** Search first at the top, then Home, Live TV, Guide, Movies, Series (Up next while
+  it has items) and Settings last, Search and Settings set apart by a small gap. Clicks open
+  each one; Alt+1…6 and Alt+0 still open Home … Up next and Settings.
+- [ ] **Fresh start opens Home:** delete `/tmp/tuner-check/config/config.toml` (keep the
+  database) and start. **Expect:** Home, also without favourites or history. With no playlists
+  at all: onboarding, as before.
+- [ ] **An old config:** set `start_screen = "auto"` under `[general]` and start. **Expect:**
+  Home; Settings ▸ Interface ▸ *Start screen* reads Home (choices: Home, Live TV, Guide, Last
+  used). Changing any setting saves `start_screen = "home"`.
+- [ ] **Live opens on All channels:** start, then Alt+2. **Expect:** All channels open, the
+  cursor on its first channel (on the playing channel when one plays); with one playlist picked
+  in the scope bar, that playlist's All channels. The guide (Alt+3) also shows All channels.
+  Open a favourites list, go Home, press Alt+2 again: the favourites list is still open.
+- [ ] **Favourites instead:** Settings ▸ Interface ▸ *Live TV opens on* ▸ Favourites, quit and
+  start, Alt+2. **Expect:** the first favourites list with channels opens; the guide shows it
+  too. Remove every favourite channel, quit and start again: All channels.

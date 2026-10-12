@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::Receiver;
 use rusqlite::{Connection, params};
-use tuner::config::{Config, StartScreen};
+use tuner::config::{Config, LiveOpensOn, StartScreen};
 use tuner::follow::{ChannelScope, FollowKind, FollowMode, FollowReason, FollowRule};
 use tuner::jobs::{JobContext, JobEvent, JobKind, JobManager, JobOutcome};
 use tuner::model::{
@@ -825,6 +825,8 @@ pub fn build(dir: &Path, media: Option<&Path>, media2: Option<&Path>, silent: bo
     // config: Home first, live previews loop the clip, nothing refreshes on its own
     let mut cfg = Config::default();
     cfg.general.start_screen = StartScreen::Home;
+    // the Live TV shots show the curated favourites list, as before the All channels default
+    cfg.interface.live_opens_on = LiveOpensOn::Favourites;
     cfg.general.epg_keep_past_days = 1;
     cfg.player.mpv_options.insert("loop-file".into(), "inf".into());
     if silent {

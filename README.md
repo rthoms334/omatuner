@@ -100,6 +100,8 @@ and [Artemis I Launch (Press Site)](https://images.nasa.gov/details/Artemis%20I%
   free iptv-org or Free-TV playlist in two keystrokes. Tuner refreshes playlists in the
   background and shows account information (expiry, connections, formats).
 - **Live TV:** groups, channel rows with now/next and progress, and a preview pane.
+  - Opens on All channels; Settings ▸ Interface ▸ *Live TV opens on* makes it your favourites
+    instead (the guide follows). Coming back to Live TV keeps the group you were in.
   - Zap with ↑/↓, recall the last channel, and browse your history.
   - Keep several favourites lists.
   - Hide, rename and reorder channels and groups; mark several groups and hide them at once.
@@ -179,8 +181,8 @@ and [Artemis I Launch (Press Site)](https://images.nasa.gov/details/Artemis%20I%
 - **Live TV, "Also on":** the preview names the same channel in your other playlists
   (`Also on ● TV 2 (FHD)`) — click one, or press `Ctrl+O`, to play it from there. They are
   alternatives you pick; Tuner never merges channels or switches by itself.
-- **Search:** global fuzzy search over channels, movies, series and programmes (`/` or Ctrl+K),
-  plus type-to-filter in every list.
+- **Search:** global fuzzy search over channels, movies, series and programmes (`/`, Ctrl+K or
+  the top entry of the sidebar), plus type-to-filter in every list.
 - **Player:**
   - Audio and subtitle tracks with language preferences, subtitle delay and size.
   - Aspect and zoom, stream info, and configurable skip steps.
@@ -330,6 +332,9 @@ With no playlists, Tuner opens a single onboarding card with these steps:
 7. **Done:** counts per kind, and how much of the playlist the guide covers (see below).
 
 Esc steps back. Everything works from the keyboard.
+
+After that, Tuner opens on Home. Settings ▸ Interface ▸ *Start screen* can make it Live TV, the
+guide, or the screen you last used.
 
 Once onboarding is done, and once per Tuner version, Tuner may also offer to connect the AI
 agents it finds on your computer (Claude Code, Codex, Gemini CLI, Copilot CLI, opencode). Esc

@@ -1,7 +1,9 @@
 //! Live TV (DESIGN §13.2): groups pane | channel list (logo, number, name, now/next +
 //! progress via `ctx.now_next`) | preview pane (video via VideoHost Preview + programme
 //! details + upcoming). Group list has virtual groups on top: each favourites list, History,
-//! Reminders, All channels.
+//! Reminders, All channels. The first time in a session it opens on All channels, or on the
+//! favourites (`interface.live_opens_on`, `LiveScreen::default_entry`); later visits keep
+//! the group the user was in.
 //! * Enter rule: Enter on the channel that is already playing → fullscreen player; otherwise
 //!   play in the preview (Shift+Enter always fullscreen). Returning from the player moves the
 //!   cursor to the channel that was zapped to.
@@ -39,6 +41,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Rect};
 
+use crate::config::LiveOpensOn;
 use crate::keymap::{Action, KeyContext};
 use crate::model::{
     ChannelId, ChannelSummary, Collection, FavListId, Group, GroupId, GroupKey, ItemKind, ItemRef, MediaRef, PlayOrigin, Programme, ProgrammeSlim,
@@ -880,6 +883,13 @@ impl LiveScreen {
         self.open.as_ref().and_then(|e| self.groups.iter().position(|g| &g.entry == e))
     }
 
+    /// Put the groups-pane cursor on the open group (when its row is shown).
+    fn cursor_on_open(&mut self) {
+        if let Some(i) = self.open_index().and_then(|gi| self.group_rows.iter().position(|&r| r as usize == gi)) {
+            self.group_list.select(i);
+        }
+    }
+
     /// The playlist scope (DESIGN §29; the guide follows it).
     fn scope<'l>(ctx: &UiCtx<'l>) -> Scope<'l> {
         Scope::current(ctx, ScopeKind::Live)
@@ -943,16 +953,21 @@ impl LiveScreen {
         self.rebuild_groups(ctx);
         if self.open.as_ref().is_none_or(|e| !self.groups.iter().any(|g| &g.entry == e)) {
             self.open = self.default_entry(ctx);
+            self.cursor_on_open();
         }
         self.rebuild_channels(ctx, false);
     }
 
+    /// The group Live opens on without one asked for (first time this session, or the open
+    /// one went away): Settings ▸ Interface ▸ Live TV opens on — All channels (in this scope),
+    /// or the first favourites list with channels in this scope, All channels without one.
     fn default_entry(&self, ctx: &UiCtx<'_>) -> Option<Entry> {
-        ctx.favs
-            .non_empty_lists()
-            .next()
-            .map(|l| Entry::FavList(l.id))
-            .or_else(|| self.groups.iter().find(|g| g.entry == Entry::All).map(|g| g.entry.clone()))
+        let first = |want: fn(&GroupItem) -> bool| self.groups.iter().find(|g| want(g)).map(|g| g.entry.clone());
+        let all = || first(|g| g.entry == Entry::All);
+        match ctx.config.interface.live_opens_on {
+            LiveOpensOn::AllChannels => all(),
+            LiveOpensOn::Favourites => first(|g| matches!(g.entry, Entry::FavList(_)) && g.group.item_count > 0).or_else(all),
+        }
     }
 
     fn rebuild_groups(&mut self, ctx: &UiCtx<'_>) {
@@ -1147,9 +1162,7 @@ impl LiveScreen {
             self.chan_list.filter.clear();
             self.rebuild_channels(ctx, true);
         }
-        if let Some(i) = self.open_index().and_then(|gi| self.group_rows.iter().position(|&r| r as usize == gi)) {
-            self.group_list.select(i);
-        }
+        self.cursor_on_open();
     }
 
     /// Put the cursor on `id`, opening a group that contains it if the open one doesn't.
@@ -1198,9 +1211,7 @@ impl LiveScreen {
     fn focus_groups(&mut self, layout: LayoutClass) {
         self.focus = Pane::Groups;
         self.drawer = layout != LayoutClass::Wide;
-        if let Some(i) = self.open_index().and_then(|gi| self.group_rows.iter().position(|&r| r as usize == gi)) {
-            self.group_list.select(i);
-        }
+        self.cursor_on_open();
     }
 
     fn close_drawer(&mut self) {
@@ -2467,6 +2478,9 @@ mod tests {
             crate::store::user::set_favourite(c, list, &fav, true, 1)?;
             Ok((a_ch[0], b, free))
         });
+        let mut cfg = (*t.config).clone();
+        cfg.interface.live_opens_on = LiveOpensOn::Favourites;
+        t.config = std::sync::Arc::new(cfg);
         let mut h = harness(t, one, LiveScreen::default(), egui::vec2(1600.0, 900.0));
         h.state_mut().enter(Route::Live { group: None, channel: None });
         h.run_steps(2);
@@ -2475,7 +2489,7 @@ mod tests {
             let (s, id) = (&app.s, app.s.channels[0]);
             app.t.with_ctx(|ctx| s.zap_for_open(ctx, id)).map_or(0, |z| z.channels.len())
         };
-        // a favourites list opens first: Free's favourite is still yours in All
+        // Live TV opens on Favourites: Free's favourite is still yours in All
         assert!(matches!(h.state().s.open, Some(Entry::FavList(_))));
         assert_eq!(h.state().s.channels.len(), 1, "Free is out of All, not out of your favourites");
         assert_eq!(h.state().s.groups[0].group.item_count, 1);
@@ -2520,6 +2534,47 @@ mod tests {
         assert!(!s.channels.is_empty() && s.open_index().is_some(), "{:?}", s.open);
         pick(&mut h, free);
         assert_eq!(h.state().s.channels.len(), 4, "out of All, but its own tab shows it");
+    }
+
+    /// Settings ▸ Interface ▸ Live TV opens on (DESIGN §13.2): the first time in a session
+    /// Live opens on All channels (cursor on the first), or on the favourites when chosen — All
+    /// channels while no list has a channel; coming back keeps the group the user was in.
+    #[test]
+    fn live_opens_on_all_channels_or_the_favourites_the_first_time() {
+        let (mut t, one) = rig();
+        let (chs, fav, list) = seed(&mut t, |c| {
+            let a = testkit::source(c, "Alpha")?;
+            let chs = testkit::channels(c, a, 3)?;
+            let list = crate::store::user::default_fav_list(c)?;
+            let fav = ItemRef { source: a, kind: ItemKind::Channel, key: crate::model::ItemKey("m3u:seed00000000002".into()) };
+            crate::store::user::set_favourite(c, list, &fav, true, 1)?;
+            Ok((chs, fav, list))
+        });
+        let mut h = harness(t, one, LiveScreen::default(), egui::vec2(1600.0, 900.0));
+        let first_open = |h: &mut egui_kittest::Harness<'static, testkit::App<LiveScreen>>| {
+            h.state_mut().s = LiveScreen::default(); // a new session
+            h.state_mut().enter(Route::Live { group: None, channel: None });
+            h.run_steps(2);
+            let s = &h.state().s;
+            assert_eq!(s.cursor_group().map(|g| &g.entry), s.open.as_ref(), "the groups cursor is on the open group");
+            s.open.clone()
+        };
+        assert_eq!(first_open(&mut h), Some(Entry::All), "All channels by default, favourites or not");
+        assert_eq!(h.state().s.cursor_channel(), Some(chs[0]));
+        // the user goes into their favourites; Live from the sidebar later keeps them there
+        let app = h.state_mut();
+        let s = &mut app.s;
+        app.t.with_ctx(|ctx| s.open_entry(ctx, Entry::FavList(list)));
+        h.state_mut().enter(Route::Live { group: None, channel: None });
+        h.run_steps(2);
+        assert_eq!(h.state().s.open, Some(Entry::FavList(list)), "returning keeps the group");
+
+        h.state_mut().t.config_edits.push(Box::new(|c| c.interface.live_opens_on = LiveOpensOn::Favourites));
+        h.state_mut().apply_config();
+        assert_eq!(first_open(&mut h), Some(Entry::FavList(list)));
+        assert_eq!(h.state().s.cursor_channel(), Some(chs[2]));
+        seed(&mut h.state_mut().t, move |c| crate::store::user::set_favourite(c, list, &fav, false, 2));
+        assert_eq!(first_open(&mut h), Some(Entry::All), "no favourites: All channels");
     }
 
     /// Spatial panes (DESIGN §15.1): ← in a filtered channel list (`Left`, from

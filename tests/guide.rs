@@ -544,10 +544,14 @@ fn guide_digits_jump_to_a_channel_number_and_watch_plays_it_fullscreen() {
     assert!(t.toasts.iter().any(|x| x.text.contains("No channel 99")));
 }
 
+/// The guide opens like Live TV (Settings ▸ Interface ▸ Live TV opens on): All channels by
+/// default even with favourites, the first non-empty favourites list when chosen.
 #[test]
-fn guide_defaults_to_the_first_non_empty_favourites_list() {
+fn guide_defaults_to_all_channels_or_the_first_non_empty_favourites_list() {
     let _one = one();
-    let (mut t, ids) = seeded(10, 10, None);
+    let mut cfg = tuner::config::Config::default();
+    cfg.interface.live_opens_on = tuner::config::LiveOpensOn::Favourites;
+    let (mut t, ids) = seeded(10, 10, Some(cfg));
     let fav = ItemRef { source: SourceId(1), kind: ItemKind::Channel, key: ItemKey(format!("m3u:seed{:011}", 6)) };
     t.services()
         .store
@@ -561,7 +565,7 @@ fn guide_defaults_to_the_first_non_empty_favourites_list() {
     let mut g = GuideScreen::default();
     t.with_ctx(|ctx| g.on_enter(ctx, &Route::Guide { collection: None, focus: None }));
     draw(&mut t, &mut g);
-    // the only row is the favourite: Watch plays it
+    // Live TV opens on Favourites: the only row is the favourite, Watch plays it
     act(&mut t, &mut g, Action::GuideWatch);
     let s = player_until(&t, "the favourite plays", plays(MediaRef::Channel(ids[6])));
     assert!(matches!(s.zap.as_ref().map(|z| &z.collection), Some(Collection::Favourites(_))));
@@ -571,6 +575,17 @@ fn guide_defaults_to_the_first_non_empty_favourites_list() {
     let Some(OverlayRequest::ContextMenu(spec)) = menus.last() else { panic!("picker: {menus:?}") };
     let labels: Vec<&str> = spec.items.iter().map(|i| i.label.as_str()).collect();
     assert!(labels.contains(&"Favourites") && labels.contains(&"All channels") && labels.contains(&"News"), "{labels:?}");
+
+    // the default, All channels: every channel, the favourite or not
+    let mut cfg = (*t.config).clone();
+    cfg.interface.live_opens_on = tuner::config::LiveOpensOn::AllChannels;
+    t.config = Arc::new(cfg);
+    let mut g = GuideScreen::default();
+    t.with_ctx(|ctx| g.on_enter(ctx, &Route::Guide { collection: None, focus: None }));
+    draw(&mut t, &mut g);
+    act(&mut t, &mut g, Action::GuideWatch);
+    let s = player_until(&t, "the first channel plays", plays(MediaRef::Channel(ids[0])));
+    assert_eq!(s.zap.as_ref().map(|z| z.collection.clone()), Some(Collection::AllChannels));
 }
 
 /// `snap` after a newer load (the player bumps the generation on every load, zaps included).
@@ -1355,6 +1370,8 @@ fn live_reorder_under_a_sort_moves_the_cursor_channel_in_custom_order() {
     let _one = one();
     let mut cfg = tuner::config::Config::default();
     cfg.interface.live_sort = tuner::model::SortMode::NameAsc;
+    // Live opens on the favourites list seeded below
+    cfg.interface.live_opens_on = tuner::config::LiveOpensOn::Favourites;
     let (mut t, ids) = seeded(12, 0, Some(cfg.clone()));
     let key = |i: usize| format!("m3u:seed{i:011}");
     let all = t.lib.live.groups.iter().find(|g| g.name == "All").map(|g| g.id).expect("All");

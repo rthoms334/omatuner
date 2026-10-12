@@ -288,7 +288,7 @@ creation callback (GL current): join fonts/theme threads → LoadedFonts::instal
       egui_style::apply → VideoSurface::new(player.render_core()) → UI reader → ImageCache →
       start_integrations (theme watcher, IPC server, MPRIS, reminders, scheduler, connection
       limits from stored AccountInfo) → idle inhibitor → start route (no sources ⇒
-      Onboarding; StartScreen::Auto ⇒ Live until favourites/history exist, then Home) →
+      Onboarding; else `general.start_screen`, Home by default) →
       RebuildLibrary job (async; lists show skeletons until it lands) → CLI/IPC request
 ```
 First frame target: < 300 ms after launch regardless of library size (library loads async;
@@ -1499,12 +1499,12 @@ clamp(width/1280, 1, 1.6).
 ### 12.2 Shell
 ```
 ┌sidebar┬───────────────────────────── content (screen) ─────────────────────────────┐
-│ 󰋜     │                                                                             │
-│ 󰔂     │                                                       ┌ toast ────────────┐ │
-│ 󰃰     │                                                       └───────────────────┘ │
-│ 󰎁     │                                                       ┌ mini player ──────┐ │
-│ 󰟴     │                                                       │  video 16:9       │ │
-│ 󰍉     │                                                       └ BBC One · ✕ ──────┘ │
+│ 󰍉     │                                                                             │
+│ 󰋜     │                                                       ┌ toast ────────────┐ │
+│ 󰔂     │                                                       └───────────────────┘ │
+│ 󰃰     │                                                       ┌ mini player ──────┐ │
+│ 󰎁     │                                                       │  video 16:9       │ │
+│ 󰟴     │                                                       └ BBC One · ✕ ──────┘ │
 │ 󰒓     │                                                                             │
 ├───────┴─────────────────────────────────────────────────────────────────────────────┤
 │ ↵ play · ⇧↵ fullscreen · Ctrl+F fav · Shift+F10 more · ? help   Guide updated 2 h ago│  ← status bar 26·rem
@@ -1680,7 +1680,7 @@ adds a `Quality` line on live channels with a quality word: "Quality  named 4K �
 | Logo / monogram | `logo::logo` | square, aspect kept; monogram on fg @ 0.04, text @ 0.52 |
 | Poster card | `poster::poster_card` | 2:3; title body; meta body-small @ 0.52 (year · ★ rating; the playlist is a code chip, §13.0); progress accent; cursor 2 px accent outline; corner chips: playlist top-left, lock / watched top-right |
 | Empty / error state | `empty_state::empty_state` | glyph display-large 28 accent @ 0.8; title 14 fg @ 0.7; detail @ 0.52 |
-| Sidebar | `sidebar::sidebar` | bg dark_background; row control-height + md; selected fg @ 0.18 + accent |
+| Sidebar | `sidebar::sidebar` | bg dark_background; row control-height + md; selected fg @ 0.18 + accent; order Search · Home, Live TV, Guide, Movies, Series, Up next · Settings (a panel gap sets Search and Settings apart; same in the rail and the Compact glyph strip; Alt+digits stay bound to their screens) |
 | Status bar | `status_bar::status_bar` | height 26 (Omarchy bar), body-small, fg @ 0.52 |
 | Toast | `toast::Toasts` | popup card, kind glyph (info fg, success green, warning yellow, error urgent) |
 | Scrim | overlays | `menu.scrim` @ 0.5; click cancels |
@@ -1696,15 +1696,15 @@ Rounding: Hyprland `decoration:rounding` (0 on Omarchy) everywhere; no shadows, 
 Wide (≈ 1600):
 ```
 ┌────────┬────────────────────────┬────────────────────────────────────────┬───────────────────────────────────────┐
-│ 󰋜 Home │ GROUPS            ⌕    │ UK News…                               │ ┌───────────────────────────────────┐ │
-│ 󰔂 Live │ 󰓎 Favourites       42  │ ▣ 101 BBC One HD              󰓎 ▕██░▏ │ │                                   │ │
-│ 󰃰 Guide│ 󰓎 Sport (list)     11  │     News at Eight · 20:00–21:00        │ │          VIDEO  (preview)         │ │
-│ 󰎁 Movie│ 󰋚 History          12  │ ▣ 102 BBC Two                    ▕█░░▏ │ │                                   │ │
-│ 󰟴 Serie│ All channels    9 812  │     Gardeners' World · next Panorama   │ └───────────────────────────────────┘ │
-│        │ ───────────────────────│ ▣ 103 ITV1  󰀦 (offline, dimmed)        │ BBC One HD · 101   [HD] [⟲ 7 d] [▣ Pr]│
-│ 󰍉      │ UK News           128  │ ▣ 104 Channel 4                        │ News at Eight          20:00 – 21:00  │
-│ 󰒓      │ UK Sports          64  │ …                                      │ ▕█████████░░░░░░▏ 34 min left          │
-│        │ Kids 󰌾             31  │                                        │ The latest national and international │
+│ 󰍉      │ GROUPS            ⌕    │ UK News…                               │ ┌───────────────────────────────────┐ │
+│        │ 󰓎 Favourites       42  │ ▣ 101 BBC One HD              󰓎 ▕██░▏ │ │                                   │ │
+│ 󰋜 Home │ 󰓎 Sport (list)     11  │     News at Eight · 20:00–21:00        │ │          VIDEO  (preview)         │ │
+│ 󰔂 Live │ 󰋚 History          12  │ ▣ 102 BBC Two                    ▕█░░▏ │ │                                   │ │
+│ 󰃰 Guide│ All channels    9 812  │     Gardeners' World · next Panorama   │ └───────────────────────────────────┘ │
+│ 󰎁 Movie│ ───────────────────────│ ▣ 103 ITV1  󰀦 (offline, dimmed)        │ BBC One HD · 101   [HD] [⟲ 7 d] [▣ Pr]│
+│ 󰟴 Serie│ UK News           128  │ ▣ 104 Channel 4                        │ News at Eight          20:00 – 21:00  │
+│        │ UK Sports          64  │ …                                      │ ▕█████████░░░░░░▏ 34 min left          │
+│ 󰒓      │ Kids 󰌾             31  │                                        │ The latest national and international │
 │        │ …                      │                                        │ news, followed by weather.            │
 │        │                        │                                        │ UPCOMING                              │
 │        │                        │                                        │ 21:00  Drama                          │
@@ -1717,6 +1717,13 @@ Groups 240·rem · channels flex (≥ 380) · preview 38 % (≥ 420). The channe
 the filter (launcher idiom; haystack `"<number> <name>"`, so typing `101` finds channel 101
 first). Virtual groups on top: each favourites list, History, Reminders, All channels; then
 provider groups (renamed/reordered/hidden per overrides; locked show 󰌾 and require PIN).
+* **Opening group** (Settings ▸ Interface ▸ Live TV opens on, `interface.live_opens_on`): the
+  first time Live TV opens in a session without a group or channel asked for (start screen,
+  sidebar, Alt+2, Home's links), it shows **All channels** (default) in the current playlist
+  scope, cursor on the first channel — or on the playing one. *Favourites* opens the first
+  favourites list with channels in that scope, All channels without one. Coming back later
+  keeps the group the user was in; back from the player follows the zapped channel; a route
+  with a group or channel opens that. The guide's default collection follows the same choice.
 * Enter follows §13.0 (plays in the preview; on the playing channel → fullscreen);
   Shift+Enter fullscreen; Ctrl+G opens it in the guide; Ctrl+I "Edit information".
 * **Preview autoplay is OFF by default** (each tune costs a provider connection and, on
@@ -1748,12 +1755,12 @@ Medium (≈ 790): the preview stays on the RIGHT; groups become a drawer (← / 
 channel list — ← also while it filters, keeping the filter — or click the breadcrumb):
 ```
 ┌──┬────────────────────────────────┬─────────────────────────────┐
-│󰋜 │ UK News ▾  (filter…)           │ ┌─────────────────────────┐ │
-│󰔂 │ ▣ 101 BBC One HD      ▕██░▏    │ │      VIDEO (16:9)       │ │
-│󰃰 │   News at Eight               │ └─────────────────────────┘ │
-│󰎁 │ ▣ 102 BBC Two         ▕█░░▏    │ BBC One HD · 101 [HD]       │
-│󰟴 │   Gardeners' World            │ News at Eight  20:00–21:00  │
-│󰍉 │ …                             │ ▕██████░░░▏                  │
+│󰍉 │ UK News ▾  (filter…)           │ ┌─────────────────────────┐ │
+│󰋜 │ ▣ 101 BBC One HD      ▕██░▏    │ │      VIDEO (16:9)       │ │
+│󰔂 │   News at Eight               │ └─────────────────────────┘ │
+│󰃰 │ ▣ 102 BBC Two         ▕█░░▏    │ BBC One HD · 101 [HD]       │
+│󰎁 │   Gardeners' World            │ News at Eight  20:00–21:00  │
+│󰟴 │ …                             │ ▕██████░░░▏                  │
 │󰒓 │                               │ 21:00 Drama · 22:00 Newsnight│
 └──┴────────────────────────────────┴─────────────────────────────┘
 ```
@@ -1779,7 +1786,7 @@ the channel's primary group) and opens VOD details; Shift+Enter resumes VOD dire
 favourites rail per non-empty list. Empty rails are omitted; when fewer than 2 rails remain a
 **"Get started" rail** appears: Browse Live TV · Open guide · Add favourites (Ctrl+F) · the
 first group's channels with now/next. An empty library routes to onboarding. The default start
-screen is `StartScreen::Auto`: Live until the user has favourites or history, then Home.
+screen is Home (`StartScreen::Home`; an old `"auto"` loads as Home).
 Medium: rails narrower, same structure.
 
 ### 13.4 TV Guide & EPG grid widget
@@ -1802,7 +1809,9 @@ Medium: rails narrower, same structure.
   Medium 140 / Compact 56); rows max(48·rem, 1.5·control-height) (compact density 36·rem);
   `px_per_min` 4 / 3 / 2.5 × rem.
 * **Collection**: header button "Favourites ▾" (click or `f`) picks favourites lists, groups or
-  All. Default: the first non-empty favourites list, else the last-used group. ‹ › and Now are
+  All. Default: the one last picked in the guide this session, else like Live TV's (§13.2
+  "Opening group"): All channels; with *Favourites*, the first favourites list with channels in
+  the playlist scope and not hidden by parental control, else All channels. ‹ › and Now are
   clickable buttons too.
 * **Several playlists** (§29): the guide shows Live TV's playlist — a `● TV 2 ▾` button before
   the collection button (Alt+P) and the stripe under the header; rows, collections and zap
@@ -2045,7 +2054,8 @@ favourites lists) show a 󰇙 drag grip and move with Alt+↑/↓ or K/J. Every 
 | | Default User-Agent | `player.user_agent` | VLC/3.0.21 |
 | | Advanced mpv options | `player.mpv_options` | {} |
 | | Pop-out size · corner (Hyprland, §21.6) | `player.popout_size`, `popout_corner` (+ `popout_last`, remembered at pop-in) | small 480 × 270 · bottom right |
-| Interface | Start screen | `general.start_screen` | Auto (Live until favourites/history exist, then Home) |
+| Interface | Start screen: Home · Live TV · Guide · Last used (no playlists → onboarding; the old `"auto"` loads as Home) | `general.start_screen` | home |
+| | Live TV opens on: All channels · Favourites (first open in a session, §13.2) | `interface.live_opens_on` | all-channels |
 | | Sidebar · density · channel numbers · logos · quality badges · 24 h clock | `interface.*` (`quality_badges`) | auto · comfortable · on · on · on · on |
 | | Playlist on cards: Auto (2+ eligible playlists, in All) · Always · Never (§13.0, §29) | `interface.playlist_on_cards` | auto |
 | | The playlist Movies / Series / Live TV show (the scope bar, Alt+P; the guide follows Live TV) | `interface.playlist_scope.{movies,series,live}` | none = All playlists |

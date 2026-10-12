@@ -419,7 +419,7 @@ fn sidebar_rail_and_compact_glyph_strip() {
         S { theme: Theme::fallback(), strip: true, clicked: None, search: false },
     );
     h.run();
-    let labels = ["Home", "Live TV", "Guide", "Movies", "Series", "Search", "Settings"];
+    let labels = ["Search", "Home", "Live TV", "Guide", "Movies", "Series", "Settings"];
     let rects: Vec<Rect> = labels.iter().map(|l| h.get_by_label(l).rect()).collect();
     for w in rects.windows(2) {
         assert_eq!(w[0].top(), w[1].top(), "one row");
@@ -436,12 +436,12 @@ fn sidebar_rail_and_compact_glyph_strip() {
     h.run();
     assert!(h.state().search);
 
-    // vertical rail without VOD: Movies/Series hidden, entries stacked
+    // vertical rail without VOD: Movies/Series hidden, entries stacked, Search on top
     h.state_mut().strip = false;
     h.run();
     assert!(h.query_by_label("Movies").is_none() && h.query_by_label("Series").is_none());
-    let (a, b) = (h.get_by_label("Home").rect(), h.get_by_label("Live TV").rect());
-    assert!(b.top() >= a.bottom() && a.left() == b.left());
+    let (search, a, b) = (h.get_by_label("Search").rect(), h.get_by_label("Home").rect(), h.get_by_label("Live TV").rect());
+    assert!(a.top() >= search.bottom() && b.top() >= a.bottom() && a.left() == b.left());
 }
 
 // ------------------------------------------------------------------ toasts

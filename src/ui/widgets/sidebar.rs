@@ -1,4 +1,4 @@
-//! Left navigation (Home, Live TV, Guide, Movies, Series · Search · Settings). Expanded (glyph +
+//! Left navigation (Search · Home, Live TV, Guide, Movies, Series, Up next · Settings). Expanded (glyph +
 //! label, 184 pt) / rail (glyph only, 48 pt) / hidden (Compact). Current item = selected fill +
 //! accent text; hover = fg@0.08. Shows Movies/Series only when some source provides them.
 //! Owner: WP-10a.
@@ -32,7 +32,7 @@ pub const ITEMS: &[SidebarItem] = &[
     SidebarItem { id: ScreenId::Settings, glyph: glyphs::SETTINGS, label: "Settings" },
 ];
 
-/// Pseudo-entry for the search button (drawn before Settings).
+/// Pseudo-entry for the search button (drawn first, above Home).
 const SEARCH: SidebarItem = SidebarItem { id: ScreenId::Home, glyph: glyphs::SEARCH, label: "Search" };
 
 /// Whether `current` highlights entry `id` (detail pages belong to their grid, Logs and EPG
@@ -47,11 +47,13 @@ pub fn is_current(id: ScreenId, current: ScreenId) -> bool {
 /// The visible entries in order; `None` marks the search button. `up_next`: Up next's pending
 /// items (`None`: the entry is hidden).
 fn entries(has_vod: bool, up_next: Option<usize>) -> impl Iterator<Item = Option<&'static SidebarItem>> {
-    ITEMS
-        .iter()
-        .filter(move |it| has_vod || !matches!(it.id, ScreenId::Movies | ScreenId::Series))
-        .filter(move |it| up_next.is_some() || it.id != ScreenId::Queue)
-        .flat_map(|it| (it.id == ScreenId::Settings).then_some(None).into_iter().chain([Some(it)]))
+    std::iter::once(None).chain(
+        ITEMS
+            .iter()
+            .filter(move |it| has_vod || !matches!(it.id, ScreenId::Movies | ScreenId::Series))
+            .filter(move |it| up_next.is_some() || it.id != ScreenId::Queue)
+            .map(Some),
+    )
 }
 
 /// One entry: `size` rect, glyph (+ label when `expanded`), tooltip otherwise; `count` (Up
@@ -124,15 +126,14 @@ pub fn sidebar(
     if !strip {
         ui.add_space(theme.space(SpaceToken::PanelPadding));
     }
+    let mut after_search = false;
     for e in entries(has_vod, up_next) {
         let it = e.unwrap_or(&SEARCH);
-        if strip {
-            if e.is_none() {
-                ui.add_space(theme.space(SpaceToken::Lg));
-            }
-        } else if e.is_none() {
-            ui.add_space(theme.space(SpaceToken::PanelGap));
+        // Search and Settings stand apart from the screens between them
+        if after_search || e.is_some_and(|it| it.id == ScreenId::Settings) {
+            ui.add_space(theme.space(if strip { SpaceToken::Lg } else { SpaceToken::PanelGap }));
         }
+        after_search = e.is_none();
         let size = if strip { egui::vec2(side, side) } else { egui::vec2(ui.available_width(), side) };
         let selected = e.is_some_and(|it| is_current(it.id, current));
         let count = up_next.filter(|_| e.is_some_and(|it| it.id == ScreenId::Queue));
@@ -151,11 +152,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vod_entries_hide_without_vod_and_search_precedes_settings() {
+    fn vod_entries_hide_without_vod_and_search_comes_first() {
         let labels = |vod, up_next| entries(vod, up_next).map(|e| e.map_or("Search", |it| it.label)).collect::<Vec<_>>();
-        assert_eq!(labels(true, None), ["Home", "Live TV", "Guide", "Movies", "Series", "Search", "Settings"]);
-        assert_eq!(labels(false, None), ["Home", "Live TV", "Guide", "Search", "Settings"]);
-        assert_eq!(labels(false, Some(2)), ["Home", "Live TV", "Guide", "Up next", "Search", "Settings"]);
+        assert_eq!(labels(true, None), ["Search", "Home", "Live TV", "Guide", "Movies", "Series", "Settings"]);
+        assert_eq!(labels(false, None), ["Search", "Home", "Live TV", "Guide", "Settings"]);
+        assert_eq!(labels(true, Some(2)), ["Search", "Home", "Live TV", "Guide", "Movies", "Series", "Up next", "Settings"]);
+        assert_eq!(labels(false, Some(2)), ["Search", "Home", "Live TV", "Guide", "Up next", "Settings"]);
         assert!(is_current(ScreenId::Movies, ScreenId::MovieDetail));
         assert!(!is_current(ScreenId::Live, ScreenId::Guide));
     }

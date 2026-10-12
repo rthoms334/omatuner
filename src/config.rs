@@ -51,10 +51,10 @@ pub struct Config {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum StartScreen {
-    /// Live TV until the user has favourites or watch history, then Home (a new M3U user would
-    /// otherwise land on an empty Home). No sources at all → onboarding regardless.
+    /// No sources at all → onboarding regardless. The old `"auto"` (Live TV until there were
+    /// favourites or history) loads as Home, so older configs and backups keep loading.
     #[default]
-    Auto,
+    #[serde(alias = "auto")]
     Home,
     Live,
     Guide,
@@ -85,7 +85,7 @@ pub struct GeneralConfig {
 impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
-            start_screen: StartScreen::Auto,
+            start_screen: StartScreen::Home,
             smart_names: true,
             live_format: LiveFormat::Auto,
             refresh_on_launch_after_h: 12,
@@ -115,6 +115,17 @@ pub enum Density {
     Comfortable,
     /// 36 px rows, no detail line.
     Compact,
+}
+
+/// Settings ▸ Interface ▸ "Live TV opens on": the group Live TV shows the first time it opens
+/// in a session without one asked for (DESIGN §13.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum LiveOpensOn {
+    #[default]
+    AllChannels,
+    /// The first favourites list with something in it; All channels without one.
+    Favourites,
 }
 
 /// Settings ▸ Interface ▸ Playlist on cards.
@@ -180,6 +191,8 @@ pub struct InterfaceConfig {
     /// Extra UI scale applied on top of Omarchy's `[font] base-size` (1.0 = follow Omarchy).
     pub ui_scale: f32,
     pub hide_empty_groups: bool,
+    /// The group Live TV (and the guide) opens on the first time in a session.
+    pub live_opens_on: LiveOpensOn,
     pub live_sort: SortMode,
     pub movie_sort: SortMode,
     pub series_sort: SortMode,
@@ -220,6 +233,7 @@ impl Default for InterfaceConfig {
             osd_timeout_ms: 3500,
             ui_scale: 1.0,
             hide_empty_groups: true,
+            live_opens_on: LiveOpensOn::AllChannels,
             live_sort: SortMode::Provider,
             movie_sort: SortMode::RecentlyAdded,
             series_sort: SortMode::RecentlyAdded,
