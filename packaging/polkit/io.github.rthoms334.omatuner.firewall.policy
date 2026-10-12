@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
+<!-- Tuner's casting firewall helper (DESIGN §40 §9.4): the one root program, started through
+     pkexec. It validates its arguments and runs a single fixed `ufw` command. auth_admin_keep so
+     a Remove, or a port change, soon after an Allow needs no second prompt. -->
+<policyconfig>
+  <vendor>Tuner</vendor>
+  <vendor_url>https://github.com/rthoms334/omatuner</vendor_url>
+
+  <action id="io.github.rthoms334.omatuner.firewall">
+    <description>Allow your TV to connect to Tuner for casting</description>
+    <message>Allow your TV to connect to Tuner for casting</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/tuner/tuner-firewall</annotate>
+  </action>
+</policyconfig>

@@ -1,0 +1,9 @@
+### RULES ###
+
+### tuple ### allow tcp 47800:47810 0.0.0.0/0 any 192.168.1.0/24 in_wlan0 comment=6f6d6174756e65722063617374
+### tuple ### allow udp 47800 0.0.0.0/0 any 192.168.1.0/24 in_wlan0 comment=6f6d6174756e65722063617374
+### tuple ### deny tcp 47800 0.0.0.0/0 any 192.168.1.0/24 in_wlan0 comment=6f6d6174756e65722063617374
+### tuple ### allow tcp 47800 0.0.0.0/0 any 192.168.1.0/24 in comment=6f6d6174756e65722063617374
+### tuple ### allow tcp 47800 192.168.1.20 any 192.168.1.0/24 in_wlan0 comment=6f6d6174756e65722063617374
+
+### END RULES ###

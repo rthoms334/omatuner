@@ -1,0 +1,7 @@
+### RULES ###
+
+### tuple ### deny tcp 47000:48000 0.0.0.0/0 any 192.168.1.0/24 in
+
+### tuple ### allow tcp 47800 0.0.0.0/0 any 192.168.1.0/24 in_wlan0 comment=6f6d6174756e65722063617374
+
+### END RULES ###

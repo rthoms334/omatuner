@@ -1,0 +1,6 @@
+### RULES ###
+
+### tuple ### route:allow tcp 47800 0.0.0.0/0 any 192.168.1.0/24 in_wlan0!out_docker0 comment=6f6d6174756e65722063617374
+### tuple ### route:deny any any 0.0.0.0/0 any 0.0.0.0/0 in_wlan0!out_br0
+
+### END RULES ###

@@ -1,0 +1,7 @@
+### RULES ###
+
+### tuple ### allow tcp 47800 0.0.0.0/0 any 10.0.5.0/24 in_enp3s0 comment=6f6d6174756e65722063617374
+
+### tuple ### allow tcp 47800 0.0.0.0/0 any 10.0.5.0/24 in_enp3s0 comment=6f6d6174756e65722063617374
+
+### END RULES ###

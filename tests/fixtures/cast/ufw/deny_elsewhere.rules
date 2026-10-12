@@ -1,0 +1,13 @@
+### RULES ###
+
+### tuple ### deny tcp 47800 0.0.0.0/0 any 192.168.1.0/24 in_eth0
+### tuple ### deny udp 47800 0.0.0.0/0 any 192.168.1.0/24 in
+### tuple ### deny tcp 47801 0.0.0.0/0 any 192.168.1.0/24 in
+### tuple ### deny tcp 47800 0.0.0.0/0 any 192.168.2.0/24 in
+### tuple ### deny tcp 47800 192.168.1.99 any 192.168.1.0/24 in
+### tuple ### deny tcp 47800 0.0.0.0/0 4000 192.168.1.0/24 in
+### tuple ### deny tcp 47800 0.0.0.0/0 any 192.168.1.0/24 out_wlan0
+### tuple ### route:deny tcp 47800 0.0.0.0/0 any 192.168.1.0/24 in_wlan0!out_br0
+### tuple ### allow tcp 47800 0.0.0.0/0 any 192.168.1.0/24 in_wlan0 comment=6f6d6174756e65722063617374
+
+### END RULES ###
