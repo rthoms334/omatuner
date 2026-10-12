@@ -122,7 +122,10 @@ impl Services {
         let jobs = JobManager::new(ctx, rt.handle().clone());
         let player = {
             let cfg = crate::config::current(&config);
-            Player::start(&cfg, player_deps(&store, &config, &bus, &agent))?
+            // picture A casts (DESIGN §40 §5.5): through `AppShared`, which answers "casting isn't
+            // available" until the cast service publishes its handle (CAST-6)
+            let cast: Arc<dyn crate::player::remote::CastConnector> = agent.clone();
+            Player::start(&cfg, PlayerDeps { cast: Some(cast), ..player_deps(&store, &config, &bus, &agent) })?
         };
         let mut memory = crate::platform::memory::Maintenance::start();
         memory.watch_player(rt.handle(), TileId::A, player.handle().subscribe());
@@ -442,12 +445,13 @@ pub fn http_options(cfg: &Config) -> HttpOptions {
 }
 
 /// A player's persistence and resolver (picture A at startup, picture B later on the blocking
-/// pool: each gets its own database reader).
+/// pool: each gets its own database reader). No cast connector: only picture A casts.
 fn player_deps(store: &Store, config: &SharedConfig, bus: &EventBus, shared: &Arc<crate::shared::AppShared>) -> PlayerDeps {
     PlayerDeps {
         bus: bus.clone(),
         store: Box::new(WriterPlayerStore(store.writer().clone())),
         resolver: Box::new(DbResolver::new(store.clone(), config.clone()).with_copies(shared.clone())),
+        cast: None,
     }
 }
 

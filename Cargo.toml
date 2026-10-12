@@ -17,6 +17,12 @@ path = "src/lib.rs"
 name = "tuner"
 path = "src/main.rs"
 
+# The casting firewall helper (DESIGN §40 §9.4): std only, the one program that runs as root,
+# started through pkexec; installed as /usr/lib/tuner/tuner-firewall. CAST-7 owns it.
+[[bin]]
+name = "tuner-firewall"
+path = "src/bin/tuner-firewall.rs"
+
 # Bench targets (DESIGN §24.2 "numeric gates"); each file is owned by the WP named in it.
 # Datasets: scripts/gen-big-fixtures.py (WP-00) → target/big-fixtures/.
 [[bench]]
@@ -66,7 +72,7 @@ libmpv2 = "=6.0.0"
 libmpv2-sys = "=4.0.1"
 
 # async runtime / concurrency
-tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "net", "signal"] }
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "net", "signal", "process"] }  # process: cast ffmpeg/ffprobe/pkexec children
 tokio-util = { version = "0.7.20", features = ["rt"] }   # CancellationToken
 futures-util = "0.3.34"
 bytes = "1.12.1"
@@ -127,6 +133,16 @@ anyhow = "1.0.104"
 thiserror = "2.0.21"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+
+# casting (DESIGN §40 §13; architect sign-off, skeleton CAST-0). Pinned per the two-week rule
+# (newest release at least 14 days old on 2026-10-12); licences in the trailing comments.
+mdns-sd = { version = "=0.21.4", default-features = false }   # Apache-2.0 OR MIT; on-demand _airplay._tcp browse (0.21.5 is from 2026-10-05)
+num-bigint = "0.5.1"        # MIT OR Apache-2.0; SRP-6a (3072-bit) for AirPlay pairing
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }  # MIT; the LAN media server (also a dev-dependency, with its defaults)
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }  # ISC AND (Apache-2.0 OR ISC); already built for rustls: X25519, Ed25519, ChaCha20-Poly1305, HKDF, SHA-512
+zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }  # MIT; already built (notify-rust): the logind sleep inhibitor
+libc = "0.2.190"            # MIT OR Apache-2.0; already built: prctl(PR_SET_PDEATHSIG) for ffmpeg children
+if-addrs = "0.15.0"         # MIT OR BSD-3-Clause; same version as mdns-sd's: interface name and subnet for the firewall rule
 
 [dev-dependencies]
 tempfile = "3.27.0"

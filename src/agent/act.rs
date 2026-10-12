@@ -123,7 +123,7 @@ pub fn plan_play(q: &Q, p: &Play) -> Out<PlayStep> {
     let r = parse_ref(&p.item)?;
     let log_ref = r.to_string();
     let ready = |target: PlayTarget, out: PlayOut| PlayStep::Ready {
-        command: AgentCommand::Play(AgentPlay { target, from_start, show: AgentShow::window(true) }),
+        command: AgentCommand::Play(AgentPlay { target, from_start, show: AgentShow::window(true), device: None }),
         out: clean_play(out),
         log_ref: log_ref.clone(),
     };
@@ -280,7 +280,7 @@ fn episode_step(q: &Q, ep: &crate::model::Episode, series: &str, from_start: boo
         None => format!("Playing {title}."),
     };
     Ok(PlayStep::Ready {
-        command: AgentCommand::Play(AgentPlay { target, from_start, show: AgentShow::window(true) }),
+        command: AgentCommand::Play(AgentPlay { target, from_start, show: AgentShow::window(true), device: None }),
         out: clean_play(PlayOut { outcome: PlayOutcome::Playing, item: out.item, title, resume_at_min: resume, message, opened_in: None }),
         log_ref: log_ref.to_owned(),
     })
@@ -559,6 +559,7 @@ pub fn error_kind(k: PlayerErrorKind) -> String {
         PlayerErrorKind::Budget => "connection-limit".into(),
         PlayerErrorKind::ProviderError => "provider-error".into(),
         PlayerErrorKind::Mpv => "player".into(),
+        PlayerErrorKind::Cast(c) => c.reason().into(),
     }
 }
 

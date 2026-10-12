@@ -83,6 +83,11 @@ pub struct RouteState {
     pub queue_running: bool,
     /// `follow.interrupt_vod`.
     pub follow_interrupt_vod: bool,
+    /// The main picture plays on a TV (`PlayerSnapshot::cast`; DESIGN §40 §5.5): plays aimed
+    /// at picture B and "Alongside" are refused ("Stop casting to use multi-view"), plays
+    /// aimed at A go through (and land on the TV). Set by the skeleton at every caller; the
+    /// refusal in [`route`] is CAST-5's.
+    pub casting: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

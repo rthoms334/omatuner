@@ -785,6 +785,8 @@ impl Controller {
                     self.snap.video_suspended = false;
                 }
             }
+            // CAST-5: the remote output (DESIGN §40 §5.5); inert until then (casting is off)
+            PlayerCommand::CastTo { .. } | PlayerCommand::StopCasting { .. } => {}
             PlayerCommand::Shutdown => {}
         }
         self.dirty = true;

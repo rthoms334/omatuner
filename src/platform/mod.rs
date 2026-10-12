@@ -58,6 +58,10 @@ pub enum PlatformEvent {
     FilePicked { purpose: PickPurpose, path: Option<std::path::PathBuf> },
     /// Pop-out player: Hyprland window state and request results (`platform::popout`).
     PopOut(popout::PopOutEvent),
+    /// **Show** on a cast alert's desktop notification (DESIGN §40 §3.8: sent while Tuner's
+    /// window wasn't on a visible workspace): raise Tuner (`hypr::focus_self`) onto the player,
+    /// where the casting card has the actions (Allow on firewall, Play here…). CAST-9.
+    ShowPlayer,
 }
 
 /// glibc malloc arenas the process may create (default: 8 per core).

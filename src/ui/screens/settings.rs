@@ -1290,6 +1290,8 @@ impl SettingsScreen {
             SettingsPage::Following => following::rows(self, ctx, &mut v),
             SettingsPage::SpoilerGuard => spoiler::rows(self, ctx, &mut v),
             SettingsPage::Agents => agents::rows(self, ctx, &mut v),
+            // CAST-9: the Cast page (`settings/cast.rs`; listed in `PAGES_ALL` once `cast::ENABLED`)
+            SettingsPage::Cast => {}
             SettingsPage::Parental => {
                 let has_pin = ctx.config.parental.pin_hash.is_some();
                 v.push(Row::Section("Parental lock".into()));

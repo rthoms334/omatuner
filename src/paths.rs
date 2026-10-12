@@ -7,6 +7,7 @@
 //! | cache     | `~/.cache/tuner/{img,epg,playlists}/` (epg, playlists: 0700) |
 //! | logs      | `~/.local/state/tuner/tuner.log`       |
 //! | runtime   | `$XDG_RUNTIME_DIR/tuner/` (IPC socket) |
+//! | casting   | `$XDG_RUNTIME_DIR/tuner/cast/` (live HLS, tmpfs), `~/.cache/tuner/cast/` (VOD HLS), `~/.local/state/tuner/cast-trace/` (dev) — all 0700 |
 //! | omarchy   | `~/.local/state/omarchy/current/`      |
 
 use std::path::{Path, PathBuf};
@@ -75,6 +76,30 @@ impl AppPaths {
     }
     pub fn ipc_socket(&self) -> PathBuf {
         self.runtime_dir.join("tuner.sock")
+    }
+
+    /// Live casting sessions' HLS output, one directory per session (tmpfs; DESIGN §40 §8.4).
+    pub fn cast_live_dir(&self) -> PathBuf {
+        self.runtime_dir.join("cast")
+    }
+    /// Catch-up and VOD casting sessions' HLS output (on disk: a film doesn't fit in tmpfs).
+    pub fn cast_vod_dir(&self) -> PathBuf {
+        self.cache_dir.join("cast")
+    }
+    /// `TUNER_CAST_TRACE=1` transcripts (dev only, redacted; DESIGN §40 §7.3).
+    pub fn cast_trace_dir(&self) -> PathBuf {
+        self.state_dir.join("cast-trace")
+    }
+
+    /// Create the casting directories (0700). The cast service calls it when it starts; it
+    /// also sweeps them (sessions left by a crash; the trace keeps its last 5 files).
+    pub fn ensure_cast_dirs(&self) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        for d in [self.cast_live_dir(), self.cast_vod_dir(), self.cast_trace_dir()] {
+            std::fs::create_dir_all(&d).map_err(|e| Error::io(&d, e))?;
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).map_err(|e| Error::io(&d, e))?;
+        }
+        Ok(())
     }
 
     /// `~/.local/state/omarchy/current` — watched (non-recursively) for theme changes.

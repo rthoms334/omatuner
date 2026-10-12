@@ -131,6 +131,7 @@ impl Harness {
             bus,
             store: Box::new(RecordingStore(rec.clone())),
             resolver: Box::new(TableResolver(table.into_iter().map(|p| (p.media.clone(), p)).collect())),
+            cast: None,
         };
         let player = Player::start(&cfg, deps).expect("headless mpv");
         let handle = player.handle();

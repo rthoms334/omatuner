@@ -63,6 +63,8 @@ pub struct AppShared {
     /// Tuner's window as the app last saw it (where an agent's play opens, DESIGN §30.13);
     /// `None` before the app's first frame.
     window: Mutex<Option<WindowNow>>,
+    /// The cast service's facade (DESIGN §40 §5.6); the inert `NullCast` until it starts.
+    cast: RwLock<crate::cast::CastHandle>,
 }
 
 impl Default for AppShared {
@@ -99,6 +101,7 @@ impl AppShared {
             sleep: Mutex::default(),
             tile_b: Mutex::default(),
             window: Mutex::default(),
+            cast: RwLock::default(),
         }
     }
 
@@ -227,6 +230,18 @@ impl AppShared {
         *self.window.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The cast service started or stopped (`Services::start_integrations` / `apply_config`;
+    /// `None`: casting is off, the inert handle answers).
+    pub fn set_cast(&self, h: Option<crate::cast::CastHandle>) {
+        *self.cast.write().unwrap_or_else(|e| e.into_inner()) = h.unwrap_or_default();
+    }
+
+    /// The cast service (devices, pairing, the firewall…; DESIGN §40). Cheap to clone; poll it,
+    /// never hold it across an await of something slow.
+    pub fn cast(&self) -> crate::cast::CastHandle {
+        self.cast.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     /// Up next's latest snapshot.
     pub fn queue(&self) -> Arc<QueueSnapshot> {
         self.queue.borrow().clone()
@@ -247,6 +262,14 @@ impl AppShared {
         let at = *self.unlocked_at.lock().unwrap_or_else(|e| e.into_inner());
         let session = ParentalSession::with_unlocked_at(at);
         ParentalView { unlocked: session.is_unlocked(cfg), hides_explicit: session.hides_explicit(cfg), pin_active: cfg.pin_active() }
+    }
+}
+
+/// Picture A's cast connector (`PlayerDeps::cast`): whatever cast service is published now, so
+/// the player can start before the service and survive its restarts.
+impl crate::player::remote::CastConnector for AppShared {
+    fn open(&self, device: crate::model::DeviceId) -> Result<crate::player::remote::RemoteOutput, crate::player::PlayerError> {
+        self.cast().open(device)
     }
 }
 

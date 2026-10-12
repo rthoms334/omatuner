@@ -350,6 +350,13 @@ pub enum Action {
     /// reminder…" on a programme — the reminder sheet (notify or switch, lead, start offset,
     /// where it opens; `reminders::ui`).
     ReminderOptions,
+    // ---- casting (DESIGN §40; the key tables and `feature_on` are CAST-8's)
+    /// `C` in the player: "Cast to a TV…" (the picker; while casting it opens with "This
+    /// computer" focused, so stopping is `C` then Enter).
+    CastMenu,
+    /// "Stop casting": the player menu, the casting card, the status chip and the picker. No
+    /// default key.
+    StopCasting,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

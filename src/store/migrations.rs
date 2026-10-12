@@ -29,6 +29,8 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("0011_follow", include_str!("migrations/0011_follow.sql")),
     ("0012_spoiler_guard", include_str!("migrations/0012_spoiler_guard.sql")),
     ("0013_agent_names", include_str!("migrations/0013_agent_names.sql")),
+    // casting (DESIGN §40; skeleton CAST-0, architect sign-off)
+    ("0014_cast", include_str!("migrations/0014_cast.sql")),
 ];
 
 /// Current schema version after all migrations.
@@ -371,7 +373,8 @@ mod tests {
                 "0010_play_queue",
                 "0011_follow",
                 "0012_spoiler_guard",
-                "0013_agent_names"
+                "0013_agent_names",
+                "0014_cast"
             ]
         );
         for (t, col) in [

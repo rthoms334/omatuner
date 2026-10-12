@@ -1,0 +1,535 @@
+//! Casting to TVs (DESIGN §40): AirPlay to the Apple TV first, Google Cast (Phase 2) and DLNA
+//! (Phase 3) as further [`receiver::Backend`]s. The skeleton (CAST-0) froze this file, the value
+//! types in `model::cast`, the player contract in `player::remote`, and the APIs of `airplay`,
+//! `relay` and `firewall`; the work items fill the bodies.
+//!
+//! ```text
+//!  UI / agent ──CastHandle (devices, pairing, firewall, test on TV; polled per frame)──┐
+//!  controller A ──CastConnector::open──▶ CastService (tokio) ◀─────────────────────────┘
+//!     ▲ RemoteEvent (crossbeam)   │ RemoteCmd (tokio mpsc)
+//!     └──────── session task (one per cast): receiver::Backend + relay::RelaySession
+//!                 ├─ AirPlay client: :7000 control connection, event channel, feedback
+//!                 └─ relay: loopback upstream proxy → ffprobe / ffmpeg → LAN server :47800
+//! ```
+//! OWNERS (DESIGN §40 §15.2):
+//! * CAST-0: this file, `receiver.rs`, `testing.rs` (all frozen: no work item edits them); the
+//!   signatures in `airplay/mod.rs`, `relay/mod.rs`, `firewall/mod.rs` (frozen).
+//! * CAST-1: `airplay/{tlv8,srp,hap,pair,bplist,features}.rs`.
+//! * CAST-2: `airplay/{rtsp,session,queue,events,position,trace}.rs` and the bodies in
+//!   `airplay/mod.rs`.
+//! * CAST-4: `relay/*` and the bodies in `relay/mod.rs`.
+//! * CAST-6: `service.rs` (implements [`CastApi`] and `player::remote::CastConnector`),
+//!   `session.rs`, `discovery.rs`, `registry.rs`, `inhibit.rs`, `store::cast`.
+//! * CAST-7: `firewall/{ufw,allow}.rs` and the bodies in `firewall/mod.rs`.
+//!
+//! Rules: the TV never gets a provider URL (Tuner always relays); casting never moves Tuner's
+//! window; device text is data (sanitized, never in error copy); no address leaves this module
+//! except to the protocol code that connects to it.
+
+pub mod airplay;
+pub mod discovery;
+pub mod firewall;
+pub mod inhibit;
+pub mod receiver;
+pub mod registry;
+pub mod relay;
+pub mod service;
+pub mod session;
+#[doc(hidden)]
+pub mod testing;
+
+use std::fmt;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+
+use crate::model::Timestamp;
+pub use crate::model::cast::{CastErrorKind, CastHints, CastLevel, CastPhase, CastView, DeviceId, ReceiverKind};
+use crate::player::remote::{CastConnector, RemoteOutput};
+use crate::player::{PlayerError, PlayerErrorKind};
+use crate::redact::Secret;
+
+/// Casting shows in the UI (the picker, `C`, the OSD control, Settings ▸ Cast, the first-run
+/// card, the agent's tools). Flipped at the gate once every CAST item has landed.
+pub const ENABLED: bool = false;
+
+/// The wire protocol a device speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Protocol {
+    AirPlay,
+    /// Phase 2.
+    GoogleCast,
+    /// Phase 3.
+    Dlna,
+}
+
+impl Protocol {
+    /// The store's `cast_device.protocol` and [`DeviceId::derive`]'s prefix.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Protocol::AirPlay => "airplay",
+            Protocol::GoogleCast => "googlecast",
+            Protocol::Dlna => "dlna",
+        }
+    }
+}
+
+/// The AirPlay pairing variant that worked (`cast_device.pair_kind`; DESIGN §40 §7.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PairVariant {
+    /// `X-Apple-HKP: 3` with `X-Apple-Client-Name` (tried first).
+    Hkp3,
+    /// `X-Apple-HKP: 5` with the ScreenCapture ACL (the fallback; tvOS 27 senders use it).
+    Hkp5,
+}
+
+impl PairVariant {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PairVariant::Hkp3 => "hkp3",
+            PairVariant::Hkp5 => "hkp5",
+        }
+    }
+
+    /// The variant **Show a new code** moves to (the ladder: HKP 3 → HKP 5, then stays).
+    pub fn next(self) -> Self {
+        PairVariant::Hkp5
+    }
+}
+
+/// Whether a device needs pairing before it casts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pairing {
+    /// The receiver doesn't ask for it (no PIN bit).
+    NotNeeded,
+    /// "Pair first": one-time PIN pairing.
+    Required,
+    Paired(PairVariant),
+}
+
+/// Whether a listed device can be chosen (the picker greys out the others).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Usability {
+    Usable,
+    /// A Mac receiver: "Mac · Can't cast to Macs".
+    Mac,
+    /// `acl=1` (Allow Access: Home only): "Same Home only", with the setting hint.
+    HomeOnly,
+}
+
+/// One receiver as the UI and the agent see it: no address (DESIGN §40 §6). Device strings are
+/// sanitized ([`sanitize_name`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Device {
+    pub id: DeviceId,
+    pub name: String,
+    pub kind: ReceiverKind,
+    pub protocol: Protocol,
+    /// "AppleTV14,1".
+    pub model: Option<String>,
+    /// The receiver's OS version for logs, `diagnose` and Settings only: "26.6 (23L773)".
+    pub os_version: Option<String>,
+    pub pairing: Pairing,
+    pub usability: Usability,
+    /// A third-party AirPlay TV (DESIGN §40 §7.7): labelled, never offered by the first-run card.
+    pub experimental: bool,
+    /// Seen on the network by the latest discovery (else remembered from the store).
+    pub available: bool,
+    /// Last cast to it (the picker lists the most recent first).
+    pub last_used: Option<Timestamp>,
+    /// Where it was last found. Private to the crate: never shown, logged at INFO or sent to an
+    /// agent.
+    pub(crate) addr: Option<SocketAddr>,
+}
+
+impl Device {
+    /// A device by identity; the rest defaults to usable, not paired (pairing required),
+    /// available, never used, no model or version. `name` is sanitized.
+    pub fn new(id: DeviceId, name: &str, kind: ReceiverKind, protocol: Protocol) -> Self {
+        Self {
+            id,
+            name: sanitize_name(name, "TV"),
+            kind,
+            protocol,
+            model: None,
+            os_version: None,
+            pairing: Pairing::Required,
+            usability: Usability::Usable,
+            experimental: kind == ReceiverKind::AirPlayTv,
+            available: true,
+            last_used: None,
+            addr: None,
+        }
+    }
+
+    /// A device at `addr` (discovery, the store, tests that point a client at a fake receiver).
+    #[doc(hidden)]
+    pub fn at(mut self, addr: SocketAddr) -> Self {
+        self.addr = Some(addr);
+        self
+    }
+
+    /// Where to connect (crate only).
+    pub(crate) fn addr(&self) -> Option<SocketAddr> {
+        self.addr
+    }
+
+    /// The picker can start a cast to it (perhaps after pairing).
+    pub fn selectable(&self) -> bool {
+        self.usability == Usability::Usable
+    }
+}
+
+/// A 4-digit PIN as typed in the pairing overlay. Used once, then dropped: never logged, stored
+/// or `Debug`-printed, and deliberately not a registered secret (it would mask every 4-digit
+/// number in the logs). The digits are zeroed on drop.
+pub struct Pin([u8; 4]);
+
+impl Pin {
+    /// Exactly four ASCII digits.
+    pub fn new(digits: &str) -> Option<Self> {
+        let b = digits.as_bytes();
+        (b.len() == 4 && b.iter().all(u8::is_ascii_digit)).then(|| Self([b[0], b[1], b[2], b[3]]))
+    }
+
+    /// The SRP password (the digit string). Grep for `expose(` when auditing.
+    pub fn expose(&self) -> &str {
+        std::str::from_utf8(&self.0).unwrap_or_default()
+    }
+}
+
+impl fmt::Debug for Pin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Pin(****)")
+    }
+}
+
+impl Drop for Pin {
+    fn drop(&mut self) {
+        self.0.fill(0);
+        std::hint::black_box(&self.0);
+    }
+}
+
+/// This install's long-term AirPlay identity (`cast_identity`): one per install.
+#[derive(Debug, Clone)]
+pub struct Identity {
+    /// The pairing identifier (a UUID string).
+    pub pairing_id: String,
+    /// Ed25519 seed of the long-term key.
+    pub seed: Secret<[u8; 32]>,
+    /// Random, locally administered MAC: SETUP `deviceID`, fallback `channelID`.
+    pub sender_mac: [u8; 6],
+}
+
+/// What pairing with one TV stored (`cast_device.peer_id`, `peer_ltpk`, `pair_kind`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerCredentials {
+    /// The TV's pairing identifier (pair-verify checks it).
+    pub peer_id: String,
+    /// The TV's long-term Ed25519 public key.
+    pub peer_ltpk: [u8; 32],
+    pub variant: PairVariant,
+}
+
+/// Everything a session needs to verify with a paired TV.
+#[derive(Debug, Clone)]
+pub struct Credentials {
+    pub identity: Identity,
+    pub peer: PeerCredentials,
+}
+
+/// Why pairing stopped (DESIGN §40 §3.2: each has its own copy in the PIN overlay).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairError {
+    /// Error TLV 2 at M4: "That code didn't match. The TV is showing a new one."
+    WrongPin,
+    /// Error TLV 3: the TV wants a break (`BackOff` seconds, when it said).
+    Backoff { secs: Option<u32> },
+    /// HTTP 470 on both variants, another error TLV, or (pair-verify) an empty 200:
+    /// `home_only` when "Everyone in your Home" is the likely cause.
+    Refused { home_only: bool },
+    /// The pairing connection closed while waiting for the code: "The code expired."
+    Expired,
+    /// No answer: "Living Room isn't answering. Is it on?"
+    Unreachable,
+    /// 403 at pin-start (a Mac).
+    NotSupported,
+    /// The TV's proof or signature didn't verify, or its reply was malformed.
+    Failed,
+}
+
+impl PairError {
+    /// The cast error this becomes when it stops a cast.
+    pub fn kind(self) -> CastErrorKind {
+        match self {
+            PairError::Unreachable | PairError::Expired => CastErrorKind::Unreachable,
+            PairError::NotSupported => CastErrorKind::Unsupported,
+            PairError::Refused { .. } => CastErrorKind::PairingRefused,
+            PairError::WrongPin | PairError::Backoff { .. } | PairError::Failed => CastErrorKind::PairingRequired,
+        }
+    }
+}
+
+/// A pairing in progress (the PIN overlay holds one while the user types).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PairJob(pub u64);
+
+/// Where a [`PairJob`] is (polled per frame by the PIN overlay).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairState {
+    /// Asking the TV to show a code.
+    Starting,
+    /// The TV shows a code; type it in.
+    EnterCode {
+        variant: PairVariant,
+    },
+    /// The code is being checked (M1–M6).
+    Checking,
+    Paired,
+    Failed(PairError),
+    /// No such job (cancelled, or the service restarted).
+    Gone,
+}
+
+/// The firewall work Settings and the firewall card poll ([`CastApi::firewall_job`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum FirewallJob {
+    #[default]
+    Idle,
+    /// polkit's dialog is (about to be) up: "Waiting for your password…" with Cancel.
+    Waiting {
+        verb: firewall::Verb,
+    },
+    Done {
+        verb: firewall::Verb,
+        outcome: firewall::AllowOutcome,
+    },
+}
+
+/// Test on TV (DESIGN §40 §8.5): a 15 s Tuner test card through the real relay and pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TestState {
+    #[default]
+    Idle,
+    Running,
+    Passed,
+    Failed(CastErrorKind),
+}
+
+/// A TV the first-run card offers to set up (an Apple-made, video-capable, unpaired receiver).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupOffer {
+    pub device: DeviceId,
+    pub name: String,
+    pub kind: ReceiverKind,
+}
+
+/// The first-run discovery pass finished ([`CastApi::take_pass_outcome`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PassOutcome {
+    /// `None`: nothing to offer (the app records `cast.checked_version`).
+    pub offer: Option<SetupOffer>,
+}
+
+/// The agent's `diagnose` cast section (DESIGN §40 §12): no addresses.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CastDiagnose {
+    /// The device last cast to (or being cast to).
+    pub device: Option<DeviceId>,
+    pub model: Option<String>,
+    pub os_version: Option<String>,
+    pub source_version: Option<String>,
+    pub pairing: Option<PairVariant>,
+    /// Always `"ptp-declared"` in Phase 1.
+    pub timing: &'static str,
+    pub firewall: Option<firewall::FirewallState>,
+    pub last_error: Option<CastErrorKind>,
+}
+
+/// What the UI, the agent and the player ask of the cast service. Every method returns at once
+/// (state is polled, work runs on the runtime). The defaults are the inert answers ("no TVs,
+/// nothing running"): [`NullCast`] is the service while casting is off, off the desktop, or
+/// before `Services::start_integrations`. CAST-6's service implements every method.
+pub trait CastApi: Send + Sync {
+    // ---- devices (Settings ▸ Cast, the picker, the agent's `cast_devices`)
+    /// Known devices: remembered ones and those the latest discovery found, merged, most
+    /// recently used first. Never starts a scan.
+    fn devices(&self) -> Vec<Device> {
+        Vec::new()
+    }
+    /// Keep discovery running: call it every frame while the picker or Settings ▸ Cast is open;
+    /// the browse stops shortly after the last call (on demand only, DESIGN §40 §6).
+    fn browse(&self) {}
+    /// A browse is running (the picker's "Searching…").
+    fn searching(&self) -> bool {
+        false
+    }
+    /// "Add by address…": probe `GET /info` on port 7000 of `ip`; the result arrives through
+    /// [`CastApi::take_add_outcome`].
+    fn add_by_address(&self, _ip: Ipv4Addr) {}
+    fn take_add_outcome(&self) -> Option<Result<DeviceId, CastErrorKind>> {
+        None
+    }
+    /// Forget a device (its pairing and hints too).
+    fn forget(&self, _device: DeviceId) {}
+
+    // ---- pairing (the PIN overlay; DESIGN §40 §3.2, §7.2)
+    /// Ask `device` to show a code (HKP 3 first). The connection stays open while the user types.
+    fn pair_start(&self, _device: DeviceId) -> PairJob {
+        PairJob(0)
+    }
+    fn pair_state(&self, _job: PairJob) -> PairState {
+        PairState::Gone
+    }
+    /// The typed code (used once, then dropped).
+    fn pair_submit(&self, _job: PairJob, _pin: Pin) {}
+    /// **Show a new code**: ask again with the next variant.
+    fn pair_new_code(&self, _job: PairJob) {}
+    fn pair_cancel(&self, _job: PairJob) {}
+
+    // ---- firewall (Settings ▸ Cast ▸ Network, the firewall card; DESIGN §40 §9.4)
+    /// The latest detection (cached ≤ 5 s; `None` until the first finished).
+    fn firewall(&self) -> Option<firewall::Detection> {
+        None
+    }
+    /// Detect again now ("Check again").
+    fn firewall_check(&self) {}
+    /// **Allow on firewall** through pkexec (prepending when detection found a shadowing rule).
+    /// After `cast.media_port` changed, it also removes Tuner's tagged rule for the old port on
+    /// this network (a move: one remove and one add under the same polkit keep).
+    fn firewall_allow(&self) {}
+    /// **Remove rule**: every rule tagged `omatuner cast`.
+    fn firewall_remove(&self) {}
+    /// Cancel a pending Allow / Remove (kills pkexec, which closes its dialog).
+    fn firewall_cancel(&self) {}
+    fn firewall_job(&self) -> FirewallJob {
+        FirewallJob::Idle
+    }
+
+    // ---- setup (the first-run card and wizard; DESIGN §40 §3.5)
+    /// The one 5 s first-run browse.
+    fn start_pass(&self) {}
+    fn take_pass_outcome(&self) -> Option<PassOutcome> {
+        None
+    }
+    /// Test on TV: the test card through the real relay (no provider, no controller).
+    fn test_on_tv(&self, _device: DeviceId) {}
+    fn test_state(&self) -> TestState {
+        TestState::Idle
+    }
+
+    // ---- the session now casting (the player menu, the casting card; DESIGN §40 §3.3, §8.3)
+    /// **Convert this channel**: remember L3 for the item now casting on its TV
+    /// (`cast_hint.forced`) and restart its pipeline at L3 (a replace on the same session, the
+    /// same load generation). Nothing when nothing casts.
+    fn convert_current(&self) {}
+
+    // ---- the agent (`status.casting.error`, `diagnose`)
+    /// The last cast failure (kept after casting ended, e.g. `StoppedOnTv`).
+    fn last_error(&self) -> Option<CastErrorKind> {
+        None
+    }
+    fn diagnose(&self) -> CastDiagnose {
+        CastDiagnose { timing: "ptp-declared", ..CastDiagnose::default() }
+    }
+
+    // ---- the player (picture A's controller, through `AppShared`)
+    /// Start a session to `device` (non-blocking; it connects on the runtime and reports
+    /// `Phase` / `Lost`).
+    fn open(&self, _device: DeviceId) -> Result<RemoteOutput, PlayerError> {
+        Err(PlayerError { kind: PlayerErrorKind::Cast(CastErrorKind::Unreachable), message: "Casting isn't available.".into() })
+    }
+}
+
+/// The inert service: no devices, nothing to do.
+#[derive(Debug, Default)]
+pub struct NullCast;
+
+impl CastApi for NullCast {}
+
+/// The cloneable facade the UI and the agent hold (`AppShared::cast`). Derefs to [`CastApi`].
+#[derive(Clone)]
+pub struct CastHandle(Arc<dyn CastApi>);
+
+impl CastHandle {
+    pub fn new(api: Arc<dyn CastApi>) -> Self {
+        Self(api)
+    }
+}
+
+impl Default for CastHandle {
+    fn default() -> Self {
+        Self(Arc::new(NullCast))
+    }
+}
+
+impl fmt::Debug for CastHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CastHandle")
+    }
+}
+
+impl std::ops::Deref for CastHandle {
+    type Target = dyn CastApi;
+    fn deref(&self) -> &Self::Target {
+        &*self.0
+    }
+}
+
+impl CastConnector for CastHandle {
+    fn open(&self, device: DeviceId) -> Result<RemoteOutput, PlayerError> {
+        self.0.open(device)
+    }
+}
+
+/// Longest device string kept (names, models, versions).
+pub const MAX_NAME_CHARS: usize = 64;
+
+/// A device-supplied string made safe to show (DESIGN §40 §6 "Untrusted strings"): control and
+/// bidi-override characters dropped, whitespace runs collapsed, trimmed, capped at
+/// [`MAX_NAME_CHARS`]; empty, or anything that looks like a URL (`://`), becomes `fallback`
+/// (`"AirPlay TV"`).
+pub fn sanitize_name(raw: &str, fallback: &str) -> String {
+    if raw.contains("://") {
+        return fallback.to_owned();
+    }
+    let bidi = |c: char| matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}');
+    let mut out = String::new();
+    let mut space = false;
+    for c in raw.chars().filter(|c| !c.is_control() && !bidi(*c)) {
+        if c.is_whitespace() {
+            space = !out.is_empty();
+            continue;
+        }
+        if out.chars().count() >= MAX_NAME_CHARS {
+            break;
+        }
+        if space {
+            out.push(' ');
+            space = false;
+        }
+        out.push(c);
+    }
+    if out.is_empty() { fallback.to_owned() } else { out }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_strings_are_sanitized() {
+        assert_eq!(sanitize_name("  Living\u{0}  Room\n", "AirPlay TV"), "Living Room");
+        assert_eq!(sanitize_name("http://evil.example/x", "AirPlay TV"), "AirPlay TV");
+        assert_eq!(sanitize_name("\u{202E}\u{7}", "AirPlay TV"), "AirPlay TV");
+        assert_eq!(sanitize_name(&"x".repeat(200), "AirPlay TV").chars().count(), MAX_NAME_CHARS);
+    }
+
+    #[test]
+    fn a_pin_is_four_digits_and_never_printed() {
+        assert!(Pin::new("123").is_none() && Pin::new("12a4").is_none());
+        let pin = Pin::new("4711").unwrap();
+        assert_eq!(pin.expose(), "4711");
+        assert_eq!(format!("{pin:?}"), "Pin(****)");
+    }
+}

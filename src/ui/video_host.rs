@@ -684,6 +684,8 @@ pub(crate) fn error_copy(kind: PlayerErrorKind, message: &str) -> (String, Strin
         PlayerErrorKind::Budget => "Connection limit reached for this playlist",
         PlayerErrorKind::ProviderError => "The provider can't deliver this channel right now",
         PlayerErrorKind::HttpOther(_) | PlayerErrorKind::Mpv => "Playback failed",
+        // CAST-8: the casting card's own copy and actions (DESIGN §40 §3.4)
+        PlayerErrorKind::Cast(c) => crate::player::state::describe_cast(c),
     };
     let detail = if detail.is_empty() || detail == head { String::new() } else { detail };
     (head.to_owned(), detail)

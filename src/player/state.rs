@@ -52,6 +52,12 @@ pub struct MachineConfig {
     pub buffer_timeout_vod: Duration,
     /// Live: time-pos frozen this long while "playing" → Stalled.
     pub stall_timeout: Duration,
+    /// Casting (DESIGN §40 §5.5): no first picture on the TV within this → Timeout. Covers the
+    /// upstream connect, the probe, the first segments and AVPlayer's start (foxCast gives up
+    /// after 30 s too).
+    pub remote_load_timeout: Duration,
+    /// Casting: no progress from the TV this long while "playing" → Stalled.
+    pub remote_stall_timeout: Duration,
     pub policy: ReconnectPolicy,
 }
 
@@ -64,6 +70,8 @@ impl MachineConfig {
             buffer_timeout_live: Duration::from_secs(15),
             buffer_timeout_vod: Duration::from_secs(30),
             stall_timeout: Duration::from_secs(12),
+            remote_load_timeout: Duration::from_secs(30),
+            remote_stall_timeout: Duration::from_secs(20),
             policy: ReconnectPolicy { max_attempts_live: p.reconnect_max_attempts, ..ReconnectPolicy::default() },
         }
     }
@@ -685,6 +693,25 @@ pub fn describe(kind: PlayerErrorKind) -> &'static str {
         PlayerErrorKind::Budget => "Connection limit reached for this provider",
         PlayerErrorKind::ProviderError => "The provider can't deliver this channel right now",
         PlayerErrorKind::Mpv => "Playback failed",
+        PlayerErrorKind::Cast(k) => describe_cast(k),
+    }
+}
+
+/// Generic copy for a cast failure (DESIGN §40 §3.4). The casting card, toasts and
+/// notifications name the TV themselves; this never holds device or provider text.
+pub fn describe_cast(kind: crate::model::CastErrorKind) -> &'static str {
+    use crate::model::CastErrorKind as C;
+    match kind {
+        C::Unreachable => "The TV isn't answering. Is it on and on the same network?",
+        C::PairingRequired => "The TV needs pairing",
+        C::PairingLost => "The TV forgot Tuner. This can happen after a TV update.",
+        C::PairingRefused => "The TV refused pairing. Check its Allow Access setting.",
+        C::Firewall => "The TV couldn't connect back to Tuner. Your firewall is blocking it.",
+        C::Unsupported => "The TV can't play this channel's format",
+        C::NeedsFfmpeg => "Casting needs ffmpeg (it's normally installed with mpv)",
+        C::CpuTooSlow => "This computer can't convert this channel fast enough",
+        C::StoppedOnTv => "The TV stopped playing. Its remote stopped it, or another device took over.",
+        C::ReceiverFailed => "The TV couldn't play it",
     }
 }
 

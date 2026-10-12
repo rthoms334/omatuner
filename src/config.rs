@@ -46,6 +46,8 @@ pub struct Config {
     pub spoiler: SpoilerConfig,
     /// Connecting AI agents to Tuner (DESIGN §39).
     pub agents: AgentsConfig,
+    /// Casting to TVs (DESIGN §40).
+    pub cast: CastConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -548,6 +550,78 @@ impl Default for AgentsConfig {
     }
 }
 
+/// `[cast]`: casting to TVs (DESIGN §40 §13). Machine-local like `[agents]` (`Config::restored`
+/// keeps this machine's): the TVs and the network are this computer's. No secrets and no
+/// addresses (pairings live in the database, out of backups).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CastConfig {
+    /// Cast to TVs (Settings ▸ Cast). Off: no discovery, no picker, no server.
+    pub enabled: bool,
+    /// Offer to set up a TV found on the network, once per Tuner version (the first-run card).
+    /// "Don't ask again" turns it off; Settings ▸ Cast "Offer to set up new TVs" turns it on.
+    pub offer_setup: bool,
+    /// The Tuner version whose first-run pass finished (the card was answered, or there was
+    /// nothing to offer); `None`: run it at the next start.
+    pub checked_version: Option<String>,
+    /// The TV the picker focuses first (a `DeviceId` in hex); `None`: the last one used.
+    pub default_device: Option<String>,
+    /// The TCP port the TV fetches from: fixed, so the firewall can open exactly it.
+    pub media_port: u16,
+    /// Segments ready before the TV is told to play (VioletRelay: 2 × 4 s).
+    pub min_segments: u32,
+    /// Convert what the TV can't play (CPU): automatically, or never (refuse instead).
+    pub convert: CastConvert,
+    /// Interlaced channels: deinterlace (Apple HLS rule 1.14) or send as is.
+    pub interlaced: CastInterlaced,
+    /// List third-party AirPlay TVs (experimental, DESIGN §40 §7.7).
+    pub experimental: bool,
+    /// Block system sleep while casting (logind inhibitor).
+    pub keep_awake: bool,
+}
+
+impl CastConfig {
+    pub const DEFAULT_MEDIA_PORT: u16 = 47800;
+}
+
+impl Default for CastConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            offer_setup: true,
+            checked_version: None,
+            default_device: None,
+            media_port: Self::DEFAULT_MEDIA_PORT,
+            min_segments: 2,
+            convert: CastConvert::Auto,
+            interlaced: CastInterlaced::Auto,
+            experimental: true,
+            keep_awake: true,
+        }
+    }
+}
+
+/// `cast.convert`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CastConvert {
+    /// Re-encode on the CPU when the TV can't play the original.
+    #[default]
+    Auto,
+    Never,
+}
+
+/// `cast.interlaced`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CastInterlaced {
+    /// Deinterlace for receivers that need it (AirPlay: always).
+    #[default]
+    Auto,
+    /// Send interlaced video as is (L2 copy); the opt-out when the CPU can't keep up.
+    AsIs,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ParentalConfig {
@@ -632,7 +706,8 @@ impl Config {
 
     /// The settings of a restored backup (`raw` = its `config.toml`) for this machine: the
     /// backup's preferences, except what belongs to this machine and stays `local` — fonts,
-    /// hardware decoding, raw mpv options, UI scale, debug logging, the last screen. The
+    /// hardware decoding, raw mpv options, UI scale, debug logging, the last screen, the agents
+    /// and casting sections. The
     /// parental settings (PIN) come from the backup only while no PIN is set here: a restore
     /// must not remove or replace an existing PIN.
     pub fn restored(raw: &str, local: &Config) -> Result<Config> {
@@ -644,6 +719,7 @@ impl Config {
         c.interface.last_screen.clone_from(&local.interface.last_screen);
         c.general.debug_log = local.general.debug_log;
         c.agents = local.agents.clone();
+        c.cast = local.cast.clone();
         if local.parental.pin_hash.is_some() {
             c.parental = local.parental.clone();
         }
@@ -772,9 +848,11 @@ mod tests {
         local.player.mpv_options.insert("vo".into(), "gpu-next".into());
         local.interface.ui_scale = 1.1;
         local.agents.offer_connect = false;
+        local.cast.media_port = 48000;
 
         let c = Config::restored(&raw, &local).unwrap();
         assert_eq!(c.agents, local.agents, "agent connections are this machine's");
+        assert_eq!(c.cast, local.cast, "TVs and the network are this machine's");
         assert_eq!(c.player.zap_delay_ms, 120);
         assert_eq!(c.parental, backup.parental, "no PIN here: the backup's applies");
         assert_eq!((c.player.hwdec.as_str(), c.interface.ui_scale), ("no", 1.1));

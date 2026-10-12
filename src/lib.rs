@@ -38,6 +38,7 @@ pub mod platform;
 
 pub mod agent;
 pub mod app;
+pub mod cast;
 pub mod devshot;
 pub mod services;
 pub mod shared;

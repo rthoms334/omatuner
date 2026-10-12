@@ -322,7 +322,7 @@ impl TunerApp {
             Aim::Tile(t) => t,
             Aim::Alongside => {
                 let main_kind = kind_of(&self.snapshot);
-                let st = RouteState { tiles: self.tiles_state(), main_kind, ..Default::default() };
+                let st = RouteState { tiles: self.tiles_state(), main_kind, casting: self.snapshot.cast.is_some(), ..Default::default() };
                 let intent = PlayIntent { source: PlaySource::Alongside, kind, live_channel: channel };
                 match crate::playback::route(&intent, &st, &self.services().agent.guard(), crate::model::now()) {
                     PlayRoute::Refuse(why) => return self.toast(Toast::info(why)),

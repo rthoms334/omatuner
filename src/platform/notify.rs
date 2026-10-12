@@ -412,7 +412,13 @@ impl ReminderBackend for StoreBackend {
             crate::reminders::flash_skip(&f, &cfg.follow.news_flash, &ctx, r)
         });
         let ctx = FireCtx {
-            route: crate::playback::RouteState { tiles, main_kind, queue_running, follow_interrupt_vod: cfg.follow.interrupt_vod },
+            route: crate::playback::RouteState {
+                tiles,
+                main_kind,
+                queue_running,
+                follow_interrupt_vod: cfg.follow.interrupt_vod,
+                casting: main.as_ref().is_some_and(|p| p.cast.is_some()),
+            },
             target_locked,
             target_playing,
             flash_skip,

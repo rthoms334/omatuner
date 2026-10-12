@@ -618,6 +618,8 @@ impl TunerApp {
                 PlatformEvent::SwitchSoon { reminder, channel, start } => self.on_switch_soon(*reminder, channel, *start, None, OpenIn::FullWindow),
                 PlatformEvent::SwitchNow { reminder, channel } => self.on_switch_now(*reminder, channel, OpenIn::FullWindow, None, None, egui_ctx),
                 PlatformEvent::PopOut(ev) => self.on_popout_event(ev, egui_ctx),
+                // CAST-9: a cast alert's Show (DESIGN §40 §3.8); never sent while casting is off
+                PlatformEvent::ShowPlayer => {}
             },
             // the first copy of a title failed before its first frame (DESIGN §29.15)
             AppEvent::Player(crate::player::PlayerEvent::FellBack { title, from, to, .. }) => {
@@ -4581,6 +4583,7 @@ mod tests {
             target: crate::agent::PlayTarget::Media(MediaRef::Movie(id)),
             from_start: false,
             show: crate::agent::act::AgentShow::window(true),
+            device: None,
         };
         rig.event(AppEvent::Agent(crate::agent::AgentCommand::Play(play)));
         rig.frame_with(vec![]);
@@ -4623,7 +4626,7 @@ mod tests {
         rig.frame_with(vec![]);
         assert_eq!(rig.app.overlays.len(), 1);
         let ch = rig.app.lib.live.by_ref(&channel_ref(1)).unwrap();
-        let play = AgentPlay { target: PlayTarget::Media(MediaRef::Channel(ch)), from_start: false, show: AgentShow::window(false) };
+        let play = AgentPlay { target: PlayTarget::Media(MediaRef::Channel(ch)), from_start: false, show: AgentShow::window(false), device: None };
         rig.event(AppEvent::Agent(AgentCommand::Play(play)));
         rig.frame_with(vec![]);
         assert_eq!(rig.route(), &Route::Player, "from Live TV: the player screen");
@@ -4631,7 +4634,7 @@ mod tests {
         assert!(rig.app.overlays.is_empty(), "the menu closed with Live TV");
         rig.press(Key::Escape, NONE);
 
-        let play = AgentPlay { target: PlayTarget::Media(MediaRef::Channel(ch)), from_start: false, show: AgentShow::POP_OUT };
+        let play = AgentPlay { target: PlayTarget::Media(MediaRef::Channel(ch)), from_start: false, show: AgentShow::POP_OUT, device: None };
         rig.event(AppEvent::Agent(AgentCommand::Play(play)));
         assert!(rig.app.reminder_ui.pop_out_pending, "before the worker: asked for");
         assert!(!rig.log().toasts.iter().any(|t| t.text.contains("needs Hyprland")), "{:?}", rig.log().toasts);
@@ -4665,7 +4668,7 @@ mod tests {
         rig.settle();
         rig.app.reminder_ui.pop_out_pending = true;
         let ch0 = rig.app.lib.live.by_ref(&channel_ref(0)).unwrap();
-        let play = AgentPlay { target: PlayTarget::Media(MediaRef::Channel(ch0)), from_start: false, show: AgentShow::window(true) };
+        let play = AgentPlay { target: PlayTarget::Media(MediaRef::Channel(ch0)), from_start: false, show: AgentShow::window(true), device: None };
         rig.event(AppEvent::Agent(AgentCommand::Play(play)));
         rig.frame_with(vec![]);
         assert_eq!(rig.overlay_kinds(), [pin_prompt()]);
@@ -5014,6 +5017,7 @@ mod tests {
             target: PlayTarget::Media(MediaRef::Channel(ch1)),
             from_start: false,
             show: crate::agent::act::AgentShow::window(true),
+            device: None,
         })));
         rig.frame_with(vec![]);
         assert!(played(&rig.log()).is_empty(), "the PIN first");
@@ -5052,6 +5056,7 @@ mod tests {
             target: crate::agent::PlayTarget::Media(MediaRef::Movie(id)),
             from_start: false,
             show: crate::agent::act::AgentShow::window(true),
+            device: None,
         };
         rig.event(AppEvent::Agent(crate::agent::AgentCommand::Play(play)));
         rig.frame_with(vec![]);

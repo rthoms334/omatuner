@@ -376,6 +376,7 @@ impl Engine {
             main_kind: main_kind(&self.last),
             queue_running: true,
             follow_interrupt_vod: self.config().follow.interrupt_vod,
+            casting: self.last.cast.is_some(),
         };
         let intent = PlayIntent { source: PlaySource::Queue, kind, live_channel };
         matches!(crate::playback::route(&intent, &st, &self.shared.guard(), now()), Route::Tile { tile: crate::model::TileId::A, .. })
