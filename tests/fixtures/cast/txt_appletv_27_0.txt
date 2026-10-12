@@ -1,0 +1,20 @@
+# _airplay._tcp TXT record of "Living Room" (AppleTV14,1, tvOS 27.0 after an auto-update),
+# captured on the LAN with avahi-browse on 2026-10-12. Identifiers scrubbed (deviceid, btaddr,
+# gid, pi, psi, pk); pi matches info_appletv_26_6.plist. One key=value per line, in wire order.
+acl=0
+btaddr=02:00:00:00:02:05
+deviceid=02:00:00:00:00:05
+fex=1d9/St5fFzw4oY7cDg
+features=0x4A7FDFD5,0x3C175FDE
+flags=0x18644
+gid=00000000-0000-4000-8000-000000000205
+igl=1
+gcgl=1
+model=AppleTV14,1
+protovers=1.1
+pi=00000000-0000-4000-8000-000000000005
+psi=00000000-0000-4000-8000-000000000105
+pk=1111111111111111111111111111111111111111111111111111111111111111
+srcvers=980.77.2
+osvers=27.0
+vv=1
