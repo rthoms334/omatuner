@@ -72,7 +72,7 @@ pub struct QueueItemOut {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub by_claude: bool,
+    pub by_agent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -123,7 +123,7 @@ pub fn list_out(s: &QueueSnapshot, include_played: bool) -> QueueListOut {
                     end: fmt_time(p.stop),
                 }),
                 note: r.note.clone(),
-                by_claude: e.by_agent,
+                by_agent: e.by_agent,
             }
         })
         .collect();

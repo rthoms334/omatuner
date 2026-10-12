@@ -10,9 +10,9 @@
 //!   `Action::UndoGuideFix` arm can call [`submit_undo`] too (a toast's Undo off the screen).
 //! * [`to_fix`]: "Fix guide data… (N to fix)" for Settings ▸ EPG, cached per library build.
 //! * Item menus: "Time shift…" on a channel opens Guide fixes on it with Adjust focused.
-//! * [`offer_review`] / [`take_review`]: a batch of Claude's over 50 channels
+//! * [`offer_review`] / [`take_review`]: an agent's batch over 50 channels
 //!   (`AgentCommand::GuideFixReview`) waits here for the Guide fixes screen, which opens its
-//!   confirm card prefilled; Enter applies it as Claude's batch ([`claude_label`]).
+//!   confirm card prefilled; Enter applies it as that agent's batch ([`agent_label`]).
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -22,7 +22,7 @@ use super::issues::{ClassifyOpts, IssueReport, classify};
 use crate::error::Result;
 use crate::jobs::JobKind;
 use crate::keymap::{Action, KeyContext};
-use crate::model::{ChannelId, EpgMatchMethod, FixActor, GuideFixLogId, GuideRules, IssueKind, Proposal, SourceId, Timestamp};
+use crate::model::{AgentName, ChannelId, EpgMatchMethod, FixActor, GuideFixLogId, GuideRules, IssueKind, Proposal, SourceId, Timestamp};
 use crate::msg::{DataScope, Toast, ToastKind};
 use crate::services::Services;
 use crate::store::Ticket;
@@ -188,28 +188,30 @@ fn undo_toast(text: String, log: GuideFixLogId) -> Toast {
     Toast { kind: ToastKind::Info, text, action: Some(("Undo".into(), Action::UndoGuideFix(Some(log)))), ttl_ms: UNDO_TTL_MS }
 }
 
-/// "Claude fixed the guide for 140 channels" (a batch of Claude's, applied from chat or from
-/// the confirm card).
-pub fn claude_fixed_text(n: usize) -> String {
-    format!("Claude fixed the guide for {} channel{}", crate::ui::widgets::rows::grouped(n), if n == 1 { "" } else { "s" })
+/// "Codex fixed the guide for 140 channels" (an agent's batch, applied from chat or from the
+/// confirm card; "Your agent…" when it didn't say who it is).
+pub fn agent_fixed_text(agent: &AgentName, n: usize) -> String {
+    format!("{} fixed the guide for {} channel{}", agent.subject(), crate::ui::widgets::rows::grouped(n), if n == 1 { "" } else { "s" })
 }
 
-/// The toast of a batch Claude applied from chat (`None`: nothing changed).
-pub fn claude_toast(r: &ApplyReport) -> Option<Toast> {
-    r.log.map(|log| undo_toast(applied_text(&claude_fixed_text(r.applied), r), log))
+/// The toast of a batch an agent applied from chat (`None`: nothing changed).
+pub fn agent_toast(agent: &AgentName, r: &ApplyReport) -> Option<Toast> {
+    r.log.map(|log| undo_toast(applied_text(&agent_fixed_text(agent, r.applied), r), log))
 }
 
-/// What the log calls a batch of Claude's.
-pub fn claude_label(n: usize) -> String {
-    format!("Claude: {n} channel{}", if n == 1 { "" } else { "s" })
+/// What the log calls an agent's batch ("Codex: 55 channels"; stored, so it keeps the name).
+pub fn agent_label(agent: &AgentName, n: usize) -> String {
+    format!("{}: {n} channel{}", agent.subject(), if n == 1 { "" } else { "s" })
 }
 
-/// Apply `p` as one logged batch of `actor`'s (`label` goes in the log, `toast` on screen).
-/// The toast offers Undo; Following re-evaluates after a mapping change (B7). A proposal bound
-/// to an older guide check (Claude's, `store::guide_fix::STALE`) applies nothing and says so.
+/// Apply `p` as one logged batch of `actor`'s (`agent`: which one, for an agent's; `label` goes
+/// in the log, `toast` on screen). The toast offers Undo; Following re-evaluates after a mapping
+/// change (B7). A proposal bound to an older guide check (an agent's, `store::guide_fix::STALE`)
+/// applies nothing and says so.
 pub fn submit_apply(
     services: &Services,
     actor: FixActor,
+    agent: AgentName,
     label: String,
     toast: String,
     p: Proposal,
@@ -218,10 +220,10 @@ pub fn submit_apply(
 ) -> Ticket<ApplyReport> {
     let (bus, jobs) = (services.bus.clone(), services.jobs.clone());
     services.store.writer().submit_notify(DataScope::Epg, move |c| {
-        let r = match crate::store::guide_fix::apply(c, actor, &label, &p, &opts, now) {
+        let r = match crate::store::guide_fix::apply(c, actor, &agent, &label, &p, &opts, now) {
             Ok(r) => r,
             Err(crate::error::Error::Other(m)) if m == crate::store::guide_fix::STALE => {
-                let again = if actor == FixActor::Claude { "ask Claude to propose them again" } else { "try again" };
+                let again = if actor == FixActor::Agent { format!("ask {} to propose them again", agent.name()) } else { "try again".into() };
                 bus.toast(Toast::info(format!("The guide data changed since these fixes were proposed — nothing changed; {again}")));
                 return Ok(ApplyReport::default());
             }
@@ -338,22 +340,22 @@ pub(crate) fn take_focus_adjust() -> bool {
     FOCUS_ADJUST.with(|f| f.replace(false))
 }
 
-// ------------------------------------------------------------------ Claude's big batches
+// ------------------------------------------------------------------ an agent's big batches
 
 thread_local! {
-    /// A batch of Claude's too big to apply from chat, waiting for the Guide fixes screen to
+    /// An agent's batch too big to apply from chat, waiting for the Guide fixes screen to
     /// open its confirm card (the app sets it on `AgentCommand::GuideFixReview`; the UI is one
     /// thread). A newer one replaces it.
     static REVIEW: RefCell<Option<crate::agent::GuideFixReview>> = const { RefCell::new(None) };
 }
 
-/// Hand Claude's batch to the Guide fixes screen (the app opens the screen). True when it
+/// Hand an agent's batch to the Guide fixes screen (the app opens the screen). True when it
 /// replaced an earlier batch still waiting for its card (the app says so).
 pub(crate) fn offer_review(r: crate::agent::GuideFixReview) -> bool {
     REVIEW.with(|s| s.borrow_mut().replace(r).is_some())
 }
 
-/// Claude's batch for the confirm card (once).
+/// The agent's batch for the confirm card (once).
 pub(crate) fn take_review() -> Option<crate::agent::GuideFixReview> {
     REVIEW.with(|s| s.borrow_mut().take())
 }

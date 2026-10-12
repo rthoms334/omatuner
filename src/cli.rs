@@ -83,9 +83,10 @@ impl Cli {
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Command {
-    /// Serve the Model Context Protocol on stdin/stdout so an AI assistant (Claude Code:
-    /// `claude mcp add tuner -- tuner mcp`) can search the guide and your library and play
-    /// things in the running Tuner — starting it when needed (DESIGN §30).
+    /// Serve the Model Context Protocol on stdin/stdout so an AI agent (any MCP client: Claude
+    /// Code, Codex, Gemini CLI, Cursor…; e.g. `claude mcp add tuner -- tuner mcp`) can search the
+    /// guide and your library and play things in the running Tuner — starting it when needed
+    /// (DESIGN §30).
     Mcp,
     /// Show how to connect Claude Code to Tuner (the omatuner plugin: the MCP server and its
     /// skills). `--apply` runs the plugin steps after asking on the terminal.

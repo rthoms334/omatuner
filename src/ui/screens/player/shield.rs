@@ -235,7 +235,7 @@ impl PlayerScreen {
             s.drawn_pass = Some(pass);
             // multi-view opened or closed under the card: it goes, its picture plays again
             let mode = s.card.is_some() && s.tile.is_some() != ctx.multiview.on();
-            // something else plays now in its picture (a choice in Live, Claude, a reminder)
+            // something else plays now in its picture (a choice in Live, an agent, a reminder)
             let under_now = match s.tile {
                 Some(t) => ctx.multiview.snap(t).and_then(|p| playing_channel(p)),
                 None => playing_channel(snap),

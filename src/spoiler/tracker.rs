@@ -115,6 +115,7 @@ impl Tracker {
             episode: w.season_episode.map(|s| s.1),
             seen_at: now,
             how,
+            agent: Default::default(),
         })
     }
 }

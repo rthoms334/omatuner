@@ -35,7 +35,7 @@ use crate::store::sql::{self, atomic, enum_parse, enum_str, from_json_opt};
 /// Logs kept: 90 days or 200 batches.
 pub const LOG_KEEP_S: i64 = 90 * 86_400;
 pub const LOG_KEEP_N: usize = 200;
-/// Channel changes one batch from Claude may hold (50 on "yes", more opens the confirm card).
+/// Channel changes one batch from an agent may hold (50 on "yes", more opens the confirm card).
 pub const MAX_BATCH: usize = 200;
 /// The error text of a proposal made before the guides, playlists or rules changed.
 pub const STALE: &str = "stale: the guide data changed since this was proposed";
@@ -634,6 +634,8 @@ pub struct LogEntry {
     pub id: GuideFixLogId,
     pub at: Timestamp,
     pub actor: FixActor,
+    /// Which agent, when `actor` is `Agent` (unknown = "your agent").
+    pub agent: crate::model::AgentName,
     pub label: String,
     pub n: usize,
     pub undone_at: Option<Timestamp>,
@@ -652,7 +654,7 @@ pub struct LoggedChange {
 
 /// The newest batches first.
 pub fn recent(conn: &Connection, limit: usize) -> Result<Vec<LogEntry>> {
-    let mut stmt = conn.prepare_cached("SELECT id, at, actor, label, n, undone_at FROM guide_fix_log ORDER BY id DESC LIMIT ?1")?;
+    let mut stmt = conn.prepare_cached("SELECT id, at, actor, label, n, undone_at, agent FROM guide_fix_log ORDER BY id DESC LIMIT ?1")?;
     let rows = stmt.query_map([limit as i64], |r| {
         Ok(LogEntry {
             id: r.get(0)?,
@@ -661,6 +663,7 @@ pub fn recent(conn: &Connection, limit: usize) -> Result<Vec<LogEntry>> {
             label: r.get(3)?,
             n: r.get::<_, i64>(4)?.max(0) as usize,
             undone_at: r.get(5)?,
+            agent: crate::model::AgentName::from(r.get::<_, Option<String>>(6)?),
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -812,18 +815,27 @@ fn log_change(
 }
 
 /// Apply a proposal as one logged batch. A proposal carrying a stamp (`Proposal::stamp` ≠ 0)
-/// must match [`stamp`] now, else it is [`STALE`]; Claude's batches hold at most
-/// [`MAX_BATCH`] channel changes. Changes to channels that no longer exist are skipped and
-/// named. Rule changes re-derive the rule rows in the same transaction.
-pub fn apply(conn: &Connection, actor: FixActor, label: &str, p: &Proposal, opts: &GuideOpts, now: Timestamp) -> Result<ApplyReport> {
+/// must match [`stamp`] now, else it is [`STALE`]; an agent's batches (named `agent` in the log)
+/// hold at most [`MAX_BATCH`] channel changes. Changes to channels that no longer exist are
+/// skipped and named. Rule changes re-derive the rule rows in the same transaction.
+pub fn apply(
+    conn: &Connection,
+    actor: FixActor,
+    agent: &crate::model::AgentName,
+    label: &str,
+    p: &Proposal,
+    opts: &GuideOpts,
+    now: Timestamp,
+) -> Result<ApplyReport> {
     if p.stamp != [0; 16] && p.stamp != stamp(conn, opts)? {
         return Err(Error::Other(STALE.into()));
     }
-    if actor == FixActor::Claude && p.changes.len() > MAX_BATCH {
+    if actor == FixActor::Agent && p.changes.len() > MAX_BATCH {
         return Err(Error::Other(format!("too many changes in one batch ({} > {MAX_BATCH})", p.changes.len())));
     }
     atomic(conn, |c| {
-        c.execute("INSERT INTO guide_fix_log(at, actor, label, n) VALUES (?1, ?2, ?3, 0)", params![now, enum_str(&actor), label])?;
+        let agent = (actor == FixActor::Agent).then(|| agent.stored()).flatten();
+        c.execute("INSERT INTO guide_fix_log(at, actor, label, n, agent) VALUES (?1, ?2, ?3, 0, ?4)", params![now, enum_str(&actor), label, agent])?;
         let log = GuideFixLogId(c.last_insert_rowid());
         let mut report = ApplyReport::default();
         for ch in &p.changes {

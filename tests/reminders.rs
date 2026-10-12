@@ -216,6 +216,7 @@ fn closed_tuner_fires_by_mode() {
             shield: true,
             enabled: true,
             by_agent: false,
+            agent: Default::default(),
             created_at: 0,
         };
         tuner::store::spoiler::add_rule(c, &rule, now).map(drop)

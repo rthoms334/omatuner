@@ -2,10 +2,10 @@
 //! track.
 //!
 //! preview → show → confirm → add (the skill's rule: always preview, one rule per add, switch
-//! mode only when the user asked). Rules Claude makes are marked (`by_agent`, Settings shows
-//! them), capped at 10 an hour and 20 in all. Previews never look at explicit or hidden
-//! channels (`follow::plan::Pool`); a spoiler-safe rule's matches show only the rule's name,
-//! the time and the channel.
+//! mode only when the user asked). Rules an agent makes are marked with its name (`by_agent`,
+//! Settings shows "by Codex"), capped at 10 an hour and 20 in all. Previews never look at
+//! explicit or hidden channels (`follow::plan::Pool`); a spoiler-safe rule's matches show only
+//! the rule's name, the time and the channel.
 
 use std::sync::Arc;
 
@@ -22,7 +22,7 @@ use crate::follow::{Airings, ChannelScope, FollowKind, FollowMode, FollowRule};
 use crate::model::FollowRuleId;
 use crate::msg::DataScope;
 
-/// Rules Claude may add in an hour, and in all.
+/// Rules agents may add in an hour, and in all (every agent together: names are display only).
 pub const AGENT_RULES_PER_HOUR: usize = 10;
 pub const AGENT_RULES_MAX: usize = 20;
 /// Terms (names and aliases) a rule takes at most.
@@ -75,7 +75,7 @@ pub struct RuleOut {
     pub spoiler_safe: bool,
     pub enabled: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub by_claude: bool,
+    pub by_agent: bool,
     /// List rules: the next few matches.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub next: Vec<MatchOut>,
@@ -110,7 +110,7 @@ fn rule_out(r: &FollowRule) -> RuleOut {
         without: r.spec.without.iter().map(|t| clean(t)).collect(),
         spoiler_safe: r.spoiler_safe,
         enabled: r.enabled,
-        by_claude: r.by_agent,
+        by_agent: r.by_agent,
         next: Vec::new(),
     }
 }
@@ -151,7 +151,7 @@ fn words(field: &str, v: &[String]) -> Out<Vec<String>> {
     v.iter().map(|t| text(field, t).map(str::to_owned)).collect()
 }
 
-/// A rule from Claude's description (`id` 0 unless replacing).
+/// A rule from the agent's description (`id` 0 unless replacing).
 pub fn rule_from_input(q: &Q, i: &FollowRuleInput) -> Out<FollowRule> {
     let name = text("rule.name", &i.name)?;
     let kind = match i.kind.as_str() {
@@ -328,7 +328,7 @@ fn list(q: &Q) -> Out<Value> {
     Ok(json!({ "rules": out }))
 }
 
-pub(super) async fn handle(h: &Arc<Inner>, p: Follow) -> Out<Value> {
+pub(super) async fn handle(h: &Arc<Inner>, p: Follow, who: &crate::model::AgentName) -> Out<Value> {
     match p.action {
         FollowAction::Preview => {
             let out = h.run(true, move |q| preview(q, &p)).await?;
@@ -338,16 +338,19 @@ pub(super) async fn handle(h: &Arc<Inner>, p: Follow) -> Out<Value> {
         FollowAction::Add => {
             let input = p.rule.clone().ok_or_else(|| Fail::bad("add needs rule"))?;
             let replace = p.replace_id;
+            let who = who.clone();
             let (rule, would) = h
                 .run(true, move |q| {
                     let mut rule = rule_from_input(q, &input)?;
+                    rule.agent = who;
                     if let Some(id) = replace {
                         let old = saved_rule(q, id)?;
-                        // Claude never loosens the user's guard
+                        // an agent never loosens the user's guard
                         if old.spoiler_safe && !rule.spoiler_safe {
                             return Err(Fail::bad("that rule is spoiler-safe; only the user can turn that off in Tuner ▸ Settings ▸ Following"));
                         }
                         rule.by_agent = old.by_agent;
+                        rule.agent = old.agent;
                         rule.id = old.id;
                         rule.priority = old.priority;
                         rule.created_at = old.created_at;
@@ -372,7 +375,7 @@ pub(super) async fn handle(h: &Arc<Inner>, p: Follow) -> Out<Value> {
                     let (hour, all) = crate::store::follow::agent_rule_counts(c, now - 3600)?;
                     if to_save.id.0 == 0 && (hour >= AGENT_RULES_PER_HOUR || all >= AGENT_RULES_MAX) {
                         return Ok(Err(format!(
-                            "Claude may add {AGENT_RULES_PER_HOUR} rules an hour and {AGENT_RULES_MAX} in all; the user can add more in Tuner"
+                            "agents may add {AGENT_RULES_PER_HOUR} rules an hour and {AGENT_RULES_MAX} in all; the user can add more in Tuner"
                         )));
                     }
                     Ok(Ok(crate::store::follow::save_rule(c, &to_save, max_rules, now)?))
@@ -385,12 +388,12 @@ pub(super) async fn handle(h: &Arc<Inner>, p: Follow) -> Out<Value> {
             if rule.id.0 == 0 {
                 let name = clean(&rule.name);
                 let reminders = if would == 1 { "1 reminder".to_owned() } else { format!("{would} reminders") };
-                let mut toast = crate::msg::Toast::info(format!("Claude added {name} · {reminders}"));
+                let mut toast = crate::msg::Toast::info(format!("{} added {name} · {reminders}", rule.agent.subject()));
                 toast.action = Some(("Undo".into(), crate::keymap::Action::UndoFollow(id)));
                 h.bus.toast(toast);
             }
             let mut out = rule_out(&FollowRule { id, ..rule });
-            out.by_claude = true;
+            out.by_agent = true;
             to_value(&json!({ "rule": out, "reminders_to_set": would, "message": "Tuner checks the guide for this after every refresh." }))
         }
         FollowAction::Remove => {

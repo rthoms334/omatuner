@@ -5,10 +5,10 @@
 //! lives 10 minutes and is bound to the guide check it was made from (applied after a guide
 //! import it is `stale`); more than 50 channels aren't applied from chat (`pending_review`: the
 //! proposal goes to Tuner, `AgentCommand::GuideFixReview`, which opens Guide fixes with its
-//! confirm card prefilled, and the user's Enter there applies it as Claude's batch); channels
-//! needing the PIN now are refused; explicit and hidden channels don't exist here. Claude undoes
-//! only its own batches. Guide channels are named by `guide:<guide id>:<xmltv id>` refs, never
-//! by an address.
+//! confirm card prefilled, and the user's Enter there applies it as the agent's batch); channels
+//! needing the PIN now are refused; explicit and hidden channels don't exist here. An agent
+//! undoes only agents' batches, never the user's. Guide channels are named by
+//! `guide:<guide id>:<xmltv id>` refs, never by an address.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,7 +35,7 @@ use crate::store::guide_fix::GuideOpts;
 pub const PROPOSAL_TTL_S: i64 = 600;
 /// Proposals kept at once (the oldest goes).
 const LIVE_PROPOSALS: usize = 5;
-/// Channels Claude applies on a "yes"; more go to Tuner's confirm card (the user's Enter).
+/// Channels an agent applies on a "yes"; more go to Tuner's confirm card (the user's Enter).
 pub const CHAT_APPLY_MAX: usize = 50;
 
 /// `propose`'s proposals until applied or expired (in the handler).
@@ -405,7 +405,7 @@ fn propose(q: &Q, p: &GuideFix) -> Out<Proposed> {
     Ok(Proposed { proposal, channels, rejected })
 }
 
-/// What `apply` / `undo` skipped, as Claude can name it: the proposal's ref of that channel and
+/// What `apply` / `undo` skipped, as the agent can name it: the proposal's ref of that channel and
 /// its name when it still shows (the store reports bare channel keys). Concealed ones are left
 /// out.
 fn skipped_out(q: &Q, skipped: &[(String, String)], known: &[ItemRef]) -> Vec<Value> {
@@ -470,7 +470,7 @@ fn proposal_out(q: &Q, pr: &Proposed, id: &str, expires: Timestamp) -> Out<Value
     }))
 }
 
-pub(super) async fn handle(h: &Arc<Inner>, p: GuideFix) -> Out<Value> {
+pub(super) async fn handle(h: &Arc<Inner>, p: GuideFix, who: &crate::model::AgentName) -> Out<Value> {
     match p.action {
         GuideFixAction::Issues => h.run(true, move |q| issues(q, &p)).await,
         GuideFixAction::Propose => {
@@ -492,20 +492,25 @@ pub(super) async fn handle(h: &Arc<Inner>, p: GuideFix) -> Out<Value> {
             if channels > CHAT_APPLY_MAX {
                 // Tuner's confirm card takes it from here (applied there or not at all)
                 h.proposals.take(&id);
-                h.bus.send(AppEvent::Agent(AgentCommand::GuideFixReview(GuideFixReview { proposal, expires: now + PROPOSAL_TTL_S })));
+                h.bus.send(AppEvent::Agent(AgentCommand::GuideFixReview(GuideFixReview {
+                    proposal,
+                    expires: now + PROPOSAL_TTL_S,
+                    agent: who.clone(),
+                })));
                 crate::platform::hypr::focus_self();
                 tracing::info!("agent: guide_fix apply → {channels} channels to Tuner's confirm card");
                 return to_value(&json!({
                     "pending_review": true,
                     "channels": channels,
-                    "message": format!("{channels} channels is more than Claude applies from chat, so Tuner now shows them in a confirm card in Guide fixes: the user presses Enter there to apply them, Esc cancels, Ctrl+Z in Guide fixes undoes. Don't apply this proposal again; if they cancel, propose again or a narrower batch."),
+                    "message": format!("{channels} channels is more than an agent may apply from chat, so Tuner now shows them in a confirm card in Guide fixes: the user presses Enter there to apply them, Esc cancels, Ctrl+Z in Guide fixes undoes. Don't apply this proposal again; if they cancel, propose again or a narrower batch."),
                 }));
             }
             let opts = GuideOpts::from_config(&h.cfg());
-            let label = crate::guide_fix::ui::claude_label(channels);
+            let label = crate::guide_fix::ui::agent_label(who, channels);
+            let agent = who.clone();
             let known: Vec<ItemRef> = proposal.changes.iter().filter_map(|c| c.channel.clone()).collect();
             let report = h
-                .write(DataScope::Epg, move |c| match crate::store::guide_fix::apply(c, FixActor::Claude, &label, &proposal, &opts, now) {
+                .write(DataScope::Epg, move |c| match crate::store::guide_fix::apply(c, FixActor::Agent, &agent, &label, &proposal, &opts, now) {
                     Ok(r) => Ok(Ok(r)),
                     Err(crate::error::Error::Other(m)) if m == crate::store::guide_fix::STALE => Ok(Err(m)),
                     Err(e) => Err(e),
@@ -525,7 +530,7 @@ pub(super) async fn handle(h: &Arc<Inner>, p: GuideFix) -> Out<Value> {
             }
             tracing::info!("agent: guide_fix apply → {} channels", report.applied);
             // the user sees it and can take it back at once (as the confirm card's batch does)
-            if let Some(t) = crate::guide_fix::ui::claude_toast(&report) {
+            if let Some(t) = crate::guide_fix::ui::agent_toast(who, &report) {
                 h.bus.toast(t);
             }
             let skipped = report.skipped.clone();
@@ -545,10 +550,11 @@ pub(super) async fn handle(h: &Arc<Inner>, p: GuideFix) -> Out<Value> {
                 })
                 .await?
                 .ok_or_else(|| Fail::not_found("guide fix batch"))?;
-            if entry.actor != FixActor::Claude {
+            // any agent's batch (names are display only), never the user's
+            if entry.actor != FixActor::Agent {
                 return Err(Fail::new(
                     ErrorCode::Unavailable,
-                    "Claude undoes only its own batches; the user can undo theirs in Tuner's Guide fixes (Ctrl+Z)",
+                    "you can undo only batches an agent made; the user undoes theirs in Tuner's Guide fixes (Ctrl+Z)",
                 ));
             }
             if entry.undone_at.is_some() {

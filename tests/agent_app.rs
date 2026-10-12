@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use tuner::agent::guard::Limits;
-use tuner::agent::proto::{Call, ErrorCode, Reply, Request};
+use tuner::agent::proto::{Call, ClientInfo, ErrorCode, Reply, Request};
 use tuner::agent::server::{AgentHandler, AgentService};
 use tuner::agent::{AgentCommand, PlayTarget};
 use tuner::config::Config;
@@ -225,6 +225,8 @@ struct World {
     handler: AgentHandler,
     now: Timestamp,
     next: u64,
+    /// The MCP client the requests come from (`None`: a bridge that doesn't say).
+    agent: Option<ClientInfo>,
 }
 
 impl World {
@@ -239,7 +241,7 @@ impl World {
         let s = ui.services();
         let handler =
             AgentHandler::with_limits(s.agent.clone(), s.store.clone(), s.config.clone(), s.tiles.focused(), s.bus.clone(), s.jobs.clone(), limits);
-        Self { ui, handler, now, next: 1 }
+        Self { ui, handler, now, next: 1, agent: None }
     }
 
     /// Publish a snapshot built with `visibility`, like the app does on every frame.
@@ -256,7 +258,7 @@ impl World {
     fn reply(&mut self, method: &str, params: Value) -> Reply {
         let call = Call::from_tool(method, params).expect("valid arguments");
         self.next += 1;
-        let reply = self.ui.services().rt.block_on(self.handler.handle(Request::new(self.next, call)));
+        let reply = self.ui.services().rt.block_on(self.handler.handle(Request::new(self.next, call).with_agent(self.agent.clone())));
         let wire = serde_json::to_string(&reply).unwrap();
         assert!(!wire.contains("://"), "{method}: an address on the wire: {wire}");
         assert!(!wire.contains("http-header") && !wire.contains("password"), "{method}: {wire}");
@@ -1067,10 +1069,10 @@ fn library_tools_keep_the_parental_rules() {
     assert_eq!((out["locked"].as_u64(), out["already_locked"].as_u64()), (Some(1), Some(1)), "{out}");
     assert!(out["refused"][0]["error"].as_str().unwrap().starts_with("not_lockable"));
     w.publish(Visibility::NO_EXPLICIT);
-    assert_eq!(w.ok("play", json!({ "ref": airplane }))["outcome"], "pin_required", "locked by Claude: the PIN on screen");
+    assert_eq!(w.ok("play", json!({ "ref": airplane }))["outcome"], "pin_required", "locked by the agent: the PIN on screen");
     w.commands();
 
-    // the session: unlocked by the user, locked by Claude on request
+    // the session: unlocked by the user, locked by the agent on request
     w.unlock(Some(Instant::now()));
     let st = w.ok("parental_status", json!({}));
     assert_eq!((st["pin_set"].as_bool(), st["session_unlocked"].as_bool(), st["relock_min"].as_u64()), (Some(true), Some(true), Some(1)));
@@ -1195,7 +1197,7 @@ fn reminders_and_the_sleep_timer() {
     assert!(w.ok("sleep_timer", json!({ "action": "status" }))["set"].is_null());
 }
 
-/// queue: Claude's adds go through the Up next engine, which refuses a locked title ("locked:
+/// queue: an agent's adds go through the Up next engine, which refuses a locked title ("locked:
 /// needs your PIN in Tuner") and an explicit one (not_found); a bare channel has no slot.
 #[test]
 fn the_queue_tool_drives_up_next() {
@@ -1238,10 +1240,11 @@ fn the_queue_tool_drives_up_next() {
 }
 
 /// follow: a preview never looks at explicit channels; a spoiler-safe rule shows only its
-/// name; rules Claude adds are marked and capped at 10 an hour.
+/// name; rules an agent adds are marked with its name and capped at 10 an hour.
 #[test]
 fn follow_rules_preview_add_and_cap() {
     let mut w = World::new(pin_config());
+    w.agent = Some(ClientInfo { name: "codex-mcp-client".into(), title: Some("Codex".into()) });
     w.publish(Visibility::NO_EXPLICIT);
     let rule = json!({ "name": "Touring", "kind": "custom", "terms": ["touring"] });
     let p = w.ok("follow", json!({ "action": "preview", "rule": rule }));
@@ -1262,7 +1265,11 @@ fn follow_rules_preview_add_and_cap() {
 
     let added = w.ok("follow", json!({ "action": "add", "rule": rule }));
     let id = added["rule"]["id"].as_i64().unwrap();
-    assert_eq!(added["rule"]["by_claude"], true);
+    assert_eq!(added["rule"]["by_agent"], true);
+    let toasts: Vec<String> = w.ui.events.try_iter().filter_map(|e| if let AppEvent::Toast(t) = e { Some(t.text) } else { None }).collect();
+    assert!(toasts.iter().any(|t| t.starts_with("Codex added Touring · ")), "{toasts:?}");
+    let stored = tuner::store::follow::rule(&w.ui.services().store.reader().unwrap(), tuner::model::FollowRuleId(id)).unwrap().unwrap();
+    assert!(tuner::follow::ui::rule_summary(&stored).ends_with("by Codex"), "Settings ▸ Following names it");
     let list = w.ok("follow", json!({ "action": "list" }));
     assert_eq!(names(&list, "rules", "name"), ["Touring"]);
     for i in 1..10 {
@@ -1275,7 +1282,7 @@ fn follow_rules_preview_add_and_cap() {
     assert_eq!(w.err("follow", json!({ "action": "remove", "id": id })), ErrorCode::NotFound);
 }
 
-/// spoiler_guard: Claude adds a topic and marks a programme seen (once), removes its rule; a
+/// spoiler_guard: an agent adds a topic and marks a programme seen (once), removes its rule; a
 /// topic blackout needs an end.
 #[test]
 fn the_spoiler_guard_tool() {
@@ -1284,7 +1291,7 @@ fn the_spoiler_guard_tool() {
     let id =
         w.ok("spoiler_guard", json!({ "action": "add_topic", "label": "Touring cars", "terms": ["touring car", "btcc"] }))["id"].as_i64().unwrap();
     let list = w.ok("spoiler_guard", json!({ "action": "list" }));
-    assert_eq!((list["rules"][0]["kind"].as_str(), list["rules"][0]["by_claude"].as_bool()), (Some("topic"), Some(true)));
+    assert_eq!((list["rules"][0]["kind"].as_str(), list["rules"][0]["by_agent"].as_bool()), (Some("topic"), Some(true)));
     let live = programme(&mut w, "british touring");
     assert_eq!(w.ok("spoiler_guard", json!({ "action": "mark_seen", "ref": live }))["marked"], true);
     assert_eq!(w.ok("spoiler_guard", json!({ "action": "mark_seen", "ref": live }))["marked"], false, "seen once");
@@ -1314,7 +1321,7 @@ fn the_spoiler_guard_tool() {
     let rule = list["rules"].as_array().unwrap().iter().find(|r| r["id"] == b).unwrap();
     assert_eq!((rule["label"].as_str(), rule["terms"].clone()), (Some("Arsenal v Chelsea"), json!(["arsenal", "chelsea"])));
     assert_eq!(w.ok("spoiler_guard", json!({ "action": "remove", "id": id }))["removed"], true);
-    // the user's own rule stays theirs: Claude never loosens the guard
+    // the user's own rule stays theirs: an agent never loosens the guard
     use tuner::model::{SpoilerMode, SpoilerRule, SpoilerRuleId, SpoilerRuleKind};
     let mine =
         w.ui.services()
@@ -1335,6 +1342,7 @@ fn the_spoiler_guard_tool() {
                     shield: false,
                     enabled: true,
                     by_agent: false,
+                    agent: Default::default(),
                     created_at: 0,
                 };
                 tuner::store::spoiler::add_rule(c, &r, now)
@@ -1345,7 +1353,7 @@ fn the_spoiler_guard_tool() {
 }
 
 /// guide_fix: propose → apply (only with confirm) → undo; a locked channel is refused while
-/// the session is locked, an explicit one doesn't exist; Claude undoes only its own batches.
+/// the session is locked, an explicit one doesn't exist; an agent undoes only agents' batches.
 #[test]
 fn guide_fixes_round_trip() {
     let mut w = World::new(pin_config());
@@ -1451,7 +1459,7 @@ fn guide_fix_batches_over_50_go_to_tuners_confirm_card() {
         })
         .collect();
     assert!(
-        toasts.iter().any(|t| t.text == "Claude fixed the guide for 50 channels"
+        toasts.iter().any(|t| t.text == "Your agent fixed the guide for 50 channels"
             && t.action == Some(("Undo".into(), tuner::keymap::Action::UndoGuideFix(Some(undo))))),
         "{toasts:?}"
     );

@@ -489,7 +489,7 @@ impl TunerApp {
             AppEvent::Ipc(req) => self.handle_ipc(req),
             // the handler raised the window (`hypr::focus_self`) and validated the target
             AppEvent::Agent(crate::agent::AgentCommand::Play(p)) => self.on_agent_play(p.clone()),
-            // `lock session_now`: Claude can only ever lock (the handler's view locked already)
+            // `lock session_now`: an agent can only ever lock (the handler's view locked already)
             AppEvent::Agent(crate::agent::AgentCommand::LockSession) => self.parental.lock(),
             // `control popout`: the pop-out never takes the keyboard
             AppEvent::Agent(crate::agent::AgentCommand::PopOut) => {
@@ -498,11 +498,11 @@ impl TunerApp {
                 }
             }
             AppEvent::Agent(crate::agent::AgentCommand::MultiView(r)) => self.on_agent_multiview(r),
-            // Claude's batch over 50 channels: Guide fixes with its confirm card prefilled (the
+            // an agent's batch over 50 channels: Guide fixes with its confirm card prefilled (the
             // handler raised the window); Enter applies it, Esc drops it
             AppEvent::Agent(crate::agent::AgentCommand::GuideFixReview(r)) => {
                 if crate::guide_fix::ui::offer_review(r.clone()) {
-                    self.toast(Toast::info("Claude's earlier guide fixes were replaced by its newer ones"));
+                    self.toast(Toast::info(format!("{} newer guide fixes replaced the earlier ones", r.agent.subject_possessive())));
                 }
                 if self.popout.is_out() || self.video_only {
                     self.toggle_popout(egui_ctx);
@@ -4064,7 +4064,7 @@ mod tests {
         let id = rig.app.lib.live.by_ref(&explicit_ref()).unwrap();
         rig.app.log.borrow_mut().jobs.clear();
         rig.app.log.borrow_mut().commands.clear();
-        // Claude's `lock session_now` (the user's own relock takes the same path from here)
+        // an agent's `lock session_now` (the user's own relock takes the same path from here)
         rig.event(AppEvent::Agent(crate::agent::AgentCommand::LockSession));
         assert!(!rig.app.parental.is_unlocked(&rig.app.services().config().parental));
         let playable = crate::model::Playable {
@@ -4324,13 +4324,13 @@ mod tests {
         assert_eq!(rig.route(), &Route::Player);
     }
 
-    /// DESIGN §31.5 end to end: Claude's `guide_fix apply` of more than 50 channels writes
+    /// DESIGN §31.5 end to end: an agent's `guide_fix apply` of more than 50 channels writes
     /// nothing from chat; Tuner opens Guide fixes with the confirm card prefilled, the user's
-    /// Enter applies it as Claude's batch (its toast offers Undo), and Esc on a second one
-    /// leaves everything as it was.
+    /// Enter applies it as that agent's batch, named as its MCP client said (its toast offers
+    /// Undo), and Esc on a second one leaves everything as it was.
     #[test]
-    fn claude_guide_fixes_over_50_channels_wait_for_enter_in_the_confirm_card() {
-        use crate::agent::proto::{Call, Request};
+    fn agent_guide_fixes_over_50_channels_wait_for_enter_in_the_confirm_card() {
+        use crate::agent::proto::{Call, ClientInfo, Request};
         use crate::agent::server::{AgentHandler, AgentService};
         let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_channels(c, 60, None));
         rig.settle();
@@ -4338,7 +4338,9 @@ mod tests {
         let s = rig.app.services();
         let handler = AgentHandler::new(s.agent.clone(), s.store.clone(), s.config.clone(), s.tiles.focused(), s.bus.clone(), s.jobs.clone());
         let tool = |rig: &Rig, args: serde_json::Value| {
-            let reply = rig.app.services().rt.block_on(handler.handle(Request::new(1, Call::from_tool("guide_fix", args).unwrap())));
+            let codex = ClientInfo { name: "codex-mcp-client".into(), title: Some("Codex".into()) };
+            let req = Request::new(1, Call::from_tool("guide_fix", args).unwrap()).with_agent(Some(codex));
+            let reply = rig.app.services().rt.block_on(handler.handle(req));
             assert!(reply.ok, "{reply:?}");
             reply.result.unwrap()
         };
@@ -4363,20 +4365,21 @@ mod tests {
         assert!(out.get("applied").is_none() && batches(&rig).is_empty(), "nothing is applied from chat");
         rig.until("Guide fixes with the confirm card", |r| r.route().screen() == ScreenId::EpgMapping && r.overlay_kinds() == [confirm]);
         let shown = texts(&rig.frame_with(vec![]));
-        assert!(shown.iter().any(|(t, _, _)| t == "Accept Claude's 55 fixes?"), "the card's title: {shown:?}");
-        assert!(shown.iter().any(|(t, _, _)| t.contains("Claude proposed these in chat") && t.contains("55 time shifts")), "{shown:?}");
+        assert!(shown.iter().any(|(t, _, _)| t == "Accept Codex's 55 fixes?"), "the card's title: {shown:?}");
+        assert!(shown.iter().any(|(t, _, _)| t.contains("Codex proposed these in chat") && t.contains("55 time shifts")), "{shown:?}");
         assert!(button(&shown, "Accept 55").is_some(), "the card's button: {shown:?}");
 
         rig.press(Key::Enter, NONE);
         assert!(rig.app.overlays.is_empty(), "Enter confirms");
-        rig.until("Claude's batch", |r| !batches(r).is_empty());
+        rig.until("Codex's batch", |r| !batches(r).is_empty());
         let b = batches(&rig);
-        assert_eq!((b.len(), b[0].actor, b[0].label.as_str(), b[0].n), (1, crate::model::FixActor::Claude, "Claude: 55 channels", 55));
+        assert_eq!((b.len(), b[0].actor, b[0].label.as_str(), b[0].n), (1, crate::model::FixActor::Agent, "Codex: 55 channels", 55));
+        assert_eq!(b[0].agent.name(), "Codex", "Recent changes names it");
         rig.until("its toast", |r| {
             r.log()
                 .toasts
                 .iter()
-                .any(|t| t.text == "Claude fixed the guide for 55 channels" && t.action == Some(("Undo".into(), Action::UndoGuideFix(Some(b[0].id)))))
+                .any(|t| t.text == "Codex fixed the guide for 55 channels" && t.action == Some(("Undo".into(), Action::UndoGuideFix(Some(b[0].id)))))
         });
         let shifts = crate::store::guide_fix::facts(
             &rig.app.services().store.reader().unwrap(),
@@ -4411,7 +4414,7 @@ mod tests {
             .unwrap();
         rig.press(Key::Enter, NONE);
         rig.until("the stale toast", |r| r.log().toasts.iter().any(|t| t.text.starts_with("The guide data changed since these fixes were proposed")));
-        assert!(rig.log().toasts.iter().any(|t| t.text.ends_with("ask Claude to propose them again")));
+        assert!(rig.log().toasts.iter().any(|t| t.text.ends_with("ask Codex to propose them again")));
         assert_eq!(batches(&rig).len(), 1, "a stale batch applies nothing");
     }
 

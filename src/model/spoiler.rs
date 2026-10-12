@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{SpoilerRuleId, Timestamp};
+use super::{AgentName, SpoilerRuleId, Timestamp};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -39,6 +39,10 @@ pub struct SpoilerRule {
     /// `false` on a series row = "don't guard" (the user's exception).
     pub enabled: bool,
     pub by_agent: bool,
+    /// Which agent, when `by_agent` ("added by Codex"); absent in backups from before names =
+    /// Claude's (`null` = unknown).
+    #[serde(default = "AgentName::before_names")]
+    pub agent: AgentName,
     pub created_at: Timestamp,
 }
 
@@ -69,6 +73,9 @@ pub struct SeenRow {
     pub episode: Option<i32>,
     pub seen_at: Timestamp,
     pub how: SeenHow,
+    /// Which agent, when `how` is `Agent` ("marked seen by Codex"); as [`SpoilerRule::agent`].
+    #[serde(default = "AgentName::before_names")]
+    pub agent: AgentName,
 }
 
 /// Airings of one event key this close to a seen row's `first_start` are the same event.

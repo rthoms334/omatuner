@@ -14,15 +14,19 @@
 //! "<code>: <message>"}], isError: true}`. An unknown tool name is a JSON-RPC `-32602`, as the
 //! MCP spec shows it.
 //!
-//! stdout carries only protocol lines; logging goes to stderr (Claude Code keeps it in its MCP
-//! log) at WARN, or DEBUG with `--debug` — never to `tuner.log`, which the running app owns.
+//! `initialize` records the client's `clientInfo` (name, title), sent with every call so Tuner can
+//! name the agent that made a change (DESIGN §30.12).
+//!
+//! stdout carries only protocol lines; logging goes to stderr (MCP clients such as Claude Code
+//! keep it in their MCP log) at WARN, or DEBUG with `--debug` — never to `tuner.log`, which the
+//! running app owns.
 
 use std::io::{BufRead, Write};
 
 use serde_json::{Value, json};
 
 use super::client::{Client, ClientError, ExeLauncher};
-use super::proto::{Call, ErrorCode};
+use super::proto::{Call, ClientInfo, ErrorCode};
 use super::tools::{self, PROTOCOL_VERSIONS};
 
 /// Largest JSON-RPC message line read from the client.
@@ -32,6 +36,16 @@ const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
+
+/// Longest client name or title passed on (Tuner sanitises it again and keeps 32 chars).
+const MAX_CLIENT_TEXT: usize = 64;
+
+/// What one stdio session knows about its client.
+#[derive(Debug, Default)]
+struct Session {
+    /// `initialize.clientInfo`; `None` before it, or when it was malformed.
+    agent: Option<ClientInfo>,
+}
 
 /// `tuner mcp [--profile-dir DIR] [--debug]`: serve stdin/stdout until stdin closes.
 pub fn main(paths: &crate::paths::AppPaths, profile_dir: Option<&std::path::Path>, debug: bool) -> anyhow::Result<()> {
@@ -71,6 +85,7 @@ fn init_stderr_logging(debug: bool) {
 /// The protocol loop over any reader/writer (tests drive it with in-memory pipes).
 pub fn serve(mut input: impl BufRead, mut output: impl Write, client: &Client) -> std::io::Result<()> {
     let mut buf = Vec::new();
+    let mut session = Session::default();
     loop {
         let line = match read_message(&mut input, &mut buf)? {
             None => return Ok(()),
@@ -78,7 +93,7 @@ pub fn serve(mut input: impl BufRead, mut output: impl Write, client: &Client) -
                 tracing::warn!("mcp: refused a message over {MAX_MESSAGE} bytes");
                 Some(error(Value::Null, INVALID_REQUEST, "message too large"))
             }
-            Some(Line::Text) => handle_line(&buf, client),
+            Some(Line::Text) => handle_line(&buf, client, &mut session),
         };
         if let Some(reply) = line {
             let mut out = serde_json::to_vec(&reply).map_err(std::io::Error::other)?;
@@ -142,7 +157,7 @@ fn error(id: Value, code: i64, message: &str) -> Value {
 }
 
 /// One message → its response (`None` for notifications, responses and blank lines).
-fn handle_line(line: &[u8], client: &Client) -> Option<Value> {
+fn handle_line(line: &[u8], client: &Client, session: &mut Session) -> Option<Value> {
     if line.iter().all(u8::is_ascii_whitespace) {
         return None;
     }
@@ -172,10 +187,10 @@ fn handle_line(line: &[u8], client: &Client) -> Option<Value> {
     }
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
     Some(match method {
-        "initialize" => response(id, initialize(&params)),
+        "initialize" => response(id, initialize(&params, session)),
         "ping" => response(id, json!({})),
         "tools/list" => response(id, json!({ "tools": tools::tools().iter().map(tools::ToolDef::to_json).collect::<Vec<_>>() })),
-        "tools/call" => match tools_call(&params, client) {
+        "tools/call" => match tools_call(&params, client, session) {
             Ok(result) => response(id, result),
             Err(message) => error(id, INVALID_PARAMS, &message),
         },
@@ -183,11 +198,15 @@ fn handle_line(line: &[u8], client: &Client) -> Option<Value> {
     })
 }
 
-/// `initialize`: the client's protocol version when we speak it, else our newest.
-fn initialize(params: &Value) -> Value {
+/// `initialize`: the client's protocol version when we speak it, else our newest; records who
+/// the client says it is (a second `initialize` replaces it).
+fn initialize(params: &Value, session: &mut Session) -> Value {
     let asked = params.get("protocolVersion").and_then(Value::as_str);
     let version = asked.and_then(|v| PROTOCOL_VERSIONS.iter().find(|&&ours| ours == v)).copied().unwrap_or(PROTOCOL_VERSIONS[0]);
-    tracing::debug!("mcp: initialize (client asked {asked:?}, using {version})");
+    let info = params.get("clientInfo");
+    let text = |key: &str| info.and_then(|i| i.get(key)).and_then(Value::as_str).map(|s| s.chars().take(MAX_CLIENT_TEXT).collect::<String>());
+    session.agent = text("name").map(|name| ClientInfo { name, title: text("title") });
+    tracing::debug!("mcp: initialize (client asked {asked:?}, using {version}; client {:?})", session.agent);
     json!({
         "protocolVersion": version,
         "capabilities": { "tools": { "listChanged": false } },
@@ -198,7 +217,7 @@ fn initialize(params: &Value) -> Value {
 
 /// `tools/call`: `Err` only for a malformed call or an unknown tool (JSON-RPC errors); every
 /// other failure is a tool result with `isError`.
-fn tools_call(params: &Value, client: &Client) -> Result<Value, String> {
+fn tools_call(params: &Value, client: &Client, session: &Session) -> Result<Value, String> {
     let name = params.get("name").and_then(Value::as_str).ok_or("params.name must be a tool name")?;
     let tool = tools::tool(name).ok_or_else(|| format!("unknown tool: {}", name.chars().take(64).collect::<String>()))?;
     let arguments = match params.get("arguments") {
@@ -211,7 +230,7 @@ fn tools_call(params: &Value, client: &Client) -> Result<Value, String> {
         Err(e) => return Ok(tool_error("bad_request", &crate::redact::redact(&e))),
     };
     tracing::debug!("mcp: tools/call {}", tool.name);
-    Ok(match client.send(call, tool.launches) {
+    Ok(match client.send_as(call, tool.launches, session.agent.clone()) {
         Ok(sent) if sent.reply.ok => {
             let mut result = sent.reply.result.unwrap_or_else(|| json!({}));
             if !result.is_object() {

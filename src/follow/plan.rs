@@ -302,7 +302,7 @@ pub struct PlanCtx<'a> {
     pub pool: &'a Pool,
     /// Ledger rows of every rule (paused and deleted rules' rows retire).
     pub ledger: &'a [LedgerRow],
-    /// Pending switches that are not a rule's (yours or Claude's): they win every clash.
+    /// Pending switches that are not a rule's (yours or an agent's): they win every clash.
     pub manual_switches: &'a [(Timestamp, Timestamp)],
     /// Rule-made pending reminders, at most (`follow.max_pending`).
     pub max_pending: usize,

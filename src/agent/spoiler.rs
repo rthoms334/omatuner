@@ -2,7 +2,7 @@
 //! agent track.
 //!
 //! The guard itself already applies to every reply (`agent::guard::guard_reply`); this tool
-//! reads and adds its rules. Claude can add guards and mark things seen when the user says they
+//! reads and adds its rules. An agent can add guards and mark things seen when the user says they
 //! watched them; it can't pause the guard (that stays in the app) and never reveals anything on
 //! its own (`reveal_spoilers` exists only on the read tools, for refs the user asked about in
 //! that turn).
@@ -60,7 +60,7 @@ pub struct RuleOut {
     /// A series row with `enabled` false is the user's "don't guard" exception.
     pub enabled: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub by_claude: bool,
+    pub by_agent: bool,
 }
 
 /// Terms per topic, and the longest label (the store's limits, checked here for a clear
@@ -85,7 +85,7 @@ fn rule_out(r: &SpoilerRule) -> RuleOut {
         window_h: (r.kind != SpoilerRuleKind::Series).then_some(r.window_h),
         until: r.until_at.map(fmt_time),
         enabled: r.enabled,
-        by_claude: r.by_agent,
+        by_agent: r.by_agent,
     }
 }
 
@@ -143,6 +143,8 @@ fn base_rule(kind: SpoilerRuleKind, label: &str, now: crate::model::Timestamp) -
         shield: true,
         enabled: true,
         by_agent: true,
+        // named by `handle`
+        agent: Default::default(),
         created_at: now,
     }
 }
@@ -216,7 +218,7 @@ fn plan(q: &Q, p: &SpoilerGuard, snap: &crate::spoiler::snapshot::GuardSnapshot)
             Ok(Write::Add(SpoilerRule { terms, until_at: Some(until), window_h, ..base_rule(SpoilerRuleKind::Blackout, &label, q.now) }))
         }
         SpoilerAction::Remove => {
-            // only Claude's own rules: removing the user's would loosen their guard
+            // only an agent's rules (any agent's): removing the user's would loosen their guard
             let id = SpoilerRuleId(p.id.ok_or_else(|| Fail::bad("remove needs id (from list)"))?);
             let r = crate::store::spoiler::rule(q.conn, id).map_err(|_| Fail::not_found("spoiler rule"))?;
             if !r.by_agent {
@@ -247,6 +249,7 @@ fn plan(q: &Q, p: &SpoilerGuard, snap: &crate::spoiler::snapshot::GuardSnapshot)
                         episode: i32::try_from(ep.episode).ok(),
                         seen_at: q.now,
                         how: SeenHow::Agent,
+                        agent: Default::default(),
                     }))
                 }
                 _ => Err(Fail::bad("ref is a programme or episode ref")),
@@ -256,7 +259,7 @@ fn plan(q: &Q, p: &SpoilerGuard, snap: &crate::spoiler::snapshot::GuardSnapshot)
     }
 }
 
-pub(super) async fn handle(h: &Arc<Inner>, p: SpoilerGuard) -> Out<Value> {
+pub(super) async fn handle(h: &Arc<Inner>, p: SpoilerGuard, who: &crate::model::AgentName) -> Out<Value> {
     match p.action {
         SpoilerAction::Status => Ok(status(h)),
         SpoilerAction::List => {
@@ -271,15 +274,16 @@ pub(super) async fn handle(h: &Arc<Inner>, p: SpoilerGuard) -> Out<Value> {
             let snap = h.shared.guard().snapshot();
             let write = h.run(true, move |q| plan(q, &p, &snap)).await?;
             let now = crate::model::now();
+            let who = who.clone();
             let out = h
                 .write(DataScope::Spoiler, move |c| {
                     Ok(match write {
-                        Write::Add(r) => json!({ "id": crate::store::spoiler::add_rule(c, &r, now)?.0 }),
+                        Write::Add(r) => json!({ "id": crate::store::spoiler::add_rule(c, &SpoilerRule { agent: who, ..r }, now)?.0 }),
                         Write::Series { norm, label } => {
-                            json!({ "id": crate::store::spoiler::set_series_guard(c, &norm, &label, true, true, now)?.0 })
+                            json!({ "id": crate::store::spoiler::set_series_guard(c, &norm, &label, true, Some(&who), now)?.0 })
                         }
                         Write::Remove(id) => json!({ "removed": crate::store::spoiler::remove_rule(c, id)? }),
-                        Write::Seen(row) => json!({ "marked": crate::store::spoiler::mark_seen(c, &row)? }),
+                        Write::Seen(row) => json!({ "marked": crate::store::spoiler::mark_seen(c, &SeenRow { agent: who, ..row })? }),
                     })
                 })
                 .await?;

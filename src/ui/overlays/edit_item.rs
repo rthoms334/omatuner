@@ -211,6 +211,7 @@ impl EditItemOverlay {
             let _ = crate::guide_fix::ui::submit_apply(
                 ctx.services,
                 crate::model::FixActor::You,
+                Default::default(),
                 format!("Time shift {shift}"),
                 toast,
                 crate::model::Proposal { changes: vec![change], ..Default::default() },

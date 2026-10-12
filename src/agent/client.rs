@@ -6,9 +6,9 @@
 //!
 //! Not running (no socket / connection refused): tools with `ToolDef::launches` start Tuner
 //! through the [`Launcher`] (detached: own process group, stdio to /dev/null, so it outlives
-//! Claude and never writes into the MCP stream), then poll the socket every 100 ms for up to
-//! [`LAUNCH_WAIT`]; `ErrorCode::Loading` replies (library not built yet) are retried every
-//! 250 ms within [`LOADING_WAIT`]. `status` / `control` never launch: `status` answers
+//! the MCP client and never writes into the MCP stream), then poll the socket every 100 ms for
+//! up to [`LAUNCH_WAIT`]; `ErrorCode::Loading` replies (library not built yet) are retried
+//! every 250 ms within [`LOADING_WAIT`]. `status` / `control` never launch: `status` answers
 //! `{"running":false}`, `control` says Tuner isn't running.
 //! A running Tuner from before v2 answers with a v1 error line (no `"v"`): "restart Tuner".
 
@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::proto::{self, Call, ErrorCode, Reply, Request};
+use super::proto::{self, Call, ClientInfo, ErrorCode, Reply, Request};
 
 /// Longest wait for a launched Tuner's socket.
 pub const LAUNCH_WAIT: Duration = Duration::from_secs(15);
@@ -81,11 +81,11 @@ impl Launcher for ExeLauncher {
         if let Some(dir) = &self.profile_dir {
             cmd.arg("--profile-dir").arg(dir);
         }
-        // own process group: Claude ending the bridge (or the terminal hanging up its
+        // own process group: the MCP client ending the bridge (or the terminal hanging up its
         // foreground group) doesn't take Tuner with it; stdio never touches the MCP stream
         cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).process_group(0);
-        // the bridge's `RUST_LOG` is for its stderr, not tuner.log; Claude's working directory
-        // isn't Tuner's
+        // the bridge's `RUST_LOG` is for its stderr, not tuner.log; the MCP client's working
+        // directory isn't Tuner's
         cmd.env_remove("RUST_LOG").current_dir("/");
         let mut child = cmd.spawn()?;
         tracing::info!("mcp: started Tuner (pid {})", child.id());
@@ -197,8 +197,15 @@ impl Client {
 
     /// [`Client::call`], also saying whether it started Tuner.
     pub fn send(&self, call: Call, launch: bool) -> Result<Sent, ClientError> {
+        self.send_as(call, launch, None)
+    }
+
+    /// [`Client::send`] on behalf of an MCP client (`initialize.clientInfo`), so Tuner can say
+    /// which agent made a change.
+    pub fn send_as(&self, call: Call, launch: bool, agent: Option<ClientInfo>) -> Result<Sent, ClientError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let mut line = serde_json::to_string(&Request::new(id, call)).map_err(|e| ClientError::Failed(e.to_string()))?;
+        let req = Request::new(id, call).with_agent(agent);
+        let mut line = serde_json::to_string(&req).map_err(|e| ClientError::Failed(e.to_string()))?;
         line.push('\n');
         if line.len() > MAX_REQUEST {
             return Ok(Sent { reply: Reply::err(id, ErrorCode::BadRequest, "the arguments are too large"), started: false });

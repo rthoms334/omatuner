@@ -1,0 +1,9 @@
+-- 0013 agent names (DESIGN §30.12). Idempotent: the columns are added by the Rust step
+-- `migrations::agent_names` (add_column_if_missing), which also names the agent rows made
+-- before it 'Claude' (only the Claude Code plugin could make them):
+--   follow_rule.agent   TEXT   -- the agent that added it (origin = 'agent'); NULL = unknown
+--   spoiler_rule.agent  TEXT   -- likewise (origin = 'agent')
+--   spoiler_seen.agent  TEXT   -- the agent that marked it seen (how = 'agent')
+--   guide_fix_log.agent TEXT   -- the agent whose batch it was (actor = 'claude': an agent's)
+-- The name is the friendly name of the MCP client that asked (`model::AgentName`): display only,
+-- never a permission. A user's row is always NULL.

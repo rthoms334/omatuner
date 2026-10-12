@@ -244,9 +244,9 @@ fn populate(s: &Store, creds: &Creds) -> Fixture {
                 rule_id: None,
             },
         )?;
-        // Guide fixes: a mapping Claude picked (with the guide channel's name), your time shift
+        // Guide fixes: a mapping an agent picked (with the guide channel's name), your time shift
         // and an "It's right"
-        epg::set_manual_mapping_as(c, &ch(m3u, "m3u:aa"), guide, "arte.de", Some("Arte HD"), FixActor::Claude)?;
+        epg::set_manual_mapping_as(c, &ch(m3u, "m3u:aa"), guide, "arte.de", Some("Arte HD"), FixActor::Agent)?;
         let fixes = Proposal {
             changes: vec![
                 FixChange { channel: Some(ch(xt, "xt:live:1")), shift_min: Some(Some(60)), ..Default::default() },
@@ -254,7 +254,7 @@ fn populate(s: &Store, creds: &Creds) -> Fixture {
             ],
             ..Default::default()
         };
-        tuner::store::guide_fix::apply(c, FixActor::You, "t", &fixes, &Default::default(), NOW)?;
+        tuner::store::guide_fix::apply(c, FixActor::You, &Default::default(), "t", &fixes, &Default::default(), NOW)?;
         // "Not the same title" (DESIGN §29.11): the split survives a restore
         tuner::store::titles::set_split(c, &mv(xt, "xt:vod:7"), true, NOW + 4)?;
         // "Same title as…" (DESIGN §29.16): the join (both copies, one group) survives too

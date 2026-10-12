@@ -142,6 +142,7 @@ impl World {
             shield: true,
             enabled: true,
             by_agent: false,
+            agent: AgentName::default(),
             created_at: 0,
         };
         w(&self.store, move |c| db::add_rule(c, &r, 0))
@@ -227,6 +228,7 @@ fn an_embargo_opens_at_kick_off_and_lifts_when_seen_or_after_its_window() {
             episode: None,
             seen_at: t,
             how: SeenHow::Marked,
+            agent: AgentName::default(),
         };
         assert!(w(&world.store, move |c| db::mark_seen(c, &row)));
         key
@@ -270,6 +272,7 @@ fn always_topics_never_lift_and_blackouts_end_on_time() {
         shield: true,
         enabled: true,
         by_agent: false,
+        agent: AgentName::default(),
         created_at: 0,
     };
     w(&world.store, move |c| db::add_rule(c, &blackout, 0));
@@ -331,16 +334,17 @@ fn series_hide_episodes_after_next_up_across_playlists() {
         episode: Some(5),
         seen_at: KICK_OFF,
         how: SeenHow::Live,
+        agent: AgentName::default(),
     };
     w(&world.store, move |c| db::mark_seen(c, &row));
     let g = world.guard(&cfg, KICK_OFF);
     assert!(!g.judge(&ep(2, 6), KICK_OFF).guarded() && g.judge(&ep(2, 7), KICK_OFF).guarded());
 
     // "don't guard this series" wins over the automatic rule
-    w(&world.store, |c| db::set_series_guard(c, "severance", "Severance", false, false, KICK_OFF));
+    w(&world.store, |c| db::set_series_guard(c, "severance", "Severance", false, None, KICK_OFF));
     assert!(!world.guard(&cfg, KICK_OFF).judge(&ep(2, 9), KICK_OFF).guarded());
     // and the automatic rule is a setting
-    w(&world.store, |c| db::set_series_guard(c, "severance", "Severance", true, false, KICK_OFF).map(|_| ()));
+    w(&world.store, |c| db::set_series_guard(c, "severance", "Severance", true, None, KICK_OFF).map(|_| ()));
     assert!(world.guard(&cfg, KICK_OFF).judge(&ep(2, 9), KICK_OFF).guarded(), "the user's own row");
     let manual_off = Config { spoiler: tuner::config::SpoilerConfig { series_auto: false, ..Default::default() }, ..Default::default() };
     assert!(world.guard(&manual_off, KICK_OFF).judge(&ep(2, 9), KICK_OFF).guarded(), "explicit rows guard with the automatic rule off");
@@ -431,7 +435,7 @@ fn series_airings_without_s_e_are_placed_before_they_are_guarded() {
 
     // a series guarded before it's started: the user's own guard holds — an airing nothing
     // places loses its text, a first showing too
-    w(&world.store, |c| db::set_series_guard(c, "taskmaster", "Taskmaster", true, false, KICK_OFF).map(|_| ()));
+    w(&world.store, |c| db::set_series_guard(c, "taskmaster", "Taskmaster", true, None, KICK_OFF).map(|_| ()));
     let g = world.guard(&cfg, KICK_OFF);
     let tm = |sub, is_new| Subject::Programme {
         title: "Taskmaster",
@@ -557,6 +561,7 @@ fn rules_and_seen_rows_survive_a_backup_round_trip() {
         episode: None,
         seen_at: 6,
         how: SeenHow::Agent,
+        agent: AgentName::named("Codex"),
     };
     w(&world.store, move |c| db::mark_seen(c, &row));
     let v = db::export(&world.store.reader().unwrap()).unwrap().expect("something to back up");
@@ -566,7 +571,19 @@ fn rules_and_seen_rows_survive_a_backup_round_trip() {
     let c = other.store.reader().unwrap();
     let rules = db::list_rules(&c).unwrap();
     assert_eq!((rules[0].label.as_str(), rules[0].terms.len(), rules[0].categories.as_slice()), ("Arsenal", 2, &["Sport".to_string()][..]));
-    assert_eq!(db::seen_recent(&c, 10).unwrap()[0].how, SeenHow::Agent);
+    let seen = &db::seen_recent(&c, 10).unwrap()[0];
+    assert_eq!((seen.how, seen.agent.name()), (SeenHow::Agent, "Codex"), "marked seen by Codex");
+    drop(c);
+    // a backup from before agent names (no "agent" keys): its agent rows are Claude's
+    let mut old = v.clone();
+    for rows in ["seen", "rules"] {
+        old[rows].as_array_mut().unwrap().iter_mut().for_each(|r| _ = r.as_object_mut().unwrap().remove("agent"));
+    }
+    let third = World::new("spoiler-backup-3");
+    w(&third.store, move |c| db::import(c, &old, &|r| Some(r.clone())));
+    let c = third.store.reader().unwrap();
+    assert_eq!(db::seen_recent(&c, 10).unwrap()[0].agent.name(), "Claude");
+    assert_eq!(db::list_rules(&c).unwrap()[0].agent.stored(), None, "the user's own rule stays unnamed");
     drop(c);
     assert_eq!(w(&other.store, move |c| db::import(c, &v, &|r| Some(r.clone()))), 0, "a second restore adds nothing");
     // pruning keeps recent rows

@@ -32,7 +32,8 @@ pub const KEEP_S: i64 = 30 * 86_400;
 
 // ------------------------------------------------------------------ rules
 
-const RULE_COLS: &str = "id, name, kind, spec, mode, lead_s, offset_s, spoiler_safe, max_per_week, priority, enabled, origin, created_at, updated_at";
+const RULE_COLS: &str =
+    "id, name, kind, spec, mode, lead_s, offset_s, spoiler_safe, max_per_week, priority, enabled, origin, created_at, updated_at, agent";
 
 fn rule_from_row(r: &Row<'_>) -> rusqlite::Result<FollowRule> {
     let spec: String = r.get(3)?;
@@ -54,6 +55,7 @@ fn rule_from_row(r: &Row<'_>) -> rusqlite::Result<FollowRule> {
         by_agent: r.get::<_, String>(11)? == "agent",
         created_at: r.get(12)?,
         updated_at: r.get(13)?,
+        agent: crate::model::AgentName::from(r.get::<_, Option<String>>(14)?),
     })
 }
 
@@ -81,6 +83,8 @@ pub fn save_rule(conn: &Connection, r: &FollowRule, max_rules: u32, now: Timesta
     }
     let spec = serde_json::to_string(&r.spec).map_err(Error::other)?;
     let origin = if r.by_agent { "agent" } else { "user" };
+    // the agent's name only on its own rules; edits below never change it
+    let agent = r.by_agent.then(|| r.agent.stored()).flatten();
     if r.id.0 == 0 {
         let n: i64 = conn.query_row("SELECT count(*) FROM follow_rule", [], |x| x.get(0))?;
         if n >= i64::from(max_rules) {
@@ -92,9 +96,9 @@ pub fn save_rule(conn: &Connection, r: &FollowRule, max_rules: u32, now: Timesta
             r.priority
         };
         conn.execute(
-            "INSERT INTO follow_rule(name, kind, spec, mode, lead_s, offset_s, spoiler_safe, max_per_week, priority, enabled, origin, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
-            params![name, enum_str(&r.kind), spec, enum_str(&r.mode), r.lead_s, r.offset_s, r.spoiler_safe, r.max_per_week, priority, r.enabled, origin, now],
+            "INSERT INTO follow_rule(name, kind, spec, mode, lead_s, offset_s, spoiler_safe, max_per_week, priority, enabled, origin, created_at, updated_at, agent)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13)",
+            params![name, enum_str(&r.kind), spec, enum_str(&r.mode), r.lead_s, r.offset_s, r.spoiler_safe, r.max_per_week, priority, r.enabled, origin, now, agent],
         )?;
         return Ok(FollowRuleId(conn.last_insert_rowid()));
     }
@@ -169,7 +173,8 @@ pub fn reorder_rules(conn: &Connection, order: &[FollowRuleId], now: Timestamp) 
     })
 }
 
-/// Rules Claude added in the last `window_s` (MCP rate limit: 10 an hour) and in all.
+/// Rules agents added (any agent: the name is display only) in the last `window_s` (MCP rate
+/// limit: 10 an hour) and in all.
 pub fn agent_rule_counts(conn: &Connection, since: Timestamp) -> Result<(usize, usize)> {
     Ok(conn.query_row("SELECT count(*) FILTER (WHERE created_at >= ?1), count(*) FROM follow_rule WHERE origin = 'agent'", [since], |r| {
         Ok((r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)? as usize))
@@ -491,7 +496,7 @@ pub fn trouble(conn: &Connection, since: Timestamp) -> Result<Vec<ItemRef>> {
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// Pending switches that aren't a rule's (yours, Claude's): (start, stop). They win clashes.
+/// Pending switches that aren't a rule's (yours, an agent's): (start, stop). They win clashes.
 pub fn manual_switches(conn: &Connection, now: Timestamp) -> Result<Vec<(Timestamp, Timestamp)>> {
     let mut stmt = conn.prepare_cached(
         "SELECT start + offset_s, stop FROM reminder WHERE state = 'pending' AND rule_id IS NULL AND (mode = 'switch' OR lead_s = ?1) AND stop > ?2",
@@ -722,6 +727,9 @@ struct BackupRule {
     max_per_week: u32,
     enabled: bool,
     by_agent: bool,
+    /// Which agent made it (`null` = unknown); absent in backups from before names = Claude's.
+    #[serde(default = "crate::model::AgentName::before_names")]
+    agent: crate::model::AgentName,
 }
 
 /// Rules for a backup (not the ledger).
@@ -743,6 +751,7 @@ pub fn export(conn: &Connection) -> Result<Option<serde_json::Value>> {
             max_per_week: r.max_per_week,
             enabled: r.enabled,
             by_agent: r.by_agent,
+            agent: r.agent,
         })
         .collect();
     Ok(Some(serde_json::to_value(out).map_err(Error::other)?))
@@ -782,6 +791,7 @@ pub fn import(conn: &Connection, v: &serde_json::Value, remap: &dyn Fn(&ItemRef)
             priority: i64::MAX,
             enabled: b.enabled,
             by_agent: b.by_agent,
+            agent: b.agent,
             created_at: now,
             updated_at: now,
         };
@@ -914,6 +924,26 @@ mod tests {
         assert_eq!(import(&fresh, &v, &|r| (r == &ch).then(|| moved.clone())).unwrap(), 0, "merged by name and spec");
         assert_eq!(rules(&fresh).unwrap()[0].spec.channels, crate::follow::ChannelScope::Channels(vec![moved]));
         assert_eq!(import(&db(), &v, &|_| None).unwrap(), 1, "a channel list with no channel left isn't widened to any channel");
+
+        // an agent's rule keeps its name; one from a backup made before names is Claude's
+        let mut theirs = FollowRule::draft("Arsenal", FollowKind::Team, vec!["Arsenal".into()], &Default::default(), 0);
+        (theirs.by_agent, theirs.agent) = (true, crate::model::AgentName::named("Codex"));
+        save_rule(&c, &theirs, 100, 0).unwrap();
+        let v = export(&c).unwrap().unwrap();
+        let fresh = db();
+        import(&fresh, &v, &|r| Some(r.clone())).unwrap();
+        let named = |c: &Connection| rules(c).unwrap().into_iter().find(|r| r.name == "Arsenal").map(|r| (r.by_agent, r.agent.name().to_owned()));
+        assert_eq!(named(&fresh), Some((true, "Codex".into())));
+        let mut old = v.clone();
+        old.as_array_mut().unwrap().iter_mut().for_each(|r| _ = r.as_object_mut().unwrap().remove("agent"));
+        let fresh = db();
+        import(&fresh, &old, &|r| Some(r.clone())).unwrap();
+        assert_eq!(named(&fresh), Some((true, "Claude".into())));
+        assert_eq!(
+            rules(&fresh).unwrap().iter().filter(|r| !r.by_agent).map(|r| r.agent.stored()).collect::<Vec<_>>(),
+            [None, None],
+            "the user's own"
+        );
     }
 
     #[test]

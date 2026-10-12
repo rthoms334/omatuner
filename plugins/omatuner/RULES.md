@@ -54,7 +54,7 @@ reminders is the hard cap for one request; never loop calls to get around a tool
   web search on the event, and reply with only the channel, the time and "playing from the
   start". For a series the boundary is the last finished episode.
 - Never web-search an event the guard covers.
-- `spoiler_guard remove` takes only rules you added (`by_claude: true` in `list`). The user's own
+- `spoiler_guard remove` takes only rules you added (`by_agent: true` in `list`). The user's own
   rules are theirs to remove in Tuner ▸ Settings ▸ Spoiler guard; say so, never work around it.
 
 ## 5. Locked and explicit content

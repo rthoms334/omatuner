@@ -636,7 +636,17 @@ fn xtream_catchup_applies_shift_offset_and_caps_running_programmes() {
         ..Default::default()
     };
     let opts = tuner::store::guide_fix::GuideOpts::default();
-    w(&s, move |c| tuner::store::guide_fix::apply(c, FixActor::You, "t", &Proposal { changes: vec![shift], ..Default::default() }, &opts, now));
+    w(&s, move |c| {
+        tuner::store::guide_fix::apply(
+            c,
+            FixActor::You,
+            &Default::default(),
+            "t",
+            &Proposal { changes: vec![shift], ..Default::default() },
+            &opts,
+            now,
+        )
+    });
     let p = resolve(&reader(&s), &cfg, &catchup(ch, T20 + HOUR, T20 + 2 * HOUR), false, now).expect("user shift");
     assert!(url_of(&p).ends_with("/60/2026-10-09:21-05/1234.m3u8"), "{}", p.url.redacted());
 
