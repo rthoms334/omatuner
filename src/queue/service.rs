@@ -355,8 +355,10 @@ impl Engine {
                 Vec::new()
             }
             Effect::NotifyPin(id) => {
-                // the card shows it in the window; a hidden window gets a notification
-                if self.last.video_suspended
+                // the card shows it in the window; a hidden window, or the pop-out (it never
+                // takes the keyboard: an agent's Up next plays there, DESIGN §30.13), gets a
+                // notification
+                if (self.last.video_suspended || self.shared.window().is_some_and(|w| w.popped_out))
                     && let Some(r) = self.machine.rows().iter().find(|r| r.id == id)
                 {
                     let title = self.shared.guard().outside_title(&r.title, now()).into_owned();

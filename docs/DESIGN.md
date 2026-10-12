@@ -2073,7 +2073,7 @@ favourites lists) show a 󰇙 drag grip and move with Alt+↑/↓ or K/J. Every 
 | Backup | export (include passwords? history?) · import (merge/replace, restore settings?) | §19 | — |
 | Hidden items | unhide groups/channels/VOD | overrides | — |
 | Orphans | Enter = attach to…, Delete/x → menu with Forget | §8.3 | — |
-| AI agents (§39, after Parental) | offer to connect agents after updates · keep Claude Code's plugin up to date · per agent: Connect / Update / Disconnect… / Copy | `agents.offer_connect`, `agents.keep_in_sync` (+ `agents.checked_version`) | on · on |
+| AI agents (§39, after Parental) | offer to connect agents after updates · keep Claude Code's plugin up to date · agents play in (Pop-out / Tuner window, §30.13) · per agent: Connect / Update / Disconnect… / Copy | `agents.offer_connect`, `agents.keep_in_sync`, `agents.play_in` (+ `agents.checked_version`) | on · on · Pop-out |
 | About & logs | version, paths, debug logging, log viewer, export log | `general.debug_log` | off |
 Per channel (Ctrl+I "Edit information", `OverlayRequest::EditItem`, WP-11): rename, catch-up
 offset (minutes), EPG assignment, lock, hide.
@@ -3043,13 +3043,15 @@ for any window. Tuner does it for itself with `o` in the player or Ctrl+Shift+O 
   for up to 3 s until a just-created window is mapped).
 * **Focus**: no pop-out step takes the keyboard (checked against Hyprland 0.56's
   `Actions::floatWindow` / `pinWindow` / `resize` / `move` / `tag`), and an IPC `--play …
-  --popout` or `--reminder` never calls `focus_self`. `alter_zorder` is the exception: it
+  --popout` or `--reminder` never calls `focus_self`; nor does an agent's play that opens in
+  the pop-out (§30.13). `alter_zorder` is the exception: it
   simulates a pointer motion after raising, and with `follow_mouse = 1` a pointer that moved
   in the last 0.5 s over the raised window hands it the keyboard. So the raise is only sent
   for a window that was floating already: floating a window raises it anyway (0.56
   `floatWindow`; `changeWindowFloatingMode` in older releases).
 * **Launch into the pop-out** (Tuner closed: a scheduled switch with Open in: Pop-out starts it
-  — `ClosedOutcome::StartApp { popout }` — or `tuner --play <ref> --popout`): under Hyprland the
+  — `ClosedOutcome::StartApp { popout }` — `tuner --play <ref> --popout`, or `tuner mcp` for an
+  agent's play that opens in the pop-out, `--agent-popout`, §30.13): under Hyprland the
   window is created with the app id **`tuner-popout`** (`tuner::window_app_id`, chosen from the
   command line before the window exists; winit can't change it later) at the pop-out size. The
   packaged rule `o.window("^(tuner-popout)$", { float = true, pin = true, no_initial_focus =
@@ -5087,9 +5089,11 @@ itself provides. Tuner names the agent on its own screens by the name its client
 * Readers: a small pool (≤ 3) of lazily opened store readers behind a mutex; every query runs on
   `spawn_blocking` inside `HANDLER_BUDGET` (4 s).
 * `play`: resolve the ref against the snapshot (fallback: the DB like `channel_for`), apply the
-  guards, compute the outcome (`pin_required` when locked and `!unlocked`), send
-  `AppEvent::Agent(AgentCommand::Play(AgentPlay { target, from_start }))`, call
-  `hypr::focus_self()`, reply. The app's `on_agent` plays exactly like the UI: channels via
+  guards, compute the outcome (`pin_required` when locked and `!unlocked`), resolve where it
+  shows (`act::agent_show`, §30.13), send `AppEvent::Agent(AgentCommand::Play(AgentPlay {
+  target, from_start, place }))`, call `hypr::focus_self()` only when it shows in the window
+  (`AgentShow::raise`), reply with `opened_in`. The app's `on_agent_play` plays exactly like
+  the UI, then moves the window to `place` (`agent_place`): channels via
   `play_channel(id, PlayOrigin::Cli)` (PIN prompt, zap list, fullscreen); catch-up like
   `live::play_catchup`; movies / episodes with `PlayRequest { resume: !from_start }` (copies:
   `ui::copies` play order and fallback, as Enter on a card); series → next episode over its
@@ -5109,10 +5113,10 @@ itself provides. Tuner names the agent on its own screens by the name its client
 | `continue_watching` | `limit?` (10, ≤ 30) | `{items: [ContinueItem]}` | `store::user::continue_watching`, every playlist (a user list), `Library::conceals` + live parental check. |
 | `favourites` | `kind?`, `list?`, `limit?` (50, ≤ 100) | `{lists: [FavListOut]}` | `load_favs` on a handler reader; via `by_ref` / VOD lookups, so hidden and concealed items drop out. |
 | `status` | — | `StatusOut` (+ `running: false` from the bridge) | Never launches. |
-| `play` | `ref`, `from_start?` | `PlayOut {outcome: playing / catch_up / pin_required, ref, title, resume_at_min?, message}` | Programme: live → channel (with `from_start` + catch-up → restart from the archive); past → catch-up if `in_window` else `unavailable`; upcoming → `not_started`. |
+| `play` | `ref`, `from_start?`, `open_in?` (`popout` / `full_window` / `where_i_am`) | `PlayOut {outcome: playing / catch_up / pin_required, ref, title, resume_at_min?, message, opened_in: popout / window}` | Programme: live → channel (with `from_start` + catch-up → restart from the archive); past → catch-up if `in_window` else `unavailable`; upcoming → `not_started`. Where it opens: §30.13. |
 | `schedule_switch` | `ref` (programme, or channel + `at`) | `SwitchOut {id, channel, title?, start, warn_at}` | Not for something already started (`unavailable`: use play); ≤ 20 pending switches; an existing reminder of that programme becomes a switch. |
 | `cancel_switch` | `id` | `{cancelled}` | Only switch reminders. |
-| `control` | `action` (pause, resume, toggle_pause, stop, volume, mute, unmute), `value?` | `StatusOut` | Never launches; volume clamped 0–130. |
+| `control` | `action` (pause, resume, toggle_pause, stop, volume, mute, unmute, previous_channel, popout, window), `value?`, `tile?` | `StatusOut` | Never launches; volume clamped 0–130; `window` moves what plays to the window, fullscreen and raised (§30.13). |
 
 Example flows: "touring cars is on" → `guide_search{query:"touring car"}` → a `live` hit →
 `play{ref}`; an `upcoming` one → "It starts at 13:15 on ITV4 — want me to switch then?" →
@@ -5146,7 +5150,9 @@ Example flows: "touring cars is on" → `guide_search{query:"touring car"}` → 
 ### 30.7 Launch, loading, old instances
 * No instance: `ExeLauncher` → wait for the socket (≤ 15 s; a background `--refresh` holding the
   lock shows up as "didn't start" with its reason) → `loading` until the first library build
-  (≤ 20 s). A started-by-MCP Tuner opens its normal start screen on the current workspace.
+  (≤ 20 s). A started-by-MCP Tuner opens its normal start screen on the current workspace —
+  except for a play that opens in the pop-out (§30.13): `tuner --agent-popout`, the pop-out
+  only (pinned, without the keyboard) on the current workspace.
 * An instance from before v2 → `TooOld` ("restart Tuner to update it").
 
 ### 30.8 Auto-switch reminders (`platform::notify`, `store::user`, `app.rs`)
@@ -5333,6 +5339,85 @@ back to "your agent".
 
 ---
 
+### 30.13 Where an agent's playback opens (decision record, 2026-10-12)
+User report: "I tested out the play from claude and it started the mini player in the app.
+What I meant for this feature would be to start it detached as the multi workspace visible
+player" — the pop-out (§21.6). Decision: what an agent plays opens in the pop-out by default,
+the way scheduled playback does (§30.8, reminders "Open in"), and the agent says where.
+* **Where.** `play` and `queue` (`play`, `skip`) take `open_in`: the reminders' names,
+  `popout` / `full_window` / `where_i_am`. Settings ▸ AI agents "Agents play in" (`[agents]
+  play_in`, `pop-out` (default) / `full-window`; an older config loads as the pop-out) is the
+  default (a hand-written `where-i-am` counts as the pop-out, which the screen then shows; the
+  screen says *Pop-out* / *Tuner window*). `act::agent_show(asked, setting, window, pin)`,
+  pure, in this order:
+  1. `full_window` → the window, raised, on its player, **fullscreen** (the tool says: when the
+     user asks for full screen, the big screen or the TV; `AgentShow::fullscreen`: set at once,
+     or once a pop-out is back in, `fullscreen_after_pop_in`);
+  2. the item needs the PIN → the window, raised (the PIN is typed there);
+  3. `where_i_am` → only what plays changes (the screen stays; the mini player shows it);
+  4. no Hyprland (no pop-out) → the window, raised, as before;
+  5. `popout` → the pop-out, also out of a fullscreen window (asked for);
+  6. the setting: Tuner window → the window, raised. Pop-out: a pop-out stays the pop-out (one
+     still pending from a launch counts); two pictures on (§35) stay in the window, raised when
+     it is out of sight; a fullscreen window or the player **on screen** stay in the window,
+     **not raised** (it is where the user looks); anything else (Tuner on a workspace no
+     monitor shows, browsing, a fullscreen window out of sight) → the pop-out.
+  "On screen" (`WindowNow::visible`) is not keyboard focus: an agent's user types in a terminal,
+  so Tuner is almost never focused when a play arrives (tiled beside it, on a second monitor).
+  The app publishes `visible = focused`; when the answer depends on it, the handler asks
+  Hyprland at play time (`platform::popout::self_shown`, `spawn_blocking`: `j/clients` +
+  `j/monitors` — our window pinned, or on a monitor's active or open special workspace, and not
+  a hidden group tab). When Hyprland can't tell, the window counts as seen (nothing moves
+  uninvited).
+* **Focus.** The handler calls `hypr::focus_self()` only when the window is raised (before, it
+  raised on every play: the main window jumped in front). The pop-out never takes the
+  keyboard (§21.6).
+* **Saying where.** The result has `opened_in: popout | window` (`OpenedIn`); `play`'s message
+  ends "It's in the pop-out." / "It's in Tuner's window." (+ "the pop-out needs Hyprland" when
+  `popout` was asked off Hyprland). The skills tell the user.
+* **The window's facts.** The app publishes `reminders::ui::WindowNow { focused, watching,
+  popped_out, can_pop, fullscreen, multiview, visible }` to `AppShared::window` every frame (`logic`
+  runs while the window is hidden too). Before the first frame `can_pop` is whether Hyprland
+  runs (the worker starts with the first frame; a pop-out asked for then waits for it through
+  `reminder_ui.pop_out_pending`, like a switch reminder's launch).
+* **Up next.** `queue play` and `skip` used to only tell the engine, which sends the play
+  straight to the main picture: the app never heard of it, so the window stayed on Home and the
+  corner mini player showed the film (the user's report was such a `queue play`). Now the
+  handler sends `AgentCommand::Show(AgentShow)` after the engine answers `Playing`: the app
+  pushes the player and places the window like a `play`. A `WaitingForPin` shows the window,
+  raised. A `skip` while Up next already drives the picture leaves it where it plays (like a
+  zap; `opened_in` says where that is); the next items play into the same picture, so a
+  pop-out stays a pop-out. A later locked item waiting for the PIN in the pop-out sends the
+  "Up next is waiting for your PIN" notification (as for a hidden window: the pop-out never
+  takes the keyboard). Movies and episodes resume as before: only the window moves.
+* **"Put it on the big screen".** `control window`: `AgentCommand::Show` with the window,
+  raised and fullscreen, for what already plays (nothing restarts; `unavailable` when nothing
+  plays).
+* **The PIN and a launch.** A launch for the pop-out asks for it before the worker runs
+  (`reminder_ui.pop_out_pending`). A play that then goes to the window (the PIN) drops that
+  request (`agent_place`), so the prompt never lands in the pop-out, which can't take the
+  keyboard. `agent_play` reports a channel's prompt only when this play opened it (a
+  `pending_locked` left by a prompt dismissed earlier says nothing).
+* **A play that fails** (`play` or `queue play` / `skip` erring, or Up next with nothing to
+  play) while the published window is popped out (or about to be) and the main picture idle
+  sends `AgentCommand::PopIn`: the empty pop-out goes back into the window, unraised, instead of
+  staying pinned on every workspace saying "Nothing playing".
+* **Tuner not running.** The bridge decides with the same function (no window to keep):
+  a play that would open in the pop-out under Hyprland starts `tuner --agent-popout`
+  (`client::Launch::PopOut`) — the switch reminders' launch (`tuner-popout` app id, the
+  packaged no-focus rule, popped out on the first frame), showing "Nothing playing" for the
+  second until the play arrives. Everything else starts Tuner's window as before.
+* **Multi-view** stays in the main window: an agent's `multiview open` while popped out pops
+  back in and raises the window first (§35.3).
+* **Unchanged.** `control previous_channel`, zaps and `control popout` act wherever playback
+  is.
+* **Older Tuner.** `Play` and `Queue` refuse unknown fields; a Tuner from before `open_in`
+  still running after an upgrade answers `bad_request` naming it. The bridge then asks again
+  without `open_in` (that Tuner's own play: its window) and adds a `note` to restart Tuner.
+* **Known race.** `tuner --agent-popout` that loses the start race to a Tuner starting at the
+  same moment hands off `popout: true` with no play: that Tuner pops out empty until the
+  agent's play arrives (it goes there), or the failed play puts it back in (above).
+
 ## Batch v0.2: five features, reminders, Claude skills (§31–§38)
 
 The v0.2 batch adds five features designed together (big-features plan, 2026-10-11), the
@@ -5458,6 +5543,9 @@ the panel, `n` / `N` step. Home shows an "Up next" rail while items wait and not
   30 s card at its end; a future slot waits; after a suspend a slot plays from its archive or
   is skipped as "Expired".
 * Every play goes through B1 (`PlaySource::Queue`); in multi-view Up next waits.
+* An agent's `queue play` (and `skip` when Up next wasn't playing) shows where `play` would —
+  the pop-out by default, `open_in` — and the following items stay there; a `skip` inside a
+  running Up next keeps it where it plays (§30.13).
 * With Up next empty, an episode ending outside it offers the next episode with a countdown
   (the engine, in any placement, a hidden window included). Before it plays it re-reads the
   lock and concealment: a series locked again says "Next episode is locked" and plays nothing.
@@ -5702,7 +5790,9 @@ goes alongside the focused
 picture, judged against that picture's stream; `needs_rearrange` when only moving the playing
 picture works; a film playing answers "multi-view is for live TV and catch-up". `control` with
 no `tile` pauses/stops both, sets volume and mute on the picture with the sound, and acts on the
-focused one for previous channel and pop-out.
+focused one for previous channel and pop-out. Opened while the window is popped out (an
+agent's play went to the pop-out, §30.13), the window pops back in and comes forward first:
+two pictures belong in the window.
 
 ### 35.4 Gaps
 A PIN prompt cancelled with Esc keeps its stored plays until a relock (harmless: only `play_channel`'s or the agent's
@@ -5857,7 +5947,8 @@ do it in settings also".
 ### 39.2 Config (`[agents]`, `config::AgentsConfig`)
 `offer_connect` (true), `keep_in_sync` (true), `checked_version: Option<String>` (the Tuner
 version whose start check finished: the card was answered, or there was nothing to offer;
-`None` on a new install or an upgrade from 0.2.2 or older). `connect::should_check` = (either
+`None` on a new install or an upgrade from 0.2.2 or older), `play_in` (`pop-out`; where an
+agent's play opens, §30.13). `connect::should_check` = (either
 switch on) and `checked_version` ≠ this version. Machine-local: `Config::restored` keeps this
 machine's `[agents]` from a restored backup (connections are per computer).
 
@@ -5942,7 +6033,8 @@ idle (Esc hides it early; the work continues, toasts carry the results). Both an
 `checked_version`; *Don't ask again* also sets `offer_connect = false`.
 
 ### 39.7 Settings ▸ AI agents (`ui::screens::settings::agents`)
-After Parental. The two toggles, *Check again*, one row per agent found (status, "used 2 h ago"),
+After Parental. The two toggles, *Agents play in* (Pop-out / Tuner window, §30.13; off Hyprland a
+note says agents play in Tuner's window there), *Check again*, one row per agent found (status, "used 2 h ago"),
 "Not found on this computer: …", and *Other agents* (Copy `tuner mcp`, the VS Code command, the
 README link). Enter or a click opens the row's menu: Connect / Repair, Update to <version>,
 Disconnect… (destructive confirm naming what the agent loses), Copy the setup command, the

@@ -1230,9 +1230,47 @@ with Claude Code, and *Second agent* with another one.
 - [ ] **Not running → starts:** quit Tuner. Ask the agent "what's on now?".
   **Expect:** Tuner opens on the current workspace within a few seconds; the agent lists programmes
   with channels and times in your local time.
-- [ ] **"Touring cars is on" (or any live sport / show in your guide):**
-  **Expect:** the agent finds the live programme and Tuner plays the channel fullscreen and comes to
-  the front. Backspace returns to the previous channel.
+- [ ] **"Touring cars is on" (or any live sport / show in your guide):** with Tuner's window on
+  another workspace (or tiled behind the terminal). **Expect:** the agent finds the live programme
+  and it plays in the pop-out: pinned, bottom right, on the workspace you are on; the terminal keeps
+  the keyboard (keep typing) and Tuner's window doesn't come forward. The agent says it's in the
+  pop-out. Hover the pop-out → ↑ zaps; Backspace in it returns to the previous channel.
+- [ ] **On the TV / full screen:** "put the news on the big screen" (or "full screen").
+  **Expect:** it plays full screen in Tuner's window, brought forward; the agent says it's in
+  Tuner's window. From the pop-out, the window pops back in and goes full screen.
+- [ ] **Big screen for what plays:** with something in the pop-out, "put it on the big screen".
+  **Expect:** the same programme or film carries on (no reconnect, no jump back) full screen in
+  Tuner's window, in front.
+- [ ] **Watching in the window:** Tuner fullscreen (Super+F) and playing, ask the agent to play
+  another channel. **Expect:** it stays fullscreen in the window (no pop-out). Same with Tuner's
+  player tiled beside the terminal while you type in the terminal (or on a second monitor), and
+  with two pictures on (multi-view). "Move it to the pop-out" then pops it out.
+- [ ] **Watching on another workspace:** Tuner playing in its window on workspace 2, you on
+  workspace 1 in the terminal: ask for another channel. **Expect:** it comes to you in the
+  pop-out on workspace 1.
+- [ ] **Setting:** Settings ▸ AI agents ▸ *Agents play in* = Tuner window, Tuner on another
+  workspace, ask the agent to play something. **Expect:** Tuner's window comes forward and plays
+  it. Set it back to Pop-out.
+- [ ] **Tuner not running → the pop-out:** quit Tuner, keep typing in the terminal, ask "play
+  BBC One". **Expect:** Tuner starts as the pop-out only, on this workspace, without the keyboard
+  ("Nothing playing" for a second, then the channel); no full window jumps in front. Esc tiles it.
+- [ ] **Not running, then it fails:** quit Tuner, ask for a programme that hasn't started (or Up
+  next while it is empty). **Expect:** the agent says why; Tuner doesn't stay as an empty pinned
+  pop-out (it goes back into a normal window).
+- [ ] **Not running, locked:** quit Tuner with a PIN set and a locked channel, ask the agent to
+  play it. **Expect:** Tuner's window (not the pop-out) with the PIN prompt; typing the PIN works.
+- [ ] **Up next follows the pop-out:** queue two short films (or two episodes) from the agent and
+  say "play Up next". **Expect:** the first plays in the pop-out (not the corner mini player in
+  Tuner's window); when it ends, the second plays in the pop-out too. "Skip" keeps it there.
+  Lock the second film first: when it comes up, a notification asks for the PIN.
+  With *Agents play in* = Tuner window, "play Up next" opens Tuner's player (not the mini player).
+- [ ] **Multi-view from the pop-out:** with a channel in the pop-out, ask for "BBC One and BBC
+  Two side by side". **Expect:** Tuner's window comes back in, in front, with the two pictures.
+- [ ] **Locked item from the pop-out:** set a PIN, lock a channel, lock the session, ask the agent
+  to play it. **Expect:** Tuner's window comes forward with its PIN prompt; after the PIN it plays
+  there.
+- [ ] **Off Hyprland (if available):** ask the agent to play something. **Expect:** Tuner's window
+  plays it, as before; the agent says it's in Tuner's window.
 - [ ] **Upcoming → automatic switch:** ask for something starting in 2–3 minutes and accept the
   switch. **Expect:** the agent reports the start time; 10 s before, Tuner toasts "Switching to …
   in 10 s" with Cancel; at the start it switches by itself. Repeat and press Cancel: no switch.
@@ -1252,7 +1290,8 @@ with Claude Code, and *Second agent* with another one.
 - [ ] **Control:** "pause", "resume", "volume to 30", "stop". **Expect:** each happens, also
   while Tuner sits on another workspace.
 - [ ] **Window hidden:** move Tuner to another workspace, ask "what's on BBC One at 9?".
-  **Expect:** an answer without Tuner coming forward; "play it" brings it forward.
+  **Expect:** an answer without Tuner coming forward; "play it" plays it in the pop-out on the
+  workspace you are on.
 - [ ] **Outlives the agent:** with Tuner started by the agent (first check), quit the agent (and
   close its terminal). **Expect:** Tuner keeps running and playing.
 - [ ] **Relock while away:** set a PIN with a 1-minute relock, unlock, ask the agent to switch to

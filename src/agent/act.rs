@@ -1,17 +1,19 @@
-//! The action tools' decisions (DESIGN §30.4, §30.5, §30.8): what `play` plays and says,
-//! what `schedule_switch` writes, whether `cancel_switch` may remove a row, and `status`.
+//! The action tools' decisions (DESIGN §30.4, §30.5, §30.8, §30.13): what `play` plays and
+//! says, where an agent's playback opens, what `schedule_switch` writes, whether
+//! `cancel_switch` may remove a row, and `status`.
 //! Pure over a [`Q`]; the handler (`agent::server`) does the sending and writing. Owner:
 //! MCP-app track.
 
 use super::proto::{
-    AgentRef, Airing, CancelSwitch, ErrorCode, MultiviewStatusOut, NowPlayingOut, Play, PlayOut, PlayOutcome, PlayerStateOut, QueueNextOut,
+    AgentRef, Airing, CancelSwitch, ErrorCode, MultiviewStatusOut, NowPlayingOut, OpenedIn, Play, PlayOut, PlayOutcome, PlayerStateOut, QueueNextOut,
     QueueStatusOut, ScheduleSwitch, SleepOut, StatusOut, StreamsOut, SwitchOut, TileName, TileOut, fmt_time, item_ref,
 };
 use super::query::{Fail, Out, Q, channel_ref, clean, parse_ref, when};
 use super::{AgentCommand, AgentPlay, PlayTarget};
 use crate::jobs::JobKind;
-use crate::model::{ItemKind, MediaRef, PlayableKind, Reminder, ReminderId, ReminderState, VodKind};
+use crate::model::{ItemKind, MediaRef, OpenIn, PlayableKind, Reminder, ReminderId, ReminderState, VodKind};
 use crate::player::{PlayerErrorKind, PlayerSnapshot, PlayerState};
+use crate::reminders::ui::{Placement, WindowNow};
 
 /// Pending automatic switches allowed at once.
 pub const MAX_SWITCHES: usize = 20;
@@ -22,6 +24,87 @@ pub const MAX_SWITCH_AHEAD_S: i64 = 14 * 86_400;
 pub(super) fn is_clock_time(s: &str) -> bool {
     let digits = |x: &str| !x.is_empty() && x.len() <= 2 && x.bytes().all(|b| b.is_ascii_digit());
     s.trim().split_once(':').is_some_and(|(h, m)| digits(h) && m.len() == 2 && digits(m))
+}
+
+/// Where an agent's play shows (`agent_show`): the placement the app applies, whether the
+/// handler raises Tuner's window, and whether the window goes fullscreen (asked for).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentShow {
+    pub place: Placement,
+    pub raise: bool,
+    /// `open_in: full_window` ("full screen", "the TV"): the window fullscreen too.
+    pub fullscreen: bool,
+}
+
+impl AgentShow {
+    /// The pop-out (never raised: it takes no keyboard).
+    pub const POP_OUT: Self = Self { place: Placement::PopOut, raise: false, fullscreen: false };
+    /// Only what plays changes (the screen stays; the mini player shows it).
+    pub const IN_PLACE: Self = Self { place: Placement::InPlace, raise: false, fullscreen: false };
+
+    /// Tuner's window, raised or not.
+    pub const fn window(raise: bool) -> Self {
+        Self { place: Placement::FullWindow, raise, fullscreen: false }
+    }
+}
+
+/// Where an agent's play opens (DESIGN §30.13). An explicit `open_in` wins, else the setting
+/// (Settings ▸ AI agents "Agents play in"; a hand-written `where-i-am` counts as the pop-out,
+/// the screen's two choices). The PIN is typed in Tuner's window; without Hyprland there is no
+/// pop-out; `full_window` also makes the window fullscreen. Unasked, the pop-out never takes
+/// what the user watches in the window: a fullscreen window or the player on screen
+/// (`WindowNow::visible`: focused, or on a workspace a monitor shows) stay in the window, not
+/// raised (it is where the user looks); two pictures stay in the window, raised when it's out
+/// of sight; a pop-out stays the pop-out. Pure.
+pub fn agent_show(asked: Option<OpenIn>, setting: OpenIn, w: WindowNow, pin: bool) -> AgentShow {
+    let full = AgentShow { fullscreen: true, ..AgentShow::window(true) };
+    match asked {
+        Some(OpenIn::FullWindow) => full,
+        _ if pin => AgentShow::window(true),
+        Some(OpenIn::WhereIAm) => AgentShow::IN_PLACE,
+        // off Hyprland: the window, as before the pop-out default
+        _ if !w.can_pop => AgentShow::window(true),
+        // asked for: also out of a fullscreen window
+        Some(OpenIn::PopOut) => AgentShow::POP_OUT,
+        None => match setting {
+            OpenIn::FullWindow => AgentShow::window(true),
+            OpenIn::PopOut | OpenIn::WhereIAm if w.popped_out => AgentShow::POP_OUT,
+            OpenIn::PopOut | OpenIn::WhereIAm if w.multiview => AgentShow::window(!w.visible),
+            OpenIn::PopOut | OpenIn::WhereIAm if w.visible && (w.fullscreen || w.watching) => AgentShow::window(false),
+            OpenIn::PopOut | OpenIn::WhereIAm => AgentShow::POP_OUT,
+        },
+    }
+}
+
+/// What `opened_in` says for `show` in window `w`.
+pub fn opened_in(show: AgentShow, w: WindowNow) -> OpenedIn {
+    match show.place {
+        Placement::PopOut => OpenedIn::Popout,
+        Placement::FullWindow => OpenedIn::Window,
+        Placement::InPlace if w.popped_out => OpenedIn::Popout,
+        Placement::InPlace => OpenedIn::Window,
+    }
+}
+
+/// `open_in` as the tools take it: `popout`, `full_window` or `where_i_am` (the reminders'
+/// names).
+pub fn parse_open_in(s: Option<&str>) -> Out<Option<OpenIn>> {
+    Ok(match s {
+        None => None,
+        Some("popout") => Some(OpenIn::PopOut),
+        Some("full_window") => Some(OpenIn::FullWindow),
+        Some("where_i_am") => Some(OpenIn::WhereIAm),
+        Some(_) => return Err(Fail::bad("open_in is popout, full_window or where_i_am")),
+    })
+}
+
+/// `OpenIn`'s tool name (see [`parse_open_in`]).
+pub fn open_in_name(o: OpenIn) -> &'static str {
+    match o {
+        OpenIn::PopOut => "popout",
+        OpenIn::FullWindow => "full_window",
+        OpenIn::WhereIAm => "where_i_am",
+    }
 }
 
 /// What `play` decided.
@@ -38,7 +121,7 @@ pub fn plan_play(q: &Q, p: &Play) -> Out<PlayStep> {
     let r = parse_ref(&p.item)?;
     let log_ref = r.to_string();
     let ready = |target: PlayTarget, out: PlayOut| PlayStep::Ready {
-        command: AgentCommand::Play(AgentPlay { target, from_start }),
+        command: AgentCommand::Play(AgentPlay { target, from_start, show: AgentShow::window(true) }),
         out: clean_play(out),
         log_ref: log_ref.clone(),
     };
@@ -62,6 +145,7 @@ pub fn plan_play(q: &Q, p: &Play) -> Out<PlayStep> {
                         title: prog.title.to_string(),
                         resume_at_min: None,
                         message,
+                        opened_in: None,
                     },
                 ))
             };
@@ -85,6 +169,7 @@ pub fn plan_play(q: &Q, p: &Play) -> Out<PlayStep> {
                             title: prog.title.to_string(),
                             resume_at_min: None,
                             message: if locked { pin(&c.name) } else { format!("Switched to {} for {}.{live_only}", c.name, prog.title) },
+                            opened_in: None,
                         },
                     ))
                 }
@@ -102,6 +187,7 @@ pub fn plan_play(q: &Q, p: &Play) -> Out<PlayStep> {
                         title: c.name.to_string(),
                         resume_at_min: None,
                         message: if locked { pin(&c.name) } else { format!("Playing {}.", c.name) },
+                        opened_in: None,
                     },
                 ))
             }
@@ -128,6 +214,7 @@ pub fn plan_play(q: &Q, p: &Play) -> Out<PlayStep> {
                         title: v.name.to_string(),
                         resume_at_min: resume.filter(|_| !locked),
                         message,
+                        opened_in: None,
                     },
                 ))
             }
@@ -145,6 +232,7 @@ pub fn plan_play(q: &Q, p: &Play) -> Out<PlayStep> {
                             title: v.name.to_string(),
                             resume_at_min: None,
                             message: pin(&v.name),
+                            opened_in: None,
                         },
                     ));
                 }
@@ -165,7 +253,14 @@ pub fn plan_play(q: &Q, p: &Play) -> Out<PlayStep> {
                     let title = format!("{} — S{:02}E{:02}", series.name, ep.season, ep.episode);
                     return Ok(ready(
                         PlayTarget::Media(MediaRef::Episode(ep.id)),
-                        PlayOut { outcome: PlayOutcome::PinRequired, item: item_ref(&item), message: pin(&title), title, resume_at_min: None },
+                        PlayOut {
+                            outcome: PlayOutcome::PinRequired,
+                            item: item_ref(&item),
+                            message: pin(&title),
+                            title,
+                            resume_at_min: None,
+                            opened_in: None,
+                        },
                     ));
                 }
                 episode_step(q, &ep, series.name.as_ref(), from_start, PlayTarget::Media(MediaRef::Episode(ep.id)), &log_ref)
@@ -183,8 +278,8 @@ fn episode_step(q: &Q, ep: &crate::model::Episode, series: &str, from_start: boo
         None => format!("Playing {title}."),
     };
     Ok(PlayStep::Ready {
-        command: AgentCommand::Play(AgentPlay { target, from_start }),
-        out: clean_play(PlayOut { outcome: PlayOutcome::Playing, item: out.item, title, resume_at_min: resume, message }),
+        command: AgentCommand::Play(AgentPlay { target, from_start, show: AgentShow::window(true) }),
+        out: clean_play(PlayOut { outcome: PlayOutcome::Playing, item: out.item, title, resume_at_min: resume, message, opened_in: None }),
         log_ref: log_ref.to_owned(),
     })
 }
@@ -462,5 +557,58 @@ pub fn error_kind(k: PlayerErrorKind) -> String {
         PlayerErrorKind::Budget => "connection-limit".into(),
         PlayerErrorKind::ProviderError => "provider-error".into(),
         PlayerErrorKind::Mpv => "player".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// DESIGN §30.13's order: an explicit `full_window` (fullscreen), the PIN, the rest of
+    /// `open_in`, then no Hyprland, then the setting — which, unasked, keeps what the user
+    /// watches in a window on screen (focused or not: the agent's terminal has the keyboard) and
+    /// a pop-out, and pops out of a window nobody sees.
+    #[test]
+    fn agent_show_resolves_explicit_then_setting_then_the_window() {
+        use OpenIn::{FullWindow, PopOut, WhereIAm};
+        let away = WindowNow { can_pop: true, ..Default::default() };
+        let pop = AgentShow::POP_OUT;
+        let raised = AgentShow::window(true);
+        let kept = AgentShow::window(false);
+        let full = AgentShow { fullscreen: true, ..raised };
+        let in_place = AgentShow::IN_PLACE;
+        let shown = WindowNow { visible: true, ..away };
+        let fullscreen = WindowNow { fullscreen: true, watching: true, ..shown };
+        let cases = [
+            // (asked, setting, window, pin) → show
+            (None, PopOut, away, false, pop),
+            (None, PopOut, WindowNow { focused: true, visible: true, ..away }, false, pop),
+            (None, PopOut, WindowNow { watching: true, ..away }, false, pop),
+            // tiled beside the terminal, or on the other monitor: the terminal has the keyboard
+            (None, PopOut, WindowNow { watching: true, ..shown }, false, kept),
+            (None, PopOut, WindowNow { focused: true, watching: true, ..shown }, false, kept),
+            (None, PopOut, fullscreen, false, kept),
+            (None, PopOut, WindowNow { fullscreen: true, watching: true, ..away }, false, pop),
+            (None, PopOut, WindowNow { multiview: true, ..shown }, false, kept),
+            (None, PopOut, WindowNow { multiview: true, ..away }, false, raised),
+            (None, PopOut, WindowNow { popped_out: true, ..away }, false, pop),
+            (None, WhereIAm, away, false, pop),
+            (None, FullWindow, WindowNow { popped_out: true, ..away }, false, raised),
+            (None, FullWindow, away, true, raised),
+            (Some(FullWindow), PopOut, WindowNow { popped_out: true, ..away }, false, full),
+            (Some(FullWindow), PopOut, away, true, full),
+            (Some(FullWindow), PopOut, WindowNow { can_pop: false, ..away }, false, full),
+            (Some(PopOut), FullWindow, fullscreen, false, pop),
+            (Some(WhereIAm), PopOut, away, false, in_place),
+            (None, PopOut, WindowNow { can_pop: false, ..away }, false, raised),
+            (Some(PopOut), PopOut, WindowNow { can_pop: false, ..away }, false, raised),
+            (Some(PopOut), PopOut, away, true, raised),
+        ];
+        for (asked, setting, w, pin, want) in cases {
+            assert_eq!(agent_show(asked, setting, w, pin), want, "{asked:?} {setting:?} {w:?} pin {pin}");
+        }
+        assert_eq!(opened_in(in_place, WindowNow { popped_out: true, ..away }), OpenedIn::Popout);
+        assert_eq!(opened_in(in_place, away), OpenedIn::Window);
+        assert_eq!(opened_in(kept, fullscreen), OpenedIn::Window);
     }
 }

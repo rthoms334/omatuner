@@ -90,7 +90,9 @@ fn main() -> anyhow::Result<()> {
         view: cli.view,
         play: cli.play.as_deref().map(absolute_input),
         inputs: cli.inputs.iter().map(|i| absolute_input(i)).collect(),
-        popout: cli.popout,
+        // `tuner mcp` starting Tuner for an agent's play in the pop-out (DESIGN §30.13): the
+        // switch reminders' launch, the play follows over IPC v2
+        popout: cli.popout || cli.agent_popout,
         reminder: cli.reminder,
     };
     // held until the process exits: the database has one owner

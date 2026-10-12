@@ -14,8 +14,8 @@
 //!   is concealed by the reader itself (`ParentalView::hides_explicit`);
 //! * the spoiler guard ([`AppShared::guard`], identity until S1), the pictures as the UI last
 //!   published them ([`AppShared::tiles`], B1), the main picture's snapshots
-//!   ([`AppShared::main_player`]) and Up next's snapshot ([`AppShared::queue`], empty until
-//!   Q-core).
+//!   ([`AppShared::main_player`]), Up next's snapshot ([`AppShared::queue`], empty until
+//!   Q-core) and the window ([`AppShared::window`]: where an agent's play opens).
 //!
 //! Never hold a snapshot across an await: take it, use it, drop it (the memory field fixes).
 //! Headless `tuner --refresh` has no published library: it uses `Library::load` and treats the
@@ -31,6 +31,7 @@ use crate::platform::notify::ReminderWaker;
 use crate::playback::TilesState;
 use crate::player::PlayerSnapshot;
 use crate::queue::QueueSnapshot;
+use crate::reminders::ui::WindowNow;
 use crate::store::library::{ExplicitGate, Library};
 use crate::ui::ParentalSession;
 
@@ -59,6 +60,9 @@ pub struct AppShared {
     sleep: Mutex<Option<crate::reminders::sleep::SleepHandle>>,
     /// Picture B's snapshots while it exists (the spoiler tracker, multi-view).
     tile_b: Mutex<Option<watch::Receiver<Arc<PlayerSnapshot>>>>,
+    /// Tuner's window as the app last saw it (where an agent's play opens, DESIGN §30.13);
+    /// `None` before the app's first frame.
+    window: Mutex<Option<WindowNow>>,
 }
 
 impl Default for AppShared {
@@ -94,6 +98,7 @@ impl AppShared {
             queue_handle: Mutex::default(),
             sleep: Mutex::default(),
             tile_b: Mutex::default(),
+            window: Mutex::default(),
         }
     }
 
@@ -210,6 +215,16 @@ impl AppShared {
     /// The sleep timer's service started.
     pub fn set_sleep(&self, h: Option<crate::reminders::sleep::SleepHandle>) {
         *self.sleep.lock().unwrap_or_else(|e| e.into_inner()) = h;
+    }
+
+    /// The app publishes its window every frame (`TunerApp::window_now`).
+    pub fn set_window(&self, w: WindowNow) {
+        *self.window.lock().unwrap_or_else(|e| e.into_inner()) = Some(w);
+    }
+
+    /// Tuner's window as last published (`None` before the app's first frame).
+    pub fn window(&self) -> Option<WindowNow> {
+        *self.window.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Up next's latest snapshot.

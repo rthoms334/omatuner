@@ -23,6 +23,13 @@ line.
 - Call `status` first. If something plays, say "this replaces <what plays>". A plain "play X"
   needs no other confirmation.
 - `status.queue`: Up next is playing. Say so before replacing it.
+- Where it plays: `play` and `queue play` open in the pop-out (a small player pinned on every
+  workspace that never takes the keyboard) unless the user asks for full screen, the big screen
+  or the TV: then pass `open_in: "full_window"` (Tuner's window, full screen). To move what
+  already plays there, use `control` `window` instead of playing it again. Never pass
+  `open_in: "popout"` to move what the user watches in Tuner's window unless they ask (Tuner
+  keeps a window the user can see by itself). Say where it opened (`opened_in`: "in the
+  pop-out" / "in Tuner's window"). A `note` saying to restart Tuner: pass it on.
 - `status.multiview`: two pictures are on. `play` replaces the silent picture and gives it the
   sound. `control` without a `tile` pauses, resumes or stops both pictures, sets volume and mute
   on the picture with the sound, and goes back a channel on the focused one; name a `tile` to act

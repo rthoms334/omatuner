@@ -41,10 +41,18 @@ pub mod tools_batch;
 use crate::model::{MediaRef, SeriesId};
 
 /// What the handler asks the UI thread to do (`AppEvent::Agent`). The handler validated the
-/// target (it exists and is visible); the app re-applies the PIN rules and raises the window.
+/// target (it exists and is visible) and raised the window when the play shows there; the app
+/// re-applies the PIN rules.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentCommand {
     Play(AgentPlay),
+    /// Up next started playing for an agent (`queue play` / `skip`), or `control window`: show
+    /// it where the handler resolved (`act::agent_show`; the engine already sent the play to
+    /// the main picture).
+    Show(act::AgentShow),
+    /// An agent's play failed while Tuner shows an empty pop-out (one started for that play,
+    /// `--agent-popout`): back into the window, as the old launch was (DESIGN §30.13).
+    PopIn,
     /// `control popout`: move what plays to the pop-out without taking the keyboard (MV-2).
     PopOut,
     /// `lock session_now`: lock the parental session now (the app's `ParentalSession::lock`).
@@ -111,6 +119,8 @@ pub struct AgentPlay {
     pub target: PlayTarget,
     /// Movies / episodes: ignore saved progress (else resume unless finished).
     pub from_start: bool,
+    /// Where it shows, resolved by the handler (`act::agent_show`, DESIGN §30.13).
+    pub show: act::AgentShow,
 }
 
 #[derive(Debug, Clone, PartialEq)]
