@@ -138,6 +138,10 @@ pub struct TunerApp {
     popout: PopOut,
     popout_backend: Option<Box<dyn PopOutBackend>>,
     popout_started: bool,
+    /// Started straight into the pop-out (`--play … --popout`, a scheduled switch): under
+    /// Hyprland the window is `crate::POPOUT_APP_ID`, mapped floating and pinned by the
+    /// packaged rule (`PopOutWorker::start`'s `launched`).
+    launched_popped_out: bool,
     /// `f` on the popped-out player: pop in, then go fullscreen.
     fullscreen_after_pop_in: bool,
     /// This frame shows the video-only player (`PopOut::video_only` at the window's size):
@@ -260,6 +264,7 @@ impl TunerApp {
             popout: PopOut::default(),
             popout_backend: None,
             popout_started: false,
+            launched_popped_out: initial.popout,
             fullscreen_after_pop_in: false,
             video_only: false,
             window_size: egui::vec2(1280.0, 800.0),
@@ -793,9 +798,10 @@ impl TunerApp {
         if req.reminder.is_some() {
             self.services().agent.wake_reminders();
         }
-        // `--play <ref> --popout` (a scheduled launch): the pop-out, never taking focus — on the
-        // first frame the Hyprland worker runs (at startup it doesn't yet)
-        if req.popout && req.play.is_some() {
+        // `--play <ref> --popout`, or a scheduled switch that started Tuner for the pop-out (its
+        // countdown then shows in the pop-out, where it plays): the pop-out, never taking focus
+        // — on the first frame the Hyprland worker runs (at startup it doesn't yet)
+        if req.popout {
             self.reminder_ui.pop_out_pending = true;
         }
         match req.view {
@@ -2225,8 +2231,8 @@ impl eframe::App for TunerApp {
             w.pre_present_notify();
             if !self.popout_started {
                 self.popout_started = true;
-                self.popout_backend =
-                    crate::platform::popout::PopOutWorker::start(self.services().bus.clone()).map(|w| Box::new(w) as Box<dyn PopOutBackend>);
+                self.popout_backend = crate::platform::popout::PopOutWorker::start(self.services().bus.clone(), self.launched_popped_out)
+                    .map(|w| Box::new(w) as Box<dyn PopOutBackend>);
             }
             if let Some((w, h)) = self.devshot.as_mut().and_then(|d| d.initial_size()) {
                 float_window_at(w, h);
@@ -3868,6 +3874,26 @@ mod tests {
         assert_eq!(rig.app.routes, [Route::Settings(Default::default()), Route::Player]);
         assert_eq!(played(&rig.log()), [(MediaRef::Url("http://127.0.0.1:9/x.ts".into()), PlayOrigin::Cli)]);
         assert_eq!(rig.log().jobs.first(), Some(&JobKind::RebuildLibrary), "the library loads asynchronously at startup");
+    }
+
+    /// A scheduled switch that started Tuner for the pop-out (`main`: `StartApp { popout }` →
+    /// `IpcRequest { reminder, popout }`, no `--play`): the window pops out on the first frame
+    /// the Hyprland worker runs, so the countdown shows in the pop-out and the switch plays
+    /// there; the worker is told the window was launched for it. A running Tuner's reminder
+    /// wake-up (no `popout`) doesn't pop anything out.
+    #[test]
+    fn scheduled_launch_for_the_pop_out_pops_out_at_once() {
+        let req = IpcRequest { reminder: Some(42), popout: true, ..Default::default() };
+        let mut rig = Rig::with(test_config(), req, 1.0, |_| Ok(()));
+        assert!(rig.app.launched_popped_out);
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        rig.app.popout_backend = Some(Box::new(PopRecorder(sent.clone())));
+        rig.frame_with(vec![]);
+        assert!(matches!(sent.borrow().as_slice(), [PopRequest::Out { .. }]), "{:?}", sent.borrow());
+        rig.app.handle_ipc(&IpcRequest { reminder: Some(42), ..Default::default() });
+        rig.frame_with(vec![]);
+        assert_eq!(sent.borrow().len(), 1, "{:?}", sent.borrow());
+        assert!(rig.app.video_only, "the pop-out's video-only layout from the request on");
     }
 
     #[test]

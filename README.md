@@ -1029,7 +1029,7 @@ tuner claude-setup [--apply]
 |---|---|
 | `--view <screen>` | Open that screen. If Tuner is already running, it switches the running window. |
 | `--play <ref>` | Play a channel by its stable reference `<source-id>:<item-key>` (e.g. `2:xt:live:1234`), a stream URL or a media file. |
-| `--popout` | With `--play`: play it in the pop-out player (Hyprland), without taking focus. |
+| `--popout` | With `--play`: play it in the pop-out player (Hyprland), without taking focus. Started this way, the window's class is `tuner-popout` (see [Pop-out player](#pop-out-player)). |
 | `--reminder <id>` | Fire reminder `<id>` now. This is what the reminder timers run while Tuner is closed; you don't need it yourself. |
 | `--debug` | Debug logging for this session, whatever the setting says. |
 | `--profile-dir <dir>` | Keep config, data, cache, logs and the socket under `<dir>`. Use it for testing, or for a second profile. |
@@ -1164,7 +1164,9 @@ in the source tree and in `/usr/share/tuner/` when installed as a package.
 **Hyprland window rules (recommended):** `hypr/tuner.lua` makes the video fully opaque, opting
 out of Omarchy's default window transparency. It also sets **`render_unfocused`**, so playback
 keeps rendering while Tuner is on another workspace. Without that rule, Hyprland stops drawing
-the window; Tuner then pauses video decoding to save CPU, and the audio keeps playing.
+the window; Tuner then pauses video decoding to save CPU, and the audio keeps playing. And it
+keeps a Tuner that starts by itself for a scheduled switch from taking the keyboard: that
+window (class `tuner-popout`) appears floating and pinned, without focus.
 
 ```sh
 cp /usr/share/tuner/hypr/tuner.lua ~/.config/hypr/tuner.lua   # or packaging/hypr/tuner.lua
@@ -1214,6 +1216,12 @@ leaves the pop-out where it is ("Nothing playing"); its page is waiting when you
 - Install the packaged window rules (`hypr/tuner.lua`, above) for the pop-out too: without them
   Omarchy draws unfocused windows at 96 % opacity, so the page behind shows through the video.
   They also keep video rendering while a tiled Tuner sits on another workspace.
+- A scheduled switch (Open in: Pop-out) while Tuner is closed, or `tuner --play <ref>
+  --popout`, starts Tuner straight into the pop-out. That window's class is **`tuner-popout`**
+  (all session long), and the packaged rules map it floating and pinned **without taking the
+  keyboard** from what you are typing in. Esc tiles it like any pop-out. Without the rules it
+  may open tiled and focused first. Popping out a running Tuner never takes the keyboard
+  either. If you have your own rules for class `tuner`, add `tuner-popout` to them.
 
 ## Troubleshooting
 

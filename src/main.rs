@@ -145,6 +145,16 @@ fn main() -> anyhow::Result<()> {
             Theme::from_parts(t.name, t.palette, t.shell, t.tokens.rounding, ui_scale)
         }
     })?;
+    // a launch straight into the pop-out (a scheduled switch, `--play … --popout`): its own app
+    // id, so the packaged Hyprland rule maps it floating, pinned and without the keyboard, at
+    // the pop-out's size (the app then places, sizes and tags it like any pop-out)
+    let app_id = tuner::window_app_id(request.popout, tuner::platform::hypr::is_hyprland());
+    let inner_size = if app_id == tuner::POPOUT_APP_ID {
+        let (w, h) = config.player.popout_size.logical();
+        [w as f32, h as f32]
+    } else {
+        [1280.0, 800.0]
+    };
     let services = Services::start(paths.clone(), config, logs, bus.clone())?;
     services.watch_signals();
 
@@ -160,8 +170,8 @@ fn main() -> anyhow::Result<()> {
         glow_options: eframe::egui_glow::GlowConfiguration { vsync: false, ..Default::default() },
         viewport: egui::ViewportBuilder::default()
             .with_title(tuner::APP_NAME)
-            .with_app_id(tuner::APP_ID)
-            .with_inner_size([1280.0, 800.0])
+            .with_app_id(app_id)
+            .with_inner_size(inner_size)
             .with_min_inner_size([360.0, 240.0]),
         ..Default::default()
     };
