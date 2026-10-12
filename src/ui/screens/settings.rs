@@ -1,5 +1,5 @@
 //! Settings (DESIGN §13.9): page list (Playlists, EPG, Player, Interface, Favourites,
-//! Reminders, Parental, Backup, Hidden, Orphans, About) | page content. Panel idiom; reorder
+//! Reminders, Parental, AI agents, Backup, Hidden, Orphans, About) | page content. Panel idiom; reorder
 //! rows (playlists, EPG priority, favourites lists, Following rules) with Alt+↑/↓ or K/J or the
 //! drag grip.
 //! Playlists page: sources with status, account info (expiry, connections, formats),
@@ -73,6 +73,7 @@ use crate::ui::{LayoutClass, OnboardingStart, OverlayRequest, Route, Screen, Scr
 // The batch features' parts of Settings (base-B): each file is its track's, with the same
 // hooks — `rows` (its rows on the pages it adds to), `act` (its `Act::Feature` buttons), `item`
 // (Enter on its `Item::Feature` rows) and, for a page of its own, `enter` (load on entering).
+mod agents; // the AI agents page (DESIGN §39)
 mod following; // F-C: the Following page (DESIGN §33)
 mod guide_fix; // G-ui: EPG ▸ "Fix guide data… (N to fix)" (DESIGN §31)
 mod multiview; // MV-2: Player ▸ Multi-view (DESIGN §35)
@@ -84,6 +85,7 @@ mod spoiler; // S-ui: the Spoiler guard page (DESIGN §34)
 #[allow(dead_code)] // base-B: each feature file constructs its own once its track fills it
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Feature {
+    Agents,
     Following,
     GuideFix,
     MultiView,
@@ -93,7 +95,7 @@ enum Feature {
 }
 
 /// Every page in list order (`pages` leaves out the features that are off).
-const PAGES_ALL: [(SettingsPage, &str, &str); 13] = [
+const PAGES_ALL: [(SettingsPage, &str, &str); 14] = [
     (SettingsPage::Playlists, glyphs::PLAYLIST, "Playlists"),
     (SettingsPage::Epg, glyphs::GUIDE, "EPG"),
     (SettingsPage::Player, glyphs::PLAY, "Player"),
@@ -103,6 +105,7 @@ const PAGES_ALL: [(SettingsPage, &str, &str); 13] = [
     (SettingsPage::Following, glyphs::FOLLOW, "Following"),
     (SettingsPage::SpoilerGuard, glyphs::SPOILER, "Spoiler guard"),
     (SettingsPage::Parental, glyphs::LOCK, "Parental"),
+    (SettingsPage::Agents, glyphs::AGENT, "AI agents"),
     (SettingsPage::Backup, glyphs::BACKUP, "Backup"),
     (SettingsPage::Hidden, glyphs::HIDDEN, "Hidden items"),
     (SettingsPage::Orphans, glyphs::WARNING, "Orphans"),
@@ -764,6 +767,8 @@ enum Pending {
     UsePlaylist(SourceId),
     /// "Show explicit content" turned on without a PIN: set one first, or show anyway.
     ShowExplicit,
+    /// A feature file's confirm (an agent's Disconnect…), answered through the file.
+    Feature(Feature, i64),
 }
 
 const MENU_EDIT: u8 = 1;
@@ -795,6 +800,7 @@ pub struct SettingsScreen {
     following: following::State,
     #[allow(dead_code)] // base-B: S-ui's
     spoiler: spoiler::State,
+    agents: agents::State,
     page: SettingsPage,
     pane: Pane,
     /// When a click on the page list last opened a page (egui time): at Compact the page
@@ -906,6 +912,7 @@ impl SettingsScreen {
             }
             SettingsPage::Following => following::enter(self, ctx),
             SettingsPage::SpoilerGuard => spoiler::enter(self, ctx),
+            SettingsPage::Agents => agents::enter(self, ctx),
             _ => {}
         }
     }
@@ -913,6 +920,7 @@ impl SettingsScreen {
     /// A feature file's button.
     fn feature_act(&mut self, ctx: &mut UiCtx<'_>, f: Feature, n: u16) {
         match f {
+            Feature::Agents => agents::act(self, ctx, n),
             Feature::Following => following::act(self, ctx, n),
             Feature::GuideFix => guide_fix::act(self, ctx, n),
             Feature::MultiView => multiview::act(self, ctx, n),
@@ -925,6 +933,7 @@ impl SettingsScreen {
     /// Enter on a feature file's row.
     fn feature_item(&mut self, ctx: &mut UiCtx<'_>, f: Feature, id: i64) {
         match f {
+            Feature::Agents => agents::item(self, ctx, id),
             Feature::Following => following::item(self, ctx, id),
             Feature::GuideFix => guide_fix::item(self, ctx, id),
             Feature::MultiView => multiview::item(self, ctx, id),
@@ -1271,6 +1280,7 @@ impl SettingsScreen {
             }
             SettingsPage::Following => following::rows(self, ctx, &mut v),
             SettingsPage::SpoilerGuard => spoiler::rows(self, ctx, &mut v),
+            SettingsPage::Agents => agents::rows(self, ctx, &mut v),
             SettingsPage::Parental => {
                 let has_pin = ctx.config.parental.pin_hash.is_some();
                 v.push(Row::Section("Parental lock".into()));
@@ -2325,6 +2335,11 @@ impl SettingsScreen {
                 Some(menu) => menu,
                 None => return,
             },
+            // an agent: Connect / Update / Disconnect… and the Copy actions (none while busy)
+            Item::Feature(Feature::Agents, id) => match agents::menu(ctx, id) {
+                Some(menu) => menu,
+                None => return,
+            },
             // a feature file opens its own menu from `item`
             Item::AttachTarget(_) | Item::Categories(_) | Item::Feature(..) => return,
         };
@@ -2385,6 +2400,7 @@ impl SettingsScreen {
                 }));
             }
             (Item::Feature(Feature::Following, id), code) if code != MENU_UP && code != MENU_DOWN => following::menu_choice(self, ctx, id, code),
+            (Item::Feature(Feature::Agents, id), code) => agents::menu_choice(self, ctx, id, code),
             (item, MENU_UP) | (item, MENU_DOWN) => self.reorder(ctx, item, if code == MENU_UP { -1 } else { 1 }),
             (Item::Reminder(id), MENU_DELETE) => self.cancel_reminder(ctx, id),
             (Item::Explicit(id), MENU_TOGGLE) => self.toggle_explicit_item(ctx, id),
@@ -2924,7 +2940,8 @@ impl Screen for SettingsScreen {
                         self.apply_use_xtream(ctx, false);
                     }
                 }
-                Pending::Menu(_) | Pending::Adjust(_) | Pending::ShowExplicit => {}
+                Pending::Feature(Feature::Agents, id) => agents::confirmed(ctx, id),
+                Pending::Menu(_) | Pending::Adjust(_) | Pending::ShowExplicit | Pending::Feature(..) => {}
             },
             // the PIN was entered: retry what needed it (the same value change, else Enter)
             (OverlayResult::Unlocked(_), pending) => {
@@ -2941,6 +2958,7 @@ impl Screen for SettingsScreen {
 
     fn ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) {
         self.poll_loaders(ctx);
+        agents::frame(self, ui);
         let theme = ctx.theme;
         let compact = ctx.layout == LayoutClass::Compact;
         let full = ui.available_rect_before_wrap();
@@ -3296,7 +3314,8 @@ impl SettingsScreen {
                             inner.label(RichText::new(icon).size(theme.font(TypeToken::IconLarge)).color(c));
                         }
                         let more = matches!(item, Item::Source(_) | Item::Epg(_) | Item::List(_) | Item::Orphan(_) | Item::Reminder(_))
-                            || matches!(item, Item::Feature(Feature::Following, id) if *id > 0);
+                            || matches!(item, Item::Feature(Feature::Following, id) if *id > 0)
+                            || matches!(item, Item::Feature(Feature::Agents, _));
                         // the button is laid out first so long names and errors end before it
                         inner.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if more {

@@ -38,6 +38,7 @@ struct Headless {
 
 impl Headless {
     fn start(root: &std::path::Path) -> Self {
+        tuner::platform::keep_off_desktop(); // no agent CLI, desktop or session bus of the user's
         let mut paths = AppPaths::rooted(root);
         paths.home = root.join("home"); // never the user's theme or fonts
         let mut cfg = Config::load(&paths.config_file()).expect("demo config");

@@ -1,0 +1,15 @@
+# pacman scriptlet for omatuner (PKGBUILD install=). It only prints a hint: pacman runs it as
+# root, and connecting an AI agent changes that agent's settings in the user's home directory,
+# so Tuner does it (its card on the next start, or Settings ▸ AI agents) when the user asks.
+
+post_install() {
+  echo "==> To connect an AI agent (Claude Code, Codex, Gemini CLI…) to Tuner: Tuner offers it"
+  echo "    when it next starts, or open Settings ▸ AI agents (Claude Code: tuner claude-setup)."
+}
+
+post_upgrade() {
+  # Once, on the upgrade that brings the card and the page; later upgrades stay quiet.
+  if (( $(vercmp "$2" 0.2.3) < 0 )); then
+    post_install
+  fi
+}

@@ -13,10 +13,13 @@
 //! * [`client`] — `tuner mcp`'s IPC v2 client: connect, launch Tuner when needed, retry while
 //!   it loads.
 //! * [`mcp`] — the MCP stdio server (`tuner mcp`).
+//! * [`connect`] — connecting AI agents to Tuner from Tuner (the first-run card, Settings ▸ AI
+//!   agents; DESIGN §39).
 
 pub mod act;
 pub mod actions;
 pub mod client;
+pub mod connect;
 pub mod follow;
 pub mod guard;
 pub mod guide;

@@ -78,6 +78,9 @@ pub struct Services {
     /// unlock, the guard, the pictures, Up next; DESIGN §30.4). The agent handler itself lives in
     /// the IPC server.
     pub agent: Arc<crate::shared::AppShared>,
+    /// Connecting AI agents to Tuner: detection, status, connect / update / disconnect, the
+    /// start-of-version pass (DESIGN §39). Runs nothing off the desktop.
+    pub agent_connect: crate::agent::connect::AgentConnect,
     /// Set when [`Services::shutdown`] begins (the signal watcher leaves the exit to it; a
     /// signal after that means it is stuck).
     closing: Arc<AtomicBool>,
@@ -125,6 +128,7 @@ impl Services {
         memory.watch_player(rt.handle(), TileId::A, player.handle().subscribe());
         let tiles = crate::player::tiles::Tiles::single(player);
         agent.set_main_player(tiles.main_watch());
+        let agent_connect = crate::agent::connect::AgentConnect::for_services(&paths, store.clone(), bus.clone(), rt.handle().clone());
         Ok(Self {
             paths,
             config,
@@ -140,6 +144,7 @@ impl Services {
             undo: Default::default(),
             memory,
             agent,
+            agent_connect,
             closing: Arc::default(),
             socket: Arc::default(),
         })
@@ -404,6 +409,8 @@ impl Services {
         // the signal watcher stays until the runtime stops: a signal during a stuck shutdown
         // still exits directly (`platform::signals`)
         self.closing.store(true, Ordering::SeqCst);
+        // agent CLIs still running are killed with what they started
+        self.agent_connect.shutdown();
         if let Some(m) = &mut self.integrations.mpris {
             m.stop();
         }

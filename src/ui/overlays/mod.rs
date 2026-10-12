@@ -7,6 +7,7 @@
 //! (2 px border; popups use the accent border); opens centred, grows downward only once
 //! typing starts (launcher idiom).
 
+pub mod agent_connect;
 pub mod categories;
 pub mod delete_playlist;
 pub mod dialogs;
@@ -185,5 +186,6 @@ pub fn build(req: OverlayRequest, ctx: &mut UiCtx<'_>) -> Box<dyn Overlay> {
         OverlayRequest::SleepTimer => Box::<reminders::SleepTimerMenu>::default(),
         OverlayRequest::ReminderSheet(spec) => Box::new(reminders::ReminderSheet::new(spec)),
         OverlayRequest::WatchAlongside => Box::new(crate::ui::multiview::AlongsidePicker),
+        OverlayRequest::AgentConnect(offer) => Box::new(agent_connect::AgentConnectCard::new(offer)),
     }
 }

@@ -29,6 +29,8 @@ optdepends=('hyprland: window rules from /usr/share/tuner/hypr, raising the wind
 # (Cargo.toml), so makepkg must not strip again, and a split -debug package would be empty.
 options=('!lto' '!debug' '!strip')
 source=()
+# Prints how to connect an AI agent (after install, and on the upgrade that brought it); no more.
+install=omatuner.install
 _srcdir="$(realpath "$startdir/..")"
 
 # aws-lc-sys (rustls' crypto) compiles jitterentropy with -O0 and refuses any optimisation, but
@@ -84,8 +86,8 @@ package() {
   install -Dm644 packaging/hypr/tuner.lua "$pkgdir/usr/share/tuner/hypr/tuner.lua"
   install -Dm644 packaging/omarchy/omarchy-menu.jsonc "$pkgdir/usr/share/tuner/omarchy/omarchy-menu.jsonc"
   # The Claude Code plugin (its marketplace, the `tuner mcp` server entry, the skills): installed
-  # here only; `tuner claude-setup` prints (or, asked, runs) the commands that add it to Claude
-  # Code. Nothing is written to the home directory.
+  # here only. Tuner adds it to Claude Code when the user asks (its first-start card, Settings ▸ AI
+  # agents, or `tuner claude-setup`). Nothing is written to the home directory.
   install -Dm644 .claude-plugin/marketplace.json "$pkgdir/usr/share/tuner/claude/.claude-plugin/marketplace.json"
   local _f
   while IFS= read -r -d '' _f; do

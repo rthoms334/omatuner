@@ -66,6 +66,7 @@ impl App {
     /// in-memory test overrides that are never saved (headless mpv, no session-bus or theme
     /// integrations, no launch refresh).
     fn start(root: &Path) -> Self {
+        tuner::platform::keep_off_desktop(); // no agent CLI, desktop or session bus of the user's
         let paths = profile(root);
         let mut cfg = Config::load(&paths.config_file()).expect("config");
         cfg.player.mpv_options.insert("vo".into(), "null".into());

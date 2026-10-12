@@ -87,6 +87,8 @@ pub enum SettingsPage {
     Following,
     /// The spoiler guard (DESIGN §34; listed once `spoiler::ENABLED`).
     SpoilerGuard,
+    /// Connect AI agents to Tuner (DESIGN §39).
+    Agents,
 }
 
 /// Where the onboarding card starts (the same card is reused by Settings ▸ Playlists ▸ Add,
@@ -231,6 +233,9 @@ pub enum OverlayRequest {
     ReminderSheet(overlays::reminders::ReminderSheetSpec),
     /// Choose the channel for the other picture (Ctrl+M in the player; DESIGN §35, MV-2).
     WatchAlongside,
+    /// The first-run card: connect the AI agents found on this computer (DESIGN §39). Opened
+    /// by the app, once per Tuner version.
+    AgentConnect(crate::agent::connect::Offer),
 }
 
 /// Requests a screen makes during a frame; the app applies them after the frame.

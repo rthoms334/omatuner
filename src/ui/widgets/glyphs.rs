@@ -99,5 +99,9 @@ pub const SPOILER: &str = HIDDEN;
 pub const MULTI_VIEW: &str = MINI_PLAYER;
 pub const SLEEP: &str = REMINDER;
 pub const GUIDE_FIX: &str = GUIDE;
+/// An AI agent (Settings ▸ AI agents; nf-md-robot).
+pub const AGENT: &str = "\u{f06a9}";
+/// Copy to the clipboard (nf-md-content_copy).
+pub const COPY: &str = "\u{f018f}";
 
 pub const SOURCE_ICONS: &[&str] = &[PLAYLIST, LIVE_TV, SOURCE_XTREAM, SOURCE_URL, MOVIES, SERIES, RADIO, MUSIC, FAVOURITE, HEART, FOLDER, TAG];

@@ -63,6 +63,7 @@ fn memory_stays_flat_over_2000_zaps_and_guide_scrolls() {
     // the allocator setup of `main` (glibc arenas; without it mpv's per-file threads fragment
     // the heap and RSS climbs ~50 KiB per zap)
     tuner::platform::limit_malloc_arenas();
+    tuner::platform::keep_off_desktop(); // no agent CLI, desktop or session bus of the user's
     let Some(media) = ensure_media() else { return };
     let zaps: usize = std::env::var("TUNER_SOAK_ZAPS").ok().and_then(|v| v.parse().ok()).unwrap_or(2_000);
     let warmup = (zaps / 5).max(1);
