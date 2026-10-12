@@ -172,7 +172,8 @@ pub(super) async fn handle(h: &Arc<Inner>, p: MultiView) -> Out<Value> {
     let send = |m: AgentMultiView| h.bus.send(AppEvent::Agent(AgentCommand::MultiView(m)));
     match p.action {
         MultiViewAction::Open => {
-            let snap = h.player.snapshot();
+            // the picture that keeps playing is the focused one (one ref goes alongside it)
+            let snap = h.tiles.as_ref().and_then(|r| r.get(tiles.focus)).map_or_else(|| h.player.snapshot(), |p| p.snapshot());
             let playing_item = snap.playable.as_ref().filter(|p| p.kind.is_live()).and_then(|p| p.item.clone());
             let claim = snap.claim;
             let on = tiles.on;

@@ -437,7 +437,9 @@ impl Inner {
             ControlAction::Volume | ControlAction::Mute | ControlAction::Unmute => {
                 get(audible).or_else(|| get(crate::model::TileId::A)).into_iter().collect()
             }
-            ControlAction::PreviousChannel | ControlAction::Popout => vec![self.player.clone()],
+            ControlAction::PreviousChannel | ControlAction::Popout => {
+                get(self.shared.tiles().focus).or_else(|| get(crate::model::TileId::A)).into_iter().collect()
+            }
             _ => match &self.tiles {
                 Some(reg) => reg.all(),
                 None => vec![self.player.clone()],

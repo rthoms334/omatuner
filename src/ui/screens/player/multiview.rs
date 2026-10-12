@@ -276,9 +276,15 @@ impl PlayerScreen {
         for (i, ((_, label, tip, req), w)) in items.into_iter().zip(widths).enumerate() {
             let r = Rect::from_min_size(egui::pos2(x, bar.top()), egui::vec2(w, h));
             x += w;
+            // "Sound here" on the picture that has it does nothing: drawn dimmed
             let disabled = req == MvRequest::Sound(None) && view.audible == view.focus;
             let text = &texts[i];
-            if osd_button(ui, &p, theme, r, ui.id().with(("mv-bar", i)), text, font.clone(), label, Some(tip), false).clicked() && !disabled {
+            let mut painter = p.clone();
+            if disabled {
+                painter.multiply_opacity(0.45);
+            }
+            let tip = if disabled { "This picture has the sound" } else { tip };
+            if osd_button(ui, &painter, theme, r, ui.id().with(("mv-bar", i)), text, font.clone(), label, Some(tip), false).clicked() && !disabled {
                 ctx.mv_request(req);
                 self.show_banner(ctx);
             }
@@ -384,7 +390,19 @@ fn strip_text(ctx: &mut UiCtx<'_>, snap: &PlayerSnapshot) -> StripText {
     let now = now.or_else(|| {
         snap.playable.as_ref().filter(|_| catchup).map(|p| {
             let pos = snap.position.zip(snap.duration).map_or(0.0, |(a, b)| (a / b.max(1.0)) as f32);
-            (p.subtitle.clone().unwrap_or_else(|| "Catch-up".into()), "Catch-up".into(), pos)
+            // a catch-up's sub-title is its programme's title: the spoiler guard's, as the guide's
+            let start = match p.kind {
+                PlayableKind::Catchup { start, .. } => start,
+                _ => 0,
+            };
+            let title = p.subtitle.as_deref().map_or_else(
+                || "Catch-up".to_owned(),
+                |t| {
+                    let subject = crate::guard::Subject::Programme { title: t, sub_title: None, categories: &[], season_episode: None, start };
+                    spoilers.text(&subject, crate::guard::Field::Title, t).map(|c| c.into_owned()).unwrap_or_default()
+                },
+            );
+            (title, "Catch-up".into(), pos)
         })
     });
     StripText { head, now, next }

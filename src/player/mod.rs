@@ -131,7 +131,12 @@ pub enum PlayerCommand {
         unlocked: bool,
     },
     /// Tune a channel by id keeping the current ZapList and origin (numeric entry, history).
-    ZapTo(ChannelId),
+    /// `unlocked` as for [`PlayerCommand::Zap`]: while false (and a PIN is set) a PIN-locked
+    /// copy never stands in for it when the other picture holds its playlist.
+    ZapTo {
+        id: ChannelId,
+        unlocked: bool,
+    },
     /// Recall the previously watched live channel (Backspace / UHF ←). Ignored when that
     /// channel is PIN-locked, a PIN is set and `unlocked` is false (the session re-locked since).
     LastChannel {
@@ -754,7 +759,7 @@ mod tests {
 
     /// Two playlists of three channels each (1–3 on playlist 1, 4–6 on playlist 2), all
     /// playing lavfi's test source; channel 4's copy is channel 2, channel 1's is channel 5.
-    /// Like the user's "TV" and "TV 2" with one connection each.
+    /// Channel 2 is PIN-locked. Like the user's "TV" and "TV 2" with one connection each.
     struct TwoPlaylists;
 
     impl TwoPlaylists {
@@ -786,8 +791,8 @@ mod tests {
         fn skip_on_zap(&mut self, _ch: ChannelId) -> bool {
             false
         }
-        fn is_locked(&mut self, _ch: ChannelId) -> bool {
-            false
+        fn is_locked(&mut self, ch: ChannelId) -> bool {
+            ch.0 == 2
         }
         fn channel_source(&mut self, ch: ChannelId) -> Option<SourceId> {
             Some(Self::source(ch))
@@ -890,11 +895,20 @@ mod tests {
         assert_eq!(tiles.budget().usage().iter().map(|u| u.in_use).sum::<u32>(), 1);
 
         // "Move picture A to its TV 2 copy so B can use TV?" — Enter
-        tiles.rearrange(TileId::A, SourceId(2), PlayerCommand::ZapTo(ChannelId(5)), TileId::B, PlayerCommand::Play(channel(2, None)));
+        let zap_to = |id: i64| PlayerCommand::ZapTo { id: ChannelId(id), unlocked: true };
+        tiles.rearrange(TileId::A, SourceId(2), zap_to(5), TileId::B, Some(SourceId(1)), PlayerCommand::Play(channel(2, None)));
         assert!(on(&a, 5) && on(&b, 2), "both play: A {:?}, B {:?}", a.snapshot().state, b.snapshot().state);
         assert_eq!((a.snapshot().claim, b.snapshot().claim), (Some(SourceId(2)), Some(SourceId(1))));
         let usage = tiles.budget().usage();
         assert!(usage.iter().all(|u| u.in_use == 1 && u.limit == Some(1)), "never two streams on one playlist: {usage:?}");
+
+        // the two swap playlists (B wants a TV 2-only channel; A goes back to TV): whichever
+        // player takes its command first waits for the other's old stream, never refused
+        tiles.rearrange(TileId::A, SourceId(1), zap_to(1), TileId::B, Some(SourceId(2)), PlayerCommand::Play(channel(6, None)));
+        assert!(on(&a, 1) && on(&b, 6), "both play after the swap: A {:?}, B {:?}", a.snapshot().state, b.snapshot().state);
+        assert_eq!((a.snapshot().claim, b.snapshot().claim), (Some(SourceId(1)), Some(SourceId(2))));
+        let usage = tiles.budget().usage();
+        assert!(usage.iter().all(|u| u.in_use == 1), "never two streams on one playlist: {usage:?}");
     }
 
     /// Zapping picture B onto a channel whose playlist A holds plays its copy on the free
@@ -919,6 +933,27 @@ mod tests {
         let skipped: Vec<_> = tile_events(&events).into_iter().filter(|e| matches!(e, PlayerEvent::ZapSkipped { .. })).collect();
         assert_eq!(skipped, [PlayerEvent::ZapSkipped { channel: ChannelId(6), source: SourceId(2), holder: Some(TileId::A) }]);
         assert_eq!(a.snapshot().playable.as_ref().map(|p| p.media.clone()), Some(MediaRef::Channel(ChannelId(5))), "A untouched");
+
+        // numeric entry while the session is locked: channel 4's copy (2) is PIN-locked, so it
+        // never stands in — the budget's refusal stands — until the sender is unlocked
+        let mut cfg = headless_config();
+        cfg.parental = crate::config::ParentalConfig {
+            show_explicit: true,
+            enabled: true,
+            pin_hash: Some("h".into()),
+            pin_salt: Some("s".into()),
+            relock_min: 0,
+        };
+        b.send(PlayerCommand::ApplyConfig(Box::new(cfg)));
+        b.send(PlayerCommand::ZapTo { id: ChannelId(4), unlocked: false });
+        assert!(
+            wait_until(Duration::from_secs(10), || matches!(&b.snapshot().state, PlayerState::Error(e) if e.kind == PlayerErrorKind::Budget)),
+            "{:?}",
+            b.snapshot().state
+        );
+        assert_ne!(b.snapshot().playable.as_ref().map(|p| p.media.clone()), Some(MediaRef::Channel(ChannelId(2))), "the locked copy never played");
+        b.send(PlayerCommand::ZapTo { id: ChannelId(4), unlocked: true });
+        assert!(on(&b, 2), "an unlocked sender gets the copy: {:?}", b.snapshot().playable);
     }
 
     /// One listening volume (DESIGN §35 §4.3): B is silent from its creation; moving the sound
