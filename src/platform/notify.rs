@@ -500,6 +500,21 @@ pub async fn notify_with_open(summary: &str, body: &str, on_open: Box<dyn FnOnce
     show_with_action(None, summary, body, ("open", "Open"), on_open).await
 }
 
+/// A cast alert while Tuner's window isn't on a visible workspace (DESIGN §40 §3.8): the
+/// alert's fixed sentence (`summary`, `body`: no device or provider text beyond the TV's
+/// sanitized name) with **Show** (and a click on its body), which raises Tuner (raised right
+/// away: the UI may not run while the window sits on another workspace) and sends
+/// `PlatformEvent::ShowPlayer` — the player, where the casting card has the actions (Allow on
+/// firewall, Play here…). False when no notification server answered (the caller toasts
+/// instead). Must run inside a tokio runtime.
+pub async fn notify_cast(summary: &str, body: &str, bus: EventBus) -> bool {
+    let on_show: Box<dyn FnOnce() + Send> = Box::new(move || {
+        bus.send(AppEvent::Platform(PlatformEvent::ShowPlayer));
+        crate::platform::hypr::focus_self();
+    });
+    show_with_action(None, summary, body, ("show", "Show"), on_show).await
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum Decision {
     /// Ended while nobody was looking: mark `Dismissed`, no notification.
@@ -681,8 +696,9 @@ impl Engine {
                         tracing::info!("reminder {}: switching now ({open_in:?})", r.id);
                         // raise first: the UI may not run while the window sits on another
                         // workspace. Only for the full window: the pop-out and "where I am"
-                        // never take focus (the pop-out shows on every workspace).
-                        if !s.rich || open_in == OpenIn::FullWindow {
+                        // never take focus (the pop-out shows on every workspace). Never while
+                        // casting: the switch retunes the TV (DESIGN §40 §3.8)
+                        if (!s.rich || open_in == OpenIn::FullWindow) && !facts.ctx.route.casting {
                             crate::platform::hypr::focus_self();
                         }
                         let event = if s.rich {
