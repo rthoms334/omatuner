@@ -4,8 +4,8 @@
 //! MCP-app track.
 
 use super::proto::{
-    AgentRef, Airing, CancelSwitch, ErrorCode, NowPlayingOut, Play, PlayOut, PlayOutcome, PlayerStateOut, ScheduleSwitch, StatusOut, SwitchOut,
-    fmt_time, item_ref,
+    AgentRef, Airing, CancelSwitch, ErrorCode, MultiviewStatusOut, NowPlayingOut, Play, PlayOut, PlayOutcome, PlayerStateOut, QueueNextOut,
+    QueueStatusOut, ScheduleSwitch, SleepOut, StatusOut, StreamsOut, SwitchOut, TileName, TileOut, fmt_time, item_ref,
 };
 use super::query::{Fail, Out, Q, channel_ref, clean, parse_ref, when};
 use super::{AgentCommand, AgentPlay, PlayTarget};
@@ -19,7 +19,7 @@ pub const MAX_SWITCHES: usize = 20;
 pub const MAX_SWITCH_AHEAD_S: i64 = 14 * 86_400;
 
 /// `HH:MM` alone (no date): today's, or tomorrow's once it has passed.
-fn is_clock_time(s: &str) -> bool {
+pub(super) fn is_clock_time(s: &str) -> bool {
     let digits = |x: &str| !x.is_empty() && x.len() <= 2 && x.bytes().all(|b| b.is_ascii_digit());
     s.trim().split_once(':').is_some_and(|(h, m)| digits(h) && m.len() == 2 && digits(m))
 }
@@ -291,8 +291,93 @@ pub fn scheduled(q: &Q) -> Out<Vec<SwitchOut>> {
         .collect())
 }
 
-pub fn status(q: &Q, snap: &PlayerSnapshot) -> Out<StatusOut> {
-    let state = match &snap.state {
+/// What `status` adds from outside the player (the handler gathers it).
+#[derive(Debug, Clone, Default)]
+pub struct StatusMore {
+    pub queue: std::sync::Arc<crate::queue::QueueSnapshot>,
+    pub tiles: crate::playback::TilesState,
+    /// Picture B's snapshot, while it exists.
+    pub tile_b: Option<std::sync::Arc<PlayerSnapshot>>,
+    pub sleep: Option<crate::reminders::sleep::SleepStatus>,
+}
+
+/// [`status`] with Up next, multi-view, the playlists' streams and the sleep timer.
+pub fn status_with(q: &Q, snap: &PlayerSnapshot, more: &StatusMore) -> Out<StatusOut> {
+    let mut out = status(q, snap)?;
+    let queue = &more.queue;
+    if queue.pending() > 0 {
+        let next = queue.next.and_then(|id| queue.row(id)).map(|r| QueueNextOut { item: item_ref(&r.entry.item), title: clean(&r.entry.title) });
+        out.queue = Some(QueueStatusOut {
+            current_id: queue.current.map(|i| i.0),
+            next,
+            left: queue.pending() as u32,
+            eta_end: queue.eta_end.map(|(t, _)| fmt_time(t)),
+            playing: queue.driving,
+        });
+    }
+    let mut snaps: Vec<(crate::model::TileId, &PlayerSnapshot)> = vec![(crate::model::TileId::A, snap)];
+    if let Some(b) = more.tile_b.as_deref() {
+        snaps.push((crate::model::TileId::B, b));
+    }
+    if more.tiles.on {
+        let tiles = snaps
+            .iter()
+            .map(|(t, s)| {
+                let shown = s.playable.as_ref().filter(|p| !p.item.as_ref().is_some_and(|i| q.conceals(i)));
+                TileOut {
+                    tile: TileName::of(*t),
+                    item: shown.and_then(|p| p.item.as_ref()).map(item_ref),
+                    title: shown.map(|p| clean(&p.title)),
+                    playlist: s.claim.and_then(|src| q.lib.source(src)).map(|m| clean(&m.name)),
+                    state: state_out(s),
+                    sound: more.tiles.audible == *t,
+                    focused: more.tiles.focus == *t,
+                }
+            })
+            .collect();
+        out.multiview = Some(MultiviewStatusOut { on: true, tiles });
+    }
+    // the connection limit of each playlist with channels, and the pictures holding it
+    let accounts: std::collections::HashMap<crate::model::SourceId, Option<u32>> =
+        crate::store::sources::list_sources(q.conn)?.into_iter().map(|s| (s.id, s.status.account.and_then(|a| a.max_connections))).collect();
+    out.streams = q
+        .lib
+        .sources
+        .iter()
+        .filter(|s| s.enabled && s.has_live)
+        .map(|s| StreamsOut {
+            playlist: clean(&s.name),
+            limit: accounts.get(&s.id).copied().flatten(),
+            in_use: snaps.iter().filter(|(_, x)| x.claim == Some(s.id)).count() as u32,
+        })
+        .collect();
+    out.sleep_timer = more.sleep.map(|s| sleep_out(&s));
+    Ok(out)
+}
+
+/// The sleep timer as tools show it.
+pub fn sleep_out(s: &crate::reminders::sleep::SleepStatus) -> SleepOut {
+    use crate::reminders::sleep::{SleepAction, SleepWhen};
+    SleepOut {
+        when: match s.when {
+            SleepWhen::At(_) => "at",
+            SleepWhen::EndOfProgramme => "end_of_programme",
+            SleepWhen::AfterItems(_) => "after_items",
+            SleepWhen::EndOfQueue => "end_of_queue",
+        }
+        .into(),
+        then: match s.action {
+            SleepAction::Stop => "stop",
+            SleepAction::Pause => "pause",
+        }
+        .into(),
+        fires_at: s.fires_at.map(fmt_time),
+        items_left: s.items_left,
+    }
+}
+
+fn state_out(snap: &PlayerSnapshot) -> PlayerStateOut {
+    match &snap.state {
         PlayerState::Idle | PlayerState::Ended => PlayerStateOut::Idle,
         PlayerState::Zapping { .. } | PlayerState::Loading { .. } => PlayerStateOut::Loading,
         PlayerState::Playing if snap.paused => PlayerStateOut::Paused,
@@ -301,7 +386,11 @@ pub fn status(q: &Q, snap: &PlayerSnapshot) -> Out<StatusOut> {
         PlayerState::Buffering { .. } => PlayerStateOut::Buffering,
         PlayerState::Reconnecting { .. } => PlayerStateOut::Reconnecting,
         PlayerState::Error(_) => PlayerStateOut::Error,
-    };
+    }
+}
+
+pub fn status(q: &Q, snap: &PlayerSnapshot) -> Out<StatusOut> {
+    let state = state_out(snap);
     let idle = state == PlayerStateOut::Idle;
     let now_playing = snap.playable.as_ref().filter(|_| !idle).and_then(|p| {
         // concealed (explicit while hidden): say nothing about it. The snapshot's explicit
@@ -350,6 +439,10 @@ pub fn status(q: &Q, snap: &PlayerSnapshot) -> Out<StatusOut> {
         error,
         parental_locked: q.view.pin_active && !q.view.unlocked,
         scheduled: scheduled(q)?,
+        queue: None,
+        multiview: None,
+        streams: Vec::new(),
+        sleep_timer: None,
     })
 }
 

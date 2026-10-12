@@ -207,7 +207,7 @@ fn claude_finds_the_live_sport_plays_it_and_schedules_the_next() {
     assert_eq!(init["result"]["serverInfo"]["name"], "tuner");
     bridge.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
     let tools = bridge.request(&mut app, "tools/list", json!({}));
-    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 13);
+    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), tuner::agent::tools::tools().len());
 
     // "sports is on": the live programme, played
     let live = find(&mut bridge, &mut app, "live");

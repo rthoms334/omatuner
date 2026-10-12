@@ -422,6 +422,10 @@ impl TunerApp {
             AppEvent::Ipc(req) => self.handle_ipc(req),
             // the handler raised the window (`hypr::focus_self`) and validated the target
             AppEvent::Agent(crate::agent::AgentCommand::Play(p)) => self.on_agent_play(p.clone()),
+            // `lock session_now`: Claude can only ever lock (the handler's view locked already)
+            AppEvent::Agent(crate::agent::AgentCommand::LockSession) => self.parental.lock(),
+            // the pop-out and multi-view commands are MV-2's (`AgentCommand::{PopOut, MultiView}`)
+            AppEvent::Agent(_) => {}
             // the batch features' events (owners: F-C, rui, MV-2) — nothing to do until they land
             AppEvent::Follow(_) | AppEvent::Reminder(_) | AppEvent::Tile(_) => {}
             AppEvent::Platform(p) => match p {
@@ -3662,7 +3666,7 @@ mod tests {
         };
         let mut ids = Vec::new();
         for q in ["touring", "rally"] {
-            let found = ask(&rig, Call::GuideSearch(GuideSearch { query: q.into(), ..Default::default() }));
+            let found = ask(&rig, Call::GuideSearch(GuideSearch { query: Some(q.into()), ..Default::default() }));
             let item = found["programmes"][0]["ref"].as_str().unwrap().to_owned();
             let s = ask(&rig, Call::ScheduleSwitch(ScheduleSwitch { item, at: None }));
             ids.push(crate::model::ReminderId(s["id"].as_i64().unwrap()));
@@ -3697,7 +3701,7 @@ mod tests {
         use crate::agent::proto::{Call, CancelSwitch, GuideSearch, ScheduleSwitch};
         let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_agent(c, 12));
         rig.settle();
-        let found = ask(&rig, Call::GuideSearch(GuideSearch { query: "touring".into(), ..Default::default() }));
+        let found = ask(&rig, Call::GuideSearch(GuideSearch { query: Some("touring".into()), ..Default::default() }));
         let item = found["programmes"][0]["ref"].as_str().unwrap().to_owned();
         let id = crate::model::ReminderId(ask(&rig, Call::ScheduleSwitch(ScheduleSwitch { item, at: None }))["id"].as_i64().unwrap());
         let showing = |r: &mut Rig| {

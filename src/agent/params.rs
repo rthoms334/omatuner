@@ -362,6 +362,8 @@ pub struct Episodes {
     pub query: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spoiler_safe: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reveal_spoilers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]

@@ -46,6 +46,10 @@ const REFRESH_SETTLE: Duration = Duration::from_millis(500);
 fn main() -> anyhow::Result<()> {
     tuner::platform::limit_malloc_arenas();
     let cli = Cli::parse();
+    // prints (or, with --apply and a "y", runs) the Claude Code setup; touches no profile
+    if let Some(tuner::cli::Command::ClaudeSetup { apply }) = cli.command {
+        return tuner::agent::setup::main(apply);
+    }
     // developer-only screenshot capture (DESIGN §23.1); a typo fails here, not after a minute
     let devshot = tuner::devshot::ShotConfig::from_env().map_err(|e| anyhow::anyhow!("TUNER_SCREENSHOT*: {e}"))?;
     let paths = match &cli.profile_dir {
