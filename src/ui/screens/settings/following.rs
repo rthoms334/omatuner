@@ -203,6 +203,7 @@ pub(super) fn rows(s: &SettingsScreen, ctx: &UiCtx<'_>, v: &mut Vec<Row>) {
             categories: &[],
             season_episode: None,
             start: u.start,
+            is_new: false,
         };
         let guarded = |field, s: &str| spoilers.text(&subject, field, s).map(std::borrow::Cow::into_owned).unwrap_or_default();
         let title = guarded(crate::guard::Field::Title, &u.title);

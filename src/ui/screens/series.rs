@@ -44,4 +44,7 @@ impl Screen for SeriesScreen {
     fn hint_extras(&self) -> Vec<(Action, &'static str)> {
         self.browser.hint_extras()
     }
+    fn reveal_target(&self, ctx: &UiCtx<'_>) -> Option<crate::ui::item_menu::Target> {
+        self.browser.reveal_target(ctx)
+    }
 }

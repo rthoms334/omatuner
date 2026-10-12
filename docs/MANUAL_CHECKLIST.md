@@ -1342,6 +1342,14 @@ once (`claude mcp list` shows `tuner` connected).
 - [ ] **Part-way series:** with a series half watched, open its page and the guide. **Expect:**
   later episodes' titles are bars, plots say "hidden — … · Ctrl+B to show"; the next-up episode
   and earlier ones show. `Ctrl+B` on one reveals it until you move.
+- [ ] **Guide airings of that series:** find its airings in the guide (some guides give no
+  season/episode). **Expect:** an airing whose sub-title is an episode you've seen (or the
+  next-up one) shows it; later episodes and first showings ("new") are bars; the status bar
+  says "Ctrl+B show spoilers" on a hidden one. Watch one to the end (or Ctrl+W it): its repeats
+  show their sub-title afterwards.
+- [ ] **In the player:** play the channel airing a hidden episode. **Expect:** the banner reads
+  "Show · ▆▆▆▆▆▆▆▆ 󰈉" with "Ctrl+B show spoilers"; Ctrl+B shows the episode title ("Ctrl+B
+  hide spoilers"); a zap hides it again.
 - [ ] **Followed sport:** follow your team spoiler-safe; during and after their match, look at
   the guide and the news channels. **Expect:** "Arsenal v Chelsea 󰈉" where a score was (also
   "Arsenal v Chelsea 2-1"); news sub-titles mentioning the team are bars; unrelated sport and
@@ -1351,6 +1359,9 @@ once (`claude mcp list` shows `tuner` connected).
   channel talking about it. **Expect:** the card covers the picture **before any sound** (the
   channel isn't tuned; the previous picture pauses under it); Enter watches anyway, ↓ judges
   the next channel, Backspace resumes the previous one.
+- [ ] **Zap shield in multi-view:** with two pictures, zap the focused one onto that channel.
+  **Expect:** the card covers that picture only; the other keeps playing with sound; `w` to the
+  other picture and Enter does nothing to the card; back on it, Enter watches anyway.
 - [ ] **Notifications:** a reminder for the match's channel fires (Tuner open, then closed).
   **Expect:** no score in the notification either way.
 - [ ] **Claude:** ask Claude "what was the Arsenal score?" and "what's on Sky Sports News?".

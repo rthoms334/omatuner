@@ -313,11 +313,12 @@ impl PlayerScreen {
                 if mini {
                     let nn = live::now_next_of(ctx, &ch);
                     let h24 = ctx.config.interface.clock_24h;
+                    let spoilers = crate::ui::widgets::spoiler::Spoilers::of(ctx);
                     let detail = match nn {
                         Some(n) => {
-                            let now = n.now.map(|p| p.title.to_string()).unwrap_or_else(|| "No information".into());
+                            let now = n.now.map(|p| spoilers.programme_title(&p).into_owned()).unwrap_or_else(|| "No information".into());
                             match n.next {
-                                Some(nx) => format!("{now} · {} {}", hhmm(nx.start, h24), nx.title),
+                                Some(nx) => format!("{now} · {} {}", hhmm(nx.start, h24), spoilers.programme_title(&nx)),
                                 None => now,
                             }
                         }

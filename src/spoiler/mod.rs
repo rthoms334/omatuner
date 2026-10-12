@@ -31,6 +31,11 @@ pub fn local_date(ts: Timestamp) -> String {
     jiff::Timestamp::from_second(ts).map(|t| t.to_zoned(jiff::tz::TimeZone::system()).date().to_string()).unwrap_or_default()
 }
 
+/// The local date of an instant (the air-date checks of series airings).
+pub fn local_day(ts: Timestamp) -> Option<jiff::civil::Date> {
+    jiff::Timestamp::from_second(ts).ok().map(|t| t.to_zoned(jiff::tz::TimeZone::system()).date())
+}
+
 /// The event key of a guide programme (`textmatch::event_key`, shared with Following's
 /// ledger): what "seen" is recorded against.
 pub fn event_key_of(title: &str, sub_title: Option<&str>, description: Option<&str>, season_episode: Option<(i32, i32)>, start: Timestamp) -> String {
@@ -61,9 +66,43 @@ pub fn seen_row_for(p: &crate::model::Programme, how: crate::model::SeenHow, now
     }
 }
 
+/// [`seen_row_for`] placed by the guard: an airing of a guarded series whose sub-title names
+/// an episode records that episode (watching it moves the series on); one nothing places keeps
+/// its series key so a repeat of it shows (DESIGN §34.5).
+pub fn placed_seen_row(
+    snap: &snapshot::GuardSnapshot,
+    p: &crate::model::Programme,
+    how: crate::model::SeenHow,
+    now: Timestamp,
+) -> crate::model::SeenRow {
+    let mut row = seen_row_for(p, how, now);
+    place_seen_row(snap, &mut row, p.sub_title.as_deref());
+    row
+}
+
+/// Place a seen row of an airing without S/E (see [`placed_seen_row`]).
+pub fn place_seen_row(snap: &snapshot::GuardSnapshot, row: &mut crate::model::SeenRow, sub_title: Option<&str>) {
+    if row.episode.is_some() || !verdict::guards_series(snap, &row.title) {
+        return;
+    }
+    if let Some((s, e)) = verdict::placed_episode(snap, &row.title, sub_title) {
+        row.season = Some(s);
+        row.episode = Some(e);
+        row.series_norm = Some(series_key(&row.title));
+    } else if row.event_key.contains('#') {
+        // "title#sub-title": the airing's own key, kept like the series' episodes
+        row.series_norm = Some(series_key(&row.title));
+    }
+}
+
 /// A programme's season and episode, when the guide gave both.
 pub fn programme_se(p: &crate::model::Programme) -> Option<(i32, i32)> {
-    p.episode.and_then(|e| Some((i32::try_from(e.season?).ok()?, i32::try_from(e.episode?).ok()?)))
+    p.episode.and_then(episode_se)
+}
+
+/// A guide `<episode-num>` as (season, episode), when it has both.
+pub fn episode_se(e: crate::model::EpisodeNum) -> Option<(i32, i32)> {
+    Some((i32::try_from(e.season?).ok()?, i32::try_from(e.episode?).ok()?))
 }
 
 /// The key series rules and `Subject::{Vod, Episode}::series_norm` use: the catalogue's

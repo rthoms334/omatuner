@@ -102,7 +102,7 @@ fn guarded(sp: &crate::ui::widgets::spoiler::Spoilers, e: &QueueEntry) -> QueueE
     use crate::guard::{Field, Subject};
     let mut out = e.clone();
     if let Some(slot) = &e.programme {
-        let subj = Subject::Programme { title: &e.title, sub_title: None, categories: &[], season_episode: None, start: slot.start };
+        let subj = Subject::Programme { title: &e.title, sub_title: None, categories: &[], season_episode: None, start: slot.start, is_new: false };
         out.title = sp.text(&subj, Field::Title, &e.title).map_or_else(|| "Programme (spoiler guard)".to_owned(), |t| t.into_owned());
         return out;
     }
@@ -706,7 +706,7 @@ pub(crate) mod tests {
         let mut series = std::collections::HashMap::new();
         series.insert(
             crate::spoiler::series_key("Queue Guard Show"),
-            SeriesMark { label: "Queue Guard Show".into(), next_up: (2, 4), automatic: true, rule: None },
+            SeriesMark { label: "Queue Guard Show".into(), next_up: (2, 4), automatic: true, part_way: true, ..Default::default() },
         );
         let guard = crate::guard::Guard::with_snapshot(GuardSnapshot::from_parts(Settings::default(), Vec::new(), series, Default::default()));
         let sp = crate::ui::widgets::spoiler::Spoilers::with_guard(guard, 0, true);

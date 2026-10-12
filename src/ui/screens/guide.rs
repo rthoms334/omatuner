@@ -585,6 +585,10 @@ impl Screen for GuideScreen {
         ScreenId::Guide
     }
 
+    fn reveal_target(&self, _ctx: &UiCtx<'_>) -> Option<crate::ui::item_menu::Target> {
+        self.focused_target()
+    }
+
     fn key_contexts(&self) -> Vec<KeyContext> {
         if self.numeric.is_some() { vec![KeyContext::NumericEntry, KeyContext::Guide] } else { vec![KeyContext::Guide] }
     }

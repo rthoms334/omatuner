@@ -221,6 +221,7 @@ impl EpgReader for FakeEpg {
                 title: if self.result_slot == Some(slot) { "Arsenal 2-1 Chelsea".into() } else { format!("Show {slot}").into() },
                 sub_title: None,
                 flags: ProgrammeFlags::default(),
+                episode: None,
             });
             s += 1800;
         }

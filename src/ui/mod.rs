@@ -498,6 +498,12 @@ pub trait Screen {
         Vec::new()
     }
 
+    /// The focused item the spoiler guard's Ctrl+B acts on, for the status bar's "Ctrl+B show
+    /// spoilers" (DESIGN §34.5); `None`: no such item (the player says it in its banner).
+    fn reveal_target(&self, _ctx: &UiCtx<'_>) -> Option<crate::ui::item_menu::Target> {
+        None
+    }
+
     /// Whether the corner mini-player may show over this screen while something plays.
     /// False for Onboarding and the Player itself.
     fn allows_mini_player(&self) -> bool {

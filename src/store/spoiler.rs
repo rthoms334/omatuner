@@ -289,6 +289,14 @@ pub fn seen_episodes(conn: &Connection) -> Result<Vec<SeenRow>> {
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// Seen airings of a guarded series that carried no S/E (a series key, no episode):
+/// `(series key, event key)`. They are the series' seen state, like the S/E rows.
+pub fn seen_series_airings(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare_cached("SELECT series_norm, event_key FROM spoiler_seen WHERE series_norm IS NOT NULL AND episode IS NULL")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 /// Prune seen rows (`jobs::maintenance::prune_features`): a row goes [`SEEN_KEEP_S`] after the
 /// longest window any rule could still give its event (rules' `window_h`, at least 48 h, plus
 /// the repeat span). Series rows (S/E) stay: they are the series' seen state.
@@ -547,6 +555,19 @@ pub fn next_episode_after(conn: &Connection, series_norm: &str, after: (i32, i32
         )?
         .query_row(params![series_norm, after.0, after.1], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?)
+}
+
+/// A catalogue episode: `(season, episode, title, air date)`.
+pub type CatalogueEpisode = (i32, i32, String, Option<String>);
+
+/// The catalogue's episodes of the series, any playlist.
+pub fn series_episodes(conn: &Connection, series_norm: &str) -> Result<Vec<CatalogueEpisode>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT e.season, e.episode, e.title, e.air_date FROM episode e JOIN series s ON s.id = e.series_id
+         WHERE s.source_id IN (SELECT id FROM source) AND s.norm_name = ?1",
+    )?;
+    let rows = stmt.query_map([series_norm], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 #[cfg(test)]

@@ -110,8 +110,16 @@ impl<'a> Guarded<'a> {
 /// What the text belongs to.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Subject<'a> {
-    /// A guide programme (title + categories + S/E decide; `start` is the airing's).
-    Programme { title: &'a str, sub_title: Option<&'a str>, categories: &'a [String], season_episode: Option<(i32, i32)>, start: Timestamp },
+    /// A guide programme (title + categories + S/E decide; `start` is the airing's, 0 when
+    /// unknown; `is_new`: the guide says it's a first showing).
+    Programme {
+        title: &'a str,
+        sub_title: Option<&'a str>,
+        categories: &'a [String],
+        season_episode: Option<(i32, i32)>,
+        start: Timestamp,
+        is_new: bool,
+    },
     /// A movie or series of the library (`series_norm`: `spoiler::series_key` of a series).
     Vod { title: &'a str, series_norm: Option<&'a str> },
     /// An episode of a series (`series_norm`: the catalogue's `series.norm_name`, which is
@@ -449,7 +457,14 @@ mod tests {
     #[test]
     fn the_identity_guards_nothing_but_spoiler_safe_still_strips() {
         let g = Guard::default();
-        let subj = Subject::Programme { title: "Arsenal 2-1 Chelsea", sub_title: Some("Goals"), categories: &[], season_episode: None, start: 0 };
+        let subj = Subject::Programme {
+            title: "Arsenal 2-1 Chelsea",
+            sub_title: Some("Goals"),
+            categories: &[],
+            season_episode: None,
+            start: 0,
+            is_new: false,
+        };
         assert_eq!(g.text(&subj, Field::Title, "Arsenal 2-1 Chelsea", Policy::Normal, 0).text(), Some("Arsenal 2-1 Chelsea"));
         assert_eq!(
             g.text(&subj, Field::Title, "Arsenal 2-1 Chelsea", Policy::SpoilerSafe, 0),

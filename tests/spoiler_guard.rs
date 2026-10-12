@@ -149,7 +149,7 @@ impl World {
 }
 
 fn prog<'a>(title: &'a str, sub: Option<&'a str>, cats: &'a [String]) -> Subject<'a> {
-    Subject::Programme { title, sub_title: sub, categories: cats, season_episode: None, start: 0 }
+    Subject::Programme { title, sub_title: sub, categories: cats, season_episode: None, start: 0, is_new: false }
 }
 
 fn hidden(g: &Guarded<'_>) -> bool {
@@ -308,7 +308,14 @@ fn series_hide_episodes_after_next_up_across_playlists() {
     assert_eq!(v.reason.map(|r| (r.rule, r.kind)), Some(("Severance".into(), ReasonKind::Series)));
     // guide airings: S/E after next-up hidden, without S/E the sub-title and description go
     let drama: Vec<String> = vec!["Drama".into()];
-    let airing = |se| Subject::Programme { title: "Severance", sub_title: Some("Cold Harbor"), categories: &drama, season_episode: se, start: 0 };
+    let airing = |se| Subject::Programme {
+        title: "Severance",
+        sub_title: Some("Cold Harbor"),
+        categories: &drama,
+        season_episode: se,
+        start: 0,
+        is_new: false,
+    };
     assert!(g.judge(&airing(Some((2, 9))), KICK_OFF).hide_sub);
     assert!(!g.judge(&airing(Some((2, 4))), KICK_OFF).guarded());
     assert!(g.judge(&airing(None), KICK_OFF).hide_descr);
@@ -337,6 +344,104 @@ fn series_hide_episodes_after_next_up_across_playlists() {
     assert!(world.guard(&cfg, KICK_OFF).judge(&ep(2, 9), KICK_OFF).guarded(), "the user's own row");
     let manual_off = Config { spoiler: tuner::config::SpoilerConfig { series_auto: false, ..Default::default() }, ..Default::default() };
     assert!(world.guard(&manual_off, KICK_OFF).judge(&ep(2, 9), KICK_OFF).guarded(), "explicit rows guard with the automatic rule off");
+}
+
+/// Guide airings of a guarded series without S/E in the guide (DESIGN §34.5): the slim rows
+/// the grid paints carry the guide's S/E; a sub-title naming a catalogue episode or carrying an
+/// "S02E04" marker places the airing; a seen repeat shows; the catalogue's air dates and the
+/// guide's "new" flag place what's left; an airing nothing places is guarded only while the
+/// series is part-way.
+#[test]
+fn series_airings_without_s_e_are_placed_before_they_are_guarded() {
+    let world = World::new("spoiler-airings");
+    let bbc2 = world.ch["BBC Two"].1;
+    w(&world.store, |c| {
+        c.execute(
+            "INSERT INTO watch_progress(source_id, kind, item_key, position_s, duration_s, finished, updated_at, title, fp)
+             VALUES (1, 'episode', 'm3u:ep-2-3', 10, 3000, 1, ?1, 'Severance', json_object('norm_name', 'severance:s2e3'))",
+            [KICK_OFF - 86_400],
+        )?;
+        c.execute("UPDATE episode SET title = 'Severance - S02E02 - Goodbye, Mrs. Selvig' WHERE season = 2 AND episode = 2", [])?;
+        c.execute("UPDATE episode SET title = 'Cold Harbor' WHERE season = 2 AND episode = 9", [])?;
+        Ok(())
+    });
+    // (sub-title, guide S/E, new) on BBC Two, an hour apart from kick-off
+    let airings = [
+        ("Goodbye, Mrs. Selvig", None, false),
+        ("Cold Harbor", None, false),
+        ("S02E04", None, false),
+        ("Woe's Hollow", None, false),
+        ("Attila", Some((2, 4)), false),
+        ("Sweet Vitriol", None, true),
+    ];
+    for (i, (sub, se, new)) in airings.into_iter().enumerate() {
+        w(&world.store, move |c| {
+            let start = KICK_OFF + i as i64 * H;
+            c.execute(
+                "INSERT INTO programme(epg_source_id, epg_channel_id, gen, start, stop, title, sub_title, season, episode, flags)
+                 VALUES (1, ?1, 1, ?2, ?3, 'Severance', ?4, ?5, ?6, ?7)",
+                params![bbc2, start, start + H, sub, se.map(|s| s.0), se.map(|s| s.1), if new { 1 } else { 0 }],
+            )?;
+            Ok(())
+        });
+    }
+    let cfg = Config::default();
+    // what the grid paints: slim rows, judged as the painters judge them
+    let slim = |world: &World| tuner::store::epg::window(&world.store.reader().unwrap(), EpgChannelId(bbc2), KICK_OFF, KICK_OFF + 12 * H).unwrap();
+    let hidden_subs = |world: &World, g: &Guard| -> Vec<String> {
+        slim(world)
+            .iter()
+            .filter(|p| g.judge(&tuner::ui::widgets::spoiler::slim_subject(p), KICK_OFF).hide_sub)
+            .filter_map(|p| p.sub_title.as_deref().map(str::to_owned))
+            .collect()
+    };
+    assert_eq!(slim(&world)[4].episode, Some(EpisodeNum { season: Some(2), episode: Some(4) }), "slim rows carry the guide's S/E");
+    let g = world.guard(&cfg, KICK_OFF);
+    assert_eq!(
+        hidden_subs(&world, &g),
+        vec!["Cold Harbor", "Woe's Hollow", "Sweet Vitriol"],
+        "S2E2 by its catalogue title, S2E4 by its marker or the guide's S/E show; S2E9, an unplaced repeat of a part-way series and a first showing don't"
+    );
+
+    // Woe's Hollow watched (Ctrl+W): a repeat of it shows; Cold Harbor would record S2E9
+    let full = |sub: &str| {
+        let r = world.store.reader().unwrap();
+        let id = slim(&world).into_iter().find(|p| p.sub_title.as_deref() == Some(sub)).unwrap().id;
+        tuner::store::epg::programme(&r, id).unwrap()
+    };
+    let placed = tuner::spoiler::placed_seen_row(&g.snapshot(), &full("Cold Harbor"), SeenHow::Marked, KICK_OFF);
+    assert_eq!((placed.series_norm.as_deref(), placed.season, placed.episode), (Some("severance"), Some(2), Some(9)));
+    let row = tuner::spoiler::placed_seen_row(&g.snapshot(), &full("Woe's Hollow"), SeenHow::Marked, KICK_OFF);
+    assert_eq!((row.series_norm.as_deref(), row.episode), (Some("severance"), None), "kept as the series' seen state");
+    w(&world.store, move |c| db::mark_seen(c, &row));
+    let g = world.guard(&cfg, KICK_OFF);
+    assert_eq!(hidden_subs(&world, &g), vec!["Cold Harbor", "Sweet Vitriol"]);
+    let prune_later = KICK_OFF + 400 * 86_400;
+    w(&world.store, move |c| db::prune(c, prune_later));
+    assert_eq!(hidden_subs(&world, &world.guard(&cfg, KICK_OFF)), vec!["Cold Harbor", "Sweet Vitriol"], "pruning keeps it");
+
+    // air dates: S2E4 aired in November, S2E5 on in December — tonight's airings can't be S2E5+
+    w(&world.store, |c| {
+        c.execute("UPDATE episode SET air_date = '2026-11-20' WHERE season = 2 AND episode = 4", [])?;
+        c.execute("UPDATE episode SET air_date = '2026-12-01' WHERE season = 2 AND episode > 4", [])?;
+        Ok(())
+    });
+    let g = world.guard(&cfg, KICK_OFF);
+    assert_eq!(hidden_subs(&world, &g), vec!["Cold Harbor"], "the catalogue title still places S2E9");
+
+    // a series guarded before it's started: unplaced airings keep their text, a first showing doesn't
+    w(&world.store, |c| db::set_series_guard(c, "taskmaster", "Taskmaster", true, false, KICK_OFF).map(|_| ()));
+    let g = world.guard(&cfg, KICK_OFF);
+    let tm = |sub, is_new| Subject::Programme {
+        title: "Taskmaster",
+        sub_title: Some(sub),
+        categories: &[],
+        season_episode: None,
+        start: KICK_OFF,
+        is_new,
+    };
+    assert!(!g.judge(&tm("Hot Dogs", false), KICK_OFF).guarded());
+    assert!(g.judge(&tm("Hot Dogs", true), KICK_OFF).hide_sub);
 }
 
 #[test]
