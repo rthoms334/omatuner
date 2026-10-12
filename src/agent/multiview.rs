@@ -8,7 +8,7 @@
 //! user before sending `rearrange=true`. Movies and episodes stay single view. The app applies
 //! the PIN rules on screen.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
@@ -117,6 +117,7 @@ fn fits(wants: &[Want], held: Option<(SourceId, Vec<SourceId>)>, limits: &HashMa
 }
 
 /// What the picture that stays (the focused one) plays when one ref goes alongside it.
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Staying {
     Nothing,
     /// A live channel on a playlist: it may move to one of its copies.
@@ -138,7 +139,39 @@ fn staying(snap: &crate::player::PlayerSnapshot, q: &Q) -> Staying {
     }
 }
 
-fn plan_open(q: &Q, p: &MultiView, playing: Staying, multiview_on: bool) -> Out<(Option<AgentMultiView>, Value)> {
+/// The refs to judge and the picture they go alongside. Two refs while multi-view is on with
+/// a picture already showing one (live): the app keeps it there and puts the other in the
+/// other picture, so that one is judged alongside it, as one ref is; both on screen already:
+/// nothing to place. Otherwise all of them, alongside `playing`.
+fn to_check<'a>(wants: &'a [Want], playing: Staying, pictures: &[Staying], multiview_on: bool) -> (&'a [Want], Staying) {
+    let shown = |w: &Want| {
+        pictures.iter().find_map(|s| match s {
+            Staying::Live(ch, _) if w.media == MediaRef::Channel(*ch) => Some(*s),
+            _ => None,
+        })
+    };
+    match wants {
+        [a, b] if multiview_on => match (shown(a), shown(b)) {
+            (Some(_), Some(_)) => (&[], Staying::Nothing),
+            (Some(s), None) => (std::slice::from_ref(b), s),
+            (None, Some(s)) => (std::slice::from_ref(a), s),
+            (None, None) => (wants, playing),
+        },
+        _ => (wants, playing),
+    }
+}
+
+/// `ch`'s copies' playlists (where a playing picture could move).
+fn copy_sources(q: &Q, ch: ChannelId) -> Out<Vec<SourceId>> {
+    Ok(crate::store::copies::channel_copies(q.lib, q.conn, ch)?
+        .iter()
+        .filter(|c| !(c.explicit && q.view.hides_explicit) && q.channel(c.id).is_some())
+        .map(|c| c.source)
+        .collect())
+}
+
+/// `playing`: the focused picture; `pictures`: both pictures while multi-view is on.
+fn plan_open(q: &Q, p: &MultiView, playing: Staying, pictures: &[Staying], multiview_on: bool) -> Out<(Option<AgentMultiView>, Value)> {
     let refs = p.refs.as_deref().filter(|r| (1..=2).contains(&r.len())).ok_or_else(|| Fail::bad("open takes 1–2 refs"))?;
     let from_start = p.from_start == Some(true);
     let wants: Vec<Want> = refs.iter().map(|s| want(q, s, from_start)).collect::<Out<_>>()?;
@@ -150,16 +183,10 @@ fn plan_open(q: &Q, p: &MultiView, playing: Staying, multiview_on: bool) -> Out<
         .into_iter()
         .filter_map(|s| Some((s.id, s.status.account?.max_connections.filter(|m| *m > 0)?)))
         .collect();
+    let (check, playing) = to_check(&wants, playing, pictures, multiview_on);
     // one ref goes alongside what plays (which keeps its playlist, or moves to a copy)
-    let held = match (wants.len(), playing) {
-        (1, Staying::Live(ch, src)) => {
-            let alts: Vec<SourceId> = crate::store::copies::channel_copies(q.lib, q.conn, ch)?
-                .iter()
-                .filter(|c| !(c.explicit && q.view.hides_explicit) && q.channel(c.id).is_some())
-                .map(|c| c.source)
-                .collect();
-            Some((src, alts))
-        }
+    let held = match (check.len(), playing) {
+        (1, Staying::Live(ch, src)) => Some((src, copy_sources(q, ch)?)),
         (1, Staying::Catchup(src)) => Some((src, vec![])),
         (1, Staying::Film) if !multiview_on => {
             return Err(Fail::new(ErrorCode::Unavailable, "A film or episode is playing: multi-view is for live TV and catch-up"));
@@ -170,14 +197,19 @@ fn plan_open(q: &Q, p: &MultiView, playing: Staying, multiview_on: bool) -> Out<
         _ => None,
     };
     let names: Vec<String> = wants.iter().map(|w| clean(&w.name)).collect();
-    let fits = fits(&wants, held, &limits).map_err(|why| Fail::new(ErrorCode::Unavailable, format!("Can't show both: {why}.")))?;
+    let fits = check.is_empty() || fits(check, held, &limits).map_err(|why| Fail::new(ErrorCode::Unavailable, format!("Can't show both: {why}.")))?;
     if !fits && p.rearrange != Some(true) {
-        let unique: HashSet<&String> = names.iter().collect();
+        let mut unique: Vec<String> = Vec::new();
+        for n in check.iter().map(|w| clean(&w.name)) {
+            if !unique.contains(&n) {
+                unique.push(n);
+            }
+        }
         return Ok((
             None,
             json!({
                 "outcome": "needs_rearrange",
-                "message": format!("To add {} the playing picture has to move to its copy in another playlist (it pauses up to 30 s). Ask the user, then send rearrange=true.", unique.into_iter().cloned().collect::<Vec<_>>().join(" and ")),
+                "message": format!("To add {} the playing picture has to move to its copy in another playlist (it pauses up to 30 s). Ask the user, then send rearrange=true.", unique.join(" and ")),
             }),
         ));
     }
@@ -210,7 +242,21 @@ pub(super) async fn handle(h: &Arc<Inner>, p: MultiView) -> Out<Value> {
                 None => h.player.snapshot(),
             };
             let on = tiles.on;
-            let (cmd, out) = h.run(true, move |q| plan_open(q, &p, staying(&snap, q), on)).await?;
+            // with multi-view on, what each picture shows (one already showing a ref keeps it)
+            let pictures: Vec<Arc<crate::player::PlayerSnapshot>> = if on {
+                [crate::model::TileId::A, crate::model::TileId::B]
+                    .into_iter()
+                    .filter_map(|t| h.shared.tile_player(t).map(|rx| rx.borrow().clone()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let (cmd, out) = h
+                .run(true, move |q| {
+                    let shown: Vec<Staying> = pictures.iter().map(|s| staying(s, q)).collect();
+                    plan_open(q, &p, staying(&snap, q), &shown, on)
+                })
+                .await?;
             if let Some(cmd) = cmd {
                 send(cmd);
                 tracing::info!("agent: multiview open");
@@ -254,7 +300,45 @@ mod tests {
     use super::*;
 
     fn w(sources: &[i64]) -> Want {
-        Want { media: MediaRef::Channel(ChannelId(1)), name: String::new(), sources: sources.iter().map(|s| SourceId(*s)).collect(), locked: false }
+        on(1, sources)
+    }
+
+    /// Channel `id` on `sources`.
+    fn on(id: i64, sources: &[i64]) -> Want {
+        Want {
+            media: MediaRef::Channel(ChannelId(id)),
+            name: format!("{id}"),
+            sources: sources.iter().map(|s| SourceId(*s)).collect(),
+            locked: false,
+        }
+    }
+
+    /// Two refs while multi-view is on: none on screen → both judged afresh (both pictures
+    /// play anew); one on screen → the other alongside the picture that keeps it, so a move of
+    /// that picture is `needs_rearrange` (the app asks too); both on screen → nothing to judge.
+    #[test]
+    fn two_refs_in_multi_view_are_judged_against_a_picture_that_keeps_one() {
+        let one = HashMap::from([(SourceId(1), 1), (SourceId(2), 1)]);
+        // A: Delta (6) on playlist 2, B: Charlie (3) on playlist 1
+        let pictures = [Staying::Live(ChannelId(6), SourceId(2)), Staying::Live(ChannelId(3), SourceId(1))];
+        let focused = pictures[0];
+        // Bravo (1, 2) and Alpha (1 only): neither shows, both play anew
+        let wants = [on(2, &[1, 2]), on(1, &[1])];
+        let (check, playing) = to_check(&wants, focused, &pictures, true);
+        assert_eq!((check.len(), playing), (2, focused));
+        assert_eq!(fits(check, None, &one), Ok(true), "Alpha on 1, Bravo's copy on 2");
+        // Alpha and Charlie (B shows it on 1; its copy is on 2): Alpha needs 1, so B must move
+        let wants = [on(1, &[1]), on(3, &[1, 2])];
+        let (check, playing) = to_check(&wants, focused, &pictures, true);
+        assert_eq!(check.iter().map(|w| w.media.clone()).collect::<Vec<_>>(), [MediaRef::Channel(ChannelId(1))]);
+        assert_eq!(playing, pictures[1]);
+        assert_eq!(fits(check, Some((SourceId(1), vec![SourceId(2)])), &one), Ok(false), "needs_rearrange");
+        // both on screen
+        let wants = [on(3, &[1]), on(6, &[2])];
+        assert!(to_check(&wants, focused, &pictures, true).0.is_empty());
+        // single view: as before
+        let (check, _) = to_check(&wants, focused, &[], false);
+        assert_eq!(check.len(), 2);
     }
 
     /// The user's setup: both accounts carry one stream. Two pictures need two playlists; one

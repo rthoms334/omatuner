@@ -5018,6 +5018,7 @@ mod tests {
                 position_s: 10.0,
                 duration_s: None,
                 copy: None,
+                queue: None,
             }),
         ];
         for o in overlays {
@@ -5529,6 +5530,71 @@ mod tests {
             assert_eq!(tile_plays(&rig.log(), PIC_B), [delta], "film {film}");
             assert!(rig.app.mv.view.on, "film {film}");
         }
+    }
+
+    /// The `multiview` tool with two channels while two pictures show (both really playing,
+    /// one stream per playlist): one plan for both, so neither plans against what the other
+    /// replaces — the pictures trade playlists with no "Move picture B?" for a picture that is
+    /// replaced anyway, and neither load is refused. A picture that already shows one of the two
+    /// keeps it; the other goes in the other picture, and moving the one that stays is asked
+    /// first.
+    #[test]
+    fn the_agents_two_replace_both_pictures_in_one_step() {
+        use crate::agent::{AgentCommand, AgentMultiView};
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_two_playlists_with(c, |_, _| "av://lavfi:testsrc2=size=160x90:rate=25".into()));
+        rig.settle();
+        let open = |targets: &[i64]| {
+            AppEvent::Agent(AgentCommand::MultiView(AgentMultiView::Open {
+                targets: targets.iter().map(|c| MediaRef::Channel(ChannelId(*c))).collect(),
+                layout: None,
+                sound: None,
+                rearrange: false,
+            }))
+        };
+        let shows = |r: &Rig, t, ch: i64| {
+            r.app.mv_snap(t).is_some_and(|s| s.state == PlayerState::Playing && crate::ui::screens::live::playing_channel(&s) == Some(ChannelId(ch)))
+        };
+        // Alpha (TV) in A, then Bravo alongside: its TV 2 copy in B
+        rig.app.send_player(PlayerCommand::Play(PlayRequest {
+            media: MediaRef::Channel(ChannelId(1)),
+            zap: None,
+            origin: PlayOrigin::Fullscreen,
+            resume: false,
+            immediate: true,
+        }));
+        rig.until("Alpha plays", |r| shows(r, PIC_A, 1));
+        rig.event(open(&[2]));
+        rig.until("both play", |r| shows(r, PIC_A, 1) && shows(r, PIC_B, 4));
+
+        // Delta (only on TV 2) and Charlie: A takes TV 2, B takes TV, in one step
+        rig.app.log.borrow_mut().tile_commands.clear();
+        rig.event(open(&[6, 3]));
+        rig.frame_with(vec![]);
+        assert!(rig.overlay_kinds().is_empty(), "no move card for a picture that is replaced anyway");
+        assert_eq!(tile_plays(&rig.log(), PIC_A), [MediaRef::Channel(ChannelId(6))], "Delta in A");
+        assert_eq!(tile_plays(&rig.log(), PIC_B), [MediaRef::Channel(ChannelId(3))], "Charlie from TV in B");
+        rig.until("both trade playlists", |r| shows(r, PIC_A, 6) && shows(r, PIC_B, 3));
+        let v = rig.app.mv.view;
+        assert!(v.on && v.audible == PIC_A, "the sound stays where it was: {v:?}");
+
+        // Alpha (only on TV) and Charlie (B shows it, from TV): B keeps Charlie, Alpha goes in
+        // A — only if B moves to Charlie's TV 2 copy, which is asked first
+        rig.app.log.borrow_mut().tile_commands.clear();
+        rig.event(open(&[1, 3]));
+        rig.frame_with(vec![]);
+        assert_eq!(
+            rig.overlay_kinds(),
+            [kind(OverlayRequest::Confirm(overlays::ConfirmSpec {
+                title: String::new(),
+                body: String::new(),
+                confirm_label: String::new(),
+                destructive: false,
+                token: 0
+            }))]
+        );
+        assert!(tile_plays(&rig.log(), PIC_A).is_empty() && tile_plays(&rig.log(), PIC_B).is_empty(), "nothing moves before the answer");
+        rig.press(Key::Enter, NONE);
+        rig.until("A plays Alpha, B moved", |r| shows(r, PIC_A, 1) && shows(r, PIC_B, 5));
     }
 
     /// The multi-view player at a tiled half (790 pt) and full screen (1600 pt), text size 12

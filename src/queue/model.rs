@@ -292,6 +292,12 @@ pub enum QueueCommand {
         played_only: bool,
     },
     PlayAt(QueueId),
+    /// The Resume prompt's answer on a row (Enter in the list): `resume` = "Resume from …"
+    /// (whatever the row's "from the start" says), else "Start over". UI only.
+    PlayAtFrom {
+        id: QueueId,
+        resume: bool,
+    },
     /// `n`, MPRIS Next: skip to the next row (a locked or not-started one is skipped / left).
     Next,
     Prev,

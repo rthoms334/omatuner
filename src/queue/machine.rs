@@ -264,7 +264,7 @@ impl QueueMachine {
             Input::MultiView(on) => {
                 self.multiview = on;
                 if let (false, Some((Blocked::MultiView, Some(id)))) = (on, self.blocked) {
-                    self.advance(Some(id), false, now, &mut fx);
+                    self.advance(Some(id), None, now, &mut fx);
                 }
             }
             Input::Rows(rows) => self.set_rows(rows),
@@ -516,9 +516,9 @@ impl QueueMachine {
                     self.owned = false;
                     self.set_state(cur, RowState::Played, fx);
                 }
-                self.advance(c.id, false, now, fx);
+                self.advance(c.id, None, now, fx);
             }
-            CountdownWhy::Ended | CountdownWhy::Failed => self.advance(c.id, false, now, fx),
+            CountdownWhy::Ended | CountdownWhy::Failed => self.advance(c.id, None, now, fx),
         }
     }
 
@@ -543,7 +543,7 @@ impl QueueMachine {
         if let Some((Blocked::NotStarted, Some(id))) = self.blocked
             && self.row(id).and_then(|r| r.programme.as_ref()).is_some_and(|s| s.start <= now)
         {
-            self.advance(Some(id), false, now, fx);
+            self.advance(Some(id), None, now, fx);
         }
     }
 
@@ -570,15 +570,18 @@ impl QueueMachine {
 
     // ---------------------------------------------------------------- playing
 
-    /// Play `id` (or, when it can't play, the rows after it). `resume_current`: Resume of an
-    /// interrupted row — its position, whatever "from the start" says.
-    fn advance(&mut self, id: Option<QueueId>, resume_current: bool, now: Timestamp, fx: &mut Vec<Effect>) {
+    /// Play `id` (or, when it can't play, the rows after it). `resume`: `None` follows the
+    /// row's "from the start"; `Some(true)` resumes whatever it says (Resume of an interrupted
+    /// row, "Resume from" in the Resume prompt); `Some(false)` starts over (the prompt's "Start
+    /// over"). Only the row asked for gets the choice; rows played in its place follow their own.
+    fn advance(&mut self, id: Option<QueueId>, resume: Option<bool>, now: Timestamp, fx: &mut Vec<Effect>) {
         self.countdown = None;
         self.blocked = None;
         self.finished = None;
         self.next_episode = None;
         self.lookup = None;
         self.resolving = None;
+        let asked = id;
         let mut id = id;
         for _ in 0..=self.rows.len() {
             let Some(row) = id.and_then(|i| self.row(i)).cloned() else { return };
@@ -614,8 +617,12 @@ impl QueueMachine {
                 Some(s) if row.from_start && self.catchup_ok(row.id, s.start, now) => How::Catchup,
                 Some(_) => How::Live,
             };
+            let resume = match (resume, asked == Some(row.id)) {
+                (Some(r), true) => r,
+                _ => !row.from_start,
+            };
             self.resolving = Some((row.id, how));
-            fx.push(Effect::Play { id: row.id, how, resume: resume_current || !row.from_start });
+            fx.push(Effect::Play { id: row.id, how, resume });
             return;
         }
     }
@@ -653,14 +660,14 @@ impl QueueMachine {
                     f.unavailable = true;
                 }
                 let next = self.next_after(id);
-                self.advance(next, false, now, fx);
+                self.advance(next, None, now, fx);
             }
             Resolved::Concealed => {
                 if let Some(f) = self.facts.get_mut(&id) {
                     f.concealed = true;
                 }
                 let next = self.next_after(id);
-                self.advance(next, false, now, fx);
+                self.advance(next, None, now, fx);
             }
             Resolved::Failed(_) => self.item_failed(id, now, fx),
         }
@@ -684,7 +691,12 @@ impl QueueMachine {
             QueueCommand::PlayAt(id) => {
                 self.deferred.remove(&id);
                 self.interrupted = false;
-                self.advance(Some(id), false, now, fx);
+                self.advance(Some(id), None, now, fx);
+            }
+            QueueCommand::PlayAtFrom { id, resume } => {
+                self.deferred.remove(&id);
+                self.interrupted = false;
+                self.advance(Some(id), Some(resume), now, fx);
             }
             QueueCommand::Next => self.next(now, fx),
             QueueCommand::Prev => {
@@ -693,7 +705,7 @@ impl QueueMachine {
                 match self.rows[..end].iter().rev().find(|r| r.state.is_done() && self.visible(r.id) && !r.orphaned).map(|r| r.id) {
                     Some(prev) => {
                         self.interrupted = false;
-                        self.advance(Some(prev), false, now, fx);
+                        self.advance(Some(prev), None, now, fx);
                     }
                     None => fx.push(Effect::Toast("Nothing before this in Up next")),
                 }
@@ -726,7 +738,7 @@ impl QueueMachine {
                         if let Some(f) = self.facts.get_mut(&id) {
                             f.needs_pin = false;
                         }
-                        self.advance(Some(id), false, now, fx);
+                        self.advance(Some(id), None, now, fx);
                     } else {
                         self.next(now, fx);
                     }
@@ -738,8 +750,8 @@ impl QueueMachine {
                     self.failed_streak = 0;
                 }
                 match self.current() {
-                    Some(cur) => self.advance(Some(cur), true, now, fx),
-                    None => self.advance(self.next_row(), false, now, fx),
+                    Some(cur) => self.advance(Some(cur), Some(true), now, fx),
+                    None => self.advance(self.next_row(), None, now, fx),
                 }
             }
         }
@@ -752,12 +764,12 @@ impl QueueMachine {
             Some((Blocked::NeedsPin, Some(id))) => {
                 self.set_state(id, RowState::Skipped, fx);
                 self.notes.insert(id, "Locked");
-                self.advance(self.next_row(), false, now, fx);
+                self.advance(self.next_row(), None, now, fx);
                 return;
             }
             Some((Blocked::NotStarted, Some(id))) => {
                 self.deferred.insert(id);
-                self.advance(self.next_row(), false, now, fx);
+                self.advance(self.next_row(), None, now, fx);
                 return;
             }
             _ => {}
@@ -778,7 +790,7 @@ impl QueueMachine {
             self.set_state(cur, RowState::Skipped, fx);
         }
         self.interrupted = false;
-        self.advance(Some(next), false, now, fx);
+        self.advance(Some(next), None, now, fx);
     }
 
     // ---------------------------------------------------------------- snapshot
@@ -1089,6 +1101,26 @@ mod tests {
         m.step(Input::NextEpisode(Some(NextEpisode { id: EpisodeId(4), label: "S01E04".into(), series: "Show".into(), season: 1, episode: 4 })), T0);
         assert_eq!(m.snapshot().countdown.as_ref().map(|c| c.why), Some(CountdownWhy::NextEpisode));
         assert_eq!(m.step(Input::Tick, T0 + 10), vec![Effect::PlayEpisode { id: EpisodeId(4), origin: PlayOrigin::Home }]);
+    }
+
+    /// The Resume prompt's answer (Enter on a row): "Start over" plays from 0 and "Resume
+    /// from" resumes, whatever the row's own "from the start" says; a row played in place of
+    /// the one asked for (gone) follows its own setting.
+    #[test]
+    fn the_resume_prompt_answer_overrides_the_row_setting() {
+        let mut m = machine(vec![movie(1), QueueEntry { from_start: true, ..movie(2) }]);
+        let fx = m.step(Input::Command(QueueCommand::PlayAtFrom { id: QueueId(1), resume: false }), T0);
+        assert_eq!(fx, vec![Effect::Play { id: QueueId(1), how: How::Vod, resume: false }]);
+        let fx = m.step(Input::Command(QueueCommand::PlayAtFrom { id: QueueId(2), resume: true }), T0);
+        assert_eq!(fx, vec![Effect::Play { id: QueueId(2), how: How::Vod, resume: true }]);
+        // the plain PlayAt still follows the row
+        let fx = m.step(Input::Command(QueueCommand::PlayAt(QueueId(2))), T0);
+        assert_eq!(fx, vec![Effect::Play { id: QueueId(2), how: How::Vod, resume: false }]);
+
+        let mut m = machine(vec![movie(1), movie(2)]);
+        m.step(Input::Facts([(QueueId(1), RowFacts { unavailable: true, ..Default::default() }), (QueueId(2), RowFacts::default())].into()), T0);
+        let fx = m.step(Input::Command(QueueCommand::PlayAtFrom { id: QueueId(1), resume: false }), T0);
+        assert_eq!(fx, vec![Effect::Play { id: QueueId(2), how: How::Vod, resume: true }], "the next row resumes as it would");
     }
 
     /// Live slots: airing plays live and advances at its stop with a 30 s card; ended plays

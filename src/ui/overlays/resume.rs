@@ -43,6 +43,13 @@ impl ResumeOverlay {
     }
 
     fn start(&self, ctx: &mut UiCtx<'_>, resume: bool) -> OverlayOutcome {
+        if let Some(q) = self.spec.queue {
+            let sent = crate::queue::ui::send(ctx, crate::queue::QueueCommand::PlayAtFrom { id: q.id, resume });
+            if sent && q.fullscreen {
+                ctx.push(Route::Player);
+            }
+            return OverlayOutcome::Close;
+        }
         let req = PlayRequest { media: self.spec.media.clone(), zap: None, origin: PlayOrigin::Fullscreen, resume, immediate: true };
         match &self.spec.copy {
             // a combined title: its fallback, and (resuming) the latest progress of any copy
@@ -178,7 +185,7 @@ mod tests {
     use crate::model::MediaRef;
 
     fn spec(pos: f64) -> ResumeSpec {
-        ResumeSpec { media: MediaRef::Url("x".into()), title: "T".into(), position_s: pos, duration_s: Some(100.0), copy: None }
+        ResumeSpec { media: MediaRef::Url("x".into()), title: "T".into(), position_s: pos, duration_s: Some(100.0), copy: None, queue: None }
     }
 
     use crate::ui::NavRequest;

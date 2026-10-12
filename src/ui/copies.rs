@@ -82,6 +82,7 @@ pub fn play_title(ctx: &mut UiCtx<'_>, movies: bool, item: u32, pick: Option<u32
                     position_s: p.position_s,
                     duration_s: p.duration_s,
                     copy: Some(Box::new(copy)),
+                    queue: None,
                 };
                 ctx.open(OverlayRequest::Resume(spec));
             }
@@ -147,8 +148,14 @@ pub fn play_episode(ctx: &mut UiCtx<'_>, plan: &CopyPlan, series: SeriesId, ep: 
         Some(p) => {
             let name = ctx.lib.vod.find(VodKind::Series(series)).map(|v| v.name.to_string()).unwrap_or_default();
             let title = format!("{name} — S{:02}E{:02}", ep.season, ep.episode);
-            let spec =
-                ResumeSpec { media: copy.req.media.clone(), title, position_s: p.position_s, duration_s: p.duration_s, copy: Some(Box::new(copy)) };
+            let spec = ResumeSpec {
+                media: copy.req.media.clone(),
+                title,
+                position_s: p.position_s,
+                duration_s: p.duration_s,
+                copy: Some(Box::new(copy)),
+                queue: None,
+            };
             ctx.open(OverlayRequest::Resume(spec));
         }
         None => start(ctx, copy),

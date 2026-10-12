@@ -103,6 +103,18 @@ pub struct ResumeSpec {
     /// A combined title (DESIGN §29.15): `media` is the copy that plays, this its fallback and
     /// the position to start at when the latest progress is another copy's.
     pub copy: Option<Box<crate::player::CopyPlay>>,
+    /// An Up next row (Enter in the list): the answer goes to the engine, which plays it as
+    /// Up next's.
+    pub queue: Option<QueueResume>,
+}
+
+/// The Resume prompt over an Up next row (up-next-design §3 "Resume"): "Resume from" and
+/// "Start over" send `QueueCommand::PlayAtFrom`; the player opens only when `fullscreen` (the
+/// list's Enter keeps the list, Shift+Enter opens the player).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueResume {
+    pub id: crate::model::QueueId,
+    pub fullscreen: bool,
 }
 
 /// What an overlay reports back to the screen that opened it.

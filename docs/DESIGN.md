@@ -5379,6 +5379,15 @@ the panel, `n` / `N` step. Home shows an "Up next" rail while items wait and not
   When the queue runs out after an episode, the next one is offered with no countdown.
 * A queued film ending in the fullscreen player keeps the player (the next item follows on the
   card); only films started elsewhere return to their page.
+* The player's OSD row has `Up next` (the panel, `u`) and, while Up next has a next item and
+  multi-view is off, `Next` (`n`), before Info; narrow keeps `Next` only. Both are in the
+  controls focus walk, and a button that comes or goes keeps the focus on its control.
+* Enter (a double-click, "Play now") on a film or episode row with progress past
+  `resume_min_s` opens the usual Resume prompt (the latest progress of any copy, as the
+  resolver resumes it); its answer goes to the engine as `PlayAtFrom { id, resume }`, which
+  overrides the row's "from the start" for that row only. A row that asks for the start, a
+  programme slot, and locked, concealed or gone rows play at once as before (the engine says
+  why). Advancing never asks.
 
 ### 32.3 Guardrails
 * Locked rows wait for the PIN (`Blocked::NeedsPin`; the engine never unlocks; a hidden window
@@ -5594,16 +5603,20 @@ with the sound). Esc never closes a picture.
   until exit.
 
 ### 35.3 Claude
-`multiview open` with two refs from single view plans both pictures at once (one plan, so the
-second never plans against what the first replaces); one ref goes alongside the focused
+`multiview open` with two refs plans both pictures at once (one plan, so the second never
+plans against what the first replaces): from single view the focused picture and the other,
+with multi-view on A and B (the layout's places and the sound stay; both claims move before
+either loads, so pictures that trade playlists aren't refused). A picture that already shows
+one of the two keeps it, and the other goes in the other picture alongside it — moving the
+picture that stays is asked first (the app's card, or `needs_rearrange` over MCP). One ref
+goes alongside the focused
 picture, judged against that picture's stream; `needs_rearrange` when only moving the playing
 picture works; a film playing answers "multi-view is for live TV and catch-up". `control` with
 no `tile` pauses/stops both, sets volume and mute on the picture with the sound, and acts on the
 focused one for previous channel and pop-out.
 
 ### 35.4 Gaps
-Two refs while multi-view is already on still go one picture at a time; a PIN prompt cancelled
-with Esc keeps its stored plays until a relock (harmless: only `play_channel`'s or the agent's
+A PIN prompt cancelled with Esc keeps its stored plays until a relock (harmless: only `play_channel`'s or the agent's
 prompts send them).
 
 ## 36. Reminders (pass 2) and the sleep timer
