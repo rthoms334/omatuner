@@ -5,8 +5,8 @@
 # usage: scripts/screenshots.sh [shot...]          (default: every shot listed below)
 #
 # Needs a Hyprland session (each window floats itself at an exact size, centred on the
-# current workspace; don't type while it runs), cargo, curl and ffmpeg. pngquant and oxipng
-# shrink the PNGs when installed. Nothing of your own setup reaches the images: every shot runs on a
+# current workspace; don't type while it runs), cargo, curl and ffmpeg. pngquant (else ffmpeg) and oxipng
+# shrink the PNGs. Nothing of your own setup reaches the images: every shot runs on a
 # fresh copy of the demo profile in target/screenshots/, with a bundled theme
 # (TUNER_THEME_DIR) instead of your Omarchy theme.
 #
@@ -110,8 +110,20 @@ shot guidefix    "$big"  "$dark"  settings "key:Left;key:Down;key:Right;key:Down
 
 # Every regeneration adds the images to git history again: rerun it only when the UI changes.
 # pngquant (lossy, 256 colours) roughly halves them; oxipng then recompresses losslessly.
+# Without pngquant, ffmpeg (already needed) does the same 256-colour pass, kept only if smaller.
 if command -v pngquant >/dev/null && ((${#taken[@]})); then
   pngquant --quality 70-90 --skip-if-larger --force --ext .png "${taken[@]}" || true
+elif ((${#taken[@]})); then
+  for png in "${taken[@]}"; do
+    tmp=${png%.png}.q.png
+    if ffmpeg -loglevel error -y -i "$png" -lavfi \
+        "split[a][b];[a]palettegen=max_colors=256:stats_mode=full[p];[b][p]paletteuse=dither=sierra2_4a" \
+        "$tmp" && (($(stat -c%s "$tmp") < $(stat -c%s "$png"))); then
+      mv "$tmp" "$png"
+    else
+      rm -f "$tmp"
+    fi
+  done
 fi
 if command -v oxipng >/dev/null && ((${#taken[@]})); then
   oxipng -q -o 4 --strip safe "${taken[@]}"
