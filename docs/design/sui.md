@@ -1,0 +1,33 @@
+# Spoiler guard UI (track "sui", S2–S4)
+
+The UI half of DESIGN §34 on top of the S1 engine (`docs/design/score.md`). `spoiler::ENABLED` is now on: the services start the guard (`tracker::start`), Settings lists the Spoiler guard page, and Help and the hint line show Ctrl+B and Ctrl+Shift+B.
+
+## Pieces
+
+| File | What it holds |
+|---|---|
+| `ui/widgets/spoiler.rs` | **`Spoilers::text`** is what every base-B painter call site shows. Text that isn't guarded shows as is. A rewritten title gets the dim glyph ("Arsenal v Chelsea 󰈉"). A hidden sub-title or episode title becomes a fixed-width bar ("▆▆▆▆▆▆▆▆ 󰈉"), the same width for every title. A hidden description or plot says why and how to show it ("󰈉 Description hidden — mentions Arsenal · until you watch it or 19:30 · Ctrl+B to show"). A hidden title reads "Arsenal · title hidden 󰈉". **`field`** is the full painter for one field, built from Omarchy tokens: a `separator` bar, a `fill_field` + `card_border` block, and, once revealed, a 2 px `accent` rule with 󰈈. A click on a bar or block reveals the item (`FieldClick::Revealed`: the row underneath ignores that click), and a click on 󰈈 hides it again. **`obscured_image`** draws `ImageKind::Obscured` stretched, under the scrim and 󰈉. **`stamp()`** returns (guard generation, reveal generation) for painters that cache text. Accessible names never carry hidden text ("Hidden by spoiler guard (Arsenal)"). |
+| `spoiler/ui.rs` | **`RevealSet`** lives in a UI-thread-local, in memory only. A `RevealKey` covers the same item wherever it is painted: an airing (same title within 6 h), an episode, a series (its episodes too), or a film. **Ctrl+B** on an item (`item_menu::dispatch`) reveals it. Any movement key, or a key pressed on another item, hides it again. On an item with nothing hidden it says "Nothing hidden here". **Ctrl+W** on a guide programme the guard tracks marks it seen (only guarded subjects are ever recorded). It toasts with "Undo…", which opens the menu. **Ctrl+Shift+B** on an item opens the menu about that item. Item menus gain "Show / Hide spoilers", "Mark seen" and "Spoiler guard…". The **status chip** while paused reads "󰈈 Spoilers shown · 14 min": clicking it opens the menu, and its ✕ guards again. The chip also takes in the tracker's seen events (`Guard::take_seen`) for the menu's Undo. |
+| `ui/overlays/spoiler_menu.rs` | A launcher card (the context menu, wrapped). With nothing focused it offers: show everything for 15 min / 1 h / until restart ("Guard again now" while paused), undo the last seen events, guard a topic, settings. On an item it adds: show spoilers here, mark seen, "I'll watch … later…", guard spoilers about…, stop guarding ‹topic›, guard / don't guard ‹series›. Settings rows get their own: Edit / Turn off / Delete, or Guard / Don't guard, or Undo. |
+| `ui/overlays/spoiler_rule.rs` | The rule editor. Teams are parsed from "A v B" (`parse_fixture`), and the home team is pre-ticked. Then: Also called (aliases), Only in ‹Sport / Anything›, and Hide until ‹watched, ≤ N h / 24 h after it ends (live too) / 3 days / Always›. "I'll watch it later" opens it on the blackout. Keys: ↑/↓/Tab move, Space/Enter tick or step, ←/→ step, Enter saves from a text field or Save, Esc cancels. Every row is clickable. A click outside doesn't throw an edit away. |
+| `ui/screens/settings/spoiler.rs` | The page: the toggles (on, part-way series, "Sport I follow" = `follow.spoiler_safe_default`, scores everywhere, zap shield), the guard time, and pause / guard again. **Rules:** each with what it guards now ("guarding now: Arsenal v Chelsea (Sat 17:30)"), Following's spoiler-safe teams, and the automatic series ("you're on S2E4"). **Seen recently:** Enter undoes. Enter on any row opens its menu. |
+| `ui/screens/player/shield.rs` | The zap shield card. A zap inside the player (↑/↓, a panel, a number) onto a channel `Guard::shield` names covers the picture in black and asks: Watch anyway (Enter, or a click; for this channel, this session), Next channel (↓), Back (⌫). The card goes when the channel changes or its programme stops being shielded. A channel chosen in Live or the guide is never shielded: the state resets whenever the player wasn't drawn in the previous egui pass. The sound isn't muted, because no hook unmutes it if the user leaves the player with the card up (the mini player would stay silent). |
+| `ui/widgets/status_bar.rs` | A chip can have a ✕ (`ChipClose`) that runs at once. Chips repaint every 20 s while shown (countdowns). |
+| `images.rs` | `ImageKind::Obscured`: fit in 12×12, shown with linear filtering. It has its own cache key, so a guarded painter never gets the sharp texture. |
+
+## Cross-track needs
+
+1. **Painters (integrator / owners of `rows.rs`, `epg_grid.rs`, `search.rs`, `home.rs`):**
+   - Guide cell titles, programme rows (`rows::programme_row`), search hits and Home's tiles don't ask the guard yet. They should show `Spoilers::text(subject, Field::Title, title)`, and `Field::SubTitle` for "title · sub".
+   - Grid cells: cache per (programme, `stamp()`, minute), as score measured.
+   - For the full look with mouse reveal, the base-B call sites can swap their `Label`s for `ui::widgets::spoiler::field(...)`: the popover sub-title and description, the series page plot, Live's details pane, and the movie page plot.
+2. **Live (`live.rs`, MV-2) and the guide (`guide.rs`):** the details pane (`self.description`) and the tooltip (`hover_detail`) cache guarded text. They should reload when `Spoilers::stamp()` changes. Until then, a Ctrl+B on a Live channel shows only on the next reload.
+3. **Player (`player/mod.rs`, MV-2):**
+   - The shield acts after the zap: the stream opens (sound included), then the picture is covered. To not open it at all, `zap()` should check `guard.shield(neighbour, now)` before sending `Zap` / `ZapTo`, and the card should stay keyed to that neighbour.
+   - Enter on the card works through `osd_focus` (the card treats it as "watch anyway").
+   - The player doesn't dispatch Ctrl+B to `item_menu`, so revealing the banner's or mini guide's text needs `item_menu::dispatch(ctx, action, &Target::Channel(playing))` in `on_action`.
+4. **Keymap (integrator):** `hint_line` should add "Ctrl+B show spoilers" when the focused item is guarded.
+5. **Settings (integrator):** Delete or `x` on a `Item::Feature` row could call `feature_item` as Enter does. Today the menu (Enter) holds Delete.
+6. **Agent:**
+   - `tests/agent_mcp.rs` (`tools_list_has_every_tool`, `the_real_binary_speaks_only_json_on_stdout`) and `tests/agent_e2e.rs` count 13 tools.
+   - With the spoiler guard on, `spoiler_guard` is listed (14). Update the expected lists.

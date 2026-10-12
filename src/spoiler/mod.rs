@@ -21,8 +21,8 @@ pub mod tracker;
 pub mod ui;
 pub mod verdict;
 
-/// S-ui flips this in its last commit.
-pub const ENABLED: bool = false;
+/// The guard's UI is on (S-ui).
+pub const ENABLED: bool = true;
 
 use crate::model::Timestamp;
 

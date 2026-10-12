@@ -40,7 +40,8 @@ pub struct StatusInfo<'a> {
     pub chips: &'a [StatusChip],
 }
 
-/// A feature's status chip: clicking it runs `action` as a global key.
+/// A feature's status chip: clicking it runs `action` as a global key; its ✕ (when it has
+/// one) runs `close` right away (the spoiler guard's "guard again").
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatusChip {
     pub text: String,
@@ -48,6 +49,35 @@ pub struct StatusChip {
     pub label: String,
     pub action: Action,
     pub warning: bool,
+    pub close: Option<ChipClose>,
+}
+
+/// A chip's ✕: what it does (run on the UI thread when clicked) and its accessible name.
+#[derive(Clone)]
+pub struct ChipClose {
+    pub label: String,
+    run: std::sync::Arc<dyn Fn() + Send + Sync>,
+}
+
+impl ChipClose {
+    pub fn new(label: impl Into<String>, run: impl Fn() + Send + Sync + 'static) -> Self {
+        Self { label: label.into(), run: std::sync::Arc::new(run) }
+    }
+    pub fn run(&self) {
+        (self.run)()
+    }
+}
+
+impl std::fmt::Debug for ChipClose {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ChipClose({})", self.label)
+    }
+}
+
+impl PartialEq for ChipClose {
+    fn eq(&self, other: &Self) -> bool {
+        self.label == other.label && std::sync::Arc::ptr_eq(&self.run, &other.run)
+    }
 }
 
 /// The focus line noted this frame: (text, from the pointer). A hovered item beats the
@@ -154,9 +184,22 @@ pub fn status_bar(ui: &mut egui::Ui, theme: &Theme, info: &StatusInfo<'_>) -> St
             ui.spacing_mut().item_spacing.x = gap;
         }
         for c in info.chips {
-            if chip(ui, c.text.clone(), if c.warning { t.warning } else { t.text_secondary }, size, &c.label).clicked() {
+            // right to left: the ✕ first, close to its chip
+            if let Some(close) = &c.close {
+                ui.spacing_mut().item_spacing.x = theme.space(SpaceToken::Md);
+                if chip(ui, glyphs::CLOSE, t.text_secondary, size, &close.label).on_hover_text(&close.label).clicked() {
+                    close.run();
+                    ui.ctx().request_repaint();
+                }
+            }
+            if chip(ui, c.text.clone(), if c.warning { t.warning } else { t.accent }, size, &c.label).clicked() {
                 click = StatusClick::Chip(c.action);
             }
+            ui.spacing_mut().item_spacing.x = gap;
+        }
+        if !info.chips.is_empty() {
+            // a chip's text counts down ("14 min") and goes when its state ends
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(20));
         }
         if info.offline {
             ui.label(egui::RichText::new(format!("{} Offline — showing saved data", glyphs::OFFLINE)).size(size).color(t.warning));
