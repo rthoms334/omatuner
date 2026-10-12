@@ -369,6 +369,8 @@ pub struct FlashRun {
     pub was_on_player: bool,
     /// Muted for it ("silent flash").
     pub muted: bool,
+    /// Multi-view: the picture it plays in (it closes there; the other one is left alone).
+    pub tile: Option<crate::model::TileId>,
 }
 
 /// What to do when a flash ends. Pure.
@@ -606,6 +608,7 @@ mod tests {
             popped: true,
             was_on_player: false,
             muted: false,
+            tile: None,
         };
         assert_eq!(f.restore(Some(&MediaRef::Channel(ChannelId(9)))), FlashRestore::Play(prev));
         assert_eq!(f.restore(Some(&MediaRef::Channel(ChannelId(5)))), FlashRestore::Nothing);

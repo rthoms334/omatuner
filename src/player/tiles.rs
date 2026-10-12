@@ -180,16 +180,28 @@ impl Tiles {
 
     /// The planner's move, ONLY after the user said yes ("Move picture A to its TV 2 copy so B
     /// can use TV? · Enter Move"): `mover` retunes with `mover_cmd` (its copy, on playlist
-    /// `to`), then `target` plays with `target_cmd` on the playlist the mover leaves. The
-    /// mover's claim moves at once, so the target's load waits for the mover's old stream to
-    /// close instead of being refused (a few seconds at most), and the shared race window then
+    /// `mover_to`), then `target` plays with `target_cmd` (on playlist `target_to`, when
+    /// known). Both claims move at once, so each load waits for the other picture's old stream
+    /// to close instead of being refused (a few seconds at most) — whichever player gets its
+    /// command first, and also when the two swap playlists — and the shared race window then
     /// retries the 403s of a provider that still counts the old stream (up to ~45 s).
-    pub fn rearrange(&self, mover: TileId, to: SourceId, mover_cmd: PlayerCommand, target: TileId, target_cmd: PlayerCommand) {
+    pub fn rearrange(
+        &self,
+        mover: TileId,
+        mover_to: SourceId,
+        mover_cmd: PlayerCommand,
+        target: TileId,
+        target_to: Option<SourceId>,
+        target_cmd: PlayerCommand,
+    ) {
         if self.player(mover).is_none() || self.player(target).is_none() || mover == target {
             return;
         }
-        tracing::info!("player: moving picture {mover} to source {} so picture {target} can use its playlist", to.0);
-        self.budget.claim(mover, Some(to));
+        tracing::info!("player: moving picture {mover} to source {} so picture {target} can use its playlist", mover_to.0);
+        self.budget.claim(mover, Some(mover_to));
+        if target_to.is_some() {
+            self.budget.claim(target, target_to);
+        }
         self.handle(mover).send(mover_cmd);
         self.handle(target).send(target_cmd);
     }

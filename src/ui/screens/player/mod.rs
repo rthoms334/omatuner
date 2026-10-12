@@ -172,7 +172,8 @@ fn is_live(snap: &PlayerSnapshot) -> bool {
 /// controller's own zap would skip (`failing`: ≥ 2 failures in 24 h; DRM; vanished channels).
 fn zap_target(live_idx: &LiveIndex, snap: &PlayerSnapshot, forward: bool, failing: &HashSet<ItemRef>) -> Option<ChannelId> {
     let zap = snap.zap.as_ref()?;
-    let current = playing_channel(snap).or_else(|| match snap.playable.as_ref().map(|p| &p.media) {
+    // a copy standing in for the pick (multi-view) zaps from the pick's place in the list
+    let current = snap.zap_anchor.or_else(|| playing_channel(snap)).or_else(|| match snap.playable.as_ref().map(|p| &p.media) {
         Some(MediaRef::Channel(c)) => Some(*c),
         _ => None,
     })?;
@@ -193,7 +194,7 @@ impl PlayerScreen {
         }
         let failing = super::live::failing_set(ctx).unwrap_or_default();
         if let Some(target) = zap_target(&ctx.lib.live, &snap, forward, &failing) {
-            ctx.play(PlayerCommand::ZapTo(target));
+            ctx.play(PlayerCommand::ZapTo { id: target, unlocked: false });
         }
     }
 
@@ -213,7 +214,8 @@ impl PlayerScreen {
             return false;
         }
         if ctx.player.zap.is_some() {
-            ctx.play(PlayerCommand::ZapTo(id));
+            let unlocked = ctx.parental.is_unlocked(&ctx.config.parental);
+            ctx.play(PlayerCommand::ZapTo { id, unlocked });
         } else {
             let zap = live::primary_zap(ctx, id);
             ctx.play(PlayerCommand::Play(PlayRequest {

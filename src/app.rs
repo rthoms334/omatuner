@@ -360,14 +360,23 @@ impl TunerApp {
     }
 
     /// Every player command of the app goes through here (tests record them): to the focused
-    /// picture; a film, an episode or a file to picture A, ending multi-view.
+    /// picture; a film, an episode or a file to picture A, ending multi-view; with two pictures,
+    /// volume and mute to the one with the sound (as the keys, `ui::multiview::route_command`).
     fn send_player(&self, cmd: PlayerCommand) {
         #[cfg(test)]
         self.log.borrow_mut().commands.push(cmd.clone());
         if self.mv_vod_to_a(&cmd) {
             return;
         }
-        self.services().tiles.focused().send(cmd);
+        let tiles = &self.services().tiles;
+        match cmd {
+            PlayerCommand::SetVolume(_) | PlayerCommand::AdjustVolume(_) | PlayerCommand::ToggleMute | PlayerCommand::SetMute(_)
+                if self.mv.view.on =>
+            {
+                tiles.audible_handle().send(cmd)
+            }
+            cmd => tiles.focused().send(cmd),
+        }
     }
 
     /// Every job the app submits goes through here (tests record them).
@@ -855,6 +864,7 @@ impl TunerApp {
             self.pending_toasts.clear();
             self.pending_locked = None;
             self.pending_agent = None;
+            self.mv.forget_pending();
             let hidden = Arc::new(self.lib.hiding_explicit());
             let old = std::mem::replace(&mut self.lib, hidden);
             // a playlist left with only explicit movies isn't eligible any more (its toast names
@@ -1130,6 +1140,8 @@ impl TunerApp {
             paused: self.snapshot.paused,
         });
         let was_on_player = self.view_screen() == ScreenId::Player;
+        // what the user hears now (two pictures: the one with the sound)
+        let listening_muted = self.mv_snap(self.mv.view.audible).map_or(self.snapshot.muted, |s| s.muted);
         self.play_switch(cid, late);
         if self.pending_locked.as_ref().is_some_and(|(c, _)| *c == cid) {
             return; // the PIN prompt shows where the window is; nothing moves under it
@@ -1153,8 +1165,9 @@ impl TunerApp {
         let from = row.as_ref().map_or_else(crate::model::now, crate::reminders::target_at);
         let stop = row.as_ref().map_or(from + crate::reminders::DEFAULT_DURATION_S, crate::reminders::effective_stop);
         let ends_at = crate::follow::flash::ends_at(&f.spec, from).map_or(stop, |t| t.min(stop));
-        let muted = f.spec.volume == crate::follow::flash::FlashVolume::Mute && !self.snapshot.muted;
+        let muted = f.spec.volume == crate::follow::flash::FlashVolume::Mute && !listening_muted;
         if muted {
+            // two pictures: the flash plays in the one that took the sound
             self.send_player(PlayerCommand::SetMute(true));
         }
         self.reminder_ui.flash = Some(crate::reminders::ui::FlashRun {
@@ -1166,6 +1179,7 @@ impl TunerApp {
             popped: place == Place::PopOut,
             was_on_player,
             muted,
+            tile: self.mv.view.on.then(|| self.mv.outside_tile()),
         });
         // it closes by itself even while no frame runs (the window hidden): the event wakes
         // `logic`
@@ -1185,13 +1199,17 @@ impl TunerApp {
         match late {
             Some(l) if l.catchup && open => {
                 self.pending_zap = None;
-                self.send_player(PlayerCommand::Play(PlayRequest {
-                    media: MediaRef::Catchup { channel: cid, start: l.from, stop: l.stop, catchup_id: None },
-                    zap: None,
-                    origin: PlayOrigin::Reminder,
-                    resume: false,
-                    immediate: true,
-                }));
+                // two pictures: the silent one, as every automatic switch
+                let media = MediaRef::Catchup { channel: cid, start: l.from, stop: l.stop, catchup_id: None };
+                if !self.mv_outside(media.clone(), None, PlayOrigin::Reminder) {
+                    self.send_player(PlayerCommand::Play(PlayRequest {
+                        media,
+                        zap: None,
+                        origin: PlayOrigin::Reminder,
+                        resume: false,
+                        immediate: true,
+                    }));
+                }
                 self.nav.push(NavRequest::Push(Route::Player));
                 self.toast(Toast::info(format!("Started {} min ago — playing from the beginning", l.by_s / 60)));
             }
@@ -1226,6 +1244,14 @@ impl TunerApp {
     fn end_flash(&mut self, restore: bool, egui_ctx: &egui::Context) {
         use crate::reminders::ui::FlashRestore;
         let Some(f) = self.reminder_ui.flash.take() else { return };
+        // two pictures: the flash had a picture of its own; it closes (if it still shows the
+        // flash) and the other carries on with the sound — before the unmute, which then
+        // reaches the picture that has the sound
+        let flash_tile = f.tile.filter(|_| self.mv.view.on);
+        let shows_flash = |app: &Self, t| app.mv_snap(t).is_some_and(|s| crate::ui::screens::live::playing_channel(&s) == Some(f.channel));
+        if restore && let Some(t) = flash_tile.filter(|t| shows_flash(self, *t)) {
+            self.apply_mv(crate::ui::multiview::MvRequest::Close(Some(t)));
+        }
         if f.muted {
             self.send_player(PlayerCommand::SetMute(false));
         }
@@ -1234,6 +1260,7 @@ impl TunerApp {
         }
         let playing = self.snapshot.playable.as_ref().filter(|_| self.snapshot.state != PlayerState::Idle).map(|p| p.media.clone());
         match f.restore(playing.as_ref()) {
+            _ if flash_tile.is_some() => {}
             FlashRestore::Nothing => return,
             FlashRestore::Stop => self.send_player(PlayerCommand::Stop),
             FlashRestore::Play(p) => match p.media {
@@ -4823,6 +4850,18 @@ mod tests {
     /// "TV" (Alpha, Bravo, Charlie) and "TV 2" (Bravo, Charlie, Delta), one stream each: the
     /// user's two accounts. Channel ids 1–3 on TV, 4–6 on TV 2.
     fn seed_two_playlists(c: &mut rusqlite::Connection) -> crate::error::Result<()> {
+        seed_two_playlists_with(c, |src, i| format!("http://127.0.0.1/{src}/{i}.ts"))
+    }
+
+    /// `seed_two_playlists` with Alpha (TV) PIN-locked and every channel playing lavfi's test
+    /// source, so both pictures really play.
+    fn seed_two_locked_playlists(c: &mut rusqlite::Connection) -> crate::error::Result<()> {
+        seed_two_playlists_with(c, |_, _| "av://lavfi:testsrc2=size=160x90:rate=25".into())?;
+        c.execute("INSERT INTO item_override(source_id, kind, item_key, locked, fp) VALUES (1, 'channel', 'm3u:Alpha', 1, '')", [])?;
+        Ok(())
+    }
+
+    fn seed_two_playlists_with(c: &mut rusqlite::Connection, url_of: impl Fn(usize, usize) -> String) -> crate::error::Result<()> {
         use rusqlite::params;
         let account = serde_json::to_string(&crate::model::AccountInfo { max_connections: Some(1), ..Default::default() }).unwrap();
         for (src, (name, chans)) in [("TV", ["Alpha", "Bravo", "Charlie"]), ("TV 2", ["Bravo", "Charlie", "Delta"])].into_iter().enumerate() {
@@ -4837,7 +4876,7 @@ mod tests {
             )?;
             let grp = c.last_insert_rowid();
             for (i, ch) in chans.iter().enumerate() {
-                let url = format!("http://127.0.0.1/{src}/{i}.ts");
+                let url = url_of(src, i);
                 c.execute(
                     "INSERT INTO channel(source_id, key, name, clean_name, norm_name, number, stream, url_key, provider_order, seen_gen)
                      VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
@@ -5005,6 +5044,85 @@ mod tests {
         assert_eq!(tile_plays(&rig.log(), PIC_A), [MediaRef::Channel(ChannelId(4))], "A moved to Bravo's TV 2 copy");
         assert_eq!(tile_plays(&rig.log(), PIC_B), [MediaRef::Channel(ChannelId(1))], "B plays Alpha from TV");
         assert_eq!(rig.app.services().tiles.budget().claim_of(PIC_A), Some(SourceId(2)), "A's claim moved at once");
+    }
+
+    /// Alpha (TV) is PIN-locked: Ctrl+M on it with nothing playing, and the agent's two
+    /// pictures with Alpha first, ask for the PIN before anything plays; with the PIN both land
+    /// at once, Alpha in A and Bravo's TV 2 copy in B (one plan: B never plans against what A
+    /// replaces). From one picture the agent's two again fill both, on different playlists.
+    #[test]
+    fn locked_pictures_ask_for_the_pin_and_the_agents_two_fill_both_pictures() {
+        use crate::agent::{AgentCommand, AgentMultiView};
+        let mut rig = Rig::with(pin_config(), live(), 1.0, seed_two_locked_playlists);
+        rig.settle();
+        rig.app.nav.push(NavRequest::Switch(Route::Live { group: None, channel: Some(ChannelId(1)) }));
+        rig.frame_with(vec![]);
+        rig.press(Key::M, CTRL);
+        rig.frame_with(vec![]);
+        assert_eq!(rig.overlay_kinds(), [pin_prompt()], "Ctrl+M on a locked channel");
+        assert!(played(&rig.log()).is_empty() && rig.log().tile_commands.is_empty(), "nothing played: {:?}", rig.log().commands);
+        rig.press(Key::Escape, NONE);
+
+        let open = |targets: [i64; 2]| {
+            AppEvent::Agent(AgentCommand::MultiView(AgentMultiView::Open {
+                targets: targets.iter().map(|c| MediaRef::Channel(ChannelId(*c))).collect(),
+                layout: None,
+                sound: None,
+                rearrange: false,
+            }))
+        };
+        rig.event(open([1, 2]));
+        rig.frame_with(vec![]);
+        assert_eq!(rig.overlay_kinds(), [pin_prompt()], "the agent's pair with a locked channel");
+        assert!(played(&rig.log()).is_empty() && rig.log().tile_commands.is_empty(), "nothing played before the PIN");
+        type_pin(&mut rig);
+        rig.until("picture B plays", |r| r.app.services().tiles.b().is_some() && !tile_plays(&r.log(), PIC_B).is_empty());
+        assert_eq!(tile_plays(&rig.log(), PIC_A), [MediaRef::Channel(ChannelId(1))], "Alpha in A");
+        assert_eq!(tile_plays(&rig.log(), PIC_B), [MediaRef::Channel(ChannelId(4))], "Bravo's TV 2 copy in B");
+        assert!(played(&rig.log()).is_empty(), "no play went the single-view way");
+        let v = rig.app.mv.view;
+        assert!(v.on && v.focus == PIC_A && v.audible == PIC_A, "{v:?}");
+
+        // one picture (B closed), the agent opens two others: one plan again
+        rig.app.apply_mv(crate::ui::multiview::MvRequest::Close(Some(PIC_B)));
+        rig.until("single view", |r| !r.app.mv.view.on);
+        rig.app.log.borrow_mut().tile_commands.clear();
+        rig.event(open([3, 6]));
+        rig.until("both sent", |r| !tile_plays(&r.log(), PIC_A).is_empty() && !tile_plays(&r.log(), PIC_B).is_empty());
+        assert_eq!(tile_plays(&rig.log(), PIC_A), [MediaRef::Channel(ChannelId(3))], "Charlie from TV");
+        assert_eq!(tile_plays(&rig.log(), PIC_B), [MediaRef::Channel(ChannelId(6))], "Delta, only on TV 2");
+    }
+
+    /// DESIGN §35 §7.8: relocking stops only the picture that shows a locked channel; the other
+    /// carries on (with the sound).
+    #[test]
+    fn relocking_stops_only_the_locked_picture() {
+        let mut rig = Rig::with(pin_config(), live(), 1.0, seed_two_locked_playlists);
+        rig.settle();
+        let cfg = rig.app.services().config();
+        assert!(rig.app.parental.unlock("1234", &cfg.parental));
+        rig.app.send_player(PlayerCommand::Play(PlayRequest {
+            media: MediaRef::Channel(ChannelId(1)),
+            zap: None,
+            origin: PlayOrigin::Fullscreen,
+            resume: false,
+            immediate: true,
+        }));
+        let playing = |r: &Rig, t, ch: i64| r.app.mv_snap(t).is_some_and(|s| crate::ui::screens::live::playing_channel(&s) == Some(ChannelId(ch)));
+        rig.until("Alpha plays", |r| playing(r, PIC_A, 1));
+        rig.app.nav.push(NavRequest::Switch(Route::Live { group: None, channel: Some(ChannelId(2)) }));
+        rig.frame_with(vec![]);
+        rig.press(Key::M, CTRL);
+        rig.until("both play", |r| playing(r, PIC_A, 1) && playing(r, PIC_B, 4));
+        rig.app.parental.lock();
+        rig.frame_with(vec![]);
+        let stops = |r: &Rig, t| r.log().tile_commands.iter().any(|(x, c)| *x == t && *c == PlayerCommand::Stop);
+        assert!(stops(&rig, PIC_A), "locked Alpha stopped");
+        assert!(!stops(&rig, PIC_B), "picture B carries on");
+        assert!(rig.log().toasts.iter().any(|t| t.text == "Picture A stopped — parental control is on"), "{:?}", rig.log().toasts);
+        rig.until("single view on B", |r| !r.app.mv.view.on);
+        let v = rig.app.mv.view;
+        assert!(v.focus == PIC_B && v.audible == PIC_B, "{v:?}");
     }
 
     /// The multi-view player at a tiled half (790 pt) and full screen (1600 pt), text size 12

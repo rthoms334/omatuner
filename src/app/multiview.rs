@@ -50,8 +50,8 @@ pub(super) struct MvApp {
     make_surface: bool,
     /// A move waiting for the user's yes.
     consent: Option<Sending>,
-    /// A locked channel's PIN prompt for a picture.
-    pin: Option<PlaceIn>,
+    /// The plays waiting for a locked channel's PIN (one, or the agent's pair).
+    pin: Vec<PlaceIn>,
     /// The load generation each picture had when it was sent a play: it counts as busy until
     /// its player took the command.
     sent: [Option<u64>; 2],
@@ -74,6 +74,21 @@ struct Sending {
     slots: [TileId; 2],
     /// "Picture B plays it from TV 2 — TV is busy with picture A".
     note: Option<String>,
+}
+
+impl MvApp {
+    /// A PIN prompt or a "move the playing picture?" card that went away unanswered (relock
+    /// closed every dialog): their plays must never go out later.
+    pub(super) fn forget_pending(&mut self) {
+        self.pin.clear();
+        self.consent = None;
+    }
+
+    /// The picture an outside play just went to (it took the sound, or will once picture B is
+    /// up).
+    pub(super) fn outside_tile(&self) -> TileId {
+        self.waiting.as_ref().filter(|s| s.take_sound).map_or(self.view.audible, |s| s.target)
+    }
 }
 
 fn slot(t: TileId) -> usize {
@@ -234,17 +249,21 @@ impl TunerApp {
                 if let Some(l) = layout {
                     set_layout(self, *l);
                 }
-                let on = self.mv.view.on;
-                let aims: &[Aim] = match targets.len() {
-                    1 => &[Aim::Alongside],
-                    _ if on => &[Aim::Tile(A), Aim::Tile(B)],
-                    _ => &[Aim::Focused, Aim::Alongside],
+                let place = |i: usize, aim: Aim, media: &MediaRef| PlaceIn {
+                    take_sound: *sound == Some(i),
+                    rearrange: *rearrange,
+                    ..PlaceIn::new(aim, media.clone(), None)
                 };
-                for (i, (media, aim)) in targets.iter().zip(aims).enumerate() {
-                    let mut p = PlaceIn::new(*aim, media.clone(), None);
-                    p.take_sound = *sound == Some(i);
-                    p.rearrange = *rearrange;
-                    self.mv_place(p);
+                match targets.as_slice() {
+                    [one] => self.mv_place(place(0, Aim::Alongside, one)),
+                    [a, b, ..] if self.mv.view.on => {
+                        self.mv_place(place(0, Aim::Tile(A), a));
+                        self.mv_place(place(1, Aim::Tile(B), b));
+                    }
+                    // single view: one plan for both (the focused picture and the other), so
+                    // the second never plans against what the first replaces
+                    [a, b, ..] => self.mv_place_pair(vec![place(0, Aim::Focused, a), place(1, Aim::Alongside, b)]),
+                    [] => {}
                 }
             }
             M::Swap(Swap::Sound) => self.apply_mv(MvRequest::Sound(Some(self.mv.view.audible.other()))),
@@ -291,6 +310,14 @@ impl TunerApp {
         let plain = |p: &PlaceIn| {
             PlayerCommand::Play(PlayRequest { media: p.media.clone(), zap: p.zap.clone(), origin: p.origin, resume: false, immediate: true })
         };
+        // the parental gate before anything plays, whichever picture it is for
+        let ch = match channel {
+            Some(id) => match self.mv_gate(id, std::slice::from_ref(&p)) {
+                Some(ch) => Some(ch),
+                None => return,
+            },
+            None => None,
+        };
         let tile = match p.aim {
             Aim::Focused | Aim::Silent if !view.on => return self.send_player(plain(&p)),
             Aim::Focused => view.focus,
@@ -314,25 +341,9 @@ impl TunerApp {
             return self.send_player(plain(&p));
         }
         let take_sound = p.take_sound || p.aim == Aim::Silent;
-        let Some(id) = channel else { return };
-        let Some(ch) = self.lib.live.get(id).cloned() else {
-            return self.toast(Toast::info("That channel is no longer in your playlists"));
-        };
-        if ch.unsupported {
-            return self.toast(Toast::info("DRM-protected — can't be played"));
-        }
+        let (Some(id), Some(ch)) = (channel, ch) else { return };
         let cfg = self.services().config();
         let unlocked = self.parental.is_unlocked(&cfg.parental);
-        if ch.locked && !unlocked {
-            self.pending_locked = None;
-            self.pending_agent = None;
-            self.nav.push(NavRequest::Open(OverlayRequest::Pin {
-                then: Box::new(Action::OpenPlayer),
-                reason: format!("“{}” is locked — for picture {tile}", ch.name),
-            }));
-            self.mv.pin = Some(PlaceIn { aim: Aim::Tile(tile), take_sound, ..p });
-            return;
-        }
         // already on screen: that picture is chosen (Enter) or gets the sound (outside plays)
         if matches!(p.media, MediaRef::Channel(_))
             && let Some(t) = [A, B].into_iter().find(|t| {
@@ -429,6 +440,106 @@ impl TunerApp {
         }
     }
 
+    /// The parental gate of a picture's channel (DESIGN §20.3): `None` when it can't play now —
+    /// gone, DRM, or locked while the session is (the PIN prompt opens, and `plays` go out once
+    /// it is typed).
+    fn mv_gate(&mut self, id: ChannelId, plays: &[PlaceIn]) -> Option<crate::model::ChannelSummary> {
+        let Some(ch) = self.lib.live.get(id).cloned() else {
+            self.toast(Toast::info("That channel is no longer in your playlists"));
+            return None;
+        };
+        if ch.unsupported {
+            self.toast(Toast::info("DRM-protected — can't be played"));
+            return None;
+        }
+        if ch.locked && !self.parental.is_unlocked(&self.services().config().parental) {
+            self.pending_locked = None;
+            self.pending_agent = None;
+            let view = self.mv.view;
+            let picture = match plays.first().map(|p| p.aim) {
+                _ if plays.len() > 1 => None,
+                Some(Aim::Tile(t)) => Some(t),
+                Some(Aim::Focused) if view.on => Some(view.focus),
+                Some(Aim::Silent) if view.on => Some(view.silent()),
+                Some(Aim::Alongside) if view.on || kind_of(&self.snapshot).is_some() => Some(view.focus.other()),
+                _ => None,
+            };
+            let reason = match picture {
+                Some(t) => format!("“{}” is locked — for picture {t}", ch.name),
+                None => format!("“{}” is locked", ch.name),
+            };
+            self.nav.push(NavRequest::Open(OverlayRequest::Pin { then: Box::new(Action::OpenPlayer), reason }));
+            self.mv.pin = plays.to_vec();
+            return None;
+        }
+        Some(ch)
+    }
+
+    /// Two live channels or catch-ups from single view (the agent's `multiview open`): the
+    /// focused picture and the other, planned together on the playlists' limits (nothing is
+    /// kept: both pictures play anew). Both pass the parental gate before either plays.
+    pub(super) fn mv_place_pair(&mut self, pair: Vec<PlaceIn>) {
+        let channel = |p: &PlaceIn| match &p.media {
+            MediaRef::Channel(c) | MediaRef::Catchup { channel: c, .. } => Some(*c),
+            _ => None,
+        };
+        let (Some(first), Some(second)) = (pair.first(), pair.get(1)) else { return };
+        let (Some(id0), Some(id1)) = (channel(first), channel(second)) else {
+            return self.toast(Toast::info("Films and episodes play on their own"));
+        };
+        let Some(ch0) = self.mv_gate(id0, &pair) else { return };
+        let Some(ch1) = self.mv_gate(id1, &pair) else { return };
+        let focus = self.mv.view.focus;
+        // the focused picture already shows the first: only the second needs a picture
+        if matches!(first.media, MediaRef::Channel(_))
+            && self.mv_snap(focus).is_some_and(|s| crate::ui::screens::live::playing_channel(&s) == Some(id0))
+        {
+            let p = PlaceIn { aim: Aim::Alongside, ..second.clone() };
+            return self.mv_place(p);
+        }
+        let cfg = self.services().config();
+        let unlocked = self.parental.is_unlocked(&cfg.parental);
+        let slots = [focus, focus.other()];
+        let layout = Layout::effective(cfg.player.multiview.layout, self.window_size.x, self.theme.rem(), self.video_only);
+        let area = egui::Rect::from_min_size(egui::Pos2::ZERO, self.window_size);
+        let ppp = if self.mv.ppp > 0.0 { self.mv.ppp } else { 1.0 };
+        let mut wanted = Vec::new();
+        for (p, id, ch, tile) in [(first, id0, &ch0, slots[0]), (second, id1, &ch1, slots[1])] {
+            let candidates = match p.media {
+                MediaRef::Channel(_) => self.copies_of(id),
+                _ => vec![self.copy_of(ch)],
+            };
+            let target_px = mv::target_px(layout, area, slots, cfg.player.multiview.pip_corner, self.theme.rem(), ppp, tile);
+            wanted.push(Wanted { tile, pick: id, candidates, target_px });
+        }
+        let all: Vec<ChannelId> = wanted.iter().flat_map(|w| w.candidates.iter().map(|c| c.id)).collect();
+        let trouble = self.trouble(&all);
+        let names = self.lib.sources.iter().map(|s| (s.id, s.name.clone())).collect();
+        let req = PlaceRequest { wanted, keeps: None, locked_session: !unlocked, trouble, names };
+        let plan = match mv::plan(&req, &self.services().tiles.budget().usage()) {
+            Ok(plan) => plan,
+            Err(u) => return self.toast(Toast::info(u.reason)),
+        };
+        let light = cfg.player.multiview.light_decode_small.0;
+        let mut cmds = Vec::new();
+        for ((t, chosen, _), (p, id)) in plan.tiles.into_iter().zip([(first, id0), (second, id1)]) {
+            if light {
+                cmds.push((t, PlayerCommand::SetLightDecode(layout != Layout::SideBySide && slots[1] == t)));
+            }
+            let media = match &p.media {
+                MediaRef::Catchup { .. } => p.media.clone(),
+                _ => MediaRef::Channel(chosen),
+            };
+            let req = PlayRequest { media, zap: zap_with(p.zap.as_ref(), id, chosen), origin: p.origin, resume: false, immediate: true };
+            cmds.push((t, PlayerCommand::Play(req)));
+        }
+        let (target, take_sound) = match pair.iter().position(|p| p.take_sound) {
+            Some(i) => (slots[i.min(1)], true),
+            None => (slots[1], false),
+        };
+        self.mv_send(Sending { target, cmds, mover: None, take_sound, slots, note: None });
+    }
+
     /// Send a plan, starting picture B first when it doesn't exist yet.
     fn mv_send(&mut self, s: Sending) {
         if let Some(n) = &s.note {
@@ -437,6 +548,11 @@ impl TunerApp {
         self.mv.view.slots = s.slots;
         let needs_b = s.cmds.iter().any(|(t, _)| *t == B) && self.services().tiles.b().is_none();
         if needs_b {
+            // the pictures it is for count as busy while B starts (an idle A must not end
+            // multi-view before its play goes out)
+            for (t, _) in &s.cmds {
+                self.mv.sent[slot(*t)] = Some(self.mv_snap(*t).map_or(0, |x| x.load_generation));
+            }
             self.services_mut().start_tile_b();
             self.mv.waiting = Some(s);
             self.mv.view.on = true;
@@ -458,7 +574,15 @@ impl TunerApp {
                 if let (Some(mc), Some(tc)) = (play(mover), play(s.target)) {
                     #[cfg(test)]
                     self.log.borrow_mut().tile_commands.extend([(mover, mc.clone()), (s.target, tc.clone())]);
-                    self.services().tiles.rearrange(mover, to, mc, s.target, tc);
+                    // the target's playlist is claimed ahead too: the mover's load then waits
+                    // for the target's old stream instead of being refused (a swap)
+                    let target_to = played_media(&tc)
+                        .and_then(|m| match m {
+                            MediaRef::Channel(c) | MediaRef::Catchup { channel: c, .. } => self.lib.live.get(*c),
+                            _ => None,
+                        })
+                        .map(|c| c.source_id);
+                    self.services().tiles.rearrange(mover, to, mc, s.target, target_to, tc);
                 }
             }
             None => {
@@ -536,16 +660,18 @@ impl TunerApp {
             }
             // a newer prompt of `play_channel` / the agent's is theirs
             OverlayResult::Unlocked(Action::OpenPlayer) if self.pending_locked.is_some() || self.pending_agent.is_some() => {
-                self.mv.pin = None;
+                self.mv.pin.clear();
                 false
             }
-            OverlayResult::Unlocked(Action::OpenPlayer) => match self.mv.pin.take() {
-                Some(p) => {
-                    self.mv_place(p);
-                    true
+            OverlayResult::Unlocked(Action::OpenPlayer) => {
+                let mut plays = std::mem::take(&mut self.mv.pin);
+                match plays.len() {
+                    0 => return false,
+                    1 => self.mv_place(plays.remove(0)),
+                    _ => self.mv_place_pair(plays),
                 }
-                None => false,
-            },
+                true
+            }
             _ => false,
         }
     }
@@ -588,6 +714,17 @@ impl TunerApp {
                 self.send_to(B, PlayerCommand::Stop);
                 self.mv_single(A);
             }
+        }
+        // the sound went to a picture that then failed while the other plays: it comes back
+        // (a play that was just sent still counts as busy, `sent`)
+        let audible = self.mv.view.audible;
+        let state = |t: TileId| snaps[slot(t)].as_ref().map(|s| &s.state);
+        if self.mv.view.on
+            && self.mv.sent[slot(audible)].is_none()
+            && matches!(state(audible), Some(PlayerState::Error(_)))
+            && state(audible.other()) == Some(&PlayerState::Playing)
+        {
+            self.mv_sound(audible.other());
         }
         // relocking stops each picture that shows a locked channel (explicit content goes in
         // `hide_explicit_now`)

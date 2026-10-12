@@ -493,6 +493,8 @@ impl Controller {
                 }
                 Err(e) if e.closing && Instant::now() < deadline => {
                     tracing::debug!("{}: source {} is still closing in picture {:?}; waiting", self.log, src.0, e.holder);
+                    // the lease went above: the old stream must not run on unaccounted
+                    let _ = self.mpv.command("stop", &[]);
                     self.waiting = Some(PendingLoad { playable: p, deadline });
                     return;
                 }
@@ -692,10 +694,12 @@ impl Controller {
                     return self.zap_onto(next, copy);
                 }
             }
-            PlayerCommand::ZapTo(id) => {
+            PlayerCommand::ZapTo { id, unlocked } => {
                 // numeric entry / history: the copy when the other picture holds the playlist
-                // (none: the budget refuses it and the error card says why)
-                let copy = match self.placement(id, true) {
+                // (none: the budget refuses it and the error card says why); a locked copy only
+                // for an unlocked sender, or for a pick that is locked itself (its PIN was typed)
+                let unlocked = unlocked || self.deps.resolver.is_locked(id);
+                let copy = match self.placement(id, unlocked) {
                     Placement::Copy(c) => Some(c),
                     _ => None,
                 };
@@ -1270,7 +1274,7 @@ fn retargets(cmd: &PlayerCommand) -> bool {
         PlayerCommand::Play(_)
             | PlayerCommand::PlayCopy(_)
             | PlayerCommand::Zap { .. }
-            | PlayerCommand::ZapTo(_)
+            | PlayerCommand::ZapTo { .. }
             | PlayerCommand::LastChannel { .. }
             | PlayerCommand::JumpToLive
             | PlayerCommand::Stop
