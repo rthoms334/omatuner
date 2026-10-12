@@ -363,12 +363,37 @@ pub struct JobContext {
     pub player_busy: Arc<AtomicBool>,
     /// Whether library builds show explicit content (DESIGN §20.3), kept by the app.
     pub explicit: crate::store::library::ExplicitGate,
+    /// What the app publishes (B2): jobs use its library snapshot instead of building their
+    /// own. `None` headless (`tuner --refresh`, tests).
+    pub shared: Option<Arc<crate::shared::AppShared>>,
 }
 
 impl JobContext {
     /// `submit` is a no-op placeholder until [`JobManager::new`] installs the real one.
     pub fn new(store: Store, http: HttpClient, bus: EventBus, paths: AppPaths, config: SharedConfig) -> Self {
-        Self { store, http, bus, paths, config, submit: Arc::new(|_| JobId(0)), player_busy: Arc::default(), explicit: Default::default() }
+        Self {
+            store,
+            http,
+            bus,
+            paths,
+            config,
+            submit: Arc::new(|_| JobId(0)),
+            player_busy: Arc::default(),
+            explicit: Default::default(),
+            shared: None,
+        }
+    }
+
+    /// Jobs read what the app publishes; the explicit gate becomes the app's.
+    pub fn with_shared(mut self, shared: Arc<crate::shared::AppShared>) -> Self {
+        self.explicit = shared.explicit().clone();
+        self.shared = Some(shared);
+        self
+    }
+
+    /// The library snapshot the app last published (`None` headless or before the first).
+    pub fn published_library(&self) -> Option<Arc<crate::store::library::Library>> {
+        self.shared.as_ref().map(|s| s.library()).filter(|l| l.built_at != 0)
     }
 }
 

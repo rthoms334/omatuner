@@ -333,12 +333,19 @@ pub fn set_source_settings(conn: &Connection, id: SourceId, settings: &SourceSet
     Ok(())
 }
 
-/// `settings` with the category rule currently stored for `id` (`category_filter` and
-/// `own_category_filter`; none for an unknown id: the caller's update then reports it).
+/// `settings` with the category rule and the Guide fixes settings currently stored for `id`
+/// (`category_filter`, `own_category_filter`, `guide`; none for an unknown id: the caller's
+/// update then reports it). Those have their own writers (`set_guide_rules`,
+/// `store::guide_fix::apply`), so a stale copy of the settings never reverts them.
 fn with_stored_category_filter(conn: &Connection, id: SourceId, settings: &SourceSettings) -> Result<SourceSettings> {
     let stored: Option<String> = conn.prepare_cached("SELECT settings FROM source WHERE id = ?1")?.query_row([id], |r| r.get(0)).optional()?;
     let stored = from_json_opt::<SourceSettings>(stored).unwrap_or_default();
-    Ok(SourceSettings { category_filter: stored.category_filter, own_category_filter: stored.own_category_filter, ..settings.clone() })
+    Ok(SourceSettings {
+        category_filter: stored.category_filter,
+        own_category_filter: stored.own_category_filter,
+        guide: stored.guide,
+        ..settings.clone()
+    })
 }
 
 /// `meta` key of the category rule every playlist shares (DESIGN §28.3; JSON, absent = none).

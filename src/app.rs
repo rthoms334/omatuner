@@ -619,6 +619,7 @@ impl TunerApp {
                 Err(e) => tracing::warn!("favourites: {e}"),
             },
             DataScope::Epg => {
+                self.services().agent.guard().rebuild();
                 self.now_next.invalidate();
                 self.refresh_epg_updated();
                 self.submit_job(JobKind::RebuildLibrary);
@@ -635,14 +636,20 @@ impl TunerApp {
                 self.submit_job(JobKind::RebuildLibrary);
             }
             DataScope::Live | DataScope::Vod | DataScope::Overrides => {
+                if scope != DataScope::Overrides {
+                    self.services().agent.guard().rebuild();
+                }
                 self.submit_job(JobKind::RebuildLibrary);
             }
             // every zap writes history: patch the recently watched list, never rebuild
             DataScope::History => self.refresh_recent_channels(),
-            DataScope::VodDetails | DataScope::Progress => {}
+            DataScope::VodDetails => {}
+            // a finished episode moves a series' spoiler boundary (debounced in the builder)
+            DataScope::Progress => self.services().agent.guard().rebuild(),
             // the batch features' own data: their screens and services react (Following's job
-            // raises `Reminders` too; the guard rebuilds in S1's service)
-            DataScope::Follow | DataScope::Spoiler | DataScope::GuideIssues => {}
+            // raises `Reminders` too)
+            DataScope::Spoiler | DataScope::Follow => self.services().agent.guard().rebuild(),
+            DataScope::GuideIssues => {}
         }
     }
 

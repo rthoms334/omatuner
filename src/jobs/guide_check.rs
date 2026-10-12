@@ -62,12 +62,13 @@ pub async fn run(ctx: &JobContext, progress: &Progress, cancel: &CancellationTok
     check_now(ctx, lib, progress, cancel).await.map(|_| ())
 }
 
-/// The visibility snapshot the check works on.
-///
-/// CROSS-TRACK: jobs have no `AppShared` yet; once `JobContext` carries it, this becomes
-/// `ctx.shared.library()` (no second build).
+/// The visibility snapshot the check works on: the app's published one, else a build
+/// (headless, or before the app published its first).
 async fn job_library(ctx: &JobContext) -> Result<Arc<Library>> {
-    super::maintenance::rebuild_library(ctx).await
+    match ctx.published_library() {
+        Some(lib) => Ok(lib),
+        None => super::maintenance::rebuild_library(ctx).await,
+    }
 }
 
 /// The check without the debounce (tests, and `run` after it).

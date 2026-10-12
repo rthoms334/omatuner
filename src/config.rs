@@ -297,8 +297,9 @@ pub struct PlayerConfig {
 pub struct MultiViewConfig {
     pub layout: MultiViewLayout,
     pub pip_corner: PopoutCorner,
-    /// Lighter decoding for the small picture (`vd-lavc-skiploopfilter=all` when it loads);
-    /// ships on only if the MV-1 measurement saves ≥ 15 %.
+    /// Lighter decoding for the small picture (`vd-lavc-skiploopfilter=all` when it loads).
+    /// Off by default: the MV-1 measurement saved 10–13 % of a 4K decode, under the 15 % bar
+    /// (docs/design/multiview-spike.md).
     pub light_decode_small: LightDecode,
 }
 
@@ -314,16 +315,10 @@ pub enum MultiViewLayout {
     Pip,
 }
 
-/// `light_decode_small` as a bool that defaults to on (a plain `bool` would default off).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// `light_decode_small` (off by default; see [`MultiViewConfig::light_decode_small`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(transparent)]
 pub struct LightDecode(pub bool);
-
-impl Default for LightDecode {
-    fn default() -> Self {
-        Self(true)
-    }
-}
 
 /// 16:9 pop-out sizes (logical px).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

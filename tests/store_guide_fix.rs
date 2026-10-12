@@ -444,6 +444,13 @@ fn fixes_follow_a_rekeyed_channel() {
     let e = &facts.extras[&l.live.by_ref(&new).unwrap()];
     assert_eq!((e.shift_min, e.guide_ok), (Some(60), IssueKind::GuideEnded.bit()));
     assert!(e.manual.as_ref().is_some_and(|m| m.live && m.epg_name.as_deref() == Some("Sky Mix HD")));
+
+    // saving Edit (Ctrl+I) with nothing of its own set keeps the shift and the dismissal
+    let item = new.clone();
+    s.writer().blocking(move |c| tuner::store::user::set_item_override(c, &item, &tuner::model::ItemOverride::default())).unwrap();
+    let facts = gf::facts(&s.reader().unwrap(), &opts(), NOW).unwrap();
+    let e = &facts.extras[&l.live.by_ref(&new).unwrap()];
+    assert_eq!((e.shift_min, e.guide_ok), (Some(60), IssueKind::GuideEnded.bit()));
 }
 
 /// A guide that renames the id of a manually mapped channel: "Gone from guide", found again

@@ -12,6 +12,7 @@
 //! terms, titles or channels.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Instant;
 
 use rusqlite::Connection;
@@ -74,10 +75,14 @@ pub async fn evaluate(ctx: &JobContext, reason: FollowReason, progress: &Progres
     let opts =
         Opts { now: crate::model::now(), reason, cfg: cfg.follow.clone(), pin_active: cfg.parental.pin_active(), tz: jiff::tz::TimeZone::system() };
     let (o, token) = (opts.clone(), cancel.clone());
-    // No published snapshot reaches jobs: build one that never shows explicit content (the
-    // headless `--refresh` path of the design; the pool drops explicit channels either way).
+    // The app's published snapshot; headless (`--refresh`) or before the first, build one that
+    // never shows explicit content. The pool drops explicit channels either way.
+    let published = ctx.published_library();
     let ev = super::read(ctx, move |c| {
-        let lib = crate::store::library::load_visible(c, crate::store::library::Visibility::NO_EXPLICIT)?;
+        let lib = match published {
+            Some(lib) => lib,
+            None => Arc::new(crate::store::library::load_visible(c, crate::store::library::Visibility::NO_EXPLICIT)?),
+        };
         prepare(c, &lib, &o, &|| token.is_cancelled())
     })
     .await?;

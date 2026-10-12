@@ -82,7 +82,7 @@ fn main() -> anyhow::Result<()> {
 
     // Paths are made absolute HERE: a running instance receiving them over IPC has another
     // working directory.
-    let request = IpcRequest {
+    let mut request = IpcRequest {
         view: cli.view,
         play: cli.play.as_deref().map(absolute_input),
         inputs: cli.inputs.iter().map(|i| absolute_input(i)).collect(),
@@ -97,9 +97,28 @@ fn main() -> anyhow::Result<()> {
         // launched from the desktop, nobody reads stderr
         tuner::platform::notify::notify(tuner::APP_NAME, &e.to_string(), false);
     }
-    let Some(_instance) = primary? else {
+    let Some(instance) = primary? else {
         return Ok(());
     };
+    // a reminder's systemd timer fired while Tuner was closed (B6): show its note from here,
+    // start Tuner for a switch, or do nothing
+    if let Some(id) = cli.reminder {
+        let store = tuner::store::Store::open(&paths.db_file(), None)?;
+        // TODO(score): a guard built from the store once the spoiler guard ships; identity until then
+        let outcome = tuner::reminders::closed::fire(&store, &config, &tuner::guard::Guard::default(), id, tuner::model::now());
+        store.close(Duration::from_secs(3));
+        match outcome? {
+            tuner::reminders::closed::ClosedOutcome::Exit => return Ok(()),
+            tuner::reminders::closed::ClosedOutcome::StartApp { popout } => request.popout = popout,
+            tuner::reminders::closed::ClosedOutcome::Notify(note) => {
+                // Watch launches a fresh `tuner --play`, which must be able to become primary
+                drop(instance);
+                tuner::reminders::closed::notify_and_wait(&note);
+                return Ok(());
+            }
+        }
+    }
+    let _instance = instance;
 
     let (bus, events) = EventBus::new(None);
     // only the primary instance: the first Settings change saves over config.toml

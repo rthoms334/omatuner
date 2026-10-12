@@ -125,7 +125,8 @@ impl Watch {
             (Some(d), Some(pos)) if d > 0.0 => Some((d - pos).max(0.0)),
             _ => None,
         };
-        let driving = p.origin == Some(crate::model::PlayOrigin::Queue) && q.current.is_some() && !q.interrupted;
+        // The engine's own word (origin Queue on one of the row's refs; a zap away is not driving).
+        let driving = q.driving && q.current.is_some();
         Self {
             now,
             media,
@@ -565,6 +566,7 @@ mod tests {
                 from_start: false,
                 state,
                 by_agent: false,
+                orphaned: false,
             },
             locked: false,
             eta: None,
@@ -578,6 +580,7 @@ mod tests {
         let w = Watch::of(&p, &q, T0);
         assert_eq!((w.queue_current, w.left_s), (None, Some(900.0)), "the user plays something else");
         p.origin = Some(crate::model::PlayOrigin::Queue);
+        let q = QueueSnapshot { driving: true, ..q };
         let w = Watch::of(&p, &q, T0);
         assert_eq!((w.queue_current, w.queue_left), (Some(QueueId(1)), 1));
     }

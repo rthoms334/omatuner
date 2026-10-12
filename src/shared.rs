@@ -51,6 +51,12 @@ pub struct AppShared {
     main_player: Mutex<Option<watch::Receiver<Arc<PlayerSnapshot>>>>,
     /// Up next's snapshots (the engine publishes; empty until Q-core).
     queue: watch::Sender<Arc<QueueSnapshot>>,
+    /// Up next's engine (`Services::start_integrations`; `None` while it is off).
+    queue_handle: Mutex<Option<crate::queue::QueueHandle>>,
+    /// The sleep timer (`Services::start_integrations`): the agent's `sleep_timer`, the menu.
+    sleep: Mutex<Option<crate::reminders::sleep::SleepHandle>>,
+    /// Picture B's snapshots while it exists (the spoiler tracker, multi-view).
+    tile_b: Mutex<Option<watch::Receiver<Arc<PlayerSnapshot>>>>,
 }
 
 impl Default for AppShared {
@@ -82,6 +88,9 @@ impl AppShared {
             tiles: watch::Sender::new(TilesState::default()),
             main_player: Mutex::default(),
             queue: watch::Sender::new(Arc::default()),
+            queue_handle: Mutex::default(),
+            sleep: Mutex::default(),
+            tile_b: Mutex::default(),
         }
     }
 
@@ -160,6 +169,36 @@ impl AppShared {
     /// The main picture's snapshots (the queue engine, the spoiler tracker).
     pub fn main_player(&self) -> Option<watch::Receiver<Arc<PlayerSnapshot>>> {
         self.main_player.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// A picture's snapshots: A is the main picture, B only while it exists.
+    pub fn tile_player(&self, tile: crate::model::TileId) -> Option<watch::Receiver<Arc<PlayerSnapshot>>> {
+        if tile == crate::model::TileId::A { self.main_player() } else { self.tile_b.lock().unwrap_or_else(|e| e.into_inner()).clone() }
+    }
+
+    /// Picture B started (`Services::adopt_tile_b`) or went away (`None`).
+    pub fn set_tile_b(&self, rx: Option<watch::Receiver<Arc<PlayerSnapshot>>>) {
+        *self.tile_b.lock().unwrap_or_else(|e| e.into_inner()) = rx;
+    }
+
+    /// Up next's engine, for the agent and MPRIS (`None` while Up next is off).
+    pub fn queue_handle(&self) -> Option<crate::queue::QueueHandle> {
+        self.queue_handle.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The queue engine started.
+    pub fn set_queue_handle(&self, h: Option<crate::queue::QueueHandle>) {
+        *self.queue_handle.lock().unwrap_or_else(|e| e.into_inner()) = h;
+    }
+
+    /// The sleep timer (`None` before the services start it).
+    pub fn sleep(&self) -> Option<crate::reminders::sleep::SleepHandle> {
+        self.sleep.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The sleep timer's service started.
+    pub fn set_sleep(&self, h: Option<crate::reminders::sleep::SleepHandle>) {
+        *self.sleep.lock().unwrap_or_else(|e| e.into_inner()) = h;
     }
 
     /// Up next's latest snapshot.

@@ -236,9 +236,18 @@ pub fn item_override(conn: &Connection, item: &ItemRef) -> Result<Option<ItemOve
 /// `ItemOverride::default()`.
 pub fn set_item_override(conn: &Connection, item: &ItemRef, ov: &ItemOverride) -> Result<()> {
     if *ov == ItemOverride::default() {
+        // the row may still carry Guide fixes' columns (a time shift, dismissed issues), which
+        // `ItemOverride` doesn't model: clear ours and drop the row only when nothing is left
+        let key = params![item.source, item.kind.as_str(), item.key.as_str()];
         conn.execute(
-            "DELETE FROM item_override WHERE source_id = ?1 AND kind = ?2 AND item_key = ?3",
-            params![item.source, item.kind.as_str(), item.key.as_str()],
+            "UPDATE item_override SET rename = NULL, hidden = 0, locked = 0, user_order = NULL, catchup_offset_s = NULL
+             WHERE source_id = ?1 AND kind = ?2 AND item_key = ?3",
+            key,
+        )?;
+        conn.execute(
+            "DELETE FROM item_override WHERE source_id = ?1 AND kind = ?2 AND item_key = ?3
+               AND shift_min IS NULL AND guide_ok = 0",
+            key,
         )?;
         return Ok(());
     }

@@ -114,8 +114,9 @@ impl Services {
         });
         let http = HttpClient::new(&http_options(&config))?;
         let config: SharedConfig = Arc::new(RwLock::new(Arc::new(config)));
-        let jobs = JobManager::new(JobContext::new(store.clone(), http.clone(), bus.clone(), paths.clone(), config.clone()), rt.handle().clone());
-        let agent = Arc::new(crate::shared::AppShared::new(jobs.context().explicit.clone()));
+        let agent = Arc::new(crate::shared::AppShared::default());
+        let ctx = JobContext::new(store.clone(), http.clone(), bus.clone(), paths.clone(), config.clone()).with_shared(agent.clone());
+        let jobs = JobManager::new(ctx, rt.handle().clone());
         let player = {
             let cfg = crate::config::current(&config);
             Player::start(&cfg, player_deps(&store, &config, &bus, &agent))?
@@ -164,13 +165,28 @@ impl Services {
         *self.socket.lock().unwrap_or_else(|e| e.into_inner()) = self.integrations.ipc.as_ref().map(|s| s.socket());
         // Up next before MPRIS: its Next/Previous go to the queue while it drives
         if crate::queue::ENABLED {
-            self.queue = Some(crate::queue::service::start(self.rt.handle(), self.agent.clone()));
+            let deps = crate::queue::service::EngineDeps {
+                store: self.store.clone(),
+                config: self.config.clone(),
+                player: Arc::new(self.tiles.handle(TileId::A)),
+                bus: self.bus.clone(),
+            };
+            self.queue = Some(crate::queue::service::spawn(self.rt.handle(), self.agent.clone(), deps));
+            self.agent.set_queue_handle(self.queue.clone());
         }
         if cfg.integration.mpris {
             self.start_mpris();
         }
         // always: automatic switches (DESIGN §30.8) run with notification reminders off too
-        self.start_reminders(&cfg);
+        self.start_reminders();
+        let sleep = crate::reminders::sleep::SleepService::start(
+            self.rt.handle(),
+            self.tiles.main_watch(),
+            self.agent.subscribe_queue(),
+            crate::reminders::sleep::player_actuator(self.tiles.handles()),
+            self.bus.clone(),
+        );
+        self.agent.set_sleep(Some(sleep));
         self.integrations.scheduler = Some(crate::jobs::scheduler::spawn(self.jobs.clone()));
         match self.store.reader().and_then(|c| connection_limits(&c)) {
             Ok(cmds) => cmds.into_iter().for_each(|c| {
@@ -185,6 +201,8 @@ impl Services {
         if crate::spoiler::ENABLED {
             crate::spoiler::tracker::start(self.rt.handle(), self.agent.clone(), self.store.clone());
         }
+        // the guard's builder reads the live settings (identity guard: no-op)
+        self.agent.guard().configure(cfg.clone());
     }
 
     fn start_theme_watch(&mut self, cfg: &Config) {
@@ -233,23 +251,23 @@ impl Services {
             && let Some(b) = self.tiles.b()
         {
             self.memory.watch_player(self.rt.handle(), TileId::B, b.handle().subscribe());
+            self.agent.set_tile_b(Some(b.handle().subscribe()));
         }
         Some(adopted)
     }
 
-    fn start_reminders(&mut self, cfg: &Config) {
-        let lead_s = cfg.reminders.lead_min as i64 * 60;
-        self.integrations.reminders = ok(
-            "reminders",
-            crate::platform::notify::ReminderScheduler::start(
-                self.rt.handle(),
-                self.store.clone(),
-                self.bus.clone(),
-                lead_s,
-                cfg.reminders.enabled,
-                self.jobs.context().explicit.clone(),
-            ),
-        );
+    fn start_reminders(&mut self) {
+        // settings are read live from the shared config; systemd timers only for the default
+        // profile (and only once `reminders::ENABLED` arms anything)
+        let armer = crate::platform::systemd::SystemdArmer::for_profile(&self.paths).map(|a| Arc::new(a) as Arc<dyn crate::platform::systemd::Armer>);
+        let deps = crate::platform::notify::SchedulerDeps {
+            store: self.store.clone(),
+            bus: self.bus.clone(),
+            shared: self.agent.clone(),
+            config: self.config.clone(),
+            armer,
+        };
+        self.integrations.reminders = Some(crate::platform::notify::ReminderScheduler::start_with(self.rt.handle(), deps));
         self.agent.set_reminder_waker(self.integrations.reminders.as_ref().map(|r| r.waker()));
     }
 
@@ -279,7 +297,10 @@ impl Services {
         }
         if old.reminders != new.reminders {
             self.integrations.reminders = None; // dropping the scheduler aborts its task
-            self.start_reminders(new);
+            self.start_reminders();
+        }
+        if old.spoiler != new.spoiler || old.follow != new.follow {
+            self.agent.guard().configure(self.config());
         }
         if old.general.debug_log != new.general.debug_log {
             crate::logging::set_debug(new.general.debug_log);
