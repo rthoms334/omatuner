@@ -3160,6 +3160,8 @@ mod tests {
     #[test]
     fn the_back_button_and_the_lit_tab_go_back() {
         let mut rig = Rig::new();
+        // the built (empty) library drops Movies and Series, moving Settings up under the click
+        rig.settle();
         let back_buttons = |out: &egui::FullOutput| texts(out).into_iter().filter(|(t, _, _)| t.starts_with("Back to ")).count();
         assert_eq!(back_buttons(&rig.frame_with(vec![])), 0, "a tab root has no back button");
         rig.app.routes.push(Route::MovieDetail(crate::model::MovieId(1)));
