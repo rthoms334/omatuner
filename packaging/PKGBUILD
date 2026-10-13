@@ -8,7 +8,7 @@
 # Cargo's build output goes to packaging/src/target, so makepkg's RUSTFLAGS don't invalidate the
 # developer's own target/ directory.
 pkgname=omatuner
-pkgver=0.2.5
+pkgver=0.2.7
 pkgrel=1
 pkgdesc="Keyboard-first IPTV player for Omarchy (M3U, Xtream, XMLTV, catch-up)"
 arch=('x86_64' 'aarch64')
@@ -23,8 +23,8 @@ license=('GPL-3.0-or-later')
 depends=('mpv>=1:0.38' 'xz' 'fontconfig' 'ttf-jetbrains-mono-nerd' 'wayland' 'libxkbcommon'
          'mesa' 'dbus' 'gcc-libs' 'glibc' 'ffmpeg')
 makedepends=('cargo')
-optdepends=('hyprland: window rules from /usr/share/tuner/hypr, raising the window'
-            'polkit: the "Allow on firewall" button for casting (pkexec)'
+optdepends=('polkit: installing Tuner updates and the "Allow on firewall" button for casting (pkexec; Omarchy has it)'
+            'hyprland: window rules from /usr/share/tuner/hypr, raising the window'
             'xdg-desktop-portal-gtk: file pickers (add a playlist file, backup, log export)'
             'noto-fonts-cjk: CJK channel and programme names'
             'noto-fonts: Arabic, Hebrew and Indic fallbacks')
@@ -78,6 +78,10 @@ check() {
   # suite is the developer gate (`cargo test`, see README "Development"): built here it would be
   # a second thin-LTO release binary, which took over an hour on a 16 GB machine.
   "$srcdir/target/release/tuner" --version
+  # the update helper runs, and refuses anyone but root through pkexec (exit 2)
+  local _rc=0
+  "$srcdir/target/release/tuner-update" passwordless off 2>/dev/null || _rc=$?
+  (( _rc == 2 ))
 }
 
 package() {
@@ -93,6 +97,13 @@ package() {
   # Opt-in snippets (nothing is written to the user's config): see README "Omarchy integration".
   install -Dm644 packaging/hypr/tuner.lua "$pkgdir/usr/share/tuner/hypr/tuner.lua"
   install -Dm644 packaging/omarchy/omarchy-menu.jsonc "$pkgdir/usr/share/tuner/omarchy/omarchy-menu.jsonc"
+  # Re-arms the reminder timers at every login (DESIGN §36.2), for every account: the package
+  # owns the graphical-session.target.wants/ link (no scriptlet, removed with the package; a
+  # user can `systemctl --user mask` it). pacman's daemon-reload-user hook reloads running user
+  # managers.
+  install -Dm644 packaging/systemd/tuner-rearm.service "$pkgdir/usr/lib/systemd/user/tuner-rearm.service"
+  install -dm755 "$pkgdir/usr/lib/systemd/user/graphical-session.target.wants"
+  ln -s ../tuner-rearm.service "$pkgdir/usr/lib/systemd/user/graphical-session.target.wants/tuner-rearm.service"
   # The Claude Code plugin (its marketplace, the `tuner mcp` server entry, the skills): installed
   # here only. Tuner adds it to Claude Code when the user asks (its first-start card, Settings ▸ AI
   # agents, or `tuner claude-setup`). Nothing is written to the home directory.
@@ -101,6 +112,12 @@ package() {
   while IFS= read -r -d '' _f; do
     install -Dm644 "$_f" "$pkgdir/usr/share/tuner/claude/$_f"
   done < <(find plugins/omatuner -type f -print0)
+  # Tuner's updates (DESIGN §41): the root helper, started only through pkexec under its
+  # polkit actions; the policy names this exact path, so it must not move. Nothing is written to
+  # /etc: the passwordless rule exists only once the user turns that switch on in Tuner.
+  install -Dm755 "$srcdir/target/release/tuner-update" "$pkgdir/usr/lib/tuner/tuner-update"
+  install -Dm644 packaging/polkit/io.github.rthoms334.omatuner.update.policy \
+    "$pkgdir/usr/share/polkit-1/actions/io.github.rthoms334.omatuner.update.policy"
   install -Dm644 -t "$pkgdir/usr/share/doc/tuner" README.md docs/DESIGN.md docs/MANUAL_CHECKLIST.md
   install -Dm644 LICENSE THIRD_PARTY_NOTICES.md -t "$pkgdir/usr/share/licenses/$pkgname"
 }

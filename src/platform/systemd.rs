@@ -5,7 +5,9 @@
 //!   `tuner --reminder <id>` at `OnCalendar=@<epoch>` (1 s accuracy). Nothing else: no title,
 //!   channel or ref (`systemctl --user list-timers` is readable by anything in the session).
 //! * Transient units live in the user manager's runtime state: nothing is written in `$HOME`,
-//!   and they are gone after a logout or reboot (the next Tuner start re-arms them).
+//!   and they are gone after a logout or reboot. The packaged `tuner-rearm.service` runs
+//!   `tuner --rearm` at every login (`arming::rearm_at_login`); the next Tuner start re-arms
+//!   them too.
 //! * Only the default profile arms (a `--profile-dir` test profile never does: its units would
 //!   fire the default profile's reminder ids), and only when `systemd-run` exists. Without it
 //!   reminders fire only while Tuner runs, as in v1.
@@ -120,7 +122,10 @@ pub struct SystemdArmer {
     env: Vec<(String, String)>,
     /// …except those the user manager has already (read once, on the first arm): a unit
     /// inherits them as they are when it fires — current again after a re-login (Omarchy
-    /// imports the session's environment at login) — instead of frozen at arm time.
+    /// imports the session's environment at login) — instead of frozen at arm time. So
+    /// `tuner --rearm` at login sets none: run by the user manager, its environment is the
+    /// manager's (everything is "managed"), and one run before the session's variables arrive
+    /// has none to set — its units read them from the manager when they fire.
     managed: OnceLock<HashSet<String>>,
 }
 
@@ -173,7 +178,9 @@ impl Armer for SystemdArmer {
     fn arm(&self, id: ReminderId, at: Timestamp) -> Result<()> {
         // a unit left over (failed service, timer of another time) must go first
         self.disarm(id)?;
-        let args = self.run_args(id, at);
+        // a time that passed while arming (the plan was made a few `systemctl` calls ago) would
+        // never elapse: such a unit runs right away instead (`--reminder` takes it late)
+        let args = self.run_args(id, at.max(crate::model::now() + 2));
         call("systemd-run", &args.iter().map(String::as_str).collect::<Vec<_>>()).map(drop)
     }
 
@@ -319,6 +326,36 @@ pub(crate) mod tests {
                 "7"
             ]
         );
+    }
+
+    /// The packaged login unit (`packaging/systemd/tuner-rearm.service`) runs `tuner --rearm`
+    /// after the target the PKGBUILD links it into, and `systemd-analyze` finds nothing to
+    /// complain about (skipped when it isn't installed).
+    #[test]
+    fn login_unit_is_valid_and_packaged() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let unit = std::fs::read_to_string(format!("{root}/packaging/systemd/tuner-rearm.service")).unwrap();
+        let pkgbuild = std::fs::read_to_string(format!("{root}/packaging/PKGBUILD")).unwrap();
+        let target = unit.lines().find_map(|l| l.strip_prefix("After=")).expect("After=");
+        assert!(unit.contains("\nExecStart=/usr/bin/tuner --rearm\n") && !unit.lines().any(|l| l == "[Install]"), "{unit}");
+        assert!(pkgbuild.contains(&format!("{target}.wants/tuner-rearm.service")), "the package enables it for {target}");
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run");
+        std::fs::create_dir(&run).unwrap();
+        // the binary must exist for `verify`; any will do
+        let copy = dir.path().join("tuner-rearm.service");
+        std::fs::write(&copy, unit.replace("/usr/bin/tuner", &arming::exe())).unwrap();
+        let out = Command::new("systemd-analyze")
+            .args(["--user", "verify"])
+            .arg(&copy)
+            .env("HOME", dir.path())
+            .env("XDG_RUNTIME_DIR", &run)
+            .env_remove("XDG_CONFIG_HOME")
+            .output();
+        match out {
+            Ok(out) => assert!(out.status.success() && out.stderr.is_empty(), "{}", String::from_utf8_lossy(&out.stderr)),
+            Err(_) => eprintln!("skipped: systemd-analyze not installed"),
+        }
     }
 
     /// A test profile never arms units (they would fire the default profile's ids).

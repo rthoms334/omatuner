@@ -1,12 +1,12 @@
 //! Settings (DESIGN §13.9): page list (Playlists, EPG, Player, Interface, Favourites,
-//! Reminders, Parental, AI agents, Backup, Hidden, Orphans, About) | page content. Panel idiom; reorder
+//! Reminders, Parental, AI agents, Cast, Backup, Hidden, Orphans, About) | page content. Panel idiom; reorder
 //! rows (playlists, EPG priority, favourites lists, Following rules) with Alt+↑/↓ or K/J or the
 //! drag grip.
 //! Playlists page: sources with status, account info (expiry, connections, formats),
 //! refresh/edit/delete/reorder, "+ Add" (→ `Route::Onboarding(AddSource)`); EPG page: ordered
 //! EPG sources with offsets + "Fix guide data…"; Reminders: pending list (Delete cancels);
-//! About: version, paths, log viewer link. Text fields push `TextInput`. Edits go through
-//! `ctx.edit_config` (applied live to the player). Owner: WP-12.
+//! About: version, paths, Tuner's updates (DESIGN §41.7), log viewer link. Text fields push
+//! `TextInput`. Edits go through `ctx.edit_config` (applied live to the player). Owner: WP-12.
 //!
 //! Model: every page is a list of [`Row`]s rebuilt from the config, the library and the rows
 //! read off the UI thread (sources, EPG sources, reminders, orphans, hidden VOD — re-read on
@@ -82,6 +82,7 @@ mod multiview; // MV-2: Player ▸ Multi-view (DESIGN §35)
 mod queue; // Q-ui: Interface ▸ Playback ▸ "Play the next item after" (DESIGN §32)
 mod reminders; // rui: Reminders ▸ open in, while closed, sleep timer (B6)
 mod spoiler; // S-ui: the Spoiler guard page (DESIGN §34)
+mod updates; // About & logs ▸ Updates (DESIGN §41)
 
 /// Which feature file a `Act::Feature` / `Item::Feature` row belongs to.
 #[allow(dead_code)] // base-B: each feature file constructs its own once its track fills it
@@ -95,6 +96,7 @@ enum Feature {
     Queue,
     Reminders,
     Spoiler,
+    Updates,
 }
 
 /// Every page in list order (`pages` leaves out the features that are off).
@@ -944,6 +946,7 @@ impl SettingsScreen {
             Feature::Queue => queue::act(self, ctx, n),
             Feature::Reminders => reminders::act(self, ctx, n),
             Feature::Spoiler => spoiler::act(self, ctx, n),
+            Feature::Updates => updates::act(self, ctx, n),
         }
     }
 
@@ -958,6 +961,7 @@ impl SettingsScreen {
             Feature::Queue => queue::item(self, ctx, id),
             Feature::Reminders => reminders::item(self, ctx, id),
             Feature::Spoiler => spoiler::item(self, ctx, id),
+            Feature::Updates => {}
         }
     }
 
@@ -1439,6 +1443,7 @@ impl SettingsScreen {
                 v.push(Row::Note(format!("Data: {}", p.data_dir.display()), false));
                 v.push(Row::Note(format!("Cache: {}", p.cache_dir.display()), false));
                 v.push(Row::Note(format!("Log: {}", p.log_file().display()), false));
+                updates::rows(self, ctx, &mut v);
                 v.push(Row::Section("Logs".into()));
                 v.push(Row::Toggle(&IFACE_T[11]));
                 v.push(Row::Act { act: Act::OpenLogs, icon: glyphs::INFO, label: "Open the log viewer".into(), danger: false });
@@ -1761,6 +1766,8 @@ impl SettingsScreen {
             Row::Toggle(t) if std::ptr::eq(*t, &PARENTAL_SHOW_EXPLICIT) && dir > 0 && !ctx.config.parental.show_explicit => {
                 self.offer_pin_for_explicit(ctx);
             }
+            // the helper writes the polkit rule first; the config follows (DESIGN §41.7)
+            Row::Toggle(t) if std::ptr::eq(*t, &updates::PASSWORDLESS) => updates::passwordless(ctx, dir > 0),
             Row::Toggle(t) => {
                 let set = t.set;
                 let on = dir > 0;

@@ -21,7 +21,7 @@ reattach · 9 Import pipelines & EPG matching · 10 Catch-up · 11 Player · 12 
 27–29 Xtream upgrade, category filter, several playlists · 30 Agent control (MCP) · v0.2 batch:
 31 Guide fixes · 32 Up next · 33 Following & news flash · 34 Spoiler guard · 35 Multi-view ·
 36 Reminders & sleep timer · 37 Claude plugin & skills · 38 Playlist codes & library load ·
-39 Connecting AI agents · 40 Casting to a TV
+39 Connecting AI agents · 40 Casting to a TV · 41 Tuner's updates
 
 ---
 
@@ -294,6 +294,8 @@ creation callback (GL current): join fonts/theme threads → LoadedFonts::instal
 ```
 First frame target: < 300 ms after launch regardless of library size (library loads async;
 measured by WP-13 with a 100k-channel DB).
+An error that ends `main` (exit status 1) is reported on stderr, in `tuner.log` and — while a
+windowed launch has no window yet — as a desktop notification (§21.7).
 
 Shutdown (`on_exit`): `VideoSurface::destroy` (GL current: render ctx, then FBO) →
 `Services::shutdown`: integrations stop → `jobs.cancel_all` → `Player::shutdown` (Stop → final
@@ -2093,7 +2095,7 @@ favourites lists) show a 󰇙 drag grip and move with Alt+↑/↓ or K/J. Every 
 | Hidden items | unhide groups/channels/VOD | overrides | — |
 | Orphans | Enter = attach to…, Delete/x → menu with Forget | §8.3 | — |
 | AI agents (§39, after Parental) | offer to connect agents after updates · keep Claude Code's plugin up to date · agents play in (Pop-out / Tuner window, §30.13) · per agent: Connect / Update / Disconnect… / Copy | `agents.offer_connect`, `agents.keep_in_sync`, `agents.play_in` (+ `agents.checked_version`) | on · on · Pop-out |
-| About & logs | version, paths, debug logging, log viewer, export log | `general.debug_log` | off |
+| About & logs | version, paths · Updates (§41.7): status, last check, Check now, Install now / Restart now, automatically install updates, install without asking for my password · debug logging, log viewer, export log | `updates.auto_install`, `updates.passwordless`, `general.debug_log` | on · off · off |
 Per channel (Ctrl+I "Edit information", `OverlayRequest::EditItem`, WP-11): rename, catch-up
 offset (minutes), EPG assignment, lock, hide.
 
@@ -3036,6 +3038,75 @@ behind parental control: absent, as if the playlist didn't have it.
 * **Not covered:** a backup export is a full dump — favourites, progress and reminders of
   explicit titles included, whatever the lock. Keep backup files private.
 
+### 20.4 The update helper (§41): threat model
+`/usr/lib/tuner/tuner-update` is the one program of the updates that runs as root, started
+only through `pkexec --disable-internal-agent` under the actions of
+`packaging/polkit/io.github.rthoms334.omatuner.update.policy`: `install` (auth_admin_keep) and
+`passwordless` (auth_admin). It must be safe to allow *without a password* (the user's switch),
+so it trusts nothing it is given: not its argument, not the files, not the environment.
+
+* **The trust root is the release key.** A package installs only when its bytes verify against
+  the minisign public key compiled into the helper (`packaging/update-key.pub` via
+  `include_str!`, pre-hashed mode, the key id and the trusted comment's global signature
+  included), its file name says a stable version (`<n>.<n>.<n>`: pre-releases are signed with
+  the same key and never installed), and pacman's own reading of the verified copy says name
+  `omatuner`, this machine's architecture, the file name's version, newer than the installed one
+  (`vercmp`, checked against pacman's `vercmp` on random input). The trusted comment isn't read:
+  the signature covers the bytes, so the `.PKGINFO` pacman reads. A key file that is the
+  placeholder (or doesn't parse) installs nothing (exit 6).
+* **Network attacker, mirror, a GitHub account without the key:** any bytes they serve fail the
+  signature. They can withhold updates, or serve an *older* signed release: the same version or
+  a downgrade is refused; a genuine release between the installed one and the newest can be
+  installed (the next check moves on). The app verifies too, but only to refuse early: the
+  helper's check is the one that counts.
+* **Local malware as the user** (what the passwordless rule exposes): it can run `install`
+  without a password, and so install a genuine, signed, newer stable Tuner earlier than the user
+  would — nothing else. It can't choose the package (name, signature, version and arch are
+  checked), pacman's arguments, a downgrade, or turn the rule on (`passwordless` always asks).
+  With the rule off it can only pop the password dialog, which names Tuner's update.
+* **The caller's process isn't trusted either.** What pkexec starts keeps the caller's resource
+  limits (pam_limits only sets what limits.conf names) and cgroup — under Omarchy a scope of
+  the user's systemd, whose `cgroup.kill`, `cgroup.freeze` and `memory.max` the user owns. Run
+  there, pacman could be killed or frozen halfway (`RLIMIT_FSIZE`/`RLIMIT_CPU`, cgroup.kill):
+  a half-installed Tuner and a stale `db.lck`; and a frozen helper stretches any window between
+  a check and its use. Two helpers at once shared root's copy: with one frozen after `pacman
+  -Qip` read its copy, another (killed once it had staged) replaced that copy with an older
+  genuine package named like the newer one (its signature verifies: it covers the bytes, not the
+  name), and the first's `pacman -U` downgraded. So
+  `install` only checks who asked and the argument's shape and runs `install-as <uid> <path>` as
+  the transient system service `omatuner-update.service` (`systemd-run --wait --pipe --collect
+  --expand-environment=no`; the path free of control characters): PID 1's child, in
+  system.slice with the system's limits, nothing of the caller's; every check below happens
+  there. The fixed unit name makes installs one at a time (systemd refuses a second while the
+  first is loaded: exit 5), so root's copy is one run's; the service empties its folder first.
+  `install-as` is refused through pkexec (`PKEXEC_UID` set). The service outlives the caller:
+  once started, an install finishes.
+* **Other users:** the rule names the user (`subject.user`, from `getent passwd PKEXEC_UID`,
+  never an argument; a name outside `[A-Za-z0-9._-]` with an optional final `$` is refused) and
+  needs `subject.local && subject.active`; the downloads folder is 0700.
+* **The path (TOCTOU):** absolute, plain components, each folder opened from the one before with
+  `O_NOFOLLOW|O_DIRECTORY` (no symlink anywhere, `/proc/<pid>/root` included), owned by root or
+  the user and not writable by others unless sticky; the last folder the user's and 0700; the
+  file and its `.minisig` opened with `O_NOFOLLOW|O_NONBLOCK|O_NOCTTY`, then checked on the open
+  descriptor: a regular file of the user's (no FIFO or device), one link, ≤ 256 MiB (≤ 4 KiB).
+  The bytes are read from that descriptor and verified in memory, then written to a new file in
+  root's private `/var/cache/omatuner/` (0700 root, refused if it is anything else); pacman
+  reads only that copy, which is removed after. Nothing a user can touch is read twice.
+* **Environment and argv:** pkexec cleans the environment; the helper still runs pacman and
+  getent with `env_clear` (`PATH`, `LC_ALL=C`), no shell, stdin closed, fixed argv (`-Qip`,
+  `-Q omatuner`, `-U --noconfirm --noprogressbar -- <copy>`). Exit codes: 0 done, 2 bad
+  arguments / not root through pkexec, 3 refused, 4 pacman, the service or the rule file failed,
+  5 busy (pacman's lock, or another install's service), 6 no release key; never 126/127. The
+  service's codes and message are passed on by `install`.
+* **What a signed release can do:** anything a package can (root scriptlets, files): whoever holds
+  the secret key and its password can update every Tuner. The key lives in the repository
+  secrets and the maintainer's offline backup (README "Release signing"). A leaked key needs a
+  new key shipped by hand (a Tuner trusts only its built-in key).
+* **Not covered:** pacman's partial-upgrade risk (`-U` installs against the system as it is; the
+  release's dependencies are declared, its libraries are built on current Arch);
+  `LocalFileSigLevel = Required` makes pacman refuse the copy (exit 4, the message says so);
+  pacman's hooks and the package's scriptlet run as on any install.
+
 ---
 
 ## 21. Desktop integration
@@ -3181,6 +3252,59 @@ for any window. Tuner does it for itself with `o` in the player or Ctrl+Shift+O 
 * A popped-out window is always visible, so its playback never meets the hidden-workspace
   limits of §11.1.
 
+### 21.7 Startup failures (`platform/startup.rs`)
+Tuner starts from the launcher (uwsm / `gtk-launch`): stderr goes nowhere. In 0.2.6 a database
+left at schema v14 by a dev build was refused with one stderr line and exit 1 — nothing on
+screen, nothing in the log (the error was printed by `main`'s return, never logged), so the
+release looked broken. Now `main` runs everything in `run` and hands an error to
+`startup::report`, which says it three ways and exits 1 (where it may report is process state
+that `run` fills in — `notify_desktop`, `log_to`, `after_update` — so the updater's thread can
+report too):
+* **stderr** — `Error: …` with the cause chain, as before (redacted).
+* **`tuner.log`** — `ERROR tuner: Tuner exits: …` through `logging::record_fatal`: the
+  subscriber's writer (flushed) once logging is up, else appended directly. Known as soon as
+  the profile's paths are; an error before that (no `$HOME`) has stderr and the desktop only.
+* **A desktop notification** (critical, `platform::notify`, redacted): title *Tuner couldn't
+  start*, body `startup::user_message` — the reason in plain words and what to do. Known causes
+  anywhere in the chain have their own words: a newer schema (below), a damaged, busy,
+  read-only database or a full disk (`rusqlite` error codes), a profile folder it can't use
+  (`Error::Io`), libmpv failing to initialise (`Error::Mpv`), no window
+  (`startup::WindowError`: no display, no GL); anything else (a background refresh holding the
+  instance lock, an instance that doesn't answer, a refused handoff) is its own message as a
+  sentence. Only for launches that would open a window or show a closed reminder's note — not
+  `--refresh` / `--rearm` (systemd's journal has stderr; the next window launch says it) nor
+  `tuner mcp` (its client reads stderr; it touches neither the log nor the desktop) — and only
+  until eframe's creation callback ran (`startup::window_up`): a winit error at logout is no
+  failed start. No notification server: nothing more happens, reporting never panics.
+
+**Newer schema.** The refusal stays (opening it would lose data); it is typed
+(`Error::NewerSchema { found, supported, opened_by }`). Every `Store::open` records its build in
+`meta.app_version` (`migrations::record_app_version`, written only when it changed; `meta` exists
+since v1, so no schema bump) and the refusal reads it back, quoting it only if it looks like a
+version. Body: "Your library was last opened by Tuner 0.3.0 (database version 14; this is 13).
+Install Tuner 0.3.0 again, or a newer one." — or "…by a newer Tuner…" / "Install that version
+again, or a newer one." for databases written before the record existed. Future builds must
+keep writing the key.
+
+**Not covered:** a missing `libmpv.so` fails in the dynamic loader before `main` (the package
+depends on `mpv`); a panic keeps Rust's report on stderr (a panic hook would also fire for the
+panics the store writer and services catch on purpose).
+
+**After an update (§41.6).** The restart re-execs `/usr/bin/tuner` in the same process, so no
+old process is left to watch the new build; the new one reports for itself. `run` reads the
+restart marker (`update::restart::peek_marker`: its own pid, ≤ 2 min; only read — the update
+service still takes it for its "Tuner updated" toast) right after the paths, before anything
+else can fail, and `startup::after_update` keeps its `from`/`to` (only if they look like
+versions). A failed start then reads "Tuner was updated to 0.2.8 but couldn't start: ‹reason›
+To go back to 0.2.7: sudo pacman -U /var/cache/pacman/pkg/omatuner-0.2.7-*.pkg.tar.zst, then
+turn off automatic installs in Settings ▸ About & logs ▸ Updates." Tuner never rolls back by
+itself: the new build may already have migrated the database, and the older one would refuse
+it (naming the newer version, thanks to `meta.app_version`). An `exec` that fails in the old
+process — `main` after the window closed, or the updater's thread for a hidden window — is a
+`startup::RestartFailed`: reported the same way under *Tuner couldn't restart* ("Tuner was
+updated to X but couldn't restart into it (‹why›). Start Tuner again from the launcher."),
+although the window was up, and the process exits 1.
+
 ---
 
 ## 22. Packaging & licence
@@ -3194,17 +3318,21 @@ for any window. Tuner does it for itself with `o` in the player or Ctrl+Shift+O 
   rendering on other workspaces (§11.1), for classes `tuner` and `tuner-popout`; `float`, `pin`,
   `no_initial_focus` for `tuner-popout` (§21.6); optional idle fallback and Super+Shift+T
   binding),
-  `packaging/omarchy/omarchy-menu.jsonc` (TV submenu), `packaging/PKGBUILD` (x86_64 + aarch64,
+  `packaging/omarchy/omarchy-menu.jsonc` (TV submenu), `packaging/systemd/tuner-rearm.service`
+  (the login re-arm of the reminder timers, §36.2), `packaging/PKGBUILD` (x86_64 + aarch64,
   depends mpv/xz/fontconfig/JetBrains Mono Nerd/wayland/mesa; builds the local checkout into
-  `packaging/src/target`, installs the snippets under `/usr/share/tuner/`, the docs under
-  `/usr/share/doc/tuner/` and `LICENSE` under `/usr/share/licenses/omatuner/`).
+  `packaging/src/target`, installs the snippets under `/usr/share/tuner/`, the user unit under
+  `/usr/lib/systemd/user/` with its `graphical-session.target.wants/` link (enabled for every
+  account, owned by the package; pacman's `daemon-reload-user` hook reloads running user
+  managers), the docs under `/usr/share/doc/tuner/` and `LICENSE` under
+  `/usr/share/licenses/omatuner/`).
   `packaging/omatuner.install` (`install=`, next to the PKGBUILD so makepkg finds it in CI's copy
   of the checkout too) only echoes where to connect an AI agent (§39.8), and, once, on the
   upgrade that brings casting (from before 0.2.6), "Cast to your TV: Settings ▸ Cast (ufw users:
   Tuner offers an Allow on firewall button)"; it runs nothing.
 * **Casting packaging** (§40): `ffmpeg` is in `depends` (mpv already pulls it; this declares the
   CLI casting runs), `polkit` is an `optdepends` (the *Allow on firewall* button's `pkexec`).
-  The second binary of the crate, `tuner-firewall` (`[[bin]]`, std only), installs as
+  The crate's helper binary `tuner-firewall` (`[[bin]]`, std only), installs as
   `/usr/lib/tuner/tuner-firewall` (0755), and `packaging/polkit/io.github.rthoms334.omatuner.
   firewall.policy` as `/usr/share/polkit-1/actions/…` (the action's `exec.path` annotation names
   that exact path). `THIRD_PARTY_NOTICES.md` (pyatv's MIT notice for the ported AirPlay code)
@@ -3225,9 +3353,21 @@ for any window. Tuner does it for itself with `o` in the player or Ctrl+Shift+O 
   (aarch64, natively on `ubuntu-24.04-arm`; pinned by digest in the release workflow, floating in
   CI), and publishes a GitHub Release (`--generate-notes`; a tag with a suffix is a pre-release;
   re-running a failed publish re-uploads into the existing release) with
-  `omatuner-<pkgver>-<rel>-<arch>.pkg.tar.zst`, `omatuner-<pkgver>-<arch>.tar.gz` (binary, desktop entry, icon, snippets, README, LICENSE) and
-  `SHA256SUMS`. A manual run with `publish=false`, and every pull request that touches
-  `packaging/`, `Cargo.*` or the workflow, is a dry run (workflow artifacts only).
+  `omatuner-<pkgver>-<rel>-<arch>.pkg.tar.zst`, `omatuner-<pkgver>-<arch>.tar.gz` (binary, desktop entry, icon, snippets, `systemd/tuner-rearm.service`, README, LICENSE, THIRD_PARTY_NOTICES.md) and
+  `SHA256SUMS`, and a minisign signature (`<file>.minisig`, pre-hashed) of every package and
+  tarball: the publish job signs with the `MINISIGN_SECRET_KEY` / `MINISIGN_PASSWORD` secrets
+  (the password on stdin) and fails unless `packaging/update-key.pub` verifies each signature
+  and each is pre-hashed (`ED`, the only kind Tuner accepts; §41.3). A manual run with `publish=false`, and every pull request that touches
+  `packaging/`, `Cargo.*` or the workflow, is a dry run (workflow artifacts only, unsigned).
+* **Updates packaging** (§41): the crate's helper binary `tuner-update` (`[[bin]]`; std,
+  `minisign-verify` and `rustix`, sharing `src/update/verify.rs` through `#[path]`, never the
+  library), installs as `/usr/lib/tuner/tuner-update` (0755) and its policy as
+  `/usr/share/polkit-1/actions/io.github.rthoms334.omatuner.update.policy` (the actions'
+  `exec.path` annotation names that exact path; `exec.argv1` picks `install` or
+  `passwordless`). `polkit` is an `optdepends` (pkexec). The package writes nothing to `/etc`:
+  the passwordless rule exists only once the user turns the switch on. `check()` runs the helper
+  once as the build user (it must refuse with exit 2). The tarball doesn't carry the helper: a
+  Tuner from it only tells.
 * **CI** (`.github/workflows/ci.yml`): pull requests and pushes to `main`, same two containers:
   `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo build
   --all-targets --locked`, `scripts/gen-test-media.sh`, then `dbus-run-session -- cargo test
@@ -5983,6 +6123,47 @@ are set only when the manager lacks them), so a re-login doesn't leave stale val
 * the session counts as locked: explicit channels wait, a Following switch to a locked channel
   becomes "needs your PIN".
 
+**Re-armed at login.** Transient units die with the user manager (reboot, or logout without
+lingering), so a reminder set before a reboot used to be missed unless Tuner was opened first.
+The package ships `tuner-rearm.service` (`/usr/lib/systemd/user/`, a oneshot running `tuner
+--rearm`) with its own `graphical-session.target.wants/` link: enabled for every account
+without a scriptlet touching home directories, removed with the package, `static` in
+`systemctl --user is-enabled`, `systemctl --user mask tuner-rearm` turns it off. `tuner
+--rearm` (`reminders::arming::rearm_at_login`) arms what a Tuner started then would arm
+(`arming::closed_plan`: the scheduler's pending reminders, Following's waiting while it is off,
+explicit channels' while parental control hides them — the session counts as locked) through
+the same `ArmSync`, and exits: no network, no refresh, no window, player or notification.
+* **When**: `After=graphical-session.target`, wanted by it. uwsm (Omarchy's session manager)
+  reaches that target at every login, after `wayland-session-waitenv.service` saw
+  `WAYLAND_DISPLAY` and `HYPRLAND_INSTANCE_SIGNATURE` in the manager's environment, and stops it
+  at logout, so a re-login with the manager still up (lingering, another session) runs it again
+  (the pattern of Omarchy's own `omarchy-migrate-notify.service`). `default.target` would not:
+  with a lingering manager it stays up across logins. Sessions started without uwsm never reach
+  the target; there the next Tuner start (or `tuner --refresh`) arms, as before.
+* **Environment**: the service's environment is the manager's, so every session variable it
+  has is one the manager has: nothing is passed with `--setenv` and the units read the
+  manager's values when they fire (a run before the variables arrived would have none to pass
+  either). A unit armed at login therefore fires into the session that is current at its time.
+* **Safe to run any time**: no database yet (an account that never started Tuner) → exit 0
+  having made nothing, not even the log; Tuner or a refresh holding the instance lock → exit 0
+  (they arm themselves); the lock is held while arming, so a window started meanwhile waits a
+  moment; setting off, a `--profile-dir` profile or no `systemd-run` → exit 0; systemd refusing
+  → exit 1 (the unit shows failed). Twice in a row is the same as once: a fresh `ArmSync`
+  learns the armed units and re-arms them for the times planned now. A store migration after
+  an upgrade happens here, under the lock, as for `--reminder`.
+* **Due while nothing ran**: a reminder whose unit time passed during the reboot or logout
+  (or a switch whose unit fired with no display) is what a starting Tuner fires late — a note
+  while its programme airs (notes on), a switch up to `LATE_SWITCH_S` after its time.
+  `closed_plan` gives each such one a unit `LATE_UNIT_S` (5 s) from now, ahead of the others
+  within the 30, so `tuner --reminder` fires it late by the same rules; past those it is
+  dismissed by the next start, as before. Its `--reminder` waits for the lock if the re-arm
+  still holds it (a few seconds; it waits up to 10).
+* **A time that passes while arming**: `SystemdArmer::arm` arms no earlier than 2 s from the
+  call — an `OnCalendar=` time already past never elapses — so a unit due during a slow run
+  (a re-login re-arms every unit, five `systemctl` calls each) fires a moment late instead of
+  never.
+* Suspend and resume need nothing: the user manager, and its timers, stay up.
+
 ### 36.3 Sleep timer
 Ctrl+Shift+T, the player menu, the status-bar chip ("Sleep timer — 23:10 (Ctrl+Shift+T)" with
 ✕) and Settings ▸ Reminders: stop or pause, in 15 min–2 h, at the end of this programme, after N
@@ -6336,3 +6517,197 @@ loopback, `tests/cast_service.rs` (fake receiver and relay), `tests/cast_firewal
 a real pyatv (`TUNER_CAST_PYATV`) and the LAN (`TUNER_CAST_LIVE`). Not covered: the fMP4 keyframe
 check end to end, the 8 GiB film cap, `CpuTooSlow`, and pkexec, polkit and ufw on a real system
 (manual checklist §30 item 15).
+
+---
+
+## 41. Tuner's updates (checked, signed, installed, restarted when idle)
+
+Code: `src/update/` (`verify`, `github`, `service`, `helper`, `restart`),
+`src/bin/tuner-update.rs`, `src/app/update.rs`, `src/ui/screens/settings/updates.rs`,
+`platform::hypr::{placement, put_back}`. Security: §20.4. Packaging and signing: §22.
+
+### 41.1 Decisions (user, 2026-10-13, authoritative)
+1. **Install: automatic, with the password; passwordless opt-in.** Tuner downloads and verifies
+   by itself, then installs through pkexec with the system's password dialog (`auth_admin_keep`).
+   Settings' *Install updates without asking for my password* writes, through the helper under
+   pkexec once, a polkit rule that allows only the install action for the active local user;
+   turning it off removes the rule. The helper is built to be safe without a password (§20.4).
+2. **Restart: when idle.** After an install while Tuner runs: the chip "Updated to X — restarts
+   when idle (Restart now)"; Tuner restarts by itself when nothing plays (or casts), nothing is
+   open and the window is away, after a quiet period — never during playback.
+3. **Channel: stable releases only**, at start (after a short delay) and every 6 h, through the
+   GitHub Releases API with the app's HTTP client and proxy settings, conditional requests, no
+   token.
+4. **Signing: minisign.** The maintainer keeps the secret key (repository secrets
+   `MINISIGN_SECRET_KEY`, `MINISIGN_PASSWORD`); the public key `packaging/update-key.pub` is
+   compiled in. A placeholder key installs nothing. Verification: `minisign-verify` 0.3.0 (MIT,
+   no dependencies, 18 days old at the pin), not aws-lc-rs: minisign's pre-hash is BLAKE2b,
+   which neither aws-lc-rs nor ring offers.
+5. **In-app first:** Settings ▸ About & logs ▸ Updates, notifications and toasts. A Tuner not
+   installed with pacman checks and tells only, and says why.
+
+### 41.2 Checks (`update::github`, `Updater::check`)
+`GET https://api.github.com/repos/rthoms334/omatuner/releases?per_page=20` with
+`Accept: application/vnd.github+json`, `X-GitHub-Api-Version: 2022-11-28`, `User-Agent:
+Tuner/<version> (+repo)` and `If-None-Match` from the last 200 (`HttpClient::get_conditional`;
+answer and ETag kept in `~/.cache/tuner/update/releases.{json,etag}`; a 304 doesn't count against
+the 60/h limit). 403/429 with `X-RateLimit-Remaining: 0` or `Retry-After`: the next check at the
+reset (1 min–24 h), a quiet note in Settings, no toast. Other failures: again in 1 h. `pick`:
+not draft, not pre-release, tag exactly `v<n>.<n>.<n>`; the newest by `vercmp`; its package for
+`std::env::consts::ARCH` (`omatuner-<ver>-<rel>-<arch>.pkg.tar.zst`, version = the tag's) and
+that file's `.minisig` — both, or the release is only told about. Newer means: than pacman's
+installed `omatuner` (full version) when pacman manages Tuner, else than the running version.
+The loop sleeps in ≤ 10 min chunks against the wall clock (a laptop that slept checks late, not
+never); *Check now* and any `[updates]` change wake it.
+
+### 41.3 The key and the signatures (`update::verify`, shared with the helper)
+`RELEASE_KEY = include_str!("packaging/update-key.pub")` (minisign's two-line `.pub`; key id
+7FC95FA61A0134E8). `release_key` refuses the placeholder (`REPLACE-WITH-THE-RELEASE-KEY`) and
+anything that doesn't parse. `verify` accepts only pre-hashed signatures (`ED`: Ed25519 over
+BLAKE2b-512 of the file, minisign's default), by the key's id, with a valid global signature
+over the trusted comment; legacy (`Ed`) signatures are refused (release.yml never makes them).
+`vercmp` is libalpm's `alpm_pkg_vercmp` (epoch, `rpmvercmp`, release only when both have one),
+tested against pacman's own table. The same file is compiled into the helper (`#[path]`), so
+the app and the helper can't disagree.
+
+### 41.4 The service (`update::service::Updater`, in `Services`)
+```text
+start ─20 s─▶ check ◀─ every 6 h · Check now · [updates] changed · 1 h after a failure · the rate-limit reset
+               │ Mode: this exe is /usr/bin/tuner, pacman -Qqo says omatuner, helper + policy + pkexec,
+               │       a real key → Managed{installed}; else TellOnly(why)
+               ├─ pacman's omatuner newer than what runs ─────────────────────────────▶ Installed
+               ├─ releases (If-None-Match) ─ newest stable not newer ─▶ UpToDate
+               ├─ TellOnly, or automatic installs off ─▶ Available: notification + toast, once per version
+               ▼
+          Downloading: <pkg>.minisig, then <pkg> → ~/.cache/tuner/update/ (0700; files 0600)
+               │ verified here ─ fails ─▶ deleted, refused this session, error toast, Available
+               ▼
+             Ready ── passwordless rule on ──────────────────────────────┐
+               │ notification "ready"; the app's gate: window focused,   │
+               │ nothing plays, nothing open, not typing, not popped out │
+               ▼ (toast: "Installing Tuner X: enter your password")      ▼
+          Installing: pkexec --disable-internal-agent /usr/lib/tuner/tuner-update install <pkg>
+               │ 126 dismissed → Ready (declined: Install now) · 127 → Ready + why
+               │ 3 refused → Available, not again this session · 4 failed → Ready + pacman's message
+               │ 5 busy → Ready, next check in 10 min · 6 no key → TellOnly
+               ▼ 0: downloads removed
+          Installed: toast "Tuner updated to X — it restarts when idle" [Restart now], notification,
+               │     status-bar chip "Updated to X — restarts when idle (Restart now)"
+               │ every 5 s, held 60 s: A and B idle (not even paused), no multi-view, no overlay /
+               │ typing / onboarding, no job, not installing, the window without the keyboard
+               ▼
+          restart (§41.6) ─▶ the new process: marker → toast, window put back, §39 pass
+```
+The UI reads `status()` (phase, mode, last check, problem, the switch) each frame and calls
+`check_now`, `install_now` (Settings, the toast's *Install*, the app's prompt gate),
+`set_passwordless`, `restart_now`; the app tells it `note_ui` every frame and saves
+`take_config_change` (the switch, once the helper succeeded) into `[updates]`. Notifications go
+out on the blocking pool (`platform::notify::notify`). `shutdown` stops the waits; an install in
+pacman's hands finishes (it runs as root and can't be killed from here). Off the desktop
+(`platform::off_desktop`) or with a profile whose home isn't `$HOME`, nothing runs
+(`status().inert`).
+
+### 41.5 The helper (`src/bin/tuner-update.rs`) and polkit
+`tuner-update install <path>` and `tuner-update passwordless on|off`, as root through pkexec
+only (`PKEXEC_UID` set). `install` runs the install as the system service
+`omatuner-update.service` (`tuner-update install-as <uid> <path>` under `systemd-run`, §20.4:
+nothing of the caller's process reaches pacman, one install at a time). The checks, in order,
+are §20.4's; the passwordless rule is
+`/etc/polkit-1/rules.d/49-omatuner-update-<uid>.rules` (0644, written atomically):
+```js
+polkit.addRule(function (action, subject) {
+    if (action.id == "io.github.rthoms334.omatuner.update" &&
+        subject.user == "<user>" && subject.local && subject.active) {
+        return polkit.Result.YES;
+    }
+});
+```
+The policy has two actions on the same `exec.path`, told apart by `exec.argv1` (pkexec ≥ polkit
+0.114): `…update` (`install`, auth_admin_keep) and `…update-passwordless` (auth_admin, always
+the password). Other arguments match neither and fall to pkexec's generic action (the
+password); the helper refuses them anyway (exit 2). The app's runner (`update::helper`):
+no shell, stdin closed, output drained on threads (capped), 15 min for an install (the dialog
+and pacman), 3 min for the switch; a stop or a time-out kills pkexec while it is still ours
+(closing the dialog) and leaves a running helper alone. Exit codes → `helper::Outcome`.
+
+### 41.6 Restart (`update::restart`)
+* **Gate**: §41.4's, evaluated off the UI thread from the players' snapshots
+  (`AppShared::tile_player`), the job manager and what the UI last said (`UiNow`: focus, an open
+  overlay or text field or onboarding, multi-view, the screen); no frame yet counts as busy.
+  "Unfocused" covers "not visible". Casting (§40) joins the gate in the next commit.
+* **Exec**: `restart::request(Plan { view })`, then `PlatformEvent::Quit`: the window closes the
+  normal way (`on_exit`: last screen, GL, `Services::shutdown`), `main` drops the instance lock
+  and execs `/usr/bin/tuner [--profile-dir D] [--debug] [--view V]` — same pid, session,
+  environment, cgroup; never the original command line (no second `--play` or playlist file).
+  A window on a hidden workspace gets no frames (§3): like the signal watcher, after 3 s the
+  updater runs the direct-exit cleanup (players stopped, writer flushed, socket removed) and
+  execs from its own thread. An exec that fails (either way) is reported like a failed start,
+  on the desktop too, and the process exits 1; a start that fails right after the restart
+  names the new version and the way back (§21.7).
+* **After**: the marker `$XDG_RUNTIME_DIR/tuner/restart.json` (`from`, `to`, pid, time, the
+  Hyprland `Placement`: workspace and the window that had the keyboard) is taken by the new
+  process when it is its own and ≤ 2 min old: toast "Tuner updated to X (from Y)", and under
+  Hyprland `put_back` moves the new window to its old workspace without following
+  (`hl.dsp.window.move{follow=false}`, legacy `movetoworkspacesilent`) and focuses the window
+  that had the keyboard (`hl.dsp.focus`, legacy `focuswindow`). Workspace names and addresses
+  are validated before they go into a dispatcher string.
+* **Agents**: running `tuner mcp` bridges keep their old binary (pacman replaces the file; the
+  old inode lives) and open one connection per request, so they carry on with the new Tuner;
+  one launching Tuner meanwhile launches the new file (`ExeLauncher::current` strips
+  " (deleted)"). An agent gets the new tools in a new session. The restarted Tuner is a normal
+  start of a new version, so §39's start-of-version pass runs and, with *Keep Claude Code's
+  plugin up to date*, updates the plugin.
+
+### 41.7 Settings, toasts, notifications
+Settings ▸ About & logs ▸ **Updates** (`settings/updates.rs`, a feature file of the About
+page): the status line ("Tuner 0.2.5 · up to date · checked 12 min ago", "… is downloaded and
+verified: it installs when you're back at Tuner with nothing playing", "Installing…", "… is
+installed: it restarts when idle"), the last problem in red, *Check now*, *Install Tuner X now*
+or *Restart now into Tuner X*, then for a pacman-managed Tuner the two switches —
+*Automatically install updates* (`updates.auto_install`, on) and *Install updates without
+asking for my password* (`updates.passwordless`, off; the screen's `adjust` sends it to
+`set_passwordless`, the config follows the helper's success; "Waiting for your password…" or
+the failure under it) — and for any other Tuner the sentence saying why it only tells
+(`Why::text`). A note says what is installed and when it checks. `[updates]` is machine-local
+(`Config::restored` keeps it). Toasts: *Install* (`Action::InstallUpdate`) on "Tuner X is
+available" when it can install; *Restart now* (`Action::RestartToUpdate`) on "Tuner updated to
+X"; neither action has a key. Desktop notifications: available (once per version, kept in
+`update/told`), ready (once per version per session), installed.
+
+### 41.8 Tests
+No test reaches GitHub, runs pkexec, pacman or getent, or needs root. The tests' release key is
+made from a seed in the test (`update/test_signer.rs`: aws-lc-rs Ed25519 + an RFC 7693
+BLAKE2b, minisign's file format; a dev-dependency only). Unit: `vercmp` against pacman's table
+both ways; stable tags; package file names; the committed key parses with id 7FC95FA61A0134E8
+and the placeholder is no key; signatures (exact bytes, key, legacy, trusted comment); `pick`
+(drafts, pre-releases, suffixes, numeric order, arch, unsigned); the API's JSON; pkexec / helper
+exit codes; the runner's time-out and stop; the gate and its quiet period; the re-exec argv; the
+marker; Hyprland placement parsing. The service against an axum GitHub with a fake pacman and
+pkexec (shell scripts run by `/bin/sh`): download → private files → ready → install argv →
+installed toast → 304 on the next check; passwordless installs at once; a dismissed dialog waits
+for Install now; a tampered download is deleted and never reaches pkexec; a Tuner not from
+pacman only tells, once; the rate limit; pacman newer than what runs; the switch follows the
+helper; the gate reads the players. The helper (its own tests): a signed newer package goes to
+pacman from root's copy (an interrupted run's leftovers gone first); `install` only hands the
+path to the update service (its systemd-run argv, its exit codes passed on, "already loaded" is
+busy, no control characters through); tampered, foreign, legacy and missing signatures; a signed
+pre-release; the placeholder key; another name, arch, version not newer, not installed; busy and
+failing pacman; relative, `..`, symlinked folder or file, hard link, open or writable folders,
+over the cap; not root through pkexec, `install-as` through pkexec, bad arguments; the
+passwordless rule's text, mode, removal and refused user names.
+The real update (password, rule, restart, refusals) is `docs/MANUAL_CHECKLIST.md` §31.
+
+### 41.9 Risks
+* `exec.argv1` needs polkit ≥ 0.114 (Arch: 127). Older polkit would pick one of the two actions
+  for both verbs.
+* The restart's put-back is best effort: the new window maps on the active workspace and holds
+  the keyboard for a moment before it is moved and the keyboard handed back.
+* A window on a hidden workspace without `render_unfocused` stops drawing: its last published
+  state (taken when it lost focus) decides the gate, and the restart exits without `on_exit`
+  (no last-screen save; the screen comes from `--view`).
+* Partial upgrades (§20.4) and `LocalFileSigLevel = Required` are pacman's; Settings shows
+  pacman's message.
+* The install runs as a transient system service (§20.4), so it needs systemd as PID 1 (Arch's
+  `base`); without it `install` fails (exit 4, systemd-run's message). An install already in
+  its service when Tuner quits or gives up waiting finishes; the next one meanwhile is busy.
+* The download stops past 256 MiB whatever size GitHub lists for the package.

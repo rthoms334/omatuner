@@ -1,6 +1,6 @@
 //! Desktop integration: MPRIS, idle inhibit, notifications/reminders, file picker, Hyprland
-//! helpers, the pop-out player's window control, memory upkeep (glibc trims, memory stats).
-//! Owner: WP-08. Every service degrades
+//! helpers, the pop-out player's window control, memory upkeep (glibc trims, memory stats),
+//! fatal startup errors on the desktop (`startup`, §21.7). Owner: WP-08. Every service degrades
 //! gracefully (logs a warning and becomes a no-op) when its D-Bus name / Wayland protocol /
 //! binary is unavailable.
 
@@ -13,6 +13,7 @@ pub mod mpris;
 pub mod notify;
 pub mod popout;
 pub mod signals;
+pub mod startup;
 pub mod systemd;
 
 use std::sync::atomic::{AtomicBool, Ordering};

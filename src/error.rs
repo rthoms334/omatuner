@@ -39,6 +39,12 @@ pub enum Error {
     },
     #[error("config error: {0}")]
     Config(String),
+    /// The database's schema (`PRAGMA user_version`) is newer than this build's
+    /// ([`crate::store::migrations::latest_version`]): opening it is refused, it would lose
+    /// data. `opened_by` is the Tuner version that last opened it, when that one recorded it
+    /// (`meta.app_version`, DESIGN §21.7). Typed so the startup report can say it in plain words.
+    #[error("database schema v{found} is newer than this build (v{supported}){}; refusing to open", .opened_by.as_ref().map(|v| format!(", last opened by Tuner {v}")).unwrap_or_default())]
+    NewerSchema { found: i64, supported: i64, opened_by: Option<String> },
     /// mpv returned an error code. Message is mpv's error string.
     #[error("player error: {0}")]
     Mpv(String),

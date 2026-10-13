@@ -1,6 +1,6 @@
 [package]
 name = "tuner"
-version = "0.2.5"
+version = "0.2.7"
 edition = "2024"
 rust-version = "1.95"
 description = "Tuner: a keyboard-first IPTV player for Omarchy (Hyprland)"
@@ -13,12 +13,19 @@ default-run = "tuner"
 name = "tuner"
 path = "src/lib.rs"
 
+# The update helper (DESIGN §41.5): the root program that installs a verified Tuner update,
+# started only through pkexec; installed as /usr/lib/tuner/tuner-update. std, minisign-verify and
+# rustix only (it shares `src/update/verify.rs` through `#[path]`, never the `tuner` library).
+[[bin]]
+name = "tuner-update"
+path = "src/bin/tuner-update.rs"
+
 [[bin]]
 name = "tuner"
 path = "src/main.rs"
 
-# The casting firewall helper (DESIGN §40 §9.4): std only, the one program that runs as root,
-# started through pkexec; installed as /usr/lib/tuner/tuner-firewall. CAST-7 owns it.
+# The casting firewall helper (DESIGN §40 §9.4): std only, casting's one program that runs as
+# root, started through pkexec; installed as /usr/lib/tuner/tuner-firewall. CAST-7 owns it.
 [[bin]]
 name = "tuner-firewall"
 path = "src/bin/tuner-firewall.rs"
@@ -127,6 +134,11 @@ wayland-client = "0.31.15"
 wayland-backend = { version = "0.3.17", features = ["client_system"] }
 wayland-protocols = { version = "0.32.13", features = ["client", "unstable"] }  # zwp_idle_inhibit_manager_v1
 
+# updates (DESIGN §41). Pinned per the two-week rule (newest release at least 14 days old on
+# 2026-10-13); licences in the trailing comments.
+minisign-verify = "=0.3.0"  # MIT; no dependencies (its own Ed25519 + BLAKE2b): the release signatures (0.3.0 is from 2026-09-25)
+rustix = { version = "1.1.5", default-features = false, features = ["std", "fs", "process"] }  # Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT; already built (zbus, wayland): the helper's openat / fstat / geteuid
+
 # cli, errors, logging
 clap = { version = "4.6.7", features = ["derive"] }
 anyhow = "1.0.104"
@@ -139,7 +151,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 mdns-sd = { version = "=0.21.4", default-features = false }   # Apache-2.0 OR MIT; on-demand _airplay._tcp browse (0.21.5 is from 2026-10-05)
 num-bigint = "0.5.1"        # MIT OR Apache-2.0; SRP-6a (3072-bit) for AirPlay pairing
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }  # MIT; the LAN media server (also a dev-dependency, with its defaults)
-aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }  # ISC AND (Apache-2.0 OR ISC); already built for rustls: X25519, Ed25519, ChaCha20-Poly1305, HKDF, SHA-512
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }  # ISC AND (Apache-2.0 OR ISC); already built for rustls: X25519, Ed25519, ChaCha20-Poly1305, HKDF, SHA-512 (casting; the update tests' own release key, DESIGN §41.8)
 zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }  # MIT; already built (notify-rust): the logind sleep inhibitor
 libc = "0.2.190"            # MIT OR Apache-2.0; already built: prctl(PR_SET_PDEATHSIG) for ffmpeg children
 if-addrs = "0.15.0"         # MIT OR BSD-3-Clause; same version as mdns-sd's: interface name and subnet for the firewall rule

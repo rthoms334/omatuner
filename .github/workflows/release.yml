@@ -6,6 +6,10 @@ name: Release
 # (lowercase letters, digits and dots, starting with a letter) is appended to the package version:
 # tag v0.1.0-rc4 builds omatuner 0.1.0rc4, which pacman orders before 0.1.0, so the final release
 # upgrades it.
+# Publishing signs every package and tarball with minisign (the MINISIGN_SECRET_KEY and
+# MINISIGN_PASSWORD secrets) and uploads the .minisig files with them; Tuner installs an update
+# only when its signature verifies against packaging/update-key.pub (DESIGN §41.3), so the
+# publish fails unless that key verifies every signature it made.
 # Run by hand with `publish` off for a dry run on any branch: the files are only uploaded as
 # workflow artifacts. Pull requests that change the packaging or this workflow get the same dry
 # run (build only; the publish job never runs for them).
@@ -151,17 +155,27 @@ jobs:
           # The tarball holds the packaged binary and files (same build as the package).
           root="$src/pkg/omatuner"
           stage="omatuner-$PKGVERSION-$ARCH"
-          mkdir -p "$stage/hypr" "$stage/omarchy"
+          mkdir -p "$stage/hypr" "$stage/omarchy" "$stage/systemd"
           install -m755 "$root/usr/bin/tuner" "$stage/tuner"
           install -m644 "$root/usr/share/applications/tuner.desktop" "$stage/"
           install -m644 "$root/usr/share/icons/hicolor/scalable/apps/tuner.svg" "$stage/"
           install -m644 "$root/usr/share/tuner/hypr/tuner.lua" "$stage/hypr/"
           install -m644 "$root/usr/share/tuner/omarchy/omarchy-menu.jsonc" "$stage/omarchy/"
-          install -m644 README.md LICENSE "$stage/"
+          install -m644 "$root/usr/lib/systemd/user/tuner-rearm.service" "$stage/systemd/"
+          # THIRD_PARTY_NOTICES.md: pyatv's MIT notice for casting's ported AirPlay code. The root
+          # helpers (casting's firewall, the updater) and their polkit policies ship only in the
+          # package: without it the generic polkit action is used (DESIGN §22).
+          install -m644 README.md LICENSE THIRD_PARTY_NOTICES.md "$stage/"
           tar --owner=0 --group=0 --sort=name -czf "dist/$stage.tar.gz" "$stage"
           # Sanity checks: the binary runs and reports Cargo's version; list what ships.
           out="$("$stage/tuner" --version)"
           [[ $out == "tuner $VERSION" ]]
+          # the package carries both root helpers and both polkit actions
+          for f in usr/lib/tuner/tuner-firewall usr/lib/tuner/tuner-update \
+            usr/share/polkit-1/actions/io.github.rthoms334.omatuner.firewall.policy \
+            usr/share/polkit-1/actions/io.github.rthoms334.omatuner.update.policy; do
+            [[ -f $root/$f ]] || { echo "::error::the package lacks /$f"; exit 1; }
+          done
           pacman -Qip "dist/$pkg"
           pacman -Qlp "dist/$pkg"
           tar -tzvf "dist/$stage.tar.gz"
@@ -183,11 +197,47 @@ jobs:
     permissions:
       contents: write
     steps:
+      # only the release key: the signatures are checked against what the app compiles in
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          sparse-checkout: packaging/update-key.pub
+          sparse-checkout-cone-mode: false
+
       - uses: actions/download-artifact@v8
         with:
           pattern: omatuner-*
           path: dist
           merge-multiple: true
+
+      - name: Sign the packages and tarballs (minisign)
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          if [[ -z $MINISIGN_SECRET_KEY ]]; then
+            echo "::error::the MINISIGN_SECRET_KEY secret is missing: Tuner installs only signed updates (README \"Release signing\")"
+            exit 1
+          fi
+          retry() { local i; for i in 1 2 3; do "$@" && return; [[ $i == 3 ]] || sleep 20; done; return 1; }
+          retry sudo apt-get update -qq
+          retry sudo apt-get install -y -qq minisign
+          key="$RUNNER_TEMP/minisign.key"
+          (umask 077 && printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key")
+          trap 'rm -f "$key"' EXIT
+          cd dist
+          for f in *.pkg.tar.zst *.tar.gz; do
+            # pre-hashed (minisign's default); the password comes on stdin, never on a command line
+            printf '%s\n' "$MINISIGN_PASSWORD" | minisign -S -s "$key" -m "$f"
+            # the key Tuner compiles in must verify it, or no Tuner could install this release
+            minisign -V -q -p ../packaging/update-key.pub -m "$f"
+            # pre-hashed (`ED`), the only kind Tuner accepts: minisign -V takes legacy ones too
+            if [[ $(sed -n 2p "$f.minisig" | base64 -d | head -c 2) != ED ]]; then
+              echo "::error::$f.minisig isn't a pre-hashed signature: Tuner refuses legacy (Ed) ones"
+              exit 1
+            fi
+          done
+          ls -l ./*.minisig
 
       - name: Create the GitHub Release
         env:

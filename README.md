@@ -225,7 +225,8 @@ and [Artemis I Launch (Press Site)](https://images.nasa.gov/details/Artemis%20I%
   your other playlist, and moving the playing picture to its other playlist always asks first.
 - **Reminders and sleep timer:** notify or switch at a programme's start (or "10 min in"),
   opened in the pop-out, the full window or where you are; reminders fire even while Tuner is
-  closed (systemd user timers). The sleep timer (`Ctrl+Shift+T`) stops or pauses after a time,
+  closed, after a reboot too (systemd user timers, see
+  [Reminders while Tuner is closed](#reminders-while-tuner-is-closed)). The sleep timer (`Ctrl+Shift+T`) stops or pauses after a time,
   at the end of the programme, after N episodes or at the end of Up next.
 - **Use it from an AI agent:** ask Claude Code, Codex, Gemini CLI or any other MCP-capable agent
   — "put the touring cars on", "something light under 2 hours", "follow Arsenal, spoiler-safe",
@@ -271,7 +272,7 @@ fontconfig, JetBrains Mono Nerd Font, …):
 
 ```sh
 sha256sum -c --ignore-missing SHA256SUMS
-sudo pacman -U omatuner-0.2.5-1-x86_64.pkg.tar.zst     # or …-aarch64.pkg.tar.zst
+sudo pacman -U omatuner-0.2.7-1-x86_64.pkg.tar.zst     # or …-aarch64.pkg.tar.zst
 ```
 
 The package installs:
@@ -279,13 +280,24 @@ The package installs:
 - `/usr/bin/tuner`
 - the desktop entry and icon
 - the opt-in snippets under `/usr/share/tuner/`
+- `tuner-rearm.service`, a systemd user unit that re-arms the reminder timers at every login
+  (see [Reminders while Tuner is closed](#reminders-while-tuner-is-closed))
+- the update helper `/usr/lib/tuner/tuner-update` and its polkit policy (see [Updates](#updates))
 - this README and the design notes under `/usr/share/doc/tuner/`, the licence under
   `/usr/share/licenses/omatuner/`
 
-`omatuner-<version>-<arch>.tar.gz` holds the same binary, desktop entry, icon, snippets, README
-and LICENSE for other setups. The binary links against the system libmpv, so install `mpv`
-first. Copy `tuner` to a directory on your session PATH (e.g. `~/.local/bin`), then install the
-desktop entry and icon as described under [With cargo](#with-cargo).
+From then on Tuner [updates itself](#updates). Every package and tarball has a minisign
+signature (`.minisig`) by Tuner's release key; to check one by hand:
+
+```sh
+minisign -Vm omatuner-0.2.5-1-x86_64.pkg.tar.zst -P RWToNAEapl/Jf9Fxx7q+fhN1qm5144l/vu41N8lmQyTM7KGrDShJjRer
+```
+
+`omatuner-<version>-<arch>.tar.gz` holds the same binary, desktop entry, icon, snippets, login
+unit (`systemd/tuner-rearm.service`), README, LICENSE and THIRD_PARTY_NOTICES.md for other
+setups. The binary links against the system libmpv, so install `mpv` first. Copy `tuner` to a
+directory on your session PATH (e.g. `~/.local/bin`), then install the desktop entry, icon and
+login unit as described under [With cargo](#with-cargo).
 
 ### Build the Arch package from source
 
@@ -297,7 +309,7 @@ makepkg -si          # builds this checkout, smoke-tests the binary, installs th
 
 - `makepkg --nocheck -si` skips the smoke test. The test suite is `cargo test` (see Development).
 - The PKGBUILD builds the checkout it sits in (no download of the app itself), so check out the
-  tag you want first, e.g. `git checkout v0.2.5`.
+  tag you want first, e.g. `git checkout v0.2.7`.
 
 ### With cargo
 
@@ -312,7 +324,74 @@ sure `~/.cargo/bin` is on your session PATH, or edit `Exec=` to the full path:
 - `packaging/tuner.desktop` to `~/.local/share/applications/`
 - `packaging/icons/tuner.svg` to `~/.local/share/icons/hicolor/scalable/apps/`
 
-Then follow [Omarchy integration](#omarchy-integration).
+Then follow [Omarchy integration](#omarchy-integration). Without the package nothing re-arms
+the reminder timers at login; to have that too, copy `packaging/systemd/tuner-rearm.service`
+(the tarball's `systemd/tuner-rearm.service`) to `~/.config/systemd/user/`, set its
+`ExecStart=` to your `tuner` by its full path (systemd doesn't expand `~`; `%h` is your home,
+e.g. `ExecStart=%h/.cargo/bin/tuner --rearm`), and run
+`systemctl --user add-wants graphical-session.target tuner-rearm.service`.
+
+## Updates
+
+Tuner installed with the package keeps itself up to date. It looks for a new **stable** release
+on GitHub 20 seconds after it starts and every 6 hours (pre-releases and tags like `v0.3.0-rc1`
+are never installed), downloads the package for your computer, and checks its signature against
+Tuner's release key, which is built into Tuner. Only then does it install it, through a small
+helper that runs as root (`/usr/lib/tuner/tuner-update`) and checks everything again itself.
+Everything is in **Settings ▸ About & logs ▸ Updates**: the version, the last check, *Check now*,
+*Install now* and the two switches below.
+
+- **Your password:** installing asks for it, in your desktop's usual password dialog. Tuner
+  waits for a moment you're at it with nothing playing, and a toast says why the dialog appears.
+  A desktop notification tells you when an update is ready. Cancel the dialog and it waits for
+  *Install now*.
+- **Install updates without asking for my password** (off): turning it on asks for your
+  password once and adds a polkit rule (`/etc/polkit-1/rules.d/49-omatuner-update-<uid>.rules`)
+  that lets *you*, at this computer, run the helper's install without a password. The helper
+  installs only an `omatuner` package signed with Tuner's release key, for your computer, and
+  newer than the one installed: never another package, never the same or an older version.
+  Turning the switch off removes the rule (it asks for your password again).
+- **Automatically install updates** (on): off, Tuner tells you about a new version and installs
+  it when you choose *Install now*.
+- **Restart:** the running Tuner keeps the old version until it restarts. The status bar says
+  *Updated to 0.2.6 — restarts when idle (Restart now)*. Tuner restarts by itself once nothing
+  has been playing (or paused) for a minute, no dialog is open, no import runs and you're in
+  another window; it opens on the screen it was on, stays on its workspace and leaves the
+  keyboard where it was. It never restarts during playback. Click the chip to restart now.
+- **AI agents:** the `tuner mcp` servers your agents started keep working through an install and
+  the restart. An agent gets the new version's tools in its next session (for Claude Code, start
+  a new session); with *Keep Claude Code's plugin up to date* on, the plugin is brought up to
+  date after the restart.
+- **Not installed with pacman** (`cargo install`, the tarball, a checkout): Tuner checks and tells
+  you about a new version, but never installs it; Settings says why. Update it the way you
+  installed it.
+- **Network:** one request to `api.github.com` per check, conditional (unchanged answers don't
+  count against GitHub's limit of 60 an hour), no account, no token, through your proxy settings
+  (`HTTPS_PROXY`); then the package from GitHub's release files.
+
+### Release signing (maintainers)
+
+Releases are signed in the release workflow with minisign. The public key is
+`packaging/update-key.pub`, built into Tuner and its helper; the secret key and its password are
+the repository secrets `MINISIGN_SECRET_KEY` (the whole secret key file) and `MINISIGN_PASSWORD`.
+The one-time setup:
+
+```sh
+minisign -G -p packaging/update-key.pub -s ~/.minisign/omatuner.key   # asks for a password
+gh secret set MINISIGN_SECRET_KEY < ~/.minisign/omatuner.key
+gh secret set MINISIGN_PASSWORD                                       # type the password
+git add packaging/update-key.pub && git commit -m "Release signing key"
+```
+
+- Keep `~/.minisign/omatuner.key` and its password backed up and offline: anyone with both can
+  publish an update every Tuner installs, and without them no Tuner installs another update.
+- Publishing signs every `.pkg.tar.zst` and `.tar.gz` and uploads the `.minisig` files; it fails
+  if the secret is missing or `packaging/update-key.pub` doesn't verify a signature it made.
+- A build whose key file isn't a valid key (a fork, or the placeholder
+  `REPLACE-WITH-THE-RELEASE-KEY`) checks and tells but never installs anything.
+- Changing the key: a Tuner installs only what its own built-in key verifies, so the release
+  that brings a new key must be signed with the old one. Publish that release by hand (the
+  workflow checks against the new file), or have users install it by hand once.
 
 ## First run
 
@@ -1065,6 +1144,7 @@ Settings ▸ Parental sets a 4–8 digit PIN. It is a speed bump for children, n
 ```text
 tuner [--view home|live|guide|movies|series|search|settings] [--play <ref> [--popout]]
       [--reminder <id>] [--debug] [--profile-dir <dir>] [--refresh] [PLAYLIST_OR_URL...]
+tuner --rearm [--debug]
 tuner mcp [--profile-dir <dir>] [--debug]
 tuner claude-setup [--apply]
 ```
@@ -1078,6 +1158,7 @@ tuner claude-setup [--apply]
 | `--debug` | Debug logging for this session, whatever the setting says. |
 | `--profile-dir <dir>` | Keep config, data, cache, logs and the socket under `<dir>`. Use it for testing, or for a second profile. |
 | `--refresh` | Refresh stale playlists and guides without a window, then exit (status 1 if a refresh failed). Does nothing while Tuner is running, because the open window refreshes on its own. While it runs, starting Tuner waits a few seconds and then says (also as a desktop notification) that a background refresh is running. A playlist it upgraded to its Xtream login is announced the next time Tuner opens. |
+| `--rearm` | Re-arm the reminder timers and exit: offline, without a window, in a second or two (exit status 1 only if systemd refused). This is what `tuner-rearm.service` runs at every login; you don't need it yourself. Does nothing while Tuner is running. See [Reminders while Tuner is closed](#reminders-while-tuner-is-closed). |
 | `PLAYLIST_OR_URL…` | An `.m3u`/`.m3u8` file opens the add-playlist card. A stream URL or media file plays straight away. `file://` URIs are treated as paths. |
 | `mcp` | Run the MCP server on stdin/stdout for an AI agent (Claude Code, Codex, Gemini CLI or any other MCP client; see [Use Tuner from an AI agent](#use-tuner-from-an-ai-agent)). |
 | `claude-setup` | Show how to connect Claude Code to Tuner (the omatuner plugin). `--apply` runs the plugin steps after asking on the terminal. Settings ▸ AI agents does the same from inside Tuner, for other agents too. |
@@ -1465,6 +1546,7 @@ use them directly. Their full descriptions are in `src/agent/tools.rs` and
 | Caches | `~/.cache/tuner/img`, `…/epg`, `…/playlists` | Logos and posters (up to 500 MB). Guide and playlist downloads are 0700 and deleted after import. |
 | Log | `~/.local/state/tuner/tuner.log` (+ `.1`) | Rotated at 5 MB. Redacted. |
 | Instance socket | `$XDG_RUNTIME_DIR/tuner/tuner.sock` | Removed on exit, including on SIGTERM/SIGINT. |
+| Update downloads | `~/.cache/tuner/update/` | 0700. The package waiting to install and its signature; removed once installed. |
 
 With `--profile-dir DIR`, the same files live under `DIR/config`, `DIR/data`, `DIR/cache`,
 `DIR/state` and `DIR/run`. The Omarchy theme is still read from your real home.
@@ -1562,8 +1644,44 @@ leaves the pop-out where it is ("Nothing playing"); its page is waiting when you
   may open tiled and focused first. Popping out a running Tuner never takes the keyboard
   either. If you have your own rules for class `tuner`, add `tuner-popout` to them.
 
+### Reminders while Tuner is closed
+
+With Settings ▸ Reminders *Fire while Tuner is closed* on (the default), every reminder and
+automatic switch due in the next 48 hours (at most 30) gets a systemd user timer, "Tuner
+reminder", that runs `tuner --reminder <id>` at its time: a notification shows by itself, a
+switch starts Tuner. `systemctl --user list-timers 'tuner-reminder-*'` lists them; they carry
+the reminder's number only, never a title.
+
+These timers don't survive a reboot or a logout. The package's `tuner-rearm.service` puts them
+back at every login (it runs `tuner --rearm` once the Hyprland session is up: offline, no
+window, done in a second), so a reminder set before a reboot fires without you opening Tuner.
+One whose time passed while the computer was off fires as soon as you log in, as it would if
+you opened Tuner then: a notification while the programme is still on, a switch up to 15
+minutes late.
+It does nothing while Tuner runs (Tuner keeps its timers itself) or for an account that never
+started Tuner. `systemctl --user status tuner-rearm` shows its last run; `systemctl --user mask
+tuner-rearm` turns it off for your account. It needs a session started by uwsm, as Omarchy's
+is; otherwise the timers come back the next time Tuner starts.
+
 ## Troubleshooting
 
+- **Tuner doesn't open:** when it can't start, a notification *Tuner couldn't start* says why
+  and what to do, and `~/.local/state/tuner/tuner.log` ends with an `ERROR tuner: Tuner exits:`
+  line. Running `tuner` in a terminal prints the same reason.
+  - *"Your library was last opened by a newer Tuner"*: a newer version (or a development build)
+    upgraded your library database, and this one can't read it. Tuner refuses rather than risk
+    your data. Install that version again, or a newer one (the message names it when it knows).
+  - *"Your library file (tuner.db) is damaged"*: quit Tuner, move
+    `~/.local/share/tuner/tuner.db` (with its `-wal` and `-shm` files) aside, start Tuner again
+    and restore a backup in Settings ▸ Backup if you made one.
+  - *"…libmpv couldn't start"*: reinstall `mpv` (`sudo pacman -S mpv`).
+  - *"…couldn't open its window"*: start it from your desktop session, not over SSH or a TTY.
+  - *"Tuner was updated to X but couldn't start"*: the reason follows. To go back, install the
+    previous package from pacman's cache as the message shows
+    (`sudo pacman -U /var/cache/pacman/pkg/omatuner-<previous>-*.pkg.tar.zst`) and turn off
+    automatic installs in Settings ▸ About & logs ▸ Updates until a fixed release is out. Tuner
+    never downgrades by itself.
+  - No notification at all: check the log file above, or run `tuner` in a terminal.
 - **Logs:** open them with Settings ▸ About & logs ▸ *Open the log viewer*.
   - Type to filter. Ctrl+S sets the minimum level or exports the log (*Export…*).
   - The same page has *Export log…*. The file is `~/.local/state/tuner/tuner.log`.
@@ -1575,6 +1693,11 @@ leaves the pop-out where it is ("Nothing playing"); its page is waiting when you
     `RUST_LOG=tuner::player=trace`) overrides both.
   - Messages from libraries (TLS, windowing) are hidden in normal use and appear as DEBUG lines
     with debug logging on.
+- **An update doesn't install:** Settings ▸ About & logs ▸ Updates says why under its status
+  (the log has the details). "No polkit agent answered": your session runs no password agent
+  (Omarchy's is `hyprpolkitagent`). "pacman was busy": it tries again in 10 minutes. With
+  `LocalFileSigLevel = Required` in `/etc/pacman.conf`, pacman refuses every package file without
+  a pacman signature, Tuner's included: install it by hand or relax that setting.
 - **"No guide data" everywhere:** see [guide coverage](#tv-guide-and-guide-coverage). Check
   Settings ▸ EPG for "Matches N of M channels".
 - **Playback stops or stutters on another workspace:** install the Hyprland snippet
@@ -1628,7 +1751,8 @@ leaves the pop-out where it is ("Nothing playing"); its page is waiting when you
 ## Privacy
 
 - **Network:** Tuner talks only to the playlist, guide, stream and logo/poster addresses your
-  playlists and guides contain. There is no telemetry and no account.
+  playlists and guides contain, and to GitHub for its updates. There is no telemetry and no
+  account.
 - **Credentials** are stored only in the database (0600). Credential-bearing downloads (Xtream
   `get.php` / `xmltv.php`) go to 0700 cache folders and are deleted after import. `config.toml`
   never holds secrets. libmpv is embedded, so stream URLs never appear on a command line.
@@ -1643,8 +1767,11 @@ leaves the pop-out where it is ("Nothing playing"); its page is waiting when you
 - **Casting** opens a listener on your local network only while a cast runs, on the address the
   TV reaches (never all interfaces), answering only that TV with a one-time token; the TV never
   sees your provider's address or login. Pairing keys for your TVs are stored in the database
-  (0600) and left out of backups. The only root code is the firewall helper, and only when you
-  press *Allow on firewall*.
+  (0600) and left out of backups. Casting's only root code is the firewall helper, and only when
+  you press *Allow on firewall*.
+- **Updates:** one request to `api.github.com` at start and every 6 hours (no account, no
+  token), and the package download from GitHub when there is a new version. See
+  [Updates](#updates).
 - **Backups** leave passwords out unless you tick *Include passwords*.
 - **The parental PIN** is a speed bump for children, not security.
 
@@ -1668,7 +1795,8 @@ scripts/screenshots.sh                        # README screenshots from it (Hypr
   `-D warnings`, the build, and `cargo test` with ffmpeg test media under a D-Bus session bus.
 - **Releases** (`.github/workflows/release.yml`): pushing a tag `vX.Y.Z` (matching `Cargo.toml`
   and the PKGBUILD's `pkgver`) builds the PKGBUILD with makepkg on both architectures and
-  publishes a GitHub Release with the packages, tarballs and `SHA256SUMS`. A tag with a suffix
+  publishes a GitHub Release with the packages, tarballs, their minisign signatures (see
+  [Release signing](#release-signing-maintainers)) and `SHA256SUMS`. A tag with a suffix
   (`v0.1.1-rc1` for version 0.1.1; lowercase letters, digits and dots, starting with a letter)
   becomes a pre-release whose package version is `0.1.1rc1`, which pacman orders before `0.1.1`,
   so the final release upgrades it. *Run workflow* with `publish` off is a dry run that only
