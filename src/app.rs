@@ -357,6 +357,7 @@ impl TunerApp {
             #[cfg(test)]
             log: Default::default(),
         };
+        app.restore_play_on();
         app.refresh_epg_updated();
         app.refresh_image_agents();
         // the first build already leaves out what parental control hides (DESIGN §20.3)
@@ -427,6 +428,20 @@ impl TunerApp {
             multiview: self.mv.view.on,
             typing: egui_ctx.egui_wants_keyboard_input() || self.key_stack().contains(&KeyContext::TextInput),
             own_page: self.current_route() == &Route::Settings(page),
+        }
+    }
+
+    /// "Remember Play on across restarts" (DESIGN §40 §3.9, `cast.remember_play_on`): the
+    /// switch's TV from the last run goes back to picture A. Off (the default), every start plays
+    /// on this computer: a TV that's off now never swallows plays.
+    fn restore_play_on(&self) {
+        let cfg = self.services().config();
+        let c = &cfg.cast;
+        if crate::cast::on(&cfg)
+            && c.remember_play_on
+            && let Some(id) = c.play_on.as_deref().and_then(|h| h.parse::<crate::model::DeviceId>().ok())
+        {
+            self.services().tiles.a().handle().send(PlayerCommand::SetPlayOn(Some(id)));
         }
     }
 
@@ -510,7 +525,9 @@ impl TunerApp {
             },
             K::NeedsFfmpeg => Toast { ttl_ms: 10_000, ..Toast::error(text.clone()) },
             // the casting card has the actions (Allow on firewall, Pair, Play here…)
-            _ => Toast { action: self.has_media().then(|| ("Show".into(), Action::OpenPlayer)), ttl_ms: 10_000, ..Toast::error(text.clone()) },
+            _ if self.has_media() => Toast { action: Some(("Show".into(), Action::OpenPlayer)), ttl_ms: 10_000, ..Toast::error(text.clone()) },
+            // no card: the session never opened, and what was to play there can play here
+            _ => Toast { action: Some(("Play here".into(), Action::PlayHere)), ttl_ms: 10_000, ..Toast::error(text.clone()) },
         };
         let on_player = self.view_screen() == ScreenId::Player;
         self.cast.ended_alert = ended.then(|| toast.clone());
@@ -567,6 +584,43 @@ impl TunerApp {
             self.reminder_ui.pop_out_pending = false;
             self.toggle_popout(egui_ctx);
         }
+    }
+
+    /// Picture A's plays go to a TV by the Play on switch (DESIGN §40 §3.9): single view (two
+    /// pictures are this computer's) and the switch on a TV. An agent's play, a reminder's switch
+    /// then leave the window where it is, as a cast does (§3.8).
+    fn play_on_tv(&self) -> bool {
+        !self.mv.view.on && self.services().tiles.a().handle().snapshot().play_on.is_some()
+    }
+
+    /// The status bar's "Play on" chip (DESIGN §40 §3.9): where plays go — the TV casting now,
+    /// else the switch's TV, else "This computer" — and a click (or Alt+T) for the chooser.
+    /// Shown while casting is on and a TV is ready (paired), or a cast or the switch names one;
+    /// not beside the Compact cast chip, which already says "Casting · Living Room".
+    fn play_on_chip(&self, cast_chip: bool) -> Option<crate::ui::widgets::status_bar::StatusChip> {
+        if cast_chip || !crate::cast::on(&self.services().config()) {
+            return None;
+        }
+        let a = self.services().tiles.a().handle().snapshot();
+        let to = crate::ui::casting::plays_on(&a);
+        let devices = self.services().agent.cast().devices();
+        if to.is_none() && crate::ui::casting::ready(&devices).is_empty() {
+            return None;
+        }
+        let name = to.map(|id| match (devices.iter().find(|d| d.id == id), &a.cast) {
+            (Some(d), _) => d.name.clone(),
+            (None, Some(c)) => c.name.clone(),
+            (None, None) => "your TV".to_owned(),
+        });
+        let key = keymap::GLOBAL.iter().find(|b| b.action == Action::PlayOnMenu).map(|b| b.chord.label()).unwrap_or_default();
+        let (text, label) = crate::ui::casting::chip_text(name.as_deref(), &key);
+        Some(crate::ui::widgets::status_bar::StatusChip {
+            text,
+            label,
+            action: Action::PlayOnMenu,
+            warning: a.cast.as_ref().is_some_and(|c| c.phase == crate::model::CastPhase::Lost),
+            close: None,
+        })
     }
 
     /// The status bar's chip while casting and no mini player shows (Compact, or the mini
@@ -683,14 +737,12 @@ impl TunerApp {
     /// picture; a film, an episode or a file to picture A, ending multi-view; with two pictures,
     /// volume and mute to the one with the sound (as the keys, `ui::multiview::route_command`).
     fn send_player(&self, cmd: PlayerCommand) {
-        // an agent's `play {device}` (DESIGN §40 §12): its play goes to that TV — already
-        // casting there, the play simply lands on it (everything played in picture A does)
-        let cmd = match (self.cast.device, cmd) {
-            (Some(device), PlayerCommand::Play(req) | PlayerCommand::PlayCopy(crate::player::CopyPlay { req, .. }))
-                if self.snapshot.cast.as_ref().is_none_or(|c| c.device != device) =>
-            {
-                PlayerCommand::CastTo { device, play: Some(req) }
-            }
+        // an agent's `play {device}` (DESIGN §40 §12): its play goes to that TV, a title's copy
+        // with its fallback and start point — already casting there, the play simply lands on
+        // it (everything played in picture A does)
+        let cmd = match (self.cast.device.filter(|d| self.snapshot.cast.as_ref().is_none_or(|c| c.device != *d)), cmd) {
+            (Some(device), PlayerCommand::Play(req)) => PlayerCommand::CastTo { device, play: Some(req) },
+            (Some(device), PlayerCommand::PlayCopy(copy)) => PlayerCommand::CastCopy { device, copy },
             (_, cmd) => cmd,
         };
         #[cfg(test)]
@@ -1400,7 +1452,7 @@ impl TunerApp {
         match self.agent_play(p) {
             // a cast (asked for, or one already running: the play lands on its TV) never moves
             // the window (DESIGN §40 §3.8)
-            AgentPlayed::Sent if device.is_some() || self.snapshot.cast.is_some() => self.drop_player_push(),
+            AgentPlayed::Sent if device.is_some() || self.snapshot.cast.is_some() || self.play_on_tv() => self.drop_player_push(),
             AgentPlayed::Sent => {
                 if show.place == Placement::FullWindow {
                     self.agent_leave_screen();
@@ -1681,9 +1733,9 @@ impl TunerApp {
         if self.pending_locked.as_ref().is_some_and(|(c, _)| *c == cid) {
             return; // the PIN prompt shows where the window is; nothing moves under it
         }
-        // casting: the switch retunes the TV and skips its "Open in" (DESIGN §40 §3.8: casting
-        // never moves the window)
-        let place = if self.snapshot.cast.is_some() { Place::InPlace } else { place };
+        // casting, or Play on a TV: the switch tunes the TV and skips its "Open in" (DESIGN §40
+        // §3.8: casting never moves the window; §3.9)
+        let place = if self.snapshot.cast.is_some() || self.play_on_tv() { Place::InPlace } else { place };
         match place {
             Place::PopOut => {
                 self.toggle_popout(egui_ctx);
@@ -2124,6 +2176,9 @@ impl TunerApp {
             // the alert after the TV stopped it: casting has ended, the controller replays the
             // last item here when nothing plays
             Action::PlayHere => self.send_player(PlayerCommand::StopCasting { play_here: true }),
+            // where plays go (DESIGN §40 §3.9): the chip, Alt+T
+            Action::PlayOnMenu if crate::cast::on(&self.services().config()) => self.nav.push(NavRequest::Open(OverlayRequest::PlayOn)),
+            Action::PlayOnMenu => self.toast(Toast::info("Casting is off (Settings ▸ Cast)")),
             Action::CastMenu if crate::cast::on(&self.services().config()) && !self.mv.view.on => {
                 if self.popout.is_out() || self.video_only {
                     self.toggle_popout(egui_ctx);
@@ -2356,6 +2411,12 @@ impl TunerApp {
                     self.cast.device = self.cast.pending_device.take();
                     self.play_channel(id, origin);
                     self.cast.device = None;
+                    return;
+                }
+                // ... or by "Cast to…" of a locked item (DESIGN §40 §3.1): cast it now
+                if result == overlays::OverlayResult::Unlocked(Action::CastUnlocked) {
+                    self.overlays.pop();
+                    self.with_ctx(|ctx, _, _| crate::ui::casting::unlocked(ctx));
                     return;
                 }
                 // ... or by an MCP client's `play` of a locked title / catch-up
@@ -2861,9 +2922,11 @@ impl eframe::App for TunerApp {
                 (mini_hidden && self.snapshot.state != PlayerState::Idle).then(|| self.snapshot.playable.as_ref().map(|p| p.title.clone())).flatten();
             // multi-view: "▶ 2 pictures · Sky Sports Main Event" (the focused one's)
             let now_playing = now_playing.map(|t| if self.mv.view.on { format!("2 pictures · {t}") } else { t });
-            let chips: Vec<_> = self
-                .cast_chip(mini_hidden)
+            let cast_chip = self.cast_chip(mini_hidden);
+            let play_on = self.play_on_chip(cast_chip.is_some());
+            let chips: Vec<_> = cast_chip
                 .into_iter()
+                .chain(play_on)
                 .chain(crate::spoiler::ui::status_chip(&self.services().agent, crate::model::now()))
                 .chain(self.sleep_chip())
                 .chain(self.update_chip())
@@ -5773,6 +5836,7 @@ mod tests {
                 duration_s: None,
                 copy: None,
                 queue: None,
+                cast: None,
             }),
         ];
         for o in overlays {
@@ -6441,6 +6505,124 @@ mod tests {
         });
         rig.frame_with(vec![]);
         fake
+    }
+
+    /// The far ends of the cast sessions picture A opened (kept for the test's length: a dropped
+    /// event sender reads as a lost TV).
+    type Sessions = Arc<
+        Mutex<
+            Vec<(
+                tokio::sync::mpsc::UnboundedReceiver<crate::player::remote::RemoteCmd>,
+                crossbeam_channel::Sender<crate::player::remote::RemoteEvent>,
+            )>,
+        >,
+    >;
+
+    /// A paired Living Room on a scripted cast service whose sessions hand the test what picture
+    /// A's controller sends them.
+    fn paired_living_room(rig: &mut Rig) -> Sessions {
+        let fake = Arc::new(crate::cast::testing::FakeCast::default());
+        let sessions: Sessions = Arc::default();
+        let keep = sessions.clone();
+        let mut tv =
+            crate::cast::Device::new(living_room(), "Living Room", crate::model::cast::ReceiverKind::AppleTv, crate::cast::Protocol::AirPlay);
+        tv.pairing = crate::cast::Pairing::Paired(crate::cast::PairVariant::Hkp3);
+        fake.script(move |s| {
+            s.devices = vec![tv];
+            s.open = Some(Box::new(move |device| {
+                let (cmd, cmds) = tokio::sync::mpsc::unbounded_channel();
+                let (events_tx, events) = crossbeam_channel::unbounded();
+                keep.lock().unwrap().push((cmds, events_tx));
+                let view = crate::model::CastView {
+                    device,
+                    name: "Living Room".into(),
+                    kind: crate::model::cast::ReceiverKind::AppleTv,
+                    phase: crate::model::CastPhase::Connecting,
+                    level: None,
+                    as_is: false,
+                    behind_live_s: None,
+                    can_seek: true,
+                    volume: false,
+                };
+                Ok(crate::player::remote::RemoteOutput { cmd, events, view })
+            }));
+        });
+        rig.app.services().agent.set_cast(Some(crate::cast::CastHandle::new(fake)));
+        rig.frame_with(vec![]);
+        sessions
+    }
+
+    /// What the newest session's TV is told to play first (bounded wait).
+    fn tv_load(rig: &mut Rig, sessions: &Sessions) -> Arc<crate::model::Playable> {
+        let mut load = None;
+        rig.until("the TV's load", |_| {
+            let mut s = sessions.lock().unwrap();
+            if let Some((cmds, _)) = s.last_mut()
+                && let Ok(crate::player::remote::RemoteCmd::Load { playable, .. }) = cmds.try_recv()
+            {
+                load = Some(playable);
+            }
+            load.is_some()
+        });
+        load.expect("a load")
+    }
+
+    /// "Cast to…" on a Live TV row (Alt+C; DESIGN §40 §3.1) with one TV paired: the channel
+    /// goes straight to it — the session's first load is that channel — the screen stays (the
+    /// mini player shows the casting card) and a toast says so.
+    #[test]
+    fn cast_to_on_a_channel_row_goes_straight_to_the_one_tv() {
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_channels(c, 3, None));
+        rig.settle();
+        let sessions = paired_living_room(&mut rig);
+        let start = rig.route().clone();
+        rig.press(Key::C, ALT);
+        let load = tv_load(&mut rig, &sessions);
+        assert_eq!(Some(&load.media), rig.app.lib.live.by_ref(&channel_ref(0)).map(MediaRef::Channel).as_ref());
+        rig.until("casting", |r| r.app.services().tiles.a().handle().snapshot().cast.is_some());
+        assert_eq!(rig.route(), &start, "the screen stays");
+        assert!(rig.log().toasts.iter().any(|t| t.text == "Casting Channel 0 to Living Room"), "{:?}", rig.log().toasts);
+    }
+
+    /// The Play on switch (DESIGN §40 §3.9): with a TV paired the status chip says where plays
+    /// go; Alt+T opens the chooser, and Living Room there sets the switch (kept in
+    /// `cast.play_on`); Shift+Enter on a channel then plays it on the TV, on the player's
+    /// casting card.
+    #[test]
+    fn play_on_sends_plays_to_the_tv_and_the_chip_says_where() {
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_channels(c, 3, None));
+        rig.settle();
+        let sessions = paired_living_room(&mut rig);
+        let chip = |r: &Rig| r.app.play_on_chip(false).map(|c| c.text);
+        assert_eq!(chip(&rig), Some(crate::ui::casting::chip_text(None, "Alt+T").0));
+        rig.press(Key::T, ALT);
+        assert_eq!(rig.overlay_kinds(), [kind(OverlayRequest::PlayOn)]);
+        rig.frame_with(vec![]);
+        rig.press(Key::ArrowDown, NONE);
+        rig.press(Key::Enter, NONE);
+        rig.until("the switch on Living Room", |r| r.app.services().tiles.a().handle().snapshot().play_on == Some(living_room()));
+        assert_eq!(rig.app.services().config().cast.play_on, Some(living_room().to_string()));
+        assert_eq!(chip(&rig), Some(crate::ui::casting::chip_text(Some("Living Room"), "Alt+T").0));
+        rig.press(Key::Enter, Modifiers::SHIFT);
+        let load = tv_load(&mut rig, &sessions);
+        assert_eq!(Some(&load.media), rig.app.lib.live.by_ref(&channel_ref(0)).map(MediaRef::Channel).as_ref());
+        assert_eq!(rig.route(), &Route::Player, "the player shows the casting card");
+    }
+
+    /// "Remember Play on across restarts" brings the switch back at the next start; off (the
+    /// default), every start plays on this computer whatever `cast.play_on` says.
+    #[test]
+    fn play_on_comes_back_only_when_remembered() {
+        for remember in [false, true] {
+            let mut cfg = test_config();
+            (cfg.cast.play_on, cfg.cast.remember_play_on) = (Some(living_room().to_string()), remember);
+            let mut rig = Rig::with(cfg, live(), 1.0, |_| Ok(()));
+            let a = rig.app.services().tiles.a().handle();
+            // a command sent after the restore: once its effect shows, the restore's does too
+            a.send(PlayerCommand::SetZapList(ZapList { collection: Collection::Group(GroupId(7)), channels: Vec::new().into() }));
+            rig.until("the player's answer", |_| a.snapshot().zap.is_some());
+            assert_eq!(a.snapshot().play_on, remember.then(living_room), "remember: {remember}");
+        }
     }
 
     fn cast_failed(kind: crate::cast::CastErrorKind) -> AppEvent {

@@ -61,7 +61,8 @@ First read `${CLAUDE_SKILL_DIR}/../../RULES.md` (this plugin's shared rules) and
   with `device`; follow rule 12 (one paired TV: cast to it, the request is the yes; two or more:
   ask which; naming one is the yes; unpaired TVs don't count; Tuner's window stays where it is,
   `status.casting` to confirm). Say "on the TV" in the confirmation. "Bring it back here" is
-  `control` `play_here`.
+  `control` `play_here`. With `status.play_on` set, the user's Play on switch sends every play to
+  that TV already (rule 2): a plain `play` lands there.
 - **"Pop it out" / mini player**: `control` `popout`.
 - **"Go back to the last channel"**: `control` `previous_channel`.
 

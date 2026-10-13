@@ -83,10 +83,11 @@ and [Artemis I Launch (Press Site)](https://images.nasa.gov/details/Artemis%20I%
   provider's guide). You can add several playlists, each with its own colour and glyph badge.
   A new playlist gets a colour no other playlist uses, and Settings ▸ Playlists offers to fix
   two playlists that share a colour.
-- **Casting:** press `C` in the player to send what you are watching to an Apple TV on your
-  network (AirPlay), live TV, catch-up, films and episodes alike. Tuner fetches the stream
-  itself and serves the TV a plain picture, so your playlists' addresses and logins never leave
-  this computer. See [Casting to a TV](#casting-to-a-tv).
+- **Casting:** send live TV, catch-up, films and episodes to an Apple TV on your network
+  (AirPlay): *Cast to…* on any channel, card, programme or episode (`C` or `Alt+C`), `C` in the
+  player for what you are watching, or set **Play on** to the TV and everything you play goes
+  there. Tuner fetches the stream itself and serves the TV a plain picture, so your playlists'
+  addresses and logins never leave this computer. See [Casting to a TV](#casting-to-a-tv).
 - **Several playlists:** when two or more playlists have movies, series or channels, Movies,
   Series and Live TV get a bar on top: *All playlists* or one playlist, each with its count.
   Pick one with a click, `Alt+P` (a picker; digits jump) or `Ctrl+PgDn` / `Ctrl+PgUp`. Each
@@ -658,6 +659,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Ctrl+Shift+B` | Spoiler guard… (pause, I'll watch it later, guard a topic) |
 | `Ctrl+Shift+T` | Sleep timer… |
 | `Alt+P` | Choose the playlist shown (Movies, Series, Live TV, guide) |
+| `Alt+T` | Play on… (this computer or a TV) |
 | `Ctrl+PgDn` / `Ctrl+PgUp` | Next / previous playlist (Movies, Series, Live TV, guide) |
 
 ### Lists (`List`)
@@ -692,6 +694,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Ctrl+N` | Add to Up next |
 | `Ctrl+Shift+N` | Play next (Up next) |
 | `Ctrl+M` | Watch alongside |
+| `Alt+C` | Cast to a TV… |
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
 | `a–z, 0–9 …` | Type to filter |
 
@@ -727,6 +730,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Ctrl+N` | Add to Up next |
 | `Ctrl+Shift+N` | Play next (Up next) |
 | `Ctrl+M` | Watch alongside |
+| `Alt+C` | Cast to a TV… |
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
 | `a–z, 0–9 …` | Type to filter |
 
@@ -779,6 +783,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Ctrl+N` | Add to Up next |
 | `Ctrl+Shift+N` | Play next (Up next) |
 | `Ctrl+M` | Watch alongside |
+| `Alt+C` | Cast to a TV… |
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
 | `a–z, 0–9 …` | Type to filter |
 
@@ -811,6 +816,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Ctrl+N` | Add to Up next |
 | `Ctrl+Shift+N` | Play next (Up next) |
 | `Ctrl+M` | Watch alongside |
+| `Alt+C` | Cast to a TV… |
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
 | `a–z, 0–9 …` | Type to filter |
 
@@ -828,6 +834,7 @@ The full reference is generated from `src/keymap.rs`:
 | `/` | Search everything |
 | `?` | Keyboard help |
 | `Ctrl+O` | Play from another copy… |
+| `C` / `Alt+C` | Cast to a TV… |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
 | `Ctrl+H` | Hide / unhide |
@@ -866,6 +873,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Ctrl+N` | Add to Up next |
 | `Ctrl+Shift+N` | Play next (Up next) |
 | `Ctrl+M` | Watch alongside |
+| `C` / `Alt+C` | Cast to a TV… |
 | `f` | Collection: favourites lists, groups, all |
 | `0` / `1` / `2` / `3` / `4` / `5` / `6` / `7` / `8` / `9` | Jump to channel number |
 | `Ctrl+F` | Add channel to Favourites |
@@ -1030,6 +1038,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Ctrl+N` | Add to Up next |
 | `Ctrl+Shift+N` | Play next (Up next) |
 | `Ctrl+M` | Watch alongside |
+| `Alt+C` | Cast to a TV… |
 | `Shift+F10` / `Ctrl+Enter` | List these shortcuts |
 
 ### Dialogs & menus (`Modal`)
@@ -1178,10 +1187,35 @@ Only one Tuner runs per profile. A second `tuner …` hands its request to the r
 
 ## Casting to a TV
 
-Press `C` in the player (or use the Cast control in the on-screen controls, or the player menu's
-*Cast to a TV…*) and pick a TV. What you are watching moves to it: live TV, catch-up, films and
-episodes. The window can stay on another workspace, or be closed to the mini player; nothing
-pops out or comes forward. Tuner is the source of the picture, so it has to keep running.
+Three ways, for live TV, catch-up, films and episodes alike:
+
+- **Cast to… on what you pick.** Right-click a channel in Live TV, a tile on Home, a film or
+  series card, an episode, or a programme in the guide, and choose *Cast to Living Room* (or
+  *Cast to…* with several TVs). The keys: `C` in the guide and on a film's or series' page, and
+  `Alt+C` everywhere (in lists and grids a plain `C` types into the filter). With one TV paired
+  it goes straight there and a toast says *Casting BBC One to Living Room*; with several, a
+  small panel asks which. Nothing plays on this computer first, and you stay where you are: the
+  mini player shows the casting card. It plays as Shift+Enter would play it here: a locked
+  channel asks for the PIN, a film with progress asks *Resume* or *Start over*, and a title
+  with copies in several playlists falls back to the next copy. A programme in the guide casts
+  its channel while it is on and its catch-up once it has aired; one that hasn't started offers
+  *Remind me* instead.
+- **Play on.** The status bar's chip **Play on: This computer ▾** (there once a TV is paired),
+  `Alt+T` or Settings ▸ Cast choose where everything plays: this computer or a TV. With a TV chosen, Enter or a
+  click on a channel, a film, an episode, the guide's Watch, a Home tile, Up next, a reminder
+  that switches channel and what an agent plays all go to the TV, and the player shows the
+  casting card. What is playing here moves to the TV when you choose it, and *This computer*
+  brings a cast back. The Live TV preview never casts: it stays off while Play on is a TV.
+  The choice lasts until Tuner closes; *Remember Play on across restarts* (Settings ▸ Cast, off)
+  keeps it, which isn't the default so that a TV that's off at the next start never swallows
+  what you play. A TV that doesn't answer shows the usual error card with *Play here*, and the
+  switch stays where you put it.
+- **What is playing now.** Press `C` in the player (or use the Cast control in the on-screen
+  controls, or the player menu's *Cast to a TV…*) and pick a TV. What you are watching moves to
+  it.
+
+The window can stay on another workspace, or be closed to the mini player; nothing pops out or
+comes forward. Tuner is the source of the picture, so it has to keep running.
 
 **What it casts to.** An Apple TV 4K (tvOS 26 and 27) over AirPlay, and third-party TVs with
 AirPlay video (Hisense, Samsung, LG), listed beside it and set up the same way. Macs, Chromecast
@@ -1221,8 +1255,13 @@ and the picture format in one go.
 ### While it casts
 
 The player shows a casting card: the channel, what is on, *Playing on Living Room*, and
-*Stop casting* and *Play here* (back to this computer, carrying on from where the TV was). `C`
-then Enter is *Play here*: the picker opens on *This computer*. Pause, resume, seek (films, episodes and catch-up) and zapping work as
+*Stop casting* and *Play here* (back to this computer, carrying on from where the TV was); the
+player menu has both too. `C` then Enter is *Play here*: the picker opens on *This computer*.
+*Stream info* (`I`, the on-screen *Info*) says what the TV is fed: the source's codecs and sound
+layout, whether the picture is copied or converted on this computer (and deinterlaced), how the
+sound and any surround track get there, the segments and their target duration, the TV and its
+model, how far behind live it runs, and whether its position is reported by the TV or
+estimated. Pause, resume, seek (films, episodes and catch-up) and zapping work as
 usual and reach the TV; everything you start while casting plays on the TV, including Up next,
 reminders that switch channel and what an agent plays. Volume is the TV remote's job. Closing
 Tuner asks first, because it would stop the picture. Failures are told in one sentence: in the

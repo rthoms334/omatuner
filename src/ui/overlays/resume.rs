@@ -43,6 +43,15 @@ impl ResumeOverlay {
     }
 
     fn start(&self, ctx: &mut UiCtx<'_>, resume: bool) -> OverlayOutcome {
+        // "Cast to…" a film or an episode (DESIGN §40 §3.1): the answer plays on the TV
+        match self.spec.cast.clone() {
+            Some(dest) => ctx.cast_with(dest, |ctx| self.start_here(ctx, resume)),
+            None => self.start_here(ctx, resume),
+        }
+    }
+
+    /// [`Self::start`] as the answer plays (here, or on the TV inside `cast_with`).
+    fn start_here(&self, ctx: &mut UiCtx<'_>, resume: bool) -> OverlayOutcome {
         if let Some(q) = self.spec.queue {
             let sent = crate::queue::ui::send(ctx, crate::queue::QueueCommand::PlayAtFrom { id: q.id, resume });
             if sent && q.fullscreen {
@@ -185,7 +194,15 @@ mod tests {
     use crate::model::MediaRef;
 
     fn spec(pos: f64) -> ResumeSpec {
-        ResumeSpec { media: MediaRef::Url("x".into()), title: "T".into(), position_s: pos, duration_s: Some(100.0), copy: None, queue: None }
+        ResumeSpec {
+            media: MediaRef::Url("x".into()),
+            title: "T".into(),
+            position_s: pos,
+            duration_s: Some(100.0),
+            copy: None,
+            queue: None,
+            cast: None,
+        }
     }
 
     use crate::ui::NavRequest;

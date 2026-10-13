@@ -216,6 +216,7 @@ pub fn play_row(ctx: &mut UiCtx<'_>, s: &QueueSnapshot, id: QueueId, fullscreen:
                 duration_s: at.duration_s,
                 copy: None,
                 queue: Some(crate::ui::overlays::QueueResume { id, fullscreen }),
+                cast: None,
             }));
             return RowPlay::Prompt;
         }

@@ -9,7 +9,9 @@
 //!   cursor to the channel that was zapped to.
 //! * Preview autoplay (`live_preview_autoplay`, OFF by default): only after the KEYBOARD cursor
 //!   rested `preview_delay_ms` (1200), only if nothing plays or the current stream was itself
-//!   started by autoplay (`snapshot.origin == LivePreview`); never from hover.
+//!   started by autoplay (`snapshot.origin == LivePreview`); never from hover, never while
+//!   casting or while Play on is a TV (DESIGN §40 §11.4, §3.9: the cursor never retunes a TV).
+//!   Enter and Shift+Enter follow Play on: on a TV the preview shows the casting card.
 //! * Hover moves the cursor only after real pointer motion (Omarchy `pointerGate`).
 //! * Layouts: Wide 3 panes; Medium = channels + preview on the right, groups in a drawer
 //!   (← / Backspace or the breadcrumb; ← also while the channels filter, keeping the filter);
@@ -2209,8 +2211,10 @@ impl LiveScreen {
         self.rest = None;
         let snap = ctx.player;
         // never replaces something the user started (only idle or its own autoplay)
-        // never while casting: moving the cursor must not retune the TV (DESIGN §40 §11.4)
-        let allowed = snap.cast.is_none() && (snap.state == PlayerState::Idle || snap.origin == Some(PlayOrigin::LivePreview));
+        // never while casting: moving the cursor must not retune the TV (DESIGN §40 §11.4); nor
+        // while Play on is a TV (§3.9): what plays is the TV's business, not the preview's
+        let allowed =
+            snap.cast.is_none() && snap.play_on.is_none() && (snap.state == PlayerState::Idle || snap.origin == Some(PlayOrigin::LivePreview));
         let Some(c) = ctx.lib.live.get(ch) else { return };
         if !allowed || playing_channel(snap) == Some(ch) || c.unsupported || (c.locked && !ctx.parental.is_unlocked(&ctx.config.parental)) {
             return;

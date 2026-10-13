@@ -1816,6 +1816,42 @@ mod casting {
         drop(ends);
     }
 
+    /// Tuner's Play on switch on Living Room (DESIGN §40 §3.9): `status.play_on` names the TV,
+    /// and a `play` without `device` goes there — answered as a cast (`opened_in: device`, the
+    /// TV named), the window left where it is. Back on this computer, plays are as before.
+    #[test]
+    fn plays_follow_the_play_on_switch() {
+        let (mut w, tvs) = cast_world(Config::default());
+        w.publish(Visibility::NO_EXPLICIT);
+        let a = w.ui.services().tiles.handle(tuner::model::TileId::A);
+        a.send(tuner::player::PlayerCommand::SetPlayOn(Some(tvs.living.id)));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while a.snapshot().play_on.is_none() {
+            assert!(Instant::now() < deadline, "the switch never reached picture A");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let status = w.ok("status", json!({}));
+        assert_eq!(status["play_on"], json!({ "ref": device_ref(&tvs.living), "device": "Living Room" }), "{status}");
+
+        let out = w.ok("play", json!({ "ref": "channel:1:m3u:bbc1" }));
+        assert_eq!((out["opened_in"].as_str(), out["device"].as_str()), (Some("device"), Some("Living Room")), "{out}");
+        assert!(out["message"].as_str().unwrap().ends_with("It's on Living Room."), "{out}");
+        match &w.commands()[..] {
+            [AgentCommand::Play(p)] => assert_eq!((p.device, p.show), (None, AgentShow::IN_PLACE), "the controller casts it; nothing moves"),
+            other => panic!("{other:?}"),
+        }
+        assert_no_address(&status);
+
+        a.send(tuner::player::PlayerCommand::SetPlayOn(None));
+        while a.snapshot().play_on.is_some() {
+            assert!(Instant::now() < deadline, "the switch never came back");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(w.ok("status", json!({})).get("play_on").is_none());
+        let out = w.ok("play", json!({ "ref": "channel:1:m3u:bbc1" }));
+        assert!(out.get("device").is_none() && out["opened_in"] != "device", "{out}");
+    }
+
     /// What stops a cast is typed, never device text: no such TV, a Mac, two pictures on, the
     /// firewall known to block the port for this TV. An unknown firewall, or one not looked at
     /// toward this TV's own address (another TV, the mDNS group, no network), blocks nothing

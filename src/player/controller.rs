@@ -165,6 +165,7 @@ pub fn spawn(
         output: Output::Local,
         lease_generation: None,
         local_view: None,
+        undelivered: None,
     };
     let name = if tile == TileId::A { "player".to_owned() } else { format!("player-{}", tile.letter().to_ascii_lowercase()) };
     std::thread::Builder::new().name(name).spawn(move || c.run(cmd_rx, evt_rx))
@@ -285,6 +286,9 @@ struct Controller {
     lease_generation: Option<u64>,
     /// The user's mpv-only snapshot fields while casting ([`LocalView`]).
     local_view: Option<LocalView>,
+    /// A play whose cast couldn't even start (its session didn't open: casting off, the TV no
+    /// longer paired): the failure's Play here plays it here. Any other play forgets it.
+    undelivered: Option<CopyPlay>,
 }
 
 /// The state last logged (see [`Controller::log_transition`]).
@@ -887,6 +891,9 @@ impl Controller {
     }
 
     fn command(&mut self, cmd: PlayerCommand) -> bool {
+        if retargets(&cmd) && !matches!(cmd, PlayerCommand::StopCasting { .. }) {
+            self.undelivered = None;
+        }
         if self.casting()
             && let Some(changed) = self.remote_command(&cmd)
         {
@@ -896,11 +903,17 @@ impl Controller {
         match cmd {
             PlayerCommand::Play(req) => {
                 self.snap.zap_anchor = None;
-                return self.resolve_and_play(req);
+                return match self.play_on_tv(&req) {
+                    Some(device) => self.cast_to(device, Some(req.into())),
+                    None => self.resolve_and_play(req),
+                };
             }
             PlayerCommand::PlayCopy(c) => {
                 self.snap.zap_anchor = None;
-                return self.play_copy(c);
+                return match self.play_on_tv(&c.req) {
+                    Some(device) => self.cast_to(device, Some(c)),
+                    None => self.play_copy(c),
+                };
             }
             PlayerCommand::Stop => return self.feed(Input::Stop, Instant::now()),
             PlayerCommand::TogglePause => {
@@ -1015,8 +1028,17 @@ impl Controller {
                     self.snap.video_suspended = false;
                 }
             }
-            PlayerCommand::CastTo { device, play } => return self.cast_to(device, play),
+            PlayerCommand::CastTo { device, play } => return self.cast_to(device, play.map(CopyPlay::from)),
+            PlayerCommand::CastCopy { device, copy } => return self.cast_to(device, Some(copy)),
             PlayerCommand::StopCasting { play_here } => return self.stop_casting(play_here),
+            PlayerCommand::SetPlayOn(device) => {
+                self.snap.play_on = device.filter(|_| self.tile == TileId::A);
+                tracing::info!(
+                    "{}: plays go to {}",
+                    self.log,
+                    self.snap.play_on.map_or_else(|| "this computer".to_owned(), |d| format!("cast device {}", d.short()))
+                );
+            }
             PlayerCommand::Shutdown => {}
         }
         self.dirty = true;
@@ -1026,6 +1048,15 @@ impl Controller {
     /// The picture plays on a TV.
     fn casting(&self) -> bool {
         matches!(self.output, Output::Remote(_))
+    }
+
+    /// The Play on switch's TV for a play that would start here (DESIGN §40 §3.9): picture A,
+    /// playing here (on a TV already, the play lands there through the remote output), not the
+    /// Live preview's (moving the cursor never retunes a TV, §11.4) and not with two pictures
+    /// (multi-view is this computer's; `cast_to` would refuse it).
+    fn play_on_tv(&self, req: &PlayRequest) -> Option<DeviceId> {
+        let here = self.tile == TileId::A && !self.casting() && !self.budget.others_active(self.tile);
+        self.snap.play_on.filter(|_| here && req.origin != PlayOrigin::LivePreview)
     }
 
     /// mpv shows the current target (what `CastTo` reads the hints from).
@@ -1064,7 +1095,7 @@ impl Controller {
     /// waits for its END_FILE, so the relay's upstream becomes A's only lease), and play `play`
     /// or what played, at its position. Another TV's session (or a lost one) ends first: one
     /// relay at a time.
-    fn cast_to(&mut self, device: DeviceId, play: Option<PlayRequest>) -> bool {
+    fn cast_to(&mut self, device: DeviceId, play: Option<CopyPlay>) -> bool {
         if self.tile != TileId::A || self.budget.others_active(self.tile) {
             tracing::info!("{}: not casting: multi-view is on", self.log);
             return false;
@@ -1074,9 +1105,9 @@ impl Controller {
             && r.device == device
         {
             return match play {
-                Some(req) => {
+                Some(c) => {
                     self.snap.zap_anchor = None;
-                    self.resolve_and_play(req)
+                    self.play_copy(c)
                 }
                 None if !self.busy() => self.replay(),
                 None => false,
@@ -1106,6 +1137,8 @@ impl Controller {
             Ok(out) => out,
             Err(err) => {
                 tracing::info!("{}: casting to device {} didn't start ({:?})", self.log, device.short(), err.kind);
+                // what was to play there plays here on the alert's Play here (`stop_casting`)
+                self.undelivered = play;
                 self.emit(PlayerEvent::Failed(err));
                 return changed;
             }
@@ -1113,9 +1146,9 @@ impl Controller {
         self.stop_local();
         self.enter_remote(device, out, hints);
         match (play, moving) {
-            (Some(req), _) => {
+            (Some(c), _) => {
                 self.snap.zap_anchor = None;
-                self.resolve_and_play(req)
+                self.play_copy(c)
             }
             (None, Some(target)) => self.feed(Input::Play { target, immediate: true }, Instant::now()),
             (None, None) => changed,
@@ -1136,6 +1169,10 @@ impl Controller {
     /// last item here when nothing plays (the alert after the TV stopped it).
     fn stop_casting(&mut self, play_here: bool) -> bool {
         let was = self.leave_remote(false, if play_here { "Play here" } else { "Stop casting" }).is_some();
+        // a play the TV never got (its session couldn't even open): Play here plays it here
+        if let Some(c) = self.undelivered.take().filter(|_| play_here && !was && !self.busy()) {
+            return self.play_copy(c);
+        }
         if !was && (!play_here || self.busy()) {
             return false;
         }
@@ -1974,6 +2011,7 @@ fn retargets(cmd: &PlayerCommand) -> bool {
             | PlayerCommand::JumpToLive
             | PlayerCommand::Stop
             | PlayerCommand::CastTo { .. }
+            | PlayerCommand::CastCopy { .. }
             | PlayerCommand::StopCasting { .. }
     )
 }

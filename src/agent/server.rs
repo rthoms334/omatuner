@@ -327,7 +327,14 @@ impl Inner {
     pub(super) fn status_more(&self) -> act::StatusMore {
         let tiles = self.shared.tiles();
         let b = self.shared.tile_player(crate::model::TileId::B).map(|rx| rx.borrow().clone());
-        act::StatusMore { queue: self.shared.queue(), tiles, tile_b: b, sleep: self.shared.sleep().and_then(|h| h.status()), casting: None }
+        act::StatusMore {
+            queue: self.shared.queue(),
+            tiles,
+            tile_b: b,
+            sleep: self.shared.sleep().and_then(|h| h.status()),
+            casting: None,
+            play_on: None,
+        }
     }
 
     /// What the cast service remembers of the last cast, for `status.casting` (DESIGN §40 §12).
@@ -382,10 +389,22 @@ impl Inner {
         }
     }
 
+    /// The TV a play without `device` lands on (DESIGN §40 §3.8, §3.9): the one picture A casts
+    /// to, else the Play on switch's (single view), with its name.
+    pub(super) fn lands_on(&self, snap: &crate::player::PlayerSnapshot) -> Option<(crate::model::DeviceId, String)> {
+        if let Some(v) = &snap.cast {
+            return Some((v.device, v.name.clone()));
+        }
+        let id = snap.play_on.filter(|_| !self.window().multiview)?;
+        let name = self.shared.cast().devices().into_iter().find(|d| d.id == id).map_or_else(|| "your TV".to_owned(), |d| d.name);
+        Some((id, name))
+    }
+
     async fn status(self: &Arc<Self>) -> Out<serde_json::Value> {
         let snap = self.player.snapshot();
         let mut more = self.status_more();
         more.casting = act::casting_out(&snap, &self.cast_last());
+        more.play_on = act::play_on_out(&snap, &self.shared.cast().devices());
         let v = self.run(false, move |q| act::status_with(q, &snap, &more)).await?;
         to_value(&v)
     }
@@ -510,8 +529,10 @@ impl Inner {
             }
             act::for_device(&mut command, &mut out, device);
         }
-        // without `device` while casting, the play lands on that TV too
-        let casting = if target.is_none() { self.player.snapshot().cast.clone() } else { None };
+        // without `device` while casting, the play lands on that TV too; and with Tuner's Play on
+        // switch on a TV (DESIGN §40 §3.9), on the switch's TV (single view: two pictures are
+        // this computer's)
+        let casting = if target.is_none() { self.lands_on(&self.player.snapshot()) } else { None };
         // a cast never places the window (DESIGN §40 §3.8): only the PIN prompt raises it
         let (show, w) = match (target.is_some() || casting.is_some(), pin) {
             (true, false) => (act::AgentShow::IN_PLACE, self.window()),
@@ -524,9 +545,9 @@ impl Inner {
         self.bus.send(AppEvent::Agent(command));
         let opened = Self::raise_for(show, w);
         out.opened_in.get_or_insert(opened);
-        if let Some(view) = &casting {
-            act::on_the_tv(&mut out, &view.name);
-            tracing::info!("agent: play {log_ref} → {:?} on cast device {}", out.outcome, view.device.short());
+        if let Some((device, name)) = &casting {
+            act::on_the_tv(&mut out, name);
+            tracing::info!("agent: play {log_ref} → {:?} on cast device {}", out.outcome, device.short());
             return to_value(&out);
         }
         if let Some((device, _)) = &target {

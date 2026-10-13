@@ -35,6 +35,10 @@ line.
   pop-out" / "in Tuner's window"). A `note` saying to restart Tuner: pass it on.
 - `status.casting`: the picture is on a TV. A `play` without `device` lands on that TV too, so
   say "this replaces <what plays> on <the TV>".
+- `status.play_on`: the user set Tuner's "Play on" switch to that TV, so every play goes there,
+  a `play` without `device` too (`opened_in: "device"`, the window stays where it is): say "on
+  <the TV>". Only the user changes the switch, in Tuner (the status bar's "Play on" chip, Alt+T,
+  Settings ▸ Cast); to play one thing on this computer anyway, ask them to switch it there.
 - `status.multiview`: two pictures are on. `play` replaces the silent picture and gives it the
   sound. `control` without a `tile` pauses, resumes or stops both pictures, sets volume and mute
   on the picture with the sound, and goes back a channel on the focused one; name a `tile` to act
@@ -135,7 +139,8 @@ tools start it (except `status` and `control`).
   which if several are listed). If you are not sure they mean casting, ask. Then `play` with
   `device` (the TV's `ref`, or its exact name).
 - Tuner's window stays where it is while it casts: nothing pops out or comes forward, whatever
-  `open_in` says. `opened_in: "device"`. The picture arrives after a few seconds; `casting_started`
+  `open_in` says. `opened_in: "device"`. The same holds for any play while `status.play_on`
+  names a TV (§2): it casts there. The picture arrives after a few seconds; `casting_started`
   is not "playing". Check `status.casting` once, after about 20 seconds, and report its `phase`.
   Its `error` is a typed reason: use the table in the `fix` skill.
 - `pairing_required`: the user pairs the TV in Tuner (Settings ▸ Cast): a code appears on the TV and

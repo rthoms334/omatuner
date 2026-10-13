@@ -2357,10 +2357,15 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 
 Casting (§40) adds `C` (*Cast to a TV…*, `Action::CastMenu`, in the player's common table) and
 `Action::StopCasting` (no key: the menu, the card and the chip; the picker's *This computer* is
-Play here) and `Action::PlayHere` (no key: the alert after the TV stopped a cast). All are gated
+Play here) and `Action::PlayHere` (no key: the alert after the TV stopped a cast). *Cast to…* on
+the focused item (`Action::CastItem`, cast design §3.1) is `C` in the guide and on detail pages,
+which don't filter, and Alt+C in `ITEM_ACTIONS` (lists, grids, Home, detail pages), Search and
+the guide: lists and grids filter on every printable key, so a plain `C` there would steal a
+filter's capital C. Alt+T (`Action::PlayOnMenu`, global) opens the Play on chooser (§3.9).
+`Action::CastUnlocked` is the PIN prompt's answer for a cast item, never bound. All are gated
 by `keymap::feature_on` on `cast::ENABLED`, so the generated rows list them once casting is
-switched on. The picker and the PIN overlay reuse `Modal` / `List`; there is no new context and no
-global chord (Ctrl+Shift+C is the terminal's copy).
+switched on. The pickers and the PIN overlay reuse `Modal` / `List`; there is no new context and
+no Ctrl+Shift+C (the terminal's copy).
 
 #### Everywhere (`Global`)
 
@@ -2388,6 +2393,7 @@ global chord (Ctrl+Shift+C is the terminal's copy).
 | `Ctrl+Shift+B` | Spoiler guard… (pause, I'll watch it later, guard a topic) |
 | `Ctrl+Shift+T` | Sleep timer… |
 | `Alt+P` | Choose the playlist shown (Movies, Series, Live TV, guide) |
+| `Alt+T` | Play on… (this computer or a TV) |
 | `Ctrl+PgDn` / `Ctrl+PgUp` | Next / previous playlist (Movies, Series, Live TV, guide) |
 
 #### Lists (`List`)
@@ -2422,6 +2428,7 @@ global chord (Ctrl+Shift+C is the terminal's copy).
 | `Ctrl+N` | Add to Up next |
 | `Ctrl+Shift+N` | Play next (Up next) |
 | `Ctrl+M` | Watch alongside |
+| `Alt+C` | Cast to a TV… |
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
 | `a–z, 0–9 …` | Type to filter |
 
@@ -2457,6 +2464,7 @@ global chord (Ctrl+Shift+C is the terminal's copy).
 | `Ctrl+N` | Add to Up next |
 | `Ctrl+Shift+N` | Play next (Up next) |
 | `Ctrl+M` | Watch alongside |
+| `Alt+C` | Cast to a TV… |
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
 | `a–z, 0–9 …` | Type to filter |
 
@@ -2509,6 +2517,7 @@ global chord (Ctrl+Shift+C is the terminal's copy).
 | `Ctrl+N` | Add to Up next |
 | `Ctrl+Shift+N` | Play next (Up next) |
 | `Ctrl+M` | Watch alongside |
+| `Alt+C` | Cast to a TV… |
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
 | `a–z, 0–9 …` | Type to filter |
 
@@ -2541,6 +2550,7 @@ global chord (Ctrl+Shift+C is the terminal's copy).
 | `Ctrl+N` | Add to Up next |
 | `Ctrl+Shift+N` | Play next (Up next) |
 | `Ctrl+M` | Watch alongside |
+| `Alt+C` | Cast to a TV… |
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
 | `a–z, 0–9 …` | Type to filter |
 
@@ -2558,6 +2568,7 @@ global chord (Ctrl+Shift+C is the terminal's copy).
 | `/` | Search everything |
 | `?` | Keyboard help |
 | `Ctrl+O` | Play from another copy… |
+| `C` / `Alt+C` | Cast to a TV… |
 | `Ctrl+F` | Add to / remove from Favourites |
 | `Ctrl+Shift+F` | Favourites lists… (add, new list) |
 | `Ctrl+H` | Hide / unhide |
@@ -2596,6 +2607,7 @@ global chord (Ctrl+Shift+C is the terminal's copy).
 | `Ctrl+N` | Add to Up next |
 | `Ctrl+Shift+N` | Play next (Up next) |
 | `Ctrl+M` | Watch alongside |
+| `C` / `Alt+C` | Cast to a TV… |
 | `f` | Collection: favourites lists, groups, all |
 | `0` / `1` / `2` / `3` / `4` / `5` / `6` / `7` / `8` / `9` | Jump to channel number |
 | `Ctrl+F` | Add channel to Favourites |
@@ -2760,6 +2772,7 @@ global chord (Ctrl+Shift+C is the terminal's copy).
 | `Ctrl+N` | Add to Up next |
 | `Ctrl+Shift+N` | Play next (Up next) |
 | `Ctrl+M` | Watch alongside |
+| `Alt+C` | Cast to a TV… |
 | `Shift+F10` / `Ctrl+Enter` | List these shortcuts |
 
 #### Dialogs & menus (`Modal`)
@@ -6409,7 +6422,8 @@ decision records). **Section numbers written as "DESIGN §40 §x.y" in the code 
 checks on a real TV: `docs/MANUAL_CHECKLIST.md` §30.
 
 ### 40.1 What it is
-Press `C` in the player and pick a TV: picture A's controller sends what plays to the TV
+Press `C` in the player and pick a TV, choose *Cast to…* on any channel, card, programme or
+episode, or set *Play on* to a TV (§40.3): picture A's controller sends what plays to the TV
 instead of mpv. Tuner is the relay: it pulls the stream from the provider (one upstream
 connection, as the local player would), repackages it with `ffmpeg` into HLS and serves that to
 the TV over the LAN; the TV never sees a provider address or login. Phase 1 casts to an Apple TV
@@ -6475,13 +6489,43 @@ user's `[cast] enabled`.
   once and never logged), the casting card (phase line, *Stop casting*, *Play here*, error
   actions), the first-run discovery card and three-step wizard (pair, network, Test on TV),
   Settings ▸ Cast, a compact-layout status chip, and `cast_offer::error_sentence` as the one
-  place the §3.4 failure sentences are written.
+  place the §3.4 failure sentences are written. `ui/casting.rs` is casting from where things
+  are chosen: *Cast to…* on items (through `ui::item_menu`, `UiCtx::cast_with`) and the Play on
+  switch's chooser and status chip; the picker has three purposes (what plays, an item, Play
+  on).
 * **Agents** (§30, `agent/`): `cast_devices`, `play {device}`, `control stop_casting` /
   `play_here`, `status.casting`, `diagnose.cast`, the `RULES.md` section 12 and the `fix`,
   `watch`, `kids` notes. "Put it on the TV" counts only paired TVs: one is cast to without asking
   (the request is the yes), two or more are asked which (§30.5).
 
 ### 40.3 Behaviour worth knowing
+* **Cast to… on what you pick** (cast design §3.1; 0.3.0 field feedback: casting needed playing
+  locally first). The item menu of a Live TV row, a Home tile, a card, a title's page, an episode
+  and a guide programme has *Cast to Living Room* (one TV ready) or *Cast to…* (the picker for
+  that item), and `C` / Alt+C does the same on the focused one. The item plays exactly as
+  Shift+Enter plays it here — PIN, copy and fallback, Resume / Start over — with its commands
+  turned into `CastTo` / `CastCopy` (`UiCtx::cast_with`); nothing plays here first, the screen
+  stays, a toast says "Casting BBC One to Living Room". A programme casts its channel while it
+  airs, its catch-up once aired; an upcoming one isn't offered.
+* **Play on** (cast design §3.9). A switch picture A's controller holds
+  (`PlayerCommand::SetPlayOn`, `PlayerSnapshot::play_on`): while it names a TV, a `Play` /
+  `PlayCopy` that would start here is cast there instead, whoever sent it (the screens, Up
+  next, reminders, `--play`, an agent's `play` without `device`, answered `opened_in: device`
+  with `status.play_on`), except the Live preview's (and the preview autoplay is off) and in
+  multi-view. Chosen from the status chip *Play on: … ▾*, Alt+T or Settings ▸ Cast; a choice
+  moves what plays (a speaker picker). Only the user changes it: failures, Stop casting and Play
+  here leave it. `cast.play_on` keeps the last choice; it comes back at start only with
+  *Remember Play on across restarts* (off). Reminder switches and agent plays on it leave the
+  window in place, as casts do (§3.8).
+* **`CastCopy`**: a title's copy cast with its fallback and start point (the UI's *Cast to…* of
+  a film or an episode, and an agent's `play {device}` of one, which lost both in 0.3.0).
+* **Stream info while casting** (cast design §11.3): the relay reports what the TV is fed at
+  every launch, probed or not (the probe is skipped whenever the hints suffice, which left the
+  0.3.0 panel on "Reading stream info…"): `StreamInfo::cast` (`CastFeed`). The panel shows the TV
+  and its model, the source's codecs, size, rate, scan and sound layout, each stream's way to the
+  TV (copied, converted, deinterlaced; AAC stereo; surround copied or AC-3 5.1), the segments and
+  their pinned target, behind-live, and whether positions are the TV's `playbackInfo` or the
+  estimate (`CastApi::position_source`).
 * **Where alerts go** (cast design §3.8). Casting never moves the window: an agent's cast, a
   reminder's switch while casting and a play from anywhere leave the workspace alone (a locked
   item still raises Tuner for the PIN). A cast that starts while the pop-out is up pops it back
@@ -6503,8 +6547,10 @@ user's `[cast] enabled`.
   opens the firewall card, where it is pressed again; the *Pairing refused* sentence merges the
   470 hint and the "Everyone in your Home" hint; separate HLS audio tracks are not followed (such
   a provider plays without sound); moving the cast to another TV that then fails to open leaves
-  the player Idle; an agent cast of a title with several copies loses `start_at` and the
-  fallback copy; `cast_devices` is listed even while casting is switched off.
+  the player Idle; `cast_devices` is listed even while casting is switched off. The C key in
+  lists and grids is Alt+C (a plain `C` types into the filter there). The position source is
+  one process-wide slot (one cast session at a time). While the Compact cast chip shows, the
+  Play on chip doesn't (Alt+T still opens the chooser).
 
 ### 40.4 Tests (cast design §14)
 Pure: TLV8/SRP/HAP vectors from pyatv 0.18.0 itself (`tests/fixtures/cast/vectors/`), the plan
@@ -6513,7 +6559,15 @@ validation, the remote-event adapter. Scenario: `tests/cast_airplay.rs` against 
 receiver (`tests/support/fake_airplay.rs`, tvOS 26 and 27 modes), `tests/cast_relay.rs` over
 loopback, `tests/cast_service.rs` (fake receiver and relay), `tests/cast_firewall.rs` (a fake
 `pkexec`), the controller's casting section in `tests/player_mpv.rs`, the agent's in
-`tests/agent_app.rs`, and kittest screens in the modules. Two `#[ignore]`d tests interoperate with
+`tests/agent_app.rs`, and kittest screens in the modules. Cast to… and Play on: the controller's
+diversion (every play but the Live preview's, Play here keeping the switch), `CastCopy`'s fallback
+and start point and the never-opened session's Play here (`tests/player_mpv.rs`); Alt+C on a
+Live TV row going straight to the one TV, the chip and the chooser sending Shift+Enter to the
+TV, and the switch restored only when remembered (app rig); the picker's item and Play on
+modes, `cast_with` (the screen stays, the Resume prompt carries the TV), the keys (`C` never
+taken from a filter); `status.play_on` and a `play` without `device` on the switch's TV
+(`tests/agent_app.rs`); the feed's mapping per rung of the ladder (`relay/plan.rs`) and the
+info panel while casting (`banner.rs`). Two `#[ignore]`d tests interoperate with
 a real pyatv (`TUNER_CAST_PYATV`) and the LAN (`TUNER_CAST_LIVE`). Not covered: the fMP4 keyframe
 check end to end, the 8 GiB film cap, `CpuTooSlow`, and pkexec, polkit and ufw on a real system
 (manual checklist §30 item 15).

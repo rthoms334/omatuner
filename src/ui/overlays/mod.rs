@@ -111,6 +111,8 @@ pub struct ResumeSpec {
     /// An Up next row (Enter in the list): the answer goes to the engine, which plays it as
     /// Up next's.
     pub queue: Option<QueueResume>,
+    /// "Cast to…" (DESIGN §40 §3.1): the answer plays on this TV (`UiCtx::cast_with`).
+    pub cast: Option<crate::ui::casting::CastDest>,
 }
 
 /// The Resume prompt over an Up next row (up-next-design §3 "Resume"): "Resume from" and
@@ -196,5 +198,9 @@ pub fn build(req: OverlayRequest, ctx: &mut UiCtx<'_>) -> Box<dyn Overlay> {
         OverlayRequest::CastPair { device, then_cast } => Box::new(cast_pair::CastPair::new(device, then_cast)),
         OverlayRequest::CastFirewall => Box::new(cast_firewall::CastFirewall::new()),
         OverlayRequest::CastOffer(offer) => Box::new(cast_offer::CastOffer::new(offer)),
+        // casting from where things are chosen (DESIGN §40 §3.1, §3.9; `ui::casting`)
+        OverlayRequest::CastItem(item) => Box::new(cast_picker::CastPicker::for_item(item)),
+        OverlayRequest::PlayOn => Box::new(cast_picker::CastPicker::play_on()),
+        OverlayRequest::CastPairThen { device, then } => Box::new(cast_pair::CastPair::then(device, then)),
     }
 }

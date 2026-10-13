@@ -98,6 +98,13 @@ pub struct CopyPlay {
     pub start_at: Option<f64>,
 }
 
+impl From<PlayRequest> for CopyPlay {
+    /// A title with no other copy: `req` alone.
+    fn from(req: PlayRequest) -> Self {
+        Self { req, fallback: None, elsewhere: None, start_at: None }
+    }
+}
+
 impl CopyPlay {
     /// The copy to fall back to after a failure of `kind` before the first frame.
     pub fn fallback_for(fallback: Option<MediaRef>, elsewhere: Option<MediaRef>, kind: PlayerErrorKind) -> Option<MediaRef> {
@@ -197,6 +204,19 @@ pub enum PlayerCommand {
         device: crate::model::DeviceId,
         play: Option<PlayRequest>,
     },
+    /// [`PlayerCommand::CastTo`] of a title's copy: "Cast to…" on a film or an episode (DESIGN
+    /// §40 §3.1) and an agent's `play {device}` of one (§12). It plays on that TV as
+    /// `PlayCopy` plays here: with its fallback copy and its start point.
+    CastCopy {
+        device: crate::model::DeviceId,
+        copy: CopyPlay,
+    },
+    /// The Play on switch (DESIGN §40 §3.9): while it names a TV, picture A's `Play` and
+    /// `PlayCopy` go there (`CastTo`) instead of playing here — not the Live preview's (moving
+    /// the cursor never casts), not in multi-view (two pictures are this computer's), and on a
+    /// TV already they land on that TV anyway. `None` = this computer. Changing it moves nothing
+    /// (the chooser sends the move itself). Picture A only.
+    SetPlayOn(Option<crate::model::DeviceId>),
     /// End casting: the TV stops, the output goes back to local, then `play_here` resumes here
     /// (VOD and catch-up at the TV's position, live at the live point), else Idle.
     StopCasting {
@@ -349,6 +369,9 @@ pub struct PlayerSnapshot {
     /// `video_size`, `cache_secs`, `video_suspended`, `sub_*`, `aspect`, `zoom`) stay at their
     /// defaults.
     pub cast: Option<crate::model::CastView>,
+    /// The Play on switch (DESIGN §40 §3.9, [`PlayerCommand::SetPlayOn`]): the TV picture A's
+    /// plays go to; `None` = this computer (and always for picture B).
+    pub play_on: Option<crate::model::DeviceId>,
 }
 
 impl Default for PlayerSnapshot {
@@ -383,6 +406,7 @@ impl Default for PlayerSnapshot {
             claim: None,
             zap_anchor: None,
             cast: None,
+            play_on: None,
         }
     }
 }

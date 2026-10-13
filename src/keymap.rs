@@ -365,6 +365,17 @@ pub enum Action {
     /// "Play here" on the alert after the TV stopped the cast (§3.4 "Play here · Cast again"):
     /// the last item plays here, from where the TV was. No default key.
     PlayHere,
+    /// "Cast to…" on the focused item (DESIGN §40 §3.1): a channel row, a card, a programme, an
+    /// episode, a title's page. `C` where typing doesn't filter (the guide, detail pages),
+    /// Alt+C everywhere an item is focused (lists and grids filter on letters). One paired TV:
+    /// straight there; else the picker for that item (`ui::casting`).
+    CastItem,
+    /// Alt+T and the status bar's "Play on" chip (DESIGN §40 §3.9): the chooser of where plays
+    /// go — this computer or a TV.
+    PlayOnMenu,
+    /// The PIN prompt's answer for a locked item that "Cast to…" casts (never bound): the app
+    /// casts it once unlocked (`ui::casting::unlocked`).
+    CastUnlocked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -489,6 +500,8 @@ pub static GLOBAL: &[Binding] = &[
     b(C::ctrl_shift(Key::T), A::SleepTimer, "Sleep timer…"),
     // not Ctrl+0 (egui's zoom reset) nor Alt+[ / Alt+] (AltGr chords on German / French keyboards)
     b(C::alt(Key::P), A::PlaylistPicker, "Choose the playlist shown (Movies, Series, Live TV, guide)"),
+    // casting (DESIGN §40 §3.9): where plays go; T for TV (Alt+C casts the focused item)
+    b(C::alt(Key::T), A::PlayOnMenu, "Play on… (this computer or a TV)"),
     b(C::ctrl(Key::PageDown), A::NextPlaylist, "Next / previous playlist (Movies, Series, Live TV, guide)"),
     b(C::ctrl(Key::PageUp), A::PrevPlaylist, "Next / previous playlist (Movies, Series, Live TV, guide)"),
 ];
@@ -513,6 +526,9 @@ pub static ITEM_ACTIONS: &[Binding] = &[
     b(C::ctrl(Key::N), A::QueueAdd, "Add to Up next"),
     b(C::ctrl_shift(Key::N), A::QueuePlayNext, "Play next (Up next)"),
     b(C::ctrl(Key::M), A::WatchAlongside, "Watch alongside"),
+    // casting (DESIGN §40 §3.1): a chord, so it works while a filter is typed (plain `C` would
+    // start or extend the filter here)
+    b(C::alt(Key::C), A::CastItem, "Cast to a TV…"),
     b(C::shift(Key::F10), A::ContextMenu, "Context menu"),
     b(C::ctrl(Key::Enter), A::ContextMenu, "Context menu"),
 ];
@@ -627,6 +643,8 @@ pub static DETAIL: &[Binding] = &[
     b(C::ch('/'), A::OpenSearch, "Search everything"),
     b(C::ch('?'), A::ToggleHelp, "Keyboard help"),
     b(C::ctrl(Key::O), A::PlayFrom, "Play from another copy…"),
+    // no filter on a title's page: `C` as in the player (Alt+C from `ITEM_ACTIONS` too)
+    b(C::ch('C'), A::CastItem, "Cast to a TV…"),
 ];
 
 pub static GUIDE: &[Binding] = &[
@@ -660,6 +678,9 @@ pub static GUIDE: &[Binding] = &[
     b(C::ctrl(Key::N), A::QueueAdd, "Add to Up next"),
     b(C::ctrl_shift(Key::N), A::QueuePlayNext, "Play next (Up next)"),
     b(C::ctrl(Key::M), A::WatchAlongside, "Watch alongside"),
+    // casting (DESIGN §40 §3.1): the channel airing, or a past programme's catch-up
+    b(C::ch('C'), A::CastItem, "Cast to a TV…"),
+    b(C::alt(Key::C), A::CastItem, "Cast to a TV…"),
     b(C::ch('f'), A::GuideCategory, "Collection: favourites lists, groups, all"),
     b(C::ch('0'), A::Digit(0), "Jump to channel number"),
     b(C::ch('1'), A::Digit(1), "Jump to channel number"),
@@ -860,6 +881,7 @@ pub static SEARCH_ITEM_ACTIONS: &[Binding] = &[
     b(C::ctrl(Key::N), A::QueueAdd, "Add to Up next"),
     b(C::ctrl_shift(Key::N), A::QueuePlayNext, "Play next (Up next)"),
     b(C::ctrl(Key::M), A::WatchAlongside, "Watch alongside"),
+    b(C::alt(Key::C), A::CastItem, "Cast to a TV…"),
     b(C::shift(Key::F10), A::ContextMenu, "List these shortcuts"),
     b(C::ctrl(Key::Enter), A::ContextMenu, "List these shortcuts"),
 ];
@@ -1079,7 +1101,7 @@ pub fn feature_on(a: Action) -> bool {
         | A::ClosePicture
         | A::WatchAlongside => crate::ui::multiview::ENABLED,
         A::SleepTimer | A::EndNewsFlash | A::ReminderOptions => crate::reminders::ENABLED,
-        A::CastMenu | A::StopCasting | A::PlayHere => crate::cast::ENABLED,
+        A::CastMenu | A::StopCasting | A::PlayHere | A::CastItem | A::PlayOnMenu | A::CastUnlocked => crate::cast::ENABLED,
         _ => true,
     }
 }
@@ -1416,6 +1438,31 @@ mod tests {
         assert_eq!(resolve(&[K::Help], &key(Key::Escape, false)), Some(Action::Back));
         assert_eq!(resolve(&[K::Help], &key(Key::F1, false)), Some(Action::ToggleHelp));
         assert_eq!(resolve(&[K::Help], &key(Key::Q, true)), Some(Action::Quit), "globals keep working");
+    }
+
+    /// "Cast to…" on an item (DESIGN §40 §3.1): `C` where typing doesn't filter (the guide, a
+    /// title's page; the player's `C` casts what plays), Alt+C everywhere an item is focused —
+    /// a list or a grid filtering or not, search — because there a plain `C` types: it starts
+    /// or extends the filter as before. Alt+T opens the Play on chooser from anywhere, a text
+    /// field included (§3.9).
+    #[test]
+    fn cast_keys_never_take_a_typed_letter() {
+        let c = egui::Event::Text("C".into());
+        let alt = |k| key_ev(k, false, true, false, false);
+        assert_eq!(resolve(&[K::Guide], &c), Some(Action::CastItem));
+        assert_eq!(resolve(&[K::Detail], &c), Some(Action::CastItem));
+        assert_eq!(resolve(&[K::PlayerLive], &c), Some(Action::CastMenu), "the player casts what plays");
+        for stack in [vec![K::List], vec![K::ListFiltering], vec![K::PosterGrid], vec![K::PosterGridFiltering], vec![K::Search]] {
+            assert_eq!(resolve(&stack, &alt(Key::C)), Some(Action::CastItem), "{stack:?}");
+        }
+        assert_eq!(resolve(&[K::Guide], &alt(Key::C)), Some(Action::CastItem));
+        assert_eq!(resolve(&[K::List], &c), Some(Action::FilterInput('C')), "typing still filters");
+        assert_eq!(resolve(&[K::PosterGrid], &c), Some(Action::FilterInput('C')));
+        assert_eq!(resolve(&[K::Search], &c), Some(Action::FilterInput('C')));
+        for stack in [vec![K::List], vec![K::Guide], vec![K::Panel], vec![K::TextInput, K::Panel], vec![K::PlayerVod]] {
+            assert_eq!(resolve(&stack, &alt(Key::T)), Some(Action::PlayOnMenu), "{stack:?}");
+        }
+        assert!(help_rows(K::Guide).iter().any(|(k, h)| *h == "Cast to a TV…" && k == "C / Alt+C"), "{:?}", help_rows(K::Guide));
     }
 
     #[test]
