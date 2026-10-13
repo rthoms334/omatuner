@@ -470,12 +470,23 @@ async fn every_rendition_shares_the_pictures_timeline() {
             files.push(path);
         }
         relay.stop(false).await;
-        let ffmpeg = caps.ffmpeg.clone();
-        let offsets = tokio::task::spawn_blocking(move || avsync::offsets(&ffmpeg, &files)).await.unwrap();
+        let (ffmpeg, ffprobe) = (caps.ffmpeg.clone(), caps.ffprobe.clone());
+        let (offsets, first) =
+            tokio::task::spawn_blocking(move || (avsync::offsets(&ffmpeg, &files), avsync::first_picture(&ffprobe, &files[0]))).await.unwrap();
         let (picture, sounds) = offsets.split_first().unwrap();
         for (i, sound) in sounds.iter().enumerate() {
             let av_ms = (sound - picture) * 1000.0;
             assert!(av_ms.abs() < 40.0, "{case}: rendition {i}'s sound is {av_ms:+.1} ms off the picture ({offsets:?})");
+        }
+        // where the TV's playlist starts in the film is where the session counts from: a copied
+        // resume starts at the keyframe before the point asked (10 s for 13.3 s: 5 s GOPs), and
+        // positions and saved progress must never run ahead of the picture
+        let shown = first - picture;
+        let said = prepared.load.offset_s;
+        assert!((said - shown).abs() < 0.1, "{case}: the session counts from {said:.3} s, the TV's picture starts at {shown:.3} s");
+        assert!(said <= shown + 0.03, "{case}: ahead of the picture ({said:.3} > {shown:.3})");
+        if force.is_none() && start_at.is_some() {
+            assert!((said - 10.0).abs() < 0.05, "{case}: the copy starts at the keyframe: {said:.3}");
         }
     }
 }
@@ -498,6 +509,22 @@ mod avsync {
         let mut out = vec![picture];
         out.extend(sounds.iter().map(|f| offset(&beeps(ffmpeg, f), Some(picture))));
         out
+    }
+
+    /// The picture's first presentation time on the file's timeline (fMP4: from the boxes, as
+    /// the TV reads them; MPEG-TS: the PTS).
+    pub fn first_picture(ffprobe: &Path, file: &Path) -> f64 {
+        let times = if file.extension().is_some_and(|e| e == "mp4") {
+            picture_times(&std::fs::read(file).unwrap())
+        } else {
+            let out = Command::new(ffprobe)
+                .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time", "-read_intervals", "%+#16", "-of", "csv=p=0"])
+                .arg(file)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.trim().trim_end_matches(',').parse().ok()).collect()
+        };
+        times.into_iter().reduce(f64::min).expect("a picture")
     }
 
     /// The median of (onset − its second) over the markers named by their lengths; `near`: the

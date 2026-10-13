@@ -207,7 +207,8 @@ struct Pipeline {
     generation: Arc<AtomicU64>,
     live: bool,
     level: CastLevel,
-    /// Seconds into the item where ffmpeg started (`-ss`).
+    /// Seconds into the item where the output starts: the `-ss`, or for copied video the
+    /// keyframe before it ([`ffmpeg::resumed_at`]).
     offset_s: f64,
     /// The item (the pinned target's key).
     media: Option<MediaRef>,
@@ -268,6 +269,9 @@ struct Launch {
     gop: Option<f64>,
     /// Copied video: the target gets headroom (`playlist::pin`).
     copy: bool,
+    /// The run writes [`ffmpeg::START_FILE`] (copied video resumed): the item starts at its
+    /// keyframe, not at `offset_s`.
+    notes_start: bool,
     /// The item and its pinned target so far.
     media: Option<MediaRef>,
     floor: Option<u32>,
@@ -400,6 +404,7 @@ impl RelaySession {
             let input = ffmpeg::Input::Proxy { url: &loopback, hls: feed.is_hls(), seek_s: offset_s, readrate: !live };
             let out = ffmpeg::Output { dir: &dir, live, hls_time, fps: facts.fps, audio_index: facts.audio_index };
             let argv = ffmpeg::argv(&input, &plan, &out);
+            let notes_start = ffmpeg::notes_start(&input, &plan);
             tracing::info!(
                 "{}: {} {} {}{}{}",
                 self.label,
@@ -440,6 +445,7 @@ impl RelaySession {
                 hls_time,
                 gop,
                 copy: plan.video == Video::Copy,
+                notes_start,
                 media: Some(p.media.clone()),
                 floor,
                 surround,
@@ -660,6 +666,20 @@ impl RelaySession {
                     }
                 }
             }
+            // a copied resume starts at the keyframe before the seek point: positions (and saved
+            // progress) count from there, never from the later point asked for
+            let offset_s = if l.notes_start {
+                let text = tokio::fs::read_to_string(l.dir.join(ffmpeg::START_FILE)).await.ok();
+                let first = ready[0].segments.first().map_or(l.hls_time, |s| s.dur);
+                if text.as_deref().and_then(ffmpeg::first_pts_s).is_none() {
+                    tracing::warn!("{}: where the copy starts is unknown: counting from a segment earlier", self.label);
+                }
+                let at = ffmpeg::resumed_at(l.offset_s, text.as_deref(), first);
+                tracing::debug!("{}: resumed at {at:.3} s (asked {:.3} s)", self.label, l.offset_s);
+                at
+            } else {
+                l.offset_s
+            };
             let ended = phase.compare_exchange(LOADING, READY, Ordering::AcqRel, Ordering::Acquire).is_err();
             if ended {
                 // ffmpeg ended before the TV got anything: a short stream is what it is
@@ -679,7 +699,7 @@ impl RelaySession {
                 generation: l.generation.clone(),
                 live: l.live,
                 level: l.level,
-                offset_s: l.offset_s,
+                offset_s,
                 media: l.media.clone(),
                 as_is: l.as_is,
                 out,
@@ -694,7 +714,7 @@ impl RelaySession {
                 let _ = self.tx.send(RelayEvent::UpstreamEof { generation: l.generation.load(Ordering::Relaxed) });
                 feed.close(false).await;
             }
-            let load = LoadReq { url: Secret::new(url), live: l.live, offset_s: l.offset_s };
+            let load = LoadReq { url: Secret::new(url), live: l.live, offset_s };
             return Ok(Prepared { load, level: l.level, behind_live_s, surround: l.surround.is_some(), as_is: l.as_is });
         }
         Err(Fail::Exited)
@@ -783,6 +803,7 @@ impl RelaySession {
             hls_time,
             gop: Some(2.0),
             copy: false,
+            notes_start: false,
             media: None,
             floor: None,
             surround: None,

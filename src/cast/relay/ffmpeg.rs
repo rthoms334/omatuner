@@ -25,6 +25,13 @@
 //!   (`-copypriorss:a 0`). The renditions then start within one audio frame or the source's
 //!   interleave of each other, and their timestamps say by how much.
 //!
+//! **Where a copied resume starts.** Copied video resumed at X starts at the keyframe K ≤ X, and
+//! the output's timestamps don't say where K was (every muxer shifts its first packet to 0, or
+//! MPEG-TS's 1.4 s). So that the session never puts the TV, and saved progress, ahead of the
+//! picture, such a run has a second output: the first video packet copied to a `framecrc` line
+//! ([`START_FILE`], flushed at once, not a served name), whose time on the input's shifted
+//! timeline is K − X ([`first_pts_s`]); the relay starts the item at K ([`resumed_at`]).
+//!
 //! After the fix every case measured −21 to +10 ms (−21: L3's frame grid at a seek between
 //! frames; +10: converted MPEG-TS, as before), with or without edit lists honoured. `tests/cast_relay.rs`
 //! measures it on every run.
@@ -48,6 +55,11 @@ use super::super::CastErrorKind;
 use super::plan::{Audio, Plan, Segments, Surround, Video};
 use super::renditions;
 use crate::redact::redact;
+
+/// The side output of a resume with copied video: its first picture's `framecrc` line (module
+/// docs, "Where a copied resume starts"). In the pipeline's directory, never served
+/// (`server::served_file`).
+pub const START_FILE: &str = "start.crc";
 
 /// `hls_time` (s): VioletRelay's 4 s segments, which work on its tvOS 26.5 hardware (§8.4).
 pub const SEGMENT_S: f64 = 4.0;
@@ -328,7 +340,45 @@ pub fn argv(input: &Input<'_>, plan: &Plan, out: &Output<'_>) -> Vec<String> {
     let seg = dir.join(format!("s%d.{ext}"));
     let index = dir.join("index.m3u8");
     push(&["-hls_segment_filename", &seg.to_string_lossy(), &index.to_string_lossy()]);
+    if notes_start(input, plan) {
+        // where the keyframe the copy starts at is (module docs, "Where a copied resume starts")
+        let start = out.dir.join(START_FILE);
+        push(&["-map", "0:v:0", "-c:v", "copy", "-frames:v", "1", "-flush_packets", "1", "-f", "framecrc", &start.to_string_lossy()]);
+    }
     a
+}
+
+/// The run writes [`START_FILE`]: copied video resumed after the start.
+pub fn notes_start(input: &Input<'_>, plan: &Plan) -> bool {
+    plan.video == Video::Copy && matches!(input, Input::Proxy { seek_s, .. } if *seek_s > 0.0)
+}
+
+/// The first packet's presentation time in seconds from a `framecrc` text (`#tb 0: 1/1000`, then
+/// `0, dts, pts, duration, size, crc`): on the input's timeline shifted by the seek, ≤ 0 for a
+/// keyframe before it.
+pub fn first_pts_s(text: &str) -> Option<f64> {
+    let tb = text.lines().find_map(|l| l.strip_prefix("#tb 0:"))?;
+    let (num, den) = tb.trim().split_once('/')?;
+    let (num, den): (f64, f64) = (num.trim().parse().ok()?, den.trim().parse().ok()?);
+    let line = text.lines().find(|l| !l.starts_with('#') && !l.trim().is_empty())?;
+    let mut fields = line.split(',').map(str::trim);
+    if fields.next()? != "0" {
+        return None;
+    }
+    let pts: i64 = fields.nth(1)?.parse().ok()?;
+    let s = pts as f64 * num / den;
+    (den > 0.0 && s.is_finite()).then_some(s)
+}
+
+/// Seconds into the item where a resume at `seek_s` with copied video really starts: the seek
+/// plus the first packet's (non-positive) time from [`START_FILE`]'s `text`. Without a readable
+/// line, `first_segment_s` before the seek (a copied segment holds at least the GOP the seek
+/// fell into): early rather than late, since saved progress must never run ahead of the picture.
+pub fn resumed_at(seek_s: f64, text: Option<&str>, first_segment_s: f64) -> f64 {
+    match text.and_then(first_pts_s) {
+        Some(pts) => (seek_s + pts.min(0.0)).max(0.0),
+        None => (seek_s - first_segment_s.max(0.0)).max(0.0),
+    }
 }
 
 fn fmt_secs(s: f64) -> String {
@@ -551,6 +601,8 @@ mod tests {
             "{a}"
         );
         assert!(!a.contains("delete_segments") && !a.contains("-http_multiple") && !a.contains("-copypriorss"));
+        // a copied resume notes where its keyframe is, after the HLS output
+        assert!(a.ends_with("/c/g1/index.m3u8 -map 0:v:0 -c:v copy -frames:v 1 -flush_packets 1 -f framecrc /c/g1/start.crc"), "{a}");
 
         let l3 = plan(crate::model::CastLevel::Converted, Video::Encode { deinterlace: true }, Audio::Aac, Segments::Ts);
         let live = Input::Proxy { url: "http://127.0.0.1:1/u/t", hls: false, seek_s: 0.0, readrate: false };
@@ -568,6 +620,7 @@ mod tests {
         let resume = Input::Proxy { url: "http://127.0.0.1:1/u/t", hls: false, seek_s: 30.0, readrate: true };
         let a = argv(&resume, &l3, &Output { dir, live: false, hls_time: 4.0, fps: Some(25.0), audio_index: None }).join(" ");
         assert!(a.contains("-readrate_initial_burst 60 -ss 30.000 -i ") && a.contains("format=yuv420p -copypriorss:a 0 "), "{a}");
+        assert!(!a.contains("framecrc"), "converted video starts at the seek point: {a}");
 
         let card = argv(
             &Input::TestCard { label: true },
@@ -602,6 +655,30 @@ mod tests {
         p.surround = Some(Surround::Ac3);
         let a = argv(&vod, &p, &Output { dir, live: false, hls_time: 4.0, fps: None, audio_index: None }).join(" ");
         assert!(a.contains("-map 0:a:0? -map 0:a:0? ") && a.contains("-c:a:1 ac3 -ac:a:1 6 -b:a:1 448k"), "{a}");
+    }
+
+    /// A copied resume starts at its keyframe (from the side output's line), never later than
+    /// asked; without the line, a whole first segment earlier.
+    #[test]
+    fn a_copied_resume_starts_at_its_keyframe() {
+        let crc = "#extradata 0:       45, 0x23c80ea0\n#software: Lavf63.1.102\n#tb 0: 1/1000\n#media_type 0: video\n\
+                   #codec_id 0: h264\n#dimensions 0: 320x180\n#sar 0: 1/1\n0,      -2380,      -2300,       40,       65, 0x1ef91f8e\n";
+        assert_eq!(first_pts_s(crc), Some(-2.3));
+        assert!((resumed_at(7.3, Some(crc), 5.0) - 5.0).abs() < 1e-9);
+        assert_eq!(first_pts_s("#tb 0: 1/90000\n0, 0, 900000, 3600, 9, 0x0\n"), Some(10.0));
+        assert_eq!(resumed_at(7.3, Some("#tb 0: 1/90000\n0, 0, 900000, 3600, 9, 0x0\n"), 5.0), 7.3, "never later than asked");
+        for broken in
+            ["", "#tb 0: 1/1000\n", "0, -1, -2, 40, 65, 0x0\n", "#tb 0: 1/1000\n1, -2380, -2300, 40, 65, 0x0\n", "#tb 0: 1/0\n0, 1, 2, 3, 4, 0\n"]
+        {
+            assert_eq!(first_pts_s(broken), None, "{broken:?}");
+        }
+        assert!((resumed_at(30.0, None, 10.1) - 19.9).abs() < 1e-9);
+        assert_eq!(resumed_at(3.0, Some(""), 10.1), 0.0);
+        let input = |seek_s| Input::Proxy { url: "http://127.0.0.1:1/u/t", hls: false, seek_s, readrate: true };
+        let copy = plan(crate::model::CastLevel::Repackaged, Video::Copy, Audio::Copy, Segments::Ts);
+        let l3 = plan(crate::model::CastLevel::Converted, Video::Encode { deinterlace: false }, Audio::Aac, Segments::Ts);
+        assert!(notes_start(&input(7.3), &copy));
+        assert!(!notes_start(&input(0.0), &copy) && !notes_start(&input(7.3), &l3) && !notes_start(&Input::TestCard { label: false }, &copy));
     }
 
     #[test]
