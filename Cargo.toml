@@ -13,6 +13,13 @@ default-run = "tuner"
 name = "tuner"
 path = "src/lib.rs"
 
+# The update helper (DESIGN §41.5): the root program that installs a verified Tuner update,
+# started only through pkexec; installed as /usr/lib/tuner/tuner-update. std, minisign-verify and
+# rustix only (it shares `src/update/verify.rs` through `#[path]`, never the `tuner` library).
+[[bin]]
+name = "tuner-update"
+path = "src/bin/tuner-update.rs"
+
 [[bin]]
 name = "tuner"
 path = "src/main.rs"
@@ -121,6 +128,11 @@ wayland-client = "0.31.15"
 wayland-backend = { version = "0.3.17", features = ["client_system"] }
 wayland-protocols = { version = "0.32.13", features = ["client", "unstable"] }  # zwp_idle_inhibit_manager_v1
 
+# updates (DESIGN §41). Pinned per the two-week rule (newest release at least 14 days old on
+# 2026-10-13); licences in the trailing comments.
+minisign-verify = "=0.3.0"  # MIT; no dependencies (its own Ed25519 + BLAKE2b): the release signatures (0.3.0 is from 2026-09-25)
+rustix = { version = "1.1.5", default-features = false, features = ["std", "fs", "process"] }  # Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT; already built (zbus, wayland): the helper's openat / fstat / geteuid
+
 # cli, errors, logging
 clap = { version = "4.6.7", features = ["derive"] }
 anyhow = "1.0.104"
@@ -135,6 +147,7 @@ insta = "1.49.0"
 criterion = "0.8.2"
 egui_kittest = "=0.36.2"   # headless widget/screen tests (no GPU; accesskit queries)
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "test-util"] }
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }  # ISC AND (Apache-2.0 OR ISC); already built for rustls: Ed25519 for the tests' own release key (DESIGN §41.8)
 
 [profile.dev]
 opt-level = 1               # parsers + software video paths are painfully slow at 0

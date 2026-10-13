@@ -3,8 +3,8 @@
 //! Start order (DESIGN §5.1): paths → config → logging → tokio runtime → store (migrate,
 //! register secrets) → HTTP client → job manager → player (mpv + threads) → [window] →
 //! video surface → integrations (theme watcher, IPC server, MPRIS, reminders, scheduler,
-//! connection limits). The memory maintenance thread (`platform::memory`) starts with the
-//! player and follows its snapshots.
+//! connection limits, the updater's loop, DESIGN §41). The memory maintenance thread
+//! (`platform::memory`) starts with the player and follows its snapshots.
 //!
 //! Multi-view (DESIGN §35, MV-1): `tiles` holds picture A from the start and picture B once
 //! [`Services::start_tile_b`] started it on the blocking pool and the app adopted it
@@ -81,6 +81,9 @@ pub struct Services {
     /// Connecting AI agents to Tuner: detection, status, connect / update / disconnect, the
     /// start-of-version pass (DESIGN §39). Runs nothing off the desktop.
     pub agent_connect: crate::agent::connect::AgentConnect,
+    /// Tuner's own updates: check, download and verify, install through the helper, restart
+    /// when idle (DESIGN §41). Runs nothing off the desktop.
+    pub updater: crate::update::Updater,
     /// Set when [`Services::shutdown`] begins (the signal watcher leaves the exit to it; a
     /// signal after that means it is stuck).
     closing: Arc<AtomicBool>,
@@ -129,6 +132,8 @@ impl Services {
         let tiles = crate::player::tiles::Tiles::single(player);
         agent.set_main_player(tiles.main_watch());
         let agent_connect = crate::agent::connect::AgentConnect::for_services(&paths, store.clone(), bus.clone(), rt.handle().clone());
+        let updater =
+            crate::update::Updater::for_services(&paths, http.clone(), bus.clone(), rt.handle().clone(), config.clone(), agent.clone(), jobs.clone());
         Ok(Self {
             paths,
             config,
@@ -145,6 +150,7 @@ impl Services {
             memory,
             agent,
             agent_connect,
+            updater,
             closing: Arc::default(),
             socket: Arc::default(),
         })
@@ -215,6 +221,11 @@ impl Services {
         }
         // the guard's builder reads the live settings (identity guard: no-op)
         self.agent.guard().configure(cfg.clone());
+        // a restart into an update from a hidden window exits the way a signal does
+        let (registry, writer, socket) = (self.tiles.registry(), self.store.writer().clone(), self.socket.clone());
+        let cleanup =
+            move || -> futures_util::future::BoxFuture<'static, ()> { Box::pin(direct_exit_cleanup(registry.all(), writer.clone(), socket.clone())) };
+        self.updater.start(crate::update::service::RestartHooks { closing: self.closing.clone(), cleanup: Arc::new(cleanup) });
     }
 
     fn start_theme_watch(&mut self, cfg: &Config) {
@@ -325,6 +336,10 @@ impl Services {
         if old.general.debug_log != new.general.debug_log {
             crate::logging::set_debug(new.general.debug_log);
         }
+        // automatic installs turned on: look again now (a 304 costs nothing)
+        if old.updates != new.updates {
+            self.updater.check_now();
+        }
         // the app sends ApplyConfig to the focused picture; the others get it here
         let focused = self.tiles.focus();
         for tile in [TileId::A, TileId::B].into_iter().filter(|t| *t != focused) {
@@ -386,22 +401,7 @@ impl Services {
     /// it): stop the player (its final progress save goes to the writer), flush the writer
     /// queue, remove the IPC socket. mpv and the WAL are left to process exit / the next open.
     pub(crate) fn exit_cleanup(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
-        let (players, writer, socket) = (self.tiles.handles(), self.store.writer().clone(), self.socket.clone());
-        async move {
-            for player in &players {
-                player.send(PlayerCommand::Shutdown);
-            }
-            for player in &players {
-                let mut snap = player.subscribe();
-                let _ = tokio::time::timeout(Duration::from_secs(1), snap.wait_for(|s| s.state == crate::player::PlayerState::Idle)).await;
-            }
-            if tokio::time::timeout(Duration::from_secs(2), writer.run(|_| Ok(()))).await.is_err() {
-                tracing::warn!("database writer busy at exit");
-            }
-            if let Some(s) = socket.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-                s.remove();
-            }
-        }
+        direct_exit_cleanup(self.tiles.handles(), self.store.writer().clone(), self.socket.clone())
     }
 
     /// Orderly shutdown (see module docs). The video surface must already be destroyed.
@@ -411,6 +411,7 @@ impl Services {
         self.closing.store(true, Ordering::SeqCst);
         // agent CLIs still running are killed with what they started
         self.agent_connect.shutdown();
+        self.updater.shutdown();
         if let Some(m) = &mut self.integrations.mpris {
             m.stop();
         }
@@ -429,6 +430,24 @@ impl Services {
         if !self.store.close(Duration::from_secs(3)) {
             tracing::warn!("database writer did not finish within 3 s");
         }
+    }
+}
+
+/// [`Services::exit_cleanup`] for these players (the signal watcher, and the updater's restart
+/// from a hidden window).
+async fn direct_exit_cleanup(players: Vec<crate::player::PlayerHandle>, writer: Writer, socket: Arc<Mutex<Option<crate::ipc::SocketGuard>>>) {
+    for player in &players {
+        player.send(PlayerCommand::Shutdown);
+    }
+    for player in &players {
+        let mut snap = player.subscribe();
+        let _ = tokio::time::timeout(Duration::from_secs(1), snap.wait_for(|s| s.state == crate::player::PlayerState::Idle)).await;
+    }
+    if tokio::time::timeout(Duration::from_secs(2), writer.run(|_| Ok(()))).await.is_err() {
+        tracing::warn!("database writer busy at exit");
+    }
+    if let Some(s) = socket.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        s.remove();
     }
 }
 

@@ -1724,3 +1724,108 @@ Use a profile with a playlist and at least one favourite channel.
 - [ ] **Favourites instead:** Settings ▸ Interface ▸ *Live TV opens on* ▸ Favourites, quit and
   start, Alt+2. **Expect:** the first favourites list with channels opens; the guide shows it
   too. Remove every favourite channel, quit and start again: All channels.
+
+## 30. Updates: a real update from vN to vN+1 (DESIGN §41)
+
+Run on the **default profile** with Tuner started from the launcher, on a machine with omatuner
+vN installed from its release package, once vN+1 is published. `id -u` is your uid below.
+Turn on Settings ▸ About & logs ▸ *Debug logging* first: the log shows each request and the
+helper's outcome.
+
+- [ ] **The release is signed:**
+  - **Do:** open vN+1's release page; download a package and its `.minisig`;
+    `minisign -Vm omatuner-<vN+1>-1-$(uname -m).pkg.tar.zst -p packaging/update-key.pub`.
+  - **Expect:** a `.minisig` beside every `.pkg.tar.zst` and `.tar.gz`; "Signature and comment
+    signature verified". The publish job's log shows the signing step verifying each file.
+- [ ] **Check and download:**
+  - **Do:** start Tuner (vN); wait 30 s; open Settings ▸ About & logs ▸ Updates;
+    `ls -la ~/.cache/tuner/update`. Then *Check now*.
+  - **Expect:** a desktop notification "Tuner vN+1 is ready to install"; the status line
+    "Tuner vN+1 is downloaded and verified: it installs when you're back at Tuner with nothing
+    playing …"; the folder is `drwx------` with the package and its `.minisig`, both
+    `-rw-------`. *Check now* logs a 304 (no second download). No pre-release is ever offered.
+- [ ] **The password dialog waits for its moment:**
+  - **Do:** play a channel full screen for a minute; stop it with Tuner in front.
+  - **Expect:** nothing while it plays. Once stopped, with Tuner focused: the toast "Installing
+    Tuner vN+1: enter your password to go on" and polkit's dialog "Install the Tuner update
+    (signed with Tuner's release key)".
+- [ ] **Cancel, then Install now:**
+  - **Do:** Cancel the dialog. Wait a minute. Then Settings ▸ About & logs ▸ Updates ▸ *Install
+    Tuner vN+1 now*, and enter the password.
+  - **Expect:** after Cancel the toast "Tuner vN+1 isn't installed yet: … Install now" and no
+    new dialog by itself. After the password: the toast "Tuner updated to vN+1 — it restarts when
+    idle" with *Restart now*, a notification, and the status-bar chip "Updated to vN+1 —
+    restarts when idle (Restart now)". `pacman -Q omatuner` says vN+1; `~/.cache/tuner/update`
+    holds no package; `sudo ls /var/cache/omatuner` is empty.
+- [ ] **Agents carry on:**
+  - **Do:** before the install, in Claude Code (connected), ask Tuner's `status`. After the
+    install, and again after the restart below, ask it again; `ls -l /proc/$(pgrep -f 'tuner
+    mcp' | head -1)/exe`.
+  - **Expect:** every call answers; the bridge's binary reads `/usr/bin/tuner (deleted)` (the old
+    one keeps running). A new Claude Code session gets vN+1's bridge. With *Keep Claude Code's
+    plugin up to date* on, after the restart Claude's plugin is at vN+1 (`claude plugin list
+    --json`).
+- [ ] **Restart when idle, never during playback:**
+  - **Do:** note `pgrep -x tuner`. Play something for 3 minutes; stop; stay in Tuner for 2
+    minutes; then click into a terminal on the same workspace (or go to another workspace) and
+    type there for 2 minutes.
+  - **Expect:** no restart while playing or paused, nor while Tuner has the keyboard. About a
+    minute after you left it: Tuner restarts with the same pid, opens on the screen it was on,
+    on its own workspace, and the terminal keeps the keyboard (your typing isn't interrupted);
+    the toast "Tuner updated to vN+1 (from vN)"; Settings ▸ About shows vN+1 and "up to date".
+  - **Do:** repeat with Tuner alone on a hidden workspace (also without the packaged
+    `render_unfocused` rule). **Expect:** it restarts there too, about a minute plus 3 s later,
+    and stays on that workspace.
+- [ ] **Restart now:** with an update waiting (install vN again by hand, then let Tuner update),
+  click the chip. **Expect:** an immediate restart into the same screen.
+- [ ] **The passwordless switch:**
+  - **Do:** turn on *Install updates without asking for my password*; Cancel the dialog. Turn it
+    on again and enter the password. `sudo cat /etc/polkit-1/rules.d/49-omatuner-update-$(id
+    -u).rules`. Then install vN by hand (`sudo pacman -U` its package) and *Check now*.
+  - **Expect:** after Cancel the switch stays off. After the password the toast "Tuner now
+    installs its updates without asking for your password" and the rule naming your user, only
+    the action `io.github.rthoms334.omatuner.update`, `subject.local && subject.active`. The
+    check installs vN+1 with no dialog, the chip follows.
+  - **Do:** with the rule on, `pkexec /usr/lib/tuner/tuner-update passwordless off` and
+    `pkexec /usr/bin/true` from a terminal. **Expect:** both ask for the password.
+  - **Do:** turn the switch off. **Expect:** a dialog; afterwards the rule file is gone and the
+    next install asks for the password again.
+- [ ] **A tampered signature is refused:**
+  - **Do:** `mkdir -m 700 ~/upd`; copy vN+1's package and `.minisig` there; flip a byte
+    (`printf x | dd of=~/upd/omatuner-<vN+1>-1-$(uname -m).pkg.tar.zst bs=1 seek=4096
+    conv=notrunc`); with vN installed,
+    `pkexec /usr/lib/tuner/tuner-update install ~/upd/omatuner-<vN+1>-1-$(uname -m).pkg.tar.zst;
+    echo $?`.
+  - **Expect:** exit 3, "… the signature doesn't match the file"; `pacman -Q omatuner` is still
+    vN; `/var/cache/omatuner` holds nothing.
+- [ ] **A downgrade or the same version is refused:** with vN+1 installed, run the helper on
+  vN's genuine package (with its `.minisig`), then on vN+1's. **Expect:** exit 3, "… isn't newer
+  than the installed …", both times.
+- [ ] **Unsafe paths are refused:** `ln -s ~/upd ~/upd-link` and run the helper on
+  `~/upd-link/<package>`; then `chmod 755 ~/upd` and run it on `~/upd/<package>`. **Expect:**
+  exit 3, "folders on the way must not be symlinks", then "must be yours and private (0700)".
+- [ ] **The install runs as a system service, one at a time:**
+  - **Do:** with vN installed and the passwordless rule on, start two installs of vN+1 at once:
+    `p=~/upd/omatuner-<vN+1>-1-$(uname -m).pkg.tar.zst; for i in 1 2; do pkexec
+    /usr/lib/tuner/tuner-update install $p & done; wait`; while they run, `systemctl status
+    omatuner-update.service`.
+  - **Expect:** one prints "installed omatuner vN+1 …", the other exit 5 (busy); the status shows
+    the unit in system.slice running `tuner-update install-as <uid> <path>` (its pacman child
+    under it); afterwards the unit is gone and `sudo ls -A /var/cache/omatuner` is empty.
+  - **Do:** `pkexec /usr/lib/tuner/tuner-update install-as $(id -u) $p`. **Expect:** the
+    password dialog (polkit's generic action); after it, exit 2.
+  - **Do:** with vN installed again, in a shell `ulimit -f 1024` and run the install.
+    **Expect:** vN+1 installs: the limit isn't the service's.
+- [ ] **A Tuner not installed with pacman only tells:**
+  - **Do:** from a checkout of vN, `cargo build --release`, then
+    `target/release/tuner --profile-dir /tmp/tuner-check`; wait 30 s.
+  - **Expect:** a notification and a toast "Tuner vN+1 is available — Settings ▸ About & logs
+    says more", once (not after a restart); Settings says it runs from
+    `…/target/release/tuner` and wasn't installed with pacman, without the two switches;
+    nothing in `/tmp/tuner-check/cache/update` but `releases.json`, `releases.etag`, `told`.
+- [ ] **No release key, no installs:** build the package from a checkout whose
+  `packaging/update-key.pub` holds `REPLACE-WITH-THE-RELEASE-KEY`; install it. **Expect:**
+  Settings says this build has no release key; running the helper on a signed newer package
+  exits 6.
+- [ ] **Offline:** disconnect the network; *Check now*. **Expect:** "Couldn't check for
+  updates: …" under the status, no toast; reconnecting and *Check now* clears it.
