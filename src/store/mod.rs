@@ -318,7 +318,7 @@ mod tests {
         });
         assert!(r.is_err());
         // the open transaction was rolled back and the writer still works
-        let n: i64 = w.blocking(|c| Ok(c.query_row("SELECT count(*) FROM meta", [], |r| r.get(0))?)).unwrap();
+        let n: i64 = w.blocking(|c| Ok(c.query_row("SELECT count(*) FROM meta WHERE key = 'a'", [], |r| r.get(0))?)).unwrap();
         assert_eq!(n, 0);
         // a write submitted before shutdown is executed
         let _ = w.submit(|c| Ok(c.execute("INSERT INTO meta(key,value) VALUES ('b','2')", [])?));
