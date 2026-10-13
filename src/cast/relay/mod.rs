@@ -277,6 +277,9 @@ enum Fail {
     Exited,
     /// The surround renditions didn't come (the stereo retry).
     Surround,
+    /// A full-length item's first segments didn't come out where its keyframe index said
+    /// (§8.5): the same plan again as an EVENT playlist.
+    Unindexed,
     Kind(CastErrorKind),
 }
 
@@ -555,6 +558,16 @@ impl RelaySession {
                     tracing::info!("{}: ffmpeg didn't make the surround renditions: stereo", self.label);
                     stereo = true;
                 }
+                // the keyframe index didn't hold on the first run (§8.5's fallback matrix): the
+                // item is an EVENT playlist from now on, starting with this load
+                Err(Fail::Unindexed) if !feed.failed() => {
+                    let _ = tokio::fs::remove_dir_all(&dir).await;
+                    tracing::info!("{}: the segments didn't come out where the keyframe index said: a growing playlist", self.label);
+                    if !self.unindexed.contains(&p.media) {
+                        self.unindexed.push(p.media.clone());
+                    }
+                    maps = [Some(None), Some(None)];
+                }
                 // a failure with the hints alone re-probes once (§8.1.2)
                 Err(Fail::Exited) if probed.is_none() && !feed.failed() => {
                     let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -571,7 +584,8 @@ impl RelaySession {
                     let _ = tokio::fs::remove_dir_all(&dir).await;
                     self.drop_feed(&feed).await;
                     return Err(match fail {
-                        Fail::Upstream => UPSTREAM_FAILED,
+                        // the fallback is taken unless the provider failed meanwhile
+                        Fail::Upstream | Fail::Unindexed => UPSTREAM_FAILED,
                         Fail::Exited | Fail::Surround => CastErrorKind::Unsupported,
                         Fail::Kind(k) => k,
                     });
@@ -842,7 +856,7 @@ impl RelaySession {
         let total = probed.duration_s.or(index.end.map(|e| e - start)).ok_or("its length is unknown")?;
         let aim = vod::segment_s();
         match plan.video {
-            Video::Encode { .. } => vod::Map::grid(total, aim),
+            Video::Encode { .. } => vod::Map::grid(total, aim, probed.video_start_s.map_or(0.0, |v| v - start)),
             _ => vod::Map::from_index(&index, start, total, aim),
         }
     }
@@ -898,6 +912,9 @@ impl RelaySession {
             }
             let fail = if feed.failed() {
                 Some(Fail::Upstream)
+            } else if od.broken() {
+                // not a failure of ffmpeg's or the plan's: the index (the caller falls back)
+                Some(Fail::Unindexed)
             } else if od.over() || od.failed_start().await {
                 Some(if l.surround.is_some() { Fail::Surround } else { Fail::Exited })
             } else if started.elapsed() >= LOAD_BUDGET {
@@ -925,6 +942,12 @@ impl RelaySession {
                     return Err(Fail::Surround);
                 }
             }
+        }
+        // from here a map that doesn't hold is the session's to handle (`Unindexed`); one that
+        // broke since the wait is still this load's
+        if !od.serve() {
+            self.quit_pending().await;
+            return Err(Fail::Unindexed);
         }
         let lan = self.lan.as_ref().ok_or(Fail::Kind(CastErrorKind::Unreachable))?;
         let (view_first, start, offset_s) = start_of(&od, lan.start_ignored(), l.offset_s, out.renditions.len());
@@ -1067,7 +1090,7 @@ impl RelaySession {
                 self.end_pending(false).await;
                 Err(match fail {
                     Fail::Kind(k) => k,
-                    Fail::Upstream | Fail::Exited | Fail::Surround => CastErrorKind::NeedsFfmpeg,
+                    Fail::Upstream | Fail::Exited | Fail::Surround | Fail::Unindexed => CastErrorKind::NeedsFfmpeg,
                 })
             }
         }

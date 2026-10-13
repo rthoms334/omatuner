@@ -15,6 +15,10 @@
 //!   `trex`; each `moof` keeps `mfhd` and that track's `traf` with its `trun` data offsets moved
 //!   onto a new `mdat` holding only that track's samples (ffmpeg writes a track's samples of a
 //!   fragment contiguously, in `trun` order). Track IDs are kept, so `tfhd` matches the `tkhd`.
+//!   A track with no samples in a segment (the sound ended before the picture: a film's silent
+//!   credits) has no `traf` there (`movenc` writes none): its segment is one fragment without
+//!   samples (`mfhd`, a `traf` with only its `tfhd`, an empty `mdat`), a gap in that rendition
+//!   rather than a segment the TV can't have.
 
 /// A box at the start of `b`: `(type, header length, size)`.
 fn header(b: &[u8]) -> Option<([u8; 4], usize, usize)> {
@@ -184,9 +188,11 @@ fn runs(traf: &[u8], trex_size: Option<u32>) -> Option<Vec<Run>> {
 }
 
 /// `track`'s fragments of a media segment (`moof` + `mdat` pairs, as the module docs say);
-/// `trex_size`: the init's default sample size for it. `None` when the segment can't be read.
+/// `trex_size`: the init's default sample size for it. `None` when the segment can't be read
+/// (or holds no fragment at all); one fragment without samples when it has none of `track`'s.
 pub fn track_media(seg: &[u8], track: u32, trex_size: Option<u32>) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(seg.len() / 2);
+    let mut first_mfhd: Option<&[u8]> = None;
     let mut at = 0usize;
     for (kind, whole) in boxes(seg)? {
         let here = at;
@@ -203,6 +209,7 @@ pub fn track_media(seg: &[u8], track: u32, trex_size: Option<u32>) -> Option<Vec
                 _ => {}
             }
         }
+        first_mfhd = first_mfhd.or(mfhd);
         let (Some(mfhd), Some(traf)) = (mfhd, traf) else { continue };
         let runs = runs(body(traf), trex_size)?;
         let mut data = Vec::new();
@@ -220,7 +227,14 @@ pub fn track_media(seg: &[u8], track: u32, trex_size: Option<u32>) -> Option<Vec
         out.extend(wrap(b"moof", &[mfhd, &new_traf]));
         out.extend(wrap(b"mdat", &[&data]));
     }
-    (!out.is_empty()).then_some(out)
+    if out.is_empty() {
+        // none of the track's samples here: a fragment without any (default-base-is-moof)
+        let mut tfhd = 0x0002_0000u32.to_be_bytes().to_vec();
+        tfhd.extend_from_slice(&track.to_be_bytes());
+        out.extend(wrap(b"moof", &[first_mfhd?, &wrap(b"traf", &[&wrap(b"tfhd", &[&tfhd])])]));
+        out.extend(wrap(b"mdat", &[]));
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -308,8 +322,17 @@ mod tests {
             assert_eq!(r[0].data_offset as usize, moof.len() + 8, "track {track}");
             assert_eq!(boxes(body(moof)).unwrap().iter().filter(|(k, _)| k == b"traf").count(), 1);
         }
-        assert_eq!(track_media(&seg, 9, None), None, "no such track");
+        // a track without samples in the segment (the sound ended): one empty fragment
+        let none = track_media(&seg, 9, None).unwrap();
+        let parts = boxes(&none).unwrap();
+        assert_eq!(parts.iter().map(|(k, _)| *k).collect::<Vec<_>>(), [*b"moof", *b"mdat"]);
+        assert!(samples_of(&none).is_empty());
+        let traf = boxes(body(parts[0].1)).unwrap().into_iter().find(|(k, _)| k == b"traf").unwrap().1;
+        assert_eq!(runs(body(traf), None).map(|r| r.len()), Some(0));
+        let tfhd = boxes(body(traf)).unwrap()[0];
+        assert_eq!((tfhd.0, be32(body(tfhd.1), 4)), (*b"tfhd", Some(9)));
         assert_eq!(track_media(&seg[..seg.len() - 3], 1, None), None, "cut short");
+        assert_eq!(track_media(&bx(b"styp", &[b"msdh"]), 1, None), None, "no fragment at all");
     }
 
     #[test]

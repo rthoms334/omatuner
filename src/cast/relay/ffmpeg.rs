@@ -79,6 +79,8 @@ const TEST_CARD_S: u32 = 15;
 /// catch-up, so production runs about a minute ahead of playback instead of pulling the whole
 /// film at 4× (§8.4; the relay's lead cap stops it while the TV is paused).
 const READ_BURST_S: &str = "60";
+/// [`READ_BURST_S`] as a number: a full-length run's pace (vod.rs, "On demand").
+pub const READ_BURST: f64 = 60.0;
 
 /// `hls_time` override for the loopback tests (`-hls_time 1`, DESIGN §40 §14.2), in ms; 0 = the
 /// default [`SEGMENT_S`].
@@ -877,5 +879,10 @@ mod tests {
         assert!(!w.feed(0.5, s(60)), "once");
         assert_eq!(parse_speed(" 0.97x"), Some(0.97));
         assert_eq!(parse_speed("N/A"), None);
+    }
+
+    #[test]
+    fn the_read_bursts_number_is_the_arguments() {
+        assert_eq!(READ_BURST_S.parse::<f64>(), Ok(READ_BURST));
     }
 }

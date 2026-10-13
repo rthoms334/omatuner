@@ -21,8 +21,10 @@
 //!   *k*'s start (converted), `-copyts -start_at_zero` (the item's own clock), ffmpeg's `segment`
 //!   muxer with the cut points relative to the run's first picture (`segment.c` counts
 //!   `-segment_times` from the reference stream's first timestamp: measured 2026-10-13, ffmpeg
-//!   n9.0.2), `-segment_start_number k`, a constant `-output_ts_offset` of 10 s, TS or fMP4 as
-//!   the plan says, and a CSV segment list. Measured on a 12 s film with irregular keyframes, a
+//!   n9.0.2): *k*'s keyframe, or from the item's start, where the picture starts on the item's
+//!   clock (the sound may lead it, as in a remux of a broadcast: the map keeps that time, and no
+//!   cut comes before it), `-segment_start_number k`, a constant `-output_ts_offset` of 10 s, TS
+//!   or fMP4 as the plan says, and a CSV segment list. Measured on a 12 s film with irregular keyframes, a
 //!   run from 0 and a run from segment 2 give byte-identical fMP4 init sections and media
 //!   segments after the restart's first (but for the `mfhd` sequence number), identical TS
 //!   video timestamps, and the restart's first segment one copied audio frame earlier (the mov
@@ -42,14 +44,19 @@
 //!   time: it is published once and stripped from the segments. Each segment is
 //!   checked against the map (its start, and that its end doesn't pass the next cut point): a map
 //!   that doesn't hold (an index ffmpeg reads otherwise) sends `Unindexed`, and the item goes
-//!   back to its EVENT playlist where the TV is. Copied pictures get Phase 1's IDR check (two
-//!   misses: `Irregular`, L3 next time).
+//!   back to its EVENT playlist where the TV is; during the load (the first run's first
+//!   segments) the load itself falls back, before the TV has anything. Copied pictures get Phase
+//!   1's IDR check (two misses: `Irregular`, L3 next time). A segment that can't be published (a
+//!   write that failed, a muxed segment that can't be split) is lost: the TV's requests for it
+//!   get the 404 at once, and the run goes on.
 //! * **On demand** ([`OnDemand::segment`], Jellyfin's rule): a published segment is served; one
 //!   the running run will reach within [`LOOKAHEAD_S`] is waited for (polling every 100 ms, at
-//!   most [`WAIT`]; production's lead cap is lifted while anyone waits); anything else (behind the
-//!   run's start, further ahead, or no run) stops the run and starts one at that segment. The new
-//!   ffmpeg's request reaches the provider only once the old connection has closed (the proxy's
-//!   one wire, §10). Each rendition's request for segment *k* follows the same rule.
+//!   most [`WAIT`]; production's lead cap is lifted while anyone waits), when the run's pace gets
+//!   it there soon ([`keeps`]: past its first minute a run reads at real time, which Jellyfin's
+//!   rule doesn't assume); anything else (behind the run's start, further ahead, or no run) stops
+//!   the run and starts one at that segment. The new ffmpeg's request reaches the provider only
+//!   once the old connection has closed (the proxy's one wire, §10). Each rendition's request for
+//!   segment *k* follows the same rule.
 //! * **Production stays capped** (§8.4): a run reads its first minute as fast as the provider
 //!   sends it, then at real time (`-readrate`), and pauses while it is more than three minutes
 //!   ahead of the segment the TV fetched last; the 8 GiB cap deletes the published segments
@@ -63,6 +70,7 @@
 pub mod fmp4;
 pub mod keyframes;
 
+use std::collections::BTreeSet;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -88,6 +96,9 @@ pub const SEGMENT_S: f64 = 6.0;
 const MERGE_SLACK_S: f64 = 0.5;
 /// A segment the running run will reach within this is waited for (Jellyfin: 24 s of segments).
 pub const LOOKAHEAD_S: f64 = 24.0;
+/// ... and only when it can be made within this much media past where the run's pace lets it
+/// be by now ([`keeps`]): a segment or so, a few seconds of real time at worst.
+const PACED_LOOKAHEAD_S: f64 = 8.0;
 /// A request for a segment waits at most this long (the load budget of §5.5).
 pub const WAIT: Duration = Duration::from_secs(30);
 /// How often a waiting request and a run's publisher look again.
@@ -131,6 +142,8 @@ pub struct Map {
     starts: Vec<f64>,
     /// `-ss` of a run from segment *k* (`seeks[0]` unused: a run from 0 doesn't seek).
     seeks: Vec<f64>,
+    /// Where the picture starts: what a run from 0 counts its cut points from (module docs).
+    picture: f64,
     total: f64,
     target: u32,
     pub cuts: Cuts,
@@ -138,17 +151,19 @@ pub struct Map {
 
 impl Map {
     /// The map of copied video from its keyframe `index` (module docs): `start_s` is the file's
-    /// start on the index's clock (ffprobe's `format.start_time`), `total` its length.
+    /// start on the index's clock (ffprobe's `format.start_time`), `total` its length. The
+    /// picture starts at the first keyframe (later than the file when the sound leads).
     pub fn from_index(index: &keyframes::Index, start_s: f64, total: f64, aim: f64) -> Result<Map, Why> {
         if !(total.is_finite() && total > 0.0) {
             return Err("its length is unknown");
         }
+        let picture = index.keyframes.iter().map(|k| k.pts - start_s).reduce(f64::min).filter(|p| p.is_finite()).unwrap_or(0.0).max(0.0);
         let last = (aim / 2.0).min(1.0);
         let kfs: Vec<(f64, f64)> = index
             .keyframes
             .iter()
             .filter_map(|k| Some((k.pts - start_s, k.seek? - start_s)))
-            .filter(|(pts, seek)| *pts > 0.001 && *pts < total - last && seek >= pts)
+            .filter(|(pts, seek)| *pts > picture + 0.001 && *pts < total - last && seek >= pts)
             .collect();
         let (limit, min) = (aim + MERGE_SLACK_S, (aim / 2.0).min(1.0));
         let (mut starts, mut seeks) = (vec![0.0], vec![0.0]);
@@ -175,22 +190,24 @@ impl Map {
             seeks.push(kfs[cut].1);
             from = kfs[cut].0;
         }
-        Map::finish(starts, seeks, total, Cuts::Index(index.container))
+        Map::finish(starts, seeks, picture, total, Cuts::Index(index.container))
     }
 
     /// Converted video's map: a cut every `step` seconds (the last segment may be up to half a
-    /// step longer rather than a sliver).
-    pub fn grid(total: f64, step: f64) -> Result<Map, Why> {
+    /// step longer rather than a sliver), none within half a step after where the `picture`
+    /// starts (ffprobe's: the sound may lead it).
+    pub fn grid(total: f64, step: f64, picture: f64) -> Result<Map, Why> {
         if !(total.is_finite() && total > 0.0 && step > 0.0) {
             return Err("its length is unknown");
         }
+        let picture = if picture.is_finite() { picture.max(0.0) } else { 0.0 };
         let n = ((total - step / 2.0) / step).ceil().max(1.0) as usize;
-        let starts: Vec<f64> = (0..n).map(|k| k as f64 * step).collect();
-        Map::finish(starts.clone(), starts, total, Cuts::Grid)
+        let starts: Vec<f64> = (0..n).map(|k| k as f64 * step).filter(|s| *s == 0.0 || *s >= picture + step / 2.0).collect();
+        Map::finish(starts.clone(), starts, picture, total, Cuts::Grid)
     }
 
-    fn finish(starts: Vec<f64>, seeks: Vec<f64>, total: f64, cuts: Cuts) -> Result<Map, Why> {
-        let mut map = Map { starts, seeks, total, target: 1, cuts };
+    fn finish(starts: Vec<f64>, seeks: Vec<f64>, picture: f64, total: f64, cuts: Cuts) -> Result<Map, Why> {
+        let mut map = Map { starts, seeks, picture, total, target: 1, cuts };
         let longest = (0..map.len()).map(|k| map.dur(k)).fold(0.0, f64::max);
         // RFC 8216 §4.3.3.1: every EXTINF, rounded, at most the target
         map.target = (longest.round() as u32).max(1);
@@ -245,11 +262,12 @@ impl Map {
         (k > 0).then(|| self.seeks.get(k as usize).copied()).flatten()
     }
 
-    /// A run from segment `k`: its cut points relative to `k`'s start (`-segment_times`), and the
-    /// first segment it can't finish (a run cut short by [`MAX_CUTS`] doesn't know where its last
-    /// segment ends; `len()` when it reaches the item's end).
+    /// A run from segment `k`: its cut points relative to its first picture (`-segment_times`:
+    /// `k`'s keyframe, or where the picture starts in a run from 0), and the first segment it
+    /// can't finish (a run cut short by [`MAX_CUTS`] doesn't know where its last segment ends;
+    /// `len()` when it reaches the item's end).
     pub fn cuts_from(&self, k: u64) -> (String, u64) {
-        let from = self.start(k);
+        let from = self.start(k).max(self.picture);
         let next = (k as usize + 1).min(self.starts.len());
         let upto = (next + MAX_CUTS).min(self.starts.len());
         let cuts = self.starts[next..upto].iter().map(|s| format!("{:.6}", s - from)).collect::<Vec<_>>().join(",");
@@ -337,6 +355,8 @@ pub struct Ctx {
 /// A run's state, shared by its supervisor and [`OnDemand::decide`].
 struct RunCtx {
     dir: PathBuf,
+    /// When ffmpeg started (its `-readrate` clock: [`keeps`]).
+    born: Instant,
     first: u64,
     /// The first segment it can't finish ([`Map::cuts_from`]).
     limit: u64,
@@ -351,6 +371,22 @@ const RUNNING: u8 = 0;
 const DONE: u8 = 1;
 const FAILED: u8 = 2;
 const KILLED: u8 = 3;
+
+/// [`OnDemand`]'s phase bits: the TV has the playlist ([`OnDemand::serve`]); the map didn't hold.
+const SERVING: u8 = 1;
+const BROKEN: u8 = 2;
+
+/// Whether a request for segment `k` waits for the run from `first` that has made the segments
+/// before `made`, can make those before `limit` and started `elapsed` seconds ago (module docs, "On
+/// demand"): it hasn't passed `k`, `k` starts within [`LOOKAHEAD_S`] of what it made, and `k`
+/// ends within [`PACED_LOOKAHEAD_S`] of where `-readrate` lets the run be by now (its first
+/// [`ffmpeg::READ_BURST`] seconds from where it started at once, then real time). Past its burst,
+/// a run about a minute ahead of the TV reads at 1×: a segment 24 s beyond what it made would take
+/// it up to 30 s of real time, where a run started there makes it in seconds.
+fn keeps(map: &Map, first: u64, made: u64, limit: u64, elapsed: f64, k: u64) -> bool {
+    let frontier = map.start(first) + ffmpeg::READ_BURST + elapsed.max(0.0);
+    made <= k && k < limit && map.start(k) - map.start(made) <= LOOKAHEAD_S && map.start(k + 1) <= frontier + PACED_LOOKAHEAD_S
+}
 
 impl RunCtx {
     fn made(&self) -> u64 {
@@ -394,8 +430,12 @@ pub struct OnDemand {
     init: Mutex<Option<Vec<u8>>>,
     violations: AtomicU32,
     irregular_sent: AtomicBool,
-    /// The map didn't hold: nothing more is published (`Unindexed` sent).
-    broken: AtomicBool,
+    /// [`SERVING`] and [`BROKEN`]: the map didn't hold, nothing more is published (`Unindexed`
+    /// sent once the TV has the playlist; before, the load falls back).
+    phase: AtomicU8,
+    /// Segments made but not published (module docs, "Publishing"): requests for them fail at
+    /// once instead of making them again and again.
+    lost: Mutex<BTreeSet<u64>>,
     /// Ended (the generation, or the provider): every request is a miss.
     dead: AtomicBool,
 }
@@ -416,14 +456,26 @@ impl OnDemand {
             init: Mutex::new(None),
             violations: AtomicU32::new(0),
             irregular_sent: AtomicBool::new(false),
-            broken: AtomicBool::new(false),
+            phase: AtomicU8::new(0),
+            lost: Mutex::new(BTreeSet::new()),
             dead: AtomicBool::new(false),
         }
     }
 
     /// The map didn't hold (the relay serves the item's next load as an EVENT playlist).
     pub fn broken(&self) -> bool {
-        self.broken.load(Ordering::Relaxed)
+        self.phase.load(Ordering::SeqCst) & BROKEN != 0
+    }
+
+    /// The load hands the TV the playlist: from now on a map that doesn't hold is reported
+    /// (`Unindexed`). `false` when it already didn't hold: the load falls back instead (one RMW
+    /// each side, so exactly one of them acts).
+    pub fn serve(&self) -> bool {
+        self.phase.fetch_or(SERVING, Ordering::SeqCst) & BROKEN == 0
+    }
+
+    fn is_lost(&self, k: u64) -> bool {
+        self.lost.lock().unwrap_or_else(|e| e.into_inner()).contains(&k)
     }
 
     fn send(&self, ev: impl FnOnce(u64) -> RelayEvent) {
@@ -572,11 +624,11 @@ impl OnDemand {
             }
             return true;
         };
-        if st.end.is_some_and(|e| k >= e) {
+        if st.end.is_some_and(|e| k >= e) || self.is_lost(k) {
             return false;
         }
         // the run hasn't passed `k` (a segment it made and the cap deleted is made again)
-        let keep = st.run.as_ref().is_some_and(|(r, _)| r.made() <= k && k < r.limit && self.map.start(k) - self.map.start(r.made()) <= LOOKAHEAD_S);
+        let keep = st.run.as_ref().is_some_and(|(r, _)| keeps(&self.map, r.first, r.made(), r.limit, r.born.elapsed().as_secs_f64(), k));
         // published meanwhile (a run publishes the file before it counts it as made)
         if !keep && !exists(path).await {
             tracing::debug!("{}: making segment {k} ({:.1} s) on demand", self.ctx.label, self.map.start(k));
@@ -631,7 +683,15 @@ impl OnDemand {
         self.ctx.feed.arm_final_reader();
         let progress = ffmpeg::Progress { watch_speed: false, on_slow: Box::new(|| {}) };
         let child = ffmpeg::spawn(&self.spec.ffmpeg, &argv, self.ctx.label.clone(), progress)?;
-        let ctx = Arc::new(RunCtx { dir, first: k, limit, made: AtomicU64::new(k), state: AtomicU8::new(RUNNING), stop: CancellationToken::new() });
+        let ctx = Arc::new(RunCtx {
+            dir,
+            born: Instant::now(),
+            first: k,
+            limit,
+            made: AtomicU64::new(k),
+            state: AtomicU8::new(RUNNING),
+            stop: CancellationToken::new(),
+        });
         let task = tokio::spawn(self.clone().supervise(child, ctx.clone()));
         Ok((ctx, task))
     }
@@ -694,7 +754,8 @@ impl OnDemand {
     }
 
     /// Publish the segments `run` has finished since `seen` (module docs, "Publishing");
-    /// `false` when the run must stop (the map broke, its cut points ran out, a write failed).
+    /// `false` when the run must stop (the map broke, its cut points ran out). A segment that
+    /// can't be published is lost, and the run goes on.
     async fn scan(&self, run: &RunCtx, seen: &mut usize, ended: bool) -> bool {
         let Ok(text) = tokio::fs::read_to_string(run.dir.join(ffmpeg::RUN_LIST)).await else { return true };
         let entries: Vec<(u64, f64, f64)> = text.lines().filter_map(list_entry).collect();
@@ -709,7 +770,8 @@ impl OnDemand {
                 return false;
             }
             if !self.holds(run, k, start, end) {
-                if !self.broken.swap(true, Ordering::Relaxed) {
+                let was = self.phase.fetch_or(BROKEN, Ordering::SeqCst);
+                if was & BROKEN == 0 {
                     tracing::warn!(
                         "{}: segment {k} came out at {:.3}–{:.3} s, the map says {:.3}–{:.3} s: the item goes back to a growing playlist",
                         self.ctx.label,
@@ -718,14 +780,22 @@ impl OnDemand {
                         self.map.start(k),
                         self.map.start(k + 1)
                     );
-                    self.send(|generation| RelayEvent::Unindexed { generation });
+                    // a load still waiting falls back by itself (`serve`)
+                    if was & SERVING != 0 {
+                        self.send(|generation| RelayEvent::Unindexed { generation });
+                    }
                 }
                 self.changed.notify_waiters();
                 return false;
             }
-            if let Err(e) = self.publish(run, k).await {
-                tracing::warn!("{}: segment {k} can't be published: {e}", self.ctx.label);
-                return false;
+            match self.publish(run, k).await {
+                Ok(()) => {
+                    self.lost.lock().unwrap_or_else(|e| e.into_inner()).remove(&k);
+                }
+                Err(e) => {
+                    tracing::warn!("{}: segment {k} can't be published ({e}): the TV's requests for it go unanswered", self.ctx.label);
+                    self.lost.lock().unwrap_or_else(|e| e.into_inner()).insert(k);
+                }
             }
             *seen += 1;
             run.made.store(k + 1, Ordering::Release);
@@ -1017,13 +1087,13 @@ mod tests {
 
     #[test]
     fn the_grid_cuts_every_step_and_the_end_absorbs_a_sliver() {
-        let m = Map::grid(20.0, 6.0).unwrap();
+        let m = Map::grid(20.0, 6.0, 0.0).unwrap();
         assert_eq!(m.starts, [0.0, 6.0, 12.0]);
         assert_eq!((m.dur(2), m.target()), (8.0, 8), "20 − 12: not a 2 s sliver after 18");
-        let m = Map::grid(21.5, 6.0).unwrap();
+        let m = Map::grid(21.5, 6.0, 0.0).unwrap();
         assert_eq!(m.starts, [0.0, 6.0, 12.0, 18.0]);
         assert_eq!(m.target(), 6);
-        assert_eq!(Map::grid(2.0, 6.0).unwrap().starts, [0.0]);
+        assert_eq!(Map::grid(2.0, 6.0, 0.0).unwrap().starts, [0.0]);
         assert_eq!(m.seek(2), Some(12.0), "converted runs start exactly at the cut");
         assert_eq!(m.segment_at(-1.0), 0);
         assert_eq!(m.segment_at(12.0), 2);
@@ -1036,14 +1106,55 @@ mod tests {
     /// item's clock, and where a run cut short by the argument limit stops publishing.
     #[test]
     fn a_runs_cut_points() {
-        let m = Map::grid(60.0, 6.0).unwrap();
+        let m = Map::grid(60.0, 6.0, 0.0).unwrap();
         assert_eq!(m.cuts_from(7), ("6.000000,12.000000".into(), 10));
         assert_eq!(m.forced_from(7, 10), "42.000000,48.000000,54.000000");
         assert_eq!(m.cuts_from(9), (String::new(), 10), "the last segment: no cut");
-        let long = Map::grid(6.0 * (MAX_CUTS as f64 + 10.0), 6.0).unwrap();
+        let long = Map::grid(6.0 * (MAX_CUTS as f64 + 10.0), 6.0, 0.0).unwrap();
         let (cuts, limit) = long.cuts_from(0);
         assert_eq!((cuts.split(',').count(), limit), (MAX_CUTS, MAX_CUTS as u64), "segment 3000 would run to the end");
         assert_eq!(long.cuts_from(9).1, long.len(), "from 9 on, the list reaches the end");
+    }
+
+    /// The sound leads the picture (a remux of a broadcast: the picture at 0.5 s): the playlist
+    /// still starts at the item's start, no cut comes before the picture (its first keyframe is
+    /// no cut point), and a run from 0 counts its cut points from the picture, as `segment.c`
+    /// does (5.5 s is 5 s after it); a run from a later segment from that segment's keyframe.
+    #[test]
+    fn a_run_from_the_start_counts_from_the_picture() {
+        let m = Map::from_index(&index(&[0.5, 1.82, 3.0, 5.5, 7.1, 9.0, 12.5]), 0.0, 14.0, 6.0).unwrap();
+        assert_eq!(m.starts, [0.0, 5.5, 9.0]);
+        assert_eq!(m.cuts_from(0).0, "5.000000,8.500000");
+        assert_eq!(m.cuts_from(1).0, "3.500000");
+        // a picture from the file's start: as before
+        let m = Map::from_index(&index(&[0.0, 1.82, 3.0, 5.5, 7.1]), 0.0, 9.0, 6.0).unwrap();
+        assert_eq!((m.starts.as_slice(), m.cuts_from(0).0.as_str()), ([0.0, 5.5].as_slice(), "5.500000"));
+        // converted: the grid's first cut at least half a step after the picture, counted from it
+        let g = Map::grid(30.0, 6.0, 3.5).unwrap();
+        assert_eq!(g.starts, [0.0, 12.0, 18.0, 24.0]);
+        assert_eq!(g.cuts_from(0).0, "8.500000,14.500000,20.500000");
+        assert_eq!(Map::grid(30.0, 6.0, 0.5).unwrap().starts, [0.0, 6.0, 12.0, 18.0, 24.0]);
+    }
+
+    /// Jellyfin's rule at the run's pace: a fresh run (its first minute read at once) is waited
+    /// for up to 24 s ahead; a run past its burst, reading at real time, only for what it reaches
+    /// within a few seconds: a scrub 75 s past the TV restarts rather than wait half a minute.
+    #[test]
+    fn a_request_waits_only_for_a_run_that_gets_there_soon() {
+        let m = Map::grid(600.0, 6.0, 0.0).unwrap();
+        // just started at 0: 18–24 s is waited for, 30 s is beyond the look-ahead
+        assert!(keeps(&m, 0, 0, m.len(), 0.0, 3));
+        assert!(!keeps(&m, 0, 0, m.len(), 0.0, 5));
+        // 100 s in, it has made 0–156 s (the burst, then 1×: its frontier is 160 s)
+        let made = m.segment_at(156.0);
+        assert!(keeps(&m, 0, made, m.len(), 100.0, made), "the next segment");
+        assert!(keeps(&m, 0, made, m.len(), 100.0, made + 1), "the one after: 162–168 s, within 8 s");
+        assert!(!keeps(&m, 0, made, m.len(), 100.0, made + 3), "174–180 s: 20 s of real time away");
+        // behind what it made, past its limit, or no run of its own: never
+        assert!(!keeps(&m, 0, made, m.len(), 100.0, made - 1));
+        assert!(!keeps(&m, 0, made, made + 1, 100.0, made + 1));
+        // a run restarted at 300 s has a fresh burst
+        assert!(keeps(&m, 50, 50, m.len(), 1.0, 53));
     }
 
     #[test]

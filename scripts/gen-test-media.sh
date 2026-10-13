@@ -22,6 +22,14 @@
 #                    fMP4 output of a full-length film
 #   vod.ts, vod_nocues.mkv   the same without a keyframe index (MPEG-TS; Matroska written to a
 #                    pipe, so without cues): EVENT playlists when cast
+#   vod_late.mkv, vod_late.mp4   vod.mp4 with the picture 0.5 s after the sound (a remux of a
+#                    broadcast recording: the sound leads), Matroska and MP4 (an empty edit)
+#   vod_noelst.mp4   vod.mp4 without an edit list (`-use_editlist 0`): the picture starts one
+#                    B-frame delay (0.08 s) after the sound
+#   vod_quiet_end.mkv  10 s 320x180 25 fps H.264 (1 s GOPs) + AAC 5.1 that ends at 6 s (silent
+#                    credits on a trimmed track): a surround cast's last segments have no sound
+#   vod_big.mkv      20 s 320x180 H.264 at a constant 8 Mbit/s (filler) + AAC: 20 MB, more than the
+#                    relay's 16 MiB head buffer, so reading its cues is a provider request of its own
 #   live/            rolling "live" HLS written by `--live` until killed (manual checks only)
 # Tests call this through `tests/support/media.rs::ensure_media`, which runs it once into a
 # temporary directory and renames it into place, so concurrent test binaries never see
@@ -74,6 +82,14 @@ ff -f lavfi -i testsrc2=size=320x180:rate=25 -f lavfi -i sine=frequency=330:samp
    -force_key_frames 0,1.32,2.68,4.12,5.0,6.6,8.04,9.4,10.8 -tag:v hvc1 -c:a aac -b:a 128k "$out/vod_hevc.mp4"
 ff -i "$out/vod.mp4" -c copy -f mpegts "$out/vod.ts"
 ffmpeg -nostdin -hide_banner -loglevel error -i "$out/vod.mp4" -c copy -f matroska - > "$out/vod_nocues.mkv"
+ff -i "$out/vod.mp4" -itsoffset 0.5 -i "$out/vod.mp4" -map 1:v -map 0:a -c copy "$out/vod_late.mkv"
+ff -i "$out/vod.mp4" -itsoffset 0.5 -i "$out/vod.mp4" -map 1:v -map 0:a -c copy "$out/vod_late.mp4"
+ff -i "$out/vod.mp4" -c copy -use_editlist 0 "$out/vod_noelst.mp4"
+ff -f lavfi -i testsrc2=size=320x180:rate=25 -f lavfi -t 6 -i "$six" \
+   -t 10 "${x264[@]}" -g 25 -keyint_min 25 -sc_threshold 0 -c:a aac -b:a 320k -metadata:s:a:0 language=eng "$out/vod_quiet_end.mkv"
+ff -f lavfi -i testsrc2=size=320x180:rate=25 -f lavfi -i sine=frequency=330:sample_rate=48000 -t 20 \
+   -c:v libx264 -preset ultrafast -pix_fmt yuv420p -b:v 8M -minrate 8M -maxrate 8M -bufsize 2M \
+   -x264-params nal-hrd=cbr:force-cfr=1 -g 50 -c:a aac "$out/vod_big.mkv"
 
 if [[ "${2:-}" == "--live" ]]; then
   mkdir -p "$out/live"

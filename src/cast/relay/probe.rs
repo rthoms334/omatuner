@@ -72,6 +72,9 @@ pub struct Probe {
     /// file's start, which `-copyts -start_at_zero` and `-ss` count from (§8.5).
     pub duration_s: Option<f64>,
     pub start_s: Option<f64>,
+    /// The picture's `start_time` (seconds, the container's clock): where a run from the item's
+    /// start counts its converted cut points from (§8.5; after `start_s` when the sound leads).
+    pub video_start_s: Option<f64>,
 }
 
 /// Why the probe gave nothing.
@@ -169,6 +172,7 @@ pub fn parse(json: &str) -> Option<Probe> {
                 }
                 let Some(codec) = s(st, "codec_name") else { continue };
                 video_index = st.get("index").and_then(Value::as_i64);
+                out.video_start_s = st.get("start_time").and_then(Value::as_str).and_then(|t| t.parse::<f64>().ok()).filter(|t| t.is_finite());
                 out.video = Some(VideoStream {
                     codec,
                     profile: s(st, "profile"),
@@ -311,7 +315,7 @@ mod tests {
       ],
       "streams": [
         {"index": 0, "codec_name": "mpeg2video", "codec_type": "video", "profile": "Main", "level": 8,
-         "width": 720, "height": 576, "pix_fmt": "yuv420p", "field_order": "tt", "avg_frame_rate": "25/1",
+         "width": 720, "height": 576, "pix_fmt": "yuv420p", "field_order": "tt", "avg_frame_rate": "25/1", "start_time": "1.440000",
          "codec_tag_string": "[2][0][0][0]", "disposition": {"default": 0, "attached_pic": 0}},
         {"index": 1, "codec_name": "mp2", "codec_type": "audio", "channels": 2, "sample_rate": "48000",
          "codec_tag_string": "[3][0][0][0]", "disposition": {"default": 0}},
@@ -326,7 +330,7 @@ mod tests {
     fn a_dvb_probe_becomes_facts_hints_and_stream_info() {
         let p = parse(DVB).unwrap();
         assert_eq!(p.container.as_deref(), Some("mpegts"));
-        assert_eq!((p.start_s, p.duration_s), (Some(1.4), Some(5426.24)));
+        assert_eq!((p.start_s, p.duration_s, p.video_start_s), (Some(1.4), Some(5426.24), Some(1.44)));
         assert_eq!(p.interlaced(), Some(true));
         assert_eq!(p.max_gop_s, Some(0.5));
         let a = p.chosen_audio().unwrap();

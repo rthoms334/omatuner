@@ -9,8 +9,12 @@
 //!   ffmpeg does), `stss` (sync samples; none means every sample is one) and `elst`. Times are
 //!   normalised as ffmpeg's mov demuxer does (`mov_fix_index`): the edit's `media_time` is time 0,
 //!   a leading empty edit delays it, and a video track whose first presented picture is still
-//!   after 0 is shifted to 0. More than one non-empty edit, a fragmented file (`mvex`) or a
-//!   damaged box is no index (the item keeps its EVENT playlist).
+//!   after 0 is shifted to 0. Without an edit list the times stay as the tables give them: ffmpeg
+//!   keeps the composition delay then (B-frames two deep: the first picture at 0.08 s, measured
+//!   with n9.0.2 on `-use_editlist 0`). More than one non-empty edit, a fragmented file (`mvex`),
+//!   a damaged box or a sample table bigger than its `moov` could hold is no index (the item
+//!   keeps its EVENT playlist). The tables are walked off the async runtime (a blocking task), so
+//!   the relay's time budget for the index holds whatever they say.
 //! * **Matroska** (RFC 9559): `SeekHead` locates `Info` (`TimestampScale`, `Duration`), `Tracks`
 //!   (the first video track) and `Cues`; every `CuePoint` with a `CueTrackPositions` of the video
 //!   track is a keyframe at `CueTime × TimestampScale`. Sparse cues give longer segments, never
@@ -30,16 +34,25 @@ use std::time::Duration;
 
 use reqwest::header;
 
+use crate::cast::relay::upstream::{HEAD_CAP, OPTIONAL_HEADER};
+
 /// Bytes read at the start of the file in one request (served from the proxy's head buffer).
 const HEAD: u64 = 256 * 1024;
-/// The largest `moov` read (a three-hour film's is a few MiB).
-const MAX_MOOV: u64 = 64 << 20;
-/// The largest Matroska element read (`Cues` of a long film with a cue per keyframe: < 1 MiB).
-const MAX_ELEMENT: u64 = 32 << 20;
+/// The largest `moov` read (a three-hour film's is a few MiB): what the proxy holds of a request
+/// before ffmpeg has opened its input (its head buffer, [`HEAD_CAP`]), less a margin. A bigger
+/// read would wait for bytes the proxy doesn't fetch until [`READ_TIMEOUT`]; this way it is no
+/// index at once.
+const MAX_MOOV: u64 = HEAD_CAP as u64 - (1 << 20);
+/// The largest Matroska element read (`Cues` of a long film with a cue per keyframe: < 1 MiB),
+/// within the proxy's head buffer as [`MAX_MOOV`].
+const MAX_ELEMENT: u64 = MAX_MOOV;
 /// Top-level boxes walked before giving up on finding the `moov`.
 const MAX_BOXES: usize = 64;
 /// Samples accepted in a video track (a 24-hour recording at 60 fps is 5.2 M).
 const MAX_SAMPLES: u64 = 8_000_000;
+/// Samples a `moov` of n bytes may describe: 2n (each sample has a size in `stsz`, 4 bytes, or
+/// `stz2`, half a byte at the least). A damaged `stts` can't make a few bytes cost gigabytes.
+const SAMPLES_PER_BYTE: u64 = 2;
 /// Each read through the proxy gets this long (the provider's own timeout is 15 s).
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 /// A seek lands at most this far after its keyframe (Jellyfin's 0.5 s).
@@ -120,7 +133,8 @@ impl Reader {
         match &self.inner {
             Inner::Mem(data) => Ok(data[at as usize..end as usize].to_vec()),
             Inner::Http { client, url } => {
-                let req = client.get(url).header(header::RANGE, format!("bytes={at}-{}", end - 1));
+                // optional for the proxy: a refusal fails this read (no index), not the feed
+                let req = client.get(url).header(header::RANGE, format!("bytes={at}-{}", end - 1)).header(OPTIONAL_HEADER, "1");
                 let body = async {
                     let resp = req.send().await.ok()?;
                     if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
@@ -193,7 +207,7 @@ async fn mp4(r: &mut Reader, head: Vec<u8>) -> Result<Index, Why> {
                     }
                     all[hdr as usize..].to_vec()
                 };
-                return parse_moov(&body);
+                return off_runtime(move || parse_moov(&body)).await;
             }
             b"moof" => return Err("a fragmented MP4"),
             _ => {}
@@ -291,6 +305,9 @@ pub fn parse_moov(moov: &[u8]) -> Result<Index, Why> {
         if samples < 2 {
             continue; // a still (cover art, a thumbnail track): not the picture ffmpeg maps
         }
+        if samples > (moov.len() as u64).saturating_mul(SAMPLES_PER_BYTE) {
+            return Err("a sample table bigger than its moov");
+        }
         let scale = child(mdia, b"mdhd").and_then(timescale).ok_or("no mdhd")?;
         let ctts = match child(stbl, b"ctts") {
             Some(b) => Some(pairs(b).ok_or("a damaged ctts")?),
@@ -344,13 +361,16 @@ fn track(t: Track) -> Result<Index, Why> {
     let mut pts = dts.clone();
     if let Some(ctts) = &t.ctts {
         let mut i = 0usize;
-        // ffmpeg reads the offsets signed whatever the box version says
+        // ffmpeg reads the offsets signed whatever the box version says; a count past the
+        // samples (a damaged entry) stops at the last one
         for (count, off) in ctts {
-            for _ in 0..*count {
-                if let Some(p) = pts.get_mut(i) {
-                    *p += i64::from(*off as i32);
-                }
-                i += 1;
+            let run = (*count as usize).min(n - i);
+            for p in &mut pts[i..i + run] {
+                *p += i64::from(*off as i32);
+            }
+            i += run;
+            if i >= n {
+                break;
             }
         }
     }
@@ -371,12 +391,15 @@ fn track(t: Track) -> Result<Index, Why> {
         }
     };
     let empty_ts = (empty as f64 / f64::from(t.movie_scale) * f64::from(t.scale)).round() as i64;
-    // the presented samples, and the shift that puts the first of them at 0 (mov_fix_index)
+    // the presented samples, and with an edit, the shift that puts the first of them at 0
+    // (mov_fix_index); without one, the tables' own times (module docs)
     let presented = |i: usize| media_time.is_none_or(|m| pts[i] >= m);
-    let base = media_time.unwrap_or(0);
-    let first = (0..n).filter(|i| presented(*i)).map(|i| pts[i] - base).min().ok_or("no presented picture")?;
-    // never shifted later: a first picture before 0 (negative composition offsets) stays there
-    let base = base + first.max(0);
+    let first = (0..n).filter(|i| presented(*i)).map(|i| pts[i]).min().ok_or("no presented picture")?;
+    let base = match media_time {
+        // never shifted later: a first picture before the edit (negative offsets) stays there
+        Some(m) => m + (first - m).max(0),
+        None => 0,
+    };
     let secs = |v: i64| (v - base + empty_ts) as f64 / f64::from(t.scale);
     let end = (0..n).filter(|i| presented(*i)).map(|i| pts[i] + dur[i]).max().map(secs);
     let sync: Vec<usize> = match &t.sync {
@@ -583,7 +606,14 @@ async fn matroska(r: &mut Reader, head: Vec<u8>) -> Result<Index, Why> {
             mkv.keep(want, data);
         }
     }
-    parse_matroska(mkv.info.as_deref(), mkv.tracks.as_deref().ok_or("no Tracks")?, mkv.cues.as_deref().ok_or("no cues")?)
+    let (info, tracks, cues) = (mkv.info, mkv.tracks.ok_or("no Tracks")?, mkv.cues.ok_or("no cues")?);
+    off_runtime(move || parse_matroska(info.as_deref(), &tracks, &cues)).await
+}
+
+/// A parse on the blocking pool: whatever the tables say, the runtime's workers stay free and
+/// the caller's timeout can fire.
+async fn off_runtime(parse: impl FnOnce() -> Result<Index, Why> + Send + 'static) -> Result<Index, Why> {
+    tokio::task::spawn_blocking(parse).await.unwrap_or(Err("its index can't be read"))
 }
 
 /// The video track's cues (module docs) from the bodies of `Info`, `Tracks` and `Cues`.
@@ -767,9 +797,15 @@ mod tests {
         let i = parse_moov(&intra[8..]).unwrap();
         assert_eq!(i.keyframes.iter().map(|k| k.pts).collect::<Vec<_>>(), [0.0, 0.04, 0.08, 0.12]);
         assert!(i.keyframes.iter().all(|k| k.seek.is_some()));
-        // no edit list but B-frames: ffmpeg shifts the first picture to 0
+        // no edit list but B-frames: ffmpeg keeps the composition delay (the first picture at
+        // 0.2 s here, as at 0.08 s in a `-use_editlist 0` film)
         let b = moov(&[Trak { handler: b"vide", scale: 100, stts: &[(4, 10)], ctts: Some(&[(4, 20)]), stss: Some(&[1, 3]), elst: None }]);
         let i = parse_moov(&b[8..]).unwrap();
+        assert_eq!(i.keyframes.iter().map(|k| k.pts).collect::<Vec<_>>(), [0.2, 0.4]);
+        // the same with an edit at 0: shifted to 0
+        let edited =
+            moov(&[Trak { handler: b"vide", scale: 100, stts: &[(4, 10)], ctts: Some(&[(4, 20)]), stss: Some(&[1, 3]), elst: Some(&[(40, 0)]) }]);
+        let i = parse_moov(&edited[8..]).unwrap();
         assert_eq!(i.keyframes.iter().map(|k| k.pts).collect::<Vec<_>>(), [0.0, 0.2]);
         // keyframes one frame apart with two frames of delay: the first has no seek window
         assert_eq!(i.keyframes[0].seek, None, "the next keyframe decodes before this one shows");
@@ -790,6 +826,13 @@ mod tests {
         assert_eq!(parse_moov(&sound[8..]), Err("no video track"));
         let still = moov(&[Trak { handler: b"vide", scale: 100, stts: &[(1, 10)], ctts: None, stss: None, elst: None }]);
         assert_eq!(parse_moov(&still[8..]), Err("no video track"));
+        // a damaged ctts count (a flipped high byte): the walk stops at the last sample, at once
+        let flipped =
+            moov(&[Trak { handler: b"vide", scale: 100, stts: &[(4, 10)], ctts: Some(&[(0xFF00_0001, 20), (u32::MAX, 0)]), stss: None, elst: None }]);
+        assert_eq!(parse_moov(&flipped[8..]).unwrap().keyframes.len(), 4);
+        // a few bytes declaring eight million samples: no index (and no gigabyte of tables)
+        let huge = moov(&[Trak { handler: b"vide", scale: 100, stts: &[(8_000_000, 1)], ctts: None, stss: None, elst: None }]);
+        assert_eq!(parse_moov(&huge[8..]), Err("a sample table bigger than its moov"));
         // damaged tables
         let mut cut = film();
         let at = cut.windows(4).position(|w| w == b"stss").unwrap() + 8;

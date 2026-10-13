@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures_util::FutureExt;
 use support::media::{Faults, TestServer, ensure_media};
 use tuner::cast::relay::{self, LoadSpec, Prepared, RelayConfig, RelayEvent, RelaySession};
 use tuner::config::{CastConvert, CastInterlaced};
@@ -1113,8 +1114,9 @@ fn same_frames(a: &[String], b: &[String]) -> bool {
 }
 
 /// A film reaches the TV whole (§8.5): a VOD playlist listing every segment at once, cut only at
-/// the source's keyframes (the MP4 index with its moov at the end, the Matroska cues), whole
-/// keyframe runs, one target for all, nothing more than one provider connection at a time, and
+/// the source's keyframes (the MP4 index with its moov at the end, the Matroska cues; the picture
+/// starting 0.5 s after the sound, as in a remux of a broadcast, or one B-frame delay after it in
+/// an MP4 without an edit list), whole keyframe runs, one target for all, nothing more than one provider connection at a time, and
 /// the directory gone with the session. Then the TV starts where `EXT-X-START` says (a resume
 /// at 25 s: the first run starts there) and scrubs back to 10 s with its own remote: that
 /// segment is made on demand by a run started there, and it is the same media as the same segment of a run from the start: identical picture
@@ -1126,7 +1128,14 @@ async fn a_film_reaches_the_tv_whole_and_any_segment_is_made_on_demand_as_the_sa
     let Some(media) = media() else { return };
     let caps = relay::ffmpeg::caps().await.unwrap();
     // the film, its length, where it resumes and where the TV scrubs back to
-    for (file, length, resume, back) in [("/vod.mp4", 30.0, 25.0, 10.0), ("/vod.mkv", 30.0, 25.0, 10.0), ("/vod_hevc.mp4", 12.0, 9.0, 3.0)] {
+    for (file, length, resume, back) in [
+        ("/vod.mp4", 30.0, 25.0, 10.0),
+        ("/vod.mkv", 30.0, 25.0, 10.0),
+        ("/vod_hevc.mp4", 12.0, 9.0, 3.0),
+        ("/vod_late.mkv", 30.5, 25.0, 10.0),
+        ("/vod_late.mp4", 30.5, 25.0, 10.0),
+        ("/vod_noelst.mp4", 30.08, 25.0, 10.0),
+    ] {
         let local = media.join(file.trim_start_matches('/'));
         let keys = keyframes(&caps.ffprobe, &local);
         let hevc = file.contains("hevc");
@@ -1335,4 +1344,138 @@ async fn without_an_index_a_film_keeps_a_growing_playlist_unless_it_is_converted
             .unwrap();
         assert!(first.ends_with("K__,") || first.contains(",K"), "a segment starts with a keyframe: {first}");
     }
+}
+
+/// `vod.mkv` with every cue but the first 300 ms later than its keyframe: an index ffmpeg doesn't
+/// cut where it says (`CueTime`s rewritten in place, same widths).
+fn shifted_cues(mut file: Vec<u8>) -> Vec<u8> {
+    // an EBML element at `at`: (id, header length, data size)
+    fn element(b: &[u8], at: usize) -> Option<(u32, usize, usize)> {
+        let first = *b.get(at)?;
+        let id_len = first.leading_zeros() as usize + 1;
+        let id = b.get(at..at + id_len)?.iter().fold(0u32, |a, x| (a << 8) | u32::from(*x));
+        let s = *b.get(at + id_len)?;
+        let size_len = s.leading_zeros() as usize + 1;
+        let raw = b.get(at + id_len..at + id_len + size_len)?;
+        let size = raw[1..].iter().fold(u64::from(s) & (0xff >> size_len), |a, x| (a << 8) | u64::from(*x));
+        Some((id, id_len + size_len, usize::try_from(size).ok()?))
+    }
+    // the children of the element whose data is `from..to`: (id, data start, data end)
+    fn children(b: &[u8], from: usize, to: usize) -> Vec<(u32, usize, usize)> {
+        let mut out = Vec::new();
+        let mut at = from;
+        while at < to
+            && let Some((id, hdr, size)) = element(b, at)
+        {
+            out.push((id, at + hdr, at + hdr + size));
+            at += hdr + size;
+        }
+        out
+    }
+    let top = children(&file, 0, file.len());
+    let segment = top.iter().find(|(id, ..)| *id == 0x1853_8067).copied().expect("a Segment");
+    let cues = children(&file, segment.1, segment.2).into_iter().find(|(id, ..)| *id == 0x1C53_BB6B).expect("Cues");
+    let mut shifted = 0;
+    for (_, p0, p1) in children(&file, cues.1, cues.2).into_iter().filter(|(id, ..)| *id == 0xBB) {
+        for (_, t0, t1) in children(&file, p0, p1).into_iter().filter(|(id, ..)| *id == 0xB3) {
+            let v = file[t0..t1].iter().fold(0u64, |a, x| (a << 8) | u64::from(*x));
+            let bigger = v + 300;
+            if v > 0 && bigger < 1 << (8 * (t1 - t0)) {
+                file[t0..t1].copy_from_slice(&bigger.to_be_bytes()[8 - (t1 - t0)..]);
+                shifted += 1;
+            }
+        }
+    }
+    assert!(shifted >= 10, "{shifted} cues shifted");
+    file
+}
+
+/// Events the relay has queued by now.
+fn queued(relay: &mut RelaySession) -> Vec<RelayEvent> {
+    std::iter::from_fn(|| relay.next_event().now_or_never()).collect()
+}
+
+/// A keyframe index ffmpeg doesn't cut where it says (§8.5's fallback matrix, "segments not where
+/// the index said"), found on the load's first run: the load itself falls back to a growing
+/// playlist at once (not a failed cast, nor an `Unindexed` that would restart what the TV is
+/// about to get), with one provider connection throughout; a later load of the item in the
+/// session goes there directly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_index_that_doesnt_hold_on_the_first_run_falls_back_at_once() {
+    let Some(media) = media() else { return };
+    let served = tempfile::tempdir().unwrap();
+    std::fs::write(served.path().join("film.mkv"), shifted_cues(std::fs::read(media.join("vod.mkv")).unwrap())).unwrap();
+    let server = TestServer::start(served.path().to_owned(), Faults::default());
+    let dir = tempfile::tempdir().unwrap();
+    let mut relay = RelaySession::start(config(&dir, LOOPBACK)).await.unwrap();
+    let tv = tv();
+    let p = playable(PlayableKind::Movie, server.url("/film.mkv"), HttpHeaders::default());
+    for generation in [1, 2] {
+        let prepared = relay.load(spec(generation, p.clone(), None)).await.unwrap_or_else(|e| panic!("load {generation}: {e:?}"));
+        let text = tv.get(prepared.load.url.expose()).send().await.unwrap().text().await.unwrap();
+        assert!(text.contains("#EXT-X-PLAYLIST-TYPE:EVENT\n"), "load {generation}:\n{text}");
+        let first = text.lines().find(|l| !l.is_empty() && !l.starts_with('#')).expect("a segment");
+        assert_eq!(tv.get(format!("{}{first}", base_of(&prepared))).send().await.unwrap().status(), 200);
+        let events = queued(&mut relay);
+        assert!(!events.iter().any(|e| matches!(e, RelayEvent::Unindexed { .. } | RelayEvent::Failed { .. })), "load {generation}: {events:?}");
+    }
+    assert_eq!(server.max_concurrent(), 1, "{:#?}", server.overlaps());
+    relay.stop(false).await;
+}
+
+/// A surround film whose sound ends 4 s before its picture (silent credits on a trimmed track):
+/// the segments without sound are still whole in every rendition (the sound's are fragments
+/// without samples), so the TV gets every segment of every rendition, and the item is made by one
+/// run, not by a run restarted for each request of a segment that can't be split.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_surround_film_whose_sound_ends_early_is_served_to_the_end() {
+    let Some(media) = media() else { return };
+    let server = TestServer::start(media, Faults::default());
+    let dir = tempfile::tempdir().unwrap();
+    let mut relay = RelaySession::start(config(&dir, LOOPBACK)).await.unwrap();
+    let file = "/vod_quiet_end.mkv";
+    let prepared = relay.load(spec(1, playable(PlayableKind::Movie, server.url(file), HttpHeaders::default()), None)).await.unwrap();
+    assert!(prepared.surround, "{prepared:?}");
+    let (tv, base) = (tv(), base_of(&prepared));
+    for r in ["v/", "a/", "s/"] {
+        let text = tv.get(format!("{base}{r}index.m3u8")).send().await.unwrap().text().await.unwrap();
+        assert!(text.contains("#EXT-X-PLAYLIST-TYPE:VOD\n"), "{r}:\n{text}");
+        let segs = vod_segments(&text);
+        assert!(segs.len() >= 8, "{r}: {segs:?}");
+        let init = text.lines().find_map(|l| l.strip_prefix("#EXT-X-MAP:URI=\"").map(|u| u.trim_end_matches('"').to_owned())).unwrap();
+        for name in std::iter::once(&init).chain(segs.iter().map(|s| &s.2)) {
+            let resp = tv.get(format!("{base}{r}{name}")).send().await.unwrap();
+            assert_eq!(resp.status(), 200, "{r}{name}");
+            assert!(!resp.bytes().await.unwrap().is_empty(), "{r}{name}");
+        }
+    }
+    // the provider's requests: the open, the probe's and the index's reads, and one run
+    let requests = server.requests_for(file);
+    assert!(requests.len() <= 6, "{} requests: {requests:#?}", requests.len());
+    relay.stop(false).await;
+}
+
+/// The keyframe index is an extra read (the Matroska cues at the end of a film bigger than the
+/// proxy's head buffer: a provider request of its own) that the cast can do without: a provider that refuses it (one-connection panels answer a connection made right
+/// after the previous one closed with 503 or 509) costs the full-length playlist, not the cast
+/// (the feed doesn't fail: no `Http`), and the film plays as a growing playlist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_index_read_falls_back_without_failing_the_feed() {
+    let Some(media) = media() else { return };
+    let size = std::fs::metadata(media.join("vod_big.mkv")).unwrap().len();
+    let server = TestServer::start(media, Faults::default());
+    server.fail_ranges_from("/vod_big.mkv", size / 2, 503, 1);
+    let dir = tempfile::tempdir().unwrap();
+    let mut relay = RelaySession::start(config(&dir, LOOPBACK)).await.unwrap();
+    let prepared = relay.load(spec(1, playable(PlayableKind::Movie, server.url("/vod_big.mkv"), HttpHeaders::default()), None)).await.unwrap();
+    assert!(server.requests_for("/vod_big.mkv").iter().any(|r| r.status == 503), "the index read was refused");
+    let tv = tv();
+    let text = tv.get(prepared.load.url.expose()).send().await.unwrap().text().await.unwrap();
+    assert!(text.contains("#EXT-X-PLAYLIST-TYPE:EVENT\n"), "{text}");
+    let first = text.lines().find(|l| !l.is_empty() && !l.starts_with('#')).expect("a segment");
+    assert_eq!(tv.get(format!("{}{first}", base_of(&prepared))).send().await.unwrap().status(), 200);
+    let events = queued(&mut relay);
+    // (the 20 s film is all read in its first burst: its end closes the feed, as any film's)
+    assert!(!events.iter().any(|e| matches!(e, RelayEvent::Http { .. } | RelayEvent::ProviderText { .. } | RelayEvent::Failed { .. })), "{events:?}");
+    relay.stop(false).await;
 }
