@@ -243,8 +243,12 @@ pub enum OverlayRequest {
     /// device picker over the player (CAST-8).
     CastPicker,
     /// PIN pairing with a TV on Tuner's own screen (DESIGN §40 §3.2; CAST-8). Opened from the
-    /// picker, Settings ▸ Cast and the setup wizard.
-    CastPair(crate::model::DeviceId),
+    /// picker and the casting card (`then_cast`: what plays moves to the TV once paired), and
+    /// from Settings ▸ Cast and the setup wizard (pairing only).
+    CastPair {
+        device: crate::model::DeviceId,
+        then_cast: bool,
+    },
     /// The firewall card: Allow on firewall, "Waiting for your password…", the outcomes, Show
     /// command (DESIGN §40 §3.4, §9.4; CAST-9).
     CastFirewall,

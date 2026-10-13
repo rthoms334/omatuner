@@ -27,8 +27,9 @@
 //!
 //! The PIN goes to the service once (`pair_submit`, a [`Pin`]) and is dropped: it is never
 //! logged, stored or shown in `Debug` output, and the digit buffer is zeroed when it is sent or
-//! cleared. On success: the toast "Paired with <TV>", and when something is playing the cast
-//! starts (`PlayerCommand::CastTo`, what plays moves to the TV).
+//! cleared. On success: the toast "Paired with <TV>", and when opened to cast (the picker, the
+//! casting card's Pair) with something playing, the cast starts (`PlayerCommand::CastTo`, what
+//! plays moves to the TV); from Settings ▸ Cast or the setup wizard it only pairs.
 
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -110,6 +111,8 @@ impl Code {
 
 pub struct CastPair {
     pub device: DeviceId,
+    /// Cast once paired (opened from the picker or the casting card).
+    then_cast: bool,
     /// The job and the service that runs it (cancelled when the overlay goes, unless it ended).
     job: Option<(CastHandle, PairJob)>,
     code: Code,
@@ -132,8 +135,8 @@ enum Failure {
 }
 
 impl CastPair {
-    pub fn new(device: DeviceId) -> Self {
-        Self { device, job: None, code: Code::default(), focus: Focus::Code, opened: None, failure: None, enter: false, ended: false }
+    pub fn new(device: DeviceId, then_cast: bool) -> Self {
+        Self { device, then_cast, job: None, code: Code::default(), focus: Focus::Code, opened: None, failure: None, enter: false, ended: false }
     }
 
     fn armed(&self) -> bool {
@@ -331,9 +334,8 @@ impl Overlay for CastPair {
             PairState::Paired => {
                 self.ended = true;
                 ctx.toast(Toast::info(format!("Paired with {name}")));
-                // the cast starts if something plays (opened from the picker); from Settings
-                // with nothing playing, it only pairs
-                if ctx.player.playable.is_some() {
+                // opened to cast, what plays moves to the TV; Settings and the wizard only pair
+                if self.then_cast && ctx.player.playable.is_some() {
                     ctx.play(PlayerCommand::CastTo { device: self.device, play: None });
                 }
                 return self.cancel();
@@ -441,7 +443,7 @@ mod tests {
             s.pair_state = Some(PairState::EnterCode { variant: PairVariant::Hkp3 });
         });
         t.services().agent.set_cast(Some(CastHandle::new(fake.clone())));
-        let mut h = overlay_harness(t, one, CastPair::new(TV), egui::vec2(1200.0, 800.0));
+        let mut h = overlay_harness(t, one, CastPair::new(TV, true), egui::vec2(1200.0, 800.0));
         h.state_mut().o.opened = Some(Instant::now() - ARMING);
         h.run_steps(2);
         (h, fake)
@@ -490,7 +492,7 @@ mod tests {
         assert_eq!(pin.expose(), "4719");
         assert!(code.digits == [0; DIGITS] && code.len == 0, "zeroed once sent");
         assert!(code.take().is_none(), "nothing left to send");
-        let mut o = CastPair::new(TV);
+        let mut o = CastPair::new(TV, true);
         "4711".chars().for_each(|c| o.code.push(c));
         let shown = format!("{o:?}");
         assert!(!shown.contains("4711") && shown.contains("typed: 4"), "{shown}");
@@ -504,7 +506,7 @@ mod tests {
         let fake = Arc::new(FakeCast::default());
         fake.script(|s| s.pair_state = Some(PairState::EnterCode { variant: PairVariant::Hkp3 }));
         t.services().agent.set_cast(Some(CastHandle::new(fake.clone())));
-        let mut h = overlay_harness(t, one, CastPair::new(TV), egui::vec2(1200.0, 800.0));
+        let mut h = overlay_harness(t, one, CastPair::new(TV, true), egui::vec2(1200.0, 800.0));
         // too soon: a digit or Enter was meant for the screen behind
         type_digits(&mut h, "4711");
         assert_eq!(h.state_mut().act(Action::Activate), "Keep");

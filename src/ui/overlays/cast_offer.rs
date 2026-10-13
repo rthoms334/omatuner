@@ -202,7 +202,7 @@ impl CastOffer {
             cast.firewall_check();
             self.go(Step::Network { forced: false });
         } else {
-            ctx.open(OverlayRequest::CastPair(self.offer.device));
+            ctx.open(OverlayRequest::CastPair { device: self.offer.device, then_cast: false });
             self.go(Step::Pair);
         }
     }
@@ -499,7 +499,10 @@ mod tests {
         let (mut h, fake) = card();
         assert_eq!(h.state_mut().act(Action::Activate), "Keep");
         let nav = h.state_mut().nav();
-        assert!(matches!(nav.as_slice(), [crate::ui::NavRequest::Open(OverlayRequest::CastPair(d))] if *d == living_room()), "{nav:?}");
+        assert!(
+            matches!(nav.as_slice(), [crate::ui::NavRequest::Open(OverlayRequest::CastPair { device: d, then_cast: false })] if *d == living_room()),
+            "{nav:?}"
+        );
         assert_eq!(answered(&mut h).cast.checked_version.as_deref(), Some(VERSION));
         // back from the PIN overlay without pairing: say so, Pair again
         h.run_steps(2);

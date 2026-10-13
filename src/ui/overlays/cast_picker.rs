@@ -161,7 +161,7 @@ impl CastPicker {
                 OverlayOutcome::Close
             }
             Pick::Pair(device) => {
-                ctx.open(OverlayRequest::CastPair(device));
+                ctx.open(OverlayRequest::CastPair { device, then_cast: true });
                 OverlayOutcome::Close
             }
             Pick::PlayHere => {
@@ -786,7 +786,7 @@ mod tests {
         assert_eq!(h.state_mut().act(Action::Down), "Keep");
         h.state_mut().nav();
         assert_eq!(h.state_mut().act(Action::Activate), "Close");
-        assert_eq!(h.state_mut().nav(), vec![NavRequest::Open(OverlayRequest::CastPair(id(2)))]);
+        assert_eq!(h.state_mut().nav(), vec![NavRequest::Open(OverlayRequest::CastPair { device: id(2), then_cast: true })]);
         drop(h);
         // ↓ again skips the Mac and lands on "Add by address…"
         let (mut h, _fake) = picker(devices());

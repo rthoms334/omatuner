@@ -193,7 +193,7 @@ pub fn build(req: OverlayRequest, ctx: &mut UiCtx<'_>) -> Box<dyn Overlay> {
         OverlayRequest::AgentConnect(offer) => Box::new(agent_connect::AgentConnectCard::new(offer)),
         // casting (DESIGN §40; picker and pairing CAST-8, firewall and setup CAST-9)
         OverlayRequest::CastPicker => Box::new(cast_picker::CastPicker::new()),
-        OverlayRequest::CastPair(device) => Box::new(cast_pair::CastPair::new(device)),
+        OverlayRequest::CastPair { device, then_cast } => Box::new(cast_pair::CastPair::new(device, then_cast)),
         OverlayRequest::CastFirewall => Box::new(cast_firewall::CastFirewall::new()),
         OverlayRequest::CastOffer(offer) => Box::new(cast_offer::CastOffer::new(offer)),
     }

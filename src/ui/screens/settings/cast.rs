@@ -353,7 +353,7 @@ pub(super) fn menu_choice(s: &mut SettingsScreen, ctx: &mut UiCtx<'_>, id: i64, 
     let cast = ctx.services.agent.cast();
     let Some(d) = device_of(&cast, id) else { return };
     match code {
-        MENU_PAIR => ctx.open(OverlayRequest::CastPair(d.id)),
+        MENU_PAIR => ctx.open(OverlayRequest::CastPair { device: d.id, then_cast: false }),
         MENU_TEST => test(s, &cast, d.id),
         MENU_DEFAULT => {
             let hex = d.id.to_string();

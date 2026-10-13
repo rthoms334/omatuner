@@ -1519,6 +1519,6 @@ mod tests {
         h.state_mut().nav();
         h.get_by_label("Pair").click();
         h.run_steps(2);
-        assert_eq!(h.state_mut().nav(), vec![NavRequest::Open(OverlayRequest::CastPair(TV))]);
+        assert_eq!(h.state_mut().nav(), vec![NavRequest::Open(OverlayRequest::CastPair { device: TV, then_cast: true })]);
     }
 }
