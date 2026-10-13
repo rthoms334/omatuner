@@ -43,7 +43,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use crate::model::Timestamp;
-pub use crate::model::cast::{CastErrorKind, CastHints, CastLevel, CastPhase, CastView, DeviceId, ReceiverKind};
+pub use crate::model::cast::{CastErrorKind, CastHints, CastLevel, CastPhase, CastView, DeviceId, PositionSource, ReceiverKind};
 use crate::player::remote::{CastConnector, RemoteOutput};
 use crate::player::{PlayerError, PlayerErrorKind};
 use crate::redact::Secret;
@@ -506,6 +506,12 @@ pub trait CastApi: Send + Sync {
     /// failure) and load it again without converting, where the TV is (§8.3). Nothing when
     /// nothing casts.
     fn send_as_is(&self) {}
+    /// Where the positions of the item casting now come from (§7.3: the TV's `playbackInfo`
+    /// answers, or the estimate once one went unanswered): the info panel's Position line.
+    /// `None` while nothing casts, before the first request, and for live (never asked).
+    fn position_source(&self) -> Option<PositionSource> {
+        None
+    }
 
     // ---- Tuner's updates (the restart and install gates; DESIGN §41.6)
     /// What casting has going on (sessions, Test on TV, pairing, the firewall's dialog).

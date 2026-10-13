@@ -132,7 +132,8 @@ pub enum RelayEvent {
         generation: u64,
     },
     /// ffprobe's view of the input (the info panel while casting; the hints cached in
-    /// `cast_hint`).
+    /// `cast_hint`); again once each launch is ready, with what the TV is fed
+    /// (`StreamInfo::cast`), probed or not.
     Probed {
         generation: u64,
         info: Box<crate::player::tracks::StreamInfo>,
@@ -259,6 +260,9 @@ enum Fail {
 /// What [`RelaySession::launch`] needs besides the argv.
 struct Launch {
     argv: Vec<String>,
+    /// What the TV is fed (the info panel while casting, §11.3): sent once the target is
+    /// pinned ([`plan::pinned`]).
+    info: crate::player::tracks::StreamInfo,
     live: bool,
     level: CastLevel,
     offset_s: f64,
@@ -395,6 +399,8 @@ impl RelaySession {
                 Video::Copy => ffmpeg::segment_s().max(gop.unwrap_or(0.0)),
                 _ => ffmpeg::segment_s(),
             };
+            // what the TV is fed: ffprobe's view of the source, else the hints' (§11.3)
+            let info = plan::fed_info(probed.as_ref().map(probe::Probe::stream_info), &facts, &plan);
             let codec = match (plan.video, facts.vcodec.as_deref()) {
                 (Video::Encode { .. }, _) | (Video::Copy, Some("h264")) => Some(Codec::H264),
                 (Video::Copy, Some("hevc")) => Some(Codec::Hevc),
@@ -436,6 +442,7 @@ impl RelaySession {
             });
             let launch = Launch {
                 argv,
+                info,
                 live,
                 level: plan.level,
                 offset_s,
@@ -709,6 +716,8 @@ impl RelaySession {
             });
             let behind_live_s = l.live.then(|| (3.0 * f64::from(target) + l.hls_time).round().min(f64::from(u16::MAX)) as u16);
             tracing::debug!("{}: ready, target duration {target} s", self.label);
+            let info = Box::new(plan::pinned(l.info.clone(), target));
+            let _ = self.tx.send(RelayEvent::Probed { generation: l.generation.load(Ordering::Relaxed), info });
             if ended && let Some(feed) = &l.feed {
                 // the monitor left this to us: the input's end, then the close
                 let _ = self.tx.send(RelayEvent::UpstreamEof { generation: l.generation.load(Ordering::Relaxed) });
@@ -794,6 +803,7 @@ impl RelaySession {
         );
         let launch = Launch {
             argv,
+            info: Default::default(),
             live: false,
             level: CastLevel::Converted,
             offset_s: 0.0,

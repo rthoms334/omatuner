@@ -117,6 +117,10 @@ pub struct StreamInfo {
     pub dropped_frames: Option<i64>,
     pub cache_secs: Option<f64>,
     pub container: Option<String>,
+    /// Casting (DESIGN §40 §11.3): what the TV is fed, from the relay; the fields above are then
+    /// the source as the relay knew it (ffprobe's view, else the hints'), not mpv's. `None` for
+    /// local playback.
+    pub cast: Option<crate::model::cast::CastFeed>,
 }
 
 impl StreamInfo {
@@ -147,6 +151,7 @@ pub fn query_stream_info(mpv: &Mpv) -> StreamInfo {
         dropped_frames: i("frame-drop-count"),
         cache_secs: f("demuxer-cache-duration"),
         container: s("file-format"),
+        cast: None,
     }
 }
 

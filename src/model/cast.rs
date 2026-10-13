@@ -204,6 +204,68 @@ pub struct CastView {
     pub volume: bool,
 }
 
+/// What the TV is fed (DESIGN §40 §8.3, §8.4): the relay's plan for the generation that plays,
+/// sent with every launch (`StreamInfo::cast`, the info panel while casting, §11.3
+/// `RefreshStreamInfo`). The source itself is the rest of that `StreamInfo`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CastFeed {
+    /// The source's facts are ffprobe's; `false`: the hints alone (mpv's view of the item that
+    /// moved to the TV, or a cached `cast_hint`) said enough and the probe was skipped (§8.1.2).
+    pub probed: bool,
+    pub level: CastLevel,
+    pub picture: FeedPicture,
+    /// The stereo sound (beside a surround rendition always AAC stereo, made from the source).
+    pub sound: FeedSound,
+    /// The surround rendition beside the stereo one (§8.4), if any.
+    pub surround: Option<FeedSurround>,
+    /// fMP4 segments (HEVC, or every rendition beside a surround one); else MPEG-TS.
+    pub fmp4: bool,
+    /// The item's pinned `#EXT-X-TARGETDURATION` (§8.1.4), once its first segments are ready.
+    pub target_s: Option<u32>,
+    /// The source's scan type as planned on (`None`: unknown).
+    pub interlaced: Option<bool>,
+    /// The source sound's channel layout as ffprobe names it (`5.1(side)`); probe only.
+    pub layout: Option<String>,
+}
+
+/// The picture's way to the TV (§8.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedPicture {
+    /// No picture (a radio channel).
+    None,
+    /// Copied as the provider sends it (L2 repackaged, L1 untouched).
+    Copied,
+    /// Re-encoded on this computer (L3); `deinterlaced`: through yadif first (Apple rule 1.14).
+    Converted { deinterlaced: bool },
+}
+
+/// The stereo sound's way to the TV (§8.3: AAC up to two channels is copied).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedSound {
+    None,
+    Copied,
+    /// Converted to AAC stereo (Apple rule 2.3).
+    Stereo,
+}
+
+/// The surround rendition (§8.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedSurround {
+    /// The source's own AC-3, E-AC-3 or AAC ≤ 5.1, copied.
+    Copied,
+    /// Converted to AC-3 5.1.
+    Ac3,
+}
+
+/// Where the TV's positions come from (DESIGN §40 §7.3; VOD and catch-up only, live has
+/// none): its `playbackInfo` answers, or, once one went unanswered, the estimate from
+/// `timeJumped` and its fetches (a little behind). The info panel says which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PositionSource {
+    Reported,
+    Estimated,
+}
+
 /// What is known about an item's streams before the relay plans (DESIGN §40 §8.2): mpv's view
 /// when moving what plays, a cached `cast_hint`, or nothing (the relay probes).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

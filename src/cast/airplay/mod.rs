@@ -46,12 +46,14 @@ pub mod trace;
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use super::receiver::{LoadReq, ReceiverEvent, ReceiverInfo};
 use super::{CastErrorKind, Credentials, Identity, PairError, PairVariant, PeerCredentials, Pin};
+use crate::model::cast::PositionSource;
 use events::{Event, PlaybackState};
 use position::{Estimate, Fetch, Fetches, Source};
 use rtsp::{Connection, Request};
@@ -59,8 +61,26 @@ use session::{Channel, Raw, Session};
 
 /// The AirPlay control port (RTSP and HTTP on one TCP connection).
 pub const CONTROL_PORT: u16 = 7000;
+
 /// `X-Apple-Client-Name` on pin-start and every pair-setup (tvOS 27 shows no PIN without it).
 pub const CLIENT_NAME: &str = "Tuner";
+
+/// Where the positions of the session casting now come from (§7.3), for the info panel
+/// (`CastApi::position_source`): 0 nothing asked yet, 1 the TV's `playbackInfo` answers, 2 the
+/// estimate. One slot for the process: one cast session runs at a time (Test on TV waits while
+/// one does), and each client clears it when it connects. Written only by [`State::set_source`].
+static POSITIONS: AtomicU8 = AtomicU8::new(0);
+
+/// The position source of the AirPlay session that connected last (`None` before its first
+/// `playbackInfo` request, and for live, which never asks): the service answers it only while a
+/// session runs.
+pub(crate) fn position_source() -> Option<PositionSource> {
+    match POSITIONS.load(Ordering::Relaxed) {
+        1 => Some(PositionSource::Reported),
+        2 => Some(PositionSource::Estimated),
+        _ => None,
+    }
+}
 
 /// Which `/command` dialect a receiver gets (DESIGN §40 §7.3 for the Apple TV, §7.7 for
 /// third-party TVs: the type-120 SETUP, `SETPEERSX`, stream-id header negotiation,
@@ -181,6 +201,7 @@ impl Client {
 impl State {
     async fn connect(addr: SocketAddr, creds: &Credentials, profile: Profile, ids: &features::ReceiverIds) -> Result<Self, CastErrorKind> {
         let (session, info, raw) = Session::establish(addr, creds, profile, ids).await?;
+        POSITIONS.store(0, Ordering::Relaxed);
         Ok(Self {
             addr,
             creds: creds.clone(),
@@ -367,7 +388,7 @@ impl State {
         self.raw = raw;
         self.played = false;
         self.done = false;
-        self.source = Source::Untried;
+        self.set_source(Source::Untried);
         self.start(req).await
     }
 
@@ -526,18 +547,29 @@ impl State {
         };
         match answer {
             Some(a) => {
-                self.source = Source::Answers;
+                self.set_source(Source::Answers);
                 self.estimate.anchor(a.position, Instant::now());
                 Some(a)
             }
             None => {
                 if self.source == Source::Untried {
                     tracing::debug!("cast: playbackInfo goes unanswered; estimating positions for this session");
-                    self.source = Source::Estimate;
+                    self.set_source(Source::Estimate);
                 }
                 None
             }
         }
+    }
+
+    /// Where positions come from now, mirrored for the info panel ([`position_source`]).
+    fn set_source(&mut self, source: Source) {
+        self.source = source;
+        let slot = match source {
+            Source::Untried => 0,
+            Source::Answers => 1,
+            Source::Estimate => 2,
+        };
+        POSITIONS.store(slot, Ordering::Relaxed);
     }
 
     /// Wait for the response to `id`, taking in every other event meanwhile.
