@@ -13,7 +13,10 @@
 //! * **One upstream request at a time** (§10). Every upstream request goes through the feed's
 //!   [`Wire`]: a new one cancels the one in flight and waits for its connection to close first.
 //!   reqwest keeps no idle connection (`pool_max_idle_per_host(0)`), so a finished request leaves
-//!   nothing open either.
+//!   nothing open either. "Closed" is the socket's close, not the end of the request: reqwest
+//!   closes a connection on hyper's connection task, some time after its response is dropped (or
+//!   read to the end), so every provider connection of a session lives on the session's own
+//!   runtime ([`Net`]), and a request connects only once no task is left there.
 //! * **Head buffer.** A stream's first response is kept from byte 0 (up to [`HEAD_CAP`]; the pump
 //!   then waits) so ffprobe and then ffmpeg read the same first bytes from one provider
 //!   connection. When the relay arms the final reader ([`Feed::arm_final_reader`]), the next
@@ -76,8 +79,11 @@ const SNIFF: usize = 512;
 /// reader (a TV paused at the VOD cap with ffmpeg SIGSTOPped, the head-mode attach wait) never
 /// counts as the provider going silent.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(15);
-/// `close` waits this long for the upstream connection to go (stop-before-start, §8.5).
+/// `close` waits this long for the upstream connection to go (stop-before-start, §8.5), and a
+/// new request this long for the previous one's socket to close.
 pub const CLOSE_WAIT: Duration = Duration::from_millis(1500);
+/// How often [`Net::closed`] looks again while a connection is still closing.
+const CLOSE_POLL: Duration = Duration::from_millis(1);
 /// A cached rewritten playlist is served again for this long (ffprobe → ffmpeg hand-over).
 const PLAYLIST_REUSE: Duration = Duration::from_secs(1);
 /// Upstream URLs remembered for one HLS feed (a live window rotates through them).
@@ -105,6 +111,7 @@ pub struct Proxy {
     addr: SocketAddr,
     feeds: Arc<Mutex<Grants<Arc<Feed>>>>,
     client: reqwest::Client,
+    net: Net,
     kill: CancellationToken,
 }
 
@@ -127,6 +134,7 @@ impl Proxy {
             .map_err(io::Error::other)?;
         let feeds: Arc<Mutex<Grants<Arc<Feed>>>> = Arc::new(Mutex::new(Grants::default()));
         let kill = CancellationToken::new();
+        let net = Net::start(kill.clone()).await?;
         let app = axum::Router::new().fallback(handle).with_state(feeds.clone());
         let capped = Capped::new(listener, super::server::MAX_CONNECTIONS, Ipv4Addr::LOCALHOST, kill.clone());
         let stop = kill.clone();
@@ -136,7 +144,7 @@ impl Proxy {
                 tracing::debug!("cast: loopback proxy: {e}");
             }
         });
-        Ok(Self { addr, feeds, client, kill })
+        Ok(Self { addr, feeds, client, net, kill })
     }
 
     /// One generation's feed under a new loopback token. Nothing is requested yet: the caller
@@ -147,6 +155,8 @@ impl Proxy {
         let feed = Arc::new(Feed {
             ctx,
             client: self.client.clone(),
+            net: self.net.clone(),
+            closing: CancellationToken::new(),
             url: url.clone(),
             headers: request_headers(headers, user_agent),
             base: Secret::new(base),
@@ -183,6 +193,57 @@ impl Proxy {
 impl Drop for Proxy {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// The runtime a session's provider connections live on (§10), on a thread of its own.
+///
+/// reqwest hands a connection's socket to hyper's connection task, which closes it once the
+/// response is dropped or read to the end: later, on another task. A request that waited only for
+/// the previous one's response to go would connect while that socket is still open (the task
+/// that dropped the response wakes the one that waits first, and the connection task runs after
+/// it). Requests are sent from here, so their connection tasks are spawned here too, and no task
+/// alive on this runtime means no provider socket open. Ending the runtime (the proxy's shutdown)
+/// drops whatever is left, which closes it.
+#[derive(Clone)]
+struct Net {
+    handle: tokio::runtime::Handle,
+}
+
+impl Net {
+    /// Start the thread; it ends (dropping every connection left) when `stop` is cancelled.
+    async fn start(stop: CancellationToken) -> io::Result<Self> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new().name("cast-upstream".into()).spawn(move || {
+            match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => {
+                    let _ = tx.send(Ok(rt.handle().clone()));
+                    rt.block_on(stop.cancelled());
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                }
+            }
+        })?;
+        let handle = rx.await.map_err(io::Error::other)??;
+        Ok(Self { handle })
+    }
+
+    /// Send `req` from this runtime. Dropping the future aborts the request: its socket closes
+    /// with its task, which [`Net::closed`] waits for.
+    async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response, String> {
+        let task = tokio_util::task::AbortOnDropHandle::new(self.handle.spawn(req.send()));
+        match task.await {
+            Ok(r) => r.map_err(|e| redact(&e.without_url().to_string()).into_owned()),
+            Err(_) => Err("the request was dropped".to_owned()),
+        }
+    }
+
+    /// Resolves once every provider connection of the session is closed.
+    async fn closed(&self) {
+        while self.handle.metrics().num_alive_tasks() > 0 {
+            tokio::time::sleep(CLOSE_POLL).await;
+        }
     }
 }
 
@@ -347,7 +408,8 @@ struct Wire {
 }
 
 impl Wire {
-    /// Cancel the request in flight and wait until its connection is gone.
+    /// Cancel the request in flight and wait until its pump has let go of the response (its
+    /// socket closes after that, on its connection task: [`Net::closed`]).
     async fn hang_up(&mut self) {
         if let Some((tape, task)) = self.pump.take() {
             tape.cancel.cancel();
@@ -407,6 +469,10 @@ struct FeedState {
 pub struct Feed {
     ctx: FeedCtx,
     client: reqwest::Client,
+    net: Net,
+    /// Cancelled by [`Feed::close`] and [`Feed::cancel_all`]: a request connecting, or a playlist
+    /// being read, gives up at once.
+    closing: CancellationToken,
     url: Secret<String>,
     headers: HeaderMap,
     /// `http://127.0.0.1:P/u/<tok>`: the loopback URL (a bearer token while the session lives).
@@ -493,17 +559,24 @@ impl Feed {
 
     /// Cancel every upstream request now (no waiting, no event: `Drop`'s path).
     pub fn cancel_all(&self) {
+        self.closing.cancel();
         for t in self.tapes.lock().unwrap_or_else(|e| e.into_inner()).iter() {
             t.cancel.cancel();
         }
     }
 
     /// End the feed: cancel the request in flight, wait (≤ [`CLOSE_WAIT`], unless `fast`) for
-    /// its connection to close, then report `UpstreamClosed` (once).
+    /// its socket to close, then report `UpstreamClosed` (once), which frees the lease.
     pub async fn close(&self, fast: bool) {
         self.cancel_all();
         if !fast {
-            let _ = tokio::time::timeout(CLOSE_WAIT, async { self.wire.lock().await.hang_up().await }).await;
+            let gone = async {
+                self.wire.lock().await.hang_up().await;
+                self.net.closed().await;
+            };
+            if tokio::time::timeout(CLOSE_WAIT, gone).await.is_err() {
+                tracing::info!("{}: the provider connection is still closing after {CLOSE_WAIT:?}", self.ctx.label);
+            }
         }
         let first = !std::mem::replace(&mut self.state.lock().unwrap_or_else(|e| e.into_inner()).closed, true);
         if first {
@@ -529,20 +602,31 @@ impl Feed {
         self.client.get(url).headers(self.headers.clone()).header(header::RANGE, format!("bytes={from}-"))
     }
 
-    /// Send on the wire (after hanging up the request in flight). Statuses ≥ 400 are reported
-    /// and fail the feed when `fatal` says so.
+    /// Send on the wire, after hanging up the request in flight and once its socket has closed.
+    /// Statuses ≥ 400 are reported and fail the feed when `fatal` says so.
     async fn send(&self, wire: &mut Wire, url: &str, from: u64, fatal: impl Fn(u16) -> bool) -> Option<reqwest::Response> {
         wire.hang_up().await;
-        if self.state.lock().unwrap_or_else(|e| e.into_inner()).closed {
+        // the provider sees the previous socket close before this one connects (§10)
+        if tokio::time::timeout(CLOSE_WAIT, self.net.closed()).await.is_err() {
+            tracing::info!("{}: the previous provider connection is still closing after {CLOSE_WAIT:?}", self.ctx.label);
+        }
+        // ending (`cancel_all` comes before `close` marks the feed closed): nothing new opens, not
+        // even a reader continuing past its cut tape
+        if self.closing.is_cancelled() {
             return None;
         }
-        let sent = match tokio::time::timeout(UPSTREAM_TIMEOUT, self.request(url, from).send()).await {
-            Ok(r) => r.map_err(|e| redact(&e.without_url().to_string()).into_owned()),
-            Err(_) => Err(format!("no answer within {} s", UPSTREAM_TIMEOUT.as_secs())),
+        let sent = tokio::select! {
+            biased;
+            // the request is aborted with its socket
+            () = self.closing.cancelled() => return None,
+            r = tokio::time::timeout(UPSTREAM_TIMEOUT, self.net.send(self.request(url, from))) => match r {
+                Ok(r) => r,
+                Err(_) => Err(format!("no answer within {} s", UPSTREAM_TIMEOUT.as_secs())),
+            },
         };
         match sent {
-            // closed while connecting: dropping the response closes the connection
-            Ok(_) if self.state.lock().unwrap_or_else(|e| e.into_inner()).closed => None,
+            // ending while connecting: dropping the response closes the connection
+            Ok(_) if self.closing.is_cancelled() => None,
             Ok(r) if r.status().is_success() => Some(r),
             Ok(r) => {
                 let status = r.status().as_u16();
@@ -767,8 +851,13 @@ impl Feed {
         };
         let mut wire = self.wire.lock().await;
         let Some(resp) = self.send(&mut wire, &url, 0, |_| true).await else { return Err(StatusCode::BAD_GATEWAY) };
+        // read on the wire: no other request connects while this one's is open
+        let text = tokio::select! {
+            t = read_rest(resp, Vec::new(), false) => t,
+            () = self.closing.cancelled() => return Err(StatusCode::BAD_GATEWAY),
+        };
         drop(wire);
-        let Some(text) = read_rest(resp, Vec::new(), false).await else {
+        let Some(text) = text else {
             self.fail(None, None);
             return Err(StatusCode::BAD_GATEWAY);
         };

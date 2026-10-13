@@ -111,6 +111,19 @@ fn port_of(url: &str) -> u16 {
     url.split("://").nth(1).and_then(|r| r.split('/').next()).and_then(|h| h.rsplit(':').next()).and_then(|p| p.parse().ok()).unwrap()
 }
 
+/// Sockets this process holds open toward 127.0.0.1:`port`, now. One closed by its owner stays
+/// in `/proc/net/tcp` while it winds down (FIN_WAIT, TIME_WAIT), but without an inode.
+fn sockets_to(port: u16) -> usize {
+    let tcp = std::fs::read_to_string("/proc/net/tcp").unwrap();
+    let remote = format!("{:08X}:{port:04X}", u32::from_ne_bytes(LOOPBACK.octets()));
+    // sl local_address rem_address st tx:rx tr:when retrnsmt uid timeout inode
+    tcp.lines()
+        .skip(1)
+        .map(|l| l.split_whitespace().collect::<Vec<_>>())
+        .filter(|f| f.get(2) == Some(&remote.as_str()) && f.get(9).is_some_and(|i| *i != "0"))
+        .count()
+}
+
 /// The command lines of this process's ffmpeg children.
 fn ffmpeg_cmdlines() -> Vec<String> {
     let me = std::process::id().to_string();
@@ -298,6 +311,52 @@ async fn probe_and_stream_share_one_provider_request() {
     relay.stop(false).await;
 }
 
+/// A request that supersedes one still downloading (a seek, a reconnect, the next segment asked
+/// for early) cuts it, and the provider sees that connection close before the next one opens
+/// (§10). A closed feed's socket is gone by the time `close` returns (its `UpstreamClosed` frees
+/// the lease: mpv or the next load may connect at once). The socket closes on hyper's connection
+/// task some time after the proxy drops the response, so both have to wait for that, not only for
+/// the pump. The throttle keeps segment A mid-body when B is asked for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cut_request_closes_before_the_next_one_connects() {
+    use tuner::cast::relay::upstream::{FeedCtx, Pick, Proxy};
+    let Some(media) = media() else { return };
+    let server = TestServer::start(media, Faults::default());
+    let proxy = Proxy::start().await.unwrap();
+    let client = tv();
+    let port = port_of(&server.base);
+    for round in 0..10 {
+        // a fresh feed each round: no tape holds A or B yet
+        server.set_throttle(None);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = FeedCtx { generation: Arc::new(std::sync::atomic::AtomicU64::new(round)), tx, label: "cast session test".into() };
+        let feed = proxy.feed(ctx, &Secret::new(server.url("/live/index.m3u8")), &HttpHeaders::default(), "TunerTest/1.0");
+        feed.open(Pick::default()).await;
+        assert!(feed.is_hls() && !feed.failed());
+        let text = client.get(feed.loopback_url().expose()).send().await.unwrap().text().await.unwrap();
+        let segs: Vec<&str> = text.lines().filter(|l| !l.starts_with('#')).collect();
+        assert!(segs.len() >= 2, "{text}");
+        server.set_throttle(Some(16_000)); // about 3 s per segment: A is mid-body when B is asked for
+        let a = client.get(segs[0]).send().await.unwrap();
+        assert_eq!(a.status(), 200);
+        let b = client.get(segs[1]).send().await.unwrap();
+        assert_eq!(b.status(), 200);
+        assert_eq!(
+            server.max_concurrent(),
+            1,
+            "round {round}: a provider connection opened before the previous one closed: {:#?}",
+            server.requests()
+        );
+        drop((a, b));
+        proxy.forget(&feed);
+        // the next round opens right away, as the next load would
+        feed.close(false).await;
+    }
+    assert_eq!(sockets_to(port), 0, "the last feed closed with its socket open");
+    assert_eq!(server.max_concurrent(), 1, "{:#?}", server.requests());
+    proxy.shutdown();
+}
+
 /// A load dropped mid-way (the session's `play` is cancelled by a zap or a stop) leaves nothing
 /// running: `stop` (as the next load would) closes its provider connection and kills its ffmpeg,
 /// and the generation still reports `UpstreamClosed` (§10: a one-connection account must never
@@ -441,7 +500,7 @@ async fn broadcast_fixtures_probe_to_the_apple_tv_plan() {
         ("interlaced.ts", CastLevel::Converted, Video::Encode { deinterlace: true }, Audio::Aac),
     ] {
         let path = support::fixture("cast/ts").join(name);
-        let probe = relay::probe::probe(&caps.ffprobe, path.to_str().unwrap()).await.unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        let probe = relay::probe::probe(&caps.ffprobe, path.to_str().unwrap(), false).await.unwrap_or_else(|e| panic!("{name}: {e:?}"));
         let got = plan::plan(ReceiverKind::AppleTv, &probe.facts(&CastHints::default()), opts).unwrap();
         assert_eq!((got.level, got.video, got.audio), (level, video, audio), "{name}: {probe:?}");
     }

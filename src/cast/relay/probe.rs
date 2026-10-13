@@ -72,8 +72,11 @@ pub enum ProbeError {
 }
 
 /// The argv after the program: only the loopback URL is variable (DESIGN §20 "never on a command
-/// line": no provider URL ever).
-pub fn argv(url: &str) -> Vec<String> {
+/// line": no provider URL ever). `hls`: the proxy serves an HLS media playlist, read one segment
+/// at a time (`-http_multiple 0`, as ffmpeg's input): ffprobe's HLS demuxer otherwise opens the
+/// next segment while it still reads this one, which cuts this one's provider request.
+pub fn argv(url: &str, hls: bool) -> Vec<String> {
+    let hls: &[&str] = if hls { &["-http_multiple", "0"] } else { &[] };
     [
         "-v",
         "error",
@@ -89,18 +92,19 @@ pub fn argv(url: &str) -> Vec<String> {
         "3M",
         "-analyzeduration",
         "3M",
-        url,
     ]
     .iter()
+    .chain(hls)
+    .chain(&[url])
     .map(|s| (*s).to_owned())
     .collect()
 }
 
 /// Run ffprobe on `url` (environment cleared but `LC_ALL=C`, killed on drop and when Tuner dies,
 /// like ffmpeg: [`super::ffmpeg::command`]).
-pub async fn probe(ffprobe: &Path, url: &str) -> Result<Probe, ProbeError> {
+pub async fn probe(ffprobe: &Path, url: &str, hls: bool) -> Result<Probe, ProbeError> {
     let mut cmd = super::ffmpeg::command(ffprobe);
-    cmd.args(argv(url)).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.args(argv(url, hls)).stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = cmd.spawn().map_err(|e| {
         tracing::warn!("cast: ffprobe didn't start: {e}");
         ProbeError::Spawn
@@ -322,8 +326,12 @@ mod tests {
 
     #[test]
     fn the_argv_holds_only_the_given_url() {
-        let a = argv("http://127.0.0.1:4711/u/tok");
-        assert_eq!(a.last().map(String::as_str), Some("http://127.0.0.1:4711/u/tok"));
-        assert_eq!(a.iter().filter(|s| s.contains("://")).count(), 1);
+        for hls in [false, true] {
+            let a = argv("http://127.0.0.1:4711/u/tok", hls);
+            assert_eq!(a.last().map(String::as_str), Some("http://127.0.0.1:4711/u/tok"));
+            assert_eq!(a.iter().filter(|s| s.contains("://")).count(), 1);
+            // an option the input doesn't take is an error to ffprobe: HLS only
+            assert_eq!(a.join(" ").contains("-http_multiple 0 "), hls, "{a:?}");
+        }
     }
 }

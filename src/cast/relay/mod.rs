@@ -389,7 +389,7 @@ impl RelaySession {
     /// ffprobe on the head buffer: `Probed` for the info panel; a provider failure is
     /// [`UPSTREAM_FAILED`], an unreadable input `Unsupported`.
     async fn probe(&self, caps: &ffmpeg::Caps, feed: &upstream::Feed, url: &str, generation: u64) -> Result<probe::Probe, CastErrorKind> {
-        match probe::probe(&caps.ffprobe, url).await {
+        match probe::probe(&caps.ffprobe, url, feed.is_hls()).await {
             Ok(pr) => {
                 let _ = self.tx.send(RelayEvent::Probed { generation, info: Box::new(pr.stream_info()) });
                 Ok(pr)

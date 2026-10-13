@@ -1492,7 +1492,7 @@ sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=1
   1. mpv stops through `must_stop_first` (END_FILE awaited for ≤ 1.5 s on limit-1 or unknown-limit playlists);
   2. the controller acquires the lease;
   3. the relay opens upstream.
-- **The TV never opens a provider connection.** Its retries and stalls hit the relay, not the provider. The probe shares the head buffer, and HLS upstream is fetched one variant, one request at a time.
+- **The TV never opens a provider connection.** Its retries and stalls hit the relay, not the provider. The probe shares the head buffer, and HLS upstream is fetched one variant, one request at a time (ffprobe and ffmpeg both read it with `-http_multiple 0`). A request connects only once the previous one's socket has closed, and `UpstreamClosed` comes after that close: reqwest closes a socket on hyper's connection task after the response is gone, so the relay's provider connections live on a runtime of their own and the relay waits until none is left there.
 - **Relay reconnects** are the controller's `Effect::Load` under the existing policy, including the 45 s `race_window` and `race_retry` (`reconnect.rs:44-45`).
 - **Copy fallback still works.** `CopyPlay.elsewhere` for 401/403/Budget and `observe_refusal` act on `Input::HttpStatus`, which the relay now supplies.
 - **Mirroring (local plus TV) is not offered.** It needs a second lease, and on these accounts it is usually refused.
@@ -1712,7 +1712,7 @@ Not needed: protobuf/prost, `plist`, dalek/RustCrypto, `srp`, `rust_cast`, `rupn
   - a wrong token, a wrong peer (allow-list injected) and path traversal all get byte-identical 404s;
   - HEAD and Range give 206 and a correct `Content-Length`;
   - a view token serves the shared segments and the old token 404s.
-- **One connection:** `set_session_limit(1)` and `max_concurrent == 1` across probe and stream.
+- **One connection:** `set_session_limit(1)` and `max_concurrent == 1` across probe and stream; a request cut mid-body (throttled HLS segments) closes its socket before the next one connects, and none is left open when `close` returns.
 - **Reconnect:** 403 becomes `RemoteEvent::Http(403)`; `kill`/`revive` produces upstream close and reopen.
 - **No leaks:**
   - no provider host, path or credential string in any served byte, header or log line (the `tests/redact.rs` pattern);
