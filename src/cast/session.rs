@@ -35,10 +35,12 @@
 //!   A surround item the TV doesn't play is first tried again in stereo (§8.4), which costs no
 //!   escalation; a segment that outgrew the pinned target restarts the item where the TV is
 //!   (§8.1.4), at the same level.
-//! * **Positions** (§7.3): the receiver reports positions in its current playlist, which always
-//!   starts at 0 (EVENT playlists say `EXT-X-START:TIME-OFFSET=0`); the item's offset (a `-ss`
-//!   restart or a playlist view's first segment) is added here, so the controller's snapshot,
-//!   progress and `finished` stay true to the film. The receiver reports them on its own
+//! * **Positions** (§7.3): the receiver reports positions in its current playlist; the item's
+//!   offset (a `-ss` restart or a playlist view's first segment) is added here, so the
+//!   controller's snapshot, progress and `finished` stay true to the film. A full-length item
+//!   (§8.5) is the whole film from 0 whatever its start (`EXT-X-START` places the TV): its offset
+//!   is 0, and a seek, the TV's own scrub included, is the TV's position as it says it.
+//!   A TV that ignores `EXT-X-START` (`StartIgnored`) gets a view that starts there instead. The receiver reports them on its own
 //!   (AirPlay: `playbackInfo` every 10 s while VOD or catch-up plays, `Client::next_event`); the
 //!   session asks once more before a stop, and before every reload of the item under the same
 //!   generation ([`Session::here`]): a reload continues where the viewer is, not at the last 10 s
@@ -1169,7 +1171,12 @@ impl Session {
                     (c.fetched_playlist, c.fetched_segments, c.watchdog) = (true, true, None);
                 }
             }
-            RelayEvent::Irregular { .. } | RelayEvent::TargetOverflow { .. } | RelayEvent::CpuTooSlow { .. } | RelayEvent::Failed { .. } => {}
+            RelayEvent::Irregular { .. }
+            | RelayEvent::TargetOverflow { .. }
+            | RelayEvent::StartIgnored { .. }
+            | RelayEvent::Unindexed { .. }
+            | RelayEvent::CpuTooSlow { .. }
+            | RelayEvent::Failed { .. } => {}
         }
     }
 
@@ -1215,6 +1222,23 @@ impl Session {
                 // a longer GOP than the pinned target covers: the same level, where the TV is
                 self.cur.as_ref().filter(|c| c.generation == generation)?;
                 tracing::info!("cast session {}: a segment outgrew the target duration: restarting with a longer one", self.device.id.short());
+                let at = self.here().await;
+                Some(Job::again(self.cur.as_ref()?, at))
+            }
+            RelayEvent::StartIgnored { generation, at_s } => {
+                // the TV played a full-length item from its beginning, not from where its playlist
+                // said: the same place again, as a view that starts there (§8.5)
+                self.cur.as_ref().filter(|c| c.generation == generation)?;
+                tracing::info!(
+                    "cast session {}: the TV doesn't start where the playlist says: a playlist from there instead",
+                    self.device.id.short()
+                );
+                self.seek(at_s).await
+            }
+            RelayEvent::Unindexed { generation } => {
+                // the item's keyframe index didn't hold: a growing playlist, where the TV is
+                self.cur.as_ref().filter(|c| c.generation == generation)?;
+                tracing::info!("cast session {}: the film's keyframe index didn't hold: restarting it as a growing playlist", self.device.id.short());
                 let at = self.here().await;
                 Some(Job::again(self.cur.as_ref()?, at))
             }

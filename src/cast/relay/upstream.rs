@@ -33,6 +33,11 @@
 //!   2026-10-13 film's provider closed its connection 30 s in; that had cost a reconnect and a
 //!   reload on the TV). Live and HLS segments fail as before (ffmpeg skips a broken segment; a
 //!   live stream reconnects through the controller's policy).
+//! * **Optional requests** (a full-length item's keyframe index, §8.5, marked with
+//!   [`OPTIONAL_HEADER`]) are a byte range the relay can do without: a provider that refuses or
+//!   breaks one fails that request alone (the relay falls back to an EVENT playlist), never the
+//!   feed. Some one-connection panels refuse a connection made right after the previous one
+//!   closed; for the stream itself that is a provider failure, for the index it isn't.
 //! * **Why a stream broke** is logged as its cause ([`cause`]): reqwest files every failure to
 //!   read a body as "error decoding response body", a provider closing its connection too.
 //! * **HLS upstream.** The proxy picks one variant (mpv's, approximated by its height, else the
@@ -72,6 +77,8 @@ use crate::redact::{Secret, redact};
 
 /// The head buffer (§8.1.1): bytes kept from byte 0 until ffmpeg attaches.
 pub const HEAD_CAP: usize = 16 << 20;
+/// A request with this header is optional (module docs): its failures are its own.
+pub const OPTIONAL_HEADER: &str = "x-tuner-optional";
 /// Bytes a tape may run ahead of its reader once trimming.
 const AHEAD_CAP: u64 = 16 << 20;
 /// A request this far past a filling tape's end waits for it instead of re-opening.
@@ -518,6 +525,17 @@ impl Feed {
         matches!(*self.kind.lock().unwrap_or_else(|e| e.into_inner()), Kind::Hls(_))
     }
 
+    /// The resource's length when the provider serves it by `Range` (a film's file, as the
+    /// first response said): a full-length cast makes each segment from where it starts (§8.5).
+    /// `None` for live streams, HLS, and providers that ignore `Range`.
+    pub fn sized(&self) -> Option<u64> {
+        let tapes = self.tapes.lock().unwrap_or_else(|e| e.into_inner());
+        tapes.iter().filter(|t| t.key == Key::Main).find_map(|t| {
+            let s = t.lock();
+            s.total.filter(|_| s.ranges)
+        })
+    }
+
     /// An HLS key that isn't AES-128 (`SAMPLE-AES`, a DRM `KEYFORMAT`): refused.
     pub fn encrypted(&self) -> bool {
         self.encrypted.load(Ordering::Relaxed)
@@ -810,8 +828,9 @@ impl Feed {
         wire.pump = Some((tape, task));
     }
 
-    /// The tape that serves `key` at `pos`, opening the provider when none does.
-    async fn tape_for(&self, key: Key, pos: u64) -> Result<Arc<Tape>, StatusCode> {
+    /// The tape that serves `key` at `pos`, opening the provider when none does; `optional`: the
+    /// provider's refusal fails this request only (module docs).
+    async fn tape_for(&self, key: Key, pos: u64, optional: bool) -> Result<Arc<Tape>, StatusCode> {
         if let Some(t) = self.find_tape(key, pos) {
             return Ok(t);
         }
@@ -828,8 +847,8 @@ impl Feed {
             return Ok(t);
         }
         // a segment that's gone (404) or broken is skipped by ffmpeg, as mpv does; a refusal
-        // (401/403/429/451) or the main stream failing ends the feed
-        let fatal = move |s: u16| key == Key::Main || matches!(s, 401 | 403 | 429 | 451);
+        // (401/403/429/451) or the main stream failing ends the feed; an optional read, nothing
+        let fatal = move |s: u16| !optional && (key == Key::Main || matches!(s, 401 | 403 | 429 | 451));
         let Some(resp) = self.send(&mut wire, &url, pos, fatal).await else { return Err(StatusCode::BAD_GATEWAY) };
         let tape = self.new_tape(key, pos, &resp);
         self.start_pump(&mut wire, tape.clone(), resp);
@@ -1237,6 +1256,7 @@ async fn handle(State(feeds): State<Arc<Mutex<Grants<Arc<Feed>>>>>, req: Request
         return not_found();
     }
     let range = req.headers().get(header::RANGE).and_then(|v| v.to_str().ok()).map(str::to_owned);
+    let optional = req.headers().contains_key(OPTIONAL_HEADER);
     let epoch = feed.new_reader();
     let hls = feed.is_hls();
     match (hls, key) {
@@ -1249,19 +1269,20 @@ async fn handle(State(feeds): State<Arc<Mutex<Grants<Arc<Feed>>>>>, req: Request
             Err(code) => status(code),
         },
         (false, Key::Res(_)) => not_found(),
-        _ => serve_bytes(feed, key, range.as_deref(), epoch).await,
+        _ => serve_bytes(feed, key, range.as_deref(), epoch, optional).await,
     }
 }
 
-/// A stream or an HLS resource from its tape(s), from the requested offset on.
-async fn serve_bytes(feed: Arc<Feed>, key: Key, range: Option<&str>, epoch: u64) -> Response {
+/// A stream or an HLS resource from its tape(s), from the requested offset on (`optional`: see
+/// the module docs).
+async fn serve_bytes(feed: Arc<Feed>, key: Key, range: Option<&str>, epoch: u64, optional: bool) -> Response {
     // the offset only; an end is honoured by length (ffmpeg asks open-ended)
     let (from, upto) = range
         .and_then(|r| r.trim().strip_prefix("bytes="))
         .and_then(|r| r.split_once('-'))
         .and_then(|(a, b)| Some((a.trim().parse::<u64>().ok()?, b.trim().parse::<u64>().ok())))
         .unwrap_or((0, None));
-    let tape = match feed.tape_for(key, from).await {
+    let tape = match feed.tape_for(key, from, optional).await {
         Ok(t) => t,
         Err(code) => return status(code),
     };
@@ -1286,7 +1307,7 @@ async fn serve_bytes(feed: Arc<Feed>, key: Key, range: Option<&str>, epoch: u64)
         (None, None) => None,
     };
     let limit = last.map(|l| l + 1 - from);
-    let body = reader(feed, tape, from, limit, epoch);
+    let body = reader(ReadState { feed, tape, pos: from, left: limit, epoch, optional, done: false });
     let mut resp = Response::new(body);
     let h = resp.headers_mut();
     if let Some(ct) = ct {
@@ -1325,14 +1346,15 @@ struct ReadState {
     pos: u64,
     left: Option<u64>,
     epoch: u64,
+    /// An optional request (module docs): a break ends it, not the feed.
+    optional: bool,
     done: bool,
 }
 
 /// The response body of one reader: bytes from `pos`, across tapes when one is cut, until the
 /// end, `limit`, a newer reader, or a failure (an error: hyper aborts the response, so the
 /// reader sees a broken transfer rather than a clean end).
-fn reader(feed: Arc<Feed>, tape: Arc<Tape>, pos: u64, limit: Option<u64>, epoch: u64) -> Body {
-    let st = ReadState { feed, tape, pos, left: limit, epoch, done: false };
+fn reader(st: ReadState) -> Body {
     Body::from_stream(futures_util::stream::unfold(st, |mut s| async move {
         if s.done || s.left == Some(0) {
             return None;
@@ -1406,17 +1428,19 @@ async fn next_chunk(s: &mut ReadState) -> io::Result<Option<Bytes>> {
             Some(Err(None)) => return Ok(None),
             Some(Err(Some(End::Cut))) if !s.feed.failed() => {
                 // continue on a new request from here (same response)
-                s.tape = s.feed.tape_for(s.tape.key, s.pos).await.map_err(|_| io::Error::other("the provider stopped"))?;
+                s.tape = s.feed.tape_for(s.tape.key, s.pos, s.optional).await.map_err(|_| io::Error::other("the provider stopped"))?;
                 continue;
             }
             Some(Err(Some(End::Failed))) if resumable(&s.tape) && s.feed.may_resume(s.pos) => {
                 // a film's connection dropped: the same bytes from where it broke (module docs)
                 tracing::info!("{}: resuming the provider's stream at byte {}", s.feed.ctx.label, s.pos);
-                s.tape = s.feed.tape_for(s.tape.key, s.pos).await.map_err(|_| io::Error::other("the provider stopped"))?;
+                s.tape = s.feed.tape_for(s.tape.key, s.pos, s.optional).await.map_err(|_| io::Error::other("the provider stopped"))?;
                 continue;
             }
             Some(Err(Some(_))) => {
-                s.feed.fail(None, None);
+                if !s.optional {
+                    s.feed.fail(None, None);
+                }
                 return Err(io::Error::other("the provider's stream broke"));
             }
             None if moved => s.tape.changed.notify_waiters(), // room for the pump; look again

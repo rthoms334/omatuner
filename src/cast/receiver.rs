@@ -4,9 +4,10 @@
 //! orchestrator's tests use (CAST-6); the protocol-level fake TV is
 //! `tests/support/fake_airplay.rs` (CAST-3).
 //!
-//! The TV always starts at 0 of the playlist it is given: a resume or a seek gives it a playlist
-//! that starts there (`-ss` restart or a playlist view), and `LoadReq::offset_s` is added to the
-//! positions it reports, so the player sees absolute positions.
+//! The TV starts where the playlist it is given says: at its 0 (a resume or a seek gives it a
+//! playlist that starts there: a `-ss` restart or a playlist view, whose start is
+//! `LoadReq::offset_s`, added to the positions it reports), or for a full-length item at its
+//! `EXT-X-START` (the item's own time: offset 0). The player sees absolute positions.
 
 use std::sync::{Arc, Mutex};
 
@@ -23,7 +24,8 @@ pub struct LoadReq {
     pub url: Secret<String>,
     /// A live sliding-window playlist (else EVENT: catch-up, VOD, the test card).
     pub live: bool,
-    /// Seconds into the item where this playlist starts (added to reported positions).
+    /// Seconds into the item where this playlist starts (added to reported positions; 0 for a
+    /// full-length item's whole playlist).
     pub offset_s: f64,
 }
 

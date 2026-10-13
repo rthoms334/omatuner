@@ -1240,15 +1240,21 @@ notification with *Show* when Tuner is on another workspace.
   the TV picks for stereo speakers (AC-3, E-AC-3 and AAC 5.1 as they are, anything else as
   Dolby Digital 5.1); other AirPlay TVs get stereo. Subtitles and teletext are dropped.
   Encrypted (DRM) streams can't be cast.
-- **On a film, the TV's own scrubber** reaches about a minute past where it plays (Tuner
-  fetches the film as it is watched); Tuner's seek bar reaches the whole film.
+- **Films, episodes and catch-up reach the TV whole** when they can: the TV shows the real
+  length, and its remote scrubs anywhere (each part is prepared when the TV asks for it, so a
+  jump takes a few seconds). That needs a provider that serves the file in parts and a file
+  that says where its keyframes are (MP4, and MKV with an index); otherwise (MPEG-TS films and
+  most catch-up, MKV without an index, a provider that sends the whole file only) the TV's own
+  scrubber reaches about a minute past where it plays, and Tuner's seek bar reaches the whole
+  item. The log says which (`full length: …` or `a growing playlist: …`).
 - **One picture:** casting is unavailable in multi-view, and the pop-out is disabled while it
   casts.
 - **Provider connections:** the cast uses the one connection the local player would, so a
   one-connection account works; a change of channel or a reload can briefly collide with the
   provider's limit.
-- **Catch-up and films** can seek only as far as has been prepared (a toast says so); a film
-  uses up to 8 GiB of disk cache while it casts, wiped when it stops.
+- **Catch-up that isn't cast whole** can seek only as far as has been prepared (a toast says
+  so). A film uses up to 8 GiB of disk cache while it casts, wiped when it stops; Tuner reads
+  it from the provider about a minute ahead of the TV, never the whole film at once.
 - **Keeping awake:** casting holds a sleep inhibitor so the laptop doesn't suspend (Settings ▸
   Cast ▸ *Keep this computer awake while casting*); closing the lid still suspends.
 - **Developer variables:** `TUNER_CAST_TRACE=1` writes a redacted transcript of the AirPlay
