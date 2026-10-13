@@ -55,6 +55,7 @@ use crate::player::render::SurfaceFactory;
 use crate::player::{PlayerError, PlayerErrorKind, PlayerSnapshot, PlayerState, VideoSurface};
 use crate::theme::{SpaceToken, Theme, TypeToken, with_alpha};
 use crate::ui::LayoutClass;
+use crate::ui::overlays::cast_offer::error_sentence;
 use crate::ui::widgets::{glyphs, logo};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -867,7 +868,7 @@ pub(crate) fn cast_card(snap: &PlayerSnapshot, convert_off: bool) -> Option<Cast
         _ => None,
     };
     if let Some(kind) = failed {
-        return Some(CastCard::Failed { kind, sentence: cast_error_copy(kind, &view.name, live, convert_off) });
+        return Some(CastCard::Failed { kind, sentence: error_sentence(kind, &view.name, live, convert_off) });
     }
     let (line, busy) = cast_phase_line(snap, view, live);
     Some(CastCard::Running { name: view.name.clone(), line, busy })
@@ -898,31 +899,6 @@ fn cast_phase_line(snap: &PlayerSnapshot, view: &CastView, live: bool) -> (Strin
         (Some(CastLevel::Converted), true) => ("Converting picture".to_owned(), false),
         (Some(CastLevel::Converted), false) => (format!("{state} · Converting picture"), false),
         _ => (state, false),
-    }
-}
-
-/// The one sentence for each failure (DESIGN §40 §3.4). Only the sanitized TV name appears:
-/// never device or provider text. `live` picks "channel's" or "title's"; `convert_off` adds
-/// where to turn converting on.
-pub(crate) fn cast_error_copy(kind: CastErrorKind, name: &str, live: bool, convert_off: bool) -> String {
-    match kind {
-        CastErrorKind::Firewall => format!("{name} couldn't connect back to Tuner. Your firewall is blocking it."),
-        CastErrorKind::Unsupported => {
-            let what = if live { "channel's" } else { "title's" };
-            let hint = if convert_off { " Converting is off in Settings ▸ Cast." } else { "" };
-            format!("{name} can't play this {what} format.{hint}")
-        }
-        CastErrorKind::CpuTooSlow => format!("This computer can't convert this {} fast enough.", if live { "channel" } else { "title" }),
-        CastErrorKind::NeedsFfmpeg => "Casting needs ffmpeg (it's normally installed with mpv).".to_owned(),
-        CastErrorKind::Unreachable => format!("{name} isn't answering. Is it on and on the same network?"),
-        CastErrorKind::PairingRequired => format!("{name} needs pairing."),
-        CastErrorKind::PairingLost => format!("{name} forgot Tuner. This can happen after a TV update."),
-        // both causes read the same here: 470 at pairing, or an empty pair-verify reply
-        CastErrorKind::PairingRefused => "On the Apple TV: Settings ▸ AirPlay and HomeKit ▸ Allow Access ▸ Anyone on the Same Network \
-             ('Everyone in your Home' blocks Tuner), and give it a room in the Home app."
-            .to_owned(),
-        CastErrorKind::StoppedOnTv => format!("{name} stopped playing. Its remote stopped it, or another device took over."),
-        CastErrorKind::ReceiverFailed => format!("{name} couldn't play it."),
     }
 }
 
@@ -1253,17 +1229,17 @@ mod tests {
         assert_eq!(cast_actions(None), vec![A::StopCasting, A::PlayHere]);
         for (kind, actions) in table {
             assert_eq!(cast_actions(Some(kind)), actions, "{kind:?}");
-            let copy = cast_error_copy(kind, "Living Room", true, true);
+            let copy = error_sentence(kind, "Living Room", true, true);
             assert!(!copy.is_empty() && !copy.contains("://"), "{kind:?}: {copy}");
             // every action but the recovery buttons has a name
             assert!(actions.iter().all(|a| a.cast_label().is_some()), "{kind:?}");
         }
         assert_eq!(
-            cast_error_copy(K::Unsupported, "Living Room", true, true),
+            error_sentence(K::Unsupported, "Living Room", true, true),
             "Living Room can't play this channel's format. Converting is off in Settings ▸ Cast."
         );
-        assert_eq!(cast_error_copy(K::Unsupported, "Living Room", true, false), "Living Room can't play this channel's format.");
-        assert_eq!(cast_error_copy(K::Unreachable, "Living Room", true, false), "Living Room isn't answering. Is it on and on the same network?");
+        assert_eq!(error_sentence(K::Unsupported, "Living Room", true, false), "Living Room can't play this channel's format.");
+        assert_eq!(error_sentence(K::Unreachable, "Living Room", true, false), "Living Room isn't answering. Is it on and on the same network?");
     }
 
     #[test]

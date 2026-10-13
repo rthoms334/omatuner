@@ -58,23 +58,26 @@ pub(crate) fn kind_label(kind: ReceiverKind) -> &'static str {
     }
 }
 
-/// The one sentence of a cast failure (DESIGN §40 §3.4), shared by the alerts (toast and
-/// desktop notification), the wizard and Settings. `name` is the TV's sanitized name; never
-/// device or provider text beyond it. `convert_off`: `cast.convert = never` (Unsupported says
-/// so).
-pub(crate) fn error_sentence(kind: CastErrorKind, name: &str, convert_off: bool) -> String {
+/// The one sentence of a cast failure (DESIGN §40 §3.4), shared by the casting card, the
+/// alerts (toast and desktop notification), the wizard and Settings. `name` is the TV's
+/// sanitized name; never device or provider text beyond it. `live` picks "channel's" or
+/// "title's"; `convert_off`: `cast.convert = never` (Unsupported says where to turn it on).
+pub(crate) fn error_sentence(kind: CastErrorKind, name: &str, live: bool, convert_off: bool) -> String {
+    let what = if live { "channel" } else { "title" };
     match kind {
         CastErrorKind::Firewall => super::cast_firewall::blocked_sentence(name),
-        CastErrorKind::Unsupported if convert_off => format!("{name} can't play this channel's format. Converting is off in Settings ▸ Cast."),
-        CastErrorKind::Unsupported => format!("{name} can't play this channel's format."),
-        CastErrorKind::CpuTooSlow => "This computer can't convert this channel fast enough.".into(),
+        CastErrorKind::Unsupported if convert_off => format!("{name} can't play this {what}'s format. Converting is off in Settings ▸ Cast."),
+        CastErrorKind::Unsupported => format!("{name} can't play this {what}'s format."),
+        CastErrorKind::CpuTooSlow => format!("This computer can't convert this {what} fast enough."),
         CastErrorKind::NeedsFfmpeg => "Casting needs ffmpeg (it's normally installed with mpv).".into(),
         CastErrorKind::Unreachable => format!("{name} isn't answering. Is it on and on the same network?"),
         CastErrorKind::PairingRequired => format!("{name} needs pairing."),
         CastErrorKind::PairingLost => format!("{name} forgot Tuner. This can happen after a TV update."),
-        CastErrorKind::PairingRefused => {
-            "On the Apple TV: Settings ▸ AirPlay and HomeKit ▸ Allow Access ▸ Anyone on the Same Network, and give it a room in the Home app.".into()
-        }
+        // both causes read the same here (CastErrorKind has no home-only flag): a 470 at
+        // pairing, or an empty pair-verify reply (the PIN overlay tells them apart)
+        CastErrorKind::PairingRefused => "On the Apple TV: Settings ▸ AirPlay and HomeKit ▸ Allow Access ▸ Anyone on the Same Network \
+             ('Everyone in your Home' blocks Tuner), and give it a room in the Home app."
+            .into(),
         CastErrorKind::StoppedOnTv => format!("{name} stopped playing. Its remote stopped it, or another device took over."),
         CastErrorKind::ReceiverFailed => format!("{name} couldn't play it."),
     }
@@ -307,7 +310,7 @@ impl CastOffer {
                 ),
             ),
             Step::Test { .. } => (format!("Set up {name}"), format!("Playing Tuner's test card on {name} for 15 seconds…")),
-            Step::Failed(kind) => (format!("Set up {name}"), error_sentence(kind, name, ctx.config.cast.convert == CastConvert::Never)),
+            Step::Failed(kind) => (format!("Set up {name}"), error_sentence(kind, name, true, ctx.config.cast.convert == CastConvert::Never)),
             Step::Ready => (format!("{name} is ready"), format!("Ready. Press {} in the player to cast.", cast_key())),
         }
     }

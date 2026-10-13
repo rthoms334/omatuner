@@ -258,7 +258,7 @@ pub(super) fn rows(s: &SettingsScreen, ctx: &UiCtx<'_>, v: &mut Vec<Row>) {
         match cast.test_state() {
             TestState::Running => v.push(Row::Note(format!("Playing Tuner's test card on {} for 15 seconds…", tv.name), false)),
             TestState::Passed => v.push(Row::Note(format!("{} played the test card: ready to cast.", tv.name), false)),
-            TestState::Failed(kind) => v.push(Row::Note(error_sentence(kind, &tv.name, cfg.cast.convert == CastConvert::Never), true)),
+            TestState::Failed(kind) => v.push(Row::Note(error_sentence(kind, &tv.name, true, cfg.cast.convert == CastConvert::Never), true)),
             TestState::Idle => {}
         }
     }
@@ -407,7 +407,7 @@ pub(super) fn frame(s: &mut SettingsScreen, ui: &egui::Ui, ctx: &mut UiCtx<'_>) 
             let name = cast.devices().into_iter().find(|d| d.id == id).map_or_else(|| "The TV".to_owned(), |d| d.name);
             ctx.toast(Toast::info(format!("Added {name}")));
         }
-        Some(Err(kind)) => ctx.toast(Toast::error(error_sentence(kind, "The TV at that address", false))),
+        Some(Err(kind)) => ctx.toast(Toast::error(error_sentence(kind, "The TV at that address", true, false))),
         None => {}
     }
     let busy = cast.searching() || matches!(cast.test_state(), TestState::Running) || cast.firewall().is_none();

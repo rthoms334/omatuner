@@ -494,7 +494,8 @@ impl TunerApp {
         use crate::cast::CastErrorKind as K;
         let name = self.cast_name();
         let convert_off = self.services().config().cast.convert == crate::config::CastConvert::Never;
-        let text = crate::ui::overlays::cast_offer::error_sentence(kind, &name, convert_off);
+        let live = crate::ui::video_host::is_live(self.snapshot.playable.as_ref().map(|p| &p.kind));
+        let text = crate::ui::overlays::cast_offer::error_sentence(kind, &name, live, convert_off);
         let toast = match kind {
             _ if ended => Toast { kind: ToastKind::Info, text: text.clone(), action: Some(("Cast again".into(), Action::CastMenu)), ttl_ms: 10_000 },
             K::NeedsFfmpeg => Toast { ttl_ms: 10_000, ..Toast::error(text.clone()) },
