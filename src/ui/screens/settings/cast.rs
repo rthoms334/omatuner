@@ -251,7 +251,8 @@ pub(super) fn rows(s: &SettingsScreen, ctx: &UiCtx<'_>, v: &mut Vec<Row>) {
     }
     v.push(Row::Act { act: Act::Feature(Feature::Cast, ACT_CHECK), icon: glyphs::REFRESH, label: "Check again".into(), danger: false });
     v.push(Row::Number(&PORT));
-    if test_device(cfg, &devices).is_some() {
+    // the service skips Test on TV while a cast runs (one session at a time)
+    if casting.is_none() && test_device(cfg, &devices).is_some() {
         v.push(Row::Act { act: Act::Feature(Feature::Cast, ACT_TEST), icon: glyphs::CAST, label: "Test on TV…".into(), danger: false });
     }
     if let Some(tv) = s.cast.tested.and_then(|id| devices.iter().find(|d| d.id == id)) {
@@ -337,7 +338,7 @@ pub(super) fn menu(ctx: &UiCtx<'_>, id: i64) -> Option<(String, Vec<MenuItem>)> 
             Pairing::Paired(_) => items.push(mi(glyphs::REFRESH, "Pair again", MENU_PAIR)),
             Pairing::NotNeeded => {}
         }
-        if !matches!(d.pairing, Pairing::Required) {
+        if !matches!(d.pairing, Pairing::Required) && ctx.player.cast.is_none() {
             items.push(mi(glyphs::CAST, "Test on TV", MENU_TEST));
         }
         if !is_default(ctx.config, &d) {
