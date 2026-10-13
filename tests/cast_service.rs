@@ -417,6 +417,31 @@ fn a_seek_uses_a_view_inside_what_is_produced_and_a_restart_beyond() {
     assert!(matches!(evs.last(), Some(RemoteEvent::UpstreamClosed { generation: 1, at }) if *at != old_feed), "{evs:?}");
 }
 
+/// Catch-up can seek only as far as it has loaded (§8.5): a seek beyond the produced edge is a
+/// view at the edge (no new upstream), and the controller is told for its banner.
+#[test]
+fn a_catch_up_seek_past_what_is_loaded_clamps_to_the_edge() {
+    let r = rig("tuner-cast-service-clamp", calm());
+    let tv = r.links.receiver();
+    let relay = r.links.relay();
+    relay.with(|s| s.produced_s = 600.0);
+    let out = r.cast.open(tv_id()).unwrap();
+    let kind = PlayableKind::Catchup { start: 1_000, stop: 4_600 };
+    let media = MediaRef::Catchup { channel: ChannelId(1), start: 1_000, stop: 4_600, catchup_id: None };
+    load(&out, 1, playable(media, kind, item(ItemKind::Channel, "ch:a"), None, Some(3600.0)));
+    until("the insert", || calls(&tv).len() == 1);
+    relay.emit(RelayEvent::PlaylistFetched { generation: 1 });
+    tv.emit(ReceiverEvent::Playing);
+    wait_event(&out.events, "the picture", |e| matches!(e, RemoteEvent::Playing { .. }));
+
+    out.cmd.send(RemoteCmd::SeekTo(2000.0)).unwrap();
+    wait_event(&out.events, "the clamp", |e| *e == RemoteEvent::SeekClamped { generation: 1 });
+    until("the view's replace", || calls(&tv).len() == 2);
+    assert!(matches!(&calls(&tv)[1], Call::Replace(req) if req.offset_s == 600.0));
+    let loads = relay.with(|s| s.calls.iter().filter(|c| matches!(c, RelayCall::Load { .. })).count());
+    assert_eq!(loads, 1, "no restart: catch-up keeps its one upstream");
+}
+
 /// Discovery lists a new TV as "Pair first" (and the store remembers it); casting to it is
 /// refused until it is paired.
 #[test]

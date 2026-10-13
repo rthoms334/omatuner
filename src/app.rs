@@ -874,6 +874,15 @@ impl TunerApp {
                 kind: crate::player::PlayerErrorKind::Cast(kind),
                 ..
             })) => self.cast_alert(*kind, false, egui_ctx),
+            // a catch-up seek on the TV stopped at what the relay has loaded (DESIGN §40 §8.5)
+            AppEvent::Player(crate::player::PlayerEvent::SeekClamped) => {
+                self.toast(Toast {
+                    kind: ToastKind::Info,
+                    text: "Catch-up can only seek as far as it has loaded".into(),
+                    action: None,
+                    ttl_ms: 4000,
+                });
+            }
             AppEvent::Player(crate::player::PlayerEvent::CastEnded { device, name, kind }) => {
                 self.cast.last = Some((*device, name.clone()));
                 self.cast_alert(*kind, true, egui_ctx);

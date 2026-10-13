@@ -220,6 +220,14 @@ impl Relay {
         }
     }
 
+    /// How far a catch-up seek can go (`RelaySession::produced_s`).
+    pub async fn produced_s(&mut self) -> Option<f64> {
+        match self {
+            Relay::Session(r) => r.produced_s().await,
+            Relay::Fake(f) => Some(f.state.lock().unwrap_or_else(|e| e.into_inner()).produced_s),
+        }
+    }
+
     pub async fn test_card(&mut self, generation: u64) -> Result<Prepared, CastErrorKind> {
         match self {
             Relay::Session(r) => r.test_card(generation).await,
@@ -898,8 +906,8 @@ impl Session {
     }
 
     /// A seek (§11.3): inside what's produced, a replace with a playlist view; beyond it, VOD
-    /// restarts at the target (`-ss`, a new token); catch-up stays where it is (it can seek
-    /// only as far as it has loaded).
+    /// restarts at the target (`-ss`, a new token) and catch-up clamps to the produced edge
+    /// (§8.5: it can seek only as far as it has loaded; the controller's banner says so).
     async fn seek(&mut self, at: f64) -> Option<Job> {
         let c = self.cur.as_ref()?;
         if c.live || c.playable().is_none() {
@@ -908,7 +916,20 @@ impl Session {
         let (generation, catchup) = (c.generation, matches!(c.playable()?.kind, PlayableKind::Catchup { .. }));
         self.set_phase(CastPhase::Seeking);
         let relay = self.relay.as_mut()?;
-        match relay.view(generation, at).await {
+        let mut target = at;
+        let mut view = relay.view(generation, at).await;
+        if catchup
+            && matches!(view, Ok(None))
+            && let Some(edge) = relay.produced_s().await.filter(|edge| at > *edge)
+        {
+            tracing::debug!("cast session {}: catch-up seek clamped to what is loaded", self.device.id.short());
+            target = edge;
+            view = relay.view(generation, edge).await;
+            if matches!(view, Ok(Some(_))) {
+                self.send(RemoteEvent::SeekClamped { generation });
+            }
+        }
+        match view {
             Ok(Some(view)) => {
                 if let Some(c) = self.cur.as_mut() {
                     c.seeking = true;
@@ -917,7 +938,7 @@ impl Session {
                     Ok(()) => {
                         if let Some(c) = self.cur.as_mut() {
                             c.offset_s = view.load.offset_s;
-                            c.position = Some(at);
+                            c.position = Some(target);
                         }
                     }
                     Err(Trouble::Lost(kind)) => self.lost(kind).await,

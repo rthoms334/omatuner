@@ -108,6 +108,12 @@ pub enum RemoteEvent {
         pos: f64,
         dur: Option<f64>,
     },
+    /// A catch-up seek went past what the relay has loaded and was clamped to its edge (§8.5):
+    /// the controller passes it on for the banner "Catch-up can only seek as far as it has
+    /// loaded".
+    SeekClamped {
+        generation: u64,
+    },
     /// The item played to its end (VOD: `Ended`, then Up next).
     Ended {
         generation: u64,

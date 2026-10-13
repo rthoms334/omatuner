@@ -417,6 +417,9 @@ pub enum PlayerEvent {
         source: SourceId,
         holder: Option<TileId>,
     },
+    /// Casting: a catch-up seek past what the relay has loaded stopped at its edge (DESIGN §40
+    /// §8.5); the app says "Catch-up can only seek as far as it has loaded".
+    SeekClamped,
     /// Casting ended without the user asking in Tuner (DESIGN §40 §3.4, §3.8): `kind` is
     /// `StoppedOnTv` (the TV's remote stopped it, or another device took over). The output is
     /// local again and nothing plays; no error state. The app alerts where the user is (the

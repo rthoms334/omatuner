@@ -554,6 +554,19 @@ impl RelaySession {
         Ok(Some(Prepared { load: LoadReq { url: Secret::new(url), live: false, offset_s: p.offset_s + start }, level: p.level, behind_live_s: None }))
     }
 
+    /// Seconds into the item where the last segment ffmpeg has written starts: how far a
+    /// catch-up seek can go (§8.5: beyond, it clamps here). `None` for live, or before the
+    /// first segment.
+    pub async fn produced_s(&mut self) -> Option<f64> {
+        let p = self.current.as_ref().filter(|p| !p.live)?;
+        // what ffmpeg has written by now, not only what the TV fetched (as `view`)
+        if let Ok(text) = tokio::fs::read_to_string(p.out.dir.join("index.m3u8")).await {
+            p.out.serve_playlist(&text, None);
+        }
+        let guard = p.out.guard.lock().unwrap_or_else(|e| e.into_inner());
+        Some(p.offset_s + guard.start_of(guard.last_seq()?)?)
+    }
+
     /// Test on TV: the lavfi test card (15 s, "Tuner" label) through L3 into the same server; no
     /// provider connection.
     pub async fn test_card(&mut self, generation: u64) -> Result<Prepared, CastErrorKind> {

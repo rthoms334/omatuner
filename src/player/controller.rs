@@ -1214,6 +1214,7 @@ impl Controller {
         let now = Instant::now();
         let Output::Remote(r) = &mut self.output else { return false };
         let ours = |g: &u64| r.adapter.generation() == Some(*g);
+        let clamped = matches!(&ev, RemoteEvent::SeekClamped { generation } if ours(generation));
         let mut release = false;
         let mut repaint = false;
         self.dirty = true;
@@ -1284,6 +1285,7 @@ impl Controller {
         }
         match ev {
             RemoteEvent::Lost(CastErrorKind::StoppedOnTv) => return self.stopped_on_tv(),
+            RemoteEvent::SeekClamped { .. } if clamped => self.emit(PlayerEvent::SeekClamped),
             RemoteEvent::Http { status, .. } if !inputs.is_empty() => self.log_http(status, now),
             RemoteEvent::ProviderText { ref text, .. } if !inputs.is_empty() => {
                 tracing::warn!("{}: the provider answered the relay with a message instead of a stream: {text:?}", self.log);
