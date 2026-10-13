@@ -126,7 +126,8 @@ fn sockets_to(port: u16) -> usize {
         .count()
 }
 
-/// The command lines of this process's ffmpeg children.
+/// The command lines of this process's relay ffmpeg children (the ones writing HLS: not the
+/// marker film's analysis, which runs ffmpeg on files beside them).
 fn ffmpeg_cmdlines() -> Vec<String> {
     let me = std::process::id().to_string();
     let mut out = Vec::new();
@@ -139,7 +140,7 @@ fn ffmpeg_cmdlines() -> Vec<String> {
         }
         if let Ok(cmd) = std::fs::read(e.path().join("cmdline")) {
             let cmd = String::from_utf8_lossy(&cmd).replace('\0', " ");
-            if cmd.contains("ffmpeg") {
+            if cmd.contains("ffmpeg") && cmd.contains(" -f hls ") {
                 out.push(cmd);
             }
         }
@@ -411,6 +412,257 @@ async fn a_surround_film_gets_a_stereo_and_a_surround_rendition() {
         assert_eq!((a.codec.as_str(), a.channels), (codec, Some(6)), "{file}: {probe:?}");
         assert!(tv.get(format!("{base}init_0.mp4")).send().await.unwrap().status() == 404, "only the multivariant playlist at the top");
         relay.stop(false).await;
+    }
+}
+
+/// Every rendition shares the picture's timeline (cast design §8.4; `relay::ffmpeg` module docs,
+/// "One timeline"), measured on what the TV is served: the `avsync.mkv` marker film (at each
+/// second k a white picture and a beep lasting 40 ms × (1 + k mod 23)) from the start and
+/// resumed between keyframes, copied and converted, with surround (fMP4 renditions) and in
+/// stereo (MPEG-TS). The picture's times come from the boxes (`tfdt`, durations, composition
+/// offsets: what the Apple TV reads, no edit list), the sound's from ffmpeg on that timeline.
+/// On 2026-10-13 the converted, resumed surround cast played its copied 5.1 10 s late.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_rendition_shares_the_pictures_timeline() {
+    let Some(media) = media() else { return };
+    let caps = relay::ffmpeg::caps().await.unwrap();
+    let server = TestServer::start(media, Faults::default());
+    for (receiver, force, start_at) in [
+        (ReceiverKind::AppleTv, None, None),
+        (ReceiverKind::AppleTv, None, Some(13.3)),
+        (ReceiverKind::AppleTv, Some(CastLevel::Converted), Some(13.3)),
+        (ReceiverKind::AirPlayTv, None, Some(13.3)),
+        (ReceiverKind::AirPlayTv, Some(CastLevel::Converted), Some(13.3)),
+    ] {
+        let case = format!("{receiver:?} {force:?} from {start_at:?}");
+        let dir = tempfile::tempdir().unwrap();
+        let mut relay = RelaySession::start(config(&dir, LOOPBACK)).await.unwrap();
+        let mut p = (*playable(PlayableKind::Movie, server.url("/avsync.mkv"), HttpHeaders::default())).clone();
+        p.start_at = start_at;
+        let spec = LoadSpec { receiver, ..spec(1, Arc::new(p), force) };
+        let prepared = relay.load(spec).await.unwrap_or_else(|e| panic!("{case}: {e:?}"));
+        assert_eq!(prepared.surround, receiver == ReceiverKind::AppleTv, "{case}");
+        let (tv, base) = (tv(), base_of(&prepared));
+        let renditions: &[&str] = if prepared.surround { &["v/", "a/", "s/"] } else { &[""] };
+        let mut files = Vec::new();
+        for r in renditions {
+            // the whole film: ffmpeg reads the first minute at once
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let text = loop {
+                let text = tv.get(format!("{base}{r}index.m3u8")).send().await.unwrap().text().await.unwrap();
+                if text.contains("#EXT-X-ENDLIST") {
+                    break text;
+                }
+                assert!(Instant::now() < deadline, "{case} {r}: no ENDLIST:\n{text}");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            };
+            let names = text
+                .lines()
+                .filter_map(|l| l.strip_prefix("#EXT-X-MAP:URI=\"").map(|u| u.trim_end_matches('"')))
+                .chain(text.lines().filter(|l| !l.is_empty() && !l.starts_with('#')));
+            let mut bytes = Vec::new();
+            for name in names {
+                bytes.extend_from_slice(&tv.get(format!("{base}{r}{name}")).send().await.unwrap().bytes().await.unwrap());
+            }
+            let ext = if text.contains("#EXT-X-MAP") { "mp4" } else { "ts" };
+            let path = dir.path().join(format!("{}.{ext}", if r.is_empty() { "muxed" } else { r.trim_end_matches('/') }));
+            std::fs::write(&path, &bytes).unwrap();
+            files.push(path);
+        }
+        relay.stop(false).await;
+        let ffmpeg = caps.ffmpeg.clone();
+        let offsets = tokio::task::spawn_blocking(move || avsync::offsets(&ffmpeg, &files)).await.unwrap();
+        let (picture, sounds) = offsets.split_first().unwrap();
+        for (i, sound) in sounds.iter().enumerate() {
+            let av_ms = (sound - picture) * 1000.0;
+            assert!(av_ms.abs() < 40.0, "{case}: rendition {i}'s sound is {av_ms:+.1} ms off the picture ({offsets:?})");
+        }
+    }
+}
+
+/// The marker film's timing (see `every_rendition_shares_the_pictures_timeline`).
+mod avsync {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    /// A marker at second k lasts `STEP` × (1 + k mod `CODES`).
+    const STEP: f64 = 0.04;
+    const CODES: i64 = 23;
+
+    /// For the files of one cast (the picture's first: muxed sound in it, or demuxed renditions
+    /// after it), where content second 0 falls on each one's timeline: the picture's, then each
+    /// sound's.
+    pub fn offsets(ffmpeg: &Path, files: &[PathBuf]) -> Vec<f64> {
+        let picture = offset(&flashes(ffmpeg, &files[0]), None);
+        let sounds: &[PathBuf] = if files.len() == 1 { files } else { &files[1..] };
+        let mut out = vec![picture];
+        out.extend(sounds.iter().map(|f| offset(&beeps(ffmpeg, f), Some(picture))));
+        out
+    }
+
+    /// The median of (onset − its second) over the markers named by their lengths; `near`: the
+    /// offset a marker's second is chosen around (else the first marker's code is its second).
+    fn offset(runs: &[(f64, f64)], near: Option<f64>) -> f64 {
+        let mut near = near;
+        let mut offs: Vec<f64> = runs[..runs.len().saturating_sub(1)]
+            .iter()
+            .filter_map(|&(t, d)| {
+                let code = (d / STEP).round() as i64 - 1;
+                if !(0..CODES).contains(&code) {
+                    return None;
+                }
+                let anchor = *near.get_or_insert(t - code as f64);
+                let k = code + CODES * ((t - anchor - code as f64) / CODES as f64).round() as i64;
+                Some(t - k as f64)
+            })
+            .collect();
+        assert!(offs.len() >= 5, "too few markers: {runs:?}");
+        offs.sort_by(f64::total_cmp);
+        offs[offs.len() / 2]
+    }
+
+    fn ffmpeg_out(ffmpeg: &Path, args: &[&str]) -> String {
+        let out = Command::new(ffmpeg).args(["-nostdin", "-hide_banner", "-loglevel", "error"]).args(args).output().unwrap();
+        assert!(out.status.success(), "ffmpeg {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// `(onset, length)` of each lit run of `(time, on)` samples.
+    fn runs(points: impl IntoIterator<Item = (f64, bool)>) -> Vec<(f64, f64)> {
+        let (mut out, mut start) = (Vec::new(), None);
+        for (t, on) in points {
+            match (on, start) {
+                (true, None) => start = Some(t),
+                (false, Some(s)) => {
+                    out.push((s, t - s));
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// `(pts_time, value)` of each frame `ffmpeg … metadata=print:key=<key>` prints.
+    fn printed(text: &str, key: &str) -> Vec<(f64, f64)> {
+        let mut pts = None;
+        let mut out = Vec::new();
+        for line in text.lines() {
+            if let Some(p) = line.split("pts_time:").nth(1) {
+                pts = p.split_whitespace().next().and_then(|v| v.parse().ok());
+            } else if let (Some(v), Some(t)) = (line.strip_prefix(&format!("{key}=")), pts) {
+                out.push((t, v.parse().unwrap_or(-200.0)));
+            }
+        }
+        out
+    }
+
+    fn input(file: &Path) -> Vec<&str> {
+        // the timeline as written: no start shift, and (fMP4) no edit list
+        let mut a = vec!["-copyts"];
+        if file.extension().is_some_and(|e| e == "mp4") {
+            a.extend(["-ignore_editlist", "1"]);
+        }
+        a.extend(["-i", file.to_str().unwrap()]);
+        a
+    }
+
+    /// The white pictures. fMP4: their presentation times from the boxes, matched in order to
+    /// the decoded frames (the leading pictures of an open GOP don't decode: they come first);
+    /// MPEG-TS: the PTS.
+    fn flashes(ffmpeg: &Path, file: &Path) -> Vec<(f64, f64)> {
+        let key = "lavfi.signalstats.YAVG";
+        let mut args = input(file);
+        args.extend([
+            "-map",
+            "0:v:0",
+            "-vf",
+            "signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-",
+            "-fps_mode",
+            "passthrough",
+            "-f",
+            "null",
+            "-",
+        ]);
+        let frames = printed(&ffmpeg_out(ffmpeg, &args), key);
+        if file.extension().is_some_and(|e| e == "ts") {
+            return runs(frames.into_iter().map(|(t, y)| (t, y > 128.0)));
+        }
+        let times = picture_times(&std::fs::read(file).unwrap());
+        let skip = times.len().saturating_sub(frames.len());
+        runs(times[skip..].iter().zip(&frames).map(|(&t, &(_, y))| (t, y > 128.0)))
+    }
+
+    /// The beeps (peak level over 1 ms, mono, on ffmpeg's timeline of the file).
+    fn beeps(ffmpeg: &Path, file: &Path) -> Vec<(f64, f64)> {
+        let key = "lavfi.astats.Overall.Peak_level";
+        let mut args = input(file);
+        let af = format!("aresample=8000,pan=mono|c0=c0,asetnsamples=n=8,astats=metadata=1:reset=1,ametadata=print:key={key}:file=-");
+        args.extend(["-map", "0:a:0", "-af", &af, "-f", "null", "-"]);
+        runs(printed(&ffmpeg_out(ffmpeg, &args), key).into_iter().map(|(t, db)| (t, db > -12.0)))
+    }
+
+    /// ISO/IEC 14496-12 boxes of `b`: `(type, body)`.
+    fn boxes(mut b: &[u8]) -> impl Iterator<Item = ([u8; 4], &[u8])> {
+        std::iter::from_fn(move || {
+            let size = u32::from_be_bytes(b.get(..4)?.try_into().ok()?) as usize;
+            let kind: [u8; 4] = b.get(4..8)?.try_into().ok()?;
+            let (hdr, size) = if size == 1 { (16, u64::from_be_bytes(b.get(8..16)?.try_into().ok()?) as usize) } else { (8, size) };
+            let body = b.get(hdr..size)?;
+            b = &b[size..];
+            Some((kind, body))
+        })
+    }
+
+    fn be32(b: &[u8], at: usize) -> u32 {
+        u32::from_be_bytes(b[at..at + 4].try_into().unwrap())
+    }
+
+    /// The presentation times (s) of track 1's samples (ffmpeg maps the picture first), sorted:
+    /// each fragment's `tfdt`, plus the durations before, plus the composition offset (signed in
+    /// `trun` version 1). Edit lists are not applied.
+    fn picture_times(file: &[u8]) -> Vec<f64> {
+        let child = |b: &[u8], k: &[u8; 4]| boxes(b).find(|(kind, _)| kind == k).map(|(_, body)| body.to_vec());
+        let moov = child(file, b"moov").expect("an init segment first");
+        let trak = child(&moov, b"trak").unwrap();
+        let mdhd = child(&child(&trak, b"mdia").unwrap(), b"mdhd").unwrap();
+        let timescale = f64::from(if mdhd[0] == 1 { be32(&mdhd, 20) } else { be32(&mdhd, 12) });
+        let trex_duration = child(&child(&moov, b"mvex").unwrap(), b"trex").map_or(0, |t| be32(&t, 12));
+        let mut out = Vec::new();
+        for (_, moof) in boxes(file).filter(|(k, _)| k == b"moof") {
+            for (_, traf) in boxes(moof).filter(|(k, _)| k == b"traf") {
+                let tfhd = child(traf, b"tfhd").unwrap();
+                if be32(&tfhd, 4) != 1 {
+                    continue;
+                }
+                let flags = be32(&tfhd, 0) & 0xff_ffff;
+                let at = 8 + if flags & 1 != 0 { 8 } else { 0 } + if flags & 2 != 0 { 4 } else { 0 };
+                let default_duration = if flags & 8 != 0 { be32(&tfhd, at) } else { trex_duration };
+                let tfdt = child(traf, b"tfdt").unwrap();
+                let mut t = if tfdt[0] == 1 { u64::from_be_bytes(tfdt[4..12].try_into().unwrap()) as i64 } else { i64::from(be32(&tfdt, 4)) };
+                let trun = child(traf, b"trun").unwrap();
+                let (version, flags, n) = (trun[0], be32(&trun, 0) & 0xff_ffff, be32(&trun, 4));
+                let mut j = 8 + if flags & 1 != 0 { 4 } else { 0 } + if flags & 4 != 0 { 4 } else { 0 };
+                for _ in 0..n {
+                    let mut duration = default_duration;
+                    if flags & 0x100 != 0 {
+                        duration = be32(&trun, j);
+                        j += 4;
+                    }
+                    j += if flags & 0x200 != 0 { 4 } else { 0 } + if flags & 0x400 != 0 { 4 } else { 0 };
+                    let mut cto = 0i64;
+                    if flags & 0x800 != 0 {
+                        let raw = be32(&trun, j);
+                        cto = if version == 1 { i64::from(raw as i32) } else { i64::from(raw) };
+                        j += 4;
+                    }
+                    out.push((t + cto) as f64 / timescale);
+                    t += i64::from(duration);
+                }
+            }
+        }
+        out.sort_by(f64::total_cmp);
+        out
     }
 }
 

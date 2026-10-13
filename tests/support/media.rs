@@ -29,12 +29,13 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
 /// Bump when the script's outputs change (forces regeneration of an existing directory).
-const MEDIA_VERSION: &str = "4";
+const MEDIA_VERSION: &str = "5";
 const STAMP: &str = ".complete";
 
 /// Directory with `testsrc.mp4` (10 s 640×360 25 fps + 1 kHz sine), `bars.ts` (MPEG-TS),
 /// `hls/index.m3u8` (6 × 2 s segments) — generated on first use into `target/test-media`.
-/// Also `long/index.m3u8` (60 × 1 s segments) and the 5.1 `surround*` films (see the script).
+/// Also `long/index.m3u8` (60 × 1 s segments), the 5.1 `surround*` films and the `avsync.mkv`
+/// marker film (see the script).
 pub fn ensure_media() -> Option<PathBuf> {
     static MEDIA: OnceLock<Option<PathBuf>> = OnceLock::new();
     MEDIA

@@ -11,6 +11,9 @@
 #   surround.mp4     10 s 320x180 25 fps H.264 + AAC 5.1(side) MP4 (the 2026-10-13 film's sound)
 #   surround_eac3.mkv, surround_flac.mkv   the same with E-AC-3 5.1 (copied) and FLAC 5.1 (German:
 #                    converted to AC-3)
+#   avsync.mkv       40 s 320x180 25 fps H.264 (5 s GOPs, B-frames) + AAC 5.1: at each second k a
+#                    white picture and a 1 kHz beep on every channel, both lasting 40 ms x (1 + k mod
+#                    23), so a marker names its second (casting's A/V alignment, tests/cast_relay.rs)
 #   live/            rolling "live" HLS written by `--live` until killed (manual checks only)
 # Tests call this through `tests/support/media.rs::ensure_media`, which runs it once into a
 # temporary directory and renames it into place, so concurrent test binaries never see
@@ -43,6 +46,13 @@ ff -f lavfi -i testsrc2=size=320x180:rate=25 -f lavfi -i "$six" \
    -t 10 "${x264[@]}" -g 50 -c:a eac3 -b:a 384k -metadata:s:a:0 language=eng "$out/surround_eac3.mkv"
 ff -f lavfi -i testsrc2=size=320x180:rate=25 -f lavfi -i "$six" \
    -t 10 "${x264[@]}" -g 50 -c:a flac -metadata:s:a:0 language=ger "$out/surround_flac.mkv"
+
+# the marker film: picture and sound share each marker's start and length
+mark='lt(mod(t\,1)\,0.04*(1+mod(floor(t)\,23)))'
+beep="if($mark\\,0.8*sin(2*PI*1000*t)\\,0)"
+ff -f lavfi -i "color=c=black:s=320x180:r=25,drawbox=c=white:t=fill:enable='$mark'" \
+   -f lavfi -i "aevalsrc=$beep|$beep|$beep|$beep|$beep|$beep:c=5.1(side):s=48000" \
+   -t 40 "${x264[@]}" -g 125 -keyint_min 125 -sc_threshold 0 -bf 2 -c:a aac -b:a 384k "$out/avsync.mkv"
 
 if [[ "${2:-}" == "--live" ]]; then
   mkdir -p "$out/live"

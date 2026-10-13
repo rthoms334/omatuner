@@ -4,6 +4,31 @@
 //! redacted at debug, `-progress pipe:1` speed → `CpuTooSlow`, encoder check once per run.
 //! OWNER: CAST-4.
 //!
+//! **One timeline** (DESIGN §40 §8.4; Apple's HLS authoring spec: alternate audio renditions
+//! carry the video's timestamps). Measured 2026-10-13 on ffmpeg n9.0.2 with a marker film (a
+//! flash and a beep at each second whose length names the second), HEVC + AAC 5.1 in MKV and
+//! MP4, 10 s GOPs, from 0, 30 and 33.3 s:
+//! * ffmpeg's fMP4 muxer (one per rendition under `-var_stream_map`, or one for a muxed output)
+//!   starts every track's `tfdt` at 0 and says where the track really starts only in an empty
+//!   edit (`elst`) of its init segment, and it covers B-frames' composition delay with another
+//!   edit. The Apple TV aligns on the media timestamps without them: the 2026-10-13 surround cast
+//!   (L3, resumed) played its copied 5.1 10.04 s late, a resumed L2 film's stereo ran 3.4–10 s
+//!   early, and from 0 every fMP4 output was 59 ms off. `movflags=+frag_discont` writes the real
+//!   decode times into `tfdt` (consistent with `sidx`, which already had them), and
+//!   `negative_cts_offsets` (`trun` version 1) makes the first picture's presentation time its
+//!   decode time: nothing is left to an edit list. MPEG-TS was never affected (its PTS are one
+//!   clock: ≤ 10 ms in every case).
+//! * With `-ss` the streams started at different points: converted video and sound exactly at
+//!   the seek point, copied streams at the demuxer's seek position (up to a GOP early: 10.1 s
+//!   for that film). Copied video therefore starts every stream at its keyframe
+//!   (`-noaccurate_seek`); converted video drops copied sound before the seek point
+//!   (`-copypriorss:a 0`). The renditions then start within one audio frame or the source's
+//!   interleave of each other, and their timestamps say by how much.
+//!
+//! After the fix every case measured −21 to +10 ms (−21: L3's frame grid at a seek between
+//! frames; +10: converted MPEG-TS, as before), with or without edit lists honoured. `tests/cast_relay.rs`
+//! measures it on every run.
+//!
 //! `PR_SET_PDEATHSIG` follows the spawning *thread*: a tokio worker lives as long as the runtime,
 //! but a blocking-pool thread exits when idle and would take the child with it. So children are
 //! spawned from `async` code on a worker (§5.6), and the pre-exec hook also catches the race where
@@ -190,6 +215,11 @@ pub fn argv(input: &Input<'_>, plan: &Plan, out: &Output<'_>) -> Vec<String> {
                 push(&["-readrate", "1", "-readrate_initial_burst", READ_BURST_S]);
             }
             if *seek_s > 0.0 {
+                // one start for every stream (module docs, "One timeline"): copied video can only
+                // start at the keyframe before the seek point, so the sound starts there too
+                if plan.video == Video::Copy {
+                    push(&["-noaccurate_seek"]);
+                }
                 push(&["-ss", &format!("{seek_s:.3}")]);
             }
             push(&["-i", url]);
@@ -236,6 +266,11 @@ pub fn argv(input: &Input<'_>, plan: &Plan, out: &Output<'_>) -> Vec<String> {
                 vf.push("drawtext=text=Tuner:fontsize=120:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=24:x=(w-tw)/2:y=(h-th)/2".to_owned());
             }
             push(&["-vf", &vf.join(",")]);
+            // converted video starts exactly at the seek point: so does copied sound (else it
+            // keeps the packets back to the demuxer's seek position, a GOP early)
+            if matches!(input, Input::Proxy { seek_s, .. } if *seek_s > 0.0) {
+                push(&["-copypriorss:a", "0"]);
+            }
         }
     }
     match (plan.audio, plan.surround) {
@@ -273,7 +308,12 @@ pub fn argv(input: &Input<'_>, plan: &Plan, out: &Output<'_>) -> Vec<String> {
     let ext = plan.segments.ext();
     match plan.segments {
         Segments::Ts => push(&["-hls_segment_type", "mpegts"]),
-        Segments::Fmp4 => push(&["-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init.mp4"]),
+        Segments::Fmp4 => {
+            push(&["-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init.mp4"]);
+            // every rendition's tfdt on the one timeline, the first picture's presentation time
+            // its decode time: no edit list to honour (module docs, "One timeline")
+            push(&["-hls_segment_options", "movflags=+frag_discont+negative_cts_offsets"]);
+        }
     }
     // surround (§8.4): three media playlists in `v/`, `a/`, `s/` (`init_<n>.mp4` each); the
     // relay writes the multivariant playlist itself
@@ -500,11 +540,17 @@ mod tests {
         let vod = Input::Proxy { url: "http://127.0.0.1:1/u/t", hls: false, seek_s: 4210.5, readrate: true };
         let hevc = plan(crate::model::CastLevel::Repackaged, Video::Copy, Audio::Copy, Segments::Fmp4);
         let a = argv(&vod, &hevc, &Output { dir, live: false, hls_time: 6.0, fps: None, audio_index: None }).join(" ");
-        assert!(a.contains("-readrate 1 -readrate_initial_burst 60 -ss 4210.500 -i http://127.0.0.1:1/u/t"), "{a}");
+        assert!(a.contains("-readrate 1 -readrate_initial_burst 60 -noaccurate_seek -ss 4210.500 -i http://127.0.0.1:1/u/t"), "{a}");
         assert!(a.contains("-map 0:v:0 -map 0:a:0? -c:v copy -tag:v hvc1 -c:a copy -bsf:a aac_adtstoasc"), "{a}");
         assert!(a.contains("-hls_playlist_type event -hls_flags independent_segments+program_date_time+temp_file"), "{a}");
-        assert!(a.contains("-hls_segment_type fmp4 -hls_fmp4_init_filename init.mp4 -hls_segment_filename /c/g1/s%d.m4s"), "{a}");
-        assert!(!a.contains("delete_segments") && !a.contains("-http_multiple"));
+        assert!(
+            a.contains(
+                "-hls_segment_type fmp4 -hls_fmp4_init_filename init.mp4 -hls_segment_options movflags=+frag_discont+negative_cts_offsets \
+                 -hls_segment_filename /c/g1/s%d.m4s"
+            ),
+            "{a}"
+        );
+        assert!(!a.contains("delete_segments") && !a.contains("-http_multiple") && !a.contains("-copypriorss"));
 
         let l3 = plan(crate::model::CastLevel::Converted, Video::Encode { deinterlace: true }, Audio::Aac, Segments::Ts);
         let live = Input::Proxy { url: "http://127.0.0.1:1/u/t", hls: false, seek_s: 0.0, readrate: false };
@@ -516,6 +562,12 @@ mod tests {
             ),
             "{a}"
         );
+        assert!(!a.contains("-hls_segment_options") && !a.contains("-noaccurate_seek") && !a.contains("-copypriorss"), "TS, from the start: {a}");
+        // a converted resume: the picture and its stereo start at the seek point, and so does
+        // copied sound
+        let resume = Input::Proxy { url: "http://127.0.0.1:1/u/t", hls: false, seek_s: 30.0, readrate: true };
+        let a = argv(&resume, &l3, &Output { dir, live: false, hls_time: 4.0, fps: Some(25.0), audio_index: None }).join(" ");
+        assert!(a.contains("-readrate_initial_burst 60 -ss 30.000 -i ") && a.contains("format=yuv420p -copypriorss:a 0 "), "{a}");
 
         let card = argv(
             &Input::TestCard { label: true },
@@ -538,9 +590,10 @@ mod tests {
         p.surround = Some(Surround::Copy { aac: true });
         let a = argv(&vod, &p, &Output { dir, live: false, hls_time: 4.0, fps: None, audio_index: Some(0) }).join(" ");
         for want in [
+            "-noaccurate_seek -ss 30.000 -i ",
             "-map 0:v:0 -map 0:a:0 -map 0:a:0 -c:v copy -tag:v hvc1",
             "-c:a:0 aac -ac:a:0 2 -b:a:0 160k -c:a:1 copy -bsf:a:1 aac_adtstoasc -sn -dn",
-            "-hls_segment_type fmp4 -hls_fmp4_init_filename init.mp4 -var_stream_map v:0,name:v a:0,name:a a:1,name:s",
+            "-hls_segment_options movflags=+frag_discont+negative_cts_offsets -var_stream_map v:0,name:v a:0,name:a a:1,name:s",
             "-hls_segment_filename /c/g2/%v/s%d.m4s /c/g2/%v/index.m3u8",
         ] {
             assert!(a.contains(want), "{want:?} missing from {a}");
