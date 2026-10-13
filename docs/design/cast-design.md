@@ -1372,7 +1372,7 @@ The residual risk is a LAN host that spoofs the TV's IP and also has the token. 
   - `systemctl is-active ufw`, `firewalld` and `nftables`.
 - **Interface and subnet.** The UDP `connect()` trick gives the source IP towards the TV. `if-addrs` gives its interface and prefix, so (wlan0, 192.168.1.0/24) here.
 - **The parser** reads `### tuple ###` lines. The format comes from ufw's own reader (`backend_iptables.py` L697–790) and the real lines on this machine:
-  - the fields are action, proto, dport, dst, sport, src, `dir[_iface]`, then two app fields when present, then `comment=<hex>`, which is stripped first;
+  - the fields are action, proto, dport, dst, sport, src, then two app fields when present, then `dir[_iface]`, then `comment=<hex>`, which is stripped first (the app fields come before the direction in ufw's reader, so a 9-field line is `… src dapp sapp dir`);
   - actions `allow`, `deny`, `reject` and `limit`, each with `_log` or `_log-all`;
   - `route:` rules are ignored;
   - ports may be lists (`80,443`) or ranges (`8080:8090`);

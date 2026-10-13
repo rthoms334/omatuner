@@ -1696,3 +1696,71 @@ Use a profile with a playlist and at least one favourite channel.
 - [ ] **Favourites instead:** Settings ▸ Interface ▸ *Live TV opens on* ▸ Favourites, quit and
   start, Alt+2. **Expect:** the first favourites list with channels opens; the guide shows it
   too. Remove every favourite channel, quit and start again: All channels.
+
+## 30. Casting to the Apple TV (DESIGN §40; cast design §18)
+
+Run these once against the real Apple TV ("Living Room", 192.168.1.5) on the release build, in
+the **default profile** (pairing and the firewall rule belong to this computer). Casting ships
+behind `cast::ENABLED` (`src/cast/mod.rs`); the build under test has it on.
+
+- Start the **first session with `TUNER_CAST_TRACE=1`** and keep the transcript
+  (`~/.local/state/tuner/cast-trace/`, redacted) as the fixture follow-up.
+- Note the tvOS version shown in Settings ▸ Cast.
+- **The Apple TV auto-updates.** When it reaches tvOS 27 (or a new 26.x), repeat items 1, 2 and 7.
+- The Hisense repeats items 1, 2 and 7 (item 14).
+
+- [ ] **1. Pairing:**
+  - **Do:** pick Living Room in the player's cast picker (`C`).
+  - **Expect:** a PIN appears on the TV (HKP 3). If it doesn't, *Show a new code* (HKP 5) works.
+    Pairing completes without a 470. The pairing survives an Apple TV reboot. Note the Allow
+    Access setting and the HomeKit room; with "Everyone in your Home" the hint is right.
+- [ ] **2. Session:**
+  - **Do:** cast live TV for **60 minutes** with ufw on and only the TCP rule.
+  - **Expect:** events keep arriving (declared PTP, no NTP). From the trace: does SETUP return
+    `skipRecord`, and what does RECORD answer? Does `playbackInfo` answer, and with which keys?
+- [ ] **3. Firewall button:**
+  - **Do:** with ufw blocking, cast.
+  - **Expect:** it fails within about 10 s with the Firewall message. *Allow on firewall* shows
+    Omarchy's dialog (note its text); Cancel leaves everything as it was. Allow adds
+    `allow tcp 47800 0.0.0.0/0 any 192.168.1.0/24 in_wlan0 comment=6f6d…` to
+    `/etc/ufw/user.rules`, and Check again plays the test card. *Remove rule* removes it, with
+    no second prompt within 5 minutes. *Show command* pasted into a terminal works.
+- [ ] **4. Live HLS** (TS segments, H.264 + AAC) on a real channel: note the tune-in time with
+  `min_segments = 2`, the delay behind live, and the behaviour on a long-GOP channel.
+- [ ] **5. Formats:**
+  - **Expect:** 1080i25 and 576i are deinterlaced (L3) with no combing, and ffmpeg's `speed`
+    stays above 1.0× on this M2. MP2 is converted to AAC. AAC 5.1 is converted to stereo. HEVC
+    (and 10-bit) plays in fMP4. For Phase 2, note whether an AC-3-only HLS plays.
+- [ ] **6. Segment hygiene on real channels:** `ffprobe -show_frames` on each segment's first
+  frame: is it an IDR? Does the playlist guard ever raise TARGETDURATION?
+- [ ] **7. Controls:**
+  - **Expect:** pause (`setRate 0`) and resume work, including after more than 80 s paused.
+    Seeking inside the produced part (playlist view) and beyond it (`-ss`) lands at the right
+    time. Zap by replace shows the new channel with no stuck old picture. Stop really stops the
+    TV. Stopping from the Apple TV remote gives "Living Room stopped playing". For VOD,
+    `itemPlayedToEnd` arrives, Up next continues on the TV, and the progress shown matches the
+    TV. Seeking a catch-up programme past what has loaded clamps with the toast "Catch-up can
+    only seek as far as it has loaded".
+- [ ] **8. VOD EVENT playlist:** the TV starts before `ENDLIST`; resume a film at 1:10:00.
+- [ ] **9. Stray requests:** does the TV fetch anything besides the playlist and segments
+  (`/favicon.ico`, `HEAD`, `Range`)? The 404s are harmless.
+- [ ] **10. Volume:** confirm there is no working path (expected), so the "TV remote" copy is
+  right.
+- [ ] **11. Provider limit:** with a one-stream account, a relay reconnect inside 45 s of
+  closing gets 403s that the race window absorbs.
+- [ ] **12. Power:** with the logind inhibitor held, the laptop screen locks but casting
+  continues for 30 minutes.
+- [ ] **13. Workspaces (§3.8):**
+  - **Do/Expect:** ask Claude to put a channel on the TV while Tuner is on another workspace:
+    nothing pops out, raises or moves, and `play` answers `opened_in: "device"`. A locked
+    channel raises Tuner with the PIN prompt. Block the firewall and cast, then switch
+    workspace: a desktop notification appears, and its **Show** raises Tuner on the casting card
+    with *Allow on firewall*. Start a cast while the pop-out is up: the pop-out goes back into
+    the window without taking focus.
+- [ ] **14. Hisense (experimental):** items 1, 2 and 7 through the third-party profile. If it
+  can't play, set `experimental = false` as the default.
+- [ ] **15. Not covered by tests (found while building it):** the fMP4 keyframe check end to
+  end, the 8 GiB film cap (a long film casts without filling the disk), a `CpuTooSlow` message
+  on a channel the computer can't convert in time, and pkexec, polkit and ufw on a real system
+  (the helper at `/usr/lib/tuner/tuner-firewall` exists after installing the package, and the
+  dialog names the action "Allow your TV to connect to Tuner for casting").

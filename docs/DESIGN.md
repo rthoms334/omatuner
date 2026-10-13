@@ -20,7 +20,8 @@ reattach · 9 Import pipelines & EPG matching · 10 Catch-up · 11 Player · 12 
 24 Implementation plan (work packages) · 25 Risks & verification backlog · 26 Review decisions ·
 27–29 Xtream upgrade, category filter, several playlists · 30 Agent control (MCP) · v0.2 batch:
 31 Guide fixes · 32 Up next · 33 Following & news flash · 34 Spoiler guard · 35 Multi-view ·
-36 Reminders & sleep timer · 37 Claude plugin & skills · 38 Playlist codes & library load
+36 Reminders & sleep timer · 37 Claude plugin & skills · 38 Playlist codes & library load ·
+39 Connecting AI agents · 40 Casting to a TV
 
 ---
 
@@ -1444,6 +1445,11 @@ countdown; `r` retries now; Backspace = last channel; Stop.
   a second instance) must acquire a lease and is refused with a clear message at the limit.
 * If `active_cons ≥ max_connections` at login, Settings shows a warning ("another device is
   using this account").
+* **Casting** (§40): the lease is held for the provider connection the relay uses, so the budget is
+  unchanged: one open lease, and a zap or reload on the TV follows the same stop-before-start
+  (the session waits up to 1.5 s for the upstream close). While a cast runs the Wayland idle
+  inhibitor (§21.2) is released, so the screen may lock, and a logind *sleep* inhibitor
+  (`cast.keep_awake`) keeps the relay alive instead; closing the lid still suspends.
 * **Settings apply live**: `PlayerCommand::ApplyConfig` re-derives `MachineConfig` (zap delay,
   timeouts, reconnect attempts, watched %) and sets `hwdec`, `cache-secs`,
   `demuxer-readahead-secs`, `demuxer-max-bytes`, `network-timeout`, `alang`, `slang`,
@@ -1983,6 +1989,18 @@ Live preview opens the player. End of playback per §13.6. Esc leaves to the pre
 playback continues in the mini player (bottom-right 16:9, 320 Wide / 240 Medium × rem, hidden
 in Compact → status-bar chip; click = back to player, ✕ = stop; a pop-out button beside the ✕).
 
+**While casting (§40).** `C` (or the Cast control before Fullscreen, or the menu's *Cast to a
+TV…*) opens the picker, a right-edge panel in OSD colours (*This computer*, then the TVs, a
+"Searching…" bar, *Add by address…*, *Firewall help…*); Enter on an unpaired TV opens the PIN
+overlay first. The video area is replaced by the casting card (logo, title and now/next through
+the spoiler guard, "Playing on ‹TV›", a phase line such as "Live · about 15 s behind", *Stop
+casting* and *Play here*; errors add their own action). The OSD keeps its controls except audio
+track, subtitles, aspect and zoom; the info panel shows the probe result, the speaker reads
+"TV remote" (AirPlay volume is the TV's), and the Cast control shows the connected glyph with the
+TV's name. The mini player shows the same card with a cast glyph, the compact layout a "Casting
+· ‹TV›" chip whose ✕ stops, the pop-out is disabled ("Nothing to show here — playing on ‹TV›"),
+and quitting asks first. Multi-view shows "Leave multi-view to cast".
+
 **Video-only (popped-out window, §12.3).** Same screen, same keys (zap ↑/↓, volume, pause,
 mute, tracks, `c`/`g`/`h` panels) plus `PopOut` (Esc / `o` = back to the full window). The
 passive banner is one bottom strip — title (⏸ when paused) and volume, then the programme on
@@ -2334,6 +2352,12 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
   toggle on Omarchy). Media keys arrive via MPRIS.
 
 ### 15.2 Tables (generated: `cargo run --example keymap_md`)
+
+Casting (§40) adds `C` (*Cast to a TV…*, `Action::CastMenu`, in the player's common table) and
+`Action::StopCasting` (no key: the menu, the card, the chip and the picker). Both are gated by
+`keymap::feature_on` on `cast::ENABLED`, so the generated rows list them once casting is switched
+on. The picker and the PIN overlay reuse `Modal` / `List`; there is no new context and no
+global chord (Ctrl+Shift+C is the terminal's copy).
 
 #### Everywhere (`Global`)
 
@@ -2920,6 +2944,26 @@ the current settings; the onboarding restore always applies them). Machine-speci
   `Error` Display, mpv log messages, job errors, toasts, stream-info panel, Settings URL
   display. The secret registry is process-global: tests never call `redact::clear_secrets`
   (parallel tests race) and use a unique secret per test instead.
+* **Casting** (§40; cast design §9.3 and §9.4): the first LAN-facing listener and the first root
+  helper. The listener binds only the address the kernel uses to reach the TV (never `0.0.0.0`),
+  on `cast.media_port`, only while a session exists; it answers `GET`/`HEAD` of `/c/<token>/<file>`
+  with a fixed file-name pattern from the TV's own IP and otherwise one identical 404, with no
+  redirects and no listing. Tokens are 128-bit, constant-time compared, one per load generation,
+  `Secret`s registered with `redact`. The TV only ever sees `http://<lan-ip>:<port>/c/<token>/…`:
+  no provider host, path or login, and no playlist rewritten with absolute URLs. ffmpeg and
+  ffprobe get only a loopback token URL on their command line (a test asserts it); the loopback
+  token is visible to local users in `ps` for the session (accepted: a single-user desktop; the
+  proxy accepts only 127.0.0.1, one client). Device-supplied strings (names, models, versions,
+  plists) are data: capped, sanitized, bplist depth and size limited. Pairing keys sit in the
+  0600 database, out of backups; the PIN is used once and never logged or registered as a secret.
+  Toasts, notifications and agent replies carry typed `CastErrorKind` sentences only. **The root
+  helper** `/usr/lib/tuner/tuner-firewall` (std only) is started through `pkexec
+  --disable-internal-agent` under the polkit action `io.github.rthoms334.omatuner.firewall`
+  (`auth_admin_keep`); it validates a verb, an interface present in `/sys/class/net`, an RFC 1918
+  IPv4 network (/8–/32, zero host bits) and a port 1024–65535, refuses to run unless root with
+  `PKEXEC_UID` set, and runs one fixed `/usr/bin/ufw` command; the arguments are not secrets and
+  polkit's agent, not Tuner, takes the password. No agent tool runs `pkexec` or `sudo`. The
+  residual risk is a LAN host that both spoofs the TV's address and has the token.
 * **Never on a command line**: mpv is embedded (no `ps` exposure); `force-media-title` keeps
   URLs out of mpv's title; MPRIS exposes titles and logo URLs only (http(s) logos are fine).
 
@@ -3029,6 +3073,17 @@ already ended are dismissed silently, ones still airing fire with "started N min
 calls `ReminderScheduler::refresh` on `DataScope::Reminders`; `PlatformEvent::ReminderWatch`
 carries the channel's `ItemRef` (resolved by the app through `LiveIndex::by_ref`).
 Reminders fire only while Tuner runs (v1).
+
+**Cast alerts** (§40, cast design §3.8): a failure or a stop on the TV that needs the user, while
+Tuner's window is not on a visible workspace (not focused and not shown by
+`platform::popout::self_shown`; off Hyprland an unfocused window counts as not seen, so an alert
+is never missed), goes through `platform::notify::notify_cast` with a fixed sentence (no device
+or provider text) and the action **Show**, which sends `PlatformEvent::ShowPlayer`: Tuner is
+raised (`hypr::focus_self`) onto the player, where the casting card has the buttons (Allow on
+firewall, Try again, Play here). With no notification server the in-app toast is used. Phase
+changes never alert. A switch reminder that fires while casting retunes the TV and does not raise
+or pop the window (§30.13). "Up next is waiting for your PIN" is sent when the window is not
+focused, since no local video is suspended while casting.
 
 ### 21.4 Single instance & CLI
 `$XDG_RUNTIME_DIR/tuner/tuner.sock`; a second `tuner [--view guide] [--play …] [file/url]`
@@ -3141,7 +3196,18 @@ for any window. Tuner does it for itself with `o` in the player or Ctrl+Shift+O 
   `packaging/src/target`, installs the snippets under `/usr/share/tuner/`, the docs under
   `/usr/share/doc/tuner/` and `LICENSE` under `/usr/share/licenses/omatuner/`).
   `packaging/omatuner.install` (`install=`, next to the PKGBUILD so makepkg finds it in CI's copy
-  of the checkout too) only echoes where to connect an AI agent (§39.8); it runs nothing.
+  of the checkout too) only echoes where to connect an AI agent (§39.8), and, once, on the
+  upgrade that brings casting (from before 0.2.6), "Cast to your TV: Settings ▸ Cast (ufw users:
+  Tuner offers an Allow on firewall button)"; it runs nothing.
+* **Casting packaging** (§40): `ffmpeg` is in `depends` (mpv already pulls it; this declares the
+  CLI casting runs), `polkit` is an `optdepends` (the *Allow on firewall* button's `pkexec`).
+  The second binary of the crate, `tuner-firewall` (`[[bin]]`, std only), installs as
+  `/usr/lib/tuner/tuner-firewall` (0755), and `packaging/polkit/io.github.rthoms334.omatuner.
+  firewall.policy` as `/usr/share/polkit-1/actions/…` (the action's `exec.path` annotation names
+  that exact path). `THIRD_PARTY_NOTICES.md` (pyatv's MIT notice for the ported AirPlay code)
+  installs beside `LICENSE` in `/usr/share/licenses/omatuner/`. Nothing else changes for either
+  architecture. The release tarball (`omatuner-<pkgver>-<arch>.tar.gz`) does not carry the
+  helper: a user without the package gets the generic polkit action (cast design §9.4).
 * **Names**: the repository (<https://github.com/rthoms334/omatuner>) and the Arch package
   (`pkgname=omatuner`) are *omatuner*; everything the user sees or configures keeps *tuner*: the
   app name "Tuner", the command `/usr/bin/tuner`, the desktop entry/icon/app id `tuner`, the
@@ -5161,6 +5227,22 @@ Example flows: "touring cars is on" → `guide_search{query:"touring car"}` → 
 `browse{kind:"movie", group:"comedy", max_minutes:120, unwatched:true, sort:"random"}` →
 `details` → `play`. "What's on BBC One at 9" → `whats_on{channel:"BBC One", at:"21:00"}`.
 
+**Casting (§40, cast design §12).** `cast_devices` (read-only, never scans) returns `{devices: [{ref:
+"device:<32 hex>", name, kind, paired, available, experimental, casting}]}` with no addresses.
+`play` takes `device` (a ref or an exact name): the reply is immediate (`casting_started`), the
+agent confirms with `status`, whose `casting: {device, kind, phase, behind_live_s?, error?}` carries
+the typed reason of the last failure (cleared when the TV shows a picture, or when the user ends
+a cast that was not lost). Outcomes: `pin_required` (a locked item; the PIN is typed in Tuner),
+`pairing_required` (the user pairs in Settings ▸ Cast; no tool takes a PIN), `unavailable` with
+`cast-unreachable`, `cast-firewall`, `cast-unsupported` or `multiview-on`. `control` gains
+`stop_casting` and `play_here`; `volume` answers `unsupported` on AirPlay; `popout` / `window`
+answer `unavailable: casting`. `diagnose` gains a `cast` section (model, tvOS version, pairing
+variant, timing, firewall state, last error kind). Placement: a `play` with `device` skips §30.13's
+window placement entirely (`opened_in: "device"`); a popped-out window is put back in, unraised.
+The bridge never retries a `device` play without the field on an older Tuner (it answers "The
+running Tuner can't cast; update Tuner"). Casting calls are actions (the 2/s bucket). No tool
+changes the firewall. There are 29 tools with `cast_devices`.
+
 ### 30.6 Guardrails
 * **Visibility = the screens' rules.** Results only contain what the snapshot shows: hidden
   channels / groups, the category filter (§28), explicit content while hidden (§20.3), stacks
@@ -5912,7 +5994,7 @@ Verified against Hyprland's source and docs only; the real-desktop check is in
 Build notes: `docs/design/agent.md`. Extends §30.
 
 ### 37.1 Tools
-28 tools: the 13 of §30.5 (extended: `guide_search` without a query over a window and
+29 tools (28 before casting added `cast_devices`, §30.5): the 13 of §30.5 (extended: `guide_search` without a query over a window and
 categories, `whats_on` filters, `details.copies`, `search.explain_filtered`, `status.queue /
 multiview / streams / sleep_timer`, `control.previous_channel / popout / tile`), plus
 `match_titles`, `history`, `episodes`, `favourites_edit`, `parental_status`, `lock`,
@@ -6122,3 +6204,111 @@ first failure, sync on start, the queue); `SystemRunner` with real shell utiliti
 config restore. kittest with the fake: the page (rows, Connect, Disconnect confirm and cancel,
 Copy), the card (Enter, Esc, Don't ask again, several agents, a key or click as it appears),
 and the gate (waits for the player to close; a stale offer isn't shown).
+
+---
+
+## 40. Casting to a TV (AirPlay to an Apple TV, Phase 1)
+
+The full design, with its reasoning, the pinned reference implementations and the manual
+checklist, is `docs/design/cast-design.md` (it stays the authority for the protocol and the
+decision records). **Section numbers written as "DESIGN §40 §x.y" in the code are that file's
+§x.y.** This section says what shipped and where; the sections it touches (§11.5, §13.8, §15.2,
+§20, §21.3, §22, §30) carry a pointer back here. User-facing text: README "Casting to a TV";
+checks on a real TV: `docs/MANUAL_CHECKLIST.md` §30.
+
+### 40.1 What it is
+Press `C` in the player and pick a TV: picture A's controller sends what plays to the TV
+instead of mpv. Tuner is the relay: it pulls the stream from the provider (one upstream
+connection, as the local player would), repackages it with `ffmpeg` into HLS and serves that to
+the TV over the LAN; the TV never sees a provider address or login. Phase 1 casts to an Apple TV
+4K (tvOS 26.x and 27, pairing mandatory) over AirPlay 2 video, in native Rust with no helper
+process. Third-party AirPlay TVs (the Hisense) are listed as *experimental*. Chromecast, DLNA
+and Roku are later phases (cast design §15.3). The whole feature sits behind the compile-time
+switch `cast::ENABLED` (`src/cast/mod.rs`; the key table's `feature_on`, the service start, the
+OSD and menu items, the Settings page, the cards and the agent's tools all read it) and the
+user's `[cast] enabled`.
+
+### 40.2 Pieces (cast design §5.3 is the map; what exists)
+* **Value types and the seam.** `model/cast.rs` (ids, kinds, phases, `CastView`, `CastErrorKind`,
+  `CastHints`) is shared; `player/remote.rs` defines the controller's contract (`CastConnector`,
+  `RemoteOutput`, `RemoteCmd`, `RemoteEvent`) and the pure `RemoteEvent` → `state::Input`
+  adapter, so `player` never depends on `cast`. The controller treats a cast like an output
+  that is not mpv: zaps, reconnects, seeks, Up next, progress and the failure cache run through
+  the same state machine (§11). Live preview autoplay is off while casting.
+* **AirPlay client** (`cast/airplay/`): TLV8, SRP-6a, HAP framing, pair-setup (HKP 3, HKP 5
+  fallback only inside the pairing session) and pair-verify, binary plists, the HTTP/RTSP
+  transport on one connection, SETUP / type-130 video, the `/command` play queue (insert,
+  replace, set rate, seek), the event channel, `playbackInfo` positions, and the redacted
+  `TUNER_CAST_TRACE` transcript. Ported from pyatv (MIT) and the pinned references of cast
+  design §7.0, with the notice in `THIRD_PARTY_NOTICES.md`. Timing is declared PTP, never NTP.
+  tvOS 27 differences (client name, `skipRecord`, split event frames) are behaviour, not
+  branches (cast design §7.6).
+* **Relay** (`cast/relay/`): a loopback upstream proxy (`upstream.rs`: one provider connection,
+  playlist rewriting, `Range`), `probe.rs` (ffprobe), the pure ladder `plan.rs` (L1 original,
+  L2 repackage, L3 convert with libx264; DRM refused; interlaced is deinterlaced for AirPlay,
+  Apple's HLS rule 1.14), the ffmpeg supervisor (`ffmpeg.rs`), the served-playlist guard and
+  playlist views (`playlist.rs`: seeks inside what is produced cost no new upstream), the LAN
+  server (`server.rs`, axum: only `GET`/`HEAD` of `/c/<token>/<file>`, bound to the one address
+  that reaches the TV, peer check, listening only during a session) and tokens (`token.rs`:
+  128 random bits, one per load generation, `Secret`, revoked on stop). Live output goes to
+  tmpfs (`cast_live_dir`), films and catch-up to `cast_vod_dir` (8 GiB cap, wiped on stop, swept
+  at startup).
+* **Service** (`cast/service.rs`, `session.rs`, `discovery.rs`, `registry.rs`, `inhibit.rs`,
+  `store/cast.rs`): started and stopped by `Services` like the MPRIS service; mDNS discovery
+  (`mdns-sd`) with a manual address probe; one session task per cast driving receiver and relay,
+  escalating L2 → L3 once (the result kept in `cast_hint`), the 10 s "TV never fetched" firewall
+  check, one `playbackInfo` every 10 s, the logind sleep inhibitor (`cast.keep_awake`). Pairing
+  identity and devices live in `cast_identity` / `cast_device` (migration `0014_cast.sql`,
+  never exported by backup).
+* **Firewall** (`cast/firewall/`, `src/bin/tuner-firewall.rs`, `packaging/polkit/`): detection
+  without root from `/etc/ufw/*` and `systemctl is-active` (`FirewallState`), the `user.rules`
+  parser, and the *Allow on firewall* / *Remove rule* runner through `pkexec`. The helper
+  validates its verb, interface (present in `/sys/class/net`), RFC 1918 CIDR and port, refuses
+  unless root under pkexec, and runs one fixed `ufw` command tagged `omatuner cast`. From a
+  checkout it falls back to the generic polkit action running `ufw` itself.
+* **UI** (`ui/overlays/{cast_picker,cast_pair,cast_firewall,cast_offer}.rs`,
+  `ui/screens/settings/cast.rs`, the player's OSD / banner / cards and `video_host.rs`): the
+  picker (`C`, the Cast control, the menu), the PIN overlay (600 ms arming guard, the PIN used
+  once and never logged), the casting card (phase line, *Stop casting*, *Play here*, error
+  actions), the first-run discovery card and three-step wizard (pair, network, Test on TV),
+  Settings ▸ Cast, a compact-layout status chip, and `cast_offer::error_sentence` as the one
+  place the §3.4 failure sentences are written.
+* **Agents** (§30, `agent/`): `cast_devices`, `play {device}`, `control stop_casting` /
+  `play_here`, `status.casting`, `diagnose.cast`, the `RULES.md` section 12 and the `fix`,
+  `watch`, `kids` notes.
+
+### 40.3 Behaviour worth knowing
+* **Where alerts go** (cast design §3.8). Casting never moves the window: an agent's cast, a
+  reminder's switch while casting and a play from anywhere leave the workspace alone (a locked
+  item still raises Tuner for the PIN). A cast that starts while the pop-out is up pops it back
+  in, unraised. A failure shows on the casting card when the player is on screen, as a toast when
+  the window is seen, and as a desktop notification with **Show** (`PlatformEvent::ShowPlayer`)
+  when it is not.
+* **Same generation reloads.** Escalation, Convert, a film seek past what is produced and a live
+  resume close and reopen the provider under one generation; the session holds the close back so
+  the controller does not read it as the upstream dropping (and still reports it when the
+  reload fails or is superseded).
+* **Catch-up seeks clamp** to the produced edge (`RemoteEvent::SeekClamped`, toast "Catch-up can
+  only seek as far as it has loaded"); films restart ffmpeg with `-ss`.
+* **Config** `[cast]`: `enabled`, `offer_setup`, `checked_version`, `default_device`,
+  `media_port` (47800), `min_segments` (2), `convert` (auto | never), `interlaced` (auto |
+  as-is), `experimental`, `keep_awake`. Machine-local like `[agents]`.
+* **Accepted limits.** Alert toasts carry one button (the `Action` enum has no Play here / Cast
+  again / open-firewall-card actions; the menu uses `Action::Digit(248/249)`); *Show command*
+  opens the firewall card, where it is pressed again; the *Pairing refused* sentence merges the
+  470 hint and the "Everyone in your Home" hint; separate HLS audio tracks are not followed (such
+  a provider plays without sound); moving the cast to another TV that then fails to open leaves
+  the player Idle; an agent cast of a title with several copies loses `start_at` and the
+  fallback copy; `cast_devices` is listed even while casting is switched off.
+
+### 40.4 Tests (cast design §14)
+Pure: TLV8/SRP/HAP vectors from pyatv 0.18.0 itself (`tests/fixtures/cast/vectors/`), the plan
+ladder, the playlist guard, the ufw parser (fixture `user.rules` files), the helper's argument
+validation, the remote-event adapter. Scenario: `tests/cast_airplay.rs` against the fake
+receiver (`tests/support/fake_airplay.rs`, tvOS 26 and 27 modes), `tests/cast_relay.rs` over
+loopback, `tests/cast_service.rs` (fake receiver and relay), `tests/cast_firewall.rs` (a fake
+`pkexec`), the controller's casting section in `tests/player_mpv.rs`, the agent's in
+`tests/agent_app.rs`, and kittest screens in the modules. Two `#[ignore]`d tests interoperate with
+a real pyatv (`TUNER_CAST_PYATV`) and the LAN (`TUNER_CAST_LIVE`). Not covered: the fMP4 keyframe
+check end to end, the 8 GiB film cap, `CpuTooSlow`, and pkexec, polkit and ufw on a real system
+(manual checklist §30 item 15).
