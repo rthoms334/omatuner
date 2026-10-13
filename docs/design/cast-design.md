@@ -503,6 +503,8 @@ next's engine, the agent) and the PIN, copy and Resume rules stay the senders' a
 play. Not diverted: the Live preview's plays (`PlayOrigin::LivePreview`: moving the cursor never
 casts; the preview autoplay is off anyway while the switch is on a TV, `live.rs` / `guide.rs`),
 and anything in multi-view (two pictures are this computer's; the switch applies once it ends).
+Multi-view that ended on picture B: a play while the switch names a TV, and a *Cast to…*, go to
+picture A as a film does (picture B stops, its claim goes at once: `app::mv_vod_to_a`).
 On a TV already, plays land on that TV as before (§3.3).
 
 **The chooser** (`OverlayRequest::PlayOn`; the status chip, Alt+T, Settings ▸ Cast ▸ *Play on:
@@ -525,7 +527,7 @@ it changes and restored at start only with Settings ▸ Cast ▸ *Remember Play 
 (`cast.remember_play_on`, off): by default every start plays here, so a TV that's off at the
 next start never swallows plays.
 
-**Agents.** `status.play_on` names the switch's TV, and a `play` without `device` while it names
+**Agents.** `status.play_on` names the switch's TV (single view), and a `play` without `device` while it names
 one is answered as a cast (`opened_in: "device"`, the TV named, the window left in place, §3.8),
 as a play while casting is. Agents never change the switch: it is the user's (RULES.md §2, §12).
 Reminder switches follow it too, and skip their "Open in" placement as while casting.

@@ -1053,9 +1053,10 @@ impl Controller {
     /// The Play on switch's TV for a play that would start here (DESIGN §40 §3.9): picture A,
     /// playing here (on a TV already, the play lands there through the remote output), not the
     /// Live preview's (moving the cursor never retunes a TV, §11.4) and not with two pictures
-    /// (multi-view is this computer's; `cast_to` would refuse it).
+    /// (multi-view is this computer's; `cast_to` would refuse it). A picture B that was just
+    /// stopped for this play (multi-view ending with it) no longer counts once its claim went.
     fn play_on_tv(&self, req: &PlayRequest) -> Option<DeviceId> {
-        let here = self.tile == TileId::A && !self.casting() && !self.budget.others_active(self.tile);
+        let here = self.tile == TileId::A && !self.casting() && !self.budget.others_claim(self.tile);
         self.snap.play_on.filter(|_| here && req.origin != PlayOrigin::LivePreview)
     }
 
@@ -1096,7 +1097,8 @@ impl Controller {
     /// or what played, at its position. Another TV's session (or a lost one) ends first: one
     /// relay at a time.
     fn cast_to(&mut self, device: DeviceId, play: Option<CopyPlay>) -> bool {
-        if self.tile != TileId::A || self.budget.others_active(self.tile) {
+        // picture B's claim, not a stream it is still closing: the relay's lease waits for that
+        if self.tile != TileId::A || self.budget.others_claim(self.tile) {
             tracing::info!("{}: not casting: multi-view is on", self.log);
             return false;
         }

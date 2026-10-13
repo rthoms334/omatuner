@@ -477,6 +477,22 @@ impl<'a> UiCtx<'a> {
             }
             (_, cmd) => cmd,
         };
+        // single view on picture B (multi-view ended there): a cast, and any play while picture
+        // A's Play on switch names a TV, goes to picture A — the one that casts (the app's
+        // `mv_vod_to_a`; DESIGN §40 §3.1, §3.9)
+        let view = &self.multiview.view;
+        if !view.on && view.focus != crate::model::TileId::A {
+            let casts = match &cmd {
+                C::CastTo { play, .. } => play.is_some(),
+                C::CastCopy { .. } => true,
+                C::Play(_) | C::PlayCopy(_) => self.services.tiles.a().handle().snapshot().play_on.is_some(),
+                _ => false,
+            };
+            if casts {
+                self.mv_out.borrow_mut().push(multiview::MvRequest::SingleView(Box::new(cmd)));
+                return;
+            }
+        }
         match multiview::route_command(&self.multiview.view, cmd) {
             multiview::Routed::Focused(cmd) => self.services.tiles.focused().send(cmd),
             multiview::Routed::Audible(cmd) => self.services.tiles.audible_handle().send(cmd),

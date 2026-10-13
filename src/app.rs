@@ -433,8 +433,10 @@ impl TunerApp {
 
     /// "Remember Play on across restarts" (DESIGN §40 §3.9, `cast.remember_play_on`): the
     /// switch's TV from the last run goes back to picture A. Off (the default), every start plays
-    /// on this computer: a TV that's off now never swallows plays.
-    fn restore_play_on(&self) {
+    /// on this computer: a TV that's off now never swallows plays. `cast.play_on` is what the
+    /// switch is: one not restored is cleared, so turning Remember on later remembers this
+    /// session's choice, not a TV from an older one.
+    fn restore_play_on(&mut self) {
         let cfg = self.services().config();
         let c = &cfg.cast;
         if crate::cast::on(&cfg)
@@ -442,6 +444,8 @@ impl TunerApp {
             && let Some(id) = c.play_on.as_deref().and_then(|h| h.parse::<crate::model::DeviceId>().ok())
         {
             self.services().tiles.a().handle().send(PlayerCommand::SetPlayOn(Some(id)));
+        } else if c.play_on.is_some() {
+            self.config_edits.push(Box::new(|c| c.cast.play_on = None));
         }
     }
 
@@ -580,9 +584,13 @@ impl TunerApp {
         if now.is_some() {
             self.cast.last = now;
         }
-        if started && (self.popout.is_out() || self.video_only) {
+        if started {
+            // a pop-out asked for at launch and not up yet (`--play … --popout`, a switch that
+            // started Tuner, with Play on a TV remembered): it never comes
             self.reminder_ui.pop_out_pending = false;
-            self.toggle_popout(egui_ctx);
+            if self.popout.is_out() || self.video_only {
+                self.toggle_popout(egui_ctx);
+            }
         }
     }
 
@@ -2325,7 +2333,8 @@ impl TunerApp {
     fn open_overlay(&mut self, req: OverlayRequest, owner: Option<usize>, at: Option<egui::Pos2>) {
         match req {
             OverlayRequest::Help => self.open_help(self.key_stack()),
-            OverlayRequest::Jobs if self.overlays.last().is_some_and(|o| o.kind == std::mem::discriminant(&req)) => {
+            // their keys (Alt+T: the Play on chooser) close what they opened
+            OverlayRequest::Jobs | OverlayRequest::PlayOn if self.overlays.last().is_some_and(|o| o.kind == std::mem::discriminant(&req)) => {
                 self.overlays.pop();
             }
             req => {
@@ -6597,6 +6606,9 @@ mod tests {
         assert_eq!(chip(&rig), Some(crate::ui::casting::chip_text(None, "Alt+T").0));
         rig.press(Key::T, ALT);
         assert_eq!(rig.overlay_kinds(), [kind(OverlayRequest::PlayOn)]);
+        rig.press(Key::T, ALT);
+        assert!(rig.overlay_kinds().is_empty(), "Alt+T again closes it");
+        rig.press(Key::T, ALT);
         rig.frame_with(vec![]);
         rig.press(Key::ArrowDown, NONE);
         rig.press(Key::Enter, NONE);
@@ -6622,7 +6634,51 @@ mod tests {
             a.send(PlayerCommand::SetZapList(ZapList { collection: Collection::Group(GroupId(7)), channels: Vec::new().into() }));
             rig.until("the player's answer", |_| a.snapshot().zap.is_some());
             assert_eq!(a.snapshot().play_on, remember.then(living_room), "remember: {remember}");
+            // not restored: the old TV is gone from the config too, so turning Remember on
+            // later brings back this session's choice, not that one
+            rig.frame_with(vec![]);
+            assert_eq!(rig.app.services().config().cast.play_on, remember.then(|| living_room().to_string()), "remember: {remember}");
         }
+    }
+
+    /// `tuner --play … --popout` with Play on a TV remembered: the play casts before the
+    /// Hyprland worker is up, and the pop-out asked for never comes (nor its "Nothing to show
+    /// here" refusal): casting never moves the window (DESIGN §40 §3.8).
+    #[test]
+    fn a_launch_for_the_pop_out_that_casts_stays_in_place() {
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_channels(c, 2, None));
+        rig.settle();
+        let _sessions = paired_living_room(&mut rig);
+        let a = rig.app.services().tiles.a().handle();
+        a.send(PlayerCommand::SetPlayOn(Some(living_room())));
+        rig.until("the switch on Living Room", |_| a.snapshot().play_on.is_some());
+        rig.event(AppEvent::Ipc(IpcRequest { play: Some("1:m3u:ch1".into()), popout: true, ..Default::default() }));
+        rig.until("casting", |r| r.app.snapshot.cast.is_some());
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        rig.app.popout_backend = Some(Box::new(PopRecorder(sent.clone())));
+        rig.frame_with(vec![]);
+        assert!(sent.borrow().is_empty() && !rig.app.reminder_ui.pop_out_pending, "{:?}", sent.borrow());
+        assert!(!rig.log().toasts.iter().any(|t| t.text.starts_with("Nothing to show here")), "{:?}", rig.log().toasts);
+    }
+
+    /// Multi-view ended on picture B (picture A closed): with Play on a TV, Shift+Enter on a
+    /// channel still casts it — through picture A, the one that casts — instead of playing it in
+    /// picture B here.
+    #[test]
+    fn play_on_after_multi_view_ended_on_picture_b_still_casts() {
+        let mut rig = two_pictures();
+        rig.app.apply_mv(crate::ui::multiview::MvRequest::Close(Some(PIC_A)));
+        rig.until("single view on picture B", |r| !r.app.mv.view.on && r.app.mv.view.focus == PIC_B);
+        rig.until("picture A stopped", |r| r.app.mv_snap(PIC_A).is_some_and(|s| s.state == PlayerState::Idle));
+        let sessions = paired_living_room(&mut rig);
+        let a = rig.app.services().tiles.a().handle();
+        a.send(PlayerCommand::SetPlayOn(Some(living_room())));
+        rig.until("the switch on Living Room", |_| a.snapshot().play_on.is_some());
+        rig.press(Key::Enter, Modifiers::SHIFT);
+        let load = tv_load(&mut rig, &sessions);
+        assert_eq!(load.media, MediaRef::Channel(ChannelId(2)), "Bravo, on the TV");
+        rig.until("casting, back on picture A", |r| r.app.mv.view.focus == PIC_A && r.app.snapshot.cast.is_some());
+        rig.until("picture B stopped", |r| r.app.mv_snap(PIC_B).is_none_or(|s| s.state == PlayerState::Idle));
     }
 
     fn cast_failed(kind: crate::cast::CastErrorKind) -> AppEvent {

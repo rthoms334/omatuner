@@ -184,6 +184,13 @@ impl SharedBudget {
         s.claims.keys().any(|t| *t != tile) || s.open.iter().any(|((t, _), n)| *t != tile && *n > 0)
     }
 
+    /// Another picture targets a playlist (multi-view is on): its claim. A stream it is still
+    /// closing doesn't count — it stopped, single view again — the leases wait for that stream
+    /// (casting's checks, DESIGN §40 §0.6, §3.9).
+    pub fn others_claim(&self, tile: TileId) -> bool {
+        self.state().claims.keys().any(|t| *t != tile)
+    }
+
     /// The first other picture holding `source` (banner: "TV is in use by picture A").
     pub fn holder(&self, tile: TileId, source: SourceId) -> Option<TileId> {
         self.state().holders(tile, source).first().copied()

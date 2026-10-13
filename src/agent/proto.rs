@@ -986,7 +986,8 @@ pub struct StatusOut {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub casting: Option<CastingOut>,
     /// Tuner's Play on switch names a TV (DESIGN §40 §3.9): every play goes there, a `play`
-    /// without `device` too (`opened_in: "device"`). Absent: plays are on this computer.
+    /// without `device` too (`opened_in: "device"`). Absent: plays are on this computer (always
+    /// with two pictures: multi-view is this computer's).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub play_on: Option<PlayOnOut>,
 }

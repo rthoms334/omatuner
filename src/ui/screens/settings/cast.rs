@@ -81,7 +81,18 @@ pub(super) struct State {
 }
 
 static TOGGLES: [CfgToggle; 2] = [
-    CfgToggle { label: "Cast to TVs", get: |c| c.cast.enabled, set: |c, v| c.cast.enabled = v },
+    // off: the Play on switch goes back to this computer (the services' `SetPlayOn(None)`), and
+    // so does what it keeps for the next start (DESIGN §40 §3.9)
+    CfgToggle {
+        label: "Cast to TVs",
+        get: |c| c.cast.enabled,
+        set: |c, v| {
+            c.cast.enabled = v;
+            if !v {
+                c.cast.play_on = None;
+            }
+        },
+    },
     CfgToggle { label: "Offer to set up new TVs", get: |c| c.cast.offer_setup, set: |c, v| c.cast.offer_setup = v },
 ];
 

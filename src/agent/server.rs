@@ -404,7 +404,8 @@ impl Inner {
         let snap = self.player.snapshot();
         let mut more = self.status_more();
         more.casting = act::casting_out(&snap, &self.cast_last());
-        more.play_on = act::play_on_out(&snap, &self.shared.cast().devices());
+        // where a play without `device` goes: not with two pictures, as `lands_on`
+        more.play_on = act::play_on_out(&snap, &self.shared.cast().devices()).filter(|_| !self.window().multiview);
         let v = self.run(false, move |q| act::status_with(q, &snap, &more)).await?;
         to_value(&v)
     }

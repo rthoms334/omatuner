@@ -196,7 +196,8 @@ fn airing(ctx: &UiCtx<'_>, programme: crate::model::ProgrammeId, channel: crate:
         Airing::NotYet
     } else if stop > ctx.now {
         Airing::Live
-    } else if ch.has_catchup {
+    } else if ch.has_catchup && ch.catchup_days > 0 && start >= ctx.now - i64::from(ch.catchup_days) * 86_400 {
+        // inside the channel's archive window, as the guide's Catch up (`epg_grid::catchup_available`)
         Airing::Past { start, stop, catchup_id: p.catchup_id }
     } else {
         Airing::NoArchive
