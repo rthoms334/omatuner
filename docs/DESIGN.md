@@ -6254,20 +6254,29 @@ user's `[cast] enabled`.
   tvOS 27 differences (client name, `skipRecord`, split event frames) are behaviour, not
   branches (cast design §7.6).
 * **Relay** (`cast/relay/`): a loopback upstream proxy (`upstream.rs`: one provider connection,
-  playlist rewriting, `Range`), `probe.rs` (ffprobe), the pure ladder `plan.rs` (L1 original,
-  L2 repackage, L3 convert with libx264; DRM refused; interlaced is deinterlaced for AirPlay,
-  Apple's HLS rule 1.14), the ffmpeg supervisor (`ffmpeg.rs`), the served-playlist guard and
-  playlist views (`playlist.rs`: seeks inside what is produced cost no new upstream), the LAN
-  server (`server.rs`, axum: only `GET`/`HEAD` of `/c/<token>/<file>`, bound to the one address
-  that reaches the TV, peer check, listening only during a session) and tokens (`token.rs`:
-  128 random bits, one per load generation, `Secret`, revoked on stop). Live output goes to
-  tmpfs (`cast_live_dir`), films and catch-up to `cast_vod_dir` (8 GiB cap, wiped on stop, swept
-  at startup).
+  playlist rewriting, `Range`, a film's broken stream resumed from the byte it reached, the
+  cause of a break logged), `probe.rs` (ffprobe), the pure ladder `plan.rs` (L1 original, L2
+  repackage, L3 convert with libx264; DRM refused; interlaced is deinterlaced for AirPlay,
+  Apple's HLS rule 1.14; multichannel sound on the Apple TV adds a surround rendition), the
+  ffmpeg supervisor (`ffmpeg.rs`; films and catch-up read a 60 s burst, then real time), the
+  served-playlist guard and playlist views (`playlist.rs`: a target duration pinned per item
+  and never changed mid-stream, `EXT-X-START` at 0; seeks inside what is produced cost no new
+  upstream), the surround multivariant playlist (`renditions.rs`: a stereo AAC group and a
+  surround group, Apple's authoring spec 2.3, 9.6), the LAN server (`server.rs`, axum: only
+  `GET`/`HEAD` of `/c/<token>/[v|a|s/]<file>`, bound to the one address that reaches the TV,
+  peer check, listening only during a session) and tokens (`token.rs`: 128 random bits, one per
+  load generation, `Secret`, revoked on stop). Live output goes to tmpfs (`cast_live_dir`),
+  films and catch-up to `cast_vod_dir` (8 GiB cap, production paused 180 s ahead of the TV,
+  wiped on stop, swept at startup).
 * **Service** (`cast/service.rs`, `session.rs`, `discovery.rs`, `registry.rs`, `inhibit.rs`,
   `store/cast.rs`): started and stopped by `Services` like the MPRIS service; mDNS discovery
   (`mdns-sd`) with a manual address probe; one session task per cast driving receiver and relay,
-  escalating L2 → L3 once (the result kept in `cast_hint`), the 10 s "TV never fetched" firewall
-  check, one `playbackInfo` every 10 s, the logind sleep inhibitor (`cast.keep_awake`). Pairing
+  escalating L2 → L3 once (the result kept in `cast_hint`; a surround item the TV fails goes
+  again in stereo first, a segment longer than the pinned target restarts at the same level),
+  the 10 s "TV never fetched" firewall check, one `playbackInfo` every 10 s (tvOS 27 answers
+  under `info` with CMTimes; else an estimate from `timeJumped` and the TV's fetches, 2 s
+  behind), every reload continuing where the TV is, the logind sleep inhibitor
+  (`cast.keep_awake`), and INFO lines for a session's and an item's end with why. Pairing
   identity and devices live in `cast_identity` / `cast_device` (migration `0014_cast.sql`,
   never exported by backup).
 * **Firewall** (`cast/firewall/`, `src/bin/tuner-firewall.rs`, `packaging/polkit/`): detection

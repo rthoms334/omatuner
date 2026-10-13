@@ -1214,6 +1214,30 @@ mod casting {
         assert_eq!((tv.next(), tv.next()), (RemoteCmd::SeekTo(730.0), RemoteCmd::SeekTo(720.0)), "a small skip keeps the big one");
     }
 
+    /// The provider breaks a film's stream while the TV still plays what it buffered: the
+    /// reconnect resumes where the TV is by then (its last report run on while it played, 2 s back
+    /// as ever), not at that report, which can be 10 s old, nor at the cast's first start
+    /// (2026-10-13: "it reset back to the start").
+    #[test]
+    fn a_reconnect_resumes_where_the_tv_is_now() {
+        let Some((_media, _serial)) = setup() else { return };
+        let m = movie(82, "http://127.0.0.1:9/never-fetched.mp4".into());
+        let (h, sessions) = start_casting(vec![m.clone()]);
+        cast(&h, Some(m.media.clone()));
+        let mut tv = sessions.recv_timeout(LONG).expect("a session");
+        let (generation, ..) = tv.load();
+        tv.start(generation);
+        tv.send(RemoteEvent::Position { generation, pos: 100.0, dur: Some(3600.0) });
+        h.wait_snapshot(LONG, |s| casting_and_playing(s) && s.position == Some(100.0));
+        let reported = Instant::now();
+        tv.send(RemoteEvent::UpstreamClosed { generation, at: Instant::now() });
+        let (again, p, _) = tv.load();
+        let ran = reported.elapsed().as_secs_f64();
+        assert!(again > generation && p.media == m.media);
+        let at = p.start_at.expect("a resume point");
+        assert!(at > 98.0 && at <= 98.0 + ran, "resumed at {at}: the report (100 s) run on for up to {ran:.3} s, 2 s back");
+    }
+
     /// A film on the TV: transport goes to the session, positions are the progress, and the
     /// TV's `itemPlayedToEnd` is the film's `Ended` (Up next's cue).
     #[test]

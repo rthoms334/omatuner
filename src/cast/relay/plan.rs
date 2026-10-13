@@ -1,7 +1,8 @@
 //! The level decision (DESIGN §40 §8.3): pure and table-tested. DRM → refuse; override or hint
 //! L3 → L3; video outside the receiver profile → L3 (or refuse when `convert = never`);
 //! interlaced on AirPlay with `interlaced = auto` → L3 + yadif (Apple HLS rule 1.14); HEVC → L2
-//! fMP4; else L2 TS. Audio: AAC ≤ 2 ch copied, everything else AAC stereo 160k. OWNER: CAST-4.
+//! fMP4; else L2 TS. Audio: AAC ≤ 2 ch copied, everything else AAC stereo 160k; multichannel
+//! sound on the Apple TV adds a surround rendition (fMP4 throughout). OWNER: CAST-4.
 //!
 //! ```text
 //! plan(receiver, facts, options) →
@@ -12,7 +13,10 @@
 //!   interlaced && interlaced = auto && profile.deinterlace .... L3 + yadif   (Apple HLS rule 1.14)
 //!   HEVC ...................................................... L2 with fMP4 segments (Apple rule 1.5)
 //!   otherwise ................................................. L2 (TS segments)
-//!   audio: AAC ≤ 2 ch → copy; everything else → AAC stereo 160k (Apple rule 2.3; surround is Phase 2)
+//!   audio: AAC ≤ 2 ch → copy; everything else → AAC stereo 160k (Apple rule 2.3)
+//!   surround (Apple TV, video, > 2 ch) .......................... + a surround rendition beside
+//!       the stereo one (rules 2.5, 9.6: separate audio streams; fMP4 segments for every
+//!       rendition): AC-3, E-AC-3 and AAC ≤ 5.1 copied; anything else AC-3 5.1 448k
 //! ```
 //! L1 (byte relay) is Phase 2, and only AirPlay receivers have a profile in Phase 1 (Google Cast
 //! and DLNA plan as `Refuse(Unsupported)` until their phases add one).
@@ -23,6 +27,12 @@ use crate::config::{CastConvert, CastInterlaced};
 /// What a receiver plays without converting (DESIGN §40 §4.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Profile {
+    /// Multichannel sound goes as a surround rendition beside the stereo AAC one (§8.3): the
+    /// Apple TV decodes AC-3, E-AC-3 and multichannel AAC (Apple's HLS authoring spec, "Audio
+    /// compatibility") and sends them on as multichannel PCM, or Dolby Digital when set so.
+    /// Third-party AirPlay TVs stay stereo: Apple's section for them makes the renditions'
+    /// segment boundaries a MUST (8.22), which copied video can't promise.
+    pub surround: bool,
     /// ffmpeg video codec names played as they are.
     pub video: &'static [&'static str],
     /// The highest H.264 `level_idc` played as is (`None`: no limit within the codec list; the
@@ -33,14 +43,17 @@ pub struct Profile {
     pub deinterlace: bool,
 }
 
-/// The Apple TV and the experimental third-party AirPlay TVs (VioletRelay plays the same HLS on
-/// the Hisense): H.264 and HEVC.
-pub const AIRPLAY: Profile = Profile { video: &["h264", "hevc"], h264_max_level: None, deinterlace: true };
+/// The Apple TV: H.264 and HEVC, surround.
+pub const APPLE_TV: Profile = Profile { video: &["h264", "hevc"], h264_max_level: None, deinterlace: true, surround: true };
+/// Third-party AirPlay TVs (VioletRelay plays the same HLS on the Hisense): as the Apple TV, in
+/// stereo.
+pub const AIRPLAY_TV: Profile = Profile { surround: false, ..APPLE_TV };
 
 /// The receiver's profile; `None` before its phase (Google Cast: 2, DLNA: 3).
 pub fn profile(receiver: ReceiverKind) -> Option<Profile> {
     match receiver {
-        ReceiverKind::AppleTv | ReceiverKind::AirPlayTv => Some(AIRPLAY),
+        ReceiverKind::AppleTv => Some(APPLE_TV),
+        ReceiverKind::AirPlayTv => Some(AIRPLAY_TV),
         ReceiverKind::Chromecast | ReceiverKind::Dlna => None,
     }
 }
@@ -58,6 +71,16 @@ pub struct Facts {
     /// ffmpeg audio codec name of the stream that plays; `None`: no audio.
     pub acodec: Option<String>,
     pub channels: Option<u32>,
+    /// What the probe adds about that stream: its layout (`5.1(side)`), profile (`LC`,
+    /// `HE-AAC`, `Dolby Digital Plus + Dolby Atmos`), sample rate and language tag (`eng`).
+    pub layout: Option<String>,
+    pub aprofile: Option<String>,
+    pub sample_rate: Option<i64>,
+    pub language: Option<String>,
+    /// The picture's width and transfer characteristic (`smpte2084`, `arib-std-b67`): the
+    /// multivariant playlist's `RESOLUTION` and `VIDEO-RANGE`.
+    pub width: Option<u32>,
+    pub transfer: Option<String>,
     /// `-map 0:a:<n>`: the audio stream that plays (mpv's choice, else the default, else the
     /// first; §8.3). `None`: the first, if any (`0:a:0?`).
     pub audio_index: Option<usize>,
@@ -80,9 +103,21 @@ impl Facts {
 }
 
 /// The hints decide on their own (the probe is skipped, §8.1.2): both codecs, the channel count
-/// and the scan type are known.
-pub fn hints_suffice(h: &CastHints) -> bool {
-    h.vcodec.is_some() && h.acodec.is_some() && h.channels.is_some() && h.interlaced.is_some()
+/// and the scan type are known, and the sound isn't surround for a receiver that takes it (the
+/// surround rendition needs what only the probe tells: layout, profile, language, frame rate).
+pub fn hints_suffice(h: &CastHints, receiver: ReceiverKind) -> bool {
+    let surround = profile(receiver).is_some_and(|p| p.surround) && h.channels.is_some_and(|c| c > 2);
+    h.vcodec.is_some() && h.acodec.is_some() && h.channels.is_some() && h.interlaced.is_some() && !surround
+}
+
+impl Facts {
+    /// The sound for a log line: `aac 5.1(side) 48 kHz`, `ac3 6 ch`, `no audio`.
+    pub fn sound(&self) -> String {
+        let Some(codec) = self.acodec.as_deref() else { return "no audio".into() };
+        let layout = self.layout.clone().or_else(|| self.channels.map(|c| format!("{c} ch")));
+        let rate = self.sample_rate.map(|r| format!("{} kHz", r as f64 / 1000.0));
+        [Some(codec.to_owned()), layout, rate].into_iter().flatten().collect::<Vec<_>>().join(" ")
+    }
 }
 
 /// The settings and state the decision depends on.
@@ -95,6 +130,9 @@ pub struct Options {
     pub force: Option<CastLevel>,
     /// `libx264` and `aac` are there ([`super::check_ffmpeg`]): without them L3 is off.
     pub can_convert: bool,
+    /// Stereo only, whatever the source: the TV didn't play the surround renditions, or ffmpeg
+    /// couldn't make them (the session's and the relay's one fallback each).
+    pub stereo: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +152,19 @@ pub enum Audio {
     Copy,
     /// AAC stereo 160k (Apple rule 2.3).
     Aac,
+}
+
+/// The surround rendition beside the stereo AAC one (§8.3; Apple HLS authoring 2.3 stereo MUST,
+/// 2.5 multichannel formats, 9.6 multichannel MUST be a separate audio stream).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surround {
+    /// The source's own sound, copied: AC-3 (`ac-3`), E-AC-3 (`ec-3`), or AAC up to 5.1
+    /// (`mp4a.40.2`, which MPEG-TS carries as ADTS: `aac` says so).
+    Copy { aac: bool },
+    /// Converted to AC-3 5.1 at 448 kbit/s (DTS, TrueHD, multichannel MP2 or PCM, AAC 7.1…):
+    /// what every Dolby receiver decodes, and needing no Dolby Digital companion (rule 2.6 asks
+    /// for one beside E-AC-3 for devices without it).
+    Ac3,
 }
 
 /// HLS segment container.
@@ -140,8 +191,11 @@ impl Segments {
 pub struct Plan {
     pub level: CastLevel,
     pub video: Video,
+    /// The stereo sound (with a surround rendition: always AAC stereo, made from the source).
     pub audio: Audio,
     pub segments: Segments,
+    /// A surround rendition beside the stereo one (then every rendition is fMP4).
+    pub surround: Option<Surround>,
 }
 
 /// The ladder (module docs). `Err` is the refusal: `Unsupported` (DRM, no profile, converting
@@ -151,16 +205,19 @@ pub fn plan(receiver: ReceiverKind, facts: &Facts, opt: Options) -> Result<Plan,
         return Err(CastErrorKind::Unsupported);
     }
     let profile = profile(receiver).ok_or(CastErrorKind::Unsupported)?;
-    let audio = audio(facts);
+    let surround = surround(profile, facts, opt);
+    let audio = if surround.is_some() { Audio::Aac } else { audio(facts) };
+    // the renditions are demuxed, and an audio rendition is fMP4 (rule 2.1): so is the video
+    let renditions = if surround.is_some() { Segments::Fmp4 } else { Segments::Ts };
     let convert = |deinterlace: bool| -> Result<Plan, CastErrorKind> {
         if !opt.can_convert {
             return Err(CastErrorKind::NeedsFfmpeg);
         }
-        Ok(Plan { level: CastLevel::Converted, video: Video::Encode { deinterlace }, audio, segments: Segments::Ts })
+        Ok(Plan { level: CastLevel::Converted, video: Video::Encode { deinterlace }, audio, segments: renditions, surround })
     };
     let Some(vcodec) = facts.vcodec.as_deref() else {
         // radio: the sound alone, repackaged
-        return Ok(Plan { level: CastLevel::Repackaged, video: Video::None, audio, segments: Segments::Ts });
+        return Ok(Plan { level: CastLevel::Repackaged, video: Video::None, audio, segments: Segments::Ts, surround: None });
     };
     // yadif with `deint=interlaced` leaves progressive frames alone, so a converted picture is
     // always run through it for a receiver that needs deinterlacing (the scan type of a channel
@@ -194,8 +251,23 @@ pub fn plan(receiver: ReceiverKind, facts: &Facts, opt: Options) -> Result<Plan,
     {
         return convert(true);
     }
-    let segments = if vcodec == "hevc" { Segments::Fmp4 } else { Segments::Ts };
-    Ok(Plan { level: CastLevel::Repackaged, video: Video::Copy, audio, segments })
+    let segments = if vcodec == "hevc" { Segments::Fmp4 } else { renditions };
+    Ok(Plan { level: CastLevel::Repackaged, video: Video::Copy, audio, segments, surround })
+}
+
+/// The surround rendition, when the receiver takes one and there is a picture (tvOS lists no
+/// audio-only variant, rule 9.20: a radio channel stays a single stereo playlist) and more than
+/// two channels.
+fn surround(profile: Profile, f: &Facts, opt: Options) -> Option<Surround> {
+    if !profile.surround || opt.stereo || f.vcodec.is_none() {
+        return None;
+    }
+    let channels = f.channels.filter(|c| *c > 2)?;
+    Some(match f.acodec.as_deref()? {
+        "ac3" | "eac3" => Surround::Copy { aac: false },
+        "aac" if channels <= 6 => Surround::Copy { aac: true },
+        _ => Surround::Ac3,
+    })
 }
 
 /// AAC with at most two channels is copied; anything else (MP2, AC-3, E-AC-3, AAC-LATM, AAC 5.1,
@@ -216,10 +288,15 @@ mod tests {
         Facts { vcodec: v.map(str::to_owned), acodec: a.map(str::to_owned), channels: Some(ch), interlaced: Some(interlaced), ..Facts::default() }
     }
 
-    const AUTO: Options = Options { convert: CastConvert::Auto, interlaced: CastInterlaced::Auto, force: None, can_convert: true };
-    const L2_TS: fn(Audio) -> Plan = |audio| Plan { level: CastLevel::Repackaged, video: Video::Copy, audio, segments: Segments::Ts };
-    const L3: fn(bool, Audio) -> Plan =
-        |deinterlace, audio| Plan { level: CastLevel::Converted, video: Video::Encode { deinterlace }, audio, segments: Segments::Ts };
+    const AUTO: Options = Options { convert: CastConvert::Auto, interlaced: CastInterlaced::Auto, force: None, can_convert: true, stereo: false };
+    const L2_TS: fn(Audio) -> Plan = |audio| Plan { level: CastLevel::Repackaged, video: Video::Copy, audio, segments: Segments::Ts, surround: None };
+    const L3: fn(bool, Audio) -> Plan = |deinterlace, audio| Plan {
+        level: CastLevel::Converted,
+        video: Video::Encode { deinterlace },
+        audio,
+        segments: Segments::Ts,
+        surround: None,
+    };
 
     /// Every Apple TV row of §4.2 and every rung of §8.3.
     #[test]
@@ -235,17 +312,16 @@ mod tests {
             ("progressive H.264 + AAC stereo", facts(Some("h264"), Some("aac"), 2, false), AUTO, Ok(L2_TS(Audio::Copy))),
             ("MP2 sound", facts(Some("h264"), Some("mp2"), 2, false), AUTO, Ok(L2_TS(Audio::Aac))),
             ("AAC-LATM sound", facts(Some("h264"), Some("aac_latm"), 2, false), AUTO, Ok(L2_TS(Audio::Aac))),
-            ("AC-3 5.1", facts(Some("h264"), Some("ac3"), 6, false), AUTO, Ok(L2_TS(Audio::Aac))),
-            ("AAC 5.1", facts(Some("h264"), Some("aac"), 6, false), AUTO, Ok(L2_TS(Audio::Aac))),
+            ("AC-3 stereo", facts(Some("h264"), Some("ac3"), 2, false), AUTO, Ok(L2_TS(Audio::Aac))),
             ("interlaced → L3 + yadif (Apple 1.14)", facts(Some("h264"), Some("aac"), 2, true), AUTO, Ok(L3(true, Audio::Copy))),
             ("interlaced, send as is", facts(Some("h264"), Some("mp2"), 2, true), as_is, Ok(L2_TS(Audio::Aac))),
             ("interlaced, converting off", facts(Some("h264"), Some("aac"), 2, true), never, Ok(L2_TS(Audio::Copy))),
             ("interlaced, no encoder", facts(Some("h264"), Some("aac"), 2, true), no_enc, Ok(L2_TS(Audio::Copy))),
             (
                 "HEVC → fMP4",
-                facts(Some("hevc"), Some("eac3"), 6, false),
+                facts(Some("hevc"), Some("eac3"), 2, false),
                 AUTO,
-                Ok(Plan { level: CastLevel::Repackaged, video: Video::Copy, audio: Audio::Aac, segments: Segments::Fmp4 }),
+                Ok(Plan { level: CastLevel::Repackaged, video: Video::Copy, audio: Audio::Aac, segments: Segments::Fmp4, surround: None }),
             ),
             ("MPEG-2 → L3", facts(Some("mpeg2video"), Some("mp2"), 2, false), AUTO, Ok(L3(false, Audio::Aac))),
             ("576i MPEG-2 → L3 + yadif", facts(Some("mpeg2video"), Some("mp2"), 2, true), AUTO, Ok(L3(true, Audio::Aac))),
@@ -259,7 +335,7 @@ mod tests {
                 "radio",
                 facts(None, Some("mp2"), 2, false),
                 AUTO,
-                Ok(Plan { level: CastLevel::Repackaged, video: Video::None, audio: Audio::Aac, segments: Segments::Ts }),
+                Ok(Plan { level: CastLevel::Repackaged, video: Video::None, audio: Audio::Aac, segments: Segments::Ts, surround: None }),
             ),
             ("silent", facts(Some("h264"), None, 0, false), AUTO, Ok(L2_TS(Audio::None))),
         ];
@@ -269,6 +345,60 @@ mod tests {
         }
         let unknown_scan = Facts { interlaced: None, ..facts(Some("mpeg2video"), Some("aac"), 2, false) };
         assert_eq!(plan(ReceiverKind::AppleTv, &unknown_scan, AUTO), Ok(L3(true, Audio::Copy)), "unknown scan: yadif decides per frame");
+    }
+
+    /// Multichannel sound on the Apple TV (§8.3): a surround rendition beside the stereo AAC one,
+    /// every rendition fMP4; the source's Dolby or AAC ≤ 5.1 copied, anything else AC-3 5.1. A
+    /// third-party TV, a radio channel, stereo sound or the stereo fallback: one stereo playlist,
+    /// as before.
+    #[test]
+    fn surround_renditions_per_source_layout() {
+        use Surround::*;
+        let l2 = |segments, surround| Ok(Plan { level: CastLevel::Repackaged, video: Video::Copy, audio: Audio::Aac, segments, surround });
+        let fmp4 = Segments::Fmp4;
+        let rows: &[(&str, Facts, Options, Result<Plan, CastErrorKind>)] = &[
+            ("H.264 + AC-3 5.1", facts(Some("h264"), Some("ac3"), 6, false), AUTO, l2(fmp4, Some(Copy { aac: false }))),
+            ("HEVC + E-AC-3 5.1", facts(Some("hevc"), Some("eac3"), 6, false), AUTO, l2(fmp4, Some(Copy { aac: false }))),
+            ("HEVC + E-AC-3 7.1", facts(Some("hevc"), Some("eac3"), 8, false), AUTO, l2(fmp4, Some(Copy { aac: false }))),
+            ("HEVC + AAC 5.1 (the 2026-10-13 film)", facts(Some("hevc"), Some("aac"), 6, false), AUTO, l2(fmp4, Some(Copy { aac: true }))),
+            ("AAC 7.1", facts(Some("h264"), Some("aac"), 8, false), AUTO, l2(fmp4, Some(Ac3))),
+            ("DTS 5.1", facts(Some("hevc"), Some("dts"), 6, false), AUTO, l2(fmp4, Some(Ac3))),
+            ("TrueHD 7.1", facts(Some("hevc"), Some("truehd"), 8, false), AUTO, l2(fmp4, Some(Ac3))),
+            ("MP2 5.1", facts(Some("h264"), Some("mp2"), 6, false), AUTO, l2(fmp4, Some(Ac3))),
+            (
+                "interlaced + AC-3 5.1: converted, still surround",
+                facts(Some("h264"), Some("ac3"), 6, true),
+                AUTO,
+                Ok(Plan {
+                    level: CastLevel::Converted,
+                    video: Video::Encode { deinterlace: true },
+                    audio: Audio::Aac,
+                    segments: fmp4,
+                    surround: Some(Copy { aac: false }),
+                }),
+            ),
+            ("stereo fallback", facts(Some("h264"), Some("ac3"), 6, false), Options { stereo: true, ..AUTO }, Ok(L2_TS(Audio::Aac))),
+            ("AAC stereo", facts(Some("h264"), Some("aac"), 2, false), AUTO, Ok(L2_TS(Audio::Copy))),
+            (
+                "radio 5.1: no audio-only variant (rule 9.20)",
+                facts(None, Some("ac3"), 6, false),
+                AUTO,
+                Ok(Plan { level: CastLevel::Repackaged, video: Video::None, audio: Audio::Aac, segments: Segments::Ts, surround: None }),
+            ),
+        ];
+        for (what, f, opt, want) in rows {
+            assert_eq!(plan(ReceiverKind::AppleTv, f, *opt), *want, "{what}");
+        }
+        // a third-party TV stays stereo
+        assert_eq!(plan(ReceiverKind::AirPlayTv, &facts(Some("h264"), Some("ac3"), 6, false), AUTO), Ok(L2_TS(Audio::Aac)));
+        assert_eq!(plan(ReceiverKind::AirPlayTv, &facts(Some("hevc"), Some("aac"), 6, false), AUTO), l2(fmp4, None));
+        // the hints alone don't decide surround: the probe tells layout, language and frame rate
+        let h = CastHints { vcodec: Some("hevc".into()), acodec: Some("aac".into()), channels: Some(6), interlaced: Some(false), height: None };
+        assert!(!hints_suffice(&h, ReceiverKind::AppleTv));
+        assert!(hints_suffice(&h, ReceiverKind::AirPlayTv));
+        let f = Facts { layout: Some("5.1(side)".into()), sample_rate: Some(48000), ..facts(Some("hevc"), Some("aac"), 6, false) };
+        assert_eq!(f.sound(), "aac 5.1(side) 48 kHz");
+        assert_eq!(facts(Some("h264"), Some("ac3"), 6, false).sound(), "ac3 6 ch");
     }
 
     #[test]
@@ -281,8 +411,8 @@ mod tests {
     #[test]
     fn hints_suffice_only_when_complete() {
         let full = CastHints { vcodec: Some("h264".into()), acodec: Some("aac".into()), channels: Some(2), interlaced: Some(false), height: None };
-        assert!(hints_suffice(&full));
-        assert!(!hints_suffice(&CastHints { interlaced: None, ..full.clone() }), "mpv knows interlace only per frame");
-        assert!(!hints_suffice(&CastHints::default()));
+        assert!(hints_suffice(&full, ReceiverKind::AppleTv));
+        assert!(!hints_suffice(&CastHints { interlaced: None, ..full.clone() }, ReceiverKind::AppleTv), "mpv knows interlace only per frame");
+        assert!(!hints_suffice(&CastHints::default(), ReceiverKind::AppleTv));
     }
 }

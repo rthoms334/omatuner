@@ -27,8 +27,9 @@
 //!   sends no `stopped`) → `StoppedOnTv`. A close before anything played, or a frame that doesn't
 //!   open → `Lost(Unreachable)` (the controller re-verifies once).
 //! * **Position** (`position.rs`): while VOD or catch-up plays the client asks `playbackInfo`
-//!   every 10 s and reports `Position`; once the first request goes unanswered, the estimate.
-//!   Positions are relative to the current playlist.
+//!   every 10 s and reports `Position`; once the first request goes unanswered, the estimate. The
+//!   estimate starts where `timeJumped` says the playhead went (or where the TV's first fetch after
+//!   a jump starts) and runs while the TV plays. Positions are relative to the current playlist.
 
 pub mod bplist;
 pub mod events;
@@ -52,7 +53,7 @@ use tokio::time::Instant;
 use super::receiver::{LoadReq, ReceiverEvent, ReceiverInfo};
 use super::{CastErrorKind, Credentials, Identity, PairError, PairVariant, PeerCredentials, Pin};
 use events::{Event, PlaybackState};
-use position::{Estimate, Source};
+use position::{Estimate, Fetch, Fetches, Source};
 use rtsp::{Connection, Request};
 use session::{Channel, Raw, Session};
 
@@ -108,6 +109,8 @@ struct State {
     source: Source,
     /// The last `playbackInfo` messageID (PR 2846 counts from 1).
     message_id: i64,
+    /// The TV's media fetches as the estimate reads them ([`Fetches`]).
+    fetches: Fetches,
     /// When the next position is due (VOD and catch-up, once playing).
     next_sample: Option<Instant>,
     /// After a replace: `actionAtItemEnd 1` once the TV fetched the new item.
@@ -145,9 +148,10 @@ impl Client {
         self.0.set_paused(paused).await
     }
 
-    /// The TV fetched media up to `upto_s` of the current playlist.
-    pub async fn fetched(&mut self, upto_s: f64) {
-        self.0.fetched(upto_s).await
+    /// The TV fetched the segment `from_s..upto_s` of the current playlist: the estimate's bound,
+    /// and its new base after a jump (see [`Fetches`]).
+    pub async fn fetched(&mut self, from_s: f64, upto_s: f64) {
+        self.0.fetched(from_s, upto_s).await
     }
 
     /// `playbackInfo` (every 10 s while VOD plays, once before Play here / Stop), else the
@@ -192,6 +196,7 @@ impl State {
             estimate: Estimate::default(),
             source: Source::Untried,
             message_id: 0,
+            fetches: Fetches::default(),
             next_sample: None,
             rearm: false,
         })
@@ -241,8 +246,19 @@ impl State {
         Ok(())
     }
 
-    async fn fetched(&mut self, upto_s: f64) {
-        self.estimate.bound(upto_s);
+    async fn fetched(&mut self, from_s: f64, upto_s: f64) {
+        // a `timeJumped` the TV sent before this fetch reads with it
+        self.take_in();
+        match self.fetches.saw(from_s, upto_s) {
+            Fetch::Next => self.estimate.bound(upto_s),
+            Fetch::Jump => {
+                // the playhead is inside this segment: its start errs behind, never ahead
+                tracing::debug!("cast: the TV jumped to {from_s:.1} s (its fetches say)");
+                self.estimate.rebase(from_s, upto_s, Instant::now());
+            }
+            Fetch::NewRun => self.estimate.rebound(upto_s),
+            Fetch::Again => {}
+        }
         if std::mem::take(&mut self.rearm) && !self.done {
             // VioletRelay `finish_replacement`, best effort: until it lands the TV would advance
             // at the item's end (`actionAtItemEnd 0`), which is harmless with one item queued
@@ -255,6 +271,8 @@ impl State {
     }
 
     async fn position(&mut self) -> Option<f64> {
+        // everything the TV said so far counts (a jump, a pause)
+        self.take_in();
         self.item.as_ref()?;
         if self.source != Source::Estimate
             && !self.done
@@ -262,7 +280,7 @@ impl State {
         {
             return Some(a.position);
         }
-        Some(self.estimate.at(Instant::now()))
+        Some(self.estimate.reported(Instant::now()))
     }
 
     /// Cancel-safe: the only waits are the event queue and the position timer; a position
@@ -356,6 +374,7 @@ impl State {
     fn begin_item(&mut self, uuid: String, live: bool) {
         self.item = Some(Item { uuid, live, state: None, played: false, ended: false });
         self.estimate.restart();
+        self.fetches = Fetches::default();
         self.next_sample = None;
         self.rearm = false;
     }
@@ -363,10 +382,15 @@ impl State {
     /// Before a new item: what the TV said about the old one is moot (and must not be read as the
     /// new one's), so it is taken in and dropped.
     fn forget_stale(&mut self) {
+        self.take_in();
+        self.pending.clear();
+    }
+
+    /// Take in the events the tasks delivered so far (their `ReceiverEvent`s wait in `pending`).
+    fn take_in(&mut self) {
         while let Ok(raw) = self.raw.try_recv() {
             self.absorb(raw);
         }
-        self.pending.clear();
     }
 
     fn absorb(&mut self, raw: Raw) {
@@ -377,6 +401,7 @@ impl State {
         match raw {
             Raw::Event(Event::State(state)) => self.on_state(state, now),
             Raw::Event(Event::Notification(name)) => self.on_notification(&name),
+            Raw::Event(Event::TimeJumped { item, position }) => self.on_jump(item.as_deref(), position, now),
             Raw::Event(Event::Response { message_id, .. }) => tracing::debug!("cast: a late playbackInfo answer ({message_id})"),
             Raw::Event(Event::UpdateInfo | Event::Other(_)) => {}
             Raw::Closed { channel, bad } => {
@@ -427,9 +452,27 @@ impl State {
         self.pending.extend(ev);
     }
 
+    /// `timeJumped` with a position: the estimate continues from there (the TV's own word, at
+    /// the start and after every seek, also one made with the TV's remote). One about another item
+    /// (the one a replace removed) is ignored.
+    fn on_jump(&mut self, uuid: Option<&str>, position: f64, now: Instant) {
+        let Some(item) = self.item.as_ref() else { return };
+        if uuid.is_some_and(|u| u != item.uuid) {
+            return;
+        }
+        tracing::debug!("cast: notification timeJumped to {position:.1} s");
+        self.estimate.anchor(position, now);
+        self.fetches.placed();
+    }
+
     fn on_notification(&mut self, name: &str) {
         let Some(item) = self.item.as_mut() else { return };
         match name {
+            // a jump without a position: the TV's next fetch says where it went
+            "timeJumped" => {
+                tracing::debug!("cast: notification timeJumped");
+                self.fetches.jumped();
+            }
             "itemPlayedToEnd" if !item.ended => {
                 item.ended = true;
                 self.next_sample = None;
@@ -462,7 +505,7 @@ impl State {
         }
         let (pos, dur) = match answer {
             Some(a) => (a.position, a.duration),
-            None => (self.estimate.at(Instant::now()), None),
+            None => (self.estimate.reported(Instant::now()), None),
         };
         self.pending.push_back(ReceiverEvent::Position { pos, dur });
     }

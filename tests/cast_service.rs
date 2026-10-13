@@ -389,6 +389,50 @@ fn an_irregular_playlist_escalates_once_and_the_next_cast_starts_converted() {
     assert!(matches!(relay.with(|s| s.calls[0].clone()), RelayCall::Load { generation: 7, force: Some(CastLevel::Converted), .. }));
 }
 
+/// Every reload of the item under the same generation continues where the TV is now (§7.3):
+/// on 2026-10-13 an escalation restarted the film at the cast's first start, 70 s back. A segment
+/// that outgrew the pinned target restarts it at the same level (§8.1.4); a surround item the TV
+/// can't play goes again in stereo before any escalation (§8.4).
+#[test]
+fn reloads_continue_where_the_tv_is() {
+    let r = rig("tuner-cast-service-reload-at", calm());
+    let tv = r.links.receiver();
+    let relay = r.links.relay();
+    let out = r.cast.open(tv_id()).unwrap();
+    load(&out, 1, film(Some(30.0)));
+    until("the insert", || calls(&tv).len() == 1);
+    relay.emit(RelayEvent::UpstreamOpened { generation: 1 });
+    tv.emit(ReceiverEvent::Playing);
+    tv.emit(ReceiverEvent::Position { pos: 10.0, dur: None });
+    wait_event(&out.events, "the report", |e| matches!(e, RemoteEvent::Position { pos, .. } if *pos == 40.0));
+    // later: the TV is 35 s into its playlist (what it answers, or the estimate, now)
+    tv.with(|s| s.position = Some(35.0));
+    relay.emit(RelayEvent::TargetOverflow { generation: 1 });
+    until("the restart's replace", || calls(&tv).len() == 2);
+    let loads = |relay: &FakeRelayRemote| {
+        relay.with(|s| {
+            s.calls
+                .iter()
+                .filter_map(|c| match c {
+                    RelayCall::Load { generation, force, start_at, stereo, .. } => Some((*generation, *force, *start_at, *stereo)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(loads(&relay)[1], (1, Some(CastLevel::Repackaged), Some(65.0), false), "where the TV is, not 30 or 40");
+    assert!(matches!(&calls(&tv)[1], Call::Replace(req) if req.offset_s == 65.0));
+
+    // the next item comes with surround renditions, and the TV gives up before its first picture
+    relay.with(|s| s.surround = true);
+    let _again = r.links.receiver();
+    load(&out, 2, film(Some(100.0)));
+    until("the next item", || loads(&relay).len() == 3);
+    tv.emit(ReceiverEvent::Lost(CastErrorKind::ReceiverFailed));
+    until("the stereo load", || loads(&relay).len() == 4);
+    assert_eq!(loads(&relay)[3], (2, Some(CastLevel::Repackaged), Some(100.0), true), "stereo, same level, no escalation spent");
+}
+
 /// A seek inside what's produced replaces with a playlist view (its first segment is the new
 /// offset); beyond it, the film restarts there (`-ss`) and the card says "Seeking…". The
 /// restart's provider close and reopen stay inside generation 1: the controller hears only the

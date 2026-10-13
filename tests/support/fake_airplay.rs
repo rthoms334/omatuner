@@ -144,8 +144,9 @@ pub enum AllowAccess {
 /// What a `playbackInfo` request gets (DESIGN §40 §7.3 "Position").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaybackInfo {
-    /// 200, then `{kind: response, messageID, value: {position, duration, rate…}}` on the event
-    /// channel (PR 2846; LIVI's keys).
+    /// 200, then the answer on the event channel: tvOS 27 as an AppleTV14,1 sent it on
+    /// 2026-10-13, `{kind: response, messageID, info: {position: <CMTime>, duration: <CMTime>,
+    /// rate…}}`; tvOS 26 in LIVI's form (PR 2846), `value: {position: <real>, …}`.
     Answer,
     /// HTTP 500.
     Status500,
@@ -724,6 +725,17 @@ impl FakeAirPlay {
     /// Push `{type: notification, name}`.
     pub fn push_notification(&self, name: &str) {
         self.inner.notification(name);
+    }
+
+    /// The TV's playhead jumped (its own remote scrubbed): `timeJumped` for the current item,
+    /// with the position as tvOS 27 sends it (a CMTime), or without one.
+    pub fn jump(&self, position: Option<f64>) {
+        let uuid = self.inner.lock().current.clone().unwrap_or_default();
+        let mut d = vec![("type", string("notification")), ("name", string("timeJumped")), ("item", dict([("uuid", string(&uuid))]))];
+        if let Some(p) = position {
+            d.push(("position", cmtime((p * 90_000.0).round() as i64, 90_000, 1)));
+        }
+        self.inner.push_wrapped("notification timeJumped".into(), Value::Dict(d.into_iter().map(|(k, v)| (k.to_owned(), v)).collect()));
     }
 
     /// Wait (bounded, polling) until `f` gives a value; fails the test with the log otherwise.
@@ -1622,16 +1634,24 @@ fn command(inner: &Arc<Inner>, conn: &Conn, req: &Message) -> Reply {
                 let (position, duration) = st.position;
                 let rate = st.rate;
                 drop(st);
-                let mut value = vec![("position", Value::Real(position)), ("rate", Value::Real(rate)), ("readyToPlay", Value::Bool(true))];
-                if let Some(d) = duration {
-                    value.push(("duration", Value::Real(d)));
+                let tvos27 = inner.cfg.tvos == Tvos::V27;
+                // tvOS 27: CMTimes (a growing playlist's duration is indefinite, flags 17)
+                let time = |t: Option<f64>| match (tvos27, t) {
+                    (true, Some(t)) => cmtime((t * 1e9).round() as i64, 1_000_000_000, 1),
+                    (true, None) => cmtime(0, 0, 17),
+                    (false, t) => Value::Real(t.unwrap_or(f64::INFINITY)),
+                };
+                let mut value = vec![("position", time(Some(position))), ("rate", Value::Real(rate)), ("readyToPlay", Value::Bool(true))];
+                if duration.is_some() || tvos27 {
+                    value.push(("duration", time(duration)));
                 }
                 value.push(("playbackLikelyToKeepUp", Value::Bool(true)));
                 let mut answer = vec![("kind", string("response")), ("type", string("playbackInfo"))];
                 if let Some(id) = cmd.get("messageID") {
                     answer.push(("messageID", id.clone()));
                 }
-                answer.push(("value", Value::Dict(value.into_iter().map(|(k, v)| (k.to_owned(), v)).collect())));
+                let key = if tvos27 { "info" } else { "value" };
+                answer.push((key, Value::Dict(value.into_iter().map(|(k, v)| (k.to_owned(), v)).collect())));
                 let answer = Value::Dict(answer.into_iter().map(|(k, v)| (k.to_owned(), v)).collect());
                 reply.then = Some(("playbackInfo response".into(), answer));
             }
@@ -2063,6 +2083,11 @@ fn map_tlv(msg: &[u8], mut f: impl FnMut(u8, &mut Vec<u8>)) -> Vec<u8> {
 
 fn dict<const N: usize>(pairs: [(&str, Value); N]) -> Value {
     Value::Dict(pairs.into_iter().map(|(k, v)| (k.to_owned(), v)).collect())
+}
+
+/// A CMTime dict as tvOS sends times (`flags` 1 valid, 17 valid + indefinite).
+fn cmtime(value: i64, timescale: i64, flags: i64) -> Value {
+    dict([("epoch", Value::Int(0)), ("flags", Value::Int(flags)), ("timescale", Value::Int(timescale)), ("value", Value::Int(value))])
 }
 
 fn string(v: &str) -> Value {

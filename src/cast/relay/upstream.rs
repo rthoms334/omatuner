@@ -27,6 +27,14 @@
 //!   where it stopped, in the same response, so ffmpeg (`-reconnect 0`) never sees a gap.
 //! * **One client at a time.** Each request supersedes the previous reader, whose response
 //!   ends with an error.
+//! * **A film's stream that breaks mid-body resumes** where it broke: a sized resource the
+//!   provider serves by `Range` (VOD) is asked again from the byte the reader reached, in the
+//!   same response to ffmpeg, up to [`RESUMES`] times for a feed, each after progress (the
+//!   2026-10-13 film's provider closed its connection 30 s in; that had cost a reconnect and a
+//!   reload on the TV). Live and HLS segments fail as before (ffmpeg skips a broken segment; a
+//!   live stream reconnects through the controller's policy).
+//! * **Why a stream broke** is logged as its cause ([`cause`]): reqwest files every failure to
+//!   read a body as "error decoding response body", a provider closing its connection too.
 //! * **HLS upstream.** The proxy picks one variant (mpv's, approximated by its height, else the
 //!   highest bandwidth the receiver plays), fetches its media playlist itself and serves ffmpeg a
 //!   copy whose URIs (segments, `EXT-X-KEY`, `EXT-X-MAP`) are `…/u/<tok>/r/<n>.<ext>`, `n` indexing a
@@ -90,6 +98,10 @@ const PLAYLIST_REUSE: Duration = Duration::from_secs(1);
 const URI_TABLE_CAP: usize = 4096;
 /// Chunk handed to a reader at once.
 const READ_CHUNK: usize = 64 * 1024;
+/// A film's stream resumes after breaking this many times per feed, each after at least
+/// [`RESUME_PROGRESS`] bytes since the last (a provider that drops it at once again is down).
+const RESUMES: u32 = 3;
+const RESUME_PROGRESS: u64 = 1 << 20;
 
 /// What the events of a feed carry and where they go.
 #[derive(Clone)]
@@ -234,7 +246,7 @@ impl Net {
     async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response, String> {
         let task = tokio_util::task::AbortOnDropHandle::new(self.handle.spawn(req.send()));
         match task.await {
-            Ok(r) => r.map_err(|e| redact(&e.without_url().to_string()).into_owned()),
+            Ok(r) => r.map_err(|e| cause(&e)),
             Err(_) => Err("the request was dropped".to_owned()),
         }
     }
@@ -463,6 +475,9 @@ struct FeedState {
     failed: bool,
     closed: bool,
     http_sent: bool,
+    /// Mid-body resumes so far, and where the last one started.
+    resumes: u32,
+    resumed_at: Option<u64>,
 }
 
 /// One generation's upstream.
@@ -535,6 +550,18 @@ impl Feed {
     /// ffmpeg has made its first request (the 10 s attach watchdog, §8.1.1).
     pub fn final_attached(&self) -> bool {
         self.attached.load(Ordering::Relaxed)
+    }
+
+    /// May a film's stream that broke at `pos` resume there (module docs)?
+    fn may_resume(&self, pos: u64) -> bool {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let progressed = st.resumed_at.is_none_or(|at| pos >= at + RESUME_PROGRESS);
+        if st.failed || st.resumes >= RESUMES || !progressed || self.closing.is_cancelled() {
+            return false;
+        }
+        st.resumes += 1;
+        st.resumed_at = Some(pos);
+        true
     }
 
     fn fail(&self, status: Option<u16>, text: Option<String>) {
@@ -940,12 +967,35 @@ async fn pump(tape: Arc<Tape>, mut resp: reqwest::Response, ctx: FeedCtx) {
 }
 
 /// One body chunk, its wait timed on its own ([`UPSTREAM_TIMEOUT`]): the clock starts when the
-/// caller asks, after any backpressure. `Err` is a redacted reason.
+/// caller asks, after any backpressure. `Err` is a redacted reason: our own timeout says
+/// "nothing for 15 s", anything else is the provider's side ([`cause`]).
 async fn read_chunk(resp: &mut reqwest::Response) -> Result<Option<Bytes>, String> {
     match tokio::time::timeout(UPSTREAM_TIMEOUT, resp.chunk()).await {
-        Ok(r) => r.map_err(|e| redact(&e.without_url().to_string()).into_owned()),
+        Ok(r) => r.map_err(|e| cause(&e)),
         Err(_) => Err(format!("nothing for {} s", UPSTREAM_TIMEOUT.as_secs())),
     }
+}
+
+/// Why a request or a body failed, redacted and without the URL: the causes under reqwest's
+/// label. `Response::chunk` labels every failure to read a body "error decoding response body"
+/// (reqwest 0.13.5, `async_impl/response.rs`: `res.map_err(crate::error::decode)`), whatever
+/// it was; the client sets no read timeout (reads are timed by [`read_chunk`]), so what's under it
+/// is hyper's word for the connection: "error reading a body from connection: end of file before
+/// message length reached" (the provider hung up with bytes owed), "…: connection reset by peer".
+fn cause(e: &reqwest::Error) -> String {
+    use std::error::Error as _;
+    let mut parts: Vec<String> = Vec::new();
+    let mut next = e.source();
+    while let Some(c) = next {
+        let s = c.to_string();
+        if parts.last() != Some(&s) {
+            parts.push(s);
+        }
+        next = c.source();
+    }
+    let text = if parts.is_empty() { e.to_string() } else { parts.join(": ") };
+    let text = if e.is_timeout() && !text.contains("timed out") { format!("timed out: {text}") } else { text };
+    redact(&text).into_owned()
 }
 
 /// The rest of a small body (a playlist), capped.
@@ -1262,6 +1312,13 @@ async fn serve_bytes(feed: Arc<Feed>, key: Key, range: Option<&str>, epoch: u64)
     resp
 }
 
+/// A tape a broken read may resume: the main stream of a sized resource the provider serves by
+/// `Range`.
+fn resumable(tape: &Tape) -> bool {
+    let s = tape.lock();
+    tape.key == Key::Main && s.total.is_some() && s.ranges
+}
+
 struct ReadState {
     feed: Arc<Feed>,
     tape: Arc<Tape>,
@@ -1352,6 +1409,12 @@ async fn next_chunk(s: &mut ReadState) -> io::Result<Option<Bytes>> {
                 s.tape = s.feed.tape_for(s.tape.key, s.pos).await.map_err(|_| io::Error::other("the provider stopped"))?;
                 continue;
             }
+            Some(Err(Some(End::Failed))) if resumable(&s.tape) && s.feed.may_resume(s.pos) => {
+                // a film's connection dropped: the same bytes from where it broke (module docs)
+                tracing::info!("{}: resuming the provider's stream at byte {}", s.feed.ctx.label, s.pos);
+                s.tape = s.feed.tape_for(s.tape.key, s.pos).await.map_err(|_| io::Error::other("the provider stopped"))?;
+                continue;
+            }
             Some(Err(Some(_))) => {
                 s.feed.fail(None, None);
                 return Err(io::Error::other("the provider's stream broke"));
@@ -1377,12 +1440,41 @@ mod tests {
         #EXT-X-STREAM-INF:BANDWIDTH=12000000,RESOLUTION=1920x1080,CODECS=\"hvc1.2.4.L123.B0,ec-3\"\nhd/hevc.m3u8\n\
         #EXT-X-STREAM-INF:BANDWIDTH=1500000,RESOLUTION=960x540\nsd/index.m3u8\n";
 
+    /// A provider that hangs up mid-body (as the 2026-10-13 film's did, 30 s in) is logged as
+    /// that, not as reqwest's "error decoding response body", and our own read timeout can't be
+    /// the cause (the client has none).
+    #[tokio::test]
+    async fn a_body_cut_by_the_provider_says_so() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 1024];
+            let _ = sock.read(&mut req).await;
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n").await;
+            let _ = sock.write_all(&[0x47; 1000]).await;
+            // the provider hangs up with 99 000 bytes owed
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut resp = client.get(format!("http://{addr}/movie/u/p/1.mkv")).send().await.unwrap();
+        let why = loop {
+            match read_chunk(&mut resp).await {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("a cut body ended cleanly"),
+                Err(why) => break why,
+            }
+        };
+        assert_eq!(why, "error reading a body from connection: end of file before message length reached");
+        assert!(!why.contains("decoding") && !why.contains("timed out") && !why.contains("/movie/"), "{why}");
+    }
+
     #[test]
     fn the_variant_is_mpvs_else_the_best_the_receiver_plays() {
         let vs = variants(MASTER);
         assert_eq!(vs.len(), 4);
         assert_eq!((vs[1].bandwidth, vs[1].height), (6_000_000, Some(1080)));
-        let airplay = Some(super::super::plan::AIRPLAY);
+        let airplay = Some(super::super::plan::APPLE_TV);
         assert_eq!(choose_variant(&vs, Pick { profile: airplay, height: None }), Some(2), "HEVC 12M; never the VP9 one");
         assert_eq!(choose_variant(&vs, Pick { profile: airplay, height: Some(540) }), Some(3), "what mpv was playing");
         assert_eq!(choose_variant(&vs, Pick { profile: airplay, height: Some(720) }), Some(2), "no 720p: the best playable");

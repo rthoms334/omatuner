@@ -1717,7 +1717,8 @@ behind `cast::ENABLED` (`src/cast/mod.rs`); the build under test has it on.
 - [ ] **2. Session:**
   - **Do:** cast live TV for **60 minutes** with ufw on and only the TCP rule.
   - **Expect:** events keep arriving (declared PTP, no NTP). From the trace: does SETUP return
-    `skipRecord`, and what does RECORD answer? Does `playbackInfo` answer, and with which keys?
+    `skipRecord`, and what does RECORD answer? `playbackInfo` answers (under `info`, CMTimes):
+    the log never says "playbackInfo goes unanswered".
 - [ ] **3. Firewall button:**
   - **Do:** with ufw blocking, cast.
   - **Expect:** it fails within about 10 s with the Firewall message. *Allow on firewall* shows
@@ -1729,10 +1730,16 @@ behind `cast::ENABLED` (`src/cast/mod.rs`); the build under test has it on.
   `min_segments = 2`, the delay behind live, and the behaviour on a long-GOP channel.
 - [ ] **5. Formats:**
   - **Expect:** 1080i25 and 576i are deinterlaced (L3) with no combing, and ffmpeg's `speed`
-    stays above 1.0× on this M2. MP2 is converted to AAC. AAC 5.1 is converted to stereo. HEVC
-    (and 10-bit) plays in fMP4. For Phase 2, note whether an AC-3-only HLS plays.
+    stays above 1.0× on this M2. MP2 is converted to AAC. HEVC (and 10-bit) plays in fMP4.
+  - **Surround:** a film with AAC 5.1 (`xt:vod:346970`), a channel with AC-3 5.1 and a film with
+    E-AC-3: the log says `… 5.1(side) 48 kHz + surround (copied)`, the TV's audio menu shows one
+    track, an AVR (or the Apple TV's audio format) shows 5.1; on stereo speakers the sound is
+    the stereo track. If the TV doesn't start it, the log says "again in stereo" and the cast
+    goes on.
 - [ ] **6. Segment hygiene on real channels:** `ffprobe -show_frames` on each segment's first
-  frame: is it an IDR? Does the playlist guard ever raise TARGETDURATION?
+  frame: is it an IDR? A segment held back by the guard ("a segment outgrew the target
+  duration: restarting with a longer one") happens at most once a film, and TARGETDURATION
+  never changes within a playlist nor between the loads of one item.
 - [ ] **7. Controls:**
   - **Expect:** pause (`setRate 0`) and resume work, including after more than 80 s paused.
     Seeking inside the produced part (playlist view) and beyond it (`-ss`) lands at the right
@@ -1741,7 +1748,12 @@ behind `cast::ENABLED` (`src/cast/mod.rs`); the build under test has it on.
     `itemPlayedToEnd` arrives, Up next continues on the TV, and the progress shown matches the
     TV. Seeking a catch-up programme past what has loaded clamps with the toast "Catch-up can
     only seek as far as it has loaded".
-- [ ] **8. VOD EVENT playlist:** the TV starts before `ENDLIST`; resume a film at 1:10:00.
+- [ ] **8. VOD EVENT playlist:** the TV starts before `ENDLIST`, at the resume point (not 10 s
+  later); resume a film at 1:10:00. The TV's scrubber shows about a minute ahead, not the whole
+  film. Pause the TV for 5 minutes: the log says "pausing production … ahead of the TV", and it
+  resumes cleanly. A provider drop logs "resuming the provider's stream at byte …" and the TV
+  doesn't jump; *Convert this channel* 10 minutes into a film resumes within seconds of where
+  the TV was, never at the cast's start. The session's end is in the log with why.
 - [ ] **9. Stray requests:** does the TV fetch anything besides the playlist and segments
   (`/favicon.ico`, `HEAD`, `Range`)? The 404s are harmless.
 - [ ] **10. Volume:** confirm there is no working path (expected), so the "TV remote" copy is

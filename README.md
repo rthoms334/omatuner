@@ -1149,13 +1149,17 @@ notification with *Show* when Tuner is on another workspace.
 
 ### Limits
 
-- **Live TV runs about 10-20 seconds behind** and a channel change takes 6-12 seconds.
+- **Live TV runs about 15-25 seconds behind** and a channel change takes 6-12 seconds.
 - **Formats the TV can't play are converted** on this computer (CPU only): MPEG-2, VC-1 and
   interlaced pictures (Apple requires deinterlacing), and audio other than AAC stereo. A slow
   computer may not keep up with a 1080i channel: *Convert this channel* and Settings ▸ Cast ▸
-  *Convert what the TV can't play* / *Interlaced channels* are the controls. Sound is stereo;
-  surround is not sent yet. Subtitles and teletext are dropped. Encrypted (DRM) streams can't
-  be cast.
+  *Convert what the TV can't play* / *Interlaced channels* are the controls. Surround sound
+  (5.1 and 7.1 films and channels) reaches an Apple TV as surround beside a stereo track, which
+  the TV picks for stereo speakers (AC-3, E-AC-3 and AAC 5.1 as they are, anything else as
+  Dolby Digital 5.1); other AirPlay TVs get stereo. Subtitles and teletext are dropped.
+  Encrypted (DRM) streams can't be cast.
+- **On a film, the TV's own scrubber** reaches about a minute past where it plays (Tuner
+  fetches the film as it is watched); Tuner's seek bar reaches the whole film.
 - **One picture:** casting is unavailable in multi-view, and the pop-out is disabled while it
   casts.
 - **Provider connections:** the cast uses the one connection the local player would, so a

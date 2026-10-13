@@ -32,13 +32,22 @@
 //! * **Escalation** (§8.3) is one step per item: the TV fetched segments but never played
 //!   within 15 s, the TV reported a failure, or the playlist guard tripped. L3 then replaces the
 //!   item under the same generation; what worked is cached in `cast_hint` at the first picture.
+//!   A surround item the TV doesn't play is first tried again in stereo (§8.4), which costs no
+//!   escalation; a segment that outgrew the pinned target restarts the item where the TV is
+//!   (§8.1.4), at the same level.
 //! * **Positions** (§7.3): the receiver reports positions in its current playlist, which always
-//!   starts at 0; the item's offset (a `-ss` restart or a playlist view's first segment) is
-//!   added here, so the controller's snapshot, progress and `finished` stay true to the film.
-//!   The receiver reports them on its own (AirPlay: `playbackInfo` every 10 s while VOD or
-//!   catch-up plays, `Client::next_event`); the session asks once more before a stop.
+//!   starts at 0 (EVENT playlists say `EXT-X-START:TIME-OFFSET=0`); the item's offset (a `-ss`
+//!   restart or a playlist view's first segment) is added here, so the controller's snapshot,
+//!   progress and `finished` stay true to the film. The receiver reports them on its own
+//!   (AirPlay: `playbackInfo` every 10 s while VOD or catch-up plays, `Client::next_event`); the
+//!   session asks once more before a stop, and before every reload of the item under the same
+//!   generation ([`Session::here`]): a reload continues where the viewer is, not at the last 10 s
+//!   report, and never at the cast's first start.
 //! * **Test on TV** (§3.5, §8.5) runs the same machinery on the relay's lavfi test card, with no
 //!   provider and no controller: it passes at the TV's first `playing`.
+//! * **Field logs** (§7.6): one INFO line when the session ends and one when an item ends, each
+//!   with why (the player closed it, another cast took over, shutdown; replaced by the next item,
+//!   stopped, played to its end, failed, lost or stopped on the TV).
 
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -254,7 +263,7 @@ impl Relay {
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum RelayCall {
-    Load { generation: u64, force: Option<CastLevel>, start_at: Option<f64>, hints: CastHints },
+    Load { generation: u64, force: Option<CastLevel>, start_at: Option<f64>, hints: CastHints, stereo: bool },
     View { generation: u64, at_s: f64 },
     TestCard { generation: u64 },
     Stop { fast: bool },
@@ -271,11 +280,13 @@ pub struct FakeRelayState {
     pub produced_s: f64,
     /// Segment length (a view starts at the segment holding its target).
     pub segment_s: f64,
+    /// Loads that may make surround renditions say they did (`Prepared::surround`).
+    pub surround: bool,
 }
 
 impl Default for FakeRelayState {
     fn default() -> Self {
-        Self { calls: Vec::new(), fail_next: Vec::new(), produced_s: 0.0, segment_s: 4.0 }
+        Self { calls: Vec::new(), fail_next: Vec::new(), produced_s: 0.0, segment_s: 4.0, surround: false }
     }
 }
 
@@ -307,21 +318,23 @@ impl FakeRelay {
         if s.fail_next.is_empty() { Ok(()) } else { Err(s.fail_next.remove(0)) }
     }
 
-    fn prepared(&self, live: bool, offset_s: f64, level: CastLevel) -> Prepared {
+    fn prepared(&self, live: bool, offset_s: f64, level: CastLevel, surround: bool) -> Prepared {
         let n = self.state.lock().unwrap_or_else(|e| e.into_inner()).calls.len();
         Prepared {
             load: LoadReq { url: Secret::new(format!("http://192.0.2.1:47800/c/fake{n}/index.m3u8")), live, offset_s },
             level,
             behind_live_s: live.then_some(15),
+            surround,
         }
     }
 
     fn load(&self, spec: LoadSpec) -> Result<Prepared, CastErrorKind> {
         let live = spec.playable.kind.is_live();
         let start_at = spec.playable.start_at;
-        self.record(RelayCall::Load { generation: spec.generation, force: spec.force, start_at, hints: spec.hints })?;
+        self.record(RelayCall::Load { generation: spec.generation, force: spec.force, start_at, hints: spec.hints, stereo: spec.stereo })?;
         let offset = if live { 0.0 } else { start_at.unwrap_or(0.0) };
-        Ok(self.prepared(live, offset, spec.force.unwrap_or(CastLevel::Repackaged)))
+        let surround = !spec.stereo && self.state.lock().unwrap_or_else(|e| e.into_inner()).surround;
+        Ok(self.prepared(live, offset, spec.force.unwrap_or(CastLevel::Repackaged), surround))
     }
 
     fn view(&self, generation: u64, at_s: f64) -> Result<Option<Prepared>, CastErrorKind> {
@@ -330,12 +343,12 @@ impl FakeRelay {
             let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             (s.produced_s, s.segment_s)
         };
-        Ok((at_s <= produced).then(|| self.prepared(false, (at_s / seg).floor() * seg, CastLevel::Repackaged)))
+        Ok((at_s <= produced).then(|| self.prepared(false, (at_s / seg).floor() * seg, CastLevel::Repackaged, false)))
     }
 
     fn test_card(&self, generation: u64) -> Result<Prepared, CastErrorKind> {
         self.record(RelayCall::TestCard { generation })?;
-        Ok(self.prepared(false, 0.0, CastLevel::Converted))
+        Ok(self.prepared(false, 0.0, CastLevel::Converted, false))
     }
 }
 
@@ -385,11 +398,18 @@ struct Job {
     escalated: bool,
     /// A seek's restart (the card says "Seeking…", not "Starting…").
     seeking: bool,
+    /// Stereo only (the TV didn't play the surround renditions).
+    stereo: bool,
 }
 
 impl Job {
     fn item(generation: u64, playable: Arc<Playable>, hints: CastHints) -> Self {
-        Self { generation, source: Source::Item { playable, hints }, force: None, escalated: false, seeking: false }
+        Self { generation, source: Source::Item { playable, hints }, force: None, escalated: false, seeking: false, stereo: false }
+    }
+
+    /// `c`'s item again from `at` (see [`Current::again`]), at its level and settings.
+    fn again(c: &Current, at: Option<f64>) -> Self {
+        Self { generation: c.generation, source: c.again(at), force: Some(c.level), escalated: c.escalated, seeking: false, stereo: c.stereo }
     }
 }
 
@@ -399,6 +419,9 @@ struct Current {
     source: Source,
     level: CastLevel,
     escalated: bool,
+    /// The TV got surround renditions (§8.4); `stereo`: this generation was asked for none.
+    surround: bool,
+    stereo: bool,
     /// Seconds into the item where the TV's playlist starts.
     offset_s: f64,
     live: bool,
@@ -428,8 +451,9 @@ impl Current {
         }
     }
 
-    /// The item to load again (escalation, Convert, a live resume, a VOD seek): from `at`
-    /// seconds for VOD and catch-up (`-ss`), at the live point for live.
+    /// The item to load again (escalation, Convert, a target overflow, a live resume, a VOD
+    /// seek): from `at` seconds for VOD and catch-up (`-ss`; [`Session::here`] for "where the TV
+    /// is"), at the live point for live.
     fn again(&self, at: Option<f64>) -> Source {
         match &self.source {
             Source::Item { playable, hints } => {
@@ -549,19 +573,26 @@ impl Session {
             let job = match next {
                 Next::Cmd(None) => {
                     // the controller dropped its output without a Close
-                    self.close(false).await;
+                    self.close(false, "the player let go").await;
                     break;
                 }
                 Next::Cmd(Some(RemoteCmd::Close { fast })) | Next::Ctl(Ctl::Close { fast }) => {
                     if self.phase != CastPhase::Lost {
                         self.shared.clear_error();
                     }
-                    self.close(fast).await;
+                    let why = match next {
+                        _ if stop.is_cancelled() => "shutdown",
+                        Next::Ctl(_) => "another cast took over",
+                        _ => "the player closed it",
+                    };
+                    self.close(fast, why).await;
                     break;
                 }
                 Next::Cmd(Some(cmd)) => self.command(cmd, &mut deferred).await,
-                Next::Ctl(Ctl::Convert) => self.convert(),
-                Next::Ctl(Ctl::TestCard) => Some(Job { generation: 0, source: Source::TestCard, force: None, escalated: true, seeking: false }),
+                Next::Ctl(Ctl::Convert) => self.convert().await,
+                Next::Ctl(Ctl::TestCard) => {
+                    Some(Job { generation: 0, source: Source::TestCard, force: None, escalated: true, seeking: false, stereo: false })
+                }
                 Next::Relay(ev) => self.relay_event(ev).await,
                 Next::Receiver(ev) => self.receiver_event(ev).await,
                 Next::Timer => self.timer().await,
@@ -584,6 +615,7 @@ impl Session {
     }
 
     fn fail(&mut self, generation: u64, kind: PlayerErrorKind) {
+        tracing::info!("cast session {}: the item failed ({kind:?})", self.device.id.short());
         if let PlayerErrorKind::Cast(k) = kind {
             self.shared.note_error(k);
         }
@@ -597,7 +629,10 @@ impl Session {
     /// say so. It stays alive for the controller's `Close` or a new `Load` (which connects
     /// again).
     async fn lost(&mut self, kind: CastErrorKind) {
-        tracing::info!("cast session {}: lost ({})", self.device.id.short(), kind.reason());
+        match kind {
+            CastErrorKind::StoppedOnTv => tracing::info!("cast session {}: ended (stopped on the TV)", self.device.id.short()),
+            kind => tracing::info!("cast session {}: lost ({})", self.device.id.short(), kind.reason()),
+        }
         self.shared.note_error(kind);
         self.teardown(true).await;
         self.set_phase(CastPhase::Lost);
@@ -657,11 +692,28 @@ impl Session {
         self.cur = None;
     }
 
-    async fn close(&mut self, fast: bool) {
+    async fn close(&mut self, fast: bool, why: &str) {
+        tracing::info!("cast session {}: ended ({why})", self.device.id.short());
         if !fast {
             self.final_position().await;
         }
         self.teardown(fast).await;
+    }
+
+    /// Where the TV is in the item now (absolute; `None` for live): asked now (`playbackInfo`,
+    /// else the receiver's estimate, which errs behind) once the item played, else where its
+    /// playlist starts (it never played: it starts there again). Reloads under the same
+    /// generation start here.
+    async fn here(&mut self) -> Option<f64> {
+        let c = self.cur.as_ref().filter(|c| !c.live)?;
+        let (offset, playing, last) = (c.offset_s, c.playing, c.position);
+        if playing
+            && let Some(b) = self.backend.as_mut()
+            && let Ok(Some(rel)) = tokio::time::timeout(FINAL_POSITION, b.position()).await
+        {
+            return Some(rel + offset);
+        }
+        Some(if playing { last.unwrap_or(offset) } else { offset })
     }
 
     /// One last `playbackInfo` before Play here / Stop, so the computer resumes where the TV was.
@@ -711,6 +763,9 @@ impl Session {
         if self.reopen.is_some_and(|r| r.generation != job.generation) {
             self.end_reopen();
         }
+        if self.cur.as_ref().is_some_and(|c| c.generation != job.generation) {
+            tracing::info!("cast session {}: the item ended (replaced by the next one)", self.device.id.short());
+        }
         let same = self.cur.as_ref().filter(|c| c.generation == job.generation);
         let (playing, position) = (same.is_some_and(|c| c.playing), same.and_then(|c| c.position));
         if same.is_some() {
@@ -726,6 +781,8 @@ impl Session {
             source: job.source.clone(),
             level: force.unwrap_or(CastLevel::Repackaged),
             escalated: job.escalated || force == Some(CastLevel::Converted),
+            surround: false,
+            stereo: job.stereo,
             offset_s: 0.0,
             live,
             duration,
@@ -745,7 +802,8 @@ impl Session {
         let relay = self.relay.as_mut().expect("connected");
         let prepared = match &job.source {
             Source::Item { playable, .. } => {
-                let spec = LoadSpec { generation: job.generation, playable: playable.clone(), hints, receiver: self.device.kind, force };
+                let spec =
+                    LoadSpec { generation: job.generation, playable: playable.clone(), hints, receiver: self.device.kind, force, stereo: job.stereo };
                 relay.load(spec).await
             }
             Source::TestCard => relay.test_card(job.generation).await,
@@ -768,6 +826,7 @@ impl Session {
         if let Some(c) = self.cur.as_mut() {
             c.level = prepared.level;
             c.offset_s = prepared.load.offset_s;
+            c.surround = prepared.surround;
         }
         self.send(RemoteEvent::Level(prepared.level));
         self.send(RemoteEvent::BehindLive(prepared.behind_live_s));
@@ -873,6 +932,9 @@ impl Session {
                 None
             }
             RemoteCmd::Stop => {
+                if self.cur.is_some() {
+                    tracing::info!("cast session {}: the item ended (stopped)", self.device.id.short());
+                }
                 self.final_position().await;
                 self.teardown(false).await;
                 None
@@ -885,8 +947,7 @@ impl Session {
         let c = self.cur.as_ref()?;
         // a live pause longer than the window resumes at the live point (§11.3)
         if !paused && c.live && c.paused.is_some_and(|t| t.elapsed() >= LIVE_WINDOW) {
-            let job = Job { generation: c.generation, source: c.again(None), force: Some(c.level), escalated: c.escalated, seeking: false };
-            return Some(job);
+            return Some(Job::again(c, None));
         }
         let b = self.backend.as_mut()?;
         match b.set_paused(paused).await {
@@ -951,7 +1012,7 @@ impl Session {
             Ok(None) => {
                 let c = self.cur.as_ref()?;
                 let force = (c.level == CastLevel::Converted).then_some(CastLevel::Converted);
-                Some(Job { generation, source: c.again(Some(at)), force, escalated: c.escalated, seeking: true })
+                Some(Job { force, seeking: true, ..Job::again(c, Some(at)) })
             }
             Err(kind) => {
                 self.fail(generation, PlayerErrorKind::Cast(kind));
@@ -961,26 +1022,30 @@ impl Session {
     }
 
     /// **Convert this channel**: remembered for the item on this TV (`cast_hint.forced`), and
-    /// L3 now unless it already converts (a replace, same generation).
-    fn convert(&mut self) -> Option<Job> {
+    /// L3 now unless it already converts (a replace, same generation, where the TV is).
+    async fn convert(&mut self) -> Option<Job> {
         let c = self.cur.as_ref()?;
         let item = c.playable()?.item.clone();
         if let Some(item) = item {
             let (device, now) = (self.device.id, crate::model::now());
             let _ = self.shared.writer().submit(move |conn| crate::store::cast::force_convert(conn, &item, device, now));
         }
-        let c = self.cur.as_ref().filter(|c| c.level != CastLevel::Converted)?;
-        Some(Job { generation: c.generation, source: c.again(None), force: Some(CastLevel::Converted), escalated: true, seeking: false })
+        self.cur.as_ref().filter(|c| c.level != CastLevel::Converted)?;
+        let at = self.here().await;
+        let c = self.cur.as_ref()?;
+        Some(Job { force: Some(CastLevel::Converted), escalated: true, ..Job::again(c, at) })
     }
 
     /// One step L2 → L3 (§8.3), cached for the item and TV at once: L2's 15 s and L3's own start
     /// (a new relay load, two real-time live segments, the replace) can outlast the controller's
     /// 30 s load timeout, and its retry (a new generation) then starts converted instead of on L2
-    /// again. The first picture confirms the level (`remember`).
-    fn escalate(&mut self, why: &str) -> Option<Job> {
-        let c = self.cur.as_mut().filter(|c| c.can_escalate())?;
+    /// again. The first picture confirms the level (`remember`). It continues where the TV is.
+    async fn escalate(&mut self, why: &str) -> Option<Job> {
+        self.cur.as_ref().filter(|c| c.can_escalate())?;
+        let at = self.here().await;
+        let c = self.cur.as_mut()?;
         c.escalated = true;
-        let job = Job { generation: c.generation, source: c.again(None), force: Some(CastLevel::Converted), escalated: true, seeking: false };
+        let job = Job { force: Some(CastLevel::Converted), escalated: true, ..Job::again(c, at) };
         let cache = match &c.source {
             Source::Item { playable, hints } => playable.item.clone().map(|item| (item, hints.clone())),
             Source::TestCard => None,
@@ -991,6 +1056,16 @@ impl Session {
             let _ = self.shared.writer().submit(move |conn| crate::store::cast::save_hint(conn, &item, device, CastLevel::Converted, &seen, now));
         }
         Some(job)
+    }
+
+    /// The TV didn't play a surround item (§8.4): the same item, level and place in stereo, once;
+    /// no escalation is spent. `None` when it wasn't surround (or already stereo).
+    async fn stereo_again(&mut self, why: &str) -> Option<Job> {
+        self.cur.as_ref().filter(|c| c.surround && !c.stereo)?;
+        tracing::info!("cast session {}: {why} with surround: again in stereo", self.device.id.short());
+        let at = self.here().await;
+        let c = self.cur.as_ref()?;
+        Some(Job { stereo: true, ..Job::again(c, at) })
     }
 
     // ---- events
@@ -1050,7 +1125,7 @@ impl Session {
                     (c.fetched_playlist, c.fetched_segments, c.watchdog) = (true, true, None);
                 }
             }
-            RelayEvent::Irregular { .. } | RelayEvent::CpuTooSlow { .. } | RelayEvent::Failed { .. } => {}
+            RelayEvent::Irregular { .. } | RelayEvent::TargetOverflow { .. } | RelayEvent::CpuTooSlow { .. } | RelayEvent::Failed { .. } => {}
         }
     }
 
@@ -1076,12 +1151,12 @@ impl Session {
 
     async fn relay_event(&mut self, ev: RelayEvent) -> Option<Job> {
         match ev {
-            RelayEvent::SegmentFetched { generation, upto_s } => {
-                self.forward_relay(RelayEvent::SegmentFetched { generation, upto_s });
+            RelayEvent::SegmentFetched { generation, from_s, upto_s } => {
+                self.forward_relay(RelayEvent::SegmentFetched { generation, from_s, upto_s });
                 if self.cur.as_ref().is_some_and(|c| c.generation == generation)
                     && let Some(b) = self.backend.as_mut()
                 {
-                    b.fetched(upto_s).await;
+                    b.fetched(from_s, upto_s).await;
                 }
                 None
             }
@@ -1091,7 +1166,14 @@ impl Session {
                     let (device, now) = (self.device.id, crate::model::now());
                     let _ = self.shared.writer().submit(move |conn| crate::store::cast::mark_irregular(conn, &item, device, now));
                 }
-                self.escalate("irregular playlist")
+                self.escalate("irregular playlist").await
+            }
+            RelayEvent::TargetOverflow { generation } => {
+                // a longer GOP than the pinned target covers: the same level, where the TV is
+                self.cur.as_ref().filter(|c| c.generation == generation)?;
+                tracing::info!("cast session {}: a segment outgrew the target duration: restarting with a longer one", self.device.id.short());
+                let at = self.here().await;
+                Some(Job::again(self.cur.as_ref()?, at))
             }
             RelayEvent::CpuTooSlow { generation } => {
                 self.fail(generation, PlayerErrorKind::Cast(CastErrorKind::CpuTooSlow));
@@ -1116,9 +1198,15 @@ impl Session {
             }
             ReceiverEvent::Lost(kind) => {
                 // the TV gave up before the first picture: that's the TV failing the format
-                if kind == CastErrorKind::ReceiverFailed && self.cur.as_ref().is_some_and(|c| !c.playing && c.can_escalate()) {
-                    self.drop_backend().await;
-                    return self.escalate("the TV couldn't play it");
+                if kind == CastErrorKind::ReceiverFailed && self.cur.as_ref().is_some_and(|c| !c.playing) {
+                    if self.cur.as_ref().is_some_and(|c| c.surround && !c.stereo) {
+                        self.drop_backend().await;
+                        return self.stereo_again("the TV couldn't play it").await;
+                    }
+                    if self.cur.as_ref().is_some_and(Current::can_escalate) {
+                        self.drop_backend().await;
+                        return self.escalate("the TV couldn't play it").await;
+                    }
                 }
                 self.lost(kind).await;
                 return None;
@@ -1172,6 +1260,7 @@ impl Session {
                 out.push(RemoteEvent::Position { generation, pos, dur });
             }
             ReceiverEvent::Ended => {
+                tracing::info!("cast session {}: the item played to its end", self.device.id.short());
                 finished = !c.live;
                 out.push(RemoteEvent::Ended { generation });
             }
@@ -1235,8 +1324,11 @@ impl Session {
         if c.stall.is_some_and(|t| t <= now) {
             c.stall = None;
             if !c.playing && c.fetched_segments {
+                if c.surround && !c.stereo {
+                    return self.stereo_again("fetched but not playing").await;
+                }
                 if c.can_escalate() {
-                    return self.escalate("fetched but not playing");
+                    return self.escalate("fetched but not playing").await;
                 }
                 self.fail(generation, PlayerErrorKind::Cast(CastErrorKind::ReceiverFailed));
             }

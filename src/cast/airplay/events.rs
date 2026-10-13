@@ -2,7 +2,8 @@
 //! The event channel (DESIGN §40 §7.3 step 3, "Events"): keys `Events-Salt` swapped, every
 //! RTSP-framed request acked `RTSP/1.0 200 OK` with its CSeq (else the TV closes after ~25–30 s),
 //! requests reassembled across HAP frames up to Content-Length and acked once (castcli #35),
-//! `playbackState` / `notification` / `playbackInfo` responses decoded. OWNER: CAST-2.
+//! `playbackState` / `notification` / `playbackInfo` responses decoded, `timeJumped` with the
+//! TV's position. OWNER: CAST-2.
 //!
 //! Ported from pyatv PR 2899's `EventChannel.handle_received` / `_dispatch_event` (the ack's
 //! headers, the `{params: {data: <bplist>}}` unwrapping) @ b2484099 (MIT), with robkochman's
@@ -49,13 +50,22 @@ pub enum PlaybackState {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     State(PlaybackState),
-    /// `{type: "notification", name}`: `currentItemChanged`, `timeJumped`,
-    /// `playbackLikelyToKeepUp`, `loadedTimeRangesChanged`, `playbackBufferFull`,
-    /// `itemPlayedToEnd`, …
+    /// `{type: "notification", name}`: `currentItemChanged`, `playbackLikelyToKeepUp`,
+    /// `loadedTimeRangesChanged`, `playbackBufferFull`, `itemPlayedToEnd`, …
     Notification(String),
+    /// `{type: "notification", name: "timeJumped", item: {uuid}, position: <CMTime>}`: where the
+    /// TV's playhead now is in its playlist (the item's start, a seek). tvOS 27 sends one at every
+    /// start, with the position it chose (trace of 2026-10-13: 12.18 s into a VOD playlist).
+    /// Without a readable position it is a plain [`Event::Notification`].
+    TimeJumped {
+        item: Option<String>,
+        position: f64,
+    },
     /// `updateInfo`: acked and ignored.
     UpdateInfo,
-    /// `{kind: "response", messageID, value}`: the answer to a `playbackInfo` request (PR 2846).
+    /// `{kind: "response", messageID, info | value}`: the answer to a `playbackInfo` request (PR
+    /// 2846). tvOS 27.0 (AppleTV14,1, 24J361) puts the playback info under `info`, its times as
+    /// CMTime dicts; LIVI's form puts it under `value`, as numbers. Either is the `value` here.
     Response {
         message_id: i64,
         value: Option<Value>,
@@ -86,7 +96,8 @@ pub fn from_plist(v: &Value) -> Option<Event> {
         return None;
     }
     if queue::str_of(v.get("kind")) == Some("response") {
-        return Some(Event::Response { message_id: queue::int(v.get("messageID"))?, value: v.get("value").cloned() });
+        let value = v.get("info").or_else(|| v.get("value")).cloned();
+        return Some(Event::Response { message_id: queue::int(v.get("messageID"))?, value });
     }
     Some(match queue::str_of(v.get("type"))? {
         "playbackState" => {
@@ -99,7 +110,16 @@ pub fn from_plist(v: &Value) -> Option<Event> {
                 _ => Event::Other(format!("playbackState {}", short(name))),
             }
         }
-        "notification" => Event::Notification(queue::str_of(v.get("name")).map(short).unwrap_or_default()),
+        "notification" => {
+            let name = queue::str_of(v.get("name")).map(short).unwrap_or_default();
+            match super::position::seconds(v.get("position")) {
+                Some(position) if name == "timeJumped" => {
+                    let item = v.get("item").and_then(|i| queue::str_of(i.get("uuid"))).map(str::to_owned);
+                    Event::TimeJumped { item, position }
+                }
+                _ => Event::Notification(name),
+            }
+        }
         "updateInfo" => Event::UpdateInfo,
         other => Event::Other(short(other)),
     })
@@ -300,5 +320,31 @@ mod tests {
         assert_eq!(from_plist(&resp), Some(Event::Response { message_id: 3, value: Some(value) }));
         assert_eq!(from_plist(&Value::Array(vec![])), None);
         assert_eq!(decode(b"not a plist"), None);
+    }
+
+    fn cmtime(value: i64, timescale: i64) -> Value {
+        dict(&[("epoch", Value::Int(0)), ("flags", Value::Int(1)), ("timescale", Value::Int(timescale)), ("value", Value::Int(value))])
+    }
+
+    /// The shapes an AppleTV14,1 on tvOS 27.0 (24J361) sent on 2026-10-13: the `playbackInfo`
+    /// answer under `info` (read as "unanswered" before, so every session estimated), and
+    /// `timeJumped` with the position the TV chose (12.18 s into a growing playlist).
+    #[test]
+    fn tvos_27_answers_under_info_and_jumps_with_a_position() {
+        let info = dict(&[("position", cmtime(12_179_000_000, 1_000_000_000)), ("rate", Value::Real(1.0))]);
+        let resp =
+            dict(&[("info", info.clone()), ("kind", queue::text("response")), ("messageID", Value::Int(1)), ("type", queue::text("playbackInfo"))]);
+        let Some(Event::Response { message_id: 1, value: Some(v) }) = from_plist(&resp) else { panic!("{:?}", from_plist(&resp)) };
+        assert_eq!(super::super::position::answer(&v).map(|a| a.position), Some(12.179));
+        let uuid = dict(&[("uuid", queue::text("6F1C2D3E-4A5B-4C6D-8E7F-901234567890"))]);
+        let jumped = dict(&[
+            ("item", uuid),
+            ("name", queue::text("timeJumped")),
+            ("position", cmtime(1_096_110, 90_000)),
+            ("type", queue::text("notification")),
+        ]);
+        assert_eq!(from_plist(&jumped), Some(Event::TimeJumped { item: Some("6F1C2D3E-4A5B-4C6D-8E7F-901234567890".into()), position: 12.179 }));
+        let bare = dict(&[("name", queue::text("timeJumped")), ("type", queue::text("notification"))]);
+        assert_eq!(from_plist(&bare), Some(Event::Notification("timeJumped".into())), "no position: a plain notification");
     }
 }

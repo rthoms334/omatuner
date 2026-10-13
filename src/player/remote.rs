@@ -126,6 +126,54 @@ pub enum RemoteEvent {
     Lost(CastErrorKind),
 }
 
+/// Where the TV is between its position reports (DESIGN §40 §11.2; they come every 10 s, §7.3):
+/// the last report (or a seek's target), run on while the TV plays and held while it is paused or
+/// buffering. A relative seek counts from it, and a failure gives it to the machine first, so a
+/// reconnect resumes where the viewer was, not at the last report.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TvClock {
+    /// The position and when it held.
+    at: Option<(f64, Instant)>,
+    playing: bool,
+    paused: bool,
+    buffering: bool,
+}
+
+impl TvClock {
+    /// A report (absolute), or the target of a seek sent to the TV.
+    pub fn report(&mut self, pos: f64, now: Instant) {
+        self.at = Some((pos, now));
+    }
+
+    /// The TV plays (its first picture, or after a pause or buffering).
+    pub fn playing(&mut self, now: Instant) {
+        self.change(now, |c| (c.playing, c.paused, c.buffering) = (true, false, false));
+    }
+
+    pub fn paused(&mut self, paused: bool, now: Instant) {
+        self.change(now, |c| c.paused = paused);
+    }
+
+    pub fn buffering(&mut self, buffering: bool, now: Instant) {
+        self.change(now, |c| c.buffering = buffering);
+    }
+
+    /// Where the TV is at `now` (`None` before any report).
+    pub fn now(&self, now: Instant) -> Option<f64> {
+        let running = self.playing && !self.paused && !self.buffering;
+        self.at.map(|(pos, t)| if running { pos + now.saturating_duration_since(t).as_secs_f64() } else { pos })
+    }
+
+    /// A state change holds the position reached so far.
+    fn change(&mut self, now: Instant, f: impl FnOnce(&mut Self)) {
+        let pos = self.now(now);
+        f(self);
+        if let Some(pos) = pos {
+            self.at = Some((pos, now));
+        }
+    }
+}
+
 /// mpv's `MPV_ERROR_LOADING_FAILED`: an upstream that closed before its end is the END_FILE
 /// error mpv gives a dropped connection (`state::classify` → `Network`, or the HTTP status
 /// seen while loading).
@@ -290,6 +338,27 @@ mod tests {
         assert!(vod.at_eof());
         assert_eq!(vod.inputs(&closed(6)), vec![], "read to the end, not dropped");
         assert_eq!(vod.inputs(&RemoteEvent::Ended { generation: 6 }), vec![Input::EndFile { reason: EndReason::Eof, error: 0, entry: 6 }]);
+    }
+
+    /// The TV clock runs only while the TV plays: a pause or a buffering holds it, a report or a
+    /// seek moves it.
+    #[test]
+    fn the_tv_clock_runs_while_the_tv_plays() {
+        let t0 = Instant::now();
+        let s = |n: u64| t0 + std::time::Duration::from_secs(n);
+        let mut c = TvClock::default();
+        assert_eq!(c.now(s(5)), None, "nothing reported yet");
+        c.playing(s(0));
+        c.report(30.0, s(1));
+        assert_eq!(c.now(s(11)), Some(40.0));
+        c.paused(true, s(11));
+        assert_eq!(c.now(s(60)), Some(40.0), "paused");
+        c.paused(false, s(60));
+        c.buffering(true, s(65));
+        assert_eq!(c.now(s(90)), Some(45.0), "buffering");
+        c.playing(s(90));
+        c.report(47.0, s(91)); // the TV's next report corrects it
+        assert_eq!(c.now(s(101)), Some(57.0));
     }
 
     /// A zap's late replies never move the new generation; a lost session fails the current

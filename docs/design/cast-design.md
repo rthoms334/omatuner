@@ -110,7 +110,7 @@ Citations:
 **Non-goals for v1**
 - Screen mirroring, AirPlay audio (RAOP), legacy AirPlay `/play`.
 - Playing on the computer and the TV at the same time; casting in multi-view; casting both pictures.
-- Subtitles on the TV, choosing the TV's audio track, and surround sound (Phase 2).
+- Subtitles on the TV and choosing the TV's audio track (Phase 2). Surround sound is in Phase 1 (§8.4).
 - TV volume over AirPlay. No verified way to do it exists [AP 2.5]. pyatv PR 2919 does volume over a control-only session, but only with transient pairing and only tested on speakers [REF].
 - Receivers other than AirPlay in Phase 1:
   - Google Cast is Phase 2 and DLNA is Phase 3.
@@ -469,7 +469,7 @@ The paths are defined in §8.3:
 | Content (from hints or probe, §8.2) | Apple TV (P1) | Third-party AirPlay (P1, exp.) | Chromecast (P2) | DLNA (P3) |
 |---|---|---|---|---|
 | Live TS or HLS: progressive H.264 ≤ High@5.2 (Apple 1.3b), AAC ≤ 2 ch | L2, TS segments, copy and copy | L2 | L2 + CORS. L3 when above the model's level (gen 1/2: ≤ 4.1, 1080p30) | L1 `video/mp2t` |
-| Same, audio MP2, AAC-LATM, AC-3/E-AC-3 or AAC 5.1 | L2, audio converted to AAC stereo (Apple rule 2.3 requires stereo AAC). Surround is Phase 2. | L2 → AAC | L2 → AAC (AC-3 only passes through to an AVR) | L1 |
+| Same, audio MP2, AAC-LATM, AC-3/E-AC-3 or AAC 5.1 | L2, audio converted to AAC stereo (Apple rule 2.3 requires stereo AAC); with more than two channels, plus a surround rendition (§8.4: the source's AC-3, E-AC-3 or AAC 5.1 copied, others as AC-3 5.1). Third-party AirPlay TVs: stereo. | L2 → AAC | L2 → AAC (AC-3 only passes through to an AVR) | L1 |
 | Interlaced H.264 (1080i25, 576i) | L3 + `yadif`. Apple rule 1.14: "All interlaced source content MUST be deinterlaced." The setting "Send as is" gives L2. | L3 + `yadif` | L3 on gen 1/2 | L1 |
 | HEVC (TS or HLS upstream) | L2, **fMP4** segments, `hvc1` tag (Apple 1.5; verified locally [PL §1]) | L2 fMP4 | L2 fMP4 on Ultra, Chromecast with Google TV and Streamer; L3 otherwise (never HEVC in TS) | L1 if the sink's protocolInfo lists it |
 | MPEG-2 video, VC-1, other video | L3 | L3 | L3 | L1 |
@@ -550,7 +550,7 @@ src/cast/airplay/            features.rs (TXT/`/info` decode, versions), tlv8.rs
 src/cast/relay/              mod.rs (Relay API), server.rs (LAN, axum), token.rs, upstream.rs (loopback proxy, head buffer,
                              playlist rewrite, single upstream connection), probe.rs (ffprobe JSON), plan.rs (pure ladder),
                              ffmpeg.rs (args + supervisor + progress), playlist.rs (served-playlist guard, IDR check,
-                             playlist views)
+                             playlist views), renditions.rs (the surround multivariant playlist)
 src/cast/firewall/           mod.rs (FirewallState, detect, rule and command text), ufw.rs (user.rules parser),
                              allow.rs (pkexec runner, outcomes)
 src/bin/tuner-firewall.rs    the root helper (std only): validates, runs one fixed ufw command
@@ -1046,19 +1046,28 @@ setRate 0 → setProperty actionAtItemEnd 0 → insertPlayQueueItem {new item, i
   Without `itemPlayedToEnd`, the end is `Lost(StoppedOnTv)`.
 
 **Position (`position.rs`).** No reference reads a position from `playbackState`, so that is not relied on [REF].
-1. **A `playbackInfo` request.** It is sent every 10 s while VOD or catch-up plays, and once before Play here or Stop. It is `/command {type: "playbackInfo", kind: "request", messageID: n}`, answered on the event channel by `{kind: "response", messageID: n, value: {position, duration, rate, …}}`. Source: PR 2846; the reply shape is from LIVI.
+1. **A `playbackInfo` request.** It is sent every 10 s while VOD or catch-up plays, and once before Play here, Stop and every reload of the item under the same generation. It is `/command {type: "playbackInfo", kind: "request", messageID: n}`, answered on the event channel. Source: PR 2846.
+   - **The answer as tvOS 27 sends it** (AppleTV14,1, 24J361, traced 2026-10-13): `{kind: "response", messageID: n, type: "playbackInfo", info: {position, duration, rate, playbackState, loadedTimeRanges, …}}`, every time a CMTime dict `{value, timescale, flags, epoch}`. A growing playlist's `duration` has `flags 17` (valid + indefinite): no duration. LIVI's form (`value` with plain numbers) is read too.
+   - Revision 2 read only `value`: the TV's answer, which came 40 ms after the request, was taken for no answer, and every session estimated.
 2. **An estimate.** If the first request gets no answer within 3 s, or a non-2xx, the session switches to an estimate for the rest of the session:
-   - it advances from the item's offset while `playing`, and freezes on `paused` and `loading`;
-   - it is bounded above by the end of the last segment the TV fetched (VioletRelay does this for receivers without metadata).
+   - it starts where the TV says its playhead is: `timeJumped` carries the position (a CMTime) at every start and after every seek, also one made with the TV's remote;
+   - after a jump the TV doesn't place (a `timeJumped` without a position), or any break in the run of segment fetches (AVPlayer fetches ahead in order, so a fetch that doesn't start where the last ended is the playhead moving there), it continues from the start of that first fetched segment: behind the playhead, never ahead;
+   - it advances while `playing`, and freezes on `paused` and `loading`;
+   - it is bounded above by the end of the fetches since the last jump (VioletRelay bounds by fetches for receivers without metadata);
+   - it is reported 2 s behind: it becomes the saved progress and a reload's start, which must never be ahead of what the viewer saw.
    
-   It is accurate to about one segment. That is enough for the 10 s progress saves and for Play here.
+   It is accurate to about one segment. That is enough for the 10 s progress saves, a reload and Play here.
 3. `GET /playback-info` is never polled: it answers 500 on 26.x and 27.0.
 
-Positions are reported absolute. The session adds the item's offset: the `-ss` start, or the first segment of the playlist view.
+Positions are reported absolute. The session adds the item's offset: the `-ss` start, or the first segment of the playlist view. The TV starts at 0 of every playlist: EVENT playlists say `EXT-X-START:TIME-OFFSET=0` (§8.1.4), else AVPlayer starts a growing playlist three target durations from its end (it did: 12.18 s into a film's first playlist, 9.22 s into its reload's).
+
+**Reloads continue where the TV is.** A reload under the same generation (an escalation, Convert this channel, a segment that outgrew the target, a stereo retry) starts at the position asked now (`playbackInfo`, else the estimate), never at the last 10 s report, nor at the cast's first start when this generation hasn't reported yet. A reconnect by the controller (a new generation) starts where its TV clock says the TV is (§11.2), 2 s back as ever.
 
 - **The session outlives zaps.**
 - **No metadata is sent in Phase 1.** If a title is ever sent to the TV, it goes through the spoiler guard and the parental view first.
 - **Trace (dev only, `trace.rs`).** With `TUNER_CAST_TRACE=1`, a session writes a redacted JSON transcript to `state_dir/cast-trace/` (0600). It holds request lines, statuses, decoded plists and event bodies. Tokens, the LAN URL path, addresses, MACs and ids are replaced by placeholders. §18 uses it once to turn the real TV's replies into fixtures.
+  - **Bounded.** A transcript stops at 10 MiB (`trace::MAX_FILE`; a VOD session wrote 1.7 MB an hour on 2026-10-13) with one last line, `{"t", "stopped": "size cap", "cap"}`; the session goes on untraced. The directory keeps the newest five (`service::TRACE_KEEP`).
+- **Field logs.** One INFO line when a session ends and one when an item ends, each with why: the player closed it (the controller's own line says Play here, Stop casting, stopped, stopped on the TV, moved to another TV or shutdown), another cast took over, shutdown; replaced by the next item, stopped, played to its end, failed (the kind), lost or stopped on the TV. Test on TV logs its start and verdict.
 
 ### 7.4 What the AirPlay client can do
 
@@ -1159,6 +1168,8 @@ TV ◀──────── LAN server <lan-ip>:47800 /c/<tok>/… (token, pe
 - **One upstream request per token at a time.** A new request (ffmpeg seeking with `Range` on VOD) cancels the previous one.
   - Every upstream request carries `Range: bytes=<from>-`, from 0 too, as ffmpeg's `http` (and so mpv) sends it. The proxy tells ffmpeg the input is seekable (206, `Content-Range`) only when the provider is (a 206 or `Accept-Ranges: bytes`); a provider that ignores `Range` is served as a plain 200, so ffmpeg never seeks to bytes the proxy could only reach by buffering everything before them.
   - Each provider read is timed on its own (15 s, the player's `network-timeout`), never the gap since the last one: a pump held back by its reader (a paused TV with ffmpeg stopped at the VOD cap) isn't a stalled provider.
+  - **A film's stream that breaks mid-body resumes** where it broke: a sized resource the provider serves by `Range` is asked again from the byte the reader reached, inside the same response to ffmpeg, up to three times per feed, each after 1 MiB of progress. Live streams and HLS segments fail as before. On 2026-10-13 the provider closed a film's connection 30 s into a cast; that had cost a reconnect and a reload on the TV.
+  - **Why a stream broke is logged as its cause.** reqwest's `Response::chunk` files every failure to read a body as "error decoding response body" (0.13.5, `async_impl/response.rs`), a provider hanging up too; the client sets no read timeout (reads are timed one by one, as above, and our own timeout says "nothing for 15 s"), so the 2026-10-13 break was the provider's side, not backpressure. The log now gives hyper's cause: "error reading a body from connection: end of file before message length reached" (the provider hung up with bytes owed), "…: connection reset by peer".
 - **HLS upstream: the proxy picks one variant itself.** It rewrites the URIs to `/u/<tok>/r/<n>` (a table of `Secret` upstream URLs) and serves ffmpeg a single media playlist.
   - The pick is the variant mpv was playing, else the highest bandwidth the receiver can take.
   - Otherwise ffmpeg's HLS demuxer may open several variants at once and break a one-connection account.
@@ -1166,7 +1177,7 @@ TV ◀──────── LAN server <lan-ip>:47800 /c/<tok>/… (token, pe
 **2. Probe (`probe.rs`)**
 - Runs `ffprobe -v error -of json -show_streams -show_format -probesize 3M -analyzeduration 3M http://127.0.0.1:P/u/<tok>`.
 - The JSON gives codec, profile, level, `field_order`, `pix_fmt`, size, frame rate, audio codec and channels.
-- **Skipped** when the hints are already enough: the moving item's mpv hints (§5.5), or a cached `cast_hint` for this item and receiver less than 30 days old.
+- **Skipped** when the hints are already enough: the moving item's mpv hints (§5.5), or a cached `cast_hint` for this item and receiver less than 30 days old. Never for multichannel sound on the Apple TV: the surround rendition needs the layout, profile, language, frame rate and transfer only the probe gives.
 - A failure with a cached hint re-probes once.
 
 **3. ffmpeg (`ffmpeg.rs`)**
@@ -1178,11 +1189,14 @@ TV ◀──────── LAN server <lan-ip>:47800 /c/<tok>/… (token, pe
 - Capabilities are checked once per run (`ffmpeg -hide_banner -encoders` for `libx264` and `aac`). If either is missing, L3 is off and the UI says so.
 
 **4. Playlist guard (`playlist.rs`).** Tuner serves ffmpeg's playlist through a small rewriter. It addresses two unverified risks [PL §1]:
-- **Stable target duration.** `#EXT-X-TARGETDURATION` is pinned to a session constant: `ceil(max(hls_time, probed max GOP))`.
-  - It is raised only if a segment exceeds it by more than 0.5 s, and that event is counted.
-  - In copy mode ffmpeg derives this value from the current window and can change it mid-session, which RFC 8216 forbids.
+- **Stable target duration.** `#EXT-X-TARGETDURATION` is pinned when the first segments are ready and never changes while a playlist is served (RFC 8216 §6.2.1; in copy mode ffmpeg derives it from its window and changes it).
+  - **The pin:** `ceil(max(hls_time, probed max GOP))`, at least the longest first segment (rounded), and for copied video 2 s above the longest of them all. Copied video cuts at the source's keyframes: segments run up to `hls_time` plus a GOP, and a film's scene cuts make its GOPs anything up to the encoder's maximum. Copied VOD pins on 20 s of its first burst (or 3 s more), not on two segments.
+  - **One per item.** The relay keeps the pin for the item for the whole session: every later load of it (a reconnect, an escalation, a restart) declares at least as much. On 2026-10-13 one film's loads declared 10, 8 and 4 s.
+  - **A longer segment** (its rounded `EXTINF` above the target) is held back with everything after it, and the session restarts the item where the TV is, at the same level, under a pin that covers it (its length + 2 s): a replace with a new token, a new playlist, no changed TARGETDURATION. A segment beyond 30 s is a violation: keyframes that sparse need converting.
+  - **Revision 2 raised the target mid-stream** and counted each raise as a violation: the 2026-10-13 film (HEVC, segments of 10.09 s and 12.10 s) was "irregular" after two and went to L3, at 700 % CPU on the M2, and restarted. A long GOP is no irregular source.
 - **IDR check.** The first video access unit of each new segment is checked for an IDR (H.264 NAL type 5, HEVC IRAP 16–21). Apple rule 7.4 requires it, and ffmpeg copy mode may cut on recovery-point I-frames.
-- **Escalation.** Two violations in a session mark the item "irregular" in `cast_hint`, and its next start uses L3, where forced keyframes fix both problems.
+- **Escalation.** Two violations (missing IDRs, or a segment past any target) in a session mark the item "irregular" in `cast_hint`, and its next start uses L3, where forced keyframes fix them.
+- **Start.** EVENT playlists say `#EXT-X-START:TIME-OFFSET=0`, so the TV starts where the relay started (§7.3).
 - The guard never adds absolute URLs; ffmpeg writes relative segment names.
 
 **5. Playlist views (`playlist.rs`).** A served playlist can start at segment *k* of what ffmpeg has produced:
@@ -1210,7 +1224,9 @@ plan(receiver, kind, hints, cfg) →
   interlaced && cfg.interlaced = auto && profile.deinterlace . L3 + yadif   (AirPlay: Apple HLS rule 1.14)
   HEVC ...................................................... L2 with fMP4 segments (Refuse→L3 where HEVC unsupported)
   otherwise ................................................. L2 (TS segments)
-  audio: AAC ≤ 2 ch → copy; everything else → AAC stereo 160k (Apple rule 2.3; surround is Phase 2)
+  audio: AAC ≤ 2 ch → copy; everything else → AAC stereo 160k (Apple rule 2.3)
+  surround: Apple TV, a picture, > 2 ch ...................... + a surround rendition (§8.4), every rendition fMP4:
+      AC-3, E-AC-3, AAC ≤ 5.1 → copy; DTS, TrueHD, MP2/PCM 5.1, AAC 7.1… → AC-3 5.1 448k
   L1 (byte relay) ........................................... Phase 2: faststart MP4 VOD; DLNA live TS (Phase 3)
 ```
 
@@ -1226,10 +1242,12 @@ plan(receiver, kind, hints, cfg) →
 | L2 | `-map 0:v:0 -map 0:a:<chosen> -c:v copy -c:a copy │ aac -ac 2 -b:a 160k` | "Repackaged" |
 | L3 | `-c:v libx264 -preset veryfast -profile:v high -level 4.1 -crf 21 -maxrate 8M -bufsize 16M -g <2×fps> -sc_threshold 0 [-vf yadif=deint=interlaced,scale=-2:'min(1080,ih)']` + AAC stereo | "Converted" (CPU only: this M2 has no usable hardware encoder [PL change 3]) |
 
-**Escalation at runtime.** One step only, then the result is cached in `cast_hint`: when the step is taken, not at L3's first picture, because L2's 15 s and L3's own start can outlast the controller's 30 s load timeout on live, and its retry (a new generation) must start at L3 rather than on L2 again. Any of these moves L2 to L3:
+**Escalation at runtime.** One step only, then the result is cached in `cast_hint`: when the step is taken, not at L3's first picture, because L2's 15 s and L3's own start can outlast the controller's 30 s load timeout on live, and its retry (a new generation) must start at L3 rather than on L2 again. It continues where the TV is (§7.3). Any of these moves L2 to L3:
 - the TV fetched segments but never reached `playing` within 15 s;
 - the TV reported a failure;
-- the playlist guard tripped.
+- the playlist guard tripped (missing IDRs, a segment past any target).
+
+A segment that outgrows the pinned target is no reason to escalate: it restarts the item at the same level (§8.1.4). A surround item the TV fails (either of the first two) goes again in stereo first, at the same level and place, without spending the step; ffmpeg failing to make the renditions does the same inside the relay.
 
 The audio track is the one mpv had selected, else the default track, else the first. Subtitles and teletext are dropped in Phase 1.
 
@@ -1252,12 +1270,44 @@ The audio track is the one mpv had selected, else the default track, else the fi
 - **Segment length.** `hls_time` is 4 s, VioletRelay's value, which works on its tvOS 26.5 hardware [REF]. That is short of the 6 s Apple rule 7.5 recommends (a SHOULD, not a MUST), trading the recommendation for tune-in time.
 - **When the TV is told to play.** `insertPlayQueueItem` is sent once the playlist holds `cast.min_segments` segments, default 2. This is VioletRelay's `wait_until_ready(segments=2)`, or ENDLIST for a short item.
 - **Expected delay behind live:** about 3 × TARGETDURATION plus one segment fill, which is roughly 10–20 s depending on the channel's GOP [PL §1].
-- **Media playlists only.** The TV is given ffmpeg's media playlist, never a multivariant one, in Phase 1. If one is ever served (Phase 2 renditions), it writes the measured `BANDWIDTH`, `AVERAGE-BANDWIDTH`, `FRAME-RATE` and `CODECS`. On tvOS 27 a variant with an 80 Mbit `BANDWIDTH` and no `FRAME-RATE` was fetched but never played (foxCast) [REF].
+- **Media playlists, except for surround.** Stereo items give the TV one media playlist. Surround items get a multivariant playlist (below) that writes the measured `BANDWIDTH` and `AVERAGE-BANDWIDTH`, `FRAME-RATE` and `CODECS`. On tvOS 27 a variant with an 80 Mbit `BANDWIDTH` and no `FRAME-RATE` was fetched but never played (foxCast) [REF].
+- **The live hold-back grows with the pin's headroom:** about 3 × TARGETDURATION, so a 4 s channel whose first window was 4–6 s runs 18–24 s behind (12–18 s before). That is the price of never restarting a live channel for a segment a little over its target.
+
+**Surround (multichannel sound on the Apple TV)**
+
+Verified against Apple's *HLS Authoring Specification for Apple Devices* (revision of 2025-06-26) and Apple's bipbop advanced example:
+- 2.3: stereo AAC MUST be provided; 2.5: the multichannel formats include AAC, AC-3 (`ac-3`) and E-AC-3 (`ec-3`); 2.6: E-AC-3 needs an AC-3 companion only for devices without it (the Apple TV 4K decodes both, "Audio compatibility"); 9.6: multichannel audio MUST be a separate audio stream, declared with `EXT-X-MEDIA` (8.9) with `LANGUAGE` (8.10); 8.2: every playlist of a presentation has the same target duration; 9.20 (tvOS): no audio-only variant.
+- The appendix "Audio rendition groups and variants": one group per codec and channel count, a stereo AAC group as the fallback every device plays, each video variant listed once per group (bipbop: `aud1` AAC, `aud2` AC-3 `CHANNELS="6"`, `aud3` E-AC-3, the whole ladder repeated per group). AVPlayer picks the highest bandwidth it can play on its audio route; the Apple TV decodes Dolby and multichannel AAC and sends multichannel PCM by default (Apple's tvOS audio settings), so a stereo TV gets the stereo group.
+
+So a source with more than two channels (and a picture) on the Apple TV gets:
+
+```
+ffmpeg … -map 0:v:0 -map 0:a:<n> -map 0:a:<n> -c:v copy [-tag:v hvc1]
+         -c:a:0 aac -ac:a:0 2 -b:a:0 160k
+         -c:a:1 copy [-bsf:a:1 aac_adtstoasc] | -c:a:1 ac3 -ac:a:1 6 -b:a:1 448k
+         -f hls -hls_segment_type fmp4 -hls_fmp4_init_filename init.mp4
+         -var_stream_map "v:0,name:v a:0,name:a a:1,name:s"  -hls_segment_filename <dir>/%v/s%d.m4s <dir>/%v/index.m3u8
+
+index.m3u8 (written by the relay; the renditions are ffmpeg's, served under the same token):
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="surround",LANGUAGE="en",NAME="Main",AUTOSELECT=YES,DEFAULT=YES,CHANNELS="6",URI="s/index.m3u8"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="stereo",LANGUAGE="en",NAME="Main",AUTOSELECT=YES,DEFAULT=YES,CHANNELS="2",URI="a/index.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=…,AVERAGE-BANDWIDTH=…,CODECS="hvc1.2.4.L150.B0,ac-3",RESOLUTION=…,FRAME-RATE=…,VIDEO-RANGE=SDR,AUDIO="surround"
+v/index.m3u8
+#EXT-X-STREAM-INF:…,CODECS="hvc1.2.4.L150.B0,mp4a.40.2",…,AUDIO="stereo"
+v/index.m3u8
+```
+- The video codec string and size come from the video rendition's init segment (`avcC`/`hvcC`), the bandwidths from the first ready segments, the frame rate and `VIDEO-RANGE` (SDR, PQ, HLG) from the probe, `LANGUAGE` from the stream's tag (`eng` → `en`, else `und`). Copied E-AC-3 with Atmos says `CHANNELS="16/JOC"`.
+- Copied: AC-3, E-AC-3 and AAC up to 5.1 (no re-encode). Converted: anything else to AC-3 5.1 at 448 kbit/s (7.1 folded to 5.1, AC-3's most), which every Dolby receiver decodes and which needs no companion.
+- Every rendition is fMP4 (rule 2.1 wants audio as elementary streams or fMP4; one muxer writes all three), H.264 included (rule 1.2 allows it). A stereo item keeps TS for H.264, as before.
+- The audio renditions are cut every `hls_time`; copied video at its keyframes, so their boundaries differ (rule 8.22 is a SHOULD for Apple devices; AVPlayer aligns renditions on their timestamps). Third-party AirPlay TVs, for which Apple makes 8.22 a MUST, stay stereo.
+- A view (a seek inside what's produced) starts each audio rendition at its segment holding the video's first.
+- **Not verified on the TV yet** (§18 item 5): that tvOS 27 picks the surround group, and plays the renditions over AirPlay's URL playback. If it doesn't play them, the session's stereo retry keeps the cast going.
 
 **Catch-up and VOD**
 - They use `-hls_playlist_type event` (rule 8.8), with no `delete_segments` and with `ENDLIST` at the end.
 - Output goes to `paths.cache_dir/cast/<session>/` on disk, because a film doesn't fit in tmpfs. It is capped at 8 GiB, wiped on stop and swept at startup.
-- ffmpeg reads with `-readrate 4 -readrate_initial_burst 30`, so it stays ahead without draining the provider at line rate.
+- **Production stays about a minute ahead of the TV.** ffmpeg reads the first 60 s as fast as the provider sends them (a quick start, room for the TV's first buffer), then at real time with its 5 % catch-up (`-readrate 1 -readrate_initial_burst 60`). Revision 2 read at 4× after a 30 s burst: the film ran minutes ahead and the TV's scrubber showed it all as loaded.
+- **The lead cap.** Production pauses (SIGSTOP, as at the 8 GiB cap) while it is more than 180 s ahead of the end of what the TV fetched (a TV paused for minutes), and resumes under 120 s. No film is pulled from the provider faster than it is watched.
 
 ### 8.5 Per content type
 
@@ -1283,6 +1333,13 @@ The audio track is the one mpv had selected, else the default track, else the fi
 - **Resume, or seek beyond the produced edge**, restarts ffmpeg with `-ss <t>`. That turns into a `Range` request through the proxy, so there is still one upstream connection. The new playlist starts at `t`, so the TV starts at its 0.
 - The session adds `t` (or the view's first segment time) to the positions the TV reports, so the snapshot, progress and `finished` stay true to the film.
 - A seek inside the produced part is a replace with a playlist view.
+- **The TV's own scrubber** shows what is produced: the position plus about a minute (§8.4), growing as it plays. Seeking with the TV's remote works inside that; Tuner's seek bar (and the agent) reach the whole film.
+
+**Why not a complete VOD playlist (the film's real length on the TV, every segment listed, made on demand)?** That is how Jellyfin serves Apple TVs (facts: its `DynamicHlsController` lists every segment up front and restarts ffmpeg at the segment the client asks for). It needs the segment boundaries before anything is produced, and that holds only where the relay chooses them:
+- **Copied video (L2, almost every film)** can only cut at the source's keyframes, and ffmpeg's HLS muxer decides where (the first keyframe past each `hls_time` step, counted from where that ffmpeg started), so a restart at segment k cuts differently from a run that reached k. A precomputed list needs every keyframe time (an MP4's `stss`; an MKV's `Cues` may list only some), `hls_time` below the shortest GOP so ffmpeg cuts at each one (segments as short as a scene cut), restarts on exact keyframes with `-copyts` (ffmpeg drops copied packets before `-ss`), and audio renditions cut at those same times (the muxer cuts audio-only renditions every `hls_time`, so surround would break it). MPEG-TS films and catch-up have no index at all, and catch-up can't restart at an arbitrary point (§8.5 "Catch-up").
+- **Converted video (L3)** has fixed 4 s segments, so it could; it is the rare path (MPEG-2, VC-1, VP9 films, or Convert this channel), runs near real time on this M2, and a scrub would restart the encoder anyway.
+
+So Phase 1 keeps the EVENT playlist with the lead and start fixes above. The complete playlist is the Phase 2 item "Full-length VOD on the TV" (§15.3): MP4 `stss` and MKV `Cues` read through the proxy by `Range`, one segment per keyframe run, on-demand restarts, L3 first.
 
 **Test on TV**
 - The input is `-f lavfi -i testsrc2=s=1280x720:r=25 -f lavfi -i sine=f=440 -t 15`, plus a drawn "Tuner" label, through L3 into the same server.
@@ -1511,6 +1568,7 @@ sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=1
 | later `Playing` / `Buffering(false)` | `PausedForCache(false)` |
 | `Buffering(true)` | `PausedForCache(true)` |
 | `Position { pos, dur }` | `TimePos(pos)` (absolute: the session adds the item's offset), and `duration`. From `playbackInfo` or the estimate (§7.3). |
+| a failure of the generation (`UpstreamClosed` before EOF, `Failed`, `Lost`) | `TimePos(the TV clock)` first: the last report run on while the TV played and held while it was paused or buffering. The TV plays its buffer on after a provider drop, so the reconnect's resume point (the machine's `last_pos − 2`) is where the viewer is, not the last report (up to 10 s old). Relative seeks count from the same clock. |
 | `Paused(b)` | `Pause(b)` |
 | `Http { status }` then the upstream ends | `HttpStatus(status)` then `EndFile { reason: Error, entry: gen }`: the same sequence mpv produces today |
 | `ProviderText { text }` | `ProviderMessage(text)` |
@@ -1532,7 +1590,7 @@ sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=1
 | `SetVolume`, `AdjustVolume`, `ToggleMute`, `SetMute` | Banner "Use the TV remote for volume". The snapshot volume is left alone. | Receiver level: Tuner 0–130 maps to `min(v,100)/100` |
 | Audio or subtitle track, aspect, zoom, sub delay or scale, `SetLightDecode`, `ResumeVideo` | No-op, banner "Not available while casting". The controls are hidden. | Phase 2: track choice is a reload with `-map` |
 | `RefreshStreamInfo` | Filled from the probe: codec, size, fps, interlace, level, level path | same |
-| `Reconnect` | Restart the pipeline and replace | same |
+| `Reconnect` | Restart the pipeline and replace, where the TV clock says the TV is (§11.2) | same |
 | `ApplyConfig` | Applied to the local player. `[cast]` changes take effect on the next load. | — |
 | `Shutdown` | Fast stop (≤ 300 ms), then the session closes | same |
 
@@ -1617,11 +1675,11 @@ media_port = 47800           # TCP; the only port the firewall needs
 min_segments = 2             # segments ready before the TV is told to play (VioletRelay: 2 × 4 s)
 convert = "auto"             # auto | never
 interlaced = "auto"          # auto (deinterlace for AirPlay, Apple HLS rule 1.14) | as-is
-experimental = true          # list third-party AirPlay TVs
 keep_awake = true            # logind sleep inhibitor while casting
 ```
 
-- Revision 1's `timing_port`, `airplay_timing` and `audio` are gone: timing is PTP only, and surround is Phase 2.
+- Revision 1's `timing_port`, `airplay_timing` and `audio` are gone: timing is PTP only, and surround is automatic (§8.4: a stereo group is always there, AVPlayer picks).
+- The test builds' `experimental` is gone too: third-party AirPlay TVs are always listed. A config that still has it loads (unknown keys are ignored).
 - Dev-only environment variables, never in config:
   - `TUNER_CAST_TRACE=1` (the redacted transcript, §7.3);
   - `TUNER_CAST_LIVE=<ip>` (the ignored LAN smoke test);
@@ -1922,15 +1980,15 @@ Every default the spike was going to set now comes from a source:
 | `min_segments` | 2 | VioletRelay |
 | step order | RECORD, then `/info` | PR 2899, foxCast, castcli |
 | start key | none needed | playlists start at 0, §8.5 |
-| surround | Phase 2 | §17 |
-| Hisense | experimental | VioletRelay |
+| surround | Phase 1: a surround rendition beside the stereo one | §8.4, §17 |
+| Hisense | third-party profile, listed like the Apple TV | VioletRelay |
 
 No provider URL is recorded, and no throwaway venv runs against the TV.
 
 ### 15.1 Phase 1 scope: AirPlay to the Apple TV
 
 **In scope**
-- **Discovery:** on-demand mDNS, plus manual address. Third-party AirPlay TVs are labelled experimental. Receiver versions are read.
+- **Discovery:** on-demand mDNS, plus manual address. Third-party AirPlay TVs are listed like the Apple TV. Receiver versions are read.
 - **Pairing and storage:**
   - PIN pairing in Tuner, with the HKP 3 → HKP 5 ladder on one connection;
   - credential and hint tables.
@@ -1965,7 +2023,7 @@ No provider URL is recorded, and no throwaway venv runs against the TV.
 **Not in Phase 1:**
 - Google Cast, DLNA, L1 pass-through;
 - local files;
-- audio-track choice, surround, subtitles;
+- audio-track choice, subtitles;
 - seamless zap;
 - TV volume;
 - catch-up seek beyond what's produced;
@@ -2064,7 +2122,7 @@ The skeleton is commit "Cast skeleton (CAST-0)" on `feat/cast`, based on `main` 
 - **Seamless zap and reconnect** (`append_list` + DISCONTINUITY).
 - **Catch-up seek** by re-resolving.
 - **Audio-track choice** (`-map`).
-- **"Sound on the TV: Surround when possible"** (AAC + AC-3 renditions in a multivariant playlist written per §8.4). Offered only if §18 item 5 shows AC-3 HLS plays.
+- **Full-length VOD on the TV:** a complete playlist with the film's real length, every segment made on demand (§8.5: MP4 `stss` and MKV `Cues` read by `Range`, one segment per keyframe run, exact-keyframe restarts; L3 first).
 - **Guide and browse "Play on <device>"** menus.
 - **Local files and ad-hoc URLs.**
 - **Trace replay:** the fake replays the user's real-TV transcripts (§14.3 anchor 4).
@@ -2097,9 +2155,9 @@ The skeleton is commit "Cast skeleton (CAST-0)" on `feat/cast`, based on `main` 
 | 7 | **First LAN-facing listener.** | Narrow bind, listening only during a session, 128-bit redacted tokens per generation, peer check, uniform 404s, one route family, no redirects, connection caps, tests. |
 | 8 | **One-connection accounts.** | Lease reuse, stop-before-start, head buffer for the probe, single-variant HLS, the shared race window; tested with `set_session_limit(1)`. |
 | 9 | **Latency of 10–20 s and zaps of 6–12 s feel slow.** | Stated in the UI; zaps coalesce; replace on the same session; seamless zap in Phase 2. |
-| 10 | **Position is unproven on tvOS** (`playbackInfo` has no hardware transcript). | The estimate fallback, bounded by the segments the TV fetched. Progress saving every 10 s tolerates one segment of error. §18 item 7 checks both. |
+| 10 | **Position on tvOS.** Proven on 2026-10-13: tvOS 27.0 answers `playbackInfo` under `info` with CMTimes, and sends `timeJumped` with a position at every start and seek (§7.3). | Both forms are read. The estimate fallback starts from `timeJumped` or the first fetch after a jump, errs 2 s behind, and is bounded by the fetches since the last jump. §18 item 7 checks both. |
 | 11 | **Suspend or a network change kills the relay.** | logind sleep inhibitor; `Lost`/`Unreachable` with Play here; the firewall rule re-offered for a new network. |
-| 12 | **Third-party AirPlay TVs (Hisense, VIDAA) may not support play-queue video.** | Labelled experimental, never offered by the first-run card, with VioletRelay's profile. Cast or DLNA via those TVs in Phase 2/3. |
+| 12 | **Third-party AirPlay TVs (Hisense, VIDAA) may not support play-queue video.** | VioletRelay's profile, checked on the Hisense (§18 item 14). If it can't play there, third-party TVs are no longer listed until it can. Cast or DLNA via those TVs in Phase 2/3. |
 | 13 | **Frozen-file churn, and the parallel `fix/agent-play-placement` branch** (`act.rs`, `app.rs`). | One skeleton tag up front, cut after that branch merges; `msg.rs` and `tests/support/mod.rs` untouched. |
 | 14 | **Licence mix in the references.** | Only pyatv (MIT) code is ported, with the notice installed. LGPL and GPL projects, and those without a licence, are read for facts only (§7.0). |
 
@@ -2122,12 +2180,12 @@ These were the open decisions of revision 1, plus the user's decisions for revis
    The rule is the interface plus subnet, TCP 47800 only. (user; scope from revision 1)
 5. **Casting moves the stream**; there is no "play on both". One-stream accounts require it.
 6. **Converting is "Automatically (uses the CPU)" by default.** Otherwise MPEG-2 and interlaced channels can't be cast.
-7. **Sound on the TV is AAC stereo in Phase 1** (Apple rule 2.3). "Surround" is Phase 2, if §18 item 5 shows AC-3 HLS plays.
+7. **Surround is in Phase 1** (the user never approved deferring it): multichannel sound on the Apple TV comes as a surround rendition beside the required stereo AAC one (§8.4, verified against Apple's authoring spec 2.3, 2.5, 9.6 and its rendition-group appendix). AC-3, E-AC-3 and AAC 5.1 are copied; anything else becomes AC-3 5.1. If the TV doesn't play it, the session goes on in stereo. Third-party AirPlay TVs stay stereo. (user)
 8. **Interlaced is "Auto", which deinterlaces for AirPlay** (Apple rule 1.14), with "Send as is" as an opt-out.
-9. **Third-party AirPlay TVs** are listed as "experimental" in the picker and never offered by the first-run card. They are hidden by default if §18 item 14 fails.
+9. **Third-party AirPlay TVs** are listed and offered like the Apple TV, cast with the third-party profile (§7.7). There is no experimental tier: "We either support it or we don't." (user, after the first LAN test)
 10. **Startup discovery for the first-run card:** one 5 s browse per Tuner version.
 11. **Power while casting:** block system sleep (logind inhibitor, default on), but let lid close suspend as usual.
-12. **Claude and casting:** `play { device }` in Phase 1. An agent may start a cast without asking only when the user named the device in that request.
+12. **Claude and casting:** `play { device }` in Phase 1. An agent may start a cast without asking when the user named the TV in that request, or asked for "the TV" while exactly one TV is paired (unpaired ones never make "the TV" ambiguous); with two or more paired, it asks which (§12). (user)
 13. **Stop ends the cast.** The TV stays first in the picker, so recasting is `C` then Enter.
 14. **About 10–20 s behind live is accepted.** It's inherent to HLS on AirPlay. Phase 2 tries to shave it.
 15. **After AirPlay: Google Cast (Phase 2), then DLNA (Phase 3).**
@@ -2157,7 +2215,7 @@ Run these against "Living Room" (192.168.1.5) once the gate has passed.
 2. **Session.**
    - Live TV plays for **60 minutes** with ufw on and only the TCP rule, and events keep arriving (declared PTP).
    - From the trace: does SETUP return `skipRecord`, and what does RECORD answer?
-   - Does `playbackInfo` answer, and with which keys?
+   - `playbackInfo` answers under `info` with CMTimes (2026-10-13, tvOS 27.0): the log never says "playbackInfo goes unanswered".
 3. **Firewall button.**
    - With ufw blocking: the cast fails within about 10 s with the Firewall message.
    - **Allow on firewall** shows Omarchy's dialog. Note its text.
@@ -2172,12 +2230,11 @@ Run these against "Living Room" (192.168.1.5) once the gate has passed.
 5. **Formats.**
    - 1080i25 and 576i deinterlaced (L3): no combing, and ffmpeg's `speed` stays above 1.0× on this M2.
    - MP2 converted to AAC.
-   - AAC 5.1 converted to stereo.
+   - **Surround** (§8.4): a film with AAC 5.1 (the 2026-10-13 one, `xt:vod:346970`), a channel with AC-3 5.1 and a film with E-AC-3. The log says `… aac 5.1(side) 48 kHz + surround (copied)`; the TV's audio menu shows one track; an AVR (or the Apple TV's Settings ▸ Video and Audio ▸ Audio Format) shows 5.1. With the TV on stereo speakers, the sound is the stereo group. If the TV doesn't start it, the log says "again in stereo" and the cast goes on.
    - HEVC (and 10-bit) in fMP4.
-   - For Phase 2: does an AC-3-only HLS play?
 6. **Segment hygiene on real channels.**
    - `ffprobe -show_frames` on each segment's first frame: is it an IDR?
-   - Does the playlist guard ever raise TARGETDURATION?
+   - Does the playlist guard hold a segment back ("a segment outgrew the target duration: restarting with a longer one")? Never twice for one film. TARGETDURATION never changes within a playlist, nor between the loads of one item.
 7. **Controls.**
    - Pause with `setRate 0` and resume, including after more than 80 s paused.
    - Seek inside the produced part (playlist view) and beyond it (`-ss`): does the TV land at the right time?
@@ -2185,7 +2242,9 @@ Run these against "Living Room" (192.168.1.5) once the gate has passed.
    - Stop really stops the TV.
    - Stopping from the Apple TV remote gives "Living Room stopped playing".
    - For VOD, `itemPlayedToEnd` arrives, Up next continues on the TV, and the progress shown matches the TV.
-8. **VOD EVENT playlist:** the TV starts before `ENDLIST`; resume a film at 1:10:00.
+8. **VOD EVENT playlist:** the TV starts before `ENDLIST`, at the resume point (not 10 s later); resume a film at 1:10:00. Pause the TV for 5 minutes: the log says "pausing production … ahead of the TV", and playback resumes cleanly. The TV's scrubber shows about a minute ahead, not the whole film.
+   - **A reload keeps the place:** when the provider drops a film's connection, the log says "resuming the provider's stream at byte …" and the TV doesn't jump. Convert this channel 10 minutes into a film resumes within a few seconds of where the TV was, never at the cast's start; so does a reconnect.
+   - The session's end is in the log at INFO with why (Play here, Stop casting, stopped on the TV…).
 9. **Stray requests:** does the TV fetch anything besides the playlist and segments (`/favicon.ico`, `HEAD`, `Range`)? Check that the 404s are harmless.
 10. **Volume:** confirm there's no working path (expected), so the "TV remote" copy is right.
 11. **Provider limit:** with a one-stream account, a relay reconnect inside 45 s of closing gets 403s that the race window absorbs.
@@ -2304,3 +2363,18 @@ The three proposals were scored on five criteria: correctness against the fact-c
   - the per-item model and effort follow the user's policy;
   - the hardware checks are now the end-of-phase checklist (§18).
 - **§16 risks and §17 decisions** updated: §17 is now a "Decided" list. "Pause tvOS updates" is reversed.
+
+---
+
+## Appendix C. Revision 3 (2026-10-13): after the first real-TV test
+
+The first cast of a film to "Living Room" (AppleTV14,1, tvOS 27.0 24J361, hkp3, PTP; this M2) "reset back to the start a few times". The log and two redacted traces showed why, and what else needed changing:
+- **Positions (§7.3, §11.2).** The TV answered every `playbackInfo` within 40 ms, under `info` with CMTimes; the client read only `value` and estimated from 0 for the whole session, while the TV had started 12.18 s in (no `EXT-X-START` on a growing playlist). Reloads under a generation started from the last 10 s report, or from the cast's first start before one; the controller's reconnect from its last report. Now: both answer forms, `timeJumped` and fetch runs anchor the estimate (2 s behind), EVENT playlists start at 0, in-session reloads ask the TV, the controller's TV clock gives the reconnect's resume point.
+- **Target duration (§8.1.4).** Copied HEVC with 10–12 s GOPs raised the served target twice and was escalated to L3 (700 % CPU) as "irregular"; the loads declared 10, 8 and 4 s. Now: a pin with headroom, kept per item, never changed mid-stream; a longer segment restarts the item where the TV is, at the same level.
+- **The provider's drop (§8.1.1).** "error decoding response body" was reqwest's label for the provider hanging up mid-body, not a relay timeout (the client has none). Now the cause is logged, and a film's stream resumes from the byte it reached.
+- **Production lead (§8.4).** 4× reading made the TV's scrubber show the whole film loaded. Now a 60 s burst, then real time, and a pause beyond 180 s ahead.
+- **Surround (§8.4, §17 decision 7)** moved into Phase 1: demuxed renditions, a stereo AAC group and a surround group, per Apple's authoring spec.
+- **Field logs:** INFO lines for session and item ends with why, Test on TV's verdict; the dev trace capped at 10 MiB a file.
+- **Third-party AirPlay TVs** are listed and offered like the Apple TV, with no experimental tier (§17 decision 9).
+- **"The TV" for an agent** is the one paired TV, when there is exactly one (§12, §17 decision 12).
+- The 09:34 "live cast" in that log was Test on TV (the 15 s card); its session end now logs.

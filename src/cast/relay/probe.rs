@@ -37,6 +37,8 @@ pub struct VideoStream {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub fps: Option<f64>,
+    /// `color_transfer` (`bt709`, `smpte2084`: PQ, `arib-std-b67`: HLG).
+    pub transfer: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -45,7 +47,13 @@ pub struct AudioStream {
     pub index: usize,
     pub codec: String,
     pub channels: Option<u32>,
+    /// `channel_layout` (`stereo`, `5.1(side)`, `7.1`).
+    pub layout: Option<String>,
+    /// `profile` (`LC`, `HE-AAC`, `Dolby Digital Plus + Dolby Atmos`).
+    pub profile: Option<String>,
     pub sample_rate: Option<i64>,
+    /// `tags.language` (ISO 639-2: `eng`).
+    pub language: Option<String>,
     pub default: bool,
 }
 
@@ -159,6 +167,7 @@ pub fn parse(json: &str) -> Option<Probe> {
                     width: u(st, "width"),
                     height: u(st, "height"),
                     fps: rate(st, "avg_frame_rate").or_else(|| rate(st, "r_frame_rate")),
+                    transfer: s(st, "color_transfer"),
                 });
             }
             Some("audio") => {
@@ -167,7 +176,10 @@ pub fn parse(json: &str) -> Option<Probe> {
                     index,
                     codec: s(st, "codec_name").unwrap_or_else(|| "unknown".into()),
                     channels: u(st, "channels"),
+                    layout: s(st, "channel_layout"),
+                    profile: s(st, "profile"),
                     sample_rate: st.get("sample_rate").and_then(Value::as_str).and_then(|r| r.parse().ok()),
+                    language: st.get("tags").and_then(|t| s(t, "language")).filter(|l| l != "und"),
                     default: st.get("disposition").and_then(|d| d.get("default")).and_then(Value::as_i64) == Some(1),
                 });
             }
@@ -226,6 +238,12 @@ impl Probe {
             fps: self.video.as_ref().and_then(|v| v.fps),
             acodec: audio.map(|a| a.codec.clone()),
             channels: audio.and_then(|a| a.channels),
+            layout: audio.and_then(|a| a.layout.clone()),
+            aprofile: audio.and_then(|a| a.profile.clone()),
+            sample_rate: audio.and_then(|a| a.sample_rate),
+            language: audio.and_then(|a| a.language.clone()),
+            width: self.video.as_ref().and_then(|v| v.width),
+            transfer: self.video.as_ref().and_then(|v| v.transfer.clone()),
             audio_index: audio.map(|a| a.index),
             encrypted: self.encrypted,
         }
@@ -286,8 +304,8 @@ mod tests {
          "codec_tag_string": "[2][0][0][0]", "disposition": {"default": 0, "attached_pic": 0}},
         {"index": 1, "codec_name": "mp2", "codec_type": "audio", "channels": 2, "sample_rate": "48000",
          "codec_tag_string": "[3][0][0][0]", "disposition": {"default": 0}},
-        {"index": 2, "codec_name": "ac3", "codec_type": "audio", "channels": 6, "sample_rate": "48000",
-         "codec_tag_string": "[129][0][0][0]", "disposition": {"default": 1}},
+        {"index": 2, "codec_name": "ac3", "codec_type": "audio", "channels": 6, "channel_layout": "5.1(side)", "sample_rate": "48000",
+         "codec_tag_string": "[129][0][0][0]", "disposition": {"default": 1}, "tags": {"language": "eng"}},
         {"index": 3, "codec_name": "dvb_teletext", "codec_type": "subtitle"}
       ],
       "format": {"format_name": "mpegts", "nb_streams": 4}
@@ -304,6 +322,8 @@ mod tests {
         let f = p.facts(&CastHints::default());
         assert_eq!((f.vcodec.as_deref(), f.interlaced, f.audio_index, f.fps), (Some("mpeg2video"), Some(true), Some(1), Some(25.0)));
         assert_eq!(p.hints().height, Some(576));
+        assert_eq!((f.layout.as_deref(), f.language.as_deref(), f.width), (Some("5.1(side)"), Some("eng"), Some(720)));
+        assert_eq!(f.sound(), "ac3 5.1(side) 48 kHz");
         let info = p.stream_info();
         assert_eq!((info.video_codec.as_deref(), info.audio_channels.as_deref()), (Some("mpeg2video (Main)"), Some("6")));
     }

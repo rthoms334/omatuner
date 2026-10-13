@@ -9,6 +9,11 @@
 //! turns the transcript into fixtures. Bodies: binary plists decoded (nested `data` plists too),
 //! text redacted, anything else (the TLV8 of pair-verify) only its size.
 //!
+//! **Bounded** (every log is): a file stops at [`MAX_FILE`] (10 MiB, about six hours of a VOD
+//! session at the 1.7 MB/h measured on 2026-10-13) with one last line, `{"t", "stopped":
+//! "size cap", "cap": bytes}`; the session goes on untraced. The service keeps the newest five
+//! files (`service::TRACE_KEEP`).
+//!
 //! Redaction, before anything is written: registered secrets and credential patterns
 //! ([`crate::redact::redact`]: the relay token is a registered secret), then every URL becomes
 //! `<scheme>://<addr>/<path>`, IPv4 addresses `<addr>`, MAC-like ids `<mac>`, UUIDs `<uuid>`; the
@@ -32,6 +37,8 @@ use super::session::Channel;
 
 /// The switch (`1` turns it on).
 pub const ENV: &str = "TUNER_CAST_TRACE";
+/// One transcript's size cap (module docs).
+pub const MAX_FILE: u64 = 10 << 20;
 
 /// Plist keys whose values identify a device, a sender or a session.
 const ID_KEYS: &[&str] = &[
@@ -70,6 +77,11 @@ pub struct Trace(Arc<Mutex<Writer>>);
 struct Writer {
     file: File,
     start: Instant,
+    /// Bytes written so far, and the cap ([`MAX_FILE`]; tests use a small one).
+    written: u64,
+    cap: u64,
+    /// The cap was reached: nothing more is written.
+    stopped: bool,
 }
 
 impl Trace {
@@ -92,13 +104,19 @@ impl Trace {
         }
     }
 
-    /// A new 0600 file in `dir` (created 0700).
+    /// A new 0600 file in `dir` (created 0700), capped at [`MAX_FILE`].
     pub fn create(dir: &Path) -> std::io::Result<(Self, PathBuf)> {
+        Self::create_capped(dir, MAX_FILE)
+    }
+
+    /// [`Trace::create`] with another size cap.
+    pub fn create_capped(dir: &Path, cap: u64) -> std::io::Result<(Self, PathBuf)> {
         DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
         let secs = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let path = dir.join(format!("cast-{secs}-{:04x}.jsonl", super::random_u32() & 0xffff));
         let file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
-        Ok((Self(Arc::new(Mutex::new(Writer { file, start: Instant::now() }))), path))
+        let w = Writer { file, start: Instant::now(), written: 0, cap, stopped: false };
+        Ok((Self(Arc::new(Mutex::new(w))), path))
     }
 
     /// A request we send.
@@ -119,13 +137,24 @@ impl Trace {
 
     fn write(&self, chan: Channel, dir: &str, mut entry: Json) {
         let mut w = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if w.stopped {
+            return;
+        }
+        let t = (w.start.elapsed().as_secs_f64() * 1000.0).round() / 1000.0;
         if let Json::Object(m) = &mut entry {
-            m.insert("t".into(), json!((w.start.elapsed().as_secs_f64() * 1000.0).round() / 1000.0));
+            m.insert("t".into(), json!(t));
             m.insert("chan".into(), json!(chan.as_str()));
             m.insert("dir".into(), json!(dir));
         }
         let mut line = entry.to_string();
         line.push('\n');
+        if w.written + line.len() as u64 > w.cap {
+            // the last line says why the transcript ends here
+            w.stopped = true;
+            line = format!("{}\n", json!({ "t": t, "stopped": "size cap", "cap": w.cap }));
+            tracing::info!("cast: the trace reached its {} MiB cap; the session goes on untraced", w.cap >> 20);
+        }
+        w.written += line.len() as u64;
         if let Err(e) = w.file.write_all(line.as_bytes()) {
             tracing::debug!("cast: trace write failed: {e}");
         }
@@ -233,5 +262,23 @@ mod tests {
         assert_eq!(std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
         let line: Json = serde_json::from_str(std::fs::read_to_string(&path).unwrap().lines().next().unwrap()).unwrap();
         assert_eq!((line["status"].as_u64(), line["chan"].as_str(), line["dir"].as_str()), (Some(200), Some("control"), Some("in")));
+    }
+
+    /// A long session can't grow a transcript past its cap: one closing line says why it ends.
+    #[test]
+    fn a_trace_stops_at_its_size_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let (trace, path) = Trace::create_capped(dir.path(), 1000).unwrap();
+        let ok = Response { proto: "RTSP/1.0".into(), status: 200, reason: "OK".into(), headers: vec![], body: vec![] };
+        for _ in 0..100 {
+            trace.response(Channel::Events, &ok);
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.len() <= 1000 + 100, "{} bytes", text.len());
+        let lines: Vec<Json> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert!(lines.len() > 2 && lines[..lines.len() - 1].iter().all(|l| l["status"] == 200));
+        assert_eq!(lines.last().unwrap()["stopped"].as_str(), Some("size cap"));
+        trace.response(Channel::Events, &ok);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "nothing after the cap");
     }
 }

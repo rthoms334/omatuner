@@ -32,9 +32,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::Sleep;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
-use super::RelayEvent;
 use super::playlist::{self, Codec, FIRST_PICTURE_BYTES, Guard};
 use super::token::{Grants, STOPPED_TTL, Token};
+use super::{RelayEvent, renditions};
 
 /// Concurrent connections per session (§9.1).
 pub const MAX_CONNECTIONS: usize = 8;
@@ -45,17 +45,33 @@ pub const IDLE: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum File {
     Playlist,
-    Init,
+    /// `init.mp4`, or a rendition's `init_<n>.mp4` (ffmpeg's `-var_stream_map` names, §8.4).
+    Init(Option<u8>),
     /// `s<n>.ts` / `s<n>.m4s`: sequence number `n`.
     Segment(u64),
 }
 
-/// `^(index\.m3u8|init\.mp4|s\d{1,7}\.(ts|m4s))$` (§9.1), by hand.
+impl File {
+    /// The file's name on disk (`fmp4`: the output's segment type).
+    pub fn name(self, fmp4: bool) -> String {
+        match self {
+            File::Playlist => "index.m3u8".into(),
+            File::Init(None) => "init.mp4".into(),
+            File::Init(Some(n)) => format!("init_{n}.mp4"),
+            File::Segment(n) => format!("s{n}.{}", if fmp4 { "m4s" } else { "ts" }),
+        }
+    }
+}
+
+/// `^(index\.m3u8|init(_\d)?\.mp4|s\d{1,7}\.(ts|m4s))$` (§9.1), by hand.
 pub fn served_file(name: &str) -> Option<File> {
     match name {
         "index.m3u8" => return Some(File::Playlist),
-        "init.mp4" => return Some(File::Init),
+        "init.mp4" => return Some(File::Init(None)),
         _ => {}
+    }
+    if let Some(n) = name.strip_prefix("init_").and_then(|r| r.strip_suffix(".mp4")) {
+        return (n.len() == 1).then(|| n.parse().ok().map(|n| File::Init(Some(n)))).flatten();
     }
     let digits = name.strip_prefix('s')?.strip_suffix(".ts").or_else(|| name.strip_prefix('s')?.strip_suffix(".m4s"))?;
     if digits.is_empty() || digits.len() > 7 || !digits.bytes().all(|b| b.is_ascii_digit()) {
@@ -64,48 +80,48 @@ pub fn served_file(name: &str) -> Option<File> {
     digits.parse().ok().map(File::Segment)
 }
 
-/// `/c/<tok>/<file>` → `(tok, file)`. The raw path only: nothing is percent-decoded, so `%2e%2e`
-/// or `%2f` never become a traversal; they simply don't match.
-pub fn route(path: &str) -> Option<(&str, File)> {
+/// `/c/<tok>/[<rendition>/]<file>` → `(tok, rendition, file)`; a rendition is one of the
+/// surround output's fixed names (`v`, `a`, `s`). The raw path only: nothing is percent-decoded,
+/// so `%2e%2e` or `%2f` never become a traversal; they simply don't match.
+pub fn route(path: &str) -> Option<(&str, Option<&'static str>, File)> {
     let rest = path.strip_prefix("/c/")?;
     let (tok, file) = rest.split_once('/')?;
     if tok.is_empty() || !tok.bytes().all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b)) {
         return None;
     }
-    Some((tok, served_file(file)?))
+    let (rendition, file) = match file.split_once('/') {
+        Some((r, f)) => ([renditions::VIDEO, renditions::STEREO, renditions::SURROUND].into_iter().find(|n| *n == r)?, f),
+        None => return Some((tok, None, served_file(file)?)),
+    };
+    Some((tok, Some(rendition), served_file(file)?))
 }
 
-/// One generation's output directory as the server sees it (shared by its views).
+/// One media playlist of an output and its files: the only one (one stereo playlist, as ever),
+/// or a rendition of a surround output (§8.4: `v` video, `a` stereo, `s` surround, each in its
+/// own directory).
 #[derive(Debug)]
-pub struct Output {
+pub struct Rendition {
+    /// The URL and directory component (`None`: the output's own directory).
+    pub name: Option<&'static str>,
     pub dir: PathBuf,
-    /// fMP4 segments (HEVC): `init.mp4` + `s<n>.m4s`.
-    pub fmp4: bool,
-    /// The load generation events carry (a view may move it on).
-    pub generation: Arc<AtomicU64>,
     pub guard: Mutex<Guard>,
-    /// The codec of the IDR check (`None`: radio).
+    /// The codec of the IDR check (the video playlist; `None`: radio, audio renditions).
     pub codec: Option<Codec>,
-    irregular_sent: AtomicBool,
+    pub mime: &'static str,
     /// 1 + the highest segment the TV fetched (0: none yet): the VOD cap deletes behind it.
     pub fetched: AtomicU64,
 }
 
-impl Output {
-    pub fn new(dir: PathBuf, fmp4: bool, generation: Arc<AtomicU64>, guard: Guard, codec: Option<Codec>) -> Self {
-        Self { dir, fmp4, generation, guard: Mutex::new(guard), codec, irregular_sent: AtomicBool::new(false), fetched: AtomicU64::new(0) }
+impl Rendition {
+    pub fn new(name: Option<&'static str>, dir: PathBuf, codec: Option<Codec>, mime: &'static str) -> Self {
+        Self { name, dir, guard: Mutex::new(Guard::new(1, codec)), codec, mime, fetched: AtomicU64::new(0) }
     }
 
-    fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Relaxed)
-    }
-
-    /// ffmpeg's playlist through the guard: `(parsed, rendered for view_first, irregular now)`.
-    /// Reads only the new segments' first bytes (the IDR check).
-    pub fn serve_playlist(&self, text: &str, view_first: Option<u64>) -> (playlist::MediaPlaylist, String, bool) {
+    /// ffmpeg's playlist through the guard: `(parsed, rendered for view_first)`. Reads only the
+    /// new segments' first bytes (the IDR check).
+    pub fn serve_playlist(&self, text: &str, view_first: Option<u64>, fmp4: bool) -> (playlist::MediaPlaylist, String) {
         let pl = playlist::parse(text);
         let mut g = self.guard.lock().unwrap_or_else(|e| e.into_inner());
-        let fmp4 = self.fmp4;
         let dir = &self.dir;
         g.observe(&pl, |file, codec| {
             use std::io::Read;
@@ -115,8 +131,67 @@ impl Output {
             playlist::first_picture_is_idr(&head, codec, fmp4)
         });
         let body = g.render(&pl, view_first);
+        (pl, body)
+    }
+
+    /// Read ffmpeg's current playlist into the guard (what's produced, not only what the TV
+    /// fetched).
+    pub async fn refresh(&self, fmp4: bool) {
+        if let Ok(text) = tokio::fs::read_to_string(self.dir.join("index.m3u8")).await {
+            self.serve_playlist(&text, None, fmp4);
+        }
+    }
+}
+
+/// One generation's output as the server sees it (shared by its views).
+#[derive(Debug)]
+pub struct Output {
+    /// The generation's directory.
+    pub dir: PathBuf,
+    /// fMP4 segments (HEVC, surround): `init*.mp4` + `s<n>.m4s`.
+    pub fmp4: bool,
+    /// The load generation events carry (a view may move it on).
+    pub generation: Arc<AtomicU64>,
+    /// The main playlist first (the video, or the only one), then the audio renditions.
+    pub renditions: Vec<Rendition>,
+    /// The multivariant playlist of a surround output, once its renditions are ready.
+    pub master: Mutex<Option<String>>,
+    irregular_sent: AtomicBool,
+    overflow_sent: AtomicBool,
+}
+
+impl Output {
+    pub fn new(dir: PathBuf, fmp4: bool, generation: Arc<AtomicU64>, renditions: Vec<Rendition>) -> Self {
+        Self {
+            dir,
+            fmp4,
+            generation,
+            renditions,
+            master: Mutex::new(None),
+            irregular_sent: AtomicBool::new(false),
+            overflow_sent: AtomicBool::new(false),
+        }
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
+    /// The main playlist (video, or the only one): positions, views, the guard's verdicts.
+    pub fn main(&self) -> &Rendition {
+        &self.renditions[0]
+    }
+
+    fn rendition(&self, name: Option<&str>) -> Option<(usize, &Rendition)> {
+        self.renditions.iter().enumerate().find(|(_, r)| r.name == name)
+    }
+
+    /// The main playlist's verdicts, each reported once: `(irregular, target overflow)`.
+    fn verdicts(&self) -> (bool, bool) {
+        let g = self.main().guard.lock().unwrap_or_else(|e| e.into_inner());
         let irregular = g.irregular() && !self.irregular_sent.swap(true, Ordering::Relaxed);
-        (pl, body, irregular)
+        let overflow = g.overflow().is_some() && !g.irregular() && !self.overflow_sent.swap(true, Ordering::Relaxed);
+        (irregular, overflow)
     }
 }
 
@@ -124,10 +199,9 @@ impl Output {
 #[derive(Debug)]
 pub struct Served {
     pub out: Arc<Output>,
-    /// A playlist view's first segment (`None`: everything ffmpeg lists).
-    pub view_first: Option<u64>,
+    /// A playlist view's first segment per rendition (`None`: everything ffmpeg lists).
+    pub view_first: Option<Vec<u64>>,
     playlist_seen: bool,
-    upto: f64,
 }
 
 struct Shared {
@@ -169,10 +243,10 @@ impl LanServer {
 
     /// Serve `out` under `token` and revoke every other token (one per generation: a zap, a
     /// seek or a reconnect revokes the old one, §9.2).
-    pub fn grant_only(&self, token: Token, out: Arc<Output>, view_first: Option<u64>) {
+    pub fn grant_only(&self, token: Token, out: Arc<Output>, view_first: Option<Vec<u64>>) {
         let mut g = self.shared.grants.lock().unwrap_or_else(|e| e.into_inner());
         g.clear();
-        g.insert(token, Served { out, view_first, playlist_seen: false, upto: 0.0 });
+        g.insert(token, Served { out, view_first, playlist_seen: false });
     }
 
     pub fn revoke_all(&self) {
@@ -210,7 +284,7 @@ async fn handle(State(srv): State<Arc<Shared>>, ConnectInfo(Peer(from)): Connect
         tracing::debug!("{}: 404 for a request from another host", srv.label);
         return not_found();
     }
-    let Some((tok, file)) = route(req.uri().path()) else {
+    let Some((tok, rendition, file)) = route(req.uri().path()) else {
         tracing::debug!("{}: 404 for an unknown path", srv.label);
         return not_found();
     };
@@ -225,8 +299,9 @@ async fn handle(State(srv): State<Arc<Shared>>, ConnectInfo(Peer(from)): Connect
         // produced and the TV has fetched its last segment (it needs nothing more from us)
         let out = g.value.out.clone();
         let done = {
-            let guard = out.guard.lock().unwrap_or_else(|e| e.into_inner());
-            guard.complete() && guard.last_seq().is_some_and(|last| out.fetched.load(Ordering::Relaxed) > last)
+            let main = out.main();
+            let guard = main.guard.lock().unwrap_or_else(|e| e.into_inner());
+            guard.complete() && guard.last_seq().is_some_and(|last| main.fetched.load(Ordering::Relaxed) > last)
         };
         if done && g.last_fetch.is_some_and(|t| now.duration_since(t) >= STOPPED_TTL) {
             grants.revoke(|_| true);
@@ -234,15 +309,29 @@ async fn handle(State(srv): State<Arc<Shared>>, ConnectInfo(Peer(from)): Connect
             return not_found();
         }
         g.last_fetch = Some(now);
-        (out, g.value.view_first)
+        (out, g.value.view_first.clone())
     };
     let generation = out.generation();
+    // a surround output's own top level holds only the multivariant playlist
+    let master = if rendition.is_none() { out.master.lock().unwrap_or_else(|e| e.into_inner()).clone() } else { None };
+    let rend = out.rendition(rendition);
     match file {
         File::Playlist => {
-            let Ok(text) = tokio::fs::read_to_string(out.dir.join("index.m3u8")).await else { return not_found() };
-            let (_, body, irregular) = out.serve_playlist(&text, view_first);
+            let body = match (master, rend) {
+                (Some(master), _) => master,
+                (None, Some((index, rend))) => {
+                    let Ok(text) = tokio::fs::read_to_string(rend.dir.join("index.m3u8")).await else { return not_found() };
+                    let first = view_first.as_ref().and_then(|v| v.get(index).copied());
+                    rend.serve_playlist(&text, first, out.fmp4).1
+                }
+                (None, None) => return not_found(),
+            };
+            let (irregular, overflow) = out.verdicts();
             if irregular {
                 let _ = srv.tx.send(RelayEvent::Irregular { generation });
+            }
+            if overflow {
+                let _ = srv.tx.send(RelayEvent::TargetOverflow { generation });
             }
             if !head && first_fetch(&srv, tok) {
                 let _ = srv.tx.send(RelayEvent::PlaylistFetched { generation });
@@ -251,26 +340,21 @@ async fn handle(State(srv): State<Arc<Shared>>, ConnectInfo(Peer(from)): Connect
             r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
             r
         }
-        File::Init | File::Segment(_) => {
-            let name = match file {
-                File::Init => "init.mp4".to_owned(),
-                File::Segment(n) => format!("s{n}.{}", if out.fmp4 { "m4s" } else { "ts" }),
-                File::Playlist => return not_found(),
-            };
-            let Ok(data) = tokio::fs::read(out.dir.join(&name)).await else { return not_found() };
+        File::Init(_) | File::Segment(_) => {
+            let Some((index, rend)) = rend else { return not_found() };
+            let Ok(data) = tokio::fs::read(rend.dir.join(file.name(out.fmp4))).await else { return not_found() };
             if let File::Segment(n) = file
                 && !head
             {
-                out.fetched.fetch_max(n + 1, Ordering::Relaxed);
-                let upto = out.guard.lock().unwrap_or_else(|e| e.into_inner()).upto(n, view_first.unwrap_or(0));
-                if let Some(upto) = upto
-                    && raise_upto(&srv, tok, upto)
-                {
-                    let _ = srv.tx.send(RelayEvent::SegmentFetched { generation, upto_s: upto });
+                rend.fetched.fetch_max(n + 1, Ordering::Relaxed);
+                // the main playlist's fetches are the position estimate's evidence (§7.3)
+                let first = view_first.as_ref().and_then(|v| v.first().copied()).unwrap_or(0);
+                let span = (index == 0).then(|| rend.guard.lock().unwrap_or_else(|e| e.into_inner()).span(n, first)).flatten();
+                if let Some((from_s, upto_s)) = span {
+                    let _ = srv.tx.send(RelayEvent::SegmentFetched { generation, from_s, upto_s });
                 }
             }
-            let mime = if out.fmp4 { "video/mp4" } else { "video/mp2t" };
-            ranged(head, req.headers(), data, mime)
+            ranged(head, req.headers(), data, rend.mime)
         }
     }
 }
@@ -279,16 +363,6 @@ async fn handle(State(srv): State<Arc<Shared>>, ConnectInfo(Peer(from)): Connect
 fn first_fetch(srv: &Shared, tok: &str) -> bool {
     let mut grants = srv.grants.lock().unwrap_or_else(|e| e.into_inner());
     grants.find_mut(tok).is_some_and(|g| !std::mem::replace(&mut g.value.playlist_seen, true))
-}
-
-/// Record a fetch bound; `true` when it moved forward.
-fn raise_upto(srv: &Shared, tok: &str, upto: f64) -> bool {
-    let mut grants = srv.grants.lock().unwrap_or_else(|e| e.into_inner());
-    grants.find_mut(tok).is_some_and(|g| {
-        let moved = upto > g.value.upto;
-        g.value.upto = g.value.upto.max(upto);
-        moved
-    })
 }
 
 fn cors(h: &mut HeaderMap) {
@@ -546,11 +620,21 @@ mod tests {
     #[test]
     fn the_route_matcher_admits_one_family_only() {
         let tok = "abcdefghijklmnopqrstuvwxyz";
-        assert_eq!(route(&format!("/c/{tok}/index.m3u8")), Some((tok, File::Playlist)));
-        assert_eq!(route(&format!("/c/{tok}/init.mp4")), Some((tok, File::Init)));
-        assert_eq!(route(&format!("/c/{tok}/s0.ts")), Some((tok, File::Segment(0))));
-        assert_eq!(route(&format!("/c/{tok}/s9999999.m4s")), Some((tok, File::Segment(9_999_999))));
+        assert_eq!(route(&format!("/c/{tok}/index.m3u8")), Some((tok, None, File::Playlist)));
+        assert_eq!(route(&format!("/c/{tok}/init.mp4")), Some((tok, None, File::Init(None))));
+        assert_eq!(route(&format!("/c/{tok}/s0.ts")), Some((tok, None, File::Segment(0))));
+        assert_eq!(route(&format!("/c/{tok}/s9999999.m4s")), Some((tok, None, File::Segment(9_999_999))));
+        // a surround output's renditions (§8.4)
+        assert_eq!(route(&format!("/c/{tok}/v/index.m3u8")), Some((tok, Some("v"), File::Playlist)));
+        assert_eq!(route(&format!("/c/{tok}/a/init_1.mp4")), Some((tok, Some("a"), File::Init(Some(1)))));
+        assert_eq!(route(&format!("/c/{tok}/s/s12.m4s")), Some((tok, Some("s"), File::Segment(12))));
         for bad in [
+            format!("/c/{tok}/w/index.m3u8"),
+            format!("/c/{tok}/v/v/index.m3u8"),
+            format!("/c/{tok}/v/../index.m3u8"),
+            format!("/c/{tok}/init_12.mp4"),
+            format!("/c/{tok}/init_.mp4"),
+            format!("/c/{tok}/v/"),
             format!("/c/{tok}/s10000000.ts"),
             format!("/c/{tok}/s.ts"),
             format!("/c/{tok}/s1.TS"),

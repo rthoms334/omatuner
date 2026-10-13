@@ -21,7 +21,7 @@ mod static_http;
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fake_airplay::{
     AllowAccess, By, Channel, Entry, FakeAirPlay, FakeConfig, Forge, Pairing, PlaybackInfo, Request, State, StreamHeader, Tvos, command_label,
@@ -94,6 +94,7 @@ on_tvos_26_and_27!(
     stopped_from_the_remote,
     position_from_playback_info,
     position_estimate_when_playback_info_fails,
+    the_estimate_follows_jumps_and_reloads,
     replace_on_the_same_session,
     a_failed_replace_restarts_the_session,
     stop_closes_everything,
@@ -892,12 +893,51 @@ async fn position_estimate_when_playback_info_fails(tvos: Tvos) {
         let media = Media::new("tokP2", 3, false);
         let mut client = session(&fake, Profile::AppleTv).await;
         play(&fake, &mut client, &media).await;
-        within("fetched", client.fetched(2.0)).await;
+        within("fetched", client.fetched(0.0, 2.0)).await;
         let pos = within("position", client.position()).await.unwrap_or_else(|| panic!("{mode:?}: an estimate"));
         assert!((0.0..=2.0).contains(&pos), "{mode:?}: {pos} past what the TV fetched");
         let again = within("position again", client.position()).await.expect("still estimating");
         assert!((pos..=2.0).contains(&again), "{mode:?}: {again} after {pos}");
     }
+}
+
+/// A TV that never answers `playbackInfo` (§7.3 "Position"): the estimate starts where
+/// `timeJumped` puts the playhead, follows a seek made with the TV's remote by where the TV's
+/// fetches go, starts over at 0 of a replaced item's playlist, and is reported a little behind,
+/// never ahead (it becomes the saved progress). Every check is a bound around elapsed time.
+async fn the_estimate_follows_jumps_and_reloads(tvos: Tvos) {
+    let fake = FakeAirPlay::start(FakeConfig { playback_info: PlaybackInfo::Silent, ..FakeConfig::new(tvos) });
+    let (a, b) = (Media::new("tokP3", 3, false), Media::new("tokP4", 3, false));
+    let mut client = session(&fake, Profile::AppleTv).await;
+    play(&fake, &mut client, &a).await;
+    within("the first, unanswered request", client.position()).await;
+    let behind = |pos: f64, at: f64, since: Instant| {
+        let ran = since.elapsed().as_secs_f64();
+        assert!(pos <= at + ran && pos >= at - 2.5, "{pos} for {at} (+{ran:.2} s)");
+    };
+    // the TV places its playhead at 5 min (its own remote), and says so
+    let t = Instant::now();
+    fake.jump(Some(300.0));
+    let mut pos = 0.0;
+    for _ in 0..500 {
+        pos = within("position", client.position()).await.expect("an estimate");
+        if pos >= 297.0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    behind(pos, 300.0, t);
+    within("fetched", client.fetched(296.0, 304.0)).await;
+    // then scrubbed to 10 min without a word: its first fetch there is where it is
+    let t = Instant::now();
+    within("fetched", client.fetched(600.0, 604.0)).await;
+    behind(within("position", client.position()).await.expect("an estimate"), 600.0, t);
+    // a replace (a reload of the item): the new playlist's 0
+    within("replace", client.replace(&b.req())).await.expect("replaced");
+    let t = Instant::now();
+    within("fetched", client.fetched(0.0, 1.0)).await;
+    behind(within("position", client.position()).await.expect("an estimate"), 0.0, t);
+    no_violations(&fake);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -937,7 +977,7 @@ async fn replace_on_the_same_session(tvos: Tvos) {
     fake.until("the new item's first segment", |s| s.fetches().any(|f| f.path == first && f.status == 200).then_some(())).await;
     let rearmed = |s: &State| s.requests().filter_map(Request::command).skip(before).map(command_label).any(|l| l == "setProperty actionAtItemEnd=1");
     assert!(!fake.with(rearmed), "actionAtItemEnd 1 before the TV fetched the new item");
-    within("fetched", client.fetched(1.0)).await;
+    within("fetched", client.fetched(0.0, 1.0)).await;
     fake.until("actionAtItemEnd 1 after the fetch", |s| rearmed(s).then_some(())).await;
 
     let reqs = fake.requests();

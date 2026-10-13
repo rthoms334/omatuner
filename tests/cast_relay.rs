@@ -64,7 +64,7 @@ fn playable(kind: PlayableKind, url: String, headers: HttpHeaders) -> Arc<Playab
 }
 
 fn spec(generation: u64, playable: Arc<Playable>, force: Option<CastLevel>) -> LoadSpec {
-    LoadSpec { generation, playable, hints: CastHints::default(), receiver: ReceiverKind::AppleTv, force }
+    LoadSpec { generation, playable, hints: CastHints::default(), receiver: ReceiverKind::AppleTv, force, stereo: false }
 }
 
 /// Events until `want` matches one (returned with everything before it), or panic at `within`.
@@ -248,7 +248,7 @@ async fn a_live_channel_reaches_the_tv_as_an_apple_media_playlist() {
     assert_eq!(body[0], 0x47, "an MPEG-TS segment");
 
     let seen =
-        until(&mut relay, Duration::from_secs(10), |e| matches!(e, RelayEvent::SegmentFetched { generation: 1, upto_s } if *upto_s > 0.0)).await;
+        until(&mut relay, Duration::from_secs(10), |e| matches!(e, RelayEvent::SegmentFetched { generation: 1, upto_s, .. } if *upto_s > 0.0)).await;
     assert!(seen.contains(&RelayEvent::UpstreamOpened { generation: 1 }), "{seen:?}");
     assert!(seen.contains(&RelayEvent::PlaylistFetched { generation: 1 }), "{seen:?}");
     assert!(seen.iter().any(|e| matches!(e, RelayEvent::Probed { generation: 1, .. })), "{seen:?}");
@@ -338,6 +338,80 @@ async fn the_server_answers_its_token_and_peer_only_and_views_share_the_segments
     assert!(relay.view(9, 3600.0).await.unwrap().is_none(), "beyond the film");
 
     relay.stop(false).await;
+}
+
+/// A film with 5.1 sound reaches the Apple TV as Apple's HLS authoring spec asks (§8.4): a
+/// multivariant playlist with a surround group (the source's AC-3, AAC 5.1 or E-AC-3 copied, its
+/// FLAC converted to AC-3) and a stereo AAC group, the video listed once per group with what was
+/// produced (codec string from the init segment, size, frame rate, measured bandwidths, the
+/// stream's language); three fMP4 media playlists under the token, one pinned target,
+/// `EXT-X-START` at 0; and the surround rendition's media really is six channels of that codec.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_surround_film_gets_a_stereo_and_a_surround_rendition() {
+    let Some(media) = media() else { return };
+    let caps = relay::ffmpeg::caps().await.unwrap();
+    let server = TestServer::start(media, Faults::default());
+    for (file, codec, codecs, lang) in [
+        ("/surround.ts", "ac3", "ac-3", "en"),
+        ("/surround.mp4", "aac", "mp4a.40.2", "en"),
+        ("/surround_eac3.mkv", "eac3", "ec-3", "en"),
+        ("/surround_flac.mkv", "ac3", "ac-3", "de"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut relay = RelaySession::start(config(&dir, LOOPBACK)).await.unwrap();
+        let p = playable(PlayableKind::Movie, server.url(file), HttpHeaders::default());
+        let prepared = relay.load(spec(1, p, None)).await.unwrap_or_else(|e| panic!("{file}: {e:?}"));
+        assert!(prepared.surround && prepared.level == CastLevel::Repackaged, "{file}: {prepared:?}");
+        let (tv, base) = (tv(), base_of(&prepared));
+        let master = tv.get(prepared.load.url.expose()).send().await.unwrap().text().await.unwrap();
+        let lines: Vec<&str> = master.lines().collect();
+        assert_eq!(lines[..3], ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-INDEPENDENT-SEGMENTS"], "{file}:\n{master}");
+        assert_eq!(
+            lines[3],
+            format!(
+                "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"surround\",LANGUAGE=\"{lang}\",NAME=\"Main\",AUTOSELECT=YES,DEFAULT=YES,CHANNELS=\"6\",URI=\"s/index.m3u8\""
+            )
+        );
+        assert_eq!(
+            lines[4],
+            format!(
+                "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"stereo\",LANGUAGE=\"{lang}\",NAME=\"Main\",AUTOSELECT=YES,DEFAULT=YES,CHANNELS=\"2\",URI=\"a/index.m3u8\""
+            )
+        );
+        for (line, uri, group, audio) in [(5, 6, "surround", codecs), (7, 8, "stereo", "mp4a.40.2")] {
+            let inf = lines[line];
+            assert!(
+                inf.contains("CODECS=\"avc1.")
+                    && inf.contains(&format!(",{audio}\",RESOLUTION=320x180,FRAME-RATE=25.000,VIDEO-RANGE=SDR,AUDIO=\"{group}\"")),
+                "{file}: {inf}"
+            );
+            let bw = |key: &str| inf.split(&format!("{key}=")).nth(1).and_then(|r| r.split(',').next()).and_then(|n| n.parse::<u64>().ok()).unwrap();
+            assert!(bw("BANDWIDTH") >= bw("AVERAGE-BANDWIDTH") && (20_000..20_000_000).contains(&bw("BANDWIDTH")), "{file}: {inf}");
+            assert_eq!(lines[uri], "v/index.m3u8");
+        }
+        let mut targets = Vec::new();
+        for (r, init, mime) in [("v", "init_0.mp4", "video/mp4"), ("a", "init_1.mp4", "audio/mp4"), ("s", "init_2.mp4", "audio/mp4")] {
+            let text = tv.get(format!("{base}{r}/index.m3u8")).send().await.unwrap().text().await.unwrap();
+            assert!(text.contains(&format!("#EXT-X-MAP:URI=\"{init}\"")) && text.contains("#EXT-X-START:TIME-OFFSET=0\n"), "{file} {r}:\n{text}");
+            targets.push(text.lines().find_map(|l| l.strip_prefix("#EXT-X-TARGETDURATION:")).unwrap().to_owned());
+            for name in [init, "s0.m4s"] {
+                let resp = tv.get(format!("{base}{r}/{name}")).send().await.unwrap();
+                assert_eq!((resp.status().as_u16(), resp.headers()["content-type"].to_str().unwrap()), (200, mime), "{file} {r}/{name}");
+            }
+        }
+        targets.dedup();
+        assert_eq!(targets.len(), 1, "one target for every rendition (Apple rule 8.2): {targets:?}");
+        // the surround rendition is the source's 5.1, copied
+        let mut mp4 = tv.get(format!("{base}s/init_2.mp4")).send().await.unwrap().bytes().await.unwrap().to_vec();
+        mp4.extend_from_slice(&tv.get(format!("{base}s/s0.m4s")).send().await.unwrap().bytes().await.unwrap());
+        let probe_at = dir.path().join("surround.mp4");
+        std::fs::write(&probe_at, &mp4).unwrap();
+        let probe = relay::probe::probe(&caps.ffprobe, probe_at.to_str().unwrap(), false).await.unwrap();
+        let a = probe.chosen_audio().unwrap();
+        assert_eq!((a.codec.as_str(), a.channels), (codec, Some(6)), "{file}: {probe:?}");
+        assert!(tv.get(format!("{base}init_0.mp4")).send().await.unwrap().status() == 404, "only the multivariant playlist at the top");
+        relay.stop(false).await;
+    }
 }
 
 /// Live MPEG-TS (`bars.ts`) converted (2 s GOPs): ffprobe and ffmpeg read one provider request
@@ -587,7 +661,7 @@ async fn broadcast_fixtures_probe_to_the_apple_tv_plan() {
         assert!(std::env::var_os("CI").is_none(), "ffmpeg is required in CI");
         return;
     };
-    let opts = Options { convert: CastConvert::Auto, interlaced: CastInterlaced::Auto, force: None, can_convert: caps.l3 };
+    let opts = Options { convert: CastConvert::Auto, interlaced: CastInterlaced::Auto, force: None, can_convert: caps.l3, stereo: false };
     for (name, level, video, audio) in [
         ("idr.ts", CastLevel::Repackaged, Video::Copy, Audio::Copy),
         ("mp2.ts", CastLevel::Repackaged, Video::Copy, Audio::Aac),

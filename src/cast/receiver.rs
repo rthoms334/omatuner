@@ -109,13 +109,13 @@ impl Backend {
         }
     }
 
-    /// The TV fetched the current playlist's media up to `upto_s` (relative): bounds the
-    /// position estimate and, after a replace, re-arms `actionAtItemEnd`.
-    pub async fn fetched(&mut self, upto_s: f64) {
+    /// The TV fetched the current playlist's segment `from_s..upto_s` (relative): the position
+    /// estimate's evidence and, after a replace, the `actionAtItemEnd` re-arm.
+    pub async fn fetched(&mut self, from_s: f64, upto_s: f64) {
         match self {
-            Backend::AirPlay(c) => c.fetched(upto_s).await,
+            Backend::AirPlay(c) => c.fetched(from_s, upto_s).await,
             Backend::Fake(f) => {
-                let _ = f.call(Call::Fetched(upto_s));
+                let _ = f.call(Call::Fetched(from_s, upto_s));
             }
         }
     }
@@ -168,7 +168,8 @@ pub enum Call {
     Load(LoadReq),
     Replace(LoadReq),
     SetPaused(bool),
-    Fetched(f64),
+    /// `(from_s, upto_s)`.
+    Fetched(f64, f64),
     SetVolume(f64),
     Stop,
 }

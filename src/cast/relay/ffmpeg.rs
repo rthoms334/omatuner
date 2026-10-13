@@ -20,7 +20,8 @@ use tokio::sync::{OnceCell, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::super::CastErrorKind;
-use super::plan::{Audio, Plan, Segments, Video};
+use super::plan::{Audio, Plan, Segments, Surround, Video};
+use super::renditions;
 use crate::redact::redact;
 
 /// `hls_time` (s): VioletRelay's 4 s segments, which work on its tvOS 26.5 hardware (§8.4).
@@ -36,6 +37,11 @@ pub const SLOW_FOR: Duration = Duration::from_secs(20);
 const STDERR_LINES: usize = 64;
 /// The test card (§8.5): 15 s of `testsrc2` and a 440 Hz tone.
 const TEST_CARD_S: u32 = 15;
+/// EVENT playlists (VOD, catch-up): ffmpeg reads the first minute as fast as the provider sends
+/// it (a quick start, and room for the TV's first buffer), then at real time with ffmpeg's 5 %
+/// catch-up, so production runs about a minute ahead of playback instead of pulling the whole
+/// film at 4× (§8.4; the relay's lead cap stops it while the TV is paused).
+const READ_BURST_S: &str = "60";
 
 /// `hls_time` override for the loopback tests (`-hls_time 1`, DESIGN §40 §14.2), in ms; 0 = the
 /// default [`SEGMENT_S`].
@@ -146,8 +152,8 @@ pub enum Input<'a> {
         hls: bool,
         /// `-ss` (VOD resume or a seek beyond what's produced).
         seek_s: f64,
-        /// EVENT playlists (VOD, catch-up): `-readrate 4 -readrate_initial_burst 30`, ahead of
-        /// the TV without draining the provider at line rate.
+        /// EVENT playlists (VOD, catch-up): `-readrate 1 -readrate_initial_burst 60` (see
+        /// [`READ_BURST_S`]).
         readrate: bool,
     },
     /// Test on TV (§8.5): `testsrc2` + `sine`, 15 s.
@@ -181,7 +187,7 @@ pub fn argv(input: &Input<'_>, plan: &Plan, out: &Output<'_>) -> Vec<String> {
                 push(&["-http_multiple", "0"]);
             }
             if *readrate {
-                push(&["-readrate", "4", "-readrate_initial_burst", "30"]);
+                push(&["-readrate", "1", "-readrate_initial_burst", READ_BURST_S]);
             }
             if *seek_s > 0.0 {
                 push(&["-ss", &format!("{seek_s:.3}")]);
@@ -199,10 +205,13 @@ pub fn argv(input: &Input<'_>, plan: &Plan, out: &Output<'_>) -> Vec<String> {
     match (plan.audio, input) {
         (Audio::None, _) => {}
         (_, Input::TestCard { .. }) => push(&["-map", "1:a:0"]),
-        (_, Input::Proxy { .. }) => match out.audio_index {
-            Some(n) => push(&["-map", &format!("0:a:{n}")]),
-            None => push(&["-map", "0:a:0?"]),
-        },
+        (_, Input::Proxy { .. }) => {
+            let map = out.audio_index.map_or_else(|| "0:a:0?".to_owned(), |n| format!("0:a:{n}"));
+            // a surround output maps the sound twice: the stereo rendition, then the surround one
+            for _ in 0..if plan.surround.is_some() { 2 } else { 1 } {
+                push(&["-map", &map]);
+            }
+        }
     }
     match plan.video {
         Video::None => push(&["-vn"]),
@@ -229,9 +238,19 @@ pub fn argv(input: &Input<'_>, plan: &Plan, out: &Output<'_>) -> Vec<String> {
             push(&["-vf", &vf.join(",")]);
         }
     }
-    match plan.audio {
-        Audio::None => push(&["-an"]),
-        Audio::Copy => {
+    match (plan.audio, plan.surround) {
+        (_, Some(surround)) => {
+            push(&["-c:a:0", "aac", "-ac:a:0", "2", "-b:a:0", "160k"]);
+            match surround {
+                // the mp4 muxer wants an AudioSpecificConfig, MPEG-TS carries ADTS (see below)
+                Surround::Copy { aac: true } => push(&["-c:a:1", "copy", "-bsf:a:1", "aac_adtstoasc"]),
+                Surround::Copy { aac: false } => push(&["-c:a:1", "copy"]),
+                // 7.1 is folded to 5.1, AC-3's most
+                Surround::Ac3 => push(&["-c:a:1", "ac3", "-ac:a:1", "6", "-b:a:1", "448k"]),
+            }
+        }
+        (Audio::None, None) => push(&["-an"]),
+        (Audio::Copy, None) => {
             push(&["-c:a", "copy"]);
             // copied audio is AAC (plan.rs): the mp4 muxer behind fMP4 segments refuses ADTS
             // ("Malformed AAC bitstream detected", ffmpeg exits at the first audio packet), and
@@ -241,7 +260,7 @@ pub fn argv(input: &Input<'_>, plan: &Plan, out: &Output<'_>) -> Vec<String> {
                 push(&["-bsf:a", "aac_adtstoasc"]);
             }
         }
-        Audio::Aac => push(&["-c:a", "aac", "-ac", "2", "-b:a", "160k"]),
+        (Audio::Aac, None) => push(&["-c:a", "aac", "-ac", "2", "-b:a", "160k"]),
     }
     // subtitles and teletext are dropped in Phase 1
     push(&["-sn", "-dn", "-f", "hls", "-hls_time", &fmt_secs(out.hls_time)]);
@@ -256,8 +275,18 @@ pub fn argv(input: &Input<'_>, plan: &Plan, out: &Output<'_>) -> Vec<String> {
         Segments::Ts => push(&["-hls_segment_type", "mpegts"]),
         Segments::Fmp4 => push(&["-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init.mp4"]),
     }
-    let seg = out.dir.join(format!("s%d.{ext}"));
-    let index = out.dir.join("index.m3u8");
+    // surround (§8.4): three media playlists in `v/`, `a/`, `s/` (`init_<n>.mp4` each); the
+    // relay writes the multivariant playlist itself
+    let dir = match plan.surround {
+        Some(_) => {
+            let map = format!("v:0,name:{} a:0,name:{} a:1,name:{}", renditions::VIDEO, renditions::STEREO, renditions::SURROUND);
+            push(&["-var_stream_map", &map]);
+            out.dir.join("%v")
+        }
+        None => out.dir.to_path_buf(),
+    };
+    let seg = dir.join(format!("s%d.{ext}"));
+    let index = dir.join("index.m3u8");
     push(&["-hls_segment_filename", &seg.to_string_lossy(), &index.to_string_lossy()]);
     a
 }
@@ -443,7 +472,7 @@ mod tests {
     use super::*;
 
     fn plan(level: crate::model::CastLevel, video: Video, audio: Audio, segments: Segments) -> Plan {
-        Plan { level, video, audio, segments }
+        Plan { level, video, audio, segments, surround: None }
     }
 
     #[test]
@@ -471,7 +500,7 @@ mod tests {
         let vod = Input::Proxy { url: "http://127.0.0.1:1/u/t", hls: false, seek_s: 4210.5, readrate: true };
         let hevc = plan(crate::model::CastLevel::Repackaged, Video::Copy, Audio::Copy, Segments::Fmp4);
         let a = argv(&vod, &hevc, &Output { dir, live: false, hls_time: 6.0, fps: None, audio_index: None }).join(" ");
-        assert!(a.contains("-readrate 4 -readrate_initial_burst 30 -ss 4210.500 -i http://127.0.0.1:1/u/t"), "{a}");
+        assert!(a.contains("-readrate 1 -readrate_initial_burst 60 -ss 4210.500 -i http://127.0.0.1:1/u/t"), "{a}");
         assert!(a.contains("-map 0:v:0 -map 0:a:0? -c:v copy -tag:v hvc1 -c:a copy -bsf:a aac_adtstoasc"), "{a}");
         assert!(a.contains("-hls_playlist_type event -hls_flags independent_segments+program_date_time+temp_file"), "{a}");
         assert!(a.contains("-hls_segment_type fmp4 -hls_fmp4_init_filename init.mp4 -hls_segment_filename /c/g1/s%d.m4s"), "{a}");
@@ -496,6 +525,30 @@ mod tests {
         .join(" ");
         assert!(card.contains("-f lavfi -i testsrc2=s=1280x720:r=25 -f lavfi -i sine=f=440 -t 15 -map 0:v:0 -map 1:a:0"), "{card}");
         assert!(card.contains("drawtext=text=Tuner") && !card.contains("://"), "{card}");
+    }
+
+    /// The 2026-10-13 film (HEVC + AAC 5.1) with surround (§8.4): the sound mapped twice, AAC
+    /// stereo made from it and the 5.1 copied, three media playlists under `v/`, `a/` and `s/`;
+    /// a DTS source gets AC-3 5.1.
+    #[test]
+    fn surround_argv_writes_three_renditions() {
+        let dir = Path::new("/c/g2");
+        let vod = Input::Proxy { url: "http://127.0.0.1:1/u/t", hls: false, seek_s: 30.0, readrate: true };
+        let mut p = plan(crate::model::CastLevel::Repackaged, Video::Copy, Audio::Aac, Segments::Fmp4);
+        p.surround = Some(Surround::Copy { aac: true });
+        let a = argv(&vod, &p, &Output { dir, live: false, hls_time: 4.0, fps: None, audio_index: Some(0) }).join(" ");
+        for want in [
+            "-map 0:v:0 -map 0:a:0 -map 0:a:0 -c:v copy -tag:v hvc1",
+            "-c:a:0 aac -ac:a:0 2 -b:a:0 160k -c:a:1 copy -bsf:a:1 aac_adtstoasc -sn -dn",
+            "-hls_segment_type fmp4 -hls_fmp4_init_filename init.mp4 -var_stream_map v:0,name:v a:0,name:a a:1,name:s",
+            "-hls_segment_filename /c/g2/%v/s%d.m4s /c/g2/%v/index.m3u8",
+        ] {
+            assert!(a.contains(want), "{want:?} missing from {a}");
+        }
+        assert!(!a.contains("-c:a copy") && !a.contains("-c:a aac "), "{a}");
+        p.surround = Some(Surround::Ac3);
+        let a = argv(&vod, &p, &Output { dir, live: false, hls_time: 4.0, fps: None, audio_index: None }).join(" ");
+        assert!(a.contains("-map 0:a:0? -map 0:a:0? ") && a.contains("-c:a:1 ac3 -ac:a:1 6 -b:a:1 448k"), "{a}");
     }
 
     #[test]

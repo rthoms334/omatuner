@@ -63,8 +63,9 @@ const SEEN_FRESH: Duration = Duration::from_secs(60);
 const STOP_WAIT: Duration = Duration::from_secs(1);
 /// Detection's target when no TV is known: the mDNS group, so the route is the LAN's.
 const MDNS_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
-/// The trace directory keeps this many transcripts (§13).
-const TRACE_KEEP: usize = 5;
+/// The trace directory keeps this many transcripts (§13), each at most
+/// [`super::airplay::trace::MAX_FILE`] (10 MiB).
+pub const TRACE_KEEP: usize = 5;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -887,11 +888,17 @@ impl CastApi for Api {
         };
         test.state = TestState::Running;
         let cancel = shared.stop.child_token();
+        let short = device.id.short();
+        tracing::info!("cast: Test on TV on device {short}");
         let session = Session::new(shared.clone(), device, creds, Arc::new(|_| {}));
         let this = shared.clone();
         let stop = cancel.clone();
         let task = shared.rt.spawn(async move {
             let state = super::session::test_on_tv(session, None, stop).await;
+            match state {
+                TestState::Failed(kind) => tracing::info!("cast: Test on TV on device {short}: failed ({})", kind.reason()),
+                state => tracing::info!("cast: Test on TV on device {short}: {state:?}"),
+            }
             lock(&this.test).state = state;
         });
         test.task = Some((task, cancel));

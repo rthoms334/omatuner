@@ -1,19 +1,30 @@
 //! The served-playlist guard and playlist views (DESIGN §40 §8.1.4–5): a stable
 //! `#EXT-X-TARGETDURATION`, the IDR check on each new segment (two violations → "irregular"),
-//! relative names only; views that start at segment k (`MEDIA-SEQUENCE:k`, PDT kept, growing only
-//! at the end) for seeks inside what's produced. OWNER: CAST-4.
+//! relative names only, `EXT-X-START` at 0 for EVENT playlists; views that start at segment k
+//! (`MEDIA-SEQUENCE:k`, PDT kept, growing only at the end) for seeks inside what's produced.
+//! OWNER: CAST-4.
 //!
 //! The TV never reads ffmpeg's `index.m3u8` as written. Every fetch goes through
 //! [`Guard::observe`] (new segments: duration and IDR checks, the timeline) and
 //! [`Guard::render`]:
 //! * **Target duration.** In copy mode ffmpeg derives `#EXT-X-TARGETDURATION` from the current
-//!   window and may change it mid-session, which RFC 8216 §6.2.1 forbids. The served value is a
-//!   session constant ([`pin`]), raised only when a segment exceeds it by more than 0.5 s (that
-//!   is, its rounded `EXTINF` would exceed it), and each raise is a violation.
+//!   window and may change it mid-session, which RFC 8216 §6.2.1 forbids. The served value is
+//!   pinned when the first segments are ready ([`pin`]): copied video cuts at the source's
+//!   keyframes, so it covers the longest of them plus [`COPY_HEADROOM_S`]; the relay keeps it
+//!   for the item across reloads. It never changes while a playlist is served: a segment that
+//!   outgrows it (its rounded `EXTINF` above it) is held back with everything after it
+//!   ([`Guard::overflow`]: the session restarts the item where the TV is, under a longer pinned
+//!   target). That is no violation: a long-GOP film is no irregular source (the 2026-10-13 film
+//!   ran 10.09 s and 12.10 s segments, and two raises had sent it to a 700 % CPU conversion). A
+//!   segment beyond [`MAX_TARGET_S`] is: keyframes that sparse need converting.
 //! * **IDR.** Apple rule 7.4 wants every segment to start with an IDR (H.264 NAL 5, HEVC IRAP
 //!   16–21); copy mode may cut on a recovery-point I-frame. A segment whose first picture isn't
 //!   one is a violation. Two violations make the item "irregular" (L3 next time, where forced
-//!   keyframes fix both).
+//!   keyframes fix it).
+//! * **Start.** An EVENT playlist (VOD, catch-up) says `#EXT-X-START:TIME-OFFSET=0`: without it
+//!   AVPlayer treats the growing playlist as live and starts three target durations from its end
+//!   (RFC 8216 §6.3.3; traced 2026-10-13: 12.18 s in, then 9.22 s after a reload), while the
+//!   relay started it exactly where playback should be.
 //! * **Names.** Only ffmpeg's relative segment names that the LAN server serves
 //!   ([`super::server::served_file`]) pass; anything else (an absolute URL, a path) is dropped.
 //!
@@ -28,6 +39,13 @@ use super::server::{File, served_file};
 
 /// A segment may exceed the pinned target by this much before it counts (rounding, §6.2.1).
 const TARGET_SLACK_S: f64 = 0.5;
+/// What copied video's target covers beyond the longest segment of the first window: hlsenc
+/// cuts at the first keyframe past each `hls_time` step, so segments run up to `hls_time` plus a
+/// GOP, and a source's GOPs vary.
+pub const COPY_HEADROOM_S: f64 = 2.0;
+/// The longest target declared (a TV reloads a live playlist about once per target): a segment
+/// beyond it is a source to convert, not to wait for.
+pub const MAX_TARGET_S: u32 = 30;
 /// Violations that make an item irregular.
 const IRREGULAR_AFTER: u32 = 2;
 /// Segments remembered in the timeline (a live window slides for hours; a seek needs only
@@ -131,15 +149,17 @@ pub enum Codec {
     Hevc,
 }
 
-/// The session constant `#EXT-X-TARGETDURATION` (§8.1.4): `ceil(max(hls_time, probed max GOP))`,
-/// and never below the longest segment of the first ready window (rounded, as §6.2.1 compares).
-/// hlsenc cuts at the first keyframe after `hls_time · n`, so a segment can run up to
-/// `hls_time + GOP` even when the GOP is regular (a 3 s GOP with 4 s segments gives 6 s, 3 s,
-/// 3 s…); the first window shows that before the TV reads anything.
-pub fn pin(hls_time: f64, gop: Option<f64>, first: &MediaPlaylist) -> u32 {
-    let longest = first.segments.iter().map(|s| s.dur.round()).fold(0.0, f64::max);
-    let base = hls_time.max(gop.unwrap_or(0.0)).ceil();
-    base.max(longest).max(1.0) as u32
+/// The pinned `#EXT-X-TARGETDURATION` (§8.1.4): `ceil(max(hls_time, probed max GOP))`, never
+/// below the longest segment of the first ready window (rounded, as §6.2.1 compares), and for
+/// copied video (`copy`) [`COPY_HEADROOM_S`] above the longest of them all. hlsenc cuts at the
+/// first keyframe after `hls_time · n`, so a segment can run up to `hls_time + GOP` even when the
+/// GOP is regular (a 3 s GOP with 4 s segments gives 6 s, 3 s, 3 s…), and a film's scene cuts make
+/// its GOPs anything up to the encoder's maximum; converted video has fixed 4 s segments.
+pub fn pin(hls_time: f64, gop: Option<f64>, first: &MediaPlaylist, copy: bool) -> u32 {
+    let longest = first.segments.iter().map(|s| s.dur).fold(0.0, f64::max);
+    let base = hls_time.max(gop.unwrap_or(0.0)).ceil().max(longest.round());
+    let target = if copy { base.max((hls_time.max(gop.unwrap_or(0.0)).max(longest) + COPY_HEADROOM_S).ceil()) } else { base };
+    target.max(1.0) as u32
 }
 
 /// Where a produced segment sits in the item (seconds from the generation's first segment).
@@ -155,7 +175,10 @@ pub struct Guard {
     target: u32,
     codec: Option<Codec>,
     violations: u32,
-    raised: u32,
+    /// The first segment that outgrew the target: it and everything after it are held back.
+    hold: Option<u64>,
+    /// The target the held segments need (with the headroom), for the restart.
+    wanted: u32,
     /// The highest sequence number checked.
     checked: Option<u64>,
     timeline: BTreeMap<u64, Slot>,
@@ -165,7 +188,7 @@ pub struct Guard {
 impl Guard {
     /// `target` from [`pin`]; `codec`: the IDR check (none for radio).
     pub fn new(target: u32, codec: Option<Codec>) -> Self {
-        Self { target, codec, violations: 0, raised: 0, checked: None, timeline: BTreeMap::new(), endlist: false }
+        Self { target, codec, violations: 0, hold: None, wanted: target, checked: None, timeline: BTreeMap::new(), endlist: false }
     }
 
     pub fn target(&self) -> u32 {
@@ -179,6 +202,12 @@ impl Guard {
     /// Two violations: mark the item irregular (§8.1.4 escalation).
     pub fn irregular(&self) -> bool {
         self.violations >= IRREGULAR_AFTER
+    }
+
+    /// A segment outgrew the target: the target the item needs (the session restarts it under
+    /// that, where the TV is). `None` while everything fits.
+    pub fn overflow(&self) -> Option<u32> {
+        self.hold.map(|_| self.wanted)
     }
 
     /// ffmpeg wrote ENDLIST (the item is fully produced).
@@ -209,11 +238,23 @@ impl Guard {
                 self.timeline.pop_first();
             }
             if seg.dur > f64::from(self.target) + TARGET_SLACK_S {
-                self.violations += 1;
-                self.raised += 1;
-                let raised = seg.dur.round() as u32;
-                tracing::debug!("cast: segment {} lasts {:.2} s: target duration raised {} → {raised}", seg.seq, seg.dur, self.target);
-                self.target = raised;
+                // never a new TARGETDURATION mid-stream (§6.2.1): held back from here
+                let wanted = ((seg.dur + COPY_HEADROOM_S).ceil() as u32).max(self.target + 1);
+                if self.hold.is_none() {
+                    tracing::debug!(
+                        "cast: segment {} lasts {:.2} s, past the {} s target: held back (needs {wanted} s)",
+                        seg.seq,
+                        seg.dur,
+                        self.target
+                    );
+                }
+                self.hold.get_or_insert(seg.seq);
+                self.wanted = self.wanted.max(wanted);
+                if wanted > MAX_TARGET_S && self.violations < IRREGULAR_AFTER {
+                    // keyframes this sparse: converting is the way (L3's are every 2 s)
+                    tracing::debug!("cast: segment {} lasts {:.2} s: past any target", seg.seq, seg.dur);
+                    self.violations = IRREGULAR_AFTER;
+                }
             }
             if let (Some(codec), Some(file)) = (self.codec, seg.file())
                 && first_picture(file, codec) == Some(false)
@@ -226,10 +267,11 @@ impl Guard {
     }
 
     /// The playlist the TV gets: `view_first` = the view's first segment (`None`: everything
-    /// listed, the live window).
+    /// listed, the live window); nothing from a held segment on.
     pub fn render(&self, pl: &MediaPlaylist, view_first: Option<u64>) -> String {
         let first = view_first.unwrap_or(0);
-        let shown: Vec<&Segment> = pl.segments.iter().filter(|s| s.seq >= first && s.file().is_some()).collect();
+        let held = |s: &Segment| self.hold.is_some_and(|h| s.seq >= h);
+        let shown: Vec<&Segment> = pl.segments.iter().filter(|s| s.seq >= first && s.file().is_some() && !held(s)).collect();
         let media_seq = shown.first().map_or(first.max(pl.media_seq), |s| s.seq);
         let dropped_disc = pl.segments.iter().filter(|s| s.seq < media_seq && s.discontinuity()).count() as u64;
         let mut out = String::with_capacity(64 + shown.len() * 96);
@@ -251,6 +293,11 @@ impl Guard {
             out.push_str(t);
             out.push('\n');
         }
+        // the TV starts where the relay started (module docs)
+        let event = pl.header.iter().any(|t| t == "#EXT-X-PLAYLIST-TYPE:EVENT");
+        if event && !pl.header.iter().any(|t| tag_name(t) == "#EXT-X-START") {
+            out.push_str("#EXT-X-START:TIME-OFFSET=0\n");
+        }
         for s in shown {
             for t in &s.tags {
                 out.push_str(t);
@@ -259,7 +306,7 @@ impl Guard {
             out.push_str(s.file().unwrap_or_default());
             out.push('\n');
         }
-        if pl.endlist {
+        if pl.endlist && self.hold.is_none() {
             out.push_str("#EXT-X-ENDLIST\n");
         }
         out
@@ -273,12 +320,12 @@ impl Guard {
             .then_some((*seq, slot.start))
     }
 
-    /// The end of segment `seq` measured from the start of `view_first` (the TV's position bound,
-    /// `SegmentFetched::upto_s`).
-    pub fn upto(&self, seq: u64, view_first: u64) -> Option<f64> {
-        let end = self.timeline.get(&seq).map(|s| s.start + s.dur)?;
+    /// Segment `seq` as `(start, end)` measured from the start of `view_first` (what the TV's
+    /// fetch says about its playhead, `SegmentFetched`).
+    pub fn span(&self, seq: u64, view_first: u64) -> Option<(f64, f64)> {
+        let slot = self.timeline.get(&seq)?;
         let origin = self.timeline.get(&view_first).map_or(0.0, |s| s.start);
-        Some((end - origin).max(0.0))
+        Some(((slot.start - origin).max(0.0), (slot.start + slot.dur - origin).max(0.0)))
     }
 
     /// The start of segment `seq` (seconds from the generation's first segment).
@@ -507,7 +554,7 @@ mod tests {
     fn a_view_starts_at_segment_k_keeps_pdt_and_grows_only_at_the_end() {
         let pl = parse(EVENT);
         assert_eq!((pl.segments.len(), pl.target, pl.endlist), (4, Some(4), false));
-        let mut g = Guard::new(pin(4.0, Some(2.0), &pl), Some(Codec::H264));
+        let mut g = Guard::new(pin(4.0, Some(2.0), &pl, false), Some(Codec::H264));
         assert_eq!(g.observe(&pl, |_, _| Some(true)), 0);
         assert_eq!(g.segment_at(9.0), Some((2, 8.0)));
         assert_eq!(g.segment_at(14.6), None, "beyond what's produced");
@@ -515,11 +562,11 @@ mod tests {
         assert_eq!(
             view,
             "#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:2\n#EXT-X-PLAYLIST-TYPE:EVENT\n\
-             #EXT-X-INDEPENDENT-SEGMENTS\n\
+             #EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-START:TIME-OFFSET=0\n\
              #EXTINF:4.000000,\n#EXT-X-PROGRAM-DATE-TIME:2026-10-12T21:00:08.000+0100\ns2.ts\n\
              #EXTINF:2.500000,\n#EXT-X-PROGRAM-DATE-TIME:2026-10-12T21:00:12.000+0100\ns3.ts\n"
         );
-        assert_eq!(g.upto(3, 2), Some(6.5), "positions are relative to the view");
+        assert_eq!(g.span(3, 2), Some((4.0, 6.5)), "positions are relative to the view");
 
         // ffmpeg appends and ends the item: the view only grows at its end
         let more = format!("{EVENT}#EXTINF:4.000000,\n#EXT-X-PROGRAM-DATE-TIME:2026-10-12T21:00:14.500+0100\ns4.ts\n#EXT-X-ENDLIST\n");
@@ -532,23 +579,36 @@ mod tests {
         assert_eq!(g.segment_at(18.5), Some((4, 14.5)), "the very end of a complete item");
     }
 
+    /// The 2026-10-13 film (HEVC copied, GOPs up to 12 s): the target covers the first window's
+    /// longest segment with headroom; a later, longer one is held back (never a new
+    /// TARGETDURATION mid-stream) and asks for a restart under a longer target; neither is a
+    /// violation. Only a missing IDR is.
     #[test]
-    fn the_target_is_pinned_and_raised_only_by_a_long_segment() {
-        // copy mode: ffmpeg rewrites TARGETDURATION from the window (5 here, 9 later)
-        let first = "#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXT-X-MEDIA-SEQUENCE:40\n#EXTINF:4.96,\ns40.ts\n#EXTINF:4.2,\ns41.ts\n";
+    fn the_target_never_changes_and_a_longer_segment_is_held_back() {
+        // ffmpeg rewrites TARGETDURATION from its window (10 here, 12 later)
+        let first = "#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:EVENT\n\
+            #EXTINF:10.09,\ns0.ts\n#EXTINF:4.2,\ns1.ts\n";
         let pl = parse(first);
-        let mut g = Guard::new(pin(4.0, None, &pl), Some(Codec::H264));
-        assert_eq!(g.target(), 5, "the first window's longest segment, rounded");
-        g.observe(&pl, |_, _| Some(true));
-        let later = "#EXTM3U\n#EXT-X-TARGETDURATION:9\n#EXT-X-MEDIA-SEQUENCE:41\n#EXTINF:4.2,\ns41.ts\n#EXTINF:5.4,\ns42.ts\n#EXTINF:8.8,\ns43.ts\n";
-        let pl = parse(later);
-        assert_eq!(g.observe(&pl, |_, _| Some(true)), 1, "5.4 s rounds to 5: fine; 8.8 s is a violation");
-        assert!(g.render(&pl, None).contains("#EXT-X-TARGETDURATION:9\n#EXT-X-MEDIA-SEQUENCE:41\n"));
+        let mut g = Guard::new(pin(4.0, None, &pl, true), Some(Codec::Hevc));
+        assert_eq!(g.target(), 13, "10.09 s + 2 s headroom, rounded up");
+        assert_eq!(g.observe(&pl, |_, _| Some(true)), 0);
+        let later = format!("{first}#EXTINF:12.10,\ns2.ts\n#EXTINF:8.0,\ns3.ts\n#EXTINF:13.6,\ns4.ts\n#EXTINF:4.0,\ns5.ts\n#EXT-X-ENDLIST\n");
+        let pl = parse(&later);
+        assert_eq!(g.observe(&pl, |_, _| Some(true)), 0, "a long GOP is no violation");
+        let out = g.render(&pl, None);
+        assert!(out.contains("#EXT-X-TARGETDURATION:13\n") && out.contains("\ns3.ts\n"), "12.10 s fits 13: {out}");
+        assert!(!out.contains("s4.ts") && !out.contains("s5.ts") && !out.contains("ENDLIST"), "held back from s4: {out}");
+        assert_eq!(g.overflow(), Some(16), "13.6 s + 2 s, rounded up");
         assert!(!g.irregular());
-        let pl = parse("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:43\n#EXTINF:8.8,\ns43.ts\n#EXTINF:4,\ns44.ts\n");
-        assert_eq!(g.observe(&pl, |f, _| Some(f != "s44.ts")), 1, "s44 starts on a recovery-point I-frame");
-        assert!(g.irregular(), "two violations");
-        assert_eq!(pin(4.0, Some(6.0), &parse("")), 6, "max(hls_time, GOP)");
+        assert_eq!(g.observe(&parse("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:6\n#EXTINF:4,\ns6.ts\n"), |_, _| Some(false)), 1, "s6 starts on no IDR");
+        assert!(!g.irregular());
+
+        // converted video: fixed 4 s segments, no headroom; keyframes 40 s apart: irregular
+        assert_eq!(pin(4.0, Some(2.0), &parse("#EXTM3U\n#EXTINF:4.0,\ns0.ts\n#EXTINF:4.0,\ns1.ts\n"), false), 4);
+        assert_eq!(pin(4.0, Some(6.0), &parse(""), false), 6, "max(hls_time, GOP)");
+        let mut g = Guard::new(8, Some(Codec::H264));
+        g.observe(&parse("#EXTM3U\n#EXTINF:40.0,\ns0.ts\n"), |_, _| Some(true));
+        assert!(g.irregular(), "past any target");
     }
 
     #[test]

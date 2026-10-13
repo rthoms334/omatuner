@@ -46,7 +46,7 @@ use tokio::sync::watch;
 use super::budget::{Lease, Released, SharedBudget};
 use super::events::{EndReason, MpvEvent, PropId, PropValue};
 use super::mpv_log::{self, MpvLog};
-use super::remote::{RemoteAdapter, RemoteCmd, RemoteEvent, RemoteOutput};
+use super::remote::{RemoteAdapter, RemoteCmd, RemoteEvent, RemoteOutput, TvClock};
 use super::state::{Effect, Input, MachineConfig, PlayerMachine};
 use super::tracks::{AspectMode, StreamInfo, parse_track_list, query_stream_info};
 use super::{CopyPlay, PlayRequest, PlayerCommand, PlayerDeps, PlayerError, PlayerErrorKind, PlayerEvent, PlayerSnapshot, PlayerState, RenderClock};
@@ -200,9 +200,9 @@ struct Remote {
     hints: Option<(MediaRef, CastHints)>,
     /// A live pause on the TV began ([`LIVE_PAUSE_WINDOW`]).
     paused_at: Option<Instant>,
-    /// The TV's last reported position and when: a relative seek counts from where the TV is
-    /// now (reports come every 10 s, §7.3).
-    reported: Option<(f64, Instant)>,
+    /// Where the TV is between its reports (every 10 s, §7.3): a relative seek counts from it,
+    /// and a failure gives it to the machine first (a reconnect resumes there).
+    clock: TvClock,
 }
 
 /// The mpv-only snapshot fields the user set, kept while casting shows the defaults (mpv keeps
@@ -317,7 +317,7 @@ impl Controller {
                 recv(cmd_rx) -> cmd => match cmd {
                     Ok(PlayerCommand::Shutdown) | Err(_) => {
                         // the TV gets the session's fast stop (≤ 300 ms, nobody waits for it)
-                        self.leave_remote(true);
+                        self.leave_remote(true, "shutdown");
                         // the final progress save reaches the store before its writer closes
                         self.feed(Input::Stop, Instant::now());
                         self.publish(true);
@@ -754,7 +754,7 @@ impl Controller {
         let Output::Remote(r) = &mut self.output else { return };
         r.paused_at = None;
         r.info = None;
-        r.reported = None;
+        r.clock = TvClock::default();
         let hints = r.hints.take().filter(|(m, _)| *m == p.media).map(|(_, h)| h).unwrap_or_default();
         r.adapter.loaded(generation, live);
         let sent = r.out.cmd.send(RemoteCmd::Load { generation, playable: p.clone(), hints }).is_ok();
@@ -1084,7 +1084,7 @@ impl Controller {
         }
         let mut changed = false;
         if self.casting() {
-            self.leave_remote(false);
+            self.leave_remote(false, "moved to another TV");
             changed = self.feed(Input::Stop, Instant::now());
         }
         let moving = match &play {
@@ -1135,7 +1135,7 @@ impl Controller {
     /// TV's last position, live at the live point) or Idle. Not casting, Play here plays the
     /// last item here when nothing plays (the alert after the TV stopped it).
     fn stop_casting(&mut self, play_here: bool) -> bool {
-        let was = self.leave_remote(false).is_some();
+        let was = self.leave_remote(false, if play_here { "Play here" } else { "Stop casting" }).is_some();
         if !was && (!play_here || self.busy()) {
             return false;
         }
@@ -1175,7 +1175,7 @@ impl Controller {
             info: None,
             hints,
             paused_at: None,
-            reported: None,
+            clock: TvClock::default(),
         }));
         self.force_publish = true;
     }
@@ -1185,8 +1185,9 @@ impl Controller {
     /// stop, nobody waits). Positions the TV still reports meanwhile count: the session asks it
     /// for one before it stops, and Play here continues there. Then the lease is released and
     /// the picture is mpv's again; the caller plays or stops. Returns the session's view, `None`
-    /// when not casting.
-    fn leave_remote(&mut self, fast: bool) -> Option<CastView> {
+    /// when not casting. `why` ends the INFO line that says casting ended (field logs tell a stop
+    /// from Play here, the TV's own stop or a move to another TV).
+    fn leave_remote(&mut self, fast: bool, why: &str) -> Option<CastView> {
         let Output::Remote(mut r) = std::mem::replace(&mut self.output, Output::Local) else { return None };
         if r.alive {
             let _ = r.out.cmd.send(RemoteCmd::Close { fast });
@@ -1225,7 +1226,7 @@ impl Controller {
         self.snap.seekable = false;
         self.snap.stream_info = None;
         self.force_publish = true;
-        tracing::info!("{}: casting to device {} ended", self.log, r.device.short());
+        tracing::info!("{}: casting to device {} ended: {why}", self.log, r.device.short());
         self.snap.cast.take()
     }
 
@@ -1272,7 +1273,7 @@ impl Controller {
                 }
             }
             RemoteEvent::Position { generation, pos, dur } if ours(generation) => {
-                r.reported = Some((*pos, now));
+                r.clock.report(*pos, now);
                 self.snap.position = Some(*pos);
                 self.snap.duration = dur.or(self.snap.duration);
                 let sec = pos.floor() as i64;
@@ -1281,11 +1282,14 @@ impl Controller {
             RemoteEvent::Paused(p) => {
                 self.snap.paused = *p;
                 r.paused_at = if *p { r.paused_at.or(Some(now)) } else { None };
+                r.clock.paused(*p, now);
                 self.force_publish = true;
             }
+            RemoteEvent::Buffering(b) => r.clock.buffering(*b, now),
             RemoteEvent::Playing { generation } if ours(generation) => {
                 self.force_publish |= std::mem::take(&mut self.snap.paused);
                 r.paused_at = None;
+                r.clock.playing(now);
             }
             RemoteEvent::Lost(kind) => {
                 tracing::info!("{}: the cast session to device {} ended: {kind:?}", self.log, r.device.short());
@@ -1299,7 +1303,14 @@ impl Controller {
             }
             _ => {}
         }
-        let inputs = r.adapter.inputs(&ev);
+        let mut inputs = r.adapter.inputs(&ev);
+        // the generation fails while the TV still plays what it buffered: the machine's resume
+        // point (a reconnect, Try again) is where the TV is now, not its last report (§11.2)
+        if inputs.iter().any(|i| matches!(i, Input::EndFile { reason: EndReason::Error, .. } | Input::Failed { .. }))
+            && let Some(pos) = r.clock.now(now)
+        {
+            inputs.insert(0, Input::TimePos(pos));
+        }
         if release {
             self.release_lease();
         }
@@ -1333,7 +1344,7 @@ impl Controller {
     /// sender took over. Casting ends as for Stop, without an error state; the app alerts
     /// where the user is, with Play here · Cast again.
     fn stopped_on_tv(&mut self) -> bool {
-        let view = self.leave_remote(false);
+        let view = self.leave_remote(false, "stopped on the TV");
         let changed = self.feed(Input::Stop, Instant::now());
         if let Some(v) = view {
             self.emit(PlayerEvent::CastEnded { device: v.device, name: v.name, kind: CastErrorKind::StoppedOnTv });
@@ -1359,15 +1370,14 @@ impl Controller {
         match *cmd {
             // the sleep timer, Ctrl+Shift+S and relock turn the TV off: casting ends
             C::Stop => {
-                self.leave_remote(false);
+                self.leave_remote(false, "stopped");
                 return Some(self.feed(Input::Stop, Instant::now()));
             }
             C::TogglePause => return Some(self.remote_pause(!self.snap.paused)),
             C::SetPause(p) => return Some(self.remote_pause(p)),
             // a replace with a playlist view inside what's produced, else a restart (the session)
             C::SeekBy(d) if self.snap.seekable => {
-                let playing = matches!(self.machine.state(), PlayerState::Playing);
-                let now = r.reported.map(|(pos, at)| if playing { pos + at.elapsed().as_secs_f64() } else { pos });
+                let now = r.clock.now(Instant::now());
                 let t = (now.or(self.snap.position).unwrap_or(0.0) + d).max(0.0);
                 let t = self.snap.duration.map_or(t, |dur| t.min(dur));
                 send(RemoteCmd::SeekTo(t));
@@ -1409,7 +1419,7 @@ impl Controller {
     fn remote_seeked(&mut self, t: f64) -> bool {
         let now = Instant::now();
         if let Output::Remote(r) = &mut self.output {
-            r.reported = Some((t, now));
+            r.clock.report(t, now);
         }
         self.snap.position = Some(t);
         self.dirty = true;
