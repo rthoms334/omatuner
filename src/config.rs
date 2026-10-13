@@ -37,6 +37,8 @@ pub struct Config {
     pub reminders: ReminderConfig,
     pub parental: ParentalConfig,
     pub integration: IntegrationConfig,
+    /// Tuner's own updates (DESIGN §41).
+    pub updates: UpdatesConfig,
     pub fonts: FontConfig,
     /// Up next (DESIGN §32).
     pub queue: QueueConfig,
@@ -602,6 +604,27 @@ impl Default for IntegrationConfig {
     }
 }
 
+/// `[updates]`: Tuner's own updates (DESIGN §41; Settings ▸ About & logs ▸ Updates). Checking is
+/// always on (stable releases on GitHub, at start and every 6 h). Machine-local like `[agents]`
+/// (`Config::restored` keeps this machine's): `passwordless` mirrors a file in this computer's
+/// /etc.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdatesConfig {
+    /// Download, verify and install a new release by itself (installed with pacman only;
+    /// otherwise Tuner says there is one). Off: it says so and installs on "Install now".
+    pub auto_install: bool,
+    /// The polkit rule that lets this user install Tuner's verified updates without a password
+    /// is in place: set by the app once the helper wrote it (or removed it), never by hand.
+    pub passwordless: bool,
+}
+
+impl Default for UpdatesConfig {
+    fn default() -> Self {
+        Self { auto_install: true, passwordless: false }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FontConfig {
@@ -643,6 +666,7 @@ impl Config {
         c.interface.ui_scale = local.interface.ui_scale;
         c.interface.last_screen.clone_from(&local.interface.last_screen);
         c.general.debug_log = local.general.debug_log;
+        c.updates = local.updates.clone(); // the passwordless rule is this computer's
         c.agents = local.agents.clone();
         if local.parental.pin_hash.is_some() {
             c.parental = local.parental.clone();

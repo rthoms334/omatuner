@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
+<!-- Tuner's update helper (DESIGN §41.5): the root program that installs a Tuner update,
+     started only through pkexec. pkexec picks the action by the program's path and its first
+     argument (exec.argv1, polkit ≥ 0.114).
+
+     `install`: the helper installs only an omatuner package signed with Tuner's release key,
+     for this architecture and newer than the installed one. auth_admin_keep; the rule Tuner's
+     "Install updates without asking for my password" switch writes
+     (/etc/polkit-1/rules.d/49-omatuner-update-<uid>.rules) allows this action, and only this
+     one, for that user while local and active.
+
+     `passwordless`: writes or removes that rule. auth_admin: always the password. -->
+<policyconfig>
+  <vendor>Tuner</vendor>
+  <vendor_url>https://github.com/rthoms334/omatuner</vendor_url>
+
+  <action id="io.github.rthoms334.omatuner.update">
+    <description>Install a Tuner update</description>
+    <message>Install the Tuner update (signed with Tuner's release key)</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/tuner/tuner-update</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">install</annotate>
+  </action>
+
+  <action id="io.github.rthoms334.omatuner.update-passwordless">
+    <description>Let Tuner install its updates without a password</description>
+    <message>Change whether Tuner may install its signed updates without asking for your password</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/tuner/tuner-update</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">passwordless</annotate>
+  </action>
+</policyconfig>

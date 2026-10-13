@@ -96,6 +96,21 @@ pub enum Compression {
     Xz,
 }
 
+/// What [`HttpClient::get_conditional`] got: the status, the headers a REST client needs, and
+/// the body of a 2xx (empty otherwise).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApiResponse {
+    pub status: u16,
+    pub etag: Option<String>,
+    /// `Retry-After`, in seconds.
+    pub retry_after_s: Option<u64>,
+    /// `X-RateLimit-Remaining` (GitHub).
+    pub rate_remaining: Option<u64>,
+    /// `X-RateLimit-Reset`: when the limit resets, unix seconds (GitHub).
+    pub rate_reset: Option<i64>,
+    pub body: Bytes,
+}
+
 /// Progress callback: (bytes so far, total if known).
 pub type ProgressFn<'a> = &'a (dyn Fn(u64, Option<u64>) + Send + Sync);
 
@@ -189,6 +204,38 @@ impl HttpClient {
             let _ = tokio::fs::remove_file(&part).await;
         }
         result
+    }
+
+    /// GET a small API document conditionally (Tuner's update check, DESIGN §41.2): `etag` from
+    /// the last 200 goes in `If-None-Match`. Every HTTP status comes back as an [`ApiResponse`]
+    /// (the caller reads 304 and rate limits); only transport failures, cancellation and a body
+    /// over `max_bytes` are errors. The body is read for 2xx only.
+    pub async fn get_conditional(
+        &self,
+        url: &str,
+        headers: &HttpHeaders,
+        etag: Option<&str>,
+        max_bytes: u64,
+        cancel: &CancellationToken,
+    ) -> Result<ApiResponse> {
+        let mut rb = self.request(url, headers);
+        if let Some(etag) = etag.and_then(header_value) {
+            rb = rb.header(header::IF_NONE_MATCH, etag);
+        }
+        let mut resp = self.send(rb, url, cancel).await?;
+        let number = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<i64>().ok());
+        let mut out = ApiResponse {
+            status: resp.status().as_u16(),
+            etag: header_string(&resp, header::ETAG),
+            retry_after_s: number("retry-after").and_then(|s| u64::try_from(s).ok()),
+            rate_remaining: number("x-ratelimit-remaining").and_then(|s| u64::try_from(s).ok()),
+            rate_reset: number("x-ratelimit-reset"),
+            body: Bytes::new(),
+        };
+        if resp.status().is_success() {
+            out.body = read_body(&mut resp, url, max_bytes, cancel).await?;
+        }
+        Ok(out)
     }
 
     pub fn default_user_agent(&self) -> String {

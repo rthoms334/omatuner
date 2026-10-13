@@ -339,6 +339,11 @@ pub enum Action {
     /// Ctrl+M: watch in the other picture (opens multi-view from a list, the guide, search;
     /// in the player, choose the channel for the other picture).
     WatchAlongside,
+    // ---- Tuner's updates (DESIGN §41): toasts and the status-bar chip, never bound to a key
+    /// "Install" on the toast of an update that waits: download it if need be, then install.
+    InstallUpdate,
+    /// "Restart now" on the update's toast and chip: restart into the installed version.
+    RestartToUpdate,
     // ---- reminders, sleep timer, news flash (B6, big-features additions)
     /// Ctrl+Shift+T: the sleep timer menu (in N min, end of programme, after N items, end of
     /// Up next, off).

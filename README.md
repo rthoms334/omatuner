@@ -265,7 +265,7 @@ fontconfig, JetBrains Mono Nerd Font, …):
 
 ```sh
 sha256sum -c --ignore-missing SHA256SUMS
-sudo pacman -U omatuner-0.2.6-1-x86_64.pkg.tar.zst     # or …-aarch64.pkg.tar.zst
+sudo pacman -U omatuner-0.2.7-1-x86_64.pkg.tar.zst     # or …-aarch64.pkg.tar.zst
 ```
 
 The package installs:
@@ -275,8 +275,16 @@ The package installs:
 - the opt-in snippets under `/usr/share/tuner/`
 - `tuner-rearm.service`, a systemd user unit that re-arms the reminder timers at every login
   (see [Reminders while Tuner is closed](#reminders-while-tuner-is-closed))
+- the update helper `/usr/lib/tuner/tuner-update` and its polkit policy (see [Updates](#updates))
 - this README and the design notes under `/usr/share/doc/tuner/`, the licence under
   `/usr/share/licenses/omatuner/`
+
+From then on Tuner [updates itself](#updates). Every package and tarball has a minisign
+signature (`.minisig`) by Tuner's release key; to check one by hand:
+
+```sh
+minisign -Vm omatuner-0.2.5-1-x86_64.pkg.tar.zst -P RWToNAEapl/Jf9Fxx7q+fhN1qm5144l/vu41N8lmQyTM7KGrDShJjRer
+```
 
 `omatuner-<version>-<arch>.tar.gz` holds the same binary, desktop entry, icon, snippets, login
 unit (`systemd/tuner-rearm.service`), README and LICENSE for other setups. The binary links
@@ -294,7 +302,7 @@ makepkg -si          # builds this checkout, smoke-tests the binary, installs th
 
 - `makepkg --nocheck -si` skips the smoke test. The test suite is `cargo test` (see Development).
 - The PKGBUILD builds the checkout it sits in (no download of the app itself), so check out the
-  tag you want first, e.g. `git checkout v0.2.6`.
+  tag you want first, e.g. `git checkout v0.2.7`.
 
 ### With cargo
 
@@ -315,6 +323,68 @@ the reminder timers at login; to have that too, copy `packaging/systemd/tuner-re
 `ExecStart=` to your `tuner` by its full path (systemd doesn't expand `~`; `%h` is your home,
 e.g. `ExecStart=%h/.cargo/bin/tuner --rearm`), and run
 `systemctl --user add-wants graphical-session.target tuner-rearm.service`.
+
+## Updates
+
+Tuner installed with the package keeps itself up to date. It looks for a new **stable** release
+on GitHub 20 seconds after it starts and every 6 hours (pre-releases and tags like `v0.3.0-rc1`
+are never installed), downloads the package for your computer, and checks its signature against
+Tuner's release key, which is built into Tuner. Only then does it install it, through a small
+helper that runs as root (`/usr/lib/tuner/tuner-update`) and checks everything again itself.
+Everything is in **Settings ▸ About & logs ▸ Updates**: the version, the last check, *Check now*,
+*Install now* and the two switches below.
+
+- **Your password:** installing asks for it, in your desktop's usual password dialog. Tuner
+  waits for a moment you're at it with nothing playing, and a toast says why the dialog appears.
+  A desktop notification tells you when an update is ready. Cancel the dialog and it waits for
+  *Install now*.
+- **Install updates without asking for my password** (off): turning it on asks for your
+  password once and adds a polkit rule (`/etc/polkit-1/rules.d/49-omatuner-update-<uid>.rules`)
+  that lets *you*, at this computer, run the helper's install without a password. The helper
+  installs only an `omatuner` package signed with Tuner's release key, for your computer, and
+  newer than the one installed: never another package, never the same or an older version.
+  Turning the switch off removes the rule (it asks for your password again).
+- **Automatically install updates** (on): off, Tuner tells you about a new version and installs
+  it when you choose *Install now*.
+- **Restart:** the running Tuner keeps the old version until it restarts. The status bar says
+  *Updated to 0.2.6 — restarts when idle (Restart now)*. Tuner restarts by itself once nothing
+  has been playing (or paused) for a minute, no dialog is open, no import runs and you're in
+  another window; it opens on the screen it was on, stays on its workspace and leaves the
+  keyboard where it was. It never restarts during playback. Click the chip to restart now.
+- **AI agents:** the `tuner mcp` servers your agents started keep working through an install and
+  the restart. An agent gets the new version's tools in its next session (for Claude Code, start
+  a new session); with *Keep Claude Code's plugin up to date* on, the plugin is brought up to
+  date after the restart.
+- **Not installed with pacman** (`cargo install`, the tarball, a checkout): Tuner checks and tells
+  you about a new version, but never installs it; Settings says why. Update it the way you
+  installed it.
+- **Network:** one request to `api.github.com` per check, conditional (unchanged answers don't
+  count against GitHub's limit of 60 an hour), no account, no token, through your proxy settings
+  (`HTTPS_PROXY`); then the package from GitHub's release files.
+
+### Release signing (maintainers)
+
+Releases are signed in the release workflow with minisign. The public key is
+`packaging/update-key.pub`, built into Tuner and its helper; the secret key and its password are
+the repository secrets `MINISIGN_SECRET_KEY` (the whole secret key file) and `MINISIGN_PASSWORD`.
+The one-time setup:
+
+```sh
+minisign -G -p packaging/update-key.pub -s ~/.minisign/omatuner.key   # asks for a password
+gh secret set MINISIGN_SECRET_KEY < ~/.minisign/omatuner.key
+gh secret set MINISIGN_PASSWORD                                       # type the password
+git add packaging/update-key.pub && git commit -m "Release signing key"
+```
+
+- Keep `~/.minisign/omatuner.key` and its password backed up and offline: anyone with both can
+  publish an update every Tuner installs, and without them no Tuner installs another update.
+- Publishing signs every `.pkg.tar.zst` and `.tar.gz` and uploads the `.minisig` files; it fails
+  if the secret is missing or `packaging/update-key.pub` doesn't verify a signature it made.
+- A build whose key file isn't a valid key (a fork, or the placeholder
+  `REPLACE-WITH-THE-RELEASE-KEY`) checks and tells but never installs anything.
+- Changing the key: a Tuner installs only what its own built-in key verifies, so the release
+  that brings a new key must be signed with the old one. Publish that release by hand (the
+  workflow checks against the new file), or have users install it by hand once.
 
 ## First run
 
@@ -1382,6 +1452,7 @@ use them directly. Their full descriptions are in `src/agent/tools.rs` and
 | Caches | `~/.cache/tuner/img`, `…/epg`, `…/playlists` | Logos and posters (up to 500 MB). Guide and playlist downloads are 0700 and deleted after import. |
 | Log | `~/.local/state/tuner/tuner.log` (+ `.1`) | Rotated at 5 MB. Redacted. |
 | Instance socket | `$XDG_RUNTIME_DIR/tuner/tuner.sock` | Removed on exit, including on SIGTERM/SIGINT. |
+| Update downloads | `~/.cache/tuner/update/` | 0700. The package waiting to install and its signature; removed once installed. |
 
 With `--profile-dir DIR`, the same files live under `DIR/config`, `DIR/data`, `DIR/cache`,
 `DIR/state` and `DIR/run`. The Omarchy theme is still read from your real home.
@@ -1523,6 +1594,11 @@ is; otherwise the timers come back the next time Tuner starts.
     `RUST_LOG=tuner::player=trace`) overrides both.
   - Messages from libraries (TLS, windowing) are hidden in normal use and appear as DEBUG lines
     with debug logging on.
+- **An update doesn't install:** Settings ▸ About & logs ▸ Updates says why under its status
+  (the log has the details). "No polkit agent answered": your session runs no password agent
+  (Omarchy's is `hyprpolkitagent`). "pacman was busy": it tries again in 10 minutes. With
+  `LocalFileSigLevel = Required` in `/etc/pacman.conf`, pacman refuses every package file without
+  a pacman signature, Tuner's included: install it by hand or relax that setting.
 - **"No guide data" everywhere:** see [guide coverage](#tv-guide-and-guide-coverage). Check
   Settings ▸ EPG for "Matches N of M channels".
 - **Playback stops or stutters on another workspace:** install the Hyprland snippet
@@ -1572,7 +1648,8 @@ is; otherwise the timers come back the next time Tuner starts.
 ## Privacy
 
 - **Network:** Tuner talks only to the playlist, guide, stream and logo/poster addresses your
-  playlists and guides contain. There is no telemetry and no account.
+  playlists and guides contain, and to GitHub for its updates. There is no telemetry and no
+  account.
 - **Credentials** are stored only in the database (0600). Credential-bearing downloads (Xtream
   `get.php` / `xmltv.php`) go to 0700 cache folders and are deleted after import. `config.toml`
   never holds secrets. libmpv is embedded, so stream URLs never appear on a command line.
@@ -1584,6 +1661,9 @@ is; otherwise the timers come back the next time Tuner starts.
   or to check its status (and, when you connected Claude Code, to keep its plugin up to date).
   It reads only the `tuner` entry of the agent's settings, and the log keeps the commands and
   their redacted results, never the settings themselves.
+- **Updates:** one request to `api.github.com` at start and every 6 hours (no account, no
+  token), and the package download from GitHub when there is a new version. See
+  [Updates](#updates).
 - **Backups** leave passwords out unless you tick *Include passwords*.
 - **The parental PIN** is a speed bump for children, not security.
 
@@ -1607,7 +1687,8 @@ scripts/screenshots.sh                        # README screenshots from it (Hypr
   `-D warnings`, the build, and `cargo test` with ffmpeg test media under a D-Bus session bus.
 - **Releases** (`.github/workflows/release.yml`): pushing a tag `vX.Y.Z` (matching `Cargo.toml`
   and the PKGBUILD's `pkgver`) builds the PKGBUILD with makepkg on both architectures and
-  publishes a GitHub Release with the packages, tarballs and `SHA256SUMS`. A tag with a suffix
+  publishes a GitHub Release with the packages, tarballs, their minisign signatures (see
+  [Release signing](#release-signing-maintainers)) and `SHA256SUMS`. A tag with a suffix
   (`v0.1.1-rc1` for version 0.1.1; lowercase letters, digits and dots, starting with a letter)
   becomes a pre-release whose package version is `0.1.1rc1`, which pacman orders before `0.1.1`,
   so the final release upgrades it. *Run workflow* with `publish` off is a dry run that only
