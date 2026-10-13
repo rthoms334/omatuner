@@ -111,8 +111,10 @@ fn port_of(url: &str) -> u16 {
     url.split("://").nth(1).and_then(|r| r.split('/').next()).and_then(|h| h.rsplit(':').next()).and_then(|p| p.parse().ok()).unwrap()
 }
 
-/// Sockets this process holds open toward 127.0.0.1:`port`, now. One closed by its owner stays
-/// in `/proc/net/tcp` while it winds down (FIN_WAIT, TIME_WAIT), but without an inode.
+/// Sockets toward 127.0.0.1:`port` still open, now: not hung up by whoever holds them
+/// (ESTABLISHED, SYN_SENT, CLOSE_WAIT, as `tcp_open`). One closed stays in `/proc/net/tcp`
+/// while it winds down (FIN_WAIT, TIME_WAIT), even with an inode: a child forked before the
+/// close holds it until its exec, after the client's FIN went out (hyper's shutdown).
 fn sockets_to(port: u16) -> usize {
     let tcp = std::fs::read_to_string("/proc/net/tcp").unwrap();
     let remote = format!("{:08X}:{port:04X}", u32::from_ne_bytes(LOOPBACK.octets()));
@@ -120,7 +122,7 @@ fn sockets_to(port: u16) -> usize {
     tcp.lines()
         .skip(1)
         .map(|l| l.split_whitespace().collect::<Vec<_>>())
-        .filter(|f| f.get(2) == Some(&remote.as_str()) && f.get(9).is_some_and(|i| *i != "0"))
+        .filter(|f| f.get(2) == Some(&remote.as_str()) && f.get(3).is_some_and(|st| matches!(*st, "01" | "02" | "08")))
         .count()
 }
 
@@ -143,6 +145,52 @@ fn ffmpeg_cmdlines() -> Vec<String> {
         }
     }
     out
+}
+
+/// What `max_concurrent` (the relay's one-connection assertions) measures: client sockets open
+/// in the kernel at once, not the server's view of them. A client that hangs up on a request
+/// before its answer, waits for the kernel to close it (as the relay does: a child forked
+/// meanwhile holds a copy until its exec) and only then connects again counts once, though the
+/// server's task, still reading the file, notices the hang-up later (the server's own count gave
+/// 2 to 4 here with no load, and failed the live channel's assertion once in a full run); one
+/// that connects while holding its previous socket counts twice.
+#[test]
+fn the_servers_connection_count_is_the_clients() {
+    use support::media::tcp_open;
+    let Some(media) = media() else { return };
+    let server = TestServer::start(media, Faults::default());
+    let addr = server.base.trim_start_matches("http://").to_owned();
+    let get = |s: &mut TcpStream, path: &str| write!(s, "GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    let close = |s: TcpStream| {
+        let (ours, theirs) = (s.local_addr().unwrap(), s.peer_addr().unwrap());
+        drop(s);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while tcp_open(ours, theirs).unwrap() {
+            assert!(Instant::now() < deadline, "a closed socket stayed open");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    for path in ["/live/seg003.ts", "/testsrc.mp4"].iter().cycle().take(40) {
+        let mut a = TcpStream::connect(&addr).unwrap();
+        get(&mut a, path);
+        close(a);
+        let mut b = TcpStream::connect(&addr).unwrap();
+        get(&mut b, "/live/index.m3u8");
+        let _ = b.read_to_end(&mut Vec::new());
+        close(b);
+    }
+    assert_eq!(server.max_concurrent(), 1, "{:#?}", server.overlaps());
+
+    let mut a = TcpStream::connect(&addr).unwrap();
+    get(&mut a, "/testsrc.mp4");
+    let b = TcpStream::connect(&addr).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while server.max_concurrent() < 2 {
+        assert!(Instant::now() < deadline, "a connection made while holding another wasn't counted");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(server.overlaps().len(), 1, "{:#?}", server.overlaps());
+    drop((a, b));
 }
 
 /// A live HLS channel (the server's sliding `/live` window of 1 s segments) as the TV sees it:
@@ -204,7 +252,7 @@ async fn a_live_channel_reaches_the_tv_as_an_apple_media_playlist() {
     assert!(seen.contains(&RelayEvent::UpstreamOpened { generation: 1 }), "{seen:?}");
     assert!(seen.contains(&RelayEvent::PlaylistFetched { generation: 1 }), "{seen:?}");
     assert!(seen.iter().any(|e| matches!(e, RelayEvent::Probed { generation: 1, .. })), "{seen:?}");
-    assert_eq!(server.max_concurrent(), 1, "one provider connection at a time, probe included");
+    assert_eq!(server.max_concurrent(), 1, "one provider connection at a time, probe included: {:#?}", server.overlaps());
 
     relay.stop(false).await;
     until(&mut relay, Duration::from_secs(5), |e| matches!(e, RelayEvent::UpstreamClosed { generation: 1, .. })).await;
@@ -307,7 +355,7 @@ async fn probe_and_stream_share_one_provider_request() {
     let RelayEvent::Probed { info, .. } = seen.last().unwrap() else { unreachable!() };
     assert_eq!((info.width, info.height), (Some(1280), Some(720)));
     assert_eq!(server.requests_for("/bars.ts").len(), 1, "{:?}", server.requests());
-    assert_eq!(server.max_concurrent(), 1);
+    assert_eq!(server.max_concurrent(), 1, "{:#?}", server.overlaps());
     relay.stop(false).await;
 }
 
@@ -316,12 +364,16 @@ async fn probe_and_stream_share_one_provider_request() {
 /// (§10). A closed feed's socket is gone by the time `close` returns (its `UpstreamClosed` frees
 /// the lease: mpv or the next load may connect at once). The socket closes on hyper's connection
 /// task some time after the proxy drops the response, so both have to wait for that, not only for
-/// the pump. The throttle keeps segment A mid-body when B is asked for.
+/// the pump. Tuner forks children while it streams (ffprobe, ffmpeg: [`Forks`]), each holding a
+/// copy of the sockets open at its fork until its exec; the provider still sees the connection
+/// close, as hyper half-closes it (FIN) before letting go. The throttle keeps segment A mid-body
+/// when B is asked for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cut_request_closes_before_the_next_one_connects() {
     use tuner::cast::relay::upstream::{FeedCtx, Pick, Proxy};
     let Some(media) = media() else { return };
     let server = TestServer::start(media, Faults::default());
+    let _forks = Forks::start();
     let proxy = Proxy::start().await.unwrap();
     let client = tv();
     let port = port_of(&server.base);
@@ -345,7 +397,7 @@ async fn a_cut_request_closes_before_the_next_one_connects() {
             server.max_concurrent(),
             1,
             "round {round}: a provider connection opened before the previous one closed: {:#?}",
-            server.requests()
+            server.overlaps()
         );
         drop((a, b));
         proxy.forget(&feed);
@@ -353,8 +405,51 @@ async fn a_cut_request_closes_before_the_next_one_connects() {
         feed.close(false).await;
     }
     assert_eq!(sockets_to(port), 0, "the last feed closed with its socket open");
-    assert_eq!(server.max_concurrent(), 1, "{:#?}", server.requests());
+    assert_eq!(server.max_concurrent(), 1, "{:#?}", server.overlaps());
     proxy.shutdown();
+}
+
+/// Children forked and exec'd all along, as the relay's (`pre_exec` makes it fork + exec), each
+/// 20 ms between the two (a big process, a loaded machine): each holds a copy of every socket
+/// open at its fork until its exec. Stops when dropped.
+struct Forks {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Forks {
+    fn start() -> Self {
+        use std::os::unix::process::CommandExt;
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let threads = (0..2)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let mut child = std::process::Command::new("true");
+                        // SAFETY: the hook only sleeps (nanosleep is async-signal-safe)
+                        unsafe {
+                            child.pre_exec(|| {
+                                std::thread::sleep(Duration::from_millis(20));
+                                Ok(())
+                            })
+                        };
+                        let _ = child.status();
+                    }
+                })
+            })
+            .collect();
+        Self { stop, threads }
+    }
+}
+
+impl Drop for Forks {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for t in self.threads.drain(..) {
+            let _ = t.join();
+        }
+    }
 }
 
 /// A load dropped mid-way (the session's `play` is cancelled by a zap or a stop) leaves nothing
