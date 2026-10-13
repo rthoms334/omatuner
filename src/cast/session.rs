@@ -35,7 +35,8 @@
 //! * **Positions** (§7.3): the receiver reports positions in its current playlist, which always
 //!   starts at 0; the item's offset (a `-ss` restart or a playlist view's first segment) is
 //!   added here, so the controller's snapshot, progress and `finished` stay true to the film.
-//!   `playbackInfo` is asked every 10 s while VOD or catch-up plays, and once before a stop.
+//!   The receiver reports them on its own (AirPlay: `playbackInfo` every 10 s while VOD or
+//!   catch-up plays, `Client::next_event`); the session asks once more before a stop.
 //! * **Test on TV** (§3.5, §8.5) runs the same machinery on the relay's lavfi test card, with no
 //!   provider and no controller: it passes at the TV's first `playing`.
 
@@ -69,8 +70,6 @@ pub struct Timings {
     pub fetch_watchdog: Duration,
     /// Segments fetched but no `playing` after this: one-step escalation (§8.3).
     pub stall: Duration,
-    /// `playbackInfo` while VOD or catch-up plays (§7.3).
-    pub position_every: Duration,
     /// The mDNS refresh before casting to a remembered TV (§6).
     pub refresh: Duration,
     /// The first-run pass's browse (§3.5).
@@ -89,7 +88,6 @@ impl Default for Timings {
         Self {
             fetch_watchdog: Duration::from_secs(10),
             stall: Duration::from_secs(15),
-            position_every: Duration::from_secs(10),
             refresh: Duration::from_secs(2),
             pass: Duration::from_secs(5),
             linger: Duration::from_secs(3),
@@ -108,8 +106,6 @@ const STOP: Duration = Duration::from_secs(2);
 const RELAY_STOP: Duration = Duration::from_secs(3);
 /// The final `playbackInfo` before Play here / Stop.
 const FINAL_POSITION: Duration = Duration::from_secs(1);
-/// A periodic `playbackInfo` (the estimate answers at once when the TV doesn't).
-const POSITION_WAIT: Duration = Duration::from_secs(3);
 /// A live pause longer than the sliding window (20 × 4 s segments, "about 80 s", §11.3)
 /// resumes by reloading at the live point.
 const LIVE_WINDOW: Duration = Duration::from_secs(80);
@@ -422,7 +418,6 @@ struct Current {
     position: Option<f64>,
     watchdog: Option<Instant>,
     stall: Option<Instant>,
-    position_due: Option<Instant>,
 }
 
 impl Current {
@@ -453,7 +448,7 @@ impl Current {
     }
 
     fn deadline(&self) -> Option<Instant> {
-        [self.watchdog, self.stall, self.position_due].into_iter().flatten().min()
+        [self.watchdog, self.stall].into_iter().flatten().min()
     }
 }
 
@@ -745,7 +740,6 @@ impl Session {
             position,
             watchdog: None,
             stall: None,
-            position_due: None,
         });
         self.set_phase(if job.seeking { CastPhase::Seeking } else { CastPhase::Starting });
         let relay = self.relay.as_mut().expect("connected");
@@ -1142,9 +1136,6 @@ impl Session {
                     out.push(RemoteEvent::Buffering(false));
                 }
                 (c.playing, c.seeking, c.watchdog, c.stall) = (true, false, None, None);
-                if first && !c.live {
-                    c.position_due = Some(Instant::now() + self.shared.timings.position_every);
-                }
                 out.extend([RemoteEvent::Phase(CastPhase::Playing), RemoteEvent::Playing { generation }]);
             }
             ReceiverEvent::Paused => {
@@ -1229,21 +1220,6 @@ impl Session {
                 self.fail(generation, PlayerErrorKind::Cast(CastErrorKind::ReceiverFailed));
             }
             return None;
-        }
-        if c.position_due.is_some_and(|t| t <= now) {
-            c.position_due = Some(now + self.shared.timings.position_every);
-            if c.paused.is_some() || !c.playing {
-                return None;
-            }
-            let (offset, dur) = (c.offset_s, c.duration);
-            let b = self.backend.as_mut()?;
-            if let Ok(Some(pos)) = tokio::time::timeout(POSITION_WAIT, b.position()).await {
-                let pos = pos + offset;
-                if let Some(c) = self.cur.as_mut() {
-                    c.position = Some(pos);
-                }
-                self.send(RemoteEvent::Position { generation, pos, dur });
-            }
         }
         None
     }
