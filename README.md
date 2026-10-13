@@ -271,7 +271,7 @@ fontconfig, JetBrains Mono Nerd Font, …):
 
 ```sh
 sha256sum -c --ignore-missing SHA256SUMS
-sudo pacman -U omatuner-0.2.4-1-x86_64.pkg.tar.zst     # or …-aarch64.pkg.tar.zst
+sudo pacman -U omatuner-0.2.5-1-x86_64.pkg.tar.zst     # or …-aarch64.pkg.tar.zst
 ```
 
 The package installs:
@@ -297,7 +297,7 @@ makepkg -si          # builds this checkout, smoke-tests the binary, installs th
 
 - `makepkg --nocheck -si` skips the smoke test. The test suite is `cargo test` (see Development).
 - The PKGBUILD builds the checkout it sits in (no download of the app itself), so check out the
-  tag you want first, e.g. `git checkout v0.2.4`.
+  tag you want first, e.g. `git checkout v0.2.5`.
 
 ### With cargo
 
