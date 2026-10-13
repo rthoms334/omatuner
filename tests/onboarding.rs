@@ -164,7 +164,8 @@ fn xtream_login_probes_imports_once_and_opens_live_tv() {
     let x = sources[0].xtream.as_ref().unwrap();
     assert_eq!(x.server, mock.base, "server normalized");
     assert_eq!((x.username.as_str(), x.password.expose().as_str()), ("demo", "s3cret-onboarding-1"));
-    assert!(!h.state().t.lib.live.channels.is_empty(), "channels are in the library");
+    // the library reloads after the import's job ended (a frame or more after "All set")
+    until(&mut h, "channels in the library", |h| !h.state().t.lib.live.channels.is_empty());
     assert!(h.query_all_by_label_contains("channels").next().is_some(), "Done shows the counts");
     // Open Live TV
     press(&mut h, Action::Activate);
@@ -292,7 +293,9 @@ fn m3u_file_without_a_guide_asks_for_one_and_imports() {
     }
     press(&mut h, Action::Activate); // Skip
     until(&mut h, "the import", |h| has(h, "All set"));
-    assert!(has(&h, "2 channels") || has_containing(&h, "2 channels"));
+    // the count reads the library, which reloads after the import's job ended: a frame or more
+    // after "All set" on a loaded machine
+    until(&mut h, "the channel count", |h| has_containing(h, "2 channels"));
     let sources = h.state().sources();
     assert_eq!(sources.len(), 1);
     assert_eq!((sources[0].name.as_str(), sources[0].kind), ("Holiday List", SourceKind::M3uFile));
