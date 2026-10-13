@@ -640,17 +640,16 @@ pub async fn probe_info(addr: SocketAddr) -> Result<features::AirPlayInfo, CastE
 }
 
 /// A pairing request (`/pair-pin-start`, `/pair-setup`, `/pair-verify`) with `variant`'s headers
-/// (`pair::headers`: `X-Apple-HKP`, `X-Apple-Client-Name`, …). HKP 5 adds
-/// `X-Apple-SupportedPINLengths: 4` on pin-start and `X-Apple-PD: 1` on pair-verify (foxCast,
-/// facts); the body is `application/octet-stream` (pyatv `_AIRPLAY_HEADERS`).
+/// from `pair` (`X-Apple-HKP`, `X-Apple-Client-Name`, the `application/octet-stream` body type,
+/// `User-Agent: AirPlay/320.20`; HKP 5 adds `X-Apple-SupportedPINLengths: 4` on pin-start and
+/// `X-Apple-PD: 1` on pair-verify, foxCast, facts).
 fn pairing_request(path: &str, variant: PairVariant, identity: &Identity) -> Request {
-    let req = pair::headers(variant, identity).into_iter().fold(Request::http("POST", path), |r, (k, v)| r.header(k, v));
-    let req = req.header_once("Content-Type", "application/octet-stream");
-    match (variant, path) {
-        (PairVariant::Hkp5, "/pair-pin-start") => req.header_once("X-Apple-SupportedPINLengths", 4),
-        (PairVariant::Hkp5, "/pair-verify") => req.header_once("X-Apple-PD", 1),
-        _ => req,
-    }
+    let headers = match path {
+        "/pair-pin-start" => pair::pin_start_headers(variant, identity),
+        "/pair-verify" => pair::verify_headers(variant, identity),
+        _ => pair::headers(variant, identity),
+    };
+    headers.into_iter().fold(Request::http("POST", path), |r, (k, v)| r.header(k, v))
 }
 
 fn random_bytes<const N: usize>() -> [u8; N] {

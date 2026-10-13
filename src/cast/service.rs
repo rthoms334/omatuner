@@ -443,17 +443,23 @@ impl Shared {
         }
     }
 
-    /// A session's `/info` (Settings shows the TV's current version; `diagnose`).
-    pub(crate) fn learned(&self, id: DeviceId, info: &ReceiverInfo) {
+    /// A session's `/info` (Settings shows the TV's current version; `diagnose`): the info with
+    /// the OS version joined with what discovery knew ("27.0" + "(23L773)").
+    pub(crate) fn learned(&self, id: DeviceId, info: &ReceiverInfo) -> ReceiverInfo {
+        let mut info = info.clone();
         let row = {
             let mut reg = lock(&self.registry);
-            reg.learned(id, info);
+            reg.learned(id, &info);
+            if let Some(d) = reg.get(id) {
+                info.os_version = d.os_version.clone();
+            }
             reg.get(id).filter(|d| d.usability == Usability::Usable).and_then(|_| reg.stored(id, crate::model::now()))
         };
         if let Some(row) = row {
             let _ = self.writer().submit(move |c| crate::store::cast::upsert_device(c, &row));
         }
         lock(&self.last).info = Some((id, info.clone()));
+        info
     }
 
     /// The last cast failure (the agent's `status.casting.error`; kept after casting ended).
@@ -582,18 +588,13 @@ impl Shared {
     }
 }
 
-/// `/pair-pin-start` with `variant`; a TV that refuses HKP 3 (a status other than 200 / 453, or
-/// 470) gets HKP 5 once (DESIGN §40 §7.2, the ladder). A Mac's 403 and an unreachable TV don't
-/// move down.
-async fn pin_start(addr: SocketAddr, identity: &Identity, variant: PairVariant) -> std::result::Result<PairingSession, PairError> {
-    match PairingSession::start(addr, identity, variant).await {
-        Err(PairError::Refused { .. }) if variant == PairVariant::Hkp3 => PairingSession::start(addr, identity, variant.next()).await,
-        r => r,
-    }
-}
-
 /// One pairing: holds the connection while the user types; a wrong PIN keeps it (the TV shows
 /// a new code), anything else drops it until **Show a new code**.
+///
+/// The HKP 3 → HKP 5 ladder (DESIGN §40 §7.2) runs inside [`PairingSession`] on the pairing
+/// connection: a refused pin-start climbs in `start`, and a 470 at M2–M4 under HKP 3 makes
+/// `finish` ask for a new code with HKP 5 and answer `WrongPin` ("The TV is showing a new
+/// one"); `variant()` then says which variant shows the code. A `Refused` is final.
 async fn pair_task(shared: Arc<Shared>, job: u64, device: DeviceId, mut ops: UnboundedReceiver<PairOp>) {
     let set = |s: PairState| shared.set_pair(job, s);
     let identity = match shared.ensure_identity().await {
@@ -605,7 +606,7 @@ async fn pair_task(shared: Arc<Shared>, job: u64, device: DeviceId, mut ops: Unb
     };
     let Some(addr) = shared.resolve(device).await else { return set(PairState::Failed(PairError::Unreachable)) };
     let mut variant = PairVariant::Hkp3;
-    let mut session = match pin_start(addr, &identity, variant).await {
+    let mut session = match PairingSession::start(addr, &identity, variant).await {
         Ok(s) => {
             variant = s.variant();
             set(PairState::EnterCode { variant });
@@ -659,20 +660,10 @@ async fn pair_task(shared: Arc<Shared>, job: u64, device: DeviceId, mut ops: Unb
                         }
                         return;
                     }
-                    // the TV shows a new code on the same connection
-                    Err(PairError::WrongPin) => set(PairState::Failed(PairError::WrongPin)),
-                    // 470 at M2–M4 on HKP 3: down the ladder (a new code on the TV)
-                    Err(PairError::Refused { .. }) if variant == PairVariant::Hkp3 => {
-                        session = None; // closes the pairing connection
-                        set(PairState::Starting);
-                        match PairingSession::start(addr, &identity, variant.next()).await {
-                            Ok(s) => {
-                                variant = s.variant();
-                                set(PairState::EnterCode { variant });
-                                session = Some(s);
-                            }
-                            Err(e) => set(PairState::Failed(e)),
-                        }
+                    // the TV shows a new code on the same connection (maybe with HKP 5 now)
+                    Err(PairError::WrongPin) => {
+                        variant = s.variant();
+                        set(PairState::Failed(PairError::WrongPin));
                     }
                     Err(e) => {
                         session = None; // closes the pairing connection

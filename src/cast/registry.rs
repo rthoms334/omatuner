@@ -99,7 +99,7 @@ impl Registry {
         d.name = sanitize_name(&s.name, super::discovery::FALLBACK_NAME);
         d.kind = s.kind;
         d.model = s.model.or(d.model.take());
-        d.os_version = s.os_version.or(d.os_version.take());
+        d.os_version = crate::cast::merge_os_version(d.os_version.take(), s.os_version);
         d.usability = s.usability;
         d.experimental = s.experimental;
         d.available = true;
@@ -172,7 +172,7 @@ impl Registry {
         if let Some(e) = self.entries.get_mut(&id) {
             let clean = |s: &Option<String>| s.as_deref().map(|v| sanitize_name(v, "")).filter(|v| !v.is_empty());
             e.device.model = clean(&info.model).or(e.device.model.take());
-            e.device.os_version = clean(&info.os_version).or(e.device.os_version.take());
+            e.device.os_version = crate::cast::merge_os_version(e.device.os_version.take(), clean(&info.os_version));
             e.source_version = clean(&info.source_version).or(e.source_version.take());
         }
     }

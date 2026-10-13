@@ -595,9 +595,8 @@ impl Session {
         }
         if self.backend.is_none() {
             let backend = self.shared.links.connect(&self.device, &self.creds).await?;
-            let info = backend.info();
+            let info = self.shared.learned(self.device.id, &backend.info());
             log_receiver(&self.device, &info);
-            self.shared.learned(self.device.id, &info);
             self.backend = Some(backend);
             self.loaded = false;
         }

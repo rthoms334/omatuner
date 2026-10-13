@@ -69,10 +69,7 @@ pub fn sighting(info: &features::AirPlayInfo, addr: SocketAddr, key: String, man
     let class = features::classify(info)?;
     let id = features::device_id(info)?;
     let clean = |s: &Option<String>| s.as_deref().map(|v| sanitize_name(v, "")).filter(|v| !v.is_empty());
-    let os_version = match (clean(&info.os_version), clean(&info.os_build)) {
-        (Some(v), Some(b)) => Some(format!("{v} ({b})")),
-        (v, b) => v.or(b),
-    };
+    let os_version = crate::cast::os_version_text(clean(&info.os_version), clean(&info.os_build));
     Some(Sighting {
         id,
         key,

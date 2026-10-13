@@ -513,9 +513,52 @@ pub fn sanitize_name(raw: &str, fallback: &str) -> String {
     if out.is_empty() { fallback.to_owned() } else { out }
 }
 
+/// The OS version Settings, `diagnose` and the session's log line show: "26.6 (23L773)".
+/// The TXT record carries the version (`osvers`) and the Apple TV's `/info` only the build
+/// (`osBuildVersion`, no `osVersion`), so a build alone is "(23L773)" and
+/// [`merge_os_version`] joins the halves.
+pub fn os_version_text(version: Option<String>, build: Option<String>) -> Option<String> {
+    match (version, build) {
+        (Some(v), Some(b)) => Some(format!("{v} ({b})")),
+        (Some(v), None) => Some(v),
+        (None, Some(b)) => Some(format!("({b})")),
+        (None, None) => None,
+    }
+}
+
+/// `new` ([`os_version_text`]) over what was known: each half that `new` lacks is kept, except
+/// that a new version drops the old build (the TV updated; its build comes with the next
+/// `/info`).
+pub fn merge_os_version(old: Option<String>, new: Option<String>) -> Option<String> {
+    fn split(s: Option<String>) -> (Option<String>, Option<String>) {
+        let Some(s) = s else { return (None, None) };
+        match s.strip_suffix(')').and_then(|s| s.rsplit_once('(')) {
+            Some((v, b)) => (Some(v.trim().to_owned()).filter(|v| !v.is_empty()), Some(b.to_owned())),
+            None => (Some(s), None),
+        }
+    }
+    let ((ov, ob), (nv, nb)) = (split(old), split(new));
+    let keep_build = nv.is_none() || nv == ov;
+    let build = nb.or(if keep_build { ob } else { None });
+    os_version_text(nv.or(ov), build)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Apple TV's TXT version and its `/info` build meet in one line, in either order; an
+    /// update drops the old build.
+    #[test]
+    fn os_version_halves_merge() {
+        let s = |v: &str| Some(v.to_owned());
+        assert_eq!(merge_os_version(s("27.0"), s("(23L773)")), s("27.0 (23L773)"));
+        assert_eq!(merge_os_version(s("27.0 (23L773)"), s("27.0")), s("27.0 (23L773)"));
+        assert_eq!(merge_os_version(s("26.6 (23L773)"), s("27.0")), s("27.0"));
+        assert_eq!(merge_os_version(s("27.0"), s("26.6 (23L773)")), s("26.6 (23L773)"));
+        assert_eq!(merge_os_version(None, s("(23L773)")), s("(23L773)"));
+        assert_eq!(merge_os_version(s("26.5"), None), s("26.5"));
+    }
 
     #[test]
     fn device_strings_are_sanitized() {

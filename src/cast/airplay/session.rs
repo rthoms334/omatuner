@@ -385,7 +385,6 @@ impl Session {
         let stream_id = queue::int(stream.get("streamID")).unwrap_or(1);
 
         let info = receiver_info(&ap, creds.peer.variant);
-        log_session(&ap, creds.peer.variant, profile);
         let session_id = conn.session_id();
         let session = Self { control: Some(Control::spawn(conn, raw_tx)), events, uri, session_id, stream_id, spelling: Spelling::new(profile) };
         Ok((session, info, raw_rx))
@@ -488,33 +487,11 @@ fn clean(s: &Option<String>) -> Option<String> {
 }
 
 /// What the session learned (device strings sanitized: they are shown in Settings and logged).
-/// `/info` carries the build (`23L773`); the version number (`26.6`) comes from the TXT record,
-/// which the registry has.
+/// The Apple TV's `/info` carries only the build ("(23L773)"); the registry joins it with the TXT
+/// version (`merge_os_version`) and the session logs the joined line (DESIGN §40 §7.6).
 pub fn receiver_info(ap: &AirPlayInfo, variant: PairVariant) -> ReceiverInfo {
-    let os_version = match (clean(&ap.os_version), clean(&ap.os_build)) {
-        (Some(v), Some(b)) => Some(format!("{v} ({b})")),
-        (v, b) => v.or(b),
-    };
+    let os_version = crate::cast::os_version_text(clean(&ap.os_version), clean(&ap.os_build));
     ReceiverInfo { model: clean(&ap.model), os_version, source_version: clean(&ap.source_version), pairing: Some(variant) }
-}
-
-/// The one INFO line per session, without addresses (DESIGN §40 §7.6):
-/// `cast: AppleTV14,1 tvOS 26.6 (23L773) AirPlay 960.13.1 pairing=hkp3 timing=ptp`.
-fn log_session(ap: &AirPlayInfo, variant: PairVariant, profile: Profile) {
-    let model = clean(&ap.model).unwrap_or_else(|| "AirPlay TV".to_owned());
-    let os = match (clean(&ap.os_version), clean(&ap.os_build)) {
-        (Some(v), Some(b)) => format!("{v} ({b})"),
-        (Some(v), None) => v,
-        (None, Some(b)) => format!("({b})"),
-        (None, None) => String::new(),
-    };
-    let os = match profile {
-        Profile::AppleTv if !os.is_empty() => format!(" tvOS {os}"),
-        _ if !os.is_empty() => format!(" {os}"),
-        _ => os,
-    };
-    let source = clean(&ap.source_version).unwrap_or_else(|| "?".to_owned());
-    tracing::info!("cast: {model}{os} AirPlay {source} pairing={} timing=ptp", variant.as_str());
 }
 
 #[cfg(test)]
