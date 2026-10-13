@@ -480,6 +480,11 @@ pub trait CastApi: Send + Sync {
     /// (`cast_hint.forced`) and restart its pipeline at L3 (a replace on the same session, the
     /// same load generation). Nothing when nothing casts.
     fn convert_current(&self) {}
+    /// **Send as is** (shown instead of Convert this channel when `CastView::as_is`): forget
+    /// the item's remembered conversion on its TV (`cast_hint.forced` and a remembered L2
+    /// failure) and load it again without converting, where the TV is (§8.3). Nothing when
+    /// nothing casts.
+    fn send_as_is(&self) {}
 
     // ---- the agent (`status.casting.error`, `diagnose`)
     /// The last cast failure (kept after casting ended, e.g. `StoppedOnTv`).

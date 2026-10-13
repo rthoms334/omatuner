@@ -99,6 +99,10 @@ pub struct Prepared {
     pub behind_live_s: Option<u16>,
     /// The TV gets a multivariant playlist with a surround rendition (§8.4).
     pub surround: bool,
+    /// L3 only because it was forced (Convert this channel, a remembered L2 failure, the
+    /// session's escalation): the plan alone would copy the picture, so **Send as is** can
+    /// undo it (§8.3). False when the format needs converting.
+    pub as_is: bool,
 }
 
 /// What the relay reports. The `Upstream*`, `Http` and `ProviderText` events become the same
@@ -207,6 +211,8 @@ struct Pipeline {
     offset_s: f64,
     /// The item (the pinned target's key).
     media: Option<MediaRef>,
+    /// [`Prepared::as_is`].
+    as_is: bool,
     out: Arc<server::Output>,
     feed: Option<Arc<upstream::Feed>>,
     /// Ends the monitor quietly (it kills ffmpeg first).
@@ -270,6 +276,8 @@ struct Launch {
     feed: Option<Arc<upstream::Feed>>,
     generation: Arc<AtomicU64>,
     watch_speed: bool,
+    /// [`Prepared::as_is`].
+    as_is: bool,
 }
 
 /// The multivariant playlist's inputs from the plan and the probe ([`renditions::Master`]).
@@ -438,6 +446,10 @@ impl RelaySession {
                 feed: Some(feed.clone()),
                 generation: generation.clone(),
                 watch_speed: live && plan.level == CastLevel::Converted,
+                // the same facts and settings without the force: would it copy the picture?
+                as_is: plan.level == CastLevel::Converted
+                    && opts.force == Some(CastLevel::Converted)
+                    && plan::plan(spec.receiver, &facts, plan::Options { force: None, ..opts }).is_ok_and(|p| p.level != CastLevel::Converted),
             };
             match self.launch(&caps, launch).await {
                 Ok(prepared) => return Ok(prepared),
@@ -669,6 +681,7 @@ impl RelaySession {
                 level: l.level,
                 offset_s: l.offset_s,
                 media: l.media.clone(),
+                as_is: l.as_is,
                 out,
                 feed: l.feed.clone(),
                 stop,
@@ -682,7 +695,7 @@ impl RelaySession {
                 feed.close(false).await;
             }
             let load = LoadReq { url: Secret::new(url), live: l.live, offset_s: l.offset_s };
-            return Ok(Prepared { load, level: l.level, behind_live_s, surround: l.surround.is_some() });
+            return Ok(Prepared { load, level: l.level, behind_live_s, surround: l.surround.is_some(), as_is: l.as_is });
         }
         Err(Fail::Exited)
     }
@@ -722,7 +735,7 @@ impl RelaySession {
         tracing::debug!("{}: view from segment {} ({start:.1} s)", self.label, firsts[0]);
         lan.grant_only(token, p.out.clone(), Some(firsts));
         let load = LoadReq { url: Secret::new(url), live: false, offset_s: p.offset_s + start };
-        Ok(Some(Prepared { load, level: p.level, behind_live_s: None, surround: p.out.renditions.len() > 1 }))
+        Ok(Some(Prepared { load, level: p.level, behind_live_s: None, surround: p.out.renditions.len() > 1, as_is: p.as_is }))
     }
 
     /// Seconds into the item where the last segment ffmpeg has written starts: how far a
@@ -776,6 +789,7 @@ impl RelaySession {
             feed: None,
             generation: Arc::new(AtomicU64::new(generation)),
             watch_speed: false,
+            as_is: false,
         };
         match self.launch(&caps, launch).await {
             Ok(p) => Ok(p),

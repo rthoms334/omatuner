@@ -63,6 +63,9 @@ pub enum RemoteCmd {
 pub enum RemoteEvent {
     Phase(CastPhase),
     Level(CastLevel),
+    /// Sent with each `Level`: L3 only because it was forced, so **Send as is** can undo it
+    /// (`CastView::as_is`, DESIGN §40 §8.3).
+    AsIs(bool),
     UpstreamOpened {
         generation: u64,
     },

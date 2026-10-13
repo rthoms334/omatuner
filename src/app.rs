@@ -6427,6 +6427,7 @@ mod tests {
             kind: crate::model::cast::ReceiverKind::AppleTv,
             phase: crate::model::CastPhase::Playing,
             level: None,
+            as_is: false,
             behind_live_s: Some(15),
             can_seek: false,
             volume: false,

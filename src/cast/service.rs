@@ -963,6 +963,12 @@ impl CastApi for Api {
         }
     }
 
+    fn send_as_is(&self) {
+        if let Some(live) = lock(&self.0.live).as_ref() {
+            let _ = live.ctl.send(Ctl::AsIs);
+        }
+    }
+
     fn last_error(&self) -> Option<CastErrorKind> {
         lock(&self.0.last).error
     }
@@ -1011,6 +1017,7 @@ impl CastApi for Api {
             kind: device.kind,
             phase: CastPhase::Connecting,
             level: None,
+            as_is: false,
             behind_live_s: None,
             can_seek: true,
             // AirPlay has no verified volume path ("Use the TV remote for volume")

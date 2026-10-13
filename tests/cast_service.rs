@@ -385,7 +385,9 @@ fn stopped_on_the_tv_releases_the_upstream_before_lost() {
 }
 
 /// The playlist guard tripping escalates L2 → L3 once (a replace under the same generation) and
-/// marks the item irregular; the next cast of it starts at L3 straight away (§8.3).
+/// remembers the L2 failure (irregular, under today's logic); the next cast of it starts at L3
+/// straight away (§8.3). There the player menu offers **Send as is**: it forgets the failure and
+/// loads the item again on L2, whose first picture leaves nothing that converts it.
 #[test]
 fn an_irregular_playlist_escalates_once_and_the_next_cast_starts_converted() {
     let r = rig("tuner-cast-service-escalate", calm());
@@ -413,12 +415,29 @@ fn an_irregular_playlist_escalates_once_and_the_next_cast_starts_converted() {
     out.cmd.send(RemoteCmd::Close { fast: false }).unwrap();
     until("the relay stops", || relay.with(|s| s.calls.iter().any(|c| matches!(c, RelayCall::Stop { .. }))));
 
-    let _tv = r.links.receiver();
+    let tv = r.links.receiver();
     let relay = r.links.relay();
     let out = r.cast.open(tv_id()).unwrap();
     load(&out, 7, channel("ch:sport"));
     until("the load", || relay.with(|s| !s.calls.is_empty()));
     assert!(matches!(relay.with(|s| s.calls[0].clone()), RelayCall::Load { generation: 7, force: Some(CastLevel::Converted), .. }));
+    let sport = item(ItemKind::Channel, "ch:sport");
+    let hint = |r: &Rig| {
+        let sport = sport.clone();
+        r.store.writer().blocking(move |c| tuner::store::cast::hint(c, &sport, tv_id())).unwrap().unwrap()
+    };
+    let h = hint(&r);
+    assert!(h.irregular && h.l2_failed_logic == Some(tuner::store::cast::L2_FAILURE_LOGIC), "{h:?}");
+    // converted only because of that: Send as is applies
+    wait_event(&out.events, "Send as is offered", |e| *e == RemoteEvent::AsIs(true));
+    r.cast.send_as_is();
+    until("the reload as is", || relay.with(|s| s.calls.len() == 2));
+    assert!(matches!(relay.with(|s| s.calls[1].clone()), RelayCall::Load { generation: 7, force: None, .. }));
+    wait_event(&out.events, "Send as is gone", |e| *e == RemoteEvent::AsIs(false));
+    tv.emit(ReceiverEvent::Playing);
+    until("the L2 picture is cached", || hint(&r).level == Some(CastLevel::Repackaged));
+    let h = hint(&r);
+    assert!(!h.irregular && h.l2_failed_at.is_none() && h.force(tuner::model::now()).is_none(), "{h:?}");
 }
 
 /// Every reload of the item under the same generation continues where the TV is now (§7.3):

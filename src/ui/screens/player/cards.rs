@@ -20,8 +20,9 @@ pub(super) struct NextEpisode {
 
 pub(super) const NEXT_EPISODE_DELAY: Duration = Duration::from_secs(10);
 
-/// The player menu's "Play here" and "Convert this channel" (codes above typed digits and the
-/// Ctrl+O copies, below multi-view's `CLOSE_OTHER`).
+/// The player menu's "Send as is", "Play here" and "Convert this channel" (codes above typed
+/// digits and the Ctrl+O copies, below multi-view's `CLOSE_OTHER`).
+pub(super) const CAST_AS_IS: u8 = 247;
 pub(super) const CAST_PLAY_HERE: u8 = 248;
 pub(super) const CAST_CONVERT: u8 = 249;
 
@@ -276,7 +277,10 @@ impl PlayerScreen {
     }
 
     /// The player menu's casting items: "Cast to a TV…" (also to switch TV), and while casting
-    /// Stop casting, Play here and Convert this channel (L3 for this item on this TV).
+    /// Stop casting, Play here and Convert this channel (L3 for this item on this TV). When the
+    /// TV is fed L3 only because it was forced, a remembered choice or failure (`as_is`), that
+    /// last slot is **Send as is**, which forgets it (DESIGN §40 §3.3, §8.3); a format that
+    /// needs converting leaves Convert this channel greyed.
     pub(super) fn cast_menu_items(&self, ctx: &UiCtx<'_>, k: KeyContext) -> Vec<crate::ui::overlays::MenuItem> {
         let Some(view) = ctx.player.cast.as_ref() else {
             return if crate::cast::on(ctx.config) {
@@ -285,11 +289,16 @@ impl PlayerScreen {
                 Vec::new()
             };
         };
+        let converted = view.level == Some(crate::model::CastLevel::Converted);
         vec![
             menu_item(glyphs::CAST_CONNECTED, "Cast to a TV…", Action::CastMenu, true, k),
             menu_item(glyphs::STOP, "Stop casting", Action::StopCasting, true, k),
             menu_item(glyphs::PLAY, "Play here", Action::Digit(CAST_PLAY_HERE), true, k),
-            menu_item(glyphs::SYNC, "Convert this channel", Action::Digit(CAST_CONVERT), view.level != Some(crate::model::CastLevel::Converted), k),
+            if converted && view.as_is {
+                menu_item(glyphs::SYNC, "Send as is", Action::Digit(CAST_AS_IS), true, k)
+            } else {
+                menu_item(glyphs::SYNC, "Convert this channel", Action::Digit(CAST_CONVERT), !converted, k)
+            },
         ]
     }
 

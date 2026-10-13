@@ -280,7 +280,7 @@ The glyphs are nf-md `cast` / `cast_connected`. Check their codepoints against t
   | Converting picture | L3 is active (§8.3). |
 
 - Buttons: **Stop casting** and **Play here**. Error states add their own action (§3.4).
-- The player menu gets **Stop casting**, **Play here** and **Convert this channel** (L3 for this item on this TV, remembered).
+- The player menu gets **Stop casting**, **Play here** and **Convert this channel** (L3 for this item on this TV, remembered). When the TV is fed L3 only because it was forced (that choice, or an L2 failure remembered for the item on this TV, §8.3), the last item is **Send as is** instead: it forgets both and loads the item again as the plan alone decides, where the TV is, with the escalation step back.
 
 **The OSD while casting**
 - The controls row stays. Controls that do nothing on the TV are hidden: audio track, subtitles, aspect and zoom.
@@ -1198,7 +1198,7 @@ TV ◀──────── LAN server <lan-ip>:47800 /c/<tok>/… (token, pe
   - **A longer segment** (its rounded `EXTINF` above the target) is held back with everything after it, and the session restarts the item where the TV is, at the same level, under a pin that covers it (its length + 2 s): a replace with a new token, a new playlist, no changed TARGETDURATION. A segment beyond 30 s is a violation: keyframes that sparse need converting.
   - **Revision 2 raised the target mid-stream** and counted each raise as a violation: the 2026-10-13 film (HEVC, segments of 10.09 s and 12.10 s) was "irregular" after two and went to L3, at 700 % CPU on the M2, and restarted. A long GOP is no irregular source.
 - **IDR check.** The first video access unit of each new segment is checked for an IDR (H.264 NAL type 5, HEVC IRAP 16–21). Apple rule 7.4 requires it, and ffmpeg copy mode may cut on recovery-point I-frames.
-- **Escalation.** Two violations (missing IDRs, or a segment past any target) in a session mark the item "irregular" in `cast_hint`, and its next start uses L3, where forced keyframes fix them.
+- **Escalation.** Two violations (missing IDRs, or a segment past any target) in a session escalate an L2 generation and are remembered as an "irregular" L2 failure in `cast_hint` (§8.3), so its next start uses L3, where forced keyframes fix them.
 - **Start.** EVENT playlists say `#EXT-X-START:TIME-OFFSET=0`, so the TV starts where the relay started (§7.3).
 - The guard never adds absolute URLs; ffmpeg writes relative segment names.
 
@@ -1212,7 +1212,7 @@ TV ◀──────── LAN server <lan-ip>:47800 /c/<tok>/… (token, pe
 
 1. The receiver profile (Apple TV / third-party AirPlay TV; Chromecast models in Phase 2).
 2. The user's per-item override ("Convert this channel" → L3).
-3. The cached `cast_hint(item, receiver)`: which level worked, interlaced, codecs.
+3. The cached `cast_hint(item, receiver)`: an L2 failure remembered under today's logic (→ L3), interlaced, codecs.
 4. mpv's hints when moving the item that's playing.
 5. ffprobe on the head buffer (or with Range on VOD).
 
@@ -1249,6 +1249,8 @@ plan(receiver, kind, hints, cfg) →
 - the TV fetched segments but never reached `playing` within 15 s;
 - the TV reported a failure;
 - the playlist guard tripped (missing IDRs, a segment past any target).
+
+**What is remembered** (`cast_hint`, `store::cast`). The step records an *L2 failure* for the item on that TV: when, whether the guard found it (`irregular`), and the version of the relay logic that judged it (`L2_FAILURE_LOGIC`). Verdicts are versioned because the logic changes: on 2026-10-13 the guard of the morning called a long-GOP HEVC film irregular, and the row it left sent every later cast of the film straight to L3 under the fixed guard. So a failure forces L3 only when today's logic judged it, for 30 days counted from the failure (L3 pictures don't extend it), and the first L2 picture of the item on that TV clears it, as does **Send as is** (§3.3). A cached `level` never forces L3 by itself: a format that needs converting is re-decided from its codecs. Bump `L2_FAILURE_LOGIC` with any change to what counts as a failure.
 
 A segment that outgrows the pinned target is no reason to escalate: it restarts the item at the same level (§8.1.4). A surround item the TV fails (either of the first two) goes again in stereo first, at the same level and place, without spending the step; ffmpeg failing to make the renditions does the same inside the relay.
 

@@ -1256,6 +1256,12 @@ impl Controller {
                 }
                 self.force_publish = true;
             }
+            RemoteEvent::AsIs(on) => {
+                if let Some(v) = &mut self.snap.cast {
+                    v.as_is = *on;
+                }
+                self.force_publish = true;
+            }
             RemoteEvent::BehindLive(s) => {
                 if let Some(v) = &mut self.snap.cast {
                     v.behind_live_s = *s;

@@ -325,6 +325,7 @@ impl FakeRelay {
             level,
             behind_live_s: live.then_some(15),
             surround,
+            as_is: false,
         }
     }
 
@@ -334,7 +335,9 @@ impl FakeRelay {
         self.record(RelayCall::Load { generation: spec.generation, force: spec.force, start_at, hints: spec.hints, stereo: spec.stereo })?;
         let offset = if live { 0.0 } else { start_at.unwrap_or(0.0) };
         let surround = !spec.stereo && self.state.lock().unwrap_or_else(|e| e.into_inner()).surround;
-        Ok(self.prepared(live, offset, spec.force.unwrap_or(CastLevel::Repackaged), surround))
+        // the fake's format never needs converting: a forced L3 is all that converts it
+        let level = spec.force.unwrap_or(CastLevel::Repackaged);
+        Ok(Prepared { as_is: level == CastLevel::Converted, ..self.prepared(live, offset, level, surround) })
     }
 
     fn view(&self, generation: u64, at_s: f64) -> Result<Option<Prepared>, CastErrorKind> {
@@ -371,6 +374,9 @@ impl FakeRelayRemote {
 pub(crate) enum Ctl {
     /// **Convert this channel**: L3 for what plays now (a replace, same generation).
     Convert,
+    /// **Send as is**: forget the item's remembered conversion on this TV and, when that is
+    /// all that converts it, load it again without (a replace, same generation).
+    AsIs,
     /// Test on TV: play the relay's test card.
     TestCard,
     /// The service ends the session (another cast took over, or shutdown).
@@ -422,6 +428,8 @@ struct Current {
     /// The TV got surround renditions (§8.4); `stereo`: this generation was asked for none.
     surround: bool,
     stereo: bool,
+    /// L3 only because it was forced (`relay::Prepared::as_is`): **Send as is** applies.
+    as_is: bool,
     /// Seconds into the item where the TV's playlist starts.
     offset_s: f64,
     live: bool,
@@ -590,6 +598,7 @@ impl Session {
                 }
                 Next::Cmd(Some(cmd)) => self.command(cmd, &mut deferred).await,
                 Next::Ctl(Ctl::Convert) => self.convert().await,
+                Next::Ctl(Ctl::AsIs) => self.as_is().await,
                 Next::Ctl(Ctl::TestCard) => {
                     Some(Job { generation: 0, source: Source::TestCard, force: None, escalated: true, seeking: false, stereo: false })
                 }
@@ -783,6 +792,7 @@ impl Session {
             escalated: job.escalated || force == Some(CastLevel::Converted),
             surround: false,
             stereo: job.stereo,
+            as_is: false,
             offset_s: 0.0,
             live,
             duration,
@@ -827,8 +837,10 @@ impl Session {
             c.level = prepared.level;
             c.offset_s = prepared.load.offset_s;
             c.surround = prepared.surround;
+            c.as_is = prepared.as_is;
         }
         self.send(RemoteEvent::Level(prepared.level));
+        self.send(RemoteEvent::AsIs(prepared.as_is));
         self.send(RemoteEvent::BehindLive(prepared.behind_live_s));
         match self.insert(&prepared.load).await {
             Ok(()) => {}
@@ -854,7 +866,16 @@ impl Session {
         match self.shared.writer().run(move |c| crate::store::cast::hint(c, &item, device)).await {
             Ok(Some(h)) => {
                 h.fill(&mut hints, now);
-                (h.force(now), hints)
+                let force = h.force(now);
+                if force.is_some() {
+                    let why = match (h.forced, h.irregular) {
+                        (true, _) => "Convert this channel",
+                        (false, true) => "its playlist was irregular here before",
+                        (false, false) => "the TV failed it as is before",
+                    };
+                    tracing::info!("cast session {}: converting ({why})", self.device.id.short());
+                }
+                (force, hints)
             }
             Ok(None) => (None, hints),
             Err(e) => {
@@ -1036,11 +1057,14 @@ impl Session {
         Some(Job { force: Some(CastLevel::Converted), escalated: true, ..Job::again(c, at) })
     }
 
-    /// One step L2 → L3 (§8.3), cached for the item and TV at once: L2's 15 s and L3's own start
-    /// (a new relay load, two real-time live segments, the replace) can outlast the controller's
-    /// 30 s load timeout, and its retry (a new generation) then starts converted instead of on L2
-    /// again. The first picture confirms the level (`remember`). It continues where the TV is.
-    async fn escalate(&mut self, why: &str) -> Option<Job> {
+    /// One step L2 → L3 (§8.3), remembered for the item and TV at once as an L2 failure
+    /// (`store::cast::l2_failed`, under today's `L2_FAILURE_LOGIC`; `irregular`: the playlist
+    /// guard's): L2's 15 s and L3's own start (a new relay load, two real-time live segments,
+    /// the replace) can outlast the controller's 30 s load timeout, and its retry (a new
+    /// generation) then starts converted instead of on L2 again. The first L2 picture of the item
+    /// on this TV clears it again (`remember`), as does **Send as is**. It continues where the
+    /// TV is.
+    async fn escalate(&mut self, why: &str, irregular: bool) -> Option<Job> {
         self.cur.as_ref().filter(|c| c.can_escalate())?;
         let at = self.here().await;
         let c = self.cur.as_mut()?;
@@ -1053,9 +1077,29 @@ impl Session {
         tracing::info!("cast session {}: converting ({why})", self.device.id.short());
         if let Some((item, seen)) = cache {
             let (device, now) = (self.device.id, crate::model::now());
-            let _ = self.shared.writer().submit(move |conn| crate::store::cast::save_hint(conn, &item, device, CastLevel::Converted, &seen, now));
+            let _ = self.shared.writer().submit(move |conn| crate::store::cast::l2_failed(conn, &item, device, irregular, &seen, now));
         }
         Some(job)
+    }
+
+    /// **Send as is** (§3.3, §8.3): forget why the item converts on this TV (Convert this
+    /// channel, a remembered L2 failure) and, when the TV is fed L3 only for that reason
+    /// ([`Current::as_is`]), load it again where the TV is as the plan alone decides, with the
+    /// escalation step back: a real failure escalates (and is remembered) again, an L2
+    /// picture confirms the item plays as is.
+    async fn as_is(&mut self) -> Option<Job> {
+        let c = self.cur.as_ref()?;
+        let item = c.playable()?.item.clone();
+        if let Some(item) = item {
+            let device = self.device.id;
+            // the writer runs in order: the reload's `hinted` reads the row after this
+            let _ = self.shared.writer().submit(move |conn| crate::store::cast::clear_convert(conn, &item, device));
+        }
+        self.cur.as_ref().filter(|c| c.as_is)?;
+        tracing::info!("cast session {}: sending as is (the conversion is forgotten)", self.device.id.short());
+        let at = self.here().await;
+        let c = self.cur.as_ref()?;
+        Some(Job { force: None, escalated: false, ..Job::again(c, at) })
     }
 
     /// The TV didn't play a surround item (§8.4): the same item, level and place in stereo, once;
@@ -1161,12 +1205,11 @@ impl Session {
                 None
             }
             RelayEvent::Irregular { generation } => {
-                let c = self.cur.as_ref().filter(|c| c.generation == generation)?;
-                if let Some(item) = c.playable().and_then(|p| p.item.clone()) {
-                    let (device, now) = (self.device.id, crate::model::now());
-                    let _ = self.shared.writer().submit(move |conn| crate::store::cast::mark_irregular(conn, &item, device, now));
-                }
-                self.escalate("irregular playlist").await
+                // only real failures since da47cd9: missing IDRs, or a segment past any target
+                // (a longer GOP is `TargetOverflow`); remembered by `escalate`, which only an
+                // L2 generation takes (an L3 one has its keyframes forced)
+                self.cur.as_ref().filter(|c| c.generation == generation)?;
+                self.escalate("irregular playlist", true).await
             }
             RelayEvent::TargetOverflow { generation } => {
                 // a longer GOP than the pinned target covers: the same level, where the TV is
@@ -1205,7 +1248,7 @@ impl Session {
                     }
                     if self.cur.as_ref().is_some_and(Current::can_escalate) {
                         self.drop_backend().await;
-                        return self.escalate("the TV couldn't play it").await;
+                        return self.escalate("the TV couldn't play it", false).await;
                     }
                 }
                 self.lost(kind).await;
@@ -1328,7 +1371,7 @@ impl Session {
                     return self.stereo_again("fetched but not playing").await;
                 }
                 if c.can_escalate() {
-                    return self.escalate("fetched but not playing").await;
+                    return self.escalate("fetched but not playing", false).await;
                 }
                 self.fail(generation, PlayerErrorKind::Cast(CastErrorKind::ReceiverFailed));
             }

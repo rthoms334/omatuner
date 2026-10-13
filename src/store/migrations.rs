@@ -48,6 +48,7 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
         )));
     }
     reconcile_renumbered(conn, current)?;
+    cast_hint_failures(conn, current)?;
     for (i, (name, sql)) in MIGRATIONS.iter().enumerate().skip(current as usize) {
         tracing::info!("applying migration {name}");
         let tx = conn.transaction()?;
@@ -81,6 +82,23 @@ fn reconcile_renumbered(conn: &mut Connection, current: i64) -> Result<()> {
     let tx = conn.transaction()?;
     add_column_if_missing(&tx, "grp", "raw_name", "TEXT")?;
     add_column_if_missing(&tx, "group_override", "shown", "INTEGER NOT NULL DEFAULT 0")?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// 0014 gained `cast_hint.l2_failed_at` / `l2_failed_logic` before its release (DESIGN §40
+/// §8.3, `store::cast` module docs): a test build's database already at v14 (or a later cast
+/// branch's) has the table without them and gets them here, NULL. Its rows' L2 failures were
+/// judged by the guard that called long-GOP films irregular, and a NULL failure never forces
+/// L3, so that verdict is dropped without touching the rows (their codecs stay useful).
+fn cast_hint_failures(conn: &mut Connection, current: i64) -> Result<()> {
+    if current < 14 || has_column(conn, "cast_hint", "l2_failed_at")? {
+        return Ok(());
+    }
+    tracing::info!("applying 0014_cast's L2 failure columns (database from a test build)");
+    let tx = conn.transaction()?;
+    add_column_if_missing(&tx, "cast_hint", "l2_failed_at", "INTEGER")?;
+    add_column_if_missing(&tx, "cast_hint", "l2_failed_logic", "INTEGER")?;
     tx.commit()?;
     Ok(())
 }

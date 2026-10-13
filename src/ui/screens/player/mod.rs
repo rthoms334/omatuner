@@ -799,6 +799,7 @@ impl Screen for PlayerScreen {
             // the menu's casting items (codes above typed digits)
             OverlayResult::Chosen(Action::Digit(CAST_PLAY_HERE)) => ctx.play(PlayerCommand::StopCasting { play_here: true }),
             OverlayResult::Chosen(Action::Digit(CAST_CONVERT)) => ctx.services.agent.cast().convert_current(),
+            OverlayResult::Chosen(Action::Digit(CAST_AS_IS)) => ctx.services.agent.cast().send_as_is(),
             // a copy of the Ctrl+O menu (never a typed channel number)
             OverlayResult::Chosen(Action::Digit(d)) if d >= SWITCH_COPY && !self.switch_copies.is_empty() => {
                 if let Some(c) = self.switch_copies.get(usize::from(d - SWITCH_COPY)) {
@@ -1415,6 +1416,7 @@ mod tests {
             kind: ReceiverKind::AppleTv,
             phase: CastPhase::Playing,
             level: Some(CastLevel::Repackaged),
+            as_is: false,
             behind_live_s: Some(15),
             can_seek: false,
             volume: false,
@@ -1505,6 +1507,33 @@ mod tests {
         for gone in ["Aspect ratio", "Zoom", "Audio…", "Subtitles…", "Pop out"] {
             assert!(!labels.contains(&gone), "{gone}: {labels:?}");
         }
+    }
+
+    /// L3 forced by a remembered choice or failure: the menu's last casting item is **Send as
+    /// is**, which asks the service to forget it (DESIGN §40 §8.3); converted for the format,
+    /// Convert this channel stays, greyed.
+    #[test]
+    fn a_remembered_conversion_offers_send_as_is() {
+        let menu = |as_is: bool| {
+            let mut h = casting(PlayerState::Playing);
+            let mut s = (*h.state().t.snapshot).clone();
+            let view = s.cast.as_mut().unwrap();
+            (view.level, view.as_is) = (Some(CastLevel::Converted), as_is);
+            h.state_mut().t.snapshot = Arc::new(s);
+            h.run_steps(2);
+            h.state_mut().nav();
+            let c = egui::pos2(WIDE.x / 3.0, WIDE.y / 2.0);
+            h.hover_at(c);
+            press(&h, c, egui::PointerButton::Secondary);
+            h.run_steps(2);
+            let nav = h.state_mut().nav();
+            let Some(NavRequest::Open(OverlayRequest::ContextMenu(spec))) = nav.last() else { panic!("no menu: {nav:?}") };
+            spec.items.iter().map(|i| (i.label.clone(), i.enabled)).collect::<Vec<_>>()
+        };
+        let items = menu(true);
+        assert!(items.contains(&("Send as is".into(), true)) && !items.iter().any(|i| i.0 == "Convert this channel"), "{items:?}");
+        let items = menu(false);
+        assert!(items.contains(&("Convert this channel".into(), false)) && !items.iter().any(|i| i.0 == "Send as is"), "{items:?}");
     }
 
     /// A failure reads as one sentence with its own buttons; the buttons open what they say.

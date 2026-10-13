@@ -35,8 +35,11 @@ CREATE TABLE IF NOT EXISTS cast_device (
 );
 
 -- What worked for an item on a TV (DESIGN §40 §8.2–8.3): the level, whether it is interlaced,
--- its codecs, and whether the playlist guard found it irregular (→ L3 next time). `forced` is
--- the user's "Convert this channel". Rows older than 30 days are re-probed.
+-- its codecs (re-probed 30 days after the last picture). `forced` is the user's "Convert this
+-- channel". A remembered L2 failure (→ L3 next time) is `l2_failed_at` with the relay logic
+-- version that judged it (`store::cast::L2_FAILURE_LOGIC`: another version's verdict is
+-- ignored), `irregular` when the playlist guard found it; the first L2 picture clears it.
+-- Databases made before the two columns get them from `migrations::cast_hint_failures`.
 CREATE TABLE IF NOT EXISTS cast_hint (
   source_id   INTEGER NOT NULL REFERENCES source(id) ON DELETE CASCADE,
   kind        TEXT    NOT NULL CHECK (kind IN ('channel', 'movie', 'episode')),
@@ -48,6 +51,8 @@ CREATE TABLE IF NOT EXISTS cast_hint (
   vcodec      TEXT,
   acodec      TEXT,
   irregular   INTEGER NOT NULL DEFAULT 0,
+  l2_failed_at    INTEGER,
+  l2_failed_logic INTEGER,
   updated_at  INTEGER NOT NULL,
   PRIMARY KEY (source_id, kind, item_key, device)
 );

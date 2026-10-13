@@ -192,6 +192,10 @@ pub struct CastView {
     pub phase: CastPhase,
     /// How the TV is fed, once the relay decided.
     pub level: Option<CastLevel>,
+    /// The TV is fed L3 only because it was forced (Convert this channel, an L2 failure
+    /// remembered for this item on this TV, the session's escalation), not by the format: the
+    /// player menu offers **Send as is** instead of a greyed Convert this channel (§3.3, §8.3).
+    pub as_is: bool,
     /// Live: roughly how far the TV runs behind the live point.
     pub behind_live_s: Option<u16>,
     /// The receiver can seek (by replace; DESIGN §40 §11.3).

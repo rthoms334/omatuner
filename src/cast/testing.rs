@@ -29,6 +29,7 @@ pub enum FakeCall {
     StartPass,
     TestOnTv(DeviceId),
     ConvertCurrent,
+    SendAsIs,
     Open(DeviceId),
 }
 
@@ -156,6 +157,9 @@ impl CastApi for FakeCast {
     }
     fn convert_current(&self) {
         self.call(FakeCall::ConvertCurrent);
+    }
+    fn send_as_is(&self) {
+        self.call(FakeCall::SendAsIs);
     }
     fn last_error(&self) -> Option<CastErrorKind> {
         self.read(|s| s.last_error)

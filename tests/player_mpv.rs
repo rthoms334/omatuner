@@ -1053,6 +1053,7 @@ mod casting {
                 kind: ReceiverKind::AppleTv,
                 phase: CastPhase::Connecting,
                 level: None,
+                as_is: false,
                 behind_live_s: None,
                 can_seek: true,
                 volume: false,
