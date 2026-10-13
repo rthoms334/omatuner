@@ -1441,8 +1441,11 @@ mod tests {
         let conn = zbus::conn::Builder::session().unwrap().name(name).unwrap().build().await.unwrap();
         let calls = Arc::new(Mutex::new(Vec::new()));
         let (c, rec) = (conn.clone(), calls.clone());
+        // subscribed before the caller can send: zbus drops a message no stream is active for, so
+        // a stream made inside the task lost the Notify whenever the task started late (a loaded
+        // run: no reply, `show` timed out, "assertion failed: shown")
+        let mut stream = zbus::MessageStream::from(&c);
         tokio::spawn(async move {
-            let mut stream = zbus::MessageStream::from(&c);
             let mut next_id = 4_000_000u32;
             while let Some(Ok(msg)) = stream.next().await {
                 let h = msg.header();
