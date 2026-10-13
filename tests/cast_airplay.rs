@@ -29,6 +29,7 @@ use fake_airplay::{
 };
 use static_http::StaticServer;
 use tuner::cast::airplay::bplist::Value;
+use tuner::cast::airplay::features::{self, ReceiverIds};
 use tuner::cast::airplay::{self, CLIENT_NAME, Client, PairingSession, Profile};
 use tuner::cast::receiver::{LoadReq, ReceiverEvent};
 use tuner::cast::{CastErrorKind, Credentials, Identity, PairError, PairVariant, PeerCredentials, Pin};
@@ -161,10 +162,18 @@ impl Media {
     }
 }
 
+/// The TXT identifiers discovery hands the client: a third-party fake's are the Hisense's.
+fn txt_ids(profile: Profile) -> ReceiverIds {
+    match profile {
+        Profile::AppleTv => ReceiverIds::default(),
+        Profile::ThirdParty => features::from_txt(&fake_airplay::txt(fake_airplay::HISENSE_TXT)).ids(),
+    }
+}
+
 /// A TV paired with HKP 3 (no PIN dance) and a verified session on it.
 async fn session(fake: &FakeAirPlay, profile: Profile) -> Client {
     let creds = fake.pre_pair(&identity(), PairVariant::Hkp3);
-    match within("Client::connect", Client::connect(fake.addr(), &creds, profile)).await {
+    match within("Client::connect", Client::connect(fake.addr(), &creds, profile, &txt_ids(profile))).await {
         Ok(client) => client,
         Err(e) => panic!("connect: {e:?}\n{}", fake.dump()),
     }
@@ -373,7 +382,7 @@ async fn ladders_to_hkp5(tvos: Tvos) {
     assert_eq!(last.acl.as_deref(), Some(SCREEN_CAPTURE_ACL));
 
     let creds = Credentials { identity: me, peer };
-    let connected = within("connect", Client::connect(fake.addr(), &creds, Profile::AppleTv)).await;
+    let connected = within("connect", Client::connect(fake.addr(), &creds, Profile::AppleTv, &ReceiverIds::default())).await;
     assert!(connected.is_ok(), "verify with HKP 5: {:?}\n{}", connected.err(), fake.dump());
     let verify: Vec<Request> = fake.requests().into_iter().filter(|r| r.uri == "/pair-verify").collect();
     assert_eq!(verify.len(), 2, "pair-verify M1 and M3");
@@ -473,7 +482,7 @@ async fn a_changed_tv_key_is_pairing_lost(tvos: Tvos) {
     let fake = FakeAirPlay::start(FakeConfig::new(tvos));
     let creds = fake.pre_pair(&identity(), PairVariant::Hkp3);
     fake.reset_accessory();
-    let result = within("connect", Client::connect(fake.addr(), &creds, Profile::AppleTv)).await;
+    let result = within("connect", Client::connect(fake.addr(), &creds, Profile::AppleTv, &ReceiverIds::default())).await;
     assert_eq!(result.err(), Some(CastErrorKind::PairingLost));
 }
 
@@ -483,7 +492,7 @@ async fn home_only_is_pairing_refused(tvos: Tvos) {
     for allow in [AllowAccess::HomeOnly, AllowAccess::Refuse470] {
         let fake = FakeAirPlay::start(FakeConfig { allow_access: allow, ..FakeConfig::new(tvos) });
         let creds = fake.pre_pair(&identity(), PairVariant::Hkp3);
-        let result = within("connect", Client::connect(fake.addr(), &creds, Profile::AppleTv)).await;
+        let result = within("connect", Client::connect(fake.addr(), &creds, Profile::AppleTv, &ReceiverIds::default())).await;
         assert_eq!(result.err(), Some(CastErrorKind::PairingRefused), "{allow:?}");
     }
 }
@@ -1003,10 +1012,12 @@ async fn stop_closes_everything(tvos: Tvos) {
 // Third-party AirPlay TVs (§7.7)
 // ---------------------------------------------------------------------------------------------
 
-/// VioletRelay's profile: the type-120 SETUP before the type-130 one; the stream-id header
-/// negotiated in the order `X-Apple-Stream-ID`, none, `X-Apple-StreamID` and kept; never the
-/// session headers; `HLS-Content-Location`, `isAudioOnly`, `streamType 1`, a millisecond
-/// Start-Position; `channelID` from our MAC (no `psi`).
+/// VioletRelay's profile: the type-120 SETUP before the type-130 one, both with its stream
+/// headers; `/command` over RTSP with the stream-id header negotiated in the order
+/// `X-Apple-Stream-ID`, none, `X-Apple-StreamID` and kept, never the session headers;
+/// `HLS-Content-Location`, `isAudioOnly`, `streamType 1`, a millisecond Start-Position;
+/// `channelID` `<TXT psi>-RCS-1` and `ClockPorts` keyed by the TXT `gid` (the fake checks it),
+/// although `/info` has only `pi`.
 async fn third_party_profile(tvos: Tvos) {
     let cfg = FakeConfig { profile: fake_airplay::Profile::ThirdParty, third_party_header: StreamHeader::Joined, ..FakeConfig::new(tvos) };
     let fake = FakeAirPlay::start(cfg);
@@ -1029,8 +1040,18 @@ async fn third_party_profile(tvos: Tvos) {
     let tried: Vec<(&str, u16)> = commands.iter().take(3).map(|r| (spelling(r), r.status)).collect();
     assert_eq!(tried, [("hyphenated", 400), ("none", 400), ("joined", 200)], "\n{}", fake.dump());
     assert!(commands[3..].iter().all(|r| spelling(r) == "joined"), "the spelling that worked is kept");
-    for r in &reqs {
+    for r in &commands {
+        assert_eq!(r.protocol, "RTSP/1.0", "{}", r.step());
+        assert!(r.header("CSeq").is_some() && r.header("Active-Remote").is_some(), "{}", r.step());
         assert!(r.header("X-Apple-ProtocolVersion").is_none() && r.header("X-Apple-Session-ID").is_none(), "{}", r.step());
+    }
+    let setup = reqs.iter().find(|r| r.step() == "SETUP").expect("SETUP");
+    let session_uuid = setup.plist().and_then(|p| text(p, "sessionUUID")).expect("sessionUUID").to_ascii_lowercase();
+    for step in ["SETUP 120", "SETUP 130"] {
+        let r = reqs.iter().find(|r| r.step() == step).expect(step);
+        assert_eq!(r.header("X-Apple-ProtocolVersion"), Some("1"), "{step}");
+        assert_eq!(r.header("X-Apple-Session-ID"), Some(session_uuid.as_str()), "{step}");
+        assert_eq!(r.header("X-Apple-Stream-ID"), Some("1"), "{step}");
     }
 
     let insert = fake.commands().into_iter().find(|c| text(c, "type") == Some("insertPlayQueueItem")).expect("insert");
@@ -1043,11 +1064,10 @@ async fn third_party_profile(tvos: Tvos) {
     assert_eq!(number(start, "timescale"), Some(1000.0));
     assert_eq!(number(start, "value"), Some(0.0));
 
-    let setup = reqs.iter().find(|r| r.step() == "SETUP").and_then(Request::plist).expect("SETUP");
-    let device = text(setup, "deviceID").expect("deviceID");
     let rcs = reqs.iter().find(|r| r.step() == "SETUP 130").and_then(Request::plist).expect("SETUP 130");
     let Some(Value::Array(streams)) = rcs.get("streams") else { panic!("{rcs:?}") };
-    assert_eq!(text(&streams[0], "channelID"), Some(format!("{device}-RCS-1").as_str()));
+    assert_eq!(text(&streams[0], "channelID"), Some(format!("{}-RCS-1", fake_airplay::hisense_txt("psi")).as_str()));
+    assert!(reqs.iter().any(|r| r.step() == "SETPEERSX"), "{steps:?}");
     no_violations(&fake);
 }
 
@@ -1116,7 +1136,7 @@ async fn interop_our_client_pairs_and_verifies_with_pyatv() {
     };
     assert_eq!(peer.peer_id, ready["identifier"].as_str().expect("identifier"));
     let creds = Credentials { identity: identity(), peer };
-    let _ = within("connect", Client::connect(addr, &creds, Profile::AppleTv)).await;
+    let _ = within("connect", Client::connect(addr, &creds, Profile::AppleTv, &ReceiverIds::default())).await;
     next_json(&mut lines, "verified", |v| v["event"] == "verified").await;
     let next = next_json(&mut lines, "an encrypted request", |v| v["event"] == "request" && v["encrypted"] == true).await;
     assert_eq!(next["method"], "SETUP", "{next}");

@@ -279,7 +279,11 @@ impl PlayerScreen {
     /// Stop casting, Play here and Convert this channel (L3 for this item on this TV).
     pub(super) fn cast_menu_items(&self, ctx: &UiCtx<'_>, k: KeyContext) -> Vec<crate::ui::overlays::MenuItem> {
         let Some(view) = ctx.player.cast.as_ref() else {
-            return if crate::cast::ENABLED { vec![menu_item(glyphs::CAST, "Cast to a TV…", Action::CastMenu, true, k)] } else { Vec::new() };
+            return if crate::cast::on(ctx.config) {
+                vec![menu_item(glyphs::CAST, "Cast to a TV…", Action::CastMenu, true, k)]
+            } else {
+                Vec::new()
+            };
         };
         vec![
             menu_item(glyphs::CAST_CONNECTED, "Cast to a TV…", Action::CastMenu, true, k),

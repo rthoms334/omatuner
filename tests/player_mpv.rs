@@ -1066,6 +1066,8 @@ mod casting {
     }
 
     fn start_casting(table: Vec<Playable>) -> (Harness, Receiver<FakeTv>) {
+        // the test answers `Close` itself (polling): leaving the TV waits for its upstream close
+        tuner::player::controller::set_cast_close_wait_for_tests(LONG);
         let (bus, events) = EventBus::new(None);
         let rec = Recorded::default();
         let (opened, sessions) = crossbeam_channel::unbounded();
@@ -1163,6 +1165,53 @@ mod casting {
         tv.start(zapped);
         h.wait_state_from(mark, LONG, is_playing);
         assert_eq!(a_leases(&h.player), 1);
+    }
+
+    /// A TV that was buffering when the channel changed doesn't carry its cache pause into the
+    /// next one: the new item's first picture is Playing (the session reports no
+    /// `Buffering(false)` for it), not a Buffering that the stall clock would reload every 20 s.
+    #[test]
+    fn a_zap_while_the_tv_buffers_plays_the_next_channel() {
+        let Some((_media, _serial)) = setup() else { return };
+        let ch = live(72, "http://127.0.0.1:9/never-fetched.ts".into());
+        let other = live(73, "http://127.0.0.1:9/never-fetched-either.ts".into());
+        let (mut h, sessions) = start_casting(vec![ch.clone(), other.clone()]);
+        cast(&h, Some(ch.media.clone()));
+        let mut tv = sessions.recv_timeout(LONG).expect("a session");
+        let (generation, ..) = tv.load();
+        tv.start(generation);
+        h.wait_snapshot(LONG, casting_and_playing);
+        tv.send(RemoteEvent::Buffering(true));
+        h.wait_state(LONG, |s| matches!(s, PlayerState::Buffering { .. }));
+
+        let mark = h.mark();
+        h.play(other.media.clone(), true);
+        let (zapped, ..) = tv.load();
+        tv.start(zapped);
+        h.wait_state_from(mark, LONG, |s| *s == PlayerState::Playing);
+    }
+
+    /// Three quick skips while casting add up: each counts from the last one's target, not from
+    /// the TV's last position report (every 10 s).
+    #[test]
+    fn quick_skips_on_the_tv_add_up() {
+        let Some((_media, _serial)) = setup() else { return };
+        let m = movie(81, "http://127.0.0.1:9/never-fetched.mp4".into());
+        let (h, sessions) = start_casting(vec![m.clone()]);
+        cast(&h, Some(m.media.clone()));
+        let mut tv = sessions.recv_timeout(LONG).expect("a session");
+        let (generation, ..) = tv.load();
+        tv.start(generation);
+        tv.send(RemoteEvent::Paused(true));
+        tv.send(RemoteEvent::Position { generation, pos: 100.0, dur: Some(3600.0) });
+        h.wait_snapshot(LONG, |s| s.paused && s.position == Some(100.0) && s.seekable);
+        for want in [110.0, 120.0, 130.0] {
+            h.handle.send(PlayerCommand::SeekBy(10.0));
+            assert_eq!(tv.next(), RemoteCmd::SeekTo(want));
+        }
+        h.handle.send(PlayerCommand::SeekBy(600.0));
+        h.handle.send(PlayerCommand::SeekBy(-10.0));
+        assert_eq!((tv.next(), tv.next()), (RemoteCmd::SeekTo(730.0), RemoteCmd::SeekTo(720.0)), "a small skip keeps the big one");
     }
 
     /// A film on the TV: transport goes to the session, positions are the progress, and the

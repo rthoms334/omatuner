@@ -36,7 +36,7 @@
 //! don't drive the machine and the mpv-only snapshot fields stay at their defaults.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, select};
@@ -59,8 +59,27 @@ use crate::msg::AppEvent;
 
 const PROGRESS_EVERY: Duration = Duration::from_secs(10);
 const PUBLISH_EVERY: Duration = Duration::from_millis(100);
-/// Max wait for the old stream's END_FILE before loading anyway (stop-before-start).
+/// Max wait for the old stream's END_FILE before loading anyway (stop-before-start); leaving
+/// the TV waits as long for the relay's upstream to close ([`cast_close_wait`]).
 const PENDING_LOAD_MAX: Duration = Duration::from_millis(1500);
+/// The tests' override of the TV's close wait (0: [`PENDING_LOAD_MAX`]).
+static CAST_CLOSE_WAIT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Tests only: how long leaving the TV waits for the upstream's close, for every later
+/// controller in this process (a test that plays the TV itself answers `Close` from a polling
+/// thread and must not race the 1.5 s).
+#[doc(hidden)]
+pub fn set_cast_close_wait_for_tests(wait: Duration) {
+    CAST_CLOSE_WAIT_MS.store(wait.as_millis().max(1) as u64, Ordering::Relaxed);
+}
+
+fn cast_close_wait() -> Duration {
+    match CAST_CLOSE_WAIT_MS.load(Ordering::Relaxed) {
+        0 => PENDING_LOAD_MAX,
+        ms => Duration::from_millis(ms),
+    }
+}
+
 /// Max wait for ANOTHER picture's stream that is closing (its claim already moved on, its
 /// END_FILE not seen yet) before the budget's refusal stands: multi-view's "move picture A to
 /// its TV 2 copy so B can use TV" (`Tiles::rearrange`).
@@ -728,6 +747,10 @@ impl Controller {
             self.snap.paused = false;
             self.feed(Input::Pause(false), now);
         }
+        // a buffering TV's cache pause was its generation's: each starts clear, as a new file
+        // does under mpv (the session's new item reports no `Buffering(false)`, so the first
+        // picture would land in Buffering and the stall clock reload a live channel every 20 s)
+        self.feed(Input::PausedForCache(false), now);
         let Output::Remote(r) = &mut self.output else { return };
         r.paused_at = None;
         r.info = None;
@@ -1167,7 +1190,7 @@ impl Controller {
         let Output::Remote(mut r) = std::mem::replace(&mut self.output, Output::Local) else { return None };
         if r.alive {
             let _ = r.out.cmd.send(RemoteCmd::Close { fast });
-            let deadline = Instant::now() + PENDING_LOAD_MAX;
+            let deadline = Instant::now() + cast_close_wait();
             while !fast && r.upstream.is_some() {
                 match r.out.events.recv_deadline(deadline) {
                     Ok(RemoteEvent::UpstreamClosed { generation, .. }) if r.upstream == Some(generation) => r.upstream = None,
@@ -1346,9 +1369,14 @@ impl Controller {
                 let playing = matches!(self.machine.state(), PlayerState::Playing);
                 let now = r.reported.map(|(pos, at)| if playing { pos + at.elapsed().as_secs_f64() } else { pos });
                 let t = (now.or(self.snap.position).unwrap_or(0.0) + d).max(0.0);
-                send(RemoteCmd::SeekTo(self.snap.duration.map_or(t, |dur| t.min(dur))));
+                let t = self.snap.duration.map_or(t, |dur| t.min(dur));
+                send(RemoteCmd::SeekTo(t));
+                return Some(self.remote_seeked(t));
             }
-            C::SeekTo(t) if self.snap.seekable => send(RemoteCmd::SeekTo(t.max(0.0))),
+            C::SeekTo(t) if self.snap.seekable => {
+                send(RemoteCmd::SeekTo(t.max(0.0)));
+                return Some(self.remote_seeked(t.max(0.0)));
+            }
             C::SeekBy(_) | C::SeekTo(_) => {}
             C::SetVolume(v) if volume => send(RemoteCmd::SetVolume(v.clamp(0.0, 130.0))),
             C::AdjustVolume(d) if volume => send(RemoteCmd::SetVolume((self.snap.volume + d).clamp(0.0, 130.0))),
@@ -1371,6 +1399,21 @@ impl Controller {
         }
         self.dirty = true;
         Some(false)
+    }
+
+    /// A seek went to the TV: its target is where the item is now until the TV reports (every
+    /// 10 s, or once it plays the replace), as mpv's `time-pos` moves at a seek. A second skip
+    /// counts from it (three quick 10 s skips are 30 s; a small one can't undo a big one), and
+    /// the stall clock and a reconnect's resume point follow it. A clamp (catch-up past what's
+    /// loaded) is corrected by the next report.
+    fn remote_seeked(&mut self, t: f64) -> bool {
+        let now = Instant::now();
+        if let Output::Remote(r) = &mut self.output {
+            r.reported = Some((t, now));
+        }
+        self.snap.position = Some(t);
+        self.dirty = true;
+        self.feed(Input::TimePos(t), now)
     }
 
     /// Pause or resume the TV (`setRate 0/1`). A live pause holds only while the relay's window

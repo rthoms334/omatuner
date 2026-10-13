@@ -71,7 +71,10 @@ const MAX_PLAYLIST: usize = 4 << 20;
 const MAX_TEXT: usize = 200;
 /// Bytes sniffed before deciding what the first response is.
 const SNIFF: usize = 512;
-/// Connect and read timeouts toward the provider: the player's default `network-timeout`.
+/// Toward the provider, the player's default `network-timeout`: for the connect, for the reply
+/// to a request, and for each body read on its own ([`read_chunk`]), so a pump held back by its
+/// reader (a TV paused at the VOD cap with ffmpeg SIGSTOPped, the head-mode attach wait) never
+/// counts as the provider going silent.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(15);
 /// `close` waits this long for the upstream connection to go (stop-before-start, §8.5).
 pub const CLOSE_WAIT: Duration = Duration::from_millis(1500);
@@ -110,8 +113,9 @@ impl Proxy {
         let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
         let addr = listener.local_addr()?;
         let client = reqwest::Client::builder()
+            // no `read_timeout`: its clock runs from the last frame, so a body polled again after
+            // backpressure would fail at once; reads are timed one by one instead
             .connect_timeout(UPSTREAM_TIMEOUT)
-            .read_timeout(UPSTREAM_TIMEOUT)
             .redirect(reqwest::redirect::Policy::limited(10))
             // no idle connection to the provider: a finished request leaves nothing open
             .pool_max_idle_per_host(0)
@@ -124,7 +128,7 @@ impl Proxy {
         let feeds: Arc<Mutex<Grants<Arc<Feed>>>> = Arc::new(Mutex::new(Grants::default()));
         let kill = CancellationToken::new();
         let app = axum::Router::new().fallback(handle).with_state(feeds.clone());
-        let capped = Capped::new(listener, super::server::MAX_CONNECTIONS, kill.clone());
+        let capped = Capped::new(listener, super::server::MAX_CONNECTIONS, Ipv4Addr::LOCALHOST, kill.clone());
         let stop = kill.clone();
         tokio::spawn(async move {
             let serve = axum::serve(capped, app.into_make_service_with_connect_info::<Peer>()).with_graceful_shutdown(stop.cancelled_owned());
@@ -135,10 +139,9 @@ impl Proxy {
         Ok(Self { addr, feeds, client, kill })
     }
 
-    /// Open the provider for one generation: the first request, `UpstreamOpened` / `Http` /
-    /// `ProviderText`, and (HLS) the variant pick. Always returns the feed; check
-    /// [`Feed::failed`].
-    pub async fn open(&self, ctx: FeedCtx, url: &Secret<String>, headers: &HttpHeaders, user_agent: &str, pick: Pick) -> Arc<Feed> {
+    /// One generation's feed under a new loopback token. Nothing is requested yet: the caller
+    /// keeps the feed (so a load dropped mid-way can still end it), then calls [`Feed::open`].
+    pub fn feed(&self, ctx: FeedCtx, url: &Secret<String>, headers: &HttpHeaders, user_agent: &str) -> Arc<Feed> {
         let token = Token::mint();
         let base = format!("http://{}/u/{}", self.addr, token.expose());
         let feed = Arc::new(Feed {
@@ -159,7 +162,6 @@ impl Proxy {
             encrypted: AtomicBool::new(false),
         });
         self.feeds.lock().unwrap_or_else(|e| e.into_inner()).insert(token, feed.clone());
-        feed.first_request(pick).await;
         feed
     }
 
@@ -168,8 +170,12 @@ impl Proxy {
         self.feeds.lock().unwrap_or_else(|e| e.into_inner()).revoke(|g| Arc::ptr_eq(&g.value, feed));
     }
 
+    /// Stop serving and cancel every feed's upstream requests (no pump outlives the session).
     pub fn shutdown(&self) {
-        self.feeds.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.feeds.lock().unwrap_or_else(|e| e.into_inner()).revoke(|g| {
+            g.value.cancel_all();
+            true
+        });
         self.kill.cancel();
     }
 }
@@ -515,12 +521,12 @@ impl Feed {
         }
     }
 
+    /// Every request carries `Range: bytes=<from>-`, from 0 too, as ffmpeg's `http` sends it (so
+    /// the provider sees what mpv's requests show it): a 206 or `Accept-Ranges: bytes` tells
+    /// the tape the provider honours ranges; a 200 without either, that it doesn't, and ffmpeg is
+    /// then told the input can't seek ([`serve_bytes`]).
     fn request(&self, url: &str, from: u64) -> reqwest::RequestBuilder {
-        let mut rb = self.client.get(url).headers(self.headers.clone());
-        if from > 0 {
-            rb = rb.header(header::RANGE, format!("bytes={from}-"));
-        }
-        rb
+        self.client.get(url).headers(self.headers.clone()).header(header::RANGE, format!("bytes={from}-"))
     }
 
     /// Send on the wire (after hanging up the request in flight). Statuses ≥ 400 are reported
@@ -530,7 +536,11 @@ impl Feed {
         if self.state.lock().unwrap_or_else(|e| e.into_inner()).closed {
             return None;
         }
-        match self.request(url, from).send().await {
+        let sent = match tokio::time::timeout(UPSTREAM_TIMEOUT, self.request(url, from).send()).await {
+            Ok(r) => r.map_err(|e| redact(&e.without_url().to_string()).into_owned()),
+            Err(_) => Err(format!("no answer within {} s", UPSTREAM_TIMEOUT.as_secs())),
+        };
+        match sent {
             // closed while connecting: dropping the response closes the connection
             Ok(_) if self.state.lock().unwrap_or_else(|e| e.into_inner()).closed => None,
             Ok(r) if r.status().is_success() => Some(r),
@@ -542,8 +552,8 @@ impl Feed {
                 }
                 None
             }
-            Err(e) => {
-                tracing::info!("{}: the provider can't be reached: {}", self.ctx.label, redact(&e.without_url().to_string()));
+            Err(why) => {
+                tracing::info!("{}: the provider can't be reached: {why}", self.ctx.label);
                 if fatal(0) {
                     self.fail(None, None);
                 }
@@ -552,8 +562,9 @@ impl Feed {
         }
     }
 
-    /// The first request: decide what the upstream is.
-    async fn first_request(self: &Arc<Self>, pick: Pick) {
+    /// Open the provider: the first request decides what the upstream is (`UpstreamOpened` /
+    /// `Http` / `ProviderText`, and for HLS the variant pick). Check [`Feed::failed`] after.
+    pub async fn open(self: &Arc<Self>, pick: Pick) {
         let mut wire = self.wire.lock().await;
         let url = self.url.expose().clone();
         let Some(mut resp) = self.send(&mut wire, &url, 0, |_| true).await else { return };
@@ -562,14 +573,14 @@ impl Feed {
         let mut head = Vec::with_capacity(SNIFF);
         let mut eof = false;
         while head.len() < SNIFF {
-            match resp.chunk().await {
+            match read_chunk(&mut resp).await {
                 Ok(Some(b)) => head.extend_from_slice(&b),
                 Ok(None) => {
                     eof = true;
                     break;
                 }
-                Err(e) => {
-                    tracing::info!("{}: the provider's stream broke: {}", self.ctx.label, redact(&e.without_url().to_string()));
+                Err(why) => {
+                    tracing::info!("{}: the provider's stream broke: {why}", self.ctx.label);
                     self.fail(None, None);
                     return;
                 }
@@ -779,6 +790,14 @@ impl Feed {
     }
 }
 
+impl Drop for Feed {
+    /// The last holder let go: its pumps stop too (a pump parked on backpressure would otherwise
+    /// hold the provider connection until Tuner exits).
+    fn drop(&mut self) {
+        self.cancel_all();
+    }
+}
+
 /// Read a tape into the provider: until EOF, cancellation, failure, or (backpressure) until the
 /// reader catches up.
 async fn pump(tape: Arc<Tape>, mut resp: reqwest::Response, ctx: FeedCtx) {
@@ -808,7 +827,7 @@ async fn pump(tape: Arc<Tape>, mut resp: reqwest::Response, ctx: FeedCtx) {
                 tape.finish(End::Cut);
                 return;
             }
-            c = resp.chunk() => c,
+            c = read_chunk(&mut resp) => c,
         };
         match chunk {
             Ok(Some(b)) => {
@@ -822,8 +841,8 @@ async fn pump(tape: Arc<Tape>, mut resp: reqwest::Response, ctx: FeedCtx) {
                 tape.finish(End::Eof);
                 return;
             }
-            Err(e) => {
-                tracing::info!("{}: the provider's stream broke: {}", ctx.label, redact(&e.without_url().to_string()));
+            Err(why) => {
+                tracing::info!("{}: the provider's stream broke: {why}", ctx.label);
                 tape.finish(End::Failed);
                 return;
             }
@@ -831,11 +850,20 @@ async fn pump(tape: Arc<Tape>, mut resp: reqwest::Response, ctx: FeedCtx) {
     }
 }
 
+/// One body chunk, its wait timed on its own ([`UPSTREAM_TIMEOUT`]): the clock starts when the
+/// caller asks, after any backpressure. `Err` is a redacted reason.
+async fn read_chunk(resp: &mut reqwest::Response) -> Result<Option<Bytes>, String> {
+    match tokio::time::timeout(UPSTREAM_TIMEOUT, resp.chunk()).await {
+        Ok(r) => r.map_err(|e| redact(&e.without_url().to_string()).into_owned()),
+        Err(_) => Err(format!("nothing for {} s", UPSTREAM_TIMEOUT.as_secs())),
+    }
+}
+
 /// The rest of a small body (a playlist), capped.
 async fn read_rest(mut resp: reqwest::Response, mut buf: Vec<u8>, eof: bool) -> Option<String> {
     if !eof {
         loop {
-            match resp.chunk().await {
+            match read_chunk(&mut resp).await {
                 Ok(Some(b)) => {
                     buf.extend_from_slice(&b);
                     if buf.len() > MAX_PLAYLIST {
@@ -1131,7 +1159,10 @@ async fn serve_bytes(feed: Arc<Feed>, key: Key, range: Option<&str>, epoch: u64)
     if let Some(n) = limit {
         h.insert(header::CONTENT_LENGTH, HeaderValue::from(n));
     }
+    // seekable only when the provider is: a 206 for a provider that ignores Range would have
+    // ffmpeg seek to bytes the proxy can only reach by buffering everything before them
     if range.is_some()
+        && ranges
         && let (Some(t), Some(l)) = (total, last)
     {
         *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
@@ -1182,6 +1213,7 @@ async fn next_chunk(s: &mut ReadState) -> io::Result<Option<Bytes>> {
         tokio::pin!(feed_changed, tape_changed);
         feed_changed.as_mut().enable();
         tape_changed.as_mut().enable();
+        let mut moved = false;
         let next = {
             let mut st = s.tape.lock();
             if s.pos < st.base {
@@ -1204,6 +1236,14 @@ async fn next_chunk(s: &mut ReadState) -> io::Result<Option<Bytes>> {
                 }
                 Some(Ok(b))
             } else {
+                // waiting ahead of what's there: the pump's lead is measured from here, or a full
+                // tape (16 MiB past where the previous reader stopped) would never fill up to us
+                let at = s.pos.min(st.end_offset());
+                if !st.keep_head && st.end.is_none() && at > st.reader {
+                    st.reader = at;
+                    st.trim();
+                    moved = true;
+                }
                 match st.end {
                     None => None,
                     Some(End::Eof) => Some(Err(None)),
@@ -1227,6 +1267,7 @@ async fn next_chunk(s: &mut ReadState) -> io::Result<Option<Bytes>> {
                 s.feed.fail(None, None);
                 return Err(io::Error::other("the provider's stream broke"));
             }
+            None if moved => s.tape.changed.notify_waiters(), // room for the pump; look again
             None => {
                 tokio::select! {
                     () = &mut feed_changed => {}

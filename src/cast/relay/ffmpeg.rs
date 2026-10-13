@@ -231,7 +231,16 @@ pub fn argv(input: &Input<'_>, plan: &Plan, out: &Output<'_>) -> Vec<String> {
     }
     match plan.audio {
         Audio::None => push(&["-an"]),
-        Audio::Copy => push(&["-c:a", "copy"]),
+        Audio::Copy => {
+            push(&["-c:a", "copy"]);
+            // copied audio is AAC (plan.rs): the mp4 muxer behind fMP4 segments refuses ADTS
+            // ("Malformed AAC bitstream detected", ffmpeg exits at the first audio packet), and
+            // MPEG-TS sources carry ADTS; the filter turns it into an AudioSpecificConfig and
+            // passes MP4/MKV audio (already ASC) through unchanged
+            if plan.segments == Segments::Fmp4 {
+                push(&["-bsf:a", "aac_adtstoasc"]);
+            }
+        }
         Audio::Aac => push(&["-c:a", "aac", "-ac", "2", "-b:a", "160k"]),
     }
     // subtitles and teletext are dropped in Phase 1
@@ -463,7 +472,7 @@ mod tests {
         let hevc = plan(crate::model::CastLevel::Repackaged, Video::Copy, Audio::Copy, Segments::Fmp4);
         let a = argv(&vod, &hevc, &Output { dir, live: false, hls_time: 6.0, fps: None, audio_index: None }).join(" ");
         assert!(a.contains("-readrate 4 -readrate_initial_burst 30 -ss 4210.500 -i http://127.0.0.1:1/u/t"), "{a}");
-        assert!(a.contains("-map 0:v:0 -map 0:a:0? -c:v copy -tag:v hvc1 -c:a copy"), "{a}");
+        assert!(a.contains("-map 0:v:0 -map 0:a:0? -c:v copy -tag:v hvc1 -c:a copy -bsf:a aac_adtstoasc"), "{a}");
         assert!(a.contains("-hls_playlist_type event -hls_flags independent_segments+program_date_time+temp_file"), "{a}");
         assert!(a.contains("-hls_segment_type fmp4 -hls_fmp4_init_filename init.mp4 -hls_segment_filename /c/g1/s%d.m4s"), "{a}");
         assert!(!a.contains("delete_segments") && !a.contains("-http_multiple"));

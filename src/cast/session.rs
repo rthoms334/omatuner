@@ -973,12 +973,24 @@ impl Session {
         Some(Job { generation: c.generation, source: c.again(None), force: Some(CastLevel::Converted), escalated: true, seeking: false })
     }
 
-    /// One step L2 → L3 (§8.3), cached for the item and TV once it plays.
+    /// One step L2 → L3 (§8.3), cached for the item and TV at once: L2's 15 s and L3's own start
+    /// (a new relay load, two real-time live segments, the replace) can outlast the controller's
+    /// 30 s load timeout, and its retry (a new generation) then starts converted instead of on L2
+    /// again. The first picture confirms the level (`remember`).
     fn escalate(&mut self, why: &str) -> Option<Job> {
         let c = self.cur.as_mut().filter(|c| c.can_escalate())?;
         c.escalated = true;
+        let job = Job { generation: c.generation, source: c.again(None), force: Some(CastLevel::Converted), escalated: true, seeking: false };
+        let cache = match &c.source {
+            Source::Item { playable, hints } => playable.item.clone().map(|item| (item, hints.clone())),
+            Source::TestCard => None,
+        };
         tracing::info!("cast session {}: converting ({why})", self.device.id.short());
-        Some(Job { generation: c.generation, source: c.again(None), force: Some(CastLevel::Converted), escalated: true, seeking: false })
+        if let Some((item, seen)) = cache {
+            let (device, now) = (self.device.id, crate::model::now());
+            let _ = self.shared.writer().submit(move |conn| crate::store::cast::save_hint(conn, &item, device, CastLevel::Converted, &seen, now));
+        }
+        Some(job)
     }
 
     // ---- events
@@ -1118,6 +1130,7 @@ impl Session {
         // decided under the borrow of `cur`, sent after it (phases deduplicated in order)
         let mut out = Vec::new();
         let mut first = false;
+        let mut finished = false;
         match ev {
             ReceiverEvent::Loading => {
                 if !c.playing && !c.seeking {
@@ -1158,7 +1171,10 @@ impl Session {
                 let dur = c.duration.or(dur.map(|d| d + c.offset_s));
                 out.push(RemoteEvent::Position { generation, pos, dur });
             }
-            ReceiverEvent::Ended => out.push(RemoteEvent::Ended { generation }),
+            ReceiverEvent::Ended => {
+                finished = !c.live;
+                out.push(RemoteEvent::Ended { generation });
+            }
             ReceiverEvent::StoppedOnTv | ReceiverEvent::Lost(_) => {}
         }
         for ev in out {
@@ -1170,6 +1186,11 @@ impl Session {
         if first {
             self.shared.clear_error();
             self.remember();
+        }
+        if finished {
+            // the film is over and nothing may follow: the computer may sleep again (`connect`
+            // takes the lock back for the next load, Up next's or Cast again's)
+            self.inhibitor = None;
         }
         None
     }

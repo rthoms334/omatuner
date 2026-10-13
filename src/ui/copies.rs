@@ -42,7 +42,7 @@ fn write_with_undo(
     let (bus, stash) = (ctx.services.bus.clone(), ctx.services.undo.clone());
     let _ = ctx.services.store.writer().submit_notify(scope, move |c| {
         let n = stash.stash(f(c)?);
-        bus.toast(Toast { kind: ToastKind::Info, text, action: Some(("Undo".into(), Action::Undo(n))), ttl_ms: UNDO_TTL_MS });
+        bus.toast(Toast { kind: ToastKind::Info, text, action: Some(("Undo".into(), Action::Undo(n))), also: None, ttl_ms: UNDO_TTL_MS });
         Ok(())
     });
 }
@@ -233,7 +233,7 @@ pub fn fell_back_toast(lib: &Library, title: &str, from: Option<SourceId>, to: O
         (None, Some(t)) => format!("{title} couldn't start — playing from {t}"),
         _ => format!("{title} couldn't start — playing another copy"),
     };
-    Toast { kind: ToastKind::Warning, text, action: None, ttl_ms: 5000 }
+    Toast { kind: ToastKind::Warning, text, action: None, also: None, ttl_ms: 5000 }
 }
 
 /// Another copy to offer on the player's error card after a failure mid-film.

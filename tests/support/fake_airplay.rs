@@ -65,6 +65,20 @@ pub const PSI: &str = "6F0C3A52-1B7E-4D2C-9A11-5E0D2C7B4F10";
 pub const DEVICE_ID: &str = "AA:BB:CC:00:00:01";
 /// The stream id the type-130 SETUP answers (the `X-Apple-StreamID` the client must send back).
 pub const STREAM_ID: i64 = 1;
+/// A [`Profile::ThirdParty`] fake's mDNS TXT record: the user's Hisense's (scrubbed). Its `psi`
+/// and `gid` are what VioletRelay keys the `channelID` and `SETPEERSX`'s `ClockPorts` by; the
+/// fake's `/info` has only `pi` (= [`DEVICE_ID`], unlike the record's), as the TV's does.
+pub const HISENSE_TXT: &str = include_str!("../fixtures/cast/txt_hisense.txt");
+
+/// A TXT fixture's `key=value` lines (comments skipped).
+pub fn txt(fixture: &str) -> Vec<(String, String)> {
+    fixture.lines().filter(|l| !l.starts_with('#')).filter_map(|l| l.split_once('=')).map(|(k, v)| (k.to_owned(), v.to_owned())).collect()
+}
+
+/// One key of [`HISENSE_TXT`].
+pub fn hisense_txt(key: &str) -> String {
+    txt(HISENSE_TXT).into_iter().find(|(k, _)| k == key).map(|(_, v)| v).unwrap_or_else(|| panic!("no {key} in the Hisense TXT"))
+}
 
 // ---------------------------------------------------------------------------------------------
 // Configuration (the §14.3 "Modes" table, plus quirk switches)
@@ -434,6 +448,9 @@ pub enum Violation {
     LongPlayerLoggingId(String),
     /// An event-channel answer that isn't `RTSP/1.0 200 OK` with a CSeq.
     BadAck(String),
+    /// A third-party TV's `SETPEERSX` keyed `ClockPorts` by something other than its TXT `gid`
+    /// (VioletRelay's flow, the only one proven on the Hisense).
+    ClockPortsKey(String),
     /// The fake's own consistency check failed (its shadow SRP disagrees with the server half).
     Fake(String),
 }
@@ -1162,7 +1179,20 @@ fn handle(inner: &Arc<Inner>, conn: &mut Conn, req: &Message, encrypted: bool) -
         ("POST", "/command") => command(inner, conn, req),
         ("SETPEERSX", _) => match inner.cfg.profile {
             Profile::AppleTv => Reply::status(200),
-            Profile::ThirdParty => Reply::status(501),
+            Profile::ThirdParty => {
+                let key = match bplist::decode(&req.body) {
+                    Ok(Value::Array(peers)) => peers.first().and_then(|p| match p.get("ClockPorts") {
+                        Some(Value::Dict(d)) => d.first().map(|(k, _)| k.clone()),
+                        _ => None,
+                    }),
+                    _ => None,
+                };
+                let key = key.unwrap_or_default();
+                if key != hisense_txt("gid") {
+                    inner.log(Entry::Violation(Violation::ClockPortsKey(key)));
+                }
+                Reply::status(501)
+            }
         },
         ("TEARDOWN", _) => {
             inner.end_session(&mut inner.lock(), conn.id);

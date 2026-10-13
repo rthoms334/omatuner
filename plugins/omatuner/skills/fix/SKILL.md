@@ -42,7 +42,8 @@ change Tuner's settings yourself (guide fixes go through `guide_fix`, with the u
      Tuner (Settings ▸ Cast). For `cast-pairing-refused` (and often after a tvOS update) the
      Apple TV needs Settings ▸ AirPlay and HomeKit ▸ Allow Access ▸ Anyone on the Same Network.
    - `cast-stopped-on-tv`: the TV's remote stopped it, or another device took over. Not a fault;
-     offer `play` with `device` again, or `control` `play_here`.
+     offer `play` with `device` again, or `control` `play_here` (the last item here, from where
+     the TV was).
    - `cast-unsupported` / `cast-needs-ffmpeg` / `cast-cpu-too-slow` / `cast-receiver-failed`: that
      channel's format doesn't play on the TV (Tuner converts it when it can); offer another copy
      (`details` `copies`) or `control` `play_here`.

@@ -104,6 +104,9 @@ impl Registry {
         d.experimental = s.experimental;
         d.available = true;
         d.addr = Some(s.addr);
+        if !s.ids.is_empty() {
+            d.ids = s.ids;
+        }
         if !matches!(d.pairing, Pairing::Paired(_)) {
             d.pairing = if s.pairing_required { Pairing::Required } else { Pairing::NotNeeded };
         }
@@ -232,6 +235,7 @@ mod tests {
             experimental: kind == ReceiverKind::AirPlayTv,
             manual: false,
             addr: "192.168.1.5:7000".parse().unwrap(),
+            ids: Default::default(),
         }
     }
 

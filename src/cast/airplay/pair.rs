@@ -14,9 +14,11 @@
 //! Messages, byte for byte pyatv's (checked against `tests/fixtures/cast/vectors/pyatv_0_18_0.json`):
 //! * pair-setup M1 `{Method 0, State 1}`; M3 `{State 3, PublicKey A, Proof M1}`; M5 `{State 5,
 //!   EncryptedData}` sealed with `HKDF(K, "Pair-Setup-Encrypt-Salt", "Pair-Setup-Encrypt-Info")`
-//!   under nonce `PS-Msg05`, holding `{Identifier, PublicKey LTPK, Signature [, 0x12 ACL]}`, the
-//!   signature over `HKDF(K, "Pair-Setup-Controller-Sign-Salt", "…-Info") ‖ id ‖ LTPK`. No
-//!   `Name` TLV (pyatv adds one only when asked for a display name).
+//!   under nonce `PS-Msg05`, holding `{Identifier, PublicKey LTPK, Signature, Name [, 0x12 ACL]}`,
+//!   the signature over `HKDF(K, "Pair-Setup-Controller-Sign-Salt", "…-Info") ‖ id ‖ LTPK`. The
+//!   0x11 `Name` (OPACK `{"name": "Tuner"}`, [`NAME_TLV`]) is always sent, as pyatv's AirPlay
+//!   pairing handler does (it passes its name, `pyatv` by default, to `step3`; PR 2894 sends
+//!   the same name as `X-Apple-Client-Name`), so the TV's paired-controller record is named.
 //! * M4 must carry the server proof `H(A ‖ M1 ‖ K)`; M6 (nonce `PS-Msg06`) the TV's id, LTPK
 //!   and a signature over `HKDF(K, "Pair-Setup-Accessory-Sign-Salt", "…-Info") ‖ id ‖ LTPK`.
 //! * pair-verify M1 `{State 1, PublicKey}`; M2's sealed part (nonce `PV-Msg02`, key
@@ -47,6 +49,9 @@ pub const CONTENT_TYPE: &str = "application/octet-stream";
 /// HKP 5's M5 extra, TLV 0x12: OPACK `{"com.apple.ScreenCapture": true}` (foxCast; pyatv's
 /// `opack.pack` gives the same bytes, checked by `scripts/cast/pyatv_vectors.py`).
 pub const SCREEN_CAPTURE_ACL: &[u8] = b"\xE1\x57com.apple.ScreenCapture\x01";
+/// M5's 0x11 Name: OPACK `{"name": CLIENT_NAME}` (pyatv `hap_srp.step3(name=…)`; `opack.pack`
+/// gives the same bytes, checked by `scripts/cast/pyatv_vectors.py`).
+pub const NAME_TLV: &[u8] = b"\xE1\x44name\x45Tuner";
 
 /// HAP error codes (pyatv `ErrorCode`).
 mod code {
@@ -202,7 +207,8 @@ impl PairSetup {
         Ok(m3)
     }
 
-    /// Verify M4's proof; M5 `{State 5, EncryptedData{Identifier, PublicKey, Signature[, ACL]}}`.
+    /// Verify M4's proof; M5 `{State 5, EncryptedData{Identifier, PublicKey, Signature, Name[,
+    /// ACL]}}` (pyatv's order: the name, then `additional_data`).
     pub fn m5(&mut self, m4: &[u8]) -> Result<Vec<u8>, PairError> {
         let proof = self.proof.as_ref().ok_or(PairError::Failed)?;
         let tlv = decode(m4)?;
@@ -215,7 +221,7 @@ impl PairSetup {
         let id = self.pairing_id.as_bytes();
         let ltpk = ltpk(self.seed.expose());
         let sig = sign(self.seed.expose(), &[controller_sign_key(k).expose(), id, &ltpk])?;
-        let mut inner: Vec<(u8, &[u8])> = vec![(tag::IDENTIFIER, id), (tag::PUBLIC_KEY, &ltpk), (tag::SIGNATURE, &sig)];
+        let mut inner: Vec<(u8, &[u8])> = vec![(tag::IDENTIFIER, id), (tag::PUBLIC_KEY, &ltpk), (tag::SIGNATURE, &sig), (tag::NAME, NAME_TLV)];
         if self.variant == PairVariant::Hkp5 {
             inner.push((tag::ACL, SCREEN_CAPTURE_ACL));
         }
@@ -616,6 +622,7 @@ mod tests {
         client.m3(&m("m2"), &pin()).unwrap();
         assert_eq!(client.m5(&m("m4")).unwrap(), m("m5_hkp5"));
         assert_eq!(unhex(&golden::get()["inputs"]["acl"]), SCREEN_CAPTURE_ACL);
+        assert_eq!(unhex(&golden::get()["inputs"]["name"]), NAME_TLV);
         let mut server = setup_server();
         server.handle(&m("m1"));
         server.handle(&m("m3"));

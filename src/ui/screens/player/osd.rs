@@ -38,10 +38,10 @@ pub(super) struct OptionalButtons {
 
 impl OptionalButtons {
     /// `Up next` with Up next on; `Next` while it has a next item and multi-view is off (Up
-    /// next waits in multi-view). `Cast` with casting on, or while a cast runs (its way off);
-    /// not in multi-view, which can't cast.
+    /// next waits in multi-view). `Cast` with casting on (`cast::on`: built in and not switched
+    /// off in Settings), or while a cast runs (its way off); not in multi-view, which can't cast.
     pub(super) fn of(ctx: &UiCtx<'_>) -> Self {
-        let cast = (crate::cast::ENABLED || ctx.player.cast.is_some()) && !ctx.multiview.on();
+        let cast = (crate::cast::on(ctx.config) || ctx.player.cast.is_some()) && !ctx.multiview.on();
         if !crate::queue::ENABLED {
             return Self { cast, ..Self::default() };
         }

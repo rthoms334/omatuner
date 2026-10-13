@@ -351,7 +351,7 @@ impl Engine {
             Effect::Write(w) => self.write(w).await,
             Effect::Toast(text) => {
                 let action = (text == PAUSED_TOAST).then(|| ("Up next".to_owned(), crate::keymap::Action::GoQueue));
-                self.deps.bus.toast(Toast { kind: ToastKind::Info, text: text.into(), action, ttl_ms: 5000 });
+                self.deps.bus.toast(Toast { kind: ToastKind::Info, text: text.into(), action, also: None, ttl_ms: 5000 });
                 Vec::new()
             }
             Effect::NotifyPin(id) => {

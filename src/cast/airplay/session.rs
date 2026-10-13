@@ -18,6 +18,9 @@
 //! * **The sender identity is foxCast's** (castcli sends the same model and OS): an iPhone, as
 //!   every working sender presents itself, named [`super::CLIENT_NAME`], with
 //!   `cast_identity.sender_mac` as `deviceID` and `macAddress`.
+//! * **A third-party TV** (§7.7) gets VioletRelay's flow, the only one tested on such a TV (a
+//!   Hisense): its TXT identifiers for the `channelID` and the `ClockPorts` key, `SETPEERSX`,
+//!   the type-120 SETUP, and [`stream_headers`] on the type-120 and type-130 SETUPs.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -28,7 +31,7 @@ use tokio::time::MissedTickBehavior;
 
 use super::bplist::Value;
 use super::events::{self, Event};
-use super::features::{self, AirPlayInfo};
+use super::features::{self, AirPlayInfo, ReceiverIds};
 use super::hap::FrameCipher;
 use super::pair::{PairVerify, SessionKeys};
 use super::queue::{self, Spelling};
@@ -55,6 +58,14 @@ pub const SENDER_OS_BUILD: &str = "20F66";
 pub const SENDER_SOURCE_VERSION: &str = "690.7.1";
 /// SETPEERSX's clock port (VioletRelay, third-party TVs only).
 pub const PEER_CLOCK_PORT: i64 = 32768;
+
+/// Third-party TVs: VioletRelay's `_stream_headers` on the type-120 and type-130 SETUPs
+/// (`airplay_modern.py` L285–289, L350–353, L401; facts only), the session id being the base
+/// SETUP's `sessionUUID` in lower case. Never on `/command`: the Hisense SDK rejects the
+/// session and protocol headers there (VioletRelay; `queue::Spelling` negotiates the stream id).
+pub fn stream_headers(req: Request, session_uuid: &str) -> Request {
+    req.header("X-Apple-ProtocolVersion", 1).header("X-Apple-Session-ID", session_uuid.to_ascii_lowercase()).header("X-Apple-Stream-ID", 1)
+}
 
 /// Which connection something happened on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,10 +145,11 @@ pub fn rcs_body(channel_id: &str, client_uuid: &str) -> Value {
     queue::dict([("streams", Value::Array(vec![stream]))])
 }
 
-/// `channelID`: `<psi>-RCS-1` (PR 2899, foxCast); without a `psi`, `<sender MAC>-RCS-1`
-/// (castcli's form; both work on 26.x).
-pub fn channel_id(psi: Option<&str>, sender_mac: &str) -> String {
-    format!("{}-RCS-1", psi.filter(|p| !p.is_empty()).unwrap_or(sender_mac))
+/// `channelID`: `<receiver id>-RCS-1` — an Apple TV's `/info` `psi` (PR 2899, foxCast), a
+/// third-party TV's TXT `psi`, else its `pi` (VioletRelay, [`ReceiverIds::receiver_id`]);
+/// without one, `<sender MAC>-RCS-1` (castcli's form; both work on 26.x).
+pub fn channel_id(receiver_id: Option<&str>, sender_mac: &str) -> String {
+    format!("{}-RCS-1", receiver_id.filter(|p| !p.is_empty()).unwrap_or(sender_mac))
 }
 
 /// Third-party TVs (DESIGN §40 §7.7, VioletRelay `build_playback_stream_body`): a playback stream
@@ -147,7 +159,7 @@ pub fn playback_stream_body() -> Value {
 }
 
 /// Third-party TVs: `SETPEERSX`'s peer list (VioletRelay, facts). The clock-port key is the TV's
-/// `gid`, else its `psi`, else its `pi`.
+/// TXT `gid`, else its `psi`, else its `pi` ([`ReceiverIds::clock_key`]).
 pub fn peers_body(local_ip: &str, correlation: &str, clock_id: i64, receiver_key: &str) -> Value {
     Value::Array(vec![queue::dict([
         ("ID", queue::text(correlation)),
@@ -274,17 +286,20 @@ pub struct Session {
     uri: String,
     session_id: u32,
     stream_id: i64,
+    profile: Profile,
     spelling: Spelling,
 }
 
 impl Session {
     /// Steps 1–6 of DESIGN §40 §7.3 on a new connection to `addr`. Returns the session, what it
     /// learned about the TV, and the stream of raw events (the client owns the only receiver:
-    /// once both tasks end it yields `None`).
+    /// once both tasks end it yields `None`). `txt` are the receiver's TXT identifiers (a
+    /// third-party TV's; an Apple TV's `channelID` comes from `/info`).
     pub async fn establish(
         addr: SocketAddr,
         creds: &Credentials,
         profile: Profile,
+        txt: &ReceiverIds,
     ) -> Result<(Self, ReceiverInfo, mpsc::UnboundedReceiver<Raw>), CastErrorKind> {
         let mut conn = Connection::connect(addr).await.map_err(|_| CastErrorKind::Unreachable)?;
         let trace = Trace::start();
@@ -302,8 +317,9 @@ impl Session {
         let local = conn.local_ip().to_string();
         let mac = super::mac_string(&creds.identity.sender_mac);
         let correlation = super::uuid();
+        let session_uuid = super::uuid();
         let uri = conn.session_uri();
-        let body = setup_body(&local, &super::uuid(), &correlation, &mac);
+        let body = setup_body(&local, &session_uuid, &correlation, &mac);
         let resp = conn.exchange(Request::rtsp("SETUP", uri.clone()).plist(&body)).await.map_err(unreachable)?;
         if !resp.ok() {
             tracing::info!("cast: the TV refused the video session (SETUP answered {})", resp.status);
@@ -333,8 +349,8 @@ impl Session {
             }
         }
 
-        // 5. GET /info: psi (the channel id), the TV's model and versions; without it the channel
-        //    id comes from the sender MAC
+        // 5. GET /info: psi (an Apple TV's channel id), the TV's model and versions; without it
+        //    the channel id comes from the sender MAC
         let info_plist = match tolerate(conn.exchange(Request::http("GET", "/info")).await)? {
             Some(r) if r.ok() => r.plist(),
             r => {
@@ -344,16 +360,20 @@ impl Session {
         };
         let ap = info_plist.as_ref().map(features::from_info).unwrap_or_default();
 
-        // third-party TVs (§7.7): SETPEERSX (404/501 tolerated), then a type-120 playback stream
+        // third-party TVs (§7.7): the TXT record's identifiers, as VioletRelay reads them; `/info`'s
+        // only when the record had none (a TV added by address)
+        let ids = match profile {
+            Profile::AppleTv => ap.ids(),
+            Profile::ThirdParty if txt.is_empty() => ap.ids(),
+            Profile::ThirdParty => txt.clone(),
+        };
+        let mut rcs_setup = Request::rtsp("SETUP", uri.clone());
+
+        // third-party TVs: SETPEERSX (404/501 tolerated), then a type-120 playback stream
         if profile == Profile::ThirdParty {
-            let key = info_plist
-                .as_ref()
-                .and_then(|v| queue::str_of(v.get("gid")).map(str::to_owned))
-                .or(ap.psi.clone())
-                .or(ap.pi.clone())
-                .unwrap_or_default();
+            let key = ids.clock_key().unwrap_or_default();
             let clock_id = i64::try_from(super::random_u64() >> 1).unwrap_or(1).max(1);
-            let body = super::bplist::encode(&peers_body(&local, &correlation, clock_id, &key));
+            let body = super::bplist::encode(&peers_body(&local, &correlation, clock_id, key));
             let peers = Request::rtsp("SETPEERSX", uri.clone()).header("Content-Type", "/peer-list-changed-x").body(body);
             let resp = conn.exchange(peers).await.map_err(unreachable)?;
             match resp.status {
@@ -364,16 +384,23 @@ impl Session {
                     return Err(CastErrorKind::ReceiverFailed);
                 }
             }
-            let resp = conn.exchange(Request::rtsp("SETUP", uri.clone()).plist(&playback_stream_body())).await.map_err(unreachable)?;
+            let playback = stream_headers(Request::rtsp("SETUP", uri.clone()), &session_uuid).plist(&playback_stream_body());
+            let resp = conn.exchange(playback).await.map_err(unreachable)?;
             if !resp.ok() {
                 tracing::info!("cast: the TV refused the playback stream (SETUP answered {})", resp.status);
                 return Err(CastErrorKind::ReceiverFailed);
             }
+            rcs_setup = stream_headers(rcs_setup, &session_uuid);
         }
 
-        // 6. the type-130 remote-control stream: /command answers 500 until it exists
-        let rcs = rcs_body(&channel_id(ap.psi.as_deref(), &mac), &super::uuid());
-        let resp = conn.exchange(Request::rtsp("SETUP", uri.clone()).plist(&rcs)).await.map_err(unreachable)?;
+        // 6. the type-130 remote-control stream: /command answers 500 until it exists. An Apple
+        //    TV's channel id is its /info psi (PR 2899, foxCast)
+        let receiver_id = match profile {
+            Profile::AppleTv => ids.psi.as_deref(),
+            Profile::ThirdParty => ids.receiver_id(),
+        };
+        let rcs = rcs_body(&channel_id(receiver_id, &mac), &super::uuid());
+        let resp = conn.exchange(rcs_setup.plist(&rcs)).await.map_err(unreachable)?;
         let streams = resp.plist().and_then(|v| match v.get("streams") {
             Some(Value::Array(a)) => a.first().cloned(),
             _ => None,
@@ -386,19 +413,21 @@ impl Session {
 
         let info = receiver_info(&ap, creds.peer.variant);
         let session_id = conn.session_id();
-        let session = Self { control: Some(Control::spawn(conn, raw_tx)), events, uri, session_id, stream_id, spelling: Spelling::new(profile) };
+        let session =
+            Self { control: Some(Control::spawn(conn, raw_tx)), events, uri, session_id, stream_id, profile, spelling: Spelling::new(profile) };
         Ok((session, info, raw_rx))
     }
 
-    /// `POST /command` with `cmd` (DESIGN §40 §7.3 step 7). A third-party TV gets the stream-id
-    /// header spellings in turn until one is answered 2xx (§7.7); after that, that one. Any
-    /// status comes back (the caller decides what is fatal); a broken connection is `Unreachable`.
+    /// `POST /command` with `cmd` (DESIGN §40 §7.3 step 7). A third-party TV gets it over RTSP and
+    /// the stream-id header spellings in turn until one is answered 2xx (§7.7); after that, that
+    /// one. Any status comes back (the caller decides what is fatal); a broken connection is
+    /// `Unreachable`.
     pub async fn command(&mut self, cmd: &Value) -> Result<Response, CastErrorKind> {
         let control = self.control.as_ref().ok_or(CastErrorKind::Unreachable)?;
         let body = queue::wrap(cmd);
         let mut last = None;
         for header in self.spelling.candidates() {
-            let resp = control.exchange(queue::request(&body, header, self.stream_id)).await.map_err(unreachable)?;
+            let resp = control.exchange(queue::request(self.profile, &body, header, self.stream_id)).await.map_err(unreachable)?;
             if resp.ok() {
                 self.spelling.confirm(header);
                 return Ok(resp);

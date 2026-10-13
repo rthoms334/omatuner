@@ -218,7 +218,8 @@ struct CastApp {
     last: Option<(crate::model::DeviceId, String)>,
     /// A cast was on at the last frame (a cast that starts while popped out pops back in).
     was_casting: bool,
-    /// What a "casting stopped" alert offers (Cast again), kept for its notification's Show.
+    /// What a "casting stopped" alert offers (Play here, Cast again), kept for its notification's
+    /// Show.
     ended_alert: Option<Toast>,
     /// "Quit anyway" was confirmed: the next close request closes.
     quit_confirmed: bool,
@@ -497,7 +498,14 @@ impl TunerApp {
         let live = crate::ui::video_host::is_live(self.snapshot.playable.as_ref().map(|p| &p.kind));
         let text = crate::ui::overlays::cast_offer::error_sentence(kind, &name, live, convert_off);
         let toast = match kind {
-            _ if ended => Toast { kind: ToastKind::Info, text: text.clone(), action: Some(("Cast again".into(), Action::CastMenu)), ttl_ms: 10_000 },
+            // §3.4 "Play here · Cast again": the last item here from where the TV was, or a TV
+            _ if ended => Toast {
+                kind: ToastKind::Info,
+                text: text.clone(),
+                action: Some(("Play here".into(), Action::PlayHere)),
+                also: Some(("Cast again".into(), Action::CastMenu)),
+                ttl_ms: 10_000,
+            },
             K::NeedsFfmpeg => Toast { ttl_ms: 10_000, ..Toast::error(text.clone()) },
             // the casting card has the actions (Allow on firewall, Pair, Play here…)
             _ => Toast { action: self.has_media().then(|| ("Show".into(), Action::OpenPlayer)), ttl_ms: 10_000, ..Toast::error(text.clone()) },
@@ -881,6 +889,7 @@ impl TunerApp {
                     kind: ToastKind::Info,
                     text: "Catch-up can only seek as far as it has loaded".into(),
                     action: None,
+                    also: None,
                     ttl_ms: 4000,
                 });
             }
@@ -1387,7 +1396,9 @@ impl TunerApp {
         let show = p.show;
         let device = p.device;
         match self.agent_play(p) {
-            AgentPlayed::Sent if device.is_some() => self.drop_player_push(),
+            // a cast (asked for, or one already running: the play lands on its TV) never moves
+            // the window (DESIGN §40 §3.8)
+            AgentPlayed::Sent if device.is_some() || self.snapshot.cast.is_some() => self.drop_player_push(),
             AgentPlayed::Sent => {
                 if show.place == Placement::FullWindow {
                     self.agent_leave_screen();
@@ -2061,7 +2072,9 @@ impl TunerApp {
         let (logs, bus) = (services.logs.clone(), services.bus.clone());
         services.rt.spawn_blocking(move || {
             let toast = match logs.export(&path) {
-                Ok(()) => Toast { kind: ToastKind::Success, text: format!("Log saved to {}", path.display()), action: None, ttl_ms: 4000 },
+                Ok(()) => {
+                    Toast { kind: ToastKind::Success, text: format!("Log saved to {}", path.display()), action: None, also: None, ttl_ms: 4000 }
+                }
                 Err(e) => Toast::error(format!("Couldn't save the log: {e}")),
             };
             bus.toast(toast);
@@ -2103,7 +2116,10 @@ impl TunerApp {
             // screen's): the status chip, a toast's "Cast again" (the picker over the player:
             // the TV chosen there replays the last item, `CastTo { play: None }`)
             Action::StopCasting if self.snapshot.cast.is_some() => self.send_player(PlayerCommand::StopCasting { play_here: false }),
-            Action::CastMenu if crate::cast::ENABLED && !self.mv.view.on => {
+            // the alert after the TV stopped it: casting has ended, the controller replays the
+            // last item here when nothing plays
+            Action::PlayHere => self.send_player(PlayerCommand::StopCasting { play_here: true }),
+            Action::CastMenu if crate::cast::on(&self.services().config()) && !self.mv.view.on => {
                 if self.popout.is_out() || self.video_only {
                     self.toggle_popout(egui_ctx);
                 }
@@ -6427,7 +6443,7 @@ mod tests {
     /// DESIGN §40 §3.8: the window seen with the player on screen leaves the alert to the
     /// casting card; seen elsewhere, a toast with the sentence; not seen, the notification path
     /// (off the desktop it falls back to the toast). A cast that ended on the TV has no card:
-    /// its toast offers Cast again.
+    /// its toast offers Play here and Cast again.
     #[test]
     fn cast_alerts_go_where_the_user_is() {
         use crate::cast::CastErrorKind as K;
@@ -6457,7 +6473,8 @@ mod tests {
         }));
         let last = rig.log().toasts.last().cloned().expect("a toast");
         assert_eq!(last.text, "Living Room stopped playing. Its remote stopped it, or another device took over.");
-        assert_eq!(last.action, Some(("Cast again".into(), Action::CastMenu)));
+        assert_eq!(last.action, Some(("Play here".into(), Action::PlayHere)));
+        assert_eq!(last.also, Some(("Cast again".into(), Action::CastMenu)));
 
         // out of sight: a notification (none off the desktop, so the toast comes back through
         // the bus); the window isn't moved

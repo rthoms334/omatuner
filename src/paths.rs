@@ -93,10 +93,20 @@ impl AppPaths {
 
     /// Create the casting directories (0700). The cast service calls it when it starts; it
     /// also sweeps them (sessions left by a crash; the trace keeps its last 5 files).
+    ///
+    /// Without `XDG_RUNTIME_DIR` the runtime directory is `/tmp/tuner`, where another local user
+    /// could have made it first, with a `cast` symlink into this user's files that the sweep
+    /// would empty. So nothing is created, chmodded or swept unless the runtime directory is a
+    /// real directory of this user that nobody else can enter, and each casting directory a real
+    /// directory of this user (not a symlink); otherwise `Error::Config`, and casting is off.
     pub fn ensure_cast_dirs(&self) -> Result<()> {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let run = &self.runtime_dir;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(run).map_err(|e| Error::io(run, e))?;
+        own_dir(run, true)?;
         for d in [self.cast_live_dir(), self.cast_vod_dir(), self.cast_trace_dir()] {
             std::fs::create_dir_all(&d).map_err(|e| Error::io(&d, e))?;
+            own_dir(&d, false)?;
             std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).map_err(|e| Error::io(&d, e))?;
         }
         // no session runs before the service: whatever is here a crash left (the relay's
@@ -159,6 +169,19 @@ impl AppPaths {
     }
 }
 
+/// `dir` itself (not followed) is a directory owned by this user; `private`: with no group or
+/// other permissions either.
+fn own_dir(dir: &Path, private: bool) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::symlink_metadata(dir).map_err(|e| Error::io(dir, e))?;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    if !m.file_type().is_dir() || m.uid() != me || (private && m.mode() & 0o077 != 0) {
+        return Err(Error::Config(format!("{} isn't a private directory of this user", dir.display())));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +216,27 @@ mod tests {
         assert_eq!(traces.len(), 6, "{traces:?}");
         assert_eq!(traces.first().map(String::as_str), Some("cast-1700000002-002a.jsonl"));
         assert!(traces.contains(&"notes.txt".to_owned()));
+    }
+
+    /// A runtime directory others can enter (the `/tmp` fallback made by another user), or a
+    /// casting directory that is a symlink, is refused before anything is chmodded or swept.
+    #[test]
+    fn a_foreign_runtime_dir_or_a_symlinked_cast_dir_is_never_swept() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let p = AppPaths::rooted(tmp.path());
+        let victim = tmp.path().join("documents");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("thesis.odt"), b"mine").unwrap();
+        let mode = || std::fs::metadata(&victim).unwrap().permissions().mode();
+        let before = mode();
+        std::fs::create_dir_all(&p.runtime_dir).unwrap();
+        std::fs::set_permissions(&p.runtime_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::os::unix::fs::symlink(&victim, p.cast_live_dir()).unwrap();
+        assert!(matches!(p.ensure_cast_dirs(), Err(Error::Config(_))));
+        std::fs::set_permissions(&p.runtime_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(p.ensure_cast_dirs(), Err(Error::Config(_))), "the symlinked cast dir");
+        assert!(victim.join("thesis.odt").is_file());
+        assert_eq!(mode(), before, "not chmodded through the symlink");
     }
 }

@@ -493,7 +493,7 @@ impl Screen for PlayerScreen {
         let live = self.live_ctx;
         let casting = ctx.player.cast.is_some();
         match action {
-            Action::CastMenu if crate::cast::ENABLED || casting => self.cast_menu(ctx),
+            Action::CastMenu if crate::cast::on(ctx.config) || casting => self.cast_menu(ctx),
             Action::StopCasting if casting => ctx.play(PlayerCommand::StopCasting { play_here: false }),
             // a TV with no volume, and keys for what the TV does itself (DESIGN §40 §11.3)
             Action::Mute | Action::VolumeUp | Action::VolumeDown if tv_volume(ctx.player) => self.cast_notice(ctx, TV_VOLUME),
@@ -1449,8 +1449,9 @@ mod tests {
         assert!(has_label(&h, "Volume: use the TV remote") && has_label(&h, "Info") && has_label(&h, "Fullscreen"));
     }
 
-    /// Without a cast the control is only there once casting is switched on (`C` is inert
-    /// before), and it never offers a TV to multi-view.
+    /// Without a cast the control is only there while casting is on — built in and not
+    /// switched off in Settings ▸ Cast (`C` is inert otherwise: no picker without the service
+    /// behind it) — and it never offers a TV to multi-view.
     #[test]
     fn the_cast_control_and_key_wait_for_the_feature() {
         let mut h = player(WIDE);
@@ -1458,6 +1459,14 @@ mod tests {
         h.state_mut().nav();
         assert_eq!(h.state_mut().act(Action::CastMenu), crate::cast::ENABLED);
         assert_eq!(h.state_mut().nav().contains(&NavRequest::Open(OverlayRequest::CastPicker)), crate::cast::ENABLED);
+
+        let mut off = (*h.state().t.config).clone();
+        off.cast.enabled = false;
+        h.state_mut().t.config = Arc::new(off);
+        h.run_steps(3);
+        assert!(!has_label(&h, "Cast to a TV"), "switched off in Settings");
+        h.state_mut().act(Action::CastMenu);
+        assert!(!h.state_mut().nav().contains(&NavRequest::Open(OverlayRequest::CastPicker)));
     }
 
     /// While casting `C` opens the picker; the keys that do nothing on a TV say so in the

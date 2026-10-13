@@ -54,8 +54,9 @@ First read `${CLAUDE_SKILL_DIR}/../../RULES.md` (this plugin's shared rules) and
   catch-up later (spoiler-safe)".
 - **"I'll watch it later" / "don't tell me the score"**: offer `spoiler_guard` `blackout` for
   that programme (confirm), and `mark_seen` once they say they've watched it.
-- **On the TV / full screen / the big screen**: `play` with `open_in: "full_window"`; for what
-  already plays, `control` `window` (it carries on, full screen in Tuner's window).
+- **Full screen / the big screen**: `play` with `open_in: "full_window"`; for what already plays,
+  `control` `window` (it carries on, full screen in Tuner's window). "On the TV" means casting
+  when `cast_devices` lists a TV (next line); with none listed, it is this.
 - **"Put it on the TV" (a TV Tuner casts to, such as the Apple TV)**: `cast_devices`, then `play`
   with `device`; follow rule 12 (the user's yes unless they named the TV, Tuner's window stays
   where it is, `status.casting` to confirm). Say "on the TV" in the confirmation. "Bring it back

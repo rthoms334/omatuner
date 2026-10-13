@@ -337,7 +337,7 @@ seconds; pairing_required: the user pairs the TV in Tuner (Settings ▸ Cast), n
                 json!({
                     "ref": text("Channel, programme, movie, series or episode ref."),
                     "from_start": { "type": "boolean", "default": false },
-                    "open_in": open_in("Where it plays (default: the user's setting: Tuner's window when on screen, else the pop-out). full_window: full screen, the big screen, the TV."),
+                    "open_in": open_in("Where it plays (default: the user's setting: Tuner's window when on screen, else the pop-out). full_window: full screen, the big screen (for a TV that cast_devices lists, use device)."),
                     "device": text("A TV to cast to: a ref from cast_devices, or its exact name."),
                 }),
                 &["ref"],

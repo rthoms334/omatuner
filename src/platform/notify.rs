@@ -620,7 +620,7 @@ impl Engine {
             crate::platform::hypr::focus_self();
         });
         if !self.notifier.show_reminder(note.clone(), on_watch).await {
-            self.bus.toast(Toast { kind: ToastKind::Info, text: note.toast_text(), action: None, ttl_ms: 10_000 });
+            self.bus.toast(Toast { kind: ToastKind::Info, text: note.toast_text(), action: None, also: None, ttl_ms: 10_000 });
         }
     }
 

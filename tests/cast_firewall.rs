@@ -499,12 +499,20 @@ async fn cancel_kills_pkexec() {
     assert!(!alive(pid), "pkexec was left running");
 }
 
+/// The timeout outlasts the fake's start by seconds, and its pid is read before anything is
+/// killed: no race between the shell writing its pid and the timeout.
 #[tokio::test]
 async fn the_timeout_kills_pkexec() {
     let _g = EXEC.lock().await;
     let sb = Sandbox::new();
     sb.put("sleep", "");
-    let outcome = run_with(&sb.env, ALLOW, &rule(), CancellationToken::new(), Duration::from_millis(300)).await;
+    let task = tokio::spawn({
+        let env = sb.env.clone();
+        async move { run_with(&env, ALLOW, &rule(), CancellationToken::new(), Duration::from_secs(3)).await }
+    });
+    let pid = running_pid(&sb).await;
+    assert!(alive(pid));
+    let outcome = tokio::time::timeout(Duration::from_secs(15), task).await.expect("the timeout did not stop the runner").unwrap();
     assert_eq!(outcome, AllowOutcome::TimedOut);
-    assert!(!alive(running_pid(&sb).await), "pkexec was left running");
+    assert!(!alive(pid), "pkexec was left running");
 }

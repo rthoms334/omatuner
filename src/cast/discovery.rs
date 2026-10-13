@@ -53,10 +53,14 @@ pub struct Sighting {
     pub experimental: bool,
     pub manual: bool,
     pub addr: SocketAddr,
+    /// The TXT record's `psi`/`pi`/`gid` (empty for a manual probe: the session reads `/info`
+    /// itself).
+    pub ids: features::ReceiverIds,
 }
 
 /// What a browse reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)] // a few per browse; boxing buys nothing
 pub enum Seen {
     Found(Sighting),
     /// The instance with this [`Sighting::key`] left the network.
@@ -84,6 +88,7 @@ pub fn sighting(info: &features::AirPlayInfo, addr: SocketAddr, key: String, man
         experimental: class.experimental,
         manual,
         addr,
+        ids: if manual { features::ReceiverIds::default() } else { info.ids() },
     })
 }
 

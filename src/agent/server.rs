@@ -498,11 +498,13 @@ impl Inner {
             }
             act::for_device(&mut command, &mut out, device);
         }
+        // without `device` while casting, the play lands on that TV too
+        let casting = if target.is_none() { self.player.snapshot().cast.clone() } else { None };
         // a cast never places the window (DESIGN §40 §3.8): only the PIN prompt raises it
-        let (show, w) = match (&target, pin) {
-            (Some(_), false) => (act::AgentShow::IN_PLACE, self.window()),
-            (Some(_), true) => (act::AgentShow::window(true), self.window()),
-            (None, _) => self.show(asked, pin).await,
+        let (show, w) = match (target.is_some() || casting.is_some(), pin) {
+            (true, false) => (act::AgentShow::IN_PLACE, self.window()),
+            (true, true) => (act::AgentShow::window(true), self.window()),
+            (false, _) => self.show(asked, pin).await,
         };
         if let super::AgentCommand::Play(play) = &mut command {
             play.show = show;
@@ -510,6 +512,11 @@ impl Inner {
         self.bus.send(AppEvent::Agent(command));
         let opened = Self::raise_for(show, w);
         out.opened_in.get_or_insert(opened);
+        if let Some(view) = &casting {
+            act::on_the_tv(&mut out, &view.name);
+            tracing::info!("agent: play {log_ref} → {:?} on cast device {}", out.outcome, view.device.short());
+            return to_value(&out);
+        }
         if let Some((device, _)) = &target {
             tracing::info!("agent: play {log_ref} → {:?} on cast device {}", out.outcome, device.id.short());
             return to_value(&out);
@@ -600,7 +607,8 @@ impl Inner {
         let snap = first.snapshot();
         let idle = |s: &crate::player::PlayerSnapshot| matches!(s.state, crate::player::PlayerState::Idle | crate::player::PlayerState::Ended);
         let view = self.view().0;
-        if let Some(refused) = act::cast_control_guard(c.action, snap.cast.as_ref()) {
+        let tv_stopped = snap.cast.is_none() && idle(&snap) && self.cast_last().error == Some(crate::cast::CastErrorKind::StoppedOnTv);
+        if let Some(refused) = act::cast_control_guard(c.action, snap.cast.as_ref(), tv_stopped) {
             return Err(refused);
         }
         let cmd = match c.action {
@@ -659,9 +667,12 @@ impl Inner {
                 ControlAction::Unmute => !s.muted,
                 ControlAction::PreviousChannel => s.load_generation != was_gen,
                 ControlAction::Popout | ControlAction::Window => true,
+                // after the TV stopped it: the last item playing here again
+                ControlAction::PlayHere if tv_stopped => s.load_generation != was_gen,
                 ControlAction::StopCasting | ControlAction::PlayHere => s.cast.is_none(),
             };
-            let wait = if matches!(c.action, ControlAction::StopCasting | ControlAction::PlayHere) { CAST_STOP_WAIT } else { CONTROL_WAIT };
+            let stops = matches!(c.action, ControlAction::StopCasting | ControlAction::PlayHere) && !tv_stopped;
+            let wait = if stops { CAST_STOP_WAIT } else { CONTROL_WAIT };
             let mut rx = first.subscribe();
             rx.borrow_and_update();
             for t in &targets {

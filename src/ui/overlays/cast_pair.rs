@@ -15,8 +15,11 @@
 //! the connection stays open while the user types (the Apple TV takes the PIN only on the
 //! connection that asked for it) and the overlay waits if the user leaves its workspace; when
 //! the TV drops the code meanwhile, the state says so ("The code expired.") and **Show a new
-//! code** (`pair_new_code`: the next pairing variant) asks again. Each `PairError` has its own
-//! copy ([`failure_copy`]).
+//! code** (`pair_new_code`: the next pairing variant) asks again. A code that didn't match leaves
+//! the TV showing a new one on the same connection: the service goes from `Checking` back to
+//! `EnterCode`, and the overlay, having sent a code, says "That code didn't match. The TV is
+//! showing a new one." and takes the new code. Each `PairError` has its own copy
+//! ([`failure_copy`]).
 //!
 //! Keys are `[TextInput, Modal]` and no new context: digits and Backspace edit the code (read
 //! from the frame's events, so no text field takes focus), Enter pairs once 4 digits are in (or
@@ -125,6 +128,16 @@ pub struct CastPair {
     enter: bool,
     /// The job ended (paired, or failed for good): nothing to cancel.
     ended: bool,
+    /// Where the code last sent is: `EnterCode` after its `Checking` is the TV asking again.
+    sent: Sent,
+}
+
+/// A sent code's progress through the service (`pair_submit` makes the job `Checking` at once).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sent {
+    No,
+    Submitted,
+    Checking,
 }
 
 /// A failure to show: the error, or a job the service no longer knows.
@@ -136,7 +149,18 @@ enum Failure {
 
 impl CastPair {
     pub fn new(device: DeviceId, then_cast: bool) -> Self {
-        Self { device, then_cast, job: None, code: Code::default(), focus: Focus::Code, opened: None, failure: None, enter: false, ended: false }
+        Self {
+            device,
+            then_cast,
+            job: None,
+            code: Code::default(),
+            focus: Focus::Code,
+            opened: None,
+            failure: None,
+            enter: false,
+            ended: false,
+            sent: Sent::No,
+        }
     }
 
     fn armed(&self) -> bool {
@@ -167,6 +191,7 @@ impl CastPair {
         }
         let (Some((cast, job)), Some(pin)) = (&self.job, self.code.take()) else { return };
         cast.pair_submit(*job, pin);
+        self.sent = Sent::Submitted;
     }
 
     /// **Show a new code**: the next variant on the same job, or a fresh job when the service
@@ -175,6 +200,7 @@ impl CastPair {
         self.code.clear();
         self.failure = None;
         self.ended = false;
+        self.sent = Sent::No;
         if let Some((cast, job)) = &mut self.job {
             if interrupted {
                 *job = cast.pair_start(self.device);
@@ -341,18 +367,35 @@ impl Overlay for CastPair {
                 return self.cancel();
             }
             PairState::Failed(e) => {
+                self.sent = Sent::No;
                 if self.failure != Some(Failure::Pair(e)) {
                     self.code.clear();
                 }
                 self.failure = Some(Failure::Pair(e));
             }
             PairState::Gone => {
+                self.sent = Sent::No;
                 if self.failure.is_none() {
                     self.code.clear();
                 }
                 self.failure = self.failure.or(Some(Failure::Interrupted));
             }
-            PairState::Starting | PairState::Checking => egui_ctx.request_repaint_after(Duration::from_millis(100)),
+            PairState::Checking => {
+                if self.sent == Sent::Submitted {
+                    self.sent = Sent::Checking;
+                }
+                egui_ctx.request_repaint_after(Duration::from_millis(100));
+            }
+            PairState::Starting => {
+                self.sent = Sent::No;
+                egui_ctx.request_repaint_after(Duration::from_millis(100));
+            }
+            // asked again after checking a code: it didn't match, the TV shows a new one
+            PairState::EnterCode { .. } if self.sent == Sent::Checking => {
+                self.sent = Sent::No;
+                self.code.clear();
+                self.failure = Some(Failure::Pair(PairError::WrongPin));
+            }
             PairState::EnterCode { .. } => {}
         }
         self.read_keys(egui_ctx, state);
@@ -534,8 +577,9 @@ mod tests {
         assert!(fake.take_calls().contains(&FakeCall::PairCancel(PairJob(1))));
     }
 
-    /// Enter before four digits pairs nothing; a wrong code says so and clears the boxes; the
-    /// code expiring while the user was away says "The code expired."
+    /// Enter before four digits pairs nothing; a wrong code (the service checks it, then asks
+    /// again: the TV shows a new code on the same connection) says so, and the new code is
+    /// typed and sent; the code expiring while the user was away says "The code expired."
     #[test]
     fn a_short_code_a_wrong_code_and_an_expired_code() {
         let (mut h, fake) = pairing();
@@ -544,15 +588,23 @@ mod tests {
         h.run_steps(2);
         assert!(!fake.take_calls().iter().any(|c| matches!(c, FakeCall::PairSubmit(_))), "Enter needs four digits");
         type_digits(&mut h, "1");
-        fake.script(|s| s.pair_state = Some(PairState::Failed(PairError::WrongPin)));
+        h.state_mut().act(Action::Activate);
+        h.run_steps(1);
+        assert_eq!(fake.take_calls().iter().filter(|c| matches!(c, FakeCall::PairSubmit(_))).count(), 1);
+        // what the service does: checking, then the TV asks for its new code (HKP 5 after a 470)
+        fake.script(|s| s.pair_state = Some(PairState::Checking));
         h.run_steps(2);
-        assert!(painted(&h).iter().any(|t| t == "That code didn't match. The TV is showing a new one."));
-        assert_eq!(h.state().o.code.len, 0, "the boxes are cleared");
-        // the service asked again: the TV shows a new code; typing clears the notice
         fake.script(|s| s.pair_state = Some(PairState::EnterCode { variant: PairVariant::Hkp5 }));
         h.run_steps(2);
-        type_digits(&mut h, "2");
+        assert!(painted(&h).iter().any(|t| t == "That code didn't match. The TV is showing a new one."));
+        assert_eq!(h.state().o.code.len, 0, "the boxes are empty");
+        // the new code: typing clears the notice, and it goes to the same job
+        type_digits(&mut h, "2580");
         assert!(!painted(&h).iter().any(|t| t.starts_with("That code didn't match")));
+        assert!(has_label(&h, "Code, 4 of 4 digits"));
+        h.state_mut().act(Action::Activate);
+        h.run_steps(1);
+        assert!(fake.take_calls().contains(&FakeCall::PairSubmit(PairJob(1))), "the new code is sent");
         fake.script(|s| s.pair_state = Some(PairState::Failed(PairError::Expired)));
         h.run_steps(2);
         assert!(painted(&h).iter().any(|t| t == "The code expired."));

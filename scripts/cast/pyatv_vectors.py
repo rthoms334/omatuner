@@ -49,6 +49,8 @@ CONTROLLER_SEED = bytes(range(1, 33))                 # Ed25519 seed, also SRP `
 CLIENT_EPHEMERAL = bytes(range(0x40, 0x60))           # X25519 secret for pair-verify
 SALT = bytes(range(0xA0, 0xB0))                       # first byte non-zero (srptools keeps salts as ints)
 ACL = b"\xe1\x57com.apple.ScreenCapture\x01"          # HKP 5 M5 TLV 0x12 (DESIGN §40 §7.2)
+CLIENT_NAME = "Tuner"                                 # M5 TLV 0x11, as pyatv's AirPlay pairing handler sends its name
+NAME = b"\xe1\x44name\x45Tuner"                       # opack.pack({"name": CLIENT_NAME})
 
 
 def pattern(n, seed=0):
@@ -136,7 +138,7 @@ async def main(out_path):
     hap_srp.os = urandom_queue(CONTROLLER_SEED, bytes(32))
     setup = AirPlayHapPairSetupProcedure(http, setup_srp)
     await setup.start_pairing()
-    creds = await setup.finish_pairing("", PIN_CODE, None)
+    creds = await setup.finish_pairing("", PIN_CODE, CLIENT_NAME)
     (_, _, _), (_, m1, m2), (_, m3, m4), (_, m5, m6) = http.log
     assert creds.atv_id == SERVER_IDENTIFIER.encode() and creds.ltsk == CONTROLLER_SEED
 
@@ -145,9 +147,11 @@ async def main(out_path):
     srp_s = ctx.get_client_premaster_secret(sess._password_hash, sess._server_public, sess._this_private, sess._common_secret)
     k_bytes = bytes.fromhex(srp_hex(sess.key))
 
-    # HKP 5: the same exchange, M5 carries the ScreenCapture ACL (pyatv's `additional_data`)
+    # HKP 5: the same exchange, M5 carries the name and then the ScreenCapture ACL (pyatv's
+    # `additional_data`)
     assert opack.pack({"com.apple.ScreenCapture": True}) == ACL
-    m5_hkp5 = write_tlv({TlvValue.SeqNo: b"\x05", TlvValue.EncryptedData: setup_srp.step3(additional_data={0x12: ACL})})
+    assert opack.pack({"name": CLIENT_NAME}) == NAME
+    m5_hkp5 = write_tlv({TlvValue.SeqNo: b"\x05", TlvValue.EncryptedData: setup_srp.step3(name=CLIENT_NAME, additional_data={0x12: ACL})})
 
     # ---- pair-verify, then the control and event keys
     http.log.clear()
@@ -242,6 +246,7 @@ async def main(out_path):
             "accessory_ephemeral": h(PRIVATE_KEY),
             "salt": h(SALT),
             "acl": h(ACL),
+            "name": h(NAME),
         },
         "tlv8": tlv8,
         "srp": {

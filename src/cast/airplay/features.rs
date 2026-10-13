@@ -43,8 +43,10 @@ pub struct AirPlayInfo {
     pub device_id: Option<String>,
     /// `pi`: the pairing identity (the stable id when present).
     pub pi: Option<String>,
-    /// `psi` (`/info`): the `channelID` prefix.
+    /// `psi`: the `channelID` prefix (an Apple TV's `/info`; a third-party TV's TXT record).
     pub psi: Option<String>,
+    /// `gid`: the group id (a third-party TV keys `SETPEERSX`'s `ClockPorts` by it, §7.7).
+    pub gid: Option<String>,
     pub features: u64,
     pub flags: u64,
     pub act: Option<u32>,
@@ -55,6 +57,40 @@ pub struct AirPlayInfo {
     pub os_build: Option<String>,
     /// TXT `srcvers` / `/info` `sourceVersion` ("960.13.1").
     pub source_version: Option<String>,
+}
+
+/// A receiver's identifiers as VioletRelay reads them from its TXT record (DESIGN §40 §7.7,
+/// `airplay_modern.py` L281–283, facts only): `psi`, else `pi`, is its `receiver_id` — the
+/// type-130 `channelID` prefix — and `gid`, else that id, keys `SETPEERSX`'s `ClockPorts`.
+/// Discovery keeps them with the device (crate only, like its address); a session falls back to
+/// `/info`'s only when the TXT record had none (a TV added by address).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReceiverIds {
+    pub psi: Option<String>,
+    pub pi: Option<String>,
+    pub gid: Option<String>,
+}
+
+impl ReceiverIds {
+    pub fn is_empty(&self) -> bool {
+        self.psi.is_none() && self.pi.is_none() && self.gid.is_none()
+    }
+
+    /// VioletRelay's `receiver_id`: `psi`, else `pi`.
+    pub fn receiver_id(&self) -> Option<&str> {
+        self.psi.as_deref().or(self.pi.as_deref())
+    }
+
+    /// `SETPEERSX`'s `ClockPorts` key: `gid`, else [`ReceiverIds::receiver_id`].
+    pub fn clock_key(&self) -> Option<&str> {
+        self.gid.as_deref().or_else(|| self.receiver_id())
+    }
+}
+
+impl AirPlayInfo {
+    pub fn ids(&self) -> ReceiverIds {
+        ReceiverIds { psi: self.psi.clone(), pi: self.pi.clone(), gid: self.gid.clone() }
+    }
 }
 
 /// How the picker and the first-run card treat a receiver.
@@ -98,6 +134,7 @@ pub fn from_txt(txt: &[(String, String)]) -> AirPlayInfo {
         device_id: get("deviceid"),
         pi: get("pi"),
         psi: get("psi"),
+        gid: get("gid"),
         features: get("features").or_else(|| get("ft")).map_or(0, |f| parse_features(&f)),
         flags: get("flags").or_else(|| get("sf")).map_or(0, |f| parse_flags(&f)),
         act: num("act"),
@@ -131,6 +168,7 @@ pub fn from_info(plist: &bplist::Value) -> AirPlayInfo {
         device_id: string("deviceID"),
         pi: string("pi"),
         psi: string("psi"),
+        gid: string("gid"),
         features,
         flags: int("statusFlags").or_else(|| int("flags")).unwrap_or(0),
         act: int("act").and_then(|v| u32::try_from(v).ok()),
@@ -219,6 +257,10 @@ mod tests {
         }
         assert_eq!(i.psi, None, "a third-party TV's /info has no psi");
         assert_eq!(device_id(&t), device_id(&i));
+        // VioletRelay's identifiers are the TXT record's (`/info` has only `pi`)
+        let psi = "00000000-0000-0000-0000-020000000070";
+        assert_eq!((t.ids().receiver_id(), t.ids().clock_key()), (Some(psi), Some(psi)));
+        assert_eq!(i.ids().receiver_id(), Some("02:00:00:00:00:70"));
     }
 
     #[test]

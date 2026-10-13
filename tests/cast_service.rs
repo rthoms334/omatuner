@@ -2,7 +2,10 @@
 //! against a scripted receiver (`receiver::FakeReceiver`) and relay (`session::FakeRelay`), a
 //! scripted discovery and firewall detection, in a temp profile with a real store. Nothing
 //! touches the LAN, logind or the firewall. Every wait is a bounded poll; the protocol-level fake
-//! TV is `tests/cast_airplay.rs`'s.
+//! TV is `tests/cast_airplay.rs`'s (here only for the pairing job, which talks to the TV itself).
+
+#[path = "support/fake_airplay.rs"]
+mod fake_airplay;
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -11,6 +14,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
+use fake_airplay::{FakeAirPlay, FakeConfig, Tvos};
 use futures_util::future::BoxFuture;
 use tokio_util::sync::CancellationToken;
 use tuner::cast::discovery::{FakeDiscovery, Sighting};
@@ -19,7 +23,9 @@ use tuner::cast::receiver::{Backend, Call, FakeReceiver, FakeRemote, ReceiverEve
 use tuner::cast::relay::{RelayConfig, RelayEvent};
 use tuner::cast::service::{CastDeps, CastService};
 use tuner::cast::session::{FakeRelay, FakeRelayRemote, Links, Relay, RelayCall, Timings};
-use tuner::cast::{CastErrorKind, CastHandle, CastLevel, CastPhase, Credentials, Device, DeviceId, PairVariant, Pairing, PeerCredentials, Protocol};
+use tuner::cast::{
+    CastErrorKind, CastHandle, CastLevel, CastPhase, Credentials, Device, DeviceId, PairState, PairVariant, Pairing, PeerCredentials, Pin, Protocol,
+};
 use tuner::cast::{ReceiverKind, Usability};
 use tuner::config::Config;
 use tuner::model::{ChannelId, HttpHeaders, ItemKey, ItemKind, ItemRef, MediaRef, MovieId, Playable, PlayableKind, SourceId};
@@ -105,6 +111,7 @@ fn sighting(id: DeviceId, name: &str) -> Sighting {
         experimental: false,
         manual: false,
         addr: TV_ADDR.parse().unwrap(),
+        ids: Default::default(),
     }
 }
 
@@ -364,10 +371,15 @@ fn an_irregular_playlist_escalates_once_and_the_next_cast_starts_converted() {
         s.calls.iter().filter_map(|c| if let RelayCall::Load { generation, force, .. } = c { Some((*generation, *force)) } else { None }).collect()
     });
     assert_eq!(loads, [(1, None), (1, Some(CastLevel::Converted))]);
+    // the guard trips again; an event behind it on the same relay channel proves the session
+    // handled it (a Close sent at once would win the session's biased select and skip it)
     relay.emit(RelayEvent::Irregular { generation: 1 });
+    relay.emit(RelayEvent::UpstreamEof { generation: 1 });
+    let evs = wait_event(&out.events, "the event behind it", |e| *e == RemoteEvent::UpstreamEof { generation: 1 });
+    assert!(!evs.iter().any(|e| matches!(e, RemoteEvent::Level(_))), "{evs:?}");
+    assert_eq!(relay.with(|s| s.calls.iter().filter(|c| matches!(c, RelayCall::Load { .. })).count()), 2, "one step only");
     out.cmd.send(RemoteCmd::Close { fast: false }).unwrap();
     until("the relay stops", || relay.with(|s| s.calls.iter().any(|c| matches!(c, RelayCall::Stop { .. }))));
-    assert_eq!(relay.with(|s| s.calls.iter().filter(|c| matches!(c, RelayCall::Load { .. })).count()), 2, "one step only");
 
     let _tv = r.links.receiver();
     let relay = r.links.relay();
@@ -459,6 +471,44 @@ fn casting_needs_a_paired_tv() {
     assert_eq!(err.kind, PlayerErrorKind::Cast(CastErrorKind::PairingRequired));
     assert!(!err.message.contains("Den"), "copy never carries device text");
     drop(r.service);
+}
+
+/// The pairing job against the protocol fake (§7.2, §3.2): a wrong code, or the right one under
+/// HKP 3 on a TV that takes HKP 5 only (the ladder's 470), leaves the TV showing a new code on
+/// the same connection, and the job asks for it again (`EnterCode`, the only state the overlay
+/// takes a code in; `Checking` from the moment one is sent); the new code pairs.
+#[test]
+fn a_wrong_code_or_the_ladder_asks_for_the_new_code_on_the_same_connection() {
+    for (pairing, wrong, variant) in
+        [(fake_airplay::Pairing::Hkp3, true, PairVariant::Hkp3), (fake_airplay::Pairing::Hkp5Only, false, PairVariant::Hkp5)]
+    {
+        let r = rig(&format!("tuner-cast-service-pair-{}", variant.as_str()), calm());
+        let fake = FakeAirPlay::start(FakeConfig { pairing, ..FakeConfig::new(Tvos::V27) });
+        let den = DeviceId::derive("airplay", "den-pi");
+        r.discovery.with(|d| d.sightings = vec![Sighting { key: "Den._airplay._tcp.local.".into(), addr: fake.addr(), ..sighting(den, "Den") }]);
+        r.cast.browse();
+        until("the new TV", || r.cast.devices().iter().any(|d| d.id == den && d.available));
+
+        let job = r.cast.pair_start(den);
+        until("the code on the TV", || matches!(r.cast.pair_state(job), PairState::EnterCode { .. }));
+        let first = fake.shown_pin().expect("a code");
+        let typed = match (wrong, first.as_str()) {
+            (false, _) => first.clone(),
+            (true, "9999") => "8888".into(),
+            (true, _) => "9999".into(),
+        };
+        r.cast.pair_submit(job, Pin::new(&typed).unwrap());
+        until("asked again", || r.cast.pair_state(job) != PairState::Checking);
+        assert_eq!(r.cast.pair_state(job), PairState::EnterCode { variant }, "{}", fake.dump());
+        let second = fake.shown_pin().expect("a new code");
+        assert_ne!(first, second, "the TV shows a new code");
+
+        r.cast.pair_submit(job, Pin::new(&second).unwrap());
+        until("paired", || r.cast.pair_state(job) == PairState::Paired);
+        assert!(r.cast.devices().iter().any(|d| d.id == den && d.pairing == Pairing::Paired(variant)));
+        let conns: std::collections::BTreeSet<usize> = fake.requests().iter().filter(|q| q.uri.starts_with("/pair-")).map(|q| q.conn).collect();
+        assert_eq!(conns.len(), 1, "one connection throughout");
+    }
 }
 
 /// Pairings and hints are per machine (§7.5): a backup never carries a `cast_*` row.

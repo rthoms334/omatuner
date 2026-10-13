@@ -238,6 +238,20 @@ pub fn for_device(command: &mut AgentCommand, out: &mut PlayOut, d: &Device) {
     out.opened_in = Some(OpenedIn::Device);
 }
 
+/// A `play` without `device` while picture A casts: it lands on that TV (the controller's output
+/// is the TV; RULES.md), so it is answered as a device play — the TV named, and no word of a
+/// window, which stays where it is (DESIGN §40 §3.8) unless the PIN prompt needs it (then
+/// `opened_in` stays the window the prompt is in, as for a `play {device}`).
+pub fn on_the_tv(out: &mut PlayOut, tv: &str) {
+    out.device = Some(clean(tv));
+    if out.outcome == PlayOutcome::PinRequired {
+        out.message = clean(&format!("{} It will play on {tv}.", out.message));
+        return;
+    }
+    out.opened_in = Some(OpenedIn::Device);
+    out.message = clean(&format!("{} It's on {tv}.", out.message));
+}
+
 /// The reply to a `play {device}` for an unpaired TV: nothing was sent.
 pub fn pairing_required(out: &PlayOut, d: &Device) -> PlayOut {
     PlayOut {
@@ -292,10 +306,13 @@ pub fn casting_out(snap: &PlayerSnapshot, last: &CastLast) -> Option<CastingOut>
 /// What `control` refuses because of the TV (DESIGN §40 §12): the picture is on it, so there is no
 /// window to move (`popout`, `window`: `unavailable: casting`), the volume is the TV's own
 /// (`volume`, `mute`, `unmute`: `unsupported` on a receiver without one, AirPlay), and
-/// `stop_casting` / `play_here` need a cast.
-pub fn cast_control_guard(action: super::proto::ControlAction, cast: Option<&crate::model::CastView>) -> Option<Fail> {
+/// `stop_casting` / `play_here` need a cast — except `play_here` once the TV stopped one
+/// (`tv_stopped`: `StoppedOnTv` with nothing playing), which plays the last item here from
+/// where the TV was, as the alert's Play here does (the fix skill offers it).
+pub fn cast_control_guard(action: super::proto::ControlAction, cast: Option<&crate::model::CastView>, tv_stopped: bool) -> Option<Fail> {
     use super::proto::ControlAction as A;
     match (action, cast) {
+        (A::PlayHere, None) if tv_stopped => None,
         (A::Popout | A::Window, Some(_)) => {
             Some(Fail::new(ErrorCode::Unavailable, "casting: the picture is on the TV; stop casting or play here first"))
         }
@@ -991,7 +1008,7 @@ mod tests {
             volume,
         };
         let airplay = view(false);
-        let code = |a, v: Option<&CastView>| cast_control_guard(a, v).map(|f| f.code);
+        let code = |a, v: Option<&CastView>| cast_control_guard(a, v, false).map(|f| f.code);
         for window in [A::Popout, A::Window] {
             assert_eq!(code(window, Some(&airplay)), Some(ErrorCode::Unavailable));
             assert_eq!(code(window, None), None, "locally they are allowed");
@@ -1005,11 +1022,14 @@ mod tests {
             assert_eq!(code(stop, None), Some(ErrorCode::Unavailable), "nothing is being cast");
             assert_eq!(code(stop, Some(&airplay)), None);
         }
+        // after the TV stopped it: Play here plays the last item here; there is nothing to stop
+        assert!(cast_control_guard(A::PlayHere, None, true).is_none());
+        assert_eq!(cast_control_guard(A::StopCasting, None, true).map(|f| f.code), Some(ErrorCode::Unavailable));
         // the transport reaches the TV as it is
         for transport in [A::Pause, A::Resume, A::TogglePause, A::Stop, A::PreviousChannel] {
             assert_eq!(code(transport, Some(&airplay)), None);
         }
-        let f = cast_control_guard(A::Window, Some(&airplay)).unwrap();
+        let f = cast_control_guard(A::Window, Some(&airplay), false).unwrap();
         assert!(f.message.starts_with("casting: "), "unavailable: casting");
     }
 }

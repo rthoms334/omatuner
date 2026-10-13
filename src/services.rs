@@ -346,6 +346,12 @@ impl Services {
         }
         // the service reads every other `[cast]` value live (a cast picks it up at its next load)
         if old.cast.enabled != new.cast.enabled {
+            if !new.cast.enabled && self.tiles.handle(TileId::A).snapshot().cast.is_some() {
+                // turned off mid-cast: the picture comes back here (Play here) before the
+                // service goes, else the session's end reads as a lost TV ("isn't answering")
+                // and every later play would try to reopen it
+                self.tiles.handle(TileId::A).send(PlayerCommand::StopCasting { play_here: true });
+            }
             self.stop_cast();
             if crate::cast::ENABLED && new.cast.enabled {
                 self.start_cast();

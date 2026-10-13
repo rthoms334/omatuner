@@ -100,7 +100,8 @@ fn base_of(p: &Prepared) -> String {
 fn raw(port: u16, request_line: &str) -> String {
     let mut s = TcpStream::connect((LOOPBACK, port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    write!(s, "{request_line}\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").unwrap();
+    // a connection the server closes at accept may refuse the write: what came back still counts
+    let _ = s.write_all(format!("{request_line}\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").as_bytes());
     let mut out = Vec::new();
     let _ = s.read_to_end(&mut out);
     String::from_utf8_lossy(&out).lines().filter(|l| !l.to_ascii_lowercase().starts_with("date:")).collect::<Vec<_>>().join("\n")
@@ -199,8 +200,8 @@ async fn a_live_channel_reaches_the_tv_as_an_apple_media_playlist() {
 }
 
 /// A film (`testsrc.mp4`, moov at the end: ffprobe and ffmpeg seek it with `Range` through the
-/// proxy) as an EVENT playlist, and the server's rules: byte-identical 404s for a wrong token, a
-/// wrong peer, other paths and methods; HEAD and `Range`; a view's token serves the shared
+/// proxy) as an EVENT playlist, and the server's rules: byte-identical 404s for a wrong token,
+/// other paths and methods; a wrong peer closed unanswered; HEAD and `Range`; a view's token serves the shared
 /// segments while the old token 404s.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_server_answers_its_token_and_peer_only_and_views_share_the_segments() {
@@ -243,13 +244,13 @@ async fn the_server_answers_its_token_and_peer_only_and_views_share_the_segments
     ] {
         assert_eq!(raw(port, &req), miss, "{req}");
     }
-    // the same token from another host: the same 404
+    // the right token from another host: closed at accept, unanswered (it never holds a slot)
     let other = tempfile::tempdir().unwrap();
     let mut elsewhere = RelaySession::start(config(&other, Ipv4Addr::new(10, 9, 8, 7))).await.unwrap();
     let theirs = elsewhere.load(spec(1, p, None)).await.unwrap();
     let their_port = port_of(theirs.load.url.expose());
     let their_path = theirs.load.url.expose().split_once(&format!(":{their_port}")).unwrap().1.to_owned();
-    assert_eq!(raw(their_port, &format!("GET {their_path} HTTP/1.1")), miss, "wrong peer");
+    assert_eq!(raw(their_port, &format!("GET {their_path} HTTP/1.1")), "", "wrong peer");
     elsewhere.stop(false).await;
 
     // HEAD and Range on a segment
@@ -295,6 +296,43 @@ async fn probe_and_stream_share_one_provider_request() {
     assert_eq!(server.requests_for("/bars.ts").len(), 1, "{:?}", server.requests());
     assert_eq!(server.max_concurrent(), 1);
     relay.stop(false).await;
+}
+
+/// A load dropped mid-way (the session's `play` is cancelled by a zap or a stop) leaves nothing
+/// running: `stop` (as the next load would) closes its provider connection and kills its ffmpeg,
+/// and the generation still reports `UpstreamClosed` (§10: a one-connection account must never
+/// see the abandoned connection beside the next one).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_load_dropped_mid_way_leaves_no_connection_or_ffmpeg() {
+    let Some(media) = media() else { return };
+    let server = TestServer::start(media, Faults::default());
+    // about 24 s to serve bars.ts: an abandoned reader would hold the connection past every wait
+    server.set_throttle(Some(8_000));
+    let dir = tempfile::tempdir().unwrap();
+    let mut relay = RelaySession::start(config(&dir, LOOPBACK)).await.unwrap();
+    let ours = dir.path().to_string_lossy().into_owned();
+    let running = || ffmpeg_cmdlines().iter().filter(|c| c.contains(&ours)).count();
+    let p = playable(PlayableKind::Live, server.url("/bars.ts"), HttpHeaders::default());
+    // hints that suffice: straight to ffmpeg, no probe
+    let hints = CastHints { vcodec: Some("h264".into()), acodec: Some("aac".into()), channels: Some(1), interlaced: Some(false), height: Some(720) };
+    let load = LoadSpec { hints, ..spec(1, p, Some(CastLevel::Converted)) };
+    tokio::select! {
+        r = relay.load(load) => panic!("ready before it could be dropped: {r:?}"),
+        () = poll(Duration::from_secs(20), || running() > 0) => {}
+    }
+    assert_eq!(server.active(), 1, "the dropped load's provider connection");
+    relay.stop(false).await;
+    poll(Duration::from_secs(5), || server.active() == 0 && running() == 0).await;
+    until(&mut relay, Duration::from_secs(1), |e| matches!(e, RelayEvent::UpstreamClosed { generation: 1, .. })).await;
+}
+
+/// Resolves once `done` holds (checked every 50 ms), or panics at `within`.
+async fn poll(within: Duration, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + within;
+    while !done() {
+        assert!(Instant::now() < deadline, "not within {within:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// The provider's answers become the controller's inputs (§11.2): a 403 is `Http(403)` then the

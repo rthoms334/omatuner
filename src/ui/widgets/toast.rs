@@ -108,6 +108,12 @@ impl Toasts {
                                 out = Some(*action);
                                 dismiss = Some(i);
                             }
+                            if let Some((label, action)) = &t.also
+                                && button(ui, theme, None, label, ButtonStyle { bordered: true, ..Default::default() }).clicked()
+                            {
+                                out = Some(*action);
+                                dismiss = Some(i);
+                            }
                             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                 ui.add(egui::Label::new(egui::RichText::new(&t.text).color(tk.fg).size(theme.font(TypeToken::Body))).wrap());
                             });

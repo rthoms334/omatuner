@@ -357,6 +357,9 @@ pub enum Action {
     /// "Stop casting": the player menu, the casting card, the status chip and the picker. No
     /// default key.
     StopCasting,
+    /// "Play here" on the alert after the TV stopped the cast (§3.4 "Play here · Cast again"):
+    /// the last item plays here, from where the TV was. No default key.
+    PlayHere,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1071,7 +1074,7 @@ pub fn feature_on(a: Action) -> bool {
         | A::ClosePicture
         | A::WatchAlongside => crate::ui::multiview::ENABLED,
         A::SleepTimer | A::EndNewsFlash | A::ReminderOptions => crate::reminders::ENABLED,
-        A::CastMenu | A::StopCasting => crate::cast::ENABLED,
+        A::CastMenu | A::StopCasting | A::PlayHere => crate::cast::ENABLED,
         _ => true,
     }
 }

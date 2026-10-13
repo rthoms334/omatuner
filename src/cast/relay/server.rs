@@ -152,7 +152,7 @@ impl LanServer {
         let kill = CancellationToken::new();
         let shared = Arc::new(Shared { peer, grants: Mutex::new(Grants::default()), tx, label });
         let app = axum::Router::new().fallback(handle).with_state(shared.clone());
-        let capped = Capped::new(listener, MAX_CONNECTIONS, kill.clone());
+        let capped = Capped::new(listener, MAX_CONNECTIONS, peer, kill.clone());
         let stop = kill.clone();
         tokio::spawn(async move {
             let serve = axum::serve(capped, app.into_make_service_with_connect_info::<Peer>()).with_graceful_shutdown(stop.cancelled_owned());
@@ -385,18 +385,24 @@ impl Connected<IncomingStream<'_, Capped>> for Peer {
     }
 }
 
-/// A listener that holds at most `n` connections (the next waits in the kernel's backlog), closes
-/// any connection idle for [`IDLE`], and cuts them all when `kill` fires (axum's graceful
-/// shutdown would let a long download finish).
+/// A listener that serves `peer` only, holds at most `n` of its connections (the next waits in
+/// the kernel's backlog), closes any connection idle for [`IDLE`], and cuts them all when `kill`
+/// fires (axum's graceful shutdown would let a long download finish).
+///
+/// A connection from any other host is closed as soon as it is accepted, before it takes a slot
+/// or sends a byte: the ufw rule may admit the whole subnet, and a host that held the 8 slots
+/// (idle, or dripping a byte under the idle limit) would stall the TV's fetches in the backlog
+/// (§9.3). The handler's peer check stays as the second line.
 pub struct Capped {
     inner: TcpListener,
     permits: Arc<Semaphore>,
+    peer: Ipv4Addr,
     kill: CancellationToken,
 }
 
 impl Capped {
-    pub fn new(inner: TcpListener, n: usize, kill: CancellationToken) -> Self {
-        Self { inner, permits: Arc::new(Semaphore::new(n)), kill }
+    pub fn new(inner: TcpListener, n: usize, peer: Ipv4Addr, kill: CancellationToken) -> Self {
+        Self { inner, permits: Arc::new(Semaphore::new(n)), peer, kill }
     }
 }
 
@@ -406,14 +412,18 @@ impl Listener for Capped {
 
     async fn accept(&mut self) -> (Conn, SocketAddr) {
         loop {
-            let permit = self.permits.clone().acquire_owned().await.expect("the semaphore is never closed");
             match self.inner.accept().await {
+                Ok((io, addr)) if addr.ip() != IpAddr::V4(self.peer) => {
+                    drop(io);
+                    tracing::debug!("cast: closed a connection from another host");
+                }
                 Ok((io, addr)) => {
+                    // the receiver's connection waits here (accepted) while all its slots are busy
+                    let permit = self.permits.clone().acquire_owned().await.expect("the semaphore is never closed");
                     let _ = io.set_nodelay(true);
                     return (Conn::new(io, permit, &self.kill), addr);
                 }
                 Err(e) => {
-                    drop(permit);
                     tracing::debug!("cast: accept: {e}");
                     // EMFILE and friends: back off instead of spinning
                     tokio::time::sleep(Duration::from_millis(100)).await;

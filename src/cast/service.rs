@@ -601,7 +601,8 @@ impl Shared {
 /// The HKP 3 → HKP 5 ladder (DESIGN §40 §7.2) runs inside [`PairingSession`] on the pairing
 /// connection: a refused pin-start climbs in `start`, and a 470 at M2–M4 under HKP 3 makes
 /// `finish` ask for a new code with HKP 5 and answer `WrongPin` ("The TV is showing a new
-/// one"); `variant()` then says which variant shows the code. A `Refused` is final.
+/// one"); `variant()` then says which variant shows the code. A wrong code is `EnterCode` again
+/// (the TV waits for its new code on the same connection), never `Failed`. A `Refused` is final.
 async fn pair_task(shared: Arc<Shared>, job: u64, device: DeviceId, mut ops: UnboundedReceiver<PairOp>) {
     let set = |s: PairState| shared.set_pair(job, s);
     let identity = match shared.ensure_identity().await {
@@ -667,10 +668,12 @@ async fn pair_task(shared: Arc<Shared>, job: u64, device: DeviceId, mut ops: Unb
                         }
                         return;
                     }
-                    // the TV shows a new code on the same connection (maybe with HKP 5 now)
+                    // the TV shows a new code on the same connection (maybe with HKP 5 now) and
+                    // waits for it: asked for again, as at the start (the overlay, which saw this
+                    // code go from `Checking` back to `EnterCode`, says it didn't match)
                     Err(PairError::WrongPin) => {
                         variant = s.variant();
-                        set(PairState::Failed(PairError::WrongPin));
+                        set(PairState::EnterCode { variant });
                     }
                     Err(e) => {
                         session = None; // closes the pairing connection
@@ -793,8 +796,11 @@ impl CastApi for Api {
         lock(&self.0.pairs).get(&job.0).map_or(PairState::Gone, |s| s.state)
     }
 
+    /// `Checking` from the moment the code is sent (not when the task picks it up): the overlay
+    /// never reads the `EnterCode` from before it as the TV asking again.
     fn pair_submit(&self, job: PairJob, pin: Pin) {
-        if let Some(slot) = lock(&self.0.pairs).get(&job.0) {
+        if let Some(slot) = lock(&self.0.pairs).get_mut(&job.0) {
+            slot.state = PairState::Checking;
             let _ = slot.ops.send(PairOp::Submit(pin));
         }
     }

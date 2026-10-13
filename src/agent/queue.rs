@@ -231,6 +231,8 @@ fn shows(reply: &QueueReply, moves: bool) -> Shows {
 /// empty pop-out back in. `opened_in` for the result; `None` when nothing started.
 async fn show(h: &Inner, reply: &QueueReply, asked: Option<crate::model::OpenIn>, moves: bool) -> Option<super::proto::OpenedIn> {
     match shows(reply, moves) {
+        // casting: it plays on the TV and the window stays where it is (DESIGN §40 §3.8)
+        Shows::Place { pin: false } | Shows::Stays if h.player.snapshot().cast.is_some() => Some(super::proto::OpenedIn::Device),
         Shows::Place { pin } => {
             let (show, w) = h.show(asked, pin).await;
             h.bus.send(crate::msg::AppEvent::Agent(super::AgentCommand::Show(show)));

@@ -2354,9 +2354,10 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 ### 15.2 Tables (generated: `cargo run --example keymap_md`)
 
 Casting (§40) adds `C` (*Cast to a TV…*, `Action::CastMenu`, in the player's common table) and
-`Action::StopCasting` (no key: the menu, the card, the chip and the picker). Both are gated by
-`keymap::feature_on` on `cast::ENABLED`, so the generated rows list them once casting is switched
-on. The picker and the PIN overlay reuse `Modal` / `List`; there is no new context and no
+`Action::StopCasting` (no key: the menu, the card and the chip; the picker's *This computer* is
+Play here) and `Action::PlayHere` (no key: the alert after the TV stopped a cast). All are gated
+by `keymap::feature_on` on `cast::ENABLED`, so the generated rows list them once casting is
+switched on. The picker and the PIN overlay reuse `Modal` / `List`; there is no new context and no
 global chord (Ctrl+Shift+C is the terminal's copy).
 
 #### Everywhere (`Global`)

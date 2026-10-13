@@ -52,6 +52,14 @@ use crate::redact::Secret;
 /// card, the agent's tools). On since the combined gate (DESIGN §40 §15.0 step 4).
 pub const ENABLED: bool = true;
 
+/// Casting is on: built in ([`ENABLED`]) and not switched off in Settings ▸ Cast
+/// (`cast.enabled`, which stops the service). Off, nothing offers a TV — the OSD control, `C`,
+/// the player menu — rather than a picker with no service behind it; a cast that still runs
+/// keeps its way off.
+pub fn on(cfg: &crate::config::Config) -> bool {
+    ENABLED && cfg.cast.enabled
+}
+
 /// The wire protocol a device speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Protocol {
@@ -139,6 +147,9 @@ pub struct Device {
     /// Where it was last found. Private to the crate: never shown, logged at INFO or sent to an
     /// agent.
     pub(crate) addr: Option<SocketAddr>,
+    /// Its TXT identifiers (a third-party TV's `channelID` and `ClockPorts` key, §7.7), from this
+    /// run's discovery. Private to the crate, like the address.
+    pub(crate) ids: airplay::features::ReceiverIds,
 }
 
 impl Device {
@@ -158,6 +169,7 @@ impl Device {
             available: true,
             last_used: None,
             addr: None,
+            ids: airplay::features::ReceiverIds::default(),
         }
     }
 

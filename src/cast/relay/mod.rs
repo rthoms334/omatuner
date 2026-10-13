@@ -155,8 +155,23 @@ pub struct RelaySession {
     lan: Option<server::LanServer>,
     proxy: Option<upstream::Proxy>,
     current: Option<Pipeline>,
+    /// What a load (or an ending) has started and not handed over yet.
+    pending: Pending,
     /// Pipelines started (each gets its own directory; a view shares its pipeline's).
     started: u64,
+}
+
+/// What a load has opened or started before it becomes [`RelaySession::current`]: its feed (the
+/// provider connection), its pipeline (ffmpeg's monitor and the token that kills ffmpeg) and its
+/// directories. The session's `play` is dropped mid-load by a zap or a stop; whatever that load
+/// had started stays here, and the next load, `stop` or `Drop` ends it (§10: a one-connection
+/// account must never see the abandoned connection beside the new one). `end_current` moves the
+/// pipeline it ends here first, for the same reason.
+#[derive(Default)]
+struct Pending {
+    feed: Option<Arc<upstream::Feed>>,
+    pipeline: Option<(CancellationToken, JoinHandle<()>)>,
+    dirs: Vec<PathBuf>,
 }
 
 /// The generation now producing.
@@ -236,7 +251,7 @@ impl RelaySession {
             CastErrorKind::Unreachable
         })?;
         tracing::debug!("{label}: listening on port {}", lan.addr().port());
-        Ok(Self { cfg, label, sid, tx, rx, lan: Some(lan), proxy: Some(proxy), current: None, started: 0 })
+        Ok(Self { cfg, label, sid, tx, rx, lan: Some(lan), proxy: Some(proxy), current: None, pending: Pending::default(), started: 0 })
     }
 
     pub fn config(&self) -> &RelayConfig {
@@ -253,8 +268,20 @@ impl RelaySession {
     /// failure (§3.4 "Upstream errors: unchanged"): its events are already queued (`Http` or
     /// `ProviderText`, then `UpstreamClosed`), so the controller's reconnect policy acts on them as
     /// it does for mpv, and `load` returns `Err(Unreachable)` with nothing more to add.
+    ///
+    /// Cancel-safe: a load dropped mid-way leaves what it started in [`Pending`], which the next
+    /// load or `stop` ends.
     pub async fn load(&mut self, spec: LoadSpec) -> Result<Prepared, CastErrorKind> {
         self.end_current(false).await;
+        let r = self.prepare(spec).await;
+        if r.is_err() {
+            // whatever the failed attempt left (its own paths end most of it)
+            self.end_pending(false).await;
+        }
+        r
+    }
+
+    async fn prepare(&mut self, spec: LoadSpec) -> Result<Prepared, CastErrorKind> {
         let caps = ffmpeg::caps().await?;
         let p = spec.playable.clone();
         let live = p.kind.is_live();
@@ -263,7 +290,9 @@ impl RelaySession {
         let ctx = upstream::FeedCtx { generation: generation.clone(), tx: self.tx.clone(), label: self.label.clone() };
         let pick = upstream::Pick { profile: plan::profile(spec.receiver), height: spec.hints.height };
         let proxy = self.proxy.as_ref().ok_or(CastErrorKind::Unreachable)?;
-        let feed = proxy.open(ctx, &p.url, &p.headers, &self.cfg.user_agent, pick).await;
+        let feed = proxy.feed(ctx, &p.url, &p.headers, &self.cfg.user_agent);
+        self.pending.feed = Some(feed.clone());
+        feed.open(pick).await;
         if feed.failed() {
             self.drop_feed(&feed).await;
             return Err(UPSTREAM_FAILED);
@@ -375,11 +404,12 @@ impl RelaySession {
     }
 
     /// End a feed that never reached a pipeline (its `UpstreamClosed` releases the lease).
-    async fn drop_feed(&self, feed: &Arc<upstream::Feed>) {
+    async fn drop_feed(&mut self, feed: &Arc<upstream::Feed>) {
         if let Some(proxy) = &self.proxy {
             proxy.forget(feed);
         }
         feed.close(false).await;
+        self.pending.feed = None;
     }
 
     /// A fresh 0700 directory for one pipeline: tmpfs for a live window, the cache for EVENT
@@ -393,6 +423,7 @@ impl RelaySession {
             tracing::warn!("{}: can't create the HLS directory: {e}", self.label);
             CastErrorKind::Unsupported
         })?;
+        self.pending.dirs.push(dir.clone());
         Ok(dir)
     }
 
@@ -426,24 +457,23 @@ impl RelaySession {
             let phase = Arc::new(AtomicU8::new(LOADING));
             let stop = CancellationToken::new();
             let (exit_tx, mut exit_rx) = watch::channel(None);
-            let monitor = tokio::spawn(monitor(
-                child,
-                Watch {
-                    feed: l.feed.clone(),
-                    phase: phase.clone(),
-                    stop: stop.clone(),
-                    exit: exit_tx,
-                    tx: self.tx.clone(),
-                    generation: l.generation.clone(),
-                    live: l.live,
-                    out: out.clone(),
-                    label: self.label.clone(),
-                },
+            self.pending.pipeline = Some((
+                stop.clone(),
+                tokio::spawn(monitor(
+                    child,
+                    Watch {
+                        feed: l.feed.clone(),
+                        phase: phase.clone(),
+                        stop: stop.clone(),
+                        exit: exit_tx,
+                        tx: self.tx.clone(),
+                        generation: l.generation.clone(),
+                        live: l.live,
+                        out: out.clone(),
+                        label: self.label.clone(),
+                    },
+                )),
             ));
-            let quit = |stop: CancellationToken, monitor: JoinHandle<()>| async move {
-                stop.cancel();
-                let _ = monitor.await;
-            };
             let started = Instant::now();
             let mut tick = tokio::time::interval(READY_POLL);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -455,7 +485,7 @@ impl RelaySession {
                         if exit == Some(ffmpeg::Exit::Done) && let Some(pl) = read_playlist(&l.dir).await && !pl.segments.is_empty() {
                             break pl;
                         }
-                        quit(stop, monitor).await;
+                        self.quit_pending().await;
                         return Err(if l.feed.as_ref().is_some_and(|f| f.failed()) { Fail::Upstream } else { Fail::Exited });
                     }
                     _ = tick.tick() => {
@@ -464,14 +494,14 @@ impl RelaySession {
                         }
                         if l.feed.as_ref().is_some_and(|f| !f.final_attached()) && started.elapsed() >= ATTACH_WITHIN {
                             tracing::info!("{}: ffmpeg didn't open its input within {ATTACH_WITHIN:?}", self.label);
-                            quit(stop, monitor).await;
+                            self.quit_pending().await;
                             if attempt == 0 {
                                 continue 'attempt;
                             }
                             return Err(Fail::Exited);
                         }
                         if started.elapsed() >= LOAD_BUDGET {
-                            quit(stop, monitor).await;
+                            self.quit_pending().await;
                             return Err(if l.feed.as_ref().is_some_and(|f| f.failed()) {
                                 Fail::Upstream
                             } else if l.level == CastLevel::Converted {
@@ -491,7 +521,7 @@ impl RelaySession {
             if ended {
                 // ffmpeg ended before the TV got anything: a short stream is what it is
                 if *exit_rx.borrow() != Some(ffmpeg::Exit::Done) {
-                    quit(stop, monitor).await;
+                    self.quit_pending().await;
                     return Err(if l.feed.as_ref().is_some_and(|f| f.failed()) { Fail::Upstream } else { Fail::Exited });
                 }
             }
@@ -502,6 +532,9 @@ impl RelaySession {
             if let Ok(text) = tokio::fs::read_to_string(l.dir.join("index.m3u8")).await {
                 out.serve_playlist(&text, None); // the first segments' IDR check
             }
+            let Some((stop, monitor)) = self.pending.pipeline.take() else { return Err(Fail::Exited) };
+            // handed over: the pipeline, its feed and its directory are `current`'s now
+            self.pending = Pending::default();
             self.current = Some(Pipeline {
                 generation: l.generation.clone(),
                 live: l.live,
@@ -601,7 +634,7 @@ impl RelaySession {
         match self.launch(&caps, launch).await {
             Ok(p) => Ok(p),
             Err(fail) => {
-                let _ = tokio::fs::remove_dir_all(&dir).await;
+                self.end_pending(false).await;
                 Err(match fail {
                     Fail::Kind(k) => k,
                     Fail::Upstream | Fail::Exited => CastErrorKind::NeedsFfmpeg,
@@ -634,27 +667,58 @@ impl RelaySession {
 
     /// Stop-before-start (§8.5): the monitor kills ffmpeg, the feed closes (≤ 1.5 s for the
     /// upstream connection unless `fast`) and reports `UpstreamClosed`, the token goes, and so
-    /// does the pipeline's directory.
+    /// does the pipeline's directory. What a dropped load or ending left goes first.
     async fn end_current(&mut self, fast: bool) {
+        self.end_pending(fast).await;
         let Some(p) = self.current.take() else { return };
-        p.stop.cancel();
         if let Some(lan) = &self.lan {
             lan.revoke_all();
         }
-        if !fast {
-            let _ = tokio::time::timeout(Duration::from_secs(2), p.monitor).await;
+        // through the pending slot: an ending dropped half-way is finished by the next one
+        self.pending = Pending { feed: p.feed, pipeline: Some((p.stop, p.monitor)), dirs: vec![p.out.dir.clone()] };
+        self.end_pending(fast).await;
+    }
+
+    /// End what [`Pending`] holds: ffmpeg is told to die and the feed's requests are cancelled at
+    /// once (nothing outlives a drop of this future), then the monitor is awaited (≤ 2 s unless
+    /// `fast`), the feed closes (its `UpstreamClosed`, once) and the directories go.
+    async fn end_pending(&mut self, fast: bool) {
+        if let Some((stop, _)) = &self.pending.pipeline {
+            stop.cancel();
         }
-        if let Some(feed) = &p.feed {
+        if let Some(feed) = &self.pending.feed {
             if let Some(proxy) = &self.proxy {
                 proxy.forget(feed);
             }
+            feed.cancel_all();
+        }
+        if let Some((_, monitor)) = &mut self.pending.pipeline
+            && !fast
+        {
+            let _ = tokio::time::timeout(Duration::from_secs(2), monitor).await;
+        }
+        self.pending.pipeline = None;
+        if let Some(feed) = self.pending.feed.clone() {
             feed.close(fast).await;
         }
-        if fast {
-            let _ = std::fs::remove_dir_all(&p.out.dir);
-        } else {
-            let _ = tokio::fs::remove_dir_all(&p.out.dir).await;
+        self.pending.feed = None;
+        for dir in std::mem::take(&mut self.pending.dirs) {
+            if fast {
+                let _ = std::fs::remove_dir_all(&dir);
+            } else {
+                let _ = tokio::fs::remove_dir_all(&dir).await;
+            }
         }
+    }
+
+    /// Stop the pipeline `launch` is waiting on and wait for its monitor (ffmpeg killed); its
+    /// feed and directory stay for the caller.
+    async fn quit_pending(&mut self) {
+        if let Some((stop, monitor)) = &mut self.pending.pipeline {
+            stop.cancel();
+            let _ = monitor.await;
+        }
+        self.pending.pipeline = None;
     }
 
     /// Remove the session's directories (both roots).
@@ -675,6 +739,13 @@ impl Drop for RelaySession {
             if let Some(feed) = &p.feed {
                 feed.cancel_all();
             }
+        }
+        if let Some((stop, monitor)) = self.pending.pipeline.take() {
+            stop.cancel();
+            monitor.abort();
+        }
+        if let Some(feed) = self.pending.feed.take() {
+            feed.cancel_all();
         }
         if let Some(lan) = self.lan.take() {
             lan.shutdown();

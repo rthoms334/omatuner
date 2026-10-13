@@ -15,9 +15,13 @@
 //! * **The start position is always 0**: every playlist the TV gets starts where playback should
 //!   (a `-ss` restart or a playlist view, §8.5), so nothing depends on whether tvOS honours a
 //!   start key (Screenbox: tvOS 26 ignores it).
-//! * **Headers** (Apple TV): `Content-Type` and `X-Apple-StreamID`, spelt exactly so — the
-//!   hyphenated `X-Apple-Stream-ID` gets a 200 on an Apple TV but the item never starts
-//!   (VioletRelay). No `X-Apple-ProtocolVersion` or `X-Apple-Session-ID` (a Hisense rejects them).
+//! * **Headers** (Apple TV): `POST /command HTTP/1.1` with `Content-Type` and `X-Apple-StreamID`,
+//!   spelt exactly so — the hyphenated `X-Apple-Stream-ID` gets a 200 on an Apple TV but the
+//!   item never starts (VioletRelay). No `X-Apple-ProtocolVersion` or `X-Apple-Session-ID` (a
+//!   Hisense rejects them on `/command`).
+//! * **A third-party TV** gets `POST /command RTSP/1.0`, as VioletRelay sends it through pyatv's
+//!   `RtspSession.exchange` (the mux adds CSeq, DACP-ID, Active-Remote, Client-Instance and
+//!   pyatv's User-Agent), with the negotiated stream-id header (§7.7).
 
 use super::Profile;
 use super::bplist::{self, Value};
@@ -204,10 +208,15 @@ impl Spelling {
     }
 }
 
-/// `POST /command HTTP/1.1` with PR 2899's headers (User-Agent, Content-Type) and the stream
-/// header.
-pub fn request(body: &Value, header: StreamHeader, stream_id: i64) -> Request {
-    let req = Request::http("POST", "/command").header("User-Agent", COMMAND_USER_AGENT).header("Content-Type", BPLIST_CONTENT_TYPE);
+/// `POST /command` with the stream header: an Apple TV's over HTTP/1.1 with PR 2899's headers
+/// (User-Agent, Content-Type); a third-party TV's over RTSP/1.0 with the Content-Type, as
+/// VioletRelay's `send` (pyatv `RtspSession.exchange`, its default User-Agent).
+pub fn request(profile: Profile, body: &Value, header: StreamHeader, stream_id: i64) -> Request {
+    let req = match profile {
+        Profile::AppleTv => Request::http("POST", "/command").header("User-Agent", COMMAND_USER_AGENT),
+        Profile::ThirdParty => Request::rtsp("POST", "/command"),
+    };
+    let req = req.header("Content-Type", BPLIST_CONTENT_TYPE);
     let req = match header.name() {
         Some(name) => req.header(name, stream_id),
         None => req,
@@ -290,14 +299,17 @@ mod tests {
     #[test]
     fn the_stream_header_is_spelt_exactly_and_negotiated_for_third_parties() {
         let body = wrap(&set_rate(1.0));
-        let req = request(&body, StreamHeader::StreamId, 7);
+        let req = request(Profile::AppleTv, &body, StreamHeader::StreamId, 7);
         assert_eq!((req.method, req.uri.as_str(), req.proto.as_str()), ("POST", "/command", "HTTP/1.1"));
         assert!(req.headers.contains(&("X-Apple-StreamID".to_owned(), "7".to_owned())));
         assert!(req.headers.contains(&("Content-Type".to_owned(), BPLIST_CONTENT_TYPE.to_owned())));
         for never in ["X-Apple-Stream-ID", "X-Apple-ProtocolVersion", "X-Apple-Session-ID"] {
             assert!(!req.has_header(never), "{never}");
         }
-        assert!(!request(&body, StreamHeader::Omitted, 7).headers.iter().any(|(k, _)| k.starts_with("X-Apple")));
+        // a third-party TV: RTSP (VioletRelay), the stream header as negotiated, nothing else
+        let other = request(Profile::ThirdParty, &body, StreamHeader::Omitted, 7);
+        assert_eq!((other.uri.as_str(), other.proto.as_str()), ("/command", "RTSP/1.0"));
+        assert!(!other.headers.iter().any(|(k, _)| k.starts_with("X-Apple")));
 
         let mut apple = Spelling::new(Profile::AppleTv);
         assert_eq!(apple.candidates(), [StreamHeader::StreamId]);

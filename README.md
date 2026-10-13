@@ -1140,7 +1140,7 @@ and the picture format in one go.
 
 The player shows a casting card: the channel, what is on, *Playing on Living Room*, and
 *Stop casting* and *Play here* (back to this computer, carrying on from where the TV was). `C`
-then Enter also stops. Pause, resume, seek (films, episodes and catch-up) and zapping work as
+then Enter is *Play here*: the picker opens on *This computer*. Pause, resume, seek (films, episodes and catch-up) and zapping work as
 usual and reach the TV; everything you start while casting plays on the TV, including Up next,
 reminders that switch channel and what an agent plays. Volume is the TV remote's job. Closing
 Tuner asks first, because it would stop the picture. Failures are told in one sentence: in the

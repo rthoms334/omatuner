@@ -80,7 +80,7 @@ impl Backend {
                     ReceiverKind::AirPlayTv => airplay::Profile::ThirdParty,
                     _ => airplay::Profile::AppleTv,
                 };
-                airplay::Client::connect(addr, creds, profile).await.map(Backend::AirPlay)
+                airplay::Client::connect(addr, creds, profile, &device.ids).await.map(Backend::AirPlay)
             }
             Protocol::GoogleCast | Protocol::Dlna => Err(CastErrorKind::Unsupported),
         }

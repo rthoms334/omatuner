@@ -1740,6 +1740,59 @@ mod casting {
         assert_no_address(&out);
     }
 
+    /// While picture A casts to Living Room, a `play` without `device` lands on that TV
+    /// (RULES.md): the reply says so (`opened_in: device`, the TV's name), and the window is
+    /// neither popped out nor raised (DESIGN §40 §3.8), whatever "Agents play in" says.
+    #[test]
+    fn a_play_without_a_device_while_casting_stays_on_the_tv() {
+        let (mut w, tvs) = cast_world(Config::default());
+        w.publish(Visibility::NO_EXPLICIT);
+        // the session's far ends live as long as the test
+        let ends: Arc<std::sync::Mutex<Vec<Box<dyn std::any::Any + Send>>>> = Arc::default();
+        let keep = ends.clone();
+        tvs.fake.script(move |s| {
+            s.open = Some(Box::new(move |device| {
+                let (cmd, cmds) = tokio::sync::mpsc::unbounded_channel::<tuner::player::remote::RemoteCmd>();
+                let (events_tx, events) = crossbeam_channel::unbounded::<tuner::player::remote::RemoteEvent>();
+                keep.lock().unwrap().push(Box::new((cmds, events_tx)));
+                let view = tuner::model::CastView {
+                    device,
+                    name: "Living Room".into(),
+                    kind: ReceiverKind::AppleTv,
+                    phase: tuner::model::CastPhase::Connecting,
+                    level: None,
+                    behind_live_s: None,
+                    can_seek: true,
+                    volume: false,
+                };
+                Ok(tuner::player::remote::RemoteOutput { cmd, events, view })
+            }));
+        });
+        let id: i64 = w.ui.services().store.reader().unwrap().query_row("SELECT id FROM channel WHERE key = 'm3u:bbc1'", [], |r| r.get(0)).unwrap();
+        let a = w.ui.services().tiles.handle(tuner::model::TileId::A);
+        let media = MediaRef::Channel(tuner::model::ChannelId(id));
+        let play = tuner::player::PlayRequest { media, zap: None, origin: tuner::model::PlayOrigin::Cli, resume: false, immediate: true };
+        a.send(tuner::player::PlayerCommand::CastTo { device: tvs.living.id, play: Some(play) });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while a.snapshot().cast.is_none() {
+            assert!(Instant::now() < deadline, "picture A never started casting");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let out = w.ok("play", json!({ "ref": "channel:1:m3u:bbc1" }));
+        assert_eq!(
+            (out["outcome"].as_str(), out["opened_in"].as_str(), out["device"].as_str()),
+            (Some("playing"), Some("device"), Some("Living Room")),
+            "{out}"
+        );
+        assert!(out["message"].as_str().unwrap().ends_with("It's on Living Room.") && !mentions(&out, "pop-out"), "{out}");
+        match &w.commands()[..] {
+            [AgentCommand::Play(p)] => assert_eq!((p.device, p.show), (None, AgentShow::IN_PLACE), "the window is not placed or raised"),
+            other => panic!("{other:?}"),
+        }
+        drop(ends);
+    }
+
     /// What stops a cast is typed, never device text: no such TV, a Mac, two pictures on, the
     /// firewall known to block the port. An unknown firewall, or one not looked at toward a
     /// network, blocks nothing here.
@@ -1785,7 +1838,7 @@ mod casting {
 
     /// `status.casting` after a cast ended without the user asking: the TV and the typed reason,
     /// so an agent can say what happened while Tuner is out of sight; nothing is claimed when no
-    /// cast failed. `control stop_casting` needs a cast.
+    /// cast failed. `control stop_casting` needs a cast; `play_here` after the TV stopped it doesn't.
     #[test]
     fn status_and_control_speak_of_a_cast_that_ended() {
         let (mut w, tvs) = cast_world(Config::default());
@@ -1803,10 +1856,11 @@ mod casting {
         );
         assert_eq!(st["state"], "idle");
 
-        for action in ["stop_casting", "play_here"] {
-            let (code, message) = refused(&mut w, "control", json!({ "action": action }));
-            assert_eq!(code, ErrorCode::Unavailable, "{action}: {message}");
-        }
+        let (code, message) = refused(&mut w, "control", json!({ "action": "stop_casting" }));
+        assert_eq!(code, ErrorCode::Unavailable, "{message}");
+        // the alert's Play here (the fix skill offers it): the last item here, nothing to replay
+        // in this world
+        assert_eq!(w.ok("control", json!({ "action": "play_here" }))["state"], "idle");
         assert_eq!(w.err("control", json!({ "action": "stop_casting", "value": 1 })), ErrorCode::BadRequest);
     }
 

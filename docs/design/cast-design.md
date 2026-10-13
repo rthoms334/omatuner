@@ -400,12 +400,13 @@ Settings ▸ Cast
 
 | Key | Action | Where |
 |---|---|---|
-| `C` | `Action::CastMenu`: "Cast to a TV…". While casting it opens the picker with "This computer" focused, so stopping is `C` then Enter. | `PLAYER_COMMON` (checked free) |
-| — | `Action::StopCasting`: "Stop casting". No default key; it is in the menu, the card, the chip and the picker. | — |
+| `C` | `Action::CastMenu`: "Cast to a TV…". While casting it opens the picker with "This computer" focused, so `C` then Enter is Play here (back to this computer). | `PLAYER_COMMON` (checked free) |
+| — | `Action::StopCasting`: "Stop casting". No default key; it is in the menu, the card and the chip (the picker offers Play here, `StopCasting { play_here: true }`). | — |
+| — | `Action::PlayHere`: "Play here" on the alert after the TV stopped the cast (§3.4 "Play here · Cast again"). No default key. | — |
 | Enter / ↑↓ / Esc | Picker and PIN overlay. They reuse the `Modal`/`List` contexts, so there is no new `KeyContext`. | — |
 
 - There is no global chord, because Ctrl+Shift+C is the terminal copy chord.
-- `feature_on`: `A::CastMenu | A::StopCasting => crate::cast::ENABLED`.
+- `feature_on`: `A::CastMenu | A::StopCasting | A::PlayHere => crate::cast::ENABLED`. With casting switched off in Settings (`cast::on`), `C` and the player's cast controls do nothing and aren't shown; a cast that still runs keeps its way off.
 - Regenerate DESIGN §15.2 and the README key tables with `cargo run --example keymap_md`.
 
 ### 3.8 When Tuner isn't on a visible workspace
@@ -676,6 +677,7 @@ The exception is `stream_info` while the info panel is open, which is filled fro
 - `Integrations` gains `cast: Option<CastService>`.
 - It is started in `start_integrations` (`:155-217`) through `ok()`, so a failure means no casting, never a crash.
 - `apply_config` (`:289-353`) restarts it on `[cast]` changes using the mpris pattern (`.take().stop()`, then start if enabled).
+  - Turning casting off while picture A casts sends A `StopCasting { play_here: true }` first: the picture comes back here, instead of the session's end reading as a lost TV and every later play trying to reopen it.
 - `AppShared::set_cast(CastHandle)` exposes it to the UI and the agent (the `set_queue_handle` slot pattern).
 
 **Shutdown (`:408-433`)**
@@ -884,7 +886,7 @@ POST /pair-setup M1 {Method 0, State 1}                   ─────▶
 SRP-6a (3072, g=5, SHA-512; padded k and u; unpadded M1 proof)
 POST /pair-setup M3 {State 3, PublicKey A, Proof}         ─────▶
                                                      ◀───── M4 {State 4, Proof} │ {Error 2: wrong PIN}   (proof verified)
-POST /pair-setup M5 {State 5, EncryptedData{Identifier, PublicKey LTPK, Signature [, 0x12 ACL]}} ─────▶
+POST /pair-setup M5 {State 5, EncryptedData{Identifier, PublicKey LTPK, Signature, 0x11 Name [, 0x12 ACL]}} ─────▶
                                                      ◀───── M6 {State 6, EncryptedData{Identifier, PublicKey, Signature, …}}
                                                             (signature verified; unknown TLVs ignored)
 store: cast_identity (once per install) · cast_device.peer_id + peer_ltpk + pair_kind + paired_at
@@ -895,7 +897,7 @@ store: cast_identity (once per install) · cast_device.peer_id + peer_ltpk + pai
 | | **HKP 3** (first) | **HKP 5 + ScreenCapture ACL** (fallback) |
 |---|---|---|
 | Headers on `/pair-pin-start` and every `/pair-setup` | `X-Apple-HKP: 3`, `X-Apple-Client-Name: Tuner`, `Content-Type: application/octet-stream`, `User-Agent: AirPlay/320.20` | `X-Apple-HKP: 5`, `X-Apple-Client-Name: Tuner`, `X-Apple-Client-ID: <pairing UUID>`, same Content-Type and User-Agent. `/pair-pin-start` adds `X-Apple-SupportedPINLengths: 4`. |
-| M5 extra | — | TLV 0x12 = `E1 57 "com.apple.ScreenCapture" 01` (OPACK `{"com.apple.ScreenCapture": true}`) |
+| M5 extra | TLV 0x11 Name = OPACK `{"name": "Tuner"}` (`E1 44 "name" 45 "Tuner"`): pyatv's AirPlay pairing handler always passes its name to `step3`, and PR 2894 sends the same name as `X-Apple-Client-Name` | the same Name, then TLV 0x12 = `E1 57 "com.apple.ScreenCapture" 01` (OPACK `{"com.apple.ScreenCapture": true}`), in pyatv's order (name, then `additional_data`) |
 | `/pair-verify` headers | `X-Apple-HKP: 3`, client name | the same as pair-setup, plus `X-Apple-PD: 1` |
 | Evidence | castcli: AppleTV14,1, tvOS 26.6, video played. PR 2894: PIN shown on 14,1 with tvOS 27. | foxCast: AppleTV11,1, tvOS 27, URL video. doubletake: tvOS 27. |
 | Source | pyatv `hap.py` + PR 2894 | foxCast `pairing.go` (facts) |
@@ -1013,7 +1015,7 @@ The sequence is PR 2899's and foxCast's, which agree on it. foxCast has hardware
 - **Headers on `/command`** (Apple TV) are exactly foxCast's minimal form, which works on tvOS 27:
   - `Content-Type` and **`X-Apple-StreamID`**, spelt exactly so. VioletRelay found that the hyphenated `X-Apple-Stream-ID` gets a 200 on an Apple TV but the item never starts.
   - No `X-Apple-ProtocolVersion` or `X-Apple-Session-ID`. Apple TVs tolerate them, but they aren't needed, and the Hisense rejects them.
-- **`channelID`** is `<psi>-RCS-1` (PR 2899, foxCast). Without a `psi` it is `<sender MAC>-RCS-1`, castcli's form; both work on 26.x.
+- **`channelID`** is `<psi>-RCS-1` (PR 2899, foxCast), an Apple TV's `/info` `psi`. Without a `psi` it is `<sender MAC>-RCS-1`, castcli's form; both work on 26.x. A third-party TV's comes from its TXT record (§7.7).
 - The type-130 SETUP is **not** the MRP tunnel, which is `controlType 2` with `clientTypeUUID 1910A70F-…`. The `A6B27562-…` client type is the "UrlFling" constant, confirmed independently by LIVI and DiPlay.
 - **The sender identity strings** are foxCast's. castcli sends the same model and OS with `sourceVersion 960.13.1`. Every working sender presents itself as an iPhone.
 
@@ -1125,9 +1127,11 @@ Each session logs one INFO line without addresses: `cast: AppleTV14,1 tvOS 26.6 
 - The differences come from VioletRelay `airplay_modern.py` L84–300. VioletRelay reports them working on a Hisense 100E75LE, the same family as the user's 85E75LE:
   - a playback-stream `SETUP {streams:[{type: 120}]}` before the type-130 SETUP;
   - `SETPEERSX /peer-list-changed-x` is sent, and a 404 or 501 is tolerated;
-  - the stream-id header is negotiated in this order: `X-Apple-Stream-ID`, none, `X-Apple-StreamID`. `X-Apple-ProtocolVersion` and `X-Apple-Session-ID` are never sent;
+  - `/command` goes out as `POST /command RTSP/1.0`, as VioletRelay sends it through pyatv's `RtspSession.exchange` (with CSeq, DACP-ID, Active-Remote and Client-Instance);
+  - the stream-id header on `/command` is negotiated in this order: `X-Apple-Stream-ID`, none, `X-Apple-StreamID`. `X-Apple-ProtocolVersion` and `X-Apple-Session-ID` are never sent on `/command`: the Hisense SDK rejects them on the queue endpoint;
+  - the type-120 and type-130 SETUPs carry VioletRelay's stream headers: `X-Apple-ProtocolVersion: 1`, `X-Apple-Session-ID: <the base SETUP's sessionUUID, lower case>` and `X-Apple-Stream-ID: 1`;
   - the item adds `HLS-Content-Location` (the same URL), `isAudioOnly false`, `streamType 1`, and a `Start-Position` with timescale 1000 and value 0. VioletRelay: "the receiver uses this key—not the URL suffix—to select its HLS/MSE player".
-  - `/info` may have no `psi`, so the `channelID` comes from the sender MAC.
+  - the identifiers come from the TXT record, as VioletRelay reads them (`airplay_modern.py` L281–283, L331, L407): the `channelID` is `<TXT psi, else TXT pi>-RCS-1`, and `SETPEERSX`'s `ClockPorts` is keyed by the TXT `gid`, else that id. The Hisense's `/info` has only `pi` (no `psi` or `gid`). Discovery keeps the TXT identifiers with the device; only a TV the record never named (one added by address) falls back to `/info`'s, then to the sender MAC.
 - Its player is hls.js 4.0.16 (`playbackCapabilities`), so HLS only: L2 TS for progressive H.264, L3 otherwise.
 - Nobody has run this against an 85E75LE. It is §18 item 14. If it fails, the TVs are hidden by default (`cast.experimental = false`) and Phase 2/3 reach them over Cast or DLNA.
 
@@ -1156,6 +1160,8 @@ TV ◀──────── LAN server <lan-ip>:47800 /c/<tok>/… (token, pe
   - So ffprobe and then ffmpeg read the same first bytes without opening a second provider connection [PL §4].
   - The buffer is dropped once ffmpeg passes it. If ffmpeg doesn't attach within 10 s, the attempt is restarted.
 - **One upstream request per token at a time.** A new request (ffmpeg seeking with `Range` on VOD) cancels the previous one.
+  - Every upstream request carries `Range: bytes=<from>-`, from 0 too, as ffmpeg's `http` (and so mpv) sends it. The proxy tells ffmpeg the input is seekable (206, `Content-Range`) only when the provider is (a 206 or `Accept-Ranges: bytes`); a provider that ignores `Range` is served as a plain 200, so ffmpeg never seeks to bytes the proxy could only reach by buffering everything before them.
+  - Each provider read is timed on its own (15 s, the player's `network-timeout`), never the gap since the last one: a pump held back by its reader (a paused TV with ffmpeg stopped at the VOD cap) isn't a stalled provider.
 - **HLS upstream: the proxy picks one variant itself.** It rewrites the URIs to `/u/<tok>/r/<n>` (a table of `Secret` upstream URLs) and serves ffmpeg a single media playlist.
   - The pick is the variant mpv was playing, else the highest bandwidth the receiver can take.
   - Otherwise ffmpeg's HLS demuxer may open several variants at once and break a one-connection account.
@@ -1223,7 +1229,7 @@ plan(receiver, kind, hints, cfg) →
 | L2 | `-map 0:v:0 -map 0:a:<chosen> -c:v copy -c:a copy │ aac -ac 2 -b:a 160k` | "Repackaged" |
 | L3 | `-c:v libx264 -preset veryfast -profile:v high -level 4.1 -crf 21 -maxrate 8M -bufsize 16M -g <2×fps> -sc_threshold 0 [-vf yadif=deint=interlaced,scale=-2:'min(1080,ih)']` + AAC stereo | "Converted" (CPU only: this M2 has no usable hardware encoder [PL change 3]) |
 
-**Escalation at runtime.** One step only, then the result is cached in `cast_hint`. Any of these moves L2 to L3:
+**Escalation at runtime.** One step only, then the result is cached in `cast_hint`: when the step is taken, not at L3's first picture, because L2's 15 s and L3's own start can outlast the controller's 30 s load timeout on live, and its retry (a new generation) must start at L3 rather than on L2 again. Any of these moves L2 to L3:
 - the TV fetched segments but never reached `playing` within 15 s;
 - the TV reported a failure;
 - the playlist guard tripped.
@@ -1304,7 +1310,7 @@ The audio track is the one mpv had selected, else the default track, else the fi
 
 **Requests**
 - **Routes:** only `GET` or `HEAD` on `/c/<tok>/<file>`, where `<file>` matches `^(index\.m3u8|init\.mp4|s\d{1,7}\.(ts|m4s))$`. Every other path or method returns the same 404 (not 405), with no body differences.
-- **Peer check:** the peer IP must be the session receiver's IP. Otherwise it gets the same 404, so the server can't be used as an oracle. These misses are logged at debug, redacted.
+- **Peer check:** the peer IP must be the session receiver's IP. A connection from any other host is closed as soon as it is accepted, before it takes one of the 8 connection slots or is read: the ufw rule may admit the whole subnet, and a host holding every slot would stall the TV's fetches. The handler checks the peer again and answers a mismatch with the same 404, so the server can't be used as an oracle. These misses are logged at debug, redacted.
 - **No redirects ever** (Apple rule 8.18).
 
 **Responses**
@@ -1549,7 +1555,7 @@ sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=1
 ### 11.5 Power
 
 - **Wayland idle inhibitor.** Omarchy's inhibitor (`platform/idle.rs`) is a Wayland surface inhibitor. It is released while casting, so the laptop screen may lock and blank.
-- **logind sleep inhibitor.** Without one, a suspend kills the relay. While casting, Tuner takes `Inhibit("sleep", "Tuner", "Casting to Living Room", "block")` through `zbus`, which is already in the tree. It is controlled by `cast.keep_awake`, on by default. It holds whatever workspace Tuner is on, and with the screen locked.
+- **logind sleep inhibitor.** Without one, a suspend kills the relay. While casting, Tuner takes `Inhibit("sleep", "Tuner", "Casting to Living Room", "block")` through `zbus`, which is already in the tree. It is controlled by `cast.keep_awake`, on by default. It holds whatever workspace Tuner is on, and with the screen locked. A film that played to its end lets it go (the computer may sleep again with nothing playing); the next load on the TV takes it back.
 - **Lid switch.** Closing the lid still suspends (§17).
 
 ---
@@ -1760,7 +1766,7 @@ No open-source receiver implements the `/command` play queue: foxCast's receiver
 | `split_events` | bool (1024 + 1259-B frames) | §7.6 row 6 |
 | `playback_info` | `Answer`, `Status500`, `Silent` | §7.3 position |
 | `fetch` | `Normal`, `Never` (firewall-blocked), `Slow` | the 10 s check, escalation |
-| `profile` | `AppleTv`, `ThirdParty` (needs the type-120 SETUP; rejects `X-Apple-ProtocolVersion`; no `psi`) | §7.7 |
+| `profile` | `AppleTv`, `ThirdParty` (needs the type-120 SETUP; rejects `X-Apple-ProtocolVersion` on `/command`; no `psi` in `/info`; checks that `SETPEERSX`'s `ClockPorts` is keyed by the TXT `gid`) | §7.7 |
 | `strict_ntp` | bool (an NTP declaration → no events, close after 2 s) | §7.6 row 9 |
 | `late_feedback_reply` | bool (answers one `/feedback` late) | the stray-CSeq guard (#2893) |
 
@@ -2025,6 +2031,7 @@ The skeleton is commit "Cast skeleton (CAST-0)" on `feat/cast`, based on `main` 
   - `glyphs::{CAST, CAST_CONNECTED}` (U+F0118 and U+F0119, checked with `fc-query`).
   - `airplay::pair::server::{Accessory, PairSetupServer, PairVerifyServer}` signatures, so CAST-3 builds in parallel with CAST-1.
   - `PlayerCommand::CastTo { play: None }` when nothing plays replays the last item. This is **Try again** and **Cast again**.
+- **Changed by the review of the integrated branch.** `airplay::Client::connect` takes the receiver's TXT identifiers (`features::ReceiverIds`, kept on `Device` and `Sighting` from discovery) for the third-party `channelID` and `ClockPorts` key (§7.7).
 - **Actions.** `C` and the player menu's cast items are handled in `ui/screens/player/mod.rs` (CAST-8). `app.rs` (CAST-9) handles only the status chip, global contexts and the alerts.
 
 **Final file ownership.** Every file has one owner. "Split" means CAST-0 froze the declarations and the named item writes the bodies.

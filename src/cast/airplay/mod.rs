@@ -90,6 +90,7 @@ struct State {
     addr: SocketAddr,
     creds: Credentials,
     profile: Profile,
+    ids: features::ReceiverIds,
     info: ReceiverInfo,
     session: Session,
     /// From the control and event tasks (this is the only receiver: `None` once both ended).
@@ -115,9 +116,10 @@ struct State {
 
 impl Client {
     /// Pair-verify (encryption on at once), SETUP (declared PTP), the event channel, RECORD
-    /// (skipped on `skipRecord`; errors non-fatal), `GET /info`, the type-130 SETUP.
-    pub async fn connect(addr: SocketAddr, creds: &Credentials, profile: Profile) -> Result<Self, CastErrorKind> {
-        State::connect(addr, creds, profile).await.map(|s| Self(Box::new(s)))
+    /// (skipped on `skipRecord`; errors non-fatal), `GET /info`, the type-130 SETUP. `ids` are the
+    /// receiver's TXT identifiers: a third-party TV's `channelID` and `ClockPorts` key (§7.7).
+    pub async fn connect(addr: SocketAddr, creds: &Credentials, profile: Profile, ids: &features::ReceiverIds) -> Result<Self, CastErrorKind> {
+        State::connect(addr, creds, profile, ids).await.map(|s| Self(Box::new(s)))
     }
 
     /// `insertPlayQueueItem` (fatal on non-2xx), `isInterestedInDateRange` and
@@ -173,12 +175,13 @@ impl Client {
 }
 
 impl State {
-    async fn connect(addr: SocketAddr, creds: &Credentials, profile: Profile) -> Result<Self, CastErrorKind> {
-        let (session, info, raw) = Session::establish(addr, creds, profile).await?;
+    async fn connect(addr: SocketAddr, creds: &Credentials, profile: Profile, ids: &features::ReceiverIds) -> Result<Self, CastErrorKind> {
+        let (session, info, raw) = Session::establish(addr, creds, profile, ids).await?;
         Ok(Self {
             addr,
             creds: creds.clone(),
             profile,
+            ids: ids.clone(),
             info,
             session,
             raw,
@@ -334,7 +337,7 @@ impl State {
         self.item = None;
         self.next_sample = None;
         self.rearm = false;
-        let (session, info, raw) = match Session::establish(self.addr, &self.creds, self.profile).await {
+        let (session, info, raw) = match Session::establish(self.addr, &self.creds, self.profile, &self.ids).await {
             Ok(s) => s,
             Err(e) => {
                 self.done = true;
