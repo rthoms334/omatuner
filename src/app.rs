@@ -73,6 +73,8 @@ use crate::ui::{BackTarget, LayoutClass, NavRequest, OnboardingStart, OverlayReq
 
 /// Multi-view (DESIGN §35, MV-2): focus, sound, picture B, the planner's plays.
 mod multiview;
+/// Tuner's updates (DESIGN §41): what the updater needs from the UI, the chip.
+mod update;
 
 /// An open overlay, the screen that opened it (receives its result) and which request built
 /// it (Help / Jobs toggle closed when requested again).
@@ -1801,6 +1803,9 @@ impl TunerApp {
             Action::SleepTimer if crate::reminders::ENABLED => self.nav.push(NavRequest::Open(OverlayRequest::SleepTimer)),
             Action::EndNewsFlash => self.on_end_news_flash(egui_ctx),
             Action::Quit => egui_ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            // an update's toast and chip (DESIGN §41)
+            Action::InstallUpdate => self.services().updater.install_now(),
+            Action::RestartToUpdate => self.services().updater.restart_now(),
             // the popped-out player: back to the full window, fullscreen
             Action::ToggleWindowFullscreen if self.video_only => {
                 self.fullscreen_after_pop_in = self.toggle_popout(egui_ctx);
@@ -2488,6 +2493,7 @@ impl eframe::App for TunerApp {
         self.dispatch_actions(&egui_ctx);
         self.handle_dropped_files();
         self.agent_card_frame(&egui_ctx);
+        self.update_frame(&egui_ctx);
         self.apply_nav(&egui_ctx);
 
         let title = self.title_now();
@@ -2512,8 +2518,11 @@ impl eframe::App for TunerApp {
                 (mini_hidden && self.snapshot.state != PlayerState::Idle).then(|| self.snapshot.playable.as_ref().map(|p| p.title.clone())).flatten();
             // multi-view: "▶ 2 pictures · Sky Sports Main Event" (the focused one's)
             let now_playing = now_playing.map(|t| if self.mv.view.on { format!("2 pictures · {t}") } else { t });
-            let chips: Vec<_> =
-                crate::spoiler::ui::status_chip(&self.services().agent, crate::model::now()).into_iter().chain(self.sleep_chip()).collect();
+            let chips: Vec<_> = crate::spoiler::ui::status_chip(&self.services().agent, crate::model::now())
+                .into_iter()
+                .chain(self.sleep_chip())
+                .chain(self.update_chip())
+                .collect();
             let info = StatusInfo {
                 jobs: &jobs,
                 epg_updated: self.epg_updated,

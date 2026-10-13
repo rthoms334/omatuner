@@ -14,6 +14,9 @@
 //! refresh is running (and a desktop notification says so); playlists it upgraded to their
 //! Xtream login are toasted by the next window (`store::sources::note_unseen_upgrade`).
 //!
+//! A restart into an installed update (DESIGN §41.6) closes the window like Quit; once
+//! `run_native` returns, `main` re-execs `/usr/bin/tuner` in this process.
+//!
 //! `tuner --rearm` (the packaged `tuner-rearm.service`, at every login) arms the reminder timers
 //! a reboot or logout removed and exits (`reminders::arming::rearm_at_login`, DESIGN §36.2):
 //! offline, no window, no player. It takes the instance lock like `--refresh` (a running Tuner,
@@ -154,6 +157,8 @@ fn main() -> anyhow::Result<()> {
         }
     }
     let _instance = instance;
+    // a restart into an update re-execs with the same profile and logging (DESIGN §41.6)
+    tuner::update::restart::set_launch(tuner::update::restart::Launch { profile_dir: cli.profile_dir.clone(), debug: cli.debug });
 
     let (bus, events) = EventBus::new(None);
     // only the primary instance: the first Settings change saves over config.toml
@@ -223,6 +228,15 @@ fn main() -> anyhow::Result<()> {
         }),
     )
     .map_err(|e| anyhow::anyhow!("window: {e}"))?;
+    // the window closed for a restart into an installed update: the services are down, the
+    // instance lock goes, the new /usr/bin/tuner takes this process over
+    if let Some(plan) = tuner::update::restart::take() {
+        drop(_instance);
+        let e = tuner::update::restart::exec(&plan);
+        tracing::error!("update: couldn't restart: {e}");
+        tuner::logging::flush(Duration::from_millis(500));
+        anyhow::bail!("couldn't restart into the update: {e}");
+    }
     Ok(())
 }
 

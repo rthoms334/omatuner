@@ -21,7 +21,8 @@ license=('GPL-3.0-or-later')
 depends=('mpv>=1:0.38' 'xz' 'fontconfig' 'ttf-jetbrains-mono-nerd' 'wayland' 'libxkbcommon'
          'mesa' 'dbus' 'gcc-libs' 'glibc')
 makedepends=('cargo')
-optdepends=('hyprland: window rules from /usr/share/tuner/hypr, raising the window'
+optdepends=('polkit: installing Tuner updates from Tuner (pkexec; Omarchy has it)'
+            'hyprland: window rules from /usr/share/tuner/hypr, raising the window'
             'xdg-desktop-portal-gtk: file pickers (add a playlist file, backup, log export)'
             'noto-fonts-cjk: CJK channel and programme names'
             'noto-fonts: Arabic, Hebrew and Indic fallbacks')
@@ -75,6 +76,10 @@ check() {
   # suite is the developer gate (`cargo test`, see README "Development"): built here it would be
   # a second thin-LTO release binary, which took over an hour on a 16 GB machine.
   "$srcdir/target/release/tuner" --version
+  # the update helper runs, and refuses anyone but root through pkexec (exit 2)
+  local _rc=0
+  "$srcdir/target/release/tuner-update" passwordless off 2>/dev/null || _rc=$?
+  (( _rc == 2 ))
 }
 
 package() {
@@ -100,6 +105,12 @@ package() {
   while IFS= read -r -d '' _f; do
     install -Dm644 "$_f" "$pkgdir/usr/share/tuner/claude/$_f"
   done < <(find plugins/omatuner -type f -print0)
+  # Tuner's updates (DESIGN §41): the root helper, started only through pkexec under its
+  # polkit actions; the policy names this exact path, so it must not move. Nothing is written to
+  # /etc: the passwordless rule exists only once the user turns that switch on in Tuner.
+  install -Dm755 "$srcdir/target/release/tuner-update" "$pkgdir/usr/lib/tuner/tuner-update"
+  install -Dm644 packaging/polkit/io.github.rthoms334.omatuner.update.policy \
+    "$pkgdir/usr/share/polkit-1/actions/io.github.rthoms334.omatuner.update.policy"
   install -Dm644 -t "$pkgdir/usr/share/doc/tuner" README.md docs/DESIGN.md docs/MANUAL_CHECKLIST.md
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

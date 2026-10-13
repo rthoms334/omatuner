@@ -6,6 +6,10 @@ name: Release
 # (lowercase letters, digits and dots, starting with a letter) is appended to the package version:
 # tag v0.1.0-rc4 builds omatuner 0.1.0rc4, which pacman orders before 0.1.0, so the final release
 # upgrades it.
+# Publishing signs every package and tarball with minisign (the MINISIGN_SECRET_KEY and
+# MINISIGN_PASSWORD secrets) and uploads the .minisig files with them; Tuner installs an update
+# only when its signature verifies against packaging/update-key.pub (DESIGN §41.3), so the
+# publish fails unless that key verifies every signature it made.
 # Run by hand with `publish` off for a dry run on any branch: the files are only uploaded as
 # workflow artifacts. Pull requests that change the packaging or this workflow get the same dry
 # run (build only; the publish job never runs for them).
@@ -184,11 +188,42 @@ jobs:
     permissions:
       contents: write
     steps:
+      # only the release key: the signatures are checked against what the app compiles in
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          sparse-checkout: packaging/update-key.pub
+          sparse-checkout-cone-mode: false
+
       - uses: actions/download-artifact@v8
         with:
           pattern: omatuner-*
           path: dist
           merge-multiple: true
+
+      - name: Sign the packages and tarballs (minisign)
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          if [[ -z $MINISIGN_SECRET_KEY ]]; then
+            echo "::error::the MINISIGN_SECRET_KEY secret is missing: Tuner installs only signed updates (README \"Release signing\")"
+            exit 1
+          fi
+          retry() { local i; for i in 1 2 3; do "$@" && return; [[ $i == 3 ]] || sleep 20; done; return 1; }
+          retry sudo apt-get update -qq
+          retry sudo apt-get install -y -qq minisign
+          key="$RUNNER_TEMP/minisign.key"
+          (umask 077 && printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key")
+          trap 'rm -f "$key"' EXIT
+          cd dist
+          for f in *.pkg.tar.zst *.tar.gz; do
+            # pre-hashed (minisign's default); the password comes on stdin, never on a command line
+            printf '%s\n' "$MINISIGN_PASSWORD" | minisign -S -s "$key" -m "$f"
+            # the key Tuner compiles in must verify it, or no Tuner could install this release
+            minisign -V -q -p ../packaging/update-key.pub -m "$f"
+          done
+          ls -l ./*.minisig
 
       - name: Create the GitHub Release
         env:
