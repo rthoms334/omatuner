@@ -558,6 +558,9 @@ impl Session {
                     break;
                 }
                 Next::Cmd(Some(RemoteCmd::Close { fast })) | Next::Ctl(Ctl::Close { fast }) => {
+                    if self.phase != CastPhase::Lost {
+                        self.shared.clear_error();
+                    }
                     self.close(fast).await;
                     break;
                 }
@@ -1174,6 +1177,7 @@ impl Session {
             }
         }
         if first {
+            self.shared.clear_error();
             self.remember();
         }
         None

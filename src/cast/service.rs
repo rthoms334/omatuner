@@ -467,6 +467,13 @@ impl Shared {
         lock(&self.last).error = Some(kind);
     }
 
+    /// The failure is over: the TV shows a picture again, or the user ended a cast that wasn't
+    /// lost (Stop casting, Play here). A cast lost or stopped on the TV keeps its reason for
+    /// the agent while nothing plays.
+    pub(crate) fn clear_error(&self) {
+        lock(&self.last).error = None;
+    }
+
     /// The detection target: the TV last cast to, else the default TV, else any TV on the
     /// network, else the mDNS group (the LAN's route either way).
     fn toward(&self) -> Ipv4Addr {
