@@ -29,7 +29,7 @@
 
 use eframe::egui::{self, RichText};
 
-use super::dialogs::{card_area, scrim, title};
+use super::dialogs::{button_row, card_area, scrim, title};
 use super::{Overlay, OverlayOutcome};
 use crate::cast::firewall::{self, AllowOutcome, Detection, FirewallState, Rule, UnknownWhy, Verb};
 use crate::cast::{CastErrorKind, CastHandle, FirewallJob};
@@ -181,7 +181,7 @@ impl Buttons {
     /// Draw them; the one clicked.
     pub(super) fn ui(&mut self, ui: &mut egui::Ui, theme: &Theme) -> Option<Btn> {
         let mut clicked = None;
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        button_row(ui, |ui| {
             ui.spacing_mut().item_spacing.x = theme.space(SpaceToken::Md);
             for (i, b) in self.shown.iter().enumerate() {
                 let style = ButtonStyle { primary: i == 0, bordered: true, focused: i == self.focus, ..Default::default() };
@@ -581,6 +581,23 @@ mod tests {
 
     /// Allow on firewall waits for polkit's dialog with Cancel (which kills pkexec), then says
     /// how it went; a job finished before the card asked isn't its outcome.
+    /// The card is as tall as what it shows, not the window (`dialogs::button_row`): blocked
+    /// with its buttons, and waiting for the password.
+    #[test]
+    fn the_card_sizes_to_its_content_in_a_tall_window() {
+        let (t, one) = rig();
+        let fake = Arc::new(FakeCast::default());
+        fake.script(|s| s.firewall = Some(detection(FirewallState::Blocked { shadowed: false })));
+        t.services().agent.set_cast(Some(CastHandle::new(fake.clone())));
+        let mut h = overlay_harness(t, one, CastFirewall::new(), egui::vec2(1280.0, 1400.0));
+        for job in [FirewallJob::Idle, FirewallJob::Waiting { verb: Verb::Allow { first: false } }] {
+            fake.script(|s| s.firewall_job = job.clone());
+            h.run_steps(3);
+            let height = crate::ui::overlays::dialogs::card_height(&h.ctx, "cast-firewall");
+            assert!(height > 100.0 && height < 700.0, "{job:?}: {height} px tall in a 1400 px window");
+        }
+    }
+
     #[test]
     fn allow_waits_for_the_password_and_says_how_it_went() {
         let (t, one) = rig();

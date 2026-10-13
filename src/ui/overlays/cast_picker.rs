@@ -767,6 +767,19 @@ mod tests {
         assert_eq!(CastPicker::best(&rows_of(Vec::new(), None, true, Duration::ZERO), false, None), 0);
     }
 
+    /// The panel's height is its rows' (computed, not the window's) in a tall window too.
+    #[test]
+    fn the_panel_sizes_to_its_rows_in_a_tall_window() {
+        let (t, one) = rig();
+        let fake = Arc::new(FakeCast::default());
+        fake.script(|s| s.devices = devices());
+        t.services().agent.set_cast(Some(CastHandle::new(fake.clone())));
+        let mut h = overlay_harness(t, one, CastPicker::new(), egui::vec2(1280.0, 1400.0));
+        h.run_steps(3);
+        let height = h.ctx.memory(|m| m.area_rect(egui::Id::new("cast-picker-panel"))).map_or(0.0, |r| r.height());
+        assert!(height > 100.0 && height < 700.0, "{height} px tall in a 1400 px window");
+    }
+
     /// The panel lists the TVs with their state lines and starts discovery; ↓ skips the Mac;
     /// an unpaired TV opens the PIN overlay; "Firewall help…" opens the firewall card.
     #[test]

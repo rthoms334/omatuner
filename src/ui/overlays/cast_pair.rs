@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, RichText};
 
-use super::dialogs::{card_area, scrim, title};
+use super::dialogs::{button_row, card_area, scrim, title};
 use super::{Overlay, OverlayOutcome};
 use crate::cast::{CastHandle, PairError, PairJob, PairState, Pin};
 use crate::keymap::{Action, KeyContext};
@@ -425,7 +425,7 @@ impl Overlay for CastPair {
             let hint = "No code on the TV? On the Apple TV open Settings ▸ AirPlay and HomeKit ▸ Allow Access ▸ Anyone on the Same Network.";
             ui.add(egui::Label::new(RichText::new(hint).size(theme.font(TypeToken::BodySmall)).color(t.text_secondary)).wrap());
             ui.add_space(theme.space(SpaceToken::Lg));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            button_row(ui, |ui| {
                 ui.spacing_mut().item_spacing.x = theme.space(SpaceToken::Lg);
                 let style = |f: Focus, primary: bool| ButtonStyle { primary, bordered: true, focused: self.focus == f, ..Default::default() };
                 pair =
@@ -539,6 +539,23 @@ mod tests {
         "4711".chars().for_each(|c| o.code.push(c));
         let shown = format!("{o:?}");
         assert!(!shown.contains("4711") && shown.contains("typed: 4"), "{shown}");
+    }
+
+    /// The PIN overlay is as tall as what it shows, not the window (`dialogs::button_row`),
+    /// waiting for the code and entering it.
+    #[test]
+    fn the_overlay_sizes_to_its_content_in_a_tall_window() {
+        let (t, one) = rig();
+        let fake = Arc::new(FakeCast::default());
+        fake.script(|s| s.pair_state = Some(PairState::Starting));
+        t.services().agent.set_cast(Some(CastHandle::new(fake.clone())));
+        let mut h = overlay_harness(t, one, CastPair::new(TV, true), egui::vec2(1280.0, 1400.0));
+        for state in [PairState::Starting, PairState::EnterCode { variant: PairVariant::Hkp3 }] {
+            fake.script(|s| s.pair_state = Some(state));
+            h.run_steps(3);
+            let height = crate::ui::overlays::dialogs::card_height(&h.ctx, "cast-pair");
+            assert!(height > 100.0 && height < 700.0, "{state:?}: {height} px tall in a 1400 px window");
+        }
     }
 
     /// The overlay arms after 600 ms; the digits go to the service once, on Enter, and are

@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, RichText};
 
 use super::cast_firewall::{Ask, FirewallPanel, Subject, key};
-use super::dialogs::{card_area, scrim, title};
+use super::dialogs::{button_row, card_area, scrim, title};
 use super::{Overlay, OverlayOutcome};
 use crate::cast::firewall::FirewallState;
 use crate::cast::{CastErrorKind, CastHandle, Pairing, ReceiverKind, SetupOffer, TestState};
@@ -392,7 +392,7 @@ impl Overlay for CastOffer {
                 busy_bar(ui, theme, 3.0);
                 ui.add_space(theme.space(SpaceToken::Lg));
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            button_row(ui, |ui| {
                 ui.spacing_mut().item_spacing.x = theme.space(SpaceToken::Lg);
                 for (i, b) in shown.iter().enumerate() {
                     let style = ButtonStyle { primary: i == 0, bordered: true, focused: i == self.focus, ..Default::default() };
@@ -455,6 +455,33 @@ mod tests {
         let mut h = overlay_harness(t, one, CastOffer::new(offer), egui::vec2(1200.0, 800.0));
         h.state_mut().o.opened = Some(Instant::now() - ARMING); // the user has seen it
         (h, fake)
+    }
+
+    /// Every step of the card is as tall as what it shows, not the window (each filled a tall
+    /// window, its buttons halfway down: `dialogs::button_row`): the offer, Network with the
+    /// firewall panel, the test with its progress bar, a failure.
+    #[test]
+    fn every_step_sizes_to_its_content_in_a_tall_window() {
+        let (t, one) = rig();
+        let fake = Arc::new(FakeCast::default());
+        fake.script(|s| {
+            s.devices = vec![Device::new(living_room(), "Living Room", ReceiverKind::AppleTv, Protocol::AirPlay)];
+            s.firewall = Some(blocked());
+        });
+        t.services().agent.set_cast(Some(CastHandle::new(fake.clone())));
+        let offer = SetupOffer { device: living_room(), name: "Living Room".into(), kind: ReceiverKind::AppleTv };
+        let mut h = overlay_harness(t, one, CastOffer::new(offer), egui::vec2(1280.0, 1400.0));
+        for step in [
+            Step::Offer,
+            Step::Network { forced: true },
+            Step::Test { before: TestState::Idle, seen: true },
+            Step::Failed(CastErrorKind::Unreachable),
+        ] {
+            h.state_mut().o.step = step;
+            h.run_steps(3);
+            let height = crate::ui::overlays::dialogs::card_height(&h.ctx, "cast-offer");
+            assert!(height > 100.0 && height < 700.0, "{step:?}: {height} px tall in a 1400 px window");
+        }
     }
 
     /// The config after the card's answers.
