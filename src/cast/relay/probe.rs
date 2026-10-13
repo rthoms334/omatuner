@@ -68,6 +68,10 @@ pub struct Probe {
     pub max_gop_s: Option<f64>,
     /// An encrypted track (`encv`/`enca`/`drms`).
     pub encrypted: bool,
+    /// `format.duration` and `format.start_time` (seconds): a full-length item's length and the
+    /// file's start, which `-copyts -start_at_zero` and `-ss` count from (§8.5).
+    pub duration_s: Option<f64>,
+    pub start_s: Option<f64>,
 }
 
 /// Why the probe gave nothing.
@@ -145,7 +149,14 @@ pub fn parse(json: &str) -> Option<Probe> {
     let streams = v.get("streams")?.as_array()?;
     let s = |st: &Value, k: &str| st.get(k).and_then(Value::as_str).map(str::to_owned).filter(|s| !s.is_empty() && s != "unknown");
     let u = |st: &Value, k: &str| st.get(k).and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()).filter(|n| *n > 0);
-    let mut out = Probe { container: v.get("format").and_then(|f| s(f, "format_name")), ..Probe::default() };
+    let format = v.get("format");
+    let secs = |k: &str| format.and_then(|f| f.get(k)).and_then(Value::as_str).and_then(|t| t.parse::<f64>().ok()).filter(|t| t.is_finite());
+    let mut out = Probe {
+        container: format.and_then(|f| s(f, "format_name")),
+        duration_s: secs("duration").filter(|d| *d > 0.0),
+        start_s: secs("start_time"),
+        ..Probe::default()
+    };
     let mut video_index = None;
     for st in streams {
         let tag = st.get("codec_tag_string").and_then(Value::as_str).unwrap_or_default();
@@ -308,13 +319,14 @@ mod tests {
          "codec_tag_string": "[129][0][0][0]", "disposition": {"default": 1}, "tags": {"language": "eng"}},
         {"index": 3, "codec_name": "dvb_teletext", "codec_type": "subtitle"}
       ],
-      "format": {"format_name": "mpegts", "nb_streams": 4}
+      "format": {"format_name": "mpegts", "nb_streams": 4, "start_time": "1.400000", "duration": "5426.240000"}
     }"#;
 
     #[test]
     fn a_dvb_probe_becomes_facts_hints_and_stream_info() {
         let p = parse(DVB).unwrap();
         assert_eq!(p.container.as_deref(), Some("mpegts"));
+        assert_eq!((p.start_s, p.duration_s), (Some(1.4), Some(5426.24)));
         assert_eq!(p.interlaced(), Some(true));
         assert_eq!(p.max_gop_s, Some(0.5));
         let a = p.chosen_audio().unwrap();

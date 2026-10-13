@@ -126,8 +126,9 @@ fn sockets_to(port: u16) -> usize {
         .count()
 }
 
-/// The command lines of this process's relay ffmpeg children (the ones writing HLS: not the
-/// marker film's analysis, which runs ffmpeg on files beside them).
+/// The command lines of this process's relay ffmpeg children (the ones writing HLS or a
+/// full-length run's segments: not the marker film's analysis, which runs ffmpeg on files beside
+/// them).
 fn ffmpeg_cmdlines() -> Vec<String> {
     let me = std::process::id().to_string();
     let mut out = Vec::new();
@@ -140,7 +141,7 @@ fn ffmpeg_cmdlines() -> Vec<String> {
         }
         if let Ok(cmd) = std::fs::read(e.path().join("cmdline")) {
             let cmd = String::from_utf8_lossy(&cmd).replace('\0', " ");
-            if cmd.contains("ffmpeg") && cmd.contains(" -f hls ") {
+            if cmd.contains("ffmpeg") && (cmd.contains(" -f hls ") || cmd.contains(" -f segment ")) {
                 out.push(cmd);
             }
         }
@@ -261,35 +262,33 @@ async fn a_live_channel_reaches_the_tv_as_an_apple_media_playlist() {
     assert!(!dir.path().join("live").read_dir().unwrap().any(|_| true), "the session directory is wiped");
 }
 
-/// A film (`testsrc.mp4`, moov at the end: ffprobe and ffmpeg seek it with `Range` through the
-/// proxy) as an EVENT playlist, and the server's rules: byte-identical 404s for a wrong token,
-/// other paths and methods; a wrong peer closed unanswered; HEAD and `Range`; a view's token serves the shared
-/// segments while the old token 404s.
+/// A film (`testsrc.mp4`, moov at the end: ffprobe, the index reader and ffmpeg seek it with
+/// `Range` through the proxy) reaches the TV whole (§8.5), and the server's rules: byte-identical
+/// 404s for a wrong token, other paths and methods (a segment past the film too); a wrong peer
+/// closed unanswered; HEAD and `Range`; a seek is the whole film under a new token that starts
+/// the TV there, while the old token 404s.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_server_answers_its_token_and_peer_only_and_views_share_the_segments() {
+async fn the_server_answers_its_token_and_peer_only_and_a_seek_is_the_whole_film_from_there() {
     let Some(media) = media() else { return };
     let server = TestServer::start(media, Faults::default());
     let dir = tempfile::tempdir().unwrap();
     let mut relay = RelaySession::start(config(&dir, LOOPBACK)).await.unwrap();
     let p = playable(PlayableKind::Movie, server.url("/testsrc.mp4"), HttpHeaders::default());
     let prepared = relay.load(spec(7, p.clone(), None)).await.unwrap();
-    assert!(!prepared.load.live && prepared.behind_live_s.is_none());
+    assert!(!prepared.load.live && prepared.behind_live_s.is_none() && prepared.load.offset_s == 0.0);
     let base = base_of(&prepared);
     let port = port_of(&base);
     let tok = base.trim_end_matches('/').rsplit('/').next().unwrap().to_owned();
     let tv = tv();
 
-    // wait for the whole film (EVENT + ENDLIST: ffmpeg reads 4× real time)
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let text = loop {
-        let text = tv.get(prepared.load.url.expose()).send().await.unwrap().text().await.unwrap();
-        if text.contains("#EXT-X-ENDLIST") {
-            break text;
-        }
-        assert!(Instant::now() < deadline, "no ENDLIST:\n{text}");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    };
-    assert!(text.contains("#EXT-X-PLAYLIST-TYPE:EVENT\n") && text.contains("#EXT-X-MEDIA-SEQUENCE:0\n"), "{text}");
+    // the whole film at once: 2 s GOPs, a segment each
+    let text = tv.get(prepared.load.url.expose()).send().await.unwrap().text().await.unwrap();
+    assert!(
+        text.contains("#EXT-X-PLAYLIST-TYPE:VOD\n") && text.contains("#EXT-X-MEDIA-SEQUENCE:0\n") && text.ends_with("#EXT-X-ENDLIST\n"),
+        "{text}"
+    );
+    assert_eq!(vod_segments(&text).len(), 5, "{text}");
+    assert!(!text.contains("#EXT-X-START") && !text.contains("PROGRAM-DATE-TIME"), "{text}");
 
     let miss = raw(port, &format!("GET /c/{}/index.m3u8 HTTP/1.1", "a".repeat(26)));
     assert!(miss.starts_with("HTTP/1.1 404"), "{miss}");
@@ -298,6 +297,7 @@ async fn the_server_answers_its_token_and_peer_only_and_views_share_the_segments
         format!("GET /c/{tok}/../index.m3u8 HTTP/1.1"),
         format!("GET /c/{tok}/%2e%2e/index.m3u8 HTTP/1.1"),
         format!("GET /c/{tok}/s999.ts HTTP/1.1"),
+        format!("GET /c/{tok}/init.mp4 HTTP/1.1"),
         format!("GET /c/{tok} HTTP/1.1"),
         format!("POST /c/{tok}/index.m3u8 HTTP/1.1"),
         format!("OPTIONS /c/{tok}/index.m3u8 HTTP/1.1"),
@@ -327,17 +327,62 @@ async fn the_server_answers_its_token_and_peer_only_and_views_share_the_segments
     assert_eq!(part.headers()["content-length"], "2");
     assert_eq!(&part.bytes().await.unwrap()[..], &s0[..2]);
 
-    // a seek inside what's produced: a view from the segment holding 4.5 s (2 s GOPs)
-    let view = relay.view(8, 4.5).await.unwrap().expect("inside what's produced");
-    assert!((view.load.offset_s - 4.0).abs() < 0.05, "{}", view.load.offset_s);
+    // a seek: the whole film again, starting the TV at 4.5 s; positions are the film's own
+    let view = relay.view(8, 4.5).await.unwrap().expect("anywhere in the film");
+    assert_eq!(view.load.offset_s, 0.0);
     let vtext = tv.get(view.load.url.expose()).send().await.unwrap().text().await.unwrap();
-    assert!(vtext.contains("#EXT-X-MEDIA-SEQUENCE:2\n") && vtext.contains("\ns2.ts\n") && !vtext.contains("\ns1.ts\n"), "{vtext}");
-    assert!(vtext.contains("#EXT-X-PROGRAM-DATE-TIME:") && vtext.ends_with("#EXT-X-ENDLIST\n"), "{vtext}");
+    assert!(
+        vtext
+            .contains("#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-START:TIME-OFFSET=4.500,PRECISE=YES\n"),
+        "{vtext}"
+    );
     let shared = tv.get(format!("{}s2.ts", base_of(&view))).send().await.unwrap();
     assert_eq!(shared.status(), 200);
     assert_eq!(raw(port, &format!("GET /c/{tok}/index.m3u8 HTTP/1.1")), miss, "the old token is revoked");
-    assert!(relay.view(9, 3600.0).await.unwrap().is_none(), "beyond the film");
+    let past = relay.view(9, 3600.0).await.unwrap().expect("clamped to the film");
+    let ptext = tv.get(past.load.url.expose()).send().await.unwrap().text().await.unwrap();
+    let at = ext_x_start(&ptext).expect("a start");
+    assert!((8.9..9.1).contains(&at), "a second before the end: {ptext}");
+    assert_eq!(server.max_concurrent(), 1, "one provider connection at a time: {:#?}", server.overlaps());
+    relay.stop(false).await;
+}
 
+/// An item without a keyframe index keeps Phase 1's EVENT playlist (§8.5's fallback matrix), and
+/// a seek inside what's produced is a view: `MEDIA-SEQUENCE:k`, the segments from k with their
+/// `PROGRAM-DATE-TIME`, under a new token that serves the shared segments; beyond it, `None`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unindexed_film_keeps_a_growing_playlist_whose_views_share_the_segments() {
+    let Some(media) = media() else { return };
+    let server = TestServer::start(media, Faults::default());
+    let dir = tempfile::tempdir().unwrap();
+    let mut relay = RelaySession::start(config(&dir, LOOPBACK)).await.unwrap();
+    // an HLS film: no index to read (1 s GOPs, 60 s)
+    let p = playable(PlayableKind::Movie, server.url("/long/index.m3u8"), HttpHeaders::default());
+    let prepared = relay.load(spec(7, p, None)).await.unwrap();
+    let base = base_of(&prepared);
+    let tok = base.trim_end_matches('/').rsplit('/').next().unwrap().to_owned();
+    let tv = tv();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let text = loop {
+        let text = tv.get(prepared.load.url.expose()).send().await.unwrap().text().await.unwrap();
+        if text.matches(".ts\n").count() >= 8 {
+            break text;
+        }
+        assert!(Instant::now() < deadline, "too few segments:\n{text}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert!(text.contains("#EXT-X-PLAYLIST-TYPE:EVENT\n") && text.contains("#EXT-X-START:TIME-OFFSET=0\n"), "{text}");
+
+    let view = relay.view(8, 4.5).await.unwrap().expect("inside what's produced");
+    assert!((view.load.offset_s - 4.0).abs() < 0.05, "{}", view.load.offset_s);
+    let vtext = tv.get(view.load.url.expose()).send().await.unwrap().text().await.unwrap();
+    assert!(vtext.contains("#EXT-X-MEDIA-SEQUENCE:4\n") && vtext.contains("\ns4.ts\n") && !vtext.contains("\ns3.ts\n"), "{vtext}");
+    assert!(vtext.contains("#EXT-X-PROGRAM-DATE-TIME:"), "{vtext}");
+    let shared = tv.get(format!("{}s4.ts", base_of(&view))).send().await.unwrap();
+    assert_eq!(shared.status(), 200);
+    let old = tv.get(format!("{base}index.m3u8")).send().await.unwrap();
+    assert_eq!(old.status(), 404, "the old token ({tok}) is revoked");
+    assert!(relay.view(9, 3600.0).await.unwrap().is_none(), "beyond the film");
     relay.stop(false).await;
 }
 
@@ -391,9 +436,16 @@ async fn a_surround_film_gets_a_stereo_and_a_surround_rendition() {
             assert_eq!(lines[uri], "v/index.m3u8");
         }
         let mut targets = Vec::new();
+        let mut maps = Vec::new();
         for (r, init, mime) in [("v", "init_0.mp4", "video/mp4"), ("a", "init_1.mp4", "audio/mp4"), ("s", "init_2.mp4", "audio/mp4")] {
             let text = tv.get(format!("{base}{r}/index.m3u8")).send().await.unwrap().text().await.unwrap();
-            assert!(text.contains(&format!("#EXT-X-MAP:URI=\"{init}\"")) && text.contains("#EXT-X-START:TIME-OFFSET=0\n"), "{file} {r}:\n{text}");
+            // the MPEG-TS film has no index: an EVENT playlist that starts the TV at 0; the MP4
+            // and Matroska ones go full length (§8.5), every rendition on the same map
+            let start = if file == "/surround.ts" { "#EXT-X-START:TIME-OFFSET=0\n" } else { "#EXT-X-PLAYLIST-TYPE:VOD\n" };
+            assert!(text.contains(&format!("#EXT-X-MAP:URI=\"{init}\"")) && text.contains(start), "{file} {r}:\n{text}");
+            if file != "/surround.ts" {
+                maps.push(vod_segments(&text));
+            }
             targets.push(text.lines().find_map(|l| l.strip_prefix("#EXT-X-TARGETDURATION:")).unwrap().to_owned());
             for name in [init, "s0.m4s"] {
                 let resp = tv.get(format!("{base}{r}/{name}")).send().await.unwrap();
@@ -402,6 +454,8 @@ async fn a_surround_film_gets_a_stereo_and_a_surround_rendition() {
         }
         targets.dedup();
         assert_eq!(targets.len(), 1, "one target for every rendition (Apple rule 8.2): {targets:?}");
+        maps.dedup();
+        assert!(maps.len() <= 1, "{file}: one map for every rendition: {maps:?}");
         // the surround rendition is the source's 5.1, copied
         let mut mp4 = tv.get(format!("{base}s/init_2.mp4")).send().await.unwrap().bytes().await.unwrap().to_vec();
         mp4.extend_from_slice(&tv.get(format!("{base}s/s0.m4s")).send().await.unwrap().bytes().await.unwrap());
@@ -416,58 +470,95 @@ async fn a_surround_film_gets_a_stereo_and_a_surround_rendition() {
 }
 
 /// Every rendition shares the picture's timeline (cast design §8.4; `relay::ffmpeg` module docs,
-/// "One timeline"), measured on what the TV is served: the `avsync.mkv` marker film (at each
-/// second k a white picture and a beep lasting 40 ms × (1 + k mod 23)) from the start and
-/// resumed between keyframes, copied and converted, with surround (fMP4 renditions) and in
-/// stereo (MPEG-TS). The picture's times come from the boxes (`tfdt`, durations, composition
-/// offsets: what the Apple TV reads, no edit list), the sound's from ffmpeg on that timeline.
-/// On 2026-10-13 the converted, resumed surround cast played its copied 5.1 10 s late.
+/// "One timeline"), measured on what the TV is served: the `avsync` marker film (at each second
+/// k a white picture and a beep lasting 40 ms × (1 + k mod 23)) from the start and resumed
+/// between keyframes, copied and converted, with surround (fMP4 renditions) and in stereo
+/// (MPEG-TS). The picture's times come from the boxes (`tfdt`, durations, composition offsets:
+/// what the Apple TV reads, no edit list), the sound's from ffmpeg on that timeline. On
+/// 2026-10-13 the converted, resumed surround cast played its copied 5.1 10 s late.
+///
+/// The film is cast full length (§8.5): its segments are made on demand by runs that start where
+/// the TV starts (`EXT-X-START`), and where it scrubs to (back from 31 s to 17 s: a second run,
+/// whose segments join the first's); converted, it is cut on the grid of its forced keyframes.
+/// Without cues, or from a provider that ignores `Range`, it keeps its EVENT playlist. Either way
+/// the TV's picture starts where the session counts from, never later.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_rendition_shares_the_pictures_timeline() {
     let Some(media) = media() else { return };
     let caps = relay::ffmpeg::caps().await.unwrap();
-    let server = TestServer::start(media, Faults::default());
-    for (receiver, force, start_at) in [
-        (ReceiverKind::AppleTv, None, None),
-        (ReceiverKind::AppleTv, None, Some(13.3)),
-        (ReceiverKind::AppleTv, Some(CastLevel::Converted), Some(13.3)),
-        (ReceiverKind::AirPlayTv, None, Some(13.3)),
-        (ReceiverKind::AirPlayTv, Some(CastLevel::Converted), Some(13.3)),
+    let server = TestServer::start(media.clone(), Faults::default());
+    // a provider that ignores `Range`: no full length (§8.5)
+    let whole = TestServer::start(media, Faults::default());
+    whole.set_ranges(false);
+    let converted = Some(CastLevel::Converted);
+    let (cued, uncued) = ("/avsync.mkv", "/avsync_nocues.mkv");
+    for (file, ranges, receiver, force, start_at, scrub) in [
+        (cued, true, ReceiverKind::AppleTv, None, None, None),
+        (cued, true, ReceiverKind::AppleTv, None, Some(13.3), None),
+        (cued, true, ReceiverKind::AppleTv, converted, Some(13.3), None),
+        (cued, true, ReceiverKind::AirPlayTv, None, Some(13.3), None),
+        (cued, true, ReceiverKind::AirPlayTv, converted, Some(13.3), None),
+        (cued, true, ReceiverKind::AppleTv, None, Some(31.0), Some(17.0)),
+        // no index: an EVENT playlist, copied or converted
+        (uncued, true, ReceiverKind::AppleTv, None, Some(13.3), None),
+        (uncued, true, ReceiverKind::AppleTv, converted, Some(13.3), None),
+        (uncued, true, ReceiverKind::AirPlayTv, None, Some(13.3), None),
+        (cued, false, ReceiverKind::AppleTv, None, None, None),
     ] {
-        let case = format!("{receiver:?} {force:?} from {start_at:?}");
+        let full = ranges && file == cued;
+        let case = format!("{file}{} {receiver:?} {force:?} from {start_at:?} scrubbed to {scrub:?}", if ranges { "" } else { " (no Range)" });
         let dir = tempfile::tempdir().unwrap();
         let mut relay = RelaySession::start(config(&dir, LOOPBACK)).await.unwrap();
-        let mut p = (*playable(PlayableKind::Movie, server.url("/avsync.mkv"), HttpHeaders::default())).clone();
+        let url = if ranges { server.url(file) } else { whole.url(file) };
+        let mut p = (*playable(PlayableKind::Movie, url, HttpHeaders::default())).clone();
         p.start_at = start_at;
         let spec = LoadSpec { receiver, ..spec(1, Arc::new(p), force) };
         let prepared = relay.load(spec).await.unwrap_or_else(|e| panic!("{case}: {e:?}"));
         assert_eq!(prepared.surround, receiver == ReceiverKind::AppleTv, "{case}");
         let (tv, base) = (tv(), base_of(&prepared));
         let renditions: &[&str] = if prepared.surround { &["v/", "a/", "s/"] } else { &[""] };
+        // full length: the TV fetches where the playlist starts it, then (a scrub) jumps
+        let mut from = None;
         let mut files = Vec::new();
         for r in renditions {
-            // the whole film: ffmpeg reads the first minute at once
-            let deadline = Instant::now() + Duration::from_secs(60);
-            let text = loop {
-                let text = tv.get(format!("{base}{r}index.m3u8")).send().await.unwrap().text().await.unwrap();
-                if text.contains("#EXT-X-ENDLIST") {
-                    break text;
+            let text = tv.get(format!("{base}{r}index.m3u8")).send().await.unwrap().text().await.unwrap();
+            assert_eq!(text.contains("#EXT-X-PLAYLIST-TYPE:VOD\n"), full, "{case} {r}:\n{text}");
+            let (names, starts): (Vec<String>, Option<f64>) = if full {
+                let segs = vod_segments(&text);
+                assert_eq!(ext_x_start(&text), start_at, "{case} {r}");
+                let at = |t: f64| segs.iter().rposition(|s| s.0 <= t).unwrap();
+                let k = at(start_at.unwrap_or(0.0));
+                if from.is_none() && scrub.is_some() {
+                    assert_eq!(tv.get(format!("{base}{r}{}", segs[k].2)).send().await.unwrap().status(), 200, "{case}: where the TV starts");
                 }
-                assert!(Instant::now() < deadline, "{case} {r}: no ENDLIST:\n{text}");
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                let first = scrub.map_or(k, at);
+                from = Some(segs[first].0);
+                (segs[first..].iter().map(|s| s.2.clone()).collect(), from)
+            } else {
+                // the whole film: ffmpeg reads the first minute at once
+                let deadline = Instant::now() + Duration::from_secs(60);
+                let text = loop {
+                    let text = tv.get(format!("{base}{r}index.m3u8")).send().await.unwrap().text().await.unwrap();
+                    if text.contains("#EXT-X-ENDLIST") {
+                        break text;
+                    }
+                    assert!(Instant::now() < deadline, "{case} {r}: no ENDLIST:\n{text}");
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                };
+                (text.lines().filter(|l| !l.is_empty() && !l.starts_with('#')).map(str::to_owned).collect(), None)
             };
-            let names = text
-                .lines()
-                .filter_map(|l| l.strip_prefix("#EXT-X-MAP:URI=\"").map(|u| u.trim_end_matches('"')))
-                .chain(text.lines().filter(|l| !l.is_empty() && !l.starts_with('#')));
+            let init = text.lines().find_map(|l| l.strip_prefix("#EXT-X-MAP:URI=\"").map(|u| u.trim_end_matches('"').to_owned()));
             let mut bytes = Vec::new();
-            for name in names {
-                bytes.extend_from_slice(&tv.get(format!("{base}{r}{name}")).send().await.unwrap().bytes().await.unwrap());
+            for name in init.iter().chain(&names) {
+                let resp = tv.get(format!("{base}{r}{name}")).send().await.unwrap();
+                assert_eq!(resp.status(), 200, "{case} {r}{name}");
+                bytes.extend_from_slice(&resp.bytes().await.unwrap());
             }
-            let ext = if text.contains("#EXT-X-MAP") { "mp4" } else { "ts" };
+            let ext = if init.is_some() { "mp4" } else { "ts" };
             let path = dir.path().join(format!("{}.{ext}", if r.is_empty() { "muxed" } else { r.trim_end_matches('/') }));
             std::fs::write(&path, &bytes).unwrap();
             files.push(path);
+            let _ = starts;
         }
         relay.stop(false).await;
         let (ffmpeg, ffprobe) = (caps.ffmpeg.clone(), caps.ffprobe.clone());
@@ -478,15 +569,22 @@ async fn every_rendition_shares_the_pictures_timeline() {
             let av_ms = (sound - picture) * 1000.0;
             assert!(av_ms.abs() < 40.0, "{case}: rendition {i}'s sound is {av_ms:+.1} ms off the picture ({offsets:?})");
         }
-        // where the TV's playlist starts in the film is where the session counts from: a copied
-        // resume starts at the keyframe before the point asked (10 s for 13.3 s: 5 s GOPs), and
-        // positions and saved progress must never run ahead of the picture
+        // where the TV's picture starts in the film is where the session counts from: a
+        // full-length playlist's segment start (the film's own time: the session adds nothing),
+        // an EVENT playlist's offset; a copy starts at the keyframe before the point asked (10 s
+        // for 13.3 s: 5 s GOPs); positions and saved progress never run ahead of the picture
         let shown = first - picture;
-        let said = prepared.load.offset_s;
+        let said = if full { from.unwrap() } else { prepared.load.offset_s };
+        if full {
+            assert_eq!(prepared.load.offset_s, 0.0, "{case}");
+        }
         assert!((said - shown).abs() < 0.1, "{case}: the session counts from {said:.3} s, the TV's picture starts at {shown:.3} s");
         assert!(said <= shown + 0.03, "{case}: ahead of the picture ({said:.3} > {shown:.3})");
-        if force.is_none() && start_at.is_some() {
+        if force.is_none() && start_at.is_some() && scrub.is_none() {
             assert!((said - 10.0).abs() < 0.05, "{case}: the copy starts at the keyframe: {said:.3}");
+        }
+        if let Some(to) = scrub {
+            assert!((said - 15.0).abs() < 0.05, "{case}: the scrub to {to} s starts at its keyframe: {said:.3}");
         }
     }
 }
@@ -951,5 +1049,290 @@ async fn broadcast_fixtures_probe_to_the_apple_tv_plan() {
         let probe = relay::probe::probe(&caps.ffprobe, path.to_str().unwrap(), false).await.unwrap_or_else(|e| panic!("{name}: {e:?}"));
         let got = plan::plan(ReceiverKind::AppleTv, &probe.facts(&CastHints::default()), opts).unwrap();
         assert_eq!((got.level, got.video, got.audio), (level, video, audio), "{name}: {probe:?}");
+    }
+}
+
+// ---- full-length films (§8.5) -------------------------------------------------------------
+
+/// A VOD playlist's segments: `(start, EXTINF, name)`, starts summed from its first.
+fn vod_segments(text: &str) -> Vec<(f64, f64, String)> {
+    let mut out = Vec::new();
+    let mut at = 0.0;
+    let mut dur = None;
+    for line in text.lines() {
+        if let Some(d) = line.strip_prefix("#EXTINF:") {
+            dur = d.trim_end_matches(',').parse::<f64>().ok();
+        } else if !line.starts_with('#') && !line.is_empty() {
+            let d = dur.take().expect("an EXTINF before each segment");
+            out.push((at, d, line.to_owned()));
+            at += d;
+        }
+    }
+    out
+}
+
+/// `#EXT-X-START:TIME-OFFSET=<t>` of a playlist.
+fn ext_x_start(text: &str) -> Option<f64> {
+    text.lines().find_map(|l| l.strip_prefix("#EXT-X-START:TIME-OFFSET=")).and_then(|v| v.split(',').next()?.parse().ok())
+}
+
+/// The keyframes' presentation times of a local file's picture, as ffprobe reads them.
+fn keyframes(ffprobe: &std::path::Path, file: &std::path::Path) -> Vec<f64> {
+    let out = std::process::Command::new(ffprobe)
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time,flags", "-of", "csv=p=0"])
+        .arg(file)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).lines().filter(|l| l.contains(",K")).filter_map(|l| l.split(',').next()?.parse().ok()).collect()
+}
+
+/// The packets of one stream of a segment (`v` or `a`): `pts,dts,size,flags` lines, as ffprobe
+/// reads them on the segment's own timeline (MPEG-TS: what the TV decodes).
+fn packets(ffprobe: &std::path::Path, file: &std::path::Path, stream: &str) -> Vec<String> {
+    let out = std::process::Command::new(ffprobe)
+        .args(["-v", "error", "-select_streams", stream, "-show_entries", "packet=pts,dts,size,flags", "-of", "csv=p=0"])
+        .arg(file)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).lines().map(str::to_owned).collect()
+}
+
+/// The same packets (`pts,dts,size,flags` lines), timestamps within a millisecond (90 ticks).
+fn same_frames(a: &[String], b: &[String]) -> bool {
+    let parse = |l: &String| {
+        let f: Vec<&str> = l.split(',').collect();
+        let n = |i: usize| f.get(i).and_then(|v| v.parse::<i64>().ok());
+        (n(0), n(1), f.get(2).map(|s| s.to_string()), f.get(3).map(|s| s.to_string()))
+    };
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            let (x, y) = (parse(x), parse(y));
+            let close = |p: Option<i64>, q: Option<i64>| matches!((p, q), (Some(p), Some(q)) if (p - q).abs() <= 90);
+            close(x.0, y.0) && close(x.1, y.1) && x.2 == y.2 && x.3 == y.3
+        })
+}
+
+/// A film reaches the TV whole (§8.5): a VOD playlist listing every segment at once, cut only at
+/// the source's keyframes (the MP4 index with its moov at the end, the Matroska cues), whole
+/// keyframe runs, one target for all, nothing more than one provider connection at a time, and
+/// the directory gone with the session. Then the TV starts where `EXT-X-START` says (a resume
+/// at 25 s: the first run starts there) and scrubs back to 10 s with its own remote: that
+/// segment is made on demand by a run started there, and it is the same media as the same segment of a run from the start: identical picture
+/// packets (timestamps, sizes, keyframes); the next segment's sound identical too, the scrub's
+/// first segment holding at most one audio frame more (the demuxer's seek lands the sound a
+/// frame before the keyframe).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_film_reaches_the_tv_whole_and_any_segment_is_made_on_demand_as_the_same_media() {
+    let Some(media) = media() else { return };
+    let caps = relay::ffmpeg::caps().await.unwrap();
+    // the film, its length, where it resumes and where the TV scrubs back to
+    for (file, length, resume, back) in [("/vod.mp4", 30.0, 25.0, 10.0), ("/vod.mkv", 30.0, 25.0, 10.0), ("/vod_hevc.mp4", 12.0, 9.0, 3.0)] {
+        let local = media.join(file.trim_start_matches('/'));
+        let keys = keyframes(&caps.ffprobe, &local);
+        let hevc = file.contains("hevc");
+        let work = tempfile::tempdir().unwrap();
+        let tv = tv();
+        // a segment as the TV gets it: MPEG-TS, or fMP4 after its init section
+        let fetch = |base: String, init: Option<Vec<u8>>, name: String, path: std::path::PathBuf| {
+            let tv = tv.clone();
+            async move {
+                let resp = tv.get(format!("{base}{name}")).send().await.unwrap();
+                assert_eq!(resp.status(), 200, "{name}");
+                let mut bytes = init.unwrap_or_default();
+                bytes.extend_from_slice(&resp.bytes().await.unwrap());
+                std::fs::write(&path, bytes).unwrap();
+                path
+            }
+        };
+        let init_of = |base: String, text: String| {
+            let tv = tv.clone();
+            async move {
+                let name = text.lines().find_map(|l| l.strip_prefix("#EXT-X-MAP:URI=\"").map(|u| u.trim_end_matches('"').to_owned()))?;
+                Some(tv.get(format!("{base}{name}")).send().await.unwrap().bytes().await.unwrap().to_vec())
+            }
+        };
+
+        // from the start, every segment in order: one run
+        let server = TestServer::start(media.clone(), Faults::default());
+        let dir = tempfile::tempdir().unwrap();
+        let mut relay = RelaySession::start(config(&dir, LOOPBACK)).await.unwrap();
+        let p = playable(PlayableKind::Movie, server.url(file), HttpHeaders::default());
+        let prepared = relay.load(spec(1, p.clone(), None)).await.unwrap_or_else(|e| panic!("{file}: {e:?}"));
+        assert_eq!((prepared.load.offset_s, prepared.surround), (0.0, false), "{file}");
+        let text = tv.get(prepared.load.url.expose()).send().await.unwrap().text().await.unwrap();
+        let version = if hevc { "#EXT-X-VERSION:7\n" } else { "#EXT-X-VERSION:3\n" };
+        assert!(text.starts_with(&format!("#EXTM3U\n{version}#EXT-X-TARGETDURATION:")), "{file}:\n{text}");
+        assert!(text.contains("#EXT-X-PLAYLIST-TYPE:VOD\n") && text.ends_with("#EXT-X-ENDLIST\n"), "{file}:\n{text}");
+        assert_eq!(text.contains("#EXT-X-MAP:URI=\"init.mp4\"\n"), hevc, "{file}: HEVC goes in fMP4:\n{text}");
+        let segs = vod_segments(&text);
+        let total: f64 = segs.iter().map(|s| s.1).sum();
+        assert!((total - length).abs() < 0.1, "{file}: the film's length, {total}");
+        let target: f64 = text.lines().find_map(|l| l.strip_prefix("#EXT-X-TARGETDURATION:")).unwrap().parse().unwrap();
+        assert_eq!(target, segs.iter().map(|s| s.1.round()).fold(0.0, f64::max), "{file}: the longest segment, rounded");
+        for (start, dur, name) in &segs[1..] {
+            assert!(keys.iter().any(|k| (k - start).abs() < 0.002), "{file}: {name} starts at {start}, not a keyframe of {keys:?}");
+            // whole keyframe runs of at most 1.5 s (the tests' 1 s aim), or one longer GOP
+            let gop = keys.iter().filter(|k| **k > start + 0.002).fold(f64::MAX, |m, k| m.min(k - start));
+            assert!(*dur <= 1.5 + 1e-6 || (*dur - gop).abs() < 0.002 || name == &segs.last().unwrap().2, "{file}: {name} lasts {dur}");
+        }
+        let base = base_of(&prepared);
+        let init = init_of(base.clone(), text.clone()).await;
+        let mut linear = Vec::new();
+        for (i, (_, _, name)) in segs.iter().enumerate() {
+            linear.push(fetch(base.clone(), init.clone(), name.clone(), work.path().join(format!("linear{i}"))).await);
+        }
+        assert_eq!(server.max_concurrent(), 1, "{file}: {:#?}", server.overlaps());
+        relay.stop(false).await;
+        assert!(std::fs::read_dir(dir.path().join("vod")).map_or(true, |mut d| d.next().is_none()), "{file}: the session's directory is gone");
+        drop(server);
+
+        // resumed, then scrubbed back on the TV
+        let server = TestServer::start(media.clone(), Faults::default());
+        let dir = tempfile::tempdir().unwrap();
+        let mut relay = RelaySession::start(config(&dir, LOOPBACK)).await.unwrap();
+        let mut resumed = (*p).clone();
+        resumed.url = Secret::new(server.url(file));
+        resumed.start_at = Some(resume);
+        let prepared = relay.load(spec(2, Arc::new(resumed), None)).await.unwrap();
+        assert_eq!(prepared.load.offset_s, 0.0, "{file}: positions are the film's own");
+        let text = tv.get(prepared.load.url.expose()).send().await.unwrap().text().await.unwrap();
+        assert_eq!(ext_x_start(&text), Some(resume), "{file}:\n{text}");
+        assert_eq!(vod_segments(&text), segs, "{file}: the same map");
+        let at = |t: f64| segs.iter().rposition(|s| s.0 <= t).unwrap();
+        let (k, n) = (at(resume), at(back));
+        let base = base_of(&prepared);
+        let again = init_of(base.clone(), text.clone()).await;
+        assert_eq!(again, init, "{file}: the same init section");
+        let _ = fetch(base.clone(), None, segs[k].2.clone(), work.path().join("start")).await;
+        let mut scrubbed = Vec::new();
+        for i in [n, n + 1] {
+            scrubbed.push(fetch(base.clone(), init.clone(), segs[i].2.clone(), work.path().join(format!("scrub{i}"))).await);
+        }
+        for (j, i) in [n, n + 1].into_iter().enumerate() {
+            let (a, b) = (&linear[i], &scrubbed[j]);
+            assert_eq!(packets(&caps.ffprobe, a, "v"), packets(&caps.ffprobe, b, "v"), "{file}: segment {i}'s pictures");
+            // the sound: the same frames (Matroska's millisecond clock lets a run's first few
+            // timestamps differ by a fraction of one)
+            let (sa, sb) = (packets(&caps.ffprobe, a, "a"), packets(&caps.ffprobe, b, "a"));
+            let extra = if j == 0 && sb.len() == sa.len() + 1 { 1 } else { 0 };
+            assert!(same_frames(&sa, &sb[extra..]), "{file}: segment {i}'s sound:\n{sa:?}\n{sb:?}");
+        }
+        assert_eq!(server.max_concurrent(), 1, "{file}: one provider connection across the runs: {:#?}", server.overlaps());
+        relay.stop(false).await;
+    }
+}
+
+/// A TV that ignores `EXT-X-START` (§8.5): one that fetches where it is told keeps whole
+/// playlists; one whose first segment under a resumed playlist is the film's first is reported
+/// once (`StartIgnored`, with where it should have started), and from then on the session's
+/// seeks and loads are views that start there (`MEDIA-SEQUENCE:k`, the offset its start: the TV's
+/// positions count from it, as Phase 1's views).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tv_that_ignores_where_the_playlist_starts_gets_views_from_there() {
+    let Some(media) = media() else { return };
+    let server = TestServer::start(media, Faults::default());
+    let dir = tempfile::tempdir().unwrap();
+    let mut relay = RelaySession::start(config(&dir, LOOPBACK)).await.unwrap();
+    let mut p = (*playable(PlayableKind::Movie, server.url("/vod.mkv"), HttpHeaders::default())).clone();
+    p.start_at = Some(20.0);
+    let p = Arc::new(p);
+    let tv = tv();
+    let prepared = relay.load(spec(1, p.clone(), None)).await.unwrap();
+    let text = tv.get(prepared.load.url.expose()).send().await.unwrap().text().await.unwrap();
+    assert_eq!((prepared.load.offset_s, ext_x_start(&text)), (0.0, Some(20.0)), "{text}");
+    let segs = vod_segments(&text);
+    let at = |t: f64| segs.iter().rposition(|s| s.0 <= t).unwrap();
+    // as told: the segment holding 20 s first
+    assert_eq!(tv.get(format!("{}{}", base_of(&prepared), segs[at(20.0)].2)).send().await.unwrap().status(), 200);
+    let view = relay.view(2, 5.0).await.unwrap().unwrap();
+    let vtext = tv.get(view.load.url.expose()).send().await.unwrap().text().await.unwrap();
+    assert_eq!((view.load.offset_s, ext_x_start(&vtext)), (0.0, Some(5.0)), "still whole: {vtext}");
+    // from the film's start instead
+    assert!(at(5.0) >= 2, "{segs:?}");
+    assert_eq!(tv.get(format!("{}{}", base_of(&view), segs[0].2)).send().await.unwrap().status(), 200);
+    until(&mut relay, Duration::from_secs(5), |e| *e == RelayEvent::StartIgnored { generation: 2, at_s: 5.0 }).await;
+    let view = relay.view(3, 5.0).await.unwrap().unwrap();
+    let vtext = tv.get(view.load.url.expose()).send().await.unwrap().text().await.unwrap();
+    assert!((view.load.offset_s - segs[at(5.0)].0).abs() < 1e-3 && ext_x_start(&vtext).is_none(), "{vtext}");
+    assert!(vtext.contains(&format!("#EXT-X-MEDIA-SEQUENCE:{}\n", at(5.0))) && vtext.contains("#EXT-X-PLAYLIST-TYPE:VOD\n"), "{vtext}");
+    assert_eq!(vod_segments(&vtext).first().map(|s| s.2.clone()), Some(segs[at(5.0)].2.clone()));
+    // a load of the next item starts with a view too
+    let prepared = relay.load(spec(4, p, None)).await.unwrap();
+    let text = tv.get(prepared.load.url.expose()).send().await.unwrap().text().await.unwrap();
+    assert!((prepared.load.offset_s - segs[at(20.0)].0).abs() < 1e-3 && ext_x_start(&text).is_none(), "{text}");
+    relay.stop(false).await;
+}
+
+/// §8.5's fallback matrix on real files: a film without a keyframe index (MPEG-TS, Matroska
+/// without cues), converted or not, and one from a provider that ignores `Range` keep their
+/// EVENT playlists; converted (L3), an indexed film goes full length on the grid of its forced
+/// keyframes (1 s here), each segment starting with a keyframe at its grid time, and a segment
+/// made by a run started at a scrub has the same pictures, at the same times, as a run from the
+/// start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_an_index_a_film_keeps_a_growing_playlist_unless_it_is_converted() {
+    let Some(media) = media() else { return };
+    let caps = relay::ffmpeg::caps().await.unwrap();
+    let tv = tv();
+    let converted = Some(CastLevel::Converted);
+    for (file, ranges, force) in [
+        ("/vod.ts", true, None),
+        ("/vod.ts", true, converted),
+        ("/vod_nocues.mkv", true, None),
+        ("/vod.mkv", false, None),
+        ("/vod.mkv", false, converted),
+    ] {
+        let server = TestServer::start(media.clone(), Faults::default());
+        server.set_ranges(ranges);
+        let dir = tempfile::tempdir().unwrap();
+        let mut relay = RelaySession::start(config(&dir, LOOPBACK)).await.unwrap();
+        let prepared = relay.load(spec(1, playable(PlayableKind::Movie, server.url(file), HttpHeaders::default()), force)).await.unwrap();
+        let text = tv.get(prepared.load.url.expose()).send().await.unwrap().text().await.unwrap();
+        assert!(text.contains("#EXT-X-PLAYLIST-TYPE:EVENT\n"), "{file} (Range: {ranges}, {force:?}):\n{text}");
+        relay.stop(false).await;
+    }
+
+    let server = TestServer::start(media, Faults::default());
+    let work = tempfile::tempdir().unwrap();
+    let mut made: Vec<Vec<std::path::PathBuf>> = Vec::new();
+    for (start_at, fetch) in [(None, vec![9, 10, 11]), (Some(25.0), vec![10, 11])] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut relay = RelaySession::start(config(&dir, LOOPBACK)).await.unwrap();
+        let mut p = (*playable(PlayableKind::Movie, server.url("/vod.mkv"), HttpHeaders::default())).clone();
+        p.start_at = start_at;
+        let prepared = relay.load(spec(1, Arc::new(p), converted)).await.unwrap();
+        assert_eq!((prepared.level, prepared.load.offset_s), (CastLevel::Converted, 0.0));
+        let text = tv.get(prepared.load.url.expose()).send().await.unwrap().text().await.unwrap();
+        assert!(text.contains("#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n") && text.contains("#EXT-X-TARGETDURATION:1\n"), "{text}");
+        let segs = vod_segments(&text);
+        assert_eq!(segs.len(), 30, "{text}");
+        assert!(segs.iter().enumerate().all(|(k, s)| (s.0 - k as f64).abs() < 1e-6), "a cut every second: {segs:?}");
+        let base = base_of(&prepared);
+        if start_at.is_some() {
+            // where the TV starts, then the scrub back
+            assert_eq!(tv.get(format!("{base}s25.ts")).send().await.unwrap().status(), 200);
+        }
+        let mut files = Vec::new();
+        for k in fetch {
+            let resp = tv.get(format!("{base}s{k}.ts")).send().await.unwrap();
+            assert_eq!(resp.status(), 200, "s{k}.ts");
+            let path = work.path().join(format!("{}-{k}.ts", made.len()));
+            std::fs::write(&path, resp.bytes().await.unwrap()).unwrap();
+            files.push(path);
+        }
+        made.push(files);
+        relay.stop(false).await;
+    }
+    // the pictures of segments 10 and 11: from the start, and from a run started at 10
+    for (a, b) in made[0][1..].iter().zip(&made[1]) {
+        let pts = |f: &std::path::Path| {
+            packets(&caps.ffprobe, f, "v").iter().map(|l| l.split(',').next().unwrap_or_default().to_owned()).collect::<Vec<_>>()
+        };
+        assert_eq!(pts(a), pts(b), "{a:?} / {b:?}");
+        let first = packets(&caps.ffprobe, b, "v")
+            .into_iter()
+            .min_by_key(|l| l.split(',').next().and_then(|p| p.parse::<i64>().ok()).unwrap_or(i64::MAX))
+            .unwrap();
+        assert!(first.ends_with("K__,") || first.contains(",K"), "a segment starts with a keyframe: {first}");
     }
 }

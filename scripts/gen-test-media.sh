@@ -14,6 +14,14 @@
 #   avsync.mkv       40 s 320x180 25 fps H.264 (5 s GOPs, B-frames) + AAC 5.1: at each second k a
 #                    white picture and a 1 kHz beep on every channel, both lasting 40 ms x (1 + k mod
 #                    23), so a marker names its second (casting's A/V alignment, tests/cast_relay.rs)
+#   avsync_nocues.mkv  the marker film without cues (written to a pipe): no keyframe index
+#   vod.mp4, vod.mkv 30 s 320x180 25 fps H.264 (B-frames, keyframes at irregular times) + AAC
+#                    stereo: casting's full-length films (MP4 index, Matroska cues); vod.mp4 has its
+#                    moov at the end
+#   vod_hevc.mp4     12 s 320x180 HEVC (x265, B-frames, irregular keyframes) + AAC stereo: casting's
+#                    fMP4 output of a full-length film
+#   vod.ts, vod_nocues.mkv   the same without a keyframe index (MPEG-TS; Matroska written to a
+#                    pipe, so without cues): EVENT playlists when cast
 #   live/            rolling "live" HLS written by `--live` until killed (manual checks only)
 # Tests call this through `tests/support/media.rs::ensure_media`, which runs it once into a
 # temporary directory and renames it into place, so concurrent test binaries never see
@@ -53,6 +61,19 @@ beep="if($mark\\,0.8*sin(2*PI*1000*t)\\,0)"
 ff -f lavfi -i "color=c=black:s=320x180:r=25,drawbox=c=white:t=fill:enable='$mark'" \
    -f lavfi -i "aevalsrc=$beep|$beep|$beep|$beep|$beep|$beep:c=5.1(side):s=48000" \
    -t 40 "${x264[@]}" -g 125 -keyint_min 125 -sc_threshold 0 -bf 2 -c:a aac -b:a 384k "$out/avsync.mkv"
+
+ffmpeg -nostdin -hide_banner -loglevel error -i "$out/avsync.mkv" -c copy -f matroska - > "$out/avsync_nocues.mkv"
+
+# full-length casting: keyframes where a film's scene cuts would put them
+keys=0,1.32,2.68,4.12,5.0,6.6,8.04,9.4,10.8,13.0,14.2,17.6,19.0,21.44,22.0,24.8,27.2,28.6
+ff -f lavfi -i testsrc2=size=320x180:rate=25 -f lavfi -i sine=frequency=330:sample_rate=48000 \
+   -t 30 "${x264[@]}" -bf 2 -g 250 -sc_threshold 0 -force_key_frames "$keys" -c:a aac -b:a 128k "$out/vod.mp4"
+ff -i "$out/vod.mp4" -c copy "$out/vod.mkv"
+ff -f lavfi -i testsrc2=size=320x180:rate=25 -f lavfi -i sine=frequency=330:sample_rate=48000 \
+   -t 12 -c:v libx265 -preset ultrafast -pix_fmt yuv420p -x265-params "bframes=2:keyint=250:scenecut=0:log-level=error" \
+   -force_key_frames 0,1.32,2.68,4.12,5.0,6.6,8.04,9.4,10.8 -tag:v hvc1 -c:a aac -b:a 128k "$out/vod_hevc.mp4"
+ff -i "$out/vod.mp4" -c copy -f mpegts "$out/vod.ts"
+ffmpeg -nostdin -hide_banner -loglevel error -i "$out/vod.mp4" -c copy -f matroska - > "$out/vod_nocues.mkv"
 
 if [[ "${2:-}" == "--live" ]]; then
   mkdir -p "$out/live"

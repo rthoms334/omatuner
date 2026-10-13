@@ -13,8 +13,9 @@
 //! * **The item** is foxCast's key set. `playerLoggingID` is at most 6 characters: longer values
 //!   make the TV close the connection silently (`P/ABCD` works, `P/ABCDE` doesn't; PR 2899).
 //! * **The start position is always 0**: every playlist the TV gets starts where playback should
-//!   (a `-ss` restart or a playlist view, §8.5), so nothing depends on whether tvOS honours a
-//!   start key (Screenbox: tvOS 26 ignores it).
+//!   (a `-ss` restart or a playlist view), or says where (a full-length item's `EXT-X-START`,
+//!   §8.5), so nothing depends on whether tvOS honours a start key (Screenbox: tvOS 26 ignores
+//!   it).
 //! * **Headers** (Apple TV): `POST /command HTTP/1.1` with `Content-Type` and `X-Apple-StreamID`,
 //!   spelt exactly so — the hyphenated `X-Apple-Stream-ID` gets a 200 on an Apple TV but the
 //!   item never starts (VioletRelay). No `X-Apple-ProtocolVersion` or `X-Apple-Session-ID` (a

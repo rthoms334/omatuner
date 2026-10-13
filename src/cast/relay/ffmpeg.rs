@@ -92,9 +92,14 @@ pub fn set_segment_seconds_for_tests(s: f64) {
 
 /// The configured segment length (4 s, or the tests' override).
 pub fn segment_s() -> f64 {
+    segment_override().unwrap_or(SEGMENT_S)
+}
+
+/// The tests' segment length, when set (full-length items use it instead of their 6 s too).
+pub fn segment_override() -> Option<f64> {
     match SEGMENT_MS_OVERRIDE.load(Ordering::Relaxed) {
-        0 => SEGMENT_S,
-        ms => ms as f64 / 1000.0,
+        0 => None,
+        ms => Some(ms as f64 / 1000.0),
     }
 }
 
@@ -241,74 +246,20 @@ pub fn argv(input: &Input<'_>, plan: &Plan, out: &Output<'_>) -> Vec<String> {
             push(&["-t", &TEST_CARD_S.to_string()]);
         }
     }
-    if plan.video != Video::None {
-        push(&["-map", "0:v:0"]);
-    }
-    match (plan.audio, input) {
-        (Audio::None, _) => {}
-        (_, Input::TestCard { .. }) => push(&["-map", "1:a:0"]),
-        (_, Input::Proxy { .. }) => {
-            let map = out.audio_index.map_or_else(|| "0:a:0?".to_owned(), |n| format!("0:a:{n}"));
-            // a surround output maps the sound twice: the stereo rendition, then the surround one
-            for _ in 0..if plan.surround.is_some() { 2 } else { 1 } {
-                push(&["-map", &map]);
-            }
-        }
-    }
-    match plan.video {
-        Video::None => push(&["-vn"]),
-        Video::Copy => {
-            push(&["-c:v", "copy"]);
-            if plan.segments == Segments::Fmp4 {
-                push(&["-tag:v", "hvc1"]);
-            }
-        }
-        Video::Encode { deinterlace } => {
-            let gop = (2.0 * out.fps.filter(|f| *f > 0.0).unwrap_or(25.0)).round().max(1.0) as u32;
-            push(&["-c:v", "libx264", "-preset", "veryfast", "-profile:v", "high", "-level", "4.1", "-crf", "21"]);
-            push(&["-maxrate", "8M", "-bufsize", "16M", "-g", &gop.to_string(), "-sc_threshold", "0"]);
-            let mut vf = Vec::new();
-            if deinterlace {
-                vf.push("yadif=deint=interlaced".to_owned());
-            }
-            vf.push("scale=-2:'min(1080,ih)'".to_owned());
-            // High profile is 8-bit 4:2:0 (a 10-bit HEVC source would make x264 pick High 10)
-            vf.push("format=yuv420p".to_owned());
-            if matches!(input, Input::TestCard { label: true }) {
-                vf.push("drawtext=text=Tuner:fontsize=120:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=24:x=(w-tw)/2:y=(h-th)/2".to_owned());
-            }
-            push(&["-vf", &vf.join(",")]);
-            // converted video starts exactly at the seek point: so does copied sound (else it
-            // keeps the packets back to the demuxer's seek position, a GOP early)
-            if matches!(input, Input::Proxy { seek_s, .. } if *seek_s > 0.0) {
-                push(&["-copypriorss:a", "0"]);
-            }
-        }
-    }
-    match (plan.audio, plan.surround) {
-        (_, Some(surround)) => {
-            push(&["-c:a:0", "aac", "-ac:a:0", "2", "-b:a:0", "160k"]);
-            match surround {
-                // the mp4 muxer wants an AudioSpecificConfig, MPEG-TS carries ADTS (see below)
-                Surround::Copy { aac: true } => push(&["-c:a:1", "copy", "-bsf:a:1", "aac_adtstoasc"]),
-                Surround::Copy { aac: false } => push(&["-c:a:1", "copy"]),
-                // 7.1 is folded to 5.1, AC-3's most
-                Surround::Ac3 => push(&["-c:a:1", "ac3", "-ac:a:1", "6", "-b:a:1", "448k"]),
-            }
-        }
-        (Audio::None, None) => push(&["-an"]),
-        (Audio::Copy, None) => {
-            push(&["-c:a", "copy"]);
-            // copied audio is AAC (plan.rs): the mp4 muxer behind fMP4 segments refuses ADTS
-            // ("Malformed AAC bitstream detected", ffmpeg exits at the first audio packet), and
-            // MPEG-TS sources carry ADTS; the filter turns it into an AudioSpecificConfig and
-            // passes MP4/MKV audio (already ASC) through unchanged
-            if plan.segments == Segments::Fmp4 {
-                push(&["-bsf:a", "aac_adtstoasc"]);
-            }
-        }
-        (Audio::Aac, None) => push(&["-c:a", "aac", "-ac", "2", "-b:a", "160k"]),
-    }
+    let seeking = matches!(input, Input::Proxy { seek_s, .. } if *seek_s > 0.0);
+    let gop = (2.0 * out.fps.filter(|f| *f > 0.0).unwrap_or(25.0)).round().max(1.0) as u32;
+    let codecs = Codecs {
+        test_card: matches!(input, Input::TestCard { .. }),
+        label: matches!(input, Input::TestCard { label: true }),
+        audio_index: out.audio_index,
+        // Phase 1's HLS outputs tag every fMP4 picture (hlsenc passes it over for H.264)
+        hvc1: plan.segments == Segments::Fmp4,
+        gop,
+        forced: None,
+        seeking,
+    };
+    codecs.push(&mut a, plan);
+    let mut push = |items: &[&str]| a.extend(items.iter().map(|s| (*s).to_owned()));
     // subtitles and teletext are dropped in Phase 1
     push(&["-sn", "-dn", "-f", "hls", "-hls_time", &fmt_secs(out.hls_time)]);
     if out.live {
@@ -345,6 +296,189 @@ pub fn argv(input: &Input<'_>, plan: &Plan, out: &Output<'_>) -> Vec<String> {
         let start = out.dir.join(START_FILE);
         push(&["-map", "0:v:0", "-c:v", "copy", "-frames:v", "1", "-flush_packets", "1", "-f", "framecrc", &start.to_string_lossy()]);
     }
+    a
+}
+
+/// The maps and codecs of an output (shared by the HLS outputs and the full-length runs).
+struct Codecs<'a> {
+    test_card: bool,
+    /// The test card's "Tuner" label.
+    label: bool,
+    audio_index: Option<usize>,
+    /// Copied video gets the `hvc1` tag (Apple rule 1.5).
+    hvc1: bool,
+    /// Converted video's keyframe interval (frames).
+    gop: u32,
+    /// Converted video's forced keyframes (`-force_key_frames` times), full-length runs.
+    forced: Option<&'a str>,
+    /// The input starts past 0 (`-ss`): converted video drops copied sound before it.
+    seeking: bool,
+}
+
+impl Codecs<'_> {
+    fn push(&self, a: &mut Vec<String>, plan: &Plan) {
+        let mut push = |items: &[&str]| a.extend(items.iter().map(|s| (*s).to_owned()));
+        if plan.video != Video::None {
+            push(&["-map", "0:v:0"]);
+        }
+        match plan.audio {
+            Audio::None => {}
+            _ if self.test_card => push(&["-map", "1:a:0"]),
+            _ => {
+                let map = self.audio_index.map_or_else(|| "0:a:0?".to_owned(), |n| format!("0:a:{n}"));
+                // a surround output maps the sound twice: the stereo rendition, then the surround one
+                for _ in 0..if plan.surround.is_some() { 2 } else { 1 } {
+                    push(&["-map", &map]);
+                }
+            }
+        }
+        match plan.video {
+            Video::None => push(&["-vn"]),
+            Video::Copy => {
+                push(&["-c:v", "copy"]);
+                if self.hvc1 {
+                    push(&["-tag:v", "hvc1"]);
+                }
+            }
+            Video::Encode { deinterlace } => {
+                push(&["-c:v", "libx264", "-preset", "veryfast", "-profile:v", "high", "-level", "4.1", "-crf", "21"]);
+                push(&["-maxrate", "8M", "-bufsize", "16M", "-g", &self.gop.to_string(), "-sc_threshold", "0"]);
+                if let Some(times) = self.forced {
+                    push(&["-force_key_frames", times]);
+                }
+                let mut vf = Vec::new();
+                if deinterlace {
+                    vf.push("yadif=deint=interlaced".to_owned());
+                }
+                vf.push("scale=-2:'min(1080,ih)'".to_owned());
+                // High profile is 8-bit 4:2:0 (a 10-bit HEVC source would make x264 pick High 10)
+                vf.push("format=yuv420p".to_owned());
+                if self.label {
+                    vf.push(
+                        "drawtext=text=Tuner:fontsize=120:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=24:x=(w-tw)/2:y=(h-th)/2".to_owned(),
+                    );
+                }
+                push(&["-vf", &vf.join(",")]);
+                // converted video starts exactly at the seek point: so does copied sound (else it
+                // keeps the packets back to the demuxer's seek position, a GOP early)
+                if self.seeking {
+                    push(&["-copypriorss:a", "0"]);
+                }
+            }
+        }
+        match (plan.audio, plan.surround) {
+            (_, Some(surround)) => {
+                push(&["-c:a:0", "aac", "-ac:a:0", "2", "-b:a:0", "160k"]);
+                match surround {
+                    // the mp4 muxer wants an AudioSpecificConfig, MPEG-TS carries ADTS (see below)
+                    Surround::Copy { aac: true } => push(&["-c:a:1", "copy", "-bsf:a:1", "aac_adtstoasc"]),
+                    Surround::Copy { aac: false } => push(&["-c:a:1", "copy"]),
+                    // 7.1 is folded to 5.1, AC-3's most
+                    Surround::Ac3 => push(&["-c:a:1", "ac3", "-ac:a:1", "6", "-b:a:1", "448k"]),
+                }
+            }
+            (Audio::None, None) => push(&["-an"]),
+            (Audio::Copy, None) => {
+                push(&["-c:a", "copy"]);
+                // copied audio is AAC (plan.rs): the mp4 muxer behind fMP4 segments refuses ADTS
+                // ("Malformed AAC bitstream detected", ffmpeg exits at the first audio packet), and
+                // MPEG-TS sources carry ADTS; the filter turns it into an AudioSpecificConfig and
+                // passes MP4/MKV audio (already ASC) through unchanged
+                if plan.segments == Segments::Fmp4 {
+                    push(&["-bsf:a", "aac_adtstoasc"]);
+                }
+            }
+            (Audio::Aac, None) => push(&["-c:a", "aac", "-ac", "2", "-b:a", "160k"]),
+        }
+    }
+}
+
+/// The constant every full-length run adds to its timestamps (`-output_ts_offset`): a run from 0
+/// would otherwise start one B-frame delay (and AAC priming) later than a run restarted later,
+/// whose first timestamps aren't negative (Phase 2 design §29.6, measured 2026-10-13); it also
+/// keeps the sound's priming off negative `tfdt`s.
+pub const RUN_OFFSET_S: f64 = 10.0;
+/// The segment list a full-length run writes beside its segments (`name,start,end` per segment
+/// once it is closed: the relay publishes from it).
+pub const RUN_LIST: &str = "list.csv";
+/// The movie fragment flags of a full-length run's fMP4 segments (vod.rs module docs): each
+/// segment is a whole fragmented file (`-individual_header_trailer 1`) whose init section is
+/// written with its first fragment (`delay_moov`: AC-3 and E-AC-3 need their first packet; with
+/// one muxer for the run, its first flush wrote only the `moov` and a one-GOP first segment's
+/// pictures landed in the next file), fragments start at picture keyframes, decode times are
+/// absolute (`frag_discont`), the first picture's presentation time is its decode time
+/// (`negative_cts_offsets`, Phase 1's "One timeline"), and no index or trailer boxes.
+const RUN_MOVFLAGS: &str = "movflags=+frag_keyframe+empty_moov+delay_moov+default_base_moof+frag_discont+skip_sidx+skip_trailer+negative_cts_offsets";
+
+/// One full-length run (vod.rs): the item from segment `first` on, cut where the segment map
+/// says, into `dir`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Run<'a> {
+    pub url: &'a str,
+    /// `-ss` (copied video: where the demuxer lands on segment `first`'s keyframe; converted:
+    /// the segment's start). `None` from the start.
+    pub seek_s: Option<f64>,
+    /// The run's directory (`s<n>.<ext>` and [`RUN_LIST`]).
+    pub dir: &'a Path,
+    pub first: u64,
+    /// `-segment_times`: the cut points after the first, relative to the run's first picture.
+    pub cuts: &'a str,
+    /// The segment muxer's tolerance (a cut lands on the first keyframe at or after point − it).
+    pub delta: f64,
+    /// Converted video: `-force_key_frames` (the cut points on the item's clock).
+    pub forced: Option<&'a str>,
+    /// Copied HEVC (`-tag:v hvc1`; never on H.264, which the mp4 muxer refuses).
+    pub hevc: bool,
+    pub fps: Option<f64>,
+    pub audio_index: Option<usize>,
+}
+
+/// A full-length run's argv (pure: tested). Holds only the loopback URL and paths under
+/// `run.dir`.
+pub fn run_argv(run: &Run<'_>, plan: &Plan) -> Vec<String> {
+    let mut a: Vec<String> = Vec::with_capacity(80);
+    let mut push = |items: &[&str]| a.extend(items.iter().map(|s| (*s).to_owned()));
+    push(&["-nostdin", "-hide_banner", "-nostats", "-loglevel", "warning", "-progress", "pipe:1"]);
+    push(&["-reconnect", "0", "-readrate", "1", "-readrate_initial_burst", READ_BURST_S]);
+    if let Some(at) = run.seek_s.filter(|s| *s > 0.0) {
+        // copied video: the demuxer lands on the keyframe and every stream starts there;
+        // converted: decoded from the keyframe before, shown from the point
+        if plan.video == Video::Copy {
+            push(&["-noaccurate_seek"]);
+        }
+        push(&["-ss", &format!("{at:.6}")]);
+    }
+    // the item's own clock (from the file's start) in every run: cut points, seeks and the
+    // forced keyframes all count on it
+    push(&["-copyts", "-start_at_zero", "-i", run.url]);
+    let fps = run.fps.filter(|f| *f > 0.0).unwrap_or(25.0);
+    let codecs = Codecs {
+        test_card: false,
+        label: false,
+        audio_index: run.audio_index,
+        hvc1: run.hevc,
+        // only the forced keyframes: the encoder's own interval never comes first
+        gop: (fps * 60.0).round().max(1.0) as u32,
+        forced: run.forced,
+        seeking: run.seek_s.is_some_and(|s| s > 0.0),
+    };
+    codecs.push(&mut a, plan);
+    let mut push = |items: &[&str]| a.extend(items.iter().map(|s| (*s).to_owned()));
+    push(&["-sn", "-dn", "-map_metadata", "-1", "-map_chapters", "-1", "-fflags", "+bitexact"]);
+    push(&["-output_ts_offset", &fmt_secs(RUN_OFFSET_S), "-avoid_negative_ts", "disabled", "-f", "segment"]);
+    match plan.segments {
+        Segments::Ts => push(&["-segment_format", "mpegts"]),
+        Segments::Fmp4 => push(&["-segment_format", "mp4", "-segment_format_options", RUN_MOVFLAGS]),
+    }
+    // no cut after the first (a run of the last segment): one point past any item
+    let cuts = if run.cuts.is_empty() { "100000000" } else { run.cuts };
+    push(&["-segment_times", cuts, "-segment_time_delta", &format!("{:.6}", run.delta)]);
+    // MPEG-TS: one muxer for the run (PAT and PMT at each segment's start); fMP4: one per segment
+    let individual = if plan.segments == Segments::Fmp4 { "1" } else { "0" };
+    push(&["-segment_start_number", &run.first.to_string(), "-individual_header_trailer", individual]);
+    let list = run.dir.join(RUN_LIST);
+    let seg = run.dir.join(format!("s%d.{}", plan.segments.ext()));
+    push(&["-segment_list", &list.to_string_lossy(), "-segment_list_type", "csv", &seg.to_string_lossy()]);
     a
 }
 
@@ -655,6 +789,55 @@ mod tests {
         p.surround = Some(Surround::Ac3);
         let a = argv(&vod, &p, &Output { dir, live: false, hls_time: 4.0, fps: None, audio_index: None }).join(" ");
         assert!(a.contains("-map 0:a:0? -map 0:a:0? ") && a.contains("-c:a:1 ac3 -ac:a:1 6 -b:a:1 448k"), "{a}");
+    }
+
+    /// A full-length run (vod.rs): the item's own clock (`-copyts -start_at_zero`) with the
+    /// constant offset, the segment muxer with cut points relative to the run's first picture
+    /// and its CSV list; copied video lands on its keyframe (`-noaccurate_seek`), converted video
+    /// starts at the point with its keyframes forced on the item's clock; fMP4 is one muxer per
+    /// segment, `hvc1` only on HEVC.
+    #[test]
+    fn full_length_runs_cut_where_the_map_says() {
+        let dir = Path::new("/c/p3/r2");
+        let copy = plan(crate::model::CastLevel::Repackaged, Video::Copy, Audio::Copy, Segments::Ts);
+        let run = Run {
+            url: "http://127.0.0.1:1/u/t",
+            seek_s: Some(4210.5),
+            dir,
+            first: 701,
+            cuts: "6.000000,12.040000",
+            delta: 0.001,
+            forced: None,
+            hevc: false,
+            fps: None,
+            audio_index: Some(1),
+        };
+        let a = run_argv(&run, &copy).join(" ");
+        for want in [
+            "-reconnect 0 -readrate 1 -readrate_initial_burst 60 -noaccurate_seek -ss 4210.500000 -copyts -start_at_zero -i http://127.0.0.1:1/u/t",
+            "-map 0:v:0 -map 0:a:1 -c:v copy -c:a copy -sn -dn -map_metadata -1 -map_chapters -1 -fflags +bitexact",
+            "-output_ts_offset 10 -avoid_negative_ts disabled -f segment -segment_format mpegts -segment_times 6.000000,12.040000",
+            "-segment_time_delta 0.001000 -segment_start_number 701 -individual_header_trailer 0",
+            "-segment_list /c/p3/r2/list.csv -segment_list_type csv /c/p3/r2/s%d.ts",
+        ] {
+            assert!(a.contains(want), "{want:?} missing from {a}");
+        }
+        assert_eq!(a.matches("://").count(), 1, "only the loopback URL: {a}");
+        assert!(!a.contains("-tag:v") && !a.contains("-force_key_frames") && !a.contains("-copypriorss"), "{a}");
+
+        let mut hevc = plan(crate::model::CastLevel::Repackaged, Video::Copy, Audio::Aac, Segments::Fmp4);
+        hevc.surround = Some(Surround::Ac3);
+        let a = run_argv(&Run { seek_s: None, cuts: "", hevc: true, ..run.clone() }, &hevc).join(" ");
+        assert!(a.contains("-copyts -start_at_zero -i ") && !a.contains("-ss "), "from 0: {a}");
+        assert!(a.contains("-c:v copy -tag:v hvc1 -c:a:0 aac -ac:a:0 2 -b:a:0 160k -c:a:1 ac3"), "{a}");
+        assert!(a.contains(&format!("-segment_format mp4 -segment_format_options {RUN_MOVFLAGS} -segment_times 100000000 ")), "{a}");
+        assert!(a.contains("-individual_header_trailer 1 ") && a.ends_with("/c/p3/r2/s%d.m4s"), "{a}");
+
+        let l3 = plan(crate::model::CastLevel::Converted, Video::Encode { deinterlace: false }, Audio::Aac, Segments::Ts);
+        let a = run_argv(&Run { seek_s: Some(42.0), forced: Some("42.000000,48.000000"), fps: Some(25.0), delta: 1.0, ..run }, &l3).join(" ");
+        assert!(a.contains("-ss 42.000000 -copyts") && !a.contains("-noaccurate_seek"), "converted: from the point: {a}");
+        assert!(a.contains("-g 1500 -sc_threshold 0 -force_key_frames 42.000000,48.000000 -vf scale"), "{a}");
+        assert!(a.contains("format=yuv420p -copypriorss:a 0 -c:a aac"), "{a}");
     }
 
     /// A copied resume starts at its keyframe (from the side output's line), never later than

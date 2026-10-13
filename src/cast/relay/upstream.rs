@@ -518,6 +518,17 @@ impl Feed {
         matches!(*self.kind.lock().unwrap_or_else(|e| e.into_inner()), Kind::Hls(_))
     }
 
+    /// The resource's length when the provider serves it by `Range` (a film's file, as the
+    /// first response said): a full-length cast makes each segment from where it starts (§8.5).
+    /// `None` for live streams, HLS, and providers that ignore `Range`.
+    pub fn sized(&self) -> Option<u64> {
+        let tapes = self.tapes.lock().unwrap_or_else(|e| e.into_inner());
+        tapes.iter().filter(|t| t.key == Key::Main).find_map(|t| {
+            let s = t.lock();
+            s.total.filter(|_| s.ranges)
+        })
+    }
+
     /// An HLS key that isn't AES-128 (`SAMPLE-AES`, a DRM `KEYFORMAT`): refused.
     pub fn encrypted(&self) -> bool {
         self.encrypted.load(Ordering::Relaxed)

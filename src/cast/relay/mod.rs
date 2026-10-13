@@ -21,6 +21,11 @@
 //! * **VOD and catch-up stay about a minute ahead** of the TV (`-readrate 1` after a 60 s burst),
 //!   and production pauses when it runs [`LEAD_MAX`] ahead of what the TV fetched (a paused TV):
 //!   no film is pulled from the provider faster than it is watched.
+//! * **Full length** (§8.5, [`vod`]): a film, an episode or a catch-up programme whose segments
+//!   can be known up front (a keyframe index: copied video is cut at its keyframes, converted
+//!   video on a grid of forced ones; a provider that serves it by `Range`) reaches the TV as a
+//!   complete VOD playlist, each segment made when the TV asks for it. Anything else keeps the
+//!   EVENT playlist (§8.5's fallback matrix).
 
 pub mod ffmpeg;
 pub mod plan;
@@ -30,6 +35,7 @@ pub mod renditions;
 pub mod server;
 pub mod token;
 pub mod upstream;
+pub mod vod;
 
 use std::net::Ipv4Addr;
 use std::os::unix::fs::DirBuilderExt;
@@ -42,7 +48,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use self::plan::{Segments, Surround, Video};
+use self::plan::{Plan, Segments, Surround, Video};
 use self::playlist::{Codec, Guard};
 use self::server::Rendition;
 use self::token::Token;
@@ -162,6 +168,19 @@ pub enum RelayEvent {
     CpuTooSlow {
         generation: u64,
     },
+    /// A full-length item's playlist said to start at `at_s` (`EXT-X-START`) and the TV fetched
+    /// from its beginning instead (§8.5): the relay gives this TV playlists that start where it
+    /// should from now on, and the session replaces the item with one at `at_s`.
+    StartIgnored {
+        generation: u64,
+        at_s: f64,
+    },
+    /// A full-length item's segments didn't come out where its keyframe index said (§8.5): the
+    /// relay serves the item as an EVENT playlist from now on; the session restarts it where the
+    /// TV is, at the same level.
+    Unindexed {
+        generation: u64,
+    },
     /// The pipeline failed (ffmpeg missing, unsupported input, …).
     Failed {
         generation: u64,
@@ -187,6 +206,8 @@ pub struct RelaySession {
     started: u64,
     /// The item's pinned target duration in this session (module docs).
     pin: Option<(MediaRef, u32)>,
+    /// Items whose keyframe index didn't hold in this session: EVENT playlists from now on.
+    unindexed: Vec<MediaRef>,
 }
 
 /// What a load has opened or started before it becomes [`RelaySession::current`]: its feed (the
@@ -244,6 +265,9 @@ const LEAD_RESUME: f64 = 120.0;
 /// the first ready segments.
 const PIN_WINDOW_S: f64 = 20.0;
 const PIN_WAIT: Duration = Duration::from_secs(3);
+/// Reading a full-length item's keyframe index gets this long (a `Range` request or two through
+/// the proxy).
+const INDEX_BUDGET: Duration = Duration::from_secs(15);
 
 /// How a launch failed (before the TV was given anything).
 enum Fail {
@@ -284,6 +308,17 @@ struct Launch {
     as_is: bool,
 }
 
+/// What a full-length launch needs besides [`Launch`] (§8.5, [`vod`]).
+struct Full<'a> {
+    map: vod::Map,
+    plan: Plan,
+    hevc: bool,
+    fps: Option<f64>,
+    audio_index: Option<usize>,
+    /// The proxy's loopback URL.
+    url: &'a str,
+}
+
 /// The multivariant playlist's inputs from the plan and the probe ([`renditions::Master`]).
 struct SurroundSpec {
     codecs: &'static str,
@@ -316,7 +351,20 @@ impl RelaySession {
             CastErrorKind::Unreachable
         })?;
         tracing::debug!("{label}: listening on port {}", lan.addr().port());
-        Ok(Self { cfg, label, sid, tx, rx, lan: Some(lan), proxy: Some(proxy), current: None, pending: Pending::default(), started: 0, pin: None })
+        Ok(Self {
+            cfg,
+            label,
+            sid,
+            tx,
+            rx,
+            lan: Some(lan),
+            proxy: Some(proxy),
+            current: None,
+            pending: Pending::default(),
+            started: 0,
+            pin: None,
+            unindexed: Vec::new(),
+        })
     }
 
     pub fn config(&self) -> &RelayConfig {
@@ -367,7 +415,9 @@ impl RelaySession {
         let mut probed = None;
         let mut stereo = spec.stereo;
         let floor = self.pin.as_ref().filter(|(m, _)| *m == p.media).map(|(_, t)| *t);
-        if !plan::hints_suffice(&spec.hints, spec.receiver) {
+        // films and catch-up are always probed: a full-length playlist needs the file's start and
+        // length (§8.5)
+        if !plan::hints_suffice(&spec.hints, spec.receiver) || !live {
             match self.probe(&caps, &feed, &loopback, spec.generation).await {
                 Ok(pr) => probed = Some(pr),
                 Err(kind) => {
@@ -376,6 +426,8 @@ impl RelaySession {
                 }
             }
         }
+        // the full-length map per kind of picture (copied, converted), read once per load
+        let mut maps: [Option<Option<vod::Map>>; 2] = [None, None];
         loop {
             let mut facts = probed.as_ref().map_or_else(|| plan::Facts::from_hints(&spec.hints), |pr| pr.facts(&spec.hints));
             facts.encrypted |= feed.encrypted();
@@ -400,11 +452,28 @@ impl RelaySession {
                 (Video::Copy, Some("hevc")) => Some(Codec::Hevc),
                 _ => None,
             };
+            let full = if live {
+                None
+            } else {
+                let slot = &mut maps[usize::from(plan.video == Video::Copy)];
+                if slot.is_none() {
+                    *slot = Some(match self.full_map(&p, &plan, probed.as_ref(), &feed, &loopback).await {
+                        Ok(map) => Some(map),
+                        Err(why) => {
+                            tracing::info!("{}: a growing playlist: {why}", self.label);
+                            None
+                        }
+                    });
+                }
+                slot.clone().flatten()
+            };
             let dir = self.new_dir(live)?;
             let input = ffmpeg::Input::Proxy { url: &loopback, hls: feed.is_hls(), seek_s: offset_s, readrate: !live };
             let out = ffmpeg::Output { dir: &dir, live, hls_time, fps: facts.fps, audio_index: facts.audio_index };
-            let argv = ffmpeg::argv(&input, &plan, &out);
-            let notes_start = ffmpeg::notes_start(&input, &plan);
+            let (argv, notes_start) = match full {
+                Some(_) => (Vec::new(), false),
+                None => (ffmpeg::argv(&input, &plan, &out), ffmpeg::notes_start(&input, &plan)),
+            };
             tracing::info!(
                 "{}: {} {} {}{}{}",
                 self.label,
@@ -416,7 +485,20 @@ impl RelaySession {
                     Some(Surround::Ac3) => " + surround (as AC-3 5.1)",
                     None => "",
                 },
-                if live { " (live)" } else { "" }
+                match &full {
+                    _ if live => " (live)".to_owned(),
+                    Some(m) => format!(
+                        ", full length: {} in {} segments, target {} s, from {}",
+                        clock(m.total()),
+                        m.len(),
+                        m.target(),
+                        match m.cuts {
+                            vod::Cuts::Index(c) => c.name(),
+                            vod::Cuts::Grid => "forced keyframes",
+                        }
+                    ),
+                    None => String::new(),
+                }
             );
             let surround = plan.surround.map(|s| {
                 let (codec, profile) = (facts.acodec.as_deref().unwrap_or_default(), facts.aprofile.as_deref());
@@ -457,7 +539,15 @@ impl RelaySession {
                     && opts.force == Some(CastLevel::Converted)
                     && plan::plan(spec.receiver, &facts, plan::Options { force: None, ..opts }).is_ok_and(|p| p.level != CastLevel::Converted),
             };
-            match self.launch(&caps, launch).await {
+            let launched = match full {
+                Some(map) => {
+                    let hevc = plan.video == Video::Copy && facts.vcodec.as_deref() == Some("hevc");
+                    let f = Full { map, plan, hevc, fps: facts.fps, audio_index: facts.audio_index, url: &loopback };
+                    self.launch_full(&caps, launch, f).await
+                }
+                None => self.launch(&caps, launch).await,
+            };
+            match launched {
                 Ok(prepared) => return Ok(prepared),
                 // surround never costs the cast: the same plan in stereo (§8.4)
                 Err(Fail::Surround) if !feed.failed() => {
@@ -720,13 +810,171 @@ impl RelaySession {
         Err(Fail::Exited)
     }
 
+    /// The item's full-length map (§8.5), or why it keeps an EVENT playlist: a provider that
+    /// serves the file by `Range` (each segment is made from where it starts) and a keyframe
+    /// index, whose keyframes are copied video's cut points; converted video is cut on the grid
+    /// of its forced keyframes, but needs the index too: ffmpeg's `-ss` lands on the keyframe
+    /// before a point only in a container with one (in MPEG-TS it lands between keyframes, and
+    /// the pictures up to the next one are lost: a restarted run's first segment would start up
+    /// to a GOP late, measured 2026-10-13).
+    async fn full_map(
+        &self,
+        p: &Playable,
+        plan: &Plan,
+        probed: Option<&probe::Probe>,
+        feed: &upstream::Feed,
+        url: &str,
+    ) -> Result<vod::Map, vod::Why> {
+        if self.unindexed.contains(&p.media) {
+            return Err("its keyframe index didn't hold earlier in this cast");
+        }
+        if plan.video == Video::None {
+            return Err("it has no picture");
+        }
+        if feed.is_hls() {
+            return Err("the provider sends it as HLS");
+        }
+        let size = feed.sized().ok_or("the provider doesn't serve it by byte range")?;
+        let probed = probed.ok_or("it wasn't probed")?;
+        let mut reader = vod::keyframes::Reader::http(url, size)?;
+        let index = tokio::time::timeout(INDEX_BUDGET, vod::keyframes::read(&mut reader)).await.map_err(|_| "its index took too long to read")??;
+        let start = probed.start_s.unwrap_or(0.0);
+        let total = probed.duration_s.or(index.end.map(|e| e - start)).ok_or("its length is unknown")?;
+        let aim = vod::segment_s();
+        match plan.video {
+            Video::Encode { .. } => vod::Map::grid(total, aim),
+            _ => vod::Map::from_index(&index, start, total, aim),
+        }
+    }
+
+    /// A full-length item (§8.5, [`vod`]): the first run from the segment holding `l.offset_s`,
+    /// ready once that segment (and the next, with `min_segments` ≥ 2) is published in every
+    /// rendition; the TV gets the whole playlist, starting there (`EXT-X-START`), or a view from
+    /// there on a TV that ignored it before.
+    async fn launch_full(&mut self, caps: &ffmpeg::Caps, l: Launch, f: Full<'_>) -> Result<Prepared, Fail> {
+        let Some(feed) = l.feed.clone() else { return Err(Fail::Exited) };
+        let layout = match (&l.surround, l.fmp4) {
+            (Some(_), _) => vod::Layout::Surround,
+            (None, true) => vod::Layout::Fmp4,
+            (None, false) => vod::Layout::Ts,
+        };
+        let rends = match layout {
+            vod::Layout::Surround => vec![
+                Rendition::new(Some(renditions::VIDEO), l.dir.join(renditions::VIDEO), l.codec, "video/mp4"),
+                Rendition::new(Some(renditions::STEREO), l.dir.join(renditions::STEREO), None, "audio/mp4"),
+                Rendition::new(Some(renditions::SURROUND), l.dir.join(renditions::SURROUND), None, "audio/mp4"),
+            ],
+            _ => vec![Rendition::new(None, l.dir.clone(), l.codec, if l.fmp4 { "video/mp4" } else { "video/mp2t" })],
+        };
+        for r in &rends {
+            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&r.dir).map_err(|_| Fail::Kind(CastErrorKind::Unsupported))?;
+        }
+        let k = f.map.segment_at(l.offset_s);
+        let want = if self.cfg.min_segments >= 2 { (k + 1).min(f.map.len() - 1) } else { k };
+        let spec = vod::Spec {
+            ffmpeg: caps.ffmpeg.clone(),
+            url: Secret::new(f.url.to_owned()),
+            plan: f.plan,
+            hevc: f.hevc,
+            fps: f.fps,
+            audio_index: f.audio_index,
+            // converted pictures are forced IDRs
+            idr: if f.plan.video == Video::Copy { l.codec } else { None },
+        };
+        let ctx = vod::Ctx { feed: feed.clone(), tx: self.tx.clone(), generation: l.generation.clone(), label: self.label.clone() };
+        let dirs = rends.iter().map(|r| r.dir.clone()).collect();
+        let od = Arc::new(vod::OnDemand::new(f.map, layout, l.dir.clone(), dirs, spec, ctx));
+        let out = Arc::new(server::Output::new(l.dir.clone(), l.fmp4, l.generation.clone(), rends).with_full(od.clone()));
+        let stop = CancellationToken::new();
+        self.pending.pipeline = Some((stop.clone(), tokio::spawn(od.clone().monitor(stop.clone()))));
+        od.start(k).await;
+        let started = Instant::now();
+        let mut tick = tokio::time::interval(READY_POLL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if od.ready(k).await && od.ready(want).await {
+                break;
+            }
+            let fail = if feed.failed() {
+                Some(Fail::Upstream)
+            } else if od.over() || od.failed_start().await {
+                Some(if l.surround.is_some() { Fail::Surround } else { Fail::Exited })
+            } else if started.elapsed() >= LOAD_BUDGET {
+                Some(if l.level == CastLevel::Converted {
+                    Fail::Kind(CastErrorKind::CpuTooSlow)
+                } else if l.surround.is_some() {
+                    Fail::Surround
+                } else {
+                    Fail::Upstream
+                })
+            } else {
+                None
+            };
+            if let Some(fail) = fail {
+                self.quit_pending().await;
+                return Err(fail);
+            }
+        }
+        if let Some(spec) = &l.surround {
+            match master_full(&out, &od, k, want, spec).await {
+                Some(text) => *out.master.lock().unwrap_or_else(|e| e.into_inner()) = Some(text),
+                None => {
+                    tracing::info!("{}: the video rendition's init segment can't be read", self.label);
+                    self.quit_pending().await;
+                    return Err(Fail::Surround);
+                }
+            }
+        }
+        let lan = self.lan.as_ref().ok_or(Fail::Kind(CastErrorKind::Unreachable))?;
+        let (view_first, start, offset_s) = start_of(&od, lan.start_ignored(), l.offset_s, out.renditions.len());
+        let token = Token::mint();
+        let url = format!("http://{}/c/{}/index.m3u8", lan.addr(), token.expose());
+        lan.grant(token, out.clone(), view_first, start);
+        let Some((stop, monitor)) = self.pending.pipeline.take() else { return Err(Fail::Exited) };
+        // handed over: the pipeline, its feed and its directory are `current`'s now
+        self.pending = Pending::default();
+        self.current = Some(Pipeline {
+            generation: l.generation.clone(),
+            live: false,
+            level: l.level,
+            offset_s,
+            media: l.media.clone(),
+            as_is: l.as_is,
+            out,
+            feed: Some(feed),
+            stop,
+            monitor,
+        });
+        tracing::debug!("{}: ready from segment {k}, target duration {} s", self.label, od.map.target());
+        let load = LoadReq { url: Secret::new(url), live: false, offset_s };
+        Ok(Prepared { load, level: l.level, behind_live_s: None, surround: l.surround.is_some(), as_is: l.as_is })
+    }
+
     /// A playlist view starting at the segment that holds `at_s` (seconds into the item) under a
     /// new token, when it is inside what's produced; `Ok(None)` when it isn't (the caller loads
-    /// again with `start_at`, or clamps catch-up).
+    /// again with `start_at`, or clamps catch-up). A full-length item (§8.5) is the whole playlist
+    /// starting the TV at `at_s` (`EXT-X-START`; anywhere in the item: segments are made on
+    /// demand), or on a TV that ignored that, a view from the segment holding it.
     pub async fn view(&mut self, generation: u64, at_s: f64) -> Result<Option<Prepared>, CastErrorKind> {
         let Some(p) = &self.current else { return Ok(None) };
         if p.live {
             return Ok(None);
+        }
+        if let Some(od) = p.out.full.clone() {
+            let lan = self.lan.as_ref().ok_or(CastErrorKind::Unreachable)?;
+            if !at_s.is_finite() {
+                return Ok(None);
+            }
+            let at = at_s.clamp(0.0, (od.map.total() - 1.0).max(0.0));
+            let (view_first, start, offset_s) = start_of(&od, lan.start_ignored(), at, p.out.renditions.len());
+            p.generation.store(generation, Ordering::Relaxed);
+            let token = Token::mint();
+            let url = format!("http://{}/c/{}/index.m3u8", lan.addr(), token.expose());
+            tracing::debug!("{}: the whole item from {at:.1} s", self.label);
+            lan.grant(token, p.out.clone(), view_first, start);
+            let load = LoadReq { url: Secret::new(url), live: false, offset_s };
+            return Ok(Some(Prepared { load, level: p.level, behind_live_s: None, surround: p.out.renditions.len() > 1, as_is: p.as_is }));
         }
         let rel = at_s - p.offset_s;
         if rel < 0.0 || !rel.is_finite() {
@@ -762,7 +1010,8 @@ impl RelaySession {
     /// catch-up seek can go (§8.5: beyond, it clamps here). `None` for live, or before the
     /// first segment.
     pub async fn produced_s(&mut self) -> Option<f64> {
-        let p = self.current.as_ref().filter(|p| !p.live)?;
+        // a full-length item reaches everywhere: nothing to clamp to
+        let p = self.current.as_ref().filter(|p| !p.live && p.out.full.is_none())?;
         // what ffmpeg has written by now, not only what the TV fetched (as `view`)
         let main = p.out.main();
         main.refresh(p.out.fmp4).await;
@@ -863,6 +1112,13 @@ impl RelaySession {
             tracing::debug!("{}: the item's target duration goes from {t} s to {wanted} s", self.label);
             *t = (*t).max(wanted);
         }
+        // a full-length map that didn't hold: the item's next load is an EVENT playlist (§8.5)
+        if let (Some(media), Some(od)) = (&p.media, &p.out.full)
+            && od.broken()
+            && !self.unindexed.contains(media)
+        {
+            self.unindexed.push(media.clone());
+        }
         // through the pending slot: an ending dropped half-way is finished by the next one
         self.pending = Pending { feed: p.feed, pipeline: Some((p.stop, p.monitor)), dirs: vec![p.out.dir.clone()] };
         self.end_pending(fast).await;
@@ -925,6 +1181,9 @@ impl Drop for RelaySession {
         if let Some(p) = self.current.take() {
             p.stop.cancel();
             p.monitor.abort();
+            if let Some(od) = &p.out.full {
+                od.abort();
+            }
             if let Some(feed) = &p.feed {
                 feed.cancel_all();
             }
@@ -984,6 +1243,45 @@ async fn master(out: &server::Output, ready: &[playlist::MediaPlaylist], spec: &
         surround_channels: spec.channels.clone(),
         language: spec.language.clone(),
     }))
+}
+
+/// A full-length surround item's multivariant playlist: the video codec and size from its init
+/// segment, the bandwidths measured on the published segments `k..=want`.
+async fn master_full(out: &server::Output, od: &vod::OnDemand, k: u64, want: u64, spec: &SurroundSpec) -> Option<String> {
+    let [v, a, s] = &out.renditions[..] else { return None };
+    let init = tokio::fs::read(v.dir.join(server::File::Init(Some(0)).name(true))).await.ok()?;
+    let video = renditions::video_init(&init)?;
+    let pl = od.published(k, want - k + 1);
+    let (vr, ar, sr) = (renditions::measure(&v.dir, &pl), renditions::measure(&a.dir, &pl), renditions::measure(&s.dir, &pl));
+    Some(renditions::render(&renditions::Master {
+        video,
+        fps: spec.fps,
+        range: spec.range,
+        video_rate: vr,
+        stereo_rate: ar,
+        surround_rate: sr,
+        surround_codecs: spec.codecs.to_owned(),
+        surround_channels: spec.channels.clone(),
+        language: spec.language.clone(),
+    }))
+}
+
+/// Where a full-length item's playlist starts the TV at `at` (§8.5): the whole playlist with
+/// `EXT-X-START` there (positions are the item's own: offset 0), or on a TV that ignored that, a
+/// view from the segment holding it (its start is the offset). `(view_first, start, offset_s)`.
+fn start_of(od: &vod::OnDemand, start_ignored: bool, at: f64, renditions: usize) -> (Option<Vec<u64>>, Option<f64>, f64) {
+    let k = od.map.segment_at(at);
+    match (at > 0.0, start_ignored) {
+        (false, _) => (None, None, 0.0),
+        (true, false) => (None, Some(at), 0.0),
+        (true, true) => (Some(vec![k; renditions]), None, od.map.start(k)),
+    }
+}
+
+/// `1:52:03`.
+fn clock(s: f64) -> String {
+    let s = s.max(0.0).round() as u64;
+    format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
 }
 
 fn level_name(l: CastLevel) -> &'static str {

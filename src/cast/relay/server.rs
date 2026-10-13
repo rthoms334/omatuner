@@ -34,7 +34,7 @@ use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 use super::playlist::{self, Codec, FIRST_PICTURE_BYTES, Guard};
 use super::token::{Grants, STOPPED_TTL, Token};
-use super::{RelayEvent, renditions};
+use super::{RelayEvent, renditions, vod};
 
 /// Concurrent connections per session (§9.1).
 pub const MAX_CONNECTIONS: usize = 8;
@@ -156,6 +156,9 @@ pub struct Output {
     pub renditions: Vec<Rendition>,
     /// The multivariant playlist of a surround output, once its renditions are ready.
     pub master: Mutex<Option<String>>,
+    /// A full-length item (§8.5): its playlists come from the map and its segments are made on
+    /// demand ([`vod::OnDemand`]); `None`: ffmpeg's playlists through the guard (EVENT, live).
+    pub full: Option<Arc<vod::OnDemand>>,
     irregular_sent: AtomicBool,
     overflow_sent: AtomicBool,
 }
@@ -168,9 +171,15 @@ impl Output {
             generation,
             renditions,
             master: Mutex::new(None),
+            full: None,
             irregular_sent: AtomicBool::new(false),
             overflow_sent: AtomicBool::new(false),
         }
+    }
+
+    /// The output of a full-length item made by `od`.
+    pub fn with_full(self, od: Arc<vod::OnDemand>) -> Self {
+        Self { full: Some(od), ..self }
     }
 
     fn generation(&self) -> u64 {
@@ -199,9 +208,14 @@ impl Output {
 #[derive(Debug)]
 pub struct Served {
     pub out: Arc<Output>,
-    /// A playlist view's first segment per rendition (`None`: everything ffmpeg lists).
+    /// A playlist view's first segment per rendition (`None`: everything ffmpeg lists, or the
+    /// whole full-length item).
     pub view_first: Option<Vec<u64>>,
+    /// A full-length item's `EXT-X-START` (seconds into it): where the TV should start.
+    pub start: Option<f64>,
     playlist_seen: bool,
+    /// The first picture segment the TV fetched under this token (the `EXT-X-START` check).
+    segment_seen: bool,
 }
 
 struct Shared {
@@ -209,6 +223,9 @@ struct Shared {
     grants: Mutex<Grants<Served>>,
     tx: mpsc::UnboundedSender<RelayEvent>,
     label: Arc<str>,
+    /// This TV fetched a full-length playlist from its beginning, not where `EXT-X-START` said
+    /// (§8.5): it gets views from now on.
+    start_ignored: AtomicBool,
 }
 
 /// The running LAN server of one session.
@@ -224,7 +241,7 @@ impl LanServer {
         let listener = TcpListener::bind(SocketAddr::from((bind, port))).await?;
         let addr = listener.local_addr()?;
         let kill = CancellationToken::new();
-        let shared = Arc::new(Shared { peer, grants: Mutex::new(Grants::default()), tx, label });
+        let shared = Arc::new(Shared { peer, grants: Mutex::new(Grants::default()), tx, label, start_ignored: AtomicBool::new(false) });
         let app = axum::Router::new().fallback(handle).with_state(shared.clone());
         let capped = Capped::new(listener, MAX_CONNECTIONS, peer, kill.clone());
         let stop = kill.clone();
@@ -244,9 +261,20 @@ impl LanServer {
     /// Serve `out` under `token` and revoke every other token (one per generation: a zap, a
     /// seek or a reconnect revokes the old one, §9.2).
     pub fn grant_only(&self, token: Token, out: Arc<Output>, view_first: Option<Vec<u64>>) {
+        self.grant(token, out, view_first, None);
+    }
+
+    /// [`LanServer::grant_only`], for a full-length item with its `EXT-X-START`.
+    pub fn grant(&self, token: Token, out: Arc<Output>, view_first: Option<Vec<u64>>, start: Option<f64>) {
         let mut g = self.shared.grants.lock().unwrap_or_else(|e| e.into_inner());
         g.clear();
-        g.insert(token, Served { out, view_first, playlist_seen: false });
+        g.insert(token, Served { out, view_first, start, playlist_seen: false, segment_seen: false });
+    }
+
+    /// The TV didn't start a full-length playlist where `EXT-X-START` said (see
+    /// [`RelayEvent::StartIgnored`]).
+    pub fn start_ignored(&self) -> bool {
+        self.shared.start_ignored.load(Ordering::Relaxed)
     }
 
     pub fn revoke_all(&self) {
@@ -289,16 +317,18 @@ async fn handle(State(srv): State<Arc<Shared>>, ConnectInfo(Peer(from)): Connect
         return not_found();
     };
     let now = Instant::now();
-    let (out, view_first) = {
+    let (out, view_first, start) = {
         let mut grants = srv.grants.lock().unwrap_or_else(|e| e.into_inner());
         let Some(g) = grants.find_mut(tok) else {
             tracing::debug!("{}: 404 for an unknown or revoked token", srv.label);
             return not_found();
         };
         // §9.2: 60 s after the last fetch once playback has stopped, i.e. the item is fully
-        // produced and the TV has fetched its last segment (it needs nothing more from us)
+        // produced and the TV has fetched its last segment (it needs nothing more from us). A
+        // full-length item's token lives as long as its generation: having fetched the end, the
+        // TV may still scrub back anywhere (§8.5)
         let out = g.value.out.clone();
-        let done = {
+        let done = out.full.is_none() && {
             let main = out.main();
             let guard = main.guard.lock().unwrap_or_else(|e| e.into_inner());
             guard.complete() && guard.last_seq().is_some_and(|last| main.fetched.load(Ordering::Relaxed) > last)
@@ -309,7 +339,7 @@ async fn handle(State(srv): State<Arc<Shared>>, ConnectInfo(Peer(from)): Connect
             return not_found();
         }
         g.last_fetch = Some(now);
-        (out, g.value.view_first.clone())
+        (out, g.value.view_first.clone(), g.value.start)
     };
     let generation = out.generation();
     // a surround output's own top level holds only the multivariant playlist
@@ -317,13 +347,22 @@ async fn handle(State(srv): State<Arc<Shared>>, ConnectInfo(Peer(from)): Connect
     let rend = out.rendition(rendition);
     match file {
         File::Playlist => {
+            let first = |index: usize| view_first.as_ref().and_then(|v| v.get(index).copied());
             let body = match (master, rend) {
-                (Some(master), _) => master,
-                (None, Some((index, rend))) => {
-                    let Ok(text) = tokio::fs::read_to_string(rend.dir.join("index.m3u8")).await else { return not_found() };
-                    let first = view_first.as_ref().and_then(|v| v.get(index).copied());
-                    rend.serve_playlist(&text, first, out.fmp4).1
-                }
+                // a full-length item starts the TV where its token says (§8.5)
+                (Some(master), _) => match start.filter(|s| *s > 0.0) {
+                    Some(at) => {
+                        master.replacen("#EXT-X-INDEPENDENT-SEGMENTS\n", &format!("#EXT-X-INDEPENDENT-SEGMENTS\n{}\n", vod::start_tag(at)), 1)
+                    }
+                    None => master,
+                },
+                (None, Some((index, rend))) => match &out.full {
+                    Some(od) => od.playlist(index, first(index).unwrap_or(0), start),
+                    None => {
+                        let Ok(text) = tokio::fs::read_to_string(rend.dir.join("index.m3u8")).await else { return not_found() };
+                        rend.serve_playlist(&text, first(index), out.fmp4).1
+                    }
+                },
                 (None, None) => return not_found(),
             };
             let (irregular, overflow) = out.verdicts();
@@ -342,20 +381,56 @@ async fn handle(State(srv): State<Arc<Shared>>, ConnectInfo(Peer(from)): Connect
         }
         File::Init(_) | File::Segment(_) => {
             let Some((index, rend)) = rend else { return not_found() };
-            let Ok(data) = tokio::fs::read(rend.dir.join(file.name(out.fmp4))).await else { return not_found() };
+            // a full-length item's segments are made when asked for (§8.5)
+            let path = match (&out.full, file) {
+                (Some(od), File::Segment(n)) => od.segment(n, index).await,
+                (Some(od), _) if od.init_file(index) == Some(file) => od.init(index).await,
+                (Some(_), _) => None,
+                (None, _) => Some(rend.dir.join(file.name(out.fmp4))),
+            };
+            let Some(path) = path else { return not_found() };
+            let Ok(data) = tokio::fs::read(path).await else { return not_found() };
             if let File::Segment(n) = file
                 && !head
             {
                 rend.fetched.fetch_max(n + 1, Ordering::Relaxed);
                 // the main playlist's fetches are the position estimate's evidence (§7.3)
                 let first = view_first.as_ref().and_then(|v| v.first().copied()).unwrap_or(0);
-                let span = (index == 0).then(|| rend.guard.lock().unwrap_or_else(|e| e.into_inner()).span(n, first)).flatten();
+                let span = match &out.full {
+                    Some(od) => {
+                        od.fetched(index, n);
+                        if index == 0 {
+                            started_where_told(&srv, tok, od, n, generation);
+                        }
+                        (index == 0).then(|| od.map.span(n, first)).flatten()
+                    }
+                    None => (index == 0).then(|| rend.guard.lock().unwrap_or_else(|e| e.into_inner()).span(n, first)).flatten(),
+                };
                 if let Some((from_s, upto_s)) = span {
                     let _ = srv.tx.send(RelayEvent::SegmentFetched { generation, from_s, upto_s });
                 }
             }
             ranged(head, req.headers(), data, rend.mime)
         }
+    }
+}
+
+/// The TV's first picture segment under a full-length token that says where to start
+/// (`EXT-X-START`): one from well before there means the TV started from the beginning (§8.5).
+/// Reported once per session; the relay serves views from then on.
+fn started_where_told(srv: &Shared, tok: &str, od: &vod::OnDemand, n: u64, generation: u64) {
+    let start = {
+        let mut grants = srv.grants.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(g) = grants.find_mut(tok) else { return };
+        if std::mem::replace(&mut g.value.segment_seen, true) {
+            return;
+        }
+        g.value.start
+    };
+    let Some(at) = start else { return };
+    if n + 1 < od.map.segment_at(at) && !srv.start_ignored.swap(true, Ordering::Relaxed) {
+        tracing::info!("{}: the TV started at segment {n}, not where the playlist says ({at:.0} s): views from now on", srv.label);
+        let _ = srv.tx.send(RelayEvent::StartIgnored { generation, at_s: at });
     }
 }
 
