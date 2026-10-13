@@ -574,8 +574,6 @@ pub struct CastConfig {
     pub convert: CastConvert,
     /// Interlaced channels: deinterlace (Apple HLS rule 1.14) or send as is.
     pub interlaced: CastInterlaced,
-    /// List third-party AirPlay TVs (experimental, DESIGN §40 §7.7).
-    pub experimental: bool,
     /// Block system sleep while casting (logind inhibitor).
     pub keep_awake: bool,
 }
@@ -595,7 +593,6 @@ impl Default for CastConfig {
             min_segments: 2,
             convert: CastConvert::Auto,
             interlaced: CastInterlaced::Auto,
-            experimental: true,
             keep_awake: true,
         }
     }
@@ -821,6 +818,15 @@ mod tests {
         let window: Config = toml::from_str("[agents]\nplay_in = \"full-window\"\n").unwrap();
         assert_eq!(window.agents.play_in, OpenIn::FullWindow);
         assert!(toml::to_string_pretty(&window).unwrap().contains("play_in = \"full-window\""));
+    }
+
+    /// A `[cast]` section from the casting test builds, with `experimental` (third-party AirPlay
+    /// TVs are now always listed), still loads: the key is ignored and the next save drops it.
+    #[test]
+    fn a_cast_section_with_the_old_experimental_key_loads() {
+        let old: Config = toml::from_str("[cast]\nexperimental = false\nmedia_port = 48000\n").unwrap();
+        assert_eq!(old.cast, CastConfig { media_port: 48000, ..CastConfig::default() });
+        assert!(!toml::to_string_pretty(&old).unwrap().contains("experimental"));
     }
 
     #[test]

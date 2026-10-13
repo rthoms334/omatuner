@@ -1757,8 +1757,10 @@ behind `cast::ENABLED` (`src/cast/mod.rs`); the build under test has it on.
     workspace: a desktop notification appears, and its **Show** raises Tuner on the casting card
     with *Allow on firewall*. Start a cast while the pop-out is up: the pop-out goes back into
     the window without taking focus.
-- [ ] **14. Hisense (experimental):** items 1, 2 and 7 through the third-party profile. If it
-  can't play, set `experimental = false` as the default.
+- [ ] **14. Hisense:** the picker and Settings ▸ Cast list "Living Room TV" (AirPlay TV · Pair
+  first) beside the Apple TV, with no setting to turn on. Items 1, 2 and 7 through the
+  third-party profile. If it can't play, fix the profile or stop listing third-party TVs (cast
+  design §7.7).
 - [ ] **15. Not covered by tests (found while building it):** the fMP4 keyframe check end to
   end, the 8 GiB film cap (a long film casts without filling the disk), a `CpuTooSlow` message
   on a channel the computer can't convert in time, and pkexec, polkit and ufw on a real system

@@ -1101,9 +1101,9 @@ Press `C` in the player (or use the Cast control in the on-screen controls, or t
 episodes. The window can stay on another workspace, or be closed to the mini player; nothing
 pops out or comes forward. Tuner is the source of the picture, so it has to keep running.
 
-**What it casts to.** An Apple TV 4K (tvOS 26 and 27) over AirPlay. Third-party AirPlay TVs
-(Hisense, Samsung, LG) are listed as *experimental* and are untested; Settings ▸ Cast ▸ *Show
-experimental AirPlay TVs* hides them. Macs, Chromecast and DLNA TVs are not supported yet.
+**What it casts to.** An Apple TV 4K (tvOS 26 and 27) over AirPlay, and third-party TVs with
+AirPlay video (Hisense, Samsung, LG), listed beside it and set up the same way. Macs, Chromecast
+and DLNA TVs are not supported yet.
 
 ### Pairing
 
@@ -1112,8 +1112,8 @@ once; the TV remembers Tuner. If no code appears, use *Show a new code*, and che
 TV: Settings ▸ AirPlay and HomeKit ▸ Allow Access ▸ **Anyone on the Same Network**, and give the
 Apple TV a room in the Home app. *Everyone in your Home* blocks Tuner, and a major tvOS update
 can reset the setting (Tuner then says the TV forgot it, and you pair again).
-Tuner offers to set up an Apple TV it finds on its first start (a card with *Set up*, *Not now*
-and *Don't ask again*); Settings ▸ Cast does the same any time: *Pair*, *Pair again*, *Make
+Tuner offers to set up a TV it finds on its first start (a card with *Set up*, *Not now* and
+*Don't ask again*); Settings ▸ Cast does the same any time: *Pair*, *Pair again*, *Make
 default*, *Forget…*, *Search again*, *Add by address*.
 
 ### The firewall button
@@ -1350,9 +1350,14 @@ Tuner is already running, your terminal keeps the keyboard. The agent says where
   [pop-out](#pop-out-player): the small player pinned on every workspace, so it appears where
   you are.
 
-- Ask for **full screen**, **the big screen** or **the TV** and it plays full screen in Tuner's
+- Ask for **full screen** or **the big screen** and it plays full screen in Tuner's
   window instead, brought to the front. "Put it on the big screen" moves what already plays
   there the same way, without starting it again.
+- Ask for **the TV** ("put it on the TV") and it casts to your TV (see
+  [Casting to a TV](#casting-to-a-tv)), Tuner's window staying where it is. With one paired TV,
+  that is the yes: the agent casts to it without asking. With two or more paired TVs it asks
+  which; naming the TV ("on the Living Room TV") is the yes. A TV that is discovered but not paired
+  doesn't count. With no TV listed, "the TV" plays full screen in Tuner's window.
 - Ask for the **pop-out** ("move it to the pop-out") and it plays there wherever Tuner's window
   is. Once something plays in the pop-out, an agent's next play stays there.
 - A Tuner window hidden behind a fullscreen (or maximized) window, your terminal after Super+F

@@ -9,11 +9,12 @@
 //!  Enter Set up Living Room · Esc Not now · Tab moves
 //! ```
 //! Opened by the app (`start_cast_pass`, the `CardGate`, one card at a time: the agent card
-//! goes first) when the pass found an Apple-made, video-capable, unpaired TV. **Set up <TV>**
-//! runs the wizard in the card's place: Pair (§3.2: the PIN overlay, `OverlayRequest::CastPair`,
-//! opens over the card; the card goes on once the TV is paired) → Network (only when detection
-//! says ufw blocks: the firewall panel of `cast_firewall.rs` with Allow on firewall, Show
-//! command, Check again and Continue; it moves on by itself once the port is open) → Test on TV
+//! goes first) when the pass found a usable, unpaired AirPlay TV (an Apple TV or a third-party
+//! one, `Registry::offer`). **Set up <TV>** runs the wizard in the card's place: Pair (§3.2: the
+//! PIN overlay, `OverlayRequest::CastPair`, opens over the card; the card goes on once the TV is
+//! paired) → Network (only when detection says ufw blocks: the firewall panel of
+//! `cast_firewall.rs` with Allow on firewall, Show command, Check again and Continue; it moves
+//! on by itself once the port is open) → Test on TV
 //! (`CastHandle::test_on_tv`: a 15 s Tuner test card through the real relay, proving pairing,
 //! the firewall path and the format at once; a `Firewall` failure goes back to Network), ending
 //! "Ready. Press C in the player to cast." Every answer writes `cast.checked_version`; "Don't

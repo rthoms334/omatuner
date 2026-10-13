@@ -1675,13 +1675,10 @@ mod casting {
         assert_eq!(out["devices"].as_array().unwrap().len(), 4);
         assert_eq!(
             out["devices"][0],
-            json!({ "ref": device_ref(&tvs.living), "name": "Living Room", "kind": "apple_tv", "paired": true, "available": true, "experimental": false, "casting": false })
+            json!({ "ref": device_ref(&tvs.living), "name": "Living Room", "kind": "apple_tv", "paired": true, "available": true, "casting": false })
         );
         let bedroom = &out["devices"][1];
-        assert_eq!(
-            (bedroom["kind"].as_str(), bedroom["paired"].as_bool(), bedroom["experimental"].as_bool()),
-            (Some("airplay_tv"), Some(false), Some(true))
-        );
+        assert_eq!((bedroom["kind"].as_str(), bedroom["paired"].as_bool()), (Some("airplay_tv"), Some(false)));
         assert_eq!(out["devices"][3]["name"], "TV", "a name with an address in it is replaced");
         assert!(tvs.fake.take_calls().is_empty(), "reading the list scans nothing");
         // casting is off (no service): an empty list, not an error

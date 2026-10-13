@@ -6,7 +6,7 @@
 //!                                  │   Living Room                 │
 //!                                  │   Apple TV · Paired           │
 //!                                  │   Living Room TV              │
-//!                                  │   AirPlay TV · Pair first · experimental
+//!                                  │   AirPlay TV · Pair first     │
 //!                                  │   OT Macbook Air              │  ← greyed, not selectable
 //!                                  │   Mac · Can't cast to Macs    │
 //!                                  │ ━━━━━━━━━━━━━  Searching…     │
@@ -289,9 +289,6 @@ fn device_line(d: &Device) -> String {
             Pairing::Paired(_) => parts.push("Paired"),
             Pairing::NotNeeded => {}
         },
-    }
-    if d.experimental {
-        parts.push("experimental");
     }
     if !d.available {
         parts.push("Not found now");
@@ -686,7 +683,7 @@ mod tests {
     }
 
     fn tv(n: u8, name: &str, kind: ReceiverKind, pairing: Pairing) -> Device {
-        Device { pairing, experimental: kind == ReceiverKind::AirPlayTv, ..Device::new(id(n), name, kind, Protocol::AirPlay) }
+        Device { pairing, ..Device::new(id(n), name, kind, Protocol::AirPlay) }
     }
 
     /// Living Room (paired Apple TV), Living Room TV (a Hisense: pair first), a Mac.
@@ -715,7 +712,7 @@ mod tests {
     fn the_second_line_names_the_kind_and_the_state_without_an_address() {
         let ds = devices();
         assert_eq!(device_line(&ds[0]), "Apple TV · Paired");
-        assert_eq!(device_line(&ds[1]), "AirPlay TV · Pair first · experimental");
+        assert_eq!(device_line(&ds[1]), "AirPlay TV · Pair first");
         assert_eq!(device_line(&ds[2]), "Mac · Can't cast to Macs");
         let home = Device { usability: Usability::HomeOnly, ..tv(4, "Bedroom", ReceiverKind::AppleTv, Pairing::Required) };
         assert_eq!(device_line(&home), "Apple TV · Same Home only");
@@ -769,14 +766,8 @@ mod tests {
         let (mut h, fake) = picker(devices());
         h.run_steps(2);
         let texts = painted(&h);
-        for want in [
-            "This computer",
-            "Living Room",
-            "Apple TV · Paired",
-            "Living Room TV",
-            "AirPlay TV · Pair first · experimental",
-            "Mac · Can't cast to Macs",
-        ] {
+        for want in ["This computer", "Living Room", "Apple TV · Paired", "Living Room TV", "AirPlay TV · Pair first", "Mac · Can't cast to Macs"]
+        {
             assert!(texts.iter().any(|t| t == want), "{want}: {texts:?}");
         }
         assert!(has_label(&h, "Add by address…") && has_label(&h, "Firewall help…"));

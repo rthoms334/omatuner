@@ -488,7 +488,7 @@ impl Shared {
             .into_iter()
             .flatten()
             .find_map(|id| v4(reg.addr(id)))
-            .or_else(|| reg.list(true).iter().filter(|d| d.available).find_map(|d| v4(d.addr())))
+            .or_else(|| reg.list().iter().filter(|d| d.available).find_map(|d| v4(d.addr())))
             .unwrap_or(MDNS_GROUP)
     }
 
@@ -751,7 +751,7 @@ fn cast_error(kind: CastErrorKind) -> PlayerError {
 
 impl CastApi for Api {
     fn devices(&self) -> Vec<Device> {
-        lock(&self.0.registry).list(self.0.config().cast.experimental)
+        lock(&self.0.registry).list()
     }
 
     fn browse(&self) {

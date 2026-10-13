@@ -101,7 +101,6 @@ impl Registry {
         d.model = s.model.or(d.model.take());
         d.os_version = crate::cast::merge_os_version(d.os_version.take(), s.os_version);
         d.usability = s.usability;
-        d.experimental = s.experimental;
         d.available = true;
         d.addr = Some(s.addr);
         if !s.ids.is_empty() {
@@ -124,10 +123,10 @@ impl Registry {
         }
     }
 
-    /// The list the picker, Settings and the agent show: most recently used first, then the
-    /// ones on the network, then by name. Third-party TVs only when `experimental` is on.
-    pub fn list(&self, experimental: bool) -> Vec<Device> {
-        let mut out: Vec<Device> = self.entries.values().map(|e| e.device.clone()).filter(|d| experimental || !d.experimental).collect();
+    /// The list the picker, Settings and the agent show, Apple TVs and third-party AirPlay TVs
+    /// alike: most recently used first, then the ones on the network, then by name.
+    pub fn list(&self) -> Vec<Device> {
+        let mut out: Vec<Device> = self.entries.values().map(|e| e.device.clone()).collect();
         out.sort_by(|a, b| b.last_used.cmp(&a.last_used).then(b.available.cmp(&a.available)).then_with(|| a.name.cmp(&b.name)).then(a.id.cmp(&b.id)));
         out
     }
@@ -200,12 +199,12 @@ impl Registry {
         })
     }
 
-    /// The first-run card's offer (DESIGN §40 §3.5): an Apple-made, video-capable, unpaired
-    /// receiver that is on the network now. Third-party TVs never trigger it.
+    /// The first-run card's offer (DESIGN §40 §3.5): the first usable, unpaired AirPlay video
+    /// receiver on the network now, an Apple TV or a third-party AirPlay TV.
     pub fn offer(&self) -> Option<SetupOffer> {
-        self.list(false)
+        self.list()
             .into_iter()
-            .find(|d| d.available && d.kind == ReceiverKind::AppleTv && d.usability == Usability::Usable && !matches!(d.pairing, Pairing::Paired(_)))
+            .find(|d| d.available && d.protocol == Protocol::AirPlay && d.usability == Usability::Usable && !matches!(d.pairing, Pairing::Paired(_)))
             .map(|d| SetupOffer { device: d.id, name: d.name, kind: d.kind })
     }
 
@@ -232,7 +231,6 @@ mod tests {
             source_version: Some("960.13.1".into()),
             pairing_required: true,
             usability: Usability::Usable,
-            experimental: kind == ReceiverKind::AirPlayTv,
             manual: false,
             addr: "192.168.1.5:7000".parse().unwrap(),
             ids: Default::default(),
@@ -241,7 +239,8 @@ mod tests {
 
     /// A paired TV from the store stays paired when discovery finds it again, becomes available
     /// with its new version, and is listed first (most recently used); a third-party TV is
-    /// listed only with `experimental`; the first-run card offers only the unpaired Apple TV.
+    /// listed like the Apple TVs; the first-run card offers an unpaired TV on the network, the
+    /// third-party one too.
     #[test]
     fn stored_and_discovered_devices_merge() {
         let tv = sighting("pi-tv", "Living Room", ReceiverKind::AppleTv);
@@ -267,13 +266,14 @@ mod tests {
         assert_eq!((d.pairing, d.available, d.os_version.as_deref()), (Pairing::Paired(PairVariant::Hkp5), true, Some("26.6 (23L773)")));
         assert_eq!(r.peer(tv.id).map(|p| p.peer_id), Some("tv".into()));
 
-        let names = |exp| r.list(exp).into_iter().map(|d| d.name).collect::<Vec<_>>();
-        assert_eq!(names(false), ["Living Room", "Den"]);
-        assert_eq!(names(true), ["Living Room", "Den", "Living Room TV"]);
-        assert_eq!(r.offer().map(|o| o.device), Some(other.id), "unpaired Apple TV only");
+        let names = r.list().into_iter().map(|d| d.name).collect::<Vec<_>>();
+        assert_eq!(names, ["Living Room", "Den", "Living Room TV"]);
+        assert_eq!(r.offer().map(|o| o.device), Some(other.id), "unpaired, the first in the list");
 
         r.gone(&other.key);
         assert!(!r.get(other.id).unwrap().available);
+        assert_eq!(r.offer().map(|o| (o.device, o.kind)), Some((hisense.id, ReceiverKind::AirPlayTv)), "offered like an Apple TV");
+        r.gone(&hisense.key);
         assert_eq!(r.offer(), None, "not on the network");
         r.forget(tv.id);
         assert!(r.get(tv.id).is_none() && r.peer(tv.id).is_none());

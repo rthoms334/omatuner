@@ -17,7 +17,8 @@ use crossbeam_channel::Receiver;
 use fake_airplay::{FakeAirPlay, FakeConfig, Tvos};
 use futures_util::future::BoxFuture;
 use tokio_util::sync::CancellationToken;
-use tuner::cast::discovery::{FakeDiscovery, Sighting};
+use tuner::cast::airplay::features;
+use tuner::cast::discovery::{self, FakeDiscovery, Sighting};
 use tuner::cast::firewall::{AllowOutcome, Detection, FirewallState, Rule, Verb};
 use tuner::cast::receiver::{Backend, Call, FakeReceiver, FakeRemote, ReceiverEvent};
 use tuner::cast::relay::{RelayConfig, RelayEvent};
@@ -26,7 +27,7 @@ use tuner::cast::session::{FakeRelay, FakeRelayRemote, Links, Relay, RelayCall, 
 use tuner::cast::{
     CastErrorKind, CastHandle, CastLevel, CastPhase, Credentials, Device, DeviceId, PairState, PairVariant, Pairing, PeerCredentials, Pin, Protocol,
 };
-use tuner::cast::{ReceiverKind, Usability};
+use tuner::cast::{PassOutcome, ReceiverKind, SetupOffer, Usability};
 use tuner::config::Config;
 use tuner::model::{ChannelId, HttpHeaders, ItemKey, ItemKind, ItemRef, MediaRef, MovieId, Playable, PlayableKind, SourceId};
 use tuner::paths::AppPaths;
@@ -108,7 +109,6 @@ fn sighting(id: DeviceId, name: &str) -> Sighting {
         source_version: Some("960.13.1".into()),
         pairing_required: true,
         usability: Usability::Usable,
-        experimental: false,
         manual: false,
         addr: TV_ADDR.parse().unwrap(),
         ids: Default::default(),
@@ -470,6 +470,49 @@ fn casting_needs_a_paired_tv() {
     let err = r.cast.open(den).unwrap_err();
     assert_eq!(err.kind, PlayerErrorKind::Cast(CastErrorKind::PairingRequired));
     assert!(!err.message.contains("Den"), "copy never carries device text");
+    drop(r.service);
+}
+
+/// The Hisense as the LAN announced it (`txt_hisense.txt`: features `0x7F8AD0,0x38BCF46`, bits
+/// 49 and 33 without bit 0; flags 0x244; acl 0): discovery classifies it as a third-party
+/// AirPlay TV, and the list the picker and Settings ▸ Cast read carries it beside the paired
+/// Apple TV, "Pair first" and selectable, with no setting to turn on; the first-run pass offers
+/// it like an unpaired Apple TV.
+#[test]
+fn a_third_party_airplay_tv_is_listed_and_offered_like_an_apple_tv() {
+    let r = rig("tuner-cast-service-hisense", Timings { pass: Duration::from_millis(50), ..calm() });
+    let txt: Vec<(String, String)> = include_str!("fixtures/cast/txt_hisense.txt")
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+    let mut info = features::from_txt(&txt);
+    info.name = Some("Living Room TV".into());
+    let key = "Living Room TV._airplay._tcp.local.".to_owned();
+    let hisense = discovery::sighting(&info, "127.0.0.3:7000".parse().unwrap(), key, false).expect("a video receiver");
+    let id = hisense.id;
+    r.discovery.with(|d| d.sightings.push(hisense));
+    r.cast.browse();
+    until("the Hisense", || r.cast.devices().iter().any(|d| d.id == id));
+
+    let devices = r.cast.devices();
+    assert_eq!(devices.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["Living Room", "Living Room TV"]);
+    let tv = &devices[1];
+    assert_eq!(
+        (tv.kind, tv.pairing, tv.usability, tv.available, tv.model.as_deref()),
+        (ReceiverKind::AirPlayTv, Pairing::Required, Usability::Usable, true, Some("85E75LE"))
+    );
+    assert!(tv.selectable());
+
+    r.cast.start_pass();
+    let mut outcome = None;
+    until("the first-run pass", || {
+        outcome = r.cast.take_pass_outcome();
+        outcome.is_some()
+    });
+    let offer = SetupOffer { device: id, name: "Living Room TV".into(), kind: ReceiverKind::AirPlayTv };
+    assert_eq!(outcome, Some(PassOutcome { offer: Some(offer) }));
     drop(r.service);
 }
 

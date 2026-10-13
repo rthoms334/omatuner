@@ -50,7 +50,6 @@ pub struct Sighting {
     pub source_version: Option<String>,
     pub pairing_required: bool,
     pub usability: Usability,
-    pub experimental: bool,
     pub manual: bool,
     pub addr: SocketAddr,
     /// The TXT record's `psi`/`pi`/`gid` (empty for a manual probe: the session reads `/info`
@@ -85,7 +84,6 @@ pub fn sighting(info: &features::AirPlayInfo, addr: SocketAddr, key: String, man
         source_version: clean(&info.source_version),
         pairing_required: class.pairing_required,
         usability: class.usability,
-        experimental: class.experimental,
         manual,
         addr,
         ids: if manual { features::ReceiverIds::default() } else { info.ids() },

@@ -5231,7 +5231,7 @@ Example flows: "touring cars is on" → `guide_search{query:"touring car"}` → 
 `details` → `play`. "What's on BBC One at 9" → `whats_on{channel:"BBC One", at:"21:00"}`.
 
 **Casting (§40, cast design §12).** `cast_devices` (read-only, never scans) returns `{devices: [{ref:
-"device:<32 hex>", name, kind, paired, available, experimental, casting}]}` with no addresses.
+"device:<32 hex>", name, kind, paired, available, casting}]}` with no addresses.
 `play` takes `device` (a ref or an exact name): the reply is immediate (`casting_started`), the
 agent confirms with `status`, whose `casting: {device, kind, phase, behind_live_s?, error?}` carries
 the typed reason of the last failure (cleared when the TV shows a picture, or when the user ends
@@ -5244,7 +5244,12 @@ variant, timing, firewall state, last error kind). Placement: a `play` with `dev
 window placement entirely (`opened_in: "device"`); a popped-out window is put back in, unraised.
 The bridge never retries a `device` play without the field on an older Tuner (it answers "The
 running Tuner can't cast; update Tuner"). Casting calls are actions (the 2/s bucket). No tool
-changes the firewall. There are 29 tools with `cast_devices`.
+changes the firewall. There are 29 tools with `cast_devices`. Whether a cast needs a question is the
+agent's protocol (the MCP instructions, `RULES.md` section 12, the tool descriptions), not the
+server's: naming the TV is the user's yes, and so is "on the TV" when exactly one TV is `paired`;
+with two or more paired TVs the agent asks which; unpaired TVs (only discovered) don't count;
+with none paired it is the old behaviour (`full_window` when no TV is listed, `pairing_required`
+when one is). `play {device}` always names its TV; nothing resolves "the TV" server-side.
 
 ### 30.6 Guardrails
 * **Visibility = the screens' rules.** Results only contain what the snapshot shows: hidden
@@ -5474,7 +5479,8 @@ the way scheduled playback does (§30.8, reminders "Open in"), and the agent say
   screen says *Pop-out* / *Tuner window*). `act::agent_show(asked, setting, window, pin)`,
   pure, in this order:
   1. `full_window` → the window, raised, on its player, **fullscreen** (the tool says: when the
-     user asks for full screen, the big screen or the TV; `AgentShow::fullscreen`: set at once,
+     user asks for full screen or the big screen, or the TV when `cast_devices` lists none;
+     `AgentShow::fullscreen`: set at once,
      or once a pop-out is back in, `fullscreen_after_pop_in`);
   2. the item needs the PIN → the window, raised (the PIN is typed there);
   3. `where_i_am` → only what plays changes (the screen stays; the mini player shows it);
@@ -6225,7 +6231,8 @@ instead of mpv. Tuner is the relay: it pulls the stream from the provider (one u
 connection, as the local player would), repackages it with `ffmpeg` into HLS and serves that to
 the TV over the LAN; the TV never sees a provider address or login. Phase 1 casts to an Apple TV
 4K (tvOS 26.x and 27, pairing mandatory) over AirPlay 2 video, in native Rust with no helper
-process. Third-party AirPlay TVs (the Hisense) are listed as *experimental*. Chromecast, DLNA
+process. Third-party AirPlay TVs (the Hisense) are listed and offered like the Apple TV and cast
+with VioletRelay's third-party profile; there is no experimental tier. Chromecast, DLNA
 and Roku are later phases (cast design §15.3). The whole feature sits behind the compile-time
 switch `cast::ENABLED` (`src/cast/mod.rs`; the key table's `feature_on`, the service start, the
 OSD and menu items, the Settings page, the cards and the agent's tools all read it) and the
@@ -6278,7 +6285,8 @@ user's `[cast] enabled`.
   place the §3.4 failure sentences are written.
 * **Agents** (§30, `agent/`): `cast_devices`, `play {device}`, `control stop_casting` /
   `play_here`, `status.casting`, `diagnose.cast`, the `RULES.md` section 12 and the `fix`,
-  `watch`, `kids` notes.
+  `watch`, `kids` notes. "Put it on the TV" counts only paired TVs: one is cast to without asking
+  (the request is the yes), two or more are asked which (§30.5).
 
 ### 40.3 Behaviour worth knowing
 * **Where alerts go** (cast design §3.8). Casting never moves the window: an agent's cast, a
@@ -6295,7 +6303,8 @@ user's `[cast] enabled`.
   only seek as far as it has loaded"); films restart ffmpeg with `-ss`.
 * **Config** `[cast]`: `enabled`, `offer_setup`, `checked_version`, `default_device`,
   `media_port` (47800), `min_segments` (2), `convert` (auto | never), `interlaced` (auto |
-  as-is), `experimental`, `keep_awake`. Machine-local like `[agents]`.
+  as-is), `keep_awake`. Machine-local like `[agents]`. The test builds' `experimental` is gone
+  (an old key is ignored).
 * **Accepted limits.** Alert toasts carry one button (the `Action` enum has no Play here / Cast
   again / open-firewall-card actions; the menu uses `Action::Digit(248/249)`); *Show command*
   opens the firewall card, where it is pressed again; the *Pairing refused* sentence merges the

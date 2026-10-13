@@ -162,7 +162,6 @@ pub fn cast_devices(devices: &[Device], casting: Option<DeviceId>) -> CastDevice
                 kind: kind_name(d.kind).into(),
                 paired: !matches!(d.pairing, Pairing::Required),
                 available: d.available,
-                experimental: d.experimental,
                 casting: casting == Some(d.id),
             })
             .collect(),

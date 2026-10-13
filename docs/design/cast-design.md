@@ -161,7 +161,7 @@ Guide and browse context menus get "Play on Living Room" in Phase 2.
                                          │   Living Room                    │
                                          │   Apple TV · Paired              │
                                          │   Living Room TV                 │
-                                         │   Hisense · Pair first · experimental
+                                         │   Hisense · Pair first           │
                                          │   OT Macbook Air                 │  ← greyed, not selectable
                                          │   Mac · Can't cast to Macs       │
                                          │ ━━━━━━━━━━━━━━  Searching…       │
@@ -179,7 +179,6 @@ Guide and browse context menus get "Play on Living Room" in Phase 2.
   |---|---|
   | `Apple TV · Paired` | Ready to cast. |
   | `Pair first` | Needs one-time PIN pairing. |
-  | `experimental` | A third-party AirPlay TV (§7.7). |
   | `Mac · Can't cast to Macs` | Greyed out. |
   | `Same Home only` | Greyed out, with the setting hint. |
 
@@ -323,8 +322,7 @@ The copy never contains device text or provider text.
 - It runs one 5 s mDNS browse at startup, at most once per Tuner version, and only when `cast.offer_setup` is on and `off_desktop()` is false.
 
 **When the card appears**
-- Only when the pass found a video-capable, Apple-made, **unpaired** receiver.
-- Experimental third-party TVs never trigger it.
+- Only when the pass found a usable, video-capable, **unpaired** AirPlay receiver: an Apple TV or a third-party AirPlay TV (§7.7), the first in list order.
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -370,7 +368,7 @@ Settings ▸ Cast
    Offer to set up new TVs                             [on]
  TVs
    Living Room       Apple TV · Paired · tvOS 26.6 · used today ⋯   (Pair again · Forget · Make default)
-   Living Room TV    Hisense · Not paired · experimental        ⋯   (Pair · Forget)
+   Living Room TV    Hisense · Not paired                       ⋯   (Pair · Forget)
    Search again
    Add by address…
  Network
@@ -382,7 +380,6 @@ Settings ▸ Cast
  Picture and sound
    Convert what the TV can't play       Automatically (uses the CPU) │ Never
    Interlaced channels                  Deinterlace (Apple's rule) │ Send as is
-   Show experimental AirPlay TVs        [on]
    Keep this computer awake while casting   [on]
  Live TV on the TV runs about 10–20 s behind the computer.
 ```
@@ -455,7 +452,7 @@ Casting is the one kind of playback that doesn't need Tuner's window: the pictur
 | Receiver | Protocol | Phase | On the user's LAN today |
 |---|---|---|---|
 | Apple TV 4K (tvOS 26.x and 27) | AirPlay 2 video, `/command` play queue | **1** | "Living Room": AppleTV14,1 (4K gen 3), tvOS 26.6, 192.168.1.5:7000.<br>- `/info` statusFlags 0x118644, TXT flags 0x18644; bit 9 means pairing is mandatory.<br>- Features bits 0, 4, 33, 38, 48 and 49 [NE A.1].<br>- Auto-updates are on; both versions are supported (§7.6). |
-| Third-party AirPlay TVs (Hisense VIDAA, Samsung, LG) | same, third-party profile (§7.7) | 1, **experimental** | "Living Room TV": Hisense 85E75LE.<br>- Sets bits 49 and 33 but not bit 0 (so no legacy `/play`); flags 0x244.<br>- Its player is hls.js, so expect HLS only [NE A.2].<br>- VioletRelay reports a Hisense 100E75LE from the same family working [REF]. |
+| Third-party AirPlay TVs (Hisense VIDAA, Samsung, LG) | same, third-party profile (§7.7) | 1 | "Living Room TV": Hisense 85E75LE.<br>- Sets bits 49 and 33 but not bit 0 (so no legacy `/play`); flags 0x244.<br>- Its player is hls.js, so expect HLS only [NE A.2].<br>- VioletRelay reports a Hisense 100E75LE from the same family working [REF]. |
 | Mac AirPlay receiver | — | never | "OT Macbook Air" (`act=2`) |
 | Chromecast, Google TV, TVs with Cast built in (Sony, TCL, Hisense, LG 2024+, Samsung 2026) | CASTV2 Default Media Receiver `CC1AD845` | 2 | none found |
 | DLNA/UPnP MediaRenderer (older Samsung/LG, Panasonic, Philips, Kodi, AV receivers) | AVTransport + RenderingControl | 3 | None seen. This is inconclusive, because ufw drops unicast M-SEARCH replies [NE]. |
@@ -731,9 +728,9 @@ There is no continuous scanning. Under `platform::off_desktop()` it uses `NullDi
 - Unsupported (listed but greyed out):
   - `act=2`, or a model matching `^Mac\d+,\d+$`: "Can't cast to Macs";
   - `acl=1`: "Same Home only", with the Allow Access hint.
-- Integrator other than Apple (a `model` not starting with `AppleTV`): **experimental**.
+- Integrator other than Apple (a `model` not starting with `AppleTV`): a third-party AirPlay TV, cast with the third-party profile (§7.7).
   - It also needs features bit 33, which gates play-queue support for third-party TVs (VioletRelay) [REF].
-  - It is listed only when `cast.experimental` is on, and never offered by the first-run card.
+  - It is listed, and offered by the first-run card, like an Apple TV. There is no experimental tier (§17 item 9).
 - **Versions** are read for logs, `diagnose` and Settings only (§7.6):
   - TXT `osvers` (26.6) and `srcvers` (960.13.1);
   - `/info` `osBuildVersion` (23L773) and `sourceVersion`.
@@ -1121,7 +1118,7 @@ Each session logs one INFO line without addresses: `cast: AppleTV14,1 tvOS 26.6 
 
 **Not relied on.** A comment claims that 27.5 fixed AirPlay PIN pairing to home theatres. It is unverifiable and concerns receivers, so it is ignored [TV27].
 
-### 7.7 Third-party AirPlay TVs (experimental; the Hisense)
+### 7.7 Third-party AirPlay TVs (the Hisense)
 
 - The profile is chosen when the `model` doesn't start with `AppleTV` (VioletRelay's detection) and features bit 33 is set.
 - The differences come from VioletRelay `airplay_modern.py` L84–300. VioletRelay reports them working on a Hisense 100E75LE, the same family as the user's 85E75LE:
@@ -1133,7 +1130,7 @@ Each session logs one INFO line without addresses: `cast: AppleTV14,1 tvOS 26.6 
   - the item adds `HLS-Content-Location` (the same URL), `isAudioOnly false`, `streamType 1`, and a `Start-Position` with timescale 1000 and value 0. VioletRelay: "the receiver uses this key—not the URL suffix—to select its HLS/MSE player".
   - the identifiers come from the TXT record, as VioletRelay reads them (`airplay_modern.py` L281–283, L331, L407): the `channelID` is `<TXT psi, else TXT pi>-RCS-1`, and `SETPEERSX`'s `ClockPorts` is keyed by the TXT `gid`, else that id. The Hisense's `/info` has only `pi` (no `psi` or `gid`). Discovery keeps the TXT identifiers with the device; only a TV the record never named (one added by address) falls back to `/info`'s, then to the sender MAC.
 - Its player is hls.js 4.0.16 (`playbackCapabilities`), so HLS only: L2 TS for progressive H.264, L3 otherwise.
-- Nobody has run this against an 85E75LE. It is §18 item 14. If it fails, the TVs are hidden by default (`cast.experimental = false`) and Phase 2/3 reach them over Cast or DLNA.
+- §18 item 14 runs it against the 85E75LE. If it fails there, the profile is fixed, or third-party TVs are no longer listed (no hidden tier) until Phase 2/3 reach them over Cast or DLNA.
 
 ---
 
@@ -1196,7 +1193,7 @@ TV ◀──────── LAN server <lan-ip>:47800 /c/<tok>/… (token, pe
 
 ### 8.2 Hints, in priority order
 
-1. The receiver profile (Apple TV / experimental AirPlay TV; Chromecast models in Phase 2).
+1. The receiver profile (Apple TV / third-party AirPlay TV; Chromecast models in Phase 2).
 2. The user's per-item override ("Convert this channel" → L3).
 3. The cached `cast_hint(item, receiver)`: which level worked, interlaced, codecs.
 4. mpv's hints when moving the item that's playing.
@@ -1563,7 +1560,7 @@ sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=1
 ## 12. Agent and MCP (`src/agent/`, plugin skills)
 
 **`cast_devices` (new, read-only, query bucket)**
-- Returns `{devices: [{ref: "device:<32 hex>", name, kind: apple_tv|airplay_tv|chromecast|dlna, paired, available, experimental, casting}]}`.
+- Returns `{devices: [{ref: "device:<32 hex>", name, kind: apple_tv|airplay_tv|chromecast|dlna, paired, available, casting}]}`.
 - Reads the registry, which includes paired devices from the store. It never starts a scan.
 - Refs are opaque (DESIGN §30.3), and no addresses are returned.
 
@@ -1598,7 +1595,8 @@ sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=1
 - Actions are logged at INFO by method and ref only, with no device names or IPs.
 
 **Instructions and skills**
-- MCP server instructions get the line: "Starting a cast on a TV needs the user's yes unless they named the device."
+- MCP server instructions get the line: "Starting a cast on a TV needs the user's yes: naming the TV is the yes, and so is asking for 'the TV' when exactly one TV in `cast_devices` is paired (cast to it, no question); with two or more paired, ask which. Unpaired TVs don't count."
+- **Which TV "the TV" is.** The agent counts only `paired` TVs. Exactly one: it casts to it, and the request is the yes, as naming the TV is. Two or more: it asks which. An unpaired TV (one that is discovered, not paired) never makes "the TV" ambiguous. With none paired, "the TV" means what it did with no TV listed: `full_window` when `cast_devices` is empty, and `pairing_required` when a TV is listed but not paired. This is the agent's protocol (rules, skills and tool descriptions): the server resolves no "the TV" and enforces no confirmation; `play {device}` always names its TV.
 - `watch` gets one "put it on the TV" line.
 - `kids` notes that parental locks apply on the TV too.
 - `fix` reads `status.casting` and the typed errors. For `cast-firewall` it tells the user to press **Allow on firewall** in Tuner (Settings ▸ Cast ▸ Network). No tool changes the firewall, and agents never run `sudo` or `pkexec`.
@@ -1684,7 +1682,7 @@ Not needed: protobuf/prost, `plist`, dalek/RustCrypto, `srp`, `rust_cast`, `rupn
    - bplist round-trip and golden bytes, plus caps against hostile input;
    - TXT and `/info` feature, flag and version decoding on the two real plists. Assert:
      - the Apple TV is video-capable, with pairing mandatory and version 26.6;
-     - the Hisense is experimental, with bits 49 and 33 and no bit 0;
+     - the Hisense is a usable third-party AirPlay TV, with bits 49 and 33 and no bit 0;
      - a Mac is unsupported;
      - both the TXT (0x18644) and `/info` (0x118644) flag forms decode.
 3. **Transport:** RTSP/HTTP mixed-response matching; a stray late CSeq dropped; one-in-flight enforced; event reassembly (multi-frame, CSeq ack).
@@ -1940,7 +1938,7 @@ No provider URL is recorded, and no throwaway venv runs against the TV.
   - the §7.3 session with declared PTP, the replace sequence and the event channel;
   - `playbackInfo` with the estimate fallback;
   - tvOS 26 and 27 behaviour (§7.6);
-  - the third-party profile (experimental);
+  - the third-party profile;
   - the dev trace.
 - **Relay:**
   - the loopback upstream proxy with head buffer and HLS variant pick;
@@ -2197,7 +2195,7 @@ Run these against "Living Room" (192.168.1.5) once the gate has passed.
     - A locked channel raises Tuner with the PIN prompt.
     - Block the firewall and cast, then switch workspace. A desktop notification appears, and its **Show** raises Tuner on the casting card with Allow on firewall.
     - Start a cast while the pop-out is up. The pop-out goes back into the window without taking focus.
-14. **Hisense (experimental).** Items 1, 2 and 7 through the third-party profile. If it can't play, set `experimental = false` as the default.
+14. **Hisense.** It is listed in the picker beside the Apple TV. Items 1, 2 and 7 through the third-party profile. If it can't play, fix the profile or stop listing third-party TVs (§7.7).
 
 ---
 

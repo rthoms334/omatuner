@@ -138,8 +138,6 @@ pub struct Device {
     pub os_version: Option<String>,
     pub pairing: Pairing,
     pub usability: Usability,
-    /// A third-party AirPlay TV (DESIGN §40 §7.7): labelled, never offered by the first-run card.
-    pub experimental: bool,
     /// Seen on the network by the latest discovery (else remembered from the store).
     pub available: bool,
     /// Last cast to it (the picker lists the most recent first).
@@ -165,7 +163,6 @@ impl Device {
             os_version: None,
             pairing: Pairing::Required,
             usability: Usability::Usable,
-            experimental: kind == ReceiverKind::AirPlayTv,
             available: true,
             last_used: None,
             addr: None,
@@ -328,7 +325,8 @@ pub enum TestState {
     Failed(CastErrorKind),
 }
 
-/// A TV the first-run card offers to set up (an Apple-made, video-capable, unpaired receiver).
+/// A TV the first-run card offers to set up (a usable, unpaired AirPlay video receiver: an Apple
+/// TV or a third-party AirPlay TV).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetupOffer {
     pub device: DeviceId,

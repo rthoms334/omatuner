@@ -1026,8 +1026,6 @@ pub struct CastDeviceOut {
     pub paired: bool,
     /// Seen on the network by the latest discovery (else remembered).
     pub available: bool,
-    /// A third-party AirPlay TV.
-    pub experimental: bool,
     /// Tuner casts to it now.
     pub casting: bool,
 }

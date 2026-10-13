@@ -99,7 +99,7 @@ impl<'de> Deserialize<'de> for DeviceId {
 pub enum ReceiverKind {
     /// An Apple TV (AirPlay 2 video, `/command` play queue). Phase 1.
     AppleTv,
-    /// A third-party AirPlay TV (Hisense, Samsung, LG): experimental (DESIGN §40 §7.7).
+    /// A third-party AirPlay TV (Hisense, Samsung, LG): the third-party profile (DESIGN §40 §7.7).
     AirPlayTv,
     /// Phase 2.
     Chromecast,

@@ -3,7 +3,7 @@
 //! CAST-1. `features`/`ft` as `lo,hi` 32-bit words; `flags`/`sf` (TXT 0x18644 and `/info`
 //! statusFlags 0x118644 both decode). Video-capable: bit 0 or bit 49 (pyatv's gate). Pairing
 //! required: `flags & (0x200 | 0x8)` (never 0x8 alone). A Mac (`act=2`, `^Mac\d+,\d+$`): listed,
-//! greyed. `acl=1`: "Same Home only". A non-`AppleTV` model with bit 33: experimental. Versions
+//! greyed. `acl=1`: "Same Home only". A non-`AppleTV` model with bit 33: a third-party TV. Versions
 //! (`osvers`, `srcvers`, `osBuildVersion`, `sourceVersion`) are for logs, `diagnose` and Settings
 //! only. Every string is device data: sanitized by the caller (`cast::sanitize_name`).
 //!
@@ -16,8 +16,9 @@
 //!
 //! The order of [`classify`]: not video-capable → not listed; a Mac (`act=2` or a `Mac` model)
 //! → greyed "Can't cast to Macs"; an Apple TV (`model` starting `AppleTV`) → usable; any other
-//! model → a third-party TV, listed only with features bit 33 (the play queue) and always
-//! experimental. `acl=1` greys an otherwise usable receiver as "Same Home only".
+//! model → a third-party TV (`ReceiverKind::AirPlayTv`, cast with the third-party profile),
+//! listed only with features bit 33 (the play queue). `acl=1` greys an otherwise usable receiver
+//! as "Same Home only".
 
 use super::bplist;
 use crate::cast::{DeviceId, ReceiverKind, Usability};
@@ -99,7 +100,6 @@ pub struct Classified {
     pub kind: ReceiverKind,
     pub pairing_required: bool,
     pub usability: Usability,
-    pub experimental: bool,
 }
 
 /// pyatv `parse_features`: `0xLO` or `0xLO,0xHI` → `HI << 32 | LO`; anything else → 0.
@@ -194,10 +194,10 @@ pub fn classify(info: &AirPlayInfo) -> Option<Classified> {
     let pairing_required = info.flags & (FLAG_PAIRING | FLAG_PIN_REQUIRED) != 0;
     let model = info.model.as_deref().unwrap_or_default();
     let mac = info.act == Some(2) || is_mac_model(model);
-    let (kind, experimental) = if mac || model.starts_with("AppleTV") {
-        (ReceiverKind::AppleTv, false)
+    let kind = if mac || model.starts_with("AppleTV") {
+        ReceiverKind::AppleTv
     } else if info.features & VIDEO_PLAY_QUEUE != 0 {
-        (ReceiverKind::AirPlayTv, true)
+        ReceiverKind::AirPlayTv
     } else {
         return None;
     };
@@ -208,7 +208,7 @@ pub fn classify(info: &AirPlayInfo) -> Option<Classified> {
     } else {
         Usability::Usable
     };
-    Some(Classified { kind, pairing_required, usability, experimental })
+    Some(Classified { kind, pairing_required, usability })
 }
 
 /// `DeviceId::derive("airplay", pi-or-deviceid)`; `None` without either.
@@ -238,22 +238,25 @@ mod tests {
         assert_eq!(i.flags, 0x118644, "/info statusFlags has bit 20 set, TXT flags don't");
         assert_eq!((i.os_build.as_deref(), i.source_version.as_deref()), (Some("23L773"), Some("960.13.1")));
         assert_eq!(i.psi.as_deref(), Some("00000000-0000-4000-8000-000000000105"));
-        let expected = Classified { kind: ReceiverKind::AppleTv, pairing_required: true, usability: Usability::Usable, experimental: false };
+        let expected = Classified { kind: ReceiverKind::AppleTv, pairing_required: true, usability: Usability::Usable };
         assert_eq!(classify(&t), Some(expected));
         assert_eq!(classify(&i), Some(expected));
         assert_eq!(device_id(&t), device_id(&i), "the same TV whichever way it was found");
     }
 
+    /// The Hisense's TXT `features=0x7F8AD0,0x38BCF46` is the low word, then bits 32–63: bits 49
+    /// and 33 without bit 0. `flags=0x244` has the pairing bit, `acl=0` lets anyone cast.
     #[test]
-    fn the_hisense_is_experimental_with_bits_49_and_33_only() {
+    fn the_hisense_is_a_usable_third_party_tv_with_bits_49_and_33_only() {
         let t = from_txt(&txt(include_str!("../../../tests/fixtures/cast/txt_hisense.txt")));
         let i = info(include_bytes!("../../../tests/fixtures/cast/info_hisense.plist"));
+        assert_eq!((t.features, t.flags, t.acl), (0x038BCF46_007F8AD0, 0x244, Some(0)));
         for r in [&t, &i] {
             assert_eq!(r.features & VIDEO_V1, 0);
             assert_ne!(r.features & VIDEO_V2, 0);
             assert_ne!(r.features & VIDEO_PLAY_QUEUE, 0);
             let c = classify(r).unwrap();
-            assert_eq!((c.kind, c.experimental, c.pairing_required, c.usability), (ReceiverKind::AirPlayTv, true, true, Usability::Usable));
+            assert_eq!((c.kind, c.pairing_required, c.usability), (ReceiverKind::AirPlayTv, true, Usability::Usable));
         }
         assert_eq!(i.psi, None, "a third-party TV's /info has no psi");
         assert_eq!(device_id(&t), device_id(&i));

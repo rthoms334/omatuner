@@ -7,7 +7,7 @@
 //! Offer to set up new TVs                                            [ On  ]
 //! TVS
 //! 󰄙 Living Room      Apple TV · Paired · tvOS 26.6 · used 2 h ago · default   ⋯
-//! 󰄙 Living Room TV   AirPlay TV · Not paired · experimental                   ⋯
+//! 󰄙 Living Room TV   AirPlay TV · Not paired                                  ⋯
 //! ↻ Search again
 //! Add by address     [ the TV's IPv4 address ]
 //! + Add
@@ -20,7 +20,6 @@
 //! PICTURE AND SOUND
 //! Convert what the TV can't play             ‹ Automatically (uses the CPU) ›
 //! Interlaced channels                        ‹ Deinterlace (Apple's rule) ›
-//! Show experimental AirPlay TVs                                      [ On  ]
 //! Keep this computer awake while casting                             [ On  ]
 //! Live TV on the TV runs about 10–20 s behind the computer.
 //! ```
@@ -80,10 +79,8 @@ static TOGGLES: [CfgToggle; 2] = [
     CfgToggle { label: "Offer to set up new TVs", get: |c| c.cast.offer_setup, set: |c, v| c.cast.offer_setup = v },
 ];
 
-static PICTURE: [CfgToggle; 2] = [
-    CfgToggle { label: "Show experimental AirPlay TVs", get: |c| c.cast.experimental, set: |c, v| c.cast.experimental = v },
-    CfgToggle { label: "Keep this computer awake while casting", get: |c| c.cast.keep_awake, set: |c, v| c.cast.keep_awake = v },
-];
+static PICTURE: [CfgToggle; 1] =
+    [CfgToggle { label: "Keep this computer awake while casting", get: |c| c.cast.keep_awake, set: |c, v| c.cast.keep_awake = v }];
 
 static CONVERT: CfgChoice = CfgChoice {
     label: "Convert what the TV can't play",
@@ -154,9 +151,6 @@ fn detail(d: &Device, cfg: &Config, now: crate::model::Timestamp) -> String {
     if !d.available {
         parts.push("not found now".into());
     }
-    if d.experimental {
-        parts.push("experimental".into());
-    }
     if is_default(cfg, d) {
         parts.push("default".into());
     }
@@ -179,9 +173,8 @@ pub(super) fn rows(s: &SettingsScreen, ctx: &UiCtx<'_>, v: &mut Vec<Row>) {
 
     let devices = cast.devices();
     v.push(Row::Section(if cast.searching() { "TVs · searching…".into() } else { "TVs".into() }));
-    let shown = devices.iter().filter(|d| cfg.cast.experimental || !d.experimental);
     let casting = ctx.player.cast.as_ref().map(|c| c.device);
-    for d in shown {
+    for d in &devices {
         v.push(Row::Item {
             item: Item::Feature(Feature::Cast, row_id(d.id)),
             icon: if casting == Some(d.id) { glyphs::CAST_CONNECTED } else { glyphs::CAST }.to_owned(),
@@ -460,7 +453,7 @@ mod tests {
         h.state_mut().enter(Route::Settings(SettingsPage::Cast));
         h.run_steps(2);
         assert!(has_label(&h, "Apple TV · Paired · tvOS 26.6 (23L773)"));
-        assert!(has_label(&h, "AirPlay TV · Not paired · experimental"));
+        assert!(has_label(&h, "AirPlay TV · Not paired"));
         assert!(has_label(&h, "Firewall: Blocked (ufw)"));
         assert!(has_label(&h, "Tuner serves the TV from this computer (wlan0), port 47800."));
         assert!(has_label(&h, "Allow on firewall") && !has_label(&h, "Remove rule"));

@@ -56,11 +56,12 @@ First read `${CLAUDE_SKILL_DIR}/../../RULES.md` (this plugin's shared rules) and
   that programme (confirm), and `mark_seen` once they say they've watched it.
 - **Full screen / the big screen**: `play` with `open_in: "full_window"`; for what already plays,
   `control` `window` (it carries on, full screen in Tuner's window). "On the TV" means casting
-  when `cast_devices` lists a TV (next line); with none listed, it is this.
+  when `cast_devices` lists a paired TV (next line); with no TV listed, it is this.
 - **"Put it on the TV" (a TV Tuner casts to, such as the Apple TV)**: `cast_devices`, then `play`
-  with `device`; follow rule 12 (the user's yes unless they named the TV, Tuner's window stays
-  where it is, `status.casting` to confirm). Say "on the TV" in the confirmation. "Bring it back
-  here" is `control` `play_here`.
+  with `device`; follow rule 12 (one paired TV: cast to it, the request is the yes; two or more:
+  ask which; naming one is the yes; unpaired TVs don't count; Tuner's window stays where it is,
+  `status.casting` to confirm). Say "on the TV" in the confirmation. "Bring it back here" is
+  `control` `play_here`.
 - **"Pop it out" / mini player**: `control` `popout`.
 - **"Go back to the last channel"**: `control` `previous_channel`.
 
