@@ -233,7 +233,8 @@ impl Drop for SessionGuard {
 
 enum Ctl {
     Kill,
-    Revive,
+    /// Answered once the listener is bound again.
+    Revive(std::sync::mpsc::Sender<()>),
     Shutdown,
 }
 
@@ -311,9 +312,12 @@ impl TestServer {
         let _ = self.ctl.send(Ctl::Kill);
     }
 
-    /// Listen again on the same port.
+    /// Listen again on the same port (returns once it does, so a connect right after succeeds).
     pub fn revive(&self) {
-        let _ = self.ctl.send(Ctl::Revive);
+        let (tx, rx) = std::sync::mpsc::channel();
+        if self.ctl.send(Ctl::Revive(tx)).is_ok() {
+            let _ = rx.recv_timeout(Duration::from_secs(5));
+        }
     }
 
     /// Stop (`false`) or resume recording requests for [`TestServer::requests`].
@@ -329,7 +333,9 @@ impl TestServer {
         self.requests().into_iter().filter(|r| r.path == path).collect()
     }
 
-    /// Highest number of simultaneously open connections so far.
+    /// Highest number of simultaneously open connections so far. A connection counts from its
+    /// accept until it ends, which after a served response is when the client closes it (at
+    /// most 2 s later): a client that connects again before closing its previous socket shows.
     pub fn max_concurrent(&self) -> usize {
         self.shared.max_active.load(Ordering::SeqCst)
     }
@@ -366,7 +372,7 @@ async fn run(std_listener: std::net::TcpListener, addr: SocketAddr, ctx: Arc<Ctx
                     listener = None;
                     conns.abort_all();
                 }
-                Some(Ctl::Revive) => {
+                Some(Ctl::Revive(done)) => {
                     if listener.is_none() {
                         // the old socket is closed; SO_REUSEADDR (tokio default) lets us rebind
                         for _ in 0..50 {
@@ -379,6 +385,7 @@ async fn run(std_listener: std::net::TcpListener, addr: SocketAddr, ctx: Arc<Ctx
                             }
                         }
                     }
+                    let _ = done.send(());
                 }
                 Some(Ctl::Shutdown) | None => {
                     conns.abort_all();
