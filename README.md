@@ -355,9 +355,10 @@ Everything is in **Settings ▸ About & logs ▸ Updates**: the version, the las
   it when you choose *Install now*.
 - **Restart:** the running Tuner keeps the old version until it restarts. The status bar says
   *Updated to 0.2.6 — restarts when idle (Restart now)*. Tuner restarts by itself once nothing
-  has been playing (or paused) for a minute, no dialog is open, no import runs and you're in
-  another window; it opens on the screen it was on, stays on its workspace and leaves the
-  keyboard where it was. It never restarts during playback. Click the chip to restart now.
+  has been playing (or paused) or casting to a TV for a minute, no dialog is open, no import
+  runs and you're in another window; it opens on the screen it was on, stays on its workspace
+  and leaves the keyboard where it was. It never restarts during playback, a cast, Test on TV or
+  pairing (an update doesn't even install while you pair a TV). Click the chip to restart now.
 - **AI agents:** the `tuner mcp` servers your agents started keep working through an install and
   the restart. An agent gets the new version's tools in its next session (for Claude Code, start
   a new session); with *Keep Claude Code's plugin up to date* on, the plugin is brought up to

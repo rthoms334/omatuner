@@ -5,8 +5,9 @@
 //! * **When** ([`may_restart`], held for a quiet period by [`QuietTimer`]): nothing plays or is
 //!   paused in either picture, no multi-view, no overlay or dialog, no text field with the
 //!   keyboard, no onboarding, no background job (an import would start again), the helper isn't
-//!   installing — and the window doesn't have the keyboard (unfocused, which includes not
-//!   visible). Casting (DESIGN §40, its own branch) joins the gate when it lands.
+//!   installing, nothing casts (a session starting, casting or letting go of the TV, Test on TV,
+//!   a pairing, the firewall's dialog: DESIGN §40) — and the window doesn't have the keyboard
+//!   (unfocused, which includes not visible).
 //! * **How**: the updater asks the window to close (`PlatformEvent::Quit`, the normal `on_exit`
 //!   path) and `main` re-execs `/usr/bin/tuner` once `run_native` returns ([`take`], [`exec`]):
 //!   same process id, session, environment and profile (`--profile-dir`, `--debug`), the screen
@@ -51,11 +52,14 @@ pub struct Quiet {
     pub jobs: bool,
     /// The helper is installing.
     pub installing: bool,
+    /// Casting has something going on ([`crate::cast::CastActivity::any`]): picture A's player
+    /// is idle during Test on TV and pairing, and a session outlives its player for a moment.
+    pub casting: bool,
 }
 
 /// Whether Tuner may restart now (see the module docs).
 pub fn may_restart(q: &Quiet) -> bool {
-    !q.playing && !q.multiview && !q.busy_ui && !q.focused && !q.jobs && !q.installing
+    !q.playing && !q.multiview && !q.busy_ui && !q.focused && !q.jobs && !q.installing && !q.casting
 }
 
 /// The gate must hold this long, without a break, before the restart.
@@ -203,6 +207,7 @@ mod tests {
             Quiet { focused: true, ..Default::default() },
             Quiet { jobs: true, ..Default::default() },
             Quiet { installing: true, ..Default::default() },
+            Quiet { casting: true, ..Default::default() },
         ];
         for q in busy {
             assert!(!may_restart(&q), "{q:?}");

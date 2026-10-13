@@ -1877,6 +1877,14 @@ helper's outcome.
   - **Do:** repeat with Tuner alone on a hidden workspace (also without the packaged
     `render_unfocused` rule). **Expect:** it restarts there too, about a minute plus 3 s later,
     and stays on that workspace.
+- [ ] **Never while casting** (§30's Apple TV): with an update waiting for the restart, cast a
+  film to the TV, then click into a terminal for 3 minutes; stop casting from the TV's remote
+  and wait 2 more minutes. Then, with Tuner unfocused, run Settings ▸ Cast ▸ Test on TV, and
+  open the PIN overlay (Forget the TV, then Pair) and leave it up for 2 minutes.
+  **Expect:** no restart while it casts, while the test runs or while the PIN overlay is up; a
+  restart about a minute after each ends. With *Install updates without asking for my password*
+  on and a new version published, an update found while the PIN overlay is up installs only
+  after it closed (the log: "installs once the TV's pairing is over").
 - [ ] **Restart now:** with an update waiting (install vN again by hand, then let Tuner update),
   click the chip. **Expect:** an immediate restart into the same screen.
 - [ ] **The passwordless switch:**

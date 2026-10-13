@@ -48,8 +48,8 @@ use super::registry::Registry;
 use super::relay::RelayConfig;
 use super::session::{Ctl, Links, NullLinks, RealLinks, Session, Timings};
 use super::{
-    CastApi, CastDiagnose, CastErrorKind, CastHandle, CastPhase, CastView, Credentials, Device, DeviceId, FirewallJob, Identity, PairError, PairJob,
-    PairState, PairVariant, Pairing, PassOutcome, PeerCredentials, Pin, ReceiverKind, TestState, Usability,
+    CastActivity, CastApi, CastDiagnose, CastErrorKind, CastHandle, CastPhase, CastView, Credentials, Device, DeviceId, FirewallJob, Identity,
+    PairError, PairJob, PairState, PairVariant, Pairing, PassOutcome, PeerCredentials, Pin, ReceiverKind, TestState, Usability,
 };
 use crate::config::{Config, SharedConfig};
 use crate::error::Result;
@@ -966,6 +966,19 @@ impl CastApi for Api {
     fn send_as_is(&self) {
         if let Some(live) = lock(&self.0.live).as_ref() {
             let _ = live.ctl.send(Ctl::AsIs);
+        }
+    }
+
+    /// A session counts from `open` until its task let go of the TV (a stopped one may still be
+    /// closing); a pairing from `pair_start` until the overlay cancels or closes (its drop
+    /// cancels), whatever the job's state.
+    fn activity(&self) -> CastActivity {
+        let shared = &self.0;
+        CastActivity {
+            session: lock(&shared.live).as_ref().is_some_and(|l| !l.task.is_finished()),
+            test: lock(&shared.test).task.as_ref().is_some_and(|(t, _)| !t.is_finished()),
+            pairing: !lock(&shared.pairs).is_empty(),
+            firewall: matches!(lock(&shared.firewall).job, FirewallJob::Waiting { .. }),
         }
     }
 

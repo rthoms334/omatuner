@@ -7,7 +7,9 @@
 use std::net::Ipv4Addr;
 use std::sync::Mutex;
 
-use super::{CastApi, CastDiagnose, CastErrorKind, Device, DeviceId, FirewallJob, PairJob, PairState, PassOutcome, TestState, firewall};
+use super::{
+    CastActivity, CastApi, CastDiagnose, CastErrorKind, Device, DeviceId, FirewallJob, PairJob, PairState, PassOutcome, TestState, firewall,
+};
 use crate::player::PlayerError;
 use crate::player::remote::RemoteOutput;
 
@@ -49,6 +51,7 @@ pub struct FakeScript {
     pub test_state: TestState,
     pub last_error: Option<CastErrorKind>,
     pub diagnose: Option<CastDiagnose>,
+    pub activity: CastActivity,
     /// What `open` answers (`None`: the inert error).
     pub open: Option<OpenFn>,
 }
@@ -160,6 +163,9 @@ impl CastApi for FakeCast {
     }
     fn send_as_is(&self) {
         self.call(FakeCall::SendAsIs);
+    }
+    fn activity(&self) -> CastActivity {
+        self.read(|s| s.activity)
     }
     fn last_error(&self) -> Option<CastErrorKind> {
         self.read(|s| s.last_error)

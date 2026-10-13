@@ -380,6 +380,27 @@ pub struct PassOutcome {
     pub offer: Option<SetupOffer>,
 }
 
+/// What casting has going on now ([`CastApi::activity`]): Tuner's updates never restart, nor
+/// install by themselves, in the middle of it (DESIGN §41.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CastActivity {
+    /// A session is starting, casting, or still letting go of the TV.
+    pub session: bool,
+    /// Test on TV runs.
+    pub test: bool,
+    /// A pairing is open: from asking the TV for a code until the PIN overlay closes.
+    pub pairing: bool,
+    /// The firewall's Allow / Remove waits on polkit's dialog.
+    pub firewall: bool,
+}
+
+impl CastActivity {
+    /// Anything at all: the restart waits.
+    pub fn any(self) -> bool {
+        self.session || self.test || self.pairing || self.firewall
+    }
+}
+
 /// The agent's `diagnose` cast section (DESIGN §40 §12): no addresses.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CastDiagnose {
@@ -485,6 +506,12 @@ pub trait CastApi: Send + Sync {
     /// failure) and load it again without converting, where the TV is (§8.3). Nothing when
     /// nothing casts.
     fn send_as_is(&self) {}
+
+    // ---- Tuner's updates (the restart and install gates; DESIGN §41.6)
+    /// What casting has going on (sessions, Test on TV, pairing, the firewall's dialog).
+    fn activity(&self) -> CastActivity {
+        CastActivity::default()
+    }
 
     // ---- the agent (`status.casting.error`, `diagnose`)
     /// The last cast failure (kept after casting ended, e.g. `StoppedOnTv`).

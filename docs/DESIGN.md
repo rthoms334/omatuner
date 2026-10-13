@@ -6582,9 +6582,10 @@ start ─20 s─▶ check ◀─ every 6 h · Check now · [updates] changed · 
           Downloading: <pkg>.minisig, then <pkg> → ~/.cache/tuner/update/ (0700; files 0600)
                │ verified here ─ fails ─▶ deleted, refused this session, error toast, Available
                ▼
-             Ready ── passwordless rule on ──────────────────────────────┐
+             Ready ── passwordless rule on (held while a TV pairs) ──────┐
                │ notification "ready"; the app's gate: window focused,   │
-               │ nothing plays, nothing open, not typing, not popped out │
+               │ nothing plays or casts, nothing open, not typing, not   │
+               │ popped out                                              │
                ▼ (toast: "Installing Tuner X: enter your password")      ▼
           Installing: pkexec --disable-internal-agent /usr/lib/tuner/tuner-update install <pkg>
                │ 126 dismissed → Ready (declined: Install now) · 127 → Ready + why
@@ -6594,7 +6595,8 @@ start ─20 s─▶ check ◀─ every 6 h · Check now · [updates] changed · 
           Installed: toast "Tuner updated to X — it restarts when idle" [Restart now], notification,
                │     status-bar chip "Updated to X — restarts when idle (Restart now)"
                │ every 5 s, held 60 s: A and B idle (not even paused), no multi-view, no overlay /
-               │ typing / onboarding, no job, not installing, the window without the keyboard
+               │ typing / onboarding, no job, not installing, nothing casting, the window without
+               │ the keyboard
                ▼
           restart (§41.6) ─▶ the new process: marker → toast, window put back, §39 pass
 ```
@@ -6634,7 +6636,13 @@ and pacman), 3 min for the switch; a stop or a time-out kills pkexec while it is
 * **Gate**: §41.4's, evaluated off the UI thread from the players' snapshots
   (`AppShared::tile_player`), the job manager and what the UI last said (`UiNow`: focus, an open
   overlay or text field or onboarding, multi-view, the screen); no frame yet counts as busy.
-  "Unfocused" covers "not visible". Casting (§40) joins the gate in the next commit.
+  "Unfocused" covers "not visible". **Casting** holds it too (`CastApi::activity`, §40): a
+  session from `open` until its task let go of the TV (starting, casting, a stop still
+  closing), Test on TV, a pairing (from `pair_start` until the PIN overlay closes, whatever the
+  job's state) and the firewall's polkit dialog — the player alone misses these, as picture A
+  is idle during Test on TV and pairing. The same activity holds the password dialog
+  (`prompt_due`), and a pairing holds the passwordless install: it stays *Ready* and the
+  restart watch installs it on its first tick after the overlay closed.
 * **Exec**: `restart::request(Plan { view })`, then `PlatformEvent::Quit`: the window closes the
   normal way (`on_exit`: last screen, GL, `Services::shutdown`), `main` drops the instance lock
   and execs `/usr/bin/tuner [--profile-dir D] [--debug] [--view V]` — same pid, session,
