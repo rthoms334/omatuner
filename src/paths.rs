@@ -99,6 +99,32 @@ impl AppPaths {
             std::fs::create_dir_all(&d).map_err(|e| Error::io(&d, e))?;
             std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).map_err(|e| Error::io(&d, e))?;
         }
+        // no session runs before the service: whatever is here a crash left (the relay's
+        // `<session>/p<n>` directories); entries are never followed through a symlink
+        for root in [self.cast_live_dir(), self.cast_vod_dir()] {
+            for entry in std::fs::read_dir(&root).map_err(|e| Error::io(&root, e))?.flatten() {
+                let gone = match entry.file_type() {
+                    Ok(t) if t.is_dir() => std::fs::remove_dir_all(entry.path()),
+                    _ => std::fs::remove_file(entry.path()),
+                };
+                if let Err(e) = gone {
+                    tracing::debug!("cast: can't sweep a leftover session: {e}");
+                }
+            }
+        }
+        // the dev trace keeps its newest 5 (`cast-<unix time>-<hex>.jsonl` sort by age)
+        let trace = self.cast_trace_dir();
+        let mut files: Vec<_> = std::fs::read_dir(&trace)
+            .map_err(|e| Error::io(&trace, e))?
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .map(|e| e.path())
+            .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("cast-") && n.ends_with(".jsonl")))
+            .collect();
+        files.sort();
+        for old in files.iter().rev().skip(5) {
+            let _ = std::fs::remove_file(old);
+        }
         Ok(())
     }
 
@@ -130,5 +156,42 @@ impl AppPaths {
             std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)).map_err(|e| Error::io(d, e))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Startup sweep (DESIGN §40 §13): a crash's session directories go, the trace keeps its
+    /// newest 5, and nothing outside the casting directories is touched through a symlink.
+    #[test]
+    fn the_cast_sweep_clears_leftovers_and_keeps_five_traces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = AppPaths::rooted(tmp.path());
+        p.ensure_cast_dirs().unwrap();
+        let outside = tmp.path().join("keep");
+        std::fs::create_dir_all(outside.join("inner")).unwrap();
+        std::fs::create_dir_all(p.cast_live_dir().join("ab12/p1")).unwrap();
+        std::fs::write(p.cast_vod_dir().join("stray.ts"), b"x").unwrap();
+        std::os::unix::fs::symlink(&outside, p.cast_vod_dir().join("link")).unwrap();
+        for t in 0..7 {
+            std::fs::write(p.cast_trace_dir().join(format!("cast-170000000{t}-00{t}a.jsonl")), b"{}").unwrap();
+        }
+        std::fs::write(p.cast_trace_dir().join("notes.txt"), b"mine").unwrap();
+
+        p.ensure_cast_dirs().unwrap();
+        let names = |d: PathBuf| {
+            let mut v: Vec<_> = std::fs::read_dir(d).unwrap().flatten().map(|e| e.file_name().into_string().unwrap()).collect();
+            v.sort();
+            v
+        };
+        assert!(names(p.cast_live_dir()).is_empty());
+        assert!(names(p.cast_vod_dir()).is_empty());
+        assert!(outside.join("inner").is_dir(), "a symlink is removed, not followed");
+        let traces = names(p.cast_trace_dir());
+        assert_eq!(traces.len(), 6, "{traces:?}");
+        assert_eq!(traces.first().map(String::as_str), Some("cast-1700000002-002a.jsonl"));
+        assert!(traces.contains(&"notes.txt".to_owned()));
     }
 }
