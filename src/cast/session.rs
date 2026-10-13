@@ -139,7 +139,7 @@ impl Links for RealLinks {
     }
 
     fn relay(&self, cfg: RelayConfig) -> BoxFuture<'static, Result<Relay, CastErrorKind>> {
-        Box::pin(async move { RelaySession::start(cfg).await.map(Relay::Session) })
+        Box::pin(async move { RelaySession::start(cfg).await.map(|r| Relay::Session(Box::new(r))) })
     }
 
     fn detect(&self, port: u16, toward: Ipv4Addr) -> BoxFuture<'static, Detection> {
@@ -191,8 +191,9 @@ pub fn local_toward(peer: Ipv4Addr) -> Option<Ipv4Addr> {
 // ------------------------------------------------------------------ relay dispatch
 
 /// The relay a session drives: enum dispatch like `receiver::Backend` (no `dyn` async trait).
+/// The real session is boxed (as `airplay::Client` is) so the enum stays small.
 pub enum Relay {
-    Session(RelaySession),
+    Session(Box<RelaySession>),
     /// Scripted (session tests).
     #[doc(hidden)]
     Fake(FakeRelay),
