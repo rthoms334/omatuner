@@ -855,6 +855,13 @@ mod tests {
         h.state().t.services().tiles.focused().snapshot()
     }
 
+    /// What the screen draws from (after [`sync`]). A wait checks this, not [`real`]: the
+    /// player can change between the copy and the check, and a wait that passed on the newer
+    /// state left the screen on the older one (the Unmute label then never came).
+    fn shown(h: &H) -> Arc<PlayerSnapshot> {
+        h.state().t.snapshot.clone()
+    }
+
     /// The screen's snapshot: mpv's volume / mute / pause, playing a live channel.
     fn sync(h: &mut H) {
         let mut s = (*real(h)).clone();
@@ -894,7 +901,7 @@ mod tests {
         h.drop_at(c);
         until(&mut h, "volume 65 %", |h| {
             sync(h);
-            real(h).volume == 65.0
+            shown(h).volume == 65.0
         });
         h.hover_at(c);
         h.event(egui::Event::MouseWheel {
@@ -905,13 +912,13 @@ mod tests {
         });
         until(&mut h, "one wheel notch up", |h| {
             sync(h);
-            real(h).volume == 70.0
+            shown(h).volume == 70.0
         });
         assert!(!real(&h).muted);
         h.get_by_label("Mute").click();
         until(&mut h, "muted", |h| {
             sync(h);
-            real(h).muted
+            shown(h).muted
         });
         // the label follows the player's state a frame or more later (slow under a loaded test run)
         until(&mut h, "the speaker says what a click does (Unmute)", |h| has_label(h, "Unmute"));
@@ -920,7 +927,7 @@ mod tests {
         h.drop_at(c);
         until(&mut h, "unmuted at 65 %", |h| {
             sync(h);
-            !real(h).muted && real(h).volume == 65.0
+            !shown(h).muted && shown(h).volume == 65.0
         });
         // half a notch over the video, then a notch over the speaker: the speaker's notch
         // alone counts (the video used to take it too, +10)
@@ -934,7 +941,7 @@ mod tests {
         wheel(&h, egui::MouseWheelUnit::Line, 1.0);
         until(&mut h, "one notch over the speaker", |h| {
             sync(h);
-            real(h).volume >= 70.0
+            shown(h).volume >= 70.0
         });
         h.run_steps(30);
         std::thread::sleep(Duration::from_millis(100));
@@ -1220,7 +1227,7 @@ mod tests {
         h.get_by_label("Play / pause").click();
         until(&mut h, "pause toggled", |h| {
             sync(h);
-            real(h).paused != paused
+            shown(h).paused != paused
         });
         assert_eq!(h.state().s.key_contexts(), vec![KeyContext::PlayerLive]);
     }
