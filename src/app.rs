@@ -5621,6 +5621,10 @@ mod tests {
         rig.frame_with(vec![]);
         rig.press(Key::M, CTRL);
         rig.until("picture B plays", |r| r.app.services().tiles.b().is_some() && !tile_plays(&r.log(), PIC_B).is_empty());
+        // ...and its player says so: a news flash remembers what the picture's snapshot shows,
+        // which lags the command by the player thread (read too early: nothing to put back, the
+        // flash's end closed picture B instead of bringing Bravo back)
+        rig.until("picture B shows it", |r| r.app.mv_snap(PIC_B).is_some_and(|s| s.state != PlayerState::Idle && s.playable.is_some()));
         rig
     }
 

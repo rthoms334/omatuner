@@ -75,6 +75,10 @@ impl Store {
         let mut conn = Connection::open(path)?;
         configure(&conn, false)?;
         migrations::migrate(&mut conn)?;
+        // which build last opened it: an older one quotes it when it refuses this schema (§21.7)
+        if let Err(e) = migrations::record_app_version(&conn) {
+            tracing::warn!("recording the app version in the database: {e}");
+        }
         // rules saved per playlist before the category rule was shared (DESIGN §28.3)
         sources::adopt_legacy_category_filters(&conn)?;
         let writer = Writer::spawn(conn, bus)?;
@@ -314,7 +318,7 @@ mod tests {
         });
         assert!(r.is_err());
         // the open transaction was rolled back and the writer still works
-        let n: i64 = w.blocking(|c| Ok(c.query_row("SELECT count(*) FROM meta", [], |r| r.get(0))?)).unwrap();
+        let n: i64 = w.blocking(|c| Ok(c.query_row("SELECT count(*) FROM meta WHERE key = 'a'", [], |r| r.get(0))?)).unwrap();
         assert_eq!(n, 0);
         // a write submitted before shutdown is executed
         let _ = w.submit(|c| Ok(c.execute("INSERT INTO meta(key,value) VALUES ('b','2')", [])?));
