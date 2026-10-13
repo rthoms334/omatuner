@@ -85,6 +85,13 @@ package() {
   # Opt-in snippets (nothing is written to the user's config): see README "Omarchy integration".
   install -Dm644 packaging/hypr/tuner.lua "$pkgdir/usr/share/tuner/hypr/tuner.lua"
   install -Dm644 packaging/omarchy/omarchy-menu.jsonc "$pkgdir/usr/share/tuner/omarchy/omarchy-menu.jsonc"
+  # Re-arms the reminder timers at every login (DESIGN §36.2), for every account: the package
+  # owns the graphical-session.target.wants/ link (no scriptlet, removed with the package; a
+  # user can `systemctl --user mask` it). pacman's daemon-reload-user hook reloads running user
+  # managers.
+  install -Dm644 packaging/systemd/tuner-rearm.service "$pkgdir/usr/lib/systemd/user/tuner-rearm.service"
+  install -dm755 "$pkgdir/usr/lib/systemd/user/graphical-session.target.wants"
+  ln -s ../tuner-rearm.service "$pkgdir/usr/lib/systemd/user/graphical-session.target.wants/tuner-rearm.service"
   # The Claude Code plugin (its marketplace, the `tuner mcp` server entry, the skills): installed
   # here only. Tuner adds it to Claude Code when the user asks (its first-start card, Settings ▸ AI
   # agents, or `tuner claude-setup`). Nothing is written to the home directory.

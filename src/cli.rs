@@ -3,6 +3,7 @@
 //! ```text
 //! tuner [--view home|live|guide|movies|series|search|settings] [--play <source>:<item-key> [--popout]]
 //!       [--reminder <id>] [--debug] [--profile-dir <dir>] [--refresh] [PLAYLIST_OR_URL...]
+//! tuner --rearm [--debug]                       # re-arm reminder timers at login (DESIGN §36.2)
 //! tuner mcp [--debug] [--profile-dir <dir>]     # MCP server on stdio (DESIGN §30)
 //! ```
 //! A second invocation hands its request to the running instance over the IPC socket and exits
@@ -67,6 +68,11 @@ pub struct Cli {
     #[arg(long)]
     pub refresh: bool,
 
+    /// Re-arm the reminder timers and exit: offline, no window (what the packaged
+    /// tuner-rearm.service runs at every login, DESIGN §36.2). Does nothing while Tuner runs.
+    #[arg(long, conflicts_with_all = ["refresh", "reminder", "play", "view", "inputs"])]
+    pub rearm: bool,
+
     /// M3U/M3U8 files or URLs (desktop MimeType handler `%U`): offered as a new playlist,
     /// or played directly if it is a single stream.
     pub inputs: Vec<String>,
@@ -83,7 +89,8 @@ impl Cli {
                 && self.view.is_none()
                 && self.play.is_none()
                 && self.reminder.is_none()
-                && !self.refresh)
+                && !self.refresh
+                && !self.rearm)
     }
 }
 
@@ -143,5 +150,18 @@ mod tests {
         // `tuner mcp`'s launch for an agent's play: the play itself comes over IPC v2
         let cli = Cli::try_parse_from(["tuner", "--agent-popout"]).unwrap();
         assert!(cli.agent_popout && !cli.popout && !cli.is_mcp());
+    }
+
+    /// What `tuner-rearm.service` runs at login: on its own (with the global flags), never a
+    /// player request or the MCP bridge.
+    #[test]
+    fn rearm_flag_stands_alone() {
+        let cli = Cli::try_parse_from(["tuner", "--rearm"]).unwrap();
+        assert!(cli.rearm && !cli.refresh && !cli.is_mcp());
+        let cli = Cli::try_parse_from(["tuner", "--rearm", "--debug", "--profile-dir", "/p"]).unwrap();
+        assert!(cli.rearm && cli.debug);
+        for not in [&["tuner", "--rearm", "--refresh"][..], &["tuner", "--rearm", "--reminder", "7"], &["tuner", "--rearm", "mcp"]] {
+            assert!(Cli::try_parse_from(not).is_err(), "{not:?}");
+        }
     }
 }

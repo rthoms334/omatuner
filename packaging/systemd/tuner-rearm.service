@@ -1,0 +1,27 @@
+# Re-arms Tuner's reminder timers at every login (DESIGN §36.2). Reminders fire while Tuner is
+# closed through transient `systemd-run --user` timers, which a reboot or logout removes; this
+# puts them back without opening Tuner. Offline and quick: it reads Tuner's database, arms the
+# timers and exits. It does nothing for an account that never started Tuner, while Tuner runs
+# (Tuner arms them itself) or with Settings ▸ Reminders "Fire while Tuner is closed" off.
+#
+# The package enables it for every account through its own
+# graphical-session.target.wants/ link (hence no [Install] section: `systemctl --user
+# is-enabled` says "static"). To turn it off for your account:
+#   systemctl --user mask tuner-rearm.service
+
+[Unit]
+Description=Re-arm Tuner's reminder timers
+Documentation=file:///usr/share/doc/tuner/README.md
+# uwsm reaches graphical-session.target at every login (and stops it at logout), only once the
+# session's WAYLAND_DISPLAY and HYPRLAND_INSTANCE_SIGNATURE are in the user manager's
+# environment. The timers set no session variables of their own: they take the manager's when
+# they fire, so a later re-login never leaves them stale.
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/tuner --rearm
+# It only reads the database and talks to the user manager (systemctl, systemd-run).
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX
+TimeoutStartSec=2min
