@@ -371,6 +371,23 @@ pub fn flush(timeout: Duration) {
     }
 }
 
+/// Put a fatal error in `log_file` as an ERROR line of target `tuner` (redacted) and wait until
+/// it is on disk — without the stderr mirror, which the caller prints itself (DESIGN §21.7).
+/// Through the installed subscriber's writer when there is one (no second handle racing its
+/// rotation), else appended directly (the error came before [`init`], or `init` couldn't open
+/// the file — then this fails quietly too). Never panics: it runs while Tuner is going down.
+pub fn record_fatal(log_file: &Path, message: &str) {
+    let line = LogLine { at: crate::model::now(), level: Level::ERROR, target: "tuner".into(), message: crate::redact::redact(message).into_owned() };
+    if let Some(w) = FILE.get() {
+        w.send(line.to_text());
+        w.flush(Duration::from_secs(1));
+        return;
+    }
+    if let Ok(mut sink) = FileSink::open(log_file, ROTATE_BYTES) {
+        let _ = sink.write_line(&line.to_text()).and_then(|()| sink.flush());
+    }
+}
+
 /// Apply `general.debug_log` to the running subscriber (Settings edit; no restart needed).
 pub fn set_debug(debug: bool) {
     if let Some(f) = FILTER.get() {

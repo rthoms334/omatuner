@@ -445,6 +445,25 @@ Run each item at **Wide** and **Tiled**, at **text 12** and **text 16**, in a **
 These items use the **default** profile: start Tuner from the launcher, not with
 `--profile-dir`.
 
+- [ ] **A failed start is visible** (DESIGN §21.7):
+  - **Do:** quit Tuner. Back up the library:
+    `cp ~/.local/share/tuner/tuner.db /tmp/tuner.db.bak`. Note its version with
+    `sqlite3 ~/.local/share/tuner/tuner.db 'PRAGMA user_version'` (13 for 0.2.x), then set
+    `sqlite3 ~/.local/share/tuner/tuner.db 'PRAGMA user_version=99'`. Start Tuner from
+    Super+Space → Apps. Afterwards put the version back
+    (`sqlite3 ~/.local/share/tuner/tuner.db 'PRAGMA user_version=13'`) and start Tuner again.
+  - **Expect:**
+    - No window. A notification *Tuner couldn't start* says "Your library was last opened by
+      Tuner ‹this version› (database version 99; this is 13). Install Tuner ‹this version›
+      again, or a newer one." (the version this build recorded in the database), and it shows
+      no address or password.
+    - `~/.local/state/tuner/tuner.log` ends with `ERROR tuner: Tuner exits: database schema v99
+      is newer than this build (v13), last opened by Tuner ‹version›; refusing to open`.
+    - Before putting the version back, `dbus-run-session -- tuner` in a terminal (a session
+      bus without a notification server) prints `Error: database schema v99 …`, adds the log
+      line and exits 1 (`echo $?`) after at most a few seconds, without a panic.
+    - After putting the version back, Tuner opens with the library unchanged.
+
 - [ ] **Media keys and MPRIS:**
   - **Do:** while playing, check `busctl --user list | grep mpris` and `playerctl -p tuner
     metadata`. Then use the Omarchy media keys (play/pause, next, previous), also with Tuner

@@ -36,14 +36,19 @@ pub fn latest_version() -> i64 {
     MIGRATIONS.len() as i64
 }
 
-/// Apply pending migrations. Refuses to open a DB newer than this binary.
+/// `meta` key holding the Tuner version that last opened the database for writing
+/// ([`record_app_version`]). Not a schema change: `meta` exists since v1, so every build from
+/// this one on writes it and every build reads it when it refuses a newer schema (DESIGN
+/// §21.7). Keep writing it in future builds — it is what an older build quotes to the user.
+pub const APP_VERSION_KEY: &str = "app_version";
+
+/// Apply pending migrations. Refuses to open a DB newer than this binary
+/// ([`Error::NewerSchema`](crate::error::Error::NewerSchema), naming the version that last
+/// opened it when it recorded one).
 pub fn migrate(conn: &mut Connection) -> Result<()> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if current > latest_version() {
-        return Err(crate::error::Error::Config(format!(
-            "database schema v{current} is newer than this build (v{}); refusing to open",
-            latest_version()
-        )));
+        return Err(crate::error::Error::NewerSchema { found: current, supported: latest_version(), opened_by: recorded_app_version(conn) });
     }
     reconcile_renumbered(conn, current)?;
     for (i, (name, sql)) in MIGRATIONS.iter().enumerate().skip(current as usize) {
@@ -55,6 +60,29 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
         tx.commit()?;
     }
     Ok(())
+}
+
+/// Note this build's version as the one that last opened the database
+/// ([`APP_VERSION_KEY`]); written only when it changed, so a normal start costs one read.
+pub fn record_app_version(conn: &Connection) -> Result<()> {
+    let me = env!("CARGO_PKG_VERSION");
+    if recorded_app_version(conn).as_deref() != Some(me) {
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![APP_VERSION_KEY, me],
+        )?;
+    }
+    Ok(())
+}
+
+/// The recorded [`APP_VERSION_KEY`], if any and if it looks like a version (it ends up in a
+/// desktop notification: a damaged or odd value is dropped, never quoted). Best effort: a
+/// database too new or too damaged to read it gives `None`.
+fn recorded_app_version(conn: &Connection) -> Option<String> {
+    use rusqlite::OptionalExtension;
+    let v: String = conn.query_row("SELECT value FROM meta WHERE key = ?1", [APP_VERSION_KEY], |r| r.get(0)).optional().ok()??;
+    let plausible = !v.is_empty() && v.len() <= 32 && v.bytes().all(|b| b.is_ascii_alphanumeric() || b".+-_".contains(&b));
+    plausible.then_some(v)
 }
 
 /// `user_version` is positional, so a database from a pre-merge build of the quality-badges
@@ -348,6 +376,32 @@ mod tests {
         c.execute_batch("PRAGMA foreign_keys=ON").unwrap();
         migrate(&mut c).unwrap();
         c
+    }
+
+    /// Incident 0.2.6: a database from a newer dev build (v14) was refused with a bare
+    /// "config error". The refusal stays, now typed, and names the version that last opened it
+    /// when that one recorded it (an implausible value is never quoted).
+    #[test]
+    fn a_newer_schema_is_refused_naming_the_build_that_opened_it() {
+        let mut c = fresh();
+        record_app_version(&c).unwrap();
+        assert_eq!(recorded_app_version(&c).as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        let newer = latest_version() + 1;
+        c.pragma_update(None, "user_version", newer).unwrap();
+        c.execute("UPDATE meta SET value = '9.1.0' WHERE key = ?1", [APP_VERSION_KEY]).unwrap();
+        match migrate(&mut c) {
+            Err(crate::error::Error::NewerSchema { found, supported, opened_by }) => {
+                assert_eq!((found, supported, opened_by.as_deref()), (newer, latest_version(), Some("9.1.0")));
+            }
+            other => panic!("{other:?}"),
+        }
+        let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, newer, "nothing was touched");
+        // a build from before the record, or a value that isn't a version
+        c.execute("UPDATE meta SET value = 'http://h.tv/live/u/p/1.ts' WHERE key = ?1", [APP_VERSION_KEY]).unwrap();
+        let err = migrate(&mut c).unwrap_err();
+        assert!(matches!(err, crate::error::Error::NewerSchema { opened_by: None, .. }), "{err:?}");
+        assert_eq!(err.to_string(), format!("database schema v{newer} is newer than this build (v{}); refusing to open", latest_version()));
     }
 
     #[test]

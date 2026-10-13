@@ -18,8 +18,14 @@
 //! a reboot or logout removed and exits (`reminders::arming::rearm_at_login`, DESIGN §36.2):
 //! offline, no window, no player. It takes the instance lock like `--refresh` (a running Tuner,
 //! or a refresh, arms them itself: exit 0) and exits 1 only when systemd refused.
+//!
+//! A fatal error (exit status 1) goes to stderr, to `tuner.log` once the profile is known, and
+//! — for a launch that would open a window, until it is up — to a desktop notification "Tuner
+//! couldn't start" in plain words: from the launcher nobody reads stderr
+//! (`platform::startup`, DESIGN §21.7).
 
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -35,6 +41,7 @@ use tuner::jobs::{JobContext, JobEvent, JobKind, JobManager};
 use tuner::model::JobId;
 use tuner::msg::{AppEvent, EventBus};
 use tuner::paths::AppPaths;
+use tuner::platform::startup::{Fatal, WindowError};
 use tuner::services::Services;
 use tuner::sources::http::HttpClient;
 use tuner::store::Store;
@@ -48,15 +55,30 @@ const REFRESH_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// such as provider EPG → RebuildLibrary are submitted around their parent's end).
 const REFRESH_SETTLE: Duration = Duration::from_millis(500);
 
-fn main() -> anyhow::Result<()> {
+fn main() -> ExitCode {
     tuner::platform::limit_malloc_arenas();
     let cli = Cli::parse();
+    let mut fatal = Fatal::default();
+    match run(cli, &mut fatal) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            fatal.report(&e);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Everything `main` does; `fatal` learns on the way where an error of this run is reported
+/// (stderr only, then also the log, and the desktop for a windowed launch).
+fn run(cli: Cli, fatal: &mut Fatal) -> anyhow::Result<()> {
     // prints (or, with --apply and a "y", runs) the Claude Code setup; touches no profile
     if let Some(tuner::cli::Command::ClaudeSetup { apply }) = cli.command {
         return tuner::agent::setup::main(apply);
     }
-    // developer-only screenshot capture (DESIGN §23.1); a typo fails here, not after a minute
-    let devshot = tuner::devshot::ShotConfig::from_env().map_err(|e| anyhow::anyhow!("TUNER_SCREENSHOT*: {e}"))?;
+    // a launch that opens a window (or shows a closed reminder's note) says on the desktop when
+    // it can't: started from the launcher, nobody reads stderr. Not the headless runs (their
+    // journal has stderr; the next window launch says it) nor the MCP bridge (its client does).
+    fatal.notify_desktop(cli.command.is_none() && !cli.refresh && !cli.rearm && !cli.is_mcp());
     let paths = match &cli.profile_dir {
         Some(dir) => AppPaths::rooted(dir),
         None => AppPaths::from_env()?,
@@ -71,6 +93,9 @@ fn main() -> anyhow::Result<()> {
     if cli.rearm && !paths.db_file().exists() {
         return Ok(());
     }
+    fatal.log_to(paths.log_file());
+    // developer-only screenshot capture (DESIGN §23.1); a typo fails here, not after a minute
+    let devshot = tuner::devshot::ShotConfig::from_env().map_err(|e| anyhow::anyhow!("TUNER_SCREENSHOT*: {e}"))?;
     let (config, config_err) = match Config::load(&paths.config_file()) {
         Ok(c) => (c, None),
         Err(e) => (Config::default(), Some(e)),
@@ -124,14 +149,8 @@ fn main() -> anyhow::Result<()> {
         reminder: cli.reminder,
     };
     // held until the process exits: the database has one owner
-    let primary = become_primary(&paths, &request, HANDOFF_WAIT);
-    if let Err(e) = &primary
-        && e.is::<RefreshRunning>()
-    {
-        // launched from the desktop, nobody reads stderr
-        tuner::platform::notify::notify(tuner::APP_NAME, &e.to_string(), false);
-    }
-    let Some(instance) = primary? else {
+    // a refresh holding the lock, an instance that doesn't answer: `fatal` tells the desktop
+    let Some(instance) = become_primary(&paths, &request, HANDOFF_WAIT)? else {
         return Ok(());
     };
     // a reminder's systemd timer fired while Tuner was closed (B6): show its note from here,
@@ -209,6 +228,8 @@ fn main() -> anyhow::Result<()> {
         tuner::APP_NAME,
         options,
         Box::new(move |cc| {
+            // the window exists: a later error is no failed start (no notification)
+            tuner::platform::startup::window_up();
             // The bus was created before the window; attaching the context here makes every
             // clone (player, jobs, store writer) wake the UI when it sends.
             bus.attach_egui(cc.egui_ctx.clone());
@@ -222,7 +243,7 @@ fn main() -> anyhow::Result<()> {
             Ok(Box::new(app))
         }),
     )
-    .map_err(|e| anyhow::anyhow!("window: {e}"))?;
+    .map_err(|e| WindowError(e.to_string()))?;
     Ok(())
 }
 
@@ -496,7 +517,7 @@ mod tests {
         let refresh = refresh_lock(&paths).expect("nothing running");
         assert!(refresh_lock(&paths).is_none(), "one refresh at a time");
         let req = IpcRequest::default();
-        // the type picks the desktop notification
+        // its text is the desktop notification (`platform::startup`)
         let err = become_primary(&paths, &req, Duration::from_millis(200)).unwrap_err();
         assert!(err.is::<RefreshRunning>() && err.to_string().contains("background refresh"), "{err}");
         drop(refresh);

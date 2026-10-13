@@ -1500,6 +1500,18 @@ is; otherwise the timers come back the next time Tuner starts.
 
 ## Troubleshooting
 
+- **Tuner doesn't open:** when it can't start, a notification *Tuner couldn't start* says why
+  and what to do, and `~/.local/state/tuner/tuner.log` ends with an `ERROR tuner: Tuner exits:`
+  line. Running `tuner` in a terminal prints the same reason.
+  - *"Your library was last opened by a newer Tuner"*: a newer version (or a development build)
+    upgraded your library database, and this one can't read it. Tuner refuses rather than risk
+    your data. Install that version again, or a newer one (the message names it when it knows).
+  - *"Your library file (tuner.db) is damaged"*: quit Tuner, move
+    `~/.local/share/tuner/tuner.db` (with its `-wal` and `-shm` files) aside, start Tuner again
+    and restore a backup in Settings ▸ Backup if you made one.
+  - *"…libmpv couldn't start"*: reinstall `mpv` (`sudo pacman -S mpv`).
+  - *"…couldn't open its window"*: start it from your desktop session, not over SSH or a TTY.
+  - No notification at all: check the log file above, or run `tuner` in a terminal.
 - **Logs:** open them with Settings ▸ About & logs ▸ *Open the log viewer*.
   - Type to filter. Ctrl+S sets the minimum level or exports the log (*Export…*).
   - The same page has *Export log…*. The file is `~/.local/state/tuner/tuner.log`.

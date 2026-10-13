@@ -293,6 +293,8 @@ creation callback (GL current): join fonts/theme threads → LoadedFonts::instal
 ```
 First frame target: < 300 ms after launch regardless of library size (library loads async;
 measured by WP-13 with a 100k-channel DB).
+An error that ends `main` (exit status 1) is reported on stderr, in `tuner.log` and — while a
+windowed launch has no window yet — as a desktop notification (§21.7).
 
 Shutdown (`on_exit`): `VideoSurface::destroy` (GL current: render ctx, then FBO) →
 `Services::shutdown`: integrations stop → `jobs.cancel_all` → `Player::shutdown` (Stop → final
@@ -3122,6 +3124,52 @@ for any window. Tuner does it for itself with `o` in the player or Ctrl+Shift+O 
   like Hyprland in either syntax, and the app takes a recording `PopOutBackend`.
 * A popped-out window is always visible, so its playback never meets the hidden-workspace
   limits of §11.1.
+
+### 21.7 Startup failures (`platform/startup.rs`)
+Tuner starts from the launcher (uwsm / `gtk-launch`): stderr goes nowhere. In 0.2.6 a database
+left at schema v14 by a dev build was refused with one stderr line and exit 1 — nothing on
+screen, nothing in the log (the error was printed by `main`'s return, never logged), so the
+release looked broken. Now `main` runs everything in `run` and hands an error to
+`startup::Fatal::report`, which says it three ways and exits 1:
+* **stderr** — `Error: …` with the cause chain, as before (redacted).
+* **`tuner.log`** — `ERROR tuner: Tuner exits: …` through `logging::record_fatal`: the
+  subscriber's writer (flushed) once logging is up, else appended directly. Known as soon as
+  the profile's paths are; an error before that (no `$HOME`) has stderr and the desktop only.
+* **A desktop notification** (critical, `platform::notify`, redacted): title *Tuner couldn't
+  start*, body `startup::user_message` — the reason in plain words and what to do. Known causes
+  anywhere in the chain have their own words: a newer schema (below), a damaged, busy,
+  read-only database or a full disk (`rusqlite` error codes), a profile folder it can't use
+  (`Error::Io`), libmpv failing to initialise (`Error::Mpv`), no window
+  (`startup::WindowError`: no display, no GL); anything else (a background refresh holding the
+  instance lock, an instance that doesn't answer, a refused handoff) is its own message as a
+  sentence. Only for launches that would open a window or show a closed reminder's note — not
+  `--refresh` / `--rearm` (systemd's journal has stderr; the next window launch says it) nor
+  `tuner mcp` (its client reads stderr; it touches neither the log nor the desktop) — and only
+  until eframe's creation callback ran (`startup::window_up`): a winit error at logout is no
+  failed start. No notification server: nothing more happens, reporting never panics.
+
+**Newer schema.** The refusal stays (opening it would lose data); it is typed
+(`Error::NewerSchema { found, supported, opened_by }`). Every `Store::open` records its build in
+`meta.app_version` (`migrations::record_app_version`, written only when it changed; `meta` exists
+since v1, so no schema bump) and the refusal reads it back, quoting it only if it looks like a
+version. Body: "Your library was last opened by Tuner 0.3.0 (database version 14; this is 13).
+Install Tuner 0.3.0 again, or a newer one." — or "…by a newer Tuner…" / "Install that version
+again, or a newer one." for databases written before the record existed. Future builds must
+keep writing the key.
+
+**Not covered:** a missing `libmpv.so` fails in the dynamic loader before `main` (the package
+depends on `mpv`); a panic keeps Rust's report on stderr (a panic hook would also fire for the
+panics the store writer and services catch on purpose).
+
+**Auto-update (on `feat/auto-update`, not on `main` yet):** its restart re-execs
+`/usr/bin/tuner` in the same process (`update::restart::exec`), so nothing old is left to watch
+the new build: a failed start after an update goes through this same path and notifies. When
+that branch lands, `run` should read its restart marker before anything can fail and, with one
+present, word the notification "Tuner was updated to ‹version› but couldn't start: ‹reason›"
+plus how to go back (`sudo pacman -U` the previous package from pacman's cache); the old
+process reports an `exec` that itself fails through `Fatal` as well. Never roll back
+automatically: the new build may already have migrated the database, and the older one would
+then refuse it (naming the newer version, thanks to `meta.app_version`).
 
 ---
 

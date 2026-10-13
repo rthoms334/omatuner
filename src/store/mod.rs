@@ -75,6 +75,10 @@ impl Store {
         let mut conn = Connection::open(path)?;
         configure(&conn, false)?;
         migrations::migrate(&mut conn)?;
+        // which build last opened it: an older one quotes it when it refuses this schema (§21.7)
+        if let Err(e) = migrations::record_app_version(&conn) {
+            tracing::warn!("recording the app version in the database: {e}");
+        }
         // rules saved per playlist before the category rule was shared (DESIGN §28.3)
         sources::adopt_legacy_category_filters(&conn)?;
         let writer = Writer::spawn(conn, bus)?;
