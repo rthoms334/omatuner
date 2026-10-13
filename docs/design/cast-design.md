@@ -1455,7 +1455,11 @@ The residual risk is a LAN host that spoofs the TV's IP and also has the token. 
   | `Unknown { why }` | firewalld active, nftables only, or the files unreadable | "Can't tell (firewalld)" etc. |
 
 - It also returns `tagged`: every tuple whose comment decodes to `omatuner cast`. These are used for Remove and to spot rules for another interface or subnet.
-- It runs on the runtime, because it spawns `systemctl`. The result is cached for 5 s and re-run on Check again, after Allow or Remove, and at each session start.
+- It runs on the runtime, because it spawns `systemctl`. The result is cached for 5 s per address it was made toward, and re-run on Check again, after Allow or Remove, and at each session start.
+- **Toward which TV.** ufw rules are scoped by source (`from 192.168.1.0/24`, or one host), so a detection answers for the TV it was made toward and no other. Every `Detection` carries its `toward`, and `Detection::state_for(tv)` answers only when that is the TV's own address and a network toward it was found.
+  - "The TV" for Settings, the firewall card and Allow (`CastApi::firewall()`) is the one asked about or cast to last, else the default TV, else any TV on the network.
+  - With no TV known, detection goes toward the mDNS group (224.0.0.251) for the LAN's route. That address never sends the flow, so a LAN-scoped rule can't match it and the DROP policy would say `Blocked` for a port the TVs reach. Toward an address that isn't a host, a block is `Unknown { NoTv }` ("Can't tell until Tuner finds a TV"); a covering unscoped allow still counts.
+  - Anything that refuses or holds a cast before a session judges by a fresh detection toward the TV's own address (`CastApi::firewall_for`): the agent's gate (§12) and the wizard's Network step. A detection toward another address, the mDNS group or no route never refuses. This was a real refusal (2026-10-13): an agent's cast to the Apple TV at 192.168.1.5 was refused with `cast-firewall` from a detection made toward 224.0.0.251 before any cast, while Tuner's own tagged rule allowed the TV.
 - The files show what is configured, not what is loaded. A hand-flushed ruleset is invisible, so the end-to-end check stays the truth.
 
 **End-to-end check**
@@ -1629,6 +1633,7 @@ sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=1
   - `pin_required`: a locked item. The PIN is asked on Tuner's screen as today, raising the window (§30.13 step 2). Nothing is cast before the unlock.
   - `pairing_required`: "Pair Living Room in Tuner (Settings ▸ Cast)". Agents never pair; no tool takes a PIN.
   - `unavailable`, with a typed reason: `cast-unreachable`, `cast-firewall`, `cast-unsupported` or `multiview-on`.
+  - `cast-firewall` only from a fresh detection made toward that TV's own address (`firewall_for`, waited for up to 1 s), which says `Blocked` (§9.4 "Toward which TV"). No detection in time, an unknown state, or one made toward another address blocks nothing: the session's 10 s fetch check is the authority for a real block.
 - **Tuner not running.** The bridge starts Tuner's window, as for any play that doesn't open in the pop-out (§30.13). It never uses `--agent-popout` for a cast.
 - **Bridge (`agent/mcp.rs`).** Unlike `open_in`, `device` must **not** be retried without the field on an older Tuner. Playing locally instead would be wrong. The bridge returns "The running Tuner can't cast; update Tuner".
 

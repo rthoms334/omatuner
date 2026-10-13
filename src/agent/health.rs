@@ -78,6 +78,7 @@ fn firewall_name(s: FirewallState) -> &'static str {
         FirewallState::Unknown { why: UnknownWhy::Firewalld } => "unknown_firewalld",
         FirewallState::Unknown { why: UnknownWhy::Nftables } => "unknown_nftables",
         FirewallState::Unknown { why: UnknownWhy::Unreadable } => "unknown_unreadable",
+        FirewallState::Unknown { why: UnknownWhy::NoTv } => "unknown_no_tv",
     }
 }
 

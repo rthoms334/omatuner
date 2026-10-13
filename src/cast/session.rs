@@ -177,9 +177,9 @@ impl Links for NullLinks {
         Box::pin(async { Err(CastErrorKind::Unsupported) })
     }
 
-    fn detect(&self, port: u16, _toward: Ipv4Addr) -> BoxFuture<'static, Detection> {
+    fn detect(&self, port: u16, toward: Ipv4Addr) -> BoxFuture<'static, Detection> {
         let unknown = FirewallState::Unknown { why: firewall::UnknownWhy::Unreadable };
-        Box::pin(async move { Detection { state: unknown, ufw: false, pkexec: false, net: None, tagged: Vec::new(), port } })
+        Box::pin(async move { Detection { state: unknown, toward, ufw: false, pkexec: false, net: None, tagged: Vec::new(), port } })
     }
 
     fn firewall(&self, _verb: Verb, _rule: Rule, _cancel: CancellationToken) -> BoxFuture<'static, AllowOutcome> {

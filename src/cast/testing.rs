@@ -122,6 +122,11 @@ impl CastApi for FakeCast {
     fn firewall(&self) -> Option<firewall::Detection> {
         self.read(|s| s.firewall.clone())
     }
+    /// The scripted detection, whatever its `toward`: the code under test must check that it
+    /// was made toward the TV ([`firewall::Detection::state_for`]).
+    fn firewall_for(&self, _device: DeviceId) -> Option<firewall::Detection> {
+        self.read(|s| s.firewall.clone())
+    }
     fn firewall_check(&self) {
         self.call(FakeCall::FirewallCheck);
     }

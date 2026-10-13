@@ -424,6 +424,7 @@ mod tests {
     fn detection(state: FirewallState, tagged: Vec<Rule>) -> Detection {
         Detection {
             state,
+            toward: Ipv4Addr::new(192, 168, 1, 5),
             ufw: true,
             pkexec: true,
             net: Some(LanNet { iface: "wlan0".into(), addr: Ipv4Addr::new(192, 168, 1, 88), prefix: 24 }),

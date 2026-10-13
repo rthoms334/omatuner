@@ -11,7 +11,7 @@ use super::proto::{
 };
 use super::query::{Fail, Out, Q, channel_ref, clean, parse_ref, when};
 use super::{AgentCommand, AgentPlay, PlayTarget};
-use crate::cast::firewall::FirewallState;
+use crate::cast::firewall::{Detection, FirewallState};
 use crate::cast::{Device, Pairing, Protocol};
 use crate::jobs::JobKind;
 use crate::model::{
@@ -184,9 +184,19 @@ pub const REASON_MULTIVIEW: &str = "multiview-on";
 /// Whether a cast to `d` can start now, before the item is looked at (DESIGN §40 §12): multi-view
 /// is off, the TV is one Phase 1 casts to (an Apple-made or third-party AirPlay TV that isn't a
 /// Mac, nor "Same Home only"), it is paired, Tuner has seen it, and the firewall isn't known to
-/// block the port. `firewall`: the latest detection's state, only when it was made toward a
-/// network (an unknown one blocks nothing here: the session's own check still reports it).
-pub fn cast_gate(d: &Device, multiview: bool, firewall: Option<FirewallState>) -> CastGate {
+/// block the port *for this TV*.
+///
+/// `firewall` counts only when it was made toward `d`'s own address and found the network
+/// toward it ([`Detection::state_for`]): ufw rules are scoped by source (`from 192.168.1.0/24`),
+/// so a detection toward the mDNS group or another TV says nothing about this one (§9.4
+/// "Toward which TV"; a real TV was refused on one). Anything else, and an unknown state, blocks
+/// nothing here: the session's own check (the TV never fetched) is the authority.
+pub fn cast_gate(d: &Device, multiview: bool, firewall: Option<&Detection>) -> CastGate {
+    let toward = d.addr().and_then(|a| match a.ip() {
+        std::net::IpAddr::V4(v4) => Some(v4),
+        std::net::IpAddr::V6(_) => None,
+    });
+    let firewall = firewall.zip(toward).and_then(|(f, tv)| f.state_for(tv));
     let phase_one = d.protocol == Protocol::AirPlay && matches!(d.kind, ReceiverKind::AppleTv | ReceiverKind::AirPlayTv);
     if multiview {
         CastGate::Refused(REASON_MULTIVIEW)
@@ -850,19 +860,37 @@ mod tests {
         assert_eq!(opened_in(kept, fullscreen), OpenedIn::Window);
     }
 
+    /// "Living Room" at 192.168.1.5 (the user's Apple TV), as the registry has it.
     fn tv(name: &str, pairing: Pairing) -> Device {
-        Device { pairing, ..Device::new(DeviceId::derive("airplay", name), name, ReceiverKind::AppleTv, Protocol::AirPlay) }
+        let at = std::net::SocketAddr::from((LIVING_ROOM, 7000));
+        Device { pairing, ..Device::new(DeviceId::derive("airplay", name), name, ReceiverKind::AppleTv, Protocol::AirPlay).at(at) }
+    }
+
+    const LIVING_ROOM: std::net::Ipv4Addr = std::net::Ipv4Addr::new(192, 168, 1, 5);
+
+    /// This computer on the user's Wi-Fi.
+    fn wlan0() -> crate::cast::firewall::LanNet {
+        crate::cast::firewall::LanNet { iface: "wlan0".into(), addr: std::net::Ipv4Addr::new(192, 168, 1, 20), prefix: 24 }
+    }
+
+    /// A detection with `state`, made toward `toward` on the user's Wi-Fi.
+    fn det(state: FirewallState, toward: std::net::Ipv4Addr) -> Detection {
+        Detection { state, toward, ufw: true, pkexec: true, net: Some(wlan0()), tagged: Vec::new(), port: 47800 }
     }
 
     /// DESIGN §40 §12: what stops a cast before the item is looked at, in the order an agent
-    /// can act on it: multi-view, a TV Phase 1 can't cast to, pairing, a TV not seen, a blocked
-    /// firewall. An unknown firewall blocks nothing here.
+    /// can act on it: multi-view, a TV Phase 1 can't cast to, pairing, a TV not seen, a firewall
+    /// that blocks this TV. An unknown firewall blocks nothing here.
     #[test]
     fn a_cast_is_gated_in_the_order_an_agent_can_act_on() {
         use crate::cast::Usability;
         use crate::cast::firewall::UnknownWhy;
         let paired = tv("Living Room", Pairing::Paired(crate::cast::PairVariant::Hkp3));
-        let blocked = Some(FirewallState::Blocked { shadowed: false });
+        let blocked = det(FirewallState::Blocked { shadowed: false }, LIVING_ROOM);
+        let blocked = Some(&blocked);
+        let allowed = det(FirewallState::Allowed { ours: true }, LIVING_ROOM);
+        let unknown = det(FirewallState::Unknown { why: UnknownWhy::Nftables }, LIVING_ROOM);
+        let shadowed = det(FirewallState::Blocked { shadowed: true }, LIVING_ROOM);
         let mac = Device { usability: Usability::Mac, ..paired.clone() };
         let home_only = Device { usability: Usability::HomeOnly, ..paired.clone() };
         let chromecast = Device { kind: ReceiverKind::Chromecast, protocol: Protocol::GoogleCast, ..paired.clone() };
@@ -870,8 +898,8 @@ mod tests {
         let unpaired = Device { pairing: Pairing::Required, ..unseen.clone() };
         let cases = [
             (&paired, false, None, CastGate::Go),
-            (&paired, false, Some(FirewallState::Allowed { ours: true }), CastGate::Go),
-            (&paired, false, Some(FirewallState::Unknown { why: UnknownWhy::Nftables }), CastGate::Go),
+            (&paired, false, Some(&allowed), CastGate::Go),
+            (&paired, false, Some(&unknown), CastGate::Go),
             (&tv("No pairing", Pairing::NotNeeded), false, None, CastGate::Go),
             (&paired, true, blocked, CastGate::Refused("multiview-on")),
             (&mac, false, None, CastGate::Refused("cast-unsupported")),
@@ -880,7 +908,7 @@ mod tests {
             (&unpaired, false, blocked, CastGate::PairingRequired),
             (&unseen, false, blocked, CastGate::Refused("cast-unreachable")),
             (&paired, false, blocked, CastGate::Refused("cast-firewall")),
-            (&paired, false, Some(FirewallState::Blocked { shadowed: true }), CastGate::Refused("cast-firewall")),
+            (&paired, false, Some(&shadowed), CastGate::Refused("cast-firewall")),
         ];
         for (d, multiview, firewall, want) in cases {
             assert_eq!(cast_gate(d, multiview, firewall), want, "{d:?} multiview {multiview} {firewall:?}");
@@ -889,6 +917,60 @@ mod tests {
         let f = refusal("cast-firewall");
         assert_eq!(f.code, ErrorCode::Unavailable);
         assert!(f.message.starts_with("cast-firewall: ") && f.message.contains("Allow on firewall"), "{}", f.message);
+    }
+
+    /// The real-TV refusal of 2026-10-13 (DESIGN §40 §9.4 "Toward which TV"): the user's ufw
+    /// allows 47800 from 192.168.1.0/24 on wlan0 (Tuner's tagged rule) under a DROP policy, and
+    /// an agent's cast to the Apple TV at 192.168.1.5 was refused with `cast-firewall` because
+    /// the cached detection had been made toward the mDNS group, before any cast. Only a
+    /// detection made toward the TV itself may refuse it; toward the TV these rules allow it.
+    #[test]
+    fn the_firewall_is_judged_toward_the_tv_not_toward_another_address() {
+        use crate::cast::firewall::{UnknownWhy, assess};
+        // the tuples of the user's /etc/ufw/user.rules, verbatim
+        let rules = "\
+### tuple ### allow udp 53317 0.0.0.0/0 any 0.0.0.0/0 in
+### tuple ### allow tcp 53317 0.0.0.0/0 any 0.0.0.0/0 in
+### tuple ### allow udp 53 172.17.0.1 any 172.16.0.0/12 in comment=616c6c6f772d646f636b65722d646e73
+### tuple ### allow udp 53 172.17.0.1 any 192.168.0.0/16 in comment=616c6c6f772d646f636b65722d646e73
+### tuple ### allow tcp 47800 0.0.0.0/0 any 192.168.1.0/24 in_wlan0 comment=6f6d6174756e65722063617374
+";
+        let drop = crate::cast::firewall::input_policy_blocks("DEFAULT_INPUT_POLICY=\"DROP\"\n");
+        assert!(drop);
+        let paired = tv("Living Room", Pairing::Paired(crate::cast::PairVariant::Hkp5));
+        let judged = |toward| {
+            let (state, _) = assess(rules, drop, &wlan0(), toward, 47800);
+            det(state, toward)
+        };
+
+        // toward the TV: Tuner's own rule covers it
+        let at_tv = judged(LIVING_ROOM);
+        assert_eq!(at_tv.state, FirewallState::Allowed { ours: true });
+        assert_eq!(at_tv.state_for(LIVING_ROOM), Some(FirewallState::Allowed { ours: true }));
+        assert_eq!(cast_gate(&paired, false, Some(&at_tv)), CastGate::Go);
+
+        // toward the mDNS group (no TV known yet): can't tell, never "blocked"
+        let mdns = judged(std::net::Ipv4Addr::new(224, 0, 0, 251));
+        assert_eq!(mdns.state, FirewallState::Unknown { why: UnknownWhy::NoTv });
+        assert_eq!(mdns.state_for(LIVING_ROOM), None);
+        assert_eq!(cast_gate(&paired, false, Some(&mdns)), CastGate::Go);
+        // …and a "blocked" made toward it (as before this fix) still doesn't refuse the TV
+        let old = det(FirewallState::Blocked { shadowed: false }, std::net::Ipv4Addr::new(224, 0, 0, 251));
+        assert_eq!(cast_gate(&paired, false, Some(&old)), CastGate::Go);
+
+        // toward a TV on another subnet: blocked for that TV, which says nothing about this one
+        let elsewhere = judged(std::net::Ipv4Addr::new(10, 0, 0, 7));
+        assert_eq!(elsewhere.state, FirewallState::Blocked { shadowed: false });
+        assert_eq!(elsewhere.state_for(LIVING_ROOM), None);
+        assert_eq!(cast_gate(&paired, false, Some(&elsewhere)), CastGate::Go);
+
+        // toward the TV with no network found (no route): nothing to judge by
+        let no_route = Detection { net: None, ..det(FirewallState::Blocked { shadowed: false }, LIVING_ROOM) };
+        assert_eq!(cast_gate(&paired, false, Some(&no_route)), CastGate::Go);
+        // the same rules without Tuner's: blocked toward the TV itself, and that refuses
+        let without: String = rules.lines().filter(|l| !l.contains("47800")).map(|l| format!("{l}\n")).collect();
+        let (state, _) = assess(&without, drop, &wlan0(), LIVING_ROOM, 47800);
+        assert_eq!(cast_gate(&paired, false, Some(&det(state, LIVING_ROOM))), CastGate::Refused("cast-firewall"));
     }
 
     /// `device` is a `device:<hex>` ref or an exact name; a name two TVs share is not guessed.

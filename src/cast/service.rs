@@ -17,15 +17,18 @@
 //!   refuses HKP 3, or on **Show a new code**. The identity is created by the first pairing.
 //! * **Sessions**: one at a time ([`Session`], `session.rs`); a new cast or the end of Test on
 //!   TV waits until the previous one let go of the TV and the media port.
-//! * **Firewall**: detection cached ≤ 5 s (re-run on Check again, after Allow / Remove and at
-//!   each session start); Allow / Remove run through pkexec with a cancel token that shutdown
-//!   also cancels (killing pkexec closes polkit's dialog).
+//! * **Firewall**: detections cached ≤ 5 s per address toward which they were made (re-run on
+//!   Check again, after Allow / Remove and at each session start). ufw rules are scoped by
+//!   source, so a TV is only ever judged by a detection made toward its own address
+//!   ([`CastApi::firewall_for`]); [`CastApi::firewall`] answers for "the TV" (the one asked
+//!   about or cast to last, else the default…). Allow / Remove run through pkexec with a cancel
+//!   token that shutdown also cancels (killing pkexec closes polkit's dialog).
 //!
 //! Settings: every `[cast]` value is read live (a cast picks up a change at its next load,
 //! §11.3), so the service restarts only when `cast.enabled` flips; a restart for any other
 //! field would end the cast that's playing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -57,6 +60,9 @@ use crate::store::{Store, Writer};
 
 /// A firewall detection is reused this long (DESIGN §40 §9.4).
 const FIREWALL_CACHE: Duration = Duration::from_secs(5);
+/// A detection toward an address nobody asked about for this long is dropped (the cache holds
+/// one per TV, plus the mDNS group).
+const FIREWALL_KEEP: Duration = Duration::from_secs(600);
 /// A TV discovery saw this recently needs no refresh before a cast.
 const SEEN_FRESH: Duration = Duration::from_secs(60);
 /// How long stopping waits for the session to let go (inside the runtime's 2 s budget).
@@ -69,6 +75,14 @@ pub const TRACE_KEEP: usize = 5;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// An IPv4 address (Phase 1 casts over IPv4 only).
+fn v4(a: Option<SocketAddr>) -> Option<Ipv4Addr> {
+    match a?.ip() {
+        IpAddr::V4(ip) => Some(ip),
+        IpAddr::V6(_) => None,
+    }
 }
 
 /// What the service runs with.
@@ -240,13 +254,24 @@ struct BrowseState {
     until: Option<Instant>,
 }
 
+/// The firewall's state: detections by the address they were made toward (DESIGN §40 §9.4
+/// "Toward which TV"), the one running per address, and the Allow / Remove job.
 #[derive(Default)]
 struct FirewallCache {
-    det: Option<Detection>,
-    at: Option<Instant>,
-    refreshing: bool,
+    dets: HashMap<Ipv4Addr, (Detection, Instant)>,
+    refreshing: HashSet<Ipv4Addr>,
+    /// The TV the UI or an agent asked about last ([`CastApi::firewall_for`], a cast's start):
+    /// what [`CastApi::firewall`], Check again and Allow / Remove are about.
+    subject: Option<DeviceId>,
     job: FirewallJob,
     cancel: Option<CancellationToken>,
+}
+
+impl FirewallCache {
+    /// The detection toward `toward` and whether it is older than [`FIREWALL_CACHE`].
+    fn get(&self, toward: Ipv4Addr) -> Option<(Detection, bool)> {
+        self.dets.get(&toward).map(|(d, at)| (d.clone(), at.elapsed() > FIREWALL_CACHE))
+    }
 }
 
 /// A pairing in progress.
@@ -475,17 +500,19 @@ impl Shared {
         lock(&self.last).error = None;
     }
 
-    /// The detection target: the TV last cast to, else the default TV, else any TV on the
-    /// network, else the mDNS group (the LAN's route either way).
+    /// Where `id` was last found (IPv4 only in Phase 1).
+    fn addr_v4(&self, id: DeviceId) -> Option<Ipv4Addr> {
+        v4(lock(&self.registry).addr(id))
+    }
+
+    /// The UI's detection target, "the TV": the one asked about or cast to last, else the
+    /// default TV, else any TV on the network, else the mDNS group (no TV known: the LAN's
+    /// route, and at most "can't tell", never "blocked", `firewall::assess`).
     fn toward(&self) -> Ipv4Addr {
-        let v4 = |a: Option<SocketAddr>| match a?.ip() {
-            IpAddr::V4(ip) => Some(ip),
-            IpAddr::V6(_) => None,
-        };
-        let last = lock(&self.last).device;
+        let subject = lock(&self.firewall).subject;
         let default = self.config().cast.default_device.as_deref().and_then(|s| s.parse::<DeviceId>().ok());
         let reg = lock(&self.registry);
-        [last, default]
+        [subject, default]
             .into_iter()
             .flatten()
             .find_map(|id| v4(reg.addr(id)))
@@ -493,27 +520,45 @@ impl Shared {
             .unwrap_or(MDNS_GROUP)
     }
 
-    /// Detect in the background unless a detection already runs.
+    /// The TV the firewall is about from now on (a cast's start, [`CastApi::firewall_for`]).
+    pub(crate) fn firewall_subject(&self, id: DeviceId) {
+        lock(&self.firewall).subject = Some(id);
+    }
+
+    /// Detect toward `toward` (else [`Shared::toward`]) in the background, unless a detection
+    /// toward that address already runs.
     pub(crate) fn refresh_firewall(self: &Arc<Self>, toward: Option<Ipv4Addr>) {
+        let toward = toward.unwrap_or_else(|| self.toward());
         {
             let mut fw = lock(&self.firewall);
-            if fw.refreshing || self.stop.is_cancelled() {
+            if self.stop.is_cancelled() || !fw.refreshing.insert(toward) {
                 return;
             }
-            fw.refreshing = true;
         }
         let this = self.clone();
         self.rt.spawn(async move {
-            this.detect_now(toward).await;
+            this.detect_now(Some(toward)).await;
         });
     }
 
-    /// Detect now (and cache it).
+    /// The cached detection toward `toward` (fresh or not); a stale or missing one is
+    /// refreshed in the background.
+    fn firewall_toward(self: &Arc<Self>, toward: Ipv4Addr) -> Option<(Detection, bool)> {
+        let got = lock(&self.firewall).get(toward);
+        if got.as_ref().is_none_or(|(_, stale)| *stale) {
+            self.refresh_firewall(Some(toward));
+        }
+        got
+    }
+
+    /// Detect now toward `toward` (else [`Shared::toward`]) and cache it under that address.
     pub(crate) async fn detect_now(&self, toward: Option<Ipv4Addr>) -> Detection {
         let toward = toward.unwrap_or_else(|| self.toward());
         let det = self.links.detect(self.config().cast.media_port, toward).await;
         let mut fw = lock(&self.firewall);
-        (fw.det, fw.at, fw.refreshing) = (Some(det.clone()), Some(Instant::now()), false);
+        fw.dets.retain(|a, (_, at)| *a != toward && at.elapsed() < FIREWALL_KEEP);
+        fw.dets.insert(toward, (det.clone(), Instant::now()));
+        fw.refreshing.remove(&toward);
         det
     }
 
@@ -818,15 +863,18 @@ impl CastApi for Api {
         }
     }
 
+    /// The detection toward "the TV" ([`Shared::toward`]); one made toward another address
+    /// never stands in for it (the UI says "checking…" for the moment detection takes).
     fn firewall(&self) -> Option<Detection> {
-        let (det, stale) = {
-            let fw = lock(&self.0.firewall);
-            (fw.det.clone(), fw.at.is_none_or(|t| t.elapsed() > FIREWALL_CACHE))
-        };
-        if stale {
-            self.0.refresh_firewall(None);
-        }
-        det
+        self.0.firewall_toward(self.0.toward()).map(|(d, _)| d)
+    }
+
+    /// Only a fresh detection made toward the TV's own address (DESIGN §40 §12): the agent's
+    /// gate polls this briefly before a cast. The TV becomes the firewall's subject.
+    fn firewall_for(&self, device: DeviceId) -> Option<Detection> {
+        let toward = self.0.addr_v4(device)?;
+        self.0.firewall_subject(device);
+        self.0.firewall_toward(toward).filter(|(_, stale)| !stale).map(|(d, _)| d)
     }
 
     fn firewall_check(&self) {
@@ -887,6 +935,7 @@ impl CastApi for Api {
             }
         };
         test.state = TestState::Running;
+        shared.firewall_subject(device.id);
         let cancel = shared.stop.child_token();
         let short = device.id.short();
         tracing::info!("cast: Test on TV on device {short}");
@@ -924,6 +973,9 @@ impl CastApi for Api {
             (last.device, last.info.clone(), last.error)
         };
         let info = info.filter(|(id, _)| Some(*id) == device).map(|(_, i)| i).unwrap_or_default();
+        // toward the TV last cast to: the state the user's question is about
+        let toward = device.and_then(|id| self.0.addr_v4(id)).unwrap_or_else(|| self.0.toward());
+        let firewall = self.0.firewall_toward(toward).map(|(d, _)| d.state);
         let reg = lock(&self.0.registry);
         let d = device.and_then(|id| reg.get(id));
         let pairing = match d.map(|d| d.pairing) {
@@ -937,7 +989,7 @@ impl CastApi for Api {
             source_version: info.source_version.or_else(|| device.and_then(|id| reg.source_version(id))),
             pairing,
             timing: "ptp-declared",
-            firewall: lock(&self.0.firewall).det.as_ref().map(|d| d.state),
+            firewall,
             last_error,
         }
     }
@@ -983,6 +1035,7 @@ impl CastApi for Api {
             let mut last = lock(&shared.last);
             (last.device, last.error) = (Some(id), None);
         }
+        shared.firewall_subject(id);
         Ok(RemoteOutput { cmd: cmd_tx, events: ev_rx, view })
     }
 }

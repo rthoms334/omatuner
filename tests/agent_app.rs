@@ -1645,9 +1645,26 @@ mod casting {
             },
         };
         let all = vec![tvs.living.clone(), tvs.bedroom.clone(), tvs.study.clone()];
-        tvs.fake.script(|s| s.devices = all);
+        tvs.fake.script(|s| {
+            s.devices = all;
+            // detection has answered: no firewall (a cast doesn't wait for one)
+            s.firewall = Some(no_firewall());
+        });
         w.ui.services().agent.set_cast(Some(CastHandle::new(tvs.fake.clone())));
         (w, tvs)
+    }
+
+    /// ufw isn't on, as detection says toward the mDNS group.
+    fn no_firewall() -> Detection {
+        Detection {
+            state: FirewallState::NoFirewall,
+            toward: Ipv4Addr::new(224, 0, 0, 251),
+            ufw: false,
+            pkexec: true,
+            net: None,
+            tagged: Vec::new(),
+            port: 47800,
+        }
     }
 
     fn device_ref(d: &Device) -> String {
@@ -1799,8 +1816,9 @@ mod casting {
     }
 
     /// What stops a cast is typed, never device text: no such TV, a Mac, two pictures on, the
-    /// firewall known to block the port. An unknown firewall, or one not looked at toward a
-    /// network, blocks nothing here.
+    /// firewall known to block the port for this TV. An unknown firewall, or one not looked at
+    /// toward this TV's own address (another TV, the mDNS group, no network), blocks nothing
+    /// here: the real-TV refusal of 2026-10-13 (DESIGN §40 §9.4 "Toward which TV").
     #[test]
     fn play_with_a_device_refuses_with_a_typed_reason() {
         let (mut w, tvs) = cast_world(Config::default());
@@ -1816,29 +1834,37 @@ mod casting {
         // the item is still checked
         assert_eq!(refused(&mut w, "play", json!({ "ref": "channel:1:m3u:gone", "device": "Living Room" })).0, ErrorCode::NotFound);
 
-        let blocked = |net: Option<LanNet>| Detection {
+        let lan = LanNet { iface: "wlan0".into(), addr: Ipv4Addr::new(192, 168, 1, 20), prefix: 24 };
+        let blocked = |toward: Ipv4Addr, net: Option<LanNet>| Detection {
             state: FirewallState::Blocked { shadowed: false },
+            toward,
             ufw: true,
             pkexec: true,
             net,
             tagged: Vec::new(),
             port: 47800,
         };
-        let lan = LanNet { iface: "wlan0".into(), addr: Ipv4Addr::new(192, 168, 1, 20), prefix: 24 };
-        tvs.fake.script(|s| s.firewall = Some(blocked(Some(lan))));
+        let living = Ipv4Addr::new(192, 168, 1, 50);
+        tvs.fake.script(|s| s.firewall = Some(blocked(living, Some(lan.clone()))));
         let (code, message) = refused(&mut w, "play", ask("Living Room"));
         assert_eq!(code, ErrorCode::Unavailable);
         assert!(message.starts_with("cast-firewall: ") && message.contains("Allow on firewall"), "{message}");
         assert_no_address(&json!(message));
-        tvs.fake.script(|s| s.firewall = Some(blocked(None)));
-        assert_eq!(w.ok("play", ask("Living Room"))["outcome"], "casting_started", "no network was looked at: the session's own check decides");
-        tvs.fake.script(|s| s.firewall = None);
+        for (toward, net, why) in [
+            (Ipv4Addr::new(224, 0, 0, 251), Some(lan.clone()), "made toward the mDNS group, before any TV was known"),
+            (Ipv4Addr::new(192, 168, 1, 51), Some(lan.clone()), "made toward another TV"),
+            (living, None, "no network was looked at"),
+        ] {
+            tvs.fake.script(|s| s.firewall = Some(blocked(toward, net)));
+            assert_eq!(w.ok("play", ask("Living Room"))["outcome"], "casting_started", "{why}: the session's own check decides");
+        }
+        tvs.fake.script(|s| s.firewall = Some(no_firewall()));
 
         w.ui.services().agent.publish_tiles(TilesState { on: true, ..Default::default() });
         let (code, message) = refused(&mut w, "play", ask("Living Room"));
         assert_eq!(code, ErrorCode::Unavailable);
         assert!(message.starts_with("multiview-on: "), "{message}");
-        assert_eq!(w.commands().len(), 1, "only the one that went through reached the app");
+        assert_eq!(w.commands().len(), 3, "only the three that went through reached the app");
     }
 
     /// `status.casting` after a cast ended without the user asking: the TV and the typed reason,

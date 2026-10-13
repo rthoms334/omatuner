@@ -69,6 +69,9 @@ const CONTROL_WAIT: Duration = Duration::from_millis(500);
 const CAST_STOP_WAIT: Duration = Duration::from_secs(2);
 /// How long `play {device}` lets discovery look for a remembered TV Tuner hasn't seen yet.
 const DISCOVER_WAIT: Duration = Duration::from_secs(2);
+/// How long `play {device}` waits for a firewall detection toward the TV (files and three
+/// `systemctl is-active`: tens of ms); none by then blocks nothing (DESIGN §40 §12).
+const FIREWALL_WAIT: Duration = Duration::from_secs(1);
 
 /// The production [`AgentService`].
 #[derive(Clone)]
@@ -344,24 +347,33 @@ impl Inner {
     /// The TV `play {device}` asks for, once a cast to it can start, and whether it still has to
     /// be paired (an outcome, not an error: agents never pair). A remembered TV Tuner hasn't
     /// seen since it started gets one look by discovery (bounded) before it counts as
-    /// unreachable.
+    /// unreachable. The firewall is judged last, by a fresh detection made toward this TV's own
+    /// address (bounded too): never by one made toward another TV or before any was known.
     async fn cast_target(&self, asked: &str) -> Out<(crate::cast::Device, bool)> {
         let cast = self.shared.cast();
         let mut device = act::resolve_device(&cast.devices(), asked)?;
         let multiview = self.shared.tiles().on;
-        let blocked = || cast.firewall().filter(|d| d.net.is_some()).map(|d| d.state);
-        let mut gate = act::cast_gate(&device, multiview, blocked());
+        let mut gate = act::cast_gate(&device, multiview, None);
         if gate == act::CastGate::Refused(CastErrorKind::Unreachable.reason()) {
             cast.browse();
             let deadline = Instant::now() + DISCOVER_WAIT;
             while Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 if let Some(seen) = cast.devices().into_iter().find(|d| d.id == device.id && d.available) {
-                    gate = act::cast_gate(&seen, multiview, blocked());
+                    gate = act::cast_gate(&seen, multiview, None);
                     device = seen;
                     break;
                 }
             }
+        }
+        if gate == act::CastGate::Go {
+            let deadline = Instant::now() + FIREWALL_WAIT;
+            let mut det = cast.firewall_for(device.id);
+            while det.is_none() && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                det = cast.firewall_for(device.id);
+            }
+            gate = act::cast_gate(&device, multiview, det.as_ref());
         }
         match gate {
             act::CastGate::Go => Ok((device, false)),

@@ -19,7 +19,7 @@ use futures_util::future::BoxFuture;
 use tokio_util::sync::CancellationToken;
 use tuner::cast::airplay::features;
 use tuner::cast::discovery::{self, FakeDiscovery, Sighting};
-use tuner::cast::firewall::{AllowOutcome, Detection, FirewallState, Rule, Verb};
+use tuner::cast::firewall::{AllowOutcome, Detection, FirewallState, LanNet, Rule, Verb};
 use tuner::cast::receiver::{Backend, Call, FakeReceiver, FakeRemote, ReceiverEvent};
 use tuner::cast::relay::{RelayConfig, RelayEvent};
 use tuner::cast::service::{CastDeps, CastService};
@@ -45,6 +45,8 @@ struct TestLinks {
     receivers: Mutex<VecDeque<Backend>>,
     relays: Mutex<VecDeque<Relay>>,
     firewall: Mutex<FirewallState>,
+    /// Detection's answer toward one address (else `firewall`).
+    firewall_at: Mutex<Vec<(std::net::Ipv4Addr, FirewallState)>>,
     connects: AtomicUsize,
 }
 
@@ -54,6 +56,7 @@ impl TestLinks {
             receivers: Mutex::default(),
             relays: Mutex::default(),
             firewall: Mutex::new(FirewallState::NoFirewall),
+            firewall_at: Mutex::default(),
             connects: AtomicUsize::new(0),
         })
     }
@@ -83,9 +86,11 @@ impl Links for TestLinks {
         Box::pin(async move { r.ok_or(CastErrorKind::Unsupported) })
     }
 
-    fn detect(&self, port: u16, _toward: std::net::Ipv4Addr) -> BoxFuture<'static, Detection> {
-        let state = *self.firewall.lock().unwrap();
-        Box::pin(async move { Detection { state, ufw: true, pkexec: true, net: None, tagged: Vec::new(), port } })
+    fn detect(&self, port: u16, toward: std::net::Ipv4Addr) -> BoxFuture<'static, Detection> {
+        let at = self.firewall_at.lock().unwrap().iter().find(|(a, _)| *a == toward).map(|(_, s)| *s);
+        let state = at.unwrap_or(*self.firewall.lock().unwrap());
+        let net = Some(LanNet { iface: "lo".into(), addr: std::net::Ipv4Addr::LOCALHOST, prefix: 8 });
+        Box::pin(async move { Detection { state, toward, ufw: true, pkexec: true, net, tagged: Vec::new(), port } })
     }
 
     fn firewall(&self, _verb: Verb, _rule: Rule, _cancel: CancellationToken) -> BoxFuture<'static, AllowOutcome> {
@@ -327,6 +332,32 @@ fn a_tv_that_never_fetches_is_the_firewall_only_when_detection_blocks() {
     load(&out, 2, channel("ch:b"));
     let evs = wait_event(&out.events, "the watchdog", |e| matches!(e, RemoteEvent::Failed { .. }));
     assert_eq!(evs.last(), Some(&RemoteEvent::Failed { generation: 2, kind: PlayerErrorKind::Cast(CastErrorKind::ReceiverFailed) }));
+}
+
+/// Detections are kept per address and a TV is judged only toward its own (DESIGN §40 §9.4
+/// "Toward which TV"): before any cast "the TV" is unknown and detection goes toward the mDNS
+/// group, whose answer never stands in for the TV's; `firewall_for` detects toward the TV, which
+/// then becomes what `firewall()` and `diagnose` are about.
+#[test]
+fn the_firewall_is_detected_toward_the_tv_it_is_asked_about() {
+    let r = rig("tuner-cast-service-toward", calm());
+    let mdns = std::net::Ipv4Addr::new(224, 0, 0, 251);
+    let tv = std::net::Ipv4Addr::LOCALHOST; // TV_ADDR
+    *r.links.firewall.lock().unwrap() = FirewallState::Blocked { shadowed: false };
+    r.links.firewall_at.lock().unwrap().push((tv, FirewallState::Allowed { ours: true }));
+
+    until("a detection toward the mDNS group", || r.cast.firewall().is_some());
+    assert_eq!(r.cast.firewall().map(|d| (d.toward, d.state)), Some((mdns, FirewallState::Blocked { shadowed: false })));
+    assert!(r.cast.firewall().unwrap().state_for(tv).is_none(), "says nothing about the TV");
+
+    let mut det = None;
+    until("a detection toward the TV", || {
+        det = r.cast.firewall_for(tv_id());
+        det.is_some()
+    });
+    assert_eq!(det.map(|d| (d.toward, d.state_for(tv))), Some((tv, Some(FirewallState::Allowed { ours: true }))));
+    assert_eq!(r.cast.firewall().map(|d| d.toward), Some(tv), "the TV asked about is the one Settings shows");
+    assert_eq!(r.cast.diagnose().firewall, Some(FirewallState::Allowed { ours: true }));
 }
 
 /// Stopped from the TV's remote: the relay stops and the upstream's close reaches the controller

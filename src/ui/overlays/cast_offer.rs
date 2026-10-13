@@ -262,6 +262,8 @@ impl CastOffer {
     fn advance(&mut self, cast: &CastHandle) {
         match self.step {
             Step::Pair if self.paired(cast) => {
+                // the firewall is this TV's from now on (§9.4 "Toward which TV")
+                cast.firewall_for(self.offer.device);
                 cast.firewall_check();
                 self.go(Step::Network { forced: false });
             }
@@ -269,7 +271,7 @@ impl CastOffer {
             // except after the TV couldn't fetch: what the files say isn't what is loaded, so
             // the user continues
             Step::Network { forced } => {
-                let open = cast.firewall().is_some_and(|d| !matches!(d.state, FirewallState::Blocked { .. }));
+                let open = cast.firewall_for(self.offer.device).is_some_and(|d| !matches!(d.state, FirewallState::Blocked { .. }));
                 if self.firewall.take_allowed() || (open && !forced) {
                     self.start_test(cast);
                 }
@@ -466,6 +468,7 @@ mod tests {
     fn blocked() -> Detection {
         Detection {
             state: FirewallState::Blocked { shadowed: false },
+            toward: std::net::Ipv4Addr::new(192, 168, 1, 5),
             ufw: true,
             pkexec: true,
             net: Some(LanNet { iface: "wlan0".into(), addr: std::net::Ipv4Addr::new(192, 168, 1, 88), prefix: 24 }),

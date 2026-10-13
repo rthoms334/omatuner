@@ -5237,7 +5237,9 @@ agent confirms with `status`, whose `casting: {device, kind, phase, behind_live_
 the typed reason of the last failure (cleared when the TV shows a picture, or when the user ends
 a cast that was not lost). Outcomes: `pin_required` (a locked item; the PIN is typed in Tuner),
 `pairing_required` (the user pairs in Settings ▸ Cast; no tool takes a PIN), `unavailable` with
-`cast-unreachable`, `cast-firewall`, `cast-unsupported` or `multiview-on`. `control` gains
+`cast-unreachable`, `cast-firewall`, `cast-unsupported` or `multiview-on` (`cast-firewall` only
+from a fresh firewall detection made toward that TV's own address: ufw rules are scoped by source,
+so one made toward another TV or the mDNS group never refuses; cast-design §9.4). `control` gains
 `stop_casting` and `play_here`; `volume` answers `unsupported` on AirPlay; `popout` / `window`
 answer `unavailable: casting`. `diagnose` gains a `cast` section (model, tvOS version, pairing
 variant, timing, firewall state, last error kind). Placement: a `play` with `device` skips §30.13's
@@ -6280,7 +6282,8 @@ user's `[cast] enabled`.
   identity and devices live in `cast_identity` / `cast_device` (migration `0014_cast.sql`,
   never exported by backup).
 * **Firewall** (`cast/firewall/`, `src/bin/tuner-firewall.rs`, `packaging/polkit/`): detection
-  without root from `/etc/ufw/*` and `systemctl is-active` (`FirewallState`), the `user.rules`
+  without root from `/etc/ufw/*` and `systemctl is-active` (`FirewallState`), made toward one
+  address and cached per address (a TV is judged only toward its own), the `user.rules`
   parser, and the *Allow on firewall* / *Remove rule* runner through `pkexec`. The helper
   validates its verb, interface (present in `/sys/class/net`), RFC 1918 CIDR and port, refuses
   unless root under pkexec, and runs one fixed `ufw` command tagged `omatuner cast`. From a

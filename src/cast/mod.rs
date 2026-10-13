@@ -398,8 +398,16 @@ pub trait CastApi: Send + Sync {
     fn pair_cancel(&self, _job: PairJob) {}
 
     // ---- firewall (Settings ▸ Cast ▸ Network, the firewall card; DESIGN §40 §9.4)
-    /// The latest detection (cached ≤ 5 s; `None` until the first finished).
+    /// The detection toward "the TV" (the one asked about or cast to last, else the default,
+    /// else any on the network; cached ≤ 5 s per address; `None` until one toward it finished).
     fn firewall(&self) -> Option<firewall::Detection> {
+        None
+    }
+    /// A fresh detection made toward `device`'s own address, the only one that may say the
+    /// firewall blocks that TV (the agent's gate, the wizard). `None` while it runs (it starts
+    /// one), or when the TV has no known address. `device` becomes what [`CastApi::firewall`],
+    /// Check again and Allow are about.
+    fn firewall_for(&self, _device: DeviceId) -> Option<firewall::Detection> {
         None
     }
     /// Detect again now ("Check again").

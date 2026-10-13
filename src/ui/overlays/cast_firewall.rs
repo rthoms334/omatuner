@@ -57,6 +57,7 @@ pub(crate) fn state_text(state: FirewallState) -> &'static str {
         FirewallState::Unknown { why: UnknownWhy::Firewalld } => "Can't tell (firewalld)",
         FirewallState::Unknown { why: UnknownWhy::Nftables } => "Can't tell (nftables)",
         FirewallState::Unknown { why: UnknownWhy::Unreadable } => "Can't tell (the ufw files can't be read)",
+        FirewallState::Unknown { why: UnknownWhy::NoTv } => "Can't tell until Tuner finds a TV",
     }
 }
 
@@ -528,6 +529,7 @@ mod tests {
     fn detection(state: FirewallState) -> Detection {
         Detection {
             state,
+            toward: Ipv4Addr::new(192, 168, 1, 5),
             ufw: true,
             pkexec: true,
             net: Some(LanNet { iface: "wlan0".into(), addr: Ipv4Addr::new(192, 168, 1, 88), prefix: 24 }),

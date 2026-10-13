@@ -51,6 +51,10 @@ pub enum UnknownWhy {
     Nftables,
     /// The ufw files couldn't be read.
     Unreadable,
+    /// No TV to judge toward (the detection was made toward the mDNS group: no TV known yet).
+    /// ufw's verdict depends on the TV's address (a rule is scoped to a subnet or a host), so
+    /// "blocked" toward anything but the TV itself would be a guess (DESIGN §40 §9.4).
+    NoTv,
 }
 
 /// This computer's side of the LAN toward the TV (the UDP `connect()` trick + `if-addrs`).
@@ -94,11 +98,15 @@ impl Rule {
     }
 }
 
-/// One detection (cached ≤ 5 s by the service; re-run on Check again, after Allow / Remove and
-/// at each session start).
+/// One detection, made toward one address (cached ≤ 5 s per address by the service; re-run on
+/// Check again, after Allow / Remove and at each session start).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Detection {
+    /// The state for a TV at [`Detection::toward`] only: ufw rules are scoped by source, so
+    /// another address can get another answer (DESIGN §40 §9.4 "Toward which TV").
     pub state: FirewallState,
+    /// The address it was made toward: the TV, or the mDNS group when no TV is known.
+    pub toward: Ipv4Addr,
     /// `/usr/bin/ufw` exists and ufw is enabled and active.
     pub ufw: bool,
     /// `pkexec` exists (with `ufw`: the button can show).
@@ -111,6 +119,14 @@ pub struct Detection {
 }
 
 impl Detection {
+    /// The state for the TV at `tv`, when this detection can say: it was made toward that very
+    /// address and found the network toward it. `None` otherwise (made toward another TV or the
+    /// mDNS group, or no route): nothing may be concluded about `tv` from it, least of all that
+    /// the firewall blocks it (DESIGN §40 §12, the agent's gate).
+    pub fn state_for(&self, tv: Ipv4Addr) -> Option<FirewallState> {
+        (self.toward == tv && self.net.is_some()).then_some(self.state)
+    }
+
     /// **Allow on firewall** can show: ufw blocks, and pkexec is there.
     pub fn can_allow(&self) -> bool {
         self.ufw && self.pkexec && matches!(self.state, FirewallState::Blocked { .. })
@@ -198,7 +214,7 @@ pub struct CopyText {
 pub async fn detect(env: &FirewallEnv, port: u16, toward: Ipv4Addr) -> Detection {
     let (ufw_unit, firewalld, nftables) = tokio::join!(unit_active(env, "ufw"), unit_active(env, "firewalld"), unit_active(env, "nftables"));
     let net = lan_net(toward);
-    let mut det = Detection { state: FirewallState::NoFirewall, ufw: false, pkexec: env.pkexec.exists(), net, tagged: Vec::new(), port };
+    let mut det = Detection { state: FirewallState::NoFirewall, toward, ufw: false, pkexec: env.pkexec.exists(), net, tagged: Vec::new(), port };
     let unreadable = FirewallState::Unknown { why: UnknownWhy::Unreadable };
     // ufw is in force when its binary is there, its unit is active and ufw.conf says ENABLED=yes.
     let mut ufw_on = false;
@@ -245,16 +261,29 @@ pub async fn detect(env: &FirewallEnv, port: u16, toward: Ipv4Addr) -> Detection
 ///
 /// ufw is first-match: the first rule matching the traffic decides; with none, the input policy
 /// does (`policy_blocks`: `DEFAULT_INPUT_POLICY` is DROP or REJECT).
+///
+/// `tv` that isn't a host (the mDNS group the service falls back to before it knows a TV, a
+/// broadcast) never sends the flow: a rule scoped to the LAN (`from 192.168.1.0/24`) doesn't
+/// contain it, so the policy would answer "blocked" for a port the LAN's TVs reach. Toward such
+/// an address a block is [`UnknownWhy::NoTv`]; an allow that covers it (an unscoped rule) still
+/// counts.
 pub fn assess(rules: &str, policy_blocks: bool, net: &LanNet, tv: Ipv4Addr, port: u16) -> (FirewallState, Vec<Rule>) {
     let tuples = ufw::parse(rules);
     let flow = ufw::Flow { port, iface: &net.iface, local: net.addr, tv };
     let state = match ufw::evaluate(&tuples, &flow) {
         ufw::Verdict::Allowed { ours } => FirewallState::Allowed { ours },
+        ufw::Verdict::Unmatched if !policy_blocks => FirewallState::NoFirewall,
+        _ if !is_host(tv) => FirewallState::Unknown { why: UnknownWhy::NoTv },
         ufw::Verdict::Denied => FirewallState::Blocked { shadowed: true },
-        ufw::Verdict::Unmatched if policy_blocks => FirewallState::Blocked { shadowed: false },
-        ufw::Verdict::Unmatched => FirewallState::NoFirewall,
+        ufw::Verdict::Unmatched => FirewallState::Blocked { shadowed: false },
     };
     (state, ufw::tagged(&tuples))
+}
+
+/// An address one machine sends from (not multicast, broadcast or unspecified; the loopback is
+/// one: `tests/cast_firewall.rs` detects toward it).
+fn is_host(ip: Ipv4Addr) -> bool {
+    !(ip.is_multicast() || ip.is_broadcast() || ip.is_unspecified())
 }
 
 /// `DEFAULT_INPUT_POLICY` of `/etc/default/ufw`: DROP and REJECT block, ACCEPT doesn't; a missing
