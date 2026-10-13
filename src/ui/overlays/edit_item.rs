@@ -15,7 +15,7 @@
 
 use eframe::egui::{self, RichText};
 
-use super::dialogs::{card_area, scrim_guarded};
+use super::dialogs::{button_row, card_area, scrim_guarded};
 use super::{Overlay, OverlayOutcome};
 use crate::keymap::{Action, KeyContext};
 use crate::model::{ChannelId, ItemKind, ItemOverride, ItemRef};
@@ -480,7 +480,7 @@ impl Overlay for EditItemOverlay {
                 ui.add(egui::Label::new(RichText::new(e.as_str()).size(theme.font(TypeToken::BodySmall)).color(t.urgent)).wrap());
             }
             ui.add_space(theme.space(SpaceToken::Lg));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            button_row(ui, |ui| {
                 ui.spacing_mut().item_spacing.x = theme.space(SpaceToken::Lg);
                 let save = button(
                     ui,
