@@ -6,8 +6,8 @@
 //! Cast to TVs                                                        [ On  ]
 //! Offer to set up new TVs                                            [ On  ]
 //! TVS
-//! 󰄙 Living Room      Apple TV · Paired · tvOS 26.6 · used 2 h ago · default   ⋯
-//! 󰄙 Living Room TV   AirPlay TV · Not paired                                  ⋯
+//! 󰄙 Living Room      Apple TV 4K (3rd generation) · Paired · tvOS 26.6 · used 2 h ago · default   ⋯
+//! 󰄙 Living Room TV   Hisense 85E75LE · Not paired                                                ⋯
 //! ↻ Search again
 //! Add by address     [ the TV's IPv4 address ]
 //! + Add
@@ -43,7 +43,7 @@ use crate::cast::firewall::FirewallState;
 use crate::cast::{CastHandle, Device, DeviceId, Pairing, ReceiverKind, TestState, Usability};
 use crate::config::{CastConvert, CastInterlaced};
 use crate::ui::overlays::cast_firewall::{allow_shows, command_lines, other_networks, state_text};
-use crate::ui::overlays::cast_offer::{error_sentence, kind_label};
+use crate::ui::overlays::cast_offer::error_sentence;
 
 /// `Act::Feature(Feature::Cast, n)`.
 const ACT_SEARCH: u16 = 0;
@@ -130,9 +130,10 @@ fn test_device(cfg: &Config, devices: &[Device]) -> Option<DeviceId> {
     devices.iter().filter(ready).find(|d| is_default(cfg, d)).or_else(|| devices.iter().find(ready)).map(|d| d.id)
 }
 
-/// "Apple TV · Paired · tvOS 26.6 · used 2 h ago · default".
+/// "Apple TV 4K (3rd generation) · Paired · tvOS 26.6 · used 2 h ago · default", "Hisense
+/// 85E75LE · Not paired" ([`Device::make`]).
 fn detail(d: &Device, cfg: &Config, now: crate::model::Timestamp) -> String {
-    let mut parts: Vec<String> = vec![kind_label(d.kind).to_owned()];
+    let mut parts: Vec<String> = vec![d.make()];
     match d.usability {
         Usability::Mac => parts.push("Mac · Can't cast to Macs".into()),
         Usability::HomeOnly => parts.push("Same Home only".into()),
@@ -445,7 +446,9 @@ mod tests {
             let mut a = Device::new(apple, "Living Room", ReceiverKind::AppleTv, Protocol::AirPlay).at("192.168.1.5:7000".parse().unwrap());
             a.pairing = Pairing::Paired(PairVariant::Hkp3);
             a.os_version = Some("26.6 (23L773)".into());
-            let h = Device::new(hisense, "Living Room TV", ReceiverKind::AirPlayTv, Protocol::AirPlay);
+            a.model = Some("AppleTV14,1".into());
+            let mut h = Device::new(hisense, "Living Room TV", ReceiverKind::AirPlayTv, Protocol::AirPlay);
+            (h.model, h.manufacturer) = (Some("85E75LE".into()), Some("Hisense".into()));
             sc.devices = vec![a, h];
             sc.firewall = Some(detection(FirewallState::Blocked { shadowed: false }, Vec::new()));
         });
@@ -453,8 +456,8 @@ mod tests {
         let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1600.0, 1400.0));
         h.state_mut().enter(Route::Settings(SettingsPage::Cast));
         h.run_steps(2);
-        assert!(has_label(&h, "Apple TV · Paired · tvOS 26.6 (23L773)"));
-        assert!(has_label(&h, "AirPlay TV · Not paired"));
+        assert!(has_label(&h, "Apple TV 4K (3rd generation) · Paired · tvOS 26.6 (23L773)"));
+        assert!(has_label(&h, "Hisense 85E75LE · Not paired"), "the Hisense by maker and model");
         assert!(has_label(&h, "Firewall: Blocked (ufw)"));
         assert!(has_label(&h, "Tuner serves the TV from this computer (wlan0), port 47800."));
         assert!(has_label(&h, "Allow on firewall") && !has_label(&h, "Remove rule"));

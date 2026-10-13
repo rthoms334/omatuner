@@ -1,18 +1,18 @@
 //! "Cast to…": the device picker (DESIGN §40 §3.1). OWNER: CAST-8.
 //!
 //! ```text
-//!                                  ┌ CAST TO ──────────────────────┐
-//!                                  │ ✓ This computer               │
-//!                                  │   Living Room                 │
-//!                                  │   Apple TV · Paired           │
-//!                                  │   Living Room TV              │
-//!                                  │   AirPlay TV · Pair first     │
-//!                                  │   OT Macbook Air              │  ← greyed, not selectable
-//!                                  │   Mac · Can't cast to Macs    │
-//!                                  │ ━━━━━━━━━━━━━  Searching…     │
-//!                                  │   Add by address…             │
-//!                                  │   Firewall help…              │
-//!                                  └───────────────────────────────┘
+//!                        ┌ CAST TO ────────────────────────────────┐
+//!                        │ ✓ This computer                         │
+//!                        │   Living Room                           │
+//!                        │   Apple TV 4K (3rd generation) · Paired │
+//!                        │   Living Room TV                        │
+//!                        │   Hisense 85E75LE · Pair first          │
+//!                        │   OT Macbook Air                        │  ← greyed, not selectable
+//!                        │   Mac · Can't cast to Macs              │
+//!                        │ ━━━━━━━━━━━━━━━━━━━━━━━  Searching…     │
+//!                        │   Add by address…                       │
+//!                        │   Firewall help…                        │
+//!                        └─────────────────────────────────────────┘
 //! ```
 //! A right-edge panel in OSD colours (`osd_scrim`, `osd_text`, `osd_accent`), so it is readable
 //! over the video, built like `tracks.rs`: rows, a cursor, `place_cursor` and `choose`. "This
@@ -42,7 +42,7 @@ use eframe::egui::{self, Align2, FontId, Rect};
 use super::{Overlay, OverlayOutcome};
 use crate::cast::{Device, Pairing, Usability};
 use crate::keymap::{Action, KeyContext};
-use crate::model::{CastErrorKind, DeviceId, ReceiverKind};
+use crate::model::{CastErrorKind, DeviceId};
 use crate::player::PlayerCommand;
 use crate::theme::{SpaceToken, Theme, TypeToken, with_alpha};
 use crate::ui::video_host::osd_text;
@@ -270,17 +270,15 @@ fn pick(row: &Row) -> Pick {
     }
 }
 
-/// The second line of a TV: its kind and state ("Apple TV · Paired"). Never an address, and
-/// the name is the sanitized one; the model and OS version live in Settings only.
+/// The second line of a TV: what it is and its state ("Hisense 85E75LE · Paired", "Apple TV
+/// 4K (3rd generation) · Paired"; [`Device::make`]). Never an address, and every string is the
+/// sanitized one; the OS version lives in Settings only.
 fn device_line(d: &Device) -> String {
-    let kind = match (d.usability, d.kind) {
-        (Usability::Mac, _) => "Mac",
-        (_, ReceiverKind::AppleTv) => "Apple TV",
-        (_, ReceiverKind::AirPlayTv) => "AirPlay TV",
-        (_, ReceiverKind::Chromecast) => "Chromecast",
-        (_, ReceiverKind::Dlna) => "DLNA",
+    let kind = match d.usability {
+        Usability::Mac => "Mac".to_owned(),
+        _ => d.make(),
     };
-    let mut parts = vec![kind];
+    let mut parts = vec![kind.as_str()];
     match d.usability {
         Usability::Mac => parts.push("Can't cast to Macs"),
         Usability::HomeOnly => parts.push("Same Home only"),
@@ -672,7 +670,7 @@ mod tests {
     use super::*;
     use crate::cast::testing::{FakeCall, FakeCast};
     use crate::cast::{CastHandle, PairVariant, Protocol};
-    use crate::model::{CastPhase, CastView};
+    use crate::model::{CastPhase, CastView, ReceiverKind};
     use crate::ui::screens::home::testkit::{OvApp, has_label, overlay_harness, painted, rig, until_ov};
     use crate::ui::{NavRequest, OverlayRequest};
 
@@ -686,11 +684,16 @@ mod tests {
         Device { pairing, ..Device::new(id(n), name, kind, Protocol::AirPlay) }
     }
 
-    /// Living Room (paired Apple TV), Living Room TV (a Hisense: pair first), a Mac.
+    /// Living Room (paired Apple TV), Living Room TV (a Hisense: pair first), a Mac; the models
+    /// and maker are the user's real registry rows.
     fn devices() -> Vec<Device> {
         vec![
-            tv(1, "Living Room", ReceiverKind::AppleTv, Pairing::Paired(PairVariant::Hkp3)),
-            tv(2, "Living Room TV", ReceiverKind::AirPlayTv, Pairing::Required),
+            Device { model: Some("AppleTV14,1".into()), ..tv(1, "Living Room", ReceiverKind::AppleTv, Pairing::Paired(PairVariant::Hkp3)) },
+            Device {
+                model: Some("85E75LE".into()),
+                manufacturer: Some("Hisense".into()),
+                ..tv(2, "Living Room TV", ReceiverKind::AirPlayTv, Pairing::Required)
+            },
             Device { usability: Usability::Mac, ..tv(3, "OT Macbook Air", ReceiverKind::AppleTv, Pairing::Required) },
         ]
     }
@@ -708,12 +711,17 @@ mod tests {
         Row::Device { device: Box::new(device), current: false }
     }
 
+    /// The second line says what the TV is (a third-party TV by maker and model, so the Hisense
+    /// isn't taken for a generic entry; an Apple TV by its model's name when known) and its
+    /// state, never an address.
     #[test]
-    fn the_second_line_names_the_kind_and_the_state_without_an_address() {
+    fn the_second_line_names_the_tv_and_the_state_without_an_address() {
         let ds = devices();
-        assert_eq!(device_line(&ds[0]), "Apple TV · Paired");
-        assert_eq!(device_line(&ds[1]), "AirPlay TV · Pair first");
+        assert_eq!(device_line(&ds[0]), "Apple TV 4K (3rd generation) · Paired");
+        assert_eq!(device_line(&ds[1]), "Hisense 85E75LE · Pair first");
         assert_eq!(device_line(&ds[2]), "Mac · Can't cast to Macs");
+        let unnamed = tv(7, "Den TV", ReceiverKind::AirPlayTv, Pairing::Required);
+        assert_eq!(device_line(&unnamed), "AirPlay TV · Pair first", "remembered, not announced this run");
         let home = Device { usability: Usability::HomeOnly, ..tv(4, "Bedroom", ReceiverKind::AppleTv, Pairing::Required) };
         assert_eq!(device_line(&home), "Apple TV · Same Home only");
         assert!(device_hint(&home).is_some_and(|h| h.contains("Anyone on the Same Network")));
@@ -766,8 +774,14 @@ mod tests {
         let (mut h, fake) = picker(devices());
         h.run_steps(2);
         let texts = painted(&h);
-        for want in ["This computer", "Living Room", "Apple TV · Paired", "Living Room TV", "AirPlay TV · Pair first", "Mac · Can't cast to Macs"]
-        {
+        for want in [
+            "This computer",
+            "Living Room",
+            "Apple TV 4K (3rd generation) · Paired",
+            "Living Room TV",
+            "Hisense 85E75LE · Pair first",
+            "Mac · Can't cast to Macs",
+        ] {
             assert!(texts.iter().any(|t| t == want), "{want}: {texts:?}");
         }
         assert!(has_label(&h, "Add by address…") && has_label(&h, "Firewall help…"));

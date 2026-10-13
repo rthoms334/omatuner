@@ -44,6 +44,9 @@ pub struct Sighting {
     pub kind: ReceiverKind,
     pub protocol: Protocol,
     pub model: Option<String>,
+    /// "Hisense" (sanitized; kept in memory only: the store has no column for it, and the
+    /// picker browses whenever it is open).
+    pub manufacturer: Option<String>,
     /// "26.6 (23L773)".
     pub os_version: Option<String>,
     /// "960.13.1".
@@ -80,6 +83,7 @@ pub fn sighting(info: &features::AirPlayInfo, addr: SocketAddr, key: String, man
         kind: class.kind,
         protocol: Protocol::AirPlay,
         model: clean(&info.model),
+        manufacturer: clean(&info.manufacturer),
         os_version,
         source_version: clean(&info.source_version),
         pairing_required: class.pairing_required,

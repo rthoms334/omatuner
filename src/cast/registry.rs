@@ -99,6 +99,7 @@ impl Registry {
         d.name = sanitize_name(&s.name, super::discovery::FALLBACK_NAME);
         d.kind = s.kind;
         d.model = s.model.or(d.model.take());
+        d.manufacturer = s.manufacturer.or(d.manufacturer.take());
         d.os_version = crate::cast::merge_os_version(d.os_version.take(), s.os_version);
         d.usability = s.usability;
         d.available = true;
@@ -227,6 +228,7 @@ mod tests {
             kind,
             protocol: Protocol::AirPlay,
             model: Some(if kind == ReceiverKind::AppleTv { "AppleTV14,1" } else { "85E75LE" }.into()),
+            manufacturer: (kind == ReceiverKind::AirPlayTv).then(|| "Hisense".into()),
             os_version: Some("26.6 (23L773)".into()),
             source_version: Some("960.13.1".into()),
             pairing_required: true,
@@ -268,6 +270,8 @@ mod tests {
 
         let names = r.list().into_iter().map(|d| d.name).collect::<Vec<_>>();
         assert_eq!(names, ["Living Room", "Den", "Living Room TV"]);
+        let makes = r.list().iter().map(Device::make).collect::<Vec<_>>();
+        assert_eq!(makes, ["Apple TV 4K (3rd generation)", "Apple TV 4K (3rd generation)", "Hisense 85E75LE"], "the maker from discovery");
         assert_eq!(r.offer().map(|o| o.device), Some(other.id), "unpaired, the first in the list");
 
         r.gone(&other.key);

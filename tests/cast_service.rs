@@ -110,6 +110,7 @@ fn sighting(id: DeviceId, name: &str) -> Sighting {
         kind: ReceiverKind::AppleTv,
         protocol: Protocol::AirPlay,
         model: Some("AppleTV14,1".into()),
+        manufacturer: None,
         os_version: Some("26.6 (23L773)".into()),
         source_version: Some("960.13.1".into()),
         pairing_required: true,

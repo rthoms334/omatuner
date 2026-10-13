@@ -134,6 +134,9 @@ pub struct Device {
     pub protocol: Protocol,
     /// "AppleTV14,1".
     pub model: Option<String>,
+    /// "Hisense": a third-party TV's maker from its TXT record or `/info` (sanitized; this
+    /// run's discovery only, never stored).
+    pub manufacturer: Option<String>,
     /// The receiver's OS version for logs, `diagnose` and Settings only: "26.6 (23L773)".
     pub os_version: Option<String>,
     pub pairing: Pairing,
@@ -160,6 +163,7 @@ impl Device {
             kind,
             protocol,
             model: None,
+            manufacturer: None,
             os_version: None,
             pairing: Pairing::Required,
             usability: Usability::Usable,
@@ -186,6 +190,41 @@ impl Device {
     pub fn selectable(&self) -> bool {
         self.usability == Usability::Usable
     }
+
+    /// What the TV is, for the picker's and Settings' second line (DESIGN §40 §3.1): a
+    /// third-party TV by maker and model ("Hisense 85E75LE": "AirPlay TV" alone read as a
+    /// generic entry next to the Apple TV), an Apple TV by the name of its model identifier
+    /// when Tuner knows it ("Apple TV 4K (3rd generation)"), else the kind. Both strings are the
+    /// device's own, sanitized at discovery ([`sanitize_name`]) and shown as plain text.
+    pub fn make(&self) -> String {
+        match self.kind {
+            ReceiverKind::AppleTv => self.model.as_deref().and_then(apple_tv_name).unwrap_or("Apple TV").to_owned(),
+            ReceiverKind::AirPlayTv => match (self.manufacturer.as_deref(), self.model.as_deref()) {
+                // a model that already names its maker isn't prefixed twice
+                (Some(m), Some(model)) if model.to_lowercase().starts_with(&m.to_lowercase()) => model.to_owned(),
+                (Some(m), Some(model)) => format!("{m} {model}"),
+                (Some(m), None) => format!("{m} AirPlay TV"),
+                (None, Some(model)) => format!("AirPlay TV {model}"),
+                (None, None) => "AirPlay TV".to_owned(),
+            },
+            ReceiverKind::Chromecast => "Chromecast".to_owned(),
+            ReceiverKind::Dlna => "DLNA TV".to_owned(),
+        }
+    }
+}
+
+/// The Apple TV models by identifier (Apple's own names); `None` for one Tuner doesn't know
+/// (it is then just "Apple TV", never a guess).
+fn apple_tv_name(model: &str) -> Option<&'static str> {
+    Some(match model {
+        "AppleTV2,1" => "Apple TV (2nd generation)",
+        "AppleTV3,1" | "AppleTV3,2" => "Apple TV (3rd generation)",
+        "AppleTV5,3" => "Apple TV HD",
+        "AppleTV6,2" => "Apple TV 4K",
+        "AppleTV11,1" => "Apple TV 4K (2nd generation)",
+        "AppleTV14,1" => "Apple TV 4K (3rd generation)",
+        _ => return None,
+    })
 }
 
 /// A 4-digit PIN as typed in the pairing overlay. Used once, then dropped: never logged, stored
@@ -564,6 +603,49 @@ pub fn merge_os_version(old: Option<String>, new: Option<String>) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a TV is, as the picker and Settings say it: a third-party TV by maker and model
+    /// from its own TXT record (the Hisense was taken for a generic "AirPlay TV" entry), an
+    /// Apple TV by its model's name only when Tuner knows the identifier. The maker is the
+    /// device's text: sanitized and capped at discovery like its name.
+    #[test]
+    fn a_tv_is_named_by_maker_and_model() {
+        use airplay::features::{self, AirPlayInfo};
+        let tv = |kind, model: Option<&str>, maker: Option<&str>| Device {
+            model: model.map(Into::into),
+            manufacturer: maker.map(Into::into),
+            ..Device::new(DeviceId::derive("airplay", "x"), "TV", kind, Protocol::AirPlay)
+        };
+        let cases = [
+            (tv(ReceiverKind::AirPlayTv, Some("85E75LE"), Some("Hisense")), "Hisense 85E75LE"),
+            (tv(ReceiverKind::AirPlayTv, Some("Hisense 85E75LE"), Some("hisense")), "Hisense 85E75LE"),
+            (tv(ReceiverKind::AirPlayTv, None, Some("Hisense")), "Hisense AirPlay TV"),
+            (tv(ReceiverKind::AirPlayTv, Some("85E75LE"), None), "AirPlay TV 85E75LE"),
+            (tv(ReceiverKind::AirPlayTv, None, None), "AirPlay TV"),
+            (tv(ReceiverKind::AppleTv, Some("AppleTV14,1"), None), "Apple TV 4K (3rd generation)"),
+            (tv(ReceiverKind::AppleTv, Some("AppleTV6,2"), None), "Apple TV 4K"),
+            (tv(ReceiverKind::AppleTv, Some("AppleTV99,9"), Some("Apple Inc.")), "Apple TV"),
+            (tv(ReceiverKind::AppleTv, None, None), "Apple TV"),
+        ];
+        for (d, want) in cases {
+            assert_eq!(d.make(), want, "{:?} {:?}", d.model, d.manufacturer);
+        }
+
+        // from the wire: control and bidi characters go, the length is capped, a URL isn't kept
+        let info = |maker: &str| AirPlayInfo {
+            name: Some("Living Room TV".into()),
+            model: Some("85E75LE".into()),
+            manufacturer: Some(maker.into()),
+            pi: Some("02:00:00:00:00:70".into()),
+            features: features::VIDEO_V2 | features::VIDEO_PLAY_QUEUE,
+            ..AirPlayInfo::default()
+        };
+        let seen = |maker: &str| discovery::sighting(&info(maker), "192.168.1.6:7000".parse().unwrap(), "k".into(), false).unwrap().manufacturer;
+        assert_eq!(seen("Hisense").as_deref(), Some("Hisense"));
+        assert_eq!(seen("\u{202E}Hi\u{0}sense\n").as_deref(), Some("Hisense"));
+        assert_eq!(seen(&"H".repeat(300)).map(|m| m.chars().count()), Some(MAX_NAME_CHARS));
+        assert_eq!(seen("http://evil.example/"), None);
+    }
 
     /// The Apple TV's TXT version and its `/info` build meet in one line, in either order; an
     /// update drops the old build.

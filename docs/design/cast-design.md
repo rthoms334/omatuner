@@ -159,9 +159,9 @@ Guide and browse context menus get "Play on Living Room" in Phase 2.
                                          │ ▸ This computer               ✓  │
                                          │                                  │
                                          │   Living Room                    │
-                                         │   Apple TV · Paired              │
+                                         │   Apple TV 4K (3rd gen…) · Paired│
                                          │   Living Room TV                 │
-                                         │   Hisense · Pair first           │
+                                         │   Hisense 85E75LE · Pair first   │
                                          │   OT Macbook Air                 │  ← greyed, not selectable
                                          │   Mac · Can't cast to Macs       │
                                          │ ━━━━━━━━━━━━━━  Searching…       │
@@ -173,11 +173,14 @@ Guide and browse context menus get "Play on Living Room" in Phase 2.
 **Layout and rows**
 - It is a right-edge panel in OSD colours, so it is readable over video. It is built like `ui/overlays/tracks.rs` (`Row`, `cursor`, `place_cursor`, `choose`).
 - "This computer" comes first, then the devices, most recently used first.
-- The second line of each device row gives its kind and state:
+- The second line of each device row says what the TV is, then its state (`Device::make`):
+  - a third-party TV by its TXT/`/info` `manufacturer` and `model`: "Hisense 85E75LE" ("AirPlay TV" alone read as a generic entry next to the Apple TV). The maker is kept in memory from this run's discovery (the store has no column; the picker browses while open), so a remembered TV not announced yet shows "AirPlay TV 85E75LE";
+  - an Apple TV by its model identifier's name where Tuner knows it ("AppleTV14,1" → "Apple TV 4K (3rd generation)"), else "Apple TV", never a guess;
+  - both strings are the device's own: sanitized and capped like its name (§6 "Untrusted strings").
 
   | Row text | Meaning |
   |---|---|
-  | `Apple TV · Paired` | Ready to cast. |
+  | `Apple TV 4K (3rd generation) · Paired` | Ready to cast. |
   | `Pair first` | Needs one-time PIN pairing. |
   | `Mac · Can't cast to Macs` | Greyed out. |
   | `Same Home only` | Greyed out, with the setting hint. |
@@ -367,8 +370,8 @@ Settings ▸ Cast
    Cast to TVs                                         [on]
    Offer to set up new TVs                             [on]
  TVs
-   Living Room       Apple TV · Paired · tvOS 26.6 · used today ⋯   (Pair again · Forget · Make default)
-   Living Room TV    Hisense · Not paired                       ⋯   (Pair · Forget)
+   Living Room       Apple TV 4K (3rd generation) · Paired · tvOS 26.6 · used today ⋯   (Pair again · Forget · Make default)
+   Living Room TV    Hisense 85E75LE · Not paired                                   ⋯   (Pair · Forget)
    Search again
    Add by address…
  Network

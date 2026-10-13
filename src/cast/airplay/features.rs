@@ -40,6 +40,8 @@ pub const FLAG_PAIRING: u64 = 0x200;
 pub struct AirPlayInfo {
     pub name: Option<String>,
     pub model: Option<String>,
+    /// TXT / `/info` `manufacturer` ("Hisense"; a third-party TV's maker, shown with its model).
+    pub manufacturer: Option<String>,
     /// `deviceid` (a MAC-like id).
     pub device_id: Option<String>,
     /// `pi`: the pairing identity (the stable id when present).
@@ -131,6 +133,7 @@ pub fn from_txt(txt: &[(String, String)]) -> AirPlayInfo {
         // the name is the mDNS instance name, not a TXT key (the caller fills it)
         name: None,
         model: get("model"),
+        manufacturer: get("manufacturer"),
         device_id: get("deviceid"),
         pi: get("pi"),
         psi: get("psi"),
@@ -165,6 +168,7 @@ pub fn from_info(plist: &bplist::Value) -> AirPlayInfo {
     AirPlayInfo {
         name: string("name"),
         model: string("model"),
+        manufacturer: string("manufacturer"),
         device_id: string("deviceID"),
         pi: string("pi"),
         psi: string("psi"),
@@ -259,6 +263,7 @@ mod tests {
             assert_eq!((c.kind, c.pairing_required, c.usability), (ReceiverKind::AirPlayTv, true, Usability::Usable));
         }
         assert_eq!(i.psi, None, "a third-party TV's /info has no psi");
+        assert_eq!((t.manufacturer.as_deref(), i.manufacturer.as_deref()), (Some("Hisense"), Some("Hisense")));
         assert_eq!(device_id(&t), device_id(&i));
         // VioletRelay's identifiers are the TXT record's (`/info` has only `pi`)
         let psi = "00000000-0000-0000-0000-020000000070";

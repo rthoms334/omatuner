@@ -49,7 +49,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// After the card appears, Enter, Space and clicks wait this long (`agent_connect.rs`).
 const ARMING: Duration = Duration::from_millis(600);
 
-/// "Apple TV" / "AirPlay TV" (the picker's and Settings' second line).
+/// "Apple TV" / "AirPlay TV" (the first-run card; the picker and Settings name the model,
+/// [`crate::cast::Device::make`]).
 pub(crate) fn kind_label(kind: ReceiverKind) -> &'static str {
     match kind {
         ReceiverKind::AppleTv => "Apple TV",
