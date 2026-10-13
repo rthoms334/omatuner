@@ -1582,6 +1582,11 @@ is; otherwise the timers come back the next time Tuner starts.
     and restore a backup in Settings ▸ Backup if you made one.
   - *"…libmpv couldn't start"*: reinstall `mpv` (`sudo pacman -S mpv`).
   - *"…couldn't open its window"*: start it from your desktop session, not over SSH or a TTY.
+  - *"Tuner was updated to X but couldn't start"*: the reason follows. To go back, install the
+    previous package from pacman's cache as the message shows
+    (`sudo pacman -U /var/cache/pacman/pkg/omatuner-<previous>-*.pkg.tar.zst`) and turn off
+    automatic installs in Settings ▸ About & logs ▸ Updates until a fixed release is out. Tuner
+    never downgrades by itself.
   - No notification at all: check the log file above, or run `tuner` in a terminal.
 - **Logs:** open them with Settings ▸ About & logs ▸ *Open the log viewer*.
   - Type to filter. Ctrl+S sets the minimum level or exports the log (*Export…*).

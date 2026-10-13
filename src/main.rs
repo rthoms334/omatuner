@@ -15,7 +15,8 @@
 //! Xtream login are toasted by the next window (`store::sources::note_unseen_upgrade`).
 //!
 //! A restart into an installed update (DESIGN §41.6) closes the window like Quit; once
-//! `run_native` returns, `main` re-execs `/usr/bin/tuner` in this process.
+//! `run_native` returns, `main` re-execs `/usr/bin/tuner` in this process. An exec that fails
+//! is reported like a failed start (it notifies although the window was up).
 //!
 //! `tuner --rearm` (the packaged `tuner-rearm.service`, at every login) arms the reminder timers
 //! a reboot or logout removed and exits (`reminders::arming::rearm_at_login`, DESIGN §36.2):
@@ -25,7 +26,9 @@
 //! A fatal error (exit status 1) goes to stderr, to `tuner.log` once the profile is known, and
 //! — for a launch that would open a window, until it is up — to a desktop notification "Tuner
 //! couldn't start" in plain words: from the launcher nobody reads stderr
-//! (`platform::startup`, DESIGN §21.7).
+//! (`platform::startup`, DESIGN §21.7). Right after a restart into an update (its marker is
+//! read before anything else can fail) the notification says which version failed and how to
+//! go back.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -44,7 +47,7 @@ use tuner::jobs::{JobContext, JobEvent, JobKind, JobManager};
 use tuner::model::JobId;
 use tuner::msg::{AppEvent, EventBus};
 use tuner::paths::AppPaths;
-use tuner::platform::startup::{Fatal, WindowError};
+use tuner::platform::startup::{self, WindowError};
 use tuner::services::Services;
 use tuner::sources::http::HttpClient;
 use tuner::store::Store;
@@ -61,19 +64,18 @@ const REFRESH_SETTLE: Duration = Duration::from_millis(500);
 fn main() -> ExitCode {
     tuner::platform::limit_malloc_arenas();
     let cli = Cli::parse();
-    let mut fatal = Fatal::default();
-    match run(cli, &mut fatal) {
+    match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            fatal.report(&e);
+            startup::report(&e);
             ExitCode::FAILURE
         }
     }
 }
 
-/// Everything `main` does; `fatal` learns on the way where an error of this run is reported
-/// (stderr only, then also the log, and the desktop for a windowed launch).
-fn run(cli: Cli, fatal: &mut Fatal) -> anyhow::Result<()> {
+/// Everything `main` does; `platform::startup` learns on the way where an error of this run is
+/// reported (stderr only, then also the log, and the desktop for a windowed launch).
+fn run(cli: Cli) -> anyhow::Result<()> {
     // prints (or, with --apply and a "y", runs) the Claude Code setup; touches no profile
     if let Some(tuner::cli::Command::ClaudeSetup { apply }) = cli.command {
         return tuner::agent::setup::main(apply);
@@ -81,7 +83,8 @@ fn run(cli: Cli, fatal: &mut Fatal) -> anyhow::Result<()> {
     // a launch that opens a window (or shows a closed reminder's note) says on the desktop when
     // it can't: started from the launcher, nobody reads stderr. Not the headless runs (their
     // journal has stderr; the next window launch says it) nor the MCP bridge (its client does).
-    fatal.notify_desktop(cli.command.is_none() && !cli.refresh && !cli.rearm && !cli.is_mcp());
+    let windowed = cli.command.is_none() && !cli.refresh && !cli.rearm && !cli.is_mcp();
+    startup::notify_desktop(windowed);
     let paths = match &cli.profile_dir {
         Some(dir) => AppPaths::rooted(dir),
         None => AppPaths::from_env()?,
@@ -96,7 +99,13 @@ fn run(cli: Cli, fatal: &mut Fatal) -> anyhow::Result<()> {
     if cli.rearm && !paths.db_file().exists() {
         return Ok(());
     }
-    fatal.log_to(paths.log_file());
+    // this process was just re-exec'd into an installed update (DESIGN §41.6): a failure from
+    // here on names the new version and the way back. Only read — the update service takes it
+    // (and says "Tuner updated") once the window is up.
+    if windowed && let Some(m) = tuner::update::restart::peek_marker(&paths.runtime_dir, std::process::id(), tuner::model::now()) {
+        startup::after_update(&m.from, &m.to);
+    }
+    startup::log_to(paths.log_file());
     // developer-only screenshot capture (DESIGN §23.1); a typo fails here, not after a minute
     let devshot = tuner::devshot::ShotConfig::from_env().map_err(|e| anyhow::anyhow!("TUNER_SCREENSHOT*: {e}"))?;
     let (config, config_err) = match Config::load(&paths.config_file()) {
@@ -151,8 +160,8 @@ fn run(cli: Cli, fatal: &mut Fatal) -> anyhow::Result<()> {
         popout: cli.popout || cli.agent_popout,
         reminder: cli.reminder,
     };
-    // held until the process exits: the database has one owner
-    // a refresh holding the lock, an instance that doesn't answer: `fatal` tells the desktop
+    // held until the process exits: the database has one owner; a refresh holding the lock or
+    // an instance that doesn't answer ends the start (`platform::startup` tells the desktop)
     let Some(instance) = become_primary(&paths, &request, HANDOFF_WAIT)? else {
         return Ok(());
     };
@@ -254,7 +263,8 @@ fn run(cli: Cli, fatal: &mut Fatal) -> anyhow::Result<()> {
     if let Some(plan) = tuner::update::restart::take() {
         drop(_instance);
         let e = tuner::update::restart::exec(&plan);
-        anyhow::bail!("couldn't restart into the update: {e}");
+        // reported like a failed start, and on the desktop although the window was up
+        return Err(tuner::update::restart::failed(e, &paths.runtime_dir).into());
     }
     Ok(())
 }

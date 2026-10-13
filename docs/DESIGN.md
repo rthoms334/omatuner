@@ -3200,7 +3200,9 @@ Tuner starts from the launcher (uwsm / `gtk-launch`): stderr goes nowhere. In 0.
 left at schema v14 by a dev build was refused with one stderr line and exit 1 — nothing on
 screen, nothing in the log (the error was printed by `main`'s return, never logged), so the
 release looked broken. Now `main` runs everything in `run` and hands an error to
-`startup::Fatal::report`, which says it three ways and exits 1:
+`startup::report`, which says it three ways and exits 1 (where it may report is process state
+that `run` fills in — `notify_desktop`, `log_to`, `after_update` — so the updater's thread can
+report too):
 * **stderr** — `Error: …` with the cause chain, as before (redacted).
 * **`tuner.log`** — `ERROR tuner: Tuner exits: …` through `logging::record_fatal`: the
   subscriber's writer (flushed) once logging is up, else appended directly. Known as soon as
@@ -3231,15 +3233,20 @@ keep writing the key.
 depends on `mpv`); a panic keeps Rust's report on stderr (a panic hook would also fire for the
 panics the store writer and services catch on purpose).
 
-**Auto-update (on `feat/auto-update`, not on `main` yet):** its restart re-execs
-`/usr/bin/tuner` in the same process (`update::restart::exec`), so nothing old is left to watch
-the new build: a failed start after an update goes through this same path and notifies. When
-that branch lands, `run` should read its restart marker before anything can fail and, with one
-present, word the notification "Tuner was updated to ‹version› but couldn't start: ‹reason›"
-plus how to go back (`sudo pacman -U` the previous package from pacman's cache); the old
-process reports an `exec` that itself fails through `Fatal` as well. Never roll back
-automatically: the new build may already have migrated the database, and the older one would
-then refuse it (naming the newer version, thanks to `meta.app_version`).
+**After an update (§41.6).** The restart re-execs `/usr/bin/tuner` in the same process, so no
+old process is left to watch the new build; the new one reports for itself. `run` reads the
+restart marker (`update::restart::peek_marker`: its own pid, ≤ 2 min; only read — the update
+service still takes it for its "Tuner updated" toast) right after the paths, before anything
+else can fail, and `startup::after_update` keeps its `from`/`to` (only if they look like
+versions). A failed start then reads "Tuner was updated to 0.2.8 but couldn't start: ‹reason›
+To go back to 0.2.7: sudo pacman -U /var/cache/pacman/pkg/omatuner-0.2.7-*.pkg.tar.zst, then
+turn off automatic installs in Settings ▸ About & logs ▸ Updates." Tuner never rolls back by
+itself: the new build may already have migrated the database, and the older one would refuse
+it (naming the newer version, thanks to `meta.app_version`). An `exec` that fails in the old
+process — `main` after the window closed, or the updater's thread for a hidden window — is a
+`startup::RestartFailed`: reported the same way under *Tuner couldn't restart* ("Tuner was
+updated to X but couldn't restart into it (‹why›). Start Tuner again from the launcher."),
+although the window was up, and the process exits 1.
 
 ---
 
@@ -6422,7 +6429,9 @@ and pacman), 3 min for the switch; a stop or a time-out kills pkexec while it is
   environment, cgroup; never the original command line (no second `--play` or playlist file).
   A window on a hidden workspace gets no frames (§3): like the signal watcher, after 3 s the
   updater runs the direct-exit cleanup (players stopped, writer flushed, socket removed) and
-  execs from its own thread.
+  execs from its own thread. An exec that fails (either way) is reported like a failed start,
+  on the desktop too, and the process exits 1; a start that fails right after the restart
+  names the new version and the way back (§21.7).
 * **After**: the marker `$XDG_RUNTIME_DIR/tuner/restart.json` (`from`, `to`, pid, time, the
   Hyprland `Placement`: workspace and the window that had the keyboard) is taken by the new
   process when it is its own and ≤ 2 min old: toast "Tuner updated to X (from Y)", and under

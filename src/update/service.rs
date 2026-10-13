@@ -829,8 +829,9 @@ impl Updater {
         crate::logging::flush(Duration::from_millis(500));
         if let Some(plan) = restart::take() {
             let e = restart::exec(&plan);
-            tracing::error!("update: couldn't restart: {e}");
-            crate::logging::flush(Duration::from_millis(500));
+            // like `main`'s: stderr, the log and the desktop (DESIGN §21.7), then status 1
+            crate::platform::startup::report(&restart::failed(e, &self.inner.env.runtime_dir).into());
+            std::process::exit(1);
         }
         std::process::exit(0);
     }

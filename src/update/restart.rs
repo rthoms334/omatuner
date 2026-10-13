@@ -165,8 +165,26 @@ pub fn take_marker(runtime_dir: &Path, pid: u32, now: Timestamp) -> Option<Marke
     let path = runtime_dir.join(MARKER);
     let bytes = std::fs::read(&path).ok()?;
     let _ = std::fs::remove_file(&path);
-    let m: Marker = serde_json::from_slice(&bytes).ok()?;
+    own_marker(&bytes, pid, now)
+}
+
+/// [`take_marker`] without taking it: `main` reads it before anything can fail, so a failed
+/// start right after the restart names the update (`platform::startup::after_update`, DESIGN
+/// §21.7); the update service still takes it once the window is up.
+pub fn peek_marker(runtime_dir: &Path, pid: u32, now: Timestamp) -> Option<Marker> {
+    own_marker(&std::fs::read(runtime_dir.join(MARKER)).ok()?, pid, now)
+}
+
+fn own_marker(bytes: &[u8], pid: u32, now: Timestamp) -> Option<Marker> {
+    let m: Marker = serde_json::from_slice(bytes).ok()?;
     (m.pid == pid && (0..=MARKER_MAX_AGE_S).contains(&(now - m.at))).then_some(m)
+}
+
+/// [`exec`] returned `e`: the error to report (`platform::startup`, which tells the desktop
+/// although the window was up), naming the version from this process's marker when there is one.
+pub fn failed(e: std::io::Error, runtime_dir: &Path) -> crate::platform::startup::RestartFailed {
+    let to = peek_marker(runtime_dir, std::process::id(), crate::model::now()).map(|m| m.to);
+    crate::platform::startup::RestartFailed { to, why: e }
 }
 
 #[cfg(test)]
@@ -223,6 +241,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let m = Marker { from: "0.2.5".into(), to: "0.2.6".into(), pid: 42, at: 1_000, place: None };
         write_marker(dir.path(), &m);
+        assert_eq!(peek_marker(dir.path(), 42, 1_030), Some(m.clone()), "read, left in place");
+        assert_eq!(peek_marker(dir.path(), 43, 1_030), None, "another process's");
         assert_eq!(take_marker(dir.path(), 42, 1_030), Some(m.clone()));
         assert_eq!(take_marker(dir.path(), 42, 1_030), None, "taken once");
         write_marker(dir.path(), &m);

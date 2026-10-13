@@ -81,8 +81,7 @@ pub fn record_app_version(conn: &Connection) -> Result<()> {
 fn recorded_app_version(conn: &Connection) -> Option<String> {
     use rusqlite::OptionalExtension;
     let v: String = conn.query_row("SELECT value FROM meta WHERE key = ?1", [APP_VERSION_KEY], |r| r.get(0)).optional().ok()??;
-    let plausible = !v.is_empty() && v.len() <= 32 && v.bytes().all(|b| b.is_ascii_alphanumeric() || b".+-_".contains(&b));
-    plausible.then_some(v)
+    crate::platform::startup::version_like(&v).then_some(v)
 }
 
 /// `user_version` is positional, so a database from a pre-merge build of the quality-badges
