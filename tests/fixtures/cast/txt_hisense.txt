@@ -1,0 +1,22 @@
+# _airplay._tcp TXT record of "Living Room TV" (Hisense 85E75LE, VIDAA), captured on the LAN
+# with avahi-browse on 2026-10-12. Identifiers scrubbed (deviceid, serialNumber, pi, psi, gid,
+# pk); pi matches info_hisense.plist. One key=value per line, in wire order.
+acl=0
+deviceid=02:00:00:00:00:70
+features=0x7F8AD0,0x38BCF46
+fex=0Ip/AEbPiwNABA
+rsf=0x3
+fv=p20.09.6111.260704
+at=0x1
+flags=0x244
+model=85E75LE
+integrator=Hisense
+manufacturer=Hisense
+serialNumber=SERIAL00000000000000000
+protovers=1.1
+srcvers=377.40.00
+pi=02:00:00:00:00:70
+psi=00000000-0000-0000-0000-020000000070
+gid=00000000-0000-0000-0000-020000000070
+gcgl=0
+pk=2222222222222222222222222222222222222222222222222222222222222222

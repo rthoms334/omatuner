@@ -33,6 +33,14 @@
 //!   really refuses still reaches Error when the window ends.
 //! * A provider message instead of a stream ([`Input::ProviderMessage`]) is a
 //!   `ProviderError` carrying the provider's text.
+//!
+//! Casting (DESIGN §40 §5.5, §11.2): the same machine drives picture A when its output is a TV
+//! ([`PlayerMachine::set_remote`]). The controller turns the session's events into these same
+//! inputs (`player::remote::RemoteAdapter`; entry ids are load generations), so reconnects,
+//! the race window, progress and `Ended` work unchanged. Only the clocks differ: the remote
+//! load and stall timeouts, and a stall counts for VOD too (the TV's reported position is the
+//! only sign of life). A cast failure is the TV's or the network's, never the item's: it is
+//! not recorded against the item ([`blames_item`]).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -52,6 +60,12 @@ pub struct MachineConfig {
     pub buffer_timeout_vod: Duration,
     /// Live: time-pos frozen this long while "playing" → Stalled.
     pub stall_timeout: Duration,
+    /// Casting (DESIGN §40 §5.5): no first picture on the TV within this → Timeout. Covers the
+    /// upstream connect, the probe, the first segments and AVPlayer's start (foxCast gives up
+    /// after 30 s too).
+    pub remote_load_timeout: Duration,
+    /// Casting: no progress from the TV this long while "playing" → Stalled.
+    pub remote_stall_timeout: Duration,
     pub policy: ReconnectPolicy,
 }
 
@@ -64,6 +78,8 @@ impl MachineConfig {
             buffer_timeout_live: Duration::from_secs(15),
             buffer_timeout_vod: Duration::from_secs(30),
             stall_timeout: Duration::from_secs(12),
+            remote_load_timeout: Duration::from_secs(30),
+            remote_stall_timeout: Duration::from_secs(20),
             policy: ReconnectPolicy { max_attempts_live: p.reconnect_max_attempts, ..ReconnectPolicy::default() },
         }
     }
@@ -115,6 +131,14 @@ pub enum Input {
     /// The controller could not start the other copy an [`Effect::Fallback`] asked for: the
     /// failure stands (Error, nothing recorded again).
     GiveUp(PlayerError),
+    /// The output reported a failure of `entry` (casting: the session's `Failed`, or `Lost`
+    /// for the generation it was playing; DESIGN §40 §11.2). Handled like an END_FILE error of
+    /// that kind, through the reconnect policy: `Cast(Unreachable)` re-verifies once, the other
+    /// cast kinds don't retry. Ignored unless `entry` is the current target's.
+    Failed {
+        entry: i64,
+        kind: PlayerErrorKind,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -187,6 +211,8 @@ pub struct PlayerMachine {
     /// Another copy of this VOD target can be played instead when it fails before its first
     /// frame ([`Effect::Fallback`]). Set by the controller for every play.
     fallback: bool,
+    /// The output is a TV ([`PlayerMachine::set_remote`]): the remote timeouts apply.
+    remote: bool,
 }
 
 impl PlayerMachine {
@@ -217,6 +243,7 @@ impl PlayerMachine {
             paused: false,
             paused_for_cache: false,
             fallback: false,
+            remote: false,
         }
     }
 
@@ -238,6 +265,14 @@ impl PlayerMachine {
     /// 403 retry stays) — and asks for [`Effect::Fallback`] instead of entering Error.
     pub fn arm_fallback(&mut self, on: bool) {
         self.fallback = on;
+    }
+    /// The output changed (casting started or ended, DESIGN §40 §5.5): `remote` selects the
+    /// remote load and stall timeouts. The pause mirrors start over: they followed the other
+    /// output (a picture paused here before it moved to the TV must not land in Paused there).
+    pub fn set_remote(&mut self, remote: bool) {
+        self.remote = remote;
+        self.paused = false;
+        self.paused_for_cache = false;
     }
     /// The current target showed its first frame (a failure now is mid-playback: the error
     /// card offers the other copy, nothing switches by itself).
@@ -333,7 +368,7 @@ impl PlayerMachine {
                 fx.push(Effect::StopMpv);
                 self.clear_entries();
                 // the budget is ours, not the channel's: never dim a channel for it
-                if err.kind != PlayerErrorKind::Budget
+                if blames_item(err.kind)
                     && let Some(t) = &self.target
                 {
                     fx.push(Effect::RecordFailure(t.clone(), err.kind));
@@ -349,6 +384,11 @@ impl PlayerMachine {
             Input::GiveUp(err) => {
                 fx.push(Effect::Emit(PlayerEvent::Failed(err.clone())));
                 self.set_state(PlayerState::Error(err), &mut fx);
+            }
+            Input::Failed { entry, kind } => {
+                if self.owns_entry(entry) {
+                    self.fail(kind, now, &mut fx);
+                }
             }
             Input::StartFile { entry } => {
                 if self.awaiting_start && (self.expected_entry == Some(entry) || self.accept_any_start) {
@@ -488,20 +528,29 @@ impl PlayerMachine {
 
     fn tick(&mut self, now: Instant, fx: &mut Vec<Effect>) {
         let live = self.target.as_ref().map(|t| t.kind.is_live()).unwrap_or(true);
+        // casting (DESIGN §40 §5.5): the first picture on the TV may take the upstream connect,
+        // the probe, the first segments and AVPlayer's start; "no progress" is the TV's reported
+        // position (or its buffering) for VOD as much as for live
+        let (load_timeout, stall_timeout) =
+            if self.remote { (self.cfg.remote_load_timeout, self.cfg.remote_stall_timeout) } else { (self.cfg.load_timeout, self.cfg.stall_timeout) };
         match self.state.clone() {
             PlayerState::Zapping { until } if now >= until => self.begin_load(now, fx),
-            PlayerState::Loading { since, .. } if now.duration_since(since) > self.cfg.load_timeout => self.fail(PlayerErrorKind::Timeout, now, fx),
+            PlayerState::Loading { since, .. } if now.duration_since(since) > load_timeout => self.fail(PlayerErrorKind::Timeout, now, fx),
             PlayerState::Buffering { since, .. } => {
-                let limit = if live { self.cfg.buffer_timeout_live } else { self.cfg.buffer_timeout_vod };
+                let limit = match (self.remote, live) {
+                    (true, _) => self.cfg.remote_stall_timeout,
+                    (false, true) => self.cfg.buffer_timeout_live,
+                    (false, false) => self.cfg.buffer_timeout_vod,
+                };
                 if now.duration_since(since) > limit {
                     self.fail(PlayerErrorKind::Stalled, now, fx);
                 }
             }
             PlayerState::Playing => {
-                if live
+                if (live || self.remote)
                     && self.last_pos.is_some()
                     && let Some(at) = self.last_pos_change
-                    && now.duration_since(at) > self.cfg.stall_timeout
+                    && now.duration_since(at) > stall_timeout
                 {
                     self.fail(PlayerErrorKind::Stalled, now, fx);
                     return;
@@ -609,7 +658,9 @@ impl PlayerMachine {
             }
             None => {
                 let err = PlayerError { kind, message: self.error_message(kind) };
-                if let Some(t) = &self.target {
+                if blames_item(kind)
+                    && let Some(t) = &self.target
+                {
                     fx.push(Effect::RecordFailure(t.clone(), kind));
                 }
                 if early {
@@ -654,6 +705,13 @@ impl PlayerMachine {
     }
 }
 
+/// A failure of `kind` says something about the item (recorded in its failure cache, dims a
+/// channel). Our own connection budget doesn't, nor does casting: the TV's or the network's
+/// problem (DESIGN §40 §3.4), the same item plays here.
+pub fn blames_item(kind: PlayerErrorKind) -> bool {
+    !matches!(kind, PlayerErrorKind::Budget | PlayerErrorKind::Cast(_))
+}
+
 /// Map an mpv END_FILE error (+ last HTTP status seen in logs) to a failure kind.
 pub fn classify(mpv_error: i32, http: Option<u16>) -> PlayerErrorKind {
     match http {
@@ -685,6 +743,25 @@ pub fn describe(kind: PlayerErrorKind) -> &'static str {
         PlayerErrorKind::Budget => "Connection limit reached for this provider",
         PlayerErrorKind::ProviderError => "The provider can't deliver this channel right now",
         PlayerErrorKind::Mpv => "Playback failed",
+        PlayerErrorKind::Cast(k) => describe_cast(k),
+    }
+}
+
+/// Generic copy for a cast failure (DESIGN §40 §3.4). The casting card, toasts and
+/// notifications name the TV themselves; this never holds device or provider text.
+pub fn describe_cast(kind: crate::model::CastErrorKind) -> &'static str {
+    use crate::model::CastErrorKind as C;
+    match kind {
+        C::Unreachable => "The TV isn't answering. Is it on and on the same network?",
+        C::PairingRequired => "The TV needs pairing",
+        C::PairingLost => "The TV forgot Tuner. This can happen after a TV update.",
+        C::PairingRefused => "The TV refused pairing. Check its Allow Access setting.",
+        C::Firewall => "The TV couldn't connect back to Tuner. Your firewall is blocking it.",
+        C::Unsupported => "The TV can't play this channel's format",
+        C::NeedsFfmpeg => "Casting needs ffmpeg (it's normally installed with mpv)",
+        C::CpuTooSlow => "This computer can't convert this channel fast enough",
+        C::StoppedOnTv => "The TV stopped playing. Its remote stopped it, or another device took over.",
+        C::ReceiverFailed => "The TV couldn't play it",
     }
 }
 
@@ -1784,6 +1861,80 @@ mod tests {
         m.handle(Input::StartFile { entry: 2 }, t0);
         m.handle(Input::TimePos(1.0), t0);
         assert_eq!(m.last_position(), Some(1.0));
+    }
+
+    /// Casting (DESIGN §40 §5.5): the first picture on the TV gets 30 s (not the local 20 s),
+    /// the TV's frozen position or buffering is a stall after 20 s for VOD as well as live, and
+    /// a picture paused here before it moved doesn't land in Paused there.
+    #[test]
+    fn a_remote_output_uses_the_remote_clocks() {
+        let t0 = Instant::now();
+        let mut m = machine();
+        m.set_remote(true);
+        m.handle(Input::Play { target: live(), immediate: true }, t0);
+        m.handle(Input::Loaded { entry: Some(1) }, t0);
+        m.handle(Input::Tick, t0 + secs(25));
+        assert!(matches!(m.state(), PlayerState::Loading { .. }), "the TV may take longer than mpv");
+        m.handle(Input::Tick, t0 + secs(31));
+        assert!(matches!(m.state(), PlayerState::Reconnecting { reason: PlayerErrorKind::Timeout, .. }));
+
+        let mut m = machine();
+        m.handle(Input::Pause(true), t0);
+        m.set_remote(true);
+        start_playing(&mut m, vod(), 1, t0);
+        m.handle(Input::TimePos(600.0), t0);
+        m.handle(Input::TimePos(610.0), t0 + secs(10));
+        m.handle(Input::Tick, t0 + secs(29));
+        assert_eq!(m.state(), &PlayerState::Playing, "one report missed");
+        m.handle(Input::Tick, t0 + secs(31));
+        assert!(matches!(m.state(), PlayerState::Reconnecting { reason: PlayerErrorKind::Stalled, .. }), "{:?}", m.state());
+
+        let mut m = machine();
+        m.set_remote(true);
+        start_playing(&mut m, vod(), 1, t0);
+        m.handle(Input::PausedForCache(true), t0);
+        m.handle(Input::Tick, t0 + secs(20));
+        assert!(matches!(m.state(), PlayerState::Buffering { .. }));
+        m.handle(Input::Tick, t0 + secs(21));
+        assert!(matches!(m.state(), PlayerState::Reconnecting { reason: PlayerErrorKind::Stalled, .. }));
+    }
+
+    /// DESIGN §40 §11.2: an unreachable TV is re-verified once, other cast failures end at
+    /// once; none is the item's fault, and a late failure of a replaced generation is ignored.
+    #[test]
+    fn cast_failures_follow_their_policy_and_never_blame_the_item() {
+        use crate::model::CastErrorKind as C;
+        let t0 = Instant::now();
+        let cast = |k| PlayerErrorKind::Cast(k);
+        let mut m = machine();
+        m.set_remote(true);
+        start_playing(&mut m, live(), 4, t0);
+        assert!(m.handle(Input::Failed { entry: 3, kind: cast(C::ReceiverFailed) }, t0).is_empty(), "a replaced generation");
+        let fx = m.handle(Input::Failed { entry: 4, kind: cast(C::Unreachable) }, t0);
+        assert!(matches!(m.state(), PlayerState::Reconnecting { attempt: 1, reason: PlayerErrorKind::Cast(C::Unreachable), .. }), "{:?}", m.state());
+        assert_eq!(recorded(&fx), None);
+        assert!(has_load(&m.handle(Input::Tick, t0 + secs(2))));
+        m.handle(Input::Loaded { entry: Some(5) }, t0 + secs(2));
+        let fx = m.handle(Input::Failed { entry: 5, kind: cast(C::Unreachable) }, t0 + secs(3));
+        assert!(matches!(m.state(), PlayerState::Error(PlayerError { kind: PlayerErrorKind::Cast(C::Unreachable), .. })));
+        assert_eq!(recorded(&fx), None, "the TV's problem, not the channel's");
+
+        let mut m = machine();
+        m.set_remote(true);
+        m.handle(Input::Play { target: vod(), immediate: true }, t0);
+        m.handle(Input::Loaded { entry: Some(1) }, t0);
+        let fx = m.handle(Input::Failed { entry: 1, kind: cast(C::Firewall) }, t0);
+        assert!(matches!(m.state(), PlayerState::Error(PlayerError { kind: PlayerErrorKind::Cast(C::Firewall), .. })));
+        assert!(fx.iter().any(|e| matches!(e, Effect::StopMpv)) && recorded(&fx).is_none());
+        // the relay's real HTTP statuses still blame the channel, as mpv's do
+        let mut m = machine();
+        m.set_remote(true);
+        m.handle(Input::Play { target: vod(), immediate: true }, t0);
+        m.handle(Input::Loaded { entry: Some(1) }, t0);
+        m.handle(Input::StartFile { entry: 1 }, t0);
+        m.handle(Input::HttpStatus(404), t0);
+        let fx = m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry: 1 }, t0);
+        assert_eq!(recorded(&fx), Some(PlayerErrorKind::HttpNotFound));
     }
 
     #[test]

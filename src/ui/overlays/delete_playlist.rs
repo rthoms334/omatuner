@@ -132,7 +132,7 @@ impl DeletePlaylistOverlay {
                     text.push_str(&format!("; {left} couldn't move"));
                 }
             }
-            bus.toast(Toast { kind: ToastKind::Info, text, action: None, ttl_ms: 6000 });
+            bus.toast(Toast { kind: ToastKind::Info, text, action: None, also: None, ttl_ms: 6000 });
             Ok(())
         });
         OverlayOutcome::CloseWith(OverlayResult::Confirmed(self.token))

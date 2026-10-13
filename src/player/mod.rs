@@ -44,6 +44,7 @@ pub mod events;
 pub mod mpv;
 pub mod mpv_log;
 pub mod reconnect;
+pub mod remote;
 pub mod render;
 pub mod state;
 pub mod tiles;
@@ -102,6 +103,8 @@ impl CopyPlay {
     pub fn fallback_for(fallback: Option<MediaRef>, elsewhere: Option<MediaRef>, kind: PlayerErrorKind) -> Option<MediaRef> {
         match kind {
             PlayerErrorKind::HttpForbidden | PlayerErrorKind::Budget => elsewhere.or(fallback),
+            // the TV's problem: another copy would fail the same way (DESIGN §40 §3.4)
+            PlayerErrorKind::Cast(_) => None,
             _ => fallback,
         }
     }
@@ -185,6 +188,20 @@ pub enum PlayerCommand {
     ApplyConfig(Box<Config>),
     /// The UI renders frames again after `video_suspended` (see module docs).
     ResumeVideo,
+    /// Cast to `device` (DESIGN §40 §5.5): `play` = what to play there (the agent's `play
+    /// {device}`), `None` = move what plays now (at its position; live: the same channel), or,
+    /// when nothing plays, the last item (the alerts' **Try again** and **Cast again**). The
+    /// local picture stops first, so the relay takes over picture A's lease. Refused in
+    /// multi-view. Picture A only.
+    CastTo {
+        device: crate::model::DeviceId,
+        play: Option<PlayRequest>,
+    },
+    /// End casting: the TV stops, the output goes back to local, then `play_here` resumes here
+    /// (VOD and catch-up at the TV's position, live at the live point), else Idle.
+    StopCasting {
+        play_here: bool,
+    },
     Shutdown,
 }
 
@@ -217,6 +234,10 @@ pub enum PlayerErrorKind {
     ProviderError,
     /// Other mpv error.
     Mpv,
+    /// Casting failed (DESIGN §40 §3.4: one sentence and an action per kind). The TV's or the
+    /// network's problem, not the item's: never recorded as its stream failure
+    /// (`PlayerStore::record_failure`), never a reason to try another copy.
+    Cast(crate::model::CastErrorKind),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -323,6 +344,11 @@ pub struct PlayerSnapshot {
     /// A copy plays in place of this zap-list channel (its playlist was held by the other
     /// picture): the next zap continues from here.
     pub zap_anchor: Option<ChannelId>,
+    /// Casting (DESIGN §40 §11.1): the picture plays on a TV; `None` = local. While casting the
+    /// mpv-only fields (`tracks`, `stream_info` unless the info panel asked, `hwdec`,
+    /// `video_size`, `cache_secs`, `video_suspended`, `sub_*`, `aspect`, `zoom`) stay at their
+    /// defaults.
+    pub cast: Option<crate::model::CastView>,
 }
 
 impl Default for PlayerSnapshot {
@@ -356,6 +382,7 @@ impl Default for PlayerSnapshot {
             audible: true,
             claim: None,
             zap_anchor: None,
+            cast: None,
         }
     }
 }
@@ -389,6 +416,21 @@ pub enum PlayerEvent {
         channel: ChannelId,
         source: SourceId,
         holder: Option<TileId>,
+    },
+    /// Casting: a catch-up seek past what the relay has loaded stopped at its edge (DESIGN §40
+    /// §8.5); the app says "Catch-up can only seek as far as it has loaded".
+    SeekClamped,
+    /// Casting ended without the user asking in Tuner (DESIGN §40 §3.4, §3.8): `kind` is
+    /// `StoppedOnTv` (the TV's remote stopped it, or another device took over). The output is
+    /// local again and nothing plays; no error state. The app alerts where the user is (the
+    /// casting card's place, a toast, or a desktop notification when the window isn't seen)
+    /// with Play here · Cast again. Failures while casting still come as `Failed(Cast(kind))`.
+    /// Sent by the controller (CAST-5), shown by the app (CAST-9).
+    CastEnded {
+        device: crate::model::DeviceId,
+        /// Sanitized device name ("Living Room").
+        name: String,
+        kind: crate::model::CastErrorKind,
     },
 }
 
@@ -448,6 +490,9 @@ pub struct PlayerDeps {
     pub bus: EventBus,
     pub store: Box<dyn PlayerStore>,
     pub resolver: Box<dyn MediaResolver>,
+    /// Opens cast sessions (picture A; DESIGN §40 §5.5). `None` in tests and for picture B:
+    /// `CastTo` then fails as "Casting isn't available".
+    pub cast: Option<Arc<dyn remote::CastConnector>>,
 }
 
 /// Milliseconds since [`Player::start`] of the last frame the UI rendered (0 = never / no
@@ -659,7 +704,7 @@ mod tests {
     }
 
     fn start_with(cfg: &Config, resolver: Lavfi) -> Player {
-        let deps = PlayerDeps { bus: EventBus::new(None).0, store: Box::new(NullPlayerStore), resolver: Box::new(resolver) };
+        let deps = PlayerDeps { bus: EventBus::new(None).0, store: Box::new(NullPlayerStore), resolver: Box::new(resolver), cast: None };
         Player::start(cfg, deps).expect("headless mpv")
     }
 
@@ -709,7 +754,12 @@ mod tests {
         let p = start();
         let mpv = p.mpv.clone().expect("mpv");
         let h = p.handle();
-        let deps = PlayerDeps { bus: EventBus::new(None).0, store: Box::new(NullPlayerStore), resolver: Box::new(Lavfi(Vec::new(), Vec::new())) };
+        let deps = PlayerDeps {
+            bus: EventBus::new(None).0,
+            store: Box::new(NullPlayerStore),
+            resolver: Box::new(Lavfi(Vec::new(), Vec::new())),
+            cast: None,
+        };
         let b = Player::start_tile(&headless_config(), deps, TileId::B, p.budget().clone()).expect("picture B");
         play(&p);
         play(&b);
@@ -817,7 +867,7 @@ mod tests {
     /// `events`).
     fn two_pictures() -> (Tiles, crossbeam_channel::Receiver<crate::msg::AppEvent>) {
         let (bus, events) = EventBus::new(None);
-        let deps = |bus: EventBus| PlayerDeps { bus, store: Box::new(NullPlayerStore), resolver: Box::new(TwoPlaylists) };
+        let deps = |bus: EventBus| PlayerDeps { bus, store: Box::new(NullPlayerStore), resolver: Box::new(TwoPlaylists), cast: None };
         let a = Player::start(&headless_config(), deps(EventBus::new(None).0)).expect("picture A");
         a.budget().set_limit(SourceId(1), Some(1));
         a.budget().set_limit(SourceId(2), Some(1));
@@ -1073,7 +1123,7 @@ mod tests {
     fn a_copy_that_fails_before_its_first_frame_falls_back_to_the_next_once() {
         use crate::model::{MovieId, SourceId};
         let (bus, events) = EventBus::new(None);
-        let deps = PlayerDeps { bus, store: Box::new(NullPlayerStore), resolver: Box::new(Copies) };
+        let deps = PlayerDeps { bus, store: Box::new(NullPlayerStore), resolver: Box::new(Copies), cast: None };
         let p = Player::start(&headless_config(), deps).expect("headless mpv");
         let h = p.handle();
         let copy = |media: i64, fallback: Option<i64>, start_at: Option<f64>| {
@@ -1195,7 +1245,7 @@ mod tests {
         cfg.player.hwdec = "no".into();
         cfg.player.mpv_options.insert("loop-file".into(), "inf".into());
         let path = media.to_string_lossy().into_owned();
-        let deps = || PlayerDeps { bus: EventBus::new(None).0, store: Box::new(NullPlayerStore), resolver: Box::new(File(path.clone())) };
+        let deps = || PlayerDeps { bus: EventBus::new(None).0, store: Box::new(NullPlayerStore), resolver: Box::new(File(path.clone())), cast: None };
         let cpu_s = || {
             let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
             let f: Vec<&str> = stat[stat.rfind(')').unwrap() + 2..].split_whitespace().collect();

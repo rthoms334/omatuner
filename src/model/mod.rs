@@ -6,6 +6,7 @@
 //! refreshes and re-numbering (see DESIGN §8 "Identity & reattach").
 
 pub mod agent;
+pub mod cast;
 pub mod category;
 pub mod epg;
 pub mod ids;
@@ -17,6 +18,7 @@ pub mod user;
 pub mod vod;
 
 pub use agent::AgentName;
+pub use cast::{CastErrorKind, CastHints, CastLevel, CastPhase, CastView, DeviceId, ReceiverKind};
 pub use category::*;
 pub use epg::*;
 pub use ids::*;

@@ -23,9 +23,20 @@
 //! keeps the user's own mute and volume (one listening volume, moved with the sound). Zapping a
 //! picture onto a channel whose playlist the other picture holds plays the channel's copy on a
 //! free playlist (`zap_anchor` keeps the zap-list position), or skips it.
+//!
+//! Casting (DESIGN §40 §5.5, §11): picture A's output is mpv ([`Output::Local`]) or a TV
+//! ([`Output::Remote`]). Everything up to `Effect::Load` is unchanged (resolving, zaps, the
+//! reconnect policy, copy fallback, the budget lease); `load_now_by` then hands the `Playable`
+//! to the cast session instead of `loadfile`, transport commands are forwarded (§11.3), and the
+//! session's events come back through a fifth `select!` arm as the same `state::Input`s
+//! ([`RemoteAdapter`]). The relay's upstream is A's lease: released on its `UpstreamClosed`,
+//! as on mpv's END_FILE. `CastTo` stops mpv first (the TV's first load waits for the local
+//! stream's END_FILE); `StopCasting`, `Stop` and the TV's own stop close the session (≤ 1.5 s
+//! for the upstream's close) and give the picture back to mpv. While casting, mpv's events
+//! don't drive the machine and the mpv-only snapshot fields stay at their defaults.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, select};
@@ -35,17 +46,40 @@ use tokio::sync::watch;
 use super::budget::{Lease, Released, SharedBudget};
 use super::events::{EndReason, MpvEvent, PropId, PropValue};
 use super::mpv_log::{self, MpvLog};
+use super::remote::{RemoteAdapter, RemoteCmd, RemoteEvent, RemoteOutput, TvClock};
 use super::state::{Effect, Input, MachineConfig, PlayerMachine};
-use super::tracks::{AspectMode, parse_track_list, query_stream_info};
+use super::tracks::{AspectMode, StreamInfo, parse_track_list, query_stream_info};
 use super::{CopyPlay, PlayRequest, PlayerCommand, PlayerDeps, PlayerError, PlayerErrorKind, PlayerEvent, PlayerSnapshot, PlayerState, RenderClock};
 use crate::config::Config;
-use crate::model::{ChannelId, HistoryEntry, ItemRef, MediaRef, PlayOrigin, Playable, PlayableKind, SourceId, TileId, WatchProgress};
+use crate::model::{
+    CastErrorKind, CastHints, CastPhase, CastView, ChannelId, DeviceId, HistoryEntry, ItemRef, MediaRef, PlayOrigin, Playable, PlayableKind,
+    SourceId, TileId, WatchProgress,
+};
 use crate::msg::AppEvent;
 
 const PROGRESS_EVERY: Duration = Duration::from_secs(10);
 const PUBLISH_EVERY: Duration = Duration::from_millis(100);
-/// Max wait for the old stream's END_FILE before loading anyway (stop-before-start).
+/// Max wait for the old stream's END_FILE before loading anyway (stop-before-start); leaving
+/// the TV waits as long for the relay's upstream to close ([`cast_close_wait`]).
 const PENDING_LOAD_MAX: Duration = Duration::from_millis(1500);
+/// The tests' override of the TV's close wait (0: [`PENDING_LOAD_MAX`]).
+static CAST_CLOSE_WAIT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Tests only: how long leaving the TV waits for the upstream's close, for every later
+/// controller in this process (a test that plays the TV itself answers `Close` from a polling
+/// thread and must not race the 1.5 s).
+#[doc(hidden)]
+pub fn set_cast_close_wait_for_tests(wait: Duration) {
+    CAST_CLOSE_WAIT_MS.store(wait.as_millis().max(1) as u64, Ordering::Relaxed);
+}
+
+fn cast_close_wait() -> Duration {
+    match CAST_CLOSE_WAIT_MS.load(Ordering::Relaxed) {
+        0 => PENDING_LOAD_MAX,
+        ms => Duration::from_millis(ms),
+    }
+}
+
 /// Max wait for ANOTHER picture's stream that is closing (its claim already moved on, its
 /// END_FILE not seen yet) before the budget's refusal stands: multi-view's "move picture A to
 /// its TV 2 copy so B can use TV" (`Tiles::rearrange`).
@@ -61,6 +95,10 @@ const HEALTH_EVERY: Duration = Duration::from_secs(10 * 60);
 /// `mpv_wait_event` returns queued events before log messages, so ffmpeg's "HTTP error 403"
 /// (logged before the file ended) is delivered just AFTER the END_FILE.
 const END_FILE_LOG_GRACE: Duration = Duration::from_millis(200);
+/// Casting (DESIGN §40 §11.3, §8.4): a live pause on the TV holds while the relay's sliding
+/// window (20 segments of ≥ 4 s) still has the paused point; resuming later reloads at the
+/// live point.
+const LIVE_PAUSE_WINDOW: Duration = Duration::from_secs(80);
 
 /// Which picture a controller drives and the budget it shares (multi-view, DESIGN §35).
 #[derive(Debug, Clone)]
@@ -124,6 +162,9 @@ pub fn spawn(
         logged: LoggedState { label: state_label(&PlayerState::Idle), who: "nothing".into(), since: Instant::now(), outage: None, provider: None },
         last_health: Instant::now(),
         ffmpeg_reconnects: 0,
+        output: Output::Local,
+        lease_generation: None,
+        local_view: None,
     };
     let name = if tile == TileId::A { "player".to_owned() } else { format!("player-{}", tile.letter().to_ascii_lowercase()) };
     std::thread::Builder::new().name(name).spawn(move || c.run(cmd_rx, evt_rx))
@@ -133,6 +174,44 @@ pub fn spawn(
 struct PendingLoad {
     playable: Arc<Playable>,
     deadline: Instant,
+}
+
+/// Where the picture goes (DESIGN §40 §5.5).
+enum Output {
+    /// mpv, in the window.
+    Local,
+    /// A TV, through a cast session.
+    Remote(Box<Remote>),
+}
+
+/// A cast session as the controller holds it.
+struct Remote {
+    device: DeviceId,
+    out: RemoteOutput,
+    /// The session still runs: `Lost` (or its channel closing) ends it, and the next load opens
+    /// a new one (the reconnect policy's one re-verify of `Cast(Unreachable)`, Try again).
+    alive: bool,
+    adapter: RemoteAdapter,
+    /// The generation whose relay upstream is open (`UpstreamOpened` → `UpstreamClosed`).
+    upstream: Option<u64>,
+    /// The relay's probe of the current generation (the info panel, `RefreshStreamInfo`).
+    info: Option<StreamInfo>,
+    /// mpv's view of the item that moved to the TV, for its first load only (§8.2 hint 4).
+    hints: Option<(MediaRef, CastHints)>,
+    /// A live pause on the TV began ([`LIVE_PAUSE_WINDOW`]).
+    paused_at: Option<Instant>,
+    /// Where the TV is between its reports (every 10 s, §7.3): a relative seek counts from it,
+    /// and a failure gives it to the machine first (a reconnect resumes there).
+    clock: TvClock,
+}
+
+/// The mpv-only snapshot fields the user set, kept while casting shows the defaults (mpv keeps
+/// them all along): back on mpv they are true again.
+struct LocalView {
+    sub_delay: f64,
+    sub_scale: f64,
+    aspect: AspectMode,
+    zoom: f64,
 }
 
 struct Controller {
@@ -199,6 +278,13 @@ struct Controller {
     last_health: Instant,
     /// FFmpeg's own reconnects of dropped transfers since the last health line.
     ffmpeg_reconnects: u32,
+    /// mpv or a TV (DESIGN §40 §5.5).
+    output: Output,
+    /// Casting: the load generation whose relay upstream the current lease is (`lease_entry`
+    /// is mpv's playlist entry; the two never mix, their numbers would).
+    lease_generation: Option<u64>,
+    /// The user's mpv-only snapshot fields while casting ([`LocalView`]).
+    local_view: Option<LocalView>,
 }
 
 /// The state last logged (see [`Controller::log_transition`]).
@@ -223,9 +309,15 @@ impl Controller {
                 Some((.., at)) => crossbeam_channel::at(*at),
                 None => crossbeam_channel::never(),
             };
+            let remote = match &self.output {
+                Output::Remote(r) if r.alive => r.out.events.clone(),
+                _ => crossbeam_channel::never(),
+            };
             select! {
                 recv(cmd_rx) -> cmd => match cmd {
                     Ok(PlayerCommand::Shutdown) | Err(_) => {
+                        // the TV gets the session's fast stop (≤ 300 ms, nobody waits for it)
+                        self.leave_remote(true, "shutdown");
                         // the final progress save reaches the store before its writer closes
                         self.feed(Input::Stop, Instant::now());
                         self.publish(true);
@@ -248,6 +340,11 @@ impl Controller {
                     Ok(ev) => state_changed |= self.mpv_event(ev),
                 },
                 recv(deferred) -> _ => state_changed |= self.flush_deferred_end(),
+                recv(remote) -> ev => state_changed |= match ev {
+                    Ok(ev) => self.remote_event(ev),
+                    // the session task ended without a word: lost like an unreachable TV
+                    Err(_) => self.remote_event(RemoteEvent::Lost(CastErrorKind::Unreachable)),
+                },
                 recv(ticker) -> _ => {
                     let now = Instant::now();
                     state_changed |= self.feed(Input::Tick, now);
@@ -374,7 +471,17 @@ impl Controller {
         let state = self.machine.state();
         let reconnects = std::mem::take(&mut self.ffmpeg_reconnects);
         let health = if self.tile == TileId::A { "health".to_owned() } else { format!("health {}", self.tile) };
-        if matches!(state, PlayerState::Playing | PlayerState::Buffering { .. } | PlayerState::Paused) {
+        if let Some(v) = &self.snap.cast {
+            // mpv is stopped: its cache and drops say nothing about the TV
+            tracing::info!(
+                "{health}: {} {} on cast device {} ({:?}, {:?}); {mem}",
+                self.target_label(),
+                state_label(state),
+                v.device.short(),
+                v.phase,
+                v.level
+            );
+        } else if matches!(state, PlayerState::Playing | PlayerState::Buffering { .. } | PlayerState::Paused) {
             let int = |name: &str| self.mpv.get_property::<i64>(name).ok();
             let speed = int("cache-speed").map_or("-".into(), |b| format!("{} KiB/s", b / 1024));
             let (vo, dec) = (int("frame-drop-count").unwrap_or(0), int("decoder-frame-drop-count").unwrap_or(0));
@@ -396,15 +503,8 @@ impl Controller {
         for e in fx {
             match e {
                 Effect::Load(p) => self.load(p),
-                Effect::StopMpv => {
-                    self.pending = None;
-                    self.waiting = None;
-                    let _ = self.mpv.command("stop", &[]);
-                    // the lease is released when the stopped entry's END_FILE arrives
-                    if self.lease_entry.is_none() {
-                        self.release_lease();
-                    }
-                }
+                Effect::StopMpv if self.casting() => self.stop_remote(),
+                Effect::StopMpv => self.stop_local(),
                 Effect::Emit(mut ev) => {
                     if let PlayerEvent::Ended { finished, .. } = &mut ev {
                         *finished = self.watched(pos.or(self.machine.last_position()));
@@ -442,13 +542,54 @@ impl Controller {
             self.budget.release(self.tile, l, closed);
         }
         self.lease_entry = None;
+        self.lease_generation = None;
         self.lease_redirected = false;
     }
 
+    /// `Effect::StopMpv` on mpv: stop; the lease is released when the stopped entry's END_FILE
+    /// arrives (now, when no entry is open).
+    fn stop_local(&mut self) {
+        self.pending = None;
+        self.waiting = None;
+        let _ = self.mpv.command("stop", &[]);
+        if self.lease_entry.is_none() {
+            self.release_lease();
+        }
+    }
+
+    /// `Effect::StopMpv` while casting (DESIGN §40 §11.3): a failure stops the TV (the session
+    /// stays for the next load, and the relay's upstream closes with it), except between
+    /// reconnect attempts, where the TV keeps its item and the next load replaces it (§7.3).
+    /// The lease waits for the upstream's `UpstreamClosed`, unless that upstream never opened
+    /// (or already closed).
+    fn stop_remote(&mut self) {
+        self.pending = None;
+        self.waiting = None;
+        let replaced_next = matches!(self.machine.state(), PlayerState::Reconnecting { .. });
+        let Output::Remote(r) = &self.output else { return };
+        if !replaced_next && r.alive {
+            let _ = r.out.cmd.send(RemoteCmd::Stop);
+        }
+        if self.lease_generation.is_some() && r.upstream != self.lease_generation {
+            self.release_lease();
+        }
+    }
+
     /// Stop-before-start (see [`must_stop_first`]): `stop`, wait for the old entry's END_FILE
-    /// (or 1.5 s), then load.
+    /// (or 1.5 s), then load. Casting: the relay stops its previous generation itself before it
+    /// opens the next (§8.5), so only the local stream a cast just stopped is waited for: the
+    /// TV's upstream never runs alongside it.
     fn load(&mut self, p: Arc<Playable>) {
         self.waiting = None;
+        if self.casting() {
+            if let Some(old) = self.lease_entry {
+                tracing::debug!("cast: waiting for the local entry {old}'s END_FILE before the TV's load");
+                self.pending = Some(PendingLoad { playable: p, deadline: Instant::now() + PENDING_LOAD_MAX });
+                return;
+            }
+            self.pending = None;
+            return self.load_now(p);
+        }
         if let Some(old) = must_stop_first(self.lease.as_ref(), self.lease_entry, p.source_id, &self.budget) {
             tracing::debug!("stop-before-start: stopping entry {old} and waiting for its END_FILE");
             let _ = self.mpv.command("stop", &[]);
@@ -493,8 +634,11 @@ impl Controller {
                 }
                 Err(e) if e.closing && Instant::now() < deadline => {
                     tracing::debug!("{}: source {} is still closing in picture {:?}; waiting", self.log, src.0, e.holder);
-                    // the lease went above: the old stream must not run on unaccounted
-                    let _ = self.mpv.command("stop", &[]);
+                    // the lease went above: the old stream must not run on unaccounted (casting
+                    // excludes multi-view, so the relay never gets here)
+                    if !self.casting() {
+                        let _ = self.mpv.command("stop", &[]);
+                    }
                     self.waiting = Some(PendingLoad { playable: p, deadline });
                     return;
                 }
@@ -507,6 +651,9 @@ impl Controller {
         // extra header values are credentials (cookies, tokens): keep them out of mpv logs
         for (_, v) in &p.headers.extra {
             crate::redact::register_secret(v);
+        }
+        if self.casting() {
+            return self.load_remote(p);
         }
         if self.snap.paused {
             // a new play always plays (mpv's `pause` survives loadfile)
@@ -536,6 +683,12 @@ impl Controller {
         };
         tracing::debug!("loadfile: entry {entry:?}");
         self.lease_entry = entry;
+        self.loaded(&p, entry);
+    }
+
+    /// The load of `p` went out as `entry` (mpv's playlist entry, or a cast generation): bind
+    /// the machine to it and arm the connection-limit race window.
+    fn loaded(&mut self, p: &Playable, entry: Option<i64>) {
         self.feed(Input::Loaded { entry }, Instant::now());
         let closed = p.source_id.and_then(|s| self.other_stream_closed(s, &p.media));
         self.race_armed = closed.is_some();
@@ -543,6 +696,78 @@ impl Controller {
             tracing::debug!("another stream of this source closed {:?} ago: a 403 is the connection-limit race", at.elapsed());
         }
         self.feed(Input::SourceClosed(closed), Instant::now());
+    }
+
+    /// `load_now_by` with the picture on a TV (DESIGN §40 §5.5): the lease and the secret
+    /// registration above are unchanged; the session gets `RemoteCmd::Load` (a replace on the
+    /// TV after the first) and the machine `Loaded { entry: generation }`. A session that was
+    /// lost is opened again first: the reconnect policy's one re-verify of `Cast(Unreachable)`,
+    /// Try again, or the next play after the TV dropped out.
+    fn load_remote(&mut self, p: Arc<Playable>) {
+        let now = Instant::now();
+        let reopen = match &self.output {
+            Output::Remote(r) if !r.alive => Some(r.device),
+            _ => None,
+        };
+        if let Some(device) = reopen {
+            match self.open_session(device) {
+                Ok(out) => {
+                    tracing::info!("{}: cast device {}: session opened again", self.log, device.short());
+                    self.snap.cast = Some(out.view.clone());
+                    if let Output::Remote(r) = &mut self.output {
+                        r.out = out;
+                        r.alive = true;
+                        r.upstream = None;
+                    }
+                }
+                Err(err) => {
+                    tracing::info!("{}: cast device {}: the session can't be opened again ({:?})", self.log, device.short(), err.kind);
+                    self.release_lease();
+                    self.feed(Input::Fail(err), now);
+                    return;
+                }
+            }
+        }
+        self.snap.load_generation += 1;
+        let generation = self.snap.load_generation;
+        // periodic progress saves count from the start of each item
+        self.last_progress = now;
+        self.snap.position = None;
+        self.snap.duration = p.duration_hint;
+        self.snap.stream_info = None;
+        self.snap.last_error = None;
+        let live = p.kind.is_live();
+        if let Some(v) = &mut self.snap.cast {
+            v.level = None;
+            v.behind_live_s = None;
+            self.snap.seekable = v.can_seek && !live;
+        }
+        if self.snap.paused {
+            // a new play always plays (the session's load ends with `setRate 1`)
+            self.snap.paused = false;
+            self.feed(Input::Pause(false), now);
+        }
+        // a buffering TV's cache pause was its generation's: each starts clear, as a new file
+        // does under mpv (the session's new item reports no `Buffering(false)`, so the first
+        // picture would land in Buffering and the stall clock reload a live channel every 20 s)
+        self.feed(Input::PausedForCache(false), now);
+        let Output::Remote(r) = &mut self.output else { return };
+        r.paused_at = None;
+        r.info = None;
+        r.clock = TvClock::default();
+        let hints = r.hints.take().filter(|(m, _)| *m == p.media).map(|(_, h)| h).unwrap_or_default();
+        r.adapter.loaded(generation, live);
+        let sent = r.out.cmd.send(RemoteCmd::Load { generation, playable: p.clone(), hints }).is_ok();
+        r.alive &= sent;
+        if self.lease.is_some() {
+            self.lease_generation = Some(generation);
+        }
+        tracing::debug!("cast load: generation {generation}");
+        self.loaded(&p, Some(generation as i64));
+        if !sent {
+            // the session ended before it could take the load
+            self.feed(Input::Failed { entry: generation as i64, kind: PlayerErrorKind::Cast(CastErrorKind::Unreachable) }, now);
+        }
     }
 
     /// When a stream of `source` closed within the race window, on a source whose limit is one
@@ -662,6 +887,11 @@ impl Controller {
     }
 
     fn command(&mut self, cmd: PlayerCommand) -> bool {
+        if self.casting()
+            && let Some(changed) = self.remote_command(&cmd)
+        {
+            return changed;
+        }
         let m = self.mpv.clone();
         match cmd {
             PlayerCommand::Play(req) => {
@@ -785,9 +1015,439 @@ impl Controller {
                     self.snap.video_suspended = false;
                 }
             }
+            PlayerCommand::CastTo { device, play } => return self.cast_to(device, play),
+            PlayerCommand::StopCasting { play_here } => return self.stop_casting(play_here),
             PlayerCommand::Shutdown => {}
         }
         self.dirty = true;
+        false
+    }
+
+    /// The picture plays on a TV.
+    fn casting(&self) -> bool {
+        matches!(self.output, Output::Remote(_))
+    }
+
+    /// mpv shows the current target (what `CastTo` reads the hints from).
+    fn on_screen(&self) -> bool {
+        matches!(self.machine.state(), PlayerState::Playing | PlayerState::Paused | PlayerState::Buffering { .. })
+    }
+
+    /// Something plays or is on its way (a cast's Try again replays only when nothing does).
+    fn busy(&self) -> bool {
+        self.machine.state().is_active() || matches!(self.machine.state(), PlayerState::Paused)
+    }
+
+    fn open_session(&self, device: DeviceId) -> Result<RemoteOutput, PlayerError> {
+        let unavailable = || PlayerError { kind: PlayerErrorKind::Cast(CastErrorKind::Unreachable), message: "Casting isn't available.".into() };
+        self.deps.cast.as_ref().ok_or_else(unavailable)?.open(device)
+    }
+
+    /// What `CastTo { play: None }` moves and Play here brings back (DESIGN §40 §5.5): the
+    /// current item, else the last one (Try again, Cast again after the TV stopped it). VOD and
+    /// catch-up continue at their position (the TV's while casting: its reports are the
+    /// machine's positions), or where they were asked to start if they never played; an item
+    /// that ended starts over; live comes in at the live point.
+    fn resume_target(&self) -> Option<Arc<Playable>> {
+        let p = self.machine.target().or(self.snap.playable.as_ref())?;
+        let at = match (p.kind.is_live(), self.machine.state()) {
+            (true, _) | (false, PlayerState::Ended) => None,
+            (false, _) => self.machine.last_position().or(p.start_at).filter(|s| *s > 0.0),
+        };
+        Some(Arc::new(Playable { start_at: at, ..(**p).clone() }))
+    }
+
+    /// `CastTo` (DESIGN §40 §5.5): refused in multi-view (the router refuses it first; picture
+    /// B never casts); on the TV already, it plays `play` there, or the last item when nothing
+    /// plays (Try again, Cast again). Otherwise: mpv's hints of what plays, open the session
+    /// (non-blocking; a failure leaves the picture where it is), stop mpv (the TV's first load
+    /// waits for its END_FILE, so the relay's upstream becomes A's only lease), and play `play`
+    /// or what played, at its position. Another TV's session (or a lost one) ends first: one
+    /// relay at a time.
+    fn cast_to(&mut self, device: DeviceId, play: Option<PlayRequest>) -> bool {
+        if self.tile != TileId::A || self.budget.others_active(self.tile) {
+            tracing::info!("{}: not casting: multi-view is on", self.log);
+            return false;
+        }
+        if let Output::Remote(r) = &self.output
+            && r.alive
+            && r.device == device
+        {
+            return match play {
+                Some(req) => {
+                    self.snap.zap_anchor = None;
+                    self.resolve_and_play(req)
+                }
+                None if !self.busy() => self.replay(),
+                None => false,
+            };
+        }
+        let mut changed = false;
+        if self.casting() {
+            self.leave_remote(false, "moved to another TV");
+            changed = self.feed(Input::Stop, Instant::now());
+        }
+        let moving = match &play {
+            Some(_) => None,
+            None => match self.resume_target() {
+                Some(t) => Some(t),
+                None => {
+                    tracing::debug!("{}: nothing to cast", self.log);
+                    return changed;
+                }
+            },
+        };
+        // read before mpv stops; only for what mpv shows (§8.2 hint 4)
+        let hints = match (&moving, self.machine.target()) {
+            (Some(_), Some(t)) if self.on_screen() => Some((t.media.clone(), super::mpv::cast_hints(&self.mpv))),
+            _ => None,
+        };
+        let out = match self.open_session(device) {
+            Ok(out) => out,
+            Err(err) => {
+                tracing::info!("{}: casting to device {} didn't start ({:?})", self.log, device.short(), err.kind);
+                self.emit(PlayerEvent::Failed(err));
+                return changed;
+            }
+        };
+        self.stop_local();
+        self.enter_remote(device, out, hints);
+        match (play, moving) {
+            (Some(req), _) => {
+                self.snap.zap_anchor = None;
+                self.resolve_and_play(req)
+            }
+            (None, Some(target)) => self.feed(Input::Play { target, immediate: true }, Instant::now()),
+            (None, None) => changed,
+        }
+    }
+
+    /// Play [`Controller::resume_target`] in the current output.
+    fn replay(&mut self) -> bool {
+        match self.resume_target() {
+            Some(target) => self.feed(Input::Play { target, immediate: true }, Instant::now()),
+            None => false,
+        }
+    }
+
+    /// `StopCasting` (DESIGN §40 §5.5): the session closes (≤ 1.5 s for the upstream's close, so
+    /// the lease is free), the picture is mpv's again, then Play here (VOD and catch-up at the
+    /// TV's last position, live at the live point) or Idle. Not casting, Play here plays the
+    /// last item here when nothing plays (the alert after the TV stopped it).
+    fn stop_casting(&mut self, play_here: bool) -> bool {
+        let was = self.leave_remote(false, if play_here { "Play here" } else { "Stop casting" }).is_some();
+        if !was && (!play_here || self.busy()) {
+            return false;
+        }
+        match play_here.then(|| self.resume_target()).flatten() {
+            Some(target) => self.feed(Input::Play { target, immediate: true }, Instant::now()),
+            None => self.feed(Input::Stop, Instant::now()),
+        }
+    }
+
+    /// The output becomes the TV. The mpv-only snapshot fields show their defaults while
+    /// casting (§5.5 `publish`) and come back with mpv; the pause mirrors start over.
+    fn enter_remote(&mut self, device: DeviceId, out: RemoteOutput, hints: Option<(MediaRef, CastHints)>) {
+        tracing::info!("{}: casting to device {} ({:?})", self.log, device.short(), out.view.kind);
+        if self.snap.video_suspended {
+            // back on mpv, the next local play decodes video again
+            let _ = self.mpv.set_property("vid", "auto");
+        }
+        let d = PlayerSnapshot::default();
+        let s = &mut self.snap;
+        self.local_view = Some(LocalView { sub_delay: s.sub_delay, sub_scale: s.sub_scale, aspect: s.aspect, zoom: s.zoom });
+        (s.sub_delay, s.sub_scale, s.aspect, s.zoom) = (d.sub_delay, d.sub_scale, d.aspect, d.zoom);
+        (s.stream_info, s.hwdec, s.video_size, s.cache_secs, s.video_suspended) = (None, None, None, None, false);
+        s.paused = false;
+        s.cast = Some(out.view.clone());
+        if s.tracks != d.tracks {
+            s.tracks = d.tracks;
+            self.emit(PlayerEvent::TracksChanged);
+        }
+        self.machine.set_remote(true);
+        let adapter = RemoteAdapter::default();
+        self.output = Output::Remote(Box::new(Remote {
+            device,
+            out,
+            alive: true,
+            adapter,
+            upstream: None,
+            info: None,
+            hints,
+            paused_at: None,
+            clock: TvClock::default(),
+        }));
+        self.force_publish = true;
+    }
+
+    /// Leave the TV (DESIGN §40 §5.5 `StopCasting` steps 1–3): `Close` the session and wait
+    /// ≤ 1.5 s for its upstream to close, unless `fast` (shutdown: the session's own ≤ 300 ms
+    /// stop, nobody waits). Positions the TV still reports meanwhile count: the session asks it
+    /// for one before it stops, and Play here continues there. Then the lease is released and
+    /// the picture is mpv's again; the caller plays or stops. Returns the session's view, `None`
+    /// when not casting. `why` ends the INFO line that says casting ended (field logs tell a stop
+    /// from Play here, the TV's own stop or a move to another TV).
+    fn leave_remote(&mut self, fast: bool, why: &str) -> Option<CastView> {
+        let Output::Remote(mut r) = std::mem::replace(&mut self.output, Output::Local) else { return None };
+        if r.alive {
+            let _ = r.out.cmd.send(RemoteCmd::Close { fast });
+            let deadline = Instant::now() + cast_close_wait();
+            while !fast && r.upstream.is_some() {
+                match r.out.events.recv_deadline(deadline) {
+                    Ok(RemoteEvent::UpstreamClosed { generation, .. }) if r.upstream == Some(generation) => r.upstream = None,
+                    Ok(ev @ RemoteEvent::Position { .. }) => {
+                        for input in r.adapter.inputs(&ev) {
+                            if let Input::TimePos(t) = input {
+                                self.snap.position = Some(t);
+                                self.feed(input, Instant::now());
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            if r.upstream.is_some() {
+                tracing::debug!("cast: the relay's upstream didn't report its close in time");
+            }
+        }
+        if self.lease_generation.is_some() {
+            self.release_lease();
+        }
+        // a TV load still waiting for the local stream's END_FILE
+        self.pending = None;
+        self.machine.set_remote(false);
+        if let Some(l) = self.local_view.take() {
+            (self.snap.sub_delay, self.snap.sub_scale, self.snap.aspect, self.snap.zoom) = (l.sub_delay, l.sub_scale, l.aspect, l.zoom);
+        }
+        // mpv's pause from before the cast must not hold the next local play
+        let _ = self.mpv.set_property("pause", false);
+        self.snap.paused = false;
+        self.snap.seekable = false;
+        self.snap.stream_info = None;
+        self.force_publish = true;
+        tracing::info!("{}: casting to device {} ended: {why}", self.log, r.device.short());
+        self.snap.cast.take()
+    }
+
+    /// A session event (DESIGN §40 §11.2): the view and the snapshot fields here, the machine's
+    /// inputs from the [`RemoteAdapter`]. The relay's upstream closing releases the lease (and
+    /// records it for the race window, exactly as END_FILE does); a lost session's relay is gone
+    /// with it. Returns true if the state changed.
+    fn remote_event(&mut self, ev: RemoteEvent) -> bool {
+        let now = Instant::now();
+        let Output::Remote(r) = &mut self.output else { return false };
+        let ours = |g: &u64| r.adapter.generation() == Some(*g);
+        let clamped = matches!(&ev, RemoteEvent::SeekClamped { generation } if ours(generation));
+        let mut release = false;
+        let mut repaint = false;
+        self.dirty = true;
+        match &ev {
+            RemoteEvent::Phase(p) => {
+                if let Some(v) = &mut self.snap.cast {
+                    v.phase = *p;
+                }
+                self.force_publish = true;
+            }
+            RemoteEvent::Level(l) => {
+                tracing::info!("{}: the TV is fed {l:?}", self.log);
+                if let Some(v) = &mut self.snap.cast {
+                    v.level = Some(*l);
+                }
+                self.force_publish = true;
+            }
+            RemoteEvent::AsIs(on) => {
+                if let Some(v) = &mut self.snap.cast {
+                    v.as_is = *on;
+                }
+                self.force_publish = true;
+            }
+            RemoteEvent::BehindLive(s) => {
+                if let Some(v) = &mut self.snap.cast {
+                    v.behind_live_s = *s;
+                }
+            }
+            RemoteEvent::StreamInfo { generation, info } if ours(generation) => r.info = Some((**info).clone()),
+            RemoteEvent::UpstreamOpened { generation } => r.upstream = Some(*generation),
+            RemoteEvent::UpstreamClosed { generation, at } => {
+                if r.upstream == Some(*generation) {
+                    r.upstream = None;
+                }
+                if self.lease_generation == Some(*generation) {
+                    tracing::debug!("cast: the upstream of generation {generation} closed {:?} ago; lease released", at.elapsed());
+                    release = true;
+                }
+            }
+            RemoteEvent::Position { generation, pos, dur } if ours(generation) => {
+                r.clock.report(*pos, now);
+                self.snap.position = Some(*pos);
+                self.snap.duration = dur.or(self.snap.duration);
+                let sec = pos.floor() as i64;
+                repaint = self.last_second.replace(sec) != Some(sec);
+            }
+            RemoteEvent::Paused(p) => {
+                self.snap.paused = *p;
+                r.paused_at = if *p { r.paused_at.or(Some(now)) } else { None };
+                r.clock.paused(*p, now);
+                self.force_publish = true;
+            }
+            RemoteEvent::Buffering(b) => r.clock.buffering(*b, now),
+            RemoteEvent::Playing { generation } if ours(generation) => {
+                self.force_publish |= std::mem::take(&mut self.snap.paused);
+                r.paused_at = None;
+                r.clock.playing(now);
+            }
+            RemoteEvent::Lost(kind) => {
+                tracing::info!("{}: the cast session to device {} ended: {kind:?}", self.log, r.device.short());
+                r.alive = false;
+                r.upstream = None;
+                release = self.lease_generation.is_some();
+                if let Some(v) = &mut self.snap.cast {
+                    v.phase = CastPhase::Lost;
+                }
+                self.force_publish = true;
+            }
+            _ => {}
+        }
+        let mut inputs = r.adapter.inputs(&ev);
+        // the generation fails while the TV still plays what it buffered: the machine's resume
+        // point (a reconnect, Try again) is where the TV is now, not its last report (§11.2)
+        if inputs.iter().any(|i| matches!(i, Input::EndFile { reason: EndReason::Error, .. } | Input::Failed { .. }))
+            && let Some(pos) = r.clock.now(now)
+        {
+            inputs.insert(0, Input::TimePos(pos));
+        }
+        if release {
+            self.release_lease();
+        }
+        if repaint {
+            self.deps.bus.request_repaint();
+        }
+        match ev {
+            RemoteEvent::Lost(CastErrorKind::StoppedOnTv) => return self.stopped_on_tv(),
+            RemoteEvent::SeekClamped { .. } if clamped => self.emit(PlayerEvent::SeekClamped),
+            RemoteEvent::Http { status, .. } if !inputs.is_empty() => self.log_http(status, now),
+            RemoteEvent::ProviderText { ref text, .. } if !inputs.is_empty() => {
+                tracing::warn!("{}: the provider answered the relay with a message instead of a stream: {text:?}", self.log);
+            }
+            _ => {}
+        }
+        let mut changed = false;
+        for input in inputs {
+            let refusal = match input {
+                Input::HttpStatus(code) => Some(code),
+                _ => None,
+            };
+            changed |= self.feed(input, now);
+            if let Some(code) = refusal {
+                self.observe_refusal(code);
+            }
+        }
+        changed
+    }
+
+    /// `Lost(StoppedOnTv)` (DESIGN §40 §5.5, §3.4): the TV's remote stopped it, or another
+    /// sender took over. Casting ends as for Stop, without an error state; the app alerts
+    /// where the user is, with Play here · Cast again.
+    fn stopped_on_tv(&mut self) -> bool {
+        let view = self.leave_remote(false, "stopped on the TV");
+        let changed = self.feed(Input::Stop, Instant::now());
+        if let Some(v) = view {
+            self.emit(PlayerEvent::CastEnded { device: v.device, name: v.name, kind: CastErrorKind::StoppedOnTv });
+        }
+        changed
+    }
+
+    /// Transport while casting (DESIGN §40 §11.3). `None` leaves the command to the shared
+    /// path: plays, zaps, recall and reconnects run unchanged up to `Effect::Load`, which goes
+    /// to the TV. What the TV can't do (tracks, aspect, zoom, subtitles, light decoding, video
+    /// suspension) is a no-op: the UI hides those controls and says "Not available while
+    /// casting"; volume reaches only a receiver that takes one (AirPlay doesn't: "Use the TV
+    /// remote for volume"), and the snapshot's volume is left alone.
+    fn remote_command(&mut self, cmd: &PlayerCommand) -> Option<bool> {
+        use PlayerCommand as C;
+        let Output::Remote(r) = &self.output else { return None };
+        let send = |c: RemoteCmd| {
+            if r.alive {
+                let _ = r.out.cmd.send(c);
+            }
+        };
+        let volume = self.snap.cast.as_ref().is_some_and(|v| v.volume);
+        match *cmd {
+            // the sleep timer, Ctrl+Shift+S and relock turn the TV off: casting ends
+            C::Stop => {
+                self.leave_remote(false, "stopped");
+                return Some(self.feed(Input::Stop, Instant::now()));
+            }
+            C::TogglePause => return Some(self.remote_pause(!self.snap.paused)),
+            C::SetPause(p) => return Some(self.remote_pause(p)),
+            // a replace with a playlist view inside what's produced, else a restart (the session)
+            C::SeekBy(d) if self.snap.seekable => {
+                let now = r.clock.now(Instant::now());
+                let t = (now.or(self.snap.position).unwrap_or(0.0) + d).max(0.0);
+                let t = self.snap.duration.map_or(t, |dur| t.min(dur));
+                send(RemoteCmd::SeekTo(t));
+                return Some(self.remote_seeked(t));
+            }
+            C::SeekTo(t) if self.snap.seekable => {
+                send(RemoteCmd::SeekTo(t.max(0.0)));
+                return Some(self.remote_seeked(t.max(0.0)));
+            }
+            C::SeekBy(_) | C::SeekTo(_) => {}
+            C::SetVolume(v) if volume => send(RemoteCmd::SetVolume(v.clamp(0.0, 130.0))),
+            C::AdjustVolume(d) if volume => send(RemoteCmd::SetVolume((self.snap.volume + d).clamp(0.0, 130.0))),
+            C::SetVolume(_) | C::AdjustVolume(_) | C::ToggleMute | C::SetMute(_) => {}
+            C::SetAudioTrack(_)
+            | C::SetSubtitleTrack(_)
+            | C::CycleAudio
+            | C::CycleSubtitle
+            | C::AdjustSubDelay(_)
+            | C::ResetSubDelay
+            | C::AdjustSubScale(_)
+            | C::SetAspect(_)
+            | C::CycleAspect
+            | C::SetZoom(_)
+            | C::SetLightDecode(_)
+            | C::ResumeVideo => {}
+            // the relay's probe: codec, size, fps, interlacing
+            C::RefreshStreamInfo => self.snap.stream_info = r.info.clone(),
+            _ => return None,
+        }
+        self.dirty = true;
+        Some(false)
+    }
+
+    /// A seek went to the TV: its target is where the item is now until the TV reports (every
+    /// 10 s, or once it plays the replace), as mpv's `time-pos` moves at a seek. A second skip
+    /// counts from it (three quick 10 s skips are 30 s; a small one can't undo a big one), and
+    /// the stall clock and a reconnect's resume point follow it. A clamp (catch-up past what's
+    /// loaded) is corrected by the next report.
+    fn remote_seeked(&mut self, t: f64) -> bool {
+        let now = Instant::now();
+        if let Output::Remote(r) = &mut self.output {
+            r.clock.report(t, now);
+        }
+        self.snap.position = Some(t);
+        self.dirty = true;
+        self.feed(Input::TimePos(t), now)
+    }
+
+    /// Pause or resume the TV (`setRate 0/1`). A live pause holds only while the relay's window
+    /// still has the paused point ([`LIVE_PAUSE_WINDOW`]); resuming later reloads at the live
+    /// point (a replace on the TV).
+    fn remote_pause(&mut self, pause: bool) -> bool {
+        let Output::Remote(r) = &self.output else { return false };
+        let expired = r.paused_at.is_some_and(|at| at.elapsed() >= LIVE_PAUSE_WINDOW);
+        if !pause
+            && expired
+            && let Some(t) = self.machine.target().filter(|t| t.kind.is_live()).cloned()
+        {
+            tracing::info!("{}: the TV was paused past the live window; tuning in again at the live point", self.log);
+            return self.feed(Input::Play { target: t, immediate: true }, Instant::now());
+        }
+        if r.alive {
+            let _ = r.out.cmd.send(RemoteCmd::SetPaused(pause));
+        }
         false
     }
 
@@ -929,7 +1589,9 @@ impl Controller {
         } else {
             tracing::debug!("{line}");
         }
-        let changed = self.feed(Input::EndFile { reason, error, entry: entry_id }, Instant::now());
+        // casting: mpv's entries aren't the machine's (its entries are generations then); only
+        // the lease of the local stream a cast stopped is settled here
+        let changed = !self.casting() && self.feed(Input::EndFile { reason, error, entry: entry_id }, Instant::now());
         match lease_on_end(self.lease_entry, entry_id, reason, inserted) {
             LeaseOnEnd::Unrelated => {}
             LeaseOnEnd::MoveTo(next) => {
@@ -961,6 +1623,9 @@ impl Controller {
 
     fn mpv_event(&mut self, ev: MpvEvent) -> bool {
         let now = Instant::now();
+        if self.casting() {
+            return self.mpv_event_casting(ev, now);
+        }
         match ev {
             MpvEvent::StartFile { entry_id } => {
                 if self.lease_redirected && self.lease.is_some() {
@@ -1005,26 +1670,14 @@ impl Controller {
             }
             MpvEvent::Log { level, prefix, text } => {
                 if let Some(code) = http_status_in(&text) {
-                    let (verdict, summary) = self.http_log.admit(&format!("HTTP {code}"), tracing::Level::INFO, now);
-                    if let Some(s) = summary {
-                        log_http_summary(&s);
-                    }
-                    if verdict != mpv_log::Verdict::Suppress {
-                        tracing::info!("HTTP {code} in {}", state_label(self.machine.state()));
-                    }
+                    self.log_http(code, now);
                     self.feed(Input::HttpStatus(code), now);
                     self.observe_refusal(code);
                 }
                 if mpv_log::is_internal_reconnect(&text) {
                     self.ffmpeg_reconnects += 1;
                 }
-                let (verdict, summary) = self.mpv_log.admit(&prefix, mpv_log::level_for(&level, &text), now);
-                if let Some(s) = summary {
-                    mpv_log::emit_summary(&s);
-                }
-                if let mpv_log::Verdict::Show(l) = verdict {
-                    mpv_log::emit(l, &prefix, &text);
-                }
+                self.log_mpv(&level, &prefix, &text, now);
                 false
             }
             MpvEvent::Prop { id, value } => self.prop(id, value, now),
@@ -1034,6 +1687,48 @@ impl Controller {
                 false
             }
             MpvEvent::Shutdown => false,
+        }
+    }
+
+    /// mpv's events while the picture is on a TV: mpv is stopped and none of its states is the
+    /// picture's. Only the END_FILE of the local stream a cast stopped counts (its lease, and
+    /// the TV's first load waiting for it), plus mpv's log lines and the volume (the user's,
+    /// left alone while casting).
+    fn mpv_event_casting(&mut self, ev: MpvEvent, now: Instant) -> bool {
+        match ev {
+            MpvEvent::EndFile { reason, error, entry_id, inserted } => {
+                self.flush_deferred_end();
+                self.end_file(reason, error, entry_id, inserted);
+            }
+            MpvEvent::Log { level, prefix, text } => self.log_mpv(&level, &prefix, &text, now),
+            MpvEvent::Prop { id: id @ (PropId::Volume | PropId::Mute), value } => {
+                self.prop(id, value, now);
+            }
+            MpvEvent::QueueOverflow => tracing::warn!("mpv event queue overflow"),
+            _ => {}
+        }
+        false
+    }
+
+    /// An HTTP status for the log (rate-limited: a segment 404 storm is one line per 10 s).
+    fn log_http(&mut self, code: u16, now: Instant) {
+        let (verdict, summary) = self.http_log.admit(&format!("HTTP {code}"), tracing::Level::INFO, now);
+        if let Some(s) = summary {
+            log_http_summary(&s);
+        }
+        if verdict != mpv_log::Verdict::Suppress {
+            tracing::info!("HTTP {code} in {}", state_label(self.machine.state()));
+        }
+    }
+
+    /// One of mpv's log lines, through its rate limiter.
+    fn log_mpv(&mut self, level: &str, prefix: &str, text: &str, now: Instant) {
+        let (verdict, summary) = self.mpv_log.admit(prefix, mpv_log::level_for(level, text), now);
+        if let Some(s) = summary {
+            mpv_log::emit_summary(&s);
+        }
+        if let mpv_log::Verdict::Show(l) = verdict {
+            mpv_log::emit(l, prefix, text);
         }
     }
 
@@ -1278,6 +1973,8 @@ fn retargets(cmd: &PlayerCommand) -> bool {
             | PlayerCommand::LastChannel { .. }
             | PlayerCommand::JumpToLive
             | PlayerCommand::Stop
+            | PlayerCommand::CastTo { .. }
+            | PlayerCommand::StopCasting { .. }
     )
 }
 

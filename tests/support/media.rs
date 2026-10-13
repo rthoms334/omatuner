@@ -16,7 +16,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -28,12 +29,13 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
 /// Bump when the script's outputs change (forces regeneration of an existing directory).
-const MEDIA_VERSION: &str = "2";
+const MEDIA_VERSION: &str = "5";
 const STAMP: &str = ".complete";
 
 /// Directory with `testsrc.mp4` (10 s 640×360 25 fps + 1 kHz sine), `bars.ts` (MPEG-TS),
 /// `hls/index.m3u8` (6 × 2 s segments) — generated on first use into `target/test-media`.
-/// Also `long/index.m3u8` (60 × 1 s segments; see the script).
+/// Also `long/index.m3u8` (60 × 1 s segments), the 5.1 `surround*` films and the `avsync.mkv`
+/// marker film (see the script).
 pub fn ensure_media() -> Option<PathBuf> {
     static MEDIA: OnceLock<Option<PathBuf>> = OnceLock::new();
     MEDIA
@@ -158,6 +160,10 @@ struct Shared {
     segment_count: AtomicUsize,
     active: AtomicUsize,
     max_active: AtomicUsize,
+    /// Open connections by number.
+    open: Mutex<HashMap<usize, OpenConn>>,
+    /// Accepts that found other connections still open on the client's side.
+    overlaps: Mutex<Vec<String>>,
     throttle_bps: Mutex<Option<u64>>,
     /// Requests are not recorded (long soaks: the log would grow with every stream load).
     unlogged: AtomicBool,
@@ -233,7 +239,8 @@ impl Drop for SessionGuard {
 
 enum Ctl {
     Kill,
-    Revive,
+    /// Answered once the listener is bound again.
+    Revive(std::sync::mpsc::Sender<()>),
     Shutdown,
 }
 
@@ -311,9 +318,12 @@ impl TestServer {
         let _ = self.ctl.send(Ctl::Kill);
     }
 
-    /// Listen again on the same port.
+    /// Listen again on the same port (returns once it does, so a connect right after succeeds).
     pub fn revive(&self) {
-        let _ = self.ctl.send(Ctl::Revive);
+        let (tx, rx) = std::sync::mpsc::channel();
+        if self.ctl.send(Ctl::Revive(tx)).is_ok() {
+            let _ = rx.recv_timeout(Duration::from_secs(5));
+        }
     }
 
     /// Stop (`false`) or resume recording requests for [`TestServer::requests`].
@@ -329,11 +339,23 @@ impl TestServer {
         self.requests().into_iter().filter(|r| r.path == path).collect()
     }
 
-    /// Highest number of simultaneously open connections so far.
+    /// Highest number of connections the client held open at once, counted at each accept: the
+    /// new one, plus every earlier one the client hasn't hung up yet by its socket's state in
+    /// the kernel ([`count_accept`]). Not the server's own view: a task busy answering (reading
+    /// the file) notices a hang-up only later, and so may the server's socket under load (the
+    /// client's FIN still on its way), so a strict client would show two connections. A client
+    /// that connects again before closing its previous socket shows.
     pub fn max_concurrent(&self) -> usize {
         self.shared.max_active.load(Ordering::SeqCst)
     }
 
+    /// Each accept that found earlier connections still open (for assertion messages): which,
+    /// their request, and their TCP state.
+    pub fn overlaps(&self) -> Vec<String> {
+        self.shared.overlaps.lock().unwrap().clone()
+    }
+
+    /// Connections the server hasn't finished with (its own view: it may lag the client's close).
     pub fn active(&self) -> usize {
         self.shared.active.load(Ordering::SeqCst)
     }
@@ -366,7 +388,7 @@ async fn run(std_listener: std::net::TcpListener, addr: SocketAddr, ctx: Arc<Ctx
                     listener = None;
                     conns.abort_all();
                 }
-                Some(Ctl::Revive) => {
+                Some(Ctl::Revive(done)) => {
                     if listener.is_none() {
                         // the old socket is closed; SO_REUSEADDR (tokio default) lets us rebind
                         for _ in 0..50 {
@@ -379,6 +401,7 @@ async fn run(std_listener: std::net::TcpListener, addr: SocketAddr, ctx: Arc<Ctx
                             }
                         }
                     }
+                    let _ = done.send(());
                 }
                 Some(Ctl::Shutdown) | None => {
                     conns.abort_all();
@@ -387,7 +410,9 @@ async fn run(std_listener: std::net::TcpListener, addr: SocketAddr, ctx: Arc<Ctx
             },
             a = async { listener.as_ref().unwrap().accept().await }, if listener.is_some() => {
                 if let Ok((stream, _)) = a {
-                    conns.spawn(connection(stream, ctx.clone()));
+                    // counted here, as soon as possible after the client connected
+                    let guard = ConnGuard::accepted(&ctx.shared, &stream);
+                    conns.spawn(connection(stream, guard, ctx.clone()));
                 }
             },
             Some(_) = conns.join_next(), if !conns.is_empty() => {}
@@ -395,13 +420,153 @@ async fn run(std_listener: std::net::TcpListener, addr: SocketAddr, ctx: Arc<Ctx
     }
 }
 
-/// Decrements the active count and stamps the close time even when the task is aborted.
+// The kernel's view of one TCP socket of this host, by an exact `sock_diag` lookup (what `ss`
+// reads). Closing a socket doesn't close the connection while a child forked before that
+// (another test's ffmpeg starting) still holds a copy of its descriptor, until its `exec`.
+
+/// `TCP_ESTABLISHED` (`include/net/tcp_states.h`).
+const ESTABLISHED: u8 = 1;
+const SYN_SENT: u8 = 2;
+const CLOSE_WAIT: u8 = 8;
+/// `SOCK_DIAG_BY_FAMILY` (`linux/sock_diag.h`).
+const SOCK_DIAG_BY_FAMILY: u16 = 20;
+/// `struct nlmsghdr` + `struct inet_diag_req_v2` (with its `struct inet_diag_sockid`).
+const REQUEST_LEN: usize = 16 + 8 + 48;
+
+/// The state (`ESTABLISHED` = 1 …, as `include/net/tcp_states.h` numbers them) of this host's
+/// TCP socket from `local` to `remote`; `None` when there is none any more.
+pub fn tcp_state(local: SocketAddr, remote: SocketAddr) -> std::io::Result<Option<u8>> {
+    let (family, src, dst) = match (local.ip(), remote.ip()) {
+        (IpAddr::V4(l), IpAddr::V4(r)) => (libc::AF_INET, pad(&l.octets()), pad(&r.octets())),
+        (l, r) => (libc::AF_INET6, v6(l), v6(r)),
+    };
+    let mut req = [0u8; REQUEST_LEN];
+    // struct nlmsghdr: len, type, flags, seq, pid
+    req[0..4].copy_from_slice(&(REQUEST_LEN as u32).to_ne_bytes());
+    req[4..6].copy_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
+    req[6..8].copy_from_slice(&(libc::NLM_F_REQUEST as u16).to_ne_bytes());
+    // struct inet_diag_req_v2: family, protocol, ext, pad, states
+    req[16] = family as u8;
+    req[17] = libc::IPPROTO_TCP as u8;
+    req[20..24].copy_from_slice(&u32::MAX.to_ne_bytes());
+    // struct inet_diag_sockid: sport, dport (big-endian), src[16], dst[16], if, cookie[2]
+    req[24..26].copy_from_slice(&local.port().to_be_bytes());
+    req[26..28].copy_from_slice(&remote.port().to_be_bytes());
+    req[28..44].copy_from_slice(&src);
+    req[44..60].copy_from_slice(&dst);
+    req[64..72].fill(0xff); // INET_DIAG_NOCOOKIE: any socket with these addresses
+    let mut answer = [0u8; 512];
+    // SAFETY: plain syscalls on a socket owned here; each buffer is valid for the length given.
+    let n = unsafe {
+        let fd = libc::socket(libc::AF_NETLINK, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, libc::NETLINK_SOCK_DIAG);
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let fd = OwnedFd::from_raw_fd(fd);
+        let mut kernel: libc::sockaddr_nl = std::mem::zeroed();
+        kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+        let to = (&raw const kernel).cast::<libc::sockaddr>();
+        if libc::sendto(fd.as_raw_fd(), req.as_ptr().cast(), req.len(), 0, to, size_of::<libc::sockaddr_nl>() as libc::socklen_t) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // the kernel answers within `sendto`
+        let n = libc::recv(fd.as_raw_fd(), answer.as_mut_ptr().cast(), answer.len(), libc::MSG_DONTWAIT);
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        n as usize
+    };
+    if n < 20 {
+        return Err(std::io::Error::other("short sock_diag answer"));
+    }
+    match u16::from_ne_bytes([answer[4], answer[5]]) {
+        // struct inet_diag_msg: family, state, …
+        SOCK_DIAG_BY_FAMILY => Ok(Some(answer[17])),
+        // struct nlmsgerr: a negative errno, ENOENT for no such socket
+        t if t == libc::NLMSG_ERROR as u16 => match -i32::from_ne_bytes([answer[16], answer[17], answer[18], answer[19]]) {
+            libc::ENOENT => Ok(None),
+            e => Err(std::io::Error::from_raw_os_error(e)),
+        },
+        t => Err(std::io::Error::other(format!("sock_diag answered message type {t}"))),
+    }
+}
+
+/// The connection from `local` to `remote` is still open on this host's side: no FIN has gone
+/// out (`ESTABLISHED`, `SYN_SENT`, or `CLOSE_WAIT` after the peer's FIN). One closed, or
+/// half-closed (`shutdown`, as hyper does before letting go), is winding down (`FIN_WAIT1` …)
+/// or gone; the peer has seen it end.
+pub fn tcp_open(local: SocketAddr, remote: SocketAddr) -> std::io::Result<bool> {
+    Ok(tcp_state(local, remote)?.is_some_and(is_open))
+}
+
+fn is_open(state: u8) -> bool {
+    matches!(state, ESTABLISHED | SYN_SENT | CLOSE_WAIT)
+}
+
+fn pad(v4: &[u8; 4]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out[..4].copy_from_slice(v4);
+    out
+}
+
+fn v6(ip: IpAddr) -> [u8; 16] {
+    match ip {
+        IpAddr::V4(v4) => v4.to_ipv6_mapped().octets(),
+        IpAddr::V6(v6) => v6.octets(),
+    }
+}
+
+/// An accepted connection, until its task ends.
+struct OpenConn {
+    /// The client's end.
+    peer: SocketAddr,
+    /// Its current request.
+    path: String,
+}
+
+/// Count a new connection: itself, plus every open one whose client socket is still open in the
+/// kernel now that the new one has connected ([`tcp_open`]: no FIN from the client yet, which a
+/// child it forked can delay until its exec). Not the server's view of it: its task may be busy
+/// answering (reading the file), and its socket may not have the client's FIN yet.
+fn count_accept(shared: &Shared, conn: usize, stream: &TcpStream) {
+    let (Ok(server), Ok(peer)) = (stream.local_addr(), stream.peer_addr()) else {
+        // reset before the accept: a connection for a moment, nothing to watch
+        shared.max_active.fetch_max(1, Ordering::SeqCst);
+        return;
+    };
+    let mut open = shared.open.lock().unwrap();
+    let held: Vec<String> = open
+        .iter()
+        .filter_map(|(c, o)| match tcp_state(o.peer, server) {
+            Ok(Some(state)) if is_open(state) => Some(format!("connection {c} ({}, client TCP state {state})", o.path)),
+            Ok(_) => None,
+            Err(e) => Some(format!("connection {c} ({}, client TCP state unknown: {e})", o.path)),
+        })
+        .collect();
+    shared.max_active.fetch_max(held.len() + 1, Ordering::SeqCst);
+    if !held.is_empty() {
+        shared.overlaps.lock().unwrap().push(format!("connection {conn} accepted while the client held {}", held.join(", ")));
+    }
+    open.insert(conn, OpenConn { peer, path: String::new() });
+}
+
+/// Decrements the active count, forgets the connection and stamps the close time even when the
+/// task is aborted.
 struct ConnGuard {
     shared: Arc<Shared>,
     index: Option<usize>,
+    conn: usize,
 }
 
 impl ConnGuard {
+    /// Number and count a new connection ([`count_accept`]).
+    fn accepted(shared: &Arc<Shared>, stream: &TcpStream) -> Self {
+        shared.active.fetch_add(1, Ordering::SeqCst);
+        let conn = shared.connections.fetch_add(1, Ordering::SeqCst) + 1;
+        count_accept(shared, conn, stream);
+        Self { shared: shared.clone(), index: None, conn }
+    }
+
     fn stamp_closed(&mut self) {
         if let Some(i) = self.index.take() {
             self.shared.requests.lock().unwrap()[i].closed = Some(Instant::now());
@@ -411,6 +576,7 @@ impl ConnGuard {
 
 impl Drop for ConnGuard {
     fn drop(&mut self) {
+        self.shared.open.lock().unwrap().remove(&self.conn);
         self.shared.active.fetch_sub(1, Ordering::SeqCst);
         self.stamp_closed();
     }
@@ -424,12 +590,9 @@ enum After {
     Next,
 }
 
-async fn connection(mut stream: TcpStream, ctx: Arc<Ctx>) {
+async fn connection(mut stream: TcpStream, mut guard: ConnGuard, ctx: Arc<Ctx>) {
     let shared = ctx.shared.clone();
-    let n = shared.active.fetch_add(1, Ordering::SeqCst) + 1;
-    shared.max_active.fetch_max(n, Ordering::SeqCst);
-    let mut guard = ConnGuard { shared: shared.clone(), index: None };
-    let conn = shared.connections.fetch_add(1, Ordering::SeqCst) + 1;
+    let conn = guard.conn;
     for nth in 1.. {
         let keep = *shared.keep_alive.lock().unwrap();
         let head = match keep {
@@ -440,6 +603,9 @@ async fn connection(mut stream: TcpStream, ctx: Arc<Ctx>) {
             _ => read_head(&mut stream).await,
         };
         let Some((method, path, headers)) = head else { return };
+        if let Some(c) = shared.open.lock().unwrap().get_mut(&conn) {
+            c.path.clone_from(&path);
+        }
         let index = (!shared.unlogged.load(Ordering::SeqCst)).then(|| {
             let mut reqs = shared.requests.lock().unwrap();
             reqs.push(Request { path: path.clone(), headers: headers.clone(), status: 0, conn, nth, opened: Instant::now(), closed: None });

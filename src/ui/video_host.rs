@@ -34,6 +34,14 @@
 //! the focused one into the sink — so a picture nobody shows stops its render clock and its
 //! player suspends its video after 10 s ([`VideoHost::was_painted`] tells the app when to
 //! resume it). The mini player shows picture in picture ([`VideoHost::mini_player_with`]).
+//!
+//! Casting (DESIGN §40 §3.3, §3.4): while `snap.cast` is set the picture is on a TV, so the
+//! state overlay draws the casting card instead of black: the logo, the title and now / next
+//! (the player sets them through [`VideoHost::set_cast_context`], spoiler guard applied), "Playing
+//! on Living Room" and a phase line; a failure shows its one sentence. The fullscreen player gets
+//! the card's buttons from [`VideoHost::state_buttons`] like the recovery buttons. The card is
+//! decided by [`cast_card`] (pure, table-tested); the preview pane and the mini player show it
+//! without buttons.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -42,12 +50,12 @@ use eframe::egui::{self, Align2, Color32, FontId, Rect};
 use eframe::glow;
 
 use crate::images::{ImageCache, ImageKind, ImageState};
-use crate::model::PlayableKind;
-use crate::model::TileId;
+use crate::model::{CastErrorKind, CastLevel, CastPhase, CastView, PlayableKind, TileId};
 use crate::player::render::SurfaceFactory;
-use crate::player::{PlayerErrorKind, PlayerSnapshot, PlayerState, VideoSurface};
+use crate::player::{PlayerError, PlayerErrorKind, PlayerSnapshot, PlayerState, VideoSurface};
 use crate::theme::{SpaceToken, Theme, TypeToken, with_alpha};
 use crate::ui::LayoutClass;
+use crate::ui::overlays::cast_offer::error_sentence;
 use crate::ui::widgets::{glyphs, logo};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -80,6 +88,23 @@ pub enum StateAction {
     OtherCopy,
     /// Stop the reconnects and close the player (`q`).
     Stop,
+    /// The casting card (DESIGN §40 §3.3, §3.4): end casting and go idle.
+    StopCasting,
+    /// Casting card: end casting and carry on here (VOD at the TV's position, live at the live
+    /// point).
+    PlayHere,
+    /// Casting card, `Unreachable` / `Firewall`: cast to the same TV again.
+    TryAgain,
+    /// Casting card, `StoppedOnTv`: cast to the same TV again.
+    CastAgain,
+    /// Casting card, `ReceiverFailed`: **Convert this channel** (L3 for this item on this TV).
+    ConvertChannel,
+    /// Casting card, `Firewall`: **Allow on firewall** (pkexec), then the firewall card follows it.
+    AllowFirewall,
+    /// Casting card, `Firewall`: the firewall card with the command to run by hand.
+    ShowCommand,
+    /// Casting card, the pairing kinds: the PIN overlay for this TV.
+    Pair,
 }
 
 /// Where the player draws a [`StateAction`] button this frame (laid out by the state overlay,
@@ -90,6 +115,28 @@ pub struct StateButton {
     pub rect: Rect,
     pub text: String,
     pub font: FontId,
+}
+
+/// The casting card's programme line (DESIGN §40 §3.3), read by the fullscreen player through
+/// the spoiler guard exactly as the OSD reads it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CastNow {
+    /// "Semi-final 1" (the guarded title and sub-title).
+    pub line: String,
+    /// "19:45–22:00".
+    pub range: String,
+    /// 0–1 through the programme.
+    pub progress: f32,
+}
+
+/// What the casting card needs that the snapshot doesn't say; set by the fullscreen player
+/// before each paint and dropped at the next frame ([`VideoHost::begin_frame`]), so the preview
+/// pane never shows a stale one.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CastContext {
+    pub now: Option<CastNow>,
+    /// `cast.convert` is off: an `Unsupported` failure adds "Converting is off in Settings ▸ Cast."
+    pub convert_off: bool,
 }
 
 /// One picture's video: its surface and what painting it needs.
@@ -120,6 +167,8 @@ pub struct VideoHost {
     buttons: Vec<StateButton>,
     /// The label of the other copy a failed title can play from ([`VideoHost::set_other_copy`]).
     other_copy: Option<String>,
+    /// What the casting card adds ([`VideoHost::set_cast_context`]); one frame's worth.
+    cast_ctx: CastContext,
 }
 
 fn slot(tile: TileId) -> usize {
@@ -171,6 +220,7 @@ impl VideoHost {
             self.mini = None;
         }
         self.mini_drawn = false;
+        self.cast_ctx = CastContext::default();
     }
 
     /// Where the video was shown last frame.
@@ -269,6 +319,12 @@ impl VideoHost {
         self.other_copy = label;
     }
 
+    /// What the casting card adds for this frame's paint (the fullscreen player sets it before
+    /// every `paint`; the preview and the mini player paint the card without it).
+    pub fn set_cast_context(&mut self, c: CastContext) {
+        self.cast_ctx = c;
+    }
+
     /// The recovery buttons laid out by the last fullscreen [`paint`](Self::paint).
     pub fn state_buttons(&self) -> &[StateButton] {
         &self.buttons
@@ -345,27 +401,14 @@ impl VideoHost {
         let title = snap.playable.as_ref().map(|p| p.title.as_str()).unwrap_or("");
         let live = snap.playable.as_ref().is_none_or(|p| p.kind.is_live());
         let time = ui.input(|i| i.time);
-        // recovery buttons centred under the text (the fullscreen player handles them)
-        let buttons = |bottom: f32, reconnecting: bool| -> Vec<StateButton> {
+        // buttons centred under the text (the fullscreen player handles them)
+        let row = |bottom: f32, list: Vec<(StateAction, String)>| -> Vec<StateButton> {
             // keys act on the focused picture; inside one narrower than 360 pt only the hint
             // says what to press
             if placement != Placement::Fullscreen || !focused || rect.width() < 360.0 {
                 return Vec::new();
             }
             let font = FontId::proportional((theme.font(TypeToken::Body) * k).round());
-            let retry = if reconnecting { "Retry now" } else { "Retry" };
-            let mut list = Vec::new();
-            // after the reconnects gave up, the title's other copy comes first
-            if let Some(label) = self.other_copy.as_ref().filter(|_| !reconnecting) {
-                list.push((StateAction::OtherCopy, format!("{}  {label}", glyphs::PLAY)));
-            }
-            list.push((StateAction::Retry, format!("{}  {retry}", glyphs::REFRESH)));
-            if live && snap.previous_live.is_some() {
-                list.push((StateAction::LastChannel, format!("{}  Last channel", glyphs::HISTORY)));
-            }
-            if reconnecting {
-                list.push((StateAction::Stop, format!("{}  Stop", glyphs::STOP)));
-            }
             let pad = egui::vec2(gap, gap / 2.0);
             let sizes: Vec<egui::Vec2> = list.iter().map(|(_, s)| p.layout_no_wrap(s.clone(), font.clone(), t.osd_text).size() + 2.0 * pad).collect();
             let total = sizes.iter().map(|s| s.x).sum::<f32>() + gap * (sizes.len() as f32 - 1.0);
@@ -379,6 +422,34 @@ impl VideoHost {
                 })
                 .collect()
         };
+        // the recovery buttons of a failed / reconnecting stream
+        let buttons = |bottom: f32, reconnecting: bool| -> Vec<StateButton> {
+            let retry = if reconnecting { "Retry now" } else { "Retry" };
+            let mut list = Vec::new();
+            // after the reconnects gave up, the title's other copy comes first
+            if let Some(label) = self.other_copy.as_ref().filter(|_| !reconnecting) {
+                list.push((StateAction::OtherCopy, format!("{}  {label}", glyphs::PLAY)));
+            }
+            list.push((StateAction::Retry, format!("{}  {retry}", glyphs::REFRESH)));
+            if live && snap.previous_live.is_some() {
+                list.push((StateAction::LastChannel, format!("{}  Last channel", glyphs::HISTORY)));
+            }
+            if reconnecting {
+                list.push((StateAction::Stop, format!("{}  Stop", glyphs::STOP)));
+            }
+            row(bottom, list)
+        };
+        // casting: the picture is on the TV, so the card stands in for it (DESIGN §40 §3.3)
+        if let Some(card) = cast_card(snap, self.cast_ctx.convert_off) {
+            p.rect_filled(rect, 0.0, t.osd_scrim);
+            let bottom = self.paint_cast_card(&p, rect, theme, snap, &card, k);
+            if card.busy() {
+                spinner(&p, egui::pos2(rect.center().x, bottom + 12.0 * k), 9.0 * k, t.osd_accent, time);
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+            }
+            let list = card.actions().into_iter().map(|a| (a, cast_action_text(a))).collect();
+            return row(bottom + if card.busy() { 24.0 * k } else { 0.0 }, list);
+        }
         match &snap.state {
             PlayerState::Idle => {}
             PlayerState::Zapping { .. } | PlayerState::Loading { .. } => {
@@ -511,6 +582,70 @@ impl VideoHost {
         Vec::new()
     }
 
+    /// The casting card (DESIGN §40 §3.3, §3.4) in OSD colours, centred in `rect`; returns the
+    /// bottom of what it drew (the buttons go under it). A running card has the logo, the
+    /// title, the programme now (fullscreen and preview room only), "Playing on <TV>" and the
+    /// phase line; a failed one its glyph and sentence.
+    fn paint_cast_card(&self, p: &egui::Painter, rect: Rect, theme: &Theme, snap: &PlayerSnapshot, card: &CastCard, k: f32) -> f32 {
+        let t = &theme.tokens;
+        let title_font = FontId::proportional((theme.font(TypeToken::Title) * k).round());
+        let body_font = FontId::proportional((theme.font(TypeToken::Body) * k).round());
+        let small_font = FontId::proportional((theme.font(TypeToken::BodySmall) * k).round());
+        let gap = theme.space(SpaceToken::Md) * k;
+        let max_w = rect.width() - 2.0 * gap;
+        let (name, line, busy) = match card {
+            CastCard::Failed { sentence, .. } => {
+                let glyph_font = FontId::proportional((theme.font(TypeToken::DisplayLarge) * k).round());
+                let lines = [(glyphs::WARNING, glyph_font, t.osd_accent), (sentence.as_str(), title_font, t.osd_text)];
+                return stacked(p, rect, &lines, gap);
+            }
+            CastCard::Running { name, line, busy } => (name, line, *busy),
+        };
+        let title = snap.playable.as_ref().map(|p| p.title.as_str()).unwrap_or("");
+        // the programme needs room: not in the corner mini player
+        let now = self.cast_ctx.now.as_ref().filter(|_| rect.height() >= 240.0);
+        let tile = 56.0 * k;
+        let line_h = small_font.size * 1.4;
+        let head = format!("{}  Playing on {name}", glyphs::CAST_CONNECTED);
+        let mut block_h = tile + gap + title_font.size;
+        if now.is_some() {
+            block_h += gap / 2.0 + line_h + 6.0 * k + line_h;
+        }
+        block_h += gap + body_font.size + if line.is_empty() { 0.0 } else { gap / 2.0 + line_h };
+        let mut y = rect.center().y - (block_h + if busy { 24.0 * k } else { 0.0 }) / 2.0;
+        logo_tile(p, theme, Rect::from_center_size(egui::pos2(rect.center().x, y + tile / 2.0), egui::vec2(tile, tile)), title, self.logo_for(snap));
+        y += tile + gap;
+        osd_text(p, egui::pos2(rect.center().x, y), Align2::CENTER_TOP, title, title_font.clone(), t.osd_text, max_w);
+        y += title_font.size;
+        if let Some(n) = now {
+            y += gap / 2.0;
+            osd_text(
+                p,
+                egui::pos2(rect.center().x, y),
+                Align2::CENTER_TOP,
+                &format!("{} · {}", n.line, n.range),
+                small_font.clone(),
+                with_alpha(t.osd_text, 0.8),
+                max_w,
+            );
+            y += line_h + 6.0 * k;
+            let bar_w = (max_w * 0.5).min(240.0 * k);
+            let bar = Rect::from_center_size(egui::pos2(rect.center().x, y + 2.0 * k), egui::vec2(bar_w, 4.0 * k));
+            p.rect_filled(bar, t.rounding, with_alpha(t.osd_text, 0.25));
+            p.rect_filled(Rect::from_min_size(bar.min, egui::vec2(bar_w * n.progress.clamp(0.0, 1.0), bar.height())), t.rounding, t.osd_accent);
+            y += line_h;
+        }
+        y += gap;
+        osd_text(p, egui::pos2(rect.center().x, y), Align2::CENTER_TOP, &head, body_font.clone(), t.osd_accent, max_w);
+        y += body_font.size;
+        if !line.is_empty() {
+            y += gap / 2.0;
+            osd_text(p, egui::pos2(rect.center().x, y), Align2::CENTER_TOP, line, small_font, with_alpha(t.osd_text, 0.7), max_w);
+            y += line_h;
+        }
+        y
+    }
+
     /// Corner mini-player (app calls when nothing else placed the video, the screen allows it,
     /// the layout isn't Compact and `interface.mini_player` is on). Returns what was clicked:
     /// the video opens the fullscreen player, the strip pops the player out or stops it.
@@ -574,6 +709,10 @@ impl VideoHost {
             let mut label = title.to_owned();
             if let Some(n) = snap.playable.as_ref().and_then(|p| p.number) {
                 label = format!("{title} · {n}");
+            }
+            // playing on a TV (DESIGN §40 §3.3)
+            if snap.cast.is_some() {
+                label = format!("{} {label}", glyphs::CAST_CONNECTED);
             }
             osd_text(
                 p,
@@ -684,9 +823,132 @@ pub(crate) fn error_copy(kind: PlayerErrorKind, message: &str) -> (String, Strin
         PlayerErrorKind::Budget => "Connection limit reached for this playlist",
         PlayerErrorKind::ProviderError => "The provider can't deliver this channel right now",
         PlayerErrorKind::HttpOther(_) | PlayerErrorKind::Mpv => "Playback failed",
+        // without a casting card (no `snap.cast`) the generic sentence; the card names the TV
+        PlayerErrorKind::Cast(c) => crate::player::state::describe_cast(c),
     };
     let detail = if detail.is_empty() || detail == head { String::new() } else { detail };
     (head.to_owned(), detail)
+}
+
+/// What the casting card shows for a snapshot (DESIGN §40 §3.3, §3.4).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CastCard {
+    /// "Playing on Living Room" and its phase line (`busy`: connecting, starting or tuning).
+    Running { name: String, line: String, busy: bool },
+    /// A failure: the one sentence of `kind` (the buttons follow the kind).
+    Failed { kind: CastErrorKind, sentence: String },
+}
+
+impl CastCard {
+    fn busy(&self) -> bool {
+        matches!(self, CastCard::Running { busy: true, .. })
+    }
+
+    /// The buttons under the card, in order.
+    pub(crate) fn actions(&self) -> Vec<StateAction> {
+        match self {
+            CastCard::Running { .. } => cast_actions(None),
+            CastCard::Failed { kind, .. } => cast_actions(Some(*kind)),
+        }
+    }
+}
+
+/// The casting card for `snap`, or `None` when the existing overlays say it (nothing casting,
+/// idle, finished, reconnecting, or an upstream error: "Reconnecting… attempt n", the budget
+/// copy and provider messages are unchanged while casting, DESIGN §40 §3.4). `convert_off`:
+/// converting is off in Settings (adds its hint to an unsupported format).
+pub(crate) fn cast_card(snap: &PlayerSnapshot, convert_off: bool) -> Option<CastCard> {
+    let view = snap.cast.as_ref()?;
+    let live = is_live(snap.playable.as_ref().map(|p| &p.kind));
+    let failed = match &snap.state {
+        PlayerState::Error(PlayerError { kind: PlayerErrorKind::Cast(kind), .. }) => Some(*kind),
+        PlayerState::Idle | PlayerState::Ended | PlayerState::Reconnecting { .. } | PlayerState::Error(_) => return None,
+        // the session ended without the user asking and the controller kept the view
+        _ if view.phase == CastPhase::Lost => Some(CastErrorKind::StoppedOnTv),
+        _ => None,
+    };
+    if let Some(kind) = failed {
+        return Some(CastCard::Failed { kind, sentence: error_sentence(kind, &view.name, live, convert_off) });
+    }
+    let (line, busy) = cast_phase_line(snap, view, live);
+    Some(CastCard::Running { name: view.name.clone(), line, busy })
+}
+
+/// The card's phase line and whether it is a wait (DESIGN §40 §3.3).
+fn cast_phase_line(snap: &PlayerSnapshot, view: &CastView, live: bool) -> (String, bool) {
+    let name = &view.name;
+    let waiting = |s: String| (s, true);
+    let title = snap.playable.as_ref().map_or("", |p| p.title.as_str());
+    let state = match (&snap.state, view.phase) {
+        (_, CastPhase::Seeking) => "Seeking…".to_owned(),
+        (PlayerState::Zapping { .. }, _) if title.is_empty() => return waiting(format!("Tuning {name}…")),
+        (PlayerState::Zapping { .. }, _) => return waiting(format!("Tuning {name} to {title}…")),
+        (_, CastPhase::Connecting) => return waiting(format!("Connecting to {name}…")),
+        (PlayerState::Loading { .. }, _) | (_, CastPhase::Starting) => return waiting(format!("Starting on {name}…")),
+        (PlayerState::Buffering { .. }, _) | (_, CastPhase::Buffering) => "Buffering on the TV".to_owned(),
+        (PlayerState::Paused, _) | (_, CastPhase::Paused) => "Paused".to_owned(),
+        _ if snap.paused => "Paused".to_owned(),
+        _ if !live => String::new(),
+        _ => match view.behind_live_s {
+            Some(s) => format!("Live · about {s} s behind"),
+            None => "Live".to_owned(),
+        },
+    };
+    // L3 is active: the picture is being re-encoded on this computer
+    match (view.level, state.is_empty()) {
+        (Some(CastLevel::Converted), true) => ("Converting picture".to_owned(), false),
+        (Some(CastLevel::Converted), false) => (format!("{state} · Converting picture"), false),
+        _ => (state, false),
+    }
+}
+
+/// The buttons under the casting card: the running card's, or a failure's own actions
+/// (DESIGN §40 §3.4 table).
+pub(crate) fn cast_actions(failed: Option<CastErrorKind>) -> Vec<StateAction> {
+    use StateAction as A;
+    match failed {
+        None => vec![A::StopCasting, A::PlayHere],
+        Some(CastErrorKind::Firewall) => vec![A::AllowFirewall, A::ShowCommand, A::TryAgain, A::PlayHere],
+        Some(CastErrorKind::Unsupported | CastErrorKind::CpuTooSlow) => vec![A::PlayHere],
+        Some(CastErrorKind::NeedsFfmpeg) => Vec::new(),
+        Some(CastErrorKind::Unreachable) => vec![A::TryAgain, A::PlayHere],
+        Some(CastErrorKind::PairingRequired | CastErrorKind::PairingLost | CastErrorKind::PairingRefused) => vec![A::Pair],
+        Some(CastErrorKind::StoppedOnTv) => vec![A::PlayHere, A::CastAgain],
+        Some(CastErrorKind::ReceiverFailed) => vec![A::ConvertChannel, A::PlayHere],
+    }
+}
+
+impl StateAction {
+    /// The button's name for the casting card's actions (also its hover text); `None` for the
+    /// recovery buttons, which the player names itself.
+    pub fn cast_label(self) -> Option<&'static str> {
+        Some(match self {
+            StateAction::StopCasting => "Stop casting",
+            StateAction::PlayHere => "Play here",
+            StateAction::TryAgain => "Try again",
+            StateAction::CastAgain => "Cast again",
+            StateAction::ConvertChannel => "Convert this channel",
+            StateAction::AllowFirewall => "Allow on firewall",
+            StateAction::ShowCommand => "Show command",
+            StateAction::Pair => "Pair",
+            StateAction::Retry | StateAction::LastChannel | StateAction::OtherCopy | StateAction::Stop => return None,
+        })
+    }
+}
+
+/// A casting button's text: its glyph and name.
+fn cast_action_text(a: StateAction) -> String {
+    let glyph = match a {
+        StateAction::StopCasting => glyphs::STOP,
+        StateAction::PlayHere => glyphs::PLAY,
+        StateAction::TryAgain | StateAction::CastAgain => glyphs::REFRESH,
+        StateAction::ConvertChannel => glyphs::SYNC,
+        StateAction::AllowFirewall => glyphs::UNLOCK,
+        StateAction::ShowCommand => glyphs::INFO,
+        StateAction::Pair => glyphs::CAST,
+        _ => glyphs::DOT,
+    };
+    format!("{glyph}  {}", a.cast_label().unwrap_or_default())
 }
 
 /// Headline of the reconnect overlay: "attempt n" when the player keeps trying (`max` 0: a
@@ -807,6 +1069,24 @@ pub(crate) fn is_live(kind: Option<&PlayableKind>) -> bool {
 mod tests {
     use super::*;
 
+    /// A live channel (the casting tests only read its title).
+    pub(super) fn playable() -> crate::model::Playable {
+        crate::model::Playable {
+            media: crate::model::MediaRef::Channel(crate::model::ChannelId(1)),
+            kind: PlayableKind::Live,
+            item: None,
+            source_id: None,
+            title: "News".into(),
+            subtitle: None,
+            logo: None,
+            number: Some(1),
+            url: crate::redact::Secret::new("http://127.0.0.1/live.ts".into()),
+            headers: Default::default(),
+            start_at: None,
+            duration_hint: None,
+        }
+    }
+
     #[test]
     fn mini_rect_sits_bottom_right_above_the_status_bar() {
         let th = Theme::fallback();
@@ -848,6 +1128,119 @@ mod tests {
             assert!(!h.contains("r Retry") && !h.contains("Backspace"), "{h}");
         }
         assert_eq!(recovery_hint(Placement::Mini, true, true, false), "Click to open the player");
+    }
+
+    fn view(phase: CastPhase) -> CastView {
+        CastView {
+            device: crate::model::DeviceId::from_bytes([7; 16]),
+            name: "Living Room".into(),
+            kind: crate::model::ReceiverKind::AppleTv,
+            phase,
+            level: None,
+            as_is: false,
+            behind_live_s: None,
+            can_seek: false,
+            volume: false,
+        }
+    }
+
+    /// A live channel casting to "Living Room" in `state`.
+    fn casting(state: PlayerState, phase: CastPhase) -> PlayerSnapshot {
+        PlayerSnapshot { state, cast: Some(view(phase)), ..Default::default() }
+    }
+
+    fn line_of(snap: &PlayerSnapshot) -> String {
+        match cast_card(snap, false) {
+            Some(CastCard::Running { line, .. }) => line,
+            other => panic!("not a running card: {other:?}"),
+        }
+    }
+
+    /// The phase line says where the session is, in the design's words (DESIGN §40 §3.3).
+    #[test]
+    fn the_casting_card_reads_the_phase_of_the_session() {
+        let since = Instant::now();
+        let connecting = casting(PlayerState::Loading { since, attempt: 0 }, CastPhase::Connecting);
+        assert_eq!(line_of(&connecting), "Connecting to Living Room…");
+        let starting = casting(PlayerState::Loading { since, attempt: 0 }, CastPhase::Starting);
+        assert_eq!(line_of(&starting), "Starting on Living Room…");
+        let mut zapping = casting(PlayerState::Zapping { until: since }, CastPhase::Starting);
+        assert_eq!(line_of(&zapping), "Tuning Living Room…");
+        zapping.playable = Some(std::sync::Arc::new(crate::model::Playable { title: "BBC One".into(), ..playable() }));
+        assert_eq!(line_of(&zapping), "Tuning Living Room to BBC One…");
+        let mut live = casting(PlayerState::Playing, CastPhase::Playing);
+        assert_eq!(line_of(&live), "Live");
+        live.cast.as_mut().unwrap().behind_live_s = Some(15);
+        assert_eq!(line_of(&live), "Live · about 15 s behind");
+        live.cast.as_mut().unwrap().level = Some(CastLevel::Converted);
+        assert_eq!(line_of(&live), "Live · about 15 s behind · Converting picture");
+        let paused = casting(PlayerState::Paused, CastPhase::Paused);
+        assert_eq!(line_of(&paused), "Paused");
+        let buffering = casting(PlayerState::Buffering { since, percent: None }, CastPhase::Buffering);
+        assert_eq!(line_of(&buffering), "Buffering on the TV");
+        // a seek's replace shows while the state is still Playing
+        assert_eq!(line_of(&casting(PlayerState::Playing, CastPhase::Seeking)), "Seeking…");
+        // the waits spin; the rest doesn't
+        assert!(matches!(cast_card(&connecting, false), Some(CastCard::Running { busy: true, .. })));
+        assert!(matches!(cast_card(&live, false), Some(CastCard::Running { busy: false, .. })));
+    }
+
+    /// Nothing casting, nothing playing, and upstream trouble keep their own overlays; only the
+    /// TV's own failures get the card's sentence and buttons (DESIGN §40 §3.4).
+    #[test]
+    fn the_casting_card_leaves_upstream_trouble_to_the_existing_overlays() {
+        assert!(cast_card(&PlayerSnapshot { state: PlayerState::Playing, ..Default::default() }, false).is_none(), "not casting");
+        assert!(cast_card(&casting(PlayerState::Idle, CastPhase::Playing), false).is_none());
+        let reconnecting = PlayerState::Reconnecting { attempt: 2, max: 0, at: Instant::now(), reason: PlayerErrorKind::ProviderError };
+        assert!(cast_card(&casting(reconnecting, CastPhase::Playing), false).is_none(), "\"Reconnecting… attempt n\" stays");
+        let upstream = PlayerState::Error(PlayerError { kind: PlayerErrorKind::Budget, message: String::new() });
+        assert!(cast_card(&casting(upstream, CastPhase::Playing), false).is_none(), "the Budget copy stays");
+        let failed = PlayerState::Error(PlayerError { kind: PlayerErrorKind::Cast(CastErrorKind::Firewall), message: String::new() });
+        match cast_card(&casting(failed, CastPhase::Lost), false) {
+            Some(CastCard::Failed { kind: CastErrorKind::Firewall, sentence }) => {
+                assert_eq!(sentence, "Living Room couldn't connect back to Tuner. Your firewall is blocking it.");
+            }
+            other => panic!("{other:?}"),
+        }
+        // a session that ended without an error (the controller kept the view)
+        assert!(matches!(
+            cast_card(&casting(PlayerState::Playing, CastPhase::Lost), false),
+            Some(CastCard::Failed { kind: CastErrorKind::StoppedOnTv, .. })
+        ));
+    }
+
+    /// Each failure's actions are the design's table; none of the copy holds device or provider
+    /// text, only the sanitized TV name.
+    #[test]
+    fn every_cast_failure_has_its_sentence_and_actions() {
+        use CastErrorKind as K;
+        use StateAction as A;
+        let table = [
+            (K::Firewall, vec![A::AllowFirewall, A::ShowCommand, A::TryAgain, A::PlayHere]),
+            (K::Unsupported, vec![A::PlayHere]),
+            (K::CpuTooSlow, vec![A::PlayHere]),
+            (K::NeedsFfmpeg, vec![]),
+            (K::Unreachable, vec![A::TryAgain, A::PlayHere]),
+            (K::PairingRequired, vec![A::Pair]),
+            (K::PairingLost, vec![A::Pair]),
+            (K::PairingRefused, vec![A::Pair]),
+            (K::StoppedOnTv, vec![A::PlayHere, A::CastAgain]),
+            (K::ReceiverFailed, vec![A::ConvertChannel, A::PlayHere]),
+        ];
+        assert_eq!(cast_actions(None), vec![A::StopCasting, A::PlayHere]);
+        for (kind, actions) in table {
+            assert_eq!(cast_actions(Some(kind)), actions, "{kind:?}");
+            let copy = error_sentence(kind, "Living Room", true, true);
+            assert!(!copy.is_empty() && !copy.contains("://"), "{kind:?}: {copy}");
+            // every action but the recovery buttons has a name
+            assert!(actions.iter().all(|a| a.cast_label().is_some()), "{kind:?}");
+        }
+        assert_eq!(
+            error_sentence(K::Unsupported, "Living Room", true, true),
+            "Living Room can't play this channel's format. Converting is off in Settings ▸ Cast."
+        );
+        assert_eq!(error_sentence(K::Unsupported, "Living Room", true, false), "Living Room can't play this channel's format.");
+        assert_eq!(error_sentence(K::Unreachable, "Living Room", true, false), "Living Room isn't answering. Is it on and on the same network?");
     }
 
     #[test]

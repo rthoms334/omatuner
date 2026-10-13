@@ -17,11 +17,13 @@
 //!   passwordless rule it installs at once; without, it waits for a moment the password dialog
 //!   makes sense — Tuner's window has the keyboard and nothing plays, nothing is open (the
 //!   app's gate, [`Updater::prompt_due`]) — and a toast says why the dialog appears. A dismissed
-//!   dialog isn't shown again by itself this session ("Install now" in Settings).
+//!   dialog isn't shown again by itself this session ("Install now" in Settings). Casting holds
+//!   both back (`CastApi::activity`): the dialog while anything casts, the passwordless install
+//!   while a TV is being paired (it goes on, checked every 5 s, once the PIN overlay closes).
 //! * **Installed**: notification and toast "Tuner updated to X — restarts when idle", the
 //!   status-bar chip, then the restart (`super::restart`) once the gate held for 60 s, checked
-//!   here every 5 s off the UI thread (the players' snapshots, the jobs, and what the UI last
-//!   said, [`UiNow`]), so a window on a hidden workspace restarts too.
+//!   here every 5 s off the UI thread (the players' snapshots, the jobs, casting, and what the
+//!   UI last said, [`UiNow`]), so a window on a hidden workspace restarts too.
 //!
 //! **Only on the user's own desktop**: off it (unit tests, `TUNER_NO_DESKTOP`, the integration
 //! harnesses' `keep_off_desktop`) or with a profile whose home isn't `$HOME`, nothing runs: no
@@ -179,6 +181,8 @@ struct State {
     refused: Option<String>,
     /// The "ready" notification went out for this version.
     ready_told: Option<String>,
+    /// A passwordless install waits for a pairing to end (the restart watch installs it).
+    held_for_pairing: bool,
 }
 
 impl Updater {
@@ -271,6 +275,12 @@ impl Updater {
         matches!(st.status.phase, Phase::Ready { declined: false, .. })
             && matches!(st.status.mode, Some(Mode::Managed { .. }))
             && !crate::config::current(&self.inner.config).updates.passwordless
+            && !self.casting().any()
+    }
+
+    /// What casting has going on (the inert answer while casting is off).
+    fn casting(&self) -> crate::cast::CastActivity {
+        self.inner.shared.cast().activity()
     }
 
     /// What only the UI knows, every frame.
@@ -498,16 +508,24 @@ impl Updater {
         }
         let cfg = crate::config::current(&self.inner.config).updates.clone();
         let managed = matches!(mode, Mode::Managed { .. });
+        let pairing = self.casting().pairing;
         let next = {
             let mut st = self.state();
             let ready_path = match &st.status.phase {
                 // already on it, or waiting for the restart
                 Phase::Downloading(x) | Phase::Installing(x) if x.version == r.version => Some(None),
                 Phase::Installed { .. } => Some(None),
-                // waiting for the password; with the rule (or after pacman was busy) go on
-                Phase::Ready { release, path, .. } if release.version == r.version => Some((cfg.passwordless && managed).then(|| path.clone())),
+                // waiting for the password; with the rule (or after pacman was busy) go on, unless
+                // a TV is being paired
+                Phase::Ready { release, path, .. } if release.version == r.version => {
+                    let go = cfg.passwordless && managed;
+                    Some((go && !pairing).then(|| path.clone()))
+                }
                 _ => None,
             };
+            if pairing && cfg.passwordless && managed && matches!(&st.status.phase, Phase::Ready { release, .. } if release.version == r.version) {
+                st.held_for_pairing = true;
+            }
             match ready_path {
                 Some(Some(path)) => {
                     st.status.phase = Phase::Installing(r.clone());
@@ -586,9 +604,18 @@ impl Updater {
             }
         };
         let passwordless = crate::config::current(&self.inner.config).updates.passwordless;
-        if passwordless || user {
+        if user || (passwordless && !self.casting().pairing) {
             self.state().status.phase = Phase::Installing(r.clone());
             self.install(r, path, !passwordless).await;
+            return;
+        }
+        if passwordless {
+            tracing::info!("update: Tuner {} installs once the TV's pairing is over", r.version);
+            let mut st = self.state();
+            st.status.phase = Phase::Ready { release: r, path, declined: false };
+            st.held_for_pairing = true;
+            drop(st);
+            self.inner.bus.request_repaint();
             return;
         }
         let tell = {
@@ -766,6 +793,10 @@ impl Updater {
             if !self.sleep(GATE_TICK).await {
                 return;
             }
+            if self.held_install_due() {
+                self.install_now();
+                continue;
+            }
             let due = {
                 let mut st = self.state();
                 if !matches!(st.status.phase, Phase::Installed { .. }) || st.restarting {
@@ -782,6 +813,24 @@ impl Updater {
         }
     }
 
+    /// A passwordless install held back by a pairing may go on now (taken once).
+    fn held_install_due(&self) -> bool {
+        let mut st = self.state();
+        if !st.held_for_pairing {
+            return false;
+        }
+        if !matches!(st.status.phase, Phase::Ready { declined: false, .. }) || !crate::config::current(&self.inner.config).updates.passwordless {
+            st.held_for_pairing = false;
+            return false;
+        }
+        drop(st);
+        let go = !self.casting().pairing;
+        if go {
+            self.state().held_for_pairing = false;
+        }
+        go
+    }
+
     /// The gate's inputs: the players (their snapshots, off the UI thread), the jobs, what the
     /// UI last said (nothing yet counts as busy).
     fn quiet(&self, st: &State) -> restart::Quiet {
@@ -795,6 +844,7 @@ impl Updater {
             focused: ui.focused,
             jobs: self.inner.jobs.as_ref().is_some_and(|j| !j.active().is_empty()),
             installing: matches!(st.status.phase, Phase::Installing(_)),
+            casting: self.casting().any(),
         }
     }
 
@@ -1266,5 +1316,70 @@ mod tests {
         tx.send_replace(Arc::new(crate::player::PlayerSnapshot::default()));
         rig.updater.note_ui(UiNow { focused: true, ..Default::default() });
         assert!(!quiet(), "the user is at Tuner");
+    }
+
+    /// A rig whose cast service is a scripted fake (its activity set by the test).
+    fn with_fake_cast(rig: &Rig) -> Arc<crate::cast::testing::FakeCast> {
+        let fake = Arc::new(crate::cast::testing::FakeCast::default());
+        rig.updater.inner.shared.set_cast(Some(crate::cast::CastHandle::new(fake.clone())));
+        fake
+    }
+
+    /// Casting holds the restart whatever the players say: picture A is idle during Test on TV
+    /// and pairing, and a stopped session still lets go of the TV for a moment. It holds the
+    /// password dialog too.
+    #[test]
+    fn casting_holds_the_restart_and_the_password_dialog() {
+        use crate::cast::CastActivity;
+        let rig = Rig::new(Opts::default());
+        let fake = with_fake_cast(&rig);
+        rig.updater.note_ui(UiNow { focused: false, ..Default::default() });
+        let quiet = || restart::may_restart(&rig.updater.quiet(&rig.updater.state()));
+        assert!(quiet(), "idle, nothing casts");
+        let each = [
+            CastActivity { session: true, ..Default::default() },
+            CastActivity { test: true, ..Default::default() },
+            CastActivity { pairing: true, ..Default::default() },
+            CastActivity { firewall: true, ..Default::default() },
+        ];
+        for a in each {
+            fake.script(|s| s.activity = a);
+            assert!(!quiet(), "{a:?}");
+        }
+        fake.script(|s| s.activity = CastActivity::default());
+        assert!(quiet());
+
+        rig.check();
+        assert!(rig.updater.prompt_due());
+        for a in each {
+            fake.script(|s| s.activity = a);
+            assert!(!rig.updater.prompt_due(), "no password dialog while casting: {a:?}");
+        }
+    }
+
+    /// The passwordless install doesn't go in while a TV is being paired: it waits, ready, and
+    /// the restart watch installs it once the PIN overlay closed.
+    #[test]
+    fn a_pairing_holds_the_passwordless_install() {
+        let rig = Rig::new(Opts { passwordless: true, ..Default::default() });
+        let fake = with_fake_cast(&rig);
+        fake.script(|s| s.activity.pairing = true);
+        let st = rig.check();
+        assert!(matches!(st.phase, Phase::Ready { declined: false, .. }), "{st:?}");
+        assert!(rig.pkexec_argv().is_empty());
+        assert!(!rig.updater.held_install_due(), "still pairing");
+        // the next check doesn't go around it either
+        let st = rig.check();
+        assert!(matches!(st.phase, Phase::Ready { .. }), "{st:?}");
+        assert!(rig.pkexec_argv().is_empty());
+
+        fake.script(|s| s.activity.pairing = false);
+        // what the restart watch does on its next tick
+        assert!(rig.updater.held_install_due());
+        rig.updater.install_now();
+        rig.until("installed", |s| matches!(s.phase, Phase::Installed { .. }));
+        assert_eq!(rig.pkexec_argv()[1], "install");
+        assert!(!rig.updater.held_install_due(), "taken once");
+        assert!(!rig.toasts().iter().any(|t| t.text.contains("enter your password")));
     }
 }

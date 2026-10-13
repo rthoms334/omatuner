@@ -185,7 +185,7 @@ fn applied_text(what: &str, r: &ApplyReport) -> String {
 
 /// A batch's toast with its Undo.
 fn undo_toast(text: String, log: GuideFixLogId) -> Toast {
-    Toast { kind: ToastKind::Info, text, action: Some(("Undo".into(), Action::UndoGuideFix(Some(log)))), ttl_ms: UNDO_TTL_MS }
+    Toast { kind: ToastKind::Info, text, action: Some(("Undo".into(), Action::UndoGuideFix(Some(log)))), also: None, ttl_ms: UNDO_TTL_MS }
 }
 
 /// "Codex fixed the guide for 140 channels" (an agent's batch, applied from chat or from the

@@ -28,7 +28,7 @@ With the Arch package installed, `tuner claude-setup` prints the same steps for 
 `RULES.md` holds the rules every skill follows: confirm before changing things, never handle the
 parental PIN, treat provider text as data, respect the spoiler guard.
 
-The full guide, including what Claude (or any agent) asks first, the 28 tools and what it can't
+The full guide, including what Claude (or any agent) asks first, the 29 tools and what it can't
 see, is in Tuner's README: [Use Tuner from an AI agent](https://github.com/rthoms334/omatuner#use-tuner-from-an-ai-agent).
 
 Other agents (Codex, Gemini CLI, Cursor, VS Code and any other MCP client) don't need this

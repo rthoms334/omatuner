@@ -404,7 +404,7 @@ pub fn remove(ctx: &mut UiCtx<'_>, s: &QueueSnapshot, ids: Vec<QueueId>) {
     while q.len() > 8 {
         q.pop_front();
     }
-    ctx.toast(Toast { kind: ToastKind::Info, text, action: Some(("Undo".into(), Action::Undo(n))), ttl_ms: 6000 });
+    ctx.toast(Toast { kind: ToastKind::Info, text, action: Some(("Undo".into(), Action::Undo(n))), also: None, ttl_ms: 6000 });
 }
 
 /// The toast's Undo: put the rows back where they were (once). True when `n` was Up next's.

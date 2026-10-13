@@ -67,6 +67,8 @@ impl ReconnectPolicy {
     /// | ProviderError (message body) | 3 retries, 3 s apart     | same |
     /// | HttpOther(5xx)               | backoff                  | backoff |
     /// | Unsupported / Drm / Resolve / Budget | none             | none |
+    /// | Cast(Unreachable)            | 1 retry after 2 s (re-verify) | same |
+    /// | Cast(other)                  | none                     | none |
     pub fn delay(&self, attempt: u32, kind: PlayerErrorKind, live: bool) -> Option<Duration> {
         use PlayerErrorKind as K;
         let max = if live { self.max_attempts_live } else { self.max_attempts_vod };
@@ -77,6 +79,9 @@ impl ReconnectPolicy {
             K::HttpNotFound => (live && attempt <= 1).then(|| Duration::from_secs(2)),
             K::HttpOther(code) if (400..500).contains(&code) => None,
             K::ProviderError => (attempt <= PROVIDER_RETRIES).then(|| Duration::from_secs(3)),
+            // casting (DESIGN §40 §11.2): an unreachable TV is re-verified once; nothing else retries
+            K::Cast(crate::model::CastErrorKind::Unreachable) => (attempt <= 1).then(|| Duration::from_secs(2)),
+            K::Cast(_) => None,
             K::Network | K::Timeout | K::Stalled | K::StreamEnded | K::HttpOther(_) | K::Mpv => {
                 if attempt > max {
                     None
@@ -90,7 +95,10 @@ impl ReconnectPolicy {
     /// Whether a live channel that already played keeps reconnecting after a failure of
     /// `kind` (see [`ReconnectPolicy::sticky_delay`]).
     pub fn sticky(kind: PlayerErrorKind) -> bool {
-        !matches!(kind, PlayerErrorKind::Unsupported | PlayerErrorKind::Drm | PlayerErrorKind::Resolve | PlayerErrorKind::Budget)
+        !matches!(
+            kind,
+            PlayerErrorKind::Unsupported | PlayerErrorKind::Drm | PlayerErrorKind::Resolve | PlayerErrorKind::Budget | PlayerErrorKind::Cast(_)
+        )
     }
 
     /// Delay before reconnect `attempt` (1-based) of a live channel that already played, `since`

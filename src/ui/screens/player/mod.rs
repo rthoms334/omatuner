@@ -47,6 +47,12 @@
 //!   context: `w` next picture, Ctrl+arrows, `M` sound here, `W` swap, `t` layout, `q` close
 //!   this picture (Esc never closes one); the right-click menu starts with them.
 //!
+//! * Casting (DESIGN §40; `C`, the OSD's Cast control, the player menu): the picker
+//!   (`overlays::cast_picker`) and the PIN overlay open from here; while `snap.cast` is set the
+//!   video host draws the casting card with Stop casting / Play here (and a failure's own
+//!   buttons, `cards.rs`), the controls row drops audio, subtitles and pop-out, the volume
+//!   reads "TV remote", and the keys that do nothing on a TV say so in the banner.
+//!
 //! Everything over the video uses the fixed OSD colours (`osd_scrim`, `osd_text`,
 //! `osd_accent`), never theme colours, so it is legible on any theme (FIXED DECISION 6). Keys
 //! that manage the window or the app (F11, Esc, ?, /) don't show the banner. Zapping before
@@ -319,17 +325,22 @@ impl PlayerScreen {
                 items.push(menu_item(icon, label, Action::ToggleFavourite, true, k));
             }
         }
-        items.push(menu_item(glyphs::ASPECT, "Aspect ratio", Action::CycleAspect, true, k));
-        items.push(menu_item(glyphs::DISPLAY, "Zoom", Action::CycleZoom, true, k));
-        items.push(menu_item(glyphs::AUDIO_TRACK, "Audio…", Action::AudioMenu, true, k));
-        items.push(menu_item(glyphs::SUBTITLES, "Subtitles…", Action::SubtitleMenu, true, k));
+        // the TV has its own picture, tracks and window (DESIGN §40 §3.3)
+        let casting = snap.cast.is_some();
+        if !casting {
+            items.push(menu_item(glyphs::ASPECT, "Aspect ratio", Action::CycleAspect, true, k));
+            items.push(menu_item(glyphs::DISPLAY, "Zoom", Action::CycleZoom, true, k));
+            items.push(menu_item(glyphs::AUDIO_TRACK, "Audio…", Action::AudioMenu, true, k));
+            items.push(menu_item(glyphs::SUBTITLES, "Subtitles…", Action::SubtitleMenu, true, k));
+        }
         items.push(menu_item(glyphs::INFO, "Stream info", Action::StreamInfo, true, k));
         if matches!(snap.playable.as_ref().map(|p| &p.kind), Some(PlayableKind::Catchup { .. })) {
             items.push(menu_item(glyphs::LIVE_DOT, "Jump to live", Action::JumpToLive, true, KeyContext::PlayerVod));
         }
+        items.extend(self.cast_menu_items(ctx, k));
         if ctx.video_only {
             items.push(menu_item(glyphs::POP_IN, "Back to the full window", Action::TogglePopOut, true, KeyContext::PopOut));
-        } else {
+        } else if !casting {
             items.push(menu_item(glyphs::POP_OUT, "Pop out", Action::TogglePopOut, true, k));
         }
         items.push(menu_item(glyphs::MINI_PLAYER, "Keep playing in the mini player", Action::Minimize, true, k));
@@ -480,7 +491,27 @@ impl Screen for PlayerScreen {
         let skip_small = f64::from(ctx.config.player.skip_small_s);
         let skip_large = f64::from(ctx.config.player.skip_large_s);
         let live = self.live_ctx;
+        let casting = ctx.player.cast.is_some();
         match action {
+            Action::CastMenu if crate::cast::on(ctx.config) || casting => self.cast_menu(ctx),
+            Action::StopCasting if casting => ctx.play(PlayerCommand::StopCasting { play_here: false }),
+            // a TV with no volume, and keys for what the TV does itself (DESIGN §40 §11.3)
+            Action::Mute | Action::VolumeUp | Action::VolumeDown if tv_volume(ctx.player) => self.cast_notice(ctx, TV_VOLUME),
+            Action::CycleAudio
+            | Action::CycleSubtitle
+            | Action::AudioMenu
+            | Action::SubtitleMenu
+            | Action::SubDelayMinus
+            | Action::SubDelayPlus
+            | Action::SubDelayReset
+            | Action::SubSizeMinus
+            | Action::SubSizePlus
+            | Action::CycleAspect
+            | Action::CycleZoom
+                if casting =>
+            {
+                self.cast_notice(ctx, NOT_WHILE_CASTING)
+            }
             Action::PlayPause => ctx.play(PlayerCommand::TogglePause),
             Action::Mute => {
                 ctx.play(PlayerCommand::ToggleMute);
@@ -494,7 +525,7 @@ impl Screen for PlayerScreen {
                 self.osd_focus = true;
                 self.row = OsdRow::Buttons;
                 self.control = self
-                    .active_controls(ctx.player, narrow, ctx.video_only, osd::QueueButtons::of(ctx))
+                    .active_controls(ctx.player, narrow, ctx.video_only, osd::OptionalButtons::of(ctx))
                     .iter()
                     .position(|c| *c == Control::PlayPause)
                     .unwrap_or(0);
@@ -620,6 +651,7 @@ impl Screen for PlayerScreen {
             return;
         }
         self.update_other_copy(ctx, &snap);
+        self.update_cast_context(ctx, &snap);
         // multi-view: both pictures in their layout (the response covers every picture)
         let resp = match self.paint_multiview(ui, ctx, rect) {
             Some(r) => r,
@@ -634,13 +666,23 @@ impl Screen for PlayerScreen {
         for (i, b) in ctx.video.state_buttons().to_vec().into_iter().enumerate() {
             p.rect_stroke(b.rect, theme.tokens.rounding, egui::Stroke::new(1.0, with_alpha(theme.tokens.osd_text, 0.6)), egui::StrokeKind::Inside);
             let (label, tip, action) = match b.action {
-                StateAction::Retry => ("Retry", "Retry (r)", Action::Retry),
-                StateAction::LastChannel => ("Last channel", "Last channel (Backspace)", Action::LastChannel),
-                StateAction::OtherCopy => ("Play from another copy", "Play from another copy (Ctrl+O)", Action::PlayFrom),
-                StateAction::Stop => ("Stop", "Stop and close (q)", Action::StopAndClose),
+                StateAction::Retry => ("Retry", "Retry (r)", Some(Action::Retry)),
+                StateAction::LastChannel => ("Last channel", "Last channel (Backspace)", Some(Action::LastChannel)),
+                StateAction::OtherCopy => ("Play from another copy", "Play from another copy (Ctrl+O)", Some(Action::PlayFrom)),
+                StateAction::Stop => ("Stop", "Stop and close (q)", Some(Action::StopAndClose)),
+                // the casting card's own (DESIGN §40 §3.3, §3.4)
+                cast => {
+                    let label = cast.cast_label().unwrap_or_default();
+                    (label, label, None)
+                }
             };
             if osd_button(ui, &p, theme, b.rect, ui.id().with(("state-button", i)), &b.text, b.font, label, Some(tip), false).clicked() {
-                self.on_action(ctx, action);
+                match action {
+                    Some(a) => {
+                        self.on_action(ctx, a);
+                    }
+                    None => self.cast_state_action(ctx, b.action, &snap),
+                }
             }
         }
         // mouse: motion shows the banner, double-click toggles window fullscreen (pops the
@@ -719,9 +761,13 @@ impl Screen for PlayerScreen {
             let steps = (self.wheel / 40.0).trunc();
             if steps != 0.0 {
                 self.wheel -= steps * 40.0;
-                ctx.play(PlayerCommand::AdjustVolume(f64::from(steps) * 5.0));
-                self.flash = Some((Flash::Volume, Instant::now()));
-                self.show_banner(ctx);
+                if tv_volume(&snap) {
+                    self.cast_notice(ctx, TV_VOLUME);
+                } else {
+                    ctx.play(PlayerCommand::AdjustVolume(f64::from(steps) * 5.0));
+                    self.flash = Some((Flash::Volume, Instant::now()));
+                    self.show_banner(ctx);
+                }
             }
         }
         // the banner stays while the pointer is in use on a bar (it would vanish under a drag of
@@ -750,6 +796,10 @@ impl Screen for PlayerScreen {
             OverlayResult::Chosen(Action::Digit(multiview::CLOSE_OTHER)) if ctx.multiview.on() => {
                 ctx.mv_request(crate::ui::multiview::MvRequest::Close(Some(ctx.multiview.view.unfocused())));
             }
+            // the menu's casting items (codes above typed digits)
+            OverlayResult::Chosen(Action::Digit(CAST_PLAY_HERE)) => ctx.play(PlayerCommand::StopCasting { play_here: true }),
+            OverlayResult::Chosen(Action::Digit(CAST_CONVERT)) => ctx.services.agent.cast().convert_current(),
+            OverlayResult::Chosen(Action::Digit(CAST_AS_IS)) => ctx.services.agent.cast().send_as_is(),
             // a copy of the Ctrl+O menu (never a typed channel number)
             OverlayResult::Chosen(Action::Digit(d)) if d >= SWITCH_COPY && !self.switch_copies.is_empty() => {
                 if let Some(c) = self.switch_copies.get(usize::from(d - SWITCH_COPY)) {
@@ -805,6 +855,13 @@ mod tests {
         h.state().t.services().tiles.focused().snapshot()
     }
 
+    /// What the screen draws from (after [`sync`]). A wait checks this, not [`real`]: the
+    /// player can change between the copy and the check, and a wait that passed on the newer
+    /// state left the screen on the older one (the Unmute label then never came).
+    fn shown(h: &H) -> Arc<PlayerSnapshot> {
+        h.state().t.snapshot.clone()
+    }
+
     /// The screen's snapshot: mpv's volume / mute / pause, playing a live channel.
     fn sync(h: &mut H) {
         let mut s = (*real(h)).clone();
@@ -844,7 +901,7 @@ mod tests {
         h.drop_at(c);
         until(&mut h, "volume 65 %", |h| {
             sync(h);
-            real(h).volume == 65.0
+            shown(h).volume == 65.0
         });
         h.hover_at(c);
         h.event(egui::Event::MouseWheel {
@@ -855,13 +912,13 @@ mod tests {
         });
         until(&mut h, "one wheel notch up", |h| {
             sync(h);
-            real(h).volume == 70.0
+            shown(h).volume == 70.0
         });
         assert!(!real(&h).muted);
         h.get_by_label("Mute").click();
         until(&mut h, "muted", |h| {
             sync(h);
-            real(h).muted
+            shown(h).muted
         });
         // the label follows the player's state a frame or more later (slow under a loaded test run)
         until(&mut h, "the speaker says what a click does (Unmute)", |h| has_label(h, "Unmute"));
@@ -870,7 +927,7 @@ mod tests {
         h.drop_at(c);
         until(&mut h, "unmuted at 65 %", |h| {
             sync(h);
-            !real(h).muted && real(h).volume == 65.0
+            !shown(h).muted && shown(h).volume == 65.0
         });
         // half a notch over the video, then a notch over the speaker: the speaker's notch
         // alone counts (the video used to take it too, +10)
@@ -884,7 +941,7 @@ mod tests {
         wheel(&h, egui::MouseWheelUnit::Line, 1.0);
         until(&mut h, "one notch over the speaker", |h| {
             sync(h);
-            real(h).volume >= 70.0
+            shown(h).volume >= 70.0
         });
         h.run_steps(30);
         std::thread::sleep(Duration::from_millis(100));
@@ -1170,7 +1227,7 @@ mod tests {
         h.get_by_label("Play / pause").click();
         until(&mut h, "pause toggled", |h| {
             sync(h);
-            real(h).paused != paused
+            shown(h).paused != paused
         });
         assert_eq!(h.state().s.key_contexts(), vec![KeyContext::PlayerLive]);
     }
@@ -1349,5 +1406,164 @@ mod tests {
         h.run_steps(2);
         assert!(h.state_mut().nav().contains(&NavRequest::Back), "Stop leaves the player");
         until(&mut h, "stopped", |h| real(h).state == PlayerState::Idle);
+    }
+
+    // ---------------------------------------------------------------- casting (DESIGN §40)
+
+    use crate::model::{CastErrorKind, CastLevel, CastPhase, CastView, DeviceId, ReceiverKind};
+
+    const TV: DeviceId = DeviceId::from_bytes([1; 16]);
+
+    /// The player while casting live TV to "Living Room" in `state`.
+    fn casting(state: PlayerState) -> H {
+        let mut h = player(WIDE);
+        let view = CastView {
+            device: TV,
+            name: "Living Room".into(),
+            kind: ReceiverKind::AppleTv,
+            phase: CastPhase::Playing,
+            level: Some(CastLevel::Repackaged),
+            as_is: false,
+            behind_live_s: Some(15),
+            can_seek: false,
+            volume: false,
+        };
+        let mut s = (*real(&h)).clone();
+        s.state = state;
+        s.playable = Some(playable());
+        s.cast = Some(view);
+        h.state_mut().t.snapshot = Arc::new(s);
+        let mut cfg = (*h.state().t.config).clone();
+        cfg.interface.osd_timeout_ms = 60_000;
+        h.state_mut().t.config = Arc::new(cfg);
+        h.run_steps(3);
+        h
+    }
+
+    /// The card stands in for the picture ("Playing on Living Room", Live · about 15 s behind),
+    /// with Stop casting and Play here; the OSD has the Cast control with the TV's name, no
+    /// audio, subtitles or pop-out, and the speaker reads "TV remote".
+    #[test]
+    fn casting_shows_the_card_and_trims_the_osd() {
+        use crate::ui::screens::home::testkit::painted;
+        let h = casting(PlayerState::Playing);
+        let texts = painted(&h);
+        assert!(texts.iter().any(|t| t.ends_with("Playing on Living Room")), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "Live · about 15 s behind"), "{texts:?}");
+        assert!(has_label(&h, "Stop casting") && has_label(&h, "Play here"));
+        assert!(has_label(&h, "Cast to a TV") && texts.contains(&format!("{}  Living Room", glyphs::CAST_CONNECTED)), "{texts:?}");
+        for gone in ["Audio", "Subtitles", "Pop out", "Mute", "Volume"] {
+            assert!(!has_label(&h, gone), "{gone} stays hidden while casting");
+        }
+        assert!(has_label(&h, "Volume: use the TV remote") && has_label(&h, "Info") && has_label(&h, "Fullscreen"));
+    }
+
+    /// Without a cast the control is only there while casting is on — built in and not
+    /// switched off in Settings ▸ Cast (`C` is inert otherwise: no picker without the service
+    /// behind it) — and it never offers a TV to multi-view.
+    #[test]
+    fn the_cast_control_and_key_wait_for_the_feature() {
+        let mut h = player(WIDE);
+        assert_eq!(has_label(&h, "Cast to a TV"), crate::cast::ENABLED);
+        h.state_mut().nav();
+        assert_eq!(h.state_mut().act(Action::CastMenu), crate::cast::ENABLED);
+        assert_eq!(h.state_mut().nav().contains(&NavRequest::Open(OverlayRequest::CastPicker)), crate::cast::ENABLED);
+
+        let mut off = (*h.state().t.config).clone();
+        off.cast.enabled = false;
+        h.state_mut().t.config = Arc::new(off);
+        h.run_steps(3);
+        assert!(!has_label(&h, "Cast to a TV"), "switched off in Settings");
+        h.state_mut().act(Action::CastMenu);
+        assert!(!h.state_mut().nav().contains(&NavRequest::Open(OverlayRequest::CastPicker)));
+    }
+
+    /// While casting `C` opens the picker; the keys that do nothing on a TV say so in the
+    /// banner instead of reaching mpv.
+    #[test]
+    fn casting_keys_open_the_picker_and_explain_themselves() {
+        use crate::ui::screens::home::testkit::painted;
+        let mut h = casting(PlayerState::Playing);
+        h.state_mut().nav();
+        assert!(h.state_mut().act(Action::CastMenu));
+        assert_eq!(h.state_mut().nav(), vec![NavRequest::Open(OverlayRequest::CastPicker)]);
+        assert!(h.state_mut().act(Action::VolumeUp));
+        h.run_steps(2);
+        assert!(painted(&h).iter().any(|t| t == "Use the TV remote for volume"));
+        assert!(h.state_mut().act(Action::CycleAspect));
+        h.run_steps(2);
+        assert!(painted(&h).iter().any(|t| t == "Not available while casting"));
+    }
+
+    /// The player menu while casting: Stop casting, Play here and Convert this channel come
+    /// with "Cast to a TV…"; what the TV does itself is left out.
+    #[test]
+    fn the_player_menu_while_casting_has_the_casting_items() {
+        let mut h = casting(PlayerState::Playing);
+        h.state_mut().nav();
+        let c = egui::pos2(WIDE.x / 3.0, WIDE.y / 2.0);
+        h.hover_at(c);
+        press(&h, c, egui::PointerButton::Secondary);
+        h.run_steps(2);
+        let nav = h.state_mut().nav();
+        let Some(NavRequest::Open(OverlayRequest::ContextMenu(spec))) = nav.last() else { panic!("no menu: {nav:?}") };
+        let labels: Vec<&str> = spec.items.iter().map(|i| i.label.as_str()).collect();
+        for want in ["Cast to a TV…", "Stop casting", "Play here", "Convert this channel", "Stream info"] {
+            assert!(labels.contains(&want), "{want}: {labels:?}");
+        }
+        for gone in ["Aspect ratio", "Zoom", "Audio…", "Subtitles…", "Pop out"] {
+            assert!(!labels.contains(&gone), "{gone}: {labels:?}");
+        }
+    }
+
+    /// L3 forced by a remembered choice or failure: the menu's last casting item is **Send as
+    /// is**, which asks the service to forget it (DESIGN §40 §8.3); converted for the format,
+    /// Convert this channel stays, greyed.
+    #[test]
+    fn a_remembered_conversion_offers_send_as_is() {
+        let menu = |as_is: bool| {
+            let mut h = casting(PlayerState::Playing);
+            let mut s = (*h.state().t.snapshot).clone();
+            let view = s.cast.as_mut().unwrap();
+            (view.level, view.as_is) = (Some(CastLevel::Converted), as_is);
+            h.state_mut().t.snapshot = Arc::new(s);
+            h.run_steps(2);
+            h.state_mut().nav();
+            let c = egui::pos2(WIDE.x / 3.0, WIDE.y / 2.0);
+            h.hover_at(c);
+            press(&h, c, egui::PointerButton::Secondary);
+            h.run_steps(2);
+            let nav = h.state_mut().nav();
+            let Some(NavRequest::Open(OverlayRequest::ContextMenu(spec))) = nav.last() else { panic!("no menu: {nav:?}") };
+            spec.items.iter().map(|i| (i.label.clone(), i.enabled)).collect::<Vec<_>>()
+        };
+        let items = menu(true);
+        assert!(items.contains(&("Send as is".into(), true)) && !items.iter().any(|i| i.0 == "Convert this channel"), "{items:?}");
+        let items = menu(false);
+        assert!(items.contains(&("Convert this channel".into(), false)) && !items.iter().any(|i| i.0 == "Send as is"), "{items:?}");
+    }
+
+    /// A failure reads as one sentence with its own buttons; the buttons open what they say.
+    #[test]
+    fn a_cast_failure_shows_its_sentence_and_buttons() {
+        use crate::ui::screens::home::testkit::painted;
+        let failed = |k| PlayerState::Error(crate::player::PlayerError { kind: crate::player::PlayerErrorKind::Cast(k), message: String::new() });
+        let mut h = casting(failed(CastErrorKind::Firewall));
+        assert!(painted(&h).iter().any(|t| t == "Living Room couldn't connect back to Tuner. Your firewall is blocking it."), "{:?}", painted(&h));
+        for b in ["Allow on firewall", "Show command", "Try again", "Play here"] {
+            assert!(has_label(&h, b), "{b}");
+        }
+        assert!(!has_label(&h, "Stop casting"));
+        h.state_mut().nav();
+        h.get_by_label("Show command").click();
+        h.run_steps(2);
+        assert_eq!(h.state_mut().nav(), vec![NavRequest::Open(OverlayRequest::CastFirewall)]);
+        drop(h);
+        let mut h = casting(failed(CastErrorKind::PairingLost));
+        assert!(painted(&h).iter().any(|t| t == "Living Room forgot Tuner. This can happen after a TV update."));
+        h.state_mut().nav();
+        h.get_by_label("Pair").click();
+        h.run_steps(2);
+        assert_eq!(h.state_mut().nav(), vec![NavRequest::Open(OverlayRequest::CastPair { device: TV, then_cast: true })]);
     }
 }

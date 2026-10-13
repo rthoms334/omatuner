@@ -8,6 +8,10 @@
 //! typing starts (launcher idiom).
 
 pub mod agent_connect;
+pub mod cast_firewall;
+pub mod cast_offer;
+pub mod cast_pair;
+pub mod cast_picker;
 pub mod categories;
 pub mod delete_playlist;
 pub mod dialogs;
@@ -187,5 +191,10 @@ pub fn build(req: OverlayRequest, ctx: &mut UiCtx<'_>) -> Box<dyn Overlay> {
         OverlayRequest::ReminderSheet(spec) => Box::new(reminders::ReminderSheet::new(spec)),
         OverlayRequest::WatchAlongside => Box::new(crate::ui::multiview::AlongsidePicker),
         OverlayRequest::AgentConnect(offer) => Box::new(agent_connect::AgentConnectCard::new(offer)),
+        // casting (DESIGN §40; picker and pairing CAST-8, firewall and setup CAST-9)
+        OverlayRequest::CastPicker => Box::new(cast_picker::CastPicker::new()),
+        OverlayRequest::CastPair { device, then_cast } => Box::new(cast_pair::CastPair::new(device, then_cast)),
+        OverlayRequest::CastFirewall => Box::new(cast_firewall::CastFirewall::new()),
+        OverlayRequest::CastOffer(offer) => Box::new(cast_offer::CastOffer::new(offer)),
     }
 }

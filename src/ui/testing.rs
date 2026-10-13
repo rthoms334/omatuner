@@ -88,7 +88,11 @@ impl TestUi {
             lib: Arc::new(Library::default()),
             favs: FavIndex::default(),
             db,
-            budget: FrameBudget::default(),
+            // behaviour, not frame timing: the app's 2 ms per-frame DB budget defers loads to
+            // later frames, which a test drawing one frame never sees on a loaded machine (the
+            // guide's focused programme was still unloaded, so Enter watched instead of opening
+            // its popover). The budget's own tests build their own `FrameBudget`.
+            budget: FrameBudget::new(std::time::Duration::from_secs(5)),
             now_next: NowNextCache::default(),
             config,
             snapshot,

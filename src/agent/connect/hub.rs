@@ -581,7 +581,7 @@ fn run_steps(runner: &dyn CommandRunner, env: &ConnectEnv, id: AgentId, op: Op) 
 
 /// The toast for an op's result (`None`: a quiet pass's "up to date").
 fn toast(id: AgentId, op: Op, result: &Result<Done, String>, status: &Status, quiet: bool) -> Option<Toast> {
-    let success = |text: String| Some(Toast { kind: ToastKind::Success, text, action: None, ttl_ms: TOAST_MS });
+    let success = |text: String| Some(Toast { kind: ToastKind::Success, text, action: None, also: None, ttl_ms: TOAST_MS });
     let label = id.label();
     match (op, result) {
         (Op::Connect, Ok(_)) if id == AgentId::Claude => success(format!("{label} is connected to Tuner — restart {label} to use it")),

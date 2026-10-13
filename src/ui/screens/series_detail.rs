@@ -387,7 +387,7 @@ impl SeriesDetailScreen {
         if !missing.is_empty() {
             let names = crate::ui::copies::series_playlists(ctx.lib, &missing);
             let text = format!("{names} couldn't load its episodes — marked in the other copies only");
-            ctx.toast(crate::msg::Toast { kind: crate::msg::ToastKind::Warning, text, action: None, ttl_ms: 6000 });
+            ctx.toast(crate::msg::Toast { kind: crate::msg::ToastKind::Warning, text, action: None, also: None, ttl_ms: 6000 });
         }
     }
 

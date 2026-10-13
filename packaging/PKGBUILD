@@ -17,11 +17,13 @@ license=('GPL-3.0-or-later')
 # Linked: libmpv (client API >= 2.5, mpv >= 0.38) and liblzma (xz). Loaded at runtime:
 # libwayland-client, libxkbcommon, libEGL/libGL (mesa). fontconfig for fc-match/fc-list; the
 # UI font and its icon glyphs are JetBrains Mono Nerd Font (Omarchy's monospace). MPRIS,
-# notifications and the portal file pickers talk to the session bus (dbus).
+# notifications and the portal file pickers talk to the session bus (dbus). ffmpeg: the ffmpeg and
+# ffprobe commands that casting runs (DESIGN §40 §8); mpv depends on it already, so this only
+# declares it.
 depends=('mpv>=1:0.38' 'xz' 'fontconfig' 'ttf-jetbrains-mono-nerd' 'wayland' 'libxkbcommon'
-         'mesa' 'dbus' 'gcc-libs' 'glibc')
+         'mesa' 'dbus' 'gcc-libs' 'glibc' 'ffmpeg')
 makedepends=('cargo')
-optdepends=('polkit: installing Tuner updates from Tuner (pkexec; Omarchy has it)'
+optdepends=('polkit: installing Tuner updates and the "Allow on firewall" button for casting (pkexec; Omarchy has it)'
             'hyprland: window rules from /usr/share/tuner/hypr, raising the window'
             'xdg-desktop-portal-gtk: file pickers (add a playlist file, backup, log export)'
             'noto-fonts-cjk: CJK channel and programme names'
@@ -85,6 +87,11 @@ check() {
 package() {
   cd "$_srcdir"
   install -Dm755 "$srcdir/target/release/tuner" "$pkgdir/usr/bin/tuner"
+  # Casting's one root program, started only through pkexec under its polkit action (DESIGN §40
+  # §9.4); the policy names this exact path, so it must not move.
+  install -Dm755 "$srcdir/target/release/tuner-firewall" "$pkgdir/usr/lib/tuner/tuner-firewall"
+  install -Dm644 packaging/polkit/io.github.rthoms334.omatuner.firewall.policy \
+    "$pkgdir/usr/share/polkit-1/actions/io.github.rthoms334.omatuner.firewall.policy"
   install -Dm644 packaging/tuner.desktop "$pkgdir/usr/share/applications/tuner.desktop"
   install -Dm644 packaging/icons/tuner.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/tuner.svg"
   # Opt-in snippets (nothing is written to the user's config): see README "Omarchy integration".
@@ -112,5 +119,5 @@ package() {
   install -Dm644 packaging/polkit/io.github.rthoms334.omatuner.update.policy \
     "$pkgdir/usr/share/polkit-1/actions/io.github.rthoms334.omatuner.update.policy"
   install -Dm644 -t "$pkgdir/usr/share/doc/tuner" README.md docs/DESIGN.md docs/MANUAL_CHECKLIST.md
-  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 LICENSE THIRD_PARTY_NOTICES.md -t "$pkgdir/usr/share/licenses/$pkgname"
 }

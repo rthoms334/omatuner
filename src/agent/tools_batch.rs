@@ -327,7 +327,8 @@ removing one needs the PIN in Tuner. Confirm with the user first.",
             title: "Diagnose playback",
             description: "Playback health now (state, cache, dropped frames, decoder), recent state changes with reasons and HTTP \
 status, failures on the same playlist, and redacted warnings — to tell a provider outage, a connection limit, a dead channel and a \
-local problem apart. Never contains addresses or logins.",
+local problem apart. With a TV paired, a cast section: its model and tvOS version, the pairing variant, the firewall state and the \
+last cast error. Never contains addresses or logins.",
             input_schema: object(json!({ "ref": text("A channel or item ref (default: what plays)."), "since": text(TIME) }), &[]),
             read_only: true,
             launches: true,

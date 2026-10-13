@@ -121,6 +121,11 @@ pub struct AgentPlay {
     pub from_start: bool,
     /// Where it shows, resolved by the handler (`act::agent_show`, DESIGN §30.13).
     pub show: act::AgentShow,
+    /// `play {device}` (DESIGN §40 §3.8, §12): play it on this TV (`PlayerCommand::CastTo`
+    /// with the request) instead of here. The window stays where it is (no pop-out, no raise,
+    /// whatever `show` says; a popped-out window goes back in, unraised); only a PIN prompt
+    /// raises it, and nothing is cast before the unlock. Set by CAST-10, played by CAST-9.
+    pub device: Option<crate::model::DeviceId>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -351,14 +351,16 @@ impl Engine {
             Effect::Write(w) => self.write(w).await,
             Effect::Toast(text) => {
                 let action = (text == PAUSED_TOAST).then(|| ("Up next".to_owned(), crate::keymap::Action::GoQueue));
-                self.deps.bus.toast(Toast { kind: ToastKind::Info, text: text.into(), action, ttl_ms: 5000 });
+                self.deps.bus.toast(Toast { kind: ToastKind::Info, text: text.into(), action, also: None, ttl_ms: 5000 });
                 Vec::new()
             }
             Effect::NotifyPin(id) => {
                 // the card shows it in the window; a hidden window, or the pop-out (it never
                 // takes the keyboard: an agent's Up next plays there, DESIGN §30.13), gets a
-                // notification
-                if (self.last.video_suspended || self.shared.window().is_some_and(|w| w.popped_out))
+                // notification. Casting suspends no local video (there is none): there, a
+                // window without the focus gets it (DESIGN §40 §3.8, §11.4)
+                let casting_unseen = self.last.cast.is_some() && !self.shared.window().is_some_and(|w| w.focused);
+                if (self.last.video_suspended || casting_unseen || self.shared.window().is_some_and(|w| w.popped_out))
                     && let Some(r) = self.machine.rows().iter().find(|r| r.id == id)
                 {
                     let title = self.shared.guard().outside_title(&r.title, now()).into_owned();
@@ -376,6 +378,7 @@ impl Engine {
             main_kind: main_kind(&self.last),
             queue_running: true,
             follow_interrupt_vod: self.config().follow.interrupt_vod,
+            casting: self.last.cast.is_some(),
         };
         let intent = PlayIntent { source: PlaySource::Queue, kind, live_channel };
         matches!(crate::playback::route(&intent, &st, &self.shared.guard(), now()), Route::Tile { tile: crate::model::TileId::A, .. })

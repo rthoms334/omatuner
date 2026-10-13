@@ -20,34 +20,41 @@ pub(super) enum Control {
     UpNext,
     /// Up next's next item (`n`): while Up next has one and multi-view is off.
     QueueNext,
+    /// Cast to a TV (`C`; DESIGN §40 §3.1): before Fullscreen in the wide layout; while casting
+    /// it shows the connected glyph and the TV's name.
+    Cast,
     Fullscreen,
     PopOut,
 }
 
-/// Which of Up next's OSD buttons the controls row has (DESIGN §32, up-next-design §2.5 Mouse).
+/// Which of the optional OSD buttons the controls row has: Up next's (DESIGN §32, up-next-design
+/// §2.5 Mouse) and Cast (DESIGN §40 §3.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(super) struct QueueButtons {
+pub(super) struct OptionalButtons {
     pub(super) panel: bool,
     pub(super) next: bool,
+    pub(super) cast: bool,
 }
 
-impl QueueButtons {
+impl OptionalButtons {
     /// `Up next` with Up next on; `Next` while it has a next item and multi-view is off (Up
-    /// next waits in multi-view).
+    /// next waits in multi-view). `Cast` with casting on (`cast::on`: built in and not switched
+    /// off in Settings), or while a cast runs (its way off); not in multi-view, which can't cast.
     pub(super) fn of(ctx: &UiCtx<'_>) -> Self {
+        let cast = (crate::cast::on(ctx.config) || ctx.player.cast.is_some()) && !ctx.multiview.on();
         if !crate::queue::ENABLED {
-            return Self::default();
+            return Self { cast, ..Self::default() };
         }
-        Self { panel: true, next: !ctx.multiview.on() && ctx.services.agent.queue().next.is_some() }
+        Self { panel: true, next: !ctx.multiview.on() && ctx.services.agent.queue().next.is_some(), cast }
     }
 }
 
 impl Control {
-    pub(super) fn glyph(self, paused: bool) -> &'static str {
+    pub(super) fn glyph(self, snap: &PlayerSnapshot) -> &'static str {
         match self {
             Control::Prev => glyphs::PREVIOUS,
             Control::PlayPause => {
-                if paused {
+                if snap.paused {
                     glyphs::PLAY
                 } else {
                     glyphs::PAUSE
@@ -64,6 +71,8 @@ impl Control {
             Control::Info => glyphs::INFO,
             Control::UpNext => glyphs::UP_NEXT,
             Control::QueueNext => glyphs::QUEUE_NEXT,
+            Control::Cast if snap.cast.is_some() => glyphs::CAST_CONNECTED,
+            Control::Cast => glyphs::CAST,
             Control::Fullscreen => glyphs::FULLSCREEN,
             Control::PopOut => glyphs::POP_OUT,
         }
@@ -83,6 +92,7 @@ impl Control {
             Control::Info => "Info",
             Control::UpNext => "Up next",
             Control::QueueNext => "Next in Up next",
+            Control::Cast => "Cast to a TV",
             Control::Fullscreen => "Fullscreen",
             Control::PopOut => "Pop out",
         }
@@ -100,6 +110,7 @@ impl Control {
         match self {
             Control::UpNext => Some("Up next (u)"),
             Control::QueueNext => Some("Play the next item in Up next (n)"),
+            Control::Cast => Some("Cast to a TV (C)"),
             _ => None,
         }
     }
@@ -185,13 +196,15 @@ pub(super) fn control_text(c: Control, snap: &PlayerSnapshot) -> String {
         Control::Audio => snap.tracks.selected_audio().map_or_else(|| "Audio".into(), |a| a.label()),
         Control::Subtitles => snap.tracks.selected_sub().map_or_else(|| "Off".into(), |a| a.label()),
         Control::QueueNext => "Next".into(),
+        // the TV's name while casting, else what the button does
+        Control::Cast => snap.cast.as_ref().map_or_else(|| "Cast".into(), |c| c.name.clone()),
         other => other.label().into(),
     }
 }
 
 impl PlayerScreen {
     /// The controls focus mode walks: those drawn last frame (a prefix of `controls`).
-    pub(super) fn active_controls(&self, snap: &PlayerSnapshot, narrow: bool, video_only: bool, queue: QueueButtons) -> Vec<Control> {
+    pub(super) fn active_controls(&self, snap: &PlayerSnapshot, narrow: bool, video_only: bool, queue: OptionalButtons) -> Vec<Control> {
         let all = Self::controls(snap, narrow, video_only, queue);
         let drawn: Vec<Control> = all.iter().copied().filter(|c| self.visible.contains(c)).collect();
         if drawn.is_empty() { all } else { drawn }
@@ -214,25 +227,30 @@ impl PlayerScreen {
     /// The controls row; narrow keeps zapping (the only mouse path to it), play / tracks /
     /// info and Up next's `Next`. "Pop out" isn't offered in the popped-out window (its strip
     /// has the way back). Up next's buttons sit before Info (up-next-design §2.4).
-    pub(super) fn controls(snap: &PlayerSnapshot, narrow: bool, video_only: bool, queue: QueueButtons) -> Vec<Control> {
+    pub(super) fn controls(snap: &PlayerSnapshot, narrow: bool, video_only: bool, queue: OptionalButtons) -> Vec<Control> {
         use Control as C;
         let live = is_live(snap);
+        // the TV has its own tracks, picture and window: those controls do nothing while casting
+        let casting = snap.cast.is_some();
+        let tracks = [C::Audio, C::Subtitles].into_iter().filter(|_| !casting);
         let up_next = [queue.panel.then_some(C::UpNext), queue.next.then_some(C::QueueNext)];
         if narrow {
             let mut v = if live { vec![C::Prev, C::PlayPause, C::Next] } else { vec![C::PlayPause] };
-            v.extend([C::Audio, C::Subtitles]);
+            v.extend(tracks);
             v.extend(queue.next.then_some(C::QueueNext));
             v.push(C::Info);
             return v;
         }
-        let mut v = if live {
-            vec![C::Prev, C::PlayPause, C::Next, C::Audio, C::Subtitles, C::Channels, C::Guide, C::History]
-        } else {
-            vec![C::SkipBack, C::PlayPause, C::SkipForward, C::Audio, C::Subtitles]
-        };
+        let mut v = if live { vec![C::Prev, C::PlayPause, C::Next] } else { vec![C::SkipBack, C::PlayPause, C::SkipForward] };
+        v.extend(tracks);
+        if live {
+            v.extend([C::Channels, C::Guide, C::History]);
+        }
         v.extend(up_next.into_iter().flatten());
-        v.extend([C::Info, C::Fullscreen]);
-        if !video_only {
+        v.push(C::Info);
+        v.extend(queue.cast.then_some(C::Cast));
+        v.push(C::Fullscreen);
+        if !video_only && !casting {
             v.push(C::PopOut);
         }
         v
@@ -279,6 +297,16 @@ impl PlayerScreen {
     ) {
         let theme = ctx.theme;
         let t = &theme.tokens;
+        // AirPlay has no volume to set from here: one "TV remote" button (DESIGN §40 §3.3)
+        if tv_volume(snap) {
+            let full = slider.map_or(speaker, |(s, label)| speaker.union(s).union(label.unwrap_or(s)));
+            let text = if slider.is_some() { format!("{}  TV remote", glyphs::VOLUME) } else { glyphs::VOLUME.to_owned() };
+            let id = ui.id().with("osd-speaker");
+            if osd_button(ui, p, theme, full, id, &text, font, "Volume: use the TV remote", Some(TV_VOLUME), false).clicked() {
+                self.cast_notice(ctx, TV_VOLUME);
+            }
+            return;
+        }
         if !snap.muted {
             self.unmuting = None;
         }
@@ -352,6 +380,7 @@ impl PlayerScreen {
             Control::QueueNext => {
                 self.queue_action(ctx, Action::QueueNext);
             }
+            Control::Cast => self.cast_menu(ctx),
             Control::Fullscreen => self.toggle_fullscreen = true,
             Control::PopOut => ctx.navigate(NavRequest::TogglePopOut),
         }
@@ -365,7 +394,7 @@ impl PlayerScreen {
             return None;
         }
         let snap = ctx.player.clone();
-        let controls = self.active_controls(&snap, narrow, ctx.video_only, QueueButtons::of(ctx));
+        let controls = self.active_controls(&snap, narrow, ctx.video_only, OptionalButtons::of(ctx));
         let n = controls.len();
         self.control = self.focused_index(&controls);
         // the index below is into this list from now on
@@ -449,7 +478,13 @@ impl PlayerScreen {
         }
         // narrow: the bottom bar has only the speaker, so the level stays up here
         let clock_right = if narrow {
-            let vol = if snap.muted { format!("{} muted", glyphs::MUTED) } else { format!("{} {:.0} %", glyphs::VOLUME, snap.volume) };
+            let vol = if tv_volume(snap) {
+                format!("{} TV remote", glyphs::VOLUME)
+            } else if snap.muted {
+                format!("{} muted", glyphs::MUTED)
+            } else {
+                format!("{} {:.0} %", glyphs::VOLUME, snap.volume)
+            };
             osd_text(&p, egui::pos2(top.right() - pad, top.center().y), Align2::RIGHT_CENTER, &vol, small_font.clone(), t.osd_text, f32::INFINITY)
                 .left()
                 - pad
@@ -507,7 +542,7 @@ impl PlayerScreen {
 
         // ---- bottom bar
         let nn = ch.as_ref().filter(|_| live).and_then(|c| live::now_next_of(ctx, c));
-        let controls = Self::controls(snap, narrow, ctx.video_only, QueueButtons::of(ctx));
+        let controls = Self::controls(snap, narrow, ctx.video_only, OptionalButtons::of(ctx));
         let ctrl_h = (theme.space(SpaceToken::ControlHeight) * s * 1.2).round();
         let line = body_font.size * 1.4;
         let lines = 3.0;
@@ -686,11 +721,7 @@ impl PlayerScreen {
         let mut cx = inner.left();
         let mut clicked = None;
         let text_of = |c: Control, glyphs_only: bool| {
-            if glyphs_only || c.glyph_only() {
-                c.glyph(snap.paused).to_owned()
-            } else {
-                format!("{}  {}", c.glyph(snap.paused), control_text(c, snap))
-            }
+            if glyphs_only || c.glyph_only() { c.glyph(snap).to_owned() } else { format!("{}  {}", c.glyph(snap), control_text(c, snap)) }
         };
         let row_width = |glyphs_only: bool| -> f32 {
             controls.iter().map(|c| p.layout_no_wrap(text_of(*c, glyphs_only), small_font.clone(), t.osd_text).size().x + pad * 1.5).sum()

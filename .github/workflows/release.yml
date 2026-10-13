@@ -162,11 +162,20 @@ jobs:
           install -m644 "$root/usr/share/tuner/hypr/tuner.lua" "$stage/hypr/"
           install -m644 "$root/usr/share/tuner/omarchy/omarchy-menu.jsonc" "$stage/omarchy/"
           install -m644 "$root/usr/lib/systemd/user/tuner-rearm.service" "$stage/systemd/"
-          install -m644 README.md LICENSE "$stage/"
+          # THIRD_PARTY_NOTICES.md: pyatv's MIT notice for casting's ported AirPlay code. The root
+          # helpers (casting's firewall, the updater) and their polkit policies ship only in the
+          # package: without it the generic polkit action is used (DESIGN §22).
+          install -m644 README.md LICENSE THIRD_PARTY_NOTICES.md "$stage/"
           tar --owner=0 --group=0 --sort=name -czf "dist/$stage.tar.gz" "$stage"
           # Sanity checks: the binary runs and reports Cargo's version; list what ships.
           out="$("$stage/tuner" --version)"
           [[ $out == "tuner $VERSION" ]]
+          # the package carries both root helpers and both polkit actions
+          for f in usr/lib/tuner/tuner-firewall usr/lib/tuner/tuner-update \
+            usr/share/polkit-1/actions/io.github.rthoms334.omatuner.firewall.policy \
+            usr/share/polkit-1/actions/io.github.rthoms334.omatuner.update.policy; do
+            [[ -f $root/$f ]] || { echo "::error::the package lacks /$f"; exit 1; }
+          done
           pacman -Qip "dist/$pkg"
           pacman -Qlp "dist/$pkg"
           tar -tzvf "dist/$stage.tar.gz"

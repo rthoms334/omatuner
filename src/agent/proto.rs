@@ -27,7 +27,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 pub use super::params::*;
-use crate::model::{ItemKey, ItemKind, ItemRef, SourceId, Timestamp};
+use crate::model::{CastPhase, ItemKey, ItemKind, ItemRef, SourceId, Timestamp};
 
 /// Protocol version of this build.
 pub const VERSION: u32 = 2;
@@ -105,6 +105,7 @@ pub enum Call {
     ContinueWatching(ContinueWatching),
     Favourites(Favourites),
     Status(Empty),
+    CastDevices(Empty),
     Play(Play),
     ScheduleSwitch(ScheduleSwitch),
     CancelSwitch(CancelSwitch),
@@ -141,6 +142,7 @@ impl Call {
             Call::ContinueWatching(_) => "continue_watching",
             Call::Favourites(_) => "favourites",
             Call::Status(_) => "status",
+            Call::CastDevices(_) => "cast_devices",
             Call::Play(_) => "play",
             Call::ScheduleSwitch(_) => "schedule_switch",
             Call::CancelSwitch(_) => "cancel_switch",
@@ -444,6 +446,11 @@ pub struct Play {
     /// default: the user's setting (DESIGN §30.13). Older clients don't send it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_in: Option<String>,
+    /// Play it on this TV (DESIGN §40 §12): a `device:<hex>` ref from `cast_devices`, or the
+    /// TV's exact name. The window stays where it is, whatever `open_in` says. A Tuner from
+    /// before casting refuses the field and the bridge never retries without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -481,6 +488,10 @@ pub enum ControlAction {
     /// Move what plays to Tuner's window, fullscreen and raised ("put it on the big screen",
     /// DESIGN §30.13): out of the pop-out without starting it again.
     Window,
+    /// End the cast: the TV stops and nothing plays here (DESIGN §40 §12).
+    StopCasting,
+    /// End the cast and carry on here, at the TV's position (live: at the live point).
+    PlayHere,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -970,6 +981,53 @@ pub struct StatusOut {
     /// The sleep timer, when set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sleep_timer: Option<SleepOut>,
+    /// The picture plays on a TV, or a cast just ended in a failure the user may not have seen
+    /// (DESIGN §40 §12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub casting: Option<CastingOut>,
+}
+
+/// Where a cast is (`status.casting`). No address: the TV is named and referred to by its
+/// `device:` ref.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CastingOut {
+    /// The TV's `cast_devices` ref.
+    #[serde(rename = "ref")]
+    pub device_ref: String,
+    /// The TV's name (sanitised).
+    pub device: String,
+    /// `apple_tv`, `airplay_tv`, `chromecast` or `dlna` (`act::kind_name`).
+    pub kind: String,
+    pub phase: CastPhase,
+    /// Live: roughly how far the TV runs behind the live point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behind_live_s: Option<u16>,
+    /// The typed reason of the failure (`cast-firewall`, `cast-stopped-on-tv`, …), never a
+    /// message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// `cast_devices`: the TVs Tuner knows (DESIGN §40 §12).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CastDevicesOut {
+    pub devices: Vec<CastDeviceOut>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CastDeviceOut {
+    /// `device:<32 hex>`; `play {device}` takes it.
+    #[serde(rename = "ref")]
+    pub device_ref: String,
+    pub name: String,
+    /// `apple_tv`, `airplay_tv`, `chromecast` or `dlna` (`act::kind_name`).
+    pub kind: String,
+    /// Ready to cast: paired, or a TV that needs no pairing. `false`: pair it in Tuner first.
+    pub paired: bool,
+    /// Seen on the network by the latest discovery (else remembered).
+    pub available: bool,
+    /// Tuner casts to it now.
+    pub casting: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1045,6 +1103,12 @@ pub enum PlayOutcome {
     CatchUp,
     /// Tuner is showing the parental PIN prompt; it plays once the user types it there.
     PinRequired,
+    /// `device`: Tuner is connecting to the TV (it can take longer than a request may); `status`
+    /// says how it went.
+    CastingStarted,
+    /// `device`: the TV isn't paired; the user does it in Tuner (Settings ▸ Cast). Nothing was
+    /// sent.
+    PairingRequired,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1062,6 +1126,9 @@ pub struct PlayOut {
     /// Where it plays (DESIGN §30.13; the handler fills it in).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opened_in: Option<OpenedIn>,
+    /// `play {device}`: the TV's name (DESIGN §40 §12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
 }
 
 /// Where an agent's play shows (`PlayOut::opened_in`, `queue play`'s `opened_in`).
@@ -1072,6 +1139,8 @@ pub enum OpenedIn {
     Popout,
     /// Tuner's window.
     Window,
+    /// A TV: Tuner's window stayed where it is (DESIGN §40 §3.8).
+    Device,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1244,10 +1313,14 @@ mod tests {
     fn tool_arguments_are_the_params() {
         let call = Call::from_tool("play", serde_json::json!({"ref": "channel:2:xt:live:1", "from_start": true})).unwrap();
         // an older client: no open_in
-        assert_eq!(call, Call::Play(Play { item: "channel:2:xt:live:1".into(), from_start: Some(true), open_in: None }));
+        assert_eq!(call, Call::Play(Play { item: "channel:2:xt:live:1".into(), from_start: Some(true), open_in: None, device: None }));
         assert!(call.is_action() && call.name() == "play");
         let tv = Call::from_tool("play", serde_json::json!({"ref": "movie:2:xt:vod:1", "open_in": "full_window"})).unwrap();
-        assert_eq!(tv, Call::Play(Play { item: "movie:2:xt:vod:1".into(), from_start: None, open_in: Some("full_window".into()) }));
+        assert_eq!(tv, Call::Play(Play { item: "movie:2:xt:vod:1".into(), from_start: None, open_in: Some("full_window".into()), device: None }));
+        let cast =
+            Call::from_tool("play", serde_json::json!({"ref": "movie:2:xt:vod:1", "device": "device:00112233445566778899aabbccddeeff"})).unwrap();
+        assert_eq!(cast.name(), "play");
+        assert!(matches!(&cast, Call::Play(p) if p.device.as_deref() == Some("device:00112233445566778899aabbccddeeff")));
         assert!(Call::from_tool("browse", serde_json::json!({"kind": "film"})).is_err());
         assert!(Call::from_tool("nope", serde_json::json!({})).is_err());
     }

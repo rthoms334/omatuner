@@ -23,6 +23,7 @@ preview playing](docs/screenshots/live.png)
 - [TV guide and guide coverage](#tv-guide-and-guide-coverage)
 - [Keyboard](#keyboard)
 - [Command line](#command-line)
+- [Casting to a TV](#casting-to-a-tv)
 - [Use Tuner from an AI agent](#use-tuner-from-an-ai-agent)
 - [Files and profiles](#files-and-profiles)
 - [Theming](#theming)
@@ -82,6 +83,10 @@ and [Artemis I Launch (Press Site)](https://images.nasa.gov/details/Artemis%20I%
   provider's guide). You can add several playlists, each with its own colour and glyph badge.
   A new playlist gets a colour no other playlist uses, and Settings ▸ Playlists offers to fix
   two playlists that share a colour.
+- **Casting:** press `C` in the player to send what you are watching to an Apple TV on your
+  network (AirPlay), live TV, catch-up, films and episodes alike. Tuner fetches the stream
+  itself and serves the TV a plain picture, so your playlists' addresses and logins never leave
+  this computer. See [Casting to a TV](#casting-to-a-tv).
 - **Several playlists:** when two or more playlists have movies, series or channels, Movies,
   Series and Live TV get a bar on top: *All playlists* or one playlist, each with its count.
   Pick one with a click, `Alt+P` (a picker; digits jump) or `Ctrl+PgDn` / `Ctrl+PgUp`. Each
@@ -248,8 +253,10 @@ and [Artemis I Launch (Press Site)](https://images.nasa.gov/details/Artemis%20I%
   font packages: `noto-fonts-cjk` for CJK names, `noto-fonts` for Arabic, Hebrew and Indic names.
 - `xdg-desktop-portal` with the GTK backend for the file pickers.
 - To build: Rust ≥ 1.95 (`cargo`) and a C compiler (`base-devel`).
-- Optional, for development only: `ffmpeg`. It generates the test media for the player tests,
-  which are skipped without it.
+- `ffmpeg` (the `ffmpeg` and `ffprobe` commands; `mpv` already depends on it). Casting runs them
+  to repackage a stream for the TV. It also generates the test media for the player tests, which
+  are skipped without it.
+- Optional, for the *Allow on firewall* button: `polkit` (`pkexec`), when `ufw` is your firewall.
 
 ## Build and install
 
@@ -287,10 +294,10 @@ minisign -Vm omatuner-0.2.5-1-x86_64.pkg.tar.zst -P RWToNAEapl/Jf9Fxx7q+fhN1qm51
 ```
 
 `omatuner-<version>-<arch>.tar.gz` holds the same binary, desktop entry, icon, snippets, login
-unit (`systemd/tuner-rearm.service`), README and LICENSE for other setups. The binary links
-against the system libmpv, so install `mpv` first. Copy `tuner` to a directory on your session
-PATH (e.g. `~/.local/bin`), then install the desktop entry, icon and login unit as described
-under [With cargo](#with-cargo).
+unit (`systemd/tuner-rearm.service`), README, LICENSE and THIRD_PARTY_NOTICES.md for other
+setups. The binary links against the system libmpv, so install `mpv` first. Copy `tuner` to a
+directory on your session PATH (e.g. `~/.local/bin`), then install the desktop entry, icon and
+login unit as described under [With cargo](#with-cargo).
 
 ### Build the Arch package from source
 
@@ -348,9 +355,10 @@ Everything is in **Settings ▸ About & logs ▸ Updates**: the version, the las
   it when you choose *Install now*.
 - **Restart:** the running Tuner keeps the old version until it restarts. The status bar says
   *Updated to 0.2.6 — restarts when idle (Restart now)*. Tuner restarts by itself once nothing
-  has been playing (or paused) for a minute, no dialog is open, no import runs and you're in
-  another window; it opens on the screen it was on, stays on its workspace and leaves the
-  keyboard where it was. It never restarts during playback. Click the chip to restart now.
+  has been playing (or paused) or casting to a TV for a minute, no dialog is open, no import
+  runs and you're in another window; it opens on the screen it was on, stays on its workspace
+  and leaves the keyboard where it was. It never restarts during playback, a cast, Test on TV or
+  pairing (an update doesn't even install while you pair a TV). Click the chip to restart now.
 - **AI agents:** the `tuner mcp` servers your agents started keep working through an install and
   the restart. An agent gets the new version's tools in its next session (for Claude Code, start
   a new session); with *Keep Claude Code's plugin up to date* on, the plugin is brought up to
@@ -901,6 +909,7 @@ The full reference is generated from `src/keymap.rs`:
 | `o` | Pop out: small window on every workspace (Hyprland) |
 | `q` | Stop and close |
 | `r` | Retry (after an error) |
+| `C` | Cast to a TV… |
 | `u` | Up next |
 | `n` / `N` | Next / previous in Up next |
 | `Ctrl+M` | Watch alongside… (choose the channel) |
@@ -937,6 +946,7 @@ The full reference is generated from `src/keymap.rs`:
 | `o` | Pop out: small window on every workspace (Hyprland) |
 | `q` | Stop and close |
 | `r` | Retry (after an error) |
+| `C` | Cast to a TV… |
 | `u` | Up next |
 | `n` / `N` | Next / previous in Up next |
 | `Ctrl+M` | Watch alongside… (choose the channel) |
@@ -1166,6 +1176,86 @@ Only one Tuner runs per profile. A second `tuner …` hands its request to the r
 `$XDG_RUNTIME_DIR/tuner/tuner.sock` (`<dir>/run/tuner.sock` with `--profile-dir`) and exits.
 `omarchy-launch-or-focus` and the menu entries rely on this.
 
+## Casting to a TV
+
+Press `C` in the player (or use the Cast control in the on-screen controls, or the player menu's
+*Cast to a TV…*) and pick a TV. What you are watching moves to it: live TV, catch-up, films and
+episodes. The window can stay on another workspace, or be closed to the mini player; nothing
+pops out or comes forward. Tuner is the source of the picture, so it has to keep running.
+
+**What it casts to.** An Apple TV 4K (tvOS 26 and 27) over AirPlay, and third-party TVs with
+AirPlay video (Hisense, Samsung, LG), listed beside it and set up the same way. Macs, Chromecast
+and DLNA TVs are not supported yet.
+
+### Pairing
+
+The first time you pick an Apple TV, Tuner asks for the 4-digit code the TV shows. Enter it
+once; the TV remembers Tuner. If no code appears, use *Show a new code*, and check on the Apple
+TV: Settings ▸ AirPlay and HomeKit ▸ Allow Access ▸ **Anyone on the Same Network**, and give the
+Apple TV a room in the Home app. *Everyone in your Home* blocks Tuner, and a major tvOS update
+can reset the setting (Tuner then says the TV forgot it, and you pair again).
+Tuner offers to set up a TV it finds on its first start (a card with *Set up*, *Not now* and
+*Don't ask again*); Settings ▸ Cast does the same any time: *Pair*, *Pair again*, *Make
+default*, *Forget…*, *Search again*, *Add by address*.
+
+### The firewall button
+
+The TV connects back to Tuner, on TCP port 47800 (Settings ▸ Cast ▸ Port), from your local
+network. Omarchy's `ufw` drops that by default, so the first cast fails after about 10 seconds
+with "your firewall is blocking it". Press **Allow on firewall** (on the casting card, the setup
+card or Settings ▸ Cast ▸ Network): Omarchy's password dialog appears and Tuner adds one `ufw`
+rule for that port, this network interface and your local subnet, tagged `omatuner cast`. The
+only thing that runs as root is the small helper `/usr/lib/tuner/tuner-firewall`, under the
+polkit action `io.github.rthoms334.omatuner.firewall`; it checks every argument and runs one
+fixed `ufw` command. **Remove rule** takes the rule out again, and **Show command** (or *Copy
+the command*) gives the same thing to run yourself, including a `firewall-cmd` line for
+firewalld. The button needs `polkit` and `ufw`; without them only the command is shown. Nothing
+listens on the network when no cast is running. Nothing a TV sees contains your provider's
+address or login: it gets an address on this computer with a random one-time token, and only
+the TV may use it.
+
+*Test on TV* (Settings ▸ Cast, and the last step of the setup) plays a 15-second test card
+through the whole path, without using a provider connection, so it proves pairing, the firewall
+and the picture format in one go.
+
+### While it casts
+
+The player shows a casting card: the channel, what is on, *Playing on Living Room*, and
+*Stop casting* and *Play here* (back to this computer, carrying on from where the TV was). `C`
+then Enter is *Play here*: the picker opens on *This computer*. Pause, resume, seek (films, episodes and catch-up) and zapping work as
+usual and reach the TV; everything you start while casting plays on the TV, including Up next,
+reminders that switch channel and what an agent plays. Volume is the TV remote's job. Closing
+Tuner asks first, because it would stop the picture. Failures are told in one sentence: in the
+card when the player is on screen, as a toast when the window is visible, and as a desktop
+notification with *Show* when Tuner is on another workspace.
+
+### Limits
+
+- **Live TV runs about 15-25 seconds behind** and a channel change takes 6-12 seconds.
+- **Formats the TV can't play are converted** on this computer (CPU only): MPEG-2, VC-1 and
+  interlaced pictures (Apple requires deinterlacing), and audio other than AAC stereo. A slow
+  computer may not keep up with a 1080i channel: *Convert this channel* and Settings ▸ Cast ▸
+  *Convert what the TV can't play* / *Interlaced channels* are the controls. Surround sound
+  (5.1 and 7.1 films and channels) reaches an Apple TV as surround beside a stereo track, which
+  the TV picks for stereo speakers (AC-3, E-AC-3 and AAC 5.1 as they are, anything else as
+  Dolby Digital 5.1); other AirPlay TVs get stereo. Subtitles and teletext are dropped.
+  Encrypted (DRM) streams can't be cast.
+- **On a film, the TV's own scrubber** reaches about a minute past where it plays (Tuner
+  fetches the film as it is watched); Tuner's seek bar reaches the whole film.
+- **One picture:** casting is unavailable in multi-view, and the pop-out is disabled while it
+  casts.
+- **Provider connections:** the cast uses the one connection the local player would, so a
+  one-connection account works; a change of channel or a reload can briefly collide with the
+  provider's limit.
+- **Catch-up and films** can seek only as far as has been prepared (a toast says so); a film
+  uses up to 8 GiB of disk cache while it casts, wiped when it stops.
+- **Keeping awake:** casting holds a sleep inhibitor so the laptop doesn't suspend (Settings ▸
+  Cast ▸ *Keep this computer awake while casting*); closing the lid still suspends.
+- **Developer variables:** `TUNER_CAST_TRACE=1` writes a redacted transcript of the AirPlay
+  session under `~/.local/state/tuner/cast-trace/`.
+
+Agents can cast too: see [Use Tuner from an AI agent](#use-tuner-from-an-ai-agent).
+
 ## Use Tuner from an AI agent
 
 Tuner includes an [MCP](https://modelcontextprotocol.io) server, `tuner mcp`, so any agent that
@@ -1219,7 +1309,7 @@ when you can see it, the pop-out when it's on another workspace) or always the *
 (Tuner adds `--json` to the `claude plugin` commands so it can read their answers.)
 
 - Claude Code gets the omatuner plugin: the tools and the seven skills. The other agents get the
-  MCP server and its 28 tools (the skills are written for Claude Code).
+  MCP server and its 29 tools (the skills are written for Claude Code).
 - **Keeping the plugin up to date:** Claude Code records which plugin version it installed.
   After a Tuner update, with *Keep Claude Code's plugin up to date after Tuner updates* on (the
   default), Tuner runs `claude plugin marketplace update omatuner` and `claude plugin update
@@ -1266,7 +1356,7 @@ in the directory you ran the command in. `claude mcp list` shows whether it is c
 
 #### Other agents
 
-Other agents get the same 28 tools. The skills are part of the Claude Code plugin, but Tuner
+Other agents get the same 29 tools. The skills are part of the Claude Code plugin, but Tuner
 sends its own instructions when an agent connects and each tool's description says how to use
 it, so the requests in [What you can ask](#what-you-can-ask) work in other agents too.
 
@@ -1346,9 +1436,14 @@ Tuner is already running, your terminal keeps the keyboard. The agent says where
   [pop-out](#pop-out-player): the small player pinned on every workspace, so it appears where
   you are.
 
-- Ask for **full screen**, **the big screen** or **the TV** and it plays full screen in Tuner's
+- Ask for **full screen** or **the big screen** and it plays full screen in Tuner's
   window instead, brought to the front. "Put it on the big screen" moves what already plays
   there the same way, without starting it again.
+- Ask for **the TV** ("put it on the TV") and it casts to your TV (see
+  [Casting to a TV](#casting-to-a-tv)), Tuner's window staying where it is. With one paired TV,
+  that is the yes: the agent casts to it without asking. With two or more paired TVs it asks
+  which; naming the TV ("on the Living Room TV") is the yes. A TV that is discovered but not paired
+  doesn't count. With no TV listed, "the TV" plays full screen in Tuner's window.
 - Ask for the **pop-out** ("move it to the pop-out") and it plays there wherever Tuner's window
   is. Once something plays in the pop-out, an agent's next play stays there.
 - A Tuner window hidden behind a fullscreen (or maximized) window, your terminal after Super+F
@@ -1396,14 +1491,14 @@ every agent gets the same limits.
 
 ### Tools
 
-The plugin's skills use these 28 tools; other agents, and Claude Code with *just the tools*,
+The plugin's skills use these 29 tools; other agents, and Claude Code with *just the tools*,
 use them directly. Their full descriptions are in `src/agent/tools.rs` and
 `src/agent/tools_batch.rs`.
 
 | Area | Tools |
 |---|---|
 | Find | `guide_search` (programmes by title, category or time window), `whats_on` (what's on at a time), `search` (channels, movies and series by name), `details` (plot, cast, what's on next, other copies), `categories`, `browse` (filters for picking by mood), `episodes`, `continue_watching`, `favourites`, `history`, `match_titles` (which titles from a web list you have) |
-| Play | `play`, `control` (pause, volume, mute, previous channel, pop-out), `status`, `multiview`, `queue` (Up next), `sleep_timer` |
+| Play | `play`, `control` (pause, volume, mute, previous channel, pop-out, stop casting, play here), `status`, `cast_devices` (the TVs Tuner can cast to; `play` takes a `device`), `multiview`, `queue` (Up next), `sleep_timer` |
 | Plan | `reminders` (notify or switch), `schedule_switch`, `cancel_switch`, `follow` (Following rules and news flashes) |
 | Look after | `spoiler_guard`, `guide_fix`, `favourites_edit`, `lock` (add locks only), `parental_status`, `diagnose` (playback health), `sources` (account status, expiry, connections, guide coverage) |
 
@@ -1649,6 +1744,10 @@ is; otherwise the timers come back the next time Tuner starts.
   the log. Browsing still works.
 - **Quitting:** Ctrl+Q, closing the window, SIGTERM and SIGINT all save your playback position
   and remove the socket.
+- **Casting fails with "your firewall is blocking it":** press *Allow on firewall* (see
+  [Casting to a TV](#casting-to-a-tv)). "No TVs found": the TV must be on and on the same
+  network; *Add by address* takes its IPv4 address. "Needs pairing" again after a tvOS update:
+  recheck Allow Access, then pair again.
 
 ## Privacy
 
@@ -1666,6 +1765,11 @@ is; otherwise the timers come back the next time Tuner starts.
   or to check its status (and, when you connected Claude Code, to keep its plugin up to date).
   It reads only the `tuner` entry of the agent's settings, and the log keeps the commands and
   their redacted results, never the settings themselves.
+- **Casting** opens a listener on your local network only while a cast runs, on the address the
+  TV reaches (never all interfaces), answering only that TV with a one-time token; the TV never
+  sees your provider's address or login. Pairing keys for your TVs are stored in the database
+  (0600) and left out of backups. Casting's only root code is the firewall helper, and only when
+  you press *Allow on firewall*.
 - **Updates:** one request to `api.github.com` at start and every 6 hours (no account, no
   token), and the package download from GitHub when there is a new version. See
   [Updates](#updates).

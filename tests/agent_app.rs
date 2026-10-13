@@ -1601,3 +1601,336 @@ fn the_multiview_tool() {
     assert_eq!(w.err("multiview", json!({ "action": "swap", "what": "sound" })), ErrorCode::Unavailable);
     assert_eq!(w.err("multiview", json!({ "action": "close" })), ErrorCode::Unavailable);
 }
+
+// ------------------------------------------------------------------ casting (DESIGN §40 §12, §14.8)
+
+mod casting {
+    use std::net::Ipv4Addr;
+
+    use tuner::agent::act::AgentShow;
+    use tuner::cast::firewall::{Detection, FirewallState, LanNet};
+    use tuner::cast::testing::FakeCast;
+    use tuner::cast::{CastDiagnose, CastHandle, Device, PairVariant, Pairing, Protocol, Usability};
+    use tuner::model::{CastErrorKind, DeviceId, ReceiverKind};
+    use tuner::playback::TilesState;
+
+    use super::*;
+
+    /// "Living Room" (an Apple TV, paired), "Bedroom" (a third-party AirPlay TV, not paired) and
+    /// "Study" (a Mac). Each has an address the agent must never see.
+    struct Tvs {
+        fake: Arc<FakeCast>,
+        living: Device,
+        bedroom: Device,
+        study: Device,
+    }
+
+    fn device(name: &str, kind: ReceiverKind, pairing: Pairing, host: u8) -> Device {
+        let addr = std::net::SocketAddr::from((Ipv4Addr::new(192, 168, 1, host), 7000));
+        let mut d = Device::new(DeviceId::derive("airplay", name), name, kind, Protocol::AirPlay).at(addr);
+        d.pairing = pairing;
+        d
+    }
+
+    fn cast_world(cfg: Config) -> (World, Tvs) {
+        let w = World::new(cfg);
+        let tvs = Tvs {
+            fake: Arc::new(FakeCast::default()),
+            living: device("Living Room", ReceiverKind::AppleTv, Pairing::Paired(PairVariant::Hkp3), 50),
+            bedroom: device("Bedroom", ReceiverKind::AirPlayTv, Pairing::Required, 51),
+            study: {
+                let mut mac = device("Study", ReceiverKind::AppleTv, Pairing::Paired(PairVariant::Hkp3), 52);
+                mac.usability = Usability::Mac;
+                mac
+            },
+        };
+        let all = vec![tvs.living.clone(), tvs.bedroom.clone(), tvs.study.clone()];
+        tvs.fake.script(|s| {
+            s.devices = all;
+            // detection has answered: no firewall (a cast doesn't wait for one)
+            s.firewall = Some(no_firewall());
+        });
+        w.ui.services().agent.set_cast(Some(CastHandle::new(tvs.fake.clone())));
+        (w, tvs)
+    }
+
+    /// ufw isn't on, as detection says toward the mDNS group.
+    fn no_firewall() -> Detection {
+        Detection {
+            state: FirewallState::NoFirewall,
+            toward: Ipv4Addr::new(224, 0, 0, 251),
+            ufw: false,
+            pkexec: true,
+            net: None,
+            tagged: Vec::new(),
+            port: 47800,
+        }
+    }
+
+    fn device_ref(d: &Device) -> String {
+        format!("device:{}", d.id)
+    }
+
+    /// The reply of a failing call: its code and message.
+    fn refused(w: &mut World, method: &str, params: Value) -> (ErrorCode, String) {
+        let e = w.reply(method, params.clone()).error.unwrap_or_else(|| panic!("{method} {params} should fail"));
+        (e.code, e.message)
+    }
+
+    fn assert_no_address(v: &Value) {
+        assert!(!v.to_string().contains("192.168"), "an address in {v}");
+    }
+
+    /// `cast_devices` reads the registry (it never starts a scan): refs, names, kinds and flags,
+    /// no address; a device's own text is sanitised first.
+    #[test]
+    fn cast_devices_lists_the_registry_without_addresses() {
+        let (mut w, tvs) = cast_world(Config::default());
+        tvs.fake.script(|s| s.devices.push(device("http://evil.example/x", ReceiverKind::AppleTv, Pairing::Required, 53)));
+        let out = w.ok("cast_devices", json!({}));
+        assert_no_address(&out);
+        assert_eq!(out["devices"].as_array().unwrap().len(), 4);
+        assert_eq!(
+            out["devices"][0],
+            json!({ "ref": device_ref(&tvs.living), "name": "Living Room", "kind": "apple_tv", "paired": true, "available": true, "casting": false })
+        );
+        let bedroom = &out["devices"][1];
+        assert_eq!((bedroom["kind"].as_str(), bedroom["paired"].as_bool()), (Some("airplay_tv"), Some(false)));
+        assert_eq!(out["devices"][3]["name"], "TV", "a name with an address in it is replaced");
+        assert!(tvs.fake.take_calls().is_empty(), "reading the list scans nothing");
+        // casting is off (no service): an empty list, not an error
+        assert_eq!(World::new(Config::default()).ok("cast_devices", json!({})), json!({ "devices": [] }));
+    }
+
+    /// `play {device}`: an unpaired TV is `pairing_required` and sends nothing; a paired one is
+    /// `casting_started` with `opened_in: device`, in place whatever `open_in` says, by ref or
+    /// by exact name; a locked item asks for the PIN in the window first and sends the cast
+    /// with it.
+    #[test]
+    fn play_with_a_device_casts_in_place_and_asks_the_pin_on_screen() {
+        let (mut w, tvs) = cast_world(pin_config());
+        w.publish(Visibility::NO_EXPLICIT);
+        let bbc = || json!({ "ref": "channel:1:m3u:bbc1", "device": device_ref(&tvs.living) });
+        let sent = |w: &World| match &w.commands()[..] {
+            [AgentCommand::Play(p)] => p.clone(),
+            other => panic!("{other:?}"),
+        };
+
+        let out = w.ok("play", json!({ "ref": "channel:1:m3u:bbc1", "device": "Bedroom" }));
+        assert_eq!((out["outcome"].as_str(), out["device"].as_str()), (Some("pairing_required"), Some("Bedroom")), "{out}");
+        assert!(out.get("opened_in").is_none() && out["message"].as_str().unwrap().contains("Settings ▸ Cast"), "{out}");
+        assert!(w.commands().is_empty(), "nothing is cast to a TV that isn't paired");
+
+        let out = w.ok("play", bbc());
+        assert_eq!(
+            (out["outcome"].as_str(), out["opened_in"].as_str(), out["device"].as_str()),
+            (Some("casting_started"), Some("device"), Some("Living Room")),
+            "{out}"
+        );
+        assert_eq!(out["message"], "Casting BBC One HD to Living Room.");
+        let p = sent(&w);
+        assert_eq!((p.device, p.show), (Some(tvs.living.id), AgentShow::IN_PLACE), "the window is not placed or raised");
+        assert!(matches!(p.target, PlayTarget::Media(MediaRef::Channel(_))), "the channel plays on the TV");
+
+        // by exact name, asked for the pop-out or the TV screen: still in place
+        for open_in in ["popout", "full_window"] {
+            let out = w.ok("play", json!({ "ref": "channel:1:m3u:bbc1", "device": "living room", "open_in": open_in }));
+            assert_eq!(out["opened_in"], "device", "{open_in}: {out}");
+            let p = sent(&w);
+            assert_eq!((p.device, p.show), (Some(tvs.living.id), AgentShow::IN_PLACE), "{open_in}");
+        }
+        // a window that is popped out is the app's to put back (unraised); the handler places nothing
+        w.ui.services().agent.set_window(tuner::reminders::ui::WindowNow { can_pop: true, popped_out: true, ..Default::default() });
+        w.ok("play", bbc());
+        assert_eq!(sent(&w).show, AgentShow::IN_PLACE);
+
+        // locked: the PIN is typed in Tuner's window, which comes forward; nothing is cast before
+        let out = w.ok("play", json!({ "ref": "channel:1:m3u:locked", "device": device_ref(&tvs.living) }));
+        assert_eq!(
+            (out["outcome"].as_str(), out["opened_in"].as_str(), out["device"].as_str()),
+            (Some("pin_required"), Some("window"), Some("Living Room")),
+            "{out}"
+        );
+        assert!(out["message"].as_str().unwrap().ends_with("It will play on Living Room."), "{out}");
+        let p = sent(&w);
+        assert_eq!((p.device, p.show), (Some(tvs.living.id), AgentShow::window(true)));
+
+        // a play without a device is as before
+        let out = w.ok("play", json!({ "ref": "channel:1:m3u:bbc1" }));
+        assert!(out.get("device").is_none() && out["outcome"] == "playing", "{out}");
+        assert_eq!(sent(&w).device, None);
+        assert_no_address(&out);
+    }
+
+    /// While picture A casts to Living Room, a `play` without `device` lands on that TV
+    /// (RULES.md): the reply says so (`opened_in: device`, the TV's name), and the window is
+    /// neither popped out nor raised (DESIGN §40 §3.8), whatever "Agents play in" says.
+    #[test]
+    fn a_play_without_a_device_while_casting_stays_on_the_tv() {
+        let (mut w, tvs) = cast_world(Config::default());
+        w.publish(Visibility::NO_EXPLICIT);
+        // the session's far ends live as long as the test
+        let ends: Arc<std::sync::Mutex<Vec<Box<dyn std::any::Any + Send>>>> = Arc::default();
+        let keep = ends.clone();
+        tvs.fake.script(move |s| {
+            s.open = Some(Box::new(move |device| {
+                let (cmd, cmds) = tokio::sync::mpsc::unbounded_channel::<tuner::player::remote::RemoteCmd>();
+                let (events_tx, events) = crossbeam_channel::unbounded::<tuner::player::remote::RemoteEvent>();
+                keep.lock().unwrap().push(Box::new((cmds, events_tx)));
+                let view = tuner::model::CastView {
+                    device,
+                    name: "Living Room".into(),
+                    kind: ReceiverKind::AppleTv,
+                    phase: tuner::model::CastPhase::Connecting,
+                    level: None,
+                    as_is: false,
+                    behind_live_s: None,
+                    can_seek: true,
+                    volume: false,
+                };
+                Ok(tuner::player::remote::RemoteOutput { cmd, events, view })
+            }));
+        });
+        let id: i64 = w.ui.services().store.reader().unwrap().query_row("SELECT id FROM channel WHERE key = 'm3u:bbc1'", [], |r| r.get(0)).unwrap();
+        let a = w.ui.services().tiles.handle(tuner::model::TileId::A);
+        let media = MediaRef::Channel(tuner::model::ChannelId(id));
+        let play = tuner::player::PlayRequest { media, zap: None, origin: tuner::model::PlayOrigin::Cli, resume: false, immediate: true };
+        a.send(tuner::player::PlayerCommand::CastTo { device: tvs.living.id, play: Some(play) });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while a.snapshot().cast.is_none() {
+            assert!(Instant::now() < deadline, "picture A never started casting");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let out = w.ok("play", json!({ "ref": "channel:1:m3u:bbc1" }));
+        assert_eq!(
+            (out["outcome"].as_str(), out["opened_in"].as_str(), out["device"].as_str()),
+            (Some("playing"), Some("device"), Some("Living Room")),
+            "{out}"
+        );
+        assert!(out["message"].as_str().unwrap().ends_with("It's on Living Room.") && !mentions(&out, "pop-out"), "{out}");
+        match &w.commands()[..] {
+            [AgentCommand::Play(p)] => assert_eq!((p.device, p.show), (None, AgentShow::IN_PLACE), "the window is not placed or raised"),
+            other => panic!("{other:?}"),
+        }
+        drop(ends);
+    }
+
+    /// What stops a cast is typed, never device text: no such TV, a Mac, two pictures on, the
+    /// firewall known to block the port for this TV. An unknown firewall, or one not looked at
+    /// toward this TV's own address (another TV, the mDNS group, no network), blocks nothing
+    /// here: the real-TV refusal of 2026-10-13 (DESIGN §40 §9.4 "Toward which TV").
+    #[test]
+    fn play_with_a_device_refuses_with_a_typed_reason() {
+        let (mut w, tvs) = cast_world(Config::default());
+        w.publish(Visibility::NO_EXPLICIT);
+        let ask = |d: &str| json!({ "ref": "channel:1:m3u:bbc1", "device": d });
+        let (code, message) = refused(&mut w, "play", ask("device:00112233445566778899aabbccddeeff"));
+        assert_eq!(code, ErrorCode::NotFound, "{message}");
+        assert_eq!(refused(&mut w, "play", ask("Kitchen")).0, ErrorCode::NotFound);
+        assert_eq!(refused(&mut w, "play", ask("device:xyz")).0, ErrorCode::BadRequest);
+        let (code, message) = refused(&mut w, "play", ask("Study"));
+        assert_eq!(code, ErrorCode::Unavailable);
+        assert!(message.starts_with("cast-unsupported: "), "{message}");
+        // the item is still checked
+        assert_eq!(refused(&mut w, "play", json!({ "ref": "channel:1:m3u:gone", "device": "Living Room" })).0, ErrorCode::NotFound);
+
+        let lan = LanNet { iface: "wlan0".into(), addr: Ipv4Addr::new(192, 168, 1, 20), prefix: 24 };
+        let blocked = |toward: Ipv4Addr, net: Option<LanNet>| Detection {
+            state: FirewallState::Blocked { shadowed: false },
+            toward,
+            ufw: true,
+            pkexec: true,
+            net,
+            tagged: Vec::new(),
+            port: 47800,
+        };
+        let living = Ipv4Addr::new(192, 168, 1, 50);
+        tvs.fake.script(|s| s.firewall = Some(blocked(living, Some(lan.clone()))));
+        let (code, message) = refused(&mut w, "play", ask("Living Room"));
+        assert_eq!(code, ErrorCode::Unavailable);
+        assert!(message.starts_with("cast-firewall: ") && message.contains("Allow on firewall"), "{message}");
+        assert_no_address(&json!(message));
+        for (toward, net, why) in [
+            (Ipv4Addr::new(224, 0, 0, 251), Some(lan.clone()), "made toward the mDNS group, before any TV was known"),
+            (Ipv4Addr::new(192, 168, 1, 51), Some(lan.clone()), "made toward another TV"),
+            (living, None, "no network was looked at"),
+        ] {
+            tvs.fake.script(|s| s.firewall = Some(blocked(toward, net)));
+            assert_eq!(w.ok("play", ask("Living Room"))["outcome"], "casting_started", "{why}: the session's own check decides");
+        }
+        tvs.fake.script(|s| s.firewall = Some(no_firewall()));
+
+        w.ui.services().agent.publish_tiles(TilesState { on: true, ..Default::default() });
+        let (code, message) = refused(&mut w, "play", ask("Living Room"));
+        assert_eq!(code, ErrorCode::Unavailable);
+        assert!(message.starts_with("multiview-on: "), "{message}");
+        assert_eq!(w.commands().len(), 3, "only the three that went through reached the app");
+    }
+
+    /// `status.casting` after a cast ended without the user asking: the TV and the typed reason,
+    /// so an agent can say what happened while Tuner is out of sight; nothing is claimed when no
+    /// cast failed. `control stop_casting` needs a cast; `play_here` after the TV stopped it doesn't.
+    #[test]
+    fn status_and_control_speak_of_a_cast_that_ended() {
+        let (mut w, tvs) = cast_world(Config::default());
+        w.publish(Visibility::NO_EXPLICIT);
+        assert!(w.ok("status", json!({})).get("casting").is_none());
+        tvs.fake.script(|s| {
+            s.last_error = Some(CastErrorKind::StoppedOnTv);
+            s.diagnose = Some(CastDiagnose { device: Some(tvs.living.id), timing: "ptp-declared", ..CastDiagnose::default() });
+        });
+        let st = w.ok("status", json!({}));
+        assert_no_address(&st);
+        assert_eq!(
+            st["casting"],
+            json!({ "ref": device_ref(&tvs.living), "device": "Living Room", "kind": "apple_tv", "phase": "lost", "error": "cast-stopped-on-tv" })
+        );
+        assert_eq!(st["state"], "idle");
+
+        let (code, message) = refused(&mut w, "control", json!({ "action": "stop_casting" }));
+        assert_eq!(code, ErrorCode::Unavailable, "{message}");
+        // the alert's Play here (the fix skill offers it): the last item here, nothing to replay
+        // in this world
+        assert_eq!(w.ok("control", json!({ "action": "play_here" }))["state"], "idle");
+        assert_eq!(w.err("control", json!({ "action": "stop_casting", "value": 1 })), ErrorCode::BadRequest);
+    }
+
+    /// `diagnose` has the cast section once casting has something to say, with the receiver, the
+    /// pairing variant, the timing, the firewall and the last error as words, and no address.
+    #[test]
+    fn diagnose_has_a_cast_section_and_no_address() {
+        let (mut w, tvs) = cast_world(Config::default());
+        w.publish(Visibility::NO_EXPLICIT);
+        tvs.fake.script(|s| {
+            s.diagnose = Some(CastDiagnose {
+                device: Some(tvs.living.id),
+                model: Some("AppleTV14,1".into()),
+                os_version: Some("26.6 (23L773)".into()),
+                source_version: Some("940.38.1".into()),
+                pairing: Some(PairVariant::Hkp3),
+                timing: "ptp-declared",
+                firewall: Some(FirewallState::Blocked { shadowed: false }),
+                last_error: Some(CastErrorKind::Firewall),
+            });
+        });
+        let out = w.ok("diagnose", json!({}));
+        assert_no_address(&out);
+        assert_eq!(
+            out["cast"],
+            json!({
+                "model": "AppleTV14,1",
+                "os_version": "26.6 (23L773)",
+                "source_version": "940.38.1",
+                "pairing": "hkp3",
+                "timing": "ptp-declared",
+                "firewall": "blocked",
+                "last_error": "cast-firewall",
+            })
+        );
+        // casting is off, or nothing is known: no section
+        let mut off = World::new(Config::default());
+        off.publish(Visibility::NO_EXPLICIT);
+        assert!(off.ok("diagnose", json!({})).get("cast").is_none());
+    }
+}

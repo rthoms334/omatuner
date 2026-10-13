@@ -95,7 +95,7 @@ pub fn on_event(ev: &FollowEvent) -> Option<Toast> {
         FollowEvent::Summary { title, lines } => {
             invalidate();
             let text = if lines.is_empty() { title.clone() } else { format!("{title} — {}", lines.join("; ")) };
-            Some(Toast { kind: ToastKind::Info, text, action: Some(("Open".into(), Action::OpenFollowing)), ttl_ms: 8000 })
+            Some(Toast { kind: ToastKind::Info, text, action: Some(("Open".into(), Action::OpenFollowing)), also: None, ttl_ms: 8000 })
         }
         FollowEvent::PreviewReady { .. } | FollowEvent::Open => None,
     }

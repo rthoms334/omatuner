@@ -355,6 +355,16 @@ pub enum Action {
     /// reminder…" on a programme — the reminder sheet (notify or switch, lead, start offset,
     /// where it opens; `reminders::ui`).
     ReminderOptions,
+    // ---- casting (DESIGN §40; the key tables and `feature_on` are CAST-8's)
+    /// `C` in the player: "Cast to a TV…" (the picker; while casting it opens with "This
+    /// computer" focused, so stopping is `C` then Enter).
+    CastMenu,
+    /// "Stop casting": the player menu, the casting card, the status chip and the picker. No
+    /// default key.
+    StopCasting,
+    /// "Play here" on the alert after the TV stopped the cast (§3.4 "Play here · Cast again"):
+    /// the last item plays here, from where the TV was. No default key.
+    PlayHere,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -703,6 +713,9 @@ pub static PLAYER_COMMON: &[Binding] = &[
     b(C::ch('o'), A::TogglePopOut, "Pop out: small window on every workspace (Hyprland)"),
     b(C::ch('q'), A::StopAndClose, "Stop and close"),
     b(C::ch('r'), A::Retry, "Retry (after an error)"),
+    // casting (DESIGN §40 §3.7): while casting it opens the picker on "This computer", so
+    // stopping is `C` then Enter; no global chord (Ctrl+Shift+C is the terminal's copy)
+    b(C::ch('C'), A::CastMenu, "Cast to a TV…"),
     b(C::ch('u'), A::QueuePanel, "Up next"),
     b(C::ch('n'), A::QueueNext, "Next / previous in Up next"),
     b(C::ch('N'), A::QueuePrev, "Next / previous in Up next"),
@@ -1066,6 +1079,7 @@ pub fn feature_on(a: Action) -> bool {
         | A::ClosePicture
         | A::WatchAlongside => crate::ui::multiview::ENABLED,
         A::SleepTimer | A::EndNewsFlash | A::ReminderOptions => crate::reminders::ENABLED,
+        A::CastMenu | A::StopCasting | A::PlayHere => crate::cast::ENABLED,
         _ => true,
     }
 }

@@ -5,8 +5,9 @@
 //! restart ("Updated to 0.2.6 — restarts when idle (Restart now)").
 //!
 //! The moment for the password dialog: Tuner's window has the keyboard (so the dialog makes
-//! sense to whoever is at it), nothing plays in either picture, nothing is open, no text field
-//! is being typed in, not popped out. The restart itself is decided off the UI thread
+//! sense to whoever is at it), nothing plays in either picture, nothing casts (a session, Test
+//! on TV, a pairing, the firewall's dialog: `Updater::prompt_due`), nothing is open, no text
+//! field is being typed in, not popped out. The restart itself is decided off the UI thread
 //! (`update::service`), from what this publishes.
 
 use eframe::egui;

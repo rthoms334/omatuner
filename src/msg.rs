@@ -58,15 +58,17 @@ pub struct Toast {
     pub text: String,
     /// Optional action label + action fired when the user presses it (e.g. "Undo").
     pub action: Option<(String, crate::keymap::Action)>,
+    /// A second action, beside the first (a cast the TV stopped: "Play here · Cast again").
+    pub also: Option<(String, crate::keymap::Action)>,
     pub ttl_ms: u32,
 }
 
 impl Toast {
     pub fn info(text: impl Into<String>) -> Self {
-        Self { kind: ToastKind::Info, text: text.into(), action: None, ttl_ms: 3000 }
+        Self { kind: ToastKind::Info, text: text.into(), action: None, also: None, ttl_ms: 3000 }
     }
     pub fn error(text: impl Into<String>) -> Self {
-        Self { kind: ToastKind::Error, text: text.into(), action: None, ttl_ms: 6000 }
+        Self { kind: ToastKind::Error, text: text.into(), action: None, also: None, ttl_ms: 6000 }
     }
     /// An M3U playlist now signs in with its Xtream login (DESIGN §27.3); `name` when it could
     /// be any of several playlists.

@@ -131,6 +131,7 @@ impl Harness {
             bus,
             store: Box::new(RecordingStore(rec.clone())),
             resolver: Box::new(TableResolver(table.into_iter().map(|p| (p.media.clone(), p)).collect())),
+            cast: None,
         };
         let player = Player::start(&cfg, deps).expect("headless mpv");
         let handle = player.handle();
@@ -988,4 +989,374 @@ fn test_server_keep_alive_text_bodies_and_lingering_sessions() {
     assert_eq!(http_get(&srv.base, "/long/index.m3u8", "").0, 403, "another stream while /live lingers");
     std::thread::sleep(Duration::from_millis(900));
     assert_eq!(http_get(&srv.base, "/long/index.m3u8", "").0, 200, "after the linger");
+}
+
+// ---------------------------------------------------------------------------------------------
+// casting (cast-design §14.5): picture A's remote output against a scripted session
+
+mod casting {
+    use super::*;
+    use tokio::sync::mpsc::error::TryRecvError;
+    use tuner::model::{CastErrorKind, CastHints, CastPhase, CastView, DeviceId, ReceiverKind, TileId};
+    use tuner::player::remote::{CastConnector, RemoteCmd, RemoteEvent, RemoteOutput};
+
+    /// A session's far ends: what the controller sends, and the events the test answers with
+    /// (the test plays the cast service, its relay and the TV).
+    struct FakeTv {
+        cmds: tokio::sync::mpsc::UnboundedReceiver<RemoteCmd>,
+        events: crossbeam_channel::Sender<RemoteEvent>,
+    }
+
+    impl FakeTv {
+        fn next(&mut self) -> RemoteCmd {
+            let deadline = Instant::now() + LONG;
+            loop {
+                match self.cmds.try_recv() {
+                    Ok(c) => return c,
+                    Err(TryRecvError::Empty) => assert!(Instant::now() < deadline, "no command for the TV within {LONG:?}"),
+                    Err(TryRecvError::Disconnected) => panic!("the controller dropped the session"),
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        fn load(&mut self) -> (u64, Arc<Playable>, CastHints) {
+            match self.next() {
+                RemoteCmd::Load { generation, playable, hints } => (generation, playable, hints),
+                other => panic!("expected a load, got {other:?}"),
+            }
+        }
+
+        fn send(&self, ev: RemoteEvent) {
+            self.events.send(ev).expect("the controller listens");
+        }
+
+        /// The relay's upstream opens and the TV shows its first picture.
+        fn start(&self, generation: u64) {
+            self.send(RemoteEvent::UpstreamOpened { generation });
+            self.send(RemoteEvent::Phase(CastPhase::Playing));
+            self.send(RemoteEvent::Playing { generation });
+        }
+    }
+
+    /// Every `open` hands the new session's far ends to the test.
+    struct FakeConnector(crossbeam_channel::Sender<FakeTv>);
+
+    impl CastConnector for FakeConnector {
+        fn open(&self, device: DeviceId) -> Result<RemoteOutput, PlayerError> {
+            let (cmd, cmds) = tokio::sync::mpsc::unbounded_channel();
+            let (events, rx) = crossbeam_channel::unbounded();
+            self.0.send(FakeTv { cmds, events }).expect("the test listens");
+            let view = CastView {
+                device,
+                name: "Living Room".into(),
+                kind: ReceiverKind::AppleTv,
+                phase: CastPhase::Connecting,
+                level: None,
+                as_is: false,
+                behind_live_s: None,
+                can_seek: true,
+                volume: false,
+            };
+            Ok(RemoteOutput { cmd, events: rx, view })
+        }
+    }
+
+    fn device() -> DeviceId {
+        DeviceId::derive("airplay", "living-room")
+    }
+
+    fn start_casting(table: Vec<Playable>) -> (Harness, Receiver<FakeTv>) {
+        // the test answers `Close` itself (polling): leaving the TV waits for its upstream close
+        tuner::player::controller::set_cast_close_wait_for_tests(LONG);
+        let (bus, events) = EventBus::new(None);
+        let rec = Recorded::default();
+        let (opened, sessions) = crossbeam_channel::unbounded();
+        let deps = PlayerDeps {
+            bus,
+            store: Box::new(RecordingStore(rec.clone())),
+            resolver: Box::new(TableResolver(table.into_iter().map(|p| (p.media.clone(), p)).collect())),
+            cast: Some(Arc::new(FakeConnector(opened))),
+        };
+        let player = Player::start(&headless_config(), deps).expect("headless mpv");
+        let handle = player.handle();
+        (Harness { player, handle, events, seen: Vec::new(), rec }, sessions)
+    }
+
+    fn cast(h: &Harness, media: Option<MediaRef>) {
+        let play = media.map(|media| PlayRequest { media, zap: None, origin: PlayOrigin::Fullscreen, resume: false, immediate: true });
+        h.handle.send(PlayerCommand::CastTo { device: device(), play });
+    }
+
+    /// Streams picture A holds open on source 1 (0, 1, or 2 for "more"): probes the shared
+    /// budget at limits 1 and 2 and gives the probe's lease back. Only while nothing loads.
+    fn a_leases(p: &Player) -> u32 {
+        let b = p.budget();
+        let full = |limit| {
+            b.set_limit(SourceId(1), Some(limit));
+            match b.acquire(TileId::A, SourceId(1)) {
+                Ok(l) => {
+                    b.release(TileId::A, l, None);
+                    false
+                }
+                Err(_) => true,
+            }
+        };
+        let n = if !full(1) {
+            0
+        } else if !full(2) {
+            1
+        } else {
+            2
+        };
+        b.set_limit(SourceId(1), Some(1));
+        n
+    }
+
+    fn casting_and_playing(s: &PlayerSnapshot) -> bool {
+        s.state == PlayerState::Playing && s.cast.as_ref().is_some_and(|c| c.phase == CastPhase::Playing)
+    }
+
+    /// `CastTo` with what plays: mpv's hints travel with the first load, mpv's stream closes
+    /// before the TV's load goes out (one-connection account), the relay's upstream is A's
+    /// only lease, and a zap is a new load with a new generation.
+    #[test]
+    fn casting_moves_the_channel_after_the_local_stream_closed_and_zaps_reload() {
+        let Some((media, _serial)) = setup() else { return };
+        let srv = TestServer::start(media, Faults::default());
+        srv.set_throttle(Some(48 * 1024));
+        let ch = live(70, srv.url("bars.ts"));
+        let other = live(71, srv.url("hls/seg001.ts"));
+        let (mut h, sessions) = start_casting(vec![ch.clone(), other.clone()]);
+        h.handle.send(PlayerCommand::SetConnectionLimit { source: SourceId(1), max: Some(1) });
+        h.play(ch.media.clone(), true);
+        h.wait_state(LONG, is_playing);
+        controller_log();
+
+        cast(&h, None);
+        let mut tv = sessions.recv_timeout(LONG).expect("a session");
+        let (generation, playable, hints) = tv.load();
+        assert_eq!((&playable.media, playable.start_at), (&ch.media, None), "live comes in at the live point");
+        let read = (hints.vcodec.as_deref(), hints.acodec.as_deref(), hints.channels, hints.height, hints.interlaced);
+        assert_eq!(read, (Some("h264"), Some("aac"), Some(1), Some(720), Some(false)), "mpv's view of bars.ts");
+        let log = controller_log();
+        let (waited, entry) = log
+            .iter()
+            .enumerate()
+            .find_map(|(i, l)| Some((i, l.strip_prefix("cast: waiting for the local entry ")?.split('\'').next()?.parse::<i64>().ok()?)))
+            .unwrap_or_else(|| panic!("the TV's load didn't wait for mpv: {log:#?}"));
+        let ended = end_file_at(&log, entry).unwrap_or_else(|| panic!("END_FILE of {entry} never processed: {log:#?}"));
+        let loaded = log.iter().position(|l| *l == format!("cast load: generation {generation}")).expect("the load");
+        assert!(waited < ended && ended < loaded, "wait {waited}, END_FILE {ended}, load {loaded}: {log:#?}");
+
+        tv.start(generation);
+        let s = h.wait_snapshot(LONG, casting_and_playing);
+        assert_eq!(s.cast.as_ref().map(|c| c.device), Some(device()));
+        assert!(s.video_size.is_none() && s.hwdec.is_none() && s.tracks == Default::default(), "mpv-only fields stay empty");
+        assert_eq!(a_leases(&h.player), 1, "the relay's upstream is A's only lease");
+
+        let mark = h.mark();
+        h.play(other.media.clone(), true);
+        let (zapped, p, hints) = tv.load();
+        assert!(zapped > generation);
+        assert_eq!(p.media, other.media);
+        assert_eq!(hints, CastHints::default(), "mpv's hints were for the item that moved");
+        // the old generation's late close doesn't touch the new lease
+        tv.send(RemoteEvent::UpstreamClosed { generation, at: Instant::now() });
+        tv.start(zapped);
+        h.wait_state_from(mark, LONG, is_playing);
+        assert_eq!(a_leases(&h.player), 1);
+    }
+
+    /// A TV that was buffering when the channel changed doesn't carry its cache pause into the
+    /// next one: the new item's first picture is Playing (the session reports no
+    /// `Buffering(false)` for it), not a Buffering that the stall clock would reload every 20 s.
+    #[test]
+    fn a_zap_while_the_tv_buffers_plays_the_next_channel() {
+        let Some((_media, _serial)) = setup() else { return };
+        let ch = live(72, "http://127.0.0.1:9/never-fetched.ts".into());
+        let other = live(73, "http://127.0.0.1:9/never-fetched-either.ts".into());
+        let (mut h, sessions) = start_casting(vec![ch.clone(), other.clone()]);
+        cast(&h, Some(ch.media.clone()));
+        let mut tv = sessions.recv_timeout(LONG).expect("a session");
+        let (generation, ..) = tv.load();
+        tv.start(generation);
+        h.wait_snapshot(LONG, casting_and_playing);
+        tv.send(RemoteEvent::Buffering(true));
+        h.wait_state(LONG, |s| matches!(s, PlayerState::Buffering { .. }));
+
+        let mark = h.mark();
+        h.play(other.media.clone(), true);
+        let (zapped, ..) = tv.load();
+        tv.start(zapped);
+        h.wait_state_from(mark, LONG, |s| *s == PlayerState::Playing);
+    }
+
+    /// Three quick skips while casting add up: each counts from the last one's target, not from
+    /// the TV's last position report (every 10 s).
+    #[test]
+    fn quick_skips_on_the_tv_add_up() {
+        let Some((_media, _serial)) = setup() else { return };
+        let m = movie(81, "http://127.0.0.1:9/never-fetched.mp4".into());
+        let (h, sessions) = start_casting(vec![m.clone()]);
+        cast(&h, Some(m.media.clone()));
+        let mut tv = sessions.recv_timeout(LONG).expect("a session");
+        let (generation, ..) = tv.load();
+        tv.start(generation);
+        tv.send(RemoteEvent::Paused(true));
+        tv.send(RemoteEvent::Position { generation, pos: 100.0, dur: Some(3600.0) });
+        h.wait_snapshot(LONG, |s| s.paused && s.position == Some(100.0) && s.seekable);
+        for want in [110.0, 120.0, 130.0] {
+            h.handle.send(PlayerCommand::SeekBy(10.0));
+            assert_eq!(tv.next(), RemoteCmd::SeekTo(want));
+        }
+        h.handle.send(PlayerCommand::SeekBy(600.0));
+        h.handle.send(PlayerCommand::SeekBy(-10.0));
+        assert_eq!((tv.next(), tv.next()), (RemoteCmd::SeekTo(730.0), RemoteCmd::SeekTo(720.0)), "a small skip keeps the big one");
+    }
+
+    /// The provider breaks a film's stream while the TV still plays what it buffered: the
+    /// reconnect resumes where the TV is by then (its last report run on while it played, 2 s back
+    /// as ever), not at that report, which can be 10 s old, nor at the cast's first start
+    /// (2026-10-13: "it reset back to the start").
+    #[test]
+    fn a_reconnect_resumes_where_the_tv_is_now() {
+        let Some((_media, _serial)) = setup() else { return };
+        let m = movie(82, "http://127.0.0.1:9/never-fetched.mp4".into());
+        let (h, sessions) = start_casting(vec![m.clone()]);
+        cast(&h, Some(m.media.clone()));
+        let mut tv = sessions.recv_timeout(LONG).expect("a session");
+        let (generation, ..) = tv.load();
+        tv.start(generation);
+        tv.send(RemoteEvent::Position { generation, pos: 100.0, dur: Some(3600.0) });
+        h.wait_snapshot(LONG, |s| casting_and_playing(s) && s.position == Some(100.0));
+        let reported = Instant::now();
+        tv.send(RemoteEvent::UpstreamClosed { generation, at: Instant::now() });
+        let (again, p, _) = tv.load();
+        let ran = reported.elapsed().as_secs_f64();
+        assert!(again > generation && p.media == m.media);
+        let at = p.start_at.expect("a resume point");
+        assert!(at > 98.0 && at <= 98.0 + ran, "resumed at {at}: the report (100 s) run on for up to {ran:.3} s, 2 s back");
+    }
+
+    /// A film on the TV: transport goes to the session, positions are the progress, and the
+    /// TV's `itemPlayedToEnd` is the film's `Ended` (Up next's cue).
+    #[test]
+    fn a_film_on_the_tv_saves_its_progress_and_ends() {
+        let Some((_media, _serial)) = setup() else { return };
+        let m = movie(80, "http://127.0.0.1:9/never-fetched.mp4".into());
+        let (mut h, sessions) = start_casting(vec![m.clone()]);
+        cast(&h, Some(m.media.clone()));
+        let mut tv = sessions.recv_timeout(LONG).expect("a session");
+        let (generation, ..) = tv.load();
+        tv.start(generation);
+        tv.send(RemoteEvent::Position { generation, pos: 30.0, dur: Some(60.0) });
+        h.wait_snapshot(LONG, |s| casting_and_playing(s) && s.position == Some(30.0) && s.duration == Some(60.0) && s.seekable);
+        h.handle.send(PlayerCommand::SetAudioTrack(Some(2)));
+        h.handle.send(PlayerCommand::SeekTo(10.0));
+        assert_eq!(tv.next(), RemoteCmd::SeekTo(10.0), "a track choice is a no-op on the TV");
+        h.handle.send(PlayerCommand::TogglePause);
+        assert_eq!(tv.next(), RemoteCmd::SetPaused(true));
+        tv.send(RemoteEvent::Paused(true));
+        h.wait_snapshot(LONG, |s| s.state == PlayerState::Paused && s.paused);
+        tv.send(RemoteEvent::Playing { generation });
+        h.wait_snapshot(LONG, |s| s.state == PlayerState::Playing && !s.paused);
+
+        tv.send(RemoteEvent::Position { generation, pos: 59.5, dur: Some(60.0) });
+        tv.send(RemoteEvent::Ended { generation });
+        let ended = h.wait_event(LONG, |e| matches!(e, PlayerEvent::Ended { .. })).expect("Ended");
+        assert_eq!(ended, PlayerEvent::Ended { item: m.item.clone(), finished: true });
+        h.wait_state(LONG, |s| matches!(s, PlayerState::Ended));
+        let last = h.rec.progress.lock().unwrap().last().cloned().expect("the final save");
+        assert_eq!((last.position_s, last.duration_s, last.finished), (59.5, Some(60.0), true));
+        assert_eq!(h.rec.history.lock().unwrap().len(), 1);
+        assert!(h.snapshot().cast.is_some(), "the TV stays for Up next");
+    }
+
+    /// The sleep timer's (and Ctrl+Shift+S's) Stop ends casting: the session closes, the lease
+    /// goes with the relay's upstream, the player is Idle here.
+    #[test]
+    fn a_stop_turns_the_tv_off_and_leaves_the_player_idle() {
+        let Some((_media, _serial)) = setup() else { return };
+        let ch = live(85, "http://127.0.0.1:9/never-fetched.ts".into());
+        let (mut h, sessions) = start_casting(vec![ch.clone()]);
+        h.handle.send(PlayerCommand::SetConnectionLimit { source: SourceId(1), max: Some(1) });
+        cast(&h, Some(ch.media.clone()));
+        let mut tv = sessions.recv_timeout(LONG).expect("a session");
+        let (generation, ..) = tv.load();
+        tv.start(generation);
+        h.wait_snapshot(LONG, casting_and_playing);
+        let mark = h.mark();
+        h.handle.send(PlayerCommand::Stop);
+        assert_eq!(tv.next(), RemoteCmd::Close { fast: false });
+        tv.send(RemoteEvent::UpstreamClosed { generation, at: Instant::now() });
+        h.wait_state_from(mark, LONG, |s| *s == PlayerState::Idle);
+        assert!(h.wait_snapshot(LONG, |s| s.cast.is_none()).last_error.is_none());
+        assert_eq!(a_leases(&h.player), 0);
+    }
+
+    /// A lost session is an error with the casting card's Play here (the picture stays on
+    /// the TV until the user picks); Cast again opens a new session; the TV's own stop ends
+    /// casting quietly (Idle, `CastEnded` for the alert).
+    #[test]
+    fn a_lost_tv_errors_with_play_here_and_a_stop_on_the_tv_goes_idle() {
+        let Some((media, _serial)) = setup() else { return };
+        let srv = TestServer::start(media, Faults::default());
+        let ch = live(90, srv.url("long/index.m3u8"));
+        let (mut h, sessions) = start_casting(vec![ch.clone()]);
+        cast(&h, Some(ch.media.clone()));
+        let mut tv = sessions.recv_timeout(LONG).expect("a session");
+        let (generation, ..) = tv.load();
+        tv.start(generation);
+        h.wait_snapshot(LONG, casting_and_playing);
+        tv.send(RemoteEvent::Lost(CastErrorKind::ReceiverFailed));
+        let s = h.wait_state(LONG, |s| matches!(s, PlayerState::Error(_)));
+        assert!(matches!(s, PlayerState::Error(PlayerError { kind: PlayerErrorKind::Cast(CastErrorKind::ReceiverFailed), .. })), "{s:?}");
+        let snap = h.wait_snapshot(LONG, |s| matches!(s.state, PlayerState::Error(_)));
+        assert_eq!(snap.cast.as_ref().map(|c| c.phase), Some(CastPhase::Lost), "still casting: Play here is on the card");
+        assert!(h.rec.failures.lock().unwrap().iter().all(|(_, k)| k.is_none()), "the TV's failure isn't the channel's");
+
+        h.handle.send(PlayerCommand::StopCasting { play_here: true });
+        h.wait_snapshot(LONG, |s| s.cast.is_none() && s.state == PlayerState::Playing && s.position.is_some());
+
+        cast(&h, None);
+        let mut tv = sessions.recv_timeout(LONG).expect("cast again: a new session");
+        let (generation, playable, _) = tv.load();
+        assert_eq!(playable.media, ch.media);
+        tv.start(generation);
+        h.wait_snapshot(LONG, casting_and_playing);
+        let mark = h.mark();
+        tv.send(RemoteEvent::Lost(CastErrorKind::StoppedOnTv));
+        h.wait_state_from(mark, LONG, |s| *s == PlayerState::Idle);
+        let ended = h.wait_event_from(mark, LONG, |e| matches!(e, PlayerEvent::CastEnded { .. })).expect("CastEnded");
+        assert_eq!(ended, PlayerEvent::CastEnded { device: device(), name: "Living Room".into(), kind: CastErrorKind::StoppedOnTv });
+        assert!(!states_from(&mut h, mark).iter().any(|s| matches!(s, PlayerState::Error(_))), "no error state");
+        assert!(h.wait_snapshot(LONG, |s| s.cast.is_none()).last_error.is_none());
+    }
+
+    /// Play here: the session closes (its last position report still counts), and the film
+    /// carries on here from where the TV was.
+    #[test]
+    fn play_here_carries_on_from_the_tvs_position() {
+        let Some((media, _serial)) = setup() else { return };
+        let srv = TestServer::start(media, Faults::default());
+        let m = movie(95, srv.url("long/index.m3u8"));
+        let (h, sessions) = start_casting(vec![m.clone()]);
+        cast(&h, Some(m.media.clone()));
+        let mut tv = sessions.recv_timeout(LONG).expect("a session");
+        let (generation, ..) = tv.load();
+        tv.start(generation);
+        tv.send(RemoteEvent::Position { generation, pos: 30.0, dur: Some(60.0) });
+        h.wait_snapshot(LONG, |s| casting_and_playing(s) && s.position == Some(30.0));
+        assert!(srv.requests().is_empty(), "the TV's relay fetches, not mpv");
+
+        h.handle.send(PlayerCommand::StopCasting { play_here: true });
+        assert_eq!(tv.next(), RemoteCmd::Close { fast: false });
+        tv.send(RemoteEvent::Position { generation, pos: 31.0, dur: Some(60.0) });
+        tv.send(RemoteEvent::UpstreamClosed { generation, at: Instant::now() });
+        let s = h.wait_snapshot(LONG, |s| s.cast.is_none() && s.state == PlayerState::Playing && s.position.is_some());
+        assert!(s.position.unwrap() >= 30.0, "resumed at {:?}", s.position);
+        let saved = h.rec.progress.lock().unwrap().clone();
+        assert!(saved.iter().any(|p| p.position_s == 31.0 && !p.finished), "the TV's last position was saved: {saved:?}");
+    }
 }

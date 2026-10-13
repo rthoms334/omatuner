@@ -103,5 +103,10 @@ pub const GUIDE_FIX: &str = GUIDE;
 pub const AGENT: &str = "\u{f06a9}";
 /// Copy to the clipboard (nf-md-content_copy).
 pub const COPY: &str = "\u{f018f}";
+/// Cast to a TV (nf-md-cast): the OSD control, the player menu, Settings ▸ Cast (DESIGN §40).
+/// Added by the skeleton (CAST-0) so CAST-8 and CAST-9 share it; verified with `fc-query`.
+pub const CAST: &str = "\u{f0118}";
+/// Casting now (nf-md-cast_connected): the casting card, the OSD control, the mini player.
+pub const CAST_CONNECTED: &str = "\u{f0119}";
 
 pub const SOURCE_ICONS: &[&str] = &[PLAYLIST, LIVE_TV, SOURCE_XTREAM, SOURCE_URL, MOVIES, SERIES, RADIO, MUSIC, FAVOURITE, HEART, FOLDER, TAG];

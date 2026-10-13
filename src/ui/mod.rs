@@ -90,6 +90,8 @@ pub enum SettingsPage {
     SpoilerGuard,
     /// Connect AI agents to Tuner (DESIGN §39).
     Agents,
+    /// Casting to TVs (DESIGN §40; listed once `cast::ENABLED`).
+    Cast,
 }
 
 /// Where the onboarding card starts (the same card is reused by Settings ▸ Playlists ▸ Add,
@@ -237,6 +239,22 @@ pub enum OverlayRequest {
     /// The first-run card: connect the AI agents found on this computer (DESIGN §39). Opened
     /// by the app, once per Tuner version.
     AgentConnect(crate::agent::connect::Offer),
+    /// "Cast to…" (`C`, the OSD Cast control, the player menu; DESIGN §40 §3.1): the right-edge
+    /// device picker over the player (CAST-8).
+    CastPicker,
+    /// PIN pairing with a TV on Tuner's own screen (DESIGN §40 §3.2; CAST-8). Opened from the
+    /// picker and the casting card (`then_cast`: what plays moves to the TV once paired), and
+    /// from Settings ▸ Cast and the setup wizard (pairing only).
+    CastPair {
+        device: crate::model::DeviceId,
+        then_cast: bool,
+    },
+    /// The firewall card: Allow on firewall, "Waiting for your password…", the outcomes, Show
+    /// command (DESIGN §40 §3.4, §9.4; CAST-9).
+    CastFirewall,
+    /// The first-run card and setup wizard: pair → network → Test on TV (DESIGN §40 §3.5;
+    /// CAST-9). Opened by the app, once per Tuner version.
+    CastOffer(crate::cast::SetupOffer),
 }
 
 /// Requests a screen makes during a frame; the app applies them after the frame.
