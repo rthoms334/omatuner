@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, RichText};
 
-use super::dialogs::{card_area, scrim, title};
+use super::dialogs::{button_row, card_area, scrim, title};
 use super::{Overlay, OverlayOutcome};
 use crate::agent::connect::{AgentId, AgentRow, Offer, Op, OpResult};
 use crate::keymap::{Action, KeyContext};
@@ -377,7 +377,7 @@ impl Overlay for AgentConnectCard {
                 ui.add_space(theme.space(SpaceToken::Sm));
                 busy_bar(ui, theme, 3.0);
                 ui.add_space(theme.space(SpaceToken::Lg));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                button_row(ui, |ui| {
                     hide = button(ui, theme, None, "Hide", ButtonStyle { bordered: true, focused: true, ..Default::default() }).clicked();
                 });
                 ui.add_space(theme.space(SpaceToken::Sm));
@@ -399,7 +399,7 @@ impl Overlay for AgentConnectCard {
                 clicked_tick = Some(Focus::DontAsk);
             }
             ui.add_space(theme.space(SpaceToken::Lg));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            button_row(ui, |ui| {
                 ui.spacing_mut().item_spacing.x = theme.space(SpaceToken::Lg);
                 let style = ButtonStyle { primary: true, bordered: true, focused: self.focus == Focus::Connect, ..Default::default() };
                 connect =
@@ -480,6 +480,27 @@ mod tests {
             overlay_harness(t, one, AgentConnectCard::new(Offer { agents: agents.to_vec(), connected: Vec::new() }), egui::vec2(1200.0, 800.0));
         h.state_mut().o.opened = Some(Instant::now() - ARMING); // the user has seen it
         (h, fake, home)
+    }
+
+    /// The card is as tall as what it shows, not the window (it used to fill a tall window,
+    /// its buttons floating halfway down): asking, and connecting with its progress bar.
+    #[test]
+    fn the_card_sizes_to_its_content_in_a_tall_window() {
+        let (t, one) = rig();
+        let home = tempfile::tempdir().unwrap();
+        let runner = fake();
+        t.services().agent_connect.with_fake(runner.clone(), ConnectEnv::rooted(home.path()));
+        let offer = Offer { agents: vec![AgentId::Claude, AgentId::Codex], connected: Vec::new() };
+        let mut h = overlay_harness(t, one, AgentConnectCard::new(offer), egui::vec2(1280.0, 1400.0));
+        h.state_mut().o.opened = Some(Instant::now() - ARMING);
+        h.run_steps(3);
+        let asking = crate::ui::overlays::dialogs::card_height(&h.ctx, "agent-connect");
+        assert!(asking > 100.0 && asking < 700.0, "asking: {asking} px tall in a 1400 px window");
+        h.state_mut().act(Action::Activate);
+        h.run_steps(3);
+        assert!(h.state().o.running.is_some(), "connecting");
+        let running = crate::ui::overlays::dialogs::card_height(&h.ctx, "agent-connect");
+        assert!(running > 50.0 && running < 700.0, "connecting: {running} px tall in a 1400 px window");
     }
 
     /// The config after the card's answers.

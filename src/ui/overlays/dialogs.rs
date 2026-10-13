@@ -187,10 +187,24 @@ fn error_line(ui: &mut egui::Ui, theme: &Theme, error: Option<&str>) {
     }
 }
 
+/// A right-aligned row of buttons, one control high, under what the card shows above it.
+///
+/// Never `ui.with_layout(Layout::right_to_left(Align::Center), …)` in a card: egui centres a
+/// horizontal layout's widgets on the cross axis by filling the *whole* available height
+/// (`Layout::next_frame_ignore_wrap`), and a card's available height is the window's
+/// ([`card_area`] only caps it), so the row claimed it all and every card using one (the
+/// agent card, the casting cards, the confirm dialogs) grew to the window's full height, its
+/// buttons floating in the middle. Like `ui.horizontal`, this row starts one control high and
+/// grows only as tall as its tallest button.
+pub(super) fn button_row<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> egui::InnerResponse<R> {
+    let row = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+    ui.allocate_ui_with_layout(row, egui::Layout::right_to_left(egui::Align::Center), add)
+}
+
 /// Right-aligned button row; returns (cancel clicked, confirm clicked).
 pub(super) fn buttons(ui: &mut egui::Ui, theme: &Theme, confirm: &str, style: ButtonStyle, focus_confirm: Option<bool>) -> (bool, bool) {
     ui.add_space(theme.space(SpaceToken::Lg));
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+    button_row(ui, |ui| {
         ui.spacing_mut().item_spacing.x = theme.space(SpaceToken::Lg);
         let ok = button(ui, theme, None, confirm, ButtonStyle { focused: focus_confirm == Some(true), ..style }).clicked();
         let cancel =
@@ -1020,9 +1034,35 @@ impl Overlay for ListPickerOverlay {
     }
 }
 
+/// The height of the card `id` ([`card_area`]) as last laid out (tests: a card sizes to its
+/// content, [`button_row`]).
+#[cfg(test)]
+pub(crate) fn card_height(ctx: &egui::Context, id: &str) -> f32 {
+    ctx.memory(|m| m.area_rect(egui::Id::new((id, "card")))).map_or(0.0, |r| r.height())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A confirm dialog in a tall window is as tall as what it says, not the window: its button
+    /// row ([`button_row`]) doesn't claim the height a right-to-left layout would centre in.
+    #[test]
+    fn a_dialog_sizes_to_its_content_in_a_tall_window() {
+        use crate::ui::screens::home::testkit::{overlay_harness, rig};
+        let (t, one) = rig();
+        let spec = ConfirmSpec {
+            title: "Delete the list?".into(),
+            body: "Its channels stay in your playlists.".into(),
+            confirm_label: "Delete".into(),
+            destructive: true,
+            token: 1,
+        };
+        let mut h = overlay_harness(t, one, ConfirmOverlay::new(spec), egui::vec2(1280.0, 1400.0));
+        h.run_steps(3);
+        let height = card_height(&h.ctx, "confirm");
+        assert!(height > 50.0 && height < 400.0, "the card is {height} px tall in a 1400 px window");
+    }
 
     #[test]
     fn pin_cooldown_is_per_thread() {
