@@ -378,7 +378,9 @@ fn an_irregular_playlist_escalates_once_and_the_next_cast_starts_converted() {
 }
 
 /// A seek inside what's produced replaces with a playlist view (its first segment is the new
-/// offset); beyond it, the film restarts there (`-ss`) and the card says "Seeking…".
+/// offset); beyond it, the film restarts there (`-ss`) and the card says "Seeking…". The
+/// restart's provider close and reopen stay inside generation 1: the controller hears only the
+/// final close (one per generation, which it would read as the upstream dropping).
 #[test]
 fn a_seek_uses_a_view_inside_what_is_produced_and_a_restart_beyond() {
     let r = rig("tuner-cast-service-seek", calm());
@@ -388,6 +390,7 @@ fn a_seek_uses_a_view_inside_what_is_produced_and_a_restart_beyond() {
     let out = r.cast.open(tv_id()).unwrap();
     load(&out, 1, film(None));
     until("the insert", || calls(&tv).len() == 1);
+    relay.emit(RelayEvent::UpstreamOpened { generation: 1 });
     relay.emit(RelayEvent::PlaylistFetched { generation: 1 });
     tv.emit(ReceiverEvent::Playing);
     wait_event(&out.events, "the picture", |e| matches!(e, RemoteEvent::Playing { .. }));
@@ -404,6 +407,14 @@ fn a_seek_uses_a_view_inside_what_is_produced_and_a_restart_beyond() {
     until("the restart's replace", || calls(&tv).len() == 3);
     assert!(matches!(&calls(&tv)[2], Call::Replace(req) if req.offset_s == 5000.0));
     assert!(relay.with(|s| s.calls.iter().any(|c| matches!(c, RelayCall::Load { generation: 1, start_at: Some(t), .. } if *t == 5000.0))));
+
+    let old_feed = std::time::Instant::now();
+    relay.emit(RelayEvent::UpstreamClosed { generation: 1, at: old_feed });
+    relay.emit(RelayEvent::UpstreamOpened { generation: 1 });
+    out.cmd.send(RemoteCmd::Close { fast: false }).unwrap();
+    let evs = wait_event(&out.events, "the final close", |e| matches!(e, RemoteEvent::UpstreamClosed { .. }));
+    assert!(!evs.iter().any(|e| matches!(e, RemoteEvent::UpstreamOpened { .. })), "{evs:?}");
+    assert!(matches!(evs.last(), Some(RemoteEvent::UpstreamClosed { generation: 1, at }) if *at != old_feed), "{evs:?}");
 }
 
 /// Discovery lists a new TV as "Pair first" (and the store remembers it); casting to it is

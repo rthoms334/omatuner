@@ -23,6 +23,12 @@
 //!   a teardown forwards every relay event still queued and, if the upstream of a generation
 //!   was opened but never reported closed, says so itself — before any `Lost`, after which the
 //!   controller stops listening.
+//! * **A reload under the same generation** (escalation, Convert, a VOD seek past what's
+//!   produced, a live resume) closes the provider and opens it again, as an mpv seek does
+//!   without an END_FILE: the old feed's `UpstreamClosed` and the new feed's `UpstreamOpened`
+//!   are kept from the controller, which holds the lease across ([`Reopen`]). Within one
+//!   generation the controller sees one `UpstreamClosed`, and it is final (`RemoteAdapter`
+//!   reads a close before EOF as the upstream dropping).
 //! * **Escalation** (§8.3) is one step per item: the TV fetched segments but never played
 //!   within 15 s, the TV reported a failure, or the playlist guard tripped. L3 then replaces the
 //!   item under the same generation; what worked is cached in `cast_hint` at the first picture.
@@ -466,6 +472,23 @@ pub(crate) struct Session {
     phase: CastPhase,
     /// A generation whose upstream opened and hasn't been reported closed.
     upstream: Option<u64>,
+    /// A reload under the generation whose upstream is open.
+    reopen: Option<Reopen>,
+}
+
+/// Reloads under the same generation (see the module docs). Each one ends a feed and opens
+/// the next (the relay stops the old before it opens the new, §8.5), so each keeps one close and
+/// one open from the controller; a close kept is held until its successor opens. A close with
+/// nothing left to keep (the new feed failed before it opened) is reported and ends this, as
+/// does [`Session::end_reopen`] when a reload fails or is superseded. Counted, because the
+/// relay's events may still be queued when the next reload starts (a second seek).
+#[derive(Debug, Clone, Copy)]
+struct Reopen {
+    generation: u64,
+    closes: u32,
+    opens: u32,
+    /// The last close kept whose successor hasn't opened.
+    held: Option<std::time::Instant>,
 }
 
 impl Session {
@@ -482,6 +505,7 @@ impl Session {
             cur: None,
             phase: CastPhase::Connecting,
             upstream: None,
+            reopen: None,
         }
     }
 
@@ -618,6 +642,7 @@ impl Session {
                 self.forward_relay(ev);
             }
         }
+        self.reopen = None;
         if let Some(generation) = self.upstream.take() {
             self.send(RemoteEvent::UpstreamClosed { generation, at: std::time::Instant::now() });
         }
@@ -677,8 +702,15 @@ impl Session {
             self.lost(kind).await;
             return;
         }
+        if self.reopen.is_some_and(|r| r.generation != job.generation) {
+            self.end_reopen();
+        }
         let same = self.cur.as_ref().filter(|c| c.generation == job.generation);
         let (playing, position) = (same.is_some_and(|c| c.playing), same.and_then(|c| c.position));
+        if same.is_some() {
+            let r = self.reopen.get_or_insert(Reopen { generation: job.generation, closes: 0, opens: 0, held: None });
+            (r.closes, r.opens) = (r.closes + 1, r.opens + 1);
+        }
         let (live, duration) = match &job.source {
             Source::Item { playable, .. } => (playable.kind.is_live(), playable.duration_hint),
             Source::TestCard => (false, None),
@@ -718,6 +750,7 @@ impl Session {
             Err(kind) => {
                 // the provider's status, if the relay saw one, is the real reason (§11.2)
                 self.drain_relay();
+                self.end_reopen();
                 let http = self.cur.as_ref().and_then(|c| c.http).filter(|s| *s >= 400);
                 let failure = match http {
                     Some(status) => crate::player::state::classify(-13, Some(status)),
@@ -936,9 +969,25 @@ impl Session {
         match ev {
             RelayEvent::UpstreamOpened { generation } => {
                 self.upstream = Some(generation);
+                if let Some(r) = self.reopen.as_mut().filter(|r| r.generation == generation && r.opens > 0) {
+                    // a reload's feed: the controller's upstream (and lease) carry over
+                    (r.opens, r.held) = (r.opens - 1, None);
+                    if r.opens == 0 && r.closes == 0 {
+                        self.reopen = None;
+                    }
+                    return;
+                }
                 self.send(RemoteEvent::UpstreamOpened { generation });
             }
             RelayEvent::UpstreamClosed { generation, at } => {
+                if let Some(r) = self.reopen.as_mut().filter(|r| r.generation == generation && r.closes > 0) {
+                    (r.closes, r.held) = (r.closes - 1, Some(at));
+                    return;
+                }
+                if self.reopen.is_some_and(|r| r.generation == generation) {
+                    // a reload's feed closed before it opened (a provider failure): final
+                    self.reopen = None;
+                }
                 if self.upstream == Some(generation) {
                     self.upstream = None;
                 }
@@ -972,6 +1021,18 @@ impl Session {
                 }
             }
             RelayEvent::Irregular { .. } | RelayEvent::CpuTooSlow { .. } | RelayEvent::Failed { .. } => {}
+        }
+    }
+
+    /// A reload is over without its feed opening (it failed, or a newer load superseded it):
+    /// the held close is reported now. A close not seen yet is reported when it comes.
+    fn end_reopen(&mut self) {
+        let Some(r) = self.reopen.take() else { return };
+        if let Some(at) = r.held {
+            if self.upstream == Some(r.generation) {
+                self.upstream = None;
+            }
+            self.send(RemoteEvent::UpstreamClosed { generation: r.generation, at });
         }
     }
 
