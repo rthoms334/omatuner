@@ -170,9 +170,7 @@ pub struct UpdateStatus {
 /// "0.2.6" for a stable tag `v0.2.6` (three numbers, nothing after: `v0.3.0-rc1` and
 /// `v0.3.0rc1` are pre-releases whatever GitHub says).
 pub fn stable_version(tag: &str) -> Option<&str> {
-    let v = tag.strip_prefix('v')?;
-    let parts: Vec<&str> = v.split('.').collect();
-    (parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.len() <= 9 && p.bytes().all(|b| b.is_ascii_digit()))).then_some(v)
+    tag.strip_prefix('v').filter(|v| verify::is_stable(v))
 }
 
 /// pkgver of pacman's full version: "0.2.6" of "0.2.6-1" (and of "1:0.2.6-1").

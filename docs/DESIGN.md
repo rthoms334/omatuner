@@ -3000,35 +3000,56 @@ so it trusts nothing it is given: not its argument, not the files, not the envir
 * **The trust root is the release key.** A package installs only when its bytes verify against
   the minisign public key compiled into the helper (`packaging/update-key.pub` via
   `include_str!`, pre-hashed mode, the key id and the trusted comment's global signature
-  included), and pacman's own reading of the verified copy says name `omatuner`, this machine's
-  architecture, the signed file name's version, newer than the installed one (`vercmp`). A key
-  file that is the placeholder (or doesn't parse) installs nothing (exit 6).
+  included), its file name says a stable version (`<n>.<n>.<n>`: pre-releases are signed with
+  the same key and never installed), and pacman's own reading of the verified copy says name
+  `omatuner`, this machine's architecture, the file name's version, newer than the installed one
+  (`vercmp`, checked against pacman's `vercmp` on random input). The trusted comment isn't read:
+  the signature covers the bytes, so the `.PKGINFO` pacman reads. A key file that is the
+  placeholder (or doesn't parse) installs nothing (exit 6).
 * **Network attacker, mirror, a GitHub account without the key:** any bytes they serve fail the
   signature. They can withhold updates, or serve an *older* signed release: the same version or
   a downgrade is refused; a genuine release between the installed one and the newest can be
   installed (the next check moves on). The app verifies too, but only to refuse early: the
   helper's check is the one that counts.
 * **Local malware as the user** (what the passwordless rule exposes): it can run `install`
-  without a password, and so install a genuine, signed, newer Tuner earlier than the user would
-  — nothing else. It can't choose the package (name, signature, version and arch are checked),
-  pacman's arguments, a downgrade, or turn the rule on (`passwordless` always asks). With the
-  rule off it can only pop the password dialog, which names Tuner's update.
+  without a password, and so install a genuine, signed, newer stable Tuner earlier than the user
+  would — nothing else. It can't choose the package (name, signature, version and arch are
+  checked), pacman's arguments, a downgrade, or turn the rule on (`passwordless` always asks).
+  With the rule off it can only pop the password dialog, which names Tuner's update.
+* **The caller's process isn't trusted either.** What pkexec starts keeps the caller's resource
+  limits (pam_limits only sets what limits.conf names) and cgroup — under Omarchy a scope of
+  the user's systemd, whose `cgroup.kill`, `cgroup.freeze` and `memory.max` the user owns. Run
+  there, pacman could be killed or frozen halfway (`RLIMIT_FSIZE`/`RLIMIT_CPU`, cgroup.kill):
+  a half-installed Tuner and a stale `db.lck`; and a frozen helper stretches any window between
+  a check and its use. Two helpers at once shared root's copy: with one frozen after `pacman
+  -Qip` read its copy, another (killed once it had staged) replaced that copy with an older
+  genuine package named like the newer one (its signature verifies: it covers the bytes, not the
+  name), and the first's `pacman -U` downgraded. So
+  `install` only checks who asked and the argument's shape and runs `install-as <uid> <path>` as
+  the transient system service `omatuner-update.service` (`systemd-run --wait --pipe --collect
+  --expand-environment=no`; the path free of control characters): PID 1's child, in
+  system.slice with the system's limits, nothing of the caller's; every check below happens
+  there. The fixed unit name makes installs one at a time (systemd refuses a second while the
+  first is loaded: exit 5), so root's copy is one run's; the service empties its folder first.
+  `install-as` is refused through pkexec (`PKEXEC_UID` set). The service outlives the caller:
+  once started, an install finishes.
 * **Other users:** the rule names the user (`subject.user`, from `getent passwd PKEXEC_UID`,
   never an argument; a name outside `[A-Za-z0-9._-]` with an optional final `$` is refused) and
   needs `subject.local && subject.active`; the downloads folder is 0700.
 * **The path (TOCTOU):** absolute, plain components, each folder opened from the one before with
-  `O_NOFOLLOW|O_DIRECTORY` (no symlink anywhere), owned by root or the user and not writable by
-  others unless sticky; the last folder the user's and 0700; the file and its `.minisig` opened
-  with `O_NOFOLLOW|O_NONBLOCK|O_NOCTTY`, then checked on the open descriptor: a regular file of
-  the user's, one link, ≤ 256 MiB (≤ 4 KiB). The bytes are read from that descriptor and
-  verified in memory, then written to a new file in root's private `/var/cache/omatuner/` (0700
-  root, refused if it is anything else); pacman reads only that copy, which is removed after.
-  Nothing a user can touch is read twice.
+  `O_NOFOLLOW|O_DIRECTORY` (no symlink anywhere, `/proc/<pid>/root` included), owned by root or
+  the user and not writable by others unless sticky; the last folder the user's and 0700; the
+  file and its `.minisig` opened with `O_NOFOLLOW|O_NONBLOCK|O_NOCTTY`, then checked on the open
+  descriptor: a regular file of the user's (no FIFO or device), one link, ≤ 256 MiB (≤ 4 KiB).
+  The bytes are read from that descriptor and verified in memory, then written to a new file in
+  root's private `/var/cache/omatuner/` (0700 root, refused if it is anything else); pacman
+  reads only that copy, which is removed after. Nothing a user can touch is read twice.
 * **Environment and argv:** pkexec cleans the environment; the helper still runs pacman and
   getent with `env_clear` (`PATH`, `LC_ALL=C`), no shell, stdin closed, fixed argv (`-Qip`,
   `-Q omatuner`, `-U --noconfirm --noprogressbar -- <copy>`). Exit codes: 0 done, 2 bad
-  arguments / not root through pkexec, 3 refused, 4 pacman or the rule file failed, 5 pacman busy
-  (its lock), 6 no release key; never 126/127.
+  arguments / not root through pkexec, 3 refused, 4 pacman, the service or the rule file failed,
+  5 busy (pacman's lock, or another install's service), 6 no release key; never 126/127. The
+  service's codes and message are passed on by `install`.
 * **What a signed release can do:** anything a package can (root scriptlets, files): whoever holds
   the secret key and its password can update every Tuner. The key lives in the repository
   secrets and the maintainer's offline backup (README "Release signing"). A leaked key needs a
@@ -3213,7 +3234,7 @@ for any window. Tuner does it for itself with `o` in the player or Ctrl+Shift+O 
   `SHA256SUMS`, and a minisign signature (`<file>.minisig`, pre-hashed) of every package and
   tarball: the publish job signs with the `MINISIGN_SECRET_KEY` / `MINISIGN_PASSWORD` secrets
   (the password on stdin) and fails unless `packaging/update-key.pub` verifies each signature
-  (§41.3). A manual run with `publish=false`, and every pull request that touches
+  and each is pre-hashed (`ED`, the only kind Tuner accepts; §41.3). A manual run with `publish=false`, and every pull request that touches
   `packaging/`, `Cargo.*` or the workflow, is a dry run (workflow artifacts only, unsigned).
 * **Updates packaging** (§41): the crate's second binary, `tuner-update` (`[[bin]]`; std,
   `minisign-verify` and `rustix`, sharing `src/update/verify.rs` through `#[path]`, never the
@@ -6321,7 +6342,10 @@ pacman's hands finishes (it runs as root and can't be killed from here). Off the
 
 ### 41.5 The helper (`src/bin/tuner-update.rs`) and polkit
 `tuner-update install <path>` and `tuner-update passwordless on|off`, as root through pkexec
-only (`PKEXEC_UID` set). The checks, in order, are §20.4's; the passwordless rule is
+only (`PKEXEC_UID` set). `install` runs the install as the system service
+`omatuner-update.service` (`tuner-update install-as <uid> <path>` under `systemd-run`, §20.4:
+nothing of the caller's process reaches pacman, one install at a time). The checks, in order,
+are §20.4's; the passwordless rule is
 `/etc/polkit-1/rules.d/49-omatuner-update-<uid>.rules` (0644, written atomically):
 ```js
 polkit.addRule(function (action, subject) {
@@ -6395,10 +6419,13 @@ installed toast → 304 on the next check; passwordless installs at once; a dism
 for Install now; a tampered download is deleted and never reaches pkexec; a Tuner not from
 pacman only tells, once; the rate limit; pacman newer than what runs; the switch follows the
 helper; the gate reads the players. The helper (its own tests): a signed newer package goes to
-pacman from root's copy; tampered, foreign, legacy and missing signatures; the placeholder key;
-another name, arch, version not newer, not installed; busy and failing pacman; relative, `..`,
-symlinked folder or file, hard link, open or writable folders, over the cap; not root through
-pkexec, bad arguments; the passwordless rule's text, mode, removal and refused user names.
+pacman from root's copy (an interrupted run's leftovers gone first); `install` only hands the
+path to the update service (its systemd-run argv, its exit codes passed on, "already loaded" is
+busy, no control characters through); tampered, foreign, legacy and missing signatures; a signed
+pre-release; the placeholder key; another name, arch, version not newer, not installed; busy and
+failing pacman; relative, `..`, symlinked folder or file, hard link, open or writable folders,
+over the cap; not root through pkexec, `install-as` through pkexec, bad arguments; the
+passwordless rule's text, mode, removal and refused user names.
 The real update (password, rule, restart, refusals) is `docs/MANUAL_CHECKLIST.md` "Updates".
 
 ### 41.9 Risks
@@ -6411,3 +6438,7 @@ The real update (password, rule, restart, refusals) is `docs/MANUAL_CHECKLIST.md
   (no last-screen save; the screen comes from `--view`).
 * Partial upgrades (§20.4) and `LocalFileSigLevel = Required` are pacman's; Settings shows
   pacman's message.
+* The install runs as a transient system service (§20.4), so it needs systemd as PID 1 (Arch's
+  `base`); without it `install` fails (exit 4, systemd-run's message). An install already in
+  its service when Tuner quits or gives up waiting finishes; the next one meanwhile is busy.
+* The download stops past 256 MiB whatever size GitHub lists for the package.

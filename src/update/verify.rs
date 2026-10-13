@@ -15,7 +15,11 @@
 //!   segments (numbers by value, a number beats letters, `1.0rc1` < `1.0`), the release compared
 //!   only when both have one.
 //! * [`package_file`] reads `omatuner-<pkgver>-<pkgrel>-<arch>.pkg.tar.zst`, the name
-//!   release.yml gives the package (no epoch).
+//!   release.yml gives the package (no epoch); [`is_stable`] tells a stable release's pkgver
+//!   from a pre-release's (both are signed).
+//! * The trusted comment (minisign's `timestamp:… file:… hashed`) is verified but not read: the
+//!   signature covers the package's bytes, and so its `.PKGINFO`, which is where pacman takes
+//!   the name, version and architecture the helper checks.
 
 use std::cmp::Ordering;
 
@@ -92,6 +96,14 @@ pub fn package_file(name: &str) -> Option<PackageFile<'_>> {
         && !arch.is_empty()
         && arch.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
     ok.then_some(PackageFile { pkgver, pkgrel, arch })
+}
+
+/// A stable release's version, `<n>.<n>.<n>` (the tag `v<n>.<n>.<n>`). A pre-release's version
+/// has its tag's suffix (`0.3.0rc1`, signed with the same key): the app never picks one and the
+/// helper never installs one.
+pub fn is_stable(version: &str) -> bool {
+    let parts: Vec<&str> = version.split('.').collect();
+    parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.len() <= 9 && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// libalpm's `alpm_pkg_vercmp(a, b)`: how `a` orders against `b` (pacman's `vercmp`).

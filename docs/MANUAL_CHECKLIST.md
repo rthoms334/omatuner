@@ -1804,6 +1804,18 @@ helper's outcome.
 - [ ] **Unsafe paths are refused:** `ln -s ~/upd ~/upd-link` and run the helper on
   `~/upd-link/<package>`; then `chmod 755 ~/upd` and run it on `~/upd/<package>`. **Expect:**
   exit 3, "folders on the way must not be symlinks", then "must be yours and private (0700)".
+- [ ] **The install runs as a system service, one at a time:**
+  - **Do:** with vN installed and the passwordless rule on, start two installs of vN+1 at once:
+    `p=~/upd/omatuner-<vN+1>-1-$(uname -m).pkg.tar.zst; for i in 1 2; do pkexec
+    /usr/lib/tuner/tuner-update install $p & done; wait`; while they run, `systemctl status
+    omatuner-update.service`.
+  - **Expect:** one prints "installed omatuner vN+1 …", the other exit 5 (busy); the status shows
+    the unit in system.slice running `tuner-update install-as <uid> <path>` (its pacman child
+    under it); afterwards the unit is gone and `sudo ls -A /var/cache/omatuner` is empty.
+  - **Do:** `pkexec /usr/lib/tuner/tuner-update install-as $(id -u) $p`. **Expect:** the
+    password dialog (polkit's generic action); after it, exit 2.
+  - **Do:** with vN installed again, in a shell `ulimit -f 1024` and run the install.
+    **Expect:** vN+1 installs: the limit isn't the service's.
 - [ ] **A Tuner not installed with pacman only tells:**
   - **Do:** from a checkout of vN, `cargo build --release`, then
     `target/release/tuner --profile-dir /tmp/tuner-check`; wait 30 s.

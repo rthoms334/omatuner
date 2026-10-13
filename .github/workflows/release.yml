@@ -222,6 +222,11 @@ jobs:
             printf '%s\n' "$MINISIGN_PASSWORD" | minisign -S -s "$key" -m "$f"
             # the key Tuner compiles in must verify it, or no Tuner could install this release
             minisign -V -q -p ../packaging/update-key.pub -m "$f"
+            # pre-hashed (`ED`), the only kind Tuner accepts: minisign -V takes legacy ones too
+            if [[ $(sed -n 2p "$f.minisig" | base64 -d | head -c 2) != ED ]]; then
+              echo "::error::$f.minisig isn't a pre-hashed signature: Tuner refuses legacy (Ed) ones"
+              exit 1
+            fi
           done
           ls -l ./*.minisig
 

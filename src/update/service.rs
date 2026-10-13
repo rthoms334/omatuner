@@ -631,7 +631,19 @@ impl Updater {
             etag: None,
             last_modified: None,
         };
-        self.inner.http.download(&req, &|_, _| {}, &self.inner.cancel).await.map_err(|e| (format!("downloading it: {e}"), false))?;
+        // the size GitHub lists is only what it says: the download stops once past the cap
+        let too_big = self.inner.cancel.child_token();
+        let cap = |done: u64, total: Option<u64>| {
+            if done.max(total.unwrap_or(0)) > MAX_PACKAGE {
+                too_big.cancel();
+            }
+        };
+        let downloaded = self.inner.http.download(&req, &cap, &too_big).await;
+        if too_big.is_cancelled() && !self.inner.cancel.is_cancelled() {
+            let _ = std::fs::remove_file(&dest);
+            return Err((format!("its package is larger than {} MiB", MAX_PACKAGE >> 20), true));
+        }
+        downloaded.map_err(|e| (format!("downloading it: {e}"), false))?;
         let (key, file, text) = (self.inner.env.key.clone(), dest.clone(), sig.clone());
         let verified = self
             .inner
