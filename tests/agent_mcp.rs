@@ -191,6 +191,8 @@ fn tools_list_has_every_tool() {
             "continue_watching",
             "favourites",
             "status",
+            // the TVs to cast to (DESIGN §40 §12; next to status, before play's `device`)
+            "cast_devices",
             "play",
             "schedule_switch",
             "cancel_switch",

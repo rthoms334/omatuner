@@ -2636,6 +2636,7 @@ global chord (Ctrl+Shift+C is the terminal's copy).
 | `o` | Pop out: small window on every workspace (Hyprland) |
 | `q` | Stop and close |
 | `r` | Retry (after an error) |
+| `C` | Cast to a TV… |
 | `u` | Up next |
 | `n` / `N` | Next / previous in Up next |
 | `Ctrl+M` | Watch alongside… (choose the channel) |
@@ -2672,6 +2673,7 @@ global chord (Ctrl+Shift+C is the terminal's copy).
 | `o` | Pop out: small window on every workspace (Hyprland) |
 | `q` | Stop and close |
 | `r` | Retry (after an error) |
+| `C` | Cast to a TV… |
 | `u` | Up next |
 | `n` / `N` | Next / previous in Up next |
 | `Ctrl+M` | Watch alongside… (choose the channel) |

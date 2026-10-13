@@ -829,6 +829,7 @@ The full reference is generated from `src/keymap.rs`:
 | `o` | Pop out: small window on every workspace (Hyprland) |
 | `q` | Stop and close |
 | `r` | Retry (after an error) |
+| `C` | Cast to a TV… |
 | `u` | Up next |
 | `n` / `N` | Next / previous in Up next |
 | `Ctrl+M` | Watch alongside… (choose the channel) |
@@ -865,6 +866,7 @@ The full reference is generated from `src/keymap.rs`:
 | `o` | Pop out: small window on every workspace (Hyprland) |
 | `q` | Stop and close |
 | `r` | Retry (after an error) |
+| `C` | Cast to a TV… |
 | `u` | Up next |
 | `n` / `N` | Next / previous in Up next |
 | `Ctrl+M` | Watch alongside… (choose the channel) |

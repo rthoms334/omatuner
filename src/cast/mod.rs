@@ -49,8 +49,8 @@ use crate::player::{PlayerError, PlayerErrorKind};
 use crate::redact::Secret;
 
 /// Casting shows in the UI (the picker, `C`, the OSD control, Settings ▸ Cast, the first-run
-/// card, the agent's tools). Flipped at the gate once every CAST item has landed.
-pub const ENABLED: bool = false;
+/// card, the agent's tools). On since the combined gate (DESIGN §40 §15.0 step 4).
+pub const ENABLED: bool = true;
 
 /// The wire protocol a device speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
