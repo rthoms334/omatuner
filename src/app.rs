@@ -5278,17 +5278,19 @@ mod tests {
     /// reminders are off) → the strip's countdowns "Switching to … in N s · ‹title›" → the
     /// switch plays the channel at its start in the pop-out (the window isn't in front: asked of
     /// Hyprland, never focused); the switch whose Cancel was clicked never plays.
+    ///
+    /// Real time, so nothing may hang on how fast the rig starts or the scheduler runs: both
+    /// countdowns must show at once, and a countdown lasts `SWITCH_WARN_S`. The switches are set
+    /// for programmes 10 minutes ahead, then both move (one write) to start a countdown from now,
+    /// so the scheduler's next pass sends both countdowns together and each switches no sooner
+    /// than `SWITCH_WARN_S` after it: a slow pass only delays the switches.
     #[test]
     fn agent_switches_count_down_then_pop_out_and_cancel_stops_one() {
         use crate::agent::proto::{Call, GuideSearch, ScheduleSwitch};
-        let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_agent(c, 14));
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_agent(c, 600));
         let sent = Rc::new(RefCell::new(Vec::new()));
         rig.app.popout_backend = Some(Box::new(PopRecorder(sent.clone())));
         rig.settle();
-        let rally_start = {
-            let conn = &rig.app.db;
-            conn.query_row("SELECT start FROM programme WHERE title = 'Rally Stage'", [], |r| r.get::<_, i64>(0)).unwrap()
-        };
         let mut ids = Vec::new();
         for q in ["touring", "rally"] {
             let found = ask(&rig, Call::GuideSearch(GuideSearch { query: Some(q.into()), ..Default::default() }));
@@ -5297,6 +5299,19 @@ mod tests {
             ids.push(crate::model::ReminderId(s["id"].as_i64().unwrap()));
         }
         let touring = ids[0];
+        // both programmes (and their switches) now start `SWITCH_WARN_S` from now: their
+        // countdowns are due at once (the strip lists the earlier-set touring cars first)
+        let start = crate::model::now() + crate::model::Reminder::SWITCH_WARN_S;
+        rig.writer()
+            .blocking(move |c| {
+                let tx = c.transaction()?;
+                tx.execute("UPDATE programme SET start = ?1, stop = ?1 + 3600", [start])?;
+                tx.execute("UPDATE reminder SET start = ?1, stop = ?1 + 3600", [start])?;
+                tx.commit()?;
+                Ok(())
+            })
+            .unwrap();
+        rig.app.services().agent.wake_reminders();
         rig.until_within("the countdowns", Duration::from_secs(20), |r| r.app.reminder_ui.countdowns.len() == 2);
         let first = rig.app.reminder_ui.countdowns[0].clone();
         let text = first.text(crate::model::now());
@@ -5312,12 +5327,15 @@ mod tests {
         assert_eq!(rig.log().toasts.last().map(|t| t.text.as_str()), Some("Switch cancelled"));
         assert_eq!(rig.app.reminder_ui.countdowns.iter().map(|c| c.reminder).collect::<Vec<_>>(), [touring]);
         let ch1 = rig.app.lib.live.by_ref(&channel_ref(1)).unwrap();
-        rig.until_within("the switch", Duration::from_secs(25), |r| played(&r.log()).contains(&(MediaRef::Channel(ch1), PlayOrigin::Reminder)));
+        // waits measured from the switch time, however long getting here took
+        let past = |at: Timestamp, slack: u64| Duration::from_secs((at - crate::model::now()).max(0) as u64 + slack);
+        rig.until_within("the switch", past(first.at, 20), |r| played(&r.log()).contains(&(MediaRef::Channel(ch1), PlayOrigin::Reminder)));
         assert!(matches!(sent.borrow().as_slice(), [PopRequest::Out { .. }]), "{:?}", sent.borrow());
         assert!(rig.app.reminder_ui.countdowns.is_empty());
         assert_eq!(rig.route(), &Route::Player);
-        // past the rally's start: nothing else switched
-        rig.until_within("the rally's start", Duration::from_secs(10), |_| crate::model::now() > rally_start + 1);
+        // past the rally's start and the time its switch was due (the touring cars' too):
+        // nothing else switched
+        rig.until_within("the rally's switch time", past(first.at + 1, 10), |_| crate::model::now() > first.at + 1);
         rig.frame_with(vec![]);
         assert_eq!(played(&rig.log()).len(), 1, "{:?}", played(&rig.log()));
         let states: Vec<(i64, String)> = {
