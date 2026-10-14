@@ -468,6 +468,9 @@ fn watchlist_reads_fresh_order_and_progress_after_the_users_queue() {
     assert_eq!(rig.queue.snapshot().rows[0].entry.watchlist_item_id, Some(entries[0]));
     rig.player(&movie_ref(src, 0), MediaRef::Movie(movies[0]), PlayOrigin::Queue, PlayerState::Playing, 1);
     until("list owns first film", || rig.queue.snapshot().driving);
+    // "Then from Saga" starts after the film that plays (it isn't finished while it plays)
+    let then = |snap: &tuner::queue::QueueSnapshot| snap.watchlist.as_ref().map(|l| l.then.iter().map(|p| p.id).collect::<Vec<_>>());
+    until("preview after the playing entry", || then(&rig.queue.snapshot()) == Some(vec![entries[1], entries[2], entries[3]]));
     req(QueueCommand::Add { targets: vec![target(movie_ref(src, 4))], at: Insert::End, by: AddedBy::App });
     let moved = entries[3];
     w(&s, move |c| {
@@ -492,6 +495,8 @@ fn watchlist_reads_fresh_order_and_progress_after_the_users_queue() {
     assert!(!rig.player.plays().iter().any(|(m, _)| *m == MediaRef::Movie(movies[1])), "watched elsewhere is passed over");
     rig.player(&movie_ref(src, 2), MediaRef::Movie(movies[2]), PlayOrigin::Queue, PlayerState::Playing, 4);
     until("last film owns playback", || rig.queue.snapshot().driving);
+    // the last entry has nothing after it: no preview, so MPRIS offers no Next
+    until("empty preview on the last entry", || then(&rig.queue.snapshot()) == Some(vec![]));
     w(&s, move |c| tuner::store::user::mark_watched(c, &[(movie_ref(src, 2), "Last".into())], true, NOW));
     rig.player(&movie_ref(src, 2), MediaRef::Movie(movies[2]), PlayOrigin::Queue, PlayerState::Ended, 4);
     until("list finished", || rig.queue.snapshot().finished_watchlist.as_deref() == Some("Saga"));
